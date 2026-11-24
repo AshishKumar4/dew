@@ -643,18 +643,37 @@ def constrained[T](x: T, spec: jax.sharding.PartitionSpec | Callable[[], jax.sha
     return jax.lax.with_sharding_constraint(x, auto_part(spec() if callable(spec) else spec, mesh))
 
 
-def gathered_over[T](x: T, spec: jax.sharding.PartitionSpec, axis: str) -> T:
-    """`x`, placed as `spec`, gathered whole over the mesh's `axis` and placed as before on every other: under
-    an Explicit `axis` resharded from its type's spec without it (`jax.sharding.reshard`), else constrained to
-    `spec` without it (`constrained`). Where `axis` holds one device or `spec` places nothing on it (a
-    forward's whole placement, a leaf split over other axes alone), `x` as it is. Its transpose places a
-    gradient back as `spec`, reduced over `axis` (`dew.nn.backbones.looping`'s gathered block)."""
-    mesh = jax.sharding.get_abstract_mesh()
-    if mesh.empty or mesh.shape.get(axis, 1) == 1 or axis not in _named(spec):
-        return x
-    if axis in mesh.explicit_axes:
-        return jax.sharding.reshard(x, _without(jax.typeof(x).sharding.spec, axis))
-    return constrained(x, _without(spec, axis))
+def gathered_over(x: jax.Array, spec: jax.sharding.PartitionSpec, axis: str) -> jax.Array:
+    """`x`, placed as `spec`, gathered whole over `axis`, an Explicit axis of the mesh in context
+    (`explicit_over`), and reduced over it (`PartitionSpec`'s `reduced`): every device holds the one copy,
+    and a gradient reaching it stays unreduced, each use's partial sum added as it lies, reduced over `axis`
+    once where its transpose places it back as `spec` places it over `axis` (a reduce-scatter).
+    `x` is first placed over the axis as `spec` places it there (from a type placing it on the mesh the step
+    traces, where `axis` is Auto): what `dew.nn.backbones.looping`'s gathered block reads."""
+    placed = jax.sharding.reshard(x, _only(spec, {axis}))
+    return jax.sharding.reshard(placed, jax.sharding.PartitionSpec(reduced={axis}))
+
+
+def explicit_over[T](axis: str, fn: Callable[[jax.Array], T], x: jax.Array) -> T:
+    """`fn(x)` traced with the context mesh's `axis` Explicit (`jax.sharding.explicit_axes`): `x`, a stream's
+    rows, placed over `axis` as its batch is (`activation_batch`), what `fn` returns placed back on the
+    mesh in context as its type places it there. An array `fn` reads from outside it is typed on the mesh in
+    context, which no operation inside mixes with its own: `fn` places each it reads (`jax.sharding.reshard`,
+    `gathered_over`), and `typed_on` what it writes elsewhere."""
+    rows = _only(logical_spec(("activation_batch",), x.shape[:1]), {axis})
+    return jax.sharding.explicit_axes(fn, axes=axis, in_sharding=(rows,))(x)
+
+
+def typed_on[T](tree: T, mesh: jax.sharding.AbstractMesh) -> T:
+    """`tree` with each array typed on another mesh than `mesh` (one `explicit_over` traced) placed back on
+    `mesh` as its type places it over `mesh`'s Explicit axes, every other leaf as it is."""
+    def back(value):
+        if not isinstance(value, jax.Array) or jax.typeof(value).sharding.mesh == mesh:
+            return value
+        with jax.sharding.use_abstract_mesh(mesh):
+            spec = jax.typeof(value).sharding.spec
+            return jax.sharding.reshard(value, _only(spec, set(mesh.explicit_axes)))
+    return jax.tree.map(back, tree)
 
 
 def _named(spec: jax.sharding.PartitionSpec) -> set[str]:
@@ -665,29 +684,46 @@ def _named(spec: jax.sharding.PartitionSpec) -> set[str]:
 
 @dataclasses.dataclass(frozen=True)
 class GatheredOver:
-    """A layout (`layout`) placing every leaf of a looped block's layers (`span`, `[first, end)`, under the
-    decoder's variables `scope`, `('params', ...)`) whole over `axis` as `gathered_over` takes it, every
-    other where `layout` does: what a pass of a gathered loop traces under (`placing`), so a projection
-    mapped per shard takes its gathered weight as it lies (`dew.nn.kernels.projections.shard_placement`) and
-    gathers it again in no pass. A layer is met by any module name running it, its own (`layers_3`) or a
-    scanned run's within the block (`layers_1_2`, `dew.nn.backbones.layer_names.group_layers`)."""
+    """A layout (`layout`, on the mesh `mesh` a step traces) placing every leaf a gathered loop's passes read
+    (`held`) whole over `axis` as `gathered_over` takes it, every other where `layout` does: what a pass of
+    a gathered loop traces under (`placing`), so a projection mapped per shard takes its gathered weight as
+    it lies (`dew.nn.kernels.projections.shard_placement`) and gathers it again in no pass."""
 
     layout: ParameterLayout
     scope: tuple[str, ...]
     span: tuple[int, int]
     axis: str
+    mesh: jax.sharding.AbstractMesh
 
-    def leaf_spec(self, mesh, path, value) -> jax.sharding.PartitionSpec:
+    def held(self, path) -> bool:
+        """Whether the passes read the leaf at `path` (a variables tree's): one under the decoder's variables
+        `scope`, `('params', ...)`, of a layer within the block (`span`, `[first, end)`), met by any module
+        name running it, its own (`layers_3`) or a scanned run's within the block (`layers_1_2`,
+        `dew.nn.backbones.layer_names.group_layers`), or of the decoder's own, no layer's (its step and
+        reinjection norms)."""
         from dew.nn.backbones.layer_names import group_layers
 
-        spec = self.layout.leaf_spec(mesh, path, value)
         names = tuple(key.key if isinstance(key, jax.tree_util.DictKey) else key for key in path)
         at = len(self.scope)
-        runs = (group_layers(names[at]) if len(names) > at and isinstance(names[at], str)
-                and names[:at] == self.scope else None)
+        if len(names) <= at or names[:at] != self.scope or not isinstance(names[at], str):
+            return False
+        runs = group_layers(names[at])
         first, end = self.span
-        held = runs is not None and first <= runs.start and runs.stop <= end
-        return _without(spec, self.axis) if held else spec
+        return runs is None or (first <= runs.start and runs.stop <= end)
+
+    def leaf_spec(self, mesh, path, value) -> jax.sharding.PartitionSpec:
+        """Where the leaf at `path` lies in a pass: `layout`'s placement on the step's mesh (`self.mesh`,
+        whichever mesh a pass traces, its `axis` Explicit), without `axis` where the passes read it."""
+        spec = self.layout.leaf_spec(self.mesh, path, value)
+        return _without(spec, self.axis) if self.held(path) else spec
+
+
+def _only(spec: jax.sharding.PartitionSpec, axes: Collection[str]) -> jax.sharding.PartitionSpec:
+    """`spec` with only `axes` kept in each dimension that names any."""
+    def kept(entry):
+        names = tuple(name for name in mesh_axes(entry) if name in axes)
+        return None if not names else names[0] if len(names) == 1 else names
+    return jax.sharding.PartitionSpec(*map(kept, spec))
 
 
 def _without(spec: jax.sharding.PartitionSpec, axis: str) -> jax.sharding.PartitionSpec:

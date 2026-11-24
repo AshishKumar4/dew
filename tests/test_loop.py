@@ -1181,11 +1181,12 @@ def _gathered_case(*, gathered: bool, remat: bool):
 @pytest.mark.parametrize("remat", [False, True], ids=["plain", "recomputed"])
 def test_a_gathered_loop_reads_its_block_gathered_once(remat, boxed):
     """A looped block whose parameters fully sharded data parallelism splits, with `Loop.gathered`, reads
-    them gathered once before its passes: its training step's pass loop (the `while` of its three later
-    passes), its body and all it calls, holds no all-gather, where the same step without it gathers there
-    each pass, and no more of the passes' gradient reductions, each pass and layer recomputed or not
-    (row 12722: the gather is not sunk back into a checkpointed body), its variables arrays or as its init
-    boxes them (`flax.core.meta`'s logical axes). Every leaf split eight ways (`Layout(min_shard=1)`)."""
+    them gathered once before its passes, and reduces their gradient once after them: its training step's
+    pass loop (the `while` of its three later passes), its body and all it calls, holds no all-gather and no
+    gradient reduction (all-reduce or reduce-scatter), where the same step without it gathers and reduces
+    there each pass, each pass and layer recomputed or not (row 12722: the gather is not sunk back into a
+    checkpointed body), its variables arrays or as its init boxes them (`flax.core.meta`'s logical axes).
+    Every leaf split eight ways (`Layout(min_shard=1)`)."""
     from dew.distributed.placement import Layout
     from dew.mesh import DEFAULT_RULES
     from dew.nn.sharding import placing
@@ -1205,17 +1206,17 @@ def test_a_gathered_loop_reads_its_block_gathered_once(remat, boxed):
             text = jax.jit(gradient).lower(variables, ids, cotangent).compile().as_text()
         found[gathered] = _collectives_in_loops(text)
     assert found[False]["all-gather"] and not found[True]["all-gather"], found
-    # The passes' gradient reductions as without it (`Loop.gathered`), none added.
-    assert found[True]["all-reduce"] + found[True]["reduce-scatter"] <= (
-        found[False]["all-reduce"] + found[False]["reduce-scatter"]), found
+    # The passes' gradients summed unreduced, reduced once after the loop (`Loop.gathered`).
+    assert found[False]["all-reduce"] + found[False]["reduce-scatter"], found
+    assert not found[True]["all-reduce"] + found[True]["reduce-scatter"], found
 
 
 @pytest.mark.mesh(devices=8)
 def test_a_gathered_loop_trains_the_same_model():
-    """A gathered loop's logits and every gradient, its block's parameters' summed across passes before
-    their one reduce-scatter, are on par with the same loop's reading them where they lie (check 1, both
-    from the loop's float64 twin): the same sums in another order (row 12722). Every leaf split eight ways
-    over the FSDP axis (`Layout(min_shard=1)`)."""
+    """A gathered loop's logits and every gradient, its block's parameters' summed unreduced across
+    passes before their one reduce-scatter, are on par with the same loop's reading them where they lie
+    (check 1, both from the loop's float64 twin): the same sums in another order (row 12722). Every leaf
+    split eight ways over the FSDP axis (`Layout(min_shard=1)`)."""
     from dew.distributed.placement import Layout
     from dew.mesh import DEFAULT_RULES
     from dew.nn.sharding import placing
