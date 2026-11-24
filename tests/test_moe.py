@@ -413,11 +413,14 @@ def test_float32_expert_routing_with_x64_keeps_its_output_and_gradients():
         np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-7)
 
 
-def test_experts_served_from_packed_banks_are_on_par_with_their_values_dense():
+@pytest.mark.parametrize("scale_inputs", [False, True])
+def test_experts_served_from_packed_banks_are_on_par_with_their_values_dense(scale_inputs):
     """An expert layer whose matrices are packed NVFP4 banks in its `QUANTIZATION` collection, no parameter
     beside them (a served 4-bit checkpoint's, row 4516: `dew.nn.dense.packed_matrix`), multiplied as NVFP4
     products (`gemm.nvfp4_product`): on par with the layer holding the banks' values as dense parameters in
-    the same compute dtype, bf16 (check 1, truth the values in float64)."""
+    the same compute dtype, bf16 (check 1, truth the values in float64). A layer scaling its inputs by their
+    routing weights (Llama 4's) hands the packed products its rows scaled, as no packed product takes a
+    prologue (`moe._streamed`)."""
     from arm_arithmetic import float64_held
     from packed_experts import packed_banks
     from reference_error import assert_as_exact
@@ -432,17 +435,18 @@ def test_experts_served_from_packed_banks_are_on_par_with_their_values_dense():
     packed = {QUANTIZATION: {name: {"kernel": bank} for name, (bank, _) in banks.items()}}
 
     def layer(dtype):
-        return ExpertMLP(num_experts=experts, hidden_features=hidden, out_features=width, dtype=dtype)
+        return ExpertMLP(num_experts=experts, hidden_features=hidden, out_features=width, dtype=dtype,
+                         scale_inputs=scale_inputs)
 
     def draw(seed: int):
-        streams = jax.random.split(jax.random.key(seed), 2)
+        streams = jax.random.split(jax.random.key(seed), 3)
         x = jax.random.normal(streams[0], (tokens, width), jnp.bfloat16)
         indices = jax.random.randint(streams[1], (tokens, top_k), 0, experts)
-        return x, jnp.full((tokens, top_k), 1.0 / top_k, jnp.float32), indices
+        return x, jax.random.uniform(streams[2], (tokens, top_k), jnp.float32, 0.25, 1.0), indices
 
     assert_as_exact(jax.jit(lambda *inputs: layer(None).apply(packed, *inputs)),
                     jax.jit(lambda *inputs: layer(jnp.bfloat16).apply(dense, *inputs)), draw,
-                    "packed experts", seeds=8,
+                    f"packed experts{', inputs scaled' if scale_inputs else ''}", seeds=8,
                     truth_fn=lambda *inputs: layer(None).apply(float64_held(dense), *inputs))
 
 
@@ -506,44 +510,66 @@ def test_a_runs_stacked_packed_banks_decode_as_each_layers_bank_does():
                                   np.stack([values for _, values in layers]))
 
 
-def test_a_layers_paired_and_scaled_expert_products_read_their_rows_and_layer_in_place():
-    """A stack's layer's gate and up projections pair at that layer (`paired_projections`: one product,
-    `gemm.gemm`'s `paired` at its `layer`), and a scaled stream's rows (`Gathered.scales`, Llama 4's scaled
-    input) are read where they lie and scaled in the product's prologue (its `gather` and `prologue`), no
-    copy of them gathered or scaled first, nor of the layer's matrices sliced out: the one grouped call the
-    pair makes, each time it is weighed (`grouped_matmul.weighed`), takes the whole stacks, the layer's
-    offset, the rows' indices and a prologue, and each product is the values of its rows gathered and
-    scaled, its layer's matrices sliced, multiplied apart, bit for bit (row 12306)."""
+def test_a_layers_paired_and_scaled_expert_products_are_one_launch_as_exact_as_apart():
+    """A stack's layer's gate and up projections over a scaled stream (`Gathered.scales`, Llama 4's scaled
+    input) are, on an H100's routes, one paired launch (`paired_projections`) taking both whole stacks, the
+    layer's offset into them, the rows' table and the scale in its prologue: no copy of the rows gathered or
+    scaled, nor of the layer's matrices sliced (`grouped_matmul.weighed`, its route the template's). Its
+    outputs and its gradients of the tokens, both stacks and the scales are as exact as the products of the
+    rows gathered and scaled and the layer's matrices sliced, each multiplied apart, both from float64
+    truth (check 1; row 12306). The kernels run interpreted on this CPU, as the H100's."""
+    from reference_error import assert_as_exact, with_gradients
+
     from dew.nn import moe
-    from dew.nn.kernels import grouped_matmul
+    from dew.nn.kernels import generation, grouped_matmul
 
-    keys = jax.random.split(jax.random.key(12306), 4)
-    tokens = jax.random.normal(keys[0], (6, 8), jnp.float32)
-    stacks = [jax.random.normal(key, (2, 3, 8, 4), jnp.float32) for key in keys[1:3]]
-    rows = jnp.asarray([0, 3, 1, 5, 2, 2, 4, 0], jnp.int32)
-    scales = jax.random.uniform(keys[3], (8,), jnp.float32, 0.5, 1.5)
-    sizes = jnp.asarray([3, 2, 3], jnp.int32)
-    stream = moe.Gathered(tokens, rows, jnp.arange(8, dtype=jnp.int32), scales)
-    # One index for both stacks, as a scanned iteration hands its layer (`moe.at_iteration`).
-    layer = jnp.asarray(1, jnp.int32)
+    layers, experts, depth, width, tokens, top_k = 2, 2, 128, 256, 68, 2
+    slots = tokens * top_k
+    sizes = jnp.asarray([70, 66], jnp.int32)
+    order = np.random.default_rng(12306).permutation(slots).astype(np.int32)
+    rows, where = jnp.asarray(order // top_k), jnp.arange(slots, dtype=jnp.int32)
 
-    with grouped_matmul.weighed() as calls:
-        gate, up = moe.paired_projections(stream, *(moe.Layered(stack, layer) for stack in stacks), sizes,
-                                          jnp.float32, "auto", None)
-    bound = [next(iter(call.bound.values()))[1].arguments for call, _ in calls]
-    assert bound
-    # The pair as the projections hand it: both whole stacks at the layer's offset over the rows where they
-    # lie, scaled in its prologue. A target no launch of a pair takes runs its products apart (`gemm`'s
-    # `APART`), each still the whole stack at the offset: no call takes a layer's matrices sliced.
-    paired = [arguments for arguments in bound if arguments["paired"] is not None]
-    assert paired, bound
-    for arguments in paired:
-        assert arguments["kernel"].shape == (6, 8, 4) and arguments["paired"].shape == (6, 8, 4)
-        assert arguments["first"] is not None and arguments["gather"].shape == rows.shape
-        assert arguments["tokens"].shape == tokens.shape and arguments["hooks"].prologue is not None
-    assert all(arguments["kernel"].shape == (6, 8, 4) and arguments["first"] is not None
-               for arguments in bound)
-    apart = [moe.expert_projection(moe.gathered(stream), stack[1], sizes, jnp.float32, "auto", None)
-             for stack in stacks]
-    np.testing.assert_array_equal(np.asarray(gate), np.asarray(apart[0]))
-    np.testing.assert_array_equal(np.asarray(up), np.asarray(apart[1]))
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(rng.normal(size=(tokens, depth)), jnp.bfloat16),
+                *(jnp.asarray(rng.normal(size=(layers, experts, depth, width)) / 8, jnp.bfloat16)
+                  for _ in range(2)),
+                jnp.asarray(rng.uniform(0.25, 1.0, size=slots), jnp.float32),
+                tuple(jnp.asarray(rng.normal(size=(slots, width)), jnp.bfloat16) for _ in range(2)))
+
+    def dew(x, gate, up, scales):
+        layer = jnp.asarray(1, jnp.int32)
+        return moe.paired_projections(moe.Gathered(x, rows, where, scales), moe.Layered(gate, layer),
+                                      moe.Layered(up, layer), sizes, jnp.bfloat16, "auto", None)
+
+    def plain(x, gate, up, scales, wide=jnp.float32, out=jnp.bfloat16):
+        # The rows scaled as the prologue scales them, in the products' dtype; float64 truth rounds nothing.
+        scaled = (x[rows] * scales.astype(x.dtype)[:, None] if wide == jnp.float32
+                  else x[rows].astype(wide) * scales.astype(wide)[:, None]).astype(wide)
+
+        def projected(stack):
+            return jnp.concatenate([scaled[:70] @ stack[1, 0].astype(wide),
+                                    scaled[70:] @ stack[1, 1].astype(wide)]).astype(out)
+        return projected(gate), projected(up)
+
+    def valued(f):
+        """`f` of the drawn inputs but the cotangent."""
+        return lambda x, gate, up, scales, cotangent: f(x, gate, up, scales)
+
+    truth = functools.partial(plain, wide=jnp.float64, out=jnp.float64)
+    with generation.assumed("sm90", interpreted=True), generation.chosen(grouped_matmul="mosaic"):
+        with grouped_matmul.weighed() as calls:
+            jax.eval_shape(dew, *draw(0)[:4])
+        paired = [(next(iter(call.bound.values()))[1].arguments, kernel) for call, kernel in calls
+                  if next(iter(call.bound.values()))[1].arguments["paired"] is not None]
+        assert paired, [kernel for _, kernel in calls]
+        for arguments, kernel in paired:
+            assert kernel == "mosaic", kernel
+            assert arguments["kernel"].shape == arguments["paired"].shape == (layers * experts, depth, width)
+            assert arguments["first"] is not None and arguments["gather"].shape == (slots,)
+            assert arguments["tokens"].shape == (tokens, depth) and arguments["hooks"].prologue is not None
+        label = "a layer's paired experts over scaled rows"
+        assert_as_exact(jax.jit(valued(dew)), jax.jit(valued(plain)), draw, label, seeds=8,
+                        truth_fn=valued(truth))
+        assert_as_exact(jax.jit(with_gradients(dew)), jax.jit(with_gradients(plain)), draw,
+                        f"{label}, gradients", seeds=8, truth_fn=with_gradients(truth))

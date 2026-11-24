@@ -675,16 +675,18 @@ def gathered(x: jax.Array | Gathered) -> jax.Array:
     return rows if x.scales is None else rows * x.scales[:, None].astype(rows.dtype)
 
 
-def _streamed(x: jax.Array | Gathered, compute) -> tuple[jax.Array, jax.Array | None, dict]:
+def _streamed(x: jax.Array | Gathered, compute, *, hooked: bool = True
+              ) -> tuple[jax.Array, jax.Array | None, dict]:
     """What a projection of `x` hands the GEMM template: its tokens, the rows it gathers of them (None for
     rows taken whole), and the prologue that scales the rows so read (`Gathered.scales`), formed in the
     compute dtype as `gathered` forms them in the tokens', the same arithmetic where the two are one. Rows
-    of tokens in another dtype are gathered and scaled in theirs, then rounded once to the product's."""
+    of tokens in another dtype, or for a product that takes no prologue (not `hooked`: a packed matrix's,
+    `gemm._packed_gemm`), are gathered and scaled in theirs, then rounded once to the product's."""
     if not isinstance(x, Gathered):
         return x, None, {}
     if x.scales is None:
         return x.tokens, x.rows, {}
-    if x.tokens.dtype != compute:
+    if x.tokens.dtype != compute or not hooked:
         return gathered(x), None, {}
     return x.tokens, x.rows, {'prologue': _scaled,
                               'prologue_operands': ((x.scales.astype(x.tokens.dtype), ('rows',)),)}
@@ -752,7 +754,7 @@ def expert_projection(x: jax.Array | Gathered, kernel: jax.Array | formats.NvFp4
     if recipe is not None:
         return recipe if scatter is None else jnp.zeros_like(recipe).at[scatter].set(recipe,
                                                                                     unique_indices=True)
-    tokens, rows, prologue = _streamed(x, compute)
+    tokens, rows, prologue = _streamed(x, compute, hooked=not packed)
     with _named(implementation):
         return gemm.gemm(tokens, stack, group_sizes, compute=compute, out_dtype=compute, precision=precision,
                          layer=layer, gather=rows, scatter=scatter, **prologue, **_biased(bias, compute))
@@ -783,17 +785,19 @@ def paired_projections(x: jax.Array | Gathered, first: jax.Array | Layered, seco
     (`grouped_matmul._takes_pair`), each under `expert_projection`'s law. On an H100 the pair took 0.79
     to 1.0 of the two products' time at the routings of DeepSeek-V3, Qwen3-30B-A3B and GPT-OSS-20B, its
     outputs theirs bit for bit (FS-3699-PAIRED2-h100, ledger 3699). Both products take one compute dtype,
-    the rows' and both matrices' however a matrix is held; two stacks' one layer (`Layered`, `at_iteration`'s
-    index) pair at that layer, read in place. `Gathered` rows are read and scaled where they lie, as
-    `expert_projection` reads them."""
-    (first_stack, layer), (second_stack, second_layer) = (
+    the rows' and both matrices' however a matrix is held; two stacks' layer (`Layered`) pair at it, read in
+    place: an iteration's (`at_iteration`) or a bank's run's index, one for every kernel its layer reads,
+    which a derivative's span hands on as one tracer a kernel (`derivatives.span`), so the pair takes the
+    first's. `Gathered` rows are read and scaled where they lie, as `expert_projection` reads them."""
+    (first_stack, layer), (second_stack, _) = (
         (kernel.stack, kernel.layer) if isinstance(kernel, Layered) else (kernel, None)
         for kernel in (first, second))
     compute = canonicalize_dtype(x.tokens if isinstance(x, Gathered) else x, _held(first_stack),
                                  _held(second_stack), dtype=dtype)
-    if (layer is not second_layer or isinstance(first_stack, formats.NvFp4)
-            or isinstance(second_stack, formats.NvFp4) or _recipe_takes_experts(first_stack)):
-        # Matrices of two layers (or a stack's beside a matrix), a packed bank (its product the NVFP4 one,
+    if (isinstance(first, Layered) is not isinstance(second, Layered)
+            or isinstance(first_stack, formats.NvFp4) or isinstance(second_stack, formats.NvFp4)
+            or _recipe_takes_experts(first_stack)):
+        # A stack's layer beside a matrix, a packed bank (its product the NVFP4 one,
         # which pairs with none), or a run's low-precision recipe that takes the experts (`recipe_refusal`),
         # take each product apart (`expert_projection`); experts the recipe leaves pair as without one.
         return (expert_projection(x, first, group_sizes, compute, implementation, precision),
