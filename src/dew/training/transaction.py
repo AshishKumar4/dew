@@ -2033,9 +2033,11 @@ class Transaction:
         return run
 
 
-_PASSED = frozenset({"sharding_constraint", "optimization_barrier", "copy"})
+_PASSED = frozenset({"sharding_constraint", "optimization_barrier", "copy", "reshape", "squeeze",
+                     "expand_dims", "transpose", "convert_element_type"})
 """The primitives whose results are their operands one for one, placed (a sharding constraint), held from
-fusion (a barrier) or copied, which a run's variables pass through as themselves (`_run_reads`)."""
+fusion (a barrier), copied, laid out anew (a stage-local stack's layers reshaped to a run's) or cast,
+which a run's variables pass through as themselves (`_run_reads`)."""
 
 
 def _run_reads(program: jcore.Jaxpr, roots: Mapping[jcore.Var, tuple[str, ...]],
@@ -2056,8 +2058,8 @@ def _run_reads(program: jcore.Jaxpr, roots: Mapping[jcore.Var, tuple[str, ...]],
             continue
         if equation.primitive.name in _PASSED:
             # Each result its operand, placed or held apart: still the run's.
-            held.update({value: held[given] for value, given in zip(equation.outvars, equation.invars,
-                                                                    strict=True)
+            held.update({value: held[given]
+                         for value, given in zip(equation.outvars, equation.invars, strict=False)
                          if computed(given) and given in held})
             continue
         body = called(equation)

@@ -645,6 +645,7 @@ class _Repeated(LMObjective):
         def scored(carry, _):
             return carry, LMObjective.loss(self, variables, batch, step)
         _, (stats, aux) = jax.lax.scan(scored, None, None, length=2)
+        assert isinstance(stats, Ratio), type(stats)
         return (Ratio(jnp.sum(stats.total), jnp.sum(stats.mass)), jax.tree.map(lambda leaf: leaf[0], aux))
 
 
