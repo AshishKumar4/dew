@@ -191,21 +191,25 @@ def _named(kernel: str, parts: tuple) -> str:
     return kernel + "_" + "_".join(f"{width}{'n' if head else ''}" for width, head in parts)
 
 
-@tuning.lowered_once(("parts", "activation", "eps", "dtype", "family", "interpret"))
+@tuning.lowered_once(("parts", "activation", "eps", "dtype", "family", "interpret", "firsts"))
 def forward(x, taps, bias, valid, documents, *, parts: tuple, activation: bool, eps: float, dtype,
-            family: mosaic.Family, interpret: bool = False):
-    """Every piece's output in one launch, `[B, T, width]` each of `parts` (each `(width, head)` in channel
-    order): `x`'s channels convolved by `taps` `[C, K]` plus `bias`, activated and, a piece with a `head`,
-    l2-normalised over each head, each program's channels its piece's (`lanes`). Lowered once a configuration
-    (`tuning.lowered_once`): a model's layers' identical convs were each lowered again (two Mamba layers six
-    Mosaic calls to one's four, jsf-r06p). A launch a piece, a decode token's conv took three, 10.1 us on an
-    H100 against the Triton conv's one at 4.8 (M-JS-25)."""
+            family: mosaic.Family, interpret: bool = False, firsts: tuple | None = None):
+    """Every piece's output in one launch, `[B, T, width]` each of `parts` (each `(width, head)`, each at its
+    of `firsts`' channels of `x`, else in channel order from the first): `x`'s channels convolved by `taps`
+    `[C, K]` plus `bias`, activated and, a piece with a `head`, l2-normalised over each head, each program's
+    channels its piece's (`lanes`); a launch of some of a conv's pieces (`firsts`,
+    `short_conv._through_norms`) reads them where they lie, no slice of `x` copied. Lowered once a
+    configuration (`tuning.lowered_once`): a model's layers' identical convs were each lowered again (two
+    Mamba layers six Mosaic calls to one's four, jsf-r06p). A launch a piece, a decode token's conv took
+    three, 10.1 us on an H100 against the Triton conv's one at 4.8 (M-JS-25)."""
     rows, length, _ = x.shape
     count, tokens, lanes_ = taps.shape[1], _tokens(length), lanes(parts, x.dtype)
     unrolled = _unrolled(tokens)
     operands = [x, taps.T, bias, valid, documents]
-    bounds = [(first // lanes_, (first + width) // lanes_, first, head)
-              for first, width, head in pieces(parts)]
+    # Each piece's programs in the launch's order and its first channel in `x`.
+    placed = [first for first, _, _ in pieces(parts)] if firsts is None else list(firsts)
+    bounds = [(at // lanes_, (at + width) // lanes_, first, head)
+              for (at, width, head), first in zip(pieces(parts), placed, strict=True)]
 
     def walk(piece: _Piece, out_ref, exchanged, head: int | None):
         group = _group(head, lanes_)
@@ -241,7 +245,7 @@ def forward(x, taps, bias, valid, documents, *, parts: tuple, activation: bool, 
     # Each piece's rows and tokens `x`'s, its width its own (a share of the channels the config sets).
     out_type = tuple(outputs.output(dtype, outputs.axis(x, 0), outputs.axis(x, 1), width)
                      for width, _ in parts)
-    grid = (rows, pl.cdiv(length, tokens), x.shape[-1] // lanes_)
+    grid = (rows, pl.cdiv(length, tokens), sum(width for width, _ in parts) // lanes_)
     launched = mosaic.kernel(entry, out_type=out_type, grid=grid,
                              grid_names=("rows", "tokens", "channels"), warpgroups=1, interpret=interpret,
                              family=family.name, compiled=mosaic.compiler_params(),
@@ -249,22 +253,19 @@ def forward(x, taps, bias, valid, documents, *, parts: tuple, activation: bool, 
     return tuple(launched(*(operand for operand in operands if operand is not None)))
 
 
-def backward(x, taps, bias, valid, documents, dys, *, parts: tuple, activation: bool,
-             family: mosaic.Family, interpret: bool = False):
-    """Every piece's gradients in one launch: the input's gradient `[B, T, C]` in `x`'s dtype, each program's
-    channels its piece's (`parts`, each `(width, None)` in channel order: no piece normalised, a norm's
-    transpose its caller's, `short_conv._through_norms`; `dys` their output gradients, any dtype), and
-    the tap and bias gradients `[K, C]` and `[C]` fp32 (the bias's zero without one), each program walking its
-    row's span of tokens (`span`) on the device the launch runs (the interpreted one's facts where
-    `interpret`). A launch a piece wrote its piece's input gradient apart, which XLA joined: 0.66 of an A100's
-    2.65 ms conv training step at Qwen3.5-0.8B's widths (M-JS-18)."""
-    if any(head is not None for _, head in parts):
-        raise ValueError(f"the conv's backward walks no normalised piece: {parts}")
-    rows, length, _ = x.shape
+def backward(x, taps, bias, valid, documents, dy, *, activation: bool, family: mosaic.Family,
+             interpret: bool = False):
+    """The conv's gradients in one launch, every channel unnormalised (a normalised piece's norm's transpose
+    its caller's, `short_conv._through_norms`): the input's gradient `[B, T, C]` in `x`'s dtype from the
+    output's `dy` `[B, T, C]` (any dtype), and the tap and bias gradients `[K, C]` and `[C]` fp32 (the bias's
+    zero without one), each program walking its row's span of tokens (`span`) on the device the launch runs
+    (the interpreted one's facts where `interpret`). A launch a piece wrote its piece's input gradient apart,
+    which XLA joined: 0.66 of an A100's 2.65 ms conv training step at Qwen3.5-0.8B's widths (M-JS-18)."""
+    rows, length, channels = x.shape
     target = generation.interpreted_target() if interpret else generation.gpu_target()
-    return _backward(x, taps, bias, valid, documents, dys, parts=parts, activation=activation,
-                     family=family, interpret=interpret,
-                     tokens=span(length, rows, x.shape[-1] // lanes(parts, x.dtype), target))
+    return _backward(x, taps, bias, valid, documents, dy, activation=activation, family=family,
+                     interpret=interpret,
+                     tokens=span(length, rows, channels // lanes(((channels, None),), x.dtype), target))
 
 
 def span(length: int, rows: int, programs: int, target: generation.GpuTarget) -> int:
@@ -283,30 +284,24 @@ def span(length: int, rows: int, programs: int, target: generation.GpuTarget) ->
     return -(-blocks // spans) * tokens
 
 
-@tuning.lowered_once(("parts", "activation", "family", "interpret", "tokens"))
-def _backward(x, taps, bias, valid, documents, dys, *, parts: tuple, activation: bool,
-              family: mosaic.Family, interpret: bool, tokens: int):
-    """`backward`'s launch, each program walking `tokens` of its row. Lowered once a configuration
-    (`tuning.lowered_once`), as a model's layers' identical convs share it."""
+@tuning.lowered_once(("activation", "family", "interpret", "tokens"))
+def _backward(x, taps, bias, valid, documents, dy, *, activation: bool, family: mosaic.Family,
+              interpret: bool, tokens: int):
+    """`backward`'s launch, each program walking `tokens` of its row, its walk emitted once. Lowered once a
+    configuration (`tuning.lowered_once`), as a model's layers' identical convs share it."""
     rows, length, channels = x.shape
-    count, lanes_ = taps.shape[1], lanes(parts, x.dtype)
+    count, lanes_ = taps.shape[1], lanes(((channels, None),), x.dtype)
     blocks = pl.cdiv(length, tokens)
     operands = [x, taps.T, bias, valid, documents]
-    bounds = [(first // lanes_, (first + width) // lanes_, first) for first, width, _ in pieces(parts)]
 
     def entry(*refs):
-        *given, dx_ref, dw_ref, db_ref = refs
-        given, dy_refs = given[:-len(dys)], given[-len(dys):]
+        *given, dy_ref, dx_ref, dw_ref, db_ref = refs
         given = iter(given)
         found = [next(given) if operand is not None else None for operand in operands]
-        program = lax.axis_index("channels")
-        for (lo, hi, first), dy_ref in zip(bounds, dy_refs, strict=True):
-            @pl.when((program >= lo) & (program < hi))
-            def _(lo=lo, first=first, dy_ref=dy_ref):
-                piece = _Piece(found, first=first, local=(program - lo) * lanes_, length=length,
-                               count=count, tokens=tokens, lanes_=lanes_)
-                _backward_walk(piece, dy_ref, (dx_ref, dw_ref, db_ref), activation=activation,
-                               tokens=tokens, family=family)
+        local = lax.axis_index("channels") * lanes_
+        piece = _Piece(found, first=0, local=local, length=length, count=count, tokens=tokens, lanes_=lanes_)
+        _backward_walk(piece, dy_ref, (dx_ref, dw_ref, db_ref), activation=activation, tokens=tokens,
+                       family=family)
 
     # The input's gradient `x`'s axes; the taps' and bias's partials a program's rows by its token spans
     # (`x`'s tokens over `tokens`), the taps' count and the channels.
@@ -317,8 +312,8 @@ def _backward(x, taps, bias, valid, documents, dys, *, parts: tuple, activation:
     launched = mosaic.kernel(entry, out_type=out_type, grid=(rows, blocks, channels // lanes_),
                              grid_names=("rows", "tokens", "channels"), warpgroups=1, interpret=interpret,
                              family=family.name, compiled=mosaic.compiler_params(),
-                             name=_named("short_conv_backward", parts))
-    dx, dw, db = launched(*(operand for operand in operands if operand is not None), *dys)
+                             name=_named("short_conv_backward", ((channels, None),)))
+    dx, dw, db = launched(*(operand for operand in operands if operand is not None), dy)
     # The bias's partials summed in one rounding, the one rule of a conv's bias (`short_conv.conv_bias`).
     return dx, jnp.sum(dw, axis=(0, 1)), compensated_sum(db, (0, 1))
 
