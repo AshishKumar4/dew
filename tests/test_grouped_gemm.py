@@ -2260,6 +2260,18 @@ def test_sm100_pair_tiles_refuse_depth_splits_in_legal_and_derivation():
             fam, dataclasses.replace(t64, programs=3), jnp.bfloat16, target=sm100, stream_blocks=scales)
 
 
+def test_the_planner_prices_mma_syncs_row_bound_where_its_grouped_kernel_issues_it():
+    """A one-consumer grouped mma.sync tile, whose products take a row bound, is priced its issuer's own
+    registers for it (`MmaIssuer.bound_registers`); a dense call, whose products take none, none (row 12304).
+    """
+    tile = tiling.Tiles(128, 128, 32, 3, 1, warpgroups=1, family="mma.sync")
+    with generation.assumed("sm80"):
+        family = pricing.family_of(tile, jnp.bfloat16)
+        priced = {dense: pricing.bounded_registers(family, tile, jnp.bfloat16, dense=dense, staged_rows=False)
+                  for dense in (False, True)}
+    assert family.bound_registers > 0 and priced == {False: family.bound_registers, True: 0}, priced
+
+
 @INTERPRETS
 def test_mma_sync_grouped_gemm_suppresses_ragged_rows_via_bounded():
     """One-consumer `mma.sync` grouped tiles (`tiles.sharing == 1`) bind `group.actual_end - row_start` onto
@@ -2285,13 +2297,6 @@ def test_mma_sync_grouped_gemm_suppresses_ragged_rows_via_bounded():
         len(eq.invars) == 4 and eq.invars[3].aval.dtype == jnp.int32 and eq.invars[3].aval.shape == ()
         for eq in grouped_mmas), grouped_mmas
     assert dense_mmas and all(len(eq.invars) == 3 for eq in dense_mmas), dense_mmas
-    # The planner prices the bound where the kernel issues it, by the issuer's own cost, none where dense (row
-    # 12304).
-    with generation.assumed("sm80"):
-        family = pricing.family_of(tile_128, jnp.bfloat16)
-        priced = {dense: pricing.bounded_registers(family, tile_128, jnp.bfloat16, dense=dense,
-                                                   staged_rows=False) for dense in (False, True)}
-    assert priced == {False: family.bound_registers, True: 0} and family.bound_registers > 0, priced
 
     # Verify the typed mma_p row bound derives from group metadata (`actual_end - row_start`, clipped), not a
     # constant (rows 5623, 7091).
