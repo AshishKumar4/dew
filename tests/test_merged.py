@@ -327,7 +327,7 @@ def _mosaic_served(name: str):
 
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("cases", ["widths-narrow", "widths-wide", "shapes-finished", "shapes-resumed",
-                                   "shapes-long"])
+                                   "shapes-long-64", "shapes-long-256"])
 @pytest.mark.parametrize("name", ["sm80", "sm90", "sm100"])
 def test_a_padded_merge_compiles_as_one_launch(name, cases):
     """The padded merge's one Mosaic GPU launch (`merged_mosaic.launch`, row 9795) compiles spill-free for
@@ -385,8 +385,10 @@ def test_a_padded_merge_compiles_as_one_launch(name, cases):
                        lambda: (finished_with_initial(2, 16, jnp.float32, 2),
                                 (small_p, small_s, small_m, small_m, small_a))),
         ],
-        # The resumed shape a case of its own: beside it, a Blackwell's long shapes took 151 s (row 12698).
-        "shapes-long": [one_case(f"slices-{slices}", slices=slices, width=128) for slices in (64, 256)],
+        # Each long split and the resumed shape a case of its own: together a Blackwell's took 151 s, and the
+        # two long splits 145 s (row 12698).
+        **{f"shapes-long-{slices}": [one_case(f"slices-{slices}", slices=slices, width=128)]
+           for slices in (64, 256)},
     }
     with generation.assumed(name), _mosaic_served(name):
         records = compile_mosaic_kernels(named[cases], name)
