@@ -332,6 +332,9 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
     (`attention_decode`), whose walk the memory bounds."""
     per_span: int = 1
     """The queries each of the spans' intervals holds (`KeySpans.per_span`)."""
+    runs: int = 1
+    """The key runs each query of a spans call sees the union of (`KeySpans.start`'s last axis where it has
+    one: R of `[B, Q, R]`), each further run's bounds a walk holds across its loop (`ForwardRegisters.runs`)."""
 
     @property
     def score_types(self) -> tuple:
@@ -1378,6 +1381,7 @@ class MosaicForward(_Mainloop[Tiles]):
                                 self._scales(table, sources, scales, computed), codes=scales is not None,
                                 positions=math.ceil(query.shape[1] / self.per_span)
                                 if self.form == "spans" and self.per_span > 1 else 0, per_span=self.per_span,
+                                runs=self.runs,
                                 merged=initial is not None and residuals is not Kept.SPLIT,
                                 started=initial is not None and residuals is Kept.SPLIT,
                                 dropped=drop is not None,
@@ -1663,6 +1667,7 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                        scale=logit_scale(query.shape[3], scale), natural=natural,
                        out_dtype=None if out_dtype is None else jnp.dtype(out_dtype).name, masked=masked,
                        splits=splits, subtracted=subtracted, per_span=spans.per_span,
+                       runs=spans.start.shape[-1] if spans.start.ndim == 3 else 1,
                        parts=parts, rounds=hooks.rounds, scaled=scaled, bounded=bounded, in_key=in_key,
                        query_mod=hooks.query_mod,
                        query_kinds=tuple(param.kind for param in hooks.query_params),
