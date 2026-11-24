@@ -239,8 +239,14 @@ def staged(smem, value: jax.Array, ref, place: tuple, *, write: Callable = writt
             raise ValueError("a scattered output's rows land a row at a time as computed, none packed")
     elif transposed:
         _whole_shares(smem.shape[-1], width, ref.shape[-1], first, stored)
-    if divisor > 1 and not transposed:
+    elif divisor > 1:
         _aligned_ladder(width * jax.dtypes.itemsize_bits(smem.dtype) // 8, first, ladder)
+        if (ladder[1] if len(ladder) > 1 else 1) == 1 and ref.shape[-1] % width:
+            # A rung of one row is one contiguous run, which Mosaic GPU copies by a linear bulk copy clamped
+            # at the whole tensor's end, not its row's (`launch_context.async_copy`): a last chunk past the
+            # row's end would write into the next row.
+            raise ValueError(f"a packed chunk of {width} columns copied a row at a time over "
+                             f"{ref.shape[-1]} columns runs its last chunk into the next row")
     chunks = column_chunks(value, width * divisor)
     waits = buffer_waits(len(chunks), buffers) if waits is None else waits
     for chunk, (start, piece) in enumerate(chunks):
