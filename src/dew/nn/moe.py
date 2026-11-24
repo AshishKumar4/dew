@@ -817,7 +817,11 @@ def gated_experts(x: jax.Array | Gathered, gate: jax.Array | Layered, up: jax.Ar
     `Residual.UP_PROJ`); the down projection's prologue that gated product of the kept roundings, the
     epilogue's output its formed value (`gemm.gemm`'s `applied`). So neither backward recomputes the pair: the
     paired product's reads its kept roundings, the down projection's its prologue's operands, which a policy
-    saving the two names keeps. Where the pair runs apart (`paired_projections`) or the down projection takes
+    saving the two names keeps. The gated product's gradient is `gated_hook`'s portable one (its activation
+    rounded to the compute dtype, as `GatedMLP`'s fused products take it), check 1 against float64 and bitwise
+    the unfused hook's; a dense layer's standalone `norm_swiglu` launch multiplies by the unrounded fp32
+    activation, a bf16 ulp apart where they differ. Where the pair runs apart (`paired_projections`) or the
+    down projection takes
     no prologue (a packed bank's NVFP4 product, a run's recipe that takes the experts, `expert_projection`)
     or the activation is a `Situ` (no hook's arithmetic), each projection runs on its own and the gated
     product between them (`gated_product`), as before. Every arm's output the compute dtype's. `scatter`,
