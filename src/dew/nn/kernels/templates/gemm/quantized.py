@@ -318,9 +318,10 @@ def outputs(part: tuple[int, int], dtypes: tuple, forms: tuple) -> tuple:
                  for dtype, form in zip(dtypes, _formed(forms), strict=True))
 
 
-def declared(dtype, form: Form, rows: int, columns: int) -> jax.ShapeDtypeStruct:
+def declared(dtype, form: Form | tuple, rows: int, columns: int) -> jax.ShapeDtypeStruct:
     """An output a form stores (`forms_of`) as its call declares it: one value a row each `divisor` of
     `columns`, `[columns // divisor, rows]` where transposed, `[rows, columns // divisor]` otherwise."""
+    form = Form(*form)
     if columns % form.divisor:
         raise ValueError(f"{columns} columns hold no whole {form.divisor}-column blocks")
     stored_columns = columns // form.divisor
@@ -384,13 +385,14 @@ def forms_refusal(out_forms: tuple | None, config, *, dense: bool) -> str | None
     return None
 
 
-def stored(value: jax.Array, form: Form | None) -> jax.Array:
+def stored(value: jax.Array, form: Form | tuple | None) -> jax.Array:
     """`value` (`[rows, columns]`, an epilogue's output) as its call stores it (`declared`): itself for a
     tile; two codes a byte where `form` packs it (`_pairs`); else a block's first column each block (its
     value broadcast across its block), `[columns // divisor, rows]` where transposed: XLA's form of a form's
     store."""
     if form is None:
         return value
+    form = Form(*form)
     if form.packed:
         return _pairs(value)
     blocks = value[:, ::form.divisor]
