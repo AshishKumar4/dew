@@ -2049,8 +2049,8 @@ def value_shift(dout: jax.Array, value: jax.Array, hooks: Hooks) -> jax.Array:
     wherever `sum_d max|dO_d| max|V_d|` over that row and head (the largest `|dP|` and `|D|` it can form, its
     channels' maxima paired, an initial state's mean among the values) stays under fp32's `2^127`, else the
     binades it passes by, so `dP = dO V^T`, `D = dO . O` and their difference form finite; a row's own, so
-    one past the format takes no other's small values beneath it, equal only along the axes a score hook's
-    parameter is shared across.
+    one past the format takes no other's small values beneath it, whatever hook parameters the rows share (a
+    launch summing a shared one's gradient across rows restores each row's part first, `restore_factors`).
     Within a row and head the shift is its keys' and queries' together: a query of small values beside a
     key at the format's edge is taken beneath it too (row 12452). Its sum taken at each factor's own largest
     binade, finite whatever their product."""
@@ -2071,15 +2071,6 @@ def value_shift(dout: jax.Array, value: jax.Array, hooks: Hooks) -> jax.Array:
     lead_o, lead_v = binade_of(jnp.max(cotangents, axis=-1)), binade_of(jnp.max(values, axis=-1))
     held = jnp.sum(power2(cotangents, -lead_o[..., None]) * power2(values, -lead_v[..., None]), axis=-1)
     shift = jnp.maximum(binade_of(held) + lead_o + lead_v - 126, 0)
-    # Equal along each axis a score hook's parameter is shared across, whose gradient a launch may sum
-    # across it before it is raised (`shared_place`): a head's parameter across the batch rows, another's
-    # across those of its leading two axes of extent one.
-    for param in hooks.score_params:
-        shape = param.value.shape
-        if param.kind == Kind.HEAD or (shape[0] == 1 and batch > 1):
-            shift = jnp.broadcast_to(jnp.max(shift, axis=0, keepdims=True), shift.shape)
-        if param.kind != Kind.HEAD and len(shape) > 1 and shape[1] == 1 and heads > 1:
-            shift = jnp.broadcast_to(jnp.max(shift, axis=1, keepdims=True), shift.shape)
     return jax.lax.stop_gradient(shift).astype(jnp.int32)
 
 
@@ -2089,15 +2080,27 @@ def shifted(x: jax.Array, shift: jax.Array) -> jax.Array:
     return jnp.where(shift == 0, x, power2(x, shift).astype(x.dtype))
 
 
+def restore_factors(dout: jax.Array, value: jax.Array, hooks: Hooks) -> jax.Array:
+    """Each batch row's and query head's shift (`value_shift`) as the factors a launch restores a part of a
+    hook's gradient by before it sums it across rows into a parameter they share, `[B, H, 3]` fp32: `2^a`,
+    `2^b` (`a + b` the shift, each within fp32) and 1 where the shift is 0, its part then kept as it is (a
+    product by 1 flushes a subnormal where a GPU flushes them)."""
+    shift = value_shift(dout, value, hooks)
+    shift = jnp.repeat(shift, dout.shape[2] // shift.shape[1], axis=1)
+    half = shift // 2
+    return jnp.stack([power2(jnp.ones(shift.shape, jnp.float32), half),
+                      power2(jnp.ones(shift.shape, jnp.float32), shift - half),
+                      (shift == 0).astype(jnp.float32)], axis=-1)
+
+
 def hook_restored(grad: jax.Array, shift: jax.Array, kind: Kind) -> jax.Array:
     """A score hook's parameter gradient as a launch returns it, raised by its rows' and heads' shift `[B,
-    H]` (`beneath_shift`) before any sum across them: a head's laid `[., B, H, 1]`, another's `[B, H, ...]`;
-    an axis a launch summed already (extent one) at its shift, equal along it (`value_shift`)."""
+    H]` (`beneath_shift`) before `gradients` sums it across them: a head's laid `[., B, H, 1]`, another's
+    `[B, H, ...]`. One a launch summed across its rows or heads already (an axis of extent one) the launch
+    restored a part at a time (`restore_factors`), as it is."""
     rows, heads = (1, 2) if kind == Kind.HEAD else (0, 1)
-    if grad.shape[rows] != shift.shape[0]:
-        shift = jnp.max(shift, axis=0, keepdims=True)
-    if grad.shape[heads] != shift.shape[1]:
-        shift = jnp.max(shift, axis=1, keepdims=True)
+    if grad.shape[rows] != shift.shape[0] or grad.shape[heads] != shift.shape[1]:
+        return grad
     laid = [1] * grad.ndim
     laid[rows], laid[heads] = shift.shape
     return shifted(grad, shift.reshape(laid))

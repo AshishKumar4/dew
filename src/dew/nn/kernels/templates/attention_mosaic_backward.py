@@ -50,7 +50,7 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
                      score_params, *, score_mod, score_kinds, score_dtypes, scale: float, prescale: float,
                      spec: algebra.Forward, accurate: bool, tiles: BackwardTiles, family: mosaic.Family,
                      interpret: bool, drop: Dropout | None = None, rounded: bool = True,
-                     registered: BackwardRegisters | None = None):
+                     registered: BackwardRegisters | None = None, restore=None):
     """`gradients`' launch on this mainloop: D from the forward's split sums, each query's anchor key as the
     first pass chose it. Two launches: the dQ program's sums, their finish (`gradient.dq_finish`) and the
     dK/dV program under its refined D, whose cotangents sum to 0 where the first pass's do not (a small weight
@@ -67,7 +67,8 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     The query arrives the call's own: its logits are those of the query taken by `prescale` (`by_power`) at
     `scale`, the scale left (`gradients`), which `spec` takes; dK and dV leave fp32 where the caller takes
     them unrounded (`rounded`, `MosaicBackward.rounded`). Each launch states its registers by `registered`
-    (`_Backward.registers`)."""
+    (`_Backward.registers`); the dK/dV launch restores each row's part of a hook gradient it sums across
+    rows by `restore` (`template.restore_factors`)."""
     spec = dataclasses.replace(spec, scale=scale, prescale=prescale)
     width, value_width = query.shape[-1], value.shape[-1]
     _, state_total = gradient.off_anchor_start(peak0, total0, maximum, value_width, shift)
@@ -123,7 +124,7 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
             # The fused launch keys first on its own layout (`BackwardTiles.dkv`): its consumers' shares of a
             # slot's queries each a warpgroup MMA's rows, dQ added a tile at a time.
             dq, dk, dv = _dkv_launch(query, key, value, dout, maximum, forward_total, anchor, delta, chosen,
-                                     dkv_spans, score_params, drop, scaled, walk=dkv_walk)
+                                     dkv_spans, score_params, drop, scaled, walk=dkv_walk, restore=restore)
         else:
             dq, dk, dv = _fused_launch(query, key, value, dout, maximum, forward_total, anchor, delta, chosen,
                                        spans, drop, walk=walk)
@@ -142,7 +143,7 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
         sums, forward_total, state_total, peak0, (total0, initial_term), maximum, anchor, delta,
         accurate=accurate)
     dk, dv, *key_tile = _dkv_launch(query, key, value, dout, maximum, denominator, anchor, refined, chosen,
-                                    dkv_spans, score_params, drop, scaled, walk=dkv_walk)
+                                    dkv_spans, score_params, drop, scaled, walk=dkv_walk, restore=restore)
     summed_kinds = [kind for kind in score_kinds if kind in DQ_GRADS]
     head_query = tuple(grad.sum(axis=-1)[None, :, :, None] if kind == Kind.HEAD else grad
                        for grad, kind in zip(dq_grads, summed_kinds, strict=True))

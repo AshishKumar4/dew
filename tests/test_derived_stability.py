@@ -32,7 +32,12 @@ from reference_error import widened
 from test_recurrence_chunk import chunk_on, token_by_token
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import attention as template, attention_portable, attention_route
+from dew.nn.kernels.templates import (
+    attention as template,
+    attention_mosaic,
+    attention_portable,
+    attention_route,
+)
 
 
 @contextlib.contextmanager
@@ -217,23 +222,41 @@ def test_the_derived_chunk_holds_every_order_at_the_decays_edges(edge, name):
         assert np.isfinite(np.asarray(ours))[finite].all(), f"{name} {edge} {leaf}"
 
 
+def _two_rows(width: int, dtype):
+    """Two batch rows of one query over two keys `K = [0, 1]` (its first channel's), cotangent 2^127: row A's
+    values at fp32's largest, row B's `[0, 2^-120]` in their first channel."""
+    query = jnp.zeros((2, 1, 1, width), dtype)
+    key = jnp.zeros((2, 2, 1, width), dtype).at[:, 1, 0, 0].set(1.0)
+    value = jnp.zeros((2, 2, 1, width), dtype).at[0, :, 0, :].set(2.0 ** 127).at[1, 1, 0, 0].set(2.0 ** -120)
+    return query, key, value, jnp.full((2, 1, 1, width), 2.0 ** 127, dtype)
+
+
+def _biased(shape: tuple[int, ...]) -> template.Hooks:
+    """A tile bias of zeros `shape` (`Kind.TILE`), each row's own where its batch axis is 2, shared at 1."""
+    return template.Hooks(lambda s, q_pos, k_pos, bias: s + bias.astype(s.dtype),
+                          (template.Param(jnp.zeros(shape, jnp.float32), template.Kind.TILE),))
+
+
 def test_a_rows_gradients_take_no_other_rows_shift():
-    """Two batch rows of one query over two zero-logit keys `K = [0, 1]`, cotangent 2^127: row A's values at
-    fp32's largest take its values beneath a shift (`attention.value_shift`), row B's `[0, 2^-120]` none, so
-    its dQ is `2^5` (its weights 1/2, `dS = [-2^5, 2^5]`), unhooked and under a tile bias each row's own,
-    where one shift for the call took its 2^-120 beneath 2^-248 and gave 0."""
+    """Row A's values at fp32's largest take its values beneath a shift (`attention.value_shift`), row B's
+    none (`_two_rows`), so row B's dQ is `2^5` (its weights 1/2, `dS = [-2^5, 2^5]`): unhooked, under a tile
+    bias each row's own, and under one the rows share, whose gradient the portable launch hands back a row
+    at a time (`attention.hook_restored` raises each) and the Mosaic dK/dV launch sums across them, each
+    row's part restored first (`attention.restore_factors`); where one shift for the call took row B's
+    2^-120 beneath 2^-248 and gave 0."""
     spans = template.spans(1, 2, 2)
-    query = jnp.zeros((2, 1, 1, 1), jnp.float32)
-    key = jnp.asarray([0.0, 1.0], jnp.float32).reshape(1, 2, 1, 1).repeat(2, axis=0)
-    value = jnp.asarray([[2.0 ** 127, 2.0 ** 127], [0.0, 2.0 ** -120]], jnp.float32).reshape(2, 2, 1, 1)
-    dout = jnp.full((2, 1, 1, 1), 2.0 ** 127, jnp.float32)
     natural, accurate = attention_route.run_forms()
     tiles = attention_portable.Tiles(block_q=8, block_k=8, pad=8)
-    # Unhooked, and under a tile bias of zeros each row's own (`Kind.TILE` `[2, 1, 1, 2]`): a parameter no
-    # row shares keeps the rows' shifts apart.
-    biased = template.Hooks(lambda s, q_pos, k_pos, bias: s + bias.astype(s.dtype),
-                            (template.Param(jnp.zeros((2, 1, 1, 2), jnp.float32), template.Kind.TILE),))
-    for hooks in (None, biased):
+    query, key, value, dout = _two_rows(1, jnp.float32)
+    for hooks in (None, _biased((2, 1, 1, 2)), _biased((1, 1, 1, 2))):
         made = attention_portable.backward(tiles, query, key, value, spans, hooks, dout, natural=natural,
                                            accurate=accurate)
         np.testing.assert_array_equal(np.asarray(made.query[1]), 2.0 ** 5)
+    query, key, value, dout = _two_rows(64, jnp.bfloat16)
+    with generation.assumed("sm90", interpreted=True):
+        for hooks in (_biased((2, 1, 1, 2)), _biased((1, 1, 1, 2))):
+            residuals = attention_mosaic.forward(query, key, value, spans, hooks,
+                                                 residuals=template.Kept.SPLIT, interpret=True)[1:]
+            made = attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals,
+                                             interpret=True)
+            np.testing.assert_array_equal(np.asarray(made.query[1, 0, 0, 0], np.float32), 2.0 ** 5)

@@ -491,18 +491,34 @@ def _grading(shares: tuple) -> bool:
     return shares[0][0] == 0
 
 
-def _tiles_added(family: mosaic.Family, refs, stage, place: tuple, k_first, index, interpret: bool, first,
-                 pieces) -> None:
+def _tiles_added(family: mosaic.Family, refs, stage, place: tuple, restored: Callable, k_first, index,
+                 interpret: bool, first, pieces) -> None:
     """Each tile gradient of `pieces` (`[bk, its queries]`, queries from `first`) added into its place in the
     keys-first `[B or 1, H or 1, Kp, Qp]` refs (`refs`), the one a parameter the batch rows or heads share
-    holds for the program's row and head (`place`, `shared_place`, row 2577), through consumer `index`'s
-    `stage`."""
+    holds for the program's row and head (`place`, `shared_place`, row 2577), restored first where it sums
+    rows (`_restored`), through consumer `index`'s `stage`."""
     row, head = place
     for ref, piece in zip(refs, pieces, strict=True):
         assert stage is not None
         view = ref.at[*shared_place(ref.shape, row, head), pl.ds(k_first, piece.shape[0]),
                       pl.ds(first, piece.shape[1])]
-        family.added(piece, view, interpret, smem=stage.at[index])
+        family.added(restored(ref, piece), view, interpret, smem=stage.at[index])
+
+
+def _restored(restore_ref, place: tuple, batch: int, heads: int) -> Callable:
+    """`(ref, part) -> part` raised by the program's row's and head's shift (`place`, its factors
+    `restore_ref` `[B, H, 3]`, `template.restore_factors`) where `ref`, a hook gradient's buffer, sums the
+    batch rows or heads (an axis of extent one: `template.hook_restored` then raises it not), else as it is: a
+    part of each row's own scale summed with another's is no row's. Each factor within fp32, their product by
+    1 at a shift of 0 exact (the kernel's products keep denormals)."""
+    row, head = place
+
+    def restored(ref, part):
+        if restore_ref is None or (ref.shape[0] == batch and ref.shape[1] == heads):
+            return part
+        return part * restore_ref[row, head, 0] * restore_ref[row, head, 1]
+
+    return restored
 
 
 def _dkv_stored(family: mosaic.Family, sums: tuple, views: tuple, stages: tuple, *, index, interpret: bool
@@ -664,8 +680,8 @@ def _dkv_kernel(walk: _Backward, entry, graded: list[Kind], query, key, value, d
                              + (value_width if shares[0][0] == 0 else 0)))
 
 def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, spans: _Spans | None,
-                score_params: tuple, drop: Dropout | None, scaled: jax.Array, *, walk: _Backward
-                ) -> tuple[jax.Array, ...]:
+                score_params: tuple, drop: Dropout | None, scaled: jax.Array, *, walk: _Backward,
+                restore: jax.Array | None = None) -> tuple[jax.Array, ...]:
     """`_dkv_columns`' launch of each of the config's `columns`, its share of dK's and dV's columns (the
     score hook's key and tile gradients the first's), dK and dV joined along their widths; `scaled` the
     queries taken by the call's power, its logits' (`_dkv_step`)."""
@@ -674,7 +690,7 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
     name = "attention_dkv_fused" if walk.fused else "attention_dkv"
     launched: list[tuple[jax.Array, ...]] = [
         _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index, spans, score_params,
-                     drop, scaled, walk=walk,
+                     drop, scaled, walk=walk, restore=restore,
                      shares=((column * width, width), (column * value_width, value_width)),
                      name=name + ("" if columns == 1 else f"_columns{column}"))
         for column in range(columns)]
@@ -698,7 +714,7 @@ def _keys_stored(family: mosaic.Family, sums: tuple, views: tuple, stages: tuple
 @tuning.lowered_once(("walk", "shares", "name"))
 def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index, spans: _Spans | None,
                  score_params: tuple, drop: Dropout | None, scaled: jax.Array, *, walk: _Backward,
-                 shares: tuple, name: str) -> tuple[jax.Array, ...]:
+                 shares: tuple, name: str, restore: jax.Array | None = None) -> tuple[jax.Array, ...]:
     """The dK/dV program under the dQ program's softmax: each consumer's `block_k` keys of a query head,
     resident, walked by the query tiles that see them, streamed with their output cotangents through a ring
     each; a tile's weights and score cotangents (the algebra's, rows the keys, `_dkv_step`) the transposed
@@ -719,14 +735,14 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
                                       adds_vectors=family.adds_vectors)
     # A tile parameter's entries keys first, as the program's tiles hold them (`_param`).
     scaled_in = None if program.tiles.staged_logits else head_layout(family, scaled)
-    leaves, treedef = jax.tree.flatten((spans, _keys_last(score_params, kinds), drop, scaled_in))
+    leaves, treedef = jax.tree.flatten((spans, _keys_last(score_params, kinds), drop, scaled_in, restore))
     tiled = Kind.TILE in graded
 
     def body(*refs, streams, after=None):
         inputs, unflattened, outputs, held, (key_refs, tile_refs) = _dkv_refs(
             refs, treedef, len(leaves), graded, groups, widths=value_width == width, split=split,
             fused=walk.fused, after=after is not None, vectors=family.stages_vectors)
-        spans_of, score_refs, drop_of, l_ref = unflattened
+        spans_of, score_refs, drop_of, l_ref, restore_ref = unflattened
         dq_ref, dk_ref, dv_ref = outputs
         q_ref, k_ref, v_ref, do_ref, *stat_refs = inputs
         k_smem, v_smem, out_smem, dv_smem, rows_smem, k_loaded, v_loaded, *rest = held
@@ -734,6 +750,7 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
             rest, relayed=family.relay_bytes(block_k, count) > 0, tiled=tiled,
             fused=(4 if placing else 2) if walk.fused else 0)
         row, head = family.program_index("batch"), family.program_index("heads")
+        restored = _restored(restore_ref, (row, head), query.shape[0], heads)
         named = {"queries": q_ref, "douts": do_ref, **({} if l_ref is None else {"logits": l_ref})}
         views, streams = _query_streams(family, streams, named, (score_refs, kinds), row, head, heads=heads)
         pair_first = family.program_index("k_tiles") * pair
@@ -758,7 +775,7 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
             step = _consumer_step(_relayed(walk, relay, index), (row, head), k_first, index, holder, part,
                                   stage, shares,
                                   refs=(tile_refs, tile_stage, spans_of, drop_of, score_refs, k_smem, v_smem,
-                                        dq_ref, fused_stages),
+                                        dq_ref, fused_stages, restored),
                                   statistics=rows_of)
             # Each consumer's walk over the key block's readers (`Family.walk_own`).
             run = program.whole_run(k_first, q_steps, spans_of)
@@ -768,6 +785,7 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
                     streams, program.segmented(step, run, lo, hi),
                     tuple(family.zeros((block_k,)) for _ in key_refs),
                     tuple((block_k, share) for _, share in shares), walk.interpret, first=counted))
+            key_sums = tuple(restored(ref, key_sum) for ref, key_sum in zip(key_refs, key_sums, strict=True))
             if ring is not None:
                 ring.drained(lo, hi, index)
             if stage is not None:
@@ -877,13 +895,14 @@ def _consumer_step(walk: _Backward, place: tuple, k_first, index: int, holder: i
     hook's coordinates, parameters and tile gradients' stores, its resident key and value block (its
     `holder`'s), a fused launch's dQ adds and its logits' `stage`, for its batch row and head (`place`); a
     compute warpgroup's where its family places its products on a role (`_placed_step_of`)."""
-    tile_refs, tile_stage, spans_of, drop_of, score_refs, k_smem, v_smem, dq_ref, fused_stages = refs
+    (tile_refs, tile_stage, spans_of, drop_of, score_refs, k_smem, v_smem, dq_ref, fused_stages,
+     restored) = refs
     family = walk.program.family
     if family.places_on_role:
         return _placed_step_of(walk, statistics, spans_of, place, k_first, dq_ref, fused_stages)
     row, head = place
-    store_tiles = functools.partial(_tiles_added, family, tile_refs, tile_stage, place, k_first, index,
-                                    walk.interpret)
+    store_tiles = functools.partial(_tiles_added, family, tile_refs, tile_stage, place, restored, k_first,
+                                    index, walk.interpret)
     coords_of = functools.partial(_coords, family, spans_of, row, k_first=k_first, keys_first=True,
                                   draw=None if drop_of is None else drop_of.draw(row, head))
     # The key block's parameters held across the walk, read once (`held_params`), each query tile's of the
