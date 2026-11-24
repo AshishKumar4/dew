@@ -184,10 +184,12 @@ def a_joined_layers_training_step_is_on_par(case: tuple[str, ...]) -> None:
     assert (combination["join"], "joined") in recorded and not unnamed, (sorted(recorded), unnamed)
     if combination["join"] == "qkv":
         # Joined, its step binds the side-by-side forward and the chained input gradient; apart, neither
-        # (head review of 0099a4701 F4: the cell checked the route alone).
+        # (head review of 0099a4701 F4: the cell checked the route alone). Traced as on the cell's GPU: a GPU
+        # tier's prepare, whose device is no GPU, refused the template's launch here (row 12378).
         operands = jax.eval_shape(draw, 0)
         for joins, forms in ((True, {"beside", "chained"}), (False, set())):
-            with generation.chosen(**unfused), row_joins("qkv", joins=joins), tuning.seen() as launches:
+            with (generation.assumed(combination["generation"]), generation.chosen(**unfused),
+                  row_joins("qkv", joins=joins), tuning.seen() as launches):
                 jax.eval_shape(with_gradients(layer.apply), *operands)
             bound = {form for _, each in launches.taken for form in ("beside", "chained")
                      if each.arguments.get(form)}
