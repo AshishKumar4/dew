@@ -227,10 +227,33 @@ BALANCED_TAIL = "a balanced tail's partials fixed up across programs, which the 
 """Why a dense kernel gradient's balanced tail stays on the GPU (the GEMM lane, 11-12)."""
 
 
+def _toolkit_cells() -> list[Cell]:
+    """The toolkit's rings and walks on the GPUs whose waits the interpreter takes as no-ops: an H100's rings
+    and reads, an A100's shared cp.async pipeline (each kept by name for its fault)."""
+    return [
+        *(Cell(f"a ring streams tiles of their own trip counts: {consumers} consumers",
+               functools.partial(mosaic_toolkit.a_ring_streams_tiles_of_their_own_trip_counts_on_an_h100,
+                                 consumers), "sm90", fault=RING)
+          for consumers in (1, 2)),
+        *(Cell(f"every warpgroup read lands its products: {path}",
+               functools.partial(mosaic_toolkit.every_warpgroup_read_lands_its_products_on_an_h100, path),
+               "sm90", fault="ptxas's fold of a read path's sign op (row 4346)")
+          for path in mosaic_toolkit.READS),
+        *(Cell(f"consumers feeding their own ring split a step: {consumers} consumers from {lo}",
+               functools.partial(mosaic_toolkit.consumers_feeding_their_own_ring_split_a_step_on_an_h100,
+                                 consumers, lo), "sm90", fault=RING)
+          for consumers, lo in ((1, 0), (2, 0), (2, 3))),
+        *(Cell(f"consumers sharing one cp.async pipeline: {consumers} consumers{', split' * split}",
+               functools.partial(mosaic_toolkit.consumers_sharing_one_pipeline_on_an_a100, consumers, split),
+               "sm80", fault=SHARED)
+          for consumers, split in ((1, False), (2, False), (2, True))),
+    ]
+
+
 def test_the_gemm_kernels_run_on_this_gpu():
     """The GEMM and toolkit cells above a GPU runs (`gpu_flow.covering`: each kept for a GPU-only fault by
     name, the fewest others covering its native axes, every other the CPU's, interpreted and through the
-    compile gate), each one's failure kept and all raised together; the toolkit's on an H100 alone."""
+    compile gate), each one's failure kept and all raised together; the toolkit's apart (`_toolkit_cells`)."""
     run_cells(covering([
         Cell("a fused projection trains its producer and epilogue",
              a_fused_projection_trains_its_producer_and_epilogue, "sm90",
@@ -300,22 +323,7 @@ def test_the_gemm_kernels_run_on_this_gpu():
                                  shared), native={"launch": "cutlass", "groups": "mapped",
                                                   "matrices": "shared" if shared else "mapped"})
           for shared in (False, True)),
-        *(Cell(f"a ring streams tiles of their own trip counts: {consumers} consumers",
-               functools.partial(mosaic_toolkit.a_ring_streams_tiles_of_their_own_trip_counts_on_an_h100,
-                                 consumers), "sm90", fault=RING)
-          for consumers in (1, 2)),
-        *(Cell(f"every warpgroup read lands its products: {path}",
-               functools.partial(mosaic_toolkit.every_warpgroup_read_lands_its_products_on_an_h100, path),
-               "sm90", fault="ptxas's fold of a read path's sign op (row 4346)")
-          for path in mosaic_toolkit.READS),
-        *(Cell(f"consumers feeding their own ring split a step: {consumers} consumers from {lo}",
-               functools.partial(mosaic_toolkit.consumers_feeding_their_own_ring_split_a_step_on_an_h100,
-                                 consumers, lo), "sm90", fault=RING)
-          for consumers, lo in ((1, 0), (2, 0), (2, 3))),
-        *(Cell(f"consumers sharing one cp.async pipeline: {consumers} consumers{', split' * split}",
-               functools.partial(mosaic_toolkit.consumers_sharing_one_pipeline_on_an_a100, consumers, split),
-               "sm80", fault=SHARED)
-          for consumers, split in ((1, False), (2, False), (2, True))),
+        *_toolkit_cells(),
         Cell("the shared GEMM mainloop runs on Blackwell's tcgen05",
              gemm_tcgen05.the_shared_mainloop_runs_exactly_on_blackwell, "sm100",
              native={"launch": "tcgen05 mainloop"}),
