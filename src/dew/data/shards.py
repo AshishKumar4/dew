@@ -333,9 +333,11 @@ class _SequentialIterator(grain.DatasetIterator):
             self.reader.empty.ended(yielded=True, place=self.places[passed])
         self.reader.empty.rows += window.held
         for passed_place, _, _, rows_passed in window.parts[:-1]:
-            # A place read through holds its file no longer, nor its records' places.
-            self._indexed.pop(self.places[passed_place], None)
-            rows_passed.close()
+            # A place read through holds its records' places no longer, but where the window's last part
+            # reads the same shard (a repeated pass's places are one shard's, `_by_index`).
+            if rows_passed is not rows:
+                self._indexed.pop(self.places[passed_place], None)
+                rows_passed.close()
         self._close_rows()
         self.place = place
         self.rows = iter(self.reader(self.places[place]))
