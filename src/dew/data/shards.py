@@ -408,23 +408,23 @@ class IndexedMap(grain.IterDataset):
 class _IndexedMapIterator(grain.DatasetIterator):
     def __init__(self, parent: grain.DatasetIterator, step: Callable, made: Callable[[Batch], Batch]):
         super().__init__(parent)
-        self.step, self.made = step, made
+        self.parent, self.step, self.made = parent, step, made
 
     def __next__(self):
-        return self.step(next(self._parent))
+        return self.step(next(self.parent))
 
     def get_state(self):
-        return self._parent.get_state()
+        return self.parent.get_state()
 
     def set_state(self, state) -> None:
-        self._parent.set_state(state)
+        self.parent.set_state(state)
 
     def window(self, limit: int) -> Window | None:
-        window = served(self._parent, limit)
+        window = served(self.parent, limit)
         return None if window is None else window.mapped(self.made)
 
     def skip(self, window: Window) -> None:
-        passed(self._parent, window)
+        passed(self.parent, window)
 
 
 @runtime_checkable
