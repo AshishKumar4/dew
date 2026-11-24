@@ -311,3 +311,35 @@ def test_a_blockwise_fp8_epilogues_codes_and_scales_are_the_recipes():
     np.testing.assert_array_equal(np.asarray(codes).view(np.uint8), np.asarray(want_codes).view(np.uint8))
     np.testing.assert_array_equal(np.asarray(stored_scales).view(np.uint32),
                                   np.asarray(want_scales.T).view(np.uint32))
+
+
+@pytest.mark.parametrize("rows", [200, 256])
+def test_an_ungated_mlps_recipe_chain_is_its_two_recipe_projections_apart(rows):
+    """Under a run's blockwise FP8 recipe, an ungated MLP's chain (`projections.recipe_chain`) of any rows
+    count, laid in whole 128-row blocks and the padding dropped: its value and every gradient bitwise the two
+    `recipe_projection` calls apart with the activation between them in XLA (row 8547); and outside the
+    recipe, None, which the two apart take."""
+    from dew.nn.precision import FP8, projection_role
+
+    rng = np.random.default_rng(8551)
+    x = jnp.asarray(rng.normal(size=(rows, 256)), jnp.bfloat16)
+    up = jnp.asarray(rng.normal(size=(256, 384)) / 16, jnp.bfloat16)
+    down = jnp.asarray(rng.normal(size=(384, 256)) / 16, jnp.bfloat16)
+    cotangent = jnp.asarray(rng.normal(size=(rows, 256)), jnp.bfloat16)
+
+    def chained(x, up, down):
+        return projections.recipe_chain(x, up, down, jax.nn.gelu, out_dtype=jnp.bfloat16)
+
+    def apart(x, up, down):
+        hidden = projections.recipe_projection(x, up, out_dtype=jnp.bfloat16)
+        return projections.recipe_projection(jax.nn.gelu(hidden).astype(jnp.bfloat16), down,
+                                             out_dtype=jnp.bfloat16)
+
+    assert chained(x, up, down) is None
+    with generation.run_precision(FP8), projection_role("mlp"):
+        fused = jax.jit(with_gradients(chained))(x, up, down, cotangent)
+        separate = jax.jit(with_gradients(apart))(x, up, down, cotangent)
+    for name, got, want in zip(("value", "d_x", "d_up", "d_down"), fused, separate, strict=True):
+        assert got.dtype == want.dtype, (name, got.dtype, want.dtype)
+        bits = np.dtype(f"uint{8 * got.dtype.itemsize}")
+        np.testing.assert_array_equal(np.asarray(got).view(bits), np.asarray(want).view(bits), err_msg=name)

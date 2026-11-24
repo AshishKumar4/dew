@@ -143,6 +143,39 @@ def recipe_projection(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array
     return out.astype(out_dtype)
 
 
+def recipe_chain(rows: jax.Array, up: jax.Array, down: jax.Array, activation: Callable, *,
+                 out_dtype) -> jax.Array | None:
+    """`recipe_projection(activation(recipe_projection(rows, up)), down)` of an ungated MLP's rows (`[rows,
+    in]`, any count; `up` `[in, hidden]`, `down` `[hidden, out]`, dense) as one chain where the run trains in
+    DeepSeek-V3's blockwise FP8 recipe and its role takes both projections (`recipe_refusal`): the rows laid
+    in whole 128-row blocks, zero rows after them dropped after (each row's tiles its own, so the real rows
+    are the two apart's, bitwise), the down projection's rows quantized in the up projection's epilogue
+    (`blockwise_chain`, row 8547); rows a mesh splits each device's own chain, the matrices whole and their
+    gradients summed (`on_shards`, as `_projected_apart`). None elsewhere: the run's recipe another's or
+    none, or a projection its role keeps, which the two `recipe_projection` calls then take apart. Each
+    product's route is its selector's (`BLOCKWISE_FP8`)."""
+    from dew.nn.precision import recipe_role
+
+    held = recipe_role()
+    if (held is None or held[0].recipe != "blockwise_fp8" or up.ndim != 2 or down.ndim != 2
+            or recipe_refusal(*up.shape) is not None or recipe_refusal(*down.shape) is not None):
+        return None
+    if (placed := explicit_spec(rows)) is not None and placed.spec[0] is not None:
+        along = placed.spec[0]
+    else:
+        along = None if (split := rows_split(rows)) is None else split[0]
+    if along is not None:
+        def chained(rows, up, down):
+            out = recipe_chain(rows, up, down, activation, out_dtype=out_dtype)
+            assert out is not None, "the recipe takes the chain on every device as on the whole"
+            return out
+
+        return on_shards(chained, jax.sharding.PartitionSpec(along, None), (rows, up, down), whole=(1, 2))
+    count = rows.shape[0]
+    laid = jnp.pad(rows, ((0, -count % SCALE_DEPTH), (0, 0)))
+    return blockwise_chain(laid, up[None], down[None], activation, out_dtype=out_dtype)[:count]
+
+
 def _projected_apart(rows, matrix, group_sizes, *, out_dtype, bias, along) -> jax.Array:
     """`recipe_projection` of rows the mesh's axes `along` split, Explicit (rows 4854, 4859) or automatic
     alone (row 6719): each device's rows its own projection (`on_shards`, whose map is unchecked as a Pallas
