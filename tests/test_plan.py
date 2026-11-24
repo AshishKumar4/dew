@@ -1690,15 +1690,18 @@ def climbed(monkeypatch, target: str, fields: dict, batch: dict, room_of, reques
 
     room = room_of(need)
     def fits(moves: int) -> bool:
-        # The place's own step compiled in the room, its first compile the judge: where it misses, the
-        # search past it may find nothing more at a remat the run now states (`PlanRefused`). Its rung
-        # recorded apart, so no search after it reads the rung it settles (`rung_records`).
+        # The place's own step compiled in the room, its first compile's headroom the judge, a number read
+        # off its compile, not the admission under test: where it misses, the search past it may find nothing
+        # more at a remat the run now states (`PlanRefused`). Its rung recorded apart, so no search after it
+        # reads the rung it settles (`rung_records`).
         with pytest.MonkeyPatch.context() as apart:
             apart.setenv("DEW_RUNG_RECORDS", str(request.getfixturevalue("tmp_path_factory").mktemp("rungs")))
             try:
-                return planned(moves, room).plan["probes"][0]["fits"]
+                headroom = planned(moves, room).plan["probes"][0]["headroom"]
             except PlanRefused as refused:
-                return refused.probes[0].fits
+                headroom = refused.probes[0].headroom
+        assert headroom is not None, "the census's compiles state their memory"
+        return headroom >= 0
 
     if request.node.get_closest_marker("shards") is None:
         # Each place's fit compiled where it is asked, once (no place past the one sought is compiled).
@@ -1721,6 +1724,8 @@ def climbed(monkeypatch, target: str, fields: dict, batch: dict, room_of, reques
     # What a start asks, a probe a place at its fixed split: its own rung, which settles it where it fits
     # (a split step's scanned gradient pooled in its backward needs no more at no remat than at a remat rung,
     # row 12080's), else each remat rung at its own head and options up to the first that fits.
+    # The start's own first verdict as its compile measured it, wherever it settles.
+    assert trainer.plan["probes"][0]["fits"] == fitted(0), (trainer.plan["probes"][0], fitted(0))
     asks = ([places[0]] if fitted(0) else None if settled is None
             else [places[0], *(places[moves] for moves in preferred[:settled + 1])])
     lightest = None if recomputing is not None else next(
