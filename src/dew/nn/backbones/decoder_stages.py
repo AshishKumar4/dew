@@ -77,6 +77,15 @@ def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer
         x = x.astype(at_least_fp32(x.dtype))
     stages = pipeline_stages()
     first, end = (0, decoder.num_layers) if span is None else span
+
+    def unrolled():
+        # Each layer run directly, in the stream's own dtype: no scan carries it.
+        return run_stack(
+            decoder.layers, decoder.block, decoder.specs,
+            tuple((index, 1) for index in range(first, end)), x,
+            train=train, decode=decode, kv_store={} if decoder.provides else None,
+            per_layer_input=per_layer_input, attention_metadata=attention_metadata, prior_bank=prior_bank)
+
     # A seeded initialization (PTQ's abstract annotation pass) reads the
     # supplied layout; the scan's init=True pass would draw over it first.
     if (decoder.is_initializing() and stages == 1 and not decode
@@ -93,11 +102,7 @@ def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer
                                    trans_out_fn=view.unstack, init=True, mutable=True)
             return run(decoder, view, x, train, decode, per_layer_input, attention_metadata, prior_bank)
     if decoder.is_initializing() or (stages == 1 and not scanned()):
-        return run_stack(
-            decoder.layers, decoder.block, decoder.specs,
-            tuple((index, 1) for index in range(first, end)), x,
-            train=train, decode=decode, kv_store={} if decoder.provides else None,
-            per_layer_input=per_layer_input, attention_metadata=attention_metadata, prior_bank=prior_bank)
+        return unrolled()
     staged = stored_by_stage(decoder.variables)
     banked = () if staged else decoder.banked_collections()
     held = decoder.variables.get('cache', {})
@@ -121,13 +126,8 @@ def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer
         if not any(count > 1 for _, count in groups) or (
                 not banked and 'streaming' not in decoder.variables and captures_any_method(decoder)):
             # No run scans, or a capture of any method keeps what no scan stacks (a method's non-array
-            # return): run each layer directly, without probing a scan carry dtype.
-            return run_stack(
-                decoder.layers, decoder.block, decoder.specs,
-                tuple((index, 1) for index in range(first, end)), x,
-                train=train, decode=decode, kv_store={} if decoder.provides else None,
-                per_layer_input=per_layer_input, attention_metadata=attention_metadata,
-                prior_bank=prior_bank)
+            # return): each layer runs as the plain stack runs it.
+            return unrolled()
         view, split = (StackView(groups, banked=banked, periods=periods),
                        StageSplit(0, decoder.num_layers, 0))
     else:
