@@ -570,8 +570,10 @@ takes the family's every consumer (FlashAttention 3's d64 tile: three, 192 rows)
 
 def most_consumers(family: mosaic.Family, tiles: "Tiles | BackwardTiles") -> int:
     """The consumers a launch of `tiles` takes at most on `family`: a forward's the family's own
-    (`Family.consumers`), a backward's at most `BACKWARD_CONSUMERS`."""
-    return family.consumers if isinstance(tiles, Tiles) else min(family.consumers, BACKWARD_CONSUMERS)
+    (`Family.consumers`), a backward's those a launch may name there (`Family.shared_consumers`: an A100's
+    paired fused launch's two, `MosaicBackward.legal`), at most `BACKWARD_CONSUMERS`."""
+    return (family.consumers if isinstance(tiles, Tiles)
+            else min(family.shared_consumers, BACKWARD_CONSUMERS))
 
 
 def held_walked(family: mosaic.Family, tiles: "Tiles | BackwardTiles") -> tuple[int, int]:

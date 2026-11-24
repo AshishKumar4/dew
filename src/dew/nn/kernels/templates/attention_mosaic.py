@@ -74,6 +74,7 @@ from dew.nn.kernels.templates.attention_mosaic_forward import (
     rewalks_in_place,
 )
 from dew.nn.kernels.templates.attention_mosaic_fused import (
+    dq_summed,
     fused_reduces,
     fused_staging,
     staged_parts,
@@ -1887,6 +1888,13 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                 or not super().legal(ba, config, target)):
             return False
         family = bundle_of(config, dtype, target=target)
+        # Consumers past those its family's derivations take (`Family.shared_consumers`'s) the paired fused
+        # launch's alone, queries first over keys each its own, its consumers' dQ summed (`dq_summed`): no
+        # other walk of its family is written for them (a shared key block's, `_coop_launch`, loads by one).
+        if (family is not None and config.consumers > family.consumers
+                and not (config.queries_first and not config.shared_keys
+                         and dq_summed(family, config.consumers))):
+            return False
         # Deterministic mode takes no one launch: its programs add into dQ (and grouped dK and dV) across
         # programs, whose fixed order would wait on programs an ordinary launch need not hold resident
         # (row 4732: a ticket spins on a predecessor another stream's kernel keeps off the
@@ -2114,6 +2122,19 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             config = derive(layout, query.dtype, key.shape[1], query.shape[1], fed_fused, fits,
                             overlapped=True)
             if config is not None and config.consumers > 1:
+                return config
+        # Queries first on the dQ launch's layout at the consumers a launch may name there where they walk
+        # every streamed step paired and its adds are element-wise (`dq_summed`: an A100's collective cp.async
+        # ring, `Family.shared_consumers`), each its own keys, a step's dQ summed between them before one add:
+        # FlashAttention 2's eight warps over a 128-key block (M-NA-9-a100: one consumer's 64-key program ran
+        # 6.25% of the warps FlashAttention 2's did, 2.05 to 2.12 times its dQ adds; row 5272).
+        if dq_summed(family, family.shared_consumers) and family.shared_consumers > family.consumers:
+            def paired(rows: int, walked: int, consumers: int) -> BackwardTiles:
+                del consumers  # the launch names its family's paired consumers
+                return BackwardTiles(walked, rows, 2, family.shared_consumers, fused=True, family=family.name)
+
+            if config := derive(family, query.dtype, key.shape[1], query.shape[1], paired, fits,
+                                overlapped=False):
                 return config
         # Else keys first on the dQ launch's layout, its dK/dV on the fed one where there is one, the logits'
         # queries a stream of their own, then staged a step, then on the dQ launch's layout alone.

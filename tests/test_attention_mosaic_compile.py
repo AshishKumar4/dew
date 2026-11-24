@@ -16,13 +16,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from fla_gdn_support import KernelCase
 from generation_support import COMPILES_FOR_TPU, COMPILES_ON_CPU, INTERPRETS, lowers
 from jax.sharding import AbstractDevice, AbstractMesh, AxisType, Mesh
-from kernel_compile import gate_generations, lowered_for
+from kernel_compile import compile_mosaic_kernels, gate_generations, lowered_for, mosaic_failures
 from test_attention_mosaic import (
     BACKWARD_HOOKS,
+    CALLS,
     FORWARD_HOOKS,
     SHAPES,
+    _backward_call,
     _bound,
     _check_backward,
     _forward_call,
@@ -2438,3 +2441,48 @@ def test_sm90_d256_gqa_forward_and_shared_keys_backward_compile_spill_free():
         _fast_backward_compile_case("sm90-d256-gqa-bwd", q, k, spans, res),
     ], "sm90")
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
+PAIRED = attention_mosaic.BackwardTiles(64, 64, 2, 2, fused=True, family="mma.sync")
+"""An A100's fast backward in one launch on two consumers sharing one cp.async pipeline (`mosaic_sm80`'s
+`shared_consumers`), each its own 64 keys of a 128-key block, a query tile's dQ summed between them before
+its one add (`attention_mosaic_fused.dq_summed`)."""
+
+
+@INTERPRETS
+@pytest.mark.parametrize("call", CALLS)
+def test_an_a100s_one_launch_on_two_paired_consumers_holds_check_1_interpreted(call,
+                                                                                 without_deterministic_ops):
+    """`PAIRED` over every query tile the block's readers read (a tile none of a consumer's keys sees
+    masked whole, the consumers' segments the same, `attention_mosaic_fused._walked_run`): within check 1 of
+    the reference from float64 over grouped heads, causal and full, under the interpreter."""
+    _check_backward(call, SHAPES["interpreted"], form=None, config=PAIRED, interpret=True, width=64,
+                    target=generation.gpu_target("sm80"))
+
+
+def test_an_a100s_two_consumers_are_legal_on_its_paired_launch_alone():
+    """An A100's two consumers past its derivations' one (`mosaic_sm80`'s `shared_consumers`) are legal on
+    the paired launch (`PAIRED`: queries first, each consumer its own keys, their dQ summed) and on no launch
+    whose consumers share a key block (`shared_keys`, `_coop_launch`, which loads its block by one)."""
+    with generation.assumed("sm80"):
+        target = generation.gpu_target()
+        op, ba = _backward_call((1, 512, 8, 2), 64, accurate=False)
+        assert op.legal(ba, PAIRED, target)
+        assert not op.legal(ba, dataclasses.replace(PAIRED, shared_keys=True), target)
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("causal", [True, False], ids=["causal", "full"])
+def test_an_a100s_fast_backward_on_two_paired_consumers_compiles(causal, without_deterministic_ops):
+    """An A100's fast backward at Llama 3.2 1B's head width (8 query heads over 2, 512 tokens, causal and
+    full) at its derived tiles on two paired consumers (`PAIRED`'s) is legal and lowers and compiles on a
+    compile-only A100 within its resources: the collective pipeline's two warpgroups walking the same
+    segments, their staged scores and the sum's parts and barriers in one block."""
+    with generation.assumed("sm80"):
+        target = generation.gpu_target()
+        op, ba = _backward_call((1, 512, 8, 2), 64, accurate=False, causal=causal)
+        config = dataclasses.replace(op.derived(ba, target), consumers=PAIRED.consumers)
+        assert op.legal(ba, config, target), config
+        case = KernelCase(f"paired backward {config}", lambda: op.lowering(ba, config))
+        found = compile_mosaic_kernels([case], "sm80")
+    assert not (failed := mosaic_failures(found)), "\n".join(failed)
