@@ -519,7 +519,7 @@ def test_a_layers_paired_and_scaled_expert_products_are_one_launch_as_exact_as_a
     rows gathered and scaled and the layer's matrices sliced, each multiplied apart, both from float64
     truth (check 1; row 12306). The kernels run interpreted on this CPU, as the H100's."""
     from generation_support import here
-    from reference_error import assert_as_exact, with_gradients
+    from reference_error import as_given, assert_as_exact, with_gradients
 
     from dew.nn import moe
     from dew.nn.kernels import gemm, generation, grouped_matmul
@@ -543,11 +543,14 @@ def test_a_layers_paired_and_scaled_expert_products_are_one_launch_as_exact_as_a
         return moe.paired_projections(moe.Gathered(x, rows, where, scales), moe.Layered(gate, layer),
                                       moe.Layered(up, layer), sizes, jnp.bfloat16, "auto", None)
 
+    # This process's own platform, read before `generation.assumed` states another.
+    on_a_cpu = here() == "cpu"
+
     def launched(x, gate, up, scales):
         # The paired call `dew` makes (its binding asserted below) run as the H100's launch: on a GPU the
         # projections themselves; on this CPU the template's interpreter over the same hand-off
         # (`moe._streamed`), which product code never asks for (`interpret_on_cpu`).
-        if here() != "cpu":
+        if not on_a_cpu:
             return dew(x, gate, up, scales)
         tokens, gather, prologue = moe._streamed(moe.Gathered(x, rows, where, scales), jnp.bfloat16)
         return gemm.gemm(tokens, gate, sizes, compute=jnp.bfloat16, out_dtype=jnp.bfloat16,
@@ -585,8 +588,8 @@ def test_a_layers_paired_and_scaled_expert_products_are_one_launch_as_exact_as_a
             assert_as_exact(jax.jit(valued(launched)), jax.jit(valued(plain)), draw, label, seeds=8,
                             truth_fn=valued(truth))
         assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"mosaic"}
-        # The gradients eagerly, as the Mosaic interpreters' ordered callbacks need.
-        assert_as_exact(with_gradients(launched), jax.jit(with_gradients(plain)), draw,
+        # The gradients eagerly, as the Mosaic interpreters' ordered callbacks need (`as_given`).
+        assert_as_exact(as_given(with_gradients(launched)), jax.jit(with_gradients(plain)), draw,
                         f"{label}, gradients", seeds=8, truth_fn=with_gradients(truth))
 
     # Stacks read at two indices are each read at its own: no pair, the second stack at its layer.
