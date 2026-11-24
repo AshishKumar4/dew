@@ -224,7 +224,7 @@ def test_a_read_erase_takes_the_template_under_a_decay_a_head_alone(per_key, ker
     """The delta rule's selector gives PGDN's 16-bit training call the template it names (its keys' erase
     along reads of their own, `chunk_forward.forward`'s `reads`), where fla's port, which takes no reads,
     and PKDA's decay a key dimension, which the template's read erase does not take yet, hand over to the
-    portable math: each traced route its kernel's."""
+    portable math: the kernels its traced routes name, beside the portable tangent's."""
     drawn = operands(per_key, TEMPLATED)(0)[:-1]
     # A 16-bit call's queries, keys and values, as a layer's projections give them.
     drawn = (*(x.astype(jnp.bfloat16) for x in drawn[:3]), *drawn[3:])
@@ -234,7 +234,9 @@ def test_a_read_erase_takes_the_template_under_a_decay_a_head_alone(per_key, ker
 
     with generation.routes() as found:
         jax.eval_shape(jax.grad(loss, argnums=(0, 1, 2)), *drawn)
-    assert {route.kernel for route in found if route.choice == generation.Choice.GATED_DELTA_RULE} == {taken}
+    # Beside a kernel's routes, its derivative's portable tangent's (`_per_product`).
+    kernels = {route.kernel for route in found if route.choice == generation.Choice.GATED_DELTA_RULE}
+    assert kernels == {taken, 'xla'}, kernels
 
 
 def test_atks_walk_on_the_template_is_as_exact_over_packed_spans():
