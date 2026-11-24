@@ -265,6 +265,9 @@ class _Lanes:
             work = work + self.region(op.regions[0], active)
             carried = [self.read(value) for value in _yielded(op)]
         for result, lanes in zip(op.results, carried, strict=False):
+            # An earlier walk's facts of its results (an outer trip's) dropped before this one's.
+            for held in (self.values, self.partial, self.relative):
+                held.pop(result, None)
             if lanes is not None:
                 self.values[result] = lanes
         return work
@@ -536,8 +539,8 @@ def _instruction(words: list[str], issued: float, moving: float) -> Work:
         copied = (sizes[0] if sizes else 16) * moving
         return Work(device_bytes=copied, shared_bytes=copied)
     elif mnemonic.startswith(("atom.", "red.")) and ".global" in mnemonic:
-        # Its word read and written (an atomic's), a reduction's written, at its type's bytes.
-        moved = _ptx_bytes(mnemonic) * (2 if mnemonic.startswith("atom.") else 1) * moving
+        # Its word read and written, an atomic's and a reduction's alike, at its type's bytes.
+        moved = _ptx_bytes(mnemonic) * 2 * moving
         return Work(device_bytes=moved)
     elif mnemonic.startswith(("ld.", "st.")):
         moved = _ptx_bytes(mnemonic) * moving
@@ -546,13 +549,14 @@ def _instruction(words: list[str], issued: float, moving: float) -> Work:
 
 
 def _ptx_bytes(mnemonic: str) -> int:
-    """A PTX memory instruction's bytes a lane: its type's (`.u32`, `.f16`, `.b64`, ...) times its vector's
-    count (`.v2`, `.v4`); refused where it states no type."""
-    found = re.search(r"\.[usbf](8|16|32|64)\b", mnemonic)
+    """A PTX memory instruction's bytes a lane: its type's (`.u32`, `.f16`, `.b64`, `.b128`, a packed pair's
+    `.f16x2` or `.bf16x2`) times its vector's count (`.v2`, `.v4`); refused where it states no type."""
+    found = re.search(r"\.(?:[usbf](8|16|32|64|128)|b?f16x2)\b", mnemonic)
     if found is None:
         raise Uncounted(f"a PTX memory instruction of no type the count reads: {mnemonic}")
+    bits = int(found.group(1)) if found.group(1) else 32  # a packed pair of 16-bit floats
     vector = re.search(r"\.v(2|4|8)\b", mnemonic)
-    return int(found.group(1)) // 8 * (int(vector.group(1)) if vector else 1)
+    return bits // 8 * (int(vector.group(1)) if vector else 1)
 
 
 def _ptx_integer(word: str) -> int | None:
@@ -605,14 +609,14 @@ def _lane_values(name: str, op, operands: list[np.ndarray]) -> np.ndarray | None
     """`name` over its operands' lanes, for the integer arithmetic a lane's place is computed by."""
     first, last = operands[0], operands[-1]
     match name:
-        case "arith.index_cast" | "arith.index_castui" | "arith.extsi":
-            return first
-        case "arith.extui" | "arith.trunci":
-            # Its operand's bits (extui) or its result's (trunci) read unsigned, as wide as they are.
-            width = _width(op.operands[0].type if name == "arith.extui" else op.results[0].type)
+        case "arith.index_cast" | "arith.index_castui" | "arith.extsi" | "arith.extui" | "arith.trunci":
+            # An extension reads its operand's bits signed (extsi, index_cast's) or unsigned (extui,
+            # index_castui's); a truncation keeps its result's bits, unsigned.
+            signed = name in ("arith.extsi", "arith.index_cast")
+            width = _width(op.results[0].type if name == "arith.trunci" else op.operands[0].type)
             if width is None or width >= 64:
                 return None if width is None else first
-            return _at_width(first, width, signed=False).astype(np.int64)
+            return _at_width(first, width, signed=signed and name != "arith.trunci").astype(np.int64)
         case "arith.addi":
             return first + last
         case "arith.subi":
