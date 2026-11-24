@@ -532,14 +532,17 @@ def test_a_layers_paired_and_scaled_expert_products_read_their_rows_and_layer_in
                                           jnp.float32, "auto", None)
     bound = [next(iter(call.bound.values()))[1].arguments for call, _ in calls]
     assert bound
-    # The pair weighed whole, and its products apart where a launch takes no pair (`gemm`'s `APART`): each
-    # still the whole stack at the layer's offset over the rows where they lie, scaled in its prologue.
-    assert any(arguments["paired"] is not None and arguments["paired"].shape == (6, 8, 4)
+    # The pair as the projections hand it: both whole stacks at the layer's offset over the rows where they
+    # lie, scaled in its prologue. A target no launch of a pair takes runs its products apart (`gemm`'s
+    # `APART`), each still the whole stack at the offset: no call takes a layer's matrices sliced.
+    paired = [arguments for arguments in bound if arguments["paired"] is not None]
+    assert paired, bound
+    for arguments in paired:
+        assert arguments["kernel"].shape == (6, 8, 4) and arguments["paired"].shape == (6, 8, 4)
+        assert arguments["first"] is not None and arguments["gather"].shape == rows.shape
+        assert arguments["tokens"].shape == tokens.shape and arguments["hooks"].prologue is not None
+    assert all(arguments["kernel"].shape == (6, 8, 4) and arguments["first"] is not None
                for arguments in bound)
-    for arguments in bound:
-        assert arguments["kernel"].shape == (6, 8, 4) and arguments["first"] is not None
-        assert arguments["gather"].shape == rows.shape and arguments["tokens"].shape == tokens.shape
-        assert arguments["hooks"].prologue is not None
     apart = [moe.expert_projection(moe.gathered(stream), stack[1], sizes, jnp.float32, "auto", None)
              for stack in stacks]
     np.testing.assert_array_equal(np.asarray(gate), np.asarray(apart[0]))
