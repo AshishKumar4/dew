@@ -463,24 +463,28 @@ def test_a_kimi_decays_gradient_of_a_small_cross_term_is_exact_interpreted():
 
 
 @lowers('sm80')
-def test_a_fast_fp32_kimi_forward_traces_its_launches_for_an_ampere_gpu():
-    """Kimi delta attention's fp32 forward under the fast forms, traced through the template for an Ampere
-    GPU: its scores take one fp32 part (TF32, mma.sync's) and its system its fp32, two sums of one shape and
-    dtype, which its own pairs write in place as one stacked ref (`chunk_forward._paired`), where two refs of
-    one shape and dtype are refused at the launch's trace (`mosaic.checked`, row 3180; the queue review's
-    P0). Traced, not lowered: the form's lowering on an A100 fails apart (row 12647)."""
+@pytest.mark.parametrize('product', ['forward', 'training'])
+def test_a_fast_fp32_kimi_call_lowers_on_its_route_for_an_ampere_gpu(product):
+    """Kimi delta attention's fp32 forward and training under the fast forms (TF32's products), as its
+    selector routes them on an Ampere GPU, lowered compile-only: Mosaic GPU synthesized no shared-memory
+    transfer for the intra walk's 128-byte swizzled fp32 streams, so the template it routed to raised at
+    lowering (row 12647); and its scores' one fp32 part and its system, two sums of one shape and dtype, its
+    own pairs write in place as one stacked ref (`chunk_forward._paired`), where two refs of one shape and
+    dtype were refused at the launch's trace (`mosaic.checked`, row 3180)."""
     rows, length, heads, width = 1, 128, 2, 64
-    operands = ([jax.ShapeDtypeStruct((rows, length, heads, width), jnp.float32)] * 3
-                + [jax.ShapeDtypeStruct((rows, length, heads, width), jnp.float32),
-                   jax.ShapeDtypeStruct((rows, length, heads), jnp.float32)])
+    operands = ([jax.ShapeDtypeStruct((rows, length, heads, width), jnp.float32)] * 4
+                + [jax.ShapeDtypeStruct((rows, length, heads), jnp.float32)])
 
     def forward(query, key, value, g, beta):
-        return chunk_gated_delta_rule(query, key, value, g, beta)
+        return chunk_gated_delta_rule(query, key, value, g, beta)[0]
+
+    def training(*given):
+        return jax.grad(lambda *given: jnp.sum(forward(*given)), argnums=(0, 1, 2, 3, 4))(*given)
 
     mesh = generation.gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), 'sm80')
-    # The default product precision the fast forms round at (the suite's lanes configure 'highest', which
-    # refuses an fp32 call on the template before its launch).
+    # The default product precision the fast forms round at (the suite's lanes configure 'highest').
     with (generation.assumed('sm80'), jax.sharding.use_abstract_mesh(mesh),
           generation.run_precision(dataclasses.replace(generation.numerics(), forms='fast')),
-          jax.default_matmul_precision('default'), generation.chosen(gated_delta_rule='mosaic_gpu')):
-        jax.jit(forward).trace(*operands)
+          jax.default_matmul_precision('default')):
+        traced = jax.jit(forward if product == 'forward' else training).trace(*operands)
+        traced.lower(lowering_platforms=("cuda",))
