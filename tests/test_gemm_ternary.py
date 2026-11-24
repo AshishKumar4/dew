@@ -587,3 +587,108 @@ def test_a_packed_products_rescue_keeps_an_explicit_meshs_row_placement():
             want = np.zeros((16, 256), np.float32)
             want[0, 0] = expected
             np.testing.assert_array_equal(np.asarray(d_rows), want)
+
+
+def test_a_packed_products_rescue_keeps_a_subnormal_remainder():
+    """Codes +1, -1 and +1 at a scale of 4 under cotangents 2**126, 2**126 and 2**-149: the first two
+    cancel past fp32's largest and the remainder, 2**-147, is subnormal; the rescue rounds it in integers,
+    so a process whose float32 arithmetic flushes subnormals still returns it (rows 1464, 12403)."""
+    codes = jnp.zeros((256, 64), jnp.float32).at[0, 0].set(1.0).at[0, 1].set(-1.0).at[0, 2].set(1.0)
+    weights = dataclasses.replace(formats.TernaryWeights.of(codes, scale=jnp.float32(1.0)),
+                                  scale=jnp.float32(4.0))
+    _, pull = jax.vjp(lambda x: gemm.ternary_weight_product(x, weights, quantize_activations=False,
+                                                            out_dtype=jnp.float32),
+                      jnp.zeros((16, 256), jnp.float32))
+    cotangent = jnp.zeros((16, 64), jnp.float32).at[0, :3].set(
+        jnp.asarray([2.0 ** 126, 2.0 ** 126, 2.0 ** -149], jnp.float32))
+    (d_rows,) = pull(cotangent)
+    want = np.zeros((16, 256), np.float32)
+    want[0, 0] = np.float32(2.0 ** -147)
+    np.testing.assert_array_equal(np.asarray(d_rows).view(np.uint32), want.view(np.uint32))
+
+
+def test_an_fp8_products_rescue_leaves_an_infinite_coefficient_to_its_own_coordinate():
+    """An E5M2 bank with codes +1, -1 and +1 at input coordinate 0 and +inf at coordinate 1, a scale of 4,
+    under cotangents 2**126, 2**126 and 1: coordinate 0's gradient is 4 (the infinity leaves the exact
+    sums' grid alone) and coordinate 1's IEEE's, +inf, the product 4 * 2**126 times the infinity; every
+    other coordinate of the row is 0 (rows 1464, 12403)."""
+    matrix = jnp.zeros((64, 64), jnp.float32).at[0, :3].set(jnp.asarray([1.0, -1.0, 1.0]))
+    matrix = matrix.at[1, 0].set(jnp.inf)
+    # E5M2 codes as given (an encode would saturate the infinity to E5M2's largest).
+    codes = formats.Fp8Weights.of(matrix.astype(jnp.float8_e5m2), fmt="e5m2", scale=jnp.float32(1.0))
+    assert np.isposinf(np.asarray(codes.decoded(jnp.float32))[1, 0])
+    weights = dataclasses.replace(codes, scale=jnp.float32(4.0))
+    _, pull = jax.vjp(lambda x: gemm.fp8_weight_product(x, weights, out_dtype=jnp.float32),
+                      jnp.zeros((16, 64), jnp.float32))
+    (d_rows,) = pull(jnp.zeros((16, 64), jnp.float32).at[0, :3].set(
+        jnp.asarray([2.0 ** 126, 2.0 ** 126, 1.0], jnp.float32)))
+    row = np.array(d_rows[0])
+    assert row[0] == 4.0 and np.isposinf(row[1]), row[:2]
+    np.testing.assert_array_equal(row[2:], np.zeros_like(row[2:]))
+
+
+def test_an_fp8_products_rescue_sums_its_non_finite_products_as_ieee_does():
+    """E5M2 coefficients +inf and +1 at input coordinate 0, +inf and NaN at 1, +inf and -1 at 2, under
+    cotangents 1 and -inf at a unit scale: coordinate 0 sums +inf and -inf, NaN; coordinate 1 a NaN; and
+    coordinate 2 +inf twice, +inf. Every non-finite product of a coordinate is read together, so no later
+    one hides an earlier; a subnormal cotangent's sign is read from its bits (rows 1464, 12403)."""
+    matrix = jnp.zeros((64, 64), jnp.float32).at[:3, 0].set(jnp.inf)
+    matrix = matrix.at[0, 1].set(1.0).at[1, 1].set(jnp.nan).at[2, 1].set(-1.0)
+    weights = formats.Fp8Weights.of(matrix.astype(jnp.float8_e5m2), fmt="e5m2", scale=jnp.float32(1.0))
+    _, pull = jax.vjp(lambda x: gemm.fp8_weight_product(x, weights, out_dtype=jnp.float32),
+                      jnp.zeros((16, 64), jnp.float32))
+    (d_rows,) = pull(jnp.zeros((16, 64), jnp.float32).at[0, :2].set(jnp.asarray([1.0, -jnp.inf])))
+    row = np.array(d_rows[0])
+    assert np.isnan(row[0]) and np.isnan(row[1]) and np.isposinf(row[2]), row[:3]
+
+    # A subnormal cotangent, -2**-149, at a scale of 2**126 against +inf: -inf, its sign and its nonzero
+    # read from its bits where a process flushes it to zero (not zero times an infinity's NaN).
+    infinite = jnp.zeros((64, 64), jnp.float32).at[0, 0].set(jnp.inf).astype(jnp.float8_e5m2)
+    single = formats.Fp8Weights.of(infinite, fmt="e5m2", scale=jnp.float32(1.0))
+    single = dataclasses.replace(single, scale=jnp.float32(2.0 ** 126))
+    _, pull = jax.vjp(lambda x: gemm.fp8_weight_product(x, single, out_dtype=jnp.float32),
+                      jnp.zeros((16, 64), jnp.float32))
+    (d_rows,) = pull(jnp.zeros((16, 64), jnp.float32).at[0, 0].set(jnp.float32(-(2.0 ** -149))))
+    assert np.isneginf(np.asarray(d_rows)[0, 0]), np.asarray(d_rows)[0, 0]
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_packed_products_rescue_is_exact_within_a_row_and_across_replicas():
+    """A ternary product's rescue sums its products exactly before one rounding (rows 12392, 12403): within
+    one row, codes +1, -1, +1 under cotangents 2**39, 2**39, 2**-1 at a scale of 2**126 leave 2**125 of
+    2**165 - 2**165 + 2**125; across two replicas of a checked `shard_map` (the rows and codes +1, -1 every
+    device's, each its own scale and cotangent), 2**126 under 4, 4 beside 2**100 under 1, 0 leaves 2**100,
+    and 2**126 under 4, 2**-26 beside 2**100 under -2**28, 0 leaves -2**100."""
+    rows = jnp.zeros((16, 256), jnp.float32).at[0, 0].set(1.0)
+    three = jnp.zeros((256, 32), jnp.float32).at[0, :3].set(jnp.asarray([1.0, -1.0, 1.0]))
+    within = dataclasses.replace(formats.TernaryWeights.of(three, scale=jnp.float32(1.0)),
+                                 scale=jnp.float32(2.0 ** 126))
+    product = functools.partial(gemm.ternary_weight_product, weights=within, quantize_activations=False,
+                                out_dtype=jnp.float32)
+    cotangent = jnp.zeros((16, 32), jnp.float32).at[0, :3].set(jnp.asarray([2.0 ** 39, 2.0 ** 39, 0.5]))
+    (d_rows,) = jax.vjp(product, rows)[1](cotangent)
+    want = np.zeros((16, 256), np.float32)
+    want[0, 0] = 2.0 ** 125
+    np.testing.assert_array_equal(np.asarray(d_rows), want)
+
+    codes = jnp.zeros((256, 32), jnp.float32).at[0, 0].set(1.0).at[0, 1].set(-1.0)
+    weights = formats.TernaryWeights.of(codes, scale=jnp.float32(1.0))
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:2]), ("data",))
+    data, whole = jax.sharding.PartitionSpec("data"), jax.sharding.PartitionSpec()
+
+    def each_device(x, scale, dy):
+        scaled = dataclasses.replace(weights, scale=scale[0])
+        replica = functools.partial(gemm.ternary_weight_product, weights=scaled, quantize_activations=False,
+                                    out_dtype=jnp.float32)
+        return jax.vjp(replica, x)[1](dy)[0]
+
+    mapped = jax.jit(jax.shard_map(each_device, mesh=mesh, in_specs=(whole, data, data), out_specs=whole,
+                                   check_vma=True))
+    scales = jnp.asarray([2.0 ** 126, 2.0 ** 100], jnp.float32)
+    for first, second, expected in (((4.0, 4.0), (1.0, 0.0), 2.0 ** 100),
+                                    ((4.0, 2.0 ** -26), (-(2.0 ** 28), 0.0), -(2.0 ** 100))):
+        dy = jnp.zeros((32, 32), jnp.float32).at[0, :2].set(jnp.asarray(first)).at[16, :2].set(
+            jnp.asarray(second))
+        want = np.zeros((16, 256), np.float32)
+        want[0, 0] = expected
+        np.testing.assert_array_equal(np.asarray(mapped(rows, scales, dy)), want)

@@ -1214,8 +1214,9 @@ def wide_transpose(cotangent: jax.Array, matrices: jax.Array, sizes: jax.Array |
                     interpret_on_cpu: bool) -> jax.Array:
     """The rows' transpose of a product with decoded bf16 `matrices` (grouped by `sizes`, or one), in fp32:
     the cotangent as its bf16 parts (`_bf16_parts`), each part's product exact and summed in fp32, the
-    parts' sums added in fp32, as the packed kernel's pullback forms it before its one rounding."""
-    parts = _bf16_parts(cotangent, bf16_part_count(jnp.float32))
+    parts' sums added in fp32, as the packed kernel's pullback forms it before its one rounding; a bf16
+    cotangent is its own one part."""
+    parts = _bf16_parts(cotangent, bf16_part_count(cotangent.dtype))
     return functools.reduce(jnp.add, [
         jnp.asarray(gemm(part, matrices, sizes, transpose_rhs=True, out_dtype=jnp.float32,
                          precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret_on_cpu))
