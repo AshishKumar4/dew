@@ -441,27 +441,39 @@ def test_a_dense_kernel_gradient_xla_takes_is_its_own_dot():
 
 
 def _masked_dot_operands(graph) -> list:
-    """Each `dot_general` operand of `graph` (its sub-jaxprs' too) that a `select_n` computes, through the
-    elementwise casts between them: a mask of the product's rows."""
+    """Each `dot_general` of `graph` (its sub-jaxprs' too, an operand followed into a call's jaxpr as its
+    parameter) whose operand a `select_n` computes, through the elementwise casts between them: a mask of the
+    product's rows."""
+    from jax.extend import core as jcore
+
     found = []
 
-    def walk(jaxpr):
-        produced = {out: eqn for eqn in jaxpr.eqns for out in eqn.outvars}
+    def walk(jaxpr, inherited: dict):
+        sources = dict(inherited) | {out: eqn for eqn in jaxpr.eqns for out in eqn.outvars}
+
+        def source(var):
+            eqn = sources.get(var)
+            while eqn is not None and eqn.primitive.name in ("convert_element_type", "copy"):
+                eqn = sources.get(eqn.invars[0])
+            return eqn
+
         for eqn in jaxpr.eqns:
-            if eqn.primitive.name == "dot_general":
-                for operand in eqn.invars:
-                    source = produced.get(operand)
-                    while source is not None and source.primitive.name in ("convert_element_type", "copy"):
-                        source = produced.get(source.invars[0])
-                    if source is not None and source.primitive.name == "select_n":
-                        found.append(eqn)
+            if eqn.primitive.name == "dot_general" and any(
+                    (each := source(operand)) is not None and each.primitive.name == "select_n"
+                    for operand in eqn.invars):
+                found.append(eqn)
             for param in eqn.params.values():
                 for sub in (param if isinstance(param, (tuple, list)) else (param,)):
                     inner = getattr(sub, "jaxpr", sub)
                     if hasattr(inner, "eqns"):
-                        walk(inner)
+                        # A call's parameters are its operands where their counts agree (pjit, custom calls).
+                        passed = ({var: sources[outer] for var, outer in zip(inner.invars, eqn.invars,
+                                                                              strict=True)
+                                   if isinstance(outer, jcore.Var) and outer in sources}
+                                  if len(inner.invars) == len(eqn.invars) else {})
+                        walk(inner, passed)
 
-    walk(graph.jaxpr)
+    walk(graph.jaxpr, {})
     return found
 
 @pytest.mark.parametrize("product", ["forward", "input gradient", "kernel gradient"])
