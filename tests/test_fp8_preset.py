@@ -842,6 +842,38 @@ def test_a_delayed_nvfp4_dense_reads_its_history_and_records_its_rows(general):
         assert NVFP4_HISTORY not in layer.init(jax.random.key(0), x)
 
 
+def test_a_delayed_nvfp4_models_every_taken_projection_reads_its_own_history():
+    """Under a delayed-scaling NVFP4 recipe (row 12721), a model's every projection the recipe takes holds an
+    amax history, one a route taken (`generation.routes`): its attention's projections (joined or not: a
+    join the recipe would take is refused, `joined._recipe_differs`), its dense and shared experts' MLPs (the
+    recipe chain declines a delayed recipe, each projection then its own), its experts' three; its gradient
+    runs, no projection refused for a scale it lacks, and the largest magnitudes it records mirror its
+    histories path for path (`dense.NVFP4_AMAX` against `dense.NVFP4_HISTORY`), what a step rolls in."""
+    from dew.nn.dense import NVFP4_AMAX, NVFP4_HISTORY
+
+    model = mixed()
+    tokens = jnp.asarray(np.random.default_rng(0).integers(0, VOCAB, (2, 64)), jnp.int32)
+    with generation.run_precision(_delayed_nvfp4()):
+        variables = model.init(jax.random.key(0), tokens)
+        held = {name: tree for name, tree in variables.items() if name != NVFP4_AMAX}
+
+        def loss(params):
+            logits, sown = model.apply({**held, "params": params}, tokens, mutable=[NVFP4_AMAX])
+            return jnp.sum(logits.astype(jnp.float32)), sown
+
+        _, sown = jax.grad(loss, has_aux=True)(held["params"])
+        # The forward's routes, one a projection the recipe considers.
+        with generation.routes() as found:
+            jax.eval_shape(lambda params: model.apply({**held, "params": params}, tokens), held["params"])
+    choice = projections.RECIPES["nvfp4"].choice
+    taken = [route for route in found if route.choice == choice and route.kernel != "unquantized"]
+    histories = jax.tree_util.tree_flatten_with_path(held[NVFP4_HISTORY])[0]
+    recorded = jax.tree_util.tree_flatten_with_path(sown[NVFP4_AMAX],
+                                                    is_leaf=lambda leaf: isinstance(leaf, tuple))[0]
+    assert histories and len(histories) == len(taken), (len(histories), len(taken))
+    assert [path for path, _ in histories] == [path for path, _ in recorded]
+
+
 def test_a_rolled_history_takes_its_steps_largest_newest():
     """A training step's update of a delayed-scaling NVFP4 run's histories (`dense.rolled`, row 12721):
     each history a step recorded shifted by one along its steps, the step's largest newest and its oldest
