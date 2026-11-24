@@ -13,8 +13,9 @@ from test_recurrence_chunk import assert_packed_on_par, hosted, sigmoid, softplu
 from dew.nn.kernels.preconditioned import CENTER, preconditioned_delta_rule
 from dew.nn.precision import l2norm
 
-ROWS, LENGTH, KEY_HEADS, VALUE_HEADS, KEYS, VALUES, CHUNK = 2, 40, 1, 2, 16, 8, 16
-"""Two whole chunks of 16 tokens and a part one, two value heads sharing a key head's moment."""
+ROWS, LENGTH, KEY_HEADS, VALUE_HEADS, KEYS, VALUES, CHUNK = 2, 40, 4, 8, 16, 8, 16
+"""Two whole chunks of 16 tokens and a part one, each pair of value heads sharing a key head's moment; four
+key heads, so a draw's centers' gradient, a key head's sum over every token and key, holds four."""
 DOCUMENTS = ((0, 11, 30), (5, 17))
 """Each row's packed documents' first tokens."""
 SEEDS = 16

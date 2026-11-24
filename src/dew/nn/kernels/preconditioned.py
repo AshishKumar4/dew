@@ -66,4 +66,4 @@ def preconditioned_delta_rule(query, key, value, log_decay, beta, atk_decay, atk
                              scale=width ** -0.5 if scale is None else scale)
     out, final = chunk(hooks, Chunk(query, written, value, log_decay=log_decay, beta=beta, erase_key=written,
                                     erase_read=key, state=state, starts=starts), chunk_size=chunk_size)
-    return out, (final, moment)
+    return out.astype(value.dtype), (final, moment)
