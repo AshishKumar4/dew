@@ -13,6 +13,7 @@ the same arrays step after step.
 """
 from __future__ import annotations
 
+import collections
 import contextlib
 import contextvars
 import dataclasses
@@ -1630,27 +1631,6 @@ class Transaction:
             norms = merge(norms, _nested(path, {in_backward.PERIOD_NORMS: held} if periodic else held))
         return norms
 
-    @staticmethod
-    def _pooled_run(accumulated: Variables, norms: Variables, prior: Variables, direct: Variables,
-                    pooling: _Pooling) -> Variables:
-        """A run's window sum once this microbatch joined it: the sum its backward pooled in place
-        (`accumulated`), or, where its backward ran on no layer of it (a branch its loss took around the
-        run, its norms' cotangent then none: `dew.nn.in_backward.scanned_run`), the sum before it at its
-        share (`prior`, as `_pooled_leaf` keeps it); with the gradient of the loss's direct reads of the run's
-        parameters outside the scan (`direct`, a term on the weights themselves) pooled at this microbatch's
-        share, as an ordinary step pools the whole of its gradient."""
-        fill, old, new, factor = pooling.fill, pooling.old, pooling.new, pooling.factor
-        assert fill is not None and old is not None and new is not None and factor is not None
-        # Every layer's squares and count not finite are zero where its backward never ran.
-        ran = jnp.stack([jnp.any(leaf != 0) for leaf in jax.tree.leaves(norms)]).any()
-
-        def joined(pooled, before, outside):
-            kept = jnp.where(fill == 0, jnp.zeros_like(before), before * jnp.asarray(old, before.dtype))
-            return (jnp.where(ran, pooled, kept)
-                    + _unscale(outside, factor).astype(pooled.dtype) * jnp.asarray(new, pooled.dtype))
-
-        return jax.tree.map(joined, accumulated, prior, direct)
-
     def _planned_accumulation(self, state: TrainState) -> _Planned | None:
         """In-backward gradient pooling for a shared-mean accumulating window (`self.size > 1`): each
         scanned layer's unscaled gradient is pooled directly into `state.accumulation.gradient` during the
@@ -1803,6 +1783,9 @@ class Transaction:
         otherwise), and that plan."""
         watching = step_info.watched is not None and bool(step_info.watched.cotangents)
         planned = None if host or watching or realize != self.realize else self.planned(state)
+        if planned is not None and planned.pooling is not None and not self._pools_once(
+                planned, read, batch, step_info, factor):
+            planned = None
         if planned is None:
             return self._realized(realize, read, batch, step_info, factor), None
         with in_backward.planned(planned.plan):
@@ -1814,6 +1797,37 @@ class Transaction:
                              "_updates_in_backward must say so")
         return realized, planned
 
+    def _pools_once(self, planned: _Planned, read: Variables, batch: Batch, step_info, factor) -> bool:
+        """Whether every run the loss reads under `planned`'s pooling reads its parameters, and the window's
+        sum it pools into, in one call at the loss's own level, which nothing else of the loss reads: its
+        backward then runs exactly once a microbatch and writes the sum in place (the donated sum read by
+        nothing after it), its parameters' gradient all its own. A run called in a loop or a branch (whose
+        body runs as many times as it steps, or none), or whose parameters the loss reads beside it (a term
+        on the weights themselves), is pooled by no backward: the step accumulates as it would unscanned.
+        Read off the loss's program, traced once under a plan of its own (`gradients_read`'s walk)."""
+        trainable = {"params": read["params"], **planned.read}
+        probe = dataclasses.replace(planned.plan, handled=[])
+
+        def loss(trainable):
+            return self.objective._loss({**read, **trainable}, batch, step_info)
+
+        with unscaled(factor), fixed_routers(), in_backward.planned(probe):
+            program = jax.make_jaxpr(loss)(trainable).jaxpr
+        handled = [_state_path(path) for path in probe.handled]
+        if not handled:
+            return True
+        roots: dict[jcore.Var, tuple[str, ...]] = {}
+        for (path, _), value in zip(jax.tree_util.tree_flatten_with_path(trainable)[0], program.invars,
+                                    strict=True):
+            names = tuple(str(entry.key) for entry in path[1:] if isinstance(entry, jax.tree_util.DictKey))
+            root = next((run for run in handled if names[:len(run)] == run), None)
+            if root is not None:
+                roots[value] = root
+        reads: collections.Counter[tuple[str, ...]] = collections.Counter()
+        refused: set[tuple[str, ...]] = set()
+        _run_reads(program, roots, reads, refused)
+        return all(reads[run] == 1 and run not in refused for run in handled)
+
     def _pulled(self, state: TrainState, realized: Realization, cotangent, planned: _Planned | None,
                 factor, *, whole: bool, masters: bool
                 ) -> tuple[Variables, Variables | None, Applied | None, tuple[tuple[str, ...], ...]]:
@@ -1823,7 +1837,7 @@ class Transaction:
         if planned is not None:
             if planned.pooling is not None:
                 previous = state.accumulation
-                assert previous is not None and previous.gradient is not None
+                assert previous is not None
                 prior_mass, _, mass, _, _, denominator = _pooling_weights(previous, realized.stats)
                 planned.pooling.fill, planned.pooling.old = occupancy(previous), prior_mass / denominator
                 planned.pooling.new, planned.pooling.factor = mass / denominator, factor
@@ -1832,10 +1846,11 @@ class Transaction:
                 handled = tuple(_state_path(path) for path in planned.plan.handled)
                 if not handled:
                     return gradient, None, None, ()
-                pooled = functools.reduce(merge, [_nested(path, self._pooled_run(
-                    _at(cotangents[in_backward.MASTERS], path), _at(cotangents[in_backward.NORMS], path),
-                    _at(previous.gradient, path), _at(gradient, path), planned.pooling))
-                    for path in handled], {})
+                # Each run read once, its parameters by nothing else (`_pools_once`): its window sum is the
+                # one its backward pooled in place, its parameters' own cotangent none.
+                accumulated = cotangents[in_backward.MASTERS]
+                pooled = functools.reduce(merge, [_nested(path, _at(accumulated, path)) for path in handled],
+                                          {})
                 return merge(gradient, pooled), None, None, handled
             loss, active = self.objective.reduce_loss(realized.stats)
             # A run that updates in its backward holds no loss scale (`consumed_where_made`), so where it
@@ -2016,6 +2031,48 @@ class Transaction:
                                                     tokens, probed)
             return together(advanced, held), loss, aux, committed
         return run
+
+
+_PASSED = frozenset({"sharding_constraint", "optimization_barrier", "copy", "reshape", "squeeze",
+                     "expand_dims", "transpose", "convert_element_type"})
+"""The primitives whose results are their operands one for one, placed (a sharding constraint), held from
+fusion (a barrier), copied, laid out anew (a stage-local stack's layers reshaped to a run's) or cast,
+which a run's variables pass through as themselves (`_run_reads`)."""
+
+
+def _run_reads(program: jcore.Jaxpr, roots: Mapping[jcore.Var, tuple[str, ...]],
+               reads: collections.Counter[tuple[str, ...]], refused: set[tuple[str, ...]]
+               ) -> dict[jcore.Var, tuple[str, ...]]:
+    """Count in `reads` each equation of `program` that reads a run's variables (`roots`: each by its run)
+    as one read of that run: a custom derivative's call (a scanned run's own, `dew.nn.in_backward`) one
+    read, a call (`called`) through its program, its results that are the run's variables still the run's;
+    any other equation reading them (a loop, a branch, a term on the weights) puts the run in `refused`.
+    The variables of each run among `program`'s results."""
+    held = dict(roots)
+    for equation in program.eqns:
+        runs = {held[value] for value in equation.invars if computed(value) and value in held}
+        if not runs:
+            continue
+        if "custom_vjp" in equation.primitive.name:
+            reads.update(runs)
+            continue
+        if equation.primitive.name in _PASSED:
+            # Each result its operand, placed or held apart: still the run's.
+            held.update({value: held[given]
+                         for value, given in zip(equation.outvars, equation.invars, strict=False)
+                         if computed(given) and given in held})
+            continue
+        body = called(equation)
+        if body is None:
+            refused |= runs
+            continue
+        inner = {inside: held[value] for value, inside in zip(equation.invars, body.invars, strict=True)
+                 if computed(value) and value in held}
+        through = _run_reads(body, inner, reads, refused)
+        held.update({value: through[inside]
+                     for value, inside in zip(equation.outvars, body.outvars, strict=True)
+                     if computed(inside) and inside in through})
+    return held
 
 
 def gradients_read(program: jcore.Jaxpr, read: Sequence[frozenset[int]]) -> list[frozenset[int]]:

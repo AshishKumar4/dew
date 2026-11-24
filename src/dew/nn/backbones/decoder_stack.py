@@ -601,11 +601,22 @@ def _updates_in_backward(run: nn.Module, specs: Sequence[LayerSpec], *, train: b
     return not any(run.is_mutable_collection(name) for name in (*WRITTEN, "intermediates"))
 
 
-def _drops_out(run: nn.Module) -> bool:
-    """Whether `run`'s layers drop anything out (a field naming a dropout rate above zero), whose masks a
-    layer applied on its own draws otherwise than Linen's scan does (`_updated_in_backward`)."""
-    return any(field.name.endswith("dropout_rate") and getattr(run, field.name) > 0
-               for field in dataclasses.fields(run))
+def _drops_out(module: nn.Module, seen: frozenset[int] = frozenset()) -> bool:
+    """Whether `module`, a run's layer, or any module it holds (a stage's blocks, a block's mixers and their
+    context) drops anything out: a field naming a dropout rate above zero, whose masks a layer applied on
+    its own draws otherwise than Linen's scan does (`_updated_in_backward`)."""
+    seen = seen | {id(module)}
+    for field in dataclasses.fields(module):
+        if field.name == "parent":
+            continue
+        value = getattr(module, field.name)
+        if "dropout" in field.name and isinstance(value, int | float) and value > 0:
+            return True
+        held = value if isinstance(value, tuple | list) else (value,)
+        if any(isinstance(child, nn.Module) and id(child) not in seen and _drops_out(child, seen)
+               for child in held):
+            return True
+    return False
 
 
 def _kept_without_a_rung(remat: RematPolicy | None) -> tuple[str, ...]:

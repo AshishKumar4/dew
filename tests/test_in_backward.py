@@ -598,16 +598,14 @@ def test_an_accumulating_scanned_step_holds_no_extra_gradient_buffer(generation,
     split = ahead(1, 2, 2)
     shapes = jax.eval_shape(model.init, jax.random.key(0), jnp.zeros((1, 16), jnp.int32))["params"]
     narrow = 2 * sum(leaf.size for leaf in jax.tree.leaves(shapes))
-    # The window's float32 sum its first call builds, an output beside the step's state, no argument yet.
-    window = 4 * sum(leaf.size for leaf in jax.tree.leaves(shapes))
 
     def beside(ahead) -> int:
         """What a step holds beside its arguments: its outputs that alias none and its temporaries, so a
         second stacked sum held as an unaliased output counts as one held among its temporaries does."""
         return ahead.output_bytes - ahead.alias_bytes + ahead.temp_bytes
 
-    assert beside(accumulated) - beside(one) < window + narrow, (beside(accumulated), beside(one), window)
-    assert beside(split) - beside(one) < window + narrow, (beside(split), beside(one), window)
+    assert beside(accumulated) - beside(one) < narrow, (beside(accumulated), beside(one), narrow)
+    assert beside(split) - beside(one) < narrow, (beside(split), beside(one), narrow)
 
 
 ACCUMULATING_SEEDS = 64
@@ -616,32 +614,68 @@ layer-at-a-time sites' (`RUN_SEEDS`), whose judgement the map judge widens where
 
 
 class _Penalized(LMObjective):
-    """An LM whose loss adds a term on its parameters themselves, read where they lie outside any scan: a
-    gradient its step pools beside the one its scanned layers pool in their backward."""
+    """An LM whose loss adds a term on its stacked layers' parameters themselves, read where they lie beside
+    the layers' scan: a run whose parameters another term reads pools nothing in its backward
+    (`Transaction._pools_once`)."""
 
     def loss(self, variables, batch, step):
         stats, aux = super().loss(variables, batch, step)
         assert isinstance(stats, Ratio), type(stats)
-        penalty = sum(jnp.sum(jnp.square(leaf.astype(jnp.float32))) for leaf in jax.tree.leaves(
-            variables["params"]))
+        stacked = [leaf for path, leaf in jax.tree_util.tree_leaves_with_path(variables["params"])
+                   if "layers" in jax.tree_util.keystr(path)]
+        penalty = sum(jnp.sum(jnp.square(leaf.astype(jnp.float32))) for leaf in stacked)
         return Ratio(stats.total + 1e-3 * penalty * stats.mass, stats.mass), aux
 
 
+class _Branched(LMObjective):
+    """An LM whose loss runs its decoder in a branch its batch chooses (`jax.lax.cond`), the same call both
+    ways: a run read in a branch pools nothing in its backward (`Transaction._pools_once`)."""
+
+    def loss(self, variables, batch, step):
+        def scored(held):
+            return LMObjective.loss(self, held, batch, step)
+        return jax.lax.cond(batch["text"][0, 0] >= 0, scored, scored, variables)
+
+
+class _Repeated(LMObjective):
+    """An LM whose loss reads its batch twice in a loop (`jax.lax.scan`), its two passes' statistics summed:
+    a run read in a loop pools nothing in its backward (`Transaction._pools_once`)."""
+
+    def loss(self, variables, batch, step):
+        def scored(carry, _):
+            return carry, LMObjective.loss(self, variables, batch, step)
+        _, (stats, aux) = jax.lax.scan(scored, None, None, length=2)
+        assert isinstance(stats, Ratio), type(stats)
+        return (Ratio(jnp.sum(stats.total), jnp.sum(stats.mass)), jax.tree.map(lambda leaf: leaf[0], aux))
+
+
+OBJECTIVES = {"lm": LMObjective, "penalized": _Penalized, "branched": _Branched, "repeated": _Repeated}
+"""Each accumulating witness's objective: the LM, whose runs pool in their backward, and those whose runs
+the step accumulates ordinarily, read beside a term on the weights, in a branch or in a loop."""
+
+
 @pytest.mark.mesh(devices=2)
-@pytest.mark.parametrize(("dtype", "clip", "periodic"), [
-    pytest.param("float32", 0.0, False, id="fp32",
+@pytest.mark.parametrize(("dtype", "clip", "periodic", "objective"), [
+    pytest.param("float32", 0.0, False, "lm", id="fp32",
                  marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
-    pytest.param("bfloat16", 1.0, False, id="bf16-clipped",
+    pytest.param("bfloat16", 1.0, False, "lm", id="bf16-clipped",
                  marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
-    pytest.param("float32", 0.0, True, id="periodic",
+    pytest.param("float32", 0.0, True, "lm", id="periodic",
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
+    pytest.param("float32", 0.0, False, "penalized", id="direct-reader",
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
+    pytest.param("float32", 0.0, False, "branched", id="branched",
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
+    pytest.param("float32", 0.0, False, "repeated", id="repeated",
                  marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
 ])
-def test_an_accumulating_scanned_step_matches_unrolled(dtype, clip, periodic):
-    """A scanned step pooling its gradient in its backward (`Transaction._planned_accumulation`) over a
-    window of two accumulated batches each split in two, its parts of unequal token counts, its loss
-    reading its parameters directly beside its layers' scan, clipped with narrow copies or over a periodic
-    stack, on two devices splitting its parameters, leaves its parameters and optimizer state after two
-    updates on par with the unrolled step's (check 1, against one device's float64 unrolled step)."""
+def test_an_accumulating_scanned_step_matches_unrolled(dtype, clip, periodic, objective):
+    """A scanned step accumulating a window of two batches each split in two, its parts of unequal token
+    counts (padding scored as none), leaves its parameters and optimizer state after two updates on par
+    with the unrolled step's (check 1, against one device's float64 unrolled step), on two devices
+    splitting its parameters: pooling its gradient in its backward (`Transaction._planned_accumulation`),
+    clipped with narrow copies or over a periodic stack; or accumulating it as an unscanned step does where
+    its loss reads a run beside a term on its weights, in a branch or in a loop (`_pools_once`)."""
     from arm_forms import as_given
     from test_stage_local import wide
 
@@ -655,7 +689,8 @@ def test_an_accumulating_scanned_step_matches_unrolled(dtype, clip, periodic):
     def built(*, exact: bool = False) -> Trainer:
         model = decoder(dtype="float64" if exact else dtype, **extra)
         mesh = MeshSpec() if exact else MeshSpec(fsdp=2)
-        run = Trainer(_Penalized(model, SEQ), optimizer, key=jax.random.key(0), mesh=mesh,
+        scored = OBJECTIVES[objective](model, SEQ, pad_id=0)
+        run = Trainer(scored, optimizer, key=jax.random.key(0), mesh=mesh,
                       layout=Layout(min_shard=TINY_SHARD), update=UpdateBatch(batches=2),
                       fit=FitPolicy(split=2), checkpoints=None, tracker=None)
         run.device_mesh = mesh.build(jax.devices()[:1 if exact else 2])
