@@ -242,6 +242,12 @@ def staged(smem, value: jax.Array, ref, place: tuple, *, write: Callable = writt
                          f"share of rows {first} to {first} + {stored} (a grouped tile's, or one ending "
                          "mid-tensor) takes none; a dense call's last share states them all, the tensor's "
                          "bound clipping")
+    if transposed and width == 1 and ref.shape[-1] % rows:
+        # A one-column box is one contiguous run, which Mosaic GPU copies by a linear bulk copy clamped
+        # at the whole tensor's end, not its row's: a last share past the rows' end writes into the next
+        # column's rows (`launch_context.async_copy`'s contiguous path).
+        raise ValueError(f"a transposed output's one-column chunk of {rows}-row shares over "
+                         f"{ref.shape[-1]} rows runs its last share into its next column")
     if divisor > 1 and not transposed:
         _aligned_ladder(width * jax.dtypes.itemsize_bits(smem.dtype) // 8, first, ladder)
     chunks = column_chunks(value, width * divisor)
