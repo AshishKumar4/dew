@@ -1931,11 +1931,13 @@ def test_fused_dkv_width64_derives_and_compiles_spill_free_on_sm80_and_sm100(gen
     key = jax.ShapeDtypeStruct((1, queries, 2, 64), jnp.bfloat16)
     shapes = jax.tree.map(lambda array: jax.ShapeDtypeStruct(array.shape, array.dtype),
                           _residuals(query.shape))
-    op_b, ba_b, _ = _gated_backward(gen, 64, accurate=False)
+    op_b, ba_b, derived = _gated_backward(gen, 64, accurate=False)
+    assert isinstance(derived, attention_mosaic.BackwardTiles), derived
     with generation.assumed(gen):
-        # The fused launch the derivation prices beside the two (`MosaicBackward.candidates`), whichever it
-        # takes (an A100's the two, row 12752).
-        cfg = next(config for config in op_b.candidates(ba_b, generation.gpu_target(gen)) if config.fused)
+        # The derived launch where fused (a B200's walk), else the fused one its derivation priced beside the
+        # two it took (`MosaicBackward.candidates`: an A100's, row 12752).
+        cfg = derived if derived.fused else next(
+            config for config in op_b.candidates(ba_b, generation.gpu_target(gen)) if config.fused)
         if gen == "sm100":
             t_sm100 = generation.gpu_target(gen)
             shallow = dataclasses.replace(cfg, stages=2)
