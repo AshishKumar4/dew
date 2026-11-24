@@ -179,21 +179,22 @@ def _erases_laid(hooks: recurrence.Hooks, query, key, value, g, beta, given: dic
     beta k (v + c^T D h)^T`); an untied one (GDN-2's, Comba's) as two such a token: the decay and erase, keys
     `a`, values zero, gate `beta`, reader `c = -b`, then the write, keys `k`, values `v`, gate `beta`, no
     decay or correction, its query on the second, a packed document from its first. The erase vectors each key
-    head's over its value heads. `(query, key, value, g, beta, erase, starts, firsts)`, `erase` the additive
-    erase's `(a, c)`, the read's and the untied's `(None, c)`, the untied's laid `[B, 2S, ...]` (`_laid`)."""
+    head's over its value heads, but a read erase's, each key head's. `(query, key, value, g, beta, erase,
+    starts, firsts)`, `erase` the additive erase's `(a, c)`, the read's and the untied's `(None, c)`, the
+    untied's laid `[B, 2S, ...]` (`_laid`)."""
     heads = value.shape[2]
-    b = jnp.repeat(given['erase_read'], heads // given['erase_read'].shape[2], axis=2).astype(g.dtype)
-    a = (None if hooks.erase == 'read'
-         else jnp.repeat(given['erase_key'], heads // given['erase_key'].shape[2], axis=2).astype(g.dtype))
+    if hooks.erase == 'read':
+        # Its reads and keys each key head's, as given (the template shares them over the key head's value
+        # heads; the portable math repeats them, `_on_portable`), the keys in their dtype: a 16-bit call's a
+        # 16-bit call on the template (`port_kernel`'s `reads`).
+        return query, key, value, g, beta, (None, -given['erase_read'].astype(g.dtype)), starts, firsts
+    b, a = (jnp.repeat(given[name], heads // given[name].shape[2], axis=2).astype(g.dtype)
+            for name in ('erase_read', 'erase_key'))
     if hooks.erase == 'additive':
         return query, key, value, g, beta, (a, -b), starts, firsts
     group = heads // key.shape[2]
-    keys = jnp.repeat(key, group, axis=2)
+    keys = jnp.repeat(key, group, axis=2).astype(g.dtype)
     queries = jnp.repeat(query, group, axis=2)
-    if hooks.erase == 'read':
-        # The keys in their dtype: a 16-bit call's a 16-bit call on the template (`port_kernel`'s `reads`).
-        return queries, keys, value, g, beta, (None, -b), starts, firsts
-    keys = keys.astype(g.dtype)
 
     def laid(first, second):
         return jnp.stack([first, second], axis=2).reshape(first.shape[0], -1, *first.shape[2:])
@@ -1602,6 +1603,9 @@ def _on_portable(hooks: recurrence.Hooks, query, key, value, g, beta, state, tur
     # Oja's rule's keys on its transposed memory are its values (`_portable`).
     width = value.shape[-1] if hooks.erase == 'values' else key.shape[-1]
     size = held_chunk(chunk_size, width) if hooks.delta else chunk_size
+    if correction is not None and correction.shape[2] != value.shape[2]:
+        # A read erase's reads each key head's (`_erases_laid`), its correction each value head's.
+        correction = jnp.repeat(correction, value.shape[2] // correction.shape[2], axis=2)
     if correction is not None or across is not None or hooks.erase == 'values':
         return _portable(hooks, Tiles(size), query, key, value, g, beta, state, starts, firsts, scale=scale,
                          dtype=dtype, forked=forked, own=own, correction=correction, across=across,
