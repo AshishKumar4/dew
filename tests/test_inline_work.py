@@ -322,3 +322,34 @@ def test_an_address_through_chained_element_pointers_keeps_each_index_lanes():
         llvm.load(f32, mgpu_utils.getelementptr(lane, [uniform.registers.item()], f32))
 
     assert _counted(body, 0).shared_bytes == 4 * 128
+
+
+def test_element_pointers_of_mixed_widths_cancel_by_their_bytes_and_a_narrow_index_reads_signed():
+    """Two element pointers of a lane, its word's (4 bytes) then minus four times its index in bytes (an i16
+    index of -4 times the lane, `arith.trunci` of it, over bytes): every lane's address the same, one word
+    moved, as the bytes cancel; read unscaled, or unsigned (-4 as 65532), the lanes stay apart."""
+    def body(ctx, ref):
+        del ctx
+        from jax._src.lib.mlir.dialects import llvm
+
+        f32, i8, i16 = (ir.F32Type.get(), ir.IntegerType.get_signless(8), ir.IntegerType.get_signless(16))
+        thread = mgpu_utils.thread_idx()
+        word = mgpu_utils.getelementptr(mgpu_utils.memref_ptr(ref), [thread], f32)
+        back = arith.trunci(i16, arith.muli(thread, arith.constant(ir.IntegerType.get_signless(32), -4)))
+        llvm.load(f32, mgpu_utils.getelementptr(word, [back], i8))
+
+    assert _counted(body).shared_bytes == 4
+
+
+def test_an_elements_stride_is_stated_only_where_its_layout_is_its_payload():
+    """An element pointer's stride is its element's bytes only where LLVM lays it out so (a scalar of 8 to 64
+    bits, a vector of a power of two of them); an i24 (padded to four bytes), i1s (packed to bits) and a
+    vector of three (padded to four) state none, their lanes left unknown."""
+    from dew.nn.kernels.templates import inline_work
+
+    with ir.Context(), ir.Location.unknown():
+        i32, f16 = ir.IntegerType.get_signless(32), ir.F16Type.get()
+        assert inline_work._stride(i32) == 4 and inline_work._stride(ir.VectorType.get([4], f16)) == 8
+        bits = ir.VectorType.get([8], ir.IntegerType.get_signless(1))
+        for unknown in (ir.IntegerType.get_signless(24), bits, ir.VectorType.get([3], i32)):
+            assert inline_work._stride(unknown) is None

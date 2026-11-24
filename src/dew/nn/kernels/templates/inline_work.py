@@ -354,7 +354,9 @@ class _Lanes:
             case "arith.extsi" | "arith.extui" | "arith.index_cast" | "arith.index_castui" | "arith.trunci":
                 return offsets[0]
             case "llvm.getelementptr" if all(each is not None for each in offsets):
-                return _element_offsets(op, offsets)
+                index = op.operands[1] if len(op.operands) > 1 else None
+                return _element_offsets(op, offsets, index is None or index in self.values
+                                        or index not in self.varying)
         return None
 
     def issued(self, op, active: np.ndarray) -> Work:
@@ -714,21 +716,49 @@ def _is_float(value_type: ir.Type) -> bool:
     return isinstance(element, ir.FloatType)
 
 
-def _element_offsets(op, offsets: list) -> np.ndarray | None:
+def _element_offsets(op, offsets: list, known: bool) -> np.ndarray | None:
     """An `llvm.getelementptr`'s address in bytes up to a uniform term, its base's (`offsets[0]`) plus its
-    one index's times its element's bytes (a dynamic index `offsets[1]`, a constant one a uniform term), so
-    each index of a chain of them keeps its lanes; None for several indices (a struct's or array's walk)."""
+    one index's, read signed at its width as LLVM reads it, times its element's stride (a dynamic index
+    `offsets[1]`, a constant one a uniform term), so each index of a chain of them keeps its lanes; None for
+    several indices (a struct's or array's walk), an element whose stride is no rule's (`_stride`), or a
+    narrow index its lanes hold apart known only up to a uniform term (not `known`: its wrap at its width
+    depends on that term; an index every lane holds alike moves no lane from another)."""
     indices = ir.DenseI32ArrayAttr(op.attributes["rawConstantIndices"])
     if len(indices) != 1:
         return None
     base = offsets[0]
     if len(offsets) == 1:
         return base
-    element = ir.TypeAttr(op.attributes["elem_type"]).value
-    scalar = element.element_type if isinstance(element, ir.VectorType) else element
-    if not isinstance(scalar, ir.IntegerType | ir.FloatType | ir.IndexType):
+    stride = _stride(ir.TypeAttr(op.attributes["elem_type"]).value)
+    index_type = op.operands[1].type
+    narrow = isinstance(index_type, ir.IntegerType) and index_type.width < 64
+    if stride is None or (narrow and not known):
         return None
-    return base + offsets[1] * _bytes(element)
+    return base + (_signed(offsets[1], index_type.width) if narrow else offsets[1]) * stride
+
+
+def _stride(element: ir.Type) -> int | None:
+    """An element's allocation stride in bytes as LLVM lays an array of it out, where it is its payload's: a
+    scalar of 8, 16, 32 or 64 bits, or a vector of a power of two of them (its alignment its size); None for
+    any other (a vector of three, padded to four; an i24, padded to four bytes; i1s, packed to bits), whose
+    layout no rule states."""
+    scalar = element.element_type if isinstance(element, ir.VectorType) else element
+    if isinstance(scalar, ir.IndexType):
+        bits = 64
+    elif isinstance(scalar, ir.IntegerType | ir.FloatType):
+        bits = scalar.width
+    else:
+        return None
+    if bits not in (8, 16, 32, 64):
+        return None
+    count = _elements(element)
+    return _bytes(element) if count & (count - 1) == 0 else None
+
+
+def _signed(values: np.ndarray, width: int) -> np.ndarray:
+    """`values`' low `width` bits read as a signed integer."""
+    half = 1 << (width - 1)
+    return (values + half) % (1 << width) - half if width < 64 else values
 
 
 def _bytes(value_type: ir.Type) -> int:
