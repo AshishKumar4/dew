@@ -40,7 +40,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable, Mapping, Sequence
-from typing import Literal, NamedTuple
+from typing import Literal, NamedTuple, cast
 
 import jax
 import jax.numpy as jnp
@@ -135,14 +135,16 @@ def _traced(declaration: Scan, function: Callable, names: tuple[str, ...], chunk
     def named(h, *xs):
         return function(h, **dict(zip(names, xs, strict=True)))
 
-    def token(name: str) -> jax.ShapeDtypeStruct:
-        axes = zip(chunk[name].shape, declaration.operands[name], strict=True)
-        return jax.ShapeDtypeStruct(tuple(extent for extent, axis in axes if axis != declaration.walked),
-                                    chunk[name].dtype)
-
-    tokens = [token(name) for name in names]
+    tokens = [token_type(declaration, chunk, name) for name in names]
     with jax.disable_jit():
         return jax.make_jaxpr(named)(jax.ShapeDtypeStruct(shape, dtype), *tokens)
+
+
+def token_type(declaration: Scan, chunk: Mapping, name: str) -> jax.ShapeDtypeStruct:
+    """`chunk`'s operand `name` at one token: its type without the walked axis."""
+    axes = zip(chunk[name].shape, declaration.operands[name], strict=True)
+    return jax.ShapeDtypeStruct(tuple(extent for extent, axis in axes if axis != declaration.walked),
+                                chunk[name].dtype)
 
 
 def derive_scan(declaration: Scan, *, saturation: program.Saturation,
@@ -176,15 +178,10 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
     product) forming and joining a walk's transfer. The same forms without one take Dew's products, the
     portable route's; a chunk's transition, which a walk that carries its transfer composes (`prepare(chunk,
     transition=True)`), is always Dew's, formed chunk-parallel."""
-    if isinstance(declaration.state[0][0], tuple):
-        # A pair's states (`Scan.state`), each a shape and a dtype.
-        from dew.algebra.coupled_scan import derive_coupled
-
-        return derive_coupled(declaration, saturation=saturation)
+    if isinstance(declaration.state[0][0], tuple):  # a pair's (`Scan.state`)
+        return _coupled(declaration, saturation)
     names = tuple(name for name in declaration.operands if name != declaration.reset)
-    shape, dtype = declaration.state
-    if len(shape) != 2:
-        raise Refused("a state of rank other than two (keys by values) has no chunk form here")
+    shape, dtype = _keyed_state(declaration)
 
     # The token's affine map by its operands' types and what its derivation reads where it runs
     # (`derive.context`: the mesh, the target, the numerics, the matmul precision its products' parameters
@@ -270,6 +267,21 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
     return Derived(init, _stepped, merge, finish, mapped,
                    {"rounding": "compensated prefix", "walked": declaration.walked},
                    functools.partial(_replay_backward, replay, names), prepare, replay=replay)
+
+
+def _keyed_state(declaration: Scan) -> State:
+    """A declaration's one state's shape and dtype, refused unless it is keys by values."""
+    shape, dtype = cast(State, declaration.state)
+    if len(shape) != 2:
+        raise Refused("a state of rank other than two (keys by values) has no chunk form here")
+    return shape, dtype
+
+
+def _coupled(declaration: Scan, saturation: program.Saturation) -> Derived:
+    """A pair's forms (`coupled_scan.derive_coupled`)."""
+    from dew.algebra.coupled_scan import derive_coupled
+
+    return derive_coupled(declaration, saturation=saturation)
 
 
 def _segment_parts(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, window=None):
@@ -1009,23 +1021,8 @@ def _token(parts: linear_scan.Parts, token: tuple) -> tuple:
     `Q`, free readout `R` (zeros where the readout has none) and exponent along the values `E` (zeros where
     its update decays none, `linear_scan.Parts.across`): the affine map's parts
     (`linear_scan.Parts`) at the token's values, each in float32 at least."""
-    shape = aval(parts.update.jaxpr.invars[0]).shape
-    zero = jnp.zeros(shape, aval(parts.update.jaxpr.invars[0]).dtype)
-    carried = at_least_fp32(zero.dtype)  # the parts' constants': a float64 run's are float64
-    envs: dict = {}
-
-    def read(index: int):
-        traced, atom = parts.atoms[index]
-        if isinstance(atom, jcore.Literal):
-            return jnp.asarray(atom.val)
-        env = envs.setdefault(id(traced), environment(traced, (zero, *token), {}))
-        evaluate(traced, env, read_by(traced.jaxpr, {atom}))
-        return env[atom].astype(at_least_fp32(env[atom].dtype))
-
-    def along(term, extent: int):
-        value = linear_scan.value_of(term, read, shape[0], carried)
-        return jnp.broadcast_to(jnp.reshape(value, (-1,)) if jnp.ndim(value) == 2 else value, (extent,))
-
+    shape, along = token_terms(parts, token)
+    carried = at_least_fp32(aval(parts.update.jaxpr.invars[0]).dtype)
     keys, values = shape
     B, U = along(parts.left, keys), along(parts.right, values)
     corrects = parts.correction is not None
@@ -1037,6 +1034,33 @@ def _token(parts: linear_scan.Parts, token: tuple) -> tuple:
     across = jnp.zeros((values,), carried) if parts.across is None else along(parts.across, values)
     erase = jnp.zeros_like(B) if parts.erase is None else along(parts.erase, keys)
     return exponent, B, U, s, C, along(parts.reader, reader), along(parts.free, out), across, erase
+
+
+def token_terms(parts, token: tuple, states: int = 1) -> tuple[tuple[int, ...], Callable]:
+    """The state's shape and `along(term, extent)`: a term of the update's or readout's parts free of the
+    state (`linear_scan.Parts`', `Coupled`'s) at one token's values, `[extent]` in float32 at least, its
+    traced programs evaluated from `states` zero states (a pair's two) and `token`."""
+    shape = aval(parts.update.jaxpr.invars[0]).shape
+    zero = jnp.zeros(shape, aval(parts.update.jaxpr.invars[0]).dtype)
+    carried = at_least_fp32(zero.dtype)  # the parts' constants': a float64 run's are float64
+    envs: dict = {}
+
+    def read(index: int):
+        traced, atom = parts.atoms[index]
+        if isinstance(atom, jcore.Literal):
+            return jnp.asarray(atom.val)
+        env = envs.setdefault(id(traced), environment(traced, (*(zero,) * states, *token), {}))
+        evaluate(traced, env, read_by(traced.jaxpr, {atom}))
+        return env[atom].astype(at_least_fp32(env[atom].dtype))
+
+    def along(term, extent: int | None):
+        """`term`'s value broadcast to `[extent]`, or as it is where `extent` is None (a scalar)."""
+        value = linear_scan.value_of(term, read, shape[0], carried)
+        if extent is None:
+            return value
+        return jnp.broadcast_to(jnp.reshape(value, (-1,)) if jnp.ndim(value) == 2 else value, (extent,))
+
+    return shape, along
 
 
 @functools.cache

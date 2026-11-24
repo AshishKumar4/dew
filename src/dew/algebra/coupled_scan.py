@@ -40,14 +40,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
-from jax.extend import core as jcore
 from jax.scipy.linalg import solve_triangular
 
 from dew import _cache
 from dew.algebra import derive, linear_scan, program, terms
-from dew.algebra.forms import Derived, Refused, aval, environment, evaluate
+from dew.algebra.forms import Derived, Refused
+from dew.algebra.scan import _exp, _replay_backward, _walked_tokens, token_terms, token_type
 from dew.nn.precision import at_least_fp32
-from dew.nn.programs import read_by
 
 
 def derive_coupled(declaration, *, saturation: program.Saturation) -> Derived:
@@ -57,8 +56,6 @@ def derive_coupled(declaration, *, saturation: program.Saturation) -> Derived:
     the pair entering it, `finish(state, operands)` the final pair, `replay(chunk, h)` the chunk walked token
     by token and `backward(chunk, state, d_state, d_outputs)` its derivative; `merge`, a window and a walk's
     hooks refused."""
-    from dew.algebra import scan
-
     names = tuple(name for name in declaration.operands if name != declaration.reset)
     (shape, dtype), second = declaration.state
     if second != (shape, dtype) or len(shape) != 2:
@@ -81,7 +78,7 @@ def derive_coupled(declaration, *, saturation: program.Saturation) -> Derived:
         return _cache.holding(decomposed, key, made, derive.FORMS_HELD)
 
     def tokens(chunk: Mapping) -> tuple:
-        along, every = scan._walked_tokens(declaration, chunk)
+        along, every = _walked_tokens(declaration, chunk)
         parts = affine_of(chunk)
         return jax.vmap(lambda token: _at_token(declaration, names, parts, {**token, **every}))(along)
 
@@ -109,7 +106,7 @@ def derive_coupled(declaration, *, saturation: program.Saturation) -> Derived:
 
     return Derived(init, _stepped, merge, finish, _mapped,
                    {"rounding": "running products", "walked": declaration.walked},
-                   functools.partial(scan._replay_backward, replay, names), prepare, replay=replay)
+                   functools.partial(_replay_backward, replay, names), prepare, replay=replay)
 
 
 def _traced(declaration, function, names: tuple[str, ...], chunk: Mapping):
@@ -120,39 +117,20 @@ def _traced(declaration, function, names: tuple[str, ...], chunk: Mapping):
     def named(pair, *xs):
         return function(pair, **dict(zip(names, xs, strict=True)))
 
-    def token(name: str) -> jax.ShapeDtypeStruct:
-        axes = zip(chunk[name].shape, declaration.operands[name], strict=True)
-        return jax.ShapeDtypeStruct(tuple(extent for extent, axis in axes if axis != declaration.walked),
-                                    chunk[name].dtype)
-
     state = jax.ShapeDtypeStruct(shape, dtype)
+    tokens = [token_type(declaration, chunk, name) for name in names]
     with jax.disable_jit():
-        return jax.make_jaxpr(named)((state, state), *(token(name) for name in names))
+        return jax.make_jaxpr(named)((state, state), *tokens)
 
 
 def _token(parts: linear_scan.Coupled, token: tuple) -> tuple:
     """One token's parts at its values (`linear_scan.Coupled`'s), each in float32 at least: the two
     exponents and `lam`, scalars, the input `B` and `U`, the correction `C`, the reader `Q` (its scale on it)
     and the free readout `R`; refused where an exponent or `lam` is a key's own."""
-    shape = aval(parts.update.jaxpr.invars[0]).shape
-    zero = jnp.zeros(shape, aval(parts.update.jaxpr.invars[0]).dtype)
-    carried = at_least_fp32(zero.dtype)
-    envs: dict = {}
-
-    def read(index: int):
-        traced, atom = parts.atoms[index]
-        if isinstance(atom, jcore.Literal):
-            return jnp.asarray(atom.val)
-        env = envs.setdefault(id(traced), environment(traced, (zero, zero, *token), {}))
-        evaluate(traced, env, read_by(traced.jaxpr, {atom}))
-        return env[atom].astype(at_least_fp32(env[atom].dtype))
-
-    def along(term, extent: int):
-        value = linear_scan.value_of(term, read, shape[0], carried)
-        return jnp.broadcast_to(jnp.reshape(value, (-1,)) if jnp.ndim(value) == 2 else value, (extent,))
+    shape, along = token_terms(parts, token, states=2)
 
     def scalar(term):
-        value = linear_scan.value_of(term, read, shape[0], carried)
+        value = along(term, None)
         if np.size(value) != 1:
             raise Refused("a pair's decays and its second state's weight are scalars a token, not a key's "
                           "own")
@@ -168,8 +146,6 @@ def _token(parts: linear_scan.Coupled, token: tuple) -> tuple:
 def _at_token(declaration, names: Sequence[str], parts: linear_scan.Coupled, token: Mapping) -> tuple:
     """One token's decays `alpha` and `mu`, `lam`, `B`, `U`, `C`, `Q` and `R` (`_token`), a reset token's
     decays and correction zero: it reads nothing of the pair entering it."""
-    from dew.algebra.scan import _exp
-
     first, second, lam, b, u, c, q, r = _token(parts, tuple(token[name] for name in names))
     alpha, mu = _exp(parts.base2, first), _exp(parts.base2, second)
     if declaration.reset is not None:
@@ -182,11 +158,7 @@ def _bounded(declaration, names: Sequence[str], chunk: Mapping, parts: linear_sc
     """Refused unless the declared ranges (`Scan.ranges`, `terms.region`'s magnitudes) bound the decays and
     `lam`, and the chunk's sums they bound stay within float32's range: each `g(s, t)` at most the chunk's
     tokens times `lam`'s bound times the larger decay's to the chunk's length."""
-    tokens = [jax.ShapeDtypeStruct(tuple(extent for extent, axis in zip(chunk[name].shape,
-                                                                          declaration.operands[name],
-                                                                          strict=True)
-                                         if axis != declaration.walked), chunk[name].dtype)
-              for name in names]
+    tokens = [token_type(declaration, chunk, name) for name in names]
 
     def bounded(*xs):
         # The language's exponentials, whose bound an exponent's declared interval states (`terms.region`).
@@ -296,8 +268,6 @@ def _mapped(prepared: tuple, state, issue=None):
 def _replayed(declaration, names: Sequence[str], parts: linear_scan.Coupled, chunk: Mapping, pair) -> tuple:
     """`chunk` walked token by token from the pair entering it (`_at_token`'s parts): `(outputs, pair)`, each
     token's output and the pair leaving the chunk, a reset token's entering pair selected to zero."""
-    from dew.algebra.scan import _walked_tokens
-
     along, every = _walked_tokens(declaration, chunk)
     count = next(iter(along.values())).shape[0]
     along.update({name: jnp.broadcast_to(value, (count, *value.shape)) for name, value in every.items()})

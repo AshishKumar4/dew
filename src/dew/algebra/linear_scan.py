@@ -351,14 +351,7 @@ def parts(update: Program, readout: Program, saturation: program.Saturation) -> 
     state through an equation whose algebra no constructor states."""
     atoms: list = []
     made, read = _translated(update, atoms), _translated(readout, atoms)
-    began, graph = time.perf_counter(), EGraph()
-    graph.register(made, read)
-    sized = program.node_count(graph)
-    limits = saturation.sized(sized, max(_chain(update), _chain(readout)))
-    saturated = program.run_within(graph, _token_rules(), limits, "a scan's token")
-    kernel_report.record_rewrite(program.reported(graph, sized, saturated, began))
-    stopped = (f" (its saturation stopped at its limits, {limits[0]} nodes and {limits[1]} iterations, short "
-               f"of its fixpoint)" if saturated.limited else "")
+    graph, stopped = _saturated(made, read, update, readout, saturation, _token_rules(), "a scan's token")
     made, read = graph.extract(form_of(made)), graph.extract(form_of(read))
     erase = None
     if (erased := get_callable_args(made, Affine.erased_before)) is not None:
@@ -394,6 +387,22 @@ def parts(update: Program, readout: Program, saturation: program.Saturation) -> 
                  reader_scale=reader_scale, across=across, before=before is not None, erase=erase)
 
 
+def _saturated(made: Token, read: Token, update: Program, readout: Program, saturation: program.Saturation,
+               rules, name: str) -> tuple[EGraph, str]:
+    """An e-graph of a token's update `made` and readout `read` saturated by `rules` within `saturation`'s
+    limits for its size and the programs' longer chain, reported as `name`, and the refusal's note where a
+    limit stopped it short of its fixpoint."""
+    began, graph = time.perf_counter(), EGraph()
+    graph.register(made, read)
+    sized = program.node_count(graph)
+    limits = saturation.sized(sized, max(_chain(update), _chain(readout)))
+    saturated = program.run_within(graph, rules, limits, name)
+    kernel_report.record_rewrite(program.reported(graph, sized, saturated, began))
+    stopped = (f" (its saturation stopped at its limits, {limits[0]} nodes and {limits[1]} iterations, short "
+               f"of its fixpoint)" if saturated.limited else "")
+    return graph, stopped
+
+
 @dataclasses.dataclass(frozen=True)
 class Coupled:
     """A pair's token update and readout as the coupled map the rules reach (`coupled_parts`): the second
@@ -426,14 +435,8 @@ def coupled_parts(update: Program, readout: Program, saturation: program.Saturat
     part free of the states."""
     atoms: list = []
     made, read = _translated(update, atoms, pair=True, outputs=2), _translated(readout, atoms, pair=True)
-    began, graph = time.perf_counter(), EGraph()
-    graph.register(made, read)
-    sized = program.node_count(graph)
-    limits = saturation.sized(sized, max(_chain(update), _chain(readout)))
-    saturated = program.run_within(graph, _coupled_rules(), limits, "a coupled scan's token")
-    kernel_report.record_rewrite(program.reported(graph, sized, saturated, began))
-    stopped = (f" (its saturation stopped at its limits, {limits[0]} nodes and {limits[1]} iterations, short "
-               f"of its fixpoint)" if saturated.limited else "")
+    graph, stopped = _saturated(made, read, update, readout, saturation, _coupled_rules(),
+                                "a coupled scan's token")
     args = get_callable_args(graph.extract(form_of(made)), Affine.coupled)
     if args is None:
         raise Refused("a pair's update is not its second state decayed by a scalar plus a rank-one input "

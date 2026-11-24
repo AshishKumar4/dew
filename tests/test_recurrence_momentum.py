@@ -41,8 +41,8 @@ def tokenwise(query, key, value, log_decay, beta, momentum_decay, erase, state, 
         memory = jnp.exp(a)[..., None, None] * memory - b[..., None, None] * momentum
         return (memory, momentum), jnp.einsum('bhk,bhkv->bhv', q * KEYS ** -0.5, memory)
 
-    steps = tuple(jnp.moveaxis(jnp.asarray(x, work), 1, 0)
-                  for x in (query, key, value, log_decay, beta, momentum_decay, erase)) + (first.T,)
+    steps = (*(jnp.moveaxis(jnp.asarray(x, work), 1, 0)
+               for x in (query, key, value, log_decay, beta, momentum_decay, erase)), first.T)
     (memory, momentum), out = jax.lax.scan(one, (state[:, :, 0].astype(work), state[:, :, 1].astype(work)),
                                            steps)
     return jnp.moveaxis(out, 0, 1).astype(value.dtype), jnp.stack([memory, momentum], axis=2)
@@ -120,7 +120,7 @@ def test_the_decode_step_is_as_exact_as_the_recurrence_a_token_at_a_time():
     """The decode step's output and final pair, and the gradients of every operand and the entering pair, a
     token at a time on par with the recurrence's from float64 (check 1)."""
     assert_as_exact(jax.jit(with_gradients(stepped)), jax.jit(with_gradients(tied(tokenwise))),
-                    operands(jnp.float32, False), "decode momentum steps", seeds=SEEDS)
+                    operands(jnp.float32, untied=False), "decode momentum steps", seeds=SEEDS)
 
 
 def test_a_coupled_momentum_refuses_a_forked_call_and_an_unbounded_gate():
@@ -128,7 +128,7 @@ def test_a_coupled_momentum_refuses_a_forked_call_and_an_unbounded_gate():
     its chunked op walks no forked documents: each refused, named."""
     with pytest.raises(ValueError):
         recurrence.Hooks(decay='scalar', coupled='momentum', scale=KEYS ** -0.5)
-    q, k, v, log_decay, beta, mu, state, _ = operands(jnp.float32, False)(0)
+    q, k, v, log_decay, beta, mu, state, _ = operands(jnp.float32, untied=False)(0)
     loads = jnp.zeros((ROWS, 1), jnp.int32)
     with pytest.raises(ValueError):
         starts = jnp.zeros((ROWS, LENGTH), bool).at[:, 0].set(True)
