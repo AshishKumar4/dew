@@ -146,6 +146,9 @@ class _Lanes:
 
     values: dict = dataclasses.field(default_factory=dict)
     partial: dict = dataclasses.field(default_factory=dict)
+    # The values that differ between lanes: a thread's index, what any op computes of one, a region's
+    # results where its condition or what it yields does.
+    varying: set = dataclasses.field(default_factory=set)
 
     def region(self, region, active: np.ndarray) -> Work:
         work = Work()
@@ -155,11 +158,24 @@ class _Lanes:
         return work
 
     def op(self, op, active: np.ndarray) -> Work:
+        work = self.walked(op, active)
+        if op.results and (any(operand in self.varying for operand in op.operands) or _thread(op.name)
+                           or any(operand in self.varying for operand in _yielded(op))):
+            self.varying.update(op.results)
+        return work
+
+    def walked(self, op, active: np.ndarray) -> Work:
         name = op.name
         if name == "scf.for":
             trips = _trips(*(self.read(op.operands[at]) for at in range(3)))
             if trips is None:
                 raise Uncounted("an scf.for whose trips its operands state only at run time")
+            # A carried value's argument varies between lanes where its start or what a trip yields does.
+            body = op.regions[0].blocks[0]
+            carried_values = zip(body.arguments[1:], op.operands[3:], _yielded(op), strict=False)
+            for argument, start, carried in carried_values:
+                if start in self.varying or carried in self.varying:
+                    self.varying.add(argument)
             return _repeated(self.region(op.regions[0], active), trips)
         if name == "scf.if":
             maybe, surely = self.bounds(op.operands[0])
@@ -240,7 +256,10 @@ class _Lanes:
                      else op.results[0].type)
             stores = name in ("memref.store", "vector.store", "llvm.store")
             address = op.operands[1] if stores else op.operands[0]
-            moved = _bytes(value) * moving
+            indices = op.operands[2 if stores else 1:] if name.startswith(("memref.", "vector.")) else ()
+            uniform = address not in self.varying and not any(index in self.varying for index in indices)
+            # A lane-uniform address's access moves its bytes once, however many lanes make it.
+            moved = _bytes(value) * (float(bool(moving)) if uniform else moving)
             return Work(shared_bytes=moved) if _shared(address.type) else Work(device_bytes=moved)
         if name in _FREE or name.startswith(_FREE_PREFIXES):
             return Work()
@@ -378,6 +397,18 @@ def _repeated(work: Work, count: int) -> Work:
 def _most(first: Work, second: Work) -> Work:
     return Work(**{field.name: max(getattr(first, field.name), getattr(second, field.name))
                    for field in dataclasses.fields(Work) if field.name not in ("span", "chains")})
+
+
+def _thread(name: str) -> bool:
+    """Whether `name` reads a thread's place: its index, its lane."""
+    return name in ("gpu.thread_id", "gpu.lane_id") or name.startswith("nvvm.read.ptx.sreg.tid") or (
+        name == "nvvm.read.ptx.sreg.laneid")
+
+
+def _yielded(op) -> list:
+    """The values the regions of `op` yield (an scf.if's or scf.for's results)."""
+    return [operand for region in op.regions for block in region.blocks for inner in block.operations
+            if inner.operation.name == "scf.yield" for operand in inner.operation.operands]
 
 
 def _predicate(value_type: ir.Type) -> bool:
