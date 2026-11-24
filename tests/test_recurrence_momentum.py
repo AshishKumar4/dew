@@ -295,6 +295,21 @@ def test_a_chunks_faint_reads_are_kept_for_the_factors_that_raise_them():
                                        pair(0.0, 2.0 ** -59))
 
 
+def test_a_chunks_faint_system_weight_keeps_what_a_large_input_raises():
+    """ReviewMomentum1454's faint weight (row 12693): two tokens of keys along the first and second keys,
+    erase keys along the third and the third plus 2^-60 the first, write gates 2^-95 and one, values -2^100
+    and none, every decay one, queries along the second key: the chunked op is the decode step, its second
+    output 2^-55, where the system's weight -2^-155, landed beneath the least normal, dropped what the first
+    token's input of 2^100 raises it to."""
+    rows = jnp.eye(3, dtype=jnp.float32)
+    keys = jnp.stack([rows[0], rows[1]])[None, :, None]
+    erase = jnp.stack([rows[2], rows[2] + 2.0 ** -60 * rows[0]])[None, :, None]
+    value = jnp.asarray([-(2.0 ** 100), 0.0], jnp.float32).reshape(1, 2, 1, 1)
+    beta = jnp.asarray([2.0 ** -95, 1.0], jnp.float32).reshape(1, 2, 1)
+    assert_chunks_are_the_decode_steps(along(2, 3, 1), keys, erase, value, beta, jnp.zeros_like(beta),
+                                       pair(0.0, 0.0, keys=3))
+
+
 def test_a_chunk_solves_its_inputs_once(monkeypatch):
     """ReviewMomentum1454's double solve (row 12693): the chunked op's forward program builds one solve a
     chunk, its walk's step's scaled substitution (`coupled_scan._substituted`), which its outputs read again
