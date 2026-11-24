@@ -221,11 +221,13 @@ def test_a_read_erase_on_the_mainloop_is_as_exact_as_its_recurrence_a_token_at_a
                                                          (False, 'fla', 'xla'), (True, 'mosaic_gpu', 'xla')],
                          ids=['pgdn template', 'pgdn port', 'pkda template'])
 def test_a_read_erase_takes_the_template_under_a_decay_a_head_alone(per_key, kernel, taken):
-    """The delta rule's selector gives PGDN's training call the template it names (its keys' erase along
-    reads of their own, `chunk_forward.forward`'s `reads`), where fla's port, which takes no reads, and
-    PKDA's decay a key dimension, which the template's read erase does not take yet, hand over to the
+    """The delta rule's selector gives PGDN's 16-bit training call the template it names (its keys' erase
+    along reads of their own, `chunk_forward.forward`'s `reads`), where fla's port, which takes no reads,
+    and PKDA's decay a key dimension, which the template's read erase does not take yet, hand over to the
     portable math: each traced route its kernel's."""
     drawn = operands(per_key, TEMPLATED)(0)[:-1]
+    # A 16-bit call's queries, keys and values, as a layer's projections give them.
+    drawn = (*(x.astype(jnp.bfloat16) for x in drawn[:3]), *drawn[3:])
 
     def loss(*given):
         return templated(*given, kernel=kernel)[0].astype(jnp.float32).sum()

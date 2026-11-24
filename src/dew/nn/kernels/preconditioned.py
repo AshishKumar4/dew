@@ -93,8 +93,10 @@ def preconditioned_delta_rule(query, key, value, log_decay, beta, atk_decay, atk
                                           eps=eps)
     hooks = recurrence.Hooks(decay='vector' if log_decay.ndim == 4 else 'scalar', erase='read',
                              scale=width ** -0.5 if scale is None else scale)
-    out, final = chunk(hooks, Chunk(query, written, value, log_decay=log_decay, beta=beta, erase_read=key,
-                                    state=state, starts=starts), chunk_size=chunk_size)
+    # The write keys in the keys' dtype, as fla's ATK stores its `k_precond` (`torch.empty_like(k)`,
+    # fla-core 0.6.0 ops/atk/chunk_atk_fwd.py:354): a 16-bit call's delta rule a 16-bit call, its kernels'.
+    out, final = chunk(hooks, Chunk(query, written.astype(key.dtype), value, log_decay=log_decay, beta=beta,
+                                    erase_read=key, state=state, starts=starts), chunk_size=chunk_size)
     return out.astype(value.dtype), (final, moment)
 
 
@@ -114,6 +116,8 @@ def preconditioned_step(query, key, value, log_decay, beta, atk_decay, atk_beta,
     written = _squashed(k, moment, center, x, eps)
     hooks = recurrence.Hooks(decay='vector' if log_decay.ndim == 3 else 'scalar', erase='read',
                              scale=width ** -0.5 if scale is None else scale)
-    out, _, held = recurrence.step(hooks, recurrence.Step(state, query=query, key=written, value=value,
-                                                          log_decay=log_decay, beta=beta, erase_read=key))
+    # The write keys in the keys' dtype, as the chunked rule's (`preconditioned_delta_rule`).
+    out, _, held = recurrence.step(hooks, recurrence.Step(state, query=query, key=written.astype(key.dtype),
+                                                          value=value, log_decay=log_decay, beta=beta,
+                                                          erase_read=key))
     return out.astype(value.dtype), (held, moment)
