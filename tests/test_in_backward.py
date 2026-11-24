@@ -597,8 +597,14 @@ def test_an_accumulating_scanned_step_holds_no_extra_gradient_buffer(generation,
     split = ahead(1, 2, 2)
     shapes = jax.eval_shape(model.init, jax.random.key(0), jnp.zeros((1, 16), jnp.int32))["params"]
     narrow = 2 * sum(leaf.size for leaf in jax.tree.leaves(shapes))
-    assert accumulated.temp_bytes - one.temp_bytes < narrow, (accumulated.temp_bytes, one.temp_bytes, narrow)
-    assert split.temp_bytes - one.temp_bytes < narrow, (split.temp_bytes, one.temp_bytes, narrow)
+
+    def beside(ahead) -> int:
+        """What a step holds beside its arguments: its outputs that alias none and its temporaries, so a
+        second stacked sum held as an unaliased output counts as one held among its temporaries does."""
+        return ahead.output_bytes - ahead.alias_bytes + ahead.temp_bytes
+
+    assert beside(accumulated) - beside(one) < narrow, (beside(accumulated), beside(one), narrow)
+    assert beside(split) - beside(one) < narrow, (beside(split), beside(one), narrow)
 
 
 ACCUMULATING_SEEDS = 64
@@ -606,6 +612,18 @@ ACCUMULATING_SEEDS = 64
 layer-at-a-time sites' (`RUN_SEEDS`), whose judgement the map judge widens where it needs more units."""
 
 
+class _Penalized(LMObjective):
+    """An LM whose loss adds a term on its parameters themselves, read where they lie outside any scan: a
+    gradient its step pools beside the one its scanned layers pool in their backward."""
+
+    def loss(self, variables, batch, step):
+        stats, aux = super().loss(variables, batch, step)
+        penalty = sum(jnp.sum(jnp.square(leaf.astype(jnp.float32))) for leaf in jax.tree.leaves(
+            variables["params"]))
+        return stats.replace(total=stats.total + 1e-3 * penalty * stats.mass), aux
+
+
+@pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize(("dtype", "clip", "periodic"), [
     pytest.param("float32", 0.0, False, id="fp32",
                  marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
@@ -616,9 +634,10 @@ layer-at-a-time sites' (`RUN_SEEDS`), whose judgement the map judge widens where
 ])
 def test_an_accumulating_scanned_step_matches_unrolled(dtype, clip, periodic):
     """A scanned step pooling its gradient in its backward (`Transaction._planned_accumulation`) over a
-    window of two accumulated batches each split in two, clipped with narrow copies or over a periodic
-    stack, leaves its parameters and optimizer state after two updates on par with the unrolled step's
-    (check 1, against one device's float64 unrolled step)."""
+    window of two accumulated batches each split in two, its parts of unequal token counts, its loss
+    reading its parameters directly beside its layers' scan, clipped with narrow copies or over a periodic
+    stack, on two devices splitting its parameters, leaves its parameters and optimizer state after two
+    updates on par with the unrolled step's (check 1, against one device's float64 unrolled step)."""
     from arm_forms import as_given
     from test_stage_local import wide
 
@@ -631,10 +650,11 @@ def test_an_accumulating_scanned_step_matches_unrolled(dtype, clip, periodic):
 
     def built(*, exact: bool = False) -> Trainer:
         model = decoder(dtype="float64" if exact else dtype, **extra)
-        run = Trainer(LMObjective(model, SEQ), optimizer, key=jax.random.key(0), mesh=MeshSpec(),
-                      layout=Layout(min_shard=2**30), update=UpdateBatch(batches=2), fit=FitPolicy(split=2),
-                      checkpoints=None, tracker=None)
-        run.device_mesh = MeshSpec().build(jax.devices()[:1])
+        mesh = MeshSpec() if exact else MeshSpec(fsdp=2)
+        run = Trainer(_Penalized(model, SEQ), optimizer, key=jax.random.key(0), mesh=mesh,
+                      layout=Layout(min_shard=TINY_SHARD), update=UpdateBatch(batches=2),
+                      fit=FitPolicy(split=2), checkpoints=None, tracker=None)
+        run.device_mesh = mesh.build(jax.devices()[:1 if exact else 2])
         run.validate(steps=4)
         return run
 
@@ -677,9 +697,37 @@ def test_an_accumulating_scanned_step_matches_unrolled(dtype, clip, periodic):
         return run
 
     def draw(seed):
-        # Four batches of four rows, two updates of two batches each.
-        return np.stack([token_rows(VOCAB, 4, SEQ + 1, seed=4 * seed + at)["text"] for at in range(4)]), (
-            np.int64(seed))
+        # Four batches of four rows, two updates of two batches each, a part of each batch two rows ending
+        # in padding of its own length, so no two parts count as many tokens.
+        batches = []
+        for at in range(4):
+            rows = token_rows(VOCAB, 4, SEQ + 1, seed=4 * seed + at)["text"]
+            rows[2:, SEQ + 1 - (at + 2):] = 0
+            batches.append(rows)
+        return np.stack(batches), np.int64(seed)
 
     assert_as_exact(stepped(scan=True), stepped(scan=False), draw, "an accumulating scanned step",
                     seeds=ACCUMULATING_SEEDS, truth_fn=stepped(scan=False, exact=True))
+
+
+def test_an_accumulating_scanned_step_that_watches_its_layers_logs_what_they_made():
+    """A scanned step accumulating two batches that watches its MLPs' outputs (`Inspection.modules`, no
+    cotangents) runs them as the ordinary scan does, which opens the collections its watch reads, and logs
+    their summaries (review of row 12080: its layers, pooled in their backward, ran with no collection
+    open and the watch raised)."""
+    from test_inspection import Kept
+    from token_support import repeated_token_batch
+
+    from dew.data.dataset import Loader
+    from dew.training import UpdateBatch
+    from dew.training.inspection import Inspection
+
+    tracker = Kept()
+    run = Trainer(LMObjective(decoder(num_layers=2), SEQ), ADAMW, key=jax.random.key(0), mesh=MeshSpec(),
+                  layout=Layout(min_shard=2**30), update=UpdateBatch(batches=2), tracker=tracker,
+                  inspection=Inspection(modules=("*MLP",), cotangents=False, every=1), checkpoints=None)
+    loader = Loader(train=lambda partition: repeated_token_batch(VOCAB, 4, SEQ + 1), val=None, records=None,
+                    batch=4)
+    scanning(run.fit)(loader, steps=2, log_every=1, eval_every=None)
+    logged = {name for row in tracker.rows.values() for name in row}
+    assert any(name.startswith("inspect/activations/") for name in logged), sorted(logged)
