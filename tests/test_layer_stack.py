@@ -716,7 +716,8 @@ def test_a_resident_moe_decode_reads_each_layers_experts_in_place_and_decodes_as
     routed = {"experts": 4, "top_k": 2, "expert_features": 16, "layers": tuple(range(4))}
     scanned = tiny(num_layers=4, max_seq_len=16, mixture=routed)
     variables = scanned.init(jax.random.key(0), ids)
-    stacks = {tuple(leaf.shape) for leaf in jax.tree.leaves(experts_apart(variables)[BANKED_EXPERTS])}
+    # The model holds each layer under its own name; the run's scan reads its four layers' kernels stacked.
+    stacks = {(4, *leaf.shape) for leaf in jax.tree.leaves(experts_apart(variables)[BANKED_EXPERTS])}
     assert stacks
 
     cache = scanned.init(jax.random.key(0), ids[:, :1], decode=True)["cache"]
