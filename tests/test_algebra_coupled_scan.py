@@ -136,3 +136,18 @@ def test_a_state_of_no_rank_is_refused_named():
                          state=((), jnp.float32))
     with pytest.raises(Refused):
         scan.derive_scan(declared, saturation=SATURATION)
+
+
+def test_a_float32_pairs_walk_over_float64_tokens_carries_it_wide():
+    """ReviewMomentum1454's x64 case: a pair declared float32 replayed token by token (`Derived.replay`) and
+    differentiated (`Derived.backward`) over float64 tokens carries the pair in float64, its outputs and the
+    pair leaving it float64, where a carry typed as the entering float32 pair failed the scan."""
+    with jax.enable_x64(new_val=True):
+        forms = scan.derive_scan(DECLARED, saturation=SATURATION)
+        tokens = draws(packed=True)(0)
+        chunk = {name: value[:CHUNK].astype(jnp.float64) if jnp.issubdtype(value.dtype, jnp.floating)
+                 else value[:CHUNK] for name, value in zip(OPERANDS, tokens, strict=True)}
+        entering = jnp.zeros((2, STATE, WIDTH), jnp.float32)
+        outputs, leaving = forms.replay(chunk, entering)
+        d_entering, _ = forms.backward(chunk, (None, entering), jnp.ones_like(leaving), jnp.ones_like(outputs))
+    assert {outputs.dtype, leaving.dtype, d_entering.dtype} == {jnp.dtype(jnp.float64)}

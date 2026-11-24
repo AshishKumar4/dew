@@ -45,7 +45,15 @@ from jax.scipy.linalg import solve_triangular
 from dew import _cache
 from dew.algebra import derive, linear_scan, program, terms
 from dew.algebra.forms import Derived, Refused
-from dew.algebra.scan import _exp, _replay_backward, _traced, _walked_tokens, token_terms, token_type
+from dew.algebra.scan import (
+    _carry_type,
+    _exp,
+    _replay_backward,
+    _traced,
+    _walked_tokens,
+    token_terms,
+    token_type,
+)
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import varying_like
 
@@ -285,6 +293,14 @@ def _replayed(declaration, names: Sequence[str], parts: linear_scan.Coupled, chu
         first = alpha * first + lam * second
         return (first, second), jnp.sum(q[:, None] * first, axis=0) + r
 
-    pair = pair.astype(at_least_fp32(pair.dtype))
+    # The pair carried in the type its update's parts widen it to (`scan._carry_type`, the single state's
+    # walk's): a float32 pair over float64 tokens (x64's) widens once.
+    one = {name: jax.ShapeDtypeStruct(x.shape[1:], x.dtype, weak_type=jax.typeof(x).weak_type)
+           for name, x in along.items()}
+    def carry_typed(step):
+        # The update's parts (its readout's none): its decays, weight, input and correction.
+        return jnp.zeros((), _carry_type(pair, *_at_token(declaration, names, parts, step)[:6]))
+
+    pair = pair.astype(jax.eval_shape(carry_typed, one).dtype)
     (first, second), outputs = lax.scan(token, (pair[0], pair[1]), along)
     return outputs, jnp.stack([first, second])
