@@ -78,10 +78,11 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
     its program's share of the `columns`; each consumer's stage for its key gradients' sums; the two loads'
     barriers; a fused launch's (`BackwardTiles.fused`) staged score cotangents and dQ tile each consumer's;
     where its logits' queries are staged (`BackwardTiles.staged_logits`) one slot's of them and their two
-    turns; where a score hook's tile parameter is `tiled`, each consumer's stage for its tile gradients' adds
-    (`Family.added`); each consumer's relay tile where its weights and score cotangents reach dV's and dK's
-    products through shared memory (`Family.relay_bytes`, `_relayed`); and its query and output-cotangent
-    streams, and its logits' queries' unless staged, in `stages` slots (`Family.streams`). On a layout whose
+    turns; where a score hook's tile parameter is `tiled`, each consumer's stage for its tile gradients'
+    stores (`Family.stored`); each consumer's relay tile where its weights and score cotangents reach dV's
+    and dK's products through shared memory (`Family.relay_bytes`, `_relayed`); and its query and
+    output-cotangent streams, and its logits' queries' unless staged, in `stages` slots (`Family.streams`). On
+    a layout whose
     consumers feed their rings (`split_queries`) the consumers share one key block, held once, and each takes
     its share of a slot's queries: every block a product of theirs reads staged at the swizzle their share's
     contraction takes (`swizzling.swizzle_for`). The output and key gradients' stages, which no walk reads,
@@ -490,16 +491,16 @@ def _grading(shares: tuple) -> bool:
     return shares[0][0] == 0
 
 
-def _tiles_added(family: mosaic.Family, refs, stage, place: tuple, k_first, index, interpret: bool, first,
-                 pieces) -> None:
-    """Each tile gradient of `pieces` (`[bk, its queries]`, queries from `first`) added into its place in the
+def _tiles_stored(family: mosaic.Family, refs, stage, place: tuple, k_first, index, first, pieces) -> None:
+    """Each tile gradient of `pieces` (`[bk, its queries]`, queries from `first`) written to its place in the
     keys-first `[B, H, Kp, Qp]` refs (`refs`), the program's row's and head's (`place`, `_grad_buffers`),
-    through consumer `index`'s `stage`."""
+    through consumer `index`'s `stage`: its one writer's, stored, not added (an A100's `red.add.f32` flushed
+    a subnormal entry added into its zero), the tiles no walk reads their zeros."""
     row, head = place
     for ref, piece in zip(refs, pieces, strict=True):
         assert stage is not None
         view = ref.at[row, head, pl.ds(k_first, piece.shape[0]), pl.ds(first, piece.shape[1])]
-        family.added(piece, view, interpret, smem=stage.at[index])
+        family.stored((piece,), (view,), smem=stage.at[index])
 
 
 def _dkv_stored(family: mosaic.Family, sums: tuple, views: tuple, stages: tuple, *, index, interpret: bool
@@ -575,8 +576,8 @@ def _summed_stored(family: mosaic.Family, sums: tuple, views: tuple, consumers: 
     """The sums of the `consumers` sharing a key block (each over its share of the queries) added in a fixed
     order and stored once to their `views` (`across.summed_across`), dK's and dV's, the key gradients' added
     into theirs (`Family.added`, the program's row's and head's zeros), each in a
-    scope after the walk's, whose shared memory it reuses (`across.summing`): the walk's last adds' reads of
-    their stage (`Family.added`, its tile gradients') done first (row 2633, ET-DETDIAG-h100: the last query
+    scope after the walk's, whose shared memory it reuses (`across.summing`): the walk's last stores' reads of
+    their stage (`Family.stored`, its tile gradients') done first (row 2633, ET-DETDIAG-h100: the last query
     tile's gradient read from a stage this scope had written)."""
     family.store_wait(0)
     for place, (value, view) in enumerate(zip(sums, views, strict=True)):
@@ -872,8 +873,7 @@ def _consumer_step(walk: _Backward, place: tuple, k_first, index: int, holder: i
     if family.places_on_role:
         return _placed_step_of(walk, statistics, spans_of, place, k_first, dq_ref, fused_stages)
     row, head = place
-    store_tiles = functools.partial(_tiles_added, family, tile_refs, tile_stage, place, k_first, index,
-                                    walk.interpret)
+    store_tiles = functools.partial(_tiles_stored, family, tile_refs, tile_stage, place, k_first, index)
     coords_of = functools.partial(_coords, family, spans_of, row, k_first=k_first, keys_first=True,
                                   draw=None if drop_of is None else drop_of.draw(row, head))
     # The key block's parameters held across the walk, read once (`held_params`), each query tile's of the

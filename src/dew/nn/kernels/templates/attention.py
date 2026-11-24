@@ -2083,19 +2083,18 @@ def shifted(x: jax.Array, shift: jax.Array) -> jax.Array:
 def raised_sum(grad: jax.Array, shift: jax.Array, axes: tuple[int, ...]) -> jax.Array:
     """`grad` fp32, each part `2^shift` beneath its truth (`shift` int32, at least 0, broadcast against it),
     raised and summed over `axes` (kept): a part apiece exactly (`shifted`) where it sums none; else the
-    plain fp32 sum where every shift is 0, and otherwise the exact sum of the raised parts rounded once
-    (`aligned.aligned_sum`, `2^shift` its two factors within fp32), so parts past fp32's largest that cancel
-    give what they cancel to (two rows' `±2^252` under a shared bias 0, where each raised first was `±inf`
-    and their sum NaN) and a part at its own scale keeps its bits beside a larger one's."""
+    exact sum of the raised parts rounded once (`aligned.aligned_sum`), so parts past fp32's largest that
+    cancel give what they cancel to (two rows' `±2^252` under a shared bias 0, where each raised first was
+    `±inf` and their sum NaN), a part at its own scale keeps its bits beside a larger one's, and normal parts
+    that cancel to a subnormal keep it where fp32's sum flushes it (XLA's CPU, `bodies.subnormals`). Its
+    factor `2^shift` three powers of two each within fp32's normals (a shift of 257 at most, an `inf` row's
+    cotangent's), so a part of 0 raised is 0, never `0 * inf`."""
     if not axes:
         return shifted(grad, shift)
-    half = shift // 2
     one = jnp.ones((), jnp.float32)
-
-    def aligned() -> jax.Array:
-        return aligned_sum([(grad, power2(one, half), power2(one, shift - half))], axis=axes)
-
-    return jax.lax.cond(jnp.any(shift != 0), aligned, lambda: grad.sum(axis=axes, keepdims=True))
+    third = shift // 3
+    factors = (power2(one, third), power2(one, third), power2(one, shift - 2 * third))
+    return aligned_sum([(grad, *factors)], axis=axes)
 
 
 def hook_gradient(grad: jax.Array, shift: jax.Array, param: Param) -> jax.Array:

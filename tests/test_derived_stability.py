@@ -233,22 +233,30 @@ def _channel(rows: list[list[float]]) -> jax.Array:
     return jnp.pad(first, ((0, 0), (0, 0), (0, 0), (0, WIDTH - 1))).astype(jnp.bfloat16)
 
 
+def _held(rows: list) -> np.ndarray:
+    """`rows` as float32, an entry None (one no truth holds: an `inf` cotangent's own) NaN, unchecked."""
+    return np.asarray([[np.nan if entry is None else entry for entry in row] for row in rows], np.float32)
+
+
 def _witness(keys: list[float], values: list[list[float]], douts: list[list[float]], bias: list[list[float]],
-             gradients: dict[str, list], *, shared: bool) -> tuple:
-    """A call of queries of zeros over two keys (`keys` their first channel, every row's), its `values` and
-    output cotangents `douts` each row's, under a tile bias `[B or 1, 1, Q, 2]` (`bias` its queries' rows,
-    one table for every row where `shared`), and its exact gradients at a logit scale of 1, each leaf's first
-    channel (`gradients`, the bias's whole), every other channel's 0."""
-    batch, queries = len(values), len(douts[0])
+             gradients: dict[str, list], *, shared: bool, bounds: dict | None = None) -> tuple:
+    """A call of queries of zeros over keys whose first channel is `keys` (every row's), its `values` and
+    output cotangents `douts` each row's, each row's keys `bounds`' (`template.spans`' `lengths` and
+    `starts`) or all, under a tile bias `[B or 1, 1, Q, K]` (`bias` its queries' rows, one table for every
+    row where `shared`), and its exact gradients at a logit scale of 1, each leaf's first channel
+    (`gradients`, the bias's whole; `_held`'s None unchecked), every other channel's 0."""
+    batch, queries, count = len(values), len(douts[0]), len(keys)
     query = jnp.zeros((batch, queries, 1, WIDTH), jnp.bfloat16)
-    key = jnp.broadcast_to(_channel([keys]), (batch, 2, 1, WIDTH))
+    key = jnp.broadcast_to(_channel([keys]), (batch, count, 1, WIDTH))
     table = jnp.asarray(bias, jnp.float32)[None, None]
     hooks = template.Hooks(lambda s, q_pos, k_pos, bias: s + bias.astype(s.dtype), (template.Param(
-        table if shared else jnp.broadcast_to(table, (batch, 1, queries, 2)), template.Kind.TILE),))
-    expected = {name: np.asarray(_channel(rows), np.float32) for name, rows in gradients.items()
-                if name != "bias"}
-    expected["bias"] = np.asarray(gradients["bias"], np.float32).reshape(hooks.score_params[0].value.shape)
-    return (query, key, _channel(values), _channel(douts), hooks), expected
+        table if shared else jnp.broadcast_to(table, (batch, 1, queries, count)), template.Kind.TILE),))
+    expected = {name: np.pad(_held(rows)[:, :, None, None], ((0, 0), (0, 0), (0, 0), (0, WIDTH - 1)))
+                for name, rows in gradients.items() if name != "bias"}
+    expected["bias"] = _held(gradients["bias"]).reshape(hooks.score_params[0].value.shape)
+    spans = template.spans(queries, count, batch, **{name: jnp.asarray(bound, jnp.int32)
+                                                      for name, bound in (bounds or {}).items()})
+    return (query, key, _channel(values), _channel(douts), hooks, spans), expected
 
 
 def _witnesses(name: str) -> list[tuple]:
@@ -291,20 +299,40 @@ def _witnesses(name: str) -> list[tuple]:
                              [[0.0, 0.0], [-np.inf, -np.inf]],
                              {"query": [[0.0, 0.0]] * 2, "key": [[0.0, 0.0]] * 2,
                               "value": [[0.0, 0.0]] * 2, "bias": [[0.0, 0.0]] * 2}, shared=True)]
+        case "rows that cancel to a subnormal":
+            # Each row's bias gradient normal and unshifted, `±2^-125` and `±(2^-125 + 2^-132)`, opposite:
+            # the shared one's sum `±2^-132`, a subnormal, which fp32's sum flushed on XLA's CPU.
+            return [_witness([0.0, 0.0], [[0.0, 2.0 ** -123], [2.0 ** -123 + 2.0 ** -130, 0.0]],
+                             [[1.0], [1.0]], [[0.0, 0.0]],
+                             {"query": [[0.0]] * 2, "key": [[0.0, 0.0]] * 2, "value": [[0.5, 0.5]] * 2,
+                              "bias": [[2.0 ** -132, -(2.0 ** -132)]] if shared
+                                      else [[-(2.0 ** -125), 2.0 ** -125],
+                                            [2.0 ** -125 + 2.0 ** -132, -(2.0 ** -125 + 2.0 ** -132)]]},
+                             shared=shared) for shared in sharing]
+        case "keys beside an inf cotangent's":
+            # Row A sees key 0 alone under a cotangent of inf (a shift of 257), row B keys 1 and 2 (`[0, 1]`
+            # under 1, its bias gradient there `[-1/4, 1/4]`): row A's 0 at the keys it does not see raised
+            # is 0, so the shared bias's sum there is row B's, where `0 * 2^128 * 2^129` was NaN. Row A's own
+            # gradients, an inf cotangent's, are checked by none.
+            return [_witness([0.0, 0.0, 0.0], [[2.0 ** 127, 0.0, 0.0], [0.0, 0.0, 1.0]], [[np.inf], [1.0]],
+                             [[0.0, 0.0, 0.0]],
+                             {"query": [[None], [0.0]], "key": [[None] * 3, [0.0] * 3],
+                              "value": [[None] * 3, [0.0, 0.5, 0.5]], "bias": [[None, -0.25, 0.25]]},
+                             shared=True, bounds={"lengths": [1, 3], "starts": [0, 1]})]
     raise KeyError(name)
 
 
 WITNESSES = ["a row beside one at fp32's largest", "rows at their own scales", "rows past fp32 that cancel",
-             "an empty query of cotangent inf"]
+             "an empty query of cotangent inf", "rows that cancel to a subnormal",
+             "keys beside an inf cotangent's"]
 """Calls whose rows' values the backward takes beneath shifts of their own (`attention.value_shift`), their
 gradients exact (`_witnesses`): a shared bias's summed across its rows at each one's scale
 (`attention.hook_gradient`)."""
 
 
-def _mainloops(query, key, value, dout, hooks) -> dict[str, template.Gradients]:
+def _mainloops(query, key, value, dout, hooks, spans) -> dict[str, template.Gradients]:
     """The call's gradients at a logit scale of 1 on each mainloop: the plain-JAX one's, and the
     Pallas-Triton one's and the Mosaic one's as an H100's, interpreted."""
-    spans = template.spans(query.shape[1], key.shape[1], query.shape[0])
     natural, accurate = attention_route.run_forms()
     form = {"scale": 1.0, "natural": natural, "accurate": accurate}
     made = {"plain-JAX": attention_portable.backward(attention_portable.Tiles(block_q=8, block_k=8, pad=8),
@@ -327,6 +355,6 @@ def test_a_rows_gradients_are_at_its_own_shift_and_a_shared_bias_sums_them(witne
     for call, expected in _witnesses(witness):
         for mainloop, made in _mainloops(*call).items():
             for name, want in expected.items():
-                got = made.score_params[0] if name == "bias" else getattr(made, name)
-                np.testing.assert_array_equal(np.asarray(got, np.float32), want,
-                                              err_msg=f"{witness} {mainloop} {name}")
+                got = np.asarray(made.score_params[0] if name == "bias" else getattr(made, name), np.float32)
+                held = ~np.isnan(want)
+                np.testing.assert_array_equal(got[held], want[held], err_msg=f"{witness} {mainloop} {name}")
