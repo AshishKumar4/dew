@@ -858,3 +858,30 @@ def test_launch_seconds_shares_sm_units_overlaps_paths_and_prices_integer_work()
     got_path_r1 = cost.launch_seconds(path_work, 176, target, resident=1)
     got_path_r2 = cost.launch_seconds(path_work, 176, target, resident=2)
     assert got_path_r2 < got_path_r1, (got_path_r2, got_path_r1)
+
+
+def test_an_atomic_add_into_global_memory_counts_its_bytes_reduced_and_an_a100_prices_them():
+    """A kernel adding a 64 x 64 fp32 tile into global memory an element at a time (`plgpu.atomic_add`,
+    `red.global`) counts its 16 KiB among its global reductions (`Work.global_reductions`), its device bytes
+    beside them; an A100 prices them at its measured 3 bytes a multiprocessor a clock (M-NA-9), so its
+    launch takes their time, where an H100 states no rate and leaves them unpriced (a form adding more of
+    them never cheaper there)."""
+    tile = jax.ShapeDtypeStruct((64, 64), jnp.float32)
+
+    def body(x_ref, o_ref):
+        plgpu.atomic_add(o_ref, x_ref[...])
+
+    launch = plgpu.kernel(body, out_type=tile, grid=(1,), grid_names=("programs",))
+    traced = jax.make_jaxpr(emission.costed(launch, Stated(steps=1, bytes_accessed=0)))(tile)
+    (kernel,) = [equation for equation in programs.equations(traced.jaxpr)
+                 if "cost_estimate" in equation.params]
+    work = emission.work_of(kernel)
+    assert work.global_reductions == 64 * 64 * 4
+    ampere, hopper = generation.gpu_target("sm80"), generation.gpu_target("sm90")
+    reductions = cost.rates(ampere, device=False).reductions
+    assert reductions == 3.0 * ampere.loaded_clock_hz
+    alone = Work(global_reductions=work.global_reductions, kernels=1.0)
+    assert cost.launch_seconds(alone, 1, ampere) == work.global_reductions / reductions + (
+        ampere.launch_seconds or 0.0)
+    assert cost.rates(hopper, device=False).reductions is None
+    assert work.global_reductions in cost.units(work, cost.rates(hopper, device=False))[1]
