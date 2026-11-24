@@ -18,7 +18,7 @@ from dew.nn.backbones.layer_names import group_layers
 from dew.nn.kernels.generation import compile_only_gpus
 from dew.nn.kernels.options import program
 from dew.nn.precision import at_least_fp32
-from dew.objectives.base import Ratio
+from dew.objectives.base import Objective, Ratio
 from dew.objectives.lm import LMObjective
 from dew.optim import AdamW, OptimConfig, ParamGroup
 from dew.registry import models
@@ -688,6 +688,10 @@ class _Scalar(LMObjective):
         stats, aux = super().loss(variables, batch, step)
         assert isinstance(stats, Ratio), type(stats)
         return stats.mean()[0], aux
+
+    def reduce_loss(self, stats):
+        # A scalar's own value, as any objective's (`Objective.reduce_loss`); the LM's reads a ratio.
+        return Objective.reduce_loss(self, stats)
 
 
 OBJECTIVES = {"lm": LMObjective, "penalized": _Penalized, "branched": _Branched, "repeated": _Repeated,
