@@ -134,3 +134,26 @@ def test_a_coupled_momentum_refuses_a_forked_call_and_an_unbounded_gate():
         starts = jnp.zeros((ROWS, LENGTH), bool).at[:, 0].set(True)
         chunk(TIED, Chunk(q, k, v, log_decay=log_decay, beta=beta, momentum_decay=mu, state=state,
                           starts=starts, loads=loads, stores=loads), chunk_size=CHUNK)
+
+
+def test_a_query_reads_a_memory_near_float32s_largest_decayed_first():
+    """ReviewMomentum1454's overflow: one token reading a memory of 2^127 through a decay of 1/2, its query
+    (1/2 each of four keys) and its unit key and erase key along the first, its value 2^126 and no write
+    gate: the chunked op's and the decode step's output is the token recurrence's 2^127 and their final
+    memory 2^126, each finite, where the query's read of the entering memory before its decay passed float32's
+    largest."""
+    hooks = recurrence.Hooks(decay='scalar', coupled='momentum', write_bound=1.0, scale=1.0)
+    query = jnp.full((1, 1, 1, 4), 0.5, jnp.float32)
+    key = jnp.zeros((1, 1, 1, 4), jnp.float32).at[..., 0].set(1.0)
+    value = jnp.full((1, 1, 1, 1), 2.0 ** 126, jnp.float32)
+    log_decay, beta, momentum_decay = (jnp.full((1, 1, 1), x, jnp.float32) for x in (np.log(0.5), 0.0, 0.0))
+    state = jnp.zeros((1, 1, 2, 4, 1), jnp.float32).at[:, :, 0].set(2.0 ** 127)
+    out, final = chunk(hooks, Chunk(query, key, value, log_decay=log_decay, beta=beta,
+                                    momentum_decay=momentum_decay, state=state), chunk_size=CHUNK)
+    token = {name: x[:, 0] for name, x in (('query', query), ('key', key), ('value', value),
+                                            ('log_decay', log_decay), ('beta', beta),
+                                            ('momentum_decay', momentum_decay))}
+    stepped_out, _, stepped_final = recurrence.step(hooks, recurrence.Step(state, **token))
+    for read, memory in ((out[:, 0], final), (stepped_out, stepped_final)):
+        np.testing.assert_array_equal(np.asarray(read), 2.0 ** 127)
+        np.testing.assert_array_equal(np.asarray(memory[:, :, 0]), 2.0 ** 126)
