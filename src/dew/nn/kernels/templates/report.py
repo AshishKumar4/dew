@@ -1066,7 +1066,7 @@ def _lowered_verdict_key(calls) -> str | None:
 
 
 def stored_key(provenance: frozenset[str] | None, *fields) -> str | None:
-    """What decides a stored launch decision (`attention_mosaic._choice_key`) for a compile
+    """What decides a stored launch decision (`attention_mosaic_derivation._choice_key`) for a compile
     target before it traces: its code (`dew._code.provenance_code`: an edit of it invalidates the stored
     entry), the installed JAX, jaxlib and CUDA plugins, whose Mosaic GPU and XLA lower and compile it (the
     Pallas lowering cache's seal of them), caller-specific `fields`, and the environment a kernel's lowering
