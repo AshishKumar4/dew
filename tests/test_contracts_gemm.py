@@ -11,6 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from arm_arithmetic import ahead_on_the_host
 from contract_support import EDGES, FORWARD_ORDERS, assert_contract, assert_drawn_contract, normal_draw
 from reference_error import Followed, Rounded, as_given, assert_as_exact, widened
 
@@ -340,9 +341,12 @@ def test_an_nvfp4_products_kernels_hold_every_order(edge, kernel="xla"):
     e2m1 = np.asarray([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
     magnitudes = np.where(codes >= 8, -1.0, 1.0) * e2m1[codes & 7]
     exponents = np.random.default_rng(3622).integers(-2, 3, size=(16, 64))
-    block = jnp.asarray(np.exp2(exponents), jnp.float8_e4m3fn)
-    matrix = formats.NvFp4.of(jnp.asarray(magnitudes, jnp.float32), block, 0.5)
-    values = matrix.decoded().astype(jnp.float32) * matrix.factor
+    # Packed and decoded on the host where a GPU tier part's prepare runs the cell, its device computing
+    # nothing before the contract's sites (row 12377's class: the H100 and A100 flows' packed cells).
+    with ahead_on_the_host():
+        matrix = formats.NvFp4.of(magnitudes.astype(np.float32),
+                                  np.exp2(exponents).astype(jnp.float8_e4m3fn), 0.5)
+        values = np.asarray(matrix.decoded().astype(jnp.float32) * matrix.factor)
     primals = normal_draw(3623, (64, 256), scale=EDGES[edge])
     direction = normal_draw(3624, (64, 256), scale=EDGES[edge])
     (cotangent,) = normal_draw(3625, (64, 64))
