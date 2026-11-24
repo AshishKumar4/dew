@@ -242,20 +242,20 @@ def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], sha
 def _ring_staged(tile: Tiles, layout: mosaic.Family, outputs: tuple, *, candidate: Callable,
                  launch_of: Callable, target, programs: int) -> Tiles:
     """`tile`, whose ring its consumers feed (`mosaic.Transport.feeds_itself`) at its least busy depth, with
-    its outputs (`outputs`, their dtypes) staged in smaller buffers where that leaves the ring deeper: of the
-    stagings at the widest output's unstated chunk (`stores.output_staging`) and its halvings down to an
-    accumulator atom's columns, in one buffer or two, each output's legal (`stores.staging_refusal`) and its
-    buffers (`Family.output_staging`) smaller than the unstated ones, the most bytes first and one buffer
-    before two on a tie, the first the planner places deeper, at the deepest ring it holds there
-    (`resources.plan`) and no compile of this process refused (`candidate`). Its loading consumer issues a
-    step's loads between its own products, no producer running ahead, so a ring at its least busy depth
-    leaves a load's latency no slack: an RTX PRO 6000's input gradient at 128 x 256 x 32, two stages beside
-    32 KB of output staging, slept on its full barriers in 14.4% of its samples (M-NG-1's ncu). The ring
-    serves every step and the staging a tile's store once, CUTLASS's order (StageCountAutoCarveout: the
-    epilogue's shared memory carved out first, the ring the rest). One buffer first: sm120's three-stage
-    128 x 256 forward compiled spill-free at (64, 1) and (32, 1), 227-229 registers, where CUDA 12.9's
-    allocator took (32, 2) to 255 and spilled 148 bytes, its live values no more (row 12667). The tile as
-    it was where no smaller staging deepens it."""
+    its outputs (`outputs`, their dtypes) staged in smaller buffers where that leaves the ring deeper: of
+    the stagings at the widest output's unstated chunk (`stores.output_staging`) and its halvings, in one
+    buffer or two, legal for the tile's issuer and each output (`Tiles.staging_refusal`: whole accumulator
+    atoms, whole TMA rows) and its buffers (`Family.output_staging`) smaller than the unstated ones, the
+    most bytes first and one buffer before two on a tie, the first the planner places deeper, at the
+    deepest ring it holds there (`resources.plan`) and no compile of this process refused (`candidate`).
+    Its loading consumer issues a step's loads between its own products, no producer running ahead, so a
+    ring at its least busy depth leaves a load's latency no slack: an RTX PRO 6000's input gradient at 128
+    x 256 x 32, two stages beside 32 KB of output staging, slept on its full barriers in 14.4% of its
+    samples (M-NG-1's ncu). The ring serves every step and the staging a tile's store once, CUTLASS's order
+    (StageCountAutoCarveout: the epilogue's shared memory carved out first, the ring the rest). One buffer
+    first: sm120's three-stage 128 x 256 forward compiled spill-free at (64, 1) and (32, 1), 227-229
+    registers, where CUDA 12.9's allocator took (32, 2) to 255 and spilled 148 bytes, its live values no
+    more (row 12667). The tile as it was where no smaller staging deepens it."""
     columns = pricing.tile_columns(tile, layout)
     piece = layout.chunk_columns(columns)
     shapes = tuple(((tile.share, columns), dtype) for dtype in outputs)
@@ -265,10 +265,10 @@ def _ring_staged(tile: Tiles, layout: mosaic.Family, outputs: tuple, *, candidat
                                      for buffer in layout.output_staging(shapes, tile.warpgroups, staging)))
 
     widest = max(stores.output_staging(columns, (dtype,), piece=piece)[0] for dtype in outputs)
-    legal = [(widest >> shift, count) for shift in range(widest.bit_length()) for count in (1, 2)
-             if widest >> shift >= ACCUMULATOR_COLUMNS
-             and not any(stores.staging_refusal(columns, (dtype,), (widest >> shift, count), piece=piece)
-                         for dtype in outputs)]
+    halved = (dataclasses.replace(tile, staging=(widest >> shift, count))
+              for shift in range(widest.bit_length()) for count in (1, 2)
+              if widest >> shift >= ACCUMULATOR_COLUMNS)
+    legal = [staged.staging for staged in halved if staged.staging_refusal(outputs, layout) is None]
     unstated = staged_bytes(None)
     sized = {staging: size for staging in legal if (size := staged_bytes(staging)) < unstated}
     for staging in sorted(sized, key=lambda staging: (-sized[staging], staging[1])):
