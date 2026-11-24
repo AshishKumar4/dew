@@ -18,19 +18,29 @@ at all (`gated`) is decided after its forward, and the backward reads it as the 
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import contextvars
 import dataclasses
 import functools
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from typing import NamedTuple
 
 import jax
+import jax.extend.core as jcore
 import jax.numpy as jnp
 import numpy as np
+from jax.core import ShapedArray
 
-from dew.nn.derivatives import Surrogate, contracted, declared_derivative, with_gradients_formed
+from dew.nn.derivatives import (
+    Surrogate,
+    contracted,
+    declared_derivative,
+    marked_call_p,
+    with_gradients_formed,
+)
 from dew.nn.finite import zeroed_unless
-from dew.nn.programs import holes
+from dew.nn.programs import called, computed, holes
 
 type Tree = Mapping[str, object]
 
@@ -60,6 +70,126 @@ class RunRule(Surrogate):
 RUN_RULE = RunRule()
 
 
+class RunRead(NamedTuple):
+    """A run's variable in a loss's program (`read_once`): its run's path, the shapes of what the run's
+    call reads as its trace saw them (`InBackward.shapes`), where each operand of that call reads from
+    (`InBackward.sources`), and the variable's own collection and leaf's path within the run, which its
+    weights, masters and moments share."""
+
+    run: tuple[str, ...]
+    called: tuple[tuple[int, ...], ...]
+    sources: tuple[tuple[str, tuple[str, ...]] | None, ...]
+    collection: str
+    leaf: tuple[str, ...]
+
+
+_PLACED = frozenset({"sharding_constraint", "optimization_barrier", "copy"})
+"""The primitives whose results are their operands, value for value, placed (a sharding constraint), held
+from fusion (a barrier) or copied: a run's variables pass through them as themselves (`read_once`). A cast
+rounds what a rule would update in place (the step's narrow copies are inputs of their own)."""
+
+_LAID_OUT = frozenset({"reshape", "squeeze", "expand_dims"})
+"""The primitives that lay their operand out anew, its coordinates in row-major order (a stage-local
+stack's layers reshaped to a run's): a run's variables pass through them where each leaf's weights,
+masters and moments pass through the same ones, so the state its rule writes is laid out as the weights
+it reads (`read_once`). A transpose, or a reshape that permutes its dimensions first, moves coordinates:
+no such layout."""
+
+_DRAWS = frozenset({"random_bits", "threefry2x32", "rng_bit_generator"})
+"""The primitives that draw random bits: a run whose layers draw them (dropout) keys its masks otherwise
+than Linen's scan does (`dew.nn.backbones.decoder_stack._updated_in_backward`), so no plan updates it."""
+
+
+def read_once(program: jcore.Jaxpr, roots: Mapping[jcore.Var, RunRead], runs: Sequence[tuple[str, ...]]
+              ) -> bool:
+    """Whether each of `runs` is read in `program`, a loss's, once by its own rule (`runs_rule`) at the
+    loss's own level, its variables (`roots`) read by nothing else: through calls (but a nested jit, whose
+    cached program a later trace reads without calling the run), placements (`_PLACED`) and layouts every
+    variable of the run takes alike (`_LAID_OUT`); its rule's operands shaped as its trace saw them (no
+    batching transform's lanes beside them) and drawing no random bits."""
+    reads: collections.Counter[tuple[str, ...]] = collections.Counter()
+    refused: set[tuple[str, ...]] = set()
+    _reads(program, {value: (root, ()) for value, root in roots.items()}, reads, refused)
+    return all(reads[run] == 1 and run not in refused for run in runs)
+
+
+def _reads(program: jcore.Jaxpr, roots: Mapping[jcore.Var, tuple[RunRead, tuple]],
+           reads: collections.Counter[tuple[str, ...]], refused: set[tuple[str, ...]]
+           ) -> dict[jcore.Var, tuple[RunRead, tuple]]:
+    """`read_once`'s walk of `program`, each run variable held with the layouts it passed through: counts
+    each run's rule reading it in `reads`, puts in `refused` each run any other equation reads; the run
+    variables among `program`'s results."""
+    held = dict(roots)
+    for equation in program.eqns:
+        read = [held[value] for value in equation.invars if computed(value) and value in held]
+        if not read:
+            continue
+        runs = {root.run for root, _ in read}
+        name = equation.primitive.name
+        if name.startswith("custom_vjp") and runs_rule(equation):
+            reads.update(runs)
+            root = read[0][0]
+            operands = equation.invars[-len(root.called):]
+            given = tuple(tuple(value.aval.shape) if isinstance(value.aval, ShapedArray) else ()
+                          for value in operands)
+            # Each operand read from the source its call states (no weight swapped, repeated or missing),
+            # each leaf laid out alike in every collection reading it, its operands its trace's, no draws.
+            leaves = {(root.run, root.leaf) for root, _ in read}
+            if (len(runs) != 1 or not _sourced(operands, held, root.sources)
+                    or len({(root.run, root.leaf, layout) for root, layout in read}) != len(leaves)
+                    or given != root.called
+                    or any(_draws(inner) for inner in jcore.jaxprs_in_params(equation.params))):
+                refused |= runs
+            continue
+        if name == "reshape" and equation.params.get("dimensions") is not None:
+            refused |= runs
+            continue
+        if name in _PLACED or name in _LAID_OUT:
+            step = () if name in _PLACED else ((name, repr(sorted(equation.params.items()))),)
+            held.update({value: (held[given][0], held[given][1] + step)
+                         for value, given in zip(equation.outvars, equation.invars, strict=False)
+                         if computed(given) and given in held})
+            continue
+        body = None if name.startswith(("custom", "pjit", "jit")) else called(equation)
+        if body is None:
+            refused |= runs
+            continue
+        inner = {inside: held[value] for value, inside in zip(equation.invars, body.invars, strict=True)
+                 if computed(value) and value in held}
+        through = _reads(body, inner, reads, refused)
+        held.update({value: through[inside]
+                     for value, inside in zip(equation.outvars, body.outvars, strict=True)
+                     if computed(inside) and inside in through})
+    return held
+
+
+def _sourced(operands: Sequence[jcore.Var | jcore.Literal], held: Mapping[jcore.Var, tuple[RunRead, tuple]],
+             sources: Sequence[tuple[str, tuple[str, ...]] | None]) -> bool:
+    """Whether each of a run's rule's `operands` reads the source its call states (`InBackward.sources`): a
+    run variable (`held`) of that collection and leaf where it states one (the step's narrow copies among
+    the variables its gate roots), never a value the loss made in its place; none where it states none."""
+    for operand, source in zip(operands, sources, strict=True):
+        root = held[operand][0] if computed(operand) and operand in held else None
+        read = None if root is None else (root.collection, root.leaf)
+        if read != source:
+            return False
+    return True
+
+
+def runs_rule(equation: jcore.JaxprEqn) -> bool:
+    """Whether `equation`, a custom derivative's call, is a run's own rule (`RUN_RULE`): its function a
+    marked call of that kind (`dew.nn.derivatives.declared_derivative`), no rule around it."""
+    return any(inner.primitive is marked_call_p and isinstance(inner.params["kind"], RunRule)
+               for program in jcore.jaxprs_in_params(equation.params) for inner in program.eqns)
+
+
+def _draws(program: jcore.Jaxpr) -> bool:
+    """Whether `program`, or any program it holds, draws random bits (`_DRAWS`)."""
+    return any(equation.primitive.name in _DRAWS
+               or any(_draws(inner) for inner in jcore.jaxprs_in_params(equation.params))
+               for equation in program.eqns)
+
+
 @dataclasses.dataclass(frozen=True)
 class InBackward:
     """A step's plan for the runs that update in their backward.
@@ -78,7 +208,12 @@ class InBackward:
     shapes: dict[tuple[str, ...], tuple[tuple[int, ...], ...]] = dataclasses.field(default_factory=dict)
     """The shapes of what each run's call reads, by its path, as its trace sees them (`_registered`): under
     a batching transform (`jax.vmap`) its lanes' axis hidden from them, which the call's program states,
-    one call standing for each lane's (`dew.training.transaction._pools_once`)."""
+    one call standing for each lane's (`dew.training.transaction._read_once`)."""
+    sources: dict[tuple[str, ...], tuple[tuple[str, tuple[str, ...]] | None, ...]] = dataclasses.field(
+        default_factory=dict)
+    """Where each operand of each run's call reads from, by the run's path, in the call's order
+    (`_registered`): the collection and the leaf's path within the run of each of its weights, masters,
+    moments and norms, None for what it reads beside them (its input, its rows' values)."""
 
 
 _PLAN: contextvars.ContextVar[InBackward | None] = contextvars.ContextVar("dew_in_backward", default=None)
@@ -349,3 +484,12 @@ def _registered(current: InBackward, path: tuple[str, ...], called: tuple) -> No
     what its call reads as the trace sees them (`InBackward.shapes`)."""
     current.handled.append(path)
     current.shapes[path] = tuple(jnp.shape(leaf) for leaf in jax.tree.leaves(called))
+    weights, masters, moments, norms, *rest = called
+
+    def sourced(collection: str, tree) -> list[tuple[str, tuple[str, ...]]]:
+        return [(collection, tuple(str(key.key) for key in leaf if isinstance(key, jax.tree_util.DictKey)))
+                for leaf, _ in jax.tree_util.tree_flatten_with_path(tree)[0]]
+
+    current.sources[path] = (*sourced("params", weights), *sourced(MASTERS, masters),
+                             *(source for name in sorted(moments) for source in sourced(name, moments[name])),
+                             *sourced(NORMS, norms), *([None] * len(jax.tree.leaves(rest))))

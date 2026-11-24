@@ -13,13 +13,12 @@ the same arrays step after step.
 """
 from __future__ import annotations
 
-import collections
 import contextlib
 import contextvars
 import dataclasses
 import functools
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
-from typing import Generic, NamedTuple
+from typing import Generic
 
 import jax
 import jax.extend.core as jcore
@@ -28,7 +27,6 @@ import numpy as np
 import optax
 from flax import struct
 from flax.training import dynamic_scale as dynamic_scale_lib
-from jax.core import ShapedArray
 from typing_extensions import TypeVar
 
 from dew._coordination import read_by_holders
@@ -38,7 +36,6 @@ from dew.data.dataset import rows_of
 from dew.gauss_newton import solves_equations
 from dew.held_updates import holds_back, input_taken, refuse_untold, update_applied
 from dew.nn import in_backward
-from dew.nn.derivatives import marked_call_p
 from dew.nn.finite import all_finite, leaf_finite, zeroed_unless
 from dew.nn.inspection import (
     PROBES,
@@ -650,7 +647,7 @@ class _Planned:
     (`Transaction._planned_accumulation`): the weights each layer pools by, set once the forward knows the
     microbatch's share of the window (`Transaction._pulled`); None where they update in it."""
     runs: tuple[tuple[str, ...], ...] = ()
-    """The stacked runs the state holds, by their paths in it, which may pool (`Transaction._pools_once`)."""
+    """The stacked runs the state holds, by their paths in it, which may pool (`Transaction._read_once`)."""
 
 
 @dataclasses.dataclass
@@ -1654,12 +1651,9 @@ class Transaction:
         def accumulate(path, index, gradient, held, moments):
             del path, index, moments
             fill, prior, given, factor = pooling.fill, pooling.old, pooling.new, pooling.factor
-            if fill is None or prior is None or given is None or factor is None:
-                # Its weights are set once the step's forward is (`_pulled`): a backward before it is one
-                # the loss itself takes of the run, a second differentiation no pooling may write.
-                raise ValueError(f"{type(self.objective).__name__} differentiates a stacked layer run inside "
-                                 "its loss, which no backward may pool in place: its _updates_in_backward "
-                                 "must say so")
+            # Set once the step's forward is (`_pulled`): no backward runs before it, a loss differentiating
+            # a run itself planned none (`_read_once`).
+            assert fill is not None and prior is not None and given is not None and factor is not None
 
             def pooled(old, new):
                 return _pooled_leaf(fill, prior, given, old, _unscale(new, factor))
@@ -1684,8 +1678,6 @@ class Transaction:
         window of one under no loss scale (`consumed_where_made` refuses `TrainState.scale`) commits every
         attempt it takes, so what the backward wrote is what the commit keeps (`Applied.onto`), on the
         state the window leaves as on the one it commits."""
-        if not self.objective._updates_in_backward():
-            return None
         if self.size > 1:
             # A step that inspects what its layers made reads their scan's own collections, which a layer
             # applied on its own opens none of: it pools no run in its backward.
@@ -1742,7 +1734,7 @@ class Transaction:
         if state.compute is not None:
             # The masters the step's update applies to, as its constraint projects them (`Transaction.read`).
             read[in_backward.MASTERS] = self.objective.projected(params, updated=False)
-        return _Planned(in_backward.InBackward(update=update, moments=names), read)
+        return _Planned(in_backward.InBackward(update=update, moments=names), read, runs=tuple(runs))
 
     def realize_planned(self, planned: _Planned) -> Callable[[Variables, Batch, Step], Realization]:
         """`realize`, differentiating the collections `planned` adds beside the parameters, whose
@@ -1787,75 +1779,80 @@ class Transaction:
         otherwise), and that plan."""
         watching = step_info.watched is not None and bool(step_info.watched.cotangents)
         planned = None if host or watching or realize != self.realize else self.planned(state)
-        if planned is not None and planned.pooling is not None and not self._pools_once(
-                planned, read, batch, step_info, factor):
+        if planned is not None and not self._read_once(planned, read, batch, step_info, factor):
             planned = None
         if planned is None:
             return self._realized(realize, read, batch, step_info, factor), None
         with in_backward.planned(planned.plan):
             realized = self._realized(self.realize_planned(planned), read, batch, step_info, factor)
-        if len(planned.plan.handled) != len(set(planned.plan.handled)):
-            # A run its loss differentiated twice would take the sum of two updates as its weights.
-            raise ValueError(f"{type(self.objective).__name__} differentiates a stacked layer run more than "
-                             "once in one loss, which no backward may update in place: its "
-                             "_updates_in_backward must say so")
         return realized, planned
 
-    def _pools_once(self, planned: _Planned, read: Variables, batch: Batch, step_info, factor) -> bool:
-        """Whether every run the state stacks (`_Planned.runs`) is read by the loss, its parameters and the
-        window's sum it pools into, in one call of its own rule at the loss's own level, which nothing else
-        of the loss reads, and whose backward the loss's gradient runs: it then pools exactly once a
-        microbatch, writing the sum in place (the donated sum read by nothing after it), its parameters'
-        gradient all its own. A run called in a loop or a branch (whose body runs as many times as it
+    def _read_once(self, planned: _Planned, read: Variables, batch: Batch, step_info, factor) -> bool:
+        """Whether every run the state stacks (`_Planned.runs`) is read by the loss once, in a call of its
+        own rule at the loss's own level that nothing else of the loss reads its variables beside
+        (`in_backward.read_once`), and whose backward the step's own pullback runs: it then updates or
+        pools exactly once a microbatch, its parameters' gradient all its own, the donated state it writes
+        read by nothing after it. A run called in a loop or a branch (whose body runs as many times as it
         steps, or none), within a nested jit (whose cached program a later trace reads without calling the
-        run), whose parameters the loss reads beside it (a term on the weights themselves), whose output
-        the loss detaches (its backward never run), or that the loss does not call at all, is pooled by no
-        backward: the step accumulates as it would unscanned. Read off the loss's program and its
-        gradient's, each traced once under a plan of its own whose update records the runs it pools."""
-        trainable = {"params": read["params"], **planned.read}
-        pulled: list[tuple[str, ...]] = []
+        run), under a batching transform, drawing random bits, whose parameters the loss reads beside it or
+        lays out otherwise than the state it writes (a transposed weight), whose output the loss detaches
+        (its backward never run), or that the loss does not call at all, is updated by no backward: the step
+        runs as it would unscanned. Read off the loss's program traced under a plan of its own, and off the
+        step's realization, reduction and pullback (`realize_planned`, `local_reduction`) traced under one
+        whose update records the runs it reaches."""
+        # A backward its own primal trace takes (a loss differentiating a run itself) calls the update.
+        inner: list[tuple[str, ...]] = []
 
-        def recorded(path, index, gradient, held, moments):
-            del index, gradient, moments
-            pulled.append(_state_path(path))
-            return held, {}
+        def differentiated(path, index, gradient, held, moments):
+            del index, gradient
+            inner.append(path)
+            return held, dict(moments)
+
+        probe = dataclasses.replace(planned.plan, handled=[], shapes={}, sources={}, update=differentiated)
 
         def loss(trainable):
             return self.objective._loss({**read, **trainable}, batch, step_info)
 
-        def total(trainable):
-            # Reduced as the step reduces it (`local_reduction`), whatever form its statistics take.
-            stats, _ = loss(trainable)
-            return self.objective.reduce_loss(stats)[0]
-
-        probe = dataclasses.replace(planned.plan, handled=[], shapes={})
+        trainable = {"params": read["params"], **planned.read}
         with unscaled(factor), fixed_routers(), in_backward.planned(probe):
-            program = jax.make_jaxpr(loss)(trainable).jaxpr
+            program = jax.make_jaxpr(loss)(trainable)
         handled = [_state_path(path) for path in probe.handled]
-        if sorted(handled) != sorted(planned.runs):
-            # A run the loss does not call, or calls where no trace registers it (a nested jit's cached
-            # program), or calls more than once at trace time.
+        if inner or sorted(handled) != sorted(planned.runs):
+            # A run the loss differentiates itself, does not call, calls where no trace registers it (a
+            # nested jit's cached program), or calls more than once (a loss scoring it twice).
             return False
         shapes = {_state_path(path): called for path, called in probe.shapes.items()}
-        roots: dict[jcore.Var, _Root] = {}
-        for (path, _), value in zip(jax.tree_util.tree_flatten_with_path(trainable)[0], program.invars,
+        sources = {_state_path(path): read for path, read in probe.sources.items()}
+        roots = {}
+        for (path, _), value in zip(jax.tree_util.tree_flatten_with_path(trainable)[0], program.jaxpr.invars,
                                     strict=True):
             names = tuple(str(entry.key) for entry in path[1:] if isinstance(entry, jax.tree_util.DictKey))
-            root = next((run for run in handled if names[:len(run)] == run), None)
-            if root is not None:
-                collection = path[0].key if isinstance(path[0], jax.tree_util.DictKey) else None
-                roots[value] = _Root(root, collection == in_backward.MASTERS, shapes[root])
-        reads: collections.Counter[tuple[str, ...]] = collections.Counter()
-        refused: set[tuple[str, ...]] = set()
-        _run_reads(program, roots, reads, refused)
-        if not all(reads[run] == 1 and run not in refused for run in handled):
+            run = next((at for at in handled if names[:len(at)] == at), None)
+            if run is not None and isinstance(path[0], jax.tree_util.DictKey):
+                roots[value] = in_backward.RunRead(run, shapes[run], sources[run], str(path[0].key),
+                                                   names[len(run):])
+        if not in_backward.read_once(program.jaxpr, roots, handled):
             return False
-        # Live in the gradient: each run's own rule pools in the backward the loss's gradient runs, the
-        # recorded update called there for exactly the runs registered, never for one detached.
-        live = dataclasses.replace(planned.plan, handled=[], shapes={}, update=recorded)
-        with unscaled(factor), fixed_routers(), in_backward.planned(live):
-            jax.make_jaxpr(jax.grad(total))(trainable)
-        return set(pulled) == set(handled)
+        # Live in the step's own pullback: each run's rule reached by the backward the step runs, its update
+        # called for exactly the runs registered, never for one detached.
+        reached: list[tuple[str, ...]] = []
+
+        def recorded(path, index, gradient, held, moments):
+            del index, gradient
+            reached.append(_state_path(path))
+            return held, dict(moments)
+
+        live = dataclasses.replace(planned, plan=dataclasses.replace(planned.plan, handled=[], shapes={},
+                                                                     sources={}, update=recorded))
+
+        def pulled():
+            realized = self._realized(self.realize_planned(live), read, batch, step_info, factor)
+            _, cotangent = self.local_reduction(realized.stats, factor)
+            return realized.pullback(cotangent)
+
+        with in_backward.planned(live.plan):
+            jax.make_jaxpr(pulled)()
+        return set(reached) == set(handled)
 
     def _pulled(self, state: TrainState, realized: Realization, cotangent, planned: _Planned | None,
                 factor, *, whole: bool, masters: bool
@@ -1875,7 +1872,7 @@ class Transaction:
                 handled = tuple(_state_path(path) for path in planned.plan.handled)
                 if not handled:
                     return gradient, None, None, ()
-                # Each run read once, its parameters by nothing else (`_pools_once`): its window sum is the
+                # Each run read once, its parameters by nothing else (`_read_once`): its window sum is the
                 # one its backward pooled in place, its parameters' own cotangent none.
                 accumulated = cotangents[in_backward.MASTERS]
                 pooled = functools.reduce(merge, [_nested(path, _at(accumulated, path)) for path in handled],
@@ -2060,86 +2057,6 @@ class Transaction:
                                                     tokens, probed)
             return together(advanced, held), loss, aux, committed
         return run
-
-
-_PASSED = frozenset({"sharding_constraint", "optimization_barrier", "copy", "reshape", "squeeze",
-                     "expand_dims", "transpose", "convert_element_type"})
-"""The primitives whose results are their operands one for one, placed (a sharding constraint), held from
-fusion (a barrier), copied, laid out anew (a stage-local stack's layers reshaped to a run's) or cast,
-which a run's variables pass through as themselves (`_run_reads`)."""
-
-_DRAWS = frozenset({"random_bits", "threefry2x32", "rng_bit_generator"})
-"""The primitives that draw random bits: a run whose layers draw them (dropout) keys its masks otherwise
-than Linen's scan does (`dew.nn.backbones.decoder_stack._updated_in_backward`), so it pools none."""
-
-
-class _Root(NamedTuple):
-    """A run's variable in a loss's program (`_run_reads`): its run's path, whether it is the window's sum
-    the run pools into (`dew.nn.in_backward.MASTERS`), which only the run's own rule reads, and the shapes of
-    what the run's call reads as its trace saw them (`dew.nn.in_backward.InBackward.shapes`)."""
-
-    run: tuple[str, ...]
-    sum: bool
-    called: tuple[tuple[int, ...], ...]
-
-
-def _run_reads(program: jcore.Jaxpr, roots: Mapping[jcore.Var, _Root],
-               reads: collections.Counter[tuple[str, ...]], refused: set[tuple[str, ...]]
-               ) -> dict[jcore.Var, _Root]:
-    """Count in `reads` each equation of `program` that reads a run's variables (`roots`) as one read of
-    that run: the run's own rule (a custom derivative that reads its sum, `dew.nn.in_backward.scanned_run`)
-    one read, where its layers draw no random bits; a call through its program, but a nested jit, whose
-    cached program a later trace reads without calling the run again; and its variables through
-    placements, layouts and casts (`_PASSED`) as themselves. Any other equation reading them (a loop, a
-    branch, another custom derivative, a term on the weights) puts the run in `refused`. The variables of
-    each run among `program`'s results."""
-    held = dict(roots)
-    for equation in program.eqns:
-        read = [held[value] for value in equation.invars if computed(value) and value in held]
-        if not read:
-            continue
-        runs = {root.run for root in read}
-        name = equation.primitive.name
-        if name.startswith("custom_vjp") and any(root.sum for root in read) and _runs_rule(equation):
-            reads.update(runs)
-            # Its operands' shapes the run's own as its trace saw them, else a batching transform's lanes
-            # beside them: one call standing for each lane's.
-            given = tuple(tuple(value.aval.shape) if isinstance(value.aval, ShapedArray) else ()
-                          for value in equation.invars[-len(read[0].called):])
-            if (given != read[0].called
-                    or any(_draws(inner) for inner in jcore.jaxprs_in_params(equation.params))):
-                refused |= runs
-            continue
-        if name in _PASSED:
-            held.update({value: held[given]
-                         for value, given in zip(equation.outvars, equation.invars, strict=False)
-                         if computed(given) and given in held})
-            continue
-        body = None if name.startswith(("custom", "pjit", "jit")) else called(equation)
-        if body is None:
-            refused |= runs
-            continue
-        inner = {inside: held[value] for value, inside in zip(equation.invars, body.invars, strict=True)
-                 if computed(value) and value in held}
-        through = _run_reads(body, inner, reads, refused)
-        held.update({value: through[inside]
-                     for value, inside in zip(equation.outvars, body.outvars, strict=True)
-                     if computed(inside) and inside in through})
-    return held
-
-
-def _runs_rule(equation: jcore.JaxprEqn) -> bool:
-    """Whether `equation`, a custom derivative's call, is a run's own rule (`dew.nn.in_backward.RUN_RULE`):
-    its function a marked call of that kind (`dew.nn.derivatives.declared_derivative`), no rule around it."""
-    return any(inner.primitive is marked_call_p and isinstance(inner.params["kind"], in_backward.RunRule)
-               for program in jcore.jaxprs_in_params(equation.params) for inner in program.eqns)
-
-
-def _draws(program: jcore.Jaxpr) -> bool:
-    """Whether `program`, or any program it holds, draws random bits (`_DRAWS`)."""
-    return any(equation.primitive.name in _DRAWS
-               or any(_draws(inner) for inner in jcore.jaxprs_in_params(equation.params))
-               for equation in program.eqns)
 
 
 def gradients_read(program: jcore.Jaxpr, read: Sequence[frozenset[int]]) -> list[frozenset[int]]:
