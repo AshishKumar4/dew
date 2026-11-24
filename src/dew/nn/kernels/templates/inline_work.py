@@ -112,11 +112,12 @@ class _Launch:
     branches and loops around it, its shared side's bytes moved between device and shared memory once
     however many lanes issue it; any other use of the context is no rule's."""
 
-    def async_copy(self, *, src_ref, dst_ref, **options) -> None:
+    def async_copy(self, *, src_ref, dst_ref, predicate=None, **options) -> None:
         del options
         shared = dst_ref if _shared(dst_ref.type) else src_ref
         moved = _bytes_of(ir.MemRefType(shared.type))
-        mgpu_utils.inline_ptx(f"{COPIED} {moved}", has_side_effects=True)
+        # Marked under its issuing lanes' guard where it states one.
+        mgpu_utils.inline_ptx(f"{COPIED} {moved};", has_side_effects=True, predicate=predicate)
 
     def __getattr__(self, name: str):
         raise Uncounted(f"a body's use of its launch context's {name}")
@@ -431,16 +432,19 @@ def _assembly(text: str, active: np.ndarray, operand: Callable) -> Work:
             guard, words = words[0].lstrip("@!"), words[1:]
             maybe, surely = bounds_of(guard)
             running = active & (~surely if negated else maybe)
-            if guard.startswith("$") or guard in predicates:
+            # Its lanes known where some active lane surely holds it or none may: bounded, not every lane
+            # a may (a ticket's last arriver among its elected lane is bounded by it).
+            if (surely & active).any() or not (maybe & active).all():
                 guard = None
         issued = float(running.reshape(-1, WARP).any(axis=1).sum() * WARP)
         moving = float(running.sum())
         if words and words[0].startswith("setp."):
             predicates[words[1].strip(",")] = _set(words, lanes_of, bounds_of)
             continue
-        if line.strip().startswith(COPIED):
-            # A launch context's copy (`_Launch`): its bytes once, where any lane reaches it.
-            moved = float(line.split()[-1]) * bool(moving)
+        if " ".join(words).startswith(COPIED):
+            # A launch context's copy (`_Launch`): its bytes once, where any lane reaches it and takes
+            # its issuer's guard.
+            moved = float(words[-1]) * bool(moving)
             work = work + Work(device_bytes=moved, shared_bytes=moved)
             continue
         if words and words[0].startswith("//"):
