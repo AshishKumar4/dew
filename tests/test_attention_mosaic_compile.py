@@ -55,6 +55,12 @@ GATED = gate_generations(scoped=True, tpu=True,
 runs on (`kernel_compile.gate_generations`, its launches' flags, the bundle qualified for it,
 `attention_mosaic_program.qualified`: a family whose consumers issue their products)."""
 
+FAMILY_GPUS = ("sm80", "sm86", "sm90", "sm100", "sm120")
+"""One GPU of each family's distinct facts, the hooked and cached gate cells' (row 12438): an A100's mma.sync
+at 164 KiB of shared memory, an A10's at 99 KiB, an H100's wgmma, a B200's tcgen05, consumer Blackwell's;
+an L4 (sm89) is an A10's family and shared memory for every 16-bit call the gates compile
+(`generation.GpuTarget`), so its hookless cells alone are its own."""
+
 BACKWARD_GATED = gate_generations(tpu=True, needs=lambda family, architecture: (
     attention_mosaic_program.runs_backward(family)))
 """The GPUs whose backward launches the gate compiles: one of each architecture with a bundle the backward
@@ -88,18 +94,18 @@ its every kernel is the sinks' (the same module hash at each gate cell, 2026-11-
 
 BACKWARD_GATE = [(generation_name, width, accurate, "none") for generation_name in BACKWARD_GATED
                  for width in (64, 128, 256) for accurate in (False, True)]
-BACKWARD_GATE += [(generation_name, width, accurate, hooks) for generation_name in BACKWARD_GATED
-                  for width in (64, 128) for accurate in (False, True) for hooks in COMPILED_HOOKS]
+BACKWARD_GATE += [(generation_name, 128, accurate, hooks) for generation_name in BACKWARD_GATED
+                  if generation_name in FAMILY_GPUS for accurate in (False, True) for hooks in COMPILED_HOOKS]
 BACKWARD_GATE += [("sm90", 256, False, "softcap")]
 BACKWARD_GATE = [case for case in BACKWARD_GATE if _takes(case[0], case[2], case[3])]
-"""The backward resource gate's cases, each a form its GPU's bundles take (`_takes`; a form of two
-launches refused by its typed fact where the bundle's dQ launch has no producer): each GPU whose family the
-backward runs on (`BACKWARD_GATED`), a causal
-call's head widths, each form, hookless; each score hook at the widths a hooked call's derivation takes
-whole, in each form (row 2281: its live set beside the step's; FS-A100CHECK1d: the accurate form under a
-row-indexed hook failed an A100's layout inference, a case no fast-form gate lowered); and Gemma 2's, a
-softcap 256 wide on an H100, whose one launch's consumers share a key block within its block where its hook
-reserves no reduction scratch (row 3704, `hook_reduces`)."""
+"""The backward resource gate's cases, each a form its GPU's bundles take (`_takes`; a form of two launches
+refused by its typed fact where the bundle's dQ launch has no producer): each GPU whose family the backward
+runs on (`BACKWARD_GATED`), a causal call's head widths, each form, hookless; each score hook 128 wide on
+each family's GPU (`FAMILY_GPUS`, row 12438: the 64-wide cell held what the 128-wide one did), in each form
+(row 2281: its live set beside the step's; FS-A100CHECK1d: the accurate form under a row-indexed hook
+failed an A100's layout inference, a case no fast-form gate lowered); and Gemma 2's, a softcap 256 wide on
+an H100, whose one launch's consumers share a key block within its block where its hook reserves no
+reduction scratch (row 3704, `hook_reduces`)."""
 
 
 def _gated_hooks(hooks: str, queries: int, width: int):
@@ -167,8 +173,8 @@ takes no dropout (`MosaicForward._placed_refusal`)."""
 FORWARD_GATE = [(generation_name, width, training, "none") for generation_name in GATED
                 for width in (64, 128, 256)
                 for training in (template.Kept.NONE, template.Kept.OUTPUT, template.Kept.SPLIT)]
-FORWARD_GATE += [(generation_name, width, training, hooks) for generation_name in GATED for width in (64, 128)
-                 for training in (template.Kept.NONE, template.Kept.OUTPUT, template.Kept.SPLIT)
+FORWARD_GATE += [(generation_name, 128, training, hooks) for generation_name in GATED
+                 if generation_name in FAMILY_GPUS for training in (template.Kept.NONE, template.Kept.SPLIT)
                  for hooks in COMPILED_HOOKS]
 FORWARD_GATE += [(generation_name, 256, template.Kept.NONE, "softcap") for generation_name in GATED]
 FORWARD_GATE = [(*case, jnp.bfloat16) for case in FORWARD_GATE]
@@ -178,14 +184,15 @@ FORWARD_GATE += [(generation_name, width, training, "dropout", jnp.float16) for 
                  for width in (64, 128) for training in (template.Kept.NONE, template.Kept.SPLIT)]
 """The forward resource gate's cases: each GPU whose family the mainloop qualifies (`GATED`), a causal call's
 head widths, inference and both training residual forms (the 16-bit fast path's output and the anchor's
-split sums), hookless, each score hook at the widths a hooked call's derivation takes (row 2281: its live set
-beside the walk's), a softcap's inference forward 256 wide (Gemma's), all in bf16, and fp16's inference and
-training forwards (row 3514: an A100's fp16 training forward at width 64 spilled 24 bytes), hookless and
-dropping where the mainloop drops (`DROPPING`: its kept weights' two parts beside the step, `weight_parts`;
-row 9526: an sm100's split training forward at width 128 spilled 20 bytes, its warpgroup selector and walk
-bound held across the register move, none with each consumer a static branch, its draw unpriced); and a
-B200's bf16 forwards on tcgen05's chunks (products into scoped tensor memory, read back into registers, the
-weights staged for the values' product: the Blackwell fold's H1)."""
+split sums), hookless, each score hook 128 wide on each family's GPU (`FAMILY_GPUS`) in inference and the
+split sums, the largest live set of training's (row 2281: its live set beside the walk's; row 12438), a
+softcap's inference forward 256 wide (Gemma's), all in bf16, and fp16's inference and training forwards
+(row 3514: an A100's fp16 training forward at width 64 spilled 24 bytes), hookless and dropping where the
+mainloop drops (`DROPPING`: its kept weights' two parts beside the step, `weight_parts`; row 9526: an
+sm100's split training forward at width 128 spilled 20 bytes, its warpgroup selector and walk bound held
+across the register move, none with each consumer a static branch, its draw unpriced); and a B200's bf16
+forwards on tcgen05's chunks (products into scoped tensor memory, read back into registers, the weights
+staged for the values' product: the Blackwell fold's H1)."""
 
 
 def _template_step(query, key, value):
@@ -382,15 +389,18 @@ WORK_LIST_GPUS = tuple(name for name in GATED if staged_widths(name, jnp.bfloat1
 
 
 DECODE_GATE = [(generation_name, width, stored, call) for generation_name in WORK_LIST_GPUS
+               if generation_name in FAMILY_GPUS
                for width in staged_widths(generation_name, jnp.bfloat16)
+               if generation_name == "sm90" or width == max(staged_widths(generation_name, jnp.bfloat16))
                for stored in ("bfloat16", "int8", "float32")
                for call, positions, heads, kv_heads in WORK_LISTS
                if (stored == "bfloat16" or call == "decode")
                and _served(generation_name, positions, heads, kv_heads, width, stored)]
-"""The work list gate's cases: each GPU the route serves the work list on (`WORK_LIST_GPUS`), each width its
-bundles stage (`staged_widths`, the declarations the route's legality reads: a 32-wide call's mma.sync launch
-was no case of the gate's 64 and 128, and its magnitudes' transposed load failed on an H100, IG-FINAL3), each
-cache of a decode step (bf16, int8 codes, an fp32 query's parts) and a bf16 inference call, wherever the route
+"""The work list gate's cases: each family's GPU the route serves the work list on (`WORK_LIST_GPUS`,
+`FAMILY_GPUS`), at its widest staged head and on an H100 each width its bundles stage (row 12438;
+`staged_widths`, the declarations the route's legality reads: a 32-wide call's mma.sync launch was no case
+of the gate's 64 and 128, and its magnitudes' transposed load failed on an H100, IG-FINAL3), each cache of
+a decode step (bf16, int8 codes, an fp32 query's parts) and a bf16 inference call, wherever the route
 serves the call as the work list (`_served`)."""
 
 @COMPILES_ON_CPU
