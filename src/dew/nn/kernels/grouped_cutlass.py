@@ -118,7 +118,7 @@ def _formed(tokens: jax.Array, prologue_operands: tuple, hooks: Hooks) -> jax.Ar
     if prologue is None:
         return tokens
     assert callable(prologue), prologue
-    return prologue(tokens, *prologue_operands).astype(tokens.dtype)
+    return jnp.asarray(prologue(tokens, *prologue_operands), tokens.dtype)
 
 
 @dataclasses.dataclass(frozen=True)

@@ -2426,11 +2426,11 @@ def _stand_in_cutlass(monkeypatch) -> None:
     kernel = types.SimpleNamespace(tile=(128, 256, 64), stages=4, consumers=256, cluster=2,
                                    instructions="wgmma")
     wheel = types.ModuleType("dew_cutlass")
-    wheel.__spec__ = importlib.machinery.ModuleSpec("dew_cutlass", None, origin="stand-in://dew_cutlass/sm90")
-    wheel.TARGETS = ("dew_cutlass_gmm", "dew_cutlass_tgmm")
-    wheel.KERNELS = {("sm90", "bfloat16"): kernel, ("sm90", "float32"): kernel}
-    wheel.registered = lambda: None
-    wheel.architecture = lambda major, minor: "sm90" if major == 9 else None
+    vars(wheel).update(
+        __spec__=importlib.machinery.ModuleSpec("dew_cutlass", None, origin="stand-in://dew_cutlass/sm90"),
+        TARGETS=("dew_cutlass_gmm", "dew_cutlass_tgmm"),
+        KERNELS={("sm90", "bfloat16"): kernel, ("sm90", "float32"): kernel}, registered=lambda: None,
+        architecture=lambda major, minor: "sm90" if major == 9 else None)
     monkeypatch.setitem(sys.modules, "dew_cutlass", wheel)
 
 
