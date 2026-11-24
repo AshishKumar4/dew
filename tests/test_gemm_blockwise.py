@@ -414,21 +414,38 @@ def test_a_gated_mlps_recipe_chain_is_its_three_recipe_projections_apart():
         np.testing.assert_array_equal(np.asarray(got).view(bits), np.asarray(want).view(bits), err_msg=name)
 
 
-def test_a_recipe_chain_of_padded_rows_hands_an_activation_not_zero_at_zero_to_the_projections_apart():
-    """A recipe chain whose rows a 128-row block does not hold (one row) and whose activation is not zero at
-    zero (`where(gate == 0, 256, up)`): its padding rows' activations would enter the down projection's
-    kernel gradient's token-block scales and round the real row's away, so the chain hands the call back
-    (None) and its projections apart take it; at whole blocks it takes the chain (row 12689's review)."""
+
+@pytest.mark.parametrize("activation", ["nonzero at zero", "nonfinite derivative at zero"])
+def test_a_padded_gated_recipe_chain_keeps_its_padding_out_of_every_gradient(activation):
+    """A gated recipe chain of one row (127 padding rows in its 128-row block) through an activation whose
+    padding is not inert, nonzero at zero (`where(gate == 0, 256, up)`, which would set the down kernel
+    gradient's token-block scale and round the real row away) or of a nonfinite derivative there
+    (`sqrt(gate) + up`): its value and every gradient bitwise the three recipe projections apart, the
+    padding held out of the backward (`_chain_backward`'s `live`, row 12689's review)."""
     from dew.nn.precision import FP8, projection_role
 
-    def gated(gate, up):
-        return jnp.where(gate == 0, 256.0, up)
-
-    rng = np.random.default_rng(12692)
-    gate, up = (jnp.asarray(rng.normal(size=(256, 384)) / 16, jnp.bfloat16) for _ in range(2))
+    act = {"nonzero at zero": lambda gate, up: jnp.where(gate == 0, 256.0, up),
+           "nonfinite derivative at zero": lambda gate, up: jnp.sqrt(gate) + up}[activation]
+    rng = np.random.default_rng(12693)
+    x = jnp.asarray(np.abs(rng.normal(size=(1, 256))), jnp.bfloat16)
+    gate = jnp.asarray(np.abs(rng.normal(size=(256, 384))) / 16, jnp.bfloat16)
+    up = jnp.asarray(rng.normal(size=(256, 384)) / 4096, jnp.bfloat16)
     down = jnp.asarray(rng.normal(size=(384, 256)) / 16, jnp.bfloat16)
+    cotangent = jnp.asarray(rng.normal(size=(1, 256)), jnp.bfloat16)
+
+    def chained(x, gate, up, down):
+        return projections.recipe_chain(x, up, down, act, out_dtype=jnp.bfloat16, gate=gate)
+
+    def apart(x, gate, up, down):
+        def projected(rows, matrix):
+            return projections.recipe_projection(rows, matrix, out_dtype=jnp.bfloat16)
+
+        return projected(act(projected(x, gate), projected(x, up)).astype(jnp.bfloat16), down)
+
     with generation.run_precision(FP8), projection_role("mlp"):
-        for rows, taken in ((1, False), (128, True)):
-            x = jnp.asarray(rng.normal(size=(rows, 256)), jnp.bfloat16)
-            out = projections.recipe_chain(x, up, down, gated, out_dtype=jnp.bfloat16, gate=gate)
-            assert (out is not None) == taken, (rows, out)
+        fused = jax.jit(with_gradients(chained))(x, gate, up, down, cotangent)
+        separate = jax.jit(with_gradients(apart))(x, gate, up, down, cotangent)
+    for name, got, want in zip(("value", "d_x", "d_gate", "d_up", "d_down"), fused, separate, strict=True):
+        assert np.all(np.isfinite(np.asarray(got, np.float32))), name
+        bits = np.dtype(f"uint{8 * got.dtype.itemsize}")
+        np.testing.assert_array_equal(np.asarray(got).view(bits), np.asarray(want).view(bits), err_msg=name)
