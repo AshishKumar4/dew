@@ -2322,24 +2322,41 @@ def _rounded_accumulators(kept: dict, count: int, epilogue, acc, sides, *, dtype
     jaxpr = jax.make_jaxpr(lambda *values: _tupled(epilogue, *values))(*(acc,) * count, *sides).jaxpr
     differentiated = vjp[0].jaxpr
 
+    def stored(value, width):
+        # The kept output that is `value`, stored exactly (`_lossless_cast`), at any of its places.
+        return next((kept[out] for out, var in enumerate(jaxpr.outvars)
+                     if var is value and out in kept and _lossless_cast(width, dtypes[out])), None)
+
     def read(at: int):
         var = jaxpr.invars[at]
         if var in jaxpr.outvars:
             # Returned at its own width: the output is the accumulator, whatever its derivative reads.
-            out = jaxpr.outvars.index(var)
-            return kept.get(out) if jnp.dtype(dtypes[out]) == acc.dtype else None
+            return stored(var, acc.dtype)
         rounded = _rounding(jaxpr, var)
         if rounded is None or rounded not in jaxpr.outvars:
             return None
-        out = jaxpr.outvars.index(rounded)
         width = rounded.aval.dtype
-        if (jnp.promote_types(width, dtypes[out]) != jnp.dtype(dtypes[out])
-                or not _read_rounded_alone(differentiated, differentiated.invars[at], width)):
+        if not _read_rounded_alone(differentiated, differentiated.invars[at], width):
             return None
-        return kept.get(out)
+        return stored(rounded, width)
 
     found = [read(at) for at in range(count)]
     return None if any(value is None for value in found) else tuple(found)
+
+
+def _lossless_cast(source, target) -> bool:
+    """Whether casting `source` values to `target` keeps every one exactly: the same dtype, or two floating
+    dtypes whose `target` holds every normal and subnormal of `source` (as many mantissa bits, as wide an
+    exponent range, as small a least subnormal). Never an integer's (int32 to fp32 rounds 2**24 + 1), and
+    no promotion is asked (float8 against fp32 has none, `jnp.promote_types` raising; #4050's review)."""
+    source, target = jnp.dtype(source), jnp.dtype(target)
+    if source == target:
+        return True
+    if not (jnp.issubdtype(source, jnp.floating) and jnp.issubdtype(target, jnp.floating)):
+        return False
+    have, want = jnp.finfo(target), jnp.finfo(source)
+    return (have.nmant >= want.nmant and have.maxexp >= want.maxexp and have.minexp <= want.minexp
+            and have.minexp - have.nmant <= want.minexp - want.nmant)
 
 
 def _read_rounded_alone(jaxpr, var, width) -> bool:
@@ -2397,14 +2414,14 @@ def _passes_cotangent(vjp: tuple, at: int, dtypes: tuple, narrow) -> bool:
     narrow = jnp.dtype(narrow)
 
     def held(dtype) -> bool:
-        return jnp.promote_types(dtype, narrow) == narrow
+        return _lossless_cast(dtype, narrow)
 
     widened = True  # every conversion between `var` and the result widens, exactly
     while var in producers and producers[var].primitive is jax.lax.convert_element_type_p:
         if widened and held(var.aval.dtype):
             return True
         source = producers[var].invars[0]
-        widened = widened and jnp.promote_types(source.aval.dtype, var.aval.dtype) == var.aval.dtype
+        widened = widened and _lossless_cast(source.aval.dtype, var.aval.dtype)
         var = source
     if widened and held(var.aval.dtype):
         return True
