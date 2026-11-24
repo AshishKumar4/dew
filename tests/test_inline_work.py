@@ -288,3 +288,22 @@ def test_a_body_one_warps_role_runs_counts_that_warps_lanes_alone():
                             scratch_types=[plgpu.SMEM((128,), jnp.float32)])
     counted = emission.emitted(jax.make_jaxpr(launched)().jaxpr, 1, "wg").roles[0].fixed
     assert (counted.operations, counted.shared_bytes) == (32, 2 * 4 * 32)
+
+
+def test_a_short_loops_trips_each_take_their_own_lanes():
+    """A loop of four trips each storing the word of the lane its trip names (`thread == trip`) moves four
+    words: each trip walked at its own induction value (an own band's row a trip selects), where a trip
+    walked once with its induction unknown stored every lane's word each trip."""
+    def body(ctx, ref):
+        del ctx
+        index, i32 = ir.IndexType.get(), ir.IntegerType.get_signless(32)
+        lower, upper, step = (arith.constant(index, value) for value in (0, 4, 1))
+        for_op = scf.ForOp(lower, upper, step)
+        with ir.InsertionPoint(for_op.body):
+            trip = arith.index_cast(i32, for_op.induction_variable)
+            with mgpu_utils.when(arith.cmpi(arith.CmpIPredicate.eq, mgpu_utils.thread_idx(), trip)):
+                memref.store(arith.constant(ir.F32Type.get(), 1.0), ref,
+                             [arith.index_cast(index, mgpu_utils.thread_idx())])
+            scf.YieldOp([])
+
+    assert _counted(body).shared_bytes == 4 * 4
