@@ -9,18 +9,17 @@ fla's carry, the numerator `alpha` and denominator `beta` scaled by `e^-eps`, `e
 A call over several spans summarises each span's carry from an empty past, XLA joins the summaries by the
 portable scan's operator (`rwkv4.joined`) for each span's entering carry, and a launch walks each span from
 its own, writing its outputs, its last carry and whether the carry entering it kept the running maximum
-through it (`survived`).
+through it.
 
-The backward is the numerator's and denominator's own, `A = alpha e^eps` and `B = beta e^eps`, which the
-outputs read alone: a token's output's cotangent `g_t` gives them `c_t e^-tau` and `-c_t out_t e^-tau`,
-`c_t = g_t / (e^{eps - tau} beta + e^{u + k_t - tau})`, carried to the tokens before by `e^w` a token. Their
-carry is held as fla's forward holds its own, two values scaled by `e^mu`, `mu` the running maximum walked
-back (`mu_t = max(-tau_t, w + mu_{t+1})`), so a token's terms `e^{mu + k}` and `e^{w + mu + eps}` are at
-most one. The final carry's `eps` cotangent, net of what `alpha` and `beta` take of it, runs the running
-maximum's own path back: to the key that set it, or to `w` each token it aged. Spans as the forward: a
-launch summarises each span's carry walked back from none, XLA joins them by the same operator from the
-final carry's, and a launch walks each span back from its own. Each recomputes the forward from its span's
-entering carry, a walk forward keeping each turn's carry in shared memory.
+The backward is fla's carried form (fused_recurrent.py's backward): the cotangent of the carry `(g_alpha,
+g_beta, g_eps)` walked back a token at a time at each carry's own maximum's frame, each step's key and decay
+gradients formed net of the frame's shift (`_token_back`), the running maximum's tie the later key's (`_won`).
+Spans as the forward: a launch walks each span back from none for the cotangent its own outputs give its
+entering carry; the linear part of each span's map back follows from the forward's facts (`_maps_back`: its
+decay `e^(n w + eps_in - eps_out)`, and `g_eps`'s share by whether the entering maximum held through it); XLA
+composes the maps from the final carry's cotangent in scaled values; and a launch walks each span back from
+its own, recomputing the forward from its entering carry, a walk forward keeping each turn's carry in shared
+memory.
 
 A document's first token starts from an empty past, selected; outside the row a token leaves every carry as
 it is. Every value is fp32, `w` and `u` gradients summed compensated a program (`precision.compensated_add`)
@@ -43,6 +42,7 @@ from dew.nn.kernels.templates.recurrence.walks import (
     Program,
     Walk,
     added,
+    chosen,
     cut,
     extended,
     launch,
@@ -85,22 +85,30 @@ def _entered(program: Program, token, carry: tuple, like) -> tuple:
 
 
 def _read(carry: tuple, k, v, u):
-    """A token's output from the carry it reads, and the terms its backward reuses: `(out, tau, present,
-    denominator)`, `present = e^{u + k - tau}`."""
+    """A token's output from the carry it reads, and the terms its backward reuses: `(out, past, present,
+    denominator)`, `past = e^{eps - tau}` and `present = e^{u + k - tau}` at `tau = max(u + k, eps)`."""
     alpha, beta, eps = carry
     own = u + k
     tau = jnp.maximum(own, eps)
     past, present = jnp.exp(eps - tau), jnp.exp(own - tau)
     denominator = past * beta + present
-    return (past * alpha + present * v) / denominator, tau, present, denominator
+    return (past * alpha + present * v) / denominator, past, present, denominator
 
 
 def _weights(eps, k, w) -> tuple:
     """A token's step of the running maximum: `(kept, added, top)`, the past's weight `e^(w + eps - top)`
-    and the token's `e^(k - top)` at the new maximum `top = max(w + eps, k)`."""
+    and the token's `e^(k - top)` at the new maximum `top = max(w + eps, k)`, a tie the key's (`_won`)."""
     aged = w + eps
-    top = jnp.maximum(aged, k)
+    top = jnp.where(_won(k, aged), k, aged)
     return jnp.exp(aged - top), jnp.exp(k - top), top
+
+
+def _won(k, aged):
+    """Whether a token's key sets the running maximum past it: at least the aged maximum, a tie the key's,
+    as fla's backward takes it (fused_recurrent.py: the maximum's cotangent the decay's where `w + eps > k`):
+    the later of tied maxima takes it, alike token by token and in any grouping of spans (`rwkv4.joined`),
+    where a tie split in halves token by token and by a scan's tree split three tied keys apart."""
+    return k >= aged
 
 
 def _aged(carry: tuple, k, v, w) -> tuple:
@@ -154,9 +162,8 @@ def summaries(k, v, w, starts, *, shape: Walk):
 @tuning.lowered_once(("shape",))
 def walked(k, v, w, u, starts, alpha, beta, eps, *, shape: Walk):
     """Each token's output from its span's entering carry (`alpha`, `beta`, `eps` `[B, spans, D]` fp32),
-    `[B, T, D]` in `k`'s dtype, each span's last carry, and the share of the maximum's cotangent its end
-    passes back to the carry entering it (`_shares`: one where the entering maximum held through the span,
-    halved at each tie, zero where a key set it or a document started)."""
+    `[B, T, D]` in `k`'s dtype, each span's last carry, and whether the entering carry's maximum held
+    through the span (one, else zero: a key set it, `_won`, or a document started)."""
     operands = (k, v, w, u, starts, alpha, beta, eps)
 
     def entry(*refs):
@@ -172,8 +179,8 @@ def walked(k, v, w, u, starts, alpha, beta, eps, *, shape: Walk):
             for t, k_t, v_t in zip(tokens, ks, vs, strict=True):
                 read, carry = _stepped(program, t, carry, k_t, v_t, decay)
                 program.stored(out_ref, t, _read(read, k_t, v_t, bonus)[0])
-                kept = _shares(k_t, decay + read[2], survived)[1]
-                survived = jnp.where(program.inside(t, k_t), kept, survived)
+                set_by_key = program.inside(t, k_t) & _won(k_t, decay + read[2])
+                survived = jnp.where(set_by_key, jnp.zeros_like(survived), survived)
             return carry, survived
 
         carry = tuple(program.summary(ref) for ref in entering)
@@ -224,49 +231,39 @@ def _back(program: Program, refs: tuple, shape: Walk, kept_ref, carried, emit):
     return program.turns(back, carried, reverse=True)
 
 
-def _shares(k_t, aged, e):
-    """The running maximum's cotangent `e` at a token's `max(aged, k_t)` as `(the key's, the aged past's)`:
-    all to the larger, half to each at a tie, as JAX's `maximum` takes it a token at a time (fla's recurrence,
-    `rwkv4.recurrent_wkv4`; the portable scan's associative grouping splits a tie of three or more tokens by
-    its own tree), each selected, never a product with zero."""
-    zero, half = jnp.zeros_like(e), e * 0.5
-    won, tied = k_t > aged, k_t == aged
-    return jnp.where(won, e, jnp.where(tied, half, zero)), jnp.where(won, zero, jnp.where(tied, half, e))
-
-
-def _reverse_step(program: Program, t, k_t, v_t, dy_t, read, terms, decay, carried, *, summed: bool = False):
-    """One token walked back: `(carried before it, (dk, dv, dw, du) of it)`, `carried` the reverse carry
-    `(a, b, mu)` of the state after it (`A`'s and `B`'s cotangents scaled by `e^-mu`) and the cotangent `e`
-    of its running maximum; outside the row, the carry as it is and no gradient. `summed`, a span's summary
-    walked back from none: `a` and `b` each a running sum `(value, scale)` (`walks.summed_on`), the
-    gradients of none."""
-    a, b, mu, e = carried
-    if summed:
-        a, b = a[0], b[0]
+def _token_back(program: Program, t, k_t, v_t, dy_t, read, terms, decay, after):
+    """One token walked back in fla's carried form (fused_recurrent.py's backward), contracted: `(cotangent of
+    the carry before it, (dk, dv, dw, du) of it)` from `after`, the cotangent `(g_alpha, g_beta, g_eps)` of
+    the carry past it, each at its own maximum's frame. A step's key and decay gradients are formed net of the
+    frame's shift: the maximum's cotangent less the past's share where the key sets the maximum, less the
+    token's own where the past does (`_won`), each share weighted by its step's factor first (`kept`, `added`,
+    at most one): taken apart, a reset token's key gradient was the difference of two terms each past
+    float32's largest (2^200 - 2^200, ReviewRecurrenceBatch); the output's `v - out` and `alpha - v beta`
+    products are each weighted first. A document's first token leaves the carry before it none; outside the
+    row, the carry as it is and no gradient."""
     alpha, beta, eps = read
-    out, tau, present, denominator = terms
+    out, past, present, denominator = terms
+    g_alpha, g_beta, g_eps = after
+    zero = jnp.zeros_like(g_eps)
     c = dy_t / denominator
-    direct = c * present
-    weight_k, weight_w = jnp.exp(mu + k_t), jnp.exp(decay + mu + eps)
-    zero = jnp.zeros_like(e)
-    to_key, to_age = _shares(k_t, decay + eps, e)
-    dk = direct * (v_t - out) + weight_k * (a * v_t + b) + to_key
-    dv = direct + a * weight_k
-    dw = weight_w * (a * alpha + b * beta) + to_age
-    du = direct * (v_t - out)
-    top = jnp.maximum(-tau, decay + mu)
-    own, later = jnp.exp(-tau - top), jnp.exp(decay + mu - top)
-    if summed:
-        before = (summed_on(carried[0], later * a, own * c, None),
-                  summed_on(carried[1], later * b, -(own * c) * out, None), top, to_age)
-        emptied = ((zero, zero), (zero, zero), zero - jnp.inf, zero)
-    else:
-        before = (own * c + later * a, later * b - own * c * out, top, to_age)
-        emptied = (*_empty(k_t), zero)
+    by_present, by_past = c * present, c * past
+    du = by_present * v_t - by_present * out
+    weighted = by_past * (present / denominator)
+    eps_read = weighted * alpha - (weighted * v_t) * beta
+    aged = decay + eps
+    won = _won(k_t, aged)
+    top = jnp.where(won, k_t, aged)
+    kept, added = jnp.exp(aged - top), jnp.exp(k_t - top)
+    past_share = (kept * g_alpha) * alpha + (kept * g_beta) * beta
+    own_share = (added * g_alpha) * v_t + added * g_beta
+    dk = du + jnp.where(won, g_eps - past_share, own_share)
+    dw = jnp.where(won, past_share, g_eps - own_share)
+    dv = by_present + added * g_alpha
+    before = (kept * g_alpha + by_past, kept * g_beta - by_past * out, dw + eps_read)
     first = program.first(t, k_t)
-    before = jax.tree.map(lambda value, empty: cut(first, value, empty), before, emptied)
+    before = tuple(cut(first, value, zero) for value in before)
     inside = program.inside(t, k_t)
-    return _held(inside, before, carried), tuple(jnp.where(inside, x, zero) for x in (dk, dv, dw, du))
+    return _held(inside, before, after), tuple(jnp.where(inside, x, zero) for x in (dk, dv, dw, du))
 
 
 def _kept(shape: Walk):
@@ -276,9 +273,9 @@ def _kept(shape: Walk):
 
 @tuning.lowered_once(("shape",))
 def reverse_summaries(k, v, w, u, starts, alpha, beta, eps, dy, *, shape: Walk):
-    """Each span's reverse carry walked back from none, `(a, a scale, b, b scale, mu)` `[B, spans, D]` fp32:
-    the cotangents its own outputs' (`dy`) give the state entering it, each a running sum
-    (`walks.summed_on`), from each span's entering carry (`alpha`, `beta`, `eps`)."""
+    """The cotangent each span's own outputs (`dy`) give the carry entering it, `(g_alpha, g_beta, g_eps)`
+    `[B, spans, D]` fp32 (`_token_back` from none), from each span's entering carry (`alpha`, `beta`,
+    `eps`): the constant of the span's map back, whose linear part is the forward's (`_maps_back`)."""
     operands = (k, v, w, u, starts, alpha, beta, eps, dy)
 
     def entry(*refs):
@@ -288,26 +285,25 @@ def reverse_summaries(k, v, w, u, starts, alpha, beta, eps, dy, *, shape: Walk):
         zero = jnp.zeros((shape.lanes,), jnp.float32)
 
         def emit(t, k_t, v_t, dy_t, read, terms, decay, carried):
-            return _reverse_step(program, t, k_t, v_t, dy_t, read, terms, decay, carried, summed=True)[0]
+            return _token_back(program, t, k_t, v_t, dy_t, read, terms, decay, carried)[0]
 
-        (a, b, mu, _) = _back(program, (k_ref, v_ref, w_ref, u_ref, dy_ref, entering), shape, kept_ref,
-                              ((zero, zero), (zero, zero), zero - jnp.inf, zero), emit)
-        for ref, value in zip(made, (*a, *b, mu), strict=True):
+        carried = _back(program, (k_ref, v_ref, w_ref, u_ref, dy_ref, entering), shape, kept_ref,
+                        (zero, zero, zero), emit)
+        for ref, value in zip(made, carried, strict=True):
             program.summarised(ref, value)
 
-    out_type = tuple(per_span(k, shape) for _ in range(5))
+    out_type = tuple(per_span(k, shape) for _ in range(3))
     return launch(entry, shape, "wkv4_summaries_backward", out_type, operands, scratch=(_kept(shape),))
 
 
 @tuning.lowered_once(("shape",))
-def walked_back(k, v, w, u, starts, alpha, beta, eps, dy, later_a, later_b, later_mu, later_e, *,
+def walked_back(k, v, w, u, starts, alpha, beta, eps, dy, later_alpha, later_beta, later_eps, *,
                 shape: Walk):
     """The gradients of `k` and `v` (`[B, T, D]` in their dtype), each program's of `w` and `u` (`[B, spans,
-    D]` fp32, XLA sums them), and each span's entering carry's reverse carry and maximum's cotangent (`(a, b,
-    mu, e)` `[B, spans, D]` fp32), from the outputs' cotangent `dy`, each span's entering carry and the
-    reverse carry and maximum's cotangent its last state takes from the later tokens and the final carry
-    (`later_*`)."""
-    operands = (k, v, w, u, starts, alpha, beta, eps, dy, later_a, later_b, later_mu, later_e)
+    D]` fp32, XLA sums them), and the cotangent of each span's entering carry (`[B, spans, D]` fp32 each),
+    from the outputs' cotangent `dy`, each span's entering carry and the cotangent of its last carry from the
+    later tokens and the final carry (`later_*`)."""
+    operands = (k, v, w, u, starts, alpha, beta, eps, dy, later_alpha, later_beta, later_eps)
 
     def entry(*refs):
         given, made = refs_of(refs, operands)
@@ -317,22 +313,21 @@ def walked_back(k, v, w, u, starts, alpha, beta, eps, dy, later_a, later_b, late
         zero = jnp.zeros((shape.lanes,), jnp.float32)
 
         def emit(t, k_t, v_t, dy_t, read, terms, decay, carried):
-            reverse, (dw_sum, du_sum) = carried
-            reverse, (dk, dv, dw, du) = _reverse_step(program, t, k_t, v_t, dy_t, read, terms, decay,
-                                                      reverse)
+            after, (dw_sum, du_sum) = carried
+            before, (dk, dv, dw, du) = _token_back(program, t, k_t, v_t, dy_t, read, terms, decay, after)
             program.stored(dk_ref, t, dk)
             program.stored(dv_ref, t, dv)
-            return reverse, (compensated_add(dw_sum, (dw, zero)), compensated_add(du_sum, (du, zero)))
+            return before, (compensated_add(dw_sum, (dw, zero)), compensated_add(du_sum, (du, zero)))
 
         later = tuple(program.summary(ref) for ref in given[9:])
-        reverse, sums = _back(program, (k_ref, v_ref, w_ref, u_ref, dy_ref, carries), shape, kept_ref,
+        leaving, sums = _back(program, (k_ref, v_ref, w_ref, u_ref, dy_ref, carries), shape, kept_ref,
                               (later, ((zero, zero), (zero, zero))), emit)
         for ref, (high, low) in zip((dw_ref, du_ref), sums, strict=True):
             program.summarised(ref, high + low)
-        for ref, value in zip(leaving_refs, reverse, strict=True):
+        for ref, value in zip(leaving_refs, leaving, strict=True):
             program.summarised(ref, value)
 
-    out_type = (per_token(k, k.dtype), per_token(v, v.dtype), *(per_span(k, shape) for _ in range(6)))
+    out_type = (per_token(k, k.dtype), per_token(v, v.dtype), *(per_span(k, shape) for _ in range(5)))
     return launch(entry, shape, "wkv4_walk_backward", out_type, operands, scratch=(_kept(shape),))
 
 
@@ -348,9 +343,8 @@ def _spans(shape: Walk, starts, like):
 
 
 class _Carry(NamedTuple):
-    """`rwkv4.SpanCarry` as the template's join holds it: a signed value (the numerator; reversed, both) a
-    scaled value (`walks.extended`, `dew.algebra.scaled.Scaled`), `rwkv4.joined` reading each field by its
-    name alike."""
+    """`rwkv4.SpanCarry` as the template's join holds it: its numerator a scaled value (`walks.extended`,
+    `dew.algebra.scaled.Scaled`), `rwkv4.joined` reading each field by its name alike."""
 
     numerator: jax.Array | scaled.Scaled
     denominator: jax.Array | scaled.Scaled
@@ -364,47 +358,115 @@ def _weighed(kept, earlier, added_, later):
     return added(multiplied(earlier, extended(kept, 0)), multiplied(later, extended(added_, 0)))
 
 
-def _joined(carries: tuple, given: tuple, decay, shape: Walk, starts, *, reverse: bool = False) -> tuple:
+def _joined(carries: tuple, given: tuple, decay, shape: Walk, starts) -> tuple:
     """Each span's carry as its walk enters it, `(alpha, beta, eps)` `[B, spans, D]`: `given` (the call's
-    entering carry, `[B, D]` each; `reverse`, the final carry's reverse carry, entering the last span from its
-    end) joined with the spans' (`carries`, from an empty past, each signed value a running sum's value and
-    scale: the numerator; reversed, both) by the portable scan's operator (`rwkv4.joined`) over XLA's
-    associative scan, the signed values scaled (`walks.extended`): a span's from none is its
-    last less its entering one's decayed share, past float32's largest where every value is in it."""
+    entering carry, `[B, D]` each) joined with the spans' (`carries`, from an empty past, the numerator a
+    running sum's value and scale) by the portable scan's operator (`rwkv4.joined`) over XLA's associative
+    scan, the numerators scaled (`walks.extended`): a span's from none is its last less its entering one's
+    decayed share, past float32's largest where every value is in it."""
     from dew.nn.kernels import rwkv4
 
-    if reverse:
-        a, a_scale, b, b_scale, top = carries
-        values = (extended(a, 64.0 * a_scale), extended(b, 64.0 * b_scale))
-        edges = (extended(given[0][:, None], 0), extended(given[1][:, None], 0))
-        weighing = {"numerators": _weighed, "denominators": _weighed}
-    else:
-        numerator, scale, beta, top = carries
-        values = (extended(numerator, 64.0 * scale), beta)
-        edges = (extended(given[0][:, None], 0), given[1][:, None])
-        weighing = {"numerators": _weighed}
+    numerator, scale, beta, top = carries
     tokens, fresh = _spans(shape, starts, top)
-    spans = _Carry(*values, top, tokens, fresh)
-    edge = _Carry(*edges, given[2][:, None], jnp.zeros_like(tokens[:, :1]), jnp.zeros_like(fresh[:, :1]))
-    ordered = (spans, edge) if reverse else (edge, spans)
-    joined = jax.lax.associative_scan(rwkv4.joined(decay, **weighing),
-                                      jax.tree.map(lambda *parts: jnp.concatenate(parts, axis=1), *ordered),
-                                      axis=1, reverse=reverse)
-    entered = jax.tree.map(lambda value: value[:, 1:] if reverse else value[:, :-1], joined)
-    numerator = valued(entered.numerator)
-    denominator = valued(entered.denominator) if reverse else entered.denominator
-    return numerator, denominator, entered.top
+    spans = _Carry(extended(numerator, 64.0 * scale), beta, top, tokens, fresh)
+    edge = _Carry(extended(given[0][:, None], 0), given[1][:, None], given[2][:, None],
+                  jnp.zeros_like(tokens[:, :1]), jnp.zeros_like(fresh[:, :1]))
+    ordered = jax.tree.map(lambda *parts: jnp.concatenate(parts, axis=1), edge, spans)
+    joined = jax.lax.associative_scan(rwkv4.joined(decay, numerators=_weighed), ordered, axis=1)
+    entered = jax.tree.map(lambda value: value[:, :-1], joined)
+    return valued(entered.numerator), entered.denominator, entered.top
+
+
+class _Back(NamedTuple):
+    """A span's map back from the cotangent of its last carry to its entering carry's, as scaled values:
+    `(g_alpha, g_beta)` scaled by `kept`, `g_eps` by `on_alpha`, `on_beta` and (where `held`, the entering
+    maximum held through the span) itself, plus the cotangent its own outputs give (`constant`, `(alpha,
+    beta, eps)`)."""
+
+    kept: scaled.Scaled
+    on_alpha: scaled.Scaled
+    on_beta: scaled.Scaled
+    held: jax.Array
+    constant: tuple
+
+
+def _then(first: _Back, then: _Back) -> _Back:
+    """`first`'s map back, then `then`'s (`associative_scan`'s operator, reversed: `first` the later span)."""
+    alpha, beta, eps = first.constant
+    passed = then.held != 0
+    return _Back(
+        multiplied(then.kept, first.kept),
+        added(multiplied(then.on_alpha, first.kept), chosen(passed, first.on_alpha, _nothing(first.kept))),
+        added(multiplied(then.on_beta, first.kept), chosen(passed, first.on_beta, _nothing(first.kept))),
+        then.held * first.held,
+        (added(multiplied(then.kept, alpha), then.constant[0]),
+         added(multiplied(then.kept, beta), then.constant[1]),
+         added(added(multiplied(then.on_alpha, alpha), multiplied(then.on_beta, beta)),
+               added(chosen(passed, eps, _nothing(eps)), then.constant[2]))))
+
+
+def _nothing(like: scaled.Scaled) -> scaled.Scaled:
+    """A scaled zero of `like`'s shape."""
+    return extended(jnp.zeros_like(like.significand), 0)
+
+
+def _exponential(x) -> scaled.Scaled:
+    """`e^x` as a scaled value (`dew.algebra.scaled`): its power of two apart from its significand, so a
+    span's decay below float32's range keeps its value; zero at `x = -inf`."""
+    exponent = jnp.floor(x * _LOG2E)
+    significand = jnp.exp2(x * _LOG2E - exponent)
+    finite = jnp.isfinite(x)
+    return extended(jnp.where(finite, significand, 0.0), jnp.where(finite, exponent, 0.0))
+
+
+_LOG2E = 1.4426950408889634
+"""`log2(e)`."""
+
+
+def _maps_back(forward: tuple, constants: tuple, decay, shape: Walk, starts) -> _Back:
+    """Each span's map back (`_Back`), `[B, spans, D]`, from the forward's facts (`forward`: each span's
+    entering carry, its last carry, whether its entering maximum held through it, and its carry from an
+    empty past, its numerator a running sum) and the cotangents its own outputs give its entering carry
+    (`constants`, `reverse_summaries`'). A span's decay is `e^(n w + eps_in - eps_out)` over its `n` tokens
+    (zero where a document starts in it); its last carry's numerator is its entering one's decayed share plus
+    its own from none, so the map takes `g_eps` to `-own alpha` where the entering maximum held through it and
+    to `kept alpha_in` where a key set it."""
+    (alpha_in, beta_in, eps_in), (_, _, eps_out), held, (numerator, scale, beta_own, eps_own) = forward
+    tokens, fresh = _spans(shape, starts, eps_in)
+    kept = chosen(fresh, _nothing(extended(eps_in, 0)), _exponential(tokens * decay + eps_in - eps_out))
+    own = _exponential(eps_own - eps_out)
+    keeps = held != 0
+    on_alpha = chosen(keeps, scaled.neg(multiplied(extended(numerator, 64.0 * scale), own)),
+                      multiplied(kept, extended(alpha_in, 0)))
+    on_beta = chosen(keeps, scaled.neg(multiplied(extended(beta_own, 0), own)),
+                     multiplied(kept, extended(beta_in, 0)))
+    return _Back(kept, on_alpha, on_beta, held, tuple(extended(value, 0) for value in constants))
+
+
+def _later(maps: _Back, final: tuple) -> tuple:
+    """The cotangent of each span's last carry, `(alpha, beta, eps)` `[B, spans, D]`: `final` (the final
+    carry's, `[B, D]` each) carried back through the later spans' maps (`maps`) by XLA's associative scan."""
+    through = jax.lax.associative_scan(_then, maps, axis=1, reverse=True)
+    g_alpha, g_beta, g_eps = (extended(value[:, None], 0) for value in final)
+    entered = (added(multiplied(through.kept, g_alpha), through.constant[0]),
+               added(multiplied(through.kept, g_beta), through.constant[1]),
+               added(added(added(multiplied(through.on_alpha, g_alpha), multiplied(through.on_beta, g_beta)),
+                           chosen(through.held != 0, g_eps, _nothing(g_eps))), through.constant[2]))
+    return tuple(jnp.concatenate([valued(value)[:, 1:], given[:, None]], axis=1)
+                 for value, given in zip(entered, final, strict=True))
 
 
 def _forward(k, v, w, u, state, starts, shape: Walk):
-    """`(outputs, final carry [B, 3, D], residuals)`."""
+    """`(outputs, final carry [B, 3, D], the forward's facts its backward reads)`."""
     given = (state[:, 0], state[:, 1], state[:, 2])
     alpha, beta, eps = state[:, 0, None], state[:, 1, None], state[:, 2, None]
+    own = None
     if shape.spans > 1:
-        alpha, beta, eps = _joined(summaries(k, v, w, starts, shape=shape), given, w, shape, starts)
-    out, last_alpha, last_beta, last_eps, survived = walked(k, v, w, u, starts, alpha, beta, eps, shape=shape)
-    final = jnp.stack([last_alpha[:, -1], last_beta[:, -1], last_eps[:, -1]], axis=1)
-    return out, final, ((alpha, beta, eps), survived)
+        own = summaries(k, v, w, starts, shape=shape)
+        alpha, beta, eps = _joined(own, given, w, shape, starts)
+    out, *last, held = walked(k, v, w, u, starts, alpha, beta, eps, shape=shape)
+    final = jnp.stack([value[:, -1] for value in last], axis=1)
+    return out, final, ((alpha, beta, eps), tuple(last), held, own)
 
 
 def _primal(k, v, w, u, state, starts, shape: Walk):
@@ -412,34 +474,21 @@ def _primal(k, v, w, u, state, starts, shape: Walk):
 
 
 def _forward_rule(k, v, w, u, state, starts, shape: Walk):
-    out, final, (entering, survived) = _forward(k, v, w, u, state, starts, shape)
-    return (out, final), (k, v, w, u, state, starts, entering, survived, final)
+    out, final, facts = _forward(k, v, w, u, state, starts, shape)
+    return (out, final), (k, v, w, u, starts, facts)
 
 
 def _backward_rule(shape: Walk, residuals, cotangents):
-    k, v, w, u, state, starts, entering, survived, final = residuals
+    k, v, w, u, starts, facts = residuals
+    entering = facts[0]
     dy, dfinal = cotangents
-    dfinal = dfinal.astype(jnp.float32)
-    # The final carry's cotangents as the reverse carry of `A` and `B` past the last token, and its maximum's
-    # net of what `alpha` and `beta` take of it.
-    given = (dfinal[:, 0], dfinal[:, 1], -final[:, 2])
-    raised = dfinal[:, 2] - dfinal[:, 0] * final[:, 0] - dfinal[:, 1] * final[:, 1]
-    alpha, beta, eps = entering
-    later_a, later_b, later_mu = (value[:, None] for value in given)
+    final = tuple(value.astype(jnp.float32) for value in (dfinal[:, 0], dfinal[:, 1], dfinal[:, 2]))
+    later = tuple(value[:, None] for value in final)
     if shape.spans > 1:
-        local = reverse_summaries(k, v, w, u, starts, alpha, beta, eps, dy, shape=shape)
-        later_a, later_b, later_mu = _joined(local, given, w, shape, starts, reverse=True)
-    # The maximum's cotangent reaching each span's end: the later spans' shares of it (`walked`), selected
-    # zero where a later span cut it (an infinite cotangent times zero was NaN, ReviewRecurrenceBatch).
-    held = jnp.cumprod(survived[:, ::-1], axis=1)[:, ::-1]
-    passed = jnp.concatenate([held[:, 1:], jnp.ones_like(held[:, :1])], axis=1)
-    later_e = jnp.where(passed == 0.0, 0.0, raised[:, None] * passed)
-    dk, dv, dw, du, a, b, mu, e = walked_back(k, v, w, u, starts, alpha, beta, eps, dy, later_a, later_b,
-                                              later_mu, later_e, shape=shape)
-    # The entering carry's cotangents from `A`'s and `B`'s before the first token (`A = alpha e^eps`).
-    scale = jnp.exp(mu[:, 0] + state[:, 2])
-    dstate = jnp.stack([a[:, 0] * scale, b[:, 0] * scale,
-                        scale * (a[:, 0] * state[:, 0] + b[:, 0] * state[:, 1]) + e[:, 0]], axis=1)
+        constants = reverse_summaries(k, v, w, u, starts, *entering, dy, shape=shape)
+        later = _later(_maps_back(facts, constants, w, shape, starts), final)
+    dk, dv, dw, du, *leaving = walked_back(k, v, w, u, starts, *entering, dy, *later, shape=shape)
+    dstate = jnp.stack([value[:, 0] for value in leaving], axis=1)
     return dk, dv, compensated_sum(dw, (0, 1)), compensated_sum(du, (0, 1)), dstate, None
 
 

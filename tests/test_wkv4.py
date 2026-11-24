@@ -156,9 +156,9 @@ def test_the_kernels_take_keys_and_values_in_the_dtype_they_run_them_in():
 
 def test_a_document_at_the_last_token_cuts_the_final_maximums_cotangent():
     """ReviewRecurrenceBatch's cut: a document starting at the last token, of value 2^100, under a final
-    numerator's cotangent of 2^100: the final maximum's cotangent net of the numerator's is past float32's
-    range, and every earlier span is cut from it, so every gradient but the last key's is finite, where the
-    cut multiplying it by zero made them NaN."""
+    numerator's cotangent of 2^100: taken net of the maximum's shift, the last key's gradient (the final
+    maximum's own) is finite, as is every other, where the maximum's cotangent formed apart was 2^200 - 2^200
+    and the cut multiplying it by zero made the earlier ones NaN."""
     rng = np.random.default_rng([1455, 3])
     channel = rng.standard_normal((WIDE,)).astype(np.float32)
     key = rng.standard_normal((ROWS, 150, WIDE)).astype(np.float32)
@@ -172,19 +172,28 @@ def test_a_document_at_the_last_token_cuts_the_final_maximums_cotangent():
     state = state.astype(np.float32)
     _, dtime_decay, dtime_first, dkey, dvalue, dstate = jax.jit(differentiated(routed("kernels")))(
         channel, channel, key, value, state, starts, (np.ones(key.shape, np.float32), dfinal))
-    for grad in (dtime_decay, dtime_first, dkey[:, :-1], dvalue, dstate):
+    for grad in (dtime_decay, dtime_first, dkey, dvalue, dstate):
         assert np.isfinite(np.asarray(grad)).all()
 
 
+TIES = {"the last key": (129,), "three keys across a span's end": (63, 64, 65)}
+"""Tokens whose keys tie the running maximum aged to them, each case's: the last token's ties the entering
+maximum, or three tokens' each tie the one before them, across the first span's end."""
+
+
+@pytest.mark.parametrize('ties', list(TIES))
 @pytest.mark.parametrize('route', list(ROUTES))
-def test_a_tie_of_the_running_maximum_splits_its_cotangent_as_jax_does(route):
-    """ReviewRecurrenceBatch's tie: a carry entering at a maximum of 0, a decay of -1 a token and every key
-    -1000 but the last, which ties the entering maximum aged over the call's 130 tokens (three spans): the
-    final maximum's unit cotangent goes half to the last key and half to the entering maximum, its half
-    aging it once a token to the decay (65), as JAX's `maximum` splits a tie, on both routes."""
+def test_a_tie_of_the_running_maximum_goes_to_the_later_key_on_every_route(route, ties):
+    """ReviewRecurrenceBatch's ties: a carry entering at a maximum of 0, a decay of -1 a token over 130
+    tokens (three spans), every key -1000 but those that tie the maximum aged to them (`TIES`): the final
+    maximum's unit cotangent goes to the last tied key whole, then ages to the call's end, a decay gradient
+    of one a token after it, and none to the entering maximum or an earlier tied key, alike token by token and
+    by the portable scan's tree (`rwkv4.joined`), where halves at each tie split three tied keys apart."""
+    tied = TIES[ties]
     time_decay = np.zeros((WIDE,), np.float32)
     key = np.full((ROWS, 130, WIDE), -1000.0, np.float32)
-    key[:, -1] = -130.0
+    for token in tied:
+        key[:, token] = -(token + 1.0)
     state = np.stack([np.zeros((ROWS, WIDE)), np.ones((ROWS, WIDE)), np.zeros((ROWS, WIDE))], 1)
     state = state.astype(np.float32)
     dfinal = np.zeros(state.shape, np.float32)
@@ -192,11 +201,35 @@ def test_a_tie_of_the_running_maximum_splits_its_cotangent_as_jax_does(route):
     _, dtime_decay, _, dkey, _, dstate = differentiated(routed(route))(
         time_decay, time_decay, key, np.zeros(key.shape, np.float32), state, np.zeros((ROWS, 130), bool),
         (np.zeros(key.shape, np.float32), dfinal))
-    # The decay is -exp(time_decay), -1: its gradient is minus the decay's.
-    np.testing.assert_array_equal(np.asarray(dtime_decay), -65.0 * ROWS)
-    np.testing.assert_array_equal(np.asarray(dkey[:, -1]), 0.5)
-    np.testing.assert_array_equal(np.asarray(dkey[:, :-1]), 0.0)
-    np.testing.assert_array_equal(np.asarray(dstate[:, 2]), 0.5)
+    last = tied[-1]
+    expected = np.zeros(key.shape, np.float32)
+    expected[:, last] = 1.0
+    np.testing.assert_array_equal(np.asarray(dkey), expected)
+    np.testing.assert_array_equal(np.asarray(dstate[:, 2]), 0.0)
+    # The decay is -exp(time_decay), -1: its gradient is minus the decay's, one a token aged past the key.
+    np.testing.assert_array_equal(np.asarray(dtime_decay), -(129.0 - last) * ROWS)
+
+
+def test_a_tokens_gradients_take_their_large_terms_weighted_first():
+    """ReviewRecurrenceBatch's output overflow: a carry entering at `(-3 2^126, 1, 0)`, a key of 0, a value of
+    3 2^126 and a bonus of -10 at the first token, every later key -1000 and value 0, an output cotangent of
+    2^-10 at the first token: its value less its output, 6 2^126, and its numerator less value times
+    denominator are past float32's largest, while each weighted by the cotangent is normal: on the kernels
+    every gradient is finite (`_token_back` weighs each first)."""
+    time_decay = np.zeros((WIDE,), np.float32)
+    time_first = np.full((WIDE,), -10.0, np.float32)
+    key = np.full((ROWS, 130, WIDE), -1000.0, np.float32)
+    key[:, 0] = 0.0
+    value = np.zeros(key.shape, np.float32)
+    value[:, 0] = 3.0 * 2.0 ** 126
+    state = np.stack([np.full((ROWS, WIDE), -3.0 * 2.0 ** 126), np.ones((ROWS, WIDE)),
+                      np.zeros((ROWS, WIDE))], 1).astype(np.float32)
+    dy = np.zeros(key.shape, np.float32)
+    dy[:, 0] = 2.0 ** -10
+    cotangents = (dy, np.zeros(state.shape, np.float32))
+    operands = (time_decay, time_first, key, value, state, np.zeros((ROWS, 130), bool), cotangents)
+    for grad in differentiated(routed("kernels"))(*operands)[1:]:
+        assert np.isfinite(np.asarray(grad)).all()
 
 
 @pytest.mark.mesh(devices=2)

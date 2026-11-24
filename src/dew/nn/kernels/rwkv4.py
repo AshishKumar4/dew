@@ -64,7 +64,9 @@ def joined(decay, *, numerators: Callable = _weighed, denominators: Callable = _
 
     def join(before: SpanCarry, after: SpanCarry) -> SpanCarry:
         aged = before.top + after.tokens * decay
-        top = jnp.maximum(aged, after.top)
+        # A tie the later span's, as a token's key takes it (`recurrent_wkv4`): split in halves, a scan's
+        # tree and the recurrence split three tied maxima apart.
+        top = jnp.where(after.top >= aged, after.top, aged)
         kept, added = jnp.exp(aged - top), jnp.exp(after.top - top)
         # The carries' own type (`SpanCarry`, or a form's holding its values otherwise), so the selection
         # between the joined and the dropped carry meets one tree.
@@ -222,7 +224,9 @@ def recurrent_wkv4(time_decay, time_first, key, value, state=None, starts=None):
         past, present = jnp.exp(eps - tau), jnp.exp(own - tau)
         out = (past * alpha + present * v) / (past * beta + present)
         aged = decay + eps
-        eps = jnp.maximum(aged, k)
+        # A tie the key's, as fla's backward takes it (fused_recurrent.py: the maximum's cotangent the
+        # decay's where `w + eps > k`).
+        eps = jnp.where(k >= aged, k, aged)
         kept, added = jnp.exp(aged - eps), jnp.exp(k - eps)
         return (kept * alpha + added * v, kept * beta + added, eps), out
 
