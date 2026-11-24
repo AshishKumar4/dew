@@ -2,9 +2,7 @@
 on the CPU: the template's step-scaled walk, interpreted as an H100's, on par with the scaled blocks summed in
 XLA (check 1), from the float64 sum of the dequantized blocks (tests/blockwise_matrix.py's `truth`)."""
 
-import contextlib
 import functools
-import io
 
 import blockwise_matrix
 import jax
@@ -474,9 +472,9 @@ def test_a_padded_recipe_chain_keeps_its_padding_out_of_every_gradient(activatio
 def test_a_recipe_chains_products_carry_the_names_a_remat_policy_saves(recipe, gated):
     """A recipe chain given `names` (`blockwise_chain`, `nvfp4_chain`; `recipe_chain`'s, which `GatedMLP`
     passes) names its first projections' rounded products, the residuals its backward reads, as the
-    projections apart name their outputs: under a remat policy saving those names they are saved, the gate's
-    and the up's (an ungated chain's one product the up's), so its backward recomputes neither projection nor
-    its quantizing epilogue (row 12758); unnamed, the same policy saves no product of the chain's."""
+    projections apart name their outputs: differentiated under a remat policy saving those names, its
+    program runs no more products than without remat, its backward recomputing neither first projection nor
+    its quantizing epilogue; unnamed, the same policy recomputes them (row 12758)."""
     rng = np.random.default_rng(12758)
     x = jnp.asarray(rng.normal(size=(128, 128)), jnp.bfloat16)
     firsts = [jnp.asarray(rng.normal(size=(1, 128, 256)) / 16, jnp.bfloat16) for _ in range(1 + gated)]
@@ -485,24 +483,25 @@ def test_a_recipe_chains_products_carry_the_names_a_remat_policy_saves(recipe, g
     def activation(*values):
         return jax.nn.silu(values[0]) * values[-1] if gated else jax.nn.relu(values[0])
 
-    def chained(names):
+    def total(names):
         def run(x, *matrices):
             *gate, up, down = matrices
             options = {"gate": gate[0] if gate else None, "names": names, "out_dtype": jnp.bfloat16}
             if recipe == "nvfp4":
                 scales = (jnp.float32(2.0 ** -6), jnp.float32(2.0 ** -8))
-                return projections.nvfp4_chain(x, up, down, activation, tensor_scales=scales, **options)
-            return projections.blockwise_chain(x, up, down, activation, **options)
-        policy = jax.checkpoint_policies.save_only_these_names("gate", "up")
-        return jax.checkpoint(lambda *operands: jnp.sum(run(*operands).astype(jnp.float32)), policy=policy)
+                out = projections.nvfp4_chain(x, up, down, activation, tensor_scales=scales, **options)
+            else:
+                out = projections.blockwise_chain(x, up, down, activation, **options)
+            return jnp.sum(out.astype(jnp.float32))
+        return run
 
-    def saved(names) -> list[str]:
-        # JAX's report of the residuals a differentiated call saves, a line each (`print_saved_residuals`).
-        printed = io.StringIO()
-        with contextlib.redirect_stdout(printed):
-            jax.ad_checkpoint.print_saved_residuals(chained(names), x, *firsts, down)
-        lines = printed.getvalue().splitlines()
-        return sorted(name for name in ("gate", "up") for line in lines if f"named '{name}'" in line)
+    def products(fn) -> int:
+        # The products the differentiated program runs, sub-programs' too (each `dot_general` or
+        # `ragged_dot_general` equation as the program prints it).
+        return str(jax.make_jaxpr(jax.grad(fn, argnums=tuple(range(3 + gated))))(x, *firsts, down)).count(
+            "dot_general[")
 
-    assert saved(("gate", "up")) == (["gate", "up"] if gated else ["up"])
-    assert saved(None) == []
+    policy = jax.checkpoint_policies.save_only_these_names("gate", "up")
+    plain = products(total(("gate", "up")))
+    assert products(jax.checkpoint(total(("gate", "up")), policy=policy)) == plain
+    assert products(jax.checkpoint(total(None), policy=policy)) > plain
