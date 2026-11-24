@@ -19,8 +19,9 @@ ROWS, WIDTH, STEPS, CONSUMERS = 64, 64, 4, 2
 def _prefetched_walk(x, segments: tuple[tuple[int, int], ...], interpret=INTERPRETED):
     """Two consumers sharing one cp.async pipeline walk `segments` of `x`'s `ROWS`-row steps, stated common,
     their bounds traced: each step adds its tile to an fp32 sum, its first row read ahead by the pipeline's
-    prefetch. Returns each consumer's sum and the prefetches each ran (`[CONSUMERS]`, counted in global
-    memory as they run)."""
+    prefetch; compiled (not `interpret`), its tile's square through the family's fragments
+    (`Family.products_across`, `first_fragments`: mma.sync, which the interpreter runs none of). Returns
+    each consumer's sum and the prefetches each ran (`[CONSUMERS]`, counted in global memory as they run)."""
     family = bundles.named("mma.sync", jnp.bfloat16, None)
 
     def body(x_gmem, sums_gmem, counts_gmem):
@@ -35,11 +36,17 @@ def _prefetched_walk(x, segments: tuple[tuple[int, int], ...], interpret=INTERPR
 
             def prefetch(slots):
                 counts_gmem[wg] = counts_gmem[wg] + 1
+                if interpret is False:
+                    return family.first_fragments(slots['x'], slots['x'])
                 return slots['x'][0, :].astype(jnp.float32)
 
             def step(at, slots, carry, accumulators, *, prefetched, boundary):
-                del at, prefetched
+                del at
                 (acc,) = accumulators
+                if interpret is False:
+                    acc, following = family.products_across(acc, slots['x'], slots['x'], prefetched,
+                                                            boundary)
+                    return (carry, (acc,)), following
                 tile = slots['x'][...].astype(jnp.float32)
                 return (carry, (acc + tile,)), boundary()
 
@@ -76,8 +83,8 @@ def test_a_traced_empty_common_segment_prefetches_nothing():
 
 
 def test_a_prefetching_common_walk_lowers_for_an_a100():
-    """The prefetching walk, its traced segments' pipelines each under a branch on its trips, lowers for an
-    A100 on any host."""
+    """The prefetching walk's mma.sync products and fragments, its traced segments' pipelines each under a
+    branch on its trips, lower for an A100 on any host."""
     x = jax.ShapeDtypeStruct((STEPS * ROWS, WIDTH), jnp.bfloat16)
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm80")
     walked = functools.partial(_prefetched_walk, segments=((0, 0), (0, 1), (1, STEPS)), interpret=False)
