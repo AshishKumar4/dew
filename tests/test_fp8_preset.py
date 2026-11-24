@@ -4,6 +4,7 @@ dtypes."""
 
 import contextlib
 import dataclasses
+import functools
 
 import flax.linen as nn
 import jax
@@ -845,27 +846,40 @@ def _bits(leaf) -> np.ndarray:
     return held.view(np.dtype(f"u{held.dtype.itemsize}"))
 
 
-@pytest.mark.parametrize("kind", ["a function of its own", "mixed dtypes", "a sequence axis"])
+@pytest.mark.parametrize("kind", ["a function of its own", "mixed dtypes", "a sequence axis", "float64",
+                                  "a promotion of its own"])
 def test_an_mlp_the_chain_cannot_read_runs_its_projections_apart(kind):
     """An ungated MLP the recipe's chain cannot run as its projections apart runs them apart, one recipe
     region each (`dew.nn.derivatives.Surrogate`): an activation given as a function of its own, which the
     chain would call on its rows flattened and padded (a function of one placement or mixing positions reads
     them otherwise); kernels of two dtypes, whose products promote apart (a bf16 up projection's into a
-    float32 down projection's, its output float32); and rows a sequence axis splits, which the chain would
-    flatten past the hidden activation's placement."""
+    float32 down projection's, its output float32); rows a sequence axis splits, which the chain would
+    flatten past the hidden activation's placement; float64, which its quantizing epilogue does not write;
+    and a projection promoting its operands by a function of its own, which the chain would skip."""
+    from flax.linen.dtypes import promote_dtype as flax_promote_dtype
     from jax.sharding import AbstractMesh, AxisType
     from reference_error import equations
 
+    from dew.nn.dense import Dense
     from dew.nn.derivatives import Surrogate
     from dew.nn.mlp import GatedMLP
     from dew.nn.precision import projection_role
 
     fp8 = RECIPE_NUMERICS["blockwise_fp8"]
-    mixed = kind == "mixed dtypes"
+    mixed, wide = kind == "mixed dtypes", kind == "float64"
+
+    def promoted(*operands, dtype=None):
+        # Flax's promotion, then the inputs doubled: a promotion of the layer's own.
+        inputs, *rest = flax_promote_dtype(*operands, dtype=dtype)
+        return (inputs * 2, *rest)
+
+    linear = (functools.partial(Dense, promote_dtype=promoted) if kind == "a promotion of its own"
+              else None)
     mlp = GatedMLP(hidden_features=256, out_features=128,
                    activation=jax.nn.relu if kind == "a function of its own" else "gelu",
-                   dtype=None if mixed else jnp.bfloat16)
-    x = jax.random.normal(jax.random.key(0), (2, 100, 128), jnp.bfloat16)
+                   dtype=None if mixed else jnp.float64 if wide else jnp.bfloat16,
+                   **({} if linear is None else {"linear": linear}))
+    x = jax.random.normal(jax.random.key(0), (2, 100, 128), jnp.float64 if wide else jnp.bfloat16)
     variables = nn.unbox(mlp.init(jax.random.key(1), x))
     if mixed:
         params = variables["params"]
@@ -873,10 +887,11 @@ def test_an_mlp_the_chain_cannot_read_runs_its_projections_apart(kind):
                                 "down_proj": {"kernel": params["down_proj"]["kernel"].astype(jnp.float32)}}}
     placed = (jax.sharding.use_abstract_mesh(AbstractMesh((2,), ("sequence",), axis_types=(AxisType.Auto,)))
               if kind == "a sequence axis" else contextlib.nullcontext())
-    with generation.run_precision(fp8), projection_role("mlp"), placed:
+    with (generation.run_precision(fp8), projection_role("mlp"), placed,
+          jax.enable_x64(new_val=True) if wide else contextlib.nullcontext()):
         graph = jax.make_jaxpr(lambda variables, x: mlp.apply(variables, x))(variables, x)
         out = jax.eval_shape(lambda variables, x: mlp.apply(variables, x), variables, x)
     regions = [equation for equation in equations(graph) if equation.primitive.name == "marked_call"
                and isinstance(equation.params.get("kind"), Surrogate)]
     assert len(regions) == 2, len(regions)
-    assert out.dtype == (jnp.float32 if mixed else jnp.bfloat16)
+    assert out.dtype == (jnp.float32 if mixed else jnp.float64 if wide else jnp.bfloat16)
