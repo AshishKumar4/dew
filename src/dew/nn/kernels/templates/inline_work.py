@@ -10,6 +10,7 @@ import weakref
 from collections.abc import Callable, Sequence
 
 import numpy as np
+from jax._src import core as jax_core
 from jax._src.interpreters import mlir as jax_mlir
 from jax._src.pallas.mosaic_gpu import primitives as gpu_primitives
 from jax._src.state import types as state_types
@@ -128,6 +129,7 @@ def _stand_in_type(aval, kind) -> ir.Type:
                                   kind.transforms, aval)
         assert isinstance(viewed, state_types.AbstractRef), viewed
         inner = viewed.inner_aval
+        assert isinstance(inner, jax_core.ShapedArray), inner
         shared = "smem" in str(aval.memory_space).lower()
         return ir.MemRefType.get(inner.shape, mgpu_utils.dtype_to_ir_type(inner.dtype),
                                  memory_space=mgpu_utils.smem() if shared else None)
