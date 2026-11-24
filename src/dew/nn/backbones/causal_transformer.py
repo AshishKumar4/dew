@@ -54,7 +54,7 @@ from dew.nn.continuum import (
     level_parameters,
     with_level_parameters,
 )
-from dew.nn.dense import Dense, pre_call_capture
+from dew.nn.dense import Dense, capture_filter, pre_call_capture
 from dew.quantization import LinearProducts
 
 from ..activations import GatedActivation
@@ -1549,13 +1549,10 @@ class CausalTransformer(LinearProducts):
         `jax.eval_shape`, returning only layer `first`'s output so non-array captures never fail shape
         inference; otherwise probes layer `first` alone.
         """
-        from flax.linen import module as flax_module
-
         streams = x.streams if isinstance(x, Carried) else x
         assert self.scope is not None, "a bound decoder's stack"
         opened = self.scope.mutable
-        capture = (flax_module._context.capture_stack[-1]
-                   if runs and flax_module._context.capture_stack else False)
+        capture = (capture_filter(self) or False) if runs else False
         if runs:
             last = max(position for position, (_, count, _) in enumerate(runs) if count > 1)
             steps = tuple((index, count > 1) for start, count, period in runs[:last + 1]
