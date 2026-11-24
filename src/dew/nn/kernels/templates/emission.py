@@ -40,6 +40,7 @@ from dew.nn.kernels.templates.cost import (
     issued as issue_slots,
     most,
     multiplied,
+    repeated,
 )
 from dew.nn.kernels.templates.product import product_mode
 
@@ -330,13 +331,6 @@ def _elements(aval) -> int:
 
 def _bytes(aval) -> int:
     return _elements(aval) * jnp.dtype(aval.dtype).itemsize
-
-
-def repeated(work: Work, count: float) -> Work:
-    """`work` repeated `count` times in a chain: its every unit's, its span and each of its paths'."""
-    return Work(**{field.name: getattr(work, field.name) * count for field in dataclasses.fields(Work)
-                   if field.name not in ("kernels", "chains")}, kernels=work.kernels,
-                chains=tuple(chain.times(count) for chain in work.chains))
 
 
 def _tensor(dtype, flops: float) -> Work:
@@ -687,8 +681,13 @@ class _Counting:
                 and all(value is not None for value in values[1:])):
             return [values[1 + int(values[0])]]
         if _static(equation, given):
-            # Of the program's constants alone: folded by its compile or computed once outside every loop. A
-            # call of them runs on, its body's folds the values a later guard reads.
+            # Of the program's constants alone: computed once outside every loop (or folded by its compile),
+            # its work the program's once, never a step's (the review of train 1261, F6). A call of them runs
+            # on, its body's folds the values a later guard reads.
+            if primitive in _ARITHMETIC:
+                self.fixed = _then(self.fixed, operation_work(
+                    primitive, [variable.aval for variable in equation.invars],
+                    [variable.aval for variable in equation.outvars], params, forms=self.forms))
             return unknown
         if primitive in _ARITHMETIC:
             self.add(operation_work(primitive, [variable.aval for variable in equation.invars],

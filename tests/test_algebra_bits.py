@@ -336,10 +336,10 @@ FORMS = {
     "encode-e2m1": lambda: bits.encode_form(bits.E2M1),
     "e4m3-scale": lambda: bits.E4M3_SCALE_FORM,
 }
-"""Forms whose steps together take every instruction a form's PTX writes (`BitForm.ptx`): a rotation, left
-and right shifts on either pipe, and a mask of one value and of two values' XOR; and an encode's (every
-instruction that is not linear: logic of any table, three-way adds, minima, compares, selects and shifts
-by a value)."""
+"""Forms whose steps together take every instruction a form's PTX writes (`BitForm.ptx_registers`): a
+rotation, left and right shifts on either pipe, and a mask of one value and of two values' XOR; and an
+encode's (every instruction that is not linear: logic of any table, three-way adds, minima, compares,
+selects and shifts by a value)."""
 
 
 @pytest.mark.parametrize("name", FORMS)
@@ -355,9 +355,9 @@ def test_a_forms_traced_decode_is_its_decode(name):
 
 
 def _inline_decode(form: bits.BitForm):
-    """A Triton kernel decoding a block of stored words (uint32) through the form's PTX (`BitForm.ptx`), a
-    register's block apiece, its words int32 inside, as Triton's inline assembly types a 32-bit register (a
-    signless integer)."""
+    """A Triton kernel decoding a block of stored words (uint32) through the form's PTX, every register in
+    one block (`BitForm.ptx_registers`, what a Mosaic kernel inlines), its words int32 inside, as Triton's
+    inline assembly types a 32-bit register (a signless integer)."""
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import triton as plgpu
 
@@ -365,10 +365,11 @@ def _inline_decode(form: bits.BitForm):
 
     def body(words_ref, *out_refs):
         shape = jax.ShapeDtypeStruct(words_ref.shape, jnp.int32)
-        words = words_ref[...]
-        for output, ref in enumerate(out_refs):
-            ref[...] = plgpu.elementwise_inline_asm(form.ptx(output), args=(words,), constraints="=r,r",
-                                                    pack=1, result_shape_dtypes=(shape,))[0]
+        registers = plgpu.elementwise_inline_asm(form.ptx_registers(), args=(words_ref[...],),
+                                                 constraints="=r," * count + "r", pack=1,
+                                                 result_shape_dtypes=(shape,) * count)
+        for register, ref in zip(registers, out_refs, strict=True):
+            ref[...] = register
 
     def decode(words):
         shape = jax.ShapeDtypeStruct(words.shape, jnp.int32)

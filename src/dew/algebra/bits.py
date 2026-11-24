@@ -325,7 +325,7 @@ class BitForm:
         (`templates.cost.Work`, row 5386): each step's issues on its unit (`issues`), the ALU's as integer
         operations (`Work.integer_operations`) and the FMA pipe's as integer multiply-adds (IMAD, beside the
         fp32 lanes' FFMA at its own rate, `Work.integer_multiply_adds`); a step two output registers read
-        counted once, as ptxas computes it once in the kernel's whole PTX (`ptx`)."""
+        counted once, as its PTX writes it once (`ptx_registers`)."""
         issues = self.issues
         return Work(integer_operations=issues[Unit.ALU] * words,
                     integer_multiply_adds=issues[Unit.FMA] * words)
@@ -366,20 +366,11 @@ class BitForm:
         registers = jnp.stack(self.traced(words), axis=-1)
         return jax.lax.bitcast_convert_type(registers, dtype).reshape(*words.shape[:-1], -1)
 
-    def ptx(self, output: int) -> str:
-        """Output register `output` of the form as one PTX block over its stored word `$1` into `$0`, the
-        steps it reads each on the pipe its step names (`_PTX`), for a kernel's inline assembly (Pallas's
-        `elementwise_inline_asm`, constraints `=r,r`, which takes one result a block): a register's block
-        apiece, each holding the steps it reads, so a step two registers share is written twice and ptxas,
-        which optimizes the kernel's PTX whole, may compute it once (the consumer's compile report shows
-        whether it does)."""
-        return self._block((self.outputs[output],))
-
     def ptx_registers(self) -> str:
         """Every output register of the form as one PTX block over its stored word (`$N`, N its outputs'
-        count) into `$0` to `$N-1`, each step it reads written once (`ptx`'s steps, which a block apiece
-        writes again where two registers share them): a kernel's inline assembly of several results
-        (`inline_forms.registers`), so what it emits is the form's work (`work`)."""
+        count) into `$0` to `$N-1`, each step it reads written once on the pipe its step names (`_PTX`): a
+        kernel's inline assembly of several results (`inline_forms.registers`), so what it emits is the
+        form's work (`work`)."""
         return self._block(self.outputs)
 
     def _block(self, outputs: Sequence[int]) -> str:

@@ -309,6 +309,13 @@ def units(work: Work, at: Rates) -> tuple[list[float], tuple[float, ...]]:
 
 
 
+def repeated(work: Work, count: float) -> Work:
+    """`work` repeated `count` times in a chain: its every unit's, its span and each of its paths'; its
+    kernels its own (a loop's trips run in one), `emission`'s and `inline_work`'s alike."""
+    return Work(**{field.name: getattr(work, field.name) * count for field in dataclasses.fields(Work)
+                   if field.name not in ("kernels", "chains")}, kernels=work.kernels,
+                chains=tuple(chain.times(count) for chain in work.chains))
+
 def most(works: Sequence[Work]) -> Work:
     """The most of each unit any of `works` holds, alternatives of which one runs (a conditional's branches,
     `emission`'s and `inline_work`'s; none, `Work()`): its span the longest, every path none of the others
