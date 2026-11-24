@@ -1712,9 +1712,11 @@ def climbed(monkeypatch, target: str, fields: dict, batch: dict, room_of, reques
                  if moves and place[0] is None and place[2] != places[0][2]]
     settled = next((at for at, moves in enumerate(preferred) if fitted(moves)), None)
     recomputing = None if settled is None else places[preferred[settled]]
-    # What a tight start asks, a probe a place at its fixed split: its own rung, then each remat rung at its
-    # own head and options up to the first that fits.
-    asks = None if settled is None else [places[0], *(places[moves] for moves in preferred[:settled + 1])]
+    # What a start asks, a probe a place at its fixed split: its own rung, which settles it where it fits
+    # (a split step's scanned gradient pooled in its backward needs no more at no remat than at a remat rung,
+    # row 12080's), else each remat rung at its own head and options up to the first that fits.
+    asks = ([places[0]] if fitted(0) else None if settled is None
+            else [places[0], *(places[moves] for moves in preferred[:settled + 1])])
     lightest = None if recomputing is not None else next(
         (place for moves, place in enumerate(places) if fitted(moves)), None)
     trainer = planned(0, room)
@@ -1724,7 +1726,9 @@ def climbed(monkeypatch, target: str, fields: dict, batch: dict, room_of, reques
 
 
 CENSUS = {
-    # Four attention layers over 64 tokens, room between what 'minimal' and no rung need.
+    # Four attention layers over 64 tokens, room between what 'minimal' and no rung need: past the start's
+    # need where its split step pools its scanned gradient in its backward (10.94 MB on main to 4.85 MB on
+    # a CPU, 'minimal' 5.08 MB), which then settles at its own rung.
     "decoder": ({"seq": LONG, "width": 32, "layers": 4}, LONG_BATCH,
                 lambda need: (need(None) + need("minimal")) // 2),
     # Two scanned gated delta net layers over 256 tokens, room for what 'minimal' needs.
@@ -1743,8 +1747,9 @@ remat at their own head, each read as asked (`climbed`): no other rung's need is
 ])
 def test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits(monkeypatch, shape, target,
                                                                                     request):
-    """A start whose step does not fit at its own rung asks the remat rungs at its own head first and
-    settles the first of them that fits (row 6740: a tight cold start's second compile), where an
+    """A start whose step fits at its own rung settles it in one compile; one that does not asks the remat
+    rungs at its own head first and settles the first of them that fits (row 6740: a tight cold start's
+    second compile), where an
     exhaustive walk compiling each place of the ladder in the same room finds one fits, and the lightest
     place it finds fits where none of them does, the decoder on the CPU and for a compile-only H100, the
     scanned delta decoder for the H100, what a GPU start plans for: its CPU case walked its ladder
