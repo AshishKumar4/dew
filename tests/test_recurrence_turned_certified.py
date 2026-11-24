@@ -1,6 +1,6 @@
-"""A turned call's certification on the recurrence template: the kernels its selector certifies the ones its
-step runs (`recurrence_chunk._turned_shapes`, rows 7976 and 12402), read from the lowered program's own calls
-(`lowered.kernel_calls`)."""
+"""A turned call on the recurrence template: the kernels its selector certifies the ones its step runs
+(`recurrence_chunk._turned_shapes`, rows 7976 and 12402), read from the lowered program's own calls
+(`lowered.kernel_calls`), and its forked operands refused unforked (row 12631)."""
 
 import dataclasses
 
@@ -60,3 +60,14 @@ def test_a_turned_training_step_runs_the_kernels_its_selector_certified(forked):
     assert given.key.shape[2] < given.value.shape[2], given.key.shape
     certified, emitted = _certified_and_emitted(given)
     assert emitted and set(emitted) <= certified, (sorted(set(emitted) - certified), sorted(certified))
+
+
+def test_an_unforked_call_refuses_a_table_state_or_forked_fields():
+    """An unforked call (`Chunk.loads` None) refuses a table `state` `[B, S', Hv, Dk, Dv]` and the forked
+    call's own fields (entry writes, here), where the template padded the table's head axis as a memory's and
+    a selector planning it raised a reshape's error (row 12631)."""
+    drawn, _ = entered_draw(TURNED, seed=0, entries=True)
+    with pytest.raises(ValueError):
+        chunk(TURNED, drawn)
+    with pytest.raises(ValueError):
+        chunk(TURNED, dataclasses.replace(drawn, state=None))
