@@ -39,6 +39,7 @@ from dew.nn.kernels.templates import (
     resources,
     ring_family,
     rings,
+    stores,
     swizzling,
 )
 from dew.nn.kernels.templates.rings import Ref
@@ -766,6 +767,7 @@ class Tcgen05Rings(Tcgen05Issuer, ring_family.RingFamily[Accumulator]):
         for ring in opened.values():
             ring.initialized()
         staging = self.output_staging(outputs, consumers, chunks)
+        forms = tuple(map(stores.Output.of, outputs))
         rewrites = () if prepared is None else tuple(ring.stages for ring in opened.values())
         width = sum(shape[1] for shape in accumulators)
         offsets = [sum(shape[1] for shape in accumulators[:index]) for index in range(len(accumulators))]
@@ -797,8 +799,8 @@ class Tcgen05Rings(Tcgen05Issuer, ring_family.RingFamily[Accumulator]):
                                     unrolled=unrolled)
 
             def epilogue(index):
-                visit = self._read_out(self._stores(smems, index), index, tensor, held, running, issue,
-                                       finish, summed=summed, accumulators=accumulators)
+                visit = self._read_out(self._stores(smems, index, forms), index, tensor, held, running,
+                                       issue, finish, summed=summed, accumulators=accumulators)
                 persistent.tiled(tiles, schedule, visit, axis=axis, turns=windows)
                 plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 

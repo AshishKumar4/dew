@@ -43,7 +43,7 @@ from dew.nn.kernels.templates.rings import (
     released,
     streamed,
 )
-from dew.nn.kernels.templates.stores import output_staging, staged_chunks
+from dew.nn.kernels.templates.stores import Output, output_staging, staged_chunks
 
 if TYPE_CHECKING:
     from dew.nn.kernels.templates.fed import Feed
@@ -174,12 +174,18 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
             pl.when(again.taken())(lambda: streamed(rings, tiles, lo, hi, counted=hi - lo))
 
     def output_staging(self, outputs: tuple, consumers: int, chunks: tuple[int, int] | None = None) -> list:
-        # Each consumer's share of each output in its chunk buffers, not the whole tile (`output_staging`).
-        staged = [(shape, dtype,
-                   output_staging(shape[1], (dtype,), chunks, piece=self.chunk_columns(shape[1])))
-                  for shape, dtype in outputs]
-        return [plgpu.SMEM((consumers, buffers, shape[0], chunk), dtype)
-                for shape, dtype, (chunk, buffers) in staged]
+        # Each consumer's share of each output in its chunk buffers, not the whole tile (`output_staging`):
+        # a packed one's its chunk's stored columns (`stores.Output`), a transposed one's `[columns, rows]`.
+        buffers = []
+        for output in map(Output.of, outputs):
+            (rows, columns) = output.shape
+            packed = (output,) if output.divisor > 1 or output.transposed else ()
+            chunk, count = output_staging(columns, (output.dtype,), chunks, piece=self.chunk_columns(columns),
+                                          packed=packed)
+            stored = chunk // output.divisor
+            block = (stored, rows) if output.transposed else (rows, stored)
+            buffers.append(plgpu.SMEM((consumers, count, *block), output.dtype))
+        return buffers
 
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
@@ -191,6 +197,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         # a tile's first loads go out while the consumers store the last one (`_tiled`).
         rings = self.opened(streams)
         staging = self.output_staging(outputs, consumers, chunks)
+        forms = tuple(map(Output.of, outputs))
         # Ping-pong's turns on the tensor cores (`persistent.consumed`'s `turns`).
         turns = [self.meeting(consumers)] if pingpong else []
 
@@ -200,7 +207,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
 
         def consuming(smems, turns):
             return self._tiled(rings, tiles, schedule, issue, finish, smems, axis=axis, interpret=interpret,
-                               in_flight=in_flight, unrolled=unrolled, turns=turns)
+                               in_flight=in_flight, unrolled=unrolled, turns=turns, forms=forms)
 
         def scoped(*refs):
             smems, turn_refs = refs[:len(staging)], refs[len(staging):]
@@ -211,12 +218,12 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
 
     def _tiled(self, rings: dict[str, Ring], tiles: tuple[int, ...], schedule: Callable, issue: Callable,
                finish: Callable, smems, *, axis: str, interpret: bool, in_flight: int,
-               unrolled: bool, turns=None) -> Callable:
+               unrolled: bool, turns=None, forms: tuple[Output, ...] = ()) -> Callable:
         """`persist`'s consumers: each walks its tiles' steps at a counter running across the tiles
         (`_tile_walk`) and stores its outputs (`_stores`), each tile its owner's alone at `turns` (ping-pong,
         `persistent.consumed`'s); the rings are left as `_ended` leaves them."""
         def run(index):
-            store = self._stores(smems, index)
+            store = self._stores(smems, index, forms)
 
             def walking(counter, active, steps, views):
                 # `counter`: the step every ring is at.
@@ -230,13 +237,20 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
 
         return run
 
-    def _stores(self, smems, index) -> Callable:
+    def _stores(self, smems, index, forms: tuple[Output, ...] = ()) -> Callable:
         """Consumer `index`'s `store(output, value, ref, place)` (`persist`'s): its share of each output
         staged in chunks (`output_staging`: two buffers of `staged_columns`, `smems`), written from its
-        issuer's layout (`Issuer.written`), and stored by TMA, waiting only for a buffer's last store to read
-        it before it writes it again (`stores.staged_chunks`, `stores.buffer_waits`)."""
+        issuer's layout (`Issuer.written`) or by its form's packing (`forms`, `stores.Output.write`, packed
+        `divisor` tile columns a stored column, perhaps transposed), and stored by TMA, waiting only for a
+        buffer's last store to read it before it writes it again (`stores.staged_chunks`,
+        `stores.buffer_waits`)."""
         def store(output, value, ref, place):
-            staged_chunks(smems[output].at[index], value, ref, place, write=self.written)
+            form = forms[output] if forms else None
+            if form is None:
+                staged_chunks(smems[output].at[index], value, ref, place, write=self.written)
+                return
+            staged_chunks(smems[output].at[index], value, ref, place, write=form.write or self.written,
+                          divisor=form.divisor, transposed=form.transposed)
 
         return store
 

@@ -335,8 +335,8 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
         # Each output's tile staged in VMEM twice its rows: a store's window shifted back to the output's
         # last rows holds the tile at the shift (`persist`'s `store`), whole, in no chunks.
         _one(consumers)
-        mosaic.refuse_staging(self, chunks)
-        return [pltpu.VMEM((2 * shape[0], *shape[1:]), dtype) for shape, dtype in outputs]
+        return [pltpu.VMEM((2 * shape[0], *shape[1:]), dtype)
+                for shape, dtype in mosaic.refuse_staging(self, chunks, outputs)]
 
     def opened(self, allocated, views: dict | None = None):
         if views is None:

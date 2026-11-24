@@ -7,7 +7,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable
-from typing import Any
+from typing import Any, NamedTuple
 
 import jax
 from jax import numpy as jnp
@@ -45,31 +45,85 @@ TMA_STORE_BYTES = 16
 multiple of 16 bytes (CUDA's `cuTensorMapEncodeTiled`: `boxDim[0]` times the element's size), so a staged
 chunk stores rows of whole 16-byte units in each output's dtype (8 bf16 columns, 4 fp32)."""
 
+TMA_BOX_ELEMENTS = 256
+"""The most elements a tensor map's box takes along a dimension (`cuTensorMapEncodeTiled`'s `boxDim`): a
+staged chunk's stored row is at most this many of its dtype's."""
 
-def staged_columns(columns: int, dtypes, *, swizzle: int = STAGED_BYTES) -> int:
+
+class Output(NamedTuple):
+    """An output tile a family stages (`Family.output_staging`, `persist`'s stores): its `shape` (its rows and
+    tile columns) and stored `dtype`, `divisor` tile columns a stored column (a packed form's: NVFP4's codes
+    two to a byte, its scales one a 16-column block), each staged chunk written into its buffer by
+    `write(buffer, piece)` from the chunk's tile columns (its issuer's `written` where None: a packed form's
+    packing). `transposed`, stored `[columns // divisor, rows]`, its rows contiguous (a block-scaled
+    product's scales as its consumer reads them: a 128-row share's 128 bytes of E8M0 or 512 of fp32 a
+    stored row, whatever the tile's width): its chunk's buffer `[chunk // divisor, rows]`, stored whole at
+    its share's first row, the tensor's bound clipping the rows past its last (`staged_rows`), so a call
+    whose shares store whole rows (a dense one's) alone takes one."""
+
+    shape: tuple[int, int]
+    dtype: jax.typing.DTypeLike
+    divisor: int = 1
+    write: Callable | None = None
+    transposed: bool = False
+
+    @classmethod
+    def of(cls, output: "Output | tuple") -> "Output":
+        """`output` as an `Output`: a plain `(shape, dtype)` pair stored as it is computed."""
+        return output if isinstance(output, cls) else cls(*output)
+
+
+def staged_columns(columns: int, dtypes, *, swizzle: int = STAGED_BYTES,
+                   packed: tuple[Output, ...] = ()) -> int:
     """The columns of each chunk a consumer stages a `columns`-wide output tile in: the most that divide the
     tile within `swizzle` bytes of the widest output, a swizzled row's (`STAGED_BYTES` by default; a
-    192-column tile's bf16 output in chunks of 64)."""
-    return math.gcd(columns, swizzle // max(jnp.dtype(dtype).itemsize for dtype in dtypes))
+    192-column tile's bf16 output in chunks of 64); where outputs are stored packed (`packed`, each
+    `Output`'s divisor and form), the least multiple of it dividing the tile whose stored rows each stage
+    (`_packed_refusal`: a 128-column tile's NVFP4 scales, 8 bytes a row, stage at 256), the tile's width
+    where none does (which `staging_refusal` refuses)."""
+    chunk = math.gcd(columns, swizzle // max(jnp.dtype(dtype).itemsize for dtype in dtypes))
+    if not packed:
+        return chunk
+    return next((wider for wider in range(chunk, columns + 1, chunk)
+                 if not columns % wider and _packed_refusal(wider, packed) is None), columns)
+
+
+def _packed_refusal(chunk: int, packed: tuple[Output, ...]) -> str | None:
+    """Why a chunk of `chunk` tile columns stores no whole rows of each of `packed`'s outputs, None where
+    it does: each one's divisor dividing the chunk, each stored row whole `TMA_STORE_BYTES`-byte units (by
+    its dtype's bits: a packed fp4's half byte) and at most `TMA_BOX_ELEMENTS` of its elements: a chunk's
+    `chunk // divisor` columns, a transposed one's (`Output.transposed`) its share's rows."""
+    for output in packed:
+        name = jnp.dtype(output.dtype).name
+        stored = output.shape[0] if output.transposed else chunk // output.divisor
+        if chunk % output.divisor or stored * jax.dtypes.itemsize_bits(output.dtype) % (8 * TMA_STORE_BYTES):
+            return (f"a chunk of {chunk} columns stored {output.divisor} a column in {name} is no whole "
+                    f"{TMA_STORE_BYTES}-byte TMA rows")
+        if stored > TMA_BOX_ELEMENTS:
+            return (f"a chunk of {chunk} columns stores {stored} {name} a row, past a tensor map's "
+                    f"{TMA_BOX_ELEMENTS}")
+    return None
 
 
 def output_staging(columns: int, dtypes, staging: tuple[int, int] | None = None, *,
-                   piece: int | None = None) -> tuple[int, int]:
+                   piece: int | None = None, packed: tuple[Output, ...] = ()) -> tuple[int, int]:
     """The columns of each chunk a consumer stages a `columns`-wide output tile in (`staged_columns`) and
     the chunk buffers it holds (`OUTPUT_BUFFERS`, at most its chunks), or `staging`'s (chunk columns,
     buffers) where a launch states them: the tile's output staged in its chunks' shared memory rather than
     its whole width, CUTLASS's sub-tiled epilogue, which leaves the mainloop's ring the rest of the block
     (its StageCountAutoCarveout). Fewer buffers or narrower chunks leave the ring a stage more where the
     block falls a stage short (an sm120 GEMM's 128 x 256 tile, row 5634, M-FS-62). Refused where it holds
-    no staging (`staging_refusal`)."""
-    if (refusal := staging_refusal(columns, dtypes, staging, piece=piece)) is not None:
+    no staging (`staging_refusal`). The chunk is in tile columns; an output stored packed (`packed`,
+    `Output.divisor`) holds its chunk's stored columns."""
+    if (refusal := staging_refusal(columns, dtypes, staging, piece=piece, packed=packed)) is not None:
         raise ValueError(refusal)
-    chunk, buffers = (staged_columns(columns, dtypes), OUTPUT_BUFFERS) if staging is None else staging
+    chunk, buffers = ((staged_columns(columns, dtypes, packed=packed), OUTPUT_BUFFERS)
+                      if staging is None else staging)
     return chunk, min(columns // chunk, buffers)
 
 
 def staging_refusal(columns: int, dtypes, staging: tuple[int, int] | None = None, *,
-                    piece: int | None = None) -> str | None:
+                    piece: int | None = None, packed: tuple[Output, ...] = ()) -> str | None:
     """Why a `columns`-wide output tile of `dtypes` stages in no chunks of `staging`'s (chunk columns,
     buffers), its derived ones where none is stated (`output_staging`), None where it does: what a launch's
     candidate asks of a pin before it takes it (a GEMM's tile's). A chunk divides the tile and the `piece`
@@ -77,17 +131,20 @@ def staging_refusal(columns: int, dtypes, staging: tuple[int, int] | None = None
     of 128 columns emits pieces of 64, which a 128-column chunk does not hold. A stated chunk stores whole
     TMA rows in each of `dtypes` (`TMA_STORE_BYTES`), by each dtype's bits (a packed fp4's half byte): a bf16
     output's chunk of 4 columns, 8 bytes a row, is refused here rather than by the tensor map it lowers
-    to."""
-    chunk, buffers = (staged_columns(columns, dtypes), OUTPUT_BUFFERS) if staging is None else staging
+    to. Outputs stored packed (`packed`, whose dtypes `dtypes` are) are refused where a chunk, stated or
+    derived, stores no whole rows of them (`_packed_refusal`): a 128-column tile's NVFP4 scales."""
+    chunk, buffers = ((staged_columns(columns, dtypes, packed=packed), OUTPUT_BUFFERS)
+                      if staging is None else staging)
     if chunk < 1 or columns % chunk or (piece or columns) % chunk or buffers < 1:
         return (f"a {columns}-column output tile emitted {piece or columns} columns at once stages in no "
                 f"{buffers} buffers of {chunk} columns")
     row_bits = 8 * TMA_STORE_BYTES
-    if staging is not None and (partial := [jnp.dtype(dtype).name for dtype in dtypes
-                                            if chunk * jax.dtypes.itemsize_bits(dtype) % row_bits]):
+    partial = [jnp.dtype(dtype).name for dtype in dtypes
+               if chunk * jax.dtypes.itemsize_bits(dtype) % row_bits]
+    if staging is not None and not packed and partial:
         return (f"a stated chunk of {chunk} columns stores no whole {TMA_STORE_BYTES}-byte TMA rows in "
                 f"{', '.join(partial)}")
-    return None
+    return _packed_refusal(chunk, packed)
 
 
 def written(smem, value: jax.Array) -> None:
@@ -142,29 +199,50 @@ def column_chunks(value: jax.Array, width: int) -> list[tuple[int, jax.Array]]:
 
 
 def staged_chunks(smem, value: jax.Array, ref, place: tuple, *, write: Callable = written,
-                  waits: tuple[int, ...] | None = None) -> None:
+                  waits: tuple[int, ...] | None = None, divisor: int = 1, transposed: bool = False) -> None:
     """A consumer's share `value` of an output tile staged through its chunk buffers (`smem`, `[buffers,
     rows, columns]`) a buffer's columns at a time (`column_chunks`) and stored to `ref` at `place`
     (`(row_start, first, stored, column, *ladder)`, `staged_rows`), each chunk's buffer written once the
     store groups `waits` leave in flight no longer read it: the caller's own schedule of them, where its
     chunks' groups run otherwise than one output's tiles in turn, else `buffer_waits`'. A share storing no
     rows (a ragged last tile's second consumer's) stages nothing: no buffer written, no group issued, so
-    every chunk staged commits at least one (`buffer_waits`)."""
-    pl.when(place[2] > 0)(functools.partial(staged, smem, value, ref, place, write=write, waits=waits))
+    every chunk staged commits at least one (`buffer_waits`). An output stored packed (`divisor`,
+    `Output.divisor`) stages a buffer's columns times it of the tile a chunk, stored at its tile column over
+    it; `transposed` (`Output.transposed`), its buffer `[columns, rows]`, stored whole (`transposed_rows`)."""
+    pl.when(place[2] > 0)(functools.partial(staged, smem, value, ref, place, write=write, waits=waits,
+                                            divisor=divisor, transposed=transposed))
 
 
 def staged(smem, value: jax.Array, ref, place: tuple, *, write: Callable = written,
-           waits: tuple[int, ...] | None = None) -> None:
+           waits: tuple[int, ...] | None = None, divisor: int = 1, transposed: bool = False) -> None:
     """`staged_chunks`' chunks staged whatever rows `place` stores: each its buffer's wait, its write and
     its stores."""
-    buffers, width = smem.shape[0], smem.shape[-1]
+    buffers, width = smem.shape[0], smem.shape[-2 if transposed else -1]
     row_start, first, stored, column, *ladder = place
-    chunks = column_chunks(value, width)
+    chunks = column_chunks(value, width * divisor)
     waits = buffer_waits(len(chunks), buffers) if waits is None else waits
     for chunk, (start, piece) in enumerate(chunks):
         plgpu.wait_smem_to_gmem(waits[chunk], wait_read_only=True)
-        staged_rows(smem.at[chunk % buffers], piece, ref, row_start, first, stored, column + start, *ladder,
-                    write=write)
+        if transposed:
+            transposed_rows(smem.at[chunk % buffers], piece, ref, row_start, (column + start) // divisor,
+                            write=write)
+            continue
+        staged_rows(smem.at[chunk % buffers], piece, ref, row_start, first, stored,
+                    (column + start) // divisor, *ladder, write=write)
+
+
+def transposed_rows(smem, value: jax.Array, o_gmem, row_start, column, *, write: Callable = written) -> None:
+    """`value`, a chunk of a share's tile columns, written to the shared buffer `smem` (`[columns, rows]`,
+    the share's rows contiguous, `write`'s packing: `Output.transposed`) and stored whole to `o_gmem`
+    (`[columns, rows]`) at `column` and the share's first row `row_start`, one TMA copy its own store group:
+    its rows its box's inner extent, which no partial ladder takes in whole 16-byte units, so a share stores
+    all its rows, the tensor's bound clipping those past its last. A call whose share stores fewer
+    mid-tensor (a grouped tile's) takes no transposed output."""
+    if isinstance(o_gmem, Scattered):
+        raise ValueError("a scattered output's rows land a row at a time, never transposed")
+    write(smem, value)
+    plgpu.commit_smem()
+    plgpu.copy_smem_to_gmem(smem, o_gmem.at[pl.ds(column, smem.shape[0]), pl.ds(row_start, smem.shape[1])])
 
 
 def staged_rows(smem, value: jax.Array, o_gmem, row_start, first, stored, column, most: int,
