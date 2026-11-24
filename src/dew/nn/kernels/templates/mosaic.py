@@ -183,7 +183,8 @@ _STAGING: contextvars.ContextVar[bool] = contextvars.ContextVar("staging", defau
 
 def _disjoint(buffers: Sequence) -> None:
     """Refuse `buffers` where two may alias: two views of one ref."""
-    roots = [id(getattr(buffer, "ref", buffer)) for buffer in buffers]
+    roots = [id(buffer.ref if isinstance(buffer, state_types.TransformedRef) else buffer)
+             for buffer in buffers]
     if len(set(roots)) != len(roots):
         raise ValueError("a staged batch's buffers alias one another: each a buffer of its own")
 
