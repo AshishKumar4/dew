@@ -180,8 +180,7 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
                                              rows: int | None = None,
                                              least_walked: Callable[[int], int] = lambda rows: 1,
                                              least_held: Callable[..., int] = query_rows,
-                                             choose: Callable[[list[Config]], Config] | None = None,
-                                             residency: Callable[[Config], int] | None = None
+                                             choose: Callable[[list[Config]], Config] | None = None
                                              ) -> Config | None:
     """A launch's config from its family's facts and the call's extents (design §7): its
     consumers up to the family's count (`Family.consumers`, at most a launch's `most_consumers`)
@@ -234,20 +233,17 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
                     # count's (a 192-row tile of 3 consumers over a 256-row shard pads it by half, where
                     # 2 consumers' 128 pad none): the call's padding is a copy and its last tile wasted.
                     continue
-                best_programs = 0
+                # Each walked tile that fits, at its first staging, priced against the rest where `choose`
+                # prices: a larger tile is not the faster at every call (M-NA-11b-gh200: a T512 training
+                # walk of d128 with sinks at 64 x 128 took 72.80 us, at 64 x 64 47.49, the same residency).
                 for extent in walks(family, dtype, max(walked, least_walked(grp_rows))):
                     for narrow in stagings(family):
                         config = dataclasses.replace(tiles(grp_rows, extent, consumers), narrow=narrow)
                         if fits(config):
                             if choose is None:
                                 return config
-                            held_programs = residency(config) if residency is not None else 1
-                            if not best_programs or held_programs > best_programs:
-                                picked.append(config)
-                                best_programs = held_programs
+                            picked.append(config)
                             break
-                    if best_programs and residency is None:
-                        break
         if not picked:
             return None
         return picked[0] if len(picked) == 1 or choose is None else choose(picked)
@@ -877,7 +873,6 @@ class MosaicForward(_Mainloop[Tiles]):
         families = [family for family in layouts(target.generation, query.dtype, query.shape[1])
                     if family is not skip and self.refusal(ba, family) is None]
         choose = functools.partial(self._choose_consumers, ba, target=target) if priced else None
-        residency = functools.partial(self.resident, ba, target=target) if priced else None
         for prefer_helping in (True, False):
             for family in families:
                 def fits(config: Tiles, *, helping=prefer_helping) -> bool:
@@ -885,7 +880,7 @@ class MosaicForward(_Mainloop[Tiles]):
                             and self._launchable(ba, config, target, priced=priced)
                             not in (None, *refused))
 
-                config = self._searched(ba, family, fits, choose=choose, residency=residency)
+                config = self._searched(ba, family, fits, choose=choose)
                 if config is not None:
                     launched = self._launchable(ba, config, target, priced=priced)
                     if launched is None or not priced:
@@ -950,9 +945,10 @@ class MosaicForward(_Mainloop[Tiles]):
         return total
     def _choose_consumers(self, ba: tokamax.BoundArguments, candidates: list[Tiles], *,
                           target: generation.GpuTarget) -> Tiles:
-        """Pick the fastest consumer count among `candidates` from `emission.work_of` and `cost.walked` /
-        `cost.seconds`, storing the derived count in the tuning store beside verdicts (`tuning.stored_choice`
-        / `tuning.store_choice`) so warm starts trace nothing to price (row 6710)."""
+        """Pick the fastest of `candidates`, each a consumer count at each walked tile that fits it
+        (`_derived`), priced by `price_config`, storing the choice in the tuning store beside verdicts
+        (`tuning.stored_choice` / `tuning.store_choice`) so warm starts trace nothing to price (rows 6710,
+        6216)."""
         if len(candidates) <= 1 or not target.multiprocessors or not cost.rates(target, device=False).tensor:
             return candidates[0]
         launched = [self._launchable(ba, config, target) or config for config in candidates]
@@ -1015,8 +1011,7 @@ class MosaicForward(_Mainloop[Tiles]):
         return tuple({**preferred, **deferred})
 
     def _searched(self, ba: tokamax.BoundArguments, family: mosaic.Family, fits: Callable[[Tiles], bool], *,
-                  choose: Callable[[list[Tiles]], Tiles] | None = None,
-                  residency: Callable[[Tiles], int] | None = None) -> Tiles | None:
+                  choose: Callable[[list[Tiles]], Tiles] | None = None) -> Tiles | None:
         """The derivation's search of `family`'s configs for the call of `ba` (`_derived`, over the value
         columns whole and then in blocks, `_column_blocks_of`): the first `fits` takes, or None."""
         query = ba.arguments["query"]
@@ -1026,8 +1021,7 @@ class MosaicForward(_Mainloop[Tiles]):
 
             config = _derived(family, query.dtype, query.shape[1], _keys(ba), tiles, fits, overlapped=True,
                               walks=functools.partial(walked_extents, parts=self.parts),
-                              least_walked=functools.partial(_least_keys, family), choose=choose,
-                              residency=residency)
+                              least_walked=functools.partial(_least_keys, family), choose=choose)
             if config is not None:
                 return config
         return None
