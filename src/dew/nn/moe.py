@@ -836,11 +836,11 @@ def gated_experts(x: jax.Array | Gathered, gate: jax.Array | Layered, up: jax.Ar
     compute, paired = _paired(x, gate, up, dtype)
     down_stack, down_layer = (down.stack, down.layer) if isinstance(down, Layered) else (down, None)
     fusable = (paired is not None and down_layer is paired[-1] and not isinstance(down_stack, formats.NvFp4)
-               and not _recipe_takes_experts(down_stack) and not isinstance(activation, Situ))
+               and not _recipe_takes_experts(down_stack))
     # The gated product's hook where a launch's epilogue and prologue take its operations (`hook_lowers`, as
     # `dew.nn.gated_mlp` asks: an exact GELU's erfc lowers on no Mosaic launch), else None; asked of a
     # compute dtype a launch takes (float32 or narrower), a wider one's products XLA's, whose hook is its own.
-    hook = gated_hook(activation, limit) if fusable else None
+    hook = None if isinstance(activation, Situ) or not fusable else gated_hook(activation, limit)
     if (hook is not None and jnp.dtype(compute).itemsize <= 4
             and not hook_lowers(hook, (jax.ShapeDtypeStruct((128, 128), compute),) * 2,
                                 generation.gpu_target())):
