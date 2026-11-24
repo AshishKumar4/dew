@@ -178,11 +178,7 @@ def test_checkpointed_passes_preserve_logits_and_gradients(backprop_steps, stack
     checkpointed = plain.clone(loop=dataclasses.replace(loop, remat=True))
 
     def result(model):
-        def run(tree, ids, cotangent):
-            pulled = with_gradients(lambda tree: model.apply(tree, ids, train=True))
-            logits, gradients = pulled(tree, cotangent)
-            return {'logits': logits, 'gradients': gradients}
-        return jax.jit(run)
+        return jax.jit(_logits_and_gradients(model))
 
     # Eight rows of sixteen tokens: a norm's scale sums its gradient over enough of them to resolve.
     draw = with_logit_cotangent(drawn(plain, 16, 8), VOCAB, 0x100)
@@ -1106,6 +1102,16 @@ def test_a_count_of_passes_given_per_call_weighs_the_passes_that_ran():
         PassWeights.of((0.25, 0.25, 0.25, 0.25)).ran(ran)
 
 
+def _logits_and_gradients(model):
+    """`model`'s training logits and the gradient of a cotangent on them, a function of its variables, its
+    tokens and that cotangent: what a site comparing two ways of running a loop holds on par."""
+    def run(tree, ids, cotangent):
+        pulled = with_gradients(lambda tree: model.apply(tree, ids, train=True))
+        logits, gradients = pulled(tree, cotangent)
+        return {'logits': logits, 'gradients': gradients}
+    return run
+
+
 def _collectives_in_loop(text: str, trips: int) -> collections.Counter:
     """The collectives (`all-gather`, `reduce-scatter`, `all-reduce`, their async starts) in a compiled
     program's `while` loops of `trips` known trips, their bodies and every computation they call, from its HLO
@@ -1195,10 +1201,7 @@ def test_a_gathered_loop_trains_the_same_model():
     gathered = apart.clone(loop=dataclasses.replace(loop, gathered=True))
 
     def result(model, *, placed: bool = True):
-        def run(tree, ids, cotangent):
-            pulled = with_gradients(lambda tree: model.apply(tree, ids, train=True))
-            logits, gradients = pulled(tree, cotangent)
-            return {'logits': logits, 'gradients': gradients}
+        run = _logits_and_gradients(model)
 
         @as_given
         def ran(tree, ids, cotangent):
