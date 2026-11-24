@@ -85,6 +85,7 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
         return super().taken_once(held, views, wg)
     feeds_itself = True
     gathers_rows = True  # the loading consumer, a whole warpgroup, gathers a step's rows (`gathered.Ring`)
+    walks_streamed = True  # every consumer walks each streamed step over its own feed (`walk_own`)
     loader = 0
     """The consumer that issues the loads."""
 
