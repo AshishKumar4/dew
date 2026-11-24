@@ -504,11 +504,23 @@ def _instruction(words: list[str], issued: float, moving: float) -> Work:
         copied = (sizes[0] if sizes else 16) * moving
         return Work(device_bytes=copied, shared_bytes=copied)
     elif mnemonic.startswith(("atom.", "red.")) and ".global" in mnemonic:
-        return Work(device_bytes=8 * moving)
+        # Its word read and written (an atomic's), a reduction's written, at its type's bytes.
+        moved = _ptx_bytes(mnemonic) * (2 if mnemonic.startswith("atom.") else 1) * moving
+        return Work(device_bytes=moved)
     elif mnemonic.startswith(("ld.", "st.")):
-        moved = 4 * moving
+        moved = _ptx_bytes(mnemonic) * moving
         return Work(shared_bytes=moved) if ".shared" in mnemonic else Work(device_bytes=moved)
     raise Uncounted(f"no rule counts the PTX instruction {mnemonic}")
+
+
+def _ptx_bytes(mnemonic: str) -> int:
+    """A PTX memory instruction's bytes a lane: its type's (`.u32`, `.f16`, `.b64`, ...) times its vector's
+    count (`.v2`, `.v4`); refused where it states no type."""
+    found = re.search(r"\.[usbf](8|16|32|64)\b", mnemonic)
+    if found is None:
+        raise Uncounted(f"a PTX memory instruction of no type the count reads: {mnemonic}")
+    vector = re.search(r"\.v(2|4|8)\b", mnemonic)
+    return int(found.group(1)) // 8 * (int(vector.group(1)) if vector else 1)
 
 
 def _ptx_integer(word: str) -> int | None:
@@ -535,12 +547,17 @@ _PTX_COMPARES = {"eq": np.equal, "ne": np.not_equal, "lt": np.less, "le": np.les
 
 def _set(words: list[str], lanes_of: Callable, bounds_of: Callable) -> tuple[np.ndarray, np.ndarray]:
     """A `setp`'s predicate's lanes that may and that surely hold it (`setp.cmp[.and|.or].type p, a, b[,
-    q]`): its comparison's where both sides' lanes are known, else any; and-ed or or-ed with `q`'s."""
+    q]`): its comparison's where both sides' lanes are known and its type an integer's (each side read at
+    its width and signedness, an unsigned comparison's `lo`, `ls`, `hi`, `hs` unsigned), else any; and-ed or
+    or-ed with `q`'s."""
     parts = words[0].split(".")
     compare = _PTX_COMPARES.get(parts[1])
     sides = [lanes_of(word) for word in words[2:4]]
-    if compare is not None and all(side is not None for side in sides):
-        held = compare(sides[0], sides[1])
+    kind = re.fullmatch(r"([usb])(8|16|32|64)", parts[-1])
+    if compare is not None and kind is not None and all(side is not None for side in sides):
+        signed = kind.group(1) == "s" and parts[1] not in ("lo", "ls", "hi", "hs")
+        first, second = (_at_width(side, int(kind.group(2)), signed) for side in sides)
+        held = compare(first, second)
         maybe, surely = held, held
     else:
         maybe, surely = np.ones(LANES, dtype=bool), np.zeros(LANES, dtype=bool)
@@ -556,8 +573,14 @@ def _lane_values(name: str, op, operands: list[np.ndarray]) -> np.ndarray | None
     """`name` over its operands' lanes, for the integer arithmetic a lane's place is computed by."""
     first, last = operands[0], operands[-1]
     match name:
-        case "arith.index_cast" | "arith.index_castui" | "arith.extsi" | "arith.extui" | "arith.trunci":
+        case "arith.index_cast" | "arith.index_castui" | "arith.extsi":
             return first
+        case "arith.extui" | "arith.trunci":
+            # Its operand's bits (extui) or its result's (trunci) read unsigned, as wide as they are.
+            width = _width(op.operands[0].type if name == "arith.extui" else op.results[0].type)
+            if width is None or width >= 64:
+                return None if width is None else first
+            return _at_width(first, width, signed=False).astype(np.int64)
         case "arith.addi":
             return first + last
         case "arith.subi":
@@ -583,16 +606,34 @@ def _lane_values(name: str, op, operands: list[np.ndarray]) -> np.ndarray | None
         case "arith.maxsi" | "arith.maxui":
             return np.maximum(first, last)
         case "arith.cmpi":
-            return _compared(int(op.attributes["predicate"].value), first, last)
+            width = _width(op.operands[0].type)
+            return None if width is None else _compared(int(op.attributes["predicate"].value), first, last,
+                                                        width)
         case "arith.select":
             return np.where(first.astype(bool), operands[1], last)
     return None
 
 
-def _compared(predicate: int, first: np.ndarray, second: np.ndarray) -> np.ndarray:
-    """`arith.cmpi`'s predicate (eq, ne, slt, sle, sgt, sge, ult, ule, ugt, uge) over lanes."""
+def _compared(predicate: int, first: np.ndarray, second: np.ndarray, width: int) -> np.ndarray:
+    """`arith.cmpi`'s predicate (eq, ne, slt, sle, sgt, sge, ult, ule, ugt, uge) over lanes of `width`
+    bits, each side read signed or unsigned as the predicate reads it."""
     compare = (np.equal, np.not_equal, np.less, np.less_equal, np.greater, np.greater_equal)
+    signed = predicate in (2, 3, 4, 5)
+    first, second = (_at_width(side, width, signed) for side in (first, second))
     return compare[predicate if predicate < 6 else predicate - 4](first, second).astype(np.int64)
+
+
+def _at_width(lanes: np.ndarray, width: int, signed: bool) -> np.ndarray:
+    """`lanes` as `width`-bit integers read signed or unsigned (Python's integers, as wide as they need)."""
+    held = np.asarray(lanes, dtype=object) % (1 << width)
+    return np.where(held >= (1 << (width - 1)), held - (1 << width), held) if signed else held
+
+
+def _width(value_type: ir.Type) -> int | None:
+    """An integer's bits (an index's 64), None for any other type."""
+    if isinstance(value_type, ir.IntegerType):
+        return value_type.width
+    return 64 if isinstance(value_type, ir.IndexType) else None
 
 
 def _trips(lower, upper, step) -> int | None:
