@@ -376,7 +376,7 @@ def test_an_exact_zero_decay_is_differentiated_finite():
     *given, cotangent = operands(jnp.float32, untied=False)(1)
     q, k, v, log_decay, beta, mu, state = given
     least = -jnp.finfo(jnp.float32).max
-    log_decay = log_decay.at[:, 3].set(-jnp.inf).at[:, 11].set(-jnp.inf).at[:, 7].set(least)
+    log_decay = jnp.asarray(log_decay).at[:, 3].set(-jnp.inf).at[:, 11].set(-jnp.inf).at[:, 7].set(least)
     starts = marked(DOCUMENTS, LENGTH)
     rule = with_gradients(lambda *x: tied(chunked(TIED))(*x, starts=starts))
     out, *grads = jax.jit(rule)(q, k, v, log_decay, beta, mu, state, cotangent)

@@ -252,9 +252,7 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
         return dataclasses.replace(prepared, transition=_transition(prepared, jnp.zeros(shape, carried)))
 
     def mapped(prepared, state, kept=None, issue=None):
-        # Dew's products where no mainloop issues them (`_issued`): a readout's the portable math's. A
-        # single state's step keeps nothing for it (`_stepped`).
-        del kept
+        # Dew's products where no mainloop issues them (`_issued`): the portable math's; `kept` None.
         (outputs,) = prepared.split.emit(prepared.values[1], state[1], issue or _issued)
         entering = prepared.entering
         return outputs if entering is None else _entered(outputs, entering, prepared.values_read, state[1])

@@ -157,10 +157,10 @@ def test_a_float32_pairs_walk_over_float64_tokens_carries_it_wide():
 
 
 def exp2_pair(pair, q, k, v, g, beta, p, mu):
-    """The declared update with base-2 decays (`exp2`), its momentum's none."""
+    """The declared update with base-2 decays (`exp2`), its erase key's read an einsum's."""
     del q
     h, m = pair
-    m = jnp.exp2(mu) * m + k[:, None] * (p @ h - v)[None, :]
+    m = jnp.exp2(mu) * m + k[:, None] * (jnp.einsum('k,kv->v', p, h) - v)[None, :]
     return jnp.exp2(g) * h - beta * m, m
 
 
