@@ -2,6 +2,7 @@
 it stands for (`fused_gemm.product`), its consumers reading it as that dot rounds it, and
 `fused_gemm.analysis`' report of what fusing a region decides, raises and costs, from its shapes alone."""
 
+import dataclasses
 import functools
 
 import jax
@@ -15,8 +16,10 @@ from test_algebra_program import _scaled_twice
 
 import dew
 from dew import algebra
+from dew.algebra import cost as algebra_cost
 from dew.nn import programs
 from dew.nn.kernels import fused_gemm, gemm, generation, selection
+from dew.nn.kernels.templates import cost
 
 
 @INTERPRETS
@@ -258,8 +261,9 @@ def test_a_scattered_regions_fused_price_counts_its_sides_permutation():
 
 def test_a_scattered_regions_permutation_prices_each_sides_bytes_and_table():
     """The region `fused` prices for a scattered product whose consumer adds an fp32 residual of its rows
-    holds its permutation pass's every byte: the residual read and written and the int32 scatter table
-    read, exactly (row 12419)."""
+    holds its permutation pass's every byte, the residual read and written and the int32 scatter table
+    read, and its price (`fused_gemm.priced`, which `analysis` reads) charges its fused arm exactly one
+    XLA pass of them over the same region without it, its unfused arm nothing (rows 12419, 12630)."""
     sizes = jax.ShapeDtypeStruct((4,), jnp.int32)
     x = jax.ShapeDtypeStruct((8192, 4096), jnp.bfloat16)
     w = jax.ShapeDtypeStruct((4, 4096, 4096), jnp.bfloat16)
@@ -277,7 +281,17 @@ def test_a_scattered_regions_permutation_prices_each_sides_bytes_and_table():
             jax.eval_shape(functools.partial(fused_gemm.fused, region), x, w, sizes, rows, residual)
     finally:
         fused_gemm._PRICED.reset(token)
-    assert regions[-1].permuted_bytes == 2 * 8192 * 4096 * 4 + 8192 * 4, regions[-1]
+    permuted = 2 * 8192 * 4096 * 4 + 8192 * 4
+    region = regions[-1]
+    assert region.permuted_bytes == permuted, region
+    with generation.assumed("sm90"):
+        target = generation.gpu_target()
+        fused, unfused, _ = fused_gemm.priced(region, target)
+        bare = dataclasses.replace(region, permuted_bytes=0.0)
+        bare_fused, bare_unfused, _ = fused_gemm.priced(bare, target)
+        pass_seconds = algebra_cost.fused(target)(cost.Work(device_bytes=permuted, kernels=1.0))
+    assert unfused == bare_unfused, (unfused, bare_unfused)
+    assert fused == bare_fused + pass_seconds, (fused, bare_fused, pass_seconds)
 
 
 def _chained(function, wide):
