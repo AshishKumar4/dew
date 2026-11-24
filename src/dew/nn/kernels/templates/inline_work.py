@@ -264,12 +264,12 @@ class _Lanes:
                     self.values[argument] = lanes
             work = work + self.region(op.regions[0], active)
             carried = [self.read(value) for value in _yielded(op)]
-        for result, lanes in zip(op.results, carried, strict=False):
+        for returned, lanes in zip(op.results, carried, strict=False):
             # An earlier walk's facts of its results (an outer trip's) dropped before this one's.
             for held in (self.values, self.partial, self.relative):
-                held.pop(result, None)
+                held.pop(returned, None)
             if lanes is not None:
-                self.values[result] = lanes
+                self.values[returned] = lanes
         return work
 
     def read(self, value) -> np.ndarray | None:
