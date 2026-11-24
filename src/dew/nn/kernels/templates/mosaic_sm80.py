@@ -37,7 +37,7 @@ from dew.nn.kernels.templates import (
     stores,
     swizzling,
 )
-from dew.nn.kernels.templates.cost import Stated, Work
+from dew.nn.kernels.templates.cost import Stated
 from dew.nn.programs import meshless
 
 
@@ -711,7 +711,6 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         del pending
 
 
-@emission.stating(lambda acc, left, right: Work(tf32_flops=2 * acc.shape[0] * acc.shape[1] * left.shape[1]))
 def _tf32_product(ctx, acc, left, right):
     """`acc + left @ right`, fp32's operands as TF32 by one mma.sync (`MmaIssuer._mma`), inlined: `2 m n k`
     TF32 FLOPs, its accumulator `[m, n]` and its left operand `[m, k]`."""

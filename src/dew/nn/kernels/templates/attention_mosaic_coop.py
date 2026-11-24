@@ -71,7 +71,8 @@ def _coop_allocations(family: mosaic.Family, config: BackwardTiles, width: int, 
     blocks = {"queries": ((block_q, width), dtype), "douts": ((block_q, width), dtype),
               **{name: ((block_q,), STATISTICS[name])
                  for name in streamed_statistics_order(streamed, anchored=False)}}
-    return scoped, family.streams(blocks, stages, consumers)
+    # Joined under one barrier pair, as the fused launch's (`_fused_allocations`).
+    return scoped, family.streams(blocks, stages, consumers, joined=tuple(blocks))
 
 
 def _share_scores(walk: _Backward, share: int, resident: tuple, rows_of, coords_of, whole, index, slots, *,

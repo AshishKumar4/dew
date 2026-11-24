@@ -22,7 +22,6 @@ import contextlib
 import contextvars
 import dataclasses
 import functools
-import math
 import operator
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any, NamedTuple, Self
@@ -53,7 +52,7 @@ from dew.nn.kernels.templates import (
     resources,
     swizzling,
 )
-from dew.nn.kernels.templates.cost import Stated, Work
+from dew.nn.kernels.templates.cost import Stated
 from dew.nn.kernels.templates.rings import CLUSTER, Ref, Turn, besides, drain, loaded_once
 from dew.nn.kernels.templates.stores import Output, column_chunks, column_spans, written
 from dew.telemetry.instrumentation import MODEL_FLOPS
@@ -466,7 +465,6 @@ def laid(condition, like: jax.Array) -> jax.Array:
     return (jnp.zeros_like(like, jnp.float32) + jnp.asarray(condition, jnp.float32)) != 0.0
 
 
-@emission.stating(lambda: Work())
 def _warpgroup_barrier(ctx) -> None:
     """A warpgroup's barrier (`synced`), inlined: synchronization alone, no work a count prices."""
     del ctx
@@ -714,8 +712,6 @@ class Issuer[Accumulator](abc.ABC):
             taken = group + jnp.clip(rows % period - shift, 0, period - 1)
             return jnp.take_along_axis(tile, taken, axis=0)
 
-        # A warp's shuffles: values moved between its lanes' registers, no work a count prices.
-        @emission.stating(lambda array, by: Work())
         def shifted(ctx, array, by):
             del ctx
             [value] = by.registers.flat
@@ -1508,7 +1504,6 @@ class Issuer[Accumulator](abc.ABC):
         return plgpu.layout_cast(value, self.layout)
 
 
-@emission.stating(lambda tile, scratch: Work(operations=math.prod(tile.shape)))
 def _column_sums(ctx, tile, scratch):
     """A tile's column sums across the warps holding its rows (`Issuer.column_sums`), inlined: a reduction,
     one addition an element, its warps' partials exchanged through `scratch`."""

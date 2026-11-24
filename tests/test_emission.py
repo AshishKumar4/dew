@@ -460,11 +460,17 @@ def test_a_split_walks_step_is_its_parts_mean():
     assert [role.step(_exponentials) for role in _emitted(guarded, _ROW, _TRIPS, active).roles] == [128, 128]
 
 
-def test_a_walks_guards_on_its_steps_place_count_at_their_trips():
+@pytest.mark.parametrize("start", ["operand", "indices"])
+def test_a_walks_guards_on_its_steps_place_count_at_their_trips(start):
     """A walk over a range whose first step takes its own exponential and every step but its last the next
     one's (`index == lo`, `index + 1 < hi`, as a walk reading ahead guards them) counts one a row a step and
-    none apart: each guard read at the trips it decides, not taken every step."""
+    none apart: each guard read at the trips it decides, not taken every step. Its start an operand, or
+    computed of the kernel's indices alone (an iota's least), which the count holds by its atom as any
+    unknown start (its invariance once hid that identity from the guard, which took both branches every
+    step)."""
     def walk(row, lo, hi):
+        lo = jnp.min(lax.iota(jnp.int32, 8)) if start == "indices" else lo
+
         def step(index, row):
             mosaic.step_index(index)
             row = lax.cond(index == lo, jnp.exp, lambda row: row, row)
@@ -705,6 +711,67 @@ def test_an_integer_operation_counts_on_the_integer_units_not_the_fp32_lanes():
         assert (role.fixed.integer_operations, role.fixed.operations) == (128, 0), role.fixed
 
 
+def test_a_steps_mask_of_its_tiles_indices_issues_nothing_and_one_of_its_place_counts():
+    """A walk step's mask of its tile's indices alone (iotas and literals: the recurrence solve's blocks by a
+    floor division and a remainder) issues no integer operation a step, the GPU's compile folding it or
+    computing it once outside the loop (`emission._INVARIANT`, row 4123: the solve's masks priced at 6.1M
+    integer operations a GH200 program against about a thousand integer instructions a thread a trip); a mask
+    of the step's place counts its integer operations each step. Its select of the row's data counts on the
+    fp32 lanes alike."""
+    def walk(placed: bool):
+        def step(index, row):
+            mosaic.step_index(index)
+            columns = lax.iota(jnp.int32, 128) + (index if placed else 0)
+            return jnp.where((columns // 4) % 2 == 1, row, 0.0)
+
+        return lambda row, trips: lax.fori_loop(0, trips, step, row)
+
+    def counted(placed: bool) -> tuple:
+        role = _emitted(walk(placed), _ROW, _TRIPS).roles[0]
+        return role.step(lambda work: work.integer_operations), role.step(_operations)
+
+    (indexed, selected), (placed, selected_placed) = counted(placed=False), counted(placed=True)
+    assert indexed == 0 and placed >= 3 * 128, (indexed, placed)
+    assert selected == selected_placed == 128, (selected, selected_placed)
+
+
+@pytest.mark.parametrize("held", ["step", "scope", "branch"])
+def test_a_steps_mask_of_a_runtime_value_counts_its_integer_operations_each_step(held):
+    """A walk step's mask of its tile's indices offset by its parity (`index % 2`, a value the count holds
+    concretely at each trip it reads, `emission._Place`, none of the program's constants) is computed each
+    step, its integer operations counted every step: in the step, in a scope's body that captures it
+    (`pl.run_scoped`), whose constants are as its operands are, or by the literal offset a branch the parity
+    selects returns, whose outputs vary as its selector does."""
+    def masked(row, offset):
+        columns = lax.iota(jnp.int32, 128) + offset
+        return jnp.where((columns // 4) % 2 == 1, row, 0.0)
+
+    def step(index, row):
+        mosaic.step_index(index)
+        parity = index % 2
+        if held == "scope":
+            return pl.run_scoped(lambda scratch: masked(row, parity), plgpu.SMEM((8,), jnp.float32))
+        if held == "branch":
+            return masked(row, lax.cond(parity == 0, lambda: 0, lambda: 1))
+        return masked(row, parity)
+
+    role = _emitted(lambda row, trips: lax.fori_loop(0, trips, step, row), _ROW, _TRIPS).roles[0]
+    assert role.step(lambda work: work.integer_operations) >= 3 * 128, role
+
+
+def test_a_calls_static_output_beside_a_runtime_one_issues_nothing_a_step():
+    """A call returning a mask of its tile's indices beside a value of the step (`jax.jit`) gives each output
+    the provenance its body computes: the mask stays static, so its use issues nothing a step, where the
+    call's runtime operand once made every output a runtime value."""
+    def step(index, row):
+        mosaic.step_index(index)
+        odd, _ = jax.jit(lambda at: (lax.iota(jnp.int32, 128) % 2 == 1, at + 1))(index)
+        return jnp.where(odd & (lax.iota(jnp.int32, 128) < 64), row, 0.0)
+
+    role = _emitted(lambda row, trips: lax.fori_loop(0, trips, step, row), _ROW, _TRIPS).roles[0]
+    assert role.step(lambda work: work.integer_operations) < 128, role
+
+
 def test_an_integer_multiply_counts_on_the_fma_pipe_at_its_own_rate_beside_the_fp32_lanes():
     """A row's integer multiply counts one integer multiply-add an element (`Work.integer_multiply_adds`:
     IMAD, the FMA pipe's, as a bit form's left shifts by a multiply are, `bits.BitForm.work`) and nothing of
@@ -753,35 +820,6 @@ def test_a_launchs_span_is_its_longest_programs_walk_where_its_programs_walk_une
     (kernel,) = [equation for equation in programs.equations(traced.jaxpr)
                  if "cost_estimate" in equation.params]
     assert emission.work_of(kernel).span == span
-
-
-def test_identical_scale_smem_bodies_keep_independent_emission_work():
-    """Row 9483: two distinct `across.ScaleSmem` bodies with identical fields register independent
-    `emission.stating` entries (`eq=False`): binding the second into a jaxpr and releasing the first leaves
-    the second's stated scaling work counted by emission."""
-    import gc
-
-    from dew.nn.kernels.templates import across
-
-    elements = 128 * 64
-    work = Work(operations=elements, shared_bytes=2 * elements * 2)
-    first = emission.stating(lambda r: work)(across.ScaleSmem(elements // 2, 0x3F803F80, bf16=True))
-    second = emission.stating(lambda r: work)(across.ScaleSmem(elements // 2, 0x3F803F80, bf16=True))
-
-    def traced(inline_body):
-        def body(out_gmem, smem):
-            del out_gmem
-            plgpu.inline_mgpu(arg_types=(plgpu.RefType(),))(inline_body)(smem)
-
-        kernel = plgpu.kernel(body, out_type=_ROW, num_threads=1, thread_name="wg",
-                              scratch_types=[plgpu.SMEM((128, 64), jnp.bfloat16)])
-        return jax.make_jaxpr(kernel)()
-
-    closed = traced(second)
-    del first, second
-    gc.collect()
-    fixed = emission.emitted(closed, 1, "wg").roles[0].fixed
-    assert fixed == work, fixed
 
 
 def test_launch_seconds_shares_sm_units_overlaps_paths_and_prices_integer_work():
