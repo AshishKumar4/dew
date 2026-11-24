@@ -182,13 +182,18 @@ class _Transpose:
             columns = jax.lax.dynamic_slice_in_dim(matrix, at * chunk, chunk, axis=-2)
             limbs = varying_like(_limbs(limbs_count, cotangent, chunk), cotangent, columns,
                                  *jax.tree.leaves(rest), grid)
+            # Each non-finite class's products (`_nonfinite_terms`) a coordinate sums: +inf, -inf, NaN.
+            classes = varying_like(_limbs(3, cotangent, chunk), cotangent, f, columns, *jax.tree.leaves(rest))
 
-            def width_chunk(index, limbs):
+            def width_chunk(index, carry):
+                limbs, classes = carry
                 start = index * columns_a_chunk
                 row_bits, row_binade, row_negative = (
                     jax.lax.dynamic_slice_in_dim(v, start, columns_a_chunk, axis=-1)
                     for v in (bits, binade, negative))
                 block = jax.lax.dynamic_slice_in_dim(columns, start, columns_a_chunk, axis=-1)
+                classes = self.classified(classes, *(jax.lax.dynamic_slice_in_dim(
+                    v, start, columns_a_chunk, axis=-1) for v in (cotangent, f)), block, rest)
                 block = jnp.where(jnp.isfinite(block), block, jnp.zeros_like(block))
                 block_abs = jnp.abs(block.astype(jnp.float32))
                 block_binade = jnp.where(block_abs > 0, float_bits.binade_of(block_abs), -1024)
@@ -215,41 +220,47 @@ class _Transpose:
 
                     return jax.lax.cond(jnp.any(a != 0), taken, lambda limbs: limbs, limbs)
 
-                return _carried(jax.lax.fori_loop(0, FACTORED_ROW_SLICES, row_slice, limbs))
+                return _carried(jax.lax.fori_loop(0, FACTORED_ROW_SLICES, row_slice, limbs)), classes
 
-            limbs = jax.lax.fori_loop(0, width // columns_a_chunk, width_chunk, limbs)
+            limbs, classes = jax.lax.fori_loop(0, width // columns_a_chunk, width_chunk, (limbs, classes))
+            # The counts in fp32 from here: a sum over routes and devices stays positive where any is.
+            classes = classes.astype(jnp.float32)
             if gather is not None:
-                limbs = _routed(varying_like(_limbs(limbs_count, plain, chunk), limbs, gather), gather, limbs)
+                routed_limbs = varying_like(_limbs(limbs_count, plain, chunk), limbs, gather)
+                limbs = _routed(routed_limbs, gather, limbs)
+                tokens = varying_like(_limbs(3, plain, chunk).astype(jnp.float32), classes, gather)
+                classes = tokens.at[:, gather].add(classes)
             over = tuple(sorted(jax.typeof(limbs).mat.varying - self.held))
             if over:
                 limbs = _carried(jax.lax.psum(limbs, over))
+            if counted := tuple(sorted(jax.typeof(classes).mat.varying - self.held)):
+                classes = jax.lax.psum(classes, counted)
             # The first limb's unit: 2**(grid + matrix grid - 2 slices + the headroom's slices).
             summed = _rounded(limbs, token_grid + matrix_grid + FACTORED_SLICE * (FACTORED_HEADROOM - 2))
-            return jax.lax.dynamic_update_slice_in_dim(out, varying_like(summed, out), at * chunk, axis=-1)
+            return jax.lax.dynamic_update_slice_in_dim(out, varying_like(_ieee(classes, summed), out),
+                                                       at * chunk, axis=-1)
 
         # The rows' gradient, typed and placed as the plain transpose's is (its devices' sums taken, as each
         # chunk's are), so the loop's carry and the branch it returns from keep its type.
         out = varying_like(jnp.zeros(self.shape, jnp.float32, out_sharding=explicit_spec(plain)), plain)
-        exact = jax.lax.fori_loop(0, depth // chunk, pulled_chunk, out)
-        # The products not finite, which the exact sums leave out, counted per input coordinate from the
-        # actual (cotangent * factor, coefficient) pairs: IEEE's sum of them and the exact rest.
-        positive, negative, invalid = (self.counted(each, routed, rest, plain)
-                                       for each in _nonfinite_terms(cotangent, f, matrix))
-        return jnp.where((invalid > 0) | ((positive > 0) & (negative > 0)), jnp.nan,
-                         jnp.where(positive > 0, jnp.inf, jnp.where(negative > 0, -jnp.inf, exact)))
+        return jax.lax.fori_loop(0, depth // chunk, pulled_chunk, out)
 
-    def counted(self, terms, routed, rest, plain):
-        """How many of a class of products (`terms`: a cotangent indicator and a matrix indicator, side by
-        side over the columns, each pair a product of the class) each input coordinate sums, its routes'
-        added into their tokens and its devices' over the axes they sum: a bf16 GEMM of 0s and 1s."""
-        rows, matrix = terms
-        gather, _ = routed
-        counts = self.wide(rows.astype(jnp.bfloat16), matrix.astype(jnp.bfloat16), *rest).astype(jnp.float32)
-        if gather is not None:
-            tokens = jnp.zeros(self.shape, jnp.float32, out_sharding=explicit_spec(plain))
-            counts = varying_like(tokens, counts, gather).at[gather].add(counts)
-        over = tuple(sorted(jax.typeof(counts).mat.varying - self.held))
-        return jax.lax.psum(counts, over) if over else counts
+    def classified(self, classes, cotangent, factor, coefficients, rest):
+        """`classes` (int32 counts of the products not finite each coordinate sums: +inf, -inf, NaN) plus a
+        chunk's (`_nonfinite_terms`, one 0/1 bf16 GEMM a class), counted only where the chunk holds a
+        product not finite: a finite cancellation runs none of their GEMMs. Each device decides alone;
+        their counts meet in the psum after the chunk's columns."""
+        def counted(classes):
+            for index, (rows, matrix) in enumerate(_nonfinite_terms(cotangent, factor, coefficients)):
+                counts = self.wide(rows.astype(jnp.bfloat16), matrix.astype(jnp.bfloat16), *rest)
+                counts = counts.astype(jnp.int32)
+                held = jax.lax.dynamic_index_in_dim(classes, index, 0, keepdims=False)
+                classes = jax.lax.dynamic_update_index_in_dim(classes, held + counts, index, 0)
+            return classes
+
+        special = functools.reduce(jnp.logical_or, [jnp.any(~jnp.isfinite(v))
+                                                    for v in (cotangent, factor, coefficients)])
+        return jax.lax.cond(special, counted, lambda classes: classes, classes)
 
     def tangent(self, ran, routed, primals, tangents):
         """The plain transpose's derivative, `cotangent * scale` pulled back, every term of a perturbed
@@ -344,6 +355,14 @@ def _nonfinite_terms(cotangent: jax.Array, factor: jax.Array, matrix: jax.Array)
     negative = side_by_side((c_pos, c_neg, c_pinf, c_ninf), (m_ninf, m_pinf, m_neg | m_ninf, m_pos | m_pinf))
     invalid = side_by_side((nan, c_all, c_pinf | c_ninf, zero), (m_all, m_nan, m_zero, m_pinf | m_ninf))
     return positive, negative, invalid
+
+
+def _ieee(classes: jax.Array, summed: jax.Array) -> jax.Array:
+    """`summed`, the exact finite products' rounded sum, where a coordinate met no product not finite; else
+    IEEE's: NaN beside a NaN or both infinities (`classes`' counts: +inf, -inf, NaN), else its infinity."""
+    plus, minus, invalid = classes[0] > 0, classes[1] > 0, classes[2] > 0
+    return jnp.where(invalid | (plus & minus), jnp.nan,
+                     jnp.where(plus, jnp.inf, jnp.where(minus, -jnp.inf, summed)))
 
 
 def _classes(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
