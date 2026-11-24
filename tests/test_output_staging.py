@@ -124,7 +124,8 @@ def _packed_store(rows: int, columns: int, divisor: int, chunk: int, *, transpos
         pl.run_scoped(scoped, plgpu.SMEM((2, *block), jnp.float32))
 
     out = (columns // divisor, rows) if transposed else (rows, columns // divisor)
-    return plgpu.kernel(body, out_type=jax.ShapeDtypeStruct(out, jnp.float32), interpret=True)
+    return plgpu.kernel(body, out_type=jax.ShapeDtypeStruct(out, jnp.float32),
+                        interpret=plgpu.InterpretGPUParams())
 
 
 @INTERPRETS
