@@ -61,12 +61,13 @@ def test_a_miss_whose_joined_stacks_hold_less_than_it_was_short_of_parts_them_af
 def test_a_search_asks_first_the_rung_its_miss_reads_as_dropping_what_it_was_short_of(stack):
     """A step of one row, which no split shrinks, whose MLPs' forward values hold most of its temporaries,
     that misses its devices at no remat on an H100 between what 'save_dot_except_mlp' needs and what
-    'minimal' needs, asks 'save_dot_except_mlp' next, the rung its miss reads as dropping what it was short
-    of (`RecomputeStatement`), passing over 'minimal', which drops too little, and is admitted there: two
-    compiles, where the climb a rung at a time compiled 'minimal' between them; its stack a layer at a time,
-    scanned, or scanned reading a frozen base's rows where they lie under a LoRA adapter
-    (`decoder_stack._rows_recomputed`), whose body's values the rung's policy keeps or drops as an unscanned
-    block's (`dew.nn.protocols.RUNG_SCOPE`)."""
+    'minimal' needs, its stack a layer at a time, asks 'save_dot_except_mlp' next, the rung its miss reads
+    as dropping what it was short of (`RecomputeStatement`), passing over 'minimal', which drops too little,
+    and is admitted there: two compiles, where the climb a rung at a time compiled 'minimal' between them.
+    Its stack scanned, or scanned reading a frozen base's rows where they lie under a LoRA adapter
+    (`decoder_stack._rows_recomputed`), the residuals at its peak are the scan's stacked outputs, which no
+    block's scope names (`dew.nn.protocols.RUNG_SCOPE`): the miss reads no rung, and the search climbs the
+    ladder in its order to the rung that fits, asking each once."""
     model = models.build("causal_transformer", vocab_size=256, emb_features=256, num_layers=4, num_heads=4,
                          num_kv_heads=2, head_dim=64, mlp_features=8192, max_seq_len=1024, dtype="bfloat16",
                          attention_impl="xla", scan_layers=stack != "plain")
@@ -87,5 +88,6 @@ def test_a_search_asks_first_the_rung_its_miss_reads_as_dropping_what_it_was_sho
     ahead, probes = ahead_at(None, (dropping + lighter) // 2)
     assert ahead is not None and ahead.plan["remat"] == "save_dot_except_mlp", probes
     asked = [probe["remat"] for probe in probes]
-    assert asked == [None, "save_dot_except_mlp"], probes
-    assert [probe["fits"] for probe in probes] == [False, True], probes
+    assert asked == ([None, "save_dot_except_mlp"] if stack == "plain"
+                     else [None, "minimal", "save_dot_except_mlp"]), probes
+    assert [probe["fits"] for probe in probes] == [False] * (len(asked) - 1) + [True], probes

@@ -732,6 +732,14 @@ def compiled_key(lowered: jax.stages.Lowered, options: jax.stages.CompilerOption
     return ExecutableKey(program_key(lowered), repr(sorted((options or {}).items())), tuple(devices))
 
 
+JOINED_SHARE = 4
+"""The part of a start's shortfall the joined Newton-Schulz stacks' values its miss's live set names
+(`JOINED_SCOPE`) must hold for their release to be asked before the remat rungs: a quarter, below which
+the release is deferred behind them (`FitSearch.searched`). The set names their copies but not every value
+fused past the scope, so a share near the shortfall can fit parted (a Muon step that fits only with its
+stacks parted, tests/test_plan.py); a 4B decision step's 0.1 GB of a 9.9 GB shortfall, 1%, could not
+(row 12463)."""
+
 HeldExecutables = CodeBounded[ExecutableKey, jax.stages.Compiled]
 """The executables a run's searches hold for each other and its refits (`FitSearch.executables`), by key
 (`compiled_key`), each charged its device code (`code_bytes`) within the run's bound (`CodeBounded`): each let
@@ -1356,10 +1364,13 @@ class FitSearch[LossT, EffectsT]:
         # The least the start fell short by, and its live set: what each release and rung would free of it.
         missed = self.short(named[0])
         joins = ns_group is None and any(candidate.joins for candidate in self.lowered.values())
-        # Parting the joined stacks frees at most their copies: asked first where they could cover what the
-        # start was short of on any process, or where its miss read no live set; else asked behind the remat
+        # Parting the joined stacks frees their copies and what their joined iteration holds beside them,
+        # which the live set tells only in part (values fused past the scope carry another op's name): asked
+        # first unless what the miss tells of them holds a small part of what the start was short of on
+        # every process (`JOINED_SHARE`), or where a miss read no live set; else asked behind the remat
         # rungs (`parted`), never dropped. Every process reads the one answer, so all ask in one order.
-        covers = any(self.gather(missed is None or missed[1].scoped_bytes(JOINED_SCOPE) >= missed[0]))
+        covers = any(self.gather(
+            missed is None or JOINED_SHARE * missed[1].scoped_bytes(JOINED_SCOPE) >= missed[0]))
         deferred = joins and not covers
         if deferred and missed is not None:
             _log.warning("the step's joined Newton-Schulz stacks hold %d bytes at its peak, short of the %d "
