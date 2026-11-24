@@ -739,9 +739,9 @@ def test_every_process_of_a_pool_takes_the_same_link_bandwidth(tmp_path):
 def test_a_link_figure_is_kept_for_its_placement_and_carried_by_a_checkpoint(tmp_path):
     """Two tensor meshes of one shape over the same four devices, grouped otherwise along the axis,
     are other links: the second measures its own figure beside the compilation cache rather than
-    take the first's, and a mesh built again over the first placement takes the first's. A
-    checkpoint's rung carries each figure its trace decided from, by that placement, for a resumed
-    run to decide alike."""
+    take the first's, and a mesh built again over the first placement takes the first's; a record cut
+    short is measured again and kept whole. A checkpoint's rung carries each figure its trace decided from,
+    by that placement, for a resumed run to decide alike."""
     import jax
     import optax
     from jax.sharding import Mesh
@@ -767,6 +767,12 @@ def test_a_link_figure_is_kept_for_its_placement_and_carried_by_a_checkpoint(tmp
         assert len(list((tmp_path / "cache" / "dew-links").iterdir())) == 2
         again = link_bandwidth(Mesh(devices.reshape(2, 2), ("data", "tensor")), "tensor", size=1 << 16)
         assert again == first and len(list((tmp_path / "cache" / "dew-links").iterdir())) == 2
+        # A record cut short by another writer is measured again and kept whole (Train 1248's review: its
+        # read raised, one process's error while its peers waited in the gather).
+        for record in (tmp_path / "cache" / "dew-links").iterdir():
+            record.write_text(record.read_text()[:10])
+        measured = link_bandwidth(paired, "tensor", size=1 << 16)
+        assert measured > 0 and link_bandwidth(paired, "tensor", size=1 << 16) == measured
     finally:
         jax.config.update("jax_compilation_cache_dir", kept)
 

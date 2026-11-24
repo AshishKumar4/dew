@@ -9,7 +9,6 @@ import collections
 import dataclasses
 import functools
 import hashlib
-import json
 import math
 import statistics
 from collections.abc import Callable, Hashable, Mapping
@@ -22,9 +21,8 @@ from flax import linen as nn
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P, Sharding
 
 from dew import _facts
-from dew._cache import holding
+from dew._cache import holding, keep, kept_beside, read_kept
 from dew._coordination import from_every_process
-from dew._files import write_atomically
 from dew._records import JSON, number, record
 from dew.batch import EXAMPLE_ROWS, Batch, Variables
 from dew.data.dataset import (
@@ -111,11 +109,14 @@ def link_bandwidth(mesh: Mesh, axis: str, size: int = 1 << 28) -> float:
     measured again moves by noise, across a threshold one time in some."""
     topology = link_topology(mesh, axis)
     record = _link_record(topology)
-    # Every process gathers, or none does: a pool measures unless each of its processes sees the figure,
-    # kept for exactly this placement.
-    if record is not None and all(from_every_process(
-            record.exists() and json.loads(record.read_text()).get("topology") == topology)):
-        return min(from_every_process(float(json.loads(record.read_text())["bytes_per_second"])))
+    # Every process gathers, or none does: a pool measures unless each of its processes reads the figure,
+    # kept for exactly this placement; a record no process can read (another writer's truncated file) is
+    # one it does not see, never an error one process raises while its peers wait in the gather.
+    kept = None if record is None else read_kept(record)
+    figure = (kept["bytes_per_second"] if isinstance(kept, dict) and kept.get("topology") == topology
+              and isinstance(kept.get("bytes_per_second"), int | float) else None)
+    if all(from_every_process(figure is not None)):
+        return min(from_every_process(float(figure)))
     ways = mesh.shape[axis]
     count = size // 4 // ways * ways
     sharding = NamedSharding(mesh, P(axis))
@@ -127,8 +128,7 @@ def link_bandwidth(mesh: Mesh, axis: str, size: int = 1 << 28) -> float:
     seconds = samples(gather, source, warmup=2, repeats=5)
     received = min(from_every_process((ways - 1) / ways * count * 4 / statistics.median(seconds)))
     if record is not None and jax.process_index() == 0:
-        record.parent.mkdir(parents=True, exist_ok=True)
-        write_atomically(record, json.dumps({"topology": topology, "bytes_per_second": received}))
+        keep(record, {"topology": topology, "bytes_per_second": received}, "the link's figure")
     return received
 
 
@@ -156,11 +156,10 @@ def resumed_link_figures(rung: JSON) -> dict[str, float | None]:
 
 def _link_record(topology: str) -> Path | None:
     """Where `link_bandwidth` keeps the figure of `topology` (`link_topology`): beside the persistent
-    compilation cache, or nowhere when the process keeps no cache."""
-    cache = jax.config.jax_compilation_cache_dir
-    if not cache:
-        return None
-    return Path(cache) / "dew-links" / f"{hashlib.sha256(topology.encode()).hexdigest()}.json"
+    compilation cache it is configured with (`kept_beside`), or nowhere where the process keeps none or
+    keeps it in a bucket."""
+    directory = kept_beside("dew-links", configured=True)
+    return None if directory is None else directory / f"{hashlib.sha256(topology.encode()).hexdigest()}.json"
 
 
 def batch_divisor(mesh: Mesh | AbstractMesh, microbatches: int) -> int:
