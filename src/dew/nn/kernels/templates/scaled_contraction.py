@@ -288,6 +288,12 @@ def _moved(terms: tuple[Term, ...], moving: dict, at: dict[int, int]) -> list[tu
     return moved
 
 
+def _held_out(arrays) -> list[jax.Array]:
+    """`arrays` held out of the graph: a rule's sum read for its value alone (a zero divisor, its exponent),
+    whose double floats' splits (`windows._joined`) take no derivative of their own."""
+    return [jax.lax.stop_gradient(array) for array in arrays]
+
+
 def _jvp(primals, tangents, *, form: Form):
     """The sum's tangent, one sum of the product rule's terms (`_moved`, `ad.Zero` a still operand's) landed
     once; a quotient's `(dN - out dD) / D` over its own divisor, the result `out` an operand of the
@@ -309,7 +315,7 @@ def _jvp(primals, tangents, *, form: Form):
         below = _moved(form.divisor, moving, at)
         if below:
             # A zero divisor read as one is a constant: its moved terms none there.
-            total, _ = _sum(primals, form, form.divisor, form.divided, _dtype(primals))
+            total, _ = _sum(_held_out(primals), form, form.divisor, form.divided, _dtype(primals))
             none = _laid(total == 0, form.divided, form.out)
             operands.append(jnp.where(none, jnp.zeros((), out.dtype), out))
             subscripts.append(form.out)
@@ -340,8 +346,8 @@ def _transpose(cotangent, *arrays, form: Form):
         # The divisor carried apart from its binades, as the forward keeps it unlanded: its significand at
         # its exponent `e` held out of the graph (a contraction of the primals again, its derivatives with it)
         # and `2^-e` an exponent operand, so a divisor past the format divides finite (`y + z` at 2^127).
-        unlanded, joined = _sum(shared, Form(tuple(shared_subscripts), divisor, form.divided), divisor,
-                                form.divided, _dtype(shared))
+        unlanded, joined = _sum(_held_out(shared), Form(tuple(shared_subscripts), divisor, form.divided),
+                                divisor, form.divided, _dtype(shared))
         exponent = jax.lax.stop_gradient(jnp.where(unlanded == 0, 0, joined + binade_of(unlanded)))
         shared.append(-exponent)
         shared_subscripts.append(form.divided)
