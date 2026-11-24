@@ -2075,10 +2075,11 @@ def test_an_h100s_fast_backward_derives_the_same_under_any_gpu_in_effect(ambient
         ba = op.bind(*args, interpret=False)
         return op, ba, op.derived(ba, h100)
 
-    with generation.assumed("sm90"):
-        _, _, own = derived()
+    # The ambient GPU's derivation first: a derivation the H100's own made first is read back.
     with generation.assumed(ambient):
         op, ba, config = derived()
+    with generation.assumed("sm90"):
+        _, _, own = derived()
     assert config is not None and config == own and op.legal(ba, config, h100), (config, own)
 
 
