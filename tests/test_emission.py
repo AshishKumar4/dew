@@ -711,13 +711,13 @@ def test_an_integer_operation_counts_on_the_integer_units_not_the_fp32_lanes():
         assert (role.fixed.integer_operations, role.fixed.operations) == (128, 0), role.fixed
 
 
-def test_a_steps_mask_of_its_tiles_indices_issues_nothing_and_one_of_its_place_counts():
+def test_a_steps_mask_of_its_tiles_indices_issues_once_and_one_of_its_place_each_step():
     """A walk step's mask of its tile's indices alone (iotas and literals: the recurrence solve's blocks by a
-    floor division and a remainder) issues no integer operation a step, the GPU's compile folding it or
-    computing it once outside the loop (`emission._INVARIANT`, row 4123: the solve's masks priced at 6.1M
-    integer operations a GH200 program against about a thousand integer instructions a thread a trip); a mask
-    of the step's place counts its integer operations each step. Its select of the row's data counts on the
-    fp32 lanes alike."""
+    floor division and a remainder) issues no integer operation a step, the GPU's compile computing it once
+    outside the loop (row 4123: the solve's masks priced at 6.1M integer operations a GH200 program against
+    about a thousand integer instructions a thread a trip), but its operations once in the program (the review
+    of train 1261, F6: priced at nothing); a mask of the step's place, the same operations, counts them each
+    step. Its select of the row's data counts on the fp32 lanes alike."""
     def walk(placed: bool):
         def step(index, row):
             mosaic.step_index(index)
@@ -728,10 +728,11 @@ def test_a_steps_mask_of_its_tiles_indices_issues_nothing_and_one_of_its_place_c
 
     def counted(placed: bool) -> tuple:
         role = _emitted(walk(placed), _ROW, _TRIPS).roles[0]
-        return role.step(lambda work: work.integer_operations), role.step(_operations)
+        return (role.step(lambda work: work.integer_operations), role.step(_operations),
+                role.fixed.integer_operations)
 
-    (indexed, selected), (placed, selected_placed) = counted(placed=False), counted(placed=True)
-    assert indexed == 0 and placed >= 3 * 128, (indexed, placed)
+    (indexed, selected, once), (placed, selected_placed, _) = counted(placed=False), counted(placed=True)
+    assert indexed == 0 and placed >= 3 * 128 and once == placed, (indexed, placed, once)
     assert selected == selected_placed == 128, (selected, selected_placed)
 
 
