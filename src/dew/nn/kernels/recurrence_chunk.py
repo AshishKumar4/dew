@@ -174,34 +174,28 @@ def _erases_laid(hooks: recurrence.Hooks, query, key, value, g, beta, given: dic
     """A call erasing with vectors of its own (`recurrence.Hooks.erase` 'read', 'untied' or 'additive'): an
     additive one (RWKV7's) as it is, one token a token of the algebra's erase along its own vector reading the
     state the token enters (`_delta_forms`' `corrected_by` 'erased', `D h + a (c^T h)^T + beta k v^T`, reader
-    `c = -b`); an untied one (GDN-2's, Comba's) as two tokens of the delta rule's algebra a token, each of one
-    rank-one write corrected along its own vector (`corrected_by` 'after', `D h + beta k (v + c^T D h)^T`):
-    the first the token's decay and its erase, keys `a`, values zero, gate `beta` and reader `c = -b`; the
-    second no decay and its write, keys `k`, values `v`, gate `beta`, no correction; its query on the second,
-    a packed document from its first; a read of its own (`Hooks.erase` 'read') one token a token of the
-    algebra's, its write corrected along its read (`corrected_by` 'after', reader `c = -b`). The erase vectors
-    each key head's over its value heads. `(query, key, value, g, beta, erase, starts, firsts)`, `erase` the
-    additive erase's `(a, c)`, the untied's `(None, c)` laid `[B, 2S, ...]` (its second token's output the
-    call's, `_laid`), the read's `(None, c)`."""
+    `c = -b`); a read one so too, its keys' write corrected along its read (`corrected_by` 'after', `D h +
+    beta k (v + c^T D h)^T`); an untied one (GDN-2's, Comba's) as two such a token: the decay and erase, keys
+    `a`, values zero, gate `beta`, reader `c = -b`, then the write, keys `k`, values `v`, gate `beta`, no
+    decay or correction, its query on the second, a packed document from its first. The erase vectors each key
+    head's over its value heads. `(query, key, value, g, beta, erase, starts, firsts)`, `erase` the additive
+    erase's `(a, c)`, the read's and the untied's `(None, c)`, the untied's laid `[B, 2S, ...]` (`_laid`)."""
     heads = value.shape[2]
-    group = heads // key.shape[2]
-    if hooks.erase == 'read':
-        read = given['erase_read']
-        reader = -jnp.repeat(read, heads // read.shape[2], axis=2).astype(g.dtype)
-        keys = jnp.repeat(key, group, axis=2).astype(g.dtype)
-        return jnp.repeat(query, group, axis=2), keys, value, g, beta, (None, reader), starts, firsts
     a, b = (jnp.repeat(given[name], heads // given[name].shape[2], axis=2).astype(g.dtype)
-            for name in ('erase_key', 'erase_read'))
+            if name in given else None for name in ('erase_key', 'erase_read'))
     if hooks.erase == 'additive':
         return query, key, value, g, beta, (a, -b), starts, firsts
+    group = heads // key.shape[2]
+    keys = jnp.repeat(key, group, axis=2).astype(g.dtype)
+    queries = jnp.repeat(query, group, axis=2)
+    if hooks.erase == 'read':
+        return queries, keys, value, g, beta, (None, -b), starts, firsts
     reader = -b
     zero_keys = jnp.zeros_like(reader)
 
     def laid(first, second):
         return jnp.stack([first, second], axis=2).reshape(first.shape[0], -1, *first.shape[2:])
 
-    keys = jnp.repeat(key, group, axis=2).astype(g.dtype)
-    queries = jnp.repeat(query, group, axis=2)
     return (laid(jnp.zeros_like(queries), queries), laid(a, keys), laid(jnp.zeros_like(value), value),
             laid(g, jnp.zeros_like(g)), laid(beta, beta), (None, laid(reader, zero_keys)),
             None if starts is None else laid(starts, jnp.zeros_like(starts)),
