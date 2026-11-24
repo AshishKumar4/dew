@@ -357,8 +357,9 @@ class NvFp4Block:
     def encoded(cls, codes: jax.Array, scales: jax.Array, scale: jax.Array) -> "NvFp4Block":
         """An operand of E2M1 `codes` one a byte (uint8 codes of `bits.nvfp4_coded`'s rule, as a GEMM
         epilogue stores them: `quantized.nvfp4_epilogue`), its block `scales` and tensor `scale`: each code's
-        value as float4, which XLA packs two a byte (row 12721; packed 4-bit stores of its own, row 12743)."""
-        return cls(_e2m1_values(codes).astype(jnp.float4_e2m1fn), scales, jnp.asarray(scale, jnp.float32))
+        value as float4, which XLA packs two a byte (row 12721; packed 4-bit stores of its own, row 12743);
+        its tensor scale one scalar (`bits.nvfp4_given_scale`)."""
+        return cls(_e2m1_values(codes).astype(jnp.float4_e2m1fn), scales, bits.nvfp4_given_scale(scale))
 
     @classmethod
     def of(cls, matrix: NvFp4) -> "NvFp4Block":

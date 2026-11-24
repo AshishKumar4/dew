@@ -1564,13 +1564,14 @@ def nvfp4_block_finished(lhs: NvFp4Block, matrices: NvFp4Block, group_blocks: ja
     rows quantized from them, `quantized.nvfp4_epilogue`, row 12721), each stored as `out_forms` states
     (`Hooks.out_forms`: an output broadcast across each block's columns stored one value a row a block,
     transposed). `epilogue_operands`, its side tiles (`[rows, columns]` each), the epilogue taking them after
-    the sums; `epilogue_scalars`, fp32 scalars after them (a delayed recipe's next tensor scale), each a
+    the sums; `epilogue_scalars`, fp32 scalars after them (a delayed recipe's next tensor scale, refused
+    unless one scalar as every tensor scale is, `bits.nvfp4_given_scale`), each a
     tile of its value there, carried as a vector over the rows (the launch's side of one value a row: a
     register a thread where a thread holds a row, tcgen05's, where a vector over the columns held a chunk's
     64 and spilled 7108 bytes; witness/b1-probe-3). `dense`: its one group covers every row, which a
     transposed form's stores need (`quantized.forms_refusal`)."""
     tiles = tuple(epilogue_operands)
-    vectors = tuple(jnp.broadcast_to(jnp.asarray(scalar, jnp.float32), lhs.codes.shape[:1])
+    vectors = tuple(jnp.broadcast_to(bits.nvfp4_given_scale(scalar), lhs.codes.shape[:1])
                     for scalar in (lhs.scale, matrices.scale, *epilogue_scalars))
 
     def scaled(acc, *sides):

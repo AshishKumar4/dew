@@ -44,8 +44,9 @@ def test_a_delayed_nvfp4_recipe_chain_is_its_recipe_projections_apart(rows, gate
     """Under a run's NVFP4 recipe with delayed tensor scaling, an MLP's chain (`projections.recipe_chain`, its
     `tensor_scales` the rows' and the hidden activation's) of any rows count, laid in whole 128-row blocks and
     the padding dropped: its value and every gradient bitwise the `recipe_projection` calls apart at the same
-    scales with the activation between them in XLA (row 12721); a delayed chain refuses to run without its
-    scales, and a current-scaled NVFP4 recipe takes no chain (None), which the projections apart take."""
+    scales with the activation between them in XLA (row 12721); a delayed chain given no scales, and a
+    current-scaled NVFP4 recipe's, is no chain (None), which the projections apart take, and the current
+    recipe refuses scales."""
     from dew.nn.precision import DTYPE_PRESETS, NVFP4, LowPrecision, Numerics, projection_role
 
     x, matrices, down, cotangent = _operands(12721 + rows, rows, gated)
@@ -71,12 +72,47 @@ def test_a_delayed_nvfp4_recipe_chain_is_its_recipe_projections_apart(rows, gate
     with generation.run_precision(delayed), projection_role("mlp"):
         fused = jax.jit(with_gradients(chained))(x, *matrices, down, cotangent)
         separate = jax.jit(with_gradients(apart))(x, *matrices, down, cotangent)
-        with pytest.raises(ValueError):
-            projections.recipe_chain(x, matrices[-1], down, activation, out_dtype=jnp.bfloat16)
+        assert projections.recipe_chain(x, matrices[-1], down, activation, out_dtype=jnp.bfloat16) is None
     names = ("value", "d_x", *(f"d_{name}" for name in ("gate", "up")[2 - len(matrices):]), "d_down")
     assert_bitwise_leaves(names, fused, separate)
     with generation.run_precision(NVFP4), projection_role("mlp"):
         assert projections.recipe_chain(x, matrices[-1], down, activation, out_dtype=jnp.bfloat16) is None
+        with pytest.raises(ValueError):
+            projections.recipe_chain(x, matrices[-1], down, activation, out_dtype=jnp.bfloat16,
+                                     tensor_scales=scales)
+
+
+def test_a_delayed_nvfp4_chain_of_no_rows_or_a_scale_an_array_is_no_chain():
+    """A delayed NVFP4 recipe's chain of no rows is none (`recipe_chain` None: its projections apart each lay
+    one zero block, their output no rows and every matrix's gradient zero), and its direct call
+    (`nvfp4_chain`) refuses no rows; a tensor scale of more than one value, the rows' or the hidden
+    activation's, is refused before any product (row 12721)."""
+    from dew.nn.precision import DTYPE_PRESETS, LowPrecision, Numerics, projection_role
+
+    x, (up,), down, _ = _operands(12740, 128, False)
+    scales = _scales(x)
+    empty = x[:0]
+    delayed = Numerics(DTYPE_PRESETS["bf16-mixed"],
+                       low_precision=LowPrecision(recipe="nvfp4", tensor_scaling="delayed"))
+
+    def apart(x, up, down):
+        hidden = jax.nn.gelu(projections.recipe_projection(x, up, out_dtype=jnp.bfloat16,
+                                                           tensor_scale=scales[0]))
+        return projections.recipe_projection(hidden.astype(jnp.bfloat16), down, out_dtype=jnp.bfloat16,
+                                             tensor_scale=scales[1])
+
+    with generation.run_precision(delayed), projection_role("mlp"):
+        assert projections.recipe_chain(empty, up, down, jax.nn.gelu, out_dtype=jnp.bfloat16,
+                                        tensor_scales=scales) is None
+        out, *grads = jax.jit(with_gradients(apart))(empty, up, down, jnp.zeros((0, 256), jnp.bfloat16))
+    assert out.shape == (0, 256)
+    for grad in grads[1:]:
+        assert not np.any(np.asarray(grad, np.float32))
+    rows = jnp.full((128,), scales[1])
+    for refused in ((empty, scales), (x, (scales[0], rows)), (x, (rows, scales[1]))):
+        with pytest.raises(ValueError):
+            projections.nvfp4_chain(refused[0], up[None], down[None], jax.nn.gelu, out_dtype=jnp.bfloat16,
+                                    tensor_scales=refused[1])
 
 
 @INTERPRETS

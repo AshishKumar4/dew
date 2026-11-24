@@ -166,21 +166,25 @@ def recipe_chain(rows: jax.Array, up: jax.Array, down: jax.Array, activation: Ca
     as `_projected_apart`). With `gate` (`up`'s shape), a gated MLP's: `activation(gate_rows, up_rows)`, the
     up projection's epilogue taking it (row 12689). `tensor_scales`, the rows' and the hidden activation's
     NVFP4 tensor scales under the run's delayed scaling (`delayed_tensor_scale` of the run's histories), as
-    `recipe_projection`'s `tensor_scale`: required there, refused under every other recipe. None elsewhere:
-    the run's recipe another's (MXFP8's, current NVFP4's: an activation's own tensor scale is known only once
-    the activation is) or none, or a projection its role keeps, which the `recipe_projection` calls then
-    take apart. Each product's route is its selector's (`BLOCKWISE_FP8`, `NVFP4_BLOCK_OP`)."""
+    `recipe_projection`'s `tensor_scale`: the chain's there, refused under every other recipe. None
+    elsewhere: the run's recipe another's (MXFP8's, current NVFP4's: an activation's own tensor scale is known
+    only once the activation is) or none, a delayed recipe's chain given no scales, no rows (each projection
+    apart lays one zero block), or a projection its role keeps, which the `recipe_projection` calls then take
+    apart. Each product's route is its selector's (`BLOCKWISE_FP8`, `NVFP4_BLOCK_OP`)."""
     from dew.nn.precision import recipe_role
 
     held = recipe_role()
-    if (held is None or up.ndim != 2 or down.ndim != 2 or recipe_refusal(*up.shape) is not None
-            or recipe_refusal(*down.shape) is not None or (gate is not None and gate.shape != up.shape)):
+    if (held is None or rows.shape[0] == 0 or up.ndim != 2 or down.ndim != 2
+            or recipe_refusal(*up.shape) is not None or recipe_refusal(*down.shape) is not None
+            or (gate is not None and gate.shape != up.shape)):
         return None
     recipe = held[0]
-    if (recipe.tensor_scaling == "delayed") != (tensor_scales is not None):
-        raise ValueError("a delayed-scaling NVFP4 recipe's chain takes its rows' and its hidden activation's "
-                         "tensor scales, and only it does (`LowPrecision.tensor_scaling`)")
-    # A current-scaled NVFP4 recipe's hidden activation's tensor scale is its own, known once it is whole.
+    if tensor_scales is not None and recipe.tensor_scaling != "delayed":
+        raise ValueError("a chain's tensor scales are a delayed-scaling NVFP4 recipe's alone "
+                         "(`LowPrecision.tensor_scaling`)")
+    # A current-scaled NVFP4 recipe's hidden activation's tensor scale is its own, known once it is whole;
+    # a delayed one's chain without its scales a caller's probe its projections apart then take, each
+    # given its own.
     chained = recipe.recipe
     if chained not in _CHAINS or (chained == "nvfp4" and tensor_scales is None):
         return None
@@ -416,12 +420,12 @@ def nvfp4_chain(x: jax.Array, w_up: jax.Array, w_down: jax.Array, activation, *,
 
 
 def _one_group(x, w_up, w_down, gate) -> None:
-    """Refuse a chain (`blockwise_chain`, `nvfp4_chain`) of more than one group or of rows of no whole
-    128-row blocks (its next rows' scales stored transposed, each share's rows whole), or a gate not its up
-    projection's shape."""
-    if w_up.shape[0] != 1 or w_down.shape[0] != 1 or x.shape[0] % SCALE_DEPTH:
-        raise ValueError("a recipe chain is one group's of whole 128-row blocks: its rows' quantized "
-                         "scales are stored transposed, each share's rows whole")
+    """Refuse a chain (`blockwise_chain`, `nvfp4_chain`) of more than one group, of no rows or of rows of no
+    whole 128-row blocks (its next rows' scales stored transposed, each share's rows whole; an empty tile
+    holds no block to quantize), or a gate not its up projection's shape."""
+    if w_up.shape[0] != 1 or w_down.shape[0] != 1 or x.shape[0] == 0 or x.shape[0] % SCALE_DEPTH:
+        raise ValueError("a recipe chain is one group's of one or more whole 128-row blocks: its rows' "
+                         "quantized scales are stored transposed, each share's rows whole")
     if gate is not None and gate.shape != w_up.shape:
         raise ValueError(f"a gated chain's gate is its up projection's shape {w_up.shape}, not {gate.shape}")
 
@@ -433,7 +437,10 @@ def _chained(recipe: str, x, w_up, w_down, activation, *, out_dtype, gate, live:
     NVFP4 chain's `tensor_scales` its operands, no gradient through them; a blockwise FP8 chain's none."""
     group_blocks = jnp.full((1,), x.shape[0] // SCALE_DEPTH, jnp.int32)
     w_ins = (w_up,) if gate is None else (gate, w_up)
-    scales = tuple(jnp.asarray(scale, jnp.float32) for scale in tensor_scales or ())
+    from dew.algebra import bits
+
+    # Each scale one scalar, refused before it reaches a product (`bits.nvfp4_given_scale`).
+    scales = tuple(bits.nvfp4_given_scale(scale) for scale in tensor_scales or ())
     return _recipe_chain(recipe, x, w_ins, w_down, group_blocks, scales, activation, jnp.dtype(out_dtype),
                          interpret, live)
 
