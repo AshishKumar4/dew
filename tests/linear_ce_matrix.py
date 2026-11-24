@@ -23,7 +23,6 @@ from jax.sharding import Mesh
 from kernel_matrix import AXES
 from reference_error import assert_as_exact
 
-from dew.nn import categorical
 from dew.nn.kernels import generation, selection
 from dew.nn.protocols import OutputTable
 from dew.objectives.lm import chunked
@@ -40,14 +39,16 @@ KERNELS = {"linear_ce": frozenset({"mosaic"})}
 
 def _operands(case: dict[str, str], seed: int) -> tuple:
     """`case`'s hidden states and vocabulary-major head in bfloat16, its targets, its head's bias (None for
-    `none`) and the loss's cotangent: host NumPy arrays, so a GPU tier's prepare computes on no device."""
+    `none`), the losses' cotangent and the log partitions' (a z-loss's: zero on every other row, which read
+    their loss alone): host NumPy arrays, so a GPU tier's prepare computes on no device."""
     rng = np.random.default_rng(12457 + seed)
     hidden = (rng.standard_normal((ROWS, DEPTH)) / np.sqrt(DEPTH)).astype(jnp.bfloat16)
     head = (rng.standard_normal((VOCAB, DEPTH)) / np.sqrt(DEPTH)).astype(jnp.bfloat16)
     targets = rng.integers(0, VOCAB, size=(ROWS,)).astype(np.int32)
     bias = (rng.standard_normal((VOCAB,)) * 0.25).astype(np.float32) if case["bias"] == "bias" else None
     cotangent = rng.standard_normal((ROWS,)).astype(np.float32)
-    return hidden, head, targets, bias, cotangent
+    partition = (rng.standard_normal((ROWS,)) * (np.arange(ROWS) % 2 == 0)).astype(np.float32)
+    return hidden, head, targets, bias, cotangent, partition
 
 
 def _loss(hidden, head, targets, bias):
@@ -65,7 +66,7 @@ def supported(case: dict[str, str]) -> bool:
     def spec(array):
         return None if array is None else jax.ShapeDtypeStruct(array.shape, array.dtype)
 
-    hidden, head, targets, bias, _ = map(spec, _operands(case, 0))
+    hidden, head, targets, bias, *_ = map(spec, _operands(case, 0))
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), case["generation"])
     with (generation.assumed(case["generation"]), jax.sharding.use_abstract_mesh(mesh),
           generation.chosen(linear_ce="mosaic"), generation.routes() as routes):
@@ -87,18 +88,19 @@ CASES = (
 
 
 def _step(kernel: str):
-    """The loss's step as `run(hidden, head, targets, bias, cotangent)`: its losses, log partitions and the
-    gradients of the losses against `cotangent`, `linear_ce` named `kernel`."""
-    def run(hidden, head, targets, bias, cotangent):
+    """The loss's step as `run(hidden, head, targets, bias, cotangent, partition)`: its losses, log
+    partitions and their gradients against `cotangent` and `partition`, `linear_ce` named `kernel`."""
+    def run(hidden, head, targets, bias, cotangent, partition):
         with generation.chosen(linear_ce=kernel):
             (loss, log_z), pull = jax.vjp(lambda a, b, c: _loss(a, b, targets, c), hidden, head, bias)
-            return loss, log_z, pull((cotangent, jnp.zeros_like(cotangent)))
+            return loss, log_z, pull((cotangent, partition))
     return run
 
 
 def dense_truth(hidden, head, targets, bias):
-    """The loss of the dense logits in float64 with its normalizer's terms: the losses, the log partitions,
-    each row's largest logit, its exponentials' sum scaled to it, and that sum without the target's."""
+    """The loss of the dense logits in float64 with its normalizer's terms: the losses (each row's log
+    partition less its target's logit, written out apart from Dew's own loss), the log partitions, each
+    row's largest logit, its exponentials' sum scaled to it, and that sum without the target's."""
     logits = jax.lax.dot_general(hidden.astype(jnp.float64), head.astype(jnp.float64),
                                  (((1,), (1,)), ((), ())), preferred_element_type=jnp.float64)
     if bias is not None:
@@ -108,29 +110,35 @@ def dense_truth(hidden, head, targets, bias):
     mass = jnp.sum(exp_z, axis=1)
     hit = jnp.arange(logits.shape[1], dtype=jnp.int32)[None, :] == targets[:, None]
     rest = jnp.sum(jnp.where(hit, jnp.float64(0.0), exp_z), axis=1)
-    return categorical.cross_entropy(logits, targets), peak + jnp.log(mass), peak, mass, rest
+    log_z = peak + jnp.log(mass)
+    picked = jnp.take_along_axis(logits, targets[:, None].astype(jnp.int32), axis=1)[:, 0]
+    return log_z - picked, log_z, peak, mass, rest
 
 
-def _truth(hidden, head, targets, bias, cotangent):
+def _truth(hidden, head, targets, bias, cotangent, partition):
     """`_step`'s outputs from `dense_truth`, in float64."""
     wide = (None if bias is None else jnp.asarray(bias, jnp.float64))
     (loss, log_z), pull = jax.vjp(lambda a, b, c: dense_truth(a, b, targets, c)[:2],
                                   jnp.asarray(hidden, jnp.float64), jnp.asarray(head, jnp.float64), wide)
-    cotangent = jnp.asarray(cotangent, jnp.float64)
-    return loss, log_z, pull((cotangent, jnp.zeros_like(cotangent)))
+    return loss, log_z, pull((jnp.asarray(cotangent, jnp.float64), jnp.asarray(partition, jnp.float64)))
 
 
 @cell("linear_ce", covers=lambda case: dict(zip(AXES["linear_ce"], case, strict=True)))
 @pytest.mark.parametrize("case", [pytest.param(case, marks=pinned(case[0])) for case in CASES], ids="-".join)
 def a_linear_ce_loss_is_on_par(case: tuple[str, ...]) -> None:
     """The LM loss of `case` on its GPU through the template's fused linear cross-entropy, its losses, log
-    partitions and gradients on par with the chunked XLA program's (check 1), from the float64 loss of the
-    dense logits. The routes it records run `linear_ce` `mosaic` and every other choice at XLA."""
+    partitions and gradients (a z-loss's cotangent on every other row) on par with the chunked XLA
+    program's (check 1), from the float64 loss of the dense logits. Each arm's routes, read apart as it
+    traces, run `linear_ce` as it names it, the template's arm `mosaic` and the reference's `xla`, and
+    every other choice at XLA."""
     combination = dict(zip(AXES["linear_ce"], case, strict=True))
     draw = functools.partial(_operands, combination)
-    with generation.routes() as routes:
-        assert_as_exact(jax.jit(_step("mosaic")), jax.jit(_step("xla")), draw, "-".join(case), seeds=SEEDS,
-                        truth_fn=_truth)
-    recorded = {(found.choice, found.kernel) for found in routes}
-    unnamed = sorted(pair for pair in recorded if pair[0] not in CHOICES and pair[1] != "xla")
-    assert ("linear_ce", "mosaic") in recorded and not unnamed, (sorted(recorded), unnamed)
+    for kernel in ("mosaic", "xla"):
+        with generation.routes() as routes:
+            jax.eval_shape(_step(kernel), *draw(0))
+        recorded = {(found.choice, found.kernel) for found in routes}
+        ce = {found for choice, found in recorded if choice == "linear_ce"}
+        unnamed = sorted(pair for pair in recorded if pair[0] not in CHOICES and pair[1] != "xla")
+        assert ce == {kernel} and not unnamed, (kernel, sorted(recorded), unnamed)
+    assert_as_exact(jax.jit(_step("mosaic")), jax.jit(_step("xla")), draw, "-".join(case), seeds=SEEDS,
+                    truth_fn=_truth)

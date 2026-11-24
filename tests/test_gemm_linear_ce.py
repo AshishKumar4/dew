@@ -82,8 +82,9 @@ def test_chunked_linear_ce_mosaic_arm_holds_check_1_value_vjp_and_normalizer(
 
 def test_chunked_linear_ce_non_gated_cases_take_existing_path_untouched():
     """Cases outside `MOSAIC_LINEAR_CE`'s gate (`predict=True`, `excluded`, `temperature!=1`, scaled
-    columns, `softcap`, fp32 head, or unselected default) take `chunked._forward`'s existing XLA path
-    untouched and stay bit-equal to `linear_ce='xla'` (row 12136)."""
+    columns, `softcap`, or unselected default) take `chunked._forward`'s existing XLA path untouched and
+    stay bit-equal to `linear_ce='xla'`; an fp32 head, a dtype the kernel takes none of, does so unpinned and
+    refuses a `linear_ce='mosaic'` pin (rows 12136, 12457)."""
     rng = np.random.default_rng(12136)
     x = jnp.asarray(rng.standard_normal((64, 64)) / 8.0, jnp.bfloat16)
     w = jnp.asarray(rng.standard_normal((128, 64)) / 8.0, jnp.bfloat16)
@@ -100,8 +101,6 @@ def test_chunked_linear_ce_non_gated_cases_take_existing_path_untouched():
          {"predict": False}),
         ("softcap", x, OutputTable(w, vocab_major=True, softcap=20.0, precision=chunked.BF16),
          {"predict": False}),
-        ("fp32", x.astype(jnp.float32), OutputTable(w.astype(jnp.float32), vocab_major=True),
-         {"predict": False}),
     ]
     for name, hidden, head, kwargs in cases:
         with generation.assumed("sm90"), generation.chosen(linear_ce="xla"):
@@ -114,6 +113,18 @@ def test_chunked_linear_ce_non_gated_cases_take_existing_path_untouched():
         assert not any(r.kernel == "mosaic" for r in seen), (name, seen)
         np.testing.assert_array_equal(np.asarray(got_loss), np.asarray(ref_loss))
         np.testing.assert_array_equal(np.asarray(got_log_z), np.asarray(ref_log_z))
+    wide, wide_head = x.astype(jnp.float32), OutputTable(w.astype(jnp.float32), vocab_major=True)
+    with generation.assumed("sm90"), generation.chosen(linear_ce="mosaic"), pytest.raises(
+            selection.KernelRefused):
+        chunked.chunked_cross_entropy(wide, wide_head, t, chunks=2, tile=(64, 64), predict=False)
+    with generation.assumed("sm90"), generation.chosen(linear_ce="xla"):
+        ref_wide, _, _ = chunked.chunked_cross_entropy(wide, wide_head, t, chunks=2, tile=(64, 64),
+                                                       predict=False)
+    with generation.assumed("sm90"), generation.routes() as seen:
+        got_wide, _, _ = chunked.chunked_cross_entropy(wide, wide_head, t, chunks=2, tile=(64, 64),
+                                                       predict=False)
+    assert not any(r.kernel == "mosaic" for r in seen), seen
+    np.testing.assert_array_equal(np.asarray(got_wide), np.asarray(ref_wide))
     # Default unselected mode also stays on XLA untouched.
     with generation.assumed("sm90"), generation.routes() as seen:
         got_def, _, _ = chunked.chunked_cross_entropy(x, OutputTable(w, vocab_major=True), t,

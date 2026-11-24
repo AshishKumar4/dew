@@ -158,13 +158,11 @@ def native_hopper_cluster2_balanced_tail_holds_check_1():
 
 def _syrk_and_tail_cells():
     return [
-        *(Cell(f"native Mosaic SYRK holds check 1: {name} poly={form == 'polynomial'} "
-               f"tr={form == 'gram-transposed'}",
-               functools.partial(syrk_matrix.a_symmetric_product_is_on_par, (name, form)), name,
-               fault="native SYRK upper-triangle mirror store (row 11941)" if form == "gram" else None,
-               native={"launch": "syrk", "poly": str(form == "polynomial"),
-                       "transpose": str(form == "gram-transposed")})
-          for name, form in syrk_matrix.CASES),
+        # The family's cells as its own grid states them, each pinned to its GPU (`gpu_flow.cells_of`).
+        *cells_of(syrk_matrix.a_symmetric_product_is_on_par,
+                  native=lambda case: {"launch": "syrk", "form": case[1]},
+                  fault=lambda case: ("native SYRK upper-triangle mirror store (row 11941)"
+                                      if case[1] == "gram" else None)),
         Cell("native Hopper cluster=2 balanced tail holds check 1",
              native_hopper_cluster2_balanced_tail_holds_check_1, "sm90", fault=BALANCED_TAIL,
              native={"launch": "cluster2 tail", "pass": "forward"}),

@@ -45,15 +45,19 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     source's `packed_experts` as `packed_weights` (`earlier_packed_experts`, row 8550); and wherever it holds
     a run or trainer, a trainer's retired `export_model` taken off and a looped decoder's
     `loop_message_additive` true read as unset where it could not be unset (`earlier_retired`, rows 11636,
-    11742); its model's attention kernel as the run's (`earlier_attention_kernel`, row 11938); and every
+    11742); its model's attention kernel as the run's (`earlier_attention_kernel`, row 11938); a pin of the
+    grouped products' kernel written before fused linear CE and SYRK took choices of their own as theirs too
+    (`earlier_grouped_pins`, row 12457); and every
     field a class lost since, its model's, its source options' and any class record's, left out
     (`earlier_removed`, `dew._records.REMOVED_FIELDS`).
     A configuration written today that names the earlier knobs is refused by name, as any field its class
     does not declare. A record in today's shapes passes as it is. Carried to 1.0, when it is deleted
     (ledger 1552)."""
-    unsettable, additive = (record.get(key) is True for key in (LAYOUT_UNSETTABLE, ADDITIVE_UNSETTABLE))
+    unsettable, additive, split = (record.get(key) is True
+                                   for key in (LAYOUT_UNSETTABLE, ADDITIVE_UNSETTABLE, KERNELS_SPLIT))
     moved = earlier_removed(earlier_attention_kernel(earlier_layer_scan(_records.moved_record(
         {key: value for key, value in record.items() if key not in MARKERS}))))
+    moved = moved if split else earlier_grouped_pins(moved)
     earlier = earlier_none_of_the_above(earlier_profile(earlier_trainer(
         moved if unsettable else earlier_trainer_layout(moved))))
     earlier = earlier_option_text(earlier_dynamics_positions(earlier_tokenizer_positions(earlier)))
@@ -95,6 +99,26 @@ def earlier_layer_scan(record: Mapping[str, object]) -> Mapping[str, object]:
     scanned = any(decoder.get("scan_layers") is True for part in (fields.get("model"), fields.get("source"))
                   if isinstance(part, Mapping) for decoder in saved_decoders(part))
     return chosen_kernel(record, "layer_scan", "scanned") if scanned else record
+
+
+def earlier_grouped_pins(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A saved run's record written before fused linear cross-entropy and Muon's symmetric products took
+    kernel choices of their own (`linear_ce`, `syrk`, row 12457; no `KERNELS_SPLIT` beside its fields),
+    whose `grouped_matmul` pin of `mosaic` or `xla` chose their kernels too: that pin theirs as well, where
+    the run named none of its own for them, so a resumed run computes its loss and its Muon steps as it
+    trained. A pin of another of the grouped products' kernels named none of theirs. Carried to 1.0
+    (ledger 1552)."""
+    fields = record.get("fields")
+    if not isinstance(fields, Mapping):
+        return record
+    diagnostics = fields.get("diagnostics")
+    named = _records.class_record(diagnostics) if isinstance(diagnostics, Mapping) else None
+    pins = named[1] if named is not None else diagnostics if isinstance(diagnostics, Mapping) else fields
+    kernels = pins.get("kernels")
+    pinned = kernels.get("grouped_matmul") if isinstance(kernels, Mapping) else None
+    if pinned not in ("mosaic", "xla"):
+        return record
+    return chosen_kernel(chosen_kernel(record, "linear_ce", pinned), "syrk", pinned)
 
 
 def chosen_kernel(record: Mapping[str, object], choice: str, kernel: str) -> Mapping[str, object]:
@@ -157,7 +181,13 @@ ADDITIVE_UNSETTABLE = "additive_unsettable"
 this Dew does, unset as null: a record written while it could not be unset (true its default) lacks it and
 reads its true as unset (`earlier_retired`), where one written since keeps a stated true (row 11742)."""
 
-MARKERS = (LAYOUT_UNSETTABLE, ADDITIVE_UNSETTABLE)
+KERNELS_SPLIT = "kernels_split"
+"""The key beside a run record's fields (`RunConfig.record`) that says its kernel pins name fused linear
+cross-entropy's and Muon's symmetric products' own choices (`linear_ce`, `syrk`): a record written before
+they had them lacks it, and its `grouped_matmul` pin reads as theirs too (`earlier_grouped_pins`), where
+one written since keeps them apart (row 12457)."""
+
+MARKERS = (LAYOUT_UNSETTABLE, ADDITIVE_UNSETTABLE, KERNELS_SPLIT)
 """Every key a run record holds beside its fields, each saying how it states a field (`RunConfig.record`)."""
 
 

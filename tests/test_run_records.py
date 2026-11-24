@@ -167,6 +167,25 @@ def test_a_run_saved_pinning_a_wrapped_decoders_execution_resumes_so(wrapper, fi
     plain = saved({"vocab_size": 16})
     assert read(plain) == plain
 
+@pytest.mark.parametrize("pinned", ["mosaic", "xla"])
+def test_a_run_saved_before_linear_ce_and_syrk_had_choices_keeps_its_grouped_pin_on_them(pinned):
+    """A run saved while fused linear CE and Muon's SYRK selected under the grouped products' choice (before
+    row 12457) whose `grouped_matmul` pin named `mosaic` or `xla` reads with that pin on `linear_ce` and
+    `syrk` too, as it trained; a pin it named for them stands, and a pin of another grouped kernel
+    (`cutlass`), which named none of theirs, adds none."""
+    from dew.config.earlier import earlier_grouped_pins
+
+    def saved(**kernels) -> dict:
+        return {"class": "dew.config:RunConfig", "fields": {"kernels": kernels}}
+
+    assert earlier_grouped_pins(saved(grouped_matmul=pinned))["fields"]["kernels"] == {
+        "grouped_matmul": pinned, "linear_ce": pinned, "syrk": pinned}
+    own = saved(grouped_matmul=pinned, linear_ce="xla")
+    assert earlier_grouped_pins(own)["fields"]["kernels"]["linear_ce"] == "xla"
+    other = saved(grouped_matmul="cutlass")
+    assert earlier_grouped_pins(other) == other
+
+
 LAYOUT = ROOT / "tests" / "fixtures" / "runs" / "hybrid-dit-176m" / "layout.json"
 
 
