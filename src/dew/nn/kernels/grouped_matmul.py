@@ -31,7 +31,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Any, ClassVar, Protocol
+from typing import TYPE_CHECKING, ClassVar, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -1284,7 +1284,7 @@ class MosaicGmm(_Mosaic):
                  scatter, joined=None, beside: tuple = (), chained: tuple = (), *, out_dtype: str,
                  trans_rhs: bool,
                  interpret: bool, hooks: Hooks, exact_sums: bool, dense: bool, config: tiling.Tiles,
-                 formats: dict) -> tuple[Any, Any]:
+                 formats: dict):
         """`_fwd`'s one forward, every product launch's: the call as the launch runs it, its depth and width
         padded to whole tiles (`_aligned`), its outputs sliced back; `formats` the format operands a
         subclass's binding takes (`MosaicStepScaledGmm`'s step scales, `MosaicMxGmm`'s block scales), passed
