@@ -156,7 +156,8 @@ def _token(parts: linear_scan.Coupled, token: tuple) -> tuple:
         if np.size(value) != 1:
             raise Refused("a pair's decays and its second state's weight are scalars a token, not a key's "
                           "own")
-        return jnp.reshape(value, ())
+        # A scalar as it is: reshaped, its declared interval no longer bounds its exponential (`_bounded`).
+        return value if jnp.ndim(value) == 0 else jnp.reshape(value, ())
 
     keys, values = shape
     reader = parts.reader_scale * along(parts.reader, keys)
