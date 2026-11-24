@@ -357,9 +357,16 @@ def compile_site(store: CompiledTruths, dew_fn, reference_fn, draw, label: str, 
         terms_fn, also = _site(dew_fn, reference_fn, label, seeds=seeds, truth_fn=truth_fn, library_fn=None,
                                library_row=None, library_leaves=(), also=also, terms=terms)
         truth = truth_fn if truth_fn is not None else reference_fn
-        shaped = {}
+        # Each draw keyed by its own shapes first, and one draw of each widened to name its truth's program:
+        # widening is its draw's shapes' alone, so the programs are the ones every draw widened would name,
+        # each the first draw of its shapes', with no float64 copy of every staged draw made (row 12431: a
+        # Gemma vocabulary's 1,280 draws of a 64 MiB head, each widened for one program).
+        drawn = {}
         for seed in range(staged_units(seeds)):
             inputs = drawn_on_the_host(draw, seed)
+            drawn.setdefault(named("truth", inputs), inputs)
+        shaped = {}
+        for inputs in drawn.values():
             shaped.setdefault(named("truth", widened(inputs)), inputs)
 
         # The algebra's switch and the kernels' report read where a site prepares, never at load: a test of
