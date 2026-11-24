@@ -28,7 +28,7 @@ from model_support import (
     unrolled as layer_at_a_time,
     with_logit_cotangent,
 )
-from reference_error import assert_as_exact, dew_path, with_gradients
+from reference_error import as_given, assert_as_exact, dew_path, with_gradients
 
 from dew.batch import leaves_by_path
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -1107,8 +1107,8 @@ def test_a_count_of_passes_given_per_call_weighs_the_passes_that_ran():
 
 
 def _collectives_in_loop(text: str, trips: int) -> collections.Counter:
-    """The FSDP collectives (`all-gather`, `reduce-scatter`, their async starts) in a compiled program's
-    `while` loops of `trips` known trips, their bodies and every computation they call, from its HLO
+    """The collectives (`all-gather`, `reduce-scatter`, `all-reduce`, their async starts) in a compiled
+    program's `while` loops of `trips` known trips, their bodies and every computation they call, from its HLO
     `text`."""
     computations, current = {}, None
     for line in text.splitlines():
@@ -1129,7 +1129,8 @@ def _collectives_in_loop(text: str, trips: int) -> collections.Counter:
             pending.extend(called for line in computations[name]
                            for called in re.findall(r"%([\w.\-]+)", line) if called in computations)
     return collections.Counter(op for name in seen for line in computations[name]
-                               for op in re.findall(r"\b(all-gather|reduce-scatter)(?:-start)?\(", line))
+                               for op in re.findall(r"\b(all-gather|reduce-scatter|all-reduce)(?:-start)?\(",
+                                                    line))
 
 
 def _gathered_case(*, gathered: bool, remat: bool):
@@ -1138,7 +1139,9 @@ def _gathered_case(*, gathered: bool, remat: bool):
     its tokens and the cotangent."""
     from dew.nn.backbones.decoder_block import REMAT_POLICIES
 
-    model = tiny(num_layers=4, loop=Loop(4, layers=(1, 3), remat=remat, gathered=gathered),
+    # No step norm: a pass reads its block's parameters alone (the decoder's norm, read between passes,
+    # keeps its placement).
+    model = tiny(num_layers=4, loop=Loop(4, layers=(1, 3), remat=remat, gathered=gathered, step_norm=False),
                  **({"remat": REMAT_POLICIES["full"]} if remat else {}))
     return model, with_gradients(lambda variables, ids: model.apply(variables, ids))
 
@@ -1148,8 +1151,8 @@ def _gathered_case(*, gathered: bool, remat: bool):
 def test_a_gathered_loop_reads_its_block_gathered_once(remat):
     """A looped block whose parameters fully sharded data parallelism splits, with `Loop.gathered`, reads
     them gathered once before its passes: its training step's pass loop (the `while` of its three later
-    passes), its body and all it calls, holds no all-gather or reduce-scatter over the FSDP axis, where the
-    same step without it gathers and reduce-scatters there each pass, each pass and layer recomputed or not
+    passes), its body and all it calls, holds no collective, where the same step without it gathers there
+    each pass, each pass and layer recomputed or not
     (row 12722: the gather is not sunk back into a checkpointed body). Every leaf split eight ways
     (`Layout(min_shard=1)`)."""
     from dew.distributed.placement import Layout
@@ -1168,8 +1171,7 @@ def test_a_gathered_loop_reads_its_block_gathered_once(remat):
         with jax.set_mesh(mesh), nn.logical_axis_rules(DEFAULT_RULES), placing(layout):
             text = jax.jit(gradient).lower(variables, ids, cotangent).compile().as_text()
         found[gathered] = _collectives_in_loop(text, 3)
-    assert found[False]["all-gather"] and found[False]["reduce-scatter"], found
-    assert not found[True], found
+    assert found[False]["all-gather"] and not found[True], found
 
 
 @pytest.mark.mesh(devices=8)
@@ -1195,7 +1197,9 @@ def test_a_gathered_loop_trains_the_same_model():
             logits, gradients = pulled(tree, cotangent)
             return {'logits': logits, 'gradients': gradients}
 
+        @as_given
         def ran(tree, ids, cotangent):
+            # Run as given (`as_given`): placed on the mesh and traced under its layout outside any jit.
             if not placed:
                 return jax.jit(run)(tree, ids, cotangent)
             tree = jax.device_put(tree, layout.shardings(mesh, tree))
