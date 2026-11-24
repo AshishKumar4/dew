@@ -22,7 +22,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Convolution repairs above their owner. [5665]
 - The attention forward's derivation ranking does not predict its time on most cells measured. [6216]
 - Log-linear attention 6.6x fla's forward on a GH200. [10525]
-- The recurrence suite's wall: every case within CI's group target. [12088, 12429]
+- The recurrence suite's wall: every case within CI's group target. [12429]
 - Attention tests to the bible's §6 and §7 test rules. [12432]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
@@ -57,13 +57,15 @@ This page is generated from the maintainers' findings ledger as each change land
 ## Models and interop
 
 - Every recurrence transition and state family. [1300, 1448, 1450, 1451, 1452, 1454, 1455, 1457, 1458, 1459, 1460, 1646]
-- The suite's wall. [5478, 12431, 12433, 12644]
+- The suite's wall. [5478, 12431, 12433, 12644, 12744]
 - Owner-approved Audit 4 API cleanup. [11937]
+- Owner ruling 2026-11-24: general opt-in looped-model optimization in dew.nn.backbones.looping + sharding to gather a looped block's FSDP-sharded weights once…. [12722]
 - The remaining releases' media towers. [851, 879]
 - Formats read and written. [871, 2548]
 - Looped residuals: InfiLoop on Dory. [1314]
 - Stacks, scans and looped models. [1568]
 - Every nn and interop primitive, seam, contract and derivative has one owner. [5625]
+- H-Net Cartesia presets and checkpoint interop. [12390]
 
 ## Training and parallelism
 
@@ -93,6 +95,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Dory: the release qualified and its tests' oracles. [596]
 - Serving and RL measured where users run them. [5315, 5321]
 - A served rollout's or episode cohort's server pages its cache wherever pages serve the policy as it draws (serving.served_layout, theme 15), at every prompt…. [7420]
+- H-Net general composable recursive dynamic-chunking architecture. [12389]
 
 ## Algebra
 

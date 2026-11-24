@@ -1696,12 +1696,18 @@ def climbed(monkeypatch, target: str, fields: dict, batch: dict, room_of, reques
 
     room = room_of(need)
     def fits(moves: int) -> bool:
-        # The place's own step compiled in the room, its first compile the judge: where it misses, the
-        # search past it may find nothing more at a remat the run now states (`PlanRefused`).
-        try:
-            return planned(moves, room).plan["probes"][0]["fits"]
-        except PlanRefused as refused:
-            return refused.probes[0].fits
+        # The place's own step compiled in the room, its first compile's headroom the judge, a number read
+        # off its compile, not the admission under test: where it misses, the search past it may find nothing
+        # more at a remat the run now states (`PlanRefused`). Its rung recorded apart, so no search after it
+        # reads the rung it settles (`rung_records`).
+        with pytest.MonkeyPatch.context() as apart:
+            apart.setenv("DEW_RUNG_RECORDS", str(request.getfixturevalue("tmp_path_factory").mktemp("rungs")))
+            try:
+                headroom = planned(moves, room).plan["probes"][0]["headroom"]
+            except PlanRefused as refused:
+                headroom = refused.probes[0].headroom
+        assert headroom is not None, "the census's compiles state their memory"
+        return headroom >= 0
 
     if request.node.get_closest_marker("shards") is None:
         # Each place's fit compiled where it is asked, once (no place past the one sought is compiled).
@@ -1716,23 +1722,29 @@ def climbed(monkeypatch, target: str, fields: dict, batch: dict, room_of, reques
     # The remat rungs past the start's at the run's own head, in order: what a tight start asks next.
     preferred = [moves for moves, place in enumerate(places)
                  if moves and place[0] is None and place[2] != places[0][2]]
-    settled = next((at for at, moves in enumerate(preferred) if fitted(moves)), None)
-    recomputing = None if settled is None else places[preferred[settled]]
-    # What a tight start asks, a probe a place at its fixed split: its own rung, then each remat rung at its
-    # own head and options up to the first that fits.
-    asks = None if settled is None else [places[0], *(places[moves] for moves in preferred[:settled + 1])]
-    lightest = None if recomputing is not None else next(
-        (place for moves, place in enumerate(places) if fitted(moves)), None)
-    # Unsharded runs walk `fits(0)` in this process, which records the settled rung; start the climb cold.
+    # The needs above record the rungs they settle in this process; start the climb cold.
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "cold"))
     trainer = planned(0, room)
     probes = [(probe["head_tile"], probe["head_fused"], probe["remat"], probe["xla_defaults"])
               for probe in trainer.plan["probes"]]
+    settled = next((at for at, moves in enumerate(preferred) if fitted(moves)), None)
+    recomputing = None if settled is None else places[preferred[settled]]
+    # What a start asks, a probe a place at its fixed split: its own rung, which settles it where it fits
+    # (a split step's scanned gradient pooled in its backward needs no more at no remat than at a remat rung,
+    # row 12080's), else each remat rung at its own head and options up to the first that fits.
+    # The start's own first verdict as its compile measured it, wherever it settles.
+    assert trainer.plan["probes"][0]["fits"] == fitted(0), (trainer.plan["probes"][0], fitted(0))
+    asks = ([places[0]] if fitted(0) else None if settled is None
+            else [places[0], *(places[moves] for moves in preferred[:settled + 1])])
+    lightest = None if recomputing is not None else next(
+        (place for moves, place in enumerate(places) if fitted(moves)), None)
     return places, room, placed(trainer), lightest, asks, probes
 
 
 CENSUS = {
-    # Four attention layers over 64 tokens, room between what 'minimal' and no rung need.
+    # Four attention layers over 64 tokens, room between what 'minimal' and no rung need: past the start's
+    # need where its split step pools its scanned gradient in its backward (10.94 MB on main to 4.85 MB on
+    # a CPU, 'minimal' 5.08 MB), which then settles at its own rung.
     "decoder": ({"seq": LONG, "width": 32, "layers": 4}, LONG_BATCH,
                 lambda need: (need(None) + need("minimal")) // 2),
     # Two scanned gated delta net layers over 256 tokens, room for what 'minimal' needs.
@@ -1751,8 +1763,9 @@ remat at their own head, each read as asked (`climbed`): no other rung's need is
 ])
 def test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits(monkeypatch, shape, target,
                                                                                     request, tmp_path):
-    """A start whose step does not fit at its own rung asks the remat rungs at its own head first and
-    settles the first of them that fits (row 6740: a tight cold start's second compile), where an
+    """A start whose step fits at its own rung settles it in one compile; one that does not asks the remat
+    rungs at its own head first and settles the first of them that fits (row 6740: a tight cold start's
+    second compile), where an
     exhaustive walk compiling each place of the ladder in the same room finds one fits, and the lightest
     place it finds fits where none of them does, the decoder on the CPU and for a compile-only H100, the
     scanned delta decoder for the H100, what a GPU start plans for: its CPU case walked its ladder
@@ -1768,6 +1781,9 @@ def test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits(
     if climb is None:
         return
     ladder, room, plan, lightest, asks, probes = climb
+    if (shape, target) == ("decoder", "h100"):
+        # The census's climb: its start misses and a remat rung fits, as a compile-only H100 schedules it.
+        assert asks is not None and len(asks) > 1, (asks, probes, room)
     if asks is not None:
         # A tight start asks its own rung, then the remat rungs at its own head and options in order, and
         # settles the first of them that fits: no head or options rung compiled on the way (row 6740).
