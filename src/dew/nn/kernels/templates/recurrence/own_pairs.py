@@ -349,9 +349,7 @@ def intra_own(q, k, prefix, beta, taken, call: Call, *, scale: float, products: 
 
         def read(bands, totals):
             """Each output's blocks a sub-chunk, compact (`[C, SUB]` at the head's columns), once the walk is
-            done: inside its last step, the walk's state live beside the system's inversion held a Kimi
-            Linear thread at 256 to 472 bytes of spills on an H100 and a B200 at every residency the
-            derivation tried (no tiles derived, the resource gate's)."""
+            done: inside its last step, Kimi Linear's spilled 256 to 472 bytes on an H100 and a B200."""
             del totals
             for o, (name, ref) in enumerate(zip(products, outs, strict=True)):
                 form = forms[name]

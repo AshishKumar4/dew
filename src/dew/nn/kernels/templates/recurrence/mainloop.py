@@ -1560,10 +1560,8 @@ def _weighted(k, v, a, prefix: tuple, beta, taken, call: Call):
     keyed = (key_block(call, functools.partial(_weighted_held, call),
                        functools.partial(_weighted_staged, call),
                        functools.partial(_weighted_streamed, call)) if call.per_key else call.block)
-    # Under a decay a key dimension with the delta rule, a value block beside each step's key block, at the
-    # call's value block: as many value blocks as key blocks, each a key step's share of the values, ran
-    # Kimi Linear's launch 6.5% slower on a GH200 (207.2 against 220.5 us, M-JS-264b), its key-only steps'
-    # copies of the last value tile cheaper than eight narrow value steps (row 12368).
+    # Under a decay a key dimension with the delta rule, the call's value block beside each step's key block:
+    # as many narrow value blocks as key blocks ran Kimi Linear's 6.5% slower on a GH200 (M-JS-264b).
     key_steps = width // keyed if call.per_key else 1
     vb = call.value_block
     value_steps = value_width // vb if call.per_key and call.delta else 0
