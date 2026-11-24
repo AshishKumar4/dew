@@ -107,7 +107,8 @@ def test_a_means_gradient_lands_its_parts_in_one_sum():
 
 def test_a_means_value_and_second_derivatives_are_its_own():
     """A mean with its own divisor is `sum_k m v / sum_k m`, and its Hessian along its masses, reverse over
-    reverse and forward over reverse, the plain formula's at operands whose arithmetic is exact."""
+    reverse (`jacrev` of `grad`) and forward over reverse, the plain formula's at operands whose arithmetic is
+    exact."""
     masses = jnp.asarray([1.0, 3.0], jnp.float32)
     values = jnp.asarray([[2.0, -4.0], [6.0, 8.0]], jnp.float32)
 
@@ -115,8 +116,33 @@ def test_a_means_value_and_second_derivatives_are_its_own():
         return jnp.sum(m[:, None] * values, axis=0) / jnp.sum(m)
 
     np.testing.assert_array_equal(np.asarray(contract(MEAN, masses, values)), np.asarray(plain(masses)))
-    for found, want in ((jax.hessian(lambda m: contract(MEAN, m, values)[0])(masses),
-                         jax.hessian(lambda m: plain(m)[0])(masses)),
+    for found, want in ((jax.jacrev(jax.grad(lambda m: contract(MEAN, m, values)[0]))(masses),
+                         jax.jacrev(jax.grad(lambda m: plain(m)[0]))(masses)),
                         (jax.jacfwd(jax.grad(lambda m: contract(MEAN, m, values)[1]))(masses),
                          jax.jacfwd(jax.grad(lambda m: plain(m)[1]))(masses))):
         np.testing.assert_array_equal(np.asarray(found), np.asarray(want))
+
+
+DIVIDED = Form(("", ""), ((1, (((0, 1),),)),), "", divisor=((1, (((1, 1),),)),), divided="")
+"""`x / y`, `y` the divisor's own sum."""
+
+
+def test_a_zero_divisor_read_as_one_does_not_move():
+    """`x / y` at `y = 0` is `x`, the zero divisor read as the constant one: moving `y` moves nothing, where
+    its divisor's moved term `-x dy / 1` gave -2."""
+    out, tangent = jax.jvp(lambda y: contract(DIVIDED, jnp.float32(2.0), y), (jnp.float32(0.0),),
+                           (jnp.float32(1.0),))
+    np.testing.assert_array_equal(np.asarray(out), 2.0)
+    np.testing.assert_array_equal(np.asarray(tangent), 0.0)
+
+
+def test_a_divisor_past_the_format_divides_its_cotangent_finite():
+    """`x / (y + z)` at `x = y = z = 2^127` is 1/2, and its cotangent 2^127 pulls back to `dx = 1/2`: the
+    transpose divides by the divisor carried apart from its binades, where the landed `y + z` was infinite
+    and gave 0."""
+    form = Form(("", "", ""), ((1, (((0, 1),),)),), "", divisor=((1, (((1, 1),),)), (1, (((2, 1),),))),
+                divided="")
+    big = jnp.float32(2.0 ** 127)
+    out, pull = jax.vjp(lambda x: contract(form, x, big, big), big)
+    np.testing.assert_array_equal(np.asarray(out), 0.5)
+    np.testing.assert_array_equal(np.asarray(pull(big)[0]), 0.5)

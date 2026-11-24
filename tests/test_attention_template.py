@@ -1167,6 +1167,13 @@ def test_the_references_mean_past_the_format_differentiates_beside_any_state():
 
     _, moved = jax.jvp(beside_sums, (jnp.zeros_like(zero_value),), (jnp.ones_like(zero_value),))
     np.testing.assert_array_equal(np.asarray(moved), 0.5)
+    # One zero-logit key of value 2^62 beside a valueless state of mass 2^62 moved by 2^100: the output
+    # 2^62 / (1 + 2^62) moves by -2^38, where the quotient's own derivative formed `-2^100 x 2^62 x 2^-124`,
+    # -inf, at sums and a total within any fixed reach.
+    reaching = jnp.full((1, 1, 1, 8), 2.0 ** 62, jnp.float32)
+    _, moved = jax.jvp(lambda t: _state_mean(query, key[:, :1], reaching, single, state, t)[..., 0],
+                       (jnp.full_like(state, 2.0 ** 62),), (jnp.full_like(state, 2.0 ** 100),))
+    np.testing.assert_array_equal(np.asarray(moved), -(2.0 ** 38))
     # A call of no keys beside a state of mass 2: the output 0, its gradients finite zeros.
     none = template.spans(1, 0, 1)
     out, pull = jax.vjp(lambda t: _state_mean(query, key[:, :0], value[:, :0], none, state, t),

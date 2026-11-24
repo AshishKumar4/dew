@@ -608,7 +608,8 @@ def test_native_bf16_splash_lowers_jvp_and_omitted_tiles_have_zero_jvp():
     np.testing.assert_array_equal(np.asarray(dout_nan), np.zeros((1, 256, 64), jnp.float32))
     dv_grad = jax.grad(lambda vi: jnp.sum(kernel(z, z, vi)))(v_nan)
     np.testing.assert_array_equal(np.asarray(dv_grad[:, 128:, :]), np.zeros((1, 128, 64), jnp.float32))
-    # `exactly_at('default')` overrides an outer `'highest'` for 16-bit linear_tangent rules.
+    # `configured_precision('default', exact=True)` overrides an outer `'highest'` for 16-bit
+    # linear_tangent rules.
     rng = np.random.default_rng(26541)
     q16 = jnp.asarray(rng.standard_normal((1, 128, 64)), jnp.bfloat16)
     k16 = jnp.asarray(rng.standard_normal((1, 128, 64)), jnp.bfloat16)

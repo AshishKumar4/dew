@@ -1347,7 +1347,7 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
         normalized = jnp.where(total[..., None] > 0, acc / jnp.where(total > 0, total, 1)[..., None], 0)
         if hooks.initial is None or hooks.initial.valueless:
             normalized = held_mean(acc, total, value.dtype, functools.partial(
-                _scaled_mean, logits, value.astype(wide), m0, total0, acc0))
+                _scaled_mean, logits, value, m0, total0, acc0))
         if hooks.output_mod is None and jnp.dtype(query.dtype).itemsize == 2:
             # Rounded to odd for its narrowing, as the kernels' quotients outside a register epilogue are.
             normalized = narrowing_settled(normalized, acc, total, query.dtype)
@@ -1480,59 +1480,46 @@ def _between(bits: jax.Array, dtype: DTypeLike) -> jax.Array:
     return (significand & (2 * half - 1)) == half
 
 
-PLAIN_REACH = 63
-"""The binades either side of one a row's sums and total stay within for its mean to be differentiated as the
-quotient it is (`held_mean`): its derivative forms `total^-2` and the sums times the total's tangent, which
-past 2^126 either way leave fp32 (a value of 2^126 over a total of 2^62 moved by 2^62: 2^188)."""
-
-
 def held_mean(acc: jax.Array, total: jax.Array, dtype, law) -> jax.Array:
     """The reference's mean `acc / total` (zero where `total` is) saturated (`saturated`): its value, and its
-    derivative at every order the quotient's, its sums as the call narrowed them (`valued`), so the reference
-    differentiates the arithmetic the kernels run, where its sums and total lie within `2^+-PLAIN_REACH`;
-    elsewhere `law`'s (`_scaled_mean`), one contraction formed apart from its binades (`scaled_contraction`)
-    whose every order is that contraction again. It runs only where some row needs it (`lax.cond`). The
-    sums past the reach are held out of the differentiated quotient whole: a quotient of an infinite sum
-    left in it took a zero cotangent into its divisor's derivative, `0 * inf`."""
-    held_acc = jax.lax.stop_gradient(acc)
-    finite = jnp.abs(held_acc) < jnp.inf
+    derivative at every order `law`'s (`_scaled_mean`), one quotient formed apart from its binades
+    (`scaled_contraction`) whose every order is that quotient again: its sums and total at any magnitude, and
+    any tangent's, take no `total^-2` and no sum past the format (a value of 2^62 over a mass of 2^62 moved by
+    2^100: -2^38, where the quotient's own derivative formed -inf)."""
+    finite = jnp.abs(jax.lax.stop_gradient(acc)) < jnp.inf
     held = jax.lax.stop_gradient(total)[..., None]
-    reached = (held == 0) | ((held >= 2.0 ** -PLAIN_REACH) & (held <= 2.0 ** PLAIN_REACH))
-    plain = finite & reached & (jnp.max(jnp.abs(jnp.where(finite, held_acc, 0)), axis=-1, keepdims=True)
-                                <= 2.0 ** PLAIN_REACH)
     seen = held > 0
-    out = jnp.where(seen, held_acc / jnp.where(seen, held, 1), 0)
-    quotient = jnp.where(seen, jnp.where(plain, acc, 0) / jnp.where(seen & plain, total[..., None], 1), 0)
-    differentiated = jax.lax.cond(jnp.all(plain), lambda: quotient,
-                                  lambda: jnp.where(plain, quotient, law()))
-    return saturated(out, finite, dtype) + derivative_of(differentiated)
+    out = jnp.where(seen, jax.lax.stop_gradient(acc) / jnp.where(seen, held, 1), 0)
+    return saturated(out, finite, dtype) + derivative_of(law())
 
 
 def _scaled_mean(logits: jax.Array, value: jax.Array, m0: jax.Array, total0: jax.Array,
                  acc0: jax.Array) -> jax.Array:
     """The mean of the values `[B, K, Hk, Dv]` at the logits `[B, H, Q, K]` beside a state (its maximum `m0`
     and mass `total0`, `[B, H, Q]`, and its sums `acc0`, `[B, H, Q, Dv]`, a valueless state's zero),
-    `[B, H, Q, Dv]`: each key's mass at the row's maximum held out of the graph (`m`'s, any shift's derivative
-    cancels) and the state's factor at it, the masses' contraction with the values and the state's sums at
-    its factor over the masses' and the state's mass's total, one quotient formed apart from its binades
-    (`scaled_contraction`, its divisor its own sum of its operands): its every order is that quotient again,
-    so a cotangent's part through the values and its part through the total (each `2^130` at values near the
-    format's largest) cancel within one sum, where they met as `inf - inf`; zero over a total of none."""
+    `[B, H, Q, Dv]`, as the reference forms it (`valued`): each key's mass at the row's maximum, held out of
+    the graph (`m`'s, any shift's derivative cancels), weighing the values narrowed to their dtype, the
+    narrowing a stop-gradient operand of its own; their total unnarrowed beside the state's mass. One quotient
+    formed apart from its binades (`scaled_contraction`, its divisor its own sum of its operands): every
+    order is that quotient again, so a cotangent's part through the values and through the total (each 2^130
+    at values near the format's largest) cancel within one sum; zero over a total of none."""
     batch, heads, queries, keys = logits.shape
     kv_heads, width = value.shape[2], value.shape[3]
+    wide = at_least_fp32(value.dtype)
     grouped = (batch, kv_heads, heads // kv_heads, queries)
     reached = jnp.maximum(m0, jnp.max(logits, axis=-1, initial=-jnp.inf))
     shift = jax.lax.stop_gradient(jnp.where(jnp.isfinite(reached), reached, 0))
     masses = jnp.where(jnp.isfinite(logits), jnp.exp(logits - shift[..., None]), 0)
+    narrowing = jax.lax.stop_gradient(masses.astype(value.dtype).astype(masses.dtype) - masses)
     carried = jnp.where(jnp.isfinite(m0), jnp.exp(m0 - shift), 0)
     seen = jax.lax.stop_gradient(jnp.sum(masses, axis=-1) + total0 * carried) > 0
     form = scaled_contraction.Form(
-        ("bhgqk", "bkhd", "bhgqd", "bhgq", "bhgq"),
-        ((1, (((0, 1),), ((1, 1),))), (1, (((2, 1), (3, 1)),))), "bhgqd",
-        divisor=((1, (((0, 1),),)), (1, (((3, 1), (4, 1)),))), divided="bhgq")
-    mean = scaled_contraction.contract(form, masses.reshape(*grouped, keys), value,
-                                       acc0.reshape(*grouped, width), carried.reshape(grouped),
-                                       total0.reshape(grouped))
+        ("bhgqk", "bhgqk", "bkhd", "bhgqd", "bhgq", "bhgq"),
+        ((1, (((0, 1),), ((2, 1),))), (1, (((1, 1),), ((2, 1),))), (1, (((3, 1), (4, 1)),))), "bhgqd",
+        divisor=((1, (((0, 1),),)), (1, (((4, 1), (5, 1)),))), divided="bhgq")
+    mean = scaled_contraction.contract(
+        form, masses.reshape(*grouped, keys), narrowing.reshape(*grouped, keys), value.astype(wide),
+        acc0.reshape(*grouped, width), carried.reshape(grouped), total0.reshape(grouped))
     return jnp.where(seen[..., None], mean.reshape(batch, heads, queries, width), 0)
 
 
@@ -2055,40 +2042,61 @@ def launch_arguments(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
     return arrays, params, (call, starts, cotangent)
 
 
-def value_shift(dout: jax.Array, value: jax.Array, initial: Initial | None) -> jax.Array:
-    """The power of two `gradients` takes the values beneath, int32: 0 wherever `sum_d max|dO_d| max|V_d|`
-    (the largest `|dP|` and `|D|` a call can form, its channels' maxima paired, an initial state's mean among
-    the values) stays under fp32's `2^127`, else the binades it passes by, so `dP = dO V^T`, `D = dO . O` and
-    their difference form finite. Its sum taken at each factor's own largest binade, finite whatever their
-    product."""
-    def channels(x: jax.Array) -> jax.Array:
-        return jnp.max(jnp.abs(x.astype(jnp.float32)).reshape(-1, x.shape[-1]), axis=0, initial=0.0)
+def value_shift(dout: jax.Array, value: jax.Array, hooks: Hooks) -> jax.Array:
+    """The power of two `gradients` takes each batch row's and key head's values beneath, int32 `[B, Hk]`: 0
+    wherever `sum_d max|dO_d| max|V_d|` over that row and head (the largest `|dP|` and `|D|` it can form, its
+    channels' maxima paired, an initial state's mean among the values) stays under fp32's `2^127`, else the
+    binades it passes by, so `dP = dO V^T`, `D = dO . O` and their difference form finite; a row's own, so
+    one past the format takes no other's small values beneath it. One for the whole call where a score hook
+    has parameters, whose gradients a launch may sum across rows before they are raised (`shared_place`).
+    Within a row and head the shift is its keys' and queries' together: a query of small values beside a
+    key at the format's edge is taken beneath it too (row 12452). Its sum taken at each factor's own largest
+    binade, finite whatever their product."""
+    batch, queries, heads, width = dout.shape
+    kv_heads = value.shape[2]
+    group = heads // kv_heads
 
-    cotangents, values = channels(dout), channels(value)
+    def channels(x: jax.Array, axes: tuple[int, ...]) -> jax.Array:
+        return jnp.max(jnp.abs(x.astype(jnp.float32)), axis=axes, initial=0.0)
+
+    cotangents = channels(dout.reshape(batch, queries, kv_heads, group, width), (1, 3))
+    values = channels(value, (1,))
+    initial = hooks.initial
     if initial is not None and not initial.valueless:
         total = initial.total.astype(jnp.float32)[..., None]
         mean = initial.acc.astype(jnp.float32) / jnp.where(total > 0, total, 1)
-        values = jnp.maximum(values, channels(mean))
-    lead_o, lead_v = binade_of(jnp.max(cotangents)), binade_of(jnp.max(values))
-    held = jnp.sum(power2(cotangents, -lead_o) * power2(values, -lead_v))
-    reach = binade_of(held) + lead_o + lead_v
-    return jax.lax.stop_gradient(jnp.maximum(reach - 126, 0)).astype(jnp.int32)
+        values = jnp.maximum(values, channels(mean.reshape(batch, kv_heads, group, queries, width), (2, 3)))
+    lead_o, lead_v = binade_of(jnp.max(cotangents, axis=-1)), binade_of(jnp.max(values, axis=-1))
+    held = jnp.sum(power2(cotangents, -lead_o[..., None]) * power2(values, -lead_v[..., None]), axis=-1)
+    shift = jnp.maximum(binade_of(held) + lead_o + lead_v - 126, 0)
+    if hooks.score_params:
+        shift = jnp.broadcast_to(jnp.max(shift), shift.shape)
+    return jax.lax.stop_gradient(shift).astype(jnp.int32)
+
+
+def shifted(x: jax.Array, shift: jax.Array) -> jax.Array:
+    """`x * 2^shift` in `x`'s dtype, `x` itself bit for bit where the shift is 0 (a subnormal on a process
+    that flushes them included)."""
+    return jnp.where(shift == 0, x, power2(x, shift).astype(x.dtype))
 
 
 def beneath_shift(dout: jax.Array, value: jax.Array, residuals: tuple[jax.Array, jax.Array, jax.Array, Split],
                   hooks: Hooks) -> tuple[jax.Array, jax.Array, tuple, Hooks]:
-    """The values at an exact power of two beneath them (`value_shift`), with the split sums and the initial
-    state's sums they weigh: a call whose `dO V` stays within fp32 shifts by 0 and rounds as it did; one past
-    it forms `dP`, D and their difference finite (values at fp32's largest: each 2^130, `inf - inf` where
-    its truth is 0). `(shift, value, residuals, hooks)`, each taken beneath it."""
-    shift = value_shift(dout, value, hooks.initial)
+    """The values at an exact power of two beneath them (`value_shift`), each batch row's and key head's,
+    with the split sums and the initial state's sums they weigh: a call whose `dO V` stays within fp32
+    shifts by 0 and rounds as it did; one past it forms `dP`, D and their difference finite (values at fp32's
+    largest: each 2^130, `inf - inf` where its truth is 0). `(shift [B, H], value, residuals, hooks)`, each
+    taken beneath it."""
+    shift = value_shift(dout, value, hooks)
+    heads = dout.shape[2]
+    by_head = jnp.repeat(shift, heads // shift.shape[1], axis=1)
     maxima, totals, anchors, split = residuals
     residuals = (maxima, totals, anchors,
-                 split._replace(others=power2(split.others, -shift).astype(split.others.dtype)))
+                 split._replace(others=shifted(split.others, -by_head[:, :, None, None])))
     if hooks.initial is not None:
         hooks = dataclasses.replace(hooks, initial=dataclasses.replace(
-            hooks.initial, acc=power2(hooks.initial.acc, -shift).astype(hooks.initial.acc.dtype)))
-    return shift, power2(value, -shift).astype(value.dtype), residuals, hooks
+            hooks.initial, acc=shifted(hooks.initial.acc, -by_head[:, :, None, None])))
+    return by_head, shifted(value, -shift[:, None, :, None]), residuals, hooks
 
 
 def _initial_gradients(state: Initial, starts: tuple[jax.Array, jax.Array, jax.Array], peak: jax.Array,
@@ -2178,7 +2186,9 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     shift, value, residuals, hooks = beneath_shift(dout, value, residuals, hooks)
 
     def restored(grad: jax.Array) -> jax.Array:
-        return power2(grad, shift).astype(grad.dtype)
+        # dQ's or dK's, its batch rows on axis 0 and its query or key heads on axis 2.
+        heads = shift if grad.shape[2] == shift.shape[1] else shift[:, ::shift.shape[1] // grad.shape[2]]
+        return shifted(grad, heads[:, None, :, None])
 
     batch, queries, heads, width = query.shape
     keys, kv_heads, value_width = key.shape[1], key.shape[2], value.shape[-1]
@@ -2190,9 +2200,9 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     outputs = launch(*arrays, **params)
     dq, softmax = restored(outputs[0]), outputs[1:7]
     grads_out = list(outputs[8:])
-    dq_grads = [restored(grads_out.pop(0)) for kind in kinds if kind in DQ_GRADS]
+    dq_grads = [shifted(grads_out.pop(0), jnp.max(shift)) for kind in kinds if kind in DQ_GRADS]
     dk, dv, *key_grads = grads_out
-    dk, key_grads = restored(dk), [restored(grad) for grad in key_grads]
+    dk, key_grads = restored(dk), [shifted(grad, jnp.max(shift)) for grad in key_grads]
     delta, anchor, peak, total, mass, lost = (array[:, :, :queries] for array in softmax)
     # D and what its two roundings lost, its refinement's (`lost`, `gradient.dq_finish`) and its anchor's sum.
     delta, low = two_sum(anchor, delta)
@@ -2216,7 +2226,8 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
             case Kind.OUTPUT:
                 raise ValueError("a score hook takes no output parameter")
     initial = None if state is None else _initial_gradients(
-        state, starts, peak, total, mass, delta, low, lost, cotangent, restored)
+        state, starts, peak, total, mass, delta, low, lost, cotangent,
+        functools.partial(shifted, shift=shift[:, :, None]))
     # Unrounded (`rounded` False), dK and dV stay in at least fp32 for a caller that sums them across
     # shards first and rounds once (`attention_route.attend`'s `operand_dtype`).
     key_dtype, value_dtype = ((key.dtype, value.dtype) if rounded

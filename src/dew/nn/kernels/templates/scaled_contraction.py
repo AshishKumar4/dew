@@ -37,11 +37,12 @@ from jax._src.interpreters import partial_eval as pe
 from jax.extend import core as jcore
 from jax.interpreters import ad, batching, mlir
 
-from dew.nn.float_bits import float_bits
+from dew.nn.float_bits import binade_of, float_bits
 from dew.nn.precision import at_least_fp32, exact_float32, power2
 
 Factor = tuple[int, int]
-"""An operand's index and its power, `+1` or `-1`."""
+"""An operand's index and its power, `+1` or `-1`; or `0`, an int32 operand of exponents its group's
+product is raised by (`2^e`), no value of its own: a divisor carried apart from its binades (`_transpose`)."""
 
 Term = tuple[int, tuple[tuple[Factor, ...], ...]]
 """A term's sign and its groups, each a product of its factors."""
@@ -100,9 +101,13 @@ def _held(form: Form, group: tuple[Factor, ...], arrays: Sequence[jax.Array], dt
     letters = form.letters(group)
     significand, exponent = jnp.ones((), dtype), jnp.int32(0)
     for index, power in group:
+        if power == 0:
+            exponent = exponent + _laid(arrays[index].astype(jnp.int32), form.subscripts[index], letters)
+            continue
         part, binade = _split(_laid(arrays[index].astype(dtype), form.subscripts[index], letters))
         significand = significand * part if power > 0 else significand / part
         exponent = exponent + binade if power > 0 else exponent - binade
+    significand = jnp.broadcast_to(significand, jnp.broadcast_shapes(significand.shape, jnp.shape(exponent)))
     summed = tuple(axis for axis, letter in enumerate(letters) if letter not in form.out)
     largest = jnp.max(jnp.where(significand != 0, exponent, LEAST), axis=summed, keepdims=True,
                       initial=LEAST)
@@ -111,8 +116,9 @@ def _held(form: Form, group: tuple[Factor, ...], arrays: Sequence[jax.Array], dt
 
 
 def _dtype(arrays) -> jnp.dtype:
-    """The sum's format: its operands', at least float32."""
-    return at_least_fp32(jnp.result_type(*(array.dtype for array in arrays)))
+    """The sum's format: its float operands', at least float32 (an exponent operand's none)."""
+    return at_least_fp32(jnp.result_type(*(array.dtype for array in arrays
+                                            if jnp.issubdtype(array.dtype, jnp.floating))))
 
 
 def _sum(arrays, form: Form, terms: tuple[Term, ...], out: str, dtype):
@@ -213,7 +219,8 @@ def _jvp(primals, tangents, *, form: Form):
     once; a quotient's `(dN - out dD) / D` over its own divisor, the result `out` an operand of the
     divisor's moved terms, so its numerator's and divisor's parts cancel within the one sum."""
     out = contract(form, *primals)
-    moving = {index: tangent for index, tangent in enumerate(tangents) if type(tangent) is not ad.Zero}
+    moving = {index: tangent for index, tangent in enumerate(tangents)
+              if type(tangent) is not ad.Zero and jnp.issubdtype(primals[index].dtype, jnp.floating)}
     if not moving:
         return out, ad.Zero(jax.typeof(out).to_tangent_aval())
     at = {index: len(primals) + place for place, index in enumerate(moving)}
@@ -223,7 +230,10 @@ def _jvp(primals, tangents, *, form: Form):
     if form.divisor:
         below = _moved(form.divisor, moving, at)
         if below:
-            operands.append(out)
+            # A zero divisor read as one is a constant: its moved terms none there.
+            total, _ = _sum(primals, form, form.divisor, form.divided, _dtype(primals))
+            none = _laid(total == 0, form.divided, form.out)
+            operands.append(jnp.where(none, jnp.zeros((), out.dtype), out))
             subscripts.append(form.out)
             terms += [(-sign, (*groups, ((len(operands) - 1, 1),))) for sign, groups in below]
     if not terms:
@@ -249,10 +259,20 @@ def _transpose(cotangent, *arrays, form: Form):
             raise NotImplementedError("a scaled contraction is linear in no divisor's operand")
         divisor = tuple((sign, tuple(tuple((place[index], power) for index, power in group)
                                      for group in groups)) for sign, groups in form.divisor)
-        total = contract(Form(tuple(shared_subscripts), divisor, form.divided), *shared)
-        shared.append(jnp.where(total == 0, jnp.ones((), total.dtype), total))
+        # The divisor carried apart from its binades, as the forward keeps it unlanded: its significand at
+        # its exponent `e` held out of the graph (a contraction of the primals again, its derivatives with it)
+        # and `2^-e` an exponent operand, so a divisor past the format divides finite (`y + z` at 2^127).
+        unlanded, joined = _sum(shared, Form(tuple(shared_subscripts), divisor, form.divided), divisor,
+                                form.divided, _dtype(shared))
+        exponent = jax.lax.stop_gradient(jnp.where(unlanded == 0, 0, joined + binade_of(unlanded)))
+        shared.append(-exponent)
         shared_subscripts.append(form.divided)
-        below = ((len(shared) - 1, -1),)
+        lowering = len(shared) - 1
+        lowered = tuple((sign, (*groups, ((lowering, 0),))) for sign, groups in divisor)
+        significand = contract(Form(tuple(shared_subscripts), lowered, form.divided), *shared)
+        shared.append(jnp.where(significand == 0, jnp.ones((), significand.dtype), significand))
+        shared_subscripts.append(form.divided)
+        below = ((len(shared) - 1, -1), (lowering, 0))
     for linear, array in enumerate(arrays):
         if not ad.is_undefined_primal(array):
             continue

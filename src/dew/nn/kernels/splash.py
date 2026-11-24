@@ -64,7 +64,7 @@ from dew.nn.derivatives import KernelGlue, contracted, with_gradients_formed
 from dew.nn.kernels import generation, launches, tuning
 from dew.nn.kernels.options import program
 from dew.nn.kernels.templates import attention_algebra, product
-from dew.nn.precision import compensated_sum, exactly_at, float32_einsum, products_dtype
+from dew.nn.precision import compensated_sum, configured_precision, float32_einsum, products_dtype
 
 # Dew: a hidden key's logit -inf, not upstream's finite -0.7 * float32's largest, which outweighed a row's
 # own keys below it (a causal first query's one key at -3e38 read the hidden keys' values); a row's state
@@ -1377,19 +1377,19 @@ def _build_splash_op(blocks: BlockSizes, call: _Call, precision: str | None) -> 
     """One Splash call differentiated at every order through `_splash_portable` while primal and first-order
     reverse mode run the TPU Pallas kernels (`generation.linear_tangent`, row 2654)."""
     def primal(*operands):
-        with exactly_at(precision):
+        with configured_precision(precision, exact=True):
             return _attending(*operands, blocks=blocks, call=call)
 
     def forward(*operands):
-        with exactly_at(precision):
+        with configured_precision(precision, exact=True):
             return _attention_fwd(*operands, blocks=blocks, call=call)
 
     def backward_rule(saved, operands, do):
-        with exactly_at(precision):
+        with configured_precision(precision, exact=True):
             return _attention_bwd(blocks, call, saved, operands, do)
 
     def portable(*operands):
-        with exactly_at(precision):
+        with configured_precision(precision, exact=True):
             return _splash_portable(*operands, blocks=blocks, call=call)
 
     return contracted("test_a_fused_attention_kernel_holds_every_order")(
