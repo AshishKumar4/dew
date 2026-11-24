@@ -165,10 +165,11 @@ def _decayed(state, exponent, base2: bool, cut) -> tuple:
     """`exp(exponent) state` (`2^exponent` where `base2`) as a factor and a term, `factor state + term`,
     zero where `cut`: the scan's own decay (`scan._exp`) the factor where it is a normal float, the token
     walk's rounding, its expression the walk's; beneath float32's least normal the factor zero and the term
-    the state times the remainder's exponential, its power of two the base-2 exponent's nearest integer
-    applied after (`precision.power2`), so the product and its derivative in the exponent stay what the
-    decay of a large state leaves (exp(-120) over 2^100, ReviewMomentum1454), as the chunk's forms keep them
-    (`_exponential`), never the decay landed alone."""
+    the remainder's exponential times the state scaled by the base-2 exponent's nearest integer power of
+    two first (`precision.power2`), so the product and its derivative in the exponent stay what the decay of
+    a large state leaves (exp(-120) over 2^100, ReviewMomentum1454), as the chunk's forms keep them
+    (`_exponential`), never the decay landed alone, nor a cotangent scaled beneath the least normal before
+    the state it meets (power2's pullback scales its cotangent first)."""
     decay = _exp(base2, exponent)
     if base2:
         high, low = exponent, jnp.zeros_like(exponent)
@@ -177,7 +178,7 @@ def _decayed(state, exponent, base2: bool, cut) -> tuple:
     whole = lax.stop_gradient(jnp.round(high))
     fraction = (high - whole) + low
     faint = jnp.abs(decay) < np.finfo(decay.dtype).tiny
-    split = power2(jnp.exp(fraction * np.asarray(math.log(2), fraction.dtype)) * state, whole)
+    split = jnp.exp(fraction * np.asarray(math.log(2), fraction.dtype)) * power2(state, whole)
     return jnp.where(cut | faint, 0.0, decay), jnp.where(faint & ~cut, split, 0.0)
 
 
