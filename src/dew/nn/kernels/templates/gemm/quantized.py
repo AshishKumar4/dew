@@ -166,7 +166,8 @@ def _reciprocal(scale: jax.Array) -> jax.Array:
     word = jax.lax.bitcast_convert_type(scale, jnp.uint32)
     biased = (word >> jnp.uint32(23)) & jnp.uint32(0xFF)
     inverse = jax.lax.bitcast_convert_type((jnp.uint32(254) - biased) << jnp.uint32(23), jnp.float32)
-    return jnp.where(biased == 0xFF, jnp.float32(0.0), jnp.where(word == 0x80000000, -jnp.inf, inverse))
+    infinite, sentinel = biased == jnp.uint32(0xFF), word == jnp.uint32(0x80000000)
+    return jnp.where(infinite, jnp.float32(0.0), jnp.where(sentinel, jnp.float32(-jnp.inf), inverse))
 
 
 def blockwise_fp8_epilogue(activation=None, out_dtype=jnp.bfloat16):
