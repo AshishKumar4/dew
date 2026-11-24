@@ -35,14 +35,13 @@ if TYPE_CHECKING:
 
 
 def scanned() -> bool:
-    """Whether a decoder's stack runs its like and periodic runs under the scan
-    (`generation.chosen(layer_scan="scanned")`, `Choice.LAYER_SCAN`) or every layer unrolled, the default
-    until the scanned path's open rows close (12076 to 12080; row 4074 then makes the scan the default:
-    Qwen3.5-4B's periodic stack lowers unrolled to 112k operations): how it compiles, by its structure alone,
-    never a model's field."""
+    """Whether a decoder's stack runs its like and periodic runs under the scan, the default, or every layer
+    unrolled (`generation.chosen(layer_scan="plain")`, `Choice.LAYER_SCAN`): Qwen3.5-4B's periodic stack
+    lowers unrolled to 112k operations, scanned to its period's (row 4074). How it compiles, by its
+    structure alone, never a model's field."""
     from dew.nn.kernels.generation import Choice, chosen_kernel
 
-    return chosen_kernel(Choice.LAYER_SCAN, "plain") == "scanned"
+    return chosen_kernel(Choice.LAYER_SCAN, "scanned") == "scanned"
 
 
 def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer_input,

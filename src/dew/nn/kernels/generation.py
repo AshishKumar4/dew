@@ -226,8 +226,8 @@ class Choice(enum.StrEnum):
     GROUPED_MATMUL = 'grouped_matmul'
     LAYER_SCAN = 'layer_scan'
     """How a decoder's stack compiles, decided without a selector (`dew.nn.backbones.decoder_stages.scanned`):
-    "scanned" runs each run of like layers and each period's repeats under one scanned body; "plain", the
-    default until row 4074 makes the scan it, runs every layer unrolled."""
+    "scanned", the default (row 4074), runs each run of like layers and each period's repeats under one
+    scanned body; "plain" runs every layer unrolled."""
     LOW_RANK = 'low_rank'
     MXFP8 = 'mxfp8'
     NARROW_COPIES = 'narrow_copies'
