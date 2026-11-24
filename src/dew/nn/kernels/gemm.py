@@ -1277,8 +1277,7 @@ def blockwise_fp8_product(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Ar
 
 def blockwise_fp8_finished(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Array, row_scales: jax.Array,
                            column_scales: jax.Array, *, epilogue: Callable, out_dtypes: tuple,
-                           out_forms: tuple | None = None, dense: bool = False,
-                           paired: tuple[jax.Array, jax.Array] | None = None,
+                           epilogue_operands: tuple = (), out_forms: tuple | None = None, dense: bool = False,
                            interpret_on_cpu: bool = False) -> tuple[jax.Array, ...]:
     """`blockwise_fp8_product`'s fp32 sums through `epilogue`, its several outputs in `out_dtypes` (the
     template's epilogue, XLA's the same function of its sums: a next product's rows quantized from them,
@@ -1286,17 +1285,17 @@ def blockwise_fp8_finished(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.A
     output broadcast across each block's columns stored one value a row a block, transposed, as a next
     blockwise product reads its rows' scales). `dense`: its one group covers every row (a padded chain's,
     `projections.blockwise_chain`), which a transposed form's stores need (`quantized.forms_refusal`).
-    `paired`, a second matrix and its column scales (`kernel`'s and `column_scales`' shapes), the same rows'
-    product with it summed beside the first, the epilogue taking both sums (a gated MLP's gate and up, row
-    12689)."""
+    `epilogue_operands`, its side tiles (`[rows, columns]` each, the call's output's), the epilogue taking
+    them after the sum (a gated MLP's rounded gate product, its up product's SwiGLU taken here, row 12689)."""
     return _blockwise_fp8(lhs, kernel, group_sizes, row_scales, column_scales,
                           dtypes=tuple(jnp.dtype(dtype) for dtype in out_dtypes), epilogue=epilogue,
-                          out_forms=out_forms, dense=dense, paired=paired, interpret=interpret_on_cpu)
+                          sides=tuple(epilogue_operands), out_forms=out_forms, dense=dense,
+                          interpret=interpret_on_cpu)
 
 
 def _blockwise_fp8(lhs, kernel, group_sizes, row_scales, column_scales, *, dtypes: tuple,
-                   epilogue: Callable | None = None, out_forms: tuple | None = None, dense: bool = False,
-                   paired: tuple | None = None, interpret: bool) -> tuple[jax.Array, ...]:
+                   epilogue: Callable | None = None, sides: tuple = (), out_forms: tuple | None = None,
+                   dense: bool = False, interpret: bool) -> tuple[jax.Array, ...]:
     """The blockwise FP8 product's outputs (`blockwise_fp8_product`'s, `blockwise_fp8_finished`'s), each a
     tuple's: the template's step-scaled walk where its selector names it, else XLA's."""
     from .templates.gemm import quantized
@@ -1308,17 +1307,16 @@ def _blockwise_fp8(lhs, kernel, group_sizes, row_scales, column_scales, *, dtype
     out_forms = quantized.forms_of(out_forms, len(dtypes)) or None
     several = epilogue is not None
     hooks = NO_HOOKS if not several else Hooks(
-        epilogue=epilogue, out_dtypes=tuple(dtype.name for dtype in dtypes), out_forms=out_forms)
+        epilogue=epilogue, epilogue_axes=(LAUNCH_AXES['epilogue'],) * len(sides),
+        out_dtypes=tuple(dtype.name for dtype in dtypes), out_forms=out_forms)
     stored = dtypes[0].name if several else 'float32'
     if dense and group_sizes.shape != (1,):
         raise ValueError(f"a dense blockwise product is one group's, not {group_sizes.shape[0]}")
     # A column scale covers each column, or whole weight blocks of them, which a column tile falls within.
-    pair, pair_scales = (None, ()) if paired is None else (paired[0], (paired[1],))
     tile = (_planned(launch, launch.bind(*_abstract(lhs, kernel), sizes_spec, out_dtype=stored,
                                          trans_rhs=True, interpret=interpret, exact_sums=True,
-                                         scales=_abstract(row_scales, column_scales, *pair_scales),
-                                         hooks=hooks, dense=dense,
-                                         paired=None if pair is None else _abstract(pair)[0]))
+                                         scales=_abstract(row_scales, column_scales), hooks=hooks,
+                                         dense=dense, epilogue_operands=_abstract(*sides)))
             if per == 1 or per % SCALE_DEPTH == 0 else None)
 
     def portable(lhs, kernel, sizes, row_scales, column_scales):
@@ -1328,33 +1326,28 @@ def _blockwise_fp8(lhs, kernel, group_sizes, row_scales, column_scales, *, dtype
                                         column_scales, precision=jax.lax.Precision.DEFAULT)
 
 
-    def finished(*summed):
+    def finished(summed, *sides):
         # XLA's sums through the same epilogue, each output in its dtype and form (`quantized.stored`).
-        outputs = summed[0] if epilogue is None else epilogue(*summed)
+        outputs = summed if epilogue is None else epilogue(summed, *sides)
         outputs = outputs if isinstance(outputs, tuple) else (outputs,)
         forms = out_forms or (None,) * len(dtypes)
         return tuple(quantized.stored(value.astype(dtype), form)
                      for value, dtype, form in zip(outputs, dtypes, forms, strict=True))
 
-    def mosaic(lhs, kernel, sizes, row_scales, column_scales, *pair, interpret):
-        matrix, scales = (None, ()) if not pair else (pair[0], (pair[1],))
+    def mosaic(lhs, kernel, sizes, row_scales, column_scales, *sides, interpret):
         out = launch(lhs, kernel, sizes.astype(jnp.int32), out_dtype=stored, trans_rhs=True,
-                     interpret=interpret, exact_sums=True, scales=(row_scales, column_scales, *scales),
-                     hooks=hooks, dense=dense, paired=matrix)
+                     interpret=interpret, exact_sums=True, scales=(row_scales, column_scales), hooks=hooks,
+                     dense=dense, epilogue_operands=sides)
         return tuple(out) if several else finished(out)
 
-    def portable_finished(lhs, kernel, sizes, row_scales, column_scales, *pair):
-        # A pair's product apart, the same rows' through its own matrix and column scales.
-        sums = [portable(lhs, kernel, sizes, row_scales, column_scales)]
-        if pair:
-            sums.append(portable(lhs, pair[0], sizes, row_scales, pair[1]))
-        return finished(*sums)
+    def portable_finished(lhs, kernel, sizes, row_scales, column_scales, *sides):
+        return finished(portable(lhs, kernel, sizes, row_scales, column_scales), *sides)
 
     if selection.select(BLOCKWISE_FP8, ScaledCase(tile)).kernel == 'mosaic':
         assert tile is not None, "the selector names the template where it plans a tile"
         return xla_products.dispatched(mosaic, portable_finished, interpret, lhs, kernel, group_sizes,
-                                       row_scales, column_scales, *(paired or ()))
-    return portable_finished(lhs, kernel, group_sizes, row_scales, column_scales, *(paired or ()))
+                                       row_scales, column_scales, *sides)
+    return portable_finished(lhs, kernel, group_sizes, row_scales, column_scales, *sides)
 
 
 def blockwise_fp8_kernel_gradient(lhs_t: jax.Array, rhs_t: jax.Array, group_blocks: jax.Array,

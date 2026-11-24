@@ -152,7 +152,7 @@ def recipe_chain(rows: jax.Array, up: jax.Array, down: jax.Array, activation: Ca
     are the two apart's, bitwise), the down projection's rows quantized in the up projection's epilogue
     (`blockwise_chain`, row 8547); rows a mesh splits each device's own chain, the matrices whole and their
     gradients summed (`on_shards`, as `_projected_apart`). With `gate` (`up`'s shape), a gated MLP's:
-    `activation(gate_rows, up_rows)`, the two first projections summed in one launch (row 12689). None
+    `activation(gate_rows, up_rows)`, the up projection's epilogue taking it (row 12689). None
     elsewhere: the run's recipe another's or none, or a projection its role keeps, which the
     `recipe_projection` calls then take apart. Each product's route is its selector's (`BLOCKWISE_FP8`)."""
     from dew.nn.precision import recipe_role
@@ -266,23 +266,27 @@ _blockwise_projection = contracted("test_a_blockwise_fp8_projection_holds_every_
 
 
 def _chain_value(x, w_ins, w_down, group_blocks, activation, out_dtype, interpret):
-    """`blockwise_chain`'s value and its first projections' rounded products: one projection's (an ungated
-    MLP's up), or a pair's summed in one launch (a gated MLP's gate and up, `blockwise_fp8_finished`'s
-    `paired`, row 12689), its epilogue quantizing their activation as the down projection's rows
-    (`quantized.blockwise_fp8_epilogue`: codes and 1 x 128 scales, `[width / 128, rows]`, as
-    `blockwise_fp8_product` reads its rows' scales)."""
+    """`blockwise_chain`'s value and its first projections' rounded products: an ungated MLP's up, or a gated
+    one's gate and up (the gate's its side tile, row 12689), the up projection's epilogue quantizing their
+    activation as the down projection's rows (`quantized.blockwise_fp8_epilogue`: codes and 1 x 128 scales,
+    `[width / 128, rows]`, as `blockwise_fp8_product` reads its rows' scales)."""
     from dew.nn.kernels.templates.gemm import quantized
 
     sizes = (group_blocks * SCALE_DEPTH).astype(jnp.int32)
     rows, rows_scales = rows_quantized(x)
-    (first, first_scales), *pair = [(jnp.swapaxes(blocks, 1, 2), scales)
-                                    for blocks, scales in map(blocks_quantized, w_ins)]
-    *products, codes, scales = blockwise_fp8_finished(
-        rows, first, sizes, rows_scales.T, first_scales,
+    *gate, (up, up_scales) = [(jnp.swapaxes(blocks, 1, 2), scales)
+                              for blocks, scales in map(blocks_quantized, w_ins)]
+    # A gate's product stored rounded, the up product's epilogue reading it as a tile beside its own sum:
+    # one accumulator a launch (two exact sums, each a running total and a step's partial, take a Hopper
+    # consumer's 336 registers at FP8's least 128 columns; row 12689).
+    gated = tuple(blockwise_fp8_product(rows, matrix, sizes, rows_scales.T, scales, out_dtype=out_dtype,
+                                        interpret_on_cpu=interpret) for matrix, scales in gate)
+    product, codes, scales = blockwise_fp8_finished(
+        rows, up, sizes, rows_scales.T, up_scales,
         epilogue=quantized.blockwise_fp8_epilogue(activation, out_dtype),
-        out_dtypes=(*(out_dtype,) * len(w_ins), jnp.float8_e4m3fn, jnp.float32),
-        out_forms=(*(None,) * (len(w_ins) + 1), (SCALE_DEPTH, True)), dense=True,
-        paired=pair[0] if pair else None, interpret_on_cpu=interpret)
+        out_dtypes=(out_dtype, jnp.float8_e4m3fn, jnp.float32), epilogue_operands=gated,
+        out_forms=(None, None, (SCALE_DEPTH, True)), dense=True, interpret_on_cpu=interpret)
+    products = (*gated, product)
     down_blocks, down_scales = blocks_quantized(w_down)
     out = blockwise_fp8_product(codes, jnp.swapaxes(down_blocks, 1, 2), sizes, scales, down_scales,
                                 out_dtype=out_dtype, interpret_on_cpu=interpret)
@@ -325,7 +329,7 @@ def blockwise_chain(x: jax.Array, w_up: jax.Array, w_down: jax.Array, activation
     projection's rows quantized in the up projection's epilogue, its codes and scales stored there
     (`quantized.blockwise_fp8_epilogue`, the scales `[hidden / 128, rows]`), no pass of their own between the
     two (row 8547). With `gate` (`w_up`'s shape), a gated MLP's: `activation(gate_product, up_product)`,
-    the two products summed in one launch, each by its own matrix and scales (row 12689). Bitwise the
+    the gate's product stored and read by the up projection's epilogue (row 12689). Bitwise the
     projections apart, forward and reverse (`_chain_backward`: each projection's own surrogate);
     `activation` is an elementwise function of `out_dtype` arrays, the MLP's."""
     if w_up.shape[0] != 1 or w_down.shape[0] != 1 or x.shape[0] % SCALE_DEPTH:

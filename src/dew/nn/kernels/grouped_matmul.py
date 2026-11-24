@@ -1784,8 +1784,7 @@ class MosaicStepScaledGmm(_ScaledGmm):
     call it is: each exactly summed `SCALE_DEPTH`-deep step's partial times its rows' and
     columns' scales before its add (`mosaic_gpu.gmm`'s `step_scales`), its rows' scales streamed beside its
     ring (`gmm_allocations`' `step_scaled`), a column tile within one weight block's columns, and no split,
-    swap or prologue (an epilogue reads its sums); a paired matrix's partials scaled by its own column scales
-    (`mosaic_gpu.COLUMN_SCALES`, a gated MLP's gate and up, row 12689)."""
+    swap, prologue or pair (an epilogue reads its sums)."""
 
     STEPS: ClassVar[tuple[int, ...] | None] = (SCALE_DEPTH,)
     STEP_SCALED: ClassVar[bool] = True
@@ -1793,22 +1792,19 @@ class MosaicStepScaledGmm(_ScaledGmm):
 
     def _fp8(self, ba, dtype, family: mosaic.Family) -> bool:
         # An epilogue reads its exact sums as any product's (a next product's rows quantized there, row 8547):
-        # no prologue, its rows FP8 codes no hook forms; a pair's with its own column scales (row 12689).
+        # no prologue, its rows FP8 codes no hook forms.
         hooks = ba.arguments['hooks']
-        scales = len(ba.arguments.get('scales') or ())
         return (jnp.dtype(dtype) in family.fp8_formats and self.FP8 and hooks.prologue is None
-                and scales == (2 if ba.arguments.get('paired') is None else 3)
-                and bool(ba.arguments.get('exact_sums')))
+                and ba.arguments.get('paired') is None and bool(ba.arguments.get('exact_sums')))
 
     def candidate(self, ba, config: tiling.Tiles, target) -> bool:
         within = SCALE_DEPTH % config.block_n == 0
         return config.splits == 1 and not config.swapped and within and super().candidate(ba, config, target)
 
     def _registers(self, ba, config: tiling.Tiles, *, merging: bool, target) -> int | None:
-        # Beside the exact product's live set, a step's column scales, a paired matrix's too.
-        matrices = 1 if ba.arguments.get('paired') is None else 2
+        # Beside the exact product's live set, a step's column scales.
         return _beside(super()._registers(ba, config, merging=merging, target=target),
-                       matrices * _column_scale_registers(ba, config, target))
+                       _column_scale_registers(ba, config, target))
 
 
 @dataclasses.dataclass(frozen=True)

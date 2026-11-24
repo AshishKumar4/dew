@@ -353,10 +353,9 @@ def _swiglu(gate, up):
 @pytest.mark.parametrize("rows", [256, 384])
 def test_a_gated_blockwise_chain_through_the_template_is_its_three_projections_apart(rows):
     """A gated MLP's three blockwise FP8 projections chained (`projections.blockwise_chain`'s `gate`), on an
-    H100, interpreted, through the template named: the gate and up projections summed in one launch, each by
-    its own matrix and column scales (`mosaic_gpu.COLUMN_SCALES`), their SwiGLU quantized in its epilogue as
-    the down projection's rows; its value and every gradient bitwise the three projections apart with SwiGLU
-    between them in XLA (row 12689)."""
+    H100, interpreted, through the template named: the gate's product stored and read by the up projection's
+    epilogue as a tile beside its sum, their SwiGLU quantized there as the down projection's rows; its value
+    and every gradient bitwise the three projections apart with SwiGLU between them in XLA (row 12689)."""
     group_blocks = jnp.asarray([rows // 128], jnp.int32)
     rng = np.random.default_rng(12689)
     x = jnp.asarray(rng.normal(size=(rows, 256)), jnp.bfloat16)
