@@ -758,6 +758,7 @@ def test_a_fresh_fit_whose_placed_pool_holds_its_step_in_two_microbatches_splits
 
     from dew.data.dataset import Loader
     from dew.training import Layout, MeshSpec, Trainer
+    from dew.training.memory import admitted
 
     free, limit = 2 ** 39, 2 ** 40
     monkeypatch.setattr(jax.Device, "memory_stats",
@@ -781,20 +782,40 @@ def test_a_fresh_fit_whose_placed_pool_holds_its_step_in_two_microbatches_splits
         return free - probe["headroom"], probe["temp"], probe["beside"]
 
     (one, temp_one, beside_one), (two, temp_two, beside_two) = measured(1), measured(2)
-    # On `grown` below, `largest_free_block_bytes` and the pool's remaining growth are both `room`, so
-    # `memory.placeable_beside` admits a step once `room` holds both its temporaries and twice its `beside`.
-    block_one = max(temp_one, 2 * beside_one)
-    block_two = max(temp_two, 2 * beside_two)
-    assert two < one and block_two < block_one, ((one, temp_one, beside_one), (two, temp_two, beside_two))
+    assert two < one, (one, two)
     objective, batch = _decoder(remat="full", rows=rows)
     run = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=device,
                   layout=Layout(min_shard=1, tolerance=1.0))
     with chosen(narrow_copies='off'):
         state = max(run.validate(batch).device_bytes.values())
-    room = (block_one + block_two) // 2
     total = 2 * (state + one)
-    grown = {"bytes_limit": total, "bytes_in_use": 0, "pool_bytes": total - room,
-             "largest_free_block_bytes": room}
+
+    def pool(room: int) -> dict[str, int]:
+        # A pool grown to hold all but `room`, its largest free block and what it can still grow by.
+        return {"bytes_limit": total, "bytes_in_use": 0, "pool_bytes": total - room,
+                "largest_free_block_bytes": room}
+
+    def admits(room: int, temp: int, beside: int) -> bool:
+        # Whether the planner's admission of a placed step (`memory.admitted`) places `temp` temporaries
+        # beside `beside` bytes on the allocator reading `pool(room)`.
+        monkeypatch.setattr(jax.Device, "memory_stats", lambda device: pool(room))
+        headroom = admitted(jax.devices()[:1], 0, beside, temp)
+        assert headroom is not None
+        return headroom >= 0
+
+    def least(temp: int, beside: int) -> int:
+        # The least room in which the admission places the step, which grows with the room.
+        low, high = 0, total
+        while low < high:
+            middle = (low + high) // 2
+            low, high = (low, middle) if admits(middle, temp, beside) else (middle + 1, high)
+        return low
+
+    # The room between the least each microbatch count's step is placed in: one microbatch refused, two
+    # placed.
+    placed_one, placed_two = least(temp_one, beside_one), least(temp_two, beside_two)
+    assert placed_two < placed_one, ((one, temp_one, beside_one), (two, temp_two, beside_two))
+    grown = pool((placed_one + placed_two) // 2)
     monkeypatch.setattr(jax.Device, "memory_stats", lambda device: grown)
     with chosen(narrow_copies='off'):
         run.fit(stream, steps=2)
