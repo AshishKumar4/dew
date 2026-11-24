@@ -252,6 +252,8 @@ def _nearest(parts, lowest: int, digit: int, levels: int, limits, axes: tuple[st
     OR: as bools, a select taking them as values (`jnp.where(nonzero, under, sticky)`, the sign's choice of
     states) took Mosaic TPU an i1 vector of a splat's layout, which its widening to i8 could not relayout,
     every forked TPU scan with an entry write refused (rows 12124, 12125)."""
+    from dew.nn.kernels.launches import interpreting
+
     ints = jnp.dtype(f"int{limits.bits}")
     # A limb's bits, two of `split_bits`' low halves (`_product`).
     bits, mask, width = limits.bits, (1 << digit) - 1, 2 * split_bits(limits.dtype)[2]
@@ -293,10 +295,19 @@ def _nearest(parts, lowest: int, digit: int, levels: int, limits, axes: tuple[st
                                        for product, reduced, _ in parts])
     start = (zeros, (zeros,) * held, zeros, zeros - 1, (zeros,) * held, zeros)
     first, last = _levels(parts, lowest, digit, levels, limits, axes)
-    # A counter of the value's integers: x64 traced a 64-bit index where Mosaic's is 32 (row 8757).
-    _, states = jax.lax.while_loop(lambda carried: carried[0] < last,
-                                   lambda carried: (carried[0] + 1, step(carried[0], carried[1])),
-                                   (jnp.asarray(first, ints), (start, start)))
+    if interpreting() is not None:
+        # In a kernel's body its digits are all of them (`_levels`), walked unrolled: a loop's carry starting
+        # from zeros took Mosaic TPU a splat's replicated layout, to which its body's tiled one has no
+        # relayout, every forked TPU scan with an entry write refused (rows 12362, 12363). The same steps
+        # in the same order: the same bits.
+        states = (start, start)
+        for level in range(first, last):
+            states = step(jnp.asarray(level, ints), states)
+    else:
+        # A counter of the value's integers: x64 traced a 64-bit index where Mosaic's is 32 (row 8757).
+        _, states = jax.lax.while_loop(lambda carried: carried[0] < last,
+                                       lambda carried: (carried[0] + 1, step(carried[0], carried[1])),
+                                       (jnp.asarray(first, ints), (start, start)))
     negative = states[0][0] < 0
     _, _, _, lead, kept, sticky = jax.tree.map(lambda p, n: jnp.where(negative, n, p), *states)
     return _written(lead, kept, sticky, negative, lowest, digit, limits)
