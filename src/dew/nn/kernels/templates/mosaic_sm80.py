@@ -865,6 +865,11 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         del producer  # no producer role of its own
         self.pingponged(pingpong)
         _most(self, consumers)
+        if consumers > 1 and len(outputs) > 1:
+            # Their staging opens together once a tile (`finished`), each output's beside the others', which
+            # a launch's plan charges one output at a time (`resources.scratch_bytes`' tiles after its walks).
+            raise NotImplementedError(f"two {self.name} consumers stage one output a tile, not "
+                                      f"{len(outputs)}")
         # Each tile's pipeline fills and drains before its output copy. Synchronize at that lifetime
         # boundary so the output's shared memory can reuse the pipeline's slots. Two consumers stage their
         # rows side by side in one collective scope, opened once a tile where both finish it (`finished`):
@@ -1113,11 +1118,14 @@ class Mma(MmaIssuer, CpAsync):
 
 def _dispatched(segments: tuple) -> Callable:
     """One step taking each of `segments`' steps `(step, lo, hi)` at its own place: the step of the segment
-    whose range holds its index, the segments laid end to end."""
+    whose range holds its index, nothing where none does (a gap between segments, its tiles loaded and
+    unread)."""
     def step(index, slots, carried, accumulators):
-        segment = sum((index >= lo).astype(jnp.int32) for _, lo, _ in segments[1:])
-        return lax.switch(segment, [functools.partial(each, index, slots) for each, _, _ in segments],
-                          carried, accumulators)
+        held = [((index >= lo) & (index < hi)).astype(jnp.int32) * (at + 1)
+                for at, (_, lo, hi) in enumerate(segments)]
+        branches = [lambda carried, accumulators: (carried, accumulators),
+                    *(functools.partial(each, index, slots) for each, _, _ in segments)]
+        return lax.switch(sum(held), branches, carried, accumulators)
 
     return step
 
