@@ -388,38 +388,21 @@ WORK_LIST_GPUS = tuple(name for name in GATED if staged_widths(name, jnp.bfloat1
 `staged_widths`), each the work list's gate compiles for."""
 
 
-DECODE_CANDIDATES = [(generation_name, width, stored, call) for generation_name in WORK_LIST_GPUS
+DECODE_GATE = [(generation_name, width, stored, call) for generation_name in WORK_LIST_GPUS
                if generation_name in FAMILY_GPUS
                for width in staged_widths(generation_name, jnp.bfloat16)
                if generation_name == "sm90" or width == max(staged_widths(generation_name, jnp.bfloat16))
                for stored in ("bfloat16", "int8", "float32")
                for call, positions, heads, kv_heads in WORK_LISTS
                if stored == "bfloat16" or call == "decode"]
-"""The work list gate's candidate cells: each family's GPU the route serves the work list on
-(`WORK_LIST_GPUS`, `FAMILY_GPUS`), at its widest staged head and on an H100 each width its bundles stage
-(row 12438; `staged_widths`, the declarations the route's legality reads: a 32-wide call's mma.sync launch
-was no case of the gate's 64 and 128, and its magnitudes' transposed load failed on an H100, IG-FINAL3),
-each cache of a decode step (bf16, int8 codes, an fp32 query's parts) and a bf16 inference call."""
+"""The work list gate's cells: each family's GPU the route serves the work list on (`WORK_LIST_GPUS`,
+`FAMILY_GPUS`), at its widest staged head and on an H100 each width its bundles stage (row 12438;
+`staged_widths`, the declarations the route's legality reads: a 32-wide call's mma.sync launch was no case
+of the gate's 64 and 128, and its magnitudes' transposed load failed on an H100, IG-FINAL3), each cache of
+a decode step (bf16, int8 codes, an fp32 query's parts) and a bf16 inference call; a cell decides as it
+runs whether the route serves it as the work list (`_served`), so collecting the gate derives no tiles (its
+96 derivations took 59 of the module's 67 s import, every CI shard's)."""
 
-DECODE_GATE = [
-    *((name, 256, stored, call) for name in ("sm80", "sm86")
-      for stored, call in (("bfloat16", "decode"), ("bfloat16", "prefill"), ("int8", "decode"))),
-    *(("sm90", width, stored, call) for width in (32, 64, 128, 256)
-      for stored, call in (("bfloat16", "decode"), ("bfloat16", "prefill"), ("int8", "decode"),
-                           ("float32", "decode"))),
-    *((name, 256, stored, call) for name in ("sm100", "sm120")
-      for stored, call in (("bfloat16", "decode"), ("bfloat16", "prefill"), ("int8", "decode"))),
-]
-"""The work list gate's cells: the candidates the route serves as the work list (`_served`), stated so that
-collecting the gate derives no tiles (its 96 derivations took 59 of the module's 67 s import, every CI
-shard's); `test_the_work_list_gate_is_the_cells_the_route_serves` derives them once."""
-
-def test_the_work_list_gate_is_the_cells_the_route_serves():
-    """The gate's stated cells (`DECODE_GATE`) are its candidates the route serves as the work list
-    (`_served`), in order: a change to the route's legality that serves or declines a candidate shows here."""
-    served = [(name, width, stored, call) for name, width, stored, call in DECODE_CANDIDATES
-              if _served(name, *next(shape for each, *shape in WORK_LISTS if each == call), width, stored)]
-    assert served == DECODE_GATE
 
 
 @COMPILES_ON_CPU
@@ -439,6 +422,7 @@ def test_a_decode_step_compiles_spill_free_at_its_plans_tiles(generation_name, w
     from dew.nn.kernels.templates import attention_decode
 
     positions, heads, kv_heads = next(shape for name, *shape in WORK_LISTS if name == call)
+    served = _served(generation_name, positions, heads, kv_heads, width, stored)
     rows, keys = 2, 4096 if positions == 1 else positions
     query = jax.ShapeDtypeStruct((rows, positions, heads, width),
                                  jnp.float32 if stored == "float32" else jnp.bfloat16)
@@ -449,7 +433,11 @@ def test_a_decode_step_compiles_spill_free_at_its_plans_tiles(generation_name, w
              if positions == 1 else template.spans(positions, keys, rows, causal=True))
 
     def decode(query, key, value, *scales):
-        return attention_decode.attend(query, key, value, spans, scales=scales or None)
+        # A 16-bit or fp32 cache the work list does not serve runs as the route runs it (`_served`), the
+        # cell compiling that; an int8 cache's refusal is certified below.
+        if served or quantized:
+            return attention_decode.attend(query, key, value, spans, scales=scales or None)
+        return attention_route.attend(query, key, value, spans, natural=False)
 
     operands = (query, key, key, *((scale, scale) if quantized else ()))
     with generation.assumed(generation_name):
