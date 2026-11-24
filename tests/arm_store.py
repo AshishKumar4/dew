@@ -8,7 +8,8 @@ import dataclasses
 import functools
 import itertools
 import os
-from collections.abc import Callable, Mapping
+import warnings
+from collections.abc import Callable, Iterable, Mapping
 
 import jax
 import numpy as np
@@ -58,6 +59,43 @@ def _arm_compile(compile: Callable, written: dict | None) -> Callable:
     return compiled
 
 
+_CONCRETE = (jax.errors.ConcretizationTypeError, jax.errors.TracerArrayConversionError,
+             jax.errors.TracerIntegerConversionError, jax.errors.TracerBoolConversionError)
+"""What a draw raises traced abstractly (`jax.eval_shape`) where it reads a concrete value of what it draws:
+its shapes decided on the host by those values, which only its real draw gives."""
+
+
+class ConcreteDraws(UserWarning):
+    """A prepared site whose draws read a concrete value of what they draw (`_CONCRETE`), each of them drawn
+    in full to learn its shapes: its programs are right, its prepare's time spent on those draws."""
+
+
+def _first_draws(draw, seeds: Iterable[int], label: str) -> list:
+    """The real draw (`drawn_on_the_host`) of each of `seeds` whose shapes no earlier seed's draw had, in seed
+    order: each seed's shapes read from its draw traced abstractly (`jax.eval_shape`: no array made), its real
+    draw made for a new one alone, so site `label`'s programs are those of these draws, each its first seed's,
+    as every draw's would be (row 12431: a Gemma vocabulary's 1,280 draws of a 64 MiB head, all for one
+    program). The seeds drawn in full to learn their shapes are counted, a `ConcreteDraws` warning."""
+    firsts, concrete, seen = [], 0, set()
+    for seed in seeds:
+        try:
+            shapes = jax.eval_shape(functools.partial(drawn_on_the_host, draw, seed))
+        except _CONCRETE:
+            # A draw that reads a concrete value decides its shape on the host: its real draw keys it.
+            concrete += 1
+            firsts.append(drawn_on_the_host(draw, seed))
+            continue
+        leaves, tree = jax.tree.flatten(shapes)
+        key = (str(tree), tuple((leaf.shape, str(leaf.dtype), leaf.weak_type) for leaf in leaves))
+        if key not in seen:
+            seen.add(key)
+            firsts.append(drawn_on_the_host(draw, seed))
+    if concrete:
+        warnings.warn(f"{label}: {concrete} of its draws read a concrete value of what they draw, each drawn "
+                      f"in full to learn its shapes", ConcreteDraws, stacklevel=2)
+    return firsts
+
+
 def _compile_arms(store: CompiledTruths, arms: Mapping[str, tuple[Callable, bool]], draw, label: str, *,
                   seeds: int, orders, compile: Callable, sizing: range = range(0),
                   written: bool = False) -> None:
@@ -83,8 +121,8 @@ def _compile_arms(store: CompiledTruths, arms: Mapping[str, tuple[Callable, bool
         # prepare computes nothing on its host (bible §8), and its trace refuses an arm that cannot trace.
         _refuse_numpy_arms(draw, *(fn for _, fn, _ in named_arms.values()))
     inputs: dict[str, tuple] = {}
-    for seed in itertools.chain(range(staged_units(seeds)), sizing):
-        drawn = drawn_on_the_host(draw, seed)
+    staged = itertools.chain(range(staged_units(seeds)), sizing)
+    for drawn in _first_draws(draw, staged, armed(label, written)):
         for ordered in (drawn,) if orders is None else orders(drawn):
             inputs.setdefault(named("arms", ordered), ordered)
     programs: dict = {}
@@ -357,9 +395,11 @@ def compile_site(store: CompiledTruths, dew_fn, reference_fn, draw, label: str, 
         terms_fn, also = _site(dew_fn, reference_fn, label, seeds=seeds, truth_fn=truth_fn, library_fn=None,
                                library_row=None, library_leaves=(), also=also, terms=terms)
         truth = truth_fn if truth_fn is not None else reference_fn
+        # One draw of each shapes' (`_first_draws`), widened to name its truth's program: widening is its
+        # draw's shapes' alone, so the programs are the ones every draw widened would name, each the first
+        # draw of its shapes', with no float64 copy of every staged draw made.
         shaped = {}
-        for seed in range(staged_units(seeds)):
-            inputs = drawn_on_the_host(draw, seed)
+        for inputs in _first_draws(draw, range(staged_units(seeds)), label):
             shaped.setdefault(named("truth", widened(inputs)), inputs)
 
         # The algebra's switch and the kernels' report read where a site prepares, never at load: a test of
