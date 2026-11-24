@@ -310,27 +310,33 @@ def test_a_chunks_faint_system_weight_keeps_what_a_large_input_raises():
                                        pair(0.0, 0.0, keys=3))
 
 
-def test_a_chunk_solves_its_inputs_once(monkeypatch):
-    """ReviewMomentum1454's double solve (row 12693): the chunked op's forward program builds one solve a
-    chunk, its walk's step's scaled substitution (`coupled_scan._substituted`), which its outputs read again
-    (`forms.Derived`'s `kept`), and no triangular solve beside it, where the outputs' map solved the chunk's
-    system a second time and each solve ran a float and a scaled solver both."""
+def test_a_chunks_faint_overlap_keeps_what_a_large_input_raises():
+    """ReviewMomentum1454's faint overlap (row 12693): two tokens, the first's key along the second key plus
+    2^-75 along the first and its erase key along the third, the second's key along the second key and its
+    erase key along the third plus 2^-75 along the first, values -2^100 and none, every decay and gate one,
+    queries along the second key: the chunked op is the decode step, where the second erase key's overlap
+    with the first key, 2^-150, rounded to zero before the first token's input of 2^100 raised it to the
+    second's -2^-50."""
+    rows = jnp.eye(3, dtype=jnp.float32)
+    keys = jnp.stack([rows[1] + 2.0 ** -75 * rows[0], rows[1]])[None, :, None]
+    erase = jnp.stack([rows[2], rows[2] + 2.0 ** -75 * rows[0]])[None, :, None]
+    value = jnp.asarray([-(2.0 ** 100), 0.0], jnp.float32).reshape(1, 2, 1, 1)
+    gates = jnp.ones((1, 2, 1), jnp.float32)
+    assert_chunks_are_the_decode_steps(along(2, 3, 1), keys, erase, value, gates, jnp.zeros_like(gates),
+                                       pair(0.0, 0.0, keys=3))
+
+
+def test_a_chunk_solves_its_inputs_with_no_float_solver():
+    """ReviewMomentum1454's double solve (row 12693): the chunked op's forward program holds no triangular
+    solve: a chunk's inputs are its step's one scaled substitution, which its outputs read again
+    (`forms.Derived`'s `kept`), where the outputs' map solved the chunk's system a second time and each
+    solve ran a float solver beside the scaled one."""
     from jax.lax import linalg
 
-    from dew.algebra import coupled_scan
     from dew.nn.programs import equations
 
-    built = []
-    solve = coupled_scan._substituted
-
-    def counted(*given):
-        built.append(given)
-        return solve(*given)
-
-    monkeypatch.setattr(coupled_scan, "_substituted", counted)
     *given, _ = operands(jnp.float32, untied=False)(0)
     program = jax.make_jaxpr(lambda *x: tied(chunked(TIED))(*x))(*given)
-    assert len(built) == 1
     assert not any(equation.primitive is linalg.triangular_solve_p for equation in equations(program.jaxpr))
 def faint(seed):
     """A chunk of 16 tokens whose last decays the memory by about exp(-86), every other's one, its keys
@@ -362,15 +368,17 @@ def test_a_decay_past_float32s_least_normal_keeps_the_memorys_normal_reads():
 
 
 def test_an_exact_zero_decay_is_differentiated_finite():
-    """ReviewMomentum1454's -inf (row 12693): log decays of -inf (an exact zero, admitted by their range) at
-    a packed row's tokens, one a document's first: the chunked op's output and every operand's gradient
-    finite, the -inf decays' own gradients zero, where the replay's faint arm read -inf less its nearest
-    integer, NaN, through its derivative."""
+    """ReviewMomentum1454's -inf (row 12693): log decays of -inf (an exact zero, admitted by their range) and
+    of float32's least at a packed row's tokens, one a document's first: the chunked op's output and every
+    operand's gradient finite, those decays' own gradients zero, where the replay's faint arm read -inf less
+    its nearest integer, NaN, through its derivative (float32's least overflowing to -inf in its base-2
+    split)."""
     *given, cotangent = operands(jnp.float32, untied=False)(1)
     q, k, v, log_decay, beta, mu, state = given
-    log_decay = log_decay.at[:, 3].set(-jnp.inf).at[:, 11].set(-jnp.inf)
+    least = -jnp.finfo(jnp.float32).max
+    log_decay = log_decay.at[:, 3].set(-jnp.inf).at[:, 11].set(-jnp.inf).at[:, 7].set(least)
     starts = marked(DOCUMENTS, LENGTH)
     rule = with_gradients(lambda *x: tied(chunked(TIED))(*x, starts=starts))
     out, *grads = jax.jit(rule)(q, k, v, log_decay, beta, mu, state, cotangent)
     assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves((out, grads)))
-    np.testing.assert_array_equal(np.asarray(grads[3][:, [3, 11]]), 0.0)
+    np.testing.assert_array_equal(np.asarray(grads[3][:, [3, 7, 11]]), 0.0)

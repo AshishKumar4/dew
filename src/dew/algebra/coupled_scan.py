@@ -172,9 +172,12 @@ def _decayed(state, exponent, base2: bool, cut) -> tuple:
     (`_exponential`), never the decay landed alone, nor a cotangent scaled beneath the least normal before
     the state it meets (power2's pullback scales its cotangent first)."""
     decay = _exp(base2, exponent)
-    # A faint decay's exponent finite (an exact zero's, -inf, read as none): neither arm reads -inf less
-    # its own nearest integer, NaN, nor differentiates through it (ReviewMomentum1454).
-    faint = (jnp.abs(decay) < np.finfo(decay.dtype).tiny) & jnp.isfinite(exponent) & ~cut
+    # A faint decay's exponent above the least any finite state outlives (beneath it, an exact zero's -inf
+    # or float32's least, the decay of the largest state underflows, read as none): neither arm reads -inf
+    # less its own nearest integer, NaN, nor differentiates through it (ReviewMomentum1454).
+    limits = np.finfo(decay.dtype)
+    outlived = -(limits.maxexp - limits.minexp + limits.nmant + 2) * (1.0 if base2 else math.log(2.0))
+    faint = (jnp.abs(decay) < limits.tiny) & (exponent > outlived) & ~cut
     exponent = jnp.where(faint, exponent, 0.0)
     if base2:
         high, low = exponent, jnp.zeros_like(exponent)
@@ -418,7 +421,10 @@ def _prepared(first, second, lam, b, u, c, q, r, cut, *, base2: bool) -> Chunked
     alpha, mu = _exponential(first, base2, cut), _exponential(second, base2, cut)
     g, last, kept = _decayed_sums(alpha, mu, lam)
     before = _shifted(g, 0.0)
-    lower = scaled.mul(scaled.scaled(c @ b.T), _sliced(before, (..., slice(1, None))))
+    # Each overlap `C_t . B_s` a key at a time in scaled arithmetic, never rounded alone beneath the least
+    # normal before its weight (2^-150 over 2^100, ReviewMomentum1454).
+    overlaps = _summed(_outer, (c.T, b.T), (c.shape[0], b.shape[0]))
+    lower = scaled.mul(overlaps, _sliced(before, (..., slice(1, None))))
     ends = _sliced(g, -1)
     return Chunked(
         lower=lower, inputs=u, corrections=c, kept_before=_shifted(kept, 1.0),
