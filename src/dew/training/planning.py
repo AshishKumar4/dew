@@ -41,13 +41,10 @@ from dew.mesh import LayoutRefused
 from dew.nn.kernels.options import (
     OuterProgram,
     compiler_options,
-    held,
-    hold,
     owned_program,
     program_key,
     running,
     shapes_of,
-    unhold,
 )
 from dew.nn.kernels.templates import report
 from dew.objectives.base import RECORD, Objective, Pooled, head_fused_of, head_tile_of
@@ -370,7 +367,7 @@ class Probe:
     argument: int | None
     ahead: bool = False
     """Whether the executable was compiled before this search, not by it: the step compiled ahead
-    (`FitSearch.ahead`), or one a search before it compiled (`dew.nn.kernels.options.held`)."""
+    (`FitSearch.ahead`), or one a search before it compiled (`FitSearch.executables`)."""
     compile_seconds: float = 0.0
     """Time spent compiling or loading this program, apart from its shape trace and lowering."""
     spent: Mapping[str, float] = dataclasses.field(default_factory=dict)
@@ -696,8 +693,8 @@ def guided_compile(lowered: jax.stages.Lowered, options: jax.stages.CompilerOpti
 
 def compiled_key(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,
                  devices: Sequence) -> Hashable:
-    """The key of the executable a plan compiles from `lowered` under `options` for `devices`, which the
-    process holds across its trainers (`dew.nn.kernels.options.hold`): the program within this process
+    """The key of the executable a plan compiles from `lowered` under `options` for `devices`, which a
+    run's searches hold for each other (`FitSearch.executables`): the program within this process
     (`program_key`), one for a lowering over a state's shapes before it is placed and over the placed state,
     the options as text, and the devices it loads on."""
     return program_key(lowered), repr(sorted((options or {}).items())), tuple(devices)
@@ -870,7 +867,7 @@ class FitSearch[LossT, EffectsT]:
     provisional: bool = False
     """Whether the search judges devices other than the ones the step runs on as they will stand: before
     the state is placed (`unplaced`) or off the loop while an earlier phase holds them
-    (`dew.training.ahead.LaterPlans`). It holds every executable it compiles (`dew.nn.kernels.options.hold`),
+    (`dew.training.ahead.LaterPlans`). It holds every executable it compiles (`executables`),
     one that missed among them, for the plan made on the devices as they stand to judge again in place of
     compiling it; a search that is not holds those that fit alone, and drops a held one that misses on its
     devices, which no plan after it asks for."""
@@ -888,9 +885,15 @@ class FitSearch[LossT, EffectsT]:
     asked: list[Rung] = dataclasses.field(default_factory=list)
     """The rungs its search asked past the one it stood on first (`searched`), which a plan made offline
     asks none of again (`below`)."""
+    executables: dict[Hashable, jax.stages.Compiled] = dataclasses.field(default_factory=dict)
+    """The executables its run's searches hold for each other, by key (`compiled_key`), the run's compiler's
+    (`dew.training.compiler.StepCompiler`): a plan of the same program on the same devices, a provisional
+    search's in a placed one's or a refit's, steps on one compiled before, and none is held past the run, a
+    later trainer of the process reading its step back from the persistent compilation cache (row 12131's
+    leak: a process-wide store kept a dropped run's device code and its collectives' room)."""
     holding: set[Hashable] = dataclasses.field(default_factory=set)
-    """The executables it held for the process (`dew.nn.kernels.options.hold`), by key: each a plan may
-    step on, until the search settles and drops every one but its plan's (`released_unplanned`)."""
+    """The keys of the executables it put among `executables`: each a plan may step on, until the search
+    settles and drops every one but its plan's (`released_unplanned`)."""
     kernels: dict[str, JSON] = dataclasses.field(default_factory=dict)
     """What the templates' reports found where the search compiled (`admitted`): each kernel its compiles
     found spilling (`report.misses`, `spill_record`), each launch config they refused
@@ -914,22 +917,22 @@ class FitSearch[LossT, EffectsT]:
 
     def released_unplanned(self, planned: Planned | None, *, settled: bool = False) -> None:
         """Drop what the search kept of every program it compiled but the plan's, now it settled on
-        `planned`: each executable it held but the plan's step's and its sampled step's (`unhold`), and each
-        traced step it kept for a refit but the plan's (`dew.training._candidates.forget_unplanned`), every
-        losing rung's and every frontier rung's (`above`, `below`) among them. A loaded executable holds its
-        device code and, over several GPUs, its collectives' room outside XLA's pool for as long as it lives
-        (row 12131: 24 kept beside a 4B run's step left an all-reduce no room on a 2xH100). A provisional
-        search keeps them, for the plan made on the devices as they stand to take (`provisional`), until a
-        plan is taken in its place (`settled`): its own, or the one a search on the placed devices made,
-        whose programs it then keeps where it compiled them too; none (`planned` None), every one dropped (a
-        later phase's search its run abandoned, `dew.training.ahead.LaterPlans`)."""
+        `planned`: each executable it held but the plan's step's and its sampled step's (`executables`), and
+        each traced step it kept for a refit but the plan's (`dew.training._candidates.forget_unplanned`),
+        every losing rung's and every frontier rung's (`above`, `below`) among them. A loaded executable holds
+        its device code and, over several GPUs, its collectives' room outside XLA's pool for as long as it
+        lives (row 12131: 24 kept beside a 4B run's step left an all-reduce no room on a 2xH100). A
+        provisional search keeps them, for the plan made on the devices as they stand to take (`provisional`),
+        until a plan is taken in its place (`settled`): its own, or the one a search on the placed devices
+        made, whose programs it then keeps where it compiled them too; none (`planned` None), every one
+        dropped (a later phase's search its run abandoned, `dew.training.ahead.LaterPlans`)."""
         if self.provisional and not settled:
             return
         from dew.training._candidates import forget_unplanned
 
         if planned is None:
             for key in self.holding:
-                unhold(key)
+                self.executables.pop(key, None)
             self.holding.clear()
             forget_unplanned([candidate.lowered for candidate in self.lowered.values()], None)
             return
@@ -938,7 +941,7 @@ class FitSearch[LossT, EffectsT]:
                                                  else [sampled.lowered])]
         stepped = {self.compiled_key(program, planned.options) for program in lowered}
         for key in self.holding - stepped:
-            unhold(key)
+            self.executables.pop(key, None)
         self.holding &= stepped
         forget_unplanned([candidate.lowered for candidate in self.lowered.values()],
                          planned.candidate.lowered)
@@ -1097,7 +1100,7 @@ class FitSearch[LossT, EffectsT]:
             began = time.perf_counter()
             early, firsts, relowered = None, [], None
             looked = self.compiled_key(candidate.lowered, options)
-            kept = held(looked)
+            kept = self.executables.get(looked)
             if ahead is not None:
                 executable, self.ahead = admitted_or_missed(lambda: ahead.taken(candidate.lowered),
                                                             self.refusals), None
@@ -1122,10 +1125,10 @@ class FitSearch[LossT, EffectsT]:
                 # Under the program it compiled: the relowered one past a spill, which a plan after it lowers
                 # directly, the spill's refusal held for the process. One that misses on the devices the
                 # step runs on is no step's, its device code held for nothing.
-                hold(key, executable)
+                self.executables[key] = executable
                 self.holding.add(key)
             elif kept is not None and executable is kept and not fit and not self.provisional:
-                unhold(key)
+                self.executables.pop(key, None)
             self.sampled = None
             if fit and candidate.sampled is not None:
                 if ahead is not None and ahead.sampled is not None:

@@ -237,9 +237,9 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
 def forget(lowered: jax.stages.Lowered) -> None:
     """Drop every step this process keeps for a trainer built anew (`candidate_for`) whose program is
     `lowered`'s (`program_key`): one whose executable a compile guided by a profile supersedes
-    (`Planned.guided`), whether compiled from `lowered` or taken from `options._HELD` after an earlier
-    trainer lowered it, so no kept lowering holds the superseded executable alive beside the guided one (JAX
-    keeps each executable of a lowering while it lives)."""
+    (`Planned.guided`), whether compiled from `lowered` or taken from its run's compiler's executables
+    (`FitSearch.executables`), so no kept lowering holds the superseded executable alive beside the guided
+    one (JAX keeps each executable of a lowering while it lives)."""
     target = program_key(lowered)
     with _KEEPING:
         # Its trees first, so only a lowering of the same shapes renders its text to compare.
