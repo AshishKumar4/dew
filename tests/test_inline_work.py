@@ -140,3 +140,71 @@ def test_a_copy_through_the_launch_context_moves_its_shared_tile_once():
         ctx.async_copy(src_ref=ref, dst_ref=ref)
 
     assert _counted(copied) == Work(device_bytes=4 * 128, shared_bytes=4 * 128)
+
+
+def test_a_tickets_elected_and_last_lanes_move_their_words_alone():
+    """A ticket's PTX (`across.arrived`'s) guards its atomic by the lane it elects itself (`setp` on an
+    operand whose lanes are known: the first thread) and its reset by the last arriver among it: the atomic
+    moves one lane's word, the reset at most that lane's, where a block's own predicate once refused it."""
+    def ticket(ctx, ref):
+        del ctx, ref
+        i32 = ir.IntegerType.get_signless(32)
+        thread = arith.remui(mgpu_utils.thread_idx(), arith.constant(i32, 128))
+        count = arith.constant(i32, 1)
+        mgpu_utils.inline_ptx("""{
+            .reg .pred elected, last;
+            .reg .b32 before;
+            setp.eq.u32 elected, $1, 0;
+            @elected atom.acq_rel.gpu.global.add.u32 before, [$2], 1;
+            setp.eq.and.u32 last, before, $3, elected;
+            @last st.relaxed.gpu.global.u32 [$2], 0;
+            selp.u32 $0, 1, 0, last;
+            }""", thread, count, count, result_types=i32, has_side_effects=True)
+
+    assert _counted(ticket) == Work(device_bytes=8 + 4)
+
+
+def test_a_launch_contexts_copy_counts_under_its_branch_and_loop():
+    """A copy a body asks its launch context for inside a branch no lane takes moves nothing, and inside a
+    static loop of two trips moves its tile twice: it is counted where the body asks for it."""
+    def untaken(ctx, ref):
+        with mgpu_utils.when(_thread(0)):
+            ctx.async_copy(src_ref=ref, dst_ref=ref)
+
+    assert _counted(untaken) == Work()
+
+    def looped(ctx, ref):
+        index = ir.IndexType.get()
+        lower, upper, step = (arith.constant(index, value) for value in (0, 2, 1))
+        for_op = scf.ForOp(lower, upper, step)
+        with ir.InsertionPoint(for_op.body):
+            ctx.async_copy(src_ref=ref, dst_ref=ref)
+            scf.YieldOp([])
+
+    assert _counted(looped) == Work(device_bytes=2 * 4 * 128, shared_bytes=2 * 4 * 128)
+
+
+@pytest.mark.parametrize("form", ["encode-e4m3", "decode-nvfp4"])
+def test_a_forms_inline_block_compiles_for_an_h100(form):
+    """A bit form inlined as one PTX block a word (`inline_forms.registers`) compiles for an H100 on any
+    host, its one output register the block's value (an encode's, a quantized GEMM epilogue's: LLVM refuses
+    a struct of one output) and several a struct of them (a decode's)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    from dew.algebra import bits
+    from dew.nn.kernels.templates import inline_forms
+
+    chosen = bits.encode_form(bits.E4M3) if form == "encode-e4m3" else bits.NVFP4_BFLOAT16_FORM
+    shape = (64, 16)
+
+    def body(words_ref, *out_refs):
+        words = plgpu.layout_cast(words_ref[...], plgpu.Layout.WGMMA)
+        for out_ref, register in zip(out_refs, inline_forms.registers(chosen, words, plgpu.Layout.WGMMA),
+                                     strict=True):
+            out_ref[...] = register
+
+    launch = plgpu.kernel(body, out_type=(jax.ShapeDtypeStruct(shape, jnp.uint32),) * len(chosen.outputs),
+                          num_threads=1, thread_name="wg")
+    case = KernelCase(form, lambda: (launch, (jax.ShapeDtypeStruct(shape, jnp.uint32),)))
+    assert not (failed := mosaic_failures(compile_mosaic_kernels([case], "sm90"))), failed
