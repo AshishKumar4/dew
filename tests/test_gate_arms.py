@@ -293,6 +293,20 @@ def test_an_arm_whose_launch_takes_a_local_hook_runs_from_its_store(tmp_path):
     np.testing.assert_array_equal(found, expected)
 
 
+def test_a_held_records_source_traceback_is_held_as_none():
+    """A source traceback a site's held record holds (a held launch's equation's, beside its program), which
+    pickle refuses, is held as none (`truths_ahead._held_bytes`), never refusing the store (row 12665:
+    test_algebra_fusion's normed prologues failed their dry prepare with 'cannot pickle
+    jaxlib._jax.Traceback objects')."""
+    import truths_ahead
+    from jax._src.lib import xla_client
+
+    traceback = xla_client.Traceback.get_traceback()
+    assert traceback is not None
+    held = pickle.loads(truths_ahead._held_bytes({"launches": [{"where": traceback, "kept": 3}]}))
+    assert held == {"launches": [{"where": None, "kept": 3}]}
+
+
 def test_a_held_function_pickle_refuses_by_its_type_is_held_by_its_name(monkeypatch):
     """A function in a site's held record that pickle refuses with a TypeError (a closure holding a jaxlib
     Traceback, as a fused GEMM's hook does) is held by its name like one pickle cannot name, never refusing

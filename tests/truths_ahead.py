@@ -89,9 +89,16 @@ class HeldName:
 class _HeldPickler(pickle.Pickler):
     """A site's held record pickled as pickle pickles it, but a function pickle names by no module
     (`HeldName`): a local hook of a launch (a GEMM prologue's, a derivative's span) is no function its run
-    calls (rows 9584, 9600: a held launch refused the store, its arms compiled nothing ahead)."""
+    calls (rows 9584, 9600: a held launch refused the store, its arms compiled nothing ahead); and a source
+    traceback, held as none."""
 
     def reducer_override(self, obj):
+        from jax._src.lib import xla_client
+
+        if isinstance(obj, xla_client.Traceback):
+            # A source traceback (a launch's equation's, an error's): where it was traced, which its run never
+            # reads, and pickle refuses (a fused GEMM's held launch, row 12665's prepares).
+            return type(None), ()
         if not isinstance(obj, types.FunctionType):
             return NotImplemented
         try:

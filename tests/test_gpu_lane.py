@@ -385,7 +385,8 @@ def test_only_a_dry_prepare_runs_under_a_time_cap(ci, tmp_path, monkeypatch, cap
                         threads="1", users=False, variant="@prepare-sm90", capped=capped)
     wire = ci.tier_wire()
     if not capped:
-        assert wire.PREPARE_BY not in seen["environ"]
+        # Cleared, so a cap the caller's environment carries reaches no part's prepare.
+        assert seen["environ"][wire.PREPARE_BY] == "" and not wire.past_cap(seen["environ"])
         return
     cap = float(seen["environ"][wire.PREPARE_BY])
     assert began + seen["seconds"] - ci.prepares.CAP_MARGIN <= cap <= time.monotonic() + seen["seconds"]
