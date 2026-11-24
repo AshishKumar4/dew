@@ -20,7 +20,7 @@ from arm_arithmetic import float64_held
 from flax import linen as nn
 from jax.experimental import checkify
 from map_judge import marked_seeds
-from model_support import Digits, compiled_apply, decoder, serving_task as task
+from model_support import Digits, attending, compiled_apply, decoder, serving_task as task
 from reference_error import as_given, assert_as_exact, dew_path
 from serving_support import (
     Served,
@@ -46,7 +46,6 @@ from dew.nn.inputs import MixerCall
 from dew.nn.kv_cache import POOLED, KVCache, leaf_name, row_axis
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import CausalSelfAttention
-from dew.nn.protocols import held_groups
 from dew.nn.sharding import boxed
 from dew.sampling import Sampling, Speculative
 from dew.training import Layout, MeshSpec
@@ -62,11 +61,6 @@ MIXED_STEP_SEEDS, ADAPTER_SET_SEEDS, ADAPTED_LAYERS_SEEDS = 256, 256, 8
 """The declared seeds of the mixed step's two sites, the served adapter set's two and the adapter set over
 different layers', each sized paired by `seeds_for` on armada's CPUs (2026-11-12, eg-serving-sized at
 eff3f59346b), where each run sized them again (46 to 114 s a site)."""
-
-
-
-
-
 
 
 def test_a_server_draws_at_its_tasks_progress_and_at_each_version_it_loads():
@@ -177,11 +171,12 @@ def test_a_server_decoding_on_one_device_prefills_its_split_rows_through_each_de
         assert_same_draws(ticket.result(), lone)
 
 
+@attending("xla")
 def test_prepacked_queries_keys_and_values_preserve_attention_and_cache():
     """Biases, head norms, RoPE and the cached append still read the same projections."""
     with jax.enable_x64():
         model = CausalSelfAttention(MixerContext(emb_features=8, num_heads=2, num_kv_heads=1, head_dim=4,
-                                                 max_seq_len=64, attention_bias=True, attention_impl="xla",
+                                                 max_seq_len=64, attention_bias=True,
                                                  dtype=jnp.float64))
         x = jnp.arange(32, dtype=jnp.float64).reshape(1, 4, 8) / 32
         variables = nn.unbox(model.init(jax.random.key(0), x))
@@ -207,6 +202,7 @@ def test_prepacked_queries_keys_and_values_preserve_attention_and_cache():
             np.testing.assert_array_equal(after, before)
 
 
+@attending("xla")
 def test_a_server_holds_its_weights_at_decoding_storage_and_reloads_into_it():
     """A server over a bf16 decoder's fp32 masters holds what a load at bf16
     storage holds, its head bias fp32, and a reload of trained fp32 weights
@@ -217,7 +213,7 @@ def test_a_server_holds_its_weights_at_decoding_storage_and_reloads_into_it():
     from dew.interop import Pretrained
 
     masters, native = (Pretrained.load(Path(__file__).parent / "fixtures/hf/phi-tiny", dtype="bfloat16",
-                                       attention_impl="xla", max_seq_len=64, **storage)
+                                       max_seq_len=64, **storage)
                        for storage in ({}, {"param_dtype": "bfloat16"}))
     assert native.variables["params"]["head_bias"].dtype == jnp.float32
     sampling = Sampling(temperature=0, eos_token_ids=None)
@@ -280,7 +276,7 @@ def _host_loaded(dtype="float32"):
     from dew.interop import Pretrained
 
     loaded = Pretrained.load(Path(__file__).parent / "fixtures/hf/phi-tiny", dtype=dtype,
-                             attention_impl="xla", max_seq_len=64, on_host=True)
+                             max_seq_len=64, on_host=True)
     assert all(isinstance(leaf, np.ndarray) for leaf in jax.tree.leaves(loaded.variables["params"]))
     return loaded.text_generation(sampling=Sampling(temperature=0, eos_token_ids=None))
 
@@ -306,6 +302,7 @@ def test_a_served_length_limit_truncates_a_request_as_a_direct_call_does():
         assert direct.terminated.tolist() == served.terminated.tolist() == [terminated]
 
 
+@attending("xla")
 def test_a_server_over_loaded_weights_places_them_once():
     """`Pretrained.load(on_host=True)` returns its weights in host memory, which a task keeps as given
     and places on the device once, at its first generation, as decoding reads them (`resident`); a server over
@@ -326,6 +323,7 @@ def test_a_server_over_loaded_weights_places_them_once():
     assert_same_draws(ticket.result(), bound(prompt[None], 8, key=0))
 
 
+@attending("xla")
 @pytest.mark.mesh(devices=2)
 def test_a_task_places_loaded_weights_on_the_default_device_as_its_compute_reads_them():
     """A task over host weights places them where JAX's default device is, committed there, and
@@ -385,6 +383,7 @@ PACKED_SEEDS = {"kv_shared": 8, "k_eq_v": 8, "output_gate": 8}
 armada."""
 
 
+@attending("reference")
 @pytest.mark.parametrize("case", ["kv_shared", "k_eq_v", "output_gate"])
 def test_inference_projection_layout_preserves_special_attention_logits(case):
     """The inference layout of a decoder's projections (`inference_projections`, its projections packed)
@@ -398,7 +397,7 @@ def test_inference_projection_layout_preserves_special_attention_logits(case):
 
     model = CausalTransformer(
         vocab_size=VOCAB, emb_features=16, num_layers=2, num_heads=2, num_kv_heads=1, head_dim=8,
-        mlp_features=32, max_seq_len=64, attention_impl="reference",
+        mlp_features=32, max_seq_len=64,
         kv_shared_layers=(1,) if case == "kv_shared" else None, attention_k_eq_v=case == "k_eq_v",
         v_norm=case == "k_eq_v", output_gate=case == "output_gate")
     init = jax.jit(lambda key, tokens: nn.unbox(model.init(key, tokens)))
@@ -966,6 +965,7 @@ FROM_THE_HOST = {"slots": 1, "cache": PagedKV(page_size=4, pages=6, prefix_cache
 """One slot over a pool of six pages with a host tier of eight and a store of four states."""
 
 
+@attending("reference")
 @pytest.mark.parametrize("requests, options, hits, rounds, site", [
     ((Served(12), Served(12), Served(12, flipped=(9,)), Served(12, flipped=(1,)), Served(12),
       Served(12, flipped=(6,))), {}, (0, 8, 16, 16, 24, 24), None, WIDE_HYBRID),
@@ -983,6 +983,7 @@ def test_a_hybrid_stack_reads_a_shared_prefix_with_the_state_its_prompt_left(req
     assert_reads_a_shared_prefix(requests, options, hits, rounds, site)
 
 
+@attending("reference")
 @pytest.mark.check1_shards(seeds=512, per_task=128)
 def test_a_hybrid_stack_reads_a_shared_prefix_from_a_store_of_one_entry_booked_twice():
     """`assert_reads_a_shared_prefix`'s site of 512 seeds, which CI draws in map tasks of 128: two prompts
@@ -1081,6 +1082,7 @@ def test_a_hybrid_servers_host_states_fit_the_bytes_of_its_host_pages(host_pages
     assert part.states.host.slots * entry <= budget < (part.states.host.slots + 1) * entry
 
 
+@attending("reference")
 @pytest.mark.check1_shards(seeds=256, per_task=64)
 def test_a_host_tier_of_more_states_than_pages_reads_each_state_back():
     """A hybrid stack whose row state is smaller than a page keeps more states on the host than pages
@@ -1172,6 +1174,7 @@ def test_a_paged_server_draws_what_each_request_draws_alone(options):
     assert server.prefix_hits == shared_page(options)
 
 
+@attending("reference")
 @pytest.mark.parametrize("fields", [{"position_embedding": "learned"},
                                     {"mixture": Mixture(experts=4, top_k=2, hash_layers=(0,))}],
                          ids=["learned-positions", "hash-routing"])
@@ -1243,6 +1246,7 @@ PREFILL_MESH_SEEDS = 64
 in armada's map tasks of 32 (`check1_shards`: whole, CI's took 158 s, train 1003 at de27b8e32, row 7446)."""
 
 
+@attending("reference")
 @pytest.mark.parametrize("cell", [
     *ARITHMETIC_SEEDS,
     pytest.param("speculative-blocks", id="speculative-blocks",
@@ -1278,6 +1282,9 @@ of four a later prompt reads where an earlier request wrote them, its first page
 the first page and no other, whatever the earlier requests drew."""
 QUANTIZED_CACHE_BUDGET = 8
 """Each quantized-cache cell's tokens each request draws."""
+
+
+@attending("reference")
 @pytest.mark.parametrize("cell", [
     pytest.param("int8", id="int8", marks=pytest.mark.check1_shards(seeds=128, per_task=32)),
     pytest.param("float8-over-pages", id="float8-over-pages",
@@ -1299,6 +1306,7 @@ def test_a_server_scores_its_draws_over_a_quantized_cache_as_its_rounding_does(c
                                              hits=hits)
 
 
+@attending("reference")
 @pytest.mark.mesh(devices=3)
 def test_a_server_that_prefills_on_a_mesh_of_its_own_scores_its_draws_as_a_full_forward():
     """Disaggregated serving's arithmetic: prompts prefilled on two devices of their own, their rows' state
@@ -1632,6 +1640,7 @@ def test_a_speculating_server_over_an_adapter_set_reseeds_its_depths_under_each_
     assert len({tuple(walk) for walk in walks}) > 1
 
 
+@attending("reference")
 @pytest.mark.parametrize("cache", [None, PagedKV(page_size=2, pages=64, prefix_cache=True)],
                          ids=["dense", "paged"])
 def test_a_server_over_an_adapter_set_draws_each_request_under_its_own_adapter(tmp_path, cache):
@@ -1652,7 +1661,7 @@ def test_a_server_over_an_adapter_set_draws_each_request_under_its_own_adapter(t
     from dew.lora import AdapterSet, LoRA
 
     fixtures = Path(__file__).resolve().parent / "fixtures"
-    decoder = Pretrained.load(fixtures / "hf" / "llama-tiny", dtype="float32", attention_impl="reference")
+    decoder = Pretrained.load(fixtures / "hf" / "llama-tiny", dtype="float32")
     fixture = LoRA.load(decoder.model, decoder.variables, fixtures / "lora" / "llama-tiny" / "adapter",
                         layouts=decoder.layouts)
     drawn = LoRA(rank=2, modules=("q_proj",)).apply(decoder.model, decoder.variables, key=0,
@@ -1719,6 +1728,7 @@ def test_a_server_over_an_adapter_set_draws_each_request_under_its_own_adapter(t
                     seeds=ADAPTER_SET_SEEDS, truth_fn=by_itself("float64"))
 
 
+@attending("reference")
 def test_an_adapter_set_whose_adapters_adapt_different_layers_runs_each_rows_own():
     """An adapter set of two adapters over different layers of one decoder, one over layer 0's q and one
     over layer 1's: each layer's update is its own adapter's or none, and each row's logits are those of
@@ -1735,7 +1745,7 @@ def test_an_adapter_set_whose_adapters_adapt_different_layers_runs_each_rows_own
     from dew.lora import AdapterSet
 
     decoder = Pretrained.load(Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny",
-                              dtype="float32", attention_impl="reference")
+                              dtype="float32")
 
     def drawn(layer: int, key: int):
         return drawn_adapter(decoder.model, decoder.variables, f"layers.{layer}.self_attn.q_proj", key,
@@ -1770,6 +1780,7 @@ def test_an_adapter_set_whose_adapters_adapt_different_layers_runs_each_rows_own
                     seeds=ADAPTED_LAYERS_SEEDS, truth_fn=alone("float64"))
 
 
+@attending("reference")
 def test_a_row_of_an_adapter_sets_base_computes_the_base_bit_for_bit():
     """A row naming no adapter of a set (-1 in the call's `adapters`) takes no branch: beside a row whose
     adapter's factors overflow its update to inf, its logits are the base model's, bit for bit."""
@@ -1779,7 +1790,7 @@ def test_a_row_of_an_adapter_sets_base_computes_the_base_bit_for_bit():
     from dew.lora import AdapterSet, LoRA
 
     fixtures = Path(__file__).resolve().parent / "fixtures"
-    decoder = Pretrained.load(fixtures / "hf" / "llama-tiny", dtype="float32", attention_impl="reference")
+    decoder = Pretrained.load(fixtures / "hf" / "llama-tiny", dtype="float32")
     fixture = LoRA.load(decoder.model, decoder.variables, fixtures / "lora" / "llama-tiny" / "adapter",
                         layouts=decoder.layouts)
     huge = dataclasses.replace(fixture, variables={**fixture.variables, "params": jax.tree.map(
@@ -1793,6 +1804,7 @@ def test_a_row_of_an_adapter_sets_base_computes_the_base_bit_for_bit():
     np.testing.assert_array_equal(np.asarray(served[1]), np.asarray(base[1]))
 
 
+@attending("reference")
 def test_an_adapter_sets_decode_carries_each_rows_adapter_through_a_reindex():
     """An adapter set's decode carries each row's adapter in its state (`DecoderState.adapters`, int32):
     four prompts prefilled under the set's two adapters and the base (-1), their rows reordered,
@@ -1807,7 +1819,7 @@ def test_an_adapter_sets_decode_carries_each_rows_adapter_through_a_reindex():
     from dew.sampling.text import decode_ops, prefill_state
 
     decoder = Pretrained.load(Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny",
-                              dtype="float32", attention_impl="reference")
+                              dtype="float32")
 
     def drawn(layer: int, key: int):
         return drawn_adapter(decoder.model, decoder.variables, f"layers.{layer}.self_attn.q_proj", key,
@@ -1983,7 +1995,6 @@ def test_a_server_over_a_banked_store_keeps_its_cache_banked_and_draws_what_the_
         assert_same_draws(ticket.result(), row)
 
 
-
 @pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.mesh(devices=4)
 def test_a_banked_server_over_row_groups_seats_its_paged_prompts_in_every_layer_of_their_rows():
@@ -2088,142 +2099,6 @@ def test_a_server_on_an_expert_and_stage_mesh_exchanges_its_experts_and_runs_its
         assert_same_draws(ticket.result(), row)
 
 
-class UserDecoder(nn.Module):
-    """A user's own decoder module, no Dew class: a plain module around a
-    decoder that forwards the calls a task and a server make, and answers
-    nothing a server asks of a model."""
-
-    decoder: nn.Module
-
-    @property
-    def vocab_size(self):
-        return self.decoder.vocab_size
-
-    @property
-    def max_seq_len(self):
-        return self.decoder.max_seq_len
-
-    def init_cache(self, batch_size):
-        self.decoder.init_cache(batch_size)
-
-    def __call__(self, tokens, **fields):
-        return self.decoder(tokens, **fields)
-
-    def states_and_logits(self, tokens, **fields):
-        return self.decoder.states_and_logits(tokens, **fields)
-
-    def states_and_logits_at(self, tokens, slots, **fields):
-        return self.decoder.states_and_logits_at(tokens, slots, **fields)
-
-
-class AnsweringDecoder(UserDecoder):
-    """`UserDecoder`, answering what a server asks of a model from the decoder it holds."""
-
-    @nn.nowrap
-    def with_cache_capacity(self, capacity):
-        return self.clone(decoder=self.decoder.with_cache_capacity(capacity))
-
-    @nn.nowrap
-    def mixed_admission_refusal(self):
-        return self.decoder.mixed_admission_refusal()
-
-    @nn.nowrap
-    def split_prefill_refusal(self):
-        return self.decoder.split_prefill_refusal()
-
-    @property
-    def cache_rebuild_position(self):
-        return self.decoder.cache_rebuild_position
-
-    @nn.nowrap
-    def inference_projection_groups(self, variables):
-        return held_groups(self.decoder, "decoder", variables)
-
-
-def wrapped(kind, model, variables, sampling, processor=None):
-    """A task over `kind` around `model`, its `variables` under `decoder`."""
-    held = {collection: {"decoder": tree} for collection, tree in variables.items()}
-    return TextGeneration(kind(model), held, processor, sampling=sampling)
-
-
-def test_a_user_decoder_module_is_packed_where_it_names_its_groups():
-    """Packing reaches the projections a model names (`Serving`)
-    at their paths in its variables: a user's module around a decoder that
-    names the decoder's is packed, draws what the unpacked weights draw, and
-    is served and reloaded from them; one that names none keeps its layout."""
-    from dew.nn.projections import inference_projections
-
-    bound = task(Sampling(temperature=0, eos_token_ids=None))
-    answering = wrapped(AnsweringDecoder, bound.model, bound.variables, bound.sampling, bound.processor)
-    plain = wrapped(UserDecoder, bound.model, bound.variables, bound.sampling, bound.processor)
-    members = {"q_proj", "k_proj", "v_proj"}
-    packed = inference_projections(answering.model, answering.variables)
-    attention = set(packed["params"]["decoder"]["layers_0"]["self_attn"])
-    assert "qkv_proj" in attention and not members & attention
-    assert members <= set(
-        inference_projections(plain.model, plain.variables)["params"]["decoder"]["layers_0"]["self_attn"])
-    served = TextGeneration(answering.model, packed, bound.processor, sampling=bound.sampling)
-    for index, prompt in enumerate(PROMPTS[:3]):
-        assert_same_draws(served(prompt, 5, key=index), bound(prompt, 5, key=index))
-    server = Server.from_task(served, slots=2, capacity=128)
-    trained = jax.tree.map(lambda leaf: leaf * 1.5, answering.variables)
-    server.reload(trained)
-    retrained = wrapped(UserDecoder, bound.model, jax.tree.map(lambda leaf: leaf * 1.5, bound.variables),
-                        bound.sampling, bound.processor)
-    for actual, prompt in zip(server(PROMPTS[:2], 5, key=3), PROMPTS[:2], strict=True):
-        assert_same_draws(actual, retrained(prompt, 5, key=3))
-
-
-def test_a_tree_split_for_training_packs_as_its_whole_tree_and_splits_back_as_it_was():
-    """A tree split for training (`dew.batch.freeze`), its first layer's keys and values frozen and its
-    queries trained and its second layer trained whole, packs as its whole tree does (ledger 2439): thawed,
-    it is the unsplit weights packed, the flags of its frozen members (`PACKED_FROZEN`) gone with the
-    split, so a model reads the same tree whatever its layers' membership; split, it is the tree it was,
-    each member in its own collection; and a server of it reloads its unsplit source weights."""
-    from dew.batch import PACKED_FROZEN, freeze, thaw
-    from dew.nn.projections import inference_projections, packed_owned, unpacked
-
-    model = decoder().clone(num_layers=2, max_seq_len=128)
-    whole = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
-    split = freeze(whole, lambda path: not ("layers_0" in path and {"k_proj", "v_proj"} & set(path)))
-    packed = packed_owned(model, jax.tree.map(jnp.array, split))
-    assert PACKED_FROZEN in packed and PACKED_FROZEN not in thaw(packed)
-
-    def assert_trees_equal(tree, expected):
-        assert jax.tree.structure(tree) == jax.tree.structure(expected)
-        for leaf, alike in zip(jax.tree.leaves(tree), jax.tree.leaves(expected), strict=True):
-            np.testing.assert_array_equal(np.asarray(leaf), np.asarray(alike), strict=True)
-
-    assert_trees_equal(thaw(packed), inference_projections(model, whole))
-    assert_trees_equal(unpacked(model, packed), split)
-    sampling = Sampling(temperature=0, eos_token_ids=None)
-    server = Server.from_task(TextGeneration(model, packed, RunProcessor(Digits()), sampling=sampling),
-                              slots=2, capacity=128)
-    server.reload(whole)
-    alone = TextGeneration(model, whole, RunProcessor(Digits()), sampling=sampling)
-    for actual, prompt in zip(server(PROMPTS[:2], 5, key=3), PROMPTS[:2], strict=True):
-        assert_same_draws(actual, alone(prompt, 5, key=3))
-
-
-def test_a_projection_quantized_apart_from_its_group_is_served_unpacked():
-    """A model quantized by its modules' paths (`Quantization.patterns`) selecting its query
-    projection alone keeps its query, key and value apart, each quantized as the pattern selects it,
-    and packs its gate and up projections, which no pattern selects: a server draws what the task
-    draws on its own. Packed, the query was served as `qkv_proj`, which the pattern does not
-    select, so unquantized."""
-    from dew.nn.projections import projection_groups
-    from dew.quantization import Quantization
-
-    bound = task(Sampling(temperature=0, eos_token_ids=None))
-    quantized = Quantization(patterns=(".*/q_proj",)).apply(bound.model)
-    groups = {group.packed for group in projection_groups(quantized, bound.variables)}
-    assert "qkv_proj" not in groups and "gate_up_proj" in groups
-    alone = TextGeneration(quantized, bound.variables, bound.processor, sampling=bound.sampling)
-    server = Server.from_task(alone, slots=2, capacity=128)
-    for actual, prompt in zip(server(PROMPTS[:2], 5, key=3), PROMPTS[:2], strict=True):
-        assert_same_draws(actual, alone(prompt, 5, key=3))
-
-
 @pytest.mark.parametrize("finished", [True, False], ids=["prefilled", "prefilling"])
 def test_reloaded_weights_share_no_prefix_page_the_old_weights_wrote(finished):
     """A cached prompt page holds keys the old weights computed; after a
@@ -2274,24 +2149,6 @@ def test_a_request_cancelled_while_it_waits_leaves_its_peers_running(options):
     assert tickets[1].cancelled()
     for index in (0, 2):
         assert_same_draws(tickets[index].result(), bound(PROMPTS[index], 5, key=index))
-
-
-def test_a_request_past_the_servers_own_capacity_is_refused_at_submit():
-    """A user's decoder declares a context of 128 and is served at a
-    capacity of 64: a request that fits 64 draws what the task draws alone,
-    and a budget or a prompt past it is refused at submission, leaving the
-    server serving."""
-    bound = task(Sampling(temperature=0, eos_token_ids=None))
-    plain = wrapped(UserDecoder, bound.model, bound.variables, bound.sampling, bound.processor)
-    server = Server.from_task(plain, slots=2, capacity=64)
-    assert plain.model.max_seq_len == 128
-    with pytest.raises(ValueError):
-        server.submit("12", 63, key=0)
-    with pytest.raises(ValueError):
-        server.submit("1" * 64, 1, key=0)
-    ticket = server.submit("12", 62, key=0)
-    server.run()
-    assert_same_draws(ticket.result(), plain("12", 62, key=0))
 
 
 def test_a_text_prompt_through_the_hf_processor_serves_what_the_task_draws():

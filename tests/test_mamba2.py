@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from forks_support import LAYOUTS, assert_forks_as_own_rows
-from model_support import decode_through
+from model_support import attending, decode_through
 from reference_error import (
     assert_as_exact,
     assert_moves,
@@ -96,14 +96,17 @@ def assert_recorded_moves(reference, site, changed, label: str):
                  truth_fn=truth)
 
 
+@attending("reference")
 def test_the_chunked_scan_matches_the_reference(seeded_reference):
     assert_recorded_as_exact(seeded_reference, "scan")
 
 
+@attending("reference")
 def test_a_carried_state_matches_the_reference(seeded_reference):
     assert_recorded_as_exact(seeded_reference, "carried")
 
 
+@attending("reference")
 def test_one_recurrent_step_matches_selective_state_update(seeded_reference):
     assert_recorded_as_exact(seeded_reference, "step")
 
@@ -116,6 +119,7 @@ def scan_operands(arrays):
     return x, jax.nn.softplus(dt + bias), A, B, C, D
 
 
+@attending("reference")
 def test_the_recurrent_form_matches_the_reference(seeded_reference):
     """The scan token by token from a carried state, against transformers' chunk scan from it ('carried')."""
     def recurrent(arrays):
@@ -125,6 +129,7 @@ def test_the_recurrent_form_matches_the_reference(seeded_reference):
     assert_recorded_as_exact(seeded_reference, "carried", recurrent, "the recurrent form")
 
 
+@attending("reference")
 def test_a_sequence_split_in_two_carries_its_state_across_the_cut(seeded_reference):
     """Chunk boundaries that do not line up with the cut: 70 tokens as 30 then 40 at a chunk of 32, the second
     half from the first's final state, against transformers' scan of the whole sequence ('scan')."""
@@ -137,6 +142,7 @@ def test_a_sequence_split_in_two_carries_its_state_across_the_cut(seeded_referen
     assert_recorded_as_exact(seeded_reference, "scan", cut, "the cut sequence")
 
 
+@attending("reference")
 @pytest.mark.parametrize("size", [7, 256])
 def test_the_chunk_size_does_not_change_the_scan(seeded_reference, size):
     """The scan at chunks of 7 and of 256 tokens against transformers' scan at its own 32 ('scan')."""
@@ -152,6 +158,7 @@ def fixture_layer_params(reference) -> dict:
     return mamba2_layer_params({name.removeprefix("layer."): value for name, value in reference.items()})
 
 
+@attending("reference")
 def test_the_layer_matches_mamba2_mixer(seeded_reference):
     """The whole mixer on transformers' weights, fresh at each seed: the projection, the conv with its bias,
     the step, the scan with two heads per group, the D skip, the gated norm and the output projection, its
@@ -166,6 +173,7 @@ def test_the_layer_matches_mamba2_mixer(seeded_reference):
 ON_A_TPU = pytest.mark.tpu(reason="the layer as a TPU runs it, its scan the Pallas kernel (row 678)")
 
 
+@attending("reference")
 @pytest.mark.parametrize("site", [pytest.param("layer", marks=ON_A_TPU, id="layer-tpu"),
                                   pytest.param("layer_bf16", marks=ON_A_TPU, id="layer_bf16-tpu")])
 def test_the_layer_on_a_tpu_matches_mamba2_mixer(seeded_reference, site):
@@ -200,12 +208,14 @@ def test_the_layers_gradient_on_a_tpu_is_as_exact_as_its_portable_math():
                     truth_fn=jax.jit(with_gradients(portable)))
 
 
+@attending("reference")
 def test_the_layer_in_bfloat16_matches_the_reference_in_bfloat16(seeded_reference):
     """Compute in bfloat16 with fp32 parameters, against the reference run in bfloat16 end to end; the scan
     itself is fp32 in both (check 1 against the recorded mixer)."""
     assert_recorded_as_exact(seeded_reference, "layer_bf16")
 
 
+@attending("reference")
 @pytest.mark.check1_shards(seeds=64, per_task=32)
 def test_the_layer_decodes_as_it_prefills(seeded_reference):
     """A prefill against the cache and single-token steps after it, against transformers' mixer at each step's
@@ -225,6 +235,7 @@ def test_the_layer_decodes_as_it_prefills(seeded_reference):
     assert_recorded_as_exact(seeded_reference, "decoded", decoded, "decoded")
 
 
+@attending("reference")
 def test_the_layer_takes_forward_mode(seeded_reference):
     """`jax.jvp` through the layer, as MeanFlow and consistency training trace a model: its tangent along a
     drawn direction against transformers' (`torch.func.jvp`, 'tangent'). The D skip's custom VJP refused
@@ -235,6 +246,7 @@ def test_the_layer_takes_forward_mode(seeded_reference):
     assert_recorded_as_exact(seeded_reference, "tangent", label="the layer's tangent", weighed=True)
 
 
+@attending("reference")
 def test_padded_rows_preserve_the_state_and_the_history(seeded_reference):
     """A row paused on padding neither writes its state nor advances its conv history, and its padded slots
     emit zero: each row's stream, the second's with the holes closed, against transformers' mixer on the
@@ -303,6 +315,7 @@ def test_a_layer_split_over_the_sequence_names_its_scan_for_remat(reference, mas
     assert [name for name in ("context", "scan") if kept((name,)) <= nothing] == []
 
 
+@attending("reference")
 def test_packed_documents_run_as_if_each_ran_alone(seeded_reference):
     """A row of packed documents computes, for each document, what that document computes alone: neither the
     SSM state nor the conv's taps cross a segment change, against transformers' mixer on each document alone
@@ -320,6 +333,7 @@ def test_packed_documents_run_as_if_each_ran_alone(seeded_reference):
         mamba2_layer_params(arrays), jnp.asarray(arrays["hidden"])[:1])}, "the row without segment ids")
 
 
+@attending("reference")
 @pytest.mark.parametrize("form", ["chunked", "recurrent"])
 def test_the_chunked_and_recurrent_forms_reset_alike(seeded_reference, form):
     """Document starts drop the state in both forms, including a start on the first token of a chunk and one
@@ -342,6 +356,7 @@ def test_the_chunked_and_recurrent_forms_reset_alike(seeded_reference, form):
     assert_recorded_moves(seeded_reference, "starts", unreset, "the scan without starts")
 
 
+@attending("reference")
 def test_padded_packed_rows_reset_at_each_document(seeded_reference):
     """Padding slots and packed documents together: every real token of the padded row computes what its
     document computes alone, the second document starting fresh after the gap, through the model's
@@ -379,6 +394,7 @@ def test_padded_packed_rows_reset_at_each_document(seeded_reference):
     assert_recorded_as_exact(seeded_reference, "model_scored", scored, "the scored padded row")
 
 
+@attending("reference")
 def test_the_model_decodes_as_it_scores_in_parallel(seeded_reference):
     """A prefill of four tokens and eight single-token steps, every layer's state riding the flax cache
     collection, against transformers' model on the same twelve tokens at each step's width

@@ -725,11 +725,10 @@ def a_softcapped_model_decodes_a_paged_cache_on_par_with_its_compact_cache():
     decode in float64 the truth."""
     from decode_matrix import assert_paged_decode_on_par
 
-    def model(layout, dtype, implementation="auto"):
+    def model(layout, dtype):
         # Heads 16 wide, which the paged kernel's geometry takes.
         return CausalTransformer(**{**TINY_DECODER, "vocab_size": 64, "head_dim": 16, "dtype": dtype,
-                                    "attn_logit_softcap": 20.0, "kv_cache": layout,
-                                    "attention_impl": implementation})
+                                    "attn_logit_softcap": 20.0, "kv_cache": layout})
 
     assert_paged_decode_on_par(model, "softcapped paged decode", seeds=SOFTCAP_PAGED_SEEDS)
 

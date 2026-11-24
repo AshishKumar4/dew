@@ -119,7 +119,6 @@ if TYPE_CHECKING:
     from dew.inference.tasks import SavedRun, TaskSettings
     from dew.interop.releases import ReleasePlan
     from dew.lora import Adapter, LoRA
-    from dew.nn.attention import AttentionImpl
     from dew.nn.cross_attention import CrossBlocks
     from dew.nn.dex import DifferentialExtension
     from dew.sampling.guidance import Guidance
@@ -305,6 +304,9 @@ class Pretrained:
     """The numerics the load was asked for (`load(precision=...)`), whose dtypes it computes and stores
     in and whose products' precision and forms its tasks trace under (`formed`), a saved run's those its
     step trained in (`SavedRun.precision`); None for its dtypes alone."""
+    kernels: tuple[tuple[str, str], ...] = ()
+    """The kernel choices its run pinned (`SavedRun.kernels`, a release's as its export wrote them), which
+    its tasks trace under where their caller names none of its own (`formed`, `InItsForm.pinned`)."""
     settings: TaskSettings | None = None
     """A saved run's own task declaration (`from_saved`), which its tasks build from as the run's own
     loader builds them (`TextGeneration.from_settings`: its prefix, policy and budget), where a source
@@ -342,13 +344,14 @@ class Pretrained:
         raise TypeError(f"{type(self).__name__} has no native task")
 
     def formed[TaskT](self, task: TaskT) -> TaskT:
-        """`task`, built from this source, under the numerics its load was asked for (`numerics`) where
-        it traces under numerics (`dew.inference.tasks.InItsForm`)."""
+        """`task`, built from this source, under the numerics its load was asked for (`numerics`) and its
+        run's kernel pins (`kernels`) where it traces under them (`dew.inference.tasks.InItsForm`)."""
         from dew.inference.tasks import InItsForm
 
-        if self.numerics is None or not isinstance(task, InItsForm):
+        if not isinstance(task, InItsForm) or (self.numerics is None and not self.kernels):
             return task
-        return replace(task, precision=self.numerics)
+        return replace(task, precision=task.precision if self.numerics is None else self.numerics,
+                       kernels=self.kernels or task.kernels)
 
     def packed(self) -> Self:
         """A serving view with packed projections, preserving this bundle's arrays for reuse."""
@@ -486,7 +489,7 @@ class Pretrained:
                             f"load it with {type(bundle).__name__}.from_run or Pretrained.from_run")
         # The run's own declaration and numerics, which its tasks build under as the run's loader builds
         # them, beside the generation config its export writes (ledger 3007).
-        bundle = replace(bundle, settings=task, numerics=run.precision)
+        bundle = replace(bundle, settings=task, numerics=run.precision, kernels=run.kernels)
         return bundle.bound(model, variables)
 
     def bound(self, model: nn.Module, variables: Variables) -> Self:
@@ -503,7 +506,7 @@ class Pretrained:
     @classmethod
     def load(cls, name_or_dir: str | Path, *, dtype: DTypeLike | None = None,
              param_dtype: DTypeLike | Literal["auto"] | None = None,
-             attention_impl: AttentionImpl = "auto", max_seq_len: int | None = None,
+             max_seq_len: int | None = None,
              revision: str | None = None, subfolder: str | None = None, gguf_file: str | None = None,
              single_file: str | None = None, dduf_file: str | None = None,
              mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
@@ -605,7 +608,7 @@ class Pretrained:
             # A run's native release builds the model its run recorded (`saved_sources.native_source`).
             return native_source(cls, name_or_dir, mesh=mesh, layout=layout, dtype=dtype,
                                  param_dtype=param_dtype, on_host=on_host, weights=weights,
-                                 attention_impl=attention_impl, max_seq_len=max_seq_len, building={
+                                 max_seq_len=max_seq_len, building={
                 "revision": revision, "subfolder": subfolder, "gguf_file": gguf_file,
                 "single_file": single_file, "dduf_file": dduf_file, "fallback": fallback,
                 "text_only": text_only, "modeling_overrides": modeling_overrides or None,
@@ -613,7 +616,7 @@ class Pretrained:
                 "packed_weights": packed_weights})
         return cls._from_family(
             name_or_dir, trust_remote_code, dtype=dtype, param_dtype=param_dtype,
-            attention_impl=attention_impl, max_seq_len=max_seq_len, revision=revision, subfolder=subfolder,
+            max_seq_len=max_seq_len, revision=revision, subfolder=subfolder,
             gguf_file=gguf_file, single_file=single_file, dduf_file=dduf_file, fallback=fallback, mesh=mesh,
             layout=layout, on_host=on_host, weights=weights, modeling_overrides=modeling_overrides,
             text_only=text_only, prediction_depths=prediction_depths, dex=dex, precision=precision,
@@ -623,7 +626,7 @@ class Pretrained:
     @classmethod
     def _from_family(cls, name_or_dir: str | Path, trust_remote_code: bool, *,
                      dtype: DTypeLike | None, param_dtype: DTypeLike | Literal["auto"] | None,
-                     attention_impl: AttentionImpl, max_seq_len: int | None, revision: str | None,
+                     max_seq_len: int | None, revision: str | None,
                      subfolder: str | None, gguf_file: str | None, single_file: str | None,
                      dduf_file: str | None, fallback: str | None, mesh: MeshSpec | Mesh | None,
                      layout: Layout | None, on_host: bool, weights: bool,
@@ -644,7 +647,7 @@ class Pretrained:
         loaded, extracted = _loaded_kind(
             reference, directory, composite, fallback=fallback, gguf_file=gguf_file, single_file=single_file,
             dduf_file=dduf_file, placed=placed, streaming=streaming or not weights, weights=weights,
-            dtype=loading.dtype, param_dtype=loading.param_dtype, attention_impl=attention_impl,
+            dtype=loading.dtype, param_dtype=loading.param_dtype,
             max_seq_len=loading.max_seq_len, overrides=modeling_overrides,
             trust_remote_code=trust_remote_code, text_only=text_only, prediction_depths=prediction_depths,
             packed_weights=packed_weights)
@@ -655,7 +658,7 @@ class Pretrained:
         extended = _extended(_published(loaded, name_or_dir, selected=bool(selected) or extracted
                                         or reference.subfolder is not None), dex, placed)
         return replace(_resident(extended, weights=weights, streaming=streaming, on_host=on_host),
-                       settings=loading.settings, numerics=loading.numerics)
+                       settings=loading.settings, numerics=loading.numerics, kernels=loading.kernels)
 
     @property
     def layouts(self) -> Mapping[str, WeightLayout]:
@@ -1282,7 +1285,7 @@ def _placement(mesh: MeshSpec | Mesh | None, layout: Layout | None, *, on_host: 
     return streaming, placed
 
 def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dtype: str = "float32",
-                          revision: str | None = None, attention_impl: AttentionImpl = "auto",
+                          revision: str | None = None,
                           size: tuple[int, ...] | None = None, variables: Variables | None = None,
                           mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
                           text: bool = True, text_only: bool = False,
@@ -1335,7 +1338,7 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
     if run is not None:
         stored = None if param_dtype == AUTO else param_dtype
         return pipeline_of_run(run, checkpoint, dtype=dtype, param_dtype=stored, revision=revision,
-                               attention_impl=attention_impl, size=size, variables=variables, mesh=mesh,
+                               size=size, variables=variables, mesh=mesh,
                                layout=layout, text=text, ema=ema)
     directory = sources.snapshot(checkpoint, revision, weights=False)
     if variables is not None and not text:
@@ -1347,7 +1350,7 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
         sources.SourceReference(checkpoint, None if os.path.isdir(checkpoint) else directory.name),
         directory, None, None,
         lambda values: place(values, mesh, layout) if streaming else values, dtype=dtype,
-        attention_impl=attention_impl, param_dtype=param_dtype, streaming=streaming or not weights, size=size,
+        param_dtype=param_dtype, streaming=streaming or not weights, size=size,
         variables=variables, text=text, weights=weights)
     if loaded is None:
         raise ValueError(f"{checkpoint} is not a diffusion pipeline: it has no model_index.json, or its "
@@ -1378,7 +1381,7 @@ def _pipeline_weights(source: sources.SourceReference, root: Path, index: Mappin
 
 def _assembled_pipeline(directory: Path, index: Mapping[str, object], commit: str | None,
                         placed: Callable[[Variables], Variables], *, streaming: bool, dtype: str,
-                        attention_impl: AttentionImpl, param_dtype: str, variables: Variables | None = None,
+                        param_dtype: str, variables: Variables | None = None,
                         text: bool = True, stored: sources.StoredWeights | None = None,
                         weights: bool = True) -> PretrainedPipeline:
     """The pipeline `index` describes, assembled from the directory its
@@ -1388,7 +1391,7 @@ def _assembled_pipeline(directory: Path, index: Mapping[str, object], commit: st
     leaf at a time; `variables` and `text` are as `assemble_pipeline` takes
     them."""
     loaded = PretrainedPipeline(processor=None, **assemble_pipeline(
-        directory, index, dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype,
+        directory, index, dtype=dtype, param_dtype=param_dtype,
         variables=variables, lazy=streaming, text=text, stored=stored, weights=weights))
     # A pipeline placed on a mesh is placed by its denoiser's draw and its encoders' own tables, one loaded
     # without its text encoder as one loaded with it (`pipeline_axes`).
@@ -1534,7 +1537,7 @@ def load_processor(source: sources.SourceReference, model: nn.Module) -> Process
 
 def _pipeline_source(source: sources.SourceReference, root: Path, single_file: str | None,
                      dduf_file: str | None, placed: Callable[[Variables], Variables], *, dtype: str,
-                     attention_impl: AttentionImpl, param_dtype: str, streaming: bool,
+                     param_dtype: str, streaming: bool,
                      size: tuple[int, ...] | None = None, variables: Variables | None = None,
                      text: bool = True, weights: bool = True) -> PretrainedPipeline | None:
     """The source as a latent diffusion pipeline, or None when it is a decoder.
@@ -1560,7 +1563,7 @@ def _pipeline_source(source: sources.SourceReference, root: Path, single_file: s
             index = {**index, "dew_height": size[-2], "dew_width": size[-1],
                      **({"dew_frames": size[0]} if len(size) == 3 else {})}
         return _assembled_pipeline(directory, index, commit, placed, streaming=streaming, dtype=dtype,
-                                   attention_impl=attention_impl, param_dtype=param_dtype,
+                                   param_dtype=param_dtype,
                                    variables=variables, text=text, stored=stored, weights=load_weights)
     if dduf_file is not None:
         from dew.interop import dduf
@@ -1591,7 +1594,7 @@ def _pipeline_source(source: sources.SourceReference, root: Path, single_file: s
             )
         index = json.loads((directory / "model_index.json").read_text())
         skipped = () if text else text_components(
-            pipeline_denoiser(directory, dtype=dtype, attention_impl=attention_impl).text, index)
+            pipeline_denoiser(directory, dtype=dtype).text, index)
         return pipeline(_pipeline_weights(source, root, index, skipped))
     return None
 
@@ -1605,7 +1608,7 @@ def _names_a_model(directory: Path) -> bool:
 def _loaded_kind(reference: sources.SourceReference, directory: Path, composite: CompositeSource | None, *,
                  fallback: str | None, gguf_file: str | None, single_file: str | None,
                  dduf_file: str | None, placed: Placing, streaming: bool,
-                 weights: bool, dtype: str, param_dtype: str, attention_impl: AttentionImpl,
+                 weights: bool, dtype: str, param_dtype: str,
                  max_seq_len: int | None, overrides: Mapping[str, object] | None,
                  trust_remote_code: bool, text_only: bool,
                  prediction_depths: int | None = None, packed_weights: bool = False
@@ -1630,7 +1633,7 @@ def _loaded_kind(reference: sources.SourceReference, directory: Path, composite:
     if composite is not None:
         loaded = _load_composite_source(reference, directory, composite,
                                         placed=placed, streaming=streaming, dtype=dtype,
-                                        param_dtype=param_dtype, attention_impl=attention_impl,
+                                        param_dtype=param_dtype,
                                         max_seq_len=max_seq_len, weights=weights,
                                         overrides=overrides,
                                         code=None if composite.backbone is None else code(),
@@ -1641,12 +1644,12 @@ def _loaded_kind(reference: sources.SourceReference, directory: Path, composite:
         _unread_overrides(overrides, "the transformers forward")
         _unpacked(packed_weights, "the transformers forward")
         loaded = torchax_fallback.load(reference, directory, dtype=dtype, param_dtype=param_dtype,
-                                       attention_impl=attention_impl, max_seq_len=max_seq_len,
+                                       max_seq_len=max_seq_len,
                                        weights=weights, placed=placed)
     elif gguf_file is None:
         # A selected GGUF file is a decoder, whatever pipeline index the repo also ships.
         loaded = _pipeline_source(reference, directory, single_file, dduf_file, placed,
-                                  dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype,
+                                  dtype=dtype, param_dtype=param_dtype,
                                   streaming=streaming, weights=weights)
         if loaded is not None:
             _unread_overrides(overrides, "a diffusion pipeline")
@@ -1659,7 +1662,7 @@ def _loaded_kind(reference: sources.SourceReference, directory: Path, composite:
         remote = code()
         return _load_native_source(reference, directory, gguf_file=gguf_file, placed=placed,
                                    streaming=streaming, dtype=dtype, param_dtype=param_dtype,
-                                   attention_impl=attention_impl, max_seq_len=max_seq_len, weights=weights,
+                                   max_seq_len=max_seq_len, weights=weights,
                                    overrides=overrides,
                                    remote=None if remote is None else reference.directory(remote),
                                    pinned=reference, text_only=text_only, prediction_depths=prediction_depths,
@@ -1855,7 +1858,6 @@ class _Built(NamedTuple):
 
 def _wrapper_source(config: Mapping[str, object], record: decoder_parts.WrapperFields,
                     tensors: Mapping[str, unread.Stored], directory: Path, *, dtype: str,
-                    attention_impl: AttentionImpl,
                     max_seq_len: int | None, param_dtype: str, lazy: bool,
                     checked: decoders.Checked) -> _Built:
     """A multimodal wrapper, `record` its translated config: the decoder under its text_config and the
@@ -1865,7 +1867,7 @@ def _wrapper_source(config: Mapping[str, object], record: decoder_parts.WrapperF
                                                    checked=checked)
     for fields in (text_fields, record['text']):
         decoders.held_depths(fields, parts["language_model"]["params"])
-    text = NativeFields(CausalTransformer, {**text_fields, "dtype": dtype, "attention_impl": attention_impl})
+    text = NativeFields(CausalTransformer, {**text_fields, "dtype": dtype})
     wrapper: decoder_parts.WrapperFields = {**record, "text": text}
     language_model = from_record(CausalTransformer, wrapper["text"])
     model = _wrapper_model(config, record, language_model, dtype=dtype)
@@ -1892,7 +1894,7 @@ def _spelled_source_weights(spelling: Mapping[str, str], model: CausalTransforme
 
 
 def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, unread.Stored], directory: Path,
-                    route: DecoderRoute | VerifiedRoute, *, dtype: str, attention_impl: AttentionImpl,
+                    route: DecoderRoute | VerifiedRoute, *, dtype: str,
                     max_seq_len: int | None, param_dtype: str, lazy: bool, quantized: bool,
                     checked: decoders.Checked) -> _Built:
     """A decoder of a registered family, or of one it was verified as (tier 2), as `route` read it.
@@ -1922,7 +1924,7 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, unread.S
                                              checked=checked)
     variables = decoders.with_constants(placed, record, directory)
     decoders.held_depths(record, variables["params"])
-    built = {**record, "dtype": dtype, "attention_impl": attention_impl}
+    built = {**record, "dtype": dtype}
     model = from_record(CausalTransformer, built)
     axes = decoder_parts.check_decoder_tree(variables, model)
     # The bindings are what an adapter loader resolves source names through
@@ -2054,7 +2056,7 @@ def _composite_description(directory: Path,
 
 def _load_composite_source(source: sources.SourceReference, root: Path,
                            description: CompositeSource, *, placed: Placing,
-                           streaming: bool, dtype: str, param_dtype: str, attention_impl: AttentionImpl,
+                           streaming: bool, dtype: str, param_dtype: str,
                            max_seq_len: int | None, weights: bool,
                            overrides: Mapping[str, object] | None = None,
                            code: Path | None = None, prediction_depths: int | None = None,
@@ -2099,7 +2101,7 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
             source, root,
             gguf_file=None, component=component, tensors=tensors,
             placed=placed, streaming=streaming, dtype=dtype, param_dtype=param_dtype,
-            attention_impl=attention_impl, max_seq_len=max_seq_len, weights=weights, overrides=overrides,
+            max_seq_len=max_seq_len, weights=weights, overrides=overrides,
             remote=remote, routed=routed, prediction_depths=prediction_depths, config_root=config_root,
             packed_weights=packed_weights)
     else:
@@ -2119,7 +2121,7 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
                 else source.optional_file(root, head_source.weight_file))
         missing = path is None
         head_tensors = {} if path is None else sources.tensor_file(path)
-    head = head_source.build(backbone, dtype, attention_impl,
+    head = head_source.build(backbone, dtype,
                              shapes=None if missing else {name: unread.held(tensor).shape
                                                           for name, tensor in head_tensors.items()})
     if missing:
@@ -2228,7 +2230,7 @@ class _Translated(NamedTuple):
 def _translated(config: Mapping[str, object],
                 route: DecoderRoute | WrapperRoute | DiffusionGemmaRoute | VerifiedRoute,
                 tensors: Mapping[str, unread.Stored], directory: Path, *, dtype: str, param_dtype: str,
-                attention_impl: AttentionImpl, max_seq_len: int | None, streaming: bool,
+                max_seq_len: int | None, streaming: bool,
                 packed_weights: bool = False) -> _Translated:
     """`config`'s native model and variables over `tensors`, as `route` reads them: a quantized source's
     weights decoded, or its 4-bit weights held packed (`packed_weights`, `quantized_loads.packed_banks`),
@@ -2260,7 +2262,7 @@ def _translated(config: Mapping[str, object],
             from dew.interop import diffusion_gemma
 
             model = diffusion_gemma.build(
-                config, dtype=dtype, attention_impl=attention_impl, max_seq_len=max_seq_len
+                config, dtype=dtype, max_seq_len=max_seq_len
             )
             # The vision layouts are the export's alone: the bundle's own are derived from its tree, as
             # every adapter (LoRA's projections) reads them.
@@ -2268,15 +2270,15 @@ def _translated(config: Mapping[str, object],
                                                                   lazy=streaming,
                                                                   checked=checked)
             built = _Built(model, variables, config,
-                           {**config, "dtype": dtype, "attention_impl": attention_impl}, (), {},
+                           {**config, "dtype": dtype}, (), {},
                            partial(diffusion_gemma.export_weights, vision=vision))
         case WrapperRoute(wrapper=wrapper):
             built = _wrapper_source(
-                config, wrapper, tensors, directory, dtype=dtype, attention_impl=attention_impl,
+                config, wrapper, tensors, directory, dtype=dtype,
                 max_seq_len=max_seq_len, param_dtype=param_dtype, lazy=streaming, checked=checked)
         case DecoderRoute() | VerifiedRoute():
             built = _decoder_source(
-                config, tensors, directory, route, dtype=dtype, attention_impl=attention_impl,
+                config, tensors, directory, route, dtype=dtype,
                 max_seq_len=max_seq_len, param_dtype=param_dtype, lazy=streaming,
                 quantized=source_quantization(config) is not None, checked=checked)
     model, variables = quantized_loads.input_quantization(built.model, built.variables, built.layouts, config,
@@ -2310,7 +2312,7 @@ def native_backbone(directory: str | Path, *, param_dtype: str) -> tuple[Mapping
         raise ValueError(f"{folder} holds a standalone readout and no native backbone")
     translated = _translated(component.config, lazy_route(component.config),
                              component.own_tensors(read_weights(folder / component.weights_folder)), folder,
-                             dtype="float32", param_dtype=param_dtype, attention_impl="reference",
+                             dtype="float32", param_dtype=param_dtype,
                              max_seq_len=None, streaming=True)
     return component.config, translated.built.variables
 
@@ -2368,7 +2370,7 @@ def _kept_tensors(tensors: Mapping[str, unread.Stored], config: Mapping[str, obj
 
 def _load_native_source(source: sources.SourceReference, root: Path, *,
                         gguf_file: str | None, placed: Placing, streaming: bool,
-                        dtype: str, param_dtype: str, attention_impl: AttentionImpl,
+                        dtype: str, param_dtype: str,
                         max_seq_len: int | None, weights: bool = True,
                         component: NativeComponent | None = None,
                         tensors: Mapping[str, unread.Stored] | None = None,
@@ -2424,7 +2426,7 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
         _unpacked(packed_weights, "the transformers forward (tier 3)")
         selected = source if component is None else source.component(component.config_folder)
         loaded = torchax_fallback.load(selected, root, dtype=dtype, param_dtype=param_dtype,
-                                       attention_impl=attention_impl, max_seq_len=max_seq_len,
+                                       max_seq_len=max_seq_len,
                                        admission=route.admitted, weights=weights, placed=placed)
         return loaded, False
     if tensors is None and not weights:
@@ -2446,7 +2448,7 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
     if language is not None:
         tensors = _language_model_tensors(tensors, language)
     translated = _translated(config, route, tensors, directory, dtype=dtype, param_dtype=param_dtype,
-                             attention_impl=attention_impl, max_seq_len=max_seq_len, streaming=streaming,
+                             max_seq_len=max_seq_len, streaming=streaming,
                              packed_weights=packed_weights)
     model, variables, record, built, layouts, retained, export_adapter, drawn = translated.built
     quantized_tensors, scale_dtype, grid, stored = translated[1:]

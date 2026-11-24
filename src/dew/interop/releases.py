@@ -231,7 +231,7 @@ def bundle_plan(bundle: Pretrained, variables: Mapping[str, object] | None = Non
     assets = Assets(tokenizer=bundle.processor if bundle.tokenizer is None else bundle.tokenizer,
                     generation_config=dict(bundle.generation_config), named=bundle.names_tokenizer)
     envelope = (Release() if bundle.settings is None
-                else release_record(bundle.settings, bundle.numerics, bundle.model, values))
+                else release_record(bundle.settings, bundle.numerics, bundle.model, values, bundle.kernels))
     return ReleasePlan(Placed(parts, files), assets=assets, envelope=envelope)
 
 

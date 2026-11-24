@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from forks_support import LAYOUTS, assert_forks_as_own_rows
-from model_support import TINY_DECODER, float64_twin
+from model_support import TINY_DECODER, attending, float64_twin
 from reference_error import assert_as_exact, dew_path
 
 from dew.batch import Forks, coordinates
@@ -302,6 +302,7 @@ def test_a_model_that_would_read_forks_otherwise_lays_its_rows_whole():
             model.apply(held, forks.tokens, coordinates=joint)
 
 
+@attending("xla")
 def test_a_mask_beside_forks_narrows_what_they_read():
     """A call's pairwise mask beside its forks reads a key where both let it (`call_visibility`): the same
     as the call whose mask is already the forks' visibility narrowed by it, over drawn weights (check 1),
@@ -309,7 +310,7 @@ def test_a_mask_beside_forks_narrows_what_they_read():
     inputs, so the reference widened would be the reference again, its rounding no truth's."""
     from dew.nn.attention_masks import visibility_mask
 
-    model = attention_model(attention_impl="xla")
+    model = attention_model()
     forks = ForkedRows.pack(ROWS, WIDTH)
     laid = forks.coordinates
     windows = forks.tokens.shape

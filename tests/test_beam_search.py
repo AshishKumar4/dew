@@ -23,7 +23,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from model_support import initialized_decoder
+from model_support import attending, initialized_decoder
 from recorded_runs import assert_arms_as_recorded
 
 from dew.interop import Pretrained
@@ -113,7 +113,7 @@ def beam_draw(name: str):
     eos, pad = _special(name)
     tokens = np.asarray([token for token in range(vocabulary) if token not in (eos, pad)])
     with jax.enable_x64(new_val=True):
-        truth = Pretrained.load(str(FIXTURES / name), dtype="float64", attention_impl="reference")
+        truth = Pretrained.load(str(FIXTURES / name), dtype="float64")
 
     def clears(drawn: dict) -> bool:
         # In float64 in any process: a recorder's draws run where JAX's float64 is off.
@@ -136,7 +136,7 @@ def beam_scores(name: str):
     """`dew(dtype, inputs)` of checkpoint `name`: its float32 search's returned beams under each setting,
     their scores (`case_<i>`), their generated tokens up to each one's returned length, padded past it
     (`tokens_<i>`), and their EOS flags (`ended_<i>`)."""
-    pretrained = Pretrained.load(str(FIXTURES / name), dtype="float32", attention_impl="reference")
+    pretrained = Pretrained.load(str(FIXTURES / name), dtype="float32")
     eos, pad = _special(name)
 
     def dew(_, inputs) -> dict:
@@ -160,6 +160,7 @@ def pipeline_arms(name: str):
                   for leaf in ("case", "tokens", "ended")))
 
 
+@attending("reference")
 @pytest.mark.parametrize("name", ["llama-tiny", "qwen3-tiny"])
 def test_beams_are_transformers_beam_search(name):
     """Over drawn prompts whose every ranking the float64 search decides by the selection margin, Dew's
@@ -259,6 +260,7 @@ def test_a_search_reports_its_boundary_scores_without_changing_its_beams(model, 
     assert np.all(alike[:, 0] == 0) and np.all((alike == 0) | np.isposinf(alike))
 
 
+@attending("reference")
 @pytest.mark.parametrize("name", ["llama-tiny", "qwen3-tiny"])
 def test_a_renormalized_biased_search_is_transformers(name):
     """A sequence bias followed by a renormalization is what a source with
@@ -268,7 +270,7 @@ def test_a_renormalized_biased_search_is_transformers(name):
     returns under the same chain. The fixture checks that the bias and the
     renormalization each move a beam."""
     directory = FIXTURES / name
-    pretrained = Pretrained.load(str(directory), dtype="float32", attention_impl="reference")
+    pretrained = Pretrained.load(str(directory), dtype="float32")
     with np.load(directory / "generate.npz") as stored:
         inputs = ModelInputs(jnp.asarray(stored["prompt"], jnp.int32),
                              {"attention_mask": jnp.asarray(stored["mask"], bool)})

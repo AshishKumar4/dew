@@ -13,6 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from dream_walk_support import CODE, NEW_TOKENS, PROMPTS, RELEASES, STEPS, uniforms
+from model_support import attending
 from tool_support import load
 
 from dew.diffusion.discrete import Unmask
@@ -43,6 +44,7 @@ def snapshot(release: str, root: Path, generation: dict | None = None) -> Path:
     return directory
 
 
+@attending("reference")
 @pytest.mark.parametrize("release", sorted(RELEASES))
 def test_a_dream_release_walks_its_responses_as_its_own_sampling_does(release, tmp_path, monkeypatch):
     """A Dream release's task (`text_generation`, the public path a request takes) walks as its own
@@ -54,7 +56,7 @@ def test_a_dream_release_walks_its_responses_as_its_own_sampling_does(release, t
     between the two grids' reveal chances, which the two releases walk apart."""
     recorded = json.loads((FIXTURES / "dream-tiny" / "origin.json").read_text())
     assert recorded["settings"] == {"steps": STEPS, "new_tokens": NEW_TOKENS}
-    source = Pretrained.load(snapshot(release, tmp_path), dtype="float32", attention_impl="reference")
+    source = Pretrained.load(snapshot(release, tmp_path), dtype="float32")
     task = source.text_generation()
     assert (task.solver, task.steps, task.block) == (Unmask(temperature=0.0), 512, None)
     assert task.process.endpoint == {"dream": 1e-3, "diffucoder": 1e-12}[release]
@@ -77,14 +79,14 @@ def test_a_dream_release_walks_its_responses_as_its_own_sampling_does(release, t
         assert np.asarray(generation.tokens)[0, len(prompt):].tolist() == response, (release, prompt)
 
 
+@attending("reference")
 def test_a_dream_release_asking_what_its_walk_does_not_take_is_refused(tmp_path):
     """A Dream release whose generation config asks its sampling for what `alg='origin'` does not take
     (another `alg`, a `top_k`), names a mask other than the model's or asks for each step's canvas builds
     no task. One whose sampling code Dew does not know walks Dew's MDLM instead, refusing the controls
     that code would read."""
     for index, asked in enumerate(({"alg": "entropy"}, {"alg": "origin", "top_k": 5})):
-        source = Pretrained.load(snapshot("diffucoder", tmp_path / str(index), asked), dtype="float32",
-                                 attention_impl="reference")
+        source = Pretrained.load(snapshot("diffucoder", tmp_path / str(index), asked), dtype="float32")
         assert source.masked_walk is None
         with pytest.raises(ValueError):
             source.text_generation()
@@ -94,15 +96,16 @@ def test_a_dream_release_asking_what_its_walk_does_not_take_is_refused(tmp_path)
         stated[field] = stated[field] - 1 if field == "mask_token_id" else True
         (restated / "generation_config.json").write_text(json.dumps(stated))
         with pytest.raises(ValueError):
-            Pretrained.load(restated, dtype="float32", attention_impl="reference").text_generation()
+            Pretrained.load(restated, dtype="float32").text_generation()
     unknown = snapshot("dream", tmp_path / "unknown", {"steps": 64})
     (unknown / "generation_utils.py").write_text("# another sampling\n")
-    source = Pretrained.load(unknown, dtype="float32", attention_impl="reference")
+    source = Pretrained.load(unknown, dtype="float32")
     assert source.masked_walk is None
     with pytest.raises(ValueError):
         source.text_generation()
 
 
+@attending("xla")
 def test_a_run_over_a_dream_release_saves_and_serves_its_walk(tmp_path):
     """An objective over a loaded Dream release takes the release's walk by default, the end of its grid
     among it (ledger 2563): a run of it saves the walk, and the run's task (`MaskedGeneration.from_run`,
@@ -121,7 +124,7 @@ def test_a_run_over_a_dream_release_saves_and_serves_its_walk(tmp_path):
     from dew.objectives.diffusion.masked import MaskedDiffusionObjective
     from dew.training import Trainer
 
-    source = Pretrained.load(snapshot("dream", tmp_path), dtype="float32", attention_impl="xla")
+    source = Pretrained.load(snapshot("dream", tmp_path), dtype="float32")
     walk = source.masked_walk
     walked = (walk.solver, walk.steps, walk.block, walk.endpoint)
     objective = MaskedDiffusionObjective(source, MDLM(mask_id=source.model.mask_token_id)(), 8,
@@ -139,4 +142,4 @@ def test_a_run_over_a_dream_release_saves_and_serves_its_walk(tmp_path):
         assert (restored.solver, restored.steps, restored.block, restored.process.endpoint) == walked
         np.testing.assert_array_equal(restored(prompt, 8, key=7).host().tokens, expected)
     source.save(tmp_path / "saved")
-    assert Pretrained.load(tmp_path / "saved", dtype="float32", attention_impl="xla").masked_walk == walk
+    assert Pretrained.load(tmp_path / "saved", dtype="float32").masked_walk == walk

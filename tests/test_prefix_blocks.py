@@ -19,7 +19,7 @@ import numpy as np
 import optax
 import pytest
 from block_support import VOCAB, block_causal, model, wrapped
-from model_support import TINY_DECODER, model_draw
+from model_support import TINY_DECODER, attending, model_draw
 from reference_error import as_given, assert_as_exact
 from serving_support import Served, assert_served_as_exact
 
@@ -106,10 +106,11 @@ def test_the_stage_makes_each_documents_first_tokens_the_blocks_of_its_packed_ro
     np.testing.assert_array_equal(Blocks(prefix=2).map(two)["text_block_groups"], [1, 1, -1, 2, 2, -1])
 
 
+@attending("reference")
 def test_a_prefix_run_trains_the_block_mask_on_par_with_float64():
     decoder = blocky()
     objective = LMObjective(decoder, SEQ, prefix=PREFIX)
-    wide = decoder.clone(dtype=jnp.float64, attention_impl="reference")
+    wide = decoder.clone(dtype=jnp.float64)
 
     init = jax.jit(decoder.init)
 
@@ -462,6 +463,7 @@ def served_blocky(prefix=None, images: bool = False) -> TextGeneration:
                           sampling=Sampling(temperature=0, pad_token_id=0), prefix=prefix)
 
 
+@attending("reference")
 @pytest.mark.parametrize("prefix, serving", [(PREFIX, WHOLE), (PREFIX, PIECES), ("prompt", PIECES)],
                          ids=["first-tokens", "first-tokens-in-pieces", "prompt-in-pieces"])
 def test_a_served_prefix_run_scores_what_each_request_scores_alone(prefix, serving):
@@ -474,6 +476,7 @@ def test_a_served_prefix_run_scores_what_each_request_scores_alone(prefix, servi
     assert_served_as_exact(served_blocky(prefix), THREE, label, serving=serving, seeds=(SEEDS[label],) * 2)
 
 
+@attending("reference")
 @pytest.mark.parametrize("requests, serving, prefix, images", [
     (CARRIED, WHOLE, None, False), (CARRIED, PIECES, None, False), (CARRIED, PIECES, PREFIX, False),
     (SCATTERED, PIECES, None, False), (MEDIA, PIECES, None, True)],
@@ -504,6 +507,7 @@ REACHING = (-1, 2, -1, -1, -1, -1, -1, -1, 2, -1, -1, -1)
 """A block of the second and ninth tokens, so its first member reads what the ninth reads, the sixth too."""
 
 
+@attending("reference")
 @pytest.mark.parametrize("requests, prefix, hits", [
     ((Served(8, {BLOCKS_FIELD: LONG_BLOCK}), Served(8, {BLOCKS_FIELD: SHORT_BLOCK}),
       Served(8, {BLOCKS_FIELD: LONG_BLOCK})), None, (0, 0, 4)),
@@ -603,6 +607,7 @@ def test_a_prefix_run_and_a_batch_of_blocks_are_admitted_by_one_rule():
     assert admits(chunked(2, unchunked=True)) == (True, True)
 
 
+@attending("reference")
 def test_a_prefix_run_trains_and_serves_through_a_wrapper_of_a_block_reading_decoder():
     """A wrapper answers for its decoder's block reading (`DecoderWrapper`): its prefix run is built, scored
     as the bare decoder's objective scores it (check 1, float64 from the widened decoder), and served the
@@ -611,7 +616,7 @@ def test_a_prefix_run_trains_and_serves_through_a_wrapper_of_a_block_reading_dec
     wrapper = wrapped(decoder)
     objective = LMObjective(wrapper, SEQ, prefix=PREFIX)
     bare = LMObjective(decoder, SEQ, prefix=PREFIX)
-    wide = LMObjective(decoder.clone(dtype=jnp.float64, attention_impl="reference"), SEQ, prefix=PREFIX)
+    wide = LMObjective(decoder.clone(dtype=jnp.float64), SEQ, prefix=PREFIX)
     draw = model_draw(wrapper, (BATCH, ROW), VOCAB)
 
     def language_model(variables):
@@ -689,6 +694,7 @@ def harness_batches(ids, xp=np) -> list[list[tuple]]:
             [alone, (context, rest[:2]), (other, rest[:1])]]
 
 
+@attending("reference")
 @pytest.mark.parametrize("prefix", [PREFIX, "prompt"])
 def test_a_prefix_runs_harness_scores_a_continuation_as_its_generation_reads_it(prefix):
     """lm-eval's likelihood of a prefix run's continuation is read through the blocks a server makes of
@@ -703,7 +709,7 @@ def test_a_prefix_runs_harness_scores_a_continuation_as_its_generation_reads_it(
 
     decoder = blocky()
     assert LMObjective(decoder, 1).shares_prefixes()
-    wide = decoder.clone(dtype=jnp.float64, attention_impl="reference")
+    wide = decoder.clone(dtype=jnp.float64)
     draw = model_draw(decoder, (1, ROW), VOCAB)
     def forked(requests) -> bool:
         _, forks = _scoring_inputs([[*context.tolist(), *rest.tolist()] for context, rest in requests],

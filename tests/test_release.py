@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import pytest
+from model_support import attending
 
 from dew.config import Release
 from dew.config.release import RELEASE_FILE
@@ -43,6 +44,7 @@ def test_a_release_record_of_another_shape_is_refused_naming_what_it_holds(recor
         Release.read(record)
 
 
+@attending("xla")
 def test_a_release_declares_one_temperature_over_every_type_in_its_files_or_its_record(tmp_path):
     """A release's global temperature is its `Temperatures`' default over every type and bucket it names
     none for: Laya's file stating one number for `temperature` answers as the same release stating it for
@@ -65,7 +67,7 @@ def test_a_release_declares_one_temperature_over_every_type_in_its_files_or_its_
         (tmp_path / name / "rl_agent_config.json").write_text(json.dumps(stated))
         if record is not None:
             Release(calibration=to_record(record, Calibration)).write(tmp_path / name)
-        return Decide.from_pretrained(tmp_path / name, attention_impl="xla")
+        return Decide.from_pretrained(tmp_path / name)
 
     one, each = released("one", 1.7), released("each", [1.7, 1.7, 1.7])
     assert {one.calibration.temperatures.of(kind, 4) for kind in ("choice", "score", "noul")} == {1.7}
@@ -78,7 +80,7 @@ def test_a_release_declares_one_temperature_over_every_type_in_its_files_or_its_
             == eight(request["state"], asked)["intent"].probabilities.tolist())
     # Released again, the one temperature is written as each type's, which reads back to the same answers.
     one.save_pretrained(tmp_path / "saved")
-    again = Decide.from_pretrained(tmp_path / "saved", attention_impl="xla")
+    again = Decide.from_pretrained(tmp_path / "saved")
     assert (again(request["state"], asked)["intent"].probabilities.tolist()
             == one(request["state"], asked)["intent"].probabilities.tolist())
 

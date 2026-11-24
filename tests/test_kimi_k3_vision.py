@@ -12,6 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import attending
 from recorded_runs import assert_as_exact_as_recorded
 
 from dew.interop import Pretrained
@@ -47,8 +48,7 @@ def dew(dtype, inputs) -> dict[str, jax.Array]:
         # Loaded where its weights stay concrete, though its first call traces (`recorded_dew`'s pattern).
         with jax.ensure_compile_time_eval():
             if "float32" not in _LOADED:
-                source = Pretrained.load(TINY, dtype="float32", param_dtype="float32",
-                                         attention_impl="reference")
+                source = Pretrained.load(TINY, dtype="float32", param_dtype="float32")
                 assert isinstance(source.model, MultimodalTransformer)
                 _LOADED["float32"] = source.model, source.variables
             model, variables = _LOADED["float32"]
@@ -68,6 +68,7 @@ def dew(dtype, inputs) -> dict[str, jax.Array]:
     return found
 
 
+@attending("reference")
 def test_kimi_k3_reads_its_media_through_its_tower_and_merger_on_par_with_its_release():
     """Kimi K3 loads whole (row 855): its MoonViT, attending over an item's every frame and pooling them,
     with RMS norms at its computing dtype's epsilon, and its PatchMergerMLPV2 give the release's projected
@@ -77,12 +78,13 @@ def test_kimi_k3_reads_its_media_through_its_tower_and_merger_on_par_with_its_re
                                 "Kimi K3's projected media")
 
 
+@attending("reference")
 def test_a_kimi_k3_bundle_loads_whole_and_its_language_model_alone_on_request():
     """A Kimi K3 bundle loads whole, its tower and projector read into the model (`MultimodalTransformer`),
     and `text_only` takes its language model alone, the decoder the text tests hold to the release, every
     tensor of it read the same."""
-    whole = Pretrained.load(TINY, dtype="float32", attention_impl="reference")
-    alone = Pretrained.load(TINY, dtype="float32", attention_impl="reference", text_only=True)
+    whole = Pretrained.load(TINY, dtype="float32")
+    alone = Pretrained.load(TINY, dtype="float32", text_only=True)
     assert isinstance(whole.model, MultimodalTransformer)
     assert not isinstance(alone.model, MultimodalTransformer)
     assert {"tower", "projector"} <= set(whole.variables["params"])

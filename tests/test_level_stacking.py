@@ -8,7 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from model_support import stacked as stack_scanned
+from model_support import attending, stacked as stack_scanned
 from reference_error import assert_as_exact, with_gradients
 
 from dew.batch import Coordinates
@@ -23,17 +23,18 @@ from dew.objectives.lm.stacking import stacked_scores
 VOCAB, FEATURES, LENGTH, ROWS = 16, 16, 12, 4
 
 STACKED = CausalTransformer(vocab_size=VOCAB, emb_features=FEATURES, num_layers=2, num_heads=2,
-                            head_dim=16, mlp_features=16, max_seq_len=32, attention_impl="xla")
+                            head_dim=16, mlp_features=16, max_seq_len=32)
 """A two-layer test decoder, its feed-forward blocks the levels: its heads 16 wide, so a query or key
 norm's gradient, one sum over every token the draw holds, has 16 elements a draw for check 1 to pool."""
 
-TRUTH = STACKED.clone(dtype=jnp.float64, attention_impl="reference")
-"""The decoder in float64 on the reference kernel: the loops' truth."""
+TRUTH = STACKED.clone(dtype=jnp.float64)
+"""The decoder in float64, on the reference kernel as every float64 attention is (`dew.nn.attention`'s
+narrowing rule): the loops' truth."""
 BLOCKED = STACKED.clone(layer_types=("full_attention",) * 2,
                         kinds={"full_attention": {"mixer": AttentionMixer(bidirectional_blocks=True)}})
 """`STACKED` whose attention reads a row's blocks whole (`AttentionMixer.bidirectional_blocks`), as a prefix
 run's decoder does, and its float64 truth."""
-BLOCKED_TRUTH = BLOCKED.clone(dtype=jnp.float64, attention_impl="reference")
+BLOCKED_TRUTH = BLOCKED.clone(dtype=jnp.float64)
 
 STACKING_SEEDS = {"zero": 8, ((1,), (3,)): 8, ((0, 1), (3, 6)): 8, ((1, 0), (6, 3)): 8, "gradient": 512,
                   "blocks": 8}
@@ -250,6 +251,7 @@ def test_a_padded_rows_layout_reads_as_its_coordinates_say():
                     seeds=STACKING_SEEDS["zero"], truth_fn=jax.jit(truth))
 
 
+@attending("xla")
 def test_a_stacked_row_refuses_several_packed_documents():
     """A stacked pass refuses a row of several packed documents: its levels are one level a row, so a later
     document's windows would read the levels an earlier one's tokens stepped (ValueError, its own refusal:
@@ -263,6 +265,7 @@ def test_a_stacked_row_refuses_several_packed_documents():
                        {"segment_ids": documents}, adaptation, predict=False, logits=False)
 
 
+@attending("xla")
 def test_a_run_continues_pretraining_through_its_blocks_steps():
     """An objective that steps a decoder's own blocks in context trains, its loss finite and its blocks'
     starts moved by the outer step (`LMObjective(adaptation=ChunkAdaptation(layers=...))`)."""

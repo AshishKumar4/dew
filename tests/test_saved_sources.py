@@ -10,7 +10,7 @@ from pathlib import Path
 import jax
 import numpy as np
 import pytest
-from model_support import stacked
+from model_support import attending, stacked
 from process_support import run_pool
 from run_kinds import SEQ, captioned, decision, diffusion, lm, pictures, trained
 from saved_run_kinds import over, windows
@@ -213,6 +213,7 @@ def test_a_run_started_from_a_saved_run_resumes_and_serves_on_hosts_whose_caches
     assert str(source) in str(refused.value)
 
 
+@attending("xla")
 @pytest.mark.mesh(devices=8)
 def test_a_language_model_run_starts_from_a_saved_run_no_familys_layout_writes(tmp_path, monkeypatch):
     """A language model run whose decoder no family's layout holds (GPT-J's parallel layout under a gated
@@ -241,8 +242,8 @@ def test_a_language_model_run_starts_from_a_saved_run_no_familys_layout_writes(t
     state, _ = trained(first, tmp_path, "first", trainer={"checkpoint_final": True})
     source = tmp_path / "runs" / "first"
     assert not source_layout(saved_model(SavedRun.pinned(str(source)).record, None).build())
-    loaded = Pretrained.load(str(source), max_seq_len=2 * SEQ, attention_impl="xla")
-    assert (loaded.model.max_seq_len, loaded.model.attention_impl) == (2 * SEQ, "xla")
+    loaded = Pretrained.load(str(source), max_seq_len=2 * SEQ)
+    assert loaded.model.max_seq_len == 2 * SEQ
     # Asked no mesh, its weights lie on JAX's default device, as a family's load places them, not on
     # every device of a default mesh (ledger 4798).
     assert {frozenset(leaf.sharding.device_set) for leaf in jax.tree.leaves(loaded.variables)} == {
@@ -300,6 +301,7 @@ TEAM = {"billing": "payments", "technical": "outages", "sales": "pricing"}
 """The question the chat-format decision runs answer, `Choice("Which team?", TEAM)`."""
 
 
+@attending("xla")
 @pytest.mark.shared_setup("chat_decision_run")
 def test_a_saved_chat_format_decision_runs_release_answers_as_its_run(chat_decision_run, tmp_path,
                                                                       monkeypatch):
@@ -319,7 +321,7 @@ def test_a_saved_chat_format_decision_runs_release_answers_as_its_run(chat_decis
     served = Decide.of(PretrainedDecision.of(dataclasses.replace(task, variables=jax.tree.map(
         np.asarray, task.variables))))
     for written in ("exported", "saved"):
-        reloaded = Decide.from_pretrained(tmp_path / written, attention_impl="xla")
+        reloaded = Decide.from_pretrained(tmp_path / written)
         for state_text in ("charged twice", "is the site down?"):
             np.testing.assert_array_equal(reloaded(state_text, {"team": team})["team"].probabilities,
                                           served(state_text, {"team": team})["team"].probabilities)
@@ -621,6 +623,7 @@ PUBLISHED = {"xl": ("tiny_diffusers", "xl"), "flux": ("flux_source", "pipeline")
 state its size, and Flux's, whose grid's tokens set its resolution shift."""
 
 
+@attending("xla")
 @pytest.mark.parametrize("pipeline", sorted(PUBLISHED))
 def test_a_run_from_a_published_pipeline_binds_at_another_size_as_the_pipeline_does(pipeline, tmp_path):
     """A run trained a step from a published pipeline and saved binds at another size as the pipeline binds
@@ -639,11 +642,11 @@ def test_a_run_from_a_published_pipeline_binds_at_another_size_as_the_pipeline_d
     archive, folder = PUBLISHED[pipeline]
     directory = extract_fixture(Path(__file__).parent / "fixtures" / f"{archive}.tar.xz", tmp_path / archive)
     directory = directory / folder
-    own = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla")
+    own = load_diffusion_source(str(directory), dtype="float32")
     height, width = own.inputs.sample.shape[-3:-1]
     config = DiffusionRunConfig(
         pretrained=str(directory), data=images_of("tfds://oxford_flowers102", height), preset=None,
-        model=ModelConfig("unet", {**DEFAULT_MODEL_CONFIG, "dtype": "float32", "attention_impl": "xla"}),
+        model=ModelConfig("unet", {**DEFAULT_MODEL_CONFIG, "dtype": "float32"}),
         val_metrics=(),
         trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
         objective=ObjectiveConfig("diffusion", {"steps": 2, "ema_decay": None}))
@@ -651,7 +654,7 @@ def test_a_run_from_a_published_pipeline_binds_at_another_size_as_the_pipeline_d
     # Wider and taller apart: a rectangle's two extents each read where they are.
     size = (2 * height, width + width // 2)
     saved = load_diffusion_source(str(tmp_path / "run"), dtype="float32", size=size)
-    published = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla", size=size)
+    published = load_diffusion_source(str(directory), dtype="float32", size=size)
     assert isinstance(saved, RunPipeline) and saved.grid is not None
     assert isinstance(published, PretrainedPipeline) and isinstance(own, PretrainedPipeline)
     assert saved.inputs.sample == published.inputs.sample != own.inputs.sample
@@ -682,6 +685,7 @@ def flow_shift(source) -> float:
     return schedule.shift
 
 
+@attending("xla")
 def test_a_run_naming_its_own_resolution_shift_keeps_its_process_at_another_size(tmp_path):
     """A run from a published Flux pipeline naming a resolution shift of its own keeps its process at another
     size, where its source's follows its grid there: the run's shift equals the grid's at its own size,
@@ -701,7 +705,7 @@ def test_a_run_naming_its_own_resolution_shift_keeps_its_process_at_another_size
     archive, folder = PUBLISHED["flux"]
     directory = extract_fixture(Path(__file__).parent / "fixtures" / f"{archive}.tar.xz", tmp_path / archive)
     directory = directory / folder
-    own = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla")
+    own = load_diffusion_source(str(directory), dtype="float32")
     assert isinstance(own, PretrainedPipeline)
     # An objective over the pipeline trains its process over its grid; one given another grid, even an
     # equal one, trains the pipeline's process over a grid of its own.
@@ -714,7 +718,7 @@ def test_a_run_naming_its_own_resolution_shift_keeps_its_process_at_another_size
     config = DiffusionRunConfig(
         pretrained=str(directory), data=images_of("tfds://oxford_flowers102", height),
         preset=Flow(resolution_shift=ResolutionShift(base_shift=mu, max_shift=mu)),
-        model=ModelConfig("unet", {**DEFAULT_MODEL_CONFIG, "dtype": "float32", "attention_impl": "xla"}),
+        model=ModelConfig("unet", {**DEFAULT_MODEL_CONFIG, "dtype": "float32"}),
         val_metrics=(), trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
         objective=ObjectiveConfig("diffusion", {"steps": 2, "ema_decay": None}))
     task, _, _ = saved_after_one_step(config, lambda task: batch_for(task, 4), tmp_path / "run", 1e-2)
@@ -722,7 +726,7 @@ def test_a_run_naming_its_own_resolution_shift_keeps_its_process_at_another_size
     assert flow_shift(task) == flow_shift(own)
     size = (2 * height, width + width // 2)
     saved = load_diffusion_source(str(tmp_path / "run"), dtype="float32", size=size)
-    published = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla", size=size)
+    published = load_diffusion_source(str(directory), dtype="float32", size=size)
     assert isinstance(saved, RunPipeline)
     assert flow_shift(saved) == flow_shift(own) != flow_shift(published)
     assert not task.grid_process and not saved.grid_process

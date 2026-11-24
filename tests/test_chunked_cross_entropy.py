@@ -28,6 +28,7 @@ import pytest
 from confident_support import confident, label_derivative, log_partition, log_softmax
 from flax import linen as nn
 from float64_terms import float32_values
+from model_support import attending
 from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, with_gradients
 from residual_orders import order
 from sharded import collectives
@@ -103,6 +104,7 @@ def true_losses(table, states, targets, dtype):
     return optax.softmax_cross_entropy_with_integer_labels(true_logits(table, states, dtype), targets)
 
 
+@attending("reference")
 @pytest.mark.parametrize('dtype', [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize('tied', [False, True])
 def test_vocabulary_bias_is_fp32_after_tied_or_untied_head_products(dtype, tied):
@@ -110,8 +112,7 @@ def test_vocabulary_bias_is_fp32_after_tied_or_untied_head_products(dtype, tied)
     over it are on par with the whole logits' over drawn states, biases and targets (check 1)."""
     model = CausalTransformer(vocab_size=97, emb_features=24, num_layers=1, num_heads=3,
                               mlp_features=32, max_seq_len=8, head_bias=True,
-                              tie_embeddings=tied, dtype=dtype, qk_norm=False,
-                              attention_impl='reference')
+                              tie_embeddings=tied, dtype=dtype, qk_norm=False)
     ids = jnp.asarray([[2, 7, 3], [11, 4, 9]], jnp.int32)
     variables = nn.unbox(model.init(jax.random.key(0), ids))
     bias = jax.random.normal(jax.random.key(3), (97,), jnp.float32) / 17
@@ -201,6 +202,7 @@ def test_the_fused_head_takes_the_whole_heads_loss_and_gradients_under_the_float
         np.testing.assert_array_equal(fused(*terms)[1][1], whole(*terms)[1][1])
 
 
+@attending("reference")
 @pytest.mark.parametrize('kind', ['nvfp4', 'fp8'])
 @pytest.mark.parametrize('dtype', [jnp.float32, jnp.bfloat16])
 def test_a_checkpoints_head_input_quantization_reaches_every_head_that_scores_it(kind, dtype):
@@ -214,7 +216,7 @@ def test_a_checkpoints_head_input_quantization_reaches_every_head_that_scores_it
 
     model = InputQuantization(format='modelopt', sites=(('lm_head', kind),)).apply(CausalTransformer(
         vocab_size=97, emb_features=32, num_layers=1, num_heads=2, mlp_features=32, max_seq_len=8,
-        head_bias=True, tie_embeddings=False, dtype=dtype, qk_norm=False, attention_impl='reference'))
+        head_bias=True, tie_embeddings=False, dtype=dtype, qk_norm=False))
     ids = jnp.asarray([[2, 7, 3, 5], [11, 4, 9, 1]], jnp.int32)
     variables = nn.unbox(model.init(jax.random.key(0), ids))
     variables[QUANTIZATION]['lm_head'][INPUT_SCALES[kind]] = jnp.asarray(0.37, jnp.float32)
@@ -250,6 +252,7 @@ def test_a_checkpoints_head_input_quantization_reaches_every_head_that_scores_it
                     seeds=SEEDS['quantized'], truth_fn=truth)
 
 
+@attending("reference")
 @pytest.mark.parametrize('tied', [False, True])
 def test_a_bf16_models_table_scores_states_handed_over_in_fp32_as_its_head_does(tied):
     """A table carries its model's compute dtype, so states that reach a
@@ -257,7 +260,7 @@ def test_a_bf16_models_table_scores_states_handed_over_in_fp32_as_its_head_does(
     model's own bf16 head multiplies them: bitwise its logits."""
     model = CausalTransformer(vocab_size=97, emb_features=24, num_layers=1, num_heads=3,
                               mlp_features=32, max_seq_len=8, tie_embeddings=tied, dtype=jnp.bfloat16,
-                              qk_norm=False, attention_impl='reference')
+                              qk_norm=False)
     ids = jnp.asarray([[2, 7, 3], [11, 4, 9]], jnp.int32)
     variables = nn.unbox(model.init(jax.random.key(0), ids))
     with jax.default_matmul_precision('default'):
@@ -557,6 +560,7 @@ def test_a_vocabulary_split_heads_loss_is_taken_against_the_rows_maximum():
                     seeds=SEEDS['vocabulary split'])
 
 
+@attending("reference")
 @pytest.mark.mesh(devices=2)
 def test_vocabulary_split_slices_the_bias_with_its_table_columns():
     from dew.objectives.lm import LMObjective
@@ -564,7 +568,7 @@ def test_vocabulary_split_slices_the_bias_with_its_table_columns():
     def model(dtype):
         return CausalTransformer(vocab_size=128, emb_features=8, num_layers=1, num_heads=2,
                                  mlp_features=16, max_seq_len=4, head_bias=True,
-                                 qk_norm=False, attention_impl='reference', dtype=dtype)
+                                 qk_norm=False, dtype=dtype)
 
     def objective(model, variables):
         return LMObjective(model, seq_len=4, variables=variables, head_chunks=4, head_tile=(2, 11),
@@ -578,6 +582,7 @@ def test_vocabulary_split_slices_the_bias_with_its_table_columns():
                  'vocabulary-split bias', SEEDS['split bias'])
 
 
+@attending("reference")
 @pytest.mark.mesh(devices=2)
 def test_a_quantized_split_head_scores_as_one_device_and_moves_no_head_sized_array():
     """A head whose input a checkpoint quantizes, split over the vocabulary on
@@ -592,7 +597,7 @@ def test_a_quantized_split_head_scores_as_one_device_and_moves_no_head_sized_arr
     def quantized(dtype):
         return InputQuantization(format='modelopt', sites=(('lm_head', 'fp8'),)).apply(CausalTransformer(
             vocab_size=512, emb_features=16, num_layers=1, num_heads=2, mlp_features=16, max_seq_len=4,
-            tie_embeddings=False, qk_norm=False, attention_impl='reference', dtype=dtype))
+            tie_embeddings=False, qk_norm=False, dtype=dtype))
 
     def objective(model, variables):
         return LMObjective(model, seq_len=4, variables=variables, head_chunks=4, head_tile=(2, 64),
@@ -757,6 +762,7 @@ def test_the_gradient_reaches_the_backbone_through_the_states_and_the_head():
 
 # --- the chunk arithmetic itself -------------------------------------------
 
+@attending("xla")
 @pytest.mark.parametrize("chunks", [0, -1])
 def test_an_lm_run_of_a_nonpositive_chunk_count_is_refused_where_its_step_compiles(chunks):
     """An LM objective asked to score its head in no vocabulary slices, or fewer, is refused
@@ -765,7 +771,7 @@ def test_an_lm_run_of_a_nonpositive_chunk_count_is_refused_where_its_step_compil
     from dew.training import Trainer
 
     model = CausalTransformer(vocab_size=5, emb_features=8, num_layers=1, num_heads=1,
-                              mlp_features=16, max_seq_len=8, attention_impl="xla")
+                              mlp_features=16, max_seq_len=8)
     trainer = Trainer(LMObjective(model, seq_len=4, head_chunks=chunks, ema_decay=None), optax.sgd(.01),
                       key=jax.random.key(0))
     initial = trainer.initial_state()
@@ -805,6 +811,7 @@ def test_small_vocabularies_take_any_positive_chunk_count(chunks, tile):
         np.testing.assert_array_equal(tiled(*draw(0))[1], whole(*draw(0))[1])
 
 
+@attending("xla")
 @pytest.mark.parametrize("chunks", [4, 8])
 def test_lm_training_with_small_vocabularies_matches_the_unchunked_head(chunks):
     """The objective's chunk count reaches the tiled head in both its token losses and the optimizer's
@@ -816,7 +823,7 @@ def test_lm_training_with_small_vocabularies_matches_the_unchunked_head(chunks):
     from dew.training import Trainer
 
     model = CausalTransformer(vocab_size=5, emb_features=8, num_layers=1, num_heads=1,
-                              mlp_features=16, max_seq_len=8, head_bias=True, attention_impl="xla")
+                              mlp_features=16, max_seq_len=8, head_bias=True)
     objective = LMObjective(model, seq_len=4, head_chunks=chunks, head_tile=(3, 2), ema_decay=None)
     trainer = Trainer(objective, optax.sgd(.01), key=jax.random.key(0))
     initial = trainer.initial_state()
@@ -1629,11 +1636,12 @@ def test_a_vocabulary_split_heads_unconfident_target_gradient_is_on_par_with_aut
 
 
 PROJECTED = CausalTransformer(vocab_size=97, emb_features=32, num_layers=1, num_heads=2, mlp_features=32,
-                              max_seq_len=8, embedding_features=16, qk_norm=False, attention_impl='reference')
+                              max_seq_len=8, embedding_features=16, qk_norm=False)
 """A decoder whose embedding has a width of its own (OPT-350m's `word_embed_proj_dim`): its final states
 reach the vocabulary matrix through `project_out` (`OutputTable.projection`)."""
 
 
+@attending("reference")
 @pytest.mark.parametrize('fused', [False, True], ids=['tiled', 'fused'])
 def test_a_projected_head_is_scored_as_one_matrix_as_its_exact_head_scores(fused):
     """A projected head is read as one matrix (`output_table`), its states projected once by the read

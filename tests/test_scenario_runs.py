@@ -172,7 +172,7 @@ def float64_twin(served: TextGeneration, canonical: nn.Module) -> tuple[nn.Modul
     with jax.enable_x64(new_val=True):
         weights = jax.tree.map(value, dict(served.variables),
                                is_leaf=lambda node: isinstance(node, Annotated))
-    return canonical.clone(dtype=jnp.float64, attention_impl="reference"), weights
+    return canonical.clone(dtype=jnp.float64), weights
 
 
 Draws = list[tuple[np.ndarray, int, np.ndarray]]
@@ -646,7 +646,7 @@ def published_task(cell: Mapping, root: Path):
 
     archive, inside = PIPELINES[cell["family"]]
     extract_fixture(Path(__file__).resolve().parents[1] / f"tests/fixtures/{archive}.tar.xz", root / archive)
-    loaded = Pretrained.load(str(root / archive / inside), dtype=cell["dtype"], attention_impl="xla")
+    loaded = Pretrained.load(str(root / archive / inside), dtype=cell["dtype"])
     return loaded.text_to_image()
 
 

@@ -27,7 +27,7 @@ from memory_support import (
     layer,
     written,
 )
-from model_support import scanning, unrolled
+from model_support import attending, scanning, unrolled
 from port_support import row_names_port
 from reference_error import as_given, assert_as_exact, dew_path, widened
 
@@ -570,6 +570,7 @@ def test_a_served_memory_rounds_its_moving_gradients_from_its_requests_stream(me
         assert not np.array_equal(likelihoods(moved), likelihoods(first))
 
 
+@attending("reference")
 def test_a_server_serves_a_quantized_memory_decoder_on_par_with_its_full_forward():
     """A memory decoder served quantized (`TextGeneration.quantized`: every inner Dense of its heads'
     networks, weights and activations) through a server's two slots draws tokens whose likelihoods are on

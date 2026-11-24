@@ -24,6 +24,7 @@ from flax import linen as nn
 from model_support import (
     TINY_DECODER,
     as_stepped,
+    attending,
     decode_logits,
     decode_steps,
     model_draw,
@@ -105,7 +106,7 @@ def drawn(model, batch=2, length=SEQ):
 
 def float64(model):
     """`model` in float64 on the reference kernel, which keeps float64 where a fused one narrows."""
-    return model.clone(dtype=jnp.float64, attention_impl="reference")
+    return model.clone(dtype=jnp.float64)
 
 
 def applied(model, **call):
@@ -145,12 +146,15 @@ def test_layer_kinds_refuse_invalid_rotary_mask_and_grouped_head_geometry(fields
     with pytest.raises(ValueError):
         model = tiny(num_layers=1, layer_types=("special",), kinds={"special": fields}, causal=causal)
         nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
+
+
+@attending("reference")
 @pytest.mark.parametrize("field", ["embedding_dropout_rate", "attention_dropout_rate", "dropout_rate"])
 def test_decoder_dropout_is_training_only(rng, field):
-    base = tiny(dropout_rate=0, attention_impl="reference")
+    base = tiny(dropout_rate=0)
     ids = tokens(rng, length=4)
     params = nn.unbox(base.init(rng, ids))
-    active = tiny(attention_impl="reference", **{"dropout_rate": 0, field: .5})
+    active = tiny(**{"dropout_rate": 0, field: .5})
     first = active.apply(params, ids, train=True, rngs={"dropout": jax.random.key(10)})
     second = active.apply(params, ids, train=True, rngs={"dropout": jax.random.key(11)})
     assert not np.array_equal(first, second)
@@ -176,17 +180,18 @@ def test_decoder_dropout_is_training_only(rng, field):
         np.testing.assert_array_equal(evaluated, embeddings)
 
 
+@attending("reference")
 @pytest.mark.parametrize("geometry", [{"layer_types": ("local", "local"), "kinds": {"local": {"window": 2}}},
                                      {"layer_types": ("local", "local"), "kinds": {"local": {"chunk": 2}}},
                                      {"num_kv_heads": 2}])
 def test_attention_dropout_reaches_local_and_grouped_heads(rng, geometry):
-    model = tiny(attention_dropout_rate=.5, attention_impl="reference", **geometry)
+    model = tiny(attention_dropout_rate=.5, **geometry)
     ids = tokens(rng, length=4)
     params = nn.unbox(model.init(rng, ids))
     one = model.apply(params, ids, train=True, rngs={"dropout": jax.random.key(1)})
     two = model.apply(params, ids, train=True, rngs={"dropout": jax.random.key(2)})
     assert not jnp.array_equal(one, two)
-    baseline = tiny(attention_impl="reference", **geometry).apply(params, ids)
+    baseline = tiny(**geometry).apply(params, ids)
     evaluated = model.apply(params, ids)
     assert np.asarray(evaluated).tobytes() == np.asarray(baseline).tobytes()
 
@@ -196,6 +201,7 @@ RECORDS_A_DRAW = 16
 (`test_old_decoder_record_keeps_zero_dropout_and_computes_its_export`)."""
 
 
+@attending("reference")
 def test_old_decoder_record_keeps_zero_dropout_and_computes_its_export():
     """A decoder record from before dropout builds with every rate zero and computes what its
     serialized pre-dropout forward and gradient compute: the export run as serialized is check 1's
@@ -213,7 +219,7 @@ def test_old_decoder_record_keeps_zero_dropout_and_computes_its_export():
     config = {"vocab_size": 17, "emb_features": 8, "num_layers": 1, "num_heads": 2,
                   "mlp_features": 16, "max_seq_len": 8}
     model = ModelConfig("causal_transformer", {**config, "dtype": "float32",
-                                              "precision": "highest", "attention_impl": "reference"}).build()
+                                              "precision": "highest"}).build()
     assert model.embedding_dropout_rate == model.attention_dropout_rate == 0
     directory = Path(__file__).with_name("fixtures")
     held = np.load(directory / "decoder-default-dropout.npz")
@@ -379,17 +385,18 @@ def test_logits_ignore_every_later_token(rng):
     assert not jnp.array_equal(baseline[:, cut + 1:], changed[:, cut + 1:])
 
 
-@pytest.mark.parametrize("attention_impl", ['reference', 'xla'])
-def test_decode_cache_matches_the_full_sequence(rng, attention_impl):
+@pytest.mark.parametrize("kernel", ['reference', 'xla'])
+def test_decode_cache_matches_the_full_sequence(rng, kernel):
     """The prefill plus single-token steps must reproduce the full-sequence
     logits position by position, on par with them (check 1), on the reference
     kernel and on the fused one (where the cache mask travels as a mask
     argument, not a causal flag)."""
-    model = tiny(attention_impl=attention_impl)
+    model = tiny()
     ids = tokens(rng)
-    params = nn.unbox(model.init(rng, ids))
-    assert decode_logits(model, params, ids[:, :4], ids[:, 4:]).shape == (ids.shape[0], SEQ - 3, VOCAB)
-    decoded_against_full(model, 4, f"{attention_impl} decode", SEEDS['decode'])
+    with chosen(attention=kernel):
+        params = nn.unbox(model.init(rng, ids))
+        assert decode_logits(model, params, ids[:, :4], ids[:, 4:]).shape == (ids.shape[0], SEQ - 3, VOCAB)
+        decoded_against_full(model, 4, f"{kernel} decode", SEEDS['decode'])
 
 
 @pytest.mark.parametrize("stack_scan", ["plain", "scanned"], indirect=True)
@@ -407,7 +414,7 @@ def test_a_cached_prompt_reads_its_cache_under_a_chosen_template(stack_scan):
         with chosen(attention='template'):
             return step(params, made(params, prompt.shape[0]), prompt)[0]
 
-    assert_as_exact(prefilled, applied(model.clone(attention_impl='xla')), drawn(model, length=6),
+    assert_as_exact(prefilled, attending('xla')(applied(model)), drawn(model, length=6),
                     "cached prefill on a chosen template", seeds=SEEDS['cached prefill'],
                     truth_fn=applied(float64(model)))
 
@@ -415,8 +422,8 @@ def test_a_cached_prompt_reads_its_cache_under_a_chosen_template(stack_scan):
 def test_reference_and_xla_kernels_agree_when_causal():
     """The fused kernel's logits on par with the reference kernel's (check 1)."""
     model = tiny()
-    assert_as_exact(applied(model.clone(attention_impl='xla')),
-                    applied(model.clone(attention_impl='reference')), drawn(model), "causal kernels",
+    assert_as_exact(attending('xla')(applied(model)), attending('reference')(applied(model)), drawn(model),
+                    "causal kernels",
                     seeds=SEEDS['kernels'], truth_fn=applied(float64(model)))
 
 
@@ -481,6 +488,7 @@ def test_a_softcapped_call_is_the_capped_softmax_on_every_path_it_takes(rng):
         scaled_dot_product_attention(*halves, causal=True, softcap=2.0, implementation='cudnn')
 
 
+@attending("reference")
 def test_grouped_query_heads_match_repeated_kv_projections(rng):
     """Grouped heads must read the kv head the fused kernels read: a GQA model
     is on par with an all-heads model whose kv kernels are the grouped ones
@@ -530,15 +538,15 @@ def bidirectional_reach(rng, implementation, path, kind):
     """Which positions move when token 6 of a two-layer bidirectional
     sliding stack changes, through the kernel's window, the validity mask or
     packed documents (one document, so the reach is the same)."""
-    model = tiny(layer_types=('sliding_attention',) * 2, causal=False, attention_impl=implementation,
-                 kinds={'sliding_attention': kind})
+    model = tiny(layer_types=('sliding_attention',) * 2, causal=False, kinds={'sliding_attention': kind})
     ids = tokens(rng)
     params = nn.unbox(model.init(rng, ids))
     inputs = {"plain": {}, "valid": {"attention_mask": jnp.ones(ids.shape, bool)},
               "packed": {"segment_ids": jnp.ones(ids.shape, jnp.int32),
                          "positions": jnp.broadcast_to(jnp.arange(SEQ), ids.shape)}}[path]
-    baseline = model.apply(params, ids, **inputs)
-    changed = model.apply(params, ids.at[:, 6].set((ids[:, 6] + 5) % VOCAB), **inputs)
+    with chosen(attention=implementation):
+        baseline = model.apply(params, ids, **inputs)
+        changed = model.apply(params, ids.at[:, 6].set((ids[:, 6] + 5) % VOCAB), **inputs)
     moved = jnp.any(baseline != changed, axis=(0, 2))
     return [int(index) for index in jnp.where(moved)[0]]
 
@@ -563,6 +571,7 @@ def test_a_bidirectional_layer_without_a_two_sided_window_reads_its_whole_row(rn
     assert bidirectional_reach(rng, implementation, path, {'window': 3}) == list(range(SEQ))
 
 
+@attending("reference")
 def test_sliding_attention_decode_matches_the_full_sequence():
     """A sliding layer decodes on par with its full pass (check 1)."""
     model = tiny(layer_types=('full_attention', 'sliding_attention'),
@@ -583,6 +592,7 @@ def hybrid(**overrides):
                    **overrides})
 
 
+@attending("reference")
 def test_learned_positions_continue_from_the_models_own_count_whatever_its_first_layer(rng):
     """Learned positions read a cached call's places from the model's own count of each row's real
     tokens (`DecodeCursor`), whatever mixer its first layer runs: Qwen3.5's stack, whose first layers
@@ -650,6 +660,7 @@ def test_a_hybrid_stack_decodes_as_it_scores_in_parallel(rng):
     assert not jnp.array_equal(kept, reset)
 
 
+@attending("reference")
 @pytest.mark.check1_shards(seeds=512, per_task=128)
 def test_a_hybrid_stack_decodes_on_par_with_its_parallel_scores():
     """`test_a_hybrid_stack_decodes_as_it_scores_in_parallel`'s check 1 over drawn weights and tokens:
@@ -699,6 +710,7 @@ def test_a_kinds_rope_base_only_moves_that_kinds_layers(rng):
     assert jnp.array_equal(both.apply(precedence_params, ids), model_only.apply(precedence_params, ids))
 
 
+@attending("reference")
 def test_sandwich_norms_normalize_what_the_residual_adds(rng):
     """The two norms sit on the sublayer outputs, which makes each residual
     contribution scale-free: an eight times larger o_proj and down_proj (a
@@ -895,6 +907,7 @@ def test_packed_attention_stays_causal_inside_a_document(rng):
     assert not jnp.array_equal(baseline[:, cut:6], changed[:, cut:6])
 
 
+@attending("reference")
 def test_a_packed_document_reads_like_the_document_alone(rng):
     """The second document's logits cannot depend on sitting after the first:
     same tokens, same per-document positions, the output on par with the
@@ -911,6 +924,7 @@ def test_a_packed_document_reads_like_the_document_alone(rng):
                     truth_fn=alone(float64(model)))
 
 
+@attending("reference")
 @pytest.mark.parametrize(("mixer", "layout"), [
     (None, None), (None, KVCache(page_size=4)),
     (GatedDeltaNetMixer(linear_num_key_heads=2, linear_num_value_heads=2, linear_key_head_dim=8,
@@ -992,19 +1006,19 @@ def test_padding_in_a_packed_row_reaches_no_query(rng):
 
 
 def test_a_layer_forcing_a_kernel_that_does_not_take_its_call_raises_naming_what_it_fails(rng):
-    """A model whose layers name cudnn (`attention_impl`) forces it, so a call cudnn does not take
-    raises, naming the kernel (`dew.nn.kernels.selection.select`), as torch's `sdpa_kernel` does,
-    rather than running another kernel: here an fp32 model, packed or not. 'auto' runs both."""
-    model = tiny(attention_impl='cudnn')
+    """A run naming cudnn for its attention (`chosen(attention='cudnn')`) forces it, so a call cudnn
+    does not take raises, naming the kernel (`dew.nn.kernels.selection.select`), as torch's `sdpa_kernel`
+    does, rather than running another kernel: here an fp32 model, packed or not. 'auto' runs both."""
+    model = tiny()
     ids, segment_ids, positions = packed_pair(rng)
-    params = nn.unbox(tiny().init(rng, ids))
+    params = nn.unbox(model.init(rng, ids))
 
-    with pytest.raises(KernelRefused) as plain:
+    with pytest.raises(KernelRefused) as plain, chosen(attention='cudnn'):
         model.apply(params, ids)
-    with pytest.raises(KernelRefused) as packed:
+    with pytest.raises(KernelRefused) as packed, chosen(attention='cudnn'):
         model.apply(params, ids, positions=positions, segment_ids=segment_ids)
     assert plain.value.kernel == packed.value.kernel == "cudnn"
-    tiny().apply(params, ids, positions=positions, segment_ids=segment_ids)
+    model.apply(params, ids, positions=positions, segment_ids=segment_ids)
 
 
 def test_metadata_that_restricts_no_visibility_keeps_the_fused_kernel(rng):
@@ -1016,17 +1030,17 @@ def test_metadata_that_restricts_no_visibility_keeps_the_fused_kernel(rng):
 
     Validity is the other half of the contract. An array is opaque at trace
     time, so an all-true one still builds the mask and still rides xla."""
-    model = tiny(attention_impl='cudnn')
+    model = tiny()
     ids = tokens(rng)
-    params = nn.unbox(tiny().init(rng, ids))
+    params = nn.unbox(model.init(rng, ids))
     rotary = jnp.tile(jnp.arange(ids.shape[1]), (ids.shape[0], 1))
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError), chosen(attention='cudnn'):
         model.apply(params, ids, rotary_positions=rotary)
 
     valid = jnp.ones(ids.shape, bool)
-    assert jnp.array_equal(model.apply(params, ids, attention_mask=valid),
-                           tiny(attention_impl='xla').apply(params, ids, attention_mask=valid))
+    assert jnp.array_equal(attending('cudnn')(model.apply)(params, ids, attention_mask=valid),
+                           attending('xla')(model.apply)(params, ids, attention_mask=valid))
 
 
 def test_metadata_that_restricts_no_visibility_scores_like_no_metadata(rng):
@@ -1036,19 +1050,20 @@ def test_metadata_that_restricts_no_visibility_scores_like_no_metadata(rng):
     by one gather, so XLA may fuse their reductions differently and the
     gradients are on par over drawn weights and tokens (check 1) rather than
     bitwise."""
-    model = tiny(attention_impl='xla')
+    model = tiny()
     ids = tokens(rng)
     params = nn.unbox(model.init(rng, ids))
     rotary = jnp.tile(jnp.arange(ids.shape[1]), (ids.shape[0], 1))
 
+    @attending('xla')
     def scored(model, **metadata):
         def run(tree, ids, cotangent):
             return with_gradients(lambda tree: model.apply(tree, ids, **metadata))(tree, cotangent)[1]
         return jax.jit(run)
 
     draw = with_logit_cotangent(drawn(model), VOCAB, 0x904)
-    assert jnp.array_equal(model.apply(params, ids),
-                           model.apply(params, ids, rotary_positions=rotary))
+    assert jnp.array_equal(attending('xla')(model.apply)(params, ids),
+                           attending('xla')(model.apply)(params, ids, rotary_positions=rotary))
     assert_as_exact(scored(model, rotary_positions=rotary), scored(model), draw, "spelled rotary",
                     seeds=SEEDS['metadata'], truth_fn=scored(float64(model)))
 
@@ -1078,19 +1093,16 @@ def test_a_padded_slot_reaches_no_query(rng):
     assert jnp.all(jnp.isfinite(changed))
 
 
-@pytest.mark.parametrize("overrides", [
-    {"attention_impl": 'xla'},
-    {"num_kv_heads": 2, "attention_impl": 'xla'},
-])
+@pytest.mark.parametrize("overrides", [{}, {"num_kv_heads": 2}])
 def test_packed_kernels_agree_with_the_reference(rng, overrides):
     """The reference kernel applies the segment mask itself and xla applies it
     inside jax.nn.dot_product_attention, on the same weights: on par over drawn
     weights and tokens (check 1)."""
-    kernel = tiny(**overrides)
-    reference = tiny(**{**overrides, "attention_impl": "reference"})
+    reference = tiny(**overrides)
     _, segment_ids, positions = packed_pair(rng)
     packed = {"positions": positions, "segment_ids": segment_ids}
-    assert_as_exact(applied(kernel, **packed), applied(reference, **packed), drawn(reference),
+    assert_as_exact(attending('xla')(applied(reference, **packed)),
+                    attending('reference')(applied(reference, **packed)), drawn(reference),
                     f"{overrides} packed kernels", seeds=SEEDS['packed kernels'],
                     truth_fn=applied(float64(reference), **packed))
 
@@ -1464,6 +1476,7 @@ def test_a_nope_layer_reads_no_positions_and_keeps_its_logit_scale():
     assert not np.array_equal(scaled, plain)
 
 
+@attending("reference")
 def test_an_xsa_nope_mup_model_decodes_what_its_full_forward_scores(rng):
     """Prefill and token-by-token decode read the logits of one forward, on
     par (check 1), for a Rigel-style layer: XSA subtracts the new token's own
@@ -1509,6 +1522,7 @@ def test_root_multipliers_scale_around_blocks_that_keep_their_own(extra):
                                   np.asarray(plain.apply(multiplied, ids)) / 4)
 
 
+@attending("reference")
 def test_a_decode_step_reads_each_key_head_once_for_its_group(rng):
     """A decode step's grouped query heads reach the kernel as their key
     head's query positions, [rows, group, kv_heads, width]
@@ -1704,7 +1718,7 @@ def a_bf16_decoder_trains_and_serves_through_its_gpu_kernels():
     together by check 1 from the model in float64 over drawn weights and tokens (the GPU's ones beside the
     xla kernel's):
 
-    - a packed batch on a layer naming cuDNN (`attention_impl`), its documents the kernel's mask (an
+    - a packed batch on cuDNN (`chosen(attention='cudnn')`), its documents the kernel's mask (an
       additive bias, `_attention_kernel`), its logits and every parameter's gradient on par with the xla
       kernel's: a packed training step's forward and backward;
     - a prompt prefilled into the cache under 'auto' reads it as the documents its tokens end, no mask,
@@ -1716,7 +1730,6 @@ def a_bf16_decoder_trains_and_serves_through_its_gpu_kernels():
     - a prefill of left-padded prompts, its rows' padding the selector's key validity
       (docs/performance.md, the prefill's attention), on par with the full pass over the real tokens."""
     model = tiny(dtype=jnp.bfloat16, num_kv_heads=2, head_dim=32)
-    named, plain = model.clone(attention_impl='cudnn'), model.clone(attention_impl='xla')
     wide = float64(model)
     # Its batch's layout made on the host in a GPU tier prepare (`ahead_on_the_host`, rows 7858, 7859).
     with ahead_on_the_host():
@@ -1753,14 +1766,15 @@ def a_bf16_decoder_trains_and_serves_through_its_gpu_kernels():
                     "padded prefill": padded(params, ids)}
         return run
 
+    @attending('xla')
     def stepped_reference(params, ids):
-        reference = full(plain)(params, ids)
+        reference = full(model)(params, ids)
         # The widths a cached decode computes, from its last prompt position on.
-        stepped = as_stepped(lambda tokens: plain.apply(params, tokens), ids, prompt)
+        stepped = as_stepped(lambda tokens: model.apply(params, tokens), ids, prompt)
         reference["decode steps"] = stepped[:, prompt - 1:]
         return reference
 
-    training = trained(named)
+    training = attending('cudnn')(trained(model))
 
     def ours(params, ids):
         gradients, logits = training(params, ids)

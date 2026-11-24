@@ -10,6 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import attending
 
 from dew.diffusion.discrete import MDLM, Confident, Unmask
 from dew.interop import Pretrained
@@ -18,6 +19,7 @@ from dew.nn.inputs import ModelInputs
 FIXTURES = Path(__file__).parent / "fixtures" / "hf"
 
 
+@attending("reference")
 def test_a_blockwise_walk_generates_what_llada2s_release_generates():
     """LLaDA2's tiny decoder walked in blocks of four places over four steps each, revealing as its release
     does (`Confident`, its best token alone), generates each recorded prompt's tokens as the release's own
@@ -31,7 +33,7 @@ def test_a_blockwise_walk_generates_what_llada2s_release_generates():
     threshold), so one a block its response reaches, through its end token's where it draws one."""
     recorded = json.loads((FIXTURES / "llada2-tiny" / "generate.json").read_text())
     settings = recorded["settings"]
-    source = Pretrained.load(FIXTURES / "llada2-tiny", dtype="float32", attention_impl="reference")
+    source = Pretrained.load(FIXTURES / "llada2-tiny", dtype="float32")
     process = MDLM(mask_id=recorded["mask_id"])()
     solver = Confident(threshold=settings["threshold"], top_k=settings["top_k"])
     budget, block, steps = settings["gen_length"], settings["block_length"], settings["steps"]
@@ -78,6 +80,7 @@ def _release_reveal(confidence: np.ndarray, quota: int, threshold: float) -> np.
     return chosen
 
 
+@attending("reference")
 def test_llada2s_task_walks_as_its_release_and_generates_the_recorded_prompts():
     """LLaDA2's task (`text_generation`, what `dew.pipeline` and a run return) walks as its release's
     `generate` defaults do: blocks of 32 over 32 steps each, revealing past 0.95 (`Confident`); and the
@@ -88,7 +91,7 @@ def test_llada2s_task_walks_as_its_release_and_generates_the_recorded_prompts():
 
     recorded = json.loads((FIXTURES / "llada2-tiny" / "generate.json").read_text())
     settings = recorded["settings"]
-    source = Pretrained.load(FIXTURES / "llada2-tiny", dtype="float32", attention_impl="reference")
+    source = Pretrained.load(FIXTURES / "llada2-tiny", dtype="float32")
     task = source.text_generation()
     assert isinstance(task, MaskedGeneration) and isinstance(task.solver, Confident)
     assert (task.solver.threshold, task.solver.temperature, task.block, task.steps) == (0.95, 0.0, 32, 32)
@@ -108,6 +111,7 @@ def test_llada2s_task_walks_as_its_release_and_generates_the_recorded_prompts():
     assert (rebuilt.solver, rebuilt.block, rebuilt.steps) == (walked.solver, walked.block, walked.steps)
 
 
+@attending("reference")
 @pytest.mark.parametrize("asked", [{"steps": 64}, {"temperature": 0.7}])
 def test_a_llada2_generation_config_asking_what_its_walk_does_not_read_is_refused(asked, tmp_path):
     """LLaDA2's walk reads none of the generation config's controls (32 steps a block at temperature 0
@@ -117,14 +121,15 @@ def test_a_llada2_generation_config_asking_what_its_walk_does_not_read_is_refuse
     source = Path(shutil.copytree(FIXTURES / "llada2-tiny", tmp_path / "llada2"))
     (source / "generation_config.json").write_text(json.dumps(asked))
     with pytest.raises(ValueError):
-        Pretrained.load(source, dtype="float32", attention_impl="reference").text_generation()
+        Pretrained.load(source, dtype="float32").text_generation()
 
 
+@attending("reference")
 def test_llada2s_task_continues_stops_and_takes_a_zero_budget():
     """LLaDA2's blockwise task over padded rows: its greedy reveal draws every continuation of a prompt
     alike (`n`); an end token it draws stops a row there, the rest padding; and a zero budget returns
     the prompts with no response and no refinement."""
-    source = Pretrained.load(FIXTURES / "llada2-tiny", dtype="float32", attention_impl="reference")
+    source = Pretrained.load(FIXTURES / "llada2-tiny", dtype="float32")
     task = replace(source.text_generation(), block=4, steps=4)
     tokens = jnp.asarray([[0, 3, 5, 6], [1, 2, 3, 4], [0, 0, 7, 8]])
     inputs = ModelInputs(tokens, {"attention_mask": jnp.asarray([[0, 1, 1, 1], [1, 1, 1, 1], [0, 0, 1, 1]],
@@ -146,6 +151,7 @@ def test_llada2s_task_continues_stops_and_takes_a_zero_budget():
     np.testing.assert_array_equal(empty.decoder_steps, 0)
 
 
+@attending("xla")
 def test_a_run_over_llada2_saves_and_serves_its_walk(tmp_path):
     """An objective over a loaded LLaDA2.0 source takes its walk by default (`masked_walk`); a run of
     it saves the walk in its record, and the run's task (`MaskedGeneration.from_run`, `dew.pipeline` of
@@ -163,7 +169,7 @@ def test_a_run_over_llada2_saves_and_serves_its_walk(tmp_path):
     from dew.objectives.diffusion.masked import MaskedDiffusionObjective
     from dew.training import Trainer
 
-    source = Pretrained.load(FIXTURES / "llada2-tiny", dtype="float32", attention_impl="xla")
+    source = Pretrained.load(FIXTURES / "llada2-tiny", dtype="float32")
     walk = source.masked_walk
     solver, steps, block = walk.solver, walk.steps, walk.block
     # LLaDA2.2 generates with an editing stage Dew does not run: its source, and a config Dew's export
@@ -197,11 +203,12 @@ def test_a_run_over_llada2_saves_and_serves_its_walk(tmp_path):
         np.testing.assert_array_equal(restored(prompt, 8, key=7).host().tokens, expected)
 
 
+@attending("reference")
 def test_confident_spreads_a_fixed_quota_where_no_block_is_walked():
     """Without a block, `Confident`'s quota spreads the slots masked at the walk's first step over its
     steps, fixed: eight masked slots over three steps reveal 3, 3 and 2 at a threshold no draw passes,
     every slot revealed by the last step."""
-    source = Pretrained.load(FIXTURES / "llada2-tiny", dtype="float32", attention_impl="reference")
+    source = Pretrained.load(FIXTURES / "llada2-tiny", dtype="float32")
     mask, steps = 120, 3
     process = MDLM(mask_id=mask)()
     denoise = process.denoiser(source.model, source.variables)
@@ -228,6 +235,7 @@ def test_confident_refuses_a_temperature_that_is_no_finite_number():
             Confident(temperature=temperature)
 
 
+@attending("reference")
 @pytest.mark.parametrize("threshold", [0.95, 0.3])
 def test_confident_reveals_as_llada2s_release_over_a_block(threshold):
     """`Confident` at temperature 0 reveals, at each of a block's steps, the positions LLaDA2's release's
@@ -235,7 +243,7 @@ def test_confident_reveals_as_llada2s_release_over_a_block(threshold):
     the step's quota, else the quota's most confident, the quota spreading the block's eight slots (two of
     them its prompt's) over three steps as 3, 3, 2; a low threshold reveals past the quota. With no block
     walked, the quota spreads the slots masked at the first step, fixed across the steps."""
-    source = Pretrained.load(FIXTURES / "llada2-tiny", dtype="float32", attention_impl="reference")
+    source = Pretrained.load(FIXTURES / "llada2-tiny", dtype="float32")
     mask, steps, width = 120, 3, 8
     process = MDLM(mask_id=mask)()
     block = jnp.ones((2, width), bool)

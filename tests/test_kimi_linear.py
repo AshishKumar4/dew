@@ -26,6 +26,7 @@ from kimi_support import (
     kimi_source,
     recorded_dew,
 )
+from model_support import attending
 from recorded_runs import assert_as_exact_as_recorded
 
 ROOT = Path(__file__).parent / "fixtures" / "hf"
@@ -33,6 +34,7 @@ TINY = ROOT / "kimi-linear-tiny"
 
 
 @pytest.fixture(scope="module")
+@attending("reference")
 def source():
     return kimi_source(TINY)
 
@@ -46,6 +48,7 @@ draw = drawn_batch
 dew = recorded_dew(TINY, OUTPUTS)
 
 
+@attending("reference")
 def test_forward_matches_the_reference_over_left_padding():
     """fp32 logits over drawn batches of 70 tokens (past one KDA chunk), one row left-padded by 9, on par
     with fla 0.4.0's on CUDA in IEEE fp32 over the recorded seeds (check 1, tools/venv_reference.py
@@ -53,6 +56,7 @@ def test_forward_matches_the_reference_over_left_padding():
     assert_as_exact_as_recorded(FIXTURE, "kimi-linear", SEEDS, draw, dew, "Kimi Linear's logits")
 
 
+@attending("reference")
 def test_one_sgd_step_updates_the_logits_as_exactly_as_the_reference(source):
     """One all-parameter SGD step at the reference's learning rate (1e-2,
     which moves the logits by up to 3.8). The loss is within 1e-5 of the
@@ -70,6 +74,7 @@ def test_one_sgd_step_updates_the_logits_as_exactly_as_the_reference(source):
     assert_update_as_exact(source, TINY)
 
 
+@attending("reference")
 def test_update_exports_the_trained_model_back_in_the_source_layout(source, tmp_path):
     """The model stepped once (`sgd_step`, whose numerics the test above holds,
     apart so each fits its group) and exported: the export writes every source
@@ -84,6 +89,7 @@ def test_update_exports_the_trained_model_back_in_the_source_layout(source, tmp_
         np.testing.assert_array_equal(np.asarray(after), np.asarray(trained[name]), err_msg=name)
 
 
+@attending("reference")
 def test_greedy_generation_and_decode_steps_match_the_reference(source):
     """Four greedy tokens from both rows through the cached KDA recurrence and
     MLA cache, held as tests/test_generate_reference.py holds greedy decoding.

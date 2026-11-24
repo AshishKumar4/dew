@@ -18,6 +18,7 @@ from test_inference import make_lm_run
 pytest.importorskip("lm_eval")
 
 from lm_eval.api.instance import Instance
+from model_support import attending
 
 from dew.eval.harness import DewLM
 from dew.inference import TextGeneration
@@ -30,6 +31,7 @@ def instance(*arguments, request_type="loglikelihood"):
 
 
 @pytest.fixture(scope="module")
+@attending("reference")
 def run(tmp_path_factory):
     directory = tmp_path_factory.mktemp("lm-run")
     make_lm_run(directory)
@@ -37,6 +39,7 @@ def run(tmp_path_factory):
 
 
 @pytest.fixture(scope="module")
+@attending("reference")
 def adapter(run):
     return DewLM(TextGeneration.from_run(str(run)), batch_size=2)
 
@@ -101,7 +104,7 @@ def _pair(max_length: int, directory=None, *, bos: str = "none", source: bool = 
     else:
         reference.save_pretrained(str(directory))
         processor = RunProcessor(HFTokenizer(str(directory), local_files_only=True))
-    loaded = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference",
+    loaded = Pretrained.load(LLAMA, dtype="float32",
                              max_seq_len=max_length)
     ours = DewLM(TextGeneration(loaded.model, loaded.variables, processor,
                                 sampling=Sampling(eos_token_ids=255)), batch_size=2)
@@ -121,6 +124,7 @@ def _text(length: int) -> str:
     return "".join(chr(ord("a") + (7 * step) % 26) for step in range(length))
 
 
+@attending("reference")
 def test_loglikelihood_equals_lm_evals_own_model_on_the_same_weights():
     """Contexts with trailing whitespace, where lm-eval moves the spaces into
     the continuation; an empty context, conditioned on the prefix token; a
@@ -137,6 +141,7 @@ def test_loglikelihood_equals_lm_evals_own_model_on_the_same_weights():
         assert greedy == reference_greedy
 
 
+@attending("reference")
 def test_a_bos_vocabulary_conditions_first_tokens_on_bos_as_lm_eval_does(tmp_path):
     """`HFLM.prefix_token_id` is the tokenizer's BOS when it has one. An empty
     context and a rolling window's first token are conditioned on it, so a
@@ -153,6 +158,7 @@ def test_a_bos_vocabulary_conditions_first_tokens_on_bos_as_lm_eval_does(tmp_pat
                                                              rel=RELATIVE)
 
 
+@attending("reference")
 @pytest.mark.parametrize("source", [False, True])
 @pytest.mark.parametrize("bos", ["none", "inserted", "declared"])
 def test_tokenization_controls_encode_as_lm_evals_own_model_does(bos, source, tmp_path):
@@ -176,6 +182,7 @@ def test_tokenization_controls_encode_as_lm_evals_own_model_does(bos, source, tm
                         == theirs.tok_encode(text, add_special_tokens=special, left_truncate_len=keep))
 
 
+@attending("reference")
 @pytest.mark.parametrize("source", [False, True])
 def test_a_vocabulary_that_closes_a_sequence_scores_no_eos_it_never_wrote(source, tmp_path):
     """A tokenizer that ends every encoding with an EOS, as T5's does: a scored context and its
@@ -192,6 +199,7 @@ def test_a_vocabulary_that_closes_a_sequence_scores_no_eos_it_never_wrote(source
     assert ours.tok_encode("the", add_special_tokens=False) == list(b"the")
 
 
+@attending("reference")
 def test_a_task_that_names_no_eos_has_no_end_of_text_id_to_condition_on():
     """The id an empty context is conditioned on is the task's EOS; a task whose sampling names none
     is refused, rather than conditioned on id 0, some vocabulary's ordinary token."""
@@ -200,13 +208,14 @@ def test_a_task_that_names_no_eos_has_no_end_of_text_id_to_condition_on():
     from dew.interop.pretrained import Pretrained
     from dew.sampling import Sampling
 
-    loaded = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference", max_seq_len=16)
+    loaded = Pretrained.load(LLAMA, dtype="float32", max_seq_len=16)
     adapter = DewLM(TextGeneration(loaded.model, loaded.variables, RunProcessor(ByteTokenizer()),
                                    sampling=Sampling()), batch_size=1)
     with pytest.raises(ValueError):
         _ = adapter.eot_token_id
 
 
+@attending("reference")
 def test_options_the_adapter_cannot_honour_are_refused(run, adapter):
     """A torch `--device`, and options `HFLM` does not read, raise instead of being dropped."""
     with pytest.raises(ValueError):
@@ -218,6 +227,7 @@ def test_options_the_adapter_cannot_honour_are_refused(run, adapter):
         adapter._loglikelihood_tokens([(None, [1], [2])], override_bs=1)
 
 
+@attending("reference")
 @pytest.mark.mesh(devices=2)
 def test_a_harness_loads_a_run_sharded_and_stored_narrower(run):
     """A harness loads a run over a mesh, by a layout, and stores its weights in the dtype `param_dtype`
@@ -242,6 +252,7 @@ def test_a_harness_loads_a_run_sharded_and_stored_narrower(run):
     assert not largest.sharding.is_fully_replicated
 
 
+@attending("reference")
 def test_generation_controls_shape_the_draws_as_they_shape_lm_evals_own_model():
     """On the same weights, a request that samples under `top_k=1` draws what
     lm-eval's own model draws there and what greedy decoding draws; a total
@@ -276,6 +287,7 @@ def test_generation_controls_shape_the_draws_as_they_shape_lm_evals_own_model():
             ours.generate_until(asked(refused))
 
 
+@attending("reference")
 @pytest.mark.parametrize("length, max_length", [(3, 16), (50, 16), (5000, 2048)])
 def test_rolling_likelihood_scores_every_token_once_as_lm_eval_does(length, max_length):
     """lm-eval's rolling windows score all `length` tokens, the first one
@@ -290,6 +302,7 @@ def test_rolling_likelihood_scores_every_token_once_as_lm_eval_does(length, max_
     assert score == pytest.approx(reference, rel=RELATIVE)
 
 
+@attending("reference")
 def test_a_batch_scores_every_request_as_it_would_alone_and_keeps_the_order(adapter):
     """Right padding cannot reach backwards through a causal model, so a
     short row in a batch scores what it scores alone, and the answers come
@@ -305,6 +318,7 @@ def test_a_batch_scores_every_request_as_it_would_alone_and_keeps_the_order(adap
         [score for score, _ in reversed(together)], rel=RELATIVE)
 
 
+@attending("reference")
 def test_harnesses_over_one_model_score_through_one_program(run):
     """Two harnesses over one model, each with weights of its own (a run scored at each checkpoint, a
     draw of weights per seed), score a request through the one program compiled for the model and the
@@ -325,6 +339,7 @@ def test_harnesses_over_one_model_score_through_one_program(run):
     assert compiles.count == 0 and doubled != score
 
 
+@attending("reference")
 @pytest.mark.network
 def test_a_real_task_suite_runs_against_a_run(tmp_path):
     """One tiny suite end to end, over a run whose 512-id window holds

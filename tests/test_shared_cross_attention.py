@@ -13,7 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from model_support import flat_tree, unrolled
+from model_support import attending, flat_tree, unrolled
 from reference_error import assert_as_exact
 from run_kinds import stated
 from test_cross_attention import (
@@ -57,6 +57,7 @@ SHARED_SEEDS = {"shared fresh": 8, "shared idefics": 8, "shared decode": 8, "sha
 57359d708 (job IGXSIZE) and, for the IDEFICS read and the alternating scan, at 0268ed035 (IGXSIZE3)."""
 
 
+@attending("reference")
 def test_a_fresh_shared_read_computes_the_decoder_it_was_attached_to():
     """Drawn at zero gates, the decoder reading a context through its layers' own attention computes the
     decoder without the reads (check 1), and its gates are the only weights the form adds."""
@@ -132,6 +133,7 @@ def read_draw(model: CausalTransformer):
     return drawn
 
 
+@attending("reference")
 def test_a_shared_read_is_idefics_block_over_the_layers_own_attention():
     """Gated, each layer's read through its own attention is IDEFICS's gated block whose attention is
     the layer's own projections and whose input norm is the layer's, its feed-forward gated off: the
@@ -156,6 +158,7 @@ def test_a_shared_read_is_idefics_block_over_the_layers_own_attention():
     assert all(np.isfinite(gate).all() and np.all(gate != 0) for gate in gates)
 
 
+@attending("reference")
 def test_a_cached_context_decodes_through_the_layers_own_attention_as_the_full_forward():
     """A prefill keeps the context's keys and values its layers' own projections give, and each later
     step reads them without it (check 1, from the float64 forward)."""
@@ -163,6 +166,7 @@ def test_a_cached_context_decodes_through_the_layers_own_attention_as_the_full_f
                                                         seeds=SHARED_SEEDS["shared decode"])
 
 
+@attending("reference")
 @pytest.mark.usefixtures("scanned_stacks")
 def test_a_scanned_stack_reads_through_each_layers_own_attention_as_the_plain_one():
     """With a read on every layer the layers scan as one run, on par with the plain loop (check 1)."""
@@ -204,6 +208,7 @@ def test_cross_flops_count_each_layers_own_attention_over_the_context():
     assert MODEL.held_cross_flops(lengths, context) == 0
 
 
+@attending("reference")
 def test_a_frozen_trunk_counts_no_weight_gradient_for_its_reads_through_its_own_matrices():
     """Attached frozen to a source, the shared form trains its gates alone: the training count is a fully
     trained decoder's less every trunk and head matrix's weight gradient and the weight gradient of the
@@ -214,7 +219,7 @@ def test_a_frozen_trunk_counts_no_weight_gradient_for_its_reads_through_its_own_
     from dew.nn.inputs import ModelInputs
     from dew.objectives.lm import LMObjective
 
-    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
+    source = Pretrained.load(LLAMA, dtype="float32")
     attached = source.with_cross_attention(SharedCrossAttention((1,), 3), key=0)
     width = attached.model.context_width
     rng = np.random.default_rng(0)
@@ -253,6 +258,7 @@ def test_a_row_without_context_sends_no_gradient_into_the_layers_projections():
         np.testing.assert_array_equal(leaf, other[path], err_msg=path)
 
 
+@attending("reference")
 def test_the_gates_train_alone_over_a_frozen_source():
     """Attached to a source, the gates are the only weights that train, the source frozen beside them,
     and the decoder's record rebuilds the shared form."""
@@ -260,7 +266,7 @@ def test_the_gates_train_alone_over_a_frozen_source():
 
     from dew.interop.pretrained import Pretrained
 
-    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
+    source = Pretrained.load(LLAMA, dtype="float32")
     attached = source.with_cross_attention(SharedCrossAttention((1,), 3), key=0)
     assert FROZEN in attached.variables
     trained = flat_tree(attached.variables["params"])
@@ -338,6 +344,7 @@ def test_a_layer_keyed_none_still_reads_its_context():
     assert {path.split(".", 1)[0] for path in gates} == {"layers_0", "layers_2"}
 
 
+@attending("reference")
 @pytest.mark.usefixtures("scanned_stacks")
 def test_a_configuration_of_its_own_scans_each_layers_own_block():
     """Any conforming configuration builds the blocks (`CrossBlocks`): one whose adjacent layers' blocks

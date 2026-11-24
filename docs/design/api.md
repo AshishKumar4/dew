@@ -393,7 +393,7 @@ JEPA imports nothing from diffusion.
 
 ## 5. What is deleted
 
-`SimpleTrainer`'s W&B and publishing methods, `ObjectiveTrainer`'s diffusion parameters and default objective, `RandomMarkovState`, `get_diffusion_preset`, the `+suffix` DSL and `canonicalize_architecture`, `apply_precision_policy`'s string round trip (dtype and attention_impl become fields the registry validates), `serialize_model`, `parse_config`, `DiffusionInputConfig` and `ConditionalInputConfig`, `model_key_override`, the three dataset maps, `Metrics`, `FLAXDIFF_AUGMENT_MODE` (augmentation becomes a field of the dataset spec), `__encode__` and `__decode__` in favour of `encode` and `decode`.
+`SimpleTrainer`'s W&B and publishing methods, `ObjectiveTrainer`'s diffusion parameters and default objective, `RandomMarkovState`, `get_diffusion_preset`, the `+suffix` DSL and `canonicalize_architecture`, `apply_precision_policy`'s string round trip (dtype becomes a field the registry validates, the attention kernel a run's kernel choice), `serialize_model`, `parse_config`, `DiffusionInputConfig` and `ConditionalInputConfig`, `model_key_override`, the three dataset maps, `Metrics`, `FLAXDIFF_AUGMENT_MODE` (augmentation becomes a field of the dataset spec), `__encode__` and `__decode__` in favour of `encode` and `decode`.
 
 ## 6. Stress test
 

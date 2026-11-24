@@ -1061,31 +1061,29 @@ class Server:
                 raise ValueError("speculative rows rewind a block's rejected keys from the cache saved "
                                  "before it, which a dense cache holds per row; serve without page_size")
             rows.placement = dataclasses.replace(rows.placement, plan=plan)
-        return cls(
-            model,
-            task.placed,
-            task.processor,
-            # The caller's policy as the task holds it, its stop strings uncompiled and its criteria its
-            # own, so a server's draws are read against what ends them
-            # (`dew.inference.rollouts.check_ending`) and a caller reuses it whole; what it compiles to
-            # is the server's `transforms` and `stopping`.
-            sampling=dataclasses.replace(task.sampling, pad_token_id=policy.pad_token_id),
-            transforms=transforms,
-            stopping=stopping,
-            grammar=strategy.grammar if isinstance(strategy, Sample) else None,
-            rows=rows,
-            slots=slots,
-            capacity=rounded,
-            admission=(
-                max(groups, min(slots, 8 * decode_steps) // groups * groups)
-                if admission is None
-                else admission
-            ),
-            default_budget=task.max_new_tokens,
-            max_length=task.max_length,
-            decode_steps=decode_steps, prefix=task.prefix, precision=task.precision, progress=task.progress,
-            prefill_mesh=prefill_mesh, n=task.n,
-        )
+        with task.pinned():  # Its run's kernel pins, which every step it serves traces under (`_context`).
+            return cls(
+                model,
+                task.placed,
+                task.processor,
+                # The caller's policy as the task holds it, its stop strings uncompiled and its criteria its
+                # own, so a server's draws are read against what ends them
+                # (`dew.inference.rollouts.check_ending`) and a caller reuses it whole; what it compiles to
+                # is the server's `transforms` and `stopping`.
+                sampling=dataclasses.replace(task.sampling, pad_token_id=policy.pad_token_id),
+                transforms=transforms,
+                stopping=stopping,
+                grammar=strategy.grammar if isinstance(strategy, Sample) else None,
+                rows=rows,
+                slots=slots,
+                capacity=rounded,
+                admission=(max(groups, min(slots, 8 * decode_steps) // groups * groups) if admission is None
+                           else admission),
+                default_budget=task.max_new_tokens,
+                max_length=task.max_length,
+                decode_steps=decode_steps, prefix=task.prefix, precision=task.precision,
+                progress=task.progress, prefill_mesh=prefill_mesh, n=task.n,
+            )
 
     @property
     def cache(self) -> Variables:

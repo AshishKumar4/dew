@@ -7,6 +7,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import attending
 from reference_error import assert_as_exact
 from test_level_stacking import (
     LENGTH,
@@ -45,6 +46,7 @@ def test_a_banked_stores_blocks_step_as_the_literal_chunk_loop(layers, windows):
                     seeds=STACKING_SEEDS[layers, windows], truth_fn=literal(TRUTH, truth=True))
 
 
+@attending("xla")
 def test_a_training_step_continues_pretraining_through_the_blocks_steps():
     """A training step's loss (`LMObjective.loss`, its summed head and z-loss) of a decoder stepping its
     own blocks in context is finite and moves the blocks' starts, as continued pre-training trains them."""

@@ -8,6 +8,7 @@ import subprocess
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import Protocol
 
 import jax
 import jax.numpy as jnp
@@ -30,19 +31,31 @@ TINY_DECODER = {"emb_features": 32, "num_layers": 2, "num_heads": 4, "mlp_featur
 its own vocabulary and any field its claim turns on."""
 
 
-def stacked_as[**Given, Value](scan: str) -> Callable[[Callable[Given, Value]], Callable[Given, Value]]:
-    """A function run with every decoder's stack compiled as `scan` names
-    (`generation.chosen(layer_scan=...)`): JAX keys its trace and compile caches on the choice, so a jitted
-    function traces inside."""
+class Decorator(Protocol):
+    """A function's decorator that keeps its signature."""
+
+    def __call__[**Given, Value](self, function: Callable[Given, Value], /) -> Callable[Given, Value]: ...
+
+
+def under_kernels(**kernels: str) -> Decorator:
+    """A decorator running its function, a test's, a fixture's or an arm's, with the kernel choices
+    `kernels` names (`generation.chosen`): JAX keys its trace and compile caches on the choices, so a
+    jitted function traces inside. A generator's body runs after the call returns, outside them: a yielding
+    fixture names its choices around its steps."""
     from dew.nn.kernels import generation
 
-    def chosen(function: Callable[Given, Value]) -> Callable[Given, Value]:
+    def chosen[**Given, Value](function: Callable[Given, Value]) -> Callable[Given, Value]:
         @functools.wraps(function)
         def run(*arguments: Given.args, **keywords: Given.kwargs) -> Value:
-            with generation.chosen(layer_scan=scan):
+            with generation.chosen(**kernels):
                 return function(*arguments, **keywords)
         return run
     return chosen
+
+
+def stacked_as(scan: str) -> Decorator:
+    """A function run with every decoder's stack compiled as `scan` names (`layer_scan`)."""
+    return under_kernels(layer_scan=scan)
 
 
 def unrolled[**Given, Value](function: Callable[Given, Value]) -> Callable[Given, Value]:
@@ -55,6 +68,12 @@ def scanning[**Given, Value](function: Callable[Given, Value]) -> Callable[Given
     """`function` with every decoder's stack scanned, an arm against the stack a layer at a time
     (`unrolled`)."""
     return stacked_as("scanned")(function)
+
+
+def attending(kernel: str) -> Decorator:
+    """A test, fixture or function run with every attention layer it traces on `kernel` (`attention`, as a
+    run's `Diagnostics.kernels` names it; a model's own `attention_impl` before row 11938)."""
+    return under_kernels(attention=kernel)
 
 
 def stacked(scanned: bool):

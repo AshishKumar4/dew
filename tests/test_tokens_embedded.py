@@ -10,6 +10,7 @@ import jax
 import numpy as np
 import optax
 import pytest
+from model_support import attending
 
 from dew.data import Memory
 from dew.data.pipeline import Pipeline
@@ -219,6 +220,7 @@ def test_a_masked_request_whose_image_fills_a_placeholder_past_the_table_is_fill
     assert outside(raised) == (40, 32)
 
 
+@attending("reference")
 @pytest.mark.usefixtures("scanned_stacks")
 def test_a_block_request_whose_image_fills_an_id_past_the_table_is_served():
     """A block generation over DiffusionGemma, which replaces the id at each slot its image fills before its

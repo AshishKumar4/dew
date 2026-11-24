@@ -96,6 +96,22 @@ def test_a_run_saved_with_a_field_its_class_lost_since_reads_as_the_run_it_train
     assert changed(json.loads(json.dumps(RunConfig.read(earlier_run(earlier)).record())), held) == []
 
 
+@pytest.mark.parametrize("kernels", [{}, {"attention": "xla"}])
+def test_a_run_whose_model_named_its_attention_kernel_runs_it_as_the_runs_own(kernels):
+    """The published run as an earlier Dew saved it, its model naming its attention kernel (row 11938: the
+    run's since, `Diagnostics.kernels`), reads as a run choosing that kernel for every attention it
+    traces, its model without the field, unless the run named one of its own, which stands, as
+    `RunConfig.load` reads a saved run (`earlier_run`)."""
+    held = json.loads(PUBLISHED.read_text())
+    model = held["fields"]["model"]
+    diagnostics = {**held["fields"]["diagnostics"], "kernels": kernels}
+    earlier = {**held, "fields": {**held["fields"], "diagnostics": diagnostics, "model": {
+        **model, "fields": {**model["fields"], "attention_impl": "reference"}}}}
+    run = RunConfig.read(earlier_run(earlier))
+    assert run.diagnostics.kernels == {"attention": "reference", **kernels}
+    assert "attention_impl" not in json.loads(json.dumps(run.record()))["fields"]["model"]["fields"]
+
+
 def test_a_run_saved_scanning_its_stack_resumes_scanned():
     """A run an earlier Dew saved with its stack scanned (`scan_layers=True`, its source options' or its
     model's until row 4074) reads as a run whose kernel choices scan it (`Diagnostics.kernels`'
@@ -120,25 +136,36 @@ WRAPPERS = [("diffusion_gemma", "text"), ("dew.nn.multimodal:MultimodalTransform
 """Models that wrap a decoder in a field they declare, by alias and by import path."""
 
 
+PINS = {"scan_layers": (True, "layer_scan", "scanned"),
+        "attention_impl": ("reference", "attention", "reference")}
+"""Each field an earlier decoder pinned its execution by (rows 4074, 11938): its pinning value, the kernel
+choice it reads as now and the kernel it names there."""
+
+
 @pytest.mark.parametrize("recorded", ["by its fields", "by its class"])
 @pytest.mark.parametrize(("wrapper", "field"), WRAPPERS)
-def test_a_run_saved_scanning_a_wrapped_decoders_stack_resumes_scanned(wrapper, field, recorded):
+@pytest.mark.parametrize("pin", sorted(PINS))
+def test_a_run_saved_pinning_a_wrapped_decoders_execution_resumes_so(wrapper, field, recorded, pin):
     """A run an earlier Dew saved whose model wraps its decoder (`DiffusionGemma.text`,
-    `MultimodalTransformer.language_model`), the decoder scanning its stack (`scan_layers=True` until row
-    4074), recorded by its fields alone or by its class, reads as a run whose kernel choices scan it, where
-    the root model alone was read and the wrapped decoder's field left out unread (the API02 review)."""
-    from dew.config.earlier import earlier_layer_scan
+    `MultimodalTransformer.language_model`), the decoder pinning its execution (`scan_layers=True` until row
+    4074, `attention_impl` until row 11938), recorded by its fields alone or by its class, reads as a run
+    whose kernel choices run it so, where the root model alone was read and the wrapped decoder's field left
+    out unread (the API02 review); the run's own choice, where it names one, stands."""
+    from dew.config.earlier import earlier_attention_kernel, earlier_layer_scan
 
-    def saved(decoder: dict) -> dict:
+    value, choice, kernel = PINS[pin]
+    read = earlier_layer_scan if pin == "scan_layers" else earlier_attention_kernel
+
+    def saved(decoder: dict, **run) -> dict:
         held = decoder if recorded == "by its fields" else {"class": "causal_transformer", "fields": decoder}
         model = {"name": wrapper, "fields": {field: held}}
-        return {"class": "dew.config:RunConfig", "fields": {"model": model}}
+        return {"class": "dew.config:RunConfig", "fields": {"model": model, **run}}
 
-    assert earlier_layer_scan(saved({"vocab_size": 16, "scan_layers": True}))["fields"]["kernels"] == {
-        "layer_scan": "scanned"}
+    assert read(saved({"vocab_size": 16, pin: value}))["fields"]["kernels"] == {choice: kernel}
+    own = {choice: "xla" if pin == "attention_impl" else "plain"}
+    assert read(saved({"vocab_size": 16, pin: value}, kernels=own))["fields"]["kernels"] == own
     plain = saved({"vocab_size": 16})
-    assert earlier_layer_scan(plain) == plain
-
+    assert read(plain) == plain
 
 LAYOUT = ROOT / "tests" / "fixtures" / "runs" / "hybrid-dit-176m" / "layout.json"
 

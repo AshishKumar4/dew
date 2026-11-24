@@ -15,6 +15,7 @@ import pytest
 from affine_run import TimingRegression as Regression, batches
 from diffusion_support import images_of
 from flax import linen as nn
+from model_support import attending
 
 import dew.config
 import dew.nn.backbones
@@ -205,20 +206,22 @@ def test_save_and_load_carry_a_subclass_with_its_own_knobs(tmp_path):
         DiffusionRunConfig.load(str(tmp_path))
 
 
+@attending("xla")
 def test_the_model_config_builds_with_its_own_dtype_and_attention():
     fields = {"vocab_size": 64, "emb_features": 32, "num_layers": 1, "num_heads": 2}
-    config = ModelConfig("causal_transformer", {**fields, "dtype": "bfloat16", "attention_impl": "xla"})
+    config = ModelConfig("causal_transformer", {**fields, "dtype": "bfloat16"})
     model = config.build()
     import jax
     ids = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
     params = model.init(jax.random.key(0), ids)
     logits = model.apply(params, ids)
-    expected = CausalTransformer(**fields, dtype=jnp.bfloat16, attention_impl="xla").apply(
+    expected = CausalTransformer(**fields, dtype=jnp.bfloat16).apply(
         params, ids)
     assert logits.dtype == jnp.float32
     assert jnp.array_equal(logits, expected)
 
 
+@attending("reference")
 @pytest.mark.parametrize("scaling", ["llama3", "longrope"])
 def test_dtype_changes_preserve_union_held_rotary_policies(scaling):
     """Model metadata may hold either rotary policy. It survives a compute-dtype override while
@@ -231,7 +234,7 @@ def test_dtype_changes_preserve_union_held_rotary_policies(scaling):
               LongRopeScaling((1.0,) * 4, (2.0,) * 4, 16, factor=2.0))
     model = CausalTransformer(vocab_size=16, emb_features=16, num_layers=1, num_heads=2,
                               head_dim=8, mlp_features=32, max_seq_len=32, rope_scaling=policy,
-                              dtype="float32", attention_impl="reference")
+                              dtype="float32")
     configured = ModelConfig.from_model(model).with_dtype("bfloat16").build()
     ids = jnp.asarray([[1, 2, 3]], jnp.int32)
     variables = model.init(jax.random.key(0), ids)

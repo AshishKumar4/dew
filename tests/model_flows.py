@@ -123,13 +123,13 @@ class Flow:
 
     @cached_property
     def model(self) -> CausalTransformer:
-        """The flow's model, every kernel its selectors' choice (`attention_impl` auto)."""
+        """The flow's model, every kernel its selectors' choice."""
         from dew.interop.hf_decoders import translate_config
         from dew.registry import models
 
         fields = {key: value for key, value in translate_config(self.config).items()
-                  if key not in ("dtype", "attention_impl")}
-        model = models.build("causal_transformer", **fields, dtype=self.dtype, attention_impl="auto")
+                  if key != "dtype"}
+        model = models.build("causal_transformer", **fields, dtype=self.dtype)
         assert isinstance(model, CausalTransformer)
         return model
 
@@ -260,14 +260,14 @@ class ImageFlow:
 
     @cached_property
     def model(self):
-        """The flow's UNet, its attention its selectors' choice (`attention_impl` auto), the deeper stage
+        """The flow's UNet, its attention its selectors' choice, the deeper stage
         attending."""
         from dew.nn.attention_blocks import Stage
         from dew.nn.backbones.unet import Unet
 
         return Unet(output_channels=self.channels, emb_features=2 * self.features[-1],
                     feature_depths=self.features, attention_configs=(None, Stage(heads=4)), num_res_blocks=1,
-                    norm_groups=8, dtype=self.dtype, attention_impl="auto")
+                    norm_groups=8, dtype=self.dtype)
 
     @property
     def inputs(self) -> list[jax.ShapeDtypeStruct]:

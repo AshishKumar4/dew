@@ -9,7 +9,7 @@ The commands below are templates. Replace the angle-bracket fields with your exp
 ```
 python tools/benchmark_attention.py --json-out attention.json
 python tools/benchmark_step.py --preset small --architectures <arch> \
-    --attention-impl <kernel> --warmup 3 --steps 10
+    --attention <kernel> --warmup 3 --steps 10
 XLA_FLAGS=<flags> python tools/benchmark_step.py --preset small \
     --architectures <arch> --warmup 3 --steps 10
 python tools/optimizer_curve.py --dataset <tokens> --optimizer <name> \

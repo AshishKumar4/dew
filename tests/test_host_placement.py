@@ -31,7 +31,7 @@ import optax
 import pytest
 from affine_run import BATCH, Counting, Features, Spread, val_batches
 from flax import linen as nn
-from model_support import float64_twin, stacked
+from model_support import attending, float64_twin, stacked
 from placement_parity import layouts_agree, x64
 from process_support import run_pool
 from reference_error import assert_as_exact
@@ -476,6 +476,7 @@ def test_a_packed_rows_members_each_read_home_their_own_share():
     assert read == [(3, 2), (3, 4), (3, 1)]
 
 
+@attending("reference")
 @pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize("kind", ["root", "multimodal"])
 def test_synthetic_banks_keep_namespace_values_across_bank_sizes(kind):

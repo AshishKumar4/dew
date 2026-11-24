@@ -16,7 +16,6 @@ from flax import linen as nn
 from dew._records import JSON
 from dew.interop.decoder_parts import Packed
 from dew.interop.weights import TensorPath
-from dew.nn.attention import AttentionImpl
 
 if TYPE_CHECKING:
     from dew.batch import Variables
@@ -60,7 +59,7 @@ class HeadComponent:
     reshape: Callable[[nn.Module, dict], dict] | None = None
     initialize: Callable[[nn.Module, Pretrained], Variables] | None = None
 
-    def build(self, backbone: Pretrained | None, dtype: str, attention_impl: AttentionImpl, *,
+    def build(self, backbone: Pretrained | None, dtype: str, *,
               shapes: Mapping[str, tuple[int, ...]] | None) -> nn.Module:
         """Build the readout against the backbone's output contract."""
         raise NotImplementedError

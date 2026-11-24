@@ -17,7 +17,7 @@ import pytest
 from flax import linen as nn
 from flax.core import freeze as frozen_dict
 from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P, SingleDeviceSharding
-from model_support import stacked
+from model_support import attending, stacked
 from placement_parity import layouts_agree, widened_start, x64
 from steady_state import steady_state
 from test_training_transactions import SHORT_SCALE, Terms, Tiny, batches
@@ -1120,6 +1120,7 @@ def test_a_nested_decoder_bank_trains_beside_frozen_media_entries():
         np.testing.assert_array_equal(value, initial[name], err_msg=name)
 
 
+@attending("xla")
 @pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize("detached", [False, True])
 def test_a_shared_text_owner_sums_both_block_losses_through_one_bank(detached):
@@ -1136,7 +1137,7 @@ def test_a_shared_text_owner_sums_both_block_losses_through_one_bank(detached):
     from dew.objectives.diffusion.block import BlockDiffusionObjective
 
     fixture = Path(__file__).resolve().parent / "fixtures/hf/diffusion-gemma-sft"
-    loaded = Pretrained.load(fixture, dtype="float32", attention_impl="xla", max_seq_len=32)
+    loaded = Pretrained.load(fixture, dtype="float32", max_seq_len=32)
     source = loaded.model
     assert isinstance(source, DiffusionGemma)
     scanned = source.clone(text=source.text.clone())
@@ -1896,6 +1897,7 @@ def test_processes_whose_hosts_price_the_update_apart_take_the_first_processs_de
     assert refused[0] and refused[0] == refused[1], refused
 
 
+@attending("xla")
 def test_a_phased_runs_two_prices_are_at_its_first_phases_pass_count():
     """A fresh bf16 run of a looped decoder whose first phase runs one pass of three (`phase_passes`)
     prices its device plan and its streamed step at that one pass, as the same decoder holding one pass

@@ -1445,7 +1445,7 @@ def mode_replicated_rollout(args) -> dict:
     rank, processes = jax.process_index(), jax.process_count()
     model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2,
                               head_dim=8, mlp_features=32, max_seq_len=12,
-                              dtype="float32", attention_impl="xla")
+                              dtype="float32")
     params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     drawn = np.random.default_rng(rank)
     scored = []
@@ -1734,7 +1734,7 @@ def mode_continuations(args) -> dict:
     rank, processes = jax.process_index(), jax.process_count()
     model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2,
                               head_dim=8, mlp_features=32, max_seq_len=12,
-                              dtype="float32", attention_impl="xla")
+                              dtype="float32")
     params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     placed = place(params, MeshSpec(fsdp=args.fsdp_size), Layout(min_shard=TINY))
     prompts, lengths = continuation_prompts()
@@ -1764,7 +1764,7 @@ def mode_continuations(args) -> dict:
             raise AssertionError("a rank did not return from the rejected request")
     from dew.interop import Pretrained
     source = Pretrained.load(Path(__file__).parent / "fixtures/hf/diffusion-gemma-workflow",
-                             dtype="float32", attention_impl="xla", max_seq_len=32)
+                             dtype="float32", max_seq_len=32)
     canvas_prompts = ["<bos> t5 t7 t9 t11", "<bos> t6 t8 t10 t12"] * 2
     canvas_rows = len(canvas_prompts) // processes
     canvas_prompts = canvas_prompts[rank * canvas_rows:(rank + 1) * canvas_rows]
@@ -1959,7 +1959,7 @@ def mode_decoding_components(args) -> dict:
     rank, processes = jax.process_index(), jax.process_count()
     model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2,
                               head_dim=8, mlp_features=32, max_seq_len=12,
-                              dtype="float32", attention_impl="xla",
+                              dtype="float32",
                               num_nextn_predict_layers=1)
     params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     placed = place(params, MeshSpec(fsdp=args.fsdp_size), Layout(min_shard=TINY))
@@ -2109,7 +2109,7 @@ def mode_masked_generation(args) -> dict:
 
     rank, processes = jax.process_index(), jax.process_count()
     source = Pretrained.load(Path(__file__).parent / "fixtures/hf/llada-tiny",
-                             dtype="float32", attention_impl="xla")
+                             dtype="float32")
     prompts = np.asarray([[120, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12],
                           [0, 0, 120, 5], [0, 6, 7, 8], [0, 0, 0, 9]], np.int32)
     valid = np.asarray([[1, 1, 1, 1]] * 3 + [[0, 0, 1, 1], [0, 1, 1, 1], [0, 0, 0, 1]], bool)
@@ -2336,7 +2336,7 @@ def mode_decision_publish(args) -> dict:
     from dew.training import Layout, MeshSpec
 
     mesh = MeshSpec(fsdp=jax.device_count()).build()
-    placed = Pretrained.load(args.release, dtype="float32", attention_impl="xla", mesh=mesh,
+    placed = Pretrained.load(args.release, dtype="float32", mesh=mesh,
                              layout=Layout(min_shard=1, tolerance=1.0))
     written = rollouts.SafetensorsReload(placed, Path(args.run_dir), (), "vllm", dtype="float32")
     written.write(placed.variables)

@@ -43,14 +43,15 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     source's `packed_experts` as `packed_weights` (`earlier_packed_experts`, row 8550); and wherever it holds
     a run or trainer, a trainer's retired `export_model` taken off and a looped decoder's
     `loop_message_additive` true read as unset where it could not be unset (`earlier_retired`, rows 11636,
-    11742); and every field a class lost since, its model's, its source options' and any class record's,
-    left out (`earlier_removed`, `dew._records.REMOVED_FIELDS`).
+    11742); its model's attention kernel as the run's (`earlier_attention_kernel`, row 11938); and every
+    field a class lost since, its model's, its source options' and any class record's, left out
+    (`earlier_removed`, `dew._records.REMOVED_FIELDS`).
     A configuration written today that names the earlier knobs is refused by name, as any field its class
     does not declare. A record in today's shapes passes as it is. Carried to 1.0, when it is deleted
     (ledger 1552)."""
     unsettable, additive = (record.get(key) is True for key in (LAYOUT_UNSETTABLE, ADDITIVE_UNSETTABLE))
-    moved = earlier_removed(earlier_layer_scan(_records.moved_record(
-        {key: value for key, value in record.items() if key not in MARKERS})))
+    moved = earlier_removed(earlier_attention_kernel(earlier_layer_scan(_records.moved_record(
+        {key: value for key, value in record.items() if key not in MARKERS}))))
     earlier = earlier_none_of_the_above(earlier_profile(earlier_trainer(
         moved if unsettable else earlier_trainer_layout(moved))))
     earlier = earlier_option_text(earlier_dynamics_positions(earlier_tokenizer_positions(earlier)))
@@ -59,6 +60,21 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     earlier = {name: _records.earlier_layout(_records.json_value(value, name))
                for name, value in earlier.items()}
     return records.earlier_chains(earlier_data_plan(earlier), _chains())
+
+
+def earlier_attention_kernel(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A saved run's record whose model named its attention kernel (`attention_impl`, a model's field
+    until row 11938) with the kernel the run's own (`chosen_kernel`'s `attention`), where it named one but
+    'auto' and the run named none: the model's own, else a decoder's it wraps (`saved_decoders`,
+    `DiffusionGemma.text`, `MultimodalTransformer.language_model`, the API02 review: the root alone missed
+    a wrapped decoder's); the field itself is left out after (`earlier_removed`). Carried to 1.0 (ledger
+    1552)."""
+    from dew.inference.tasks import earlier_attention_pin
+
+    fields = record.get("fields")
+    model = fields.get("model") if isinstance(fields, Mapping) else None
+    kernel = earlier_attention_pin(model) if isinstance(model, Mapping) else None
+    return record if kernel is None else chosen_kernel(record, "attention", kernel)
 
 
 def earlier_layer_scan(record: Mapping[str, object]) -> Mapping[str, object]:

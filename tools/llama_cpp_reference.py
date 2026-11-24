@@ -175,7 +175,7 @@ def export(directory: Path):
     from dew.interop.pretrained import PretrainedDecoder
     from dew.registry import models
 
-    model = models.build("causal_transformer", **FIELDS, dtype="float32", attention_impl="xla")
+    model = models.build("causal_transformer", **FIELDS, dtype="float32")
     variables = weights(jax.eval_shape(model.init, jax.random.key(SEED), jnp.zeros((1, 8), jnp.int32)))
     PretrainedDecoder.from_model(model, variables, tokenizer=HFTokenizer(str(TOKENIZER))).save(str(directory))
     return model, variables
@@ -309,4 +309,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # On the xla attention, the run's kernel choice (a model's field before row 11938), Dew imported where
+    # it runs, as this tool imports it.
+    from dew.nn.kernels import generation
+
+    with generation.chosen(attention="xla"):
+        main()

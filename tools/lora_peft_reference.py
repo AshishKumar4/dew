@@ -186,7 +186,7 @@ def write_orders(out: Path) -> None:
     from dew.interop.pretrained import Pretrained
     from dew.lora import LoRA
 
-    decoder = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
+    decoder = Pretrained.load(LLAMA, dtype="float32")
     for case in CASES:
         adapter = LoRA.load(decoder.model, decoder.variables, FIXTURE / case / "adapter",
                             layouts=decoder.layouts)
@@ -303,7 +303,7 @@ def write_masks() -> None:
     from dew.interop.pretrained import Pretrained
     from dew.lora import LoRA
 
-    decoder = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
+    decoder = Pretrained.load(LLAMA, dtype="float32")
     adapter = LoRA.load(decoder.model, decoder.variables, FIXTURE / "dropout" / "adapter",
                         layouts=decoder.layouts)
     drawn = dew_masks(adapter, np.load(LLAMA / "input_ids.npy"))
@@ -405,10 +405,15 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    if sys.argv[1:] == ["masks"]:
-        write_masks()
-    elif sys.argv[1:2] == ["write-orders"]:
-        write_orders(Path(sys.argv[2]))
+    if sys.argv[1:] == ["masks"] or sys.argv[1:2] == ["write-orders"]:
+        # Dew's side on the reference attention, the run's kernel choice (a model's field before row 11938).
+        from dew.nn.kernels import generation
+
+        with generation.chosen(attention="reference"):
+            if sys.argv[1:] == ["masks"]:
+                write_masks()
+            else:
+                write_orders(Path(sys.argv[2]))
     elif sys.argv[1:2] == ["orders"]:
         record_orders(Path(sys.argv[2]))
     else:

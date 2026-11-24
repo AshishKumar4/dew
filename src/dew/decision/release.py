@@ -26,17 +26,18 @@ from dew.registry import dtype_name, from_record, to_record
 
 def decision_envelope(held: Release, layout: Layout | None = None, calibration: Calibration | None = None, *,
                       max_length: int | None = None, numerics: Numerics | None = None,
-                      compute: str | None = None) -> Release:
+                      compute: str | None = None, kernels: tuple[tuple[str, str], ...] = ()) -> Release:
     """The release record of a decision release (`dew.config.Release`): `held`, what its backbone's own plan
     states (`dew.interop.releases.bundle_plan`), with the decision facts its format cannot state: the
     `layout` whole, its `max_length` alone where its format derives the rest of it, the `calibration`
     where it holds more than the format's own files (None states none), and the `numerics` the task traces
-    under and the dtype its model `compute`s in (`dew.interop.release.computed_in`), which its loader
-    builds the task in (`dew.interop.release.released`). A task declaration `held` states stays as it is."""
+    under, the `kernels` its run pinned (none written where it pinned none) and the dtype its model
+    `compute`s in (`dew.interop.release.computed_in`), which its loader builds the task in
+    (`dew.interop.release.released`). A task declaration `held` states stays as it is."""
     stated = None if layout is None else _record(to_record(layout, Layout))
     calibrated = None if calibration is None else _record(to_record(calibration, Calibration))
     task = held.task if held.task is not None or compute is None else ReleaseTask(
-        numerics=numerics, dtypes=ReleaseDtypes(dtype_name(compute))).record()
+        numerics=numerics, dtypes=ReleaseDtypes(dtype_name(compute)), kernels=dict(kernels) or None).record()
     return replace(held, task=task, layout=stated, max_length=max_length, calibration=calibrated)
 
 

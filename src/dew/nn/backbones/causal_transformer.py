@@ -45,7 +45,6 @@ from dew.batch import (
     token_coordinates,
     with_validity,
 )
-from dew.nn.attention import AttentionImpl
 from dew.nn.continuum import (
     HeadTerms,
     Levels,
@@ -335,7 +334,6 @@ class CausalTransformer(LinearProducts):
     dtype: Dtype | None = dataclasses.field(default=None, metadata={RUNS: True, NUMBERS: True})
     precision: PrecisionLike = dataclasses.field(default=None, metadata={RUNS: True, NUMBERS: True})
     force_fp32_for_softmax: bool = dataclasses.field(default=True, metadata={RUNS: True, ROUNDS: True})
-    attention_impl: AttentionImpl = dataclasses.field(default="auto", metadata={RUNS: True})
     kv_cache: KVCache = dataclasses.field(default=KVCache(), metadata={RUNS: True})
     """How attention layers store the decode cache: dense or paged, full or
     quantized (`dew.nn.kv_cache`). The parameters do not depend on it."""

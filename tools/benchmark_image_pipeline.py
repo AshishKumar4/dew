@@ -47,6 +47,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import peak_memory
 from receipt_paths import named, recorded
 
+from dew.nn.kernels import generation
+
 
 @dataclass
 class Config:
@@ -223,7 +225,7 @@ def training_timing(config, backend):
     from dew.training.ahead import step_batch
 
     model = SimpleDiT(patch_size=16, emb_features=32, num_layers=1, num_heads=4,
-                      dtype=jnp.float32, precision=jax.lax.Precision.HIGHEST, attention_impl="reference")
+                      dtype=jnp.float32, precision=jax.lax.Precision.HIGHEST)
     objective = DiffusionObjective(model, EDM(regime="pixel"),
                                   InputSpec(Field("image", (config.image_size, config.image_size, 3))),
                                   ema_decay=None)
@@ -328,4 +330,5 @@ def main(config):
 
 
 if __name__ == "__main__":
-    main(tyro.cli(Config))
+    with generation.chosen(attention="reference"):
+        main(tyro.cli(Config))

@@ -7,7 +7,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 from flax import linen as nn
-from model_support import decoder
+from model_support import attending, decoder
 from test_capability_matrix import ALL, CACHE, CAUSAL, SEQ, loaded
 from test_mixers import COMPRESSED, KIND_FIELDS, tiny
 
@@ -82,6 +82,7 @@ CACHED = tuple(family for family in ALL if {CAUSAL, CACHE} <= family.facts)
 """Every decoder family the capability matrix builds that decodes over a cache."""
 
 
+@attending("reference")
 @pytest.mark.parametrize("family", CACHED, ids=str)
 def test_each_familys_cache_opens_as_its_decode_opens_and_writes_it(family):
     """Each cached decoder family the capability matrix builds (its looped stacks, its multimodal wrappers,

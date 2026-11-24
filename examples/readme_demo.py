@@ -16,7 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 import tyro
 
-from dew import Checkpoints, Field, InputSpec, Trainer
+from dew import Checkpoints, Field, InputSpec, Trainer, kernels
 from dew.artifacts import uint8_pixels
 from dew.data import Memory, presets
 from dew.data.dataset import Loader
@@ -48,7 +48,7 @@ def language_model(out: Path):
     model = CausalTransformer(
         vocab_size=8, emb_features=16, num_layers=1,
         num_heads=2, mlp_features=32, max_seq_len=16,
-        dtype=jnp.float32, attention_impl="xla",
+        dtype=jnp.float32,
     )
     objective = LMObjective(model, seq_len=8, ema_decay=0.9)
     optimizer = OptimConfig(optimizer=Adam(), learning_rate=0.01)
@@ -104,7 +104,7 @@ def flow_images(out: Path):
                    records=8, batch=8)
     model = SimpleDiT(
         patch_size=4, emb_features=16, num_layers=1,
-        num_heads=2, mlp_ratio=2, dtype=jnp.float32, attention_impl="xla",
+        num_heads=2, mlp_ratio=2, dtype=jnp.float32,
     )
     objective = DiffusionObjective(
         model, Flow(), InputSpec(Field("image", (8, 8, 3))),
@@ -145,4 +145,5 @@ def main(config: Config):
 
 
 if __name__ == "__main__":
-    main(tyro.cli(Config))
+    with kernels.use(attention="xla"):
+        main(tyro.cli(Config))

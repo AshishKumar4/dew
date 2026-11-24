@@ -12,6 +12,7 @@ import numpy as np
 import optax
 import pytest
 from learning_gate import FEWEST_UNITS, assert_learns
+from model_support import attending
 from scenario_contract import held_out_measures
 from tiny_configs import MATRIX_DECODER
 
@@ -68,10 +69,11 @@ def judged(objective, label: str, width: int = SEQ + 1) -> None:
 
 def released(directory: str) -> LMObjective:
     """The next-token objective over a released tiny checkpoint's model, from its released weights."""
-    source = Pretrained.load(FIXTURES / directory, dtype="float32", attention_impl="reference")
+    source = Pretrained.load(FIXTURES / directory, dtype="float32")
     return LMObjective(source.model, SEQ, variables=jax.device_get(source.variables))
 
 
+@attending("reference")
 def test_a_dense_decoder_learns_its_language():
     """The dense LM scenario: a two-layer decoder's next-token loss."""
     judged(LMObjective(models.build("causal_transformer", **MATRIX_DECODER), SEQ), "a dense decoder")
@@ -82,6 +84,7 @@ RELEASED = {"a mixture of experts": "deepseek-v3-tiny", "a gated delta hybrid": 
 routed experts) and hybrid and state-space (Qwen3.5's gated delta net layers beside attention)."""
 
 
+@attending("reference")
 @pytest.mark.parametrize("label", RELEASED)
 def test_a_released_decoder_learns_its_language(label):
     """The mixture-of-experts and hybrid scenarios: a released decoder's next-token loss, from its released
@@ -89,6 +92,7 @@ def test_a_released_decoder_learns_its_language(label):
     judged(released(RELEASED[label]), label)
 
 
+@attending("reference")
 def test_a_masked_diffusion_lm_learns_its_language():
     """The diffusion language model scenario: masked diffusion over a bidirectional decoder, its loss over the
     whole row, masked at the id past the language's (HIGH)."""
@@ -97,6 +101,7 @@ def test_a_masked_diffusion_lm_learns_its_language():
     judged(objective, "a masked diffusion LM", width=SEQ)
 
 
+@attending("reference")
 def test_a_model_loaded_from_a_quantized_file_learns_its_language(tmp_path):
     """The quantized interchange scenario: a llama loaded from a GGUF file of Q8_0 matrices, trained on from
     its dequantized weights."""
@@ -106,6 +111,6 @@ def test_a_model_loaded_from_a_quantized_file_learns_its_language(tmp_path):
     rng = np.random.default_rng(0)
     write_gguf(tmp_path / "model.gguf", "llama", gguf.GGMLQuantizationType.Q8_0, hf_tensors("llama", rng),
                rng)
-    source = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference", gguf_file="model.gguf")
+    source = Pretrained.load(tmp_path, dtype="float32", gguf_file="model.gguf")
     judged(LMObjective(source.model, SEQ, variables=jax.device_get(source.variables)),
            "a quantized file's llama")

@@ -19,7 +19,7 @@ from interop_support import (
     transformers_arms,
     transformers_model,
 )
-from model_support import decode_steps, flat_tree, prediction_logits, stepped_outputs, unrolled
+from model_support import attending, decode_steps, flat_tree, prediction_logits, stepped_outputs, unrolled
 from one_draw import assert_as_exact_as_the_reference
 from reference_error import (
     FACTOR,
@@ -113,6 +113,7 @@ def whole(model, variables):
     return lambda ids: model.apply(variables, ids)
 
 
+@attending("reference")
 @pytest.mark.parametrize('name', (*ROUTED, 'minimax-m2-fp8-tiny'))
 def test_a_routed_decoders_logits_match_the_reference(name):
     """Dew's logits are on par with transformers', from float64, over drawn ids (check 1), with the
@@ -124,6 +125,7 @@ def test_a_routed_decoders_logits_match_the_reference(name):
     np.testing.assert_array_equal(logits.argmax(-1), np.load(directory / 'logits.npy').argmax(-1))
 
 
+@attending("reference")
 @pytest.mark.parametrize('name', ROUTED)
 def test_a_routed_decoders_prefill_and_token_steps_match_the_reference(name):
     """Four ids prefilled into the cache and the rest stepped one at a time give logits on par with
@@ -144,6 +146,7 @@ def test_a_routed_decoders_prefill_and_token_steps_match_the_reference(name):
     assert_routed(name, stepped, f'{ROUTED[name]} cache', wide=whole, prefill=4)
 
 
+@attending("reference")
 @pytest.mark.parametrize('name', ROUTED)
 def test_a_routed_decoders_padded_routing_matches_the_reference(name):
     """Left-padded rows under their mask and positions route as transformers' do: their logits are on par
@@ -161,23 +164,25 @@ def test_a_routed_decoders_padded_routing_matches_the_reference(name):
                   position_ids=positions)
 
 
+@attending("reference")
 @pytest.mark.parametrize('name', ROUTED)
 def test_a_routed_decoders_export_reloads_its_weights_and_source_config(name, tmp_path):
     """The export reloads to the same weights and writes the source's config, Qwen2-MoE's fused experts
     and shared gate, Granite MoE's packed experts and MiniMax-M2's router state included."""
-    loaded = Pretrained.load(str(FIXTURES / name), dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(str(FIXTURES / name), dtype='float32')
     loaded.save(tmp_path / 'export')
-    again = Pretrained.load(str(tmp_path / 'export'), dtype='float32', attention_impl='reference')
+    again = Pretrained.load(str(tmp_path / 'export'), dtype='float32')
     for path, leaf in flat_tree(loaded.variables).items():
         np.testing.assert_array_equal(leaf, flat_tree(again.variables)[path])
     assert json.loads((tmp_path / 'export/config.json').read_text()) == fixture_config(name)
 
 
+@attending("reference")
 def test_granitemoe_export_writes_packed_experts_and_ties_its_head(tmp_path):
     """Granite MoE's export writes its experts packed and its head tied, as its source does."""
     from safetensors.numpy import load_file
 
-    Pretrained.load(str(FIXTURES / 'granitemoe-tiny'), dtype='float32', attention_impl='reference').save(
+    Pretrained.load(str(FIXTURES / 'granitemoe-tiny'), dtype='float32').save(
         tmp_path / 'export')
     tensors = load_file(str(tmp_path / 'export/model.safetensors'))
     assert 'model.layers.0.block_sparse_moe.input_linear.weight' in tensors
@@ -191,10 +196,11 @@ def test_granitemoe_export_writes_packed_experts_and_ties_its_head(tmp_path):
 GPT_OSS = FIXTURES / "gpt-oss-tiny"
 
 
+@attending("xla")
 def test_gpt_oss_logits_match_the_reference_implementation():
     """fp32 parity through xla sink attention: tolerance 1e-4, observed
     max |logit difference| 2.5e-06 with identical argmax."""
-    pretrained = Pretrained.load(str(GPT_OSS), dtype="float32", attention_impl="xla")
+    pretrained = Pretrained.load(str(GPT_OSS), dtype="float32")
     model, variables = pretrained.model, pretrained.variables
     difference = recorded_logit_difference(model, variables, GPT_OSS)
     assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
@@ -203,18 +209,20 @@ def test_gpt_oss_logits_match_the_reference_implementation():
     assert flat["layers_1.mlp.experts.gate_up_proj_bias"].shape == (4, 128)
 
 
+@attending("xla")
 def test_gpt_oss_export_round_trips_sinks_and_fused_experts(tmp_path):
-    pretrained = Pretrained.load(str(GPT_OSS), dtype="float32", attention_impl="xla")
+    pretrained = Pretrained.load(str(GPT_OSS), dtype="float32")
     model, variables = pretrained.model, pretrained.variables
     export = tmp_path / "gpt-oss"
     PretrainedDecoder.from_model(model, variables).save(export)
-    round_trip = Pretrained.load(str(export), dtype="float32", attention_impl="xla")
+    round_trip = Pretrained.load(str(export), dtype="float32")
     again, reloaded = round_trip.model, round_trip.variables
     assert again == model
     for path, leaf in flat_tree(reloaded["params"]).items():
         assert np.array_equal(np.asarray(leaf), np.asarray(flat_tree(variables["params"])[path])), path
 
 
+@attending("xla")
 def test_an_mxfp4_gpt_oss_checkpoint_loads_through_the_dequantization(tmp_path):
     """The released layout: uint8 blocks and scales in place of the expert
     matrices. Loading them must give the logits of the fixture whose
@@ -238,7 +246,7 @@ def test_an_mxfp4_gpt_oss_checkpoint_loads_through_the_dequantization(tmp_path):
     (directory / "config.json").write_text(json.dumps(
         {**fixture_config("gpt-oss-tiny"), "quantization_config": {"quant_method": "mxfp4"}}))
 
-    pretrained = Pretrained.load(str(directory), dtype="float32", attention_impl="xla")
+    pretrained = Pretrained.load(str(directory), dtype="float32")
     _model, variables = pretrained.model, pretrained.variables
     expected = translate_weights(tensors, translate_config(fixture_config("gpt-oss-tiny")))
     for path, leaf in flat_tree(variables["params"]).items():
@@ -281,11 +289,12 @@ def decoded_in_float64(source):
     from arm_arithmetic import float64_held
     from model_support import float64_twin
 
-    loaded = Pretrained.load(str(source), dtype="float32", attention_impl="xla")
+    loaded = Pretrained.load(str(source), dtype="float32")
     model, variables = float64_twin(loaded.model), float64_held(loaded.variables)
     return jax.jit(lambda tokens: model.apply(variables, tokens))
 
 
+@attending("xla")
 def test_an_mxfp4_gpt_oss_served_packed_is_on_par_with_it_decoded(tmp_path):
     """An MXFP4 GPT-OSS loaded with its experts packed (`Pretrained.load`'s `packed_weights`, row 4516):
     each expert matrix an NVFP4 bank in the `QUANTIZATION` collection, no parameter beside it, holding
@@ -297,7 +306,7 @@ def test_an_mxfp4_gpt_oss_served_packed_is_on_par_with_it_decoded(tmp_path):
 
     source = _mxfp4_gpt_oss(tmp_path)
     packed, decoded = (Pretrained.load(str(source), dtype="bfloat16", param_dtype="auto",
-                                       attention_impl="xla", packed_weights=served)
+                                       packed_weights=served)
                        for served in (True, False))
     banks = {".".join(path): bank for path, bank in flatten_dict(
         dict(packed.variables[QUANTIZATION]), is_leaf=lambda _, leaf: isinstance(leaf, NvFp4)).items()}
@@ -330,6 +339,7 @@ def test_an_mxfp4_gpt_oss_served_packed_is_on_par_with_it_decoded(tmp_path):
             np.asarray(dequantize_mxfp4(stored[stem + "_blocks"], stored[stem + "_scales"])))
 
 
+@attending("xla")
 def test_an_mxfp4_bank_under_the_zero_byte_loads_packed_as_it_loads_dense(tmp_path):
     """E8M0's 0x00 byte is the scale 2**-127, which a writer may give a group of nonzero codes as the
     released encoder gives an all-zero group (`quantize_mxfp4`): a GPT-OSS whose first expert's groups
@@ -352,7 +362,7 @@ def test_an_mxfp4_bank_under_the_zero_byte_loads_packed_as_it_loads_dense(tmp_pa
     stored[stem + "_blocks"], stored[stem + "_scales"] = blocks, scales
     save_file(stored, str(source / "model.safetensors"))
 
-    packed, dense = (Pretrained.load(str(source), dtype="float32", attention_impl="xla", packed_weights=flag)
+    packed, dense = (Pretrained.load(str(source), dtype="float32", packed_weights=flag)
                      for flag in (True, False))
     banks = {".".join(path): bank for path, bank in flatten_dict(
         dict(packed.variables[QUANTIZATION]), is_leaf=lambda _, leaf: isinstance(leaf, NvFp4)).items()}
@@ -369,6 +379,7 @@ def test_an_mxfp4_bank_under_the_zero_byte_loads_packed_as_it_loads_dense(tmp_pa
         np.asarray(dequantize_mxfp4(written[stem + "_blocks"], written[stem + "_scales"])).view(np.uint32))
 
 
+@attending("xla")
 @pytest.mark.mesh(devices=2)
 def test_an_mxfp4_gpt_oss_packed_on_a_mesh_places_each_bank_by_its_experts_axis(tmp_path):
     """An MXFP4 GPT-OSS loaded packed onto a mesh whose expert axis takes two devices (`packed_weights`
@@ -382,11 +393,11 @@ def test_an_mxfp4_gpt_oss_packed_on_a_mesh_places_each_bank_by_its_experts_axis(
 
     source = _mxfp4_gpt_oss(tmp_path)
     mesh = MeshSpec(expert=2)
-    placed = Pretrained.load(str(source), dtype="bfloat16", param_dtype="auto", attention_impl="xla",
+    placed = Pretrained.load(str(source), dtype="bfloat16", param_dtype="auto",
                              packed_weights=True, mesh=mesh)
-    held = Pretrained.load(str(source), dtype="bfloat16", param_dtype="auto", attention_impl="xla",
+    held = Pretrained.load(str(source), dtype="bfloat16", param_dtype="auto",
                            packed_weights=True)
-    dense = Pretrained.load(str(source), dtype="bfloat16", param_dtype="auto", attention_impl="xla",
+    dense = Pretrained.load(str(source), dtype="bfloat16", param_dtype="auto",
                             mesh=mesh)
     params = dict(flatten_dict(dict(dense.variables["params"])))
     banks = flatten_dict(dict(placed.variables[QUANTIZATION]),
@@ -413,6 +424,7 @@ def test_an_mxfp4_gpt_oss_packed_on_a_mesh_places_each_bank_by_its_experts_axis(
                     truth_fn=decoded_in_float64(source))
 
 
+@attending("xla")
 @pytest.mark.usefixtures("scanned_stacks")
 def test_an_mxfp4_gpt_oss_scanned_packed_is_its_unscanned_packed_load():
     """An MXFP4 GPT-OSS loaded packed with its layers scanned (`packed_weights`, row 4861): the scan stacks
@@ -421,7 +433,7 @@ def test_an_mxfp4_gpt_oss_scanned_packed_is_its_unscanned_packed_load():
     import tempfile
 
     source = _mxfp4_gpt_oss(Path(tempfile.mkdtemp()))
-    scanned = plain = Pretrained.load(str(source), dtype="float32", attention_impl="xla", packed_weights=True)
+    scanned = plain = Pretrained.load(str(source), dtype="float32", packed_weights=True)
     tokens = jax.random.randint(jax.random.key(0), (2, 8), 0, PACKED_CONFIG["vocab_size"])
 
     def loss(loaded):
@@ -436,6 +448,7 @@ def test_an_mxfp4_gpt_oss_scanned_packed_is_its_unscanned_packed_load():
                  scanned_grad, plain_grad)
 
 
+@attending("xla")
 def test_an_mxfp4_gpt_oss_whose_experts_are_no_whole_stages_loads_packed_as_it_loads_dense():
     """The tiny MXFP4 fixture's experts, 32 deep, are no whole NVFP4 stages: loaded packed, each stays
     dense, the load its dense load leaf for leaf, nothing held in `QUANTIZATION`."""
@@ -456,7 +469,7 @@ def test_an_mxfp4_gpt_oss_whose_experts_are_no_whole_stages_loads_packed_as_it_l
     save_file(packed, str(directory / "model.safetensors"))
     (directory / "config.json").write_text(json.dumps(
         {**fixture_config("gpt-oss-tiny"), "quantization_config": {"quant_method": "mxfp4"}}))
-    served, plain = (Pretrained.load(str(directory), dtype="float32", attention_impl="xla",
+    served, plain = (Pretrained.load(str(directory), dtype="float32",
                                      packed_weights=flag) for flag in (True, False))
     assert QUANTIZATION not in served.variables
     for path, leaf in flat_tree(served.variables["params"]).items():
@@ -474,7 +487,7 @@ def _packed_run(source: Path, directory: Path, steps: int):
     from dew.objectives.lm import LMObjective
     from dew.training import Trainer
 
-    loaded = Pretrained.load(str(source), dtype="float32", attention_impl="xla", packed_weights=True)
+    loaded = Pretrained.load(str(source), dtype="float32", packed_weights=True)
     objective = LMObjective(loaded.model, seq_len=8, ema_decay=None, variables=loaded.variables)
     rows = [{"text": (np.arange(9, dtype=np.int32) + index) % PACKED_CONFIG["vocab_size"]}
             for index in range(16)]
@@ -487,6 +500,7 @@ def _packed_run(source: Path, directory: Path, steps: int):
     return state
 
 
+@attending("xla")
 def test_a_resumed_run_over_packed_experts_trains_on_bitwise_as_an_uninterrupted_run(tmp_path):
     """A run over an MXFP4 GPT-OSS served packed: two steps, a resume and a third land where three
     uninterrupted steps do, every leaf of the state bitwise, the banks among them restored as written."""
@@ -499,6 +513,7 @@ def test_a_resumed_run_over_packed_experts_trains_on_bitwise_as_an_uninterrupted
         np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
 
 
+@attending("xla")
 @pytest.mark.network
 def test_gpt_oss_20b_matches_transformers_on_the_real_weights():
     """The released MXFP4 checkpoint through the loader, its weights in the bf16 the blocks decode to
@@ -512,7 +527,7 @@ def test_gpt_oss_20b_matches_transformers_on_the_real_weights():
     recorded = recording(FIXTURE)
     ids, reference, truth = (recorded[name] for name in ("input_ids", "reference", "truth"))
     repo, revision = RELEASED
-    pretrained = Pretrained.load(repo, dtype="bfloat16", param_dtype="auto", attention_impl="xla",
+    pretrained = Pretrained.load(repo, dtype="bfloat16", param_dtype="auto",
                                  max_seq_len=int(ids.shape[1]), revision=revision)
     logits = np.asarray(pretrained.model.apply(pretrained.variables, jnp.asarray(ids)), np.float32)[0]
     assert_as_exact_as_the_reference(logits, reference, truth, "GPT OSS 20B logits")
@@ -525,6 +540,7 @@ def test_gpt_oss_20b_matches_transformers_on_the_real_weights():
 DEEPSEEK_V2 = FIXTURES / "deepseek-v2-tiny"
 
 
+@attending("reference")
 def test_deepseek_v2_logits_match_the_reference_implementation():
     """fp32 parity: tolerance 1e-4, observed max |logit difference| 2.3e-06
     with identical argmax."""
@@ -541,11 +557,12 @@ def test_deepseek_v2_logits_match_the_reference_implementation():
 KIMI_K25 = FIXTURES / "kimi-k25-tiny"
 
 
+@attending("reference")
 def test_a_kimi_k25_export_writes_the_source_names_and_the_vision_bytes(tmp_path):
     """The whole checkpoint comes back out: the decoder from the parameter
     tree under the release's names, the tower and the projector from the
     bytes they were retained as, and the source's own config beside them."""
-    loaded = Pretrained.load(str(KIMI_K25), dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(str(KIMI_K25), dtype="float32")
     from dew.interop.sources import load_shards
 
     destination = tmp_path / "export"
@@ -558,7 +575,7 @@ def test_a_kimi_k25_export_writes_the_source_names_and_the_vision_bytes(tmp_path
         np.testing.assert_array_equal(exported[name], tensor, err_msg=name)
     assert (json.loads((destination / "config.json").read_text())
             == fixture_config("kimi-k25-tiny"))
-    again = Pretrained.load(str(destination), dtype="float32", attention_impl="reference")
+    again = Pretrained.load(str(destination), dtype="float32")
     ids = jnp.asarray(np.load(KIMI_K25 / "input_ids.npy"), jnp.int32)
     np.testing.assert_array_equal(np.asarray(again.model.apply(again.variables, ids)),
                                   np.asarray(loaded.model.apply(loaded.variables, ids)))
@@ -574,6 +591,7 @@ def test_a_kimi_k25_export_writes_the_source_names_and_the_vision_bytes(tmp_path
 GLM4_MOE = FIXTURES / "glm4-moe-tiny"
 
 
+@attending("reference")
 def test_the_glm4_moe_mtp_depth_matches_the_reference_composition():
     """The checkpoint's model.layers.2.* depth loads as mtp_0 with the
     trunk's routing and computes what the engines running the released
@@ -648,6 +666,7 @@ FP8_TENSORS = {'quant_method': 'compressed-tensors', 'format': 'float-quantized'
 """Per-tensor E4M3 weights as compressed-tensors describes them."""
 
 
+@attending("reference")
 @pytest.mark.parametrize(("name", "quantized"),
                          [("kimi-k25-tiny", ".mlp.experts."), ("gpt-oss-tiny", ".self_attn.")])
 def test_a_family_reads_quantized_weights_through_the_shared_codec(tmp_path, name, quantized):
@@ -719,7 +738,7 @@ def kimi_k25_media_case(site):
         patches = rng.normal(size=(int(np.prod(grid)), 3, 2, 2)).astype(np.float32)
         return ids.astype(np.int32), patches
 
-    source = Pretrained.load(KIMI_K25, dtype="float32", attention_impl="reference")
+    source = Pretrained.load(KIMI_K25, dtype="float32")
     model, variables = source.model, source.variables
 
     def batch(ids, patches):
@@ -763,6 +782,7 @@ def kimi_k25_media_case(site):
     return dew, reference, selection_margins.clearing(draw, clears), truth
 
 
+@attending("reference")
 @pytest.mark.parametrize("site", sorted(KIMI_K25_MEDIA))
 def test_kimi_k25_reads_its_media_whole_on_par_with_transformers(site):
     """Kimi K2.5 loads whole (row 855): its MoonViT, attending over an item's every frame, its frames pooled,
@@ -772,6 +792,7 @@ def test_kimi_k25_reads_its_media_whole_on_par_with_transformers(site):
     assert_as_exact(dew, reference, draw, f"kimi-k25 {site}", seeds=KIMI_K25_MEDIA_SEEDS, truth_fn=truth)
 
 
+@attending("reference")
 @pytest.mark.parametrize("kind", ["image", "video"])
 def test_kimi_k25_reads_raw_media_through_its_processor_as_its_fields(kind):
     """Kimi K2.5's raw media reach the model through the checkpoint's own processor (transformers'
@@ -782,7 +803,7 @@ def test_kimi_k25_reads_raw_media_through_its_processor_as_its_fields(kind):
 
     from dew.nn.inputs import ModelInputs
 
-    source = Pretrained.load(KIMI_K25, dtype="float32", attention_impl="reference")
+    source = Pretrained.load(KIMI_K25, dtype="float32")
     rng = np.random.default_rng(855)
     picture = (rng.random((12, 8, 3)) * 255).astype(np.uint8)
     # A clip of two frames at two a second, which its processor samples by its own fps.
@@ -802,6 +823,7 @@ def test_kimi_k25_reads_raw_media_through_its_processor_as_its_fields(kind):
     np.testing.assert_array_equal(logits(called), logits(given))
 
 
+@attending("reference")
 def test_kimi_k25_reads_raw_images_through_its_releases_own_processor(tmp_path):
     """Kimi K2.5's release ships its own processor (KimiK25Processor and its vision processor at 4d01dfe,
     the source's code), whose public call takes `medias` and keeps one placeholder an image (row 4367): a
@@ -836,7 +858,7 @@ def test_kimi_k25_reads_raw_images_through_its_releases_own_processor(tmp_path):
                                       in_patch_limit=tiny["max_patches"], in_patch_limit_each_frame=None,
                                       patch_limit_on_one_side=side)
     (source / "preprocessor_config.json").write_text(json.dumps(released))
-    loaded = Pretrained.load(source, dtype="float32", attention_impl="reference", trust_remote_code=True)
+    loaded = Pretrained.load(source, dtype="float32", trust_remote_code=True)
     release = AutoProcessor.from_pretrained(str(source), trust_remote_code=True, local_files_only=True)
     assert type(release).__name__ == "KimiK25Processor"
     rng = np.random.default_rng(4367)
@@ -893,13 +915,14 @@ def test_kimi_k25_reads_raw_images_through_its_releases_own_processor(tmp_path):
     assert not np.array_equal(first, logits([images[0][::-1], *images[1:]]))
 
 
+@attending("reference")
 def test_kimi_k25_text_only_placeholders_match_reference():
     import torch
 
     from tools.decoder_export_reference import Case, reference_model
 
     directory = FIXTURES / "kimi-k25-tiny"
-    source = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    source = Pretrained.load(directory, dtype="float32")
     ids = np.load(directory / "input_ids.npy").copy()
     config = fixture_config("kimi-k25-tiny")
     ids[0, 0] = config["image_token_id"]
@@ -916,6 +939,7 @@ def test_kimi_k25_text_only_placeholders_match_reference():
     np.testing.assert_array_equal(actual.argmax(-1), expected.argmax(-1))
 
 
+@attending("reference")
 def test_the_glm_moe_dsa_mtp_depth_matches_the_reference_composition():
     """The checkpoint's model.layers.8.* depth loads as mtp_0 with its own
     indexer and the trunk's routing, and computes what the engines running
@@ -926,6 +950,7 @@ def test_the_glm_moe_dsa_mtp_depth_matches_the_reference_composition():
     mtp_depth(GLM_MOE_DSA, experts=(8, 32, 12))
 
 
+@attending("reference")
 def test_glm_moe_dsa_decodes_what_it_computes_in_one_pass():
     """Cached decode over the sparse layers, the sharing ones included:
     the prompt then one token reaches the one-pass logits of that token,
@@ -953,6 +978,7 @@ def test_glm_moe_dsa_decodes_what_it_computes_in_one_pass():
 DEEPSEEK_V4 = FIXTURES / "deepseek-v4-tiny"
 
 
+@attending("reference")
 @pytest.mark.parametrize("directory", [KIMI_K25, GLM4_MOE, GLM_MOE_DSA, DEEPSEEK_V4],
                          ids=["kimi-k25", "glm4-moe", "glm-moe-dsa", "deepseek-v4"])
 def test_a_moe_decoders_logits_match_the_reference_implementation(directory):
@@ -990,6 +1016,7 @@ def test_deepseek_v4_draws_each_output_group_at_its_own_fan_in():
         assert np.all((low < statistics) & (statistics < high)), (statistics, low, high)
 
 
+@attending("reference")
 def test_deepseek_v4_a_left_padded_row_pools_its_compressed_windows_over_its_own_tokens():
     """Uncached, rows padded on the left by three tokens pool the HCA windows and the CSA
     windows its lightning indexer scores over their real tokens at their ranks, as a cache appends
@@ -1005,6 +1032,7 @@ def test_deepseek_v4_a_left_padded_row_pools_its_compressed_windows_over_its_own
     assert distance(padded[:, pad:], reference) <= FACTOR * distance(alone, reference)
 
 
+@attending("reference")
 @pytest.mark.parametrize('saved_spelling', [False, True], ids=['released', 'hf_saved'])
 def test_deepseek_v4_tied_source_names_roundtrip(tmp_path, saved_spelling):
     from dew.interop.safetensors_io import save_hf_layout
@@ -1031,22 +1059,23 @@ def test_deepseek_v4_tied_source_names_roundtrip(tmp_path, saved_spelling):
     config['tie_word_embeddings'] = True
     directory = tmp_path / 'source'
     save_hf_layout(tensors, config, directory)
-    source = Pretrained.load(directory, dtype='float32', attention_impl='reference')
+    source = Pretrained.load(directory, dtype='float32')
     export = tmp_path / 'export'
     source.save(export)
     emitted = load_shards(export)
     assert set(emitted) == set(tensors)
     for name, tensor in tensors.items():
         np.testing.assert_array_equal(emitted[name], tensor, err_msg=name)
-    reloaded = Pretrained.load(export, dtype='float32', attention_impl='reference')
+    reloaded = Pretrained.load(export, dtype='float32')
     ids = np.load(DEEPSEEK_V4 / 'input_ids.npy')
     np.testing.assert_array_equal(source.model.apply(source.variables, ids),
                                   reloaded.model.apply(reloaded.variables, ids))
     save_hf_layout({**tensors, 'head.weight': tensors['head.weight'] + 1}, config, directory)
     with pytest.raises(ValueError):
-        Pretrained.load(directory, dtype='float32', attention_impl='reference')
+        Pretrained.load(directory, dtype='float32')
 
 
+@attending("reference")
 def test_a_v4_grouped_output_projection_under_the_reference_models_names_loads_as_released(tmp_path):
     """The reference model's own state dict names the grouped output
     projection and its query `model.layers.N.self_attn.o_a_proj` and
@@ -1066,17 +1095,18 @@ def test_a_v4_grouped_output_projection_under_the_reference_models_names_loads_a
         renamed[name] = tensor
     assert sum(name.endswith('.self_attn.o_a_proj.weight') for name in renamed) > 0
     save_hf_layout(renamed, fixture_config('deepseek-v4-tiny'), tmp_path)
-    module = Pretrained.load(tmp_path, dtype='float32', attention_impl='reference')
-    released = Pretrained.load(DEEPSEEK_V4, dtype='float32', attention_impl='reference')
+    module = Pretrained.load(tmp_path, dtype='float32')
+    released = Pretrained.load(DEEPSEEK_V4, dtype='float32')
     ids = np.load(DEEPSEEK_V4 / 'input_ids.npy')
     np.testing.assert_array_equal(module.model.apply(module.variables, ids),
                                   released.model.apply(released.variables, ids))
 
 
+@attending("reference")
 def test_deepseek_v4_public_speculation_preserves_padded_rows():
     # Three rows differ from the two residual streams: a row mask must not
     # accidentally broadcast along the stream axis during predictor reseeding.
-    source = Pretrained.load(DEEPSEEK_V4, dtype='float32', attention_impl='reference')
+    source = Pretrained.load(DEEPSEEK_V4, dtype='float32')
     assert_padded_speculation_is_greedy(source)
 
 
@@ -1093,6 +1123,7 @@ which 1 in 18 of the fixture's two-row draws keeps clear of (22 of 400 on armada
 under 2e-6 chance of none in this many."""
 
 
+@attending("reference")
 def test_deepseek_v4_cached_chunks_match_transformers():
     """Calls of `V4_CHUNKS` tokens through the decode cache on par with transformers' calls of the same
     widths through its own cache, from its float64 twin's (check 1, ledger 2739), over drawn rows whose
@@ -1104,7 +1135,7 @@ def test_deepseek_v4_cached_chunks_match_transformers():
 
     from tools.decoder_export_reference import Case, reference_model
 
-    source = Pretrained.load(DEEPSEEK_V4, dtype='float32', attention_impl='reference')
+    source = Pretrained.load(DEEPSEEK_V4, dtype='float32')
     model, variables = source.model, source.variables
     rows = np.load(DEEPSEEK_V4 / 'input_ids.npy').shape[0]
     reference, _ = reference_model(Case('deepseek_v4', 'deepseek-v4-tiny'), DEEPSEEK_V4)
@@ -1136,8 +1167,9 @@ def test_deepseek_v4_cached_chunks_match_transformers():
     assert_as_exact(cached, run, draw, "deepseek_v4 cached chunks", seeds=V4_CACHED_SEEDS, truth_fn=truth)
 
 
+@attending("reference")
 def test_deepseek_v4_public_prediction_states_preserve_raw_streams():
-    source = Pretrained.load(DEEPSEEK_V4, dtype='float32', attention_impl='reference')
+    source = Pretrained.load(DEEPSEEK_V4, dtype='float32')
     ids = np.load(DEEPSEEK_V4 / 'input_ids.npy')
     model, variables = source.model, source.variables
     states, logits = model.apply(variables, ids, method=model.states_and_logits)
@@ -1153,8 +1185,9 @@ def test_deepseek_v4_public_prediction_states_preserve_raw_streams():
     np.testing.assert_allclose(jnp.asarray(louder), 2 * jnp.asarray(logits), atol=1e-4, rtol=0)
 
 
+@attending("reference")
 def test_deepseek_v4_mtp_matches_released_raw_stream_composition():
-    source = Pretrained.load(DEEPSEEK_V4, dtype='float32', attention_impl='reference')
+    source = Pretrained.load(DEEPSEEK_V4, dtype='float32')
     model = source.model
     ids = np.load(DEEPSEEK_V4 / 'input_ids.npy')
 
@@ -1189,6 +1222,7 @@ def test_deepseek_v4_mtp_matches_released_raw_stream_composition():
 LLAMA4 = FIXTURES / "llama4-tiny"
 
 
+@attending("reference")
 def test_llama4_logits_match_the_reference_implementation():
     """fp32 parity: tolerance 1e-4, observed max |logit difference| 3.5e-06
     with identical argmax. The fused expert kernels arrive split in place."""
@@ -1208,6 +1242,7 @@ def test_llama4_logits_match_the_reference_implementation():
 
 
 
+@attending("reference")
 def test_gemma4_moe_logits_match_the_reference_implementation():
     """fp32 parity: tolerance 1e-4, observed max |logit difference| 4.9e-06
     with identical argmax. The fused expert kernels arrive split in place,

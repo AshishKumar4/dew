@@ -15,6 +15,7 @@ import pytest
 from diffusion_stubs import batch_for
 from diffusion_support import TanhLayer, images_of, saved_after_one_step
 from flax import linen as nn
+from model_support import attending
 from reference_error import as_given, assert_as_exact, declared_seeds, dew_path, indexed_recording, recording
 from tool_support import run_from
 
@@ -169,12 +170,13 @@ def test_one_step_is_the_papers_equations_on_stylegan_ts_heads():
 
 
 @pytest.fixture(scope="module")
+@attending("xla")
 def runs(tmp_path_factory):
     root = tmp_path_factory.mktemp("ladd")
     teacher = DiffusionRunConfig(
         model=ModelConfig("simple_dit",
                           {"patch_size": 2, "emb_features": 16, "num_layers": 2, "num_heads": 2,
-                           "dtype": "float32", "attention_impl": "xla"}),
+                           "dtype": "float32"}),
         data=images_of("tfds://oxford_flowers102", 4), preset=Flow(), val_metrics=(),
         trainer=TrainerConfig(checkpoint_dir=str(root)),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
@@ -188,6 +190,7 @@ def runs(tmp_path_factory):
     return student, batch
 
 
+@attending("xla")
 def test_validation_does_not_advance_the_spectral_statistics(runs):
     config, batch = runs
     task = config.build()
@@ -218,6 +221,7 @@ CRITIC, STUDENT = ("discriminator", "r1"), ("generator", "distillation")
 """The heads' losses and the student's, the whole loss their sum."""
 
 
+@attending("xla")
 def test_each_side_trains_on_its_own_loss(runs):
     """The heads take no gradient from the student's losses and the student none from the heads', exactly,
     and the heads' a nonzero one from theirs; the teacher is not a parameter (a configured run's
@@ -272,6 +276,7 @@ def test_each_sides_gradient_is_the_whole_losss_there():
                     truth_fn=whole(jnp.float64))
 
 
+@attending("xla")
 def test_a_saved_student_samples_in_one_step(runs, tmp_path):
     config, batch = runs
     task, state, _ = saved_after_one_step(config, batch, tmp_path / "student", 1e-3)

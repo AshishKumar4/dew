@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from model_support import unrolled
+from model_support import attending, unrolled
 from reference_error import as_given, assert_as_exact, with_gradients
 
 from dew.inference.banks import HeldBanks
@@ -607,6 +607,7 @@ def test_a_record_keyed_by_site_travels_through_pack_the_journal_and_verl_and_gr
         from_verl([{**rows[0], "routed_experts": {}}])
 
 
+@attending("reference")
 def test_a_multimodal_mixture_replays_through_its_language_model():
     """A vision-conditioned MoE decoder (Gemma 3's wrapper here, Gemma 4
     26B-A4B's in the wild) takes the replay beside the media and hands it to
@@ -616,7 +617,7 @@ def test_a_multimodal_mixture_replays_through_its_language_model():
 
     text = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=2, num_heads=2, num_kv_heads=2,
                              head_dim=8, mlp_features=32, max_seq_len=SEQ_LEN, dtype=jnp.float32,
-                             attention_impl="reference", mixture=Mixture(experts=4, top_k=2))
+                             mixture=Mixture(experts=4, top_k=2))
     vision = SiglipVision(
         hidden_size=16, intermediate_size=32, num_layers=1, num_heads=2, image_size=8, patch_size=4
     )

@@ -13,6 +13,7 @@ import optax
 import pytest
 from affine_run import dataset
 from block_support import model as kinded, wrapped
+from model_support import attending
 from reference_error import assert_as_exact, dew_path
 from test_chunk_adaptation import LENGTH, LEVEL, VOCAB, _replayed, decoder, drawn_variables, variable_shapes
 
@@ -157,6 +158,7 @@ def on_real(run):
     return real
 
 
+@attending("xla")
 @pytest.mark.parametrize("case", list(CASES))
 def test_a_decode_reads_the_logits_its_training_forward_gives(case):
     """The adapting decoder's logits at every real slot of a padded prompt, one with a hole, and the tokens
@@ -182,6 +184,7 @@ STEPS = 7
 paired by `seeds_for` on armada (15cda97a5)."""
 
 
+@attending("reference")
 def test_a_decode_across_longrope_rebuilds_its_levels_with_its_cache():
     """Phi-3's LongRoPE switches its factors past its original context, where a generation rebuilds a
     crossing row's cache from its history (`cache_rebuild_position`): four ids prefilled and five more
@@ -191,7 +194,7 @@ def test_a_decode_across_longrope_rebuilds_its_levels_with_its_cache():
     rebuilt with the trunk's cache read the factors the whole history reads (row 9066). A prompt's blocks,
     which a rebuild's replay of its ids would not carry, and a hole between its real tokens, which the
     replay closes, are refused there."""
-    loaded = Pretrained.load(PHI3, dtype="float32", attention_impl="reference", max_seq_len=48)
+    loaded = Pretrained.load(PHI3, dtype="float32", max_seq_len=48)
     adaptation = ChunkAdaptation(window=3, rate=0.1)
     model = loaded.model.clone(continuum=LEVEL)
     objective = LMObjective(model, 9, adaptation=adaptation)
@@ -233,6 +236,7 @@ def test_a_decode_across_longrope_rebuilds_its_levels_with_its_cache():
         generate(decoding, variables, holed, 2, key=jax.random.key(0))
 
 
+@attending("xla")
 def test_an_adapting_run_draws_what_its_saved_task_draws(tmp_path):
     """A run that carries its chain's levels, its windows and rates a level each and a padding id among its
     targets: its policy (`LMObjective.policy`) and the task its saved run loads (`TextGeneration.from_run`)
@@ -253,6 +257,7 @@ def test_an_adapting_run_draws_what_its_saved_task_draws(tmp_path):
         np.testing.assert_array_equal(np.asarray(getattr(ran, field)), np.asarray(getattr(again, field)))
 
 
+@attending("xla")
 def test_a_server_draws_what_its_adapting_task_draws():
     """A server of an adapting decoder's task (`Server.from_task`), two slots for three requests so a
     slot a finished request held seats another, draws each request's tokens as the task alone does: a
@@ -280,6 +285,7 @@ def test_a_server_draws_what_its_adapting_task_draws():
         server.submit(holed, 3, key=0)
 
 
+@attending("xla")
 def test_the_decoder_answers_its_models_generation_hooks():
     """The adapting decoder answers the hooks a generation reads as its model does (`dew.nn.protocols`):
     its bounds, its cache's layout and capacity, its LongRoPE rebuild, the projections it packs by its own
@@ -315,6 +321,7 @@ def test_the_decoder_answers_its_models_generation_hooks():
     assert states is None and logits.shape == (ROWS, model.vocab_size)
 
 
+@attending("xla")
 def test_what_an_adapting_decoder_cannot_draw_is_refused():
     """A strategy that reads tokens it then rejects or reorders (a speculative block's, a beam's) draws
     past what an adapting decoder's cache rewinds, through a task or the sampler alike; a damped or

@@ -109,7 +109,7 @@ def backward_recording(device, seeds=None):
     source[2].to(device)
     ours, reference, truth, drawn = gradient_functions(source)
     with jax.enable_x64(new_val=True):
-        native = Pretrained.load(FIXTURE, dtype="float64", param_dtype="float64", attention_impl="reference")
+        native = Pretrained.load(FIXTURE, dtype="float64", param_dtype="float64")
         native_truth = gradient_functions((native, source[1], source[2]))[0]
         roundings = chain_roundings(jax.make_jaxpr(native_truth)(widened(drawn(0)[0])))
 
@@ -293,4 +293,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # On the reference attention, the run's kernel choice (a model's field before row 11938), Dew
+    # imported where it runs, as this tool imports it.
+    from dew.nn.kernels import generation
+
+    with generation.chosen(attention="reference"):
+        main()

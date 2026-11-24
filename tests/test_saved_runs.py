@@ -23,6 +23,7 @@ from pathlib import Path
 
 import jax
 import pytest
+from model_support import attending
 from process_support import assert_exits_cleanly
 from reference_error import recording
 from saved_run_kinds import SAVED_KINDS, answered, trained_finite
@@ -107,6 +108,7 @@ def archived(recorded: str, kind: str) -> tarfile.TarFile:
     return tarfile.open(fileobj=io.BytesIO(stored.tobytes()), mode="r:xz")
 
 
+@attending("xla")
 def test_every_task_a_registered_objective_saves_its_runs_as_is_a_recorded_kinds(tmp_path):
     """Every kind the corpus's writer saves (`SAVED_KINDS`) has a run a main recorded (`SAVED`), and every
     task a registered objective saves its runs as (`dew.registry.objectives`' `saved_task`) is the task of
@@ -295,6 +297,7 @@ def test_a_run_an_earlier_main_saved_exports_and_loads_back_answering_as_its_run
     assert answered_alike(answers(pipeline(str(release))), answers(task.from_run(str(run))))
 
 
+@attending("xla")
 @pytest.mark.shared_setup("saved_run", by=r"[0-9a-f]{12}-[a-z0-9-]+?(?=-(?:None|another)-|$)")
 @pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
 @pytest.mark.parametrize("data_resume", ["exact", "relaxed"])
@@ -376,6 +379,7 @@ def rebuilt(tmp_path: Path, monkeypatch, recorded: str, kind: str, **stated) -> 
     return run, last, dataclasses.replace(here, trainer=trainer, **sourced, **stated)
 
 
+@attending("xla")
 @pytest.mark.shared_setup("saved_run", by=r"[0-9a-f]{12}-[a-z0-9-]+?(?=-(?:None|another)-|$)")
 @pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
 def test_a_run_an_earlier_main_saved_resumes_when_its_command_runs_again(tmp_path, monkeypatch, recorded,
@@ -393,6 +397,7 @@ def test_a_run_an_earlier_main_saved_resumes_when_its_command_runs_again(tmp_pat
 
 # The name `train` is given and the data's form are apart from each other and from the main that saved the
 # run: each main's run resumes through both forms, one under its trainer's name and one under another's.
+@attending("xla")
 @pytest.mark.shared_setup("saved_run", by=r"[0-9a-f]{12}-[a-z0-9-]+?(?=-(?:None|another)-|$)")
 @pytest.mark.parametrize(("named", "given"), [(None, "chain"), ("another", "loader")])
 @pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
@@ -431,6 +436,7 @@ def test_a_run_an_earlier_main_saved_resumes_through_its_python_train(tmp_path, 
     assert RunConfig.load(str(run)).data_plan_version == readable
 
 
+@attending("xla")
 @pytest.mark.parametrize(("landed", "version"), [(9, 9), (None, 9)])
 def test_a_run_saved_while_its_version_was_data_plan_loads_and_resumes_by_it(tmp_path, monkeypatch, landed,
                                                                              version):
@@ -474,6 +480,7 @@ jax.distributed.shutdown()
 """)
 
 
+@attending("xla")
 @pytest.mark.mesh(devices=8)
 @pytest.mark.parametrize("kind", ["decision", "decision-lettered"])
 def test_a_decision_run_this_dew_saves_resumes_when_its_command_runs_again_or_from_its_record(tmp_path,

@@ -23,7 +23,16 @@ import pytest
 import torch
 from flax import linen as nn
 from map_judge import marked_seeds
-from model_support import TINY_DECODER, Digits, compiled_apply, decoder, flat_tree, stepped_outputs, unrolled
+from model_support import (
+    TINY_DECODER,
+    Digits,
+    attending,
+    compiled_apply,
+    decoder,
+    flat_tree,
+    stepped_outputs,
+    unrolled,
+)
 from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
 from serving_support import Served, assert_same_draws, assert_served_as_exact
 
@@ -164,6 +173,7 @@ def idefics_block(wide: bool):
     return run
 
 
+@attending("reference")
 @pytest.mark.parametrize("precision", ["float32", "bfloat16"])
 def test_the_block_computes_and_differentiates_as_idefics(precision):
     """Through both gated branches, the output and the gradients into the residual, the context and
@@ -245,7 +255,7 @@ def logits(model):
 
 def float64(model):
     """`model` in float64 on the reference kernel, which keeps float64 where a fused one narrows."""
-    return model.clone(dtype=jnp.float64, attention_impl="reference")
+    return model.clone(dtype=jnp.float64)
 
 
 def fresh_against_base(model: CausalTransformer, label: str, seeds: int | None = None):
@@ -262,11 +272,13 @@ def fresh_against_base(model: CausalTransformer, label: str, seeds: int | None =
                     seeds=SEEDS[label] if seeds is None else seeds, truth_fn=base_logits(float64(base)))
 
 
+@attending("reference")
 def test_a_fresh_block_computes_the_decoder_it_was_attached_to():
     """Drawn at zero gates, the decoder with its blocks computes the decoder without them (check 1)."""
     fresh_against_base(MODEL, "base")
 
 
+@attending("reference")
 @pytest.mark.parametrize("form", FORMS)
 def test_every_residual_form_takes_the_blocks(form):
     """AltUp's active copy, mHC's streams (Single-Pass's too), the depth state's partial block and
@@ -343,6 +355,7 @@ def assert_a_cached_context_decodes_as_the_full_forward(model: CausalTransformer
         np.testing.assert_array_equal(np.asarray(leaf), lengths)
 
 
+@attending("reference")
 def test_a_cached_context_decodes_as_the_full_forward():
     """The context a prefill carries stays in the cache, and each later step attends over it without
     it: the steps' logits on par with the full forward's from the float64 forward (check 1)."""
@@ -394,6 +407,7 @@ def test_a_cached_document_reads_its_own_context_without_it(cross):
     assert not np.array_equal(decoded(ids, context, named=False), decoded(ids, second, named=False))
 
 
+@attending("reference")
 @pytest.mark.usefixtures("scanned_stacks")
 def test_a_scanned_stack_runs_its_blocks_as_the_plain_one():
     """With a block on every layer the layers scan as one run, its blocks' leaves stacked, on par with
@@ -439,10 +453,12 @@ def test_cross_flops_count_the_blocks_over_the_context():
 
 
 @pytest.fixture(scope="module")
+@attending("reference")
 def source():
-    return Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
+    return Pretrained.load(LLAMA, dtype="float32")
 
 
+@attending("reference")
 def test_a_bundle_of_a_cross_attending_model_is_its_sources_carrying_it(source):
     """A bundle of a model that reads a context through cross-attention (`PretrainedDecoder.carrying`,
     which a run's load and a decision's release both build it through) is its source's, laid out as the
@@ -463,6 +479,7 @@ def test_a_bundle_of_a_cross_attending_model_is_its_sources_carrying_it(source):
         PretrainedDecoder.from_model(attached.model, attached.variables)
 
 
+@attending("reference")
 def test_the_blocks_train_beside_an_adapter_with_the_source_frozen(source, tmp_path):
     """Attached to a loaded source, the blocks train and the source stays frozen; attached beside a
     LoRA adapter in either order, the blocks and the factors train together. An objective over the
@@ -508,6 +525,7 @@ def test_the_blocks_train_beside_an_adapter_with_the_source_frozen(source, tmp_p
         np.testing.assert_array_equal(np.asarray(kept[path]), np.asarray(leaf), err_msg=path)
 
 
+@attending("reference")
 def test_a_run_of_a_cross_attending_media_model_loads_as_its_source_carrying_it(tmp_path):
     """A media model (the tiny multimodal Qwen3.5, a `MediaWrapper`) with cross-attention attached trains
     two steps on text, and its run loads back (`Pretrained.from_run`, `from_saved`'s wrapper arm) as its
@@ -515,8 +533,7 @@ def test_a_run_of_a_cross_attending_media_model_loads_as_its_source_carrying_it(
     its export, which no family's format holds, refused (ledger 4799)."""
     from dew.nn.protocols import MediaWrapper
 
-    media = Pretrained.load(ROOT / "tests" / "fixtures" / "hf" / "qwen35-tiny-mm", dtype="float32",
-                            attention_impl="reference")
+    media = Pretrained.load(ROOT / "tests" / "fixtures" / "hf" / "qwen35-tiny-mm", dtype="float32")
     cross = CrossAttention(layer_ids=(1,), context_length=3, context_features=8)
     attached = media.with_cross_attention(cross, key=0)
     rng = np.random.default_rng(1)
@@ -536,6 +553,7 @@ def test_a_run_of_a_cross_attending_media_model_loads_as_its_source_carrying_it(
         restored.export()
 
 
+@attending("reference")
 def test_the_blocks_train_beside_a_whole_source_where_it_is_not_frozen(source):
     """With `frozen=False` the blocks join an unsplit source's weights, which all train beside them, a
     full fine-tune: the source's leaves are its own, the blocks' gates zero, so the bundle computes
@@ -650,6 +668,7 @@ def test_a_served_request_reads_its_own_context(options):
     assert (hits, server.prefix_hits) == ((4, 4) if shares else (0, 0))
 
 
+@attending("reference")
 @pytest.mark.parametrize("options", [
     pytest.param({}, id="dense", marks=pytest.mark.check1_shards(seeds=512, per_task=128)),
     pytest.param({"cache": PagedKV(page_size=4, pages=40)}, id="paged",
@@ -778,11 +797,11 @@ def test_an_objective_with_prediction_depths_scores_and_counts_a_conditioned_bat
         objective.model_flops(None, {"text": media})
 
 
+@attending("reference")
 def test_the_blocks_attach_to_a_decoder_whose_own_feed_forward_they_do_not_run():
     """GPT OSS's feed-forward is its experts' clamped SwiGLU, which no dense block runs; its blocks
     run their own activation, attach and read a context."""
-    source = Pretrained.load(ROOT / "tests" / "fixtures" / "hf" / "gpt-oss-tiny", dtype="float32",
-                             attention_impl="reference")
+    source = Pretrained.load(ROOT / "tests" / "fixtures" / "hf" / "gpt-oss-tiny", dtype="float32")
     attached = source.with_cross_attention(CrossAttention((0,), context_length=2, context_features=4), key=0)
     conditioning = {CONTEXT: jnp.ones((1, 2, 4)), CONTEXT_LENGTHS: jnp.asarray([2], jnp.int32)}
     logits = attached.model.apply(thaw(attached.variables), jnp.asarray([[1, 2, 3]]),
@@ -813,11 +832,12 @@ def test_a_wider_context_enters_in_the_decoders_context_dtype():
     assert kept and all(leaf.dtype == np.float32 for leaf in kept)
 
 
+@attending("reference")
 def test_a_frozen_trunk_counts_the_weight_gradients_of_its_blocks_alone():
     """A source with blocks attached trains the blocks alone: its training count is a fully trained
     decoder's less every trunk and head matrix's weight gradient (`parameter_flops`, `logits_flops`),
     the blocks' three passes kept."""
-    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
+    source = Pretrained.load(LLAMA, dtype="float32")
     cross = CrossAttention(layer_ids=(1,), context_length=3, context_features=8)
     attached = source.with_cross_attention(cross, key=0)
     rng = np.random.default_rng(0)
@@ -831,11 +851,11 @@ def test_a_frozen_trunk_counts_the_weight_gradients_of_its_blocks_alone():
     assert trained.training_flops(None, batch) - frozen.training_flops(None, batch) == weights
 
 
+@attending("reference")
 def test_zero_gates_leave_a_pretrained_ngpt_decoder_bit_for_bit():
     """Blocks attached to a pretrained nGPT decoder (Dory, looped), their gates at zero, return its
     logits bit for bit over a context; drawn away from zero, the gates move them."""
-    dory = Pretrained.load(ROOT / "tests" / "fixtures" / "hf" / "dory-tiny", dtype="float32",
-                           attention_impl="reference")
+    dory = Pretrained.load(ROOT / "tests" / "fixtures" / "hf" / "dory-tiny", dtype="float32")
     width = dory.model.emb_features
     attached = dory.with_cross_attention(CrossAttention((0,), context_length=3, intermediate_size=32), key=0)
     rng = np.random.default_rng(6)
