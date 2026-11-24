@@ -287,4 +287,4 @@ def test_a_body_one_warps_role_runs_counts_that_warps_lanes_alone():
     launched = plgpu.kernel(kernel, out_type=_ROW, num_threads=1, thread_name="wg",
                             scratch_types=[plgpu.SMEM((128,), jnp.float32)])
     counted = emission.emitted(jax.make_jaxpr(launched)().jaxpr, 1, "wg").roles[0].fixed
-    assert counted == Work(operations=32, shared_bytes=2 * 4 * 32)
+    assert (counted.operations, counted.shared_bytes) == (32, 2 * 4 * 32)
