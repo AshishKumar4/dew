@@ -102,12 +102,14 @@ def test_a_ring_family_stages_plain_and_packed_outputs_side_by_side():
 
 
 def _packed_store(rows: int, columns: int, divisor: int, chunk: int, *, transposed: bool, first=0,
-                  stored=None, least: int | None = None, out_rows: int | None = None):
+                  stored=None, least: int | None = None, out_rows: int | None = None,
+                  out_columns: int | None = None):
     """A kernel staging a share of `rows` by `columns` tile columns, each its column's index plus a thousand
     times its row, through two buffers of `chunk` tile columns stored packed (`stores.staged_chunks`), its
     write keeping each `divisor`th column (a stand-in for a block's scale), transposed where asked, its
     share's rows `first` to `first + stored` (the share where None), copied in rungs of at least `least` rows
-    (the share's), into an output of `out_rows` rows (the share's)."""
+    (the share's), into an output of `out_rows` rows (the share's) and `out_columns` stored columns (the
+    tile's)."""
     packed_columns = chunk // divisor
     block = (packed_columns, rows) if transposed else (rows, packed_columns)
 
@@ -127,7 +129,8 @@ def _packed_store(rows: int, columns: int, divisor: int, chunk: int, *, transpos
         pl.run_scoped(scoped, plgpu.SMEM((2, *block), jnp.float32))
 
     total = rows if out_rows is None else out_rows
-    out = (columns // divisor, total) if transposed else (total, columns // divisor)
+    width = columns // divisor if out_columns is None else out_columns
+    out = (width, total) if transposed else (total, width)
     return plgpu.kernel(body, out_type=jax.ShapeDtypeStruct(out, jnp.float32),
                         interpret=plgpu.InterpretGPUParams())
 
@@ -182,3 +185,12 @@ def test_a_one_column_transposed_chunk_whose_last_share_passes_the_rows_end_is_r
     refused as it traces; over 16 rows each share ends at a row's end."""
     with on_the_host(), pytest.raises(ValueError):
         _packed_store(8, 32, 16, 16, transposed=True, out_rows=12)()
+
+
+@INTERPRETS
+def test_a_packed_chunk_copied_a_row_at_a_time_past_its_rows_end_is_refused():
+    """A packed row-major chunk of 32 fp32 (128 bytes, aligned) copied in rungs of one row is one contiguous
+    run a rung, which Mosaic GPU copies by a linear bulk copy clamped at the tensor's end: over 36 stored
+    columns its last chunk would run into the next row, so it is refused as it traces."""
+    with on_the_host(), pytest.raises(ValueError):
+        _packed_store(8, 128, 4, 128, transposed=False, least=1, out_columns=36)()
