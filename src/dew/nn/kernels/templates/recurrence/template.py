@@ -1141,7 +1141,7 @@ def _of(kernel: str, training: bool) -> bool:
 
 def _owner(kernel: str, names: Iterable[str]) -> str | None:
     """The launch of `names` that ran `kernel`: the longest it starts with, a name another launch's extends
-    (`recurrence_intra` beside `recurrence_intra_solve`) owning only its own."""
+    (`recurrence_intra` beside `recurrence_intra_own`) owning only its own."""
     return next((name for name in sorted(names, key=len, reverse=True) if kernel.startswith(name)), None)
 
 

@@ -36,7 +36,7 @@ from generation_support import COMPILES_ON_CPU
 from map_judge import sharded
 from reference_error import FEWEST_SEEDS, assert_as_exact, widened, with_gradients
 from test_recurrence_chunk import against_the_portable_math, chunk_on, oracle, token_by_token
-from test_recurrence_mosaic import REFUSED, refuses_its_gradient, taken, template_call
+from test_recurrence_mosaic import NARROW, REFUSED, refuses_its_gradient, taken, template_call
 from test_recurrence_stability import (
     GRADIENT_SEEDS,
     REGIMES,
@@ -464,3 +464,22 @@ def test_the_narrow_gated_delta_gradient_compiles_for_an_h100():
     from kernel_compile import mosaic_failures
 
     assert mosaic_failures(compiled_gradient(HOOKS, 'the narrow gated delta gradient')) == []
+
+
+def test_an_own_score_past_fp32s_range_reads_as_it_is():
+    """Under a decay a key dimension a token's own score past fp32's range is `+inf` in the output, as the
+    recurrence gives it, and every other entry is what its zero queries make it: one chunk of one head, unit
+    decays, the queries and keys zero but one channel of token 1's, `2^64` each, so the token's own score is
+    `2^128`; every write gate `2^-64` and value `2^64`, every corrected value one. The intra walk's read once
+    placed each sub-chunk's own scores on its diagonal by a product against a shifted identity, `+inf` times
+    the identity's zeros a NaN in token 1's column 0, which the causal mask keeps: its output was NaN."""
+    length, width = 64, 64
+    big = 2.0 ** 64
+    keys = jnp.zeros((1, length, 1, width), jnp.bfloat16).at[0, 1, 0, 0].set(big)
+    values = jnp.full((1, length, 1, width), big, jnp.bfloat16)
+    decay = jnp.zeros((1, length, 1, width), jnp.float32)
+    gates = jnp.full((1, length, 1), 2.0 ** -64, jnp.bfloat16)
+    out, final = template.mosaic_rule(keys, keys, values, decay, gates, tiles=NARROW, scale=1.0)
+    expected = jnp.zeros(out.shape, jnp.float32).at[0, 1].set(jnp.inf)
+    np.testing.assert_array_equal(np.asarray(out, np.float32), np.asarray(expected))
+    assert np.isfinite(np.asarray(final)).all()

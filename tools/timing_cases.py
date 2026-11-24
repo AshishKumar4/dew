@@ -49,9 +49,10 @@ another variant is refused (`model_flows.WrongProcess`). A lane's flow:
      "arms": [{"name": "every", "implementation": "every", "env": LANE},
               {"name": "without linear", "implementation": "without linear", "env": LANE}]}
 
-with LANE = {"XLA_FLAGS": "--xla_gpu_deterministic_ops=true --xla_gpu_autotune_level=0",
-"JAX_DEFAULT_MATMUL_PRECISION": "highest"}; a user's flow's arms take {"XLA_FLAGS":
-"--xla_gpu_deterministic_ops=false --xla_gpu_autotune_level=0"}.
+with LANE = {"XLA_FLAGS": f"--xla_gpu_deterministic_ops=true {TRITON} --xla_gpu_autotune_level=0",
+"JAX_DEFAULT_MATMUL_PRECISION": "highest"}, TRITON tests/lane_environment.py's DETERMINISTIC_TRITON (the
+lane's Triton GEMMs as upstream XLA keeps them under deterministic ops); a user's flow's arms take
+{"XLA_FLAGS": "--xla_gpu_deterministic_ops=false --xla_gpu_autotune_level=0"}.
 """
 import atexit
 import contextlib

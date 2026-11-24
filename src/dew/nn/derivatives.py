@@ -43,6 +43,7 @@ from jax.extend import core as jax_core
 from jax.extend.core import create_call_primitive
 
 from dew import _cache
+from dew._facts import Held
 from dew.nn import programs
 
 if TYPE_CHECKING:
@@ -483,7 +484,7 @@ class _Spans:
     them)."""
 
     def __init__(self) -> None:
-        self.held: collections.OrderedDict[Hashable, tuple[_HeldSpan | None, dict]] = (
+        self.held: collections.OrderedDict[Hashable, Held[_HeldSpan | None]] = (
             collections.OrderedDict())
 
     def cache_clear(self) -> None:
@@ -523,7 +524,7 @@ def _holdable(closed) -> bool:
 def _traced_span(key: Hashable | None, trace: Callable, returned: dict) -> tuple:
     """A marked span's program, its outputs' structure and its known zeros (`returned`, which `trace()` fills
     as it traces): held at `key` (`_SPANS`) with the facts its trace read while each answers alike, those
-    read again wherever it is taken (`generation.held_trace`, as every held trace of Dew's), its trace's
+    read again wherever it is taken (`_cache.holding`, as every held trace of Dew's), its trace's
     routes and launches reported again there (`Recorded.replay`: a held SwiGLU span's route and Pallas launch
     reach the kernel report and the tuner, row 11002); traced afresh, as it is, where no key holds it
     (`_span_key`), and recorded afresh at each call where its program may not be held (`_holdable`, held as
@@ -535,7 +536,6 @@ def _traced_span(key: Hashable | None, trace: Callable, returned: dict) -> tuple
         closed = trace()
         return closed, returned["structure"], returned["zeros"]
     from dew.algebra.fusion import recorded
-    from dew.nn.kernels import generation
 
     fresh: dict[str, _HeldSpan] = {}
 
@@ -545,7 +545,7 @@ def _traced_span(key: Hashable | None, trace: Callable, returned: dict) -> tuple
         # A program that may not be held is kept as none (`_holdable`), so no later call takes it.
         return fresh["traced"] if _holdable(closed) else None
 
-    entry = generation.held_trace(_SPANS.held, key, made, SPANS_HELD)
+    entry = _cache.holding(_SPANS.held, key, made, SPANS_HELD)
     # A trace made here is this call's, held or not; a held one taken is its first trace's. One held as none
     # is recorded again as its first was: traced as it is, in this trace's collections, a jitted function
     # within it called before is JAX's held trace, which reports its routes no more (row 12094).

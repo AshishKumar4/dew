@@ -32,7 +32,8 @@ from dew._cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.batch import Variables, merge, part, sows_appended
 from dew.mesh import STAGE_AXIS, LayoutRefused, row_axes
 from dew.nn.inspection import QK
-from dew.nn.protocols import StagedStacks
+from dew.nn.protocols import StagedStacks, fixed_remat
+from dew.quantization import held_scales, holds_quantized
 
 from .. import in_backward
 from ..cross_pass import CrossPass
@@ -499,8 +500,9 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
             # a whole-bank device accumulator. Remat retains the original
             # host operand and refetches only this layer in backward
             # (MaxText layers/decoders.py:544-565).
-            step = nn.remat(nn.map_variables(
-                step, mapped_collections=True, trans_in_fn=fetched, init=False, mutable=True))
+            # Its policy no rung's: the whole layer recomputed in the backward (`fixed_remat`).
+            step = nn.remat(fixed_remat(nn.map_variables(
+                step, mapped_collections=True, trans_in_fn=fetched, init=False, mutable=True)))
         if count == 1:
             x, written = step(run, x, None if inputs is None else inputs.layer(0), store)
             if store is not None:
@@ -520,11 +522,14 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
             # scans its stacked layers.
             rows = tuple(run.variables.get(LAYER_ROWS, {}))
             repeats = count // len(run.specs) if periodic else count
+            # A served quantized run's scales read as the unrolled stack reads them (`held_scales`).
+            quantized = (not run.is_mutable_collection('params')
+                         and holds_quantized(run.variables.get('params', {})))
 
             policy = _rows_recomputed(remat)
 
             def scanned(layer, carry, index, *, store=store, step=step, rows=rows, inputs=inputs,
-                        policy=policy):
+                        policy=policy, quantized=quantized):
                 # The iteration's per-layer input, its layers along axis 2.
                 per_layer_input = jax.tree.map(
                     lambda leaf: jax.lax.dynamic_index_in_dim(leaf, index, axis=2, keepdims=False), inputs)
@@ -532,6 +537,10 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
                 def layered(layer, carry):
                     return step(layer, carry, per_layer_input, store)[0]
 
+                if quantized:
+                    # Its layer's params, sliced from the stacked rows: each scale held there alone.
+                    layered = nn.map_variables(layered, 'params', init=False, mutable=False,
+                                               trans_in_fn=held_scales)
                 if not rows:
                     return layered(layer, carry), None
 
@@ -539,7 +548,11 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
                     return nn.map_variables(layered, (LAYER_ROWS, *rows), init=False, mutable=False,
                                             trans_in_fn=functools.partial(_rows_joined, index=index))(
                         layer, carry)
-                return nn.remat(read, policy=policy, prevent_cse=False)(layer, carry, index), None
+                # Under no scope of its own: the rows' policy keeps what a rung keeps by its names, every
+                # product besides under none or one recomputing named residuals (`_rows_recomputed`), each
+                # value a rung's to keep or drop as a block's; the rows it read it never keeps.
+                rematted = nn.remat(read, policy=policy, prevent_cse=False)
+                return rematted(layer, carry, index), None
             # A parameter its module boxed (`nn.with_logical_partitioning`) stacks with an unnamed layer
             # axis, which the run's view cuts off again per layer (`_rows`). A decode step's rows it
             # broadcasts exist before the scan and it outputs nothing broadcast, so flax's trace of its body
@@ -609,7 +622,7 @@ def _updated_in_backward(run: nn.Module, x, *, attention_metadata, remat: RematP
                            kv_store=None, per_layer_input=None, attention_metadata=metadata, rngs=rngs)
 
     layer = applied if remat is not None and not remat.recompute else jax.checkpoint(
-        applied, policy=_KEPT_WITHOUT_A_RUNG.checkpoint_policy(), prevent_cse=False)
+        fixed_remat(applied), policy=_KEPT_WITHOUT_A_RUNG.checkpoint_policy(), prevent_cse=False)
 
     return in_backward.scanned_run(
         (*current_component(), *run.path), layer, weights, held.get(in_backward.MASTERS),

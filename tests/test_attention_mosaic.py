@@ -102,7 +102,13 @@ and `FED`'s fed consumers and its shared keys, which an A100's mma.sync, one war
 HOOKED_FORMS = ("default", "accurate")
 """The forms every hooked call takes: its fast form's one launch takes a hook of no parameters, an initial
 state or a draw alone."""
-
+WALKED_CASES = ("full", "causal", "causal-window", "documents", "cross-causal-lengths-starts", "block-causal",
+                "valid", "widest-window", "runs", "runs-documents-valid")
+"""The call forms a one-launch walk (`WGMMA_FORMS`) is checked over: one of each mechanism its block map and
+masks meet (`attention.block_map`, `algebra.seen`), whole tiles, causality's diagonal, a window's band,
+documents' ids, another sequence's documents aligned with key lengths and starts, block groups, key validity
+and its empty rows, a window at int32's largest, and runs alone and beside documents and validity; every
+other call form combines them, each checked on an H100's two launches' walks and its accurate form's."""
 
 FORM_WIDTHS = {"fused-keys-first": 64, "fused-shared-keys": 128}
 """The head width a backward form takes where the checks' own (128, a call form's 64) is not one it holds:
@@ -185,9 +191,11 @@ of one family's mechanism (a TPU core's, an H100's three consumers or pinned lay
 an fp32 call's bf16 parts, which an A100's pipeline loads in no pieces, row 4475) names its GPU itself."""
 
 
-def on_each_family_for(names: str | tuple[str, ...], values, ids=None) -> pytest.MarkDecorator:
+def on_each_family_for(names: str | tuple[str, ...], values, ids=None, *,
+                       mechanisms_elsewhere: str | None = None) -> pytest.MarkDecorator:
     """`ON_EACH_FAMILY` crossed with `values` of the parameters `names`, one of them `form`: the cells each
-    GPU's family takes, a backward form of an H100's layouts alone (`WGMMA_FORMS`) on its family alone."""
+    GPU's family takes, an H100's layouts' backward forms (`WGMMA_FORMS`) on its family alone, another's one
+    mechanism's call forms alone (`WALKED_CASES`) of the parameter `mechanisms_elsewhere`."""
     names = (names,) if isinstance(names, str) else tuple(names)
     values = list(values)
     if callable(ids):
@@ -197,8 +205,10 @@ def on_each_family_for(names: str | tuple[str, ...], values, ids=None) -> pytest
     at = names.index("form")
     cells = [(generation_name, *(value if len(names) > 1 else (value,)), f"{generation_name}-{label}")
              for generation_name in INTERPRETED_ON for value, label in zip(values, labels, strict=True)
-             if INTERPRETED_ON[generation_name] == WGMMA
-             or (value[at] if len(names) > 1 else value) not in WGMMA_FORMS]
+             if (INTERPRETED_ON[generation_name] == WGMMA
+                 or (value[at] if len(names) > 1 else value) not in WGMMA_FORMS)
+             and (mechanisms_elsewhere is None or INTERPRETED_ON[generation_name] == WGMMA
+                  or (value[names.index(mechanisms_elsewhere)] if len(names) > 1 else value) in WALKED_CASES)]
     return pytest.mark.parametrize(("interpreted_on", *names), [cell[:-1] for cell in cells],
                                    ids=[cell[-1] for cell in cells], indirect=["interpreted_on"])
 
@@ -744,7 +754,7 @@ def test_the_natural_forward_is_on_par_interpreted(call, dtype):
 
 
 @INTERPRETS
-@on_each_family_for("form", CASES)
+@on_each_family_for("form", CASES, mechanisms_elsewhere="form")
 def test_the_forward_is_on_par_over_every_call_form_interpreted(form):
     """The forward over each of the template core's call forms under the interpreter."""
     _check_call_form(form, interpret=True)
@@ -1692,16 +1702,6 @@ def test_a_hook_shaped_to_the_launchs_tile_is_taken():
                     seeds=SEEDS)
 
 
-WALKED_CASES = ("full", "causal", "causal-window", "documents", "cross-causal-lengths-starts", "block-causal",
-                "valid", "widest-window", "runs", "runs-documents-valid")
-"""The call forms a one-launch walk (`WGMMA_FORMS`) is checked over: one of each mechanism its block map and
-masks meet (`attention.block_map`, `algebra.seen`), whole tiles, causality's diagonal, a window's band,
-documents' ids, another sequence's documents aligned with key lengths and starts, block groups, key validity
-and its empty rows, a window at int32's largest, and runs alone and beside documents and validity. Every
-other call form combines these mechanisms, each checked on the two launches' walks and the accurate form's,
-which every call form runs on (`test_the_backward_is_on_par_over_every_call_form_interpreted`)."""
-
-
 def _walked(cases, forms) -> list[tuple[str, str]]:
     """Each `(case, form)` of `cases` and `forms` a backward check takes: every case on a form of two launches
     or the accurate form's, the `WALKED_CASES` on a one-launch walk."""
@@ -1710,7 +1710,7 @@ def _walked(cases, forms) -> list[tuple[str, str]]:
 
 
 @INTERPRETS
-@on_each_family_for(("case", "form"), _walked(CASES, BACKWARD_FORMS), ids=str)
+@on_each_family_for(("case", "form"), _walked(CASES, BACKWARD_FORMS), ids=str, mechanisms_elsewhere="case")
 def test_the_backward_is_on_par_over_every_call_form_interpreted(case, form):
     """The backward over the template core's call forms under the interpreter: every call form in the fast
     form's two launches and in the accurate form, the call forms of `WALKED_CASES` on each one-launch walk."""
@@ -1746,7 +1746,8 @@ def test_a_block_selected_call_holds_check_1_walking_its_selected_tiles_interpre
 
 
 @INTERPRETS
-@on_each_family_for(("case", "form"), _walked(RUN_CASES, ["forward", *BACKWARD_FORMS]), ids=str)
+@on_each_family_for(("case", "form"), _walked(RUN_CASES, ["forward", *BACKWARD_FORMS]), ids=str,
+                    mechanisms_elsewhere="case")
 def test_a_call_over_runs_is_on_par_interpreted(case, form):
     """A decision row's runs (`test_attention_template.RUN_CASES`), several key intervals a query, under the
     interpreter: each block walks its runs' envelope (`attention.block_map`), each tile masked by the union

@@ -628,7 +628,7 @@ def _merged(call: Call) -> Operand:
 
 
 def solve_persistent(call: Call) -> bool:
-    """Whether a doubling solve (`_solved`, `intra._intra_solve`) runs persistent: false on `mma.sync` with
+    """Whether the doubling solve (`_solved`) runs persistent: false on `mma.sync` with
     fp32-range merges, where the persistent loop's divmod registers push TF32 solves over 255 (row 9637)."""
     return not (call.family.operands_in_registers and _merged(call).dtype == jnp.float32)
 
@@ -1164,8 +1164,8 @@ def _persisted(family: mosaic.Family, streams, given, live, arrays, grid: tuple,
 
 
 def widest_layout(call: Call) -> mosaic.Family:
-    """The bundle a launch whose walk waits on its own latency issues by, the solve's (`_solved`,
-    `intra._intra_solve`) and the own pairs' (`own_pairs.intra_own`): of the layouts the call's device takes
+    """The bundle a launch whose walk waits on its own latency issues by, the solve's (`_solved`) and
+    the own pairs' (`own_pairs.intra_own`): of the layouts the call's device takes
     (`bundles.layouts`), the first whose programs a multiprocessor holds most (`Family.programs`, a consumer
     role's), the call's own where none holds more. The solve's persistent programs walk a chunk at a time on
     their products' latency, one a multiprocessor beside a producer leaving its tensor cores idle: on an H100

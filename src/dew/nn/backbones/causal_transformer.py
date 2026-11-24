@@ -76,7 +76,7 @@ from ..ngpt import NGPT
 from ..norms import NormSite
 from ..precision import at_least_fp32, float32_dot_general, l2norm
 from ..progress import Progress
-from ..protocols import EXITS, ExitPasses, OutputTable, ProjectionGroup, declared_groups
+from ..protocols import EXITS, ExitPasses, OutputTable, ProjectionGroup, RecomputeStatement, declared_groups
 from ..rope import Scaling
 from ..sharding import RESIDUAL, constrain
 from ..value_experts import ValueExperts
@@ -1805,6 +1805,11 @@ class CausalTransformer(LinearProducts):
         """At the ladder's top, the decoder that keeps what 'minimal' saves in pinned host memory, else None
         (`decoder_recompute.offloaded`)."""
         return decoder_recompute.offloaded(self)
+
+    @nn.nowrap
+    def recompute_statement(self) -> RecomputeStatement:
+        """What this decoder's rung recomputes (`decoder_recompute.statement`)."""
+        return decoder_recompute.statement(self)
 
     @nn.nowrap
     def marked_residuals(self) -> frozenset[str]:

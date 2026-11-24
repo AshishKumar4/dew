@@ -326,7 +326,6 @@ def _launch_for_block(units: windows.Units, padded: jax.ShapeDtypeStruct, stacke
 
     passes = 3 * chunks
     padded_item, stacked_item = padded.dtype.itemsize, stacked.dtype.itemsize
-    chunk_size = windows.chunk_width(total_slices)
     init_reads = int(has_initial)
     output_bytes = sum(
         rows * (width if kind is Kind.OUTPUT else blocks) * spec.dtype.itemsize
@@ -335,10 +334,9 @@ def _launch_for_block(units: windows.Units, padded: jax.ShapeDtypeStruct, stacke
         row_work = (_role_work(block_roles[0]) + emission.repeated(_role_work(block_roles[1]), blocks - 1)
                     if blocks > 1 else _role_work(block_roles[0]))
         emitted_total = emission.repeated(row_work, rows)
-        slice_load = (block_roles[0].walks[0].device_bytes / chunk_size
-                      if block_roles[0].walks
-                      else (min(width, read_width) / blocks) * padded_item + 2 * stacked_item)
-        load_bytes = blocks * 3 * slices * slice_load
+        # Every block's valid columns of each slice (each block's own, `merged_mosaic._columns`), and its
+        # maxima and totals.
+        load_bytes = 3 * slices * (min(width, read_width) * padded_item + blocks * 2 * stacked_item)
         single_writer = blocks == 1 or block_roles[0].fixed.device_bytes > block_roles[1].fixed.device_bytes
         stats_writers = 0 if out_dtype is not None else (1 if single_writer else blocks)
         out_item = padded_item if out_dtype is None else jnp.dtype(out_dtype).itemsize

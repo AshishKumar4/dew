@@ -15,8 +15,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import after_walk, emission, handoffs, persistent, resources, stores, swizzling
-from dew.nn.kernels.templates.cost import Stated, Work
+from dew.nn.kernels.templates import after_walk, handoffs, persistent, resources, stores, swizzling
+from dew.nn.kernels.templates.cost import Stated
 from dew.nn.kernels.templates.mosaic import (
     Family,
     Loop,
@@ -49,7 +49,6 @@ if TYPE_CHECKING:
     from dew.nn.kernels.templates.fed import Feed
 
 
-@emission.stating(lambda: Work())
 def _fenced(ctx) -> None:
     """An inline body (`plgpu.inline_mgpu`) ordering the thread's global writes the async proxy made (TMA's)
     before its generic loads (PTX's `fence.proxy.async.global`); it returns nothing, an inline body's

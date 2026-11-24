@@ -18,9 +18,9 @@ import jax
 import jax.numpy as jnp
 
 from dew._cache import unintercepted
+from dew._facts import traced_fact
 from dew.nn.derivatives import KernelGlue, contracted, declared_derivative, with_gradients_formed
 from dew.nn.kernels import tuning
-from dew.nn.kernels.generation import traced_fact
 from dew.nn.kernels.templates import attention_route
 from dew.nn.kernels.templates.attention import Hooks, KeySpans, Kind, Param, dense, score_modded
 from dew.nn.precision import float32_einsum, products_quantized
