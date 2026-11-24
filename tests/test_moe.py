@@ -612,3 +612,46 @@ def test_a_layers_paired_and_scaled_expert_products_are_one_launch_as_exact_as_a
     _, apart = moe.paired_projections(moe.Gathered(x, rows, where, scales), moe.Layered(gate, jnp.asarray(0)),
                                       moe.Layered(up, jnp.asarray(1)), sizes, jnp.bfloat16, "xla", None)
     np.testing.assert_array_equal(np.asarray(apart), np.asarray(plain(x, gate, up, scales)[1]))
+
+
+def test_a_gated_expert_layers_activation_runs_in_its_paired_products_epilogue_bitwise_apart():
+    """A gated expert layer's gate and up projections and their gated product are one paired product, the
+    product's epilogue (`moe.gated_projections`, row 1376): one grouped call taking both stacks, an epilogue,
+    and the gate's and up's roundings under the names a remat policy reads (`GATE_PROJ`, `UP_PROJ`), which
+    its backward reads where kept instead of computing the pair again; its output and every gradient, the
+    rows' and each kernel's, bitwise the products apart with the activation between them."""
+    from reference_error import equations, with_gradients
+
+    from dew.nn import moe
+    from dew.nn.kernels import grouped_matmul
+    from dew.nn.residuals import Residual
+
+    tokens, experts, depth, width = 24, 3, 32, 48
+    x = jax.random.normal(jax.random.key(0), (tokens, depth), jnp.bfloat16)
+    gate, up = (jax.random.normal(jax.random.key(seed), (experts, depth, width), jnp.bfloat16) / 4
+                for seed in (1, 2))
+    sizes = jnp.asarray([10, 6, 8], jnp.int32)
+    activation = moe.gated_product("swiglu")
+
+    def fused(x, gate, up):
+        return moe.gated_projections(x, gate, up, sizes, jnp.bfloat16, "auto", None, activation)
+
+    def apart(x, gate, up):
+        return activation(*moe.paired_projections(x, gate, up, sizes, jnp.bfloat16, "auto", None))
+
+    with grouped_matmul.weighed() as calls:
+        jax.eval_shape(fused, x, gate, up)
+    bound = [next(iter(call.bound.values()))[1].arguments for call, _ in calls]
+    assert len(bound) == 1, len(bound)
+    (arguments,) = bound
+    assert arguments["paired"] is not None and arguments["hooks"].epilogue is not None
+    # The gate's and up's roundings, the product's outputs under the names a remat policy reads.
+    graph = jax.make_jaxpr(fused)(x, gate, up)
+    names = {str(equation.params["name"]) for equation in equations(graph)
+             if equation.primitive.name == "name"}
+    assert {str(Residual.GATE_PROJ), str(Residual.UP_PROJ)} <= names, names
+    cotangent = jax.random.normal(jax.random.key(3), (tokens, width), jnp.bfloat16)
+    ran = [jax.jit(with_gradients(form))(x, gate, up, cotangent) for form in (fused, apart)]
+    for mine, theirs in zip(*(jax.tree.leaves(each) for each in ran), strict=True):
+        held = np.asarray(mine), np.asarray(theirs)
+        np.testing.assert_array_equal(*(each.view(np.uint16) for each in held))

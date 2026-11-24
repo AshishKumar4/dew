@@ -789,6 +789,53 @@ def paired_projections(x: jax.Array | Gathered, first: jax.Array | Layered, seco
     the same index: `ExpertMLP`'s kernels, `_one_layer`) pair at it, read in place, and stacks read at two
     indices each at its own. `Gathered` rows are read and scaled where they lie, as `expert_projection`
     reads them."""
+    compute, paired = _paired(x, first, second, dtype)
+    if paired is None:
+        return (expert_projection(x, first, group_sizes, compute, implementation, precision),
+                expert_projection(x, second, group_sizes, compute, implementation, precision))
+    tokens, rows, prologue, first_stack, second_stack, layer = paired
+    with _named(implementation):
+        gate, up = gemm.gemm(tokens, first_stack, group_sizes, compute=compute, out_dtype=compute,
+                             out_dtypes=(compute, compute), precision=precision, paired=second_stack,
+                             layer=layer, gather=rows, **prologue)
+    return gate, up
+
+
+def gated_projections(x: jax.Array | Gathered, first: jax.Array | Layered, second: jax.Array | Layered,
+                      group_sizes: jax.Array, dtype: Dtype | None, implementation: str,
+                      precision: PrecisionLike, activation: Callable) -> jax.Array:
+    """`activation(gate, up)` of `paired_projections`' two products, each named as a remat policy reads it
+    (`Residual.GATE_PROJ`, `Residual.UP_PROJ`): in the paired product's epilogue where the pair runs as one
+    (`gemm.gemm`'s `epilogue`), each accumulator read through its rounding alone, which the product returns
+    under its name, so its backward reads the kept roundings and never recomputes the pair (row 1376); apart
+    elsewhere, as `paired_projections` takes them. Either way the activation of the rounded gate and up,
+    rounded once, as before. `activation` is elementwise on two arrays of the compute dtype."""
+    compute, paired = _paired(x, first, second, dtype)
+    if paired is None:
+        gate, up = paired_projections(x, first, second, group_sizes, dtype, implementation, precision)
+        return activation(checkpoint_name(gate, Residual.GATE_PROJ), checkpoint_name(up, Residual.UP_PROJ))
+    tokens, rows, prologue, first_stack, second_stack, layer = paired
+
+    def fused(gate_sums, up_sums):
+        gate_rows, up_rows = gate_sums.astype(compute), up_sums.astype(compute)
+        return activation(gate_rows, up_rows).astype(compute), gate_rows, up_rows
+
+    with _named(implementation):
+        hidden, _, _ = gemm.gemm(tokens, first_stack, group_sizes, compute=compute,
+                                 out_dtypes=(compute, compute, compute), precision=precision,
+                                 paired=second_stack, layer=layer, gather=rows, epilogue=fused,
+                                 named=(None, Residual.GATE_PROJ, Residual.UP_PROJ), **prologue)
+    return hidden
+
+
+def _paired(x: jax.Array | Gathered, first: jax.Array | Layered, second: jax.Array | Layered,
+            dtype: Dtype | None) -> tuple[Dtype, tuple | None]:
+    """The compute dtype of a paired product of `first` and `second` over `x` (`paired_projections`: the
+    rows' and both matrices' however a matrix is held), and what the product takes: the template's tokens,
+    the rows it gathers and its prologue (`_streamed`), both stacks and the layer read; None where the two
+    run apart: matrices of two layer indices (or a stack's layer beside a matrix), a
+    packed bank (its product the NVFP4 one, which pairs with none), or a run's low-precision recipe that
+    takes the experts (`recipe_refusal`); experts the recipe leaves pair as without one."""
     (first_stack, layer), (second_stack, second_layer) = (
         (kernel.stack, kernel.layer) if isinstance(kernel, Layered) else (kernel, None)
         for kernel in (first, second))
@@ -796,18 +843,9 @@ def paired_projections(x: jax.Array | Gathered, first: jax.Array | Layered, seco
                                  _held(second_stack), dtype=dtype)
     if (layer is not second_layer or isinstance(first_stack, formats.NvFp4)
             or isinstance(second_stack, formats.NvFp4) or _recipe_takes_experts(first_stack)):
-        # Matrices of two layer indices (or a stack's layer beside a matrix), a packed bank (its product the
-        # NVFP4 one, which pairs with none), or a run's low-precision recipe that takes the experts
-        # (`recipe_refusal`), take each product apart (`expert_projection`); experts the recipe leaves pair as
-        # without one.
-        return (expert_projection(x, first, group_sizes, compute, implementation, precision),
-                expert_projection(x, second, group_sizes, compute, implementation, precision))
+        return compute, None
     tokens, rows, prologue = _streamed(x, compute)
-    with _named(implementation):
-        gate, up = gemm.gemm(tokens, first_stack, group_sizes, compute=compute, out_dtype=compute,
-                             out_dtypes=(compute, compute), precision=precision, paired=second_stack,
-                             layer=layer, gather=rows, **prologue)
-    return gate, up
+    return compute, (tokens, rows, prologue, first_stack, second_stack, layer)
 
 
 def _one_layer(kernels: tuple) -> tuple:
@@ -1371,12 +1409,13 @@ class ExpertMLP(nn.Module):
             up = checkpoint_name(linear(tokens, kernels[0]), Residual.UP_PROJ)
             hidden = relu2(up)
             return checkpoint_name(linear(hidden, kernels[1], slots), Residual.DOWN_PROJ)
-        # The gate and up projections read the same rows: one paired product (`paired_projections`).
-        gate, up = paired_projections(tokens, kernels[0], kernels[1], sizes, dtype, self.implementation,
-                                      self.precision)
-        gate, up = checkpoint_name(gate, Residual.GATE_PROJ), checkpoint_name(up, Residual.UP_PROJ)
-        gate, up = swiglu_clamped(gate, up, self.swiglu_limit)
-        hidden = gated_product(self.activation)(gate, up)
+        # The gate and up projections read the same rows: one paired product, their gated product its
+        # epilogue (`gated_projections`).
+        def activated(gate, up):
+            return gated_product(self.activation)(*swiglu_clamped(gate, up, self.swiglu_limit))
+
+        hidden = gated_projections(tokens, kernels[0], kernels[1], sizes, dtype, self.implementation,
+                                   self.precision, activated)
         return checkpoint_name(linear(hidden, kernels[2], slots), Residual.DOWN_PROJ)
 
     def _combine(self, slots: jax.Array, weights: jax.Array) -> jax.Array:
