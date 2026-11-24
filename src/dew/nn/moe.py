@@ -821,7 +821,7 @@ def gated_projections(x: jax.Array | Gathered, first: jax.Array | Layered, secon
         return activation(gate_rows, up_rows).astype(compute), gate_rows, up_rows
 
     with _named(implementation):
-        hidden, _, _ = gemm.gemm(tokens, first_stack, group_sizes, compute=compute,
+        hidden, _, _ = gemm.gemm(tokens, first_stack, group_sizes, compute=compute, out_dtype=compute,
                                  out_dtypes=(compute, compute, compute), precision=precision,
                                  paired=second_stack, layer=layer, gather=rows, epilogue=fused,
                                  named=(None, Residual.GATE_PROJ, Residual.UP_PROJ), **prologue)
