@@ -1304,7 +1304,7 @@ def _blockwise_fp8(lhs, kernel, group_sizes, row_scales, column_scales, *, dtype
     launch = grouped_matmul.MosaicStepScaledGmm()
     per = kernel.shape[1] // column_scales.shape[-1]
     # Its outputs' forms, refused as every route's where no several outputs state them (`forms_of`).
-    out_forms = quantized.forms_of(out_forms, len(dtypes)) or None
+    out_forms = quantized.forms_of(out_forms, dtypes) or None
     several = epilogue is not None
     hooks = NO_HOOKS if not several else Hooks(
         epilogue=epilogue, epilogue_axes=(LAUNCH_AXES['epilogue'],) * len(sides),
@@ -1487,7 +1487,7 @@ def _block_scaled(lhs, matrices, group_blocks: jax.Array, op: selection.Op, inte
 
     launch = grouped_matmul.MosaicMxGmm()
     tables = (() if gather is None else (gather,))
-    out_forms = quantized.forms_of(out_forms, len(dtypes)) or None
+    out_forms = quantized.forms_of(out_forms, dtypes) or None
     hooks = NO_HOOKS if epilogue is None else Hooks(
         epilogue=epilogue, epilogue_axes=side_axes, out_dtypes=tuple(dtype.name for dtype in dtypes),
         out_forms=out_forms)

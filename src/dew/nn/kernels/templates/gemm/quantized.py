@@ -252,18 +252,23 @@ class Form(NamedTuple):
     packed: bool = False
 
 
-def forms_of(out_forms: tuple | None, count: int) -> tuple:
-    """Each of a call's `count` outputs' form (`Hooks.out_forms`, each a `Form` or its fields' tuple): None
-    for a tile of its own; none stated, every output a tile. A packed form is two codes a byte, row-major."""
+def forms_of(out_forms: tuple | None, dtypes: tuple) -> tuple:
+    """Each of a call's outputs' form (`Hooks.out_forms`, each a `Form` or its fields' tuple), the outputs'
+    `dtypes` its several outputs' (`out_dtypes`): None for a tile of its own; none stated, every output a
+    tile. A packed form is two codes a byte, row-major, stored uint8 (its every route's: `_pairs`), the one
+    boundary each route's selection reads."""
     if not out_forms:
         return ()
-    if count < 2:
+    if len(dtypes) < 2:
         raise ValueError("output forms are a several-output call's (`out_dtypes`)")
-    if len(out_forms) != count:
-        raise ValueError(f"{len(out_forms)} output forms for {count} outputs")
+    if len(out_forms) != len(dtypes):
+        raise ValueError(f"{len(out_forms)} output forms for {len(dtypes)} outputs")
     forms = _formed(out_forms)
-    if any(form is not None and form.packed and (form.divisor != 2 or form.transposed) for form in forms):
-        raise ValueError("a packed output is two 4-bit codes a byte, row-major")
+    for form, dtype in zip(forms, dtypes, strict=True):
+        if form is not None and form.packed and (form.divisor != 2 or form.transposed
+                                                 or jnp.dtype(dtype) != jnp.dtype(jnp.uint8)):
+            raise ValueError(f"a packed output is two 4-bit codes a byte, row-major, uint8, not {form} in "
+                             f"{jnp.dtype(dtype)}")
     return forms
 
 
@@ -422,7 +427,7 @@ def typed_outputs(dtypes: tuple, out_forms: tuple | None, config, *, dense: bool
     """A `gmm` call's outputs' dtypes and forms (`forms_of`), refused where its tile stores none of them
     (`forms_refusal`): a direct call's as a launch's planning refuses it."""
     typed = tuple(jnp.dtype(dtype) for dtype in dtypes)
-    forms = forms_of(out_forms, len(typed))
+    forms = forms_of(out_forms, typed)
     if (refusal := forms_refusal(forms, config, dense=dense)) is not None:
         raise ValueError(f"{config}: {refusal}")
     return typed, forms

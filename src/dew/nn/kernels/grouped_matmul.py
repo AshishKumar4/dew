@@ -622,7 +622,7 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
         stored = _stored_dtypes(ba)
         if not self._granular(ba, config, family, target) or config.staging_refusal(
                 quantized.outputs((config.share, pricing.tile_columns(config, family)), stored,
-                                  quantized.forms_of(hooks.out_forms, len(stored))),
+                                  quantized.forms_of(hooks.out_forms, stored)),
                 family.specialized(config.share, pricing.tile_columns(config, family))) is not None:
             return False
         if hooks.out_forms and (not self.STORES_FORMS or quantized.forms_refusal(
@@ -837,7 +837,7 @@ class MosaicGmm(_Mosaic):
             epilogue_axes=hooks.epilogue_axes,
             epilogue_dtypes=tuple(side.dtype for side in ba.arguments.get('epilogue_operands', ())),
             dtypes=_stored_dtypes(ba),
-            forms=quantized.forms_of(hooks.out_forms, len(_stored_dtypes(ba))),
+            forms=quantized.forms_of(hooks.out_forms, _stored_dtypes(ba)),
             paired=ba.arguments.get('paired') is not None, step_scaled=self.STEP_SCALED,
             block_scaled=self.BLOCK_SCALED, gathered=ba.arguments.get('gather') is not None,
             interpret=bool(ba.arguments['interpret']), joined=ba.arguments.get('joined') is not None)

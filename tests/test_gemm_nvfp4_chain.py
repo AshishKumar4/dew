@@ -168,7 +168,8 @@ def test_nvfp4_codes_stored_two_a_byte_read_back_as_their_float4_codes():
     """An epilogue's E2M1 codes stored packed (`quantized.Form`'s `packed`, XLA's form of its store) are
     the float4 codes `NvFp4Block.quantized` forms at the same tensor scale, read back as stored
     (`NvFp4Block.packed`): two a byte, `[rows, columns / 2]`, the even column's in the low nibble, as XLA
-    packs float4 (row 12743); a packed form transposed or of other than two codes a byte is refused."""
+    packs float4 (row 12743); a packed form transposed, of other than two codes a byte or declared other than
+    uint8 is refused, the last at a public product's call before its route is chosen."""
     x = jnp.asarray(np.random.default_rng(12743).normal(size=(64, 128)), jnp.float32)
     scale = jnp.float32(2.0 ** -7)
     want = formats.NvFp4Block.quantized(x, scale)
@@ -177,9 +178,17 @@ def test_nvfp4_codes_stored_two_a_byte_read_back_as_their_float4_codes():
     assert stored.shape == (64, 64) and stored.dtype == jnp.uint8
     got = formats.NvFp4Block.packed(stored, want.scales, scale)
     np.testing.assert_array_equal(np.asarray(got.codes).view(np.uint8), np.asarray(want.codes).view(np.uint8))
-    for refused in (quantized.Form(2, transposed=True, packed=True), quantized.Form(4, packed=True)):
+    for refused, dtype in ((quantized.Form(2, transposed=True, packed=True), jnp.uint8),
+                           (quantized.Form(4, packed=True), jnp.uint8),
+                           (quantized.Form(2, packed=True), jnp.int16)):
         with pytest.raises(ValueError):
-            quantized.forms_of((None, refused), 2)
+            quantized.forms_of((None, refused), (jnp.bfloat16, dtype))
+    # A packed output declared other than uint8 is refused before any route is chosen.
+    blocks = jnp.asarray([1], jnp.int32)
+    with pytest.raises(ValueError):
+        gemm.nvfp4_block_finished(want, formats.NvFp4Block.quantized(x[None]), blocks,
+                                  epilogue=lambda acc: (acc, acc), out_dtypes=(jnp.float32, jnp.int16),
+                                  out_forms=(None, quantized.Form(2, packed=True)), dense=True)
 
 
 def _finished_up_projection():
