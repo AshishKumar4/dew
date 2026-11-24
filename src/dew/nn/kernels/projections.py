@@ -143,6 +143,14 @@ def recipe_projection(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array
     return out.astype(out_dtype)
 
 
+def _inert_at_zero(activation: Callable, arguments: int, dtype) -> bool:
+    """Whether `activation` of zeros is zero, evaluated as the trace's constant (`activation` elementwise):
+    the zero rows a chain pads its rows with then zero through it (GELU's, SiLU's, SwiGLU's)."""
+    with jax.ensure_compile_time_eval():
+        value = activation(*(jnp.zeros((1, 1), dtype),) * arguments)
+        return bool(jnp.all(jnp.asarray(value) == 0))
+
+
 def recipe_chain(rows: jax.Array, up: jax.Array, down: jax.Array, activation: Callable, *, out_dtype,
                  gate: jax.Array | None = None) -> jax.Array | None:
     """`recipe_projection(activation(recipe_projection(rows, up)), down)` of an ungated MLP's rows (`[rows,
@@ -175,6 +183,10 @@ def recipe_chain(rows: jax.Array, up: jax.Array, down: jax.Array, activation: Ca
         return on_shards(chained, jax.sharding.PartitionSpec(along, None), (rows, up, down, gate),
                          whole=(1, 2, 3))
     count = rows.shape[0]
+    if count % SCALE_DEPTH and not _inert_at_zero(activation, 1 + (gate is not None), out_dtype):
+        # Padding rows' activation would enter the down projection's kernel gradient's token-block scales
+        # (`_projection_backward` quantizes its rows along the tokens): the projections apart take it.
+        return None
     laid = jnp.pad(rows, ((0, -count % SCALE_DEPTH), (0, 0)))
     return blockwise_chain(laid, up[None], down[None], activation, out_dtype=out_dtype,
                            gate=None if gate is None else gate[None])[:count]
@@ -234,12 +246,25 @@ def blocks_quantized(w: jax.Array) -> tuple[jax.Array, jax.Array]:
     return codes.reshape(w.shape).astype(jnp.float8_e4m3fn), scale[..., 0, 0]
 
 
+def _k_major(w: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """`w`'s blockwise FP8 codes, K-major (`[groups, width, depth]`, as a step-scaled product streams its
+    matrix), and their 128 x 128 blocks' scales (`blocks_quantized`)."""
+    blocks, scales = blocks_quantized(w)
+    return jnp.swapaxes(blocks, 1, 2), scales
+
+
+def _quantized_rows_product(rows, rows_scales, w, sizes, out_dtype, interpret) -> jax.Array:
+    """A blockwise FP8 projection of rows already quantized (E4M3 codes and their 1 x 128 scales, `[depth /
+    128, rows]`) by `w`: the one statement a projection, a chain's gate and its down projection read."""
+    blocks, scales = _k_major(w)
+    return blockwise_fp8_product(rows, blocks, sizes, rows_scales, scales, out_dtype=out_dtype,
+                                 interpret_on_cpu=interpret)
+
+
 def _projection_value(x, w, group_blocks, out_dtype, interpret):
     rows, rows_scales = rows_quantized(x)
-    blocks, blocks_scales = blocks_quantized(w)
     sizes = (group_blocks * SCALE_DEPTH).astype(jnp.int32)
-    return blockwise_fp8_product(rows, jnp.swapaxes(blocks, 1, 2), sizes, rows_scales.T, blocks_scales,
-                                 out_dtype=out_dtype, interpret_on_cpu=interpret)
+    return _quantized_rows_product(rows, rows_scales.T, w, sizes, out_dtype, interpret)
 
 
 def _projection_forward(x, w, group_blocks, out_dtype, interpret):
@@ -274,23 +299,20 @@ def _chain_value(x, w_ins, w_down, group_blocks, activation, out_dtype, interpre
 
     sizes = (group_blocks * SCALE_DEPTH).astype(jnp.int32)
     rows, rows_scales = rows_quantized(x)
-    *gate, (up, up_scales) = [(jnp.swapaxes(blocks, 1, 2), scales)
-                              for blocks, scales in map(blocks_quantized, w_ins)]
+    *gate, w_up = w_ins
+    up, up_scales = _k_major(w_up)
     # A gate's product stored rounded, the up product's epilogue reading it as a tile beside its own sum:
     # one accumulator a launch (two exact sums, each a running total and a step's partial, take a Hopper
     # consumer's 336 registers at FP8's least 128 columns; row 12689).
-    gated = tuple(blockwise_fp8_product(rows, matrix, sizes, rows_scales.T, scales, out_dtype=out_dtype,
-                                        interpret_on_cpu=interpret) for matrix, scales in gate)
+    gated = tuple(_quantized_rows_product(rows, rows_scales.T, matrix, sizes, out_dtype, interpret)
+                  for matrix in gate)
     product, codes, scales = blockwise_fp8_finished(
         rows, up, sizes, rows_scales.T, up_scales,
         epilogue=quantized.blockwise_fp8_epilogue(activation, out_dtype),
         out_dtypes=(out_dtype, jnp.float8_e4m3fn, jnp.float32), epilogue_operands=gated,
         out_forms=(None, None, (SCALE_DEPTH, True)), dense=True, interpret_on_cpu=interpret)
     products = (*gated, product)
-    down_blocks, down_scales = blocks_quantized(w_down)
-    out = blockwise_fp8_product(codes, jnp.swapaxes(down_blocks, 1, 2), sizes, scales, down_scales,
-                                out_dtype=out_dtype, interpret_on_cpu=interpret)
-    return out, tuple(products)
+    return _quantized_rows_product(codes, scales, w_down, sizes, out_dtype, interpret), tuple(products)
 
 
 def _chain(x, w_ins, w_down, group_blocks, activation, out_dtype, interpret):
