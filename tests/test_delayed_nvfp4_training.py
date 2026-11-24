@@ -24,7 +24,7 @@ DELAYED = Numerics(DTYPE_PRESETS["bf16-mixed"], low_precision=LowPrecision(recip
 
 def delayed_lm(split: int, checkpoints: Checkpoints | None = None) -> Trainer:
     """A two-layer LM whose feed-forward projections the delayed recipe takes, initialized under it (so its
-    variables hold their histories), its batch of eight rows read in `split` microbatches."""
+    variables hold their histories), its batch of sixteen rows read in `split` microbatches."""
     model = CausalTransformer(vocab_size=64, emb_features=128, num_layers=2, num_heads=2, mlp_features=256,
                               max_seq_len=SEQ)
     return Trainer(LMObjective(model, seq_len=SEQ), optax.adamw(1e-3), key=0,
@@ -32,9 +32,10 @@ def delayed_lm(split: int, checkpoints: Checkpoints | None = None) -> Trainer:
 
 
 def data() -> Pipeline:
-    """Rows of eight, each step's its own."""
-    text = (np.arange(64 * (SEQ + 1)).reshape(64, SEQ + 1) * 7 % 64).astype(np.int32)
-    return Pipeline(Memory({"text": text})).batch(8)
+    """Rows of sixteen, each step's its own: every microbatch of a split in two whole rows on each of a
+    CPU mesh's eight data shards."""
+    text = (np.arange(128 * (SEQ + 1)).reshape(128, SEQ + 1) * 7 % 64).astype(np.int32)
+    return Pipeline(Memory({"text": text})).batch(16)
 
 
 def histories(state) -> list[np.ndarray]:
