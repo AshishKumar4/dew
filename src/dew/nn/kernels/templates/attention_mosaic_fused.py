@@ -167,17 +167,18 @@ def _fused_gradients(family: mosaic.Family, key: jax.Array, value: jax.Array, wi
 
     return grad_out(key), grad_out(value)
 def walked_sums(walk: _Backward, streams, views, reach: tuple, streamed: tuple, index, segments,
-                shapes: tuple, *, scaled: bool) -> tuple[jax.Array, jax.Array]:
+                shapes: tuple, *, scaled: bool, common: bool = False) -> tuple[jax.Array, jax.Array]:
     """A fused consumer `index`'s dK and dV sums, its walk over `reach` among the tiles its program streams
-    (`Family.walk_own`, `segments(lo, hi)` its steps, `shapes` its sums'); where `scaled`, fp16's running
-    scales carried, dV's and dK's (`_sixteen_step`'s and `attention_mosaic_coop`'s), and its sums taken back
-    by them (`algebra.running_restored`)."""
+    (`Family.walk_own`, `segments(lo, hi)` its steps, `shapes` its sums; `common` where every consumer's
+    segments are the same steps, `_walked_run`'s paired ones, a pipeline a segment); where `scaled`, fp16's
+    running scales carried, dV's and dK's (`_sixteen_step`'s and `attention_mosaic_coop`'s), and its sums
+    taken back by them (`algebra.running_restored`)."""
     family = walk.program.family
     start = (jnp.float32(-jnp.inf),) * 2 if scaled else ()
     scales, (dk, dv) = family.walk_own(
         streams, views, reach, streamed, index,
         lambda streams, lo, hi, counted: family.walk(streams, segments(lo, hi), start, shapes, walk.interpret,
-                                                     first=counted))
+                                                     first=counted), common=common)
     if scales:
         dv, dk = (algebra.running_restored(sums, scale) for sums, scale in zip((dv, dk), scales, strict=True))
     return dk, dv
@@ -441,8 +442,9 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
             # feed their rings, every tile any of the program's keys' readers reads, a tile none of a
             # consumer's own keys sees masked whole, its weights and its dQ zero (FlashAttention 3's two
             # warpgroups a CTA, each its own keys over one query stream).
+            # Paired consumers' segments are their runs intersected (`_walked_run`), the same steps for each.
             dk, dv = walked_sums(walk, streams, views, (lo, hi), streamed, index, segments, shapes,
-                                 scaled=staged_parts(query.dtype) > 1)
+                                 scaled=staged_parts(query.dtype) > 1, common=summed)
             out_view = head_slice(family, row, key_head, pl.ds(k_first, block_k), dk_ref.dtype, width=width)
             outs = (dk_ref.at[out_view], dv_ref.at[out_view])
             finished = functools.partial(_fused_out, family, (dk, dv), outs, index, block_k, grouped=grouped,
