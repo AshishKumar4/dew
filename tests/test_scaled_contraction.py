@@ -146,3 +146,29 @@ def test_a_divisor_past_the_format_divides_its_cotangent_finite():
     out, pull = jax.vjp(lambda x: contract(form, x, big, big), big)
     np.testing.assert_array_equal(np.asarray(out), 0.5)
     np.testing.assert_array_equal(np.asarray(pull(big)[0]), 0.5)
+
+
+def test_a_part_beneath_values_that_cancel_survives_them_at_every_order():
+    """A mean of four unit masses over values `[2^127, -2^127, 2^-30, 0]` is `2^-32`: the values contracted a
+    band at a time (`scaled_contraction._banded`), the pair that cancels in one band, `2^-30` in another,
+    where one exponent for the group (`2^127`) flushed it and gave 0 (row 12452). So is the tangent of a
+    mean of values all `2^127` along that direction (the reference's value-only tangent, the row's witness),
+    and the gradient along the masses, `(v_k - mean) / 4`."""
+    masses = jnp.ones(4, jnp.float32)
+    spread = jnp.asarray([[2.0 ** 127], [-(2.0 ** 127)], [2.0 ** -30], [0.0]], jnp.float32)
+    np.testing.assert_array_equal(np.asarray(contract(MEAN, masses, spread)), [2.0 ** -32])
+    _, tangent = jax.jvp(lambda v: contract(MEAN, masses, v), (jnp.full((4, 1), 2.0 ** 127, jnp.float32),),
+                         (spread,))
+    np.testing.assert_array_equal(np.asarray(tangent), [2.0 ** -32])
+    found = jax.grad(lambda m: contract(MEAN, m, spread)[0])(masses)
+    np.testing.assert_array_equal(np.asarray(found), np.asarray(
+        [2.0 ** 125, -(2.0 ** 125), 3 * 2.0 ** -34, -(2.0 ** -34)], np.float32))
+
+
+def test_terms_that_cancel_keep_the_term_beneath_them():
+    """`x - y + z` at `x = y = 2^127`, `z = 2^-30` is `2^-30`: the terms joined as double floats at their own
+    powers, where joined at the largest's they flushed `z` and gave 0."""
+    form = Form(("", "", ""), ((1, (((0, 1),),)), (-1, (((1, 1),),)), (1, (((2, 1),),))), "")
+    big = jnp.float32(2.0 ** 127)
+    np.testing.assert_array_equal(np.asarray(contract(form, big, big, jnp.float32(2.0 ** -30))), 2.0 ** -30)
+
