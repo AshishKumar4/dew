@@ -189,17 +189,20 @@ def test_band_pairs_join_from_the_largest_whatever_their_order():
 
 
 def test_a_bin_whose_high_part_cancels_keeps_its_low_part():
-    """Scalar terms `2^23 + 2^23 + 1 - 2^23 - 2^23` beside a term whose keys' band pairs cancel to zero
-    (`2^32 - 2^32 + 0`, taking the sum banded) sum to 1: the five land in one exponent bin, `2^24 + 1` rounds
-    its 1 into the low part and the two subtractions cancel the high part, and the bin renormalizes, so its
-    1 joins the total, where its high part 0 read as an empty bin and gave inf (review of #3979, P0)."""
-    form = Form(("", "", "", "", "", "k", "k"), (
-        (1, (((0, 1),),)), (1, (((1, 1),),)), (1, (((2, 1),),)), (-1, (((3, 1),),)), (-1, (((4, 1),),)),
-        (1, (((5, 1),), ((6, 1),)))), "")
+    """Scalar terms `(2^24 + 2) - 2^24` and `2^23 + 2^23 + 1 - 2^23 - 2^23`, beside a term whose keys' band
+    pairs cancel to zero (`2^32 - 2^32 + 0`, taking the sum banded), sum to 3: the second five land in one
+    exponent bin, `2^24 + 1` rounds its 1 into the low part and the subtractions cancel the high part, and
+    the bin renormalizes, so its 1 joins the first bin's 2, where its high part 0 read as an empty bin
+    beside a live total and dropped it (review of #3979, P0)."""
+    form = Form(("",) * 7 + ("k", "k"), (
+        (1, (((0, 1),),)), (-1, (((1, 1),),)), (1, (((2, 1),),)), (1, (((3, 1),),)), (1, (((4, 1),),)),
+        (-1, (((5, 1),),)), (-1, (((6, 1),),)), (1, (((7, 1),), ((8, 1),)))), "")
     big, one = jnp.float32(2.0 ** 23), jnp.float32(1.0)
     keys = jnp.asarray([2.0 ** 32, 2.0 ** 32, 2.0 ** -90], jnp.float32)
     weights = jnp.asarray([1.0, -1.0, 0.0], jnp.float32)
-    np.testing.assert_array_equal(np.asarray(contract(form, big, big, one, big, big, keys, weights)), 1.0)
+    found = contract(form, jnp.float32(2.0 ** 24 + 2), jnp.float32(2.0 ** 24), big, big, one, big, big, keys,
+                     weights)
+    np.testing.assert_array_equal(np.asarray(found), 3.0)
 
 
 def test_a_residue_beneath_the_terms_largest_reaches_its_quotient():
