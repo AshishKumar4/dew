@@ -54,7 +54,7 @@ from dew.nn.kernels.templates import (
 )
 from dew.nn.kernels.templates.cost import Stated
 from dew.nn.kernels.templates.rings import CLUSTER, Ref, Turn, besides, drain, loaded_once
-from dew.nn.kernels.templates.stores import column_chunks, column_spans, written
+from dew.nn.kernels.templates.stores import Output, column_chunks, column_spans, written
 from dew.telemetry.instrumentation import MODEL_FLOPS
 
 Operand = Ref | jax.Array
@@ -401,10 +401,16 @@ _ONCE_PREDICATED = _cache.untraced(contextvars.ContextVar("once_predicated", def
 own)."""
 
 
-def refuse_staging(family, chunks: tuple[int, int] | None) -> None:
-    """Refuses `chunks` (`Family.output_staging`'s) where `family` stages each output tile whole."""
+def refuse_staging(family, chunks: tuple[int, int] | None, outputs: tuple = ()) -> tuple[tuple, ...]:
+    """Refuses `chunks` (`Family.output_staging`'s) where `family` stages each output tile whole, and any of
+    `outputs` stored packed or written by its own write (`stores.Output`'s divisor, transposed form or write,
+    which chunked staging alone takes); `outputs` as `(shape, dtype)` pairs."""
     if chunks is not None:
         raise ValueError(f"{family.name} stages each output tile whole, in no chunks: {chunks}")
+    plain = tuple(map(Output.of, outputs))
+    if any(output.divisor > 1 or output.transposed or output.write is not None for output in plain):
+        raise ValueError(f"{family.name} stages each output tile whole as its issuer writes it, none packed")
+    return tuple((output.shape, output.dtype) for output in plain)
 
 
 def then_read(read: Callable, after: Callable | None) -> Callable:
@@ -2017,8 +2023,7 @@ class Transport[Allocated, Opened](abc.ABC):
         template's allocations count as its own (`resources.Scope`): the whole tile, where a family stages
         it whole, which takes no `chunks` (chunk columns and buffers, `stores.output_staging`'s `staging`)."""
         del consumers
-        refuse_staging(self, chunks)
-        return [plgpu.SMEM(shape, dtype) for shape, dtype in outputs]
+        return [plgpu.SMEM(shape, dtype) for shape, dtype in refuse_staging(self, chunks, outputs)]
 
     def persist_scratch(self, consumers: int, rewrites: tuple[int, ...] = (), *,
                         pingpong: bool = False) -> tuple[tuple, int]:

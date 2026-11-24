@@ -1109,18 +1109,17 @@ class Mma(MmaIssuer, CpAsync):
     consumers = 1
 
     def output_staging(self, outputs: tuple, consumers: int, chunks: tuple[int, int] | None = None) -> list:
-        mosaic.refuse_staging(self, chunks)
+        plain = mosaic.refuse_staging(self, chunks, outputs)
         # Each output tile staged at the swizzle its accumulator's stores pass the banks fewest times at
         # (`stored_swizzle`), copied out a 16-byte piece a thread over whole tiles (`persist`'s store,
         # `stores.swizzled_rows_out`); two consumers' rows of it side by side (`persist`), one output a tile:
         # their staging opens together once a tile, each output's beside the others', which a launch's plan
         # charges one output at a time (`resources.scratch_bytes`' tiles after its walks).
-        if consumers > 1 and len(outputs) > 1:
-            raise NotImplementedError(f"two {self.name} consumers stage one output a tile, not "
-                                      f"{len(outputs)}")
+        if consumers > 1 and len(plain) > 1:
+            raise NotImplementedError(f"two {self.name} consumers stage one output a tile, not {len(plain)}")
         side = () if consumers == 1 else (consumers,)
         return [swizzling.staged((*side, *shape), dtype, self.stored_swizzle(shape, dtype)) if len(shape) == 2
-                else plgpu.SMEM((*side, *shape), dtype) for shape, dtype in outputs]
+                else plgpu.SMEM((*side, *shape), dtype) for shape, dtype in plain]
 
     def stored_swizzle(self, shape: tuple[int, int], dtype) -> int:
         """The swizzle an output tile of `shape` in `dtype` stages at: of the swizzles its rows fill whole
