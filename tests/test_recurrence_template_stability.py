@@ -431,7 +431,8 @@ def test_kimis_unit_keys_under_tiny_gates_at_the_floor_stays_finite_interpreted(
 
 
 @COMPILES_ON_CPU
-@pytest.mark.check1_shards(seeds=8, per_task=2)
+# A draw a task: two took 125 to 151 s (jsf-b22-a at 3c408b8a5, row 12442).
+@pytest.mark.check1_shards(seeds=8, per_task=1)
 def test_kimis_faint_cross_terms_are_as_exact_as_fla_interpreted():
     """Kimi delta attention's 16-bit gradient through the template, interpreted, over one key under faint
     write gates beside large ones and no decay (fla_sites' `FAINT_CROSS`): its output, final memory and
