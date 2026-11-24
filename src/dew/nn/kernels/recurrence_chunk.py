@@ -188,10 +188,12 @@ def _erases_laid(hooks: recurrence.Hooks, query, key, value, g, beta, given: dic
     if hooks.erase == 'additive':
         return query, key, value, g, beta, (a, -b), starts, firsts
     group = heads // key.shape[2]
-    keys = jnp.repeat(key, group, axis=2).astype(g.dtype)
+    keys = jnp.repeat(key, group, axis=2)
     queries = jnp.repeat(query, group, axis=2)
     if hooks.erase == 'read':
+        # The keys in their dtype: a 16-bit call's a 16-bit call on the template (`port_kernel`'s `reads`).
         return queries, keys, value, g, beta, (None, -b), starts, firsts
+    keys = keys.astype(g.dtype)
 
     def laid(first, second):
         return jnp.stack([first, second], axis=2).reshape(first.shape[0], -1, *first.shape[2:])
