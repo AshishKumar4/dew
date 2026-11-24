@@ -542,24 +542,32 @@ def _sub_chunk_held(call: Call, block: int, outputs: int = 1) -> Held:
 
 def own_loaded(call: Call, views: tuple, tiles: tuple) -> None:
     """The own blocks' compact views (`own_pairs.intra_own`'s, a part each `[C, SUB]`) read into their plain
-    `tiles`, each thread its run of words (`_own_copied`): a launch's tile read once, after its walk. The
-    walk's products are mma.sync's (`sub_chunked`), whose operands load through the threads' own reads, so
-    the warpgroup's barrier after the copy (`mosaic.synced`) is all their reads wait on. A load of the
+    `tiles`, each thread its run of words (`copied_by_thread`): a launch's tile read once, after its walk.
+    The walk's products are mma.sync's (`sub_chunked`), whose operands load through the threads' own reads,
+    so the warpgroup's barrier after the copy (`mosaic.synced`) is all their reads wait on. A load of the
     views into registers is no copy of them: a 16-column bf16 row is half of each 32-byte sector a warp's
     tiled load reads ("GMEM transfer does not access a whole number of complete 32 byte sectors", every
     Kimi Linear cell of the resource gate)."""
     for view, tile in zip(views, tiles, strict=True):
         if call.interpret:
             tile[...] = view[...]
-            continue
-        plgpu.inline_mgpu(arg_types=(plgpu.RefType(), plgpu.RefType()), return_type=())(
-            lambda ctx, from_ref, to_ref: _own_copied(from_ref, to_ref))(view, tile)
+        else:
+            copied_by_thread(view, tile)
 
 
-def _own_copied(source_ref, tile_ref) -> None:
-    """`own_loaded` in Mosaic GPU's terms: a thread's `C * SUB / THREADS` words, row by row."""
-    index, i32 = ir.IndexType.get(), ir.IntegerType.get_signless(32)
+def copied_by_thread(source, target, *, scale: float | None = None) -> None:
+    """`source` `[rows, columns]` copied to `target` of its shape, each thread its run of entries, row by row:
+    as it is, or, given `scale`, each entry an fp32 scaled by it and rounded once to `target`'s dtype (the
+    own pairs' scores, `own_pairs.intra_own`). Natively alone: a Mosaic GPU program's threads' own words."""
+    plgpu.inline_mgpu(arg_types=(plgpu.RefType(), plgpu.RefType()), return_type=())(
+        lambda ctx, from_ref, to_ref: _thread_copied(from_ref, to_ref, scale=scale))(source, target)
+
+
+def _thread_copied(source_ref, target_ref, *, scale: float | None) -> None:
+    """`copied_by_thread` in Mosaic GPU's terms: a thread's `rows * columns / THREADS` entries."""
+    index, i32, f32 = ir.IndexType.get(), ir.IntegerType.get_signless(32), ir.F32Type.get()
     rows, columns = ir.MemRefType(source_ref.type).shape
+    stored = ir.MemRefType(target_ref.type).element_type
     run = rows * columns // scan.THREADS
 
     def const(value):
@@ -570,7 +578,11 @@ def _own_copied(source_ref, tile_ref) -> None:
         entry = arith.addi(arith.muli(thread, const(run)), const(step))
         at = [arith.index_cast(index, value)
               for value in (arith.divui(entry, const(columns)), arith.remui(entry, const(columns)))]
-        memref.store(memref.load(source_ref, at), tile_ref, at)
+        value = memref.load(source_ref, at)
+        if scale is not None:
+            value = arith.mulf(value, arith.constant(f32, scale))
+            value = value if stored == value.type else arith.truncf(stored, value)
+        memref.store(value, target_ref, at)
 
 
 def _sub_chunk_flops(call: Call, keys: int, outputs: int) -> int:
