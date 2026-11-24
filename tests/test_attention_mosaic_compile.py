@@ -1931,16 +1931,18 @@ def test_fused_dkv_width64_derives_and_compiles_spill_free_on_sm80_and_sm100(gen
     key = jax.ShapeDtypeStruct((1, queries, 2, 64), jnp.bfloat16)
     shapes = jax.tree.map(lambda array: jax.ShapeDtypeStruct(array.shape, array.dtype),
                           _residuals(query.shape))
-    op_b, ba_b, cfg = _gated_backward(gen, 64, accurate=False)
-    assert cfg is not None and cfg.fused, (gen, cfg)
+    op_b, ba_b, _ = _gated_backward(gen, 64, accurate=False)
     with generation.assumed(gen):
+        # The fused launch the derivation prices beside the two (`MosaicBackward.candidates`), whichever it
+        # takes (an A100's the two, row 12752).
+        cfg = next(config for config in op_b.candidates(ba_b, generation.gpu_target(gen)) if config.fused)
         if gen == "sm100":
             t_sm100 = generation.gpu_target(gen)
             shallow = dataclasses.replace(cfg, stages=2)
             deep = op_b._deepened(ba_b, shallow, t_sm100)
             assert deep.stages > shallow.stages and cfg.stages == deep.stages, (shallow, deep, cfg)
             assert op_b.resident(ba_b, deep, t_sm100) == op_b.resident(ba_b, shallow, t_sm100)
-        case = _fast_backward_compile_case(f"{gen}-fused-d64", query, key, spans, shapes)
+        case = _fast_backward_compile_case(f"{gen}-fused-d64", query, key, spans, shapes, cfg)
         found = compile_mosaic_kernels([case], gen)
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
@@ -2038,13 +2040,15 @@ def test_derived_one_consumer_heights_are_compared_by_choose():
     assert any({(c.block_q, c.block_k) for c in group} >= {(128, 32), (64, 64)} for group in seen), seen
 
 
-def _fast_backward_compile_case(name: str, q, k, spans, shapes):
-    """Build a `KernelCase` for fast-form Mosaic backward compilation."""
+def _fast_backward_compile_case(name: str, q, k, spans, shapes, config=None):
+    """Build a `KernelCase` for fast-form Mosaic backward compilation, at `config` where given (pinned), else
+    the derived one."""
     from fla_gdn_support import KernelCase
 
     def backward(query, key, value, dout, residuals):
-        grads = attention_mosaic.backward(query, key, value, spans, None, dout,
-                                          residuals=residuals, accurate=False)
+        with tuning.pinned({attention_mosaic.MosaicBackward: config} if config is not None else {}):
+            grads = attention_mosaic.backward(query, key, value, spans, None, dout,
+                                              residuals=residuals, accurate=False)
         return grads.query, grads.key, grads.value
 
     return KernelCase(name, lambda: (backward, (q, k, k, q, shapes)))
@@ -2067,13 +2071,14 @@ def test_d128_fused_backward_deepens_to_3_stages_without_losing_residency(gen):
                                                    scale=None, natural=attention_mosaic.NATURAL,
                                                    accurate=False)
         ba = op.bind(*args, interpret=False)
-        cfg = op.derived(ba, target)
-        assert cfg is not None and cfg.fused and op.takes(ba, cfg, target), (gen, cfg)
+        # The fused launch the derivation prices beside the two (`MosaicBackward.candidates`).
+        cfg = next(config for config in op.candidates(ba, target) if config.fused)
+        assert op.takes(ba, cfg, target), (gen, cfg)
         shallow = dataclasses.replace(cfg, stages=2)
         deep = op._deepened(ba, shallow, target)
         assert deep.stages > shallow.stages and cfg.stages == deep.stages, (gen, shallow, deep, cfg)
         assert op.resident(ba, deep, target) == op.resident(ba, shallow, target)
-        case = _fast_backward_compile_case(f"{gen}-fused-d128-3stage", q, k, spans, shapes)
+        case = _fast_backward_compile_case(f"{gen}-fused-d128-3stage", q, k, spans, shapes, cfg)
         found = compile_mosaic_kernels([case], gen)
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
@@ -2410,8 +2415,7 @@ def test_mma_sync_fused_32x32_backward_derives_and_compiles_spill_free(gen):
             natural=attention_mosaic.NATURAL, accurate=False)
         ba = op.bind(*args, interpret=False)
         target = generation.gpu_target()
-        cfg = op.derived(ba, target)
-        assert cfg is not None and cfg.fused, (gen, cfg)
+        cfg = next(config for config in op.candidates(ba, target) if config.fused)
         pin = attention_mosaic.BackwardTiles(32, 32, 2, 1, fused=True, family=cfg.family)
         assert op.takes(ba, pin, target), (gen, pin)
         bad = attention_mosaic.BackwardTiles(96, 64, 2, 1, fused=True, family=cfg.family)
@@ -2498,7 +2502,8 @@ def test_an_a100s_fast_backward_on_two_paired_consumers_compiles(causal, without
     with generation.assumed("sm80"):
         target = generation.gpu_target()
         op, ba = _backward_call((1, 512, 8, 2), 64, accurate=False, causal=causal)
-        config = dataclasses.replace(op.derived(ba, target), consumers=PAIRED.consumers)
+        fused = next(config for config in op.candidates(ba, target) if config.fused)
+        config = dataclasses.replace(fused, consumers=PAIRED.consumers)
         assert op.legal(ba, config, target), config
         case = KernelCase(f"paired backward {config}", lambda: op.lowering(ba, config))
         found = compile_mosaic_kernels([case], "sm80")

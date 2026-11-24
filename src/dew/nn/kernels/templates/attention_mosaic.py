@@ -157,10 +157,11 @@ def _planned_stages(family: mosaic.Family, scope_of: Callable[[int], resources.S
     return floor if planned is None else planned[0].stages
 
 
-def _choice_key(op, ba: tokamax.BoundArguments, candidates: tuple[Tiles, ...],
+def _choice_key(op, ba: tokamax.BoundArguments, candidates: tuple[Tiles, ...] | tuple[BackwardTiles, ...],
                 target: generation.GpuTarget) -> str | None:
-    """What decides `op`'s priced consumer count on `target` (`tuning.stored_choice`), keyed through
-    `report.stored_key`; None where the installation has no seal."""
+    """What decides `op`'s priced choice among `candidates` on `target` (`tuning.stored_choice`: a
+    forward's consumer count, a backward's one launch or two), keyed through `report.stored_key`; None where
+    the installation has no seal."""
     rates = cost.rates(target, device=False)
     return report.stored_key(
         op_provenance(op, ba.arguments), report._identity(op, ba, target), target.generation,
@@ -2021,11 +2022,19 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         (tcgen05's, `walked_layouts`), the walked config first where it takes the call (`walked`: on an
         emulated B200 0.18, 0.15 and 0.42 of the mma.sync two launches' time at Qwen3-8B's 2 x 4096 and
         1 x 16384 and Qwen3-4B's width 256, M-ET-74, row 6918)."""
-        family = self._family(ba, target)
-        if family is None:
+        if self._family(ba, target) is None:
             return None
         if (walked := self.walked(ba, target)) is not None:
             return self._deepened(ba, walked, target)
+        candidates = self.candidates(ba, target)
+        return self._cheaper(ba, candidates, target) if candidates else None
+
+    def candidates(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> list[BackwardTiles]:
+        """The legal one launch and two launches `derived` prices (`_one_launch`, `_two_launches`), each
+        deepened (`_deepened`), in that order; none on a target of no family."""
+        family = self._family(ba, target)
+        if family is None:
+            return []
         query = ba.arguments["query"]
         # The dK/dV launch on the layout whose consumers feed their rings where one is, its two consumers
         # splitting each slot's queries (`split_queries`); else on the dQ launch's.
@@ -2033,10 +2042,9 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # The dK/dV launch's consumers a backward's at most (`BACKWARD_CONSUMERS`), whatever its layout's.
         dkv = ({"dkv_family": fed[0].name, "dkv_consumers": min(fed[0].consumers, BACKWARD_CONSUMERS)}
                if fed else {})
-        candidates = [self._deepened(ba, config, target) for config in (
+        return [self._deepened(ba, config, target) for config in (
             self._one_launch(ba, target, family, fed, dkv), self._two_launches(ba, target, family, dkv))
             if config is not None]
-        return self._cheaper(ba, candidates, target) if candidates else None
 
     def _cheaper(self, ba: tokamax.BoundArguments, candidates: list[BackwardTiles],
                  target: generation.GpuTarget) -> BackwardTiles:
@@ -2067,14 +2075,19 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                      ) -> tuple[bool, float] | None:
         """Price `config`'s launches on `target`, the fused one's or the two's summed (`cost.launch_seconds`
         over `emission.work_of`, each at `config`'s residency), traced under `report.launching`: whether any
-        of their work lies at a rate the target states none of (`cost.units`' unpriced), and the seconds."""
+        of their work lies at a rate the target states none of (`cost.units`' unpriced), and the seconds. As
+        its hookless call (its hook fields none): a hook a choice prices takes no parameters (one with any
+        holds no fused launch, so no choice), its work the same a score in either form, and a launch keyed
+        by its hooks' fingerprints (`KernelOp.keyed`, which traces none) prices as its live call does."""
         names = ("query", "key", "value", "dout", "start", "end", "query_ids", "key_ids", "score_params",
                  "initial", "residuals", "drop")
         operands = tuple(tuning.shapes(ba.arguments[name]) for name in names)
         identity = report._identity(self, ba, target)
 
+        hookless = dataclasses.replace(self, **dict.fromkeys(self.HOOKS))
+
         def priced(*args):
-            return self._fwd(*args, interpret=False, config=config)[0]
+            return hookless._fwd(*args, interpret=False, config=config)[0]
 
         priced.__name__ = priced.__qualname__ = (
             f"priced_{type(self).__name__}_l{report._digest(identity)}_c{report._digest(repr(config))}")
