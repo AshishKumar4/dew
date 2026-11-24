@@ -362,14 +362,18 @@ class Written:
         return self._made[platform]
 
     def __call__(self, *inputs, **options):
-        return self.program(_platform_of(inputs))(*inputs, **options)
+        platform = _platform_of(inputs)
+        if platform == "tpu":
+            inputs = jax.device_put(inputs, jax.devices("cpu")[0])
+        return self.program(_written_on(platform))(*inputs, **options)
 
     @property
     def placed(self):
-        """Its program for the platform the context places a call on (`generation.placed_platform`)."""
+        """Its program for the platform the context places a call on (`generation.placed_platform`), a
+        TPU's on its host (`_written_on`)."""
         from dew.nn.kernels.generation import placed_platform
 
-        return self.program(placed_platform())
+        return self.program(_written_on(placed_platform()))
 
     def lower(self, *inputs, **options):
         return self.placed.lower(*inputs, **options)
@@ -377,6 +381,14 @@ class Written:
     @property
     def trace(self):
         return self.placed.trace
+
+
+def _written_on(platform: str) -> str:
+    """Where a twin as written (`Written`) of a call on `platform` runs: its own platform, but a TPU's host
+    CPU, as a TPU's float64 truths do (`float64_host`): XLA's TPU backend lowers a transpose only through
+    the simplifier the as-written options leave off ("HLO transpose is not implemented on TPU", rows 12118
+    and 12356), and IEEE fp32 on the host is the written arithmetic of the twin's fp32 program."""
+    return "cpu" if platform == "tpu" else platform
 
 
 class Truth:
