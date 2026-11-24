@@ -162,6 +162,19 @@ def a_blockwise_fp8_product_is_on_par(case: tuple[str, ...]) -> None:
     unnamed = sorted(pair for pair in recorded if pair[0] not in CHOICES and pair[1] != "xla")
     assert ("blockwise_fp8", "mosaic") in recorded and not unnamed, (sorted(recorded), unnamed)
 
+def assert_bitwise_leaves(names, fused, separate, *, finite: bool = False) -> None:
+    """A recipe chain's outputs (`with_gradients`' value and gradients, `names` each) bit for bit its
+    projections apart, of one dtype each, and every one finite where `finite` (a padded chain's: no
+    activation of its padding enters a gradient)."""
+    for name, got, want in zip(names, fused, separate, strict=True):
+        assert got.dtype == want.dtype, (name, got.dtype, want.dtype)
+        if finite:
+            assert np.all(np.isfinite(np.asarray(got, np.float32))), name
+        unsigned = np.dtype(f"uint{8 * got.dtype.itemsize}")
+        np.testing.assert_array_equal(np.asarray(got).view(unsigned), np.asarray(want).view(unsigned),
+                                      err_msg=name)
+
+
 def grouped(group_blocks, lhs, matrices):
     """Each group's rows of `lhs` (`group_blocks` 128-row blocks a group) times its matrix of `matrices`, in
     the rows' order: a recipe truth's grouped product."""

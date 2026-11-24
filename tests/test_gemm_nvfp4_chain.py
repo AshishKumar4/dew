@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from blockwise_matrix import assert_bitwise_leaves
 from generation_support import COMPILES_ON_CPU, INTERPRETS
 from reference_error import with_gradients
 
@@ -19,14 +20,6 @@ from dew.nn.kernels.templates.gemm import quantized
 def _swiglu(gate, up):
     """A gated MLP's SwiGLU of its rounded gate and up, in fp32."""
     return jax.nn.silu(gate.astype(jnp.float32)) * up.astype(jnp.float32)
-
-
-def _same(fused, separate, names) -> None:
-    for name, got, want in zip(names, fused, separate, strict=True):
-        assert got.dtype == want.dtype, (name, got.dtype, want.dtype)
-        unsigned = np.dtype(f"uint{8 * got.dtype.itemsize}")
-        np.testing.assert_array_equal(np.asarray(got).view(unsigned), np.asarray(want).view(unsigned),
-                                      err_msg=name)
 
 
 def _operands(seed: int, rows: int, gated: bool):
@@ -81,7 +74,7 @@ def test_a_delayed_nvfp4_recipe_chain_is_its_recipe_projections_apart(rows, gate
         with pytest.raises(ValueError):
             projections.recipe_chain(x, matrices[-1], down, activation, out_dtype=jnp.bfloat16)
     names = ("value", "d_x", *(f"d_{name}" for name in ("gate", "up")[2 - len(matrices):]), "d_down")
-    _same(fused, separate, names)
+    assert_bitwise_leaves(names, fused, separate)
     with generation.run_precision(NVFP4), projection_role("mlp"):
         assert projections.recipe_chain(x, matrices[-1], down, activation, out_dtype=jnp.bfloat16) is None
 
@@ -121,7 +114,7 @@ def test_a_delayed_nvfp4_chain_through_the_template_is_its_projections_apart(gat
         fused = jax.jit(with_gradients(chained))(x, *matrices, down, cotangent)
         separate = jax.jit(with_gradients(apart))(x, *matrices, down, cotangent)
     names = ("value", "d_x", *(f"d_{name}" for name in ("gate", "up")[2 - len(matrices):]), "d_down")
-    _same(fused, separate, names)
+    assert_bitwise_leaves(names, fused, separate)
     assert {route.kernel for route in routes if route.choice == "nvfp4_block"} == {"mosaic"}
 
 
