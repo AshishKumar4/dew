@@ -95,6 +95,31 @@ def test_a_uniform_branch_issues_its_costliest_arms_slots():
     assert both == alone, (both, alone)
 
 
+def _guarded_on(predicate, operation, divisor: int, wanted: int):
+    """A body scaling each word whose lane's `(tid - 64) operation divisor` compares to `wanted` by
+    `predicate`."""
+    def body(ctx, ref):
+        del ctx
+        i32 = ir.IntegerType.get_signless(32)
+        shifted = arith.subi(mgpu_utils.thread_idx(), arith.constant(i32, 64))
+        taken = arith.cmpi(predicate, operation(shifted, arith.constant(i32, divisor)),
+                           arith.constant(i32, wanted))
+        with mgpu_utils.when(taken):
+            _scaled(ref)
+
+    return body
+
+
+def test_a_guard_reads_a_signed_quotient_truncated_and_a_logical_shift_unsigned():
+    """A lane's integers as LLVM computes them (the review of train 1261, F7): `(tid - 64) divsi 32` is 0 on
+    lanes 33 to 95, truncated toward zero (floored, 64 to 95), two warps issuing for 63 lanes; `(tid - 64)
+    shrui 31` is 1 on lanes 0 to 63, their negative words read unsigned (shifted signed, -1)."""
+    assert _counted(_guarded_on(arith.CmpIPredicate.eq, arith.divsi, 32, 0)) == Work(
+        operations=64, shared_bytes=2 * 4 * 63)
+    assert _counted(_guarded_on(arith.CmpIPredicate.eq, arith.shrui, 31, 1)) == Work(
+        operations=64, shared_bytes=2 * 4 * 64)
+
+
 def test_a_static_loop_counts_its_trips_and_a_concrete_operand_its_lanes():
     """A loop of four static trips counts its body four times; a branch on an operand the kernel passes
     concretely (a bound of 64 lanes) takes its lanes, two warps'."""
