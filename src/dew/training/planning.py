@@ -1387,9 +1387,9 @@ class FitSearch[LossT, EffectsT]:
         narrow, group = self.narrow, self.ns_group
         # The least the start fell short by, and its live set: what each remat rung would free of it.
         missed = self.short(named[0])
-        # What its joined Newton-Schulz stacks hold by count, every process's the largest (0: it joins none,
-        # or its run states their group): what orders each rung's parted variant (`Parting`).
-        parting = Parting(0 if group is not None else max(self.gather(self.stacks_held())), self.gather)
+        # What its joined Newton-Schulz stacks hold by count, every process's the same (0: it joins none, or
+        # its run states their group): what orders each rung's parted variant (`Parting`).
+        parting = Parting(self.stacks_count() if group is None else 0, self.gather)
 
         def parted(rung: Rung) -> int | None:
             # `rung`, just asked joined and missed, asked parted at once where its miss leaves it so.
@@ -1481,7 +1481,8 @@ class FitSearch[LossT, EffectsT]:
         # The climb as the configured run reads it: one that set its own remat climbs its head alone, whatever
         # remat a record then moved it to.
         explicit = remat_stated(self.objective)
-        groups = (None, 1) if origin.ns_group is None and self.stacks_held() else (plan.ns_group,)
+        # Every process reads the same places: the count gathered, as the search gathers it.
+        groups = (None, 1) if origin.ns_group is None and self.stacks_count() else (plan.ns_group,)
         start = dataclasses.replace(origin, ns_group=groups[0])
         copies = start.narrow and any(candidate.copies for candidate in self.lowered.values())
         places = [*([dataclasses.replace(start, narrow=False)] if copies else []),
@@ -1509,6 +1510,12 @@ class FitSearch[LossT, EffectsT]:
         """What the Newton-Schulz stacks the step's updates join hold by count (`Candidate.joined`), the most
         of any step this search lowered; 0 where they join none."""
         return max((candidate.joined for candidate in self.lowered.values()), default=0)
+
+    def stacks_count(self) -> int:
+        """`stacks_held` as every process reads it, the largest any holds (`gather`): a trace JAX's cache
+        answered notes none on its process, so a process's own count is no verdict every process shares,
+        and whether a rung's parted step is asked is one (`Parting`, `below`)."""
+        return max(self.gather(self.stacks_held()))
 
     def shortfall(self, rung: str) -> int | None:
         """What the search fell short by at `rung` at the split it last missed at there, its walk's finest

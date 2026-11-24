@@ -168,4 +168,20 @@ def test_a_frontier_below_a_plan_settled_joined_reads_the_parted_steps_beneath_i
     settled, place = search.rung_now(), search.place()
     assert search.compiled == [(0, None), place] and place[0] > 0, search.compiled
     lighter = search.below([1], origin, settled)
-    assert (0, 1) in search.compiled[2:] and any(probe.fits for probe in lighter), search.compiled
+    assert [(probe.rung["ns_group"], probe.fits) for probe in lighter] == [(1, True)], search.compiled
+
+
+def test_a_process_whose_trace_noted_no_stacks_reads_the_frontier_its_peers_read():
+    """A process whose step's trace JAX's cache answered notes no joined stacks (`joined_held`'s 0), where a
+    peer's trace noted them: the frontier it reads beneath a plan settled joined is its peer's, the parted
+    steps among it, so every process compiles the same programs in the same order and none waits alone in
+    a compile's collectives (review of row 12463: the frontier branched on a process's own count)."""
+    search = Scripted(lambda place, group: {(0, None): 100, (0, 1): 90}.get((place, group), 90), room=90,
+                      count=0)
+    # Its peer answers each gathered verdict as it does, but for the stacks' count: 5 where it read 0.
+    search.gather = lambda value: [value, 5 if type(value) is int and value == 0 else value]
+    origin = search.rung_now()
+    assert search.searched([1], 0) == 1
+    settled = search.rung_now()
+    lighter = search.below([1], origin, settled)
+    assert [(probe.rung["ns_group"], probe.fits) for probe in lighter] == [(1, True)], search.compiled
