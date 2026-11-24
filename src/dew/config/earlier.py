@@ -4,11 +4,10 @@ gained since keeps for runs that predate it (`_earlier_default`)."""
 
 import dataclasses
 import sys
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
 from dew import _records, registry
 from dew._records import JSON, earlier_fields
-from dew.checkpoints._state_trees import EARLIER_OPTIMIZER_PATHS, earlier_typed, mask_readers
 from dew.data import records
 from dew.nn.precision import Numerics, numerics_of
 from dew.registry import from_record, models, objectives
@@ -381,7 +380,7 @@ def _optimizer_spec(fields: Mapping[str, _records.JSON]) -> dict[str, _records.J
     settings = {**opts, **stated}
     kept = {key: value for key, value in fields.items() if key not in EARLIER_OPTIMIZER_FIELDS}
     if typed:
-        settings, kept = _unmasked(mask, settings, kept)
+        kept = _masked(mask, kept)
         kept = _muon_masked(muon_mask, kept)
         optimizer = {"class": named, "fields": settings}
     else:
@@ -411,42 +410,102 @@ def _muon_masked(mask: _records.JSON, config: _Fields) -> _Fields:
                                        if isinstance(group, Mapping) else group for group in groups]}
 
 
-def _unmasked(mask: _records.JSON, settings: _Fields, config: _Fields) -> tuple[_Fields, _Fields]:
+EARLIER_OPTIMIZER_PATHS = {"dew.optim:_adam": "adam", "dew.optim:_adamw": "adamw", "dew.optim:_lamb": "lamb",
+                           "dew.optim:_muon_groups": "muon", "dew.optim:_muonclip_groups": "muonclip",
+                           "dew.laprop:laprop": "laprop", "dew.gauss_newton:gauss_newton": "gauss_newton"}
+"""Dew's own optimizers by the import paths of the factories a config could name them by before each held
+its own settings (row 11933's review): each the optimizer of its alias, never a generic `Optax` spec."""
+
+
+def earlier_typed(named: str) -> str | None:
+    """The alias of the Dew optimizer an earlier optimizer config named, by its alias or its factory's import
+    path (`EARLIER_OPTIMIZER_PATHS`); None for any other, an Optax factory's."""
+    named = EARLIER_OPTIMIZER_PATHS.get(named, named)
+    return named if named in registry.optimizers.paths and named != "optax" else None
+
+
+def mask_readers(config: Mapping[str, JSON]) -> tuple[list[JSON], Sequence[Mapping[str, JSON]]]:
+    """An earlier optimizer config's param groups, and the parts of it that read a mask among its optimizer's
+    options: where it spared its decay (`OptimConfig.spared`, on by default) its own mask was written over
+    the options', as a group's that spared (`ParamGroup.spared`, off by default) was, every group reading it
+    alike; so the config where it neither groups nor spares, else each group that does not spare."""
+    groups = config.get("param_groups") or []
+    assert isinstance(groups, list), groups
+    held: list[Mapping[str, JSON]] = [group for group in groups
+                                      if isinstance(group, Mapping) and not group.get("spared", False)]
+    return groups, held if groups else ([] if config.get("spared", True) else [config])
+
+
+MASKED_DECAY_MARK = "earlier-masked-decay.json"
+"""The file an intermediate Dew (main f124c76b5 until row 12338's deletion of its restore translation) kept
+beside a run whose earlier record masked its decay off as it rewrote that record, its masked parts' decay
+written as 0 (`{"unmasked_all": true}` or `{"unmasked_groups": [...]}`): read by `unmarked`, where the run
+resumes (`dew.config.RunConfig.resumed`)."""
+
+INERT_DECAY = 1e-4
+"""The decay a part masked off is given where its rewritten record holds 0: one its mask makes inert,
+which builds the masked decay step its checkpoints hold (`unmarked`)."""
+
+
+def unmarked(record: Mapping[str, object], mark: Mapping[str, object]) -> Mapping[str, object]:
+    """A run record an intermediate Dew rewrote beside its `MASKED_DECAY_MARK` (`mark`), as its earlier run
+    trained: each part the mark names (its optimizer config ungrouped, or each named param group) masked
+    off by its own mask (`OptimConfig.decay_mask`, `ParamGroup.decay_mask`) and unspared, its decay of 0,
+    which that Dew wrote in its place, given `INERT_DECAY`, so its optimizer holds the masked decay step its
+    checkpoints hold. The decay it trained at is not recorded: one of 0 held no step, so a checkpoint of
+    such a run is refused at its restore, its tree another, never read across (Main, review of d22)."""
+    named = _records.class_record({key: value for key, value in record.items() if key not in MARKERS})
+    if named is None:
+        return record
+    fields = dict(_records.record(named[1], "run fields"))
+    optim = fields.get("optim")
+    tagged = _records.class_record(optim) if isinstance(optim, Mapping) else None
+    config = dict(_records.record(tagged[1] if tagged is not None else optim, "optim"))
+
+    def masked(part: Mapping[str, object], decay_of) -> Mapping[str, object]:
+        return {**decay_of(part), "decay_mask": False, "spared": False}
+
+    def decayed(fields_: Mapping[str, object]) -> Mapping[str, object]:
+        return {**fields_, "weight_decay": fields_.get("weight_decay") or INERT_DECAY}
+
+    if mark.get("unmasked_all") is True:
+        optimizer = config.get("optimizer")
+        held = _records.class_record(optimizer) if isinstance(optimizer, Mapping) else None
+        if held is not None:
+            config["optimizer"] = {"class": held[0], "fields": decayed(_records.record(held[1], "optimizer"))}
+        config = masked(config, lambda part: dict(part))
+    else:
+        names = set(_records.listed(mark.get("unmasked_groups"), "unmasked groups", read=_records.text,
+                                    what="the names of the param groups the mark unmasked"))
+        groups = config.get("param_groups") or []
+        assert isinstance(groups, list), groups
+        config["param_groups"] = [masked(group, decayed) if isinstance(group, Mapping)
+                                  and group.get("name") in names else group for group in groups]
+    fields["optim"] = {"class": tagged[0], "fields": config} if tagged is not None else config
+    return {**record, "fields": fields}
+
+
+def _masked(mask: _records.JSON, config: _Fields) -> _Fields:
     """An earlier optimizer's `mask` among its options (`optimizer_opts`), which Dew's own optimizers take no
-    longer, as its spec's `settings` and its config's param groups (`config`'s `param_groups`), each
-    returned. Where the config spared its decay (`OptimConfig.spared`, on by default) its own mask was
-    written over it, as a group's that spared (`ParamGroup.spared`, off by default) was, every group reading
-    it alike: it changed nothing, as a mask of True or None did not. A mask of False read decayed nothing
-    there (`mask_readers`): its decay 0, the config's ungrouped, each unspared group's grouped, as it
-    trained. The empty state its masked decay step held, which a decay of 0 holds bare, and Adam's coupled
-    decay step ahead of its moments, which a decay of 0 holds none of (`Adam.COUPLED`), a restore of a run
-    whose record was this one (`unmasked_decay`) takes as they are
-    (`dew.checkpoints._state_trees.masked_decay_unsaved`). A tree of booleans is that decay's own mask where
-    it was read (`OptimConfig.decay_mask`, `ParamGroup.decay_mask`), its state as it was; any other mask is
-    refused."""
-    if mask is None or mask is True:
-        return settings, config
+    longer, as its config's decay mask (`OptimConfig.decay_mask`) or each param group's that read it
+    (`ParamGroup.decay_mask`, `mask_readers`): a boolean or a tree of them, Optax's decay mask, which builds
+    the decay step, and its state, the earlier Dew built, so its checkpoints restore as they were written.
+    Where the config spared its decay (`OptimConfig.spared`, on by default) its own mask was written over
+    it, as a group's that spared (`ParamGroup.spared`, off by default) was: it changed nothing, as a mask of
+    None did not. Any other mask, which no record of this Dew states, is refused."""
+    if mask is None:
+        return config
     groups, read = mask_readers(config)
     if not read:
-        return settings, config
-    if isinstance(mask, Mapping):
-        # A tree of booleans, the decay's own mask where it was read (`decay_mask`): its state the masked
-        # decay step a spared decay's is, so its checkpoints restore as they were written.
-        if not groups:
-            return settings, {**config, "decay_mask": mask}
-        masked: list[_records.JSON] = [
-            {**group, "decay_mask": mask} if isinstance(group, Mapping) and group in read else group
-            for group in groups]
-        return settings, {**config, "param_groups": masked}
-    if mask is not False:
+        return config
+    if type(mask) is not bool and not isinstance(mask, Mapping):
         raise ValueError(f"an earlier run masked its decay by {mask!r}, which no record of this Dew states: "
                          "set OptimConfig.decay_mask or its param groups' in its place")
     if not groups:
-        return {**settings, "weight_decay": 0.0}, config
-    unmasked: list[_records.JSON] = [
-        {**group, "weight_decay": 0.0} if isinstance(group, Mapping) and group in read else group
-        for group in groups]
-    return settings, {**config, "param_groups": unmasked}
+        return {**config, "decay_mask": mask}
+    return {**config, "param_groups": [{**group, "decay_mask": mask}
+                                       if isinstance(group, Mapping) and group in read else group
+                                       for group in groups]}
 
 
 def _recorded_class(name: str) -> type | None:

@@ -18,6 +18,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend.mlir import ir
 from jax.extend.mlir.dialects import arith, memref, scf
 
+from dew.algebra import scan as prefix_scan
 from dew.nn.kernels import recurrence_algebra as algebra
 from dew.nn.kernels.templates import emission, mosaic, native, resources, scan, swizzling
 from dew.nn.kernels.templates.cost import Work
@@ -42,6 +43,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     stream_tile,
     stream_views,
 )
+from dew.nn.precision import compensated_add
 
 
 def own_staging(call: Call, keys: int, *, padded: bool = True) -> tuple:
@@ -462,7 +464,7 @@ def key_pairs_own(q, k, prefix, beta, d_scores, d_system, taken, factored, memor
     The log decay's it finishes too, summed back over its chunk: the factored pairs' and the memory's terms
     (`decays`, `[R, HV * Dk]` fp32 each) added to its own, then each column's suffix sums from the chunk's
     last token down, each started at its memory decay's term `ending` `[chunks, HV * Dk]` (the last token's,
-    `sum(h dh) exp2(g_last)`), compensated (`scan.suffix_columns`; interpreted, `algebra.suffix_summed`).
+    `sum(h dh) exp2(g_last)`), compensated (`scan.suffix_columns`; interpreted, `_suffix_summed`'s).
     In XLA, the terms' sum and the last token's term were a pass over them and the suffix sums a batched
     fp32 product, 197 and 209 us of Kimi Linear's training on an A100 (M-JS-222). A clamped call's
     (`Call.clamped`) its clamp's derivative applied as it is stored, from the call's log decays laid
@@ -593,9 +595,13 @@ def _suffix_summed(call: Call, suffix: list, start, floor, terms: jax.Array) -> 
     `start` (`key_pairs_own`'s), and where `floor` views its log decays `[C, keys]` (a clamped call's) the
     clamp's derivative applied (`clamped_gradient`), read once the sums are: natively through the staged tile
     `suffix` (its terms' rows, then the starts' row, `scan.suffix_columns`), read back in the terms' layout
-    (`Family.tile_of`); interpreted, as a tile (`algebra.suffix_summed`)."""
+    (`Family.tile_of`); interpreted, as a tile: the compensated suffix sums (`dew.algebra.scan.compensated`),
+    each column's start added to its pair, each sum rounded once."""
     if call.interpret:
-        summed = algebra.suffix_summed(terms, start)
+        terms = terms.astype(jnp.float32)
+        high, low = prefix_scan.compensated(terms, axis=0, reverse=True)
+        started = (jnp.asarray(start, jnp.float32)[None], jnp.zeros_like(high[:1]))
+        summed = compensated_add((high, low), started)[0]
     else:
         (tile,), chunk = suffix, call.chunk
         plgpu.store(tile.at[pl.ds(0, chunk)], terms, optimized=False)

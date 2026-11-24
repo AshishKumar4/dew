@@ -61,6 +61,12 @@ def test_ternary_weights_pack_decode_and_stage_match_bitwise():
     out_empty = gemm.ternary_weight_product(jnp.ones((16, 0), jnp.bfloat16), empty_w,
                                             out_dtype=jnp.float32, interpret_on_cpu=False)
     np.testing.assert_array_equal(np.asarray(out_empty), np.zeros((16, 64), np.float32))
+    # And pull back through the rescue's branch, traced, under a jit: an empty gradient.
+    empty_product = functools.partial(gemm.ternary_weight_product, weights=empty_w,
+                                      quantize_activations=False, out_dtype=jnp.float32)
+    pull = jax.jit(lambda dy: jax.vjp(empty_product, jnp.ones((16, 0), jnp.float32))[1](dy))
+    (d_empty,) = pull(jnp.full((16, 64), 2.0 ** 126, jnp.float32))
+    assert d_empty.shape == (16, 0)
 
 
 def test_ternary_weight_product_holds_check_1_dense_grouped_bitlinear_and_compiles():
@@ -555,3 +561,29 @@ def test_swapped_register_decode_holds_for_fp8_and_ternary_at_skinny_rows():
                 assert not rec.get("error"), rec
                 assert rec["kernels"], rec
                 assert all(k.get("spilled") == 0 for k in rec["kernels"]), rec
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_packed_products_rescue_keeps_an_explicit_meshs_row_placement():
+    """A ternary product under an Explicit mesh, its rows split over two CPU devices and its codes whole:
+    cotangents of 4 and 4 against codes +1 and -1 at a scale of 2**126 pull back to 0 through the rescue,
+    and 4 and 2 to 2**127, the gradient placed as the rows are (row 1464)."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+    codes = jnp.zeros((256, 64), jnp.float32).at[0, 0].set(1.0).at[0, 1].set(-1.0)
+    weights = dataclasses.replace(formats.TernaryWeights.of(codes, scale=jnp.float32(1.0)),
+                                  scale=jnp.float32(2.0 ** 126))
+    with jax.set_mesh(mesh):
+        rows = jax.device_put(jnp.zeros((16, 256), jnp.float32).at[0, 0].set(1.0),
+                              NamedSharding(mesh, PartitionSpec("data")))
+        pull = jax.jit(lambda r, dy: jax.vjp(lambda x: gemm.ternary_weight_product(
+            x, weights, quantize_activations=False, out_dtype=jnp.float32), r)[1](dy)[0])
+        for second, expected in ((4.0, 0.0), (2.0, 2.0 ** 127)):
+            dy = jax.device_put(jnp.zeros((16, 64), jnp.float32).at[0, 0].set(4.0).at[0, 1].set(second),
+                                NamedSharding(mesh, PartitionSpec("data")))
+            d_rows = pull(rows, dy)
+            assert d_rows.sharding.spec[0] == "data", d_rows.sharding
+            want = np.zeros((16, 256), np.float32)
+            want[0, 0] = expected
+            np.testing.assert_array_equal(np.asarray(d_rows), want)

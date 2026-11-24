@@ -145,11 +145,20 @@ def _forward(x, taps, bias, valid, documents, parts, activation: bool, eps: floa
 
 def _backward(x, taps, bias, valid, documents, cotangents, parts, activation: bool, eps: float,
               interpret: bool):
-    """Every piece's gradients in one launch (`templates.recurrence.conv.backward`)."""
+    """Every piece's gradients in one launch (`templates.recurrence.conv.backward`) of one piece, the
+    pieces' cotangents joined along the channels: a normalised piece's taken through its norm in fp32 by a
+    launch joining them (`templates.recurrence.conv.through`), else by XLA's concatenation. A launch of
+    several pieces emitted its walk once a piece, Qwen3.5-4B's three pieces' backward 0.354 ms on a GH200
+    against one piece's 0.266 (M-JS-253b)."""
     from .templates.recurrence import conv
 
-    dx, dw, db = conv.backward(x, taps, bias, valid, documents, tuple(cotangents), parts=tuple(parts),
-                               activation=activation, eps=eps, **_launched(interpret))
+    if any(head is not None for _, head in parts):
+        cotangent = conv.through(x, taps, bias, valid, documents, tuple(cotangents), parts=tuple(parts),
+                                 activation=activation, eps=eps, **_launched(interpret))
+    else:
+        cotangent = jnp.concatenate(cotangents, axis=-1)
+    dx, dw, db = conv.backward(x, taps, bias, valid, documents, cotangent, activation=activation,
+                               **_launched(interpret))
     # The taps' and bias's gradients formed in their dtypes before the input's cotangent leaves (row 6027).
     dx, (d_taps, d_bias) = with_gradients_formed(
         dx, (dw.T.astype(taps.dtype), None if bias is None else db.astype(bias.dtype)))

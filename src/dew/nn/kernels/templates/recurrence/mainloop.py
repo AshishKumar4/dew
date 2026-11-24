@@ -963,7 +963,7 @@ def _laid(call: Call, scope: Callable[[int], resources.Scope], registers: int, t
         launch = resources.Launch(scope, 1, registers, floor=1, most=most, entry=entry,
                                   most_programs=most_programs)
         found = _planned_launch(call, launch)
-        held = cost.wave(call.target, found.programs if found else 1)
+        held = cost.wave(call.target.multiprocessors, found.programs if found else 1)
         return found, min(tiles, held), launch
     floor, most = stages if isinstance(stages, tuple) else (stages, stages)
     launch = resources.Launch(scope, consumers, registers, floor=floor, most=most, entry=entry,
@@ -1709,12 +1709,9 @@ def _weighted_swizzles(call: Call, keyed: int) -> dict:
 
 def _weighted_split(call: Call, keyed: int, once: tuple[str, ...]) -> tuple[dict, dict]:
     """`_weighted`'s streams' blocks at key block `keyed` (`_weighted_streamed`) split into those its walk
-    steps through and those loaded `once`; a once stream the launch has not refused, as a name matching none
-    of its parts left every step reloading it unseen (#3771's review: 'inverse' named none of its parts)."""
+    steps through and those loaded `once`, its names its streams' own (`part_names`, `vector_blocks`, as
+    `_weighted_once` builds them)."""
     streamed = _weighted_streamed(call, keyed)
-    if missing := set(once) - set(streamed):
-        raise ValueError(f"_weighted's once streams {sorted(missing)} are none of its streams "
-                         f"{sorted(streamed)}")
     return ({name: block for name, block in streamed.items() if name not in once},
             {name: block for name, block in streamed.items() if name in once})
 

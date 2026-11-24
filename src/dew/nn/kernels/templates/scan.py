@@ -15,7 +15,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
-from jax._src.lib.mlir.dialects import nvvm
+from jax._src.lib.mlir.dialects import math as mlir_math, nvvm
 from jax._src.pallas.mosaic_gpu import core as plgpu_core
 from jax.experimental.mosaic.gpu import fragmented_array as fa, utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
@@ -148,7 +148,7 @@ def compensated_columns(pairs, running) -> None:
 def suffix_columns(terms) -> None:
     """Each column of `terms`, a plain fp32 shared tile `(rows + 1, columns)`, its rows' terms and then its
     starting sum, replaced row by row by its suffix sum, row `r` the start plus rows `r` to the last
-    (`algebra.suffix_summed`'s arithmetic: each term joined to a running compensated pair,
+    (`compensated_columns`' arithmetic, `_column_sums`: each term joined to a running compensated pair,
     `precision.renormalized_sum`, its rounded sum stored), a column a thread of the first `columns` (at most
     `THREADS`), its loads and stores its own words, and the warpgroup met once when done. Additions alone, so
     no multiply contracts into them."""
@@ -169,13 +169,27 @@ def _suffix_columns(ref) -> None:
     thread = arith.remui(utils.thread_idx(), arith.constant(i32, THREADS))
     column = arith.index_cast(index, thread)
     zero = native.Word(arith.constant(f32, 0.0))
+
+    def at(row: int) -> list:
+        return [arith.constant(index, row), column]
+
     with utils.when(arith.cmpi(arith.CmpIPredicate.ult, thread, arith.constant(i32, columns))):
-        pair = (native.Word(memref.load(ref, [arith.constant(index, rows), column])), zero)
-        for row in reversed(range(rows)):
-            at = [arith.constant(index, row), column]
-            pair = precision.renormalized_sum(pair, (native.Word(memref.load(ref, at)), zero))
-            memref.store(pair[0].value, ref, at)
+        _column_sums(reversed(range(rows)), lambda row: (native.Word(memref.load(ref, at(row))), zero),
+                     lambda row, pair: memref.store(pair[0].value, ref, at(row)),
+                     (native.Word(memref.load(ref, at(rows))), zero))
     utils.warpgroup_barrier()
+
+
+def _column_sums(rows, term, store, pair):
+    """A thread's column's running compensated sum: `pair` joined to each of `rows`' terms (`term(row)`, a
+    `(hi, lo)` of words) in their order by `precision.renormalized_sum`, each sum handed to `store(row,
+    sum)`, the last returned: the running prefix's (`compensated_columns`, its terms pairs, both halves
+    stored) and the decay gradient's suffix sums (`suffix_columns`, its terms one word, the sums' rounded
+    halves stored, from the last row)."""
+    for row in rows:
+        pair = precision.renormalized_sum(pair, term(row))
+        store(row, pair)
+    return pair
 
 
 def zeroed_columns(running) -> None:
@@ -208,14 +222,16 @@ def _compensated_columns(ref, running) -> None:
         hi, lo = (native.Word(memref.load(source, [half, *at])) for half in halves)
         return hi, lo
 
-    pair = pair_at(running, [column])
-    for row in range(rows):
-        at = [arith.constant(index, row), column]
-        pair = precision.renormalized_sum(pair, pair_at(ref, at))
+    def stored(target, at: list, pair) -> None:
         for half, value in zip(halves, pair, strict=True):
-            memref.store(value.value, ref, [half, *at])
-    for half, value in zip(halves, pair, strict=True):
-        memref.store(value.value, running, [half, column])
+            memref.store(value.value, target, [half, *at])
+
+    def at(row: int) -> list:
+        return [arith.constant(index, row), column]
+
+    pair = _column_sums(range(rows), lambda row: pair_at(ref, at(row)),
+                        lambda row, pair: stored(ref, at(row), pair), pair_at(running, [column]))
+    stored(running, [column], pair)
     utils.warpgroup_barrier()
 
 
@@ -294,9 +310,16 @@ def _interpreted(decays, writes, carried, reverse: bool, exclusive: bool):
     return states, last
 
 
+def _fused(x, y, z):
+    """`x y + z` rounded once (`math.fma`, the hardware's FFMA): the scan's every join and apply, where a
+    multiply rounded apart from its add issued two instructions (an A100's selective backward 30.2 FMULs and
+    14.4 FADDs a token and state against mamba_ssm's 13.5 and 1.6, its FFMAs 3.8 to their 8.3; M-JS-241)."""
+    return mlir_math.fma(x, y, z)
+
+
 def _pair(first, then):
     """Two pairs `(a, b)` combined, `first`'s positions before `then`'s in the scan's order."""
-    return arith.mulf(first[0], then[0]), arith.addf(arith.mulf(then[0], first[1]), then[1])
+    return arith.mulf(first[0], then[0]), _fused(then[0], first[1], then[1])
 
 
 def _shuffled(pair, distance: int, reverse: bool):
@@ -368,10 +391,10 @@ def _scanned(a: fa.FragmentedArray, b: fa.FragmentedArray, carried: fa.Fragmente
     # The state before this thread's first position, then each of its positions'.
     [h] = carried.registers.flat
     prefix = _pair(before_warp, within)
-    entering = arith.addf(arith.mulf(prefix[0], h), prefix[1])
-    states = [arith.addf(arith.mulf(pairs[i][0], entering), pairs[i][1]) for i in range(count)]
+    entering = _fused(prefix[0], h, prefix[1])
+    states = [_fused(pairs[i][0], entering, pairs[i][1]) for i in range(count)]
     registers = a.registers.copy()
     registers.flat[0] = vector.from_elements(a_vector.type, states)
-    last = arith.addf(arith.mulf(total[0], h), total[1])
+    last = _fused(total[0], h, total[1])
     return (fa.FragmentedArray(_registers=registers, _layout=a.layout, _is_signed=None),
             fa.FragmentedArray.splat(last, ()))

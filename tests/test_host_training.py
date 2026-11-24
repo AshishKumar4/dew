@@ -1707,9 +1707,14 @@ def test_a_fit_that_fails_placing_its_state_keeps_none_of_its_device_plan():
     it: the trainer that ran it holds no plan no compile took, and no candidate its search compiled
     outlives the fit (`StepCompiler.abandoned`; review of row 12131's P0 r7: a start whose state's
     placement raised left its plan on the trainer's compiler)."""
+    from dew.nn.kernels import options
     from dew.training import _candidates
     from dew.training.ahead import stand_in_gpus
     from dew.training.memory import host_memory_stated
+
+    # The traced steps a fit before it kept for a refit (`_candidates`): none of this one's.
+    options.release()
+    gc.collect()
 
     def refused():
         raise RuntimeError("the devices refused the start")

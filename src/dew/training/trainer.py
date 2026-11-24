@@ -37,7 +37,6 @@ from dew._coordination import agree_process_phase, agreed, agreed_same, broadcas
 from dew._records import JSON
 from dew.batch import Batch, at_path, owned_dicts, placed_at, select, unboxed
 from dew.checkpoints import Checkpoints, Envelope, Ranking, Resume, _Laid
-from dew.data.compile import Handed
 from dew.data.dataset import (
     Checkpointable,
     Closeable,
@@ -49,6 +48,7 @@ from dew.data.dataset import (
     StepPhases,
     stream_identity,
 )
+from dew.data.handed import Handed
 from dew.data.pipeline import Dataset
 from dew.data.plan import DataResume, PlanChanged, environment_changes
 from dew.distributed.batches import (

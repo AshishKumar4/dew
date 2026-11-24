@@ -94,12 +94,13 @@ def run(arrays, *, kda: bool, scale: float, rule, dtype, device, per_sequence: b
     and memory fp32 (in float64 for the reference), and with `gradients` the output's and final memory's
     gradients under the drawn cotangents; leaves as `fla_sites.LEAVES`, the output and final memory alone
     without them. A `simple` rule (fla's simple GLA) takes the write gate on its keys, `k beta`, which its
-    gradient's chain gives `beta`'s."""
+    gradient's chain gives `beta`'s, where a site draws one (lightning attention's draws none)."""
     import torch
 
     wide = dtype == torch.float64
     owned = "own" in arrays
-    differentiated = OWN_GRADIENTS if owned else GRADIENTS
+    differentiated = tuple(name for name in (OWN_GRADIENTS if owned else GRADIENTS) if name in arrays)
+    gated = "beta" in arrays
     tensors = {name: torch.tensor(np.asarray(value, np.float64 if wide else np.float32), device=device)
                for name, value in arrays.items() if name != "starts"}
     inputs = {name: tensors[name].to(dtype if name in ("q", "k", "v", "beta") else
@@ -126,8 +127,8 @@ def run(arrays, *, kda: bool, scale: float, rule, dtype, device, per_sequence: b
                 return out.transpose(1, 2), final
             return rule(q, k, v, g, fifth, scale=scale, initial_state=state, output_final_state=True, **flat)
         if simple:
-            return rule(q, k * fifth.unsqueeze(-1), v, g, scale=scale, initial_state=state,
-                        output_final_state=True, **flat)
+            return rule(q, k if fifth is None else k * fifth.unsqueeze(-1), v, g, scale=scale,
+                        initial_state=state, output_final_state=True, **flat)
         if kda:
             return rule(q, k, v, g, fifth, scale=scale, initial_state=state, output_final_state=True, **flat)
         return rule(q, k, v, fifth, g, scale=scale, initial_state=state, output_final_state=True, **flat)
@@ -138,7 +139,7 @@ def run(arrays, *, kda: bool, scale: float, rule, dtype, device, per_sequence: b
         outs, finals = [], []
         for (row, start, end, _), state in zip(spans, states, strict=True):
             q, k, v, g = (piece(name, row, start, end) for name in ("q", "k", "v", "g"))
-            fifth = inputs["own"] if owned else piece("beta", row, start, end)
+            fifth = inputs["own"] if owned else piece("beta", row, start, end) if gated else None
             out, final = called(q, k, v, g, fifth, state)
             outs.append(out)
             finals.append(final)
@@ -146,8 +147,8 @@ def run(arrays, *, kda: bool, scale: float, rule, dtype, device, per_sequence: b
     else:
         q, k, v, g = (torch.cat([piece(name, row, start, end) for row, start, end, _ in spans], dim=1)
                       for name in ("q", "k", "v", "g"))
-        fifth = inputs["own"] if owned else torch.cat([piece("beta", row, start, end)
-                                                       for row, start, end, _ in spans], dim=1)
+        fifth = (inputs["own"] if owned else None if not gated else
+                 torch.cat([piece("beta", row, start, end) for row, start, end, _ in spans], dim=1))
         lengths = [end - start for _, start, end, _ in spans]
         cu_seqlens = torch.tensor(np.cumsum([0, *lengths]), device=device, dtype=torch.long)
         out, final = called(q, k, v, g, fifth, torch.cat(states, dim=0), cu_seqlens=cu_seqlens)
