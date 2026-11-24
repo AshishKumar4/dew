@@ -782,7 +782,7 @@ def paired_projections(x: jax.Array | Gathered, first: jax.Array | Layered, seco
     """`expert_projection` of the same rows through two expert matrices of one shape (a gate's and an up
     projection's), as one paired product (`gemm.gemm`'s `paired`): a launch that takes the pair reads
     the rows once for both, and the call hands the two products on apart where its launch takes none
-    (`grouped_matmul._takes_pair`), each under `expert_projection`'s law. On an H100 the pair took 0.79
+    (`grouped_matmul._mosaic_takes`), each under `expert_projection`'s law. On an H100 the pair took 0.79
     to 1.0 of the two products' time at the routings of DeepSeek-V3, Qwen3-30B-A3B and GPT-OSS-20B, its
     outputs theirs bit for bit (FS-3699-PAIRED2-h100, ledger 3699). Both products take one compute dtype,
     the rows' and both matrices' however a matrix is held; two stacks read at one layer index (`Layered`,
