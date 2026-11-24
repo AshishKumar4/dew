@@ -1726,7 +1726,7 @@ def _cotangents(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, pr
     acc = jax.eval_shape(zero)
     # The epilogue's VJP, traced once, its accumulators' reads and pass-through cotangents read from it.
     vjp = _epilogue_vjp(kept, count, acc, sides)
-    rounded = _rounded_accumulators(saved or {}, count, epilogue, acc, sides)
+    rounded = _rounded_accumulators(saved or {}, count, epilogue, acc, sides, dtypes=dtypes, vjp=vjp)
     if rounded is not None and _reads_accumulators(vjp, count):
         # The epilogue reads its accumulators through their roundings alone, which the forward kept under
         # their names: its VJP at them widened is its VJP at the accumulators (`_rounded_accumulators`).
@@ -2304,21 +2304,60 @@ def _as_cotangent(cotangent, operand):
     return cotangent if cotangent.dtype == jax.dtypes.float0 else cotangent.astype(operand.dtype)
 
 
-def _rounded_accumulators(kept: dict, count: int, epilogue, acc, sides) -> tuple | None:
+def _rounded_accumulators(kept: dict, count: int, epilogue, acc, sides, *, dtypes: tuple,
+                          vjp: tuple) -> tuple | None:
     """The forward's kept outputs (`gemm`'s `named`, by their places among the outputs) that are the
-    epilogue's `count` accumulators each rounded to its dtype, where the epilogue reads each through its
-    rounding alone (one conversion, which is that output): every value the epilogue computes reads the
-    roundings, so its VJP at them widened back is its VJP at the accumulators, exactly (a rounding to a
-    narrower dtype widened and rounded again is itself). A paired product's two alike (a MoE's gate and up,
-    their activation in the epilogue, each kept: its backward reads them, the pair not recomputed, row
-    1376). None elsewhere (an accumulator's rounding not kept, an epilogue reading one otherwise)."""
+    epilogue's `count` accumulators each as its derivative reads it, None where any is not (an accumulator's
+    output not kept, read otherwise), the derivative then recomputing them. An output is an accumulator's
+    where the epilogue returns it at its own width (an fp32 or fp64 call's, its value the accumulator's) or
+    reads it through one rounding alone, which the output is, stored in a dtype that holds the rounding's
+    values exactly (`dtypes`: the call casts its outputs, a bf16 rounding stored as fp16 not the rounding's
+    value), and the epilogue's derivative (`vjp`, `_epilogue_vjp`'s program) reads the accumulator through
+    that rounding alone too (a custom JVP whose tangent reads the accumulator at its width reads more than
+    the rounding): its VJP at the rounding widened back is then its VJP at the accumulator, exactly. A
+    paired product's two alike (a MoE's gate and up, their activation in the epilogue, each kept: its
+    backward reads them, the pair not recomputed, row 1376)."""
     if not kept:
         return None
     jaxpr = jax.make_jaxpr(lambda *values: _tupled(epilogue, *values))(*(acc,) * count, *sides).jaxpr
-    roundings = [_rounding(jaxpr, var) for var in jaxpr.invars[:count]]
-    found = [next((value for at, value in kept.items() if jaxpr.outvars[at] is rounded), None)
-             if rounded is not None else None for rounded in roundings]
+    differentiated = vjp[0].jaxpr
+
+    def read(at: int):
+        var = jaxpr.invars[at]
+        if var in jaxpr.outvars:
+            # Returned at its own width: the output is the accumulator, whatever its derivative reads.
+            out = jaxpr.outvars.index(var)
+            return kept.get(out) if jnp.dtype(dtypes[out]) == var.aval.dtype else None
+        rounded = _rounding(jaxpr, var)
+        if rounded is None or rounded not in jaxpr.outvars:
+            return None
+        out = jaxpr.outvars.index(rounded)
+        width = rounded.aval.dtype
+        if (jnp.promote_types(width, dtypes[out]) != jnp.dtype(dtypes[out])
+                or not _read_rounded_alone(differentiated, differentiated.invars[at], width)):
+            return None
+        return kept.get(out)
+
+    found = [read(at) for at in range(count)]
     return None if any(value is None for value in found) else tuple(found)
+
+
+def _read_rounded_alone(jaxpr, var, width) -> bool:
+    """Whether `jaxpr` reads `var` only through conversions to `width` (and calls whose programs do,
+    `called`): every value it computes of `var` then a function of that rounding."""
+    if var in jaxpr.outvars:
+        return False
+    for eqn in jaxpr.eqns:
+        if var not in eqn.invars:
+            continue
+        if eqn.primitive is jax.lax.convert_element_type_p and eqn.outvars[0].aval.dtype == width:
+            continue
+        body = called(eqn)
+        if body is None or not all(_read_rounded_alone(body, inner, width)
+                                   for inner, outer in zip(body.invars, eqn.invars, strict=True)
+                                   if outer is var):
+            return False
+    return True
 
 
 def _rounding(jaxpr, var):
@@ -2346,17 +2385,32 @@ def _reads_accumulators(vjp: tuple, count: int) -> bool:
 
 
 def _passes_cotangent(vjp: tuple, at: int, dtypes: tuple, narrow) -> bool:
-    """Whether the epilogue's VJP (`_epilogue_vjp`'s program) hands its accumulator `at` one output's
-    cotangent unchanged (a bias's, a cast's) whose dtype `narrow` holds exactly: read from the VJP's own
-    program, its result traced back through conversions alone."""
+    """Whether the epilogue's VJP (`_epilogue_vjp`'s program) hands its accumulator `at` a cotangent whose
+    values `narrow` holds exactly: one output's passed through unchanged (a bias's, a cast's) in a dtype
+    `narrow` holds, or a value rounded to such a dtype and only widened since (a nonlinear epilogue's
+    cotangent of a bf16 rounding of its accumulator: the rounding's transpose rounds it to bf16, its
+    widening back holds it), read from the VJP's own program, its result traced back through conversions
+    alone."""
     closed, cotangents = vjp
     var = closed.jaxpr.outvars[at]
     producers = {out: equation for equation in closed.jaxpr.eqns for out in equation.outvars}
+    narrow = jnp.dtype(narrow)
+
+    def held(dtype) -> bool:
+        return jnp.promote_types(dtype, narrow) == narrow
+
+    widened = True  # every conversion between `var` and the result widens, exactly
     while var in producers and producers[var].primitive is jax.lax.convert_element_type_p:
-        var = producers[var].invars[0]
+        if widened and held(var.aval.dtype):
+            return True
+        source = producers[var].invars[0]
+        widened = widened and jnp.promote_types(source.aval.dtype, var.aval.dtype) == var.aval.dtype
+        var = source
+    if widened and held(var.aval.dtype):
+        return True
     if var not in cotangents:
         return False
-    return jnp.promote_types(dtypes[cotangents.index(var)], narrow) == jnp.dtype(narrow)
+    return held(dtypes[cotangents.index(var)])
 
 
 def _epilogue_vjp(epilogue, count: int, acc: jax.ShapeDtypeStruct, sides: tuple):
