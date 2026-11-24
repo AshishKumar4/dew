@@ -279,6 +279,30 @@ VISIBLE = {
 """Calls whose visibility is per-token ids (row 1495): block and image groups, documents beside blocks, key
 starts, a cached call's query slots."""
 
+GATHERED_VISIBLE = {
+    **VISIBLE,
+    # Real keys and places a window counts by: row r's places step by one past each of its first r keys.
+    "valid keys and places": {
+        "causal": True, "sliding_window": 5,
+        "key_valid": jnp.asarray([[column % 5 != 3 for column in range(SEQ_LEN)]] * BATCH),
+        "places": jnp.asarray([[column + min(column, row) for column in range(SEQ_LEN)]
+                               for row in range(BATCH)], jnp.int32)},
+    # A cached call's slots with padding, its queries reading the block holding their slot.
+    "padded slots": {"causal": True, "block_groups": _groups((1,) * BATCH),
+                     "query_slots": jnp.asarray([[column if column < 12 + row % 4 else -1
+                                                  for column in range(SEQ_LEN)] for row in range(BATCH)],
+                                                jnp.int32)},
+}
+"""`VISIBLE` and the ids it holds none of: key validity, places, padded slots (row 1495's gather path)."""
+
+
+def _gathered_draw(seed):
+    """Three query heads over one key head, which no two-way sequence's all-to-all divides: the gather."""
+    q_key, k_key, v_key, c_key = jax.random.split(jax.random.key(seed), 4)
+    query = jax.random.normal(q_key, (BATCH, SEQ_LEN, 3, 8), jnp.float32)
+    key, value = (jax.random.normal(k, (BATCH, SEQ_LEN, 1, 8), jnp.float32) for k in (k_key, v_key))
+    return query, key, value, jax.random.normal(c_key, query.shape, jnp.float32)
+
 
 @pytest.mark.mesh
 @pytest.mark.parametrize("implementation", ["reference", "xla"])
@@ -300,6 +324,60 @@ def test_per_token_visibility_travels_whole_through_the_all_to_all(name, impleme
              if var.aval.dtype == jnp.bool_ and var.aval.shape[-2:] == (SEQ_LEN, SEQ_LEN)
              and var.aval.shape[0] == BATCH]
     assert not masks, masks
+
+
+@pytest.mark.mesh
+@pytest.mark.parametrize("implementation", ["reference", "xla"])
+@pytest.mark.parametrize("name", sorted(GATHERED_VISIBLE))
+def test_per_token_visibility_is_read_at_each_striped_querys_slot_through_the_gather(name, implementation):
+    """The entry over a split sequence of heads the all-to-all does not divide (three over one, a two-way
+    sequence) takes the gather, whose striped queries read the call's key-side ids whole at their slots,
+    their global places (`attention_parallel._striped_visibility`), so no global `[B, 1, S, S]` mask is
+    built (row 1495): every id kind, its output and its gradients, forward and backward, on par with the
+    whole sequence's (check 1), on the kernels check 1's float64 truth runs."""
+    call = dict(GATHERED_VISIBLE[name], implementation=implementation)
+    entry = with_gradients(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call))
+    assert_exchanged_on_par(entry, entry, SPLIT, _gathered_draw,
+                            f"the entry through the gather, {name}, {implementation}")
+    with jax.set_mesh(SPLIT.build()):
+        program = jax.make_jaxpr(entry)(*_gathered_draw(0))
+    masks = [var.aval.shape for var in _variables(program.jaxpr)
+             if var.aval.dtype == jnp.bool_ and var.aval.shape[-2:] == (SEQ_LEN, SEQ_LEN)
+             and var.aval.shape[0] == BATCH]
+    assert not masks, masks
+
+
+@pytest.mark.mesh
+@pytest.mark.parametrize("name", sorted(GATHERED_VISIBLE))
+def test_the_template_builds_no_mask_of_a_gathered_calls_visibility(name):
+    """The template through the gather reads a call's per-token ids as its spans at each striped query's
+    slot, so its program holds no `[rows, 1, queries, S]` mask at all, its shard's or the batch's (row
+    1495)."""
+    call = dict(GATHERED_VISIBLE[name], implementation="template")
+    entry = with_gradients(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call))
+    with jax.set_mesh(SPLIT.build()):
+        program = jax.make_jaxpr(entry)(*_gathered_draw(0))
+    masks = [var.aval.shape for var in _variables(program.jaxpr)
+             if var.aval.dtype == jnp.bool_ and len(var.aval.shape) == 4 and var.aval.shape[1] == 1
+             and var.aval.shape[-1] == SEQ_LEN]
+    assert not masks, masks
+
+
+@pytest.mark.mesh
+def test_a_cross_call_through_the_gather_takes_its_visibility_as_a_mask():
+    """A cross call (eight queries over sixteen keys) of heads the all-to-all does not divide takes its key
+    validity as the mask it means (`attention_parallel.CROSS_GATHERED`: its queries hold no slots among its
+    keys), on par with the whole call's."""
+    call = {"key_valid": jnp.asarray([[column % 3 != 1 for column in range(SEQ_LEN)]] * BATCH),
+            "implementation": "reference"}
+
+    def draw(seed):
+        query, key, value, _ = _gathered_draw(seed)
+        cotangent = jax.random.normal(jax.random.key(seed + 99), (BATCH, 8, 3, 8), jnp.float32)
+        return query[:, :8], key, value, cotangent
+
+    entry = with_gradients(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call))
+    assert_exchanged_on_par(entry, entry, SPLIT, draw, "a cross call's block groups through the gather")
 
 
 @pytest.mark.mesh

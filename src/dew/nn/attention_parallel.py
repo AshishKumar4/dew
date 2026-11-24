@@ -72,24 +72,35 @@ def sequence_parallel_attention(kernel, query, key, value, shards: int, *, causa
     mask takes the exchange that sends fewer (`all_to_all_moves_less`).
     A dropping call drops what one device would in either (`template.DropPlaces`).
     `visibility`, the per-token ids a single device's kernel reads (documents, block and image groups, key
-    validity, runs, places, slots, key starts), the all-to-all alone takes (`exchanges_heads`): each device
-    holds whole sequences, so they travel whole beside them and no dense mask is built.
+    validity, runs, places, slots, key starts), either exchange takes where `visibility_refused` names no
+    reason: the all-to-all whole beside whole sequences, the gather its key-side ids whole beside the
+    gathered keys and each striped query reading them at its slot; no dense mask is built.
     """
     masked = causal or sliding_window is not None or mask is not None or bool(visibility)
-    if exchanges_heads(query, key, shards, masked=masked):
-        return exchanged_heads_attention(
-            kernel, query, key, value, shards, causal=causal, sliding_window=sliding_window, mask=mask,
-            bias=bias, sinks=sinks, key_value_seq_lengths=key_value_seq_lengths, dropout_rate=dropout_rate,
-            dropout_seed=dropout_seed, visibility=visibility)
-    if visibility:
-        raise LayoutRefused(
-            "per-token visibility ids travel whole beside whole sequences, which the all-to-all exchange "
-            "alone gives; this call's heads or lengths do not divide for it, so its caller takes the "
-            "visibility as a mask (`dew.nn.attention._sequence_sharded`)")
-    return gathered_keys_attention(kernel, query, key, value, shards, causal=causal,
-                                   sliding_window=sliding_window, mask=mask, bias=bias, sinks=sinks,
-                                   key_value_seq_lengths=key_value_seq_lengths, dropout_rate=dropout_rate,
-                                   dropout_seed=dropout_seed)
+    if visibility and (reason := visibility_refused(query, key, shards)):
+        raise LayoutRefused(f"{reason}, so its caller takes the visibility as a mask "
+                            "(`dew.nn.attention._sequence_sharded`)")
+    run = exchanged_heads_attention if exchanges_heads(query, key, shards, masked=masked) else (
+        gathered_keys_attention)
+    return run(kernel, query, key, value, shards, causal=causal, sliding_window=sliding_window, mask=mask,
+               bias=bias, sinks=sinks, key_value_seq_lengths=key_value_seq_lengths, dropout_rate=dropout_rate,
+               dropout_seed=dropout_seed, visibility=visibility)
+
+
+CROSS_GATHERED = ("a cross call's queries hold no slots among its keys, which the gather's striped queries "
+                  "read their ids at")
+"""Why the gather takes no visibility ids for a call whose queries are not its keys (`visibility_refused`)."""
+
+
+def visibility_refused(query, key, shards: int) -> str | None:
+    """Why the sequence exchange takes this call's per-token visibility ids as a mask, or None where it
+    passes them through: the one predicate both the exchange (`sequence_parallel_attention`) and its caller
+    (`dew.nn.attention._sequence_sharded`) read. The all-to-all takes every call it exchanges
+    (`exchanges_heads`); the gather a call whose queries are its keys, each striped query reading the
+    key-side ids at its slot (`CROSS_GATHERED` otherwise)."""
+    if exchanges_heads(query, key, shards, masked=True) or query.shape[-3] == key.shape[-3]:
+        return None
+    return CROSS_GATHERED
 
 
 BATCHED_RANKS = {"key_value_seq_starts": 1, "key_runs": 4}
@@ -112,6 +123,50 @@ def _check_rows(name: str, ids, rows: int) -> None:
         if jnp.ndim(leaf) == BATCHED_RANKS.get(name, 2) and leaf.shape[0] not in (1, rows):
             raise ValueError(f"{name} of shape {leaf.shape} leads with {leaf.shape[0]} rows beside the "
                              f"call's {rows}")
+
+
+def _striped_visibility(visibility: dict, shards: int, length: int, queries, rows: int) -> dict:
+    """A self call's per-token ids as the gather's striped queries read them, each with its split: a query
+    side striped (`stripe`) and split as the queries' sequence (`queries`' spec), a key side whole, a row's
+    split as the queries' rows (`_row_leading`); documents and places their query's and key's apart
+    (`CrossDocuments`, a pair); and each query's slot, its global place, `query_slots` (a cached call's own
+    slots striped, else the striped indices), so the template reads the key-side ids at it and ends
+    causality there."""
+    from dew.nn.documents import CrossDocuments
+
+    def split(name: str, leaf, query_axis: int | None):
+        """`leaf`'s spec: its rows as the queries' where it leads with them, its `query_axis` as theirs."""
+        axis = None if query_axis is None else query_axis % jnp.ndim(leaf)
+        return P(*(_entry(queries, 0) if at == 0 and _row_leading(name, leaf, rows)
+                   else _entry(queries, 1) if at == axis else None for at in range(jnp.ndim(leaf))))
+
+    def query_side(name: str, leaf, axis: int):
+        return stripe(leaf, shards, axis=axis), split(name, leaf, axis)
+
+    def key_side(name: str, leaf):
+        return leaf, split(name, leaf, None)
+
+    out = {}
+    for name, ids in visibility.items():
+        if name == "segment_ids":
+            query_ids, key_ids = (ids.query, ids.key) if isinstance(ids, CrossDocuments) else (ids, ids)
+            (query_ids, query_spec), (key_ids, key_spec) = (query_side(name, query_ids, -1),
+                                                            key_side(name, key_ids))
+            out[name] = (CrossDocuments(query_ids, key_ids), CrossDocuments(query_spec, key_spec))
+        elif name == "places":
+            query_places, key_places = ids if isinstance(ids, tuple) else (ids, ids)
+            (query_places, query_spec), (key_places, key_spec) = (query_side(name, query_places, -1),
+                                                                  key_side(name, key_places))
+            out[name] = ((query_places, key_places), (query_spec, key_spec))
+        elif name == "key_runs" and jnp.ndim(ids) >= 3:
+            # `[B, Q, R, 2]` or every row's `[Q, R, 2]`, its queries third from last; `[R, 2]` every query's.
+            out[name] = query_side(name, ids, -3)
+        elif name != "query_slots":
+            out[name] = key_side(name, ids)
+    slots = visibility.get("query_slots")
+    slots = jnp.broadcast_to(jnp.arange(length, dtype=jnp.int32) if slots is None else slots, (rows, length))
+    out["query_slots"] = query_side("query_slots", slots, -1)
+    return out
 
 
 def exchanges_heads(query, key, shards: int, *, masked: bool) -> bool:
@@ -347,7 +402,7 @@ def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
 
 def gathered_keys_attention(kernel, query, key, value, shards: int, *, causal,
                             sliding_window, mask, bias, sinks, key_value_seq_lengths=None,
-                            dropout_rate=0.0, dropout_seed=None):
+                            dropout_rate=0.0, dropout_seed=None, visibility=None):
     """Run `kernel` on each shard's slice of the queries against the whole
     keys and values, which every shard gathers over the sequence axis.
 
@@ -360,13 +415,19 @@ def gathered_keys_attention(kernel, query, key, value, shards: int, *, causal,
     in the mask, which the kernel reads in place of its causal flag, so the mask
     and the caller's rotary angles stay exact. A dropping call draws each
     shard's weights at their global rows, heads and queries, its keys whole
-    (`template.DropPlaces`), so it drops what one device would.
+    (`template.DropPlaces`), so it drops what one device would. A call of
+    per-token `visibility` ids (`_striped_visibility`) keeps its causality and
+    window: each striped query reads them and ends its keys at its slot, its
+    global place, so no structural mask is built either.
     """
     q_len, kv_len = query.shape[1], key.shape[1]
     positions = jnp.arange(q_len)
     key, value = split_with_queries(key, value, tensor_shards(query))
 
-    reordered = causal or sliding_window is not None or mask is not None
+    reordered = causal or sliding_window is not None or mask is not None or bool(visibility)
+    causal_kept, window_kept = causal, sliding_window
+    if visibility:
+        causal, sliding_window = False, None
     if reordered:
         def rows_in_order(x: jax.Array | None) -> jax.Array | None:
             # A broadcast query row has the same value in either order.
@@ -411,6 +472,10 @@ def gathered_keys_attention(kernel, query, key, value, shards: int, *, causal,
         extras['dropout_rows'] = (jnp.arange(query.shape[0]), P(_entry(queries, 0)))
         extras['dropout_heads'] = (jnp.arange(query.shape[2]), P(_entry(queries, 2)))
         extras['dropout_queries'] = (positions, P(_entry(queries, 1)))
+    if visibility:
+        for name, ids in visibility.items():
+            _check_rows(name, ids, query.shape[0])
+        extras.update(_striped_visibility(visibility, shards, q_len, queries, query.shape[0]))
 
     def local(query, key, value, *arrays):
         if gathered:
@@ -423,6 +488,8 @@ def gathered_keys_attention(kernel, query, key, value, shards: int, *, causal,
             # Every device holds every key: their places are global.
             arguments.update(dropout_rate=dropout_rate, dropout_places=template.DropPlaces(
                 rows, heads, queries))
+        if visibility:
+            return kernel(query, key, value, causal=causal_kept, sliding_window=window_kept, **arguments)
         return kernel(query, key, value, causal=False, sliding_window=None, **arguments)
 
     attended = manual_map(
