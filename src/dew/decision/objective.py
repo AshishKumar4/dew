@@ -600,8 +600,8 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         loss = self._with_input_term(loss, term)
         if term is not None:
             aux = replace(aux, metrics={**aux.metrics, "input_ce": term})
-        qk, inspected = step.observed(sown)
-        return loss, replace(aux, qk_stats=qk, inspected=inspected)
+        qk, inspected, amax = step.observed(sown)
+        return loss, replace(aux, qk_stats=qk, inspected=inspected, amax=amax)
 
     def _with_input_term(self, loss: Ratio | Weighted, term: Ratio | None) -> Ratio | Weighted:
         """`loss` with the rows' own next-token term (`input_terms`) beside it at `input_lm`'s weight;
