@@ -102,14 +102,14 @@ def test_a_ring_family_stages_plain_and_packed_outputs_side_by_side():
 
 
 def _packed_store(rows: int, columns: int, divisor: int, chunk: int, *, transposed: bool, first=0,
-                  stored=None, least: int | None = None):
+                  stored=None, least: int | None = None, out_rows: int | None = None):
     """A kernel staging a share of `rows` by `columns` tile columns, each its column's index plus a thousand
     times its row, through two buffers of `chunk` tile columns stored packed (`stores.staged_chunks`), its
     write keeping each `divisor`th column (a stand-in for a block's scale), transposed where asked, its
     share's rows `first` to `first + stored` (the share where None), copied in rungs of at least `least` rows
-    (the share's)."""
-    stored = chunk // divisor
-    block = (stored, rows) if transposed else (rows, stored)
+    (the share's), into an output of `out_rows` rows (the share's)."""
+    packed_columns = chunk // divisor
+    block = (packed_columns, rows) if transposed else (rows, packed_columns)
 
     def write(buffer, piece):
         kept = piece[:, ::divisor]
@@ -126,7 +126,8 @@ def _packed_store(rows: int, columns: int, divisor: int, chunk: int, *, transpos
 
         pl.run_scoped(scoped, plgpu.SMEM((2, *block), jnp.float32))
 
-    out = (columns // divisor, rows) if transposed else (rows, columns // divisor)
+    total = rows if out_rows is None else out_rows
+    out = (columns // divisor, total) if transposed else (total, columns // divisor)
     return plgpu.kernel(body, out_type=jax.ShapeDtypeStruct(out, jnp.float32),
                         interpret=plgpu.InterpretGPUParams())
 
@@ -171,3 +172,13 @@ def test_a_packed_chunk_is_sought_within_the_tile_and_its_issuers_piece_alike():
     dividing both, 32 columns (16 bytes a row), not 64, which the tile's last 32 columns do not fill."""
     codes = stores.Output((64, 96), jnp.uint8, 2)
     assert stores.output_staging(96, (jnp.uint8,), piece=64, packed=(codes,)) == (32, 2)
+
+
+@INTERPRETS
+def test_a_one_column_transposed_chunk_whose_last_share_passes_the_rows_end_is_refused():
+    """A transposed output a column a chunk (a 16-column block a stored column, chunks of 16) is one
+    contiguous run a share, which Mosaic GPU copies by a linear bulk copy clamped at the tensor's end, not its
+    row's: an 8-row share over 12 rows would run its last share's rows into the next column's, so it is
+    refused as it traces; over 16 rows each share ends at a row's end."""
+    with on_the_host(), pytest.raises(ValueError):
+        _packed_store(8, 32, 16, 16, transposed=True, out_rows=12)()
