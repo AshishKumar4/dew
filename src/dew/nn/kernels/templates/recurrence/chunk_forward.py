@@ -313,6 +313,15 @@ def _taken(dtype, family: mosaic.Family | None, *, per_key: bool, rounded: bool,
     return family
 
 
+def _reads_taken(reads, k, *, per_key: bool, delta: bool) -> None:
+    """Refuses `reads` (`forward`'s) the mainloop takes none of: but of the keys' shape, under the delta rule
+    and a decay a head."""
+    if reads is not None and (per_key or not delta or reads.shape != k.shape):
+        raise NotImplementedError("the mainloop's keys erase along reads of their own, of the keys' shape, "
+                                  "under the delta rule and a decay a head alone: the portable math takes "
+                                  "the rest")
+
+
 def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles, family, interpret,
              firsts=None, inverse=None, kept=None, keeps: bool = True, rounded: bool = False, apart: int = 0,
              values_gated: bool = False, unit_pairs: bool = False,
@@ -328,19 +337,16 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
     inverse where the call `keeps` it (`_solved`). A forked call's documents, laid as a packed call's are (its
     `starts`, `firsts` and `max_segments`), give `forked` (`tabled`): each row's walk takes up each document's
     memory from its table (`table.Table`). Where `reads` is given (`forward`'s), the solve and weighted
-    launches form the system's rows and the weights from them."""
+    launches form the system's rows and the weights from them (`_reads_taken`)."""
     dtype, per_key = jnp.result_type(q, k, v), g.ndim == 4
-    if reads is not None and (per_key or not delta or reads.shape != k.shape):
-        raise NotImplementedError("the mainloop's keys erase along reads of their own, of the keys' shape, "
-                                  "under the delta rule and a decay a head alone: the portable math takes "
-                                  "the rest")
+    _reads_taken(reads, k, per_key=per_key, delta=delta)
     family = _taken(dtype, family, per_key=per_key, rounded=rounded, delta=delta, skipped=skipped)
     batch, length, _, key_width = k.shape
     heads, value_width = v.shape[2:]
     scale = key_width ** -0.5 if scale is None else scale
     width, columns = padded_widths(family, key_width, value_width, kept=keeps, per_key=per_key, tiles=tiles)
-    q, k = (zero_padded(x.astype(dtype), 3, width) for x in (q, k))
-    reads = None if reads is None else zero_padded(reads.astype(dtype), 3, width)
+    given_reads = () if reads is None else (reads,)
+    q, k, *reads = (zero_padded(x.astype(dtype), 3, width) for x in (q, k, *given_reads))
     v = zero_padded(v.astype(dtype), 3, columns)
     g = zero_padded(g.astype(jnp.float32), 3, width) if per_key else g.astype(jnp.float32)
     # The delta rule's write gate in the operands' dtype, as fla's layer holds it; without the delta rule the
@@ -382,10 +388,9 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
     # A skip reads the values a launch holds as given (`Call.gated_keys`); else it is added after them.
     landed = jnp.dtype(jnp.float32 if skipped and not call.gated_keys else out_dtype or dtype)
     beta = laid(beta).reshape(rows, heads).T
-    q, k, v = (given.split(laid(x).reshape(rows, -1)) for x in (q, k, v))
-    reads = None if reads is None else given.split(laid(reads).reshape(rows, -1))
+    q, k, v, *reads = (given.split(laid(x).reshape(rows, -1)) for x in (q, k, v, *reads))
     # The system's rows and the weights the reads' where the call takes them, else the keys'.
-    rows_of = k if reads is None else reads
+    reads, rows_of = (reads[0], reads[0]) if reads else (None, k)
     a, w, u, keys, scores, system = None, None, v, k, None, []
     decays = laid(g).reshape(rows, -1)
     if per_key:

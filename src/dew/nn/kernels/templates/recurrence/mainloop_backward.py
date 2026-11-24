@@ -249,7 +249,7 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
     extra = None if dk_w is None else keyed(headed(dk_w, width))
     grads = _unlaid(run, (q, k, v, g, beta), dq, dk, dv, run.unlaid(dg), run.unlaid(dbeta), dh0, starts,
                     extra_dk=extra)
-    dreads = (None if d_reads is None
+    dreads = (None if d_reads is None or reads is None
               else keyed(headed(call.held.joined(d_reads), width)).astype(reads.dtype))
     return (*_tabled_gradients(run, grads, taken), dskip, _entered_gradient(run, taken), dreads), kept_
 

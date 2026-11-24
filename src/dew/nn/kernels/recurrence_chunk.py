@@ -318,11 +318,7 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
         wide_out = hooks.skip or epilogue
         # fla's simple GLA rounds as its release places it, values gated (`mainloop.Call.values_gated`).
         values_gated = simple_gla(hooks)
-        # An erase along reads of its own the template's under a decay a head (`chunk_forward.forward`).
-        reading = hooks.erase == 'read' and g.ndim == 3
-        transition = (hooks.erase not in ('tied', 'read') or hooks.value_decay
-                      or (hooks.erase == 'read' and not reading))
-        reads = -correction if reading else None
+        transition, reads = _transition(hooks, correction)
         unit_pairs = _unit_pairs(hooks)
         # The least log decay a token the layer proves, which a decay a key dimension's prefix reads
         # (`mainloop.Call.prefix_limbs`); a head's takes its compensated pair whatever it is.
@@ -359,7 +355,7 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
                                           turn, starts=starts, firsts=firsts, forked=carried,
                                           max_segments=max_segments, scale=scale, wide=fused_wide,
                                           rounded=rounded, values_gated=values_gated, unit_pairs=unit_pairs,
-                                          decay_bound=decay_bound, reads=-correction if reading else None)
+                                          decay_bound=decay_bound, reads=_transition(hooks, correction)[1])
             elif kernel == 'fla':
                 out, final = fla_rule(query, key, own, g, beta, state, starts=starts,
                                       max_segments=max_segments, scale=scale, wide=wide_out, firsts=firsts)
@@ -380,6 +376,16 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     # A token's output its last laid token's (`_laid`); the epilogue in work, the output rounded once.
     out = out[:, stride - 1::stride]
     return recurrence.normed(hooks, out, given, work).astype(dtype), final
+
+
+def _transition(hooks: recurrence.Hooks, correction) -> tuple[bool, jax.Array | None]:
+    """Whether a call's transition is its own (`PortCase.transition`), and the reads its keys erase along
+    where the template takes them (`Hooks.erase` 'read' under a decay a head, `chunk_forward.forward`'s
+    `reads`, the laid correction's reader negated): a read erase under a decay a key dimension is one."""
+    reading = hooks.erase == 'read' and hooks.decay == 'scalar' and correction is not None
+    reads = -correction if reading else None
+    own = hooks.erase not in ('tied', 'read') or hooks.value_decay or (hooks.erase == 'read' and not reading)
+    return bool(own), reads
 
 
 def _laid(hooks: recurrence.Hooks, tokens: tuple, given: dict, starts, firsts, max_segments: int | None):
