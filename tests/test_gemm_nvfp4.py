@@ -947,14 +947,14 @@ def test_an_nvfp4_products_gathered_rescue_sums_across_its_bands_seam_exactly():
 def test_an_nvfp4_operand_at_a_given_tensor_scale_is_the_rule_at_that_scale():
     """`NvFp4Block.quantized(x, tensor_scale)`, a delayed-scaling recipe's operand (row 12721): at `x`'s own
     tensor scale it is the current rule's operand bit for bit; at four times it, the operand of `x / 4` at
-    its own scale (an exact power of two through every quotient), its tensor scale the given one; and at a
+    `x`'s scale (an exact power of two through every quotient), its tensor scale the given one; and at a
     scale below `x`'s own, its block scales saturate at 448 and its codes at 6, as delayed scaling clips."""
     from dew.nn.kernels.projections import delayed_tensor_scale
 
     x = jnp.asarray(np.random.default_rng(12721).normal(size=(64, 128)), jnp.float32)
     own = formats.NvFp4Block.quantized(x)
     at_own = formats.NvFp4Block.quantized(x, own.scale)
-    quartered = formats.NvFp4Block.quantized(x / 4)
+    quartered = formats.NvFp4Block.quantized(x / 4, own.scale)
     at_four = formats.NvFp4Block.quantized(x, 4 * own.scale)
     for got, want in ((at_own, own), (at_four, quartered)):
         np.testing.assert_array_equal(np.asarray(got.codes).view(np.uint8),
