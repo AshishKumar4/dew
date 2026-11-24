@@ -834,40 +834,45 @@ def test_a_tpus_vector_units_take_a_fused_pairs_add_as_an_operation_of_its_own()
     assert paired == 2048 / rates.cuda, paired
 
 
+def _multiply_add_or_adds(row, index):
+    """A conditional its data decides: a multiply-add an element, or two lone adds an element."""
+    return lax.switch(index, [lambda row: row * row + row, lambda row: row + row + row], row)
+
+
 def test_a_tpu_counts_a_bodys_multiply_adds_as_its_vector_units_run_them():
     """A TPU's VPU runs a multiply and its add as two operations (`generation._TPUS`' calibration), so its
     count fuses none: a conditional of 128 multiply-adds or 256 lone adds keeps 256 operations, where a
     fused branch's credit beside the other's adds priced 384 (the review of lane/toolkit c9307c11146, P1)."""
-    def branched(row, index):
-        return lax.switch(index, [lambda row: row * row + row, lambda row: row + row + row], row)
-
     with generation.assumed("v5e"):
-        fixed = _emitted(branched, _ROW, jax.ShapeDtypeStruct((), jnp.int32)).roles[0].fixed
+        fixed = _emitted(_multiply_add_or_adds, _ROW, jax.ShapeDtypeStruct((), jnp.int32)).roles[0].fixed
     assert (fixed.operations, fixed.fused_multiply_adds) == (256, 0), fixed
 
 
-def test_an_unknown_branch_takes_the_issue_slots_its_costliest_branch_does():
-    """A conditional its data decides, one branch 128 fp32 adds, the other 64 integer xors: an H100 issues
-    one branch's instructions, 128 slots, a clock either way, which its units' most taken unit by unit (128
-    adds beside 64 xors, 192 slots) would make one and a half (the review of lane/toolkit c9307c11146, P2)."""
+def _issued_branches(*branches) -> float:
+    """The issue slots of a conditional its data decides among `branches`, each of a row and 64 integers."""
     def branched(row, bits, index):
-        return lax.switch(index, [lambda row, bits: (row + row, bits), lambda row, bits: (row, bits ^ bits)],
-                          row, bits)
+        return lax.switch(index, list(branches), row, bits)
 
-    fixed = _emitted(branched, _ROW, jax.ShapeDtypeStruct((64,), jnp.int32),
-                     jax.ShapeDtypeStruct((), jnp.int32)).roles[0].fixed
-    target = generation.gpu_target("sm90")
-    assert max(cost.units(fixed, cost.rates(target, device=False))[0]) == 1 / target.loaded_clock_hz, fixed
+    return cost.issued(_emitted(branched, _ROW, jax.ShapeDtypeStruct((64,), jnp.int32),
+                                jax.ShapeDtypeStruct((), jnp.int32)).roles[0].fixed)
+
+
+def test_an_unknown_branch_takes_the_issue_slots_its_costliest_branch_does():
+    """A conditional its data decides, one branch 128 fp32 adds, the other 64 integer xors, issues one
+    branch's instructions: the costlier's slots, as a conditional of that branch beside one doing nothing,
+    where its units' most taken unit by unit counted both mixes (the review of lane/toolkit c9307c11146,
+    P2)."""
+    added, xored, kept = (lambda row, bits: (row + row, bits)), (lambda row, bits: (row, bits ^ bits)), (
+        lambda row, bits: (row, bits))
+    both = _issued_branches(added, xored)
+    assert both == max(_issued_branches(added, kept), _issued_branches(kept, xored)), both
 
 
 def test_an_unknown_branch_prices_the_most_lane_instructions_any_branch_issues():
     """A conditional its data decides, one branch 128 multiply-adds an FFMA each, the other 256 lone adds:
     its lanes run the costlier's 256 instructions, which a credit for the first's pairs, taken unit by unit
     over the branches' most, would cut to 128 (the review of lane/toolkit 5cbbe66c586, P1)."""
-    def branched(row, index):
-        return lax.switch(index, [lambda row: row * row + row, lambda row: row + row + row], row)
-
-    fixed = _emitted(branched, _ROW, jax.ShapeDtypeStruct((), jnp.int32)).roles[0].fixed
+    fixed = _emitted(_multiply_add_or_adds, _ROW, jax.ShapeDtypeStruct((), jnp.int32)).roles[0].fixed
     rates = cost.rates(generation.gpu_target("sm90"), device=False)
     assert cost.units(fixed, rates)[0][1] == 256 / rates.cuda, fixed
 

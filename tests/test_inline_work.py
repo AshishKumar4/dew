@@ -71,7 +71,7 @@ def _uniform_branch(*, multiplied: bool, xored: bool):
         del ctx
         first = memref.load(ref, [arith.constant(ir.IndexType.get(), 0)])
         positive = arith.cmpf(arith.CmpFPredicate.OGT, first, arith.constant(ir.F32Type.get(), 0.0))
-        branch = scf.IfOp(positive, [], hasElse=True)
+        branch = scf.IfOp(positive, [], has_else=True)
         with ir.InsertionPoint(branch.then_block):
             if multiplied:
                 arith.mulf(first, first)
