@@ -821,9 +821,12 @@ def test_a_delayed_nvfp4_dense_reads_its_history_and_records_its_rows():
         variables = layer.init(jax.random.key(0), x)
         assert variables[NVFP4_HISTORY]["amax_history"].tolist() == [0.0] * 16
         history = jnp.asarray([3.0, 7.5] + [0.0] * 14, jnp.float32)
-        held = {**variables, NVFP4_HISTORY: {"amax_history": history}}
+        # The state a step holds: its parameters and histories, no sown collection (an init sows too).
+        held = {"params": variables["params"], NVFP4_HISTORY: {"amax_history": history}}
         out, sown = layer.apply(held, x, mutable=[NVFP4_AMAX])
-        want = projections.recipe_projection(x, variables["params"]["kernel"], out_dtype=jnp.bfloat16,
+        # The layer's kernel as it multiplies it, promoted to its dtype.
+        kernel = variables["params"]["kernel"].astype(jnp.bfloat16)
+        want = projections.recipe_projection(x, kernel, out_dtype=jnp.bfloat16,
                                              tensor_scale=projections.delayed_tensor_scale(history))
         with pytest.raises(ValueError, match="amax histories"):
             layer.apply({"params": variables["params"]}, x)
