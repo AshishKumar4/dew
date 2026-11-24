@@ -24,7 +24,6 @@ from model_support import (
     attending,
     compiled_apply,
     decode_steps,
-    float64_twin,
     model_draw,
     unrolled as layer_at_a_time,
     with_logit_cotangent,
@@ -1164,7 +1163,7 @@ def test_a_gathered_loop_reads_its_block_gathered_once(remat):
     for gathered in (False, True):
         model, gradient = _gathered_case(gathered=gathered, remat=remat)
         variables, ids = model_draw(model, (8, 12), VOCAB)(0)
-        variables = jax.device_put(variables, layout.shardings(mesh, variables).tree)
+        variables = jax.device_put(variables, layout.shardings(mesh, variables))
         cotangent = jnp.ones((8, 12, VOCAB), jnp.float32)
         with jax.set_mesh(mesh), nn.logical_axis_rules(DEFAULT_RULES), placing(layout):
             text = jax.jit(gradient).lower(variables, ids, cotangent).compile().as_text()
@@ -1177,7 +1176,8 @@ def test_a_gathered_loop_reads_its_block_gathered_once(remat):
 def test_a_gathered_loop_trains_the_same_model():
     """A gathered loop's logits and every gradient, its block's parameters' summed across passes before
     their one reduce-scatter, are on par with the same loop's reading them where they lie (check 1, both
-    from the loop's own float64 twin): the same sums in another order (row 12722)."""
+    from the loop's float64 twin): the same sums in another order (row 12722). Every leaf split eight ways
+    over the FSDP axis (`Layout(min_shard=1)`)."""
     from dew.distributed.placement import Layout
     from dew.mesh import DEFAULT_RULES
     from dew.nn.sharding import placing
@@ -1185,20 +1185,27 @@ def test_a_gathered_loop_trains_the_same_model():
 
     mesh = MeshSpec(fsdp=8).build(jax.devices()[:8])
     layout = Layout(min_shard=1)
-    (model, gathered), (_, apart) = (_gathered_case(gathered=each, remat=False) for each in (True, False))
-    draw = with_logit_cotangent(model_draw(model, (8, 12), VOCAB), VOCAB, 12722)
+    loop = Loop(4, layers=(1, 3))
+    apart = tiny(num_layers=4, loop=loop, dtype="float32")
+    gathered = apart.clone(loop=dataclasses.replace(loop, gathered=True))
 
-    def placed(run):
-        def ran(variables, ids, cotangent):
-            variables = jax.device_put(variables, layout.shardings(mesh, variables).tree)
+    def result(model, *, placed: bool = True):
+        def run(tree, ids, cotangent):
+            pulled = with_gradients(lambda tree: model.apply(tree, ids, train=True))
+            logits, gradients = pulled(tree, cotangent)
+            return {'logits': logits, 'gradients': gradients}
+
+        def ran(tree, ids, cotangent):
+            if not placed:
+                return jax.jit(run)(tree, ids, cotangent)
+            tree = jax.device_put(tree, layout.shardings(mesh, tree))
             with jax.set_mesh(mesh), nn.logical_axis_rules(DEFAULT_RULES), placing(layout):
-                return jax.jit(run)(variables, ids, cotangent)
+                return jax.jit(run)(tree, ids, cotangent)
         return ran
 
-    wide = float64_twin(model)
-    assert_as_exact(placed(gathered), placed(apart), draw, "a gathered loop's logits and gradients",
-                    seeds=SEEDS["gathered"], truth_fn=with_gradients(lambda variables, ids: wide.apply(
-                        jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), variables), ids)))
+    draw = with_logit_cotangent(drawn(apart, 16, 8), VOCAB, 12722)
+    assert_as_exact(result(gathered), result(apart), draw, "a gathered loop's logits and gradients",
+                    seeds=SEEDS['gathered'], truth_fn=result(apart.clone(dtype=jnp.float64), placed=False))
 
 
 def test_a_gathered_loop_traced_under_no_layout_is_the_loop():
