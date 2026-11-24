@@ -159,8 +159,11 @@ def test_a_served_cohort_draws_what_its_policy_draws_whole(kind, sampling):
 
     @as_given
     def truth(variables):
-        # The actions the whole policy drew, teacher-forced in the float64 twin.
-        drawn = collected(whole, variables)
+        # The actions the whole policy drew, teacher-forced in the float64 twin: drawn as its arm draws them,
+        # in float32 outside the truth's x64 over the weights the gate widened (float32's exactly), by the
+        # arm's own program (row 12407: under x64 the collection compiled and ran a second time).
+        with jax.enable_x64(new_val=False):
+            drawn = collected(whole, jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float32), variables))
         with jax.enable_x64(new_val=True):
             wide = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), variables)
             return truth_score(wide, drawn["contexts"], drawn["tokens"])
