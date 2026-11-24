@@ -43,6 +43,7 @@ from dew.batch import (
 )
 from dew.inference.tasks import BlockGeneration, BlockSettings, processor_settings
 from dew.inputs import Field, InputSpec
+from dew.nn.dense import NVFP4_AMAX
 from dew.nn.inputs import ModelInputs
 from dew.nn.inspection import INSPECTED, QK
 from dew.nn.precision import at_least_fp32, weighted_total
@@ -309,9 +310,9 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
         return self.model.init(key, jnp.zeros((1, self.canvas_size), jnp.int32))
 
     def loss(self, variables: Variables, batch: Batch, step: Step):
-        stats, _, (qk, inspected) = self._scored(variables, batch, step, train=step.training)
+        stats, _, (qk, inspected, amax) = self._scored(variables, batch, step, train=step.training)
         return stats, Aux(metrics={"canvas_ce": stats.canvas, "encoder_ce": stats.encoder}, qk_stats=qk,
-                          inspected=inspected)
+                          inspected=inspected, amax=amax)
 
     def _evaluation_scores(self, params: Variables, batch: Batch, step: Step) -> TokenScores:
         """Return the denoiser's cross entropy on every canvas target of the batch.
@@ -509,6 +510,10 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
         qk = None
         if step.qk_stats:
             qk = sows_appended(sows_appended(mutated[QK], first_sown[QK]), second_sown[QK])
+        # The projections' largest magnitudes over every pass that ran them, the conditioning pass's among
+        # them, as the maxima are (row 12721).
+        amax = None if not step.amax else sows_appended(
+            sows_appended(mutated[NVFP4_AMAX], first_sown[NVFP4_AMAX]), second_sown[NVFP4_AMAX])
         # The encoder's pass and the denoiser's that carries the gradient, as the step watches them.
         inspected = None if step.watched is None else {
             "encoder": mutated.get(INSPECTED, {}), "denoiser": second_sown.get(INSPECTED, {})}
@@ -522,7 +527,7 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
                                                              at_least_fp32(encoder_states.dtype))
         encoder_losses, _, _ = self.head_terms(model, params, encoder_states, shifted, predict=False)
         correct = None if predicted is None else predicted == response
-        return canvas_losses, target_mask, encoder_losses, encoder_target_mask, correct, (qk, inspected)
+        return canvas_losses, target_mask, encoder_losses, encoder_target_mask, correct, (qk, inspected, amax)
 
     def reduce_loss(self, stats: BlockSFTStatistics):
         canvas, _ = stats.canvas.mean()

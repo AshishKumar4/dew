@@ -37,6 +37,7 @@ from dew.batch import Variables, dicts, part, thaw, unboxed, under
 from dew.inference.models import ReleasesModel
 from dew.inputs import Field, InputSpec, unit_range
 from dew.nn.backbones.decoder_stack import DecoderBank, nested_sites
+from dew.nn.dense import NVFP4_AMAX
 from dew.nn.inspection import INSPECTED
 from dew.nn.norms import LayerNorm
 from dew.nn.precision import accumulated, at_least_fp32
@@ -287,7 +288,10 @@ class JepaObjective(ReleasesModel, Objective[Ratio]):
         # Each part's under the name its variables take (`part`), which its cotangent probes are cut by.
         inspected = None if step.watched is None else {CONTEXT_ENCODER: encoder.get(INSPECTED, {}),
                                                        PREDICTOR: predictor.get(INSPECTED, {})}
-        return loss, Aux(representation_health(pooled), inspected=inspected)
+        # Its parts' largest magnitudes under their names, as their histories lie (`part`, row 12721).
+        amax = None if not step.amax else {CONTEXT_ENCODER: encoder.get(NVFP4_AMAX, {}),
+                                           PREDICTOR: predictor.get(NVFP4_AMAX, {})}
+        return loss, Aux(representation_health(pooled), inspected=inspected, amax=amax)
 
     def evaluate(self, params, batch, step: Step):
         """Return the pooled embeddings of the target encoder, the EMA copy, with the batch labels."""

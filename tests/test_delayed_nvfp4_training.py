@@ -22,12 +22,13 @@ DELAYED = Numerics(DTYPE_PRESETS["bf16-mixed"], low_precision=LowPrecision(recip
 """A run's numerics in the delayed-scaling NVFP4 recipe, which takes the feed-forward's projections."""
 
 
-def delayed_lm(split: int, checkpoints: Checkpoints | None = None) -> Trainer:
+def delayed_lm(split: int, checkpoints: Checkpoints | None = None, ema_decay: float | None = None) -> Trainer:
     """A two-layer LM whose feed-forward projections the delayed recipe takes, initialized under it (so its
-    variables hold their histories), its batch of sixteen rows read in `split` microbatches."""
+    variables hold their histories), its batch of sixteen rows read in `split` microbatches, keeping an
+    average of its weights at `ema_decay` where given."""
     model = CausalTransformer(vocab_size=64, emb_features=128, num_layers=2, num_heads=2, mlp_features=256,
                               max_seq_len=SEQ)
-    return Trainer(LMObjective(model, seq_len=SEQ), optax.adamw(1e-3), key=0,
+    return Trainer(LMObjective(model, seq_len=SEQ, ema_decay=ema_decay), optax.adamw(1e-3), key=0,
                    split=split, checkpoints=checkpoints)
 
 
@@ -75,3 +76,60 @@ def test_a_resumed_run_restores_its_amax_histories(tmp_path):
     for after, before in zip(histories(resumed), histories(saved), strict=True):
         np.testing.assert_array_equal(after[1:3], before[:2])
         assert after[0] > 0, after
+
+
+def rolled_once(state) -> None:
+    """Every amax history `state` holds took a recorded largest magnitude newest: each projection the step
+    ran was recorded at its history's path, none left at its start."""
+    held = histories(state)
+    assert held and all(history[..., 0].min() > 0 and not history[..., 1:].any() for history in held), held
+
+
+def test_a_decision_step_rolls_its_backbones_histories_where_they_lie():
+    """A decision objective's step, its backbone and head applied apart (`DecisionModel.beside_head`), rolls
+    each history its backbone holds under its own part (`nvfp4/backbone/...`): its records nest where its
+    histories lie, every scored exit's beside the last (review of row 12721: they came back unnested, and
+    the histories stayed at their start)."""
+    from decision_support import decision_rows
+    from test_decision_objective import EXAMPLES, LAYOUT, SPECIALS, TOKENIZER, tiny_backbone
+
+    from dew.decision import DecisionObjective
+
+    with generation.run_precision(DELAYED):
+        objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT)
+        state = Trainer(objective, optax.adamw(1e-3), key=0).fit(
+            decision_rows(EXAMPLES, 8, objective=objective.data()), steps=1)
+    rolled_once(state)
+
+
+def test_a_block_diffusion_step_rolls_the_largest_of_every_pass():
+    """A block diffusion step runs its projections in three passes (the encoder's, the conditioning pass's
+    and the denoiser's): its histories roll the largest any of them recorded, the step taken, not refused
+    (review of row 12721: the objective dropped its records and the step was refused)."""
+    from dew.nn.diffusion_gemma import DiffusionGemma
+    from dew.objectives.diffusion.block import BlockDiffusionObjective
+
+    text = CausalTransformer(vocab_size=16, emb_features=32, num_layers=2, num_heads=2, mlp_features=64,
+                             max_seq_len=8)
+    objective = BlockDiffusionObjective(DiffusionGemma(text=text, canvas_length=4), prompt_length=4)
+    rows = 8 * jax.device_count()
+    batch = {"text": np.random.default_rng(12721).integers(1, 16, size=(rows, 8)).astype(np.int32)}
+    with generation.run_precision(DELAYED):
+        trainer = Trainer(objective, optax.adamw(1e-3), key=0, split=1)
+        initial = trainer.initial_state()
+        state, *_ = trainer.compile(initial, batch)(initial, batch)
+    rolled_once(state)
+
+
+def test_an_averaged_forward_reads_the_committed_histories():
+    """A run that keeps an average of its weights averages no amax history: a forward over the averaged
+    weights (`TrainState.averaged`) reads the histories the run committed, bit for bit, and the run's
+    histories roll as a run keeping no average rolls them (review of row 12721: the average smoothed them,
+    and an averaged forward read a fraction of the step's largest)."""
+    with generation.run_precision(DELAYED):
+        averaged = delayed_lm(1, ema_decay=0.9).fit(data(), steps=1)
+        plain = delayed_lm(1).fit(data(), steps=1)
+    for one, other, read in zip(histories(averaged), histories(plain),
+                                jax.tree.leaves(averaged.averaged[NVFP4_HISTORY]), strict=True):
+        np.testing.assert_array_equal(one, other)
+        np.testing.assert_array_equal(np.asarray(read), one)
