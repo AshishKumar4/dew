@@ -131,6 +131,6 @@ def test_a_coupled_momentum_refuses_a_forked_call_and_an_unbounded_gate():
     q, k, v, log_decay, beta, mu, state, _ = operands(jnp.float32, False)(0)
     loads = jnp.zeros((ROWS, 1), jnp.int32)
     with pytest.raises(ValueError):
+        starts = jnp.zeros((ROWS, LENGTH), bool).at[:, 0].set(True)
         chunk(TIED, Chunk(q, k, v, log_decay=log_decay, beta=beta, momentum_decay=mu, state=state,
-                          starts=jnp.zeros((ROWS, LENGTH), bool).at[:, 0].set(True), loads=loads, stores=loads),
-              chunk_size=CHUNK)
+                          starts=starts, loads=loads, stores=loads), chunk_size=CHUNK)
