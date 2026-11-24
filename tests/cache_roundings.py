@@ -23,6 +23,7 @@ import pytest
 from jax.experimental import io_callback
 
 from dew.nn import kv_cache
+from dew.nn.kernels import generation
 from dew.nn.kv_cache import KVStore
 
 ROUNDING = kv_cache.quantize
@@ -108,7 +109,9 @@ def traced(decided: dict | None = None):
     """Each cache rounding a store writes while tracing inside reports itself to `collected` as its program
     runs; with `decided` (one row's decisions by name, `held`'s), each takes its codes and scales
     from it at its tokens' slots, so a run of one row reads them. A program compiled inside, and so a
-    server constructed inside, runs inside: its traces are keyed apart (`CAPTURED`)."""
+    server constructed inside, runs inside: its traces are keyed apart (`CAPTURED`). Its decoders run their
+    stacks a layer at a time (`generation.chosen(layer_scan="plain")`): a scanned run's layers write under
+    the run's one module path, which no report or decision would tell apart."""
     writing: list[tuple[KVStore, jax.Array, jax.Array, list[str]]] = []
     quantize, write, write_tokens = kv_cache.quantize, KVStore.write, KVStore.write_tokens
 
@@ -141,7 +144,8 @@ def traced(decided: dict | None = None):
                     scales)
         return codes, scales
 
-    with pytest.MonkeyPatch.context() as patch, CAPTURED(new_value=True):
+    with (pytest.MonkeyPatch.context() as patch, CAPTURED(new_value=True),
+          generation.chosen(layer_scan="plain")):
         patch.setattr(kv_cache, "quantize", rounded)
         patch.setattr(KVStore, "write", written)
         patch.setattr(KVStore, "write_tokens", tokens_written)

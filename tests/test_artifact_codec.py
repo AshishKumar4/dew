@@ -439,7 +439,7 @@ def test_streamed_validation_with_unencodable_host_column_refuses_together_acros
         "    partition = DataPartition.of(mesh)\n"
         "    loading = Loading(workers=0, threads=1, read_buffer=1)\n"
         "    model = CausalTransformer(vocab_size=16, emb_features=16, num_layers=1, num_heads=2,\n"
-        "                              mlp_features=32, max_seq_len=8, attention_impl='reference')\n"
+        "                              mlp_features=32, max_seq_len=8)\n"
         "    objective = LMObjective(model, seq_len=4, ema_decay=None)\n"
         "    variables = objective.init(jax.random.key(0))\n"
         "    agreed('worker init ready', lambda: None)\n"

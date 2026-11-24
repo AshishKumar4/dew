@@ -74,7 +74,7 @@ from checkpoint_cases import (
 )
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jepa_cases import MASK
-from model_support import float64_twin, floating_gradient, moved
+from model_support import attending, float64_twin, floating_gradient, moved
 from reference_error import Followed, Rounded, as_given, assert_as_exact, summed_as_run, widened
 from tiny_models import build_model, tiny_inputs
 
@@ -122,6 +122,7 @@ def gradient(model, variables, tokens, cotangent, **apply) -> dict:
 dtypes = pytest.mark.parametrize("dtype", DTYPES)
 
 
+@attending("reference")
 @pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 @pytest.mark.parametrize("name", PATHS)
 def test_a_token_models_reads_and_cache_invariance_match_its_forward(name):
@@ -149,6 +150,7 @@ def test_a_token_models_reads_and_cache_invariance_match_its_forward(name):
             same(written_c["cache"], cache)
             same(beside, without)
 
+@attending("reference")
 @pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 @pytest.mark.parametrize("name", [name for name in PATHS if name in DECODERS])
 def test_a_decoders_gradients_through_its_logits_match_its_forwards(name):
@@ -170,6 +172,7 @@ def _text(variables):
     return {collection: tree["text"] for collection, tree in variables.items() if "text" in tree}
 
 
+@attending("reference")
 @dtypes
 # The model's name alone, the id's last part (the dtype's, `dtypes`) left out: one key with its other tests.
 @pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*(?=-[a-z0-9_+]+$)")
@@ -208,6 +211,7 @@ def test_the_clean_read_is_the_causal_encoders_forward_over_the_shared_tree(name
     assert not all(np.array_equal(np.asarray(after), np.asarray(before)) for after, before in pairs)
 
 
+@attending("reference")
 @pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 @pytest.mark.parametrize("name", OWN)
 def test_trainable_layer_scalars_read_the_frozen_tree_moved_without_a_copy(name):
@@ -244,8 +248,7 @@ def _adapted(modules):
     """A tiny untied decoder whose head adds a bias and caps, under an adapter
     on `modules` whose B factors are drawn, so the adapter counts."""
     model = CausalTransformer(vocab_size=97, emb_features=24, num_layers=1, num_heads=3, mlp_features=32,
-                              max_seq_len=16, tie_embeddings=False, head_bias=True, final_logit_softcap=5.0,
-                              attention_impl="reference")
+                              max_seq_len=16, tie_embeddings=False, head_bias=True, final_logit_softcap=5.0)
     tokens = jnp.asarray(np.random.RandomState(0).randint(0, 97, (ROWS, LENGTH)), jnp.int32)
     variables = model.init(jax.random.key(0), tokens)
     variables["params"]["head_bias"] = jax.random.normal(jax.random.key(2), (97,)) / 7
@@ -256,6 +259,7 @@ def _adapted(modules):
     return model, variables, adapter.model, {**adapter.variables, "params": params}, tokens
 
 
+@attending("reference")
 def test_an_adapter_on_the_head_leaves_no_table_and_the_exact_head_scores_it():
     """The adapted head is `x W + scale (x A) B`, which no stored matrix is,
     so the model gives no table; its exact head over its states is its
@@ -269,6 +273,7 @@ def test_an_adapter_on_the_head_leaves_no_table_and_the_exact_head_scores_it():
     assert not np.array_equal(np.asarray(logits), np.asarray(model.apply(variables, tokens)))
 
 
+@attending("reference")
 def test_an_adapter_off_the_head_keeps_the_table():
     """An adapter on attention leaves the head a stored matrix: the table,
     read through the adapted model's frozen tree, contracts to its logits."""
@@ -289,6 +294,7 @@ MEDIA = [name for name in CHECKPOINTS
 for, beside the reference's own encoding of them."""
 
 
+@attending("reference")
 @pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 @pytest.mark.parametrize("name", MEDIA)
 def test_media_reach_the_logits_through_the_fused_reads(name):
@@ -341,6 +347,7 @@ TORCHAX_HEAD_SEEDS = 8
 """The torchax head site's declared check-1 seeds, sized by `seeds_for` paired on armada."""
 
 
+@attending("reference")
 def test_a_torchax_models_reads_are_its_forward(tmp_path):
     """A tiny random GPT-NeoX through transformers' own forward: the logits
     read is the call's, it writes no cache, and every field past the tokens
@@ -579,6 +586,7 @@ def _reference(name: str, call: tuple) -> tuple[Callable, Callable]:
                                quantized_arms.rounds)
 
 
+@attending("reference")
 @pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 @pytest.mark.parametrize("name", PATHS)
 def test_a_model_at_a_cache_capacity_computes_the_models_logits(name):
@@ -598,6 +606,7 @@ def _decodes(name: str) -> bool:
     return name in OWN or len(path) == 2 or path[2][4]
 
 
+@attending("reference")
 @pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 @pytest.mark.parametrize("name", [name for name in PATHS if _decodes(name)])
 def test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it(name):
@@ -640,6 +649,7 @@ def _packed(variables, groups) -> dict:
     return {**variables, "params": unflatten_dict(params)}
 
 
+@attending("reference")
 @pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 @pytest.mark.parametrize("name", [name for name in PATHS if name in DECODERS])
 def test_packed_projections_score_as_the_model_does(name):
@@ -740,6 +750,7 @@ def test_a_packed_rows_padding_continues_nothing():
     same(unmasked.extended(response).token_fields["positions"][::2, 5:], expected["positions"][::2, 3:])
 
 
+@attending("reference")
 def test_a_field_with_no_extension_rule_is_refused_and_a_named_rule_extends_it():
     """A routing replay has no value for slots the model has not routed, so
     extending it is refused until the caller names a rule, which also

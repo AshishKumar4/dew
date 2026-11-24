@@ -33,7 +33,7 @@ from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneratio
 from dew.lora import LoRA
 from dew.nn.precision import Numerics, numerics_of
 from dew.registry import ModelConfig
-from dew.training.budget import Horizon, Pause
+from dew.training.budget import Pause
 
 MULTIMODAL = "tests/fixtures/hf/gemma3-tiny-mm"
 """A multimodal source whose decoder its model nests (`MultimodalTransformer.language_model`), by its
@@ -148,11 +148,11 @@ def blockwise(root: Path, drawn: bool) -> RunConfig:
 
 
 def clocked(root: Path, drawn: bool) -> RunConfig:
-    """An LM run on the examples clock (`--trainer.horizon.examples`), its progress the examples it consumed,
+    """An LM run on the examples clock (`--trainer.examples`), its progress the examples it consumed,
     paused halfway (`--trainer.stop.fraction`), so a resume trains on to its bound: `lm`'s windows,
     unpacked, which its record reads back with no store to read (a packed chain checks its store's
     document ends as it is built)."""
-    return dataclasses.replace(lm(root, drawn), trainer=TrainerConfig(horizon=Horizon(examples=32),
+    return dataclasses.replace(lm(root, drawn), trainer=TrainerConfig(examples=32,
                                                                       stop=Pause(0.5)))
 
 

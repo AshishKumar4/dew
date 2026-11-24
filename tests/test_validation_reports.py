@@ -4,6 +4,7 @@ batch's decisions, so a pass's metrics pool exactly offline across batches and s
 
 import jax
 import numpy as np
+from model_support import attending
 
 from dew.artifacts import Decisions
 from dew.data import Memory
@@ -71,11 +72,12 @@ def test_macro_f1_pools_each_class_over_a_pass_and_keeps_questions_classes_apart
     assert count.finalize(counted) == len(gold)
 
 
+@attending("xla")
 def test_a_pass_writes_every_batchs_decisions_where_asked(tmp_path):
     """A pass asked to keep its decisions writes every batch's, its real rows alone, so the pooled files
     hold one row a record of the split and score as the pass's own metrics do."""
     backbone = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2, mlp_features=48,
-                                 max_seq_len=128, attention_impl="xla")
+                                 max_seq_len=128)
     objective = DecisionObjective(backbone, tokenizer=ByteTokenizer(), specials=SPECIALS,
                                   layout=SegmentLayout.state_first_row(max_len=96), shuffle_options=False)
     question = Choice("Which?", ["red", "green", "blue"])

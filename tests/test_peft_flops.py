@@ -6,6 +6,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from model_support import attending
 from test_model_flops import decoder, forward_products
 
 from dew.batch import FROZEN, TEXT_KEY
@@ -66,8 +67,9 @@ def test_frozen_dense_rank_factors_equal_the_actual_forward_and_gradient_dots():
                                         adapted.variables[FROZEN], x)
 
 
+@attending("reference")
 def test_adapted_prediction_depths_count_their_maps_and_the_reused_head():
-    model = decoder(num_nextn_predict_layers=2, attention_impl="reference", tie_embeddings=False)
+    model = decoder(num_nextn_predict_layers=2, tie_embeddings=False)
     tokens = jnp.ones((1, 6), jnp.int32)
     variables = model.init(jax.random.key(409), tokens)
     adapted = LoRA(rank=2, alpha=4, modules=("q_proj", "eh_proj", "lm_head")).apply(
@@ -106,11 +108,12 @@ def test_adapted_image_geometry_refuses_inherited_native_work_without_matrix_usa
             count(None, {"images": np.asarray(image)})
 
 
+@attending("reference")
 @pytest.mark.parametrize("fields", [{"altup": AltUp(num_inputs=2)},
                                     {"hyper_connections": HyperConnections(hc_mult=2, head="weighted")},
                                     {"attention_residuals": AttentionResiduals(block_size=2)}])
 def test_residual_streams_separate_learned_work_from_mixing_for_peft(fields):
-    model = decoder(causal=False, attention_impl="reference", **fields)
+    model = decoder(causal=False, **fields)
     tokens = jnp.ones((1, 4), jnp.int32)
     variables = model.init(jax.random.key(411), tokens)
     adapted = LoRA(rank=2, alpha=4, modules=("q_proj",)).apply(model, variables, key=511)
@@ -163,8 +166,9 @@ def test_mamba2_layers_learn_their_maps_and_conv_and_not_their_scan():
     assert adapted.model.training_flops(lengths) == 3 * native - learned + 3 * factors
 
 
+@attending("reference")
 def test_altup_adapter_router_is_used_for_both_prediction_and_correction():
-    model = decoder(altup=AltUp(num_inputs=2), attention_impl="reference", causal=False)
+    model = decoder(altup=AltUp(num_inputs=2), causal=False)
     tokens = jnp.ones((1, 4), jnp.int32)
     variables = model.init(jax.random.key(412), tokens)
     adapted = LoRA(rank=2, alpha=4, modules=("modality_router",)).apply(model, variables, key=512)

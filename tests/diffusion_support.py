@@ -152,7 +152,7 @@ def source_objective(source):
     from dew.interop.pretrained import Pretrained
     from dew.objectives.diffusion import DiffusionObjective
 
-    loaded = Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla")
+    loaded = Pretrained.load(str(source / "pipeline"), dtype="float32")
     return loaded, DiffusionObjective(loaded.model, loaded.process, loaded.inputs,
                                       autoencoder=loaded.autoencoder, variables=loaded.variables,
                                       unconditional_prob=0.0, ema_decay=None, steps=2)

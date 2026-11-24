@@ -15,6 +15,7 @@ import pytest
 from affine_run import TimingRegression as Regression, batches
 from diffusion_support import images_of
 from flax import linen as nn
+from model_support import attending
 
 import dew.config
 import dew.nn.backbones
@@ -25,10 +26,18 @@ from dew.data.dataset import Loader, Ramp
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.precision import Dtypes, Numerics
 from dew.nn.vision import GemmaProjector, SiglipVision
-from dew.optim import Adam, AdamW, GaussNewton, Lamb, Muon, MuonClip, Optax, OptimConfig
+from dew.optim import Adam, AdamW, Cosine, GaussNewton, Lamb, Muon, MuonClip, Optax, OptimConfig, ParamGroup
 from dew.registry import Aliases, ModelConfig, projectors, towers
-from dew.training import Checkpoints, FitPolicy, Layout, LocalTracker, MeshSpec, UpdateBatch, Wandb
-from dew.training.budget import Horizon
+from dew.training import (
+    Checkpoints,
+    FitPolicy,
+    Layout,
+    LocalTracker,
+    MeshSpec,
+    TrainerAdvanced,
+    UpdateBatch,
+    Wandb,
+)
 
 
 @pytest.mark.parametrize("dataset", ["tfds", "arrayrecord_shards"])
@@ -46,8 +55,8 @@ def test_to_dict_and_from_dict_round_trip_a_run(dataset, tmp_path):
     config = RunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 4, "emb_features": 64}),
         data=data,
-        optim=OptimConfig(optimizer=Lamb(b1=0.8, b2=0.99, weight_decay=0.1), learning_rate=1e-3),
-        trainer=TrainerConfig(name="run", horizon=Horizon(steps=10), mesh=MeshSpec(fsdp=2),
+        optim=OptimConfig(optimizer=Lamb(b1=0.8, b2=0.99, weight_decay=0.1), lr=1e-3),
+        trainer=TrainerConfig(name="run", steps=10, mesh=MeshSpec(fsdp=2),
                               layout=Layout(rules={"mlp": "fsdp"}, min_shard=8)),
     )
     record = config.to_dict()
@@ -62,7 +71,7 @@ def test_a_chain_the_record_cannot_describe_trains_from_python_and_refuses_to_re
     from dew.data import Memory
 
     data = Memory([{"x": 1.0, "y": 2.0}] * 8).map(lambda record: record).batch(8)
-    record = RunConfig(data=data, trainer=TrainerConfig(horizon=Horizon(steps=1))).to_dict()
+    record = RunConfig(data=data, trainer=TrainerConfig(steps=1)).to_dict()
     assert set(record["data"]) == {"unrecorded"}
     with pytest.raises(ValueError):
         RunConfig.from_dict(json.loads(json.dumps(record)))
@@ -78,7 +87,7 @@ def test_named_validation_splits_read_back_in_their_order(tmp_path):
     def windows(url):
         return TokenFiles(url).pipe(presets.token_windows, seq_len=8, batch=2)
 
-    config = RunConfig(data=windows("tokens/train"), trainer=TrainerConfig(horizon=Horizon(steps=1)),
+    config = RunConfig(data=windows("tokens/train"), trainer=TrainerConfig(steps=1),
                        validation={"val": windows("tokens/val"), "test": windows("tokens/test")})
     loaded = RunConfig.load(config.save(str(tmp_path / "run")))
     assert isinstance(loaded.validation, Mapping) and list(loaded.validation) == ["val", "test"]
@@ -95,7 +104,7 @@ def test_a_run_records_the_data_plan_it_reads_by_and_one_saved_before_names_eigh
     from dew.data.sources.tokens import TokenFiles
 
     config = RunConfig(data=TokenFiles("tokens/train").pipe(presets.token_windows, seq_len=8, batch=2),
-                       trainer=TrainerConfig(horizon=Horizon(steps=1)))
+                       trainer=TrainerConfig(steps=1))
     assert config.data_plan_version is None and config.resumed().data_plan_version == PLAN_VERSIONS[-1] == 17
     saved = config.resumed().record()
     assert RunConfig.read(saved).data_plan_version == 17
@@ -120,7 +129,7 @@ def test_a_run_naming_the_version_before_this_dews_records_this_dews(tmp_path):
 
     rows = np.random.default_rng(0).normal(size=(16, FEATURES)).astype(np.float32)
     loader = compile(Memory([{"x": row, "y": 2 * row[:2]} for row in rows]).batch(8).repeat(), resume="exact")
-    config = TrainerConfig(name="loaded", checkpoint_dir=str(tmp_path / "runs"), horizon=Horizon(steps=1),
+    config = TrainerConfig(name="loaded", checkpoint_dir=str(tmp_path / "runs"), steps=1,
                            eval_every=None, checkpoint_every=None, data_resume="exact")
     RunConfig(trainer=config, data_plan_version=PLAN_VERSIONS[0]).train(Regression(), loader, name="loaded")
     assert RunConfig.load(str(tmp_path / "runs" / "loaded")).data_plan_version == PLAN_VERSIONS[-1]
@@ -139,7 +148,7 @@ def test_a_run_naming_a_version_this_dew_reads_none_of_is_refused_with_a_compile
     rows = np.random.default_rng(0).normal(size=(16, FEATURES)).astype(np.float32)
     chain = Memory([{"x": row, "y": 2 * row[:2]} for row in rows]).batch(8).repeat()
     loader = compile(chain)
-    config = TrainerConfig(name="named", checkpoint_dir=str(tmp_path / "runs"), horizon=Horizon(steps=1),
+    config = TrainerConfig(name="named", checkpoint_dir=str(tmp_path / "runs"), steps=1,
                            eval_every=None, checkpoint_every=None, data_resume="exact")
     with pytest.raises(ValueError):
         RunConfig(trainer=config, data_plan_version=13).train(Regression(), loader, name="named")
@@ -157,9 +166,9 @@ def test_a_record_with_an_unknown_field_or_without_a_required_one_is_refused():
 
 def test_a_token_budget_refuses_a_ramp_or_a_budget_under_one_token():
     with pytest.raises(ValueError):
-        TrainerConfig(update=UpdateBatch(tokens=0))
+        TrainerConfig(update_tokens=0)
     with pytest.raises(ValueError):
-        TrainerConfig(update=UpdateBatch(tokens=96), batch_ramp=Ramp(start=8, increment=8, samples=8))
+        TrainerConfig(update_tokens=96, batch_ramp=Ramp(start=8, increment=8, samples=8))
 
 
 def test_a_token_budget_sets_the_accumulation_over_its_datas_token_batches():
@@ -167,23 +176,23 @@ def test_a_token_budget_sets_the_accumulation_over_its_datas_token_batches():
     accumulation to that many of the data's token batches (`TrainerConfig.accumulation`), and refuses
     data batched in rows, a budget no whole number of its batches, or phases of other token batches; an
     update of tokens and of batches together is refused as it is stated."""
-    trainer = TrainerConfig(update=UpdateBatch(tokens=98304), horizon=Horizon(steps=1))
+    trainer = TrainerConfig(update_tokens=98304, steps=1)
     tokens = Loader(train=lambda partition: iter(()), val=None, records=None, batch=8, batch_tokens=24576)
-    assert trainer.accumulation(tokens) == 4
+    assert trainer.update_batches(tokens) == 4
     recorded = json.loads(json.dumps(RunConfig(trainer=trainer).to_dict()))
     assert RunConfig.from_dict(recorded).trainer == trainer
     for refused in (dataclasses.replace(tokens, batch_tokens=None),
                     dataclasses.replace(tokens, batch_tokens=24575)):
         with pytest.raises(ValueError):
-            trainer.accumulation(refused)
+            trainer.update_batches(refused)
     with pytest.raises(ValueError):
         UpdateBatch(tokens=98304, batches=3)
     # Phases of one token batch accumulate alike; phases of 24,576 then 12,288 tokens, which one
     # accumulation would pool into updates of 98,304 then 49,152 tokens, are refused (row 4885).
     alike = dataclasses.replace(tokens, batches=(8, 8), token_batches=(24576, 24576))
-    assert trainer.accumulation(alike) == 4
+    assert trainer.update_batches(alike) == 4
     with pytest.raises(ValueError):
-        trainer.accumulation(dataclasses.replace(alike, batches=(8, 4), token_batches=(24576, 12288)))
+        trainer.update_batches(dataclasses.replace(alike, batches=(8, 4), token_batches=(24576, 12288)))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -198,27 +207,29 @@ def test_save_and_load_carry_a_subclass_with_its_own_knobs(tmp_path):
     """The record names the run's class, so a reader that knows only the
     base builds the kind of run it records, and a reader of another kind
     refuses it."""
-    config = KnobbedRun(trainer=TrainerConfig(horizon=Horizon(steps=3)), seq_len=64, pad_id=0)
+    config = KnobbedRun(trainer=TrainerConfig(steps=3), seq_len=64, pad_id=0)
     assert config.save(str(tmp_path)) == str(tmp_path / "run.json")
     assert KnobbedRun.load(str(tmp_path)) == config and RunConfig.load(str(tmp_path)) == config
     with pytest.raises(ValueError):
         DiffusionRunConfig.load(str(tmp_path))
 
 
+@attending("xla")
 def test_the_model_config_builds_with_its_own_dtype_and_attention():
     fields = {"vocab_size": 64, "emb_features": 32, "num_layers": 1, "num_heads": 2}
-    config = ModelConfig("causal_transformer", {**fields, "dtype": "bfloat16", "attention_impl": "xla"})
+    config = ModelConfig("causal_transformer", {**fields, "dtype": "bfloat16"})
     model = config.build()
     import jax
     ids = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
     params = model.init(jax.random.key(0), ids)
     logits = model.apply(params, ids)
-    expected = CausalTransformer(**fields, dtype=jnp.bfloat16, attention_impl="xla").apply(
+    expected = CausalTransformer(**fields, dtype=jnp.bfloat16).apply(
         params, ids)
     assert logits.dtype == jnp.float32
     assert jnp.array_equal(logits, expected)
 
 
+@attending("reference")
 @pytest.mark.parametrize("scaling", ["llama3", "longrope"])
 def test_dtype_changes_preserve_union_held_rotary_policies(scaling):
     """Model metadata may hold either rotary policy. It survives a compute-dtype override while
@@ -231,7 +242,7 @@ def test_dtype_changes_preserve_union_held_rotary_policies(scaling):
               LongRopeScaling((1.0,) * 4, (2.0,) * 4, 16, factor=2.0))
     model = CausalTransformer(vocab_size=16, emb_features=16, num_layers=1, num_heads=2,
                               head_dim=8, mlp_features=32, max_seq_len=32, rope_scaling=policy,
-                              dtype="float32", attention_impl="reference")
+                              dtype="float32")
     configured = ModelConfig.from_model(model).with_dtype("bfloat16").build()
     ids = jnp.asarray([[1, 2, 3]], jnp.int32)
     variables = model.init(jax.random.key(0), ids)
@@ -265,15 +276,15 @@ def test_an_unknown_model_field_is_refused():
 
 def test_the_run_length_is_steps_or_epochs():
     with pytest.raises(ValueError):
-        TrainerConfig(horizon=Horizon(steps=10, epochs=1))
+        TrainerConfig(steps=10, epochs=1)
 
     streamed = Loader(train=lambda partition: iter(()), val=None, records=None, batch=4)
     sized = Loader(train=lambda partition: iter(()), val=None, records=100, batch=4)
 
-    assert TrainerConfig(horizon=Horizon(steps=10)).total_steps(sized) == 10
-    assert TrainerConfig(horizon=Horizon(epochs=4)).total_steps(sized) == 100
+    assert TrainerConfig(steps=10).total_steps(sized) == 10
+    assert TrainerConfig(epochs=4).total_steps(sized) == 100
     with pytest.raises(ValueError):
-        TrainerConfig(horizon=Horizon(epochs=4)).total_steps(streamed)
+        TrainerConfig(epochs=4).total_steps(streamed)
     with pytest.raises(ValueError):
         TrainerConfig().total_steps(sized)
 
@@ -291,7 +302,7 @@ def test_the_cli_parses_the_mesh_and_the_layout_over_a_runs_model_and_chain():
     default = RunConfig(data=images_of("tfds://oxford_flowers102", 64),
                         model=ModelConfig("uvit", {"emb_features": 32}))
     config = RunConfig.cli(["--trainer.mesh.fsdp", "2", "--trainer.layout.min-shard", "8",
-                            "--trainer.horizon.steps", "5"], default=default)
+                            "--trainer.steps", "5"], default=default)
     assert config.trainer.mesh == MeshSpec(fsdp=2)
     assert config.trainer.layout.min_shard == 8
     assert config.model.fields == {"emb_features": 32}
@@ -395,7 +406,7 @@ def _data(records=48, batch=8):
 
 
 def test_a_run_records_its_token_budget_and_final_checkpoint_policy(tmp_path):
-    config = TrainerConfig(horizon=Horizon(tokens=30), checkpoint_final=False, checkpoint_dir=str(tmp_path),
+    config = TrainerConfig(tokens=30, checkpoint_final=False, checkpoint_dir=str(tmp_path),
                            eval_every=None, checkpoint_every=None)
     run = RunConfig(trainer=config)
     assert RunConfig.from_dict(run.to_dict()).trainer == config
@@ -403,7 +414,7 @@ def test_a_run_records_its_token_budget_and_final_checkpoint_policy(tmp_path):
 
 
 def test_a_run_can_disable_final_checkpoint_saving(tmp_path):
-    run = RunConfig(trainer=TrainerConfig(horizon=Horizon(steps=1), checkpoint_final=False,
+    run = RunConfig(trainer=TrainerConfig(steps=1, checkpoint_final=False,
                                           checkpoint_dir=str(tmp_path), eval_every=None,
                                           checkpoint_every=None))
     data = Loader(lambda partition: batches(), None, None, 8)
@@ -416,7 +427,7 @@ def test_a_run_that_must_start_afresh_refuses_a_directory_that_holds_one_before_
     every rank, before the run's record is written over that run's; `resume="require"` refuses a
     directory that holds none to continue, so a job that must continue never trains from scratch."""
     def run(resume, steps: int = 1) -> RunConfig:
-        return RunConfig(trainer=TrainerConfig(horizon=Horizon(steps=steps), resume=resume,
+        return RunConfig(trainer=TrainerConfig(steps=steps, resume=resume,
                                                checkpoint_dir=str(tmp_path), eval_every=None,
                                                checkpoint_every=None))
 
@@ -439,7 +450,7 @@ def test_train_scores_every_named_validation_split(tmp_path):
     """#36 item 5: a held-out split and a test set, scored together at each
     evaluation and logged under their own names."""
     run = RunConfig(trainer=TrainerConfig(name="splits", checkpoint_dir=str(tmp_path / "runs"),
-                                          horizon=Horizon(steps=2), eval_every=1, checkpoint_every=None))
+                                          steps=2, eval_every=1, checkpoint_every=None))
     held = next(batches())
     splits = {"val": lambda partition: iter([held]),
               "test": lambda partition: iter([{"x": held["x"], "y": held["y"] + 1}])}
@@ -462,8 +473,8 @@ def test_train_runs_the_trainer_its_config_describes(tmp_path):
     from dew.training import ProfileWindow
 
     trace = tmp_path / "trace"
-    config = TrainerConfig(name="built", checkpoint_dir=str(tmp_path / "runs"), horizon=Horizon(steps=3),
-                           update=UpdateBatch(batches=2), precision=Numerics(Dtypes(compute="float16")),
+    config = TrainerConfig(name="built", checkpoint_dir=str(tmp_path / "runs"), steps=3,
+                           accumulation=2, precision=Numerics(Dtypes(compute="float16")),
                            mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=1, tolerance=1.0),
                            profile=ProfileWindow(str(trace), steps=1, warmup=1), eval_every=None,
                            checkpoint_every=None)
@@ -488,7 +499,7 @@ def test_every_run_profiles_a_short_window_of_its_own_steps_kept_with_its_record
     from dew.training import ProfileWindow
 
     def trained(name: str, **fields) -> Path:
-        config = TrainerConfig(name=name, checkpoint_dir=str(tmp_path / "runs"), horizon=Horizon(steps=14),
+        config = TrainerConfig(name=name, checkpoint_dir=str(tmp_path / "runs"), steps=14,
                                eval_every=None, checkpoint_every=None, **fields)
         RunConfig(trainer=config).train(Regression(), Loader(lambda partition: batches(), None, None, 8),
                                         name=name)
@@ -659,7 +670,7 @@ def test_the_run_record_is_written_to_a_bucket(tmp_path, monkeypatch):
     monkeypatch.setattr(dew.config.epath, "Path",
                         lambda uri: _Bucket(uri, tmp_path, seen))
     monkeypatch.setattr(os, "makedirs", refuse)
-    config = RunConfig(trainer=TrainerConfig(horizon=Horizon(steps=6)))
+    config = RunConfig(trainer=TrainerConfig(steps=6))
 
     path = config.save("gs://dew-runs/flowers")
 
@@ -772,8 +783,8 @@ def test_a_learning_rate_schedule_is_a_typed_record_that_round_trips():
     groups included."""
     from dew.optim import ParamGroup, Power, PowerTail
     config = RunConfig(
-        trainer=TrainerConfig(horizon=Horizon(steps=1)),
-        optim=OptimConfig(learning_rate=Power(peak_value=0.01, warmup_steps=5, a=4.0, c=16.0,
+        trainer=TrainerConfig(steps=1),
+        optim=OptimConfig(schedule=Power(peak_value=0.01, warmup_steps=5, a=4.0, c=16.0,
                                          tail=PowerTail(start=8)),
                           param_groups=ParamGroup.mup(4.0)))
     loaded = RunConfig.from_dict(json.loads(json.dumps(config.to_dict())))
@@ -786,10 +797,10 @@ def test_param_groups_with_schedules_momentum_and_bounds_round_trip():
     from dew.optim import Cosine, Exponential, OneCycle, ParamGroup
     momentum = OneCycle(peak_value=0.85, init_value=0.95, end_value=0.95, every=40)
     config = RunConfig(
-        trainer=TrainerConfig(horizon=Horizon(steps=1)),
+        trainer=TrainerConfig(steps=1),
         optim=OptimConfig(
             optimizer=Adam(),
-            learning_rate=Exponential(init_value=1e-3, end_value=1e-5, decay_steps=8, offset=1e-6),
+            schedule=Exponential(init_value=1e-3, end_value=1e-5, decay_steps=8, offset=1e-6),
             param_groups=(
                 ParamGroup("delays", ("*/delay",), schedule=Cosine(peak_value=0.1, warmup_steps=0, every=40),
                            bounds=(0.0, 24.0)),
@@ -960,9 +971,9 @@ def test_a_run_whose_model_names_a_component_by_its_alias_reads_back_and_takes_a
     fields = {"emb_features": 16, "num_layers": 1, "num_heads": 2,
               "mixer": {"class": "attention", "fields": {}}}
     run = LMRunConfig(model=ModelConfig("causal_transformer", fields),
-                      trainer=TrainerConfig(horizon=Horizon(steps=1)))
+                      trainer=TrainerConfig(steps=1))
     assert LMRunConfig.from_dict(json.loads(json.dumps(run.to_dict()))).model == run.model
-    assert run.override({"trainer.horizon.steps": 3}).model == run.model
+    assert run.override({"trainer.steps": 3}).model == run.model
 
 
 def test_a_saved_runs_encoder_by_its_earlier_path_reads_as_its_path_now_and_a_path_given_today_does_not():
@@ -1090,7 +1101,7 @@ MASKED = json.loads((Path(__file__).parent / "fixtures" / "optimizers" / "masked
                     .read_text())
 """Optimizers an earlier Dew (main 65609490a) built with their decay masked among their options, off
 (`optimizer_opts={"mask": False}`) or by a tree of booleans (`{"mask": {"w": False, "b": True}}`), over
-`OptimConfig(learning_rate=1e-2)`'s other settings, each with the state its first step held, its tree's
+`OptimConfig(lr=1e-2)`'s other settings, each with the state its first step held, its tree's
 structure (`treedef`, every node a checkpoint's metadata holds, empty ones among them) and each leaf's path,
 shape and dtype, and that step's updates of two parameters with unit gradients, recorded by that Dew's own
 `OptimConfig.build`."""
@@ -1098,13 +1109,13 @@ shape and dtype, and that step's updates of two parameters with unit gradients, 
 
 def _saved_optimizer(tmp_path, earlier):
     """The optimizer a language run saved with the optimizer config `earlier` (its earlier fields, over
-    `OptimConfig(learning_rate=1e-2)`'s others) loads, its record written in `tmp_path` (`run.json`)."""
+    `OptimConfig(lr=1e-2)`'s others) loads, its record written in `tmp_path` (`run.json`)."""
     from dew.config.lm import LMRunConfig
     from dew.registry import to_record
 
     today = LMRunConfig().record()
     fields = today["fields"]
-    held = to_record(OptimConfig(learning_rate=1e-2), OptimConfig)
+    held = to_record(OptimConfig(lr=1e-2), OptimConfig)
     assert isinstance(fields, dict) and isinstance(held, dict)
     optim = {key: value for key, value in held.items() if key != "optimizer"}
     tmp_path.mkdir(parents=True, exist_ok=True)
@@ -1151,7 +1162,7 @@ def _checkpointed(directory, optimizer, steps, local=None, persistent: bool = Tr
     batch = {"text": jnp.arange(40, dtype=jnp.int32).reshape(8, 5) % 32}
     tiers = {} if local is None else {"local_directory": str(local), "local_every": 1}
     trainer = Trainer(LMObjective(model, seq_len=4), optimizer, key=jax.random.key(0),
-                      layout=Layout(min_shard=1, tolerance=1.0),
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)),
                       checkpoints=Checkpoints(str(directory), **tiers))
     state = trainer.fit(Loader(train=replayed(lambda partition: iter([batch] * 4)), val=None, records=8,
                                batch=8), steps=steps, log_every=1, checkpoint_every=1 if persistent else None,
@@ -1163,11 +1174,12 @@ def _checkpointed(directory, optimizer, steps, local=None, persistent: bool = Tr
 @pytest.mark.parametrize("case", sorted(MASKED))
 def test_a_run_whose_decay_its_options_masked_off_resumes_its_optimizers_state_as_it_trained(tmp_path, case):
     """A run saved while its optimizer's options masked its decay (`optimizer_opts={"mask": False}`, or by a
-    tree of booleans), unspared or in a param group that did not spare (`ParamGroup.spared`), whatever the
-    config spared, loads an optimizer whose decay that mask masks as it did (`OptimConfig.decay_mask`,
-    `ParamGroup.decay_mask`), a spared decay's mask dropped as that Dew wrote its own over it: its state the
-    earlier Dew's tree, node for node (`MASKED`'s `treedef`), each leaf at its path of its shape and dtype,
-    and its step updating as that one's did, so a checkpoint of it restores as it was written
+    tree of booleans), unspared or in a param group that did not spare (its `spared`,
+    `ParamGroup.decay_norms_and_biases` now), whatever the config spared, loads an optimizer whose decay that
+    mask masks as it did (`OptimConfig.decay_mask`, `ParamGroup.decay_mask`), a spared decay's mask dropped as
+    that Dew wrote its own over it: its state the earlier Dew's tree, node for node (`MASKED`'s `treedef`),
+    each leaf at its path of its shape and dtype, and its step updating as that one's did, so a checkpoint of
+    it restores as it was written
     (`test_a_checkpoint_whose_decay_its_options_masked_off_restores_into_the_optimizer_its_record_loads`;
     review of API01: a mask of False was read as a decay of 0, another state tree)."""
     held = MASKED[case]
@@ -1219,10 +1231,10 @@ def test_a_checkpoint_whose_decay_its_options_masked_off_restores_into_the_optim
                **({"param_groups": UNMASKED_GROUPS} if grouped else {"spared": False})}
     # Its earlier optimizer's state, a masked decay step's empty one where it read its mask, as a spared
     # decay's holds: the same tree the earlier Dew built.
-    groups = tuple(ParamGroup(group["name"], tuple(group["patterns"]), spared=True)
+    groups = tuple(ParamGroup(group["name"], tuple(group["patterns"]), decay_norms_and_biases=False)
                    for group in UNMASKED_GROUPS) if grouped else ()
     spec = AdamW(weight_decay=0.1) if optimizer == "adamw" else Adam(weight_decay=0.1)
-    written = OptimConfig(optimizer=spec, learning_rate=1e-2, param_groups=groups)
+    written = OptimConfig(optimizer=spec, lr=1e-2, param_groups=groups)
     run, local = tmp_path / "run", tmp_path / "local"
     _checkpointed(run, written, 1)
     saved = _checkpointed(run, written, 2, local=local, persistent=False)
@@ -1235,8 +1247,8 @@ def test_a_checkpoint_whose_decay_its_options_masked_off_restores_into_the_optim
     LMRunConfig(optim=loaded).save(str(run))
     if grouped:
         # The spared group's decay, active as it trained, dropped on resume: its state another tree.
-        rest = [dataclasses.replace(group, weight_decay=0.0, spared=False) if group.name == "rest" else group
-                for group in loaded.param_groups]
+        rest = [dataclasses.replace(group, weight_decay=0.0, decay_norms_and_biases=True)
+                if group.name == "rest" else group for group in loaded.param_groups]
         with pytest.raises(ValueError):
             _checkpointed(run, dataclasses.replace(loaded, param_groups=tuple(rest)), 3, local=local)
     assert int(_checkpointed(run, loaded, 3, local=local).step) == 3
@@ -1258,16 +1270,16 @@ def test_a_run_an_intermediate_dew_rewrote_beside_its_mark_resumes_as_it_trained
 
     spec = AdamW if optimizer == "adamw" else Adam
     # The earlier optimizer: a decay masked off, its step held where its decay was not 0.
-    written = OptimConfig(optimizer=spec(weight_decay=decay), learning_rate=1e-2, spared=decay > 0)
+    written = OptimConfig(optimizer=spec(weight_decay=decay), lr=1e-2, decay_norms_and_biases=decay == 0)
     run = tmp_path / "run"
     saved = _checkpointed(run, written, 1)
-    rewritten = OptimConfig(optimizer=spec(weight_decay=0.0), learning_rate=1e-2, spared=False)
+    rewritten = OptimConfig(optimizer=spec(weight_decay=0.0), lr=1e-2, decay_norms_and_biases=True)
     LMRunConfig(optim=rewritten, trainer=_named(run)).save(str(run))
     (run / "earlier-masked-decay.json").write_text(json_.dumps({"unmasked_all": True}))
     loaded = LMRunConfig.load(str(run)).resumed().optim
     assert type(loaded.optimizer) is spec, loaded
-    assert (loaded.decay_mask, loaded.spared) == (False, False) and isinstance(loaded.optimizer, Adam), loaded
-    assert loaded.optimizer.weight_decay > 0, loaded
+    assert loaded.decay_mask is False and loaded.decay_norms_and_biases, loaded
+    assert isinstance(loaded.optimizer, Adam) and loaded.optimizer.weight_decay > 0, loaded
     if decay == 0:
         with pytest.raises(ValueError):
             _checkpointed(run, loaded, 2)
@@ -1287,7 +1299,7 @@ def test_a_run_an_intermediate_dew_resumed_and_saved_after_its_mark_loads_its_re
     run saved after it, refusing such a run's restore)."""
 
 
-    rewritten = OptimConfig(optimizer=AdamW(weight_decay=0.0), learning_rate=1e-2, spared=False)
+    rewritten = OptimConfig(optimizer=AdamW(weight_decay=0.0), lr=1e-2, decay_norms_and_biases=True)
     run = tmp_path / "run"
     saved = _checkpointed(run, rewritten, 2)
     _typed(run / "2")
@@ -1311,7 +1323,7 @@ def test_an_intermediate_dews_newer_local_step_decides_its_mark_once_and_for_goo
 
     from dew.config.lm import LMRunConfig
 
-    rewritten = OptimConfig(optimizer=AdamW(weight_decay=0.0), learning_rate=1e-2, spared=False)
+    rewritten = OptimConfig(optimizer=AdamW(weight_decay=0.0), lr=1e-2, decay_norms_and_biases=True)
     run, local = tmp_path / "run", tmp_path / "local"
     _checkpointed(run, rewritten, 1)
     # Its host's own tier under the run's name, as its trainer's `local_directory` places it.
@@ -1342,7 +1354,7 @@ def test_a_marked_runs_newest_save_no_resume_reads_leaves_its_mark_to_decide(tmp
     import shutil
 
 
-    rewritten = OptimConfig(optimizer=AdamW(weight_decay=0.0), learning_rate=1e-2, spared=False)
+    rewritten = OptimConfig(optimizer=AdamW(weight_decay=0.0), lr=1e-2, decay_norms_and_biases=True)
     run = tmp_path / "run"
     _checkpointed(run, rewritten, 1)
     shutil.copytree(run / "1", run / "2")
@@ -1368,7 +1380,7 @@ def test_a_checkpoint_whose_decay_its_options_masked_by_a_tree_restores_into_the
     spec = AdamW if optimizer == "adamw" else Adam
     case = MASKED[f"{optimizer}-tree-unspared"]
     # The earlier optimizer's state, a masked decay step's: the tree a spared decay holds.
-    written = OptimConfig(optimizer=spec(weight_decay=0.1), learning_rate=1e-2)
+    written = OptimConfig(optimizer=spec(weight_decay=0.1), lr=1e-2)
     params = {"w": jnp.arange(4.0).reshape(2, 2) / 10, "b": jnp.arange(2.0) / 10}
     assert str(jax.tree.structure(written.build(None).init(params))) == case["treedef"]
     run = tmp_path / "run"
@@ -1377,7 +1389,7 @@ def test_a_checkpoint_whose_decay_its_options_masked_by_a_tree_restores_into_the
     mask = jax.tree.map(lambda moment: moment.ndim > 1, optax.tree_utils.tree_get(saved.opt_state, "mu"))
     assert {False, True} == set(jax.tree.leaves(mask)), mask
     loaded = _saved_optimizer(run, {**case["optim"], "optimizer_opts": {"mask": mask}})
-    assert loaded.decay_mask == mask and not loaded.spared
+    assert loaded.decay_mask == mask and loaded.decay_norms_and_biases
     resumed = _checkpointed(run, loaded, 1)
     assert jax.tree.structure(resumed.opt_state) == jax.tree.structure(saved.opt_state)
     for got, want in zip(jax.tree.leaves(resumed.opt_state), jax.tree.leaves(saved.opt_state), strict=True):
@@ -1388,7 +1400,8 @@ def test_a_checkpoint_whose_decay_its_options_masked_by_a_tree_restores_into_the
 @pytest.mark.parametrize("optimizer", ["adamw", "adam"], ids=["adamw", "adam-coupled"])
 @pytest.mark.parametrize("record", ["absent", "today"])
 def test_an_active_decays_checkpoint_resumed_without_its_decay_is_refused(tmp_path, optimizer, record):
-    """A checkpoint of a run decaying its parameters as its config spared them (`OptimConfig.spared`, its
+    """A checkpoint of a run decaying its parameters as its config spared them
+    (`OptimConfig.decay_norms_and_biases` off, its
     decay step masked by the sparing: `optax.MaskedState` over an empty state, AdamW's and Adam's coupled
     one's alike) resumed by an optimizer that decays nothing (its decay 0, unspared) is refused by its
     restore, its run's record absent or today's: no restore reads one optimizer's state into another's
@@ -1396,8 +1409,8 @@ def test_an_active_decays_checkpoint_resumed_without_its_decay_is_refused(tmp_pa
     from dew.config.lm import LMRunConfig
 
     spec = AdamW if optimizer == "adamw" else Adam
-    active = OptimConfig(optimizer=spec(weight_decay=0.1), learning_rate=1e-2)
-    undecayed = OptimConfig(optimizer=spec(weight_decay=0.0), learning_rate=1e-2, spared=False)
+    active = OptimConfig(optimizer=spec(weight_decay=0.1), lr=1e-2)
+    undecayed = OptimConfig(optimizer=spec(weight_decay=0.0), lr=1e-2, decay_norms_and_biases=True)
     run = tmp_path / "run"
     _checkpointed(run, active, 1)
     if record == "absent":
@@ -1432,10 +1445,11 @@ def test_an_earlier_muons_mask_and_gauss_newtons_cap_load_as_they_trained(tmp_pa
     grouped = _saved_optimizer(tmp_path / "grouped", {
         "optimizer": "muon", "weight_decay": 0.1, "optimizer_opts": {"weight_decay_mask": {"w": False}},
         "param_groups": [{"name": "all", "patterns": ["*"], "spared": True}]})
-    assert [(group.decay_mask, group.spared) for group in grouped.param_groups] == [({"w": False}, False)]
+    assert [(group.decay_mask, group.decay_norms_and_biases) for group in grouped.param_groups] == [
+        ({"w": False}, True)]
     capped = _saved_optimizer(tmp_path / "gauss", {"optimizer": "gauss_newton", "clip_grads": 1.0,
                                                    "optimizer_opts": {"clip": 0.5}})
-    assert capped.optimizer == GaussNewton() and capped.clip_grads == 1.0
+    assert capped.optimizer == GaussNewton() and capped.clip == 1.0
 
 
 @pytest.mark.parametrize(("stage", "earlier", "fit"), [
@@ -1458,15 +1472,15 @@ def test_a_run_saved_with_its_split_and_its_pipelines_microbatches_loads_both_an
     today = LMRunConfig(trainer=TrainerConfig(mesh=MeshSpec(stage=stage))).record()
     fields = today["fields"]
     assert isinstance(fields, dict) and isinstance(fields["trainer"], dict)
-    trainer = {key: value for key, value in fields["trainer"].items() if key != "fit"}
+    trainer = {key: value for key, value in fields["trainer"].items() if key not in earlier}
     path = tmp_path / "run.json"
     path.write_text(json.dumps({**today, "fields": {**fields, "trainer": {**trainer, **earlier}}}))
     loaded = LMRunConfig.load(str(path)).trainer
-    assert loaded.fit == fit
+    assert loaded.fit_policy == fit
     model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=2, num_heads=1, mlp_features=16,
                               max_seq_len=8)
-    run = Trainer(LMObjective(model, seq_len=4), optax.sgd(0.1), key=jax.random.key(0), fit=loaded.fit,
-                  mesh=loaded.mesh)
+    run = Trainer(LMObjective(model, seq_len=4), optax.sgd(0.1), key=jax.random.key(0), split=loaded.split,
+                  microbatches=loaded.microbatches, mesh=loaded.mesh)
     assert (run.split, run.fit_policy.microbatches) == (fit.stated_split, fit.microbatches)
 
 
@@ -1478,7 +1492,7 @@ def test_a_run_saved_with_its_experts_packed_loads_with_its_weights_packed(tmp_p
     from dew.interop.source_options import SourceOptions
 
     record = RunConfig(data=TokenFiles("tokens/train").pipe(presets.token_windows, seq_len=8, batch=2),
-                       trainer=TrainerConfig(horizon=Horizon(steps=1)),
+                       trainer=TrainerConfig(steps=1),
                        source=SourceOptions(packed_weights=True)).record()
     source = dict(record["fields"]["source"])
     source["packed_experts"] = source.pop("packed_weights")
@@ -1488,3 +1502,43 @@ def test_a_run_saved_with_its_experts_packed_loads_with_its_weights_packed(tmp_p
     (directory / "run.json").write_text(json.dumps(earlier))
     assert RunConfig.load(str(directory)).source.packed_weights is True
 
+
+
+def test_a_run_saved_before_its_surface_named_its_settings_loads_as_the_run_it_was(tmp_path):
+    """A run saved while its optimizer held its rate as `learning_rate` (here a schedule's record), its
+    sparing of norms and biases as `spared` (a group's too) and its clip as `clip_grads`, and its trainer
+    held its length, its update and its fit in records of their own (`horizon`, `update`, `fit`), its kept
+    checkpoints as a count, its ranking as a metric's name and its numerics as a preset's name, loads as
+    the run it was (`dew.config.earlier.earlier_surface`)."""
+    from dew.config.lm import LMRunConfig
+    from dew.nn.precision import numerics_of
+    from dew.training import Best, Keep
+
+    expected = LMRunConfig(
+        optim=OptimConfig(optimizer=AdamW(weight_decay=0.1), clip=1.0, decay_norms_and_biases=True,
+                          schedule=Cosine(peak_value=3e-4, warmup_steps=10),
+                          param_groups=(ParamGroup("head", ("head/*",), decay_norms_and_biases=False),
+                                        ParamGroup("rest", ("*",)))),
+        trainer=TrainerConfig(steps=100, max_tokens=10_000, accumulation=4, split=2, remat="full",
+                              keep=Keep(latest=3), best=Best("val/loss"), precision=numerics_of("bf16-true")))
+    # Read back as JSON, which the edits below rewrite as an earlier Dew wrote it.
+    record = json.loads(json.dumps(expected.record()))
+
+    def own(held):
+        return held["fields"] if "class" in held and "fields" in held else held
+
+    optim, trainer = own(record["fields"]["optim"]), own(record["fields"]["trainer"])
+    optim.pop("lr", None)
+    optim["learning_rate"] = optim.pop("schedule")
+    optim["spared"] = not optim.pop("decay_norms_and_biases", False)
+    optim["clip_grads"] = optim.pop("clip")
+    for group in optim["param_groups"]:
+        group["spared"] = not group.pop("decay_norms_and_biases", True)
+    renamed = {"horizon": {"steps": "steps", "max_tokens": "max_tokens"},
+               "update": {"accumulation": "batches"}, "fit": {"split": "split", "remat": "remat"}}
+    for nested, names in renamed.items():
+        trainer[nested] = {earlier: trainer.pop(today) for today, earlier in names.items()}
+    trainer.update(keep=3, best="val/loss", precision="bf16-true")
+    path = tmp_path / "run.json"
+    path.write_text(json.dumps(record))
+    assert LMRunConfig.load(str(path)) == expected

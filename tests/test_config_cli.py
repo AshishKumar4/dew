@@ -12,6 +12,7 @@ from typing import Annotated
 
 import pytest
 from diffusion_support import images_of
+from model_support import attending
 
 from dew.config import RunConfig
 from dew.config.diffusion import DiffusionRunConfig
@@ -23,8 +24,7 @@ from dew.diffusion.presets import CosineContinuous, CosineGeneral, Exp, Flow
 from dew.optim import Adam, ScheduleSpec
 from dew.registry import ModelConfig, import_path, record_argument
 from dew.sampling import Heun
-from dew.training import LocalTracker, MeshSpec, UpdateBatch
-from dew.training.budget import Horizon
+from dew.training import LocalTracker, MeshSpec
 
 pytestmark = pytest.mark.mesh
 
@@ -40,7 +40,7 @@ def test_the_flags_set_a_runs_own_settings_and_none_of_what_it_trains():
     trains, its model and its objective, is built in Python, and their flags are refused, the run kept as
     its default holds them."""
     default = DiffusionRunConfig(model=ModelConfig("simple_dit", {"scan_order": "hilbert"}))
-    config = parse(DiffusionRunConfig, ["preset:flow", "--preset.shift", "3.0", "--trainer.horizon.steps",
+    config = parse(DiffusionRunConfig, ["preset:flow", "--preset.shift", "3.0", "--trainer.steps",
                                         "10",
                                         "--trainer.mesh.fsdp", "2"], default=default)
     assert config.preset == Flow(shift=3.0)
@@ -140,7 +140,7 @@ def test_a_python_run_whose_chain_is_unrecorded_trains_from_dew_train(tmp_path):
         "rows = [{'x': np.full((FEATURES,), index / 32, np.float32)} for index in range(32)]\n"
         "run = dataclasses.replace(experiment(), validation=None,\n"
         "                          data=Memory(rows).map(lambda row: row).shuffle().repeat().batch(8))\n"
-        f"run = run.override({{'trainer.horizon.steps': 1,\n"
+        f"run = run.override({{'trainer.steps': 1,\n"
         f"                     'trainer.checkpoint_dir': {str(tmp_path / 'runs')!r},\n"
         "                     'trainer.eval_every': None, 'trainer.checkpoint_every': 1})\n")
     assert main(["train", str(tmp_path / "unrecorded_run.py")]) == 0
@@ -246,11 +246,11 @@ def test_a_configured_run_is_profiled_without_its_ranking_cooldowns_or_validatio
     import autoencoder_experiment
 
     from dew.checkpoints import Checkpoints
-    from dew.training import Cooldowns
+    from dew.training import Best, Cooldowns
 
     run = autoencoder_experiment.run()
     run = dataclasses.replace(run, trainer=dataclasses.replace(
-        run.trainer, name="ranked", best="train/loss", cooldowns=Cooldowns(at=(2,), length=2)))
+        run.trainer, name="ranked", best=Best("train/loss"), cooldowns=Cooldowns(at=(2,), length=2)))
     report = run.profile(str(tmp_path / "profile"), warmup=2, steps=2)
     assert report is not None and report.traced == (2, 3)
     with Checkpoints(str(tmp_path / "profile" / "ranked")) as checkpoints:
@@ -272,7 +272,7 @@ def test_a_run_trainer_fit_trains_directly_says_why_no_record_rebuilds_it(tmp_pa
 
     (x,) = records(0)
     optimizer, key = ((optax.adam(0.1), jax.random.key(0)) if built == "in Python"
-                      else (OptimConfig(optimizer=Adam(), learning_rate=0.1), 0))
+                      else (OptimConfig(optimizer=Adam(), lr=0.1), 0))
     Trainer(Pulled(), optimizer, key=key, checkpoints=Checkpoints(str(tmp_path))).fit(
         chain(x), steps=1, checkpoint_every=1)
     record = json.loads((tmp_path / "run.json").read_text())
@@ -304,7 +304,7 @@ def test_a_run_config_round_trips_through_its_json_record(name):
                  "jepa": {"objective.momentum": [0.9, 0.99]}}[name]
     data = (TokenFiles("d").pipe(presets.lm, None, seq_len=64, batch=8, pack=None) if name == "lm"
             else images_of("tfds://oxford_flowers102", 32))
-    config = dataclasses.replace(parse(cls, [*args, "--trainer.horizon.steps", "5"]).override(objective),
+    config = dataclasses.replace(parse(cls, [*args, "--trainer.steps", "5"]).override(objective),
                                  data=data)
 
     record = json.loads(json.dumps(config.record()))
@@ -323,7 +323,7 @@ def test_flaxdiffs_schedules_are_a_runs_presets_rebuilt_from_its_record(args, pr
     """FlaxDiff's tangent grid, continuous cosine and exponential table are a configured run's presets
     (row 1928): named on the command line, their arguments in the run's record, and the run read back
     from that record holds the preset they describe, which builds its process (`Preset`)."""
-    config = dataclasses.replace(parse(DiffusionRunConfig, [*args, "--trainer.horizon.steps", "5"]),
+    config = dataclasses.replace(parse(DiffusionRunConfig, [*args, "--trainer.steps", "5"]),
                                  data=images_of("tfds://oxford_flowers102", 32))
     record = json.loads(json.dumps(config.record()))
     rebuilt = RunConfig.read(record)
@@ -347,8 +347,8 @@ def test_a_run_over_url_datasets_round_trips_through_its_json_record():
 
 def test_steps_and_epochs_are_one_choice():
     with pytest.raises(SystemExit):
-        parse(RunConfig, ["--trainer.horizon.steps", "5", "--trainer.horizon.epochs", "1"])
-    config = parse(RunConfig, ["--trainer.horizon.epochs", "2"])
+        parse(RunConfig, ["--trainer.steps", "5", "--trainer.epochs", "1"])
+    config = parse(RunConfig, ["--trainer.epochs", "2"])
     data = Loader(train=lambda partition: iter(()), val=None, records=100, batch=10)
     assert config.trainer.total_steps(data) == 20
     with pytest.raises(ValueError):
@@ -364,15 +364,16 @@ def test_a_runs_updates_are_its_microsteps_over_its_accumulation():
     from dew.data.dataset import Loader
 
     loader = Loader(lambda partition: iter(()), None, batch=8, records=64)
-    assert TrainerConfig(horizon=Horizon(epochs=1), update=UpdateBatch(batches=4)).total_updates(loader) == 2
+    assert TrainerConfig(epochs=1, accumulation=4).total_updates(loader) == 2
 
 
 def test_the_cli_sets_a_token_budget_the_datas_token_batches_divide():
-    config = parse(RunConfig, ["--trainer.update.tokens", "98304", "--trainer.horizon.steps", "1"])
-    assert config.trainer.update.tokens == 98304
+    config = parse(RunConfig, ["--trainer.update-tokens", "98304", "--trainer.steps", "1"])
+    assert config.trainer.update_tokens == 98304
     assert RunConfig.from_dict(json.loads(json.dumps(config.to_dict()))) == config
 
 
+@attending("xla")
 @pytest.mark.parametrize("size", [(16, 16), (16, 8)], ids=["square", "wide-grid"])
 def test_a_jepa_run_without_probes_trains_and_validates_its_loss(tmp_path, size):
     """A checkpointed JEPA recipe validates without class probes or a representation preview, over
@@ -393,11 +394,10 @@ def test_a_jepa_run_without_probes_trains_and_validates_its_loss(tmp_path, size)
 
     run = JepaRunConfig(
         model=ModelConfig("jepa_encoder", {"patch_size": 2, "emb_features": 16, "num_layers": 1,
-                                           "num_heads": 2, "mlp_ratio": 2, "dtype": "float32",
-                                           "attention_impl": "xla"}),
+                                           "num_heads": 2, "mlp_ratio": 2, "dtype": "float32"}),
         predictor={"num_layers": 1, "predictor_features": 8}, num_target_blocks=2,
         data=prepared(train), validation=prepared(held),
-        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), horizon=Horizon(steps=1), log_every=1,
+        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), steps=1, log_every=1,
                               eval_every=1, checkpoint_every=None))
     trained = run.prepare().train("jepa-loss")
     assert int(trained.updates) == 1
@@ -406,6 +406,7 @@ def test_a_jepa_run_without_probes_trains_and_validates_its_loss(tmp_path, size)
     assert not any("probe" in name for report in reports for name in report)
 
 
+@attending("xla")
 @pytest.mark.parametrize("precision", ["bf16-mixed", "16-mixed"])
 def test_a_jepa_runs_predictor_computes_as_its_encoder_where_the_run_derives_the_dtype(precision):
     """A JEPA run whose encoder record states no dtype computes in the dtype its numerics derive
@@ -423,21 +424,21 @@ def test_a_jepa_runs_predictor_computes_as_its_encoder_where_the_run_derives_the
     root = REPO_ROOT / "tests" / "fixtures" / "tfds" / "dew_images" / "1.0.0"
     run = JepaRunConfig(
         model=ModelConfig("jepa_encoder", {"patch_size": 2, "emb_features": 16, "num_layers": 1,
-                                           "num_heads": 2, "mlp_ratio": 2, "attention_impl": "xla"}),
+                                           "num_heads": 2, "mlp_ratio": 2}),
         predictor={"num_layers": 1, "predictor_features": 8}, num_target_blocks=2,
         data=TFDS("dew_images", path=str(root), split="all").pipe(presets.images, 16, batch=8),
-        trainer=TrainerConfig(precision=numerics_of(precision), horizon=Horizon(steps=1)))
+        trainer=TrainerConfig(precision=numerics_of(precision), steps=1))
     objective = run.build_run().objective
     expected = {"bf16-mixed": jnp.bfloat16, "16-mixed": jnp.float16}[precision]
     assert jnp.dtype(objective.encoder.dtype) == jnp.dtype(expected)
     assert jnp.dtype(objective.predictor.dtype) == jnp.dtype(expected)
-    assert objective.predictor.attention_impl == objective.encoder.attention_impl == "xla"
     assert (objective.predictor.num_layers, objective.predictor.predictor_features) == (1, 8)
     assert objective.predictor.emb_features == objective.encoder.emb_features == 16
     # The options its encoder marks as shared (`FROM_ENCODER`), each set off its class's default here.
     assert (objective.predictor.num_heads, objective.predictor.mlp_ratio) == (2, 2)
 
 
+@attending("xla")
 def test_a_jepa_run_trains_its_lora_factors_and_ramps_their_momentum_over_its_updates(tmp_path):
     """`--lora` adapts the run's encoder: its factors train under `params` over a frozen draw of it.
     The target's momentum ramps over the run's updates, its steps over its accumulation: falling from
@@ -456,14 +457,13 @@ def test_a_jepa_run_trains_its_lora_factors_and_ramps_their_momentum_over_its_up
                   split="all")
     run = JepaRunConfig(
         model=ModelConfig("jepa_encoder", {"patch_size": 2, "emb_features": 16, "num_layers": 1,
-                                           "num_heads": 2, "mlp_ratio": 2, "dtype": "float32",
-                                           "attention_impl": "xla"}),
+                                           "num_heads": 2, "mlp_ratio": 2, "dtype": "float32"}),
         objective=ObjectiveConfig("jepa", {"momentum": (1.0, 0.0)}),
         predictor={"num_layers": 1, "predictor_features": 8}, num_target_blocks=2,
         lora=LoRA(rank=2, modules=("up_proj",)),
         data=images.pipe(presets.images, 16, batch=8).read("memory").loading(Loading(workers=0)),
-        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), horizon=Horizon(steps=4),
-                              update=UpdateBatch(batches=2), log_every=1, eval_every=None,
+        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), steps=4,
+                              accumulation=2, log_every=1, eval_every=None,
                               checkpoint_every=None))
     trained = run.prepare().train("jepa-lora")
     assert int(trained.updates) == 2
@@ -480,10 +480,11 @@ def test_a_jepa_run_trains_its_lora_factors_and_ramps_their_momentum_over_its_up
             np.testing.assert_array_equal(np.asarray(target), 0.5 * np.asarray(online))
 
 
+@attending("xla")
 def test_a_jepa_run_of_epochs_over_a_streamed_read_ramps_its_momentum_over_its_progress(tmp_path):
-    """A JEPA run of `--trainer.horizon.epochs` over a streamed read, whose order counts no updates ahead, is
+    """A JEPA run of `--trainer.epochs` over a streamed read, whose order counts no updates ahead, is
     bounded in examples once its data compiles (`Loader.examples`), so the target's momentum ramps over the
-    run's progress, as a run given `--trainer.horizon.examples` does, rather than being refused as a run
+    run's progress, as a run given `--trainer.examples` does, rather than being refused as a run
     bounded by tokens alone (row 3430)."""
     from dew.config import TrainerConfig
     from dew.data import TFDS, Loading, presets
@@ -493,13 +494,12 @@ def test_a_jepa_run_of_epochs_over_a_streamed_read_ramps_its_momentum_over_its_p
                   split="all")
     run = JepaRunConfig(
         model=ModelConfig("jepa_encoder", {"patch_size": 2, "emb_features": 16, "num_layers": 1,
-                                           "num_heads": 2, "mlp_ratio": 2, "dtype": "float32",
-                                           "attention_impl": "xla"}),
+                                           "num_heads": 2, "mlp_ratio": 2, "dtype": "float32"}),
         predictor={"num_layers": 1, "predictor_features": 8}, num_target_blocks=2,
         # Every image decodes (no rejecting step), so a pass's source examples are its shards' rows.
         data=images.pipe(presets.images, 16, batch=8, rejects=False).read("streamed")
         .loading(Loading(workers=0)),
-        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), horizon=Horizon(epochs=2), log_every=1,
+        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), epochs=2, log_every=1,
                               eval_every=None, checkpoint_every=None))
     prepared = run.prepare()
     # Bounded to the passes' 40 examples, whose steps its per-share order counts none of ahead.
@@ -508,9 +508,9 @@ def test_a_jepa_run_of_epochs_over_a_streamed_read_ramps_its_momentum_over_its_p
 
 
 def test_param_groups_on_the_command_line_read_their_schedules_as_records():
-    """A group's schedule is the record that names it, as the run's record
-    writes it, and the config's own rate is one value: a number, or a schedule's record that steps
-    per epoch by its `every`."""
+    """A group's schedule is the record that names it, as the run's record writes it (a list of records has
+    no flat form), and the config's own schedule is a subcommand of its own flags, here one that steps per
+    epoch by its `every`, its peak the config's rate (`OptimConfig.lr`)."""
     from dew.optim import Cosine, OneCycle, ParamGroup
     groups = [{"name": "delays", "patterns": ["*/delay"], "bounds": [0, 24],
                "schedule": {"class": "cosine",
@@ -518,11 +518,10 @@ def test_param_groups_on_the_command_line_read_their_schedules_as_records():
               {"name": "rest", "patterns": ["*"],
                "b1": {"class": "one_cycle",
                       "fields": {"peak_value": 0.85, "init_value": 0.95, "end_value": 0.95}}}]
-    rate = {"class": "one_cycle", "fields": {"peak_value": 5e-3, "every": 40}}
-    config = parse(RunConfig, ["--optim.param-groups", json.dumps(groups),
-                               "--optim.learning-rate", json.dumps(rate)])
-    assert config.optim.learning_rate == OneCycle(peak_value=5e-3, every=40)
-    assert parse(RunConfig, ["--optim.learning-rate", "3e-4"]).optim.learning_rate == 3e-4
+    config = parse(RunConfig, ["--optim.param-groups", json.dumps(groups), "--optim.lr", "5e-3",
+                               "optim.schedule:one-cycle", "--optim.schedule.every", "40"])
+    assert (config.optim.lr, config.optim.rate) == (5e-3, OneCycle(peak_value=5e-3, every=40))
+    assert parse(RunConfig, ["--optim.lr", "3e-4"]).optim.rate == 3e-4
     assert config.optim.param_groups == (
         ParamGroup("delays", ("*/delay",), schedule=Cosine(peak_value=0.1, warmup_steps=0, every=40),
                    bounds=(0.0, 24.0)),

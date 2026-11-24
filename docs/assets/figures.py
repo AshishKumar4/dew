@@ -239,7 +239,7 @@ def moe_routing_figure():
     """The router's choices in a tiny mixture decoder, read from its sown `router` collection."""
     model = CausalTransformer(vocab_size=32, emb_features=16, num_layers=2, num_heads=2,
                               mlp_features=32, max_seq_len=64, mixture=Mixture(experts=4, top_k=2),
-                              dtype=jnp.float32, attention_impl="xla")
+                              dtype=jnp.float32)
     tokens = jax.random.randint(jax.random.key(1), (1, 64), 0, 32)
     variables = model.init(jax.random.key(0), tokens)
     _, sown = model.apply(variables, tokens, mutable=["router"])

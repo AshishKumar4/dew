@@ -11,6 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import attending
 from token_support import write_token_corpus
 from tool_support import load
 
@@ -26,6 +27,7 @@ from dew.data.sources.tokens import TokenFiles
 from dew.inference import TextGeneration
 from dew.objectives.lm import LMObjective
 from dew.sampling import Sampling
+from dew.training import TrainerAdvanced
 
 pytestmark = pytest.mark.mesh
 
@@ -99,7 +101,7 @@ def test_the_recipe_trains_on_tokenized_files(tmp_path, packed):
     the trainer, perplexity scored on val.bin, the run spec and a checkpoint
     at the final step."""
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
-    args = ["--trainer.horizon.epochs", "1", "--prompt", "the ", "--max-new-tokens", "4",
+    args = ["--trainer.epochs", "1", "--prompt", "the ", "--max-new-tokens", "4",
             "--trainer.name", "run"]
     settings = {"pack": "first-fit", "bins": 2} if packed else {}
     config = run_config(tokens, *args, **settings)
@@ -141,7 +143,7 @@ def test_the_recipe_trains_an_lm_objective_it_names_by_import_path(tmp_path):
     importlib.import_module("lm_objectives")
 
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
-    config = run_config(tokens, "--trainer.horizon.steps", "1", "--trainer.name", "own",
+    config = run_config(tokens, "--trainer.steps", "1", "--trainer.name", "own",
                         objective="lm_objectives:Anchored")
     assert int(config.run().step) == 1
 
@@ -150,7 +152,7 @@ def test_a_token_budget_alone_trains_over_data_with_no_epoch_length(tmp_path):
     """Packing a streamed read online leaves a run no epoch to count, and a run whose length is its
     tokens alone needs none: it trains until its targets reach the budget."""
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
-    config = run_config(tokens, "--trainer.horizon.tokens", str(2 * 8 * SEQ), "--trainer.name", "budget",
+    config = run_config(tokens, "--trainer.tokens", str(2 * 8 * SEQ), "--trainer.name", "budget",
                         "--trainer.eval-every", "None", "--trainer.checkpoint-every", "None",
                         pack="first-fit", bins=2)
     config = dataclasses.replace(config, data=config.chain().read("streamed"))
@@ -175,7 +177,7 @@ def test_the_recipe_trains_on_weighted_corpora(tmp_path):
     config = LMRunConfig.cli([
         "--trainer.checkpoint-dir", str(tmp_path / "runs"),
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
-        "--trainer.horizon.steps", "2", "--trainer.name", "mixed", "--max-new-tokens", "0"],
+        "--trainer.steps", "2", "--trainer.name", "mixed", "--max-new-tokens", "0"],
         default=tiny(LMRunConfig(data=mixture.loading(Loading(workers=0))),
                      '{"emb_features": 16, "num_layers": 1, "num_heads": 2}'))
     mixed = config.data.source
@@ -191,7 +193,7 @@ def test_the_recipe_trains_on_weighted_corpora(tmp_path):
 
 
 def test_the_recipe_trains_muonclip_with_the_clip_firing(tmp_path):
-    """`--optim.optimizer muonclip` through `run`: the per-head maxima
+    """`optim.optimizer:muonclip` through `run`: the per-head maxima
     travel from the loss to the optimizer inside the compiled step, so the
     query kernel lands away from a Muon run at the same seed. The model has
     no QK-norm, which the clip refuses, as docs/recipes.md says. Observed on
@@ -199,12 +201,12 @@ def test_the_recipe_trains_muonclip_with_the_clip_firing(tmp_path):
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
 
     def run(name, *args):
-        config = run_config(tokens, "--trainer.name", name, "--trainer.horizon.epochs", "1", *args,
+        config = run_config(tokens, "--trainer.name", name, "--trainer.epochs", "1", *args,
                             model='{"emb_features": 16, "num_layers": 1, "num_heads": 2, "qk_norm": false}')
         return config.run()
 
-    muon = run("muon", "--optim.optimizer", "muon")
-    clipped = run("clip", "--optim.optimizer", '{"class": "muonclip", "fields": {"qk_clip_threshold": 1.0}}')
+    muon = run("muon", "optim.optimizer:muon")
+    clipped = run("clip", "optim.optimizer:muonclip", "--optim.optimizer.qk-clip-threshold", "1.0")
 
     def q_kernel(state):
         return np.asarray(
@@ -235,14 +237,14 @@ def export_tiny_decoder(directory, *, tokenizer="byte", vocab_size=256):
 
 
 def test_a_token_budget_trains_over_a_stream_with_no_epoch_length(tmp_path):
-    """`--trainer.horizon.tokens` alone bounds a run over windows read as a stream, each share its own order,
+    """`--trainer.tokens` alone bounds a run over windows read as a stream, each share its own order,
     which has no epoch length to count: the run trains until its real tokens reach the budget, three
     batches of eight windows of SEQ targets."""
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ)
     streamed = windows(tokens).read("streamed")
     assert compile(streamed).steps_per_epoch is None
     model = '{"emb_features": 16, "num_layers": 1, "num_heads": 2}'
-    config = recipe_run(LMRunConfig, tokens, "--trainer.horizon.tokens", str(3 * 8 * SEQ),
+    config = recipe_run(LMRunConfig, tokens, "--trainer.tokens", str(3 * 8 * SEQ),
                         "--trainer.eval-every",
                         "None", "--trainer.checkpoint-every", "None", "--trainer.name", "tokens",
                         "--max-new-tokens", "0", model_config=model, default=LMRunConfig(data=streamed))
@@ -264,6 +266,7 @@ def pretrained_config(tokens, pretrained, *args, model_config="{}"):
                       default=LMRunConfig(data=windows(tokens), validation=windows(tokens, held=True)))
 
 
+@attending("reference")
 def test_a_pretrained_run_starts_from_the_checkpoints_weights(tmp_path):
     """Zero steps hold what the checkpoint carries, leaf for leaf: the load
     is a continuation, not a fresh init of the same shape."""
@@ -271,13 +274,12 @@ def test_a_pretrained_run_starts_from_the_checkpoints_weights(tmp_path):
 
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
     checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
-    config = pretrained_config(tokens, checkpoint, "--trainer.horizon.steps", "0",
+    config = pretrained_config(tokens, checkpoint, "--trainer.steps", "0",
                                "--max-new-tokens", "0", "--trainer.name", "zero")
 
     state = config.run()
 
-    expected = Pretrained.load(str(checkpoint), dtype="float32",
-                               attention_impl="reference").variables
+    expected = Pretrained.load(str(checkpoint), dtype="float32").variables
     for path, leaf in jax.tree_util.tree_flatten_with_path(expected["params"])[0]:
         held = state.variables["params"]
         for entry in path:
@@ -299,14 +301,14 @@ def test_a_pretrained_runs_record_trains_again(tmp_path, lora):
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
     checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
     adapter = ("--lora.rank", "4", "--lora.modules", "q_proj") if lora else ()
-    config = pretrained_config(tokens, checkpoint, "--trainer.horizon.steps", "1", "--max-new-tokens", "0",
+    config = pretrained_config(tokens, checkpoint, "--trainer.steps", "1", "--max-new-tokens", "0",
                                "--trainer.name", "replayed", *adapter)
     state = config.run()
     run = tmp_path / "runs" / "replayed"
 
     from run_kinds import trained_record
 
-    trained_record(run, {"trainer.horizon.steps": "2"})
+    trained_record(run, {"trainer.steps": "2"})
 
     saved = Checkpoints(str(run))
     assert saved.latest == 2
@@ -324,16 +326,16 @@ def test_a_run_resumed_under_its_name_trains_the_model_it_recorded(tmp_path):
 
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
     model = {"emb_features": 16, "num_layers": 1, "num_heads": 2}
-    run_config(tokens, "--trainer.horizon.steps", "1", "--trainer.name", "kept",
+    run_config(tokens, "--trainer.steps", "1", "--trainer.name", "kept",
                model=json.dumps(model)).run()
     run = tmp_path / "runs" / "kept"
     recorded = (run / "run.json").read_bytes()
 
     from dew.quantization import Quantization
 
-    rotated = run_config(tokens, "--trainer.horizon.steps", "2", "--trainer.name", "kept",
+    rotated = run_config(tokens, "--trainer.steps", "2", "--trainer.name", "kept",
                          model=json.dumps({**model, "rope_theta": 500.0}))
-    same = run_config(tokens, "--trainer.horizon.steps", "2", "--trainer.name", "kept",
+    same = run_config(tokens, "--trainer.steps", "2", "--trainer.name", "kept",
                       model=json.dumps(model))
     quantized = dataclasses.replace(same, trainer=dataclasses.replace(same.trainer,
                                                                       quantization=Quantization()))
@@ -346,11 +348,12 @@ def test_a_run_resumed_under_its_name_trains_the_model_it_recorded(tmp_path):
     # The record may name its class by its import path, as the registry reads it too.
     record = json.loads((run / "run.json").read_text())
     (run / "run.json").write_text(json.dumps({**record, "class": "dew.config.lm:LMRunConfig"}))
-    run_config(tokens, "--trainer.horizon.steps", "2", "--trainer.name", "kept",
+    run_config(tokens, "--trainer.steps", "2", "--trainer.name", "kept",
                model=json.dumps(model)).run()
     assert Checkpoints(str(run)).latest == 2
 
 
+@attending("reference")
 def test_fresh_processes_train_a_runs_record_and_export_it(tmp_path):
     """`dew train run.json` and `dew export` each run in a process of their own, which imports what
     the record names and nothing a test happened to import before: the recorded run trains on to
@@ -366,7 +369,7 @@ def test_fresh_processes_train_a_runs_record_and_export_it(tmp_path):
 
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
     checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
-    pretrained_config(tokens, checkpoint, "--trainer.horizon.steps", "1", "--max-new-tokens", "0",
+    pretrained_config(tokens, checkpoint, "--trainer.steps", "1", "--max-new-tokens", "0",
                       "--trainer.name", "fresh").run()
     run, exported = tmp_path / "runs" / "fresh", tmp_path / "exported"
 
@@ -377,12 +380,12 @@ def test_fresh_processes_train_a_runs_record_and_export_it(tmp_path):
                               text=True, check=False, env=environment)
         assert done.returncode == 0, done.stdout + done.stderr
 
-    dew("train", str(set_record(run, {"trainer.horizon.steps": 2}) / "run.json"))
+    dew("train", str(set_record(run, {"trainer.steps": 2}) / "run.json"))
     dew("export", str(run), str(exported))
 
     assert Checkpoints(str(run)).latest == 2
     trained = Checkpoints(str(run)).variables(step=2)["params"]
-    loaded = Pretrained.load(str(exported), dtype="float32", attention_impl="reference").variables["params"]
+    loaded = Pretrained.load(str(exported), dtype="float32").variables["params"]
     for path, leaf in jax.tree_util.tree_flatten_with_path(loaded)[0]:
         held = trained
         for entry in path:
@@ -391,13 +394,13 @@ def test_fresh_processes_train_a_runs_record_and_export_it(tmp_path):
 
 
 def test_a_pretrained_run_stores_its_parameters_in_the_dtype_it_names(tmp_path):
-    """`--trainer.precision '{"dtypes": {"params": "bfloat16"}}'` loads the checkpoint's parameters as
-    bf16 and trains them so, and the run records it with its numerics."""
+    """`trainer.precision:default --trainer.precision.dtypes.params bfloat16` loads the checkpoint's
+    parameters as bf16 and trains them so, and the run records it with its numerics."""
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
     checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
-    config = pretrained_config(tokens, checkpoint, "--trainer.horizon.steps", "1", "--max-new-tokens", "0",
-                               "--trainer.name", "bf16", "--trainer.precision",
-                               '{"dtypes": {"params": "bfloat16"}}')
+    config = pretrained_config(tokens, checkpoint, "--trainer.steps", "1", "--max-new-tokens", "0",
+                               "--trainer.name", "bf16", "trainer.precision:default",
+                               "--trainer.precision.dtypes.params", "bfloat16")
     state = config.run()
     params = jax.tree.leaves(state.variables["params"])
     floating = [leaf for leaf in params if jnp.issubdtype(leaf.dtype, jnp.floating)]
@@ -405,6 +408,7 @@ def test_a_pretrained_run_stores_its_parameters_in_the_dtype_it_names(tmp_path):
     assert LMRunConfig.load(str(tmp_path / "runs" / "bf16")).trainer.precision.dtypes.params == "bfloat16"
 
 
+@attending("reference")
 def test_a_pretrained_run_trains_a_lora_that_saves_from_the_run_alone(tmp_path):
     """`--pretrained <decoder> --lora.rank 4 --lora.modules q_proj`: the recipe
     binds the adapter to the loaded weights, two steps move every factor and
@@ -418,13 +422,13 @@ def test_a_pretrained_run_trains_a_lora_that_saves_from_the_run_alone(tmp_path):
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
     checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
     lora = ("--lora.rank", "4", "--lora.modules", "q_proj")
-    config = pretrained_config(tokens, checkpoint, "--trainer.horizon.steps", "2", "--max-new-tokens", "0",
+    config = pretrained_config(tokens, checkpoint, "--trainer.steps", "2", "--max-new-tokens", "0",
                                "--trainer.name", "lora", *lora)
     assert config.lora == LoRA(rank=4, modules=("q_proj",))
 
     state = config.run()
 
-    source = Pretrained.load(str(checkpoint), dtype="float32", attention_impl="reference")
+    source = Pretrained.load(str(checkpoint), dtype="float32")
     moved = jax.tree_util.tree_leaves_with_path(state.variables["params"])
     assert moved and all(path[-1].key in ("lora_A", "lora_B") for path, _ in moved)
     assert all(bool(jnp.any(leaf)) for path, leaf in moved if path[-1].key == "lora_B")
@@ -441,6 +445,7 @@ def test_a_pretrained_run_trains_a_lora_that_saves_from_the_run_alone(tmp_path):
         assert (tmp_path / "from-run" / name).read_bytes() == (tmp_path / "in-process" / name).read_bytes()
 
 
+@attending("reference")
 @pytest.mark.parametrize("lora", [True, False], ids=["lora", "full"])
 def test_a_pretrained_run_stores_a_source_it_keeps_frozen_as_its_checkpoint_does(tmp_path, lora):
     """A source a LoRA run keeps frozen is stored as its checkpoint stores it (`param_dtype='auto'`): no
@@ -456,13 +461,12 @@ def test_a_pretrained_run_stores_a_source_it_keeps_frozen_as_its_checkpoint_does
     checkpoint = tmp_path / "checkpoint"
     bf16_except(export_tiny_decoder(tmp_path / "exported"), checkpoint, ("model.norm",))
     adapter = ("--lora.rank", "4", "--lora.modules", "q_proj") if lora else ()
-    state = pretrained_config(tokens, checkpoint, "--trainer.horizon.steps", "1", "--max-new-tokens", "0",
+    state = pretrained_config(tokens, checkpoint, "--trainer.steps", "1", "--max-new-tokens", "0",
                               "--trainer.name", "stored", *adapter).run()
     trained = jax.tree.leaves(state.variables["params"])
     assert trained and all(leaf.dtype == jnp.float32 for leaf in trained)
     if lora:
-        source = Pretrained.load(str(checkpoint), dtype="float32", param_dtype="auto",
-                                 attention_impl="reference")
+        source = Pretrained.load(str(checkpoint), dtype="float32", param_dtype="auto")
         stored = jax.tree.leaves(source.variables["params"])
         assert {leaf.dtype for leaf in stored} == {jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)}
         for before, after in zip(stored, jax.tree.leaves(state.variables[FROZEN]), strict=True):
@@ -478,9 +482,10 @@ def test_a_lora_run_under_bf16_parameters_keeps_its_factors_float32_and_its_base
 
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
     checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
-    state = pretrained_config(tokens, checkpoint, "--trainer.horizon.steps", "1", "--max-new-tokens", "0",
+    state = pretrained_config(tokens, checkpoint, "--trainer.steps", "1", "--max-new-tokens", "0",
                               "--trainer.name", "bf16", "--lora.rank", "4", "--lora.modules", "q_proj",
-                              "--trainer.precision", '{"dtypes": {"params": "bfloat16"}}').run()
+                              "trainer.precision:default", "--trainer.precision.dtypes.params",
+                              "bfloat16").run()
     for collection, dtype in (("params", jnp.float32), (FROZEN, jnp.bfloat16)):
         stored = {leaf.dtype for leaf in jax.tree.leaves(state.variables[collection])}
         assert stored == {jnp.dtype(dtype)}, collection
@@ -509,7 +514,7 @@ def test_a_pretrained_runs_source_loads_where_its_start_keeps_it(tmp_path, lora,
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
     checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
     adapter = ("--lora.rank", "4", "--lora.modules", "q_proj") if lora else ()
-    config = recipe_run(Started, tokens, "--pretrained", str(checkpoint), "--trainer.horizon.steps", "1",
+    config = recipe_run(Started, tokens, "--pretrained", str(checkpoint), "--trainer.steps", "1",
                         "--max-new-tokens", "0", *adapter,
                         default=Started(data=windows(tokens), validation=windows(tokens, held=True)))
     sharded = Layout(min_shard=1, frozen_whole=whole)
@@ -525,7 +530,7 @@ def test_a_pretrained_runs_source_loads_where_its_start_keeps_it(tmp_path, lora,
     assert all(isinstance(leaf, jax.Array) for leaf in jax.tree.leaves(base))
     assert any(leaf.addressable_shards[0].data.shape != leaf.shape for leaf in jax.tree.leaves(base))
     trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0), mesh=config.trainer.mesh,
-                      layout=config.trainer.layout)
+                      advanced=TrainerAdvanced(layout=config.trainer.layout))
     state, shardings = trainer.place()[:2]
     assert ({id(leaf) for leaf in jax.tree.leaves(state.variables[FROZEN])}
             == {id(leaf) for leaf in jax.tree.leaves(base)})
@@ -546,7 +551,7 @@ def test_a_scratch_run_trains_a_lora_that_saves_from_the_run_alone(tmp_path):
     from dew.lora import Adapter
 
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
-    config = run_config(tokens, "--trainer.horizon.steps", "2", "--max-new-tokens", "0", "--trainer.name",
+    config = run_config(tokens, "--trainer.steps", "2", "--max-new-tokens", "0", "--trainer.name",
                         "scratch", "--lora.rank", "2", "--lora.modules", "q_proj", "v_proj")
 
     state = config.run()
@@ -579,7 +584,7 @@ def test_the_recipe_balances_a_sparse_run(tmp_path):
               '"mixture": {"experts": 8, "top_k": 2, "layers": [1], "bias": true}}')
 
     def run(name, **objective_fields):
-        config = recipe_run(LMRunConfig, tokens, "--trainer.horizon.steps", "2", "--max-new-tokens", "0",
+        config = recipe_run(LMRunConfig, tokens, "--trainer.steps", "2", "--max-new-tokens", "0",
                             "--trainer.name", name, model_config=sparse, objective_fields=objective_fields,
                             default=LMRunConfig(data=windows(tokens)))
         state = config.run()
@@ -603,7 +608,7 @@ def test_the_recipe_trains_the_prediction_depths_on_request(tmp_path):
             '"num_nextn_predict_layers": 1}')
 
     def run(name, model_config=deep, **objective_fields):
-        config = recipe_run(LMRunConfig, tokens, "--trainer.horizon.steps", "2", "--max-new-tokens", "0",
+        config = recipe_run(LMRunConfig, tokens, "--trainer.steps", "2", "--max-new-tokens", "0",
                             "--trainer.name", name, model_config=model_config,
                             objective_fields=objective_fields,
                             default=LMRunConfig(data=windows(tokens)))
@@ -617,6 +622,7 @@ def test_the_recipe_trains_the_prediction_depths_on_request(tmp_path):
             model_config='{"emb_features": 16, "num_layers": 1, "num_heads": 2}')
 
 
+@attending("xla")
 def test_masked_diffusion_trains_on_packed_documents(tmp_path):
     """A masked-diffusion objective over packed documents: the packed
     windows reach the objective with their packing, so a validation batch
@@ -639,17 +645,17 @@ def test_masked_diffusion_trains_on_packed_documents(tmp_path):
 
     config = LMRunConfig.cli([
         "--tokenizer", str(checkpoint),
-        "--trainer.horizon.steps", "2", "--trainer.log-every", "1",
+        "--trainer.steps", "2", "--trainer.log-every", "1",
         "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", "packed",
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False", "--max-new-tokens", "0"],
         default=tiny(LMRunConfig(data=packed(corpus.train), validation=packed(corpus.val),
                                  pretrained=str(checkpoint)),
-                     '{"attention_impl": "xla"}', "masked_diffusion", {"ema_decay": None}))
+                     '{}', "masked_diffusion", {"ema_decay": None}))
 
     state = config.run()
 
     assert int(state.updates) == 2
-    original = Pretrained.load(str(checkpoint), dtype="float32", attention_impl="xla")
+    original = Pretrained.load(str(checkpoint), dtype="float32")
     objective = config.masked_objective(original.model, original.model_config, None)
     assert isinstance(config.validation, Dataset)
     batch = next(iter(held(config.validation, objective=objective.data())(DataPartition())))
@@ -674,7 +680,7 @@ def test_a_run_whose_tokenizer_is_gone_exports_and_starts_a_run_from_the_copy_it
     source = export_tiny_decoder(tmp_path / "source", tokenizer=tokenizer_for(str(vocabulary)),
                                  vocab_size=len(HFTokenizer(str(vocabulary)).tokenizer))
     own = write_token_files(tmp_path / "own", 40 * SEQ, 8 * SEQ, tokenizer=str(source), eos_id=0)
-    pretrained_config(own, source, "--tokenizer", str(source), "--trainer.horizon.steps", "1",
+    pretrained_config(own, source, "--tokenizer", str(source), "--trainer.steps", "1",
                       "--max-new-tokens", "0", "--trainer.name", "first").run()
     source.rename(tmp_path / "moved")
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "fresh"))
@@ -686,7 +692,7 @@ def test_a_run_whose_tokenizer_is_gone_exports_and_starts_a_run_from_the_copy_it
     bundle.save(tmp_path / "exported")
     assert HFTokenizer(str(tmp_path / "exported")).encode(text) == expected
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, tokenizer=str(vocabulary), eos_id=0)
-    started = pretrained_config(tokens, first, "--tokenizer", str(vocabulary), "--trainer.horizon.steps", "1",
+    started = pretrained_config(tokens, first, "--tokenizer", str(vocabulary), "--trainer.steps", "1",
                                 "--max-new-tokens", "0", "--trainer.name", "started").run()
     assert int(started.updates) == 1
 
@@ -720,6 +726,7 @@ def test_a_run_whose_tokenizer_this_host_cannot_resolve_is_refused_before_its_fi
     assert [record for record in map(json.loads, written) if record["type"] == "FitStarted"] == []
 
 
+@attending("xla")
 def test_masked_diffusion_continues_a_pretrained_checkpoint(tmp_path):
     """`--pretrained` over a masked-diffusion checkpoint continues from its
     weights. One step at 1e-3 leaves the trained state within 1.1e-3 of the
@@ -738,18 +745,18 @@ def test_masked_diffusion_continues_a_pretrained_checkpoint(tmp_path):
         Loading(workers=0))
     config = LMRunConfig.cli([
         "--tokenizer", str(checkpoint),
-        "--trainer.horizon.steps", "1", "--trainer.log-every", "1",
+        "--trainer.steps", "1", "--trainer.log-every", "1",
         "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", "masked",
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
-        "--max-new-tokens", "0", "--optim.learning-rate", "0.001"],
-        default=tiny(LMRunConfig(data=data, pretrained=str(checkpoint)), '{"attention_impl": "xla"}',
+        "--max-new-tokens", "0", "--optim.lr", "0.001"],
+        default=tiny(LMRunConfig(data=data, pretrained=str(checkpoint)), '{}',
                      "masked_diffusion",
                      {"ema_decay": None}))
 
     state = config.run()
 
     assert int(state.updates) == 1
-    original = Pretrained.load(str(checkpoint), dtype="float32", attention_impl="xla")
+    original = Pretrained.load(str(checkpoint), dtype="float32")
     objective = config.masked_objective(original.model, original.model_config, original.variables)
     assert objective.seq_len == 12, "the objective has to take the window's whole width"
     held = jax.tree.leaves(original.variables)
@@ -774,6 +781,7 @@ def gemma_spans(directory):
         Loading(workers=0))
 
 
+@attending("xla")
 def test_official_block_diffusion_is_a_complete_pretrained_recipe(tmp_path):
     from dew.interop import Pretrained
 
@@ -781,16 +789,16 @@ def test_official_block_diffusion_is_a_complete_pretrained_recipe(tmp_path):
     spans = gemma_spans(tmp_path / "tokens")
     config = LMRunConfig.cli([
         "--tokenizer", str(checkpoint),
-        "--trainer.horizon.steps", "1", "--trainer.log-every", "1",
+        "--trainer.steps", "1", "--trainer.log-every", "1",
         "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", "block",
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
-        "--max-new-tokens", "0", "--optim.learning-rate", "0.001"],
-        default=tiny(LMRunConfig(data=spans, pretrained=str(checkpoint)), '{"attention_impl": "xla"}',
+        "--max-new-tokens", "0", "--optim.lr", "0.001"],
+        default=tiny(LMRunConfig(data=spans, pretrained=str(checkpoint)), '{}',
                      "block_diffusion",
                      {"prompt_length": 4}))
     state = config.run()
     assert int(state.updates) == 1
-    original = Pretrained.load(checkpoint, dtype="float32", attention_impl="xla", max_seq_len=12)
+    original = Pretrained.load(checkpoint, dtype="float32", max_seq_len=12)
     initial = config.block_objective(original.model, original.variables).init(jax.random.key(0))
     difference = max(float(jnp.max(jnp.abs(a - b)))
                      for a, b in zip(jax.tree.leaves(state.variables), jax.tree.leaves(initial), strict=True))
@@ -808,6 +816,7 @@ def test_official_block_diffusion_is_a_complete_pretrained_recipe(tmp_path):
                                   trained(prompt, 4, key=9).host().tokens)
 
 
+@attending("xla")
 def test_block_diffusion_trains_quantized_as_any_lm_recipe_does(tmp_path):
     """`--trainer.quantization` wraps the module block-diffusion SFT trains, as it does any
     objective's (`quantize_trunk`): the recipe takes it, its step runs on the quantized forward,
@@ -820,11 +829,11 @@ def test_block_diffusion_trains_quantized_as_any_lm_recipe_does(tmp_path):
     def run(name, *quantized):
         return LMRunConfig.cli([
             "--tokenizer", str(checkpoint),
-            "--trainer.horizon.steps", "1", "--trainer.log-every", "1",
+            "--trainer.steps", "1", "--trainer.log-every", "1",
             "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", name,
             "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
-            "--max-new-tokens", "0", "--optim.learning-rate", "0.001", *quantized],
-            default=tiny(LMRunConfig(data=spans, pretrained=str(checkpoint)), '{"attention_impl": "xla"}',
+            "--max-new-tokens", "0", "--optim.lr", "0.001", *quantized],
+            default=tiny(LMRunConfig(data=spans, pretrained=str(checkpoint)), '{}',
                      "block_diffusion",
                          {"prompt_length": 4}))
 
@@ -837,6 +846,7 @@ def test_block_diffusion_trains_quantized_as_any_lm_recipe_does(tmp_path):
                                                       jax.tree.leaves(plain.variables), strict=True))
 
 
+@attending("xla")
 def test_a_trained_block_diffusion_tree_saves_back_over_its_source(tmp_path):
     """The SFT trains the per-layer skip scale, which the source declares a
     constant and the objective moves into `params`, so a trained tree and the
@@ -855,7 +865,7 @@ def test_a_trained_block_diffusion_tree_saves_back_over_its_source(tmp_path):
     from dew.objectives.diffusion.block import BlockDiffusionObjective
 
     checkpoint = REPO_ROOT / "tests/fixtures/hf/diffusion-gemma-workflow"
-    source = Pretrained.load(checkpoint, dtype="float32", attention_impl="xla", max_seq_len=32)
+    source = Pretrained.load(checkpoint, dtype="float32", max_seq_len=32)
     objective = BlockDiffusionObjective(source.model, prompt_length=4, num_canvases=2,
                                         variables=source.variables)
     rows = 2 * jax.device_count()
@@ -865,7 +875,7 @@ def test_a_trained_block_diffusion_tree_saves_back_over_its_source(tmp_path):
     state = Trainer(objective, optax.sgd(0.05), key=jax.random.key(0)).fit(data, steps=1, log_every=1)
     source.save(tmp_path / "trained", variables=thaw(state.variables))
 
-    read = Pretrained.load(tmp_path / "trained", dtype="float32", attention_impl="xla", max_seq_len=32)
+    read = Pretrained.load(tmp_path / "trained", dtype="float32", max_seq_len=32)
     restored = BlockDiffusionObjective(read.model, prompt_length=4, num_canvases=2,
                                        variables=read.variables)
     rebuilt = restored.init(jax.random.key(0))
@@ -887,7 +897,7 @@ def test_a_pretrained_run_loops_its_decoder_as_a_decision_run_does(tmp_path):
 
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
     checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
-    config = recipe_run(Started, tokens, "--pretrained", str(checkpoint), "--trainer.horizon.steps", "1",
+    config = recipe_run(Started, tokens, "--pretrained", str(checkpoint), "--trainer.steps", "1",
                         "--max-new-tokens", "0", "--loop-steps", "2", "--loop-layers", "0", "1",
                         default=Started(data=windows(tokens), validation=windows(tokens, held=True)))
     objective = config.prepare().train("looped")
@@ -912,7 +922,7 @@ def test_a_pretrained_run_trains_the_exit_gate_its_loop_draws_in_its_fresh_group
 
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
     checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
-    config = recipe_run(Started, tokens, "--pretrained", str(checkpoint), "--trainer.horizon.steps", "1",
+    config = recipe_run(Started, tokens, "--pretrained", str(checkpoint), "--trainer.steps", "1",
                         "--max-new-tokens", "0", "--loop-steps", "2", "--loop-layers", "0", "1",
                         "--loop-exit-gate",
                         default=Started(data=windows(tokens), validation=windows(tokens, held=True)))
@@ -955,7 +965,7 @@ def test_a_pretrained_run_passes_messages_it_trains_fresh_and_keeps_a_checkpoint
     objective = config.prepare().train("messaged")
     assert objective.model.loop.messages == CrossPass(block_size=1, rank=2, additive=False)
     assert objective.fresh_modules() and all("cross_pass_" in path for path in objective.fresh_modules())
-    trained = pretrained_config(tokens, checkpoint, "--trainer.horizon.steps", "2", *shaped,
+    trained = pretrained_config(tokens, checkpoint, "--trainer.steps", "2", *shaped,
                                 "--trainer.name", "messaged").run()
     named = {jax.tree_util.keystr(path): leaf
              for path, leaf in jax.tree_util.tree_leaves_with_path(trained.variables["params"])}
@@ -966,14 +976,14 @@ def test_a_pretrained_run_passes_messages_it_trains_fresh_and_keeps_a_checkpoint
 
     from dew.checkpoints import Checkpoints
 
-    run = trained_record(tmp_path / "runs" / "messaged", {"trainer.horizon.steps": "3"})
+    run = trained_record(tmp_path / "runs" / "messaged", {"trainer.steps": "3"})
     resumed = Checkpoints(str(run))
     assert resumed.latest == 3
     again = {jax.tree_util.keystr(path): leaf
              for path, leaf in jax.tree_util.tree_leaves_with_path(resumed.variables(step=3)["params"])}
     # It trains on from what it saved, its merges not drawn again: its third step is a run's that never
     # stopped.
-    straight = pretrained_config(tokens, checkpoint, "--trainer.horizon.steps", "3", *shaped,
+    straight = pretrained_config(tokens, checkpoint, "--trainer.steps", "3", *shaped,
                                  "--trainer.name", "straight").run()
     unbroken = {jax.tree_util.keystr(path): leaf
                 for path, leaf in jax.tree_util.tree_leaves_with_path(straight.variables["params"])}
@@ -1002,7 +1012,7 @@ def test_a_run_that_names_no_metrics_and_validates_nothing_trains(tmp_path):
     """`--val-metrics '[]'` scores no metric: a run whose data holds no validation split trains with no
     suite at all, as one that names none does, rather than an empty set of splits."""
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
-    config = dataclasses.replace(run_config(tokens, "--trainer.horizon.steps", "2", "--val-metrics", "[]"),
+    config = dataclasses.replace(run_config(tokens, "--trainer.steps", "2", "--val-metrics", "[]"),
                                  validation=None)
     assert config.val_metrics == ()
     assert int(config.run().step) == 2
@@ -1020,7 +1030,7 @@ def test_a_packed_runs_record_loads_where_its_token_store_is_not(tmp_path):
     (tmp_path / "tokens").rename(moved)
     saved = LMRunConfig.load(str(tmp_path / "saved"))
     url = moved / Path(tokens.train).relative_to(tmp_path / "tokens")
-    config = recipe_run(LMRunConfig, tokens, "--trainer.horizon.steps", "1", "--trainer.name", "moved",
+    config = recipe_run(LMRunConfig, tokens, "--trainer.steps", "1", "--trainer.name", "moved",
                         "--max-new-tokens", "0",
                         model_config='{"emb_features": 16, "num_layers": 1, "num_heads": 2}',
                         default=saved.override({"data.source.url": str(url)}))

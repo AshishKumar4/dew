@@ -17,7 +17,6 @@ from dew.data.steps.generic import Formatting
 from dew.inputs import Field, InputSpec
 from dew.optim import OptimConfig
 from dew.registry import ModelConfig
-from dew.training.budget import Horizon
 
 FEATURES = 8
 
@@ -71,5 +70,5 @@ def run() -> RunConfig:
         validation=Files(files["validation"]).map(Formatting()).batch(32),
         objective=ObjectiveConfig("supervised", {"loss": evidence_bound, "metrics": (reconstruction_error,),
                                                  "inputs": InputSpec(Field("x", (FEATURES,)))}),
-        optim=OptimConfig(learning_rate=1e-2),
-        trainer=TrainerConfig(horizon=Horizon(steps=40), log_every=1, eval_every=None, checkpoint_every=40))
+        optim=OptimConfig(lr=1e-2),
+        trainer=TrainerConfig(steps=40, log_every=1, eval_every=None, checkpoint_every=40))

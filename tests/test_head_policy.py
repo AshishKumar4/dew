@@ -3,6 +3,7 @@ builds it (`objective_cases.cases`), runs its model's head by `dew.objectives.lm
 moves and the step's program reports."""
 
 import pytest
+from model_support import attending
 from objective_cases import cases
 from objective_data import corpus_windows
 
@@ -20,6 +21,7 @@ def windows(tmp_path_factory):
     return corpus_windows(tmp_path_factory.mktemp("corpus"))
 
 
+@attending("xla")
 def test_the_token_objectives_are_registered_and_every_other_scores_no_vocabulary_head(windows):
     """The objectives this file holds are registered ones, and each registered objective it does not hold
     reports no vocabulary head in its step's program: a token objective registered later is held here."""
@@ -30,6 +32,7 @@ def test_the_token_objectives_are_registered_and_every_other_scores_no_vocabular
         assert not any(entry.head_tile or entry.head_fused for entry in objective.program_key()), name
 
 
+@attending("xla")
 @pytest.mark.parametrize("name", TOKEN_OBJECTIVES)
 def test_every_token_objective_runs_its_head_by_the_one_policy(name, windows):
     """Its fit ladder moves its head to the generation's tile, fused, then its backward, before it

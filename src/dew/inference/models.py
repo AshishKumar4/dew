@@ -72,6 +72,9 @@ class SavedModel(SavedRunTask):
     settings: ModelSettings
     objective: type[Objective]
     numerics: Numerics | None = None
+    kernels: tuple[tuple[str, str], ...] = ()
+    """The kernel choices its run pinned (`SavedRun.kernels`), which its release records beside its
+    numerics (`release_plan`)."""
 
     @classmethod
     def from_saved(cls, run: SavedRun, *, ema: bool | None = None, mesh: MeshSpec | Mesh | None = None,
@@ -87,7 +90,8 @@ class SavedModel(SavedRunTask):
                             "ModelSettings: it declares a task of its own")
         model = saved_model(run.record, dtype).build()
         variables = run.variables(ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
-        return cls(model, variables, saved_settings(run.record, settings), objective, run.precision)
+        return cls(model, variables, saved_settings(run.record, settings), objective, run.precision,
+                   run.kernels)
 
     @classmethod
     def unstated(cls, run: SavedRun) -> Unwritable | None:
@@ -123,7 +127,8 @@ class SavedModel(SavedRunTask):
         record = {"objective": import_path(self.objective),
                   "model": to_record(ModelConfig.from_model(self.model), ModelConfig),
                   **record_fields(self.settings, type(self.settings)),
-                  **({} if self.numerics is None else {"precision": to_record(self.numerics, Numerics)})}
+                  **({} if self.numerics is None else {"precision": to_record(self.numerics, Numerics)}),
+                  **({"kernels": dict(self.kernels)} if self.kernels else {})}
         return native_plan(self.variables, record, 0)
 
     def save_pretrained(self, directory: str | Path, *, max_shard_size: int | str = MAX_SHARD_SIZE) -> None:

@@ -42,7 +42,7 @@ from dew.objectives.lm import IndexerTraining, LMObjective
 from dew.objectives.perturbation import NodePerturbation
 from dew.objectives.routing import ExpertBalance
 from dew.objectives.supervised import CrossEntropy, Supervised
-from dew.training import Layout, Trainer
+from dew.training import Layout, Trainer, TrainerAdvanced
 
 LAYOUT = Layout(min_shard=1, tolerance=1.0)
 ESTIMATES = 256
@@ -325,7 +325,8 @@ def test_an_indexer_warmup_trains_its_indexer_alone_without_backpropagation():
     assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves(estimate))
     def trained(objective, steps):
         data = Memory([{"text": row} for row in tokens]).repeat().batch(8)
-        return Trainer(objective, optax.adam(1e-2), key=0, layout=LAYOUT).fit(data, steps=steps).variables
+        return Trainer(objective, optax.adam(1e-2), key=0, advanced=TrainerAdvanced(layout=LAYOUT)).fit(data,
+                                                                                                        steps=steps).variables
 
     once, twice = trained(objective, 1), trained(objective, 2)
     backpropagated = trained(LMObjective(model, 16, indexer=IndexerTraining("warmup")), 2)
@@ -352,7 +353,8 @@ def test_a_routed_decoder_trains_its_composite_statistics_without_backpropagatio
     assert jax.tree.structure(estimate) == jax.tree.structure(variables["params"])
     assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves(estimate))
     rows = Memory([{"text": row} for row in np.asarray(batch["text"])]).repeat().batch(8)
-    state = Trainer(objective, optax.adam(1e-2), key=0, layout=LAYOUT).fit(rows, steps=2)
+    state = Trainer(objective, optax.adam(1e-2), key=0, advanced=TrainerAdvanced(layout=LAYOUT)).fit(rows,
+                                                                                                     steps=2)
     assert int(state.step) == 2
 
 
@@ -435,11 +437,13 @@ def test_a_run_trains_without_differentiating_its_model():
     inputs = InputSpec(Field("x", (3,)))
     refusing = Linear(refuse_backward=True)
     with pytest.raises(RuntimeError):
-        Trainer(Supervised(refusing, squared, inputs=inputs), optax.sgd(0.01), key=0, layout=LAYOUT).fit(
+        Trainer(Supervised(refusing, squared, inputs=inputs), optax.sgd(0.01), key=0,
+                advanced=TrainerAdvanced(layout=LAYOUT)).fit(
             batches, steps=1)
     objective = Forward(refusing, squared, inputs=inputs)
     start = nn.unbox(objective.init(jax.random.key(0)))
-    state = Trainer(objective, optax.sgd(0.01), key=0, layout=LAYOUT).fit(batches, steps=40)
+    state = Trainer(objective, optax.sgd(0.01), key=0, advanced=TrainerAdvanced(layout=LAYOUT)).fit(batches,
+                                                                                                    steps=40)
     for moved, held in zip(jax.tree.leaves(state.variables), jax.tree.leaves(start), strict=True):
         assert not np.array_equal(np.asarray(moved), np.asarray(held))
 
@@ -476,7 +480,8 @@ def test_the_estimate_runs_the_model_at_the_progress_its_loss_read():
     assert all(np.any(np.asarray(leaf) != 0) for leaf in estimate(2))
     data = rows((3,))
     batches = Memory([{"x": x, "y": y} for x, y in zip(data["x"], data["y"], strict=True)]).repeat().batch(16)
-    state = Trainer(objective, optax.sgd(0.01), key=0, layout=LAYOUT).fit(batches, steps=3)
+    state = Trainer(objective, optax.sgd(0.01), key=0, advanced=TrainerAdvanced(layout=LAYOUT)).fit(batches,
+                                                                                                    steps=3)
     assert int(state.updates) == 3
 
 
@@ -502,7 +507,7 @@ def test_a_batch_norms_statistics_are_kept_as_the_clean_loss_keeps_them():
     def trained(objective_class):
         objective = objective_class(Normed(), CrossEntropy(labels="label"),
                                     inputs=InputSpec(Field("x", (3,))), mode="train")
-        return Trainer(objective, optax.sgd(0.01), key=0, layout=LAYOUT).fit(
+        return Trainer(objective, optax.sgd(0.01), key=0, advanced=TrainerAdvanced(layout=LAYOUT)).fit(
             labelled().repeat().batch(16), steps=1)
 
     perturbed, backpropagated = trained(Forward), trained(Supervised)

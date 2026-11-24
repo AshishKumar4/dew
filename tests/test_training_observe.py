@@ -13,12 +13,13 @@ import pytest
 from affine_run import Regression, dataset
 from recording import preempting
 
-from dew.training import Checkpoints, Layout, Observe, Trainer
+from dew.training import Checkpoints, Layout, Observe, Trainer, TrainerAdvanced
 from dew.training.runtime import Preempted
 
 
 def trainer(directory=None, tracker=None) -> Trainer:
-    return Trainer(Regression(), optax.sgd(0.1), key=jax.random.key(0), layout=Layout(min_shard=1),
+    return Trainer(Regression(), optax.sgd(0.1), key=jax.random.key(0),
+                   advanced=TrainerAdvanced(layout=Layout(min_shard=1)),
                    checkpoints=None if directory is None else Checkpoints(str(directory)), tracker=tracker)
 
 

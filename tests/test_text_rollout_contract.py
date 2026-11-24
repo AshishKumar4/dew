@@ -38,7 +38,7 @@ from dew.objectives.rl import GRPOObjective, RolloutScheduler
 from dew.objectives.rl.episodes import EpisodeStatus, Observation
 from dew.registry import mixers
 from dew.sampling import Sampling, generate
-from dew.training import Trainer
+from dew.training import Trainer, TrainerAdvanced
 
 ROWS = 16
 """A draw's prompts."""
@@ -597,7 +597,8 @@ def test_real_trainer_update_matches_raw_policy_ratio_with_behavior_recorded():
     def fitted(key):
         """The trainer's first step as a run takes it, its rollout its own, drawn from `key`."""
         data = Loader(train=lambda partition: iter([batch]), val=None, records=rows, batch=rows)
-        trainer = Trainer(objective, optax.sgd(0.01), key=jax.random.wrap_key_data(key), rollout=rollout)
+        trainer = Trainer(objective, optax.sgd(0.01), key=jax.random.wrap_key_data(key),
+                          advanced=TrainerAdvanced(rollout=rollout))
         state = trainer.fit(data, steps=1, log_every=1, checkpoint_every=None)
         assert int(state.step) == 1
         return state.variables
@@ -605,7 +606,8 @@ def test_real_trainer_update_matches_raw_policy_ratio_with_behavior_recorded():
     # The trainer's step, compiled once for a rollout's batch, which each draw's rollout steps from a
     # fresh state the step consumes: one program for every draw (ledger 2157), the run's own first
     # step the same to the bit (below).
-    stepper = Trainer(objective, optax.sgd(0.01), key=jax.random.key(0), rollout=rollout)
+    stepper = Trainer(objective, optax.sgd(0.01), key=jax.random.key(0),
+                      advanced=TrainerAdvanced(rollout=rollout))
     step = stepper.compile(stepper.place()[0], split_fields(rolled_from(jax.random.key(5)))[0])
 
     @as_given

@@ -35,7 +35,6 @@ from dew.inputs import TextCondition
 from dew.registry import ModelConfig
 from dew.sampling import Euler
 from dew.training import Layout, LocalTracker, MeshSpec
-from dew.training.budget import Horizon
 
 TINY_LAYA = Path(__file__).parent / "fixtures" / "laya" / "tiny"
 QWEN_TINY = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
@@ -43,6 +42,8 @@ GEMMA_TINY = Path(__file__).parent / "fixtures" / "hf" / "gemma3-native-tiny"
 DIFFUSION_GEMMA = Path(__file__).parent / "fixtures" / "hf" / "diffusion-gemma-sft"
 RATE = 0.0123
 """A learning rate no kind takes by default, which the run's optimizer logs as it steps."""
+
+
 @dataclasses.dataclass(frozen=True)
 class MostlyKept:
     """A record kept by its draw three times in four (`Pipeline.random_filter_map`): which records a
@@ -153,7 +154,7 @@ def published(root: Path, drawn: bool) -> RunConfig:
     train, held = pictures()
     return DiffusionRunConfig(
         pretrained=str(pipeline), preset=None,
-        model=ModelConfig("unet", {**DEFAULT_MODEL_CONFIG, "dtype": "float32", "attention_impl": "xla"}),
+        model=ModelConfig("unet", {**DEFAULT_MODEL_CONFIG, "dtype": "float32"}),
         data=captioned(train, 32, drawn=drawn), validation=captioned(held, 32, drawn=False), val_metrics=(),
         objective=ObjectiveConfig("diffusion", {"steps": 2}))
 
@@ -166,8 +167,7 @@ def jepa(root: Path, drawn: bool) -> RunConfig:
         return read(rows.pipe(presets.images, 16, batch=8, augment=Dimmed() if drawn else False))
     return JepaRunConfig(
         model=ModelConfig("jepa_encoder", {"patch_size": 2, "emb_features": 16, "num_layers": 1,
-                                           "num_heads": 2, "mlp_ratio": 2, "dtype": "float32",
-                                           "attention_impl": "xla"}),
+                                           "num_heads": 2, "mlp_ratio": 2, "dtype": "float32"}),
         predictor={"num_layers": 1, "predictor_features": 8}, num_target_blocks=2,
         data=patched(train, drawn=drawn), validation=patched(held, drawn=False))
 
@@ -190,10 +190,13 @@ def trained(run: RunConfig, root: Path, name: str, lowering: LowerTarget | None 
     fsdp shards, its trainer the fields given, over its defaults here: its state, and its step's
     scalars; lowered for `lowering` in place of training where given (`Prepared.lower`), which ends by
     raising."""
-    trainer = TrainerConfig(**{"checkpoint_dir": str(root / "runs"), "horizon": Horizon(steps=1),
+    given = fields.pop("trainer", {})
+    # One step, where the fields name no length of their own.
+    length = {} if {"steps", "epochs", "tokens", "examples"} & set(given) else {"steps": 1}
+    trainer = TrainerConfig(**{"checkpoint_dir": str(root / "runs"), **length,
                                "log_every": 1, "eval_every": None, "checkpoint_every": None,
                                "checkpoint_final": False, "multi_host": False, "mesh": MeshSpec(fsdp=2),
-                               "layout": Layout(min_shard=64), **fields.pop("trainer", {})})
+                               "layout": Layout(min_shard=64), **given})
     prepared = dataclasses.replace(run, trainer=trainer, **fields).prepare()
     if lowering is not None:
         prepared.lower(name, lowering)
@@ -221,7 +224,7 @@ def dreamed(root: Path, drawn: bool, release: str = "dream") -> RunConfig:
                                 tokenizer=str(source), vocab_size=128, eos_id=1)
     data = TokenFiles(corpus.train).pipe(presets.lm, None, seq_len=11, batch=8, pack=None).loading(
         Loading(workers=0))
-    model = ModelConfig("causal_transformer", {"dtype": "float32", "attention_impl": "reference"})
+    model = ModelConfig("causal_transformer", {"dtype": "float32"})
     return dataclasses.replace(lm(root, drawn), data=data, validation=None, pretrained=str(source),
                                tokenizer=str(source), model=model, max_new_tokens=0,
                                objective=ObjectiveConfig("masked_diffusion"))
@@ -305,7 +308,7 @@ def blockwise(root: Path, drawn: bool, release: str = str(DIFFUSION_GEMMA), toke
                                 tokenizer=release, vocab_size=32, eos_id=1)
     spans = TokenFiles(corpus.train).pipe(presets.lm, None, seq_len=11, batch=8, pack=None).loading(
         Loading(workers=0))
-    model = ModelConfig("causal_transformer", {"dtype": "float32", "attention_impl": "xla"})
+    model = ModelConfig("causal_transformer", {"dtype": "float32"})
     return dataclasses.replace(lm(root, drawn), pretrained=release, tokenizer=release, model=model,
                                data=spans, validation=None,
                                objective=ObjectiveConfig("block_diffusion", {"prompt_length": 4}),
@@ -331,7 +334,7 @@ def cli_settings(root: Path, name: str, assigned: Mapping[str, object] = Mapping
     """A run's settings, by dotted path (`RunConfig.override`), for a run named `name` under `root`: one
     step, no evaluation or checkpoint between steps, one host, its programs compiled into the suite's cache,
     which a run naming its own would leave the training process holding; each of `assigned` over them."""
-    return {"trainer.name": name, "trainer.checkpoint_dir": str(root / "runs"), "trainer.horizon.steps": 1,
+    return {"trainer.name": name, "trainer.checkpoint_dir": str(root / "runs"), "trainer.steps": 1,
             "trainer.eval_every": None, "trainer.checkpoint_every": None, "trainer.multi_host": False,
             "trainer.compilation_cache_dir": None, **assigned}
 

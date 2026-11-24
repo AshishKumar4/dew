@@ -148,7 +148,7 @@ class DecisionRunConfig(DecoderRunConfig):
     objective: ObjectiveConfig = dataclasses.field(default_factory=lambda: ObjectiveConfig("decision"))
     """The decision objective and its arguments: its scoring rule (`loss`),
     label smoothing, option shuffling and none-of-the-above rate."""
-    optim: OptimConfig = dataclasses.field(default_factory=lambda: OptimConfig(learning_rate=2.5e-5))
+    optim: OptimConfig = dataclasses.field(default_factory=lambda: OptimConfig(lr=2.5e-5))
     # Its compute dtype is the run's numerics' (`TrainerConfig.precision`) unless its record states one.
     model: ModelConfig = dataclasses.field(default_factory=lambda: ModelConfig("causal_transformer", {}))
     pretrained: str = LAYA
@@ -359,19 +359,18 @@ class DecisionRunConfig(DecoderRunConfig):
         """The objective over the backbone `pretrained` names, on the table's
         or the mixture's rows, scored on the held-out ones, which calibrate the
         run after it trains. The checkpoint decides the backbone; the model
-        flags choose only its compute dtype and attention kernel;
+        flags choose only its compute dtype (its attention kernel the run's, `diagnostics.kernels`);
         `trainer.precision.dtypes.params` chooses the stored dtype of a checkpoint it trains
         (`RunConfig.source_keywords`). `remat` chooses its layer recomputation before looping or
         attaching LoRA."""
         from dew.interop import Pretrained
 
         self.sourced_model()
-        decided = sorted(set(self.model.fields) - {"dtype", "attention_impl"})
+        decided = sorted(set(self.model.fields) - {"dtype"})
         if decided:
             raise ValueError(f"the run's model sets {decided}, which {self.pretrained} decides; only dtype "
-                             "and attention_impl are choices")
+                             "is a choice")
         dtype = self.compute_dtype()
-        attention_impl = self.source_attention()
         budgets = self._row_fields()
         self._refuse_unread_context()
         derived: dict[str, object] = dict(self._context_derived(dtype))
@@ -380,7 +379,7 @@ class DecisionRunConfig(DecoderRunConfig):
 
         frozen = self.lora is not None or (self.context_layers is not None and self.context_frozen)
         start = Pretrained.load(self.pretrained, subfolder=self.subfolder, revision=self.revision,
-                                dtype=dtype, attention_impl=attention_impl,
+                                dtype=dtype,
                                 **self.source_keywords(frozen=frozen))
         if isinstance(start, PretrainedDecision) and self.head is not None:
             # A head drawn over a release's backbone, its head, layout and calibration set aside, its

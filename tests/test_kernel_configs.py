@@ -181,6 +181,70 @@ def test_the_short_convs_kernels_compile_within_each_gpus_resources(target):
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 
+def _diagonal_case(*, packed: bool) -> support.KernelCase:
+    """The diagonal scan's training step through its VJP (`templates.recurrence.diagonal`, its four launches:
+    16 spans a row) over bf16 writes at HGRN 1.3B's 2048 channels, eight rows of 4096 tokens, whole or
+    packed."""
+    from dew.nn.kernels.templates.recurrence import diagonal, mainloop
+
+    def call():
+        x = jax.ShapeDtypeStruct((8, 4096, 2048), jnp.bfloat16)
+        g = jax.ShapeDtypeStruct(x.shape, jnp.float32)
+        state = jax.ShapeDtypeStruct((8, 2048), jnp.float32)
+        starts = jax.ShapeDtypeStruct(x.shape[:2], jnp.bool_) if packed else None
+
+        def grads(x, g, state, starts):
+            family, _ = mainloop.issued(jnp.float32)
+
+            def loss(x, g, state):
+                out, final = diagonal.diagonal_scan(x, g, state, starts, family=family, interpret=False)
+                return jnp.sum(out.astype(jnp.float32)) + jnp.sum(final)
+
+            return jax.grad(loss, argnums=(0, 1, 2))(x, g, state)
+        return grads, (x, g, state, starts)
+    return support.KernelCase("diagonal/packed" if packed else "diagonal", call)
+
+
+def _wkv4_case(*, packed: bool) -> support.KernelCase:
+    """RWKV4's WKV's training step through its VJP (`templates.recurrence.wkv4`, its four launches: 32 spans
+    a row) over bf16 keys and values at RWKV-4 1.5B's 2048 channels, eight rows of 4096 tokens, whole or
+    packed."""
+    from dew.nn.kernels.templates.recurrence import mainloop, wkv4
+
+    def call():
+        channel = jax.ShapeDtypeStruct((2048,), jnp.float32)
+        key = jax.ShapeDtypeStruct((8, 4096, 2048), jnp.bfloat16)
+        state = jax.ShapeDtypeStruct((8, 3, 2048), jnp.float32)
+        starts = jax.ShapeDtypeStruct(key.shape[:2], jnp.bool_) if packed else None
+
+        def grads(decay, bonus, key, value, state, starts):
+            family, _ = mainloop.issued(jnp.float32)
+
+            def loss(decay, bonus, key, value, state):
+                out, final = wkv4.wkv4(decay, bonus, key, value, state, starts, family=family,
+                                       interpret=False)
+                return jnp.sum(out.astype(jnp.float32)) + jnp.sum(final)
+
+            return jax.grad(loss, argnums=(0, 1, 2, 3, 4))(decay, bonus, key, value, state)
+        return grads, (channel, channel, key, key, state, starts)
+    return support.KernelCase("wkv4/packed" if packed else "wkv4", call)
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("target", gate_generations(scoped=True))
+def test_the_channel_walks_kernels_compile_within_each_gpus_resources(target):
+    """The channel walks' training launches (`templates.recurrence.walks`: the diagonal scan's and RWKV4's
+    WKV's) over whole rows and packed ones, lowered as on the GPU and compiled by Mosaic for a compile-only
+    device on this CPU through ptxas (tests/kernel_compile.py): within the block's shared memory (each
+    backward's kept states), no register spilled."""
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    cases = [case(packed=packed) for case in (_diagonal_case, _wkv4_case) for packed in (False, True)]
+    found = compile_mosaic_kernels(cases, target)
+    assert len(found) == len(cases)
+    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
 
 @COMPILES_ON_CPU
 @lowers("sm90")
@@ -753,12 +817,29 @@ def _gate_forms(generation_name: str) -> set[str]:
 
 
 def _gate_cases(generation_name: str, form: str) -> list:
-    """A form's cases at every projection, each at the tile its launch settles on as a call
-    (`_gemm_mainloop_cases`' `settled`): each call its own, as two calls that derive one tile may settle on
-    two (certification refuses a launch by its whole call), a module compiled once a process however many
-    cases emit it. Derived where they compile, in the gate's refusals (`report.refusals`)."""
-    return [case for shape in GEMM_SHAPES
-            for case in _gemm_mainloop_cases(generation_name, shape, form=form, settled=True)]
+    """A form's cases at the projections whose calls differ in what their kernels are built from, each at
+    the tile its launch settles on as a call (`_gemm_mainloop_cases`' `settled`): one projection of each
+    derived tile and boundary (`_boundary`), a call the gate traces whole (certification settles a tile by
+    its whole call), not every projection that derives the same tile over the same boundaries again. Derived
+    where they compile, in the gate's refusals (`report.refusals`)."""
+    kept: dict = {}
+    for shape in GEMM_SHAPES:
+        for case in _gemm_mainloop_cases(generation_name, shape, form=form, settled=True):
+            kept.setdefault((repr(case.tile), _boundary(GEMM_SHAPES[shape], case.tile)), case)
+    return list(kept.values())
+
+
+def _boundary(extents: tuple[int, int, int, int], tile) -> tuple:
+    """What a projection's `(rows, depth, width, groups)` asks of a launch's kernels at `tile` beyond the
+    tile: dense or grouped, a group's rows under one tile (a decode step's), and its depth and width whole
+    tiles, partial ones in whole 16-byte rows, or padded (`mosaic_gpu.partial_runs`,
+    `grouped_matmul._Mosaic._aligned`)."""
+    rows, depth, width, groups = extents
+
+    def edge(extent: int, block: int) -> str:
+        return "whole" if extent % block == 0 else "partial" if extent * 2 % 16 == 0 else "padded"
+
+    return (groups == 1, rows // groups < tile.block_m, edge(depth, tile.block_k), edge(width, tile.block_n))
 
 
 def _by_form(names: tuple[str, ...], forms_of: Callable[[str], set[str]]) -> list:

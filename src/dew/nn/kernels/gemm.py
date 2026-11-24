@@ -56,16 +56,7 @@ from dew.nn.derivatives import (
     with_gradients_formed,
 )
 from dew.nn.kernels import generation, grouped_matmul, selection, xla_products
-from dew.nn.kernels.formats import (
-    Fp8Weights,
-    MxFp8,
-    NvFp4,
-    NvFp4Block,
-    TernaryWeights,
-    _e2m1_values,
-    fp8_factor,
-    fp8_scale_checked,
-)
+from dew.nn.kernels.formats import MxFp8, NvFp4, NvFp4Block, TernaryWeights, _e2m1_values
 from dew.nn.kernels.templates import axes as side_axes_of, product as product_of
 from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import rows_permuted, scattered, tiling
@@ -101,7 +92,7 @@ def unbuilt():
         _UNBUILT.reset(token)
 
 
-def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | Fp8Weights | TernaryWeights,
+def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights,
          group_sizes: jax.Array | None = None, *,
          transpose_rhs: bool = False, prologue=None, prologue_operands: tuple = (), epilogue=None,
          epilogue_operands: tuple = (), out_dtype, out_dtypes: tuple | None = None,
@@ -152,7 +143,7 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | Fp8Weights | TernaryWeights,
     gradient chained in one accumulator, each kernel gradient its own; no kernels joined, no output split (row
     6794, M-EM-59i); with no other part (`_gemm_refused`). `selected`, a caller's route of the forward
     (`side_by_side`'s), runs as found."""
-    if isinstance(rhs, (NvFp4, Fp8Weights, TernaryWeights)):
+    if isinstance(rhs, (NvFp4, TernaryWeights)):
         return _packed_gemm(lhs, rhs, group_sizes, epilogue=epilogue, epilogue_operands=epilogue_operands,
                             out_dtype=out_dtype, layer=layer, gather=gather, scatter=scatter,
                             interpret_on_cpu=interpret_on_cpu,
@@ -341,10 +332,10 @@ def _gemm_refused(group_sizes, *, prologue, gather, scatter, compute, applied, l
         raise ValueError(f"a formed operand is a prologue's, of the rows' shape {lhs.shape} and dtype "
                          f"{expected}, not {applied.shape} {applied.dtype}")
 
-def _packed_gemm(lhs, matrix: NvFp4 | Fp8Weights | TernaryWeights, group_sizes, *, epilogue,
+def _packed_gemm(lhs, matrix: NvFp4 | TernaryWeights, group_sizes, *, epilogue,
                  epilogue_operands: tuple, out_dtype, layer, gather, scatter, interpret_on_cpu: bool,
                  refused: tuple) -> jax.Array:
-    """`gemm` of a packed weight matrix (`NvFp4`, `Fp8Weights`, `TernaryWeights`: its fp32 sums times its
+    """`gemm` of a packed weight matrix (`NvFp4`, `TernaryWeights`: its fp32 sums times its
     scale, frozen), its epilogue on them in XLA before the one rounding, its rows scattered as any, one
     output; none of `refused` (a transposed matrix, a prologue, its side operands, a pair, a prologue's JVP,
     several outputs) given."""
@@ -357,11 +348,8 @@ def _packed_gemm(lhs, matrix: NvFp4 | Fp8Weights | TernaryWeights, group_sizes, 
     else:
         if gather is not None or layer is not None:
             raise ValueError(f"{type(matrix).__name__} product in gemm does not take gather or layer")
-        summed = (fp8_weight_product(lhs, matrix, group_sizes, out_dtype=jnp.float32,
-                                     interpret_on_cpu=interpret_on_cpu)
-                  if isinstance(matrix, Fp8Weights)
-                  else ternary_weight_product(lhs, matrix, group_sizes, quantize_activations=False,
-                                              out_dtype=jnp.float32, interpret_on_cpu=interpret_on_cpu))
+        summed = ternary_weight_product(lhs, matrix, group_sizes, quantize_activations=False,
+                                        out_dtype=jnp.float32, interpret_on_cpu=interpret_on_cpu)
     if epilogue is not None:
         arrays, axes = _split(epilogue_operands, 'epilogue', group_sizes)
         sizes = jnp.asarray([summed.shape[0]], jnp.int32) if group_sizes is None else group_sizes
@@ -465,7 +453,7 @@ class SyrkCase:
     precision_ok: bool = True
     measured: bool = False
 
-SYRK: selection.Op[SyrkCase] = selection.Op(generation.Choice.GROUPED_MATMUL, (
+SYRK: selection.Op[SyrkCase] = selection.Op(generation.Choice.SYRK, (
     selection.Kernel('mosaic', (
         selection.Requirement(
             'dtype', lambda case: case.dtype in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)),
@@ -489,8 +477,9 @@ SYRK: selection.Op[SyrkCase] = selection.Op(generation.Choice.GROUPED_MATMUL, (
             'launch', lambda case: case.call.eligible('mosaic'),
             "no legal square super-tile holds this symmetric product on the target", SYRK_ROW))),
     selection.Kernel('xla', (), generic=True)))
-"""Symmetric Gram/polynomial selector (`symmetric_gram`, `symmetric_polynomial`): Mosaic SYRK once measured
-or when chosen by name (`generation.chosen(grouped_matmul='mosaic')`), else XLA."""
+"""Symmetric Gram/polynomial selector (`symmetric_gram`, `symmetric_polynomial`), its own choice (`syrk`, row
+12485): Mosaic SYRK once measured or when chosen by name (`generation.chosen(syrk='mosaic')`), else XLA;
+naming the grouped products' kernel (`grouped_matmul`) leaves Muon's products alone."""
 
 
 def _syrk_portable(operand: jax.Array, poly: jax.Array | None, *, transpose: bool, conjugate: bool,
@@ -771,14 +760,11 @@ def gemm_quantized(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None
     raise ValueError(f"gemm_quantized supports E4M3, E5M2, E2M1, MxFp8, or NvFp4Block, got {minifloat}")
 
 
-FP8_WEIGHT_ROW = 'ledger 8548'
-
-
 @dataclasses.dataclass(eq=False)
 class WordPackedCase:
-    """Facts deciding whether a word-packed matrix's product (`fp8_weight_product`,
-    `ternary_weight_product`) runs the inline-decoding Mosaic GEMM mainloop: its tile (`plan`'s), planned
-    only once the requirements before `launch` take the call."""
+    """Facts deciding whether a word-packed matrix's product (`ternary_weight_product`) runs the
+    inline-decoding Mosaic GEMM mainloop: its tile (`plan`'s), planned only once the requirements before
+    `launch` take the call."""
     plan: Callable[[], tiling.Tiles | None]
     whole: bool
 
@@ -808,12 +794,10 @@ def word_packed_op(format_name: str, row: str, receipt: str) -> selection.Op[Wor
     ))
 
 
-FP8_WEIGHT = word_packed_op('FP8', FP8_WEIGHT_ROW, 'M-NG-6')
-
 def _packed_weight_rules(launch: grouped_matmul.MosaicWordPackedGmm, make_bank,
                          interpret: bool, *, dense: bool):
     """Build `(forward, backward, portable)` rules for an inline-decoding packed weight product
-    (`fp8_weight_product`, `ternary_weight_product`); callers wrap `linear_tangent` with `contracted(...)`."""
+    (`ternary_weight_product`); callers wrap `linear_tangent` with `contracted(...)`."""
     def decoded(packed_words: jax.Array) -> jax.Array:
         matrices = make_bank(packed_words).unscaled()
         return matrices[0] if dense else matrices
@@ -844,57 +828,8 @@ def _packed_weight_rules(launch: grouped_matmul.MosaicWordPackedGmm, make_bank,
         return tuple(leaves[index] for index in live)
     return forward, backward, portable
 
-def fp8_weight_product(lhs: jax.Array, weights: Fp8Weights, group_sizes: jax.Array | None = None, *,
-                       out_dtype=None, interpret_on_cpu: bool = False) -> jax.Array:
-    """`lhs @ weights` for free-layout FP8 `weights` (`formats.Fp8Weights`, rows 3733, 8548): decodes staged
-    uint32 E4M3/E5M2 words inline in the GEMM mainloop via `bits.E4M3_BFLOAT16_FORM`/`E5M2_BFLOAT16_FORM` on
-    sm80/sm90, multiplies in bfloat16 with fp32 accumulation, applies `weights.scale`, and rounds once."""
-    from jax.core import Tracer
-
-    if not isinstance(weights.form, Tracer):
-        weights.checked()
-    else:
-        fp8_scale_checked(jnp.shape(weights.scale), weights.shape)
-    rows = lhs.astype(jnp.bfloat16)
-    dense = group_sizes is None
-    if (dense and len(weights.shape) != 2) or (not dense and len(weights.shape) != 3):
-        raise ValueError(f"fp8_weight_product weight rank mismatch for dense={dense}: {weights.shape}")
-    words = jnp.asarray(weights.words if not dense else weights.words[None])
-    sizes = jnp.asarray([rows.shape[0]], jnp.int32) if dense else group_sizes.astype(jnp.int32)
-    launch = grouped_matmul.MosaicFp8PackedGmm()
-
-    def _spec(operand):
-        return jax.ShapeDtypeStruct(jnp.shape(operand), jnp.result_type(operand))
-
-    bank_spec = jax.tree.map(_spec, Fp8Weights(words, jnp.ones((), jnp.float32), weights.form,
-                                               fmt=weights.fmt))
-    with (xla_products.committed_context((rows, words, sizes)),
-          xla_products.interpreted_context(interpret_on_cpu)):
-        interpreting = xla_products.interpreted(interpret_on_cpu)
-        bound = launch.bind(_spec(rows), bank_spec, _spec(sizes), (), (), None, None, None,
-                            out_dtype='float32', trans_rhs=False, interpret=interpreting,
-                            dense=dense, exact_sums=False)
-        case = WordPackedCase(functools.partial(_planned, launch, bound), not automatic_axes())
-        if selection.select(FP8_WEIGHT, case).kernel == 'mosaic':
-            form_b, one = jnp.zeros((8,), jnp.uint8), jnp.ones((), jnp.float32)
-            rules = _packed_weight_rules(launch, lambda w: Fp8Weights(w, one, form_b, fmt=weights.fmt),
-                                         interpret_on_cpu, dense=dense)
-            product = contracted("test_an_fp8_weight_product_holds_every_order")(
-                generation.linear_tangent(*rules, live_cotangents=True, kind=KernelGlue()))
-            operands = (words, sizes)
-        else:
-            product = functools.partial(decoded_product, interpret_on_cpu=interpret_on_cpu)
-            operands = (weights.unscaled(jnp.bfloat16), group_sizes)
-        factor = fp8_factor(jnp.asarray(weights.scale, jnp.float32), sizes, rows.shape[0], weights.shape,
-                            dense)
-        scaled = factored(functools.partial(_interpreted, product, interpret_on_cpu), operands, factor, lhs,
-                          wide=interpreted_wide(interpret_on_cpu),
-                          wide_operands=(weights, group_sizes), prepared=decoded_operands)
-        return scaled.astype(lhs.dtype if out_dtype is None else out_dtype)
-
-
 def decoded_operands(matrix, group_sizes: jax.Array | None) -> tuple:
-    """A packed matrix (`Fp8Weights`, `TernaryWeights`, `NvFp4`) decoded to bf16, beside its group sizes:
+    """A packed matrix (`TernaryWeights`, `NvFp4`) decoded to bf16, beside its group sizes:
     `factored`'s `prepared`, decoded once a rescue, where it runs."""
     decoded = matrix.decoded() if isinstance(matrix, NvFp4) else matrix.unscaled(jnp.bfloat16)
     return decoded, group_sizes
@@ -1214,8 +1149,9 @@ def wide_transpose(cotangent: jax.Array, matrices: jax.Array, sizes: jax.Array |
                     interpret_on_cpu: bool) -> jax.Array:
     """The rows' transpose of a product with decoded bf16 `matrices` (grouped by `sizes`, or one), in fp32:
     the cotangent as its bf16 parts (`_bf16_parts`), each part's product exact and summed in fp32, the
-    parts' sums added in fp32, as the packed kernel's pullback forms it before its one rounding."""
-    parts = _bf16_parts(cotangent, bf16_part_count(jnp.float32))
+    parts' sums added in fp32, as the packed kernel's pullback forms it before its one rounding; a bf16
+    cotangent is its own one part."""
+    parts = _bf16_parts(cotangent, bf16_part_count(cotangent.dtype))
     return functools.reduce(jnp.add, [
         jnp.asarray(gemm(part, matrices, sizes, transpose_rhs=True, out_dtype=jnp.float32,
                          precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret_on_cpu))

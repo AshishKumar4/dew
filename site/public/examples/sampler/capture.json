@@ -1,7 +1,7 @@
 {
 	"about": "The screen sampler.py left on a terminal, written by site/scripts/capture_snippets.py.",
 	"arguments": [],
-	"script_sha256": "be9a33d3cec3bc866ee35aa56d263520f09573558f4bdb968226afd6b00b944c",
+	"script_sha256": "a073bd4797c5fd8e5071b7d2fba9537aa9692da123c8b3effd8c4b3e839478db",
 	"meta": {
 		"where": "one A100",
 		"python": "3.12.15",

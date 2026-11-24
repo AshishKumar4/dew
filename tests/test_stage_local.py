@@ -19,7 +19,7 @@ import optax
 import pytest
 from affine_run import Replaying
 from flax import linen as nn
-from model_support import TINY_DECODER
+from model_support import TINY_DECODER, stacked
 from reference_error import as_given, assert_as_exact, assert_fp32_reduction_bound, widened
 from token_support import token_rows
 
@@ -43,7 +43,7 @@ from dew.optim import (
     weight_decay_mask,
 )
 from dew.registry import models, optimizers
-from dew.training import Inspection, Layout, MeshSpec, Observe, Trainer
+from dew.training import Inspection, Layout, MeshSpec, Observe, Trainer, TrainerAdvanced
 from dew.training.diloco import DiLoCo
 from dew.training.inspection import inspected
 
@@ -69,7 +69,8 @@ def trainer(model, optimizer, mesh: MeshSpec, devices: int, *, variables=None, e
     objective = LMObjective(model, SEQ, ema_decay=ema) if variables is None else LMObjective(
         model, SEQ, ema_decay=ema, variables=variables)
     run = Trainer(objective, optimizer, key=jax.random.key(key), mesh=mesh,
-                  layout=Layout(min_shard=TINY_SHARD, stage_local=stage_local), checkpoints=checkpoints,
+                  advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD, stage_local=stage_local)),
+                  checkpoints=checkpoints,
                   tracker=None)
     run.device_mesh = mesh.build(jax.devices()[:devices])
     return run
@@ -124,11 +125,11 @@ its gradient. At Adam's 1e-8 a gradient within rounding of zero steps by lr one 
 an error of 2 lr that no layout makes or removes, and check 1's ratio would count such gradients in
 a draw rather than the layout's rounding."""
 
-ADAM = OptimConfig(optimizer=Adam(), learning_rate=1e-3)
+ADAM = OptimConfig(optimizer=Adam(), lr=1e-3)
 """Dew's named Adam, which reads a stage-local run's stacked leaf as its stored layers, as optax's Adam given
 built does not say it does (`OptimizerSpec.STACKED`, row 3934)."""
 
-ADAM_FAST = OptimConfig(optimizer=Adam(), learning_rate=1e-2)
+ADAM_FAST = OptimConfig(optimizer=Adam(), lr=1e-2)
 """`ADAM` at a rate whose two steps move the decoder's state measurably."""
 
 
@@ -146,18 +147,18 @@ queries and keys no norm divides, LaProp's clip engaged."""
 
 OPTIMIZERS = {
     **{name: (OptimConfig(optimizer=optimizers.build(name, **SMOOTH, **SETTINGS.get(name, ({}, {}))[0]),
-                          learning_rate=1e-2), SETTINGS.get(name, ({}, {}))[1])
+                          lr=1e-2), SETTINGS.get(name, ({}, {}))[1])
        for name in sorted(optimizers.paths) if optimizers[name].STACKED},
-    "groups": (OptimConfig(optimizer=AdamW(**SMOOTH, weight_decay=0.1), learning_rate=1e-2,
+    "groups": (OptimConfig(optimizer=AdamW(**SMOOTH, weight_decay=0.1), lr=1e-2,
                            param_groups=(ParamGroup("mlp", ("*mlp*",), learning_rate_multiplier=0.5,
                                                     weight_decay=0.0),
                                          ParamGroup("rest", ("*",)))), {}),
     # Muon's variants that read a matrix's own sums or its name: the dual norm of a layer's momentum, its
     # projections' heads by their stored names, and NorMuon's neuron moments, each per stored layer.
-    "muon_adaptive": (OptimConfig(optimizer=Muon(**SMOOTH, adaptive=True), learning_rate=1e-2), {}),
+    "muon_adaptive": (OptimConfig(optimizer=Muon(**SMOOTH, adaptive=True), lr=1e-2), {}),
     "muon_per_head": (OptimConfig(optimizer=Muon(**SMOOTH, per_head={"layers_*/self_attn/q_proj/kernel": 8}),
-                                  learning_rate=1e-2), {}),
-    "normuon": (OptimConfig(optimizer=Muon(**SMOOTH, neuron_beta2=0.95), learning_rate=1e-2), {}),
+                                  lr=1e-2), {}),
+    "normuon": (OptimConfig(optimizer=Muon(**SMOOTH, neuron_beta2=0.95), lr=1e-2), {}),
     # M3 on every matrix, its matrices by its own default (rows the reduction), Adam on the vectors, each
     # stepped at its rate by a schedule, given built: M3's products batched on a stacked leaf's rows are
     # each its layer's (`_row_form`, rows 4031, 4035).
@@ -171,7 +172,7 @@ OPTIMIZERS = {
     # (`_Numbering.summed`, row 4036).
     "global_clip": (optax.chain(optax.clip_by_global_norm(0.05), optax.adam(1e-2)), {}),
     # A layer's 8 x 256 up projection is below int8's threshold of 4096 values, two layers stacked are not.
-    "int8": (OptimConfig(optimizer=AdamW(**SMOOTH, weight_decay=0.1, state_dtype="int8"), learning_rate=1e-2),
+    "int8": (OptimConfig(optimizer=AdamW(**SMOOTH, weight_decay=0.1, state_dtype="int8"), lr=1e-2),
              {"emb_features": 8, "num_heads": 2, "num_kv_heads": 1, "mlp_features": 256}),
 }
 """Each optimizer whose rules read a leaf as one layer, with the decoder fields its rule needs to act:
@@ -180,7 +181,7 @@ QK-Clip's per-layer maxima, LAMB's trust ratio and LaProp's clip; a param group'
 threshold and Muon's variants. A transformation given built is stage-local where its update is its layers'
 expression row by row (`whole_reading`), as optax's Adam's is, which the read-whole test reads."""
 
-LORA_OPTIMIZER = OptimConfig(optimizer=AdamW(**SMOOTH), learning_rate=1e-2)
+LORA_OPTIMIZER = OptimConfig(optimizer=AdamW(**SMOOTH), lr=1e-2)
 """What the LoRA cell trains its factors with."""
 
 
@@ -388,7 +389,7 @@ def test_a_stage_local_runs_episodes_score_the_model_every_layer_whole():
     def flown(variables, key):
         return {"logit": float(jnp.mean(model.apply({"params": variables["params"]}, ids)))}
 
-    run = trainer(model, OptimConfig(optimizer=AdamW(), learning_rate=1e-2), STAGED, 8)
+    run = trainer(model, OptimConfig(optimizer=AdamW(), lr=1e-2), STAGED, 8)
     run.tracker = RecordingTracker()
     trained = run.fit(stream(), steps=STEPS, log_every=1,
                       validation={"flight": EvalSuite(Episodes(flown, {"logit": Shown()}), every=STEPS)})
@@ -421,7 +422,8 @@ def test_a_headed_or_actor_critic_objectives_decoders_keep_their_runs_stage_loca
 
     def run(stage_local: bool) -> Trainer:
         return Trainer(objective, ADAM, key=jax.random.key(0), mesh=STAGED,
-                       layout=Layout(min_shard=TINY_SHARD, stage_local=stage_local), tracker=None)
+                       advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD, stage_local=stage_local)),
+                       tracker=None)
 
     # Each decoder's run alone, an LM's without an average, as a lower bound of what it spares.
     alone = sum(saving(functools.partial(trainer, model, ADAM, STAGED, 8, ema=None))
@@ -436,7 +438,7 @@ def test_a_stage_local_checkpoint_resumes_on_two_stages_and_on_one(tmp_path):
     stopped after its first step resumes from that checkpoint into the second step the uninterrupted
     run took, bit for bit."""
     model = decoder()
-    optimizer = OptimConfig(optimizer=AdamW(weight_decay=0.1), learning_rate=1e-2)
+    optimizer = OptimConfig(optimizer=AdamW(weight_decay=0.1), lr=1e-2)
 
     def fit(directory, mesh: MeshSpec, devices: int, steps: int):
         run = trainer(model, optimizer, mesh, devices, checkpoints=Checkpoints(str(directory)))
@@ -587,7 +589,7 @@ WHOLE = {"lamb": lambda: optax.lamb(1e-3), "adafactor": lambda: optax.adafactor(
          "rank-masked": lambda: optax.adamw(1e-3, mask=lambda params: jax.tree.map(lambda leaf: leaf.ndim > 1,
                                                                                      params)),
          # An OptimConfig's transformation is built over the run's length, which fit gives.
-         "adafactor-config": lambda: OptimConfig(optimizer=Optax('optax:adafactor'), learning_rate=1e-3),
+         "adafactor-config": lambda: OptimConfig(optimizer=Optax('optax:adafactor'), lr=1e-3),
          "doubled-gains": doubled_gains, "spread-sums": spread_sums,
          # A loop over a stack that carries across its rows, acts beside its results, or takes no step.
          "carried-across-rows": carried_across_rows, "mapped-beside-a-callback": mapped_beside_a_callback,
@@ -671,10 +673,11 @@ def test_a_diloco_run_over_stages_keeps_each_layer_whole_on_every_stage():
     pipelined layer whole on every stage, its outer and inner states alike, so its checkpoint holds each
     layer as one device's would."""
     def run(stage_local: bool) -> Trainer:
-        return Trainer(LMObjective(decoder(), SEQ), OptimConfig(optimizer=AdamW(), learning_rate=1e-2),
+        return Trainer(LMObjective(decoder(), SEQ), OptimConfig(optimizer=AdamW(), lr=1e-2),
                        key=jax.random.key(0), mesh=MeshSpec(diloco=2, stage=2, fsdp=2),
-                       layout=Layout(min_shard=TINY_SHARD, stage_local=stage_local),
-                       diloco=DiLoCo(every=2, rate=0.7, momentum=0.9), tracker=None)
+                       advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD, stage_local=stage_local),
+                                                diloco=DiLoCo(every=2, rate=0.7, momentum=0.9)),
+                       tracker=None)
 
     assert saving(run) == 0
 
@@ -706,10 +709,12 @@ def test_a_stage_local_runs_inspection_reports_each_stored_layer_by_its_name():
                          targets=("params",), every=1)
     logged, runs = [], []
     for stage_local in (True, False):
-        run = Trainer(LMObjective(decoder(), SEQ), OptimConfig(optimizer=AdamW(), learning_rate=1e-2),
-                      key=jax.random.key(0), mesh=STAGED, layout=Layout(min_shard=TINY_SHARD,
+        run = Trainer(LMObjective(decoder(), SEQ), OptimConfig(optimizer=AdamW(), lr=1e-2),
+                      key=jax.random.key(0), mesh=STAGED,
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD,
                                                                          stage_local=stage_local),
-                      inspection=watched, tracker=None)
+                                               inspection=watched),
+                      tracker=None)
         logged.append(inspected(run, stream().train(None).__next__(), steps=1))
         runs.append(run)
     local, replicated = logged
@@ -754,7 +759,8 @@ def test_a_distillation_runs_student_keeps_its_run_stage_local():
         objective = DistillationObjective(LMObjective(student, SEQ, ema_decay=None),
                                           LMObjective(teacher, SEQ, ema_decay=None))
         return Trainer(objective, ADAM, key=jax.random.key(0), mesh=STAGED,
-                       layout=Layout(min_shard=TINY_SHARD, stage_local=stage_local), tracker=None)
+                       advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD, stage_local=stage_local)),
+                       tracker=None)
 
     alone = saving(functools.partial(trainer, student, ADAM, STAGED, 8, ema=None))
     assert saving(run) == alone > 0
@@ -792,13 +798,14 @@ def test_a_stage_local_lora_fit_merges_and_saves_as_every_layer_whole(tmp_path):
     assert written[0] == written[1]
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.mesh(devices=8)
 def test_a_one_stage_scan_holds_layers_adapted_otherwise_as_runs_of_their_own():
     """A LoRA run whose layers' adapters scale apart (one alpha on layers 0 and 1, another on 2 and 3, the
     factors' shapes alike) runs them as two scanned runs (`CausalTransformer.scanned_like`), and its
     one-stage state holds them so, as its forward reads them, where it planned one run of four the forward
     never read; a state stacked so, handed to a run that does not scan, is read back onto its layers."""
-    model = decoder(scan_layers=True)
+    model = decoder()
     base = model.init(jax.random.key(0), jnp.zeros((1, SEQ), jnp.int32))
     adapter = LoRA(rank=2, modules=("q_proj",), alpha=4.0).apply(model, base, key=1)
     targets = {path: (dataclasses.replace(target, alpha=8.0) if any(f"layers_{index}" in path
@@ -813,17 +820,19 @@ def test_a_one_stage_scan_holds_layers_adapted_otherwise_as_runs_of_their_own():
     assert set(state.variables["params"]["stages"]) == {"layers_0_1", "layers_2_3"}
     moved, loss, *_ = run.compile(state, batch)(state, batch)
     assert np.isfinite(float(loss))
-    plain = Adapter.bound(model.clone(scan_layers=False), adapter.variables, targets, adapter.rslora,
-                          adapter.dropout, adapter.layouts)
-    looped = trainer(plain.model, LORA_OPTIMIZER, MeshSpec(fsdp=2), 8, variables=plain.variables)
-    looped.validate(steps=1)
-    received = looped.staged(moved)
+    plain = Adapter.bound(model, adapter.variables, targets, adapter.rslora, adapter.dropout, adapter.layouts)
+    # The same stack a layer at a time (`stacked`), whose run holds no stage-local state.
+    with stacked(scanned=False):
+        looped = trainer(plain.model, LORA_OPTIMIZER, MeshSpec(fsdp=2), 8, variables=plain.variables)
+        looped.validate(steps=1)
+        received = looped.staged(moved)
     assert "stages" not in received.variables["params"]
     for name, leaves in on_host(run.stored(moved).variables["params"]).items():
         np.testing.assert_array_equal(np.asarray(jax.tree.leaves(leaves)[0]),
                                       np.asarray(jax.tree.leaves(on_host(received.variables["params"])[name])[0]))
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.mesh(devices=8)
 def test_a_periodic_one_stage_state_goes_back_onto_its_layers_for_a_run_that_does_not_scan():
     """A one-stage state a scanned periodic stack holds (sliding and full attention alternating, each
@@ -831,22 +840,24 @@ def test_a_periodic_one_stage_state_goes_back_onto_its_layers_for_a_run_that_doe
     not scan, its parameters and every moment alike, period and all."""
     kinds = {"layer_types": ("sliding_attention", "full_attention") * 2,
              "kinds": {"sliding_attention": {"window": 4}}}
-    optimizer = OptimConfig(optimizer=AdamW(**SMOOTH), learning_rate=1e-2)
-    scanned = trainer(decoder(scan_layers=True, **kinds), optimizer, MeshSpec(fsdp=2), 8)
+    optimizer = OptimConfig(optimizer=AdamW(**SMOOTH), lr=1e-2)
+    scanned = trainer(decoder(**kinds), optimizer, MeshSpec(fsdp=2), 8)
     scanned.validate(steps=1)
     batch = shard_batch(MeshSpec(fsdp=2).build(jax.devices()), token_rows(VOCAB, BATCH, SEQ + 1))
     state, _, _ = scanned.place()
     moved = scanned.compile(state, batch)(state, batch)[0]
     assert "stages" in moved.variables["params"]
-    looped = trainer(decoder(scan_layers=False, **kinds), optimizer, MeshSpec(fsdp=2), 8)
-    looped.validate(steps=1)
-    received = looped.staged(moved)
+    with stacked(scanned=False):
+        looped = trainer(decoder(**kinds), optimizer, MeshSpec(fsdp=2), 8)
+        looped.validate(steps=1)
+        received = looped.staged(moved)
     for mine, theirs in zip(jax.tree.leaves(on_host((received.variables, received.opt_state))),
                             jax.tree.leaves(on_host(((stored := scanned.stored(moved)).variables,
                                                      stored.opt_state))), strict=True):
         np.testing.assert_array_equal(mine, theirs)
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.mesh(devices=8)
 def test_a_frozen_base_scanned_under_a_rung_that_recomputes_named_residuals_keeps_the_rest():
     """Under rung 1 (`all_but_delta_memory`, a block that recomputes its delta memory alone and keeps every
@@ -855,7 +866,7 @@ def test_a_frozen_base_scanned_under_a_rung_that_recomputes_named_residuals_keep
     recomputed the whole layer, the cheapest rung cost what the dearest does in time and held no more."""
     held = {}
     for rung in ("all_but_delta_memory", "full"):
-        model = decoder(scan_layers=True, remat=rung)
+        model = decoder(remat=rung)
         base = model.init(jax.random.key(0), jnp.zeros((1, SEQ), jnp.int32))
         adapter = LoRA(rank=2, modules=("q_proj",)).apply(model, base, key=1)
         run = trainer(adapter.model, LORA_OPTIMIZER, MeshSpec(fsdp=2), 8, variables=adapter.variables)
@@ -875,6 +886,7 @@ ROWS_SEEDS = 8
 """Check 1's declared seeds for a frozen base read where it lies against one stacked each step."""
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.mesh(devices=8)
 def test_a_one_stage_scan_reads_a_frozen_base_where_it_lies():
     """A LoRA run over a decoder that scans its layers on one stage holds its adapter's factors stacked as
@@ -882,7 +894,7 @@ def test_a_one_stage_scan_reads_a_frozen_base_where_it_lies():
     iteration reading its layer's rows where they lie (`decoder_stack.LAYER_ROWS`), so the base is held
     once whatever else holds it (row 4751): its step holds fewer temporaries than the step whose state
     stacks the base too, a copy of it made each time it runs, and updates on par with it (check 1)."""
-    model = decoder(scan_layers=True)
+    model = decoder()
     base = model.init(jax.random.key(0), jnp.zeros((1, SEQ), jnp.int32))
     adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(model, base, key=1)
     batch = shard_batch(MeshSpec(fsdp=2).build(jax.devices()), token_rows(VOCAB, BATCH, SEQ + 1))
@@ -931,15 +943,16 @@ def test_a_frozen_base_read_where_it_lies_holds_no_more_than_the_layers_unscanne
     stacks among the scan's residuals (row 4751)."""
     held = {}
     for scan in (True, False):
-        model = decoder(scan_layers=scan, dtype="bfloat16")
-        base = model.init(jax.random.key(0), jnp.zeros((1, SEQ), jnp.int32))
-        adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(model, base, key=1)
-        run = trainer(adapter.model, LORA_OPTIMIZER, MeshSpec(fsdp=2), 8, variables=adapter.variables)
-        run.validate(steps=1)
-        state, _, _ = run.place()
-        batch = shard_batch(MeshSpec(fsdp=2).build(jax.devices()), token_rows(VOCAB, BATCH, SEQ + 1))
-        run.compile(state, batch)
-        held[scan] = run.executable.memory_analysis().temp_size_in_bytes
+        with stacked(scan):
+            model = decoder(dtype="bfloat16")
+            base = model.init(jax.random.key(0), jnp.zeros((1, SEQ), jnp.int32))
+            adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(model, base, key=1)
+            run = trainer(adapter.model, LORA_OPTIMIZER, MeshSpec(fsdp=2), 8, variables=adapter.variables)
+            run.validate(steps=1)
+            state, _, _ = run.place()
+            batch = shard_batch(MeshSpec(fsdp=2).build(jax.devices()), token_rows(VOCAB, BATCH, SEQ + 1))
+            run.compile(state, batch)
+            held[scan] = run.executable.memory_analysis().temp_size_in_bytes
     assert held[True] <= held[False], held
 
 
@@ -982,7 +995,8 @@ def test_a_stage_local_state_handed_to_another_run_starts_it_on_its_stored_layer
     restarted = four.fit(stream(), steps=2, log_every=1, state=trained)
     assert int(restarted.step) == 2
     flat = Trainer(LMObjective(model, SEQ, variables=trained.variables), optimizer, key=jax.random.key(0),
-                   mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=TINY_SHARD), tracker=None)
+                   mesh=MeshSpec(fsdp=2), advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD)),
+                   tracker=None)
     started = on_host(flat.initial_state().variables)
     assert jax.tree.structure(started) == jax.tree.structure(stored)
     for mine, theirs in zip(jax.tree.leaves(started), jax.tree.leaves(stored), strict=True):
@@ -1055,18 +1069,19 @@ def test_a_local_saves_rows_on_each_stages_mesh_are_recovered_where_its_holders_
 
 
 @pytest.mark.mesh(devices=8)
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize("devices", [1, 8], ids=["1dev", "8dev"])
 def test_a_one_stage_scanned_fit_keeps_shared_frozen_arrays_alive(devices):
     """A one-stage scanned fit's state returned on its stored layers (`StageLocal.stored`, consumed) donates
     its stacked `stages` arrays alone, its unstacked collections (`FROZEN`) untouched, so the arrays it
     shares with the objective's held tree and its initial state stay readable and a second fit reads them
     (row 12079: the frozen base was donated and deleted)."""
-    model = decoder(scan_layers=True)
+    model = decoder()
     base = nn.unbox(model.init(jax.random.key(0), jnp.zeros((1, SEQ), jnp.int32)))
     adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(model, base, key=1)
     objective = LMObjective(adapter.model, SEQ, variables=adapter.variables, ema_decay=None)
     run = Trainer(objective, optax.sgd(0.1), key=jax.random.key(2), mesh=MeshSpec(),
-                  layout=Layout(min_shard=2**30), checkpoints=None, tracker=None)
+                  advanced=TrainerAdvanced(layout=Layout(min_shard=2**30)), checkpoints=None, tracker=None)
     run.device_mesh = MeshSpec().build(jax.devices()[:devices])
     initial = run.initial_state()
     batch = token_rows(VOCAB, BATCH, SEQ + 1)

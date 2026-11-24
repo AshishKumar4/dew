@@ -26,6 +26,7 @@ from jax.experimental.layout import Format, Layout
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend.mlir import ir
 from kernel_compile import Uncounted
+from model_support import attending
 from process_support import fresh, keeping_picks
 
 from dew.inputs import Field, InputSpec
@@ -37,7 +38,7 @@ from dew.nn.kernels.templates.gemm.hooks import Hooks
 from dew.nn.precision import Numerics
 from dew.objectives.supervised import Supervised
 from dew.telemetry.compiles import Compiles
-from dew.training import Layout as StepLayout, Trainer
+from dew.training import Layout as StepLayout, Trainer, TrainerAdvanced
 
 ROWS, FEATURES, WIDTH, EXPERTS = 2048, 1024, 2048, 8
 """The experts layer's step and paired product (`Experts`, `_paired_step`): its first derived tile, an H100's
@@ -82,7 +83,8 @@ def experts(mesh, nonce: float, ahead=None) -> Trainer:
     to choose streamed its parameters from a GH200's host, its loss traced on the CPU companion, where the
     layer's launch, called without a selector, holds no config (rows 8093, 8095)."""
     return Trainer(Supervised(Experts(nonce), squared, inputs=InputSpec(Field("x", (FEATURES,)))),
-                   optax.adam(1e-3), key=0, mesh=mesh, ahead=ahead, layout=StepLayout())
+                   optax.adam(1e-3), key=0, mesh=mesh, advanced=TrainerAdvanced(ahead=ahead,
+                                                                                layout=StepLayout()))
 
 
 BATCH = {"x": np.zeros((ROWS, FEATURES), np.float32)}
@@ -668,14 +670,14 @@ def _thunk(calls: int, kernels: list[bytes]) -> bytes:
 
 
 def _templated(**fields):
-    """A one-layer decoder whose attention is the template's (`attention_impl="template"`), bfloat16: its
+    """A one-layer decoder in bfloat16, its attention the template's under its tests (`attending`): its
     forward selects and reports kernels, a draw's premise."""
     from dew.registry import models
 
     return models.build("causal_transformer", **{"vocab_size": 260, "emb_features": 128, "num_layers": 1,
                                                   "num_heads": 2, "num_kv_heads": 1, "head_dim": 64,
                                                   "mlp_features": 256, "max_seq_len": 32, "dtype": "bfloat16",
-                                                  "attention_impl": "template", **fields})
+                                                  **fields})
 
 
 def _drawn_objective(kind: str):
@@ -714,6 +716,7 @@ def _drawn_objective(kind: str):
 
 
 @pytest.mark.parametrize("kind", ["lm", "decision", "ppo", "distillation"])
+@attending("template")
 def test_an_objectives_draw_of_its_variables_selects_no_kernel(kind):
     """An objective's draw of its variables (`Objective.initializer`, its `init` within `drawing`) runs
     forwards over one-row batches no step runs, for the variables its modules make, none of their values

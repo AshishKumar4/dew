@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from interop_support import extract_fixture, scaled_gap as relative_gap
+from model_support import attending
 from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
 
 from dew.diffusion.schedules.source import SourceSchedule
@@ -37,7 +38,7 @@ def source(tmp_path_factory):
 def transformer_case(directory: Path, arrays, name: str):
     """The native model, its loaded variables and the case's inputs."""
     config = json.loads(str(arrays[f"{name}.config"]))
-    model = SD3Transformer(**sd3_fields(config, attention_impl="xla"))
+    model = SD3Transformer(**sd3_fields(config))
     params, buffers, layouts = translate_sd3_weights(
         component_tensors(directory / name, "transformer"))
     latent = jnp.asarray(arrays[f"{name}.latent"]).transpose(0, 2, 3, 1)
@@ -58,6 +59,7 @@ CASE_SEEDS = {"plain": 64, "qknorm": 128, "dual": 128, "rect_cropped": 64, "deep
 """Each transformer's declared check-1 seeds, sized paired by `seeds_for` on armada (11-14)."""
 
 
+@attending("xla")
 @pytest.mark.parametrize("name", CASES)
 def test_native_sd3_matches_the_source_forward_and_every_gradient(name, source):
     """One published transformer's own tensors, read through the native model, against the source's
@@ -189,6 +191,7 @@ def test_native_flow_schedule_matches_the_source_grids_and_trajectory(name, sour
                 assert relative_gap(gradient, arrays[f"{tag}.grad"]) < 1e-4
 
 
+@attending("xla")
 @pytest.mark.mesh
 def test_native_sd3_agrees_across_a_sequence_sharded_mesh(source):
     """The joint attention under a real mesh whose sequence axis is above one.
@@ -208,7 +211,7 @@ def test_native_sd3_agrees_across_a_sequence_sharded_mesh(source):
         latent = jnp.asarray(arrays["rect_cropped.latent"]).transpose(0, 2, 3, 1)
         pooled = jnp.asarray(arrays["rect_cropped.pooled"])
         times = jnp.asarray(arrays["rect_cropped.times"])
-    model = SD3Transformer(**sd3_fields(config, attention_impl="xla"))
+    model = SD3Transformer(**sd3_fields(config))
     params, buffers, _ = translate_sd3_weights(
         component_tensors(source / "rect_cropped", "transformer"))
     rows = latent.shape[0]
@@ -244,6 +247,7 @@ def pipeline_record(source):
     return json.loads((source / "sd3_transformer.json").read_text())["pipeline"]
 
 
+@attending("xla")
 @pytest.mark.parametrize("case", PIPELINE_CASES)
 def test_published_prompt_encoding_matches_the_source_pipeline(source, pipeline_record, case):
     """The conditioner composes what `encode_prompt` composes.
@@ -258,7 +262,7 @@ def test_published_prompt_encoding_matches_the_source_pipeline(source, pipeline_
     from dew.interop.pretrained import Pretrained
 
     arrays = np.load(source / "sd3_pipeline.npz")
-    loaded = Pretrained.load(str(source / case), dtype="float32", attention_impl="xla")
+    loaded = Pretrained.load(str(source / case), dtype="float32")
     encoder = loaded.inputs.conditions["conditioning"].encoder
     params = loaded.variables["encoders"]["conditioning"]
     for prefix, rows in (("", pipeline_record["prompts"]), ("negative_", pipeline_record["negatives"])):
@@ -276,6 +280,7 @@ def test_published_prompt_encoding_matches_the_source_pipeline(source, pipeline_
     assert relative_gap(crossed.context, arrays[f"{case}.context"]) > 1e-3
 
 
+@attending("xla")
 @pytest.mark.parametrize("streamed", [False, True])
 @pytest.mark.parametrize("case", PIPELINE_CASES)
 def test_published_pipeline_walk_matches_the_source(source, pipeline_record, case, streamed):
@@ -293,7 +298,7 @@ def test_published_pipeline_walk_matches_the_source(source, pipeline_record, cas
     from dew.training import MeshSpec
 
     arrays = np.load(source / "sd3_pipeline.npz")
-    loaded = Pretrained.load(str(source / case), dtype="float32", attention_impl="xla",
+    loaded = Pretrained.load(str(source / case), dtype="float32",
                              **({"mesh": MeshSpec()} if streamed else {}))
     task = loaded.text_to_image()
     prepared = task.prepare(pipeline_record["prompts"], unconditional=pipeline_record["negatives"],
@@ -307,6 +312,7 @@ def test_published_pipeline_walk_matches_the_source(source, pipeline_record, cas
     assert relative_gap(images, arrays[f"{case}.images"]) < 2e-5
 
 
+@attending("xla")
 @pytest.mark.parametrize("case", PIPELINE_CASES)
 def test_omitted_call_policy_takes_the_published_pipelines_own(source, pipeline_record, case):
     """A call that names no policy walks what the source's own call walks.
@@ -319,7 +325,7 @@ def test_omitted_call_policy_takes_the_published_pipelines_own(source, pipeline_
     from dew.interop.pretrained import Pretrained
 
     arrays = np.load(source / "sd3_pipeline.npz")
-    loaded = Pretrained.load(str(source / case), dtype="float32", attention_impl="xla")
+    loaded = Pretrained.load(str(source / case), dtype="float32")
     task = loaded.text_to_image()
     assert task.steps == pipeline_record["default_steps"]
     assert task.guidance.scale == pipeline_record["default_guidance"]
@@ -329,6 +335,7 @@ def test_omitted_call_policy_takes_the_published_pipelines_own(source, pipeline_
     assert relative_gap(walked.latents, arrays[f"{case}.default_latents"]) < 2e-5
 
 
+@attending("xla")
 def test_a_trained_step_keeps_the_frozen_buffer_and_exports_for_the_source(source, tmp_path):
     """A real coupled-loss step over the published source, then a resume and
     an export.
@@ -355,7 +362,7 @@ def test_a_trained_step_keeps_the_frozen_buffer_and_exports_for_the_source(sourc
 
     export = tmp_path / "export"
     loaded.save(export, variables=state.variables)
-    again = Pretrained.load(str(export), dtype="float32", attention_impl="xla")
+    again = Pretrained.load(str(export), dtype="float32")
     np.testing.assert_array_equal(again.variables["buffers"]["pos_embed"], buffer)
     latent = jnp.asarray(np.load(source / "sd3_pipeline.npz")["pipeline.x_T"][:1])
     condition = DenoisingCondition(jnp.ones((1, 4, 32), jnp.float32),

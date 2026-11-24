@@ -85,7 +85,7 @@ def guided() -> DiffusionRunConfig:
 
     return dataclasses.replace(
         diffusion(guidance=None, ema_decay=None),
-        model=ModelConfig("flux_transformer", {**FLUX, "dtype": "float32", "attention_impl": "xla"}),
+        model=ModelConfig("flux_transformer", {**FLUX, "dtype": "float32"}),
         text=TextCondition(encoder="diffusion_text", checkpoint=flux_pipeline()))
 
 

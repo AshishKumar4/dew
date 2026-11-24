@@ -6,6 +6,7 @@ GEMM's own portable branch (`kernels.gemm`): its products as the call's precisio
 
 import contextlib
 import functools
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -170,9 +171,7 @@ def xla_ragged_dot(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     grouped = jnp.arange(tokens.shape[0], dtype=index_dtype)[:, None] < jnp.sum(
         group_sizes, dtype=index_dtype
     )
-    product = functools.partial(jax.lax.ragged_dot_general, ragged_dot_dimension_numbers=_GROUPED_ROWS,
-                                precision=precision,
-                                out_sharding=ragged_placement(((tokens, 0), (kernel, kernel.ndim - 1))))
+    product = ragged_product(tokens, kernel, precision=precision)
     out = accumulated(product, jnp.where(grouped, tokens, 0), kernel, group_sizes,
                       preferred_element_type=preferred_element_type)
     return jnp.where(grouped, out, 0)
@@ -183,16 +182,25 @@ _GROUPED_ROWS = jax.lax.RaggedDotDimensionNumbers(
 """`jax.lax.ragged_dot`'s own: each group's rows of `[rows, depth]` times its `[depth, width]` matrix."""
 
 
+def ragged_product(values: jax.Array, matrices: jax.Array, *,
+                   precision: PrecisionLike = None) -> Callable[..., jax.Array]:
+    """`jax.lax.ragged_dot_general` bound for `values` times `matrices` (`product(values, matrices,
+    group_sizes, preferred_element_type=...)`): its grouped rows, `precision`, and its output placed where an
+    Explicit mesh axis places its operands (`ragged_placement`): JAX infers no placement for a ragged dot
+    there (row 12401). A partial of the primitive itself, which `precision.accumulated` reads as a ragged
+    dot, its group sizes counted, not multiplied (row 12460)."""
+    return functools.partial(jax.lax.ragged_dot_general, ragged_dot_dimension_numbers=_GROUPED_ROWS,
+                             precision=precision,
+                             out_sharding=ragged_placement(((values, 0), (matrices, matrices.ndim - 1))))
+
+
 def placed_ragged_dot(values: jax.Array, matrices: jax.Array, group_sizes: jax.Array, *,
                       precision: PrecisionLike = None,
                       preferred_element_type: Dtype | None = None) -> jax.Array:
     """`jax.lax.ragged_dot` as written (its one primitive, which a fuser reads as the program's dot), placed
-    where an Explicit mesh axis places its operands (`ragged_placement`): JAX infers no placement for a
-    ragged dot there (row 12401)."""
-    return jax.lax.ragged_dot_general(
-        values, matrices, group_sizes, _GROUPED_ROWS, precision=precision,
-        preferred_element_type=preferred_element_type,
-        out_sharding=ragged_placement(((values, 0), (matrices, matrices.ndim - 1))))
+    where an Explicit mesh axis places its operands (`ragged_product`)."""
+    return ragged_product(values, matrices, precision=precision)(
+        values, matrices, group_sizes, preferred_element_type=preferred_element_type)
 
 
 def ragged_placement(sources: tuple) -> jax.sharding.NamedSharding | None:

@@ -128,7 +128,7 @@ def checkpoint_runs(checkpoint, revision) -> Runs:
         wide = AutoModelForImageTextToText.from_config(
             config, dtype=torch.float64, attn_implementation='eager', experts_implementation='eager').eval()
         wide.load_state_dict(reference.state_dict())
-    loaded = PretrainedDecoder.load(checkpoint, dtype='float32', attention_impl='reference', max_seq_len=256,
+    loaded = PretrainedDecoder.load(checkpoint, dtype='float32', max_seq_len=256,
                                     revision=revision)
     if loaded.processor is None:
         raise ValueError(f"{checkpoint} loads a decoder without its processor")
@@ -167,4 +167,7 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    from dew.nn.kernels import generation
+
+    with generation.chosen(attention='reference'):
+        main()

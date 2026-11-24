@@ -5,7 +5,6 @@
       "name": "dew.nn.backbones.ssm_dit:HybridSSMAttentionDiT",
       "fields": {
         "adaln_silu": false,
-        "attention_impl": "auto",
         "dtype": "float32",
         "emb_features": 768,
         "mlp_ratio": 4,
@@ -37,7 +36,34 @@
     },
     "data_seed": 0,
     "diagnostics": {
-      "kernels": {},
+      "kernels": {
+        "attention": null,
+        "attention_mainloop": null,
+        "blockwise_fp8": null,
+        "decode": null,
+        "delta_decode": null,
+        "delta_gates": null,
+        "gate_up": null,
+        "gated_delta_rule": null,
+        "gated_mlp": null,
+        "gemm_epilogue": null,
+        "gemm_prologue": null,
+        "grouped_matmul": null,
+        "layer_scan": null,
+        "low_rank": null,
+        "mxfp8": null,
+        "narrow_copies": null,
+        "nvfp4": null,
+        "nvfp4_block": null,
+        "paged_decode": null,
+        "qkv": null,
+        "rms_norm": null,
+        "selective_scan": null,
+        "short_conv": null,
+        "sparse_attention": null,
+        "ssd": null,
+        "swiglu": null
+      },
       "links": {},
       "tune_kernels": false,
       "xla_flags": null
@@ -48,7 +74,6 @@
       "prediction_depths": null,
       "attention": null,
       "dex": null,
-      "scan_layers": false,
       "packed_weights": false,
       "param_dtype": null,
       "step": null,
@@ -67,29 +92,34 @@
           "state_dtype": "float32"
         }
       },
-      "learning_rate": 0.0001,
-      "spared": true,
+      "lr": 0.0001,
+      "schedule": null,
+      "decay_norms_and_biases": false,
+      "decay_mask": null,
       "param_groups": [],
-      "clip_grads": 0.0,
+      "clip": 0.0,
       "forced_weight_normalization": false,
       "ema_profiles": []
     },
     "trainer": {
       "name": "text-to-image-176m",
       "checkpoint_dir": "run",
-      "keep": 1,
+      "keep": {
+        "latest": 1,
+        "every": null,
+        "interval": null,
+        "weights_only": false
+      },
       "resume": "auto",
       "data_resume": "relaxed",
       "skip_nonfinite": false,
       "best": null,
       "key": 0,
-      "horizon": {
-        "steps": 1350000,
-        "epochs": null,
-        "tokens": null,
-        "examples": null,
-        "max_tokens": null
-      },
+      "steps": 1350000,
+      "epochs": null,
+      "tokens": null,
+      "examples": null,
+      "max_tokens": null,
       "stop": null,
       "restore_best": false,
       "cooldowns": null,
@@ -100,14 +130,11 @@
       "local_directory": null,
       "local_every": null,
       "scored_to": null,
-      "update": {
-        "batches": null,
-        "tokens": null
-      },
-      "fit": {
-        "split": "auto",
-        "remat": "auto"
-      },
+      "accumulation": null,
+      "update_tokens": null,
+      "split": "auto",
+      "remat": "auto",
+      "microbatches": null,
       "batch_ramp": null,
       "precision": {
         "dtypes": {

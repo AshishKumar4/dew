@@ -8,6 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import assert_reloads, assert_same_stored_tensors, fixture_ids
+from model_support import attending
 from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording, widened
 
 from dew.interop import Pretrained, PretrainedDecoder
@@ -21,7 +22,7 @@ SOURCE = 'ByteDance/Ouro-1.4B'
 
 
 def load():
-    return Pretrained.load(TINY, dtype='float32', attention_impl='reference')
+    return Pretrained.load(TINY, dtype='float32')
 
 
 def fixture(name):
@@ -29,6 +30,7 @@ def fixture(name):
 
 
 
+@attending("reference")
 def test_every_pass_gates_its_exit_as_the_remote_code_does():
     """The logits and each pass's exit-gate logits are on par with the remote code's fp32 run from its
     float64 run (check 1), over its recording's seeds of ids (tools/ouro_reference.py `--recording`):
@@ -54,6 +56,7 @@ def test_every_pass_gates_its_exit_as_the_remote_code_does():
                     seeds=seeds, truth_fn=truth)
 
 
+@attending("reference")
 def test_a_capture_of_a_module_only_later_passes_call_appends_each_passs_output():
     """A capture of the final norm alone, which no layer calls and each pass after the first does before
     it (`looping.run_loop`), first records inside the scan over those passes: each further loop appends
@@ -71,6 +74,7 @@ def test_a_capture_of_a_module_only_later_passes_call_appends_each_passs_output(
     assert four - three == five - four == 1
 
 
+@attending("reference")
 def test_a_saved_checkpoint_reloads_bit_for_bit(tmp_path):
     loaded = load()
     loaded.save(tmp_path)
@@ -78,6 +82,7 @@ def test_a_saved_checkpoint_reloads_bit_for_bit(tmp_path):
     assert_reloads(loaded, tmp_path, fixture('input_ids'))
 
 
+@attending("reference")
 def test_a_looped_model_exports_in_the_remote_codes_layout(tmp_path):
     """A model built in Dew writes the config Ouro's remote code reads, which
     names that code; a loop it would not compute, one without the norm between
@@ -95,7 +100,7 @@ def test_a_looped_model_exports_in_the_remote_codes_layout(tmp_path):
     assert config['auto_map']['AutoModelForCausalLM'] == f'{SOURCE}--modeling_ouro.OuroForCausalLM'
     assert set(load_shards(tmp_path)) == set(load_shards(TINY))
     ids = fixture('input_ids')
-    restored = Pretrained.load(tmp_path, dtype='float32', attention_impl='reference')
+    restored = Pretrained.load(tmp_path, dtype='float32')
     np.testing.assert_array_equal(restored.model.apply(restored.variables, ids),
                                   loaded.model.apply(loaded.variables, ids))
     with pytest.raises(ValueError):

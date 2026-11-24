@@ -26,7 +26,7 @@ from map_judge import marked_seeds
 from ssd_support import stepwise_scan
 
 from dew.algebra import SATURATION, scan
-from dew.nn.kernels import generation, recurrence, recurrence_chunk, short_conv, ssd
+from dew.nn.kernels import diagonal, generation, recurrence, recurrence_chunk, rwkv4, short_conv, ssd
 from dew.nn.kernels.templates.recurrence import turned
 from dew.nn.linear import causal_conv1d
 from dew.nn.mixers.mamba2 import chunk_ssd
@@ -676,6 +676,74 @@ def test_the_short_conv_holds_every_order(edge):
         return jax.nn.silu(summed)
 
     assert_drawn_contract(kernel, draw, EDGES[edge], f"the short conv {edge}", truth_fn=plain,
+                          plain_fn=plain, without=INTERPRETED_REMAT)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_the_diagonal_scan_holds_its_orders(edge):
+    """The diagonal scan on the template's kernels (`templates.recurrence.diagonal`, a custom VJP over its
+    launches, interpreted off a GPU) as every caller reaches it (`kernels.diagonal.diagonal_scan` with the
+    kernels named, whose products' wrapper takes every order through the portable math, `_per_product`),
+    over two spans of 64 tokens at an interpreted H100's facts from a state: each token's output and the
+    final state finite at every order wherever float64 is a normal float32 and the recurrence a token at a
+    time is, at writes and states scaled to the edge, the log forget gates HGRN's."""
+    def draw(seed, scale):
+        x, g, state = normal_draw(1453 + 4096 * seed, (2, 70, 128), (2, 70, 128), (2, 128))
+        primals = (x * scale, -jax.nn.softplus(-(g + 2.0)), state * scale)
+        drawn = normal_draw(1454 + 4096 * seed, x.shape, g.shape, state.shape)
+        direction = (drawn[0] * scale, drawn[1], drawn[2] * scale)
+        return primals, direction, normal_draw(1455 + 4096 * seed, (2, 71, 128))[0]
+
+    def joined(out, final):
+        return jnp.concatenate([out, final[:, None].astype(out.dtype)], axis=1)
+
+    def kernel(x, g, state):
+        with (generation.assumed("sm90" if INTERPRETED else None, interpreted=INTERPRETED),
+              generation.chosen(diagonal_scan="mosaic_gpu")):
+            return joined(*diagonal.diagonal_scan(x, g, state))
+
+    def plain(x, g, state):
+        def step(h, token):
+            h = jnp.exp(token[1]) * h + token[0]
+            return h, h
+
+        final, out = jax.lax.scan(step, state, (jnp.moveaxis(x, 1, 0), jnp.moveaxis(g, 1, 0)))
+        return joined(jnp.moveaxis(out, 0, 1), final)
+
+    assert_drawn_contract(kernel, draw, EDGES[edge], f"the diagonal scan {edge}", truth_fn=plain,
+                          plain_fn=plain, without=INTERPRETED_REMAT)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_the_wkv4_scan_holds_its_orders(edge):
+    """RWKV4's WKV on the template's channel walk (`templates.recurrence.wkv4`, a custom VJP over its
+    launches, interpreted off a GPU) as every caller reaches it (`kernels.rwkv4.wkv4` with the kernels named,
+    whose products' wrapper takes every order through the portable scan, `_per_product`), over one span of
+    nine tokens from a carry (the spans' joins held by check 1, tests/test_wkv4.py; over two spans its four
+    interpreted launches ran past the suite's limit): each token's output and the final carry finite
+    at every order wherever float64 is a normal float32 and fla's recurrence a token at a time is
+    (`rwkv4.recurrent_wkv4`), at values and numerators scaled to the edge, the keys a few units apart."""
+    def draw(seed, scale):
+        decay, bonus, key, value, numerator, beta, top = normal_draw(
+            1455 + 4096 * seed, (128,), (128,), (2, 9, 128), (2, 9, 128), (2, 128), (2, 128), (2, 128))
+        state = jnp.stack([numerator * scale, jnp.exp(beta), top], axis=1)
+        primals = (decay, bonus, 2.0 * key, value * scale, state)
+        drawn = normal_draw(1456 + 4096 * seed, *(operand.shape for operand in primals))
+        direction = (*drawn[:3], drawn[3] * scale, drawn[4])
+        return primals, direction, normal_draw(1457 + 4096 * seed, (2, 12, 128))[0]
+
+    def joined(out, final):
+        return jnp.concatenate([out, final.astype(out.dtype)], axis=1)
+
+    def kernel(*operands):
+        with (generation.assumed("sm90" if INTERPRETED else None, interpreted=INTERPRETED),
+              generation.chosen(wkv4="mosaic_gpu")):
+            return joined(*rwkv4.wkv4(*operands))
+
+    def plain(*operands):
+        return joined(*rwkv4.recurrent_wkv4(*operands))
+
+    assert_drawn_contract(kernel, draw, EDGES[edge], f"the wkv4 scan {edge}", truth_fn=plain,
                           plain_fn=plain, without=INTERPRETED_REMAT)
 
 def _gated(h, q, k, v, g, beta):

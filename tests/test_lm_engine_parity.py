@@ -21,6 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from model_support import attending
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
@@ -51,7 +52,7 @@ def hybrid(dtype=jnp.float64) -> CausalTransformer:
                "attention": LayerKind(mixer=AttentionMixer(nope=True, exclusive_self_attention=True))},
         mixture=Mixture(experts=4, top_k=2, expert_features=8),
         embedding_multiplier=12.0, residual_multiplier=0.22, logits_scaling=4.0,
-        dtype=dtype, attention_impl="xla")
+        dtype=dtype)
 
 
 def leaves(reference, prefix: str) -> list[tuple[str, tuple[str, ...], np.ndarray]]:
@@ -140,6 +141,7 @@ def float64():
         yield
 
 
+@attending("xla")
 def test_rigel_shaped_hybrid_matches_lm_engine_forward_losses_and_gradients(reference):
     with float64():
         model = hybrid()
@@ -171,7 +173,7 @@ def test_mup_groups_and_adamw_steps_match_lm_engine(reference):
         assert node == membership[source], (path, node, membership[source])
 
     config = OptimConfig(optimizer=AdamW(eps=1e-10, b1=0.9, b2=0.95, weight_decay=0.1),
-                         learning_rate=Power(peak_value=0.01, warmup_steps=2, a=0.05, b=-0.51, c=16.0),
+                         schedule=Power(peak_value=0.01, warmup_steps=2, a=0.05, b=-0.51, c=16.0),
                          param_groups=groups)
     with float64():
         solver = config.build(3)

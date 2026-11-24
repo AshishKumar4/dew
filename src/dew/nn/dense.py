@@ -39,7 +39,7 @@ from .derivatives import KernelGlue, contracted, declared_tangent, with_tangents
 from .kernels import projections
 from .kernels.formats import NvFp4
 from .precision import accumulated, biased, float32_dot_general, refuse_recipe
-from .sharding import declared
+from .sharding import contracted_alike, declared
 
 QWIX = importlib.util.find_spec("qwix") is not None
 """Whether Qwix is installed (`dew.quantization`'s extra), whose rules a layer's product may fall under."""
@@ -214,7 +214,11 @@ def plain_product(path: tuple | None = None):
 def _accumulated_dot_general(lhs, rhs, dimension_numbers, precision=None, preferred_element_type=None,
                              **kwargs) -> jax.Array:
     """`jax.lax.dot_general` as stated, its fp32 sum taken in float64 on a CPU under Dew's tests
-    (`accumulated`)."""
+    (`accumulated`), landing where a contraction Explicit axes split on both operands lands its sum
+    (`contracted_alike`) where the call states no placement of its own."""
+    if kwargs.get("out_sharding") is None:
+        lhs, rhs, placed = contracted_alike(lhs, rhs, dimension_numbers)
+        kwargs = kwargs if placed is None else {**kwargs, "out_sharding": placed}
     return accumulated(functools.partial(jax.lax.dot_general, dimension_numbers=dimension_numbers,
                                          precision=precision, **kwargs),
                        lhs, rhs, preferred_element_type=preferred_element_type)

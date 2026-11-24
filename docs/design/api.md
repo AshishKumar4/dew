@@ -18,7 +18,7 @@ Design record, 2026-09-03. The code blocks are design sketches, not runnable cod
 | 8 | Diffusion vocabulary stays (`NoiseScheduler`, `PredictionTransform`, the sampler names). Ownership moves into one `Process` value per convention; presets are dataclasses in a registry. | 3.5 |
 | 9 | Discrete diffusion gets its own small algebra in `dew.diffusion.discrete`, shaped like the Gaussian one. It is not a special case of it. | 6.1 |
 | 10 | The objective's loss returns an `Aux` that can carry updated non-parameter collections. That is the one channel for MoE balancing, batch statistics and sown values. | 3.3, 6.2 |
-| 11 | A custom compiled step is the one escape hatch (`Trainer(step=...)`). There is no second trainer. A custom step over a model that reads the run's progress passes it and says so (`PassesProgress`). | 6.5 |
+| 11 | A custom compiled step is the one escape hatch (`TrainerAdvanced(step=...)`). There is no second trainer. A custom step over a model that reads the run's progress passes it and says so (`PassesProgress`). | 6.5 |
 | 12 | Sharding is declared on the module that owns the parameters, with a decorator, and merged into a `Layout`. The table in `training/distributed.py` moves out of the training package. | 3.8 |
 
 ## 1. What is wrong today
@@ -158,8 +158,8 @@ trainer = Trainer(
     objective, optimizer,
     key=jax.random.key(0),
     mesh=MeshSpec(fsdp=4, expert=1),          # data fills the rest, as build_mesh does now
-    layout=Layout(rules=DEFAULT_RULES, min_shard=2**16, tolerance=0.02),
-    update=UpdateBatch(batches=4),             # the one owner of an update's size; wraps MultiSteps itself
+    advanced=TrainerAdvanced(layout=Layout(rules=DEFAULT_RULES, min_shard=2**16, tolerance=0.02)),
+    accumulation=4,             # the one owner of an update's size; wraps MultiSteps itself
     checkpoints=Checkpoints("runs/flowers", keep=2),
     tracker=WandbTracker(project="dew", name="flowers"),   # or None
 )
@@ -316,9 +316,10 @@ with or without `text_only`. A run passes both through `--source.text-only` and
 `--source.prediction-depths` (`RunConfig.source`), whatever kind of run it is, the load's
 `modeling_overrides` through `--source.attention`, each layer kind causal or block_bidirectional,
 and its differential extension through `--source.dex`, the `DifferentialExtension`'s record as JSON
-(`dew.nn.dex`), and `scan_layers` through `--source.scan-layers`, which scans a decoder's runs of
-like layers, its periodic pattern among them, its stored tree unchanged, and refuses a model with no
-layers to scan (`Pretrained.load`); a diffusion pipeline, which no override reaches, refuses them. `dew.pipeline` takes
+(`dew.nn.dex`); a diffusion pipeline, which no override reaches, refuses them. How a decoder runs its
+layers is none of a source's choices: under `generation.chosen(layer_scan="scanned")` it scans its runs of
+like layers, its periodic pattern among them, by its structure, its stored tree unchanged, and a layer at a
+time otherwise, the default until row 4074 makes the scan it. `dew.pipeline` takes
 the same choices for a source as `options=SourceOptions(...)`, and refuses them for a run directory,
 whose record holds its own.
 
@@ -343,11 +344,11 @@ within its own bounds, runs them with one bounded device call a `step`, and sett
 `Timed` future. The engine steps each busy kind once a turn from one thread, so a long queue of one
 kind never holds another back, and it orders a kind's weight reload with its steps. Two kinds ship:
 autoregressive generation's `Server`, a slot scheduler over a resident cache, its prefix cache on by
-default wherever its layout pages (`Server.from_task`'s `prefix_cache` None), a finished request's
+default wherever its layout pages (`PagedKV.prefix_cache` None), a finished request's
 history (its prompt and every draw its cache holds) named for a later prompt that continues it,
 `server(prompts, max_new_tokens, key=..., first=0)` folding row `i`'s key by `first + i`; an episode
 cohort's turns run through it in process
-(`EpisodeCollector(kv_cache=KVCache(page_size=...))`); and `ScoringServer`, a
+(`EpisodeCollector(cache=PagedKV(page_size=...))`); and `ScoringServer`, a
 task answered by forward passes over its requests' rows. A scoring task (`Scoring`) holds no
 weights. It lays a request out as rows at submission (`admit`, refusing one alone, a ValueError), says
 which rows one pass holds (`fits`), runs a pass over the weights the server hands it (`forward`), and
@@ -372,13 +373,15 @@ request draws what its lone call draws under its key.
 inputs = InputSpec(sample=Field("image", (128, 128, 3)),
                    conditions={"textcontext": Condition(encoders.CLIPText.from_pretrained("openai/clip-vit-large-patch14"))})
 objective = DiffusionObjective(models.SimpleDiT(patch_size=4, emb_features=512, num_layers=12, num_heads=8),
-                               presets.EDM(regime="pixel"), inputs, sampler=samplers.Heun(), guidance=3.0, steps=40)
+                               presets.EDM(regime="pixel"), inputs, sampler=samplers.Heun(), guidance=3.0,
+                               steps=40)
 state = Trainer(objective, optax.adamw(2e-4), key=jax.random.key(0), mesh=MeshSpec(fsdp=1),
                 checkpoints=Checkpoints("runs/flowers")).fit(data, steps=steps)
 
 # language model
 objective = LMObjective(models.CausalTransformer(vocab_size=V, emb_features=384, num_layers=6, num_heads=6,
-                                                 max_seq_len=556), seq_len=256, samples=TextSamples(prompt, 300))
+                                                 max_seq_len=556), seq_len=256, samples=TextSamples(prompt,
+                                                                                                    300))
 state = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0), checkpoints=...).fit(data, steps=1200)
 
 # JEPA
@@ -392,7 +395,7 @@ JEPA imports nothing from diffusion.
 
 ## 5. What is deleted
 
-`SimpleTrainer`'s W&B and publishing methods, `ObjectiveTrainer`'s diffusion parameters and default objective, `RandomMarkovState`, `get_diffusion_preset`, the `+suffix` DSL and `canonicalize_architecture`, `apply_precision_policy`'s string round trip (dtype and attention_impl become fields the registry validates), `serialize_model`, `parse_config`, `DiffusionInputConfig` and `ConditionalInputConfig`, `model_key_override`, the three dataset maps, `Metrics`, `FLAXDIFF_AUGMENT_MODE` (augmentation becomes a field of the dataset spec), `__encode__` and `__decode__` in favour of `encode` and `decode`.
+`SimpleTrainer`'s W&B and publishing methods, `ObjectiveTrainer`'s diffusion parameters and default objective, `RandomMarkovState`, `get_diffusion_preset`, the `+suffix` DSL and `canonicalize_architecture`, `apply_precision_policy`'s string round trip (dtype becomes a field the registry validates, the attention kernel a run's kernel choice), `serialize_model`, `parse_config`, `DiffusionInputConfig` and `ConditionalInputConfig`, `model_key_override`, the three dataset maps, `Metrics`, `FLAXDIFF_AUGMENT_MODE` (augmentation becomes a field of the dataset spec), `__encode__` and `__decode__` in favour of `encode` and `decode`.
 
 ## 6. Stress test
 
@@ -450,7 +453,7 @@ A decoder gains passes over a block of its layers through `with_passes(steps, la
 
 | Need | Boundary |
 | --- | --- |
-| Alternating or multi-optimizer updates (GAN, actor-critic) | Not one `loss`. `Trainer(step=make_my_step)` replaces the compiled step and is the one documented place for a custom step. A step over a model that reads the run's progress (`dew.nn.progress.ReadsProgress`, a DEX decoder) passes it `Progress(state.updates)` and its factory is wrapped, `Trainer(step=PassesProgress(make_my_step))`; the trainer refuses that model under any other custom step, which would train it at the run's end. |
+| Alternating or multi-optimizer updates (GAN, actor-critic) | Not one `loss`. `TrainerAdvanced(step=make_my_step)` replaces the compiled step and is the one documented place for a custom step. A step over a model that reads the run's progress (`dew.nn.progress.ReadsProgress`, a DEX decoder) passes it `Progress(state.updates)` and its factory is wrapped, `TrainerAdvanced(step=PassesProgress(make_my_step))`; the trainer refuses that model under any other custom step, which would train it at the run's end. |
 | Tensor or sequence parallel | `MeshSpec(tensor=N)` and rules are cheap; correct TP needs `with_sharding_constraint` on activations inside each model. Per-architecture work. |
 | Pipeline parallel | `MeshSpec(stage=N)` runs GPipe over a stack of like layers (a decoder's, a DiT's, a JEPA's, a UNet level's transformers; `decoder_stack.run_pipeline`), each stage's layers and their optimizer state stored on that stage's devices alone (`dew.training.stages`); everything outside the stacks runs on every stage, and no 1F1B schedule is built. |
 | Non-grain data | `Dataset.train` is any callable returning an iterator; without `get_state` the run cannot checkpoint its position and `fit` says so. |

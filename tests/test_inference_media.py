@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import attending
 from steady_state import guarded
 from test_inference import make_run
 
@@ -19,6 +20,7 @@ from dew.sampling import CFG, Heun
 FIXTURE = Path(__file__).parent / "fixtures/hf/diffusion-gemma-workflow"
 
 
+@attending("reference")
 def test_trained_image_task_accepts_raw_and_prepared_inputs_and_immutable_rebinding(tmp_path):
     objective, state = make_run(tmp_path)
     task = TextToImage.from_objective(objective, state.variables)
@@ -53,6 +55,7 @@ def test_trained_image_task_accepts_raw_and_prepared_inputs_and_immutable_rebind
         task(replace(prepared, noise=prepared.noise[:, :-1]), steps=3, key=key)
 
 
+@attending("reference")
 def test_partial_image_trajectory_and_refiner_handoff_preserve_latents(tmp_path):
     from dew.sampling import Euler
 
@@ -80,12 +83,13 @@ def test_partial_image_trajectory_and_refiner_handoff_preserve_latents(tmp_path)
 
 
 
+@attending("xla")
 @pytest.mark.parametrize("family", ["diffusion-gemma-workflow", "gemma3-native-tiny"])
 def test_host_and_resident_media_generate_equivalent_public_results(family):
     from dew.training import Layout, MeshSpec
 
     directory = FIXTURE.parent / family
-    loaded = Pretrained.load(directory, dtype="float32", attention_impl="xla", max_seq_len=64)
+    loaded = Pretrained.load(directory, dtype="float32", max_seq_len=64)
     if family == "diffusion-gemma-workflow":
         with np.load(directory / "reference.npz") as reference:
             tokens = reference["image_prompt"]

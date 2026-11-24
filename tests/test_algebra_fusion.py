@@ -680,50 +680,37 @@ def test_a_starts_forward_nothing_reads_is_never_written_as_a_kernel():
     assert not unread and not unlaunched
 
 
-def test_a_steps_relowering_traces_none_of_its_written_regions_again():
+def test_a_steps_relowering_writes_the_program_its_first_lowering_wrote():
     """A step lowered again in one process (a planner's candidate, a relowering after a launch spilled: each
-    lowering's records fresh, so JAX traces the step again) writes its regions from the traces its first
-    lowering made (`fusion._traced`): the second traces nothing but the step itself (JAX's trace events, by
-    the function each traced), where the first traced its fused products' calls too, and it writes the
-    program the first did, reporting the routes it did and the launches it did, each beside the config it
-    took (`tuning.seen`, whose launches and configs pair one to one: a tuner's and a test's reads, row
-    6572). One lowered under other state a trace reads (a context variable of Dew's set, attention's
-    forward mode) traces its regions again."""
-    from jax._src import dispatch
-
+    lowering's records fresh) writes its regions from the traces its first lowering made (`fusion._traced`):
+    the program the first wrote, reporting the routes it did and the launches it did, each by its launch's
+    type beside the config it took (`tuning.seen`, whose launches and configs pair one to one: a tuner's
+    and a test's reads, row 6572); and one lowered under other state a trace reads (a context variable of
+    Dew's set, attention's forward mode), whose regions are traced again, takes those routes and launches
+    too. The facts its replayed traces read are the next test's (`generation.recording`)."""
     import dew
     from dew.algebra import program
     from dew.nn.attention import forward_mode_attention
     from dew.nn.kernels import tuning
 
-    traced: list[str] = []
-
-    def heard(event: str, duration: float, **values) -> None:
-        del duration
-        if event == dispatch.JAXPR_TRACE_EVENT:
-            traced.append(values.get("fun_name"))
-
-    jax.monitoring.register_event_duration_secs_listener(heard)
     operands = draw()
     step = dew.jit(chained)
     lowerings = []
-    try:
-        with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
-            for state in (contextlib.nullcontext(), contextlib.nullcontext(), forward_mode_attention()):
-                traced.clear()
-                with state, generation.routes() as found, tuning.seen() as launches:
-                    made = step.trace(*operands)
-                assert [op for op, _ in launches] == [ba.op for _, ba in launches.taken]
-                took = [(ba, config) for (_, ba), (config, _) in zip(launches, launches.taken, strict=True)]
-                lowerings.append((set(traced), program.structure(made.jaxpr.jaxpr),
-                                  [(route.choice, route.kernel) for route in found], took))
-    finally:
-        jax.monitoring.unregister_event_duration_listener(heard)
-    (first, written, routes, took), (again, rewritten, rerouted, retook), (other, _, _, _) = lowerings
-    assert first > {chained.__name__} and again == {chained.__name__}, (first, again)
-    assert ("grouped_matmul", "mosaic") in routes and took
-    assert rewritten == written and rerouted == routes and retook == took
-    assert other > {chained.__name__}, other
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+        for state in (contextlib.nullcontext(), contextlib.nullcontext(), forward_mode_attention()):
+            with state, generation.routes() as found, tuning.seen() as launches:
+                made = step.trace(*operands)
+            # Each launch by its op's type and the config it took, paired one to one (`tuning.Seen`).
+            assert [op for op, _ in launches] == [bound.op for _, bound in launches.taken]
+            took = [(type(bound.op).__name__, config) for config, bound in launches.taken]
+            lowerings.append((program.structure(made.jaxpr.jaxpr),
+                              [(route.choice, route.kernel) for route in found], took))
+    cold, warm, other = lowerings
+    assert ("grouped_matmul", "mosaic") in cold[1] and cold[2], cold
+    assert warm == cold
+    # Its regions traced again under the other state, which their program records (a forward-mode trace's
+    # own marks): the routes and the launches it took are the first's.
+    assert other[1:] == cold[1:]
 
 
 def test_a_written_region_records_the_facts_its_trace_read_wherever_it_is_written():

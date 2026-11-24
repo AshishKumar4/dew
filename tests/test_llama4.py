@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from interop_support import fixture_arrays
-from model_support import as_stepped, decode_through
+from model_support import as_stepped, attending, decode_through
 from reference_error import assert_as_exact, widened
 
 from dew.batch import coordinates
@@ -139,6 +139,7 @@ def test_the_temperature_reads_logical_positions_through_a_cache():
     assert float(np.max(np.abs(np.asarray(cached) - uncached))) < 1e-5
 
 
+@attending("reference")
 @pytest.mark.parametrize("dense, layout", [
     (KVCache(), KVCache(page_size=4)),
     (KVCache(quantized="int8"), KVCache(quantized="int8", page_size=4)),
@@ -148,7 +149,7 @@ def test_a_paged_cache_draws_what_the_dense_cache_draws(dense, layout):
     """The tiny Llama 4 checkpoint (three chunked rotated layers, one global layer without rope)
     decodes greedily through each storage layout of the shared attention: a paged cache draws the
     dense cache's tokens at full precision and at each quantized format."""
-    pretrained = Pretrained.load(str(LLAMA4_CHECKPOINT), dtype="float32", attention_impl="reference")
+    pretrained = Pretrained.load(str(LLAMA4_CHECKPOINT), dtype="float32")
     prompts = np.load(LLAMA4_CHECKPOINT / "input_ids.npy")[:, :7]
 
     def drawn(cache: KVCache) -> np.ndarray:

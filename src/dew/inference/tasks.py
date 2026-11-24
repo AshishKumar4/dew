@@ -19,7 +19,7 @@ import functools
 import inspect
 import json
 import logging
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Concatenate, Literal, Protocol, Self, TypedDict, runtime_checkable
@@ -70,20 +70,16 @@ from dew.nn.progress import END, Progress
 from dew.nn.projections import packed_owned
 from dew.nn.protocols import Bounded, CacheCapacity, StatesVocabulary, TokenModel, refuse_prefix
 from dew.sampling import decoding, vocabulary
-from dew.sampling.decoding import LogitsTransform, Stopping, id_row
+from dew.sampling.decoding import Stopping, id_row
 from dew.sampling.solvers import Solver
-from dew.sampling.strategies import Strategy
 from dew.sampling.text import (
-    Criteria,
     Generation,
     Sampling,
-    Transforms,
     decoded_rows,
     generate,
     prediction_depths,
     refuse_redrawn,
     row_texts,
-    with_ids_of,
 )
 from dew.telemetry.profile import region
 
@@ -363,12 +359,25 @@ class SavedRun:
         recorded = self.record.get("precision")
         return None if recorded is None else from_record(Numerics, named_fields(recorded, "precision"))
 
+    @property
+    def kernels(self) -> tuple[tuple[str, str], ...]:
+        """The kernel choices the run's step pinned, by choice: a saved model's attention kernel, its field
+        until row 11938, which its declaration holds as its run's (`earlier_shapes`); none for a record that
+        names none."""
+        recorded = self.record.get("kernels")
+        if recorded is None:
+            return ()
+        return tuple(sorted((choice, named(kernel, f"kernels.{choice}"))
+                            for choice, kernel in named_fields(recorded, "kernels").items()))
+
     def formed[TaskT](self, task: TaskT) -> TaskT:
-        """`task`, built from this run (`from_saved`), under the numerics its step trained in where it
-        traces under them (`InItsForm`); a task of another class reads `precision` itself."""
-        if not isinstance(task, InItsForm) or task.precision == self.precision:
+        """`task`, built from this run (`from_saved`), under the numerics its step trained in and the kernels
+        it pinned where it traces under them (`InItsForm`); a task of another class reads `precision`
+        itself."""
+        if not isinstance(task, InItsForm) or (task.precision, task.kernels) == (self.precision,
+                                                                                  self.kernels):
             return task
-        return replace(task, precision=self.precision)
+        return replace(task, precision=self.precision, kernels=self.kernels)
 
     @classmethod
     def pinned(cls, directory: str, step: int | str | None = None, trust: Sequence[str] = (), *,
@@ -442,7 +451,8 @@ class SavedRun:
         declared = frozenset() if objective.settings is None else settings_fields(objective.settings)
         from dew.interop.saved_sources import RELEASE_SOURCES
 
-        stray = set(record) - {'objective', 'model', 'precision', UNREAD, RELEASE_SOURCES, *declared}
+        stray = set(record) - {'objective', 'model', 'precision', 'kernels', UNREAD, RELEASE_SOURCES,
+                               *declared}
         if stray:
             raise ValueError(f"this {objective.__name__} run records fields its objective does not write: "
                              f"{sorted(stray)}")
@@ -502,12 +512,30 @@ class InItsForm:
     trained under them (`Objective.inference_record`): its products' precision and its ops' forms;
     None traces under the numerics in effect around the call."""
 
-    def traced(self) -> contextlib.AbstractContextManager[None]:
-        """The block a call of this task traces in: its run's numerics (`generation.run_precision`), which
-        JAX keys its trace and compile caches on, so another policy's task traces its own programs."""
-        if self.precision is None:
-            return contextlib.nullcontext()
-        return generation.run_precision(self.precision)
+    kernels: tuple[tuple[str, str], ...] = ()
+    """The kernel choices its run pinned (`SavedRun.kernels`: a saved model's attention kernel, a model's
+    field until row 11938), each of which its calls trace under where the caller names none of its own
+    (`dew.kernels.use`, `pinned`)."""
+
+    @contextlib.contextmanager
+    def traced(self) -> Iterator[None]:
+        """The block a call of this task traces in: its run's numerics (`generation.run_precision`) and its
+        run's kernel pins (`pinned`), which JAX keys its trace and compile caches on, so another policy's
+        task traces its own programs."""
+        with (self.pinned(), contextlib.nullcontext() if self.precision is None
+              else generation.run_precision(self.precision)):
+            yield
+
+    @contextlib.contextmanager
+    def pinned(self) -> Iterator[None]:
+        """The block its run's kernel pins hold in (`kernels`), a choice the caller names in a block of its
+        own (`dew.kernels.use`) standing over its run's: what a server made from it is made under too
+        (`dew.inference.serving.Server.from_task`)."""
+        from dew import _cache
+
+        named = dict(_cache.KERNEL_CHOICES.value)
+        with generation.chosen(**{choice: kernel for choice, kernel in self.kernels if choice not in named}):
+            yield
 
 
 def traced_in_its_form[TaskT: InItsForm, **P, R](
@@ -664,6 +692,11 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
         name = named(head["name"], "head.name")
         current["head"] = {"class": name if ":" in name else f"dew.decision.head:{name}",
                            "fields": named_fields(head.get("fields", {}), "head.fields")}
+    if isinstance(current.get("head"), Mapping):
+        # The fields its head's class lost since (`REMOVED_FIELDS`: the attention kernel a head held, the
+        # run's since row 11938), left out here, where a saved step and a release are read, so the head's
+        # constructor (`Head.from_record`) reads today's fields alone (the API02 review).
+        current["head"] = earlier_fields(json_value(current["head"], "head"))
     autoencoder = record.get("autoencoder")
     if isinstance(autoencoder, Mapping) and "name" in autoencoder and "class" not in autoencoder:
         name = named(autoencoder["name"], "autoencoder.name")
@@ -725,6 +758,12 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
         # The form a step trained in, which its numerics' forms hold now (ledger 2500).
         current["precision"] = {"forms": current.pop("attention_form")}
     if "model" in current:
+        # The attention kernel its model named, the run's since (row 11938), before its field goes: a loaded
+        # task traces under it (`SavedRun.kernels`), where it fell to the selector's (the API02 review).
+        model = current["model"]
+        if (isinstance(model, Mapping) and (pin := earlier_attention_pin(model)) is not None
+                and "kernels" not in current):
+            current["kernels"] = {"attention": pin}
         current = earlier_model(current)
     return current
 
@@ -741,7 +780,8 @@ def earlier_model(record: Mapping[str, object]) -> Mapping[str, object]:
     and an earlier lightning layer's place (`_placed_lightning`, ledger 2564), whether the decoder names
     its class or a wrapper declares the field it fills (`MultimodalTransformer.language_model`,
     `DiffusionGemma.text`), which records its fields alone (ledger 2274). Carried until 1.0 (ledger
-    1552); current constructors and source codecs accept only their current schema."""
+    1552); current constructors and source codecs accept only their current schema. Every component's
+    fields its class lost since are left out (`_removed_fields`), its given and its defaulted ones."""
     def current(value):
         if isinstance(value, list | tuple):
             return [current(field) for field in value]
@@ -753,6 +793,12 @@ def earlier_model(record: Mapping[str, object]) -> Mapping[str, object]:
         name, fields = component.get("class", component.get("name")), component.get("fields")
         if not isinstance(fields, dict):
             return component
+        if isinstance(name, str) and (removed := _removed_fields(name)):
+            # The fields its class lost since (`REMOVED_FIELDS`), out of those it was given and defaulted.
+            fields = {key: field for key, field in fields.items() if key not in removed}
+            component["fields"] = fields
+            if isinstance(defaults := component.get("defaults"), Mapping):
+                component["defaults"] = {key: field for key, field in defaults.items() if key not in removed}
         if name in _EARLIER_PROJECTORS and "vision_width" in fields:
             width, merge = fields.pop("vision_width"), fields.pop("merge_size")
             component["fields"] = {**fields, "hidden_size": width, "spatial_merge_size": merge,
@@ -769,10 +815,30 @@ def earlier_model(record: Mapping[str, object]) -> Mapping[str, object]:
     return {**record, "model": current(record["model"])}
 
 
+def _removed_fields(name: str) -> frozenset[str]:
+    """The fields the class `name` names, by import path or by a registry alias, lost since runs were saved
+    with them (`dew._records.REMOVED_FIELDS`)."""
+    from dew._records import REMOVED_FIELDS
+    from dew.registry import KINDS
+
+    paths = [name] if ":" in name else [kind.paths[name] for kind in KINDS if name in kind.paths]
+    return frozenset().union(*(REMOVED_FIELDS.get(path, frozenset()) for path in paths))
+
+
 def _declared_decoders(name: str, fields: Mapping[str, object]) -> Mapping[str, object]:
-    """The fields of the component class `name`, by import path or by its alias of any kind (a mixer's
-    `attention`), with each decoder its fields declare (`dew.registry.declared_type`) and record as
-    their fields alone translated (`_decoder_fields`); unchanged where `name` names no one class."""
+    """The fields of the component class `name` with each decoder its fields declare (`decoder_fields`)
+    and record as their fields alone translated (`_decoder_fields`); unchanged where `name` names no one
+    class."""
+    decoders = decoder_fields(name, fields)
+    return {field: (_decoder_fields(value) if field in decoders and isinstance(value, Mapping)
+                    and "class" not in value else value)
+            for field, value in fields.items()}
+
+
+def decoder_fields(name: str, fields: Iterable[str]) -> frozenset[str]:
+    """Those of `fields` the component class `name`, by import path or by its alias of any kind (a mixer's
+    `attention`), declares a decoder (`dew.registry.declared_type`: `MultimodalTransformer.language_model`,
+    `DiffusionGemma.text`); none where `name` names no one class."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.registry import KINDS, declared_type, imported
 
@@ -780,12 +846,40 @@ def _declared_decoders(name: str, fields: Mapping[str, object]) -> Mapping[str, 
                                                    if name in kind.paths]
     classes = [member for member in named if isinstance(member, type)]
     if len(classes) != 1:
-        return fields
+        return frozenset()
     (owner,) = classes
-    return {field: (_decoder_fields(value) if isinstance(value, Mapping) and "class" not in value
-                    and declared_type(owner, field) is CausalTransformer else value)
-            for field, value in fields.items()}
+    return frozenset(field for field in fields if declared_type(owner, field) is CausalTransformer)
 
+
+def saved_decoders(part: Mapping[str, object]) -> list[Mapping[str, object]]:
+    """The stated fields (`_stated`) of a saved model or source part and of each decoder it holds where its
+    class declares one (`decoder_fields`: `MultimodalTransformer.language_model`, `DiffusionGemma.text`),
+    recorded by its fields alone or by its class, the part's own first: a wrapped decoder's earlier fields,
+    which `earlier_model` leaves out, read before they go (`dew.config.earlier.earlier_layer_scan`; the API02
+    review: the root alone missed a wrapped decoder's)."""
+    stated = _stated(part)
+    name = part.get("class", part.get("name"))
+    held = decoder_fields(name, stated) if isinstance(name, str) else frozenset()
+    return [stated, *(decoder for field in sorted(held) if isinstance(decoder_part := stated[field], Mapping)
+                      for decoder in saved_decoders(decoder_part))]
+
+
+def earlier_attention_pin(model: Mapping[str, object]) -> str | None:
+    """The attention kernel a saved model record named (`attention_impl`, a field until row 11938) but
+    'auto': its own, else a decoder's it wraps (`saved_decoders`); None where it named none. Read by a
+    run's record (`dew.config.earlier.earlier_attention_kernel`) and a step's inference declaration
+    (`earlier_shapes`) alike. Carried to 1.0 (ledger 1552)."""
+    named = [str(kernel) for decoder in saved_decoders(model)
+             if (kernel := decoder.get("attention_impl", "auto")) != "auto"]
+    return named[0] if named else None
+
+def _stated(part: Mapping[str, object]) -> Mapping[str, object]:
+    """A saved part's fields as it states them: a model record's given fields over the defaults it
+    recorded (`ModelConfig`), else the part's own mapping."""
+    given, defaults = part.get("fields"), part.get("defaults")
+    if not isinstance(given, Mapping):
+        return part
+    return {**(defaults if isinstance(defaults, Mapping) else {}), **given}
 
 _LAYER_DISPATCH = ("implementation", "dispatch", "capacity_factor")
 """The routed MLP's dispatch an earlier record wrote into its value experts' fields, which run under
@@ -797,7 +891,11 @@ def _decoder_fields(fields: Mapping[str, object]) -> Mapping[str, object]:
     (`_one_scaling`), an earlier lightning layer's place as its stack hands it (`_placed_lightning`), an
     earlier cross-attention, IDEFICS's block recorded by its fields alone when the field declared that
     class, as its class record (`dew.nn.cross_attention.CrossBlocks`, ledger 2320), and earlier value
-    experts without the layer dispatch they recorded at its defaults (`_LAYER_DISPATCH`)."""
+    experts without the layer dispatch they recorded at its defaults (`_LAYER_DISPATCH`); the fields the
+    decoder lost since left out (`_removed_fields`), a decoder a wrapper records by its fields alone among
+    them (`MultimodalTransformer.language_model`, `DiffusionGemma.text`)."""
+    removed = _removed_fields(_DECODER[0])
+    fields = {key: field for key, field in fields.items() if key not in removed}
     kinds, cross, values = fields.get("kinds"), fields.get("cross_attention"), fields.get("value_experts")
     types = fields.get("layer_types")
 
@@ -1299,19 +1397,14 @@ class TextGeneration(_NativeTextTask):
     weights stay where they were placed. On a mesh, the rows are split over
     its batch axes and the results keep that sharding.
 
-    `logits` is the whole logits transform chain, and None means the chain
-    `sampling` compiles to. `stopping` holds the criteria that run beside
-    the policy's EOS and stop-string criteria, and `strategy` is the device
-    loop. A call that passes any of the three replaces the task's value
-    whole, so to add a transform you pass
-    `logits=task.sampling.transforms() + (mine,)`. A call that passes
-    `sampling=` also drops the task's own `logits` chain, because that chain
-    was built from the policy the call replaces. Where a call's policy
-    leaves the EOS and pad ids None, it takes the task's. So to change one
-    control, pass `sampling=replace(task.sampling, repetition_penalty=1.1)`
-    or a fresh `Sampling(...)`, and either one still stops where the task
-    does. `sampling.stop` strings compile against `processor` once for the
-    task's policy, and again on each call whose policy has other stop strings.
+    `sampling` is the one decoding policy a call runs (`Sampling`: its
+    controls, its logits chain, its criteria and its strategy); a call that
+    passes `sampling=` replaces it whole. Where a call's policy leaves the EOS
+    and pad ids None, it takes the task's. So to change one control, pass
+    `sampling=replace(task.sampling, repetition_penalty=1.1)` or a fresh
+    `Sampling(...)`, and either one still stops where the task does.
+    `sampling.stop` strings compile against `processor` once for the task's
+    policy, and again on each call whose policy has other stop strings.
 
     A call pads the request to `SHAPE_BUCKETS` shapes, with a cache sized to
     the buckets, and returns results at the shapes the request asked for. So
@@ -1331,9 +1424,6 @@ class TextGeneration(_NativeTextTask):
     max_new_tokens: int | None = None
     max_length: int | None = None
     n: int = 1
-    logits: tuple[LogitsTransform, ...] | None = None
-    stopping: tuple[Stopping, ...] = ()
-    strategy: Strategy | None = None
     prefix: int | Literal["prompt"] | None = None
     """The prefix run the model trained (`LMObjective(prefix=...)`): a prompt's first tokens, or all of it
     under "prompt", form one block the model reads whole. A request's own blocks stand; None is causal."""
@@ -1343,7 +1433,7 @@ class TextGeneration(_NativeTextTask):
     def __post_init__(self) -> None:
         super().__post_init__()
         refuse_prefix(self.model, self.prefix, longest=cache_ceiling(self.model))
-        refuse_redrawn(self.model, self.strategy)
+        refuse_redrawn(self.model, self.sampling.strategy)
         if self.sampling.stop:
             self._listing()
 
@@ -1379,20 +1469,14 @@ class TextGeneration(_NativeTextTask):
         bound.__dict__["_stops"] = self._stops
         return bound
 
-    def controls(self, sampling: Sampling | None = None, logits: Transforms | None = None,
-                 stopping: Criteria | None = None
-                 ) -> tuple[Sampling, Transforms | None, tuple[Stopping, ...]]:
-        """The policy, chain and criteria a call runs, the stop strings compiled
-        into criteria and the EOS and pad ids filled from the task's policy: a call
-        that overrides none of them, the task's own, which a server serves
-        (`dew.inference.serving.Server.from_task`)."""
-        policy = self.sampling if sampling is None else with_ids_of(sampling, self.sampling)
+    def controls(self, sampling: Sampling | None = None) -> Sampling:
+        """The policy a call runs, `sampling` over the task's own (`Sampling.with_defaults_of`: its ids,
+        stopping and strategy the task's where it leaves them at their defaults) or the task's own, its stop
+        strings compiled into criteria beside its own: a call that passes none, the task's, which a server
+        serves (`dew.inference.serving.Server.from_task`)."""
+        policy = self.sampling if sampling is None else sampling.with_defaults_of(self.sampling)
         stops = self._stops if policy.stop == self.sampling.stop else self._stop_criteria(policy.stop)
-        chain = (self.logits if sampling is None else None) if logits is None else logits
-        given = self.stopping if stopping is None else stopping
-        # As given: `resolve` tells the criteria that truncate from those that end a row by their kind.
-        criteria = (tuple(given) if isinstance(given, Sequence) else (given,)) + stops
-        return replace(policy, stop=(), pad_token_id=policy.pad), chain, criteria
+        return replace(policy, stop=(), pad_token_id=policy.pad, stopping=policy.stopping + stops)
 
     def quantized(self, spec: Quantization, example: Rows | None = None) -> TextGeneration:
         """Return the task with the weights matched by `spec` stored as int8 or fp8 through Qwix.
@@ -1460,20 +1544,17 @@ class TextGeneration(_NativeTextTask):
     @traced_in_its_form
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
                  key: int | jax.Array, n: int | None = None,
-                 sampling: Sampling | None = None, images: Media | None = None,
-                 logits: Transforms | None = None, stopping: Criteria | None = None,
-                 strategy: Strategy | None = None) -> Generation:
+                 sampling: Sampling | None = None, images: Media | None = None) -> Generation:
         with region("inference.text"):
             inputs, budget, random_key = _task_inputs(self.processor, request, images=images,
                                           collective=mesh_of(self.variables) is not None,
                                           max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
                                           max_length=self.max_length, key=key)
             shaped, trips, capacity = _bucketed(inputs, budget, cache_ceiling(self.model))
-            policy, chain, criteria = self.controls(sampling, logits, stopping)
             generated = generate(cache_sized(self.model, capacity), self.placed, shaped, budget,
-                                 key=random_key, sampling=policy, n=self.n if n is None else n, logits=chain,
-                                 stopping=criteria, strategy=self.strategy if strategy is None else strategy,
-                                 trips=trips, prefix=self.prefix, progress=self.progress)
+                                 key=random_key, sampling=self.controls(sampling),
+                                 n=self.n if n is None else n, trips=trips, prefix=self.prefix,
+                                 progress=self.progress)
             padding = shaped.tokens.shape[1] - inputs.tokens.shape[1]
             return self._decoded(_requested(generated, budget, padding))
 

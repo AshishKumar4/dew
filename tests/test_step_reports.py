@@ -16,7 +16,7 @@ from dew.data import Memory
 from dew.data.pipeline import Pipeline
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.lm import LMObjective
-from dew.training import FitPolicy, MeshSpec, UpdateBatch
+from dew.training import MeshSpec
 
 
 @pytest.mark.parametrize("split", [2, "auto"], ids=["two-microbatches", "planned"])
@@ -29,7 +29,7 @@ def test_a_steps_logged_loss_is_its_rows_whatever_its_split(split):
 
     def logged(split: int | str) -> list[float]:
         tracker = RecordingTracker()
-        trainer = make_trainer(tracker=tracker, update=UpdateBatch(batches=2), fit=FitPolicy(split=split))
+        trainer = make_trainer(tracker=tracker, accumulation=2, split=split)
         trainer.device_mesh = MeshSpec().build(jax.devices()[:1])
         trainer.fit(dataset(), steps=6, log_every=1)
         return [scalars["train/loss"] for _, scalars in tracker.scalars if "train/loss" in scalars]
@@ -59,7 +59,7 @@ def test_a_steps_logged_metrics_are_its_rows_whatever_its_split():
 
     def logged(split: int) -> dict[str, np.ndarray]:
         tracker = RecordingTracker()
-        trainer = make_trainer(tracker=tracker, update=UpdateBatch(batches=2), fit=FitPolicy(split=split),
+        trainer = make_trainer(tracker=tracker, accumulation=2, split=split,
                                objective=LMObjective(model, seq_len=LM_CONTEXT, pad_id=0))
         trainer.device_mesh = MeshSpec().build(jax.devices()[:1])
         trainer.fit(Pipeline(Memory({"text": rows})).repeat().batch(LM_ROWS), steps=4, log_every=1)

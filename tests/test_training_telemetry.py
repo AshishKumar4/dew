@@ -18,8 +18,7 @@ from dew.data.dataset import Loader
 from dew.data.plan import PLAN_VERSIONS
 from dew.objectives import Aux, Objective
 from dew.optim import Cosine, OptimConfig
-from dew.training import Trainer, UpdateBatch, Wandb, WandbTracker
-from dew.training.budget import Horizon
+from dew.training import Trainer, TrainerAdvanced, Wandb, WandbTracker
 
 
 class Squared(Objective):
@@ -80,7 +79,8 @@ def test_a_non_finite_run_stops_at_the_step_whose_losses_it_read(skip, cadence, 
     finite losses trains to its end."""
     Trainer(Squared(), optax.sgd(.1), key=0).fit(targets([1.] * 10), steps=10, log_every=cadence)
     sink = RecordingTracker()
-    trainer = Trainer(Squared(), optax.sgd(.1), key=0, tracker=sink, skip_nonfinite=skip)
+    trainer = Trainer(Squared(), optax.sgd(.1), key=0, tracker=sink,
+                      advanced=TrainerAdvanced(skip_nonfinite=skip))
     with pytest.raises(RuntimeError):
         trainer.fit(targets([1., 1.] + [float('nan')] * 8), steps=10, log_every=cadence)
     logged = [row for row, scalars in sink.scalars if 'train/loss' in scalars]
@@ -154,7 +154,7 @@ def test_a_run_ending_between_logs_reports_its_last_interval():
 ])
 def test_grad_norm_averages_committed_windows_only(cadence, expected):
     sink = RecordingTracker()
-    trainer = Trainer(Squared(), optax.sgd(.1), key=0, tracker=sink, update=UpdateBatch(batches=2))
+    trainer = Trainer(Squared(), optax.sgd(.1), key=0, tracker=sink, accumulation=2)
     trainer.fit(targets([1., 3., 2., 6., 1., 3.]), steps=6, log_every=cadence)
     rows = {step: values['train/grad_norm'] for step, values in sink.scalars
             if 'train/grad_norm' in values}
@@ -163,8 +163,8 @@ def test_grad_norm_averages_committed_windows_only(cadence, expected):
 
 def test_rejected_attempts_do_not_contribute_to_grad_norm():
     sink = RecordingTracker()
-    trainer = Trainer(Squared(), optax.sgd(.1), key=0, tracker=sink, update=UpdateBatch(batches=2),
-                      dynamic_scale=True)
+    trainer = Trainer(Squared(), optax.sgd(.1), key=0, tracker=sink, accumulation=2,
+                      advanced=TrainerAdvanced(dynamic_scale=True))
     trainer.fit(targets([1., float('nan'), 3., 2.]), steps=4, log_every=1)
     rows = {step: values['train/grad_norm'] for step, values in sink.scalars
             if 'train/grad_norm' in values}
@@ -223,11 +223,11 @@ def test_complex_weights_descend_and_resume_where_the_whole_run_lands(tmp_path, 
 
     target = np.array([1 + 2j, 3 + 4j], np.complex64)
     untracked = Trainer(ComplexSquared(COMPLEX_WIDTH), optax.sgd(.1), key=0,
-                        update=UpdateBatch(batches=accumulation))
+                        accumulation=accumulation)
 
     def fit(steps, target=target, directory=None, sink=None):
         trainer = untracked if directory is None and sink is None else Trainer(
-            ComplexSquared(), optax.sgd(.1), key=0, tracker=sink, update=UpdateBatch(batches=accumulation),
+            ComplexSquared(), optax.sgd(.1), key=0, tracker=sink, accumulation=accumulation,
             checkpoints=None if directory is None else Checkpoints(str(directory)))
         batch = {'target': np.broadcast_to(target, (8, len(target)))}
         data = Loader(lambda partition: Repeated(batch), None, None, 8)
@@ -276,7 +276,7 @@ def test_run_record_names_the_package_checkout_and_hardware(tmp_path, monkeypatc
 
     run = TrackedRun()
     monkeypatch.setattr(wandb, 'init', lambda **_: run)
-    config = RunConfig(trainer=TrainerConfig(name='telemetry', horizon=Horizon(steps=2),
+    config = RunConfig(trainer=TrainerConfig(name='telemetry', steps=2,
                                              checkpoint_dir=str(tmp_path), log_every=1, eval_every=None,
                                              checkpoint_every=None,
                                              wandb=Wandb('dew', 'ashishkumar4', offline=True)))
@@ -309,7 +309,7 @@ def test_a_runs_wandb_name_is_its_own_and_its_checkpoints_keep_the_runs(tmp_path
         return TrackedRun()
 
     monkeypatch.setattr(wandb, 'init', init)
-    config = RunConfig(trainer=TrainerConfig(name='kept', horizon=Horizon(steps=2),
+    config = RunConfig(trainer=TrainerConfig(name='kept', steps=2,
                                              checkpoint_dir=str(tmp_path), log_every=1, eval_every=None,
                                              checkpoint_every=None,
                                              wandb=Wandb('dew', offline=True, name=shown)))
@@ -336,7 +336,7 @@ def test_a_shared_wandb_run_opens_as_its_primary_writer_and_another_attaches_on_
         return opened[-1][1]
 
     monkeypatch.setattr(wandb, 'init', init)
-    config = RunConfig(trainer=TrainerConfig(name='shared', horizon=Horizon(steps=2),
+    config = RunConfig(trainer=TrainerConfig(name='shared', steps=2,
                                              checkpoint_dir=str(tmp_path), log_every=1, eval_every=None,
                                              checkpoint_every=None, wandb=Wandb('dew', shared=True)))
     monkeypatch.chdir(tmp_path)
@@ -382,8 +382,8 @@ def test_configured_cosine_rate_is_the_last_applied_update(every, monkeypatch):
     monkeypatch.setattr(wandb, 'init', lambda **_: run)
     schedule = Cosine(peak_value=.1, init_value=.01, end_value=.005, warmup_steps=1, every=every)
     with WandbTracker('dew', 'scheduled', offline=True) as sink:
-        trainer = Trainer(Squared(), OptimConfig(learning_rate=schedule), key=0, tracker=sink,
-                          update=UpdateBatch(batches=2))
+        trainer = Trainer(Squared(), OptimConfig(schedule=schedule), key=0, tracker=sink,
+                          accumulation=2)
         trainer.fit(targets([1.] * 16), steps=16, log_every=1)
     oracle = optax.warmup_cosine_decay_schedule(
         init_value=.01, peak_value=.1, warmup_steps=1, decay_steps=8 // every, end_value=.005)

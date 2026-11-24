@@ -11,6 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import attending
 from objective_cases import cases
 from objective_data import corpus_windows
 
@@ -26,7 +27,6 @@ from dew.objectives.lm.objective import LMObjective
 from dew.objectives.rl.grpo import GRPOObjective
 from dew.objectives.rl.preference import DPOObjective
 from dew.optim import Adam, AdamW
-from dew.training.budget import Horizon
 
 
 def tiny(**fields) -> CausalTransformer:
@@ -67,6 +67,7 @@ beyond the bare objective (its tokenizer's processor, its preview, its pretraine
 
 
 @pytest.fixture(scope="module")
+@attending("xla")
 def built_objectives(tmp_path_factory):
     """Per name, a builder of an objective and the first batch it trains on: every registered objective as
     its recipe builds it bare (`objective_cases.cases`), each run kind's as its config builds it (`run
@@ -80,7 +81,7 @@ def built_objectives(tmp_path_factory):
         # A directory of each build's own, as each run's data writes its own cache.
         configured = run_kinds.KINDS[kind](tmp_path_factory.mktemp(kind), drawn=False)
         bounded = dataclasses.replace(configured, trainer=dataclasses.replace(configured.trainer,
-                                                                              horizon=Horizon(steps=1)))
+                                                                              steps=1))
         objective = bounded.prepare().objective
         return objective, first(configured.data, objective)
 
@@ -156,6 +157,7 @@ def unvalued(objective) -> list[str]:
     return found
 
 
+@attending("xla")
 def test_every_objective_keys_every_attribute_it_holds_or_names_why_not(built_objectives):
     """Every registered objective, as its recipe builds it and as a run's config builds it
     (`built_objectives`), states a key but those that hold what states no value (`KEYLESS`), and every
@@ -199,6 +201,7 @@ def test_every_objective_keys_every_attribute_it_holds_or_names_why_not(built_ob
     assert not problems, "; ".join(f"{name} {problem}" for name, problem in problems.items())
 
 
+@attending("xla")
 def test_every_keyed_objectives_key_is_the_same_after_its_loss_is_traced_and_built_anew(built_objectives):
     """Every objective a recipe or a run's config builds (`built_objectives`) but those that state no key
     (`KEYLESS`) states one, the same once its loss and its gradient are traced (over the first batch its
@@ -242,6 +245,7 @@ run kind's as its config does (`built_objectives`), its own case each, so one th
 named by its case, and the cases share CI's groups."""
 
 
+@attending("xla")
 @pytest.mark.parametrize("name", FITTED)
 def test_every_keyed_objectives_key_is_the_same_after_a_fit_as_built_anew(built_objectives, name):
     """Every objective a recipe or a run's config builds (`built_objectives`) that states a key states the
@@ -386,7 +390,7 @@ def test_a_refit_on_a_sequence_split_mesh_reads_the_step_its_first_fit_traced():
 
     rows = {"text": np.random.default_rng(0).integers(0, 8, size=(8, 17)).astype(np.int32)}
     # The optimizer stated as a config, which keys the step.
-    optimizer = OptimConfig(optimizer=Adam(), learning_rate=1e-2)
+    optimizer = OptimConfig(optimizer=Adam(), lr=1e-2)
     trainer = Trainer(LMObjective(tiny(max_seq_len=16), 16), optimizer, key=jax.random.key(0),
                       mesh=MeshSpec(fsdp=2, sequence=2))
     fitted = []
@@ -413,7 +417,7 @@ def test_a_trainers_refit_traces_its_step_again_where_xlas_flags_change(monkeypa
     from dew.training import Trainer
 
     rows = {"text": np.random.default_rng(0).integers(0, 8, size=(8, 17)).astype(np.int32)}
-    optimizer = OptimConfig(optimizer=Adam(), learning_rate=1e-2)
+    optimizer = OptimConfig(optimizer=Adam(), lr=1e-2)
     trainer = Trainer(LMObjective(tiny(max_seq_len=16), 16), optimizer, key=jax.random.key(0))
     traced = []
     for flags in ("", "--xla_gpu_deterministic_ops=true", "--xla_gpu_deterministic_ops=true"):

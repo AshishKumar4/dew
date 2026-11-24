@@ -23,7 +23,7 @@ from dew.data.dataset import Closeable, DataPartition
 from dew.data.pipeline import Pipeline
 from dew.mesh import LayoutRefused
 from dew.objectives.base import Aux, Objective
-from dew.training import Checkpoints, Layout, Trainer, UpdateBatch
+from dew.training import Checkpoints, Layout, Trainer, TrainerAdvanced
 
 
 def fits(row) -> bool:
@@ -338,8 +338,8 @@ def test_a_run_over_phases_of_other_batches_lays_each_update_out_in_its_own_phas
                    loading=READ)
 
     def accumulating(directory):
-        return Trainer(Counted(), optax.sgd(0.1), key=jax.random.key(0), update=UpdateBatch(batches=2),
-                       layout=Layout(min_shard=1, tolerance=1.0),
+        return Trainer(Counted(), optax.sgd(0.1), key=jax.random.key(0), accumulation=2,
+                       advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)),
                        checkpoints=Checkpoints(str(directory), keep=8))
 
     whole = accumulating(tmp_path / "whole").fit(data, steps=6, log_every=100, checkpoint_every=None)
@@ -464,8 +464,10 @@ def test_a_profile_window_in_a_phase_that_reads_an_earlier_phases_batches_names_
                           DataPhase(_budget(3, 256))),
                    read="indexed", loading=READ)
     tracker = RecordingTracker()
-    Trainer(Counted(), optax.sgd(0.1), key=jax.random.key(0), layout=Layout(min_shard=1, tolerance=1.0),
-            tracker=tracker, profile=ProfileWindow(str(tmp_path / "window"), steps=1, warmup=4)).fit(
+    Trainer(Counted(), optax.sgd(0.1), key=jax.random.key(0),
+            advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0),
+                                     profile=ProfileWindow(str(tmp_path / "window"), steps=1, warmup=4)),
+            tracker=tracker).fit(
                 data, steps=6, log_every=100)
     compiled = [value for _, value in tracker.artifacts if isinstance(value, StepCompiled)]
     (window,) = [value for _, value in tracker.artifacts if isinstance(value, ProfileTraced)]

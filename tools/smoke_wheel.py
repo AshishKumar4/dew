@@ -81,9 +81,11 @@ train = TokenFiles(stores["train"]).shuffle(0).repeat().pipe(presets.token_windo
 held = TokenFiles(stores["val"]).pipe(presets.token_windows, seq_len=8, batch=4, records=4)
 data = compile(train, validation=held, read="memory", loading=Loading(workers=0, threads=1, read_buffer=2))
 model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
-                          max_seq_len=16, dtype=jnp.float32, attention_impl="xla")
-state = Trainer(LMObjective(model, seq_len=8, ema_decay=None), optax.adam(1e-2),
-                key=jax.random.key(0)).fit(data, steps=2, log_every=1)
+                          max_seq_len=16, dtype=jnp.float32)
+# On xla's attention, the run's kernel choice (`dew.kernels.use`, a model's field before row 11938).
+with dew.kernels.use(attention="xla"):
+    state = Trainer(LMObjective(model, seq_len=8, ema_decay=None), optax.adam(1e-2),
+                    key=jax.random.key(0)).fit(data, steps=2, log_every=1)
 assert int(state.step) == 2, int(state.step)
 assert all(bool(jnp.all(jnp.isfinite(leaf))) for leaf in jax.tree.leaves(state.variables["params"]))
 print("trained", int(state.step), "steps")

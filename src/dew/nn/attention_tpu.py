@@ -60,7 +60,7 @@ def tpu_attention(query, key, value, bias, mask, causal, sliding_window, *,
             "attention implementation 'tpu' takes a softcap and sinks only on "
             "the splash kernel, and this call has a bias, a mask splash cannot "
             "describe or a length that is not a multiple of "
-            f"{SPLASH_LANES}. Use attention_impl 'xla'.")
+            f"{SPLASH_LANES}. Use dew.kernels.use(attention='xla').")
 
     def local(query, key, value, bias=None, mask=None, sinks=None, segment_ids=None):
         if descriptor is None:

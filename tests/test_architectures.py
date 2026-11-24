@@ -30,6 +30,7 @@ from diffusion_support import images_of
 from flax import linen as nn
 from jepa_cases import MASK
 from map_judge import judging, sharded
+from model_support import attending
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, chain_roundings, widened
 from residual_orders import permuted, residual_width
@@ -50,7 +51,7 @@ from dew.objectives.lm import LMObjective
 from dew.registry import ModelConfig, from_record, metrics, models, to_record
 from dew.sampling import CFG, Euler
 from dew.state import TrainState
-from dew.training import Checkpoints, Layout, MeshSpec, Trainer
+from dew.training import Checkpoints, Layout, MeshSpec, Trainer, TrainerAdvanced
 from dew.training.model_flops import prepare_counts
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
@@ -143,7 +144,7 @@ def make_trainer(case: Case, tmp_path, mesh: MeshSpec, tracker=None, devices=Non
     model = models.build(case.architecture, **case.config)
     trainer = Trainer(
         make_objective(case, model, encoder), optimizer, key=jax.random.key(0),
-        mesh=mesh, layout=Layout(min_shard=TINY_SHARD),
+        mesh=mesh, advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD)),
         checkpoints=Checkpoints(str(tmp_path / f"{case.name}-fsdp{mesh.fsdp}-stage{mesh.stage}")),
         tracker=tracker)
     if devices is not None:
@@ -774,11 +775,12 @@ JSON_UNET = {"emb_features": 32, "feature_depths": [8, 16], "norm_groups": 4,
 
 def unet_run(fields):
     return DiffusionRunConfig(
-        model=ModelConfig("unet", {**fields, "dtype": "float32", "attention_impl": "reference"}),
+        model=ModelConfig("unet", {**fields, "dtype": "float32"}),
         data=images_of("tfds://oxford_flowers102", 8), text=None,
         objective=ObjectiveConfig("diffusion", {"guidance": None, "solver": Euler(), "steps": SAMPLER_STEPS}))
 
 
+@attending("reference")
 def test_a_unet_from_a_json_record_generates_what_its_value_twin_does():
     """JSON reconstruction preserves sampling with the same weights, key and `MetricConfig` validation
     metrics, while unknown metric names and unparsed string metric lists are refused."""

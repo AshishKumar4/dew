@@ -25,7 +25,6 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.activations import gelu_tanh
-from dew.nn.attention import AttentionImpl
 from dew.nn.blocks import Modulation, sinusoidal_time
 from dew.nn.dense import Dense
 from dew.nn.flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
@@ -73,7 +72,6 @@ class FluxSingleBlock(nn.Module):
     mlp_ratio: float = 4.0
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: AttentionImpl = "auto"
 
     @nn.nowrap
     def projections(self) -> dict[str, tuple[int, int]]:
@@ -103,7 +101,7 @@ class FluxSingleBlock(nn.Module):
                                dot_general=float32_dot_general)(normalized))
         attended, _ = JointAttention(
             self.heads, self.head_dim, project=False, dtype=self.dtype, precision=self.precision,
-            attention_impl=self.attention_impl, name="attn")(normalized, rotation=rotation)
+            name="attn")(normalized, rotation=rotation)
         joined = jnp.concatenate([attended, hidden], axis=-1)
         # The source calls this `proj_out` inside its own block; the tree
         # names it apart from the model's own output projection, whose two
@@ -139,7 +137,6 @@ class FluxTransformer(TextStream, nn.Module):
     axes_dims_rope: Sequence[int] = (16, 56, 56)
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: AttentionImpl = "auto"
 
     @nn.nowrap
     def image_lengths(self, sample_shape: tuple[int, ...], rows: int) -> np.ndarray:
@@ -188,13 +185,13 @@ class FluxTransformer(TextStream, nn.Module):
         """A joint block as the model runs it, named by `where` (or unbound, `parent=None`, where a FLOP
         count reads it): one factory, so the count and the execution build the same block."""
         return DoubleStreamBlock(self.features, self.heads, self.head_dim, context_first=True,
-                                 attention_impl=self.attention_impl, dtype=self.dtype,
+                                 dtype=self.dtype,
                                  precision=self.precision, **where)
 
     @nn.nowrap
     def _single(self, **where) -> FluxSingleBlock:
         """A single-stream block as the model runs it (`_double`)."""
-        return FluxSingleBlock(self.features, self.heads, self.head_dim, attention_impl=self.attention_impl,
+        return FluxSingleBlock(self.features, self.heads, self.head_dim,
                                dtype=self.dtype, precision=self.precision, **where)
 
     @nn.nowrap

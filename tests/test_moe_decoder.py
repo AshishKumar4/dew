@@ -29,7 +29,7 @@ from dew.nn.moe import SparseMLP
 from dew.objectives.lm import LMObjective
 from dew.objectives.routing import ExpertBalance
 from dew.registry import models
-from dew.training import Layout, MeshSpec, Trainer
+from dew.training import Layout, MeshSpec, Trainer, TrainerAdvanced
 
 VOCAB = 64
 SEQ_LEN = 16
@@ -120,7 +120,7 @@ def moe_trainer(expert_size, fsdp_size, tracker=None, bias=False, learning_rate=
         LMObjective(model, SEQ_LEN, balance=ExpertBalance(balance_rate=0.01) if bias else None),
         optax.adam(learning_rate), key=jax.random.key(0),
         mesh=MeshSpec(fsdp=fsdp_size, expert=expert_size),
-        layout=Layout(min_shard=TINY_SHARD), tracker=tracker)
+        advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD)), tracker=tracker)
 
 
 def run_losses(trainer, steps):
@@ -240,7 +240,7 @@ from dew.registry import models
 import dew.nn.backbones
 from dew.objectives.lm import LMObjective
 from dew.objectives.routing import ExpertBalance
-from dew.training import Trainer, MeshSpec, Layout
+from dew.training import Trainer, TrainerAdvanced, MeshSpec, Layout
 import test_moe_decoder as suite
 
 model = models.build("causal_transformer", **{{
@@ -248,7 +248,7 @@ model = models.build("causal_transformer", **{{
     "mixture": {{**suite.moe_config()["mixture"], "bias": True}}}})
 trainer = Trainer(LMObjective(model, suite.SEQ_LEN, balance=ExpertBalance(balance_rate=0.01)),
                   optax.adam(1e-3), key=jax.random.key(0),
-                  mesh=MeshSpec(), layout=Layout(min_shard=suite.TINY_SHARD))
+                  mesh=MeshSpec(), advanced=TrainerAdvanced(layout=Layout(min_shard=suite.TINY_SHARD)))
 state = trainer.fit(
     Loader(lambda partition: suite.token_batches(), None, batch=suite.BATCH, records=None), steps={steps})
 bias = state.variables["moe"]["layers_1"]["mlp"]["gate"]["e_score_correction_bias"]

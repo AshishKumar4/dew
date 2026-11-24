@@ -22,6 +22,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
+from model_support import attending
 from recording import RecordingTracker
 from reference_error import (
     as_given,
@@ -41,7 +42,7 @@ from dew.nn.mla import INDEXER, indexer_kl
 from dew.nn.sparse_selection import top_k_keys
 from dew.objectives.base import Step
 from dew.objectives.lm import IndexerTraining, LMObjective
-from dew.training import Layout, MeshSpec, Trainer
+from dew.training import Layout, MeshSpec, Trainer, TrainerAdvanced
 from tools.indexer_reference import published_inputs, published_keep
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "indexer"
@@ -149,6 +150,7 @@ def v32_block(**overrides):
     return module, block_variables(tensors), jnp.asarray(tensors["hidden"])
 
 
+@attending("reference")
 def test_an_indexer_without_a_top_k_leaves_the_attention_dense():
     """The warm-up's layer: the indexer's weights in the tree and its KL
     sown, the output the dense block's to the bit."""
@@ -161,6 +163,7 @@ def test_an_indexer_without_a_top_k_leaves_the_attention_dense():
     assert sown["indexer"]["kl"][0].shape == hidden.shape[:2]
 
 
+@attending("reference")
 def test_a_top_k_covering_the_keys_selects_the_dense_mask():
     """With the sequence inside the top-k the sparse layer attends every
     causal key, so its output and its KL are on par with the dense-indexed
@@ -524,7 +527,7 @@ def test_the_warmup_trains_through_the_trainer():
     trainer = Trainer(
         LMObjective(model, SEQ, indexer=IndexerTraining("warmup")), optax.adam(1e-2),
         key=jax.random.key(0), mesh=MeshSpec(fsdp=2),
-        layout=Layout(min_shard=TINY_SHARD), tracker=tracker)
+        advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD)), tracker=tracker)
     # The state fit starts from: the jitted init, whose initializers fuse
     # differently from an eager one at the last bit.
     initial, _, _ = trainer.place()

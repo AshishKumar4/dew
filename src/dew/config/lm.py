@@ -54,7 +54,7 @@ class ServedRollout:
     updates. A `max_lag` above 0 trains on stale rollouts, which the objective's behavior importance
     weights (the objective's `behavior_importance`). With `page_size` the server pages its cache and shares
     prompt pages, so a group's samples of one prompt prefill it once; 'whole' keeps each row's cache whole;
-    None pages it for the prompts a group's samples repeat, as `Server.from_task`'s 'shared' does."""
+    None pages it for the prompts a group's samples repeat, as a server's `PagedKV(shared=True)` does."""
 
     slots: int = 8
     ahead: int = 1
@@ -194,8 +194,8 @@ class LMRunConfig(DecoderRunConfig):
     # GPT-3 Small's (Brown et al. 2020, table 2.1 and appendix B): peak rate 6e-4, weight decay 0.1,
     # the gradient's global norm clipped at 1.0, as nanoGPT trains its 124M model.
     optim: OptimConfig = dataclasses.field(
-        default_factory=lambda: OptimConfig(learning_rate=6e-4, optimizer=AdamW(weight_decay=0.1),
-                                            clip_grads=1.0))
+        default_factory=lambda: OptimConfig(lr=6e-4, optimizer=AdamW(weight_decay=0.1),
+                                            clip=1.0))
     tokenizer: str = "byte"
     """The tokenizer the ids were written with: 'byte', or an HF tokenizer name."""
     prompt: str = ""
@@ -382,7 +382,7 @@ class LMRunConfig(DecoderRunConfig):
 
         assert self.pretrained is not None
         self.sourced_model()
-        choices = ("max_seq_len", "dtype", "attention_impl")
+        choices = ("max_seq_len", "dtype")
         overridden = sorted(set(self.model.fields) - set(choices))
         if overridden:
             raise ValueError(f"the run's model sets {overridden}, which the checkpoint at {self.pretrained} "
@@ -395,7 +395,6 @@ class LMRunConfig(DecoderRunConfig):
         # The checkpoint computes in the run's compute dtype and stores its parameters as its source
         # keywords say, by whether the run trains it.
         loaded = Pretrained.load(reference.name, dtype=jnp.dtype(self.compute_dtype()),
-                                 attention_impl=self.source_attention(),
                                  max_seq_len=reach, revision=reference.revision,
                                  # An adapter keeps its source as it is.
                                  **self.source_keywords(frozen=self.lora is not None))

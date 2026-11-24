@@ -23,6 +23,7 @@ from pathlib import Path
 
 import jax
 import pytest
+from model_support import attending
 from process_support import assert_exits_cleanly
 from reference_error import recording
 from saved_run_kinds import SAVED_KINDS, answered, trained_finite
@@ -34,7 +35,6 @@ from dew.inference.tasks import SavedRun
 from dew.interop.release import computed_in
 from dew.registry import objectives
 from dew.training import LocalTracker
-from dew.training.budget import Horizon
 
 CORPUS = Path(__file__).with_name("fixtures") / "saved_runs"
 SAVED = [(recorded.name, kind) for recorded in sorted(CORPUS.iterdir()) if recorded.is_dir()
@@ -107,6 +107,7 @@ def archived(recorded: str, kind: str) -> tarfile.TarFile:
     return tarfile.open(fileobj=io.BytesIO(stored.tobytes()), mode="r:xz")
 
 
+@attending("xla")
 def test_every_task_a_registered_objective_saves_its_runs_as_is_a_recorded_kinds(tmp_path):
     """Every kind the corpus's writer saves (`SAVED_KINDS`) has a run a main recorded (`SAVED`), and every
     task a registered objective saves its runs as (`dew.registry.objectives`' `saved_task`) is the task of
@@ -295,6 +296,7 @@ def test_a_run_an_earlier_main_saved_exports_and_loads_back_answering_as_its_run
     assert answered_alike(answers(pipeline(str(release))), answers(task.from_run(str(run))))
 
 
+@attending("xla")
 @pytest.mark.shared_setup("saved_run", by=r"[0-9a-f]{12}-[a-z0-9-]+?(?=-(?:None|another)-|$)")
 @pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
 @pytest.mark.parametrize("data_resume", ["exact", "relaxed"])
@@ -313,8 +315,8 @@ def test_an_earlier_mains_run_resumes_its_state_and_its_data_by_its_mode(
     # the checkout's root as the run that wrote it read it.
     monkeypatch.chdir(checkout_of(tmp_path, recorded))
     # A run counted in examples reads on to its bound; one counted in steps, one step more.
-    clocked = recorded_run.trainer.horizon.examples is not None
-    steps = {} if clocked else {"horizon": Horizon(steps=last + 1)}
+    clocked = recorded_run.trainer.examples is not None
+    steps = {} if clocked else {"steps": last + 1}
     trainer = dataclasses.replace(recorded_run.trainer, checkpoint_dir=str(tmp_path / "runs"), stop=None,
                                   resume="require", compilation_cache_dir=None, multi_host=False,
                                   data_resume=data_resume, **steps)
@@ -366,9 +368,9 @@ def rebuilt(tmp_path: Path, monkeypatch, recorded: str, kind: str, **stated) -> 
     with Checkpoints(str(run)) as checkpoints:
         last = checkpoints.latest
     monkeypatch.chdir(checkout_of(tmp_path, recorded))
-    clocked = recorded_run.trainer.horizon.examples is not None
+    clocked = recorded_run.trainer.examples is not None
     trainer = dataclasses.replace(recorded_run.trainer, checkpoint_dir=str(tmp_path / "runs"), stop=None,
-                                  **({} if clocked else {"horizon": Horizon(steps=last + 1)}),
+                                  **({} if clocked else {"steps": last + 1}),
                                   resume="require",
                                   compilation_cache_dir=None, multi_host=False)
     here = SAVED_KINDS[kind](tmp_path, drawn=False)
@@ -376,6 +378,7 @@ def rebuilt(tmp_path: Path, monkeypatch, recorded: str, kind: str, **stated) -> 
     return run, last, dataclasses.replace(here, trainer=trainer, **sourced, **stated)
 
 
+@attending("xla")
 @pytest.mark.shared_setup("saved_run", by=r"[0-9a-f]{12}-[a-z0-9-]+?(?=-(?:None|another)-|$)")
 @pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
 def test_a_run_an_earlier_main_saved_resumes_when_its_command_runs_again(tmp_path, monkeypatch, recorded,
@@ -393,6 +396,7 @@ def test_a_run_an_earlier_main_saved_resumes_when_its_command_runs_again(tmp_pat
 
 # The name `train` is given and the data's form are apart from each other and from the main that saved the
 # run: each main's run resumes through both forms, one under its trainer's name and one under another's.
+@attending("xla")
 @pytest.mark.shared_setup("saved_run", by=r"[0-9a-f]{12}-[a-z0-9-]+?(?=-(?:None|another)-|$)")
 @pytest.mark.parametrize(("named", "given"), [(None, "chain"), ("another", "loader")])
 @pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
@@ -431,6 +435,7 @@ def test_a_run_an_earlier_main_saved_resumes_through_its_python_train(tmp_path, 
     assert RunConfig.load(str(run)).data_plan_version == readable
 
 
+@attending("xla")
 @pytest.mark.parametrize(("landed", "version"), [(9, 9), (None, 9)])
 def test_a_run_saved_while_its_version_was_data_plan_loads_and_resumes_by_it(tmp_path, monkeypatch, landed,
                                                                              version):
@@ -474,6 +479,7 @@ jax.distributed.shutdown()
 """)
 
 
+@attending("xla")
 @pytest.mark.mesh(devices=8)
 @pytest.mark.parametrize("kind", ["decision", "decision-lettered"])
 def test_a_decision_run_this_dew_saves_resumes_when_its_command_runs_again_or_from_its_record(tmp_path,
@@ -502,7 +508,7 @@ def test_a_decision_run_this_dew_saves_resumes_when_its_command_runs_again_or_fr
         loaded = DecisionRunConfig.load(str(directory))
         assert loaded.option_text is None and loaded.resumed().option_text == written
         run = first if steps == 2 else loaded
-        trained(run, tmp_path, kind, trainer={"name": kind, "horizon": Horizon(steps=steps),
+        trained(run, tmp_path, kind, trainer={"name": kind, "steps": steps,
                                               "checkpoint_final": True})
         assert str(steps) in {path.name for path in directory.iterdir()}
         assert json.loads((directory / "run.json").read_text())["fields"]["option_text"] == written

@@ -18,10 +18,11 @@ from __future__ import annotations
 import dataclasses
 import functools
 import hashlib
+import json
 import types
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Generic, Literal, TypedDict, get_args
+from typing import Generic, Literal, TypedDict
 
 import jax
 import jax.numpy as jnp
@@ -33,7 +34,8 @@ from jax.typing import ArrayLike
 from typing_extensions import TypeVar
 
 from dew._hashing import array_fingerprint
-from dew._records import finite
+from dew._records import JSON, finite
+from dew._stated import Unestablished, stated
 from dew.batch import (
     BLOCKS_FIELD,
     VALIDITY_FIELD,
@@ -104,20 +106,8 @@ from dew.sampling.trees import TreeBlock
 
 ArrayT = TypeVar("ArrayT", bound=jax.Array | np.ndarray, default=jax.Array, covariant=True)
 
-Transforms = LogitsTransform | Sequence[LogitsTransform]
-Criteria = Stopping | Sequence[Stopping]
 Components = tuple[tuple[LogitsTransform, ...], decoding.Finishing, Strategy]
 
-# A resolved component's configuration as every process can spell it: a repr,
-# a number (an array's shape is a tuple of them), or a tuple of either nested
-# as deep as the component is. Only `repr` and `==` are applied to one, by the
-# pool agreement in `dew.nn.inputs` and by the digest that precedes it.
-type Identity = str | int | tuple[Identity, ...]
-# What carries its own qualified name, and so names a component: a class, a
-# function, a bound method, a library builtin. Anything else is named by its
-# class, which is one of these.
-type SelfNaming = type | types.FunctionType | types.MethodType | types.BuiltinFunctionType
-SELF_NAMING: tuple[type[SelfNaming], ...] = get_args(SelfNaming.__value__)
 
 
 # Transformers' `_get_logits_processor` order, by its own control names: the
@@ -154,10 +144,13 @@ class Sampling:
     policy names a ``pad_token_id``. The block and masked decoders take the
     same two names.
 
-    A ``Sampling`` value compiles to its transforms in Transformers' order
-    when a request has no explicit logits chain. An explicit chain replaces
-    those transforms. The EOS and stop-string criteria still join the
-    request's stopping criteria.
+    It is the one decoding policy a request runs (`components`): its
+    controls compile to their transforms in Transformers' order unless
+    ``logits`` holds the whole chain in the order it runs (``()`` runs
+    none), its ``stopping`` criteria run beside the EOS and stop-string ones
+    and never replace them, and its ``strategy`` is the device loop, a row's
+    own draws (``Sample``) where None. To add a transform of your own, write
+    ``logits=policy.transforms() + (mine,)``.
     """
 
     temperature: float = 1.0
@@ -173,6 +166,14 @@ class Sampling:
     min_new_tokens: int = 0
     typical_p: float = 1.0
     stop: tuple[str, ...] = ()
+    logits: tuple[LogitsTransform, ...] | None = None
+    """The whole logits chain in the order it runs, in place of the one the controls compile to
+    (`transforms`); None runs that one, and ``()`` no transform."""
+    stopping: tuple[Stopping, ...] = ()
+    """Criteria that end a row beside the policy's EOS and stop-string criteria."""
+    strategy: Strategy | None = None
+    """The device loop that draws (`dew.sampling.strategies`): a search, a speculation; None draws each
+    row's own tokens (`Sample`)."""
 
     def __post_init__(self) -> None:
         # A rate is any real number, Python's or NumPy's (a config's or a sweep's), held as a float; zero
@@ -203,6 +204,9 @@ class Sampling:
             raise ValueError("stop must hold non-empty strings")
         # A record reads a JSON list back; the policy holds a tuple.
         object.__setattr__(self, "stop", tuple(self.stop))
+        if self.logits is not None:
+            object.__setattr__(self, "logits", tuple(self.logits))
+        object.__setattr__(self, "stopping", tuple(self.stopping))
 
     @property
     def pad(self) -> int:
@@ -226,14 +230,26 @@ class Sampling:
         return () if eos is None else (eos,) if isinstance(eos, int) else tuple(eos)
 
     def transforms(self) -> tuple[LogitsTransform, ...]:
-        """Return the full default chain that a request without explicit transforms runs.
+        """Return the chain the controls compile to, which a policy whose `logits` is None runs.
 
         At zero temperature the chain ends in the argmax and runs none of the
-        sampling-only filters, as Transformers does with `do_sample=False`.
-        To add a transform of your own, pass
-        `logits=policy.transforms() + (mine,)`.
+        sampling-only filters, as Transformers does with `do_sample=False`; a
+        search reparenting its rows (`Regrouping`: `Beam`) picks its own
+        continuations, so its chain ends after the processors, as a source's
+        beams read back (`dew.interop.generation_config.source_decoding`).
+        To add a transform of your own, write
+        `replace(policy, logits=policy.transforms() + (mine,))`.
         """
-        return ordered_transforms(self)
+        return ordered_transforms(self, searching=isinstance(self.strategy, Regrouping))
+
+    def components(self) -> Components:
+        """The one chain, criterion and strategy a request under this policy runs: its `logits` or the
+        chain its controls compile to (`transforms`), its `stopping` criteria composed with its EOS
+        criterion (`criteria`), never replaced by them, so naming a criterion cannot drop termination,
+        and its `strategy`, `Sample` where None."""
+        transforms = self.transforms() if self.logits is None else self.logits
+        return (decoding.components(transforms), decoding.Finishing.of((*self.stopping, *self.criteria())),
+                Sample() if self.strategy is None else strategies.as_pytree(self.strategy))
 
     def criteria(self) -> tuple[Stopping, ...]:
         """Return the EOS criterion this policy adds after a caller's criteria, empty when it names no EOS."""
@@ -241,16 +257,18 @@ class Sampling:
             return ()
         return (EndOfSequence(jnp.asarray(self.eos_token_ids, jnp.int32)),)
 
-
-def with_ids_of(policy: Sampling, defaults: Sampling) -> Sampling:
-    """Return `policy` with the EOS and pad ids it leaves None taken from `defaults`.
-
-    A task's policy holds its model's and tokenizer's ids, so a call that
-    replaces the policy keeps stopping and padding where the task does.
-    """
-    return replace(policy, eos_token_ids=(defaults.eos_token_ids if policy.eos_token_ids is None
-                                          else policy.eos_token_ids),
-                   pad_token_id=defaults.pad_token_id if policy.pad_token_id is None else policy.pad_token_id)
+    def with_defaults_of(self, defaults: Sampling) -> Sampling:
+        """This policy, a call's, over `defaults`, the policy of what it calls (a task's, a source's): the
+        one rule by which a call's sampling replaces another's. What it leaves at its default it takes from
+        `defaults`: its EOS and pad ids (None), which belong to the model and its tokenizer, its stopping
+        criteria (none) and its strategy (None), which a task binds (a grammar, a beam search, a
+        speculation); every control it names, its logits chain among them, is its own (Train 1208's review
+        F1: a call's sampling dropped its task's criteria and strategy)."""
+        return replace(self, eos_token_ids=defaults.eos_token_ids if self.eos_token_ids is None
+                       else self.eos_token_ids,
+                       pad_token_id=defaults.pad_token_id if self.pad_token_id is None else self.pad_token_id,
+                       stopping=self.stopping or defaults.stopping,
+                       strategy=defaults.strategy if self.strategy is None else self.strategy)
 
 
 def ordered_transforms(policy: Sampling, extra: Mapping[str, LogitsTransform] = types.MappingProxyType({}),
@@ -901,86 +919,25 @@ def _validated(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
     return prepared
 
 
-def resolve(sampling: Sampling, logits: Transforms | None, stopping: Criteria | None,
-            strategy: Strategy | None) -> Components:
-    """The one chain, criterion and strategy a request runs.
+def _stable(components: Components, arrays: Mapping[int, JSON]) -> str:
+    """Resolved components' configuration as text every process states alike (`dew._stated.stated`): a
+    class or a module's function by its name, a function of the user's own or one no module holds by its
+    code and everything it reads, its globals among them, a dataclass by its type and fields, a mapping's
+    pairs in the order it holds them, which a trace may read, and each array a component holds by its
+    fingerprint (`arrays`, by its `id`, `_digest`'s one walk of the leaves). Two ranks
+    holding different code under one name, or one mapping in two orders, state two texts (the audit's row
+    12171: a name and its captured cells, a mapping sorted, agreed where the ranks' policies did not).
 
-    `logits=None` runs the policy's own filtering tail. An explicit sequence
-    is the whole chain instead, in the order given, so a caller that needs a
-    different order than `Sampling` produces writes the order it wants, and
-    `()` runs no transform at all.
-
-    Criteria always compose: an explicit sequence runs alongside the policy's
-    EOS criterion rather than replacing it, so naming a criterion cannot drop
-    termination by accident. No strategy means `Sample`.
-    """
-    transforms = sampling.transforms() if logits is None else logits
-    given = () if stopping is None else tuple(stopping) if isinstance(stopping, Sequence) else (stopping,)
-    return (decoding.components(transforms), decoding.Finishing.of((*given, *sampling.criteria())),
-            Sample() if strategy is None else strategies.as_pytree(strategy))
-
-
-def _named(value: SelfNaming) -> str:
-    """A component's identity, the same string in every process.
-
-    A repr would carry the object's address, and two processes that resolved
-    the same chain would then look like they disagreed.
-    """
-    return f"{value.__module__}.{value.__qualname__}"
-
-
-def _stable(value: object, seen: frozenset[int] = frozenset()) -> Identity:
-    """A component's configuration as something every process can compare.
-
-    The description reaches every part a rank could differ in: a dataclass's
-    fields including its array shapes, a partial's function and bound
-    arguments, and a function's captured cells and defaults. A name alone is
-    not enough, because two ranks can hold the same nested function closed
-    over different values. Module-level helpers and library references keep
-    working, since globals are not captured cells.
-
-    Anything whose text carries an address cannot be compared across
-    processes, so it is refused here rather than after the ranks have entered
-    different device loops.
-    """
-    if isinstance(value, (bool, int, float, complex, str, bytes)) or value is None:
-        return repr(value)
-    if id(value) in seen:
-        return "cycle"
-    seen = seen | {id(value)}
-    if isinstance(value, (tuple, list)):
-        return ("sequence", tuple(_stable(entry, seen) for entry in value))
-    if isinstance(value, Mapping):
-        return ("mapping", tuple(sorted((repr(name), _stable(entry, seen))
-                                        for name, entry in value.items())))
-    if isinstance(value, (np.ndarray, np.generic, jax.Array)):
-        return ("array", _hashed(value))
-    if isinstance(value, functools.partial):
-        return ("partial", _stable(value.func, seen), _stable(value.args, seen),
-                _stable(dict(value.keywords), seen))
-    if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return (_named(type(value)), *tuple(
-            (field.name, _stable(getattr(value, field.name), seen))
-            for field in dataclasses.fields(value)))
-    if isinstance(value, types.FunctionType):
-        cells = []
-        for cell in value.__closure__ or ():
-            try:
-                captured = cell.cell_contents
-            except ValueError:
-                cells.append("empty")
-                continue
-            cells.append(_stable(captured, seen))
-        return ("function", _named(value), tuple(cells), _stable(value.__defaults__ or (), seen),
-                _stable(value.__kwdefaults__ or {}, seen))
-    kind = value if isinstance(value, SELF_NAMING) else type(value)
-    text = repr(value)
-    if "0x" in text:
-        raise ValueError(
-            f"a decoding component holds {_named(kind)}, whose identity is this process's "
-            "memory address; give the configuration as arrays or plain values so a pool can "
-            "agree on it")
-    return (_named(kind), text)
+    A component with no form a statement holds (an object whose text is its address) is refused here, with
+    the rest, rather than after the ranks have entered different device loops. An installed plugin's code
+    (a distribution's outside Dew's own dependencies) is walked as the user's own is (`stated`'s
+    `installed`): the data its modules hold that it reads, which a process may set apart, is in the text
+    (the models review: a plugin named alone agreed at two biases)."""
+    try:
+        return json.dumps(stated(components, "a decoding component", arrays, installed=True))
+    except Unestablished as refused:
+        raise ValueError(f"{refused}; give the configuration as arrays, plain values, dataclasses or "
+                         "functions so a pool can agree on it") from refused
 
 
 def _hashed(value: np.ndarray | np.generic | jax.Array) -> str:
@@ -990,7 +947,13 @@ def _hashed(value: np.ndarray | np.generic | jax.Array) -> str:
     return digest.hexdigest()
 
 
-def _digest(components: Components) -> tuple[Identity, str]:
+def policy_identity(policy: Sampling) -> str:
+    """`policy` as text every process states alike: its components' configuration and arrays (`_digest`), a
+    function by what it is and holds, never by its address, which differs across processes."""
+    return repr(_digest(policy.components()))
+
+
+def _digest(components: Components) -> tuple[str, str]:
     """Resolved components as a value every process can compare.
 
     The configuration arrays are part of the identity: two processes holding
@@ -1000,15 +963,21 @@ def _digest(components: Components) -> tuple[Identity, str]:
     changes the digest too, and an array a plain function captured is covered
     by the description even though no pytree leaf holds it.
     """
+    leaves = jax.tree.leaves(components)
+    # Each leaf fingerprinted once, for the payload and the configuration's arrays alike (the models review).
+    hashed = {id(leaf): _hashed(leaf) for leaf in leaves}
     payload = hashlib.sha256()
-    for leaf in jax.tree.leaves(components):
-        payload.update(repr(_hashed(leaf)).encode())
-    return (_stable(components), payload.hexdigest())
+    for leaf in leaves:
+        payload.update(repr(hashed[id(leaf)]).encode())
+    # The statement reads the arrays of this one walk, never another's: a pytree whose flatten makes its
+    # leaves afresh hands a second walk arrays this one never saw (the models review).
+    arrays: dict[int, JSON] = {id(leaf): ["array", hashed[id(leaf)]] for leaf in leaves
+                               if isinstance(leaf, (np.ndarray, np.generic, jax.Array))}
+    return (_stable(components, arrays), payload.hexdigest())
 
 
 def _check(model: nn.Module, params: Variables, inputs: ModelInputs, max_new_tokens: int, trips: int,
-           sampling: Sampling, n: int, logits: Transforms | None, stopping: Criteria | None,
-           strategy: Strategy | None, prefix: int | Literal["prompt"] | None,
+           sampling: Sampling, n: int, prefix: int | Literal["prompt"] | None,
            pooled: bool) -> tuple[ModelInputs, tuple, Components]:
     """This process's validated request, the controls a pool compares, and
     the decoding components.
@@ -1034,7 +1003,7 @@ def _check(model: nn.Module, params: Variables, inputs: ModelInputs, max_new_tok
     if trips < max_new_tokens:
         raise ValueError(f"trips must cover the budget of {max_new_tokens} tokens, got {trips}")
     prepared = _validated(model, ids, fields, conditioning, trips, sampling, n)
-    components = resolve(sampling, logits, stopping, strategy)
+    components = sampling.components()
     refuse_redrawn(model, components[2])
     controls = (max_new_tokens, trips, n, sampling.pad) + ((_digest(components),) if pooled else ())
     return prepared, controls, components
@@ -1076,10 +1045,8 @@ _DEFAULT_SAMPLING = Sampling()
 def generate(model: nn.Module, params: Variables,
              inputs: ModelInputs | ArrayLike | Sequence[Sequence[int]], max_new_tokens: int,
              *, key: int | jax.Array,
-             sampling: Sampling = _DEFAULT_SAMPLING, n: int = 1, logits: Transforms | None = None,
-             stopping: Criteria | None = None, strategy: Strategy | None = None,
-             trips: int | None = None, prefix: int | Literal["prompt"] | None = None,
-             progress: Progress = END) -> Generation:
+             sampling: Sampling = _DEFAULT_SAMPLING, n: int = 1, trips: int | None = None,
+             prefix: int | Literal["prompt"] | None = None, progress: Progress = END) -> Generation:
     """Generate continuations from model inputs, or from token ids for a text-only prompt.
 
     ``params`` is the full variables dict, ``{'params': ...}``.
@@ -1107,11 +1074,9 @@ def generate(model: nn.Module, params: Variables,
     zero of a prompt draws with that prompt's own key, so ``n=1`` and
     continuation zero of any larger request are the same draw.
 
-    ``logits`` is the whole transform chain, in the order it runs. ``None``
-    means the chain ``sampling`` compiles to, and ``()`` runs no transform.
-    ``stopping`` adds criteria beside the policy's EOS criterion and never
-    replaces it. ``strategy`` replaces the per-row draw loop; ``None`` uses
-    ``Sample``. A strategy that reparents its rows (``Regrouping``: ``Beam``)
+    ``sampling`` is the request's one decoding policy: its chain, its
+    criteria beside its EOS one and its strategy (``Sampling.components``).
+    A strategy that reparents its rows (``Regrouping``: ``Beam``)
     decodes over the model's cache as ``regrouped_layout`` lays it: an
     undivided paged pool keeps its pages, sized for the search, each
     regrouped row sharing its parent's written pages, so a prompt is held
@@ -1142,15 +1107,16 @@ def generate(model: nn.Module, params: Variables,
     if sampling.stop:
         raise ValueError("stop strings compile against a tokenizer's vocabulary, which generate does not "
                          "have; generate through a TextGeneration with a processor, or pass "
-                         "stopping=(decoding.stop_strings(tokenizer, strings, vocab_size),)")
+                         "Sampling(stopping=(decoding.stop_strings(tokenizer, strings, vocab_size),))")
     scanned = max_new_tokens if trips is None else trips
     request, components = Request.prepare(
         inputs, key, mesh_of(params),
         lambda canonical, pooled: _check(model, params, canonical, max_new_tokens, scanned, sampling, n,
-                                         logits, stopping, strategy, prefix, pooled),
+                                         prefix, pooled),
         phase="generation")
     plan = request.plan
     capacity = model.max_seq_len if isinstance(model, Bounded) else None
+    strategy = sampling.strategy
     if isinstance(strategy, Regrouping) and isinstance(model, Layered) and capacity is not None:
         # A search reparenting its rows, its pool sized for them, or unpaged where groups split it.
         prompt = request.inputs.tokens.shape[1]

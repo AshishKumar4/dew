@@ -143,7 +143,12 @@ def import_path(member: Importable) -> str:
 
     A lambda, a function defined inside another, or anything defined in
     `__main__` has no path another process can import, so it is refused here,
-    where the record is written, rather than when it is read."""
+    where the record is written, rather than when it is read; as is a method
+    bound to an instance, whose receiver a path does not name (a reload would
+    import its unbound function: the API02 review)."""
+    if isinstance(member, types.MethodType) and not isinstance(member.__self__, type):
+        raise Unrecordable(f"{member!r} is bound to an instance its path cannot name; record a function, a "
+                           "class or a dataclass that holds what it reads")
     function = member.__func__ if isinstance(member, types.MethodType) else member
     module, name = function.__module__, function.__qualname__
     if not module or module == "__main__" or "<" in name:
@@ -422,13 +427,38 @@ class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
 
     @property
     def subcommands(self) -> Annotation:
-        """The members' union with each subcommand named as the kind names it
-        ("data:text"), rather than by its class."""
+        """The members' union with each subcommand named as the kind names it, hyphenated as a flag is
+        (`optim.optimizer:gauss-newton`),
+        rather than by its class, a subclass's before its base's: tyro chooses a default's subcommand as the
+        first member it is an instance of, an AdamW's its own and not an Adam's."""
         # The special form subscripted at runtime, where each member is a value rather than a
         # type expression, which a type checker reads `typing.Annotated[...]` as.
         annotated = vars(typing)["Annotated"]
-        members = (annotated[self[name], tyro.conf.subcommand(name)] for name in self)
+        names = sorted(self, key=lambda name: -len(kind.__mro__) if isinstance(kind := self[name], type)
+                       else 0)
+        members = (annotated[self[name], tyro.conf.subcommand(name.replace("_", "-"))] for name in names)
         return functools.reduce(operator.or_, members)
+
+    def flag_choices(self, record: type[Registered]) -> Callable[[], type]:
+        """The members' records (`record`, this kind's `Registered` class) as a command line chooses them
+        (`record_flags`): a subcommand an alias (`env:flight`), its arguments plain flags, made when a
+        command line is parsed (`tyro.conf.arg(constructor_factory=...)`), one class's first alias alone,
+        a subclass's before its base's (tyro reads a union's first member a default is an instance of)."""
+
+        def choices() -> type:
+            # A union of the subcommands' annotated records, which tyro's `constructor_factory` takes where
+            # its stubs say a type (`typing.Annotated` read by name, as tyro reads it).
+            annotated = vars(typing)["Annotated"]
+            named: dict[str, str] = {}
+            for alias in self:
+                named.setdefault(self.paths[alias], alias)
+            members = [(self[alias], path, alias) for path, alias in named.items()]
+            members.sort(key=lambda each: -len(each[0].__mro__) if isinstance(each[0], type) else 0)
+            return functools.reduce(operator.or_, (annotated[record_flags(record, member, path, alias),
+                                                             tyro.conf.subcommand(alias.replace("_", "-"))]
+                                                   for member, path, alias in members))
+
+        return choices
 
 
 def declared_type(member: type, field: str) -> Annotation:
@@ -458,9 +488,13 @@ def resolve_alias(annotation: Annotation) -> Annotation:
 
 
 def _union_members(annotation: Annotation) -> tuple[Annotation, ...]:
+    """A union's members, aliases within it expanded and each member once, by identity, however many of
+    its aliases name it (`Stops | Pause` where `Stops` holds `Pause`)."""
     annotation = resolve_alias(annotation)
     if typing.get_origin(annotation) in (Union, types.UnionType):
-        return tuple(inner for member in typing.get_args(annotation) for inner in _union_members(member))
+        expanded = [inner for member in typing.get_args(annotation) for inner in _union_members(member)]
+        return tuple(member for index, member in enumerate(expanded)
+                     if not any(member is earlier for earlier in expanded[:index]))
     if typing.get_origin(annotation) is typing.Annotated:
         return _union_members(typing.get_args(annotation)[0])
     return (annotation,)
@@ -550,6 +584,9 @@ def to_record(value, annotation) -> JSON:
 
     from dew._records import recorded_duration
 
+    if isinstance(value, Registered) and "_alias" in vars(type(value)):
+        # A command line's subcommand (`record_flags`) is the record it makes, its base's.
+        value = value.recorded()
     if isinstance(value, datetime.timedelta):
         try:
             return recorded_duration(value)
@@ -697,6 +734,67 @@ def _admits_function(annotation: Annotation) -> bool:
     return True
 
 
+def _unnamed(annotation: Annotation, classes: tuple[type, ...], value: Mapping, *,
+             dtypes: bool) -> Configured:
+    """A mapping naming no class (`class_record`) for a field of a union declaring no mapping (`_rebuilt`):
+    the record of the one dataclass of the union that reads it as its record (`_holds_record`: its keys
+    fields the class records, its required fields among them) and builds from it, its own checks passing
+    (a scaling's `rope_type`), as a field of the class reads it (row 11980: `TrainerConfig.stop`, a Pause
+    or a Plateau, given `{"fraction": 0.5}` held a dict, and the run never paused; a saved decoder's
+    `rope_scaling={"rope_type": "yarn", "factor": 4.0}` is a `YarnScaling`); refused where several
+    classes build from it, as nothing says which it is, or none does. A mapping no class reads as its
+    record stays as written, a source's own record its field reads."""
+    fitting = [member for member in classes if member is not object and _holds_record(member, value)]
+    if not fitting:
+        return configured(value)
+    built = []
+    shared = _READING.get()
+    # Each trial from the shared modules as they stood before any (`before`), its own kept beside what it
+    # built: the read keeps the one trial that builds, no other trial's, a refused or an ambiguous one's
+    # neither (the API02 review: a trial read the shared modules another had built).
+    before = None if shared is None else (dict(shared.built), dict(shared.sources))
+    for member in fitting:
+        # A class whose own check refuses the record (a scaling's `rope_type` another's) is not its class.
+        if shared is not None and before is not None:
+            shared.built, shared.sources = dict(before[0]), dict(before[1])
+        try:
+            made = _construct(member, value, dtypes=dtypes)
+        except ValueError:
+            if len(fitting) == 1:
+                raise
+            continue
+        built.append((made, None if shared is None else (shared.built, shared.sources)))
+    if shared is not None and before is not None:
+        kept = built[0][1] if len(built) == 1 else None
+        shared.built, shared.sources = kept if kept is not None else before
+    if len(built) == 1:
+        return built[0][0]
+    names = ", ".join(f"{member.__module__}:{member.__qualname__}" for member in fitting)
+    if not built:
+        raise ValueError(f"{annotation} declares {names}, each refusing {value!r} as its record")
+    raise ValueError(f"{annotation} declares {names}, each of whose fields hold {sorted(value)}: write the "
+                     f"class record {{'class': ..., 'fields': {{...}}}} that names one")
+
+
+def _holds_record(member: type, value: Mapping) -> bool:
+    """Whether the dataclass `member` reads `value` as its record (`_declared`): its every key a field the
+    class records, its every required field among them."""
+    if not dataclasses.is_dataclass(member):
+        return False
+    names, required = _record_fields(member)
+    return set(value) <= set(names) and set(required) <= set(value)
+
+
+def _record_fields(member: type) -> tuple[list[str], list[str]]:
+    """The fields the dataclass `member`'s record holds, and those of them it must (no default): a field
+    marked `metadata={"record": False}` is a binding the value picks up at runtime, not something a record
+    carries."""
+    declared = [field for field in dataclasses.fields(member) if _recorded(field)]
+    required = [field.name for field in declared
+                if field.default is dataclasses.MISSING and field.default_factory is dataclasses.MISSING]
+    return sorted(field.name for field in declared), required
+
+
 def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str = "") -> Configured:
     """Return `value` as its annotation asks for it: a record becomes the value it
     describes, and anything already built is left alone.
@@ -758,6 +856,8 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
         if isinstance(value, list) and len(sequences) == 1:
             # A record's list is the union's one sequence member (`Files.url: str | tuple[str, ...]`).
             return _rebuilt(sequences[0], value, dtypes=dtypes)
+        if isinstance(value, Mapping) and not mappings:
+            return _unnamed(annotation, classes, value, dtypes=dtypes)
         return configured(value)
     if isinstance(value, Mapping):
         if typing.get_origin(annotation) is Callable or annotation is Callable:
@@ -781,6 +881,8 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
             if named is not None:
                 return _built(_member(named[0], (nominal,)), named[1], dtypes=dtypes)
             if dataclasses.is_dataclass(nominal):
+                # A record reads as its kind's own class: a command line's subcommands are its parser's
+                # alone (`RunConfig.cli`, `Registered.flagged`), so a run saved and read back is the run.
                 return _construct(nominal, value, dtypes=dtypes)
         if typing.get_origin(annotation) in _MAPPINGS:
             keys, entries = typing.get_args(annotation)
@@ -968,7 +1070,7 @@ def _shared(annotation: Annotation, value: Mapping[str, object], *, dtypes: bool
     if "share" in value:
         source = value
     elif number in shared.built:
-        return shared.built[number]
+        return _declared_as(annotation, shared.built[number], number)
     else:
         found = shared.candidates.get(number, [])
         if len(found) != 1:
@@ -978,12 +1080,30 @@ def _shared(annotation: Annotation, value: Mapping[str, object], *, dtypes: bool
     if number in shared.built:
         if shared.sources[number] != source:
             raise ValueError(f"the record defines its shared module {number} twice")
-        return shared.built[number]
+        return _declared_as(annotation, shared.built[number], number)
     shared.sources[number] = source
     shared.built[number] = _rebuilt(annotation, {str(key): entry for key, entry in source.items()
                                                  if key != "share"}, dtypes=dtypes)
     return shared.built[number]
 
+
+def _declared_as(annotation: Annotation, built: Configured, number: int) -> Configured:
+    """`built`, the shared module `number` read before, where the field reading it again declares it
+    (`annotation`'s class, or one of its union's); refused where it declares only classes it is none of, so
+    a union's trial whose field declares another kind refuses the record as a module built for it would
+    (the API02 review: a module built for one field read as another's, and two trials built)."""
+    members = (_union_members(annotation) if typing.get_origin(annotation) in (Union, types.UnionType)
+               else (resolve_alias(annotation),))
+    declared = [member for member in members if member is not type(None)]
+    if any(member is typing.Any or member is object for member in declared):
+        return built
+    # A parameterized class (`Sequence[Module]`) by its class (`typing.get_origin`), as `isinstance` reads it.
+    nominal = [typing.get_origin(member) or member for member in declared]
+    classes = tuple(member for member in nominal if isinstance(member, type) and not is_protocol(member))
+    if declared and len(classes) == len(declared) and not isinstance(built, classes):
+        raise ValueError(f"the shared module {number} is a {type(built).__qualname__}, which the field "
+                         f"reading it again ({annotation}) does not declare")
+    return built
 
 def component[Base](base: type[Base], record: Mapping[str, object]
                     ) -> tuple[type[Base], Mapping[str, object]]:
@@ -1132,11 +1252,9 @@ def _declared(member: type, fields: Mapping[str, object], *, dtypes: bool) -> Ma
     field `member` does not declare, or a required one the record lacks,
     raises. A field marked `metadata={"record": False}` is a binding the
     value picks up at runtime, not something a record carries."""
-    declared = [f for f in dataclasses.fields(member) if _recorded(f)]
-    names = sorted(f.name for f in declared)
+    names, required = _record_fields(member)
     unknown = sorted(set(fields) - set(names))
-    missing = [f.name for f in declared if f.name not in fields
-               and f.default is dataclasses.MISSING and f.default_factory is dataclasses.MISSING]
+    missing = [name for name in required if name not in fields]
     if unknown or missing:
         raise ValueError(f"{member.__name__} does not match the record: unknown fields {unknown}, "
                          f"missing fields {missing}; its fields are {names}")
@@ -1814,6 +1932,12 @@ class Registered(ABC):
     one a record lacks, as an argument the class has since gained, takes the class's default now."""
 
     _recorded: ClassVar[bool] = True
+    _aliases: ClassVar[Aliases | None] = None
+    _flags: ClassVar[Mapping[str, Annotation]] = {}
+    """A command line's subcommand's flags (`record_flags`), each by its flat annotation (`_flat`); none on
+    a record of no subcommand."""
+    """The kind's aliases (`envs`), which name its command line's subcommands (`flagged`); None for a kind
+    no command line chooses."""
 
     @staticmethod
     @abstractmethod
@@ -1838,14 +1962,43 @@ class Registered(ABC):
         """The arguments the class is built from, before those the caller derives (`built_arguments`)."""
         return built_arguments(self.member, self.fields, self.defaults)
 
+    def recorded(self) -> Registered:
+        """This record as its kind's own class holds it, where it is a command line's subcommand
+        (`record_flags`): its name, fields, defaults and settings, the flags its fields already hold; itself
+        otherwise. What a run's record writes (`to_record`)."""
+        if "_alias" not in vars(type(self)):
+            return self
+        base = type(self).__mro__[1]
+        return base(**{field.name: vars(self)[field.name] for field in dataclasses.fields(base)})
+
+    def flagged(self) -> Self:
+        """This record as its command line's subcommand holds it (`record_flags`, `Aliases.flag_choices`): a
+        field a plain flag holds as that flag, the rest, a record's, kept as they are, its other settings as
+        they are; itself where its kind names no aliases or none names its class (a command line chooses
+        none such), or where it is already such a subcommand's."""
+        aliases = self._aliases
+        named = {} if aliases is None else {aliases.paths[alias]: alias for alias in reversed(list(aliases))}
+        if self.name not in named or "_alias" in vars(type(self)):
+            return self
+        made = record_flags(type(self), self.member, self.name, named[self.name])
+        own = {each.name for each in dataclasses.fields(type(self))}
+        held = {name: value for name, value in self.fields.items()
+                if name in made._flags and _fits(json_value(value, name), made._flags[name])}
+        settings = {name: vars(self)[name] for name in own if name not in ("name", "fields")}
+        rest = {name: value for name, value in self.fields.items() if name not in held}
+        # Its flags and settings stated over the subcommand's defaults, its `fields` the rest (its
+        # `__post_init__` adding the flags set apart from their defaults).
+        return dataclasses.replace(made(self.name, fields=rest), **settings, **held)
+
 
 @dataclasses.dataclass(frozen=True)
 class ModelConfig(Registered):
     """A model's class and the fields the run gives it.
 
     `name` is an alias or an import path, held as the path. `fields` are the
-    class's own fields, its compute and storage dtypes, attention kernel and
-    matmul precision included, which the command line sets one flag each
+    class's own fields, its compute and storage dtypes and matmul precision
+    included (its attention kernel is the run's, `Diagnostics.kernels`, since
+    row 11938), which the command line sets one flag each
     (`RunConfig.cli`); a recipe fills the ones it derives from its data in
     `build`. `defaults` holds every other field the class defaults, as it
     defaulted them when the run was first recorded, so the record builds the
@@ -1899,6 +2052,100 @@ class ModelConfig(Registered):
         for wrapper in self.wrappers:
             model = wrapper.apply(model)
         return model
+
+
+_PLAIN = (int, float, str, bool)
+"""The values a command line sets a model's field to by a plain flag (`_flat`)."""
+
+
+def _flat(annotation: Annotation) -> Annotation | None:
+    """The part of a field's `annotation` a command line sets by a plain value (`_PLAIN`, a `Literal` of
+    them, a tuple of them, None): a union's such members, its others (a record, a module) left to the
+    record; None where no member but None is one."""
+    origin = typing.get_origin(annotation)
+    if origin is Annotated:
+        return _flat(typing.get_args(annotation)[0])
+    if annotation in _PLAIN or annotation is type(None):
+        return annotation
+    if origin is Literal:
+        return annotation if all(isinstance(each, _PLAIN) for each in typing.get_args(annotation)) else None
+    if origin is tuple:
+        parts = typing.get_args(annotation)
+        return annotation if parts and all(part is Ellipsis or part in _PLAIN for part in parts) else None
+    if origin in (Union, types.UnionType):
+        kept = [part for member in typing.get_args(annotation) if (part := _flat(member)) is not None]
+        return functools.reduce(operator.or_, kept) if any(part is not type(None) for part in kept) else None
+    return None
+
+
+def _fits(value: Configured, annotation: Annotation) -> bool:
+    """Whether `value` is one a flag of the flat `annotation` (`_flat`) holds."""
+    origin = typing.get_origin(annotation)
+    if origin in (Union, types.UnionType):
+        return any(_fits(value, member) for member in typing.get_args(annotation))
+    if origin is Literal:
+        return any(value == each and type(value) is type(each) for each in typing.get_args(annotation))
+    if origin is tuple:
+        if not isinstance(value, tuple):
+            return False
+        parts = typing.get_args(annotation)
+        kinds = parts[:1] * len(value) if len(parts) == 2 and parts[1] is Ellipsis else parts
+        return len(value) == len(kinds) and all(_fits(each, kind)
+                                                for each, kind in zip(value, kinds, strict=True))
+    if annotation is type(None):
+        return value is None
+    return type(value) is annotation or (annotation is float and type(value) is int)
+
+
+@functools.cache
+def record_flags[R: Registered](record: type[R], member: type | Callable[..., Configured], path: str,
+                 alias: str) -> type[R]:
+    """`member`'s record (`record`, a `Registered` kind's) as a command line sets it (api03): a subclass whose
+    own fields are the member's arguments a plain flag sets (`_flat`; one the run builds, an object, takes
+    none), each defaulting to the member's default (None where it states none a flag holds, which leaves
+    the member's), the record's `name`, `fields` and `defaults` hidden from the command line and its other
+    settings flags as the record declares them; its `fields` the flags set apart from their defaults, over
+    any it was given. Its `_alias` names the subcommand it is (`implied_subcommand`)."""
+    reserved = {field.name for field in dataclasses.fields(record)} | set(dir(record))
+    # Each flag's annotation, `make_dataclass`'s field type, and its flat part (`_flat`), which `flagged`
+    # reads a value by.
+    flags = []
+    flats: dict[str, Annotation] = {}
+    stated_defaults: dict[str, Configured] = {}
+    for name, declared, annotation in member_fields(member):
+        flat = None if annotation is None or name in reserved else _flat(annotation)
+        if flat is None:
+            continue
+        held = declared is not dataclasses.MISSING and _fits(declared, flat)
+        default = declared if held else None
+        flats[name], stated_defaults[name] = flat, default
+        flags.append((name, flat if held else flat | None, dataclasses.field(default=default)))
+    suppressed = [("name", tyro.conf.Suppress[str], dataclasses.field(default=path)),
+                  ("fields", tyro.conf.Suppress[JsonDict], dataclasses.field(default_factory=dict)),
+                  ("defaults", tyro.conf.Suppress[JsonRecords], dataclasses.field(default_factory=dict))]
+
+    def __post_init__(self) -> None:
+        given = {name: vars(self)[name] for name in stated_defaults
+                 if vars(self)[name] != stated_defaults[name]}
+        object.__setattr__(self, "name", path)
+        object.__setattr__(self, "fields", {**self.fields, **given})
+        record.__post_init__(self)
+
+    namespace = {"__post_init__": __post_init__, "__module__": __name__, "_alias": alias.replace("_", "-"),
+                 "_flags": flats, "__doc__": (member.__doc__ or "").split("\n\n")[0]}
+    title = "".join(part.title() for part in alias.split("_"))
+    made = dataclasses.make_dataclass(f"{record.__name__}{title}", [*suppressed, *flags], bases=(record,),
+                                      frozen=True, namespace=namespace)
+    if not issubclass(made, record):
+        raise TypeError(f"{made.__name__} is no {record.__name__}")
+    return made
+
+
+def implied_subcommand(default: Configured) -> str | None:
+    """The subcommand a field's `default` is (`record_flags`'s `_alias`: `env:flight`), which a flag of the
+    field given without one implies; None for any other default."""
+    return vars(type(default)).get("_alias") if isinstance(default, Registered) else None
+
 
 
 def member_fields(member: type | Callable[..., Configured]) -> Iterator[tuple[str, Configured, Annotation]]:

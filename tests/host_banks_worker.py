@@ -19,6 +19,8 @@ from pathlib import Path
 from flax import linen as nn
 from process_support import serve_mode, worker_parser
 
+from dew.training import TrainerAdvanced
+
 VOCAB = 32
 SEQ_LEN = 8
 PROMPT = 5
@@ -89,8 +91,7 @@ def banked(args) -> dict:
     mesh = MeshSpec(fsdp=args.fsdp_size, tensor=args.tensor_size)
     resident_layout, host_layout = layouts(args.tensor_size)
     plain = models.build("causal_transformer", **FIELDS)
-    scanned = models.build("causal_transformer", **FIELDS, scan_layers=True,
-                           bank_layers=args.bank_layers)
+    scanned = models.build("causal_transformer", **FIELDS, bank_layers=args.bank_layers)
     tokens = jnp.asarray(
         np.random.default_rng(0).integers(1, VOCAB, size=(jax.device_count(), PROMPT)),
         jnp.int32)
@@ -132,21 +133,25 @@ def _checkpointed(args, scanned, plain, tokens, mesh, resident_layout, host_layo
     import optax
 
     from dew.checkpoints import Checkpoints
+    from dew.distributed.batches import shard_batch
     from dew.inference.banks import CheckpointBanks
+    from dew.nn.kernels import generation
     from dew.objectives.lm import LMObjective
     from dew.training import Trainer
 
     directory = str(Path(args.run_dir))
     checkpoints = Checkpoints(directory, keep=1)
-    trainer = Trainer(LMObjective(plain, SEQ_LEN - 1, head_chunks=1), optax.sgd(0.1),
-                      key=jax.random.PRNGKey(0), mesh=mesh, layout=resident_layout,
-                      checkpoints=checkpoints)
-    state, _, _ = trainer.place()
-    batch = {"text": np.tile(np.arange(1, SEQ_LEN + 1, dtype=np.int32)[None],
-                             (jax.device_count(), 1))}
-    from dew.distributed.batches import shard_batch
-    placed = shard_batch(trainer.device_mesh, batch)
-    state = trainer.compile(state, placed)(state, placed)[0]
+    # The run trains its plain loop a layer at a time, as its banks' reader does not.
+    with generation.chosen(layer_scan="plain"):
+        trainer = Trainer(LMObjective(plain, SEQ_LEN - 1, head_chunks=1), optax.sgd(0.1),
+                          key=jax.random.PRNGKey(0), mesh=mesh,
+                          advanced=TrainerAdvanced(layout=resident_layout),
+                          checkpoints=checkpoints)
+        state, _, _ = trainer.place()
+        batch = {"text": np.tile(np.arange(1, SEQ_LEN + 1, dtype=np.int32)[None],
+                                 (jax.device_count(), 1))}
+        placed = shard_batch(trainer.device_mesh, batch)
+        state = trainer.compile(state, placed)(state, placed)[0]
     checkpoints.save(int(state.step), state, None, metrics={"loss": 1.0})
     checkpoints.wait()
 
@@ -171,7 +176,11 @@ def main(argv=None) -> None:
     parser.add_argument("--tensor-size", type=int, default=1)
     parser.add_argument("--bank-layers", type=int)
     parser.add_argument("--run-dir")
-    serve_mode(MODES, parser.parse_args(argv))
+    from dew.nn.kernels import generation
+
+    # Its banks' decoder scanned, as banks are read (`generation.Choice.LAYER_SCAN`), in this process.
+    with generation.chosen(layer_scan="scanned"):
+        serve_mode(MODES, parser.parse_args(argv))
 
 
 if __name__ == "__main__":

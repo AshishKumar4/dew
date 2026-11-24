@@ -9,7 +9,6 @@ import functools
 import hashlib
 import math
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -28,7 +27,7 @@ NVFP4_STAGE = packed.NVFP4_STEP
 
 
 def _staged_rows(depth: int, group: int, code_width: int, depth_fn, label: str) -> np.ndarray:
-    """Shared staged-depth permutation for packed weight matrices (`staged_rows`, `fp8_staged_rows`)."""
+    """Shared staged-depth permutation for packed weight matrices (`staged_rows`, `ternary_staged_rows`)."""
     if depth % group:
         raise ValueError(f"a {label} matrix's depth is whole {group}-deep groups, not {depth}")
     groups, within = np.divmod(np.arange(depth), group)
@@ -288,38 +287,13 @@ def e8m0_scales(scales: jax.Array) -> tuple[jax.Array, jax.Array]:
     held = jax.lax.bitcast_convert_type(scales, jnp.uint8).astype(jnp.uint32)
     return bits.e8m0_decoded(held), (held & jnp.uint32(0xFF)) == 0
 
-FP8_STAGE = packed.FP8_STEP
-"""Depth unit of free-layout FP8 weight staging (`Fp8Weights`, 64 depths = 16 uint32 words per column)."""
-
-
-def fp8_staged_rows(depth: int) -> np.ndarray:
-    """Depth permutation for `Fp8Weights` (`packed.fp8_staged_depth`): word `w` (`0..15`) of each 64-depth
-    group holds codes `0..3` at depths `16 * code + w`, so inline decode writes four contiguous 16-depth
-    bfloat16 slices per group (row 8548)."""
-    return _staged_rows(depth, packed.FP8_GROUP, bits.E4M3.width, packed.fp8_staged_depth, "FP8 weight")
-
-
-def fp8_minifloat(fmt: str) -> tuple[bits.Minifloat, jnp.dtype]:
-    """Resolve `'e4m3'` / `'e5m2'` to its `(bits.Minifloat, jnp.dtype)` pair (single source of truth)."""
-    if fmt == "e4m3":
-        return bits.E4M3, jnp.dtype(jnp.float8_e4m3fn)
-    if fmt == "e5m2":
-        return bits.E5M2, jnp.dtype(jnp.float8_e5m2)
-    raise ValueError(f"Fp8Weights format must be 'e4m3' or 'e5m2', got {fmt!r}")
-
-
-def fp8_form_version(fmt: str) -> np.ndarray:
-    """8-byte digest identifying the free-layout encoder and staged order for `Fp8Weights` (`fmt`)."""
-    minifloat, _ = fp8_minifloat(fmt)
-    form, _ = bits.fp8_form(minifloat)
-    return form_version(form.version, fp8_staged_rows(FP8_STAGE))
-
-def fp8_scale_checked(scale_shape: tuple[int, ...], weights_shape: tuple[int, ...]) -> None:
-    """Validate that `scale_shape` satisfies the single unambiguous broadcast contract for `Fp8Weights` of
-    `weights_shape` (`[depth, width]` or `[groups, depth, width]`): scalar `()`/`(1,)`, per-column `(width,)`
-    or `(1, width)` / `(1, 1, width)`, or grouped per-group `(groups, 1, 1)` / `(groups, 1, width)`."""
+def scale_checked(scale_shape: tuple[int, ...], weights_shape: tuple[int, ...]) -> None:
+    """Validate that `scale_shape` satisfies the single unambiguous broadcast contract for a scaled packed
+    matrix (`TernaryWeights`) of `weights_shape` (`[depth, width]` or `[groups, depth, width]`): scalar
+    `()`/`(1,)`, per-column `(width,)` or `(1, width)` / `(1, 1, width)`, or grouped per-group
+    `(groups, 1, 1)` / `(groups, 1, width)`."""
     if len(weights_shape) not in (2, 3):
-        raise ValueError(f"Fp8Weights expects 2D [depth, width] or 3D [groups, depth, width], got "
+        raise ValueError(f"a scaled packed matrix is 2D [depth, width] or 3D [groups, depth, width], got "
                          f"{weights_shape}")
     width = weights_shape[-1]
     if len(weights_shape) == 2:
@@ -328,13 +302,14 @@ def fp8_scale_checked(scale_shape: tuple[int, ...], weights_shape: tuple[int, ..
         groups = weights_shape[0]
         allowed = {(), (1,), (width,), (1, 1, width), (groups, 1, 1), (groups, 1, width)}
     if scale_shape not in allowed:
-        raise ValueError(f"Fp8Weights scale shape {scale_shape} is invalid for weights {weights_shape}; "
+        raise ValueError(f"scale shape {scale_shape} is invalid for packed weights {weights_shape}; "
                          f"expected one of {sorted(allowed)}")
 
-def fp8_factor(scale: jax.Array, sizes: jax.Array, count: int, weights_shape: tuple[int, ...],
-               dense: bool) -> jax.Array:
-    """Broadcast `Fp8Weights.scale` to match `[count, width]` output rows under `fp8_scale_checked`."""
-    fp8_scale_checked(scale.shape, weights_shape)
+def scale_factor(scale: jax.Array, sizes: jax.Array, count: int, weights_shape: tuple[int, ...],
+                 dense: bool) -> jax.Array:
+    """Broadcast a scaled packed matrix's `scale` to match `[count, width]` output rows under
+    `scale_checked`."""
+    scale_checked(scale.shape, weights_shape)
     if scale.ndim == 0 or scale.shape == (1,) or dense:
         return scale
     if scale.ndim == 1:
@@ -342,86 +317,8 @@ def fp8_factor(scale: jax.Array, sizes: jax.Array, count: int, weights_shape: tu
     if scale.shape[0] == 1:
         return scale[0]
     return jnp.repeat(scale[:, 0, :], sizes, axis=0, total_repeat_length=count)
-class _ScaledWeights:
-    """Shared single-scale decode for free-layout packed weight formats (`Fp8Weights`, `TernaryWeights`)."""
-    if TYPE_CHECKING:
-        words: jax.Array | np.ndarray
-        scale: jax.Array | np.ndarray
-        @property
-        def shape(self) -> tuple[int, ...]: ...
-        def unscaled(self, dtype=jnp.bfloat16) -> jax.Array: ...
-
-    def _unscaled_words(self, per: int, staged_fn, decode_fn, dtype) -> jax.Array:
-        """Decode packed `[..., width, wdepth]` uint32 words to `[..., wdepth * per, width]` in `dtype`."""
-        words = jnp.asarray(self.words)
-        *batches, width, wdepth = words.shape
-        batch = math.prod(batches)
-        if batch == 0 or width == 0 or wdepth == 0:
-            return jnp.zeros((*batches, wdepth * per, width), dtype)
-        flat = words.reshape(batch, width, wdepth)
-        inv = np.argsort(staged_fn(wdepth * per))
-        decoded = jax.vmap(lambda w: decode_fn(w.T)[inv])(flat)
-        return decoded.reshape(*batches, wdepth * per, width).astype(dtype)
-
-    def decoded(self, dtype=jnp.bfloat16) -> jax.Array:
-        """Decode `words` back to `[..., depth, width]` in `dtype`, scaled once in `at_least_fp32`."""
-        fp8_scale_checked(jnp.shape(self.scale), self.shape)
-        wide = jnp.promote_types(dtype, jnp.float32)
-        return (self.unscaled(wide) * jnp.asarray(self.scale, wide)).astype(dtype)
 
 
-@jax.tree_util.register_dataclass
-@dataclasses.dataclass(frozen=True)
-class Fp8Weights(_ScaledWeights):
-    """Free-layout FP8 weight matrix `[..., depth, width]` packed 4 codes per `uint32` word in the GEMM
-    staged depth order (`fp8_staged_rows`) via `bits.E4M3_BFLOAT16_FORM` or `bits.E5M2_BFLOAT16_FORM` for
-    `scale` fp32, encoder `form` version bytes, and `fmt` static metadata."""
-
-    words: jax.Array | np.ndarray
-    scale: jax.Array | np.ndarray
-    form: jax.Array | np.ndarray
-    fmt: str = dataclasses.field(metadata={"static": True}, default="e4m3")
-
-    @classmethod
-    def of(cls, weights: jax.Array | np.ndarray, *, fmt: str = "e4m3",
-           scale: jax.Array | np.ndarray | float = 1.0) -> "Fp8Weights":
-        """Quantize/pack `weights` (`[..., depth, width]`, `depth % 64 == 0`) into staged `Fp8Weights`."""
-        minifloat, fp8_dtype = fp8_minifloat(fmt)
-        source = jnp.asarray(weights)
-        if source.ndim < 2 or source.shape[-2] % FP8_STAGE != 0:
-            raise ValueError(f"Fp8Weights expects depth divisible by {FP8_STAGE}, got {source.shape}")
-        scale_arr = jnp.asarray(scale, jnp.float32)
-        fp8_scale_checked(scale_arr.shape, source.shape)
-        if source.dtype == fp8_dtype:
-            codes = jax.lax.bitcast_convert_type(source, jnp.uint8).astype(jnp.uint32)
-        else:
-            scaled = (source.astype(jnp.float32) / scale_arr).astype(jnp.float32)
-            codes = bits.encoded(jax.lax.bitcast_convert_type(scaled, jnp.uint32), minifloat)
-        staged = codes[..., fp8_staged_rows(source.shape[-2]), :]
-        packed_words = bits.fp8_packed(jnp.swapaxes(staged, -1, -2), minifloat)
-        return cls(packed_words, scale_arr, fp8_form_version(fmt), fmt=fmt)
-
-    @property
-    def dtype(self) -> jnp.dtype:
-        return jnp.dtype(jnp.bfloat16)
-
-    @property
-    def shape(self) -> tuple[int, ...]:
-        *groups, width, words = self.words.shape
-        return (*groups, 4 * words, width)
-
-    def checked(self, form=None) -> "Fp8Weights":
-        """Verify stored `form` version (every addressable shard) and scale shape match this Dew's encoder."""
-        _checked_form(self.form, fp8_form_version(self.fmt), f"Fp8Weights({self.fmt})", "Fp8Weights.of",
-                      form=form)
-        fp8_scale_checked(jnp.shape(self.scale), self.shape)
-        return self
-
-    def unscaled(self, dtype=jnp.bfloat16) -> jax.Array:
-        """Decode `words` back to `[..., depth, width]` in `dtype` without applying `self.scale`."""
-        minifloat, _ = fp8_minifloat(self.fmt)
-        return self._unscaled_words(4, fp8_staged_rows,
-                                    lambda w: bits.fp8_codes(w, minifloat, jnp.float32), dtype)
 def _block_values(codes: jax.Array, scales: jax.Array, block: int, dtype) -> jax.Array:
     """Block-scaled codes' values in `dtype`: each code times its `block` depths' E4M3 scale, read by the one
     decode of a block scale's (`bits.scales_decoded`, row 8675), exact in float32 (an E2M1 code times an E4M3
@@ -506,7 +403,7 @@ def ternary_codes(words: jax.Array, dtype=jnp.float32) -> jax.Array:
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
-class TernaryWeights(_ScaledWeights):
+class TernaryWeights:
     """BitNet b1.58 ternary weight matrix `[..., depth, width]` packed 16 2-bit codes per `uint32` word in
     staged depth order (`ternary_staged_rows`, row 1464): `words` `[..., width, depth // 16]` uint32,
     absmean/per-column/per-group `scale` fp32, and `form` digest."""
@@ -536,7 +433,7 @@ class TernaryWeights(_ScaledWeights):
                 scale_arr = jnp.maximum(absmean, jnp.float32(1e-5))
         else:
             scale_arr = jnp.asarray(scale, jnp.float32)
-        fp8_scale_checked(scale_arr.shape, source.shape)
+        scale_checked(scale_arr.shape, source.shape)
         quantized = jnp.clip(jnp.round(source / jnp.where(scale_arr > 0, scale_arr, jnp.float32(1.0))),
                              -1.0, 1.0)
         codes = jnp.where(quantized > 0, jnp.uint32(1),
@@ -557,10 +454,25 @@ class TernaryWeights(_ScaledWeights):
     def checked(self, form=None) -> "TernaryWeights":
         """Verify stored `form` version (every addressable shard) and scale shape match this Dew's encoder."""
         _checked_form(self.form, ternary_form_version(), "TernaryWeights", "TernaryWeights.of", form=form)
-        fp8_scale_checked(jnp.shape(self.scale), self.shape)
+        scale_checked(jnp.shape(self.scale), self.shape)
         return self
 
     def unscaled(self, dtype=jnp.bfloat16) -> jax.Array:
-        """Decode packed `words` back to `[..., depth, width]` ternary `{-1, 0, +1}` in `dtype`."""
-        return self._unscaled_words(16, ternary_staged_rows,
-                                    lambda w: ternary_codes(w, jnp.float32), dtype)
+        """Decode packed `words` (`[..., width, depth // 16]`) back to `[..., depth, width]` ternary
+        `{-1, 0, +1}` in `dtype`."""
+        words = jnp.asarray(self.words)
+        *batches, width, wdepth = words.shape
+        depth = 16 * wdepth
+        batch = math.prod(batches)
+        if batch == 0 or width == 0 or wdepth == 0:
+            return jnp.zeros((*batches, depth, width), dtype)
+        inv = np.argsort(ternary_staged_rows(depth))
+        flat = words.reshape(batch, width, wdepth)
+        decoded = jax.vmap(lambda w: ternary_codes(w.T, jnp.float32)[inv])(flat)
+        return decoded.reshape(*batches, depth, width).astype(dtype)
+
+    def decoded(self, dtype=jnp.bfloat16) -> jax.Array:
+        """Decode `words` back to `[..., depth, width]` in `dtype`, scaled once in `at_least_fp32`."""
+        scale_checked(jnp.shape(self.scale), self.shape)
+        wide = jnp.promote_types(dtype, jnp.float32)
+        return (self.unscaled(wide) * jnp.asarray(self.scale, wide)).astype(dtype)

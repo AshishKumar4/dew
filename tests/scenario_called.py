@@ -21,8 +21,7 @@ from dew.data import Memory
 from dew.distributed.placement import Layout, MeshSpec
 from dew.nn.kernels.generation import run_precision
 from dew.nn.precision import numerics_of
-from dew.training import Trainer
-from dew.training.budget import Horizon
+from dew.training import Trainer, TrainerAdvanced
 
 STEPS = 3
 """A scenario run's steps, every scenario's (tests/test_scenario_runs.py's `settings`)."""
@@ -45,7 +44,7 @@ def diffusion_trained(cell: Mapping, root: str, phase: Mapping) -> dict[str, flo
     fields = {name: value for name, value in config.model.fields.items() if name != "dtype"}
     config = dataclasses.replace(
         config, model=dataclasses.replace(config.model, fields={**fields, "remat": cell["memory"]}),
-        trainer=dataclasses.replace(config.trainer, horizon=Horizon(steps=STEPS), checkpoint_final=True))
+        trainer=dataclasses.replace(config.trainer, steps=STEPS, checkpoint_final=True))
     config = config.override(settled(phase.settings()))
     images = np.random.RandomState(0).randint(0, 256, (4 * RUN_BATCH, RES, RES, 3), np.uint8)
     config.train(config.build(), Memory([{"image": image} for image in images]).batch(RUN_BATCH),
@@ -87,7 +86,7 @@ def diffusion_rl_trained(cell: Mapping, root: str, phase: Mapping) -> dict[str, 
         config, model=dataclasses.replace(config.model, fields=fields), preset=Flow(),
         objective=ObjectiveConfig(method, {**DIFFUSION_RL[method], "solver": Euler(), "steps": 2}),
         rollout=FlowRolloutConfig(reward="psnr", groups=2, steps=3, train_steps=2),
-        trainer=dataclasses.replace(config.trainer, horizon=Horizon(steps=STEPS), checkpoint_final=True))
+        trainer=dataclasses.replace(config.trainer, steps=STEPS, checkpoint_final=True))
     config = config.override(settled(phase.settings()))
     objective = config.build()
     images = np.random.RandomState(0).randint(0, 256, (4 * RUN_BATCH, RES, RES, 3), np.uint8)
@@ -120,8 +119,8 @@ def jepa_trained(cell: Mapping, root: str, phase: Mapping) -> dict[str, float]:
                    for image, label in zip(batch["image"], batch["label"], strict=True)])
     tracker = RecordingTracker()
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=MeshSpec(fsdp=cell["devices"]),
-                      layout=Layout(min_shard=256), tracker=tracker, data_resume=phase.data_resume,
-                      checkpoints=Checkpoints(str(Path(root) / "runs" / phase.name)))
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=256), data_resume=phase.data_resume),
+                      tracker=tracker, checkpoints=Checkpoints(str(Path(root) / "runs" / phase.name)))
     own = phase == CELL
     start = jax.tree.map(np.asarray, trainer.initial_state().ema) if own else None
     with run_precision(numerics_of(cell["precision"])):
@@ -154,7 +153,7 @@ def quantized_loaded(form: str, root: Path):
     name (`CODECS`)."""
     from dew.interop import Pretrained
 
-    held = {"dtype": "float32", "attention_impl": "reference"}
+    held = {"dtype": "float32"}
     if form in GGUF:
         return Pretrained.load(root, gguf_file="model.gguf", **held)
     return Pretrained.load(CODECS / form, **held)
@@ -171,7 +170,8 @@ def quantized_trained(cell: Mapping, root: str, phase: Mapping) -> dict[str, flo
     source = quantized_loaded(cell["format"], Path(root))
     tracker = RecordingTracker()
     trainer = Trainer(LMObjective(source.model, 8, variables=jax.device_get(source.variables)),
-                      optax.adam(1e-3), key=jax.random.key(0), tracker=tracker, data_resume=phase.data_resume,
+                      optax.adam(1e-3), key=jax.random.key(0), tracker=tracker,
+                      advanced=TrainerAdvanced(data_resume=phase.data_resume),
                       checkpoints=Checkpoints(str(Path(root) / "runs" / phase.name)))
     rows = np.random.default_rng(1).integers(3, 30, (8, 9)).astype(np.int32)
     trainer.fit(Memory([{"text": row} for row in rows]).batch(8), steps=STEPS, log_every=1, stop=phase.stop,

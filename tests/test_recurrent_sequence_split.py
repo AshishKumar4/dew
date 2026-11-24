@@ -287,8 +287,25 @@ FORK_SEEDS = 32
 """Each mixer's declared draws over forks under the axis."""
 
 
+CHECK1_SHARDS = {
+    "test_a_recurrent_mixer_reads_forks_under_a_sequence_axis_as_on_one_device[mamba3]": {"seeds": 32,
+                                                                                         "per_task": 8},
+}
+"""The cells whose draws run as CI's map tasks (`check1_shards`), by node id: Mamba-3's 32 forked draws took
+179 s in one task in train 1186's CI (its forked walk's derivative spans traced and compiled, then 32 draws of
+each order), 8 a task (row 11847)."""
+
+
+def _fork_mixers() -> list:
+    """`WHOLE_MIXERS`' names and the lightning layer's as parameters, each marked from `CHECK1_SHARDS`."""
+    test = "test_a_recurrent_mixer_reads_forks_under_a_sequence_axis_as_on_one_device"
+    marked = {name: [pytest.mark.check1_shards(**counts)] for name, counts in CHECK1_SHARDS.items()}
+    return [pytest.param(name, id=name, marks=marked.get(f"{test}[{name}]", []))
+            for name in [*sorted(WHOLE_MIXERS), "lightning"]]
+
+
 @pytest.mark.mesh
-@pytest.mark.parametrize("name", [*sorted(WHOLE_MIXERS), "lightning"])
+@pytest.mark.parametrize("name", _fork_mixers())
 def test_a_recurrent_mixer_reads_forks_under_a_sequence_axis_as_on_one_device(name):
     """Under a sequence axis of 4, a call over forks runs whole, each document continuing its parent's state
     across the axis (`linear.sequence_split`, rows 7400, 7424), where `held_scan`'s forked path and Mamba-3

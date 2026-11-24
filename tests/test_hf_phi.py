@@ -15,6 +15,7 @@ from interop_support import (
     transformers_arms,
     transformers_model,
 )
+from model_support import attending
 from reference_error import as_given, assert_as_exact
 
 from dew.interop import Pretrained
@@ -27,6 +28,7 @@ LIKELIHOOD_SEEDS = 16
 sized by `seeds_for` paired with Dew's token scores on the CPU."""
 
 
+@attending("reference")
 def test_phi_affine_head_trains_through_the_public_objective():
     """The public objective's per-token losses through Phi's biased head, its head cut in chunks and
     tiles, are on par with the cross entropy of transformers' logits, from its float64 twin's, over drawn
@@ -34,7 +36,7 @@ def test_phi_affine_head_trains_through_the_public_objective():
     step along it lowers the loss."""
     from dew.objectives.lm import LMObjective
 
-    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(DIRECTORY, dtype='float32')
     draw = fixture_ids(DIRECTORY)
     ids = jnp.asarray(draw(0)[0])
     objective = LMObjective(loaded.model, seq_len=ids.shape[1] - 1, variables=loaded.variables,
@@ -72,6 +74,7 @@ def yarn_source(tmp_path) -> Path:
     return respelled(DIRECTORY, tmp_path / 'phi-yarn', lambda config: {**config, 'rope_parameters': YARN})
 
 
+@attending("reference")
 def test_a_yarn_phi_trains_as_transformers_computes_it_and_writes_it_back(tmp_path):
     """Phi rotates half its head, the 'default' partial rotary, and transformers' YaRN ramps that half
     alone, and PhiModel's embedding leaves its pad row untrained by its lookups (padding_idx). Dew's
@@ -87,7 +90,7 @@ def test_a_yarn_phi_trains_as_transformers_computes_it_and_writes_it_back(tmp_pa
     from dew.nn.rope import YarnScaling
 
     source = yarn_source(tmp_path)
-    loaded = Pretrained.load(source, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(source, dtype='float32')
     assert isinstance(loaded.model.rope_scaling, YarnScaling) and loaded.model.partial_rotary_factor == 0.5
 
     def dew(ids):
@@ -134,7 +137,7 @@ def test_a_yarn_phi_trains_as_transformers_computes_it_and_writes_it_back(tmp_pa
     PretrainedDecoder.from_model(loaded.model, loaded.variables).save(export)
     written = json.loads((export / 'config.json').read_text())['rope_parameters']
     assert {key: written[key] for key in YARN} == YARN
-    assert Pretrained.load(export, dtype='float32', attention_impl='reference').model == loaded.model
+    assert Pretrained.load(export, dtype='float32').model == loaded.model
 
     def transformers_logits(directory):
         model = AutoModelForCausalLM.from_pretrained(directory, dtype=torch.float32).eval()

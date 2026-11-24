@@ -9,6 +9,7 @@ from pathlib import Path
 import jax
 import numpy as np
 import pytest
+from model_support import attending
 from run_kinds import stated
 from test_decision_context import assert_packed_as_alone, opened, windows_of
 
@@ -66,7 +67,7 @@ def lettered(segments: int, context: int = 256, *, slots: bool = False) -> Decis
     """A lettered decision over the tiny Llama with fresh cross-attention before its layers, reading each
     row's question as its context of up to `context` tokens, at most `segments` rows a window: its letters
     read by the backbone's own rows (`LabelReadout`), or by a slot release's head (`SlotReadout`)."""
-    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference", max_seq_len=512)
+    source = Pretrained.load(LLAMA, dtype="float32", max_seq_len=512)
     crossed = source.with_cross_attention(CrossAttention((0, 1), context), key=0)
     width, dtype = DecisionModel.head_size(crossed.model)
     head = (SlotReadout(features=width, label_ids=tuple(ids[0] for ids in LABELS.ids(TOKENIZER, 4)))
@@ -108,6 +109,7 @@ def test_a_lettered_row_writes_its_question_to_its_context_and_answers_at_its_ow
     assert own.questions[0].label_ids == laid.label_ids
 
 
+@attending("reference")
 def test_a_letter_answer_reads_its_question_through_the_context_alone():
     """Two questions of as many options over one state lay out the same row, the state and the cue, and
     other contexts: with the cross-attention open their letters' probabilities differ, the answer reading
@@ -126,6 +128,7 @@ def test_a_letter_answer_reads_its_question_through_the_context_alone():
     assert not np.array_equal(open_[0], open_[1])
 
 
+@attending("reference")
 def test_a_slot_readout_pools_each_option_line_from_the_context_that_holds_it():
     """A slot release's key pools each option's line where it stands (`SlotReadout`): in the context, for a
     row whose question is its context. With the cross-attention shut, two questions whose option lines
@@ -147,6 +150,7 @@ def test_a_slot_readout_pools_each_option_line_from_the_context_that_holds_it():
     assert not np.array_equal(first, second)
 
 
+@attending("reference")
 def test_a_question_past_the_context_is_unfit_and_a_none_of_the_above_past_it_declined():
     """A question that fills the context its backbone reads exactly trains, and a "none of the above" a
     read draws for it, which lengthens the context and not the row, is declined and laid out as Fit
@@ -177,6 +181,7 @@ alone, as the packed schemas' and contexts' (`test_decision_context.PACKED_CONTE
 `seeds_for` (8, 2026-10-28)."""
 
 
+@attending("reference")
 def test_lettered_rows_whose_question_is_their_context_pack_several_a_window_each_answering_its_own():
     """Lettered rows whose questions are their contexts pack several a window, each answering at its own
     cue (`readout`, moved by where its row's tokens start, not its context's) over its own question,
@@ -210,7 +215,7 @@ def test_a_run_names_its_lettered_question_read_in_context_on_the_command_line(t
                                     *(LABELS.names or ()), "--head.labels.variants", *LABELS.variants,
                                     "--head.labels.cue", LABELS.cue, "--trainer.name", "letters",
                                     "--trainer.checkpoint-dir", str(tmp_path / "runs"),
-                                    "--trainer.horizon.steps",
+                                    "--trainer.steps",
                                     "1", "--trainer.checkpoint-every", "1", "--trainer.eval-every", "None",
                                     "--trainer.multi-host", "False", "--trainer.compilation-cache-dir",
                                     "None"],

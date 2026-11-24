@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import attending
 from recording import bits
 from run_kinds import jepa, trained
 from test_env_runs import TEACHER, student, teacher_run
@@ -33,6 +34,7 @@ def assert_same(one, other) -> None:
         np.testing.assert_array_equal(left, right)
 
 
+@attending("xla")
 def test_a_jepa_run_exports_and_loads_as_its_encoder(tmp_path):
     """A JEPA run pins as a declaration (its encoder's record and its numerics, its settings none) and loads
     as a `SavedModel` of its encoder, the target encoder's average where the run kept one and the encoder's

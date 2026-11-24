@@ -25,7 +25,7 @@ from affine_run import Replaying
 from flax import linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.sharding import NamedSharding, PartitionSpec
-from model_support import TINY_DECODER
+from model_support import TINY_DECODER, attending, scanning, stacked, unrolled
 from process_support import READ_ONLY, fresh, keeping_picks
 from reference_error import as_given, assert_as_exact, widened, with_gradients
 
@@ -47,7 +47,7 @@ from dew.quantization import (
     measured_fp8_sites,
 )
 from dew.registry import models, wrapper_layers
-from dew.training import Checkpoints, Layout, MeshSpec, Trainer
+from dew.training import Checkpoints, Layout, MeshSpec, Trainer, TrainerAdvanced
 
 VOCAB, SEQ, BATCH = 64, 16, 8
 FEATURES, MLP = 64, 128
@@ -117,7 +117,6 @@ def calls(model, variables, inputs):
     """Every Dense call of `model`'s forward: its path, the module unbound, its input and its output. The
     decoder runs the plain loop, each layer's Dense under its own path (`layers_N`): a scan runs a run's
     layers as one traced body, under the run's path, whose values no interceptor reads (row 4099)."""
-    model = model.clone(scan_layers=False)
     seen = {}
 
     def capture(next_fun, args, kwargs, context):
@@ -126,7 +125,7 @@ def calls(model, variables, inputs):
             seen["/".join(context.module.path)] = (context.module.clone(parent=None), args[0], output)
         return output
 
-    with nn.intercept_methods(capture):
+    with nn.intercept_methods(capture), stacked(scanned=False):
         model.apply(variables, inputs)
     return seen
 
@@ -380,7 +379,7 @@ def fit(adapter, steps, directory=None):
 
     mesh = MeshSpec()
     trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.key(0), mesh=mesh,
-                      layout=Layout(min_shard=1, tolerance=1.0),
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)),
                       checkpoints=None if directory is None else Checkpoints(str(directory)))
     trainer.device_mesh = mesh.build(jax.devices()[:1])
     def windows(position):
@@ -441,6 +440,7 @@ def test_a_resumed_fp8_base_run_trains_what_an_uninterrupted_one_does(tmp_path):
         np.testing.assert_array_equal(np.asarray(got).view(np.uint8), np.asarray(want).view(np.uint8))
 
 
+@attending("reference")
 def test_the_scanned_stack_reads_each_layers_own_packed_kernel():
     """The scanned stack computes the looped one's output from the same
     variables, both jitted with the variables as arguments, as a step passes
@@ -449,8 +449,7 @@ def test_the_scanned_stack_reads_each_layers_own_packed_kernel():
     two on par over drawn tokens (check 1), from the plain decoder in float64
     on the kernels the codes stand for (the adapter's deltas start at zero)."""
     _, fp8 = adapters()
-    _, scanned = adapters(decoder(scan_layers=True))
-    exact = jax.jit(decoder().clone(dtype=jnp.float64, attention_impl="reference").apply)
+    exact = unrolled(jax.jit(decoder().clone(dtype=jnp.float64).apply))
     # The merged tree's layout, each packed site's kernel the one its forward codes stand for in float64
     # (`exactly`), not the float32 decode `merge` stores.
     base = flatten_dict(fp8.merge(fp8.variables)["params"])
@@ -467,8 +466,9 @@ def test_the_scanned_stack_reads_each_layers_own_packed_kernel():
         with jax.enable_x64(new_val=True):
             return exact({"params": widened(base)}, tokens)
 
-    assert_as_exact(lambda tokens: jax.jit(scanned.model.apply)(fp8.variables, tokens),
-                    lambda tokens: jax.jit(fp8.model.apply)(fp8.variables, tokens), draw, "scanned FP8 stack",
+    assert_as_exact(scanning(lambda tokens: jax.jit(fp8.model.apply)(fp8.variables, tokens)),
+                    unrolled(lambda tokens: jax.jit(fp8.model.apply)(fp8.variables, tokens)), draw,
+                    "scanned FP8 stack",
                     seeds=SCANNED_SEEDS, truth_fn=truth)
 
 

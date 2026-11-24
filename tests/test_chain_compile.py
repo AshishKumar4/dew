@@ -7,6 +7,7 @@ import grain.python as grain
 import numpy as np
 import optax
 import pytest
+from model_support import attending
 from recording import RecordingTracker
 
 from dew import Trainer
@@ -17,8 +18,6 @@ from dew.data.dataset import DataPartition
 from dew.data.pipeline import ObjectiveData
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective, Perplexity
-from dew.training import UpdateBatch
-from dew.training.budget import Horizon
 
 READ = Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1)
 
@@ -70,7 +69,7 @@ def test_phases_state_each_token_batch_which_one_update_s_tokens_divide_alike():
 
     rows = [{"id": np.int32(index + 1), "length": np.int32(3 + index % 12)} for index in range(32)]
     chain = Memory(rows).map(Tokens()).repeat()
-    budget = TrainerConfig(update=UpdateBatch(tokens=128), horizon=Horizon(steps=4))
+    budget = TrainerConfig(update_tokens=128, steps=4)
 
     def compiled(first, second):
         stepped = compile(phases(Phase(chain.batch(tokens=first), Steps(2)),
@@ -83,17 +82,17 @@ def test_phases_state_each_token_batch_which_one_update_s_tokens_divide_alike():
 
     for loader in compiled(64, 64):
         assert loader.token_batches == (64, 64)
-        assert budget.accumulation(loader) == 2
+        assert budget.update_batches(loader) == 2
     for loader in compiled(64, 32):
         assert loader.token_batches == (64, 32)
         with pytest.raises(ValueError):
-            budget.accumulation(loader)
-        assert TrainerConfig(horizon=Horizon(steps=4)).accumulation(loader) == 1
+            budget.update_batches(loader)
+        assert TrainerConfig(steps=4).update_batches(loader) == 1
     rowed = compile(phases(Phase(chain.batch(4), Steps(2)), Phase(chain.batch(8))), read="memory",
                     loading=READ)
     assert rowed.token_batches == (None, None)
     with pytest.raises(ValueError):
-        budget.accumulation(rowed)
+        budget.update_batches(rowed)
 
 
 @pytest.mark.parametrize("entry", ["validation", "iterate"])
@@ -179,13 +178,14 @@ def test_fit_reads_validation_with_its_own_mode_loading_and_batch(named):
         reader.close()
 
 
+@attending("xla")
 @pytest.mark.parametrize("named", [False, True])
 def test_fit_trains_indexed_tokens_and_scores_its_independent_streamed_split(named):
     train = from_grain(grain.MapDataset.source(list(held_tokens())), "indexed-tokens")
     train = train.batch(16).read("indexed").workers(0)
     held = from_iter(held_tokens, identity="streamed-tokens").batch(8).read("streamed").workers(0)
     objective = LMObjective(CausalTransformer(vocab_size=8, emb_features=8, num_layers=1,
-                            num_heads=2, mlp_features=16, max_seq_len=8, attention_impl="xla"), seq_len=4)
+                            num_heads=2, mlp_features=16, max_seq_len=8), seq_len=4)
     tracker = RecordingTracker()
     state = Trainer(objective, optax.adam(1e-3), key=0, tracker=tracker).fit(
         train, validation={"val": held} if named else held, steps=1, eval_every=1, log_every=1,
