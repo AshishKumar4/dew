@@ -72,9 +72,9 @@ class Output(NamedTuple):
     transposed: bool = False
 
     @classmethod
-    def of(cls, output: "Output | tuple") -> "Output":
+    def of(cls, output: "Output | tuple[tuple[int, int], jax.typing.DTypeLike]") -> "Output":
         """`output` as an `Output`: a plain `(shape, dtype)` pair stored as it is computed."""
-        return output if isinstance(output, cls) else cls(*output)
+        return output if isinstance(output, cls) else cls(output[0], output[1])
 
 
 def staged_columns(columns: int, dtypes, *, swizzle: int = STAGED_BYTES,
@@ -88,7 +88,7 @@ def staged_columns(columns: int, dtypes, *, swizzle: int = STAGED_BYTES,
     (which `staging_refusal` refuses)."""
     if not packed:
         return math.gcd(columns, swizzle // max(jnp.dtype(dtype).itemsize for dtype in dtypes))
-    within = piece or columns
+    within = columns if piece is None else math.gcd(columns, piece)
     chunk = math.gcd(within, swizzle // max(jnp.dtype(dtype).itemsize for dtype in dtypes))
     return next((wider for wider in range(chunk, within + 1, chunk)
                  if not within % wider and _packed_refusal(wider, packed) is None), columns)
@@ -236,9 +236,14 @@ def staged(smem, value: jax.Array, ref, place: tuple, *, write: Callable = writt
     row_start, first, stored, column, *ladder = place
     if isinstance(ref, Scattered) and (divisor > 1 or transposed):
         raise ValueError("a scattered output's rows land a row at a time as computed, none packed")
-    if transposed and not (isinstance(first, int) and first == 0):
-        raise ValueError("a transposed output stores its share's rows whole from its first: a share starting "
-                         f"mid-tile (a grouped tile's, first {first}) takes none")
+    rows = smem.shape[-1] if transposed else smem.shape[-2]
+    if transposed and not (_static(first, 0) and _static(stored, rows)):
+        raise ValueError(f"a transposed output stores its share's {rows} rows whole, from its first: a "
+                         f"share of rows {first} to {first} + {stored} (a grouped tile's, or one ending "
+                         "mid-tensor) takes none; a dense call's last share states them all, the tensor's "
+                         "bound clipping")
+    if divisor > 1 and not transposed:
+        _aligned_ladder(width * jax.dtypes.itemsize_bits(smem.dtype) // 8, first, ladder)
     chunks = column_chunks(value, width * divisor)
     waits = buffer_waits(len(chunks), buffers) if waits is None else waits
     for chunk, (start, piece) in enumerate(chunks):
@@ -251,14 +256,31 @@ def staged(smem, value: jax.Array, ref, place: tuple, *, write: Callable = writt
                     (column + start) // divisor, *ladder, write=write)
 
 
+def _static(value, expected: int) -> bool:
+    """Whether `value` is the Python int `expected`, known as it traces (a place's first row, its rows)."""
+    return isinstance(value, int) and value == expected
+
+
+def _aligned_ladder(row_bytes: int, first, ladder: list) -> None:
+    """Refuse a packed chunk's row ladder (`store_rows`: copies of a power of two of rows from `first`, the
+    smallest `least`, `ladder`'s second) whose copies may start a shared row at no `TMA_SMEM_ALIGNMENT` bytes:
+    a row of `row_bytes` that is no whole number of them starts aligned only at a static first row 0 and
+    rungs of whole aligned rows (a dense call's 8-row least of a 16-byte NVFP4 scale row)."""
+    least = ladder[1] if len(ladder) > 1 else 1
+    aligned = least * row_bytes % TMA_SMEM_ALIGNMENT == 0
+    if row_bytes % TMA_SMEM_ALIGNMENT and not (_static(first, 0) and aligned):
+        raise ValueError(f"a packed chunk's {row_bytes}-byte rows copied from row {first} in rungs of "
+                         f"{least} start a tensor copy at no {TMA_SMEM_ALIGNMENT}-byte shared address")
+
+
 def transposed_rows(smem, value: jax.Array, o_gmem, row_start, column, *, write: Callable = written) -> None:
     """`value`, a chunk of a share's tile columns, written to the shared buffer `smem` (`[columns, rows]`,
     the share's rows contiguous, `write`'s packing: `Output.transposed`) and stored whole to `o_gmem`
     (`[columns, rows]`) at `column` and the share's first row `row_start`, one TMA copy its own store group:
     its rows its box's inner extent, which no partial ladder takes in whole 16-byte units, so a share stores
     all its rows, the tensor's bound clipping those past its last. Its caller (`staged`) refuses a share
-    whose first row is no static 0 (a grouped tile's, its group's first row traced), so only a dense call's
-    shares reach here, each whole or ending at the tensor's last row (`gemm.mosaic_gpu._stored_rows`)."""
+    whose first row and rows are not the static 0 and the share's (a grouped tile's, a share ending
+    mid-tensor), so a dense call states each share whole, its last's rows past the tensor clipped."""
     write(smem, value)
     plgpu.commit_smem()
     plgpu.copy_smem_to_gmem(smem, o_gmem.at[pl.ds(column, smem.shape[0]), pl.ds(row_start, smem.shape[1])])
