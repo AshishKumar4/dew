@@ -422,7 +422,7 @@ def _assembly(text: str, active: np.ndarray, operand: Callable) -> Work:
             return operand(int(word[1:]))[1]
         return predicates.get(word, unknown)
 
-    for line in text.replace("{", ";").replace("}", ";").split(";"):
+    for line in _statements(text):
         words = line.split()
         running = active
         guard = None
@@ -456,6 +456,20 @@ def _assembly(text: str, active: np.ndarray, operand: Callable) -> Work:
             raise Uncounted(f"a memory instruction under a guard of unknown lanes ({guard}): {words[0]}")
         work = work + _instruction(words, issued, moving)
     return work
+
+
+def _statements(text: str) -> list[str]:
+    """A PTX block's statements: split at their semicolons, a block's braces stripped from their edges (an
+    operand list's braces, a vector's `{$0, $1}`, kept)."""
+    found = []
+    for statement in text.split(";"):
+        statement = statement.strip()
+        while statement[:1] in ("{", "}"):
+            statement = statement[1:].strip()
+        while statement[-1:] == "}" and statement.count("{") < statement.count("}"):
+            statement = statement[:-1].strip()
+        found.append(statement)
+    return found
 
 
 def _instruction(words: list[str], issued: float, moving: float) -> Work:
