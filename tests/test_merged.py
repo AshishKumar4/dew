@@ -1116,12 +1116,16 @@ def test_a_finished_split_merge_vmaps_query_params_and_keys_hooks_by_dtype_and_c
 
 
 @COMPILES_ON_CPU
-@pytest.mark.parametrize("target_name", ["sm80", "sm90", "sm100", "sm120"])
-def test_a_finished_split_merge_with_output_hooks_compiles_spill_free_and_matches_emitted_bytes(target_name):
+@pytest.mark.parametrize(("target_name", "hook"), [
+    ("sm80", "output"), ("sm90", "output"), ("sm90", "bool-int"), ("sm90", "query"), ("sm100", "output"),
+    ("sm120", "output")])
+def test_a_finished_split_merge_with_output_hooks_compiles_spill_free_and_matches_emitted_bytes(target_name,
+                                                                                               hook):
     """Row 5385: `merged.merged_finished` with fused `output_mod` (`Kind.OUTPUT` bf16 gate + `Kind.HEAD`
     scale) lowers as a single spill-free zero-SMEM Mosaic GPU `merged_padded` launch on sm80/sm90/sm100/sm120
     (no post-merge XLA hook fusion), and `merged.launch_work` device bytes agree with the emitted Mosaic body
-    to the exact byte."""
+    to the exact byte; on sm90 a bool gate with an int head, and a query hook, each lower so too. Each hook's
+    compile a cell of its own (row 12437: sm90's three in one cell took 617 s of a train's bound)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
@@ -1146,29 +1150,28 @@ def test_a_finished_split_merge_with_output_hooks_compiles_spill_free_and_matche
             output_mod=fn, output_params=tuple(
                 template.Param(val, k) for val, k in zip(extra_p, param_kinds, strict=True)))
 
-    with generation.assumed(target_name):
-        cases = [KernelCase("finished-output-hook", lambda: (call, (padded, stacked, gate, head)))]
-        if target_name == "sm90":
-            bool_gate = jax.ShapeDtypeStruct((batch, tokens, out_heads, width), jnp.bool_)
-            int_head = jax.ShapeDtypeStruct((out_heads,), jnp.int32)
+    bool_gate = jax.ShapeDtypeStruct((batch, tokens, out_heads, width), jnp.bool_)
+    int_head = jax.ShapeDtypeStruct((out_heads,), jnp.int32)
+    q_param = jax.ShapeDtypeStruct((batch, out_heads, tokens), jnp.bfloat16)
 
-            def int_bool_mod(o, m, k):
-                assert k.shape == ()
-                return jnp.where(m, o + k.astype(jnp.float32), 0.0)
+    def int_bool_mod(o, m, k):
+        assert k.shape == ()
+        return jnp.where(m, o + k.astype(jnp.float32), 0.0)
 
-            cases.append(KernelCase(
+    def query_mod(o, q_p):
+        assert o.ndim == 2 and q_p.ndim == 2 and q_p.shape == (o.shape[0], 1)
+        return o * q_p[:, :1]
+
+    case = {"output": KernelCase("finished-output-hook", lambda: (call, (padded, stacked, gate, head))),
+            "bool-int": KernelCase(
                 "finished-bool-int-hook",
-                lambda: (functools.partial(call, fn=int_bool_mod), (padded, stacked, bool_gate, int_head))))
-            q_param = jax.ShapeDtypeStruct((batch, out_heads, tokens), jnp.bfloat16)
-
-            def query_mod(o, q_p):
-                assert o.ndim == 2 and q_p.ndim == 2 and q_p.shape == (o.shape[0], 1)
-                return o * q_p[:, :1]
-            cases.append(KernelCase(
+                lambda: (functools.partial(call, fn=int_bool_mod), (padded, stacked, bool_gate, int_head))),
+            "query": KernelCase(
                 "finished-query-hook",
                 lambda: (functools.partial(call, fn=query_mod, param_kinds=(template.Kind.QUERY,)),
-                         (padded, stacked, q_param))))
-        records = compile_mosaic_kernels(cases, target_name)
+                         (padded, stacked, q_param)))}[hook]
+    with generation.assumed(target_name):
+        records = compile_mosaic_kernels([case], target_name)
         assert not (failed := mosaic_failures(records)), "\n".join(failed)
         for record in records:
             assert "error" not in record and sorted(record["thunks"]) == ["thunk"], record
@@ -1176,6 +1179,8 @@ def test_a_finished_split_merge_with_output_hooks_compiles_spill_free_and_matche
             kernels = record["kernels"]
             assert len(kernels) == 1 and kernels[0]["kernel"] == "merged_padded", record
             assert kernels[0]["spilled"] == 0 and kernels[0]["shared"] == 0, record
+        if hook != "output":
+            return
         work = merged.launch_work(spec, padded, stacked, queries, width, target, out_dtype=jnp.bfloat16,
                                   out_heads=out_heads, output_mod=mod, output_kinds=kinds,
                                   output_specs=(gate, head))
