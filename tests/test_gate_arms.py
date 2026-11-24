@@ -3,6 +3,7 @@ as the reference is."""
 
 import contextlib
 import itertools
+import pickle
 
 import jax
 import jax.numpy as jnp
@@ -290,6 +291,26 @@ def test_an_arm_whose_launch_takes_a_local_hook_runs_from_its_store(tmp_path):
             found = np.asarray(ahead_arm(doubled, "a doubled product, stored")(x, w))
     assert not (tmp_path / UNPREPARED).exists(), (tmp_path / UNPREPARED).read_text()
     np.testing.assert_array_equal(found, expected)
+
+
+def test_a_held_function_pickle_refuses_by_its_type_is_held_by_its_name(monkeypatch):
+    """A function in a site's held record that pickle refuses with a TypeError (a closure holding a jaxlib
+    Traceback, as a fused GEMM's hook does) is held by its name like one pickle cannot name, never refusing
+    the store (a dry prepare of tests/test_gpu_gemm.py: its fused cells went unprepared, row 12665)."""
+    import copyreg
+    import types
+
+    import truths_ahead
+
+    def hook(acc):
+        return acc
+
+    def refused(function):
+        raise TypeError(function)
+
+    monkeypatch.setitem(copyreg.dispatch_table, types.FunctionType, refused)
+    held = pickle.loads(truths_ahead._held_bytes({"hook": hook}))
+    assert held == {"hook": truths_ahead.HeldName(f"{hook.__module__}.{hook.__qualname__}")}
 
 
 def test_an_arm_ahead_called_again_at_its_program_in_a_prepare_reuses_it_and_refuses_another(tmp_path):
