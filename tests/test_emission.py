@@ -888,14 +888,13 @@ def test_an_atomic_add_counts_its_bytes_reduced_where_global_and_an_a100_prices_
                  if "cost_estimate" in equation.params]
     work = emission.work_of(kernel)
     if memory == "shared":
-        assert work.global_reductions == 0 and work.shared_bytes >= launched * 64 * 64 * 4
+        assert work.global_reductions == 0 and work.shared_bytes == launched * 64 * 64 * 4
         return
     assert work.global_reductions == launched * 64 * 64 * 4
     reductions = cost.rates(ampere, device=False).reductions
     assert reductions == 3.0 * ampere.loaded_clock_hz
-    alone = Work(global_reductions=work.global_reductions, kernels=1.0)
     busiest = 2 * 64 * 64 * 4 / reductions + (ampere.launch_seconds or 0.0)
     for resident in (1, 2):
-        assert cost.launch_seconds(alone, launched, ampere, resident=resident) == pytest.approx(busiest)
+        assert cost.launch_seconds(work, launched, ampere, resident=resident) == pytest.approx(busiest)
     assert cost.rates(hopper, device=False).reductions is None
     assert work.global_reductions in cost.units(work, cost.rates(hopper, device=False))[1]
