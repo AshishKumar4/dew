@@ -23,8 +23,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from certified import assert_certified
-from generation_support import lowers
 from forks_support import LAYOUTS, assert_forks_as_own_rows
+from generation_support import lowers
 from model_support import as_stepped, decode_through
 from reference_error import (
     assert_as_exact,
