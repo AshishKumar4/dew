@@ -15,6 +15,7 @@ from dew.nn import sharding
 
 from . import generation
 from .grouped_launch import _GroupedLaunch
+from .templates.axes import GROUPS
 from .templates.gemm import tiling
 from .templates.gemm.hooks import NO_HOOKS, Hooks
 
@@ -77,15 +78,19 @@ class _Cutlass(_GroupedLaunch[tiling.Tiles]):
         """Whether its kernels take the call wherever dew_cutlass holds them (`eligible` adds the installed
         library's generations): bf16 operands, bf16 or fp32 out, int32 sizes, every extent a multiple of 8
         elements (16-byte aligned rows of every operand and output, as its TMA copies and each group's
-        pointers need), no hooks or exact sums, compiled (no interpreter). A stack's layer it reads as a slice
-        of its matrices (`CutlassGmm._fwd`)."""
+        pointers need), no epilogue or exact sums, compiled (no interpreter). A stack's layer it reads as a
+        slice of its matrices, and rows a prologue forms (its sides by row or depth, none by group) as XLA
+        forms them before the call (`_formed`)."""
+        hooks = ba.arguments['hooks']
         operands = [value for name, value in ba.arguments.items()
                     if name in ('tokens', 'kernel', 'cotangent')]
         extents = {extent for operand in operands for extent in operand.shape[1:]}
         return (all(operand.dtype == jnp.bfloat16 for operand in operands)
                 and jnp.dtype(ba.arguments['out_dtype']) in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32))
                 and ba.arguments['sizes'].dtype == jnp.int32 and all(extent % 8 == 0 for extent in extents)
-                and ba.arguments['hooks'] == NO_HOOKS and not ba.arguments.get('exact_sums')
+                and hooks.epilogue is None and hooks.out_dtypes is None
+                and not any(GROUPS in axes for axes in hooks.prologue_axes)
+                and not ba.arguments.get('exact_sums')
                 and not ba.arguments['interpret'])
 
     def space(self, ba) -> tuple[tiling.Tiles, ...]:
@@ -104,6 +109,17 @@ class _Cutlass(_GroupedLaunch[tiling.Tiles]):
 
 
 @dataclasses.dataclass(frozen=True)
+def _formed(tokens: jax.Array, prologue_operands: tuple, hooks: Hooks) -> jax.Array:
+    """The rows a CUTLASS launch multiplies: `tokens` through the call's prologue where it has one, formed by
+    XLA before the call in the tokens' dtype, as `gemm`'s portable program forms them (the copy a call naming
+    CUTLASS takes where the template forms them tile by tile: an input-scaled MoE's rows times their routing
+    weights, models-28's review). Rows read through tables hand on before a CUTLASS launch
+    (`grouped_matmul`'s 'tables' need)."""
+    if hooks.prologue is None:
+        return tokens
+    return hooks.before()(tokens, *prologue_operands).astype(tokens.dtype)
+
+
 class CutlassGmm(_Cutlass):
     """`Gmm` through CUTLASS (the wheel's grouped GEMM target, `dew_cutlass.TARGETS`)."""
 
@@ -117,10 +133,11 @@ class CutlassGmm(_Cutlass):
              trans_rhs: bool, interpret: bool,
              hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
              dense: bool = False, config: tiling.Tiles, return_residuals: bool = False):
-        # No hooks, side operands, second matrix or exact sums: the launch is not eligible for them
-        # (`_Cutlass.eligible`); a dense call is one group, as any.
-        del prologue_operands, epilogue_operands, paired, gather, scatter, interpret, hooks, exact_sums
-        del dense, config, joined, beside, chained
+        # No epilogue, second matrix or exact sums: the launch is not eligible for them (`_Cutlass.eligible`);
+        # a dense call is one group, as any.
+        del epilogue_operands, paired, gather, scatter, interpret, exact_sums, dense, config, joined, beside
+        del chained
+        tokens = _formed(tokens, prologue_operands, hooks)
         if first is not None:
             # A stacked layer's call (a scanned stack's, `gemm._grouped`) reads its groups' matrices from the
             # stack's `first`: the library takes one array of them, so it gets the layer's as a slice, the
@@ -150,7 +167,8 @@ class CutlassTgmm(_Cutlass):
              hooks: Hooks = NO_HOOKS,
              exact_sums: bool = False, dense: bool = False, config: tiling.Tiles,
              return_residuals: bool = False):
-        del prologue_operands, gather, interpret, hooks, exact_sums, dense, config  # as `CutlassGmm._fwd`'s
+        del gather, interpret, exact_sums, dense, config  # as `CutlassGmm._fwd`'s
+        tokens = _formed(tokens, prologue_operands, hooks)
         importlib.import_module('dew_cutlass').registered()
         out = jax.ShapeDtypeStruct((sizes.shape[0], tokens.shape[1], cotangent.shape[1]),
                                    jnp.dtype(out_dtype))

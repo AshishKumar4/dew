@@ -2399,10 +2399,7 @@ def test_a_cutlass_launch_under_a_checked_shard_map_varies_as_its_operands_do(mo
     is typed as varying there, its operands made to vary alike before the FFI call takes them (#3976's
     review P0: the result was typed the same on every device). Traced on the CPU, the library's targets
     named as a stand-in (no CPU runs its kernels)."""
-    import types
-
-    monkeypatch.setitem(sys.modules, "dew_cutlass", types.SimpleNamespace(
-        TARGETS=("dew_cutlass_gmm", "dew_cutlass_tgmm"), registered=lambda: None))
+    _stand_in_cutlass(monkeypatch)
     gmm = grouped_cutlass.CutlassGmm()
     mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:2]), ("data",))
     data, whole = jax.sharding.PartitionSpec("data"), jax.sharding.PartitionSpec()
@@ -2417,3 +2414,38 @@ def test_a_cutlass_launch_under_a_checked_shard_map_varies_as_its_operands_do(mo
                                  out_specs=data, check_vma=True))(
         jax.ShapeDtypeStruct((64, 32), jnp.bfloat16), jax.ShapeDtypeStruct((4, 32, 16), jnp.bfloat16),
         jax.ShapeDtypeStruct((2,), jnp.int32), jax.ShapeDtypeStruct((2,), jnp.int32))
+
+
+def _stand_in_cutlass(monkeypatch) -> None:
+    """dew_cutlass's targets and its sm90 build named for a CPU's trace (no CPU runs its kernels): what a
+    route to CUTLASS and its launch read of the wheel."""
+    import types
+
+    kernel = types.SimpleNamespace(tile=(128, 256, 64), stages=4, consumers=256, cluster=2,
+                                   instructions="wgmma")
+    monkeypatch.setitem(sys.modules, "dew_cutlass", types.SimpleNamespace(
+        TARGETS=("dew_cutlass_gmm", "dew_cutlass_tgmm"), registered=lambda: None,
+        KERNELS={("sm90", "bfloat16"): kernel, ("sm90", "float32"): kernel}))
+    monkeypatch.setattr(generation, "cutlass_built", lambda: {"sm90": "sm90"})
+
+
+def test_a_call_naming_cutlass_takes_its_rows_through_a_prologue(monkeypatch):
+    """A grouped product whose rows a prologue forms (an input-scaled MoE's rows times their routing
+    weights), its route named CUTLASS on an sm90: its forward and both gradients run CUTLASS's launches, the
+    rows formed by XLA before them (`grouped_cutlass._formed`), where the named route refused the prologue
+    and raised (models-28's review)."""
+    _stand_in_cutlass(monkeypatch)
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    sizes = jnp.asarray([64, 64], jnp.int32)
+
+    def loss(x, w, weights):
+        out = gemm.gemm(x, w, sizes, prologue=lambda rows, scale: rows * scale[:, None],
+                        prologue_operands=((weights, ("rows",)),), out_dtype=jnp.bfloat16)
+        return jnp.sum(out.astype(jnp.float32))
+
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="cutlass"):
+        graph = jax.make_jaxpr(jax.grad(loss, argnums=(0, 1, 2)))(
+            bf16((128, 64)), bf16((2, 64, 128)), bf16((128,)))
+    targets = [eqn.params["target_name"] for eqn in equations(graph, platform="cuda")
+               if eqn.primitive.name == "ffi_call"]
+    assert sorted(set(targets)) == ["dew_cutlass_gmm", "dew_cutlass_tgmm"], targets
