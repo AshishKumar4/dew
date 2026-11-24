@@ -1202,11 +1202,9 @@ def _forked_steps(forms, operands, given, forked, held: int, documents: int, dec
         leaving = jax.tree.map(lambda a, b: jnp.where(ends, a, b), left, leaving)
         return (memory_in, chunk, leaving), table, outputs, entering
 
-    def mapped_alone(chunk):
-        prepared = forms.prepare(chunk)
-        return forms.mapped(prepared, (decayed, zero), forms.step((decayed, zero), prepared)[1])
-
-    shaped = jax.eval_shape(mapped_alone, jax.tree.map(lambda x: x[0], operands))
+    # A forked walk's forms are a single state's, which keep nothing for their outputs (a pair walks none).
+    shaped = jax.eval_shape(lambda chunk: forms.mapped(forms.prepare(chunk), (decayed, zero), None),
+                            jax.tree.map(lambda x: x[0], operands))
     table = varying_like(jnp.zeros((held, *given.shape[1:]), given.dtype), *reaching)
     start = (((decayed, zero), varying_like(jnp.asarray(-1), origins), (decayed, zero)), table,
              varying_like(jnp.zeros((chunks, *shaped.shape), shaped.dtype), *reaching),
