@@ -835,13 +835,15 @@ def gated_experts(x: jax.Array | Gathered, gate: jax.Array | Layered, up: jax.Ar
     and `noted`, what records the down projection's rows (their gated product) there (`dense.recorded`)."""
     compute, paired = _paired(x, gate, up, dtype)
     down_stack, down_layer = (down.stack, down.layer) if isinstance(down, Layered) else (down, None)
+    fusable = (paired is not None and down_layer is paired[-1] and not isinstance(down_stack, formats.NvFp4)
+               and not _recipe_takes_experts(down_stack) and not isinstance(activation, Situ))
     # The gated product's hook where a launch's epilogue and prologue take its operations (`hook_lowers`, as
     # `dew.nn.gated_mlp` asks: an exact GELU's erfc lowers on no Mosaic launch), else None.
-    tile = jax.ShapeDtypeStruct((128, 128), compute)
-    named = None if isinstance(activation, Situ) else gated_hook(activation, limit)
-    hook = named if named is not None and hook_lowers(named, (tile, tile), generation.gpu_target()) else None
-    if (paired is None or down_layer is not paired[-1] or isinstance(down_stack, formats.NvFp4)
-            or _recipe_takes_experts(down_stack) or hook is None):
+    hook = gated_hook(activation, limit) if fusable else None
+    if hook is not None and not hook_lowers(hook, (jax.ShapeDtypeStruct((128, 128), compute),) * 2,
+                                            generation.gpu_target()):
+        hook = None
+    if paired is None or hook is None:
         gate_scale, up_scale, down_scale = scales or (None, None, None)
         gate_rows, up_rows = (_apart(x, (gate, up), group_sizes, compute, implementation, precision,
                                      (gate_scale, up_scale))
