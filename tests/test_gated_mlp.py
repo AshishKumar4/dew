@@ -81,9 +81,9 @@ def test_a_gated_mlp_runs_fused_where_named_and_its_products_apart_where_no_rece
     (`gated_mlp.FUSED_CELLS`) runs its products apart, and fused where the block names it
     (`generation.chosen(gated_mlp='fused')`) and the template launches its products, its output the products
     apart's shape and dtype; its products apart where the projections add a bias, which the fused MLP's hooks
-    do not add, or where the run's low-precision recipe takes the products by their role
-    (`projections.recipe_projection`, which the fused products do not run), each a handoff, even named. Its
-    numerics are `fused_products`' (above) and the matrix's (tests/gated_mlp_matrix.py)."""
+    do not add, a handoff even named; where the run's low-precision recipe takes the products by their role,
+    the recipe's chain of them (`projections.recipe_chain`, row 12689), which no fused MLP's choice reads,
+    even named. Its numerics are `fused_products`' (above) and the matrix's (tests/gated_mlp_matrix.py)."""
     from dew.nn.mlp import GatedMLP
 
     def kernels(layer, **choices):
@@ -102,10 +102,10 @@ def test_a_gated_mlp_runs_fused_where_named_and_its_products_apart_where_no_rece
     assert kernels(biased, gated_mlp="fused") == ["apart"]
     with generation.run_precision(Numerics(low_precision=LowPrecision())):
         # A role-less MLP's products keep the run's dtypes, which the fused MLP runs; one in the role the
-        # recipe takes hands them to their own calls.
+        # recipe takes runs them as the recipe's chain.
         assert kernels(plain, gated_mlp="fused") == ["fused"]
         with projection_role("mlp"):
-            assert kernels(plain, gated_mlp="fused") == ["apart"]
+            assert kernels(plain, gated_mlp="fused") == []
 
 
 @pytest.mark.parametrize("generation_name", generations("sm90", "sm100"))

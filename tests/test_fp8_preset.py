@@ -799,34 +799,41 @@ def test_the_blockwise_recipes_scales_meet_its_products_in_range():
 
 
 
-def test_an_ungated_mlps_projections_run_as_one_recipe_chain_bitwise_their_two_apart():
-    """An ungated MLP whose two projections DeepSeek-V3's blockwise FP8 recipe takes in its role runs them as
-    one chain (`projections.recipe_chain`, row 8547): one recipe region of the recipe's derivative where the
-    two apart held one each (`dew.nn.derivatives.Surrogate`), its rows any count (laid in whole blocks), and
-    its output and every gradient, the rows' and both kernels', bitwise the two projections apart with its
-    activation between them (`projections.recipe_projection`)."""
+@pytest.mark.parametrize("activation", ["gelu", "swiglu"])
+def test_an_mlps_projections_run_as_one_recipe_chain_bitwise_their_projections_apart(activation):
+    """An MLP whose projections DeepSeek-V3's blockwise FP8 recipe takes in its role runs them as one chain
+    (`projections.recipe_chain`): an ungated one's up and down (row 8547), a gated one's gate, up and down,
+    its gated product in the up projection's epilogue (row 12689). One recipe region of the recipe's
+    derivative where the projections apart held one each (`dew.nn.derivatives.Surrogate`), its rows any
+    count (laid in whole blocks), and its output and every gradient, the rows' and every kernel's, bitwise
+    the projections apart with its activation between them (`projections.recipe_projection`)."""
     from reference_error import equations
 
-    from dew.nn.activations import ungated_activation
+    from dew.nn.activations import gated_product, ungated_activation
     from dew.nn.derivatives import Surrogate
     from dew.nn.mlp import GatedMLP
     from dew.nn.precision import projection_role
 
     fp8 = RECIPE_NUMERICS["blockwise_fp8"]
-    mlp = GatedMLP(hidden_features=256, out_features=128, activation="gelu", dtype=jnp.bfloat16)
+    mlp = GatedMLP(hidden_features=256, out_features=128, activation=activation, dtype=jnp.bfloat16)
     x = jax.random.normal(jax.random.key(0), (2, 100, 128), jnp.bfloat16)
     variables = nn.unbox(mlp.init(jax.random.key(1), x))
+    gated = activation == "swiglu"
 
     def chained(variables, x):
         return mlp.apply(variables, x)
 
     def apart(variables, x):
         rows = x.reshape(-1, x.shape[-1])
-        up = projections.recipe_projection(rows, variables["params"]["up_proj"]["kernel"].astype(x.dtype),
-                                           out_dtype=x.dtype)
-        hidden = ungated_activation("gelu", up)
-        out = projections.recipe_projection(
-            hidden, variables["params"]["down_proj"]["kernel"].astype(x.dtype), out_dtype=x.dtype)
+
+        def projected(rows, name):
+            kernel = variables["params"][name]["kernel"].astype(x.dtype)
+            return projections.recipe_projection(rows, kernel, out_dtype=x.dtype)
+
+        up = projected(rows, "up_proj")
+        hidden = (gated_product(activation)(projected(rows, "gate_proj"), up) if gated
+                  else ungated_activation(activation, up))
+        out = projected(hidden, "down_proj")
         return out.reshape(*x.shape[:-1], out.shape[-1])
 
     with generation.run_precision(fp8), projection_role("mlp"):
@@ -846,13 +853,17 @@ def _bits(leaf) -> np.ndarray:
     return held.view(np.dtype(f"u{held.dtype.itemsize}"))
 
 
-@pytest.mark.parametrize("kind", ["a function of its own", "mixed dtypes", "a sequence axis", "float64",
-                                  "a promotion of its own"])
-def test_an_mlp_the_chain_cannot_read_runs_its_projections_apart(kind):
-    """An ungated MLP the recipe's chain cannot run as its projections apart runs them apart, one recipe
-    region each (`dew.nn.derivatives.Surrogate`): an activation given as a function of its own, which the
-    chain would call on its rows flattened and padded (a function of one placement or mixing positions reads
-    them otherwise); kernels of two dtypes, whose products promote apart (a bf16 up projection's into a
+@pytest.mark.parametrize(("kind", "activation"), [
+    pytest.param("a function of its own", "relu", id="a function of its own"),
+    *(pytest.param(kind, activation, id=f"{kind}-{activation}")
+      for kind in ("mixed dtypes", "a sequence axis", "float64", "a promotion of its own")
+      for activation in ("gelu", "swiglu")),
+])
+def test_an_mlp_the_chain_cannot_read_runs_its_projections_apart(kind, activation):
+    """An MLP the recipe's chain cannot run as its projections apart, ungated or gated, runs them apart, one
+    recipe region each (`dew.nn.derivatives.Surrogate`): an activation given as a function of its own, which
+    the chain would call on its rows flattened and padded (a function of one placement or mixing positions
+    reads them otherwise); kernels of two dtypes, whose products promote apart (a bf16 up projection's into a
     float32 down projection's, its output float32); rows a sequence axis splits, which the chain would
     flatten past the hidden activation's placement; float64, which its quantizing epilogue does not write;
     and a projection promoting its operands by a function of its own, which the chain would skip."""
@@ -876,7 +887,7 @@ def test_an_mlp_the_chain_cannot_read_runs_its_projections_apart(kind):
     linear = (functools.partial(Dense, promote_dtype=promoted) if kind == "a promotion of its own"
               else None)
     mlp = GatedMLP(hidden_features=256, out_features=128,
-                   activation=jax.nn.relu if kind == "a function of its own" else "gelu",
+                   activation=jax.nn.relu if kind == "a function of its own" else activation,
                    dtype=None if mixed else jnp.float64 if wide else jnp.bfloat16,
                    **({} if linear is None else {"linear": linear}))
     # A float64 run's whole: its rows drawn, its parameters made and its graph traced under x64.
@@ -886,8 +897,8 @@ def test_an_mlp_the_chain_cannot_read_runs_its_projections_apart(kind):
         variables = nn.unbox(mlp.init(jax.random.key(1), x))
     if mixed:
         params = variables["params"]
-        variables = {"params": {"up_proj": {"kernel": params["up_proj"]["kernel"].astype(jnp.bfloat16)},
-                                "down_proj": {"kernel": params["down_proj"]["kernel"].astype(jnp.float32)}}}
+        variables = {"params": {name: {"kernel": params[name]["kernel"].astype(
+            jnp.float32 if name == "down_proj" else jnp.bfloat16)} for name in params}}
     placed = (jax.sharding.use_abstract_mesh(AbstractMesh((2,), ("sequence",), axis_types=(AxisType.Auto,)))
               if kind == "a sequence axis" else contextlib.nullcontext())
     with generation.run_precision(fp8), projection_role("mlp"), placed, widened:
@@ -895,5 +906,5 @@ def test_an_mlp_the_chain_cannot_read_runs_its_projections_apart(kind):
         out = jax.eval_shape(lambda variables, x: mlp.apply(variables, x), variables, x)
     regions = [equation for equation in equations(graph) if equation.primitive.name == "marked_call"
                and isinstance(equation.params.get("kind"), Surrogate)]
-    assert len(regions) == 2, len(regions)
+    assert len(regions) == (3 if activation == "swiglu" else 2), len(regions)
     assert out.dtype == (jnp.float32 if mixed else jnp.float64 if wide else jnp.bfloat16)
