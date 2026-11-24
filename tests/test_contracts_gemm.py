@@ -307,7 +307,8 @@ def test_a_gated_blockwise_fp8_chain_holds_every_reverse_order(edge):
     projection's own surrogate): every reverse order, under a nested jit and a scan, in the rows and the three matrices,
     finite wherever float64 is a normal float32 and wherever the plain product of the three through SwiGLU
     is, at values whose products near float32's ends (row 12689). It takes no forward order."""
-    primals = normal_draw(12689, (256, 128), (1, 128, 256), (1, 128, 256), (1, 256, 128), scale=EDGES[edge])
+    primals = normal_draw(12689, (256, 128), (1, 128, 256), (1, 128, 256), (1, 256, 128),
+                          scale=EDGES[edge])
     direction = normal_draw(12690, (256, 128), (1, 128, 256), (1, 128, 256), (1, 256, 128),
                             scale=EDGES[edge])
     (cotangent,) = normal_draw(12691, (256, 128))
