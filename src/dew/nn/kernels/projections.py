@@ -407,9 +407,10 @@ def nvfp4_chain(x: jax.Array, w_up: jax.Array, w_down: jax.Array, activation, *,
     and the hidden activation's (`delayed_tensor_scale` of the run's histories), each product rounded to
     `out_dtype`, the activation of the rounded up projection rounded again, as an MLP's projections run
     apart: the up projection's epilogue scaling its sums by both its operands' tensor scales and quantizing
-    their activation at `t` as the down projection's rows (`quantized.nvfp4_epilogue`: E2M1 codes one a
-    byte, which XLA packs, and E4M3 block scales stored `[hidden / 16, rows]`), which the down projection
-    reads as they are (`NvFp4Block.encoded`), no quantizing pass of their own between the two (row 12721).
+    their activation at `t` as the down projection's rows (`quantized.nvfp4_epilogue`: E2M1 codes stored
+    two a byte, row 12743, and E4M3 block scales stored `[hidden / 16, rows]`), which the down projection
+    reads as they are (`NvFp4Block.packed`), no quantizing or packing pass of their own between the two (row
+    12721).
     With `gate` (`w_up`'s shape), a gated MLP's: `activation(gate_product, up_product)`, the gate's product
     (at `s` too) stored and read by the up projection's epilogue. Bitwise the projections apart at the same
     scales, forward and reverse (each projection's own surrogate, `_nvfp4_backward`); `activation` is an
@@ -576,8 +577,9 @@ def _nvfp4_chain_value(x, w_ins, w_down, group_blocks, tensor_scales, activation
     """`nvfp4_chain`'s value and its first projections' rounded products: an ungated MLP's up, or a gated
     one's gate and up (the gate's its side tile), each of the rows at their delayed tensor scale, the up
     projection's epilogue (`gemm.nvfp4_block_finished`: its sums times both tensor scales) quantizing their
-    activation at the hidden activation's (`quantized.nvfp4_epilogue`: E2M1 codes one a byte and E4M3 block
-    scales `[width / 16, rows]`), read by the down projection as they are stored (`NvFp4Block.encoded`)."""
+    activation at the hidden activation's (`quantized.nvfp4_epilogue`: E2M1 codes stored two a byte, the
+    form's `packed`, row 12743, and E4M3 block scales `[width / 16, rows]`), read by the down projection as
+    they are stored (`NvFp4Block.packed`)."""
     from dew.nn.kernels.templates.gemm import quantized
 
     rows_scale, hidden_scale = tensor_scales
@@ -588,9 +590,10 @@ def _nvfp4_chain_value(x, w_ins, w_down, group_blocks, tensor_scales, activation
     product, codes, scales = nvfp4_block_finished(
         rows, up, group_blocks, epilogue=quantized.nvfp4_epilogue(activation, out_dtype),
         out_dtypes=(out_dtype, jnp.uint8, jnp.float8_e4m3fn), epilogue_operands=gated,
-        epilogue_scalars=(hidden_scale,), out_forms=(None, None, (NVFP4_BLOCKS.depth, True)), dense=True,
-        interpret_on_cpu=interpret)
-    hidden = NvFp4Block.encoded(codes, scales.T, hidden_scale)
+        epilogue_scalars=(hidden_scale,),
+        out_forms=(None, quantized.Form(2, packed=True), quantized.Form(NVFP4_BLOCKS.depth, transposed=True)),
+        dense=True, interpret_on_cpu=interpret)
+    hidden = NvFp4Block.packed(codes, scales.T, hidden_scale)
     out = nvfp4_block_product(hidden, NvFp4Block.quantized(jnp.swapaxes(w_down, 1, 2)), group_blocks,
                               out_dtype=out_dtype, interpret_on_cpu=interpret)
     return out, (*gated, product)

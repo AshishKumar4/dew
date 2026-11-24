@@ -569,7 +569,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                 finished = functools.partial(
                     _gmm_finished, accs, wg=wg, store=store, family=family, part=part,
                     share_row=tiles.share_row(wg), m=m, g=g, dense=dense, row_tile=block_m * pair,
-                    whole=any(form is not None and form[1] for form in forms),
+                    whole=any(form is not None and form.transposed for form in forms),
                     epilogue=epilogue, flags=(flags_gmem, pair, tiles.sharing),
                     sides=tuple(zip(side_gmems, epilogue_axes, side_smems, side_barriers, strict=True)),
                     partials=None if tail is None else (workspace, ready))
@@ -881,21 +881,23 @@ def _finished(*accs, family: mosaic.Family, wg, epilogue, o_gmems: tuple, store,
     layout = family.layout if family.budgets_registers else None
     for start, chunk in family.chunks(accs):
         columns = {'columns': slice(start, start + chunk[0].shape[-1])}
+        # The epilogue and each output's store in the accumulator's layout: a form's write reads it (a
+        # packed output's pairs, `quantized.paired`).
         with quantized.epilogue_layout(layout):
             values = chunk if epilogue is None else epilogue(*chunk, *(
                 axes.by_rows(family.side_tile(smem.at[wg].at[axes.placed(axes.held(side_axes), columns)],
                                               axes.held(side_axes)), side_axes, rows)
                 for _, side_axes, smem, _ in sides))
-        values = values if isinstance(values, tuple) else (values,)
-        for output, (o_gmem, value) in enumerate(zip(o_gmems, values, strict=True)):
-            value = value.astype(_stored_dtype(o_gmem))
-            if nonfinite is not None:
-                # An entry times zero is NaN where it is infinite or NaN, zero elsewhere, of the rows the
-                # share stores: a predicate reduced over the warpgroup by a barrier, no scratch.
-                kept = family.iota(value.shape, 0) - first
-                stored_rows = (kept >= 0) & (kept < stored)
-                seen = seen | jnp.any(stored_rows & jnp.isnan(value * 0))
-            store(output, value, o_gmem, (row_start, first, stored, column + start, *ladder))
+            values = values if isinstance(values, tuple) else (values,)
+            for output, (o_gmem, value) in enumerate(zip(o_gmems, values, strict=True)):
+                value = value.astype(_stored_dtype(o_gmem))
+                if nonfinite is not None:
+                    # An entry times zero is NaN where it is infinite or NaN, zero elsewhere, of the rows the
+                    # share stores: a predicate reduced over the warpgroup by a barrier, no scratch.
+                    kept = family.iota(value.shape, 0) - first
+                    stored_rows = (kept >= 0) & (kept < stored)
+                    seen = seen | jnp.any(stored_rows & jnp.isnan(value * 0))
+                store(output, value, o_gmem, (row_start, first, stored, column + start, *ladder))
     if nonfinite is not None:
         nonfinite[...] = jnp.broadcast_to(seen.astype(jnp.int32), (1,))
 

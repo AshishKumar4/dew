@@ -4,6 +4,8 @@ and quantizes their activation at the hidden activation's delayed tensor scale a
 (`gemm.nvfp4_block_finished`, `quantized.nvfp4_epilogue`), bitwise the projections apart at the same
 scales."""
 
+import contextlib
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -115,16 +117,15 @@ def test_a_delayed_nvfp4_chain_of_no_rows_or_a_scale_an_array_is_no_chain():
                                     tensor_scales=refused[1])
 
 
-@INTERPRETS
-@pytest.mark.parametrize("gated", [False, True], ids=["ungated", "gated"])
-def test_a_delayed_nvfp4_chain_through_the_template_is_its_projections_apart(gated):
+def a_delayed_nvfp4_chain_is_its_projections_apart(gated: bool, *, interpret: bool) -> None:
     """An MLP's NVFP4 projections chained at delayed tensor scales (`projections.nvfp4_chain`) through the
-    template named, interpreted as a B200's: the up projection's block-scaled tcgen05 product taking an
-    epilogue that scales its sums by both tensor scales and quantizes their activation (with a gate, its
-    rounded product a side tile) as E2M1 codes and E4M3 block scales, four 16-column blocks a 64-column
-    chunk stored transposed, which the down projection reads as stored; every NVFP4 product the template's,
-    and its value and every gradient bitwise the projections apart (`nvfp4_projection`) at the same scales
-    with the activation between them in XLA (row 12721)."""
+    template named, as a B200 runs them (interpreted on a CPU process): the up projection's block-scaled
+    tcgen05 product taking an epilogue that scales its sums by both tensor scales and quantizes their
+    activation (with a gate, its rounded product a side tile) as E2M1 codes stored two a byte (row 12743)
+    and E4M3 block scales, four 16-column blocks a 64-column chunk stored transposed, which the down
+    projection reads as stored; every NVFP4 product the template's, and its value and every gradient bitwise
+    the projections apart (`nvfp4_projection`) at the same scales with the activation between them in XLA
+    (row 12721)."""
     x, matrices, down, cotangent = _operands(12731 + gated, 256, gated)
     matrices, down = [matrix[None] for matrix in matrices], down[None]
     scales = _scales(x)
@@ -134,24 +135,51 @@ def test_a_delayed_nvfp4_chain_through_the_template_is_its_projections_apart(gat
     def chained(x, *matrices):
         *gate, up, down = matrices
         return projections.nvfp4_chain(x, up, down, activation, out_dtype=jnp.bfloat16, tensor_scales=scales,
-                                       gate=gate[0] if gate else None, interpret_on_cpu=True)
+                                       gate=gate[0] if gate else None, interpret_on_cpu=interpret)
 
     def apart(x, *matrices):
         *firsts, down = matrices
 
         def projected(rows, matrix, scale):
             return projections.nvfp4_projection(rows, matrix, group_blocks, out_dtype=jnp.bfloat16,
-                                                tensor_scale=scale, interpret_on_cpu=True)
+                                                tensor_scale=scale, interpret_on_cpu=interpret)
 
         hidden = activation(*(projected(x, matrix, scales[0]) for matrix in firsts)).astype(jnp.bfloat16)
         return projected(hidden, down, scales[1])
 
-    with generation.assumed("sm100"), generation.chosen(nvfp4_block="mosaic"), generation.routes() as routes:
+    assumed = generation.assumed("sm100") if interpret else contextlib.nullcontext()
+    with assumed, generation.chosen(nvfp4_block="mosaic"), generation.routes() as routes:
         fused = jax.jit(with_gradients(chained))(x, *matrices, down, cotangent)
         separate = jax.jit(with_gradients(apart))(x, *matrices, down, cotangent)
     names = ("value", "d_x", *(f"d_{name}" for name in ("gate", "up")[2 - len(matrices):]), "d_down")
     assert_bitwise_leaves(names, fused, separate)
     assert {route.kernel for route in routes if route.choice == "nvfp4_block"} == {"mosaic"}
+
+
+@INTERPRETS
+@pytest.mark.parametrize("gated", [False, True], ids=["ungated", "gated"])
+def test_a_delayed_nvfp4_chain_through_the_template_is_its_projections_apart(gated):
+    """`a_delayed_nvfp4_chain_is_its_projections_apart`, interpreted as a B200's (its native run a GPU
+    tier cell, tests/test_gpu_gemm.py)."""
+    a_delayed_nvfp4_chain_is_its_projections_apart(gated, interpret=True)
+
+
+def test_nvfp4_codes_stored_two_a_byte_read_back_as_their_float4_codes():
+    """An epilogue's E2M1 codes stored packed (`quantized.Form`'s `packed`, XLA's form of its store) are
+    the float4 codes `NvFp4Block.quantized` forms at the same tensor scale, read back as stored
+    (`NvFp4Block.packed`): two a byte, `[rows, columns / 2]`, the even column's in the low nibble, as XLA
+    packs float4 (row 12743); a packed form transposed or of other than two codes a byte is refused."""
+    x = jnp.asarray(np.random.default_rng(12743).normal(size=(64, 128)), jnp.float32)
+    scale = jnp.float32(2.0 ** -7)
+    want = formats.NvFp4Block.quantized(x, scale)
+    codes = bits.nvfp4_coded(x.T, scale)[0].T.astype(jnp.uint8)
+    stored = quantized.stored(codes, quantized.Form(2, packed=True))
+    assert stored.shape == (64, 64) and stored.dtype == jnp.uint8
+    got = formats.NvFp4Block.packed(stored, want.scales, scale)
+    np.testing.assert_array_equal(np.asarray(got.codes).view(np.uint8), np.asarray(want.codes).view(np.uint8))
+    for refused in (quantized.Form(2, transposed=True, packed=True), quantized.Form(4, packed=True)):
+        with pytest.raises(ValueError):
+            quantized.forms_of((None, refused), 2)
 
 
 def _finished_up_projection():
@@ -165,7 +193,8 @@ def _finished_up_projection():
                 rows, formats.NvFp4Block.quantized(w_up), jnp.asarray([8], jnp.int32),
                 epilogue=quantized.nvfp4_epilogue(_swiglu, jnp.bfloat16),
                 out_dtypes=(jnp.bfloat16, jnp.uint8, jnp.float8_e4m3fn), epilogue_operands=(gate,),
-                epilogue_scalars=(jnp.float32(2.0 ** -9),), out_forms=(None, None, (16, True)), dense=True)
+                epilogue_scalars=(jnp.float32(2.0 ** -9),), dense=True,
+                out_forms=(None, quantized.Form(2, packed=True), quantized.Form(16, transposed=True)))
 
     return product, (jax.ShapeDtypeStruct((1024, 4096), jnp.float32),
                      jax.ShapeDtypeStruct((1024, 14336), jnp.bfloat16),
@@ -175,10 +204,11 @@ def _finished_up_projection():
 @COMPILES_ON_CPU
 def test_a_delayed_nvfp4_up_projection_compiles_for_a_b200_within_its_resources():
     """The fused up projection of a delayed NVFP4 chain (its block-scaled tcgen05 product's epilogue scaling
-    its sums, taking a gate's tile and quantizing the hidden activation, its block scales four 16-column
-    blocks a 64-column chunk stored transposed), compiled by Mosaic for a compile-only B200 on this CPU
-    through ptxas (tests/kernel_compile.py): a template kernel within its shared and tensor memory, no
-    register spilled (row 12721)."""
+    its sums, taking a gate's tile and quantizing the hidden activation, its codes paired two a byte in the
+    registers that hold them, row 12743, its block scales four 16-column blocks a 64-column chunk stored
+    transposed), compiled by Mosaic for a compile-only B200 on this CPU through ptxas
+    (tests/kernel_compile.py): a template kernel within its shared and tensor memory, no register spilled
+    (row 12721)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 

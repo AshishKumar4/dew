@@ -19,6 +19,9 @@ one process (`gpu_flow`), each cell its own file's property:
   accumulator width and on a two-CTA pair, the pair also on extents no tile divides (test_gemm_tcgen05).
 - The NVFP4 product's packed kernel (its mainloop decoding each stage in place) holds every order on an
   H100 and an A100 (test_contracts_gemm).
+- A delayed NVFP4 MLP's chain on a Blackwell, its up projection's block-scaled epilogue storing the down
+  projection's rows as codes two a byte and transposed block scales, is bitwise its projections apart,
+  value and every gradient, gated and ungated (test_gemm_nvfp4_chain; rows 12721, 12743).
 - A grouped product whose producer gathers its rows from the tokens by a table (cp.async, row 1376) holds
   check 1 on an H100, plain and paired, the paired one's rows stored where a permutation says; a kernel
   gradient reading its tokens and its cotangent through tables is bitwise its gathered rows' on an H100;
@@ -54,6 +57,7 @@ import syrk_matrix
 import test_contracts_gemm as contracts_gemm
 import test_gemm_blockwise as gemm_blockwise
 import test_gemm_gather as gemm_gather
+import test_gemm_nvfp4_chain as gemm_nvfp4_chain
 import test_gemm_paired as gemm_paired
 import test_gemm_tcgen05 as gemm_tcgen05
 import test_gemm_template as gemm_template
@@ -277,6 +281,11 @@ def test_the_gemm_kernels_run_on_this_gpu():
                                 "k_major": k_major})
           for name, dtype in (("float32", jnp.float32), ("bfloat16", jnp.bfloat16))
           for k_major in (False, True)),
+        *(Cell(f"a delayed NVFP4 chain is its projections apart: {'gated' if gated else 'ungated'}",
+               functools.partial(gemm_nvfp4_chain.a_delayed_nvfp4_chain_is_its_projections_apart, gated,
+                                 interpret=False),
+               "sm100", native={"launch": "nvfp4 chain", "epilogue": "packed codes and scales"})
+          for gated in (False, True)),
         *(Cell(f"a pair's partial extents hold check 1: {rows}x{depth}x{width}{' transposed' * transposed}",
                functools.partial(gemm_tcgen05.a_pairs_partial_extents_hold_check_1_on_blackwell, rows, depth,
                                  width, transposed), "sm100", native={"launch": "tcgen05 pair partial"})
