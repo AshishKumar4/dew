@@ -397,15 +397,18 @@ thread runs, armada's p-9776)."""
 # The template rule near float32's largest: its reverse derivative is NaN at entries fla's chunked form keeps
 # finite (ledger 2656).
 @pytest.mark.parametrize("taken", list(TEMPLATE_ORDER_SETS))
-@pytest.mark.parametrize("edge", [edge for edge in EDGES if edge != "near the largest"])
-def test_the_template_rule_holds_its_orders(edge, taken):
+def test_the_template_rule_holds_its_orders(taken):
+    """`assert_template_contract` near float32's least normal over an order set (`TEMPLATE_ORDER_SETS`)."""
+    assert_template_contract("near the least normal", taken)
+
+
+def assert_template_contract(edge: str, taken: str, seeds: int | None = None) -> None:
     """The recurrence template's chunked rule (`template.mosaic_rule`, a custom VJP over the
     mainloop's launches, interpreted off a GPU) as every caller reaches it: the delta rule's op with the
     template named, whose products' wrapper takes every order through the portable math (`_per_product`, row
     2655), a 16-bit call with its chunk inverse's declared bound (keys of unit norm, write gates at most one:
     its domain), from a zero memory: each order of `taken`'s set finite wherever float64 is a normal float32
-    and the delta rule a token at a time is (`plain_delta_rule`), at queries and values whose products near
-    float32's least normal."""
+    and the delta rule a token at a time is (`plain_delta_rule`), at `edge`'s queries and values (`EDGES`)."""
     def draw(seed, scale):
         (query, key, value, g, beta, _), direction, _ = delta_rule_draw(
             2664, seed, scale, key_heads=1, value_heads=1, width=64, length=64, per_key=False,
@@ -427,7 +430,7 @@ def test_the_template_rule_holds_its_orders(edge, taken):
     assert_drawn_contract(jax.jit(rule), draw, EDGES[edge], f"the template rule {edge}",
                           truth_fn=jax.jit(recurrent), plain_fn=jax.jit(recurrent),
                           taking=order_set(taken, INTERPRETED_REMAT, TEMPLATE_ORDER_SETS),
-                          without=INTERPRETED_REMAT)
+                          without=INTERPRETED_REMAT, seeds=seeds)
 
 
 EDGES_BEYOND = [edge for edge in EDGES if edge != "normal"]
@@ -457,24 +460,47 @@ CHECK1_SHARDS = {
         {"seeds": 8, "per_task": 4},
     "test_the_selective_scan_holds_its_orders_over_normal_draws[jvp-of-grad-scanned]":
         {"seeds": 8, "per_task": 4},
+    "test_the_template_rule_holds_its_orders_over_normal_draws[primal-and-jvp]": {"seeds": 8, "per_task": 4},
+    "test_the_template_rule_holds_its_orders_over_normal_draws[vjp]": {"seeds": 8, "per_task": 4},
+    "test_the_template_rule_holds_its_orders_over_normal_draws[jvp-of-grad]": {"seeds": 8, "per_task": 4},
+    "test_the_template_rule_holds_its_orders_over_normal_draws[second-jvp]": {"seeds": 8, "per_task": 4},
+    "test_the_template_rule_holds_its_orders_over_normal_draws[grad-of-grad]": {"seeds": 8, "per_task": 4},
+    "test_the_template_rule_holds_its_orders_over_normal_draws[jvp-of-grad-remat]":
+        {"seeds": 8, "per_task": 4},
+    "test_the_template_rule_holds_its_orders_over_normal_draws[second-jvp-remat]":
+        {"seeds": 8, "per_task": 4},
+    "test_the_template_rule_holds_its_orders_over_normal_draws[jvp-of-grad-nested-jit]":
+        {"seeds": 8, "per_task": 4},
+    "test_the_template_rule_holds_its_orders_over_normal_draws[jvp-of-grad-scanned]":
+        {"seeds": 8, "per_task": 4},
 }
 """The selective scan's normal-draw sites, an order set each (`ORDER_SETS`), by node id, a literal the CI plan
 reads as it reads a mark's (tools/armada/ci.py): a map task compiles a set's programs once for its draws (an
 interpreted second order's 60 to 170 s, then 30 to 40 s a draw: the five sets in two tasks of four draws each
 ran past 20 minutes a task, a set's eight draws in one 141 to 421 s), four draws a task but the second jvp's
-eight."""
+eight; and the template rule's normal-draw sites, an order set each (`TEMPLATE_ORDER_SETS`), sized each run
+in one cell 92 to 161 s (main's tests/test_durations.json at 0a14c3e75, row 12405), four draws a task."""
 
 
-def normal_order_cases() -> list:
-    """`ORDER_SETS` as the selective scan's normal-draw parameters, each marked from `CHECK1_SHARDS`."""
-    test = "test_the_selective_scan_holds_its_orders_over_normal_draws"
-    cases = [(taken, taken.replace(",", "").replace(" ", "-")) for taken in ORDER_SETS]
+def normal_order_cases(test: str, sets: dict) -> list:
+    """`sets`' order sets (`ORDER_SETS`, `TEMPLATE_ORDER_SETS`) as `test`'s normal-draw parameters, each
+    marked from `CHECK1_SHARDS`."""
+    cases = [(taken, taken.replace(",", "").replace(" ", "-")) for taken in sets]
     return [pytest.param(taken, id=ident,
                          marks=pytest.mark.check1_shards(**CHECK1_SHARDS[f"{test}[{ident}]"]))
             for taken, ident in cases]
 
 
-@pytest.mark.parametrize("taken", normal_order_cases())
+@pytest.mark.parametrize("taken", normal_order_cases(
+    "test_the_template_rule_holds_its_orders_over_normal_draws", TEMPLATE_ORDER_SETS))
+def test_the_template_rule_holds_its_orders_over_normal_draws(taken, request):
+    """`assert_template_contract` in the normal domain over an order set, check 1 over its declared draws
+    (`CHECK1_SHARDS`)."""
+    assert_template_contract("normal", taken, seeds=marked_seeds(request))
+
+
+@pytest.mark.parametrize("taken", normal_order_cases(
+    "test_the_selective_scan_holds_its_orders_over_normal_draws", ORDER_SETS))
 def test_the_selective_scan_holds_its_orders_over_normal_draws(taken, request):
     """`assert_selective_contract` in the normal domain over an order set (`ORDER_SETS`), check 1 over its
     declared draws (`CHECK1_SHARDS`); the remat orders, which an interpreted kernel takes none of
