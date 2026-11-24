@@ -37,7 +37,7 @@ from dew.data.dataset import (
     stream_identity,
 )
 from dew.distributed.batches import Signature
-from dew.distributed.placement import Layout, MeshSpec, Placement, link_topology, placed_shapes
+from dew.distributed.placement import Layout, Placement, link_topology, placed_shapes
 from dew.mesh import STAGE_AXIS, LayoutRefused, batch_axes
 from dew.nn.kernels.options import Compiling, OuterProgram, Placements, compiling, owned_program
 from dew.nn.sharding import microbatched
@@ -45,12 +45,6 @@ from dew.objectives.base import Held, Initializer
 from dew.objectives.drawn import Parts, drawing, drawn_rest, reassembled
 from dew.state import TrainState, apart, together
 from dew.telemetry.benchmark import samples
-
-
-def mesh_stages(mesh: MeshSpec | Mesh) -> int:
-    """The pipeline stages `mesh` lays out: a `MeshSpec`'s `stage`, a native mesh's stage axis, one where it
-    has none."""
-    return mesh.stage if isinstance(mesh, MeshSpec) else mesh.shape.get(STAGE_AXIS, 1)
 
 
 def stage_microbatches(mesh: Mesh, asked: int | None) -> int:

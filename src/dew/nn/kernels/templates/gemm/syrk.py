@@ -28,7 +28,6 @@ from jax.extend.mlir.dialects import arith as mgpu_arith, vector as mgpu_vector
 
 from dew.nn.kernels import generation, grouped_launch, tuning
 from dew.nn.kernels.templates import (
-    base,
     bundles,
     cost as unit_cost,
     mosaic,
@@ -49,6 +48,7 @@ from dew.nn.kernels.templates.gemm.mosaic_gpu import (
     row_unit,
 )
 from dew.nn.kernels.templates.gemm.pricing import (
+    TilesTemplate,
     epilogue_registers,
     family_of,
     granular_tile,
@@ -148,36 +148,6 @@ def _swizzled_columns_out(smem, dest, row_start, col_start, *, swizzle: int) -> 
         smem, dest, jnp.asarray(row_start, jnp.int32), jnp.asarray(col_start, jnp.int32))
 
 
-def _i32(value: int, i32):
-    """Constant signless 32-bit MLIR integer."""
-    return mgpu_utils.c(value, i32)
-
-
-def _swizzled_tile_anchor(slab, col_bytes, *, row_bytes: int, swizzle: int, i32):
-    """Loop-invariant `(base, within, slab_rem)` for reading `swizzling.TILE_ROWS`-aligned slabs."""
-    if swizzle == swizzling.UNSWIZZLED:
-        return mgpu_arith.addi(mgpu_arith.muli(slab, _i32(row_bytes, i32)), col_bytes), None, None
-    slab_tile = mgpu_arith.divui(slab, _i32(swizzling.TILE_ROWS, i32))
-    slab_rem = mgpu_arith.remui(slab, _i32(swizzling.TILE_ROWS, i32))
-    tile_index = mgpu_arith.addi(mgpu_arith.muli(slab_tile, _i32(row_bytes // swizzle, i32)),
-                                 mgpu_arith.divui(col_bytes, _i32(swizzle, i32)))
-    tile_base = mgpu_arith.muli(tile_index, _i32(swizzling.TILE_ROWS * swizzle, i32))
-    return tile_base, mgpu_arith.remui(col_bytes, _i32(swizzle, i32)), slab_rem
-
-
-def _swizzled_lane_offset(anchor: tuple, dr, *, row_bytes: int, swizzle: int, i32):
-    """Byte offset in swizzled SMEM for row `slab + dr` (`anchor` from `_swizzled_tile_anchor`)."""
-    base, within, slab_rem = anchor
-    if swizzle == swizzling.UNSWIZZLED:
-        return mgpu_arith.addi(base, mgpu_arith.muli(dr, _i32(row_bytes, i32)))
-    in_tile = mgpu_arith.addi(slab_rem, dr)
-    shift = (swizzling.SWIZZLE_BYTES // swizzle).bit_length() - 1
-    shifted = mgpu_arith.shrui(in_tile, _i32(shift, i32)) if shift else in_tile
-    xor_bits = mgpu_arith.shli(shifted, _i32(4, i32))
-    return mgpu_arith.addi(mgpu_arith.addi(base, mgpu_arith.muli(in_tile, _i32(swizzle, i32))),
-                           mgpu_arith.xori(within, xor_bits))
-
-
 def _store_transposed_vec4(base, element, row_stride: int, col_stride: int, dest_row, dest_col, words,
                            *, i32, i64) -> None:
     """Pack 4 i32 words into a 16-byte global vector store at `(dest_row, dest_col)`."""
@@ -190,67 +160,61 @@ def _store_transposed_vec4(base, element, row_stride: int, col_stride: int, dest
 
 
 def _emit_transposed_16(source, store_vec, warp, c_grp, r_blk, row_start, col_start, *,
-                        rows: int, cols: int, row_bytes: int, swizzle: int, i32, byte) -> None:
+                        rows: int, cols: int, staging: swizzling.TracedStaging, c, i32, byte) -> None:
     """16-bit transposed drain: 64x8 warp tiles, staggered `dr` loads, barrel-shift + 2x `v4.u32` stores."""
     n_c = cols // 8
     total = (rows // 64) * n_c
-    mask_lo, mask_hi = _i32(0xFFFF, i32), _i32(0xFFFF0000, i32)
+    mask_lo, mask_hi = c(0xFFFF), c(0xFFFF0000)
 
-    @mgpu_utils.fori(_i32(-(-total // 4), i32), ())
+    @mgpu_utils.fori(c(-(-total // 4)), ())
     def _turns16(turn, carry):
-        blk = mgpu_arith.addi(warp, mgpu_arith.muli(turn, _i32(4, i32)))
-        branch = mgpu_scf.IfOp(mgpu_arith.cmpi(mgpu_arith.CmpIPredicate.slt, blk, _i32(total, i32)))
+        blk = mgpu_arith.addi(warp, mgpu_arith.muli(turn, c(4)))
+        branch = mgpu_scf.IfOp(mgpu_arith.cmpi(mgpu_arith.CmpIPredicate.slt, blk, c(total)))
         with mgpu_ir.InsertionPoint(branch.then_block):
-            r_base = mgpu_arith.muli(mgpu_arith.divui(blk, _i32(n_c, i32)), _i32(64, i32))
-            c_base = mgpu_arith.muli(mgpu_arith.remui(blk, _i32(n_c, i32)), _i32(8, i32))
-            col = mgpu_arith.addi(c_base, mgpu_arith.shli(c_grp, _i32(1, i32)))
-            slab = mgpu_arith.addi(r_base, mgpu_arith.shli(r_blk, _i32(3, i32)))
-            anchor = _swizzled_tile_anchor(slab, mgpu_arith.shli(col, _i32(1, i32)),
-                                           row_bytes=row_bytes, swizzle=swizzle, i32=i32)
+            r_base = mgpu_arith.muli(mgpu_arith.divui(blk, c(n_c)), c(64))
+            c_base = mgpu_arith.muli(mgpu_arith.remui(blk, c(n_c)), c(8))
+            col = mgpu_arith.addi(c_base, mgpu_arith.shli(c_grp, c(1)))
+            slab = mgpu_arith.addi(r_base, mgpu_arith.shli(r_blk, c(3)))
+            anchor = staging.anchor(slab, mgpu_arith.shli(col, c(1)))
             raw = [mgpu_llvm.load(i32, mgpu_utils.getelementptr(
-                source, [_swizzled_lane_offset(anchor, mgpu_arith.andi(
-                    mgpu_arith.addi(_i32(k, i32), r_blk), _i32(7, i32)),
-                    row_bytes=row_bytes, swizzle=swizzle, i32=i32)], byte)) for k in range(8)]
+                source, [staging.address(anchor, mgpu_arith.andi(
+                    mgpu_arith.addi(c(k), r_blk), c(7)))], byte)) for k in range(8)]
             for shift in (1, 2, 4):
-                bit = mgpu_arith.cmpi(mgpu_arith.CmpIPredicate.ne,
-                                      mgpu_arith.andi(r_blk, _i32(shift, i32)), _i32(0, i32))
+                bit = mgpu_arith.cmpi(mgpu_arith.CmpIPredicate.ne, mgpu_arith.andi(r_blk, c(shift)), c(0))
                 raw = [mgpu_arith.select(bit, raw[(d - shift) & 7], raw[d]) for d in range(8)]
             lo = [mgpu_arith.ori(mgpu_arith.andi(raw[2 * i], mask_lo),
-                                 mgpu_arith.shli(mgpu_arith.andi(raw[2 * i + 1], mask_lo), _i32(16, i32)))
+                                 mgpu_arith.shli(mgpu_arith.andi(raw[2 * i + 1], mask_lo), c(16)))
                   for i in range(4)]
-            hi = [mgpu_arith.ori(mgpu_arith.shrui(raw[2 * i], _i32(16, i32)),
+            hi = [mgpu_arith.ori(mgpu_arith.shrui(raw[2 * i], c(16)),
                                  mgpu_arith.andi(raw[2 * i + 1], mask_hi)) for i in range(4)]
             d_row, d_col = mgpu_arith.addi(col_start, col), mgpu_arith.addi(row_start, slab)
             store_vec(d_row, d_col, lo)
-            store_vec(mgpu_arith.addi(d_row, _i32(1, i32)), d_col, hi)
+            store_vec(mgpu_arith.addi(d_row, c(1)), d_col, hi)
             mgpu_scf.YieldOp([])
         return carry
 
 
 def _emit_transposed_32(source, store_vec, warp, c_grp, r_blk, row_start, col_start, *,
-                        rows: int, cols: int, row_bytes: int, swizzle: int, i32, byte) -> None:
+                        rows: int, cols: int, staging: swizzling.TracedStaging, c, i32, byte) -> None:
     """32-bit transposed drain: 32x4 warp tiles, staggered `dr` loads, barrel-shift + `v4.u32` store."""
     n_c = cols // 4
     total = (rows // 32) * n_c
 
-    @mgpu_utils.fori(_i32(-(-total // 4), i32), ())
+    @mgpu_utils.fori(c(-(-total // 4)), ())
     def _turns32(turn, carry):
-        blk = mgpu_arith.addi(warp, mgpu_arith.muli(turn, _i32(4, i32)))
-        branch = mgpu_scf.IfOp(mgpu_arith.cmpi(mgpu_arith.CmpIPredicate.slt, blk, _i32(total, i32)))
+        blk = mgpu_arith.addi(warp, mgpu_arith.muli(turn, c(4)))
+        branch = mgpu_scf.IfOp(mgpu_arith.cmpi(mgpu_arith.CmpIPredicate.slt, blk, c(total)))
         with mgpu_ir.InsertionPoint(branch.then_block):
-            r_base = mgpu_arith.muli(mgpu_arith.divui(blk, _i32(n_c, i32)), _i32(32, i32))
-            c_base = mgpu_arith.muli(mgpu_arith.remui(blk, _i32(n_c, i32)), _i32(4, i32))
+            r_base = mgpu_arith.muli(mgpu_arith.divui(blk, c(n_c)), c(32))
+            c_base = mgpu_arith.muli(mgpu_arith.remui(blk, c(n_c)), c(4))
             col = mgpu_arith.addi(c_base, c_grp)
-            slab = mgpu_arith.addi(r_base, mgpu_arith.shli(r_blk, _i32(2, i32)))
-            anchor = _swizzled_tile_anchor(slab, mgpu_arith.shli(col, _i32(2, i32)),
-                                           row_bytes=row_bytes, swizzle=swizzle, i32=i32)
+            slab = mgpu_arith.addi(r_base, mgpu_arith.shli(r_blk, c(2)))
+            anchor = staging.anchor(slab, mgpu_arith.shli(col, c(2)))
             raw = [mgpu_llvm.load(i32, mgpu_utils.getelementptr(
-                source, [_swizzled_lane_offset(anchor, mgpu_arith.andi(
-                    mgpu_arith.addi(_i32(k, i32), r_blk), _i32(3, i32)),
-                    row_bytes=row_bytes, swizzle=swizzle, i32=i32)], byte)) for k in range(4)]
+                source, [staging.address(anchor, mgpu_arith.andi(
+                    mgpu_arith.addi(c(k), r_blk), c(3)))], byte)) for k in range(4)]
             for shift in (1, 2):
-                bit = mgpu_arith.cmpi(mgpu_arith.CmpIPredicate.ne,
-                                      mgpu_arith.andi(r_blk, _i32(shift, i32)), _i32(0, i32))
+                bit = mgpu_arith.cmpi(mgpu_arith.CmpIPredicate.ne, mgpu_arith.andi(r_blk, c(shift)), c(0))
                 raw = [mgpu_arith.select(bit, raw[(d - shift) & 3], raw[d]) for d in range(4)]
             store_vec(mgpu_arith.addi(col_start, col), mgpu_arith.addi(row_start, slab), raw)
             mgpu_scf.YieldOp([])
@@ -259,25 +223,30 @@ def _emit_transposed_32(source, store_vec, warp, c_grp, r_blk, row_start, col_st
 
 def _emit_transposed_pieces(smem, dest, row_start, col_start, *, swizzle: int) -> None:
     """MLIR emission for `_swizzled_columns_out`: staggered `dr` bijection eliminates bank conflicts at
-    `SWIZZLE_128B`, barrel-shifted in registers into coalesced `v4.u32` (16B) global stores."""
+    `SWIZZLE_128B`, barrel-shifted in registers into coalesced `v4.u32` (16B) global stores via shared
+    `swizzling.TracedStaging` (row 12034)."""
     mem_type = mgpu_ir.MemRefType(smem.type)
     element = mem_type.element_type
     elem_bits = mgpu_utils.bitwidth(element)
     dims = tuple(mem_type.shape)
     rows, cols = (dims[0] * dims[2], dims[1] * dims[3]) if len(dims) == 4 else dims
-    row_bytes = cols * elem_bits // 8
+    staging = swizzling.TracedStaging(cols * elem_bits // 8, swizzle)
     i32, i64, byte = (mgpu_ir.IntegerType.get_signless(w) for w in (32, 64, 8))
+
+    def c(value: int):
+        return mgpu_utils.c(value, i32)
+
     strides, _ = mgpu_ir.MemRefType(dest.type).get_strides_and_offset()
     row_stride, col_stride = strides[0], strides[1]
     source = mgpu_utils.memref_ptr(smem)
     gmem_base = mgpu_llvm.addrspacecast(mgpu_llvm.PointerType.get(address_space=1),
                                         mgpu_utils.memref_ptr(dest))
     tid = mgpu_arith.index_cast(i32, mgpu_gpu.thread_id(mgpu_gpu.Dimension.x))
-    thread = mgpu_arith.remui(tid, _i32(resources.THREADS, i32))
-    warp = mgpu_arith.divui(thread, _i32(32, i32))
-    lane = mgpu_arith.remui(thread, _i32(32, i32))
-    c_grp = mgpu_arith.divui(lane, _i32(8, i32))
-    r_blk = mgpu_arith.remui(lane, _i32(8, i32))
+    thread = mgpu_arith.remui(tid, c(resources.THREADS))
+    warp = mgpu_arith.divui(thread, c(32))
+    lane = mgpu_arith.remui(thread, c(32))
+    c_grp = mgpu_arith.divui(lane, c(8))
+    r_blk = mgpu_arith.remui(lane, c(8))
 
     def store_vec(dest_row, dest_col, words) -> None:
         _store_transposed_vec4(gmem_base, element, row_stride, col_stride, dest_row, dest_col, words,
@@ -286,9 +255,8 @@ def _emit_transposed_pieces(smem, dest, row_start, col_start, *, swizzle: int) -
     mgpu_utils.warpgroup_barrier()
     emitter = _emit_transposed_16 if elem_bits == 16 else _emit_transposed_32
     emitter(source, store_vec, warp, c_grp, r_blk, row_start, col_start,
-            rows=rows, cols=cols, row_bytes=row_bytes, swizzle=swizzle, i32=i32, byte=byte)
+            rows=rows, cols=cols, staging=staging, c=c, i32=i32, byte=byte)
     mgpu_utils.warpgroup_barrier()
-
 
 def _write_transposed(smem_t, piece: jax.Array, family: mosaic.Family, tiles: Tiles) -> None:
     """Write `piece` transposed into `smem_t` (`[chunk, share]`): 16-bit uses `stmatrix.trans` directly;
@@ -440,6 +408,8 @@ def syrk(x: jax.Array, *, tiles: Tiles, transpose: bool = False, out_dtype, mult
     (row 11941)."""
     if x.ndim != 3:
         raise ValueError(f"syrk expects 3D [batches, m, k] (or [batches, k, m]), got {x.shape}")
+    if tiles.staging is not None:
+        raise ValueError(f"syrk stages its outputs at its family's own chunks, not {tiles.staging}")
     out_dtype = jnp.dtype(out_dtype)
     if not supports_out_dtype(out_dtype):
         raise ValueError(f"syrk supports 16-bit and 32-bit float outputs, got {out_dtype}")
@@ -567,7 +537,7 @@ def syrk_registers(tiles: Tiles, dtype, out_dtype, *, transpose: bool, polynomia
                    target) -> int | None:
     """Consumer thread register count for `syrk` at `tiles` on `target` (`resources.tile_registers` +
     shared `pricing.epilogue_registers`, row 11982)."""
-    family = family_of(tiles, dtype)
+    family = family_of(tiles, dtype, target)
     if not family.budgets_registers or generation.tpu(target):
         return None
     columns = tile_columns(tiles, family)
@@ -582,7 +552,7 @@ def syrk_launch_of(tiles: Tiles, shape: tuple[int, int, int], dtype, out_dtype, 
                    polynomial: bool, target, interpret: bool = False) -> resources.Launch:
     """Resource planner `Launch` for `syrk` at `tiles` on `target` (`resources.plan`)."""
     _, m, k = shape
-    family = family_of(tiles, dtype)
+    family = family_of(tiles, dtype, target)
     tile_side = tile_rows(tiles, family)
     m_pad = -(-m // tile_side) * tile_side
     k_target = max(k, m_pad) if polynomial else k
@@ -645,15 +615,15 @@ def derive_syrk(shape: tuple[int, int, int], dtype, out_dtype, target, *, transp
 
 
 @dataclasses.dataclass(frozen=True)
-class MosaicSyrk(base.Template[Tiles]):
-    """SYRK (`syrk`) on the shared `Template`/`KernelOp` certification path (`report.launching`,
+class MosaicSyrk(TilesTemplate):
+    """SYRK (`syrk`) on the shared `TilesTemplate`/`KernelOp` certification path (`report.launching`,
     `report.refused`), deriving legal square super-tiles and stepping past spilling tiles."""
 
-    name: ClassVar[str] = "mosaic"
-    GENERATES: ClassVar[bool] = True
     KERNEL: ClassVar[str] = SYRK
-    ROWS: ClassVar[tuple[str, ...]] = ("x",)
     config_cls: ClassVar[type[Tiles]] = Tiles
+
+    def _supports_ba(self, ba) -> bool:
+        return supports_out_dtype(ba.arguments["out_dtype"])
 
     def _shape(self, ba) -> tuple[int, int, int]:
         x = ba.arguments["x"]
@@ -667,22 +637,11 @@ class MosaicSyrk(base.Template[Tiles]):
                               polynomial=ba.arguments["poly_coeffs"] is not None,
                               target=target, interpret=ba.arguments["interpret"])
 
-    def staged_bytes(self, ba, config: Tiles, target) -> int:
-        family = family_of(config, ba.arguments["x"].dtype)
-        return resources.shared_bytes(family, self.launch_of(ba, config, target).scope(config.stages))
-
     def registers(self, ba, config: Tiles, target=None) -> int | None:
         target = generation.gpu_target() if target is None else target
         return syrk_registers(config, ba.arguments["x"].dtype, ba.arguments["out_dtype"],
                               transpose=ba.arguments["transpose"],
                               polynomial=ba.arguments["poly_coeffs"] is not None, target=target)
-
-    def register_budget(self, config: Tiles) -> int:
-        family = family_of(config, jnp.bfloat16)
-        return family.registers(config.warpgroups) if family.budgets_registers else 0
-
-    def program_shared(self, config: Tiles, target) -> int:
-        return resources.program_shared(generation.shared_budget(target), config.programs)
 
     def candidate(self, ba, config: Tiles, target) -> bool:
         x = ba.arguments["x"]
@@ -709,28 +668,12 @@ class MosaicSyrk(base.Template[Tiles]):
         return not (ba.arguments["transpose"] and specialized.operands_in_registers
                     and config.block_k % specialized.transposed_rows != 0)
 
-    def legal(self, ba, config: Tiles, target) -> bool:
-        if not self.candidate(ba, config, target):
-            return False
-        family = family_of(config, ba.arguments["x"].dtype)
-        launch = dataclasses.replace(self.launch_of(ba, config, target),
-                                     floor=config.stages, most=config.stages)
-        return resources.plan([launch], family, target, programs=config.programs) is not None
-
     def derived(self, ba, target) -> Tiles | None:
         return derive_syrk(self._shape(ba), ba.arguments["x"].dtype, ba.arguments["out_dtype"], target,
                            transpose=ba.arguments["transpose"],
                            polynomial=ba.arguments["poly_coeffs"] is not None,
                            interpret=ba.arguments["interpret"],
                            refused=lambda candidate: report.refused(self, ba, candidate, target), ba=ba)
-
-    def eligible(self, ba, target) -> bool:
-        if not supports_out_dtype(ba.arguments["out_dtype"]):
-            return False
-        budgeted = not generation.tpu(target) or target.scoped_vmem is not None
-        if not budgeted or self.derived(ba, target) is None:
-            return False
-        return target != self.launch_target() or self.holds(ba)
 
     def _fwd(self, x: jax.Array, poly_coeffs: jax.Array | None = None, *, transpose: bool = False,
              out_dtype: str = "bfloat16", interpret: bool = False, config: Tiles,
@@ -749,3 +692,30 @@ class MosaicSyrk(base.Template[Tiles]):
 
 MOSAIC_SYRK = MosaicSyrk()
 """The singleton Mosaic SYRK launch on the shared `Template`/`KernelOp` certification path."""
+
+
+MEASURED_GRAM_GENERATIONS: frozenset[str] = frozenset({"sm80", "sm90"})
+"""GPU generations where real receipts (`M-NG-45-a100`, `M-NG-45b-gh200`, row 11941) proved whole-tile
+bf16 symmetric Gram beats XLA (1.52-1.98x across all measured square and rectangular stacked cells)."""
+
+
+def measured_gram(target: generation.GpuTarget, shape: tuple[int, int, int], dtype, *,
+                  transpose: bool, out_dtype=None) -> bool:
+    """Whether symmetric Gram `(target, shape, transpose, dtype, out_dtype)` is admitted by the derived
+    whole-tile bf16 shape-class rule on measured generations (`MEASURED_GRAM_GENERATIONS`, rows 11941,
+    12163): whole square super-tile `m` and step `k`, filling at least one SM wave of upper-triangle CTAs."""
+    if generation.tpu(target) or target.generation not in MEASURED_GRAM_GENERATIONS:
+        return False
+    in_dtype = jnp.dtype(dtype)
+    resolved_out = in_dtype if out_dtype is None else jnp.dtype(out_dtype)
+    if in_dtype != jnp.bfloat16 or resolved_out != jnp.bfloat16:
+        return False
+    g, m, k = (shape[0], shape[2], shape[1]) if transpose else shape
+    tile = derive_syrk((g, m, k), in_dtype, resolved_out, target, transpose=transpose)
+    if tile is None:
+        return False
+    side = tile_rows(tile, family_of(tile, in_dtype, target))
+    if m % side != 0 or k % tile.block_k != 0:
+        return False
+    tiles_m = m // side
+    return g * tiles_m * (tiles_m + 1) // 2 * tile.cluster >= (target.multiprocessors or 1)

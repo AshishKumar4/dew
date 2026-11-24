@@ -71,7 +71,7 @@ from dew._cache import carried, cuda_libraries, plugin_builds, topology_digest, 
 from dew._devices import DEW_SHARE, STATED_GPUS, StatedGpu, device_memory
 from dew._records import JSON, boolean, record
 from dew._stated import Unestablished, traceback_frames
-from dew.batch import Batch
+from dew.batch import Batch, Variables
 from dew.nn.kernels import options
 from dew.nn.kernels.generation import (
     GpuTarget,
@@ -106,8 +106,8 @@ if TYPE_CHECKING:
     from jaxlib._jax import Traceback
 
     from dew.checkpoints import Resume
-    from dew.data.compile import Handed
     from dew.data.dataset import DataPartition, Loader
+    from dew.data.handed import Handed
     from dew.data.pipeline import Dataset
     from dew.state import TrainState
     from dew.training._fit import FitArguments, FitPlan, Start
@@ -684,14 +684,16 @@ def tpu_chips(devices: Sequence) -> str | None:
 def programs_need(device, programs: Iterable[tuple[CompiledMemory | None, int, int]]) -> int | None:
     """The least allocator limit a GPU like `device` must hold to admit each of `programs`, the most of
     them: each a program's memory as XLA analysed it, the bytes a loop keeps beside it and those of them its
-    first call builds, admitted as the planner admits a step (`memory.admission`, `memory.needed`) and read
-    as the limit that GPU's pool holds (`allocator_limit` at its stated share). None for a device of no GPU
-    pool (a TPU's, whose topology states its own) and where a program states no memory."""
+    first call builds, admitted as the planner admits a step (`memory.admission`) and read
+    as a limit of that GPU's pool (`least_limit`, whatever share takes it). None for a device of no GPU
+    pool (a TPU's, whose topology states its own; a CPU's, but one standing in for a GPU, `stand_in_gpus`)
+    and where a program states no memory."""
     from dew.training.memory import admission, least_limit
 
     programs = list(programs)
     stated = [(memory, held, built) for memory, held, built in programs if memory is not None]
-    if device.platform != "gpu" or not programs or len(stated) < len(programs):
+    gpu = device.platform == "gpu" or device in STATED_GPUS
+    if not gpu or not programs or len(stated) < len(programs):
         return None
     return least_limit(device, [admission(memory, held, built) for memory, held, built in stated])
 
@@ -867,12 +869,17 @@ class Keeping:
 
     def save(self, path: str | Path) -> AheadPrograms:
         """Write the programs kept so far to `path` with this process's target, for `kept` in a process of
-        it; returns what it wrote. Each program it could not keep is logged with its reason (`refused`)."""
+        it; returns what it wrote. Each program it could not keep is logged with its reason (`refused`). The
+        target states what its programs need of a device (`programs_need`), not the limit of the GPU that
+        kept them, so a smaller GPU that admits them loads them (row 8711, as rows 8094 and 8371 for a
+        build compiled ahead)."""
         for named, reason in self.refused.items():
             _log.warning("the program %s is not kept, and compiles where the file is handed: %s", named,
                          reason)
-        target = BuildTarget.of(jax.devices())
-        cpu_stated(target, jax.devices())
+        devices = jax.devices()
+        need = programs_need(devices[0], [(kept.executable.memory, 0, 0) for kept in self.kept.values()])
+        target = dataclasses.replace(BuildTarget.of(devices), memory=need)
+        cpu_stated(target, devices)
         # Each compiled on this process's devices, which made its every choice itself.
         programs = AheadPrograms(target, {}, tuned=True, at_run=(), kept=dict(self.kept))
         programs.save(path)
@@ -1330,7 +1337,7 @@ class LaterPlans:
     which plans it as it would have. A pooled run, a host-master or rollout run, one that tunes its kernels or
     runs PGLE plans its phases at their boundaries."""
 
-    def __init__(self, futures: Mapping[int, Future]) -> None:
+    def __init__(self, futures: Mapping[int, Future[Release]]) -> None:
         self.futures = dict(futures)
 
     @classmethod
@@ -1358,7 +1365,7 @@ class LaterPlans:
         # hold per thread), its context variables copied.
         entered = carried()
 
-        def planned(phase: int) -> None:
+        def planned(phase: int) -> Release:
             with entered():
                 return _phase_plan(trainer, shapes, split_fields(phase_batch(trainer, batch, phase))[0],
                                    counts[phase])
@@ -1372,31 +1379,45 @@ class LaterPlans:
         _log.info("planning the steps of data phases %s off the loop", begun)
         return cls(futures)
 
-    def waited(self, passes: int | None) -> None:
+    def waited(self, passes: int | None) -> Release:
         """The plan of the phase whose step runs `passes` waited for, so the executables it compiled, which
-        the process holds (`dew.nn.kernels.options.held`), are there for the boundary's plan; one that
-        failed said, the boundary planning it as it would have."""
+        the process holds (`dew.nn.kernels.options.held`), are there for the boundary's plan, and what drops
+        every one of them but those the boundary's plan takes, which the boundary calls once it takes one
+        (`FitSearch.released_unplanned`); one that failed said, the boundary planning it as it would have."""
         future = self.futures.pop(passes, None) if passes is not None else None
         if future is None:
-            return
+            return _kept
         try:
-            future.result()
+            return future.result()
         except Exception as error:  # the boundary plans the phase as it would have
             _log.warning("planning the step of %d passes off the loop failed; its boundary plans it: %r",
                          passes, error)
+            return _kept
 
     def stopped(self) -> None:
-        """Every phase's plan waited for as the run ends, a pending one not begun, one that failed said."""
+        """Every phase's plan waited for as the run ends, a pending one not begun, one that failed said, and
+        every program a phase the run never reached compiled dropped (`Release`)."""
         for passes, future in self.futures.items():
             if future.cancel():
                 continue
             if (error := future.exception()) is not None:
                 _log.warning("planning the step of %s passes off the loop failed: %r", passes, error)
+            else:
+                future.result()(None)
         self.futures.clear()
 
 
+type Release = Callable[[Planned | None], None]
+"""What drops every program a later phase's plan off the loop held (`FitSearch.released_unplanned`) but the
+plan its boundary took, all of them where none (a phase its run never reached)."""
+
+
+def _kept(planned: Planned | None) -> None:
+    """The release of a phase planned off the loop by nothing: nothing to drop."""
+
+
 def _phase_plan[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], state: TrainState, batch: Batch,
-                                 passes: int) -> None:
+                                 passes: int) -> Release:
     """A plan of `trainer`'s step at `passes` over `state`'s shapes and `batch` (`LaterPlans`), on a compiler
     and objective of its own, its executables held by the process (`dew.nn.kernels.options.hold`), those it
     compiled before a refusal where no candidate fit the devices as they stand off the loop among them, which
@@ -1413,6 +1434,13 @@ def _phase_plan[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], state: Train
     except PlanRefused as refused:
         _log.info("the step of %d passes fits no plan off the loop; its boundary plans it: %s", passes,
                   refused)
+    except BaseException:
+        # Its search's programs dropped where it raised otherwise, its error the boundary's to plan past.
+        if (settle := compiler._provisional()) is not None:
+            settle(None)
+        raise
+    settle = compiler._provisional()
+    return _kept if settle is None else settle
 
 def step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch,
                                  partition: DataPartition | None = None) -> Batch:
@@ -1557,6 +1585,8 @@ def _targeted[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, 
 def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, *, frontier: bool,
                                     plan: FitPlan | None, topology: bytes | None) -> AheadOfTime:
     """`_compiled_ahead`'s planning and compile: the step's plan, its programs and their record."""
+    from dew.distributed.placement import placed_shapes
+
     if trainer.host_master or trainer.rollout is not None or trainer.lower_for is not None:
         raise ValueError("compile-ahead needs a device-resident step over its loader, with no lower_for")
     began = time.perf_counter()
@@ -1584,11 +1614,12 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
     sampled = _sampled_ahead(planned)
     seconds = time.perf_counter() - began
     lowered, compiled = planned.candidate.lowered, planned.executable
-    held = [compiled, *starts.values(), *([] if planned.sampled is None else [planned.sampled.executable])]
     memory = compiled_memory(compiled)
     if memory is None:
         raise ValueError(f"XLA states no memory of the step it compiled for {generation}")
-    need = _step_need(planned, starts, devices[0])
+    programs = _step_programs(planned, starts, placed_shapes(start.abstract, start.shardings))
+    need = programs_need(devices[0], [(compiled_memory(executable), held, built)
+                                      for executable, held, built in programs])
     return AheadOfTime(
         generation, len(devices), dict(trainer.device_mesh.shape), program_digest(lowered),
         Executable.of(compiled),
@@ -1599,19 +1630,51 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
         capacity=capacity, links=dict(trainer.links), target=target,
         built=BuildTarget.built(target, len(devices), need, topology=topology, chips=tpu_chips(devices)),
         refusals=report.refused_launches(), sampled=sampled,
-        at_run=any(report.left_at_run(each) for each in held),
-        starts={digest: Executable.of(executable) for digest, executable in starts.items()})
+        at_run=any(report.left_at_run(executable) for executable, _, _ in programs),
+        starts={digest: Executable.of(executable) for digest, (executable, _) in starts.items()})
 
 
-def _step_need(planned: Planned, starts: Mapping[str, jax.stages.Compiled], device) -> int | None:
-    """What a device must hold to run a step compiled ahead (`programs_need`): its step, with its sampled
-    step, beside the bytes their loop keeps (`Candidate.held`), and the programs that build its fresh state
-    before it (`AheadOfTime.starts`), beside none."""
-    held, built = planned.candidate.held, planned.candidate.built
+def _step_programs(planned: Planned, starts: Started, placed: TrainState
+                   ) -> list[tuple[jax.stages.Compiled, int, int]]:
+    """Every program a run of a step compiled ahead runs, each with the bytes its run holds beside it and
+    those of them its first call builds (`memory.admission`'s `held` and `built`): the one list the build's
+    need (`programs_need`) and its choices left to run time (`report.left_at_run`) read (row 8713). Its
+    step and sampled step beside what their loop keeps (`Candidate.held`); its fresh state's build beside
+    none, run before any state is placed; every other program it runs (`started`) beside what the run holds
+    between its steps (the step's arguments, its first call's builds charged once, and what its loop
+    keeps), less the bytes of the state among the program's own arguments (row 8710: a program run beside
+    the placed state admitted beside none, so a device admitted at the need ran out of memory where the
+    run's own admission refused it); and each beside what of the run's placed state (`placed`) the step's
+    arguments hold none of (`_unread`). The step's memory is stated (`_planned_ahead`)."""
+    candidate = planned.candidate
+    memory = compiled_memory(planned.executable)
+    assert memory is not None
+    unread = _unread(planned.executable, placed, candidate.built)
+    resident = memory.argument - candidate.built + candidate.held + unread
     steps = [planned.executable, *([] if planned.sampled is None else [planned.sampled.executable])]
-    programs = [*((compiled_memory(executable), held, built) for executable in steps),
-                *((compiled_memory(executable), 0, 0) for executable in starts.values())]
-    return programs_need(device, programs)
+    return [*((step, candidate.held + unread, candidate.built) for step in steps),
+            *((executable, 0 if among is None else max(0, resident - among), 0)
+              for executable, among in starts.values())]
+
+
+def _unread(step: jax.stages.Compiled, placed: TrainState, built: int) -> int:
+    """The bytes of the run's placed state (`placed`, each leaf in a device's own memory) the step's
+    arguments hold none of: its state as its arguments carry it (its moving and frozen trees,
+    `step_program`'s first two), each leaf XLA kept there (a leaf it drops holds no sharding,
+    `Compiled.input_shardings`), less its first call's builds (`built`), which the placed state holds none
+    of. A frozen leaf no step reads is among them, held by the devices all the same (row 8710's review: a
+    need read off the step's arguments left out a leaf the run holds, which its evaluation may read)."""
+    from dew.distributed.placement import placed_bytes
+
+    (arguments, _), (shardings, _) = step.in_avals, step.input_shardings
+    # Each kept leaf beside its sharding, a dropped one beside None, by the arguments' own structure (a field
+    # the state holds none of, its window's, a node of neither).
+    read = [jax.ShapeDtypeStruct(aval.shape, aval.dtype, sharding=sharding)
+            for tree, laid in zip(arguments[:2], shardings[:2], strict=True)
+            for aval, sharding in zip(jax.tree.leaves(tree), jax.tree.structure(tree).flatten_up_to(laid),
+                                      strict=True)
+            if sharding is not None]
+    return max(0, placed_bytes(placed, memory="device") - (placed_bytes(read, memory="device") - built))
 
 
 def _sampled_ahead(planned: Planned) -> AheadProgram | None:
@@ -1647,8 +1710,13 @@ def prepare_host_step[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch:
                                                step_batch(trainer, batch))
 
 
+type Started = dict[str, tuple[jax.stages.Compiled, int | None]]
+"""The programs a run compiles besides its step (`started`), each by its digest with the bytes of the run's
+state among its arguments, None for one run before any state is placed."""
+
+
 def started[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, planned: Planned,
-                             plan: FitPlan | None = None) -> dict[str, jax.stages.Compiled]:
+                             plan: FitPlan | None = None) -> Started:
     """The programs a run of `trainer` compiles besides its step, compiled for the target over their
     arguments' shapes (`AheadOfTime.starts`): its fresh state's build and placement (`start_compiled`), for
     a run that starts afresh, the first step's narrowed copies of its weights where the plan reads some
@@ -1658,34 +1726,95 @@ def started[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, pl
     (`latest`), its log's copies (`copied`) and its logged tokens' sum (`added_tokens`), and with the plan
     of its `fit` (`plan`), what its evaluations' warming pass compiles before they run
     (`Evaluator.warmed_ahead`; row 4752). Each by its program's digest, through the kernel templates'
-    reports as every compile is."""
+    reports as every compile is, with the bytes of the run's state among its arguments, which the run holds
+    while it runs (`_step_programs`): None for the fresh state's build, run before any state is placed."""
     from dew.training.distributed import start_compiled
     from dew.training.narrow import narrowing
 
     candidate = planned.candidate
-    with collecting() as collected:
-        if start.resume is None and not trainer.host_master:
+    programs: Started = {}
+    if start.resume is None and not trainer.host_master:
+        with _collected(programs, lambda executable: None):
             start_compiled(start.placing, start.initializer,
                            shapes_of(start.key), start.abstract,
                            start.shardings, trainer.device_mesh)
-        if candidate.copies:
-            # The variables as the run's first step holds them, placed as its start placed them.
-            variables = jax.tree.map(lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype,
-                                                                                 sharding=sharding),
-                                     start.abstract.variables, start.shardings.variables)
-            narrowing(candidate.copies, candidate.shardings.compute).compiled(
-                variables)
-    collected.update(_results_programs(trainer, start, planned, plan))
-    return collected
+    if candidate.copies:
+        # The variables as the run's first step holds them, placed as its start placed them.
+        variables = jax.tree.map(lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype,
+                                                                             sharding=sharding),
+                                 start.abstract.variables, start.shardings.variables)
+        with _collected(programs, _arguments):
+            narrowing(candidate.copies, candidate.shardings.compute).compiled(variables)
+    _results_programs(trainer, start, planned, plan, programs)
+    return programs
+
+
+@contextlib.contextmanager
+def _collected(programs: Started, among: Callable[[jax.stages.Compiled], int | None]) -> Iterator[None]:
+    """Within the block, each program Dew's compile point compiles (`collecting`) joins `programs` by its
+    digest, with the bytes of the run's state among its arguments (`among` of it: None for one run before
+    any state is placed); a program two blocks compile, with the fewest, as its run holds the most beside
+    it there."""
+    with collecting() as collected:
+        yield
+    for digest, executable in collected.items():
+        state = among(executable)
+        if digest in programs:
+            earlier = programs[digest][1]
+            state = earlier if state is None else state if earlier is None else min(state, earlier)
+        programs[digest] = (executable, state)
+
+
+def _arguments(executable: jax.stages.Compiled) -> int:
+    """The bytes of the run's state among the arguments of a program over the state alone: its arguments',
+    as XLA analysed them, those it reads (`compiled_memory`: a program's unread arguments are no part of
+    it). A program XLA states no memory of states no need (`programs_need`), whatever this reads."""
+    memory = compiled_memory(executable)
+    return 0 if memory is None else memory.argument
+
+
+def _weights_among(evaluated: Variables) -> Callable[[jax.stages.Compiled], int]:
+    """The bytes of the run's state among an evaluation program's arguments: where its first argument is the
+    weights it scores by (`evaluated`, as the state places them, `Objective._pipeline_weights`: its variables,
+    or the average it keeps beside them), each leaf of them it reads (a leaf it drops holds no sharding,
+    `Compiled.input_shardings`) that the state holds in a device's own memory; else none. Its batches and
+    other arguments are none of the state, nor is an average the run keeps in host memory, which its
+    evaluation fetches to the device beside the live variables (`fetched_state`): new bytes there, counted
+    beside the state as its batches are (row 8710: an evaluation counted beside the whole state counted the
+    weights it holds on the device twice, and refused a GPU it fitted; its review: a fetched average read as
+    the state's)."""
+    from dew.distributed.placement import placed_bytes
+
+    signature = _signature(evaluated)
+
+    def among(executable: jax.stages.Compiled) -> int:
+        (arguments, _), (shardings, _) = executable.in_avals, executable.input_shardings
+        if not arguments or _signature(arguments[0]) != signature:
+            return 0
+        placed = jax.tree.leaves(shardings[0], is_leaf=lambda leaf: leaf is None)
+        read = [leaf for leaf, sharding in zip(jax.tree.leaves(evaluated), placed, strict=True)
+                if sharding is not None]
+        return placed_bytes(read, memory="device")
+
+    return among
+
+
+def _signature(tree) -> tuple:
+    """`tree`'s structure and each leaf's shape and dtype: what an argument and the state's weights share
+    where the one is the other."""
+    return jax.tree.structure(tree), tuple((tuple(leaf.shape), leaf.dtype)
+                                           for leaf in jax.tree.leaves(tree))
 
 
 def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, planned: Planned,
-                                       plan: FitPlan | None) -> dict[str, jax.stages.Compiled]:
+                                       plan: FitPlan | None, programs: Started) -> None:
     """The programs a run's steps run on their results and its state, and with its `fit`'s `plan` its
     evaluations' warming pass over its first state, compiled where the run's own code calls them over
-    shapes (`collecting`), by digest: `started`'s last part."""
-    from dew.distributed.placement import placed_shapes
-    from dew.state import apart, together
+    shapes (`collecting`), joining `programs` by digest (`_collected`): `started`'s last part. A window's
+    allocation and a log's copies take the state alone; the programs over a step's results take none of it,
+    and an evaluation's take the weights the run holds beside their batches (`_weights_among`)."""
+    from dew.distributed.placement import allocated_bytes, placed_shapes
+    from dew.state import apart, taken, together
     from dew.training.interval import added_tokens, book_shapes, booked, bookkeep, copied, latest, streak_of
 
     candidate, split = planned.candidate, planned.split
@@ -1694,9 +1823,14 @@ def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start:
     frozen = apart(placed)[1]
     # A sampled step's results hold its summaries (`Committed.inspected`), which its programs read too.
     steps = [planned.executable] + ([] if planned.sampled is None else [planned.sampled.executable])
-    with collecting() as collected:
-        if trainer._builds_window(placed, candidate, window):
+    if trainer._builds_window(placed, candidate, window):
+        # Built before the window it builds is: beside the run's state less the window's fresh leaves, which
+        # the steady state the need holds keeps (`Candidate.held`) and the builder's own outputs are here,
+        # those it takes over from a donor aliasing its buffers (row 8710's review: charged twice).
+        fresh = allocated_bytes(taken(placed.window, candidate.prepared.window)[0])
+        with _collected(programs, lambda executable: _arguments(executable) + fresh):
             trainer._window_of(dataclasses.replace(placed, compute=None), candidate, window)
+    with _collected(programs, lambda executable: 0):
         for step in steps:
             moving, loss, aux, finite, accepted, committed = shapes_of(step.out_info)
             # As the step runs it: its whole where it is split (`StepCompiler.runner`).
@@ -1709,8 +1843,9 @@ def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start:
             if committed is not None and committed.inspected is not None:
                 latest((committed.count, committed.inspected), (committed.count, committed.inspected))
             added_tokens(counted.tokens, counted.tokens)
-            copied(together(moving, frozen))
-        if plan is not None:
+            with _collected(programs, _arguments):
+                copied(together(moving, frozen))
+    if plan is not None:
+        with _collected(programs, _weights_among(trainer.objective._pipeline_weights(placed, None))):
             trainer._evaluator().warmed_ahead(plan, placed, start.shardings,
                                               trainer._compiler.links(trainer.device_mesh))
-    return collected

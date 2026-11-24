@@ -803,8 +803,8 @@ def _reusable(program: OuterProgram, compiled: jax.stages.Compiled, formats: For
              grammar, progress):
         arguments = (model, params, pad_id, placement, steps, resident, carried, admission, transforms,
                      stopping, grammar, progress)
-        with program.ran(compiled, arguments, {}):
-            return compiled(params, resident, carried, admission, transforms, stopping, grammar, progress)
+        return program.invoked(compiled, arguments, {}, params, resident, carried, admission, transforms,
+                               stopping, grammar, progress)
     return step
 
 
@@ -982,8 +982,8 @@ def dispatched(program: OuterProgram) -> Step:
         executable = executables.get(key)
         if executable is None:
             executable = executables[key] = program.executable(*arguments)
-        with program.ran(executable, arguments, {}):
-            return executable(params, resident, carried, admission, transforms, stopping, grammar, progress)
+        return program.invoked(executable, arguments, {}, params, resident, carried, admission, transforms,
+                               stopping, grammar, progress)
     return step
 
 

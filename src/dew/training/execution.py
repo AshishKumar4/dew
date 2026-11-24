@@ -517,7 +517,7 @@ class HostExecution:
         with on_mesh(self.accelerator):
             compiled = owned_program(whole, step=self.step_options(variables, batch))
             arguments = (primal, frozen, rest, placed, here)
-            refusals: list[RuntimeError] = []
+            refusals: list[Exception] = []
             executable = compiled_if_it_fits(compiled.lower(*arguments), compiled.options, refusals,
                                              relower=lambda: compiled.lower(*arguments))
         return executable, arguments

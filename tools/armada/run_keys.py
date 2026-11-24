@@ -107,6 +107,10 @@ class Reading:
         return (found.get(executed) or digests.MISSING) if isinstance(found, dict) else found
 
 
+APART = b"\0each whole file in a pytest of its own"
+"""What a whole file's key holds beside its inputs: that its run was its process's alone (`cache_key`)."""
+
+
 def cache_key(common: str, name: str, split: str, depends: list[str],
               reading: Reading | None = None) -> str:
     """The key of test file `name`'s row in `split`'s group whose run executed or read `depends`
@@ -125,6 +129,10 @@ def cache_key(common: str, name: str, split: str, depends: list[str],
         digest.update(path.encode() + reading.part(path))
     if "::" in name:
         digest.update(name.encode())
+    if not split:
+        # A whole file's run is its own process's (ci.py's `task`): a green run beside others, which may
+        # have passed on what they left in it, is none of its (row 3924's review).
+        digest.update(APART)
     if session.SITE.fullmatch(split):
         digest.update(split.encode())
     elif split and split != COLLECT:

@@ -8,7 +8,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Kernels and performance
 
-- GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 5851, 12415, 12419]
+- GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 5851]
 - One recurrence algebra, the template for every form and product, and port retirement. [2076, 3426, 3427]
 - Family toolkit: resources derived and checked against ptxas, one planner, one traversal. [2987, 6008, 6010, 12416, 12423, 12424, 12426]
 - The kernel challenge's lessons in the templates. [5271]
@@ -28,7 +28,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - The recurrence suite's wall: every case within CI's group target. [12088, 12429]
 - Attention tests to the bible's §6 and §7 test rules. [12432, 12438]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
-- Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822, 12427, 12428]
+- Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
 - Native TPU GEMM dispatch. [1560]
 - Flax's dot_product_attention with force_fp32_for_softmax keeps the softmax's float32 probabilities into the PV product (a float32 output), a legitimate…. [4860]
@@ -41,7 +41,8 @@ This page is generated from the maintainers' findings ledger as each change land
 - The GEMM compile gate certifies each launch with one CUDA build's compile-only client (the kernel-compile extra's), then checks the settled kernel under each…. [10766]
 - test_plan's second-trainer witness asserts no backend compile of jit(step). [12386]
 - Certification admits a spill only where every STL/LDL of its SASS sits at loop depth 0 (prologue/epilogue) or in call slow-path code. [12387]
-- MoE gathered fused head's review. [12399]
+- Memory Planner Miss-Driven ≤2-Step Search, Fast XLA Sizing & Cold-Compile Elimination. [12462]
+- ReviewGemmConfirm's review of #3913. [12630]
 - Exact on every path, every edge and every derivative order. [2656]
 - MoE transport, role-aware low precision and observability. [4515]
 - resources.operand_fragments counts every part of a multi-part shared operand live at once. [6494]
@@ -50,7 +51,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Models and interop
 
-- Every recurrence transition and state family. [1300, 1448, 1450, 1451, 1452, 1454, 1455, 1457, 1458, 1459, 1460, 1646, 12414, 12425]
+- Every recurrence transition and state family. [1300, 1448, 1450, 1451, 1452, 1454, 1455, 1457, 1458, 1459, 1460, 1646]
 - Every nn and interop primitive, seam, contract and derivative has one owner. [11980, 5625]
 - Owner-approved Audit 4 API cleanup. [11937]
 - Owner-approved Audit 4 API cleanup. [11938]
@@ -63,8 +64,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - Time to first step: the compile path's re-derivations. [5556]
 - Owner-approved Audit 4 API cleanup. [11935]
-- CI time: every test within 120 seconds. [12128]
-- A checkpoint taken after a fit's ladder climbed to recompute its layers (its model record's `remat` set by the climb) is refused on resume as 'trained another…. [12135]
+- CI time: every test within 120 seconds. [12484]
 - Distributed and memory training modes. [156, 873, 1306, 617]
 - A fact and a question for the step's owner. [6646]
 - Gradients held to an update placed after the backward are parameter-sized temporaries. [6698]
@@ -84,6 +84,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - Owner-approved Audit 4 API cleanup. [11939]
 - RL: lossless records, composed methods and real publication. [533, 579, 886, 729, 605]
+- DeepCrossAttention (DCA, arXiv:2502.06785v2) composable depth-residual capability. [12440]
 - Dory: the release qualified and its tests' oracles. [596]
 - Serving and RL measured where users run them. [5315, 5321]
 - A served rollout's or episode cohort's server pages its cache wherever pages serve the policy as it draws (serving.served_layout, theme 15), at every prompt…. [7420]
@@ -95,6 +96,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Src/dew/algebra/program.py:823-827 (_within) rewrites a sub-jaxpr inside an equation by equation.replace(params=params) and recomputes neither equation.effects…. [12217]
 - Released checkpoints judged on GPUs. [1703, 11674]
 - Bit-level synthesis in dew.algebra. [3733]
+- ReviewGemmConfirm's review of #3913. [12629]
 - VLLM engine's last_loop cache diverges from its own model code past the sliding window. [638]
 - The monograph's transformer pieces as configurations of the shared seams. [1404]
 - Reference comparisons held by derived bounds. [1719, 2094]

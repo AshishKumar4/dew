@@ -631,7 +631,7 @@ def test_a_reused_row_is_named_the_commits_only_as_its_grade_leaves_it_green(ci,
     row = {"name": "3.12:tests/test_gpu_a.py#@prepare-sm90", "exitCode": 0, "unprepared": ["a @ x"]}
     calls = []
 
-    def reused_rows(python, tests, group, common, network, kept, named):
+    def reused_rows(python, tests, group, common, network, kept, named, reading):
         named[row["name"]] = ("cls", "key")
         return [{**row, "cached": "key"}]
 

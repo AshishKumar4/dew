@@ -24,7 +24,7 @@ from flax import linen as nn
 from jax.sharding import AbstractMesh, Mesh, NamedSharding
 
 from dew import communicators
-from dew._devices import allocator_limit, device_memory, fresh_pool, gpu_free_bytes, stated_share, xla_flag
+from dew._devices import device_memory, gpu_free_bytes, pool_at, xla_flag
 from dew._records import JSON, integer, integers, json_value, listed, record
 from dew.batch import FROZEN, Batch, Variables
 from dew.data.dataset import rows_of
@@ -180,8 +180,23 @@ def step_compiler_options(objective, tokens: float, frozen: bool, devices: int, 
     return options or None
 
 
+def admitted_or_missed(take: Callable[[], jax.stages.Compiled],
+                       refusals: list[Exception]) -> jax.stages.Compiled | None:
+    """`take()`'s executable, a program compiled or loaded at a fit candidate (`compiled_if_it_fits`,
+    `dew.training.ahead.Executable.taken`), or None where its admission refuses it
+    (`dew.communicators.CommunicatorRoom`: its communicators and load have no room outside XLA's pool), the
+    refusal kept: the search asks the next candidate, as for a step that misses, and a search that finds
+    none raises naming it (row 12131's review: a losing rung's admission ended the search)."""
+    try:
+        return take()
+    except communicators.CommunicatorRoom as room:
+        _log.info("the step's communicators and load have no room outside XLA's pool: %s", room)
+        refusals.append(room)
+        return None
+
+
 def compiled_if_it_fits(program: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,
-                        refusals: list[RuntimeError], *, relower: Callable[[], jax.stages.Lowered],
+                        refusals: list[Exception], *, relower: Callable[[], jax.stages.Lowered],
                         first: report.Attempt | None = None) -> jax.stages.Compiled | None:
     """Return `program` compiled under `options`, or None if XLA refuses it for memory (`refused_for_memory`).
 
@@ -191,11 +206,13 @@ def compiled_if_it_fits(program: jax.stages.Lowered, options: jax.stages.Compile
     program's temporaries against HBM while it compiles and raises RESOURCE_EXHAUSTED instead of
     returning an executable whose memory `step_fits` could read, so the refusal means the step does
     not fit. For example, on a v6e, Qwen3-0.6B at 16 x 1024
-    tokens asked for 38.47G of temporaries next to 31.24G of HBM. Any other
-    compile error is raised. `first` is its first compile where another thread made it (`report.attempts`).
+    tokens asked for 38.47G of temporaries next to 31.24G of HBM. A program its admission refuses is a miss
+    too (`admitted_or_missed`). Any other compile error is raised. `first` is its first compile where
+    another thread made it (`report.attempts`).
     """
     try:
-        return report.compiled(program, options, relower=relower, first=first)
+        return admitted_or_missed(lambda: report.compiled(program, options, relower=relower, first=first),
+                                  refusals)
     except jax.errors.JaxRuntimeError as error:
         if not refused_for_memory(error.error_code_string, str(error)):
             raise
@@ -435,20 +452,21 @@ def _admitted(devices: Sequence, memory: Sequence[Mapping[str, int]], beside: in
     return min(margins)
 
 
-def needed(device, resident: int, beside: int, temporaries: int) -> int:
-    """The least bytes a GPU like `device` must hold for `admitted` to admit a step of `temporaries`, with
-    `resident` bytes in use and `beside` more placed: its allocator a fresh pool at its limit, as a GPU not
-    attached states it (`dew._devices.fresh_pool`), read through the one admission (`_admitted`) that
-    leaves zero or more bytes to spare there and none one byte fewer: the inverse of `admitted`, which a
-    pool of GPUs is sized by."""
+def _least_admitting(device, resident: int, beside: int, temporaries: int) -> int:
+    """The least allocator limit at which a fresh pool on a GPU like `device` (`dew._devices.pool_at`), with
+    `resident` bytes in use and `beside` more placed, admits a step of `temporaries` through the one
+    admission (`_admitted`): zero or more bytes to spare there, and none one byte fewer, the inverse of
+    `admitted`, which a pool of GPUs is sized by. Searched in the limit's own terms, which a pool states
+    whatever share of whatever GPU it holds, so it reads no share (row 8709: a compile for a generation's
+    canonical GPUs, which state none, read this process's, which XLA's platform allocator holds none of,
+    and was refused)."""
 
-    def headroom(memory: int) -> int:
-        spare = _admitted([device], [fresh_pool(memory, resident, stated_share(device))], beside,
-                          temporaries)
+    def headroom(limit: int) -> int:
+        spare = _admitted([device], [pool_at(limit, resident)], beside, temporaries)
         assert spare is not None
         return spare
 
-    # The headroom grows with the memory: double to a size that admits, then halve to its least.
+    # The headroom grows with the limit: double to a limit that admits, then halve to its least.
     low, high = 0, max(1, resident + beside + temporaries)
     while headroom(high) < 0:
         low, high = high + 1, 2 * high
@@ -459,13 +477,13 @@ def needed(device, resident: int, beside: int, temporaries: int) -> int:
 
 
 def least_limit(device, terms: Iterable[tuple[int, int, int]]) -> int:
-    """The least allocator limit admitting each of `terms` at `device`'s stated share (else this
-    process's): each a program's admission triple (`admission`: resident, beside, temporaries), its least
-    memory on a GPU like `device` (`needed`) read as the limit that GPU's pool holds (`allocator_limit`),
-    the most of them. The one reading of a program's need the planner's compile ahead (`programs_need`),
-    the GPU lane's measured units (tools/armada/measures.py) and its test share (row 8708). No terms admit
-    no program, and are refused."""
-    limits = [allocator_limit(needed(device, *each), stated_share(device)) for each in terms]
+    """The least allocator limit admitting each of `terms` on a GPU like `device`: each a program's
+    admission triple (`admission`: resident, beside, temporaries), its least limit (`_least_admitting`),
+    the most of them; a limit, whatever share of the GPU's memory takes it, so no share is read. The one
+    reading of a program's need the planner's compile ahead (`programs_need`), the GPU lane's measured
+    units (tools/armada/measures.py) and its test share (row 8708). No terms admit no program, and are
+    refused."""
+    limits = [_least_admitting(device, *each) for each in terms]
     if not limits:
         raise ValueError("least_limit: no admission terms, so no program to admit and no least limit")
     return max(limits)
@@ -507,6 +525,19 @@ class FirstRunFailed(RuntimeError):
             "the kernels loaded, and a lower fraction leaves them more")
 
 
+def first_run_failed(error: BaseException, step: int, fitted: JSON,
+                     mesh: Mesh) -> FirstRunFailed:
+    """A newly compiled step's first run's `error` on its devices, as the step's (`FirstRunFailed`): with
+    the record of the check that said it fits (`fitted`) and what each device holds now, wherever the step
+    raised it, at its own wait (`first_run`) or at a program's that waits on it before
+    (`dew.communicators.called`)."""
+    now: list[JSON] = [{"id": device.id, "outside": outside_pool(device),
+                        **{key: value for key, value in (device.memory_stats() or {}).items()
+                           if key in ('bytes_in_use', 'pool_bytes', 'largest_free_block_bytes')}}
+                       for device in local_devices(mesh)]
+    return FirstRunFailed(step, error, fitted, now)
+
+
 def first_run(loss: jax.Array, step: int, fitted: JSON, mesh: Mesh) -> dict[str, dict[int, int]]:
     """Wait for a newly compiled step's first run, and raise its failure on the devices as the step's
     (`FirstRunFailed`). A first run that succeeds returns, and logs, each GPU's bytes free outside XLA's
@@ -516,11 +547,7 @@ def first_run(loss: jax.Array, step: int, fitted: JSON, mesh: Mesh) -> dict[str,
     try:
         loss.block_until_ready()
     except jax.errors.JaxRuntimeError as error:
-        now: list[JSON] = [{"id": device.id, "outside": outside_pool(device),
-                            **{key: value for key, value in (device.memory_stats() or {}).items()
-                               if key in ('bytes_in_use', 'pool_bytes', 'largest_free_block_bytes')}}
-                           for device in devices]
-        raise FirstRunFailed(step, error, fitted, now) from error
+        raise first_run_failed(error, step, fitted, mesh) from error
     read = () if fitted is None else listed(record(fitted, "fitted")["devices"], "devices", read=record,
                                             what="each device's memory as the fit check read it")
     checked = {integer(device["id"], "id"): outside for device in read

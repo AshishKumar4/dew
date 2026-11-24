@@ -1096,31 +1096,57 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     # The census's tests run under check 1's CENSUS (tests/check1_wire.py, where the gate reads it), which
     # also keeps their rows from the records (`tested`).
     environ = {check1_wire().CENSUS: "1"} if census else {}
-    code = tested(python, names, split, out, deadline, cache, grace, common, environ, coverage,
-                  kept=whole_files)
+    # Each pytest the task starts, in order: the files one process runs together where they share one (a
+    # group's, a site's, coverage's, the census's) or there is one; else each whole file its own, so its
+    # record holds what its own process ran, never what files before it imported or executed (2026-11-23:
+    # tests/test_records.py imports 9 dew modules, and a packed process's record of it held 802); then each
+    # kept group its own. One process start a file, about 2 s (armada, 25/17).
+    together = bool(split) or coverage is not None or census or len(names) < 2
+    runs = ([(names, split, whole_files)] if together
+            else [([name], "", {name: whole_files[name]} if name in whole_files else {}) for name in names])
+    runs += [([name], group, {name: at}) for (name, group), at in kept.items() if group]
+    # Every reuse found before any of them starts: a process may leave the checkout changed, and a later
+    # key read after it would hash what it left (row 3924's review).
+    reading = run_keys.Reading()
+    found = [unrun(python, files, group, session.SITE.fullmatch(group), cache, common, network=False,
+                   kept=held, judged=None, deadline=deadline, reading=reading, afford=False)
+             for files, group, held in runs]
+    rows = [each for reused, _ in found for each in reused]
+    code, spent, written = 0, "", []
+    for index, ((_, group, held), (_, left_tests)) in enumerate(zip(runs, found, strict=True)):
+        # A kept row whose record was not found runs where its cold cost fits what is left now (`afforded`).
+        spare = deadline - (time.monotonic() - began)
+        stale_rows: list[dict] = []
+        if held:
+            left_tests, stale_rows = afforded(python, left_tests, group, held, spare)
+        rows += stale_rows
+        if not left_tests:
+            continue
+        # The checkout's untracked entries, scanned only where a later process will run (`restored`).
+        later = index < len(runs) - 1
+        before = untracked() if later else set()
+        if (left := deadline - (time.monotonic() - began)) <= 0:
+            # Never started: stale, run again, at no seconds armada weighs a plan by (`unobserved`), as a
+            # process's file it never reached is (`tested`).
+            why = (f"not graded: its task's {deadline:.0f} s were spent {spent or 'finding reuse'}, "
+                   "before it began")
+            rows += [{**stale_row(python, name, group, f"{why}; it runs again"), "unobserved": True}
+                     for name in left_tests]
+            continue
+        spent = "in " + " ".join(left_tests) + (f" ({group})" if group else "")
+        part = out.with_name(f"{out.name}.{index}")
+        code = max(code, tested(python, left_tests, group, part, left, "off", grace, common, environ,
+                                coverage, written=written))
+        rows += json.loads(part.read_text())["rows"]
+        # The next process sees the commit's checkout, not what this one left in it (row 3932's review).
+        if later:
+            restored(written[-1] if written else set(), before, out)
+    out.write_text(json.dumps({"rows": rows}))
     # A map task's red row fails its task: armada runs no judge on draws a map task did not pass, and reads
     # the judge red, naming it (`site_entries`).
     site = session.SITE.fullmatch(split)
-    if site and site["start"] is not None and any(found["exitCode"]
-                                                  for found in json.loads(out.read_text())["rows"]):
+    if site and site["start"] is not None and any(found["exitCode"] for found in rows):
         return told(out, 1)
-    groups = [(name, group, at) for (name, group), at in kept.items() if group]
-    if not groups:
-        return told(out, code)
-    rows = json.loads(out.read_text())["rows"]
-    for index, (name, group, at) in enumerate(groups, start=1):
-        left = deadline - (time.monotonic() - began)
-        if left <= 0:
-            # The task's deadline spent on the rows before it: this group is neither read nor run, stale as a
-            # kept row the task could not run is (`tested`).
-            rows.append(stale_row(python, name, group,
-                                  f"{KEPT_UNFOUND}the task's {deadline:.0f} s spent before it was read"))
-            continue
-        part = out.with_name(f"{out.name}.{index}")
-        code = max(code, tested(python, [name], group, part, left, cache, grace, common, environ, coverage,
-                                kept={name: at}))
-        rows += json.loads(part.read_text())["rows"]
-    out.write_text(json.dumps({"rows": rows}))
     return told(out, code)
 
 
@@ -1201,12 +1227,13 @@ def stages_file() -> Path:
 
 def reused_rows(python: str, tests: list[str], group: str, common: str, network: bool,
                 kept: Mapping[str, tuple[str, str]] | None = None,
-                named: dict[str, tuple[str, str]] | None = None) -> list[dict]:
+                named: dict[str, tuple[str, str]] | None = None,
+                reading: "Reading | None" = None) -> list[dict]:
     """The green rows of `tests` in `group` recorded on these inputs on this host's class (`reused`), those
     its plan kept read where it found them (`kept`), said, each one's run (its class and key) in `named` by
     its row's name. They are looked up before any test runs, from one reading of the checkout (`Reading`)."""
     kept = kept or {}
-    reading = run_keys.Reading()
+    reading = run_keys.Reading() if reading is None else reading
     rows = [found for name in tests
             if (found := reused(python, name, group, common, network, kept.get(name), reading, named))]
     if rows:
@@ -1312,15 +1339,17 @@ def watched_pytest(command: list[str], environment: dict[str, str], deadline: fl
 
 def unrun(python: str, tests: list[str], group: str, site: re.Match[str] | None, cache: str, common: str,
           network: bool, kept: Mapping[str, tuple[str, str]] | None,
-          judged: Callable[[list[dict]], list[dict]] | None, deadline: float) -> tuple[list[dict], list[str]]:
-    """`tested`'s rows it need not run (reused, no site's map task; kept, `afforded`), graded by `judged`,
-    and the tests it must; a reused row named the commit's only as its grade leaves it green."""
+          judged: Callable[[list[dict]], list[dict]] | None, deadline: float,
+          reading: "Reading | None" = None, afford: bool = True) -> tuple[list[dict], list[str]]:
+    """`tested`'s rows it need not run (reused, no site's map task; kept, `afforded` where `afford`),
+    graded by `judged`, and the tests it must, from `reading`; a reused row named the commit's only as its
+    grade leaves it green."""
     began = time.monotonic()
     named: dict[str, tuple[str, str]] = {}
     rows = ([] if cache == "off" or (site is not None and site["start"] is not None)
-            else reused_rows(python, tests, group, common, network, kept, named))
+            else reused_rows(python, tests, group, common, network, kept, named, reading))
     tests = [name for name in tests if row(python, name, group) not in {found["name"] for found in rows}]
-    if kept:
+    if kept and afford:
         tests, stale_rows = afforded(python, tests, group, kept, deadline - (time.monotonic() - began))
         rows += stale_rows
     rows = judged(rows) if judged else rows
@@ -1353,14 +1382,16 @@ def epochs_first(python: str, tests: list[str], group: str, common: str, network
 def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str, grace: float,
            common: str, environ: Mapping[str, str], coverage: Path | None = None,
            network: bool = False, kept: Mapping[str, tuple[str, str]] | None = None, recorded: bool = True,
-           variant: str = "", judged: Callable[[list[dict]], list[dict]] | None = None) -> int:
+           variant: str = "", judged: Callable[[list[dict]], list[dict]] | None = None,
+           written: list[set[str]] | None = None) -> int:
     """`task` on the inputs `common` hashes, its pytest under `environ` beside this process's, a green row
     reused as the cache's policy (`policy`) allows. With `network`, the network-marked tests alone, with the
     Hub open, recorded on the network lane's class (`device_class`). A check-1
     site's map task (`session.SITE`) is never reused: its draws, among its artifacts, are what its judge
     reads. A run that is no test of its files (a GPU lane's prepare, `recorded` false) records no row. A
     process of the files under other flags than the lane's (`variant`, a GPU lane's `VARIANTS`) runs the
-    same cut of them, its rows and their records named apart (`varied`); `judged` grades its rows first."""
+    same cut of them, its rows and their records named apart (`varied`); `judged` grades its rows first.
+    `written`: each earlier process's checkout writes, read by none of its records; it adds its own."""
     began = time.monotonic()
     ends = began + deadline  # The task's one end: its reuse's lookups, its epochs and its pytest within it.
     group = varied(split, variant)
@@ -1370,17 +1401,14 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         out.write_text(json.dumps({"rows": rows}))
         return 0
     log, collection, report, unrecorded, pid = task_files(out)
-    # coverage.py follows the Python processes the tests start (pyproject.toml's patch), each writing
-    # its data where COVERAGE_FILE says.
+    # coverage.py follows the processes the tests start (pyproject.toml's patch), into COVERAGE_FILE.
     measured = [] if coverage is None else ["coverage", "run"]
     environ = environ if coverage is None else {**environ, "COVERAGE_FILE": str(coverage / ".coverage")}
     run = session.selected(session.pytest_run(python, report, *measured), network, site is not None)
-    # A resuming task keeps its progress and sets aside the tests its recalled attempt passed (`resumed`,
-    # SET_ASIDE); a site's map task (its artifacts its judge's draws) and a trace resume none, nor
-    # does a run that records none (a prepare's: a test it prepared has not passed, and a test an earlier
-    # attempt passed still prepares into this one's store).
+    # A resuming task sets aside the tests its recalled attempt passed (`resumed`); a site's map task, a trace
+    # and a run that records none (a prepare's, whose tests still prepare into this store) resume none.
     resumes = recorded and site is None and coverage is None and not variant.startswith(prepares.PREPARE)
-    done_before, cold_before, peak_before = (progress.resumed(tests, grading.owning) if resumes
+    done_before, cold_before, peak_before = (progress.resumed(tests, grading.owning, not group) if resumes
                                              else ({}, set(), None))
     (aside := out.with_name(f"{out.name}.set-aside.json")).write_text(json.dumps(sorted(done_before)))
     # A traced run's rows, timed under tracing, are no rows to reuse, nor the census's, nor a resumed one's,
@@ -1390,13 +1418,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     began_in = epochs_first(python, tests, group, common, network, ends, recording)
     command = [*session.pytest_command(run, tests, split), *(["-p", "progress"] if resumes else [])]
     with temp_roots.temp_root() as root:
-        environment = session.pytest_environment({
-            **environ, **site_environment(site), "DEW_EXECUTED_LOG": str(log), "PYTEST_DEBUG_TEMPROOT": root,
-            "DEW_COLLECTED": str(collection), "DEW_UNRECORDED": str(unrecorded), "DEW_PYTEST_PID": str(pid),
-            "DEW_STACKS_READER": str(os.getpid()), **({progress.SET_ASIDE: str(aside)} if resumes else {}),
-            **({session.SPLIT_EVENLY: "1"} if prepares.prepared_group(group, VARIED) else {})})
-        if network:
-            environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
+        environment = task_environment(environ, site, root, (log, collection, unrecorded, pid),
+                                       aside if resumes else None, group, network)
         # What is left of the task's end, read once as its pytest starts (`unstarted` where none is).
         if (left := ends - time.monotonic()) <= 0:
             return unstarted(out, rows, python, tests, group)
@@ -1405,14 +1428,16 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # This attempt's peak, and an earlier attempt's where it ran tests this row carries (`progress.resumed`).
     peaks = [found for found in (progress.task_peak(host), peak_before) if found is not None]
     peak = max(peaks, default=None)
-    cases = list(ET.parse(report).getroot().iter("testcase")) if report.is_file() else []
+    cases, reported = reported_cases(report)
     # How collection found each file: a file with no row is green only where every test it holds was set aside
     # by the selection, as pytest reported it (executed.py); a run that wrote no report greens nothing.
-    counts = json.loads(collection.read_text()) if collection.is_file() else {}
+    counts = read_json(collection) or {}
     ran = []
-    stood = followed.visited(followed.log_events(log)) if expired or not report.is_file() else []
-    shares = task_shares(tests, cases, time.monotonic() - began, stood[-1] if expired and stood else None,
-                         expired, grading)
+    stood = followed.visited(followed.log_events(log)) if expired or not reported else []
+    # The file its tests were in where it stopped; a process of one file stalled before any test, that file.
+    running = stood[-1] if stood else (grading.owning(tests[0]) if expired and len(tests) == 1 else None)
+    shares = task_shares(tests, cases, time.monotonic() - began, running if expired else None, expired,
+                         grading)
     # Where the task ran out of time, the file whose test started last is the one it was spent in (executed.py
     # logs each visit): its row is the deadline's red; a file pytest reported is graded by its own cases, the
     # exit the interrupt's, not its; and one with none is not graded but run again (`grading.STALE`), never
@@ -1421,11 +1446,10 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # A task stalled before any test started (its collection) has no such file: each row is the deadline's.
     # A row named by a test node (`file::test`) is graded by its own cases (`grading.of`), its file's
     # collection and visits its own: a GPU lane runs each such row in a task of its own (`lane_units`).
-    running = stood[-1] if stood else None
     for name in tests:
         own = [case for case in cases if grading.of(case, name)]
         red, failed, cause = grading.graded(name, own, cases, counts.get(grading.owning(name), {}),
-                                            report.is_file(), returncode, deadline if expired else None,
+                                            reported, returncode, deadline if expired else None,
                                             running, pid.is_file(), running)
         # A file that never started in a task that ran out of time has no seconds (`deadline_shares`): its
         # row is `unobserved`, and armada weighs no plan by it.
@@ -1465,11 +1489,104 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                      **later_judged(site)})
     ran = judged(ran) if judged else ran
     out.write_text(json.dumps({"rows": rows + ran}))
+    if resumes:  # Sealed once graded: a recall sets a whole file's passes aside where it graded green alone.
+        progress.ended(read_text(pid), int(any(found["exitCode"] for found in ran)))
     unlisted = set(json.loads(unrecorded.read_text())) if unrecorded.is_file() else set()
-    if recording and (unnamed := run_keys.record(python, ran, log, common, network, opened, unlisted, wrote,
-                                        began_in)):
+    carried = set(wrote).union(*(written or []))
+    if written is not None:
+        written.append(set(wrote))
+    if recording and (unnamed := run_keys.record(python, ran, log, common, network, opened, unlisted, carried,
+                                                 began_in)):
         out.write_text(json.dumps({"rows": rows + unbaselined(python, ran, unnamed)}))
     return 0
+
+
+def task_environment(environ: Mapping[str, str], site: re.Match[str] | None, root: str,
+                     files: tuple[Path, Path, Path, Path], aside: Path | None, group: str,
+                     network: bool) -> dict[str, str]:
+    """The environment of the pytest `tested` starts under `environ`: its task's `files` (`task_files`: the
+    recorder's log, collection's, the unrecorded files' and its process id), its temporary root `root`, and
+    `aside`, the tests a resumed attempt sets aside, where it resumes; with `network`, the Hub open."""
+    log, collection, unrecorded, pid = files
+    environment = session.pytest_environment({
+        **environ, **site_environment(site), "DEW_EXECUTED_LOG": str(log), "PYTEST_DEBUG_TEMPROOT": root,
+        "DEW_COLLECTED": str(collection), "DEW_UNRECORDED": str(unrecorded), "DEW_PYTEST_PID": str(pid),
+        "DEW_STACKS_READER": str(os.getpid()), **({progress.SET_ASIDE: str(aside)} if aside else {}),
+        **({session.SPLIT_EVENLY: "1"} if prepares.prepared_group(group, VARIED) else {})})
+    if network:
+        return {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
+    return environment
+
+
+def reported_cases(report: Path) -> tuple[list[ET.Element], bool]:
+    """The test cases of a pytest's JUnit `report`, and whether it wrote one: a report its killed pytest left
+    cut short is none, its files graded as if none was written (`tested`)."""
+    try:
+        return (list(ET.parse(report).getroot().iter("testcase")), True) if report.is_file() else ([], False)
+    except ET.ParseError:
+        return [], False
+
+
+def read_json(path: Path) -> dict | None:
+    """The JSON object at `path`, or None where none is or what is there is no whole object (a write its
+    killed process cut short, said): no evidence, never a task's end."""
+    if not path.is_file():
+        return None
+    try:
+        found = json.loads(path.read_text())
+    except json.JSONDecodeError as cut:
+        print(f"ci: {path} holds no whole JSON ({cut}): read as none", flush=True)
+        return None
+    return found if isinstance(found, dict) else None
+
+
+def read_text(path: Path) -> str | None:
+    """`path`'s text stripped, None where it has none."""
+    return path.read_text().strip() if path.is_file() else None
+
+
+def untracked() -> set[str]:
+    """The checkout's entries its repository neither tracks nor ignores (none where it is no repository):
+    each file, and each such directory as `name/` (an empty one among them)."""
+    found: set[str] = set()
+    for collapsed in ([], ["--directory"]):
+        listed = subprocess.run(["git", "ls-files", "--others", "--exclude-standard", *collapsed, "-z"],
+                                capture_output=True, text=True, check=False)
+        found |= set(listed.stdout.split("\0")) - {""} if listed.returncode == 0 else set()
+    return found
+
+
+def restored(wrote: set[str], before: set[str], out: Path) -> None:
+    """The checkout as its commit holds it again after a process that wrote `wrote` (`tested`'s), so the next
+    process runs on the commit's files, not on what this one left (row 3932's review: a file rewriting a
+    later file's source, or making a conftest.py or a link under it, ran it green on code the commit does
+    not hold): each tracked file it wrote checked out again, and each entry the checkout neither tracks nor
+    ignores that was not there before it (`before`, `untracked`) removed, then each directory it made that
+    this leaves empty (one imports as a namespace package), but the task's own outputs: its verdict `out`,
+    each process's beside it (`out.N` and theirs) and its artifacts (ARMADA_ARTIFACTS), which outlive it."""
+    listed = subprocess.run(["git", "ls-files", "-z", "--", *sorted(wrote)], capture_output=True, text=True,
+                            check=False) if wrote else None
+    tracked = set(listed.stdout.split("\0")) - {""} if listed and listed.returncode == 0 else set()
+    if tracked:
+        subprocess.run(["git", "checkout", "-q", "--", *sorted(tracked)], check=True)
+    artifacts = os.environ.get("ARMADA_ARTIFACTS")
+    roots = [Path(artifacts).resolve()] if artifacts else []
+    verdicts = out.resolve()
+    ours = re.compile(rf"{re.escape(verdicts.name)}(\.\d+(\..+)?)?")
+    checkout = Path.cwd().resolve()
+    emptied: set[Path] = set()
+    for made in sorted(untracked() - before):
+        # The entry itself, a link among them, not what it names; a directory's own entry (`name/`) aside.
+        place = Path(made).parent.resolve() / Path(made).name
+        beside = place.relative_to(verdicts.parent).parts[0] if verdicts.parent in place.parents else None
+        if made.endswith("/") or any(place == root or root in place.parents for root in roots) or \
+                (beside is not None and ours.fullmatch(beside)):
+            continue
+        Path(made).unlink(missing_ok=True)
+        emptied.update(parent for parent in place.parents if checkout in parent.parents)
+    for directory in sorted(emptied, key=lambda each: len(each.parts), reverse=True):
+        if f"{directory.relative_to(checkout).as_posix()}/" not in before and not any(directory.iterdir()):
+            directory.rmdir()
 
 
 def gpu_tier(python: str) -> dict[str, list[str]]:

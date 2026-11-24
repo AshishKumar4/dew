@@ -561,7 +561,9 @@ def test_a_resumed_attempts_rows_carry_the_earlier_attempts_peak(tmp_path, monke
         + json.dumps({"node": "tests/test_x.py::light", "seconds": 1.0, "peak": 2_000}) + "\n")
     monkeypatch.setenv("ARMADA_RESUME", str(tmp_path / "resume"))
     monkeypatch.setenv("ARMADA_ARTIFACTS", str(tmp_path / "now"))
-    passed, cold, peak = progress.resumed(["tests/test_x.py"], lambda node: node.split("::")[0])
+    # A split group's attempt, whose passes count whether or not its process ended (`resumed`'s `sealed`).
+    passed, cold, peak = progress.resumed(["tests/test_x.py"], lambda node: node.split("::")[0],
+                                          sealed=False)
     assert sorted(passed) == ["tests/test_x.py::heavy", "tests/test_x.py::light"]
     assert (cold, peak) == (set(), 7_000)
     carried = [json.loads(line) for line in (tmp_path / "now" / progress.PROGRESS).read_text().splitlines()]

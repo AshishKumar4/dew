@@ -4,6 +4,7 @@ GEMM's own portable branch (`kernels.gemm`): its products as the call's precisio
 `ragged_placement`), a step-scaled one (`step_scaled`), a projection differentiated by its own products
 (`portable_projection`), and the platform choice between a kernel and them (`_on_platform`)."""
 
+import contextlib
 import functools
 
 import jax
@@ -28,6 +29,15 @@ def interpreted(interpret_on_cpu: bool) -> bool:
     return interpret_on_cpu and generation.placed_platform() == 'cpu'
 
 
+@contextlib.contextmanager
+def interpreted_context(interpret_on_cpu: bool):
+    """Bind `generation.assumed(generation.interpreted_target())` while `interpreted(interpret_on_cpu)` holds
+    (row 12158)."""
+    with (generation.assumed(generation.interpreted_target())
+          if interpreted(interpret_on_cpu) else contextlib.nullcontext()):
+        yield
+
+
 def _on_platform(kernel, fallback, interpret_on_cpu: bool):
     """`kernel` where the call lowers for its target's platform (CUDA, or a TPU's), and `fallback`
     everywhere else: a TPU's program, which never runs on CUDA, holds no CUDA branch, and a GPU's no TPU
@@ -45,6 +55,59 @@ def _on_platform(kernel, fallback, interpret_on_cpu: bool):
                              "emulates; state it with generation.assumed(...)")
         branches['cpu'] = functools.partial(kernel, interpret=True)
     return branches, fallback
+
+
+def committed_device(operands):
+    """A process-local device of concrete `operands` when every committed leaf shares one platform
+    (including homogeneous multi-host sharding), or None if uncommitted, traced, empty, or mixed-platform."""
+    from jax.core import Tracer
+
+    devices = {
+        device
+        for leaf in jax.tree.leaves(operands)
+        if isinstance(leaf, jax.Array) and not isinstance(leaf, Tracer) and leaf.committed
+        for device in leaf.devices()
+    }
+    platforms = {device.platform for device in devices}
+    if len(platforms) != 1:
+        return None
+    local = next((device for device in devices if device.process_index == jax.process_index()), None)
+    return local if local is not None else jax.local_devices(backend=next(iter(platforms)))[0]
+
+
+@contextlib.contextmanager
+def committed_context(operands):
+    """Bind `jax.default_device(committed_device(operands))` for concrete committed `operands` (row 12158)."""
+    from jax.core import Tracer
+
+    if any(isinstance(leaf, Tracer) for leaf in jax.tree.leaves(operands)):
+        yield
+        return
+    device = committed_device(operands)
+    with jax.default_device(device) if device is not None else contextlib.nullcontext():
+        yield
+
+
+def dispatched(kernel, portable, interpret_on_cpu: bool, *operands):
+    """`kernel` where the call lowers for CUDA, interpreted on the CPU where asked, `portable` elsewhere
+    (`_on_platform`). Resolves concrete committed placement before `_on_platform`, traces abstractly so every
+    branch selects, then runs eagerly on the committed device (row 11887)."""
+    from jax.core import Tracer
+
+    def run():
+        branches, default = _on_platform(kernel, portable, interpret_on_cpu)
+
+        def call(*args):
+            return jax.lax.platform_dependent(*args, default=default, **branches)
+
+        return call
+
+    if not any(isinstance(leaf, Tracer) for leaf in jax.tree.leaves(operands)):
+        with committed_context(operands):
+            call = run()
+            jax.eval_shape(call, *operands)
+            return call(*operands)
+    return run()(*operands)
 
 
 def as_multiplied(tokens: jax.Array, kernel: jax.Array, precision: PrecisionLike) -> tuple:
@@ -120,20 +183,38 @@ _GROUPED_ROWS = jax.lax.RaggedDotDimensionNumbers(
 """`jax.lax.ragged_dot`'s own: each group's rows of `[rows, depth]` times its `[depth, width]` matrix."""
 
 
+def placed_ragged_dot(values: jax.Array, matrices: jax.Array, group_sizes: jax.Array, *,
+                      precision: PrecisionLike = None,
+                      preferred_element_type: Dtype | None = None) -> jax.Array:
+    """`jax.lax.ragged_dot` as written (its one primitive, which a fuser reads as the program's dot), placed
+    where an Explicit mesh axis places its operands (`ragged_placement`): JAX infers no placement for a
+    ragged dot there (row 12401)."""
+    return jax.lax.ragged_dot_general(
+        values, matrices, group_sizes, _GROUPED_ROWS, precision=precision,
+        preferred_element_type=preferred_element_type,
+        out_sharding=ragged_placement(((values, 0), (matrices, matrices.ndim - 1))))
+
+
 def ragged_placement(sources: tuple) -> jax.sharding.NamedSharding | None:
     """Where a ragged product lands where an operand's type places it on a mesh with Explicit axes, split or
     not (`out_sharding`: JAX infers no placement for a ragged dot, "Explicit sharding inference for
     ragged_dot_general is not currently implemented"): each output dimension placed as the operand
     dimension it comes from (`sources`, each `(operand, axis)`, or None for one no operand dimension gives: a
-    group axis), a contraction's sum whole, a mesh axis placing two dimensions placing the first alone; None
-    where no operand's type names such a mesh."""
+    group axis), a contraction's sum whole, a mesh axis placing two dimensions placing the first alone; whole
+    on the context's mesh where no operand's type names one but the context's has an Explicit axis; None
+    otherwise."""
     from dew.mesh import mesh_axes
     from dew.nn.sharding import explicit_placement
 
     shardings = [None if source is None else explicit_placement(jax.typeof(source[0])) for source in sources]
     mesh = next((each.mesh for each in shardings if each is not None), None)
     if mesh is None:
-        return None
+        # Operands no mesh types (a jitted program's constants) under a context mesh with an Explicit axis,
+        # which still asks a ragged dot its placement: whole on it.
+        context = jax.sharding.get_abstract_mesh()
+        if context.empty or not context.explicit_axes:
+            return None
+        return jax.sharding.NamedSharding(context, jax.sharding.PartitionSpec())
     spec, used = [], set()
     for source, each in zip(sources, shardings, strict=True):
         axis = 0 if source is None else source[1] % source[0].ndim

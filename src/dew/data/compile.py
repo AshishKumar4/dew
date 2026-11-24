@@ -77,9 +77,6 @@ from dew.data.compilation import compiling, within
 from dew.data.dataset import (
     Closeable,
     DataPartition,
-    Ends,
-    FilledBatch,
-    Forwarding,
     GlobalReader,
     GlobalStream,
     Loader,
@@ -89,11 +86,10 @@ from dew.data.dataset import (
     Records,
     StepPhases,
     phase_stages,
-    rows_of,
-    take_batch,
 )
 from dew.data.epochs import epoch_records, order_records, tail
 from dew.data.facts import laid_out, merge_facts, row_lengths
+from dew.data.handed import Handed, native_loader
 from dew.data.handoff import record_stage_of
 from dew.data.lowering import (
     _as_iter,
@@ -169,7 +165,7 @@ from dew.data.plan import (
     identified,
     rule_in_force,
 )
-from dew.data.readers import GRAIN, Replayed, _CanonicalPass, _Host, _PerShare, _Statistics, statistics_of
+from dew.data.readers import GRAIN, _CanonicalPass, _Host, _PerShare, _Statistics, statistics_of
 from dew.data.sources.base import (
     TOKENIZER_CONTRACT,
     Read,
@@ -2035,14 +2031,14 @@ def iterate(
     seed: int | None = None,
 ) -> pygrain.IterDataset:
     """A finite record pass through the same lowering, for publication and export, in the process, read as
-    `read` says, else as the chain does (`Pipeline.read`), else streamed, as `compile` honors a chain's read:
+    `held_read` decides (`read`, else the chain's, else its sources'), as `compile` does:
     automatic workers (`Loading.unsized`) and those the chain names (row 5735), whose turns would
     interleave the records out of the order the pass publishes. A pass that seals what it makes (a
     snapshot's, `seed` given) draws its random steps' values under `seed`, which the rows it seals keep
     (row 9056: a video's clips drawn once and sealed); publication, whose cache a later pass writes
     through, holds no draw."""
     loading = loading.unsized()
-    read = read or pipeline._chain().mode or "streamed"
+    read = held_read(pipeline._chain(), read, provision=provision)
     pipeline = _in_process(pipeline)
     if (seed is None and draws(pipeline)) or any(isinstance(stage, (BatchStage, MapBatch, Repeat))
                                                  for stage in _steps(pipeline)):
@@ -2066,128 +2062,6 @@ def _in_process(pipeline: Pipeline) -> Pipeline:
     held = with_children(pipeline, _in_process)
     kept = tuple(stage for stage in held.stages if not isinstance(stage, Workers))
     return dataclasses.replace(held, stages=kept)
-
-
-type Handed = pygrain.MapDataset | pygrain.IterDataset | Mapping[str, np.ndarray]
-"""Data handed to `fit` as it is, which a run steps on as given (`native`): a Grain dataset's
-elements, or arrays whole."""
-
-
-class _Whole:
-    """The same batch every step, the arrays a run was handed whole; its position the steps read. It
-    never runs out (`Identified.ends`), and names what it reads as a stream Dew names no further does:
-    by its type (`stream_identity`)."""
-
-    ends: Ends = "never"
-
-    def __init__(self, batch: Batch):
-        self.batch, self.read = batch, 0
-
-    def identity(self) -> str:
-        return type(self).__name__
-
-    def __iter__(self):
-        return self
-
-    def __next__(self) -> Batch:
-        self.read += 1
-        return self.batch
-
-    def get_state(self) -> bytes:
-        return str(self.read).encode()
-
-    def set_state(self, state: bytes) -> None:
-        self.read = int(state)
-
-
-def _share(batch: Batch, partition: DataPartition, *, held: bool) -> Batch:
-    """`partition`'s share of `batch` (`DataPartition`: rows `index :: count`); `held`, a validation
-    share, filled out to every share's rows, a whole number of its row shards, its repeats marked
-    (`DataPartition.held`, `FilledBatch`), so every share reads a batch its devices split where any
-    does and every real row scores once."""
-    rows = rows_of(batch)
-    if not held:
-        return batch if partition.count == 1 else take_batch(batch, np.arange(rows)[partition.cut()])
-    mine, real = partition.held(rows) if partition.count > 1 else (slice(None), True)
-    shards = partition.count * partition.row_multiple
-    filled = -(-rows // shards) * partition.row_multiple
-    return FilledBatch(filled, real=real).map(take_batch(batch, np.arange(rows)[mine]))
-
-
-class _Shared(Forwarding):
-    """The `partition`'s share of each batch a stream yields (`_share`), its position, stop and close
-    the stream's; it never ends where it reads a map dataset repeated without end (`native`, `endless`),
-    which says so of nothing it reads."""
-
-    def __init__(self, batches: pygrain.DatasetIterator | _Whole | Replayed, partition: DataPartition, *,
-                 held: bool, endless: bool = False):
-        self._source, self.partition, self.held, self._endless = batches, partition, held, endless
-
-    @property
-    def ends(self) -> Ends:
-        return "never" if self._endless else super().ends
-
-    def __iter__(self):
-        return self
-
-    def __next__(self) -> Batch:
-        return _share(next(self._source), self.partition, held=self.held)
-
-    def get_state(self):
-        return self._source.get_state()
-
-    def set_state(self, state) -> None:
-        self._source.set_state(state)
-
-
-def native(handed: Handed, *, training: bool) -> Reader:
-    """A reader of the data handed to `fit` as it is, each element a batch the run steps on, never
-    batched again: a Grain dataset's elements (batched by Grain, `MapDataset.batch`), a map dataset's
-    read endlessly where it trains, or a mapping of arrays read whole, every step the same batch (a
-    full-batch run; a run of minibatches states them, `Memory(arrays).batch(size)`)."""
-    if isinstance(handed, Mapping):
-        batch = {name: np.asarray(column) for name, column in handed.items()}
-        if training:
-            return lambda partition: _Shared(_Whole(batch), partition, held=False)
-        return lambda partition: iter([_share(batch, partition, held=True)])
-    repeated = training and isinstance(handed, pygrain.MapDataset)
-    stream: pygrain.IterDataset = (
-        (handed.repeat() if training else handed).to_iter_dataset() if isinstance(handed, pygrain.MapDataset)
-        else handed)
-    return lambda partition: _Shared(iter(stream), partition, held=not training, endless=repeated)
-
-
-def native_loader(handed: Handed) -> Loader:
-    """The data handed to `fit` as it is (`native`) as the loader the run reads, its global batch
-    its first element's rows. A Grain iterable is read once for that element: its run's first stream
-    gives it again and reads on (`Replayed`), as the batch contract asks (training.md; row 6663)."""
-    if isinstance(handed, pygrain.IterDataset):
-        probe = iter(handed)
-        try:
-            before = probe.get_state()
-            first = next(probe)
-        except BaseException:
-            if isinstance(probe, Closeable):
-                probe.close()
-            raise
-        replayed = [Replayed(probe, first, before)]
-
-        def train(partition: DataPartition) -> Iterator[Batch]:
-            return _Shared(replayed.pop() if replayed else iter(handed), partition, held=False)
-
-        return Loader(train=train, val=None, records=None, batch=rows_of(_present(first)))
-    first = handed[0] if isinstance(handed, pygrain.MapDataset) else {
-        name: np.asarray(column) for name, column in handed.items()}
-    batch = rows_of(_present(first))
-    records = len(handed) * batch if isinstance(handed, pygrain.MapDataset) else batch
-    return Loader(train=native(handed, training=True), val=None, records=records, batch=batch)
-
-
-def _present(first):
-    """`first`, a dataset's first element, refused where it is missing."""
-    if first is None:
-        raise ValueError("a Grain dataset handed to fit gives its batches, and its first is missing (None)")
-    return first
 
 
 def run_widths(measured: Sequence[_Measured], objective: ObjectiveData) -> Mapping[str, object]:
@@ -2296,10 +2170,44 @@ def fitted[Entry](
                              "its chain")
     if named is None:
         return loader, None
-    return loader, {name: held(entry, objective=objective, batch=loader.batch, seed=seed, widths=widths,
-                               measured=scored[name])
-                    if isinstance(entry, Dataset) else entry
-                    for name, entry in named.items()}
+    return loader, _one_bound({name: held(entry, objective=objective, batch=loader.batch, seed=seed,
+                                          widths=widths, measured=scored[name])
+                               if isinstance(entry, Dataset) else entry
+                               for name, entry in named.items()})
+
+
+def _one_bound[Entry](readers: Mapping[str, Reader | Entry]) -> dict[str, Reader | Entry]:
+    """A run's held readers each declaring, for every packed field whose bound it knows, the most documents a
+    window of any of them holds (`Coordinates.max_segments`), so every split of one shape lays its windows
+    out to one static bound and its evaluation compiles once, where each split's own most, 14 documents
+    in one and 15 in the next, compiled a program apiece (row 12474). A split that cannot see its windows'
+    packing declares its window's length as it does, apart, and widens no known split's bound to it: a
+    sequence kernel's work follows the bound (`dew.nn.chunked_launch`). A reader that is not one of
+    `held`'s (a reader of the caller's, an evaluation suite) is passed on as it is."""
+    # Each held reader `validation` compiled (`_validation_reader`).
+    compiled = {name: entry for name, entry in readers.items()
+                if isinstance(entry, functools.partial) and entry.func is _validation_reader}
+    most: dict[str, int] = {}
+    for entry in compiled.values():
+        for step in _packed_steps(entry):
+            if step.max_segments is not None:
+                ids = step.fields[0]
+                most[ids] = max(most.get(ids, 0), step.max_segments)
+    return {name: _held_bounded(compiled[name], most) if name in compiled else entry
+            for name, entry in readers.items()}
+
+
+def _packed_steps(reader: functools.partial) -> tuple[Coordinated, ...]:
+    """The packed fields' steps (`Coordinated`) a held reader runs on the host."""
+    return tuple(step for step in reader.keywords["host"] if isinstance(step, Coordinated))
+
+
+def _held_bounded(reader: functools.partial, most: Mapping[str, int]) -> functools.partial:
+    """`reader` with each packed field's step whose bound it knows declaring `most`'s for its field."""
+    host = tuple(Coordinated.laid(step.fields, most[step.fields[0]], step.laid_out)
+                 if isinstance(step, Coordinated) and step.max_segments is not None else step
+                 for step in reader.keywords["host"])
+    return functools.partial(reader.func, *reader.args, **{**reader.keywords, "host": host})
 
 
 def _endless(chain: Pipeline) -> Pipeline:
@@ -2369,7 +2277,7 @@ def held(dataset: Dataset, *, objective: ObjectiveData | None = None, batch: int
 
         measured = dataclasses.replace(measured, branches=tuple(map(batched, measured.branches)))
     # The chain's own batch is the one it is read in; validation's `batch` adds none to it.
-    return validation(measured.branches[0], batch=1, objective=objective, read=_held_read(chain),
+    return validation(measured.branches[0], batch=1, objective=objective, read=held_read(chain),
                       loading=chain._loading or _DEFAULT_LOADING, provision=True, seed=seed, widths=widths,
                       measured=measured)
 
@@ -2390,15 +2298,17 @@ def _held_batched(chain: Pipeline, batch: int | None, *, unbatched: bool = False
         else stage for stage in chain.stages))
 
 
-def _held_read(chain: Pipeline) -> Read:
-    """The read a held chain asks, else the one its sources choose (`_preferred_read`)."""
-    return chain.mode or _preferred_read((chain,), provision=True)
+def held_read(chain: Pipeline, read: Read | None = None, *, provision: bool = True) -> Read:
+    """The read a pass over `chain` takes: `read` where stated, else the one the chain asks
+    (`Pipeline.read`), else the one its sources choose (`_preferred_read`), as `compile` decides it: the one
+    rule a held pass, an export and a publication read by."""
+    return read or chain.mode or _preferred_read((chain,), provision=provision)
 
 
 def _held_measure(chain: Pipeline, objective: ObjectiveData | None) -> _Measured:
     """A held chain prepared through its source's own steps as its pass reads them (`_measure`), its
     counts filled where a memory read runs them."""
-    return _measure((chain,), _held_read(chain), provision=True, objective=objective, counts=({},))
+    return _measure((chain,), held_read(chain), provision=True, objective=objective, counts=({},))
 
 
 @compiling
@@ -2440,14 +2350,15 @@ def publish(
     pipeline: Pipeline,
     cache,
     *,
-    read: Read = "streamed",
+    read: Read | None = None,
     provision: bool = False,
     loading: Loading = _DEFAULT_LOADING,
 ):
     """Fill and seal a deterministic prefix, then publish its certified
     generation, unless one is already published under its key (with the plan
     of a terminal pack), which it returns, its stream's fill numbering its rows
-    by the shards its source states (`dew.data.sources.base.Source.manifest`)."""
+    by the shards its source states (`dew.data.sources.base.Source.manifest`).
+    It reads as `held_read` decides: `read`, else the chain's, else its sources'."""
     from dew.data.cache import Cache
     from dew.data.generation import Generation
 
@@ -2466,6 +2377,7 @@ def publish(
             raise ValueError("publication accepts one terminal packing stage after the cached prefix")
         builder, accepted = PackingPlan(packing), plan_name(packing, "accepted")
         pipeline = dataclasses.replace(pipeline, stages=pipeline.stages[:planned])
+    read = held_read(pipeline._chain(), read, provision=provision)
     (pipeline,) = _prepared((pipeline,), read, provision=provision)
     source = pipeline.source
     if isinstance(source, Combined):

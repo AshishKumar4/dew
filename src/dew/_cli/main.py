@@ -117,7 +117,8 @@ class DataExport:
     rows_per_shard: int = 100_000
     branch: Literal["train", "validation"] = "train"
     read: Literal["memory", "indexed", "streamed"] | None = None
-    """How the export reads the chain: as it says (`Pipeline.read`), else streamed, where None."""
+    """How the export reads the chain: as it says (`Pipeline.read`), else as its sources choose, where None
+    (`dew.data.compile.held_read`)."""
     provision: bool = False
     tokenizer: str | None = None
     eos: bool = True
@@ -169,7 +170,8 @@ class DataPublish:
     """A Python file's chain, a chain's `.json` record, or a store's URL, as `DataExport` reads it."""
     destination: Positional[str]
     branch: Literal["train", "validation"] = "train"
-    read: Literal["memory", "indexed", "streamed"] = "streamed"
+    read: Literal["memory", "indexed", "streamed"] | None = None
+    """How the publication reads the chain, as `DataExport.read` says."""
     provision: bool = False
     trust: tuple[str, ...] = ()
     """Packages outside Dew whose modules a chain's record may import (its own steps')."""

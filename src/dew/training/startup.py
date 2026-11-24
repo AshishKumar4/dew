@@ -15,8 +15,9 @@ from typing import TYPE_CHECKING, Protocol
 import flax.linen as nn
 
 from dew._records import JSON
-from dew.data.compile import Handed, fitted
+from dew.data.compile import fitted
 from dew.data.dataset import DataPartition, Loader
+from dew.data.handed import Handed
 from dew.data.pipeline import Dataset, ObjectiveData
 from dew.data.plan import DataResume
 from dew.telemetry.instrumentation import count_compilation_cache
@@ -188,25 +189,50 @@ def computation_differs[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", ch
 def differing_records(saved: JSON, now: JSON, trained: JSON, training: JSON) -> list[str]:
     """Where the computation a checkpoint trained and this run's differ: each path of its objective's class
     or its model's record in its inference record (`Objective.inference_record`), the fields that say how
-    layers execute aside (the configured path's own `RunConfig.EXECUTED`), and each setting of what its
+    layers execute aside (the configured path's own `RunConfig.EXECUTED`, and a model's own fields its class
+    marks as how it runs, `_computing`: a checkpoint a fit's ladder climbed to recompute its layers resumes,
+    row 12135), and each setting of what its
     objective's loss computes (`trained` against `training`, `Objective.training_record`; row 9020: an LM's
     `z_loss` changed and resumed), where both state it and they disagree. A loop's passes (`Loop.PASSED`,
     which a phase sets) and a field one of them predates are no evidence, nor is a record either holds none
     of (an unrecordable model's, a step that predates the record): only positive evidence refuses (row
     5723)."""
-    from dew._records import without_fields
-    from dew.config import RunConfig
-
     found = []
     match saved, now:
         case dict(), dict() if "unrecorded" not in {*saved, *now}:
             found = [differs for name in ("objective", "model") if name in saved and name in now
-                     for differs in _differing(without_fields(saved[name], RunConfig.EXECUTED),
-                                               without_fields(now[name], RunConfig.EXECUTED), name)]
+                     for differs in _differing(*_computing(saved[name], now[name], name), name)]
     match trained, training:
         case dict(), dict():
             found += _differing(trained, training, "training")
     return found
+
+
+def _computing(before: JSON, after: JSON, name: str) -> tuple[JSON, JSON]:
+    """An inference record's objective or model (`name`), as the checkpoint's (`before`) and this run's
+    (`after`) state it, each without the fields that say how layers execute (`RunConfig.EXECUTED`), and
+    two records of one model class each without the fields that class marks as how it runs (its recompute,
+    dropout, kernels: `dew._records.RUNS`), the numbers it trains in kept, as a resume's check reads them
+    (`registry.computing_fields`, `RunConfig.check_resume`). Another class's field of one name, which may
+    say what it computes, is compared."""
+    from dew._records import NUMBERS, ROUNDS, TRAINS, without_fields
+    from dew.config import RunConfig
+    from dew.registry import computing_fields, member_fields, models
+
+    held = [without_fields(record, RunConfig.EXECUTED) for record in (before, after)]
+    match held:
+        case [dict() as was, dict() as now] if name == "model" and was.get("name") == now.get("name"):
+            member = models[str(now["name"])]
+            computing = set(computing_fields(member, kept=(NUMBERS, ROUNDS, TRAINS)))
+            runs = {field for field, _, _ in member_fields(member)} - computing
+
+            def computed(record: dict[str, JSON]) -> JSON:
+                return {key: {field: value for field, value in part.items() if field not in runs}
+                        if key in ("fields", "defaults") and isinstance(part, dict) else part
+                        for key, part in record.items()}
+
+            return computed(was), computed(now)
+    return held[0], held[1]
 
 
 def _differing(before: JSON, after: JSON, path: str) -> list[str]:

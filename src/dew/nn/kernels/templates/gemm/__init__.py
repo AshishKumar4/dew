@@ -6,6 +6,8 @@ from collections.abc import Sequence
 import jax
 from jax import numpy as jnp
 
+from dew.nn.sharding import explicit_spec
+
 
 def rows_extended(array: jax.Array, axis: int, extent: int) -> jax.Array:
     """`array` with zeros after its own along `axis` up to `extent`, where it holds fewer."""
@@ -37,10 +39,28 @@ def sides_extended(sides: Sequence[jax.Array], axes_of: Sequence[tuple[str, ...]
                  for side, axes in zip(sides, axes_of, strict=True))
 
 
+def rows_permuted(x: jax.Array, permutation: jax.Array, axis: int = 0) -> jax.Array:
+    """`x`'s rows along `axis` at `permutation`'s order, placed as `x` is where an Explicit axis splits it
+    (a permutation of its rows, whose placement its own is): JAX takes no gather of a split axis without its
+    output's placement."""
+    placed = explicit_spec(x)
+    if placed is None:
+        return jnp.take(x, permutation, axis=axis)
+    return x.at[(slice(None),) * axis + (permutation,)].get(out_sharding=placed)
+
+
 def scattered(outs, scatter: jax.Array | None):
     """`outs` (one output or a tuple), each row `i` written at row `scatter[i]` (a product's `scatter`, a
     permutation, so every row is written once), as XLA's program and a launch's stores give them; as they
-    are without one."""
+    are without one. An output an Explicit axis splits along its rows is read at the inverse permutation
+    instead, placed as it was (`rows_permuted`): the same rows, where JAX takes no scatter into a split axis
+    without its output's placement."""
     if scatter is None:
         return outs
-    return jax.tree.map(lambda out: jnp.zeros_like(out).at[scatter].set(out, unique_indices=True), outs)
+
+    def written(out):
+        if explicit_spec(out) is None:
+            return jnp.zeros_like(out).at[scatter].set(out, unique_indices=True)
+        return rows_permuted(out, jnp.argsort(scatter))
+
+    return jax.tree.map(written, outs)

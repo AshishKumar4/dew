@@ -1,6 +1,6 @@
 """`Supervised` trains any Flax model on a loss over its outputs, and a run
 names it, its loss and its metrics in a record that builds it again;
-`--set` changes one field of a run, read as that field's type reads it."""
+`RunConfig.override` changes one field of a run by its dotted path, read as that field's type reads it."""
 
 import json
 import os

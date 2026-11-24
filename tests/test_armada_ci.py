@@ -394,12 +394,14 @@ def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
                                                                "tests/test_pass.py::test_skip"}
     assert ci.node_of(ET.Element("testcase", classname="tests.test_split.TestB", name="test_b")) == \
         "tests/test_split.py::TestB::test_b"
-    # A process that dies after its report is written leaves every row it ran red, green cases included.
+    # A process that dies after its report is written leaves every row it ran red, green cases included;
+    # each file of a task runs in a process of its own (ci.py's `task`), so a file beside it stays green.
     (tmp_path / "tests/test_dies.py").write_text("import atexit, os\natexit.register(lambda: os._exit(3))\n"
                                                  "def test_ok(): pass\n")
     ci.task("3.12", ["tests/test_pass.py", "tests/test_dies.py"], "", out, 600.0)
-    assert {row["name"]: (row["exitCode"], row["kind"]) for row in json.loads(out.read_text())["rows"]} == {
-        "3.12:tests/test_pass.py": (1, "whole"), "3.12:tests/test_dies.py": (1, "whole")}
+    rows = json.loads(out.read_text())["rows"]
+    assert {row["name"]: (row["exitCode"], row.get("kind")) for row in rows} == {
+        "3.12:tests/test_pass.py": (0, None), "3.12:tests/test_dies.py": (1, "whole")}
 
 
 def assert_green_task(ci, tmp_path, name: str, source: str) -> None:
@@ -726,18 +728,21 @@ def test_a_tasks_wall_time_is_apportioned_by_its_files_tests_times(ci):
         "tests/test_a.py": 1.0, "tests/test_b.py": 1.0}
 
 
-def test_a_tasks_rows_share_its_wall_time_by_their_tests_times(ci, tmp_path):
+def test_the_rows_of_files_one_pytest_runs_share_its_wall_time_by_their_tests_times(ci, tmp_path):
     """The plan weighs a file by what a task spends on it, its import and
-    collection included, so a task's rows add up to its wall time, split by
-    their tests' own times (`apportioned`): at least what the tests slept, at
-    most the task's wall time, and the longer sleep the larger row."""
+    collection included, so the rows of files one pytest runs together (a
+    coverage, census or split task's: `tested`) add up to its wall time, split
+    by their tests' own times (`task_shares`): at least what the tests slept,
+    at most the process's wall time, and the longer sleep the larger row. A
+    packed task's whole files each run apart, each row its own process's."""
     (tmp_path / "tests").mkdir(exist_ok=True)
     (tmp_path / "tests/test_short.py").write_text("import time\ndef test_a(): time.sleep(0.3)\n")
     (tmp_path / "tests/test_long.py").write_text("import time\ndef test_b(): time.sleep(0.9)\n")
     interpreter(tmp_path, "3.12")
     out = tmp_path / "verdict.json"
     began = time.monotonic()
-    ci.task("3.12", ["tests/test_short.py", "tests/test_long.py"], "", out, 60.0)
+    ci.tested("3.12", ["tests/test_short.py", "tests/test_long.py"], "", out, 60.0, "on", ci.session.GRACE,
+              ci.shared("3.12"), {})
     wall = time.monotonic() - began
     rows = {row["name"]: row["seconds"] for row in json.loads(out.read_text())["rows"]}
     short, long = rows["3.12:tests/test_short.py"], rows["3.12:tests/test_long.py"]
@@ -856,8 +861,8 @@ def test_a_task_the_fleet_recalled_goes_on_from_the_tests_its_attempt_passed(ci,
     armada starts after recalling one (ARMADA_RESUME, the artifacts the recalled attempt kept, #4544) sets
     those aside and runs the rest: its row green with every test's seconds, the earlier attempt's among them,
     its progress carrying them for a later recall, and no record written, as no record holds the earlier
-    attempt's opens. It sets aside exactly those tests, never one whose id theirs begins (pytest's --deselect
-    matches by prefix: train 671's review)."""
+    attempt's opens. A whole file's tests are set aside only where its process ended 0; a split group's
+    where it did not end red."""
     (tmp_path / "tests/test_resumed.py").write_text(
         "import time\n"
         "from pathlib import Path\n"
@@ -879,18 +884,22 @@ def test_a_task_the_fleet_recalled_goes_on_from_the_tests_its_attempt_passed(ci,
     [row] = armada_task(ci, monkeypatch, out, policy="off")
     assert row["exitCode"] == 0, row["output"]
     progress = tmp_path / "artifacts" / "progress.jsonl"
-    kept = [json.loads(line)["node"] for line in progress.read_text().splitlines()]
+    lines = [json.loads(line) for line in progress.read_text().splitlines()]
+    kept = [line["node"] for line in lines if "node" in line]
     assert kept == ["tests/test_resumed.py::test_first", "tests/test_resumed.py::test_first_again"]
+    # Its process's exit sealed them, kept as it exited (row 3932's review).
+    assert [line["code"] for line in lines if "ended" in line] == [0]
     # Its seconds are its setup's, call's and teardown's, as JUnit times it and as its `compiled` counts:
     # a fixture's 0.3 s among them (row 7939's review).
-    assert json.loads(progress.read_text().splitlines()[0])["seconds"] >= 0.3
-    # The next, recalled after its first test: that one set aside, the one its name begins run, both in
-    # its row.
+    assert lines[0]["seconds"] >= 0.3
+    # The next, recalled after a process that ended 0 passed the first test: that one set aside, the one its
+    # name begins run (pytest's --deselect matches by prefix: train 671's review), both in its row. The test
+    # it passed had compiled a program the shared cache lacked: its row still times it cold, and the progress
+    # carried on says so for a later recall (row 7939's review).
     (tmp_path / "resume").mkdir()
-    # The test it passed had compiled a program the shared cache lacked: its row still times it cold, and the
-    # progress carried on says so for a later recall (row 7939's review).
-    first = {**json.loads(progress.read_text().splitlines()[0]), "cold": True}
-    (tmp_path / "resume" / "progress.jsonl").write_text(json.dumps(first) + "\n")
+    resume = tmp_path / "resume" / "progress.jsonl"
+    sealed = [line for line in lines if "ended" in line]
+    resume.write_text("".join(json.dumps(line) + "\n" for line in [{**lines[0], "cold": True}, *sealed]))
     progress.unlink()
     (tmp_path / "ran").unlink()
     monkeypatch.setenv("ARMADA_RESUME", str(tmp_path / "resume"))
@@ -900,9 +909,17 @@ def test_a_task_the_fleet_recalled_goes_on_from_the_tests_its_attempt_passed(ci,
     assert (tmp_path / "ran").read_text() == "again "
     assert set(row["tests"]) == {f"tests/test_resumed.py::test_first{end}" for end in ("", "_again")}
     assert row["cold"] == ["tests/test_resumed.py::test_first"]
-    carried = [json.loads(line) for line in progress.read_text().splitlines()]
+    carried = [json.loads(line) for line in progress.read_text().splitlines() if "node" in json.loads(line)]
     assert [line["node"] for line in carried] == kept and carried[0]["cold"] and "cold" not in carried[1]
     assert stored == {}
+    # Recalled after its first test passed, before its process ended: that pass may yet fail with its exit
+    # (an exit's crash), so the whole file runs again (row 3932's review).
+    resume.write_text(json.dumps(lines[0]) + "\n")
+    progress.unlink()
+    (tmp_path / "ran").unlink()
+    [row] = armada_task(ci, monkeypatch, out, policy="off")
+    assert row["exitCode"] == 0, row["output"]
+    assert (tmp_path / "ran").read_text() == "first again "
     # A split group resumed sets its tests aside after split.py cuts its file, as every group's container
     # cuts it whole: a cut of the rest alone would run another group's tests and none of some (train 674's
     # review: weights 1, 3, 1, 3 cut in three, the second group's first test passed, its second never ran).

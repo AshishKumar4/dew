@@ -37,7 +37,6 @@ from dew._coordination import agree_process_phase, agreed, agreed_same, broadcas
 from dew._records import JSON
 from dew.batch import Batch, at_path, owned_dicts, placed_at, select, unboxed
 from dew.checkpoints import Checkpoints, Envelope, Ranking, Resume, _Laid
-from dew.data.compile import Handed
 from dew.data.dataset import (
     Checkpointable,
     Closeable,
@@ -49,6 +48,7 @@ from dew.data.dataset import (
     StepPhases,
     stream_identity,
 )
+from dew.data.handed import Handed
 from dew.data.pipeline import Dataset
 from dew.data.plan import DataResume, PlanChanged, environment_changes
 from dew.distributed.batches import (
@@ -169,7 +169,14 @@ from dew.training.distributed import (
 from dew.training.evaluation import EvalSuite, Evaluator, episodic
 from dew.training.inspection import Inspection
 from dew.training.interval import Interval, Reading, Taken, TokenClock, copied, leaf_paths, logged_scalars
-from dew.training.memory import first_run, recompute_record, refuse_wide_floats, remat_stated, split_share
+from dew.training.memory import (
+    first_run,
+    first_run_failed,
+    recompute_record,
+    refuse_wide_floats,
+    remat_stated,
+    split_share,
+)
 from dew.training.model_flops import TOKENS, TRAINING_FLOPS, model_batch, prepare_counts, uncounted
 from dew.training.observe import Observe
 from dew.training.phase_passes import PhasePasses, SampledPasses
@@ -1087,6 +1094,18 @@ class Trainer(Generic[Loss, Effects]):
         from is released with its plan (`Planned.released`)."""
         return None if self._compiled is None else self._compiled.executable
 
+    def _stepped(self, train_step: CompiledStep, state: TrainState, device: Batch, step: int, *,
+                 sampled: bool):
+        """`train_step` over `state` and `device`, a newly compiled step's first run's failure on its
+        devices raised as the step's (`dew.training.memory.first_run_failed`), wherever the program it ran
+        raised it: at its own wait or at its admission's (`dew.communicators.called`)."""
+        try:
+            return train_step(state, device, sampled=sampled)
+        except jax.errors.JaxRuntimeError as error:
+            if not self._unproven:
+                raise
+            raise first_run_failed(error, step, self.memory, self.device_mesh) from error
+
     @property
     def step_flops(self) -> StepFlops | None:
         """The FLOPs of the last compiled step; a ramped run has one value per stage, which `fit` keeps
@@ -1203,6 +1222,11 @@ class Trainer(Generic[Loss, Effects]):
                 if self._later is not None:
                     self._later.stopped()
                     self._later = None
+                # A plan no compile of this fit took, the fit's own until one does: the start's device plan
+                # (`streaming.laid_start`) where the run failed before its first compile took it, as placing
+                # its state, or a later phase's its run never reached; released with no winner, its programs
+                # and admission charges held no more (`StepCompiler.abandoned`).
+                self._compiler.abandoned()
                 if primary is None and error is not None:
                     raise error
         if run.preempted is not None:
@@ -1356,9 +1380,9 @@ class Trainer(Generic[Loss, Effects]):
                     # its steps', its first draw's admissions (`DrawingStep.drawn`) among it.
                     interval.compiling = before + time.perf_counter() - began
                 with region("train.step"):
-                    state, loss, aux, finite, accepted, committed = train_step(
-                        state, device, sampled=self.inspection is not None and self.inspection.samples(
-                            run.current + 1, self.accumulation))
+                    state, loss, aux, finite, accepted, committed = self._stepped(
+                        train_step, state, device, run.current, sampled=self.inspection is not None
+                        and self.inspection.samples(run.current + 1, self.accumulation))
                 if not seen and self.phase_passes.counts:
                     # Once the first step is dispatched, its later phases' steps are planned off the loop.
                     from dew.training.ahead import LaterPlans
@@ -2246,8 +2270,9 @@ class Trainer(Generic[Loss, Effects]):
                 # Its empty window binds no split: the new step's window is built over it.
                 self._compiler.afresh = True
             if self._later is not None:
-                # The phase's plan off the loop waited for, its executables the process's (`LaterPlans`).
-                self._later.waited(self.phase_passes.current)
+                # The phase's plan off the loop waited for, its executables the process's (`LaterPlans`),
+                # each but those the boundary's plan takes dropped once it takes one.
+                self._compiler.settle_with(self._later.waited(self.phase_passes.current))
         # Trials here serve only explicitly enabled AutoPGLE, never frontier timing.
         trials = Trials(state, batch)
         if signature not in compiled:
