@@ -451,7 +451,8 @@ def test_a_fewer_rows_ladder_walks_the_query_blocks_its_derivation_walks():
                   if block < 128 and op.takes(ba, dataclasses.replace(config, block_q=block), target)
                   and op._regime(ba, dataclasses.replace(config, block_q=block), target)
                   == op._regime(ba, config, target)}
-        ladder = {rung.block_q for rung in op.ladder(ba, config)}
+        ladder = {rung.block_q for rung in op.ladder(ba, config)
+                  if isinstance(rung, attention_mosaic.BackwardTiles)}
     assert walked and ladder == walked, (ladder, walked)
 
 
