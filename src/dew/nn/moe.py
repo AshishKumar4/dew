@@ -38,7 +38,7 @@ from jax.sharding import PartitionSpec as P
 from dew import quantization
 from dew.batch import Variables, leaves_by_path
 from dew.mesh import EXPERT_AXIS, STAGE_AXIS, LayoutRefused, LogicalAxes, batch_axes, logical_spec, mesh_axes
-from dew.nn.dense import Dense, history_scale, packed_matrix, recorded
+from dew.nn.dense import Dense, amax_history, packed_matrix, recorded
 from dew.nn.derivatives import KernelGlue, Protected, contracted, declared_tangent, with_tangents_formed_at
 from dew.nn.residuals import Residual
 
@@ -1465,6 +1465,14 @@ class ExpertMLP(nn.Module):
                                 kernel_axes=EXPERT_AXES['down_proj'],
                                 init_std=(self.init_std if self.output_init_std is None
                                           else self.output_init_std))
+        # Each projection's amax history under a delayed-scaling NVFP4 recipe that takes the experts
+        # (`dense.amax_history`), declared here: the products run in a derivative's span, where none is.
+        shapes = {'gate_proj': (self.out_features, self.hidden_features),
+                  'up_proj': (self.out_features, self.hidden_features),
+                  'down_proj': (self.hidden_features, self.out_features)}
+        with projection_role("experts"):
+            self.histories = {name: amax_history(self, name, shape) for name, shape in shapes.items()
+                              if self.activation != 'relu2' or name != 'gate_proj'}
 
     def _project(self, tokens: jax.Array | Gathered, sizes: jax.Array, _expert_ids: jax.Array,
                  kernels: tuple[jax.Array, ...], *, dtype: Dtype) -> jax.Array:
@@ -1504,16 +1512,16 @@ class ExpertMLP(nn.Module):
     def _delayed(self, names: tuple[str, ...], kernels: tuple, tokens: jax.Array | Gathered
                  ) -> tuple[jax.Array | None, ...] | None:
         """Each of the layer's projections' (`names`, its `kernels`') delayed-scaling NVFP4 tensor scale in
-        the experts' role (`dense.history_scale`, row 12721), the rows they read first recorded
+        the experts' role, its history's (`setup`'s, `dense.amax_history`; row 12721), the rows they read
+        first recorded
         (`dense.recorded`; the down projection's its caller records), or None where the run's recipe is no
         delayed one that takes them (a packed bank its recipe never takes)."""
         if any(isinstance(kernel.stack if isinstance(kernel, Layered) else kernel, formats.NvFp4)
                for kernel in kernels):
             return None
-        with projection_role("experts"):
-            scales = tuple(history_scale(self, name, (kernel.stack if isinstance(kernel, Layered)
-                                                      else kernel).shape) for name, kernel in zip(
-                names, kernels, strict=True))
+        histories = [self.histories[name] for name in names]
+        scales = tuple(None if history is None else projections.delayed_tensor_scale(history.value)
+                       for history in histories)
         if all(scale is None for scale in scales):
             return None
         rows = gathered(tokens)

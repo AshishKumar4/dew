@@ -325,13 +325,12 @@ a float32 scalar, one a layer in a scanned stack), named and placed as its histo
 a training step takes the largest of across its calls and microbatches and rolls in (`rolled`)."""
 
 
-def history_scale(layer: nn.Module, name: str, shape: tuple[int, ...]) -> jax.Array | None:
-    """The tensor scale `layer`'s projection `name` by a `shape` (`[..., depth, width]`, a product's extents
-    as matrices) matrix quantizes
-    its rows at, where the run trains in a delayed-scaling NVFP4 recipe that takes it in the role traced
-    (`projections.recipe_takes`): its amax history's (`projections.delayed_tensor_scale`), the history held
-    at `layer`'s path as `name` (`NVFP4_HISTORY`); None elsewhere (row 12721). Its rows' largest magnitude
-    the caller records (`recorded`)."""
+def amax_history(layer: nn.Module, name: str, shape: tuple[int, ...]) -> nn.Variable | None:
+    """`layer`'s amax history for its projection `name` by a `shape` (`[..., depth, width]`, a product's
+    extents as matrices) matrix, held at its path as `name` (`NVFP4_HISTORY`), where the run trains in a
+    delayed-scaling NVFP4 recipe that takes the projection in the role traced (`projections.recipe_takes`);
+    None elsewhere (row 12721). Declared where `layer` declares its variables (its `setup` or a compact
+    method); a delayed run whose variables hold none, initialized under another recipe, is refused."""
     from dew.nn.precision import recipe_role
 
     held = recipe_role()
@@ -342,8 +341,15 @@ def history_scale(layer: nn.Module, name: str, shape: tuple[int, ...]) -> jax.Ar
                          f"amax histories (the {NVFP4_HISTORY!r} collection), and its variables hold none: "
                          "initialize the model under the run's recipe")
     length = held[0].amax_history
-    history = layer.variable(NVFP4_HISTORY, name, lambda: jnp.zeros((length,), jnp.float32))
-    return projections.delayed_tensor_scale(history.value)
+    return layer.variable(NVFP4_HISTORY, name, lambda: jnp.zeros((length,), jnp.float32))
+
+
+def history_scale(layer: nn.Module, name: str, shape: tuple[int, ...]) -> jax.Array | None:
+    """The tensor scale `layer`'s projection `name` quantizes its rows at: its amax history's
+    (`amax_history`, `projections.delayed_tensor_scale`), None where it holds none. Its rows' largest
+    magnitude the caller records (`recorded`)."""
+    history = amax_history(layer, name, shape)
+    return None if history is None else projections.delayed_tensor_scale(history.value)
 
 
 def recorded(layer: nn.Module, name: str, rows: Array) -> None:
