@@ -711,13 +711,14 @@ class Trainer(Generic[Loss, Effects]):
         placing anything, so a run is checked on a CPU host before a costly launch.
 
         The state is a fresh run's: its parameters, optimizer state and EMA, and, given one global `batch` as
-        the run reads it, the accumulation its steps pool where `accumulation` is above 1, read in the first
-        of the splits its plan may take whose devices hold it, the trainer's own where it fixes one
-        (`splits`). It leaves out the narrow copies a step may read (`TrainState.compute`), which the plan
-        drops first where the step does not fit with them. An `OptimConfig` is built over `steps`, as
-        `fit(steps=...)` builds it. A trainer on compile-only GPUs
-        (`dew.nn.kernels.generation.compile_only_gpus`) checks it against the memory stated for them, on a
-        host that holds none.
+        the run reads it (its arrays as the run places them, `placed_abstract`, as a fit's check and plan
+        read its first), the
+        accumulation its steps pool where `accumulation` is above 1, read in the first of the splits its plan
+        may take whose devices hold it, the trainer's own where it fixes one (`splits`). It leaves out the
+        narrow copies a step may read (`TrainState.compute`), which the plan drops first where the step does
+        not fit with them. An `OptimConfig` is built over `steps`, as `fit(steps=...)` builds it. A trainer
+        on compile-only GPUs (`dew.nn.kernels.generation.compile_only_gpus`) checks it against the memory
+        stated for them, on a host that holds none.
 
         Raises what `fit` raises before placing the state: `LayoutRefused` for a state over a device's memory
         or a layout that replicates too much of the model, and ValueError for rules that name an axis the
@@ -727,7 +728,8 @@ class Trainer(Generic[Loss, Effects]):
         state = jax.eval_shape(self._staged_start)
         if batch is None:
             return self._validated(state)[1]
-        return self._fitting(state, marked(DataPartition(), self._counted_batch)(batch))
+        return self._fitting(state, placed_abstract(
+            self.device_mesh, marked(DataPartition(), self._counted_batch)(batch), whole=True))
 
     def _validated(self, state: TrainState) -> tuple[Placement[TrainState], Validation]:
         """`state`'s placement and what `Layout.validate` reads of the state it places, as the

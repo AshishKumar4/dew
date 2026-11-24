@@ -111,7 +111,7 @@ def link_bandwidth(mesh: Mesh, axis: str, size: int = 1 << 28) -> float:
     figure = kept.get("bytes_per_second") if ours and isinstance(kept, dict) else None
     # A figure is a finite positive number (no flag, NaN or zero), else this process sees none.
     seen = (float(figure) if isinstance(figure, int | float) and not isinstance(figure, bool)
-            and math.isfinite(figure) and figure > 0 else None)
+            and 0 < figure < _LARGEST and math.isfinite(figure) else None)
     figures = from_every_process(seen)
     if all(each is not None for each in figures):
         return min(each for each in figures if each is not None)
@@ -128,6 +128,11 @@ def link_bandwidth(mesh: Mesh, axis: str, size: int = 1 << 28) -> float:
     if record is not None and jax.process_index() == 0:
         keep(record, {"topology": topology, "bytes_per_second": received}, "the link's figure")
     return received
+
+
+_LARGEST = 1e300
+"""A link figure past which a kept record is no figure (`link_bandwidth`): a float of it is finite, where
+an integer a record holds may overflow one."""
 
 
 def link_figures(bandwidths: Mapping[tuple[Mesh, str], float | None]) -> dict[str, JSON]:

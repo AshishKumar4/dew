@@ -90,6 +90,19 @@ def leaf_path(path) -> str:
     return jax.tree_util.keystr(path, simple=True, separator="/")
 
 
+def test_a_validated_batch_holding_a_scalar_and_a_host_field_reads_as_its_arrays_alone():
+    """A fine-tune validated over a batch holding, beside its token rows, a nested Python number (a device
+    field with no dtype of its own) and a field of strings no device holds reports what it reports over the
+    rows alone: the batch read as the run places it, its scalar and host field as they are (review of the
+    T83 follow-up: a Python number's `dtype` was read, and raised)."""
+    mesh = MeshSpec().build(jax.devices()[:1])
+    rows = step_batch()
+    plain = fine_tune(mesh, Layout()).validate(rows)
+    mixed = fine_tune(mesh, Layout()).validate({**rows, "meta": {"weight": 1.0},
+                                                "names": [f"row {index}" for index in range(BATCH)]})
+    assert mixed.device_bytes == plain.device_bytes, (mixed.device_bytes, plain.device_bytes)
+
+
 @pytest.mark.mesh(devices=8)
 @pytest.mark.parametrize("case", list(CASES))
 def test_a_validated_fine_tune_is_placed_and_held_as_its_report_said(case):
