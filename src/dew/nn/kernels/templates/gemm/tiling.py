@@ -105,16 +105,25 @@ class Tiles:
         if self.warpgroups == 2 and self.stages < 2:
             # A stage is released a step late (an MMA in flight), so one stage would wait on itself.
             raise ValueError(f"{self}: two warpgroups stream at least two stages")
-        if self.staging is not None:
-            # A family that stages its outputs whole refuses chunks (`Family.output_staging` of no outputs);
-            # its chunks against the tile's columns and its issuer's pieces, which no dtype changes
-            # (`stores.staging_refusal` of no dtypes); a chunk's bytes in the call's output dtypes are its
-            # launch's to judge (`staging_refusal`).
-            family.output_staging((), self.warpgroups, self.staging)
-            columns = self.block_n * (self.cluster if family.pairs_product else 1)
-            refusal = stores.staging_refusal(columns, (), self.staging, piece=family.chunk_columns(columns))
-            if refusal is not None:
-                raise ValueError(f"{self}: {refusal}")
+        if self.staging is not None and (refusal := self.chunked_refusal(self.staging)) is not None:
+            raise ValueError(f"{self}: {refusal}")
+
+    def chunked_refusal(self, staging: tuple[int, int]) -> str | None:
+        """Why this tile stages its outputs in no chunks of `staging` (chunk columns, buffers), whatever their
+        dtypes, None where it does: a family that stages its outputs whole refuses chunks
+        (`mosaic.refuse_staging`), and a chunk divides the tile's columns and its issuer's pieces
+        (`stores.staging_refusal` of no dtypes); a chunk's bytes in the call's output dtypes are its
+        launch's to judge (`staging_refusal`). Its constructor's check, and a caller's asking before it states
+        `staging` (`quantized.formed`)."""
+        from dew.nn.kernels.templates import bundles
+
+        family = bundles.named(self.family, jnp.bfloat16, None)
+        try:
+            family.output_staging((), self.warpgroups, staging)
+        except ValueError as refused:
+            return str(refused)
+        columns = self.block_n * (self.cluster if family.pairs_product else 1)
+        return stores.staging_refusal(columns, (), staging, piece=family.chunk_columns(columns))
 
     def stated(self, outputs, family) -> tuple[int, int] | None:
         """The output staging this tile states for a kernel storing `outputs` (`(shape, dtype)` each, or

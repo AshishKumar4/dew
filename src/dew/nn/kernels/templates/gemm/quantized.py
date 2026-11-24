@@ -145,17 +145,27 @@ def _blockwise_fp8_quantized(values: jax.Array) -> tuple[jax.Array, jax.Array]:
     amax a row reduction of each tile's columns of the accumulator's layout (`_block_max`), elsewhere one
     reduction of the tiles' view (DeepSeek-V3's blockwise FP8 recipe, row 8547)."""
     from dew.nn.fake_quant import fp8_block_scale
-    from dew.nn.precision import lowered_divide
 
     block = product_formats.SCALE_DEPTH
-    if _EPILOGUE_LAYOUT.get() is None:
-        rows, cols = values.shape
+    rows, cols = values.shape
+    if _EPILOGUE_LAYOUT.get() is None and cols % block == 0:
         tiles = jnp.max(jnp.abs(values.reshape(rows, cols // block, block)), axis=-1)
         amax = jnp.repeat(tiles, block, axis=1)
     else:
+        # A kernel's accumulator layout, or a launch identity's probe of a narrower tile (`traced`).
         amax = _block_max(values, block)
     scale = fp8_block_scale(amax)
-    return encode_tile(lowered_divide(values, scale, jnp.int32(0)), bits.E4M3), scale
+    return encode_tile(values * _reciprocal(scale), bits.E4M3), scale
+
+
+def _reciprocal(scale: jax.Array) -> jax.Array:
+    """`1 / scale` exactly for `fake_quant.fp8_block_scale`'s scales, so a product by it is the IEEE
+    quotient: a normal power of two's its exponent negated (every finite block's: its scale between 2**-22 and
+    2**120), +0 for its infinite one (an infinite amax's) and -inf for its -0 (a NaN amax's sentinel)."""
+    word = jax.lax.bitcast_convert_type(scale, jnp.uint32)
+    biased = (word >> jnp.uint32(23)) & jnp.uint32(0xFF)
+    inverse = jax.lax.bitcast_convert_type((jnp.uint32(254) - biased) << jnp.uint32(23), jnp.float32)
+    return jnp.where(biased == 0xFF, jnp.float32(0.0), jnp.where(word == 0x80000000, -jnp.inf, inverse))
 
 
 def blockwise_fp8_epilogue(activation=None, out_dtype=jnp.bfloat16):
@@ -181,6 +191,8 @@ def forms_of(out_forms: tuple | None, count: int) -> tuple:
     `(divisor, transposed)`; none stated, every output a tile."""
     if not out_forms:
         return ()
+    if count < 2:
+        raise ValueError("output forms are a several-output call's (`out_dtypes`)")
     if len(out_forms) != count:
         raise ValueError(f"{len(out_forms)} output forms for {count} outputs")
     return tuple(out_forms)
@@ -234,14 +246,12 @@ def formed(config, out_forms: tuple | None):
     from dew.nn.kernels.templates import stores
 
     divisor = _reduced_divisor(out_forms)
-    if divisor is None or config.staging is not None:
+    staging = None if divisor is None else (divisor, stores.OUTPUT_BUFFERS)
+    # A tile whose issuer emits narrower pieces than a block (tcgen05's 64 columns) stages no block a chunk
+    # (`Tiles.chunked_refusal`): left unstated, which `forms_refusal` refuses, so its family declines.
+    if staging is None or config.staging is not None or config.chunked_refusal(staging) is not None:
         return config
-    try:
-        return dataclasses.replace(config, staging=(divisor, stores.OUTPUT_BUFFERS))
-    except ValueError:
-        # A tile whose issuer emits narrower pieces than a block (tcgen05's 64 columns) stages no block a
-        # chunk: left unstated, which `forms_refusal` refuses, so its family declines the call.
-        return config
+    return dataclasses.replace(config, staging=staging)
 
 
 def forms_refusal(out_forms: tuple | None, config, *, dense: bool) -> str | None:
