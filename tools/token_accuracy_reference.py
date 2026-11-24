@@ -41,8 +41,9 @@ from dew.nn.backbones import CausalTransformer
 TRL = "https://raw.githubusercontent.com/huggingface/trl/59c4a8e104413fa9f4ca1a54eaf2ff93c0f299be/trl/trainer/"
 """TRL v1.12.0's commit."""
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "token_accuracy"
-MODEL = {"vocab_size": 32, "emb_features": 16, "num_layers": 2, "num_heads": 2, "mlp_features": 32,
-         "max_seq_len": 16, "attention_impl": "reference"}
+MODEL = CausalTransformer(vocab_size=32, emb_features=16, num_layers=2, num_heads=2, mlp_features=32,
+                          max_seq_len=16)
+"""The decoder the reference's tokens are read through, on the run's attention kernel (`main`)."""
 BATCHES = (3, 5)
 LENGTH = 12
 USER, ASSISTANT = 2, 3
@@ -82,14 +83,14 @@ def trl_accuracy(statements, logits: np.ndarray, labels: np.ndarray) -> dict:
 
 
 def decoder(statements) -> dict:
-    model = CausalTransformer(**MODEL)
+    model = MODEL
     params = model.init(jax.random.key(0), jnp.ones((1, LENGTH), jnp.int32))
     rng = np.random.default_rng(5)
     arrays, accuracies = {}, []
     for index, rows in enumerate(BATCHES):
         # Each next id is the model's own top choice for it more often than
         # not, so the batches count many right predictions and many wrong.
-        tokens = rng.integers(0, MODEL["vocab_size"], (rows, LENGTH)).astype(np.int32)
+        tokens = rng.integers(0, MODEL.vocab_size, (rows, LENGTH)).astype(np.int32)
         for position in range(1, LENGTH):
             logits = model.apply(params, jnp.asarray(tokens))
             if isinstance(logits, tuple):

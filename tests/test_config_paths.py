@@ -11,7 +11,8 @@ import json
 import typing
 
 import pytest
-from option_witness import alternatives, flag, held_at, replaced
+from model_support import attending
+from option_witness import alternatives, flag, held_at, members_of, replaced
 from run_kinds import KINDS, saved_record, scalars, trained_by_cli, trained_record
 
 from dew import registry
@@ -63,6 +64,21 @@ def option(kind: str, path: str, index: int) -> tuple[RunConfig, object, object]
     return base, *held[index]
 
 
+def test_a_strategy_is_witnessed_by_the_classes_its_call_binds_to_and_no_other():
+    """The witnesses of a protocol of a call alone (`dew.sampling.Strategy`) are the classes its call's
+    arguments bind to (`option_witness.members_of`): Dew's sampling loop among them, and no metric, which
+    is called with a pass's artifact and batch alone (Train 1209: a perplexity built as a strategy), nor a
+    class its instances are not called on, whose constructor takes any arguments (an optimizer's spec).
+    """
+    from dew.objectives.lm.objective import Perplexity
+    from dew.optim import MuonClip
+    from dew.sampling import Sample, Strategy
+
+    found = members_of(Strategy)
+    assert any(isinstance(value, Sample) for value in found)
+    assert not any(isinstance(value, Perplexity | MuonClip) for value in found)
+
+
 @pytest.mark.parametrize(("kind", "path", "index"), cases(), ids=lambda part: str(part))
 def test_each_path_that_sets_an_option_sets_the_same_run(kind, path, index, tmp_path):
     """The option set in Python, at its path, and read back from the run's record and its run.json, is the
@@ -94,6 +110,7 @@ SET = {"optim.learning_rate": 0.0123, "data_seed": 3, "trainer.key": 5}
 """Options a run trained both ways is set with, each beside its default."""
 
 
+@attending("xla")
 @pytest.mark.mesh(devices=8)
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_a_run_with_options_set_trains_alike_from_python_its_command_and_its_record_and_resumes_as_it_ran(

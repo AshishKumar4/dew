@@ -25,7 +25,7 @@ def fp32_matmuls():
 def source():
     """The tiny loaded at fp32 with the reference attention, its model without quantization, and the
     release's one-seed run (reference.npz): a module's fixture."""
-    loaded = Pretrained.load(TINY, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(TINY, dtype="float32")
     return loaded, unquantized(loaded.model), np.load(TINY / "reference.npz")
 
 

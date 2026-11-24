@@ -6,6 +6,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from model_support import attending
 
 from dew.batch import everything, merge, select, under
 from dew.data import Memory
@@ -276,6 +277,7 @@ def test_a_supplied_gradient_binds_each_rule_to_its_own_parameter_in_any_mapping
     np.testing.assert_array_equal(gradient["right"], [0.0, 1.0, 2.0])
 
 
+@attending("xla")
 def test_an_objective_whose_saved_task_builds_from_its_settings_builds_its_task_from_them():
     """An objective, any package's, whose saved task builds from the settings a run records
     (`from_settings`) builds its live task from its own settings, as a saved run of it loads: the
@@ -289,7 +291,7 @@ def test_an_objective_whose_saved_task_builds_from_its_settings_builds_its_task_
     from dew.sampling.text import Sampling
 
     model = CausalTransformer(vocab_size=11, emb_features=8, num_layers=1, num_heads=1, mlp_features=16,
-                              max_seq_len=8, attention_impl="xla")
+                              max_seq_len=8)
 
     class Decoding(Objective):
         saved_task = TextGeneration

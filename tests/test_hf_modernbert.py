@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 from arm_arithmetic import ahead_on_the_host
 from interop_support import fixture_ids, transformers_arms, transformers_model
+from model_support import attending
 from reference_error import assert_as_exact
 
 from dew.batch import field_coordinates
@@ -24,10 +25,11 @@ LOGITS_SEEDS = 8
 `seeds_for` paired with Dew's logits on the CPU."""
 
 
+@attending("reference")
 def test_modernbert_masked_lm_logits_match_the_reference():
     """The masked LM's logits are on par with ModernBertForMaskedLM's, from its float64 twin's, over
     drawn ids (check 1), with the same argmax."""
-    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(DIRECTORY, dtype='float32')
     draw = fixture_ids(DIRECTORY)
     reference, truth = transformers_arms(transformers_model(DIRECTORY, masked=True),
                                          lambda model, ids: model(ids).logits)
@@ -52,11 +54,12 @@ def test_modernbert_states_match_the_encoder_through_every_window_path(implement
     its float64 twin's, over drawn ids (check 1)."""
     import torch
 
-    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl=implementation)
+    loaded = Pretrained.load(DIRECTORY, dtype='float32')
     mask = _fixture('attention_mask')
     documents = _fixture('segment_ids')
     positions = np.where(documents == 1, np.arange(documents.shape[1]), np.arange(documents.shape[1]) - 5)
 
+    @attending(implementation)
     def ours(ids):
         def states(ids, **kwargs):
             # The flat fields laid out once (`field_coordinates`), the layout `hidden_states` reads.
@@ -90,7 +93,7 @@ def modernbert_states_in_bf16_on_the_gpu_kernels():
     float64 twin of its float32 load."""
     with ahead_on_the_host():
         # Loaded on the host in a GPU tier prepare, which computes nothing on its GPU (rows 7858, 7859).
-        loaded = Pretrained.load(DIRECTORY, dtype='bfloat16', attention_impl='auto')
+        loaded = Pretrained.load(DIRECTORY, dtype='bfloat16')
     reference, truth = transformers_arms(
         transformers_model(DIRECTORY, masked=True, dtype='bfloat16'),
         lambda model, ids: model.model(ids).last_hidden_state,

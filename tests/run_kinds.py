@@ -43,6 +43,8 @@ GEMMA_TINY = Path(__file__).parent / "fixtures" / "hf" / "gemma3-native-tiny"
 DIFFUSION_GEMMA = Path(__file__).parent / "fixtures" / "hf" / "diffusion-gemma-sft"
 RATE = 0.0123
 """A learning rate no kind takes by default, which the run's optimizer logs as it steps."""
+
+
 @dataclasses.dataclass(frozen=True)
 class MostlyKept:
     """A record kept by its draw three times in four (`Pipeline.random_filter_map`): which records a
@@ -153,7 +155,7 @@ def published(root: Path, drawn: bool) -> RunConfig:
     train, held = pictures()
     return DiffusionRunConfig(
         pretrained=str(pipeline), preset=None,
-        model=ModelConfig("unet", {**DEFAULT_MODEL_CONFIG, "dtype": "float32", "attention_impl": "xla"}),
+        model=ModelConfig("unet", {**DEFAULT_MODEL_CONFIG, "dtype": "float32"}),
         data=captioned(train, 32, drawn=drawn), validation=captioned(held, 32, drawn=False), val_metrics=(),
         objective=ObjectiveConfig("diffusion", {"steps": 2}))
 
@@ -166,8 +168,7 @@ def jepa(root: Path, drawn: bool) -> RunConfig:
         return read(rows.pipe(presets.images, 16, batch=8, augment=Dimmed() if drawn else False))
     return JepaRunConfig(
         model=ModelConfig("jepa_encoder", {"patch_size": 2, "emb_features": 16, "num_layers": 1,
-                                           "num_heads": 2, "mlp_ratio": 2, "dtype": "float32",
-                                           "attention_impl": "xla"}),
+                                           "num_heads": 2, "mlp_ratio": 2, "dtype": "float32"}),
         predictor={"num_layers": 1, "predictor_features": 8}, num_target_blocks=2,
         data=patched(train, drawn=drawn), validation=patched(held, drawn=False))
 
@@ -221,7 +222,7 @@ def dreamed(root: Path, drawn: bool, release: str = "dream") -> RunConfig:
                                 tokenizer=str(source), vocab_size=128, eos_id=1)
     data = TokenFiles(corpus.train).pipe(presets.lm, None, seq_len=11, batch=8, pack=None).loading(
         Loading(workers=0))
-    model = ModelConfig("causal_transformer", {"dtype": "float32", "attention_impl": "reference"})
+    model = ModelConfig("causal_transformer", {"dtype": "float32"})
     return dataclasses.replace(lm(root, drawn), data=data, validation=None, pretrained=str(source),
                                tokenizer=str(source), model=model, max_new_tokens=0,
                                objective=ObjectiveConfig("masked_diffusion"))
@@ -305,7 +306,7 @@ def blockwise(root: Path, drawn: bool, release: str = str(DIFFUSION_GEMMA), toke
                                 tokenizer=release, vocab_size=32, eos_id=1)
     spans = TokenFiles(corpus.train).pipe(presets.lm, None, seq_len=11, batch=8, pack=None).loading(
         Loading(workers=0))
-    model = ModelConfig("causal_transformer", {"dtype": "float32", "attention_impl": "xla"})
+    model = ModelConfig("causal_transformer", {"dtype": "float32"})
     return dataclasses.replace(lm(root, drawn), pretrained=release, tokenizer=release, model=model,
                                data=spans, validation=None,
                                objective=ObjectiveConfig("block_diffusion", {"prompt_length": 4}),

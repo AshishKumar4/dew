@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from interop_support import assert_decodes_as_it_scores
-from model_support import flat_tree, prediction_logits
+from model_support import attending, flat_tree, prediction_logits
 from test_hf_decoders import fixture_config, fp32_decoder, recorded_logit_difference, scaled_difference
 
 from dew.interop import Pretrained
@@ -30,6 +30,7 @@ DECODE_SEEDS = {"qwen35": 8, "qwen3_next": 8, "gemma3n": 32}
 GEMMA4 = ("gemma4-ple", "gemma4-kvshare")
 
 
+@attending("reference")
 @pytest.mark.parametrize("name", (*GEMMA4, "gemma4-e2b"))
 def test_gemma4_logits_match_the_reference_implementation(name):
     """Full-model parity, fully live on both branches. Largest observed max
@@ -41,6 +42,7 @@ def test_gemma4_logits_match_the_reference_implementation(name):
     assert difference < 1e-5, f"max |logit difference| {difference:.3e}"
 
 
+@attending("reference")
 def test_a_kv_shared_layers_stored_keys_and_values_load_unused_and_save_back(tmp_path):
     """google/gemma-4-E4B-it stores its kv-shared layers' own k_proj, v_proj and k_norm (layers 24-41),
     which transformers builds and never computes with, as the layer reads its provider's keys and
@@ -68,8 +70,8 @@ def test_a_kv_shared_layers_stored_keys_and_values_load_unused_and_save_back(tmp
                 like.dtype)
     safetensors_numpy.save_file({**stored, **unused}, directory / "model.safetensors",
                                 metadata={"format": "pt"})
-    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
-    alone = Pretrained.load(FIXTURES / "gemma4-kvshare", dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(directory, dtype="float32")
+    alone = Pretrained.load(FIXTURES / "gemma4-kvshare", dtype="float32")
     assert jax.tree.structure(loaded.variables) == jax.tree.structure(alone.variables)
     for ours, theirs in zip(jax.tree.leaves(loaded.variables), jax.tree.leaves(alone.variables), strict=True):
         np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
@@ -92,6 +94,7 @@ def test_gemma4_e4b_builds_from_its_released_tensors():
     assert shapes and all(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in shapes)
 
 
+@attending("reference")
 def test_the_router_bias_lands_in_the_moe_collection():
     """DeepSeek's `e_score_correction_bias` is router state a training step
     moves, not a weight, and `Router` keeps it in the `moe` collection. The
@@ -208,6 +211,7 @@ def test_qwen35s_step_certifies_element_by_element(monkeypatch):
     assert_certified(step, draw, "Qwen3.5's step", seeds=QWEN35_CERTIFIED_SEEDS)
 
 
+@attending("reference")
 @pytest.mark.parametrize("fixture", ["qwen35-tiny", "qwen35-moe-native-tiny", "qwen3-next-tiny"])
 @pytest.mark.parametrize("depth", [0, 1], ids=["trunk", "prediction-layer"])
 def test_a_hybrid_qwen_model_written_without_its_source_states_its_fields_and_reloads(fixture, depth,
@@ -221,14 +225,14 @@ def test_a_hybrid_qwen_model_written_without_its_source_states_its_fields_and_re
     scratch model of the fixture's geometry with one, drawn whole."""
     from dew.interop.pretrained import PretrainedDecoder
 
-    loaded = Pretrained.load(FIXTURES / fixture, dtype="float32", attention_impl="reference", text_only=True)
+    loaded = Pretrained.load(FIXTURES / fixture, dtype="float32", text_only=True)
     ids = jnp.arange(1, 9, dtype=jnp.int32)[None]
     model, variables = loaded.model, loaded.variables
     if depth:
         model = model.clone(num_nextn_predict_layers=depth)
         variables = nn.unbox(model.init(jax.random.key(4533), ids))
     PretrainedDecoder.from_model(model, variables).save(tmp_path / "export")
-    restored = Pretrained.load(tmp_path / "export", dtype="float32", attention_impl="reference")
+    restored = Pretrained.load(tmp_path / "export", dtype="float32")
     assert flat_tree(restored.variables).keys() == flat_tree(variables).keys()
     for path, leaf in flat_tree(variables).items():
         np.testing.assert_array_equal(np.asarray(flat_tree(restored.variables)[path]), np.asarray(leaf))
@@ -239,11 +243,11 @@ def test_a_hybrid_qwen_model_written_without_its_source_states_its_fields_and_re
                                       np.asarray(prediction_logits(model, variables, ids)))
 
 
+@attending("reference")
 def test_a_qwen35_checkpoint_decodes_as_it_scores_in_parallel():
     """The loaded weights through the cache: a prefill and single-token steps on par with the parallel
     forward at each step's width from float64 over drawn rows (check 1, ledger 2739)."""
-    assert_decodes_as_it_scores(Pretrained.load(FIXTURES / "qwen35-tiny", dtype="float32", max_seq_len=16,
-                                                attention_impl="reference"),
+    assert_decodes_as_it_scores(Pretrained.load(FIXTURES / "qwen35-tiny", dtype="float32", max_seq_len=16),
                                 "qwen35 decode", seeds=DECODE_SEEDS["qwen35"], prefill=4, length=12,
                                 salt=0x2739)
 
@@ -253,6 +257,9 @@ def test_a_qwen35_checkpoint_decodes_as_it_scores_in_parallel():
 # --------------------------------------------------------------------------
 
 QWEN3_NEXT = FIXTURES / "qwen3-next-tiny"
+
+
+@attending("reference")
 def test_qwen3_next_logits_match_the_reference_implementation():
     """Full-model parity on the tiny hybrid: three fused delta net layers,
     the gated attention, and softmax top-2 routing with the gated shared
@@ -354,6 +361,7 @@ def qwen3_next_mtp_case():
     return dew, reference, selection_margins.clearing(draw, clears), truth
 
 
+@attending("reference")
 def test_qwen3_next_prediction_layer_matches_the_published_composition():
     """The mtp.* tensors compose as vLLM's Qwen3NextMultiTokenPredictor does over the trunk's final states
     and the next tokens' embeddings: Dew's first prediction depth's logits on par with the published
@@ -404,12 +412,12 @@ def test_the_fused_delta_net_projection_is_read_by_key_head_group():
     assert float(np.abs(np.asarray(split.apply({"params": whole}, x)) - wanted).max()) > 1e-2
 
 
+@attending("reference")
 def test_a_qwen3_next_checkpoint_decodes_as_it_scores_in_parallel():
     """The fused delta net's conv and recurrent states through the cache: a prefill and single-token
     steps on par with the parallel forward at each step's width from float64 over drawn rows that clear
     its routing (check 1, ledger 2739)."""
-    assert_decodes_as_it_scores(Pretrained.load(QWEN3_NEXT, dtype="float32", max_seq_len=16,
-                                                attention_impl="reference"),
+    assert_decodes_as_it_scores(Pretrained.load(QWEN3_NEXT, dtype="float32", max_seq_len=16),
                                 "qwen3_next decode", seeds=DECODE_SEEDS["qwen3_next"], prefill=4, length=12,
                                 salt=0x2739)
 
@@ -421,6 +429,7 @@ def test_a_qwen3_next_checkpoint_decodes_as_it_scores_in_parallel():
 GEMMA3N = FIXTURES / "gemma3n-tiny"
 
 
+@attending("reference")
 def test_gemma3n_logits_match_the_reference_implementation():
     """fp32 parity: tolerance 1e-4, observed max |logit difference| 4.2e-06
     with identical argmax. The copies' projections, each layer's AltUp and
@@ -439,11 +448,11 @@ def test_gemma3n_logits_match_the_reference_implementation():
     assert "k_proj" not in params["layers_3"]["self_attn"]
 
 
+@attending("reference")
 def test_gemma3n_decodes_through_the_cache_as_it_scores_in_parallel():
     """The stream of copies rides the decode path: single-token steps through the KV cache on par with
     the whole sequence at each step's width from float64 over drawn rows that clear its gaussian top-k
     (check 1, ledger 2739)."""
-    assert_decodes_as_it_scores(Pretrained.load(GEMMA3N, dtype="float32", max_seq_len=16,
-                                                attention_impl="reference"),
+    assert_decodes_as_it_scores(Pretrained.load(GEMMA3N, dtype="float32", max_seq_len=16),
                                 "gemma3n decode", seeds=DECODE_SEEDS["gemma3n"], prefill=1, length=12,
                                 salt=0x2739, rows=1)

@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import attending
 
 from dew.batch import coordinates
 from dew.interop import Pretrained
@@ -16,6 +17,7 @@ from dew.sampling import Sampling, generate
 FIXTURES = Path(__file__).parent / 'fixtures' / 'hf'
 
 
+@attending("reference")
 def test_gpt2_same_weight_logits_and_cached_generation():
     """The biased two-projection block matches fp32 eager transformers.
 
@@ -25,7 +27,7 @@ def test_gpt2_same_weight_logits_and_cached_generation():
     these paths a numerical failure.
     """
     directory = FIXTURES / 'gpt2-tiny'
-    loaded = Pretrained.load(directory, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(directory, dtype='float32')
     model = loaded.model.clone(precision=jax.lax.Precision.HIGHEST)
     ids = np.load(directory / 'input_ids.npy')
     expected = np.load(directory / 'logits.npy')
@@ -36,11 +38,12 @@ def test_gpt2_same_weight_logits_and_cached_generation():
     np.testing.assert_array_equal(np.asarray(generated.tokens), np.load(directory / 'generated.npy'))
 
 
+@attending("reference")
 def test_gpt2_public_generation_matches_the_reference_continuation():
     from dew.inference.tasks import TextGeneration
     from dew.sampling.text import Sampling
 
-    loaded = Pretrained.load(FIXTURES / 'gpt2-tiny', dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(FIXTURES / 'gpt2-tiny', dtype='float32')
     ids = np.load(FIXTURES / 'gpt2-tiny' / 'input_ids.npy')[:1, :4]
     task = TextGeneration(loaded.model, loaded.variables, sampling=Sampling(temperature=0))
     generated = task(ids, max_new_tokens=6, key=0)
@@ -49,12 +52,13 @@ def test_gpt2_public_generation_matches_the_reference_continuation():
     )
 
 
+@attending("reference")
 def test_original_bare_gpt2_weights_and_causal_buffers_preserve_logits():
     from dew.interop.hf_decoders import translate_weights
     from dew.interop.sources import load_shards
 
     directory = FIXTURES / 'gpt2-tiny'
-    loaded = Pretrained.load(directory, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(directory, dtype='float32')
     tensors = {name.removeprefix('transformer.'): value for name, value in load_shards(directory).items()}
     for index in range(loaded.model.num_layers):
         tensors[f'h.{index}.attn.bias'] = np.tril(np.ones((1, 1, 64, 64), np.uint8))
@@ -78,6 +82,7 @@ def test_released_gpt2_small_logits_and_generation_at_highest_fp32_precision(tmp
                      revision='607a30d783dfa663caf39e06633721c8d4cfcd7e')
 
 
+@attending("reference")
 @pytest.mark.parametrize('bias', [False, True])
 def test_exact_nanogpt_architecture_trains_through_dew(bias):
     """An ungated exact-GELU GPT block goes through the public trainer."""
@@ -90,7 +95,7 @@ def test_exact_nanogpt_architecture_trains_through_dew(bias):
     model = CausalTransformer(vocab_size=32, emb_features=16, num_layers=2, num_heads=2,
                               max_seq_len=8, position_embedding='learned', mlp='gelu_exact',
                               mlp_bias=bias, norm_type='layer', norm_bias=bias,
-                              attention_bias=bias, qk_norm=False, attention_impl='reference',
+                              attention_bias=bias, qk_norm=False,
                               dropout_rate=.2, embedding_dropout_rate=.2, attention_dropout_rate=.2)
     rows = np.asarray([[2, 4, 8, 3, 2, 4, 8, 3, 2], [7, 3, 9, 5, 7, 3, 9, 5, 7]], np.int32)
     rows = np.tile(rows, (jax.device_count(), 1))
@@ -107,14 +112,14 @@ def test_exact_nanogpt_architecture_trains_through_dew(bias):
     assert np.isfinite(loss(after)) and loss(after) < loss(before)
 
 
+@attending("reference")
 @pytest.mark.parametrize('given', ['attention_mask', 'coordinates'])
-@pytest.mark.parametrize('scan_layers', [False, True])
-def test_learned_position_cache_advances_each_rows_unpadded_positions(scan_layers, given):
+@pytest.mark.parametrize("stack_scan", ["plain", "scanned"], indirect=True)
+def test_learned_position_cache_advances_each_rows_unpadded_positions(stack_scan, given):
     """Learned positions read each row's unpadded places, whether the padding comes as a raw mask
     or as the tokens' coordinates alone, prefill and cache alike."""
     model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=2, num_heads=2,
-                              max_seq_len=8, position_embedding='learned', qk_norm=False,
-                              attention_impl='reference', scan_layers=scan_layers)
+                              max_seq_len=8, position_embedding='learned', qk_norm=False)
     ids = jnp.asarray([[1, 2, 3, 4], [0, 0, 5, 6]], jnp.int32)
     valid = jnp.asarray([[True, True, True, True], [False, False, True, True]])
     variables = model.init(jax.random.key(0), ids)

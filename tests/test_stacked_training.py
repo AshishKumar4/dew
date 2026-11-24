@@ -7,11 +7,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import attending
 from reference_error import assert_as_exact
 from test_level_stacking import (
     LENGTH,
     ROWS,
-    SCANNED,
     STACKED,
     STACKING_SEEDS,
     TRUTH,
@@ -27,6 +27,7 @@ from dew.objectives.lm import LMObjective
 from dew.objectives.lm.adaptation import ChunkAdaptation
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize(("layers", "windows"), [((1,), (3,)), ((0, 1), (3, 6)), ((1, 0), (6, 3))],
                          ids=["one-layer", "faster-first", "slower-first"])
 def test_a_banked_stores_blocks_step_as_the_literal_chunk_loop(layers, windows):
@@ -40,11 +41,12 @@ def test_a_banked_stores_blocks_step_as_the_literal_chunk_loop(layers, windows):
         return jax.jit(lambda variables, tokens: chunk_loop(reference, variables, tokens, adaptation,
                                                             truth=truth))
 
-    assert_as_exact(jax.jit(stacked(adaptation, SCANNED, banked)), literal(STACKED, truth=False), draw,
+    assert_as_exact(jax.jit(stacked(adaptation, STACKED, banked)), literal(STACKED, truth=False), draw,
                     f"banked stacked blocks of layers {layers} at windows {windows}",
                     seeds=STACKING_SEEDS[layers, windows], truth_fn=literal(TRUTH, truth=True))
 
 
+@attending("xla")
 def test_a_training_step_continues_pretraining_through_the_blocks_steps():
     """A training step's loss (`LMObjective.loss`, its summed head and z-loss) of a decoder stepping its
     own blocks in context is finite and moves the blocks' starts, as continued pre-training trains them."""

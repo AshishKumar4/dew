@@ -1075,7 +1075,8 @@ class VLLMGenerateServer(_RequestServer):
         if sampling.top_k is None:
             raise ValueError("vLLM returns a sampling mask only under a finite top-k")
         unmatched = sampling.active(("repetition_penalty", "presence_penalty", "frequency_penalty",
-                                     "no_repeat_ngram_size", "min_new_tokens", "typical_p", "stop"))
+                                     "no_repeat_ngram_size", "min_new_tokens", "typical_p", "stop",
+                                     "logits", "stopping", "strategy"))
         if unmatched:
             raise ValueError(f"the token route draws under temperature, top-k, top-p and min-p alone; "
                              f"{unmatched} would not shape its draws")

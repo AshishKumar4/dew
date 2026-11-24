@@ -32,10 +32,9 @@ def _components() -> dict:
     """The declaring modules no catalogued model reaches in each of their forms, each with its inputs."""
     tokens = jnp.zeros((2, 5, 32))
     return {
-        "NormalAttention+flat": lambda: (NormalAttention(32, heads=2, dim_head=8, flat=True,
-                                                         attention_impl="reference"), (tokens,), {}),
+        "NormalAttention+flat": lambda: (NormalAttention(32, heads=2, dim_head=8, flat=True), (tokens,), {}),
         "NormalAttention+headed": lambda: (
-            NormalAttention(32, heads=2, dim_head=8, attention_impl="reference"), (tokens,), {}),
+            NormalAttention(32, heads=2, dim_head=8), (tokens,), {}),
         "GatedMLP+packed": lambda: (GatedMLP(16, 8, activation="geglu", packed=True,
                                              packed_order=("up_proj", "gate_proj")),
                                     (jnp.zeros((1, 8)),), {}),
@@ -86,7 +85,7 @@ def _features() -> dict:
         from dew.interop import Pretrained
 
         fixture = Path(__file__).with_name("fixtures") / "hf" / "dory-tiny"
-        return Pretrained.load(fixture, dtype="float32", attention_impl="reference").model, ids, {}
+        return Pretrained.load(fixture, dtype="float32").model, ids, {}
 
     return {**{f"decoder+{name}": lambda extra=extra: (tiny(max_seq_len=128, **extra), ids, {})
                for name, extra in fields.items()}, "decoder+ngpt": dory}
@@ -118,8 +117,7 @@ def _towers() -> dict:
         return towers.from_record(record["tower"]).build(), (jnp.ones((1, 3, 64, 64)),), {}
 
     def dspark():
-        model = Pretrained.load(fixtures / "deepseek-v4-dspark-tiny", weights=False, dtype="float32",
-                                attention_impl="reference").model
+        model = Pretrained.load(fixtures / "deepseek-v4-dspark-tiny", weights=False, dtype="float32").model
         return model, (jnp.zeros((1, 8), jnp.int32),), {}
 
     return {

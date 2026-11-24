@@ -13,7 +13,7 @@ import pytest
 import torch
 from arm_arithmetic import float64_held
 from flax.traverse_util import flatten_dict, unflatten_dict
-from model_support import float64_twin
+from model_support import attending, float64_twin
 from reference_error import (
     as_given,
     assert_as_exact,
@@ -39,7 +39,7 @@ FIXTURE = Path(__file__).parent / "fixtures" / "hf" / "gemma4-unified-native-tin
 
 
 def source_pair(directory, dtype="float32"):
-    native = Pretrained.load(directory, dtype=dtype, param_dtype=dtype, attention_impl="reference")
+    native = Pretrained.load(directory, dtype=dtype, param_dtype=dtype)
     reference = Gemma4UnifiedForConditionalGeneration.from_pretrained(
         directory, dtype=getattr(torch, dtype), attn_implementation="eager").eval()
     with float64():
@@ -50,6 +50,7 @@ def source_pair(directory, dtype="float32"):
 
 
 @pytest.fixture(scope="module")
+@attending("reference")
 def source():
     return source_pair(FIXTURE)
 
@@ -120,16 +121,19 @@ def assert_forward(source, draw, label, site, summary: bool = True):
                     label, seeds=seeds, truth_fn=truth)
 
 
+@attending("reference")
 def test_unified_processor_and_native_forward_follow_the_published_forward(source):
     assert_forward(source, lambda seed: unified_draw(source[1].config, seed),
                     "Gemma4 Unified source forward", "forward")
 
 
+@attending("reference")
 def test_vision_blocks_longer_than_the_window_keep_their_whole_block(source):
     assert_forward(source, lambda seed: unified_draw(source[1].config, seed, side=4),
                     "Gemma4 Unified long vision block", "long")
 
 
+@attending("reference")
 def test_a_bfloat16_unified_source_uses_the_same_media_and_decoder_policy():
     source = source_pair(FIXTURE, "bfloat16")
     # Its outputs whole: Dew's float64 forward of its bfloat16 load is not the reference's float64 run of
@@ -307,6 +311,7 @@ def gradient_functions(source):
     return ours, lambda *args: theirs(reference, *args), oracle, draw
 
 
+@attending("reference")
 def test_raw_media_train_and_reload_through_the_public_source(source, tmp_path):
     native, _, _ = source
     rng = np.random.default_rng(52)
@@ -335,7 +340,7 @@ def test_raw_media_train_and_reload_through_the_public_source(source, tmp_path):
     variables = {**native.variables, "params": params}
     expected = native.model.apply(variables, batch.tokens, **batch.kwargs())
     native.save(tmp_path, variables=variables, max_shard_size=4096)
-    restored = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
+    restored = Pretrained.load(tmp_path, dtype="float32")
     for got, wanted in zip(jax.tree.leaves(restored.variables), jax.tree.leaves(variables), strict=True):
         np.testing.assert_array_equal(got, wanted)
     np.testing.assert_array_equal(restored.model.apply(restored.variables, batch.tokens, **batch.kwargs()),
@@ -420,6 +425,7 @@ def cached_functions(source):
     return ours, lambda *args: theirs(reference, *args), oracle, draw
 
 
+@attending("reference")
 @pytest.mark.check1_shards(seeds=256, per_task=32)
 def test_unified_backward_follows_the_recorded_reference(source):
     """The recorded backward: Dew's gradients against transformers' recorded float32 evidence from its
@@ -431,7 +437,7 @@ def test_unified_backward_follows_the_recorded_reference(source):
     ours, _, _, draw = gradient_functions(source)
     stored = recording(FIXTURE / "backward.npz")
     with jax.enable_x64(new_val=True):
-        native = Pretrained.load(FIXTURE, dtype="float64", param_dtype="float64", attention_impl="reference")
+        native = Pretrained.load(FIXTURE, dtype="float64", param_dtype="float64")
         native_truth = gradient_functions((native, source[1], source[2]))[0]
     seeds = int(stored["backward.seeds"])
     recorded_draw, reference, truth = indexed_recording(
@@ -441,6 +447,7 @@ def test_unified_backward_follows_the_recorded_reference(source):
                     "Gemma4 Unified recorded backward", seeds=seeds, truth_fn=truth)
 
 
+@attending("reference")
 @pytest.mark.parametrize(("site", "functions"), [("cached", cached_functions)])
 def test_unified_runtime_observations_follow_the_reference(source, site, functions):
     ours, reference, truth, draw = functions(source)
@@ -500,6 +507,7 @@ def assert_live_forward(pair, draw, label):
     assert_as_exact(ours, reference, draw, label, seeds=128, truth_fn=truth)
 
 
+@attending("reference")
 def test_vision_without_its_token_types_runs_causal_as_transformers_does(source):
     """Pixels whose call carries no mm_token_type_ids carry no vision blocks: every vision token reads
     causally, as transformers' own forward computes them without the field (its block ids stay -1,
@@ -513,6 +521,7 @@ def test_vision_without_its_token_types_runs_causal_as_transformers_does(source)
     assert_live_forward(source, draw, "Gemma4 Unified untyped forward")
 
 
+@attending("reference")
 def test_a_softcapped_unified_release_caps_its_logits_as_transformers_does(source, tmp_path):
     """The released 12B caps its final logits at 30 (final_logit_softcapping); the fixture with that one
     field set computes transformers' capped logits."""
@@ -561,6 +570,7 @@ def test_a_unified_config_without_its_audio_placeholder_takes_the_config_class_d
     assert defaulted["audio_projector"] == stated["audio_projector"]
 
 
+@attending("reference")
 @pytest.mark.parametrize("media", ["text", "vision", "audio"])
 def test_a_unified_source_can_omit_either_media_component(source, tmp_path, media):
     pair, draw = optional_source(source, tmp_path, media)
@@ -585,6 +595,7 @@ def equal_geometry_source(source, directory):
     return source_pair(directory), lambda seed: unified_draw(config, seed)
 
 
+@attending("reference")
 def test_equal_attention_geometries_still_use_the_full_layer_vision_mask(source, tmp_path):
     pair, draw = equal_geometry_source(source, tmp_path)
     assert_forward(pair, draw,

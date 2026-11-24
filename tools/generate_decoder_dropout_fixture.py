@@ -22,6 +22,7 @@ from jax import export
 
 import dew
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.kernels import generation
 
 
 def forward_and_gradient(model):
@@ -45,7 +46,7 @@ def main():
     jax.config.update("jax_include_full_tracebacks_in_locations", val=False)
     jax.config.update("jax_hlo_source_file_canonicalization_regex", ".*")
     model = CausalTransformer(vocab_size=17, emb_features=8, num_layers=1, num_heads=2,
-                             mlp_features=16, max_seq_len=8, attention_impl="reference",
+                             mlp_features=16, max_seq_len=8,
                              precision=jax.lax.Precision.HIGHEST,
                              dtype=jnp.float64 if dtype == "float64" else None)
     with jax.default_device(jax.devices("cpu")[0]):
@@ -82,4 +83,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    with generation.chosen(attention="reference"):
+        main()

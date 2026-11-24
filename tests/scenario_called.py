@@ -154,7 +154,7 @@ def quantized_loaded(form: str, root: Path):
     name (`CODECS`)."""
     from dew.interop import Pretrained
 
-    held = {"dtype": "float32", "attention_impl": "reference"}
+    held = {"dtype": "float32"}
     if form in GGUF:
         return Pretrained.load(root, gguf_file="model.gguf", **held)
     return Pretrained.load(CODECS / form, **held)

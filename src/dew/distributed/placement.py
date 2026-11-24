@@ -667,7 +667,7 @@ class Layout:
                 f"in pinned host memory, which only a stack that fetches a layer's "
                 f"parameters as it reaches it reads; this placement keeps every "
                 f"parameter on the device. Place the weights for generation with a "
-                f"dew.inference.LayerBanks source's place, or use host=('variables',) for a "
+                f"dew.inference.banks.LayerBanks source's place, or use host=('variables',) for a "
                 f"CPU-owned training transaction and drop the inference-only patterns")
         if all(mesh.shape[axis] == 1 for axis in parameter_axes(mesh.axis_names)):
             return

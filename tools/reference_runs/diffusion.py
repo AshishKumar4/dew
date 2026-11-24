@@ -195,7 +195,7 @@ def flaxdiff_side(args, images, total, attention):
             return jnp.mean(sample_losses * weights), {}
 
     dtype = jnp.bfloat16 if args.dtype == "bfloat16" else None
-    model = SimpleDiT(**MODEL, dtype=dtype, attention_impl=attention)
+    model = SimpleDiT(**MODEL, dtype=dtype)
     train_schedule, _, transform = get_diffusion_preset("edm")
     input_config = DiffusionInputConfig(sample_data_key="image", sample_data_shape=images.shape[1:],
                                         conditions=[])
@@ -253,14 +253,14 @@ def fixed_draws(counted, initial: dict, ema: float | None):
                       variables=initial)
 
 
-def counting_objective(shape: tuple[int, ...], dtype: str, attention: str):
+def counting_objective(shape: tuple[int, ...], dtype: str):
     """The denoiser and image geometry shared by training and host-only counting."""
     from dew.diffusion.presets import EDM
     from dew.inputs import Field, InputSpec
     from dew.objectives.diffusion import DiffusionObjective
     from dew.registry import models
 
-    model = models.build("simple_dit", {**MODEL, "dtype": dtype, "attention_impl": attention})
+    model = models.build("simple_dit", {**MODEL, "dtype": dtype})
     return DiffusionObjective(model, EDM(P_mean=-0.4, P_std=1.0), InputSpec(sample=Field("image", shape)),
                               guidance=None)
 
@@ -272,7 +272,7 @@ def dew_side(args, images, total, attention):
     from dew.distributed.batches import batch_shardings
     from dew.training import MeshSpec, Trainer
 
-    counted = counting_objective(images.shape[1:], args.dtype, attention)
+    counted = counting_objective(images.shape[1:], args.dtype)
     model = counted.model
     work = measure(counted, {"image": images[:args.batch]})
     work.write(args.work)
@@ -312,6 +312,8 @@ def dew_side(args, images, total, attention):
 
 
 def main() -> None:
+    from dew.nn.kernels import generation
+
     args = arguments()
     # Read before the run, so a source that cannot be traced fails at once.
     built_from = {"jax": jax.__version__, "optax": optax.__version__, "flax": __import__("flax").__version__,
@@ -320,74 +322,75 @@ def main() -> None:
     if args.dtype == "float32":
         jax.config.update("jax_default_matmul_precision", "highest")
     attention = args.attention or ("cudnn" if args.dtype == "bfloat16" else "xla")
-    data = np.load(args.data)
-    images, order = data["images"], data["order"]
-    schedule_steps = steps_for(order, args.batch)
-    total = schedule_steps if args.steps is None else min(schedule_steps, args.steps)
-    levels, noise = draws(args.seed, total, args.batch, images.shape[1:])
+    with generation.chosen(attention=attention):
+        data = np.load(args.data)
+        images, order = data["images"], data["order"]
+        schedule_steps = steps_for(order, args.batch)
+        total = schedule_steps if args.steps is None else min(schedule_steps, args.steps)
+        levels, noise = draws(args.seed, total, args.batch, images.shape[1:])
 
-    side = flaxdiff_side if args.framework == "flaxdiff" else dew_side
-    state, run, place, schedule, mesh_shape, trainer, work = side(args, images, schedule_steps, attention)
+        side = flaxdiff_side if args.framework == "flaxdiff" else dew_side
+        state, run, place, schedule, mesh_shape, trainer, work = side(args, images, schedule_steps, attention)
 
-    def batch(step: int):
-        return place({"image": images[window_rows(order, step, args.batch)],
-                      "t": levels[step], "noise": noise[step]})
+        def batch(step: int):
+            return place({"image": images[window_rows(order, step, args.batch)],
+                          "t": levels[step], "noise": noise[step]})
 
-    losses, norms = [], []
-    trace_dir = Path(args.out).with_suffix("").resolve()
-    window = TracedWindow(total, args.timing_warmup, args.profile_steps, trace_dir)
-    loss = first_step_seconds = None
-    compile_start = time.perf_counter()
-    for step in range(total):
-        window.before(step, loss)
-        state, loss, norm = run(state, batch(step))
-        if step == 0:
-            jax.block_until_ready(loss)
-            first_step_seconds = time.perf_counter() - compile_start
-        losses.append(loss)
-        norms.append(norm)
-    window_seconds = window.close(loss)
+        losses, norms = [], []
+        trace_dir = Path(args.out).with_suffix("").resolve()
+        window = TracedWindow(total, args.timing_warmup, args.profile_steps, trace_dir)
+        loss = first_step_seconds = None
+        compile_start = time.perf_counter()
+        for step in range(total):
+            window.before(step, loss)
+            state, loss, norm = run(state, batch(step))
+            if step == 0:
+                jax.block_until_ready(loss)
+                first_step_seconds = time.perf_counter() - compile_start
+            losses.append(loss)
+            norms.append(norm)
+        window_seconds = window.close(loss)
 
-    device_kind = jax.devices()[0].device_kind
-    devices = jax.device_count()
-    timed = throughput(window_seconds, window.timed_steps, args.batch)
-    timed["images_per_s"] = timed.pop("tokens_per_s")
-    flops_image = work.training_flops_per_step / work.examples_per_step
-    peak_rate = peak_flops(device_kind)
-    stats = [device.memory_stats() or {} for device in jax.local_devices()]
-    record = {
-        "framework": args.framework,
-        "precision": args.dtype,
-        "parallel": f"{args.mesh}={devices}",
-        "world": devices,
-        "config": {**vars(args), "attention": attention, "model": MODEL, "total_steps": total,
-                   "schedule_steps": schedule_steps, "data_sha256": sha256(args.data),
-                   "init_sha256": sha256(args.init), "mesh": mesh_shape,
-                   "convention": "EDM (P_mean -0.4, P_std 1, sigma_data 0.5), l2 loss, EDM weight",
-                   "optimizer": "optax.chain(clip_by_global_norm, adamw), the gradient norm Dew's commit "
-                                "telemetry or, for flaxdiff, recorded_norm chained before it"},
-        "versions": built_from,
-        "device": device_kind,
-        "host": host(),
-        "loss": np.asarray(jax.device_get(losses), np.float64).tolist(),
-        "grad_norm": np.asarray(jax.device_get(norms), np.float64).tolist(),
-        "lr": [float(np.asarray(schedule(step))) for step in range(total)],
-        "throughput": timed,
-        "first_step_seconds": first_step_seconds,
-        "flops_per_image": flops_image,
-        "work": dataclasses.asdict(work),
-        "hlo_flops_per_step": (None if trainer is None or trainer.step_flops is None
-                               else trainer.step_flops.hardware),
-        "mfu": mfu(work.training_flops_per_step, window.timed_steps, window_seconds, peak_rate, devices),
-        "memory": device_memory(stats),
-    }
-    if args.profile_steps:
+        device_kind = jax.devices()[0].device_kind
+        devices = jax.device_count()
+        timed = throughput(window_seconds, window.timed_steps, args.batch)
+        timed["images_per_s"] = timed.pop("tokens_per_s")
+        flops_image = work.training_flops_per_step / work.examples_per_step
+        peak_rate = peak_flops(device_kind)
+        stats = [device.memory_stats() or {} for device in jax.local_devices()]
+        record = {
+            "framework": args.framework,
+            "precision": args.dtype,
+            "parallel": f"{args.mesh}={devices}",
+            "world": devices,
+            "config": {**vars(args), "attention": attention, "model": MODEL, "total_steps": total,
+                       "schedule_steps": schedule_steps, "data_sha256": sha256(args.data),
+                       "init_sha256": sha256(args.init), "mesh": mesh_shape,
+                       "convention": "EDM (P_mean -0.4, P_std 1, sigma_data 0.5), l2 loss, EDM weight",
+                       "optimizer": "optax.chain(clip_by_global_norm, adamw), the gradient norm Dew's commit "
+                                    "telemetry or, for flaxdiff, recorded_norm chained before it"},
+            "versions": built_from,
+            "device": device_kind,
+            "host": host(),
+            "loss": np.asarray(jax.device_get(losses), np.float64).tolist(),
+            "grad_norm": np.asarray(jax.device_get(norms), np.float64).tolist(),
+            "lr": [float(np.asarray(schedule(step))) for step in range(total)],
+            "throughput": timed,
+            "first_step_seconds": first_step_seconds,
+            "flops_per_image": flops_image,
+            "work": dataclasses.asdict(work),
+            "hlo_flops_per_step": (None if trainer is None or trainer.step_flops is None
+                                   else trainer.step_flops.hardware),
+            "mfu": mfu(work.training_flops_per_step, window.timed_steps, window_seconds, peak_rate, devices),
+            "memory": device_memory(stats),
+        }
+        if args.profile_steps:
+            write_record(args.out, record)
+            attach_xplane_profile(record, trace_dir, args.profile_steps)
         write_record(args.out, record)
-        attach_xplane_profile(record, trace_dir, args.profile_steps)
-    write_record(args.out, record)
-    print(json.dumps({"first_loss": record["loss"][0], "last_loss": record["loss"][-1],
-                      "images_per_s": timed["images_per_s"],
-                      "peak_gib": stated_peak_gib(record["memory"]["peak_allocated_bytes"])}, indent=1))
+        print(json.dumps({"first_loss": record["loss"][0], "last_loss": record["loss"][-1],
+                          "images_per_s": timed["images_per_s"],
+                          "peak_gib": stated_peak_gib(record["memory"]["peak_allocated_bytes"])}, indent=1))
 
 
 if __name__ == "__main__":

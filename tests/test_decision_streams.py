@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from map_judge import marked_seeds
-from model_support import TINY_DECODER
+from model_support import TINY_DECODER, attending
 from run_kinds import stated
 from test_decision_context import assert_packed_as_alone, windows_of
 from test_decision_letters_context import LABELS, QUESTIONS as LETTERED_QUESTIONS, STATES
@@ -75,7 +75,7 @@ def in_streams(layout: Layout, segments: int = 1, **options) -> DecisionObjectiv
     """A decision over the tiny Llama whose rows stand in `layout`'s streams, at most `segments` rows a
     window: a joint row's head, or a lettered row's readout of its letters, with the objective's other
     `options` (`input_lm`)."""
-    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference", max_seq_len=1024)
+    source = Pretrained.load(LLAMA, dtype="float32", max_seq_len=1024)
     width, dtype = DecisionModel.head_size(source.model)
     head = (JointSchemaHead(width, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
             if layout is JOINT else LabelReadout(features=width, label_ids=(), dtype=dtype, count=4))
@@ -110,6 +110,7 @@ def read_as_recorded(streams: np.ndarray, segments: np.ndarray, reads) -> np.nda
     return seen
 
 
+@attending("reference")
 @pytest.mark.parametrize("layout", [JOINT, LETTERED], ids=["joint", "lettered"])
 def test_a_rows_tokens_stand_in_the_streams_its_segments_name_and_a_window_keeps_each_rows(layout):
     """Each token stands in its segment's stream, the other stream's tokens (the schema, the question)
@@ -128,6 +129,7 @@ def test_a_rows_tokens_stand_in_the_streams_its_segments_name_and_a_window_keeps
     assert int(segments.max()) > 1 and np.all(packed[segments == 0] == -1)
 
 
+@attending("reference")
 @pytest.mark.parametrize("layout", [JOINT, LETTERED], ids=["joint", "lettered"])
 def test_each_token_reads_exactly_what_its_streams_record_says_in_a_packed_window(layout):
     """The key runs the model gives its backbone (`stream_runs`) are, token by token, the keys the record
@@ -157,6 +159,7 @@ def states_of(objective: DecisionObjective, variables, state: str,
     return states, np.asarray(row.streams)
 
 
+@attending("reference")
 @pytest.mark.parametrize("layout", [JOINT, LETTERED], ids=["joint", "lettered"])
 def test_the_state_reads_the_other_stream_after_it_and_that_stream_reads_no_state(layout):
     """Over drawn parameters, the other stream's states (the schema's, the question's) are the same
@@ -181,13 +184,14 @@ def test_the_state_reads_the_other_stream_after_it_and_that_stream_reads_no_stat
     assert not np.array_equal(first[:before], moved[:before])
 
 
+@attending("reference")
 def test_a_multimodal_backbones_row_in_streams_reads_as_its_text_decoders():
     """A row in two streams over a multimodal checkpoint (Gemma 3's, its vision tower beside its text
     decoder) reads its key runs through the language model, as the checkpoint's text decoder loaded alone
     (`text_only`) reads them: the backbone's final states of a joint row, bit for bit, the tower reading
     no media."""
     def states(text_only: bool) -> np.ndarray:
-        source = Pretrained.load(GEMMA, dtype="float32", attention_impl="reference", max_seq_len=1024,
+        source = Pretrained.load(GEMMA, dtype="float32", max_seq_len=1024,
                                  text_only=text_only)
         width, _ = DecisionModel.head_size(source.model)
         head = JointSchemaHead(width, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
@@ -205,6 +209,7 @@ LETTERED_STREAM_SEEDS = 128
 1.580]). The joint rows' 16 (`seeds_for`, 2026-10-30) are their mark's (`marked_seeds`, row 8577)."""
 
 
+@attending("reference")
 @pytest.mark.parametrize("layout", [
     # The joint rows' second stage drawn by CI's map tasks, 16 seeds a task: a host whose XLA:CPU rounds
     # otherwise draws it (an EPYC 9965's first 16 seeds, 47 s, left its verdict open, and its next 64 took
@@ -281,13 +286,14 @@ def test_a_row_of_one_stream_reads_as_its_reads_say():
     assert layout.attention == (((1, 0),), 1)
 
 
+@attending("reference")
 def test_a_row_in_streams_reads_its_backbone_at_the_runs_progress():
     """A row in streams reads its backbone at the run's progress, as every row does (`progressed`): over
     a backbone whose layers anneal with it (DEX on every layer), the same rows' option logits mid-anneal
     differ from the run's end's, which a streams row read at the end alone would leave the same."""
     annealed = DifferentialExtension(((0, (0, 1)), (1, (1, 3))), anneal_steps=10)
     backbone = CausalTransformer(**{**TINY_DECODER, "vocab_size": 256, "max_seq_len": 256, "num_layers": 2,
-                                    "dtype": jnp.float32, "attention_impl": "reference", "dex": annealed})
+                                    "dtype": jnp.float32, "dex": annealed})
     width, dtype = DecisionModel.head_size(backbone)
     objective = DecisionObjective(backbone, tokenizer=TOKENIZER, specials=SPECIALS, layout=LETTERED,
                                   head=LabelReadout(features=width, label_ids=(), dtype=dtype, count=4))

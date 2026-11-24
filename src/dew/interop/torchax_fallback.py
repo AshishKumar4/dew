@@ -66,8 +66,9 @@ from dew.interop.sequence_causality import (
 from dew.interop.streaming import SourceLeaf
 from dew.interop.weights import AUTO, checkpoint_dtype
 from dew.mesh import LogicalAxes
-from dew.nn.attention import AttentionImpl
+from dew.nn.attention import AttentionImpl, chosen_attention
 from dew.nn.inputs import document_reach
+from dew.nn.kernels import generation
 from dew.nn.kv_cache import CURSOR, cache_positions, cursor, filled_slots, put_opened
 from dew.nn.precision import at_least_fp32, broadcast_summed, configured_precision, exact_float32, scaled
 from dew.nn.programs import purely_called
@@ -173,9 +174,11 @@ def admitted(unmapped: verify.Unmapped) -> TorchAdmission:
     jittable = JittableModule(ran)
     params = {name: host_view(leaf, name) for name, leaf in jittable.params.items()}
     buffers = {name: host_view(leaf, name) for name, leaf in extract_all_buffers(ran)[1].items()}
-    graph = TorchGraph(jittable, (), attention_impl=None if why else "reference")
-    inference, _, _ = graph.traced(params, buffers, ids, None, train=False)
-    training, _, draws = graph.traced(params, buffers, ids, jax.random.key(0), train=True)
+    graph = TorchGraph(jittable, (), dew_attention=not why)
+    # Dew's attention as the reference path computes it, whatever the run names: a program read, not run.
+    with generation.chosen(attention="reference"):
+        inference, _, _ = graph.traced(params, buffers, ids, None, train=False)
+        training, _, draws = graph.traced(params, buffers, ids, jax.random.key(0), train=True)
     assumed = set()
     for program, forward in ((inference, "forward"), (training, "training forward")):
         verdict = causality(program, len(params) + len(buffers), ids.shape[1], (0, 1))
@@ -273,10 +276,11 @@ def _abstract(source, attention: str, length: int, *, train: bool):
     params, buffers = ({name: jax.ShapeDtypeStruct(tuple(leaf.shape), t2j_dtype(leaf.dtype))
                         for name, leaf in held.items()}
                        for held in (jittable.params, extract_all_buffers(model)[1]))
-    graph = TorchGraph(jittable, (), attention_impl="reference" if attention == _ATTENTION else None)
+    graph = TorchGraph(jittable, (), dew_attention=attention == _ATTENTION)
     tokens = jax.ShapeDtypeStruct((1, length), jnp.int32)
     key = jax.random.key(0) if train else None
-    closed, _, draws = graph.traced(params, buffers, tokens, key, train=train)
+    with generation.chosen(attention="reference"):
+        closed, _, draws = graph.traced(params, buffers, tokens, key, train=train)
     return closed, len(params) + len(buffers), draws
 
 
@@ -956,14 +960,14 @@ class TorchGraph:
     forward runs the module's own training forward, its dropout and other
     draws taking `key` as torchax's random key; one that draws on the host
     instead (OPT's layer drop, `torch.rand([])`) is decided once at trace
-    time, and is refused. `attention_impl` is the Dew attention kernel a module
-    built with Dew's attention (`_ATTENTION`) runs, None for one that runs
+    time, and is refused. `dew_attention` says the module is built with Dew's attention (`_ATTENTION`),
+    which runs the kernel the run's context names (`chosen_attention`); without it the module runs
     transformers' own.
     """
 
     module: JittableModule
     persistent: tuple[str, ...]
-    attention_impl: AttentionImpl | None = None
+    dew_attention: bool = False
     shapes: Mapping[str, Mapping[str, jax.ShapeDtypeStruct]] = field(default_factory=dict)
     """The source's variables, `params` and `buffers`, as shapes and dtypes: what an initialization,
     which holds none of them, traces the forward over (`TorchCausalLM._run`)."""
@@ -1069,8 +1073,8 @@ class TorchGraph:
             if reach is None and documents is not None:
                 reach = document_reach(documents, valid, positions)
             cached = None if cache is None else _Cached(*cache)
-            attending = (contextlib.nullcontext() if self.attention_impl is None else _attending(
-                _Attending(self.attention_impl, documents, valid, max_segments, train, key, visible,
+            attending = (contextlib.nullcontext() if not self.dew_attention else _attending(
+                _Attending(chosen_attention(), documents, valid, max_segments, train, key, visible,
                            positions, key_places, cached)))
             self.module.train(train)
             try:
@@ -1295,7 +1299,7 @@ class TorchCausalLM(nn.Module):
     A loss scores its whole logits (`Logits`). A model whose logits are the
     plain head product loads as `TorchTableLM` instead, which `LMObjective`
     scores through its head input and head weight. A model whose attention
-    runs on Dew's (`TorchGraph.attention_impl`) reads packed and padded rows:
+    runs on Dew's (`TorchGraph.dew_attention`) reads packed and padded rows:
     their `Coordinates`, or the `segment_ids`, `positions` and validity they
     are built from, keep each document's attention to itself and give
     transformers' rotary each token's place in its document (`_laid`); one on
@@ -1485,7 +1489,7 @@ class TorchCausalLM(nn.Module):
                                                       key_runs=attention_key_runs)[:, 0]
         if attention_pairwise_mask is None:
             return self._run(tokens, train, laid)[1]
-        if self.graph.attention_impl is None:
+        if not self.graph.dew_attention:
             # Transformers' own attention reads its own causal mask; Dew's reads the stated one.
             raise ValueError("a stated visibility (attention_pairwise_mask) runs on Dew's attention, and "
                              "this model runs transformers' own")
@@ -1503,7 +1507,7 @@ class TorchCausalLM(nn.Module):
     def _refuse_cache(self) -> None:
         """Refuse a decode cache to a model on transformers' own attention, which keeps none Dew's
         attention writes, as the capability it lacks."""
-        if self.graph.attention_impl is None:
+        if not self.graph.dew_attention:
             raise Lacks("cache", "this model runs transformers' own attention, and a decode cache is the one "
                                  "Dew's attention writes")
 
@@ -1511,7 +1515,7 @@ class TorchCausalLM(nn.Module):
         """The rows' `Coordinates`, their layout past `__call__` (ledger 1122), None for none: a model on
         Dew's attention reads them, one on transformers' own refuses them (`_refuse_packing`); any
         other field is refused."""
-        if self.graph.attention_impl is None:
+        if not self.graph.dew_attention:
             _refuse_packing(packing)
             return None
         laid = packing.get(COORDINATES_FIELD)
@@ -1594,7 +1598,7 @@ def _refuse_packing(packing: Mapping[str, object]) -> None:
 
 
 def load(source: sources.SourceReference, root: Path, *, dtype: str,
-         param_dtype: str, attention_impl: AttentionImpl, max_seq_len: int | None,
+         param_dtype: str, max_seq_len: int | None,
          admission: TorchAdmission | None = None, weights: bool = True,
          placed: Placing | None = None) -> PretrainedFallback:
     """Load the causal LM `source` selects through transformers and torchax.
@@ -1613,11 +1617,6 @@ def load(source: sources.SourceReference, root: Path, *, dtype: str,
     name_or_dir, revision = source.name, source.revision
     directory = source.directory(root)
     attends = admission is not None and admission.attends
-    if attention_impl != "auto" and not attends:
-        raise ValueError(
-            f"attention_impl={attention_impl!r} selects a Dew kernel, and this source runs "
-            f"transformers' own attention ({'fallback=torchax' if admission is None else admission.why}); "
-            "leave attention_impl at 'auto'")
     if not (directory / "config.json").is_file():
         raise FileNotFoundError(
             f"fallback='torchax' builds the model a transformers config.json describes, and "
@@ -1678,7 +1677,7 @@ def load(source: sources.SourceReference, root: Path, *, dtype: str,
     axes = planned_axes(model)
     # Torch's copies are no longer read: the forward runs on the arrays above.
     torch.nn.Module.to(model, "meta")
-    graph = TorchGraph(jittable, persistent, attention_impl=attention_impl if attends else None,
+    graph = TorchGraph(jittable, persistent, dew_attention=attends,
                        shapes={"params": _shapes(params), "buffers": _shapes(buffers)}, axes=axes,
                        certified={} if admission is not None and admission.attends else None)
     # The decode cache's slots: the load's, else the source's own context as its config class reads it

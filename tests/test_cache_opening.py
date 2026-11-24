@@ -7,7 +7,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 from flax import linen as nn
-from model_support import decoder
+from model_support import attending, decoder
 from test_capability_matrix import ALL, CACHE, CAUSAL, SEQ, loaded
 from test_mixers import COMPRESSED, KIND_FIELDS, tiny
 
@@ -82,6 +82,7 @@ CACHED = tuple(family for family in ALL if {CAUSAL, CACHE} <= family.facts)
 """Every decoder family the capability matrix builds that decodes over a cache."""
 
 
+@attending("reference")
 @pytest.mark.parametrize("family", CACHED, ids=str)
 def test_each_familys_cache_opens_as_its_decode_opens_and_writes_it(family):
     """Each cached decoder family the capability matrix builds (its looped stacks, its multimodal wrappers,
@@ -99,6 +100,7 @@ BANKED = {"attention": ("attention", None), "looped": ("attention", Loop(steps=2
 recurrent and a memory mixer, whose specs read their weights' shapes off the bank."""
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize("case", sorted(BANKED))
 def test_a_banked_stores_cache_opens_banked_as_its_decode_opens_and_writes_it(case):
     """A scanned stack over a store banked by run opens its cache banked, each run's layers one array
@@ -109,7 +111,7 @@ def test_a_banked_stores_cache_opens_banked_as_its_decode_opens_and_writes_it(ca
     mixer = mixers.build(kind, **fields)
     plain = tiny(num_layers=4, max_seq_len=16, loop=loop, mixer=mixer, **overrides)
     variables = plain.init(jax.random.key(0), jnp.ones((1, PROMPT), jnp.int32))
-    scanned = tiny(num_layers=4, max_seq_len=16, scan_layers=True, loop=loop, mixer=mixer, **overrides)
+    scanned = tiny(num_layers=4, max_seq_len=16, loop=loop, mixer=mixer, **overrides)
     banked = HeldBanks(variables).place(scanned)
     cache = jax.eval_shape(lambda store: scanned.apply(store, ROWS, method="init_cache", mutable=["cache"]),
                            banked)[1]["cache"]
@@ -123,6 +125,7 @@ STAGED = ("attention", "gated_delta_net", "memory", "hybrid")
 period of attention and a delta net, which the stage's run holds by position of its period."""
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize("case", STAGED)
 def test_a_stage_local_stores_cache_opens_a_layer_at_a_time_as_its_decode_opens_and_writes_it(case):
     """A scanned stack's one-stage state (`stage_sites`, `StackView.stage_form`), its runs stacked by stage
@@ -134,7 +137,7 @@ def test_a_stage_local_stores_cache_opens_a_layer_at_a_time_as_its_decode_opens_
     layer = {"mixer": mixers.build(kind, **fields), **overrides}
     layout = (layer if case != "hybrid" else
               {"layer_types": ("full_attention", "linear") * 2, "kinds": {"linear": LayerKind(**layer)}})
-    scanned = tiny(num_layers=4, max_seq_len=16, scan_layers=True, **layout)
+    scanned = tiny(num_layers=4, max_seq_len=16, **layout)
     params = nn.unbox(scanned.init(jax.random.key(0), jnp.ones((1, PROMPT), jnp.int32)))["params"]
     (site,) = scanned.stage_sites({"params": params}, 1)
     staged = {"params": site.view.stage_form("params", dict(params), stacked_rows)}

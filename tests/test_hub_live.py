@@ -25,6 +25,7 @@ from pathlib import Path
 import jax
 import numpy as np
 import pytest
+from model_support import attending
 
 safetensors_numpy = pytest.importorskip("safetensors.numpy")
 
@@ -87,6 +88,7 @@ def offline(monkeypatch):
     monkeypatch.setattr(constants, "HF_HUB_OFFLINE", True)
 
 
+@attending("reference")
 def test_a_pushed_decoder_resolves_downloads_and_loads_through_the_hub(api, throwaway, fresh_cache, tmp_path,
                                                                        monkeypatch):
     from huggingface_hub import snapshot_download
@@ -97,7 +99,7 @@ def test_a_pushed_decoder_resolves_downloads_and_loads_through_the_hub(api, thro
 
     repo = throwaway("decoder")
     model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
-                              max_seq_len=8, attention_impl="reference")
+                              max_seq_len=8)
     bundle = PretrainedDecoder.from_model(model, model.init(jax.random.key(0), np.zeros((1, 2), np.int32)),
                                           tokenizer="byte")
     bundle.push_to_hub(repo, private=True, commit_message="dew live hub test")

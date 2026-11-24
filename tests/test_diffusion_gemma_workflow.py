@@ -7,7 +7,7 @@ from pathlib import Path
 import jax
 import numpy as np
 import pytest
-from model_support import moved
+from model_support import attending, moved
 
 from dew.diffusion.block import BlockProcess
 from dew.interop import Pretrained
@@ -16,8 +16,9 @@ FIXTURE = Path(__file__).resolve().parent / "fixtures/hf/diffusion-gemma-workflo
 PROMPTS = ["<bos> t5 t7 t9 t11", "<bos> t6 t8 t10 t12"]
 
 
+@attending("xla")
 def test_public_pretrained_text_workflow_and_checkpoint_readback(tmp_path):
-    bundle = Pretrained.load(str(FIXTURE), dtype="float32", attention_impl="xla", max_seq_len=32)
+    bundle = Pretrained.load(str(FIXTURE), dtype="float32", max_seq_len=32)
     inputs = bundle.processor(PROMPTS)
     task = bundle.block_generation()
     generated = task(PROMPTS, 7, key=jax.random.key(11))
@@ -29,7 +30,7 @@ def test_public_pretrained_text_workflow_and_checkpoint_readback(tmp_path):
 
     trained = jax.tree.map(lambda leaf: leaf + np.float32(0.001), bundle.variables)
     bundle.save(str(tmp_path), variables=trained)
-    restored = Pretrained.load(str(tmp_path), dtype="float32", attention_impl="xla", max_seq_len=32)
+    restored = Pretrained.load(str(tmp_path), dtype="float32", max_seq_len=32)
     for expected, actual in zip(jax.tree.leaves(trained), jax.tree.leaves(restored.variables),
                                 strict=True):
         np.testing.assert_array_equal(actual, expected)
@@ -40,8 +41,9 @@ def test_public_pretrained_text_workflow_and_checkpoint_readback(tmp_path):
     np.testing.assert_array_equal(result.decoder_steps, [8, 8])
 
 
+@attending("xla")
 def test_public_generation_override_keeps_canvas_semantics():
-    bundle = Pretrained.load(str(FIXTURE), dtype="float32", attention_impl="xla", max_seq_len=32)
+    bundle = Pretrained.load(str(FIXTURE), dtype="float32", max_seq_len=32)
     process = BlockProcess(canvas_length=4, vocab_size=64, max_steps=4)
     process = replace(process, stability_threshold=0, confidence_threshold=10.0)
     result = bundle.block_generation()(PROMPTS, 7, key=jax.random.key(11), process=process)
@@ -50,10 +52,11 @@ def test_public_generation_override_keeps_canvas_semantics():
         np.testing.assert_array_equal(result.decoder_steps, reference["stopped_steps"])
 
 
+@attending("xla")
 def test_block_generation_reads_its_ids_as_every_parser_of_ids_does():
     """A NumPy pad id generates as the Python one does (`dew.batch.token_id`), and a fraction or
     a flag where an id goes is refused before the loop runs."""
-    bundle = Pretrained.load(str(FIXTURE), dtype="float32", attention_impl="xla", max_seq_len=32)
+    bundle = Pretrained.load(str(FIXTURE), dtype="float32", max_seq_len=32)
     process = BlockProcess(canvas_length=4, vocab_size=64, max_steps=4)
     python = process.generate(bundle.model, bundle.variables, [[2, 5, 7]], 4, key=0, pad_token_id=0)
     arrays = process.generate(bundle.model, bundle.variables, [[2, 5, 7]], 4, key=0, pad_token_id=np.int64(0))
@@ -137,6 +140,7 @@ def assert_transformers_reads(export, model, variables, reference):
     return loaded
 
 
+@attending("xla")
 def test_transformers_reads_a_trained_export_at_dews_logits_and_tokens(tmp_path):
     """The export of a changed DiffusionGemma is a checkpoint transformers'
     DiffusionGemmaForBlockDiffusion loads with a clean report. On the
@@ -149,7 +153,7 @@ def test_transformers_reads_a_trained_export_at_dews_logits_and_tokens(tmp_path)
     from dew.nn.inputs import ModelInputs
     from tools.diffusion_gemma_reference import reference_generation
 
-    bundle = Pretrained.load(str(FIXTURE), dtype="float32", attention_impl="xla", max_seq_len=32)
+    bundle = Pretrained.load(str(FIXTURE), dtype="float32", max_seq_len=32)
     changed = moved(bundle.variables, jax.random.key(5), 0.02)
     bundle.save(str(tmp_path), variables=changed)
     with np.load(FIXTURE / "reference.npz") as stored:
@@ -164,6 +168,7 @@ def test_transformers_reads_a_trained_export_at_dews_logits_and_tokens(tmp_path)
     np.testing.assert_array_equal(ours.tokens, generated.sequences.numpy()[:, :12])
 
 
+@attending("xla")
 def test_transformers_reads_a_trained_image_reading_runs_export(tmp_path):
     """A block-diffusion run records its native model and no published config;
     `Pretrained.from_run` writes one from the model
@@ -200,7 +205,7 @@ def test_transformers_reads_a_trained_image_reading_runs_export(tmp_path):
 
     # At the run's own cache length, so both reads are one program on the same values: a longer cache
     # sums each query's keys over other tiles, which a GPU rounds otherwise.
-    again = Pretrained.load(str(tmp_path / "export"), dtype="float32", attention_impl="xla",
+    again = Pretrained.load(str(tmp_path / "export"), dtype="float32",
                             max_seq_len=exported.model.max_seq_len)
     assert again.model.conditioner == exported.model.conditioner
     assert again.model.canvas_length == exported.model.canvas_length
@@ -231,6 +236,7 @@ def test_transformers_reads_a_trained_image_reading_runs_export(tmp_path):
         saved.process, saved.max_new_tokens, saved.pad_token_id) and task.pad_token_id == 5
 
 
+@attending("xla")
 @pytest.mark.parametrize("fixture", ["diffusion-gemma-workflow", "diffusion-gemma-sft"])
 def test_a_runs_export_is_its_bundles_published_layout_where_transformers_builds_it(tmp_path, fixture):
     """`dew export` of a block-diffusion run (`export_run`, which asks the model's layout first,
@@ -287,13 +293,14 @@ def test_a_block_process_round_trips_through_transformers_generation_config():
     assert generation_process(config, json.loads(json.dumps(written))) == process
 
 
+@attending("xla")
 def test_a_model_the_published_config_cannot_carry_is_refused_by_field():
     """DiffusionGemma's text config fixes the 30 softcap, and transformers
     builds the projector from the tower's epsilon; a model that differs in
     either is refused naming it rather than written as one it is not."""
     from dew.interop.diffusion_gemma import published_config
 
-    model = Pretrained.load(str(FIXTURE), dtype="float32", attention_impl="xla").model
+    model = Pretrained.load(str(FIXTURE), dtype="float32").model
     assert published_config(model)["vision_config"]["model_type"] == "gemma4_vision"
     with pytest.raises(ValueError):
         published_config(model.clone(text=model.text.clone(final_logit_softcap=50.0)))

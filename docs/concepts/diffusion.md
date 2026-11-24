@@ -156,7 +156,7 @@ from dew.sampling import DDIM, Euler, sample
 
 process = Flow()()
 model = SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2,
-                  mlp_ratio=2, dtype=jnp.float32, attention_impl="xla")
+                  mlp_ratio=2, dtype=jnp.float32)
 params = model.init(jax.random.key(0), jnp.zeros((1, 8, 8, 3)), jnp.zeros((1,)))
 denoise = process.denoiser(model, params, conditions={})
 x_T = process.noise(jax.random.key(1), (2, 8, 8, 3))

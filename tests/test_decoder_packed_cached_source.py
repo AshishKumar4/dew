@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from interop_support import transformers_arms, transformers_model
-from model_support import decode_logits
+from model_support import attending, decode_logits
 from reference_error import assert_as_exact
 
 from dew.interop.pretrained import Pretrained
@@ -44,27 +44,31 @@ def drawn(family: str, shape):
     return lambda seed: (np.random.default_rng(seed).integers(0, vocabulary, shape).astype(np.int32),)
 
 
-@pytest.mark.parametrize("attention_impl", ["reference", "xla"])
+@pytest.mark.parametrize("kernel", ["reference", "xla"])
 @pytest.mark.parametrize("family", ["llama-tiny", "mistral-tiny"])
-def test_packed_rows_are_as_exact_as_transformers(family, attention_impl):
+def test_packed_rows_are_as_exact_as_transformers(family, kernel):
     from tools.hf_packed_cached_reference import PACKING, packed
 
-    loaded = Pretrained.load(FIXTURES / family, dtype="float32", attention_impl=attention_impl)
+    loaded = Pretrained.load(FIXTURES / family, dtype="float32")
     segment_ids, positions = segments(PACKING)
     reference, truth = transformers_arms(transformers_model(FIXTURES / family), packed)
-    assert_as_exact(lambda ids: loaded.model.apply(loaded.variables, ids, positions=positions,
-                                                   segment_ids=segment_ids),
-                    reference, drawn(family, segment_ids.shape), f"{family} packed", seeds=PACKED_SEEDS,
+
+    @attending(kernel)
+    def ours(ids):
+        return loaded.model.apply(loaded.variables, ids, positions=positions, segment_ids=segment_ids)
+
+    assert_as_exact(ours, reference, drawn(family, segment_ids.shape), f"{family} packed", seeds=PACKED_SEEDS,
                     truth_fn=truth)
 
 
-@pytest.mark.parametrize("attention_impl", ["reference", "xla"])
+@pytest.mark.parametrize("kernel", ["reference", "xla"])
 @pytest.mark.parametrize("family", ["llama-tiny", "mistral-tiny"])
-def test_cached_decoding_is_as_exact_as_transformers(family, attention_impl):
+def test_cached_decoding_is_as_exact_as_transformers(family, kernel):
     from tools.hf_packed_cached_reference import PROMPT, STEPS, cached
 
-    loaded = Pretrained.load(FIXTURES / family, dtype="float32", attention_impl=attention_impl)
+    loaded = Pretrained.load(FIXTURES / family, dtype="float32")
     reference, truth = transformers_arms(transformers_model(FIXTURES / family), cached)
+    @attending(kernel)
     def ours(ids):
         return decode_logits(loaded.model, loaded.variables, ids[:, :PROMPT], ids[:, PROMPT:])
 

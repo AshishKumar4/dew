@@ -22,7 +22,6 @@ from typing import TYPE_CHECKING, ClassVar
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.attention import AttentionImpl
 from dew.nn.dex import DexStart, LayerDex
 from dew.nn.kv_cache import KVCache
 from dew.nn.ngpt import NGPT
@@ -110,7 +109,6 @@ class MixerContext:
     (csrc/pos_encoding_kernels.cu, `apply_token_rotary_embedding`)."""
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: AttentionImpl = "auto"
     force_fp32_for_softmax: bool = True
     wide_logits: bool = False
     """The logits from the query and keys widened to at least fp32 and scaled after the product, as

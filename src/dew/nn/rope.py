@@ -176,14 +176,15 @@ class LongRopeScaling:
 
 
 def rope_scaling_from_record(record: Mapping[str, object]) -> "Scaling":
-    """Build the scaling a record holds: a class record (`{"class", "fields"}`, as the registry writes a
-    union field) by its class, else the one its rope_type names, LongRoPE's, YaRN's or Llama 3.1's."""
-    if 'class' in record:
-        built = from_record(Scaling, record)
-        assert isinstance(built, RopeScaling | LongRopeScaling | YarnScaling)
-        return built
-    kinds = {'longrope': LongRopeScaling, 'yarn': YarnScaling}
-    return from_record(kinds.get(str(record.get('rope_type')), RopeScaling), record)
+    """The scaling a record holds, read by the registry's one rule for a union field (`from_record`): a
+    class record (`{"class", "fields"}`) by its class, else the one member that builds from it, its own
+    `rope_type` check passing (Train 1208's review F4: a second reader dispatched by `rope_type` alone and
+    refused what the registry built). A record no member builds from is refused."""
+    built = from_record(Scaling, record)
+    if not isinstance(built, RopeScaling | LongRopeScaling | YarnScaling):
+        raise ValueError(f"rope_scaling {dict(record)!r} is the record of no scaling: Llama 3.1's ramp, "
+                         f"LongRoPE's factors or YaRN's")
+    return built
 
 
 @dataclasses.dataclass(frozen=True)
@@ -208,6 +209,10 @@ class YarnScaling:
     # An explicit cos/sin amplitude, which the reference applies instead of
     # deriving one; None derives it from factor and the mscales above.
     attention_factor: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.rope_type != 'yarn':
+            raise ValueError(f"rope_scaling applies YaRN's ramp, got rope_type {self.rope_type!r}")
 
 
 type Scaling = RopeScaling | LongRopeScaling | YarnScaling

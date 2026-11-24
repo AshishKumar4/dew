@@ -19,7 +19,6 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.attention import AttentionImpl
 from dew.nn.dropout import Dropout
 
 from .activations import gelu_tanh
@@ -241,7 +240,6 @@ class MobileMultiQueryAttention(nn.Module):
     padding: str = "same"
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: AttentionImpl = "auto"
 
     @nn.compact
     def __call__(self, x):
@@ -258,8 +256,7 @@ class MobileMultiQueryAttention(nn.Module):
         query = query.reshape(batch, height * width, spec.heads, spec.head_dim)
         key, value = (a.reshape(batch, -1, 1, spec.head_dim) for a in (key, value))
         out = scaled_dot_product_attention(
-            query, key, value, dtype=self.dtype, precision=self.precision,
-            implementation=self.attention_impl)
+            query, key, value, dtype=self.dtype, precision=self.precision)
         out = out.reshape(batch, height, width, spec.heads * spec.head_dim)
         return MobileKVProjection(self.features, "embed", dtype=self.dtype,
                                    precision=self.precision, name="output")(out)
@@ -273,7 +270,6 @@ class MobileAttention(nn.Module):
     drop_path: float = 0.0
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: AttentionImpl = "auto"
 
     @nn.compact
     def __call__(self, x, train: bool = False):
@@ -281,7 +277,7 @@ class MobileAttention(nn.Module):
         x = _timm_rms_norm(self.dtype, "norm")(x)
         x = MobileMultiQueryAttention(
             self.spec, self.features, padding=self.padding, dtype=self.dtype,
-            precision=self.precision, attention_impl=self.attention_impl,
+            precision=self.precision,
             name="attn")(x)
         if self.layer_scale is not None:
             x = MobileLayerScale(self.layer_scale, name="layer_scale")(x)
@@ -300,7 +296,6 @@ class MobileStage(nn.Module):
     drop_path_rate: float
     dtype: Dtype | None
     precision: PrecisionLike
-    attention_impl: AttentionImpl
 
     @nn.compact
     def __call__(self, x, train: bool = False):
@@ -313,7 +308,7 @@ class MobileStage(nn.Module):
                 block = MobileAttention(
                     spec, features, padding=self.padding, layer_scale=self.layer_scale,
                     drop_path=drop_path, dtype=self.dtype, precision=self.precision,
-                    attention_impl=self.attention_impl, name=f"blocks_{i}")
+                    name=f"blocks_{i}")
             else:
                 block = MobileResidual(
                     spec, features, group_size=self.group_size, padding=self.padding,
@@ -383,7 +378,6 @@ class MobileNetV5Encoder(nn.Module):
     construction: MobileNetV5 = MobileNetV5()
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: AttentionImpl = "auto"
 
     def setup(self):
         args = self.construction
@@ -426,7 +420,7 @@ class MobileNetV5Encoder(nn.Module):
             x = MobileStage(stage, args.channel_multiplier, args.pad_type,
                             args.group_size, args.layer_scale_init_value,
                             args.drop_path_rate, self.dtype, self.precision,
-                            self.attention_impl, name=f"stages_{stage}")(x, train=train)
+                            name=f"stages_{stage}")(x, train=train)
             if stage + 1 in self.selected:
                 features.append(x)
         x = MobileMultiScaleFusion(args.msfa_output_resolution, dtype=self.dtype,

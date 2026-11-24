@@ -15,7 +15,15 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from map_judge import marked_seeds
-from model_support import TINY_DECODER, as_stepped, decode_steps, model_draw, with_logit_cotangent
+from model_support import (
+    TINY_DECODER,
+    as_stepped,
+    attending,
+    compiled_apply,
+    decode_steps,
+    model_draw,
+    with_logit_cotangent,
+)
 from reference_error import assert_as_exact, with_gradients
 
 from dew.nn.attention_residuals import AttentionResiduals
@@ -47,19 +55,38 @@ MESSAGES = CrossPass(block_size=2, rank=4)
 """Messages over blocks of two layers through a controller of rank 4."""
 
 
+SCANNED_FORMS = ("scanned", "periodic")
+"""The forms whose decoder scans its stack (`decoder`)."""
+
+
+@pytest.fixture(autouse=True)
+def scanned_forms(request):
+    """A test of a form `decoder` scans (`SCANNED_FORMS`, its `form` or its case's first element) runs its
+    decoders' stacks scanned (`generation.chosen(layer_scan="scanned")`), every other form's a layer at a
+    time."""
+    from dew.nn.kernels import generation
+
+    named = getattr(getattr(request.node, "callspec", None), "params", {})
+    case = named.get("case")
+    form = named.get("form", case[0] if isinstance(case, tuple) else None)
+    with generation.chosen(layer_scan="scanned" if form in SCANNED_FORMS else "plain"):
+        yield
+
+
 def decoder(form: str, **loop) -> CausalTransformer:
     """A tiny decoder of four layers in `form`: attention alone ('attention'), a hybrid of gated delta nets
     and attention ('hybrid'), attention under Kimi K3's attention residuals in blocks of two ('depth'), or
-    six attention layers scanned as one run (`scan_layers`, 'scanned'), or a hybrid whose block of four is
-    two periods of a delta net and an attention layer, scanned (a periodic run, 'periodic'); its block
+    six attention layers scanned as one run ('scanned'), or a hybrid whose block of four is
+    two periods of a delta net and an attention layer, scanned (a periodic run, 'periodic'), each scanned
+    as its test runs it (`scanned_forms`); its block
     [`first`, end) looped as `loop` says where it says anything, passing `MESSAGES` (blocks of four where
     scanned)."""
-    fields = {"vocab_size": VOCAB, **TINY_DECODER, "num_layers": 4, "attention_impl": "reference",
+    fields = {"vocab_size": VOCAB, **TINY_DECODER, "num_layers": 4,
               "tie_embeddings": False}
     if form == "scanned":
-        fields |= {"num_layers": 6, "scan_layers": True}
+        fields |= {"num_layers": 6}
     if form == "periodic":
-        fields |= {"num_layers": 5, "scan_layers": True, "kinds": DELTA_NETS,
+        fields |= {"num_layers": 5, "kinds": DELTA_NETS,
                    "layer_types": ("full_attention",) + ("linear_attention", "full_attention") * 2}
     if form == "hybrid":
         fields |= {"layer_types": ("linear_attention", "full_attention") * 2, "kinds": DELTA_NETS}
@@ -183,6 +210,7 @@ def _results(forward):
     return jax.jit(run)
 
 
+@attending("reference")
 @pytest.mark.parametrize("form", ["attention", "hybrid", "depth", "one pass gaining messages"])
 @pytest.mark.parametrize("steps", [1, 2, 3])
 def test_at_its_gates_draw_a_loop_passing_messages_computes_the_decoder_it_repeats(form, steps):
@@ -205,8 +233,8 @@ def test_at_its_gates_draw_a_loop_passing_messages_computes_the_decoder_it_repea
     if steps == 1:
         variables, ids, _ = draw(0)
         np.testing.assert_array_equal(
-            np.asarray(looped.apply(variables, ids)),
-            np.asarray(plain.apply({"params": _without_merges(variables["params"])}, ids)))
+            np.asarray(compiled_apply(looped, variables, ids)),
+            np.asarray(compiled_apply(plain, {"params": _without_merges(variables["params"])}, ids)))
         return
     looped_results = _results(looped.apply)
 
@@ -241,6 +269,7 @@ def _without_merges(params):
     return kept(dict(params))
 
 
+@attending("reference")
 @pytest.mark.parametrize("case, seeds", [
     pytest.param(("hybrid", {"steps": 2}), UNROLLED_SEEDS["two"], id="two"),
     pytest.param(("hybrid", {"steps": 4}), UNROLLED_SEEDS["four"], id="four",
@@ -278,6 +307,7 @@ def test_a_loop_passing_messages_computes_its_passes_unrolled(case, seeds, reque
         assert np.any(np.asarray(gradients["layers_0"]["mlp"]["down_proj"]["kernel"]) != 0)
 
 
+@attending("reference")
 @pytest.mark.check1_shards(seeds=32, per_task=16)
 def test_a_loop_passing_messages_decodes_as_it_prefills():
     """A hybrid decoder passing messages over three passes, its gates drawn off zero, each pass's cache its
@@ -304,6 +334,7 @@ def test_a_loop_passing_messages_decodes_as_it_prefills():
                     truth_fn=passes(looped.clone(dtype=jnp.float64)))
 
 
+@attending("reference")
 @pytest.mark.parametrize("form", ["hybrid", "periodic"])
 def test_a_shared_cache_prefills_as_a_cache_a_pass_does(form):
     """A hybrid decoder passing messages over four passes, its gates drawn off zero, prefills with one
@@ -336,6 +367,7 @@ def test_a_shared_cache_prefills_as_a_cache_a_pass_does(form):
             np.testing.assert_array_equal(np.asarray(one), np.asarray(other), err_msg=kept)
 
 
+@attending("reference")
 def test_a_packed_attention_projects_each_site_apart_as_its_own_projections_do():
     """A decoder passing messages packs none of its block's attention projections anew (`pending`: a later
     pass would run the packed product once a site), the prelude's alone, its feed-forwards' as any; a
@@ -347,13 +379,13 @@ def test_a_packed_attention_projects_each_site_apart_as_its_own_projections_do()
     looped = decoder("attention", steps=3)
     draw = gated_draw(looped, salt=0xC406)
     variables, _ = draw(0)
-    def attending(groups):
+    def attended_by(groups):
         return {group.path[0] for group in groups if group.packed == "qkv_proj"}
 
-    assert attending(pending(looped, variables)) == {"layers_0"}
+    assert attended_by(pending(looped, variables)) == {"layers_0"}
     plain = decoder("attention")
     groups = pending(plain, {"params": _without_merges(variables["params"])})
-    assert attending(groups) == {f"layers_{index}" for index in range(4)}
+    assert attended_by(groups) == {f"layers_{index}" for index in range(4)}
     packed_tree = pack_projections(variables, groups)
     for one, other in zip(jax.tree.leaves(unpacked(looped, packed_tree)), jax.tree.leaves(variables),
                           strict=True):
@@ -366,6 +398,7 @@ def test_a_packed_attention_projects_each_site_apart_as_its_own_projections_do()
                     seeds=SEEDS["packed"], truth_fn=jax.jit(looped.clone(dtype=jnp.float64).apply))
 
 
+@attending("reference")
 def test_a_decoder_drawn_at_one_pass_holds_every_merge_a_later_pass_reads():
     """A decoder passing messages drawn at one pass, which reads no bank, holds every merge a later pass
     reads (each core layer's sites', their depth mixtures' among them), so the same parameters run it at
@@ -383,6 +416,7 @@ def test_a_decoder_drawn_at_one_pass_holds_every_merge_a_later_pass_reads():
     assert np.all(np.isfinite(np.asarray(thrice.apply({"params": params}, ids))))
 
 
+@attending("reference")
 @pytest.mark.parametrize("refused", [
     lambda: Loop(2, messages=MESSAGES),
     lambda: Loop(2, step_norm=False, implicit=True, messages=MESSAGES),
@@ -412,6 +446,7 @@ def test_a_loop_whose_messages_cannot_summarize_its_blocks_is_refused(refused):
         refused()
 
 
+@attending("reference")
 def test_a_loaded_decoder_gains_messages_that_leave_it_as_it_was_and_train_fresh():
     """A loaded decoder that gains a loop passing messages (`with_passes`, `Pretrained.with_model`) draws
     each merge fresh (`Pretrained.fresh`, the fresh group's alone) beside its loaded weights, which stay as
@@ -422,7 +457,7 @@ def test_a_loaded_decoder_gains_messages_that_leave_it_as_it_was_and_train_fresh
     from dew.interop import Pretrained
     from dew.optim import OptimConfig, ParamGroup
 
-    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
+    source = Pretrained.load(LLAMA, dtype="float32")
     layers = source.model.num_layers
     looped = source.with_model(source.model.with_passes(3, (1, layers), messages=MESSAGES), key=3)
     assert looped.fresh and all("cross_pass_" in path for path in looped.fresh)
@@ -449,14 +484,14 @@ def test_a_loaded_decoder_gains_messages_that_leave_it_as_it_was_and_train_fresh
         looped.export()
 
 
+@attending("reference")
 def test_a_source_written_in_its_own_bindings_refuses_its_export_once_it_passes_messages():
     """A source whose family writes it back in the bindings it was read from (Mixtral's,
     `preserve_source_layout`) exports as it loaded; gaining a loop passing messages (`with_passes`), whose
     merges its format holds none of, its export is refused rather than written without them."""
     from dew.interop import Pretrained
 
-    source = Pretrained.load(Path(__file__).parent / "fixtures" / "hf" / "mixtral-tiny", dtype="float32",
-                             attention_impl="reference")
+    source = Pretrained.load(Path(__file__).parent / "fixtures" / "hf" / "mixtral-tiny", dtype="float32")
     assert source.export()
     layers = source.model.num_layers
     looped = source.with_model(source.model.with_passes(2, (1, layers), messages=MESSAGES), key=4)
@@ -465,6 +500,7 @@ def test_a_source_written_in_its_own_bindings_refuses_its_export_once_it_passes_
     assert refused.value.args == (MESSAGES_UNWRITTEN,)
 
 
+@attending("xla")
 def test_a_loop_passing_messages_trains_sampled_counts_exits_and_narrow_copies():
     """A bf16 decoder passing messages over a block every pass exits through (an exit gate), its passes
     recomputed and drawn per microbatch (`SampledPasses`), its parameters read through narrow copies,
@@ -477,7 +513,7 @@ def test_a_loop_passing_messages_trains_sampled_counts_exits_and_narrow_copies()
     from dew.training.interval import Interval
 
     model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=3, num_heads=2, mlp_features=48,
-                              max_seq_len=128, attention_impl="xla", dtype=jnp.bfloat16,
+                              max_seq_len=128, dtype=jnp.bfloat16,
                               loop=Loop(TRAINED.cap, step_norm=False, layers=(1, 3), exit_gate=True,
                                         remat=True, messages=CrossPass(block_size=1, rank=4)))
     batch = token_batch()
@@ -499,6 +535,7 @@ def test_a_loop_passing_messages_trains_sampled_counts_exits_and_narrow_copies()
     assert gains and any(np.any(gain != 0) for gain in gains)
 
 
+@attending("xla")
 def test_a_loop_passing_messages_resumes_as_it_never_stopped(tmp_path):
     """A run of a decoder passing messages stopped after two steps and resumed to four lands, bit for bit,
     where the run never stopped lands: its merges are parameters it checkpoints and resumes (`Loop.PASSED`
@@ -510,7 +547,7 @@ def test_a_loop_passing_messages_resumes_as_it_never_stopped(tmp_path):
 
     tokens, _ = phased_draw(0)
     model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=3, num_heads=2, mlp_features=48,
-                              max_seq_len=128, attention_impl="xla",
+                              max_seq_len=128,
                               loop=Loop(3, step_norm=False, layers=(1, 3), messages=CrossPass(block_size=1,
                                                                                                rank=4)))
     assert "messages" not in Loop.PASSED
@@ -582,6 +619,7 @@ def test_a_loop_passing_messages_bounds_its_step_memory_across_unrolled_passes()
             f"(msg: {msg_two} -> {msg_six}, plain: {plain_two} -> {plain_six})")
 
 
+@attending("reference")
 @pytest.mark.parametrize("watch", ["captured", "inspected"])
 def test_a_watched_merge_runs_its_depth_mixture_as_its_own_call(watch):
     """A caller watching a merge's calls, capturing every module's outputs (`capture_intermediates`) or
@@ -604,6 +642,7 @@ def test_a_watched_merge_runs_its_depth_mixture_as_its_own_call(watch):
     np.testing.assert_array_equal(np.asarray(logits), np.asarray(model.apply(variables, ids)))
 
 
+@attending("reference")
 @pytest.mark.parametrize("watch", ["capture filter", "interceptor"])
 def test_a_merge_runs_under_a_callers_unhashable_capture_filter_or_interceptor(watch):
     """A caller's `capture_intermediates` filter and method interceptor may be any callable, an unhashable
@@ -633,6 +672,7 @@ def test_a_merge_runs_under_a_callers_unhashable_capture_filter_or_interceptor(w
     np.testing.assert_array_equal(np.asarray(logits), expected)
 
 
+@attending("reference")
 def test_a_looped_decoder_runs_under_a_capture_of_every_method():
     """A capture filter may keep every method's output (`capture_intermediates=lambda module, method: True`),
     a method returning a submodule among them: a looped decoder's later pass reads its layers' stored
@@ -676,6 +716,7 @@ def qwix_owned(provider: str, rules: Sequence[dict], spec: CrossPass = MESSAGES)
     return leaves, made.get_unused_rules()
 
 
+@attending("reference")
 @pytest.mark.parametrize(("provider", "rule", "spec"), [
     ("qt", {"module_path": r".*cross_pass_[^/]+/depth", "weight_qtype": jnp.int8, "act_qtype": jnp.int8,
             "op_names": ("einsum",)}, MESSAGES),
@@ -697,6 +738,7 @@ def test_a_merge_a_direct_qwix_rule_owns_takes_its_gradients_through_the_rule(pr
     assert any(not np.array_equal(got, unquantized) for got, unquantized in zip(owned, plain, strict=True))
 
 
+@attending("reference")
 def test_a_rule_over_a_merges_own_path_owns_its_matmuls_and_not_its_depth_mixtures_einsums():
     """Rules over a merge's own path (`cross_pass_<k>`, its depth child's not), one over its matmuls and one
     over einsums, which only its depth child computes: the matmuls' rule is used, the einsums' is not (a

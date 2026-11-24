@@ -347,11 +347,71 @@ STEP, HIDDEN = 0.05, 4.0
 """A join's step scale and the hidden gains' factor, at a model's magnitudes."""
 
 
+@pytest.mark.parametrize("wide", [False, True], ids=["float32", "float64"])
+def test_ngpts_join_leaves_a_long_residuals_radial_cotangent_nothing(wide):
+    """nGPT's join (`ngpt.stepped`) of a residual row of length 2^55 at rate 0, its cotangent along the row
+    itself: the residual's gradient is the radial part the two norms' eps leave, `eps^2 2^-165` (0 in
+    float32, which holds no such value), where JAX's derivative of `rsqrt` flushed the norm's radial term
+    (`rsqrt(s) / s`, 2^-165) to zero in float32 and left the cotangent's 2^-55 (row 11940's review: the
+    join's written transpose had cancelled it); and a cotangent across the row reaches it at 2^-55."""
+    dtype = jnp.float64 if wide else jnp.float32
+    with jax.enable_x64(wide):
+        residual = jnp.asarray([[2.0 ** 55, 0.0]], dtype)
+        branch, rate = jnp.asarray([[1.0, 0.0]], dtype), jnp.zeros((1,), dtype)
+        _, pulled = jax.vjp(lambda x: ngpt.stepped(x, branch, rate, 1.0), residual)
+        (radial,) = pulled(jnp.asarray([[1.0, 0.0]], dtype))
+        (across,) = pulled(jnp.asarray([[0.0, 1.0]], dtype))
+        rounding = 32 * float(jnp.finfo(dtype).eps)
+        left = float(jnp.asarray(precision.L2NORM_EPS ** 2 * 2.0 ** -165, dtype))
+        assert float(radial[0, 1]) == 0.0
+        low, high = (1 - 4 * precision.L2NORM_EPS - rounding) * left, (1 + rounding) * left
+        assert low <= float(radial[0, 0]) <= high
+        # The second norm's row is unit, its length read through `L2NORM_EPS`: the cross term is 2^-55 scaled
+        # by (1 + eps)^(-1/2), between 1 - eps and 1 of it.
+        assert float(across[0, 0]) == 0.0
+        assert 1 - precision.L2NORM_EPS <= float(across[0, 1]) * 2.0 ** 55 <= 1
+        # Its second order, the cross tangent's along the row: -2^-110, every factor at the row's scale,
+        # where JAX's derivative of `rsqrt` read r / s and flushed it to 0 (the API02 review).
+        def crossed(x):
+            return jax.jvp(lambda y: ngpt.stepped(y, branch, rate, 1.0), (x,),
+                           (jnp.asarray([[0.0, 1.0]], dtype),))[1]
+
+        second = jax.jvp(crossed, (residual,), (jnp.asarray([[1.0, 0.0]], dtype),))[1]
+        assert 1 - precision.L2NORM_EPS <= -float(second[0, 1]) * 2.0 ** 110 <= 1
+        # The same second order in reverse, over the forward: the inverse length's derivative read from the
+        # row's own tangent, where through its squares' a reverse met r^3 first and flushed it to 0 (2^-166;
+        # the API02 review).
+        reversed_second = jax.grad(lambda x: crossed(x)[0, 1])(residual)
+        # As the forward's, between 1 - eps and 1 of it (the second norm's length read through `L2NORM_EPS`),
+        # within a few roundings of the dtype's (the inverse length's root and its products'): never 0.
+        assert (1 - precision.L2NORM_EPS - rounding <= -float(reversed_second[0, 0]) * 2.0 ** 110
+                <= 1 + rounding)
+
+
+@pytest.mark.parametrize("direction", ["forward", "reverse"])
+def test_a_unit_norm_carries_a_short_rows_huge_radial_derivative_finite(direction):
+    """nGPT's unit norm (`precision.l2_normed`) of a row of length 1/2, its tangent (forward) or cotangent
+    (reverse) along the row and as large as float32 holds (3 * 2^126): the row's derivative is the part the
+    norm's eps leaves, `c eps / (1/4 + eps)^(3/2)`, about 2^110.7, finite, positive and off the row's other
+    axis, projected off the row before it meets the row's inverse length, 2, in both directions, where scaling
+    it first overflowed to inf and the projection read inf - inf, NaN (the API02 review: the reverse's
+    fix had moved the overflow to the forward)."""
+    row = jnp.asarray([[0.5, 0.0]], jnp.float32)
+    huge = jnp.asarray([[3.0 * 2.0 ** 126, 0.0]], jnp.float32)
+    if direction == "forward":
+        derivative = jax.jvp(lambda x: precision.l2_normed(x, jnp.float32), (row,), (huge,))[1]
+    else:
+        _, pulled = jax.vjp(lambda x: precision.l2_normed(x, jnp.float32), row)
+        (derivative,) = pulled(huge)
+    assert float(derivative[0, 1]) == 0.0
+    assert np.isfinite(float(derivative[0, 0])) and float(derivative[0, 0]) > 0
+
+
 @pytest.mark.parametrize("edge", EDGES)
 def test_ngpts_join_and_normed_hidden_hold_every_order(edge):
-    """nGPT's join (`ngpt.stepped`) and normed hidden (`ngpt.normed_hidden`), each through
-    `generation.linear_tangent` with a reverse of its own: every order finite wherever float64 is a normal
-    float32 and the plain formula, the norms, the step, the gains and the product as written, is."""
+    """nGPT's join (`ngpt.stepped`) and normed hidden (`ngpt.normed_hidden`), each JAX's derivatives of its
+    formula, no rule of its own (row 11940): every order finite wherever float64 is a normal float32 and the
+    plain formula, the norms, the step, the gains and the product as written, is."""
     residual, branch, gate, up = normal_draw(2671, (3, 16), (3, 16), (3, 16), (3, 16), scale=EDGES[edge])
     alpha, gate_gain, up_gain = normal_draw(2672, (16,), (16,), (16,))
     directions = normal_draw(2673, (3, 16), (3, 16), (16,), (3, 16), (3, 16), (16,), (16,),

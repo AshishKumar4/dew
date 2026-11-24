@@ -14,7 +14,7 @@ model = CausalTransformer(
     vocab_size=32, emb_features=16,
     num_layers=2, num_heads=2, mlp_features=32, max_seq_len=8,
     mixture=Mixture(experts=4, top_k=2),
-    dtype=jnp.float32, attention_impl="xla",
+    dtype=jnp.float32,
 )
 tokens = jnp.array([[1, 2, 3, 4]], dtype=jnp.int32)
 variables = model.init(jax.random.key(0), tokens)

@@ -29,7 +29,6 @@ from dew.decision.layout import Encoded, Labels
 from dew.decision.questions import KINDS, Choice, Noul, Score
 from dew.decision.shared_state import over_one_state_row
 from dew.nn.activations import gelu_exact_torch, logistic
-from dew.nn.attention import AttentionImpl
 from dew.nn.attention_blocks import NormalAttention
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock, decoder_norm
 from dew.nn.blocks import TokenEmbedding
@@ -141,7 +140,9 @@ class Head(nn.Module):
     @staticmethod
     def from_record(record: JSON | Mapping[str, object], width: int) -> "Head":
         """Rebuild the head a run recorded, reading states `width` wide, in the numerics it
-        recorded. An earlier run's record is read through `dew.inference.tasks.earlier_shapes`."""
+        recorded. An earlier run's record is read through `dew.inference.tasks.earlier_shapes` and a
+        release's through its reader, each leaving out the fields its class lost since
+        (`dew._records.earlier_fields`), so a field this one refuses is one no Dew wrote."""
         head, fields = component(Head, _records.record(record, "head"))
         return from_record(head, {**fields, head.width_field: width})
 
@@ -172,7 +173,6 @@ class DecisionHead(Head):
     dropout_rate: float = dataclasses.field(default=0.0, metadata=RUNS)
     dtype: Dtype | None = dataclasses.field(default=None, metadata=NUMBERS)
     precision: PrecisionLike = dataclasses.field(default=None, metadata=NUMBERS)
-    attention_impl: AttentionImpl = dataclasses.field(default="auto", metadata=RUNS)
 
     @nn.nowrap
     def decision_flops(self, lengths, questions, options) -> float:
@@ -191,7 +191,7 @@ class DecisionHead(Head):
             emb_features=self.features, num_heads=heads, num_kv_heads=heads,
             head_dim=self.features // heads, max_seq_len=1, causal=False, qk_norm=False,
             attention_bias=True, attention_dropout_rate=self.dropout_rate, dtype=self.dtype,
-            precision=self.precision, attention_impl=self.attention_impl)
+            precision=self.precision)
         feedforward = functools.partial(
             GatedMLP, hidden_features=4 * self.features, out_features=self.features, activation="relu",
             use_bias=True, dtype=self.dtype, precision=self.precision)
@@ -262,13 +262,12 @@ class _RoutingLayer(nn.Module):
     feedforward: int
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: AttentionImpl = "auto"
 
     @nn.compact
     def __call__(self, queries: jax.Array, memory: jax.Array, read: _Reading) -> jax.Array:
         attention = NormalAttention(self.width, heads=self.heads, dim_head=self.width // self.heads,
                                     dtype=self.dtype, precision=self.precision,
-                                    attention_impl=self.attention_impl, name="attention")
+                                    name="attention")
         memory = _layer_norm(self.dtype, "memory_norm")(memory)
         normed = _layer_norm(self.dtype, "query_norm")(queries)
         queries = queries + attention(normed, memory, segment_ids=read.slots, key_segment_ids=read.tokens,
@@ -287,14 +286,13 @@ class _FieldLayer(nn.Module):
     feedforward: int
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: AttentionImpl = "auto"
 
     @nn.compact
     def __call__(self, fields: jax.Array, memory: jax.Array, read: _Reading) -> jax.Array:
         def attention(name: str) -> NormalAttention:
             return NormalAttention(self.width, heads=self.heads, dim_head=self.width // self.heads,
                                    dtype=self.dtype, precision=self.precision,
-                                   attention_impl=self.attention_impl, name=name)
+                                   name=name)
 
         normed = _layer_norm(self.dtype, "norm1")(fields)
         fields = fields + attention("self_attn")(normed, segment_ids=read.questions,
@@ -371,7 +369,6 @@ class JointSchemaHead(Head):
     feedforward: int = 4096
     dtype: Dtype | None = dataclasses.field(default=None, metadata=NUMBERS)
     precision: PrecisionLike = dataclasses.field(default=None, metadata=NUMBERS)
-    attention_impl: AttentionImpl = dataclasses.field(default="auto", metadata=RUNS)
     reads_table: ClassVar[bool] = True
     reads_apart: ClassVar[bool] = False
     release_format: ClassVar[ReleaseFormat | None] = "joint"
@@ -419,7 +416,7 @@ class JointSchemaHead(Head):
         self.option_lexical_projection = dense(self.width, "option_lexical_projection")
         self.type_embedding = TokenEmbedding(len(KINDS), self.width, dtype=self.dtype, name="type_embedding")
         options = {"width": self.width, "heads": self.heads, "feedforward": self.feedforward,
-                   "dtype": self.dtype, "precision": self.precision, "attention_impl": self.attention_impl}
+                   "dtype": self.dtype, "precision": self.precision}
         self.evidence_layers = [_RoutingLayer(**options, name=f"evidence_layers_{index}")
                                 for index in range(self.routing_layers)]
         self.option_summary_norm = _layer_norm(self.dtype, "option_summary_norm")

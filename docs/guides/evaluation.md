@@ -29,7 +29,7 @@ data = Loader(train=lambda partition: itertools.repeat({"text": train_tokens}),
                val=lambda partition: iter([{"text": val_tokens}]), records=8, batch=8)
 model = CausalTransformer(vocab_size=4, emb_features=16, num_layers=1,
                           num_heads=2, mlp_features=32, max_seq_len=16,
-                          dtype=jnp.float32, attention_impl="xla")
+                          dtype=jnp.float32)
 objective = LMObjective(model, seq_len=8)
 trainer = Trainer(objective, OptimConfig(optimizer=Adam(), learning_rate=0.01), key=0)
 state = trainer.fit(data, steps=10, log_every=5, eval_every=5,

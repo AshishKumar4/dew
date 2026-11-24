@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import attending
 from reference_error import as_given, assert_as_exact, declared_seeds, indexed_recording, recording
 from safetensors.numpy import load_file, save_file
 from ssd_support import MAMBA2_130M_HF, mamba2_130m, mamba2_130m_logits, mamba2_interop_draw
@@ -41,9 +42,9 @@ def assert_logits_of_the_fixture(path: Path, label: str) -> None:
     import transformers
 
     port = transformers.Mamba2ForCausalLM.from_pretrained(FIXTURE, dtype=torch.float32).eval()
-    loaded = Pretrained.load(path, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(path, dtype="float32")
     with jax.enable_x64(new_val=True):
-        wide = Pretrained.load(path, dtype="float64", param_dtype="float64", attention_impl="reference")
+        wide = Pretrained.load(path, dtype="float64", param_dtype="float64")
 
     def reference(ids):
         with torch.no_grad():
@@ -58,6 +59,7 @@ def assert_logits_of_the_fixture(path: Path, label: str) -> None:
                     fixture_tokens, label, seeds=FIXTURE_SEEDS, truth_fn=truth)
 
 
+@attending("reference")
 def test_the_public_loader_reads_the_fixture():
     """`Pretrained.load` dispatches the `mamba2` model type through the decoder family table, its config's
     unbounded time step written as transformers writes an infinity: its logits on par with transformers'
@@ -65,6 +67,7 @@ def test_the_public_loader_reads_the_fixture():
     assert_logits_of_the_fixture(FIXTURE, "the fixture's logits")
 
 
+@attending("reference")
 @pytest.mark.parametrize("bound", [{"__float__": "NaN"}, {"__float__": "nan"}, {"__float__": "inf"},
                                    {"__float__": "Infinity", "note": 1}, {"value": 1.0}])
 def test_a_time_step_bound_that_is_no_number_or_infinity_refuses_the_load(tmp_path, bound):
@@ -77,7 +80,7 @@ def test_a_time_step_bound_that_is_no_number_or_infinity_refuses_the_load(tmp_pa
     (tmp_path / "config.json").unlink()
     (tmp_path / "config.json").write_text(json.dumps(config))
     with pytest.raises(ValueError):
-        Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
+        Pretrained.load(tmp_path, dtype="float32")
 
 
 STREAM_SEEDS = 8
@@ -139,6 +142,7 @@ def mamba_ssm_config() -> dict:
             "fused_add_norm": True, "pad_vocab_size_multiple": 16, "tie_embeddings": False}
 
 
+@attending("reference")
 def test_a_mamba_ssm_checkpoint_loads_and_saves_as_its_hf_port(tmp_path, tensors):
     """mamba_ssm's tensor names differ from the port's in the embedding alone: the load's logits on par
     with transformers' model of the fixture (check 1), and a save writes the port's names and config."""
@@ -148,7 +152,7 @@ def test_a_mamba_ssm_checkpoint_loads_and_saves_as_its_hf_port(tmp_path, tensors
     save_file({name.replace("backbone.embeddings.", "backbone.embedding."): array
                for name, array in tensors.items()}, source / "model.safetensors")
 
-    loaded = Pretrained.load(source, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(source, dtype="float32")
     loaded.save(tmp_path / "saved")
 
     assert_logits_of_the_fixture(source, "mamba_ssm's names loaded")

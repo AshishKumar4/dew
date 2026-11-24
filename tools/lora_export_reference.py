@@ -328,7 +328,7 @@ def export() -> None:
 
     for name, case in PIPELINES.items():
         with source_directory(case.source) as source:
-            loaded = Pretrained.load(source, dtype="float32", attention_impl="xla")
+            loaded = Pretrained.load(source, dtype="float32")
             export_case(case, loaded, FIXTURES / name)
         print(f"{FIXTURES / name}: {sorted(path.name for path in (FIXTURES / name).iterdir())}")
 
@@ -343,4 +343,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # On the xla attention, the run's kernel choice (a model's field before row 11938), Dew imported where
+    # it runs, as this tool imports it.
+    from dew.nn.kernels import generation
+
+    with generation.chosen(attention="xla"):
+        main()

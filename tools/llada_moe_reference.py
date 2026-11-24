@@ -117,7 +117,7 @@ def record(name: str, release_python: str) -> None:
     repo, revision = RELEASES[name][:2]
     fields = llada_fields(name, 2, 16)
     mask = {} if not fields else {'visible': np.asarray(fields['attention_pairwise_mask'])[0]}
-    source = Pretrained.load(FIXTURES / name, dtype='float32', attention_impl='reference')
+    source = Pretrained.load(FIXTURES / name, dtype='float32')
 
     with reference_worker.session([release_python, __file__, '--serve', name]) as worker:
         def evaluate(inputs):
@@ -205,11 +205,16 @@ def main():
                 record_padding(*config_lookups(*released_classes(name, Path(workspace))),
                                json.loads((FIXTURES / name / 'config.json').read_text()), FIXTURES / name)
         return
+    # Dew's side on the reference attention, the run's kernel choice (a model's field before row 11938);
+    # the release's side (`--serve`) runs where no Dew is installed.
+    from dew.nn.kernels import generation
+
     for name in args.names:
         if args.draw:
             with tempfile.TemporaryDirectory() as workspace, torch.no_grad():
                 draw(released_model(name, Path(workspace) / 'draw').float(), FIXTURES / name)
-        record(name, args.release_python)
+        with generation.chosen(attention='reference'):
+            record(name, args.release_python)
 
 
 if __name__ == '__main__':

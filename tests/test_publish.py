@@ -13,6 +13,7 @@ from pathlib import Path
 
 import jax
 import pytest
+from model_support import attending
 
 import dew.io
 from dew.checkpoints import FROZEN_STORE, RUN_FILE, Checkpoints
@@ -143,6 +144,7 @@ def downloaded(artifact, target: Path) -> Path:
     return target
 
 
+@attending("xla")
 @pytest.mark.parametrize("reference", [False, True], ids=["upload", "uri"])
 def test_a_published_lora_run_downloads_to_a_run_that_loads_and_restores(tmp_path, monkeypatch, reference):
     """A LoRA run's step, uploaded or referenced by URI (a file:// one, as a
@@ -164,7 +166,7 @@ def test_a_published_lora_run_downloads_to_a_run_that_loads_and_restores(tmp_pat
 
     monkeypatch.setenv("WANDB_MODE", "offline")
     base = CausalTransformer(vocab_size=16, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
-                             max_seq_len=16, dtype="float32", attention_impl="xla")
+                             max_seq_len=16, dtype="float32")
     adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(
         base, base.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32)), key=1)
     objective = LMObjective(adapter.model, seq_len=8, ema_decay=None, variables=adapter.variables)

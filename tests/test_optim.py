@@ -21,7 +21,7 @@ import pytest
 from flax import linen as nn
 from jax.extend.core import ClosedJaxpr, Jaxpr, Literal
 from jax.sharding import NamedSharding, PartitionSpec as P
-from model_support import largest_difference
+from model_support import attending, largest_difference
 from optim_support import (
     FLOAT64,
     LR,
@@ -1485,6 +1485,7 @@ class Attending(nn.Module):
         return nn.Dense(sample.shape[-1])(Attention(name="attention")(tokens)).reshape(sample.shape)
 
 
+@attending("xla")
 @pytest.mark.parametrize("kind", ["decision", "supervised", "diffusion"])
 def test_every_objective_carries_live_qk_statistics_to_muonclip(kind, tmp_path):
     """A decision, a supervised and a continuous diffusion run return the attention logit maxima their model

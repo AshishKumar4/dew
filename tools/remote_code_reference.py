@@ -448,7 +448,7 @@ def record(name: str, release_python: str) -> None:
 
     from dew.interop import Pretrained
 
-    source = Pretrained.load(FIXTURES / name, dtype="float32", attention_impl="reference")
+    source = Pretrained.load(FIXTURES / name, dtype="float32")
     config = json.loads((FIXTURES / name / "config.json").read_text())
     layouts = {layout.name: layout for layout in source.weight_layouts}
     shapes = {path: leaf.shape for path, leaf in flat_tree(source.variables).items()}
@@ -501,8 +501,13 @@ def main() -> None:
             vendor(name)
         return
     if arguments.record:
-        for name in arguments.names:
-            record(name, arguments.release_python)
+        # Dew's side on the reference attention, the run's kernel choice (a model's field before row 11938);
+        # the release's side (`--serve`) runs where no Dew is installed.
+        from dew.nn.kernels import generation
+
+        with generation.chosen(attention="reference"):
+            for name in arguments.names:
+                record(name, arguments.release_python)
         return
     with tempfile.TemporaryDirectory() as scratch:
         if arguments.opens is not None:

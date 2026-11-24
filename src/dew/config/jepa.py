@@ -79,7 +79,7 @@ class JepaRunConfig(RunConfig):
                   if option.metadata.get(FROM_ENCODER) and option.name not in self.predictor}
         predictor = ModelConfig("jepa_predictor", {
             **self.predictor, "grid": grid, "factorized": video, "scan_order": encoder.scan_order}).build(
-                **shared, dtype=encoder.dtype, attention_impl=encoder.attention_impl)
+                **shared, dtype=encoder.dtype)
         mask = MultiBlockMask.for_grid(grid, num_targets=self.num_target_blocks, scale=self.target_scale,
                                        aspect=self.target_aspect, scan_order=encoder.scan_order)
         ramp = {}

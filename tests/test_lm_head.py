@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import attending
 from reference_error import assert_as_exact
 
 from dew.batch import TEXT_KEY, VALID_ROWS
@@ -36,11 +37,12 @@ def head_scored(vocab: int, **options):
     """A two-layer decoder whose untied head spans `vocab` columns, and two
     9-token rows of its ids, for the tests that count the head's products."""
     model = CausalTransformer(vocab_size=vocab, emb_features=24, num_layers=2, num_heads=2, mlp_features=32,
-                              max_seq_len=8, tie_embeddings=False, qk_norm=False, attention_impl="reference",
+                              max_seq_len=8, tie_embeddings=False, qk_norm=False,
                               **options)
     return model, jax.random.randint(jax.random.key(1), (2, 9), 0, vocab)
 
 
+@attending("reference")
 def test_a_head_that_is_no_matrix_is_never_fused():
     """A head past a nonlinear transform is no one matrix (`chunked.head_table`), so a training step
     tiles it unfused, its program says so once traced, and the fit ladder has no rung to unfuse."""
@@ -54,6 +56,7 @@ def test_a_head_that_is_no_matrix_is_never_fused():
     assert objective.unfuse_head() is None
 
 
+@attending("reference")
 def test_a_head_put_back_unfused_stays_so_whatever_decoder_was_traced_before():
     """A record's unfused rung, put back (`climb_to`) on a decoder the objective has not traced,
     holds once the decoder's head turns out to be one matrix: a head whose transform was traced, then
@@ -74,6 +77,7 @@ def test_a_head_put_back_unfused_stays_so_whatever_decoder_was_traced_before():
     assert not objective.program_key()[0].head_fused and objective.unfuse_head() is None
 
 
+@attending("reference")
 def test_a_decoder_put_back_keeps_what_its_trace_found_of_its_head():
     """Each decoder a loss traced keeps what that trace found of its head, so a decoder put back
     after another was traced, as a half-rung probe that missed puts its decoder back, is still no
@@ -95,6 +99,7 @@ def test_a_decoder_put_back_keeps_what_its_trace_found_of_its_head():
 
 
 
+@attending("reference")
 def test_a_decoder_set_in_its_objectives_place_is_read_as_one_matrix_before_any_trace():
     """An objective whose traced decoder's head was no matrix (`program_key` stating no tile) and whose
     decoder a caller then sets anew, one matrix, as a checkpoint's ranking swaps a model in, states its
@@ -118,6 +123,7 @@ HEAD_STEP_SEEDS = 16
 and gradients (`seeds_for`, paired)."""
 
 
+@attending("reference")
 def test_a_prediction_applies_the_head_once_and_scores_the_logits_it_returns():
     """A teacher's or a student's prediction (`LMObjective.predict`) holds the
     whole logits, and scores its losses from them: its forward contracts the
@@ -168,6 +174,7 @@ def test_a_prediction_applies_the_head_once_and_scores_the_logits_it_returns():
                         seeds=PREDICTION_SEEDS, truth_fn=scored(wide))
 
 
+@attending("reference")
 @pytest.mark.parametrize("tile_tokens", [4, 16])
 def test_a_training_steps_tiled_head_contracts_the_vocabulary_three_times_and_matches_the_tiled_head(
         tile_tokens):
@@ -223,6 +230,7 @@ def test_a_training_steps_tiled_head_contracts_the_vocabulary_three_times_and_ma
                             truth_fn=stepped(wide, training=False))
 
 
+@attending("reference")
 def test_a_batch_that_marks_its_real_rows_keeps_the_fused_head_and_counts_each_real_row_once():
     """A batch that marks its real rows (`VALID_ROWS`), as every batch of a run on the examples clock does
     and a filled short batch does, keeps the fused head (`fused_head_loss`: the vocabulary contracted three

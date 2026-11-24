@@ -22,7 +22,6 @@ from dew.interop.layouts import Unwritable
 from dew.interop.pretrained import Pretrained, with_overrides
 from dew.interop.releases import HeadFiles
 from dew.interop.safetensors_io import LazyTensors
-from dew.nn.attention import AttentionImpl
 from dew.registry import dtype_name, from_record, import_path
 
 from .calibration import Calibration
@@ -178,7 +177,7 @@ class SlotHeadSource(HeadComponent):
     def axes(self, head: nn.Module, backbone: Pretrained) -> dict[tuple[str, ...], tuple[str | None, ...]]:
         return head_axes(head, backbone)
 
-    def build(self, backbone: Pretrained | None, dtype: str, attention_impl: AttentionImpl, *,
+    def build(self, backbone: Pretrained | None, dtype: str, *,
               shapes: Mapping[str, tuple[int, ...]] | None) -> Head:
         if backbone is None:
             raise ValueError("a slot readout needs its native backbone")
