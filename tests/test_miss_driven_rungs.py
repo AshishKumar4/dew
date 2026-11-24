@@ -1,9 +1,7 @@
 """A fit search reads its first miss's live set (`jax.stages.Compiled.peak_live`) to choose what it asks
-next (row 12463): the joined Newton-Schulz stacks parted first only where their copies could cover what the
-step was short of, else after the remat rungs, and the remat rung whose dropped values cover it asked first.
-A 4B decision step on 2 x H100 asked the stacks' release for 0.1 GB of a 9.9 GB shortfall, 290 s a compile,
-before climbing one rung at a time. Compiled for compile-only H100s on the CPU, never run; each search read
-by the probes its plan or refusal records."""
+next (row 12463): the remat rung whose dropped values cover what the step was short of asked first. A 4B
+decision step on 2 x H100 climbed one rung at a time. Compiled for compile-only H100s on the CPU, never
+run; each search read by the probes its plan or refusal records."""
 
 import jax
 import numpy as np
@@ -13,7 +11,7 @@ from dew.lora import LoRA
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
 from dew.nn.kernels.generation import compile_only_gpus
 from dew.objectives.lm import LMObjective
-from dew.optim import Adam, Muon, OptimConfig
+from dew.optim import Adam, OptimConfig
 from dew.registry import models
 from dew.training import Layout, MeshSpec, Trainer
 from dew.training.ahead import AheadOfTime, compile_ahead
@@ -42,19 +40,6 @@ def _needed(ahead: AheadOfTime) -> int:
     gpu = compile_only_gpus("sm90", 1, 2 ** 34)[0]
     beside = ahead.output_bytes - ahead.alias_bytes
     return least_limit(gpu, [(ahead.argument_bytes, beside, ahead.temp_bytes)])
-
-
-def test_a_miss_whose_joined_stacks_hold_less_than_it_was_short_of_parts_them_after_the_remat_rungs():
-    """A step that misses its devices, whose joined Newton-Schulz stacks hold less at its peak than it was
-    short of, asks no compile parting them (which frees at most their copies) before the remat rungs: it
-    climbs them first, and, where none fits, parts the stacks after them before it refuses the step."""
-    model = models.build("causal_transformer", vocab_size=1024, emb_features=512, num_layers=2, num_heads=8,
-                         num_kv_heads=2, head_dim=64, mlp_features=2048, max_seq_len=512, dtype="bfloat16",
-                         attention_impl="xla")
-    ahead, probes = _ahead(model, Muon(), 512, 16, 2 ** 27)
-    climbed = next(at for at, probe in enumerate(probes) if probe["remat"] is not None)
-    assert all(probe["ns_group"] is None for probe in probes[:climbed]), probes
-    assert ahead is not None or any(probe["ns_group"] == 1 for probe in probes), probes
 
 
 @pytest.mark.parametrize("stack", ["plain", "scanned", "rows"])

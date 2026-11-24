@@ -38,7 +38,6 @@ from dew.data.dataset import rows_of
 from dew.distributed.host import snapshot
 from dew.distributed.placement import Layout, MeshSpec, Placement, explicit_axes, placed_bytes
 from dew.mesh import LayoutRefused
-from dew.newton_schulz import JOINED_SCOPE
 from dew.nn.kernels.options import (
     OuterProgram,
     compiler_options,
@@ -732,14 +731,6 @@ def compiled_key(lowered: jax.stages.Lowered, options: jax.stages.CompilerOption
     return ExecutableKey(program_key(lowered), repr(sorted((options or {}).items())), tuple(devices))
 
 
-JOINED_SHARE = 4
-"""The part of a start's shortfall the joined Newton-Schulz stacks' values its miss's live set names
-(`JOINED_SCOPE`) must hold for their release to be asked before the remat rungs: a quarter, below which
-the release is deferred behind them (`FitSearch.searched`). The set names their copies but not every value
-fused past the scope, so a share near the shortfall can fit parted (a Muon step that fits only with its
-stacks parted, tests/test_plan.py); a 4B decision step's 0.1 GB of a 9.9 GB shortfall, 1%, could not
-(row 12463)."""
-
 HeldExecutables = CodeBounded[ExecutableKey, jax.stages.Compiled]
 """The executables a run's searches hold for each other and its refits (`FitSearch.executables`), by key
 (`compiled_key`), each charged its device code (`code_bytes`) within the run's bound (`CodeBounded`): each let
@@ -1332,9 +1323,8 @@ class FitSearch[LossT, EffectsT]:
         where its updates join Newton-Schulz stacks its run states no group for (`Candidate.joins`), the same
         rung joining one at a time, its copies released (up to 11.3 GB at a 4B step's peak for 82 ms a step,
         row 5669, where a remat rung recomputes its forward; row 5889), kept only where that brought it nearer
-        (`freed`), asked first where the copies at the start's peak could cover what it was short of on any
-        process, else after the remat rungs, at the last of them asked (`parted`); then each remat rung of the
-        ladder at the run's own head and options, the narrow copies as the start held them, least
+        (`freed`, `parted`); then each remat rung of the ladder at the run's own head and options, the narrow
+        copies as the start held them, least
         recomputation first (`recomputing`), the rung every process's miss reads as dropping what it was short
         of first (`by_shortfall`): a tight start's next compile is
         the rung that recomputes the activations its miss was short of (owner, 2026-11-21: a GH200's 4B
@@ -1361,28 +1351,16 @@ class FitSearch[LossT, EffectsT]:
             return walked(candidates, 0, self.fits_here, after)
 
         narrow, ns_group = self.narrow, self.ns_group
-        # The least the start fell short by, and its live set: what each release and rung would free of it.
+        # The least the start fell short by, and its live set: what each remat rung would free of it.
         missed = self.short(named[0])
-        joins = ns_group is None and any(candidate.joins for candidate in self.lowered.values())
-        # Parting the joined stacks frees their copies and what their joined iteration holds beside them,
-        # which the live set tells only in part (values fused past the scope carry another op's name): asked
-        # first unless what the miss names of them, some, holds a small part of what the start was short of
-        # on every process (`JOINED_SHARE`); where a miss read no live set or names none of them, first;
-        # else behind the remat rungs (`parted`), never dropped. Every process reads the one answer.
-        joined = None if missed is None else missed[1].scoped_bytes(JOINED_SCOPE)
-        covers = any(self.gather(missed is None or not joined or JOINED_SHARE * joined >= missed[0]))
-        deferred = joins and not covers
-        if deferred and missed is not None:
-            _log.warning("the step's joined Newton-Schulz stacks hold %d bytes at its peak, short of the %d "
-                         "it missed by: it climbs the remat rungs first, parting them after",
-                         missed[1].scoped_bytes(JOINED_SCOPE), missed[0])
-        if joins and not deferred:
+        if ns_group is None and any(candidate.joins for candidate in self.lowered.values()):
+            # Parting the joined stacks frees their copies and what their joined iteration holds beside
+            # them, which a miss's live set does not name (XLA's fusions carry other ops' names): asked first.
             split, ns_group = self.parted(start, ask)
             if split is not None:
                 self.said(named)
                 return split
         ordered, read = self.by_shortfall(self.recomputing(start, narrow, ns_group), missed)
-        last = start
         for rung in ordered:
             if rung in self.asked:
                 continue
@@ -1390,14 +1368,8 @@ class FitSearch[LossT, EffectsT]:
             if split is not None:
                 self.said(named)
                 return split
-            last = rung
             if rung == read:
                 self.moved(rung, missed)
-        if deferred:
-            split, ns_group = self.parted(last, ask)
-            if split is not None:
-                self.said(named)
-                return split
         if narrow and any(candidate.copies for candidate in self.lowered.values()):
             # The narrow copies, two bytes a parameter held all run for 1-2% of a step, dropped at the start's
             # rung where no recomputation fits with them.
@@ -1417,16 +1389,6 @@ class FitSearch[LossT, EffectsT]:
                 _log.warning("the step's narrow copies free nothing it needs: it keeps them and climbs on")
         rungs = [rung for group in self.ladder(start, narrow, ns_group, remat_set=self.remat_set,
                                                defaults=self.own_defaults()) for rung in group]
-        if deferred:
-            # Their release deferred, every rung parting the stacks stays a rung the search asks before it
-            # refuses the step, the start's own among them (the ladder leaves the start out), with and
-            # without the narrow copies where its step reads them: one missed by less than the last remat
-            # rung's miss may fit parted where that one did not.
-            copies = start.narrow and any(candidate.copies for candidate in self.lowered.values())
-            for held in dict.fromkeys((narrow, *((not narrow,) if copies else ()))):
-                rungs.append(dataclasses.replace(start, narrow=held, ns_group=1))
-                rungs += [rung for group in self.ladder(start, held, 1, remat_set=self.remat_set,
-                                                        defaults=self.own_defaults()) for rung in group]
         for rung in rungs:
             if rung in self.asked:
                 continue
@@ -1475,10 +1437,9 @@ class FitSearch[LossT, EffectsT]:
         return tuple(found)
 
     def parted(self, at: Rung, ask: Callable[[Rung, str], int | None]) -> tuple[int | None, int | None]:
-        """The joined stacks parted at `at` (`searched`): the start, or, where their release was deferred
-        behind the remat rungs, the last of those the climb asked, at which the step misses by less than at
-        its start, which their copies may cover. The split it fits at, None where it does not; and the group
-        the rungs after it ask: one at a time where parting brought it nearer (`freed`), else joined."""
+        """The joined stacks parted at `at`, the search's start (`searched`): the split it fits at, None
+        where it does not; and the group the rungs after it ask: one at a time where parting brought it
+        nearer (`freed`), else joined."""
         self.at(at)
         kept = self.rung()
         split = ask(dataclasses.replace(at, ns_group=1), "the step does not fit the devices with its "

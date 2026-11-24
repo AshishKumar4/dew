@@ -903,10 +903,6 @@ class LiveSet:
                    if op_name.split("/")[1:2] and op_name.split("/")[1].startswith("jvp(")
                    and dropped(op_name, names))
 
-    def scoped_bytes(self, scope: str) -> int:
-        """The bytes of its values made within the name scope `scope` (`jax.named_scope`)."""
-        return sum(size for size, op_name, _ in self.made if f"/{scope}/" in f"/{op_name}/")
-
 
 def fits_everywhere(read: Callable[[], int | None]) -> tuple[bool, int | None]:
     """Whether every process's headroom, which each `read`s of its own devices alone (a compile's measure),

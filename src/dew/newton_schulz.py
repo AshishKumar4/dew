@@ -88,12 +88,6 @@ def released(group: int | None) -> Iterator[None]:
         _RELEASED.reset(token)
 
 
-JOINED_SCOPE = "newton_schulz_joined"
-"""The name scope a joined set of stacks is copied and iterated under, which the `op_name` of each value it
-makes carries: what a plan's release of them parts (`released`), which a fit search reads a miss's live set
-by (`dew.training.planning.FitSearch.searched`)."""
-
-
 @contextlib.contextmanager
 def joining() -> Iterator[list[bool]]:
     """Within the block, a list holding True once a trace joined two or more stacks of one shape where its
@@ -212,10 +206,8 @@ def _spread_orthogonalized(updates, *, numbers, coeffs, steps: int, eps: float,
             (index,) = members
             done[index] = stacks[index][1](iterated(stacks[index][0]))
             continue
-        # Named, so a compile's live set tells the joined copies (`JOINED_SCOPE`).
-        with jax.named_scope(JOINED_SCOPE):
-            joined = jnp.concatenate([stacks[index][0] for index in members])
-            orthogonal = iterated(jnp.pad(joined, ((0, -joined.shape[0] % devices), (0, 0), (0, 0))))
+        joined = jnp.concatenate([stacks[index][0] for index in members])
+        orthogonal = iterated(jnp.pad(joined, ((0, -joined.shape[0] % devices), (0, 0), (0, 0))))
         starts = np.cumsum([0, *(stacks[index][0].shape[0] for index in members)])
         for index, start, end in zip(members, starts[:-1], starts[1:], strict=True):
             done[index] = stacks[index][1](orthogonal[start:end])
