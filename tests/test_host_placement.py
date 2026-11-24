@@ -270,8 +270,8 @@ def test_a_host_resident_routed_step_fetches_each_layers_experts_alone():
     assert kernels and all(len(shape) == 4 for shape in kernels)
 
     def loss(params):
-        return scanned.apply({**on_host, "params": params}, tokens, train=True,
-                             rngs={"dropout": jax.random.key(1)}).sum()
+        return jnp.asarray(scanned.apply({**on_host, "params": params}, tokens, train=True,
+                                         rngs={"dropout": jax.random.key(1)})).sum()
 
     graph = jax.make_jaxpr(jax.grad(loss))(on_host["params"])
     fetches = {tuple(operand.aval.shape) for equation in equations(graph)

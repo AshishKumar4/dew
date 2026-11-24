@@ -515,75 +515,83 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
             # and the call's metadata alone (`_updated_in_backward`).
             x = _updated_in_backward(run, x, attention_metadata=attention_metadata, remat=remat)
         else:
-            # A longer run's layers share keys or own them, so they only read the store: a provider
-            # is always a run of one (`run_stack`).
-            # The layers the run holds a row each (`LAYER_ROWS`) are closed over whole, each iteration
-            # reading its row in place, by the iteration's index, into the collections they join
-            # (`_rows_joined`), recomputed in the backward (`_rows_recomputed`); every other collection
-            # scans its stacked layers.
-            rows = tuple(run.variables.get(LAYER_ROWS, {}))
-            repeats = count // len(run.specs) if periodic else count
-            # A served quantized run's scales read as the unrolled stack reads them (`held_scales`).
-            quantized = (not run.is_mutable_collection('params')
-                         and holds_quantized(run.variables.get('params', {})))
-            # A run whose params it reads alone (a decode, an evaluation) hands its experts' kernels to each
-            # iteration whole beside its index, which the grouped matmul reads in place
-            # (`dew.nn.moe.Layered`), as a bank's run does (`_apart`): sliced by the scan, each layer's
-            # experts were copied out every step, 45% of a Qwen3-30B-A3B decode step on an H100 (row 1346).
-            # A fetched run's kernels lie in host memory, of which each iteration fetches its layer's alone
-            # (`fetched`): handed whole, every iteration would copy every layer's to the device.
-            experts = (not quantized and not fetching and not run.is_mutable_collection('params')
-                       and holds_experts(run.variables.get('params', {})))
-            whole = tuple(name for name, held in ((LAYER_ROWS, rows), (BANKED_EXPERTS, experts)) if held)
-
-            policy = _rows_recomputed(remat)
-
-            def scanned(layer, carry, index, *, store=store, step=step, rows=rows, inputs=inputs,
-                        policy=policy, quantized=quantized, experts=experts):
-                # The iteration's per-layer input, its layers along axis 2.
-                per_layer_input = jax.tree.map(
-                    lambda leaf: jax.lax.dynamic_index_in_dim(leaf, index, axis=2, keepdims=False), inputs)
-
-                def layered(layer, carry):
-                    return step(layer, carry, per_layer_input, store)[0]
-
-                if experts:
-                    layered = nn.map_variables(layered, (BANKED_EXPERTS,), init=False, mutable=False,
-                                               trans_in_fn=functools.partial(at_iteration, layer=index))
-
-                if quantized:
-                    # Its layer's params, sliced from the stacked rows: each scale held there alone.
-                    layered = nn.map_variables(layered, 'params', init=False, mutable=False,
-                                               trans_in_fn=held_scales)
-                if not rows:
-                    return layered(layer, carry), None
-
-                def read(layer, carry, index):
-                    return nn.map_variables(layered, (LAYER_ROWS, *rows), init=False, mutable=False,
-                                            trans_in_fn=functools.partial(_rows_joined, index=index))(
-                        layer, carry)
-                # Under no scope of its own: the rows' policy keeps what a rung keeps by its names, every
-                # product besides under none or one recomputing named residuals (`_rows_recomputed`), each
-                # value a rung's to keep or drop as a block's; the rows it read it never keeps.
-                rematted = nn.remat(read, policy=policy, prevent_cse=False)
-                return rematted(layer, carry, index), None
-            # A parameter its module boxed (`nn.with_logical_partitioning`) stacks with an unnamed layer
-            # axis, which the run's view cuts off again per layer (`_rows`). A decode step's rows it
-            # broadcasts exist before the scan and it outputs nothing broadcast, so flax's trace of its body
-            # for what it broadcasts is not taken (`check_constancy_invariants`): that check refuses a body
-            # holding an effect that reads the carry, an interpreted launch's (row 12077: a quantized paged
-            # step). Every other call keeps it, whose trace its random streams advance through, so an init
-            # draws as it did.
-            scanning = nn.scan(scanned, variable_axes={nn.DenyList(whole) if whole else True: 0},
-                               variable_broadcast=whole or False, split_rngs={True: True},
-                               length=repeats, metadata_params={nn.PARTITION_NAME: None},
-                               check_constancy_invariants=not decode)
-            if experts:
-                # The expert kernels moved out of the scanned params into the collection it broadcasts.
-                scanning = nn.map_variables(scanning, ('params', BANKED_EXPERTS), init=False, mutable=False,
-                                            trans_in_fn=experts_apart)
-            x, _ = scanning(run, x, jnp.arange(repeats))
+            x = _scanned_run(run, x, step, store, inputs, count=count, periodic=periodic, fetching=fetching,
+                             decode=decode, remat=remat)
     return x
+
+
+def _scanned_run(run: nn.Module, x, step: Callable, store, inputs, *, count: int, periodic: bool,
+                 fetching: bool, decode: bool, remat: RematPolicy | None):
+    """A run of `count` like layers (a periodic run's repeats of its period) under flax's scan, each
+    iteration calling `step` on its layer (`_scanned_runs`)."""
+    # A longer run's layers share keys or own them, so they only read the store: a provider
+    # is always a run of one (`run_stack`).
+    # The layers the run holds a row each (`LAYER_ROWS`) are closed over whole, each iteration
+    # reading its row in place, by the iteration's index, into the collections they join
+    # (`_rows_joined`), recomputed in the backward (`_rows_recomputed`); every other collection
+    # scans its stacked layers.
+    rows = tuple(run.variables.get(LAYER_ROWS, {}))
+    repeats = count // len(run.specs) if periodic else count
+    # A served quantized run's scales read as the unrolled stack reads them (`held_scales`).
+    quantized = (not run.is_mutable_collection('params')
+                 and holds_quantized(run.variables.get('params', {})))
+    # A run whose params it reads alone (a decode, an evaluation) hands its experts' kernels to each
+    # iteration whole beside its index, which the grouped matmul reads in place
+    # (`dew.nn.moe.Layered`), as a bank's run does (`_apart`): sliced by the scan, each layer's
+    # experts were copied out every step, 45% of a Qwen3-30B-A3B decode step on an H100 (row 1346).
+    # A fetched run's kernels lie in host memory, of which each iteration fetches its layer's alone
+    # (`fetched`): handed whole, every iteration would copy every layer's to the device.
+    experts = (not quantized and not fetching and not run.is_mutable_collection('params')
+               and holds_experts(run.variables.get('params', {})))
+    whole = tuple(name for name, held in ((LAYER_ROWS, rows), (BANKED_EXPERTS, experts)) if held)
+
+    policy = _rows_recomputed(remat)
+
+    def scanned(layer, carry, index, *, store=store, step=step, rows=rows, inputs=inputs,
+                policy=policy, quantized=quantized, experts=experts):
+        # The iteration's per-layer input, its layers along axis 2.
+        per_layer_input = jax.tree.map(
+            lambda leaf: jax.lax.dynamic_index_in_dim(leaf, index, axis=2, keepdims=False), inputs)
+
+        def layered(layer, carry):
+            return step(layer, carry, per_layer_input, store)[0]
+
+        if experts:
+            layered = nn.map_variables(layered, (BANKED_EXPERTS,), init=False, mutable=False,
+                                       trans_in_fn=functools.partial(at_iteration, layer=index))
+
+        if quantized:
+            # Its layer's params, sliced from the stacked rows: each scale held there alone.
+            layered = nn.map_variables(layered, 'params', init=False, mutable=False,
+                                       trans_in_fn=held_scales)
+        if not rows:
+            return layered(layer, carry), None
+
+        def read(layer, carry, index):
+            return nn.map_variables(layered, (LAYER_ROWS, *rows), init=False, mutable=False,
+                                    trans_in_fn=functools.partial(_rows_joined, index=index))(
+                layer, carry)
+        # Under no scope of its own: the rows' policy keeps what a rung keeps by its names, every
+        # product besides under none or one recomputing named residuals (`_rows_recomputed`), each
+        # value a rung's to keep or drop as a block's; the rows it read it never keeps.
+        rematted = nn.remat(read, policy=policy, prevent_cse=False)
+        return rematted(layer, carry, index), None
+    # A parameter its module boxed (`nn.with_logical_partitioning`) stacks with an unnamed layer
+    # axis, which the run's view cuts off again per layer (`_rows`). A decode step's rows it
+    # broadcasts exist before the scan and it outputs nothing broadcast, so flax's trace of its body
+    # for what it broadcasts is not taken (`check_constancy_invariants`): that check refuses a body
+    # holding an effect that reads the carry, an interpreted launch's (row 12077: a quantized paged
+    # step). Every other call keeps it, whose trace its random streams advance through, so an init
+    # draws as it did.
+    scanning = nn.scan(scanned, variable_axes={nn.DenyList(whole) if whole else True: 0},
+                       variable_broadcast=whole or False, split_rngs={True: True},
+                       length=repeats, metadata_params={nn.PARTITION_NAME: None},
+                       check_constancy_invariants=not decode)
+    if experts:
+        # The expert kernels moved out of the scanned params into the collection it broadcasts.
+        scanning = nn.map_variables(scanning, ('params', BANKED_EXPERTS), init=False, mutable=False,
+                                    trans_in_fn=experts_apart)
+    return scanning(run, x, jnp.arange(repeats))[0]
 
 
 def _updates_in_backward(run: nn.Module, specs: Sequence[LayerSpec], *, train: bool, decode: bool,
