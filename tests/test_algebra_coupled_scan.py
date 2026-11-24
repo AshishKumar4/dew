@@ -184,8 +184,9 @@ def test_a_replays_decay_beneath_float32s_least_normal_keeps_its_product_and_der
 
 def test_a_pair_takes_float64_decays_beside_float32_operands():
     """ReviewMomentum1454's mixed widths: under x64 a pair's chunk forms and replay over float64 log decays
-    beside float32 keys, values and gates walk and replay their chunks, their outputs and pair float64, where
-    the decayed sums' carries typed as the gates' float32 refused the scan."""
+    beside float32 keys, values and gates walk and replay their chunks, their outputs and the pairs their
+    walks carry float64 (the final pair the declared float32's, `Derived.finish`), where the decayed sums'
+    carries typed as the gates' float32 refused the scan."""
     with jax.enable_x64(new_val=True):
         forms = scan.derive_scan(DECLARED, saturation=SATURATION)
         tokens = dict(zip(OPERANDS, draws(packed=True)(0), strict=True))
@@ -193,4 +194,4 @@ def test_a_pair_takes_float64_decays_beside_float32_operands():
         outputs, final = walked(forms)(*tokens.values())
         replayed, leaving = forms.replay({name: value[:CHUNK] for name, value in tokens.items()},
                                          jnp.zeros((2, STATE, WIDTH), jnp.float32))
-    assert {x.dtype for x in (outputs, final, replayed, leaving)} == {jnp.dtype(jnp.float64)}
+    assert [x.dtype for x in (outputs, replayed, leaving, final)] == [jnp.float64] * 3 + [jnp.float32]
