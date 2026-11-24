@@ -1526,9 +1526,12 @@ class ExpertMLP(nn.Module):
         hidden_rows: list[jax.Array] = []
 
         def observed() -> tuple[jax.Array, ...]:
-            read = admitted_amax(tokens, sizes, dtype) if delayed else None
+            held = [layer for layer in layers if layer.history is not None]
+            if not held:
+                return ()
+            read = admitted_amax(tokens, sizes, dtype)
             return tuple(admitted_amax(hidden_rows[0], sizes, dtype) if layer is layers[-1] else read
-                         for layer in layers if layer.history is not None)
+                         for layer in held)
 
         def linear(x: jax.Array | Gathered, kernel: jax.Array, scatter: jax.Array | None = None,
                    tensor_scale: jax.Array | None = None) -> jax.Array:

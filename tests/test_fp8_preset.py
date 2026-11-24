@@ -842,6 +842,18 @@ def test_a_delayed_nvfp4_dense_reads_its_history_and_records_its_rows(general):
         assert NVFP4_HISTORY not in layer.init(jax.random.key(0), x)
 
 
+def _summed_recording(module, held, *args):
+    """`module`'s outputs summed in fp32 over `held` with its params given, the largest magnitudes its
+    delayed-scaling NVFP4 projections record beside it (`dense.NVFP4_AMAX`): a loss its gradient reads."""
+    from dew.nn.dense import NVFP4_AMAX
+
+    def loss(params, *args):
+        out, sown = module.apply({**held, "params": params}, *args, mutable=[NVFP4_AMAX])
+        return jnp.sum(out.astype(jnp.float32)), sown
+
+    return loss
+
+
 def test_a_delayed_nvfp4_models_every_taken_projection_reads_its_own_history():
     """Under a delayed-scaling NVFP4 recipe (row 12721), a model's every projection the recipe takes holds an
     amax history, one a route taken (`generation.routes`): its attention's projections (joined or not: a
@@ -857,11 +869,7 @@ def test_a_delayed_nvfp4_models_every_taken_projection_reads_its_own_history():
         variables = model.init(jax.random.key(0), tokens)
         held = {name: tree for name, tree in variables.items() if name != NVFP4_AMAX}
 
-        def loss(params):
-            logits, sown = model.apply({**held, "params": params}, tokens, mutable=[NVFP4_AMAX])
-            return jnp.sum(logits.astype(jnp.float32)), sown
-
-        _, sown = jax.grad(loss, has_aux=True)(held["params"])
+        _, sown = jax.grad(_summed_recording(model, held), has_aux=True)(held["params"], tokens)
         # The forward's routes, one a projection the recipe considers.
         with generation.routes() as found:
             jax.eval_shape(lambda params: model.apply({**held, "params": params}, tokens), held["params"])
@@ -974,11 +982,8 @@ def test_a_delayed_nvfp4_gated_mlp_trains_each_projection_on_its_own_history():
         variables = layer.init(jax.random.key(0), x)
         held = {key: tree for key, tree in variables.items() if key != NVFP4_AMAX}
 
-        def loss(params, x):
-            out, sown = layer.apply({**held, "params": params}, x, mutable=[NVFP4_AMAX])
-            return jnp.sum(out.astype(jnp.float32)), sown
-
-        (value, sown), grads = jax.value_and_grad(loss, argnums=(0, 1), has_aux=True)(held["params"], x)
+        (value, sown), grads = jax.value_and_grad(_summed_recording(layer, held), argnums=(0, 1),
+                                                  has_aux=True)(held["params"], x)
     histories = jax.tree_util.tree_flatten_with_path(held[NVFP4_HISTORY])[0]
     recorded = jax.tree_util.tree_flatten_with_path(sown[NVFP4_AMAX],
                                                     is_leaf=lambda leaf: isinstance(leaf, tuple))[0]
