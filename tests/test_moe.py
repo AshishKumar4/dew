@@ -664,9 +664,10 @@ def test_a_gated_expert_layer_is_bitwise_its_projections_apart(limit):
     cotangent = jax.random.normal(jax.random.key(3), (x.shape[0] * 2, x.shape[1]), jnp.bfloat16)
     ran = [jax.jit(with_gradients(functools.partial(form, limit=limit)))(x, gate, up, down, cotangent)
            for form in (gated, apart)]
-    # The output and each kernel's gradient bitwise; the rows' gradient below.
-    (out, (_, *kernels)), (apart_out, (_, *apart_kernels)) = ran
-    for mine, theirs in zip((out, *kernels), (apart_out, *apart_kernels), strict=True):
+    # The output and each kernel's gradient bitwise (the leaves: output, rows', gate's, up's, down's); the
+    # rows' gradient below.
+    fused, separate = (jax.tree.leaves(each) for each in ran)
+    for mine, theirs in zip([fused[0], *fused[2:]], [separate[0], *separate[2:]], strict=True):
         held = np.asarray(mine), np.asarray(theirs)
         np.testing.assert_array_equal(*(each.view(np.uint16) for each in held))
 
@@ -708,8 +709,10 @@ def test_a_gated_expert_layer_runs_its_chain_on_mosaic_gpu_under_a_declared_swig
         jax.eval_shape(loss, *operands)
     assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"mosaic"}, routes
     bound = [next(iter(call.bound.values()))[1].arguments for call, _ in calls]
-    assert [arguments["hooks"].epilogue is not None for arguments in bound
-            if arguments.get("paired") is not None] == [True], bound
+    # The forward's paired call carries the epilogue; the backward's (the rows' gradient through both stacks)
+    # none.
+    assert sum(arguments["hooks"].epilogue is not None for arguments in bound
+               if arguments.get("paired") is not None) == 1, bound
     depth = operands[0].shape[-1]
     assert any(arguments["hooks"].prologue is not None and arguments["kernel"].shape[-1] == depth
                for arguments in bound), bound
