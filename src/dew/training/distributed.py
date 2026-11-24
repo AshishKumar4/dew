@@ -113,9 +113,10 @@ def link_bandwidth(mesh: Mesh, axis: str, size: int = 1 << 28) -> float:
     # kept for exactly this placement; a record no process can read (another writer's truncated file) is
     # one it does not see, never an error one process raises while its peers wait in the gather.
     kept = None if record is None else read_kept(record)
-    figure = (kept["bytes_per_second"] if isinstance(kept, dict) and kept.get("topology") == topology
-              and isinstance(kept.get("bytes_per_second"), int | float) else None)
-    if all(from_every_process(figure is not None)):
+    ours = isinstance(kept, dict) and kept.get("topology") == topology
+    figure = kept.get("bytes_per_second") if ours and isinstance(kept, dict) else None
+    if all(from_every_process(isinstance(figure, int | float))):
+        assert isinstance(figure, int | float)
         return min(from_every_process(float(figure)))
     ways = mesh.shape[axis]
     count = size // 4 // ways * ways
