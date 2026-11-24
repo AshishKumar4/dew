@@ -312,18 +312,18 @@ def test_a_chunks_faint_system_weight_keeps_what_a_large_input_raises():
 
 def test_a_chunks_faint_overlap_keeps_what_a_large_input_raises():
     """ReviewMomentum1454's faint overlap (row 12693): two tokens, the first's key along the second key plus
-    2^-75 along the first and its erase key along the third, the second's key along the second key and its
-    erase key along the third plus 2^-75 along the first, values -2^100 and none, every decay and gate one,
-    queries along the second key: the chunked op is the decode step, where the second erase key's overlap
-    with the first key, 2^-150, rounded to zero before the first token's input of 2^100 raised it to the
-    second's -2^-50."""
-    rows = jnp.eye(3, dtype=jnp.float32)
-    keys = jnp.stack([rows[1] + 2.0 ** -75 * rows[0], rows[1]])[None, :, None]
+    2^-75 along the first and its erase key along the third, the second's key along the fourth and its erase
+    key along the third plus 2^-75 along the first, values -2^100 and none, every decay and gate one, queries
+    along the fourth key: the chunked op is the decode step, its second output 2^-50, where the second
+    erase key's overlap with the first key, 2^-150, rounded to zero before the first token's input of 2^100
+    raised it."""
+    rows = jnp.eye(4, dtype=jnp.float32)
+    keys = jnp.stack([rows[1] + 2.0 ** -75 * rows[0], rows[3]])[None, :, None]
     erase = jnp.stack([rows[2], rows[2] + 2.0 ** -75 * rows[0]])[None, :, None]
     value = jnp.asarray([-(2.0 ** 100), 0.0], jnp.float32).reshape(1, 2, 1, 1)
     gates = jnp.ones((1, 2, 1), jnp.float32)
-    assert_chunks_are_the_decode_steps(along(2, 3, 1), keys, erase, value, gates, jnp.zeros_like(gates),
-                                       pair(0.0, 0.0, keys=3))
+    assert_chunks_are_the_decode_steps(along(2, 4, 3), keys, erase, value, gates, jnp.zeros_like(gates),
+                                       pair(0.0, 0.0, keys=4))
 
 
 def test_a_chunk_solves_its_inputs_with_no_float_solver():
