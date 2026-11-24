@@ -14,6 +14,7 @@ backward does."""
 import dataclasses
 import functools
 import math
+from collections.abc import Callable
 from typing import Any, ClassVar
 
 import jax
@@ -954,6 +955,13 @@ class Selective(base.Template[Tiles]):
 
     def legal(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> bool:
         return super().legal(ba, config, self._facts(ba, target))
+
+    def proposes(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget, *,
+                 held: Callable[[], bool] | None = None) -> bool:
+        """`Template.proposes` under the facts the call's launches run by (`_facts`), as `legal` reads
+        them: an interpreted call's register model under the interpreted target's, where the device's ran it
+        under a TPU's, which has no multiprocessor (rows 12453, 12467)."""
+        return super().proposes(ba, config, self._facts(ba, target), held=held)
 
     def registers(self, ba: tokamax.BoundArguments, config: Tiles) -> int | None:
         """The backward thread's registers at the config's tokens (`backward_registers`)."""
