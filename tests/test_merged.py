@@ -405,7 +405,7 @@ def test_a_padded_merge_compiles_as_one_launch(name, cases):
         assert kernels[0]["spilled"] == 0 and kernels[0]["shared"] == 0, record
 
 @COMPILES_ON_CPU
-@pytest.mark.parametrize("where", [*sorted(merged.MOSAIC_SLOWER), "mosaic"])
+@pytest.mark.parametrize("where", [*sorted(merged.MOSAIC_SLOWER), "hooked", "pinned"])
 def test_a_padded_merge_lowers_on_triton_where_mosaic_measured_slower(where):
     """Rows 9795, 12398: the generations where Mosaic GPU's merge measured slower (`merged.MOSAIC_SLOWER`,
     an A100's and a GH200's) merge on Pallas Triton's launch, as their compiled executables carry it: a
@@ -413,7 +413,8 @@ def test_a_padded_merge_lowers_on_triton_where_mosaic_measured_slower(where):
     Pallas Triton refusing), each unhooked as the measured one was. Mosaic serves there a hooked merge (a
     sigmoid output hook) and one whose config is pinned, as its executable carries its kernel; Pallas Triton
     lowers no Mosaic GPU primitive rule's `platform_index`. Each generation's Triton compiles, and the
-    Hopper's Mosaic ones, a case of its own (`where`: the three in one case took 189 s, row 12698)."""
+    Hopper's hooked and pinned Mosaic ones, a case of its own (`where`: together 189 s, the two Mosaic
+    compiles 161 s, row 12698)."""
     from fla_gdn_support import KernelCase
     from jax._src.pallas.mosaic_gpu import core as plgpu_core, lowering as mosaic_lowering
     from jax.extend import core as jcore
@@ -443,7 +444,7 @@ def test_a_padded_merge_lowers_on_triton_where_mosaic_measured_slower(where):
     launches._register_mosaic_gpu_lowerings()
     assert jcore.primitives.platform_index_p not in mosaic_lowering.mosaic_lowering_rules[
         plgpu_core.WGxWG_SEMANTICS]
-    if where != "mosaic":
+    if where in merged.MOSAIC_SLOWER:
         with generation.assumed(where):
             records = compile_kernels([
                 KernelCase("plain", lambda: (plain, (padded, stacked))),
@@ -452,11 +453,13 @@ def test_a_padded_merge_lowers_on_triton_where_mosaic_measured_slower(where):
             assert "error" not in record and sorted(record["thunks"]) == ["merged_padded"], record
         return
     with generation.assumed("sm90"):
-        hooked_records = compile_mosaic_kernels([KernelCase("hooked", lambda: (hooked, small))], "sm90")
-        with tuning.pinned({merged.MergedPadded: merged.MergeConfig(16)}):
-            pinned_records = compile_mosaic_kernels(
-                [KernelCase("pinned", lambda: (plain, (padded, stacked)))], "sm90")
-    for record in (*hooked_records, *pinned_records):
+        if where == "hooked":
+            records = compile_mosaic_kernels([KernelCase("hooked", lambda: (hooked, small))], "sm90")
+        else:
+            with tuning.pinned({merged.MergedPadded: merged.MergeConfig(16)}):
+                records = compile_mosaic_kernels(
+                    [KernelCase("pinned", lambda: (plain, (padded, stacked)))], "sm90")
+    for record in records:
         assert not mosaic_failures([record]), record
         assert [kernel["kernel"] for kernel in record["kernels"]] == ["merged_padded"], record
 
