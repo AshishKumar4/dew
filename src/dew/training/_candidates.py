@@ -28,12 +28,19 @@ from dew.distributed.batches import PREFETCH_DEPTH, batch_shardings, prefetched_
 from dew.distributed.placement import Placement, Validation, allocated_bytes, placed_bytes, placed_shapes
 from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, gpu_mesh
-from dew.nn.kernels.options import held_context, held_until_release, owned_program, program_key
+from dew.nn.kernels.options import (
+    held_context,
+    held_until_release,
+    known_program_key,
+    owned_program,
+    program_key,
+)
 from dew.nn.sharding import Link, Schedule, spread_axes, spread_over
 from dew.state import Accumulation, TrainState, apart, taken, together
 from dew.training._lowering import Routed, kernel_report, routed
 from dew.training.diloco import group_of, windowed
 from dew.training.distributed import microbatch, microbatch_shapes
+from dew.training.memory import resident_on
 from dew.training.model_flops import batch_consumed, batch_tokens
 from dew.training.narrow import holds_copies, narrow_copies, narrowed, state_reads
 from dew.training.planning import Candidate, splits
@@ -204,6 +211,8 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
     states traces its own."""
     # Read as the candidate is made, at the rung the search put the objective at (row 3873).
     stated = stepping.step_key()
+    # What this state's arrays hold where they lie, a step lowered for other devices none of this process's.
+    resident = resident_on(state) if mesh is None else {}
     # What the step traces from beside its arguments and the trainer's settings: the compiles' refusals
     # its kernels' derivation reads (a relowering after a spill reads its proposal's), and the context.
     key = None if stated is None else (
@@ -218,9 +227,9 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
                 # Its links decide as its trace decided them: the key holds their figures (`held_context`).
                 spread_over(kept.spread)
                 sampled = _sampled(stepping, kept, batch, placement, replicated, split, platforms)
-                return dataclasses.replace(kept, sampled=sampled)
-    candidate = _candidate(stepping, state, batch, schedule, placement, replicated, split, narrow,
-                           mesh=mesh, platforms=platforms)
+                return dataclasses.replace(kept, sampled=sampled, resident=resident)
+    candidate = dataclasses.replace(_candidate(stepping, state, batch, schedule, placement, replicated, split,
+                                               narrow, mesh=mesh, platforms=platforms), resident=resident)
     if key is not None:
         # Kept detached from this trainer: its batch as shapes, its inspection's step none (`_sampled`
         # builds the reader's own).
@@ -249,10 +258,10 @@ def forget_program(target: Hashable, lowered: jax.stages.Lowered | None = None) 
     (`dew.training.planning.HeldExecutables`), so no kept lowering holds its device code past that bound,
     or which a guided compile supersedes (`forget`)."""
     with _KEEPING:
-        # A lowering of `lowered`'s trees alone renders its text to compare, where one is given.
-        for key in [key for key, kept in _CANDIDATES.items() if kept.lowered is lowered or (
-                (lowered is None or kept.lowered.in_tree == lowered.in_tree)
-                and program_key(kept.lowered) == target)]:
+        # By the key each kept lowering's program was read under, none rendered here: one whose key no one
+        # read keyed no executable (`known_program_key`).
+        for key in [key for key, kept in _CANDIDATES.items()
+                    if kept.lowered is lowered or known_program_key(kept.lowered) == target]:
             del _CANDIDATES[key]
 
 

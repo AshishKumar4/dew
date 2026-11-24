@@ -75,6 +75,7 @@ from dew.training.cooldown import Branch, Cooldowns
 from dew.training.diloco import regrouped
 from dew.training.evaluation import Declared, EvalSuite, Evaluation, Split, SplitLoss, episodic
 from dew.training.interval import Interval, LogWriter, Taken, TokenClock
+from dew.training.memory import CodeBounded
 from dew.training.model_flops import TOKENS, TRAINING_FLOPS
 from dew.training.observe import Observe
 from dew.training.profiling import ProfileWindow, start_capture, stop_capture
@@ -493,10 +494,12 @@ class FitRun:
     reads: dict[Signature, tuple[bool, ...]] = dataclasses.field(default_factory=dict)
     """Which leaves of a batch of each signature its compiled step reads
     (`step_reads`), which the prefetcher alone places."""
-    compiled: dict[Hashable, tuple] = dataclasses.field(default_factory=dict)
+    compiled: CodeBounded[Hashable, tuple] = dataclasses.field(default_factory=CodeBounded)
     """The step compiled for each batch signature the run met, at each pass count its phases run
     (`Trainer._compile_key`), with its measured FLOPs (`Trainer._compiled_for`), which its cooldown branches
-    step too."""
+    step too: bounded by their device code as the compiler's executables are (`CodeBounded`), each charged
+    the most any process's code for it holds, so every process lets the same steps go and compiles a shape
+    it met again together; the step being run is held by its caller."""
     cooling: Mapping[str, object] | None = None
     """The cooldown branch the run is to run at its current step before it reads on, resolved
     (`dew.training.cooldown.Pending`): one its checkpoints kept unfinished, as the pool agreed it, or

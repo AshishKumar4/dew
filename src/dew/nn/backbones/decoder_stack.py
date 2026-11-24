@@ -32,7 +32,7 @@ from dew._cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.batch import Variables, merge, part, sows_appended
 from dew.mesh import STAGE_AXIS, LayoutRefused, row_axes
 from dew.nn.inspection import QK
-from dew.nn.protocols import StagedStacks
+from dew.nn.protocols import StagedStacks, fixed_remat
 
 from .. import in_backward
 from ..cross_pass import CrossPass
@@ -539,7 +539,9 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
                     return nn.map_variables(layered, (LAYER_ROWS, *rows), init=False, mutable=False,
                                             trans_in_fn=functools.partial(_rows_joined, index=index))(
                         layer, carry)
-                return nn.remat(read, policy=policy, prevent_cse=False)(layer, carry, index), None
+                # Its policy the rows' own, no rung's (`fixed_remat`).
+                rematted = nn.remat(fixed_remat(read), policy=policy, prevent_cse=False)
+                return rematted(layer, carry, index), None
             # A parameter its module boxed (`nn.with_logical_partitioning`) stacks with an unnamed layer
             # axis, which the run's view cuts off again per layer (`_rows`).
             x, _ = nn.scan(scanned, variable_axes={nn.DenyList(LAYER_ROWS) if rows else True: 0},
@@ -603,7 +605,7 @@ def _updated_in_backward(run: nn.Module, x, *, attention_metadata, remat: RematP
                            kv_store=None, per_layer_input=None, attention_metadata=metadata, rngs=rngs)
 
     layer = applied if remat is not None and not remat.recompute else jax.checkpoint(
-        applied, policy=_KEPT_WITHOUT_A_RUNG.checkpoint_policy(), prevent_cse=False)
+        fixed_remat(applied), policy=_KEPT_WITHOUT_A_RUNG.checkpoint_policy(), prevent_cse=False)
 
     return in_backward.scanned_run(
         (*current_component(), *run.path), layer, weights, held.get(in_backward.MASTERS),

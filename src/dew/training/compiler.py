@@ -63,6 +63,7 @@ from dew.training.distributed import (
 from dew.training.memory import (
     ceiling_headroom,
     climb_to,
+    code_bytes,
     layer_gathers,
     local_devices,
     memory_record,
@@ -1482,7 +1483,7 @@ class StepCompiler[L, E]:
             # The guided executable in the unguided one's place, as JAX's jit keeps its program's under
             # AutoPGLE: the one the run steps, the unguided one freed with the search and the step kept
             # for a refit. An empty profile replaces nothing, and every kept lowering stays.
-            self._executables[asked] = planned.executable
+            self._executables.hold(asked, planned.executable, code_bytes(planned.executable))
             forget(unguided)
         return planned
 

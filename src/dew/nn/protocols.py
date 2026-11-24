@@ -37,6 +37,7 @@ callers add flags and absent values.
 from __future__ import annotations
 
 import dataclasses
+import functools
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple, Protocol, Self, runtime_checkable
 
@@ -940,13 +941,34 @@ class Recomputing(Protocol):
     def restore_recompute(self, record: JSON) -> Self: ...
 
 
+RUNG_SCOPE = "dew_rung"
+"""The name scope each decoder block's forward runs under at every rung, none included (`DecoderBlock`): the
+values a remat rung's checkpoint keeps or recomputes by its policy's names, which a compile's live set tells
+by the `op_name` of the op that made each."""
+
+FIXED_SCOPE = "dew_fixed_remat"
+"""The name scope of the body of a checkpoint whose policy no rung sets (`fixed_remat`: a scanned run's rows,
+`dew.nn.backbones.decoder_stack`; an in-backward run's layer; a looped pass, `dew.nn.backbones.looping`):
+values made within it no rung keeps or drops by its names, whatever blocks they sit in."""
+
+
+def fixed_remat[**Given, Value](function: Callable[Given, Value]) -> Callable[Given, Value]:
+    """`function` run under `FIXED_SCOPE`: the body of a checkpoint whose policy no rung sets."""
+    @functools.wraps(function)
+    def marked(*args: Given.args, **kwargs: Given.kwargs) -> Value:
+        with jax.named_scope(FIXED_SCOPE):
+            return function(*args, **kwargs)
+    return marked
+
+
 @dataclasses.dataclass(frozen=True)
 class RecomputeStatement:
     """What a model's remat rung recomputes in place of keeping it, as a compile's live set names it
     (`jax.stages.Compiled.peak_live`): within its blocks (`scope`, a part of the `op_name` of each value its
-    blocks' forward makes), every value `save` names none of where its rung keeps names (`save`, a
-    checkpoint policy keeping those alone: the unnamed ones too), else only the values it names
-    `recompute` (a rung that recomputes those alone and keeps the rest); no remat keeps all."""
+    blocks' forward makes, `RUNG_SCOPE`), but under a checkpoint no rung sets (`FIXED_SCOPE`), every value
+    `save` names none of where its rung keeps names (`save`, a checkpoint policy keeping those alone: the
+    unnamed ones too), else only the values it names `recompute` (a rung that recomputes those alone and
+    keeps the rest); no remat keeps all."""
 
     scope: str
     save: frozenset[str] | None
@@ -954,7 +976,7 @@ class RecomputeStatement:
 
     def drops(self, op_name: str, names: tuple[str, ...]) -> bool:
         """Whether this rung keeps no value made by `op_name` that carries `names` for its backward."""
-        if self.scope not in op_name:
+        if self.scope not in op_name or FIXED_SCOPE in op_name:
             return False
         if self.save is None:
             return bool(self.recompute.intersection(names))

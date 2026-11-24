@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 from dew._records import JSON
 
 from ..mixers import AttentionMixer
-from ..protocols import RecomputeStatement
+from ..protocols import RUNG_SCOPE, RecomputeStatement
 from ..residuals import MLP_RESIDUALS, RESIDUALS
 from .decoder_block import DECODER_REMAT, REMAT_POLICIES, RematPolicy, recomputed_inside, remat_record
 
@@ -54,15 +54,15 @@ def offloaded[D: CausalTransformer](decoder: D) -> D | None:
 
 
 def statement(decoder: CausalTransformer) -> RecomputeStatement:
-    """What the decoder's rung recomputes (`RecomputeStatement`): its layers' forward values, by the names
-    its policy keeps or recomputes; none where it runs no remat."""
+    """What the decoder's rung recomputes (`RecomputeStatement`): its blocks' forward values (`RUNG_SCOPE`,
+    which each block runs under), by the names its policy keeps or recomputes; none where it runs no
+    remat."""
     policy = decoder.remat
-    scope = f"{type(decoder).__name__}.stack/"
     if policy is None:
-        return RecomputeStatement(scope, None)
+        return RecomputeStatement(RUNG_SCOPE, None)
     if policy.recompute:
-        return RecomputeStatement(scope, None, frozenset(policy.recompute))
-    return RecomputeStatement(scope, frozenset(policy.save))
+        return RecomputeStatement(RUNG_SCOPE, None, frozenset(policy.recompute))
+    return RecomputeStatement(RUNG_SCOPE, frozenset(policy.save))
 
 
 def marked_residuals(decoder: CausalTransformer) -> frozenset[str]:

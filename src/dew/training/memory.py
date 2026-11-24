@@ -16,6 +16,8 @@ import json
 import logging
 import math
 import re
+import threading
+from collections import OrderedDict
 from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
 
 import jax
@@ -746,16 +748,110 @@ def step_room(device, resident: int = 0) -> int | None:
     return available(memory, unclaimed(device, memory)) + min(resident, memory.get("bytes_in_use", 0))
 
 
-def resident_on(tree: TrainState, devices: Sequence[Hashable]) -> dict[Hashable, int]:
-    """The bytes the arrays of `tree` hold on each of `devices` now, a placed state's shards on its
-    devices; an abstract or donated leaf holds none."""
-    held = dict.fromkeys(devices, 0)
+def resident_on(tree: TrainState) -> dict[Hashable, int]:
+    """The bytes the arrays of `tree` hold on each device of this process now, by device: a placed state's
+    shards, read before the state is abstracted to the shapes its step is lowered over
+    (`dew.training._candidates`); an abstract or donated leaf holds none."""
+    held: dict[Hashable, int] = {}
     for leaf in jax.tree.leaves(tree):
         if isinstance(leaf, jax.Array) and not leaf.is_deleted():
             for shard in leaf.addressable_shards:
-                if shard.device in held:
-                    held[shard.device] += shard.data.nbytes
+                held[shard.device] = held.get(shard.device, 0) + shard.data.nbytes
     return held
+
+
+def limit_exited(executable: jax.stages.Compiled | None, options: jax.stages.CompilerOptions | None) -> bool:
+    """Whether `executable` is a compile XLA stopped at its buffer assignment past its limit (`LIMIT_EXIT`
+    in `options`): its sum past that limit (`CompiledMemory.summed`). Such an executable states its memory
+    and runs nowhere, so it is no plan's and no held step's."""
+    limit = (options or {}).get(LIMIT_EXIT)
+    memory = None if executable is None or limit is None else compiled_memory(executable)
+    return memory is not None and isinstance(limit, int) and memory.summed > limit
+
+
+HELD_CODE_BYTES = 1 << 30
+"""The device code a run holds for its refits at most (`CodeBounded`): 1 GiB, a few dozen of a large model's
+steps (a 4B decoder's is 20 to 40 MiB of code on an H100), which device code past the allocator's pool holds
+as long as anything references it (row 12131), so a run meeting shape after shape holds no step of a shape
+it left long ago beyond it (row 12385)."""
+
+
+def code_bytes(executable: jax.stages.Compiled | None) -> int:
+    """The bytes of `executable`'s device code (`CompiledMemory.generated_code`), none where its backend
+    states none."""
+    memory = None if executable is None else compiled_memory(executable)
+    return 0 if memory is None else memory.generated_code
+
+
+class CodeBounded[K: Hashable, V]:
+    """What a run holds of its compiled steps by key, bounded by the device code they hold (`budget`, by
+    default `HELD_CODE_BYTES` as it reads at construction): the executables its searches hold for each
+    other and its refits (`dew.training.planning.FitSearch.executables`) and the step runners its fit holds
+    by batch signature (`dew.training._fit.FitRun.compiled`). Each read or held marks its key as the latest
+    used, and holding one past the budget lets the least recently used go first, never the one just held,
+    each one let go handed to `released` (its key) once the table's lock is let go. One lock orders every
+    read and write, so a later phase's search off the loop (`dew.training.ahead.LaterPlans`) and the loop
+    share one table. `made` counts the entries held, `met` the keys ever held."""
+
+    def __init__(self, budget: int | None = None, released: Callable[[K], None] | None = None):
+        self.budget = HELD_CODE_BYTES if budget is None else budget
+        self.bytes = self.made = 0
+        self.met: set[K] = set()
+        self._released = released
+        self._held: OrderedDict[K, tuple[V, int]] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, key: K) -> V | None:
+        """The value held at `key`, marked the latest used; None where none is held."""
+        with self._lock:
+            if key not in self._held:
+                return None
+            self._held.move_to_end(key)
+            return self._held[key][0]
+
+    def __getitem__(self, key: K) -> V:
+        value = self.get(key)
+        if value is None:
+            raise KeyError(key)
+        return value
+
+    def hold(self, key: K, value: V, charge: int) -> None:
+        """Hold `value` at `key` as the latest used, charged `charge` bytes of device code, letting the least
+        recently used go past the budget."""
+        with self._lock:
+            if key in self._held:
+                self.bytes -= self._held.pop(key)[1]
+            self._held[key], self.bytes = (value, charge), self.bytes + charge
+            self.made += 1
+            self.met.add(key)
+            gone = []
+            while self.bytes > self.budget and (oldest := next(iter(self._held))) != key:
+                self.bytes -= self._held.pop(oldest)[1]
+                gone.append(oldest)
+        if self._released is not None:
+            for oldest in gone:
+                self._released(oldest)
+
+    def pop(self, key: K, default: V | None = None) -> V | None:
+        """Let `key`'s value go, returned, or `default` where none is held."""
+        with self._lock:
+            if key not in self._held:
+                return default
+            value, charge = self._held.pop(key)
+            self.bytes -= charge
+            return value
+
+    def __contains__(self, key: K) -> bool:
+        with self._lock:
+            return key in self._held
+
+    def __iter__(self) -> Iterator[K]:
+        with self._lock:
+            return iter(list(self._held))
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._held)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -833,9 +929,12 @@ def step_fits(executable: jax.stages.Compiled | None, mesh: Mesh, held: int = 0,
 
 
 def step_fits_admitted(executable: jax.stages.Compiled | None, mesh: Mesh, held: int = 0, built: int = 0,
-                       *, placed: bool = True) -> tuple[bool, int | None, tuple[int, int, int] | None]:
+                       *, placed: bool = True, options: jax.stages.CompilerOptions | None = None
+                       ) -> tuple[bool, int | None, tuple[int, int, int] | None]:
     """`step_fits`, with the terms this process admitted the step by (`step_admitted`), read within the
-    one agreement, so a process whose read fails ends every process's check with its error."""
+    one agreement, so a process whose read fails ends every process's check with its error. A compile XLA
+    stopped past its limit in `options` (`limit_exited`) runs nowhere: its headroom is at most that limit
+    less its sum, whatever the allocator reads, so no process admits it."""
     local = [device for device in mesh.devices.flat if device.process_index == jax.process_index()]
     if executable is None:
         return fits_everywhere(lambda: -1)[0], None, None
@@ -843,6 +942,9 @@ def step_fits_admitted(executable: jax.stages.Compiled | None, mesh: Mesh, held:
 
     def read() -> int | None:
         headroom, terms[0] = step_admitted(executable, local, held, built, placed=placed)
+        memory, limit = compiled_memory(executable), (options or {}).get(LIMIT_EXIT)
+        if headroom is not None and memory is not None and isinstance(limit, int) and memory.summed > limit:
+            headroom = min(headroom, limit - memory.summed)
         return headroom
 
     fit, headroom = fits_everywhere(read)

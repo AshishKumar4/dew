@@ -33,7 +33,13 @@ from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 from typing_extensions import TypeVar as DefaultTypeVar
 
 from dew._cleanup import attempted
-from dew._coordination import agree_process_phase, agreed, agreed_same, broadcast_from_process_zero
+from dew._coordination import (
+    agree_process_phase,
+    agreed,
+    agreed_same,
+    broadcast_from_process_zero,
+    from_every_process,
+)
 from dew._records import JSON
 from dew.batch import Batch, at_path, owned_dicts, placed_at, select, unboxed
 from dew.checkpoints import Checkpoints, Envelope, Ranking, Resume, _Laid
@@ -170,6 +176,8 @@ from dew.training.evaluation import EvalSuite, Evaluator, episodic
 from dew.training.inspection import Inspection
 from dew.training.interval import Interval, Reading, Taken, TokenClock, copied, leaf_paths, logged_scalars
 from dew.training.memory import (
+    CodeBounded,
+    code_bytes,
     first_run,
     first_run_failed,
     recompute_record,
@@ -1328,7 +1336,7 @@ class Trainer(Generic[Loss, Effects]):
             # Read under the axes the modules boxed, a stage-local run's stacked by stage, as `_groups` reads.
             with self._staging.held(boxed(self._boxed_axes())):
                 run.update_flops = self._config.update_flops(state.variables["params"])
-        compiled: dict[Hashable, tuple[CompiledStep, StepFlops | None]] = run.compiled
+        compiled: CodeBounded[Hashable, tuple[CompiledStep, StepFlops | None]] = run.compiled
         seen = 0
         run.notice = PreemptionNotice()
         run.clock = TokenClock(*interval.clocked(state.pending_tokens))
@@ -1362,20 +1370,20 @@ class Trainer(Generic[Loss, Effects]):
                     # Each batch of a shape the run has not stepped is checked against what the objective
                     # declares, a later ramp's or schedule's stage as the first; a rollout writes its own.
                     check_inputs(self, device)
-                known, began, before = len(compiled), time.perf_counter(), interval.compiling
+                known, began, before = compiled.made, time.perf_counter(), interval.compiling
                 with run.startup.phase("compile", "compiling the step", when=not known):
                     train_step, flops, state = self._compiled_for(compiled, state, device, run, interval)
-                if len(compiled) > known and self.executable is not None and not self.host_master:
+                if compiled.made > known and self.executable is not None and not self.host_master:
                     signature = batch_signature(device)
                     run.reads[signature] = step_reads(self.executable, signature)
-                interval.compiles = len(compiled)
-                if len(compiled) > known:
+                interval.compiles = compiled.made
+                if compiled.made > known:
                     self._warmed(plan, run, state, shardings, first=not known)
                 if not known:
                     # Rebound once the step is compiled, so the first tick measures steps, not the compile.
                     interval.last_log_time = time.time()
                     interval.waited, interval.compiling = 0.0, before
-                elif len(compiled) > known:
+                elif compiled.made > known:
                     # A shape met later compiles inside the interval, which reports that time apart from
                     # its steps', its first draw's admissions (`DrawingStep.drawn`) among it.
                     interval.compiling = before + time.perf_counter() - began
@@ -2241,7 +2249,7 @@ class Trainer(Generic[Loss, Effects]):
         counted = prepare_counts(self.objective, batch, count_model=False)
         return counted if self._refusal is None else uncounted(counted, self.phase_passes.drawn_cap())
 
-    def _compiled_for(self, compiled: dict[Hashable, tuple[CompiledStep, StepFlops | None]],
+    def _compiled_for(self, compiled: CodeBounded[Hashable, tuple[CompiledStep, StepFlops | None]],
                       state: TrainState, batch: Batch, run: FitRun, interval: Interval,
                       reported: int | None = None) -> tuple[CompiledStep, StepFlops | None, TrainState]:
         """Return the step compiled for this batch's abstract signature (`batch_signature`),
@@ -2258,7 +2266,7 @@ class Trainer(Generic[Loss, Effects]):
         """
         state = self._staged(state, run.current)
         signature = self.phase_passes.key(batch_signature(batch))
-        if signature not in compiled and self.phase_passes.begins(compiled) and (
+        if signature not in compiled and self.phase_passes.begins(compiled.met) and (
                 not occupied(state.window)):
             # A phase of other passes begins at an update's end: its step is planned afresh, at the split
             # the run was given or the planner's for its own passes, over the state as a fresh state holds
@@ -2282,7 +2290,10 @@ class Trainer(Generic[Loss, Effects]):
             agreed_same("training batch layout", lambda: batch_layout(batch))
             began = time.perf_counter()
             with region("compile"), run.held():
-                compiled[signature] = (self.compile(state, batch, trials), self.step_flops)
+                step = self.compile(state, batch, trials)
+            # Charged as every process charges it (`FitRun.compiled`).
+            charge = max(from_every_process(code_bytes(self.executable)))
+            compiled.hold(signature, (step, self.step_flops), charge)
             seconds = time.perf_counter() - began
             settled_heap(run, compiled=True)
             links = {axis: AxisLink(link.bytes_per_second, link.spread) for axis, link in self.links.items()}

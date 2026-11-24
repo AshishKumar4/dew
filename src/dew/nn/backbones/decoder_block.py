@@ -60,6 +60,7 @@ from ..ngpt import NGPT, stepped
 from ..norms import GatedRMSNorm, LayerNorm, NormSite, OffsetLayerNorm, RMSNorm
 from ..precision import float32_dot_general, projection_role, scaled
 from ..protocols import (
+    RUNG_SCOPE,
     InputSites,
     ProjectionGroup,
     ReadsTrain,
@@ -1058,7 +1059,8 @@ class DecoderBlock(nn.Module):
         """The residual the next block reads, in the form `x` came in: an array (the plain stream,
         AltUp's copies, mHC's streams, the depth state), or single-pass mHC's `Carried`. `prior_bank` is
         the bank of block summaries the looped pass before left (`cross_pass`), None in a first pass."""
-        with recomputing(recomputed_inside(self.remat)):
+        # Under the scope its rung's values are told by (`RUNG_SCOPE`), whichever rung it runs at.
+        with recomputing(recomputed_inside(self.remat)), jax.named_scope(RUNG_SCOPE):
             if self.remat is None or self.remat.recompute or self.is_initializing() or decode:
                 return self._forward(x, train, decode, kv_store, per_layer_input, attention_metadata,
                                      prediction_phase, prior_bank)
