@@ -705,6 +705,31 @@ BANKED_EXPERT_SEEDS = 8
 
 
 @pytest.mark.usefixtures("scanned_stacks")
+def test_a_banked_moe_decode_pairs_each_layers_gate_and_up_at_the_layer():
+    """A scanned MoE stack decoding over a bank (`HeldBanks.place`) projects each layer's gate and up as one
+    paired product of the whole stacks at the layer's offset (`moe.paired_projections`): its experts'
+    dispatch hands each kernel on as a tracer of its own (`derivatives.span`), which pairing by the layer's
+    identity read as two layers and ran apart (row 12306's review)."""
+    from dew.nn.kernels import grouped_matmul
+
+    ids = jax.random.randint(jax.random.key(2), (2, 8), 0, VOCAB)
+    routed = {"experts": 4, "top_k": 2, "expert_features": 16, "layers": tuple(range(4))}
+    scanned = tiny(num_layers=4, max_seq_len=16, mixture=routed)
+    banked = HeldBanks(tiny(num_layers=4, max_seq_len=16, mixture=routed).init(jax.random.key(0), ids)).place(
+        scanned)
+    stacks = {tuple(leaf.shape) for leaf in jax.tree.leaves(experts_apart(banked)[BANKED_EXPERTS])}
+    whole = {(layers * experts, *matrix) for layers, experts, *matrix in stacks}
+    cache = scanned.init(jax.random.key(0), ids[:, :1], decode=True)["cache"]
+    with grouped_matmul.weighed() as calls:
+        jax.make_jaxpr(lambda variables, cache: scanned.apply(
+            {**variables, "cache": cache}, ids[:, :1], decode=True, mutable=["cache"]))(banked, cache)
+    bound = [next(iter(call.bound.values()))[1].arguments for call, _ in calls]
+    assert any(arguments["paired"] is not None and tuple(arguments["kernel"].shape) in whole
+               and tuple(arguments["paired"].shape) in whole and arguments["first"] is not None
+               for arguments in bound), [(tuple(arguments["kernel"].shape), arguments["paired"] is not None)
+                                         for arguments in bound]
+
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_banked_moe_decode_reads_each_layers_experts_in_place_and_decodes_as_the_loop():
     """A scanned MoE stack decoding over a bank in device memory (`HeldBanks.place`, every run's leaves one
     array) hands each layer it reads a layer at a time the run's expert kernels whole and the layer's

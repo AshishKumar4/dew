@@ -87,10 +87,11 @@ class HeldName:
 
 
 class _HeldPickler(pickle.Pickler):
-    """A site's held record pickled as pickle pickles it, but a function pickle names by no module
-    (`HeldName`): a local hook of a launch (a GEMM prologue's, a derivative's span) is no function its run
-    calls (rows 9584, 9600: a held launch refused the store, its arms compiled nothing ahead); and a source
-    traceback, held as none."""
+    """A site's held record pickled as pickle pickles it, but a function, or a function of a custom
+    derivative, pickle names by no module or whose state it cannot take (`HeldName`): a local hook of a
+    launch (a GEMM prologue's, a normalization's custom JVP among them, a derivative's span) is no function
+    its run calls (rows 9584, 9600: a held launch refused the store, its arms compiled nothing ahead; row
+    12657: a custom JVP's traceback refused it); and a source traceback, held as none."""
 
     def reducer_override(self, obj):
         from jax._src.lib import xla_client
@@ -99,7 +100,7 @@ class _HeldPickler(pickle.Pickler):
             # A source traceback (a launch's equation's, an error's): where it was traced, which its run never
             # reads, and pickle refuses (a fused GEMM's held launch, row 12665's prepares).
             return type(None), ()
-        if not isinstance(obj, types.FunctionType):
+        if not isinstance(obj, types.FunctionType | jax.custom_jvp | jax.custom_vjp):
             return NotImplemented
         try:
             pickle.dumps(obj)
