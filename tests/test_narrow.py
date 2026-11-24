@@ -762,30 +762,36 @@ def test_a_fresh_fit_whose_placed_pool_holds_its_step_in_two_microbatches_splits
     free, limit = 2 ** 39, 2 ** 40
     monkeypatch.setattr(jax.Device, "memory_stats",
                         lambda device: {"bytes_limit": limit, "bytes_in_use": limit - free})
-    # One device, whose batch of 8 rows splits in two.
+    # One device, whose batch of 16 rows splits in two, with enough activations at remat="full" for one
+    # microbatch's temporaries to stand past twice two microbatches' window accumulator beside the step
+    # (`memory.placeable_beside`).
+    rows = 16
     device = MeshSpec().build(jax.devices()[:1])
-    stream = Loader(train=lambda partition: repeated_token_batch(64, 8, 9), val=None, records=None, batch=8)
+    stream = Loader(train=lambda partition: repeated_token_batch(64, rows, 9), val=None, records=None,
+                    batch=rows)
 
-    def measured(split: int) -> int:
+    def measured(split: int) -> tuple[int, int, int]:
         # Measured through the same fit and default stack as the run below.
-        objective, _ = _decoder(remat="full")
+        objective, _ = _decoder(remat="full", rows=rows)
         trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=device,
                           layout=Layout(min_shard=1, tolerance=1.0), fit=FitPolicy(split=split))
         with chosen(narrow_copies='off'):
             trainer.fit(stream, steps=1)
-        return free - trainer.plan["probes"][0]["headroom"]
+        probe = trainer.plan["probes"][0]
+        return free - probe["headroom"], probe["temp"], probe["beside"]
 
-    one, two = measured(1), measured(2)
-    assert two < one, (one, two)
-    objective, batch = _decoder(remat="full")
+    (one, temp_one, beside_one), (two, temp_two, beside_two) = measured(1), measured(2)
+    # On `grown` below, `largest_free_block_bytes` and the pool's remaining growth are both `room`, so
+    # `memory.placeable_beside` admits a step once `room` holds both its temporaries and twice its `beside`.
+    block_one = max(temp_one, 2 * beside_one)
+    block_two = max(temp_two, 2 * beside_two)
+    assert two < one and block_two < block_one, ((one, temp_one, beside_one), (two, temp_two, beside_two))
+    objective, batch = _decoder(remat="full", rows=rows)
     run = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=device,
                   layout=Layout(min_shard=1, tolerance=1.0))
     with chosen(narrow_copies='off'):
         state = max(run.validate(batch).device_bytes.values())
-    # The pool's largest free block, and what it can still grow by, between the step's needs at two
-    # microbatches and at one: twice what a request placed beside the step takes, so each splits it
-    # (`memory.placeable_beside`).
-    room = (one + two) // 2
+    room = (block_one + block_two) // 2
     total = 2 * (state + one)
     grown = {"bytes_limit": total, "bytes_in_use": 0, "pool_bytes": total - room,
              "largest_free_block_bytes": room}
