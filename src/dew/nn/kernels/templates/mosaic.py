@@ -182,26 +182,10 @@ _STAGING: contextvars.ContextVar[bool] = contextvars.ContextVar("staging", defau
 
 
 def _disjoint(buffers: Sequence) -> None:
-    """Refuse `buffers` where two may alias: the same ref twice, unless each takes a constant leading index
-    of its own (a stack of tiles' distinct entries)."""
-    seen: dict[int, list] = {}
-    for buffer in buffers:
-        base = getattr(buffer, "ref", buffer)
-        leading = _leading_index(buffer)
-        for other in seen.get(id(base), []):
-            if leading is None or other is None or leading == other:
-                raise ValueError("a staged batch's buffers alias one another: each a buffer of its own")
-        seen.setdefault(id(base), []).append(leading)
-
-
-def _leading_index(buffer) -> int | None:
-    """A view's constant index into its ref's leading axis (`ref.at[i]`'s), None where it takes none."""
-    for transform in getattr(buffer, "transforms", ()):
-        indices = getattr(transform, "indices", None)
-        if indices:
-            first = indices[0]
-            return int(first) if isinstance(first, int) else None
-    return None
+    """Refuse `buffers` where two may alias: two views of one ref."""
+    roots = [id(getattr(buffer, "ref", buffer)) for buffer in buffers]
+    if len(set(roots)) != len(roots):
+        raise ValueError("a staged batch's buffers alias one another: each a buffer of its own")
 
 
 def issuing() -> None:
@@ -2193,7 +2177,7 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
         that brackets its stores itself (`brackets_staged`, mma.sync's) takes one barrier before the batch's
         first store (every warp's reads of the buffers done) and one after its last (every warp's stores
         seen), where `staged` takes a pair a store (a Kimi intra step's 20 a trip, FS-INTRA-BAR1). Buffers
-        that may alias (one ref twice, its leading indices not two distinct constants) are refused."""
+        that may alias (two views of one ref) are refused."""
         buffers = [buffer for _, buffer in pairs]
         _disjoint(buffers)
         bracketed = self.brackets_staged
