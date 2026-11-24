@@ -114,9 +114,11 @@ def _formed(tokens: jax.Array, prologue_operands: tuple, hooks: Hooks) -> jax.Ar
     CUTLASS takes where the template forms them tile by tile: an input-scaled MoE's rows times their routing
     weights, models-28's review). Rows read through tables hand on before a CUTLASS launch
     (`grouped_matmul`'s 'tables' need)."""
-    if hooks.prologue is None:
+    prologue = hooks.before()
+    if prologue is None:
         return tokens
-    return hooks.before()(tokens, *prologue_operands).astype(tokens.dtype)
+    assert callable(prologue), prologue
+    return prologue(tokens, *prologue_operands).astype(tokens.dtype)
 
 
 @dataclasses.dataclass(frozen=True)
