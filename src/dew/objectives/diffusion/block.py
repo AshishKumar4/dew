@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import functools
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Literal
 
 import jax
@@ -518,8 +518,8 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
             qk = sows_appended(sows_appended(mutated[QK], first_sown[QK]), second_sown[QK])
         # The projections' largest magnitudes over every pass that ran them, the conditioning pass's among
         # them, as the maxima are (row 12721).
-        amax = None if not step.amax else functools.reduce(
-            sows_appended, (held.get(NVFP4_AMAX, {}) for held in (mutated, first_sown, second_sown)), {})
+        records: list[Mapping] = [held.get(NVFP4_AMAX) or {} for held in (mutated, first_sown, second_sown)]
+        amax = functools.reduce(sows_appended, records, {}) if step.amax else None
         # The encoder's pass and the denoiser's that carries the gradient, as the step watches them.
         inspected = None if step.watched is None else {
             "encoder": mutated.get(INSPECTED, {}), "denoiser": second_sown.get(INSPECTED, {})}
