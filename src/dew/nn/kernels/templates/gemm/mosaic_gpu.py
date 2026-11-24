@@ -594,6 +594,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                 finished = functools.partial(
                     _gmm_finished, accs, wg=wg, store=store, family=family, part=part,
                     share_row=tiles.share_row(wg), m=m, g=g, dense=dense, row_tile=block_m * pair,
+                    whole=any(form is not None and form[1] for form in forms),
                     epilogue=epilogue, flags=(flags_gmem, pair, tiles.sharing),
                     sides=tuple(zip(side_gmems, epilogue_axes, side_smems, side_barriers, strict=True)),
                     partials=None if tail is None else (workspace, ready))
@@ -801,13 +802,15 @@ def _declared(lhs, rhs, gather, shape: tuple[int, int, int | None], splits: int,
 
 def _gmm_finished(accs: tuple, tile: tuple, wg, store, *, family: mosaic.Family, part: tuple, share_row,
                   m: int, g: int, dense: bool, row_tile: int, epilogue, o_gmems: tuple, sides: tuple,
-                  partials, flags: tuple = (None, 1, 1)) -> None:
+                  partials, flags: tuple = (None, 1, 1), whole: bool = False) -> None:
     """Dew: a consumer's share of a `gmm` tile stored (`_finished`) from its accumulators: at once, or,
     a balanced tail's tile (`partials`: its workspace and readiness flags), once its program's partial and
     the other programs' are added (`mosaic.Family.fixed_up`); with `flags` (`chained.flags_declared`'s, the
     pair and the consumers sharing a tile's rows, `Tiles.sharing`), its row share's written at its table
     entry (`chained.flag_row`): a ping-pong consumer's whole tile's the one slot, as it alone finishes the
-    tile (`persistent`'s ping-pong walk; 3b97e20f F5)."""
+    tile (`persistent`'s ping-pong walk; 3b97e20f F5). With `whole` (a dense call storing a transposed
+    output, `stores.transposed_rows`), each share stores its whole rows, the tensor's bound clipping those
+    past its last."""
     group, row_start, ni, _, gathered, program, split, entry = tile
     flags_gmem, pair, sharing = flags
     nonfinite = None if flags_gmem is None else flags_gmem.at[
@@ -818,7 +821,8 @@ def _gmm_finished(accs: tuple, tile: tuple, wg, store, *, family: mosaic.Family,
         else o_gmem.at[split] for o_gmem in o_gmems)
     # This consumer's share of the tile: its first row, and its group's rows there.
     part_row, column = row_start + share_row, ni * part[1]
-    first, stored = _stored_rows(group, part_row, part[0], m, dense=dense, row_tile=row_tile)
+    first, stored = (0, part[0]) if whole else _stored_rows(group, part_row, part[0], m, dense=dense,
+                                                            row_tile=row_tile)
     finished = functools.partial(
         _finished, family=family, wg=wg, epilogue=epilogue, o_gmems=o_gmems, store=store, sides=sides,
         origins={'rows': pl.ds(part_row, part[0]), 'columns': pl.ds(column, part[1])},
