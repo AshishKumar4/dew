@@ -21,6 +21,7 @@ from affine_run import Counting
 from affine_training import frozen_trainer
 
 from dew.data.dataset import Loader
+from dew.training import TrainerAdvanced
 
 
 def frozen_bytes(state):
@@ -43,7 +44,7 @@ def test_a_non_finite_live_parameter_leaves_the_reference_bit_identical(dynamic_
     """One compiled step over infinite parameters, with and without the
     mixed-precision gate. The parameters may go wherever the update takes
     them; the frozen tree stays bitwise where it was."""
-    trainer = frozen_trainer(dynamic_scale=dynamic_scale)
+    trainer = frozen_trainer(advanced=TrainerAdvanced(dynamic_scale=dynamic_scale))
     state = poison(trainer.initial_state())
     before = frozen_bytes(state)
     batch = next(Counting())

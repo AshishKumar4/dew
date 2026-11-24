@@ -32,8 +32,7 @@ from dew.inputs import CharTable
 from dew.interop import Pretrained
 from dew.nn.cross_attention import ContextEncoder, CrossAttention, crossing
 from dew.nn.multimodal import MultimodalTransformer
-from dew.training import Trainer
-from dew.training.budget import Horizon
+from dew.training import Trainer, TrainerAdvanced
 
 pytestmark = pytest.mark.mesh
 
@@ -465,7 +464,7 @@ def test_a_context_read_by_a_configured_encoder_trains_saves_and_resumes_exactly
         want = trained("one two three", QUESTION, context=context)["pick"].probabilities
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
     again = Trainer(configured(), optax.adam(1e-3), key=0, checkpoints=Checkpoints(directory, keep=2),
-                    data_resume="exact")
+                    advanced=TrainerAdvanced(data_resume="exact"))
     resumed = again.fit(dataclasses.replace(data, resume="exact"), steps=3, log_every=1, checkpoint_every=1)
     # Every weight, the encoder's among them, and the optimizer's state as a run of three steps leaves them.
     whole = Trainer(configured(), optax.adam(1e-3), key=0).fit(data, steps=3, log_every=1)
@@ -932,16 +931,16 @@ def test_a_run_from_a_saved_run_holds_its_configured_encoders_weights_frozen_or_
     text = TextCondition(encoder="clip_text", checkpoint=str(TINY))
     first = dataclasses.replace(decision(tmp_path, drawn=False), context_layers=(0,), context_length=32,
                                 context_text=text, context_text_trained=True, calibrate=False,
-                                optim=OptimConfig(learning_rate=1e-2))
+                                optim=OptimConfig(lr=1e-2))
     # Two steps: the cross-attention's gate opens from zero on the first, so the second reaches the encoder.
-    state, _ = trained(first, tmp_path, "first", trainer={"horizon": Horizon(steps=2),
+    state, _ = trained(first, tmp_path, "first", trainer={"steps": 2,
                                                           "checkpoint_final": True})
     held = jax.tree.leaves(state.variables["params"]["context"])
     checkpoint = jax.tree.leaves(text.build(dtype="float32").encoder.params)
     assert any(np.any(np.asarray(one) != np.asarray(two)) for one, two in zip(held, checkpoint, strict=True))
     start = dataclasses.replace(decision(tmp_path, drawn=False), pretrained=str(tmp_path / "runs" / "first"),
                                 source=SourceOptions(step="latest"), calibrate=False,
-                                optim=OptimConfig(learning_rate=0.0))
+                                optim=OptimConfig(lr=0.0))
     for trains in (False, True):
         second, _ = trained(dataclasses.replace(start, context_text_trained=trains), tmp_path,
                             f"second-{trains}")
@@ -993,7 +992,7 @@ def test_a_configured_encoder_is_placed_by_its_own_axes_frozen_or_trained(tmp_pa
                                   context_text=text, context_text_trained=trains, calibrate=False)
         objective = run.prepare().objective
         trainer = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0), mesh=LAYOUT,
-                          layout=Placement(min_shard=MIN_SHARD), tracker=None)
+                          advanced=TrainerAdvanced(layout=Placement(min_shard=MIN_SHARD)), tracker=None)
         trainer.device_mesh = LAYOUT.build(jax.devices()[:8])
         placed = trainer.shardings(jax.eval_shape(trainer.initial_state)).variables
         held = placed["params" if trains else FROZEN]["context"]

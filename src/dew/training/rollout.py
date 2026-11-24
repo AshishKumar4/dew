@@ -76,8 +76,8 @@ class Rollout(Protocol):
     (`_rollout_admitted`). The
     contract is the post-training spec's (docs/design/post-training.md, §14).
 
-    `objective` is the one the step it feeds trains: the run's own, or, where its data's phases set the
-    loop's pass count (`Trainer(phase_passes=)`), the copy at the count of the phase the step's batch was
+    `objective` is the one the step it feeds trains: the run's own, or, where its data's phases set the loop's
+    pass count (`TrainerAdvanced(phase_passes=)`), the copy at the count of the phase the step's batch was
     read in (`PhasePasses.objective_for`), which a policy drawn for the step samples as. A rollout that acts
     with a policy of its own compiled once refuses one other than its own (`own_objective`).
     """

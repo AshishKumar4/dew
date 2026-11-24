@@ -41,8 +41,7 @@ from dew.objectives.lm import LMObjective
 from dew.optim import AdamW, OptimConfig
 from dew.registry import models
 from dew.telemetry.compiles import Compiles
-from dew.training import FitPolicy, Layout, MeshSpec, Trainer, UpdateBatch
-from dew.training.budget import Horizon
+from dew.training import Layout, MeshSpec, Trainer, TrainerAdvanced
 from dew.training.targets import AheadTarget, LowerFor
 
 VOCAB, SEQ_LEN, BATCH = 96, 16, 8
@@ -108,8 +107,8 @@ def fine_tune(mesh, *, ahead=None, width: int | None = None, split=1, remat=None
               **({} if remat is None else {"remat": remat}), **({} if dtype is None else {"dtype": dtype})}
     model = models.build("causal_transformer", vocab_size=vocab, **fields, num_kv_heads=2)
     return Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0), mesh=mesh,
-                   layout=Layout(min_shard=TINY_SHARD), fit=FitPolicy(split=split), ahead=ahead,
-                   inspection=inspection, tracker=tracker)
+                   advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD), ahead=ahead,
+                                            inspection=inspection), split=split, tracker=tracker)
 
 
 @functools.cache
@@ -144,7 +143,7 @@ def need_run(root, generation: str, split: int) -> int:
     root.mkdir()
     path = root / "step.dew-aot"
     run = LMRunConfig.cli(["--trainer.name", "need", "--trainer.checkpoint-dir", str(root / "runs"),
-                           "--trainer.horizon.steps", "2", "--trainer.fit.split", str(split),
+                           "--trainer.steps", "2", "--trainer.split", str(split),
                            "--trainer.eval-every",
                            "None", "--trainer.checkpoint-every", "None"], default=lm(root, drawn=False))
     with pytest.raises(CompiledAhead):
@@ -597,10 +596,12 @@ def test_a_run_resumed_mid_window_compiles_its_step_ahead_building_no_window_of_
     from dew.checkpoints import Checkpoints
     from dew.training.ahead import compile_ahead
 
-    def accumulating(**mesh):
+    def accumulating(advanced=None, **mesh):
         model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, num_kv_heads=2)
         return Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0), **mesh,
-                       layout=Layout(min_shard=TINY_SHARD), update=UpdateBatch(batches=2),
+                       advanced=dataclasses.replace(advanced or TrainerAdvanced(),
+                                                    layout=Layout(min_shard=TINY_SHARD)),
+                       accumulation=2,
                        checkpoints=Checkpoints(str(tmp_path / "run")))
 
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
@@ -634,14 +635,16 @@ def test_a_resume_compiled_ahead_steps_at_the_split_its_checkpoint_was_saved_at(
     from dew.checkpoints import Checkpoints
     from dew.training.ahead import compile_ahead
 
-    def run(**options):
+    def run(advanced=None, **options):
         model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, num_kv_heads=2)
         return Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
-                       layout=Layout(min_shard=TINY_SHARD), checkpoints=Checkpoints(str(tmp_path / "run")),
+                       advanced=dataclasses.replace(advanced or TrainerAdvanced(),
+                                                    layout=Layout(min_shard=TINY_SHARD)),
+                       checkpoints=Checkpoints(str(tmp_path / "run")),
                        **options)
 
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
-    saved = run(fit=FitPolicy(split=2), mesh=MeshSpec().build(jax.devices()[:1]))
+    saved = run(split=2, mesh=MeshSpec().build(jax.devices()[:1]))
     saved.fit(batch, steps=1, checkpoint_every=1)
     saved.checkpoints.wait()
     assert saved.checkpoints.window_size(1) == 2 and saved.checkpoints.accumulation_template(1) is None
@@ -660,7 +663,7 @@ def test_a_bfloat16_decoders_step_compiles_ahead_for_an_a100():
                          dtype="bfloat16")
     trainer = Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
                       mesh=MeshSpec().build(gpus("sm80")),
-                      layout=Layout(min_shard=TINY_SHARD))
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD)))
     assert compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1)).starts
 
 
@@ -1127,7 +1130,7 @@ def test_a_configured_run_compiling_ahead_for_gpus_of_no_stated_memory_is_refuse
     from dew.training.ahead import stated_limit
 
     run = LMRunConfig.cli(["--trainer.name", "ahead", "--trainer.checkpoint-dir", str(tmp_path / "runs"),
-                           "--trainer.horizon.steps", "2"], default=lm(tmp_path, drawn=False))
+                           "--trainer.steps", "2"], default=lm(tmp_path, drawn=False))
     with Compiles("step") as compiles, pytest.raises(ValueError):
         run.lower(AheadTarget(generation="sm80", devices=1, path=str(tmp_path / "step.dew-aot")))
     assert compiles.count == 0 and not (tmp_path / "step.dew-aot").exists()
@@ -1302,7 +1305,7 @@ model = ModelConfig("causal_transformer", {
         "class": "gated_delta_net", "fields": {"linear_num_key_heads": 2, "linear_num_value_heads": 2,
                                                "linear_key_head_dim": 64, "linear_value_head_dim": 64}}}}})
 run = LMRunConfig.cli(["--trainer.name", "ahead", "--trainer.checkpoint-dir", str(root / "runs"),
-                       "--trainer.horizon.steps", "2"],
+                       "--trainer.steps", "2"],
                       default=dataclasses.replace(lm(root, drawn=False), model=model))
 with routes() as taken:
     try:
@@ -1358,7 +1361,7 @@ from token_support import token_rows
 from dew.nn.kernels.generation import chosen, routes
 from dew.objectives.lm import LMObjective
 from dew.registry import models
-from dew.training import Layout, MeshSpec, Trainer
+from dew.training import Layout, MeshSpec, Trainer, TrainerAdvanced
 from dew.nn.kernels.generation import compile_only_gpus
 from dew.training.ahead import compile_ahead
 
@@ -1441,7 +1444,7 @@ def test_a_step_compiled_ahead_with_no_gpu_attached_runs_the_attention_its_gpu_r
     model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, num_kv_heads=2)
     trainer = Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
                       mesh=MeshSpec().build(gpus(generation)),
-                      layout=Layout(min_shard=TINY_SHARD))
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD)))
     from dew.nn.kernels.generation import routes
 
     named = contextlib.nullcontext() if implementation == "auto" else attended(attention=implementation)
@@ -1593,7 +1596,7 @@ def test_a_configured_run_compiles_its_step_ahead_for_gpus_it_lacks_and_trains_n
     default = lm(tmp_path, drawn=False)
     assert isinstance(default, LMRunConfig)
     run = LMRunConfig.cli(["--trainer.name", "ahead", "--trainer.checkpoint-dir", str(runs),
-                           "--trainer.horizon.steps", "2"], default=default)
+                           "--trainer.steps", "2"], default=default)
     with pytest.raises(CompiledAhead) as ended:
         run.lower(AheadTarget(generation="sm80", devices=1, path=str(path), capacity_gib=1.0))
     assert ended.value.code == 0
@@ -1621,7 +1624,7 @@ def test_a_configured_fresh_run_that_pauses_compiles_ahead_planned_as_it_trains_
     run = dataclasses.replace(default, trainer=dataclasses.replace(default.trainer, name="ahead",
                                                                    checkpoint_dir=str(runs),
                                                                    local_directory=str(local), local_every=2,
-                                                                   horizon=Horizon(steps=4), stop=Pause(0.5)))
+                                                                   steps=4, stop=Pause(0.5)))
     with pytest.raises(CompiledAhead) as ended:
         run.lower(target)
     assert ended.value.code == 0 and AheadOfTime.load(path).plan is not None
@@ -1659,7 +1662,7 @@ def test_a_configured_run_compiles_ahead_for_the_multiprocessors_it_states_and_l
         root.mkdir()
         path = root / "step.dew-aot"
         run = LMRunConfig.cli(["--trainer.name", "ahead", "--trainer.checkpoint-dir", str(root / "runs"),
-                               "--trainer.horizon.steps", "2",
+                               "--trainer.steps", "2",
                                *(["--trainer.inspection.every", "1"] if inspected else []),
                                "--trainer.eval-every", "None", "--trainer.checkpoint-every", "None"],
                               default=lm(root, drawn=False))
@@ -1737,7 +1740,7 @@ def test_a_configured_run_compiling_ahead_with_its_frontier_records_it_in_the_sa
     assert room < one, (one, room)
     runs, path = tmp_path / "runs", tmp_path / "step.dew-aot"
     run = LMRunConfig.cli(["--trainer.name", "ahead", "--trainer.checkpoint-dir", str(runs),
-                           "--trainer.horizon.steps", "2"], default=lm(tmp_path, drawn=False))
+                           "--trainer.steps", "2"], default=lm(tmp_path, drawn=False))
     with pytest.raises(CompiledAhead) as ended:
         run.lower(AheadTarget(generation="sm80", devices=1, path=str(path), capacity_gib=capacity_gib(room),
                               frontier=True))
@@ -1766,7 +1769,7 @@ def test_a_configured_run_compiles_its_step_ahead_for_a_tpu_topology_with_its_st
     assert isinstance(default, LMRunConfig)
     links = {"tensor": {"bytes_per_second": 4.5e11, "flops_per_second": 9.9e14}}
     run = LMRunConfig.cli(["--trainer.name", "ahead", "--trainer.checkpoint-dir", str(runs),
-                           "--trainer.horizon.steps", "2", "--trainer.mesh.tensor", "2",
+                           "--trainer.steps", "2", "--trainer.mesh.tensor", "2",
                            "--diagnostics.links",
                            json.dumps(links)], default=default)
     with pytest.raises(CompiledAhead) as ended:
@@ -1794,19 +1797,19 @@ def test_a_run_on_the_examples_clock_compiles_its_step_ahead_reading_its_progres
     default = decision(tmp_path, drawn=False)
     assert isinstance(default, DecisionRunConfig)
     run = DecisionRunConfig.cli(["--trainer.name", "ahead", "--trainer.checkpoint-dir", str(runs),
-                                 "--trainer.horizon.examples", "16", "--trainer.eval-every", "3",
-                                 "--trainer.checkpoint-every", "3", "--optim.learning-rate",
-                                 '{"class": "linear", "fields": {"peak_value": 0.001}}'], default=default)
+                                 "--trainer.examples", "16", "--trainer.eval-every", "3",
+                                 "--trainer.checkpoint-every", "3", "--optim.lr", "0.001",
+                                 "optim.schedule:linear"], default=default)
     with pytest.raises(CompiledAhead) as ended:
         run.lower(AheadTarget(generation="sm80", devices=1, path=str(path), capacity_gib=4.0))
     assert ended.value.code == 0
     assert AheadOfTime.load(path).peak_bytes > 0
 
 
-CLOCKED = ["--trainer.horizon.examples", "48", "--trainer.eval-every", "3", "--trainer.checkpoint-every", "3",
+CLOCKED = ["--trainer.examples", "48", "--trainer.eval-every", "3", "--trainer.checkpoint-every", "3",
            "--trainer.multi-host", "False", "--trainer.compilation-cache-dir", "None",
            "--trainer.cooldowns.at", "50%", "--trainer.cooldowns.length", "25%",
-           "--optim.learning-rate", '{"class": "linear", "fields": {"peak_value": 0.001}}']
+           "--optim.lr", "0.001", "optim.schedule:linear"]
 """The clocked decision run's flags (the clocked GPU cell's): its tickets stream, of no record count, so its
 evaluations and checkpoints are counted in steps (ledger 3153)."""
 
@@ -1927,10 +1930,11 @@ def test_an_accumulating_step_holds_its_gradient_sum_and_no_other_buffer_a_param
     model = models.build("causal_transformer", vocab_size=VOCAB, **WIDE_MLP, num_kv_heads=2, dtype=dtype)
 
     def ahead(accumulation: int, rows: int):
-        trainer = Trainer(LMObjective(model, SEQ_LEN), OptimConfig(optimizer=AdamW(), learning_rate=1e-3),
+        trainer = Trainer(LMObjective(model, SEQ_LEN), OptimConfig(optimizer=AdamW(), lr=1e-3),
                           key=jax.random.key(0), mesh=MeshSpec().build(gpus(generation)),
-                          layout=Layout(min_shard=TINY_SHARD), update=UpdateBatch(batches=accumulation),
-                          fit=FitPolicy(split=1))
+                          advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD)),
+                          accumulation=accumulation,
+                          split=1)
         trainer.validate(steps=8)
         return compile_ahead(trainer, token_rows(VOCAB, rows, SEQ_LEN + 1))
 
@@ -2002,11 +2006,11 @@ def a_step_compiled_ahead_and_saved_runs_on_its_gpu_in_the_run_s_place(tmp_path)
 
 @attending("xla")
 def a_run_handed_its_step_compiled_ahead_trains_from_it_on_its_gpu(tmp_path):
-    """A step compiled ahead for one compile-only GPU of this GPU's own target (`this_gpus`), saved and
-    handed to the run (`Trainer(ahead=...)`), is the program the run lowers its first step to, and the run
-    trains from it, its plan's first compile the step compiled ahead: its steps advance and its
-    parameters move (row 1915). A wider model's step for this GPU is another program, refused. The
-    model's attention takes XLA's path, which a step compiled with no GPU attached traces too."""
+    """A step compiled ahead for one compile-only GPU of this GPU's own target (`this_gpus`), saved and handed
+    to the run (`TrainerAdvanced(ahead=...)`), is the program the run lowers its first step to, and the run
+    trains from it, its plan's first compile the step compiled ahead: its steps advance and its parameters
+    move (row 1915). A wider model's step for this GPU is another program, refused. The model's attention
+    takes XLA's path, which a step compiled with no GPU attached traces too."""
     from dew.nn.kernels.generation import chosen
     from dew.training.ahead import AheadOfTime, compile_ahead
 
@@ -2173,7 +2177,8 @@ def latent(mesh, *, ahead=None, links=None, checkpoints=None):
                          mixer=MLAMixer(q_lora_rank=8, kv_lora_rank=8, qk_nope_head_dim=4,
                                         qk_rope_head_dim=4, v_head_dim=4))
     return Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0), mesh=mesh,
-                   layout=Layout(min_shard=TINY_SHARD), ahead=ahead, links=links, checkpoints=checkpoints)
+                   advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD), ahead=ahead, links=links),
+                   checkpoints=checkpoints)
 
 
 def test_a_step_compiled_ahead_records_the_links_its_program_was_decided_by():

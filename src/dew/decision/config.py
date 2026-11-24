@@ -148,7 +148,7 @@ class DecisionRunConfig(DecoderRunConfig):
     objective: ObjectiveConfig = dataclasses.field(default_factory=lambda: ObjectiveConfig("decision"))
     """The decision objective and its arguments: its scoring rule (`loss`),
     label smoothing, option shuffling and none-of-the-above rate."""
-    optim: OptimConfig = dataclasses.field(default_factory=lambda: OptimConfig(learning_rate=2.5e-5))
+    optim: OptimConfig = dataclasses.field(default_factory=lambda: OptimConfig(lr=2.5e-5))
     # Its compute dtype is the run's numerics' (`TrainerConfig.precision`) unless its record states one.
     model: ModelConfig = dataclasses.field(default_factory=lambda: ModelConfig("causal_transformer", {}))
     pretrained: str = LAYA

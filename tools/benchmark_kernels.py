@@ -171,7 +171,7 @@ def adam(args: argparse.Namespace) -> dict[str, object]:
     grads = {name: jax.random.normal(key, leaf.shape, jnp.float32) * 1e-3
              for key, (name, leaf) in zip(keys, params.items(), strict=True)}
     solver = OptimConfig(optimizer=AdamW(weight_decay=0.1, state_dtype=args.state_dtype),
-                         learning_rate=1e-4).build(1000)
+                         lr=1e-4).build(1000)
 
     def update(params, state, grads):
         updates, state = solver.update(grads, state, params)
@@ -217,7 +217,7 @@ def case_for(path: str, batch: int, args: argparse.Namespace | None) -> Case:
 def step(args: argparse.Namespace) -> dict[str, object]:
     case = case_for(args.path, args.batch, args)
     trainer = build_trainer(case, optimizer=OptimConfig(optimizer=Adam(state_dtype=args.state_dtype),
-                                                        learning_rate=1e-4).build(1000))
+                                                        lr=1e-4).build(1000))
     with compiled_step(case, trainer) as compiled:
         state, loss, _, _ = timed_steps(compiled.step, compiled.state, 5)
         losses = [float(loss)]

@@ -1023,13 +1023,24 @@ def test_sm90_roofline_forward_and_fused_backward_compile_spill_free():
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 
-def test_tcgen05_rows_prices_natural_exp_and_skips_doomed_column_splits():
-    """Row 5535: `forward_registers` for `tcgen05.rows` (`places_on_role`) charges the `natural_exp` phase
-    when `natural=True` (enabling `setmaxnreg` register transfer on 128x64 instead of capping at the flat
-    share, while leaving `natural=False` unchanged), and `MosaicForward._columns_help` rejects split columns
-    when `columns=None` already fits SMEM and TMEM at the same residency while admitting splits when
-    `columns=None` exceeds SMEM."""
-    from dew.nn.kernels.templates import attention_mosaic, attention_mosaic_program as program, resources
+def _offered_at(offered, block_q: int, block_k: int, columns: int | None) -> int | None:
+    """The place in a derivation's `offered` configs of the first `block_q x block_k` tile at `columns`."""
+    return next((at for at, config in enumerate(offered)
+                 if (config.block_q, config.block_k, config.columns) == (block_q, block_k, columns)), None)
+
+
+@COMPILES_ON_CPU
+def test_tcgen05_rows_prices_natural_exp_and_defers_same_residency_column_splits():
+    """Rows 5535, 12210: `forward_registers` for `tcgen05.rows` (`places_on_role`) charges `natural_exp`
+    when `natural=True`, and the natural 128x64 forward at d256 compiles spill-free on a compile-only B200.
+    The derivation offers a column split that changes no residency (128x64 at `columns=128`, the whole tile
+    fitting shared and tensor memory) after the whole tile, where a pin can still take it, and it lowers
+    pinned; a whole tile past shared memory (128x128) is offered nowhere."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    from dew.nn.kernels import tuning
+    from dew.nn.kernels.templates import attention_mosaic, attention_mosaic_program as program
     from dew.nn.kernels.templates.attention_mosaic_registers import forward_registers
 
     spans = template.spans(1024, 1024, 1, causal=True)
@@ -1051,41 +1062,61 @@ def test_tcgen05_rows_prices_natural_exp_and_skips_doomed_column_splits():
         ba_fold = op_fold.bind(*args_fold, residuals=template.Kept.NONE, interpret=False)
         assert op_nat.registers(ba_nat, tiles_64, target=target) == natural_regs
         assert op_fold.registers(ba_fold, tiles_64, target=target) == folded_regs
-        joined = op_nat.joined_roles(ba_nat, tiles_64, target)
-        folded_model = resources.register_model(rows_family, 1, folded_regs, target=target, joined=joined)
-        natural_model = resources.register_model(rows_family, 1, natural_regs, target=target, joined=joined)
-        assert natural_model.moves and not folded_model.moves
-        # Negative pair: 128x64 whole at d256 already fits SMEM/TMEM at same residency -> split rejected.
-        split_64 = dataclasses.replace(tiles_64, columns=128)
-        assert op_nat._columns_help(ba_nat, tiles_64, target)
-        assert not op_nat._columns_help(ba_nat, split_64, target)
-        # Positive pair: 128x128 whole at d256 exceeds SMEM on sm100 -> column split admitted.
-        split_128 = dataclasses.replace(tiles_128, columns=128)
+        offered = op_nat.offered(ba_nat, rows_family, target)
+        whole, split = _offered_at(offered, 128, 64, None), _offered_at(offered, 128, 64, 128)
+        assert whole is not None and split is not None and whole < split, offered
         assert op_fold.staged_bytes(ba_fold, tiles_128, target) > op_fold.program_shared(tiles_128, target)
-        assert op_fold._columns_help(ba_fold, split_128, target)
+        folded_offered = op_fold.offered(ba_fold, rows_family, target)
+        assert _offered_at(folded_offered, 128, 128, None) is None, folded_offered
+
+        def natural_fwd(query, key, value):
+            return attention_mosaic.forward(query, key, value, spans, None, natural=True)
+
+        with tuning.pinned({attention_mosaic.MosaicForward: offered[split]}):
+            jax.jit(natural_fwd).trace(q, k, k).lower(lowering_platforms=("cuda",))
+        found = compile_mosaic_kernels(
+            [KernelCase("natural-128x64", lambda: (natural_fwd, (q, k, k)))], "sm100")
+    assert not (failed := mosaic_failures(found)), "\n".join(failed)
 
 
-def test_fewer_hooked_admits_row_indexed_hooks_on_mma_sync():
-    """Row 7360: `_fewer_hooked` admits `mma.sync` 32-row backward tiles under row-indexed hooks (`q_pos[:,
-    :1]`) now that `_score_logits` holds query places in the accumulator's layout."""
-    from dew.nn.kernels.templates import attention_mosaic, attention_mosaic_program as program
+@COMPILES_ON_CPU
+def test_row_indexed_hooks_take_and_lower_at_fewer_rows_on_mma_sync():
+    """Rows 7360, 12210: a backward under a row-indexed hook (`q_pos[:, :1]`) or a dual-position hook over
+    packed documents takes `mma.sync`'s 32-row and 64x32 tiles on a compile-only A100, and each pinned
+    lowers both its launches (dQ and dK/dV) through Mosaic's layout solver, now that `_score_logits` holds
+    query places in the accumulator's layout."""
+    from dew.nn.kernels import tuning
+    from dew.nn.kernels.templates import attention_mosaic
 
-    spans = template.spans(512, 512, 1, causal=True)
     q = jax.ShapeDtypeStruct((1, 512, 4, 64), jnp.bfloat16)
     k = jax.ShapeDtypeStruct((1, 512, 2, 64), jnp.bfloat16)
-    hooks = template.Hooks(score_mod=lambda s, q_pos, _k: s + 0.01 * q_pos[:, :1].astype(s.dtype))
     zero_row = jax.ShapeDtypeStruct((1, 4, 512), jnp.float32)
     zero_idx = jax.ShapeDtypeStruct((1, 4, 512), jnp.int32)
     split = template.Split(jax.ShapeDtypeStruct((1, 4, 512, 64), jnp.float32),
                            zero_row, zero_row, zero_row)
+    residuals = (zero_row, zero_row, zero_idx, split)
+    docs = jnp.where(jnp.arange(512, dtype=jnp.int32)[None, :] < 256, 1, 2)
+    cases = [
+        (template.spans(512, 512, 1, causal=True),
+         template.Hooks(score_mod=lambda s, q_pos, _k: s + 0.01 * q_pos[:, :1].astype(s.dtype))),
+        (template.spans(512, 512, 1, causal=True, segment_ids=docs),
+         template.Hooks(score_mod=lambda s, q_pos, k_pos: s + 0.01 * (q_pos - k_pos).astype(s.dtype))),
+    ]
+    pins = [attention_mosaic.BackwardTiles(block_q=rows, block_k=32, stages=2, consumers=1, fused=False,
+                                           family="mma.sync") for rows in (32, 64)]
     with generation.assumed("sm80"):
         target = generation.gpu_target()
-        op, args = attention_mosaic._backward_call(
-            q, k, k, spans, hooks, q, residuals=(zero_row, zero_row, zero_idx, split),
-            scale=None, natural=attention_mosaic.NATURAL, accurate=True)
-        ba = op.bind(*args, interpret=False)
-        tiles = attention_mosaic.BackwardTiles(
-            block_q=32, block_k=32, stages=2, consumers=1, fused=False, family="mma.sync")
-        family = program.bundle_of(tiles, jnp.bfloat16, target=target)
-        assert attention_mosaic._fewer_hooked(hooks.score_mod, family)
-        assert op.takes(ba, tiles, target)
+        for spans, hooks in cases:
+            op, args = attention_mosaic._backward_call(
+                q, k, k, spans, hooks, q, residuals=residuals,
+                scale=None, natural=attention_mosaic.NATURAL, accurate=True)
+            ba = op.bind(*args, interpret=False)
+            for pin in pins:
+                assert op.takes(ba, pin, target), pin
+
+                def bwd(query, key, value, dout, res, sp=spans, hk=hooks):
+                    return attention_mosaic.backward(
+                        query, key, value, sp, hk, dout, residuals=res, accurate=True)
+
+                with tuning.pinned({attention_mosaic.MosaicBackward: pin}):
+                    jax.jit(bwd).trace(q, k, k, q, residuals).lower(lowering_platforms=("cuda",))

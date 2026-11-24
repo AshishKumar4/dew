@@ -2,7 +2,6 @@
 and E4M3 block scales decoded exactly (`NvFp4.decoded`, its codes in the staged order a stage decodes), the
 deferred factor applied to the fp32 accumulator before the one rounding."""
 
-import contextlib
 import dataclasses
 import faulthandler
 import functools
@@ -16,7 +15,6 @@ import pytest
 from generation_support import INTERPRETS, lowers
 from jax.sharding import Mesh
 from low_precision_support import nvfp4
-from reference_error import assert_as_exact
 
 from dew.algebra import bits
 from dew.nn import fake_quant
@@ -457,7 +455,7 @@ def test_an_nvfp4_product_over_operands_a_mesh_splits_decodes_its_matrix(group_s
 def test_gemm_quantize_epilogue_matches_bits_encoded(minifloat, out_dtype):
     """`gemm.gemm_quantized` encodes the GEMM accumulator via `bits.encode_form` bit-exact with
     `bits.encoded` across E4M3 and E5M2, dividing by `tensor_scale` on encode and returning `(codes, scale)`
-    consistent with `NvFp4Block` and `Fp8Weights` (rows 8547, 12037, 12160)."""
+    consistent with `NvFp4Block` (rows 8547, 12037, 12160)."""
     rng = np.random.default_rng(17)
     lhs = jnp.asarray(rng.integers(-3, 4, size=(128, 128)), jnp.bfloat16)
     rhs = jnp.asarray(rng.integers(-3, 4, size=(128, 128)), jnp.bfloat16)
@@ -508,22 +506,9 @@ def test_packed_rows_supported_reads_bundle_fragment_name():
     assert hooks._epilogue_layout(jnp.bfloat16, generation.gpu_target("sm80")) == sm80_bundle.layout
     assert hooks._epilogue_layout(jnp.bfloat16, generation.gpu_target("v5e")) is None
 
-def test_fp8_and_e8m0_bit_forms_are_exact():
-    """`E4M3_BFLOAT16_FORM`, `E5M2_BFLOAT16_FORM`, and `E8M0_SCALE_FORM` are proven bit-exact on every code
-    against `ml_dtypes` / IEEE values, and `MxFp8.decoded` handles subnormal `0x00` and `0xFF` NaN across
-    fp32 and fp64 (rows 3733, 8548, 9040)."""
-    bits.proven(bits.E4M3_BFLOAT16, bits.E4M3_BFLOAT16_FORM)
-    bits.proven(bits.E5M2_BFLOAT16, bits.E5M2_BFLOAT16_FORM)
-    for minifloat, fp8_dtype in ((bits.E4M3, jnp.float8_e4m3fn), (bits.E5M2, jnp.float8_e5m2)):
-        codes = np.arange(256, dtype=np.uint32).reshape(64, 4)
-        packed_words = bits.fp8_packed(jnp.asarray(codes), minifloat)
-        got = np.asarray(bits.fp8_codes(packed_words, minifloat, jnp.float32)).reshape(256)
-        expected = np.asarray(
-            jax.lax.bitcast_convert_type(jnp.arange(256, dtype=jnp.uint8), fp8_dtype).astype(jnp.float32))
-        nans = np.isnan(expected)
-        assert np.array_equal(np.isnan(got), nans)
-        np.testing.assert_array_equal(got[~nans], expected[~nans])
-
+def test_e8m0_bit_form_is_exact():
+    """`E8M0_SCALE_FORM` is exact on every byte under high-byte noise, and `MxFp8.decoded` handles subnormal
+    `0x00` and `0xFF` NaN across fp32 and fp64 (row 9040)."""
     # Exhaustive check of branchless E8M0_SCALE_FORM across all 256 bytes and high-byte noise.
     all_bytes = np.arange(256, dtype=np.uint32)
     exp_normal = np.ldexp(np.ones(254, dtype=np.float32), np.arange(1, 255) - 127)
@@ -547,146 +532,6 @@ def test_fp8_and_e8m0_bit_forms_are_exact():
         mx_one = formats.MxFp8(jnp.ones((1, 64), jnp.float8_e4m3fn), e8m0_scales)
         np.testing.assert_array_equal(np.asarray(mx_one.decoded(jnp.float64))[0, :32],
                                       np.full((32,), np.float64(2.0 ** -127)))
-    # Fp8Weights.checked() accepts valid form and rejects tampered form version.
-    sample = formats.Fp8Weights.of(np.zeros((64, 64), np.float32), fmt="e4m3")
-    assert sample.checked() is sample
-    bad = dataclasses.replace(sample, form=np.zeros((8,), np.uint8))
-    with pytest.raises(ValueError):
-        bad.checked()
-
-@pytest.mark.parametrize("fmt", ["e4m3", "e5m2"])
-def test_fp8_weight_product_holds_check_1_and_compiles_on_sm80(fmt: str):
-    """`gemm.fp8_weight_product` (inline mainloop decode via `E4M3_BFLOAT16_FORM`/`E5M2_BFLOAT16_FORM`)
-    holds check 1 on both the default XLA route and interpreted Mosaic route with non-unit scalar,
-    per-column, and grouped scales, refuses invalid scale shapes, and compiles spill-free on sm80
-    (rows 3733, 8548)."""
-    from fla_gdn_support import KernelCase
-    from kernel_compile import compile_mosaic_kernels
-    from low_precision_support import decoded_weight_dot
-
-    def draw(seed):
-        rng = np.random.default_rng(8548 + seed)
-        x = jnp.asarray(rng.standard_normal((128, 64)) / np.sqrt(64), jnp.bfloat16)
-        w = jnp.asarray(rng.standard_normal((64, 64)) * 0.5, jnp.float32)
-        scale = jnp.asarray(rng.uniform(0.5, 2.5, size=(64,)), jnp.float32)
-        return x, formats.Fp8Weights.of(w, fmt=fmt, scale=scale)
-
-    for interpret in (False, True):
-        def dew_fn(x, weights, *, interpret=interpret):
-            ctx = generation.chosen(grouped_matmul="mosaic") if interpret else contextlib.nullcontext()
-            with ctx:
-                return gemm.fp8_weight_product(x, weights, out_dtype=jnp.float32, interpret_on_cpu=interpret)
-
-        assert_as_exact(jax.jit(dew_fn), jax.jit(decoded_weight_dot), draw,
-                        f"fp8_weight_product {fmt} interp={interpret}",
-                        seeds=8, truth_fn=functools.partial(decoded_weight_dot, dtype=jnp.float64))
-    # Exact single-scale check on default XLA, interpreted Mosaic, and unified gemm.gemm dispatch.
-    ones = jnp.ones((64, 64), jnp.bfloat16)
-    scaled_w = formats.Fp8Weights.of(jnp.full((64, 64), 2.0, jnp.float32), fmt=fmt, scale=2.0)
-    for interpret in (False, True):
-        ctx = generation.chosen(grouped_matmul="mosaic") if interpret else contextlib.nullcontext()
-        with ctx:
-            got = gemm.fp8_weight_product(ones, scaled_w, out_dtype=jnp.float32, interpret_on_cpu=interpret)
-        np.testing.assert_array_equal(np.asarray(got), np.full((64, 64), 128.0, np.float32))
-    np.testing.assert_array_equal(np.asarray(gemm.gemm(ones, scaled_w, out_dtype=jnp.float32)),
-                                  np.full((64, 64), 128.0, np.float32))
-    rng = np.random.default_rng(8549)
-    x_g = jnp.asarray(rng.integers(-2, 3, size=(64, 64)), jnp.bfloat16)
-    w_g = jnp.asarray(rng.integers(-2, 3, size=(2, 64, 64)), jnp.float32)
-    sizes = jnp.asarray([40, 24], jnp.int32)
-    scale_cases = [
-        jnp.asarray(2.0, jnp.float32),
-        jnp.asarray(rng.choice([0.5, 1.0, 2.0], size=(64,)), jnp.float32),
-        jnp.asarray([[[0.5]], [[2.0]]], jnp.float32),
-        jnp.asarray(rng.choice([0.5, 1.0, 2.0], size=(2, 1, 64)), jnp.float32),
-    ]
-    for scale in scale_cases:
-        bank = formats.Fp8Weights.of(w_g, fmt=fmt, scale=scale)
-        ref = jax.lax.ragged_dot(x_g.astype(jnp.float32), bank.decoded(jnp.float32), sizes,
-                                 preferred_element_type=jnp.float32)
-        for interpret in (False, True):
-            ctx = generation.chosen(grouped_matmul="mosaic") if interpret else contextlib.nullcontext()
-            with ctx:
-                got = gemm.fp8_weight_product(x_g, bank, sizes, out_dtype=jnp.float32,
-                                              interpret_on_cpu=interpret)
-            np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
-    with pytest.raises(ValueError):
-        formats.Fp8Weights.of(w_g, fmt=fmt, scale=jnp.ones((2,), jnp.float32))
-    with pytest.raises(ValueError):
-        formats.Fp8Weights.of(w_g, fmt=fmt, scale=jnp.ones((2, 64), jnp.float32))
-
-    if generation.compile_only_gpus("sm80"):
-        x_s = jax.ShapeDtypeStruct((256, 128), jnp.bfloat16)
-        w_sample = formats.Fp8Weights.of(np.zeros((128, 128), np.float32), fmt=fmt)
-        w_spec = jax.tree.map(lambda a: jax.ShapeDtypeStruct(np.shape(a), np.asarray(a).dtype), w_sample)
-
-        def compiled_fp8(a, w):
-            with generation.chosen(grouped_matmul="mosaic"):
-                return gemm.fp8_weight_product(a, w, out_dtype=jnp.bfloat16)
-
-        with generation.assumed("sm80"), generation.chosen(grouped_matmul="mosaic"):
-            records = compile_mosaic_kernels(
-                [KernelCase(f"fp8_weight_{fmt}_sm80", lambda: (compiled_fp8, (x_s, w_spec)))], "sm80")
-        for rec in records:
-            assert not rec.get("error"), rec
-            assert rec["kernels"], rec
-            assert all(k.get("spilled") == 0 for k in rec["kernels"]), rec
-
-
-@pytest.mark.parametrize("fmt", ["e4m3", "e5m2"])
-def test_stage_decoded_fp8_preserves_nonfinite_codewords(fmt: str):
-    """`packed.stage_decoded_fp8` shares `bits.fp8_restored` with `bits.fp8_codes`, preserving E4M3 NaN
-    (`0x7F`/`0xFF`) and E5M2 +/-inf/NaN (`0x7C`/`0xFC`/`0x7D`..`0x7F`) bitwise identically (row 8548)."""
-    from dew.nn.kernels.templates.gemm import packed
-
-    minifloat = packed.fp8_minifloat(fmt)
-    codes_1d = np.arange(256, dtype=np.uint32)
-    codes = np.broadcast_to(codes_1d[:64, None], (64, 64)).copy()
-    codes[0, 0] = 0x7F
-    codes[1, 0] = 0xFF
-    if fmt == "e5m2":
-        codes[2, 0] = 0x7C
-        codes[3, 0] = 0xFC
-        codes[4, 0] = 0x7D
-        codes[5, 0] = 0xFD
-    staged_codes = codes[formats.fp8_staged_rows(64), :]
-    packed_words = bits.fp8_packed(jnp.asarray(staged_codes.T, jnp.uint32), minifloat)
-
-    from low_precision_support import StageRef
-
-    out = StageRef(np.zeros((64, 64), dtype=jnp.bfloat16))
-    packed.stage_decoded_fp8([StageRef(packed_words)], out, fmt, interpret=True)
-    inv = np.argsort(formats.fp8_staged_rows(64))
-    expected = bits.fp8_codes(packed_words.T, minifloat, jnp.bfloat16)[inv].T
-    np.testing.assert_array_equal(
-        np.asarray(jax.lax.bitcast_convert_type(jnp.asarray(out.arr, jnp.bfloat16), jnp.uint16)),
-        np.asarray(jax.lax.bitcast_convert_type(expected, jnp.uint16)),
-    )
-    unpermuted = np.asarray(out.arr, np.float32)
-    assert np.isnan(unpermuted[0, 0]) and np.isnan(unpermuted[0, 1])
-    if fmt == "e5m2":
-        assert np.isposinf(unpermuted[0, 2]) and np.isneginf(unpermuted[0, 3])
-        assert np.isnan(unpermuted[0, 4]) and np.isnan(unpermuted[0, 5])
-    # Feed pre-encoded NaN and +-Inf through the public gemm.fp8_weight_product boundary (row 12100).
-    col_codes = np.zeros((64, 64), dtype=np.uint32)
-    col_codes[0, 0], col_codes[0, 1] = 0x7F, 0xFF
-    if fmt == "e5m2":
-        col_codes[0, 2], col_codes[0, 3] = 0x7C, 0xFC
-        col_codes[0, 4], col_codes[0, 5] = 0x7D, 0xFD
-    col_words = bits.fp8_packed(jnp.asarray(col_codes[formats.fp8_staged_rows(64), :].T, jnp.uint32),
-                                minifloat)
-    bank = formats.Fp8Weights(col_words, jnp.ones((), jnp.float32), formats.fp8_form_version(fmt), fmt=fmt)
-    sel = jnp.zeros((64, 64), jnp.bfloat16).at[:, 0].set(1.0)
-    for interpret in (False, True):
-        ctx = generation.chosen(grouped_matmul="mosaic") if interpret else contextlib.nullcontext()
-        with ctx:
-            got = np.asarray(gemm.fp8_weight_product(sel, bank, out_dtype=jnp.float32,
-                                                     interpret_on_cpu=interpret))
-        assert np.isnan(got[0, 0]) and np.isnan(got[0, 1])
-        if fmt == "e5m2":
-            assert np.isposinf(got[0, 2]) and np.isneginf(got[0, 3])
-            assert np.isnan(got[0, 4]) and np.isnan(got[0, 5])
-
 
 @pytest.mark.parametrize("gpu", [pytest.param("sm80", marks=lowers("sm80")),
                                  pytest.param("sm90", marks=lowers("sm90"))])
@@ -727,9 +572,9 @@ def test_gemm_quantized_nvfp4_block_matches_bits_nvfp4_coded_and_lowers(gpu: str
             x_s, w_s, s_s).lower(lowering_platforms=("cuda",))
 
 
-def test_fp8_and_ternary_weights_checkpoint_restore_verifies_form_and_scale(tmp_path):
-    """Checkpoint restore (`dew.checkpoints._packed_checked`) restores matching `Fp8Weights` and
-    `TernaryWeights` banks and refuses mismatched form versions or invalid scale shapes (row 12161)."""
+def test_ternary_weights_checkpoint_restore_verifies_form_and_scale(tmp_path):
+    """Checkpoint restore (`dew.checkpoints._packed_checked`) restores a matching `TernaryWeights` bank and
+    refuses a mismatched form version or an invalid scale shape (row 12161)."""
     from dew.checkpoints import Checkpoints
 
     where = jax.sharding.SingleDeviceSharding(jax.devices()[0])
@@ -738,18 +583,322 @@ def test_fp8_and_ternary_weights_checkpoint_restore_verifies_form_and_scale(tmp_
         return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=where), of)
 
     bad_form = np.frombuffer(bytes.fromhex("0" * 16), np.uint8).copy()
-    fp8_ok = formats.Fp8Weights.of(np.ones((64, 64), np.float32), fmt="e4m3", scale=2.0)
-    tern_ok = formats.TernaryWeights.of(np.ones((256, 64), np.float32), scale=2.0)
-    for label, good in (("fp8", fp8_ok), ("ternary", tern_ok)):
-        ok_ckpt = Checkpoints(str(tmp_path / f"{label}_ok"))
-        ok_ckpt.save(1, {"w": good})
-        ok_ckpt.wait()
-        restored = Checkpoints(str(tmp_path / f"{label}_ok")).restore(template({"w": good}))[0]["w"]
-        np.testing.assert_array_equal(np.asarray(restored.words), np.asarray(good.words))
-        for tag, bad in (("form", dataclasses.replace(good, form=bad_form)),
-                         ("scale", dataclasses.replace(good, scale=jnp.ones((3,), jnp.float32)))):
-            bad_ckpt = Checkpoints(str(tmp_path / f"{label}_{tag}"))
-            bad_ckpt.save(1, {"w": bad})
-            bad_ckpt.wait()
-            with pytest.raises(ValueError):
-                Checkpoints(str(tmp_path / f"{label}_{tag}")).restore(template({"w": bad}))
+    good = formats.TernaryWeights.of(np.ones((256, 64), np.float32), scale=2.0)
+    ok_ckpt = Checkpoints(str(tmp_path / "ok"))
+    ok_ckpt.save(1, {"w": good})
+    ok_ckpt.wait()
+    restored = Checkpoints(str(tmp_path / "ok")).restore(template({"w": good}))[0]["w"]
+    np.testing.assert_array_equal(np.asarray(restored.words), np.asarray(good.words))
+    for tag, bad in (("form", dataclasses.replace(good, form=bad_form)),
+                     ("scale", dataclasses.replace(good, scale=jnp.ones((3,), jnp.float32)))):
+        bad_ckpt = Checkpoints(str(tmp_path / tag))
+        bad_ckpt.save(1, {"w": bad})
+        bad_ckpt.wait()
+        with pytest.raises(ValueError):
+            Checkpoints(str(tmp_path / tag)).restore(template({"w": bad}))
+
+
+@INTERPRETS
+def test_an_nvfp4_products_rescue_leaves_a_nan_block_scale_to_its_own_coordinates():
+    """Codes +1, -1 and +1 at input coordinate 0 beside a NaN block scale at coordinates 16 to 31 of
+    another column, a factor of 4, under cotangents 2**126, 2**126 and 1: coordinate 0's gradient is 4 and
+    the NaN block's coordinates are IEEE's NaN, every other zero (rows 1464, 12403)."""
+    codes = jnp.zeros((512, 128), jnp.float32).at[0, :3].set(jnp.asarray([1.0, -1.0, 1.0]))
+    scales = jnp.ones((32, 128), jnp.float8_e4m3fn).at[1, 3].set(jnp.nan)
+    matrix = formats.NvFp4.of(codes, scales, jnp.float32(4.0))
+    _, pull = jax.vjp(lambda rows: gemm.nvfp4_product(rows, matrix, out_dtype=jnp.float32),
+                      jnp.zeros((4, 512), jnp.float32))
+    (d_x,) = pull(jnp.zeros((4, 128), jnp.float32).at[0, :3].set(
+        jnp.asarray([2.0 ** 126, 2.0 ** 126, 1.0], jnp.float32)))
+    got = np.array(d_x)
+    assert np.isnan(got[:, 16:32]).all(), got[:, 16:32]
+    want = np.zeros((4, 512), np.float32)
+    want[0, 0] = 4.0
+    got[:, 16:32] = 0.0
+    np.testing.assert_array_equal(got, want)
+
+
+def test_the_rescues_routes_add_into_their_tokens_alike_at_any_fan_in():
+    """Carried limbs of seven routes into three tokens (`factored._routed`), one route a carry or all at
+    once: the same carried digits, the tokens' exact sums (rows 1464, 12403)."""
+    from dew.nn.kernels.templates.gemm import factored
+
+    rng = np.random.default_rng(12403)
+    digits = rng.integers(0, 2 ** factored.FACTORED_SLICE, size=(5, 7, 4)).astype(np.int32)
+    digits[0] = rng.integers(-3, 4, size=(7, 4))
+    gather = jnp.asarray([0, 2, 0, 1, 2, 2, 0], jnp.int32)
+    tokens = jnp.zeros((5, 3, 4), jnp.int32)
+    one = np.asarray(factored._routed(tokens, gather, jnp.asarray(digits), fan_in=1))
+    whole = np.asarray(factored._routed(tokens, gather, jnp.asarray(digits)))
+    np.testing.assert_array_equal(one, whole)
+    weights = 2 ** (factored.FACTORED_SLICE * np.arange(4, -1, -1, dtype=np.int64))
+    value = np.tensordot(weights, digits.astype(np.int64), axes=1)
+    want = np.zeros((3, 4), np.int64)
+    np.add.at(want, np.asarray(gather), value)
+    np.testing.assert_array_equal(np.tensordot(weights, one.astype(np.int64), axes=1), want)
+    assert (one[1:] >= 0).all() and (one[1:] < 2 ** factored.FACTORED_SLICE).all()
+
+
+def test_the_rescues_rounding_reads_a_leading_limb_past_one_digit():
+    """A sum whose first limb (`factored._rounded`'s, of any int32 size) is 128, past one digit: 2**169 at a
+    unit of 2**162 is +inf (-inf negated), not its wrapped bits; 128 + 2**-6 at a unit of one is exact, and
+    2**30 at a unit of 2**-40 is 2**-10 (rows 1464, 12403)."""
+    from dew.nn.kernels.templates.gemm import factored
+
+    def rounded(digits, unit):
+        limbs = jnp.zeros((8, 1, 1), jnp.int32).at[:len(digits), 0, 0].set(jnp.asarray(digits, jnp.int32))
+        return float(factored._rounded(limbs, jnp.full((1, 1), unit, jnp.int32))[0, 0])
+
+    assert np.isposinf(rounded([128], 162)) and np.isneginf(rounded([-128], 162))
+    assert rounded([128, 1], 0) == 128.0 + 2.0 ** -6
+    assert rounded([2 ** 30], -40) == 2.0 ** -10
+
+
+@INTERPRETS
+def test_an_nvfp4_products_input_gradient_cancels_past_fp32s_largest():
+    """An NVFP4 product's input gradient where each cotangent times the matrix's factor (2**8 owed times a
+    tensor scale of 2**110) passes fp32's largest, against codes +1 and -1 that cancel: 0, not inf - inf;
+    a cotangent of 3 * 2**126 at a factor of 3 (a tensor scale of 3/256) against a +1 code of block scale
+    one, 2**-8 decoded: 9 * 2**118, its product with the factor's significand moved, not overflowed.
+    Gathered, one token routed to two experts, the first's cancelling (cotangents 2**100 at a tensor scale
+    of 2**110) beside the second's +1 code under a cotangent of 2**-30 at a tensor scale of 2**-8: the
+    token's gradient is that second route's 2**-38; two routes' cotangents sum before they round; a gather
+    routing none pulls back zeros (row 1464's transpose, `factored`)."""
+    codes = jnp.zeros((512, 128), jnp.float32).at[0, 0].set(1.0).at[0, 1].set(-1.0)
+    scales = jnp.ones((32, 128), jnp.float8_e4m3fn)
+    x = jnp.zeros((4, 512), jnp.float32).at[:, 0].set(1.0)
+    matrix = formats.NvFp4.of(codes, scales, jnp.float32(2.0 ** 110))
+    _, pull = jax.vjp(lambda rows: gemm.nvfp4_product(rows, matrix, out_dtype=jnp.float32), x)
+    (d_x,) = pull(jnp.zeros((4, 128), jnp.float32).at[:2, :2].set(2.0 ** 20))
+    np.testing.assert_array_equal(np.asarray(d_x), np.zeros((4, 512), np.float32))
+
+    single = formats.NvFp4.of(jnp.zeros((512, 128), jnp.float32).at[0, 0].set(1.0), scales,
+                              jnp.float32(3.0 / 256.0))
+    _, pull = jax.vjp(lambda rows: gemm.nvfp4_product(rows, single, out_dtype=jnp.float32), x)
+    (d_x,) = pull(jnp.zeros((4, 128), jnp.float32).at[0, 0].set(3.0 * 2.0 ** 126))
+    want = np.zeros((4, 512), np.float32)
+    want[0, 0] = 9.0 * 2.0 ** 118
+    np.testing.assert_array_equal(np.asarray(d_x), want)
+
+    second = jnp.zeros((512, 128), jnp.float32).at[0, 2].set(1.0)
+    bank = formats.NvFp4.of(jnp.stack([codes, second]), jnp.stack([scales, scales]),
+                            jnp.asarray([2.0 ** 110, 2.0 ** -8], jnp.float32))
+    token = jnp.zeros((1, 512), jnp.float32).at[0, 0].set(1.0)
+    _, pull = jax.vjp(lambda rows: gemm.nvfp4_product(rows, bank, jnp.asarray([1, 1], jnp.int32),
+                                                      jnp.asarray([0, 0], jnp.int32), out_dtype=jnp.float32),
+                      token)
+    (d_token,) = pull(jnp.zeros((2, 128), jnp.float32).at[0, :2].set(2.0 ** 100).at[1, 2].set(2.0 ** -30))
+    want = np.zeros((1, 512), np.float32)
+    want[0, 0] = 2.0 ** -38
+    np.testing.assert_array_equal(np.asarray(d_token), want)
+
+    # Routed twice through the packed kernel to one +1 code of unit block scale (2**-8 decoded, a tensor
+    # scale of 2**-8, so a factor of one), its routes' cotangents 256 and -255.5 sum to 0.5 in fp32 before
+    # rounding, as the packed kernel's pullback sums them: 2**-9, not each route rounded to bf16's 1 and -1.
+    one = formats.NvFp4.of(jnp.zeros((1, 512, 128), jnp.float32).at[0, 0, 0].set(1.0), scales[None],
+                           jnp.asarray([2.0 ** -8], jnp.float32))
+    twice, both = jnp.asarray([2], jnp.int32), jnp.asarray([0, 0], jnp.int32)
+    with generation.assumed("sm90"), generation.chosen(nvfp4="packed"):
+        _, pull = jax.vjp(lambda rows: gemm.nvfp4_product(rows, one, twice, both, out_dtype=jnp.float32,
+                                                          interpret_on_cpu=True), token)
+        (d_token,) = pull(jnp.zeros((2, 128), jnp.float32).at[0, 0].set(256.0).at[1, 0].set(-255.5))
+    want = np.zeros((1, 512), np.float32)
+    want[0, 0] = 2.0 ** -9
+    np.testing.assert_array_equal(np.asarray(d_token), want)
+
+    # Beside a route whose products cancel past fp32's largest (the plain transpose not finite there), the
+    # same token's routes of 256 and -255.5 through a 2**-8 value still sum wide: 2**-9, packed or decoded.
+    mixed = formats.NvFp4.of(jnp.stack([codes, second]), jnp.stack([scales, scales]),
+                             jnp.asarray([2.0 ** 110, 2.0 ** -8], jnp.float32))
+    thrice = jnp.asarray([0, 0, 0], jnp.int32)
+    for kernel in ("packed", "xla"):
+        with generation.assumed("sm90"), generation.chosen(nvfp4=kernel):
+            _, pull = jax.vjp(lambda rows: gemm.nvfp4_product(
+                rows, mixed, jnp.asarray([1, 2], jnp.int32), thrice, out_dtype=jnp.float32,
+                interpret_on_cpu=True), token)
+            (d_token,) = pull(jnp.zeros((3, 128), jnp.float32).at[0, :2].set(2.0 ** 100)
+                              .at[1, 2].set(256.0).at[2, 2].set(-255.5))
+        want = np.zeros((1, 512), np.float32)
+        want[0, 0] = 2.0 ** -9
+        np.testing.assert_array_equal(np.asarray(d_token), want, err_msg=kernel)
+
+    # Two routes of one token far apart: one cancelling at 2**240 on input 0, the other's products peaking
+    # at 2**97 on input 1 and giving input 0 2**-28, each summed exactly (`aligned_segment_sum`).
+    far = (jnp.zeros((2, 512, 128), jnp.float32).at[0, 0, 0].set(1.0).at[0, 0, 1].set(-1.0)
+           .at[1, 1, 2].set(1.0).at[1, 0, 3].set(1.0))
+    wide_bank = formats.NvFp4.of(far, jnp.stack([scales, scales]), jnp.asarray([2.0 ** 112, 2.0 ** -8],
+                                                                                jnp.float32))
+    pair, two = jnp.asarray([1, 1], jnp.int32), jnp.asarray([0, 0], jnp.int32)
+    tokens2 = jnp.zeros((1, 512), jnp.float32).at[0, :2].set(1.0)
+    for kernel in ("packed", "xla"):
+        with generation.assumed("sm90"), generation.chosen(nvfp4=kernel):
+            routed = functools.partial(gemm.nvfp4_product, matrix=wide_bank, group_sizes=pair, gather=two,
+                                       out_dtype=jnp.float32, interpret_on_cpu=True)
+            _, pull = jax.vjp(routed, tokens2)
+            (d_token,) = pull(jnp.zeros((2, 128), jnp.float32).at[0, :2].set(2.0 ** 120)
+                              .at[1, 2].set(2.0 ** 97).at[1, 3].set(2.0 ** -20))
+        want = np.zeros((1, 512), np.float32)
+        want[0, 0], want[0, 1] = 2.0 ** -28, 2.0 ** 89
+        np.testing.assert_array_equal(np.asarray(d_token), want, err_msg=kernel)
+
+    # One route's products cancelling at 2**252 beside a third, 2**-126 times its factor, on the same input:
+    # each band of the route pulled back apart, the third keeps its 2**-8.
+    three = jnp.zeros((1, 512, 128), jnp.float32).at[0, 0, :3].set(jnp.asarray([1.0, -1.0, 1.0]))
+    lone = formats.NvFp4.of(three, scales[None], jnp.asarray([2.0 ** 118], jnp.float32))
+    with generation.assumed("sm90"), generation.chosen(nvfp4="xla"):
+        _, pull = jax.vjp(lambda rows: gemm.nvfp4_product(rows, lone, jnp.asarray([1], jnp.int32),
+                                                          jnp.asarray([0], jnp.int32), out_dtype=jnp.float32),
+                          token)
+        cotangent = jnp.zeros((1, 128), jnp.float32).at[0, :2].set(2.0 ** 126).at[0, 2].set(2.0 ** -126)
+        (d_token,) = pull(cotangent)
+    want = np.zeros((1, 512), np.float32)
+    want[0, 0] = 2.0 ** -8
+    np.testing.assert_array_equal(np.asarray(d_token), want)
+
+    # A gather routing no token pulls back zeros.
+    none, nowhere = jnp.asarray([0, 0], jnp.int32), jnp.zeros((0,), jnp.int32)
+    routed = functools.partial(gemm.nvfp4_product, matrix=bank, group_sizes=none, gather=nowhere,
+                               out_dtype=jnp.float32)
+    _, pull = jax.vjp(routed, token)
+    (d_none,) = pull(jnp.zeros((0, 128), jnp.float32))
+    np.testing.assert_array_equal(np.asarray(d_none), np.zeros((1, 512), np.float32))
+
+
+@pytest.mark.mesh(devices=2)
+def test_an_nvfp4_products_gathered_gradient_in_a_checked_map_is_the_tokens_sum():
+    """An NVFP4 bank's gathered product in a `shard_map` over two CPU devices that checks the axes its values
+    vary over, the tokens and bank every device's and each device its own routing table: the tokens'
+    gradient is each device's routes summed into their tokens and over the devices, as the product written
+    plainly over the decoded bank gives it, exactly, over small integers (row 1464)."""
+    rng = np.random.default_rng(14641)
+    codes = jnp.asarray(rng.integers(-2, 3, (2, 512, 128)), jnp.float32)
+    bank = formats.NvFp4.of(codes, jnp.ones((2, 32, 128), jnp.float8_e4m3fn),
+                            jnp.asarray([2.0 ** -8, 2.0 ** -7], jnp.float32))
+    decoded = jnp.asarray(bank.decoded(), jnp.float32)
+    tokens = jnp.asarray(rng.integers(-3, 4, (4, 512)), jnp.float32)
+    tables = jnp.asarray([0, 1, 2, 3, 3, 2, 1, 0], jnp.int32)
+    sizes = jnp.asarray([2, 2], jnp.int32)
+    weights = jnp.asarray(rng.integers(-2, 3, (8, 128)), jnp.float32)
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:2]), ("data",))
+    data, whole = jax.sharding.PartitionSpec("data"), jax.sharding.PartitionSpec()
+
+    def packed(x, table, w):
+        return jnp.sum(gemm.nvfp4_product(x, bank, sizes, table, out_dtype=jnp.float32) * w)
+
+    def plain(x, table, w):
+        experts = jnp.repeat(jnp.arange(2), sizes, total_repeat_length=table.shape[0])
+        rows = x[table].astype(jnp.bfloat16).astype(jnp.float32)
+        return jnp.sum(jnp.einsum('rd,rdw->rw', rows, decoded[experts]) * bank.factor[experts][:, None] * w)
+
+    def gradient(product):
+        def each_device(x, table, w):
+            return jax.grad(product)(x, table, w)
+
+        return jax.jit(jax.shard_map(each_device, mesh=mesh, in_specs=(whole, data, data), out_specs=whole,
+                                     check_vma=True))(tokens, tables, weights)
+
+    np.testing.assert_array_equal(np.asarray(gradient(packed)), np.asarray(gradient(plain)))
+
+
+@pytest.mark.mesh(devices=2)
+def test_an_nvfp4_products_gathered_rescue_sums_devices_routes_before_it_moves_them_back():
+    """One token every device holds, each of two CPU devices routing it to its own expert in a checked
+    `shard_map`, +1 on one and -1 on the other at a tensor scale of 2**110 under a cotangent of 2**30: each
+    device's partial, +-2**140, is past fp32's largest, and their sum is 0, not inf - inf, summed while
+    still moved by the token's shared power; beside them, the first device's second route, a +1 at a
+    tensor scale of 2**-8 under a cotangent of 2**-30, keeps its 2**-38 unmoved (row 1464)."""
+    codes = (jnp.zeros((3, 512, 128), jnp.float32).at[0, 0, 0].set(1.0).at[1, 0, 0].set(-1.0)
+             .at[2, 0, 2].set(1.0))
+    bank = formats.NvFp4.of(codes, jnp.ones((3, 32, 128), jnp.float8_e4m3fn),
+                            jnp.asarray([2.0 ** 110, 2.0 ** 110, 2.0 ** -8], jnp.float32))
+    token = jnp.zeros((1, 512), jnp.float32).at[0, 0].set(1.0)
+    tables = jnp.zeros((4,), jnp.int32)
+    sizes = jnp.asarray([1, 0, 1, 0, 1, 1], jnp.int32)
+    cotangents = jnp.zeros((4, 128), jnp.float32).at[0, 0].set(2.0 ** 30).at[1, 2].set(2.0 ** -30)
+    cotangents = cotangents.at[2, 0].set(2.0 ** 30)
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:2]), ("data",))
+    data, whole = jax.sharding.PartitionSpec("data"), jax.sharding.PartitionSpec()
+
+    def each_device(x, table, size, w):
+        return jax.grad(lambda x: jnp.sum(gemm.nvfp4_product(x, bank, size, table, out_dtype=jnp.float32)
+                                          * w))(x)
+
+    d_token = jax.jit(jax.shard_map(each_device, mesh=mesh, in_specs=(whole, data, data, data),
+                                    out_specs=whole, check_vma=True))(token, tables, sizes, cotangents)
+    want = np.zeros((1, 512), np.float32)
+    want[0, 0] = 2.0 ** -38
+    np.testing.assert_array_equal(np.asarray(d_token), want)
+
+
+def test_an_nvfp4_products_dense_rescue_keeps_each_product_through_its_band():
+    """An NVFP4 product's input gradient past fp32's largest, one row: input 0's codes +1, -1, +1 and input
+    1's +1 under four cotangents, each product kept through its band (`factored`'s), whatever lies beside it:
+    2**101 of 2**100, 2**100, 2**79 at a factor of 2**30; 2**-8 of 2**-126 beside 2**126s at a factor of
+    2**126, input 1's 2**244 past fp32's largest; 2**9 of a 2**-99 through an entry of 2**-18 (a code of 0.5
+    at a block scale of 2**-9) beside cancelling 2**126s; and 2**33 of 2**-85 beside cancelling 2**-126s
+    (row 1464)."""
+    scales = jnp.ones((32, 128), jnp.float8_e4m3fn)
+    row = jnp.zeros((1, 512), jnp.float32).at[0, :2].set(1.0)
+    spread = jnp.zeros((512, 128), jnp.float32).at[0, :3].set(jnp.asarray([1.0, -1.0, 1.0])).at[1, 3].set(1.0)
+    fine = scales.at[0, 2].set(jnp.float8_e4m3fn(2.0 ** -9))
+
+    def pulled(tensor, cotangent, codes=spread, blocks=scales):
+        matrix = formats.NvFp4.of(codes, blocks, jnp.float32(tensor))
+        _, pull = jax.vjp(lambda rows: gemm.nvfp4_product(rows, matrix, out_dtype=jnp.float32), row)
+        (d_row,) = pull(jnp.zeros((1, 128), jnp.float32).at[0, :4].set(jnp.asarray(cotangent, jnp.float32)))
+        return np.asarray(d_row)[0, :2]
+
+    np.testing.assert_array_equal(pulled(2.0 ** 22, (2.0 ** 100, 2.0 ** 100, 2.0 ** 79, 0.0)),
+                                  np.float32([2.0 ** 101, 0.0]))
+    np.testing.assert_array_equal(pulled(2.0 ** 118, (2.0 ** 100, 2.0 ** 100, 2.0 ** -126, 2.0 ** 126)),
+                                  np.float32([2.0 ** -8, np.inf]))
+    halves = spread.at[0, 2].set(0.5)
+    np.testing.assert_array_equal(pulled(2.0 ** 118, (2.0 ** 126, 2.0 ** 126, 2.0 ** -99, 0.0), halves, fine),
+                                  np.float32([2.0 ** 9, 0.0]))
+    plus = spread.at[0, :3].set(jnp.asarray([1.0, 1.0, -1.0]))
+    cotangent = (2.0 ** -85, 2.0 ** -126, 2.0 ** -126, 2.0 ** 126)
+    np.testing.assert_array_equal(pulled(2.0 ** 118, cotangent, plus), np.float32([2.0 ** 33, np.inf]))
+
+
+def test_an_nvfp4_products_rescue_keeps_ieee_and_subnormal_operands():
+    """Beside a product past fp32's largest (which takes the rescue): an infinite cotangent's entries are
+    IEEE's, as float64's transpose gives them (inf through a +1 code, NaN through every 0 one); and a
+    subnormal cotangent's product, 2**-149 times a factor of 2**126 through a 2**-8 entry, is 2**-31, read
+    from its bits where a process flushes subnormal operands (row 1464)."""
+    scales = jnp.ones((32, 128), jnp.float8_e4m3fn)
+    codes = jnp.zeros((512, 128), jnp.float32).at[0, 0].set(1.0).at[1, 1].set(1.0).at[2, 2].set(1.0)
+    matrix = formats.NvFp4.of(codes, scales, jnp.float32(2.0 ** 118))
+    row = jnp.zeros((1, 512), jnp.float32).at[0, :3].set(1.0)
+    _, pull = jax.vjp(lambda rows: gemm.nvfp4_product(rows, matrix, out_dtype=jnp.float32), row)
+    infinite = jnp.zeros((1, 128), jnp.float32).at[0, 0].set(2.0 ** 126).at[0, 1].set(jnp.inf)
+    (d_row,) = pull(infinite)
+    with np.errstate(invalid="ignore", over="ignore"):
+        products = np.asarray(infinite, np.float64) * 2.0 ** 126
+        truth = (products @ (np.asarray(codes, np.float64).T * 2.0 ** -8)).astype(np.float32)
+    np.testing.assert_array_equal(np.isnan(np.asarray(d_row)), np.isnan(truth))
+    np.testing.assert_array_equal(np.isinf(np.asarray(d_row)), np.isinf(truth))
+    subnormal = jnp.zeros((1, 128), jnp.float32).at[0, 0].set(2.0 ** 126)
+    subnormal = subnormal.at[0, 2].set(jnp.float32(2.0 ** -149))
+    (d_row,) = pull(subnormal)
+    want = np.zeros((512,), np.float32)
+    want[0], want[2] = np.inf, 2.0 ** -31
+    np.testing.assert_array_equal(np.asarray(d_row)[0], want)
+
+
+def test_an_nvfp4_products_gathered_rescue_sums_across_its_bands_seam_exactly():
+    """One token routed to four experts at a factor of 2**126 each: a route's product of 2**165 just above a
+    band's seam (2**183 through 2**-18), another's of -2**165 just below it (2**182 through -2**-17), a
+    third's 2**125 below it too, and a fourth's 2**244 on input 1, past fp32's largest: input 0's gradient
+    is 2**125, every band's routes summed into the token exactly before one rounding, not each band rounded
+    apart (row 1464)."""
+    codes = jnp.zeros((4, 512, 128), jnp.float32)
+    codes = codes.at[0, 0, 0].set(0.5).at[1, 0, 0].set(-1.0).at[2, 0, 0].set(0.5).at[3, 1, 1].set(1.0)
+    scales = jnp.ones((4, 32, 128), jnp.float8_e4m3fn).at[:3, 0, 0].set(jnp.float8_e4m3fn(2.0 ** -9))
+    bank = formats.NvFp4.of(codes, scales, jnp.full((4,), 2.0 ** 118, jnp.float32))
+    token = jnp.zeros((1, 512), jnp.float32).at[0, :2].set(1.0)
+    routed = functools.partial(gemm.nvfp4_product, matrix=bank, group_sizes=jnp.ones((4,), jnp.int32),
+                               gather=jnp.zeros((4,), jnp.int32), out_dtype=jnp.float32)
+    _, pull = jax.vjp(routed, token)
+    cotangent = jnp.zeros((4, 128), jnp.float32).at[0, 0].set(2.0 ** 57).at[1, 0].set(2.0 ** 56)
+    (d_token,) = pull(cotangent.at[2, 0].set(2.0 ** 17).at[3, 1].set(2.0 ** 126))
+    np.testing.assert_array_equal(np.asarray(d_token)[0, :3], np.float32([2.0 ** 125, np.inf, 0.0]))

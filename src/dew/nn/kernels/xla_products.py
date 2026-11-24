@@ -6,6 +6,7 @@ GEMM's own portable branch (`kernels.gemm`): its products as the call's precisio
 
 import contextlib
 import functools
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -170,9 +171,7 @@ def xla_ragged_dot(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     grouped = jnp.arange(tokens.shape[0], dtype=index_dtype)[:, None] < jnp.sum(
         group_sizes, dtype=index_dtype
     )
-    product = functools.partial(jax.lax.ragged_dot_general, ragged_dot_dimension_numbers=_GROUPED_ROWS,
-                                precision=precision,
-                                out_sharding=ragged_placement(((tokens, 0), (kernel, kernel.ndim - 1))))
+    product = ragged_product(tokens, kernel, precision=precision)
     out = accumulated(product, jnp.where(grouped, tokens, 0), kernel, group_sizes,
                       preferred_element_type=preferred_element_type)
     return jnp.where(grouped, out, 0)
@@ -183,20 +182,47 @@ _GROUPED_ROWS = jax.lax.RaggedDotDimensionNumbers(
 """`jax.lax.ragged_dot`'s own: each group's rows of `[rows, depth]` times its `[depth, width]` matrix."""
 
 
+def ragged_product(values: jax.Array, matrices: jax.Array, *,
+                   precision: PrecisionLike = None) -> Callable[..., jax.Array]:
+    """`jax.lax.ragged_dot_general` bound for `values` times `matrices` (`product(values, matrices,
+    group_sizes, preferred_element_type=...)`): its grouped rows, `precision`, and its output placed where an
+    Explicit mesh axis places its operands (`ragged_placement`): JAX infers no placement for a ragged dot
+    there (row 12401). A partial of the primitive itself, which `precision.accumulated` reads as a ragged
+    dot, its group sizes counted, not multiplied (row 12460)."""
+    return functools.partial(jax.lax.ragged_dot_general, ragged_dot_dimension_numbers=_GROUPED_ROWS,
+                             precision=precision,
+                             out_sharding=ragged_placement(((values, 0), (matrices, matrices.ndim - 1))))
+
+
+def placed_ragged_dot(values: jax.Array, matrices: jax.Array, group_sizes: jax.Array, *,
+                      precision: PrecisionLike = None,
+                      preferred_element_type: Dtype | None = None) -> jax.Array:
+    """`jax.lax.ragged_dot` as written (its one primitive, which a fuser reads as the program's dot), placed
+    where an Explicit mesh axis places its operands (`ragged_product`)."""
+    return ragged_product(values, matrices, precision=precision)(
+        values, matrices, group_sizes, preferred_element_type=preferred_element_type)
+
+
 def ragged_placement(sources: tuple) -> jax.sharding.NamedSharding | None:
     """Where a ragged product lands where an operand's type places it on a mesh with Explicit axes, split or
     not (`out_sharding`: JAX infers no placement for a ragged dot, "Explicit sharding inference for
     ragged_dot_general is not currently implemented"): each output dimension placed as the operand
     dimension it comes from (`sources`, each `(operand, axis)`, or None for one no operand dimension gives: a
-    group axis), a contraction's sum whole, a mesh axis placing two dimensions placing the first alone; None
-    where no operand's type names such a mesh."""
+    group axis), a contraction's sum whole, a mesh axis placing two dimensions placing the first alone; whole
+    on the context's mesh where no operand's type names one but the context's has an Explicit axis; None
+    otherwise."""
     from dew.mesh import mesh_axes
     from dew.nn.sharding import explicit_placement
 
     shardings = [None if source is None else explicit_placement(jax.typeof(source[0])) for source in sources]
     mesh = next((each.mesh for each in shardings if each is not None), None)
     if mesh is None:
-        return None
+        # Operands no mesh types (a jitted program's constants) under a context mesh with an Explicit axis,
+        # which still asks a ragged dot its placement: whole on it.
+        context = jax.sharding.get_abstract_mesh()
+        if context.empty or not context.explicit_axes:
+            return None
+        return jax.sharding.NamedSharding(context, jax.sharding.PartitionSpec())
     spec, used = [], set()
     for source, each in zip(sources, shardings, strict=True):
         axis = 0 if source is None else source[1] % source[0].ndim

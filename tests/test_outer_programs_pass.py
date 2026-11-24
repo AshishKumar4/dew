@@ -19,7 +19,7 @@ from dew.nn.kernels import options
 from dew.nn.kernels.templates import report
 from dew.objectives.rl import GRPOObjective, RolloutScheduler
 from dew.sampling.text import Sampling
-from dew.training import Layout, Trainer
+from dew.training import Layout, Trainer, TrainerAdvanced
 from dew.training.evaluation import Evaluation
 
 
@@ -48,7 +48,8 @@ def test_a_host_master_step_compiles_its_phases_through_the_pass_and_an_evaluati
     of the run's weights its own program, with its pass. (A layout keeping only the optimizer state on the
     host steps on the devices, one program, which shows no phase.)"""
     trainer = Trainer(Features(), optax.adam(0.1), key=jax.random.key(0),
-                      layout=Layout(min_shard=1, tolerance=1.0, host=("variables",)))
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0, host=("variables",
+                                                                                               ))))
     state = trainer.initial_state()
     batch = next(iter(Counting()))
     names, passes = compiled_in(passed, lambda: trainer.compile(state, batch)(state, batch))

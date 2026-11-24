@@ -104,8 +104,8 @@ def _fine_tuning(rows: tuple[int, ...], dtype: str):
     objective = LMObjective(pretrained, WIDTH - 1, ema_decay=None)
     schedule = Cosine(peak_value=OPTIONS["lr_peak"], warmup_steps=OPTIONS["warmup"],
                       end_value=OPTIONS["lr_end"], init_value=OPTIONS["lr_init"])
-    solver = OptimConfig(optimizer=AdamW(eps=1e-8, b1=0.9, b2=0.95, weight_decay=0.1), learning_rate=schedule,
-                         clip_grads=1.0, param_groups=(ParamGroup("all", ("*",)),)).build(STEPS)
+    solver = OptimConfig(optimizer=AdamW(eps=1e-8, b1=0.9, b2=0.95, weight_decay=0.1), schedule=schedule,
+                         clip=1.0, param_groups=(ParamGroup("all", ("*",)),)).build(STEPS)
     trainer = Trainer(objective, solver, key=jax.random.key(0), mesh=MeshSpec(), checkpoints=None,
                       tracker=None)
     state, _, _ = trainer.place()

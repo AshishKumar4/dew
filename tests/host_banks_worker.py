@@ -19,6 +19,8 @@ from pathlib import Path
 from flax import linen as nn
 from process_support import serve_mode, worker_parser
 
+from dew.training import TrainerAdvanced
+
 VOCAB = 32
 SEQ_LEN = 8
 PROMPT = 5
@@ -142,7 +144,8 @@ def _checkpointed(args, scanned, plain, tokens, mesh, resident_layout, host_layo
     # The run trains its plain loop a layer at a time, as its banks' reader does not.
     with generation.chosen(layer_scan="plain"):
         trainer = Trainer(LMObjective(plain, SEQ_LEN - 1, head_chunks=1), optax.sgd(0.1),
-                          key=jax.random.PRNGKey(0), mesh=mesh, layout=resident_layout,
+                          key=jax.random.PRNGKey(0), mesh=mesh,
+                          advanced=TrainerAdvanced(layout=resident_layout),
                           checkpoints=checkpoints)
         state, _, _ = trainer.place()
         batch = {"text": np.tile(np.arange(1, SEQ_LEN + 1, dtype=np.int32)[None],

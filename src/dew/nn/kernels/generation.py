@@ -124,6 +124,7 @@ class Choice(enum.StrEnum):
     """How a decoder's stack compiles, decided without a selector (`dew.nn.backbones.decoder_stages.scanned`):
     "scanned", the default (row 4074), runs each run of like layers and each period's repeats under one
     scanned body; "plain" runs every layer unrolled."""
+    LINEAR_CE = 'linear_ce'
     LOW_RANK = 'low_rank'
     MXFP8 = 'mxfp8'
     NARROW_COPIES = 'narrow_copies'
@@ -137,6 +138,7 @@ class Choice(enum.StrEnum):
     SPARSE_ATTENTION = 'sparse_attention'
     SSD = 'ssd'
     SWIGLU = 'swiglu'
+    SYRK = 'syrk'
 
 
 CHOICES = frozenset(choice.value for choice in Choice)
@@ -1952,7 +1954,7 @@ def cutlass_built() -> dict[str, str | None]:
     """The generation of the installed dew_cutlass's kernels each CUDA GPU Dew names runs, as the wheel
     dispatches on its compute capability (`dew_cutlass.architecture`, the one statement of it), None for
     one it runs none on or where the wheel is not installed: what CUTLASS's eligibility reads
-    (`grouped_matmul.cutlass_built_for`). A call's route reads the wheel's presence and its build, so a
+    (`grouped_cutlass.cutlass_built_for`). A call's route reads the wheel's presence and its build, so a
     program lowered without it, or with another build, is another program, which no executable kept for the
     first is handed for (training.md §6)."""
     import importlib.util

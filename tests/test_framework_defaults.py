@@ -21,19 +21,21 @@ def decayed(config: OptimConfig) -> dict[str, bool]:
 
 def test_a_decay_spares_biases_unless_told_not_to_and_a_group_decays_what_it_claims():
     """The ungrouped decay spares a bias, as nanoGPT's, Megatron Core's and timm's split does
-    (`OptimConfig.spared`), and decays it where the config says not to spare, as Optax does. A param
-    group decays every parameter it claims, as a torch parameter group does, unless it spares; a run's
-    default fresh groups decay as its ungrouped optimizer would (`OptimConfig.fresh_groups`)."""
-    config = OptimConfig(optimizer=AdamW(weight_decay=0.1), learning_rate=1e-2)
+    (`OptimConfig.decay_norms_and_biases` off), and decays it where the config says so, as Optax does. A
+    param group decays every parameter it claims, as a torch parameter group does, unless it spares norms
+    and biases; a run's default fresh groups decay as its ungrouped optimizer would
+    (`OptimConfig.fresh_groups`)."""
+    config = OptimConfig(optimizer=AdamW(weight_decay=0.1), lr=1e-2)
     assert decayed(config) == {"kernel": True, "bias": False}
-    assert decayed(dataclasses.replace(config, spared=False)) == {"kernel": True, "bias": True}
+    assert decayed(dataclasses.replace(config, decay_norms_and_biases=True)) == {"kernel": True, "bias": True}
     claimed = dataclasses.replace(config, param_groups=(ParamGroup("all", ("*",)),))
     assert decayed(claimed) == {"kernel": True, "bias": True}
-    sparing = dataclasses.replace(config, param_groups=(ParamGroup("all", ("*",), spared=True),))
+    sparing = dataclasses.replace(config, param_groups=(ParamGroup("all", ("*",),
+                                                                   decay_norms_and_biases=False),))
     assert decayed(sparing) == {"kernel": True, "bias": False}
     for switch in (True, False):
-        assert all(group.spared is switch
-                   for group in dataclasses.replace(config, spared=switch).fresh_groups())
+        assert all(group.decay_norms_and_biases is switch
+                   for group in dataclasses.replace(config, decay_norms_and_biases=switch).fresh_groups())
 
 
 def test_a_users_persistent_cache_thresholds_stay_theirs(tmp_path, monkeypatch):

@@ -15,7 +15,7 @@ A launch's space, heuristic and measurement are read at its key's shapes
 time a launch takes a config pinned for its kernel (`pinned`), else its own
 shapes' heuristic, its derived config (bible §6: the tuner is off by default,
 and users tune nothing). Only within an opt-in tuning run (`tune`, which
-`Trainer(tune_kernels=True)` and tools/kernel_picks.py call) does it take the
+`TrainerAdvanced(tune_kernels=True)` and tools/kernel_picks.py call) does it take the
 pick stored for its own key on its target GPU model (Dew's picks,
 `KernelOp.get_autotuning_cache`) where the space holds it; a pick serves no
 other key. Dew resolves the config itself, so no tokamax policy measures or
@@ -602,6 +602,19 @@ class KernelOp(tokamax.Op):
     template's fast backward): a gradient's product certifies it as reverse mode runs it (`report.pulled`).
     Every other op's derivative is its caller's custom VJP, of launches of their own."""
     revision: int = 1
+    pulled: bool = dataclasses.field(default=False, repr=False)
+    """Whether the call is a gradient's product of an op that carries its derivative (`moded`): part of its
+    picks' identity (a field their JSON stores, `_launch_json`), so a pick timed by the forward alone never
+    answers a gradient's call, nor the reverse, and the tuner times and certifies it as reverse mode runs it
+    (`_measured`, `report.certified`). Out of its repr, which a launch's identity reads (`report._identity`):
+    every stored verdict of an op that never pulls keeps its key."""
+
+    def moded(self) -> KernelOp:
+        """This op as the call traced here runs it: pulled where a gradient's product is traced
+        (`report.pulling`) and its call carries its derivative (`CARRIES_DERIVATIVE`), else itself."""
+        if self.CARRIES_DERIVATIVE and report.pulling() and not self.pulled:
+            return dataclasses.replace(self, pulled=True)
+        return self
 
     def __post_init__(self):
         # Each hook field as every launch takes it (`prepared`): an op built or replaced around a hook holds
@@ -627,7 +640,10 @@ class KernelOp(tokamax.Op):
     def __call__(self, *args, **kwargs):
         # One path for every config (row 1866): bound once, the op's own config, a pin or a pick checked
         # against the call itself (`pinnable`: a template's legality), the heuristic otherwise. The launch's
-        # key, which traces its hooks, is built only where a collector, a pin or a tuning read reads it.
+        # key, which traces its hooks, is built only where a collector, a pin or a tuning read reads it. A
+        # gradient's call of an op carrying its derivative is its pulled op's (`moded`), keyed and timed so.
+        if (moded := self.moded()) is not self:
+            return moded(*args, **kwargs)
         ba = self.bind(*args, **kwargs)
         config = self.config
         if config is None:
@@ -1218,7 +1234,8 @@ def _identity(op: tokamax.Op, *, traced: bool = True) -> tokamax.Op:
     """`op` as its picks name it: without the config and the vjp a call sets, its hook
     fields by what they compute (`KernelOp.traced`, a tuning run's alone: `reading`, `seen`, `tune`, whose
     picks persist under it across checkouts), or, not `traced`, as every launch's identity reads them
-    (`KernelOp.identified`, `report._identity`), tracing nothing."""
+    (`KernelOp.identified`, `report._identity`), tracing nothing; its `pulled` out of the repr that identity
+    reads, a launch's certification keying its reverse mode itself (`report.certified`)."""
     if not isinstance(op, KernelOp):
         return op.replace(config=None, vjp=None)
     fields = {field.name for field in dataclasses.fields(op)}
@@ -1303,9 +1320,18 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
     def compiled(config):
         configured = op.replace(config=config)
 
-        def launched(arrays):
-            args, kwargs = fill(arrays)
+        def run(*arrays):
+            args, kwargs = fill(list(arrays))
             return configured(*args, **kwargs)
+
+        # A pulled op's call timed as reverse mode runs it (`report.reversed_run`), its backward's kernels
+        # read beside its forward's, as certification compiles it: a forward's time alone picked a pulled
+        # call's backward unseen (row 12340, the selective scan's tokens a thread, which its forward reads
+        # none of).
+        timed = report.reversed_run(run) if op.pulled else run
+
+        def launched(arrays):
+            return timed(*arrays)
 
         start = time.perf_counter()
         # A candidate's lowering and its compile timed apart, the compile of its config as it is, never
@@ -1350,8 +1376,11 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
 
 
 def _benchmarks(read: Mapping) -> dict[Hashable, tokamax.BenchmarkData]:
-    """The configs `_measured` timed, each run's time the sum of its own kernels' (`DeviceTime.behind`)."""
-    return {config: tokamax.BenchmarkData(compile_time_ms=compiling, lower_time_ms=lowering, metadata={},
+    """The configs `_measured` timed, each run's time the sum of its own kernels' (`DeviceTime.behind`),
+    the kernels it ran named in its metadata (`kernels`: a pulled op's backward among them)."""
+    return {config: tokamax.BenchmarkData(compile_time_ms=compiling, lower_time_ms=lowering,
+                                          metadata={"kernels": sorted({kernel.name for run in runs
+                                                                       for kernel in run})},
                                           evaluation_times_ms=tuple(sum(kernel.milliseconds for kernel in run)
                                                                     for run in runs))
             for config, (runs, lowering, compiling) in read.items()}

@@ -2,6 +2,7 @@
 grown phase by phase (`Trainer`'s `phase_passes`): each loss and gradient is the passes' own models' at
 their weights, on par from float64 (check 1), and a phased run steps each phase at its own count."""
 
+import dataclasses
 import itertools
 
 import jax
@@ -26,7 +27,7 @@ from dew.nn.protocols import EXITS
 from dew.objectives.base import Step
 from dew.objectives.lm.objective import LMObjective
 from dew.objectives.passes import PassWeights, exiting
-from dew.training import FitPolicy
+from dew.training import TrainerAdvanced
 
 PASS_SEEDS = 64
 """Draws of each check-1 site here: tiny models, whose losses' errors settle well inside it."""
@@ -240,11 +241,13 @@ def test_a_phased_run_steps_each_phase_at_its_own_pass_count():
     tokens = jnp.asarray(np.random.default_rng(2).integers(0, 256, (jax.device_count() * 2, 17)), jnp.int32)
     batch = {"text": tokens}
 
-    def trainer_of(model, **phased):
+    def trainer_of(model, advanced=None, **phased):
         return Trainer(LMObjective(model, 16), optax.sgd(0.1), key=jax.random.key(0),
-                       layout=Layout(min_shard=1, tolerance=1.0), **phased)
+                       advanced=dataclasses.replace(advanced or TrainerAdvanced(), layout=Layout(min_shard=1,
+                                                                                                 tolerance=1.0)),
+                       **phased)
 
-    phased = trainer_of(model, phase_passes=(1, STEPS))
+    phased = trainer_of(model, advanced=TrainerAdvanced(phase_passes=(1, STEPS)))
     for phase, passes in enumerate((1, STEPS)):
         # The phase the batch was read in, as a phased stream marks it (`dew.batch.PHASE`).
         assert phased.phase_passes.at({**batch, PHASE: Phase(phase)}) == passes
@@ -297,13 +300,16 @@ def phased_loader(tokens):
     return Loader(train=lambda partition: PhasedTokens(tokens), val=None, records=None, batch=len(tokens))
 
 
-def phased_trainer(model, seed, phases: tuple[int, ...] | None = (1, STEPS), **options):
+def phased_trainer(model, seed, phases: tuple[int, ...] | None = (1, STEPS), advanced=None, **options):
     """A trainer of `model`'s LM over 16 tokens, its loop at 1 pass in phase 0 and STEPS in phase 1 (none
     where `phases` is None)."""
     from dew.training import Layout, Trainer
 
     return Trainer(LMObjective(model, 16), optax.sgd(0.1), key=jax.random.key(int(seed)),
-                   layout=Layout(min_shard=1, tolerance=1.0), phase_passes=phases, **options)
+                   advanced=dataclasses.replace(advanced or TrainerAdvanced(), layout=Layout(min_shard=1,
+                                                                                             tolerance=1.0),
+                                                phase_passes=phases),
+                   **options)
 
 
 def phased_params(trainer, tokens, steps: int = 4, **fitted) -> dict:
@@ -323,7 +329,7 @@ def phase_needs(monkeypatch, tokens) -> tuple[int, int, int]:
 
     def needed(model, split, *, startup=False):
         free(monkeypatch, LIMIT)
-        trainer = phased_trainer(model, 0, None, fit=FitPolicy(split=split))
+        trainer = phased_trainer(model, 0, None, split=split)
         state, _, _ = trainer.place()
         trainer.compile(state, {"text": jnp.asarray(tokens)})
         return LIMIT - trainer.plan["probes"][0]["headroom"] + (placed_bytes(state) if startup else 0)
@@ -361,9 +367,9 @@ def test_each_phase_of_a_phased_run_is_planned_at_its_own_split(monkeypatch, tmp
     assert [(probe["split"], probe["ahead"]) for probe in planned.plan["probes"]] == [(1, True), (2, True)]
     free(monkeypatch, LIMIT)
     directory = str(tmp_path / "pinned")
-    phased_params(phased_trainer(looped(), 0, fit=FitPolicy(split=1), checkpoints=Checkpoints(directory)),
+    phased_params(phased_trainer(looped(), 0, split=1, checkpoints=Checkpoints(directory)),
                   tokens, steps=2, checkpoint_every=2)
-    pinned = phased_params(phased_trainer(looped(), 0, fit=FitPolicy(split=2),
+    pinned = phased_params(phased_trainer(looped(), 0, split=2,
                                           checkpoints=Checkpoints(directory)), tokens)
     for mine, theirs in zip(bits(landed), bits(pinned), strict=True):
         np.testing.assert_array_equal(mine, theirs)
@@ -507,7 +513,8 @@ def test_a_pass_count_a_phase_whose_last_is_not_the_models_is_refused():
     from dew.training import Trainer
 
     with pytest.raises(ValueError):
-        Trainer(LMObjective(looped(), 16), optax.sgd(0.1), key=jax.random.key(0), phase_passes=(1, 2))
+        Trainer(LMObjective(looped(), 16), optax.sgd(0.1), key=jax.random.key(0),
+                advanced=TrainerAdvanced(phase_passes=(1, 2)))
 
 
 @attending("xla")
@@ -560,12 +567,14 @@ def test_a_phased_fit_steps_each_phase_as_a_run_of_its_own_pass_count_does(tmp_p
     data = compile(phases(DataPhase(corpus(1), Steps(2)), DataPhase(corpus(2))), read="indexed", loading=READ)
     model = looped()
 
-    def trainer_of(model, directory, **phased):
+    def trainer_of(model, directory, advanced=None, **phased):
         return Trainer(LMObjective(model, 16), optax.sgd(0.1), key=jax.random.key(0),
-                       layout=Layout(min_shard=1, tolerance=1.0), rollout=rollout,
+                       advanced=dataclasses.replace(advanced or TrainerAdvanced(), layout=Layout(min_shard=1,
+                                                                                                 tolerance=1.0),
+                                                    rollout=rollout),
                        checkpoints=Checkpoints(str(directory), keep=8), **phased)
 
-    whole = trainer_of(model, tmp_path / "phased", phase_passes=(1, STEPS)).fit(
+    whole = trainer_of(model, tmp_path / "phased", advanced=TrainerAdvanced(phase_passes=(1, STEPS))).fit(
         data, steps=4, log_every=100, checkpoint_every=None)
     trainer_of(model.with_passes(1), tmp_path / "apart").fit(data, steps=2, log_every=100, checkpoint_every=1)
     apart = trainer_of(model, tmp_path / "apart").fit(data, steps=4, log_every=100, checkpoint_every=1)
@@ -602,15 +611,17 @@ def test_a_phased_runs_work_counts_each_step_at_its_phases_pass_count():
     from dew.data.compile import compile
     from dew.training import Layout, Trainer
 
-    def counted(model, data, steps, **phased):
+    def counted(model, data, steps, advanced=None, **phased):
         flops = Flops()
         Trainer(LMObjective(model, 16), optax.sgd(0.1), key=jax.random.key(0), tracker=flops,
-                layout=Layout(min_shard=1, tolerance=1.0), **phased).fit(
+                advanced=dataclasses.replace(advanced or TrainerAdvanced(), layout=Layout(min_shard=1,
+                                                                                          tolerance=1.0)),
+                **phased).fit(
             compile(data, read="indexed", loading=READ), steps=steps, log_every=1, checkpoint_every=None)
         return flops.at
 
     phased = counted(looped(), phases(DataPhase(corpus(1), Steps(2)), DataPhase(corpus(2))), 4,
-                     phase_passes=(1, STEPS))
+                     advanced=TrainerAdvanced(phase_passes=(1, STEPS)))
     one = counted(looped().with_passes(1), corpus(1), 1)
     three = counted(looped(), corpus(2), 1)
     assert one[1] < three[1]

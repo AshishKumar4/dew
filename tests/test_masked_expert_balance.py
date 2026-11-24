@@ -21,7 +21,7 @@ from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Step
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.routing import ExpertBalance
-from dew.training import Trainer, UpdateBatch
+from dew.training import Trainer
 
 VOCAB = BALANCED_VOCAB
 MASK = VOCAB - 1
@@ -57,7 +57,7 @@ def test_a_masked_run_moves_each_balancing_bias_once_per_committed_update():
     left."""
     obj = objective(uniform_gates(favour_expert_zero(initial(), 1.0)))
     rows = 2 * jax.device_count()
-    train = Trainer(obj, optax.sgd(0.0), key=jax.random.PRNGKey(3), update=UpdateBatch(batches=2))
+    train = Trainer(obj, optax.sgd(0.0), key=jax.random.PRNGKey(3), accumulation=2)
     state = train.initial_state()
     run = train.compile(state, text(0, rows))
     for commit in range(2):
@@ -93,7 +93,7 @@ def test_a_masked_run_narrows_the_load_its_routers_carry():
         return float(aux.metrics["moe/max_load"] - aux.metrics["moe/min_load"])
 
     rows = 2 * jax.device_count()
-    train = Trainer(obj, optax.sgd(0.0), key=jax.random.PRNGKey(3), update=UpdateBatch(batches=2))
+    train = Trainer(obj, optax.sgd(0.0), key=jax.random.PRNGKey(3), accumulation=2)
     state = train.initial_state()
     run = train.compile(state, text(0, rows))
     spreads = [spread(state.variables)]

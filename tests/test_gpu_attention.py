@@ -332,11 +332,28 @@ def test_a_split_steps_merge_and_its_state_are_on_par_on_this_gpu(form):
     path's) on par with the plain merge's from float64 (check 1, test_merged's draws): the kernel and the
     law's composition it replaces are two programs, each held to the one truth (testing.md), never to each
     other's bits."""
+    from dew.nn.kernels import tuning
+    from dew.nn.kernels.templates import merged
+
     spec, ours, _ = test_merged._merges(form)
     reference = as_given(test_merged.state_orders(test_merged._plain_state(spec)))
     orders = jax.jit(test_merged.state_orders(test_merged.finished_state(ours, spec)))
     assert_as_exact(orders, reference, test_merged._drawn, f"a padded merge on this gpu, {form}",
                     seeds=test_merged.MERGE_SEEDS)
+    # Single stats writer holds behaviorally across 1-block and 2-block channel schedules (row 12222),
+    # and padded trailing columns (`read_width > width`) never contaminate valid outputs.
+    padded, stacked = test_merged._drawn(0)[:2]
+    with tuning.pinned({merged.MergedPadded: merged.MergeConfig(64)}):
+        one_block = jax.jit(lambda p, s: tuple(ours(p, s)))(padded, stacked)
+    with tuning.pinned({merged.MergedPadded: merged.MergeConfig(32)}):
+        two_blocks = jax.jit(lambda p, s: tuple(ours(p, s)))(padded, stacked)
+    for lhs, rhs in zip(one_block, two_blocks, strict=True):
+        np.testing.assert_array_equal(np.asarray(lhs), np.asarray(rhs))
+    nan_pad = jnp.full((*padded.shape[:-1], 32), jnp.nan, padded.dtype)
+    padded_wide = jnp.concatenate([padded, nan_pad], axis=-1)
+    with_pad = jax.jit(lambda p, s: tuple(ours(p, s)))(padded_wide, stacked)
+    for lhs, rhs in zip(one_block, with_pad, strict=True):
+        np.testing.assert_array_equal(np.asarray(lhs), np.asarray(rhs))
 
 
 def test_the_decode_matrix_holds_on_this_gpu():

@@ -15,7 +15,7 @@ from dew.optim import AdamW, OptimConfig
 
 def bf16_state_adamw(**settings):
     return OptimConfig(optimizer=AdamW(weight_decay=0.0, state_dtype='bfloat16', **settings),
-                       learning_rate=LR).build(10)
+                       lr=LR).build(10)
 
 
 BF16_FIRST_SEEDS = 8

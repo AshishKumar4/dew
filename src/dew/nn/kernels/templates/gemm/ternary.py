@@ -16,7 +16,7 @@ from jax.core import Tracer
 from dew.nn import float_bits, precision
 from dew.nn.derivatives import KernelGlue, contracted, surrogate
 from dew.nn.kernels import gemm, generation, grouped_matmul, selection, xla_products
-from dew.nn.kernels.formats import TernaryWeights, fp8_factor, fp8_scale_checked
+from dew.nn.kernels.formats import TernaryWeights, scale_checked, scale_factor
 from dew.nn.kernels.templates.gemm.factored import factored
 from dew.nn.sharding import automatic_axes
 
@@ -76,7 +76,7 @@ def ternary_weight_product(lhs: jax.Array, weights: TernaryWeights, group_sizes:
     if not isinstance(weights.form, Tracer):
         weights.checked()
     else:
-        fp8_scale_checked(jnp.shape(weights.scale), weights.shape)
+        scale_checked(jnp.shape(weights.scale), weights.shape)
     dense = group_sizes is None
     if (dense and len(weights.shape) != 2) or (not dense and len(weights.shape) != 3):
         raise ValueError(f"ternary_weight_product weight rank mismatch for dense={dense}: {weights.shape}")
@@ -105,16 +105,21 @@ def ternary_weight_product(lhs: jax.Array, weights: TernaryWeights, group_sizes:
         product = functools.partial(gemm.decoded_product, interpret_on_cpu=interpret_on_cpu)
         operands = (weights.unscaled(jnp.bfloat16), group_sizes)
     run = functools.partial(gemm._interpreted, product, interpret_on_cpu)
+    wide = gemm.interpreted_wide(interpret_on_cpu)
+    # The codes alone for the rescue's decoded matrix, no scale: a derivative rule closes over no
+    # differentiated value.
+    codes = (dataclasses.replace(weights, scale=jnp.ones((), jnp.float32)), group_sizes)
 
     def run_dot(rows_bf16: jax.Array) -> jax.Array:
         return run(rows_bf16, *operands)
 
     def factor_of(scale_arr: jax.Array) -> jax.Array:
-        return fp8_factor(jnp.asarray(scale_arr, jnp.float32), sizes, lhs.shape[0], weights.shape, dense)
+        return scale_factor(jnp.asarray(scale_arr, jnp.float32), sizes, lhs.shape[0], weights.shape, dense)
 
     scale_f32 = jnp.asarray(weights.scale, jnp.float32)
     if not quantize_activations:
-        scaled = factored(run, operands, factor_of(scale_f32), lhs)
+        scaled = factored(run, operands, factor_of(scale_f32), lhs, wide=wide,
+                          wide_operands=codes, prepared=gemm.decoded_operands)
         return scaled.astype(lhs.dtype if out_dtype is None else out_dtype)
 
     def ste_value(a: jax.Array, s: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -134,7 +139,8 @@ def ternary_weight_product(lhs: jax.Array, weights: TernaryWeights, group_sizes:
         prod_held = jax.lax.stop_gradient(prod)
         factor = factor_of(s)
         d_factor = factor_of(d_s)
-        dy_a = factored(run, operands, factor, d_a)
+        dy_a = factored(run, operands, factor, d_a, wide=wide, wide_operands=codes,
+                        prepared=gemm.decoded_operands)
         once = prod_held * peak_col
         tiny = jnp.finfo(prod_held.dtype).tiny
         kept = jnp.isfinite(once) & ((jnp.abs(once) >= tiny) | (prod_held == 0))

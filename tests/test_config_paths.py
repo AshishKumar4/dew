@@ -18,7 +18,6 @@ from run_kinds import KINDS, saved_record, scalars, trained_by_cli, trained_reco
 from dew import registry
 from dew.config import RunConfig, TrainerConfig
 from dew.training import Layout, MeshSpec
-from dew.training.budget import Horizon
 
 SUPPRESSED = ("data", "validation")
 """The fields a run's record writes as its chains (`dew.data.records`), which a path sets one setting of a
@@ -106,7 +105,7 @@ def test_each_path_that_sets_an_option_sets_the_same_run(kind, path, index, tmp_
 
 
 
-SET = {"optim.learning_rate": 0.0123, "data_seed": 3, "trainer.key": 5}
+SET = {"optim.lr": 0.0123, "data_seed": 3, "trainer.key": 5}
 """Options a run trained both ways is set with, each beside its default."""
 
 
@@ -125,14 +124,14 @@ def test_a_run_with_options_set_trains_alike_from_python_its_command_and_its_rec
     hints = typing.get_type_hints(TrainerConfig)
     given = {"mesh": MeshSpec(fsdp=2), "layout": Layout(min_shard=64), "log_every": 1}
     trainer = dataclasses.replace(run.trainer, checkpoint_dir=str(tmp_path / "runs"),
-                                  horizon=Horizon(steps=2), eval_every=None, checkpoint_every=None,
+                                  steps=2, eval_every=None, checkpoint_every=None,
                                   multi_host=False, compilation_cache_dir=None, **given)
     python = dataclasses.replace(run, trainer=trainer)
     python.prepare().train("python")
     RunConfig.load(str(saved_record(python, tmp_path, "saved"))).prepare().train("reloaded")
     stopped = trained_by_cli(run, tmp_path, "cli", {f"trainer.{name}": flag(value, hints[name])
                                                     for name, value in given.items()})
-    trained_record(stopped, {"trainer.horizon.steps": "2"})
+    trained_record(stopped, {"trainer.steps": "2"})
     runs = tmp_path / "runs"
     losses = {name: [scalars(runs / name)[step]["train/loss"] for step in (1, 2)]
               for name in ("python", "reloaded", "cli")}

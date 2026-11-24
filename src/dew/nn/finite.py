@@ -1,6 +1,6 @@
 """Whether values are finite, and a tree zeroed where they are not: the one statement a step's transaction
 (`dew.training.transaction`) and a run that updates in its backward (`dew.nn.in_backward`) both read where a
-run skips steps that are not finite (`Trainer(skip_nonfinite=True)`)."""
+run skips steps that are not finite (`TrainerAdvanced(skip_nonfinite=True)`)."""
 
 import jax
 import jax.numpy as jnp
