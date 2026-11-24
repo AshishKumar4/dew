@@ -31,7 +31,15 @@ from jax.experimental import pallas as pl
 from dew.nn import derivatives, precision, programs
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import inline_work, resources
-from dew.nn.kernels.templates.cost import ISSUED_UNITS, Chain, Stated, Work, followed, multiplied
+from dew.nn.kernels.templates.cost import (
+    ISSUED_UNITS,
+    Chain,
+    Stated,
+    Work,
+    followed,
+    issued as issue_slots,
+    multiplied,
+)
 from dew.nn.kernels.templates.product import product_mode
 
 
@@ -507,6 +515,9 @@ class _Counting:
         # The warp of its warpgroup whose 32 lanes run its body where a warp mesh's role runs it
         # (`plgpu.warp_map`), None where its warpgroup's 128 do.
         self.lanes = lanes
+        # Whether its target's assembler fuses a multiply into the add that alone reads it (`fused`): a
+        # CUDA multiprocessor's ptxas; a TPU's VPU runs them as two operations.
+        self.fuses = generation.gpu_target().architecture.multiprocessor is not None
         self.arrivals = _Arrivals() if arrivals is None else arrivals
         self.fixed = Work()
         self.walks: list[Work] = []
@@ -624,9 +635,9 @@ class _Counting:
         assembler's FFMA, ptxas's --fmad, its default): its operations, just counted, become adds fused
         (`Work.fused_multiply_adds`) in the same count, however many of its operands are products. A scalar
         product added to a row's every element is one multiply for many adds, none fused (the review of
-        lane/toolkit 5cbbe66c586)."""
+        lane/toolkit 5cbbe66c586). A target whose assembler fuses none (a TPU's, `fuses`) counts both."""
         primitive = equation.primitive
-        if primitive not in (lax.mul_p, lax.add_p, lax.sub_p):
+        if not self.fuses or primitive not in (lax.mul_p, lax.add_p, lax.sub_p):
             return
         (output,) = equation.outvars
         if (not jnp.issubdtype(output.aval.dtype, jnp.floating) or outputs[0] is not None
@@ -1051,12 +1062,13 @@ def _mean(walks: Sequence[Work]) -> Work:
 
 
 def _envelope(works) -> Work:
-    """The most of each unit any of `works` holds, and every path none of the others outlasts (as works side
-    by side keep them)."""
+    """The most of each unit any of `works` holds, the issue slots the most any one of them issues
+    (`Work.issue_excess`), and every path none of the others outlasts (as works side by side keep them)."""
     works = list(works)
-    return Work(**{field.name: max(getattr(work, field.name) for work in works)
-                   for field in dataclasses.fields(Work) if field.name != "chains"},
+    most = Work(**{field.name: max(getattr(work, field.name) for work in works)
+                   for field in dataclasses.fields(Work) if field.name not in ("chains", "issue_excess")},
                 chains=sum(works, Work()).chains)
+    return dataclasses.replace(most, issue_excess=max(0.0, issue_slots(most) - max(map(issue_slots, works))))
 
 
 def built_with(cost: pl.CostEstimate | Stated | None) -> pl.CostEstimate | None:
@@ -1123,8 +1135,11 @@ def launch_work(kernel, stated: Stated) -> Work:
     # The steps on its critical path: its longest program's walk where it states one, else their mean.
     walked = stated.steps / programs if stated.longest is None else stated.longest
 
-    return Work(**{unit: issued(unit) for unit in ISSUED_UNITS}, device_bytes=stated.bytes_accessed,
-                span=walked, kernels=1, chains=counted.paths(walked))
+    work = Work(**{unit: issued(unit) for unit in ISSUED_UNITS if unit != "issue_excess"},
+                device_bytes=stated.bytes_accessed, span=walked, kernels=1, chains=counted.paths(walked))
+    # Its walking roles' issue slots, the most one of them issues a step (`Work.issue_excess`).
+    issuing = counted.issued(issue_slots, stated.steps, programs)
+    return dataclasses.replace(work, issue_excess=max(0.0, issue_slots(work) - issuing))
 
 
 def _estimate(work: Work) -> pl.CostEstimate:
