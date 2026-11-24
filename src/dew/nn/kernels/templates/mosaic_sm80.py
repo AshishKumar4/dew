@@ -802,7 +802,8 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                               out_type=out_type)
 
     def program_scoped(self, body, *allocations, streams):
-        # Collective where any of its pipelines (`streams`, one or a tree of them) runs on two consumers.
+        # Collective where its pipelines (`streams`, one or a tree of them) run on two consumers; a tree of
+        # one-consumer and two-consumer pipelines is refused here, before its scope opens.
         return pl.run_scoped(lambda *refs: body(*refs, streams=streams), *allocations,
                              **_collective(_consumers(streams)))
 
@@ -865,19 +866,21 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         self.pingponged(pingpong)
         _most(self, consumers)
         # Each tile's pipeline fills and drains before its output copy. Synchronize at that lifetime
-        # boundary so the output's shared memory can reuse the pipeline's slots; two consumers stage their
-        # rows' share of it side by side, in one collective scope.
+        # boundary so the output's shared memory can reuse the pipeline's slots. Two consumers stage their
+        # rows side by side in one collective scope, opened once a tile where both finish it (`finished`):
+        # a store only one reaches (a balanced tail's, the last program to arrive for each consumer storing,
+        # two programs' winners apart) opens none of its own, which would wait for the other forever.
         del in_flight, unrolled, accumulators  # its walk carries its accumulators
         index = 0 if consumers == 1 else lax.axis_index("wg")
         staging = self.output_staging(outputs, consumers, chunks)
+        opened: list = []
 
         def store(output, value, ref, place):
             # Interpreted pipelines use barrier-tracked copies, not cp.async groups.
             if not interpret:
                 plgpu.wait_gmem_to_smem(0)
 
-            def copied(staged):
-                smem = staged if consumers == 1 else staged.at[index]
+            def copied(smem):
                 plgpu.store(smem, value.astype(smem.dtype), optimized=False)
                 swizzle = swizzling.UNSWIZZLED if len(smem.shape) != 2 else self.stored_swizzle(smem.shape,
                                                                                                    smem.dtype)
@@ -889,9 +892,24 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                     # A swizzled tile's rows out by its threads, whole tiles read (`output_staging`).
                     stores.swizzled_rows_out(smem, ref, *place[:4], swizzle=swizzle)
 
-            pl.run_scoped(copied, staging[output], **_collective(consumers))
+            if consumers == 1:
+                pl.run_scoped(copied, staging[output])
+            else:
+                copied(opened[-1][output].at[index])
             if not interpret:
                 plgpu.wait_gmem_to_smem(0)
+
+        def finished(index, tile, accumulators, store, *, active):
+            if consumers == 1:
+                finish(index, tile, accumulators, store, active=active)
+                return
+
+            def staged(*refs):
+                opened.append(refs)
+                finish(index, tile, accumulators, store, active=active)
+                opened.pop()
+
+            pl.run_scoped(staged, *staging, collective_axes="wg")
 
         def walking(counter, active, steps, views):
             del counter, active
@@ -902,7 +920,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
             return walk
 
-        persistent.consumed(self, tiles, schedule, issue, finish, store, index, walking, axis=axis)
+        persistent.consumed(self, tiles, schedule, issue, finished, store, index, walking, axis=axis)
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
@@ -934,6 +952,15 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         def slots_of(refs) -> rings.WholeSlots:
             return rings.WholeSlots(dict(zip(names, refs, strict=True)))
 
+        if streams.pipeline.consumers > 1 and len(segments) > 1:
+            # Consumers running one pipeline together meet at each of its steps, so they walk one grid: a
+            # pipeline of its own a segment would meet unpaired where their segments' boundaries differ (a
+            # causal call's masked segment one consumer's keys end sooner in). One pipeline over the walk's
+            # whole range, each step its segment's, its first segment's start and last one's end each
+            # consumer's alike (`walk_own`'s streamed range). A step reads no fragments ahead of its own:
+            # its boundary would be called under its segment's choice.
+            segments = (_dispatched(segments), segments[0][1], segments[-1][2]),
+            prefetching = False
         for step, lo, hi in segments:
             if isinstance(lo, int) and isinstance(hi, int) and hi <= lo:
                 # No steps: the carry and its zero accumulators as they start (`emit_pipeline` takes no
@@ -1084,6 +1111,17 @@ class Mma(MmaIssuer, CpAsync):
         return min(stagings, key=lambda swizzle: (passes(swizzle), -swizzle))
 
 
+def _dispatched(segments: tuple) -> Callable:
+    """One step taking each of `segments`' steps `(step, lo, hi)` at its own place: the step of the segment
+    whose range holds its index, the segments laid end to end."""
+    def step(index, slots, carried, accumulators):
+        segment = sum((index >= lo).astype(jnp.int32) for _, lo, _ in segments[1:])
+        return lax.switch(segment, [functools.partial(each, index, slots) for each, _, _ in segments],
+                          carried, accumulators)
+
+    return step
+
+
 def _most(family: "CpAsync", consumers: int, *, clustered: bool = False) -> None:
     """A cp.async family's programs take one compute warpgroup up to its collective pipeline's
     (`shared_consumers`), no producer, and no cluster (`clustered`: cp.async loads its own program's shared
@@ -1094,9 +1132,14 @@ def _most(family: "CpAsync", consumers: int, *, clustered: bool = False) -> None
 
 
 def _consumers(streams) -> int:
-    """The most consumers any of `streams`' pipelines (one or a tree of them) runs on."""
+    """The consumers every one of `streams`' pipelines (one or a tree of them) runs on, one where none; a
+    tree of pipelines on different counts refused (its scope is collective over all of them or none)."""
     pipelines = jax.tree.leaves(streams, is_leaf=lambda leaf: isinstance(leaf, Pipeline))
-    return max((pipeline.consumers for pipeline in pipelines if isinstance(pipeline, Pipeline)), default=1)
+    counts = {pipeline.consumers for pipeline in pipelines if isinstance(pipeline, Pipeline)}
+    if len(counts) > 1:
+        raise NotImplementedError(f"an mma.sync program's pipelines run on one count of consumers, not "
+                                  f"{sorted(counts)}")
+    return counts.pop() if counts else 1
 
 
 def _collective(consumers: int) -> dict:
