@@ -315,7 +315,7 @@ def test_an_address_through_chained_element_pointers_keeps_each_index_lanes():
     second index's lanes alone (one address) moved one."""
     def body(ctx, ref, uniform):
         del ctx
-        from jax.extend.mlir.dialects import llvm
+        from jax._src.lib.mlir.dialects import llvm
 
         f32 = ir.F32Type.get()
         lane = mgpu_utils.getelementptr(mgpu_utils.memref_ptr(ref), [mgpu_utils.thread_idx()], f32)
