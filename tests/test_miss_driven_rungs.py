@@ -15,7 +15,7 @@ from dew.optim import Adam, OptimConfig
 from dew.registry import models
 from dew.training import Layout, MeshSpec, Trainer
 from dew.training.ahead import AheadOfTime, compile_ahead
-from dew.training.memory import least_limit
+from dew.training.memory import needed
 from dew.training.planning import PlanRefused
 
 
@@ -36,10 +36,10 @@ def _ahead(model, optimizer, seq: int, rows: int, limit: int, variables=None
 
 
 def _needed(ahead: AheadOfTime) -> int:
-    """The least an H100 holds for `ahead`'s step to be admitted (`least_limit`)."""
+    """The least total memory an H100 states for `ahead`'s step to be admitted, its arguments in use and
+    its outputs that write over none beside them (`needed`), as `compile_only_gpus` takes a GPU's memory."""
     gpu = compile_only_gpus("sm90", 1, 2 ** 34)[0]
-    beside = ahead.output_bytes - ahead.alias_bytes
-    return least_limit(gpu, [(ahead.argument_bytes, beside, ahead.temp_bytes)])
+    return needed(gpu, ahead.argument_bytes, ahead.output_bytes - ahead.alias_bytes, ahead.temp_bytes)
 
 
 @pytest.mark.parametrize("stack", ["plain", "scanned", "rows"])

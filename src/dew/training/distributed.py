@@ -115,9 +115,12 @@ def link_bandwidth(mesh: Mesh, axis: str, size: int = 1 << 28) -> float:
     kept = None if record is None else read_kept(record)
     ours = isinstance(kept, dict) and kept.get("topology") == topology
     figure = kept.get("bytes_per_second") if ours and isinstance(kept, dict) else None
-    if all(from_every_process(isinstance(figure, int | float))):
-        assert isinstance(figure, int | float)
-        return min(from_every_process(float(figure)))
+    # A figure is a finite positive number (no flag, NaN or zero), else this process sees none.
+    seen = (float(figure) if isinstance(figure, int | float) and not isinstance(figure, bool)
+            and math.isfinite(figure) and figure > 0 else None)
+    figures = from_every_process(seen)
+    if all(each is not None for each in figures):
+        return min(each for each in figures if each is not None)
     ways = mesh.shape[axis]
     count = size // 4 // ways * ways
     sharding = NamedSharding(mesh, P(axis))

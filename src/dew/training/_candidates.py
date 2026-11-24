@@ -212,18 +212,13 @@ _KEPT = _Kept()
 
 
 def _shaped(tree) -> Hashable:
-    """`tree`'s structure and each leaf's abstract value: an array's alike whether placed, held as its shape
-    or a NumPy array on the host (the step lowers over the shapes its own placement gives, `placed_shapes`,
-    so a search over a state not placed yet and one over the placed state trace one step: row 12465, a 4B
-    search traced 2 to 4.5 minutes a candidate), a scalar's beside its type, which tells True from 1; or the
-    leaf itself where it is none."""
+    """`tree`'s structure and each leaf's abstract value and placement (an array's, a NumPy array's, a
+    shape's, a scalar's beside its type, which tells True from 1), or the leaf itself where it is none."""
     def leaf(value) -> Hashable:
-        if isinstance(value, jax.Array | jax.ShapeDtypeStruct | np.ndarray):
+        if isinstance(value, jax.Array | jax.ShapeDtypeStruct | np.ndarray | np.generic | bool | int | float
+                      | complex):
             aval = jax.typeof(value)
-            return "array", aval.shape, aval.dtype, aval.weak_type
-        if isinstance(value, np.generic | bool | int | float | complex):
-            aval = jax.typeof(value)
-            return type(value), aval.shape, aval.dtype, aval.weak_type
+            return type(value), aval.shape, aval.dtype, aval.weak_type, getattr(value, "sharding", None)
         return value
     leaves, structure = jax.tree.flatten(tree)
     return structure, tuple(map(leaf, leaves))
@@ -250,10 +245,15 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
     # What the state's and batch's arrays hold where they lie, the step's arguments XLA counts; a step
     # lowered for other devices none of this process's.
     resident = resident_on(state, batch) if mesh is None else {}
+    # Prepared, traced and kept over the shapes the run places them as, whether placed yet or not, so a
+    # search before the state is placed and one after it trace and lower one step (row 12465: a 4B search
+    # traced 2 to 4.5 minutes a candidate, again once placed); a step lowered for other devices over its own.
+    shaped, rows = ((state, batch) if mesh is not None
+                    else (placed_shapes(state, stepping.shardings(state)), placed_shapes(batch, placement)))
     # What the step traces from beside its arguments and the trainer's settings: the compiles' refusals
     # its kernels' derivation reads (a relowering after a spill reads its proposal's), and the context.
     key = None if stated is None else (
-        stated, _shaped(state), _shaped(batch), _shaped(placement), replicated, split, narrow,
+        stated, _shaped(shaped), _shaped(rows), _shaped(placement), replicated, split, narrow,
         stepping.settings.ns_group, mesh,
         platforms, stepping.shape.rows,
         stepping.shape.split, stepping.shape.prefetch, stepping.shape.examples, held_context())
@@ -265,7 +265,7 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
                 spread_over(kept.spread)
                 sampled = _sampled(stepping, kept, batch, placement, replicated, split, platforms)
                 return dataclasses.replace(kept, sampled=sampled, resident=resident)
-    candidate = dataclasses.replace(_candidate(stepping, state, batch, schedule, placement, replicated, split,
+    candidate = dataclasses.replace(_candidate(stepping, shaped, rows, schedule, placement, replicated, split,
                                                narrow, mesh=mesh, platforms=platforms), resident=resident)
     if key is not None:
         # Kept detached from this trainer: its batch as shapes, its inspection's step none (`_sampled`

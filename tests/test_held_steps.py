@@ -79,6 +79,7 @@ def _shaped(rows: tuple[int, ...]):
 
 
 @pytest.mark.gpu(reason="device code's bytes, which a GPU's executables state and the CPU's do not")
+@pytest.mark.compiles_at_run(reason="a fit's steps compiled as it meets each shape, no check-1 site")
 def test_a_fit_meeting_shape_after_shape_holds_no_step_past_its_budget(monkeypatch):
     """A fit whose run holds no more device code than its latest step's (`HELD_CODE_BYTES`) meets three
     batch shapes and then each again: each shape it meets lets the steps of the one before go, the runner
@@ -114,6 +115,7 @@ def test_a_fit_meeting_shape_after_shape_holds_no_step_past_its_budget(monkeypat
 
 
 @pytest.mark.gpu(reason="an allocator's live reading, which only an attached GPU states")
+@pytest.mark.compiles_at_run(reason="its compile's limit read off the GPU's live room, no check-1 site")
 def test_a_placed_steps_compile_limit_gives_back_the_state_it_reuses():
     """A placed run's step, compiled cold where its GPU has free memory short of its state and its
     temporaries together but not of its temporaries alone, compiles whole within its limit, is admitted at
@@ -124,6 +126,7 @@ def test_a_placed_steps_compile_limit_gives_back_the_state_it_reuses():
     generation, no binary of the step itself made before."""
     from token_support import token_rows
 
+    from dew._cache import uncached
     from dew.distributed.batches import shard_batch
     from dew.nn.kernels.generation import compile_only_gpus, device_generation
     from dew.objectives.lm import LMObjective
@@ -138,7 +141,7 @@ def test_a_placed_steps_compile_limit_gives_back_the_state_it_reuses():
     rows = token_rows(32768, 1, 9)
 
     def built(mesh) -> Trainer:
-        optimizer = OptimConfig(optimizer=Adam(), learning_rate=1e-3)
+        optimizer = OptimConfig(optimizer=Adam(), learning_rate=1e-3).build(100)
         return Trainer(LMObjective(model, 8, ema_decay=0.9), optimizer, key=jax.random.key(0), mesh=mesh,
                        layout=Layout(min_shard=2 ** 30), fit=FitPolicy(split=1, remat="none"))
 
@@ -149,9 +152,8 @@ def test_a_placed_steps_compile_limit_gives_back_the_state_it_reuses():
     # and temporaries together, so a limit that gives the state back nothing stops it.
     target = beside + 2 * ahead.temp_bytes + argument // 2
     assert target + (1 << 27) < argument + beside + ahead.temp_bytes, ahead
-    cached = jax.config.jax_enable_compilation_cache
-    jax.config.update("jax_enable_compilation_cache", val=False)
-    try:
+    # Compiled cold, so its limit stops a compile that misses (`uncached`).
+    with uncached():
         trainer = built(MeshSpec())
         state, _, _ = trainer.place()
         batch = shard_batch(trainer.device_mesh, rows)
@@ -165,5 +167,3 @@ def test_a_placed_steps_compile_limit_gives_back_the_state_it_reuses():
         assert probes[0]["fits"] and trainer.plan["split"] == 1, probes
         jax.block_until_ready(step(state, batch)[1])
         del filler
-    finally:
-        jax.config.update("jax_enable_compilation_cache", cached)
