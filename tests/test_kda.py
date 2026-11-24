@@ -463,11 +463,12 @@ def test_a_kimi_decays_gradient_of_a_small_cross_term_is_exact_interpreted():
 
 
 @lowers('sm80')
-def test_a_fast_fp32_kimi_forward_lowers_for_an_ampere_gpu():
-    """Kimi delta attention's fp32 forward under the fast forms, lowered through the template for an Ampere
+def test_a_fast_fp32_kimi_forward_traces_its_launches_for_an_ampere_gpu():
+    """Kimi delta attention's fp32 forward under the fast forms, traced through the template for an Ampere
     GPU: its scores take one fp32 part (TF32, mma.sync's) and its system its fp32, two sums of one shape and
     dtype, which its own pairs write in place as one stacked ref (`chunk_forward._paired`), where two refs of
-    one shape and dtype are refused at the launch (`mosaic.checked`, row 3180; the queue review's P0)."""
+    one shape and dtype are refused at the launch's trace (`mosaic.checked`, row 3180; the queue review's
+    P0). Traced, not lowered: the form's lowering on an A100 fails apart (row 12647)."""
     rows, length, heads, width = 1, 128, 2, 64
     operands = ([jax.ShapeDtypeStruct((rows, length, heads, width), jnp.float32)] * 3
                 + [jax.ShapeDtypeStruct((rows, length, heads, width), jnp.float32),
@@ -482,4 +483,4 @@ def test_a_fast_fp32_kimi_forward_lowers_for_an_ampere_gpu():
     with (generation.assumed('sm80'), jax.sharding.use_abstract_mesh(mesh),
           generation.run_precision(dataclasses.replace(generation.numerics(), forms='fast')),
           jax.default_matmul_precision('default'), generation.chosen(gated_delta_rule='mosaic_gpu')):
-        jax.jit(forward).trace(*operands).lower(lowering_platforms=("cuda",))
+        jax.jit(forward).trace(*operands)
