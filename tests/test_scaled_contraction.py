@@ -218,6 +218,28 @@ def test_a_residue_beneath_the_terms_largest_reaches_its_quotient():
                                   2.0 ** -60)
 
 
+def test_an_exponent_operands_cancelling_terms_leave_the_part_beneath_them():
+    """`2^400 - 2^400 + 1` (the two terms a unit raised by an exponent operand of 400) beside a term whose
+    keys cancel to zero across bands (taking the sum banded) is 1: the windows descend from `2^400`, the
+    first sums to zero and the next finds the 1, where bins reaching a span from the factors alone dropped
+    it beneath their last (review of #3979 v2, P0)."""
+    form = Form(("", "", "", "", "k"), (
+        (1, (((0, 1), (1, 0)),)), (-1, (((2, 1), (1, 0)),)), (1, (((3, 1),),)), (1, (((4, 1),),))), "")
+    one, raised = jnp.float32(1.0), jnp.int32(400)
+    keys = jnp.asarray([2.0 ** 127, -(2.0 ** 127), 2.0 ** -126, -(2.0 ** -126)], jnp.float32)
+    np.testing.assert_array_equal(np.asarray(contract(form, one, raised, one, one, keys)), 1.0)
+
+
+def test_six_groups_are_banded_a_digit_at_a_time():
+    """A product of six groups over three keys, the first `[2^127, -2^127, 2^-30]` and the rest ones, sums to
+    `2^-30`: its band tuples walked by a carry over their digits (nine of them), where a static bound on
+    their count past int32 took the term unbanded and flushed `2^-30` (review of #3979 v2, P0)."""
+    form = Form(("k",) * 6, ((1, tuple(((index, 1),) for index in range(6))),), "")
+    first = jnp.asarray([2.0 ** 127, -(2.0 ** 127), 2.0 ** -30], jnp.float32)
+    np.testing.assert_array_equal(np.asarray(contract(form, first, *(jnp.ones(3, jnp.float32),) * 5)),
+                                  2.0 ** -30)
+
+
 def test_a_non_finite_row_leaves_the_others_banded():
     """Beside a row whose value is infinite (its mean IEEE's, `inf`), a row whose values cancel past the
     format keeps its `2^-32`: the banded sum reads non-finite values as none and the IEEE result is laid over
@@ -228,12 +250,12 @@ def test_a_non_finite_row_leaves_the_others_banded():
                                   [[2.0 ** -32], [np.inf]])
 
 
-def test_a_term_of_more_band_pairs_than_int32_counts_is_summed_unbanded():
+def test_nine_groups_walk_the_bands_their_values_occupy():
     """A product of nine groups over two keys, the first group's values `[1, 2^-126]` and the others'
     `[2^-126, 1]`, sums to `2^-126 + 2^-1008`, `2^-126`: the products' largest pairs the first group's last
-    band with the others' first, and the term's band pairs pass what int32 counts (15^9, `_band` 0), so it is
-    summed unbanded, where the pairs' count wrapped negative, the sum took its first pair alone and gave 0
-    (review of #3967, P1)."""
+    band with the others' first, and the tuples walked are those of bands the values occupy (two a group),
+    never counted, where their count (15^9) wrapped negative in int32, the sum took its first tuple alone and
+    gave 0 (review of #3967, P1)."""
     form = Form(("k",) * 9, ((1, tuple(((index, 1),) for index in range(9))),), "")
     first = jnp.asarray([1.0, 2.0 ** -126], jnp.float32)
     others = jnp.asarray([2.0 ** -126, 1.0], jnp.float32)
