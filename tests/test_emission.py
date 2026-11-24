@@ -791,6 +791,47 @@ def test_an_integer_multiply_counts_on_the_fma_pipe_at_its_own_rate_beside_the_f
     assert beside[1] == alone[1] + 256 / rates.cuda
 
 
+@pytest.mark.parametrize(("body", "fused"), [
+    (lambda x, y, z: x * y + z, 128), (lambda x, y, z: jnp.maximum(x * y, z), 0),
+    (lambda x, y, z: (x * y + z) * (x * y), 0)], ids=["multiply-add", "maximum", "product-read-twice"])
+def test_an_fp32_multiply_whose_one_use_is_an_add_counts_as_one_fused_instruction(body, fused):
+    """An fp32 multiply whose result an add alone reads is one FFMA with it (ptxas's --fmad, its default):
+    the body counts both operations and the pair fused (`Work.fused_multiply_adds`), an element each; a
+    maximum of a product, or a product read twice, keeps its multiply an instruction of its own."""
+    row = jax.ShapeDtypeStruct((1, 128), jnp.float32)
+    role = _emitted(body, row, row, row).roles[0]
+    assert role.fixed.fused_multiply_adds == fused, role.fixed
+
+
+@pytest.mark.parametrize(("generation_name", "lanes"), [("sm80", 64), ("sm86", 128), ("sm89", 128),
+                                                        ("sm90", 128), ("sm100", 128), ("sm120", 128)])
+def test_an_fp32_instruction_takes_a_lane_a_clock_a_fused_pair_one(generation_name, lanes):
+    """A CUDA multiprocessor's fp32 lanes each run one instruction a clock, an FFMA's two FLOPs or a lone
+    add's, maximum's or select's one (`Architecture.vector_per_clock` its lanes' FLOPs, two a lane): 1024
+    lone operations take 1024 lane-clocks, and 1024 multiplies fused with 1024 adds the same, where the lanes'
+    FLOP rate priced the lone ones at half (M-FS-70: the KDA intra launch's FMNMX, a quarter of its
+    instructions, none fused)."""
+    target = generation.gpu_target(generation_name)
+    rates = cost.rates(target, device=False)
+    alone = cost.units(Work(operations=1024), rates)[0][1]
+    paired = cost.units(Work(operations=2048, fused_multiply_adds=1024), rates)[0][1]
+    assert alone == paired == 1024 / (lanes * target.loaded_clock_hz), (alone, paired)
+
+
+def test_a_multiprocessor_issues_four_warps_instructions_a_clock_whichever_units_run_them():
+    """An H100's four warp schedulers each issue one instruction a clock (CUDA C++ Programming Guide §16.8.1),
+    128 threads' a clock: 1024 fp32 operations beside 512 integer ones take 1536 threads' issue slots, 12
+    clocks, where each unit alone takes 8 (the lanes' 128 a clock, the ALU's 64); the whole device's schedule
+    (XLA's fusion, its units in series) holds no issue slot of its own."""
+    target = generation.gpu_target("sm90")
+    work = Work(operations=1024, integer_operations=512)
+    seconds = cost.units(work, cost.rates(target, device=False))[0]
+    assert max(seconds) == 1536 / (128 * target.loaded_clock_hz), seconds
+    device = sum(cost.units(work, cost.rates(target, device=True))[0])
+    per_device = target.loaded_clock_hz * target.multiprocessors
+    assert device == 1024 / (128 * per_device) + 512 / (64 * per_device), device
+
+
 @pytest.mark.parametrize("generation_name", ["sm75", "sm80", "sm86", "sm89", "sm90", "sm100", "sm120"])
 @pytest.mark.parametrize("field", ["integer_operations", "integer_multiply_adds"])
 def test_a_gpus_integer_work_is_priced_on_every_cuda_generation(field, generation_name):
