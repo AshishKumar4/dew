@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from blockwise_matrix import CUBLASLT_PRECISION
-from reference_error import assert_as_exact, with_gradients
+from reference_error import assert_as_exact, equations, with_gradients
 
 from dew.nn.kernels import gemm, generation, grouped_matmul, projections, tuning
 from dew.nn.kernels.templates.gemm import tiling
@@ -496,10 +496,10 @@ def test_a_recipe_chains_products_carry_the_names_a_remat_policy_saves(recipe, g
         return run
 
     def products(fn) -> int:
-        # The products the differentiated program runs, sub-programs' too (each `dot_general` or
-        # `ragged_dot_general` equation as the program prints it).
-        return str(jax.make_jaxpr(jax.grad(fn, argnums=tuple(range(3 + gated))))(x, *firsts, down)).count(
-            "dot_general[")
+        # The products the differentiated program runs, its sub-programs' too.
+        graph = jax.make_jaxpr(jax.grad(fn, argnums=tuple(range(3 + gated))))(x, *firsts, down)
+        return sum(equation.primitive.name in ("dot_general", "ragged_dot_general")
+                   for equation in equations(graph, platform="cpu"))
 
     policy = jax.checkpoint_policies.save_only_these_names("gate", "up")
     plain = products(total(("gate", "up")))
