@@ -1,8 +1,9 @@
 """A window shuffle over a stream of line files reads each window's records by index where its stream serves
 them so (`dew.data.shards.Window`, row 12475): the records, in the order, the stream's window gives, its
-position the stream's, read only as each is given. Each read is held to the same chain over a copy of its
-files that no index serves (`streamed`), its position saved and restored across the two."""
+position the stream's, read only as each is given. Each read is held to the same chain over a gzipped copy
+of its files, which no index serves, its position saved and restored across the two."""
 
+import gzip
 import itertools
 import json
 
@@ -16,26 +17,18 @@ from dew.data.dataset import Closeable, DataPartition, Loading
 LOADING = Loading(workers=0, threads=1, read_buffer=1)
 
 
-@pytest.fixture(autouse=True)
-def streamed(monkeypatch):
-    """Files under a `streamed` directory served by no index (`Files._by_index`): the stream as it reads
-    where no index serves a window."""
-    by_index = Files._by_index
-    monkeypatch.setattr(Files, "_by_index",
-                        lambda self, shard: None if "/streamed/" in shard.uri else by_index(self, shard))
-
-
 def _files(directory, sizes: tuple[int, ...]) -> tuple[str, ...]:
     """JSONL files of `sizes` records each, their lines ended `\\r\\n` and `\\n` by turns, a blank line and a
-    line of spaces among them and each file's last line unended."""
+    line of spaces among them and each file's last line unended; gzipped under a `streamed` directory."""
     directory.mkdir(exist_ok=True)
     paths = []
     for index, size in enumerate(sizes):
         lines = [json.dumps({"file": index, "id": row, "text": f"{index}-{row}"}) for row in range(size)]
         text = "".join(line + ("\r\n" if row % 2 else "\n") + ("\n" if row == 2 else "")
                        + ("   \n" if row == 4 else "") for row, line in enumerate(lines[:-1])) + lines[-1]
-        path = directory / f"f{index}.jsonl"
-        path.write_text(text)
+        streamed = directory.name == "streamed"
+        path = directory / f"f{index}.jsonl{'.gz' if streamed else ''}"
+        path.write_bytes(gzip.compress(text.encode()) if streamed else text.encode())
         paths.append(str(path))
     return tuple(paths)
 
@@ -48,17 +41,20 @@ def _kept(record):
     return {"file": np.int32(record["file"]), "id": np.int32(record["id"])}
 
 
+def _read(files, **fields):
+    """The JSONL `files` read, each record kept as its file and id (`_kept`)."""
+    return Files(files, format="jsonl", **fields).map(_kept)
+
+
 CHAINS = {
     # Read endlessly by the run, its root's own lifetime, no repeat written.
-    "unrepeated": (lambda files: Files(files).map(_kept).shuffle(3, window=8).batch(2), (6,)),
-    "repeated": (lambda files: Files(files).map(_kept).repeat().shuffle(3, window=8).batch(2), (5,)),
-    "repeated-twice": (lambda files: Files(files).map(_kept).repeat().repeat(2).shuffle(3, window=8)
-                       .batch(2), (5,)),
+    "unrepeated": (lambda files: _read(files).shuffle(3, window=8).batch(2), (6,)),
+    "repeated": (lambda files: _read(files).repeat().shuffle(3, window=8).batch(2), (5,)),
+    "repeated-twice": (lambda files: _read(files).repeat().repeat(2).shuffle(3, window=8).batch(2), (5,)),
     # Two files read in the run's seeded order of them, one record a window.
-    "two-files": (lambda files: Files(files).map(_kept).shuffle(3, window=1).batch(2), (1, 1)),
-    "larger-than-its-window": (lambda files: Files(files).map(_kept).shuffle(3, window=4).batch(3), (9, 7)),
-    "columns": (lambda files: Files(files, columns=("file", "id")).map(_kept).shuffle(3, window=8).batch(2),
-                (6,)),
+    "two-files": (lambda files: _read(files).shuffle(3, window=1).batch(2), (1, 1)),
+    "larger-than-its-window": (lambda files: _read(files).shuffle(3, window=4).batch(3), (9, 7)),
+    "columns": (lambda files: _read(files, columns=("file", "id")).shuffle(3, window=8).batch(2), (6,)),
 }
 
 
@@ -93,7 +89,7 @@ def test_a_window_read_by_index_reads_the_records_it_gives(tmp_path):
 
     for name in reads:
         files = _files(tmp_path / name, (9,))
-        chain = Files(files).map(counted(name)).repeat().shuffle(3, window=64).batch(2)
+        chain = Files(files, format="jsonl").map(counted(name)).repeat().shuffle(3, window=64).batch(2)
         reader = compile(chain, read="streamed", loading=LOADING, seed=7).train(DataPartition())
         next(reader)
         if isinstance(reader, Closeable):
@@ -147,7 +143,7 @@ def test_an_elastic_window_saved_without_workers_resumes_with_two(tmp_path):
     would give next."""
     def elastic(workers: int):
         files = _files(tmp_path / "served", (9, 7))
-        chain = Files(files).map(_kept).repeat().shuffle(3, window=8).batch(2).elastic()
+        chain = _read(files).repeat().shuffle(3, window=8).batch(2).elastic()
         loading = Loading(workers=workers, threads=1, read_buffer=1)
         return compile(chain, read="streamed", loading=loading, seed=7).train(DataPartition())
 

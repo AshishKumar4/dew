@@ -1599,11 +1599,19 @@ class _ShardLines:
 
     def __init__(self, kind: str, path: str, shard: Shard):
         self.kind, self.shard = kind, shard
-        self.file = open(path, "rb")  # noqa: SIM115 (held until `close`, as a stream holds its file)
-        size = os.fstat(self.file.fileno()).st_size
-        self.memory = mmap.mmap(self.file.fileno(), 0, access=mmap.ACCESS_READ) if size else None
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            size = os.fstat(descriptor).st_size
+            # The map holds the file open itself until it closes.
+            self.memory = mmap.mmap(descriptor, 0, access=mmap.ACCESS_READ) if size else None
+        finally:
+            os.close(descriptor)
         self.stop = size if shard.stop is None else min(shard.stop, size)
-        self.first = _line_start(self.file, shard.start, shard.stop) if shard.start else 0
+        self.first = 0
+        if shard.start and self.memory is not None:
+            # The first line starting at the range's start or past it, as a stream finds it (`_line_start`).
+            found = self.memory.find(b"\n", shard.start - 1, self.stop - 1)
+            self.first = self.stop if found < 0 else found + 1
         # Where the scan stands (no line starts in the bytes before it that it has not found), and the
         # records it found: their starts and ends, each end the offset past the line's newline.
         self.scanned = self.first
@@ -1660,7 +1668,6 @@ class _ShardLines:
         if self.memory is not None:
             self.memory.close()
             self.memory = None
-        self.file.close()
 
 
 class _Lines(grain.IterDataset):
