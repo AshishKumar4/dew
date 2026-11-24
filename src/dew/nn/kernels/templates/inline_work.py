@@ -413,9 +413,8 @@ def _assembly(text: str, active: np.ndarray, operand: Callable) -> Work:
         word = word.strip(",")
         if word.startswith("$") and word[1:].isdigit():
             return operand(int(word[1:]))[0]
-        if re.fullmatch(r"-?(0[xX][0-9a-fA-F]+|[0-9]+)", word):
-            return np.full(LANES, int(word, 0), dtype=np.int64)
-        return None
+        value = _ptx_integer(word)
+        return None if value is None else np.full(LANES, value, dtype=np.int64)
 
     def bounds_of(word: str) -> tuple[np.ndarray, np.ndarray]:
         word = word.strip(",")
@@ -431,10 +430,12 @@ def _assembly(text: str, active: np.ndarray, operand: Callable) -> Work:
             negated = words[0].startswith("@!")
             guard, words = words[0].lstrip("@!"), words[1:]
             maybe, surely = bounds_of(guard)
-            running = active & (~surely if negated else maybe)
-            # Its lanes known where some active lane surely holds it or none may: bounded, not every lane
-            # a may (a ticket's last arriver among its elected lane is bounded by it).
-            if (surely & active).any() or not (maybe & active).all():
+            if negated:
+                maybe, surely = ~surely, ~maybe
+            running = active & maybe
+            # Its lanes known over the active lanes where one of them surely holds it or surely does not (a
+            # ticket's last arriver among its elected lane is bounded by it), or where no lane is active.
+            if not active.any() or (active & surely).any() or (active & ~maybe).any():
                 guard = None
         issued = float(running.reshape(-1, WARP).any(axis=1).sum() * WARP)
         moving = float(running.sum())
@@ -508,6 +509,23 @@ def _instruction(words: list[str], issued: float, moving: float) -> Work:
         moved = 4 * moving
         return Work(shared_bytes=moved) if ".shared" in mnemonic else Work(device_bytes=moved)
     raise Uncounted(f"no rule counts the PTX instruction {mnemonic}")
+
+
+def _ptx_integer(word: str) -> int | None:
+    """A PTX integer literal's value (hexadecimal `0x`, binary `0b`, octal `0`, decimal, a `U` suffix and a
+    sign taken), None where `word` is none or its value lies past a 64-bit lane's."""
+    found = re.fullmatch(r"(-?)(0[xX][0-9a-fA-F]+|0[bB][01]+|0[0-7]*|[1-9][0-9]*)[uU]?", word)
+    if found is None:
+        return None
+    sign, digits = found.groups()
+    if digits[:2] in ("0x", "0X"):
+        value = int(digits[2:], 16)
+    elif digits[:2] in ("0b", "0B"):
+        value = int(digits[2:], 2)
+    else:
+        value = int(digits, 8) if digits.startswith("0") else int(digits)
+    value = -value if sign else value
+    return value if -(1 << 63) <= value < (1 << 63) else None
 
 
 _PTX_COMPARES = {"eq": np.equal, "ne": np.not_equal, "lt": np.less, "le": np.less_equal, "gt": np.greater,
