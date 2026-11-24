@@ -2406,16 +2406,14 @@ def test_a_cutlass_launch_under_a_checked_shard_map_varies_as_its_operands_do(mo
     gmm = grouped_cutlass.CutlassGmm()
     mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:2]), ("data",))
     data, whole = jax.sharding.PartitionSpec("data"), jax.sharding.PartitionSpec()
-    typed = []
 
     def each_device(tokens, stack, sizes, layer):
         out, _ = gmm._fwd(tokens, stack, sizes, first=layer[0] * sizes.shape[0], out_dtype="bfloat16",
                           trans_rhs=False, interpret=False, config=None)
-        typed.append(jax.typeof(out).mat.varying)
+        assert jax.typeof(out).mat.varying == frozenset({"data"}), jax.typeof(out)
         return out
 
     jax.make_jaxpr(jax.shard_map(each_device, mesh=mesh, in_specs=(whole, whole, whole, data),
                                  out_specs=data, check_vma=True))(
         jax.ShapeDtypeStruct((64, 32), jnp.bfloat16), jax.ShapeDtypeStruct((4, 32, 16), jnp.bfloat16),
         jax.ShapeDtypeStruct((2,), jnp.int32), jax.ShapeDtypeStruct((2,), jnp.int32))
-    assert typed == [frozenset({"data"})], typed
