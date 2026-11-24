@@ -469,8 +469,11 @@ def _read_out(call: Call, products: tuple[str, ...], totals, owned: list, solve:
     columns_of = jax.lax.broadcasted_iota(jnp.int32, (sub, chunk), 1)
 
     def identity(b):
-        """The identity's rows of sub-chunk `b` `[SUB, C]`."""
-        return jnp.where(columns_of == rows_of + b * sub, 1.0, 0.0)
+        """The identity's rows of sub-chunk `b` `[SUB, C]`, laid as the sums are (`Family.as_tile`): where no
+        sum meets them (the scores alone, `recurrence_intra_scores`), their indices took no layout the
+        exact operand's staging and the product reading it both hold (sm80, "Failed to infer a possible set
+        of layouts")."""
+        return family.as_tile(jnp.where(columns_of == rows_of + b * sub, 1.0, 0.0))
 
     def rows_at(tile, b):
         return operands.Parts(tuple(ref.at[pl.ds(b * sub, sub)] for ref in tile.refs), tile.dtype)
@@ -491,7 +494,7 @@ def _read_out(call: Call, products: tuple[str, ...], totals, owned: list, solve:
     inverted = inverse_form(call)
     # The rows of blocks staged zero, so a row block's sum over those not yet solved reads zero.
     for b in range(chunk // sub):
-        zero = family.zeros((sub, chunk))
+        zero = family.as_tile(family.zeros((sub, chunk)))
         operands.staged(family, zero, tuple(ref.at[pl.ds(b * sub, sub)] for ref in stacked))
     for b in range(chunk // sub):
         unit = identity(b)
