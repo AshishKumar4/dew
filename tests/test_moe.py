@@ -699,7 +699,7 @@ def test_a_gated_expert_layer_runs_its_chain_on_mosaic_gpu_under_a_declared_swig
     `norm_swiglu` launch), a gated expert layer's chain selects Mosaic GPU's launches, forward and backward,
     refusing none (`generation.routes`): its gated product the epilogue's and the prologue's arithmetic on the
     tile (`activations.gated_hook`), no launch of its own inside them; one paired call with an epilogue and a
-    down call whose prologue is that gated product (`grouped_matmul.weighed`)."""
+    down call reading what it formed (`grouped_matmul.weighed`)."""
     from dew.nn.kernels import generation, grouped_matmul
 
     draw, gated, _, _ = _gated_case()
@@ -714,10 +714,12 @@ def test_a_gated_expert_layer_runs_its_chain_on_mosaic_gpu_under_a_declared_swig
     # none.
     assert sum(arguments["hooks"].epilogue is not None for arguments in bound
                if arguments.get("paired") is not None) == 1, bound
-    depth = operands[0].shape[-1]
-    assert any(arguments.get("hooks") is not None and arguments["hooks"].prologue is not None
-               and arguments.get("kernel") is not None and arguments["kernel"].shape[-1] == depth
-               for arguments in bound), bound
+    # The down projection's forward reads the epilogue's formed product (`gemm.gemm`'s `applied`), its
+    # prologue the backward's: its call takes the [slots, width] rows through the down stack.
+    down = operands[3]
+    assert any(arguments.get("kernel") is not None and tuple(arguments["kernel"].shape) == (
+        down.shape[0] * down.shape[1], *down.shape[2:]) and arguments["tokens"].shape[-1] == down.shape[2]
+        for arguments in bound), bound
 
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32], ids=["bf16", "fp32"])
