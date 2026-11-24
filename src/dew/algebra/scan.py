@@ -40,7 +40,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable, Mapping, Sequence
-from typing import Literal, NamedTuple, cast
+from typing import Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -276,9 +276,9 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
                    functools.partial(_replay_backward, replay, names), prepare, replay=replay)
 
 
-def _keyed_state(declaration: Scan) -> State:
+def _keyed_state(declaration: Scan) -> tuple:
     """A declaration's one state's shape and dtype, refused unless it is keys by values."""
-    shape, dtype = cast(State, declaration.state)
+    shape, dtype = declaration.state
     if len(shape) != 2:
         raise Refused("a state of rank other than two (keys by values) has no chunk form here")
     return shape, dtype
