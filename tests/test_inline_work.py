@@ -102,3 +102,41 @@ def test_inline_ptx_counts_by_its_instructions_and_an_unknown_one_is_unpriced():
     assert _counted(_ptx("fma.rn.bf16x2")) == Work(operations=2 * 128)
     with pytest.raises(emission.Unpriced):
         _counted(_ptx("dp4a.u32.u32"))
+
+
+def test_a_warps_tensor_core_product_counts_its_operations_in_its_mode():
+    """A TF32 matrix product a warp issues in inline PTX (mma.sync's m16n8k8, the recurrence solve's) counts
+    2 M N K operations each warp, on the TF32 tensor cores."""
+    assert _counted(_ptx("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32")) == Work(
+        tf32_flops=2 * 16 * 8 * 8 * (128 // 32))
+
+
+def test_a_store_its_operand_guards_counts_the_lanes_that_take_it():
+    """A store guarded by an operand (`inline_ptx`'s predicate: the first lane's) moves that lane's word
+    alone; one guarded by a predicate the block computes itself is unpriced, its lanes unknown."""
+    def elected(ctx, ref):
+        del ctx, ref
+        i32 = ir.IntegerType.get_signless(32)
+        word = arith.constant(i32, 1)
+        mgpu_utils.inline_ptx("st.shared.u32 [$0], $1;", word, word, predicate=_thread(1))
+
+    assert _counted(elected) == Work(shared_bytes=4)
+
+    def own(ctx, ref):
+        del ctx, ref
+        i32 = ir.IntegerType.get_signless(32)
+        word = arith.constant(i32, 1)
+        mgpu_utils.inline_ptx("{ .reg .pred p; setp.eq.u32 p, $1, 0; @p st.shared.u32 [$0], $1; }", word,
+                              word, has_side_effects=True)
+
+    with pytest.raises(emission.Unpriced):
+        _counted(own)
+
+
+def test_a_copy_through_the_launch_context_moves_its_shared_tile_once():
+    """A copy a body asks its launch context for (`ctx.async_copy`, a gathered ring's TMA rows) moves its
+    shared tile's bytes between device and shared memory once, whatever lanes issue it."""
+    def copied(ctx, ref):
+        ctx.async_copy(src_ref=ref, dst_ref=ref)
+
+    assert _counted(copied) == Work(device_bytes=4 * 128, shared_bytes=4 * 128)
