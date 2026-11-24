@@ -110,7 +110,7 @@ def test_a_block_diffusion_step_rolls_the_largest_of_every_pass():
     from dew.objectives.diffusion.block import BlockDiffusionObjective
 
     text = CausalTransformer(vocab_size=16, emb_features=32, num_layers=2, num_heads=2, mlp_features=64,
-                             max_seq_len=8)
+                             max_seq_len=8, layer_scalar="trainable")
     objective = BlockDiffusionObjective(DiffusionGemma(text=text, canvas_length=4), prompt_length=4)
     rows = 8 * jax.device_count()
     batch = {"text": np.random.default_rng(12721).integers(1, 16, size=(rows, 8)).astype(np.int32)}

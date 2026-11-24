@@ -73,6 +73,11 @@ if TYPE_CHECKING:
     from dew.nn.diffusion_gemma import DiffusionGemma
 
 
+type Observed = tuple[Variables | None, Variables | None, Variables | None]
+"""What a step's scoring observed (`Step.observed`'s): the attention logit maxima, the watched activations
+and the projections' recorded largest magnitudes, each None where the step asked for none."""
+
+
 @struct.dataclass
 class BlockSFTStatistics:
     """Carry the two SFT losses separately, with the mass that supports them.
@@ -331,10 +336,10 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
         return stats, scores
 
     def _scored(self, params: Variables, batch: Batch, step: Step, *, train: bool
-                ) -> tuple[BlockSFTStatistics, TokenScores | None, tuple[Variables | None, Variables | None]]:
-        """The SFT statistics, out of training the canvas targets' scores, and the attention logit maxima
-        and watched activations the step asks for (`Step.qk_stats`, `Step.watched`, else None), from one
-        scoring of the batch."""
+                ) -> tuple[BlockSFTStatistics, TokenScores | None, Observed]:
+        """The SFT statistics, out of training the canvas targets' scores, and the attention logit maxima,
+        watched activations and recorded largest magnitudes the step asks for (`Step.qk_stats`,
+        `Step.watched`, `Step.amax`, else None), from one scoring of the batch."""
         canvas_losses, target_mask, encoder_losses, encoder_target_mask, correct, sown = self._token_losses(
             params, batch, step, train=train)
         support = (
@@ -445,7 +450,7 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
 
     def _token_losses(self, params: Variables, batch: Batch, step: Step, *, train: bool
                       ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array | None,
-                                 tuple[Variables | None, Variables | None]]:
+                                 Observed]:
         """Score both SFT passes over one batch.
 
         Returns the denoiser's per-token cross entropies over the response
