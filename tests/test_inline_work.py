@@ -339,3 +339,17 @@ def test_element_pointers_of_mixed_widths_cancel_by_their_bytes_and_a_narrow_ind
         llvm.load(f32, mgpu_utils.getelementptr(word, [back], i8))
 
     assert _counted(body).shared_bytes == 4
+
+
+def test_an_elements_stride_is_stated_only_where_its_layout_is_its_payload():
+    """An element pointer's stride is its element's bytes only where LLVM lays it out so (a scalar of 8 to 64
+    bits, a vector of a power of two of them); an i24 (padded to four bytes), i1s (packed to bits) and a
+    vector of three (padded to four) state none, their lanes left unknown."""
+    from dew.nn.kernels.templates import inline_work
+
+    with ir.Context():
+        i32, f16 = ir.IntegerType.get_signless(32), ir.F16Type.get()
+        assert inline_work._stride(i32) == 4 and inline_work._stride(ir.VectorType.get([4], f16)) == 8
+        bits = ir.VectorType.get([8], ir.IntegerType.get_signless(1))
+        for unknown in (ir.IntegerType.get_signless(24), bits, ir.VectorType.get([3], i32)):
+            assert inline_work._stride(unknown) is None
