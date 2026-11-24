@@ -28,6 +28,7 @@ import numpy as np
 import optax
 from flax import struct
 from flax.training import dynamic_scale as dynamic_scale_lib
+from jax.core import ShapedArray
 from typing_extensions import TypeVar
 
 from dew._coordination import read_by_holders
@@ -2077,7 +2078,7 @@ def _run_reads(program: jcore.Jaxpr, roots: Mapping[jcore.Var, _Root],
             reads.update(runs)
             # Its operands' shapes the run's own as its trace saw them, else a batching transform's lanes
             # beside them: one call standing for each lane's.
-            given = tuple(tuple(value.aval.shape) if isinstance(value.aval, jax.core.ShapedArray) else ()
+            given = tuple(tuple(value.aval.shape) if isinstance(value.aval, ShapedArray) else ()
                           for value in equation.invars[-len(read[0].called):])
             if (given != read[0].called
                     or any(_draws(inner) for inner in jcore.jaxprs_in_params(equation.params))):
