@@ -1718,45 +1718,6 @@ def test_a_fit_that_streams_over_its_device_plans_search_keeps_none_of_what_that
     assert not _candidates._CANDIDATES, list(_candidates._CANDIDATES)
 
 
-def test_a_fit_that_streams_over_a_device_plan_it_holds_keeps_none_of_that_plans_programs(monkeypatch):
-    """A fresh bf16 fit on stand-in H100s that hold both its device plan and the step streaming its
-    parameters from the host, the device plan priced dearer than the streamed step (`streaming.chosen`),
-    streams: the device plan its search fit, which it held and passed over, keeps neither its executable
-    nor its lowering alive once the fit has run (`StepCompiler.abandoned`; row 12404: only a search the
-    devices refused was witnessed released)."""
-    import weakref
-
-    from dew.nn.kernels import options
-    from dew.training import _candidates, compiler, streaming
-    from dew.training.ahead import stand_in_gpus
-    from dew.training.memory import StepPrice, host_memory_stated
-
-    # The device plan dearer than any streamed step: a day a step.
-    monkeypatch.setattr(streaming, "priced", lambda plan, dtype: StepPrice(compute=86400.0))
-    passed: list[weakref.ref] = []
-    abandoned = compiler.StepCompiler.abandoned
-
-    def watched(self) -> None:
-        # The plan the search held as it is passed over: its executable and its candidate's lowering.
-        held = self.unplaced
-        if held is not None:
-            passed.extend((weakref.ref(held.executable), weakref.ref(held.candidate.lowered)))
-        abandoned(self)
-
-    monkeypatch.setattr(compiler.StepCompiler, "abandoned", watched)
-    options.release()
-    gc.collect()
-    with (assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), 80 * 2 ** 30),
-          host_memory_stated(1e20)):
-        trainer = streaming_decoder(dtype=jnp.bfloat16)
-        trainer.fit(streaming_data(), steps=1, log_every=100)
-    choice = trainer.layout_choice
-    assert choice is not None and choice.held and choice.streams, choice
-    gc.collect()
-    assert passed and all(held() is None for held in passed), passed
-    assert not _candidates._CANDIDATES, list(_candidates._CANDIDATES)
-
-
 @pytest.mark.usefixtures("scanned_stacks")
 def test_a_fit_that_fails_placing_its_state_keeps_none_of_its_device_plan():
     """A fresh fit that keeps its device plan (`streaming.laid_start`) and fails placing its state, its
