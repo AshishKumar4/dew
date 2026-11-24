@@ -1816,16 +1816,18 @@ class MosaicMxGmm(_ScaledGmm):
     by its scale in the products (`product.block_format`)
     (`mosaic_gpu.gmm`'s `mx_scales`, `mosaic.Issuer.scaled_products`), its block scales streamed beside its
     rings (`gmm_allocations`' `block_scaled`) on a family whose products take them (tcgen05's), its tiles
-    whole 128s of rows, columns and depth, and no split, swap, hook or exact sums."""
+    whole 128s of rows, columns and depth, and no split, swap, prologue, pair or exact sums: an epilogue
+    reads its sums (`gemm.nvfp4_block_finished`'s, its outputs in their forms, row 12721)."""
 
     BLOCK_SCALED: ClassVar[bool] = True
     SCALES: ClassVar[str] = 'mx_scales'
 
     def _fp8(self, ba, dtype, family: mosaic.Family) -> bool:
         # Its products scale each block in the instruction, which sums in fp32 itself: no step promoted. Its
-        # operands FP8 (MXFP8) or E2M1 (NVFP4), `product.block_format`'s.
+        # operands FP8 (MXFP8) or E2M1 (NVFP4), `product.block_format`'s. An epilogue reads its sums as any
+        # product's; no prologue forms its codes.
         return (jnp.dtype(dtype) in family.block_formats
-                and ba.arguments['trans_rhs'] and ba.arguments['hooks'] == NO_HOOKS
+                and ba.arguments['trans_rhs'] and ba.arguments['hooks'].prologue is None
                 and ba.arguments.get('paired') is None and not ba.arguments.get('exact_sums'))
 
     def candidate(self, ba, config: tiling.Tiles, target) -> bool:

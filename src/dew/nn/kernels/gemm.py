@@ -56,7 +56,7 @@ from dew.nn.derivatives import (
     with_gradients_formed,
 )
 from dew.nn.kernels import generation, grouped_matmul, selection, xla_products
-from dew.nn.kernels.formats import MxFp8, NvFp4, NvFp4Block, TernaryWeights, _e2m1_values
+from dew.nn.kernels.formats import MxFp8, NvFp4, NvFp4Block, TernaryWeights
 from dew.nn.kernels.templates import axes as side_axes_of, product as product_of
 from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import epilogue_vjp, rows_permuted, scattered, tiling
@@ -756,7 +756,7 @@ def gemm_quantized(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None
                    precision=precision, interpret_on_cpu=interpret_on_cpu)
         assert isinstance(out, tuple)
         nibbles, block_scales = out
-        return NvFp4Block(_e2m1_values(nibbles).astype(jnp.float4_e2m1fn), block_scales[..., ::16], ts)
+        return NvFp4Block.encoded(nibbles, block_scales[..., ::16], ts)
     raise ValueError(f"gemm_quantized supports E4M3, E5M2, E2M1, MxFp8, or NvFp4Block, got {minifloat}")
 
 
@@ -1325,29 +1325,35 @@ def _blockwise_fp8(lhs, kernel, group_sizes, row_scales, column_scales, *, dtype
         return xla_products.step_scaled(lhs.astype(jnp.bfloat16), matrices, sizes, row_scales,
                                         column_scales, precision=jax.lax.Precision.DEFAULT)
 
-
-    def finished(summed, *sides):
-        # XLA's sums through the same epilogue, each output in its dtype and form (`quantized.stored`).
-        outputs = summed if epilogue is None else epilogue(summed, *sides)
-        outputs = outputs if isinstance(outputs, tuple) else (outputs,)
-        forms = out_forms or (None,) * len(dtypes)
-        return tuple(quantized.stored(value.astype(dtype), form)
-                     for value, dtype, form in zip(outputs, dtypes, forms, strict=True))
-
     def mosaic(lhs, kernel, sizes, row_scales, column_scales, *sides, interpret):
         out = launch(lhs, kernel, sizes.astype(jnp.int32), out_dtype=stored, trans_rhs=True,
                      interpret=interpret, exact_sums=True, scales=(row_scales, column_scales), hooks=hooks,
                      dense=dense, epilogue_operands=sides)
-        return tuple(out) if several else finished(out)
+        return tuple(out) if several else _finished(out, sides, epilogue, dtypes, out_forms)
 
     def portable_finished(lhs, kernel, sizes, row_scales, column_scales, *sides):
-        return finished(portable(lhs, kernel, sizes, row_scales, column_scales), *sides)
+        return _finished(portable(lhs, kernel, sizes, row_scales, column_scales), sides, epilogue, dtypes,
+                         out_forms)
 
     if selection.select(BLOCKWISE_FP8, ScaledCase(tile)).kernel == 'mosaic':
         assert tile is not None, "the selector names the template where it plans a tile"
         return xla_products.dispatched(mosaic, portable_finished, interpret, lhs, kernel, group_sizes,
                                        row_scales, column_scales, *sides)
     return portable_finished(lhs, kernel, group_sizes, row_scales, column_scales, *sides)
+
+
+def _finished(summed: jax.Array, sides: tuple, epilogue: Callable | None, dtypes: tuple,
+              out_forms: tuple | None) -> tuple[jax.Array, ...]:
+    """A scaled product's fp32 sums in XLA through its launch's `epilogue` (none: the sums), each output in
+    its dtype and form (`quantized.stored`): the template's epilogue's outputs, the same function of its
+    sums (`blockwise_fp8_finished`'s, `nvfp4_block_finished`'s)."""
+    from .templates.gemm import quantized
+
+    outputs = summed if epilogue is None else epilogue(summed, *sides)
+    outputs = outputs if isinstance(outputs, tuple) else (outputs,)
+    forms = out_forms or (None,) * len(dtypes)
+    return tuple(quantized.stored(value.astype(dtype), form)
+                 for value, dtype, form in zip(outputs, dtypes, forms, strict=True))
 
 
 def blockwise_fp8_kernel_gradient(lhs_t: jax.Array, rhs_t: jax.Array, group_blocks: jax.Array,
@@ -1461,7 +1467,7 @@ def mxfp8_product(lhs: MxFp8, matrices: MxFp8, group_blocks: jax.Array, *, out_d
 
 
 def _block_scaled(lhs, matrices, group_blocks: jax.Array, op: selection.Op, interpret: bool,
-                  gather: jax.Array | None = None) -> jax.Array:
+                  gather: jax.Array | None = None, *, finishing: tuple | None = None):
     """A block-scaled grouped product summed in fp32 (`mxfp8_product`'s, `nvfp4_block_product`'s): `op`
     selects the template on Blackwell's block-scaled tensor cores (`mosaic_gpu.gmm`'s `mx_scales`, the
     operands' `codes` and their block `scales`, `product.block_format`'s) where named and planned, else
@@ -1469,11 +1475,21 @@ def _block_scaled(lhs, matrices, group_blocks: jax.Array, op: selection.Op, inte
     are exact) summed as XLA sums fp32 products. Gathered rows (`gather`) are the template's gather
     (tcgen05's load warp's, row 1376) and their block scales the same table's rows of `lhs.scales`, gathered
     as every call's scales are laid out anew for the products (`mosaic_sm100.scales_tiled`), a sixteenth or a
-    thirty-second of the rows' bytes (row 4851)."""
+    thirty-second of the rows' bytes (row 4851). With `finishing` (`(epilogue, sides, side_axes, dtypes,
+    out_forms, dense)`), its outputs, a tuple, through the launch's `epilogue` of its side operands
+    (`nvfp4_block_finished`), XLA's the same function of its sums (`_finished`)."""
     from dew.nn.kernels.templates import mosaic_sm100
+
+    from .templates.gemm import quantized
 
     launch = grouped_matmul.MosaicMxGmm()
     tables = (() if gather is None else (gather,))
+    epilogue, sides, side_axes, dtypes, out_forms, dense = finishing or (None, (), (), (), None, False)
+    out_forms = quantized.forms_of(out_forms, len(dtypes)) or None
+    hooks = NO_HOOKS if epilogue is None else Hooks(
+        epilogue=epilogue, epilogue_axes=side_axes, out_dtypes=tuple(dtype.name for dtype in dtypes),
+        out_forms=out_forms)
+    stored = 'float32' if epilogue is None else dtypes[0].name
     # Gathered rows' block scales are the same table's rows of the rows' scales, laid out for the products:
     # planned from `mosaic_sm100.scale_tiles` alone so gathers and tiling run only in the chosen branch.
     rows_count = lhs.scales.shape[0] if gather is None else gather.shape[0]
@@ -1488,25 +1504,31 @@ def _block_scaled(lhs, matrices, group_blocks: jax.Array, op: selection.Op, inte
 
     scales_spec = (None if not tileable else (_tiled_spec(rows_scales_spec), _tiled_spec(mat_scales_spec)))
     tile = None if scales_spec is None else _planned(launch, launch.bind(
-        *_abstract(lhs.codes, matrices.codes), sizes_spec, (), (), None, None, *_abstract(*tables),
-        out_dtype='float32', trans_rhs=True, interpret=interpret, scales=scales_spec))
-    def portable(lhs_codes, lhs_scales, mat_codes, mat_scales, group_blocks, *gather_arg):
+        *_abstract(lhs.codes, matrices.codes), sizes_spec, (), _abstract(*sides), None, None,
+        *_abstract(*tables), out_dtype=stored, trans_rhs=True, interpret=interpret, scales=scales_spec,
+        hooks=hooks, dense=dense))
+
+    def portable(lhs_codes, lhs_scales, mat_codes, mat_scales, group_blocks, *rest):
+        gather_arg, side_args = rest[:len(tables)], rest[len(tables):]
         sizes = (group_blocks * SCALE_DEPTH).astype(jnp.int32)
         lhs_val = dataclasses.replace(lhs, codes=lhs_codes, scales=lhs_scales).decoded()
         mat_val = dataclasses.replace(matrices, codes=mat_codes, scales=mat_scales).decoded()
         values = lhs_val if not gather_arg else lhs_val[gather_arg[0]]
-        return xla_products.xla_ragged_dot(values, jnp.swapaxes(mat_val, 1, 2), sizes,
+        summed = xla_products.xla_ragged_dot(values, jnp.swapaxes(mat_val, 1, 2), sizes,
                                              precision=jax.lax.Precision.DEFAULT,
                                              preferred_element_type=jnp.float32)
+        return summed if epilogue is None else _finished(summed, side_args, epilogue, dtypes, out_forms)
 
-    def mosaic(lhs_codes, lhs_scales, mat_codes, mat_scales, group_blocks, *gather_arg, interpret):
+    def mosaic(lhs_codes, lhs_scales, mat_codes, mat_scales, group_blocks, *rest, interpret):
+        gather_arg, side_args = rest[:len(tables)], rest[len(tables):]
         sizes = (group_blocks * SCALE_DEPTH).astype(jnp.int32)
         rows_sc = lhs_scales if not gather_arg else lhs_scales[gather_arg[0]]
         scales = (mosaic_sm100.scales_tiled(rows_sc), mosaic_sm100.scales_tiled(mat_scales))
-        return launch(lhs_codes, mat_codes, sizes, (), (), None, None, *gather_arg,
-                      out_dtype='float32', trans_rhs=True, interpret=interpret, scales=scales)
+        out = launch(lhs_codes, mat_codes, sizes, (), side_args, None, None, *gather_arg, out_dtype=stored,
+                     trans_rhs=True, interpret=interpret, scales=scales, hooks=hooks, dense=dense)
+        return out if epilogue is None else tuple(out)
 
-    operands = (lhs.codes, lhs.scales, matrices.codes, matrices.scales, group_blocks, *tables)
+    operands = (lhs.codes, lhs.scales, matrices.codes, matrices.scales, group_blocks, *tables, *sides)
     if selection.select(op, ScaledCase(tile)).kernel != 'mosaic':
         return portable(*operands)
     assert tile is not None, "the selector names the template where it plans a tile"
@@ -1528,6 +1550,35 @@ def nvfp4_block_product(lhs: NvFp4Block, matrices: NvFp4Block, group_blocks: jax
     as `mxfp8_product`'s."""
     summed = _block_scaled(lhs, matrices, group_blocks, NVFP4_BLOCK_OP, interpret_on_cpu, gather)
     return twice_scaled(summed, lhs.scale, matrices.scale).astype(out_dtype)
+
+
+def nvfp4_block_finished(lhs: NvFp4Block, matrices: NvFp4Block, group_blocks: jax.Array, *,
+                         epilogue: Callable, out_dtypes: tuple, epilogue_operands: tuple = (),
+                         epilogue_scalars: tuple = (), out_forms: tuple | None = None, dense: bool = False,
+                         interpret_on_cpu: bool = False) -> tuple[jax.Array, ...]:
+    """`nvfp4_block_product`'s fp32 sums times both tensor scales (`twice_scaled`) through `epilogue`, its
+    several outputs in `out_dtypes`: the template's epilogue on Blackwell's block-scaled tensor cores, its
+    sums scaled there before any function of them, XLA's the same function of its sums (a next product's
+    rows quantized from them, `quantized.nvfp4_epilogue`, row 12721), each stored as `out_forms` states
+    (`Hooks.out_forms`: an output broadcast across each block's columns stored one value a row a block,
+    transposed). `epilogue_operands`, its side tiles (`[rows, columns]` each), the epilogue taking them after
+    the sums; `epilogue_scalars`, fp32 scalars after them (a delayed recipe's next tensor scale), each a
+    tile of its value there, carried as a vector over the columns (the launch's side of one value a column,
+    as a bias's). `dense`: its one group covers every row, which a transposed form's stores need
+    (`quantized.forms_refusal`)."""
+    tiles = tuple(epilogue_operands)
+    vectors = tuple(jnp.broadcast_to(jnp.asarray(scalar, jnp.float32), matrices.codes.shape[1:2])
+                    for scalar in (lhs.scale, matrices.scale, *epilogue_scalars))
+
+    def scaled(acc, *sides):
+        held, wide = sides[:len(tiles)], [jax.lax.broadcast_in_dim(vector, acc.shape, (1,))
+                                          for vector in sides[len(tiles):]]
+        return epilogue(twice_scaled(acc, *wide[:2]), *held, *wide[2:])
+
+    side_axes = (LAUNCH_AXES['epilogue'],) * len(tiles) + (('columns',),) * len(vectors)
+    return _block_scaled(lhs, matrices, group_blocks, NVFP4_BLOCK_OP, interpret_on_cpu, finishing=(
+        scaled, (*tiles, *vectors), side_axes, tuple(jnp.dtype(dtype) for dtype in out_dtypes), out_forms,
+        dense))
 
 
 def nvfp4_quantized_product(lhs: jax.Array, matrix: NvFp4, *, out_dtype,

@@ -612,12 +612,13 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
 def _gmm_forms_refused(tiles: Tiles, family: mosaic.Family, k: int, n: int, mx_scales, step_scales, *,
                        parts: tuple, transpose_rhs: bool, transpose_lhs: bool, exact_sums: bool) -> None:
     """Dew: `gmm`'s refusal of an MX product's or a depth split's form it cannot run (`_mx_refused`,
-    `_gmm_split_refused`), `parts` its prologue, epilogue, pair and scales: a step-scaled product's epilogue
-    reads its sums as any product's (its next product's rows quantized there, row 8547)."""
+    `_gmm_split_refused`), `parts` its prologue, epilogue, pair and scales: a step-scaled or block-scaled
+    product's epilogue reads its sums as any product's (its next product's rows quantized there, rows 8547
+    and 12721)."""
     prologue, _, paired, scales = parts
     hooked = any(each is not None for each in parts[:3])
     _mx_refused(mx_scales, tiles, family, transpose_rhs=transpose_rhs,
-                plain=all(each is None for each in (*parts, step_scales))
+                plain=all(each is None for each in (prologue, paired, scales, step_scales))
                 and not (transpose_lhs or exact_sums))
     _gmm_split_refused(tiles, k, n, step_scales, exact_sums=exact_sums, hooked=hooked,
                        plain=all(each is None for each in (prologue, paired, scales)) and not transpose_lhs)
@@ -1008,9 +1009,10 @@ def _mx_refused(mx_scales, tiles: Tiles, family: mosaic.Family, *, transpose_rhs
     row order, a gathered product's its tokens' at the table (the caller's gather, `gemm._block_scaled`, row
     4851); FP8 or E2M1 rows times a K-major matrix of theirs, each block of each scaled in the products,
     `mosaic.Issuer.scaled_products`) it does not take: but on a family whose products take block scales, its
-    matrix K-major, with no hook, pair, packed matrix, step scales, transposed rows, exact sums or split, its
-    tile whole 128s of rows, columns and depth (the scales' tiles), each group's rows whole 128-row tiles (the
-    caller's)."""
+    matrix K-major, with no prologue, pair, packed matrix, step scales, transposed rows, exact sums or split,
+    its tile whole 128s of rows, columns and depth (the scales' tiles), each group's rows whole 128-row tiles
+    (the caller's). An epilogue reads its sums as any product's (its tensor scales applied and its next
+    product's rows quantized there, `gemm.nvfp4_block_finished`, row 12721)."""
     if mx_scales is None:
         return
     if not (family.block_formats and transpose_rhs and plain and tiles.splits == 1
