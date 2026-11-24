@@ -467,3 +467,44 @@ def test_a_parts_prepare_passes_by_its_cells_placed_on_the_hosts_cpu(tmp_path, m
     with prepared(tmp_path / "store", stamp="a", target=node_target()):
         run_cells([*test_gpu_numerics.projection_cells(), *test_gpu_numerics.seams_cells(None)])
     assert not (tmp_path / "store" / DEFERRED).exists()
+
+
+def test_a_prepared_sites_draw_whose_shape_reads_its_value_keys_its_own_program():
+    """A site's prepare reads each draw's shapes traced abstractly and draws in full one seed of each shapes
+    (`arm_store._first_draws`): the draws it keeps name exactly the programs every draw drawn in full names,
+    each its first seed's draw. A draw whose shape reads a value it drew (a length from its seed's key) is
+    drawn in full for its shapes, every seed of it, and warned of (`ConcreteDraws`), each seed of other
+    shapes keying its own program; one of fixed shapes keeps its first seed's draw alone, warned of by none
+    (row 12431: a Gemma vocabulary's 1,280 draws of a 64 MiB head made in full for one program)."""
+    import warnings
+
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from arm_arithmetic import drawn_on_the_host
+    from arm_store import ConcreteDraws, _first_draws
+    from truths_ahead import named
+
+    def fixed(seed):
+        return jax.random.normal(jax.random.key(seed), (4, 3)), jnp.arange(2)
+
+    def read(seed):
+        return (jnp.ones((int(jax.random.randint(jax.random.key(seed), (), 1, 4)), 3)),)
+
+    seeds = range(12)
+    for draw, concrete in ((fixed, 0), (read, len(seeds))):
+        every: dict[str, int] = {}
+        for seed in seeds:
+            every.setdefault(named("truth", drawn_on_the_host(draw, seed)), seed)
+        with warnings.catch_warnings(record=True) as warned:
+            warnings.simplefilter("always")
+            kept = _first_draws(draw, seeds, "a site")
+        programs: dict[str, tuple] = {}
+        for inputs in kept:
+            programs.setdefault(named("truth", inputs), inputs)
+        assert list(programs) == list(every)
+        for name, inputs in programs.items():
+            jax.tree.map(np.testing.assert_array_equal, inputs, drawn_on_the_host(draw, every[name]))
+        assert len(kept) == (concrete or 1) and (len(every) > 1 if concrete else len(every) == 1)
+        assert [(item.category, f"{concrete} of its draws" in str(item.message)) for item in warned] == (
+            [(ConcreteDraws, True)] if concrete else [])
