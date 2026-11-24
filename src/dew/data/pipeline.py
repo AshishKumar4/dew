@@ -61,6 +61,25 @@ class Rejected:
     `consumed`."""
 
 
+@dataclasses.dataclass(frozen=True)
+class CachedOutputs:
+    """What a cache holds for one input, as rows: its outputs, a missing one
+    and an empty expansion each rejected, which every read of a cache uses."""
+
+    def flat_map(self, outputs: Sequence[Record]) -> tuple[Record, ...]:
+        held = tuple(Rejected("missing") if value is None else value for value in outputs)
+        return held if held else (Rejected("empty_expansion"),)
+
+
+class CachedOne:
+    """What a cache of steps that keep or reject each input holds for one, as the uncached steps make
+    it: its record, or the marker of its rejection; a missing one rejected (`CachedOutputs`)."""
+
+    def __call__(self, outputs: Record | tuple[Record, ...]) -> Record:
+        (value,) = outputs if isinstance(outputs, tuple) else (outputs,)
+        return Rejected("missing") if value is None else value
+
+
 CONSUMED = "_dew_consumed"
 """A row's count of the source examples it is the last row of, set on each source example a run bounded in
 examples reads (`MarkConsumed`) and carried through every step to the batch: each example's count goes to the

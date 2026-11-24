@@ -9,6 +9,7 @@ import io
 import itertools
 import json
 import math
+import mmap
 import os
 import posixpath
 import re
@@ -51,7 +52,17 @@ from dew.data.storage import (
     on_gcs,
 )
 
-from .base import Read, Shard, ShardManifest, _indexed_manifest, preparing, source_record, url_label
+from .base import (
+    MappedRows,
+    Read,
+    Shard,
+    ShardManifest,
+    ShardRows,
+    _indexed_manifest,
+    preparing,
+    source_record,
+    url_label,
+)
 from .index import ArrayIndex
 
 type Format = Literal[
@@ -1005,7 +1016,7 @@ class Files(Dataset):
                               for start, stop in itertools.pairwise(cuts))
         divisible = self.kind in ("jsonl", "text") and not any(
             infer_compression(url.lower()) for url in self.paths)
-        return ShardManifest(tuple(shards), self._read_shard, self._subdivided if divisible else None)
+        return ShardManifest(tuple(shards), _FileShards(self), self._subdivided if divisible else None)
 
     def _by_file(self) -> ShardManifest:
         """A Parquet store's files as its shards, each read row group by row
@@ -1101,6 +1112,24 @@ class Files(Dataset):
         rows = self._shard_rows(shard, options)
         return rows if self.columns is None else rows.map(_Columns(self.columns, self.describe())).map(
             Fields(self.columns))
+
+    def _by_index(self, shard: Shard) -> ShardRows | None:
+        """`shard`'s records by index as its stream gives them (`ShardRows`), where that stream reads the
+        lines of a file this host's own disk holds, uncompressed and stated by no producer: its records'
+        offsets found as far as they are asked (`_ShardLines`), its columns projected as the stream projects
+        them. None for any other shard, which is read as a stream alone."""
+        if (self.kind not in ("jsonl", "text") or self.where is not None
+                or shard.uri in self._declared_objects):
+            return None
+        path = next((path for url, fs, path in self._resolved[:len(self.paths)]
+                     if url == shard.uri and local(fs)), None)
+        if path is None or infer_compression(shard.uri.lower()) is not None:
+            return None
+        rows = _ShardLines(self.kind, path, shard)
+        if self.columns is None:
+            return rows
+        checked, selected = _Columns(self.columns, self.describe()), Fields(self.columns)
+        return MappedRows(rows, lambda row: selected.map(checked(row)))
 
     def _shard_rows(self, shard: Shard, options: grain.ReadOptions | None) -> grain.IterDataset:
         if self.kind == "array_record":
@@ -1536,6 +1565,102 @@ class _CsvLines(Iterator[str]):
         if not line:
             raise StopIteration
         return line.decode()
+
+
+@dataclass(frozen=True)
+class _FileShards:
+    """`Files`'s shard opener (`ShardManifest.reader`): a shard's records as a stream (`Files._read_shard`),
+    and by index where its stream reads lines that can be read so (`Files._by_index`)."""
+
+    source: Files
+
+    def __call__(self, shard: Shard, options: grain.ReadOptions | None = None) -> grain.IterDataset:
+        return self.source._read_shard(shard, options)
+
+    def indexed(self, shard: Shard) -> ShardRows | None:
+        return self.source._by_index(shard)
+
+
+_SCANNED_BYTES = 1 << 24
+"""The bytes of a file a shard's offsets are found in at a time (`_ShardLines`): a bound on what a search for
+them holds beside its tables, a byte a byte of the file and eight bytes a line."""
+
+_BLANK = np.frombuffer(b" \t\r\n\x0b\x0c", np.uint8)
+"""The bytes Python's `bytes.strip` strips, which a JSON line of them alone is (`_lines`: it is no record)."""
+
+
+class _ShardLines:
+    """A line file's shard's records by index (`ShardRows`), as `_LineIterator` gives them: the lines that
+    start in its byte range from the first whole one (`_line_start`), a JSON line of whitespace alone none,
+    each decoded as the stream decodes it (`_decoded`). The file is mapped into memory once, and its
+    records' starts and ends found a chunk at a time (`_SCANNED_BYTES`) only as far as a read asks (`rows`),
+    sixteen bytes a record; its iterator's position is the offset past the record it gave last, as the
+    stream's (`_LineIterator.get_state`). Closed with the reader that asked it."""
+
+    def __init__(self, kind: str, path: str, shard: Shard):
+        self.kind, self.shard = kind, shard
+        self.file = open(path, "rb")  # noqa: SIM115 (held until `close`, as a stream holds its file)
+        size = os.fstat(self.file.fileno()).st_size
+        self.memory = mmap.mmap(self.file.fileno(), 0, access=mmap.ACCESS_READ) if size else None
+        self.stop = size if shard.stop is None else min(shard.stop, size)
+        self.first = _line_start(self.file, shard.start, shard.stop) if shard.start else 0
+        # Where the scan stands (no line starts in the bytes before it that it has not found), and the
+        # records it found: their starts and ends, each end the offset past the line's newline.
+        self.scanned = self.first
+        self.starts = np.empty(0, np.uint64)
+        self.ends = np.empty(0, np.uint64)
+
+    def _scan(self, limit: int) -> None:
+        """Find records until `limit` are found or the range holds no more."""
+        assert self.memory is not None
+        while len(self.starts) < limit and self.scanned < self.stop:
+            chunk = np.frombuffer(self.memory, np.uint8, min(_SCANNED_BYTES, self.stop - self.scanned),
+                                  self.scanned)
+            # Each line starting in the chunk: where the scan stands, and past each newline but the last
+            # byte of the range (which starts no line in it).
+            newlines = np.flatnonzero(chunk == ord("\n")).astype(np.uint64) + np.uint64(self.scanned)
+            starts = np.concatenate([np.asarray([self.scanned], np.uint64), newlines + np.uint64(1)])
+            starts = starts[starts < np.uint64(self.stop)]
+            ends = np.empty_like(starts)
+            ends[:len(newlines)] = newlines[:len(starts)] + np.uint64(1)
+            if len(newlines) < len(starts):
+                # The last line runs past the chunk: it ends at the next newline past it, or the file's end.
+                found = self.memory.find(b"\n", int(starts[-1]))
+                ends[-1] = len(self.memory) if found < 0 else found + 1
+            self.scanned = int(ends[-1]) if len(ends) else self.stop
+            if self.kind == "jsonl":
+                # A line that opens with whitespace is no record where it holds nothing else.
+                opening = np.isin(np.frombuffer(self.memory, np.uint8)[starts.astype(np.int64)], _BLANK)
+                kept = np.ones(len(starts), bool)
+                for at in np.flatnonzero(opening):
+                    kept[at] = bool(self.memory[int(starts[at]):int(ends[at])].strip())
+                starts, ends = starts[kept], ends[kept]
+            self.starts = np.concatenate([self.starts, starts])
+            self.ends = np.concatenate([self.ends, ends])
+
+    def rows(self, limit: int) -> int:
+        if self.memory is not None:
+            self._scan(limit)
+        return min(limit, len(self.starts))
+
+    def __getitem__(self, index: int) -> Batch:
+        assert self.memory is not None and 0 <= index < len(self.starts), index
+        return _decoded(self.kind, self.memory[int(self.starts[index]):int(self.ends[index])])
+
+    def state_at(self, index: int) -> Mapping[str, object]:
+        return {"offset": self.first if index == 0 else int(self.ends[index - 1])}
+
+    def index_of(self, state: Mapping[str, object]) -> int:
+        offset = integer(state.get("offset"), f"file offset for {self.shard.id}")
+        while self.memory is not None and self.scanned < min(offset, self.stop):
+            self._scan(len(self.starts) + 1)
+        return int(np.searchsorted(self.ends, np.uint64(offset), side="right"))
+
+    def close(self) -> None:
+        if self.memory is not None:
+            self.memory.close()
+            self.memory = None
+        self.file.close()
 
 
 class _Lines(grain.IterDataset):

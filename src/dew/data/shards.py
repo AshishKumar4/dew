@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import bisect
 import dataclasses
+import functools
+import itertools
 import logging
 import threading
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
+from typing import TYPE_CHECKING
 
 import grain.experimental as experimental
 import grain.python as grain
@@ -14,7 +18,10 @@ from dew import _position
 from dew._records import boolean, integer, integers, listed, record
 
 from .dataset import LONG_RUN, DataPartition, Loading, logged_run, restore_parent
-from .sources.base import Shard, ShardManifest, ShardOpener
+from .sources.base import IndexedShards, Shard, ShardManifest, ShardOpener, ShardRows
+
+if TYPE_CHECKING:
+    from dew.batch import Batch
 
 _log = logging.getLogger(__name__)
 
@@ -256,6 +263,58 @@ class _SequentialIterator(grain.DatasetIterator):
         super().__init__()
         self.places, self.reader, self.loading = places, reader, loading
         self.place, self.rows = 0, None
+        # Each place's records by index, read as a window asks for them (`window`), by its place.
+        self._indexed: dict[Hashable, ShardRows | None] = {}
+
+    def _by_index(self, place: int) -> ShardRows | None:
+        """Place `place`'s records by index (`_Reader.indexed`), opened once, None where its reader serves
+        none so."""
+        held = self.places[place]
+        if held not in self._indexed:
+            self._indexed[held] = self.reader.indexed(held) if isinstance(self.reader, _Reader) else None
+        return self._indexed[held]
+
+    def window(self, limit: int) -> Window | None:
+        """The next `limit` records at most from where it stands, by index, none read (`Window`), every place
+        on the way read by index; None where one is not, holds no record (a run of empty places is read as
+        a stream, which watches it, `_EmptyRun`), or its position is unknown to its index."""
+        place = self.place
+        rows = None if place >= len(self.places) else self._by_index(place)
+        if place < len(self.places) and rows is None:
+            return None
+        row = 0 if self.rows is None or rows is None else rows.index_of(
+            record(self.rows.get_state()["parent"], "a place's rows"))
+        parts: list[tuple[int, int, int, ShardRows]] = []
+        held = 0
+        while held < limit and place < len(self.places):
+            rows = self._by_index(place)
+            if rows is None:
+                return None
+            count = rows.rows(row + limit - held) - row
+            if not count and not row:
+                return None
+            if count:
+                parts.append((place, row, count, rows))
+                held += count
+            if held < limit:
+                place, row = place + 1, 0
+        return Window(tuple(parts), held)
+
+    def skip(self, window: Window) -> None:
+        """Stand past `window`'s records, as reading them would have left it (its rows' position the
+        stream's there, `ShardRows.state_at`), none read."""
+        if not window.parts:
+            return
+        place, row, count, rows = window.parts[-1]
+        assert isinstance(self.reader, _Reader)
+        for passed, _, _, _ in window.parts[:-1]:
+            # Each place read through holds rows: no run of empty ones goes on past it (`_EmptyRun`).
+            self.reader.empty.ended(yielded=True, place=self.places[passed])
+        self.reader.empty.rows += window.held
+        self._close_rows()
+        self.place = place
+        self.rows = iter(self.reader(self.places[place]))
+        self.rows.set_state(self.reader.watched(rows.state_at(row + count)))
 
     def __next__(self):
         # Each place read to its end, then the next opened, until the last ends.
@@ -273,7 +332,7 @@ class _SequentialIterator(grain.DatasetIterator):
         return {"place": self.place, "rows": None if self.rows is None else self.rows.get_state()}
 
     def set_state(self, state: Mapping[str, object]) -> None:
-        self.close()
+        self._close_rows()
         position = _sequential_position(state)
         self.place = integer(position["place"], "sequential shard pass's place")
         rows = position["rows"]
@@ -281,10 +340,49 @@ class _SequentialIterator(grain.DatasetIterator):
             self.rows = iter(self.reader(self.places[self.place]))
             self.rows.set_state(record(rows, "sequential shard pass's rows"))
 
-    def close(self) -> None:
+    def _close_rows(self) -> None:
         if self.rows is not None:
             self.rows.close()
         self.rows = None
+
+    def close(self) -> None:
+        self._close_rows()
+        for rows in self._indexed.values():
+            if rows is not None:
+                rows.close()
+        self._indexed = {}
+
+
+def served(rows: grain.DatasetIterator, limit: int) -> Window | None:
+    """The next `limit` records of `rows` at most, by index, none read, where `rows` is a shard pass's
+    iterator that serves them so (`_Passing.window`); None for any other, read as a stream."""
+    return rows.window(limit) if isinstance(rows, _Passing) else None
+
+
+def passed(rows: grain.DatasetIterator, window: Window) -> None:
+    """Stand `rows`, the shard pass that served `window` (`served`), past its records."""
+    assert isinstance(rows, _Passing)
+    rows.skip(window)
+
+
+@dataclasses.dataclass(frozen=True)
+class Window:
+    """Records ahead of a stream's position, by index (`_SequentialIterator.window`): `held` of them, from
+    each of `parts` in order: a place, the index its records start at there, how many and its records by
+    index."""
+
+    parts: tuple[tuple[int, int, int, ShardRows], ...]
+    held: int
+
+    @functools.cached_property
+    def starts(self) -> list[int]:
+        """Where each part's records start among the window's."""
+        return list(itertools.accumulate((count for _, _, count, _ in self.parts[:-1]), initial=0))
+
+    def __getitem__(self, index: int) -> Batch:
+        part = bisect.bisect_right(self.starts, index) - 1
+        _, row, _, rows = self.parts[part]
+        return rows[row + index - self.starts[part]]
 
 
 _INTERLEAVED = frozenset({"iterators_in_use_indices", "exhausted", "iterators_in_use_states",
@@ -357,6 +455,17 @@ class _Passing(grain.DatasetIterator):
         if self._rows is not None:
             self._rows.close()
 
+    def window(self, limit: int) -> Window | None:
+        """Its rows' next `limit` records by index (`_SequentialIterator.window`), None where they are read as
+        a stream alone (an interleave, a bound in examples) or it was dealt none."""
+        rows = self._rows
+        return rows.window(limit) if isinstance(rows, _SequentialIterator) else None
+
+    def skip(self, window: Window) -> None:
+        """Stand past `window`'s records (`_SequentialIterator.skip`)."""
+        assert isinstance(self._rows, _SequentialIterator)
+        self._rows.skip(window)
+
 
 class _EmptyRun:
     """How many shards in a row one read found empty, no row read anywhere between them (`rows`, which every
@@ -415,6 +524,19 @@ class _Reader[Place]:
     def __call__(self, place: Place) -> grain.IterDataset:
         options = grain.ReadOptions(self.loading.threads, self.loading.read_buffer)
         return _Watched(self.reader(place, options), self.empty, place)
+
+    def indexed(self, place: Place) -> ShardRows | None:
+        """`place`'s records by index as `__call__` reads them, a shard's whose reader serves them so
+        (`IndexedShards`); None for any other, a bound's `(shard, rows)` place among them."""
+        if not isinstance(place, Shard) or not isinstance(self.reader, IndexedShards):
+            return None
+        return self.reader.indexed(place)
+
+    @staticmethod
+    def watched(state: Mapping[str, object]) -> Mapping[str, object]:
+        """The position of a place's watched rows (`_WatchedIterator`) whose reader stands at `state`,
+        having read a row: one placed past rows read by index (`_SequentialIterator.skip`)."""
+        return {"parent": state, "yielded": True}
 
 
 class _Watched(grain.IterDataset):
