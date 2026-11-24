@@ -473,33 +473,25 @@ eight; and the template rule's normal-draw sites, an order set each (`TEMPLATE_O
 in one cell 92 to 161 s (main's tests/test_durations.json at 0a14c3e75, row 12405), four draws a task."""
 
 
-def normal_order_cases() -> list:
-    """`ORDER_SETS` as the selective scan's normal-draw parameters, each marked from `CHECK1_SHARDS`."""
-    test = "test_the_selective_scan_holds_its_orders_over_normal_draws"
-    cases = [(taken, taken.replace(",", "").replace(" ", "-")) for taken in ORDER_SETS]
+def normal_order_cases(test: str, sets: dict) -> list:
+    """`sets`' order sets (`ORDER_SETS`, `TEMPLATE_ORDER_SETS`) as `test`'s normal-draw parameters, each
+    marked from `CHECK1_SHARDS`."""
+    cases = [(taken, taken.replace(",", "").replace(" ", "-")) for taken in sets]
     return [pytest.param(taken, id=ident,
                          marks=pytest.mark.check1_shards(**CHECK1_SHARDS[f"{test}[{ident}]"]))
             for taken, ident in cases]
 
 
-def normal_template_cases() -> list:
-    """`TEMPLATE_ORDER_SETS` as the template rule's normal-draw parameters, each marked from
-    `CHECK1_SHARDS`."""
-    test = "test_the_template_rule_holds_its_orders_over_normal_draws"
-    cases = [(taken, taken.replace(",", "").replace(" ", "-")) for taken in TEMPLATE_ORDER_SETS]
-    return [pytest.param(taken, id=ident,
-                         marks=pytest.mark.check1_shards(**CHECK1_SHARDS[f"{test}[{ident}]"]))
-            for taken, ident in cases]
-
-
-@pytest.mark.parametrize("taken", normal_template_cases())
+@pytest.mark.parametrize("taken", normal_order_cases(
+    "test_the_template_rule_holds_its_orders_over_normal_draws", TEMPLATE_ORDER_SETS))
 def test_the_template_rule_holds_its_orders_over_normal_draws(taken, request):
     """`assert_template_contract` in the normal domain over an order set, check 1 over its declared draws
     (`CHECK1_SHARDS`)."""
     assert_template_contract("normal", taken, seeds=marked_seeds(request))
 
 
-@pytest.mark.parametrize("taken", normal_order_cases())
+@pytest.mark.parametrize("taken", normal_order_cases(
+    "test_the_selective_scan_holds_its_orders_over_normal_draws", ORDER_SETS))
 def test_the_selective_scan_holds_its_orders_over_normal_draws(taken, request):
     """`assert_selective_contract` in the normal domain over an order set (`ORDER_SETS`), check 1 over its
     declared draws (`CHECK1_SHARDS`); the remat orders, which an interpreted kernel takes none of
