@@ -91,7 +91,8 @@ def recipe_takes(depth: int, width: int) -> bool:
 
 
 def recipe_projection(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array | None = None, *,
-                      out_dtype, bias: jax.Array | None = None) -> jax.Array | None:
+                      out_dtype, bias: jax.Array | None = None,
+                      tensor_scale: jax.Array | None = None) -> jax.Array | None:
     """`rows @ matrix` in the run's low-precision recipe (`dew.nn.precision.recipe_role`), where the
     projection's role takes it: a dense projection's (`matrix` `[in, out]`, every row its one group's) or
     experts' (`[groups, in, out]`, `group_sizes` counting each group's leading rows, any past their sum
@@ -100,7 +101,9 @@ def recipe_projection(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array
     group's `[groups, out]`, added to its rows' fp32 sums, the output rounded once after. None where the run
     trains in no recipe or the recipe does not take the projection: its role keeps the run's dtypes (a
     router's, a head's) or its widths hold no whole blocks of the recipe's, each such projection's route
-    reported with the reason."""
+    reported with the reason. `tensor_scale`, the rows' NVFP4 tensor scale under the run's delayed scaling
+    (`LowPrecision.tensor_scaling`, `delayed_tensor_scale` of the run's amax history), which it requires
+    and no other recipe takes (row 12721)."""
     from dew.nn.precision import recipe_role
 
     held, refusal = recipe_role(), recipe_refusal(*matrix.shape[-2:])
@@ -110,6 +113,9 @@ def recipe_projection(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array
                              refusal=refusal)
         return None
     recipe = held[0]
+    if (recipe.tensor_scaling == "delayed") != (tensor_scale is not None):
+        raise ValueError("a delayed-scaling NVFP4 recipe's projection takes its rows' tensor scale, and only "
+                         "it does (`LowPrecision.tensor_scaling`)")
     taken = RECIPES[recipe.recipe]
     edge = SCALE_DEPTH
     # Rows an Explicit axis splits, or the mesh's automatic axes alone (a data-parallel run's, row 6719):
@@ -119,7 +125,8 @@ def recipe_projection(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array
     else:
         along = None if (split := rows_split(rows)) is None else split[0]
     if along is not None:
-        return _projected_apart(rows, matrix, group_sizes, out_dtype=out_dtype, bias=bias, along=along)
+        return _projected_apart(rows, matrix, group_sizes, out_dtype=out_dtype, bias=bias, along=along,
+                                tensor_scale=tensor_scale)
     stacked = matrix if matrix.ndim == 3 else matrix[None]
     groups, count = stacked.shape[0], rows.shape[0]
     sizes = (jnp.full((1,), count, jnp.int32) if group_sizes is None
@@ -138,7 +145,8 @@ def recipe_projection(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array
     # A biased product's sums stay fp32 through the bias, as the template's epilogue adds it (moe's
     # `_biased`): one rounding of the whole.
     summed_dtype = out_dtype if bias is None else jnp.float32
-    product = taken.projection(laid, stacked, group_blocks, out_dtype=summed_dtype)
+    scaled = {} if tensor_scale is None else {"tensor_scale": jnp.asarray(tensor_scale, jnp.float32)}
+    product = taken.projection(laid, stacked, group_blocks, out_dtype=summed_dtype, **scaled)
     out = product.at[place].get(mode="fill", fill_value=0)
     if bias is not None:
         out = jnp.where((group < groups)[:, None], out + bias[held_group].astype(jnp.float32), out)
@@ -183,24 +191,26 @@ def recipe_chain(rows: jax.Array, up: jax.Array, down: jax.Array, activation: Ca
                     gate=None if gate is None else gate[None], live=count, interpret=False)[:count]
 
 
-def _projected_apart(rows, matrix, group_sizes, *, out_dtype, bias, along) -> jax.Array:
+def _projected_apart(rows, matrix, group_sizes, *, out_dtype, bias, along, tensor_scale=None) -> jax.Array:
     """`recipe_projection` of rows the mesh's axes `along` split, Explicit (rows 4854, 4859) or automatic
     alone (row 6719): each device's rows its own projection (`on_shards`, whose map is unchecked as a Pallas
     launch's must be), laid in whole 128-row blocks of its own as a data-parallel recipe quantizes them, the
     matrix, the groups' sizes and the bias whole on every device and the matrix's and bias's gradients
     summed over the devices (the map's transpose). Experts' sizes count every device's rows together, each
-    group's after the last's: a device's groups are its share of each (`_local_sizes`)."""
+    group's after the last's: a device's groups are its share of each (`_local_sizes`). A delayed recipe's
+    `tensor_scale` whole on every device too: the run's one scale, every device's rows quantized under it."""
 
     names = mesh_axes(along)
 
-    def projected(rows, matrix, group_sizes, bias):
+    def projected(rows, matrix, group_sizes, bias, tensor_scale):
         sizes = None if group_sizes is None else _local_sizes(group_sizes, rows.shape[0], names)
-        out = recipe_projection(rows, matrix, sizes, out_dtype=out_dtype, bias=bias)
+        out = recipe_projection(rows, matrix, sizes, out_dtype=out_dtype, bias=bias,
+                                tensor_scale=tensor_scale)
         assert out is not None, "the recipe takes the projection on every device as on the whole"
         return out
 
-    return on_shards(projected, jax.sharding.PartitionSpec(along, None), (rows, matrix, group_sizes, bias),
-                     whole=(1, 2, 3))
+    return on_shards(projected, jax.sharding.PartitionSpec(along, None),
+                     (rows, matrix, group_sizes, bias, tensor_scale), whole=(1, 2, 3, 4))
 
 
 def _local_sizes(group_sizes: jax.Array, count: int, names: tuple) -> jax.Array:
@@ -426,19 +436,38 @@ _mx_projection = contracted("test_an_mxfp8_projection_holds_every_reverse_order"
 
 
 def nvfp4_projection(x: jax.Array, w: jax.Array, group_blocks: jax.Array, *, out_dtype,
-                     interpret_on_cpu: bool = False) -> jax.Array:
+                     tensor_scale: jax.Array | None = None, interpret_on_cpu: bool = False) -> jax.Array:
     """Each group's rows of `x` (`[rows, depth]`) times its matrix of `w` (`[groups, depth, width]`) in the
     NVFP4 recipe (row 2513: E2M1 every tensor, an E4M3 scale every 16 of each product's contraction under a
     tensor scale): `x` and `w` quantized along the depth, their product `nvfp4_block_product`. Its gradients
     are the recipe's own NVFP4 products, a surrogate of the quantized product's derivative (straight through
     each rounding), as `mxfp8_projection`'s: the input's the cotangent and `w` quantized along the width;
     the matrices' each group's rows and cotangent quantized along its tokens, their decoded values contracted
-    over the group's rows in fp32 (`gemm_t`). Group `g` holds `group_blocks[g]` whole 128-row blocks."""
-    return _nvfp4_projection(x, w, group_blocks, jnp.dtype(out_dtype), interpret_on_cpu)
+    over the group's rows in fp32 (`gemm_t`). Group `g` holds `group_blocks[g]` whole 128-row blocks.
+    `tensor_scale`, `x`'s tensor scale in place of its own (a delayed-scaling recipe's, row 12721); the
+    matrices' and the gradients' operands their own, each exactly as known when it is quantized."""
+    return _nvfp4_projection(x, w, group_blocks, tensor_scale, jnp.dtype(out_dtype), interpret_on_cpu)
 
 
-def _nvfp4_value(x, w, group_blocks, out_dtype, interpret):
-    return _recipe_value(NvFp4Block, nvfp4_block_product, x, w, group_blocks, out_dtype, interpret)
+def _nvfp4_value(x, w, group_blocks, tensor_scale, out_dtype, interpret):
+    return nvfp4_block_product(NvFp4Block.quantized(x, tensor_scale),
+                               NvFp4Block.quantized(jnp.swapaxes(w, 1, 2)), group_blocks, out_dtype=out_dtype,
+                               interpret_on_cpu=interpret)
+
+
+def nvfp4_amax(x: jax.Array) -> jax.Array:
+    """`x`'s largest magnitude in fp32, no gradient through it: the value a delayed-scaling NVFP4 run records
+    in its amax history for the projection `x` is the rows of (row 12721), the max over devices its state's
+    to take."""
+    return jax.lax.stop_gradient(jnp.max(jnp.abs(x.astype(jnp.float32))))
+
+
+def delayed_tensor_scale(history: jax.Array) -> jax.Array:
+    """The NVFP4 tensor scale of an amax `history` (its last steps' largest magnitudes): the scale of their
+    largest (`bits.nvfp4_tensor_scale`), as Transformer Engine's delayed scaling takes it (row 12721)."""
+    from dew.algebra import bits
+
+    return bits.nvfp4_tensor_scale(jnp.max(jnp.asarray(history, jnp.float32)))
 
 
 class Recipe(NamedTuple):
@@ -461,8 +490,8 @@ requantized operands. DeepSeek-V3's blockwise FP8, its operands E4M3 by 1 x 128 
 each product's contraction; NVFP4, E2M1 under an E4M3 scale every 16 of it and a tensor scale."""
 
 
-def _nvfp4_forward(x, w, group_blocks, out_dtype, interpret):
-    return _recipe_forward(_nvfp4_value, x, w, group_blocks, out_dtype, interpret)
+def _nvfp4_forward(x, w, group_blocks, tensor_scale, out_dtype, interpret):
+    return _nvfp4_value(x, w, group_blocks, tensor_scale, out_dtype, interpret), (x, w, group_blocks)
 
 
 def _nvfp4_backward(out_dtype, interpret, residuals, cotangent):
@@ -477,11 +506,12 @@ def _nvfp4_backward(out_dtype, interpret, residuals, cotangent):
     d_w = gemm_t((rows.decoded() * rows.scale).T.astype(jnp.float32),
                  (cotangents.decoded() * cotangents.scale).T.astype(jnp.float32), sizes, out_dtype=w.dtype,
                  precision=jax.lax.Precision.HIGHEST, interpret_on_cpu=interpret)
-    return (*with_gradients_formed(d_x, d_w), None)
+    return (*with_gradients_formed(d_x, d_w), None, None)
 
-# The NVFP4 recipe's gradient (`nvfp4_projection`): a derivative of Dew's choosing (`Surrogate`).
+# The NVFP4 recipe's gradient (`nvfp4_projection`): a derivative of Dew's choosing (`Surrogate`); its tensor
+# scale a constant of the step (a delayed recipe's, its history's), no gradient through it.
 _nvfp4_projection = contracted("test_an_nvfp4_projection_holds_every_reverse_order")(
-    declared_derivative(Surrogate(), _nvfp4_value, _nvfp4_forward, _nvfp4_backward, nondiff_argnums=(3, 4)))
+    declared_derivative(Surrogate(), _nvfp4_value, _nvfp4_forward, _nvfp4_backward, nondiff_argnums=(4, 5)))
 
 
 def dot_general(xla, path: tuple | None = None):

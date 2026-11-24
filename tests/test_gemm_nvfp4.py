@@ -942,3 +942,78 @@ def test_an_nvfp4_products_gathered_rescue_sums_across_its_bands_seam_exactly():
     cotangent = jnp.zeros((4, 128), jnp.float32).at[0, 0].set(2.0 ** 57).at[1, 0].set(2.0 ** 56)
     (d_token,) = pull(cotangent.at[2, 0].set(2.0 ** 17).at[3, 1].set(2.0 ** 126))
     np.testing.assert_array_equal(np.asarray(d_token)[0, :3], np.float32([2.0 ** 125, np.inf, 0.0]))
+
+
+def test_an_nvfp4_operand_at_a_given_tensor_scale_is_the_rule_at_that_scale():
+    """`NvFp4Block.quantized(x, tensor_scale)`, a delayed-scaling recipe's operand (row 12721): at `x`'s own
+    tensor scale it is the current rule's operand bit for bit; at four times it, the operand of `x / 4` at
+    its own scale (an exact power of two through every quotient), its tensor scale the given one; and at a
+    scale below `x`'s own, its block scales saturate at 448 and its codes at 6, as delayed scaling clips."""
+    from dew.nn.kernels.projections import delayed_tensor_scale
+
+    x = jnp.asarray(np.random.default_rng(12721).normal(size=(64, 128)), jnp.float32)
+    own = formats.NvFp4Block.quantized(x)
+    at_own = formats.NvFp4Block.quantized(x, own.scale)
+    quartered = formats.NvFp4Block.quantized(x / 4)
+    at_four = formats.NvFp4Block.quantized(x, 4 * own.scale)
+    for got, want in ((at_own, own), (at_four, quartered)):
+        np.testing.assert_array_equal(np.asarray(got.codes).view(np.uint8),
+                                      np.asarray(want.codes).view(np.uint8))
+        np.testing.assert_array_equal(np.asarray(got.scales).view(np.uint8),
+                                      np.asarray(want.scales).view(np.uint8))
+    assert float(at_four.scale) == 4 * float(own.scale)
+    clipped = formats.NvFp4Block.quantized(x, own.scale / 64)
+    assert float(np.max(np.asarray(clipped.scales, np.float32))) == 448.0
+    assert float(np.max(np.abs(np.asarray(clipped.codes, np.float32)))) == 6.0
+    history = jnp.asarray([0.5, float(jnp.max(jnp.abs(x))), 2.0], jnp.float32)
+    assert float(delayed_tensor_scale(history)) == float(bits.nvfp4_tensor_scale(jnp.max(history)))
+
+
+def test_an_nvfp4_projection_at_its_rows_own_tensor_scale_is_the_current_recipes_bitwise():
+    """`projections.nvfp4_projection` given its rows' own tensor scale (the delayed recipe's at a history
+    of this step alone, row 12721): its value and both gradients bit for bit the current recipe's."""
+    from dew.nn.kernels import projections
+
+    rng = np.random.default_rng(12722)
+    x = jnp.asarray(rng.normal(size=(128, 128)), jnp.bfloat16)
+    w = jnp.asarray(rng.normal(size=(1, 128, 64)) / 8, jnp.bfloat16)
+    blocks = jnp.asarray([1], jnp.int32)
+    scale = bits.nvfp4_tensor_scale(projections.nvfp4_amax(x))
+
+    def run(given):
+        def projected(x, w):
+            out = projections.nvfp4_projection(x, w, blocks, out_dtype=jnp.bfloat16, tensor_scale=given)
+            return jnp.sum(out.astype(jnp.float32)), out
+        (_, out), grads = jax.value_and_grad(projected, argnums=(0, 1), has_aux=True)(x, w)
+        return out, *grads
+
+    for got, want in zip(run(scale), run(None), strict=True):
+        np.testing.assert_array_equal(np.asarray(got).view(np.uint16), np.asarray(want).view(np.uint16))
+
+
+def test_a_delayed_nvfp4_recipe_takes_its_rows_tensor_scale_and_only_it_does():
+    """A run's NVFP4 recipe under delayed tensor scaling (`LowPrecision.tensor_scaling`, opt-in, row 12721):
+    its recipe projection requires the rows' tensor scale and is `nvfp4_projection` at it; the current
+    recipe refuses one; and delayed scaling is NVFP4's alone."""
+    from dew.nn.kernels import projections
+    from dew.nn.precision import DTYPE_PRESETS, NVFP4, LowPrecision, Numerics, projection_role
+
+    with pytest.raises(ValueError, match="NVFP4's alone"):
+        LowPrecision(recipe="mxfp8", tensor_scaling="delayed")
+    rng = np.random.default_rng(12723)
+    x = jnp.asarray(rng.normal(size=(100, 128)), jnp.bfloat16)
+    w = jnp.asarray(rng.normal(size=(128, 64)) / 8, jnp.bfloat16)
+    scale = jnp.float32(0.25)
+    delayed = Numerics(DTYPE_PRESETS["bf16-mixed"],
+                       low_precision=LowPrecision(recipe="nvfp4", tensor_scaling="delayed"))
+    current = NVFP4
+    with generation.run_precision(delayed), projection_role("mlp"):
+        with pytest.raises(ValueError, match="tensor scale"):
+            projections.recipe_projection(x, w, out_dtype=jnp.bfloat16)
+        got = projections.recipe_projection(x, w, out_dtype=jnp.bfloat16, tensor_scale=scale)
+    laid = jnp.pad(x, ((0, 28), (0, 0)))
+    want = projections.nvfp4_projection(laid, w[None], jnp.asarray([1], jnp.int32), out_dtype=jnp.bfloat16,
+                                        tensor_scale=scale)[:100]
+    np.testing.assert_array_equal(np.asarray(got).view(np.uint16), np.asarray(want).view(np.uint16))
+    with generation.run_precision(current), projection_role("mlp"), pytest.raises(ValueError, match="only"):
+        projections.recipe_projection(x, w, out_dtype=jnp.bfloat16, tensor_scale=scale)
