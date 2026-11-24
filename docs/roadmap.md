@@ -46,6 +46,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - The fork takes no static register cap for a Mosaic GPU kernel. [12686]
 - Sm120's scaled GEMM forwards are derived at a tile their compile spills. [12687]
 - Mosaic GPU async_copy's 1D bulk shortcut (jax fork, launch_context.py is_simple_contiguous_copy) clips a contiguous slice at the whole buffer's end, linearly. [12692]
+- The Mosaic GPU decode merge's device bytes (merged._launch_for_block's geometry) charge each block's columns of every slice three times, once a pass, where its…. [12699]
 - Exact on every path, every edge and every derivative order. [2656]
 - MoE transport, role-aware low precision and observability. [4515]
 - resources.operand_fragments counts every part of a multi-part shared operand live at once. [6494]
