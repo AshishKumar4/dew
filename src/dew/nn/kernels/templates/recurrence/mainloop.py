@@ -1693,15 +1693,19 @@ def _weighted_views(call: Call, refs: tuple, n, h, steps: tuple[int, int]) -> tu
 
 def _weighted_value_block(call: Call, keyed: int) -> int:
     """`_weighted`'s value tile at key block `keyed`: under a decay a key dimension with the delta rule the
-    values' width a key step's share, where a key block's least columns divide it (`_key_unit`), so every
-    step walks a block of each and no segment one row alone; else the call's (`Call.value_block`). At the
-    call's wider block beside narrower key blocks, the walk's key-only steps copied the value tile held at
-    its last block again every step: 48 KB a program of Kimi Linear's on a GH200 (8 key steps beside 2 value
-    steps), about 25 us of the launch's 101 (FS-12368-STEPS, row 12368)."""
+    values' width a key step's share, where a key block's least columns divide it (`_key_unit`) and it is
+    no wider than the call's own, so every step walks a block of each and no segment one row alone; else the
+    call's (`Call.value_block`). At the call's wider block beside narrower key blocks, the walk's key-only
+    steps copied the value tile held at its last block again every step: 48 KB a program of Kimi Linear's on
+    a GH200 (8 key steps beside 2 value steps), about 25 us of the launch's 101 (FS-12368-STEPS, row
+    12368). Values many times the keys' width take the call's block, their walk's steps the value row's: a
+    key step's share widened the value tile past the call's, which the launch's resources were never sized
+    for (row 12690)."""
     if not (call.per_key and call.delta):
         return call.value_block
     block, rest = divmod(call.value_width, call.width // keyed)
-    return block if not rest and block % _key_unit(call, contracted=False) == 0 else call.value_block
+    narrows = not rest and block % _key_unit(call, contracted=False) == 0 and block <= call.value_block
+    return block if narrows else call.value_block
 
 
 def _paired_segments(step: Callable, key_steps: int, value_steps: int) -> tuple:
