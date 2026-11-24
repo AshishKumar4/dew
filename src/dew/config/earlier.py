@@ -135,7 +135,11 @@ def chosen_kernel(record: Mapping[str, object], choice: str, kernel: str) -> Map
     named = _records.class_record(diagnostics) if isinstance(diagnostics, Mapping) else None
     pins = named[1] if named is not None else diagnostics if isinstance(diagnostics, Mapping) else fields
     kernels = pins.get("kernels")
-    chosen = {choice: kernel, **(kernels if isinstance(kernels, Mapping) else {})}
+    # A choice the run left unset (written None, as a record of its kernels writes each it names none for)
+    # takes `kernel`; one it named stands.
+    named_kernels = {name: value for name, value in (kernels.items() if isinstance(kernels, Mapping) else ())
+                     if value is not None}
+    chosen = {choice: kernel, **named_kernels}
     if not isinstance(diagnostics, Mapping):
         return {**record, "fields": {**fields, "kernels": chosen}}
     stated = {**pins, "kernels": chosen}
