@@ -334,11 +334,7 @@ def _spans(shape: Walk, starts, like):
     """Each span's tokens in its row and whether a document starts in it, `[B, spans, D]` each as `like`
     (`rwkv4.SpanCarry`'s)."""
     tokens = jnp.broadcast_to(jnp.asarray(shape.tokens(), like.dtype)[None, :, None], like.shape)
-    if starts is None:
-        return tokens, jnp.zeros(like.shape, bool)
-    padded = jnp.pad(jnp.asarray(starts, bool), ((0, 0), (0, shape.spans * shape.span - shape.length)))
-    fresh = padded.reshape(shape.rows, shape.spans, shape.span).any(axis=-1)
-    return tokens, jnp.broadcast_to(fresh[..., None], like.shape)
+    return tokens, jnp.broadcast_to(walks.fresh(shape, starts), like.shape)
 
 
 class _Carry(NamedTuple):

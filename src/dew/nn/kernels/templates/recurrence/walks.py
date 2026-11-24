@@ -149,6 +149,16 @@ def per_span(x, shape: Walk) -> outputs.Output:
                           outputs.axis(x, 2))
 
 
+def fresh(shape: Walk, starts):
+    """Whether a document starts in each span, `[B, spans, 1]` bool (none without `starts`), read in XLA from
+    the documents' first tokens `starts` `[B, T]`: a span's map cuts the value entering it alike in either
+    direction (a forward state, a cotangent walked back)."""
+    if starts is None:
+        return jnp.zeros((shape.rows, shape.spans, 1), bool)
+    padded = jnp.pad(jnp.asarray(starts, bool), ((0, 0), (0, shape.spans * shape.span - shape.length)))
+    return padded.reshape(shape.rows, shape.spans, shape.span).any(axis=-1)[..., None]
+
+
 RAISES = (64, 32, 16, 8, 4, 2, 1)
 """The powers of two a product's mantissa is raised by in turn where it falls below `2^(1 - power)`
 (`normalised`), which bring any normal mantissa back to `[1, 2)`."""
