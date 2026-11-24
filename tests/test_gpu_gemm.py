@@ -60,6 +60,7 @@ import test_warpgroup_scan as warpgroup_scan
 from gpu_flow import Cell, cells_of, covering, run_cells, when
 from jax.experimental.pallas import fuser
 from reference_error import assert_as_exact
+from test_gemm_template import rms_norm as template_rms_norm
 
 from dew.nn.kernels import fused_gemm, generation
 from dew.nn.norms import rms_normalized
@@ -84,7 +85,7 @@ def _fused_projection_training():
 
     def reference(x, params):
         work = jnp.promote_types(x.dtype, jnp.float32)
-        normalized = gemm_template.rms_norm(x, params["norm"])
+        normalized = template_rms_norm(x, params["norm"])
         matrices = params["weight"].astype(x.dtype).astype(work)
         # Rows past the routed ones take no expert: ragged_dot leaves them zero.
         projected = jax.lax.ragged_dot(normalized.astype(work), matrices, groups, preferred_element_type=work)
