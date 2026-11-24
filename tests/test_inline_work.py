@@ -4,6 +4,7 @@
 import jax
 import jax.numpy as jnp
 import pytest
+from jax.experimental import pallas as pl
 from jax.experimental.mosaic.gpu import utils as mgpu_utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend.mlir import ir
@@ -242,3 +243,67 @@ def test_a_store_a_branch_holds_under_a_guard_of_the_data_is_refused():
 
     with pytest.raises(emission.Unpriced):
         _counted(body)
+
+
+def test_a_comparison_reads_its_sides_at_their_width_and_signedness():
+    """A thread's index less one compared unsigned with 32 bits' largest (PTX's octal `037777777777`, and
+    arith's `ult` against -1) holds on the first lane alone, its -1 being that largest: a store it guards
+    moves one word, and a branch on it runs one lane's."""
+    def octal(ctx, ref):
+        del ctx, ref
+        i32 = ir.IntegerType.get_signless(32)
+        below = arith.subi(arith.remui(mgpu_utils.thread_idx(), arith.constant(i32, 128)),
+                           arith.constant(i32, 1))
+        mgpu_utils.inline_ptx("{ .reg .pred p; setp.eq.u32 p, $1, 037777777777; @p st.shared.u32 [$0], $1; }",
+                              arith.constant(i32, 1), below, has_side_effects=True)
+
+    assert _counted(octal) == Work(shared_bytes=4)
+
+    def unsigned(ctx, ref):
+        del ctx
+        i32 = ir.IntegerType.get_signless(32)
+        below = arith.subi(arith.remui(mgpu_utils.thread_idx(), arith.constant(i32, 128)),
+                           arith.constant(i32, 1))
+        with mgpu_utils.when(arith.cmpi(arith.CmpIPredicate.uge, below, arith.constant(i32, 127))):
+            _scaled(ref)
+
+    assert _counted(unsigned) == Work(operations=32, shared_bytes=2 * 4)
+
+
+def test_a_body_one_warps_role_runs_counts_that_warps_lanes_alone():
+    """A body the second warp's role runs (`plgpu.warp_map`) issues its multiply over that warp's 32 lanes
+    and moves their 32 words through shared memory, not a warpgroup's 128."""
+    def body(ctx, ref):
+        del ctx
+        _scaled(ref)
+
+    def kernel(out_gmem, smem):
+        del out_gmem
+
+        @plgpu.warp_map
+        def _(warp):
+            pl.when(warp == 1)(lambda: plgpu.inline_mgpu(arg_types=(plgpu.RefType(),))(body)(smem))
+
+    launched = plgpu.kernel(kernel, out_type=_ROW, num_threads=1, thread_name="wg",
+                            scratch_types=[plgpu.SMEM((128,), jnp.float32)])
+    counted = emission.emitted(jax.make_jaxpr(launched)().jaxpr, 1, "wg").roles[0].fixed
+    assert (counted.operations, counted.shared_bytes) == (32, 2 * 4 * 32)
+
+
+def test_a_short_loops_trips_each_take_their_own_lanes():
+    """A loop of four trips each storing the word of the lane its trip names (`thread == trip`) moves four
+    words: each trip walked at its own induction value (an own band's row a trip selects), where a trip
+    walked once with its induction unknown stored every lane's word each trip."""
+    def body(ctx, ref):
+        del ctx
+        index, i32 = ir.IndexType.get(), ir.IntegerType.get_signless(32)
+        lower, upper, step = (arith.constant(index, value) for value in (0, 4, 1))
+        for_op = scf.ForOp(lower, upper, step)
+        with ir.InsertionPoint(for_op.body):
+            trip = arith.index_cast(i32, for_op.induction_variable)
+            with mgpu_utils.when(arith.cmpi(arith.CmpIPredicate.eq, mgpu_utils.thread_idx(), trip)):
+                memref.store(arith.constant(ir.F32Type.get(), 1.0), ref,
+                             [arith.index_cast(index, mgpu_utils.thread_idx())])
+            scf.YieldOp([])
+
+    assert _counted(body).shared_bytes == 4 * 4
