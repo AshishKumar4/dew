@@ -181,8 +181,9 @@ def _erases_laid(hooks: recurrence.Hooks, query, key, value, g, beta, given: dic
     head's over its value heads. `(query, key, value, g, beta, erase, starts, firsts)`, `erase` the additive
     erase's `(a, c)`, the read's and the untied's `(None, c)`, the untied's laid `[B, 2S, ...]` (`_laid`)."""
     heads = value.shape[2]
-    a, b = (jnp.repeat(given[name], heads // given[name].shape[2], axis=2).astype(g.dtype)
-            if name in given else None for name in ('erase_key', 'erase_read'))
+    b = jnp.repeat(given['erase_read'], heads // given['erase_read'].shape[2], axis=2).astype(g.dtype)
+    a = (None if hooks.erase == 'read'
+         else jnp.repeat(given['erase_key'], heads // given['erase_key'].shape[2], axis=2).astype(g.dtype))
     if hooks.erase == 'additive':
         return query, key, value, g, beta, (a, -b), starts, firsts
     group = heads // key.shape[2]
@@ -190,14 +191,12 @@ def _erases_laid(hooks: recurrence.Hooks, query, key, value, g, beta, given: dic
     queries = jnp.repeat(query, group, axis=2)
     if hooks.erase == 'read':
         return queries, keys, value, g, beta, (None, -b), starts, firsts
-    reader = -b
-    zero_keys = jnp.zeros_like(reader)
 
     def laid(first, second):
         return jnp.stack([first, second], axis=2).reshape(first.shape[0], -1, *first.shape[2:])
 
     return (laid(jnp.zeros_like(queries), queries), laid(a, keys), laid(jnp.zeros_like(value), value),
-            laid(g, jnp.zeros_like(g)), laid(beta, beta), (None, laid(reader, zero_keys)),
+            laid(g, jnp.zeros_like(g)), laid(beta, beta), (None, laid(-b, jnp.zeros_like(b))),
             None if starts is None else laid(starts, jnp.zeros_like(starts)),
             None if firsts is None else firsts * 2)
 
