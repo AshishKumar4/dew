@@ -503,11 +503,10 @@ def _tiles_stored(family: mosaic.Family, refs, stage, place: tuple, k_first, ind
         family.stored((piece,), (view,), smem=stage.at[index])
 
 
-def _dkv_stored(family: mosaic.Family, sums: tuple, views: tuple, stages: tuple, *, index, interpret: bool
-                ) -> None:
-    """A dK/dV consumer's dK and dV of its own keys to their `views`, and its key gradients' sums added into
-    theirs (`Family.added`, the program's row's and head's zeros), or written where its family adds no
-    vector (`Family.adds_vectors`), through its `stages` (dK's output stage, dV's, the key gradients')."""
+def _dkv_stored(family: mosaic.Family, sums: tuple, views: tuple, stages: tuple, *, index) -> None:
+    """A dK/dV consumer's dK and dV of its own keys to their `views`, and its key gradients' sums written to
+    theirs, the program's row's and head's (one writer each: an A100's `red.add.f32` into their zeros flushed
+    a subnormal sum), through its `stages` (dK's output stage, dV's, the key gradients')."""
     out_smem, dv_smem, rows_smem = stages
     dk, dv, *key_sums = sums
     dk_view, dv_view, *key_views = views
@@ -519,11 +518,8 @@ def _dkv_stored(family: mosaic.Family, sums: tuple, views: tuple, stages: tuple,
         family.stored((dv,), (dv_view,), smem=dv_smem.at[index])
     rows_stage = None if rows_smem is None else rows_smem.at[index]
     for key_sum, key_view in zip(key_sums, key_views, strict=True):
-        # Each key gradient, the walk's row sums, added into its row's and head's `[B, H, Kp]`.
-        if family.adds_vectors:
-            family.added(key_sum, key_view, interpret, smem=rows_stage)
-        else:
-            family.stored((family.as_row(key_sum),), (key_view,), smem=rows_stage)
+        # Each key gradient, the walk's row sums, written to its row's and head's `[B, H, Kp]`.
+        family.stored((family.as_row(key_sum),), (key_view,), smem=rows_stage)
 
 
 def _grad_buffers(graded: list[Kind], batch: int, heads: int, queries: int, keys_padded: int) -> list[tuple]:
@@ -572,20 +568,17 @@ def _shared_views(family: mosaic.Family, outputs, grad_refs, graded: list[Kind],
                  for ref, kind in zip(grad_refs, graded, strict=True) if kind == Kind.KEY]
     return dk_ref.at[row, keys, head], dv_ref.at[row, keys, head], *key_views
 
-def _summed_stored(family: mosaic.Family, sums: tuple, views: tuple, consumers: int, interpret: bool) -> None:
+def _summed_stored(family: mosaic.Family, sums: tuple, views: tuple, consumers: int) -> None:
     """The sums of the `consumers` sharing a key block (each over its share of the queries) added in a fixed
-    order and stored once to their `views` (`across.summed_across`), dK's and dV's, the key gradients' added
-    into theirs (`Family.added`, the program's row's and head's zeros), each in a
+    order and stored once to their `views` (`across.summed_across`), dK's and dV's and the key gradients'
+    (the program's row's and head's, one writer each), each in a
     scope after the walk's, whose shared memory it reuses (`across.summing`): the walk's last stores' reads of
     their stage (`Family.stored`, its tile gradients') done first (row 2633, ET-DETDIAG-h100: the last query
     tile's gradient read from a stage this scope had written)."""
     family.store_wait(0)
     for place, (value, view) in enumerate(zip(sums, views, strict=True)):
         def written(summed, stage, view=view, place=place):
-            if place < 2:
-                family.stored((summed,), (view,), smem=stage)
-            else:
-                family.added(summed, view, interpret, smem=stage)
+            family.stored((summed if place < 2 else family.as_row(summed),), (view,), smem=stage)
 
         def total(stage, value=value, written=written, **scratch):
             across.summed_across(value, scratch, lax.axis_index("wg"), consumers,
@@ -676,11 +669,11 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
     return dk, dv, *launched[0][2:]
 
 def _keys_stored(family: mosaic.Family, sums: tuple, views: tuple, stages: tuple, after: Callable | None, *,
-                 index, widths: bool, interpret: bool) -> None:
+                 index, widths: bool) -> None:
     """A consumer's dK, dV and key gradients `sums` stored to their `views` (`_dkv_stored`) through the
     program's `stages`, or through those a scope `after` the walks holds (`stages_after_walks`, dK's and dV's
     one where the head `widths` agree, `_output_stages`)."""
-    stored = functools.partial(_dkv_stored, family, sums, views, index=index, interpret=interpret)
+    stored = functools.partial(_dkv_stored, family, sums, views, index=index)
     if after is None:
         stored(stages)
     else:
@@ -771,8 +764,7 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
                          for ref, val in ((dk_ref, dk), (dv_ref, dv)))
             key_views = tuple(ref.at[row, head, span] for ref in key_refs)
             _keys_stored(family, (dk, dv, *key_sums), (*outs, *key_views),
-                         (out_smem, dv_smem, rows_smem), after, index=index, widths=value_width == width,
-                         interpret=walk.interpret)
+                         (out_smem, dv_smem, rows_smem), after, index=index, widths=value_width == width)
             return None
         reached = functools.partial(program.readers, pair_first, q_steps, spans_of, row)
         return scheduled_roles(family, consumers, consumer, functools.partial(
@@ -793,8 +785,7 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
             first = 9 + len(leaves) + walk.fused
             grads = stacked.views(refs[first:first + len(groups)], groups)
             outputs = refs[first + len(groups):first + len(groups) + 2]
-            _summed_stored(family, summed, _shared_views(family, outputs, grads, graded, block_k), consumers,
-                           walk.interpret)
+            _summed_stored(family, summed, _shared_views(family, outputs, grads, graded, block_k), consumers)
     launch = _dkv_kernel(walk, entry, graded, query, key, value, dout, shares, name)
     query, key, value, dout = (head_layout(family, arr) for arr in (query, key, value, dout))
     grads = _dkv_launched(walk, launch, (query, key, value, dout, peak, total, anchor, delta, key_index,
