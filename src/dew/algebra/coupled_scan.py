@@ -245,37 +245,62 @@ def _floored(value: scaled.Scaled) -> scaled.Scaled:
                          SUMS_REACH)
 
 
+ORDINARY = 2.0 ** -96
+"""The least magnitude a float running sum is taken at for its scaled twin (`_ordinary`): every term it
+flushed, under float32's least normal, at most 2^-120 together over a chunk of 64, beneath its rounding."""
+
+
+def _ordinary(running, twin: scaled.Scaled) -> scaled.Scaled:
+    """A decayed sum the float running product's (its FMA-contracted rounding, as the token walk's) where it
+    is finite and ordinary (`ORDINARY`), or zero where its scaled twin is; else the twin's, past the float's
+    range."""
+    zero = (running == 0) & (twin.significand == 0)
+    taken = jnp.isfinite(running) & ((jnp.abs(running) >= ORDINARY) | zero)
+    exact = scaled.scaled(jnp.where(taken, running, 0.0))
+    return scaled.Scaled(jnp.where(taken, exact.significand, twin.significand),
+                         jnp.where(taken, exact.exponent, twin.exponent), SUMS_REACH)
+
+
 def _decayed_sums(alpha: scaled.Scaled, mu: scaled.Scaled, lam) -> tuple:
     """A chunk's sums from its decays `alpha` and `mu` (scaled values) and weights `lam` `[C]`, a token at a
     time, each a running product of scaled values (`dew.algebra.scaled`: a 2x2 product's sums reach past
-    float32's range where the terms they weigh do not): `g` `[C, C + 1]`, row t `g(s, t)` at column `s + 1`
-    for token `s` (none past `t`) and `b_t` at column zero; the last token's `m(., C)` `[C + 1]` (`m(0, C)`
-    at column zero), and `A` `[C]`. `m(s, t) = mu_t m(s, t - 1)`, one at `s = t`; `g(s, t) = alpha_t g(s, t -
-    1) + lam_t m(s, t)`."""
+    float32's range where the terms they weigh do not) beside its float twin, the float's where it is
+    ordinary (`_ordinary`): `g` `[C, C + 1]`, row t `g(s, t)` at column `s + 1` for token `s` (none past `t`)
+    and `b_t` at column zero; the last token's `m(., C)` `[C + 1]` (`m(0, C)` at column zero), and `A` `[C]`.
+    `m(s, t) = mu_t m(s, t - 1)`, one at `s = t`; `g(s, t) = alpha_t g(s, t - 1) + lam_t m(s, t)`."""
     tokens = lam.shape[-1]
     own = jnp.eye(tokens + 1, dtype=jnp.bool_)[1:]
     weights = scaled.scaled(lam)
+    floats = (scaled.landed(alpha), scaled.landed(mu), lam)
 
     def token(carried, step):
-        g, m, kept = (scaled.Scaled(*parts, SUMS_REACH) for parts in carried)
-        a, u, weight, mine = step
+        scaled_parts, float_parts = carried
+        g, m, kept = (scaled.Scaled(*parts, SUMS_REACH) for parts in scaled_parts)
+        g_f, m_f, kept_f = float_parts
+        a, u, weight, mine, a_f, u_f, lam_f = step
         one = scaled.one_like(m.significand)
         m = _floored(scaled.where(mine, one, scaled.mul(m, u)))
         g = _floored(scaled.add(scaled.mul(a, g), scaled.mul(weight, m)))
         kept = _floored(scaled.mul(kept, a))
+        m_f = jnp.where(mine, 1.0, m_f * u_f)
+        g_f = a_f * g_f + lam_f * m_f
+        kept_f = kept_f * a_f
         held = tuple((x.significand, x.exponent) for x in (g, m, kept))
-        return held, (held[0], held[2])
+        return (held, (g_f, m_f, kept_f)), (held[0], held[2], g_f, kept_f)
 
     # The carries typed as the tokens vary (a checked `shard_map`'s manual axes), as a step's outputs vary.
-    def seeded(value, exponent):
-        return tuple(varying_like(x, alpha.significand, mu.significand, lam) for x in (value, exponent))
+    def seeded(*parts):
+        return tuple(varying_like(x, alpha.significand, mu.significand, lam) for x in parts)
 
-    zeros = jnp.zeros((tokens + 1,), lam.dtype)
-    carried = (seeded(zeros, jnp.zeros((tokens + 1,), jnp.int32)),
-               seeded(zeros.at[0].set(1.0), jnp.zeros((tokens + 1,), jnp.int32)),
-               seeded(jnp.ones((), lam.dtype), jnp.zeros((), jnp.int32)))
-    (_, last, _), (g, kept) = lax.scan(token, carried, (alpha, mu, weights, own))
-    return tuple(scaled.Scaled(*parts, SUMS_REACH) for parts in (g, last, kept))
+    zeros, exponents = jnp.zeros((tokens + 1,), lam.dtype), jnp.zeros((tokens + 1,), jnp.int32)
+    first = zeros.at[0].set(1.0)
+    carried = ((seeded(zeros, exponents), seeded(first, exponents),
+                seeded(jnp.ones((), lam.dtype), jnp.zeros((), jnp.int32))),
+               seeded(zeros, first, jnp.ones((), lam.dtype)))
+    ((_, last, _), (_, last_f, _)), (g, kept, g_f, kept_f) = lax.scan(
+        token, carried, (alpha, mu, weights, own, *floats))
+    return tuple(_ordinary(running, scaled.Scaled(*twin, SUMS_REACH))
+                 for running, twin in ((g_f, g), (last_f, last), (kept_f, kept)))
 
 
 def _shifted(value: scaled.Scaled, first: float) -> scaled.Scaled:
