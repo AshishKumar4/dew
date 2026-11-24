@@ -14,7 +14,10 @@ from collections.abc import Callable
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
+from jax.experimental.mosaic.gpu import utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
+from jax.extend.mlir import ir
+from jax.extend.mlir.dialects import arith, memref
 
 from dew.nn.kernels import generation, recurrence_algebra as algebra
 from dew.nn.kernels.templates import bundles, mosaic, operands, product, resources, scan, swizzling
@@ -352,15 +355,10 @@ def _sub_chunk_walk(q, k, prefix, beta, taken, own: tuple, call: Call, *, scale:
     blocks `own` (`own_pairs.intra_own`'s, the scores' and the system's inverses) read once a chunk."""
     chunk, width, family = call.chunk, call.width, call.family
     scored, outputs, later = "scores" in products, len(products), _later(call)
-    solving = "system" in products
     placed, inverted = placed_form(call), inverse_form(call)
-    once_names = ("own_scores", "own_inverses") if solving else ("own_scores",)
-    once_blocks = stream_blocks(own_scores=((chunk, algebra.SUB), placed),
-                                **({"own_inverses": ((chunk, algebra.SUB), inverted)} if solving else {}))
     keys = key_block(call, functools.partial(_sub_chunk_held, call, outputs=outputs),
                      functools.partial(_sub_chunk_staged, call, products=products),
-                     lambda block: {**pair_streams(call, block, queries=scored), **once_blocks},
-                     contracted=True)
+                     functools.partial(pair_streams, call, queries=scored), contracted=True)
     steps = width // keys
     shrinking = min(abs(scale), 1.0)
     growing = math.copysign(max(abs(scale), 1.0), scale)
@@ -375,19 +373,14 @@ def _sub_chunk_walk(q, k, prefix, beta, taken, own: tuple, call: Call, *, scale:
                              **limb_views(call, prefix_refs, row, chunk, h * width, width),
                              **({"queries": call.given.views(q_ref, row, chunk, keyed, width)} if scored
                                 else {}))
-        forms = {"own_scores": placed, "own_inverses": inverted}
-        once = stream_views(lambda i: (0, 0), **{name: forms[name].views(ref, row, chunk, h * algebra.SUB,
-                                                                          algebra.SUB)
-                                                 for name, ref in zip(forms, own_refs, strict=False)})
         (lefts, raised, separated), solve = staging[:3], staging[3:]
-        # The own blocks' tiles (`Walk.once`), read after the walk (`_read_out`).
-        held_once: dict = {}
+        # The own blocks' views, read into their tiles after the walk (`_read_out`).
+        owned = [form.views(ref, row, chunk, h * algebra.SUB, algebra.SUB)
+                 for form, ref in zip((placed, inverted), own_refs, strict=False)]
 
         def step(index, slots, carry, accumulators):
             del index
             slots.acquire_all()
-            for name in once_names:
-                held_once[name] = stream_tile(slots, name, forms[name])
             # Laid in the family's layout (`Family.tile_of`), as the scan lays it.
             whole = algebra.separated(*(family.tile_of(tile.refs[0]) for tile in limb_tiles(call, slots)))
             mosaic.synced(call.interpret)
@@ -431,32 +424,26 @@ def _sub_chunk_walk(q, k, prefix, beta, taken, own: tuple, call: Call, *, scale:
 
         def read(carry, totals):
             del carry
-            _read_out(call, products, totals, held_once, solve, landing, sums, row=row, head=h,
+            _read_out(call, products, totals, owned, solve, landing, sums, row=row, head=h,
                       growing=growing)
 
         return mosaic.Walk(views, step, steps=steps, sums=((algebra.SUB, chunk),) * (outputs * later),
-                           read=read, once=dict(once))
+                           read=read)
 
     blocks = pair_streams(call, keys, queries=scored)
     out_forms = [dataclasses.replace(call.held, rows=call.rows)] * outputs
     staging, landing = _sub_chunk_staged(call, keys, products=products)
     inputs = (q, k, *prefix, beta, taken, *own)
-    # The own blocks' streams each its widest swizzle at a sub-chunk's columns, fp32's unswizzled: a TF32
-    # product's operand takes no swizzled fp32 tile (row 12647, `_pair_swizzles`).
-    swizzles = {**_pair_swizzles(call, blocks, keys),
-                **{name: swizzling.UNSWIZZLED if dtype == jnp.float32
-                   else resources.widest_swizzle(dtype, algebra.SUB)
-                   for name, (_, dtype) in once_blocks.items()}}
     return launch_kernel(program, call, out_type=tuple(form.shape(call.heads * chunk) for form in out_forms),
                          grid=(call.chunks, call.heads), grid_names=("chunks", "heads"), blocks=blocks,
-                         once=once_blocks, stages=(1, 2), live=chunk_liveness(len(prefix) + 3), steps=steps,
+                         stages=(1, 2), live=chunk_liveness(len(prefix) + 3), steps=steps,
                          model=_sub_chunk_flops(call, keys, outputs),
                          held=_sub_chunk_held(call, keys, outputs), staging=staging, landing=landing,
                          name=_named("recurrence_intra", products), sums=(chunk,) * (outputs * later),
-                         swizzles=swizzles)(*inputs)
+                         swizzles=_pair_swizzles(call, blocks, keys))(*inputs)
 
 
-def _read_out(call: Call, products: tuple[str, ...], totals, held_once: dict, solve: tuple, landing: dict,
+def _read_out(call: Call, products: tuple[str, ...], totals, owned: list, solve: tuple, landing: dict,
               sums, *, row, head, growing: float) -> None:
     """The intra walk's outputs from its sums (`totals`, each a sub-chunk's row block `[SUB, C]` past the
     first's), a sub-chunk's rows at a time. The scores': the walk's (its first sub-chunk's none: no keys
@@ -466,9 +453,17 @@ def _read_out(call: Call, products: tuple[str, ...], totals, held_once: dict, so
     own block's inverse (`own_pairs.intra_own`'s), `L_b` the walk's sums of its rows' pairs before its
     sub-chunk (`algebra.columns_before`: a row whose write gate overflows times a zero factor is a NaN past
     them), `X` the rows of blocks before it (staged, zero past them), `E_b` the identity's rows: fla_kda's
-    merges, each stored less its unit diagonal, as `mainloop._weighted` takes it."""
+    merges, each stored less its unit diagonal, as `mainloop._weighted` takes it. The own blocks `owned`
+    (their views, a form's parts each) are read into their tiles first, each thread its run of words
+    (`own_loaded`)."""
     sub, chunk, family = algebra.SUB, call.chunk, call.family
-    place, lower, solved, stacked = solve
+    own_tiles, (place, lower, solved, stacked) = solve[0], solve[1:]
+    held_once = {}
+    for name, views, tiles, form in zip(("own_scores", "own_inverses"), owned, own_tiles,
+                                        (placed_form(call), inverse_form(call)), strict=False):
+        own_loaded(call, views, tiles)
+        held_once[name] = operands.Parts(tiles, form.dtype)
+    mosaic.synced(call.interpret)
     issuer = Issuer(call, {"place.exact": place, "lower": lower, "solve": solved})
     rows_of = jax.lax.broadcasted_iota(jnp.int32, (sub, chunk), 0)
     columns_of = jax.lax.broadcasted_iota(jnp.int32, (sub, chunk), 1)
@@ -486,7 +481,10 @@ def _read_out(call: Call, products: tuple[str, ...], totals, held_once: dict, so
 
     for b in range(chunk // sub):
         placed = issuer.summed([("place", rows_at(held_once["own_scores"], b), product.Exact(identity(b)))])
-        walked = None if b == 0 else totals[_sum_index(call, 0, b - 1)] * growing
+        # The walk's sums before the sub-chunk alone (`algebra.columns_before`), as the own blocks sat on
+        # their diagonal blocks once and the rest of the rows were zero, scaled past one.
+        walked = (None if b == 0
+                  else algebra.columns_before(totals[_sum_index(call, 0, b - 1)], b * sub) * growing)
         stored("scores", placed if walked is None else walked + placed, b)
     if "system" not in products:
         return
@@ -539,6 +537,34 @@ def _sub_chunk_held(call: Call, block: int, outputs: int = 1) -> Held:
         read))
 
 
+def own_loaded(call: Call, views: tuple, tiles: tuple) -> None:
+    """The own blocks' compact views (`own_pairs.intra_own`'s, a part each `[C, SUB]`) read into `tiles`, each
+    thread its run of words (`_own_copied`): a launch's tile read once, after its walk."""
+    for view, tile in zip(views, tiles, strict=True):
+        if call.interpret:
+            tile[...] = view[...]
+            continue
+        plgpu.inline_mgpu(arg_types=(plgpu.RefType(), plgpu.RefType()), return_type=())(
+            lambda ctx, from_ref, to_ref: _own_copied(from_ref, to_ref))(view, tile)
+
+
+def _own_copied(source_ref, tile_ref) -> None:
+    """`own_loaded` in Mosaic GPU's terms: a thread's `C * SUB / THREADS` words, row by row."""
+    index, i32 = ir.IndexType.get(), ir.IntegerType.get_signless(32)
+    rows, columns = ir.MemRefType(source_ref.type).shape
+    run = rows * columns // scan.THREADS
+
+    def const(value):
+        return arith.constant(i32, value)
+
+    thread = arith.remui(utils.thread_idx(), const(scan.THREADS))
+    for step in range(run):
+        entry = arith.addi(arith.muli(thread, const(run)), const(step))
+        at = [arith.index_cast(index, value)
+              for value in (arith.divui(entry, const(columns)), arith.remui(entry, const(columns)))]
+        memref.store(memref.load(source_ref, at), tile_ref, at)
+
+
 def _sub_chunk_flops(call: Call, keys: int, outputs: int) -> int:
     """`_sub_chunk_walk`'s tensor FLOPs: each output's later sub-chunks' pairs a key block, the own scores
     placed (`[SUB, SUB] @ [SUB, C]` a sub-chunk), and solving, the substitution's sums over the rows of
@@ -578,10 +604,14 @@ def _sub_chunk_staged(call: Call, keys: int, *, products: tuple[str, ...]) -> tu
     # After the walk (`_read_out`): the placing identity's one exact part, in the placed scores' dtype; and
     # solving, the substitution's left and right operands and its rows of blocks, in the merges' form.
     placed, inverted = placed_form(call), inverse_form(call)
+    solving = "system" in products
+    # The own blocks' tiles (`own_loaded`), unswizzled: a TF32 product's operand takes no swizzled fp32 tile
+    # (row 12647, `_pair_swizzles`).
+    own = tuple(staging_tiles(form, (chunk, sub))[0] for form in (placed, inverted)[:1 + solving])
     (place,) = staging_tiles(Operand(sub, 1, jnp.dtype(placed.stored)), (sub, chunk))
     solve = ((place, *staging_tiles(inverted, (sub, chunk), (sub, chunk), (chunk, chunk)))
-             if "system" in products else (place, (), (), ()))
-    return (lefts, raised, separated, *solve), landing
+             if solving else (place, (), (), ()))
+    return (lefts, raised, separated, own, *solve), landing
 
 
 def intra_rows(call: Call, name: str, operand: Callable[[str], jax.Array], beta) -> jax.Array:
