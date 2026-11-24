@@ -92,15 +92,16 @@ def sequence_parallel_attention(kernel, query, key, value, shards: int, *, causa
                                    dropout_seed=dropout_seed)
 
 
-ROW_VECTORS = frozenset({"key_value_seq_starts"})
-"""The visibility ids whose one dimension is the batch's rows (`[B]`); every other id's lone dimension is the
-tokens' (a shared `[K]` validity, `[S]` places, `[Q]` slots), its rows a leading dimension of a rank above
-one (`[B, S]`, `[B, K]`, `[B, Q, R, 2]`), as `dew.nn.attention_masks.key_spans` reads them."""
+BATCHED_RANKS = {"key_value_seq_starts": 1, "key_runs": 4}
+"""Each visibility id's rank where it holds a row apiece, its rows leading: `[B]` starts, `[B, Q, R, 2]` runs,
+every other id `[B, S]`, `[B, Q]` or `[B, K]` (2); one of another rank is shared by every row (a `[K]`
+validity, `[Q, R, 2]` runs), as `dew.nn.attention_masks.key_spans` reads them."""
 
 
 def _row_leading(name: str, leaf, rows: int) -> bool:
-    """Whether visibility id `name`'s array `leaf` leads with the batch's `rows` (`ROW_VECTORS`)."""
-    return (jnp.ndim(leaf) >= 2 or (jnp.ndim(leaf) == 1 and name in ROW_VECTORS)) and leaf.shape[0] == rows
+    """Whether visibility id `name`'s array `leaf` leads with the batch's `rows`: its batched rank
+    (`BATCHED_RANKS`) and their count, never a shared id's length that equals it."""
+    return jnp.ndim(leaf) == BATCHED_RANKS.get(name, 2) and leaf.shape[0] == rows
 
 
 def exchanges_heads(query, key, shards: int, *, masked: bool) -> bool:
@@ -306,7 +307,7 @@ def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
             ("activation_batch",), key_value_seq_lengths, queries, query.shape))
     for name, ids in (visibility or {}).items():
         # Whole along the sequence beside the whole sequences the exchange gives, a leaf's batch rows split
-        # as the query's own where its contract leads with them (`_ROW_LEADING`), any other whole: a
+        # as the query's own where its contract leads with them (`_row_leading`), any other whole: a
         # shared `[K]` validity of the batch's length is the keys', not the rows'.
         extras[name] = (ids, jax.tree.map(
             lambda leaf, name=name: P(_entry(queries, 0) if _row_leading(name, leaf, query.shape[0])

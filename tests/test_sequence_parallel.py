@@ -329,15 +329,23 @@ def _square_draw(seed):
     return query, key, value, jax.random.normal(c_key, query.shape, jnp.float32)
 
 
+SHARED_IDS = {
+    "key_valid": jnp.asarray([True, True, False, True]),
+    "query_slots": jnp.arange(4, dtype=jnp.int32),
+    # Each query's runs `[Q, R, 2]`, every row's: its own key and the first.
+    "key_runs": jnp.stack([jnp.asarray([[0, 1], [q, q + 1]], jnp.int32) for q in range(4)]),
+}
+"""Ids every row shares whose leading length is the batch's (four): `[K]` validity, `[Q]` slots, `[Q, R, 2]`
+runs."""
+
+
 @pytest.mark.mesh
-@pytest.mark.parametrize("name", ["key_valid", "query_slots"])
-def test_a_shared_vector_of_the_batchs_length_stays_whole(name):
-    """A shared `[K]` validity or `[Q]` slots of the batch's length (four rows of four tokens, the rows
-    split two ways) travels whole, the keys' or the queries' as it is, not split as rows (review of #4023):
-    the entry on par with whole sequences, forward and backward."""
-    vector = (jnp.asarray([True, True, False, True]) if name == "key_valid"
-              else jnp.arange(4, dtype=jnp.int32))
-    call = {"causal": True, name: vector, "implementation": "reference"}
+@pytest.mark.parametrize("name", sorted(SHARED_IDS))
+def test_a_shared_id_of_the_batchs_length_stays_whole(name):
+    """A shared `[K]` validity, `[Q]` slots or `[Q, R, 2]` runs of the batch's length (four rows of four
+    tokens, the rows split two ways) travels whole, the keys' or the queries' as it is, not split as rows
+    (reviews of #4023 and #4026): the entry on par with whole sequences, forward and backward."""
+    call = {"causal": True, name: SHARED_IDS[name], "implementation": "reference"}
     entry = with_gradients(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call))
     assert_exchanged_on_par(entry, entry, SHARED, _square_draw, f"a shared {name} of the batch's length")
 
