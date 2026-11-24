@@ -282,11 +282,10 @@ def taken_back(encoder: Tokenizer) -> int | None:
     vocabulary's own class declares of itself (its `taken_back`, an int), none inherited and none an
     instance holds; None, no bound, for any other: a ranked BPE's merges cascade, one character turning
     every later pair's parity, so no bound of its tokens' lengths holds."""
-    kind = type(encoder)
-    if isinstance(encoder, ByteTokenizer) and kind.encode is ByteTokenizer.encode and (
-            kind.offsets is ByteTokenizer.offsets):
+    if (isinstance(encoder, ByteTokenizer) and type(encoder).encode is ByteTokenizer.encode
+            and type(encoder).offsets is ByteTokenizer.offsets):
         return 0
-    declared = vars(kind).get("taken_back")
+    declared = vars(type(encoder)).get("taken_back")
     return declared if isinstance(declared, int) and not isinstance(declared, bool) else None
 
 

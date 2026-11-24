@@ -68,7 +68,6 @@ from dew.training.memory import (
     layer_gathers,
     local_devices,
     memory_record,
-    placed_beside,
     remat_admits,
     remat_topmost,
     rung_record,

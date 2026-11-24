@@ -166,7 +166,7 @@ def test_a_placed_steps_compile_limit_gives_back_the_state_it_reuses():
         # Within a 64 MiB chunk of the target, the allocator's own reservations aside: still room for the
         # temporaries beside what the step places, short of the state with them.
         filled = step_room(device)
-        assert filled is not None and abs(filled - target) < (1 << 26), (target, filled)
+        assert filled is not None and target - (1 << 26) < filled < target + (1 << 26), (target, filled)
         assert beside + ahead.temp_bytes < filled < argument + beside + ahead.temp_bytes, (filled, ahead)
         step = trainer.compile(state, batch)
         probes = trainer.plan["probes"]
