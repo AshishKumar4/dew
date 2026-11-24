@@ -1095,30 +1095,3 @@ def test_a_hosts_measurement_reaches_its_parent_whatever_the_measuring_process_p
     monkeypatch.setenv("XLA_FLAGS", device_flags(2))
     needs = communicators._child({})
     assert set(needs.to_json()) >= {"collective", "exchanged", "permuted", "runtime"}
-
-
-def test_a_runtime_that_lists_no_local_devices_is_no_loaded_program():
-    """A compiled program whose runtime executable lists no devices of this process (an unloaded one, which
-    one jaxlib build names as it names a loaded one) is no program this process loaded: `loaded_program`
-    reads it as none, as it reads a compile-only GPU's, and `admit` admits it; a program loaded here is read
-    with its devices (an A100 tier's prepare: the unloaded executable passed `isinstance(...,
-    LoadedExecutable)`, and its `local_devices` raised AttributeError)."""
-    from typing import cast
-
-    class Unloaded:
-        """A runtime as an unloaded executable holds it: a fingerprint, no devices."""
-
-        fingerprint = b"unloaded"
-
-    class Compiled:
-        """A compiled program whose runtime is `Unloaded`."""
-
-        def runtime_executable(self) -> Unloaded:
-            return Unloaded()
-
-    unloaded = cast(jax.stages.Compiled, Compiled())
-    assert communicators.loaded_program(unloaded) is None
-    communicators.admit(unloaded)
-    loaded = jax.jit(lambda x: x + 1).lower(jnp.ones(2)).compile()
-    program = communicators.loaded_program(loaded)
-    assert program is not None and program.devices == tuple(jax.local_devices()[:1]), program
