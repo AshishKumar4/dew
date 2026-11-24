@@ -336,7 +336,8 @@ class _Lanes:
 _PTX_FLOAT = ("fma.", "mul.", "add.", "sub.", "max.", "min.", "neg.", "abs.")
 _PTX_SPECIAL = ("ex2.", "lg2.", "rcp.", "rsqrt.", "sqrt.", "tanh.", "sin.", "cos.")
 _PTX_FREE = ("shfl.", "mov.", "setp.", "selp.", "bar.", "barrier.", "fence.", "membar.", "elect.", "vote.",
-             "activemask.")
+             "activemask.", "mbarrier.", "cp.async.commit_group", "cp.async.wait_group", "cp.async.wait_all",
+             "cp.async.mbarrier")
 _PTX_INTEGER = ("lop3.", "shf.", "prmt.", "and.", "or.", "xor.", "not.", "shl.", "shr.", "bfe.", "bfi.",
                 "add.", "sub.", "min.", "max.", "abs.", "neg.")
 _PTX_MULTIPLY = ("mul.", "mad.")
@@ -371,6 +372,11 @@ def _assembly(text: str, issued: float, moving: float) -> Work:
             work = work + Work(integer_multiply_adds=elements * issued)
         elif mnemonic.startswith(_PTX_INTEGER):
             work = work + Work(integer_operations=elements * issued)
+        elif mnemonic.startswith(("cp.async.ca.", "cp.async.cg.")):
+            # A lane's copy of its operand's bytes (16 where it states none) from device into shared memory.
+            sizes = [int(word.strip(",")) for word in words[1:] if word.strip(",").isdigit()]
+            copied = (sizes[0] if sizes else 16) * moving
+            work = work + Work(device_bytes=copied, shared_bytes=copied)
         elif mnemonic.startswith(("atom.", "red.")) and ".global" in mnemonic:
             work = work + Work(device_bytes=8 * moving)
         elif mnemonic.startswith(("ld.", "st.")):
