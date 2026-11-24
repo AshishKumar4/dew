@@ -635,7 +635,8 @@ class _Counting:
         if primitive is lax.mul_p:
             if live[output] == 1:
                 products.add(output)
-        elif any(isinstance(atom, jax_core.Var) and atom in products and atom.aval.shape == output.aval.shape
+        elif any(isinstance(atom, jax_core.Var) and atom in products
+                 and getattr(atom.aval, "shape", ()) == getattr(output.aval, "shape", ())
                  for atom in equation.invars):
             added = _elements(output.aval)
             self.add(Work(operations=-added, fused_multiply_adds=added))
