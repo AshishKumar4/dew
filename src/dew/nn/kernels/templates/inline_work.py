@@ -28,6 +28,10 @@ runs it, its 32 lanes all."""
 
 WARP = 32
 
+WALKED_TRIPS = 64
+"""The most trips of a static loop the count walks one at a time, its induction variable known each trip;
+past them it walks the body once, its induction variable unknown, and counts it its trips' times."""
+
 _FLOAT = frozenset({
     "arith.addf", "arith.subf", "arith.mulf", "arith.divf", "arith.remf", "arith.maximumf", "arith.minimumf",
     "arith.maxnumf", "arith.minnumf", "arith.negf", "arith.cmpf", "math.fma", "math.absf", "math.copysign"})
@@ -220,7 +224,9 @@ class _Lanes:
             for argument, start, carried in carried_values:
                 if start in self.varying or carried in self.varying:
                     self.varying.add(argument)
-            return _repeated(self.region(op.regions[0], active), trips)
+            if trips > WALKED_TRIPS:
+                return _repeated(self.region(op.regions[0], active), trips)
+            return self.trips(op, trips, active)
         if name == "scf.if":
             maybe, surely = self.bounds(op.operands[0])
             if maybe.all() and not surely.any() and op.operands[0] not in self.varying:
@@ -240,6 +246,29 @@ class _Lanes:
         self.evaluate(op)
         return self.issued(op, active)
 
+    def trips(self, op, trips: int, active: np.ndarray) -> Work:
+        """An scf.for of `trips` few trips walked one trip at a time, its induction variable each trip's and
+        its carried values each trip's start where known (a row a trip selects, a lane a trip guards); its
+        results the last trip's."""
+        body = op.regions[0].blocks[0]
+        lower, step = self.read(op.operands[0]), self.read(op.operands[2])
+        assert lower is not None and step is not None  # `_trips` read them
+        carried = [self.read(start) for start in op.operands[3:]]
+        work = Work()
+        for trip in range(trips):
+            self.values[body.arguments[0]] = lower + trip * step
+            for argument, lanes in zip(body.arguments[1:], carried, strict=False):
+                if lanes is None:
+                    self.values.pop(argument, None)
+                else:
+                    self.values[argument] = lanes
+            work = work + self.region(op.regions[0], active)
+            carried = [self.read(value) for value in _yielded(op)]
+        for result, lanes in zip(op.results, carried, strict=False):
+            if lanes is not None:
+                self.values[result] = lanes
+        return work
+
     def read(self, value) -> np.ndarray | None:
         return self.values.get(value)
 
@@ -258,6 +287,9 @@ class _Lanes:
         if not op.results or len(op.results) != 1:
             return
         produced = op.results[0]
+        # What an earlier trip of a loop held of it is no longer known (`walked`'s trips).
+        for held in (self.values, self.partial, self.relative):
+            held.pop(produced, None)
         if isinstance(produced.type, ir.VectorType | ir.MemRefType):
             return
         if name == "arith.constant":
