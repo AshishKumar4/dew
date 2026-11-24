@@ -1,6 +1,6 @@
 """A packed matrix's product times its scales, `run(rows) * factor` (`factored`), its transpose range-safe
-and exact: the packed products' (`gemm.nvfp4_product`, `gemm.fp8_weight_product`,
-`ternary.ternary_weight_product`), ledger rows 1464, 12392 and 12403."""
+and exact: the packed products' (`gemm.nvfp4_product`, `ternary.ternary_weight_product`), ledger rows 1464,
+12392 and 12403."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array,
              gather: jax.Array | None = None) -> jax.Array:
     """`run(rows as bf16, *operands) * factor`, linear in `rows`: `run` a product of bf16 rows (those
     `gather` reads where given, `gemm`'s `gather`, among `operands`), and `factor` a packed matrix's fp32
-    scales broadcast against its output (`formats.fp8_factor`), one a row's or one for all (a column's,
+    scales broadcast against its output (`formats.scale_factor`), one a row's or one for all (a column's,
     which the transpose sums over, is the plain product's). Its transpose is the plain one, the cotangent
     times its factor through `run`'s pullback, wherever that is finite; where it is not (a product past
     fp32's largest), the exact one (`_Transpose.moved`): each product `cotangent * factor` and each
@@ -293,8 +293,8 @@ each below its grids' tops, so their sum is below `2**54` times its unit's `2**-
 `2**31`."""
 
 FACTORED_MATRIX_SLICES = 6
-"""A decoded packed matrix's slices on its grid: 36 bits, past any format's span (E5M2's 31 binades and 3
-bits; NVFP4's codes times E4M3 block scales; ternary's one)."""
+"""A decoded packed matrix's slices on its grid: 36 bits, past any format's span (NVFP4's E2M1 codes times
+E4M3 block scales, 21 binades and 5 bits; ternary's one)."""
 
 
 def _limbs(count: int, like: jax.Array, columns: int) -> jax.Array:

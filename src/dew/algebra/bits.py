@@ -723,62 +723,6 @@ four masked XORs, the fp4 challenge's price (5 issues on the busiest pipe, 8 ins
 the stored layout's version: weights stored in it decode by this form alone."""
 
 
-# E4M3 (OCP 8-bit Floating Point v1.0, e4m3fn): three mantissa bits, four exponent bits of bias 7, a sign;
-# four codes of a word into two bfloat16x2 registers, each code's value times 2^-120 (`E4M3_BFLOAT16_OWED`).
-_E4M3_IN_BFLOAT16 = {0: 4, 1: 5, 2: 6, 3: 7, 4: 8, 5: 9, 6: 10, 7: 15}
-
-E4M3_BFLOAT16 = BitTransform.placed(
-    "e4m3-bf16", WORD, (0x87F087F0, 0x87F087F0),
-    {8 * code + field: (code // 2, 16 * (code % 2) + bit)
-     for code in range(4) for field, bit in _E4M3_IN_BFLOAT16.items()},
-    fragments={"wgmma": "wgmma"})
-"""Four E4M3 codes of a word in their natural order (code `i` at byte `i`) decoded into two registers of two
-bfloat16s each, every finite code exact times 2^-120 (`E4M3_BFLOAT16_OWED`; a weight tile holds no NaN,
-while `fp8_codes` restores NaN for 0x7F/0xFF; algebra.md §7.3-7.4, row 8548)."""
-
-E4M3_BFLOAT16_FORM = BitForm(
-    steps=(BitStep(BitOp.SHL, (0,), 4, Unit.FMA), BitStep(BitOp.SHR, (0,), 4, Unit.FMA),
-           BitStep(BitOp.LOP3, (0,), 0x87F087F0, Unit.ALU),
-           BitStep(BitOp.LOP3, (1, 2), 0x87F087F0, Unit.ALU)),
-    outputs=(3, 4),
-    encoder=(0x10010, 0x20020, 0x40040, 0x88880000, 0x1, 0x2, 0x4, 0x8,
-             0x10, 0x20, 0x40, 0x88800000, 0x100001, 0x200002, 0x400004, 0x80,
-             0x1001000, 0x2002000, 0x4004000, 0x88000000, 0x100, 0x200, 0x400, 0x800,
-             0x1000, 0x2000, 0x4000, 0x80000000, 0x10000100, 0x20000200, 0x40000400, 0x8000))
-"""Free-layout form for `E4M3_BFLOAT16` (price (2, 4): 2 FMA shifts + 2 ALU LOP3s, checked by `proven`,
-row 8548)."""
-
-E4M3_BFLOAT16_OWED = 2.0 ** 120
-"""Exponent bias factor `E4M3_BFLOAT16` owes each finite code (`raised_exactly(..., 120)`)."""
-
-# E5M2 (OCP 8-bit Floating Point v1.0, e5m2): two mantissa bits, five exponent bits of bias 15, a sign;
-# four codes of a word into two bfloat16x2 registers, each code's value times 2^-112 (`E5M2_BFLOAT16_OWED`).
-_E5M2_IN_BFLOAT16 = {0: 5, 1: 6, 2: 7, 3: 8, 4: 9, 5: 10, 6: 11, 7: 15}
-
-E5M2_BFLOAT16 = BitTransform.placed(
-    "e5m2-bf16", WORD, (0x8FE08FE0, 0x8FE08FE0),
-    {8 * code + field: (code // 2, 16 * (code % 2) + bit)
-     for code in range(4) for field, bit in _E5M2_IN_BFLOAT16.items()},
-    fragments={"wgmma": "wgmma"})
-"""Four E5M2 codes of a word in their natural order (code `i` at byte `i`) decoded into two registers of two
-bfloat16s each, every finite code exact times 2^-112 (`E5M2_BFLOAT16_OWED`; a weight tile holds no inf/NaN,
-while `fp8_codes` restores inf/NaN for exponent 31; algebra.md §7.3-7.4, row 8548)."""
-
-E5M2_BFLOAT16_FORM = BitForm(
-    steps=(BitStep(BitOp.SHL, (0,), 5, Unit.FMA), BitStep(BitOp.SHR, (0,), 3, Unit.FMA),
-           BitStep(BitOp.LOP3, (1,), 0x8FE08FE0, Unit.ALU),
-           BitStep(BitOp.LOP3, (0, 2), 0x8FE08FE0, Unit.ALU)),
-    outputs=(3, 4),
-    encoder=(0x1, 0x2, 0x4, 0x8, 0x10, 0x20, 0x40, 0x40080,
-             0x10020, 0x20040, 0x80, 0x90020, 0x120040, 0x200080, 0x490020, 0x800400,
-             0x100, 0x200, 0x400, 0x800, 0x1000, 0x2000, 0x4000, 0x4008000,
-             0x1002000, 0x2004000, 0x8000, 0x9002000, 0x12004000, 0x20008000, 0x49002000, 0x80000000))
-"""Free-layout form for `E5M2_BFLOAT16` (price (2, 4): 2 FMA shifts + 2 ALU LOP3s, checked by `proven`,
-row 8548)."""
-
-E5M2_BFLOAT16_OWED = 2.0 ** 112
-"""Exponent bias factor `E5M2_BFLOAT16` owes each finite code (`raised_exactly(..., 112)`)."""
-
 E4M3_SCALE = BitTransform.placed(
     "e4m3-scale", 8, (0x87F00000,), {**{bit: (0, 20 + bit) for bit in range(7)}, 7: (0, 31)}, free=False)
 """A block scale's E4M3 code (the low byte of a 32-bit word) decoded into a float32 register, the code's value
@@ -867,63 +811,19 @@ def nvfp4_codes(words: jax.Array, dtype=jnp.float32) -> jax.Array:
     return restored(pattern, dtype)
 
 
-def restored(pattern: jax.Array, dtype=jnp.float32, *, shift: int = 126) -> jax.Array:
-    """A bit-form's decoded value (`NVFP4_BFLOAT16_FORM` at `shift=126`, `E4M3_BFLOAT16_FORM` at `120`, or
-    `E5M2_BFLOAT16_FORM` at `112`: each code times `2^-shift` as a bfloat16) of each of `pattern` (uint32, a
-    bfloat16's 16 bits in its low half), restored to the code in `dtype` (float32 by default; a float64
-    truth's float64) by the one restore rule (`float_bits.raised_exactly`, its bits moved to a float32's high
-    half, the owed `2^shift` from its bits: a code of 0.5 as its mantissa's integer times 2^-7), formed in
-    float32 and cast once (a narrower format holds neither its fraction field nor its power, row 8660's head
-    review; every finite code's restoring is a normal float32, which a wider one holds exactly). The one
-    definition of the decoded value: the portable decode's (`nvfp4_decoded`, `fp8_codes`), the native staged
-    decode's, whatever lanes each extracts, and a truth's."""
+def restored(pattern: jax.Array, dtype=jnp.float32) -> jax.Array:
+    """A bit-form's decoded value (`NVFP4_BFLOAT16_FORM`'s: each code times `2^-126` as a bfloat16) of each of
+    `pattern` (uint32, a bfloat16's 16 bits in its low half), restored to the code in `dtype` (float32 by
+    default; a float64 truth's float64) by the one restore rule (`float_bits.raised_exactly`, its bits moved
+    to a float32's high half, the owed `2^126` from its bits: a code of 0.5 as its mantissa's integer times
+    2^-7), formed in float32 and cast once (a narrower format holds neither its fraction field nor its power,
+    row 8660's head review; every finite code's restoring is a normal float32, which a wider one holds
+    exactly). The one definition of the decoded value: the portable decode's (`nvfp4_decoded`), the native
+    staged decode's, whatever lanes each extracts, and a truth's."""
     held = jax.lax.bitcast_convert_type(pattern << jnp.uint32(16), jnp.float32)
-    restoring = raised_exactly(held, jnp.int32(shift))
+    restoring = raised_exactly(held, jnp.int32(126))
     return restoring.astype(dtype)
 
-
-def fp8_form(minifloat: Minifloat) -> tuple[BitForm, int]:
-    """The checked-in free-layout `(BitForm, shift)` decoding four `minifloat` FP8 codes into two bfloat16x2
-    registers (row 8548)."""
-    if minifloat == E4M3:
-        return E4M3_BFLOAT16_FORM, 120
-    if minifloat == E5M2:
-        return E5M2_BFLOAT16_FORM, 112
-    raise ValueError(f"fp8_form expects E4M3 or E5M2, got {minifloat}")
-
-
-def fp8_packed[Words: (np.ndarray, jax.Array)](codes: Words, minifloat: Minifloat, xp=jnp) -> Words:
-    """Pack FP8 byte `codes` (`[..., n]` uint32, 4 per uint32 word along the last axis) through the
-    free-layout encoder of `fp8_form(minifloat)` for inline GPU decode (row 8548)."""
-    form, _ = fp8_form(minifloat)
-    grouped = codes.reshape(*codes.shape[:-1], -1, 4)
-    places = xp.arange(4, dtype=xp.uint32) * xp.uint32(8)
-    natural = xp.sum(grouped << places, axis=-1, dtype=xp.uint32)
-    return _parities(natural, form.encoder, xp)
-
-
-def fp8_restored(pattern: jax.Array, minifloat: Minifloat, dtype=jnp.float32) -> jax.Array:
-    """Restore `pattern` (uint32 low-16 bfloat16 bits from `fp8_form(minifloat)`) to `dtype`, preserving NaN
-    on E4M3 `0x7F`/`0xFF` and +/-inf/NaN on E5M2 exponent 31 (as `scales_decoded` does, row 8548). Shared by
-    `fp8_codes` and `templates/gemm/packed.stage_decoded_fp8`."""
-    _, shift = fp8_form(minifloat)
-    restored_values = restored(pattern, dtype, shift=shift)
-    if minifloat == E4M3:
-        return jnp.where((pattern & jnp.uint32(0x7FFF)) == jnp.uint32(0x07F0),
-                         jnp.asarray(jnp.nan, dtype), restored_values)
-    nonfinite = (pattern & jnp.uint32(0x0F80)) == jnp.uint32(0x0F80)
-    infinity = jnp.where((pattern & jnp.uint32(0x8000)) != 0,
-                         jnp.asarray(-jnp.inf, dtype), jnp.asarray(jnp.inf, dtype))
-    special = jnp.where((pattern & jnp.uint32(0x0060)) != 0, jnp.asarray(jnp.nan, dtype), infinity)
-    return jnp.where(nonfinite, special, restored_values)
-
-
-def fp8_codes(words: jax.Array, minifloat: Minifloat, dtype=jnp.float32) -> jax.Array:
-    """Decode free-layout FP8 stored `words` (`[depth / 4, columns]` uint32, packed by `fp8_packed`) back to
-    `[depth, columns]` exact values in `dtype` via `fp8_form(minifloat)` and `fp8_restored` (row 8548)."""
-    form, _ = fp8_form(minifloat)
-    pattern = form.values(words.T, jnp.uint16).T.astype(jnp.uint32)
-    return fp8_restored(pattern, minifloat, dtype)
 
 class Minifloat(NamedTuple):
     """A narrow float an encode rounds fp32 to (`encoded`): its exponent and mantissa bits, its bias, its

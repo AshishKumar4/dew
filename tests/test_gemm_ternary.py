@@ -254,13 +254,13 @@ def test_fp32_tf32_grouped_and_dense_gemm_derives_and_compiles_on_mosaic(gpu: st
 
 
 def test_packed_products_hold_extreme_scales_forward_and_backward():
-    """Packed ternary and FP8 products at scales near fp32's edges (row 1464): a ternary row of `2**126` and
+    """Packed ternary products at scales near fp32's edges (row 1464): a ternary row of `2**126` and
     `+1/-1` codes cancels to 0 with STE gradients of the codes times the scale; a subnormal `2**-144` row
     codes on a process that flushes subnormals, `2**-144 * 2**120 = 2**-24`; and a cotangent of `[4, 4]`
     against columns `[+1, -1]` at a scale of `2**126` (each cotangent times its factor past fp32's
     largest) pulls back to exactly 0 (`[4, 2]` to `2**127`), not `inf - inf`, for a tensor scale, with and
-    without activation quantization, and for FP8 weights alike; a tiny cotangent beside a huge one on
-    another input pulls back whole."""
+    without activation quantization; a tiny cotangent beside a huge one on another input pulls back
+    whole."""
     x_cancel = jnp.zeros((16, 256), jnp.float32).at[0, 0].set(2.0 ** 126).at[0, 1].set(2.0 ** 126)
     w_mat = jnp.zeros((256, 64), jnp.float32).at[0, 0].set(1.0).at[1, 0].set(-1.0)
     w_cancel = dataclasses.replace(formats.TernaryWeights.of(w_mat, scale=jnp.float32(1.0)),
@@ -274,19 +274,16 @@ def test_packed_products_hold_extreme_scales_forward_and_backward():
     w_cot_mat = jnp.zeros((256, 64), jnp.float32).at[0, 0].set(1.0).at[0, 1].set(-1.0)
     huge = jnp.float32(2.0 ** 126)
     ternary = formats.TernaryWeights.of(w_cot_mat, scale=jnp.float32(1.0))
-    fp8 = formats.Fp8Weights.of(w_cot_mat, scale=jnp.float32(1.0))
     products = [
         *((functools.partial(gemm.ternary_weight_product, weights=dataclasses.replace(ternary, scale=huge),
                              quantize_activations=quantized), (quantized, "ternary"))
           for quantized in (True, False)),
-        (functools.partial(gemm.fp8_weight_product, weights=dataclasses.replace(fp8, scale=huge)), "fp8"),
     ]
     eye = jnp.zeros((256, 64), jnp.float32).at[0, 0].set(1.0).at[1, 1].set(1.0)
     unit = jnp.float32(1.0)
     separate = (
         (functools.partial(gemm.ternary_weight_product, weights=formats.TernaryWeights.of(eye, scale=unit),
-                           quantize_activations=False), "ternary"),
-        (functools.partial(gemm.fp8_weight_product, weights=formats.Fp8Weights.of(eye, scale=unit)), "fp8"))
+                           quantize_activations=False), "ternary"),)
     mixed = jnp.zeros((16, 64), jnp.float32).at[0, 0].set(2.0 ** 126).at[0, 1].set(2.0 ** -120)
     cancelling = jnp.zeros((16, 64), jnp.float32).at[0, 0].set(4.0).at[0, 1].set(4.0)
     apart = jnp.zeros((16, 64), jnp.float32).at[0, 0].set(4.0).at[0, 1].set(2.0)
@@ -418,8 +415,7 @@ def test_a_packed_products_input_gradient_differentiates_in_its_scale():
     """A packed ternary product's input gradient, `(cotangent @ codesᵀ) * scale`, has the plain transpose's
     derivative in its scale, `cotangent @ codesᵀ`, at a scale of 3, at 2**126, where cotangents against
     +1 and -1 codes cancel past fp32's largest, and at an infinite one, the cotangent held still meeting no
-    term of its own; and an FP8 product's tiny code under a large scale pulls back as the plain transpose
-    does (row 1464)."""
+    term of its own (row 1464)."""
     rng = np.random.default_rng(14640)
     codes = jnp.asarray(rng.integers(-1, 2, (256, 32)), jnp.float32).at[0, 0].set(1.0).at[0, 1].set(-1.0)
     weights = formats.TernaryWeights.of(codes, scale=jnp.float32(1.0))
@@ -437,36 +433,11 @@ def test_a_packed_products_input_gradient_differentiates_in_its_scale():
         _, derivative = jax.jvp(input_gradient, (jnp.float32(scale),), (jnp.float32(1.0),))
         np.testing.assert_array_equal(np.asarray(derivative), want.astype(np.float32), err_msg=str(scale))
 
-    # An E5M2 code of 2**-16 under a scale of 2**16 and a cotangent of 2**-120: 2**-120, the cotangent times
-    # its scale first, where the code times the cotangent alone is below bf16's least subnormal.
-    tiny = formats.Fp8Weights.of(jnp.zeros((256, 32), jnp.float32).at[0, 0].set(2.0 ** -16), fmt="e5m2",
-                                 scale=jnp.float32(1.0))
-    tiny = dataclasses.replace(tiny, scale=jnp.float32(2.0 ** 16))
-    _, pull = jax.vjp(lambda a: gemm.fp8_weight_product(a, tiny, out_dtype=jnp.float32), x)
-    (d_x,) = pull(jnp.zeros((16, 32), jnp.float32).at[0, 0].set(2.0 ** -120))
-    want = np.zeros((16, 256), np.float32)
-    want[0, 0] = 2.0 ** -120
-    np.testing.assert_array_equal(np.asarray(d_x), want)
 
-    # Codes +1, -1 and 2**-16 under a scale of 2**126 and cotangents 4, 4 and 2**-120: the first two cancel
-    # past fp32's largest, and their remainder, 2**-10, survives the pullback's bf16 rows.
-    mixed = formats.Fp8Weights.of(jnp.zeros((256, 32), jnp.float32).at[0, 0].set(1.0).at[0, 1].set(-1.0)
-                                  .at[0, 2].set(2.0 ** -16), fmt="e5m2", scale=jnp.float32(1.0))
-    mixed = dataclasses.replace(mixed, scale=jnp.float32(2.0 ** 126))
-    _, pull = jax.vjp(lambda a: gemm.fp8_weight_product(a, mixed, out_dtype=jnp.float32), x)
-    (d_x,) = pull(jnp.zeros((16, 32), jnp.float32).at[0, :2].set(4.0).at[0, 2].set(2.0 ** -120))
-    want = np.zeros((16, 256), np.float32)
-    want[0, 0] = 2.0 ** -10
-    np.testing.assert_array_equal(np.asarray(d_x), want)
-
-
-def test_swapped_register_decode_holds_for_fp8_and_ternary_at_skinny_rows():
-    """Skinny decode products (`M=13`) for `Fp8Weights` (`e4m3`/`e5m2`) and `TernaryWeights` decode
-    directly into `wgmma` register operand A (`packed_rows=True`, zero SMEM staging), matching the decoded
-    fp32 dot bitwise under forced `mosaic`, matching staged decode bit-for-bit on encoded E4M3 NaN and E5M2
-    Inf/NaN codes with independent mask checks, rejecting `splits=2`, and compiling spill-free on sm90
-    (row 5387)."""
-    from dew.algebra import bits
+def test_swapped_register_decode_holds_for_ternary_at_skinny_rows():
+    """Skinny decode products (`M=13`) for `TernaryWeights` decode directly into `wgmma` register operand A
+    (`packed_rows=True`, zero SMEM staging), matching the decoded fp32 dot bitwise under forced `mosaic`,
+    rejecting `splits=2`, and compiling spill-free on sm90 (row 5387)."""
     from dew.nn.kernels import tuning
     from dew.nn.kernels.templates.gemm import ternary, tiling
 
@@ -475,26 +446,6 @@ def test_swapped_register_decode_holds_for_fp8_and_ternary_at_skinny_rows():
     w_raw = jnp.asarray(rng.integers(-2, 3, size=(256, 128)), jnp.float32)
     with generation.assumed("sm90"):
         sm90 = generation.gpu_target("sm90")
-        swapped_fp8 = tiling.Tiles(128, 64, 64, 3, 1, warpgroups=2, family="wgmma.fed", swapped=True)
-        for fmt in ("e4m3", "e5m2"):
-            fp8_w = formats.Fp8Weights.of(w_raw, fmt=fmt, scale=0.5)
-            with (generation.chosen(grouped_matmul="mosaic"),
-                  tuning.pinned({grouped_matmul.MosaicFp8PackedGmm: swapped_fp8})):
-                got = gemm.fp8_weight_product(x, fp8_w, out_dtype=jnp.float32, interpret_on_cpu=True)
-            want = jax.lax.dot(x.astype(jnp.float32), fp8_w.decoded(jnp.float32),
-                               preferred_element_type=jnp.float32)
-            np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
-            fp8_launch = grouped_matmul.MosaicFp8PackedGmm()
-            sizes = jax.ShapeDtypeStruct((1,), jnp.int32)
-            ba_skinny = fp8_launch.bind(
-                jax.ShapeDtypeStruct((16, 4096), jnp.bfloat16),
-                jax.tree.map(lambda a: jax.ShapeDtypeStruct(np.shape(a), np.asarray(a).dtype),
-                             formats.Fp8Weights.of(np.ones((1, 4096, 128), np.float32), fmt=fmt)),
-                sizes, (), (), None, None, None, out_dtype="float32", trans_rhs=False, interpret=False,
-                dense=True, exact_sums=False)
-            assert not fp8_launch.legal(ba_skinny, dataclasses.replace(swapped_fp8, splits=2), sm90)
-            derived = fp8_launch.derived(ba_skinny, sm90)
-            assert derived is None or derived.splits == 1, derived
         tern_w = formats.TernaryWeights.of(w_raw, scale=0.5)
         swapped_t = tiling.Tiles(128, 64, 256, 3, 1, warpgroups=2, family="wgmma.fed", swapped=True)
         with (generation.chosen(grouped_matmul="mosaic"),
@@ -514,38 +465,9 @@ def test_swapped_register_decode_holds_for_fp8_and_ternary_at_skinny_rows():
         assert not t_launch.legal(ba_t, dataclasses.replace(swapped_t, splits=2), sm90)
         derived_t = t_launch.derived(ba_t, sm90)
         assert derived_t is None or derived_t.splits == 1, derived_t
-        e4_codes = np.broadcast_to(np.asarray([0x38, 0x00, 0x7F, 0xFF], np.uint32), (64, 16, 4))
-        e5_codes = np.broadcast_to(np.asarray([0x7C, 0xFC, 0x7D, 0xFF], np.uint32), (64, 16, 4))
-        special_words = {
-            "e4m3": np.asarray(bits.fp8_packed(jnp.asarray(e4_codes.reshape(64, 64)), bits.E4M3)),
-            "e5m2": np.asarray(bits.fp8_packed(jnp.asarray(e5_codes.reshape(64, 64)), bits.E5M2)),
-        }
-        for fmt, raw_words in special_words.items():
-            reg_out = packed.rows_decoded([StageRef(raw_words)], None, interpret=True, fmt=fmt)
-            stg_out = StageRef(np.zeros((64, 64), dtype=jnp.bfloat16))
-            packed.stage_decoded_words([StageRef(raw_words)], stg_out, packed.weight_format(fmt),
-                                       interpret=True)
-            reg_arr, stg_arr = np.asarray(reg_out), np.asarray(stg_out.arr)
-            np.testing.assert_array_equal(reg_arr.view(np.uint16), stg_arr.view(np.uint16))
-            f32 = reg_arr.astype(np.float32)
-            if fmt == "e4m3":
-                assert np.all(f32[:, 0:16] == 1.0) and np.all(f32[:, 16:32] == 0.0)
-                assert np.all(np.isnan(f32[:, 32:48])) and np.all(np.isnan(f32[:, 48:64]))
-            else:
-                assert np.all(np.isposinf(f32[:, 0:16])) and np.all(np.isneginf(f32[:, 16:32]))
-                assert np.all(np.isnan(f32[:, 32:48])) and np.all(np.isnan(f32[:, 48:64]))
         if generation.compile_only_gpus("sm90"):
             x_s = jax.ShapeDtypeStruct((13, 256), jnp.bfloat16)
-            e4_spec = jax.tree.map(lambda a: jax.ShapeDtypeStruct(np.shape(a), np.asarray(a).dtype),
-                                   formats.Fp8Weights.of(np.ones((256, 128), np.float32), fmt="e4m3"))
-            e5_spec = jax.tree.map(lambda a: jax.ShapeDtypeStruct(np.shape(a), np.asarray(a).dtype),
-                                   formats.Fp8Weights.of(np.ones((256, 128), np.float32), fmt="e5m2"))
             t_spec = jax.tree.map(lambda a: jax.ShapeDtypeStruct(np.shape(a), np.asarray(a).dtype), tern_w)
-
-            def c_fp8(a, w):
-                with generation.chosen(grouped_matmul="mosaic"), tuning.pinned(
-                        {grouped_matmul.MosaicFp8PackedGmm: swapped_fp8}):
-                    return gemm.fp8_weight_product(a, w, out_dtype=jnp.bfloat16)
 
             def c_tern(a, w):
                 with generation.chosen(grouped_matmul="mosaic"), tuning.pinned(
@@ -554,9 +476,7 @@ def test_swapped_register_decode_holds_for_fp8_and_ternary_at_skinny_rows():
                                                        out_dtype=jnp.bfloat16)
 
             records = compile_mosaic_kernels(
-                [KernelCase("swapped_fp8_e4m3_sm90", lambda: (c_fp8, (x_s, e4_spec))),
-                 KernelCase("swapped_fp8_e5m2_sm90", lambda: (c_fp8, (x_s, e5_spec))),
-                 KernelCase("swapped_ternary_sm90", lambda: (c_tern, (x_s, t_spec)))], "sm90")
+                [KernelCase("swapped_ternary_sm90", lambda: (c_tern, (x_s, t_spec)))], "sm90")
             for rec in records:
                 assert not rec.get("error"), rec
                 assert rec["kernels"], rec
@@ -605,51 +525,6 @@ def test_a_packed_products_rescue_keeps_a_subnormal_remainder():
     want = np.zeros((16, 256), np.float32)
     want[0, 0] = np.float32(2.0 ** -147)
     np.testing.assert_array_equal(np.asarray(d_rows).view(np.uint32), want.view(np.uint32))
-
-
-def test_an_fp8_products_rescue_leaves_an_infinite_coefficient_to_its_own_coordinate():
-    """An E5M2 bank with codes +1, -1 and +1 at input coordinate 0 and +inf at coordinate 1, a scale of 4,
-    under cotangents 2**126, 2**126 and 1: coordinate 0's gradient is 4 (the infinity leaves the exact
-    sums' grid alone) and coordinate 1's IEEE's, +inf, the product 4 * 2**126 times the infinity; every
-    other coordinate of the row is 0 (rows 1464, 12403)."""
-    matrix = jnp.zeros((64, 64), jnp.float32).at[0, :3].set(jnp.asarray([1.0, -1.0, 1.0]))
-    matrix = matrix.at[1, 0].set(jnp.inf)
-    # E5M2 codes as given (an encode would saturate the infinity to E5M2's largest).
-    codes = formats.Fp8Weights.of(matrix.astype(jnp.float8_e5m2), fmt="e5m2", scale=jnp.float32(1.0))
-    assert np.isposinf(np.asarray(codes.decoded(jnp.float32))[1, 0])
-    weights = dataclasses.replace(codes, scale=jnp.float32(4.0))
-    _, pull = jax.vjp(lambda x: gemm.fp8_weight_product(x, weights, out_dtype=jnp.float32),
-                      jnp.zeros((16, 64), jnp.float32))
-    (d_rows,) = pull(jnp.zeros((16, 64), jnp.float32).at[0, :3].set(
-        jnp.asarray([2.0 ** 126, 2.0 ** 126, 1.0], jnp.float32)))
-    row = np.array(d_rows[0])
-    assert row[0] == 4.0 and np.isposinf(row[1]), row[:2]
-    np.testing.assert_array_equal(row[2:], np.zeros_like(row[2:]))
-
-
-def test_an_fp8_products_rescue_sums_its_non_finite_products_as_ieee_does():
-    """E5M2 coefficients +inf and +1 at input coordinate 0, +inf and NaN at 1, +inf and -1 at 2, under
-    cotangents 1 and -inf at a unit scale: coordinate 0 sums +inf and -inf, NaN; coordinate 1 a NaN; and
-    coordinate 2 +inf twice, +inf. Every non-finite product of a coordinate is read together, so no later
-    one hides an earlier; a subnormal cotangent's sign is read from its bits (rows 1464, 12403)."""
-    matrix = jnp.zeros((64, 64), jnp.float32).at[:3, 0].set(jnp.inf)
-    matrix = matrix.at[0, 1].set(1.0).at[1, 1].set(jnp.nan).at[2, 1].set(-1.0)
-    weights = formats.Fp8Weights.of(matrix.astype(jnp.float8_e5m2), fmt="e5m2", scale=jnp.float32(1.0))
-    _, pull = jax.vjp(lambda x: gemm.fp8_weight_product(x, weights, out_dtype=jnp.float32),
-                      jnp.zeros((16, 64), jnp.float32))
-    (d_rows,) = pull(jnp.zeros((16, 64), jnp.float32).at[0, :2].set(jnp.asarray([1.0, -jnp.inf])))
-    row = np.array(d_rows[0])
-    assert np.isnan(row[0]) and np.isnan(row[1]) and np.isposinf(row[2]), row[:3]
-
-    # A subnormal cotangent, -2**-149, at a scale of 2**126 against +inf: -inf, its sign and its nonzero
-    # read from its bits where a process flushes it to zero (not zero times an infinity's NaN).
-    infinite = jnp.zeros((64, 64), jnp.float32).at[0, 0].set(jnp.inf).astype(jnp.float8_e5m2)
-    single = formats.Fp8Weights.of(infinite, fmt="e5m2", scale=jnp.float32(1.0))
-    single = dataclasses.replace(single, scale=jnp.float32(2.0 ** 126))
-    _, pull = jax.vjp(lambda x: gemm.fp8_weight_product(x, single, out_dtype=jnp.float32),
-                      jnp.zeros((16, 64), jnp.float32))
-    (d_rows,) = pull(jnp.zeros((16, 64), jnp.float32).at[0, 0].set(jnp.float32(-(2.0 ** -149))))
-    assert np.isneginf(np.asarray(d_rows)[0, 0]), np.asarray(d_rows)[0, 0]
 
 
 @pytest.mark.mesh(devices=2)
