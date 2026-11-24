@@ -12,6 +12,7 @@ from reference_error import FEWEST_SEEDS, assert_as_exact
 
 from dew.nn.kernels import diagonal_scan, generation
 from dew.nn.kernels.selection import KernelRefused
+from dew.nn.kernels.templates.recurrence import walks
 
 ROWS, CHANNELS = 2, 256
 
@@ -215,6 +216,18 @@ def test_a_cancelled_sum_keeps_a_least_normal_write_after_it():
                                             np.zeros((ROWS, 150), bool))
     np.testing.assert_array_equal(np.asarray(out[:, 2:]), 2.0 ** -126)
     np.testing.assert_array_equal(np.asarray(final), 2.0 ** -126)
+
+
+def test_a_running_sum_takes_a_documents_subnormal_first_write_unflushed():
+    """ReviewRecurrenceBatch's flush-to-zero catch: a document's first write of 2^-127 into a span's running
+    sum (`walks.summed_on`) is the sum exactly at scale zero, where passed on as itself times one it flushed
+    to zero under the CPU's flush-to-zero arithmetic (a summary of a document starting at a span's last
+    token)."""
+    zero = np.zeros(CHANNELS, np.float32)
+    value, scale = jax.jit(lambda term: walks.summed_on((zero, zero), zero + 1.0, term, zero == 0.0))(
+        np.full(CHANNELS, 2.0 ** -127, np.float32))
+    np.testing.assert_array_equal(np.asarray(value), 2.0 ** -127)
+    np.testing.assert_array_equal(np.asarray(scale), 0.0)
 
 
 def test_a_document_after_an_infinite_entering_state_reads_none_of_it():

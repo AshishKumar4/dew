@@ -199,23 +199,26 @@ def summed_on(carried, factor, term, first):
     the term joins it."""
     value, scale = _raised(*carried)
     decayed, scale = _raised(factor * value, scale)
-    lowered = term * _power(scale >= 1.0, -64) * _power(scale >= 2.0, -64)
+    lowered = jnp.where(scale >= 1.0, term * 2.0 ** -64 * _power(scale >= 2.0, -64), term)
     value = cut(first, decayed + lowered, term)
     scale = cut(first, scale, jnp.zeros_like(scale))
     large = jnp.abs(value) >= LARGE
-    return value * _power(large, -64), scale + _counted(large)
+    return jnp.where(large, value * 2.0 ** -64, value), scale + _counted(large)
 
 
 def _raised(value, scale):
     """`(value, scale)` raised back toward its range where it fell below one at a raised scale, 2^64 a step
-    (exact), at most twice: once below one at a scale of one or more, again below 2^-64 at two or more. Each
-    step a product with a power of two the comparisons select, the value read by them and the product alone:
-    selecting between the value and its raised copy, two at each of a token's two running sums, XLA's CPU
-    compile of a bf16 diagonal scan's three-span forward ran past 400 s where once took 2 (jsf-hang7)."""
+    (exact), at most twice: once below one at a scale of one or more, again below 2^-64 at two or more. One
+    select between the value and its raised copy, the second step a product with the power of two the
+    comparison selects: two selects chained a step, at each of a token's two running sums, XLA's CPU compile
+    of a bf16 diagonal scan's three-span forward ran past 400 s where one took 2 (jsf-hang7). The value
+    unraised is passed as it is, never times one, which flushes a subnormal where the arithmetic flushes to
+    zero (XLA's CPU interpreter: ReviewRecurrenceBatch)."""
     magnitude = jnp.abs(value)
     once = (scale >= 1.0) & (magnitude < 1.0)
     twice = once & (scale >= 2.0) & (magnitude < 2.0 ** -64)
-    return value * _power(once, 64) * _power(twice, 64), scale - _counted(once) - _counted(twice)
+    raised = jnp.where(once, value * 2.0 ** 64 * _power(twice, 64), value)
+    return raised, scale - _counted(once) - _counted(twice)
 
 
 def _power(selected, exponent: int):
