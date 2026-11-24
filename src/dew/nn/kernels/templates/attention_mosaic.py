@@ -2041,8 +2041,11 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
     def _cheaper(self, ba: tokamax.BoundArguments, candidates: list[BackwardTiles],
                  target: generation.GpuTarget) -> BackwardTiles:
         """The one launch or the two `candidates` hold whose launches the cost model prices least
-        (`price_config`), stored beside the verdicts so a warm start traces nothing to price (`_choice_key`,
-        `tuning.stored_choice`); the first where one alone is legal or the target holds no rates."""
+        (`price_config`), a candidate whose work the target prices no rate of (`cost.units`' unpriced: a
+        GPU stating no `global_reduction_bytes_per_clock` beside the fused launch's dQ adds) never the cheaper
+        beside one it prices whole, as `dew.algebra.cost.cheaper` reads it; stored beside the verdicts so a
+        warm start traces nothing to price (`_choice_key`, `tuning.stored_choice`); the first where one alone
+        is legal or the target holds no rates."""
         if len(candidates) <= 1 or not target.multiprocessors or not cost.rates(target, device=False).tensor:
             return candidates[0]
         key = _choice_key(self, ba, tuple(candidates), target)
@@ -2054,15 +2057,17 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         prices = [self.price_config(ba, config, target) for config in candidates]
         if any(price is None for price in prices):
             return candidates[0]
+        # A price is (unpriced, seconds): a candidate priced whole before any that is not, then the faster.
         best = min(zip(prices, range(len(candidates)), candidates, strict=True))[2]
         if key is not None:
             tuning.store_choice(target.generation, key, (int(best.fused),))
         return best
 
     def price_config(self, ba: tokamax.BoundArguments, config: BackwardTiles, target: generation.GpuTarget
-                     ) -> float | None:
+                     ) -> tuple[bool, float] | None:
         """Price `config`'s launches on `target`, the fused one's or the two's summed (`cost.launch_seconds`
-        over `emission.work_of`, each at `config`'s residency), traced under `report.launching`."""
+        over `emission.work_of`, each at `config`'s residency), traced under `report.launching`: whether any
+        of their work lies at a rate the target states none of (`cost.units`' unpriced), and the seconds."""
         names = ("query", "key", "value", "dout", "start", "end", "query_ids", "key_ids", "score_params",
                  "initial", "residuals", "drop")
         operands = tuple(tuning.shapes(ba.arguments[name]) for name in names)
@@ -2079,13 +2084,15 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         if not kernels:
             return None
         resident = self.resident(ba, config, target)
-        total = 0.0
+        rates = cost.rates(target, device=False)
+        total, unpriced = 0.0, False
         for kernel in kernels:
             work = emission.work_of(kernel)
             if work is None:
                 return None
             total += cost.launch_seconds(work, emission.launch_programs(kernel), target, resident=resident)
-        return total
+            unpriced = unpriced or any(cost.units(work, rates)[1])
+        return unpriced, total
 
     def _deepened(self, ba: tokamax.BoundArguments, config: BackwardTiles,
                   target: generation.GpuTarget) -> BackwardTiles:
