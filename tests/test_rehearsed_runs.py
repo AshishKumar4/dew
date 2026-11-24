@@ -16,15 +16,14 @@ from dew.training.runtime import prepare_process
 prepare_process(multi_host=False, compilation_cache_dir=sys.argv[2])
 from dew.telemetry.instrumentation import compilation_cache_counts, count_compilation_cache
 from dew.optim import AdamW, Cosine, OptimConfig
-from dew.training import Horizon
 from run_kinds import lm
 count_compilation_cache()
 root, steps = Path(sys.argv[1]), int(sys.argv[3])
 run = lm(root, drawn=False)
-trainer = dataclasses.replace(run.trainer, checkpoint_dir=str(root / "runs"), horizon=Horizon(steps=steps),
+trainer = dataclasses.replace(run.trainer, checkpoint_dir=str(root / "runs"), steps=steps,
                               log_every=1, eval_every=None, checkpoint_every=None, checkpoint_final=False,
                               compilation_cache_dir=sys.argv[2], multi_host=False)
-optim = OptimConfig(optimizer=AdamW(), learning_rate=Cosine(peak_value=1e-3, warmup_steps="10%"))
+optim = OptimConfig(optimizer=AdamW(), schedule=Cosine(peak_value=1e-3, warmup_steps="10%"))
 dataclasses.replace(run, trainer=trainer, optim=optim).prepare().train("run")
 print(json.dumps(compilation_cache_counts()))
 '''

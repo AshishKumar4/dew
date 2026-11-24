@@ -15,6 +15,7 @@ from multiprocess_worker import BATCH, dump_params
 from process_support import serve_mode, worker_parser
 
 from dew.optim import Optax
+from dew.training import TrainerAdvanced
 
 RECORDS = 10
 """The records each run reads, ids 1 to RECORDS, which its bound reaches past in a second pass."""
@@ -102,11 +103,11 @@ def examples_clock(args) -> dict:
     chain = Pipeline(source).shuffle(**shuffled).read(read).batch(BATCH)
     held = Pipeline(Memory({"id": ids[:BATCH]})).read("memory").batch(BATCH)
     tracker = Logged()
-    optim = OptimConfig(optimizer=Optax('optax:sgd'), learning_rate=Linear(peak_value=1e-2, end_value=0.0))
+    optim = OptimConfig(optimizer=Optax('optax:sgd'), schedule=Linear(peak_value=1e-2, end_value=0.0))
     checkpoints = Checkpoints(str(args.out.parent / "run")) if args.pause else None
     trainer = Trainer(Pulled(), optim, key=jax.random.key(0), mesh=MeshSpec(tensor=args.tensor),
                       tracker=tracker, checkpoints=checkpoints,
-                      rollout=DrawingFurther() if args.further else None)
+                      advanced=TrainerAdvanced(rollout=DrawingFurther() if args.further else None))
     # The examples each share's stream deals it and the batches it reads, read as the run's loader reads
     # them, apart from the run.
     loader, _ = fitted(chain, None, objective=Pulled().data(), examples=args.examples)
@@ -191,7 +192,7 @@ def counted_passes(args) -> dict:
     loader, _ = fitted(chain, None, objective=Pulled().data(), steps=args.steps, count_passes=True)
     tracker = Logged()
     checkpoints = Checkpoints(str(args.out.parent / "run"))
-    optim = OptimConfig(optimizer=Optax('optax:sgd'), learning_rate=1e-2)
+    optim = OptimConfig(optimizer=Optax('optax:sgd'), lr=1e-2)
     trainer = Trainer(Pulled(), optim, key=jax.random.key(0), tracker=tracker, checkpoints=checkpoints)
     lag = args.lag if jax.process_index() == args.lag_rank else 1
     every = Counted(loader.pass_examples, "examples")

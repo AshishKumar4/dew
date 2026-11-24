@@ -22,6 +22,7 @@ one; the byte accounting of an offload is a GPU measurement, taken with
 tools/benchmark_host_offload.py.
 """
 
+import dataclasses
 from pathlib import Path
 
 import jax
@@ -44,18 +45,19 @@ from dew.nn.kv_cache import row_axis
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.sampling.text import Sampling, generate
-from dew.training import Checkpoints, Layout, Trainer, UpdateBatch
+from dew.training import Checkpoints, Layout, Trainer, TrainerAdvanced
 
 DEVICE = Layout(min_shard=1, tolerance=1.0)
 HOST = Layout(min_shard=1, tolerance=1.0, host=("opt_state", "ema"))
 BANKS = Layout(min_shard=1, tolerance=1.0, host_parameters=("params/layers_*",))
 
 
-def fit(layout, directory, steps, optimizer=None, **options):
+def fit(layout, directory, steps, optimizer=None, advanced=None, **options):
     checkpoints = Checkpoints(str(directory), keep=3)
     # A validation pass needs a consumer, so the objective that scores
     # features stands in for the plain regression and a metric reads them.
-    trainer = Trainer(Features(), optimizer or optax.adam(0.1), key=jax.random.key(0), layout=layout,
+    trainer = Trainer(Features(), optimizer or optax.adam(0.1), key=jax.random.key(0),
+                      advanced=dataclasses.replace(advanced or TrainerAdvanced(), layout=layout),
                       checkpoints=checkpoints, **options)
     data = Loader(
         train=lambda partition: Counting(), val=lambda partition: val_batches()(), records=None, batch=BATCH
@@ -66,7 +68,7 @@ def fit(layout, directory, steps, optimizer=None, **options):
     return state
 
 
-def trained(layout, seed, steps, optimizer=None, **options):
+def trained(layout, seed, steps, optimizer=None, advanced=None, **options):
     """`steps` updates of the affine model from the start `seed` draws, without evaluation or checkpoints:
     a check-1 arm's run (`layouts_agree`), in float64 where the process runs in it."""
     wide = x64()
@@ -78,7 +80,9 @@ def trained(layout, seed, steps, optimizer=None, **options):
         return (jax.tree.map(held, batch) for batch in Counting())
 
     trainer = Trainer(Features(), optimizer or optax.adam(0.1), key=jax.random.key(int(seed)),
-                      layout=layout, param_dtype="float64" if wide else None, **options)
+                      advanced=dataclasses.replace(advanced or TrainerAdvanced(), layout=layout,
+                                                   param_dtype="float64" if wide else None),
+                      **options)
     return trainer.fit(Loader(train=stream, val=None, records=None, batch=BATCH), steps=steps,
                        log_every=steps)
 
@@ -109,7 +113,7 @@ def test_host_resident_state_trains_the_same_model_over_a_scaled_window(tmp_path
     once, which its commit then stages as one chunk (`dew.training.staging`), and a clipped Adam's run
     trains the model, moments and average the device-resident run trains, by check 1 over drawn starts."""
     options = {"optimizer": optax.chain(optax.clip_by_global_norm(1.0), optax.adam(0.1)),
-               "update": UpdateBatch(batches=2), "dynamic_scale": True}
+               "accumulation": 2, "advanced": TrainerAdvanced(dynamic_scale=True)}
     layouts_agree(lambda layout, seed: trained(layout, seed, 4, **options), lambda seed: (np.int32(seed),),
                   "a scaled window of two microbatches with the state in host memory", HOST, DEVICE)
     on_host = fit(HOST, tmp_path / "host", 4, **options)
@@ -348,7 +352,7 @@ def test_a_checkpoint_restores_bank_by_bank_into_host_memory(tmp_path):
     directory = str(tmp_path / "run")
     checkpoints = Checkpoints(directory, keep=1)
     trainer = Trainer(LMObjective(plain, SHAPE["max_seq_len"] - 1, head_chunks=1),
-                      optax.sgd(0.1), key=jax.random.PRNGKey(0), layout=DEVICE,
+                      optax.sgd(0.1), key=jax.random.PRNGKey(0), advanced=TrainerAdvanced(layout=DEVICE),
                       checkpoints=checkpoints)
     batch = {"text": jnp.tile(
         jnp.arange(1, SHAPE["max_seq_len"] + 1, dtype=jnp.int32)[None],

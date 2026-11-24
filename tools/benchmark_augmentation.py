@@ -89,8 +89,8 @@ def trained(policy: str, seed: int, steps: int) -> tuple[float, float]:
     data = compile_data(train, read="memory", provision=True, seed=seed,
                         loading=Loading(workers=0, threads=16, read_buffer=64))
     model = Classifier()
-    optimizer = OptimConfig(learning_rate=Cosine(peak_value=2e-3, warmup_steps=steps // 20, end_value=2e-5),
-                            optimizer=AdamW(weight_decay=0.05), clip_grads=1.0)
+    optimizer = OptimConfig(schedule=Cosine(peak_value=2e-3, warmup_steps=steps // 20, end_value=2e-5),
+                            optimizer=AdamW(weight_decay=0.05), clip=1.0)
     trainer = Trainer(Supervised(model, CrossEntropy(), (Accuracy(),), inputs="image"), optimizer, key=seed)
     start = time.perf_counter()
     state = trainer.fit(data, steps=steps, log_every=max(1, steps // 10))

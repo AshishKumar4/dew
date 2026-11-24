@@ -112,7 +112,7 @@ from dew.objectives.rl.sessions import (
 from dew.objectives.supervised import Accuracy, CrossEntropy, Supervised
 from dew.registry import models, objectives
 from dew.sampling import Euler, Sampling
-from dew.training import Trainer
+from dew.training import Trainer, TrainerAdvanced
 
 # CI runs this file in tasks of its own: torchax renames torch's privateuse1 backend process-wide.
 pytestmark = pytest.mark.torchax
@@ -501,7 +501,7 @@ def assert_trains(objective, batch: Mapping, directory: Path, *, evaluated: Mapp
     tracker = RecordingTracker()
     checkpoints = Checkpoints(str(directory))
     trainer = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints, tracker=tracker,
-                      rollout=rollout)
+                      advanced=TrainerAdvanced(rollout=rollout))
     if data is None:
         data = Loader(replayed(lambda partition: itertools.repeat(batch)), None, batch=ROWS, records=None)
     # A fresh fit, its own batch-aware startup the one a run that never stopped takes.
@@ -539,7 +539,7 @@ def assert_resumes(objective, data, directory: Path, rollout, whole: Trainer, un
     shutil.copytree(directory, copied)
     shutil.rmtree(Checkpoints(str(copied)).path(2))
     resumed = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=Checkpoints(str(copied)),
-                      rollout=rollout)
+                      advanced=TrainerAdvanced(rollout=rollout))
     after = resumed.fit(data, steps=2, log_every=1, checkpoint_final=False)
     assert int(after.step) == int(uninterrupted.step) == 2
 

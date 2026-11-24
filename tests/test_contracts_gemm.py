@@ -944,7 +944,7 @@ def test_a_symmetric_gram_and_polynomial_hold_every_reverse_order(edge):
     from dew.nn.sharding import automatic_axes
 
     def native_gram_bf(operand):
-        choose = contextlib.nullcontext() if automatic_axes() else generation.chosen(grouped_matmul="mosaic")
+        choose = contextlib.nullcontext() if automatic_axes() else generation.chosen(syrk="mosaic")
         with generation.assumed("sm90"), choose:
             return gemm.symmetric_gram(operand.astype(jnp.bfloat16), out_dtype=jnp.bfloat16,
                                        interpret_on_cpu=True)
@@ -958,7 +958,7 @@ def test_a_symmetric_gram_and_polynomial_hold_every_reverse_order(edge):
                     truth_fn=plain_gram, plain_fn=plain_gram_bf, without=FORWARD_ORDERS)
 
     def native_poly_bf(operand, poly):
-        choose = contextlib.nullcontext() if automatic_axes() else generation.chosen(grouped_matmul="mosaic")
+        choose = contextlib.nullcontext() if automatic_axes() else generation.chosen(syrk="mosaic")
         with generation.assumed("sm90"), choose:
             return gemm.symmetric_polynomial(operand.astype(jnp.bfloat16), poly, out_dtype=jnp.bfloat16,
                                              interpret_on_cpu=True)

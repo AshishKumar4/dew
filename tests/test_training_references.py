@@ -24,7 +24,7 @@ from test_host_training import HOST, Coupled, centered
 
 from dew.checkpoints import Checkpoints, Keep, Ranking
 from dew.objectives.base import Aux, Objective, Ratio
-from dew.training import Trainer, UpdateBatch
+from dew.training import Trainer, TrainerAdvanced
 
 ROWS = 2 * jax.device_count()
 
@@ -69,7 +69,8 @@ def test_the_loss_scale_follows_flaxs_dynamic_scale_through_finite_and_rejected_
     double after every `growth_interval` finite steps in a row, and agree on
     the scale and the streak after every step."""
     pattern = [False, False, False, True, False, False, False, False, True, True, False, False, False]
-    trainer = Trainer(Flagged(), optax.sgd(0.01), key=jax.random.key(0), dynamic_scale=True)
+    trainer = Trainer(Flagged(), optax.sgd(0.01), key=jax.random.key(0),
+                      advanced=TrainerAdvanced(dynamic_scale=True))
     state = trainer.initial_state()
     state = dataclasses.replace(state, scale=dataclasses.replace(state.scale, growth_interval=2))
     reference = DynamicScale(growth_interval=2)
@@ -105,7 +106,7 @@ def microbatches(masks):
 
 
 def windowed(batches, tx, accumulation):
-    trainer = Trainer(Linear(), tx, key=jax.random.key(0), update=UpdateBatch(batches=accumulation))
+    trainer = Trainer(Linear(), tx, key=jax.random.key(0), accumulation=accumulation)
     state = trainer.initial_state()
     run = trainer.compile(state, batches[0])
     for batch in batches:
@@ -192,7 +193,7 @@ def test_weights_held_on_the_host_take_optaxs_own_updates(optimizer):
     the gradient leaves the device and the update comes back whole, a global
     clip, a mean across leaves and a partitioned state included."""
     data = {"small": jnp.asarray(.5), "large": jnp.asarray(40.)}
-    trainer = Trainer(Coupled(), optimizer, key=jax.random.key(4), layout=HOST)
+    trainer = Trainer(Coupled(), optimizer, key=jax.random.key(4), advanced=TrainerAdvanced(layout=HOST))
     state, _, _ = trainer.place()
     step = trainer.compile(state, data)
     for _ in range(3):

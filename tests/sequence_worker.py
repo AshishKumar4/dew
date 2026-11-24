@@ -11,6 +11,8 @@ import numpy as np
 from multiprocess_worker import BATCH, MIXED_RATE, TINY, VOCAB, mixed_validity_step
 from process_support import serve_mode, worker_parser
 
+from dew.training import TrainerAdvanced
+
 
 def mode_sequence_hybrid(args) -> dict:
     """One training step of a small hybrid decoder, Mamba-2 and attention layers, split two ways over
@@ -36,7 +38,8 @@ def mode_sequence_hybrid(args) -> dict:
                          num_kv_heads=2, mlp_features=64, max_seq_len=length,
                          layer_types=("mamba", "attention") * 2, kinds={"mamba": mamba, "attention": {}})
     trainer = Trainer(LMObjective(model, length), optax.sgd(MIXED_RATE), key=jax.random.key(0),
-                      mesh=MeshSpec(fsdp=args.fsdp_size, sequence=2), layout=Layout(min_shard=TINY),
+                      mesh=MeshSpec(fsdp=args.fsdp_size, sequence=2),
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=TINY)),
                       checkpoints=None, tracker=None)
     tokens = np.random.default_rng(0).integers(0, VOCAB, size=(BATCH, length + 1)).astype(np.int32)
     share = DataPartition.of(trainer.device_mesh)

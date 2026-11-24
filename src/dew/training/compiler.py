@@ -43,7 +43,15 @@ from dew.objectives.base import Objective, head_tile_of
 from dew.state import Accumulation, TrainState, apart, occupied, together
 from dew.telemetry.compiles import Compiles, Ledger, Program, Span, owning
 from dew.telemetry.instrumentation import StepFlops, compiled_memory
-from dew.training._candidates import RunShape, Stepping, _shaped, candidate_for, forget, lowered_for
+from dew.training._candidates import (
+    RunShape,
+    Stepping,
+    _shaped,
+    candidate_for,
+    forget,
+    forget_program,
+    lowered_for,
+)
 from dew.training._lowering import Lowered, routed
 from dew.training.distributed import (
     link_figure,
@@ -55,6 +63,7 @@ from dew.training.distributed import (
 from dew.training.memory import (
     ceiling_headroom,
     climb_to,
+    code_bytes,
     layer_gathers,
     local_devices,
     memory_record,
@@ -71,6 +80,7 @@ from dew.training.phase_passes import PhasePasses, SampledPasses
 from dew.training.planning import (
     Candidate,
     FitSearch,
+    HeldExecutables,
     Planned,
     PlanRefused,
     Probe,
@@ -473,7 +483,7 @@ class HostRun:
         """Each program its steady steps call (`settled`), a sampled step's beside an unsampled one's where
         the run inspects, lowered over `held`'s and `batch`'s shapes for `platforms` where it runs on the
         accelerator and for the CPU where on its companion (`options.lowering`), none compiled: the step
-        `Trainer(lower_for=)` lowers for a target this host is not."""
+        `TrainerAdvanced(lower_for=)` lowers for a target this host is not."""
         programs: list[tuple[str, jax.stages.Lowered]] = []
         for sampled in self.bodies:
             last: list[tuple[str, jax.stages.Lowered]] = []
@@ -673,7 +683,7 @@ class StepCompiler[L, E]:
 
     def __init__(self, objective: Objective[L, E], links: Mapping[str, Link] | None,
                  ahead: AheadOfTime | None, phase_passes: PhasePasses[L, E], remat: Remat = "auto",
-                 executables: dict[Hashable, jax.stages.Compiled] | None = None):
+                 executables: HeldExecutables | None = None):
         self.objective = objective
         # What the step may recompute (`FitPolicy.remat`), which each search climbs its ladder within; a
         # later phase's planner takes the objective as a climb left it (`dew.training.ahead`).
@@ -694,9 +704,11 @@ class StepCompiler[L, E]:
         self._base_rung = None
         self._resumed_links: dict[str, float | None] = {}
         # The executables its searches hold for each other and its refits (`FitSearch.executables`), by the
-        # program, its options and its devices, held for the run alone: `executables`, its run's compiler's,
-        # where it plans a later phase off the loop (`dew.training.ahead.LaterPlans`).
-        self._executables: dict[Hashable, jax.stages.Compiled] = {} if executables is None else executables
+        # program, its options and its devices, held for the run alone and bounded by their code's bytes
+        # (`HeldExecutables`): `executables`, its run's compiler's, where it plans a later phase off the loop
+        # (`dew.training.ahead.LaterPlans`).
+        held = HeldExecutables(released=lambda key: forget_program(key.program))
+        self._executables = held if executables is None else executables
         # A fresh run's first step planned over its state's shapes before the state is placed
         # (`planned_unplaced`), by the signature of the batch it was planned over: its first compile's.
         self._unplaced: Unplaced | None = None
@@ -1470,7 +1482,7 @@ class StepCompiler[L, E]:
             # The guided executable in the unguided one's place, as JAX's jit keeps its program's under
             # AutoPGLE: the one the run steps, the unguided one freed with the search and the step kept
             # for a refit. An empty profile replaces nothing, and every kept lowering stays.
-            self._executables[asked] = planned.executable
+            self._executables.hold(asked, planned.executable, code_bytes(planned.executable))
             forget(unguided)
         return planned
 

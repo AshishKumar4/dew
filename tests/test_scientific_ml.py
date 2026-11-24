@@ -9,7 +9,6 @@ A float64 run keeps float64 through its parameters, optimizer state, loss and ch
 """
 
 import dataclasses
-import json
 
 import jax
 import jax.numpy as jnp
@@ -25,8 +24,7 @@ from dew.nn.fourier import FourierPyramid, interpolated
 from dew.objectives.base import Step
 from dew.objectives.residuals import Residuals
 from dew.optim import GaussNewton
-from dew.training import Checkpoints, Layout, Trainer, UpdateBatch
-from dew.training.budget import Horizon
+from dew.training import Checkpoints, Layout, Trainer, TrainerAdvanced
 
 LAYOUT = Layout(min_shard=1, tolerance=1.0)
 
@@ -229,7 +227,7 @@ def gauss_newton_arm(rows: int, features: int, accumulation: int, optimizer=None
     weights, of a draw's `rows` rows read in `accumulation` microbatches of an accumulation window: its
     weights after it, its bias last where it has one."""
     trainer = Trainer(LeastSquares(features, bias=bias), optimizer or gauss_newton(damping=1e-3), key=0,
-                      layout=LAYOUT, update=UpdateBatch(batches=accumulation))
+                      advanced=TrainerAdvanced(layout=LAYOUT), accumulation=accumulation)
     template = jax.tree.map(jnp.copy, trainer.initial_state())
     compiled = []
 
@@ -263,7 +261,7 @@ def test_a_grouped_gauss_newton_run_scales_each_groups_leaves_of_one_solve():
     solve (check 1)."""
     from dew.optim import OptimConfig, ParamGroup
 
-    config = OptimConfig(optimizer=GaussNewton(damping=1e-3), learning_rate=0.5,
+    config = OptimConfig(optimizer=GaussNewton(damping=1e-3), lr=0.5,
                          param_groups=(ParamGroup("kernels", ("*kernel",)),
                                        ParamGroup("rest", ("*",), learning_rate_multiplier=0.5)))
     rows, features = 64, 8
@@ -294,12 +292,11 @@ def test_a_run_that_names_gauss_newton_and_sets_no_rate_takes_its_whole_damped_s
     from dew.data.pipeline import Pipeline
     from dew.gauss_newton import solves_equations
 
-    flags = ["--optim.optimizer", json.dumps({"class": "gauss_newton", "fields": {"damping": 1e-3}}),
-             "--optim.clip-grads", str(clip)]
-    trainer = TrainerConfig(horizon=Horizon(steps=1), checkpoint_final=False, checkpoint_dir=str(tmp_path),
+    flags = ["optim.optimizer:gauss-newton", "--optim.optimizer.damping", "1e-3", "--optim.clip", str(clip)]
+    trainer = TrainerConfig(steps=1, checkpoint_final=False, checkpoint_dir=str(tmp_path),
                             eval_every=None, checkpoint_every=None)
     config = dataclasses.replace(RunConfig.cli(flags), trainer=trainer)
-    assert config.optim.learning_rate == 1.0
+    assert config.optim.lr == 1.0
     rows, features = 64, 8
     draw = least_squares_draw(rows, features, 0x6E)
 
@@ -327,7 +324,7 @@ def test_a_gauss_newton_cap_its_options_state_holds_in_param_groups_as_without(g
     from dew.optim import OptimConfig, ParamGroup
 
     grouped = (ParamGroup("all", ("*",)),) if groups else ()
-    config = OptimConfig(optimizer=GaussNewton(clip=0.05), learning_rate=1.0, param_groups=grouped)
+    config = OptimConfig(optimizer=GaussNewton(clip=0.05), lr=1.0, param_groups=grouped)
     solver = config.build(1)
     params = {"w": jnp.zeros((1,), jnp.float32)}
     system = NormalEquations(total=jnp.zeros(()), mass=jnp.ones(()), rows=jnp.asarray(1),
@@ -344,7 +341,7 @@ def test_a_gauss_newton_capped_by_its_own_setting_and_the_configs_both_is_refuse
     from dew.optim import OptimConfig
 
     with pytest.raises(ValueError):
-        OptimConfig(optimizer=GaussNewton(clip=0.05), learning_rate=1.0, clip_grads=1.0)
+        OptimConfig(optimizer=GaussNewton(clip=0.05), lr=1.0, clip=1.0)
 
 
 def test_a_capped_gauss_newton_direction_keeps_a_cap_far_below_its_norm():
@@ -374,7 +371,7 @@ def test_a_configured_gauss_newton_states_its_optimizer_as_the_runs_saved_before
 
     params = LeastSquares(8, bias=True).init(jax.random.key(0))["params"]
     grouped = (ParamGroup("kernels", ("*kernel",)), ParamGroup("rest", ("*",))) if groups else ()
-    config = OptimConfig(optimizer=GaussNewton(damping=1e-3), clip_grads=clip, param_groups=grouped)
+    config = OptimConfig(optimizer=GaussNewton(damping=1e-3), clip=clip, param_groups=grouped)
     if groups:
         solvers = {group.name: group.solver(_rate_only, 1.0, 1, {}) for group in grouped}
         earlier = optax.chain(solved_directions(1e-3), optax.multi_transform(solvers, param_labels(grouped)))
@@ -386,14 +383,14 @@ def test_a_configured_gauss_newton_states_its_optimizer_as_the_runs_saved_before
 
 
 def test_a_run_configured_for_gauss_newton_steps_its_rate_times_the_damped_solve():
-    """A run whose optimizer the command line names (`--optim.optimizer` Gauss-Newton's record, its rate 0.5
+    """A run whose optimizer the command line names (`optim.optimizer:gauss-newton`, its rate 0.5
     and its damping 1e-3), built as `OptimConfig` builds every optimizer
     (`scheduled_solver`), takes half the damped Gauss-Newton step of its batch: on par with half the float64
     solve's step (check 1)."""
     from dew.config import RunConfig
 
-    record = {"class": "gauss_newton", "fields": {"damping": 1e-3}}
-    config = RunConfig.cli(["--optim.optimizer", json.dumps(record), "--optim.learning-rate", "0.5"])
+    config = RunConfig.cli(["optim.optimizer:gauss-newton", "--optim.optimizer.damping", "1e-3", "--optim.lr",
+                            "0.5"])
     rows, features = 64, 8
     draw = least_squares_draw(rows, features, 0x6C)
     exact = as_given(lambda x, y: -0.5 * solved(x.astype(np.float64), y.astype(np.float64), 1e-3))
@@ -440,8 +437,10 @@ def test_a_float64_gauss_newton_run_keeps_float64_through_its_state_and_checkpoi
         objective = LeastSquares(4, param_dtype=jnp.float64)
         checkpoints = Checkpoints(str(tmp_path / "run"))
         solver = gauss_newton(damping=1e-12)
-        Trainer(objective, solver, key=0, layout=LAYOUT, checkpoints=checkpoints).fit(rows, steps=1)
-        state = Trainer(objective, solver, key=0, layout=LAYOUT, checkpoints=checkpoints).fit(rows, steps=3)
+        Trainer(objective, solver, key=0, advanced=TrainerAdvanced(layout=LAYOUT),
+                checkpoints=checkpoints).fit(rows, steps=1)
+        state = Trainer(objective, solver, key=0, advanced=TrainerAdvanced(layout=LAYOUT),
+                        checkpoints=checkpoints).fit(rows, steps=3)
         floats = [leaf for leaf in jax.tree.leaves((state.variables, state.opt_state))
                   if jnp.issubdtype(leaf.dtype, jnp.floating)]
         assert floats and all(leaf.dtype == jnp.float64 for leaf in floats)
@@ -467,8 +466,9 @@ def test_a_gauss_newton_window_the_stream_ends_inside_commits_a_solve_of_the_row
 
     def trained(count: int) -> np.ndarray:
         rows = Memory([{"x": row, "y": target} for row, target in zip(x[:count], y[:count], strict=True)])
-        trainer = Trainer(LeastSquares(features), gauss_newton(damping=1e-6), key=0, layout=LAYOUT,
-                          update=UpdateBatch(batches=4))
+        trainer = Trainer(LeastSquares(features), gauss_newton(damping=1e-6), key=0,
+                          advanced=TrainerAdvanced(layout=LAYOUT),
+                          accumulation=4)
         # A run of its `count` examples, streamed: its stream ends inside the second window, holding a fifth.
         state = trainer.fit(rows.read("streamed").batch(8), examples=count)
         assert int(state.updates) == -(-count // 32)
@@ -480,15 +480,16 @@ def test_a_gauss_newton_window_the_stream_ends_inside_commits_a_solve_of_the_row
 def test_a_gauss_newton_update_held_by_a_wrapper_that_drops_its_statistics_is_refused():
     """A Gauss-Newton update inside `optax.MultiSteps`, which hands its inner update no extra arguments and
     pools no system across the steps it holds, is refused as its step is traced, naming the accumulation
-    that pools the update's system (`Trainer(update=UpdateBatch(batches=k))`), never stepped by a system it
+    that pools the update's system (`Trainer(accumulation=k)`), never stepped by a system it
     lacks."""
     held = optax.MultiSteps(gauss_newton(damping=1e-3), every_k_schedule=2).gradient_transformation()
-    trainer = Trainer(LeastSquares(4), held, key=0, layout=LAYOUT)
+    trainer = Trainer(LeastSquares(4), held, key=0, advanced=TrainerAdvanced(layout=LAYOUT))
     batch = {"x": np.ones((8, 4), np.float32), "y": np.ones(8, np.float32)}
     with pytest.raises(ValueError):
         trainer.compile(trainer.initial_state(), batch)
     # Unwrapped, the same update compiles: the refusal is the wrapper's dropped statistics.
-    trainer = Trainer(LeastSquares(4), gauss_newton(damping=1e-3), key=0, layout=LAYOUT)
+    trainer = Trainer(LeastSquares(4), gauss_newton(damping=1e-3), key=0,
+                      advanced=TrainerAdvanced(layout=LAYOUT))
     trainer.compile(trainer.initial_state(), batch)
 
 
@@ -499,7 +500,8 @@ def test_an_undamped_gauss_newton_step_over_a_singular_system_stops_the_run():
     step's loss, read from the weights it moved, is not, so the run stops at it."""
     from dew.data.dataset import Loader
 
-    trainer = Trainer(LeastSquares(4), gauss_newton(damping=0.0), key=0, layout=LAYOUT)
+    trainer = Trainer(LeastSquares(4), gauss_newton(damping=0.0), key=0,
+                      advanced=TrainerAdvanced(layout=LAYOUT))
     x = np.random.default_rng(0).normal(size=(16, 4)).astype(np.float32)
     x[:, 0] = 0.0
     with pytest.raises(RuntimeError):

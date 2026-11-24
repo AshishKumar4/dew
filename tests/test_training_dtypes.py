@@ -10,7 +10,7 @@ from flax import linen as nn, struct
 from dew.checkpoints import Checkpoints
 from dew.nn.blocks import TokenEmbedding
 from dew.objectives import Aux, EMASpec, Objective, Ratio
-from dew.training import Trainer, UpdateBatch
+from dew.training import Trainer, TrainerAdvanced
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
@@ -231,8 +231,8 @@ def exercise_updates_and_resume(
     optimizer = optax.adam(.01)
     checkpoints = Checkpoints(str(tmp_path / "run"))
     def trainer():
-        return Trainer(objective, optimizer, key=jax.random.PRNGKey(17), update=UpdateBatch(batches=k),
-                       dynamic_scale=dynamic_scale, checkpoints=checkpoints)
+        return Trainer(objective, optimizer, key=jax.random.PRNGKey(17), accumulation=k,
+                       advanced=TrainerAdvanced(dynamic_scale=dynamic_scale), checkpoints=checkpoints)
     train = trainer()
     state, _, _ = train.place()
     expected_params, expected_opt, expected_ema = state.variables["params"], state.opt_state, state.ema
@@ -364,7 +364,7 @@ def test_optimizer_dtype_overflow_backs_off_and_drops_its_window():
             return left + right, active_left | active_right
 
     trainer = Trainer(Cancellation(), optax.sgd(.01), key=jax.random.PRNGKey(2),
-                      update=UpdateBatch(batches=2), dynamic_scale=True)
+                      accumulation=2, advanced=TrainerAdvanced(dynamic_scale=True))
     initial = trainer.initial_state()
     initial = dataclasses.replace(initial, scale=dataclasses.replace(initial.scale, scale=jnp.array(1.)))
     batch = {"first": jnp.ones((), dtype=bool)}
@@ -443,7 +443,7 @@ def test_x64_router_bias_storage_survives_updates_and_restart(tmp_path, bias_dty
         checkpoints = Checkpoints(str(tmp_path / "router"))
         def build():
             return Trainer(objective, optax.sgd(.01), key=jax.random.PRNGKey(2),
-                           update=UpdateBatch(batches=2), checkpoints=checkpoints)
+                           accumulation=2, checkpoints=checkpoints)
         trainer = build()
         state, _, _ = trainer.place()
         batch = {"text": jnp.ones((jax.device_count(), 5), jnp.int32)}

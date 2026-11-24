@@ -23,6 +23,7 @@ from dew.nn.protocols import (
     Generating,
     HookedDecoder,
     OutputTable,
+    RecomputeStatement,
     ReplacesTokens,
     VocabularyRows,
     block_chunks_of,
@@ -198,6 +199,11 @@ class DecoderWrapper(DecoderHooks):
     @nn.nowrap
     def restore_recompute(self, record: JSON) -> Self:
         return self._over(self._decoder.restore_recompute(record))
+
+    @nn.nowrap
+    def recompute_statement(self) -> RecomputeStatement:
+        """The decoder's (`dew.nn.protocols.StatesRecompute`): the wrapper's own modules run under no rung."""
+        return self._decoder.recompute_statement()
 
 
 def _states_method(backbone: nn.Module) -> str:

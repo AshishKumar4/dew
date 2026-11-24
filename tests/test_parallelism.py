@@ -7,6 +7,8 @@ not the ones we meant.
 """
 
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -24,7 +26,7 @@ from dew.data import Loading
 from dew.data.dataset import DataPartition, Loader, replayed
 from dew.distributed.batches import DevicePrefetchIterator, shard_batch
 from dew.objectives.base import Aux, Objective
-from dew.training import Checkpoints, Layout, MeshSpec, Trainer, UpdateBatch
+from dew.training import Checkpoints, Layout, MeshSpec, Trainer, TrainerAdvanced
 from dew.training.evaluation import WARM_BATCHES
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
@@ -51,14 +53,14 @@ def batches():
 
 
 def make_trainer(tmp_path=None, fsdp=1, optimizer=None, objective=None, tracker=None,
-                 **kwargs):
+                 advanced=None, **kwargs):
     checkpoints = None if tmp_path is None else Checkpoints(str(tmp_path), keep=4)
     return Trainer(
         DeterministicObjective() if objective is None else objective,
         optax.adam(1e-3) if optimizer is None else optimizer,
         key=jax.random.key(0),
         mesh=MeshSpec(fsdp=fsdp),
-        layout=Layout(min_shard=TINY),
+        advanced=dataclasses.replace(advanced or TrainerAdvanced(), layout=Layout(min_shard=TINY)),
         checkpoints=checkpoints,
         tracker=tracker,
         **kwargs,
@@ -147,7 +149,8 @@ def test_a_restored_run_places_its_boxed_parameters_by_their_names(tmp_path):
     a restore onto a mesh (`Checkpoints.variables`, which `from_run` and
     `dew.pipeline` read) places by them, the state having held them unboxed."""
     layout = Layout(min_shard=1, rules=(("vocab", "fsdp"),))
-    Trainer(BoxedReadout(), optax.adam(1e-3), key=jax.random.key(0), mesh=MeshSpec(fsdp=2), layout=layout,
+    Trainer(BoxedReadout(), optax.adam(1e-3), key=jax.random.key(0), mesh=MeshSpec(fsdp=2),
+            advanced=TrainerAdvanced(layout=layout),
             checkpoints=Checkpoints(str(tmp_path))).fit(
                 Loader(lambda partition: batches(), None, batch=BATCH, records=None), steps=1)
 
@@ -421,7 +424,7 @@ def test_a_checkpoint_without_a_position_does_not_resume_from_the_top_of_the_str
 # --------------------------------------------------------------------------
 
 def make_accumulating(tmp_path=None, accumulation=1):
-    return make_trainer(tmp_path, fsdp=2, optimizer=optax.sgd(0.5), update=UpdateBatch(batches=accumulation),
+    return make_trainer(tmp_path, fsdp=2, optimizer=optax.sgd(0.5), accumulation=accumulation,
                         objective=DeterministicObjective(optax.linear_schedule(0.9, 1.0, transition_steps=8)))
 
 

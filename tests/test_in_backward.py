@@ -20,7 +20,7 @@ from dew.nn.kernels.options import program
 from dew.objectives.lm import LMObjective
 from dew.optim import AdamW, OptimConfig, ParamGroup
 from dew.registry import models
-from dew.training import FitPolicy, Layout, MeshSpec, Trainer
+from dew.training import Layout, MeshSpec, Trainer, TrainerAdvanced
 from dew.training.ahead import compile_ahead
 from dew.training.narrow import forward_variables
 
@@ -39,15 +39,16 @@ def decoder(*, dtype: str = "float32", num_layers: int = 3, **wider):
 
 def trainer(model, optimizer: OptimConfig, *, key: int = 0) -> Trainer:
     run = Trainer(LMObjective(model, SEQ), optimizer, key=jax.random.key(key), mesh=MeshSpec(fsdp=2),
-                  layout=Layout(min_shard=TINY_SHARD), checkpoints=None, tracker=None)
+                  advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD)), checkpoints=None,
+                  tracker=None)
     run.device_mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
     run.validate(steps=1)
     return run
 
 
-ADAMW = OptimConfig(optimizer=AdamW(weight_decay=0.1), learning_rate=1e-2)
+ADAMW = OptimConfig(optimizer=AdamW(weight_decay=0.1), lr=1e-2)
 
-GROUPED = OptimConfig(optimizer=AdamW(weight_decay=0.1), learning_rate=1e-2,
+GROUPED = OptimConfig(optimizer=AdamW(weight_decay=0.1), lr=1e-2,
                       param_groups=(ParamGroup("embedding", ("*embed_tokens*",), learning_rate_multiplier=.5),
                                     ParamGroup("attention", ("*self_attn*",), learning_rate_multiplier=2.0),
                                     ParamGroup("rest", ("*",))))
@@ -169,7 +170,7 @@ def test_what_every_layer_of_a_run_updating_in_its_backward_reads_takes_its_laye
                     seeds=SHARED_SEEDS)
 
 
-EIGHT_BIT = OptimConfig(optimizer=AdamW(weight_decay=0.1, state_dtype="int8"), learning_rate=1e-2)
+EIGHT_BIT = OptimConfig(optimizer=AdamW(weight_decay=0.1, state_dtype="int8"), lr=1e-2)
 """Adamw keeping its moments in 8 bits (`AdamW(state_dtype='int8')`), codes and their blocks' scales no
 backward writes as a float cotangent: its step takes the whole gradient first."""
 
@@ -221,7 +222,8 @@ def test_a_scanned_step_holds_no_more_than_a_layer_at_a_time(generation, dtype, 
         gpu = compile_only_gpus(generation, 1, 80 * 2**30)
         model = decoder(dtype=dtype, num_layers=LAYERS, **wider)
         run = Trainer(LMObjective(model, SEQ), optimizer, key=jax.random.key(0), mesh=MeshSpec().build(gpu),
-                      layout=Layout(min_shard=TINY_SHARD), fit=FitPolicy(split=1), checkpoints=None,
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD)), split=1,
+                      checkpoints=None,
                       tracker=None)
         run.validate(steps=8)
         return run
@@ -239,7 +241,7 @@ def test_a_scanned_step_holds_no_more_than_a_layer_at_a_time(generation, dtype, 
         return sum(int(np.prod(leaf.shape)) * np.dtype(leaf.dtype).itemsize for leaf in leaves)
 
     updating = compile_ahead(built(ADAMW), token_rows(VOCAB, 1, SEQ + 1)).temp_bytes
-    run = built(dataclasses.replace(ADAMW, clip_grads=1.0))
+    run = built(dataclasses.replace(ADAMW, clip=1.0))
     clipped = compile_ahead(run, token_rows(VOCAB, 1, SEQ + 1)).temp_bytes
     executable = run.executable
     assert executable is not None
@@ -420,7 +422,8 @@ def test_a_scanned_step_whose_collection_is_not_finite_moves_no_weight():
     round-3 head review's F1)."""
     objective = type("Overflowing", (CollectionWriting,), {"scale": 1e4})(decoder(), SEQ)
     run = Trainer(objective, ADAMW, key=jax.random.key(0), mesh=MeshSpec(fsdp=2),
-                  layout=Layout(min_shard=TINY_SHARD), checkpoints=None, tracker=None, skip_nonfinite=True)
+                  advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD), skip_nonfinite=True),
+                  checkpoints=None, tracker=None)
     run.device_mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
     run.validate(steps=1)
     state, _, _ = run.place()
@@ -480,10 +483,10 @@ def test_a_decision_step_over_a_scanned_backbone_trains_as_its_ordinary_backward
     # eps=1e-4 keeps AdamW from magnifying 1e-8 rounding noise on DecisionHead's shift-invariant k_proj.bias.
     adamw = AdamW(weight_decay=0.1, eps=1e-4)
     optimizer = (
-        OptimConfig(optimizer=adamw, learning_rate=1e-2,
+        OptimConfig(optimizer=adamw, lr=1e-2,
                     param_groups=(ParamGroup("backbone", ("*backbone*",), learning_rate_multiplier=2.0),
                                   ParamGroup("rest", ("*",))))
-        if grouped else OptimConfig(optimizer=adamw, learning_rate=1e-2)
+        if grouped else OptimConfig(optimizer=adamw, lr=1e-2)
     )
     layout = SegmentLayout.state_first_row(max_len=32, head_max_len=24, option_tokens=6)
     opts = {"tokenizer": ByteTokenizer(), "specials": Specials(None, 10, 0, "\x00", 255),
@@ -495,7 +498,8 @@ def test_a_decision_step_over_a_scanned_backbone_trains_as_its_ordinary_backward
     def built(*, exact: bool = False) -> Trainer:
         model = backbone(dtype="float64" if exact else "float32")
         run = Trainer(DecisionObjective(model, **opts), optimizer, key=jax.random.key(0), mesh=MeshSpec(),
-                      layout=Layout(min_shard=2**30), fit=FitPolicy(split=1), checkpoints=None, tracker=None)
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=2**30)), split=1, checkpoints=None,
+                      tracker=None)
         run.device_mesh = MeshSpec().build(jax.devices()[:1])
         run.validate(steps=2)
         return run
@@ -562,8 +566,9 @@ def test_a_loss_differentiating_a_scanned_run_twice_is_refused_its_update_in_the
     objective = Twice(decoder(), SEQ)
     tokens = token_rows(VOCAB, 2, SEQ + 1)
     data = Loader(train=lambda partition: iter([tokens, tokens]), val=None, records=2, batch=2)
-    run = Trainer(objective, OptimConfig(optimizer=AdamW(), learning_rate=1e-2), key=jax.random.key(0),
-                  mesh=MeshSpec(), layout=Layout(min_shard=2**30), fit=FitPolicy(split=1), checkpoints=None,
+    run = Trainer(objective, OptimConfig(optimizer=AdamW(), lr=1e-2), key=jax.random.key(0),
+                  mesh=MeshSpec(), advanced=TrainerAdvanced(layout=Layout(min_shard=2**30)), split=1,
+                  checkpoints=None,
                   tracker=None)
     run.device_mesh = MeshSpec().build(jax.devices()[:1])
     with pytest.raises(ValueError):

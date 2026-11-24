@@ -27,7 +27,7 @@ from dew.data.dataset import DataPartition
 from dew.objectives.base import Step
 from dew.registry import to_record
 from dew.telemetry.instrumentation import compilation_cache_counts, count_compilation_cache
-from dew.training import FitPolicy, Pause, Trainer
+from dew.training import Pause, Trainer, TrainerAdvanced
 
 HELD_OUT = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=None)
 """The step a held-out loss is read at: its key fixed, so a run's loss before and after read one draw."""
@@ -319,9 +319,10 @@ def first_steps(objective_of: Callable[[bool], object], laid: Callable[[str, int
 
     def trainer_of(rows: str, devices: int, split: int, wide: bool) -> Trainer:
         trainer = Trainer(objective_of(wide), optax.chain(stash(), optax.sgd(1e-3)), key=jax.random.key(0),
-                          mesh=MeshSpec(fsdp=devices), layout=Layout(min_shard=min_shard),
-                          fit=FitPolicy(split=split), checkpoints=None, tracker=None,
-                          param_dtype="float64" if wide else None)
+                          mesh=MeshSpec(fsdp=devices),
+                          advanced=TrainerAdvanced(layout=Layout(min_shard=min_shard),
+                                                   param_dtype="float64" if wide else None),
+                          split=split, checkpoints=None, tracker=None)
         trainer.device_mesh = trainer.mesh.build(jax.devices()[:devices])
         return trainer
 

@@ -58,7 +58,7 @@ from dew.objectives.base import Step
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.lm import LMObjective
 from dew.optim import Muon, muon_weight_dimension_numbers
-from dew.training import Checkpoints, Layout, MeshSpec, Trainer
+from dew.training import Checkpoints, Layout, MeshSpec, Trainer, TrainerAdvanced
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests" / "fixtures" / "lora"
@@ -232,7 +232,7 @@ def test_an_adapted_head_trains_on_its_exact_logits(decoder, reference):
     objective = LMObjective(adapter.model, tokens.shape[1] - 1, variables=adapter.variables, ema_decay=None)
     batch, step = {"text": jnp.asarray(tokens)}, Step(jnp.int32(0), jax.random.key(1), None)
     trainer = Trainer(objective, optax.sgd(0.5), key=jax.random.key(3), mesh=MeshSpec(),
-                      layout=Layout(min_shard=2**30))
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=2**30)))
     initial = trainer.initial_state()
     logits = adapter.model.apply(initial.variables, batch["text"][:, :-1])
     first = objective.scalar_loss(initial.variables, batch, step)[0]
@@ -287,7 +287,8 @@ def test_one_trainer_step_moves_the_adapter_and_nothing_else(decoder, loaded, re
     )
     checkpoints = Checkpoints(str(tmp_path / "run"))
     trainer = Trainer(objective, optax.sgd(meta["learning_rate"]), key=jax.random.key(3),
-                      mesh=MeshSpec(), layout=Layout(min_shard=2**30), checkpoints=checkpoints)
+                      mesh=MeshSpec(), advanced=TrainerAdvanced(layout=Layout(min_shard=2**30)),
+                      checkpoints=checkpoints)
     initial = trainer.initial_state()
 
     state = trainer.fit(data, steps=1, log_every=1, checkpoint_every=1)
@@ -344,7 +345,7 @@ def test_a_source_fine_tunes_through_its_own_adapted_bundle(decoder, reference, 
     batch = {"text": tokens[np.arange(rows) % 2]}
     objective = LMObjective(tuned, tokens.shape[1] - 1)
     trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(3), mesh=MeshSpec(),
-                      layout=Layout(min_shard=2**30))
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=2**30)))
     initial = trainer.initial_state()
     state = trainer.fit(
         Loader(train=lambda partition: iter([batch, batch]), val=None, records=rows, batch=rows),
@@ -712,7 +713,7 @@ def test_a_lora_run_served_quantized_decodes_with_its_trained_factors(decoder, l
                   records=rows, batch=rows)
     checkpoints = Checkpoints(str(tmp_path / "run"))
     trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(3), mesh=MeshSpec(),
-                      layout=Layout(min_shard=2**30), checkpoints=checkpoints)
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=2**30)), checkpoints=checkpoints)
     trainer.fit(data, steps=1, log_every=1, checkpoint_every=1)
     checkpoints.wait()
 
@@ -1592,7 +1593,7 @@ def _recipe_run(tmp_path, image_size, *args, model=None, model_fields=(), object
     images = TFDS("dew_images", path=str(IMAGES), split="all").shuffle(seed=0).repeat().pipe(
         presets.images, image_size, batch=jax.device_count(), caption=image_steps.caption())
     config = DiffusionRunConfig.cli(["--val-metrics", "[]", "--trainer.checkpoint-dir", str(tmp_path),
-                                     "--trainer.horizon.steps", "2", "--trainer.eval-every", "None",
+                                     "--trainer.steps", "2", "--trainer.eval-every", "None",
                                      "--trainer.checkpoint-every", "2", "--trainer.compilation-cache-dir",
                                      "None", "--trainer.multi-host", "False", "--trainer.name", "run", *args],
                                     default=stated(DiffusionRunConfig(data=images), model=model,
@@ -1772,10 +1773,10 @@ chain = TokenFiles(tokens).pipe(presets.lm, None, seq_len=8, batch=8, pack=None)
 model = ModelConfig("causal_transformer",
                     {"emb_features": 16, "num_layers": 1, "num_heads": 2, "dtype": "float32"})
 LMRunConfig.cli([*sys.argv[4:], "--trainer.name", name, "--trainer.checkpoint-dir", root,
-                 "--trainer.horizon.steps", "1",
+                 "--trainer.steps", "1",
                  "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
                  "--trainer.eval-every", "None", "--trainer.checkpoint-every", "1", "--max-new-tokens", "0",
-                 "--optim.learning-rate", "0"], default=LMRunConfig(data=chain, model=model)).run()
+                 "--optim.lr", "0"], default=LMRunConfig(data=chain, model=model)).run()
 """
 """A recorded LM run in a process of its own, which reads `HF_ENDPOINT` as it imports the Hub client:
 `tokens`, the runs' root and the run's name, then its own flags."""

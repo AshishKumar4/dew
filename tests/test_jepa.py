@@ -31,7 +31,7 @@ from dew.objectives.jepa import (
     normalize_targets,
     representation_health,
 )
-from dew.training import Layout, MeshSpec, Trainer
+from dew.training import Layout, MeshSpec, Trainer, TrainerAdvanced
 
 RES = 32
 PATCH = 4
@@ -484,7 +484,7 @@ def make_jepa_trainer(mask, learning_rate=1e-3, fsdp=1, **kwargs):
         mesh=MeshSpec(fsdp=fsdp),
         # This encoder's parameters are far below the production shard
         # threshold, so lower it or "FSDP on" would mean "all replicated"
-        layout=Layout(min_shard=256),
+        advanced=TrainerAdvanced(layout=Layout(min_shard=256)),
     )
 
 

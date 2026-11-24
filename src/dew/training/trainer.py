@@ -21,7 +21,7 @@ import sys
 import time
 import types
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Generic, Unpack
+from typing import TYPE_CHECKING, Generic, Literal, Unpack
 
 import jax
 import jax.numpy as jnp
@@ -82,7 +82,7 @@ from dew.objectives.base import (
     taken_record,
 )
 from dew.objectives.drawn import drawn_once, traced_draw
-from dew.optim import declaring, with_bounds
+from dew.optim import OptimConfig, OptimizerSpec, declaring, with_bounds
 from dew.optim_schedules import (
     ScheduleBase,
     held_rates,
@@ -108,7 +108,7 @@ from dew.telemetry.records import (
     StepCompiled,
 )
 from dew.training import streaming
-from dew.training._candidates import RunShape, Stepping, StepSettings, prepared_for
+from dew.training._candidates import RunShape, Stepping, StepSettings, as_placed, prepared_for
 from dew.training._fit import (
     Emptied,
     FitArguments,
@@ -170,6 +170,7 @@ from dew.training.evaluation import EvalSuite, Evaluator, episodic
 from dew.training.inspection import Inspection
 from dew.training.interval import Interval, Reading, Taken, TokenClock, copied, leaf_paths, logged_scalars
 from dew.training.memory import (
+    CodeBounded,
     first_run,
     first_run_failed,
     recompute_record,
@@ -181,7 +182,7 @@ from dew.training.model_flops import TOKENS, TRAINING_FLOPS, model_batch, prepar
 from dew.training.observe import Observe
 from dew.training.phase_passes import PhasePasses, SampledPasses
 from dew.training.planning import Candidate, Planned, Trials, read_whole, released, splits
-from dew.training.policy import FitPolicy, UpdateBatch
+from dew.training.policy import FitPolicy, Remat, UpdateBatch
 from dew.training.profiling import ProfileWindow, owned_capture, pgle_runs, reported_window, waited_export
 from dew.training.rollout import Rollout, _branched, _reported, _rollout_metrics
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process, signal_wake
@@ -204,7 +205,6 @@ _input_log = logging.getLogger("dew.training.input")
 """Where a run says what its input costs its steps, once (`_written`)."""
 
 if TYPE_CHECKING:
-    from dew.optim import OptimConfig
     from dew.telemetry.profile import Profiler
     from dew.training.ahead import AheadOfTime, LaterPlans
 
@@ -216,7 +216,6 @@ Loss = DefaultTypeVar("Loss", default=Ratio | jax.Array | float)
 Effects = DefaultTypeVar("Effects", default=None)
 
 _DEFAULT_MESH = MeshSpec()
-_ONE_BATCH, _PLANNED = UpdateBatch(), FitPolicy()
 
 
 def _closer(stream: Iterator[Batch]) -> Callable[[], None] | None:
@@ -253,8 +252,57 @@ def _custom_step_refusal(step, record: bool, inspection, rollout: Rollout | None
     if rollout is not None and sampled is not None:
         raise ValueError("a rollout samples one policy a step, not sampled_passes' count a microbatch")
     if step is not None and (record or inspection is not None):
-        raise ValueError("a custom step builds its own Steps, which Trainer(record=True) cannot reach, and "
-                         "commits no update an inspection reads: build Step(record=True), report its arrays")
+        raise ValueError("a custom step builds its own Steps, which TrainerAdvanced(record=True) cannot "
+                         "reach, and commits no update an inspection reads: build Step(record=True), report "
+                         "its arrays")
+
+
+@dataclasses.dataclass(frozen=True)
+class TrainerAdvanced(Generic[Loss, Effects]):
+    """What a `Trainer` sets beyond its everyday settings: where its state lives, how it steps, what it
+    measures, inspects or compiles ahead, each the trainer's default where unset."""
+
+    layout: Layout | None = None
+    """Where the state lives (`Layout`), whose rules name the mesh's axes (`Layout.data_axes` its rows');
+    None, the run's layout chooser decides (`dew.training.streaming.laid_start`)."""
+    rollout: Rollout | None = None
+    """Runs once per batch read, before the step and outside replay."""
+    data_resume: DataResume = "relaxed"
+    """How a resume treats its data: "relaxed" starts it again where its plan differs, "exact" refuses."""
+    skip_nonfinite: bool = False
+    """Skip a step that is not finite, which a run otherwise takes and stops at (training.md)."""
+    step: Callable[[Objective[Loss, Effects], optax.GradientTransformation], StepFn] | None = None
+    """Replaces the built-in transaction. A custom step then owns the clocks, the scaler, the EMA and the
+    mutable writes, and the compiled wrapper owns only the attempted-step counter; it passes a model that
+    reads the run's progress it (`PassesProgress`)."""
+    dynamic_scale: bool | dynamic_scale_lib.DynamicScale = False
+    """Scale the loss dynamically, as a float16 compute needs (`loss_scale`)."""
+    profile: ProfileWindow | None = None
+    """The steps a profiler traces (`ProfileWindow`)."""
+    lower_for: str | None = None
+    """A CUDA generation the first step is lowered for in place of compiling it (`_lowering.Lowered`)."""
+    ahead: AheadOfTime | None = None
+    """A step compiled ahead (`dew.training.ahead`), run as the first step where it is that program; one
+    compiled without its GPU kind's tuned choices (`AheadOfTime.tuned`) is not run: the run compiles its
+    step as without it, said once (`AheadOfTime.runnable`)."""
+    tune_kernels: bool = False
+    """Opts in to the tuner (`dew.nn.kernels.tuning.tune`), else each launch takes its derived config. It
+    measures each of Dew's own launches that declares variants to time (`KernelOp`); tokamax's flash kernel
+    runs at tokamax's heuristic config, which it does not measure."""
+    record: bool = False
+    """Each step returns in its metrics what each evaluation sampled or passed (`taken_record`)."""
+    links: Mapping[str, Link] | None = None
+    """An axis's `Link` by name, in place of measuring it (`_links`)."""
+    inspection: Inspection | None = None
+    """What the run watches at its sampled steps (`dew.training.inspection`)."""
+    param_dtype: str | None = None
+    """The dtype fresh parameters are stored in (Flax's `param_dtype`); None, each module's own."""
+    diloco: DiLoCo | None = None
+    """Trains the mesh's diloco groups apart, every few updates averaged (`dew.training.diloco`)."""
+    phase_passes: Sequence[int] | None = None
+    """A looped model's count of passes a phase of the run's data (`dew.training.phase_passes`)."""
+    sampled_passes: SampledPasses | None = None
+    """A looped model's pass count drawn per microbatch (`dew.training.phase_passes`)."""
 
 
 class Trainer(Generic[Loss, Effects]):
@@ -274,68 +322,51 @@ class Trainer(Generic[Loss, Effects]):
     def __init__(
         self,
         objective: Objective[Loss, Effects],
-        optimizer: optax.GradientTransformation | OptimConfig,
+        optimizer: OptimizerSpec | OptimConfig | optax.GradientTransformation,
         *,
-        key: int | jax.Array,
+        key: int | jax.Array = 0,
+        lr: float | None = None,
+        schedule: ScheduleBase | None = None,
+        clip: float = 0.0,
+        accumulation: int | None = None,
+        update_tokens: int | None = None,
+        split: int | Literal["auto"] = "auto",
+        remat: Remat = "auto",
+        microbatches: int | None = None,
         mesh: MeshSpec | Mesh = _DEFAULT_MESH,
-        layout: Layout | None = None,
-        update: UpdateBatch = _ONE_BATCH,
-        fit: FitPolicy = _PLANNED,
-        dynamic_scale: bool | dynamic_scale_lib.DynamicScale = False,
         checkpoints: Checkpoints | None = None,
         tracker: Tracker | None = None,
-        step: Callable[[Objective[Loss, Effects], optax.GradientTransformation], StepFn] | None = None,
-        rollout: Rollout | None = None,
-        profile: ProfileWindow | None = None,
-        lower_for: str | None = None,
-        ahead: AheadOfTime | None = None,
-        tune_kernels: bool = False,
-        record: bool = False,
-        links: Mapping[str, Link] | None = None,
-        inspection: Inspection | None = None,
-        param_dtype: str | None = None,
-        diloco: DiLoCo | None = None,
-        phase_passes: Sequence[int] | None = None,
-        sampled_passes: SampledPasses | None = None,
-        data_resume: DataResume = "relaxed",
-        skip_nonfinite: bool = False,
+        advanced: TrainerAdvanced[Loss, Effects] | None = None,
     ):
         """Hold everything a run needs, without opening any of it.
 
         The mesh, the compiled step and the capabilities' resources come into being in `fit`, so constructing
         a Trainer allocates nothing.
 
-        `update` is one optimizer commit's size (`UpdateBatch`): the steps it pools, or the tokens it trains
-        on, which `fit` reads its steps from. `fit` is how the step fits the devices (`FitPolicy`): the
-        microbatches each step's batch is read in, its rows split evenly, and what it recomputes, each "auto",
-        the planner's (`compile`), by default; under a mesh of pipeline stages its split is the microbatches
-        the stages feed, a multiple of them, "auto" one a stage. `optimizer` is an optax transformation, or an
-        `OptimConfig` each `fit` builds over its updates; the run steps the objective's
-        (`Objective.optimizer`), made from it. `step` replaces the built-in transaction. A custom step then
-        owns the clocks, the scaler, the EMA and the mutable writes, and the compiled wrapper owns only the
-        attempted-step counter; it passes a model that reads the run's progress it (`PassesProgress`).
-        `rollout` runs once per batch read, before the step and outside replay. `skip_nonfinite` skips a step
-        not finite, which a run otherwise takes and stops at (training.md, a step that is not finite).
-        `layout` and `mesh` say where the state lives: `mesh` a `MeshSpec` or a native `jax.sharding.Mesh` of
-        any axes, which `layout`'s rules name (`Layout.data_axes` its rows').
-        `lower_for`, a CUDA generation, lowers the first step for it in place of compiling it
-        (`dew.training._lowering.Lowered`); `ahead`, a step compiled ahead (`dew.training.ahead`), runs as
-        the first step where it is that program, and one compiled without its GPU kind's tuned choices
-        (`AheadOfTime.tuned`) is not run: the run compiles its step as without it, said once
-        (`AheadOfTime.runnable`).
-        `tune_kernels` opts in to the tuner (`dew.nn.kernels.tuning.tune`), else each launch takes its derived
-        config. It measures each of Dew's own launches that declares variants to time (`KernelOp`: the
-        kernel templates, `generation.chosen(attention="template")`, the norms, SwiGLU and decode attention);
-        tokamax's flash kernel (`attention="triton"`) runs at tokamax's heuristic config, which it does not
-        measure. `record` makes each step return in its metrics what each
-        evaluation, replays too, sampled or passed as a boundary (`taken_record`). `links` states an axis's
-        `Link` by name in place of measuring it (`_links`). `param_dtype`, a dtype's name, stores the
-        parameters the run draws fresh, as Flax's `param_dtype` (`dew.state.drawn_in`); None keeps each
-        module's own. `inspection` names what the run watches at its sampled steps
-        (`dew.training.inspection`). `diloco` trains the mesh's diloco groups apart, every few updates
-        averaged (`dew.training.diloco`). `phase_passes` runs a looped model a count of passes a phase of
-        the run's data, and `sampled_passes` one drawn per microbatch (`dew.training.phase_passes`).
+        `optimizer` is an optimizer's spec (`Muon()`, `AdamW(b2=0.95)`), run at `lr`, or along `schedule`, its
+        peak `lr` where it names none, its gradient's norm clipped to `clip` where that is above 0
+        (`OptimConfig`, which each `fit` builds over its updates); an `OptimConfig`, which states those
+        itself; or an optax transformation, which states its own rate. The run steps the objective's
+        (`Objective.optimizer`), made from it. One optimizer update adds up `accumulation` batches, or the
+        batches of `update_tokens` tokens, a whole number of the data's token batches, which `fit` reads its
+        steps from; neither named, one batch (`UpdateBatch`). `split` is the microbatches each step's batch
+        is read in, its rows split evenly, and `remat` what the step recomputes, each "auto", the planner's
+        (`compile`), by default; under a mesh of pipeline stages `microbatches` is those the stages feed, a
+        multiple of them, None one a stage (`FitPolicy`). `mesh` is a `MeshSpec` or a native
+        `jax.sharding.Mesh` of any axes. `advanced` holds the rest, what a run sets where it lays its state
+        out, steps, measures or inspects otherwise than by default (`TrainerAdvanced`).
         """
+        advanced = TrainerAdvanced() if advanced is None else advanced
+        if isinstance(optimizer, OptimizerSpec):
+            optimizer = OptimConfig(optimizer=optimizer, lr=lr, schedule=schedule, clip=clip)
+        elif lr is not None or schedule is not None or clip:
+            raise ValueError(f"lr, schedule and clip set an optimizer spec's run (Trainer(objective, Muon(), "
+                             f"lr=3e-4)); {type(optimizer).__name__} states its own")
+        update = UpdateBatch(batches=accumulation, tokens=update_tokens)
+        fit = FitPolicy(split=split, remat=remat, microbatches=microbatches)
+        layout, rollout, step, record = advanced.layout, advanced.rollout, advanced.step, advanced.record
+        inspection, diloco, sampled_passes = advanced.inspection, advanced.diloco, advanced.sampled_passes
+        dynamic_scale, links, data_resume = advanced.dynamic_scale, advanced.links, advanced.data_resume
         self.objective = objective
         # A config's groups take what the objective draws fresh (`OptimConfig.claiming`); a built one keys.
         self._given = optimizer if isinstance(optimizer, optax.GradientTransformation) else None
@@ -349,10 +380,10 @@ class Trainer(Generic[Loss, Effects]):
         # An update's steps are its batches, or one until `fit` reads its tokens' (`UpdateBatch.of_tokens`).
         self.update, self.fit_policy, self.accumulation = update, fit, update.stated_batches
         self._update_read = update.tokens is None
-        self.split = split = fit.stated_split
+        self.split = stated = fit.stated_split
         # How a resume treats its data (`DataResume`): relaxed starts it again where its plan differs.
         self.data_resume: DataResume = data_resume
-        self.skip_nonfinite = skip_nonfinite
+        self.skip_nonfinite = advanced.skip_nonfinite
         self._microbatches, self._loss_scale = fit.microbatches, loss_scale(dynamic_scale)
         self.dynamic_scale = self._loss_scale is not None
         # A loss scale stated by a flag alone is a value a step's trace can be kept by (`_step_key`).
@@ -363,10 +394,10 @@ class Trainer(Generic[Loss, Effects]):
         _refuse_two_remats(objective, fit)
         self.record = record
         self.records: list[Recorded] = []
-        self.profile = profile
-        self.lower_for, self.tune_kernels = lower_for, tune_kernels
-        self.inspection, self.param_dtype, self.diloco = inspection, param_dtype, diloco
-        self.phase_passes = PhasePasses.of(objective, phase_passes, sampled_passes)
+        self.profile = advanced.profile
+        self.lower_for, self.tune_kernels = advanced.lower_for, advanced.tune_kernels
+        self.inspection, self.param_dtype, self.diloco = inspection, advanced.param_dtype, diloco
+        self.phase_passes = PhasePasses.of(objective, advanced.phase_passes, sampled_passes)
         # The later data phases' steps of the fit in progress, planned off its loop (`LaterPlans`).
         self._later: LaterPlans | None = None
         if diloco is not None:
@@ -375,7 +406,7 @@ class Trainer(Generic[Loss, Effects]):
         # compile found (`Compiled`), which `plan`, `memory`, `executable`, `step_flops` and `links` read.
         # A step compiled ahead is taken once the process is readied (`_handed_ahead`): constructing a trainer
         # opens no backend.
-        self._ahead_handed = ahead
+        self._ahead_handed = advanced.ahead
         self._compiler = StepCompiler(objective, links, None, self.phase_passes, fit.remat)
         self._compiled: Compiled | None = None
         # Whether a step has run since the last compile proved its plan fits (`memory`).
@@ -387,7 +418,7 @@ class Trainer(Generic[Loss, Effects]):
         # Why this run's checkpoints describe no model to load, said once.
         self._unrecorded: str | None = None
         # The run's batches' cut (`RunShape`); a layout stated is kept, `Layout()` too (row 9016).
-        self._shape, self._layout_stated = RunShape(split=split), layout is not None
+        self._shape, self._layout_stated = RunShape(split=stated), layout is not None
         self._given_layout = Layout() if layout is None else layout
         self._laid_out(self._given_layout)
 
@@ -1328,7 +1359,7 @@ class Trainer(Generic[Loss, Effects]):
             # Read under the axes the modules boxed, a stage-local run's stacked by stage, as `_groups` reads.
             with self._staging.held(boxed(self._boxed_axes())):
                 run.update_flops = self._config.update_flops(state.variables["params"])
-        compiled: dict[Hashable, tuple[CompiledStep, StepFlops | None]] = run.compiled
+        compiled: CodeBounded[Hashable, tuple[CompiledStep, StepFlops | None]] = run.compiled
         seen = 0
         run.notice = PreemptionNotice()
         run.clock = TokenClock(*interval.clocked(state.pending_tokens))
@@ -1362,20 +1393,20 @@ class Trainer(Generic[Loss, Effects]):
                     # Each batch of a shape the run has not stepped is checked against what the objective
                     # declares, a later ramp's or schedule's stage as the first; a rollout writes its own.
                     check_inputs(self, device)
-                known, began, before = len(compiled), time.perf_counter(), interval.compiling
+                known, began, before = compiled.made, time.perf_counter(), interval.compiling
                 with run.startup.phase("compile", "compiling the step", when=not known):
                     train_step, flops, state = self._compiled_for(compiled, state, device, run, interval)
-                if len(compiled) > known and self.executable is not None and not self.host_master:
+                if compiled.made > known and self.executable is not None and not self.host_master:
                     signature = batch_signature(device)
                     run.reads[signature] = step_reads(self.executable, signature)
-                interval.compiles = len(compiled)
-                if len(compiled) > known:
+                interval.compiles = compiled.made
+                if compiled.made > known:
                     self._warmed(plan, run, state, shardings, first=not known)
                 if not known:
                     # Rebound once the step is compiled, so the first tick measures steps, not the compile.
                     interval.last_log_time = time.time()
                     interval.waited, interval.compiling = 0.0, before
-                elif len(compiled) > known:
+                elif compiled.made > known:
                     # A shape met later compiles inside the interval, which reports that time apart from
                     # its steps', its first draw's admissions (`DrawingStep.drawn`) among it.
                     interval.compiling = before + time.perf_counter() - began
@@ -1528,7 +1559,7 @@ class Trainer(Generic[Loss, Effects]):
         # again where its plan changed (`_prefetched`).
         resumed = self._resumed(run, resume)
         if resumed.differs:
-            self._restarting(run, resumed.differs)
+            run.restarting(resumed.differs)
         return (start.resume, resumed.position, lambda begun=None: self._placed(start, positioned=False)[:2],
                 start.abstract, None)
 
@@ -1549,8 +1580,8 @@ class Trainer(Generic[Loss, Effects]):
         run.stages = stages_of(stream)
         try:
             if saved is not None and isinstance(stream, Checkpointable):
-                self._restarting(run, restored_or_restarted(stream, saved, resume=self.data_resume,
-                                                            step=run.current))
+                run.restarting(restored_or_restarted(stream, saved, resume=self.data_resume,
+                                                     step=run.current))
             batch = next(iter(stream), None)
             position = stream.get_state() if isinstance(stream, Checkpointable) else None
         except BaseException:
@@ -1731,10 +1762,12 @@ class Trainer(Generic[Loss, Effects]):
         accumulation its window pools. The narrow copies are left out: the plan's first rung drops
         them where the step does not fit with them (`dew.training.planning.FitSearch`)."""
         micro = microbatch_shapes(split_fields(batch)[0], split)
-        # Its loss's trace the plan's candidates read again (`StepCompiler.loss_shaped`).
+        # Its loss's trace the plan's candidates read again, over the state as they read it, as placed
+        # (`StepCompiler.loss_shaped`, `dew.training._candidates.candidate_for`).
         with self._traced_on(self.device_mesh) as schedule:
             stepping = self._compiler.loss_shaped(self._stepping(), schedule)
-            _, _, whole, _ = prepared_for(stepping, state, micro, schedule, split, narrow=False)
+            _, _, whole, _ = prepared_for(stepping, as_placed(stepping, state), micro, schedule, split,
+                                          narrow=False)
         return self._validated(whole)[1]
 
     def _fitting(self, state: TrainState, batch: Batch) -> Validation:
@@ -1786,12 +1819,12 @@ class Trainer(Generic[Loss, Effects]):
             # agrees on the one it reads.
             position, differs = resumed_on(source, lambda: position, resume=self.data_resume,
                                            step=run.current)
-            self._restarting(run, differs)
+            run.restarting(differs)
 
         def restore(stream: Checkpointable, saved: bytes) -> None:
             # On the worker that reads the stream, which it opens once (row 5577).
-            self._restarting(run, restored_or_restarted(stream, saved, resume=self.data_resume,
-                                                        step=run.current))
+            run.restarting(restored_or_restarted(stream, saved, resume=self.data_resume,
+                                                 step=run.current))
         if jax.process_count() > 1:
             # Each process opened its own stream over its own copy of the
             # corpus, and none reads a record before all agree it is one.
@@ -1824,16 +1857,6 @@ class Trainer(Generic[Loss, Effects]):
                                   functools.partial(shard_batch, self.device_mesh, reads=run.reads))
         return DevicePrefetchIterator(source, self.device_mesh, self._shape.prefetch, source_state=position,
                                       reads=run.reads, prepare=prepare, restore=restore, primed=primed)
-
-    @staticmethod
-    def _restarting(run: FitRun, differs: tuple[str, ...]) -> None:
-        """Note a resume whose data starts again, its saved plan differing in `differs` (`DataRestarted`)."""
-        if not differs:
-            return
-        run.restarted = differs
-        _log.warning("the saved data position's plan differs from this run's in %s, so its data starts "
-                     "again from the beginning of its order while its state resumes (data_resume='relaxed'; "
-                     "'exact' refuses it)", ", ".join(differs))
 
     def _scheduled(self, plan: FitPlan, run: FitRun) -> None:
         """Open the next stage of a schedule where the run's commits reached the one it stands in
@@ -1971,7 +1994,7 @@ class Trainer(Generic[Loss, Effects]):
         if run.train is not None:
             run.train.close()
         branched = FitRun(run.started, run.startup, current=run.current, partition=run.partition,
-                          reads=run.reads, compiled=run.compiled, marked=run.marked)
+                          reads=run.reads, compiled=run.compiled, passes=run.passes, marked=run.marked)
         # The branch's own clock of committed tokens, from the run's, which a schedule's stages end at
         # as the run's do (`_scheduled`), read off the devices where its steps may have reached what it
         # reads next (`FitPlan.committed`); the stages it begins are its own, the run's kept as they were.
@@ -2241,7 +2264,7 @@ class Trainer(Generic[Loss, Effects]):
         counted = prepare_counts(self.objective, batch, count_model=False)
         return counted if self._refusal is None else uncounted(counted, self.phase_passes.drawn_cap())
 
-    def _compiled_for(self, compiled: dict[Hashable, tuple[CompiledStep, StepFlops | None]],
+    def _compiled_for(self, compiled: CodeBounded[Hashable, tuple[CompiledStep, StepFlops | None]],
                       state: TrainState, batch: Batch, run: FitRun, interval: Interval,
                       reported: int | None = None) -> tuple[CompiledStep, StepFlops | None, TrainState]:
         """Return the step compiled for this batch's abstract signature (`batch_signature`),
@@ -2258,7 +2281,7 @@ class Trainer(Generic[Loss, Effects]):
         """
         state = self._staged(state, run.current)
         signature = self.phase_passes.key(batch_signature(batch))
-        if signature not in compiled and self.phase_passes.begins(compiled) and (
+        if signature not in compiled and self.phase_passes.begins(run.passes) and (
                 not occupied(state.window)):
             # A phase of other passes begins at an update's end: its step is planned afresh, at the split
             # the run was given or the planner's for its own passes, over the state as a fresh state holds
@@ -2282,7 +2305,10 @@ class Trainer(Generic[Loss, Effects]):
             agreed_same("training batch layout", lambda: batch_layout(batch))
             began = time.perf_counter()
             with region("compile"), run.held():
-                compiled[signature] = (self.compile(state, batch, trials), self.step_flops)
+                step = self.compile(state, batch, trials)
+            planned = None if self._compiled is None else self._compiled.planned
+            run.hold_step(signature, (step, self.step_flops), self.executable, planned,
+                          self.phase_passes.current)
             seconds = time.perf_counter() - began
             settled_heap(run, compiled=True)
             links = {axis: AxisLink(link.bytes_per_second, link.spread) for axis, link in self.links.items()}

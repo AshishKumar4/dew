@@ -124,6 +124,7 @@ class Choice(enum.StrEnum):
     """How a decoder's stack compiles, decided without a selector (`dew.nn.backbones.decoder_stages.scanned`):
     "scanned" runs each run of like layers and each period's repeats under one scanned body; "plain", the
     default until row 4074 makes the scan it, runs every layer unrolled."""
+    LINEAR_CE = 'linear_ce'
     LOW_RANK = 'low_rank'
     MXFP8 = 'mxfp8'
     NARROW_COPIES = 'narrow_copies'
@@ -137,6 +138,7 @@ class Choice(enum.StrEnum):
     SPARSE_ATTENTION = 'sparse_attention'
     SSD = 'ssd'
     SWIGLU = 'swiglu'
+    SYRK = 'syrk'
 
 
 CHOICES = frozenset(choice.value for choice in Choice)
