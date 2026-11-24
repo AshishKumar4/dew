@@ -262,3 +262,139 @@ def test_a_gated_product_is_one_activation_region_and_computes_as_it_did(dtype, 
         params = mlp.init(jax.random.key(0), x)
         spans = _activation_spans(jax.make_jaxpr(lambda v, mlp=mlp: mlp.apply(v, x))(params).jaxpr)
         assert spans == [derivatives.Activation("gelu", gated=False)] * (2 if after else 1), (after, spans)
+
+
+@pytest.mark.mesh(devices=4)
+@pytest.mark.parametrize("precision", [None, "BF16_BF16_F32"])
+@pytest.mark.parametrize("layout", ["tensor", "tensor and fsdp"])
+def test_a_packed_mlp_whose_tensor_axis_splits_its_pair_runs_split_on_its_hidden_width(precision, layout):
+    """A packed SwiGLU MLP on an Explicit tensor axis splitting its packed kernel's columns (the gate-and-up
+    pair, `[D, 2H]` read as `[..., 2, H]`) and its down projection's rows, alone or with an FSDP axis
+    splitting those rows beside it: the pair's axis moves onto the hidden width (`whole_along`, an
+    all-to-all in its compiled program), each device computing its share of the product, and the down
+    projection contracts the width both sides split alike (`sharding.contracted_alike`), at the default
+    precision and at `BF16_BF16_F32`'s product; its forward and its pullback on par with one device's
+    (check 1), where the explicit contraction raised (row 12225, and its confirm review's bilateral split
+    and bf16 product)."""
+    from flax import linen as nn
+    from jax.sharding import AxisType, PartitionSpec
+    from sharded import collective_axes, placed_on
+
+    from dew.nn.mlp import GatedMLP
+
+    names = ("tensor",) if layout == "tensor" else ("tensor", "fsdp")
+    mesh = jax.make_mesh((2,) * len(names), names, axis_types=(AxisType.Explicit,) * len(names),
+                         devices=jax.devices()[:2 ** len(names)])
+    algorithm = None if precision is None else jax.lax.DotAlgorithmPreset.BF16_BF16_F32
+    variables = nn.unbox(GatedMLP(32, 16, activation="swiglu", packed=True).init(
+        jax.random.key(1), jnp.zeros((2, 4, 16))))
+
+    def applied(precision):
+        mlp = GatedMLP(32, 16, activation="swiglu", packed=True, precision=precision)
+
+        def apply(gate_up, down, x):
+            params = {"gate_up_proj": {"kernel": gate_up}, "down_proj": {"kernel": down}}
+            return mlp.apply({"params": params}, x)
+
+        return with_gradients(apply)
+
+    run = applied(algorithm)
+    specs = [PartitionSpec(None, "tensor"), PartitionSpec(names if len(names) > 1 else names[0], None),
+             PartitionSpec(), PartitionSpec()]
+
+    def draw(seed):
+        gate_up = variables["params"]["gate_up_proj"]["kernel"]
+        down = variables["params"]["down_proj"]["kernel"]
+        x, dy = (jax.random.normal(jax.random.key(seed * 2 + offset), (2, 4, 16)) for offset in (0, 1))
+        return gate_up, down, x, dy
+
+    split = jax.jit(run)
+
+    def split_arm(*args):
+        # Placed by their shardings alone: a weighed check traces the arm under jit, where no mesh is set.
+        return split(*placed_on(args, specs, mesh))
+
+    assert_as_exact(split_arm, jax.jit(run), draw, f"a packed MLP split by {layout} at {precision}",
+                    seeds=SEEDS, truth_fn=applied(None))
+    # The forward exchanges the pair's tensor axis onto the width (`whole_along`) rather than gathering it:
+    # the forward program's collectives, as the profiler's parser reads them, hold that one move and no
+    # gather of the pair (`collective_axes`).
+    forward = GatedMLP(32, 16, activation="swiglu", packed=True, precision=algorithm)
+
+    def forward_apply(gate_up, down, x):
+        params = {"gate_up_proj": {"kernel": gate_up}, "down_proj": {"kernel": down}}
+        return forward.apply({"params": params}, x)
+
+    compiled = jax.jit(forward_apply).lower(*placed_on(draw(0)[:3], specs[:3], mesh)).compile()
+    moves = [(op, axes) for op, axes in collective_axes(compiled, mesh) if op in ("all-to-all", "all-gather")]
+    assert ("all-to-all", frozenset({"tensor"})) in moves, moves
+    assert ("all-gather", frozenset({"tensor"})) not in moves, moves
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_product_of_a_split_activation_and_a_weight_holding_a_sum_takes_jaxs_route():
+    """A product of rows an Explicit axis splits and a weight whose placement holds a sum still to take over
+    that axis (`reduced`) keeps JAX's own route (`sharding.contracted_alike` hands both operands back as they
+    are, placing nothing), and JAX's product of them computes what it computes unplaced, where reading the
+    weight's spec as entries raised before any product (the confirm review of row 12225)."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    from dew.nn import precision
+    from dew.nn.sharding import contracted_alike
+
+    mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+    x = jax.device_put(jax.random.normal(jax.random.key(0), (4, 8)),
+                       NamedSharding(mesh, PartitionSpec("data")))
+    w = jax.device_put(jax.random.normal(jax.random.key(1), (8, 3)),
+                       NamedSharding(mesh, PartitionSpec(None, None, reduced={"data"})))
+    numbers = (((1,), (0,)), ((), ()))
+
+    def ours(x, w):
+        lhs, rhs, placed = contracted_alike(x, w, numbers)
+        assert lhs is x and rhs is w and placed is None
+        return jax.lax.dot_general(lhs, rhs, numbers, precision=jax.lax.Precision.HIGHEST)
+
+    def theirs(x, w):
+        return jax.lax.dot_general(x, w, numbers, precision=jax.lax.Precision.HIGHEST)
+
+    with jax.set_mesh(mesh):
+        got, expected = jax.jit(ours)(x, w), jax.jit(theirs)(x, w)
+    assert jax.typeof(got).sharding.spec == jax.typeof(expected).sharding.spec
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
+
+    # The bf16 product (`precision.bf16_dot_general`) over that weight, forward and pullback, places each
+    # cotangent as JAX's own pullback of the same product does (the weight's unreduced), and computes what it
+    # computes unplaced: small integers, whose bf16 products and float32 sums are exact in any order, bit
+    # for bit (the confirm review: its pullback read the weight's spec as entries).
+    whole_x = jnp.asarray(np.random.default_rng(0).integers(-4, 5, (4, 8)), jnp.float32)
+    whole_w = jnp.asarray(np.random.default_rng(1).integers(-4, 5, (8, 3)), jnp.float32)
+    x = jax.device_put(whole_x, NamedSharding(mesh, PartitionSpec("data")))
+    w = jax.device_put(whole_w, NamedSharding(mesh, PartitionSpec(None, None, reduced={"data"})))
+
+    def pulled(product):
+        def run(x, w):
+            y, pull = jax.vjp(product, x, w)
+            return y, pull(jnp.ones_like(y))
+
+        return run
+
+    def bf16(x, w):
+        return precision.bf16_dot_general(x, w, numbers)
+
+    def native(x, w):
+        return jax.lax.dot_general(x.astype(jnp.bfloat16).astype(jnp.float32),
+                                   w.astype(jnp.bfloat16).astype(jnp.float32), numbers,
+                                   precision=jax.lax.Precision.HIGHEST)
+
+    def summed(run):
+        # Each value replicated, an unreduced cotangent's pending sum taken: no device holds it whole.
+        return lambda x, w: jax.tree.map(lambda part: jax.sharding.reshard(part, PartitionSpec()), run(x, w))
+
+    with jax.set_mesh(mesh):
+        placed, jaxs = jax.jit(pulled(bf16))(x, w), jax.jit(pulled(native))(x, w)
+        values = jax.jit(summed(pulled(bf16)))(x, w)
+    whole = jax.jit(pulled(bf16))(whole_x, whole_w)
+    for got, theirs in zip(jax.tree.leaves(placed), jax.tree.leaves(jaxs), strict=True):
+        assert jax.typeof(got).sharding.spec == jax.typeof(theirs).sharding.spec
+    for got, alone in zip(jax.tree.leaves(values), jax.tree.leaves(whole), strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(alone))
