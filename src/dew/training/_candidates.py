@@ -212,13 +212,18 @@ _KEPT = _Kept()
 
 
 def _shaped(tree) -> Hashable:
-    """`tree`'s structure and each leaf's abstract value and placement (an array's, a NumPy array's, a
-    shape's, a scalar's beside its type, which tells True from 1), or the leaf itself where it is none."""
+    """`tree`'s structure and each leaf's abstract value: an array's alike whether placed, held as its shape
+    or a NumPy array on the host (the step lowers over the shapes its own placement gives, `placed_shapes`,
+    so a search over a state not placed yet and one over the placed state trace one step: row 12465, a 4B
+    search traced 2 to 4.5 minutes a candidate), a scalar's beside its type, which tells True from 1; or the
+    leaf itself where it is none."""
     def leaf(value) -> Hashable:
-        if isinstance(value, jax.Array | jax.ShapeDtypeStruct | np.ndarray | np.generic | bool | int | float
-                      | complex):
+        if isinstance(value, jax.Array | jax.ShapeDtypeStruct | np.ndarray):
             aval = jax.typeof(value)
-            return type(value), aval.shape, aval.dtype, aval.weak_type, getattr(value, "sharding", None)
+            return "array", aval.shape, aval.dtype, aval.weak_type
+        if isinstance(value, np.generic | bool | int | float | complex):
+            aval = jax.typeof(value)
+            return type(value), aval.shape, aval.dtype, aval.weak_type
         return value
     leaves, structure = jax.tree.flatten(tree)
     return structure, tuple(map(leaf, leaves))
