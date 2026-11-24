@@ -1585,9 +1585,9 @@ def test_a_paired_epilogue_returning_its_accumulators_at_their_width_recomputes_
 
 def test_a_nonlinear_paired_epilogues_rounded_cotangents_are_its_products_bf16_operands():
     """A bf16 paired product whose nonlinear epilogue reads its accumulators through bf16 roundings: each
-    accumulator's cotangent is that rounding's, bf16's values widened (`gemm._passes_cotangent`), so the
-    input gradient's products read them in bf16 on the CPU's route, as a joined launch takes them, not fp32
-    (#4042's review)."""
+    accumulator's cotangent is that rounding's, bf16's values widened (`epilogue_vjp.passes_cotangent`), so
+    the input gradient's products read them in bf16 on the CPU's route, as a joined launch takes them, not
+    fp32 (#4042's review)."""
     x, gate, up = _operands_1376(jnp.bfloat16)
     graph = jax.make_jaxpr(functools.partial(_paired_pullback, _swiglu_of_roundings(jnp.bfloat16),
                                              (None, None, None), out_dtypes=(jnp.bfloat16,) * 3))(x, gate, up)
@@ -1601,8 +1601,8 @@ def test_a_nonlinear_paired_epilogues_rounded_cotangents_are_its_products_bf16_o
 
 def test_a_paired_epilogues_integer_rounding_stored_as_fp32_is_recomputed_not_read():
     """A paired fp32 epilogue rounding its accumulators to int32 whose outputs the call stores as fp32: fp32
-    holds no int32 exactly (2**24 + 1 rounds), so its backward recomputes the pair (`gemm._lossless_cast`,
-    #4050's review)."""
+    holds no int32 exactly (2**24 + 1 rounds), so its backward recomputes the pair
+    (`epilogue_vjp.lossless_cast`, #4050's review)."""
     def epilogue(gate_acc, up_acc):
         hidden = jax.nn.silu(gate_acc) * up_acc
         # The cotangents land on the activation and its copy; the integer roundings are named, unused.
