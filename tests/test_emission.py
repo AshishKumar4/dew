@@ -735,12 +735,13 @@ def test_a_steps_mask_of_its_tiles_indices_issues_nothing_and_one_of_its_place_c
     assert selected == selected_placed == 128, (selected, selected_placed)
 
 
-@pytest.mark.parametrize("held", ["step", "scope"])
+@pytest.mark.parametrize("held", ["step", "scope", "branch"])
 def test_a_steps_mask_of_a_runtime_value_counts_its_integer_operations_each_step(held):
     """A walk step's mask of its tile's indices offset by its parity (`index % 2`, a value the count holds
     concretely at each trip it reads, `emission._Place`, none of the program's constants) is computed each
-    step, its integer operations counted every step, in the step or in a scope's body that captures it
-    (`pl.run_scoped`), whose constants are as its operands are."""
+    step, its integer operations counted every step: in the step, in a scope's body that captures it
+    (`pl.run_scoped`), whose constants are as its operands are, or by the literal offset a branch the parity
+    selects returns, whose outputs vary as its selector does."""
     def masked(row, offset):
         columns = lax.iota(jnp.int32, 128) + offset
         return jnp.where((columns // 4) % 2 == 1, row, 0.0)
@@ -750,6 +751,8 @@ def test_a_steps_mask_of_a_runtime_value_counts_its_integer_operations_each_step
         parity = index % 2
         if held == "scope":
             return pl.run_scoped(lambda scratch: masked(row, parity), plgpu.SMEM((8,), jnp.float32))
+        if held == "branch":
+            return masked(row, lax.cond(parity == 0, lambda: 0, lambda: 1))
         return masked(row, parity)
 
     role = _emitted(lambda row, trips: lax.fori_loop(0, trips, step, row), _ROW, _TRIPS).roles[0]
