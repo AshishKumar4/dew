@@ -394,19 +394,21 @@ def test_a_forms_ptx_compiles_for_the_gpu(generation, name):
     lowered_for(_inline_decode(FORMS[name]()), (words,), generation).compile()
 
 
-def test_a_kernel_inlining_a_forms_decode_counts_the_forms_issues_on_each_pipe():
-    """A kernel that inlines the NVFP4 form's decode (`inline_forms.registers`, a body its emission count
-    cannot read) and writes every register of it counts the form's issues over its words, where the count
-    refused the body as unpriced (row 5386): the checked-in form's rotation and four masked XORs on the ALU
-    (`Work.integer_operations`), its three left shifts by a multiply on the FMA pipe
-    (`Work.integer_multiply_adds`), each word once; traced alone, nothing compiled or run."""
+@pytest.mark.parametrize("name", FORMS)
+def test_a_kernel_inlining_a_forms_decode_counts_the_forms_issues_on_each_pipe(name):
+    """A kernel that inlines a form's decode (`inline_forms.registers`) and writes every register of it
+    counts what the form's PTX issues over its words, the form's own work (`BitForm.work`: its steps' issues
+    on the ALU, `Work.integer_operations`, and the FMA pipe, `Work.integer_multiply_adds`), where the count
+    refused the body as unpriced (row 5386): a compare's and a select's ISETP and SEL each, a three-way add
+    one IADD3 (the review of train 1261, F1: setp and selp counted free, an add a PTX statement); traced
+    alone, nothing compiled or run."""
     from jax.experimental.pallas import mosaic_gpu as plgpu
 
     from dew.nn import programs
     from dew.nn.kernels.templates import emission, inline_forms
     from dew.nn.kernels.templates.cost import Stated
 
-    form, shape = bits.NVFP4_BFLOAT16_FORM, (64, 16)
+    form, shape = FORMS[name](), (64, 16)
 
     def body(words_ref, *out_refs):
         words = plgpu.layout_cast(words_ref[...], plgpu.Layout.WGMMA)
@@ -420,8 +422,9 @@ def test_a_kernel_inlining_a_forms_decode_counts_the_forms_issues_on_each_pipe()
     (kernel,) = [equation for equation in programs.equations(traced)
                  if equation.primitive in programs.NATIVE_KERNELS]
     counted = emission.launch_work(kernel, Stated(steps=0, bytes_accessed=0))
-    words = shape[0] * shape[1]
-    assert (counted.integer_operations, counted.integer_multiply_adds) == (5 * words, 3 * words)
+    stated = form.work(shape[0] * shape[1])
+    assert (counted.integer_operations, counted.integer_multiply_adds) == (
+        stated.integer_operations, stated.integer_multiply_adds), (counted, stated)
 
 
 MINIFLOATS = {"e4m3": (bits.E4M3, ml_dtypes.float8_e4m3fn), "e5m2": (bits.E5M2, ml_dtypes.float8_e5m2),
