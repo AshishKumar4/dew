@@ -48,10 +48,17 @@ def _drawn(seed: int, dtype) -> dict:
     """A seed's operands as fla's layer forms them, queries, keys, values and erase keys in `dtype`: unit
     queries, keys and erase keys, the log decays `log sigmoid` of normals (the memory's near one, the
     momentum's held at -2 or above, fla's `min_log_mu`), the write gate a sigmoid's; an entering pair `[B,
-    H, 2, Dk, Dv]`, and the cotangents of the output and the final pair."""
+    H, 2, Dk, Dv]`, and the cotangents of the output and the final pair: normals the same on every host, as
+    a recorded site draws them (testing.md, `input_digest`)."""
+    from recorded_inputs import normals
     from test_recurrence_chunk import hosted, sigmoid, softplus, unit
 
-    normal = np.random.default_rng([1454, 7, seed]).standard_normal
+    draws = iter(range(12))
+
+    def normal(shape):
+        """The seed's next normals, the same bits on every host (`recorded_inputs.normals`)."""
+        return normals([1454, 7, seed, next(draws)], shape, np.float64)
+
     gates = (ROWS, LENGTH, HEADS)
     q, k, p = (unit(normal((ROWS, LENGTH, HEADS, KEYS))) for _ in range(3))
     v = normal((ROWS, LENGTH, HEADS, VALUES))
