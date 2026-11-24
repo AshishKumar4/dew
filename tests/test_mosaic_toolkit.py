@@ -183,7 +183,7 @@ def _fed_products(p, x, *, interpret, consumers: int = 2, lo: int = 0, unrolled:
     def body(p_gmem, x_gmem, out_gmem, doubled_gmem):
         allocated = family.streams({'p': ((FED_ROWS, FED_ROWS), jnp.bfloat16),
                                     'x': ((FED_ROWS, FED_WIDTH), jnp.bfloat16)}, STAGES, consumers,
-                                   swizzles=None if shared else {'p': swizzle, 'x': swizzle})
+                                   swizzles={'p': swizzle, 'x': swizzle})
         wg = jax.lax.axis_index("wg") if threaded else 0
 
         def walked(*, streams):
