@@ -53,7 +53,6 @@ from dew.objectives.diffusion.objective import VALIDATION_SAMPLES
 from dew.registry import ModelConfig
 from dew.sampling import Euler
 from dew.training import Trainer
-from dew.training.budget import Horizon
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 T5_TINY = FIXTURES / "t5" / "tiny"
@@ -72,7 +71,7 @@ def run_config(directory):
                                                "num_heads": 2, "mlp_ratio": 1,
                                                "dtype": "float32"}),
         data=images_of("tfds://oxford_flowers102", RES, batch=BATCH),
-        trainer=TrainerConfig(checkpoint_dir=str(directory), horizon=Horizon(steps=2)),
+        trainer=TrainerConfig(checkpoint_dir=str(directory), steps=2),
         preset=Flow(), text=TextCondition(encoder="t5", checkpoint=str(T5_TINY), max_length=8),
         autoencoder=PretrainedAutoencoder(modelname=str(VAE_TINY), dtype="float32"),
         val_metrics=(),

@@ -101,8 +101,8 @@ class StepSettings[LossT, EffectsT]:
     lower_for: str | None
     state_mesh: Mesh
     skip_nonfinite: bool = False
-    """Whether a step with no loss scale that is not finite is skipped (`Trainer(skip_nonfinite=)`), else
-    taken as formed (`Transaction.skip`)."""
+    """Whether a step with no loss scale that is not finite is skipped (`TrainerAdvanced(skip_nonfinite=)`),
+    else taken as formed (`Transaction.skip`)."""
     ns_group: int | None = None
     """The stacks of one shape the step's Newton-Schulz joins at a time where the run states none, its plan's
     (`dew.newton_schulz.released`, `FitSearch`'s release): None joins them all."""

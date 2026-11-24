@@ -1,7 +1,7 @@
 {
 	"about": "The screen pretrained.py left on a terminal, written by site/scripts/capture_snippets.py.",
 	"arguments": [],
-	"script_sha256": "e27b33147b4b10ffbd5a17d30f1610f4260f72efed87f31f159ac2ce90680407",
+	"script_sha256": "4eea9605afaec056e79cde30338d62cd7831b27035bc78d52a514da7744ced26",
 	"meta": {
 		"where": "a 4-vCPU Cloudflare container",
 		"python": "3.12.15",

@@ -42,8 +42,7 @@ from dew.data.plan import Manifest, Plan
 from dew.data.sources import TokenFiles
 from dew.objectives.base import Aux, Objective, Ratio
 from dew.optim import AdamW
-from dew.training import Checkpoints, FitPolicy, Layout, MeshSpec, Trainer, UpdateBatch
-from dew.training.budget import Horizon
+from dew.training import Checkpoints, Layout, MeshSpec, Trainer, TrainerAdvanced
 
 READ = Loading(workers=0, threads=1, read_buffer=8, worker_buffer=1)
 
@@ -1217,7 +1216,8 @@ class Pooled(Regression):
 def checkpointed_trainer(objective, rate: float, directory: Path) -> Trainer:
     """A trainer of `objective` by plain SGD at `rate`, its checkpoints in `directory`: a data test's run."""
     return Trainer(objective, optax.sgd(rate), key=jax.random.key(0),
-                   layout=Layout(min_shard=1, tolerance=1.0), checkpoints=Checkpoints(str(directory), keep=8))
+                   advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)),
+                   checkpoints=Checkpoints(str(directory), keep=8))
 
 
 def regression_trainer(directory: Path) -> Trainer:
@@ -1304,7 +1304,7 @@ def test_a_fit_over_phases_of_other_batches_steps_each_in_updates_of_its_own():
 
     def accumulating() -> Trainer:
         return Trainer(Regression(), optax.sgd(0.5), key=jax.random.key(0),
-                       layout=Layout(min_shard=1, tolerance=1.0), update=UpdateBatch(batches=2))
+                       advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)), accumulation=2)
 
     phased = phases(*(Phase(corpus.batch(batch), None if end is None else Steps(end))
                       for corpus, batch, end in zip(corpora, batches, (*ends[:-1], None), strict=True)))
@@ -1349,7 +1349,8 @@ class TokenCounted(Regression):
 def token_trainer(directory: Path, tracker: RecordingTracker | None = None,
                   accumulation: int = 1) -> Trainer:
     return Trainer(TokenCounted(), optax.sgd(0.5), key=jax.random.key(0),
-                   update=UpdateBatch(batches=accumulation), layout=Layout(min_shard=1, tolerance=1.0),
+                   accumulation=accumulation, advanced=TrainerAdvanced(layout=Layout(min_shard=1,
+                                                                                     tolerance=1.0)),
                    checkpoints=Checkpoints(str(directory), keep=8), tracker=tracker)
 
 
@@ -1367,7 +1368,7 @@ def test_a_cooldown_branch_ends_a_schedules_stage_where_a_run_decayed_there_does
 
     def run(optimizer, steps: int, tracker=None, cooldowns=None):
         trainer = Trainer(TokenCounted(), optimizer, key=jax.random.key(0), tracker=tracker,
-                          layout=Layout(min_shard=1, tolerance=1.0))
+                          advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)))
         return trainer.fit(data, steps=steps, log_every=1, eval_every=steps, validation=held_out,
                            cooldowns=cooldowns)
 
@@ -1402,7 +1403,8 @@ def test_a_cooldown_branch_past_a_schedules_last_tokens_records_no_score(tmp_pat
 
     def run(tracker=None, cooldowns=None):
         trainer = Trainer(TokenCounted(), optax.inject_hyperparams(optax.sgd)(learning_rate=0.5),
-                          key=jax.random.key(0), tracker=tracker, layout=Layout(min_shard=1, tolerance=1.0))
+                          key=jax.random.key(0), tracker=tracker,
+                          advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)))
         return trainer.fit(data, log_every=1, eval_every=1, validation=held_out, cooldowns=cooldowns)
 
     tracker = RecordingTracker()
@@ -1461,9 +1463,8 @@ def test_a_configured_run_on_a_schedule_ends_where_its_data_does(tmp_path):
     second = Pipeline(Memory(Indexed(2, 64))).shuffle(1).repeat()
     data = phases(Phase(first, Tokens(50)), Phase(second, Tokens(80))).batch(8)
     fitted = token_trainer(tmp_path / "fitted").fit(data)
-    config = RunConfig(optim=OptimConfig(optimizer=AdamW(), learning_rate=1e-3),
+    config = RunConfig(optim=OptimConfig(optimizer=AdamW(), lr=1e-3),
                        trainer=TrainerConfig(checkpoint_dir=str(tmp_path / "configured"),
-                                                                                                       horizon=Horizon(),
                                                                                                        log_every=1,
                                                                                                        eval_every=None,
                                                                                                        checkpoint_every=None))
@@ -1542,10 +1543,11 @@ def test_a_ramp_stage_begins_where_an_update_does_and_an_update_pools_one_stage(
     assert ramp.stages(16) == (Stage(batch=8, records=0), Stage(batch=16, records=24))
     assert ramp.stages(16, window=2) == (Stage(batch=8, records=0), Stage(batch=16, records=32))
     assert ramp.steps_for(64, 16, window=2) == 6
-    state = Trainer(Pooled(), optax.sgd(0.5), key=jax.random.key(0), update=UpdateBatch(batches=2),
-                    layout=layout).fit(
+    state = Trainer(Pooled(), optax.sgd(0.5), key=jax.random.key(0), accumulation=2,
+                    advanced=TrainerAdvanced(layout=layout)).fit(
         ramped(indexed_data(records, 16, seed), ramp), steps=4, log_every=100)
-    batched = Trainer(Pooled(), optax.sgd(0.5), key=jax.random.key(0), layout=layout).fit(
+    batched = Trainer(Pooled(), optax.sgd(0.5), key=jax.random.key(0),
+                      advanced=TrainerAdvanced(layout=layout)).fit(
         stitched_data(records, 16, seed), steps=2, log_every=100)
 
     assert int(state.step) == 4
@@ -1564,8 +1566,8 @@ def test_a_configured_run_counts_its_ramped_epochs_in_stages_aligned_to_its_upda
     from dew.config import TrainerConfig
 
     data = ramped(indexed_data(64, 16), Ramp(start=8, increment=8, samples=24))
-    assert TrainerConfig(horizon=Horizon(epochs=1)).total_steps(data) == 6
-    config = TrainerConfig(horizon=Horizon(epochs=1), update=UpdateBatch(batches=2))
+    assert TrainerConfig(epochs=1).total_steps(data) == 6
+    config = TrainerConfig(epochs=1, accumulation=2)
     assert config.total_steps(data) == config.eval_interval(data) == config.checkpoint_interval(data) == 6
     with pytest.raises(ValueError):
         Ramp(start=8, increment=8, samples=24).stages(16, window=0)
@@ -1609,8 +1611,9 @@ def test_a_window_a_rejection_shifted_is_dropped_where_a_ramp_stage_begins(route
     def trainer():
         checkpoints = Checkpoints(str(tmp_path / "run"), keep=8) if route == "resumed" else None
         return Trainer(Rejecting(int(first["id"][0]), frozen=route == "host-frozen"), optax.sgd(0.5),
-                       key=jax.random.key(0), update=UpdateBatch(batches=2), dynamic_scale=True,
-                       layout=layout, checkpoints=checkpoints)
+                       key=jax.random.key(0), accumulation=2, advanced=TrainerAdvanced(dynamic_scale=True,
+                                                                                       layout=layout),
+                       checkpoints=checkpoints)
 
     if route == "resumed":
         trainer().fit(ramped(indexed_data(records, 16, seed), ramp), steps=2, log_every=100,
@@ -1637,8 +1640,8 @@ def test_a_resumed_runs_step_compiled_ahead_reads_the_batch_its_resume_reads(tmp
         stream.close()
 
     def trainer():
-        return Trainer(Pooled(), optax.sgd(0.5), key=jax.random.key(0), update=UpdateBatch(batches=2),
-                       layout=Layout(min_shard=1, tolerance=1.0),
+        return Trainer(Pooled(), optax.sgd(0.5), key=jax.random.key(0), accumulation=2,
+                       advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)),
                        checkpoints=Checkpoints(str(tmp_path / "run"), keep=8))
 
     trainer().fit(ramped(indexed_data(records, 24, seed), ramp), steps=2, log_every=100, checkpoint_every=2)
@@ -1673,7 +1676,8 @@ def test_a_window_that_replays_its_batches_pools_a_ramps_stages_as_batches_of_th
 
     def trainer(checkpoints: Checkpoints | None = None, accumulation: int = 2) -> Trainer:
         return Trainer(Composite(), optax.sgd(0.5), key=jax.random.key(0),
-                       update=UpdateBatch(batches=accumulation), layout=layout, checkpoints=checkpoints)
+                       accumulation=accumulation, advanced=TrainerAdvanced(layout=layout),
+                       checkpoints=checkpoints)
 
     state = trainer().fit(ramped(indexed_data(records, 16, seed), ramp), steps=4, log_every=100)
     stitched = [trainer(Checkpoints(str(tmp_path / "stitched"), keep=8), accumulation=1).fit(
@@ -1702,8 +1706,8 @@ def test_a_ramp_stage_due_inside_a_window_that_replays_its_batches_begins_at_the
     batch: it begins at the next update instead, and the run trains through both stages."""
     ramp = Ramp(start=8, increment=8, samples=8)
     assert ramp.stages(16, window=2) == (Stage(batch=8, records=0), Stage(batch=16, records=16))
-    trainer = Trainer(Composite(), optax.sgd(0.5), key=jax.random.key(0), update=UpdateBatch(batches=2),
-                      layout=Layout(min_shard=1, tolerance=1.0), checkpoints=None)
+    trainer = Trainer(Composite(), optax.sgd(0.5), key=jax.random.key(0), accumulation=2,
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)), checkpoints=None)
     state = trainer.fit(ramped(indexed_data(256, 16), ramp), steps=4, log_every=100)
     assert (int(state.step), int(state.updates)) == (4, 2)
 
@@ -1714,7 +1718,7 @@ def test_a_ramp_stage_the_mesh_cannot_hold_is_refused_before_the_run_reads(tmp_p
     to put them; the run says so before it trains rather than an hour in,
     when the stage arrives."""
     trainer = Trainer(Regression(), optax.sgd(0.5), key=jax.random.key(0),
-                      layout=Layout(min_shard=1, tolerance=1.0))
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)))
 
     with pytest.raises(ValueError):
         trainer.fit(ramped(indexed_data(256, 12), Ramp(start=4, increment=4, samples=16)),
@@ -1729,7 +1733,7 @@ def test_a_ramp_stage_the_pipeline_cannot_cut_into_microbatches_is_refused():
     six microbatches hold batches of twenty-four, six rows a device, and
     stages of eight and sixteen are not ones."""
     trainer = Trainer(Regression(), optax.sgd(0.5), key=jax.random.key(0), mesh=MeshSpec(stage=2),
-                      fit=FitPolicy(microbatches=6), layout=Layout(min_shard=1, tolerance=1.0))
+                      microbatches=6, advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)))
 
     with pytest.raises(ValueError):
         trainer.fit(ramped(indexed_data(256, 24), Ramp(start=8, increment=8, samples=16)),
@@ -1746,7 +1750,7 @@ def test_a_batch_the_pipeline_cannot_cut_into_microbatches_is_refused_before_it_
     from dew.mesh import LayoutRefused
 
     trainer = Trainer(Regression(), optax.sgd(0.5), key=jax.random.key(0), mesh=MeshSpec(fsdp=2, stage=2),
-                      fit=FitPolicy(microbatches=4), layout=Layout(min_shard=1, tolerance=1.0))
+                      microbatches=4, advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)))
 
     with pytest.raises(LayoutRefused):
         trainer.fit(indexed_data(256, 8), steps=2, log_every=100)
@@ -1760,7 +1764,7 @@ def test_a_batch_the_row_shards_cannot_split_is_refused_before_it_is_placed():
     shards and a batch that splits over them, where placing the batch raised
     jax's own error about a sharding that does not divide a dimension."""
     trainer = Trainer(Regression(), optax.sgd(0.5), key=jax.random.key(0),
-                      layout=Layout(min_shard=1, tolerance=1.0))
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)))
 
     with pytest.raises(ValueError):
         trainer.fit(indexed_data(256, 6), steps=2, log_every=100)
@@ -1785,7 +1789,7 @@ def test_the_log_tick_reports_the_records_a_ramped_interval_read():
 
     trainer = Trainer(
         Regression(), optax.sgd(0.1), key=jax.random.key(0),
-        layout=Layout(min_shard=1, tolerance=1.0), tracker=Tracker())
+        advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)), tracker=Tracker())
     trainer.fit(ramped(indexed_data(1024, FINAL), RAMP), steps=6, log_every=6)
 
     step, scalars = logged[0]

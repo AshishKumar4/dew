@@ -16,7 +16,7 @@ from dew.data import Memory, Phase, Steps
 from dew.data.pipeline import Pipeline
 from dew.optim import OptimConfig
 from dew.telemetry.records import DataRestarted, FitStarted
-from dew.training import Checkpoints, Trainer
+from dew.training import Checkpoints, Trainer, TrainerAdvanced
 
 
 def _fit(directory, seed: int, steps: int, *, data_resume: str = "relaxed"):
@@ -25,8 +25,9 @@ def _fit(directory, seed: int, steps: int, *, data_resume: str = "relaxed"):
     (x,) = records(0)
     chain = Pipeline(Memory({"x": x})).shuffle(seed=seed).repeat().batch(BATCH)
     tracker = RecordingTracker()
-    trainer = Trainer(Pulled(), OptimConfig(learning_rate=PEAK), key=0,
-                      checkpoints=Checkpoints(str(directory)), tracker=tracker, data_resume=data_resume)
+    trainer = Trainer(Pulled(), OptimConfig(lr=PEAK), key=0,
+                      checkpoints=Checkpoints(str(directory)), tracker=tracker,
+                      advanced=TrainerAdvanced(data_resume=data_resume))
     state = trainer.fit(chain, steps=steps, log_every=1, checkpoint_every=1)
     return state, tracker
 
@@ -67,7 +68,8 @@ def test_a_step_compiled_ahead_over_a_resume_whose_data_changed_starts_as_its_ru
     (x,) = records(0)
 
     def first(directory, data_resume: str):
-        trainer = Trainer(Pulled(), OptimConfig(learning_rate=PEAK), key=0, data_resume=data_resume,
+        trainer = Trainer(Pulled(), OptimConfig(lr=PEAK), key=0,
+                          advanced=TrainerAdvanced(data_resume=data_resume),
                           checkpoints=None if directory is None else Checkpoints(str(directory)))
         loader = compile(Pipeline(Memory({"x": x})).shuffle(seed=2).repeat().batch(BATCH))
         return first_step_batch(trainer, loader, steps=4)
@@ -94,10 +96,11 @@ def test_a_run_refuses_a_loader_compiled_to_resume_otherwise():
     (x,) = records(0)
     chain = Pipeline(Memory({"x": x})).shuffle(seed=1).repeat().batch(BATCH)
     for data_resume, compiled in (("relaxed", "exact"), ("exact", "relaxed")):
-        trainer = Trainer(Pulled(), OptimConfig(learning_rate=PEAK), key=0, data_resume=data_resume)
+        trainer = Trainer(Pulled(), OptimConfig(lr=PEAK), key=0,
+                          advanced=TrainerAdvanced(data_resume=data_resume))
         with pytest.raises(ValueError):
             trainer.fit(compile(chain, resume=compiled), steps=1)
-    trainer = Trainer(Pulled(), OptimConfig(learning_rate=PEAK), key=0, data_resume="exact")
+    trainer = Trainer(Pulled(), OptimConfig(lr=PEAK), key=0, advanced=TrainerAdvanced(data_resume="exact"))
     assert int(trainer.fit(compile(chain, resume="exact"), steps=1).step) == 1
 
 
@@ -175,7 +178,7 @@ def _phased(seed: int, batch: int = 8):
 
 def _phased_fit(directory, seed: int, steps: int, batch: int = 8):
     tracker = RecordingTracker()
-    trainer = Trainer(Pulled(), OptimConfig(learning_rate=PEAK), key=0,
+    trainer = Trainer(Pulled(), OptimConfig(lr=PEAK), key=0,
                       checkpoints=Checkpoints(str(directory)), tracker=tracker)
     return trainer.fit(_phased(seed, batch), steps=steps, log_every=1, checkpoint_every=1), tracker
 
@@ -275,8 +278,9 @@ def test_a_resumed_run_refused_by_its_saved_plan_starts_no_loading_worker(tmp_pa
         marks.mkdir()
         chain = (Pipeline(Memory({"x": x}, shard_rows=8)).map(Marking(str(marks)), identity="marking@1")
                  .shuffle(seed=seed, window=8).repeat().batch(BATCH).loading(Loading(workers=1)))
-        trainer = Trainer(Pulled(), OptimConfig(learning_rate=PEAK), key=0,
-                          checkpoints=Checkpoints(str(tmp_path / "run")), data_resume="exact")
+        trainer = Trainer(Pulled(), OptimConfig(lr=PEAK), key=0,
+                          checkpoints=Checkpoints(str(tmp_path / "run")),
+                          advanced=TrainerAdvanced(data_resume="exact"))
         return trainer.fit(chain.read("streamed"), steps=steps, log_every=1, checkpoint_every=1)
 
     def workers(marks: Path) -> set[str]:
@@ -308,8 +312,9 @@ def _positioned(directory: Path, shard_bytes: int, steps: int, *, data_resume: s
     files.provision()
     chain = Pipeline(files).map_with_index(_kept, identity="kept@1").read("streamed").repeat().batch(BATCH)
     tracker = RecordingTracker()
-    trainer = Trainer(Pulled(), OptimConfig(learning_rate=PEAK), key=0,
-                      checkpoints=Checkpoints(str(directory)), tracker=tracker, data_resume=data_resume)
+    trainer = Trainer(Pulled(), OptimConfig(lr=PEAK), key=0,
+                      checkpoints=Checkpoints(str(directory)), tracker=tracker,
+                      advanced=TrainerAdvanced(data_resume=data_resume))
     return trainer.fit(chain, steps=steps, log_every=1, checkpoint_every=1), tracker
 
 

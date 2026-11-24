@@ -34,7 +34,7 @@ from dew.objectives.rl.sessions import (
     packed_rows,
 )
 from dew.sampling.text import Sampling
-from dew.training import Layout, MeshSpec, Trainer
+from dew.training import Layout, MeshSpec, Trainer, TrainerAdvanced
 
 VOCAB, PROMPT, NEW = 48, 3, 6
 
@@ -120,7 +120,7 @@ def test_an_adapted_head_rescores_its_support_and_trains_its_factors_alone():
 
     data = dataset(lambda: iter([batch]), batch=rows)
     trainer = Trainer(grpo, optax.sgd(0.1), key=jax.random.key(3), mesh=MeshSpec(),
-                      layout=Layout(min_shard=2**30))
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=2**30)))
     initial = trainer.initial_state()
     state = trainer.fit(data, steps=1)
     leaves = {name: [jax.tree.leaves(tree.variables[name]) for tree in (initial, state)]

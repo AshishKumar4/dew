@@ -27,7 +27,6 @@ from dew.objectives.lm.objective import LMObjective
 from dew.objectives.rl.grpo import GRPOObjective
 from dew.objectives.rl.preference import DPOObjective
 from dew.optim import Adam, AdamW
-from dew.training.budget import Horizon
 
 
 def tiny(**fields) -> CausalTransformer:
@@ -82,7 +81,7 @@ def built_objectives(tmp_path_factory):
         # A directory of each build's own, as each run's data writes its own cache.
         configured = run_kinds.KINDS[kind](tmp_path_factory.mktemp(kind), drawn=False)
         bounded = dataclasses.replace(configured, trainer=dataclasses.replace(configured.trainer,
-                                                                              horizon=Horizon(steps=1)))
+                                                                              steps=1))
         objective = bounded.prepare().objective
         return objective, first(configured.data, objective)
 
@@ -391,7 +390,7 @@ def test_a_refit_on_a_sequence_split_mesh_reads_the_step_its_first_fit_traced():
 
     rows = {"text": np.random.default_rng(0).integers(0, 8, size=(8, 17)).astype(np.int32)}
     # The optimizer stated as a config, which keys the step.
-    optimizer = OptimConfig(optimizer=Adam(), learning_rate=1e-2)
+    optimizer = OptimConfig(optimizer=Adam(), lr=1e-2)
     trainer = Trainer(LMObjective(tiny(max_seq_len=16), 16), optimizer, key=jax.random.key(0),
                       mesh=MeshSpec(fsdp=2, sequence=2))
     fitted = []
@@ -418,7 +417,7 @@ def test_a_trainers_refit_traces_its_step_again_where_xlas_flags_change(monkeypa
     from dew.training import Trainer
 
     rows = {"text": np.random.default_rng(0).integers(0, 8, size=(8, 17)).astype(np.int32)}
-    optimizer = OptimConfig(optimizer=Adam(), learning_rate=1e-2)
+    optimizer = OptimConfig(optimizer=Adam(), lr=1e-2)
     trainer = Trainer(LMObjective(tiny(max_seq_len=16), 16), optimizer, key=jax.random.key(0))
     traced = []
     for flags in ("", "--xla_gpu_deterministic_ops=true", "--xla_gpu_deterministic_ops=true"):
