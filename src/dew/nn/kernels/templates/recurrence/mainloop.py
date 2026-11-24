@@ -1549,8 +1549,11 @@ def _weighted(k, v, a, prefix: tuple, beta, taken, call: Call):
     keyed = (key_block(call, functools.partial(_weighted_held, call),
                        functools.partial(_weighted_staged, call),
                        functools.partial(_weighted_streamed, call)) if call.per_key else call.block)
-    # Under a decay a key dimension with the delta rule, a value block beside each step's key block.
+    # Under a decay a key dimension with the delta rule, a value block beside each step's key block, as many
+    # value blocks as key blocks where they divide (`_walked_value_block`).
     key_steps = width // keyed if call.per_key else 1
+    if call.per_key and call.delta:
+        call = dataclasses.replace(call, value_block=_walked_value_block(call, key_steps))
     value_steps = value_width // call.value_block if call.per_key and call.delta else 0
     steps = max(key_steps, value_steps)
     # The inverse and the write gates loaded once a chunk where the family holds once streams apart.
@@ -1688,6 +1691,17 @@ def _weighted_views(call: Call, refs: tuple, n, h, steps: tuple[int, int]) -> tu
         return rows.get("write"), None if call.per_key else (rows["gate"], rows["low"])
 
     return views, read
+
+
+def _walked_value_block(call: Call, key_steps: int) -> int:
+    """The value block `_weighted`'s walk takes beside each of its `key_steps` key blocks: the values' width
+    a key step's share, where whole tiles of 16 columns divide it, so every step holds a block of each and no
+    segment walks one row alone; else the call's own (`Call.value_block`). Walked at the call's wider value
+    block, its key-only steps copied the value tile held at its last block again every step, 48 KB a
+    program of Kimi Linear's on a GH200 (8 key steps beside 2 value steps), about 25 us of the launch's 101
+    (FS-12368-STEPS, row 12368)."""
+    block, rest = divmod(call.value_width, key_steps)
+    return block if not rest and block % 16 == 0 else call.value_block
 
 
 def _paired_segments(step: Callable, key_steps: int, value_steps: int) -> tuple:
