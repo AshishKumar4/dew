@@ -44,10 +44,8 @@ class Merging(ByteTokenizer):
 class RankedPairs(ByteTokenizer):
     """A ranked BPE over characters: its `merges`, pairs of tokens by rank, the best-ranked pair present
     merged wherever it stands left to right, again until none is, each merged token an id of its own past
-    every byte's. Its merges cascade, so it proves no bound on what a longer cut takes back
-    (`TakesBack.taken_back` None)."""
-
-    taken_back = None
+    every byte's. Its merges cascade, so it states no bound on what a longer cut takes back
+    (`dew.data.text.TakesBack`), though it inherits the byte vocabulary."""
 
     def __init__(self, merges: list[tuple[str, str]]):
         super().__init__()

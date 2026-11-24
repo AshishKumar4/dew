@@ -61,6 +61,7 @@ from dew.training.distributed import (
     resumed_link_figures,
 )
 from dew.training.memory import (
+    admission,
     ceiling_headroom,
     climb_to,
     code_bytes,
@@ -999,11 +1000,13 @@ class StepCompiler[L, E]:
             # charge of a state the devices held none of (row 8962: a headroom and a charge of two
             # judgements in one record); and the placed judgement whole (`placed`): that headroom with its
             # copies built, and the bytes it held beside the step that the allocators did not.
-            held_out = judging.charged[0]
+            held_out, built = judging.charged
             stats = compiled_memory(planned.judged)
             beside = None if stats is None else placed_beside(stats, held_out)
-            probes = [*probes[:own], {**probes[own], "headroom": headroom, "beside": beside},
-                      *probes[own + 1:]]
+            # Its admitted terms the placed judgement's too (`memory.admission`), beside them as it placed.
+            admitted = None if stats is None else list(admission(stats, held_out, built))
+            probes = [*probes[:own], {**probes[own], "headroom": headroom, "beside": beside,
+                                      "admitted": admitted}, *probes[own + 1:]]
             memory = memory_record(planned.executable, local_devices(mesh), held_out, fits=True)
             compiled = dataclasses.replace(
                 compiled, plan={**plan, "probes": probes, "placed": {"headroom": headroom, "held": held_out}},

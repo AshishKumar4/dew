@@ -647,8 +647,11 @@ def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monk
     # that judgement placed beside the step, not the unplaced search's charge of the state it planned
     # before placing, which the placed step holds among its arguments (row 8962).
     # Here what it places beside the step, its outputs and its batches, is under the state's bytes.
+    # Its admitted terms the placed judgement's too: what they place beside the step what it says it
+    # placed (review of the T83 follow-up: the unplaced search's terms stood beside the placed figures).
     placed, own = run.plan["placed"], run.plan["probes"][0]
     assert own["headroom"] == placed["headroom"] and own["beside"] < state, (own, placed, state)
+    assert own["admitted"] is not None and own["admitted"][1] == own["beside"], own
 
 
 def test_a_fresh_plan_refused_with_its_copies_built_deletes_them_before_it_is_searched_again(monkeypatch):

@@ -278,11 +278,22 @@ def _token_row(ids: ArrayLike | Sequence[int]) -> list[int]:
 class TakesBack(Protocol):
     """A vocabulary that states, as a proof of its own encoding, the most tokens a text's encoding can lose
     as it is extended past a cut (`taken_back`): a cut of a text that overflows by more overflows however
-    much longer it is cut (`dew.decision.layout.SegmentLayout._cut`). None proves nothing: a ranked BPE's
-    merges cascade, one character turning every later pair's parity, so no bound of its tokens' lengths
-    holds."""
+    much longer it is cut (`dew.decision.layout.SegmentLayout._cut`). Stated by a vocabulary's own
+    choosing, none inherited: a ranked BPE's merges cascade, one character turning every later pair's
+    parity, so no bound of its tokens' lengths holds."""
 
-    taken_back: int | None
+    taken_back: int
+
+
+def taken_back(encoder: object) -> int | None:
+    """The most tokens `encoder`'s encoding of a text loses as the text is cut longer, where it is proved:
+    none for the byte vocabulary's own encoding (`ByteTokenizer`, its encode and offsets not overridden),
+    each character's bytes its own tokens; what a vocabulary states of itself (`TakesBack`); None, no
+    bound, for any other."""
+    kind = type(encoder)
+    if kind.encode is ByteTokenizer.encode and kind.offsets is ByteTokenizer.offsets:
+        return 0
+    return encoder.taken_back if isinstance(encoder, TakesBack) else None
 
 
 class ByteTokenizer:
@@ -298,9 +309,6 @@ class ByteTokenizer:
     name = "byte"
     """The name a run records for this vocabulary, which `tokenizer_for` resolves back to it."""
 
-    taken_back: int | None = 0
-    """None taken back: each token one byte, a text's encoding growing with every character
-    (`TakesBack`)."""
 
     def __init__(self):
         self.vocab_size = 256

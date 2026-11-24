@@ -30,7 +30,7 @@ from typing_extensions import get_protocol_members
 from dew import _records
 from dew._cache import Same
 from dew._records import EARLIER_LAYOUTS, JSON
-from dew.data.text import HFTokenizer, Offsets, TakesBack, Tokenizer
+from dew.data.text import HFTokenizer, Offsets, Tokenizer, taken_back
 from dew.data.tokens import share_tokens
 from dew.decision.questions import Choice, Noul, Question, Score, kind_of
 from dew.decision.renderer import Chunk, Point, Rendered, Unit, render as rendered_chunks, stream_point
@@ -1329,23 +1329,24 @@ class SegmentLayout(Layout):
         # and its slice's, need not grow with its cut: a ranked BPE's merges cascade, one more character
         # turning the parity of every later pair, so a longer cut can take back any number of tokens
         # (rows 9060, 11739: the walk stopped 4 tokens past the room). Its walk asks every longer cut;
-        # one whose vocabulary proves a bound (`TakesBack`: none for bytes) stops once a cut overflows the
-        # room, or its cap, by more (row 11839: a byte walk past a long state's room, each row encoded).
-        taken_back = encoder.taken_back if isinstance(encoder, TakesBack) else None
+        # one whose vocabulary proves a bound (`dew.data.text.taken_back`: none for bytes) stops once a
+        # cut overflows the room, or its cap, by more (row 11839: a byte walk past a long state's room,
+        # each row encoded).
+        bound = taken_back(encoder)
         for at, copy in enumerate(copies):
             if len(laid.tokens) > self.max_len or copy.keep == "all":
                 continue
             for count in range(kept[at] + 1, lengths[at] + 1):
                 over = own_over(at, count)
                 if over > 0:
-                    if taken_back is not None and over > taken_back:
+                    if bound is not None and over > bound:
                         break
                     continue
                 longer = built([piece(other, count if other == at else kept[other])
                                 for other in range(len(copies))])
                 if len(longer.tokens) <= self.max_len:
                     kept[at], laid = count, longer
-                elif taken_back is not None and len(longer.tokens) - self.max_len > taken_back:
+                elif bound is not None and len(longer.tokens) - self.max_len > bound:
                     break
         alone = [len(encoder.encode(own, add_special_tokens=False)) if (own := piece(at)) else 0
                  for at in range(len(copies))]

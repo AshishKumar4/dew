@@ -505,9 +505,12 @@ def test_a_long_state_cut_in_a_byte_row_encoded_whole_encodes_few_cuts_past_its_
     _, _, _, *question = release().segments
 
     class Counting(ByteTokenizer):
-        """The byte vocabulary, counting the texts it reads the offsets of."""
+        """The byte vocabulary, counting the texts it reads the offsets of: its encoding the byte
+        vocabulary's, which it states (`dew.data.text.TakesBack`), as its offsets are no longer the byte
+        vocabulary's own by name."""
 
         read = 0
+        taken_back = 0
 
         def offsets(self, text: str):
             self.read += 1
