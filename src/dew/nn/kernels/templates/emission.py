@@ -844,7 +844,12 @@ def _inlined(params: Mapping, invars: Sequence, values: Sequence) -> Work:
     arguments its operands' leading ones, their refs' transforms' leaves after them, its scalars' values
     where the count holds them."""
     leading = params["pytree_args"].num_leaves
-    avals = [variable.aval for variable in invars[:leading]]
+    # Each ref argument viewed as its body takes it: its view's transforms (a slot's index, a tile's
+    # untiling) applied, as the lowering applies them (`_inline_mgpu_flat_transformed_args`).
+    viewed = params["pytree_ref_transforms"].unflatten([variable.aval for variable in invars[leading:]])
+    avals = [functools.reduce(lambda aval, transform: transform.transform_type(aval), transforms or (),
+                              variable.aval)
+             for variable, transforms in zip(invars[:leading], viewed, strict=True)]
     try:
         return inline_work.body_work(params["mgpu_fn"], avals, params["flat_arg_types"], values[:leading])
     except inline_work.Uncounted as error:

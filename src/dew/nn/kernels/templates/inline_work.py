@@ -121,7 +121,10 @@ def _counted(fn: Callable, avals: Sequence, arg_types: Sequence, known: Sequence
 
 def _stand_in_type(aval, kind) -> ir.Type:
     if isinstance(kind, gpu_primitives.RefType):
-        inner = aval.inner_aval
+        # The memref its body takes: the ref's view with its type's own transforms (a tile's tiling and
+        # swizzle) applied, the layout it lies in.
+        inner = functools.reduce(lambda viewed, transform: transform.transform_type(viewed),
+                                 kind.transforms, aval).inner_aval
         shared = "smem" in str(aval.memory_space).lower()
         return ir.MemRefType.get(inner.shape, mgpu_utils.dtype_to_ir_type(inner.dtype),
                                  memory_space=mgpu_utils.smem() if shared else None)
