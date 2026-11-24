@@ -1469,7 +1469,7 @@ def test_an_adapted_products_backward_keeps_fp32_products_whole_under_any_preset
 
 def test_a_paired_epilogues_kept_roundings_are_its_backwards_accumulators_and_it_recomputes_no_pair():
     """A paired product (a MoE's gate and up) whose epilogue rounds each accumulator to bf16 and returns both
-    roundings beside SwiGLU of them, the roundings named (`gemm`'s `named`, a remat policy saving them): its
+    roundings beside SwiGLU of them, the roundings named (`gemm`'s `named`: its derivative's residuals): its
     reverse pass reads its accumulators from those kept outputs (`gemm._rounded_accumulators`) and
     computes the pair no second time, one product fewer than the same call unnamed, its gradients bitwise
     the unnamed call's (each accumulator read through its rounding alone, row 1376)."""
@@ -1485,11 +1485,10 @@ def test_a_paired_epilogues_kept_roundings_are_its_backwards_accumulators_and_it
 
     def gradient(names):
         def loss(x, gate, up):
-            hidden, _, _ = gemm.gemm(x, gate, sizes, paired=up, epilogue=swiglu,
-                                     out_dtypes=(jnp.bfloat16,) * 3, named=names, interpret_on_cpu=True)
+            hidden, _, _ = gemm.gemm(x, gate, sizes, paired=up, epilogue=swiglu, out_dtype=jnp.bfloat16,
+                                     out_dtypes=(jnp.bfloat16,) * 3, named=names)
             return jnp.sum(hidden.astype(jnp.float32))
-        policy = jax.checkpoint_policies.save_only_these_names("gate_proj", "up_proj")
-        return jax.grad(jax.checkpoint(loss, policy=policy), argnums=(0, 1, 2))
+        return jax.grad(loss, argnums=(0, 1, 2))
 
     def products(jaxpr) -> int:
         from dew.nn import programs
