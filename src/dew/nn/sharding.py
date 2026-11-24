@@ -643,6 +643,28 @@ def constrained[T](x: T, spec: jax.sharding.PartitionSpec | Callable[[], jax.sha
     return jax.lax.with_sharding_constraint(x, auto_part(spec() if callable(spec) else spec, mesh))
 
 
+def gathered_over[T](x: T, spec: jax.sharding.PartitionSpec, axis: str) -> T:
+    """`x`, placed as `spec`, gathered whole over the mesh's `axis` and placed as before on every other: under
+    an Explicit `axis` resharded from its type's spec without it (`jax.sharding.reshard`), else constrained to
+    `spec` without it (`constrained`). Where `axis` holds one device, `x` as it is. Its transpose places a
+    gradient back as `spec`, reduce-scattered over `axis` (`dew.nn.backbones.looping`'s gathered block)."""
+    mesh = jax.sharding.get_abstract_mesh()
+    if mesh.empty or mesh.shape.get(axis, 1) == 1:
+        return x
+    if axis in mesh.explicit_axes:
+        return jax.sharding.reshard(x, _without(jax.typeof(x).sharding.spec, axis))
+    return constrained(x, _without(spec, axis))
+
+
+def _without(spec: jax.sharding.PartitionSpec, axis: str) -> jax.sharding.PartitionSpec:
+    """`spec` with `axis` dropped from every dimension that names it."""
+    def kept(entry):
+        names = () if entry is None else (entry,) if isinstance(entry, str) else tuple(entry)
+        names = tuple(name for name in names if name != axis)
+        return None if not names else names[0] if len(names) == 1 else names
+    return jax.sharding.PartitionSpec(*map(kept, spec))
+
+
 def placed_axes(mesh: jax.sharding.AbstractMesh) -> list[str]:
     """The axes of `mesh` a constraint traced here places (`automatic_axes`, those above one device no
     `shard_map` holds): not an Explicit axis, which an array's type places, nor, inside a pipeline's stage
