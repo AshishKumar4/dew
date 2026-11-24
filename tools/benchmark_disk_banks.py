@@ -107,7 +107,7 @@ def measure(config: DiskConfig):
         record = translate_config(source.config)
         record["max_seq_len"] = config.prompt + config.tokens + 1
         model = from_record(CausalTransformer, {**record, "dtype": config.dtype, "attention_impl": "xla",
-                                                "scan_layers": True, "bank_layers": config.bank_layers})
+                                                "bank_layers": config.bank_layers})
         variables = source.stream(model, mesh=MeshSpec().build([device]),
                                    layout=Layout(min_shard=1, tolerance=1.0))
         print("non-decoder weights loaded", resident_status(), file=sys.stderr, flush=True)

@@ -22,7 +22,7 @@ from dew.interop.generation_config import generation_config_of, source_decoding
 from dew.interop.safetensors_io import read_file, write_file
 from dew.nn.autoencoders.api import AutoEncoder
 from dew.registry import to_record
-from dew.sampling import Beam, Sampling
+from dew.sampling import Beam, Sample, Sampling
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 KIMI_K25 = FIXTURES / "hf" / "kimi-k25-tiny"
@@ -460,7 +460,7 @@ def test_sampling_override_governs_beam_admission(tmp_path: Path) -> None:
     )
     loaded = PretrainedDecoder.load(stochastic_beam_dir, dtype="float32", attention_impl="reference")
     gen = loaded.text_generation(sampling=Sampling(temperature=0.0))
-    assert isinstance(gen.strategy, Beam) and gen.strategy.width == 2
+    assert isinstance(gen.sampling.strategy, Beam) and gen.sampling.strategy.width == 2
 
     det_beam_dir = tmp_path / "det_beam"
     shutil.copytree(QWEN_TINY, det_beam_dir)
@@ -470,6 +470,56 @@ def test_sampling_override_governs_beam_admission(tmp_path: Path) -> None:
     det_loaded = PretrainedDecoder.load(det_beam_dir, dtype="float32", attention_impl="reference")
     with pytest.raises(ValueError):
         det_loaded.text_generation(sampling=Sampling(temperature=0.7))
+    # A policy naming its own strategy replaces the source's beams, which nothing then judges (the review
+    # of API02b: sampling alone was refused as stochastic beams).
+    sampled = det_loaded.text_generation(sampling=Sampling(temperature=0.7, strategy=Sample()))
+    assert isinstance(sampled.sampling.strategy, Sample)
+    # So are the controls of a strategy no native search runs, contrastive search's among them.
+    contrastive_dir = tmp_path / "contrastive"
+    shutil.copytree(QWEN_TINY, contrastive_dir)
+    (contrastive_dir / "generation_config.json").write_text(
+        json.dumps({"do_sample": False, "penalty_alpha": 0.6, "top_k": 4, "eos_token_id": 2,
+                    "pad_token_id": 0}))
+    contrastive = PretrainedDecoder.load(contrastive_dir, dtype="float32", attention_impl="reference")
+    with pytest.raises(ValueError):
+        contrastive.text_generation()
+    replaced = contrastive.text_generation(sampling=Sampling(strategy=Sample()))
+    assert isinstance(replaced.sampling.strategy, Sample)
+
+
+def test_a_beam_search_policy_round_trips_through_generation_config() -> None:
+    """A policy's beam search is written as transformers' `num_beams`, `length_penalty` and
+    `early_stopping` (the review of API02b: a policy's strategy was dropped on export), which a source's
+    own decoding reads back as the same search."""
+    loaded = Pretrained.load(QWEN_TINY, dtype="float32", attention_impl="reference", weights=False)
+    search = Beam(width=3, length_penalty=0.5, early_stopping="never")
+    native = Sampling(temperature=0, eos_token_ids=2, pad_token_id=0, no_repeat_ngram_size=2, strategy=search)
+    written = generation_config_of(native)
+    assert (written["num_beams"], written["length_penalty"], written["early_stopping"]) == (3, 0.5, "never")
+    read = source_decoding({}, written, loaded.model, 1, None)
+    assert read.strategy == search
+    # The search's chain ends after the processors in both (the review of API02b: the native chain ended in
+    # an argmax, which a search collapsing every beam onto one token reads, where the source's has none).
+    assert [type(each) for each in native.transforms()] == [type(each) for each in read.components()[0]]
+
+
+def test_a_saved_runs_policy_loads_whole_and_a_release_of_its_unwritten_parts_is_refused() -> None:
+    """A saved run's policy holding what transformers' generation config holds no field of (criteria beside
+    its EOS) loads natively, its bundle's generation config the part it holds (`written_part`), and its
+    release, which a reader of that config alone would run without them, is refused before a file is
+    written (the review of API02b: the bundle itself was refused, the run unloadable)."""
+    from dataclasses import replace
+
+    from dew.inference.tasks import TextSettings
+    from dew.interop.generation_config import written_part
+    from dew.sampling import decoding
+
+    policy = Sampling(temperature=0, eos_token_ids=2, stopping=(decoding.MaxNewTokens(3),))
+    assert "max_new_tokens" not in generation_config_of(written_part(policy), None)
+    loaded = Pretrained.load(QWEN_TINY, dtype="float32", attention_impl="reference", weights=False)
+    with pytest.raises(ValueError):
+        replace(loaded, settings=TextSettings(seq_len=8, max_new_tokens=3, tokenizer=None, processor=None,
+                                              sampling=policy)).release_plan()
 
 
 def test_policy_controls_round_trip_through_generation_config() -> None:
@@ -488,8 +538,8 @@ def test_policy_controls_round_trip_through_generation_config() -> None:
         pad_token_id=0,
     )
     exported = generation_config_of(rich, max_new_tokens=16)
-    restored, transforms, strategy = source_decoding({}, exported, loaded.model, 1, None)
-    assert restored == rich and exported["max_new_tokens"] == 16 and transforms is None and strategy is None
+    restored = source_decoding({}, exported, loaded.model, 1, None)
+    assert restored == rich and exported["max_new_tokens"] == 16
 
 
 def test_medias_processor_keeps_image_paths_and_bytes_atomic(tmp_path: Path) -> None:

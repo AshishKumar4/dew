@@ -6,6 +6,8 @@ or an installed distribution's, which its version states. One statement, which a
 from __future__ import annotations
 
 import abc
+import contextlib
+import contextvars
 import dataclasses
 import enum
 import functools
@@ -64,21 +66,61 @@ def file_of(name: str) -> Path:
 def own_source(name: str | None) -> bool:
     """Whether the module `name` is a user's own code: loaded from a file no distribution versions and
     Dew's digest does not hold, or the script the process runs.
-    Read once a loaded module (`_OWN`): a module loaded again is read again."""
+    Read once a loaded module (`_OWN`), in the process's install (`environment`, which a block may set
+    apart, read afresh): a module loaded again is read again."""
     if name == "__main__":
         return vars(sys.modules[name]).get("__file__") is not None
     if name is None or name not in sys.modules:
         return False
     module = sys.modules[name]
-    held = _OWN.get(name)
+    given = _ENVIRONMENT.get()
+    held = _OWN.get(name) if given is None else None
     if held is not None and held[0] is module:
         return held[1]
     path = recorded(name)
-    placed = path is not None and within(path, installed())
-    own = path is not None and not (placed and name.partition(".")[0] in distributed()) and (
+    placed = path is not None and within(path, installs())
+    own = path is not None and not (placed and name.partition(".")[0] in packages()) and (
         placed or not within(path, standard()))
-    _OWN[name] = (module, own)
+    if given is None:
+        _OWN[name] = (module, own)
     return own
+
+
+@dataclasses.dataclass(frozen=True)
+class Environment:
+    """An install: the directories distributions are installed into and the distributions each top-level
+    package belongs to (`installed`, `distributed`, the process's)."""
+
+    directories: tuple[Path, ...]
+    packages: Mapping[str, Sequence[str]]
+
+
+_ENVIRONMENT: contextvars.ContextVar[Environment | None] = contextvars.ContextVar("environment", default=None)
+"""The install a block reads in place of the process's (`environment`), None outside one."""
+
+
+@contextlib.contextmanager
+def environment(installed: Environment):
+    """Within the block, `installed` is the install code is classified by (`own_source`, `installs`,
+    `packages`): a test's double of a distribution installed beside the process's."""
+    token = _ENVIRONMENT.set(installed)
+    try:
+        yield
+    finally:
+        _ENVIRONMENT.reset(token)
+
+
+def installs() -> tuple[Path, ...]:
+    """The install directories in effect (`environment`'s, else `installed`)."""
+    given = _ENVIRONMENT.get()
+    return installed() if given is None else given.directories
+
+
+def packages() -> Mapping[str, Sequence[str]]:
+    """The distributions each top-level package belongs to in effect (`environment`'s, else
+    `distributed`)."""
+    given = _ENVIRONMENT.get()
+    return distributed() if given is None else given.packages
 
 
 _OWN: dict[str, tuple[object, bool]] = {}
@@ -141,17 +183,18 @@ class Wrapping(Protocol):
     __wrapped__: Callable
 
 
-def hand_written(member) -> bool:
+def hand_written(member, own: Callable[[str | None], bool] = own_source) -> bool:
     """Whether `member` is, or wraps (`__wrapped__`), a function a file of the user's own code wrote: the
     file of the globals it was defined in, as against one made for the class (a dataclass's `__init__`,
     whose code is no file's, and its `__repr__`, which a wrapper of Python's own holds). By its globals,
-    not the module it names: a decorator's wrapper names the module of the function it wraps."""
+    not the module it names: a decorator's wrapper names the module of the function it wraps. `own` is
+    which modules' code counts as the user's (`dew._stated`'s walk of an installed plugin's among it)."""
     seen: set[int] = set()
     while member is not None and id(member) not in seen:
         seen.add(id(member))
         if isinstance(member, types.FunctionType):
             defined = member.__globals__
-            if (own_source(defined.get("__name__"))
+            if (own(defined.get("__name__"))
                     and member.__code__.co_filename == defined.get("__file__")):
                 return True
         member = member.__wrapped__ if isinstance(member, Wrapping) else None
@@ -177,18 +220,12 @@ def function_reads(function: types.FunctionType) -> tuple[dict, dict]:
     return cells, held | imported
 
 
-def own_classes(kind: type) -> list[type]:
-    """The classes of the user's own code `kind` is made of, itself and every base, in its MRO: what a call
-    of its methods runs, an inherited method's class among them."""
-    return [held for held in kind.__mro__ if own_source(held.__module__)]
-
-
 _ABC_STATE = type(vars(abc.ABC)["_abc_impl"])
 """The type of what `abc.ABCMeta` keeps in each class it makes (its registry and caches), machinery no
 statement of the user's code holds (`members`)."""
 
 
-def members(held) -> list[tuple]:
+def members(held, own: Callable[[str | None], bool] = own_source) -> list[tuple]:
     """What a class or a module of the user's holds, by name, in order: a method as the function its
     descriptor wraps (`wrapped`), anything else as itself. Of Python's own entries (`__dict__`, `__doc__`,
     `__annotations__`) only the methods the user wrote (`__call__`), which a call runs; the rest are its
@@ -198,12 +235,13 @@ def members(held) -> list[tuple]:
     default where the class attribute still holds it, which `generated_fields` states with its factory:
     a slotted class's and a child overriding a default hold it where their class attributes do not (train
     947's review), and a value set on the class at run time, or a class variable, stays a member (train
-    950's review: skipping every field name left them unstated)."""
+    950's review: skipping every field name left them unstated). `own` is which modules' code counts as the
+    user's (`hand_written`)."""
     defaults = {field.name: field.default for field in generated_fields(held)}
     found = []
     for name, member in sorted(vars(held).items()):
         member = wrapped(member)
-        if ((name.startswith("__") and name.endswith("__") and not hand_written(member))
+        if ((name.startswith("__") and name.endswith("__") and not hand_written(member, own))
                 or isinstance(member, _ABC_STATE)
                 or (name in defaults and member is defaults[name])
                 or (isinstance(member, types.MemberDescriptorType) and member.__objclass__ is held)):

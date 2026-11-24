@@ -356,6 +356,7 @@ def test_dense_mlp_gate_and_active_experts_are_counted():
         routed.clone(capacity_factor=0.5).model_flops(LENGTHS)
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_backbone_composes_layers_loop_passes_and_a_separate_lm_head():
     model = decoder()
     assert isinstance(model, Counted) and isinstance(model, CountedLogits)
@@ -363,7 +364,7 @@ def test_backbone_composes_layers_loop_passes_and_a_separate_lm_head():
     assert model.model_flops(LENGTHS) == 3 * layer
     assert model.logits_flops(LENGTHS) == 2 * 8 * 64 * 7
     assert model.clone(loop=Loop(3, layers=(1, 3))).model_flops(LENGTHS) == 7 * layer
-    assert model.clone(scan_layers=True, remat=RematPolicy()).model_flops(LENGTHS) == 3 * layer
+    assert model.clone(remat=RematPolicy()).model_flops(LENGTHS) == 3 * layer
     assert model.clone(tie_embeddings=False).logits_flops(LENGTHS) == model.logits_flops(LENGTHS)
 
 

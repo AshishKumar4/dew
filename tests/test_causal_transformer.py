@@ -392,15 +392,15 @@ def test_decode_cache_matches_the_full_sequence(rng, attention_impl):
     decoded_against_full(model, 4, f"{attention_impl} decode", SEEDS['decode'])
 
 
-@pytest.mark.parametrize("scanned", [False, True], ids=["loop", "scan"])
-def test_a_cached_prompt_reads_its_cache_under_a_chosen_template(scanned):
+@pytest.mark.parametrize("stack_scan", ["plain", "scanned"], indirect=True)
+def test_a_cached_prompt_reads_its_cache_under_a_chosen_template(stack_scan):
     """A prompt prefilled into the cache under `chosen(attention='template')` builds no mask, so the mask's
     kernel is never decided and the template takes the call (row 2662: decided eagerly, the template's
     refusal of a mask raised), in a scanned stack too, whose residual dtype's abstract layer opens only
     the call's collections (row 4101: opened beyond them, its attention sowed QK-Clip maxima over a mask
     and the cache's making was refused): its logits on par with the xla kernel's uncached forward from
     the float64 forward over drawn weights and prompts (check 1)."""
-    model = tiny(scan_layers=scanned)
+    model = tiny()
     made, step = decode_steps(model)
 
     def prefilled(params, prompt):

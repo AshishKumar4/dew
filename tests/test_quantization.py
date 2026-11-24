@@ -24,7 +24,7 @@ import pytest
 from lane_environment import without_flags
 from flax import linen as nn
 from interop_support import extract_fixture, token_draw
-from model_support import parameter_loss
+from model_support import compiled_apply, parameter_loss
 from reference_error import as_given, assert_as_exact, assert_fp32_reduction_bound, dew_path, with_gradients
 from token_support import token_rows
 
@@ -73,8 +73,8 @@ def quantized_forward(spec, **overrides):
     return model, qmodel, variables, ids
 
 
-@pytest.mark.parametrize("scan_layers", [False, True])
-def test_the_wrapped_forward_matches_qwixs_own_call(scan_layers):
+@pytest.mark.parametrize("stack_scan", ["plain", "scanned"], indirect=True)
+def test_the_wrapped_forward_matches_qwixs_own_call(stack_scan):
     """Dew's wrapping against the provider built by hand, over the layer
     loop and over the scanned stack, the hand-built one traced under its own key (`quantize_with`),
     as Dew traces every Qwix-quantized model so Qwix owns its products: identical compiled logits, and both
@@ -84,7 +84,7 @@ def test_the_wrapped_forward_matches_qwixs_own_call(scan_layers):
     equal on CPU and on the RTX 4080, 1.2e-01 (CPU) and 1.3e-01 (RTX 4080)
     from fp32 on logits up to 3.9."""
     qwix = pytest.importorskip("qwix")
-    model, qmodel, variables, ids = quantized_forward(Quantization(), scan_layers=scan_layers)
+    model, qmodel, variables, ids = quantized_forward(Quantization())
     rules = [qwix.QtRule(module_path=".*", weight_qtype=jnp.int8,
                          act_qtype=jnp.int8)]
     reference = quantize_with(model, qwix.QtProvider(rules))
@@ -641,8 +641,8 @@ def test_serving_stores_int8_kernels_and_computes_what_training_quantized():
     served, served_variables = quantize_for_serving(model, variables, spec, ids)
     dtypes = {leaf.dtype for leaf in jax.tree.leaves(served_variables["params"])}
     assert jnp.dtype(jnp.int8) in dtypes
-    logits = served.apply(served_variables, ids)
-    np.testing.assert_array_equal(logits, qmodel.apply(variables, ids))
+    logits = compiled_apply(served, served_variables, ids)
+    np.testing.assert_array_equal(logits, compiled_apply(qmodel, variables, ids))
     assert not np.array_equal(logits, model.apply(variables, ids))
 
 
@@ -1640,15 +1640,17 @@ def test_an_int8_models_masked_attention_runs_none_of_its_own_orders_whole_produ
     assert owned and not owned & whole, owned
 
 
+@pytest.mark.parametrize("stack_scan", ["plain", "scanned"], indirect=True)
 @pytest.mark.parametrize("step", ["decode", "mixed"])
-def test_an_int8_models_paged_steps_read_their_rows_through_the_layers_attention(step):
+def test_an_int8_models_paged_steps_read_their_rows_through_the_layers_attention(step, stack_scan):
     """A paged CausalTransformer (16-slot pages, 4 query heads over 2, 64 wide, bf16) through a decode step
     and a mixed serving step (`Admitted`: rows decoding beside an admitted prompt), traced for a B200 on its
     reported routes: plain, some route takes a kernel forming its products whole, inside a launch a rule
     never sees (a paged kernel of `kv_cache.PAGED`, the template's work list); under Qwix's int8 rule, which
     owns the steps' products, no route takes one (`PagedCase.owned`, `AttentionCase.quantized`), whichever
     kernels the selectors then pick (train 802's review F1 and F2: the mixed step's work list and paged
-    read ran whole products)."""
+    read ran whole products), its stack run a layer at a time or scanned (row 12077: the scan refused the
+    interpreted launch's effect)."""
     pytest.importorskip("qwix")
     from model_support import TINY_DECODER
 

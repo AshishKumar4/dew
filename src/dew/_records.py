@@ -258,10 +258,16 @@ def set_added(value: DataclassInstance | Sequence[DataclassInstance] | Mapping[s
                or set_added(getattr(value, field.name)) for field in dataclasses.fields(value))
 
 
-REMOVED_FIELDS: Mapping[str, frozenset[str]] = {"dew.decision.layout:OptionLines": frozenset({"stream"})}
+REMOVED_FIELDS: Mapping[str, frozenset[str]] = {
+    "dew.decision.layout:OptionLines": frozenset({"stream"}),
+    "dew.nn.backbones.causal_transformer:CausalTransformer": frozenset({"scan_layers"}),
+    "dew.interop.source_options:SourceOptions": frozenset({"scan_layers"}),
+}
 """The fields a configuration lost after runs were saved with them, by its class's import path: each always
-another's (a question's option lines' stream, its instructions', rows 2008 to 2450), so a saved record of one
-means what today's, which has none, does. A saved run's records read without them (`earlier_fields`)."""
+another's (a question's option lines' stream, its instructions', rows 2008 to 2450), or how a model executes
+and never what it computes (a decoder's layer scan, which its structure decides since row 4074), so a saved
+record of one means what today's, which has none, does. A saved run's records read without them
+(`earlier_fields`)."""
 
 
 MOVED_CLASSES: Mapping[tuple[str, str], tuple[str, ...]] = {

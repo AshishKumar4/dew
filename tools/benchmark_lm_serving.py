@@ -204,9 +204,8 @@ def dew_points(args):
     import jax
 
     import dew
-    from dew.inference.serving import Server
+    from dew.inference.serving import DenseKV, PagedKV, Server
     from dew.inference.tasks import TextGeneration
-    from dew.nn.kv_cache import KVCache
     from dew.sampling import Sampling
     from dew.telemetry.compiles import Compiles
     from dew.training import MeshSpec
@@ -216,8 +215,7 @@ def dew_points(args):
     task = dew.pipeline(args.model, mesh=mesh, dtype="bfloat16", param_dtype="bfloat16")
     if not isinstance(task, TextGeneration):
         raise ValueError(f"{args.model} loads a {type(task).__name__}, not a text generation it serves")
-    task = dataclasses.replace(task, sampling=Sampling(temperature=0, eos_token_ids=None),
-                               logits=None, stopping=())
+    task = dataclasses.replace(task, sampling=Sampling(temperature=0, eos_token_ids=None))
     if args.vocab_limit > task.model.vocab_size:
         raise ValueError("--vocab-limit exceeds the model vocabulary")
     capacity = args.prompt + args.output
@@ -229,20 +227,19 @@ def dew_points(args):
              for axis in (entry if isinstance(entry, tuple) else (entry,)) if axis is not None}
     hardware = {"devices": [device.device_kind for device in jax.devices()], "jax": jax.__version__,
                 "load_seconds": load_seconds,
-                "weights": {"split_over": sorted(split),
-                            "devices": len({device for sharding in shardings for device in sharding.device_set})}}
-    layout = KVCache(page_size=args.page_size if args.kv == "paged" else None)
+                "weights": {"split_over": sorted(split), "devices": len(
+                    {device for sharding in shardings for device in sharding.device_set})}}
+    # No prefix reuse, as the engines run without it (vLLM's enable_prefix_caching=False): the timed
+    # repeats replay the warm pass's prompts, which a paged cache's default prefix reuse would serve.
+    cache = PagedKV(page_size=args.page_size, prefix_cache=False) if args.kv == "paged" else DenseKV()
     points = []
     for slots in args.slots:
         count = args.requests or max(64, 2 * slots)
         prompts = prompts_for(slots, count, args.prompt, args.vocab_limit)
         warm = prompts_for(slots, slots, args.prompt, args.vocab_limit, warm=True)
         began = time.perf_counter()
-        # No prefix reuse, as the engines run without it (vLLM's enable_prefix_caching=False): the timed
-        # repeats replay the warm pass's prompts, which a paged cache's default prefix reuse would serve.
-        server = Server.from_task(task, slots=slots, capacity=capacity,
-                                  admission=args.admission or None, decode_steps=args.decode_steps,
-                                  kv_cache=layout, prefix_cache=False)
+        server = Server.from_task(task, slots=slots, capacity=capacity, admission=args.admission or None,
+                                  decode_steps=args.decode_steps, cache=cache)
         print(f"slots {slots}: built in {time.perf_counter() - began:.2f}s", flush=True)
         dew_run(server, warm, args.output)
         # Each power-of-two admission width is its own program (`admission_share`).
@@ -257,7 +254,8 @@ def dew_points(args):
             repeats.append(measured)
             if args.generations and repeat == 0:
                 destination = args.out.with_name(f"{args.out.stem}-slots{slots}.npz")
-                np.savez(destination, tokens=np.concatenate([row.tokens[:, -args.output:] for row in generations]),
+                np.savez(destination,
+                         tokens=np.concatenate([row.tokens[:, -args.output:] for row in generations]),
                          raw=np.concatenate([row.raw_log_probs for row in generations]),
                          behavior=np.concatenate([row.behavior_log_probs for row in generations]))
         point = {"slots": slots, "admission": server.admission, "repeats": repeats,

@@ -108,13 +108,13 @@ def test_exact_nanogpt_architecture_trains_through_dew(bias):
 
 
 @pytest.mark.parametrize('given', ['attention_mask', 'coordinates'])
-@pytest.mark.parametrize('scan_layers', [False, True])
-def test_learned_position_cache_advances_each_rows_unpadded_positions(scan_layers, given):
+@pytest.mark.parametrize("stack_scan", ["plain", "scanned"], indirect=True)
+def test_learned_position_cache_advances_each_rows_unpadded_positions(stack_scan, given):
     """Learned positions read each row's unpadded places, whether the padding comes as a raw mask
     or as the tokens' coordinates alone, prefill and cache alike."""
     model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=2, num_heads=2,
                               max_seq_len=8, position_embedding='learned', qk_norm=False,
-                              attention_impl='reference', scan_layers=scan_layers)
+                              attention_impl='reference')
     ids = jnp.asarray([[1, 2, 3, 4], [0, 0, 5, 6]], jnp.int32)
     valid = jnp.asarray([[True, True, True, True], [False, False, True, True]])
     variables = model.init(jax.random.key(0), ids)

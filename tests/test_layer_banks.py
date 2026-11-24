@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 from bank_support import SelectedReads, fixture, host_layout, identical, scores, unpack
+from model_support import stacked
 
 from dew.batch import merge
 from dew.inference.banks import CheckpointBanks, HeldBanks, at_namespace, entry_tree, in_namespace, narrowed
@@ -19,6 +20,7 @@ DEVICE = Layout(min_shard=1, tolerance=1.0)
 
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize("kind", ["root", "multimodal", "shared-diffusion"])
 def test_declared_banks_preserve_canonical_values_layout_and_model_reads(kind):
     model, variables, tokens, indices, media = fixture(kind)
@@ -46,6 +48,7 @@ def test_declared_banks_preserve_canonical_values_layout_and_model_reads(kind):
                             for site in sites for first, count in site.view.groups]
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_distillations_source_banks_its_student_and_reads_its_teacher_whole():
     """A source places a distillation's store as its student's runs banked and its frozen teacher's
     tree as it is stored, deeper than the student's: the nested model's stacks are training's host
@@ -59,7 +62,7 @@ def test_a_distillations_source_banks_its_student_and_reads_its_teacher_whole():
 
     def decoder(layers):
         return CausalTransformer(vocab_size=16, emb_features=8, num_layers=layers, num_heads=2,
-                                 mlp_features=16, max_seq_len=8, scan_layers=True)
+                                 mlp_features=16, max_seq_len=8)
 
     objective = DistillationObjective(LMObjective(decoder(2), 8, ema_decay=None),
                                       LMObjective(decoder(3), 8, ema_decay=None))
@@ -71,6 +74,7 @@ def test_a_distillations_source_banks_its_student_and_reads_its_teacher_whole():
               objective.student_variables(variables))
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.mesh(devices=2)
 def test_a_host_owned_states_banked_teacher_gathers_a_layer_as_its_tree_did():
     """The bytes a device gathers for a distillation's largest layer (`gathered_layer_bytes`) once a host
@@ -88,7 +92,7 @@ def test_a_host_owned_states_banked_teacher_gathers_a_layer_as_its_tree_did():
 
     def decoder(layers):
         return CausalTransformer(vocab_size=16, emb_features=8, num_layers=layers, num_heads=2,
-                                 mlp_features=16, max_seq_len=8, scan_layers=True)
+                                 mlp_features=16, max_seq_len=8)
 
     objective = DistillationObjective(LMObjective(decoder(2), 8, ema_decay=None),
                                       LMObjective(decoder(3), 8, ema_decay=None))
@@ -113,6 +117,7 @@ class DeclaredOwners:
         return self.sites
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_shared_decoder_readers_allocate_one_canonical_owner_and_refuse_conflicts():
     model, variables, tokens, indices, media = fixture("shared-diffusion")
     (site,) = model.bank_sites(variables)
@@ -136,6 +141,7 @@ def first_leaf(tree):
     return tree + jnp.asarray(0.125, tree.dtype)
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize("kind", ["multimodal", "shared-diffusion"])
 def test_nested_checkpoint_banks_restore_only_selected_leaves_and_partial_ema(tmp_path, kind):
     model, variables, tokens, indices, media = fixture(kind)
@@ -161,6 +167,7 @@ def test_nested_checkpoint_banks_restore_only_selected_leaves_and_partial_ema(tm
               scores(model, resident, tokens, indices, media))
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_an_unbound_decoder_plans_its_banks_from_a_store_whose_rows_differ():
     """A store whose third layer holds a leaf its neighbours lack (a checkpoint that adapts or quantizes
     one layer in part) banks that layer in a run of its own, as the decoder bound to the store scans it
@@ -180,22 +187,23 @@ def test_an_unbound_decoder_plans_its_banks_from_a_store_whose_rows_differ():
 
 
 def test_an_unscanned_decoder_banks_one_layer_at_a_time():
-    """A plain loop declares singleton runs, which stream like longer ones."""
-    model, variables, tokens, indices, media = fixture("multimodal")
-    unscanned = model.clone(language_model=model.language_model.clone(scan_layers=False))
-    (site,) = unscanned.bank_sites(variables)
-    assert site.view.groups == tuple((index, 1) for index in range(4))
-    source = SelectedReads(HeldBanks(variables), unscanned.bank_sites(variables))
-    resident = HeldBanks(variables).place(unscanned, layout=DEVICE)
-    hosted = source.place(unscanned, layout=host_layout(site))
-    identical(unpack(hosted, unscanned.bank_sites(variables), source.shapes()), variables)
-    layers = in_namespace(hosted, site.namespace)["params"]
-    device_layers = in_namespace(resident, site.namespace)["params"]
-    for index in range(4):
-        for leaf, row in zip(jax.tree.leaves(layers[f"layers_{index}"]),
-                             jax.tree.leaves(device_layers[f"layers_{index}"]), strict=True):
-            assert leaf.sharding.memory_kind == "pinned_host"
-            assert leaf.shape == row.shape
-    identical(scores(unscanned, hosted, tokens, indices, media),
-              scores(unscanned, resident, tokens, indices, media))
-    assert source.reads == [(site.namespace, (index,)) for index in range(4)]
+    """A plain loop (`unrolled`) declares singleton runs, which stream like longer ones."""
+    with stacked(scanned=False):
+        model, variables, tokens, indices, media = fixture("multimodal")
+        unscanned = model
+        (site,) = unscanned.bank_sites(variables)
+        assert site.view.groups == tuple((index, 1) for index in range(4))
+        source = SelectedReads(HeldBanks(variables), unscanned.bank_sites(variables))
+        resident = HeldBanks(variables).place(unscanned, layout=DEVICE)
+        hosted = source.place(unscanned, layout=host_layout(site))
+        identical(unpack(hosted, unscanned.bank_sites(variables), source.shapes()), variables)
+        layers = in_namespace(hosted, site.namespace)["params"]
+        device_layers = in_namespace(resident, site.namespace)["params"]
+        for index in range(4):
+            for leaf, row in zip(jax.tree.leaves(layers[f"layers_{index}"]),
+                                 jax.tree.leaves(device_layers[f"layers_{index}"]), strict=True):
+                assert leaf.sharding.memory_kind == "pinned_host"
+                assert leaf.shape == row.shape
+        identical(scores(unscanned, hosted, tokens, indices, media),
+                  scores(unscanned, resident, tokens, indices, media))
+        assert source.reads == [(site.namespace, (index,)) for index in range(4)]

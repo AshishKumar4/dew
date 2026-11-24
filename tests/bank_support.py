@@ -16,9 +16,12 @@ from dew.training import Layout
 
 
 def fixture(kind):
+    """`kind`'s banked model ('root' a decoder, 'multimodal' its Gemma 3 wrapper, else Diffusion Gemma), its
+    variables, a prompt's tokens, its image indices and media: a decoder of runs of two layers, which its test
+    runs scanned (`scanned_stacks`), as its banks read them."""
     text = CausalTransformer(vocab_size=32, emb_features=16, num_layers=4,
                              num_heads=2, num_kv_heads=2, head_dim=8, mlp_features=32,
-                             max_seq_len=16, scan_layers=True, bank_layers=2,
+                             max_seq_len=16, bank_layers=2,
                              dtype=jnp.float32, attention_impl="reference")
     tokens = jnp.asarray([[2, 1, 3, 4]], jnp.int32)
     indices = jnp.asarray([[-1, 0, -1, -1]], jnp.int32)

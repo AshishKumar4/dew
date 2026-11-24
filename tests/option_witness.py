@@ -44,7 +44,9 @@ def members_of(annotation: type, base=None) -> list[object]:
     """The values of Dew's classes that are `annotation`s: every member of a registry kind
     (`registry.KINDS`) and every class its package exports (`dew.sampling`'s CFG, APG, ...) that derives
     from `annotation`, or, for a protocol, holds each method it declares, each built from its defaults,
-    its required fields `base`'s of those names, the value a run saved, which one without them lacks."""
+    its required fields `base`'s of those names, the value a run saved, which one without them lacks. A
+    protocol of a call alone (`dew.sampling.Strategy`) is held by a class its call's arguments bind to, not
+    by every class called at all (a metric is no strategy: `_called_alike`)."""
     import importlib
 
     package = importlib.import_module(".".join(annotation.__module__.split(".")[:2]))
@@ -57,8 +59,8 @@ def members_of(annotation: type, base=None) -> list[object]:
         if not isinstance(member, type):
             continue
         fits = member is not annotation and (
-            all(callable(getattr(member, name, None)) for name in declared) if protocol
-            else issubclass(member, annotation))
+            all(callable(getattr(member, name, None)) for name in declared)
+            and _called_alike(member, annotation) if protocol else issubclass(member, annotation))
         if not fits:
             continue
         required = [field.name for field in dataclasses.fields(member) if field.init and field.default
@@ -71,6 +73,28 @@ def members_of(annotation: type, base=None) -> list[object]:
         except (TypeError, ValueError):
             continue
     return values
+
+
+def _called_alike(member: type, protocol: type) -> bool:
+    """Whether `member`'s instances are called as `protocol` declares its call, where it declares one: a
+    `__call__` of the class's own or a base's (a class's constructor is no call of its instances) that the
+    call's positional arguments bind to (a parameter of its own with a default among them)."""
+    import inspect
+
+    declared = vars(protocol).get("__call__")
+    if declared is None:
+        return True
+    called = next((vars(cls)["__call__"] for cls in member.__mro__
+                   if cls is not object and "__call__" in vars(cls)), None)
+    if called is None:
+        return False
+    positional = [parameter for parameter in inspect.signature(declared).parameters.values()
+                  if parameter.kind in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)]
+    try:
+        inspect.signature(called).bind(*(None for _ in positional))
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 WITNESSES = {Reads: (Reads((("row", "self", "whole"),)), Reads((("row", "self", "causal"),))),

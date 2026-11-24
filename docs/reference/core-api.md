@@ -244,13 +244,15 @@ Decoding has three extension points: logits transforms, stopping criteria and st
 
 `StepState` is everything a transform or a criterion receives. `tokens` is the fixed-capacity buffer of the prompt followed by the slots for generated tokens, `[rows, prompt_width + max_new_tokens]`. `valid` marks the slots that hold a real token, so a row reads its own history whatever padding its prompt batch needed. `step` counts the tokens a row has committed, `active` marks the rows still generating, and `keys` holds one PRNG key per row. `state.history()` returns each row's real tokens left aligned with their count, `prompt_history()` returns the prompt region, and `total()` returns the real token count. A transform never sees model parameters or cache internals.
 
-`logits` is the whole transform chain, in the order it runs. Left as `None`, it is the chain `sampling` compiles to. An explicit sequence replaces that chain entirely, and `()` runs no transform, so a caller who needs an order `Sampling` does not produce can write the order they want. A call's `logits` replaces the task's bound chain. An explicit `sampling=` on a call also clears a bound chain, because that chain was built for the policy the call just replaced.
+A `Sampling` value is the one decoding policy a request runs: its controls, its `logits` chain, its `stopping` criteria and its `strategy`. `logits` is the whole transform chain, in the order it runs. Left as `None`, it is the chain the controls compile to (`policy.transforms()`). An explicit sequence replaces that chain entirely, and `()` runs no transform, so a caller who needs an order the controls do not produce can write the order they want. A call's `sampling=` replaces the task's policy whole, its chain with it.
 
-`stopping` adds to the policy instead of replacing it. An explicit sequence runs beside the policy's EOS criterion, so naming a criterion cannot drop EOS termination. Criteria combine with OR and run after every committed token. The token that fired a criterion is emitted with its likelihoods, and later slots hold `pad_id` with zero likelihood.
+`stopping` adds to the policy's EOS criterion instead of replacing it. An explicit sequence runs beside the policy's EOS criterion, so naming a criterion cannot drop EOS termination. Criteria combine with OR and run after every committed token. The token that fired a criterion is emitted with its likelihoods, and later slots hold `pad_id` with zero likelihood.
 
 Built-in transforms are pytrees, so a configuration that holds arrays is passed as data and does not become part of a compilation cache key. A plain function works too, and `jax.tree_util.Partial(fn, array)` passes array configuration to one. Everything runs inside the compiled loop, with no host callback. Across a pool, the resolved components are compared by their structure and by the contents of their configuration arrays, so two ranks that ban different tokens are refused instead of each running its own policy.
 
 ```python
+from dataclasses import replace
+
 import jax
 import jax.numpy as jnp
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -268,28 +270,28 @@ def favor_short(state, logits):
     return logits.at[:, 2].add(jnp.where(state.step >= 8, 3.0, 0.0))
 
 
-# The common controls are one value, compiled in Transformers' order.
+# The common controls are one value, compiled in Transformers' order; the
+# policy also holds the criteria beside its EOS, the chain and the strategy.
 policy = Sampling(temperature=0.8, top_p=0.9, repetition_penalty=1.1, frequency_penalty=0.4,
                   no_repeat_ngram_size=3, eos_token_ids=2, pad_token_id=0)
-drawn = generate(model, variables, prompts, 32, key=0, sampling=policy,
-                 stopping=(decoding.MaxNewTokens(24),))
+drawn = generate(model, variables, prompts, 32, key=0,
+                 sampling=replace(policy, stopping=(decoding.MaxNewTokens(24),)))
 
 # An explicit chain is complete: a transform of your own joins the policy's.
-nudged = generate(model, variables, prompts, 32, key=0, sampling=policy,
-                  logits=(favor_short, *policy.transforms()))
+nudged = generate(model, variables, prompts, 32, key=0,
+                  sampling=replace(policy, logits=(favor_short, *policy.transforms())))
 
 # The same request as a deterministic search over four beams, returning two.
 searched = generate(model, variables, prompts, 32, key=0,
-                    sampling=Sampling(eos_token_ids=2, pad_token_id=0),
-                    logits=(decoding.NoRepeatNGram(3),),
-                    strategy=Beam(width=4, length_penalty=1.0), n=2)
+                    sampling=Sampling(eos_token_ids=2, pad_token_id=0, logits=(decoding.NoRepeatNGram(3),),
+                                      strategy=Beam(width=4, length_penalty=1.0)), n=2)
 
 # Drafted by the model's own prediction depths and verified by the model:
 # tokens are distributed exactly as ordinary sampling under this call's
 # policy; accepted drafts save target forwards, which untrained depths rarely give.
 drafted = generate(model, variables, prompts, 32, key=0,
-                   sampling=Sampling(temperature=0.8, top_p=0.9, eos_token_ids=2),
-                   strategy=Speculative(block=4))
+                   sampling=Sampling(temperature=0.8, top_p=0.9, eos_token_ids=2,
+                                     strategy=Speculative(block=4)))
 print(drawn.tokens.shape, nudged.tokens.shape, searched.tokens.shape, drafted.tokens.shape)
 ```
 
@@ -380,7 +382,7 @@ Dew uses T5X as a reference and a test oracle, and adapts some of its state and 
 
 A loaded source's `generation_config.json` is data. Dew assigns every control Transformers 5.16.1 writes there to one consumer: the native policy, a transform, a criterion, a strategy or the task. Otherwise the control is provenance only, or `PretrainedDecoder.text_generation()` refuses it and says why. The common controls become the task's `Sampling` value, `task.sampling`, so you change one with `dataclasses.replace(task.sampling, ...)`.
 
-A source that also sets a control `Sampling` does not hold gets `task.logits`, the complete chain. The same compiler (`ordered_transforms`) builds that chain in `_get_logits_processor`'s order, with the policy's transforms in it. A source that runs beam search always gets a chain, which ends after the processors because the search picks its own continuations. An unset control, or one at the value where `generate()` adds no processor, criterion or search mode, has no effect. As upstream, beam-only and sampling-only controls are checked only when beam search or sampling is active.
+A source that also sets a control `Sampling` does not hold gets `task.sampling.logits`, the complete chain. The same compiler (`ordered_transforms`) builds that chain in `_get_logits_processor`'s order, with the policy's transforms in it. A source that runs beam search always gets a chain, which ends after the processors because the search picks its own continuations. An unset control, or one at the value where `generate()` adds no processor, criterion or search mode, has no effect. As upstream, beam-only and sampling-only controls are checked only when beam search or sampling is active.
 
 Each source control has one rule for its consumer, neutral value, mode and refusal. Source value precedence remains `generation_config.json`, wrapper config, then text config. The source resolver selects the actual policy once. `Sampling` supplies convenience defaults at the request boundary; only resolved transforms, criteria, strategy and padding reach the compiled decoder. An explicit chain therefore has no unused sampling settings in its compilation or process-agreement identity.
 
@@ -453,7 +455,7 @@ Import `pipeline`, `TextGeneration`, `BlockGeneration`, `MaskedGeneration`, `Tex
 
 <!-- api: dew.lora.LoRA dew.lora.LoRA.apply dew.lora.LoRA.load dew.lora.Adapter.from_run dew.lora.Adapter.merge dew.lora.Adapter.save -->
 
-<!-- api: dew.inference.TextToImage dew.inference.TextToImage.from_objective dew.inference.TextToImage.from_run dew.inference.TextToImage.from_saved dew.objectives.lm.LMObjective.policy dew.inference.TextToImage.bind dew.inference.TextToImage.quantized dew.inference.TextToImage.prepare dew.inference.TextToImage.__call__ dew.inference.RunProcessor dew.inference.Server.from_task -->
+<!-- api: dew.inference.TextToImage dew.inference.TextToImage.from_objective dew.inference.TextToImage.from_run dew.inference.TextToImage.from_saved dew.objectives.lm.LMObjective.policy dew.inference.TextToImage.bind dew.inference.TextToImage.quantized dew.inference.TextToImage.prepare dew.inference.TextToImage.__call__ dew.inference.RunProcessor dew.inference.Server.from_task dew.inference.serving.DenseKV dew.inference.serving.PagedKV dew.inference.rollouts.SafetensorsReload -->
 
 `RunProcessor` adapts a run's `ByteTokenizer` or `HFTokenizer` as a task processor.
 
@@ -475,7 +477,7 @@ An explicit `sampling=` replaces the policy and the chain, and the controls behi
 
 For a source that ships a checker or an output transform, `finish(params, images)` runs it on the decoded images under the same placement. Each call encodes the task's own unconditional prompt with the encoders it holds, as the training step encodes its blank (`DiffusionObjective.blank_conditions`). Rebinding keeps every task's compilation identity.
 
-`Server.from_task(task, slots=, capacity=)` serves a `TextGeneration` task with continuous batching over one resident KV cache. Its cache stays the model's own layout unless `kv_cache` names one; `kv_cache='shared'` pages it for requests that repeat prompts. It holds `slots` rows of `capacity` cache slots each, admits queued requests into free rows, and runs one compiled step over every row per iteration. Every request runs the task's bound policy and draws with the key it was submitted with, so a served request draws the same tokens as the same request run alone, except where the model's products round at boundaries that two programs' roundings cross, as a quantized decoder's moving weights and a paged prefill's attention on a device's paged kernel do (`docs/concepts/inference.md`). `submit` returns a ticket that resolves to the request's `Generation`, `step` runs one iteration, and `run` steps until the queue and the rows are empty. Calling the server with a batch of prompts submits them and runs them.
+`Server.from_task(task, slots=, capacity=)` serves a `TextGeneration` task with continuous batching over one resident KV cache. Its cache stays the model's own layout unless `cache` lays another: `DenseKV()` keeps each row's whole, `PagedKV(...)` pools pages with the server's prefix cache, and `PagedKV(shared=True)` pages it for requests that repeat prompts. It holds `slots` rows of `capacity` cache slots each, admits queued requests into free rows, and runs one compiled step over every row per iteration. Every request runs the task's bound policy and draws with the key it was submitted with, so a served request draws the same tokens as the same request run alone, except where the model's products round at boundaries that two programs' roundings cross, as a quantized decoder's moving weights and a paged prefill's attention on a device's paged kernel do (`docs/concepts/inference.md`). `submit` returns a ticket that resolves to the request's `Generation`, `step` runs one iteration, and `run` steps until the queue and the rows are empty. Calling the server with a batch of prompts submits them and runs them.
 
 ### External engine clients
 

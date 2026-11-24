@@ -1,14 +1,14 @@
 """The decoder's layer stack under flax's scan and over the stage axis.
 
-`scan_layers` groups consecutive layers that share a parameter shape and a
-computation and runs each group as iterations of one body; a stage axis on
+A decoder groups consecutive layers that share a parameter shape and a
+computation and runs each group as iterations of one body, unless a test unrolls
+it (`model_support.unrolled`, `generation.chosen(layer_scan="plain")`); a stage axis on
 the mesh in context runs the stack as a GPipe pipeline. Both read the
 plain loop's variables tree through `StackView`, so the tests here hold the
 tree, the logits, the decode path, the loss and the gradients to the plain
 loop's, with the largest observed difference written beside each bound.
 """
 
-import dataclasses
 import functools
 import json
 from pathlib import Path
@@ -22,7 +22,7 @@ import pytest
 import selection_margins
 from arm_arithmetic import float64_held, unrewritten
 from flax import linen as nn
-from model_support import flat_tree, largest_difference, stepped_decode, steps_from
+from model_support import flat_tree, largest_difference, stepped_decode, steps_from, unrolled
 from reference_error import (
     FEWEST_SEEDS,
     GateFailure,
@@ -64,19 +64,18 @@ FIXTURE_NAMES = ("qwen3-tiny", "deepseek-v3-tiny", "gemma4-e2b", "gemma3n-tiny")
 
 
 def fixture_pair(name, **overrides):
-    """The fixture's model and its scanned twin, with the fixture's weights."""
+    """The fixture's model, which scans its stack, with the fixture's weights."""
     directory = FIXTURES / name
     pretrained = Pretrained.load(
         str(directory), dtype="float32", attention_impl="reference", **overrides)
-    scanned = models.build("causal_transformer",
-                           **{**pretrained.model_config, "scan_layers": True})
-    return pretrained.model, scanned, pretrained.variables, directory
+    return pretrained.model, pretrained.variables, directory
 
 
 def paths(tree):
     return [jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_leaves_with_path(tree)]
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize("name", sorted(FIXTURE_NAMES))
 def test_a_scanned_fixture_scores_as_the_plain_loop(name):
     """The fixture's weights through the scanned stack: the runs the geometry
@@ -84,13 +83,12 @@ def test_a_scanned_fixture_scores_as_the_plain_loop(name):
     tests/test_hf_decoders.py. Largest observed |logit difference| against
     the plain loop on CPU: qwen3-tiny 3.3e-06, and 0.0 for the three whose
     layers all differ from their neighbours."""
-    model, scanned, variables, directory = fixture_pair(name)
+    model, variables, directory = fixture_pair(name)
     ids = jnp.asarray(np.load(directory / "input_ids.npy"), jnp.int32)
     reference = np.load(directory / "logits.npy")
 
-
-    plain = np.asarray(model.apply(variables, ids))
-    logits = np.asarray(scanned.apply(variables, ids))
+    plain = np.asarray(unrolled(model.apply)(variables, ids))
+    logits = np.asarray(model.apply(variables, ids))
 
     difference = float(np.max(np.abs(logits - plain)))
     assert difference < 1e-5, f"max |logit difference| {difference:.3e}"
@@ -98,18 +96,19 @@ def test_a_scanned_fixture_scores_as_the_plain_loop(name):
     assert float(np.max(np.abs(logits - reference))) < 1e-4
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize("name", sorted(FIXTURE_NAMES))
 def test_a_scanned_fixture_decodes_through_the_cache(name):
     """A prefill and single-token steps through the scanned stack's cache
     against the whole sequence at once. Largest observed difference on
     CPU: 3.4e-06 (qwen3-tiny)."""
-    model, scanned, variables, directory = fixture_pair(name, max_seq_len=16)
+    scanned, variables, directory = fixture_pair(name, max_seq_len=16)
     ids = jnp.asarray(np.load(directory / "input_ids.npy")[:1, :8], jnp.int32)
     whole = jnp.asarray(scanned.apply(variables, ids))
 
     state = nn.unbox(scanned.init(jax.random.key(0), ids[:, :1], decode=True))
-    assert paths(state["cache"]) == paths(nn.unbox(model.init(jax.random.key(0), ids[:, :1],
-                                                     decode=True))["cache"])
+    assert paths(state["cache"]) == paths(nn.unbox(unrolled(scanned.init)(jax.random.key(0), ids[:, :1],
+                                                                          decode=True))["cache"])
     steps = []
     for position in range(ids.shape[1]):
         step, state = scanned.apply(
@@ -225,13 +224,13 @@ def same_metrics(left: dict, right: dict, relative: float = 1e-5) -> bool:
 
 
 def scanned_pair(build):
-    """`build`'s plain loop and scanned stack, the plain loop's variables and the ids it was initialized
-    over: its initializer one program, where run op by op Gemma 3n's compiled 448 programs, 16 s of a cold
-    test (row 7860)."""
-    plain, scanned = build(), build(scan_layers=True)
+    """`build`'s decoder, which a plain loop runs unrolled (`unrolled`) and which scans its stack by
+    default, its variables and the ids it was initialized over: its initializer one program, where run op
+    by op Gemma 3n's compiled 448 programs, 16 s of a cold test (row 7860)."""
+    model = build()
     ids = jax.random.randint(jax.random.key(1), (2, 12), 0, VOCAB)
-    variables = nn.unbox(jax.jit(plain.init)(jax.random.key(0), ids))
-    return plain, scanned, variables, ids
+    variables = nn.unbox(jax.jit(model.init)(jax.random.key(0), ids))
+    return model, model, variables, ids
 
 
 class ScanCase:
@@ -246,7 +245,7 @@ class ScanCase:
         self.shape = shape
         self.build = functools.partial(SHAPES[shape], **SCAN_WIDTHS.get(shape, {}))
         self.plain, _, self.variables, _ = scanned_pair(self.build)
-        self.scanned = self.build(scan_layers=True, **scanned)
+        self.scanned = self.build(**scanned)
         self.training = gemma3n_training_variables(self.variables) if shape == "gemma3n" else self.variables
         self.config = SHAPE_CONFIGS[shape](**SCAN_WIDTHS.get(shape, {}))
         rows = SCAN_ROWS.get(shape, BATCH)
@@ -257,11 +256,11 @@ class ScanCase:
             return ids, np.float32(1.0)
 
         self.runs = {"scanned": self.measured(self.scanned, self.variables, self.training),
-                     "plain": self.measured(self.plain, self.variables, self.training)}
+                     "plain": unrolled(self.measured(self.plain, self.variables, self.training))}
         self.scales: dict = {}
         self.drawn = drawn
         if selection_margins.selects(self.config):
-            selected = selection_margins.capture(self.plain)
+            selected = unrolled(selection_margins.capture(self.plain))
             least = SCAN_MARGIN if selection_margins.routes(self.config) else selection_margins.MARGIN
 
             def clears(inputs):
@@ -333,7 +332,7 @@ class ScanCase:
             if "written" not in self.runs:
                 run = self.computed(self.plain, self.variables, self.training)
                 self.runs["written"] = unrewritten(lambda ids, cotangent: run(ids, cotangent))
-            self.scales[key] = rounding_scale(self.runs["written"], *inputs, seed=seed)[1]
+            self.scales[key] = unrolled(rounding_scale)(self.runs["written"], *inputs, seed=seed)[1]
         return self.scales[key]
 
     def arms(self):
@@ -342,8 +341,8 @@ class ScanCase:
         def truth(ids, cotangent):
             with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
                 if "truth" not in self.runs:
-                    self.runs["truth"] = self.measured(self.build(dtype=jnp.float64),
-                                                       widened(self.variables), widened(self.training))
+                    self.runs["truth"] = unrolled(self.measured(
+                        self.build(dtype=jnp.float64), widened(self.variables), widened(self.training)))
                 return jax.device_get(self.runs["truth"](*widened((ids, cotangent))))
 
         def arm(name):
@@ -461,23 +460,23 @@ def next_token_cross_entropy(logits, ids):
     return -jnp.take_along_axis(jax.nn.log_softmax(logits[:, :-1]), ids[:, 1:, None], axis=-1).mean()
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize("shape", sorted(SHAPES))
 def test_a_scanned_init_is_the_plain_init(shape):
-    """`init` draws the same way whatever `scan_layers` says, so the tree
-    holds the same leaves with the same values, both drawn in one program,
-    and the scanned model reads a checkpoint of the plain one leaf for leaf
-    (ledger 3178)."""
-    build = SHAPES[shape]
-    plain, scanned = build(), build(scan_layers=True)
+    """`init` draws the same way whether the stack runs scanned or unrolled (`unrolled`), so the tree
+    holds the same leaves with the same values, each drawn in one program, and the scanned model reads a
+    checkpoint of the plain one leaf for leaf (ledger 3178)."""
+    model = SHAPES[shape]()
     ids = jnp.ones((1, 4), jnp.int32)
-    first, second = jax.jit(lambda key: [nn.unbox(model.init(key, ids)) for model in (plain, scanned)])(
-        jax.random.key(0))
+    drawn = jax.jit(lambda key: nn.unbox(model.init(key, ids)))
+    first, second = unrolled(drawn)(jax.random.key(0)), drawn(jax.random.key(0))
 
     assert paths(first) == paths(second)
     assert all(jax.tree.leaves(jax.tree.map(
         lambda a, b: bool(jnp.array_equal(a, b)), first, second)))
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_scanned_moe_stack_sows_and_balances_like_the_plain_loop():
     """The routers sow through the scanned view, so the balance loss and the
     aux-loss-free bias move as they do under the plain loop. Observed loss
@@ -486,13 +485,14 @@ def test_a_scanned_moe_stack_sows_and_balances_like_the_plain_loop():
     batch = {"text": jax.random.randint(jax.random.key(2), (BATCH, 12), 0, VOCAB)}
     step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(3), ema=None)
 
-    outcomes = []
-    for model in (plain, scanned):
+    def outcome(model):
         objective = LMObjective(model, 11, balance=ExpertBalance(balance_rate=0.01, aux_loss_alpha=0.1))
         loss, aux = objective.scalar_loss(variables, batch, step)
         assert aux.effects is not None
-        outcomes.append((float(loss), {name: float(value) for name, value in aux.metrics.items()},
-                         objective.apply_effects(variables, aux.effects)["moe"]))
+        return (float(loss), {name: float(value) for name, value in aux.metrics.items()},
+                objective.apply_effects(variables, aux.effects)["moe"])
+
+    outcomes = [unrolled(outcome)(plain), outcome(scanned)]
     (loss, metrics, moe), (scanned_loss, scanned_metrics, scanned_moe) = outcomes
 
     assert abs(loss - scanned_loss) < 1e-5, (loss, scanned_loss)
@@ -521,13 +521,19 @@ def decoder_axes(layers):
             for name in names}
 
 
-@pytest.mark.parametrize("scan", (False, True))
+@pytest.mark.parametrize("stack_scan", ["plain", "scanned"], indirect=True)
 @pytest.mark.parametrize("bank_layers", (None, 1))
-def test_a_decoder_init_keeps_every_layers_declared_kernel_axes(scan, bank_layers):
-    """A layer's stored box names its own dimensions, whichever loop draws the layers."""
-    model = tiny(num_layers=2, scan_layers=scan, bank_layers=bank_layers)
+def test_a_decoder_init_keeps_every_layers_declared_kernel_axes(stack_scan, bank_layers):
+    """A layer's stored box names its own dimensions, whichever loop draws the layers; and the stack runs as
+    the test's choice says (`stack_scan`): its two like layers one scan where scanned in one bank, no scan
+    at all where plain."""
+    model = tiny(num_layers=2, bank_layers=bank_layers)
     ids = jnp.ones((1, 4), jnp.int32)
     variables = jax.eval_shape(model.init, jax.random.key(0), ids)
+    graph = jax.make_jaxpr(lambda tree: model.apply(tree, ids))(nn.unbox(variables))
+    scans = any(equation.primitive.name == "scan" for equation in equations(graph))
+    if stack_scan == "plain" or bank_layers is None:
+        assert scans == (stack_scan == "scanned"), (stack_scan, bank_layers)
     expected = decoder_axes(2)
     actual = boxed_axes(variables)
     assert {path: actual[path] for path in expected if path in actual} == expected
@@ -580,8 +586,9 @@ def drawn_ids(stream: int, length: int):
     return draw
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_decode_step_scans_a_periodic_stack_as_one_body_and_decodes_as_the_loop():
-    """Under `scan_layers` a decode step over resident weights scans a stack whose layers repeat one
+    """A decode step over resident weights scans a stack whose layers repeat one
     period as one body of the period's layers (`scan_groups(periodic=True)`): the step is one scan
     over the period's repeats, its body the same for two periods as for six, its cache in the plain
     loop's layout, and its steps decode as exactly as the plain loop's, both from the loop's own
@@ -597,13 +604,13 @@ def test_a_decode_step_scans_a_periodic_stack_as_one_body_and_decodes_as_the_loo
         body = sorted(str(equation.primitive) for equation in equations(scan.params["jaxpr"]))
         return scan.params["length"], body
 
-    short, deep = hybrid(2, scan_layers=True), hybrid(6, scan_layers=True)
+    short, deep = hybrid(2), hybrid(6)
     (two, shallow), (six, body) = (program(model, nn.unbox(model.init(jax.random.key(0), ids)))
                                    for model in (short, deep))
     assert (two, six) == (2, 6) and shallow == body
     plain = hybrid(6)
     variables = nn.unbox(plain.init(jax.random.key(0), ids))
-    assert decoded(deep, variables, ids)[1] == decoded(plain, variables, ids)[1]
+    assert decoded(deep, variables, ids)[1] == unrolled(decoded)(plain, variables, ids)[1]
 
     draw = drawn_ids(0x9E, 10)
 
@@ -612,13 +619,14 @@ def test_a_decode_step_scans_a_periodic_stack_as_one_body_and_decodes_as_the_loo
     with jax.enable_x64(new_val=True):
         twin, wide = hybrid(6, dtype=jnp.float64), float64_held(variables)
 
+    @unrolled
     def truth(ids):
         return decoded(twin, wide, ids)[0]
 
     def steps(model):
         return lambda ids: decoded(model, variables, ids)[0]
 
-    assert_as_exact(steps(deep), steps(plain), draw, "periodic decode steps", seeds=PERIODIC_SEEDS,
+    assert_as_exact(steps(deep), unrolled(steps(plain)), draw, "periodic decode steps", seeds=PERIODIC_SEEDS,
                     truth_fn=truth)
 
 
@@ -626,6 +634,7 @@ ONE_STAGE_SEEDS = 8
 """Check 1's declared seeds for a one-stage state's stack read in place against the per-layer store."""
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_one_stage_state_holds_a_scanned_stack_as_its_scan_reads_it():
     """On one stage a scanned decoder's stage-local state (`stage_sites` at one stage, `StackView.
     stage_form`) holds each run as the scan reads it, a periodic run stacked by position of its period,
@@ -633,7 +642,7 @@ def test_a_one_stage_state_holds_a_scanned_stack_as_its_scan_reads_it():
     which comes back in the same form, on par with the per-layer store's (check 1), and its program holds
     fewer temporaries than the per-layer store's, which restacks the run every step (row 4098). Its
     layers come back as they were stored (`layer_form`, `stored_layers`)."""
-    model = hybrid(3, scan_layers=True)
+    model = hybrid(3)
     ids = jax.random.randint(jax.random.key(1), (2, 10), 0, VOCAB)
     params = nn.unbox(model.init(jax.random.key(0), ids))["params"]
     (site,) = model.stage_sites({"params": params}, 1)
@@ -685,6 +694,7 @@ BANKED_EXPERT_SEEDS = 8
 """The banked MoE decode's check-1 seeds, sized by `seeds_for` on armada."""
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_banked_moe_decode_reads_each_layers_experts_in_place_and_decodes_as_the_loop():
     """A scanned MoE stack decoding over a bank in device memory (`HeldBanks.place`, every run's leaves one
     array) hands each layer it reads a layer at a time the run's expert kernels whole and the layer's
@@ -696,7 +706,7 @@ def test_a_banked_moe_decode_reads_each_layers_experts_in_place_and_decodes_as_t
     collection open writes none of the kernels back."""
     ids = jax.random.randint(jax.random.key(2), (2, 8), 0, VOCAB)
     routed = {"experts": 4, "top_k": 2, "expert_features": 16, "layers": tuple(range(4))}
-    scanned = tiny(num_layers=4, max_seq_len=16, scan_layers=True, mixture=routed)
+    scanned = tiny(num_layers=4, max_seq_len=16, mixture=routed)
     plain = tiny(num_layers=4, max_seq_len=16, mixture=routed)
     variables = plain.init(jax.random.key(0), ids)
     banked = HeldBanks(variables).place(scanned)
@@ -728,20 +738,22 @@ def test_a_banked_moe_decode_reads_each_layers_experts_in_place_and_decodes_as_t
         wide, wide_variables = (tiny(num_layers=4, max_seq_len=16, mixture=routed, dtype=jnp.float64),
                                 float64_held(variables))
 
+    @unrolled
     def truth(ids):
         return decoded(wide, wide_variables, ids)[0]
 
     def steps(model, store):
         return lambda ids: decoded(model, store, ids)[0]
 
-    assert_as_exact(steps(scanned, banked), steps(plain, variables), draw, "banked MoE decode steps",
-                    seeds=BANKED_EXPERT_SEEDS, truth_fn=truth)
+    assert_as_exact(steps(scanned, banked), unrolled(steps(plain, variables)), draw,
+                    "banked MoE decode steps", seeds=BANKED_EXPERT_SEEDS, truth_fn=truth)
 
 
 BANKED_DECODE_SEEDS = 8
 """The banked decode's check-1 seeds, sized by `seeds_for` on armada."""
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_banked_decode_keeps_its_cache_banked_and_reads_its_layers_as_the_per_layer_cache():
     """A scanned MoE stack decoding over a banked store (`HeldBanks.place`) allocates its decode cache as
     the store holds the run's weights, the run's layers one array under the run's name, and every later
@@ -752,7 +764,7 @@ def test_a_banked_decode_keeps_its_cache_banked_and_reads_its_layers_as_the_per_
     both from the plain loop's own float64 decode (check 1), two compiled programs being two orders of
     sums; and each layer of the bank holds the per-layer cache's slots and cursor, exactly."""
     routed = {"experts": 4, "top_k": 2, "expert_features": 16, "layers": tuple(range(4))}
-    scanned = tiny(num_layers=4, max_seq_len=16, scan_layers=True, mixture=routed)
+    scanned = tiny(num_layers=4, max_seq_len=16, mixture=routed)
     plain = tiny(num_layers=4, max_seq_len=16, mixture=routed)
     # Each init and the allocating call one compiled program, where op by op they took most of the test's
     # 149 s (row 7456).
@@ -811,12 +823,12 @@ SOURCE_SCAN_SEEDS = 8
 """A loaded source's scanned decode's check-1 seeds, sized by `seeds_for` on armada."""
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_loaded_source_scans_its_periodic_stack_where_its_load_asks(tmp_path):
-    """`Pretrained.load(..., scan_layers=True)`, a run's and a pipeline's `--source.scan-layers`
-    (`SourceOptions`), scans a loaded source's periodic stack in its decode step (ledger 642): qwen35-tiny's
-    period of three delta nets and an attention layer, twice in its transformers checkpoint, decodes as
-    one scan of the period's two repeats, its steps as exactly as the plain load's, both from its own
-    float64 steps (check 1)."""
+    """A loaded source scans its periodic stack in its decode step by itself (ledger 642, row 4074):
+    qwen35-tiny's period of three delta nets and an attention layer, twice in its transformers checkpoint,
+    decodes as one scan of the period's two repeats, its steps as exactly as the same load's unrolled
+    (`unrolled`), both from its own float64 steps (check 1)."""
     import torch
     from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig
 
@@ -824,8 +836,7 @@ def test_a_loaded_source_scans_its_periodic_stack_where_its_load_asks(tmp_path):
     config.update(num_hidden_layers=8, layer_types=config["layer_types"] * 2)
     torch.manual_seed(0)
     Qwen3_5ForCausalLM(Qwen3_5TextConfig(**config)).to(torch.float32).save_pretrained(tmp_path)
-    plain, scanned = (Pretrained.load(tmp_path, dtype="float32", attention_impl="reference", scan_layers=scan)
-                      for scan in (False, True))
+    plain = scanned = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
     ids = np.zeros((2, 1), np.int32)
     cache = nn.unbox(scanned.model.init(jax.random.key(0), ids, decode=True))["cache"]
     graph = jax.make_jaxpr(lambda variables, cache: scanned.model.apply(
@@ -838,13 +849,14 @@ def test_a_loaded_source_scans_its_periodic_stack_where_its_load_asks(tmp_path):
     with jax.enable_x64(new_val=True):
         twin, wide = plain.model.clone(dtype=jnp.float64), float64_held(plain.variables)
 
+    @unrolled
     def truth(ids):
         return decoded(twin, wide, ids)[0]
 
     def steps(source):
         return lambda ids: decoded(source.model, source.variables, ids)[0]
 
-    assert_as_exact(steps(scanned), steps(plain), draw, "a loaded source's scanned decode",
+    assert_as_exact(steps(scanned), unrolled(steps(plain)), draw, "a loaded source's scanned decode",
                     seeds=SOURCE_SCAN_SEEDS, truth_fn=truth)
 
 
@@ -852,6 +864,7 @@ def bf16(**overrides):
     return models.build("causal_transformer", {**TINY, **overrides}, dtype="bfloat16", attention_impl="xla")
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_scanned_stack_under_a_bf16_policy_scores_as_the_plain_loop_does():
     """Under a bf16 compute policy the plain loop's first layer returns the
     residual stream in fp32 and the scan takes it in fp32 from the start,
@@ -860,12 +873,12 @@ def test_a_scanned_stack_under_a_bf16_policy_scores_as_the_plain_loop_does():
     observed on CPU 5.2e-02 against 5.0e-02 on logits of order 4, and
     3.1e-02 between the two. The fp32 tests above hold the two paths to
     fp32 tolerance."""
-    plain, scanned = bf16(), bf16(scan_layers=True)
+    plain, scanned = bf16(), bf16()
     exact = tiny(attention_impl="xla")
     ids = jax.random.randint(jax.random.key(1), (2, 12), 0, VOCAB)
-    variables = nn.unbox(plain.init(jax.random.key(0), ids))
-    logits, scanned_logits = plain.apply(variables, ids), scanned.apply(variables, ids)
-    reference = exact.apply(variables, ids)
+    variables = nn.unbox(unrolled(plain.init)(jax.random.key(0), ids))
+    logits, scanned_logits = unrolled(plain.apply)(variables, ids), scanned.apply(variables, ids)
+    reference = unrolled(exact.apply)(variables, ids)
 
     plain_distance = float(jnp.max(jnp.abs(logits - reference)))
     scanned_distance = float(jnp.max(jnp.abs(scanned_logits - reference)))
@@ -986,7 +999,8 @@ def pipelined_layer_states():
     model = tiny()
     variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32)))
     return (layer_states_on(MeshSpec(fsdp=2, stage=2), model, variables, microbatches=4),
-            layer_states_on(MeshSpec(fsdp=4), model, variables), float64_layer_states(model, variables))
+            unrolled(layer_states_on(MeshSpec(fsdp=4), model, variables)),
+            unrolled(float64_layer_states(model, variables)))
 
 
 @mesh_lane
@@ -1047,13 +1061,14 @@ def test_a_pipelined_loop_counts_every_passs_routing():
     variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32)))
     batch = token_batch(PIPELINED_ROWS)
 
-    plain = router_counts_on(objective, MeshSpec(fsdp=4), variables, batch)
+    plain = unrolled(router_counts_on)(objective, MeshSpec(fsdp=4), variables, batch)
     piped = router_counts_on(objective, MeshSpec(fsdp=2, stage=2), variables, batch, microbatches=4)
     assert plain.keys() == piped.keys() and len(piped) == TINY["num_layers"]
     for path, counts in piped.items():
         assert int(counts.sum()) == int(plain[path].sum()) == 2 * PIPELINED_ROWS * SEQ_LEN * top_k, path
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @mesh_lane
 def test_a_scanned_pipeline_has_the_loss_and_gradient_of_the_plain_loop():
     """Stages of two like layers scan inside the pipeline; the loss and the
@@ -1062,9 +1077,10 @@ def test_a_scanned_pipeline_has_the_loss_and_gradient_of_the_plain_loop():
     variables = nn.unbox(tiny().init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32)))
     batch = token_batch()
 
-    loss, _, grads = loss_and_grads(LMObjective(tiny(), SEQ_LEN), MeshSpec(fsdp=4), variables, batch)
+    loss, _, grads = unrolled(loss_and_grads)(LMObjective(tiny(), SEQ_LEN), MeshSpec(fsdp=4), variables,
+                                              batch)
     piped, _, piped_grads = loss_and_grads(
-        LMObjective(tiny(scan_layers=True), SEQ_LEN),
+        LMObjective(tiny(), SEQ_LEN),
         MeshSpec(fsdp=2, stage=2), variables, batch, microbatches=2)
 
     assert abs(loss - piped) < 1e-5, (loss, piped)
@@ -1082,7 +1098,7 @@ def test_a_pipeline_under_a_bf16_policy_trains_the_loss_of_the_plain_loop():
     variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32)))
     batch = token_batch(PIPELINED_ROWS)
 
-    loss, _, _ = loss_and_grads(LMObjective(model, SEQ_LEN), MeshSpec(fsdp=4), variables, batch)
+    loss, _, _ = unrolled(loss_and_grads)(LMObjective(model, SEQ_LEN), MeshSpec(fsdp=4), variables, batch)
     piped, _, piped_grads = loss_and_grads(
         LMObjective(model, SEQ_LEN), MeshSpec(fsdp=2, stage=2), variables, batch, microbatches=4)
 
@@ -1167,6 +1183,7 @@ def test_a_pipeline_of_delta_nets_split_over_the_sequence_leaves_the_stage_axis_
                         truth_fn=stepped(twin, wide, MeshSpec(), devices=jax.devices("cpu")[:1]))
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @mesh_lane
 def test_a_pipeline_past_a_dense_prefix_scans_its_stages_and_keeps_every_layers_statistics():
     """A dense first layer before eight routed ones over four stages runs the prefix beside the pipeline
@@ -1174,7 +1191,7 @@ def test_a_pipeline_past_a_dense_prefix_scans_its_stages_and_keeps_every_layers_
     layer sows its own, the prefix's as the plain loop sows it and each stage's layers per pipeline
     iteration, as a pipeline's sowing comes out."""
     routed = {"experts": 4, "top_k": 2, "expert_features": 16, "layers": tuple(range(1, 9))}
-    model = tiny(num_layers=9, scan_layers=True, mixture=routed)
+    model = tiny(num_layers=9, mixture=routed)
     ids = jnp.asarray(np.random.default_rng(0).integers(0, VOCAB, size=(BATCH, SEQ_LEN)), jnp.int32)
     variables = nn.unbox(model.init(jax.random.key(0), ids))
     _, plain = model.apply(variables, ids, mutable=["qk"])
@@ -1187,8 +1204,9 @@ def test_a_pipeline_past_a_dense_prefix_scans_its_stages_and_keeps_every_layers_
     assert piped_shapes["qk"]["layers_0"] == shapes["qk"]["layers_0"]
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_scanned_dropout_uses_the_supplied_rng():
-    model = tiny(num_layers=3, dropout_rate=0.2, scan_layers=True)
+    model = tiny(num_layers=3, dropout_rate=0.2)
     ids = jnp.asarray(token_batch()["text"][:2, :5])
     variables = nn.unbox(model.init(jax.random.key(0), ids))
 
@@ -1211,10 +1229,11 @@ def test_scanned_dropout_uses_the_supplied_rng():
     assert largest_difference(first[1], changed[1]) > 1e-5
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_scanned_glm5_next_computes_its_unrolled_forward():
     """GLM-5-Next's first three layers (Kimi Delta Attention, a dense MLP,
-    hyper-connections) scan as one run under `scan_layers`: the scanned
-    forward is the unrolled one's. XLA:CPU's XNNPACK matrix packer (at XLA's
+    hyper-connections) scan as one run: the scanned forward is the
+    unrolled one's (`unrolled`). XLA:CPU's XNNPACK matrix packer (at XLA's
     pinned 0a66ebb5) over-reads a zero matrix aliased as an all-zero-stride
     scalar view (ynnpack/subgraph/dot.cc:613-636, fixed in XNNPACK 0e7357e2):
     with the chunk loop's zero state fused there, the scan was off by 8.7,
@@ -1222,16 +1241,15 @@ def test_a_scanned_glm5_next_computes_its_unrolled_forward():
     reaches the loop materialized: 96 compilations ran right (jsf-1701)."""
     loaded = Pretrained.load(FIXTURES / "glm5-next-tiny", dtype="float32", param_dtype="float32")
     tokens = (jnp.arange(24, dtype=jnp.int32).reshape(2, 12) * 7) % 31 + 1
-    unrolled = np.asarray(jax.jit(loaded.model.apply)(loaded.variables, tokens), np.float64)
-    scanned = dataclasses.replace(loaded.model, scan_layers=True)
-    got = np.asarray(jax.jit(scanned.apply)(loaded.variables, tokens), np.float64)
-    assert np.abs(got - unrolled).max() <= 1e-4 * np.abs(unrolled).max()
+    plain = np.asarray(unrolled(jax.jit(loaded.model.apply))(loaded.variables, tokens), np.float64)
+    got = np.asarray(jax.jit(loaded.model.apply)(loaded.variables, tokens), np.float64)
+    assert np.abs(got - plain).max() <= 1e-4 * np.abs(plain).max()
 
 
 def fetched_layer_states():
     """The host-fetched (dew) and resident (reference) layer-state functions of one scanned model's
     weights and its float64 truth, each arm compiled once (`without_ynn`)."""
-    model = tiny(scan_layers=True, attention_impl="reference")
+    model = tiny(attention_impl="reference")
     variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32)))
     assert any(count > 1 for _, count in model.bind(variables).groups)
     host = jax.sharding.SingleDeviceSharding(jax.devices()[0], memory_kind="pinned_host")
@@ -1244,6 +1262,7 @@ def fetched_layer_states():
             float64_layer_states(model, variables))
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_host_resident_stacks_layer_states_are_a_resident_ones():
     """A stack whose layers sit in host memory, read by a caller that keeps intermediates, binds
     each row through Linen (`decoder_stack.run_stack`): every layer's output a reader of
@@ -1254,12 +1273,13 @@ def test_a_host_resident_stacks_layer_states_are_a_resident_ones():
                     seeds=FETCHED_STATES_SEEDS, truth_fn=truth)
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_host_resident_stack_keeps_what_its_callers_own_filter_asks_for():
     """A caller's own capture filter, every layer's input norm and nothing else, reaches the layers
     a host-resident stack fetches: it keeps the sublayer outputs the resident stack keeps, at the
     same places, and no layer output nobody asked for. A layer norm runs its own call, where the
     default RMS norm runs fused into its seam."""
-    model = tiny(scan_layers=True, attention_impl="reference", norm_type="layer")
+    model = tiny(attention_impl="reference", norm_type="layer")
     variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32)))
     host = jax.sharding.SingleDeviceSharding(jax.devices()[0], memory_kind="pinned_host")
     on_host = {**variables, "params": {
@@ -1283,8 +1303,8 @@ def test_a_host_resident_stack_keeps_what_its_callers_own_filter_asks_for():
 
 def test_a_capture_filter_can_select_only_a_later_host_resident_layer():
     """Identical layer specs need not have identical capture policies: selecting one later layer
-    keeps it even when the first layer's shape probe captured nothing."""
-    model = tiny(scan_layers=False, attention_impl="reference")
+    keeps it even when the first layer's shape probe captured nothing, a layer at a time (`unrolled`)."""
+    model = tiny(attention_impl="reference")
     ids = jnp.ones((1, SEQ_LEN), jnp.int32)
     variables = nn.unbox(model.init(jax.random.key(0), ids))
     host = jax.sharding.SingleDeviceSharding(jax.devices()[0], memory_kind="pinned_host")
@@ -1295,18 +1315,19 @@ def test_a_capture_filter_can_select_only_a_later_host_resident_layer():
     def selected(module, method):
         return method == "__call__" and module.name == f"layers_{model.num_layers - 1}"
 
-    captures = [model.apply(tree, ids, capture_intermediates=selected, mutable=["intermediates"])[1]
+    captures = [unrolled(model.apply)(tree, ids, capture_intermediates=selected, mutable=["intermediates"])[1]
                 for tree in (variables, on_host)]
     assert jax.tree.leaves(captures[0])
     assert jax.tree.structure(captures[1]) == jax.tree.structure(captures[0])
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_host_resident_key_sharing_stack_keeps_layer_states_through_cached_decoding():
     """A scanned stack whose later layers read the keys and values an earlier one provides, its
     layers in host memory, read by a caller that keeps every layer's output: decoding a prompt
     through its cache, it computes the resident stack's tokens and keeps the same layer outputs,
     the providers' writes carried out of the lifted scope that fetches them."""
-    model = SHAPES["gemma4"](scan_layers=True)
+    model = SHAPES["gemma4"]()
     tokens = jnp.asarray([[1, 2, 3, 4, 5, 6]], jnp.int32)
     variables = nn.unbox(model.init(jax.random.key(0), tokens))
     assert any(count > 1 for _, count in model.bind(variables).groups)
@@ -1334,6 +1355,7 @@ def test_a_host_resident_key_sharing_stack_keeps_layer_states_through_cached_dec
         assert our_paths == their_paths
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.check1_shards(seeds=512, per_task=128)
 def test_a_scanned_stack_in_host_memory_reads_and_writes_its_callers_state_as_a_resident_one():
     """A scanned run of host-resident layers runs one layer at a time in a scope of its
@@ -1350,7 +1372,7 @@ def test_a_scanned_stack_in_host_memory_reads_and_writes_its_callers_state_as_a_
 
     model = CausalTransformer(vocab_size=32, emb_features=16, num_layers=3, num_heads=2, num_kv_heads=2,
                               head_dim=8, mlp_features=32, max_seq_len=16, dtype=jnp.float32,
-                              attention_impl="reference", scan_layers=True,
+                              attention_impl="reference",
                               mixture=Mixture(experts=4, top_k=2, bias=True))
     tokens = jnp.asarray([[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]], jnp.int32)
     variables = nn.unbox(jax.jit(model.init)(jax.random.key(0), tokens))

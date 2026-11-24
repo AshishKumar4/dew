@@ -683,6 +683,7 @@ def _kernel_branches(text: str, kind: str) -> tuple[list[tuple[bool, ...]], bool
     return found, bool(outside)
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.mesh(devices=2)
 def test_a_tpu_decode_steps_paged_kernel_is_one_branch_of_a_conditional_on_a_mesh_splitting_rows():
     """A paged decode step's choice between the TPU's paged kernel, for rows each holding one document, and
@@ -693,7 +694,7 @@ def test_a_tpu_decode_steps_paged_kernel_is_one_branch_of_a_conditional_on_a_mes
     from sharded import placed, tpu_lowering, tpu_mesh
 
     mesh = tpu_mesh(data=2)
-    decoder = _paged_decoder().clone(scan_layers=True)
+    decoder = _paged_decoder().clone()
     tokens = jax.ShapeDtypeStruct((2, 1), jnp.int32)
     params = jax.eval_shape(decoder.init, jax.random.key(0), tokens)
     cache = jax.eval_shape(lambda params: decoder.apply(params, 2, method=CausalTransformer.init_cache,

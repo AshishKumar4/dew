@@ -25,6 +25,7 @@ from interop_support import (
     quantized_checkpoints,
     token_draw,
 )
+from model_support import scanning, stacked
 from reference_error import GateFailure, Inconclusive, as_given, assert_as_exact
 
 import dew
@@ -91,20 +92,18 @@ def test_without_its_scales_the_model_fails_the_rule_every_view_is_held_to(case)
 def test_the_scanned_stack_quantizes_each_layer_with_its_own_scales(stored):
     """A scanned run stacks every collection on the layer axis, the scales
     with the kernels, so each layer reads its own."""
-    scanned = stored.model.with_scanned_layers()
-    assert_stored_view(lambda ids: scanned.apply(stored.variables, ids), stored, "scanned")
+    assert_stored_view(scanning(lambda ids: stored.model.apply(stored.variables, ids)), stored, "scanned")
 
 
 def quantized_apart(case):
-    """The case's loaded model, its scanned clone, its ids, and a copy of its variables whose second
-    layer's query projection is left unquantized: layers quantized apart, which one scanned body
-    cannot read alike."""
+    """The case's loaded model, its ids, and a copy of its variables whose second layer's query projection
+    is left unquantized: layers quantized apart, which one scanned body cannot read alike."""
     _, loaded, reference = case
     variables = jax.tree.map(lambda leaf: leaf, dict(loaded.variables))
     layer = variables[QUANTIZATION]["layers_1"]
     mixer = next(name for name in layer if "q_proj" in layer[name] or "qkv" in layer[name])
     layer[mixer] = {name: leaves for name, leaves in layer[mixer].items() if name != "q_proj"}
-    return loaded, loaded.model.with_scanned_layers(), reference["ids"].astype(np.int32), variables
+    return loaded, reference["ids"].astype(np.int32), variables
 
 
 def test_layers_quantized_apart_run_as_scanned_runs_of_their_own(case):
@@ -115,10 +114,11 @@ def test_layers_quantized_apart_run_as_scanned_runs_of_their_own(case):
     the plain loop of the same weights is, against their own float64
     forward. The stored tree stays one subtree per layer, so the scanned and
     the plain model read and init the same tree."""
-    loaded, scanned, ids, variables = quantized_apart(case)
-    assert_view(lambda ids: scanned.apply(variables, ids), loaded.model, variables, case[2],
+    loaded, ids, variables = quantized_apart(case)
+    assert_view(scanning(lambda ids: loaded.model.apply(variables, ids)), loaded.model, variables, case[2],
                 "layers quantized apart, scanned")
-    initialized = [jax.eval_shape(model.init, jax.random.key(0), ids) for model in (scanned, loaded.model)]
+    initialized = [scanning(jax.eval_shape)(loaded.model.init, jax.random.key(0), ids),
+                   jax.eval_shape(loaded.model.init, jax.random.key(0), ids)]
     assert jax.tree.structure(initialized[0]) == jax.tree.structure(initialized[1])
 
 
@@ -128,14 +128,15 @@ def test_layers_quantized_apart_that_one_bank_holds_are_refused(case):
     rows are refused by name, rather than read as runs of their own the store does not hold."""
     from dew.nn.backbones.layer_names import group_name
 
-    loaded, scanned, ids, variables = quantized_apart(case)
+    loaded, ids, variables = quantized_apart(case)
     params = dict(variables["params"])
-    for first, count in scanned.bind(loaded.variables).groups:
-        if count > 1:
-            rows = [params.pop(f"layers_{index}") for index in range(first, first + count)]
-            params[group_name(first, count)] = jax.tree.map(lambda *leaves: jnp.stack(leaves), *rows)
-    with pytest.raises(ValueError):
-        scanned.apply({**variables, "params": params}, ids)
+    with stacked(scanned=True):
+        for first, count in loaded.model.bind(loaded.variables).groups:
+            if count > 1:
+                rows = [params.pop(f"layers_{index}") for index in range(first, first + count)]
+                params[group_name(first, count)] = jax.tree.map(lambda *leaves: jnp.stack(leaves), *rows)
+        with pytest.raises(ValueError):
+            loaded.model.apply({**variables, "params": params}, ids)
 
 
 def test_a_store_that_banks_layers_quantized_apart_reads_as_the_runs_it_banks(case):
@@ -157,11 +158,11 @@ def test_a_store_that_banks_layers_quantized_apart_reads_as_the_runs_it_banks(ca
         layer = variables[QUANTIZATION][f"layers_{index}"]
         mixer = next(name for name in layer if "q_proj" in layer[name] or "qkv" in layer[name])
         layer[mixer] = {name: leaves for name, leaves in layer[mixer].items() if name != "q_proj"}
-    scanned = four.with_scanned_layers()
-    bound = scanned.bind(variables)
-    assert bound.groups == ((0, 2), (2, 2))
-    store = HeldBanks(variables).place(bound, layout=Layout(min_shard=1, tolerance=1.0))
-    assert_view(lambda ids: scanned.apply(store, ids), four, variables, reference,
+    with stacked(scanned=True):
+        bound = four.bind(variables)
+        assert bound.groups == ((0, 2), (2, 2))
+        store = HeldBanks(variables).place(bound, layout=Layout(min_shard=1, tolerance=1.0))
+    assert_view(scanning(lambda ids: four.apply(store, ids)), four, variables, reference,
                 "banked runs quantized apart")
 
 

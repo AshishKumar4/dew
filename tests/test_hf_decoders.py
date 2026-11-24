@@ -107,6 +107,7 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import jax
@@ -123,7 +124,7 @@ from interop_support import (
     transformers_arms,
     transformers_model,
 )
-from model_support import flat_tree, llada_draw, llada_fields, prediction_logits
+from model_support import flat_tree, llada_draw, llada_fields, prediction_logits, scanning, unrolled
 from reference_error import ahead_arm, as_given, assert_as_exact, declared_seeds, recording
 
 from dew.interop import Pretrained, PretrainedDecoder
@@ -1454,7 +1455,8 @@ def assert_padded_speculation_is_greedy(source) -> None:
     inputs = ModelInputs(jnp.asarray(tokens), {"attention_mask": jnp.asarray(valid)})
     task = source.text_generation(sampling=Sampling(temperature=0))
     ordinary = task(inputs, max_new_tokens=7, key=0).host()
-    speculative = task(inputs, max_new_tokens=7, key=0, strategy=Speculative(block=3)).host()
+    speculative = task(inputs, max_new_tokens=7, key=0,
+                       sampling=replace(task.sampling, strategy=Speculative(block=3))).host()
     np.testing.assert_array_equal(speculative.tokens, ordinary.tokens)
     np.testing.assert_array_equal(speculative.lengths, ordinary.lengths)
     np.testing.assert_array_equal(speculative.terminated, ordinary.terminated)
@@ -1484,16 +1486,17 @@ def test_scalar_mode_survives_scanning_and_rematerialized_backward(mode):
     fields = {**translate_config(fixture_config("gemma4-moe-tiny")), "layer_scalar": mode}
     variables = translate_weights(load_file(str(GEMMA4_MOE / "model.safetensors")), fields)
     plain = base.clone(layer_scalar=mode)
-    scanned = plain.clone(scan_layers=True, remat="full")
+    scanned = plain.clone(remat="full")
     ids = jnp.asarray(np.load(GEMMA4_MOE / "input_ids.npy"), jnp.int32)
 
     def loss(model, params):
         return jnp.mean(model.apply({**variables, "params": params}, ids) ** 2)
 
-    expected, expected_grad = jax.jit(jax.value_and_grad(lambda params: loss(plain, params)))(
+    expected, expected_grad = unrolled(jax.jit(jax.value_and_grad(lambda params: loss(plain, params))))(
         variables["params"]
     )
-    value, gradient = jax.jit(jax.value_and_grad(lambda params: loss(scanned, params)))(variables["params"])
+    value, gradient = scanning(jax.jit(jax.value_and_grad(lambda params: loss(scanned, params))))(
+        variables["params"])
     np.testing.assert_allclose(value, expected, atol=1e-5, rtol=0)
     for actual, wanted in zip(jax.tree.leaves(gradient), jax.tree.leaves(expected_grad), strict=True):
         np.testing.assert_allclose(actual, wanted, atol=1e-4, rtol=1e-5)

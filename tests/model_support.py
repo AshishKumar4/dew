@@ -30,6 +30,41 @@ TINY_DECODER = {"emb_features": 32, "num_layers": 2, "num_heads": 4, "mlp_featur
 its own vocabulary and any field its claim turns on."""
 
 
+def stacked_as[**Given, Value](scan: str) -> Callable[[Callable[Given, Value]], Callable[Given, Value]]:
+    """A function run with every decoder's stack compiled as `scan` names
+    (`generation.chosen(layer_scan=...)`): JAX keys its trace and compile caches on the choice, so a jitted
+    function traces inside."""
+    from dew.nn.kernels import generation
+
+    def chosen(function: Callable[Given, Value]) -> Callable[Given, Value]:
+        @functools.wraps(function)
+        def run(*arguments: Given.args, **keywords: Given.kwargs) -> Value:
+            with generation.chosen(layer_scan=scan):
+                return function(*arguments, **keywords)
+        return run
+    return chosen
+
+
+def unrolled[**Given, Value](function: Callable[Given, Value]) -> Callable[Given, Value]:
+    """`function` with every decoder's stack a layer at a time, an arm against the scanned stack
+    (`scanning`)."""
+    return stacked_as("plain")(function)
+
+
+def scanning[**Given, Value](function: Callable[Given, Value]) -> Callable[Given, Value]:
+    """`function` with every decoder's stack scanned, an arm against the stack a layer at a time
+    (`unrolled`)."""
+    return stacked_as("scanned")(function)
+
+
+def stacked(scanned: bool):
+    """The block within which every decoder's stack runs scanned or unrolled a layer at a time, its default
+    (`generation.chosen(layer_scan=...)`): a test's arm of either."""
+    from dew.nn.kernels import generation
+
+    return generation.chosen(layer_scan="scanned" if scanned else "plain")
+
+
 def recorded_site(path: Path, site: str, inputs_of, truth_fn):
     """A summarized recording's `site` at `path` (`tools/recorded_references.record_case`): its draw,
     recorded reference and truth over its declared seeds, Dew's float64 run `truth_fn` its truth, held to
@@ -60,6 +95,13 @@ def with_logit_cotangent(draw, vocab: int, salt: int):
         cotangent = np.random.default_rng([salt, seed]).normal(size=(*ids.shape, vocab))
         return variables, ids, cotangent.astype(np.float32)
     return drawn
+
+
+def compiled_apply(model: nn.Module, variables, *inputs, **options):
+    """`model.apply(variables, *inputs, **options)` as one program: a scanned stack's eager call compiles
+    its scan apart and runs the rest a primitive at a time, rounding as neither program does, so two
+    forms a contract holds bit for bit compare as the programs a run compiles (row 12078)."""
+    return jax.jit(functools.partial(model.apply, **options))(variables, *inputs)
 
 
 def allocated_cache(model, variables, rows: int):

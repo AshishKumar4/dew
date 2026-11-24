@@ -4,6 +4,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import typing
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -363,3 +364,163 @@ def test_a_field_of_a_subscripted_generic_records_its_value_as_a_field_of_its_cl
     from dew.registry import to_record
 
     assert to_record(_Boxed(size=3), _Boxed[int]) == to_record(_Boxed(size=3), _Boxed) == {"size": 3}
+
+
+@dataclasses.dataclass(frozen=True)
+class Halt:
+    fraction: float = 1.0
+
+
+@dataclasses.dataclass(frozen=True)
+class Stall:
+    evals: int = 1
+
+
+@dataclasses.dataclass(frozen=True)
+class Shared:
+    either: Halt | Stall | None = None
+
+
+type Stops = Halt | Stall
+"""A union of classes through an alias, which a field's union names beside one of its classes again."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Overlapping:
+    either: Stops | Halt | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class Stopped:
+    either: Halt | Stall | None = None
+    alone: Halt | None = None
+    sized: int | Halt = 0
+
+
+def test_an_unnamed_record_of_a_union_of_classes_builds_the_one_whose_fields_hold_it():
+    """A mapping naming no class (no `{"class": ...}`) for a field of a union of classes builds the one
+    dataclass whose fields hold its every key, as a field of the class reads it (row 11980:
+    `TrainerConfig.stop`, a Pause or a Plateau, given `{"fraction": 0.5}` held a dict and the run never
+    paused); one several classes' fields hold is refused, as nothing says which it is; a class record still
+    builds the one it names."""
+    built = from_record(Stopped, {"either": {"fraction": 0.5}, "alone": {"fraction": 0.25},
+                                  "sized": {"fraction": 0.75}})
+    assert (built.either, built.alone, built.sized) == (Halt(0.5), Halt(0.25), Halt(0.75))
+    assert from_record(Stopped, {"either": {"evals": 3}}).either == Stall(3)
+    named = from_record(Stopped, {"either": {"class": f"{__name__}:Stall", "fields": {"evals": 3}}})
+    assert named.either == Stall(3)
+    with pytest.raises(ValueError):
+        from_record(Shared, {"either": {}})
+
+
+def test_a_saved_decoders_unnamed_yarn_scaling_builds_yarns_record():
+    """A saved decoder's `rope_scaling` written as YaRN's fields alone, naming no class
+    (`{"rope_type": "yarn", "factor": 4.0}`), reads as a `YarnScaling`, the one scaling of `Scaling` that
+    takes it whole: Llama 3.1's and LongRoPE's lack their required fields, and each refuses another's
+    `rope_type` (the review of API02b, P1: every class whose fields held the keys was ambiguous); a Llama
+    3.1 ramp's fields alone read as its `RopeScaling`."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.rope import RopeScaling, YarnScaling
+
+    record = {"vocab_size": 32, "emb_features": 16, "num_layers": 1, "num_heads": 2, "max_seq_len": 64,
+              "rope_scaling": {"rope_type": "yarn", "factor": 4.0}}
+    assert from_record(CausalTransformer, record).rope_scaling == YarnScaling(factor=4.0)
+    llama = {"factor": 8.0, "low_freq_factor": 1.0, "high_freq_factor": 4.0,
+             "original_max_position_embeddings": 8192}
+    assert from_record(CausalTransformer, {**record, "rope_scaling": llama}).rope_scaling == RopeScaling(
+        **llama)
+
+
+
+
+@dataclasses.dataclass(frozen=True)
+class Wide:
+    size: int = 1
+
+
+@dataclasses.dataclass(frozen=True)
+class Tall:
+    size: int = 1
+
+
+@dataclasses.dataclass(frozen=True)
+class OverWide:
+    """A union member whose shared part is a `Wide`, refusing any other its record reads as it."""
+
+    part: Wide
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.part, Wide):
+            raise ValueError("a part of another kind")
+
+
+@dataclasses.dataclass(frozen=True)
+class OverTall:
+    """`OverWide`'s twin over a `Tall`."""
+
+    part: Tall
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.part, Tall):
+            raise ValueError("a part of another kind")
+
+
+@dataclasses.dataclass(frozen=True)
+class Sharing:
+    either: OverWide | OverTall | None = None
+    again: Wide | None = None
+
+
+def test_an_unnamed_union_records_winning_trial_keeps_the_shared_module_its_record_refers_to_again():
+    """An unnamed record of a union whose part is a shared module (`{"share": n}`) the record refers to
+    again (`{"shared": n}`): the one member that builds keeps the module it built, which the later
+    reference reads, the same object; a trial that is refused keeps none (each trial reads the shared
+    modules as they stood before any, the API02 review). A guard: no public read told the
+    bookkeeping apart before."""
+    part = {"class": f"{__name__}:Wide", "share": 1, "fields": {"size": 2}}
+    built = from_record(Sharing, {"either": {"part": part}, "again": {"shared": 1}})
+    assert built.either == OverWide(Wide(2)) and built.again is built.either.part
+
+
+@dataclasses.dataclass(frozen=True)
+class OverTallDeclared:
+    """`OverTall` checking nothing itself: its declared `Tall` alone says what its part is."""
+
+    part: Tall
+
+
+@dataclasses.dataclass(frozen=True)
+class SharedFirst:
+    again: Wide | None = None
+    either: OverWide | OverTallDeclared | None = None
+
+
+def test_an_unnamed_union_records_trial_reads_a_module_shared_before_as_its_field_declares_it():
+    """A module shared by a field read first (`{"share": n}`) that an unnamed union record refers to again
+    (`{"shared": n}`): a trial whose field declares another class (`OverTallDeclared.part: Tall`) refuses the
+    `Wide` as a module built for it would, so the one member it is builds, where the module read before
+    was handed to every trial and two built, refused as ambiguous (the API02 review)."""
+    part = {"class": f"{__name__}:Wide", "share": 1, "fields": {"size": 2}}
+    built = from_record(SharedFirst, {"again": part, "either": {"part": {"shared": 1}}})
+    assert built.either == OverWide(Wide(2)) and built.either.part is built.again
+
+
+@dataclasses.dataclass(frozen=True)
+class SharedLoosely:
+    again: Wide | None = None
+    anything: typing.Any = None
+
+
+def test_a_module_shared_before_reads_again_under_a_field_declaring_any_value():
+    """A module shared by a field read first (`{"share": n}`), referred to again (`{"shared": n}`) by a field
+    declaring any value (`typing.Any`): it reads the one module, where `Any` reached `isinstance` and raised
+    (the API02 review)."""
+    part = {"class": f"{__name__}:Wide", "share": 1, "fields": {"size": 2}}
+    built = from_record(SharedLoosely, {"again": part, "anything": {"shared": 1}})
+    assert built.anything is built.again
+
+def test_an_unnamed_record_of_a_union_naming_a_class_twice_builds_it_once():
+    """A union naming one class twice, through an alias and again (`Stops | Halt`), holds it once: an
+    unnamed record of its fields builds it, where two trials of the one class read as two that fit it (the
+    review of API02b)."""
+    assert from_record(Overlapping, {"either": {"fraction": 0.5}}).either == Halt(0.5)

@@ -13,7 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from model_support import flat_tree
+from model_support import flat_tree, unrolled
 from reference_error import assert_as_exact
 from run_kinds import stated
 from test_cross_attention import (
@@ -163,11 +163,12 @@ def test_a_cached_context_decodes_through_the_layers_own_attention_as_the_full_f
                                                         seeds=SHARED_SEEDS["shared decode"])
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_scanned_stack_reads_through_each_layers_own_attention_as_the_plain_one():
     """With a read on every layer the layers scan as one run, on par with the plain loop (check 1)."""
     every = SHARED_MODEL.clone(cross_attention=SharedCrossAttention((0, 1, 2), 6))
-    assert_as_exact(logits(every.clone(scan_layers=True)), logits(every), model_draw(every), "shared scan",
-                    seeds=SHARED_SEEDS["shared scan"], truth_fn=logits(float64(every)))
+    assert_as_exact(logits(every), unrolled(logits(every)), model_draw(every), "shared scan",
+                    seeds=SHARED_SEEDS["shared scan"], truth_fn=unrolled(logits(float64(every))))
 
 
 def test_a_layer_with_no_attention_of_its_own_is_refused():
@@ -272,6 +273,7 @@ def test_the_gates_train_alone_over_a_frozen_source():
     assert rebuilt.cross_attention == SharedCrossAttention((1,), 3)
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_context_reads_logits_enter_the_layers_qk_clip_maxima():
     """The QK-Clip bounds the logits of a layer's own projections wherever they run: a layer that reads
     a context through them sows one maximum a head, its own sequence's or the context's, whichever is
@@ -286,8 +288,7 @@ def test_a_context_reads_logits_enter_the_layers_qk_clip_maxima():
         # The plain loop, a layer a program, as the claims are bitwise: a scan runs the base's like
         # layers as one body, its maxima an ulp from a layer run alone (row 4100), and the reading
         # layers cannot join it.
-        _, held = model.clone(scan_layers=False).apply(variables, ids, conditioning=conditioning,
-                                                       mutable=["qk"])
+        _, held = unrolled(model.apply)(variables, ids, conditioning=conditioning, mutable=["qk"])
         named = ((jax.tree_util.keystr(path), leaf)
                  for path, leaf in jax.tree_util.tree_leaves_with_path(held))
         return {path: np.asarray(leaf) for path, leaf in named if "['max_logits']" in path}
@@ -337,15 +338,16 @@ def test_a_layer_keyed_none_still_reads_its_context():
     assert {path.split(".", 1)[0] for path in gates} == {"layers_0", "layers_2"}
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_configuration_of_its_own_scans_each_layers_own_block():
     """Any conforming configuration builds the blocks (`CrossBlocks`): one whose adjacent layers' blocks
     differ in what they compute, not their shapes, scans each layer's own block as the plain loop does
     (check 1, from float64), its layers' keys apart (`CrossBlocks.layer_key`)."""
     every = MODEL.clone(cross_attention=Alternating(layer_ids=(0, 1, 2), context_length=6,
                                                     context_features=24))
-    assert_as_exact(logits(every.clone(scan_layers=True)), logits(every), model_draw(every),
+    assert_as_exact(logits(every), unrolled(logits(every)), model_draw(every),
                     "alternating scan", seeds=SHARED_SEEDS["alternating scan"],
-                    truth_fn=logits(float64(every)))
+                    truth_fn=unrolled(logits(float64(every))))
 
 
 def test_an_earlier_record_of_idefics_block_reads_as_its_class_record():

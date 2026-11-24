@@ -44,7 +44,7 @@ from dew.objectives.rl import (
     Verifier,
 )
 from dew.objectives.rl.rollout import Reward
-from dew.sampling import Sampling, with_ids_of
+from dew.sampling import Sampling
 from dew.state import TrainState
 from dew.training import Checkpoints, Layout, Rollout, Trainer
 
@@ -220,7 +220,7 @@ class Recipe:
             objective = GRPOObjective(self.model, prompt + stage.max_new_tokens - 1, beta=beta,
                                       variables=None)
             tokenizer = tokenizer_for(_stated(facts, "tokenizer", str))
-            sampling = with_ids_of(stage.sampling, Sampling(eos_token_ids=tokenizer.eos_id))
+            sampling = stage.sampling.with_defaults_of(Sampling(eos_token_ids=tokenizer.eos_id))
             return objective, RolloutScheduler.sampled(
                 objective, stage.reward, decode=tokenizer.decode, groups=stage.groups,
                 max_new_tokens=stage.max_new_tokens, estimator=stage.estimator, sampling=sampling), objective

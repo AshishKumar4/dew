@@ -63,10 +63,9 @@ def every_sequence(model, params, prompt, budget, eos_ids=()):
 
 
 def searched(model, params, prompt, budget, width, penalty=1.0, early=False, eos=None, n=1):
-    return generate(model, params, jnp.asarray([prompt], jnp.int32), budget,
-                    key=jax.random.key(0), sampling=Sampling(eos_token_ids=eos, pad_token_id=0), n=n,
-                    strategy=Beam(width=width, length_penalty=penalty, early_stopping=early,
-                                  stop_ids=0 if eos is None else 1))
+    search = Beam(width=width, length_penalty=penalty, early_stopping=early, stop_ids=0 if eos is None else 1)
+    return generate(model, params, jnp.asarray([prompt], jnp.int32), budget, key=jax.random.key(0),
+                    sampling=Sampling(eos_token_ids=eos, pad_token_id=0, strategy=search), n=n)
 
 
 PROMPT = [1, 2, 3]
@@ -82,10 +81,11 @@ penalty that rewards, ignores and punishes length."""
 
 
 def _searched(pretrained, ids, eos: int, pad: int, penalty, early, *, boundaries: bool = False):
+    search = Beam(width=WIDTH, length_penalty=penalty, early_stopping=early, stop_ids=1,
+                  boundaries=boundaries)
     return generate(pretrained.model, pretrained.variables, jnp.asarray(ids, jnp.int32), NEW_TOKENS,
-                    key=jax.random.key(0), sampling=Sampling(eos_token_ids=eos, pad_token_id=pad), n=WIDTH,
-                    strategy=Beam(width=WIDTH, length_penalty=penalty, early_stopping=early, stop_ids=1,
-                                  boundaries=boundaries))
+                    key=jax.random.key(0),
+                    sampling=Sampling(eos_token_ids=eos, pad_token_id=pad, strategy=search), n=WIDTH)
 
 
 def _scored(found, penalty) -> np.ndarray:
@@ -207,7 +207,7 @@ def test_the_returned_rows_are_prompt_major_and_carry_no_behaviour_probability(m
     module, params = model
     prompts = jnp.asarray([[1, 2, 3], [7, 8, 9]], jnp.int32)
     found = generate(module, params, prompts, 3, key=jax.random.key(0),
-                     sampling=Sampling(pad_token_id=0), strategy=Beam(width=4), n=2)
+                     sampling=Sampling(pad_token_id=0, strategy=Beam(width=4)), n=2)
     assert found.tokens.shape == (4, 6) and found.rows == 4
     np.testing.assert_array_equal(np.asarray(found.tokens)[:, :3],
                                   np.repeat(np.asarray(prompts), 2, axis=0))
@@ -228,7 +228,7 @@ def test_asking_for_more_hypotheses_than_the_width_is_refused(model):
     module, params = model
     with pytest.raises(ValueError):
         generate(module, params, jnp.asarray([[1, 2, 3]], jnp.int32), 2, key=jax.random.key(0),
-                 strategy=Beam(width=2), n=3)
+                 sampling=Sampling(strategy=Beam(width=2)), n=3)
 
 
 @pytest.mark.parametrize(("penalty", "early", "width", "stop_ids"),
@@ -245,9 +245,10 @@ def test_a_search_reports_its_boundary_scores_without_changing_its_beams(model, 
 
     def search(variables, *, boundaries):
         return generate(module, variables, jnp.asarray([PROMPT], jnp.int32), 3, key=jax.random.key(0),
-                        sampling=Sampling(eos_token_ids=4, pad_token_id=0), n=width,
-                        strategy=Beam(width=width, length_penalty=penalty, early_stopping=early,
-                                      stop_ids=stop_ids, boundaries=boundaries))
+                        sampling=Sampling(eos_token_ids=4, pad_token_id=0,
+                                          strategy=Beam(width=width, length_penalty=penalty,
+                                                        early_stopping=early,
+                                      stop_ids=stop_ids, boundaries=boundaries)), n=width)
 
     asked, unasked = search(params, boundaries=True), search(params, boundaries=False)
     assert unasked.boundaries is None
@@ -278,9 +279,11 @@ def test_a_renormalized_biased_search_is_transformers(name):
     penalty, early = json.loads(str(reference["shaped_setting"]))
     found = generate(pretrained.model, pretrained.variables, inputs, 6, key=jax.random.key(0),
                      sampling=Sampling(eos_token_ids=int(reference["eos"]),
-                                       pad_token_id=int(reference["pad"])),
-                     logits=(decoding.sequence_bias(entries), decoding.Renormalize()), n=3,
-                     strategy=Beam(width=3, length_penalty=penalty, early_stopping=early, stop_ids=1))
+                                       pad_token_id=int(reference["pad"]),
+                                       logits=(decoding.sequence_bias(entries), decoding.Renormalize()),
+                                       strategy=Beam(width=3, length_penalty=penalty, early_stopping=early,
+                                                     stop_ids=1)),
+                     n=3)
     want = reference["shaped_tokens"]
     np.testing.assert_array_equal(np.asarray(found.tokens)[:, width:], want)
     ended = want == int(reference["eos"])
@@ -303,15 +306,16 @@ def test_a_search_over_a_paged_model_draws_what_it_draws_over_the_dense_one(mode
     8509)."""
     # Rows long enough that a beam's own pages leave the prompt's shared ones to save.
     banked = store == "offloaded bank"
-    decoder = model[0].clone(max_seq_len=24, scan_layers=banked)
+    decoder = model[0].clone(max_seq_len=24)
     params = nn.unbox(decoder.init(jax.random.key(0), jnp.ones((1, 3), jnp.int32)))
     prompts = jnp.asarray([[1, 2, 3, 4, 5], [5, 4, 3, 2, 1]], jnp.int32)
     layout = KVCache(page_size=page_size, offloaded=banked)
     # The paged decode reads its gathered rows through the layer's attention, the dense cache's arithmetic,
     # so its scores are the dense search's bit for bit wherever it runs.
-    with generation.chosen(paged_decode="gathered"):
+    # The offloaded bank's layers scanned, the dense store's a layer at a time.
+    with generation.chosen(paged_decode="gathered", layer_scan="scanned" if banked else "plain"):
         found = {name: generate(held, params, prompts, 6, key=jax.random.key(0),
-                                sampling=Sampling(pad_token_id=0), n=2, strategy=Beam(width=3))
+                                sampling=Sampling(pad_token_id=0, strategy=Beam(width=3)), n=2)
                  for name, held in (("dense", decoder), ("paged", decoder.with_kv_cache(layout)))}
     for field in ("tokens", "lengths", "raw_log_probs"):
         np.testing.assert_array_equal(np.asarray(getattr(found["paged"], field)),
@@ -321,7 +325,7 @@ def test_a_search_over_a_paged_model_draws_what_it_draws_over_the_dense_one(mode
     # A loop scanning past its budget (`trips`) advances every row on, its pool sized for the scan.
     with generation.chosen(paged_decode="gathered"):
         tripped = {name: generate(held, params, prompts, 2, key=jax.random.key(0), trips=6,
-                                  sampling=Sampling(pad_token_id=0), n=2, strategy=Beam(width=3))
+                                  sampling=Sampling(pad_token_id=0, strategy=Beam(width=3)), n=2)
                    for name, held in (("dense", decoder), ("paged", decoder.with_kv_cache(layout)))}
     np.testing.assert_array_equal(np.asarray(tripped["paged"].tokens), np.asarray(tripped["dense"].tokens))
 
@@ -336,7 +340,7 @@ def test_a_search_over_a_pool_one_page_short_is_refused_before_it_decodes(model)
     def searched(pages: int):
         return generate(decoder.with_kv_cache(KVCache(page_size=2, pages=pages)), params,
                         jnp.asarray([[1, 2, 3, 4, 5]], jnp.int32), 6, key=jax.random.key(0),
-                        sampling=Sampling(pad_token_id=0), n=2, strategy=Beam(width=3))
+                        sampling=Sampling(pad_token_id=0, strategy=Beam(width=3)), n=2)
 
     with pytest.raises(ValueError):
         searched(least - 1)

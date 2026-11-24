@@ -410,9 +410,10 @@ class SafetensorsBanks(LayerBanks):
         calls it during execution.
 
         This works for single-device inference only. A mesh of more than one
-        device, host placement in `layout`, or a stack without `scan_layers`
-        raises ValueError before any weight is loaded. The host callback
-        needs the CPU backend beside the accelerator, so set
+        device, host placement in `layout`, or a stack run unrolled (not under
+        `generation.chosen(layer_scan="scanned")`) raises ValueError before any
+        weight is loaded. The host callback needs the CPU backend beside the
+        accelerator, so set
         `JAX_PLATFORMS=cuda,cpu` if you set platforms explicitly. Keep this
         source open until executions complete.
         """
@@ -420,7 +421,8 @@ class SafetensorsBanks(LayerBanks):
         if device_mesh.size != 1:
             raise ValueError("disk streaming requires a single-device mesh")
         if any(not site.scanned for site in sites):
-            raise ValueError("disk streaming requires scan_layers=True for bounded device prefetch")
+            raise ValueError("disk streaming reads a scanned stack's runs for bounded device prefetch; this "
+                             "one runs unrolled: stream it under generation.chosen(layer_scan='scanned')")
         if any(sharding.memory_kind != "device" for sharding in jax.tree.leaves(placement)):
             raise ValueError(
                 "disk streaming uses its own bounded host cache; leave layout host placement empty")

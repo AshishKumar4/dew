@@ -245,6 +245,7 @@ def test_phi3_dense_server_and_generate_share_the_per_row_crossing_rebuild():
         np.testing.assert_array_equal(served.lengths, alone.lengths)
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_banked_phi3_server_rebuilds_each_crossing_rows_cache_on_its_own_rows():
     """Phi-3 scanning its layers over a banked store (`HeldBanks.place`), whose decode cache is banked as
     its weights, the layers first: three rows of a dense server over its two layers cross the LongRoPE
@@ -258,8 +259,7 @@ def test_a_banked_phi3_server_rebuilds_each_crossing_rows_cache_on_its_own_rows(
     from dew.sampling import Sampling
     from dew.training import MeshSpec
 
-    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference', max_seq_len=64,
-                             scan_layers=True)
+    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference', max_seq_len=64)
     banked = HeldBanks(loaded.variables).place(loaded.model, mesh=MeshSpec().build(jax.devices()[:1]))
     task = TextGeneration(loaded.model, banked, sampling=Sampling(temperature=0, eos_token_ids=None))
     ids = np.load(DIRECTORY / 'input_ids.npy').astype(np.int32)
