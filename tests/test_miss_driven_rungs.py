@@ -13,7 +13,7 @@ from dew.nn.kernels.generation import chosen, compile_only_gpus
 from dew.objectives.lm import LMObjective
 from dew.optim import Adam, OptimConfig
 from dew.registry import models
-from dew.training import Layout, MeshSpec, Trainer
+from dew.training import Layout, MeshSpec, Trainer, TrainerAdvanced
 from dew.training.ahead import AheadOfTime, compile_ahead
 from dew.training.memory import needed
 from dew.training.planning import PlanRefused
@@ -25,9 +25,10 @@ def _ahead(model, optimizer, seq: int, rows: int, limit: int, variables=None
     tokens, its `variables` where given, None where it fit none, and each probe its search compiled, in
     order."""
     mesh = MeshSpec().build(compile_only_gpus("sm90", 1, limit))
-    built = OptimConfig(optimizer=optimizer, learning_rate=1e-3).build(100)
+    built = OptimConfig(optimizer=optimizer, lr=1e-3).build(100)
     objective = LMObjective(model, seq) if variables is None else LMObjective(model, seq, variables=variables)
-    trainer = Trainer(objective, built, key=jax.random.key(0), mesh=mesh, layout=Layout(min_shard=256))
+    trainer = Trainer(objective, built, key=jax.random.key(0), mesh=mesh,
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=256)))
     try:
         ahead = compile_ahead(trainer, {"text": np.zeros((rows, seq + 1), np.int32)})
     except PlanRefused as refused:

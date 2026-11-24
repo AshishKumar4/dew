@@ -14,7 +14,7 @@ import pytest
 from affine_run import FEATURES, Regression
 
 from dew.distributed.placement import Layout, MeshSpec
-from dew.training import FitPolicy, Trainer
+from dew.training import Trainer, TrainerAdvanced
 
 
 def test_a_runs_held_steps_let_the_one_used_least_recently_go_first_past_their_budget():
@@ -141,9 +141,9 @@ def test_a_placed_steps_compile_limit_gives_back_the_state_it_reuses():
     rows = token_rows(32768, 1, 9)
 
     def built(mesh) -> Trainer:
-        optimizer = OptimConfig(optimizer=Adam(), learning_rate=1e-3).build(100)
+        optimizer = OptimConfig(optimizer=Adam(), lr=1e-3).build(100)
         return Trainer(LMObjective(model, 8, ema_decay=0.9), optimizer, key=jax.random.key(0), mesh=mesh,
-                       layout=Layout(min_shard=2 ** 30), fit=FitPolicy(split=1, remat="none"))
+                       split=1, remat="none", advanced=TrainerAdvanced(layout=Layout(min_shard=2 ** 30)))
 
     ahead = compile_ahead(built(MeshSpec().build(compile_only_gpus(device_generation(), 1, 2 ** 36))),
                           rows)
