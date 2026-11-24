@@ -267,11 +267,14 @@ def _ordinary(running, twin: scaled.Scaled, faint) -> scaled.Scaled:
                          jnp.where(taken, exact.exponent, twin.exponent), SUMS_REACH)
 
 
-def _landed(running, twin: scaled.Scaled, flushed=False):
+def _landed(running, twin: scaled.Scaled, flushed=None):
     """A result the float computation's (matrix products' rounding, as the token walk's) where it is its own
     (`_taken`) and no decayed sum's product with a value it went on to multiply flushed (`flushed`,
     `_weighed`); else its scaled twin's landed once, past the float's range."""
-    return jnp.where(_taken(running, twin) & ~flushed, running, scaled.landed(twin))
+    taken = _taken(running, twin)
+    if flushed is not None:
+        taken = taken & ~flushed
+    return jnp.where(taken, running, scaled.landed(twin))
 
 
 def _weighed(values, sums: scaled.Scaled):
