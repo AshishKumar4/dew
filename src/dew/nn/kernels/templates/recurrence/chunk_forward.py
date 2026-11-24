@@ -12,7 +12,7 @@ import numpy as np
 
 from dew.nn.kernels import chunked_launch, generation, recurrence, recurrence_algebra as algebra, tables
 from dew.nn.kernels.chunked_launch import zero_padded
-from dew.nn.kernels.templates import mosaic, product
+from dew.nn.kernels.templates import mosaic, product, stacked
 from dew.nn.kernels.templates.recurrence import own_pairs
 from dew.nn.kernels.templates.recurrence.intra import _intra, _intra_solve
 from dew.nn.kernels.templates.recurrence.mainloop import (
@@ -267,14 +267,21 @@ class _Run:
 
 def _paired(q, k, decays, beta, taken, call, *, scale: float, solves: bool, prefix=None) -> tuple:
     """`intra._intra`'s scores, system where it `solves`, and prefix (`prefix` where given, the forward's
-    kept), each sub-chunk's own pairs added from a launch of their own (`own_pairs.intra_own`'s bands,
-    placed, `algebra.placed_bands`), on the entries the walk leaves zero, each rounded once: their sums exact
-    in the outputs' forms."""
+    kept), each sub-chunk's own pairs written in place on their diagonal blocks by a launch of their own
+    (`own_pairs.intra_own`), the entries the walk leaves zero, each rounded once."""
     *walked, prefix = _intra(q, k, decays, beta, taken, call, scale=scale, solves=solves, prefix=prefix)
-    own = own_pairs.intra_own(q, k, prefix, beta, taken, call, scale=scale,
-                              products=("scores", "system") if solves else ("scores",))
-    return (*(found + algebra.placed_bands(mine, chunk=call.chunk)
-              for found, mine in zip(walked, own, strict=True)), prefix)
+    # Sums of one shape and dtype (a fast fp32 call's on an A100, its scores' one part fp32 as its system)
+    # stacked into one ref, which `mosaic.checked` asks of refs a launch writes in place (row 3180).
+    groups = stacked.groups([(found.shape, found.dtype) for found in walked])
+    into = [jax.new_ref(walked[group[0]] if len(group) == 1 else jnp.stack([walked[i] for i in group]))
+            for group in groups]
+    own_pairs.intra_own(q, k, prefix, beta, taken, call, scale=scale,
+                        products=("scores", "system") if solves else ("scores",), into=(into, groups))
+    found = [None] * len(walked)
+    for ref, group in zip(into, groups, strict=True):
+        for place, index in enumerate(group):
+            found[index] = ref[...] if len(group) == 1 else ref[place]
+    return (*found, prefix)
 
 
 def _taken(dtype, family: mosaic.Family | None, *, per_key: bool, rounded: bool, delta: bool,

@@ -436,7 +436,10 @@ def _real_pixels(inputs: ModelInputs, gradient: jax.Array) -> jax.Array:
     grid = inputs.conditioning.get("image_grid_thw")
     if grid is None:
         return jnp.concatenate([gradient[row, :int(count)] for row, count in enumerate(lengths)])
-    return jnp.concatenate([gradient[row, image, :int(np.prod(np.asarray(grid[row, image])))]
+    # The image sizes read on the host: a concrete grid indexed as an array inside a jit is traced, which
+    # left Qwen 3.5's drawn arm untraceable (rows 4748, 5236).
+    grid = np.asarray(grid)
+    return jnp.concatenate([gradient[row, image, :int(np.prod(grid[row, image]))]
                             for row, count in enumerate(lengths) for image in range(int(count))])
 
 

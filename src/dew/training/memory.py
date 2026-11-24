@@ -24,7 +24,7 @@ from flax import linen as nn
 from jax.sharding import AbstractMesh, Mesh, NamedSharding
 
 from dew import communicators
-from dew._devices import allocator_limit, device_memory, fresh_pool, gpu_free_bytes, stated_share, xla_flag
+from dew._devices import device_memory, gpu_free_bytes, pool_at, xla_flag
 from dew._records import JSON, integer, integers, json_value, listed, record
 from dew.batch import FROZEN, Batch, Variables
 from dew.data.dataset import rows_of
@@ -452,20 +452,21 @@ def _admitted(devices: Sequence, memory: Sequence[Mapping[str, int]], beside: in
     return min(margins)
 
 
-def needed(device, resident: int, beside: int, temporaries: int) -> int:
-    """The least bytes a GPU like `device` must hold for `admitted` to admit a step of `temporaries`, with
-    `resident` bytes in use and `beside` more placed: its allocator a fresh pool at its limit, as a GPU not
-    attached states it (`dew._devices.fresh_pool`), read through the one admission (`_admitted`) that
-    leaves zero or more bytes to spare there and none one byte fewer: the inverse of `admitted`, which a
-    pool of GPUs is sized by."""
+def _least_admitting(device, resident: int, beside: int, temporaries: int) -> int:
+    """The least allocator limit at which a fresh pool on a GPU like `device` (`dew._devices.pool_at`), with
+    `resident` bytes in use and `beside` more placed, admits a step of `temporaries` through the one
+    admission (`_admitted`): zero or more bytes to spare there, and none one byte fewer, the inverse of
+    `admitted`, which a pool of GPUs is sized by. Searched in the limit's own terms, which a pool states
+    whatever share of whatever GPU it holds, so it reads no share (row 8709: a compile for a generation's
+    canonical GPUs, which state none, read this process's, which XLA's platform allocator holds none of,
+    and was refused)."""
 
-    def headroom(memory: int) -> int:
-        spare = _admitted([device], [fresh_pool(memory, resident, stated_share(device))], beside,
-                          temporaries)
+    def headroom(limit: int) -> int:
+        spare = _admitted([device], [pool_at(limit, resident)], beside, temporaries)
         assert spare is not None
         return spare
 
-    # The headroom grows with the memory: double to a size that admits, then halve to its least.
+    # The headroom grows with the limit: double to a limit that admits, then halve to its least.
     low, high = 0, max(1, resident + beside + temporaries)
     while headroom(high) < 0:
         low, high = high + 1, 2 * high
@@ -476,13 +477,13 @@ def needed(device, resident: int, beside: int, temporaries: int) -> int:
 
 
 def least_limit(device, terms: Iterable[tuple[int, int, int]]) -> int:
-    """The least allocator limit admitting each of `terms` at `device`'s stated share (else this
-    process's): each a program's admission triple (`admission`: resident, beside, temporaries), its least
-    memory on a GPU like `device` (`needed`) read as the limit that GPU's pool holds (`allocator_limit`),
-    the most of them. The one reading of a program's need the planner's compile ahead (`programs_need`),
-    the GPU lane's measured units (tools/armada/measures.py) and its test share (row 8708). No terms admit
-    no program, and are refused."""
-    limits = [allocator_limit(needed(device, *each), stated_share(device)) for each in terms]
+    """The least allocator limit admitting each of `terms` on a GPU like `device`: each a program's
+    admission triple (`admission`: resident, beside, temporaries), its least limit (`_least_admitting`),
+    the most of them; a limit, whatever share of the GPU's memory takes it, so no share is read. The one
+    reading of a program's need the planner's compile ahead (`programs_need`), the GPU lane's measured
+    units (tools/armada/measures.py) and its test share (row 8708). No terms admit no program, and are
+    refused."""
+    limits = [_least_admitting(device, *each) for each in terms]
     if not limits:
         raise ValueError("least_limit: no admission terms, so no program to admit and no least limit")
     return max(limits)
