@@ -4,6 +4,7 @@
 import jax
 import jax.numpy as jnp
 import pytest
+from jax.experimental import pallas as pl
 from jax.experimental.mosaic.gpu import utils as mgpu_utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend.mlir import ir
@@ -267,3 +268,23 @@ def test_a_comparison_reads_its_sides_at_their_width_and_signedness():
             _scaled(ref)
 
     assert _counted(unsigned) == Work(operations=32, shared_bytes=2 * 4)
+
+
+def test_a_body_one_warps_role_runs_counts_that_warps_lanes_alone():
+    """A body the second warp's role runs (`plgpu.warp_map`) issues its multiply over that warp's 32 lanes
+    and moves their 32 words through shared memory, not a warpgroup's 128."""
+    def body(ctx, ref):
+        del ctx
+        _scaled(ref)
+
+    def kernel(out_gmem, smem):
+        del out_gmem
+
+        @plgpu.warp_map
+        def _(warp):
+            pl.when(warp == 1)(lambda: plgpu.inline_mgpu(arg_types=(plgpu.RefType(),))(body)(smem))
+
+    launched = plgpu.kernel(kernel, out_type=_ROW, num_threads=1, thread_name="wg",
+                            scratch_types=[plgpu.SMEM((128,), jnp.float32)])
+    counted = emission.emitted(jax.make_jaxpr(launched)().jaxpr, 1, "wg").roles[0].fixed
+    assert counted == Work(operations=32, shared_bytes=2 * 4 * 32)
