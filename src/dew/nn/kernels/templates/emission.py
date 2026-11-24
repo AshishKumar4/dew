@@ -501,8 +501,11 @@ class _Counting:
     of its warpgroup's warps where it is one's (`warps`)."""
 
     def __init__(self, axis: str | None, index: int, loops: int = 0, warp: tuple | None = None,
-                 forms: Mapping | None = None, arrivals: _Arrivals | None = None):
+                 forms: Mapping | None = None, arrivals: _Arrivals | None = None, lanes: int | None = None):
         self.axis, self.index, self.warp, self.forms = axis, index, warp, forms
+        # The warp of its warpgroup whose 32 lanes run its body where a warp mesh's role runs it
+        # (`plgpu.warp_map`), None where its warpgroup's 128 do.
+        self.lanes = lanes
         self.arrivals = _Arrivals() if arrivals is None else arrivals
         self.fixed = Work()
         self.walks: list[Work] = []
@@ -680,7 +683,7 @@ class _Counting:
             self.add(_tensor(lhs.dtype, 2 * _elements(equation.outvars[0].aval)
                              * math.prod(lhs.shape[dimension] for dimension in contracted)))
         elif primitive is gpu.inline_mgpu_p:
-            self.add(_inlined(params, equation.invars, values, None if self.warp is None else self.warp[1]))
+            self.add(_inlined(params, equation.invars, values, self.lanes))
         elif primitive is lax.cond_p:
             return self.cond(params["branches"], values, given)
         elif (region := _REGIONS.get(primitive)) is not None:
@@ -739,7 +742,7 @@ class _Counting:
                 inputs[len(consts) + counter] = _Place(at, start, stop, parity)
                 inputs[len(consts) + bound] = stop
             trial = _Counting(self.axis, self.index, loops=len(self.loops) + 1, warp=self.warp,
-                              forms=self.forms, arrivals=self.arrivals)
+                              forms=self.forms, arrivals=self.arrivals, lanes=self.lanes)
             trial.run(body, inputs, static=static)
             self.arrivals.left(trial.landing)
             return trial
@@ -768,7 +771,8 @@ class _Counting:
         barriers = [_barrier(var) for var in inner.invars]
         for warp in range(count):
             counted = _Counting(self.axis, self.index, loops=len(self.loops), warp=(name, warp),
-                                forms=self.forms, arrivals=self.arrivals)
+                                forms=self.forms, arrivals=self.arrivals,
+                                lanes=warp if isinstance(mesh, gpu_core.WarpMesh) else self.lanes)
             counted.run(inner, barriers)
             if self.loops:
                 self.arrivals.left(counted.landing)
@@ -825,7 +829,7 @@ class _Counting:
         trials = []
         for branch in branches:
             trial = _Counting(self.axis, self.index, loops=len(self.loops), warp=self.warp,
-                              forms=self.forms, arrivals=self.arrivals)
+                              forms=self.forms, arrivals=self.arrivals, lanes=self.lanes)
             trial.run(branch, operands, static=given[1:])
             if self.loops:
                 self.arrivals.left(trial.landing)

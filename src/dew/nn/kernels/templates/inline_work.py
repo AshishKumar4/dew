@@ -108,20 +108,22 @@ _held: "weakref.WeakKeyDictionary[Callable, dict]" = weakref.WeakKeyDictionary()
 
 class _Launch:
     """A body's launch context as the count stands it in: each TMA copy it asks for (`async_copy`, a
-    gathered ring's rows) its shared side's bytes moved between device and shared memory, once, however
-    many lanes issue it; any other use of the context is no rule's."""
-
-    def __init__(self):
-        self.work = Work()
+    gathered ring's rows) marked where the body asks for it (`COPIED`), so the walk counts it under the
+    branches and loops around it, its shared side's bytes moved between device and shared memory once
+    however many lanes issue it; any other use of the context is no rule's."""
 
     def async_copy(self, *, src_ref, dst_ref, **options) -> None:
         del options
         shared = dst_ref if _shared(dst_ref.type) else src_ref
-        moved = float(_bytes_of(ir.MemRefType(shared.type)))
-        self.work = self.work + Work(device_bytes=moved, shared_bytes=moved)
+        moved = _bytes_of(ir.MemRefType(shared.type))
+        mgpu_utils.inline_ptx(f"{COPIED} {moved}", has_side_effects=True)
 
     def __getattr__(self, name: str):
         raise Uncounted(f"a body's use of its launch context's {name}")
+
+
+COPIED = "// dew.copied"
+"""The mark a stood-in launch context leaves where a body asks it for a copy, with its bytes (`_Launch`)."""
 
 
 def _counted(fn: Callable, avals: Sequence, arg_types: Sequence, known: Sequence, capability: tuple,
@@ -149,7 +151,7 @@ def _counted(fn: Callable, avals: Sequence, arg_types: Sequence, known: Sequence
         if warp is not None:
             # A warp's role runs it on its own 32 lanes.
             active = np.arange(LANES) // WARP == warp % (LANES // WARP)
-        return _Lanes().region(function.operation.regions[0], active) + launch.work
+        return _Lanes().region(function.operation.regions[0], active)
 
 
 def _stand_in_type(aval, kind) -> ir.Type:
@@ -344,14 +346,17 @@ class _Lanes:
         if name in _FREE or name.startswith(_FREE_PREFIXES):
             return Work()
         if name == "llvm.inline_asm":
-            def guarded(at: int, negated: bool) -> np.ndarray:
-                # `$N` numbers the block's results first, then its operands.
-                if at < len(op.results):
-                    return active
-                maybe, surely = self.bounds(op.operands[at - len(op.results)])
-                return active & (~surely if negated else maybe)
+            # `$N` numbers the block's outputs first (its constraints' `=`), then its operands.
+            outputs = sum(each.startswith("=") for each in
+                          ir.StringAttr(op.attributes["constraints"]).value.split(","))
 
-            return _assembly(ir.StringAttr(op.attributes["asm_string"]).value, issued, moving, guarded)
+            def operand(at: int) -> tuple[np.ndarray | None, tuple[np.ndarray, np.ndarray]]:
+                if at < outputs:
+                    raise Uncounted(f"a PTX guard or operand on the block's output ${at}")
+                value = op.operands[at - outputs]
+                return self.read(value), self.bounds(value)
+
+            return _assembly(ir.StringAttr(op.attributes["asm_string"]).value, active, operand)
         if name == "nvvm.cp.async.shared.global":
             # Each active lane's copy of `size` bytes from device into shared memory.
             copied = ir.IntegerAttr(op.attributes["size"]).value * moving
@@ -388,73 +393,127 @@ _PTX_INTEGER = ("lop3.", "shf.", "prmt.", "and.", "or.", "xor.", "not.", "shl.",
 _PTX_MULTIPLY = ("mul.", "mad.")
 
 
-def _assembly(text: str, issued: float, moving: float, guarded: Callable[[int, bool], np.ndarray]) -> Work:
+def _assembly(text: str, active: np.ndarray, operand: Callable) -> Work:
     """Inline PTX's work, an instruction at a time: float arithmetic on the fp32 lanes (a packed pair's, `x2`,
     two an instruction), special functions on their units, integer arithmetic and bit manipulation on the
     integer units (a multiply on the FMA pipe), a conversion at the conversions' rate, a load or store its
     active lanes' bytes; a shuffle, a move, a predicate and synchronization free (scalar, a lane's
     exchange); a global atomic its word read and written by each lane that runs it. An instruction guarded
-    by an operand (`@$N`, `@!$N`) runs on the lanes that may take it (`guarded`); a memory instruction
-    guarded by a predicate the block computes itself is refused, its lanes unknown. Raises `Uncounted` for
-    any other instruction."""
+    (`@p`, `@!p`) runs on the `active` lanes that may take its guard: an operand's (`$N`, `operand`), or a
+    predicate the block sets itself from operands and immediates whose lanes are known (`setp`, and-ed or
+    or-ed with another predicate: an elected lane's, a last arriver's among it); a memory instruction whose
+    guard's lanes are unknown is refused. Raises `Uncounted` for any other instruction."""
     work = Work()
-    full = (issued, moving)
+    predicates: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    unknown = (np.ones(LANES, dtype=bool), np.zeros(LANES, dtype=bool))
+
+    def lanes_of(word: str) -> np.ndarray | None:
+        word = word.strip(",")
+        if word.startswith("$") and word[1:].isdigit():
+            return operand(int(word[1:]))[0]
+        try:
+            return np.full(LANES, int(word, 0), dtype=np.int64)
+        except ValueError:
+            return None
+
+    def bounds_of(word: str) -> tuple[np.ndarray, np.ndarray]:
+        word = word.strip(",")
+        if word.startswith("$") and word[1:].isdigit():
+            return operand(int(word[1:]))[1]
+        return predicates.get(word, unknown)
+
     for line in text.replace("{", ";").replace("}", ";").split(";"):
         words = line.split()
-        issued, moving = full
+        running = active
         guard = None
         if words and words[0].startswith("@"):
             negated = words[0].startswith("@!")
             guard, words = words[0].lstrip("@!"), words[1:]
-            if guard.startswith("$") and guard[1:].isdigit():
-                lanes = guarded(int(guard[1:]), negated)
-                issued = float(lanes.reshape(-1, WARP).any(axis=1).sum() * WARP)
-                moving = float(lanes.sum())
+            maybe, surely = bounds_of(guard)
+            running = active & (~surely if negated else maybe)
+            if guard.startswith("$") or guard in predicates:
                 guard = None
-        if not words or words[0].startswith("."):
+        issued = float(running.reshape(-1, WARP).any(axis=1).sum() * WARP)
+        moving = float(running.sum())
+        if words and words[0].startswith("setp."):
+            predicates[words[1].strip(",")] = _set(words, lanes_of, bounds_of)
             continue
-        mnemonic = words[0]
-        elements = 2 if "x2" in mnemonic else 1
-        if mnemonic.startswith(_PTX_FREE):
+        if line.strip().startswith(COPIED):
+            # A launch context's copy (`_Launch`): its bytes once, where any lane reaches it.
+            moved = float(line.split()[-1]) * bool(moving)
+            work = work + Work(device_bytes=moved, shared_bytes=moved)
             continue
-        floating = any(kind in mnemonic for kind in ("f32", "f16", "bf16", "f64"))
-        if mnemonic.startswith(_PTX_FLOAT) and floating:
-            work = work + Work(operations=elements * issued)
-        elif mnemonic.startswith(_PTX_SPECIAL):
-            work = work + Work(exponentials=elements * issued)
-        elif mnemonic.startswith("cvt."):
-            work = work + Work(conversions=elements * issued)
-        elif mnemonic.startswith(_PTX_MULTIPLY):
-            work = work + Work(integer_multiply_adds=elements * issued)
-        elif mnemonic.startswith(_PTX_INTEGER):
-            work = work + Work(integer_operations=elements * issued)
-        elif mnemonic.startswith("mma.") and (shape := re.search(r"\.m(\d+)n(\d+)k(\d+)\.", mnemonic)):
-            # A warp's matrix product: 2 M N K operations each warp that issues it, in its operands' mode.
-            m, n, k = map(int, shape.groups())
-            operations = 2 * m * n * k * issued / WARP
-            if ".tf32" in mnemonic:
-                work = work + Work(tf32_flops=operations)
-            elif any(kind in mnemonic for kind in (".e4m3", ".e5m2")):
-                work = work + Work(fp8_flops=operations)
-            elif any(kind in mnemonic for kind in (".bf16", ".f16")):
-                work = work + Work(flops=operations)
-            else:
-                raise Uncounted(f"no rule counts the PTX instruction {mnemonic}")
-        elif guard is not None and mnemonic.startswith(("ld.", "st.", "atom.", "red.", "cp.async.")):
-            raise Uncounted(f"a memory instruction guarded by the block's own predicate {guard}: {mnemonic}")
-        elif mnemonic.startswith(("cp.async.ca.", "cp.async.cg.")):
-            # A lane's copy of its operand's bytes (16 where it states none) from device into shared memory.
-            sizes = [int(word.strip(",")) for word in words[1:] if word.strip(",").isdigit()]
-            copied = (sizes[0] if sizes else 16) * moving
-            work = work + Work(device_bytes=copied, shared_bytes=copied)
-        elif mnemonic.startswith(("atom.", "red.")) and ".global" in mnemonic:
-            work = work + Work(device_bytes=8 * moving)
-        elif mnemonic.startswith(("ld.", "st.")):
-            moved = 4 * moving
-            work = work + (Work(shared_bytes=moved) if ".shared" in mnemonic else Work(device_bytes=moved))
-        else:
-            raise Uncounted(f"no rule counts the PTX instruction {mnemonic}")
+        if words and words[0].startswith("//"):
+            continue
+        if not words or words[0].startswith(".") or words[0].startswith(_PTX_FREE):
+            continue
+        if guard is not None and words[0].startswith(("ld.", "st.", "atom.", "red.", "cp.async.")):
+            raise Uncounted(f"a memory instruction under a guard of unknown lanes ({guard}): {words[0]}")
+        work = work + _instruction(words, issued, moving)
     return work
+
+
+def _instruction(words: list[str], issued: float, moving: float) -> Work:
+    """One PTX instruction's work (`_assembly`'s rules), `issued` its issuing warps' lanes and `moving` its
+    running lanes."""
+    mnemonic = words[0]
+    elements = 2 if "x2" in mnemonic else 1
+    floating = any(kind in mnemonic for kind in ("f32", "f16", "bf16", "f64"))
+    if mnemonic.startswith(_PTX_FLOAT) and floating:
+        return Work(operations=elements * issued)
+    if mnemonic.startswith(_PTX_SPECIAL):
+        return Work(exponentials=elements * issued)
+    if mnemonic.startswith("cvt."):
+        return Work(conversions=elements * issued)
+    if mnemonic.startswith(_PTX_MULTIPLY):
+        return Work(integer_multiply_adds=elements * issued)
+    if mnemonic.startswith(_PTX_INTEGER):
+        return Work(integer_operations=elements * issued)
+    if mnemonic.startswith("mma.") and (shape := re.search(r"\.m(\d+)n(\d+)k(\d+)\.", mnemonic)):
+        # A warp's matrix product: 2 M N K operations each warp that issues it, in its operands' mode.
+        m, n, k = map(int, shape.groups())
+        operations = 2 * m * n * k * issued / WARP
+        if ".tf32" in mnemonic:
+            return Work(tf32_flops=operations)
+        if any(kind in mnemonic for kind in (".e4m3", ".e5m2")):
+            return Work(fp8_flops=operations)
+        if any(kind in mnemonic for kind in (".bf16", ".f16")):
+            return Work(flops=operations)
+    elif mnemonic.startswith(("cp.async.ca.", "cp.async.cg.")):
+        # A lane's copy of its operand's bytes (16 where it states none) from device into shared memory.
+        sizes = [int(word.strip(",")) for word in words[1:] if word.strip(",").isdigit()]
+        copied = (sizes[0] if sizes else 16) * moving
+        return Work(device_bytes=copied, shared_bytes=copied)
+    elif mnemonic.startswith(("atom.", "red.")) and ".global" in mnemonic:
+        return Work(device_bytes=8 * moving)
+    elif mnemonic.startswith(("ld.", "st.")):
+        moved = 4 * moving
+        return Work(shared_bytes=moved) if ".shared" in mnemonic else Work(device_bytes=moved)
+    raise Uncounted(f"no rule counts the PTX instruction {mnemonic}")
+
+
+_PTX_COMPARES = {"eq": np.equal, "ne": np.not_equal, "lt": np.less, "le": np.less_equal, "gt": np.greater,
+                 "ge": np.greater_equal, "lo": np.less, "ls": np.less_equal, "hi": np.greater,
+                 "hs": np.greater_equal}
+
+
+def _set(words: list[str], lanes_of: Callable, bounds_of: Callable) -> tuple[np.ndarray, np.ndarray]:
+    """A `setp`'s predicate's lanes that may and that surely hold it (`setp.cmp[.and|.or].type p, a, b[,
+    q]`): its comparison's where both sides' lanes are known, else any; and-ed or or-ed with `q`'s."""
+    parts = words[0].split(".")
+    compare = _PTX_COMPARES.get(parts[1])
+    sides = [lanes_of(word) for word in words[2:4]]
+    if compare is not None and all(side is not None for side in sides):
+        held = compare(sides[0], sides[1])
+        maybe, surely = held, held
+    else:
+        maybe, surely = np.ones(LANES, dtype=bool), np.zeros(LANES, dtype=bool)
+    if len(parts) > 3 and parts[2] in ("and", "or") and len(words) > 4:
+        other_maybe, other_surely = bounds_of(words[4])
+        if parts[2] == "and":
+            return maybe & other_maybe, surely & other_surely
+        return maybe | other_maybe, surely | other_surely
+    return maybe, surely
 
 
 def _lane_values(name: str, op, operands: list[np.ndarray]) -> np.ndarray | None:

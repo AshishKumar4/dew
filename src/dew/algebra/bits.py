@@ -373,29 +373,21 @@ class BitForm:
         apiece, each holding the steps it reads, so a step two registers share is written twice and ptxas,
         which optimizes the kernel's PTX whole, may compute it once (the consumer's compile report shows
         whether it does)."""
-        needed: set[int] = set()
-        pending = [self.outputs[output]]
-        while pending:
-            value = pending.pop()
-            if value and value not in needed:
-                needed.add(value)
-                pending.extend(self.steps[value - 1].args)
-        names = {0: "$1", **{value: f"v{value}" for value in needed}}
-        lines = [f".reg .b32 {', '.join(names[value] for value in sorted(needed))};"] if needed else []
-        for value in sorted(needed):
-            step = self.steps[value - 1]
-            lines.append(_written(step, names[value], [names[arg] for arg in step.args]))
-        lines.append(f"mov.b32 $0, {names[self.outputs[output]]};")
-        return "{\n" + "\n".join(lines) + "\n}"
+        return self._block((self.outputs[output],))
 
     def ptx_registers(self) -> str:
         """Every output register of the form as one PTX block over its stored word (`$N`, N its outputs'
         count) into `$0` to `$N-1`, each step it reads written once (`ptx`'s steps, which a block apiece
         writes again where two registers share them): a kernel's inline assembly of several results
         (`inline_forms.registers`), so what it emits is the form's work (`work`)."""
-        word = f"${len(self.outputs)}"
+        return self._block(self.outputs)
+
+    def _block(self, outputs: Sequence[int]) -> str:
+        """`outputs`' registers as one PTX block over the stored word (the operand after them) into `$0`
+        on, each step they read written once."""
+        word = f"${len(outputs)}"
         needed: set[int] = set()
-        pending = list(self.outputs)
+        pending = list(outputs)
         while pending:
             value = pending.pop()
             if value and value not in needed:
@@ -406,7 +398,7 @@ class BitForm:
         for value in sorted(needed):
             step = self.steps[value - 1]
             lines.append(_written(step, names[value], [names[arg] for arg in step.args]))
-        lines += [f"mov.b32 ${at}, {names[output]};" for at, output in enumerate(self.outputs)]
+        lines += [f"mov.b32 ${at}, {names[output]};" for at, output in enumerate(outputs)]
         return "{\n" + "\n".join(lines) + "\n}"
 
     @property

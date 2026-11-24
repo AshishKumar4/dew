@@ -33,7 +33,10 @@ def _asm(array, ptx: str, registers_out: int) -> tuple:
     """`ptx` (`registers_out` 32-bit registers of one 32-bit word, constraints `=r,...,r`) on each word of
     `array`'s registers, a word a block: each output register's array."""
     i32 = mgpu_ir.IntegerType.get_signless(32)
-    returned = mgpu_ir.Type.parse(f"!llvm.struct<({', '.join(['i32'] * registers_out)})>")
+    # One output register is its block's value, several a struct of them (as Mosaic GPU's `inline_ptx`
+    # returns them): LLVM refuses a struct of one output.
+    returned = (i32 if registers_out == 1
+                else mgpu_ir.Type.parse(f"!llvm.struct<({', '.join(['i32'] * registers_out)})>"))
     constraints = ",".join(["=r"] * registers_out + ["r"])
     outs = [np.empty_like(array.registers) for _ in range(registers_out)]
     for index, register in np.ndenumerate(array.registers):
@@ -44,7 +47,7 @@ def _asm(array, ptx: str, registers_out: int) -> tuple:
             word = mgpu_vector.extract(register, dynamic_position=[], static_position=position)
             done = mgpu_llvm.inline_asm(returned, [word], ptx, constraints)
             for output in range(registers_out):
-                value = mgpu_llvm.extractvalue(i32, done, [output])
+                value = done if registers_out == 1 else mgpu_llvm.extractvalue(i32, done, [output])
                 decoded[output] = mgpu_vector.insert(value, decoded[output], dynamic_position=[],
                                                      static_position=position)
         for output in range(registers_out):
