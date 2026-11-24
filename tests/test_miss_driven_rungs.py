@@ -46,19 +46,21 @@ def test_a_miss_whose_joined_stacks_hold_less_than_it_was_short_of_parts_none_of
 
 
 def test_a_search_asks_first_the_rung_its_miss_reads_as_dropping_what_it_was_short_of(caplog):
-    """A step of one row, which no split shrinks, that misses its devices at no remat by about half its
-    temporaries asks first the rung its miss reads as dropping that many bytes of its forward's values
-    (`RecomputeStatement`), before any lighter one: the first rung it compiles again at is that rung, at
-    which it fits, or, where XLA schedules that rung's peak otherwise, says what moved and climbs on."""
+    """A step of one row, which no split shrinks, whose MLPs' forward values hold most of its temporaries,
+    that misses its devices at no remat by a quarter of them asks first the rung its miss reads as dropping
+    that many bytes of its forward's values (`RecomputeStatement`), before any lighter one: the first rung
+    it compiles again at is that rung, at which it fits, or, where XLA schedules that rung's peak
+    otherwise, says what moved and climbs on."""
     model = models.build("causal_transformer", vocab_size=256, emb_features=256, num_layers=4, num_heads=4,
-                         num_kv_heads=2, head_dim=64, mlp_features=2048, max_seq_len=4096, dtype="bfloat16",
+                         num_kv_heads=2, head_dim=64, mlp_features=8192, max_seq_len=1024, dtype="bfloat16",
                          attention_impl="xla")
-    whole, _ = _ahead(model, Adam(), 4096, 1, 2 ** 34, caplog)
+    whole, _ = _ahead(model, Adam(), 1024, 1, 2 ** 34, caplog)
     assert whole is not None and whole.plan["remat"] is None, whole and whole.plan
     beside = whole.argument_bytes + whole.output_bytes - whole.alias_bytes
-    ahead, said = _ahead(model, Adam(), 4096, 1, beside + whole.temp_bytes // 2, caplog)
+    ahead, said = _ahead(model, Adam(), 1024, 1, beside + 3 * whole.temp_bytes // 4, caplog)
     read = [line for line in said if "the step's miss reads first" in line]
     climbed = [line for line in said if "recomputing more at" in line]
     assert read and climbed, said
     moved = [line for line in said if "XLA scheduled its peak otherwise" in line]
     assert moved or (ahead is not None and f'"remat": "{ahead.plan["remat"]}"' in climbed[0]), (said, ahead)
+    assert ahead is None or ahead.plan["remat"] is not None, ahead.plan
