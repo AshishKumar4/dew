@@ -220,8 +220,8 @@ def test_a_chunks_writes_past_float32s_range_cancel_as_the_token_walks():
     zero, one = jnp.zeros((1, 2, 1), jnp.float32), jnp.ones((1, 2, 1), jnp.float32)
     state = jnp.zeros((1, 1, 2, 2, 1), jnp.float32).at[:, :, 0, 0, 0].set(2.0 ** 127)
     momentum_decay = jnp.asarray([np.log(0.125), 0.0], jnp.float32).reshape(1, 2, 1)
-    given = Chunk(along, along, value, log_decay=zero, beta=one, momentum_decay=momentum_decay, erase_key=erase,
-                  state=state)
+    given = Chunk(along, along, value, log_decay=zero, beta=one, momentum_decay=momentum_decay,
+                  erase_key=erase, state=state)
     out, final = chunk(hooks, given, chunk_size=CHUNK)
 
     def one_token(state, token):
