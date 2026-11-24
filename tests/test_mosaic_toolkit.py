@@ -1873,6 +1873,82 @@ def test_groups_summed_together_on_tcgen05_issue_every_product_before_one_commit
     assert order[first + 3:first + 5] == ["tcgen05_commit_arrive", "barrier_wait"], order
 
 
+def _staged_three(x, *, interpret: bool, batched: bool, aliased: bool = False):
+    """`x` (16 x 64), twice and thrice it, staged in bf16 by an mma.sync issuer whose warps split a tile's
+    columns (its stores bracketed by its own barriers), in one batch (`Family.staged_all`) or a store apiece
+    (`Family.staged`), and each read back; `aliased`, its first buffer given twice."""
+    family = bundles.named("mma.sync", jnp.bfloat16, None).specialized(16, 64)
+
+    def body(x_gmem, *outs):
+        def scoped(*buffers):
+            value = x_gmem[...] if interpret else family.zeros((16, 64))
+            targets = (buffers[0], buffers[0], buffers[2]) if aliased else buffers
+            pairs = [(value * times, buffer) for times, buffer in zip((1, 2, 3), targets, strict=True)]
+            if batched:
+                family.staged_all(pairs)
+            else:
+                for each, buffer in pairs:
+                    family.staged(each, buffer)
+            if interpret:
+                for out, buffer in zip(outs, buffers, strict=True):
+                    out[...] = family.tile_of(buffer).astype(jnp.float32)
+
+        pl.run_scoped(scoped, *(plgpu.SMEM((16, 64), jnp.bfloat16) for _ in range(3)))
+
+    out = jax.ShapeDtypeStruct((16, 64), jnp.float32)
+    return family.kernel(body, out_type=(out,) * 3, grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=interpret, name="staged")(x)
+
+
+@INTERPRETS
+def test_a_staged_batch_holds_each_value_in_its_buffer():
+    """Interpreted: three values staged in one batch (`Family.staged_all`) read back exactly from their own
+    buffers."""
+    x = jax.random.randint(jax.random.key(7), (16, 64), -4, 4).astype(jnp.float32)
+    got = _staged_three(x, interpret=INTERPRETED, batched=True)
+    for times, value in zip((1, 2, 3), got, strict=True):
+        np.testing.assert_array_equal(np.asarray(value), times * np.asarray(x))
+
+
+def _barriers(call) -> int:
+    """The barriers (`gpu.barrier`, `nvvm.barrier`) in the typed module `call` lowers to for an A100."""
+    import jax.experimental.mosaic.gpu as mgpu
+    from kernel_compile import lowered_for
+
+    from dew.nn.kernels.lowered import kernel_calls
+
+    lowered = lowered_for(call, (jax.ShapeDtypeStruct((16, 64), jnp.float32),), "sm80")
+    (kernel,) = [each for each in kernel_calls(lowered) if each.kind == "mosaic_gpu"]
+    module = mgpu.deserialized(kernel.ir)
+    pending, found = [module.operation], 0
+    with module.context:
+        while pending:
+            for region in pending.pop().regions:
+                for block in region.blocks:
+                    for inner in block.operations:
+                        found += inner.operation.name in ("gpu.barrier", "nvvm.barrier")
+                        pending.append(inner.operation)
+    return found
+
+
+@COMPILES_ON_CPU
+def test_an_mma_sync_staged_batch_takes_one_barrier_pair_where_its_stores_took_one_each():
+    """Lowered for an A100: three tiles staged by an mma.sync issuer whose warps split a tile's columns take
+    one pair of warpgroup barriers in one batch (`Family.staged_all`), four fewer than a store apiece's pair
+    each (`staged`; a Kimi intra step's 20 a trip, FS-INTRA-BAR1)."""
+    apiece, batch = (_barriers(functools.partial(_staged_three, interpret=False, batched=batched))
+                     for batched in (False, True))
+    assert batch >= 2 and apiece - batch == 4, (apiece, batch)
+
+
+def test_a_staged_batch_refuses_a_buffer_twice():
+    """A batch given one shared-memory buffer twice is refused as it traces, before any store: its stores go
+    unbracketed against each other."""
+    with generation.assumed("sm80"), pytest.raises(ValueError):
+        jax.make_jaxpr(functools.partial(_staged_three, interpret=False, batched=True, aliased=True))(
+            jax.ShapeDtypeStruct((16, 64), jnp.float32))
+
+
 def _staged_together(x, w, *, interpret, shared: bool):
     """`x_0 @ w_0` and `2 x_0 @ w_0` on tcgen05's chunks, summed together by one prepared-operand issuer
     (`operands.Issuer.summed_together`): each group's left operand a register value its product name stages
