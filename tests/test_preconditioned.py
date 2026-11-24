@@ -40,6 +40,12 @@ WALKED_DOCUMENTS = ((0, 50, 130), (20, 64, 100))
 others within spans, a document crossing two."""
 SEEDS = 16
 """Each site's declared seeds."""
+TEMPLATED = (2, 80, 2, 4, 32, 32)
+"""PGDN on the recurrence template (its keys erasing along reads of their own, `chunk_forward.forward`'s
+`reads`): a whole chunk of its 64 tokens and a part one, two value heads a key head's."""
+TEMPLATED_DOCUMENTS = ((0, 30, 70), (5, 64))
+"""Each row's packed documents' first tokens over the template's chunks: one starting at a chunk's first
+token, others within chunks, a document crossing two."""
 INTERPRETED = interprets()
 
 
@@ -90,6 +96,14 @@ def walked(*operands, starts=None):
         return chunked(*operands, starts=starts)
 
 
+def templated(*operands, starts=None, kernel: str = "mosaic_gpu"):
+    """`chunked` with the delta rule on `kernel` (the recurrence template's where unnamed), interpreted off a
+    GPU at an H100's facts."""
+    with (generation.assumed("sm90" if INTERPRETED else None, interpreted=INTERPRETED),
+          generation.chosen(gated_delta_rule=kernel)):
+        return chunked(*operands, starts=starts)
+
+
 def operands(per_key: bool, shape: tuple[int, ...] = SHAPE):
     """A seed's fp32 operands as fla's layers form them (`hosted`), of `shape` (`SHAPE`'s order): the log
     decays `log sigmoid` of normals (the memory's near one; a key dimension's each where `per_key`), ATK's
@@ -127,6 +141,35 @@ def test_the_chunked_rule_is_as_exact_as_flas_recurrence_a_token_at_a_time(per_k
     label = f"preconditioned {'kda' if per_key else 'gdn'}"
     assert_packed_on_par(chunked, tokenwise, operands(per_key), label, packed=packed, documents=DOCUMENTS,
                          length=SHAPE[1], seeds=SEEDS)
+
+
+@pytest.mark.parametrize('packed', [False, True], ids=['one sequence', 'packed'])
+def test_pgdn_on_the_template_is_as_exact_as_flas_recurrence_a_token_at_a_time(packed):
+    """PGDN's delta rule on the recurrence template, its keys erasing along reads of their own (the system's
+    rows and the weights the normalized keys', its writes the preconditioned keys'): the output, final state
+    and moment and every operand's gradient on par with fla's recurrence a token at a time from float64
+    (check 1), over one sequence or packed documents crossing its chunks."""
+    assert_packed_on_par(templated, tokenwise, operands(per_key=False, shape=TEMPLATED),
+                         "preconditioned gdn on the template", packed=packed, documents=TEMPLATED_DOCUMENTS,
+                         length=TEMPLATED[1], seeds=SEEDS)
+
+
+@pytest.mark.parametrize(('per_key', 'kernel', 'taken'), [(False, 'mosaic_gpu', 'mosaic_gpu'),
+                                                         (False, 'fla', 'xla'), (True, 'mosaic_gpu', 'xla')],
+                         ids=['pgdn template', 'pgdn port', 'pkda template'])
+def test_a_read_erase_takes_the_template_under_a_decay_a_head_alone(per_key, kernel, taken):
+    """The delta rule's selector gives PGDN's training call the template it names (its keys' erase along
+    reads of their own, `chunk_forward.forward`'s `reads`), where fla's port, which takes no reads, and
+    PKDA's decay a key dimension, which the template's read erase does not take yet, hand over to the
+    portable math: each traced route its kernel's."""
+    drawn = operands(per_key, TEMPLATED)(0)[:-1]
+
+    def loss(*given):
+        return templated(*given, kernel=kernel)[0].astype(jnp.float32).sum()
+
+    with generation.routes() as found:
+        jax.eval_shape(jax.grad(loss, argnums=(0, 1, 2)), *drawn)
+    assert {route.kernel for route in found if route.choice == generation.Choice.GATED_DELTA_RULE} == {taken}
 
 
 def test_atks_walk_on_the_template_is_as_exact_over_packed_spans():

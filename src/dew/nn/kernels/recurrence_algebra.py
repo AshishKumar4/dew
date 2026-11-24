@@ -1423,34 +1423,43 @@ def values_gradient(lower, values: TileLoad, blocks: int, u_grads: TileLoad, bet
 
 
 def keys_gradient(lower, keys: TileLoad, columns: int, w_grads: TileLoad, d_l, beta, gate, low, dtype,
-                  issue: Issue, *,
-                  emit: Callable[[str, int, jax.Array], None]) -> tuple[jax.Array, jax.Array, jax.Array]:
+                  issue: Issue, *, emit: Callable[[str, int, jax.Array], None],
+                  reads: TileLoad | None = None) -> tuple[jax.Array, jax.Array, jax.Array]:
     """The WY representation's backward under a decay a head, its keys' part, given the system's gradient
     `d_l` (`system_gradient`'s, a tile its products read as they are, in `dtype`): each key block's gradient,
     through `w` (`X^T dw` scaled, 'inverse_t') and through the system (`dL k` and `dL^T (k beta)`,
     'keys_dl', 'keys_dlt'), to `emit('keys', c, dk)` as it is final. Returns beta's gradient through `w` and
     the system, the decay's range terms through `w` (`summed_ranges`' `after`) and its pair terms
-    `dL (k k^T) beta` (`summed_pairs`'), fp32."""
+    `dL (k k^T) beta` (`summed_pairs`'), fp32. Under an erase along reads of their own (`reads(c)`, a key
+    block of them: `recurrence.Hooks.erase` 'read', the system `beta b k^T` and `w = X (b beta exp2 g)`),
+    the system's rows and `w` are the reads': their gradient through `w` and `dL k` to `emit('reads', c,
+    db)`, the keys' through the system's columns `dL^T (b beta)` to `emit('keys', c, dk)`, beta's and the
+    decay's terms through the reads, the pair terms `dL (b k^T) beta`."""
     decay = raised(gate, low)
     narrow = d_l if isinstance(d_l, jax.Array) else d_l.value()
     weighted_l = (narrow.astype(jnp.float32) * beta[:, None]).astype(dtype)
+    rows = keys if reads is None else reads
     d_betas, d_gate = [], None
     for c in range(columns):
-        key = keys(c)
+        key, read = keys(c), rows(c)
         w_grad = w_grads(c).value().astype(jnp.float32)
         # `X^T dw` decayed, then its sum with `dL k` (each term's own beta its row's): one tile of them live.
         through_w = (w_grad + issue("inverse_t", lower.T, w_grad.astype(dtype))) * decay[:, None]
-        key_value = key.value().astype(jnp.float32)
-        d_gate = _added(d_gate, beta * jnp.sum(through_w * key_value, axis=1))
+        read_value = read.value().astype(jnp.float32)
+        d_gate = _added(d_gate, beta * jnp.sum(through_w * read_value, axis=1))
         combined = through_w + issue("keys_dl", d_l, key)
-        d_betas.append(jnp.sum(combined * key_value, axis=1))
-        # `dL^T (k beta)` as `(beta dL)^T k`: one operand in registers, the keys a tile.
-        emit("keys", c, combined * beta[:, None] + issue("keys_dlt", Transposed(weighted_l), key))
-    # The keys' own pairs once every block's gradient is out: a tile not live beside theirs.
+        d_betas.append(jnp.sum(combined * read_value, axis=1))
+        # `dL^T (b beta)` as `(beta dL)^T b`: one operand in registers, the reads a tile.
+        columned = issue("keys_dlt", Transposed(weighted_l), read)
+        if reads is None:
+            emit("keys", c, combined * beta[:, None] + columned)
+        else:
+            emit("reads", c, combined * beta[:, None])
+            emit("keys", c, columned)
+    # The system's own pairs once every block's gradient is out: a tile not live beside theirs.
     products = None
     for c in range(columns):
-        key = keys(c)
-        products = _added(products, issue("keys_dl", key, key.T))
+        products = _added(products, issue("keys_dl", rows(c), keys(c).T))
     assert products is not None and d_gate is not None, "a chunk's keys take at least a block"
     pairs = narrow.astype(jnp.float32) * (products * beta[:, None])
     return _summed(d_betas), d_gate, pairs

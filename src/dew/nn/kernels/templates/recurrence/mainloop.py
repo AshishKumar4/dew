@@ -1225,7 +1225,7 @@ def _solved_resources(call: Call, *, keeps: bool, applies: bool, narrow: bool) -
 
 
 @lowered_once
-def _solved(k, v, hi, lo, beta, taken, call: Call, *, keeps: bool = True, applies: bool = True):
+def _solved(k, v, hi, lo, beta, taken, call: Call, *, keeps: bool = True, applies: bool = True, reads=None):
     """`(a [R, HV * C], w [R, HV * Dk], u [R, HV * Dv])` as `call.held` of each chunk and value head under a
     decay a head, fla's kkt_solve and recompute_w_u in one program (FlashQLA's first kernel): the keys'
     products (`algebra.keyed`) inverted by doubling on the chunk's tile (`algebra.doubled`, its merges in
@@ -1235,8 +1235,13 @@ def _solved(k, v, hi, lo, beta, taken, call: Call, *, keeps: bool = True, applie
     stored and loaded the inverse between them. Where it `keeps` no inverse (a forward no backward reads,
     `a` None), its store's landing tile goes: an A100's launch then holds two programs a multiprocessor
     (an inverse's 8 KB past half its shared memory kept it at one, SE-family-a100-0c8018352). Where it
-    `applies` none, `(a,)` alone, which `_weighted` applies (`_solves_apart`)."""
+    `applies` none, `(a,)` alone, which `_weighted` applies (`_solves_apart`). Under an erase along reads of
+    their own (`reads` `[R, H * Dk]`, `chunk_forward.forward`'s), the system's rows and the weights are the
+    reads' (`b k^T`, `w = X (b beta exp2 g)`), streamed beside the keys."""
     chunk = call.chunk
+    reading = reads is not None
+    # The system's rows and the weights' operand: the reads where the call takes them, else the keys.
+    rows_of = "reads" if reading else "keys"
     call = dataclasses.replace(call, family=widest_layout(call))
     width, value_width, family = call.width, call.value_width, call.family
     # The values a tile narrower than a block (`Call.value_block`): their own staging and landing.
@@ -1244,14 +1249,18 @@ def _solved(k, v, hi, lo, beta, taken, call: Call, *, keeps: bool = True, applie
     held = dataclasses.replace(call.held, rows=call.rows)
 
     def program(at, *refs, streams, staging, landing):
-        k_ref = refs[0]
-        v_ref, rest = (refs[1], refs[2:]) if applies else (None, refs[1:])
+        k_ref, refs = refs[0], refs[1:]
+        reads_ref, refs = (refs[0], refs[1:]) if reading else (None, refs)
+        v_ref, rest = (refs[0], refs[1:]) if applies else (None, refs)
         hi_ref, lo_ref, beta_ref, column_hi_ref, column_lo_ref, _taken_ref, *outputs = rest
         a_ref, w_ref, u_ref = ((*outputs, None, None) if not applies else outputs if keeps
                                else (None, *outputs))
         n, h = at["chunks"], at["heads"]
         row, span = n * chunk, pl.ds(n * chunk, chunk)
-        views = stream_views(keys=call.given.views(k_ref, row, chunk, h // call.group * width, width),
+        keyed = h // call.group * width
+        views = stream_views(keys=call.given.views(k_ref, row, chunk, keyed, width),
+                             **({"reads": call.given.views(reads_ref, row, chunk, keyed, width)}
+                                if reading else {}),
                              **({"values": call.given.views(v_ref, row, chunk, h * value_width, value_width)}
                                 if applies else {}))
         vectors = {"gate": hi_ref, "low": lo_ref, "write": beta_ref, "column_gate": column_hi_ref,
@@ -1284,8 +1293,8 @@ def _solved(k, v, hi, lo, beta, taken, call: Call, *, keeps: bool = True, applie
 
             # The key blocks' products into one accumulator: an accumulator a block, an H100's solve at keys
             # 256 wide spilled 224 bytes a thread (wide-sm90 at 8d1145e66).
-            product = Issuer(call).summed([("intra", key, key.T) for key in map(
-                functools.partial(block, "keys"), range(width // call.block))])
+            product = Issuer(call).summed([("intra", block(rows_of, c), block("keys", c).T)
+                                           for c in range(width // call.block)])
             system = algebra.keyed(product, gate, low, betas, *columns)
             lower = algebra.solved(system, _merging(merges, call))
             if keeps:
@@ -1305,7 +1314,7 @@ def _solved(k, v, hi, lo, beta, taken, call: Call, *, keeps: bool = True, applie
                            smem=landing["values" if narrow else "block"])
             decay = lax.broadcast_in_dim(algebra.raised(gate, low), (chunk, call.block), (0,))
             for c in range(width // call.block):
-                w = algebra.weighted("apply_w", lower, block("keys", c).value().astype(held.dtype), betas,
+                w = algebra.weighted("apply_w", lower, block(rows_of, c).value().astype(held.dtype), betas,
                                      issue, decay)
                 held.store(w_ref, w, row, chunk, h * width + c * call.block, call.block, family=family,
                            smem=landing["block"])
@@ -1317,10 +1326,12 @@ def _solved(k, v, hi, lo, beta, taken, call: Call, *, keeps: bool = True, applie
     if keeps:
         out_type = (held.shape(call.heads * chunk), *out_type)
     model, held_tiles, staging, landing = _solved_resources(call, keeps=keeps, applies=applies, narrow=narrow)
-    inputs = (k, v, hi, lo, beta, hi, lo, taken) if applies else (k, hi, lo, beta, hi, lo, taken)
+    inputs = (k, *((reads,) if reading else ()), *((v,) if applies else ()), hi, lo, beta, hi, lo, taken)
     solved = launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                            grid_names=("chunks", "heads"),
                            blocks=stream_blocks(keys=((chunk, width), call.given),
+                                                **({"reads": ((chunk, width), call.given)}
+                                                   if reading else {}),
                                                 **({"values": ((chunk, value_width),
                                                                call.given)} if applies else {}))
                            | vector_blocks(call, "gate", "low", "write", "column_gate", "column_low"),
