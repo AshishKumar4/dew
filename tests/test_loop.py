@@ -51,9 +51,10 @@ def tokens(rng, length=12, rows=2):
     return jax.random.randint(rng, (rows, length), 0, VOCAB)
 
 
-SEEDS = {'decode': 64, 'scanned': 64, 'checkpointed': 512, 'block decode': 32}
+SEEDS = {'decode': 64, 'scanned': 64, 'block decode': 32}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada):
-the most any of a site's cases took."""
+the most any of a site's cases took; a site that `check1_shards` shards, its mark states them
+(`marked_seeds`)."""
 
 
 def drawn(model, length=12, rows=2):
@@ -163,9 +164,11 @@ def test_backprop_steps_train_through_the_last_passes_alone(rng):
 
 
 @attending("reference")
+# Each case's 512 seeds (175 s whole in a train's CI, row 12380) drawn as map tasks of 128 (`check1_shards`).
+@pytest.mark.check1_shards(seeds=512, per_task=128)
 @pytest.mark.parametrize("backprop_steps", [None, 1])
 @pytest.mark.parametrize("stack_scan", ["plain", "scanned"], indirect=True)
-def test_checkpointed_passes_preserve_logits_and_gradients(backprop_steps, stack_scan):
+def test_checkpointed_passes_preserve_logits_and_gradients(backprop_steps, stack_scan, request):
     """Three passes over layers [1, 3) of four, checkpointed, keep the fp32
     logits and gradients of the plain passes on par (check 1), including the
     cut before the last pass: a pass recomputed instead of retained may fuse
@@ -185,7 +188,7 @@ def test_checkpointed_passes_preserve_logits_and_gradients(backprop_steps, stack
     # Eight rows of sixteen tokens: a norm's scale sums its gradient over enough of them to resolve.
     draw = with_logit_cotangent(drawn(plain, 16, 8), VOCAB, 0x100)
     assert_as_exact(result(checkpointed), result(plain), draw,
-                    f'{stack_scan} {backprop_steps} checkpointed', seeds=SEEDS['checkpointed'],
+                    f'{stack_scan} {backprop_steps} checkpointed', seeds=marked_seeds(request),
                     truth_fn=result(plain.clone(dtype=jnp.float64)))
     gradients = result(checkpointed)(*draw(0))['gradients']['params']
     assert bool(jnp.any(gradients['embed_tokens']['embedding'])) == (backprop_steps is None)
