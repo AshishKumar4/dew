@@ -52,13 +52,15 @@ LADDER_VOCAB = 16384
 at two and the rung above's at one (`needing_microbatches`): its head's logits, which a second microbatch
 halves and the head's tile cuts, outweigh the 32 MiB workspace cuBLASLt takes for a scanned stack's sliced
 layer GEMMs on an H100, which neither lowers (at `VOCAB`, measured on sm90: 34,286,874 B whole and with
-its head tiled alike). At 65,536 the tiled head's own sliced GEMM takes that workspace too, and the rung
-above needs more than the step whole."""
-TILED_VOCAB = 65536
-"""The vocabulary of `fine_tune`'s step whose need at 'full' with its head tiled is less at two
-microbatches, and at two for the offloaded sibling, than at one (`need_ahead`), each of those GEMMs'
-workspaces one beside logits that a second microbatch halves (measured on sm90: 142,980,378 B and
-142,982,682 B against 159,718,890 B; at `LADDER_VOCAB`, 42,357,274 B against 40,261,610 B)."""
+its head tiled alike). At 65,536 the fused tiled head, which holds every column of its 128 tokens, needs
+more than the step whole."""
+TILED_VOCAB, TILED_BATCH = 512, 4096
+"""The vocabulary and rows of `fine_tune`'s step whose head the fit ladder's tile bounds (`need_ahead`):
+its 65,536 tokens sixteen of the tile's 4096 (`chunked.chunked_tile`), so at 'full' the step whole needs
+more untiled than tiled and either more than the tiled step and its offloaded sibling at two microbatches,
+which need more untiled too (measured on sm90: untiled 305,891,178 B whole and 153,862,554 B at two;
+tiled 199,575,914 B whole, 100,893,594 B at two, the sibling 94,819,226 B). At `BATCH`'s 128 tokens the
+fused tiled head holds every column of a tile of all of them, so tiling bounds nothing and needs more."""
 
 
 def this_gpu() -> tuple[str, int | None, int]:
@@ -126,7 +128,7 @@ def need_ahead(generation: str, *, split: int, remat: str | None, tiled: bool = 
                         vocab=TILED_VOCAB)
     if tiled:
         trainer.objective.tile_head()
-    ahead = compile_ahead(trainer, token_rows(TILED_VOCAB, BATCH, SEQ_LEN + 1))
+    ahead = compile_ahead(trainer, token_rows(TILED_VOCAB, TILED_BATCH, SEQ_LEN + 1))
     return room - record(ahead.plan, "plan")["probes"][0]["headroom"]
 
 
@@ -982,7 +984,7 @@ def test_a_frontier_at_the_ladders_top_lists_its_offloaded_sibling_at_its_last_f
         assert capacity < one, (one, two, sibling)
     trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=capacity)), split="auto", remat="full",
                         vocab=TILED_VOCAB)
-    ahead = compile_ahead(trainer, token_rows(TILED_VOCAB, BATCH, SEQ_LEN + 1), frontier=True)
+    ahead = compile_ahead(trainer, token_rows(TILED_VOCAB, TILED_BATCH, SEQ_LEN + 1), frontier=True)
     plan = record(ahead.plan, "plan")
     frontier = listed(plan["frontier"], "frontier", read=record, what="frontier")
     full, offloaded = (remat_record(REMAT_POLICIES[name]) for name in ("full", "minimal_offloaded"))
@@ -1021,7 +1023,7 @@ def test_a_fused_tiled_heads_plan_compiled_ahead_with_its_frontier_restores_the_
     trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=room)), split="auto", remat="full",
                         vocab=TILED_VOCAB)
     trainer.objective.tile_head()
-    ahead = compile_ahead(trainer, token_rows(TILED_VOCAB, BATCH, SEQ_LEN + 1), frontier=True)
+    ahead = compile_ahead(trainer, token_rows(TILED_VOCAB, TILED_BATCH, SEQ_LEN + 1), frontier=True)
     plan = record(ahead.plan, "plan")
     whole = [probe for probe in plan["probes"]
              if probe["split"] == 1 and probe["head_tile"] is not None]
