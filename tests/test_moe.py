@@ -635,10 +635,10 @@ def _gated_case():
                 *(jnp.asarray(rng.normal(size=shape) / 8, dtype)
                   for shape in ((layers, experts, depth, width),) * 2 + ((layers, experts, width, depth),)))
 
-    def gated(x, gate, up, down, limit=None):
+    def gated(x, gate, up, down, limit=None, activation="swiglu"):
         kernels = (moe.Layered(kernel, layer) for kernel in (gate, up, down))
         return moe.gated_experts(moe.Gathered(x, rows, where), *kernels, sizes, x.dtype, "auto", None,
-                                 "swiglu", limit)
+                                 activation, limit)
 
     def apart(x, gate, up, down, limit=None):
         # Each projection on its own, the gated product between them, as before the fused form.
@@ -697,9 +697,9 @@ def test_a_gated_expert_layer_is_bitwise_its_projections_apart(limit):
 def test_a_gated_expert_layer_runs_its_chain_on_mosaic_gpu_under_a_declared_swiglu():
     """On an H100 whose grouped matmul is Mosaic GPU's and whose SwiGLU is declared Pallas's (a dense layer's
     `norm_swiglu` launch), a gated expert layer's chain selects Mosaic GPU's launches, forward and backward,
-    refusing none (`generation.routes`): its gated product the epilogue's and the prologue's arithmetic on the
-    tile (`activations.gated_hook`), no launch of its own inside them; one paired call with an epilogue and a
-    down call reading what it formed (`grouped_matmul.weighed`)."""
+    refusing none (`generation.routes`), every launch's operands bf16: its gated product the epilogue's and
+    the prologue's arithmetic on the tile (`activations.gated_hook`), no launch of its own inside them; one
+    paired call with an epilogue and a down call reading what it formed (`grouped_matmul.weighed`)."""
     from dew.nn.kernels import generation, grouped_matmul
 
     draw, gated, _, _ = _gated_case()
@@ -710,6 +710,9 @@ def test_a_gated_expert_layer_runs_its_chain_on_mosaic_gpu_under_a_declared_swig
         jax.eval_shape(loss, *operands)
     assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"mosaic"}, routes
     bound = [next(iter(call.bound.values()))[1].arguments for call, _ in calls]
+    # Every launch, forward and backward, multiplies bf16 operands: none widened to take another route.
+    assert all(arguments[name].dtype == jnp.bfloat16 for arguments in bound
+               for name in ("tokens", "kernel") if arguments.get(name) is not None), bound
     # The forward's paired call carries the epilogue; the backward's (the rows' gradient through both stacks)
     # none.
     assert sum(arguments["hooks"].epilogue is not None for arguments in bound
@@ -726,11 +729,11 @@ def test_a_gated_expert_layer_runs_its_chain_on_mosaic_gpu_under_a_declared_swig
 def test_a_gated_expert_layers_checkpointed_gradient_runs_its_pair_once(dtype):
     """A gated expert layer checkpointed under the `minimal` remat policy (its blocks' `nn.remat`: the gate's,
     up's and down's outputs saved by name), its gradient of the rows and all three kernels holds the paired
-    product's forward, each wrapper and its launch, as often as the unchecked gradient does
-    (`moe.gated_experts`, row 1376): the gate's and up's roundings named where the policy reads them, the
-    paired product's backward reading its kept roundings and the down projection's its prologue's operands,
-    neither replays the pair; at bf16 on Mosaic GPU's launch and at fp32 (where the accumulators' rounding is
-    the accumulators themselves) on the route it selects."""
+    product's forward and any replay of it, each wrapper and launch, two outputs or three, as often as the
+    unchecked gradient does (`moe.gated_experts`, row 1376): the gate's and up's roundings named where the
+    policy reads them, the paired product's backward reading its kept roundings and the down projection's
+    its prologue's operands, neither replays the pair; at bf16 on Mosaic GPU's launch and at fp32 (where the
+    accumulators' rounding is the accumulators themselves) on the route it selects."""
     from reference_error import equations
 
     from dew.nn.backbones.decoder_block import REMAT_POLICIES
@@ -743,16 +746,40 @@ def test_a_gated_expert_layers_checkpointed_gradient_runs_its_pair_once(dtype):
         return gated(*operands).astype(jnp.float32).sum()
 
     def paired(f) -> collections.Counter:
-        # The paired forward's equations, each wrapper and its launch: those whose three outputs are the
-        # gate's and up's roundings and their gated product.
+        # Every paired product's equations, each wrapper and its launch, forward or recomputed: those whose
+        # outputs are the gate's and up's `[slots, width]` (two, a hookless replay of the pair) or those and
+        # their gated product (three, the forward's epilogue), the primal and every gradient live.
         chosen = {"grouped_matmul": "mosaic"} if dtype == jnp.bfloat16 else {}
         with generation.assumed("sm90"), generation.chosen(**chosen):
-            graph = jax.make_jaxpr(jax.grad(f, argnums=(0, 1, 2, 3)))(*operands)
-        three = [(slots, width)] * 3
-        return collections.Counter(equation.primitive.name for equation in equations(graph)
-                                   if [tuple(var.aval.shape) for var in equation.outvars] == three)
+            graph = jax.make_jaxpr(jax.value_and_grad(f, argnums=(0, 1, 2, 3)))(*operands)
+        return collections.Counter(
+            (equation.primitive.name, len(equation.outvars)) for equation in equations(graph)
+            if len(equation.outvars) in (2, 3)
+            and all(tuple(var.aval.shape) == (slots, width) for var in equation.outvars))
 
     plain = paired(loss)
     assert plain, "the gated expert layer runs its pair"
     # Replayed, the checkpointed gradient would hold each of them twice.
     assert paired(jax.checkpoint(loss, policy=REMAT_POLICIES["minimal"].checkpoint_policy())) == plain
+
+
+def test_a_gated_expert_layer_whose_hook_no_epilogue_lowers_runs_its_projections_apart():
+    """On an H100 whose grouped matmul is Mosaic GPU's, a gated expert layer under exact GeGLU (its GELU's
+    erfc, which no Mosaic launch lowers, `hooks.hook_lowers`) runs its projections apart, forward and
+    backward, each a Mosaic launch with no hook, refusing none (`moe.gated_experts`), as a dense gated MLP
+    hands off (`dew.nn.gated_mlp`)."""
+    from dew.nn.kernels import generation, grouped_matmul
+
+    draw, gated, _, _ = _gated_case()
+    operands = draw(0)
+    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"),
+          generation.routes() as routes, grouped_matmul.weighed() as calls):
+        def exact(*operands):
+            return gated(*operands, activation="geglu_exact").astype(jnp.float32).sum()
+
+        loss = jax.grad(exact, argnums=(0, 1, 2, 3))
+        jax.eval_shape(loss, *operands)
+    assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"mosaic"}, routes
+    bound = [next(iter(call.bound.values()))[1].arguments for call, _ in calls]
+    assert not any(arguments.get("paired") is not None and arguments["hooks"].epilogue is not None
+                   for arguments in bound), bound
