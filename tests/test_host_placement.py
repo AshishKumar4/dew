@@ -312,6 +312,29 @@ def test_a_host_resident_bank_decodes_through_the_cache_it_allocates(shape):
     assert {leaf.shape[row_axis(path)] for path, leaf in jax.tree_util.tree_leaves_with_path(cache)} == {2}
 
 
+@pytest.mark.usefixtures("scanned_stacks")
+def test_a_banked_loop_of_several_runs_decodes_through_its_passes():
+    """A six-layer decoder banked two layers a run, its middle run looped twice (`Loop(2, layers=(2, 4))`):
+    three two-layer runs, each a bank. A prefill and greedy steps through the host-resident banks take
+    the resident banks' continuation on each decided row: each pass reads its layers' shapes from its own
+    run's bank (`CausalTransformer._layer_shapes_at`), the other spans' banks hidden by its view
+    (`PassView`), none refused."""
+    from dew.nn.backbones.decoder_stack import Loop
+
+    _, scanned, variables, tokens = pair(num_layers=6, bank_layers=2, loop=Loop(2, layers=(2, 4)))
+    resident, on_host = stores(scanned, variables)
+    assert sorted(name for name in on_host["params"] if name.startswith("layers_")) == [
+        "layers_0_1", "layers_2_3", "layers_4_5"]
+    greedy = Sampling(temperature=0.0)
+    fetched = generate(scanned, on_host, tokens, 4, key=0, sampling=greedy).host()
+    held = generate(scanned, resident, tokens, 4, key=0, sampling=greedy).host()
+    decisions = np.asarray(scanned.apply(resident, jnp.asarray(held.tokens[:, :-1])),
+                           np.float64)[:, held.prompt_width - 1:]
+    decided = np.all(top_margin(decisions, 1) > MARGIN, axis=-1)
+    assert decided.any(), "no row's continuation is decided at every step"
+    np.testing.assert_array_equal(fetched.tokens[decided], held.tokens[decided])
+
+
 def placements_agree(model, placed, resident, tokens, label: str):
     """`model`'s logits from the `placed` store on par from float64 over drawn prompts shaped as `tokens`
     (check 1) with its logits from the `resident` one, the resident store in float64 the truth: the two
@@ -351,19 +374,20 @@ def test_a_layout_offloads_only_the_layers_it_names():
 def test_banked_training_preserves_each_layers_dropout_rng_lineage():
     """Lifted staging and remat must not split or fold a different RNG stream.
     Compare every layer's two dropout masks to the original Linen scan, not
-    merely repeated calls with the same root key."""
-    from flax import linen as nn
+    merely repeated calls with the same root key: observed through Flax's own
+    call capture, which a scan holds as it is (a caller's filter of any method
+    runs an unbanked stack unrolled, `decoder_stages.stack`)."""
     _, scanned, variables, tokens = pair(num_layers=4, dropout_rate=.4)
     _, on_host = stores(scanned, variables)
     captures = []
     for store in (variables, on_host):
         _, changed = scanned.apply(
             store, tokens, train=True, rngs={"dropout": jax.random.key(9)},
-            capture_intermediates=lambda module, method: isinstance(module, nn.Dropout),
-            mutable=["intermediates"])
-        captures.append(changed["intermediates"])
+            capture_intermediates=True, mutable=["intermediates"])
+        captures.append({f"layers_{index}": changed["intermediates"][f"layers_{index}"]["dropout"]
+                         for index in range(4)})
     for index in range(4):
-        assert len(captures[0][f"layers_{index}"]["dropout"]["__call__"]) == 2
+        assert len(captures[0][f"layers_{index}"]["__call__"]) == 2
     assert jax.tree.structure(captures[0]) == jax.tree.structure(captures[1])
     for a, b in zip(jax.tree.leaves(captures[0]), jax.tree.leaves(captures[1]), strict=True):
         np.testing.assert_array_equal(np.asarray(a) == 0, np.asarray(b) == 0)

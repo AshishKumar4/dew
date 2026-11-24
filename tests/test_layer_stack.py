@@ -1494,3 +1494,26 @@ def test_a_scanned_stack_in_host_memory_reads_and_writes_its_callers_state_as_a_
 
     assert_as_exact(dew_fn, reference_fn, draw, "host-resident scanned stack", seeds=HOST_STACK_SEEDS,
                     truth_fn=truth_fn)
+
+
+def test_a_scanned_stack_under_a_scoped_capture_of_a_method_keeps_its_non_array_returns():
+    """A stack of equal layers, which the default scans, under a caller's filter of a method by its layers'
+    path (`_activation`, which returns the MLP's activation, no array, wherever the decoder scopes it): runs
+    unrolled (`decoder_stages.stack`: a capture of any method may keep what no scan stacks), each layer's
+    return kept under its own name as Flax keeps it, none refused by a scan stacking a non-array."""
+    from dew.registry import models
+
+    model = models.build("causal_transformer", vocab_size=64, emb_features=16, num_heads=2, num_kv_heads=2,
+                         mlp_features=32, max_seq_len=16, num_layers=4)
+    ids = jnp.zeros((2, 8), jnp.int32)
+    variables = model.init(jax.random.key(0), ids)
+
+    def scoped(module, method):
+        return method == "_activation" and bool(module.path) and module.path[0].startswith("layers_")
+
+    _, captured = model.apply(variables, ids, capture_intermediates=scoped, mutable=["intermediates"])
+    kept = captured["intermediates"]
+    layers = sorted(name for name in kept if name.startswith("layers_"))
+    assert layers == [f"layers_{index}" for index in range(4)], layers
+    for index in range(4):
+        assert not isinstance(kept[f"layers_{index}"]["mlp"]["_activation"][0], jax.Array)
