@@ -360,14 +360,18 @@ def test_a_plan_spreads_its_kept_rows_over_tasks_of_the_targets_lookups(ci, tmp_
 
 def test_a_kept_tasks_entry_stays_within_what_a_process_starts_with_however_high_the_target(
         ci, tmp_path, monkeypatch, cache_worker):
-    """However many lookups the target allows, a kept task's entry, which armada hands its task whole as one
-    environment string (ARMADA_ITEM), and its tokens, one argument (--tests), stay within the 131,071 bytes
-    Linux starts a process with, and every kept row is reused (2026-10-31: main de315f9a05's kept rows were
-    one task, whose 149,515-byte argument started none)."""
+    """However many lookups the target allows, a kept task's tokens and row names stay within `KEPT_BYTES`,
+    so its entry, which armada hands its task whole as one environment string (ARMADA_ITEM), and its tokens,
+    one argument (--tests), stay within twice that: the 131,071 bytes Linux starts a process with, as ci.py
+    bounds it; and every kept row is reused (2026-10-31: main de315f9a05's kept rows were one task, whose
+    149,515-byte argument started none). Here at a bound of 4,096 bytes, which 40 files' rows pass: each file
+    runs in a pytest of its own, and 300 files to pass the real bound took this test past its group's 120 s
+    (row 12406)."""
+    monkeypatch.setattr(ci, "KEPT_BYTES", 4096)
     verdict, _ = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
     # Files of long names (beside a fetched fixture's manifest name, within a file system's 255 bytes), enough
-    # that their kept rows' tokens and names pass what a process starts with together.
-    names = [f"tests/test_{index:03d}{'x' * 200}.py" for index in range(300)]
+    # that their kept rows' tokens and names pass the bound together.
+    names = [f"tests/test_{index:03d}{'x' * 200}.py" for index in range(40)]
     written(tmp_path, {Path(name).name: f"def test_{index}():\n    pass\n"
                        for index, name in enumerate(names)})
     durations = tmp_path / "tests/test_durations.json"
@@ -378,8 +382,9 @@ def test_a_kept_tasks_entry_stays_within_what_a_process_starts_with_however_high
     every = sorted(f"3.12:{name}" for name in [*names, *(f"tests/test_{letter}.py" for letter in "abc")])
     assert sorted(row for entry in entries for row in entry["rows"]) == every
     assert all(ci.session.KEPT_AT in token for entry in entries for token in entry["tests"].split())
-    assert max(len(f"ARMADA_ITEM={json.dumps(entry)}".encode()) for entry in entries) <= 131_071
-    assert max(len(f"--tests={entry['tests']}".encode()) for entry in entries) <= 131_071
+    assert len(entries) > 1
+    assert max(len(f"ARMADA_ITEM={json.dumps(entry)}".encode()) for entry in entries) <= 2 * ci.KEPT_BYTES
+    assert max(len(f"--tests={entry['tests']}".encode()) for entry in entries) <= ci.KEPT_BYTES
     rows = armada_task(ci, monkeypatch, verdict, target=100_000.0)
     assert sorted((row["name"], row["exitCode"]) for row in rows) == [(name, 0) for name in every]
     assert [len((tmp_path / f"runs-{name}").read_text()) for name in "abc"] == [1, 1, 1]
