@@ -152,7 +152,9 @@ def test_a_finite_window_read_by_index_ends_where_its_stream_ends(tmp_path, stre
         saved = streamed.get_state()
     resumed = _reader(tmp_path, "one-pass")
     resumed.set_state(saved)
-    assert _taken(resumed, 100) == served[13:], served
+    # The stream's own rest from there, then its end, as the read by index gives.
+    rest = _taken(streamed, 100, streaming)
+    assert len(rest) == 2 and _taken(resumed, 100) == rest == served[13:], (rest, served)
 
 
 def test_two_workers_read_a_window_by_index_as_their_stream_does(tmp_path):

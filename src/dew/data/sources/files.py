@@ -1632,7 +1632,10 @@ class _ShardLines:
         self.count = needed
 
     def _scan(self, limit: int) -> None:
-        """Find records until `limit` are found or the range holds no more, the file mapped while it does."""
+        """Find records until `limit` are found or the range holds no more, the file mapped while it does,
+        and only where some are left to find."""
+        if self.count >= limit or self.scanned >= self.stop:
+            return
         with self._mapped() as memory:
             while self.count < limit and self.scanned < self.stop:
                 starts, ends = self._chunk(memory)
@@ -1642,10 +1645,13 @@ class _ShardLines:
         """The records starting in the next chunk of the range (`_SCANNED_BYTES`), as copies of `memory`'s
         bytes, so none holds the map past the scan."""
         chunk = np.frombuffer(memory, np.uint8, min(_SCANNED_BYTES, self.stop - self.scanned), self.scanned)
-        # Each line starting in the chunk: where the scan stands, and past each newline but the last byte of
-        # the range (which starts no line in it).
-        newlines = np.flatnonzero(chunk == ord("\n")).astype(np.uint64) + np.uint64(self.scanned)
-        del chunk
+        try:
+            # Each line starting in the chunk: where the scan stands, and past each newline but the last
+            # byte of the range (which starts no line in it).
+            newlines = np.flatnonzero(chunk == ord("\n")).astype(np.uint64) + np.uint64(self.scanned)
+        finally:
+            # No view of the map outlives the scan, whatever it raised, so the map closes.
+            del chunk
         starts = np.concatenate([np.asarray([self.scanned], np.uint64), newlines + np.uint64(1)])
         starts = starts[starts < np.uint64(self.stop)]
         ends = np.empty_like(starts)
@@ -1657,7 +1663,11 @@ class _ShardLines:
         self.scanned = int(ends[-1]) if len(ends) else self.stop
         if self.kind == "jsonl":
             # A line that opens with whitespace is no record where it holds nothing else.
-            opening = np.isin(np.asarray([memory[int(start)] for start in starts], np.uint8), _BLANK)
+            whole = np.frombuffer(memory, np.uint8)
+            try:
+                opening = np.isin(whole[starts.astype(np.int64)], _BLANK)
+            finally:
+                del whole
             kept = np.ones(len(starts), bool)
             for at in np.flatnonzero(opening):
                 kept[at] = bool(memory[int(starts[at]):int(ends[at])].strip())
