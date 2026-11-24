@@ -232,6 +232,16 @@ def _shapes(tree):
                         if hasattr(leaf, "dtype") else leaf, tree)
 
 
+def as_placed[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: TrainState) -> TrainState:
+    """`state`'s shapes as the run places it (`Stepping.shardings`), whether placed yet or not: what a fit
+    check and a plan's candidates prepare and trace over alike (row 12465). As it is where its placement
+    lays it out otherwise (a CPU-owned run's frozen layers, which the step stacks)."""
+    shardings = stepping.shardings(state)
+    if jax.tree.structure(shardings) != jax.tree.structure(state):
+        return state
+    return placed_shapes(state, shardings)
+
+
 def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: TrainState, batch: Batch,
                                    schedule: Schedule, placement, replicated, split: int, narrow: bool, *,
                                    mesh: Mesh | AbstractMesh | None = None,
@@ -248,8 +258,8 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
     # Prepared, traced and kept over the shapes the run places them as, whether placed yet or not, so a
     # search before the state is placed and one after it trace and lower one step (row 12465: a 4B search
     # traced 2 to 4.5 minutes a candidate, again once placed); a step lowered for other devices over its own.
-    shaped, rows = ((state, batch) if mesh is not None
-                    else (placed_shapes(state, stepping.shardings(state)), placed_shapes(batch, placement)))
+    shaped, rows = (state, batch) if mesh is not None else (as_placed(stepping, state),
+                                                            placed_shapes(batch, placement))
     # What the step traces from beside its arguments and the trainer's settings: the compiles' refusals
     # its kernels' derivation reads (a relowering after a spill reads its proposal's), and the context.
     key = None if stated is None else (

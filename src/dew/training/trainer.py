@@ -108,7 +108,7 @@ from dew.telemetry.records import (
     StepCompiled,
 )
 from dew.training import streaming
-from dew.training._candidates import RunShape, Stepping, StepSettings, prepared_for
+from dew.training._candidates import RunShape, Stepping, StepSettings, as_placed, prepared_for
 from dew.training._fit import (
     Emptied,
     FitArguments,
@@ -1766,8 +1766,8 @@ class Trainer(Generic[Loss, Effects]):
         # (`StepCompiler.loss_shaped`, `dew.training._candidates.candidate_for`).
         with self._traced_on(self.device_mesh) as schedule:
             stepping = self._compiler.loss_shaped(self._stepping(), schedule)
-            placed = placed_shapes(state, stepping.shardings(state))
-            _, _, whole, _ = prepared_for(stepping, placed, micro, schedule, split, narrow=False)
+            _, _, whole, _ = prepared_for(stepping, as_placed(stepping, state), micro, schedule, split,
+                                          narrow=False)
         return self._validated(whole)[1]
 
     def _fitting(self, state: TrainState, batch: Batch) -> Validation:
