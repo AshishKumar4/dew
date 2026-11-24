@@ -836,4 +836,46 @@ def test_an_ungated_mlps_projections_run_as_one_recipe_chain_bitwise_their_two_a
         cotangent = jax.random.normal(jax.random.key(2), (2, 100, 128), jnp.bfloat16)
         ran = [jax.jit(with_gradients(form))(variables, x, cotangent) for form in (chained, apart)]
     for mine, theirs in zip(*(jax.tree.leaves(each) for each in ran), strict=True):
-        np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
+        np.testing.assert_array_equal(_bits(mine), _bits(theirs))
+
+
+def _bits(leaf) -> np.ndarray:
+    """`leaf`'s raw bit patterns, so a bitwise comparison tells -0.0 from +0.0."""
+    held = np.asarray(leaf)
+    return held.view(np.dtype(f"u{held.dtype.itemsize}"))
+
+
+@pytest.mark.parametrize("kind", ["a function of its own", "mixed dtypes", "a sequence axis"])
+def test_an_mlp_the_chain_cannot_read_runs_its_projections_apart(kind):
+    """An ungated MLP the recipe's chain cannot run as its projections apart runs them apart, one recipe
+    region each (`dew.nn.derivatives.Surrogate`): an activation given as a function of its own, which the
+    chain would call on its rows flattened and padded (a function of one placement or mixing positions reads
+    them otherwise); kernels of two dtypes, whose products promote apart (a bf16 up projection's into a
+    float32 down projection's, its output float32); and rows a sequence axis splits, which the chain would
+    flatten past the hidden activation's placement."""
+    from jax.sharding import AbstractMesh, AxisType
+    from reference_error import equations
+
+    from dew.nn.derivatives import Surrogate
+    from dew.nn.mlp import GatedMLP
+    from dew.nn.precision import projection_role
+
+    fp8 = RECIPE_NUMERICS["blockwise_fp8"]
+    mixed = kind == "mixed dtypes"
+    mlp = GatedMLP(hidden_features=256, out_features=128,
+                   activation=jax.nn.relu if kind == "a function of its own" else "gelu",
+                   dtype=None if mixed else jnp.bfloat16)
+    x = jax.random.normal(jax.random.key(0), (2, 100, 128), jnp.bfloat16)
+    variables = nn.unbox(mlp.init(jax.random.key(1), x))
+    if mixed:
+        params = variables["params"]
+        variables = {"params": {"up_proj": {"kernel": params["up_proj"]["kernel"].astype(jnp.bfloat16)},
+                                "down_proj": {"kernel": params["down_proj"]["kernel"].astype(jnp.float32)}}}
+    placed = (jax.sharding.use_abstract_mesh(AbstractMesh((2,), ("sequence",), axis_types=(AxisType.Auto,)))
+              if kind == "a sequence axis" else contextlib.nullcontext())
+    with generation.run_precision(fp8), projection_role("mlp"), placed:
+        graph = jax.make_jaxpr(lambda variables, x: mlp.apply(variables, x))(variables, x)
+    regions = [equation for equation in equations(graph) if equation.primitive.name == "marked_call"
+               and isinstance(equation.params.get("kind"), Surrogate)]
+    assert len(regions) == 2, len(regions)
+    assert graph.out_avals[0].dtype == (jnp.float32 if mixed else jnp.bfloat16)

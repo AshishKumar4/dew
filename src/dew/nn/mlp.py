@@ -15,7 +15,7 @@ from flax.core import meta
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
-from dew.mesh import TENSOR_AXIS
+from dew.mesh import SEQUENCE_AXIS, TENSOR_AXIS
 from dew.nn.dense import Dense, _promoted
 from dew.nn.dropout import Dropout
 from dew.nn.residuals import Residual
@@ -322,19 +322,28 @@ class GatedMLP(nn.Module):
         bias, hidden units dropped between them, a tensor axis splitting the hidden width (the chain reads
         its matrices whole), the parameters' creation, or projections not plain `Dense` whose kernels they
         hold, their products owned by no wrapper or interceptor (a LoRA's, a served quantized kernel's) and
-        observed by no inspection (`joined.projections_of`), take them apart."""
+        observed by no inspection (`joined.projections_of`), take them apart; so do an activation not one
+        of `UNGATED`'s by its name (the chain calls it on its rows flattened and padded, which only an
+        elementwise function keeping its dtype reads as the projections apart do), projections whose
+        promoted operands are not of one dtype (the chain rounds once, in the rows'), and a sequence axis
+        splitting the rows (the chain flattens them, past the hidden activation's placement)."""
         projections_ = (self.up_proj, self.down_proj)
-        if not plain_denses(projections_):
+        if not (isinstance(self.activation, str) and self.activation in UNGATED
+                and plain_denses(projections_)):
             return None
         found = projections_of(projections_)
+        mesh = jax.sharding.get_abstract_mesh().shape
         if (self.use_bias or (self.dropout_rate and train) or not found.held
                 or found.intercepted or found.observed or not found.dot_general
-                or jax.sharding.get_abstract_mesh().shape.get(TENSOR_AXIS, 1) > 1):
+                or mesh.get(TENSOR_AXIS, 1) > 1 or mesh.get(SEQUENCE_AXIS, 1) > 1):
             return None
         up_proj, down_proj = projections_
         # Each kernel read and cast as its projection's call casts it (`dense._promoted`).
         rows, up = _promoted(up_proj, x, meta.unbox(up_proj.get_variable('params', 'kernel')), None)[:2]
-        down = _promoted(down_proj, rows, meta.unbox(down_proj.get_variable('params', 'kernel')), None)[1]
+        hidden, down = _promoted(down_proj, rows, meta.unbox(down_proj.get_variable('params', 'kernel')),
+                                 None)[:2]
+        if len({rows.dtype, up.dtype, hidden.dtype, down.dtype}) != 1:
+            return None
         out = recipe_chain(rows.reshape(-1, rows.shape[-1]), up, down, activation, out_dtype=rows.dtype)
         if out is None:
             return None
