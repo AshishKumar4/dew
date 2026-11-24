@@ -291,7 +291,7 @@ def test_a_scattered_regions_permutation_prices_each_sides_bytes_and_table():
         bare_fused, bare_unfused, _ = fused_gemm.priced(bare, target)
         pass_seconds = algebra_cost.fused(target)(cost.Work(device_bytes=permuted, kernels=1.0))
     assert unfused == bare_unfused, (unfused, bare_unfused)
-    assert fused - bare_fused == pytest.approx(pass_seconds, rel=1e-9), (fused, bare_fused, pass_seconds)
+    assert fused == bare_fused + pass_seconds, (fused, bare_fused, pass_seconds)
 
 
 def _chained(function, wide):

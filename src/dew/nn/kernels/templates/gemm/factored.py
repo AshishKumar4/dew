@@ -133,26 +133,8 @@ class _Transpose:
         infinity's sign."""
         gather, wide_operands = routed
         f = jnp.broadcast_to(scale, cotangent.shape)
-        e_c, e_f = (float_bits.binade_of(v) for v in (cotangent, f))
-        counted = (e_c > -1024) & (e_c < 128) & (e_f > -1024) & (e_f < 128)
-        # Each product's significand as fp32 forms it, from its operands' bits (a subnormal's kept where a
-        # process flushes subnormal operands), normalized into [1, 2): 24 bits, an integer at 2**23.
-        product = jnp.where(counted, _significand(cotangent) * _significand(f), 0.0)
-        doubled = jnp.abs(product) >= 2
-        product = jnp.where(doubled, product * 0.5, product)
-        binade = jnp.where(counted, e_c + e_f + doubled.astype(e_c.dtype), -1024)
-        bits = (jnp.abs(product) * 2.0 ** 23).astype(jnp.int32)
-        negative = product < 0
-        # A row's grid: its largest product's binade, a token's for its routes and every device's that sums
-        # it, rounded up to a slice's edge.
-        top = jnp.max(binade, axis=-1, keepdims=True, initial=-1024)
-        if gather is None:
-            grid = token_grid = _edge(_shared_max(top, tuple(sorted({*before, *excess}))))
-        else:
-            token = varying_like(jnp.full((self.shape[0], 1), -1024, top.dtype), top, gather)
-            token = token.at[gather].max(top)
-            token_grid = _edge(_shared_max(token, tuple(sorted(jax.typeof(token).mat.varying - self.held))))
-            grid = token_grid[gather]
+        bits, binade, negative = _products(cotangent, f)
+        grid, token_grid = self.grids(binade, gather, tuple(sorted({*before, *excess})))
         matrix, *rest = self.prepared(*wide_operands)
         # The finite coefficients' grid: one not finite is IEEE's (`value`), outside the exact sums.
         held = jnp.abs(matrix.astype(jnp.float32))
@@ -161,18 +143,7 @@ class _Transpose:
         matrix_grid = _edge(_shared_max(matrix_top, tuple(sorted(jax.typeof(matrix_top).mat.varying
                                                                    - self.held))))
         depth, width = self.shape[-1], cotangent.shape[-1]
-        # Every axis a contributing operand varies over the rows do not (each device's products summed
-        # there): the static bound reads them all; each psum sums the axes its own sums vary over, of these.
-        leaves = jax.tree.leaves((cotangent, f, gather, matrix, rest))
-        varying = frozenset().union(*(jax.typeof(leaf).mat.varying for leaf in leaves))
-        axes = tuple(sorted(varying - self.held))
-        devices = math.prod(jax.lax.axis_size(axis) for axis in axes)
-        if devices > FACTORED_FAN_IN:
-            raise ValueError(f"the exact rescue sums {devices} devices' digits, past the {FACTORED_FAN_IN} "
-                             f"whose sum int32 holds")
-        if width * (1 if gather is None else gather.shape[0]) * devices >= FACTORED_REACH:
-            raise ValueError(f"the exact rescue's sums of {width} columns, {cotangent.shape[0]} routes and "
-                             f"{devices} devices could pass its leading limb's int32 ({FACTORED_REACH})")
+        self.bounded(cotangent, f, gather, matrix, rest)
         chunk = math.gcd(depth, FACTORED_DEPTH)
         columns_a_chunk = max(d for d in range(1, min(width, FACTORED_WIDTH) + 1) if width % d == 0)
         # The products' limbs below `FACTORED_HEADROOM` limbs over them that their sums carry into.
@@ -192,8 +163,9 @@ class _Transpose:
                     jax.lax.dynamic_slice_in_dim(v, start, columns_a_chunk, axis=-1)
                     for v in (bits, binade, negative))
                 block = jax.lax.dynamic_slice_in_dim(columns, start, columns_a_chunk, axis=-1)
-                classes = self.classified(classes, *(jax.lax.dynamic_slice_in_dim(
-                    v, start, columns_a_chunk, axis=-1) for v in (cotangent, f)), block, rest)
+                row_values = jax.lax.dynamic_slice_in_dim(cotangent, start, columns_a_chunk, axis=-1)
+                row_factors = jax.lax.dynamic_slice_in_dim(f, start, columns_a_chunk, axis=-1)
+                classes = self.classified(classes, row_values, row_factors, block, rest)
                 block = jnp.where(jnp.isfinite(block), block, jnp.zeros_like(block))
                 block_abs = jnp.abs(block.astype(jnp.float32))
                 block_binade = jnp.where(block_abs > 0, float_bits.binade_of(block_abs), -1024)
@@ -244,6 +216,35 @@ class _Transpose:
         # chunk's are), so the loop's carry and the branch it returns from keep its type.
         out = varying_like(jnp.zeros(self.shape, jnp.float32, out_sharding=explicit_spec(plain)), plain)
         return jax.lax.fori_loop(0, depth // chunk, pulled_chunk, out)
+
+    def grids(self, binade, gather, shared) -> tuple[jax.Array, jax.Array]:
+        """A row's grid (its products' largest binade rounded up to a slice's edge, shared over `shared`
+        axes) and its token's, the same where nothing is gathered: a gathered row's is its token's, every
+        route's and every device's that sums it."""
+        top = jnp.max(binade, axis=-1, keepdims=True, initial=-1024)
+        if gather is None:
+            grid = _edge(_shared_max(top, shared))
+            return grid, grid
+        token = varying_like(jnp.full((self.shape[0], 1), -1024, top.dtype), top, gather)
+        token = token.at[gather].max(top)
+        token_grid = _edge(_shared_max(token, tuple(sorted(jax.typeof(token).mat.varying - self.held))))
+        return token_grid[gather], token_grid
+
+    def bounded(self, cotangent, factor, gather, matrix, rest) -> None:
+        """Refuse a rescue whose sums its int32 limbs cannot hold: more devices summing its digits than
+        `FACTORED_FAN_IN`, or more products (columns, routes, devices) than `FACTORED_REACH`. Its devices
+        are every axis a contributing operand varies over the rows do not, of which each psum sums those
+        its own sums vary over."""
+        leaves = jax.tree.leaves((cotangent, factor, gather, matrix, rest))
+        varying = frozenset().union(*(jax.typeof(leaf).mat.varying for leaf in leaves))
+        devices = math.prod(jax.lax.axis_size(axis) for axis in sorted(varying - self.held))
+        if devices > FACTORED_FAN_IN:
+            raise ValueError(f"the exact rescue sums {devices} devices' digits, past the {FACTORED_FAN_IN} "
+                             f"whose sum int32 holds")
+        width = cotangent.shape[-1]
+        if width * (1 if gather is None else gather.shape[0]) * devices >= FACTORED_REACH:
+            raise ValueError(f"the exact rescue's sums of {width} columns, {cotangent.shape[0]} routes and "
+                             f"{devices} devices could pass its leading limb's int32 ({FACTORED_REACH})")
 
     def classified(self, classes, cotangent, factor, coefficients, rest):
         """`classes` (int32 counts of the products not finite each coordinate sums: +inf, -inf, NaN) plus a
@@ -355,6 +356,19 @@ def _nonfinite_terms(cotangent: jax.Array, factor: jax.Array, matrix: jax.Array)
     negative = side_by_side((c_pos, c_neg, c_pinf, c_ninf), (m_ninf, m_pinf, m_neg | m_ninf, m_pos | m_pinf))
     invalid = side_by_side((nan, c_all, c_pinf | c_ninf, zero), (m_all, m_nan, m_zero, m_pinf | m_ninf))
     return positive, negative, invalid
+
+
+def _products(cotangent: jax.Array, factor: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Each product `cotangent * factor` as fp32 forms it, from its operands' bits (a subnormal's kept where
+    a process flushes subnormal operands): its significand normalized into [1, 2) as a 24-bit integer at
+    2**23, its binade (-1024 where it is zero or not finite) and its sign."""
+    e_c, e_f = (float_bits.binade_of(v) for v in (cotangent, factor))
+    counted = (e_c > -1024) & (e_c < 128) & (e_f > -1024) & (e_f < 128)
+    product = jnp.where(counted, _significand(cotangent) * _significand(factor), 0.0)
+    doubled = jnp.abs(product) >= 2
+    product = jnp.where(doubled, product * 0.5, product)
+    binade = jnp.where(counted, e_c + e_f + doubled.astype(e_c.dtype), -1024)
+    return (jnp.abs(product) * 2.0 ** 23).astype(jnp.int32), binade, product < 0
 
 
 def _ieee(classes: jax.Array, summed: jax.Array) -> jax.Array:
