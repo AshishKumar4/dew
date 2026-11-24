@@ -640,13 +640,15 @@ def _gmm_of_no_depth(beside: "Beside | None", shape: tuple, group_sizes, paired,
 def _gmm_forms_refused(tiles: Tiles, family: mosaic.Family, k: int, n: int, mx_scales, step_scales, *,
                        parts: tuple, transpose_rhs: bool, transpose_lhs: bool, exact_sums: bool) -> None:
     """Dew: `gmm`'s refusal of an MX product's or a depth split's form it cannot run (`_mx_refused`,
-    `_gmm_split_refused`), `parts` its prologue, epilogue, pair and scales."""
+    `_gmm_split_refused`), `parts` its prologue, epilogue, pair and scales: a step-scaled product's epilogue
+    reads its sums as any product's (its next product's rows quantized there, row 8547)."""
+    prologue, _, paired, scales = parts
     hooked = any(each is not None for each in parts[:3])
     _mx_refused(mx_scales, tiles, family, transpose_rhs=transpose_rhs,
                 plain=all(each is None for each in (*parts, step_scales))
                 and not (transpose_lhs or exact_sums))
     _gmm_split_refused(tiles, k, n, step_scales, exact_sums=exact_sums, hooked=hooked,
-                       plain=all(each is None for each in parts) and not transpose_lhs)
+                       plain=all(each is None for each in (prologue, paired, scales)) and not transpose_lhs)
 
 
 def _chained_walked(chained: tuple, tiles: Tiles, dtype, transpose_lhs: bool, dense: bool,
@@ -989,15 +991,15 @@ def _gmm_split_refused(tiles: Tiles, k: int, n: int, step_scales, *, exact_sums:
     grouped one's runs over each tile its group's rows, the rows past every group's zeros in every run, so
     their partials sum to the product: a decode step's experts, row 3622; an exact sum's runs summed exactly,
     their partials by IEEE adds), of step scales but on an
-    exactly summed product of no hook, pair, packed matrix or split (`_step_scaled_takes`)."""
+    exactly summed product of no prologue, pair, packed matrix or split (`_step_scaled_takes`)."""
     if tiles.splits > 1 and (hooked or not split_runs(-(-k // tiles.block_k), tiles.splits)):
         raise ValueError(f"a depth split is a product's of no hooks or pair, each run some steps, not "
                          f"{tiles} of a {k}-deep one")
     if step_scales is not None and not _step_scaled_takes(step_scales, tiles, k, n, exact_sums=exact_sums,
                                                           plain=plain):
         raise ValueError(f"a step-scaled product sums each {SCALE_DEPTH}-deep step exactly with no "
-                         f"hook, pair, packed matrix or split, its scales covering its steps and columns, "
-                         f"not {tiles}")
+                         f"prologue, pair, packed matrix or split, its scales covering its steps and "
+                         f"columns, not {tiles}")
 
 
 def _gmm_allocated(tiles: Tiles, family: mosaic.Family, operands: tuple, hooks: tuple, sides: tuple,
@@ -1351,8 +1353,8 @@ def partial_runs(tiles: Tiles, dtype, interpret, *, transpose_rhs: bool, plain: 
 def _step_scaled_takes(step_scales: tuple, tiles: Tiles, depth: int, width: int, *, exact_sums: bool,
                        plain: bool) -> bool:
     """Dew: whether `gmm` takes `step_scales` at `tiles` (`_step_scaling`): an exactly summed product of no
-    hook, pair, packed matrix, transposed rows or split, a step 128 deep, a row scale each step, and a
-    column scale each column or each multiple of the tile's width."""
+    prologue, pair, packed matrix, transposed rows or split (an epilogue reads its sums), a step 128 deep, a
+    row scale each step, and a column scale each column or each multiple of the tile's width."""
     rows, columns = step_scales
     per = width // columns.shape[-1] if columns.shape[-1] and width % columns.shape[-1] == 0 else 0
     return (exact_sums and plain and tiles.splits == 1 and tiles.block_k == SCALE_DEPTH

@@ -1758,7 +1758,7 @@ class MosaicStepScaledGmm(_ScaledGmm):
     call it is: each exactly summed `SCALE_DEPTH`-deep step's partial times its rows' and
     columns' scales before its add (`mosaic_gpu.gmm`'s `step_scales`), its rows' scales streamed beside its
     ring (`gmm_allocations`' `step_scaled`), a column tile within one weight block's columns, and no split,
-    swap or hook."""
+    swap, prologue or pair (an epilogue reads its sums)."""
 
     STEPS: ClassVar[tuple[int, ...] | None] = (SCALE_DEPTH,)
     STEP_SCALED: ClassVar[bool] = True

@@ -1321,8 +1321,9 @@ met yet; else the scaled blocks summed in XLA (`xla_products.step_scaled`)."""
 
 
 def blockwise_fp8_product(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Array, row_scales: jax.Array,
-                          column_scales: jax.Array, *, out_dtype, interpret_on_cpu: bool = False
-                          ) -> jax.Array:
+                          column_scales: jax.Array, *, out_dtype, epilogue: Callable | None = None,
+                          out_dtypes: tuple | None = None, interpret_on_cpu: bool = False
+                          ) -> jax.Array | tuple[jax.Array, ...]:
     """Each group's rows of `lhs` (FP8 codes, `[rows, depth]`) times its matrix of `kernel` (FP8 codes,
     K-major `[groups, width, depth]`, as Hopper's FP8 tensor cores read it), each 128-deep block's partial,
     summed exactly in fp32, times its rows' scales (`row_scales`, `[depth / 128, rows]`) and its group's
@@ -1330,7 +1331,10 @@ def blockwise_fp8_product(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Ar
     weight block's, 1 a column's) before it is added, rounded once to `out_dtype`: DeepSeek-V3's
     blockwise FP8 product (1 x 128 activation tiles, 128 x 128 weight blocks; row 4518). Its forward alone:
     a recipe's gradients are their own FP8 products of requantized operands (row 2513). Its selector
-    (`BLOCKWISE_FP8`) runs the template's exactly summed walk where named, else XLA's."""
+    (`BLOCKWISE_FP8`) runs the template's exactly summed walk where named, else XLA's. `epilogue`, where
+    given, takes each fp32 sum and returns the call's outputs, in `out_dtypes` where it returns several (the
+    template's epilogue, XLA's the same function of its sums: a next product's rows quantized from them,
+    `quantized.blockwise_fp8_epilogue`, row 8547)."""
     sizes_spec = jax.ShapeDtypeStruct(group_sizes.shape, jnp.int32)
     launch = grouped_matmul.MosaicStepScaledGmm()
     per = kernel.shape[1] // column_scales.shape[-1]
@@ -1346,17 +1350,31 @@ def blockwise_fp8_product(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Ar
         return xla_products.step_scaled(lhs.astype(jnp.bfloat16), matrices, sizes, row_scales,
                                         column_scales, precision=jax.lax.Precision.DEFAULT)
 
+    dtypes = tuple(jnp.dtype(dtype) for dtype in (out_dtypes or (out_dtype,)))
+    hooks = NO_HOOKS if epilogue is None else Hooks(
+        epilogue=epilogue, out_dtypes=tuple(dtype.name for dtype in dtypes) if out_dtypes else None)
+
+    def finished(summed):
+        # XLA's sums through the same epilogue, each output in its dtype.
+        outputs = summed if epilogue is None else epilogue(summed)
+        outputs = outputs if isinstance(outputs, tuple) else (outputs,)
+        cast = tuple(value.astype(dtype) for value, dtype in zip(outputs, dtypes, strict=True))
+        return cast if out_dtypes else cast[0]
+
     def mosaic(lhs, kernel, sizes, row_scales, column_scales, *, interpret):
-        return launch(lhs, kernel, sizes.astype(jnp.int32), out_dtype='float32', trans_rhs=True,
-                      interpret=interpret, exact_sums=True, scales=(row_scales, column_scales))
+        stored = dtypes[0].name if epilogue is not None else 'float32'
+        out = launch(lhs, kernel, sizes.astype(jnp.int32), out_dtype=stored, trans_rhs=True,
+                     interpret=interpret, exact_sums=True, scales=(row_scales, column_scales), hooks=hooks)
+        return out if epilogue is not None else finished(out)
+
+    def portable_finished(*operands):
+        return finished(portable(*operands))
 
     if selection.select(BLOCKWISE_FP8, ScaledCase(tile)).kernel == 'mosaic':
         assert tile is not None, "the selector names the template where it plans a tile"
-        summed = xla_products.dispatched(mosaic, portable, interpret_on_cpu, lhs, kernel, group_sizes,
-                                         row_scales, column_scales)
-    else:
-        summed = portable(lhs, kernel, group_sizes, row_scales, column_scales)
-    return summed.astype(out_dtype)
+        return xla_products.dispatched(mosaic, portable_finished, interpret_on_cpu, lhs, kernel, group_sizes,
+                                       row_scales, column_scales)
+    return portable_finished(lhs, kernel, group_sizes, row_scales, column_scales)
 
 
 def blockwise_fp8_kernel_gradient(lhs_t: jax.Array, rhs_t: jax.Array, group_blocks: jax.Array,
