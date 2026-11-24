@@ -1772,6 +1772,13 @@ class MosaicStepScaledGmm(_ScaledGmm):
     STEP_SCALED: ClassVar[bool] = True
     SCALES: ClassVar[str] = 'step_scales'
 
+    def _fp8(self, ba, dtype, family: mosaic.Family) -> bool:
+        # An epilogue reads its exact sums as any product's (a next product's rows quantized there, row 8547):
+        # no prologue, its rows FP8 codes no hook forms.
+        hooks = ba.arguments['hooks']
+        return (jnp.dtype(dtype) in family.fp8_formats and self.FP8 and hooks.prologue is None
+                and ba.arguments.get('paired') is None and bool(ba.arguments.get('exact_sums')))
+
     def candidate(self, ba, config: tiling.Tiles, target) -> bool:
         within = SCALE_DEPTH % config.block_n == 0
         return config.splits == 1 and not config.swapped and within and super().candidate(ba, config, target)
