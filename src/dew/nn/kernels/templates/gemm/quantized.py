@@ -140,8 +140,9 @@ def _blockwise_fp8_quantized(values: jax.Array) -> tuple[jax.Array, jax.Array]:
     """`values` (`[rows, cols]`, `cols % SCALE_DEPTH == 0`, fp32: the bf16 or fp32 values a recipe quantizes)
     as E4M3 codes a 1 x `SCALE_DEPTH` tile at a time and each tile's power-of-two scale (fp32, broadcast over
     its tile's columns), bitwise `projections.rows_quantized`'s: its scale `fake_quant.fp8_block_scale` of the
-    tile's amax, its codes E4M3 of the values over it, an IEEE quotient (`lowered_divide`, an infinite or NaN
-    scale's as the recipe's), by `bits.encode_form` (ties to even, saturated). Within a kernel the tile's
+    tile's amax, its codes E4M3 of the values over it, the IEEE quotient a product by its exact reciprocal
+    (`_reciprocal`, an infinite or NaN block's as the recipe's), by `bits.encode_form` (ties to even,
+    saturated). Within a kernel the tile's
     amax a row reduction of each tile's columns of the accumulator's layout (`_block_max`), elsewhere one
     reduction of the tiles' view (DeepSeek-V3's blockwise FP8 recipe, row 8547)."""
     from dew.nn.fake_quant import fp8_block_scale

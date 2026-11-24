@@ -1345,6 +1345,8 @@ def blockwise_fp8_product(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Ar
     launch = grouped_matmul.MosaicStepScaledGmm()
     per = kernel.shape[1] // column_scales.shape[-1]
     dtypes = tuple(jnp.dtype(dtype) for dtype in (out_dtypes or (out_dtype,)))
+    # Its outputs' forms, refused as every route's where no several outputs state them (`forms_of`).
+    out_forms = quantized.forms_of(out_forms, len(dtypes)) or None
     hooks = NO_HOOKS if epilogue is None else Hooks(
         epilogue=epilogue, out_dtypes=tuple(dtype.name for dtype in dtypes) if out_dtypes else None,
         out_forms=out_forms)
