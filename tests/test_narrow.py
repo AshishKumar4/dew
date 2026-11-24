@@ -274,7 +274,9 @@ def test_a_phase_planned_afresh_builds_its_window_over_the_outgoing_one():
     finer = Trainer(trainer.objective, optax.sgd(0.5), key=jax.random.key(0), mesh=device,
                     layout=Layout(min_shard=1, tolerance=1.0), fit=FitPolicy(split=4))
     batch = _decoder(rows=16)[1]
-    stepped, *_ = finer.compile(fresh, batch)(fresh, batch)
+    # Its stack run as the outgoing step ran it, a layer at a time (`_trained`).
+    with chosen(layer_scan="plain"):
+        stepped, *_ = finer.compile(fresh, batch)(fresh, batch)
     assert int(stepped.window_size) == 4
     # Every leaf of the outgoing window went to the new one's build, donated, or was let go; the leaves the
     # new window allocated afresh are its split-sized parts alone, none of the gradient's shapes.
@@ -300,7 +302,9 @@ def test_a_phase_planned_afresh_is_planned_at_its_own_split_past_the_window_it_h
                       layout=Layout(min_shard=1, tolerance=1.0))
     planner._compiler.afresh = True  # as the boundary sets it (`Trainer._compiled_for`)
     batch = _decoder(rows=16)[1]
-    stepped, *_ = planner.compile(fresh, batch)(fresh, batch)
+    # Its stack run as the outgoing step ran it, a layer at a time (`_trained`).
+    with chosen(layer_scan="plain"):
+        stepped, *_ = planner.compile(fresh, batch)(fresh, batch)
     assert planner.plan["split"] == 1 and stepped.window is None
     assert all(leaf.is_deleted() for leaf in donor)
 
