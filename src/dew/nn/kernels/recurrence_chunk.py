@@ -277,7 +277,9 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     fp32's least normal, is kept as normal factors (`dew.algebra.scan._Split`, row 9660), while a
     product's own range is fla's: a term whose factors meet a decay past the least normal one at a time
     reads zero as fla's does. A call names a kernel through `generation.chosen`
-    alone, the recurrence template's 'mosaic_gpu' among them (row 959: the selectors decide every call)."""
+    alone, the recurrence template's 'mosaic_gpu' among them (row 959: the selectors decide every call). A
+    coupled momentum (`recurrence.Hooks.coupled`, its memory a pair) runs on the portable math alone
+    (`recurrence_coupled.coupled_chunk`)."""
     given, query, key, value, g, beta, scale, dtype, work = _prologue_of(hooks, operands, dtype)
     state = operands.state
     if hooks.coupled is not None:
