@@ -70,7 +70,7 @@ class Leaves:
     stored: tuple[jax.Array | None, ...]
 
 
-def _dense(projections: Sequence[nn.Module]) -> TypeGuard[Sequence[Dense]]:
+def plain_denses(projections: Sequence[nn.Module]) -> TypeGuard[Sequence[Dense]]:
     """Whether every one of `projections` is a plain Dense (`dense._plain_dense`)."""
     return all(_plain_dense(projection) for projection in projections)
 
@@ -81,7 +81,7 @@ def projections_of(projections: Sequence[nn.Module], depth: int | None = None) -
     interceptor is installed (`dense.intercepting`). Of projections not every
     one a plain Dense nothing more is read (a module that is no projection, a Dropout, has none of a
     Dense's fields): none stands in for them."""
-    if not _dense(projections):
+    if not plain_denses(projections):
         return Projections(dense=False, dot_general=False, intercepted=False, held=False, recipe=False,
                            observed=False)
     leaves = _leaves(projections, depth)
@@ -455,7 +455,7 @@ def side_by_side(projections: Sequence[nn.Module], x: jax.Array) -> BesidePlan |
     """Several projections of `x` side by side as `BESIDE` admits them (`BesidePlan`: called, their
     outputs), else None, each its own call: one projection, or initialization, which creates each one's
     parameters through its own call, takes none."""
-    if len(projections) < 2 or projections[0].is_initializing() or not _dense(projections):
+    if len(projections) < 2 or projections[0].is_initializing() or not plain_denses(projections):
         return None
     case = BesideCase(projections, x)
     if select(BESIDE, case).kernel != 'joined':
