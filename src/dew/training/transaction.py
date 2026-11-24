@@ -628,6 +628,13 @@ def _pooling_weights(previous: Accumulation, stats):
     return prior_mass, prior_gradient, mass, total, total_mass, denominator
 
 
+def _unscaled_beside(gradient: Variables, factor, pooled: Sequence[tuple[str, ...]]) -> Variables:
+    """`gradient` unscaled by `factor`, but its runs at `pooled`, which pooled into the window's accumulator
+    in their backward unscaled there (`Transaction._planned_accumulation`)."""
+    return jax.tree_util.tree_map_with_path(
+        lambda path, leaf: leaf if _under(path, pooled) else _unscale(leaf, factor), gradient)
+
+
 def _pooled_leaf(fill, old_weight, new_weight, old, new):
     return jnp.where(
         fill == 0, new,
@@ -1618,8 +1625,10 @@ class Transaction:
             unfinite_state=None if scale is None or holding else unfinite_state(checked(advanced)))
 
     @staticmethod
-    def _run_norms(params: Variables, runs: Sequence[tuple[str, ...]]) -> dict:
-        norms = {}
+    def _run_norms(params: Variables, runs: Sequence[tuple[str, ...]]) -> Variables:
+        """Each run's norms the walk writes (`dew.nn.in_backward.NORMS`): a layer's sum of squares and count
+        not finite, under its period's where its run is periodic."""
+        norms: Variables = {}
         for path in runs:
             run = _at(params, path)
             count = jax.tree.leaves(run)[0].shape[1]
@@ -1909,18 +1918,14 @@ class Transaction:
             gradient, probed, applied, pooled_paths = self._pulled(
                 state, realized, cotangent, planned, factor, whole=whole, masters=state.compute is not None)
             if state.compute is None or self.size > 1:
-                # A run pooled in its backward is unscaled there already (`_planned_accumulation`).
-                gradient = (jax.tree_util.tree_map_with_path(
-                    lambda path, leaf: leaf if _under(path, pooled_paths) else _unscale(leaf, factor),
-                    gradient) if pooled_paths else unscale(gradient, factor))
+                gradient = _unscaled_beside(gradient, factor, pooled_paths) if pooled_paths else unscale(
+                    gradient, factor)
             # Otherwise no loss scale divides it (`dew.training._candidates.prepared_for`),
             # and a copied parameter's gradient stays bf16 until the update
             # widens it as it reads it. A window of several microbatches
             # widens it as it pools it, so the window sums in fp32.
-            pending = (prepare(state, realized.stats, realized.aux, loss, gradient, closing, pooled_paths)
-                       if pooled_paths else
-                       prepare(state, realized.stats, realized.aux, loss, gradient, closing))
-            pending = pending.replace(applied=applied)
+            pending = prepare(state, realized.stats, realized.aux, loss, gradient, closing,
+                              *((pooled_paths,) if pooled_paths else ())).replace(applied=applied)
             if probing is not None and not whole:
                 # The probes summarize the cotangent of the update's loss, the window's pooled one, as replay
                 # differentiates it (`pooled_cotangent`), whatever microbatches the plan splits it into.
