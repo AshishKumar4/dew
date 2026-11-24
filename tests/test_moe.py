@@ -616,7 +616,7 @@ def test_a_layers_paired_and_scaled_expert_products_are_one_launch_as_exact_as_a
 
 def test_a_gated_expert_layers_activation_runs_in_its_paired_products_epilogue_bitwise_apart():
     """A gated expert layer's gate and up projections and their gated product are one paired product, the
-    product's epilogue (`moe.gated_projections`, row 1376): one grouped call taking both stacks, an epilogue,
+    product's epilogue (`moe.gated_projections`, row 1376): one paired call taking both stacks, an epilogue,
     and the gate's and up's roundings under the names a remat policy reads (`GATE_PROJ`, `UP_PROJ`), which
     its backward reads where kept instead of computing the pair again; its output and every gradient, the
     rows' and each kernel's, bitwise the products apart with the activation between them."""
@@ -641,10 +641,12 @@ def test_a_gated_expert_layers_activation_runs_in_its_paired_products_epilogue_b
 
     with grouped_matmul.weighed() as calls:
         jax.eval_shape(fused, x, gate, up)
+    # The pair weighed whole, its epilogue the gated product; a target no launch of a pair takes runs its
+    # products apart past that (`gemm`'s `APART`), each weighed again.
     bound = [next(iter(call.bound.values()))[1].arguments for call, _ in calls]
-    assert len(bound) == 1, len(bound)
-    (arguments,) = bound
-    assert arguments["paired"] is not None and arguments["hooks"].epilogue is not None
+    paired = [arguments for arguments in bound if arguments["paired"] is not None]
+    assert len(paired) == 1, len(paired)
+    assert paired[0]["hooks"].epilogue is not None
     # The gate's and up's roundings, the product's outputs under the names a remat policy reads.
     graph = jax.make_jaxpr(fused)(x, gate, up)
     names = {str(equation.params["name"]) for equation in equations(graph)
