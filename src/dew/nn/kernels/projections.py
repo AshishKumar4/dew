@@ -390,9 +390,12 @@ def blockwise_chain(x: jax.Array, w_up: jax.Array, w_down: jax.Array, activation
     projection's rows quantized in the up projection's epilogue, its codes and scales stored there
     (`quantized.blockwise_fp8_epilogue`, the scales `[hidden / 128, rows]`), no pass of their own between the
     two (row 8547). With `gate` (`w_up`'s shape), a gated MLP's: `activation(gate_product, up_product)`,
-    the gate's product stored and read by the up projection's epilogue (row 12689). Bitwise the
-    projections apart, forward and reverse (`_chain_backward`: each projection's own surrogate);
-    `activation` is an elementwise function of `out_dtype` arrays, the MLP's."""
+    the gate's product stored and read by the up projection's epilogue (row 12689). Its gradients bitwise
+    the projections apart (`_chain_backward`: each projection's own surrogate, the activation XLA's in
+    both); its value bitwise theirs where the kernel's activation computes as XLA's does (an exact one,
+    ReLU's; any, interpreted), else its rows' codes those of the kernel's activation, within check 1 of
+    theirs (a GH200's GELU moved 0.38% of the codes by its tanh, M-NG-21b; testing.md's kernel against the
+    composition it replaces); `activation` is an elementwise function of `out_dtype` arrays, the MLP's."""
     _one_group(x, w_up, w_down, gate)
     return _chained("blockwise_fp8", x, w_up, w_down, activation, out_dtype=out_dtype, gate=gate,
                     live=x.shape[0], interpret=interpret_on_cpu)
@@ -412,9 +415,10 @@ def nvfp4_chain(x: jax.Array, w_up: jax.Array, w_down: jax.Array, activation, *,
     reads as they are (`NvFp4Block.packed`), no quantizing or packing pass of their own between the two (row
     12721).
     With `gate` (`w_up`'s shape), a gated MLP's: `activation(gate_product, up_product)`, the gate's product
-    (at `s` too) stored and read by the up projection's epilogue. Bitwise the projections apart at the same
-    scales, forward and reverse (each projection's own surrogate, `_nvfp4_backward`); `activation` is an
-    elementwise function of `out_dtype` arrays, the MLP's."""
+    (at `s` too) stored and read by the up projection's epilogue. Its gradients bitwise the projections
+    apart at the same scales (each projection's own surrogate, `_nvfp4_backward`), its value as
+    `blockwise_chain`'s is: bitwise where the kernel's activation computes as XLA's does, else within check
+    1; `activation` is an elementwise function of `out_dtype` arrays, the MLP's."""
     _one_group(x, w_up, w_down, gate)
     return _chained("nvfp4", x, w_up, w_down, activation, out_dtype=out_dtype, gate=gate, live=x.shape[0],
                     interpret=interpret_on_cpu, tensor_scales=tensor_scales)
