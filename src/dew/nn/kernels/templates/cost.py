@@ -14,11 +14,14 @@ multiprocessor's (`generation.Multiprocessor.shared_bytes_per_clock`). Nothing r
 import dataclasses
 import functools
 import math
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation
+
+if TYPE_CHECKING:
+    import numpy as np
 
 
 def estimate(flops: float, *arrays, transcendentals: float = 0) -> pl.CostEstimate:
@@ -334,9 +337,9 @@ def wave(multiprocessors: int | None, resident: int) -> int:
     return (multiprocessors or 1) * max(resident, 1)
 
 
-def spread(programs: int, over: int) -> int:
+def spread[Count: (int, "np.ndarray")](programs: Count, over: int) -> Count:
     """How many of `programs` the busiest of `over` runs, as a launch's blocks go to its multiprocessors in
-    turn (or its waves, `over` a wave's programs: how many waves it runs)."""
+    turn (or its waves, `over` a wave's programs: how many waves it runs); each of an array of counts so."""
     return -(-programs // over)
 
 
