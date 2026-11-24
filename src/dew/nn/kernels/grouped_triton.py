@@ -24,7 +24,7 @@ class _Triton(_GroupedLaunch[Tile]):
     def eligible(self, ba, target) -> bool:
         # Every CUDA GPU the template sends the kernels to (`kernels.gemm`), and
         # a CPU, which interprets them, or traces the CUDA branch a GPU's lowering takes; never a TPU (a
-        # paired product the selector hands on apart: `_takes_pair`).
+        # paired product the selector hands on apart: `grouped_matmul._mosaic_takes`).
         return generation.capability(target.generation) is not None and self.derived(ba, target) is not None
 
     def derived(self, ba, target) -> Tile | None:

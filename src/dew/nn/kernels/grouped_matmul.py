@@ -2189,7 +2189,8 @@ def grouped_case(launches, arguments, options, *, product: Product, whole: bool)
     cuda = generation.capability(call.target.generation)
     floor = cuda is not None and cuda[0] * 10 + cuda[1] >= generation.BF16_GPU
     placed = generation.tpu(call.target) or floor
-    # A pair, matrices side by side or chained products: Mosaic GPU's launch alone takes them (`_takes_pair`).
+    # A pair, matrices side by side or chained products: Mosaic GPU's launch alone takes them
+    # (`_mosaic_takes`).
     return GroupedCase(placed, whole, product, call, kind, extents, paired=compound is not None)
 
 
