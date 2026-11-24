@@ -259,6 +259,11 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
     it issue none, its accumulator's rows kept; None issues every row. Its identity's: a family bounded at
     one constant is another program than at the next."""
 
+    bound_registers = 16
+    """Its row bound's registers (`bounded`): the runtime int32 bound and each 16-row block's predicate took
+    an sm80 64 x 192 x 64 normed, biased one-consumer grouped forward from 244 modeled registers to 255, 32
+    bytes spilled (rows 5623, 7091)."""
+
     held_registers = 40
     """The registers a consumer thread holds beside its accumulator and operand fragments (addresses,
     indices, the walk's carry), a measured whole (`scalars_whole`): CUTLASS's cooperative sm90 kernel's 168

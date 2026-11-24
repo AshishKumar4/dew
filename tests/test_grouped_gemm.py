@@ -427,7 +427,8 @@ def test_a_dense_kernel_gradient_xla_takes_is_its_own_dot():
     """A dense kernel gradient the selector gives XLA (an A100's declared cell, `grouped_matmul.DECLARED`,
     which DENSE1 timed as XLA's dot) runs XLA's own dot over its rows, as a dense forward does (`xla_dot`): no
     ragged dot of one group, which took an A100's gate_up weight gradient 470 ms against the template's 11.4
-    (W121-a100)."""
+    (W121-a100), and its rows read as they are: a dense call routes every row, and a mask of them was a select
+    XLA kept, up to 23% of the A100's XLA kernel gradient (M-NG-45-a100's 4B key)."""
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     with generation.assumed("sm80"), generation.routes() as routes:
         graph = jax.make_jaxpr(lambda x, dy: gemm.gemm_t(x, dy, None, out_dtype=jnp.bfloat16))(
@@ -435,6 +436,7 @@ def test_a_dense_kernel_gradient_xla_takes_is_its_own_dot():
     assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"xla"}, routes
     names = {equation.primitive.name for equation in equations(graph, platform="cuda")}
     assert "dot_general" in names and "ragged_dot_general" not in names, names
+    assert "select_n" not in names, names
     assert graph.out_avals[0].shape == (1, 256, 384)
 
 @pytest.mark.parametrize("product", ["forward", "input gradient", "kernel gradient"])
@@ -2283,6 +2285,13 @@ def test_mma_sync_grouped_gemm_suppresses_ragged_rows_via_bounded():
         len(eq.invars) == 4 and eq.invars[3].aval.dtype == jnp.int32 and eq.invars[3].aval.shape == ()
         for eq in grouped_mmas), grouped_mmas
     assert dense_mmas and all(len(eq.invars) == 3 for eq in dense_mmas), dense_mmas
+    # The planner prices the bound where the kernel issues it, by the issuer's own cost, none where dense (row
+    # 12304).
+    with generation.assumed("sm80"):
+        family = pricing.family_of(tile_128, jnp.bfloat16)
+        priced = {dense: pricing.bounded_registers(family, tile_128, jnp.bfloat16, dense=dense,
+                                                   staged_rows=False) for dense in (False, True)}
+    assert priced == {False: family.bound_registers, True: 0} and family.bound_registers > 0, priced
 
     # Verify the typed mma_p row bound derives from group metadata (`actual_end - row_start`, clipped), not a
     # constant (rows 5623, 7091).

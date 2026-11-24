@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 from generation_support import COMPILES_ON_CPU, generations, lowers, runs
 from jax.sharding import Mesh
+from map_judge import marked_seeds
 from reference_error import ahead_arm, assert_as_exact, with_gradients
 from test_gemm_template import CASES, SEEDS, _dew, _draw, _drop, _rounded_through
 
@@ -344,14 +345,16 @@ def test_matrices_side_by_side_are_each_ones_product_in_one_launch(dense):
                        dense=dense, beside=matrices[1:])
 
 
+@pytest.mark.check1_shards(seeds=8, per_task=4)
 @pytest.mark.parametrize("kernel", ["mosaic", "xla"])
 @pytest.mark.parametrize("dense", [True, False], ids=["dense", "grouped"])
-def test_projections_side_by_side_are_on_par_with_their_gradients(kernel, dense):
+def test_projections_side_by_side_are_on_par_with_their_gradients(kernel, dense, request):
     """`gemm.gemm` of bf16 rows by a query's, a key's and a value's matrices side by side (`beside`; widths
     512, 128, 128 at a depth of 200, which no step divides, each matrix's padded) on an H100, interpreted,
     its launch Mosaic GPU's one side-by-side launch or XLA's products, fp32 outputs: the outputs, the rows'
     gradient (the three cotangents' products chained in one accumulator) and each matrix's on par with
-    XLA's products apart against float64, a dense call's and a grouped call's (row 6794)."""
+    XLA's products apart against float64, a dense call's and a grouped call's (row 6794). Its draws run in map
+    tasks of 4: the grouped template's took 130 s in one, past the group target (row 12637)."""
     sizes = (200,) if dense else (70, 0, 130)
     group_sizes = None if dense else jnp.asarray(sizes, jnp.int32)
     draw = _side_by_side_draw(dense, 200, sizes)
@@ -369,7 +372,8 @@ def test_projections_side_by_side_are_on_par_with_their_gradients(kernel, dense)
         return with_gradients(lambda rows, matrices: _apart(rows, matrices, sizes, dense))(rows, matrices,
                                                                                             cotangents)
 
-    assert_as_exact(jax.jit(through), jax.jit(apart), draw, f"projections side by side {kernel}", seeds=SEEDS)
+    assert_as_exact(jax.jit(through), jax.jit(apart), draw, f"projections side by side {kernel}",
+                    seeds=marked_seeds(request))
 
 
 def test_side_by_side_gradients_read_a_wide_cotangent_wide():
