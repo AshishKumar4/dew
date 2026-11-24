@@ -355,7 +355,8 @@ def run_loop(model, x, *, train: bool, decode: bool, passes=None, **inputs):
         return x, run.exited
 
     layout = placed_layout()
-    if loop.gathered and not model.is_initializing() and layout is not None:
+    if (loop.gathered and not model.is_initializing() and layout is not None
+            and jax.sharding.get_abstract_mesh().shape.get(FSDP_AXIS, 1) > 1):
         # Every pass reads the block's parameters gathered once before the first (`Loop.gathered`), and
         # traces under a layout placing them so (`GatheredOver`): a projection mapped per shard takes them
         # as they lie, gathering none again.

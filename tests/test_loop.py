@@ -1237,7 +1237,8 @@ def test_a_gathered_loop_traced_under_no_layout_is_the_loop():
 @pytest.mark.mesh(devices=8)
 def test_a_gathered_loop_on_one_fsdp_device_is_the_loop():
     """On a mesh whose FSDP axis holds one device (data parallel alone), a gathered loop compiles to the
-    plain loop's program, instruction for instruction (`Loop.gathered`: nothing to gather)."""
+    plain loop's program, instruction for instruction (`Loop.gathered`: nothing to gather, no scope lifted
+    for it)."""
     from dew.distributed.placement import Layout
     from dew.mesh import DEFAULT_RULES
     from dew.nn.sharding import placing
@@ -1272,14 +1273,15 @@ def test_a_gathered_loops_mapped_projections_take_their_weights_as_they_lie():
     layout = Layout(min_shard=1)
     found = {}
     for gathered in (False, True):
-        # Computing in bf16, its products ones a launch takes (`projections.launched`).
+        # Computing in bf16 at widths the GEMM template takes, Mosaic GPU's named: products a launch takes
+        # (`projections.launched`).
         model = tiny(num_layers=4, loop=Loop(4, layers=(1, 3), gathered=gathered, step_norm=False),
-                     dtype="bfloat16")
+                     dtype="bfloat16", emb_features=128, mlp_features=256)
         gradient = with_gradients(lambda variables, ids, model=model: model.apply(variables, ids))
         variables, ids = model_draw(model, (8, 16), VOCAB)(0)
         logits = jax.eval_shape(model.apply, variables, ids)
         with (jax.set_mesh(mesh), nn.logical_axis_rules(DEFAULT_RULES), placing(layout),
-              generation.assumed("sm90")):
+              generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic")):
             graph = jax.make_jaxpr(gradient)(variables, ids, jnp.ones(logits.shape, logits.dtype))
         found[gathered] = _gathers_in_loops(graph.jaxpr)
     assert found[False] and not found[True], found
