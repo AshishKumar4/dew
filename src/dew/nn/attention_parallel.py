@@ -77,7 +77,7 @@ def sequence_parallel_attention(kernel, query, key, value, shards: int, *, causa
     gathered keys and each striped query reading them at its slot; no dense mask is built.
     """
     masked = causal or sliding_window is not None or mask is not None or bool(visibility)
-    if visibility and (reason := visibility_refused(query, key, shards)):
+    if visibility and (reason := visibility_refused(query, key, shards, visibility)):
         raise LayoutRefused(f"{reason}, so its caller takes the visibility as a mask "
                             "(`dew.nn.attention._sequence_sharded`)")
     run = exchanged_heads_attention if exchanges_heads(query, key, shards, masked=masked) else (
@@ -91,20 +91,34 @@ CROSS_GATHERED = ("a cross call's queries hold no slots among its keys, which th
                   "read their ids at")
 """Why the gather takes no visibility ids for a call whose queries are not its keys (`visibility_refused`)."""
 
+ALIGNED_GATHERED = ("a cross call's documents align each query to its document's last keys, a place the "
+                    "gather's slots, the striped indices, do not hold unless the call gives its own")
+"""Why the gather takes no `CrossDocuments` without the call's own `query_slots` (`visibility_refused`): equal
+lengths need not be one sequence's (review of #4052)."""
 
-def visibility_refused(query, key, shards: int) -> str | None:
-    """Why the sequence exchange takes this call's per-token visibility ids as a mask, or None where it
+
+def visibility_refused(query, key, shards: int, visibility: dict | None = None) -> str | None:
+    """Why the sequence exchange takes this call's per-token `visibility` ids as a mask, or None where it
     passes them through: the one predicate both the exchange (`sequence_parallel_attention`) and its caller
     (`dew.nn.attention._sequence_sharded`) read. The all-to-all takes every call it exchanges
     (`exchanges_heads`); the gather a call whose queries are its keys, each striped query reading the
-    key-side ids at its slot (`CROSS_GATHERED` otherwise)."""
-    if exchanges_heads(query, key, shards, masked=True) or query.shape[-3] == key.shape[-3]:
+    key-side ids at its slot (`CROSS_GATHERED` otherwise), its documents one sequence's or slotted by the
+    call (`ALIGNED_GATHERED` otherwise)."""
+    from dew.nn.documents import CrossDocuments
+
+    visibility = visibility or {}
+    if exchanges_heads(query, key, shards, masked=True):
         return None
-    return CROSS_GATHERED
+    if query.shape[-3] != key.shape[-3]:
+        return CROSS_GATHERED
+    if isinstance(visibility.get("segment_ids"), CrossDocuments) and visibility.get("query_slots") is None:
+        return ALIGNED_GATHERED
+    return None
 
 
-BATCHED_RANKS = {"key_value_seq_starts": 1, "key_runs": 4}
-"""Each visibility id's rank where it holds a row apiece, its rows leading: `[B]` starts, `[B, Q, R, 2]` runs,
+BATCHED_RANKS = {"key_value_seq_lengths": 1, "key_value_seq_starts": 1, "key_runs": 4}
+"""Each visibility id's rank where it holds a row apiece, its rows leading: `[B]` lengths and starts,
+`[B, Q, R, 2]` runs,
 every other id `[B, S]`, `[B, Q]` or `[B, K]` (2); one of another rank is shared by every row (a `[K]`
 validity, `[Q, R, 2]` runs), as `dew.nn.attention_masks.key_spans` reads them."""
 
@@ -369,6 +383,7 @@ def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
     if sinks is not None:
         extras['sinks'] = (sinks, P(exchanged_heads))
     if key_value_seq_lengths is not None:
+        _check_rows("key_value_seq_lengths", key_value_seq_lengths, query.shape[0])
         extras['key_value_seq_lengths'] = (key_value_seq_lengths, query_split(
             ("activation_batch",), key_value_seq_lengths, queries, query.shape))
     for name, ids in (visibility or {}).items():
@@ -465,6 +480,7 @@ def gathered_keys_attention(kernel, query, key, value, shards: int, *, causal,
     if sinks is not None:
         extras['sinks'] = (sinks, query_split(("activation_heads",), sinks, queries, query.shape))
     if key_value_seq_lengths is not None:
+        _check_rows("key_value_seq_lengths", key_value_seq_lengths, query.shape[0])
         extras['key_value_seq_lengths'] = (key_value_seq_lengths, query_split(
             ("activation_batch",), key_value_seq_lengths, queries, query.shape))
     if dropout_seed is not None:

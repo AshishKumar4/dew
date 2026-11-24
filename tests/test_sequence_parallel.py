@@ -292,13 +292,22 @@ GATHERED_VISIBLE = {
         "key_valid": jnp.asarray([[column % 5 != 3 for column in range(SEQ_LEN)]] * BATCH),
         "places": jnp.asarray([[column + min(column, row) for column in range(SEQ_LEN)]
                                for row in range(BATCH)], jnp.int32)},
+    # Each query's runs a row apiece `[B, Q, R, 2]` and every row's `[Q, R, 2]`: its own key on and the first.
+    "runs": {"causal": True, "key_runs": jnp.broadcast_to(jnp.asarray(
+        [[[0, 2], [q, SEQ_LEN]] for q in range(SEQ_LEN)], jnp.int32), (BATCH, SEQ_LEN, 2, 2))},
+    "shared runs": {"key_runs": jnp.asarray([[[0, 1], [q // 2, q + 1]] for q in range(SEQ_LEN)], jnp.int32)},
+    # A cached call's live slots in no index order: query q's own key 15 - q.
+    "reversed slots": {"causal": True, "block_groups": _groups((3,) * BATCH),
+                       "query_slots": jnp.broadcast_to(SEQ_LEN - 1 - jnp.arange(SEQ_LEN, dtype=jnp.int32),
+                                                       (BATCH, SEQ_LEN))},
     # A cached call's slots with padding, its queries reading the block holding their slot.
     "padded slots": {"causal": True, "block_groups": _groups((1,) * BATCH),
                      "query_slots": jnp.asarray([[column if column < 12 + row % 4 else -1
                                                   for column in range(SEQ_LEN)] for row in range(BATCH)],
                                                 jnp.int32)},
 }
-"""`VISIBLE` and the ids it holds none of: key validity, places, padded slots (row 1495's gather path)."""
+"""`VISIBLE` and the ids it holds none of: key validity, places, runs a row apiece and every row's, live slots
+in no index order and padded slots (row 1495's gather path)."""
 
 
 EXCHANGED_VISIBLE = [("all-to-all", name) for name in sorted(VISIBLE)] + [
@@ -313,7 +322,7 @@ def _exchanged(exchange: str) -> tuple[dict, object]:
 
 
 @pytest.mark.mesh
-@pytest.mark.parametrize("implementation", ["reference", "xla"])
+@pytest.mark.parametrize("implementation", ["reference", "xla", "template"])
 @pytest.mark.parametrize(("exchange", "name"), EXCHANGED_VISIBLE,
                          ids=[" ".join(pair) for pair in EXCHANGED_VISIBLE])
 def test_per_token_visibility_passes_through_either_exchange(exchange, name, implementation):
@@ -322,12 +331,14 @@ def test_per_token_visibility_passes_through_either_exchange(exchange, name, imp
     none): the all-to-all whole beside the whole sequences it gives (`VISIBLE`), the gather its key-side ids
     whole, each striped query reading them at its slot (`GATHERED_VISIBLE`,
     `attention_parallel._striped_visibility`). Its output and its gradients, forward and backward, on par
-    with the whole sequence's (check 1), on the kernels check 1's float64 truth runs (the seam's
-    `reference` and `xla`)."""
+    with the whole sequence's (check 1) from float64, the reference's where the kernel takes no float64
+    (the template)."""
     calls, draw = _exchanged(exchange)
     call = dict(calls[name], implementation=implementation)
     entry = with_gradients(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call))
-    assert_exchanged_on_par(entry, entry, SPLIT, draw,
+    whole = entry if implementation != "template" else with_gradients(
+        lambda q, k, v: scaled_dot_product_attention(q, k, v, **dict(call, implementation="reference")))
+    assert_exchanged_on_par(entry, whole, SPLIT, draw,
                             f"the entry through the {exchange}, {name}, {implementation}")
     with jax.set_mesh(SPLIT.build()):
         program = jax.make_jaxpr(entry)(*draw(0))
@@ -418,6 +429,41 @@ def test_runs_of_another_batch_are_refused_before_the_exchange():
     with jax.set_mesh(SHARED.build()), pytest.raises(ValueError):
         jax.jit(lambda q, k, v: scaled_dot_product_attention(
             q, k, v, causal=True, key_runs=runs, implementation="reference")).trace(query, key, value)
+
+
+def _cross_draw(seed):
+    """Four rows of four tokens, three query heads over one key head (the gather on `SHARED`), and an
+    output cotangent."""
+    query, key, value, cotangent = _draw(seed, heads=3, kv_heads=1)
+    return query[:4, :4], key[:4, :4], value[:4, :4], cotangent[:4, :4]
+
+
+@pytest.mark.mesh
+def test_equal_length_cross_documents_through_the_gather_keep_their_alignment():
+    """Causal cross documents of equal lengths (queries `[1, 2, 2, 2]` over keys `[1, 1, 2, 2]`) through the
+    gather align each query to its document's last keys (query 0 sees keys 0 and 1), taken as their mask
+    (`attention_parallel.ALIGNED_GATHERED`), where the striped indices as slots overwrote the alignment and
+    query 0 saw key 0 alone (review of #4052): on par with the whole call, forward and backward."""
+    from dew.nn.documents import CrossDocuments
+
+    documents = CrossDocuments(jnp.asarray([[1, 2, 2, 2]] * 4, jnp.int32),
+                               jnp.asarray([[1, 1, 2, 2]] * 4, jnp.int32))
+    call = {"causal": True, "segment_ids": documents, "implementation": "reference"}
+    entry = with_gradients(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call))
+    assert_exchanged_on_par(entry, entry, SHARED, _cross_draw,
+                            "equal-length cross documents through the gather")
+
+
+@pytest.mark.mesh
+def test_key_lengths_of_another_batch_are_refused_before_the_exchange():
+    """Key lengths of two rows beside a batch of four, its rows split two ways, are refused before the
+    gather, where replicated whole each shard read rows zero and one's lengths as its own (review of
+    #4052)."""
+    query, key, value, _ = _cross_draw(0)
+    call = {"key_value_seq_lengths": jnp.asarray([1, 2], jnp.int32),
+            "key_valid": jnp.ones((4, 4), bool), "implementation": "reference"}
+    with jax.set_mesh(SHARED.build()), pytest.raises(ValueError):
+        jax.jit(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call)).trace(query, key, value)
 
 
 @pytest.mark.mesh

@@ -1414,7 +1414,7 @@ def _sequence_sharded(query, key, shards: int, *, causal, sliding_window, mask, 
     queries, keys = query.shape[-3], key.shape[-3]
     ids = {name: x for name, x in {"segment_ids": segment_ids, "key_value_seq_starts": starts,
                                    **spanned}.items() if x is not None}
-    if ids and visibility_refused(query, key, shards) is None:
+    if ids and visibility_refused(query, key, shards, ids) is None:
         return causal, sliding_window, mask, lengths, False, ids
     if any(x is not None for x in spanned.values()):
         mask = visibility_mask(queries, keys, causal, sliding_window, mask, segment_ids, lengths, starts,
