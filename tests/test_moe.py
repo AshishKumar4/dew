@@ -504,3 +504,41 @@ def test_a_runs_stacked_packed_banks_decode_as_each_layers_bank_does():
     decoded = decoded_banks({QUANTIZATION: {"experts": {"up_proj": {"kernel": stacked}}}})
     np.testing.assert_array_equal(np.asarray(decoded["params"]["experts"]["up_proj"]["kernel"]),
                                   np.stack([values for _, values in layers]))
+
+
+def test_a_layers_paired_and_scaled_expert_products_read_their_rows_and_layer_in_place(monkeypatch):
+    """A stack's layer's gate and up projections pair at that layer (`paired_projections`: one product,
+    `gemm.gemm`'s `paired` at its `layer`), and a scaled stream's rows (`Gathered.scales`, Llama 4's scaled
+    input) are read where they lie and scaled in the product's prologue (its `gather` and `prologue`), no
+    copy of them gathered or scaled first, nor of the layer's matrices sliced out: each product the values
+    of its rows gathered and scaled, its layer's matrices sliced, multiplied apart, bit for bit (row
+    12306)."""
+    from dew.nn import moe
+    from dew.nn.kernels import gemm
+
+    keys = jax.random.split(jax.random.key(12306), 4)
+    tokens = jax.random.normal(keys[0], (6, 8), jnp.float32)
+    stacks = [jax.random.normal(key, (2, 3, 8, 4), jnp.float32) for key in keys[1:3]]
+    rows = jnp.asarray([0, 3, 1, 5, 2, 2, 4, 0], jnp.int32)
+    scales = jax.random.uniform(keys[3], (8,), jnp.float32, 0.5, 1.5)
+    sizes = jnp.asarray([3, 2, 3], jnp.int32)
+    layer = jnp.asarray(1, jnp.int32)
+    stream = moe.Gathered(tokens, rows, jnp.arange(8, dtype=jnp.int32), scales)
+
+    calls = []
+    product = gemm.gemm
+
+    def recorded(*args, **kwargs):
+        calls.append(kwargs)
+        return product(*args, **kwargs)
+
+    monkeypatch.setattr(gemm, "gemm", recorded)
+    gate, up = moe.paired_projections(stream, *(moe.Layered(stack, layer) for stack in stacks), sizes,
+                                      jnp.float32, "auto", None)
+    (call,) = calls
+    assert call["layer"] is layer and call["gather"] is rows and call["prologue"] is not None
+    assert call["paired"] is stacks[1]
+    apart = [moe.expert_projection(moe.gathered(stream), stack[1], sizes, jnp.float32, "auto", None)
+             for stack in stacks]
+    np.testing.assert_array_equal(np.asarray(gate), np.asarray(apart[0]))
+    np.testing.assert_array_equal(np.asarray(up), np.asarray(apart[1]))
