@@ -74,10 +74,7 @@ class Output(NamedTuple):
     @classmethod
     def of(cls, output: "Output | tuple[tuple[int, int], jax.typing.DTypeLike]") -> "Output":
         """`output` as an `Output`: a plain `(shape, dtype)` pair stored as it is computed."""
-        if isinstance(output, cls):
-            return output
-        shape, dtype = output
-        return cls(shape, dtype)
+        return output if isinstance(output, cls) else cls(output[0], output[1])
 
 
 def staged_columns(columns: int, dtypes, *, swizzle: int = STAGED_BYTES,
