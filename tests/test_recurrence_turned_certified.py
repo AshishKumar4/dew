@@ -3,6 +3,7 @@
 (`lowered.kernel_calls`), and its forked operands refused unforked (row 12631)."""
 
 import dataclasses
+import functools
 
 import jax
 import jax.numpy as jnp
@@ -18,10 +19,10 @@ from dew.nn.kernels.templates import report
 
 def _certified_and_emitted(given) -> tuple[set, list]:
     """The turned call `given`'s training gradient under the fast forms, its queries, keys, values and write
-    strengths bf16 beside fp32 decays, turns and states (a mixed-dtype call), lowered for a compile-only H100
-    through its route under certification: the kernel hashes its certified launches compiled
-    (`report.Certification.kernels`, each pulled config's), and every Mosaic GPU kernel hash its program runs
-    (`lowered.kernel_calls`), one per call."""
+    strengths bf16 beside its decays, turns and states as given (a mixed-dtype call), lowered for a
+    compile-only H100 through its route under certification: the kernel hashes its certified launches compiled
+    (`report.Certification.kernels`, each pulled config's, each config certified once), and every Mosaic GPU
+    kernel hash its program runs (`lowered.kernel_calls`), one per call."""
     from dew.nn.kernels.generation import compile_only_gpus
     from dew.nn.kernels.lowered import kernel_calls
 
@@ -45,29 +46,43 @@ def _certified_and_emitted(given) -> tuple[set, list]:
 
 
 @lowers('sm90')
-@pytest.mark.parametrize('forked', [False, True], ids=['whole', 'forked'])
-def test_a_turned_training_step_runs_the_kernels_its_selector_certified(forked):
+@pytest.mark.parametrize(('forked', 'turns'),
+                         [(False, jnp.float32), (True, jnp.float32), (True, jnp.float64)],
+                         ids=['whole', 'forked', 'forked fp64 turns'])
+def test_a_turned_training_step_runs_the_kernels_its_selector_certified(forked, turns):
     """Mamba-3 MIMO's turned form (`TURNED`), a key head's queries and keys serving two value heads, its
     mixed-dtype training gradient, whole or forked (documents taking memories from a table and entry writes,
-    its load rotation bound, `chunked_launch.Forked.turning`): every Mosaic GPU kernel the lowered program
-    runs is one its certified launches compiled, each config certified once. Bound to the unturned call's
-    grouped keys the selector certified a launch the step never ran (row 7976); a forked call's rotation
-    bound fp32 whatever its turns certified one a call of wider turns never ran (row 12402)."""
-    if forked:
-        given = entering_documents(entered_draw(TURNED, seed=0, entries=True)[0])
-    else:
-        (given,) = hooked_draw(TURNED, packed=False, seed=0)
-    assert given.key.shape[2] < given.value.shape[2], given.key.shape
-    certified, emitted = _certified_and_emitted(given)
-    assert emitted and set(emitted) <= certified, (sorted(set(emitted) - certified), sorted(certified))
+    its load rotation bound, `chunked_launch.Forked.turning`), its turns fp32 or (under x64) fp64: the Mosaic
+    GPU kernels the lowered program runs are those its certified launches compiled, no more and no fewer,
+    each config certified once. Bound to the unturned call's grouped keys the selector certified a launch the
+    step never ran (row 7976); a forked call's rotation bound fp32 whatever its turns certified one a call of
+    fp64 turns never ran (row 12402)."""
+    with jax.enable_x64(new_val=turns == jnp.float64):
+        if forked:
+            given = entering_documents(entered_draw(TURNED, seed=0, entries=True)[0])
+        else:
+            (given,) = hooked_draw(TURNED, packed=False, seed=0)
+        given = dataclasses.replace(given, turn=given.turn.astype(turns))
+        assert given.key.shape[2] < given.value.shape[2], given.key.shape
+        certified, emitted = _certified_and_emitted(given)
+    assert emitted and set(emitted) == certified, (sorted(set(emitted) ^ certified))
 
 
-def test_an_unforked_call_refuses_a_table_state_or_forked_fields():
-    """An unforked call (`Chunk.loads` None) refuses a table `state` `[B, S', Hv, Dk, Dv]` and the forked
-    call's own fields (entry writes, here), where the template padded the table's head axis as a memory's and
-    a selector planning it raised a reshape's error (row 12631)."""
-    drawn, _ = entered_draw(TURNED, seed=0, entries=True)
+FORKED_FIELDS = ('state', 'stores', 'entry_key', 'entry_value', 'entry_weight', 'adds', 'held')
+"""A forked call's own fields (`state` its table's `[B, S', Hv, Dk, Dv]`), each an unforked call refuses."""
+
+
+@pytest.mark.parametrize('field', FORKED_FIELDS)
+def test_an_unforked_call_refuses_each_forked_field_alone(field):
+    """A valid unforked call (`Chunk.loads` None) given one forked call's field alone, from a forked draw
+    entered as a forked call (`entering_documents`), each else as drawn whole, is refused, where the template
+    padded a table's head axis as a memory's and a selector planning it raised a reshape's error (row 12631);
+    drawn whole, the same call traces."""
+    (whole,) = hooked_draw(TURNED, packed=False, seed=0)
+    forked = entering_documents(entered_draw(TURNED, seed=0, entries=True)[0])
+    given = {'state': forked.state, 'stores': forked.stores, 'entry_key': forked.entry_key,
+             'entry_value': forked.entry_value, 'entry_weight': forked.entry_weight, 'adds': forked.adds,
+             'held': forked.held}
+    jax.eval_shape(functools.partial(chunk, TURNED), whole)
     with pytest.raises(ValueError):
-        chunk(TURNED, drawn)
-    with pytest.raises(ValueError):
-        chunk(TURNED, dataclasses.replace(drawn, state=None))
+        chunk(TURNED, dataclasses.replace(whole, **{field: given[field]}))
