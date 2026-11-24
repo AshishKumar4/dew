@@ -86,22 +86,19 @@ def test_a_static_loop_counts_its_trips_and_a_concrete_operand_its_lanes():
     assert _counted(bounded, 64) == Work(operations=64, shared_bytes=2 * 4 * 64)
 
 
+def _ptx(instruction: str):
+    """A body inlining `instruction`, of one 32-bit result and three operands."""
+    def body(ctx, ref):
+        del ctx, ref
+        i32 = ir.IntegerType.get_signless(32)
+        word = arith.constant(i32, 0x3F803F80)
+        mgpu_utils.inline_ptx(f"{instruction} $0, $1, $2, $3;", word, word, word, result_types=i32)
+    return body
+
+
 def test_inline_ptx_counts_by_its_instructions_and_an_unknown_one_is_unpriced():
     """Inline PTX counts an instruction at a time: a packed bf16 multiply-add two operations a lane; an
     instruction no rule names is unpriced, never guessed."""
-    def packed(ctx, ref):
-        del ctx
-        i32 = ir.IntegerType.get_signless(32)
-        one = arith.constant(i32, 0x3F803F80)
-        mgpu_utils.inline_ptx("fma.rn.bf16x2 $0, $1, $2, $3;", one, one, one, result_types=i32)
-
-    assert _counted(packed) == Work(operations=2 * 128)
-
-    def unknown(ctx, ref):
-        del ctx
-        i32 = ir.IntegerType.get_signless(32)
-        one = arith.constant(i32, 1)
-        mgpu_utils.inline_ptx("dp4a.u32.u32 $0, $1, $2, $3;", one, one, one, result_types=i32)
-
+    assert _counted(_ptx("fma.rn.bf16x2")) == Work(operations=2 * 128)
     with pytest.raises(emission.Unpriced):
-        _counted(unknown)
+        _counted(_ptx("dp4a.u32.u32"))

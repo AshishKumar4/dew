@@ -817,7 +817,11 @@ class _Counting:
         the most of each unit any branch's walks take a step (their mean, `Role.step`)."""
         index, operands = values[0], values[1:]
         if programs.integral_scalar(index):
-            return self.run(branches[int(index)], operands, static=given[1:])
+            taken = self.run(branches[int(index)], operands, static=given[1:])
+            if not given[0]:
+                # Its selector a value of a trip or a thread: which branch runs varies, so its outputs do.
+                self.returned = None
+            return taken
         trials = []
         for branch in branches:
             trial = _Counting(self.axis, self.index, loops=len(self.loops), warp=self.warp,

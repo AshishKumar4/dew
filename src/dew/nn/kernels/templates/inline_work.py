@@ -182,31 +182,31 @@ class _Lanes:
         name = op.name
         if not op.results or len(op.results) != 1:
             return
-        result = op.results[0]
-        if isinstance(result.type, ir.VectorType | ir.MemRefType):
+        produced = op.results[0]
+        if isinstance(produced.type, ir.VectorType | ir.MemRefType):
             return
         if name == "arith.constant":
             attribute = op.attributes["value"]
             if isinstance(attribute, ir.IntegerAttr):
-                self.values[result] = np.full(LANES, attribute.value, dtype=np.int64)
+                self.values[produced] = np.full(LANES, attribute.value, dtype=np.int64)
             return
         if name in ("gpu.thread_id", "nvvm.read.ptx.sreg.tid.x"):
             dimension = str(op.attributes["dimension"]) if "dimension" in op.attributes else "x"
-            self.values[result] = (np.arange(LANES, dtype=np.int64) if dimension.endswith("x>")
+            self.values[produced] = (np.arange(LANES, dtype=np.int64) if dimension.endswith("x>")
                                    or dimension == "x" else np.zeros(LANES, dtype=np.int64))
             return
         if name == "gpu.block_dim":
-            self.values[result] = np.full(LANES, LANES, dtype=np.int64)
+            self.values[produced] = np.full(LANES, LANES, dtype=np.int64)
             return
         if name == "nvvm.read.ptx.sreg.laneid":
-            self.values[result] = np.arange(LANES, dtype=np.int64) % WARP
+            self.values[produced] = np.arange(LANES, dtype=np.int64) % WARP
             return
         operands = [self.read(operand) for operand in op.operands]
         if not operands or any(operand is None for operand in operands):
             return
         found = _lane_values(name, op, operands)
         if found is not None:
-            self.values[result] = found
+            self.values[produced] = found
 
     def issued(self, op, active: np.ndarray) -> Work:
         """What `op` issues over the `active` lanes: an op computes for every lane of a warp any lane of which
@@ -302,39 +302,38 @@ def _assembly(text: str, issued: float, moving: float) -> Work:
 
 def _lane_values(name: str, op, operands: list[np.ndarray]) -> np.ndarray | None:
     """`name` over its operands' lanes, for the integer arithmetic a lane's place is computed by."""
-    first, *rest = operands
-    second = rest[0] if rest else None
+    first, last = operands[0], operands[-1]
     match name:
         case "arith.index_cast" | "arith.index_castui" | "arith.extsi" | "arith.extui" | "arith.trunci":
             return first
         case "arith.addi":
-            return first + second
+            return first + last
         case "arith.subi":
-            return first - second
+            return first - last
         case "arith.muli":
-            return first * second
+            return first * last
         case "arith.divui" | "arith.divsi" | "arith.floordivsi":
-            return np.where(second == 0, 0, first // np.where(second == 0, 1, second))
+            return np.where(last == 0, 0, first // np.where(last == 0, 1, last))
         case "arith.remui" | "arith.remsi":
-            return np.where(second == 0, 0, first % np.where(second == 0, 1, second))
+            return np.where(last == 0, 0, first % np.where(last == 0, 1, last))
         case "arith.andi":
-            return first & second
+            return first & last
         case "arith.ori":
-            return first | second
+            return first | last
         case "arith.xori":
-            return first ^ second
+            return first ^ last
         case "arith.shli":
-            return first << second
+            return first << last
         case "arith.shrui" | "arith.shrsi":
-            return first >> second
+            return first >> last
         case "arith.minsi" | "arith.minui":
-            return np.minimum(first, second)
+            return np.minimum(first, last)
         case "arith.maxsi" | "arith.maxui":
-            return np.maximum(first, second)
+            return np.maximum(first, last)
         case "arith.cmpi":
-            return _compared(int(op.attributes["predicate"].value), first, second)
+            return _compared(int(op.attributes["predicate"].value), first, last)
         case "arith.select":
-            return np.where(first.astype(bool), second, rest[1])
+            return np.where(first.astype(bool), operands[1], last)
     return None
 
 
@@ -372,8 +371,11 @@ def _is_float(value_type: ir.Type) -> bool:
 
 def _bytes(value_type: ir.Type) -> int:
     element = value_type.element_type if isinstance(value_type, ir.VectorType) else value_type
-    bits = element.width if hasattr(element, "width") else 32
-    return _elements(value_type) * max(1, bits // 8)
+    if isinstance(element, ir.IntegerType | ir.FloatType):
+        return _elements(value_type) * max(1, element.width // 8)
+    if isinstance(element, ir.IndexType):
+        return _elements(value_type) * 8
+    raise Uncounted(f"a memory op of {value_type}, whose bytes no rule states")
 
 
 def _shared(address_type: ir.Type) -> bool:
