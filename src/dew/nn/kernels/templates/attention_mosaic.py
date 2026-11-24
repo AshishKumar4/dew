@@ -22,6 +22,7 @@ from dew.nn import programs
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.selection import Refusal
 from dew.nn.kernels.templates import (
+    assembled,
     attention_algebra as algebra,
     cost,
     emission,
@@ -57,7 +58,7 @@ from dew.nn.kernels.templates.attention import (
 from dew.nn.kernels.templates.attention_mosaic_backward import _launch_backward
 from dew.nn.kernels.templates.attention_mosaic_coop import _coop_allocations
 from dew.nn.kernels.templates.attention_mosaic_dkv import _dkv_allocations, dq_halves
-from dew.nn.kernels.templates.attention_mosaic_dq import _dq_allocations
+from dew.nn.kernels.templates.attention_mosaic_dq import DQ_KERNEL, _dq_allocations
 from dew.nn.kernels.templates.attention_mosaic_forward import (
     NATURAL_NAME,
     SplitOutput,
@@ -161,12 +162,15 @@ def _choice_key(op, ba: tokamax.BoundArguments, candidates: tuple[Tiles, ...] | 
                 target: generation.GpuTarget) -> str | None:
     """What decides `op`'s priced choice among `candidates` on `target` (`tuning.stored_choice`: a
     forward's consumer count, a backward's one launch or two), keyed through `report.stored_key`; None where
-    the installation has no seal."""
-    rates = cost.rates(target, device=False)
+    the installation has no seal. Every fact `cost.launch_seconds` reads of `target` keys it: a
+    multiprocessor's rates and the whole device's (its memory's among them), and its paths' latencies."""
+    rates, device = (cost.rates(target, device=on_device)._asdict() for on_device in (False, True))
+    latencies = (target.kernel_step_seconds, target.product_latency, target.barrier_seconds,
+                 target.copy_latency)
     return report.stored_key(
         op_provenance(op, ba.arguments), report._identity(op, ba, target), target.generation,
-        target.device_kind,
-        target.multiprocessors, target.launch_seconds, rates._asdict(), tuning.encoded(candidates))
+        target.device_kind, target.multiprocessors, target.launch_seconds, rates, device, latencies,
+        tuning.encoded(candidates))
 
 
 def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held: int, walked: int,
@@ -1987,12 +1991,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         """The assembler's conditions at `config`: each launch's register cap and whether its program moves
         registers, as its kernels' models state them (`resources.register_model` at the registers its
         emission states, `_launch_registers`), and the launch's residency."""
-        dtype = ba.arguments["query"].dtype
-        dq, dkv = self._launch_registers(ba, config, target=target)
-        launches = ((config.dkv, dkv),) if config.fused else ((config, dq), (config.dkv, dkv))
-        models = [resources.register_model(bundle_of(tiles, dtype, target=target), tiles.consumers,
-                                           registers, target=target)
-                  for tiles, registers in launches]
+        models = [model for _, _, model in self._launch_models(ba, config, target)]
         return (*((model.cap(1), model.moves) for model in models), self.resident(ba, config, target))
 
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> BackwardTiles | None:
@@ -2052,12 +2051,12 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         (`price_config`), a candidate it cannot price whole never the cheaper beside one it can, as
         `dew.algebra.cost.cheaper` reads it: one whose work the target prices no rate of (`cost.units`'
         unpriced: a GPU stating no `global_reduction_bytes_per_clock` beside the fused launch's dQ adds), or
-        whose launches' registers its model holds past their budget (`_past_registers`), whose spills no rate
-        prices (an H100's two launches at 128 x 64 one consumer, model 331 at a budget of 248: its dQ took
-        248 registers and 696 bytes of stack, refused, where the fused one certified). Stored beside the
-        verdicts so a
-        warm start traces nothing to price (`_choice_key`, `tuning.stored_choice`); the first where one alone
-        is legal or the target holds no rates."""
+        one of whose launches' registers its model holds past their cap (`_launch_models`), whose spills no
+        rate prices (an H100's two launches at 128 x 64 one consumer, model 331 at a budget of 248: its dQ
+        took 248 registers and 696 bytes of stack, refused, where the fused one certified). Stored beside the
+        verdicts so a warm start traces nothing to price (`_choice_key`, `tuning.stored_choice`); one whose
+        launches the model cannot count (`price_config`'s None) priced whole by nothing; the first where one
+        alone is legal or the target holds no rates."""
         if len(candidates) <= 1 or not target.multiprocessors or not cost.rates(target, device=False).tensor:
             return candidates[0]
         key = _choice_key(self, ba, tuple(candidates), target)
@@ -2066,10 +2065,8 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             matched = next((config for config in candidates if config.fused == bool(stored[0])), None)
             if matched is not None:
                 return matched
-        prices = [self.price_config(ba, config, target) for config in candidates]
-        if any(price is None for price in prices):
-            return candidates[0]
         # A price is (unpriced, seconds): a candidate priced whole before any that is not, then the faster.
+        prices = [self.price_config(ba, config, target) or (True, math.inf) for config in candidates]
         best = min(zip(prices, range(len(candidates)), candidates, strict=True))[2]
         if key is not None:
             tuning.store_choice(target.generation, key, (int(best.fused),))
@@ -2078,12 +2075,18 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
     def price_config(self, ba: tokamax.BoundArguments, config: BackwardTiles, target: generation.GpuTarget
                      ) -> tuple[bool, float] | None:
         """Price `config`'s launches on `target`, the fused one's or the two's summed (`cost.launch_seconds`
-        over `emission.work_of`, each at `config`'s residency), traced under `report.launching`: whether any
-        of their work lies at a rate the target states none of (`cost.units`' unpriced) or their registers'
-        model passes their budget (`_past_registers`: spills no rate prices), and the seconds. As
-        its hookless call (its hook fields none): a hook a choice prices takes no parameters (one with any
-        holds no fused launch, so no choice), its work the same a score in either form, and a launch keyed
-        by its hooks' fingerprints (`KernelOp.keyed`, which traces none) prices as its live call does."""
+        over `emission.work_of`, each kernel at its own launch's residency, `_launch_models`), traced under
+        `report.launching`: whether any of their work lies at a rate the target states none of, a
+        multiprocessor's or the whole device's (`cost.units`' unpriced; its memory's bandwidth, which the
+        first prices infinite), or a step of no latency (`cost.spanned`'s), or a launch's registers' model
+        passes its cap (spills no rate prices), and the seconds; None where its launches' work is uncounted.
+        Every fact read is `target`'s, whatever GPU is in effect where it is asked. As its hookless call (its
+        hook fields none): a hook a choice prices takes no parameters, its work the same a score in either
+        form, and a launch keyed by its hooks' fingerprints (`KernelOp.keyed`, which traces none) prices as
+        its live call does; one whose hook takes parameters (which holds no fused launch, so no choice)
+        None."""
+        if ba.arguments["score_params"]:
+            return None
         names = ("query", "key", "value", "dout", "start", "end", "query_ids", "key_ids", "score_params",
                  "initial", "residuals", "drop")
         operands = tuple(tuning.shapes(ba.arguments[name]) for name in names)
@@ -2096,32 +2099,52 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
 
         priced.__name__ = priced.__qualname__ = (
             f"priced_{type(self).__name__}_l{report._digest(identity)}_c{report._digest(repr(config))}")
-        with generation.assumed(target), report.launching(self, ba, config):
-            traced = jax.make_jaxpr(priced)(*operands)
-        kernels = [eq for eq in programs.equations(traced.jaxpr) if eq.primitive in programs.NATIVE_KERNELS]
-        if not kernels:
-            return None
-        resident = self.resident(ba, config, target)
-        rates = cost.rates(target, device=False)
-        total, unpriced = 0.0, self._past_registers(ba, config, target)
-        for kernel in kernels:
-            work = emission.work_of(kernel)
-            if work is None:
+        with generation.assumed(target):
+            with report.launching(self, ba, config):
+                traced = jax.make_jaxpr(priced)(*operands)
+            kernels = [eq for eq in programs.equations(traced.jaxpr)
+                       if eq.primitive in programs.NATIVE_KERNELS]
+            if not kernels:
                 return None
-            total += cost.launch_seconds(work, emission.launch_programs(kernel), target, resident=resident)
-            unpriced = unpriced or any(cost.units(work, rates)[1])
+            budgeted = bundle_of(config, ba.arguments["query"].dtype, target=target).budgets_registers
+            launches = self._launch_models(ba, config, target) if budgeted else ()
+            unpriced = any(registers > model.cap(1) for _, registers, model in launches)
+            resident = self.resident(ba, config, target)
+            # Each kernel at its launch's residency: the dQ launch's kernels `DQ_KERNEL`'s, the rest the
+            # dK/dV launch's, its model the last.
+            residency = ({dq: max(1, launches[0 if dq else -1][2].most) for dq in (True, False)}
+                         if launches else {})
+            rates = [cost.rates(target, device=device) for device in (False, True)]
+            latency = cost.step_latency(target, device=False)
+            total = 0.0
+            for kernel in kernels:
+                work = emission.work_of(kernel)
+                if work is None:
+                    return None
+                dq = assembled.kernel_of(kernel.params.get("name") or "")[0].startswith(DQ_KERNEL)
+                total += cost.launch_seconds(work, emission.launch_programs(kernel), target,
+                                             resident=residency.get(dq, resident))
+                unpriced = (unpriced or any(any(cost.units(work, at)[1]) for at in rates)
+                            or bool(cost.spanned(work, latency)[1]))
         return unpriced, total
 
-    def _past_registers(self, ba: tokamax.BoundArguments, config: BackwardTiles,
-                        target: generation.GpuTarget) -> bool:
-        """Whether a launch of `config` holds more registers in its model than its consumers' budget
-        (`_launch_registers` against `register_budget`, each launch at its own tiles: the dQ launch at
-        `config`, the dK/dV launch at `BackwardTiles.dkv`); never on a family that budgets none."""
-        if not bundle_of(config, ba.arguments["query"].dtype, target=target).budgets_registers:
-            return False
+    def _launch_models(self, ba: tokamax.BoundArguments, config: BackwardTiles, target: generation.GpuTarget
+                       ) -> tuple[tuple[BackwardTiles, int, resources.RegisterModel], ...]:
+        """Each launch `config` runs, the dQ launch's first (none where `fused`), then the dK/dV launch's at
+        its own tiles (`BackwardTiles.dkv`, the fused launch's too, whose layout may be its own, `dkv_apart`):
+        its tiles, the registers a consumer holds (`_launch_registers`), and its register model at them and
+        its own shared memory (`resources.register_model`, each term `target`'s whatever GPU is in effect)."""
+        dtype = ba.arguments["query"].dtype
         dq, dkv = self._launch_registers(ba, config, target=target)
-        launches = [(dkv, config)] if config.fused else [(dq, config), (dkv, config.dkv)]
-        return any(held > self.register_budget(tiles, target) for held, tiles in launches)
+        # `_scopes` lists the dK/dV launch's program first, then the dQ launch's.
+        staged = ([resources.shared_bytes(layout, scope)
+                   for layout, _, scope in self._scopes(ba, config, target)]
+                  if target.shared_limit else [None, None])
+        launches = (((config.dkv, dkv, staged[0]),) if config.fused
+                    else ((config, dq, staged[1]), (config.dkv, dkv, staged[0])))
+        return tuple((tiles, registers, resources.register_model(
+            bundle_of(tiles, dtype, target=target), tiles.consumers, registers, target=target, shared=shared))
+            for tiles, registers, shared in launches)
 
     def _deepened(self, ba: tokamax.BoundArguments, config: BackwardTiles,
                   target: generation.GpuTarget) -> BackwardTiles:
