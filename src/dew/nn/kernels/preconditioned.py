@@ -24,6 +24,13 @@ from . import recurrence
 from .diagonal import diagonal_scan
 from .recurrence_chunk import CHUNK_SIZE, Chunk, chunk
 
+
+def _squashed(key, moment, center, x: float, eps: float):
+    """The write keys `k x^{-s}` of keys `k` and their moment (the module's account), `center` a key head's,
+    broadcast over the keys' last two axes."""
+    r = jnp.log(moment + eps) - jnp.asarray(center, moment.dtype)[:, None]
+    return key * jnp.exp(-np.log(x) * (r / (1.0 + jnp.abs(r))))
+
 CENTER = -0.2
 """fla's default center of ATK's squash, a key head's `log_atk_scale`."""
 
@@ -42,9 +49,8 @@ def preconditioned_keys(key, log_decay, beta, state=None, starts=None, *, center
     decay = jnp.broadcast_to(log_decay.astype(work)[..., None], key.shape).reshape(flat)
     entering = None if state is None else state.astype(work).reshape(rows, heads * width)
     moment, final = diagonal_scan(written, decay, entering, starts=starts)
-    r = jnp.log(moment.astype(work).reshape(key.shape) + eps) - jnp.asarray(center, work)[:, None]
-    squash = r / (1.0 + jnp.abs(r))
-    return k * jnp.exp(-np.log(x) * squash), final.reshape(rows, heads, width)
+    written = _squashed(k, moment.astype(work).reshape(key.shape), center, x, eps)
+    return written, final.reshape(rows, heads, width)
 
 
 def preconditioned_delta_rule(query, key, value, log_decay, beta, atk_decay, atk_beta, state=None,
@@ -67,3 +73,24 @@ def preconditioned_delta_rule(query, key, value, log_decay, beta, atk_decay, atk
     out, final = chunk(hooks, Chunk(query, written, value, log_decay=log_decay, beta=beta, erase_read=key,
                                     state=state, starts=starts), chunk_size=chunk_size)
     return out.astype(value.dtype), (final, moment)
+
+
+def preconditioned_step(query, key, value, log_decay, beta, atk_decay, atk_beta, state, atk_state, *,
+                        center=None, scale: float | None = None, x: float = 1.5, eps: float = 1e-6):
+    """A decode token of the preconditioned rule (`preconditioned_delta_rule`'s, each operand without its
+    tokens' axis): ATK's moment `[rows, Hk, Dk]` decayed and written, its squashed keys the delta rule's
+    write along the read of the token's own (`recurrence.Hooks.erase` 'read', `recurrence.step`).
+    `(output [rows, Hv, Dv] in the values' dtype, (state', moment'))`."""
+    heads, width = key.shape[1], key.shape[-1]
+    center = jnp.full((heads,), CENTER, jnp.float32) if center is None else center
+    query, key = l2norm(query), l2norm(key)
+    work = at_least_fp32(key.dtype)
+    k = key.astype(work)
+    moment = (jnp.exp(atk_decay.astype(work))[..., None] * atk_state.astype(work)
+              + atk_beta.astype(work)[..., None] * k * k)
+    written = _squashed(k, moment, center, x, eps)
+    hooks = recurrence.Hooks(decay='vector' if log_decay.ndim == 3 else 'scalar', erase='read',
+                             scale=width ** -0.5 if scale is None else scale)
+    out, _, held = recurrence.step(hooks, recurrence.Step(state, query=query, key=written, value=value,
+                                                          log_decay=log_decay, beta=beta, erase_read=key))
+    return out.astype(value.dtype), (held, moment)

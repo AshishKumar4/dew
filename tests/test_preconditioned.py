@@ -11,9 +11,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from reference_error import assert_as_exact, with_gradients
 from test_recurrence_chunk import assert_packed_on_par, hosted, sigmoid, softplus
 
-from dew.nn.kernels.preconditioned import CENTER, preconditioned_delta_rule
+from dew.nn.kernels.preconditioned import CENTER, preconditioned_delta_rule, preconditioned_step
 from dew.nn.precision import l2norm
 
 ROWS, LENGTH, KEY_HEADS, VALUE_HEADS, KEYS, VALUES, CHUNK = 2, 40, 2, 4, 16, 8, 16
@@ -98,3 +99,23 @@ def test_the_chunked_rule_is_as_exact_as_flas_recurrence_a_token_at_a_time(per_k
     label = f"preconditioned {'kda' if per_key else 'gdn'}"
     assert_packed_on_par(chunked, tokenwise, operands(per_key), label, packed=packed, documents=DOCUMENTS,
                          length=LENGTH, seeds=SEEDS)
+
+
+def stepped(query, key, value, log_decay, beta, atk_decay, atk_beta, state, atk_state):
+    """The decode step (`preconditioned_step`) a token at a time over the sequence."""
+    def one(carried, token):
+        out, carried = preconditioned_step(*token, *carried, center=jnp.asarray(CENTERS))
+        return carried, out
+
+    tokens = tuple(jnp.moveaxis(x, 1, 0) for x in (query, key, value, log_decay, beta, atk_decay, atk_beta))
+    final, out = jax.lax.scan(one, (state, atk_state), tokens)
+    return jnp.moveaxis(out, 0, 1), final
+
+
+@pytest.mark.parametrize('per_key', [False, True], ids=['pgdn', 'pkda'])
+def test_the_decode_step_is_as_exact_as_flas_recurrence_a_token_at_a_time(per_key):
+    """The decode step's outputs, final state and ATK moment and the gradients of every operand and both
+    entering states, a token at a time, on par with fla's recurrence's from float64 (check 1): its delta rule
+    corrected along the read of its keys (`recurrence.Hooks.erase` 'read', `recurrence.update`'s reader)."""
+    assert_as_exact(jax.jit(with_gradients(stepped)), jax.jit(with_gradients(tokenwise)), operands(per_key),
+                    f"preconditioned {'kda' if per_key else 'gdn'} decode steps", seeds=SEEDS)
