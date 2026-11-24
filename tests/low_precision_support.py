@@ -55,7 +55,7 @@ def edge_values(dtype) -> np.ndarray:
 
 
 class StageRef:
-    """Mutable host-backed Pallas ref stub for bitwise stage-decode tests (`stage_decoded_fp8`/`ternary`)."""
+    """Mutable host-backed Pallas ref stub for bitwise stage-decode tests (`stage_decoded_ternary`)."""
 
     def __init__(self, arr):
         self.arr = np.asarray(arr)
@@ -69,7 +69,7 @@ class StageRef:
 
 
 def decoded_weight_dot(x, weights, *, dtype=jnp.float32):
-    """Plain reference dot against a decoded packed weight bank (`Fp8Weights`, `TernaryWeights`)."""
+    """Plain reference dot against a decoded packed weight bank (`TernaryWeights`)."""
     w_dec = (weights.decoded(jnp.float64) if dtype == jnp.float64
              else weights.decoded(jnp.bfloat16).astype(dtype))
     return jax.lax.dot(x.astype(dtype), w_dec, preferred_element_type=dtype)

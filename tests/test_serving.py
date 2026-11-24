@@ -1562,7 +1562,8 @@ def test_a_server_drafts_speculative_blocks_as_a_lone_call_does(temperature, dec
     thread serves it (3943). Speculation over paged or chunked rows is refused by name, and so is a
     reload with a row running, whose next block would open on the old weights' logits."""
     model = decoder().clone(max_seq_len=128, num_nextn_predict_layers=1)
-    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
+    # Drawn under one compile: op by op, the draw was 22 s of the greedy case's 122 (row 12454).
+    params = nn.unbox(jax.jit(model.init)(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     bound = TextGeneration(model, params, RunProcessor(Digits()),
                            sampling=Sampling(temperature=temperature, strategy=Speculative(block=3)))
     with contextlib.nullcontext() if keys is None else jax.default_prng_impl(keys):

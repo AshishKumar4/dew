@@ -326,14 +326,12 @@ def phase_needs(monkeypatch, tokens) -> tuple[int, int, int]:
     from test_plan import LIMIT, free
 
     from dew.distributed.placement import placed_bytes
-    from dew.nn.kernels import options
 
     def needed(model, split, *, startup=False):
         free(monkeypatch, LIMIT)
         trainer = phased_trainer(model, 0, None, split=split)
         state, _, _ = trainer.place()
         trainer.compile(state, {"text": jnp.asarray(tokens)})
-        options.unhold()
         return LIMIT - trainer.plan["probes"][0]["headroom"] + (placed_bytes(state) if startup else 0)
 
     return needed(looped(steps=1), 1, startup=True), needed(looped(), 1), needed(looped(), 2)
@@ -403,7 +401,7 @@ def test_a_later_phases_search_off_the_loop_keeps_no_program_its_boundary_passes
     assert [(probe["split"], probe["ahead"]) for probe in planned.plan["probes"]] == [(1, True), (2, True)]
     gc.collect()
     # The first phase's plan and the second's, one program each, kept; the second's whole step dropped.
-    assert len(options._HELD) == 2, list(options._HELD)
+    assert len(planned._compiler._executables) == 2, list(planned._compiler._executables)
     assert len(_candidates._CANDIDATES) <= 2, list(_candidates._CANDIDATES)
 
 
@@ -421,7 +419,7 @@ def test_a_phased_runs_later_phase_is_compiled_off_its_loop(monkeypatch, tmp_pat
     from test_plan import LIMIT, free
 
     from dew.checkpoints import Checkpoints
-    from dew.nn.kernels import generation, options
+    from dew.nn.kernels import generation
     from dew.nn.precision import Numerics
 
     free(monkeypatch, LIMIT)
@@ -436,7 +434,6 @@ def test_a_phased_runs_later_phase_is_compiled_off_its_loop(monkeypatch, tmp_pat
         phased_params(phased_trainer(looped(), 0, checkpoints=Checkpoints(directory)), tokens, steps=2,
                       checkpoint_every=2)
         # The resumed run as a process of its own, which plans and compiles its second phase as it resumes.
-        options.unhold()
         resumed = phased_trainer(looped(), 0, checkpoints=Checkpoints(directory))
         planned = phased_params(resumed, tokens)
     assert [probe["ahead"] for probe in resumed.plan["probes"]] == [False]

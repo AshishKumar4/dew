@@ -108,7 +108,7 @@ from dew.telemetry.records import (
     StepCompiled,
 )
 from dew.training import streaming
-from dew.training._candidates import RunShape, Stepping, StepSettings, prepared_for
+from dew.training._candidates import RunShape, Stepping, StepSettings, as_placed, prepared_for
 from dew.training._fit import (
     Emptied,
     FitArguments,
@@ -170,6 +170,7 @@ from dew.training.evaluation import EvalSuite, Evaluator, episodic
 from dew.training.inspection import Inspection
 from dew.training.interval import Interval, Reading, Taken, TokenClock, copied, leaf_paths, logged_scalars
 from dew.training.memory import (
+    CodeBounded,
     first_run,
     first_run_failed,
     recompute_record,
@@ -1358,7 +1359,7 @@ class Trainer(Generic[Loss, Effects]):
             # Read under the axes the modules boxed, a stage-local run's stacked by stage, as `_groups` reads.
             with self._staging.held(boxed(self._boxed_axes())):
                 run.update_flops = self._config.update_flops(state.variables["params"])
-        compiled: dict[Hashable, tuple[CompiledStep, StepFlops | None]] = run.compiled
+        compiled: CodeBounded[Hashable, tuple[CompiledStep, StepFlops | None]] = run.compiled
         seen = 0
         run.notice = PreemptionNotice()
         run.clock = TokenClock(*interval.clocked(state.pending_tokens))
@@ -1392,20 +1393,20 @@ class Trainer(Generic[Loss, Effects]):
                     # Each batch of a shape the run has not stepped is checked against what the objective
                     # declares, a later ramp's or schedule's stage as the first; a rollout writes its own.
                     check_inputs(self, device)
-                known, began, before = len(compiled), time.perf_counter(), interval.compiling
+                known, began, before = compiled.made, time.perf_counter(), interval.compiling
                 with run.startup.phase("compile", "compiling the step", when=not known):
                     train_step, flops, state = self._compiled_for(compiled, state, device, run, interval)
-                if len(compiled) > known and self.executable is not None and not self.host_master:
+                if compiled.made > known and self.executable is not None and not self.host_master:
                     signature = batch_signature(device)
                     run.reads[signature] = step_reads(self.executable, signature)
-                interval.compiles = len(compiled)
-                if len(compiled) > known:
+                interval.compiles = compiled.made
+                if compiled.made > known:
                     self._warmed(plan, run, state, shardings, first=not known)
                 if not known:
                     # Rebound once the step is compiled, so the first tick measures steps, not the compile.
                     interval.last_log_time = time.time()
                     interval.waited, interval.compiling = 0.0, before
-                elif len(compiled) > known:
+                elif compiled.made > known:
                     # A shape met later compiles inside the interval, which reports that time apart from
                     # its steps', its first draw's admissions (`DrawingStep.drawn`) among it.
                     interval.compiling = before + time.perf_counter() - began
@@ -1558,7 +1559,7 @@ class Trainer(Generic[Loss, Effects]):
         # again where its plan changed (`_prefetched`).
         resumed = self._resumed(run, resume)
         if resumed.differs:
-            self._restarting(run, resumed.differs)
+            run.restarting(resumed.differs)
         return (start.resume, resumed.position, lambda begun=None: self._placed(start, positioned=False)[:2],
                 start.abstract, None)
 
@@ -1579,8 +1580,8 @@ class Trainer(Generic[Loss, Effects]):
         run.stages = stages_of(stream)
         try:
             if saved is not None and isinstance(stream, Checkpointable):
-                self._restarting(run, restored_or_restarted(stream, saved, resume=self.data_resume,
-                                                            step=run.current))
+                run.restarting(restored_or_restarted(stream, saved, resume=self.data_resume,
+                                                     step=run.current))
             batch = next(iter(stream), None)
             position = stream.get_state() if isinstance(stream, Checkpointable) else None
         except BaseException:
@@ -1761,10 +1762,12 @@ class Trainer(Generic[Loss, Effects]):
         accumulation its window pools. The narrow copies are left out: the plan's first rung drops
         them where the step does not fit with them (`dew.training.planning.FitSearch`)."""
         micro = microbatch_shapes(split_fields(batch)[0], split)
-        # Its loss's trace the plan's candidates read again (`StepCompiler.loss_shaped`).
+        # Its loss's trace the plan's candidates read again, over the state as they read it, as placed
+        # (`StepCompiler.loss_shaped`, `dew.training._candidates.candidate_for`).
         with self._traced_on(self.device_mesh) as schedule:
             stepping = self._compiler.loss_shaped(self._stepping(), schedule)
-            _, _, whole, _ = prepared_for(stepping, state, micro, schedule, split, narrow=False)
+            _, _, whole, _ = prepared_for(stepping, as_placed(stepping, state), micro, schedule, split,
+                                          narrow=False)
         return self._validated(whole)[1]
 
     def _fitting(self, state: TrainState, batch: Batch) -> Validation:
@@ -1816,12 +1819,12 @@ class Trainer(Generic[Loss, Effects]):
             # agrees on the one it reads.
             position, differs = resumed_on(source, lambda: position, resume=self.data_resume,
                                            step=run.current)
-            self._restarting(run, differs)
+            run.restarting(differs)
 
         def restore(stream: Checkpointable, saved: bytes) -> None:
             # On the worker that reads the stream, which it opens once (row 5577).
-            self._restarting(run, restored_or_restarted(stream, saved, resume=self.data_resume,
-                                                        step=run.current))
+            run.restarting(restored_or_restarted(stream, saved, resume=self.data_resume,
+                                                 step=run.current))
         if jax.process_count() > 1:
             # Each process opened its own stream over its own copy of the
             # corpus, and none reads a record before all agree it is one.
@@ -1854,16 +1857,6 @@ class Trainer(Generic[Loss, Effects]):
                                   functools.partial(shard_batch, self.device_mesh, reads=run.reads))
         return DevicePrefetchIterator(source, self.device_mesh, self._shape.prefetch, source_state=position,
                                       reads=run.reads, prepare=prepare, restore=restore, primed=primed)
-
-    @staticmethod
-    def _restarting(run: FitRun, differs: tuple[str, ...]) -> None:
-        """Note a resume whose data starts again, its saved plan differing in `differs` (`DataRestarted`)."""
-        if not differs:
-            return
-        run.restarted = differs
-        _log.warning("the saved data position's plan differs from this run's in %s, so its data starts "
-                     "again from the beginning of its order while its state resumes (data_resume='relaxed'; "
-                     "'exact' refuses it)", ", ".join(differs))
 
     def _scheduled(self, plan: FitPlan, run: FitRun) -> None:
         """Open the next stage of a schedule where the run's commits reached the one it stands in
@@ -2001,7 +1994,7 @@ class Trainer(Generic[Loss, Effects]):
         if run.train is not None:
             run.train.close()
         branched = FitRun(run.started, run.startup, current=run.current, partition=run.partition,
-                          reads=run.reads, compiled=run.compiled, marked=run.marked)
+                          reads=run.reads, compiled=run.compiled, passes=run.passes, marked=run.marked)
         # The branch's own clock of committed tokens, from the run's, which a schedule's stages end at
         # as the run's do (`_scheduled`), read off the devices where its steps may have reached what it
         # reads next (`FitPlan.committed`); the stages it begins are its own, the run's kept as they were.
@@ -2271,7 +2264,7 @@ class Trainer(Generic[Loss, Effects]):
         counted = prepare_counts(self.objective, batch, count_model=False)
         return counted if self._refusal is None else uncounted(counted, self.phase_passes.drawn_cap())
 
-    def _compiled_for(self, compiled: dict[Hashable, tuple[CompiledStep, StepFlops | None]],
+    def _compiled_for(self, compiled: CodeBounded[Hashable, tuple[CompiledStep, StepFlops | None]],
                       state: TrainState, batch: Batch, run: FitRun, interval: Interval,
                       reported: int | None = None) -> tuple[CompiledStep, StepFlops | None, TrainState]:
         """Return the step compiled for this batch's abstract signature (`batch_signature`),
@@ -2288,7 +2281,7 @@ class Trainer(Generic[Loss, Effects]):
         """
         state = self._staged(state, run.current)
         signature = self.phase_passes.key(batch_signature(batch))
-        if signature not in compiled and self.phase_passes.begins(compiled) and (
+        if signature not in compiled and self.phase_passes.begins(run.passes) and (
                 not occupied(state.window)):
             # A phase of other passes begins at an update's end: its step is planned afresh, at the split
             # the run was given or the planner's for its own passes, over the state as a fresh state holds
@@ -2312,7 +2305,10 @@ class Trainer(Generic[Loss, Effects]):
             agreed_same("training batch layout", lambda: batch_layout(batch))
             began = time.perf_counter()
             with region("compile"), run.held():
-                compiled[signature] = (self.compile(state, batch, trials), self.step_flops)
+                step = self.compile(state, batch, trials)
+            planned = None if self._compiled is None else self._compiled.planned
+            run.hold_step(signature, (step, self.step_flops), self.executable, planned,
+                          self.phase_passes.current)
             seconds = time.perf_counter() - began
             settled_heap(run, compiled=True)
             links = {axis: AxisLink(link.bytes_per_second, link.spread) for axis, link in self.links.items()}

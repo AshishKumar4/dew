@@ -15,8 +15,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend.mlir import ir
 from jax.extend.mlir.dialects import arith
 
-from dew.nn.kernels.templates import emission, resources, swizzling
-from dew.nn.kernels.templates.cost import Work
+from dew.nn.kernels.templates import resources, swizzling
 
 
 def arrived(counter, contributors) -> jax.Array:
@@ -30,9 +29,6 @@ def arrived(counter, contributors) -> jax.Array:
     semaphores alike)."""
     scalar = plgpu.Layout.WG_SPLAT(())
 
-    # An atomic and a barrier's reduction: no product, no operation of the CUDA cores a count prices, and
-    # a word of device memory read and written.
-    @emission.stating(lambda ref, count: Work(device_bytes=8))
     def ticket(ctx, ref, count):
         del ctx
         i32 = ir.IntegerType.get_signless(32)
@@ -84,9 +80,8 @@ class LaneZero:
         return mgpu_fragments.FragmentedArray.splat(lane_value(value.registers.item(), 0), (), is_signed=True)
 
 
-# One shuffle a thread: an operation of the CUDA cores, no memory read or written.
-LANE_ZERO = emission.stating(lambda value: Work(operations=1))(LaneZero())
-"""The one `LaneZero` body every `uniform` inlines, its work stated once (`emission.stating`)."""
+LANE_ZERO = LaneZero()
+"""The one `LaneZero` body every `uniform` inlines."""
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -94,8 +89,8 @@ class ScaleSmem:
     """`scale_smem`'s body (`plgpu.inline_mgpu`'s): scales every 16-bit element of a shared-memory tile in
     place by a scalar power of two (swizzle-agnostic since scalar multiplication commutes with every
     permutation), avoiding layout inference on small or swizzled query stages (row 5274). Equal only to
-    itself, so the weak record of its stated work (`emission.stating`) is keyed by the very body a trace
-    holds: by value, an equal body's registration kept a dropped one's key and lost the live one's (the base
+    itself, so the weak record of its counted work (`inline_work.body_work`) is keyed by the very body a
+    trace holds: by value, an equal body's record kept a dropped one's key and lost the live one's (the base
     review of 09b477e3d, F1)."""
 
     words: int
@@ -143,9 +138,7 @@ def scale_smem(ref, power: float, *, swizzle: int, interpret: bool = False) -> N
     pair = bits | (bits << 16)
     transforms = () if swizzle == swizzling.UNSWIZZLED else swizzling.swizzle_transforms(dtype, swizzle)
     ref_type = plgpu.RefType(transforms) if transforms else plgpu.RefType()
-    body = emission.stating(lambda r: Work(operations=elements, shared_bytes=2 * elements * 2))(
-        ScaleSmem(words, pair, bf16))
-    plgpu.inline_mgpu(arg_types=(ref_type,))(body)(ref)
+    plgpu.inline_mgpu(arg_types=(ref_type,))(ScaleSmem(words, pair, bf16))(ref)
 
 
 def lane_value(value: ir.Value, lane: int) -> ir.Value:

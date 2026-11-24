@@ -256,6 +256,30 @@ def test_a_scattered_regions_fused_price_counts_its_sides_permutation():
     assert scattered.fused_seconds - gathered.fused_seconds >= permuted, (scattered, gathered)
 
 
+def test_a_scattered_regions_permutation_prices_each_sides_bytes_and_table():
+    """The region `fused` prices for a scattered product whose consumer adds an fp32 residual of its rows
+    holds its permutation pass's every byte: the residual read and written and the int32 scatter table
+    read, exactly (row 12419)."""
+    sizes = jax.ShapeDtypeStruct((4,), jnp.int32)
+    x = jax.ShapeDtypeStruct((8192, 4096), jnp.bfloat16)
+    w = jax.ShapeDtypeStruct((4, 4096, 4096), jnp.bfloat16)
+    rows = jax.ShapeDtypeStruct((8192,), jnp.int32)
+    residual = jax.ShapeDtypeStruct((8192, 4096), jnp.float32)
+
+    def region(x, w, sizes, rows, residual):
+        product = fused_gemm.product(x, w, sizes, out_dtype=jnp.float32, scatter=rows)
+        return (product + residual).astype(jnp.bfloat16)
+
+    regions: list = []
+    token = fused_gemm._PRICED.set(regions)
+    try:
+        with generation.assumed("sm90"), gemm.unbuilt():
+            jax.eval_shape(functools.partial(fused_gemm.fused, region), x, w, sizes, rows, residual)
+    finally:
+        fused_gemm._PRICED.reset(token)
+    assert regions[-1].permuted_bytes == 2 * 8192 * 4096 * 4 + 8192 * 4, regions[-1]
+
+
 def _chained(function, wide):
     """`function` applied eight times over `wide`, in float32."""
     for _ in range(8):

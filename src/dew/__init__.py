@@ -59,6 +59,7 @@ from dew._devices import (
     divide_exactly as _divide_exactly,
     keep_roundings as _keep_roundings,
     preallocate_gpu_pool as _preallocate_gpu_pool,
+    ungraph_peer_waits as _ungraph_peer_waits,
     unpartition_gpu_pool as _unpartition_gpu_pool,
 )
 from dew._exports import lookup as _lookup
@@ -66,6 +67,7 @@ from dew._exports import lookup as _lookup
 _keep_roundings()
 _divide_exactly()
 _unpartition_gpu_pool()
+_ungraph_peer_waits()
 _preallocate_gpu_pool()
 _connect_at_creation()
 

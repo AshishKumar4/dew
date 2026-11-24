@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 from generation_support import lowers
 
-from dew import algebra
+from dew import _facts, algebra
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import report
 from dew.nn.precision import Numerics
@@ -714,7 +714,7 @@ def test_a_steps_relowering_writes_the_program_its_first_lowering_wrote():
 
 
 def test_a_written_region_records_the_facts_its_trace_read_wherever_it_is_written():
-    """A step lowered twice in one process (`dew.jit`), each within a recording (`generation.recording`): the
+    """A step lowered twice in one process (`dew.jit`), each within a recording (`_facts.recording`): the
     second writes its regions from the traces the first made (`fusion._traced`), and its recording holds the
     facts their traces read (the fused products' launches' legality, `report.refused`), as the first's did,
     where a held region dropped them and a trace kept under the second recording could not tell when they
@@ -726,7 +726,7 @@ def test_a_written_region_records_the_facts_its_trace_read_wherever_it_is_writte
     recorded = []
     with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
         for _ in range(2):
-            with generation.recording() as reads:
+            with _facts.recording() as reads:
                 step.trace(*operands)
             recorded.append(reads)
     cold, warm = recorded
@@ -745,7 +745,7 @@ def test_a_declined_region_records_the_facts_its_probes_read_wherever_it_is_weig
     """A step lowered twice in one process on an H100 (`dew.jit`), each within a recording, whose regions
     the pass weighs and declines (its products XLA's where no call names the template; attention written by
     hand, which recognition weighs and leaves): the second reads its decisions from those the first held
-    (`generation.held_trace`), and its recording holds the facts their probes read (a launch's legality,
+    (`_cache.holding`), and its recording holds the facts their probes read (a launch's legality,
     `report.refusals_of`; FlashAttention's lowering and the device a call is placed on) as the first's did,
     and so does one around it (row 7167: a declined region's held decision dropped them, so a warm
     lowering's recording could not tell when they no longer held)."""
@@ -757,9 +757,9 @@ def test_a_declined_region_records_the_facts_its_probes_read_wherever_it_is_weig
                                            for _ in range(3))))
     step = dew.jit(function)
     with generation.assumed("sm90"):
-        with generation.recording() as cold:
+        with _facts.recording() as cold:
             step.trace(*operands)
-        with generation.recording() as outer, generation.recording() as warm:
+        with _facts.recording() as outer, _facts.recording() as warm:
             step.trace(*operands)
     assert cold and set(warm) >= set(cold) and set(outer) >= set(cold), (cold, warm)
 

@@ -1095,6 +1095,10 @@ class CompiledMemory(NamedTuple):
     (`peak_memory_in_bytes`): its arguments and the values live beside them, where `temp` is the one
     allocation its temporaries are packed into, that packing's room included. None where the backend states
     none (a TPU's, an older plugin's), never zero."""
+    stopped: bool = False
+    """Whether its compile stopped after buffer assignment, past the memory limit it compiled under
+    (`stopped_at_memory_limit`, `dew.training.memory.LIMIT_EXIT`): an executable that states its memory and
+    runs nowhere, loaded or compiled ahead alike."""
 
     @property
     def summed(self) -> int:
@@ -1120,7 +1124,7 @@ def compiled_memory(executable: jax.stages.Compiled) -> CompiledMemory | None:
             int(stats.argument_size_in_bytes), int(stats.output_size_in_bytes),
             int(stats.alias_size_in_bytes), int(stats.temp_size_in_bytes),
             int(stats.generated_code_size_in_bytes),
-            int(stats.peak_memory_in_bytes) or None)
+            int(stats.peak_memory_in_bytes) or None, bool(stats.stopped_at_memory_limit))
     return _ANALYSED[executable]
 
 

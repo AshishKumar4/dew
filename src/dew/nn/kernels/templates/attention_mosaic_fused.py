@@ -215,7 +215,12 @@ def _fused_allocations(family: mosaic.Family, config: BackwardTiles, width: int,
               **{name: ((block_q,), STATISTICS[name])
                  for name in streamed_statistics_order(streamed, anchored=anchored)}}
     out = family.staged_memory((consumers, block_k, width), dtype) if typed else stage
-    return scoped, family.streams(blocks, stages, consumers), [] if held and not typed else [out]
+    # Every stream a step reads joined under one barrier pair (`rings.joined`, CUTLASS's PipelineTmaAsync):
+    # each step's loads awaited once and its slots given back once, where a ring each cost every consumer a
+    # wait and an arrival a stream (M-NA-6: 4.4-7x FlashAttention 3's barriers and syncs a CTA, its tensor
+    # pipe active 29-33% against 51-68%; row 5272).
+    return (scoped, family.streams(blocks, stages, consumers, joined=tuple(blocks)),
+            [] if held and not typed else [out])
 
 
 def dq_and_dkv(walk: _Backward, accumulators: tuple, weights_ref, cotangents_ref,

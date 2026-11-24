@@ -50,6 +50,7 @@ class Kernels:
     gemm_prologue: Literal['fused', 'xla'] | None = None
     grouped_matmul: Literal['apart', 'cutlass', 'mosaic', 'triton', 'xla'] | None = None
     layer_scan: Literal['plain', 'scanned'] | None = None
+    linear_ce: Literal['mosaic', 'xla'] | None = None
     low_rank: Literal['fused', 'xla'] | None = None
     mxfp8: Literal['mosaic', 'xla'] | None = None
     narrow_copies: Literal['off', 'on'] | None = None
@@ -63,6 +64,7 @@ class Kernels:
     sparse_attention: Literal['template', 'xla'] | None = None
     ssd: Literal['mosaic_gpu', 'pallas', 'tpu', 'xla'] | None = None
     swiglu: Literal['pallas', 'xla'] | None = None
+    syrk: Literal['mosaic', 'xla'] | None = None
 
     def named(self) -> dict[str, str]:
         """The ops it names and the kernel each runs, those it leaves to their picks omitted."""
