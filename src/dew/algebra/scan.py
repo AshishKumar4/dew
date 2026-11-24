@@ -127,17 +127,24 @@ class Scan:
 
 
 def _traced(declaration: Scan, function: Callable, names: tuple[str, ...], chunk: Mapping):
-    """`function` (the declaration's update or readout) traced at one token of `chunk`: the state's type and
-    each operand's without its walked axis, jit disabled so a jitted library function's equations are the
-    declaration's own."""
-    shape, dtype = declaration.state
-
+    """`function` (the declaration's update or readout) traced at one token of `chunk`: the state's type (a
+    pair's two, `paired`) and each operand's without its walked axis, jit disabled so a jitted library
+    function's equations are the declaration's own."""
     def named(h, *xs):
         return function(h, **dict(zip(names, xs, strict=True)))
 
+    states = declaration.state
+    typed = (tuple(jax.ShapeDtypeStruct(*state) for state in states) if paired(states)
+             else jax.ShapeDtypeStruct(*states))
     tokens = [token_type(declaration, chunk, name) for name in names]
     with jax.disable_jit():
-        return jax.make_jaxpr(named)(jax.ShapeDtypeStruct(shape, dtype), *tokens)
+        return jax.make_jaxpr(named)(typed, *tokens)
+
+
+def paired(states) -> bool:
+    """Whether a declaration's `Scan.state` is a pair's, two shapes and dtypes, rather than one's."""
+    return len(states) == 2 and all(
+        isinstance(state, tuple) and len(state) == 2 and isinstance(state[0], tuple) for state in states)
 
 
 def token_type(declaration: Scan, chunk: Mapping, name: str) -> jax.ShapeDtypeStruct:
@@ -178,7 +185,7 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
     product) forming and joining a walk's transfer. The same forms without one take Dew's products, the
     portable route's; a chunk's transition, which a walk that carries its transfer composes (`prepare(chunk,
     transition=True)`), is always Dew's, formed chunk-parallel."""
-    if isinstance(declaration.state[0][0], tuple):  # a pair's (`Scan.state`)
+    if paired(declaration.state):
         return _coupled(declaration, saturation)
     names = tuple(name for name in declaration.operands if name != declaration.reset)
     shape, dtype = _keyed_state(declaration)
