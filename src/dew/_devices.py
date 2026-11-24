@@ -238,19 +238,22 @@ def ungraph_peer_waits() -> None:
     `unpartition_gpu_pool`."""
     if backend_open() or not cuda_plugin():
         return
-    if peer_waits_ungraphed(os.environ, _pool.placed_gpus):
+    if peer_waits_ungraphed(os.environ, _pool.local_gpus):
         _gpu_default("xla_gpu_enable_command_buffer", PEER_WAITS_UNGRAPHED)
 
 
 def peer_waits_ungraphed(env: Mapping[str, str],
-                         drives: Callable[[Mapping[str, str]], tuple[int, ...] | None]) -> bool:
+                         opens: Callable[[str, Mapping[str, str]], tuple[int, ...] | None]) -> bool:
     """Whether a CUDA process of environment `env` leaves XLA's peer-waiting commands out of its graphs
-    (`ungraph_peer_waits`): its XLA_FLAGS name no commands to graph, and it drives more than one GPU, those
-    `drives` names for it before its backend opens (`dew._pool.placed_gpus`: its place's, `dew launch`'s or
-    a Slurm or Open MPI task's, else every one it may use; None uncounted)."""
+    (`ungraph_peer_waits`): its XLA_FLAGS name no commands to graph, and it may open more than one GPU, those
+    `opens` counts for JAX's selection as it already stands (`dew._pool.local_gpus` of
+    JAX_CUDA_VISIBLE_DEVICES: its CUDA_VISIBLE_DEVICES, else every GPU its driver counts; None uncounted).
+    A place a pool would pin it to (`dew launch`'s JAX_LOCAL_DEVICE_IDS, a Slurm task's local rank) narrows
+    nothing: the process takes it only where it joins its pool, which a one-task Slurm step and a run
+    stating `multi_host=False` do not, and a process that opens two GPUs alone hung (row 12761's review)."""
     if _flag(env.get("XLA_FLAGS", ""), "xla_gpu_enable_command_buffer") is not None:
         return False
-    gpus = drives(env)
+    gpus = opens(env.get("JAX_CUDA_VISIBLE_DEVICES", _pool.ALL_GPUS), env)
     return gpus is not None and len(gpus) > 1
 
 

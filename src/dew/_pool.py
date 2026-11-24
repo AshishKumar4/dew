@@ -12,7 +12,7 @@ import signal
 import subprocess
 from collections.abc import Mapping, Sequence
 
-from dew.clusters import COORDINATOR, ClusterEnvironment, Scheduler, detected_environment
+from dew.clusters import COORDINATOR, ClusterEnvironment, Scheduler
 
 _log = logging.getLogger(__name__)
 
@@ -114,18 +114,6 @@ def local_gpus(selected: str = ALL_GPUS, environ: Mapping[str, str] | None = Non
         return named
     count = local_gpu_count(environ)
     return None if count is None else tuple(range(count))
-
-
-def placed_gpus(environ: Mapping[str, str] | None = None) -> tuple[int, ...] | None:
-    """The GPUs a process of environment `environ` (its own where None) will drive, read before its backend
-    opens: those its place names where it joins its pool as a run that asks nothing of it does (`joins_pool`:
-    `dew launch`'s JAX_LOCAL_DEVICE_IDS, a Slurm or Open MPI task's local rank), which JAX's selection then
-    names; else every one it may use (`local_gpus`), a Slurm step of one task's among them, which joins none
-    and drives every GPU it sees; None where they could not be counted. A node's GPUs, which a task's place
-    leaves idle, are `local_gpus`' (`refuse_idle_gpus`)."""
-    found = detected_environment(environ=environ)
-    placed = None if found is None or not joins_pool(None, found) else found.place().local_device_ids
-    return placed if placed is not None else local_gpus(environ=environ)
 
 
 def local_gpu_count(environ: Mapping[str, str] | None = None) -> int | None:
