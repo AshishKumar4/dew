@@ -43,7 +43,7 @@ from dew.nn.kernels.templates.rings import (
     released,
     streamed,
 )
-from dew.nn.kernels.templates.stores import Output, output_staging, staged_chunks
+from dew.nn.kernels.templates.stores import Output, Scattered, output_staging, staged_chunks
 
 if TYPE_CHECKING:
     from dew.nn.kernels.templates.fed import Feed
@@ -249,6 +249,9 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
             if form is None:
                 staged_chunks(smems[output].at[index], value, ref, place, write=self.written)
                 return
+            if form.write is not None and isinstance(ref, Scattered):
+                raise ValueError("a scattered output's rows land a row at a time as computed, no write of "
+                                 "its own")
             staged_chunks(smems[output].at[index], value, ref, place, write=form.write or self.written,
                           divisor=form.divisor, transposed=form.transposed)
 
