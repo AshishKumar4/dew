@@ -806,7 +806,7 @@ def paired_projections(x: jax.Array | Gathered, first: jax.Array | Layered, seco
 
 def gated_experts(x: jax.Array | Gathered, gate: jax.Array | Layered, up: jax.Array | Layered,
                   down: jax.Array | Layered, group_sizes: jax.Array, dtype: Dtype | None, implementation: str,
-                  precision: PrecisionLike, activation: str, limit: float | None,
+                  precision: PrecisionLike, activation: GatedActivation, limit: float | None,
                   scatter: jax.Array | None = None) -> jax.Array:
     """A gated expert MLP's output (gate, up and down projections of `x`'s expert-sorted rows, the gated
     product of `activation` between them, clamped by `limit`), as `dew.nn.gated_mlp.fused_products` runs a
@@ -817,13 +817,14 @@ def gated_experts(x: jax.Array | Gathered, gate: jax.Array | Layered, up: jax.Ar
     epilogue's output its formed value (`gemm.gemm`'s `applied`). So neither backward recomputes the pair: the
     paired product's reads its kept roundings, the down projection's its prologue's operands, which a policy
     saving the two names keeps. Where the pair runs apart (`paired_projections`) or the down projection takes
-    no prologue (a packed bank's NVFP4 product, a run's recipe that takes the experts, `expert_projection`),
-    each projection runs on its own and the gated product between them (`gated_product`), as before. Every
-    arm's output the compute dtype's. `scatter`, `expert_projection`'s."""
+    no prologue (a packed bank's NVFP4 product, a run's recipe that takes the experts, `expert_projection`)
+    or the activation is a `Situ` (no hook's arithmetic), each projection runs on its own and the gated
+    product between them (`gated_product`), as before. Every arm's output the compute dtype's. `scatter`,
+    `expert_projection`'s."""
     compute, paired = _paired(x, gate, up, dtype)
     down_stack, down_layer = (down.stack, down.layer) if isinstance(down, Layered) else (down, None)
     if (paired is None or down_layer is not paired[-1] or isinstance(down_stack, formats.NvFp4)
-            or _recipe_takes_experts(down_stack)):
+            or _recipe_takes_experts(down_stack) or not isinstance(activation, str)):
         gate_rows, up_rows = (_apart(x, (gate, up), group_sizes, compute, implementation, precision)
                               if paired is None else
                               _paired_call(paired, group_sizes, compute, implementation, precision))
