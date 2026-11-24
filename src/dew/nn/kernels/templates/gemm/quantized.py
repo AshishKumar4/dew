@@ -157,16 +157,16 @@ def _blockwise_fp8_quantized(values: jax.Array) -> tuple[jax.Array, jax.Array]:
     return encode_tile(values * inverse, bits.E4M3), scale
 
 
-def blockwise_fp8_epilogue(epilogue=None, out_dtype=jnp.bfloat16):
-    """A GEMM epilogue returning the product's value in `out_dtype` (through `epilogue` where given: a
-    gated MLP's SwiGLU of its two accumulators) beside that value quantized as DeepSeek-V3's blockwise FP8
-    recipe quantizes its next product's rows (`_blockwise_fp8_quantized`: E4M3 codes and 1 x 128 power-of-two
-    scales of the value rounded to `out_dtype`), so the next product's operand comes out of this one's
-    epilogue, bitwise the recipe's `projections.rows_quantized` of the stored value (row 8547)."""
-    def quantized(*tiles):
-        value = tiles[0] if epilogue is None else epilogue(*tiles)
-        rounded = value.astype(out_dtype)
-        codes, scales = _blockwise_fp8_quantized(rounded.astype(jnp.float32))
+def blockwise_fp8_epilogue(activation=None, out_dtype=jnp.bfloat16):
+    """A GEMM epilogue returning the product rounded to `out_dtype` beside its next product's rows quantized
+    as DeepSeek-V3's blockwise FP8 recipe quantizes them: `activation` of the rounded product (itself where
+    none), rounded to `out_dtype`, as E4M3 codes and 1 x 128 power-of-two scales (`_blockwise_fp8_quantized`),
+    bitwise the recipe's `projections.rows_quantized` of that activation, which a separate pass formed from
+    the stored product (row 8547)."""
+    def quantized(acc):
+        rounded = acc.astype(out_dtype)
+        next_rows = rounded if activation is None else activation(rounded).astype(out_dtype)
+        codes, scales = _blockwise_fp8_quantized(next_rows.astype(jnp.float32))
         return rounded, codes, scales
 
     return quantized

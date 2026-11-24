@@ -280,6 +280,28 @@ def test_a_blockwise_fp8_projection_holds_every_reverse_order(edge):
 
 
 @pytest.mark.parametrize("edge", EDGES)
+def test_a_blockwise_fp8_chain_holds_every_reverse_order(edge):
+    """`projections.blockwise_chain` (an ungated MLP's two blockwise FP8 projections, the down projection's
+    rows quantized in the up projection's epilogue; its custom VJP each projection's own surrogate): every
+    reverse order, under a nested jit and a scan, in the rows and both matrices, finite wherever float64 is a
+    normal float32 and wherever the plain product of the two through the activation is, at values whose
+    products near float32's ends (row 8547). It takes no forward order: a custom VJP has none."""
+    group_blocks = jnp.asarray([2], jnp.int32)
+    primals = normal_draw(8547, (256, 128), (1, 128, 256), (1, 256, 128), scale=EDGES[edge])
+    direction = normal_draw(8548, (256, 128), (1, 128, 256), (1, 256, 128), scale=EDGES[edge])
+    (cotangent,) = normal_draw(8549, (256, 128))
+
+    def recipe(rows, up, down):
+        return projections.blockwise_chain(rows, up, down, group_blocks, jax.nn.relu, out_dtype=rows.dtype)
+
+    def plain(rows, up, down):
+        return jax.nn.relu(rows @ up[0]) @ down[0]
+
+    assert_contract(recipe, primals, direction, cotangent, f"a blockwise fp8 chain {edge}", truth_fn=plain,
+                    plain_fn=plain, without=FORWARD_ORDERS)
+
+
+@pytest.mark.parametrize("edge", EDGES)
 def test_an_nvfp4_products_kernels_hold_every_order(edge, kernel="xla"):
     """`gemm.nvfp4_product` on its selector's `kernel` (`xla` here, the decoded matrix's product; `packed`,
     the template's mainloop decoding each stage in place through `generation.linear_tangent` as `gemm` is,
