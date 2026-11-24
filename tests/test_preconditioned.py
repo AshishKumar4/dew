@@ -7,6 +7,8 @@ ATK's walk on the recurrence template beside it, packed over spans; and the squa
 saturates. A 16-bit call carries fla's own roundings, which no walk runs: it is held to fla's chunked release
 (row 12696's recorded arm)."""
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -22,6 +24,8 @@ from dew.nn.kernels.preconditioned import (
     preconditioned_keys,
     preconditioned_step,
 )
+from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop_backward, template
+from dew.nn.kernels.templates.recurrence.mainloop import Tiles
 from dew.nn.precision import l2norm
 
 SHAPE = (2, 40, 8, 16, 16, 8)
@@ -41,11 +45,10 @@ others within spans, a document crossing two."""
 SEEDS = 16
 """Each site's declared seeds."""
 TEMPLATED = (2, 80, 2, 4, 32, 32)
-"""PGDN on the recurrence template (its keys erasing along reads of their own, `chunk_forward.forward`'s
+"""The delta rule erasing along reads of its own on the recurrence template (`chunk_forward.forward`'s
 `reads`): a whole chunk of its 64 tokens and a part one, two value heads a key head's."""
-TEMPLATED_DOCUMENTS = ((0, 30, 70), (5, 64))
-"""Each row's packed documents' first tokens over the template's chunks: one starting at a chunk's first
-token, others within chunks, a document crossing two."""
+NARROW = Tiles(32, 1, chunk=64)
+"""The template's tiles a read erase's launches take, interpreted."""
 INTERPRETED = interprets()
 
 
@@ -96,12 +99,74 @@ def walked(*operands, starts=None):
         return chunked(*operands, starts=starts)
 
 
-def templated(*operands, starts=None, kernel: str = "mosaic_gpu"):
-    """`chunked` with the delta rule on `kernel` (the recurrence template's where unnamed), interpreted off a
-    GPU at an H100's facts."""
+def read_erased(query, key, value, log_decay, beta, state, reads):
+    """The delta rule erasing along reads of its own (`recurrence.Hooks.erase` 'read') a token at a time in
+    the operands' dtype, `S' = (I - beta k b^T) exp(g) S + beta k v^T`, read `q^T S' Dk^-1/2`, each key head's
+    queries, keys and reads its value heads': `(output, final memory)`."""
+    group = value.shape[2] // key.shape[2]
+    query, key, reads = (jnp.repeat(x, group, axis=2) for x in (query, key, reads))
+
+    def one(memory, token):
+        q, k, v, g, b, r = token
+        memory = memory * jnp.exp(g)[..., None, None]
+        corrected = v - jnp.einsum('bhk,bhkv->bhv', r, memory)
+        memory = memory + jnp.einsum('bhk,bhv->bhkv', b[..., None] * k, corrected)
+        return memory, jnp.einsum('bhk,bhkv->bhv', q * q.shape[-1] ** -0.5, memory)
+
+    steps = tuple(jnp.moveaxis(x, 1, 0) for x in (query, key, value, log_decay, beta, reads))
+    final, out = jax.lax.scan(one, state, steps)
+    return jnp.moveaxis(out, 0, 1), final
+
+
+def read_erased_with_gradients(*operands):
+    """`read_erased`'s output and final memory and every operand's gradient under the drawn cotangents
+    (`operands`' last two)."""
+    *given, d_out, d_final = operands
+    found, pull = jax.vjp(read_erased, *given)
+    return found, pull((d_out, d_final))
+
+
+def on_the_mainloop(query, key, value, log_decay, beta, state, reads, d_out, d_final):
+    """`read_erased_with_gradients` on the template's mainloop (`chunk_forward.kept_forward`'s `reads` and
+    its fast backward's, `mainloop_backward.kept_backward`), its accurate fp32 forms, interpreted on an
+    A100's bundle (`mma.sync`): an fp32 call's reference under the accurate forms is the recurrence a token
+    at a time in fp32."""
+    target = generation.gpu_target('sm80')
+    common = {'tiles': NARROW, 'family': template.bundle(target, jnp.float32), 'interpret': True}
+    with generation.assumed(target, interpreted=True):
+        out, final, (inverse, kept) = chunk_forward.kept_forward(query, key, value, log_decay, beta, state,
+                                                                 reads=reads, **common)
+        grads, _ = mainloop_backward.kept_backward(query, key, value, log_decay, beta, state, d_out, d_final,
+                                                   inverse=inverse, kept=kept, reads=reads, **common)
+    dq, dk, dv, dg, dbeta, dh0, *_, d_reads = grads
+    return (out, final), (dq, dk, dv, dg, dbeta, dh0, d_reads)
+
+
+def read_erase_operands(seed):
+    """A seed's fp32 operands of `TEMPLATED`'s shape, as PGDN gives its delta rule: its reads unit keys, its
+    keys the reads scaled a channel at a time within ATK's squash's range (2/3 to 3/2), log decays a
+    sigmoid's log, write gates a sigmoid's, an entering memory, and the cotangents."""
+    rows, length, key_heads, value_heads, keys, values = TEMPLATED
+    normal = np.random.default_rng([1458, 2, seed]).standard_normal
+    reads = normal((rows, length, key_heads, keys))
+    reads = reads / np.sqrt(np.sum(reads ** 2, axis=-1, keepdims=True))
+    written = reads * np.exp(np.log(1.5) * np.tanh(normal(reads.shape)))
+    gates = (rows, length, value_heads)
+    drawn = (normal((rows, length, key_heads, keys)), written, normal((rows, length, value_heads, values)),
+             -softplus(-(normal(gates) + 3.0)), sigmoid(normal(gates)),
+             normal((rows, value_heads, keys, values)), reads, normal((rows, length, value_heads, values)),
+             normal((rows, value_heads, keys, values)))
+    return tuple(hosted(x) for x in drawn)
+
+
+def templated(*operands, kernel: str = "mosaic_gpu"):
+    """`chunked` with the delta rule on `kernel` (the recurrence template's where unnamed) under the run's
+    fast forms, where an fp32 call's products round as fla's do (`recurrence_chunk.fast_rounding`), at an
+    H100's facts."""
+    fast = dataclasses.replace(generation.numerics(), forms='fast')
     with (generation.assumed("sm90" if INTERPRETED else None, interpreted=INTERPRETED),
-          generation.chosen(gated_delta_rule=kernel)):
-        return chunked(*operands, starts=starts)
+          generation.run_precision(fast), generation.chosen(gated_delta_rule=kernel)):
+        return chunked(*operands)
 
 
 def operands(per_key: bool, shape: tuple[int, ...] = SHAPE):
@@ -143,15 +208,13 @@ def test_the_chunked_rule_is_as_exact_as_flas_recurrence_a_token_at_a_time(per_k
                          length=SHAPE[1], seeds=SEEDS)
 
 
-@pytest.mark.parametrize('packed', [False, True], ids=['one sequence', 'packed'])
-def test_pgdn_on_the_template_is_as_exact_as_flas_recurrence_a_token_at_a_time(packed):
-    """PGDN's delta rule on the recurrence template, its keys erasing along reads of their own (the system's
-    rows and the weights the normalized keys', its writes the preconditioned keys'): the output, final state
-    and moment and every operand's gradient on par with fla's recurrence a token at a time from float64
-    (check 1), over one sequence or packed documents crossing its chunks."""
-    assert_packed_on_par(templated, tokenwise, operands(per_key=False, shape=TEMPLATED),
-                         "preconditioned gdn on the template", packed=packed, documents=TEMPLATED_DOCUMENTS,
-                         length=TEMPLATED[1], seeds=SEEDS)
+def test_a_read_erase_on_the_mainloop_is_as_exact_as_its_recurrence_a_token_at_a_time():
+    """The delta rule erasing along reads of its own on the template's mainloop (PGDN's: the system's rows
+    and the weights the reads', its writes the keys'), its accurate fp32 forms: the output, the final
+    memory and every operand's gradient, the reads' among them, on par with the recurrence a token at a time
+    in fp32 from float64 (check 1)."""
+    assert_as_exact(jax.jit(on_the_mainloop), jax.jit(read_erased_with_gradients), read_erase_operands,
+                    "a read erase on the mainloop", seeds=SEEDS)
 
 
 @pytest.mark.parametrize(('per_key', 'kernel', 'taken'), [(False, 'mosaic_gpu', 'mosaic_gpu'),
