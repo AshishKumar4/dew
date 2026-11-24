@@ -170,3 +170,81 @@ def blockwise_fp8_epilogue(epilogue=None, out_dtype=jnp.bfloat16):
         return rounded, codes, scales
 
     return quantized
+
+
+def forms_of(out_forms: tuple | None, count: int) -> tuple:
+    """Each of a call's `count` outputs' form (`Hooks.out_forms`): None for a tile of its own, else
+    `(divisor, transposed)`; none stated, every output a tile."""
+    if not out_forms:
+        return ()
+    if len(out_forms) != count:
+        raise ValueError(f"{len(out_forms)} output forms for {count} outputs")
+    return tuple(out_forms)
+
+
+def reduced(buffer, piece: jax.Array) -> None:
+    """A reduced output's chunk written (`stores.Output.write`): `piece`, a consumer's rows by one block's
+    columns (the chunk its staging states, one block), its value broadcast across them by its epilogue, as
+    each row's maximum, `[1, rows]` where transposed: a row reduction of the accumulator's layout, which
+    Mosaic GPU lowers where a strided read of every `divisor`-th column does not (witness/packing-1, sm90)."""
+    buffer[0, :] = jnp.max(piece.astype(jnp.float32), axis=1).astype(buffer.dtype)
+
+
+def outputs(part: tuple[int, int], dtypes: tuple, forms: tuple) -> tuple:
+    """A consumer's share `part` of each output as its family stages it: `(shape, dtype)` for a tile,
+    `stores.Output` for one a form reduces (`forms_of`), written by `reduced`."""
+    from dew.nn.kernels.templates import stores
+
+    if not forms:
+        return tuple((part, jnp.dtype(dtype)) for dtype in dtypes)
+    return tuple((part, jnp.dtype(dtype)) if form is None
+                 else stores.Output(part, jnp.dtype(dtype), divisor=form[0], write=reduced,
+                                    transposed=form[1])
+                 for dtype, form in zip(dtypes, forms, strict=True))
+
+
+def declared(dtype, form: tuple[int, bool], rows: int, columns: int) -> jax.ShapeDtypeStruct:
+    """An output a form reduces (`forms_of`) as its call declares it: one value a row each `divisor` of
+    `columns`, `[columns // divisor, rows]` where transposed, `[rows, columns // divisor]` otherwise."""
+    divisor, transposed = form
+    if columns % divisor:
+        raise ValueError(f"{columns} columns hold no whole {divisor}-column blocks")
+    shape = (columns // divisor, rows) if transposed else (rows, columns // divisor)
+    return jax.ShapeDtypeStruct(shape, jnp.dtype(dtype))
+
+
+def _reduced_divisor(out_forms: tuple | None) -> int | None:
+    """The one block width a call's outputs a form reduces state (`Hooks.out_forms`), None for none."""
+    divisors = {form[0] for form in out_forms or () if form is not None}
+    if len(divisors) > 1:
+        raise ValueError(f"a call's reduced outputs state one block width, not {sorted(divisors)}")
+    return next(iter(divisors), None)
+
+
+def formed(config, out_forms: tuple | None):
+    """`config` (a GEMM tile) staging its outputs a block of a reduced output's columns at a time where the
+    call stores one (`Hooks.out_forms`; two buffers), so each chunk a reduced output's `write` takes is one
+    block (`reduced`); `config` as it is elsewhere, or where it states its staging."""
+    import dataclasses
+
+    from dew.nn.kernels.templates import stores
+
+    divisor = _reduced_divisor(out_forms)
+    if divisor is None or config.staging is not None:
+        return config
+    return dataclasses.replace(config, staging=(divisor, stores.OUTPUT_BUFFERS))
+
+
+def forms_refusal(out_forms: tuple | None, config, *, dense: bool) -> str | None:
+    """Why a GEMM launch at `config` stores no output a form reduces (`Hooks.out_forms`), None where it does
+    or the call stores none: its staging a block of the form's columns a chunk (`formed`, which `reduced`
+    writes), and a transposed one's call dense (its stores take a share's whole rows,
+    `stores.transposed_rows`: a grouped tile's share starts mid-tile)."""
+    divisor = _reduced_divisor(out_forms)
+    if divisor is None:
+        return None
+    if config.staging is None or config.staging[0] != divisor:
+        return f"a reduced output's chunk is one {divisor}-column block, not {config.staging}"
+    if not dense and any(form is not None and form[1] for form in out_forms):
+        return "a transposed output is a dense call's"
+    return None

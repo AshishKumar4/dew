@@ -416,10 +416,13 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
         takes where given (a swapped call's own rule, `MosaicGmm._left_fits`), on the call padded to whole
         tiles (`_aligned`'s `whole_tiles`): the tile a launch runs whether its depth and width are padded or
         run partial (`_partial_axes`)."""
-        from .templates.gemm import derivation
+        from .templates.gemm import derivation, quantized
 
         ba = self._aligned(ba, target, whole_tiles=True)
         rows, depth, width = self._generated_extents(ba)
+        # A call storing an output a form reduces stages each output a block of the form's at a time
+        # (`quantized.formed`), each tile planned and taken so.
+        formed = functools.partial(quantized.formed, out_forms=ba.arguments['hooks'].out_forms)
         # Each issuer's group in turn (`_groups`), a pair's layouts first where the rows hold its tile
         # (`derivation.paired_first`), each its own derivation, the first that holds a tile taken.
         for tried in (tried for layouts in self._groups(ba, target)
@@ -427,15 +430,15 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
             tile = derivation.derived(tried, rows=rows, depth=depth, width=width,
                                       dtype=ba.arguments['tokens'].dtype,
                                       multiprocessors=_multiprocessors(target), target=target,
-                                      candidate=lambda tile: (self.candidate(ba, tile, target)
+                                      candidate=lambda tile: (self.candidate(ba, formed(tile), target)
                                                               and (admits is None or admits(tile))),
-                                      launch_of=lambda tile: self.launch_of(ba, tile, target),
+                                      launch_of=lambda tile: self.launch_of(ba, formed(tile), target),
                                       grouped=depth is not None, depths=self._step_sizes(ba),
                                       dense=bool(ba.arguments.get('dense')),
                                       ragged=self._ragged(ba, tried[0]),
                                       units=self._vector_units(ba, tried[0]), programs=programs)
             if tile is not None:
-                return tile
+                return formed(tile)
         return None
 
     def _vector_units(self, ba, family: mosaic.Family) -> tuple[int, int, int]:
@@ -591,7 +594,7 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
         copy's extent along its axis (`mosaic.Family.copy_extent`); none a compile of this process found
         spilling (`report.refused`), so the derivation takes the next tile by its own rule."""
         from .templates.axes import held as held_axes
-        from .templates.gemm import mosaic_gpu, pricing
+        from .templates.gemm import mosaic_gpu, pricing, quantized
         family = next((bundle for group in self._groups(ba, target) for bundle in group
                        if bundle.name == config.family), None)
         if (family is None or config.cluster > family.cluster or not mosaic_gpu.pair_takes(config, family)
@@ -600,9 +603,13 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
                 or not self._divides(ba, config, target) or self._refused(ba, config, target)):
             return False
         hooks = ba.arguments['hooks']
+        stored = hooks.out_dtypes or (ba.arguments['out_dtype'],)
         if not self._granular(ba, config, family, target) or config.staging_refusal(
-                hooks.out_dtypes or (ba.arguments['out_dtype'],),
+                quantized.outputs((config.share, pricing.tile_columns(config, family)), stored,
+                                  quantized.forms_of(hooks.out_forms, len(stored))),
                 family.specialized(config.share, pricing.tile_columns(config, family))) is not None:
+            return False
+        if quantized.forms_refusal(hooks.out_forms, config, dense=bool(ba.arguments.get('dense'))):
             return False
         sides = (('prologue_operands', hooks.prologue_axes), ('epilogue_operands', hooks.epilogue_axes))
         vectors = {(axis, jnp.dtype(side.dtype)) for name, axes_of in sides
@@ -801,7 +808,7 @@ class MosaicGmm(_Mosaic):
         return _product_sides(ba)
 
     def _allocations(self, ba, config: tiling.Tiles, family: mosaic.Family) -> mosaic_gpu.Allocations:
-        from .templates.gemm import mosaic_gpu
+        from .templates.gemm import mosaic_gpu, quantized
 
         hooks = ba.arguments['hooks']
         return mosaic_gpu.gmm_allocations(
@@ -811,6 +818,7 @@ class MosaicGmm(_Mosaic):
             epilogue_axes=hooks.epilogue_axes,
             epilogue_dtypes=tuple(side.dtype for side in ba.arguments.get('epilogue_operands', ())),
             dtypes=hooks.out_dtypes or (ba.arguments['out_dtype'],),
+            forms=quantized.forms_of(hooks.out_forms, len(hooks.out_dtypes or (None,))),
             paired=ba.arguments.get('paired') is not None, step_scaled=self.STEP_SCALED,
             block_scaled=self.BLOCK_SCALED, gathered=ba.arguments.get('gather') is not None,
             interpret=bool(ba.arguments['interpret']), joined=ba.arguments.get('joined') is not None)

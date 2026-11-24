@@ -156,7 +156,7 @@ def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, 
                     transpose_lhs: bool = False, packed: bool = False, step_scaled: bool = False,
                     block_scaled: bool = False, interpret: bool = False, gathered: bool = False,
                     packed_rows: bool = False, joined: bool = False,
-                    packed_format: str | None = None) -> Allocations:
+                    packed_format: str | None = None, forms: tuple = ()) -> Allocations:
     """Dew: `gmm`'s allocations at `tiles` (`Allocations`), for rows of `dtype` and a matrix of `rhs_dtype`
     (two with `paired`), its side operands' axes and dtypes and its outputs' dtypes: a stream for the rows,
     each matrix and each prologue side operand that follows the steps (`_stepped`), each epilogue side
@@ -165,7 +165,8 @@ def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, 
     NVFP4 one's, `scales`' in `gmm`, or a free-layout FP8 matrix's, `packed_format`) streams each group's
     sixteen uint32 words (`words_{q}`, a 64-byte row, which cp.async's two-dimensional copies take and a
     register tile loads whole) and (for NVFP4) its block scales K-major, decoded a stage at a time into
-    bfloat16 buffers (`packed.stage_decoded` / `packed.stage_decoded_fp8`)."""
+    bfloat16 buffers (`packed.stage_decoded` / `packed.stage_decoded_fp8`). Its outputs stored as `forms`
+    states each (`quantized.outputs`: a tile, or one value a row each `divisor` columns, row 8547)."""
     block_m, block_n, block_k = tiles.block_m, tiles.block_n, tiles.block_k
     # A consumer's accumulators: its share of the rows by the tile's columns, a pair's both where its products
     # span it (`tile_columns`); each stream's slot a multiprocessor's block.
@@ -205,7 +206,7 @@ def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, 
                                           jnp.bfloat16)])
     return Allocations(blocks, (sides['side_smems'], sides['side_barriers'], held['fixed_smems'],
                                 held['fixed_barriers'], decoded),
-                       tuple((part, jnp.dtype(out)) for out in dtypes),
+                       quantized.outputs(part, dtypes, forms),
                        tuple(name for name in ('matrix', 'paired') if name in blocks),
                        GATHERED_STREAMS if gathered and not interpret else ())
 
@@ -296,7 +297,7 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
         scales: jax.Array | None = None, step_scales: tuple | None = None, mx_scales: tuple | None = None,
         gather: jax.Array | None = None, scatter: jax.Array | None = None, packed_rows: bool = False,
         registers: int | None = None, shared: int | None = None, balanced: bool | tail_of.Tail = True,
-        beside: tuple = (), chained: tuple = (), packed_format: str | None = None
+        beside: tuple = (), chained: tuple = (), packed_format: str | None = None, out_forms: tuple = ()
         ) -> jax.Array | tuple[jax.Array, ...]:
     """Each group's rows of `lhs` `[rows, depth]` times its matrix of `rhs`, `[groups, depth, width]` or with
     `transpose_rhs` `[groups, width, depth]`: `[rows, width]` in `out_dtype`, unrouted tail rows zeroed.
@@ -397,6 +398,7 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
         step_scales=step_scales, scale_per=per, mx_scales=mx_scales, gather=gather, scatter=scatter,
         stored=None if scatter is None else rows, packed_rows=packed_rows, registers=registers, shared=shared,
         beside=side_by_side, beside_matrices=beside, chained=linked, packed_format=packed_format,
+        forms=quantized.forms_of(out_forms, len(dtypes)),
         chained_operands=_chained_walked(chained, tiles, dtype, transpose_lhs, dense, interpret))
     outs = walk(multiprocessors=launched(fam, multiprocessors, walked, tail),
                 hooks=(prologue, prologue_axes, epilogue, epilogue_axes),
@@ -514,7 +516,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                   mx_scales: tuple | None = None, gather=None, scatter=None, shared: int | None = None,
                   beside: "Beside | None" = None, beside_matrices: tuple = (), when=None, into=None,
                   chained=None, chained_operands: tuple = (), flagged: bool = False,
-                  packed_format: str | None = None) -> tuple:
+                  packed_format: str | None = None, forms: tuple = ()) -> tuple:
     """Dew: `gmm` on its instruction family's bundle (`family_of`): `tiles.warpgroups` consumer roles, each
     its share of the rows by all the columns, one MMA a step (two: CUTLASS's cooperative split, 2-7% faster
     the family owning the operands' streams, their staging and the stores (`mosaic.Family.persist`). Each
@@ -536,7 +538,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
     allocations = _gmm_allocated(tiles, family, (lhs, rhs, paired, scales, step_scales, mx_scales, gather),
                                  hooks, sides, dtypes, transpose_rhs=transpose_rhs, packed_rows=packed_rows,
                                  transpose_lhs=transpose_lhs, interpret=bool(interpret), joined=joined,
-                                packed_format=packed_format)
+                                packed_format=packed_format, forms=forms)
     bounded = None if when is None else chained  # each product its own accumulator (`guarded_walk`)
     matrices, streamed, accumulators = _gmm_streamed(paired, scales, joined, bounded)
     # A pair's tiles: g groups' boundaries, and the unrouted rows.
@@ -606,7 +608,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                                              **_gathered(gather, tiles, lhs.dtype, interpret)))
     out_type = () if into is not None else (
         *_declared(lhs, rhs, gather, (m, n, stored), tiles.splits, dtypes, transpose_lhs, transpose_rhs,
-                   beside, beside_matrices), *((flags_declared(grid, tiles),) if flagged else ()))
+                   beside, beside_matrices, forms), *((flags_declared(grid, tiles),) if flagged else ()))
     operands = _gmm_operands(lhs, rhs, paired, scales, step_scales, mx_scales, gather, scatter, joined,
                              beside_matrices, (chained_operands, when, into))
     kernel = family.kernel(body, out_type=out_type, grid=(multiprocessors // pair,), grid_names=("programs",),
@@ -758,14 +760,15 @@ def _prefetched(tiles: Tiles, grid: tuple, steps: int, transpose_rhs: bool, inte
 
 def _declared(lhs, rhs, gather, shape: tuple[int, int, int | None], splits: int, dtypes: tuple,
               transpose_lhs: bool, transpose_rhs: bool, beside: "Beside | None" = None,
-              beside_matrices: tuple = ()) -> tuple:
+              beside_matrices: tuple = (), forms: tuple = ()) -> tuple:
     """Dew: a `gmm` launch's outputs, `[rows, n]` each, a depth split's each run's partial a slice of its own
     (`[splits, rows, n]`), stated as its operands' axes (`outputs.output`): its rows `lhs`'s (a gathered
     product's table's, `gather`), its columns `rhs`'s width (each as its transpose lays it). A
     scattered product declares its stored rows alone, which its table's entries land on, each once: its padded
     rows land nowhere, so rows past them would be declared and never written (NSNAN-2); that count is its
     call's, no operand axis of the launch, so its outputs state their shapes alone. Matrices side by side
-    declare each one's own (`Beside.declared`), `beside_matrices` those past `rhs`."""
+    declare each one's own (`Beside.declared`), `beside_matrices` those past `rhs`. An output a form
+    reduces (`forms`, `quantized.forms_of`) is `[rows, n // divisor]`, `[n // divisor, rows]` transposed."""
     m, n, stored = shape
     if beside is not None:
         return beside.declared(lhs, (rhs, *beside_matrices), dtypes[0], m)
@@ -778,6 +781,12 @@ def _declared(lhs, rhs, gather, shape: tuple[int, int, int | None], splits: int,
     width = outputs.axis(rhs, 1 if transpose_rhs else 2)
     if width.size != n:
         raise ValueError(f"a gmm's outputs are its matrix's width, {n}, not {width.size}")
+    if any(forms):
+        if splits != 1:
+            raise ValueError("an output a form reduces is a call's of no depth split")
+        return tuple(outputs.output(dtype, rows, width) if form is None
+                     else quantized.declared(dtype, form, m, n)
+                     for dtype, form in zip(dtypes, forms, strict=True))
     dims = (rows, width) if splits == 1 else (splits, rows, width)
     return tuple(outputs.output(dtype, *dims) for dtype in dtypes)
 
@@ -1005,7 +1014,7 @@ def _gmm_split_refused(tiles: Tiles, k: int, n: int, step_scales, *, exact_sums:
 def _gmm_allocated(tiles: Tiles, family: mosaic.Family, operands: tuple, hooks: tuple, sides: tuple,
                    dtypes: tuple, *, transpose_rhs: bool, transpose_lhs: bool,
                    interpret: bool = False, packed_rows: bool = False, joined=None,
-                   packed_format: str | None = None) -> Allocations:
+                   packed_format: str | None = None, forms: tuple = ()) -> Allocations:
     """Dew: `gmm_allocations` for `_gmm_mainloop`'s call: its `operands` (rows, matrix, paired matrix, packed
     scales, step and block scales, gather table), its hooks' axes and side operands' dtypes, and its outputs'
     `dtypes`; with `packed_rows`, the packed matrix its rows; with `joined` rows, their stream."""
@@ -1021,7 +1030,7 @@ def _gmm_allocated(tiles: Tiles, family: mosaic.Family, operands: tuple, hooks: 
                            paired=paired is not None, transpose_lhs=transpose_lhs, packed=scales is not None,
                            step_scaled=step_scales is not None, block_scaled=mx_scales is not None,
                            interpret=interpret, gathered=gather is not None, packed_rows=packed_rows,
-                           joined=joined is not None, packed_format=packed_format)
+                           joined=joined is not None, packed_format=packed_format, forms=forms)
 
 def _mx_refused(mx_scales, tiles: Tiles, family: mosaic.Family, *, transpose_rhs: bool, plain: bool) -> None:
     """Dew: `gmm`'s refusal of a block-scaled product (`mx_scales`: the rows' and the matrices' scales, one

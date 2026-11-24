@@ -117,17 +117,18 @@ class Tiles:
                 raise ValueError(f"{self}: {refusal}")
 
     def stated(self, outputs, family) -> tuple[int, int] | None:
-        """The output staging this tile states for a kernel storing `outputs` (`(shape, dtype)` each,
-        `persist`'s `chunks`) on `family` (its issuer specialized for the tile), refused where it holds no
-        chunk of them (`staging_refusal`), as the launch's candidate refuses it: `gmm` or `tgmm` called
-        directly at a pin."""
-        if (refusal := self.staging_refusal(tuple(dtype for _, dtype in outputs), family)) is not None:
+        """The output staging this tile states for a kernel storing `outputs` (`(shape, dtype)` each, or
+        `stores.Output`, `persist`'s `chunks`) on `family` (its issuer specialized for the tile), refused
+        where it holds no chunk of them (`staging_refusal`), as the launch's candidate refuses it: `gmm` or
+        `tgmm` called directly at a pin."""
+        if (refusal := self.staging_refusal(tuple(map(stores.Output.of, outputs)), family)) is not None:
             raise ValueError(f"{self}: {refusal}")
         return self.staging
 
     def staging_refusal(self, dtypes, family) -> str | None:
         """Why the output staging this tile states (`staging`) holds no chunk of the call's outputs of
-        `dtypes` on `family` (its issuer as the tile specializes it), None where it does or states none: a
+        `dtypes` (or `stores.Output`s, a packed one's chunk its own, `stores.staging_refusal`'s `packed`) on
+        `family` (its issuer as the tile specializes it), None where it does or states none: a
         chunk slices its accumulator at whole fragments (`ACCUMULATOR_COLUMNS`) and whole atoms of the issuer
         (`mosaic.Issuer.atom_columns`: two row warps of mma.sync tile 16 columns), and divides the tile and
         the issuer's pieces in whole TMA rows of each dtype (`stores.staging_refusal`, the one owner of
@@ -138,7 +139,13 @@ class Tiles:
         if self.staging[0] % unit:
             return f"a stated chunk of {self.staging[0]} columns slices the accumulator's {unit}-column atoms"
         columns = self.block_n * (self.cluster if family.pairs_product else 1)
-        return stores.staging_refusal(columns, dtypes, self.staging, piece=family.chunk_columns(columns))
+        piece = family.chunk_columns(columns)
+        forms = [each for each in dtypes if isinstance(each, stores.Output)]
+        if not forms:
+            return stores.staging_refusal(columns, dtypes, self.staging, piece=piece)
+        return next((refusal for form in forms if (refusal := stores.staging_refusal(
+            columns, (form.dtype,), self.staging, piece=piece,
+            packed=(form,) if form.divisor > 1 or form.transposed else ())) is not None), None)
 
 
 ACCUMULATOR_COLUMNS = 8
