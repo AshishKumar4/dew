@@ -318,11 +318,12 @@ def _chain_backward(activation, out_dtype, interpret, live, residuals, cotangent
     """The blockwise projections' own reverse modes (`_projection_backward`) through the activation's
     derivative at the first projections' rounded products: the recipe's surrogate of each, as they run
     apart, the rows' cotangent each first projection's added. Rows past the first `live` (a caller's padding,
-    `recipe_chain`) hold zeros in the down projection's rows and in the first projections' cotangents, as
+    `recipe_chain`) hold zeros in its cotangent, the down projection's rows and the first projections' cotangents, as
     the projections apart pad them: the down kernel gradient and the first ones quantize their rows along the
     tokens, which an activation of the padding (nonzero, or of a nonfinite derivative at zero) would enter."""
     x, w_ins, w_down, group_blocks, products = residuals
     kept = (jnp.arange(x.shape[0]) < live)[:, None]
+    cotangent = jnp.where(kept, cotangent, jnp.zeros((), cotangent.dtype))  # padding's, whatever it is given
     activated, pulled = jax.vjp(lambda *values: activation(*values).astype(out_dtype), *products)
     activated = jnp.where(kept, activated, jnp.zeros((), activated.dtype))
     d_activated, d_w_down, _ = _projection_backward(out_dtype, interpret, (activated, w_down, group_blocks),
