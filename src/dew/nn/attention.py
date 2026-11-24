@@ -48,6 +48,7 @@ from .attention_masks import (
     with_key_starts,
 )
 from .attention_parallel import (
+    check_rows,
     four_dimensional,
     on_attention_shards,
     pad_rows,
@@ -1414,23 +1415,25 @@ def _sequence_sharded(query, key, shards: int, *, causal, sliding_window, mask, 
     queries, keys = query.shape[-3], key.shape[-3]
     ids = {name: x for name, x in {"segment_ids": segment_ids, "key_value_seq_starts": starts,
                                    **spanned}.items() if x is not None}
+    check_rows(query.shape[0], {**ids, "key_value_seq_lengths": lengths})
     if ids and visibility_refused(query, key, shards, ids) is None:
         return causal, sliding_window, mask, lengths, False, ids
     if any(x is not None for x in spanned.values()):
         mask = visibility_mask(queries, keys, causal, sliding_window, mask, segment_ids, lengths, starts,
                                **spanned)
         return False, None, mask, None, True, None
+    built = False
     if isinstance(segment_ids, CrossDocuments) and (causal or sliding_window is not None):
         aligned = cross_document_mask(segment_ids, causal=causal, sliding_window=sliding_window)
         mask = aligned if mask is None else jnp.logical_and(aligned, mask)
-        causal, sliding_window, segment_ids = False, None, None
+        causal, sliding_window, segment_ids, built = False, None, None, True
     if starts is not None:
-        mask = with_key_starts(mask, starts, keys)
+        mask, built = with_key_starts(mask, starts, keys), True
     if segment_ids is not None:
         documents = with_documents(mask, segment_ids)
         mask = combined_attention_mask(queries, keys, causal, sliding_window, documents)
         return False, None, mask, lengths, True, None
-    return causal, sliding_window, mask, lengths, False, None
+    return causal, sliding_window, mask, lengths, built, None
 
 
 def kernel_for_materialized_mask(implementation: AttentionImpl, query, key, *, dtype=None, precision=None,

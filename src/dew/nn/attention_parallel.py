@@ -76,6 +76,7 @@ def sequence_parallel_attention(kernel, query, key, value, shards: int, *, causa
     reason: the all-to-all whole beside whole sequences, the gather its key-side ids whole beside the
     gathered keys and each striped query reading them at its slot; no dense mask is built.
     """
+    check_rows(query.shape[0], {**(visibility or {}), "key_value_seq_lengths": key_value_seq_lengths})
     masked = causal or sliding_window is not None or mask is not None or bool(visibility)
     if visibility and (reason := visibility_refused(query, key, shards, visibility)):
         raise LayoutRefused(f"{reason}, so its caller takes the visibility as a mask "
@@ -129,14 +130,18 @@ def _row_leading(name: str, leaf, rows: int) -> bool:
     return jnp.ndim(leaf) == BATCHED_RANKS.get(name, 2) and leaf.shape[0] == rows
 
 
-def _check_rows(name: str, ids, rows: int) -> None:
-    """Refuse a visibility id at its batched rank (`BATCHED_RANKS`) whose leading length is neither one nor
-    the batch's `rows`: replicated whole beside the exchange's split rows, each shard would read another's
-    (a `[2, Q, R, 2]` runs beside four rows, the review of #4035)."""
-    for leaf in jax.tree.leaves(ids):
-        if jnp.ndim(leaf) == BATCHED_RANKS.get(name, 2) and leaf.shape[0] not in (1, rows):
-            raise ValueError(f"{name} of shape {leaf.shape} leads with {leaf.shape[0]} rows beside the "
-                             f"call's {rows}")
+def check_rows(rows: int, ids: dict) -> None:
+    """Refuse each of a split call's row-scoped `ids` (visibility ids and key lengths, by name) at its
+    batched rank (`BATCHED_RANKS`) whose leading length is neither one nor the batch's `rows`: replicated
+    whole beside the exchange's split rows, or folded into a mask before it, each shard would read
+    another's (a `[2, Q, R, 2]` runs beside four rows, the review of #4035; two rows' documents or lengths
+    beside four, of #4053). Once, before any fold or exchange: `dew.nn.attention._sequence_sharded` and
+    `sequence_parallel_attention`."""
+    for name, held in ids.items():
+        for leaf in jax.tree.leaves(held):
+            if jnp.ndim(leaf) == BATCHED_RANKS.get(name, 2) and leaf.shape[0] not in (1, rows):
+                raise ValueError(f"{name} of shape {leaf.shape} leads with {leaf.shape[0]} rows beside the "
+                                 f"call's {rows}")
 
 
 def _striped_visibility(visibility: dict, shards: int, length: int, queries, rows: int) -> dict:
@@ -383,11 +388,9 @@ def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
     if sinks is not None:
         extras['sinks'] = (sinks, P(exchanged_heads))
     if key_value_seq_lengths is not None:
-        _check_rows("key_value_seq_lengths", key_value_seq_lengths, query.shape[0])
         extras['key_value_seq_lengths'] = (key_value_seq_lengths, query_split(
             ("activation_batch",), key_value_seq_lengths, queries, query.shape))
     for name, ids in (visibility or {}).items():
-        _check_rows(name, ids, query.shape[0])
         # Whole along the sequence beside the whole sequences the exchange gives, a leaf's batch rows split
         # as the query's own where its contract leads with them (`_row_leading`), any other whole: a
         # shared `[K]` validity of the batch's length is the keys', not the rows'.
@@ -480,7 +483,6 @@ def gathered_keys_attention(kernel, query, key, value, shards: int, *, causal,
     if sinks is not None:
         extras['sinks'] = (sinks, query_split(("activation_heads",), sinks, queries, query.shape))
     if key_value_seq_lengths is not None:
-        _check_rows("key_value_seq_lengths", key_value_seq_lengths, query.shape[0])
         extras['key_value_seq_lengths'] = (key_value_seq_lengths, query_split(
             ("activation_batch",), key_value_seq_lengths, queries, query.shape))
     if dropout_seed is not None:
@@ -490,8 +492,6 @@ def gathered_keys_attention(kernel, query, key, value, shards: int, *, causal,
         extras['dropout_heads'] = (jnp.arange(query.shape[2]), P(_entry(queries, 2)))
         extras['dropout_queries'] = (positions, P(_entry(queries, 1)))
     if visibility:
-        for name, ids in visibility.items():
-            _check_rows(name, ids, query.shape[0])
         extras.update(_striped_visibility(visibility, shards, q_len, queries, query.shape[0]))
 
     def local(query, key, value, *arrays):

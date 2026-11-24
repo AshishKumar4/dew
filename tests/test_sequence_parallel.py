@@ -438,20 +438,40 @@ def _cross_draw(seed):
     return query[:4, :4], key[:4, :4], value[:4, :4], cotangent[:4, :4]
 
 
-@pytest.mark.mesh
-def test_equal_length_cross_documents_through_the_gather_keep_their_alignment():
-    """Causal cross documents of equal lengths (queries `[1, 2, 2, 2]` over keys `[1, 1, 2, 2]`) through the
-    gather align each query to its document's last keys (query 0 sees keys 0 and 1), taken as their mask
-    (`attention_parallel.ALIGNED_GATHERED`), where the striped indices as slots overwrote the alignment and
-    query 0 saw key 0 alone (review of #4052): on par with the whole call, forward and backward."""
+def _documents(rows: int):
+    """Cross documents of equal lengths, `rows` rows: queries `[1, 2, 2, 2]` over keys `[1, 1, 2, 2]`."""
     from dew.nn.documents import CrossDocuments
 
-    documents = CrossDocuments(jnp.asarray([[1, 2, 2, 2]] * 4, jnp.int32),
-                               jnp.asarray([[1, 1, 2, 2]] * 4, jnp.int32))
-    call = {"causal": True, "segment_ids": documents, "implementation": "reference"}
-    entry = with_gradients(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call))
-    assert_exchanged_on_par(entry, entry, SHARED, _cross_draw,
-                            "equal-length cross documents through the gather")
+    return CrossDocuments(jnp.asarray([[1, 2, 2, 2]] * rows, jnp.int32),
+                          jnp.asarray([[1, 1, 2, 2]] * rows, jnp.int32))
+
+
+@pytest.mark.mesh
+@pytest.mark.parametrize("implementation", ["reference", "cudnn"])
+def test_equal_length_cross_documents_through_the_gather_keep_their_alignment(implementation):
+    """Causal cross documents of equal lengths through the gather align each query to its document's last
+    keys (query 0 sees keys 0 and 1), taken as their mask (`attention_parallel.ALIGNED_GATHERED`), where the
+    striped indices as slots overwrote the alignment and query 0 saw key 0 alone (review of #4052); a call
+    naming cuDNN runs that mask on the masked kernel (`kernel_for_materialized_mask`; review of #4053): on
+    par with the whole call's xla, forward and backward."""
+    def attend(name):
+        call = {"causal": True, "segment_ids": _documents(4), "implementation": name}
+        return with_gradients(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call))
+
+    assert_exchanged_on_par(attend(implementation), attend("reference" if implementation == "reference"
+                                                          else "xla"), SHARED, _cross_draw,
+                            f"equal-length cross documents through the gather, {implementation}")
+
+
+@pytest.mark.mesh
+def test_documents_of_another_batch_are_refused_before_their_mask():
+    """Cross documents of two rows beside a batch of four, its rows split two ways, are refused before the
+    gather's masked route folds them into a mask, where that `[2, 1, 4, 4]` mask replicated and rows two and
+    three read rows zero and one's documents (review of #4053)."""
+    query, key, value, _ = _cross_draw(0)
+    call = {"causal": True, "segment_ids": _documents(2), "implementation": "reference"}
+    with jax.set_mesh(SHARED.build()), pytest.raises(ValueError):
+        jax.jit(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call)).trace(query, key, value)
 
 
 @pytest.mark.mesh
