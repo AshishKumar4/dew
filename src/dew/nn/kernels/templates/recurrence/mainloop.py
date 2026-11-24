@@ -751,8 +751,8 @@ class Launch:
     registers a consumer thread holds at its program's peak (`resources.live_registers` of the tiles it
     states), the chunks in flight, the bytes a step streams in, the programs a multiprocessor holds of it at
     once (`resources.plan`; zero where it holds none, a config past the device), its consumer roles, and the
-    bundle it issues by (`family`: the call's, or the layout a launch takes for itself, `widest_layout`), which
-    every check of it reads."""
+    bundle it issues by (`family`: the call's, or the layout a launch takes for itself, `widest_layout`),
+    which every check of it reads."""
 
     name: str
     programs: int
