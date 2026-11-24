@@ -16,7 +16,7 @@ from jax.core import Tracer
 from dew.nn import float_bits, precision
 from dew.nn.derivatives import KernelGlue, contracted, surrogate
 from dew.nn.kernels import gemm, generation, grouped_matmul, selection, xla_products
-from dew.nn.kernels.formats import TernaryWeights, fp8_factor, fp8_scale_checked
+from dew.nn.kernels.formats import TernaryWeights, scale_checked, scale_factor
 from dew.nn.kernels.templates.gemm.factored import factored
 from dew.nn.sharding import automatic_axes
 
@@ -76,7 +76,7 @@ def ternary_weight_product(lhs: jax.Array, weights: TernaryWeights, group_sizes:
     if not isinstance(weights.form, Tracer):
         weights.checked()
     else:
-        fp8_scale_checked(jnp.shape(weights.scale), weights.shape)
+        scale_checked(jnp.shape(weights.scale), weights.shape)
     dense = group_sizes is None
     if (dense and len(weights.shape) != 2) or (not dense and len(weights.shape) != 3):
         raise ValueError(f"ternary_weight_product weight rank mismatch for dense={dense}: {weights.shape}")
@@ -114,7 +114,7 @@ def ternary_weight_product(lhs: jax.Array, weights: TernaryWeights, group_sizes:
         return run(rows_bf16, *operands)
 
     def factor_of(scale_arr: jax.Array) -> jax.Array:
-        return fp8_factor(jnp.asarray(scale_arr, jnp.float32), sizes, lhs.shape[0], weights.shape, dense)
+        return scale_factor(jnp.asarray(scale_arr, jnp.float32), sizes, lhs.shape[0], weights.shape, dense)
 
     scale_f32 = jnp.asarray(weights.scale, jnp.float32)
     if not quantize_activations:

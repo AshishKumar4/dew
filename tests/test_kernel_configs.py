@@ -753,12 +753,29 @@ def _gate_forms(generation_name: str) -> set[str]:
 
 
 def _gate_cases(generation_name: str, form: str) -> list:
-    """A form's cases at every projection, each at the tile its launch settles on as a call
-    (`_gemm_mainloop_cases`' `settled`): each call its own, as two calls that derive one tile may settle on
-    two (certification refuses a launch by its whole call), a module compiled once a process however many
-    cases emit it. Derived where they compile, in the gate's refusals (`report.refusals`)."""
-    return [case for shape in GEMM_SHAPES
-            for case in _gemm_mainloop_cases(generation_name, shape, form=form, settled=True)]
+    """A form's cases at the projections whose calls differ in what their kernels are built from, each at
+    the tile its launch settles on as a call (`_gemm_mainloop_cases`' `settled`): one projection of each
+    derived tile and boundary (`_boundary`), a call the gate traces whole (certification settles a tile by
+    its whole call), not every projection that derives the same tile over the same boundaries again. Derived
+    where they compile, in the gate's refusals (`report.refusals`)."""
+    kept: dict = {}
+    for shape in GEMM_SHAPES:
+        for case in _gemm_mainloop_cases(generation_name, shape, form=form, settled=True):
+            kept.setdefault((repr(case.tile), _boundary(GEMM_SHAPES[shape], case.tile)), case)
+    return list(kept.values())
+
+
+def _boundary(extents: tuple[int, int, int, int], tile) -> tuple:
+    """What a projection's `(rows, depth, width, groups)` asks of a launch's kernels at `tile` beyond the
+    tile: dense or grouped, a group's rows under one tile (a decode step's), and its depth and width whole
+    tiles, partial ones in whole 16-byte rows, or padded (`mosaic_gpu.partial_runs`,
+    `grouped_matmul._Mosaic._aligned`)."""
+    rows, depth, width, groups = extents
+
+    def edge(extent: int, block: int) -> str:
+        return "whole" if extent % block == 0 else "partial" if extent * 2 % 16 == 0 else "padded"
+
+    return (groups == 1, rows // groups < tile.block_m, edge(depth, tile.block_k), edge(width, tile.block_n))
 
 
 def _by_form(names: tuple[str, ...], forms_of: Callable[[str], set[str]]) -> list:
