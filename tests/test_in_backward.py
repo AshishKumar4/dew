@@ -330,8 +330,8 @@ def _layer_weights(variables, laid) -> dict:
 
 class _Substituted(LMObjective):
     """An LM whose model reads each layer's query projection as a constant in place of the weight, drawn
-    as an initializer draws one (a fixed normal draw of 0.02's spread), read from nothing of the state: the
-    weight's gradient none, the constant's no weight's."""
+    as an initializer draws one (a fixed normal draw of 0.02's spread, each layer's the same), read from
+    nothing of the state: the weight's gradient none, the constant's no weight's."""
 
     def loss(self, variables, batch, step):
         def substituted(node):
@@ -339,8 +339,10 @@ class _Substituted(LMObjective):
                 return node
             held = {key: substituted(value) for key, value in node.items()}
             if "q_proj" in held:
-                held["q_proj"] = jax.tree.map(lambda leaf: jnp.asarray(
-                    np.random.default_rng(0).normal(0.0, 0.02, leaf.shape), leaf.dtype), held["q_proj"])
+                # One draw of a layer's shape, every layer's alike, read a layer at a time or stacked.
+                held["q_proj"] = jax.tree.map(lambda leaf: jnp.broadcast_to(jnp.asarray(
+                    np.random.default_rng(0).normal(0.0, 0.02, leaf.shape[-2:]), leaf.dtype), leaf.shape),
+                    held["q_proj"])
             return held
         return super().loss({**variables, "params": substituted(variables["params"])}, batch, step)
 
