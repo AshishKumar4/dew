@@ -66,6 +66,14 @@ def still(reads: Facts) -> bool:
     return all(asked() == answer for asked, answer in reads.values())
 
 
+def of(fact: Callable, reads: Facts) -> Facts:
+    """The facts of `reads` that `fact`, a declared fact (`traced_fact`), answered: what a holder judges
+    of a value by one fact alone (a program's executables by the refusals of the launches its trace read,
+    `dew.nn.kernels.options`)."""
+    name = f"{fact.__module__}.{fact.__qualname__}"
+    return {key: answered for key, answered in reads.items() if isinstance(key, tuple) and key[0] == name}
+
+
 def replay(reads: Facts) -> None:
     """`reads`, a held value's (`recording`'s), recorded into each open recording, as if read again: a trace
     taking a held value read what its making read."""

@@ -501,3 +501,174 @@ def test_a_program_of_a_static_argument_counted_from_the_end_binds_its_dynamic_o
 
     run = owned_program(lambda x, mode: x * 2.0 if mode == "double" else x, static_argnums=-1)
     assert float(jax.jit(lambda y: run(y, "double"))(jnp.ones(()))) == 2.0
+
+
+def test_a_programs_executable_stands_past_a_refusal_of_a_launch_its_trace_read_none_of():
+    """A program run, then a launch its trace reads none of refused: its next call runs the executable it
+    holds, compiling none (rows 12311, 12328: every program's key held the whole registry, so any refusal,
+    an evaluation's spill among them, compiled the training step again); once a launch it reads is refused,
+    it runs one of its own past the refusal."""
+    from dew.nn.kernels.options import owned_program
+    from dew.nn.kernels.templates import report
+
+    run, x = owned_program(lambda x: x + (1.0 if report.refusals_of("a launch") else 0.0)), jnp.zeros(())
+    with report.refusals():
+        first = run.executable(x)
+        assert float(run(x)) == 0.0
+        report.refuse([("another launch", 1, ("k",))])
+        assert run.executable(x) is first
+        assert float(run(x)) == 0.0
+        report.refuse([("a launch", 1, ("k",))])
+        assert run.executable(x) is not first
+        assert float(run(x)) == 1.0
+
+
+def test_a_program_called_in_two_refusal_scopes_keeps_an_executable_for_each():
+    """A program called in turn in a scope that refused a launch its trace reads and in one that refused
+    none: each scope's call runs the executable its first call compiled, neither compiled again by the
+    other's (rows 12311, 12328: an executable held by the refusals its trace read, one a key)."""
+    from dew.nn.kernels.options import owned_program
+    from dew.nn.kernels.templates import report
+
+    run, x = owned_program(lambda x: x + (1.0 if report.refusals_of("a launch") else 0.0)), jnp.zeros(())
+    with report.refusals():
+        report.refuse([("a launch", 1, ("k",))])
+        refused = run.executable(x)
+    with report.refusals():
+        clear = run.executable(x)
+    for _ in range(2):
+        with report.refusals():
+            report.refuse([("a launch", 1, ("k",))])
+            assert run.executable(x) is refused
+            assert float(run(x)) == 1.0
+        with report.refusals():
+            assert run.executable(x) is clear
+            assert float(run(x)) == 0.0
+
+
+def test_a_compile_begun_aside_is_taken_past_a_refusal_of_a_launch_it_read_none_of():
+    """A program's compile begun aside (`options.compiling`), then a launch its trace reads none of refused:
+    the program compiled after takes the begun compile (`attempting`), lowering nothing again (row 12311:
+    the run start's begun compile no longer matched once the step's planning refused a launch, and the
+    start compiled twice)."""
+    from dew.nn.kernels import options
+    from dew.nn.kernels.templates import report
+
+    run = options.owned_program(lambda x: x + (1.0 if report.refusals_of("a launch") else 0.0))
+    x = jnp.zeros(())
+    with report.refusals():
+        begun = options.compiling(run, x)
+        report.refuse([("another launch", 1, ("k",))])
+        with options.attempting(begun):
+            assert float(run.compiled(x)(x)) == 0.0
+        assert begun.taken.is_set()
+
+
+@pytest.mark.parametrize("refused", [False, True], ids=["unrefused", "refused"])
+def test_a_programs_executable_holds_its_other_facts_still(refused):
+    """A program run under one answer of a fact its trace reads (`_facts.traced_fact`), the fact then
+    answering otherwise, alone or beside a refusal of a launch its trace reads none of: its next call runs a
+    program of the fact's answer now, its executable judged by every fact its trace read (rows 12311, 12328's
+    review P0s: judged by the refusals alone where they moved, and by the snapshot alone where they did not,
+    the program of the first answer ran on)."""
+    from dew.nn.kernels.options import owned_program
+    from dew.nn.kernels.templates import report
+
+    answer = [0]
+
+    @_facts.traced_fact
+    def flag() -> int:
+        return answer[0]
+
+    run, x = owned_program(lambda x: x + flag()), jnp.zeros(())
+    with report.refusals():
+        assert float(run(x)) == 0.0
+        answer[0] = 1
+        if refused:
+            report.refuse([("another launch", 1, ("k",))])
+        assert float(run(x)) == 1.0
+
+
+def test_a_compile_settled_under_a_snapshot_is_compiled_again_where_its_facts_answer_otherwise():
+    """A program compiled in a scope of no refusal, run past a refusal of a launch its trace reads none of,
+    then, a fact its trace reads answering otherwise, called in another scope of none: it runs a program of
+    the fact's answer now, the compile its first call settled under that snapshot let go (rows 12311,
+    12328's review P0: the completed reservation answered the call with the program of the first answer)."""
+    from dew.nn.kernels.options import owned_program
+    from dew.nn.kernels.templates import report
+
+    answer = [0]
+
+    @_facts.traced_fact
+    def flag() -> int:
+        return answer[0]
+
+    run, x = owned_program(lambda x: x + flag()), jnp.zeros(())
+    with report.refusals():
+        assert float(run(x)) == 0.0
+        report.refuse([("another launch", 1, ("k",))])
+        assert float(run(x)) == 0.0
+    answer[0] = 1
+    with report.refusals():
+        assert float(run(x)) == 1.0
+
+
+def test_a_fact_whose_reader_traces_the_program_is_judged_past_the_programs_lock():
+    """A fact a program's trace reads (`_facts.traced_fact`) whose reader traces the program itself at another
+    shape (`trace`, which takes the program's lock), then answering otherwise: the program's next call
+    judges its executable and its settled compile by the fact, the reader tracing again, and runs a program
+    of the fact's answer now (rows 12311, 12328's review P0: judged under the program's lock, the reader's
+    trace waited on it without end)."""
+    import threading
+
+    from dew.nn.kernels.options import owned_program
+    from dew.nn.kernels.templates import report
+
+    answer, reentering, inside = [0], [], []
+
+    @_facts.traced_fact
+    def flag() -> int:
+        if reentering and not inside:
+            inside.append(True)
+            try:
+                run.trace(jnp.zeros((2,)))
+            finally:
+                inside.pop()
+        return answer[0]
+
+    run, x = owned_program(lambda x: x + flag()), jnp.zeros(())
+    ran: list[float] = []
+    entered = _cache.carried()
+
+    def called() -> None:
+        with entered(), report.refusals():
+            ran.append(float(run(x)))
+            answer[0] = 1
+            reentering.append(True)
+            ran.append(float(run(x)))
+
+    running = threading.Thread(target=called, daemon=True)
+    running.start()
+    running.join(timeout=120)
+    assert ran == [0.0, 1.0], "the call waited on the program's lock without end"
+
+
+def test_a_call_within_a_block_compiled_together_answers_by_its_facts_now():
+    """A program called twice within `compiled_together`, a fact its trace reads (`_facts.traced_fact`)
+    answering otherwise between the calls: the second answers with the shapes of a program of the fact's
+    answer now, and the block compiles that program, which the call after it runs (rows 12311, 12328's review
+    P0: the block's first lowering answered both, its shapes stale)."""
+    from dew.nn.kernels import options
+
+    answer = [0]
+
+    @_facts.traced_fact
+    def flag() -> int:
+        return answer[0]
+
+    run, x = options.owned_program(lambda x: x[:1 + flag()]), jnp.zeros((4,))
+    with options.compiled_together():
+        assert run(x).shape == (1,)
+        answer[0] = 1
+        assert run(x).shape == (2,)
+    assert run(x).shape == (2,)
