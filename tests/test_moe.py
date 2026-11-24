@@ -676,8 +676,9 @@ def test_a_gated_expert_layer_is_bitwise_its_projections_apart(limit):
     def rows_gradient(form, dtype=None):
         def gradient(x, gate, up, down, cotangent):
             def loss(x):
-                return jnp.sum(form(x, gate, up, down, limit=limit).astype(jnp.float32)
-                               * cotangent.astype(jnp.float32))
+                out = form(x, gate, up, down, limit=limit)
+                wide = jnp.promote_types(out.dtype, jnp.float32)
+                return jnp.sum(out.astype(wide) * cotangent.astype(wide))
             return jax.grad(loss)(x if dtype is None else x.astype(dtype))
         return gradient
 
@@ -714,7 +715,8 @@ def test_a_gated_expert_layer_runs_its_chain_on_mosaic_gpu_under_a_declared_swig
     assert sum(arguments["hooks"].epilogue is not None for arguments in bound
                if arguments.get("paired") is not None) == 1, bound
     depth = operands[0].shape[-1]
-    assert any(arguments["hooks"].prologue is not None and arguments["kernel"].shape[-1] == depth
+    assert any(arguments.get("hooks") is not None and arguments["hooks"].prologue is not None
+               and arguments.get("kernel") is not None and arguments["kernel"].shape[-1] == depth
                for arguments in bound), bound
 
 
