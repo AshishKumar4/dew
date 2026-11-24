@@ -400,8 +400,8 @@ class ForwardRegisters:
     positions: int = 0
     per_span: int = 1
     runs: int = 1
-    """The key runs a query's visible keys are the union of (`MosaicForward.runs`): a walk of more than one
-    holds each further run's bounds across its key loop (`_runs_bounds`)."""
+    """The key runs a query's visible keys are the union of (`MosaicForward.registered`'s `start`): a walk
+    of more than one holds each further run's bounds across its key loop (`_runs_bounds`)."""
     merged: bool = False
     started: bool = False
     dropped: bool = False
