@@ -9,9 +9,9 @@ moment of the keys and erasing along the keys themselves,
 `A` a key head's vector over its key dimensions (shared by its value heads), `c` a key head's learned center
 (fla's `log_atk_scale`, -0.2 by default), `x` the squash's range (1.5) and the queries and keys l2-normalized
 first, as fla's in-kernel norm takes them. ATK's scan is the diagonal recurrence of every channel decaying
-alone (`diagonal.diagonal_scan`); the delta rule's write along `p` and erase along `k` the chunked op's untied
-erase (`recurrence.Hooks.erase` 'untied': its erase vector the write key `p`, its read `k`). A packed
-document's first token enters both states at zero."""
+alone (`diagonal.diagonal_scan`); the delta rule's write along `p` corrected along `k` the chunked op's read
+erase (`recurrence.Hooks.erase` 'read': its keys `p`, its read `k`, the correction `v - k^T D S` one write).
+A packed document's first token enters both states at zero."""
 
 from __future__ import annotations
 
@@ -62,8 +62,8 @@ def preconditioned_delta_rule(query, key, value, log_decay, beta, atk_decay, atk
     query, key = l2norm(query), l2norm(key)
     written, moment = preconditioned_keys(key, atk_decay, atk_beta, atk_state, starts, center=center, x=x,
                                           eps=eps)
-    hooks = recurrence.Hooks(decay='vector' if log_decay.ndim == 4 else 'scalar', erase='untied',
+    hooks = recurrence.Hooks(decay='vector' if log_decay.ndim == 4 else 'scalar', erase='read',
                              scale=width ** -0.5 if scale is None else scale)
-    out, final = chunk(hooks, Chunk(query, written, value, log_decay=log_decay, beta=beta, erase_key=written,
-                                    erase_read=key, state=state, starts=starts), chunk_size=chunk_size)
+    out, final = chunk(hooks, Chunk(query, written, value, log_decay=log_decay, beta=beta, erase_read=key,
+                                    state=state, starts=starts), chunk_size=chunk_size)
     return out.astype(value.dtype), (final, moment)

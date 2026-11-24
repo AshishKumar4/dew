@@ -65,7 +65,7 @@ class Conv:
 
 
 
-Erase = Literal['tied', 'untied', 'additive', 'values']
+Erase = Literal['tied', 'read', 'untied', 'additive', 'values']
 """What the delta rule erases a token (`Hooks.erase`)."""
 
 @dataclasses.dataclass(frozen=True)
@@ -129,12 +129,14 @@ class Hooks:
     turn's), unrated, without the delta rule or an own write's weight, its readout after the token's turn
     ('after' or 'apart'; base review fbb1c2f71 F1). `erase` is the delta rule's transition beside its decay
     (kernel-templates.md §3's erase kinds): 'tied', its keys' own, `S' = (I - beta k k^T) D S + beta k v^T`;
-    'untied', erase vectors of their own (`Gated.erase_key` `a`, `erase_read` `b`: GDN-2's, Comba's), `S' =
-    (I - beta a b^T) D S + beta k v^T`; 'additive', RWKV7's diagonal plus low rank, `S' = (D - a b^T) S +
-    beta k v^T`; 'values', Oja's rule's, erasing along the values under a decay along them (`log_decay`
-    `[..., Hv, Dv]`), `S' = S D (I - beta v v^T) + beta k v^T`. `value_decay`, without the delta rule,
-    decays the values' side too (two-sided GLA's value gates, `Gated.value_decay` `[..., Hv, Dv]`), `S' = D
-    S E + beta k v^T`."""
+    'read', its keys erasing along a read of its own (`Gated.erase_read` `b`: the preconditioned delta rules',
+    their keys preconditioned, `preconditioned.preconditioned_delta_rule`), `S' = (I - beta k b^T) D S + beta
+    k v^T`, the correction `v - b^T D S` one write; 'untied', erase vectors of their own (`Gated.erase_key`
+    `a`, `erase_read` `b`: GDN-2's, Comba's), `S' = (I - beta a b^T) D S + beta k v^T`; 'additive', RWKV7's
+    diagonal plus low rank, `S' = (D - a b^T) S + beta k v^T`; 'values', Oja's rule's, erasing along the
+    values under a decay along them (`log_decay` `[..., Hv, Dv]`), `S' = S D (I - beta v v^T) + beta k v^T`.
+    `value_decay`, without the delta rule, decays the values' side too (two-sided GLA's value gates,
+    `Gated.value_decay` `[..., Hv, Dv]`), `S' = D S E + beta k v^T`."""
     conv: Conv | None = None
     l2norm: bool = False
     scale: float | None = None
@@ -222,8 +224,9 @@ class Hooks:
             raise ValueError('the gates form one log decay a head: their decay is scalar')
         if self.rated and (self.decay != 'scalar' or self.gates is not None):
             raise ValueError('a rated decay is one a head without the gates, which rate their own')
-        if self.erase not in ('tied', 'untied', 'additive', 'values'):
-            raise ValueError(f"an erase is 'tied', 'untied', 'additive' or 'values', not {self.erase!r}")
+        if self.erase not in ('tied', 'read', 'untied', 'additive', 'values'):
+            raise ValueError(f"an erase is 'tied', 'read', 'untied', 'additive' or 'values', not "
+                             f"{self.erase!r}")
         if self.erase != 'tied' and not self.delta:
             raise ValueError(f"an erase of its own is the delta rule's: not {self}")
         if self.value_decay and (self.delta or self.erase != 'tied'):
@@ -279,7 +282,7 @@ def salted_bf16(state, key, value):
 
 
 def update(state, query, key, value, decay, write, *, delta: bool, reads: Reads = 'after', own=None,
-           turn=None, erase=None, additive: bool = False, across=None):
+           turn=None, erase=None, additive: bool = False, across=None, reader=None):
     """One token over a state `[..., Dk, Dv]` in its working dtype, `decay` its decay per key dimension `[...,
     Dk]` or a head's `[..., 1]` (`exp(g)`) and `write` the write gate `[..., 1]`, a head's one: its output
     `[..., Dv]` and the updated state `S' = g S + (beta k) c^T`, `c = v - (g k)^T S` the delta rule's
@@ -309,7 +312,8 @@ def update(state, query, key, value, decay, write, *, delta: bool, reads: Reads 
     given, erases with vectors of its own (`Hooks.erase` 'untied': `-(beta a) (b^T D S)`; with `additive`,
     'additive': `-a (b^T S)`) where the delta rule's correction takes its keys', the token writing its values
     as they are; `across` `[..., Dv]`, where given, decays the state's values' side too (`Hooks.value_decay`,
-    `D S E`)."""
+    `D S E`); `reader` `[..., Dk]`, where given, the vector the delta rule's correction reads the state along
+    in place of its key (`Hooks.erase` 'read', `v - (g b)^T S`)."""
     def read(x, rows):
         return jnp.sum(x[..., :, None] * rows, axis=-2)
 
@@ -318,7 +322,8 @@ def update(state, query, key, value, decay, write, *, delta: bool, reads: Reads 
         state = turned(state, turn[..., None, :], axis=-2)
     if across is not None:
         state = state * across[..., None, :]
-    corrected = value - read(key * decay, state) if delta and erase is None else value
+    corrected = (value - read((key if reader is None else reader) * decay, state) if delta and erase is None
+                 else value)
     outer = jnp.swapaxes(corrected[..., :, None] * (key * write)[..., None, :], -1, -2)
     if erase is not None:
         target, reader = erase
@@ -445,7 +450,8 @@ def _names(hooks: Hooks) -> tuple[str, ...]:
         gates = ('rate', 'beta')
     else:
         gates = ('log_decay',) * (hooks.decay != 'none') + ('beta',) * hooks.gated_write
-    erasing = ('erase_key', 'erase_read') if hooks.erase in ('untied', 'additive') else ()
+    erasing = (('erase_key', 'erase_read') if hooks.erase in ('untied', 'additive')
+               else ('erase_read',) if hooks.erase == 'read' else ())
     return (*streams, *gates, *erasing, *('value_decay',) * hooks.value_decay, *('turn',) * bool(hooks.turns),
             *('own',) * hooks.own_weight,
             *('skip',) * hooks.skip,
@@ -638,7 +644,7 @@ def step_reference(hooks: Hooks, operands: Step, *, dtype=None):
                               delta=hooks.delta, reads=hooks.reads, own=own, turn=turn,
                               erase=_erasing(hooks, given, work), additive=hooks.erase == 'additive',
                               across=accurate_exp(given['value_decay'].astype(work)) if hooks.value_decay
-                              else None)
+                              else None, reader=_reader(hooks, given, work))
     out = normed(hooks, skipped(hooks, out, value, given, work), given, work)
     held = _held(updated, key, value, state.dtype)
     if operands.active is not None:
@@ -683,6 +689,15 @@ def _erasing(hooks: Hooks, given: dict, work):
         return None
     group = given['state'].shape[1] // given['erase_key'].shape[1]
     return tuple(jnp.repeat(given[name].astype(work), group, axis=1) for name in ('erase_key', 'erase_read'))
+
+
+def _reader(hooks: Hooks, given: dict, work):
+    """A decode token's read vector `b` `[rows, Hv, Dk]` (`Hooks.erase` 'read'), in `work`, each key head's
+    over its value heads as the keys are; None for the keys' own."""
+    if hooks.erase != 'read':
+        return None
+    group = given['state'].shape[1] // given['erase_read'].shape[1]
+    return jnp.repeat(given['erase_read'].astype(work), group, axis=1)
 
 
 def _values_erased(hooks: Hooks, given: dict, state, query, key, value, work):
