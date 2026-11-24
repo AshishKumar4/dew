@@ -114,12 +114,19 @@ def _formed(tokens: jax.Array, prologue_operands: tuple, hooks: Hooks) -> jax.Ar
     XLA before the call in the tokens' dtype, as `gemm`'s portable program forms them (the copy a call naming
     CUTLASS takes where the template forms them tile by tile: an input-scaled MoE's rows times their routing
     weights, models-28's review). Rows read through tables hand on before a CUTLASS launch
-    (`grouped_matmul`'s 'tables' need)."""
-    prologue = hooks.before()
+    (`grouped_matmul`'s 'tables' need). Its side operands' dimensions of one the launch squeezed out
+    (`Hooks.prologue_broadcast`) come back as dimensions of one, the arrays the call was given, where a
+    kernel's tile broadcasts them across its own (`Hooks.before`): a `[rows, 1]` side a hook reduces along
+    its singleton reads one value a row, as the portable program's (#3985's review). As that program, it
+    forms the whole array at once, every row through the hook (`gemm`'s hooks act on each row's values)."""
+    prologue = hooks.prologue
     if prologue is None:
         return tokens
     assert callable(prologue), prologue
-    return jnp.asarray(prologue(tokens, *prologue_operands), tokens.dtype)
+    positions = hooks.prologue_broadcast or ((),) * len(prologue_operands)
+    sides = tuple(jnp.expand_dims(side, where) if where else side
+                  for side, where in zip(prologue_operands, positions, strict=True))
+    return jnp.asarray(prologue(tokens, *sides), tokens.dtype)
 
 
 @dataclasses.dataclass(frozen=True)

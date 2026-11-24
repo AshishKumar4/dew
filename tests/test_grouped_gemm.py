@@ -36,6 +36,7 @@ from dew.nn.kernels import (
     tuning,
 )
 from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing, row_tiles, tiling
+from dew.nn.kernels.templates.gemm.hooks import Hooks
 from dew.nn.moe import expert_projection
 
 pytestmark = pytest.mark.kernel
@@ -285,12 +286,15 @@ def test_cutlass_eligibility_reads_the_dew_cutlass_build_installed_now(tmp_path,
     assert ampere["sm80"] == "sm80" and grouped_cutlass.cutlass_built_for("sm80") == "sm80"
 
 
-def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes, stacked=False):
+def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes, stacked=False, prologued=False):
     """Where the installed dew-cutlass holds this GPU's kernels, the projection's forward and both
     gradients through CUTLASS's launches, chosen by name and the forward's kernel pinned, are as exact as
     XLA's ragged dot from float64, unrouted rows and empty groups included. `stacked`, its matrices the
     second layer of a stack the call reads from its layer's first (a scanned stack's, `gemm._grouped`),
-    which a pinned CUTLASS launch takes as a slice of the stack (row 4074's review)."""
+    which a pinned CUTLASS launch takes as a slice of the stack (row 4074's review). `prologued`, its rows
+    scaled by a side of one value a row, `[rows, 1]` (an input-scaled MoE's routing weights), which a
+    CUTLASS launch forms in XLA before its call (`grouped_cutlass._formed`), its gradient compared too
+    (#3985's review)."""
     # The wheel is optional: a process without it, or whose wheel holds no kernel for its GPU, runs the
     # template's launches, which the suite checks apart.
     here = generation.gpu_target().generation
@@ -300,7 +304,13 @@ def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes, stacked=Fa
 
     def draw(seed):
         x, w, dy, _ = operands(SIZES[sizes], jnp.bfloat16, seed)
-        return tuple(np.asarray(value, jnp.bfloat16) for value in (x, w, dy))
+        weights = np.random.default_rng(seed).uniform(0.5, 1.5, size=(x.shape[0], 1)).astype(np.float32)
+        return (*(np.asarray(value, jnp.bfloat16) for value in (x, w)), weights, np.asarray(dy, jnp.bfloat16))
+
+    def scaled(x, w, weights, dtype=jnp.bfloat16):
+        return gemm.gemm(x.astype(dtype), w.astype(dtype), jnp.asarray(group_sizes, jnp.int32),
+                         prologue=lambda rows, s: rows * s.astype(rows.dtype),
+                         prologue_operands=((weights.astype(dtype), ("rows", None)),), out_dtype=dtype)
 
     def projection(implementation, dtype=jnp.bfloat16):
         return lambda x, w: expert_projection(x, w, jnp.asarray(group_sizes, jnp.int32), dtype,
@@ -314,20 +324,26 @@ def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes, stacked=Fa
         return gemm.gemm(x, stack, jnp.asarray(group_sizes, jnp.int32), layer=jnp.int32(1),
                          out_dtype=jnp.bfloat16)
 
-    def through_cutlass(x, w, dy):
+    def through_cutlass(x, w, weights, dy):
         with generation.chosen(grouped_matmul="cutlass"), tuning.pinned(pinned):
+            if prologued:
+                return with_gradients(scaled)(x, w, weights, dy)
             if not stacked:
                 return with_gradients(projection("pallas"))(x, w, dy)
             # The whole stack differentiated: its other layer's gradient zero, its layer's the projection's.
             out, d_x, d_stack = with_gradients(layer_of_a_stack)(x, jnp.stack([jnp.ones_like(w), w]), dy)
             return out, d_x, d_stack[1], d_stack[0]
 
-    def plain(x, w, dy, dtype=jnp.bfloat16):
+    def plain(x, w, weights, dy, dtype=jnp.bfloat16):
+        if prologued:
+            with generation.chosen(grouped_matmul="xla"):
+                return with_gradients(functools.partial(scaled, dtype=dtype))(x, w, weights, dy)
         out, d_x, d_w = with_gradients(projection("xla", dtype))(x, w, dy)
         return (out, d_x, d_w, *((jnp.zeros_like(d_w),) if stacked else ()))
 
     assert_as_exact(jax.jit(through_cutlass), jax.jit(plain), draw,
-                    f"cutlass {sizes}{' stacked' if stacked else ''}", seeds=SEEDS,
+                    f"cutlass {sizes}{' stacked' if stacked else ''}{' prologued' if prologued else ''}",
+                    seeds=SEEDS,
                     truth_fn=functools.partial(plain, dtype=jnp.float64))
 
 
@@ -2454,3 +2470,23 @@ def test_a_call_naming_cutlass_takes_its_rows_through_a_prologue(monkeypatch):
     targets = [eqn.params["target_name"] for eqn in equations(graph, platform="cuda")
                if eqn.primitive.name == "ffi_call"]
     assert sorted(set(targets)) == ["dew_cutlass_gmm", "dew_cutlass_tgmm"], targets
+
+
+def test_a_cutlass_launch_forms_a_singleton_sides_rows_as_xla_forms_them():
+    """The rows a CUTLASS launch multiplies, formed by XLA before it (`grouped_cutlass._formed`), from a side
+    of one value a row given `[rows, 1]` (axes `('rows', None)`) and a prologue reducing along that singleton:
+    the launch's squeezed side given back as `[rows, 1]`, so the formed rows are the prologue of the call's
+    own arrays, as the portable program forms them, where a kernel tile's broadcast of it across the depth
+    read `depth` times the scale (#3985's review)."""
+    rng = np.random.default_rng(3985)
+    rows = jnp.asarray(rng.normal(size=(64, 32)), jnp.bfloat16)
+    scale = jnp.asarray(rng.normal(size=(64, 1)), jnp.float32)
+
+    def prologue(x, s):
+        return x * s.sum(axis=1, keepdims=True)
+
+    squeezed, axes, positions = gemm._launchable((scale,), (("rows", None),))
+    hooks = Hooks(prologue, axes, prologue_broadcast=positions)
+    formed = grouped_cutlass._formed(rows, squeezed, hooks)
+    want = prologue(rows, scale).astype(jnp.bfloat16)
+    np.testing.assert_array_equal(np.asarray(formed).view(np.uint16), np.asarray(want).view(np.uint16))
