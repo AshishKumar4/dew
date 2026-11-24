@@ -119,16 +119,20 @@ def earlier_grouped_pins(record: Mapping[str, object]) -> Mapping[str, object]:
     return chosen_kernel(record, "syrk", pinned)
 
 
-def _kernel_pins(record: Mapping[str, object]) -> tuple[Mapping, object, Mapping] | None:
+type _Pins = tuple[Mapping[str, object], Mapping[str, object] | None, Mapping[str, object]]
+
+
+def _kernel_pins(record: Mapping[str, object]) -> _Pins | None:
     """A saved run's record's fields, its diagnostics (a mapping, a class record, or absent) and the mapping
     that holds its kernel pins (`kernels`): its diagnostics' fields, its diagnostics, or, a record of
     before its diagnostics held them, its own fields; None where it holds no fields."""
     fields = record.get("fields")
     if not isinstance(fields, Mapping):
         return None
-    diagnostics = fields.get("diagnostics")
-    named = _records.class_record(diagnostics) if isinstance(diagnostics, Mapping) else None
-    pins = named[1] if named is not None else diagnostics if isinstance(diagnostics, Mapping) else fields
+    held = fields.get("diagnostics")
+    diagnostics = held if isinstance(held, Mapping) else None
+    named = _records.class_record(diagnostics) if diagnostics is not None else None
+    pins = named[1] if named is not None else diagnostics if diagnostics is not None else fields
     return fields, diagnostics, pins
 
 
