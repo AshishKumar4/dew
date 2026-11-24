@@ -157,7 +157,7 @@ signature; None while one is lowered, or where its lowering failed."""
 _AHEAD_LOCK = threading.Lock()
 
 
-def compile_ahead(key: tuple, made: Callable[[], Callable], *args, what: str, **kwargs) -> None:
+def compile_ahead(key: tuple, made: Callable[[], options.OuterProgram], *args, what: str, **kwargs) -> None:
     """Lower the program `made()` builds over `*args` and `**kwargs` here and compile it in a thread of its
     own (`options.compiling`), once a process for its cache directory and `key` (built only then, so a later
     save builds none), so the program is in the persistent compilation cache when a run resumes from the

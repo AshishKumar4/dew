@@ -1568,16 +1568,16 @@ class CausalTransformer(LinearProducts):
             first_out = None
             extra = {} if prior_bank is None else {'prior_bank': prior_bank}
             for (index, scanned_run), held in zip(steps, shapes, strict=True):
-                result = self.layers[index].apply(
+                stepped = self.layers[index].apply(
                     held, carry, mutable=opened, capture_intermediates=capture,
                     rngs={'params': jax.random.key(0)},
                     train=train, decode=decode, kv_store=kv_store,
                     per_layer_input=None if per_layer_input is None else per_layer_input.layer(index),
                     attention_metadata=attention_metadata, **extra)
                 if opened is False:
-                    carry = result
+                    carry = stepped
                 else:
-                    carry, mutated = result
+                    carry, mutated = stepped
                     if scanned_run and _INTERMEDIATES in mutated and any(
                             not isinstance(leaf, jax.Array)
                             for leaf in jax.tree.leaves(mutated[_INTERMEDIATES])):
