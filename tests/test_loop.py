@@ -1236,9 +1236,9 @@ def test_a_gathered_loop_traced_under_no_layout_is_the_loop():
 
 @pytest.mark.mesh(devices=8)
 def test_a_gathered_loop_on_one_fsdp_device_is_the_loop():
-    """On a mesh whose FSDP axis holds one device (data parallel alone), a gathered loop compiles to the
-    plain loop's program, instruction for instruction (`Loop.gathered`: nothing to gather, no scope lifted
-    for it)."""
+    """On a mesh whose FSDP axis holds one device (data parallel alone), a gathered loop lowers to the
+    plain loop's program, operation for operation (`Loop.gathered`: nothing to gather, no scope lifted for
+    it)."""
     from dew.distributed.placement import Layout
     from dew.mesh import DEFAULT_RULES
     from dew.nn.sharding import placing
@@ -1252,8 +1252,7 @@ def test_a_gathered_loop_on_one_fsdp_device_is_the_loop():
         variables, ids = model_draw(model, (8, 12), VOCAB)(0)
         variables = jax.device_put(variables, layout.shardings(mesh, variables))
         with jax.set_mesh(mesh), nn.logical_axis_rules(DEFAULT_RULES), placing(layout):
-            text = jax.jit(gradient).lower(variables, ids, jnp.ones((8, 12, VOCAB))).compile().as_text()
-        programs.append(re.sub(r", metadata=\{[^}]*\}", "", text))
+            programs.append(jax.jit(gradient).lower(variables, ids, jnp.ones((8, 12, VOCAB))).as_text())
     assert programs[0] == programs[1]
 
 
@@ -1261,8 +1260,10 @@ def test_a_gathered_loop_on_one_fsdp_device_is_the_loop():
 def test_a_gathered_loops_mapped_projections_take_their_weights_as_they_lie():
     """A gathered loop's projections mapped per shard on an H100 (`projections.shard_placement`, a launch
     per device on its own rows) read their block's weights where the gathered loop placed them
-    (`sharding.GatheredOver`): its traced gradient's pass loop gathers no weight in any map, where the
-    plain loop's does in each (row 12722)."""
+    (`sharding.GatheredOver`): its traced gradient gathers no weight in any map, where the plain loop's
+    gathers in each pass's (row 12722). The whole stack loops: every mapped projection is the block's."""
+    from reference_error import equations
+
     from dew.distributed.placement import Layout
     from dew.mesh import DEFAULT_RULES
     from dew.nn.kernels import generation
@@ -1274,8 +1275,8 @@ def test_a_gathered_loops_mapped_projections_take_their_weights_as_they_lie():
     found = {}
     for gathered in (False, True):
         # Computing in bf16 at widths the GEMM template takes, Mosaic GPU's named: products a launch takes
-        # (`projections.launched`).
-        model = tiny(num_layers=4, loop=Loop(4, layers=(1, 3), gathered=gathered, step_norm=False),
+        # (`projections.launched`). The whole stack loops, so every mapped projection is the block's.
+        model = tiny(num_layers=2, loop=Loop(4, layers=(0, 2), gathered=gathered, step_norm=False),
                      dtype="bfloat16", emb_features=128, mlp_features=256)
         gradient = with_gradients(lambda variables, ids, model=model: model.apply(variables, ids))
         variables, ids = model_draw(model, (8, 16), VOCAB)(0)
@@ -1283,13 +1284,5 @@ def test_a_gathered_loops_mapped_projections_take_their_weights_as_they_lie():
         with (jax.set_mesh(mesh), nn.logical_axis_rules(DEFAULT_RULES), placing(layout),
               generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic")):
             graph = jax.make_jaxpr(gradient)(variables, ids, jnp.ones(logits.shape, logits.dtype))
-        found[gathered] = _gathers_in_loops(graph)
+        found[gathered] = sum(equation.primitive.name == "all_gather" for equation in equations(graph))
     assert found[False] and not found[True], found
-
-
-def _gathers_in_loops(graph) -> int:
-    """The `all_gather`s within `graph`'s loops (`scan`, `while`), at any depth inside them."""
-    from reference_error import equations
-
-    return sum(inner.primitive.name == "all_gather" for equation in equations(graph)
-               if equation.primitive.name in ("scan", "while") for inner in equations(equation.params))
