@@ -76,7 +76,8 @@ def _ramped():
     x = np.random.default_rng(0).normal(size=(256, FEATURES)).astype(np.float32)
     records = [{"x": row, "y": 2 * row[:2]} for row in x]
     chain = Pipeline(Memory(records)).repeat().batch(32)
-    return ramped(compile(chain, loading=Loading(workers=0)), Ramp(start=8, increment=8, samples=96))
+    # Three increments over 24 records: each stage's 8 records a step of its own (`Ramp`'s stage length).
+    return ramped(compile(chain, loading=Loading(workers=0)), Ramp(start=8, increment=8, samples=24))
 
 
 @pytest.mark.gpu(reason="device code's bytes, which a GPU's executables state and the CPU's do not")
