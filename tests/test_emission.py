@@ -791,9 +791,14 @@ def test_an_integer_multiply_counts_on_the_fma_pipe_at_its_own_rate_beside_the_f
     assert beside[1] == alone[1] + 256 / rates.cuda
 
 
+def _read_twice(product, z):
+    """`product + z` times `product`: one multiply's output read by an add and by a multiply."""
+    return (product + z) * product
+
+
 @pytest.mark.parametrize(("body", "fused"), [
     (lambda x, y, z: x * y + z, 128), (lambda x, y, z: jnp.maximum(x * y, z), 0),
-    (lambda x, y, z: (x * y + z) * (x * y), 0)], ids=["multiply-add", "maximum", "product-read-twice"])
+    (lambda x, y, z: _read_twice(x * y, z), 0)], ids=["multiply-add", "maximum", "product-read-twice"])
 def test_an_fp32_multiply_whose_one_use_is_an_add_counts_as_one_fused_instruction(body, fused):
     """An fp32 multiply whose result an add alone reads is one FFMA with it (ptxas's --fmad, its default):
     the body counts both operations and the pair fused (`Work.fused_multiply_adds`), an element each; a
