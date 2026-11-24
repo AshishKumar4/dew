@@ -301,6 +301,31 @@ def test_a_blockwise_fp8_chain_holds_every_reverse_order(edge):
 
 
 @pytest.mark.parametrize("edge", EDGES)
+def test_a_gated_blockwise_fp8_chain_holds_every_reverse_order(edge):
+    """`projections.blockwise_chain` with its `gate` (a gated MLP's three blockwise FP8 projections, its gate
+    and up summed in one launch and their SwiGLU quantized in its epilogue; its custom VJP each projection's
+    own surrogate): every reverse order, under a nested jit and a scan, in the rows and the three matrices,
+    finite wherever float64 is a normal float32 and wherever the plain product of the three through SwiGLU
+    is, at values whose products near float32's ends (row 12689). It takes no forward order."""
+    primals = normal_draw(12689, (256, 128), (1, 128, 256), (1, 128, 256), (1, 256, 128), scale=EDGES[edge])
+    direction = normal_draw(12690, (256, 128), (1, 128, 256), (1, 128, 256), (1, 256, 128),
+                            scale=EDGES[edge])
+    (cotangent,) = normal_draw(12691, (256, 128))
+
+    def swiglu(gate, up):
+        return jax.nn.silu(gate) * up
+
+    def recipe(rows, gate, up, down):
+        return projections.blockwise_chain(rows, up, down, swiglu, out_dtype=rows.dtype, gate=gate)
+
+    def plain(rows, gate, up, down):
+        return swiglu(rows @ gate[0], rows @ up[0]) @ down[0]
+
+    assert_contract(recipe, primals, direction, cotangent, f"a gated blockwise fp8 chain {edge}",
+                    truth_fn=plain, plain_fn=plain, without=FORWARD_ORDERS)
+
+
+@pytest.mark.parametrize("edge", EDGES)
 def test_an_nvfp4_products_kernels_hold_every_order(edge, kernel="xla"):
     """`gemm.nvfp4_product` on its selector's `kernel` (`xla` here, the decoded matrix's product; `packed`,
     the template's mainloop decoding each stage in place through `generation.linear_tangent` as `gemm` is,

@@ -143,37 +143,41 @@ def recipe_projection(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array
     return out.astype(out_dtype)
 
 
-def recipe_chain(rows: jax.Array, up: jax.Array, down: jax.Array, activation: Callable, *,
-                 out_dtype) -> jax.Array | None:
+def recipe_chain(rows: jax.Array, up: jax.Array, down: jax.Array, activation: Callable, *, out_dtype,
+                 gate: jax.Array | None = None) -> jax.Array | None:
     """`recipe_projection(activation(recipe_projection(rows, up)), down)` of an ungated MLP's rows (`[rows,
     in]`, any count; `up` `[in, hidden]`, `down` `[hidden, out]`, dense) as one chain where the run trains in
     DeepSeek-V3's blockwise FP8 recipe and its role takes both projections (`recipe_refusal`): the rows laid
     in whole 128-row blocks, zero rows after them dropped after (each row's tiles its own, so the real rows
     are the two apart's, bitwise), the down projection's rows quantized in the up projection's epilogue
     (`blockwise_chain`, row 8547); rows a mesh splits each device's own chain, the matrices whole and their
-    gradients summed (`on_shards`, as `_projected_apart`). None elsewhere: the run's recipe another's or
-    none, or a projection its role keeps, which the two `recipe_projection` calls then take apart. Each
-    product's route is its selector's (`BLOCKWISE_FP8`)."""
+    gradients summed (`on_shards`, as `_projected_apart`). With `gate` (`up`'s shape), a gated MLP's:
+    `activation(gate_rows, up_rows)`, the two first projections summed in one launch (row 12689). None
+    elsewhere: the run's recipe another's or none, or a projection its role keeps, which the
+    `recipe_projection` calls then take apart. Each product's route is its selector's (`BLOCKWISE_FP8`)."""
     from dew.nn.precision import recipe_role
 
     held = recipe_role()
     if (held is None or held[0].recipe != "blockwise_fp8" or up.ndim != 2 or down.ndim != 2
-            or recipe_refusal(*up.shape) is not None or recipe_refusal(*down.shape) is not None):
+            or recipe_refusal(*up.shape) is not None or recipe_refusal(*down.shape) is not None
+            or (gate is not None and gate.shape != up.shape)):
         return None
     if (placed := explicit_spec(rows)) is not None and placed.spec[0] is not None:
         along = placed.spec[0]
     else:
         along = None if (split := rows_split(rows)) is None else split[0]
     if along is not None:
-        def chained(rows, up, down):
-            out = recipe_chain(rows, up, down, activation, out_dtype=out_dtype)
+        def chained(rows, up, down, gate):
+            out = recipe_chain(rows, up, down, activation, out_dtype=out_dtype, gate=gate)
             assert out is not None, "the recipe takes the chain on every device as on the whole"
             return out
 
-        return on_shards(chained, jax.sharding.PartitionSpec(along, None), (rows, up, down), whole=(1, 2))
+        return on_shards(chained, jax.sharding.PartitionSpec(along, None), (rows, up, down, gate),
+                         whole=(1, 2, 3))
     count = rows.shape[0]
     laid = jnp.pad(rows, ((0, -count % SCALE_DEPTH), (0, 0)))
-    return blockwise_chain(laid, up[None], down[None], activation, out_dtype=out_dtype)[:count]
+    return blockwise_chain(laid, up[None], down[None], activation, out_dtype=out_dtype,
+                           gate=None if gate is None else gate[None])[:count]
 
 
 def _projected_apart(rows, matrix, group_sizes, *, out_dtype, bias, along) -> jax.Array:
@@ -261,45 +265,51 @@ _blockwise_projection = contracted("test_a_blockwise_fp8_projection_holds_every_
                         nondiff_argnums=(3, 4)))
 
 
-def _chain_value(x, w_up, w_down, group_blocks, activation, out_dtype, interpret):
-    """`blockwise_chain`'s value and its up projection's rounded product: the up projection's epilogue
-    quantizing its activation as the down projection's rows (`quantized.blockwise_fp8_epilogue`: codes and
-    1 x 128 scales, `[width / 128, rows]`, as `blockwise_fp8_product` reads its rows' scales)."""
+def _chain_value(x, w_ins, w_down, group_blocks, activation, out_dtype, interpret):
+    """`blockwise_chain`'s value and its first projections' rounded products: one projection's (an ungated
+    MLP's up), or a pair's summed in one launch (a gated MLP's gate and up, `blockwise_fp8_finished`'s
+    `paired`, row 12689), its epilogue quantizing their activation as the down projection's rows
+    (`quantized.blockwise_fp8_epilogue`: codes and 1 x 128 scales, `[width / 128, rows]`, as
+    `blockwise_fp8_product` reads its rows' scales)."""
     from dew.nn.kernels.templates.gemm import quantized
 
     sizes = (group_blocks * SCALE_DEPTH).astype(jnp.int32)
     rows, rows_scales = rows_quantized(x)
-    up_blocks, up_scales = blocks_quantized(w_up)
-    up, codes, scales = blockwise_fp8_finished(
-        rows, jnp.swapaxes(up_blocks, 1, 2), sizes, rows_scales.T, up_scales,
+    (first, first_scales), *pair = [(jnp.swapaxes(blocks, 1, 2), scales)
+                                    for blocks, scales in map(blocks_quantized, w_ins)]
+    *products, codes, scales = blockwise_fp8_finished(
+        rows, first, sizes, rows_scales.T, first_scales,
         epilogue=quantized.blockwise_fp8_epilogue(activation, out_dtype),
-        out_dtypes=(out_dtype, jnp.float8_e4m3fn, jnp.float32), out_forms=(None, None, (SCALE_DEPTH, True)),
-        dense=True, interpret_on_cpu=interpret)
+        out_dtypes=(*(out_dtype,) * len(w_ins), jnp.float8_e4m3fn, jnp.float32),
+        out_forms=(*(None,) * (len(w_ins) + 1), (SCALE_DEPTH, True)), dense=True,
+        paired=pair[0] if pair else None, interpret_on_cpu=interpret)
     down_blocks, down_scales = blocks_quantized(w_down)
     out = blockwise_fp8_product(codes, jnp.swapaxes(down_blocks, 1, 2), sizes, scales, down_scales,
                                 out_dtype=out_dtype, interpret_on_cpu=interpret)
-    return out, up
+    return out, tuple(products)
 
 
-def _chain(x, w_up, w_down, group_blocks, activation, out_dtype, interpret):
-    return _chain_value(x, w_up, w_down, group_blocks, activation, out_dtype, interpret)[0]
+def _chain(x, w_ins, w_down, group_blocks, activation, out_dtype, interpret):
+    return _chain_value(x, w_ins, w_down, group_blocks, activation, out_dtype, interpret)[0]
 
 
-def _chain_forward(x, w_up, w_down, group_blocks, activation, out_dtype, interpret):
-    out, up = _chain_value(x, w_up, w_down, group_blocks, activation, out_dtype, interpret)
-    return out, (x, w_up, w_down, group_blocks, up)
+def _chain_forward(x, w_ins, w_down, group_blocks, activation, out_dtype, interpret):
+    out, products = _chain_value(x, w_ins, w_down, group_blocks, activation, out_dtype, interpret)
+    return out, (x, w_ins, w_down, group_blocks, products)
 
 
 def _chain_backward(activation, out_dtype, interpret, residuals, cotangent):
-    """The two blockwise projections' own reverse modes (`_projection_backward`) through the activation's
-    derivative at the up projection's rounded product: the recipe's surrogate of each, as the two apart."""
-    x, w_up, w_down, group_blocks, up = residuals
-    activated, pulled = jax.vjp(lambda value: activation(value).astype(out_dtype), up)
+    """The blockwise projections' own reverse modes (`_projection_backward`) through the activation's
+    derivative at the first projections' rounded products: the recipe's surrogate of each, as they run
+    apart, the rows' cotangent each first projection's added."""
+    x, w_ins, w_down, group_blocks, products = residuals
+    activated, pulled = jax.vjp(lambda *values: activation(*values).astype(out_dtype), *products)
     d_activated, d_w_down, _ = _projection_backward(out_dtype, interpret, (activated, w_down, group_blocks),
                                                     cotangent)
-    (d_up,) = pulled(d_activated.astype(activated.dtype))
-    d_x, d_w_up, _ = _projection_backward(out_dtype, interpret, (x, w_up, group_blocks), d_up)
-    return d_x, d_w_up, d_w_down, None
+    pulled_back = [_projection_backward(out_dtype, interpret, (x, w_in, group_blocks), d_product)
+                   for w_in, d_product in zip(w_ins, pulled(d_activated), strict=True)]
+    d_x = functools.reduce(jnp.add, [d_rows for d_rows, _, _ in pulled_back])
+    return d_x, tuple(d_w for _, d_w, _ in pulled_back), d_w_down, None
 
 # The chain's gradient (`blockwise_chain`): the recipe's surrogate of each projection (`Surrogate`).
 _blockwise_chain = contracted("test_a_blockwise_fp8_chain_holds_every_reverse_order")(
@@ -307,20 +317,26 @@ _blockwise_chain = contracted("test_a_blockwise_fp8_chain_holds_every_reverse_or
 
 
 def blockwise_chain(x: jax.Array, w_up: jax.Array, w_down: jax.Array, activation, *, out_dtype,
-                    interpret_on_cpu: bool = False) -> jax.Array:
+                    gate: jax.Array | None = None, interpret_on_cpu: bool = False) -> jax.Array:
     """`blockwise_fp8_projection(activation(blockwise_fp8_projection(x, w_up)), w_down)` of `x`'s rows
     (`[rows, depth]`, whole 128-row blocks, one group of them; `w_up` `[1, depth, hidden]`, `w_down` `[1,
     hidden, width]`), each product rounded to `out_dtype`, the activation of the rounded up projection rounded
     again, as an ungated MLP's two projections run apart in DeepSeek-V3's blockwise FP8 recipe: the down
     projection's rows quantized in the up projection's epilogue, its codes and scales stored there
     (`quantized.blockwise_fp8_epilogue`, the scales `[hidden / 128, rows]`), no pass of their own between the
-    two (row 8547). Bitwise the two apart, forward and reverse (`_chain_backward`: each projection's own
-    surrogate); `activation` is an elementwise function of an `out_dtype` array, the MLP's."""
+    two (row 8547). With `gate` (`w_up`'s shape), a gated MLP's: `activation(gate_product, up_product)`,
+    the two products summed in one launch, each by its own matrix and scales (row 12689). Bitwise the
+    projections apart, forward and reverse (`_chain_backward`: each projection's own surrogate);
+    `activation` is an elementwise function of `out_dtype` arrays, the MLP's."""
     if w_up.shape[0] != 1 or w_down.shape[0] != 1 or x.shape[0] % SCALE_DEPTH:
         raise ValueError("a blockwise chain is one group's of whole 128-row blocks: its rows' quantized "
                          "scales are stored transposed, each share's rows whole")
+    if gate is not None and gate.shape != w_up.shape:
+        raise ValueError(f"a gated chain's gate is its up projection's shape {w_up.shape}, not {gate.shape}")
     group_blocks = jnp.full((1,), x.shape[0] // SCALE_DEPTH, jnp.int32)
-    return _blockwise_chain(x, w_up, w_down, group_blocks, activation, jnp.dtype(out_dtype), interpret_on_cpu)
+    w_ins = (w_up,) if gate is None else (gate, w_up)
+    return _blockwise_chain(x, w_ins, w_down, group_blocks, activation, jnp.dtype(out_dtype),
+                            interpret_on_cpu)
 
 
 def mxfp8_projection(x: jax.Array, w: jax.Array, group_blocks: jax.Array, *, out_dtype,

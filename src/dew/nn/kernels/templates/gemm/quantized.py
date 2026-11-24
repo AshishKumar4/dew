@@ -171,19 +171,20 @@ def _reciprocal(scale: jax.Array) -> jax.Array:
 
 
 def blockwise_fp8_epilogue(activation=None, out_dtype=jnp.bfloat16):
-    """A GEMM epilogue returning the product rounded to `out_dtype` beside its next product's rows quantized
-    as DeepSeek-V3's blockwise FP8 recipe quantizes them: `activation` of the rounded product (itself where
-    none), rounded to `out_dtype`, as E4M3 codes and 1 x 128 power-of-two scales (`_blockwise_fp8_quantized`),
-    bitwise the recipe's `projections.rows_quantized` of that activation, which a separate pass formed from
-    the stored product (row 8547)."""
+    """A GEMM epilogue returning each of its products rounded to `out_dtype` (one, or a pair's two: a gated
+    MLP's gate and up, row 12689) beside its next product's rows quantized as DeepSeek-V3's blockwise FP8
+    recipe quantizes them: `activation` of the rounded products (the one product itself where none), rounded
+    to `out_dtype`, as E4M3 codes and 1 x 128 power-of-two scales (`_blockwise_fp8_quantized`), bitwise the
+    recipe's `projections.rows_quantized` of that activation, which a separate pass formed from the stored
+    products (row 8547)."""
     if jnp.dtype(out_dtype).itemsize > 4:  # its quantizer reads fp32 (`_blockwise_fp8_quantized`)
         raise ValueError(f"a quantizing epilogue reads fp32 at most, not {jnp.dtype(out_dtype)}")
 
-    def quantized(acc):
-        rounded = acc.astype(out_dtype)
-        next_rows = rounded if activation is None else activation(rounded).astype(out_dtype)
+    def quantized(*accs):
+        rounded = tuple(acc.astype(out_dtype) for acc in accs)
+        next_rows = rounded[0] if activation is None else activation(*rounded).astype(out_dtype)
         codes, scales = _blockwise_fp8_quantized(next_rows.astype(jnp.float32))
-        return rounded, codes, scales
+        return *rounded, codes, scales
 
     return quantized
 

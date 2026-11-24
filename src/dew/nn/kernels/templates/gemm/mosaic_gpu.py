@@ -188,7 +188,7 @@ def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, 
     blocks = {**(words(block_m) if packed_rows else {'rows': (lhs_block, dtype)}), **matrix,
               **({'paired': (rhs_block, rhs_dtype)} if paired else {}),
               **({JOINED: (lhs_block, dtype)} if joined else {}),
-              **(_scale_blocks(block_m, block_n) if step_scaled else {}),
+              **(_scale_blocks(block_m, block_n, paired=paired) if step_scaled else {}),
               # A block-scaled product's rows' and matrix's scales, a step's tiles of each (`gmm`'s
               # `mx_scales`), four scales a tile's row (`product.block_format`).
               **(_scale_tiles(block_m, block_n, block_k, dtype) if block_scaled else {}),
@@ -220,14 +220,21 @@ def _scale_tiles(block_m: int, block_n: int, block_k: int, dtype) -> dict:
             'b_scales': (mosaic_sm100.scale_tiles(block_n, block_k // per), scale)}
 
 
-def _scale_blocks(block_m: int, block_n: int) -> dict:
+def _scale_blocks(block_m: int, block_n: int, *, paired: bool = False) -> dict:
     """Dew: a step-scaled call's scale streams (`gmm`'s and `tgmm`'s `step_scales`): a step's row of its
     rows' scales at the tile's rows and of its columns' at the tile's columns (a row of the matrix's coarser
-    ones holding the tile's, `_column_scales`), unswizzled (`SCALE_SWIZZLES`)."""
-    return {'row_scales': ((1, block_m), jnp.float32), 'column_scales': ((1, block_n), jnp.float32)}
+    ones holding the tile's, `_column_scales`), and a `paired` matrix's columns' beside them
+    (`COLUMN_SCALES`), unswizzled (`SCALE_SWIZZLES`)."""
+    return {'row_scales': ((1, block_m), jnp.float32),
+            **{COLUMN_SCALES[name]: ((1, block_n), jnp.float32)
+               for name in ('matrix', 'paired')[:2 if paired else 1]}}
 
 
-SCALE_SWIZZLES = {'row_scales': swizzling.UNSWIZZLED, 'column_scales': swizzling.UNSWIZZLED}
+COLUMN_SCALES = {'matrix': 'column_scales', 'paired': 'paired_column_scales'}
+"""Dew: each matrix's column scales' stream (`_scale_blocks`) by its stream's name: a paired step-scaled
+product's two matrices each scaled by its own (a gated MLP's gate and up, row 12689)."""
+
+SCALE_SWIZZLES = dict.fromkeys(('row_scales', *COLUMN_SCALES.values()), swizzling.UNSWIZZLED)
 """Dew: the scale streams' swizzles (`_scale_blocks`): rows of fp32 a step, read a row at a time."""
 
 
@@ -620,7 +627,8 @@ def _gmm_forms_refused(tiles: Tiles, family: mosaic.Family, k: int, n: int, mx_s
                 plain=all(each is None for each in (*parts, step_scales))
                 and not (transpose_lhs or exact_sums))
     _gmm_split_refused(tiles, k, n, step_scales, exact_sums=exact_sums, hooked=hooked,
-                       plain=all(each is None for each in (prologue, paired, scales)) and not transpose_lhs)
+                       plain=all(each is None for each in (prologue, scales)) and not transpose_lhs,
+                       paired=paired is not None)
 
 
 def _chained_walked(chained: tuple, tiles: Tiles, dtype, transpose_lhs: bool, dense: bool,
@@ -964,20 +972,20 @@ def _gmm_scheduled(index, *, table_gmem, lhs_gmem, matrix_gmems: dict, prologue_
 
 
 def _gmm_split_refused(tiles: Tiles, k: int, n: int, step_scales, *, exact_sums: bool, hooked: bool,
-                       plain: bool) -> None:
+                       plain: bool, paired: bool = False) -> None:
     """Dew: `gmm`'s refusal of a depth split but a product's of no hooks or pair, each run some steps (a
     grouped one's runs over each tile its group's rows, the rows past every group's zeros in every run, so
     their partials sum to the product: a decode step's experts, row 3622; an exact sum's runs summed exactly,
-    their partials by IEEE adds), of step scales but on an
-    exactly summed product of no prologue, pair, packed matrix or split (`_step_scaled_takes`)."""
+    their partials by IEEE adds), of step scales but on an exactly summed product of no prologue, packed
+    matrix or split, a `paired` one's with its matrix's own column scales (`_step_scaled_takes`)."""
     if tiles.splits > 1 and (hooked or not split_runs(-(-k // tiles.block_k), tiles.splits)):
         raise ValueError(f"a depth split is a product's of no hooks or pair, each run some steps, not "
                          f"{tiles} of a {k}-deep one")
     if step_scales is not None and not _step_scaled_takes(step_scales, tiles, k, n, exact_sums=exact_sums,
-                                                          plain=plain):
+                                                          plain=plain, paired=paired):
         raise ValueError(f"a step-scaled product sums each {SCALE_DEPTH}-deep step exactly with no "
-                         f"prologue, pair, packed matrix or split, its scales covering its steps and "
-                         f"columns, not {tiles}")
+                         f"prologue, packed matrix or split, its scales covering its steps and each "
+                         f"matrix's columns, not {tiles}")
 
 
 def _gmm_allocated(tiles: Tiles, family: mosaic.Family, operands: tuple, hooks: tuple, sides: tuple,
@@ -1066,10 +1074,12 @@ def _workspace(tail, shape: tuple, interpret) -> tuple:
 
 
 def _scale_refs(refs: tuple, step_scales, mx_scales, gather, scatter) -> tuple:
-    """Dew: a `gmm` kernel's step scales', MX scales' (each two), gather table's and scatter table's
+    """Dew: a `gmm` kernel's step scales' (two, three with a paired matrix's), MX scales' (two), gather
+    table's and scatter table's
     references, leading the rest in that order (None where the call has none), and the references after
     them."""
-    step, refs = (refs[:2], refs[2:]) if step_scales is not None else (None, refs)
+    count = 0 if step_scales is None else len(step_scales)
+    step, refs = (refs[:count], refs[count:]) if step_scales is not None else (None, refs)
     mx, refs = (refs[:2], refs[2:]) if mx_scales is not None else (None, refs)
     gathered, refs = (refs[0], refs[1:]) if gather is not None else (None, refs)
     scattered, refs = (refs[0], refs[1:]) if scatter is not None else (None, refs)
@@ -1122,8 +1132,11 @@ def _step_scales_walked(step_scales: tuple | None, n: int, block_n: int, extent:
     of a tile (`per`, 1 without them)."""
     if step_scales is None:
         return None, 1
-    column_scales, per = _column_scales(step_scales[1], n, block_n)
-    return (rows_extended(rows_padded(step_scales[0], 1, TMA_ROWS), 1, extent), column_scales), per
+    walked = [_column_scales(columns, n, block_n) for columns in step_scales[1:]]
+    if len({per for _, per in walked}) != 1:
+        raise ValueError("a paired step-scaled product's matrices' scales cover alike many columns")
+    return (rows_extended(rows_padded(step_scales[0], 1, TMA_ROWS), 1, extent),
+            *(columns for columns, _ in walked)), walked[0][1]
 
 
 def _walked_rows(lhs, gather, scatter, tiles: Tiles, *, transpose_lhs: bool, dense: bool,
@@ -1329,12 +1342,17 @@ def partial_runs(tiles: Tiles, dtype, interpret, *, transpose_rhs: bool, plain: 
 
 
 def _step_scaled_takes(step_scales: tuple, tiles: Tiles, depth: int, width: int, *, exact_sums: bool,
-                       plain: bool) -> bool:
+                       plain: bool, paired: bool = False) -> bool:
     """Dew: whether `gmm` takes `step_scales` at `tiles` (`_step_scaling`): an exactly summed product of no
-    prologue, pair, packed matrix, transposed rows or split (an epilogue reads its sums), a step 128 deep, a
-    row scale each step, and a column scale each column or each multiple of the tile's width."""
-    rows, columns = step_scales
-    per = width // columns.shape[-1] if columns.shape[-1] and width % columns.shape[-1] == 0 else 0
+    prologue, packed matrix, transposed rows or split (an epilogue reads its sums), a step 128 deep, a row
+    scale each step, and each matrix's column scale each column or each multiple of the tile's width, alike
+    for a `paired` one's (its own, `COLUMN_SCALES`, a gated MLP's gate and up, row 12689)."""
+    rows, *columns_of = step_scales
+    if len(columns_of) != (2 if paired else 1):
+        return False
+    pers = {width // columns.shape[-1] if columns.shape[-1] and width % columns.shape[-1] == 0 else 0
+            for columns in columns_of}
+    (per,) = pers if len(pers) == 1 else (0,)
     return (exact_sums and plain and tiles.splits == 1 and tiles.block_k == SCALE_DEPTH
             and rows.shape[0] * SCALE_DEPTH == depth
             and (per == 1 or (per > 0 and per % tiles.block_n == 0)))
@@ -1416,17 +1434,18 @@ def _gmm_scaling(scaled: bool, per: int, block_n: int, column_tile, mine_rows) -
                              mine_rows=mine_rows)
 
 
-def _step_scaling(index, slots, *, per: int, offset, mine_rows) -> Callable:
+def _step_scaling(index, slots, *, per: int, offset, mine_rows, columns: str = 'column_scales') -> Callable:
     """Dew: a step-scaled walk's multiplier of a step's exactly summed partial (`gmm`'s and `tgmm`'s
     `step_scales`, `mosaic.Issuer.summed_apart`'s `scale`): this consumer's rows' scales (the step's row of
     them streamed, `row_scales`) times the tile's columns' (streamed beside them, `column_scales`: the step's
     row of them at the tile's columns, one a column, or the block holding the tile's one, at `offset`, `per`
     columns a scale), in shared memory as the step's operands land: read from global memory, a step's
     scaling waited on its load (M-NS-13: the blockwise FP8 template 1.24-1.42x its unscaled exact product).
-    `index` is the step's, whose scales are its streams'."""
+    `index` is the step's, whose scales are its streams'; `columns` the stream of the matrix's column scales
+    (`COLUMN_SCALES`)."""
     del index
     rows = slots['row_scales'].at[0, mine_rows][...]
-    column_scales = slots['column_scales']
+    column_scales = slots[columns]
     if per == 1:
         return lambda start, columns: rows[:, None] * column_scales.at[0, pl.ds(start, columns)][...][None, :]
     # A weight block's one scale scales the rows' vector before it is broadcast over the columns: a multiply
@@ -1506,10 +1525,11 @@ def _gmm_views(lhs_gmem, matrix_gmems: dict, prologue_gmems, group, row_start, c
                      for q in range(step_groups)}
     if scale_gmems is not None:
         # Its rows' scales and its matrix's columns', a step's row of each (`step_scales`): the rows' at the
-        row_scales, column_scales = scale_gmems
+        row_scales, *columns_of = scale_gmems
         block, _ = _column_block(column_tile, tiles.block_n, scale_per)
         matrices['row_scales'] = (row_scales.at[:, rows], lambda j: (first + j, 0))
-        matrices['column_scales'] = (column_scales.at[group.matrix], lambda j: (first + j, block))
+        for name, column_scales in zip(COLUMN_SCALES.values(), columns_of, strict=False):
+            matrices[name] = (column_scales.at[group.matrix], lambda j: (first + j, block))
     if mx_gmems is not None:
         # An MX product's scale tiles at step j: its rows' 128-row tiles from the tile's (whole tiles: a
         # group's rows are whole 128s) and its matrix's at the tile's columns.
@@ -1659,10 +1679,12 @@ def _gmm_step(index, slots, nothing, accumulators, *, family: mosaic.Family, pro
             acc, (left,), oriented[name])) for acc, name in zip(accumulators, matrices, strict=True))
     rows_of = _rows_of(slots, matrices, mine_rows, transpose_lhs)
     if summed:
-        scale = None if scaling is None else scaling(index, slots)
+        # Each matrix's partial times its own columns' scales (`COLUMN_SCALES`: a paired one's apart).
+        scales = {name: None if scaling is None else scaling(index, slots, columns=COLUMN_SCALES[name])
+                  for name in matrices}
         return nothing, tuple(
             issued(total, lambda total=total, name=name:
-                   family.summed_apart(total, rows_of[name], oriented[name], scale))
+                   family.summed_apart(total, rows_of[name], oriented[name], scales[name]))
             for total, name in zip(accumulators, matrices, strict=True))
     if chosen is not None:
         (name,) = matrices
