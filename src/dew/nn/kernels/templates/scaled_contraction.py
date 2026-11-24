@@ -21,7 +21,7 @@ back (the reference's mean, `attention.held_mean`).
 
 A term's group whose values span more binades than a band (`_band`) is contracted a band of each group at a
 time, each band pair at its own power of two, and every term's contractions joined as double floats at their
-own powers from the largest (`windows._joined`, `_banded`): so terms that cancel keep a part any number of
+own powers from the largest (`windows.joined`, `_banded`): so terms that cancel keep a part any number of
 binades beneath them (`2^127 - 2^127 + 2^-30` is `2^-30`, where one exponent for the group flushed it, row
 12452). Within a band a contraction rounds as an fp32 sum does (`2^127 + 2^100 - 2^127`, one band, is 0).
 """
@@ -164,9 +164,9 @@ def _sum(arrays, form: Form, terms: tuple[Term, ...], out: str, dtype):
     landed = sum((power2(summed, scale - joined) for summed, scale in parts), jnp.zeros((), dtype))
     if dtype != jnp.float32:
         return landed, joined
-    # The terms joined as double floats at their own powers (`windows._joined`), so terms that cancel keep a
+    # The terms joined as double floats at their own powers (`windows.joined`), so terms that cancel keep a
     # part beneath them; a non-finite sum IEEE's, as landed.
-    high, low, exponent = functools.reduce(windows._joined, [
+    high, low, exponent = functools.reduce(windows.joined, [
         (summed, jnp.zeros_like(summed), jnp.where(summed != 0, scale, 0)) for summed, scale in parts])
     special = ~jnp.isfinite(landed)
     landed, joined = jnp.where(special, landed, high + low), jnp.where(special, joined, exponent)
@@ -183,7 +183,7 @@ def _sum(arrays, form: Form, terms: tuple[Term, ...], out: str, dtype):
 def _banded(terms: tuple[Term, ...], held: list, scales: list, contracted) -> tuple[jax.Array, jax.Array]:
     """`_sum`'s terms contracted a band of each group at a time (`_band`: a value whose offset beneath its
     group's largest lies in `[-(i + 1) band, -i band)` in band `i`, raised `2^(i band)`), each band pair's sum
-    at its own power of two joined into the total as double floats (`windows._joined`), the terms' pairs in
+    at its own power of two joined into the total as double floats (`windows.joined`), the terms' pairs in
     one `lax.while_loop` from each term's first: its program one contraction of each term whatever the
     bands, and a part beneath a pair that cancels kept to the double floats' reach."""
     bands = [[(-offset) // _band(len(groups)) for _, _, offset, _ in groups] for groups in held]
@@ -206,7 +206,7 @@ def _banded(terms: tuple[Term, ...], held: list, scales: list, contracted) -> tu
 
     def step(state):
         t, at, total = state
-        total = jax.lax.switch(t, [lambda at, total, t=t: windows._joined(total, pair(t, at))
+        total = jax.lax.switch(t, [lambda at, total, t=t: windows.joined(total, pair(t, at))
                                    for t in range(len(terms))], at, total)
         moved = at + 1 >= pairs[t]
         return jnp.where(moved, t + 1, t), jnp.where(moved, 0, at + 1), total
@@ -290,7 +290,7 @@ def _moved(terms: tuple[Term, ...], moving: dict, at: dict[int, int]) -> list[tu
 
 def _held_out(arrays) -> list[jax.Array]:
     """`arrays` held out of the graph: a rule's sum read for its value alone (a zero divisor, its exponent),
-    whose double floats' splits (`windows._joined`) take no derivative of their own."""
+    whose double floats' splits (`windows.joined`) take no derivative of their own."""
     return [jax.lax.stop_gradient(array) for array in arrays]
 
 
