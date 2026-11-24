@@ -888,7 +888,8 @@ def test_an_mlp_the_chain_cannot_read_runs_its_projections_apart(kind, activatio
               if kind == "a sequence axis" else contextlib.nullcontext())
     with generation.run_precision(fp8), projection_role("mlp"), placed:
         graph = jax.make_jaxpr(lambda variables, x: mlp.apply(variables, x))(variables, x)
+        out = jax.eval_shape(lambda variables, x: mlp.apply(variables, x), variables, x)
     regions = [equation for equation in equations(graph) if equation.primitive.name == "marked_call"
                and isinstance(equation.params.get("kind"), Surrogate)]
     assert len(regions) == (3 if activation == "swiglu" else 2), len(regions)
-    assert graph.out_avals[0].dtype == (jnp.float32 if mixed else jnp.bfloat16)
+    assert out.dtype == (jnp.float32 if mixed else jnp.bfloat16)
