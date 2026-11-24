@@ -954,10 +954,12 @@ def test_a_delayed_nvfp4_gated_mlp_trains_each_projection_on_its_own_history():
     recorded under its history's path, finite."""
     from dew.nn.dense import NVFP4_AMAX, NVFP4_HISTORY
     from dew.nn.mlp import GatedMLP
+    from dew.nn.precision import projection_role
 
     layer = GatedMLP(hidden_features=2 * WIDTH, out_features=WIDTH, dtype=jnp.bfloat16)
     x = jnp.asarray(np.random.default_rng(12721).normal(size=(64, WIDTH)), jnp.bfloat16)
-    with generation.run_precision(_delayed_nvfp4()):
+    # In the role a decoder block runs its MLP in (`projection_role`), which the recipe takes.
+    with generation.run_precision(_delayed_nvfp4()), projection_role("mlp"):
         variables = layer.init(jax.random.key(0), x)
         held = {key: tree for key, tree in variables.items() if key != NVFP4_AMAX}
 
