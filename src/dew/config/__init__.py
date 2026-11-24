@@ -43,8 +43,14 @@ from dew._coordination import agree_process_phase, agreed, agreed_same
 from dew._files import write_atomically
 from dew._records import JSON
 from dew.checkpoints import RUN_FILE, Checkpoints
-from dew.checkpoints._state_trees import keep_unmasked_mark
-from dew.config.earlier import ADDITIVE_UNSETTABLE, LAYOUT_UNSETTABLE, MARKERS, earlier_run
+from dew.config.earlier import (
+    ADDITIVE_UNSETTABLE,
+    LAYOUT_UNSETTABLE,
+    MARKERS,
+    MASKED_DECAY_MARK,
+    earlier_run,
+    unmarked,
+)
 from dew.config.release import Release
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
 from dew.config.trainer import (
@@ -614,7 +620,9 @@ class RunConfig:
     """The model and source fields, by name, that say how a model's layers execute and not what they
     compute or store: a decoder's runs under one scan or a layer at a time hold the same layers on disk
     (`layers_N`) and compute the same step, so a run resumes under either (`check_resume`), as it does
-    with a looped block's passes recomputed in its backward or held (`loop_remat`), memory alone. A source's
+    with a looped block's passes recomputed in its backward or held (`loop_remat`), memory alone. A model's
+    own fields that say how it runs, its recompute (`remat`) among them, are its class's to mark
+    (`dew._records.RUNS`), which a resume reads by its class (`registry.computing_fields`). A source's
     weights packed or decoded (`SourceOptions.packed_weights`) are not: packed, its banks are no trainable
     parameters and hold no optimizer moments, so a resume across them is refused by name."""
 
@@ -793,11 +801,11 @@ class RunConfig:
         path = epath.Path(directory)
         path.mkdir(parents=True, exist_ok=True)
         target = path / RUN_FILE
-        # An earlier masked run's record, about to be written over in its translation, marked beside it
-        # first, so its checkpoints read across its masked decay alike (`earlier_unmasked`).
-        keep_unmasked_mark(target)
         # Whole or not at all: `load` reads it while a run is resumed.
         write_atomically(target, json.dumps(self.record(), indent=2, sort_keys=True))
+        # The record written is the run's whole account from here on: an intermediate Dew's mark beside
+        # it, read where this run was loaded (`load`), is decided and read no more.
+        (path / MASKED_DECAY_MARK).unlink(missing_ok=True)
         return str(target)
 
     def record(self) -> dict[str, JSON]:
@@ -1012,7 +1020,7 @@ class RunConfig:
         trainer = self.trainer
         built = self.BUILT if paths is None else paths
         unset = [path for path in built if _holds(self, path) and _recorded_at(self, path) is None]
-        run = self
+        run = self._marked() if trainer.name is not None and trainer.resume != "never" else self
         # The classes' defaults are resolved where the run builds its objective and model from them
         # (`prepare`, every field), never where they are built already (`readied`'s data plan version).
         defaulting = paths is None
@@ -1023,8 +1031,8 @@ class RunConfig:
             recorded = None if saved is None else self._saved_as(saved)
             # A field of a record the saved run held none of (a teacher it had not) takes nothing.
             if recorded is not None:
-                run = self.override({path: _recorded_at(recorded, path) for path in unset
-                                     if _holds(recorded, path)})
+                run = run.override({path: _recorded_at(recorded, path) for path in unset
+                                    if _holds(recorded, path)})
                 run = run._defaulted_as(recorded) if defaulting else run
         # A relaxed resume of a run saved under a version this Dew reads none of reads by this Dew's, its
         # data started again (`dew.training.Trainer._data_resumed`); an exact one is refused by it.
@@ -1034,6 +1042,29 @@ class RunConfig:
                 trainer.data_resume == "relaxed")):
             run = dataclasses.replace(run, data_plan_version=PLAN_VERSIONS[-1])
         return run
+
+    def _marked(self) -> Self:
+        """This run as its earlier run trained where an intermediate Dew rewrote its record beside its mark
+        (`MASKED_DECAY_MARK`), decided by the step its resume restores (`Checkpoints.latest`), here, where
+        its process has joined its pool (`resumed`, after `prepare_process`): its optimizer's decay masked off
+        as that run's (`unmarked`), or as it is where that step is the intermediate Dew's own
+        (`typed_optimizer`), saved under the record it rewrote."""
+        name = self.trainer.name
+        assert name is not None, "a run resumes under its name"
+        mark = epath.Path(self.trainer.directory(name)) / MASKED_DECAY_MARK
+        # Read alike by every process, or refused on all, before the checkpoints' choice agrees across them.
+        marked = agreed_same("a run's masked-decay mark",
+                             lambda: json.loads(mark.read_text()) if mark.exists() else None)
+        if marked is None:
+            return self
+        with self.trainer.checkpoints(name) as checkpoints:
+            step = checkpoints.latest
+            if step is not None and checkpoints.saved_with(step, "typed_optimizer") is True:
+                return self
+        earlier = unmarked(self.record(), _records.record(marked, MASKED_DECAY_MARK))
+        fields = _records.record(earlier["fields"], "run fields")
+        return dataclasses.replace(self, optim=from_record(OptimConfig, _records.json_value(fields["optim"],
+                                                                                           "optim")))
 
     def _defaulted_as(self, recorded: Self) -> Self:
         """This run with each class it names (`Registered`: its model, its objective) that `recorded`, the

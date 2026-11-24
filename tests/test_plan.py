@@ -414,6 +414,23 @@ def free_until_placed(monkeypatch, room):
 
 
 
+def test_a_search_handed_to_a_compile_that_refuses_is_released_with_no_winner(monkeypatch):
+    """A search made off the loop for the step a compile plans next (a later phase's,
+    `dew.training.ahead.LaterPlans`) is handed to the compile (`StepCompiler.settle_with`): a compile whose
+    plan is refused releases it with no winner (its every program dropped), never leaving it held with the
+    run's executables and their admission (review of row 12131's P0: a boundary's refusal leaked it)."""
+    from dew.training.planning import PlanRefused
+
+    trainer = lm()
+    state, _, _ = trainer.place()
+    released: list[object] = []
+    trainer._compiler.settle_with(released.append)
+    free(monkeypatch, 1 << 10)
+    with pytest.raises(PlanRefused):
+        trainer.compile(state, BATCH)
+    assert released == [None], released
+
+
 def test_a_fresh_fit_whose_step_fits_no_plan_before_its_state_is_placed_is_refused_unplaced(monkeypatch):
     """A fresh fit on devices with room for its state and for no plan of its step is refused as its search
     before the state was placed found it, every candidate short by more than placing the state can free: its
@@ -542,6 +559,88 @@ def needs(monkeypatch, trainer, run=None):
     # Measured as in a process apart: the run a test then counts compiles nothing of it.
     options.unhold()
     return LIMIT - trainer.plan["probes"][0]["headroom"]
+
+
+def test_a_settled_plan_keeps_no_program_its_search_passed_over(monkeypatch):
+    """A search that compiled the step whole, which missed, and split, which fits, keeps the plan's program
+    alone once it settles: its executable held for the process (`options.hold`) and its traced step for a
+    refit (`_candidates.candidate_for`), each other program it compiled dropped, whose lowering keys its
+    loaded executable and, over several GPUs, its collectives' room outside XLA's pool for as long as it is
+    kept (row 12131: 24 kept beside a 4B run's step left an all-reduce no room)."""
+    from dew.training import _candidates
+
+    whole, halves = needs(monkeypatch, lm(split=1)), needs(monkeypatch, lm(split=2))
+    assert halves < whole, (halves, whole)
+    free(monkeypatch, (whole + halves) // 2)
+    options.release()
+    trainer = lm()
+    trained(trainer, steps=0)
+    assert len(trainer.plan["probes"]) >= 2 and trainer.plan["split"] > 1, trainer.plan["probes"]
+    kept = [kept.lowered for kept in _candidates._CANDIDATES.values()]
+    assert len(kept) == 1, len(kept)
+    assert len(options._HELD) == 1, list(options._HELD)
+
+
+def test_a_provisional_plans_search_keeps_no_program_once_its_plan_is_taken(monkeypatch):
+    """A fresh fit plans its step before placing its state (`Trainer._planned_unplaced`), its search keeping
+    every program it compiled for that plan to take; once its compile takes the plan, its own or one
+    searched on the placed devices, the programs it passed over are dropped, the plan's alone kept (review
+    of row 12131's P0: a provisional search's losers and frontier rungs stayed loaded)."""
+    from affine_run import Replaying
+
+    from dew.data.dataset import Loader
+    from dew.training import _candidates
+
+    whole, halves = needs(monkeypatch, lm(split=1)), needs(monkeypatch, lm(split=2))
+    assert halves < whole, (halves, whole)
+    options.release()
+    rows = Replaying(lambda position: {"text": np.asarray(BATCH["text"])})
+    free(monkeypatch, LIMIT)
+    roomy = lm()
+    roomy.fit(Loader(lambda partition: rows, None, None, ROWS), steps=1)
+    assert roomy.validation is not None
+    state = max(roomy.validation.device_bytes.values())
+    options.release()
+    gc.collect()
+    trainer = lm()
+    free_until_placed(monkeypatch, state + (whole + halves) // 2)
+    trained = trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=1)
+    plan = trainer.plan
+    assert int(trained.step) == 1 and isinstance(plan, dict) and len(plan["probes"]) >= 2, plan
+    gc.collect()
+    assert len(_candidates._CANDIDATES) == 1, list(_candidates._CANDIDATES)
+    assert len(options._HELD) == 1, list(options._HELD)
+
+
+def test_a_provisional_plans_search_is_released_where_the_placed_search_after_it_refuses(monkeypatch):
+    """A fresh fit plans its step before placing its state (`Trainer._planned_unplaced`), its search
+    keeping the programs it compiled; where the devices, once the state is placed, hold no plan and the
+    placed search refuses, every program the provisional search kept is dropped with it, none outliving the
+    refused compile (review of row 12131's P0: the plan taken out of the compiler before the placed search
+    leaked its programs where that search raised)."""
+    from affine_run import Replaying
+
+    from dew.data.dataset import Loader
+    from dew.training import _candidates
+    from dew.training.planning import PlanRefused
+
+    options.release()
+    gc.collect()
+
+    def held(device) -> int:
+        return sum(array.nbytes for array in jax.live_arrays() if device in array.devices())
+
+    before = {device: held(device) for device in jax.devices()}
+    # Room for every plan until the state is placed, none once it is.
+    monkeypatch.setattr(jax.Device, "memory_stats", lambda device: {
+        "bytes_limit": LIMIT, "bytes_in_use": 0 if held(device) <= before[device] else LIMIT - (1 << 10)})
+    rows = Replaying(lambda position: {"text": np.asarray(BATCH["text"])})
+    trainer = lm()
+    with pytest.raises(PlanRefused):
+        trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=1)
+    gc.collect()
+    assert not _candidates._CANDIDATES, list(_candidates._CANDIDATES)
+    assert not options._HELD, list(options._HELD)
 
 
 def test_a_batch_that_does_not_fit_whole_is_split_before_anything_is_recomputed(monkeypatch):
@@ -1316,6 +1415,36 @@ def test_a_resumed_run_continues_its_admitted_plan_without_timing(tmp_path, monk
     assert (resumed.plan["split"], resumed.plan["remat"]) == (first.plan["split"], first.plan["remat"])
 
 
+def test_a_checkpoint_whose_step_climbed_to_recompute_its_layers_resumes_at_that_rung(tmp_path, monkeypatch):
+    """A run whose devices hold its step only recomputing its layers (`remat`) climbs to that rung and
+    checkpoints there, its model's record stating the recompute; a run resuming that checkpoint on devices
+    that hold either computes the same step, a recompute saying how layers execute and not what they compute
+    (`RunConfig.EXECUTED`), so it resumes, at the rung its checkpoint holds (`Trainer.plan`'s first probe;
+    a resume was refused as another computation, `model.fields.remat`)."""
+    corpus = token_files(tmp_path)
+
+    def run():
+        return windowed(tmp_path / "climbed", 1)
+
+    def fitted(trainer, steps):
+        trainer.fit(windows(corpus), steps=steps, log_every=100, checkpoint_every=1)
+        options.unhold()
+        return trainer
+
+    free(monkeypatch, LIMIT)
+    own = LIMIT - fitted(windowed(tmp_path / "own", 1), 1).plan["probes"][0]["headroom"]
+    free(monkeypatch, LIMIT)
+    full = LIMIT - fitted(windowed(tmp_path / "full", 1, remat="full"), 1).plan["probes"][0]["headroom"]
+    assert full < own, (full, own)
+    free(monkeypatch, (own + full) // 2)
+    climbed = fitted(run(), 1)
+    assert climbed.plan["remat"] is not None, climbed.plan
+    free(monkeypatch, LIMIT)
+    resumed = fitted(run(), 2)
+    first = resumed.plan["probes"][0]
+    assert first["remat"] == climbed.plan["remat"] and first["fits"], (first, climbed.plan)
+
+
 def test_a_split_plan_does_not_compile_or_time_an_optional_faster_sibling(monkeypatch):
     """A batch that needs two microbatches keeps the first fitting plan, without compiling a
     different remat to ask whether it is faster. Even explicitly supplied timing trials are not run:
@@ -1714,6 +1843,30 @@ def test_a_step_that_fails_on_its_first_run_states_the_room_outside_xla_s_pool()
     assert raised.value.fitted == record
     assert [(device["id"], device["outside"] is not None) for device in raised.value.now] == [
         (device.id, device.id in gpus) for device in devices]
+
+
+def test_a_fit_whose_first_step_fails_on_its_devices_raises_it_as_the_steps_first_run():
+    """A fit whose newly compiled step fails on its devices as it first runs, wherever its program raises it
+    (its own wait or an earlier one, `dew.communicators.called`), raises it as the step's first run
+    (`FirstRunFailed`), with the fit check's record and what its devices hold, never the bare runtime
+    error (review of row 12131's P0)."""
+    def refused(total):
+        raise RuntimeError("the devices refused the step")
+
+    def update(updates, state, params=None):
+        jax.debug.callback(refused, sum(jnp.sum(leaf) for leaf in jax.tree.leaves(updates)))
+        return updates, state
+
+    from affine_run import Replaying
+
+    from dew.data.dataset import Loader
+
+    refusing = optax.GradientTransformation(lambda params: optax.EmptyState(), update)
+    trainer = Trainer(lm().objective, refusing, key=jax.random.key(0))
+    rows = Replaying(lambda position: {"text": np.asarray(BATCH["text"])})
+    with pytest.raises(FirstRunFailed) as raised:
+        one_device(trainer).fit(Loader(lambda partition: rows, None, None, ROWS), steps=1)
+    assert isinstance(raised.value.__cause__, jax.errors.JaxRuntimeError), raised.value.__cause__
 
 
 @pytest.mark.parametrize("owned", [True, False], ids=["owned", "borrowed"])

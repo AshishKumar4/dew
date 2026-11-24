@@ -963,7 +963,7 @@ def _laid(call: Call, scope: Callable[[int], resources.Scope], registers: int, t
         launch = resources.Launch(scope, 1, registers, floor=1, most=most, entry=entry,
                                   most_programs=most_programs)
         found = _planned_launch(call, launch)
-        held = cost.wave(call.target, found.programs if found else 1)
+        held = cost.wave(call.target.multiprocessors, found.programs if found else 1)
         return found, min(tiles, held), launch
     floor, most = stages if isinstance(stages, tuple) else (stages, stages)
     launch = resources.Launch(scope, consumers, registers, floor=floor, most=most, entry=entry,

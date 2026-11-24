@@ -858,17 +858,166 @@ def test_gathered_prologued_negative_indices_and_sm80_forced_mosaic():
 
     # Paired + scatter under forced Mosaic on sm80 (`mma.sync` has `gathers_alone=False`): `'tables'`
     # hands off before `'launch'` so forward AND reverse (`_keeps_launch`) both run Mosaic without raising
-    # `KernelRefused` (row 12305).
+    # `KernelRefused` and hold check 1 against float64 truth (rows 12305, 12307).
     perm = jnp.asarray(rng.permutation(rows), jnp.int32)
-    up_w = jnp.asarray(rng.normal(size=(4, 64, 64)) / 8, jnp.bfloat16)
-    dy_pair = (jnp.asarray(rng.normal(size=(rows, 64)) / 8, jnp.bfloat16),
-               jnp.asarray(rng.normal(size=(rows, 64)) / 8, jnp.bfloat16))
+
+    def draw_pair(seed):
+        r = np.random.default_rng(12305 + seed)
+        return (jnp.asarray(r.normal(size=(rows, 64)) / 8, jnp.bfloat16),
+                jnp.asarray(r.normal(size=(4, 64, 64)) / 8, jnp.bfloat16),
+                jnp.asarray(r.normal(size=(4, 64, 64)) / 8, jnp.bfloat16),
+                (jnp.asarray(r.normal(size=(rows, 64)) / 8, jnp.bfloat16),
+                 jnp.asarray(r.normal(size=(rows, 64)) / 8, jnp.bfloat16)))
+
+    def pair_ref(t, gw, uw, *, dtype=jnp.float32):
+        def one(w):
+            y = jax.lax.ragged_dot(t, w, sizes, preferred_element_type=dtype).astype(
+                jnp.bfloat16 if dtype == jnp.float32 else dtype)
+            return jnp.empty_like(y).at[perm].set(y)
+
+        return one(gw), one(uw)
+
+    def pair_truth(t, gw, uw, dy):
+        outs, pull = jax.vjp(lambda a, b, c: pair_ref(a, b, c, dtype=jnp.float64),
+                             t.astype(jnp.float64), gw.astype(jnp.float64), uw.astype(jnp.float64))
+        return outs, pull(tuple(d.astype(jnp.float64) for d in dy))
+
+    def pair_plain_vjp(t, gw, uw, dy):
+        outs, pull = jax.vjp(pair_ref, t, gw, uw)
+        return outs, pull(dy)
+
+    def pair_dew_vjp(t, gw, uw, dy):
+        with generation.assumed("sm80"), generation.chosen(grouped_matmul="mosaic"):
+            outs, pull = jax.vjp(
+                lambda a, b, c: gemm.gemm(a, b, sizes, paired=c, scatter=perm, out_dtype=jnp.bfloat16,
+                                          out_dtypes=(jnp.bfloat16, jnp.bfloat16), interpret_on_cpu=True),
+                t, gw, uw)
+            return outs, pull(dy)
+
+    t0, gw0, uw0, dy0 = draw_pair(0)
     with generation.assumed("sm80"), generation.chosen(grouped_matmul="mosaic"), generation.routes() as seen:
-        outs, pull = jax.vjp(
-            lambda t, gw, uw: gemm.gemm(t, gw, sizes, paired=uw, scatter=perm, out_dtype=jnp.bfloat16,
-                                        out_dtypes=(jnp.bfloat16, jnp.bfloat16), interpret_on_cpu=True),
-            tokens[:rows] if tokens.shape[0] >= rows else jnp.concatenate([tokens, tokens], axis=0),
-            matrices, up_w)
-        grads = pull(dy_pair)
+        pair_dew_vjp(t0, gw0, uw0, dy0)
     assert any(r.kernel == "mosaic" for r in seen), seen
-    assert all(jnp.all(jnp.isfinite(x)) for x in (*outs, *grads))
+    assert_as_exact(jax.jit(pair_dew_vjp), jax.jit(pair_plain_vjp), draw_pair,
+                    "sm80 forced-mosaic paired+scatter", seeds=SEEDS, truth_fn=pair_truth)
+
+
+def test_producers_rungs_keeps_top_after_stated_cap_start():
+    """When `producers.started` picks a `stated` cap below `top` on a tensor-memory family, `producers.rungs`
+    passes that same `stated` cap into `Producers.stepped` so the first spill rung visits `top` instead of
+    skipping it (Train 1231 F2)."""
+    from dew.nn.kernels.templates import report, resources
+    from dew.nn.kernels.templates.gemm import producers
+
+    @dataclasses.dataclass(frozen=True)
+    class _HighRegGmm(grouped_matmul.MosaicGmm):
+        need: int = 160
+
+        def registers(self, ba, config, target=None) -> int:
+            del ba, config, target
+            return self.need
+
+    op = _HighRegGmm()
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    ba = op.bind(bf16((128, 64)), bf16((2, 64, 128)), jax.ShapeDtypeStruct((2,), jnp.int32),
+                 (), (), None, None, jax.ShapeDtypeStruct((128,), jnp.int32),
+                 out_dtype="bfloat16", trans_rhs=False, interpret=False)
+    tile = tiling.Tiles(128, 128, 64, 2, 1, warpgroups=1, cluster=1, family="tcgen05", programs=2)
+    with generation.assumed("sm100"), report.refusals():
+        sm100 = generation.gpu_target()
+        top = producers._top(op, ba, tile, sm100)
+        assert top is not None and op.need > top
+        started = producers.started(op, ba, tile, sm100)
+        start_cap = started.producers.of(op.KERNEL)
+        assert start_cap is not None and start_cap < top
+        report.refuse([(report._identity(op, ba, sm100), started, (op.KERNEL,))])
+        ladder = [rung.producers.of(op.KERNEL) for rung in producers.rungs(op, ba, started, sm100)]
+        assert ladder[0] == resources.facts().raises().below(top), (start_cap, top, ladder)
+        assert start_cap not in ladder, (start_cap, ladder)
+
+
+@pytest.mark.parametrize("in_dtype", [jnp.bfloat16, jnp.float32], ids=["bf16", "fp32"])
+def test_gathered_prologued_paired_layered_with_compute_holds_check_1_and_compiles(in_dtype):
+    """MoE call shape (`compute=bf16` + `prologue` + `gather` + `paired` + `layer`, rows 5391, 12306):
+    holds check 1 forward and full VJP against float64 truth for both bf16 and fp32 input tokens, and
+    compiles spill-free on `sm90` Mosaic without pre-gathering tokens."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels
+
+    rng = np.random.default_rng(12306)
+    tokens_n, rows, depth, width, layers, groups = 48, 64, 64, 64, 2, 4
+    sizes = jnp.asarray([16, 0, 24, 24], jnp.int32)
+    table = jnp.asarray(rng.integers(0, tokens_n, size=(rows,)), jnp.int32)
+    layer_idx = jnp.asarray(1, jnp.int32)
+
+    def scaled(x, r_scale, d_weight):
+        return (x.astype(jnp.float32) * r_scale[:, None] * d_weight[None, :]).astype(x.dtype)
+
+    def draw(seed):
+        r = np.random.default_rng(123060 + seed)
+        return (jnp.asarray(r.normal(size=(tokens_n, depth)) / 8, in_dtype),
+                jnp.asarray(r.normal(size=(rows,)) / 2 + 1.0, jnp.float32),
+                jnp.asarray(r.normal(size=(depth,)) / 2 + 1.0, jnp.float32),
+                jnp.asarray(r.normal(size=(layers, groups, depth, width)) / 8, jnp.bfloat16),
+                jnp.asarray(r.normal(size=(layers, groups, depth, width)) / 8, jnp.bfloat16),
+                (jnp.asarray(r.normal(size=(rows, width)) / 8, jnp.bfloat16),
+                 jnp.asarray(r.normal(size=(rows, width)) / 8, jnp.bfloat16)))
+
+    def ref_fwd(t, rs, dw, s1, s2, *, dtype=jnp.float32):
+        out_d = jnp.bfloat16 if dtype == jnp.float32 else dtype
+        x = (t[table].astype(out_d).astype(dtype) * rs.astype(dtype)[:, None]
+             * dw.astype(dtype)[None, :]).astype(out_d)
+        w1, w2 = s1[layer_idx].astype(out_d), s2[layer_idx].astype(out_d)
+        return (jax.lax.ragged_dot(x, w1, sizes, preferred_element_type=dtype).astype(out_d),
+                jax.lax.ragged_dot(x, w2, sizes, preferred_element_type=dtype).astype(out_d))
+
+    def truth(t, rs, dw, s1, s2, dy):
+        outs, pull = jax.vjp(lambda a, b, c, d, e: ref_fwd(a, b, c, d, e, dtype=jnp.float64),
+                             t.astype(jnp.float64), rs.astype(jnp.float64), dw.astype(jnp.float64),
+                             s1.astype(jnp.float64), s2.astype(jnp.float64))
+        return outs, pull(tuple(g.astype(jnp.float64) for g in dy))
+
+    def plain_vjp(t, rs, dw, s1, s2, dy):
+        outs, pull = jax.vjp(ref_fwd, t, rs, dw, s1, s2)
+        return outs, pull(dy)
+
+    def dew_vjp(t, rs, dw, s1, s2, dy):
+        with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+            outs, pull = jax.vjp(
+                lambda a, b, c, d, e: gemm.gemm(
+                    a, d, sizes, prologue=scaled,
+                    prologue_operands=((b, ("rows",)), (c, ("depth",))),
+                    compute=jnp.bfloat16, out_dtype=jnp.bfloat16,
+                    out_dtypes=(jnp.bfloat16, jnp.bfloat16), paired=e, layer=layer_idx,
+                    gather=table, interpret_on_cpu=True),
+                t, rs, dw, s1, s2)
+            return outs, pull(dy)
+
+    assert_as_exact(jax.jit(dew_vjp), jax.jit(plain_vjp), draw,
+                    f"moe gather+prologue+paired+layer+compute {in_dtype}", seeds=SEEDS, truth_fn=truth)
+
+    if in_dtype == jnp.bfloat16 and generation.compile_only_gpus("sm90"):
+        specs = (jax.ShapeDtypeStruct((tokens_n, depth), jnp.bfloat16),
+                 jax.ShapeDtypeStruct((rows,), jnp.float32),
+                 jax.ShapeDtypeStruct((depth,), jnp.float32),
+                 jax.ShapeDtypeStruct((layers, groups, depth, width), jnp.bfloat16),
+                 jax.ShapeDtypeStruct((layers, groups, depth, width), jnp.bfloat16),
+                 jax.ShapeDtypeStruct((groups,), jnp.int32),
+                 jax.ShapeDtypeStruct((rows,), jnp.int32),
+                 jax.ShapeDtypeStruct((), jnp.int32))
+
+        def compiled(t, rs, dw, s1, s2, sz, tbl, lyr):
+            with generation.chosen(grouped_matmul="mosaic"):
+                return gemm.gemm(t, s1, sz, prologue=scaled,
+                                 prologue_operands=((rs, ("rows",)), (dw, ("depth",))),
+                                 compute=jnp.bfloat16, out_dtype=jnp.bfloat16,
+                                 out_dtypes=(jnp.bfloat16, jnp.bfloat16), paired=s2, layer=lyr,
+                                 gather=tbl)
+
+        with generation.assumed("sm90"):
+            records = compile_mosaic_kernels(
+                [KernelCase("moe_gather_prologue_paired_layer_sm90", lambda: (compiled, specs))], "sm90")
+        for rec in records:
+            assert not rec.get("error"), rec
+            assert rec["kernels"], rec
+            assert all(k.get("spilled") == 0 for k in rec["kernels"]), rec

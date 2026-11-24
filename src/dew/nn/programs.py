@@ -188,9 +188,9 @@ class DotArithmetic(NamedTuple):
         return self.parts * min(self.significands)
 
 # The parts a split dot algorithm takes each operand in, by its primitive products: one product of one
-# part; three of two parts' four, the low parts' product dropped (TF32x3, BF16x3); six of three parts'
-# nine, the three lowest dropped (BF16x6); all nine (BF16x9).
-_PARTS = {1: 1, 3: 2, 6: 3, 9: 3}
+# part; three of two parts' four, the low parts' product dropped (TF32x3, BF16x3); all four of two parts
+# (an X4); six of three parts' nine, the three lowest dropped (BF16x6); all nine (BF16x9).
+_PARTS = {1: 1, 3: 2, 4: 2, 6: 3, 9: 3}
 
 TRITON_ALGORITHMS = tuple(preset for preset in jax.lax.DotAlgorithmPreset
                           if preset.supported_lhs_types is not None

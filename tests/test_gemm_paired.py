@@ -1216,3 +1216,248 @@ def test_joined_depths_walks_lora_in_place_without_concatenating_base():
 
     assert_as_exact(dew_vjp, jax.jit(ref_vjp), draw, "zero-copy chained low_rank", seeds=8,
                     truth_fn=functools.partial(ref_vjp, dtype=jnp.float64))
+
+
+def test_grouped_low_rank_walks_in_place_and_holds_check_1_and_compiles():
+    """Grouped MoE `low_rank.low_rank` (`group_sizes` given, row 1304) walks base experts `(x, W)` and LoRA
+    `(t, B)` in place via `mosaic_gpu.gmm`'s grouped `chained` launch without concatenating base weights,
+    holds check 1 forward + VJP (full and frozen-base) with an empty expert group, and compiles spill-free on
+    `sm90`."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels
+
+    from dew.nn.kernels.low_rank import low_rank
+    from dew.nn.programs import equations
+
+    groups, rows, depth, width, rank = 3, 128, 256, 128, 16
+    sizes = jnp.asarray([48, 0, 80], jnp.int32)
+
+    def draw(seed):
+        rng = np.random.default_rng(13040 + seed)
+        x = jnp.asarray(rng.standard_normal((rows, depth)) / np.sqrt(depth), jnp.bfloat16)
+        w = jnp.asarray(rng.standard_normal((groups, depth, width)) / np.sqrt(depth), jnp.bfloat16)
+        a = jnp.asarray(rng.standard_normal((groups, depth, rank)) / np.sqrt(depth), jnp.bfloat16)
+        b = jnp.asarray(rng.standard_normal((groups, rank, width)) / np.sqrt(rank), jnp.bfloat16)
+        cot = jnp.asarray(rng.standard_normal((rows, width)), jnp.bfloat16)
+        return x, w, a, b, cot
+
+    from jax.core import ShapedArray
+
+    x0, w0, a0, b0, c0 = draw(0)
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+        traced = jax.make_jaxpr(
+            lambda x, w, a, b: low_rank(x, w, a, b, 0.5, sizes, out_dtype=jnp.bfloat16,
+                                        interpret_on_cpu=True)
+        )(x0, w0, a0, b0)
+        assert not any(
+            eqn.primitive.name == "concatenate"
+            and any(isinstance(v.aval, ShapedArray)
+                    and v.aval.shape in ((rows, depth), (groups, depth, width))
+                    for v in eqn.invars)
+            for eqn in equations(traced.jaxpr)
+        )
+        # Frozen-kernel VJP (differentiating x, a, b only) produces valid adapter gradients.
+        _, pull_frozen = jax.vjp(
+            lambda xi, ai, bi: low_rank(xi, w0, ai, bi, 0.5, sizes, out_dtype=jnp.bfloat16,
+                                        interpret_on_cpu=True),
+            x0, a0, b0)
+        dx_f, da_f, db_f = pull_frozen(c0)
+        assert dx_f.shape == x0.shape and da_f.shape == a0.shape and db_f.shape == b0.shape
+
+    def dew_vjp(x, w, a, b, cot):
+        with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+            out, pull = jax.vjp(
+                lambda xi, wi, ai, bi: low_rank(xi, wi, ai, bi, 0.5, sizes, out_dtype=jnp.bfloat16,
+                                                interpret_on_cpu=True),
+                x, w, a, b)
+            return out, pull(cot)
+
+    def ref_vjp(x, w, a, b, cot, *, dtype=jnp.float32):
+        def fwd(xi, wi, ai, bi):
+            t = (0.5 * jax.lax.ragged_dot(xi, ai, sizes, preferred_element_type=dtype)).astype(
+                jnp.bfloat16 if dtype == jnp.float32 else dtype)
+            y = (jax.lax.ragged_dot(xi, wi, sizes, preferred_element_type=dtype)
+                 + jax.lax.ragged_dot(t, bi, sizes, preferred_element_type=dtype))
+            return y.astype(jnp.bfloat16 if dtype == jnp.float32 else dtype)
+
+        if dtype == jnp.float64:
+            out, pull = jax.vjp(fwd, x.astype(dtype), w.astype(dtype), a.astype(dtype), b.astype(dtype))
+            return out, pull(cot.astype(dtype))
+        out, pull = jax.vjp(fwd, x, w, a, b)
+        return out, pull(cot)
+
+    assert_as_exact(dew_vjp, jax.jit(ref_vjp), draw, "grouped zero-copy chained low_rank", seeds=8,
+                    truth_fn=functools.partial(ref_vjp, dtype=jnp.float64))
+
+    if generation.compile_only_gpus("sm90"):
+        bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+        specs = (bf16((rows, depth)), bf16((groups, depth, width)), bf16((groups, depth, rank)),
+                 bf16((groups, rank, width)), jax.ShapeDtypeStruct((groups,), jnp.int32))
+
+        def compiled_moe_lora(x, w, a, b, s):
+            with generation.chosen(grouped_matmul="mosaic"):
+                return low_rank(x, w, a, b, 0.5, s, out_dtype=jnp.bfloat16)
+
+        with generation.assumed("sm90"):
+            records = compile_mosaic_kernels(
+                [KernelCase("grouped_low_rank_sm90", lambda: (compiled_moe_lora, specs))], "sm90")
+        for rec in records:
+            assert not rec.get("error"), rec
+            assert rec["kernels"], rec
+            assert all(k.get("spilled") == 0 for k in rec["kernels"]), rec
+
+
+@pytest.mark.parametrize("grouped", [False, True])
+def test_an_adapted_products_gradient_keeps_a_wide_cotangent(grouped):
+    """An adapted product of fp16 rows with an fp32 output pulls its cotangent back at the cotangent's width:
+    `2**16`, past fp16's largest, against a kernel of `2**-10` gives the rows exactly 64, not the inf of a
+    cotangent rounded to fp16 first, dense and grouped (row 1304)."""
+    from dew.nn.kernels.low_rank import low_rank
+
+    half = functools.partial(jnp.zeros, dtype=jnp.float16)
+    x = jnp.ones((8, 16), jnp.float16)
+    kernel = jnp.full((2, 16, 8) if grouped else (16, 8), 2.0 ** -10, jnp.float16)
+    a, b = half((2, 16, 4) if grouped else (16, 4)), half((2, 4, 8) if grouped else (4, 8))
+    sizes = jnp.asarray([4, 4], jnp.int32) if grouped else None
+    _, pull = jax.vjp(lambda rows: low_rank(rows, kernel, a, b, 1.0, sizes, out_dtype=jnp.float32), x)
+    (d_x,) = pull(jnp.zeros((8, 8), jnp.float32).at[0, 0].set(2.0 ** 16))
+    want = np.zeros((8, 16), np.float16)
+    want[0] = 64.0
+    np.testing.assert_array_equal(np.asarray(d_x), want)
+
+    # An fp32 kernel's `1 + 2**-12` the forward multiplied as fp16's 1: against -1 its gradient cancels.
+    exact = jnp.zeros(kernel.shape, jnp.float32).at[..., 0, 0].set(1.0 + 2.0 ** -12).at[..., 0, 1].set(-1.0)
+    _, pull = jax.vjp(lambda rows: low_rank(rows, exact, a, b, 1.0, sizes, out_dtype=jnp.float32), x)
+    (d_x,) = pull(jnp.zeros((8, 8), jnp.float32).at[0, 0].set(1.0).at[0, 1].set(1.0))
+    assert np.asarray(d_x)[0, 0] == 0.0, np.asarray(d_x)[0, :2]
+
+    # An fp16 output's cotangent of 1 through a scale of 2**16 (past fp16's largest) and a factor of
+    # 2**-10 gives the rows 64: the scaled update's cotangent stays wide where fp16 would not hold it.
+    rank_a = jnp.full((*a.shape[:-1], 1), 2.0 ** -10, jnp.float16)
+    rank_b = jnp.ones((*b.shape[:-2], 1, b.shape[-1]), jnp.float16)
+    _, pull = jax.vjp(lambda rows: low_rank(rows, jnp.zeros_like(kernel), rank_a, rank_b, 2.0 ** 16, sizes,
+                                            out_dtype=jnp.float16), jnp.zeros_like(x))
+    (d_x,) = pull(jnp.zeros((8, 8), jnp.float16).at[0, 0].set(1.0))
+    want = np.zeros((8, 16), np.float16)
+    want[0] = 64.0
+    np.testing.assert_array_equal(np.asarray(d_x), want)
+
+    # And below fp16's least normal: a scale of 2**-26 against a factor of 2**14 gives the rows 2**-12, the
+    # scaled update's cotangent not flushed to fp16's zero first.
+    large_a = jnp.full(rank_a.shape, 2.0 ** 14, jnp.float16)
+    _, pull = jax.vjp(lambda rows: low_rank(rows, jnp.zeros_like(kernel), large_a, rank_b, 2.0 ** -26, sizes,
+                                            out_dtype=jnp.float16), jnp.zeros_like(x))
+    (d_x,) = pull(jnp.zeros((8, 8), jnp.float16).at[0, 0].set(1.0))
+    want = np.zeros((8, 16), np.float16)
+    want[0] = 2.0 ** -12
+    np.testing.assert_array_equal(np.asarray(d_x), want)
+
+    # A bf16 cotangent of 1 through a scale of (2 - 2**-8) * 2**127, finite in fp32 but past bf16's largest,
+    # and a factor of 2**-120 gives the rows 255.5, rounded to bf16's 256.
+    huge = (2.0 - 2.0 ** -8) * 2.0 ** 127
+    tiny_a, one_b = jnp.full(rank_a.shape, 2.0 ** -120, jnp.bfloat16), jnp.ones(rank_b.shape, jnp.bfloat16)
+    _, pull = jax.vjp(lambda rows: low_rank(rows, jnp.zeros(kernel.shape, jnp.bfloat16), tiny_a, one_b, huge,
+                                            sizes, out_dtype=jnp.bfloat16), jnp.zeros(x.shape, jnp.bfloat16))
+    (d_x,) = pull(jnp.zeros((8, 8), jnp.bfloat16).at[0, 0].set(1.0))
+    want = np.zeros((8, 16), np.float32)
+    want[0] = 256.0
+    np.testing.assert_array_equal(np.asarray(d_x, np.float32), want)
+
+    # The factor's gradient reads the rank operand as the forward multiplied it: 2**-26 rounds to fp16's 0,
+    # so b's gradient under a cotangent of 2**14 is 0, not 2**-12.
+    first = jnp.zeros(x.shape, jnp.float16).at[:, 0].set(1.0)
+    small_a = jnp.full(rank_a.shape, 2.0 ** -14, jnp.float16)
+    _, pull = jax.vjp(lambda b_: low_rank(first, jnp.zeros_like(kernel), small_a, b_, 2.0 ** -12, sizes,
+                                          out_dtype=jnp.float16), jnp.zeros_like(rank_b))
+    (d_b,) = pull(jnp.full((8, 8), 2.0 ** 14, jnp.float16))
+    np.testing.assert_array_equal(np.asarray(d_b), np.zeros(rank_b.shape, np.float16))
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("grouped", [False, True])
+def test_an_adapted_product_in_a_checked_map_sums_its_replicated_operands_gradients(grouped):
+    """An adapted product inside a `shard_map` over two CPU devices that checks the axes its values vary over
+    (`check_vma`), each device its own rows and every device the same kernel, factors and scale: their
+    gradients are each device's partial summed over the rows' axis, invariant, equal to the base product and
+    its update written plainly, exactly, over small integers (row 1304)."""
+    from dew.nn.kernels.low_rank import low_rank
+
+    rng = np.random.default_rng(1304)
+
+    def ints(*shape):
+        return jnp.asarray(rng.integers(-2, 3, shape), jnp.bfloat16)
+
+    stacked = (2,) if grouped else ()
+    x, kernel = ints(8, 16), ints(*stacked, 16, 8)
+    a, b, scale = ints(*stacked, 16, 4), ints(*stacked, 4, 8), jnp.float32(1.0)
+    # Each device's 4 rows, two to each group.
+    sizes = jnp.asarray([2, 2], jnp.int32) if grouped else None
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:2]), ("data",))
+    data, whole = jax.sharding.PartitionSpec("data"), jax.sharding.PartitionSpec()
+
+    def plain(rows, w, a_, b_, s):
+        rows, w, a_, b_ = (operand.astype(jnp.float32) for operand in (rows, w, a_, b_))
+        if sizes is None:
+            return rows @ w + s * ((rows @ a_) @ b_)
+        # Each row's group's matrices, gathered.
+        owner = jnp.repeat(jnp.arange(2), sizes, total_repeat_length=rows.shape[0])
+        update = jnp.einsum('rk,rkw->rw', jnp.einsum('rd,rdk->rk', rows, a_[owner]), b_[owner])
+        return jnp.einsum('rd,rdw->rw', rows, w[owner]) + s * update
+
+    def adapted(rows, w, a_, b_, s):
+        return low_rank(rows, w, a_, b_, s, sizes, out_dtype=jnp.float32)
+
+    def gradients(product):
+        def each_device(rows, w, a_, b_, s):
+            return jax.grad(lambda *ops: jnp.sum(product(rows, *ops)), argnums=(0, 1, 2, 3))(w, a_, b_, s)
+
+        return jax.jit(jax.shard_map(each_device, mesh=mesh, in_specs=(data, whole, whole, whole, whole),
+                                     out_specs=whole, check_vma=True))(x, kernel, a, b, scale)
+
+    for got, want in zip(gradients(adapted), gradients(plain), strict=True):
+        np.testing.assert_array_equal(np.asarray(got, np.float32), np.asarray(want, np.float32))
+
+
+@pytest.mark.mesh(devices=2)
+def test_an_adapted_products_replicated_gradient_sums_before_it_rounds():
+    """A replicated fp16 kernel's gradient in a checked `shard_map` over two CPU devices is their partials
+    summed wide, then rounded once: `65536` (fp16's inf alone) and `-65504` sum to 32 (row 1304)."""
+    from dew.nn.kernels.low_rank import low_rank
+
+    x = jnp.zeros((2, 8), jnp.float16).at[:, 0].set(1.0)
+    kernel, a, b = (jnp.zeros(shape, jnp.float16) for shape in ((8, 8), (8, 4), (4, 8)))
+    cotangent = jnp.zeros((2, 8), jnp.float32).at[0, 0].set(65536.0).at[1, 0].set(-65504.0)
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:2]), ("data",))
+    data, whole = jax.sharding.PartitionSpec("data"), jax.sharding.PartitionSpec()
+
+    def each_device(rows, w, dy):
+        _, pull = jax.vjp(lambda w_: low_rank(rows, w_, a, b, 1.0, out_dtype=jnp.float32), w)
+        return pull(dy)[0]
+
+    d_kernel = jax.jit(jax.shard_map(each_device, mesh=mesh, in_specs=(data, whole, data), out_specs=whole,
+                                     check_vma=True))(x, kernel, cotangent)
+    want = np.zeros((8, 8), np.float16)
+    want[0, 0] = 32.0
+    np.testing.assert_array_equal(np.asarray(d_kernel), want)
+
+
+def test_an_adapted_products_backward_keeps_fp32_products_whole_under_any_preset():
+    """An adapted product's backward runs its fp32 factor products in arithmetic that keeps an fp32
+    operand's 24 digits (`low_rank._kept`, read by `programs.dot_arithmetic`) under every dot algorithm
+    preset JAX names, those of narrower operands (BF16, TF32, F16), those JAX refuses fp32 operands for (an
+    FP8 one) and split ones (X3, X6, X9) alike, never raising; one that already keeps them is unchanged
+    (row 12394)."""
+    from dew.nn.kernels.low_rank import _kept
+    from dew.nn.programs import dot_arithmetic
+
+    for preset in jax.lax.DotAlgorithmPreset:
+        kept = _kept(preset)
+        arithmetic = dot_arithmetic(kept, jnp.float32, jnp.float32)
+        assert arithmetic is None or arithmetic.digits >= 24, (preset, kept, arithmetic)
+        try:
+            own = dot_arithmetic(preset, jnp.float32, jnp.float32)
+        except ValueError:
+            continue
+        if own is None or own.digits >= 24:
+            assert kept is preset, (preset, kept)
+

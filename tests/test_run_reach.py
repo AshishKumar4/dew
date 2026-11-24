@@ -1,10 +1,11 @@
 """A recorded run reaches the typed options the library has (theme T57, rows 2239-2245).
 
 Each option `Trainer.fit`, `Checkpoints`, `EvalSuite`, Optax, `TextGeneration.from_run` or the attention
-template takes is set where a run is set, on its command line, in its `run.json` or with `dew train
---set`, and observed where it acts: the step a plateau stops at and the model a run ends on, the steps a
-split is scored at, the local checkpoints written, the step an export reads, the updates an optimizer
-makes, the placement a harness loads into, and the form a run's attention trains in."""
+template takes is set where a run is set, on its command line, in its `run.json` or by its dotted path
+(`RunConfig.override`) before `dew train` reads it, and observed where it acts: the step a plateau stops at
+and the model a run ends on, the steps a split is scored at, the local checkpoints written, the step an export
+reads, the updates an optimizer makes, the placement a harness loads into, and the form a run's attention
+trains in."""
 
 import dataclasses
 import json
@@ -381,8 +382,9 @@ def test_a_run_saved_with_its_attention_form_reads_as_the_precision_it_named(tmp
 
 @pytest.mark.mesh(devices=8)
 def test_a_runs_numerics_are_named_on_the_command_line_in_its_record_and_at_a_load(tmp_path):
-    """A run's numerics are reachable by name (ledger 2500, review row 2589): `dew train --set
-    trainer.precision=accurate` trains a recorded run under `ACCURATE` and records it whole; a record that
+    """A run's numerics are reachable by name (ledger 2500, review row 2589): a recorded run whose
+    `trainer.precision` is set to "accurate" (`RunConfig.override`) trains under `ACCURATE` through `dew
+    train` and records it whole; a record that
     names "accurate" or a Lightning dtype preset reads as those numerics; `Pretrained.load(precision=...)`
     loads in their dtypes and serves under them, an explicit dtype beside them refused, and
     `dew.pipeline` refuses them for a run directory, whose record names its own."""
