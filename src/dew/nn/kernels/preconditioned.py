@@ -15,10 +15,10 @@ A packed document's first token enters both states at zero."""
 
 from __future__ import annotations
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.nn.derivatives import Protected, contracted, declared_tangent
 from dew.nn.precision import at_least_fp32, broadcast_summed, l2norm
 
 from . import recurrence
@@ -26,14 +26,12 @@ from .diagonal import diagonal_scan
 from .recurrence_chunk import CHUNK_SIZE, Chunk, chunk
 
 
-@jax.custom_jvp
-def _squash(r):
+def _squash_value(r):
     """The fast squash `r / (1 + |r|)`, bounded in (-1, 1) (the module's account)."""
     return r / (1.0 + jnp.abs(r))
 
 
-@_squash.defjvp
-def _squash_jvp(primals, tangents):
+def _squash_tangent(primals, tangents):
     """`_squash`'s derivative `dr / (1 + |r|)^2`, divided twice, never the quotient rule's `(1 + |r| - |r|)`,
     which cancels to zero where `1 + |r|` rounds to `|r|` (a center of -2^25: fla's ATK backward's 2^-50),
     nor squared past the range where `|r|` passes 2^64; its primal `_squash` itself, so a derivative of a
@@ -41,6 +39,10 @@ def _squash_jvp(primals, tangents):
     (r,), (dr,) = primals, tangents
     held = 1.0 + jnp.abs(r)
     return _squash(r), dr / held / held
+
+
+_squash = contracted("test_the_squash_holds_every_order")(
+    declared_tangent(Protected(), _squash_value, _squash_tangent))
 
 
 def _squashed(key, moment, center, x: float, eps: float):

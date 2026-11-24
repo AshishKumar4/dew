@@ -26,7 +26,16 @@ from map_judge import marked_seeds
 from ssd_support import stepwise_scan
 
 from dew.algebra import SATURATION, scan
-from dew.nn.kernels import diagonal, generation, recurrence, recurrence_chunk, rwkv4, short_conv, ssd
+from dew.nn.kernels import (
+    diagonal,
+    generation,
+    preconditioned,
+    recurrence,
+    recurrence_chunk,
+    rwkv4,
+    short_conv,
+    ssd,
+)
 from dew.nn.kernels.templates.recurrence import turned
 from dew.nn.linear import causal_conv1d
 from dew.nn.mixers.mamba2 import chunk_ssd
@@ -917,3 +926,19 @@ def test_a_turned_template_call_holds_every_order(edge, taken):
     plainly = jax.jit(_turned_plainly)
     assert_drawn_contract(jax.jit(rule), draw, EDGES[edge], f"a turned template call {edge}",
                           truth_fn=plainly, plain_fn=plainly, taking=ORDER_SETS[taken])
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_the_squash_holds_every_order(edge):
+    """ATK's squash `r / (1 + |r|)` (`preconditioned._squash`, its tangent `dr / (1 + |r|)^2` divided twice,
+    its primal itself): every order finite wherever float64 is a normal float32 and wherever the plain
+    quotient is, at values near float32's ends, where it saturates and `1 + |r|` rounds to `|r|`."""
+    primals = normal_draw(1458, (64,), scale=EDGES[edge])
+    direction = normal_draw(1459, (64,), scale=EDGES[edge])
+    (cotangent,) = normal_draw(1460, (64,))
+
+    def plain(r):
+        return r / (1.0 + jnp.abs(r))
+
+    assert_contract(preconditioned._squash, primals, direction, cotangent, f"ATK's squash {edge}",
+                    plain_fn=plain)

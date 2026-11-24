@@ -231,6 +231,7 @@ def test_atks_keys_over_no_tokens_keep_the_moment_and_no_gradient():
     np.testing.assert_array_equal(np.asarray(d_state), 1.0)
 
 
+@pytest.mark.mesh(devices=2)
 def test_the_rule_runs_in_a_shard_map_that_checks_varying_axes():
     """The chunked rule's rows split over a checked `shard_map`'s axis, its centers replicated: its output,
     final states and every operand's gradient finite, and the centers' gradient of the unsplit rule's
