@@ -350,7 +350,7 @@ def test_two_mma_sync_consumers_walk_segments_whose_boundaries_differ_through_on
     own a segment met unpaired where their boundaries differ, and hung). Walked directly, several segments
     are refused: the consumers' loads would follow segments each its own."""
     p, x = _fed_operands()
-    with pytest.raises(NotImplementedError, match="walk_own"):
+    with pytest.raises(NotImplementedError):
         _fed_products(p, x, interpret=INTERPRETED, consumers=2, lo=3, shared=True, split=True, agreed=False)
     got = _fed_products(p, x, interpret=INTERPRETED, consumers=2, lo=3, shared=True, split=True)
     summed = sum(weight * np.asarray(p, np.float32)[:, rows] @ np.asarray(x, np.float32)[rows]

@@ -246,7 +246,9 @@ class Streams:
     views: dict
     agreed: tuple | None = None
     """The steps `(lo, hi)` every consumer of a pipeline two run loads together, where `walk_own` agrees
-    them: a walk loads them in turn whatever its consumer's own segments (`CpAsync.walk`)."""
+    them: a walk loads them in turn whatever its consumer's own segments (`CpAsync.walk`). Its callers'
+    invariants: the streamed range is every consumer's alike, and a step's rendezvous across consumers (a
+    sum across them, `across.summed_across`) is reached by every consumer at that step."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1136,8 +1138,9 @@ def _dispatched(segments: tuple) -> Callable:
     step of the segment whose range holds its index, nothing where none does. Segments whose bounds are
     known are refused where they overlap or fall out of order."""
     known = [(lo, hi) for _, lo, hi in segments if isinstance(lo, int) and isinstance(hi, int)]
-    if len(known) == len(segments) and any(hi > lo and nxt_lo < hi and nxt_hi > nxt_lo
-                                           for (lo, hi), (nxt_lo, nxt_hi) in itertools.pairwise(known)):
+    nonempty = [(lo, hi) for lo, hi in known if hi > lo]
+    overlapping = any(nxt_lo < hi for (_, hi), (nxt_lo, _) in itertools.pairwise(nonempty))
+    if len(known) == len(segments) and overlapping:
         raise ValueError(f"a collective walk's segments lie ordered and apart, not {known}")
 
     def step(index, slots, carried, accumulators):
