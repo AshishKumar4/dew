@@ -134,3 +134,39 @@ def quantize_mxfp8_epilogue():
     """GEMM epilogue returning `(e4m3_codes [float8_e4m3fn], e8m0_scales [float8_e8m0fnu])` for each
     32-column block via `bits.encode_form` inline PTX (rows 8547, 12037)."""
     return _mxfp8_quantize_epilogue
+
+
+def _blockwise_fp8_quantized(values: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """`values` (`[rows, cols]`, `cols % SCALE_DEPTH == 0`, the bf16 values a recipe quantizes, as fp32) as
+    E4M3 codes a 1 x `SCALE_DEPTH` tile at a time and each tile's power-of-two scale (fp32, broadcast over
+    its tile's columns), bitwise `projections.rows_quantized`'s (`fake_quant.fp8_scaled_blocks`: amax floored
+    at 1e-4, the scale the ceiling power of two of amax / 448; codes E4M3 by `bits.encode_form`, ties to even,
+    saturated). Its scales are normal powers of two for every finite value, so the scaled value is the
+    product by the scale's reciprocal, exact, where a quotient would need `lowered_divide` (DeepSeek-V3's
+    blockwise FP8 recipe, row 8547)."""
+    from dew.nn.fake_quant import E4M3_MAX
+
+    amax = jnp.maximum(_block_max(values, product_formats.SCALE_DEPTH), jnp.float32(1e-4))
+    word = jax.lax.bitcast_convert_type(amax * jnp.float32(1 / E4M3_MAX), jnp.uint32)
+    # 2 ** ceil(log2(amax / 448)) off its bits (`fake_quant._power_of_two_ceil`): its biased exponent, one
+    # more where any fraction bit is set; within the normal range for every finite amax past the floor.
+    biased = ((word >> jnp.uint32(23)) & jnp.uint32(0xFF)) + ((word & jnp.uint32(0x7FFFFF)) != 0).astype(
+        jnp.uint32)
+    scale = jax.lax.bitcast_convert_type(biased << jnp.uint32(23), jnp.float32)
+    inverse = jax.lax.bitcast_convert_type((jnp.uint32(254) - biased) << jnp.uint32(23), jnp.float32)
+    return encode_tile(values * inverse, bits.E4M3), scale
+
+
+def blockwise_fp8_epilogue(epilogue=None, out_dtype=jnp.bfloat16):
+    """A GEMM epilogue returning the product's value in `out_dtype` (through `epilogue` where given: a
+    gated MLP's SwiGLU of its two accumulators) beside that value quantized as DeepSeek-V3's blockwise FP8
+    recipe quantizes its next product's rows (`_blockwise_fp8_quantized`: E4M3 codes and 1 x 128 power-of-two
+    scales of the value rounded to `out_dtype`), so the next product's operand comes out of this one's
+    epilogue, bitwise the recipe's `projections.rows_quantized` of the stored value (row 8547)."""
+    def quantized(*tiles):
+        value = tiles[0] if epilogue is None else epilogue(*tiles)
+        rounded = value.astype(out_dtype)
+        codes, scales = _blockwise_fp8_quantized(rounded.astype(jnp.float32))
+        return rounded, codes, scales
+
+    return quantized
