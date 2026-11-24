@@ -6,11 +6,12 @@ from __future__ import annotations
 
 import dataclasses
 import importlib
-from collections.abc import Callable
 from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
+
+from dew.nn import sharding
 
 from . import generation
 from .grouped_launch import _GroupedLaunch
@@ -18,12 +19,17 @@ from .templates.gemm import tiling
 from .templates.gemm.hooks import NO_HOOKS, Hooks
 
 
-def _cutlass_call(target: int, out: jax.ShapeDtypeStruct) -> Callable:
-    """dew_cutlass's FFI call giving `out` of the `target`-th of the targets the wheel names
-    (`dew_cutlass.TARGETS`: its grouped GEMM, then its weight gradient), a mapped call running its maps in
-    turn, one launch each (row 4389: JAX's FFI batching refuses a call that states no rule)."""
+def _cutlass_call(target: int, out: jax.ShapeDtypeStruct, *operands, **attributes) -> jax.Array:
+    """dew_cutlass's FFI call of the `target`-th of the targets the wheel names (`dew_cutlass.TARGETS`: its
+    grouped GEMM, then its weight gradient) on `operands`, giving `out`, a mapped call running its maps in
+    turn, one launch each (row 4389: JAX's FFI batching refuses a call that states no rule). Under a
+    checked `shard_map` its operands vary alike and its result varies as they do (`sharding.varied_alike`,
+    `sharding.computed_from`): an FFI call requires the first and states its result's type as given, so a
+    layer's matrices sliced at each device's own layer (`CutlassGmm._fwd`) were typed the same on every
+    device (#3976's review P0)."""
     name = importlib.import_module('dew_cutlass').TARGETS[target]
-    return jax.ffi.ffi_call(name, out, vmap_method='sequential')
+    call = jax.ffi.ffi_call(name, sharding.computed_from(out, *operands), vmap_method='sequential')
+    return call(*sharding.varied_alike(operands), **attributes)
 
 
 def cutlass_tile(architecture: str, out_dtype) -> tiling.Tiles:
@@ -123,8 +129,7 @@ class CutlassGmm(_Cutlass):
         importlib.import_module('dew_cutlass').registered()
         width = kernel.shape[1] if trans_rhs else kernel.shape[2]
         out = jax.ShapeDtypeStruct((tokens.shape[0], width), jnp.dtype(out_dtype))
-        call = _cutlass_call(0, out)
-        return call(tokens, kernel, sizes, transpose_w=trans_rhs), None
+        return _cutlass_call(0, out, tokens, kernel, sizes, transpose_w=trans_rhs), None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -149,4 +154,4 @@ class CutlassTgmm(_Cutlass):
         importlib.import_module('dew_cutlass').registered()
         out = jax.ShapeDtypeStruct((sizes.shape[0], tokens.shape[1], cotangent.shape[1]),
                                    jnp.dtype(out_dtype))
-        return _cutlass_call(1, out)(tokens, cotangent, sizes), None
+        return _cutlass_call(1, out, tokens, cotangent, sizes), None
