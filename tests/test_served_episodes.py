@@ -1,7 +1,6 @@
 """An episode cohort served in process (`EpisodeCollector.cache`): its turns run through the serving
 engine, each turn prefilling only what follows its row's last, and draw what the policy draws whole."""
 
-import hashlib
 import logging
 from contextlib import contextmanager
 from dataclasses import replace
@@ -14,6 +13,7 @@ from flax import linen as nn
 from model_support import float64_twin
 from reference_error import as_given, assert_as_exact
 from test_serving import hybrid_model
+from upstream_support import digest
 
 from dew.inference.serving import PagedKV
 from dew.inference.tasks import TextGeneration
@@ -146,17 +146,13 @@ def test_a_served_cohort_draws_what_its_policy_draws_whole(kind, sampling):
     names = ("raw", "behavior") if sampling.temperature else ("raw",)
     truth_score = scored(float64_twin(model), sampling)
     # Each arm's contexts and actions by the bytes of the weights it drew them over: the draws check 1 takes.
-    discrete: dict[str, dict[bytes, tuple[np.ndarray, np.ndarray]]] = {"served": {}, "whole": {}}
-
-    def weighed(variables) -> bytes:
-        leaves = jax.tree.leaves(variables)
-        return hashlib.sha256(b"".join(np.asarray(leaf).tobytes() for leaf in leaves)).digest()
+    discrete: dict[str, dict[str, tuple[np.ndarray, np.ndarray]]] = {"served": {}, "whole": {}}
 
     def likelihoods(arm, name):
         @as_given
         def run(variables):
             drawn = collected(arm, variables)
-            discrete[name][weighed(variables)] = (drawn["contexts"], drawn["tokens"])
+            discrete[name][digest(variables)] = (drawn["contexts"], drawn["tokens"])
             return {held: drawn[held] for held in names}
         return run
 
@@ -166,7 +162,7 @@ def test_a_served_cohort_draws_what_its_policy_draws_whole(kind, sampling):
         # the gate widened (float32's exactly), or drawn as its arm draws them, in float32 outside the
         # truth's x64 (row 12407: under x64 the collection compiled and ran each draw a second time).
         narrow = jax.tree.map(lambda leaf: np.asarray(leaf, np.float32), variables)
-        drawn = discrete["whole"].get(weighed(narrow))
+        drawn = discrete["whole"].get(digest(narrow))
         if drawn is None:
             with jax.enable_x64(new_val=False):
                 collection = collected(whole, narrow)
