@@ -946,6 +946,35 @@ def test_a_meshed_delayed_nvfp4_expert_layer_records_what_one_device_does():
                                      found["global"], found["exchange"]))
 
 
+def test_a_delayed_nvfp4_gated_mlp_trains_each_projection_on_its_own_history():
+    """A GatedMLP at widths the recipe takes, under a delayed-scaling NVFP4 recipe (row 12721), initializes
+    a history for each of its gate, up and down projections, and its value and every gradient run: its
+    projections apart, each at its own history's tensor scale (`mlp._chained` declines a delayed recipe,
+    and `projections.recipe_chain` given no scales declines it too), the largest magnitude each quantized
+    recorded under its history's path, finite."""
+    from dew.nn.dense import NVFP4_AMAX, NVFP4_HISTORY
+    from dew.nn.mlp import GatedMLP
+
+    layer = GatedMLP(hidden_features=2 * WIDTH, out_features=WIDTH, dtype=jnp.bfloat16)
+    x = jnp.asarray(np.random.default_rng(12721).normal(size=(64, WIDTH)), jnp.bfloat16)
+    with generation.run_precision(_delayed_nvfp4()):
+        variables = layer.init(jax.random.key(0), x)
+        held = {key: tree for key, tree in variables.items() if key != NVFP4_AMAX}
+
+        def loss(params, x):
+            out, sown = layer.apply({**held, "params": params}, x, mutable=[NVFP4_AMAX])
+            return jnp.sum(out.astype(jnp.float32)), sown
+
+        (value, sown), grads = jax.value_and_grad(loss, argnums=(0, 1), has_aux=True)(held["params"], x)
+    histories = jax.tree_util.tree_flatten_with_path(held[NVFP4_HISTORY])[0]
+    recorded = jax.tree_util.tree_flatten_with_path(sown[NVFP4_AMAX],
+                                                    is_leaf=lambda leaf: isinstance(leaf, tuple))[0]
+    assert len(histories) == 3 and [path for path, _ in histories] == [path for path, _ in recorded]
+    assert np.isfinite(float(value))
+    assert all(np.all(np.isfinite(np.asarray(leaf, np.float32))) for leaf in jax.tree.leaves(grads))
+    assert all(np.isfinite(float(amax)) and float(amax) > 0 for _, (amax,) in recorded)
+
+
 def test_a_rolled_history_takes_its_steps_largest_newest():
     """A training step's update of a delayed-scaling NVFP4 run's histories (`dense.rolled`, row 12721):
     each history a step recorded shifted by one along its steps, the step's largest newest and its oldest
