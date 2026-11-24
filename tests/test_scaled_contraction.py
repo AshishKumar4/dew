@@ -255,6 +255,20 @@ def test_an_exponent_operand_past_any_sentinel_is_a_sums_like_any_other(power):
     np.testing.assert_array_equal(np.asarray(contract(form, one, raised, keys, one, raised)), 1.0)
 
 
+def test_a_second_window_at_int32s_least_joins_the_first():
+    """`(2^(F + 24) + 1.5 2^F + 0) / 2^(F + 24)` at `F` int32's least is `1 + 2^-23`: the first window takes
+    `2^(F + 24)`, and the second at `F` lies within the total's reach, which saturates there, where it
+    wrapped positive and skipped the second window, giving 1 (review of #3991, P0)."""
+    form = Form(("", "", "", "", "k", "", ""),
+                ((1, (((0, 1), (1, 0)),)), (1, (((2, 1), (3, 0)),)), (1, (((4, 1),),))), "",
+                divisor=((1, (((5, 1), (6, 0)),)),), divided="")
+    least = np.iinfo(np.int32).min
+    one, above, below = jnp.float32(1.0), jnp.int32(least + 24), jnp.int32(least)
+    keys = jnp.asarray([2.0 ** 127, -(2.0 ** 127), 2.0 ** -126, -(2.0 ** -126)], jnp.float32)
+    found = contract(form, one, above, jnp.float32(1.5), below, keys, one, above)
+    np.testing.assert_array_equal(np.asarray(found), np.float32(1 + 2.0 ** -23))
+
+
 def test_a_windows_sums_add_exactly():
     """Eight ones, `2^-22`, `2^-23 + 2^-46`, then their negations but `2^-46`, beside a term whose keys cancel
     to zero across bands, sum to `2^-46`: one window holds them all, added as exact limbs, where a double

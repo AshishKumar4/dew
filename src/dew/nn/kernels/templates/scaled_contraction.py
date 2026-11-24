@@ -248,7 +248,8 @@ def _banded(terms: tuple[Term, ...], held: list, scales: list, contracted) -> tu
                 significands = [jnp.where(band == digit, power2(significand, offset + digit * width), 0)
                                 for significand, offset, band, digit
                                 in zip(finite, offsets, bands, digits, strict=True)]
-                carry = step(carry, sign * contracted(parts, significands), scale - sum(digits) * width)
+                carry = step(carry, sign * contracted(parts, significands),
+                             _saturated(scale, -(sum(digits) * width)))
                 moved, bump = [], jnp.ones((), bool)
                 for place, (digit, band, end) in enumerate(zip(digits, bands, past, strict=True)):
                     following = jnp.min(jnp.where(band > digit, band, end), initial=end)
@@ -265,9 +266,7 @@ def _banded(terms: tuple[Term, ...], held: list, scales: list, contracted) -> tu
         return carry
 
     def binade(summed, power):
-        # Saturating at int32's least: an exponent operand's `-2^31` beside a sum beneath one wraps no sum up.
-        at = power + binade_of(summed)
-        return jnp.where((binade_of(summed) < 0) & (at > power), FLOOR, at)
+        return _saturated(power, binade_of(summed))
 
     def placed(total, ceiling, opened):
         """The next window's top at each output, its largest sum beneath `ceiling` (any, where `opened`), and
@@ -281,7 +280,7 @@ def _banded(terms: tuple[Term, ...], held: list, scales: list, contracted) -> tu
             return (jnp.maximum(found[0], jnp.where(below, binade(summed, power), FLOOR)), found[1] | below)
 
         top, present = visited(highest, (zero + FLOOR, zero != zero))
-        reach = exponent + binade_of(high) - 2 * (WINDOW + 1) - 32
+        reach = _saturated(_saturated(exponent, binade_of(high)), -(2 * (WINDOW + 1) + 32))
         return top, present & ((high == 0) | (top >= reach))
 
     def window(state):
@@ -318,6 +317,15 @@ def _banded(terms: tuple[Term, ...], held: list, scales: list, contracted) -> tu
     (high, low, exponent), *_ = jax.lax.while_loop(lambda state: jnp.any(state[4]), window,
                                                    (total, zero, opened, *placed(total, zero, opened)))
     return high + low, exponent
+
+
+def _saturated(exponent: jax.Array, by) -> jax.Array:
+    """`exponent + by` in int32, saturating at its least and largest (`_banded`'s exponents: an exponent
+    operand's `-2^31` beside a sum beneath one, or a window's reach beneath it, wraps none up)."""
+    moved = exponent + by
+    under = (by < 0) & (moved > exponent)
+    over = (by > 0) & (moved < exponent)
+    return jnp.where(under, FLOOR, jnp.where(over, jnp.iinfo(jnp.int32).max, moved))
 
 
 def _value(*arrays: jax.Array, form: Form) -> jax.Array:
