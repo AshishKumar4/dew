@@ -27,7 +27,7 @@ from dew.inputs import Field, InputSpec
 from dew.objectives.jepa.objective import JepaObjective
 from dew.objectives.supervised import Supervised
 from dew.registry import ModelConfig
-from dew.training import Trainer
+from dew.training import Trainer, TrainerAdvanced
 from dew.training.observe import Observe
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -364,7 +364,8 @@ def test_a_step_built_with_its_evaluations_needs_their_room_beside_the_state_onc
             objective.ema = EMASpec(decay=optax.constant_schedule(0.9))
         trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0),
                           mesh=MeshSpec().build(gpus("sm90")),
-                          layout=Layout(min_shard=TINY_SHARD, host=("ema",) if average == "host" else ()))
+                          advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD,
+                                                                 host=("ema",) if average == "host" else ())))
         if scale is None:
             return trainer, compile_ahead(trainer, batch)
         scored = scale * BATCH
