@@ -232,6 +232,79 @@ def test_a_cell_that_computes_in_a_parts_prepare_is_deferred_to_its_run(tmp_path
     assert raised.value.labels == ["computes"]
 
 
+def test_a_cell_past_its_prepares_cap_is_deferred_to_its_run_and_not_run(tmp_path, monkeypatch):
+    """In a part's prepare past its cap (`tier_wire.PREPARE_BY`), a flow runs the cells before it and defers
+    each after, unrun, to its run (`tier_wire.DEFERRED`, where `tier_wire.CAPPED`), its flow passing its
+    prepare: the cells it prepared kept, those it left named unprepared."""
+    import json
+    import time
+
+    import tier_wire
+    from truths_ahead import compiled_truths
+
+    ran = []
+
+    def first():
+        ran.append("first")
+        monkeypatch.setenv(tier_wire.PREPARE_BY, repr(time.monotonic() - 1.0))
+
+    flow = [Cell("first", first), Cell("second", lambda: ran.append("second")),
+            Cell("third", lambda: ran.append("third"))]
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    monkeypatch.setenv(tier_wire.PREPARE_BY, repr(time.monotonic() + 600.0))
+    with compiled_truths(tmp_path, prepare=True, stamp="a"):
+        run_cells(flow)
+    assert ran == ["first"]
+    record = json.loads((tmp_path / tier_wire.DEFERRED).read_text())
+    assert [(reason["where"], reason["cell"]) for reason in record["reasons"]] == [
+        (tier_wire.CAPPED, "second"), (tier_wire.CAPPED, "third")]
+
+
+def test_a_test_opening_its_own_store_past_its_prepares_cap_is_named_unprepared_and_not_run(tmp_path):
+    """In a part's prepare past its cap, a test marked `prepares` (a flow's, which opens its own store, as
+    tests/test_gpu_flows.py's does, and starts its compile in its body) is skipped before its body, named
+    unprepared where its prepare's records are read (tests/conftest.py's `compiled_ahead`, where
+    `tier_wire.CAPPED`), never run past the cap."""
+    import json
+    import os
+    import subprocess
+    import sys
+    import time
+    from pathlib import Path
+
+    import tier_wire
+    from truths_ahead import UNPREPARED
+
+    ran = tmp_path / "ran"
+    (tmp_path / "test_own_store.py").write_text(
+        "import pathlib\nimport pytest\n\n\n@pytest.mark.prepares\ndef test_flow():\n"
+        f"    pathlib.Path({str(ran)!r}).write_text('ran')\n")
+    tests = Path(__file__).parent
+    # The node's one GPU, as its driver lists it (a prepare counts its run's devices by it).
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    (tools / "nvidia-smi").write_text("#!/bin/sh\necho 'GPU 0: NVIDIA H100 80GB HBM3 (UUID: GPU-0)'\n")
+    (tools / "nvidia-smi").chmod(0o755)
+    done = subprocess.run(
+        [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", "--rootdir", str(tmp_path),
+         "--junitxml", str(tmp_path / "report.xml"),
+         "-c", str(tests.parent / "pyproject.toml"), "-p", "conftest", str(tmp_path / "test_own_store.py")],
+        env={**os.environ, "PATH": f"{tools}:{os.environ['PATH']}", "JAX_PLATFORMS": "cpu",
+             "PYTHONPATH": str(tests), tier_wire.PREPARE: "1",
+             tier_wire.TRUTHS: str(tmp_path / "truths"), tier_wire.PREPARE_BY: repr(time.monotonic() - 1.0)},
+        capture_output=True, text=True, timeout=600, cwd=tests.parent)
+    import xml.etree.ElementTree as ElementTree
+
+    suite = ElementTree.parse(tmp_path / "report.xml").getroot().find("testsuite")
+    assert done.returncode == 0 and suite is not None
+    assert (suite.get("tests"), suite.get("skipped")) == ("1", "1")
+    assert not ran.exists()
+    [record] = list((tmp_path / "truths").rglob(UNPREPARED))
+    held = json.loads(record.read_text())
+    assert (held["test"].endswith("test_own_store.py::test_flow"),
+            [reason["where"] for reason in held["reasons"]]) == (True, [tier_wire.CAPPED])
+
+
 def test_a_cell_raising_after_its_prepare_compiled_its_programs_passes_it_unrecorded(tmp_path, monkeypatch):
     """In a GPU tier part's prepare, a cell that compiled a site and then raised, checking what its prepare
     gives in its programs' place (`ahead_arm`'s zeros), passes its prepare with nothing recorded, its run

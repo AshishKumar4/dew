@@ -179,6 +179,21 @@ def _deferred(label: str, error: BaseException, frames: list[tuple[str, int]],
     return True
 
 
+def _capped(label: str) -> None:
+    """A flow's cell its prepare's cap left (`tier_wire.past_cap`): recorded deferred to its run
+    (`tier_wire.DEFERRED`), where `tier_wire.CAPPED`, so its row names it unprepared and is no red for it."""
+    import os
+
+    import store_wire
+    import tier_wire
+    import truths_ahead
+
+    test = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0]
+    truths_ahead.reasoned(store_wire.COMPILED.get().directory / tier_wire.DEFERRED, test, tier_wire.CAPPED,
+                          f"{label}: {tier_wire.capped('the cell')}", label)
+    print(f"cell deferred to its run by its prepare's cap: {label}", flush=True)
+
+
 def run_cells(cells: Iterable[Cell]) -> list[str]:
     """Run every cell in order (`Cell`): each label printed first; every failure kept and raised together
     after the last, but in a GPU tier part's prepare, where a cell that computes is deferred to its run
@@ -204,6 +219,12 @@ def run_cells(cells: Iterable[Cell]) -> list[str]:
             if preparing and cell.at_run is not None:
                 # Nothing of it to compile ahead (`Cell.at_run`): its run runs it, as a deferred cell's.
                 print(f"cell compiles at its run: {cell.label}: {cell.at_run}", flush=True)
+                deferred += 1
+                continue
+            if preparing and tier_wire.past_cap():
+                # Past its prepare's cap (`tier_wire.PREPARE_BY`): deferred to its run, named unprepared, as a
+                # cell its prepare could not prepare; the cells prepared before it kept.
+                _capped(cell.label)
                 deferred += 1
                 continue
             print(f"cell: {cell.label}", flush=True)

@@ -141,7 +141,8 @@ def test_a_lanes_prepare_runs_on_the_cpu_what_its_run_will_hold_and_records_noth
         "    with open(f'{kind}.log', 'a') as log:\n"
         "        log.write(' '.join([name, os.environ.get('JAX_PLATFORMS', '-'),\n"
         f"                            os.environ.get('{tier_wire.TRUTHS}', '-'),\n"
-        f"                            os.environ.get('{tier_wire.UNIT}', '-')]) + chr(10))\n"
+        f"                            os.environ.get('{tier_wire.UNIT}', '-'),\n"
+        f"                            os.environ.get('{tier_wire.PREPARE_BY}') or '-']) + chr(10))\n"
         + "".join(f"{'@pytest.mark.prepares' + chr(10) if index % 2 else ''}"
                   f"def test_{index}():\n    said('test_{index}')\n" for index in range(6)))
     (tmp_path / "tests/test_plain.py").write_text(LANE_TEST)
@@ -160,6 +161,8 @@ def test_a_lanes_prepare_runs_on_the_cpu_what_its_run_will_hold_and_records_noth
     (resume / "progress.jsonl").write_text(
         json.dumps({"node": "tests/test_flows.py::test_1", "seconds": 1.0}) + "\n")
     monkeypatch.setenv("ARMADA_RESUME", str(resume))
+    # A cap the lane's own environment carries, expired: its prepare clears it.
+    monkeypatch.setenv(tier_wire.PREPARE_BY, "1.0")
     prepared = {}
     for group in ("1/2", "2/2"):
         name = f"tests/test_flows.py#{group}"
@@ -167,8 +170,9 @@ def test_a_lanes_prepare_runs_on_the_cpu_what_its_run_will_hold_and_records_noth
         assert [(row["name"], row["exitCode"]) for row in json.loads(out.read_text())["rows"]] == [
             (f"3.12:{name}", 0), ("3.12:tests/test_plain.py", 0)]
         lines = said("prepared")
-        # Each told the unit it prepares, as the lane names it, under which its programs' memory is filed.
-        assert {tuple(line[1:]) for line in lines} == {("cpu", str(tmp_path / "truths"), name)}
+        # Each told the unit it prepares, as the lane names it, under which its programs' memory is filed;
+        # no time cap, as its run reads every program it prepares (only a dry prepare's is capped).
+        assert {tuple(line[1:]) for line in lines} == {("cpu", str(tmp_path / "truths"), name, "-")}
         prepared[group] = {line[0] for line in lines}
     assert fetched.is_file() and not lane_runs(tmp_path, "test_plain"), "one that prepares nothing is skipped"
     assert not stored, "a prepare records no row"
@@ -306,7 +310,7 @@ def test_a_dry_prepares_row_is_red_for_each_cell_it_left_unprepared_that_mains_r
                  **({"unprepared": [ci.prepares.identity(record) for record in records]} if reused else {})}
         [row] = ci.prepares.graded([found], {} if reused else {"tests/test_gpu_vae.py": records}, before,
                                    "sm90", lambda named: ci.grading.owning(ci.parsed_row(named)[1]),
-                                   ci.grading.STALE)
+                                   ci.grading.STALE, ci.tier_wire().CAPPED)
         return row
     for reused in (False, True):
         red = graded({cells[0]}, reused=reused)
@@ -319,6 +323,72 @@ def test_a_dry_prepares_row_is_red_for_each_cell_it_left_unprepared_that_mains_r
         assert graded(ci.prepares.UNREAD, reused=reused, records=[])["exitCode"] == 0
     assert graded(set(cells), code=1)["exitCode"] == 1
     assert graded(set(cells), code=1, kind=ci.grading.STALE)["kind"] == ci.grading.STALE
+
+
+def test_a_cell_its_prepares_cap_left_is_named_and_counted_but_reds_no_row(ci):
+    """A cell a dry prepare's cap left unprepared (tests/tier_wire.py's `CAPPED`, its where exactly) is named
+    among its row's unprepared and counted apart (`capped`, its output; kept as the row is reused), but no
+    red of its row against main's run, nor stale where main's is unread (prepares.py's `graded`): its
+    prepare's time, no fault of the test. A cell left otherwise stays red, and one whose node id merely
+    holds the cap's words is no capped cell."""
+    name = "3.12:tests/test_gpu_vae.py#@prepare-sm90"
+    wire = ci.tier_wire()
+    capped = {"test": "tests/test_gpu_vae.py::test_flow", "where": wire.CAPPED, "error": "capped",
+              "cell": "two"}
+    lowered = {"test": "tests/test_gpu_vae.py::test_flow", "where": "cell one", "error": "lowered"}
+    named = {"test": f"tests/test_gpu_vae.py::test_flow[x @ {wire.CAPPED}]", "where": "a site", "error": "e"}
+
+    def graded(records, before=frozenset(), found=None):
+        found = found or {"name": name, "exitCode": 0, "output": "ran"}
+        [row] = ci.prepares.graded(
+            [found], {} if "unprepared" in found else {"tests/test_gpu_vae.py": records},
+            before if isinstance(before, str) else set(before), "sm90",
+            lambda named_: ci.grading.owning(ci.parsed_row(named_)[1]), ci.grading.STALE, wire.CAPPED)
+        return row
+    row = graded([capped])
+    assert (row["exitCode"], row["unprepared"], row["capped"]) == (
+        0, [ci.prepares.identity(capped)], [ci.prepares.identity(capped)])
+    assert ci.prepares.identity(capped) in row["output"] and row["output"].endswith("ran")
+    # Reused from its record (the row as it was rendered): its capped cells kept, still judged by neither,
+    # its banner said once.
+    reused = graded([], found=row)
+    assert (reused["exitCode"], reused["capped"], reused["output"]) == (0, row["capped"], row["output"])
+    # Its baseline not written: stale, its cap's fields and banner kept.
+    [unwritten] = ci.unbaselined("3.12", [row], {name})
+    assert (unwritten["kind"], unwritten["capped"], unwritten["unprepared"]) == (
+        ci.grading.STALE, row["capped"], row["unprepared"])
+    assert row["output"] in unwritten["output"]
+    # Main's runs unread: a row that left only capped cells is no stale.
+    assert graded([capped], before=ci.prepares.UNREAD).get("kind") != ci.grading.STALE
+    assert graded([capped, lowered], before=ci.prepares.UNREAD)["kind"] == ci.grading.STALE
+    red = graded([capped, lowered])
+    assert (red["exitCode"], red["new_unprepared"]) == (1, [ci.prepares.identity(lowered)])
+    assert graded([named])["new_unprepared"] == [ci.prepares.identity(named)]
+
+
+@pytest.mark.parametrize("capped", [False, True])
+def test_only_a_dry_prepare_runs_under_a_time_cap(ci, tmp_path, monkeypatch, capped):
+    """A dry prepare's process (prepares.py's `process`, `capped`) runs under a cap (tests/tier_wire.py's
+    `PREPARE_BY`, on the monotonic clock) its end's margin short of the time it has, past which it starts
+    nothing more; a GPU tier part's prepare (ci.py's `gpu_prepared`), whose run reads every program it
+    prepares, never."""
+    import time
+
+    seen = {}
+
+    def tested(python, files, group, verdict, seconds, *args, **kwargs):
+        seen["seconds"], seen["environ"] = seconds, args[3]
+        return 0
+    monkeypatch.setattr(ci, "tested", tested)
+    began = time.monotonic()
+    ci.prepares.process(ci, "3.12", "tests/test_gpu_vae.py", "", tmp_path / "v.json", 1500.0, unit="u",
+                        threads="1", users=False, variant="@prepare-sm90", capped=capped)
+    wire = ci.tier_wire()
+    if not capped:
+        assert wire.PREPARE_BY not in seen["environ"]
+        return
+    cap = float(seen["environ"][wire.PREPARE_BY])
+    assert began + seen["seconds"] - ci.prepares.CAP_MARGIN <= cap <= time.monotonic() + seen["seconds"]
 
 
 def test_the_plan_prepares_each_gpu_tier_file_dry_for_each_generation(ci, tmp_path):

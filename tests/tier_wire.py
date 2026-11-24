@@ -32,6 +32,30 @@ UNIT = "DEW_TIER_UNIT"
 of either), set in the prepare's environment: the unit's flows' needs are filed under it (`needs_file`)."""
 
 
+PREPARE_BY = "DEW_TIER_PREPARE_BY"
+"""The time (`time.monotonic()`, its parent's on the same host) past which a dry prepare starts no further
+test or flow cell (`past_cap`): its group's time, less what its process's end takes, so the programs it
+prepared are kept rather than lost to its task's kill (tools/armada/prepares.py's `process`). Unset or
+empty (a part's prepare clears one it inherits), no cap."""
+CAPPED = "its group's prepare time cap"
+"""Where a test or cell left unprepared by its prepare's cap is recorded (`UNPREPARED`, `DEFERRED`): named
+unprepared and run unprepared on its GPU as any is, but no red of its row (prepares.py's `graded`): a cap is
+its prepare's time, no fault of the test."""
+
+
+def past_cap(environ: Mapping[str, str] = os.environ) -> bool:
+    """Whether a dry prepare of `environ` (this process's) is past its cap (`PREPARE_BY`): it starts nothing
+    more."""
+    import time
+
+    return bool(environ.get(PREPARE_BY)) and time.monotonic() > float(environ[PREPARE_BY])
+
+
+def capped(why: str) -> str:
+    """The reason a test or cell left unprepared by its prepare's cap gives (`CAPPED`, its where)."""
+    return f"not prepared: {why} ran past its group's prepare time cap; its run compiles it on its GPU"
+
+
 def preparing(environ: Mapping[str, str] = os.environ) -> bool:
     """Whether a process of `environ` (this one's by default) is a GPU tier part's prepare (`PREPARE`): on
     the node's CPU, before its run."""

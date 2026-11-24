@@ -999,7 +999,10 @@ def unbaselined(python: str, rows: list[dict], unnamed: Container[str]) -> list[
     `baselined`) said stale: it runs again rather than stand green with no baseline."""
     why = "its prepare's baseline was not written to the CI store; it runs again"
     named = {found["name"]: parsed_row(found["name"]) for found in rows if found["name"] in unnamed}
-    return [stale_row(python, named[found["name"]][1], named[found["name"]][2], why) if found["name"] in named
+    # Stale, keeping what its prepare left unprepared and its output (a capped row's banner).
+    return [{**stale_row(python, named[found["name"]][1], named[found["name"]][2], why),
+             **{field: found[field] for field in ("unprepared", "capped") if field in found},
+             "output": "\n".join([why, found.get("output") or ""])} if found["name"] in named
             else found for found in rows]
 
 

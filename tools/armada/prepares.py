@@ -167,21 +167,32 @@ def groups_of(seconds: float | None, target: float, deadline: float) -> int:
 def process(ci, python: str, file: str, group: str, verdict: Path, left: float, *, unit: str, threads: str,
             users: bool, variant: str, cache: str = "off", common: str = "", recorded: bool = False,
             environ: Mapping[str, str] | None = None, kept: Mapping[str, tuple[str, str]] | None = None,
-            judged: Callable[[list[dict]], list[dict]] | None = None) -> int:
+            judged: Callable[[list[dict]], list[dict]] | None = None, capped: bool = False) -> int:
     """One process of a GPU tier part's prepare (ci.py's `gpu_prepared`) or a dry prepare (`run`): test file
     `file`'s `group` run on the CPU alone under the prepare's word and its unit's name (`unit`), a user's
     process's flags where `users` (`VARIANTS`), its row named for `variant`, within what is `left` of its
     caller's deadline. What its own end may take past its deadline is kept back (its grace, its group's
-    settling, its reader's last ten seconds); with none left, it is not started, its row saying so."""
+    settling, its reader's last ten seconds); with none left, it is not started, its row saying so. A dry
+    prepare's (`capped`) runs under its time cap (tests/tier_wire.py's `PREPARE_BY`); a part's never, whose
+    run reads every program it prepares."""
     if (mine := left - ci.session.GRACE - ci.SETTLE - 10.0) <= 0:
         why = "not prepared: its lane's prepare had no time left for it"
         verdict.write_text(json.dumps({"rows": [ci.stale_row(python, file, ci.varied(group, variant), why)]}))
         return 0
     wire = ci.tier_wire()
+    # Past its cap a dry prepare starts no further test or cell (tests/tier_wire.py's `past_cap`), so what it
+    # prepared is kept, its end in time to upload it: a cap of the time it has but its end's.
+    # A part's clears any cap it inherits (its environment's, its caller's).
+    cap = {wire.PREPARE_BY: repr(time.monotonic() + max(mine - CAP_MARGIN, mine / 2)) if capped else ""}
     return ci.tested(python, [file], group, verdict, mine, cache, ci.session.GRACE, common,
                      {"JAX_PLATFORMS": "cpu", wire.PREPARE: "1", "OMP_NUM_THREADS": threads,
-                      **(VARIANTS["users"][1] if users else {}), wire.UNIT: unit, **(environ or {})},
+                      **(VARIANTS["users"][1] if users else {}), wire.UNIT: unit, **cap, **(environ or {})},
                      recorded=recorded, variant=variant, kept=kept, judged=judged)
+
+
+CAP_MARGIN = 240.0
+"""What a dry prepare keeps of its time past its cap (`process`) for its process's end: the test or cell
+running at its cap, its programs' upload to the shared cache, its report."""
 
 
 def planned(files: list[tuple[str, bool, int]], took: Callable[[str, str], tuple[float, float] | None],
@@ -249,35 +260,52 @@ def as_ran(row: dict, stale: str) -> dict:
 
 
 def graded(rows: list[dict], unprepared: Mapping[str, list[dict]], before: set[str] | str, generation: str,
-           file_of: Callable[[str], str], stale: str) -> list[dict]:
+           file_of: Callable[[str], str], stale: str, capped_at: str) -> list[dict]:
     """A dry prepare's `rows` (`file_of` a row's name its test file), each keeping the cells it left
     unprepared (`identity`) as its `unprepared`: a row this run prepared, its file's records (`unprepared`,
     from `unprepared_in`); a row reused from its record, the list that record keeps. A row is red, its new
     cells its `new_unprepared`, where it left one unprepared that main's run of the row did not (`before`);
     `BOOTSTRAP`, main with no run of it, reds none; `UNREAD`, main's not read whole, says a row that left
     any unprepared `stale`, not graded and run again, never green. A reused row is graded again against the
-    baseline that stands now, and every red row is its group's as it ran (`as_ran`)."""
+    baseline that stands now, and every red row is its group's as it ran (`as_ran`). A cell its prepare's
+    time cap left (where `capped_at`, tests/tier_wire.py's `CAPPED`) is named and counted (`capped`, kept
+    with a reused row) but judged by neither."""
     judged = []
     for found in rows:
         own = unprepared.get(file_of(found["name"]), [])
         held = ([{"identity": cell} for cell in found["unprepared"]] if "unprepared" in found
                 else [{**record, "identity": identity(record)} for record in own])
         cells = sorted(record["identity"] for record in held)
+        capped = sorted(found.get("capped", []) if "unprepared" in found
+                        else {identity(record) for record in own if record["where"] == capped_at})
+        judged_ = [record for record in held if record["identity"] not in set(capped)]
+        # Said once: a reused row's output holds its banner (`capped_banner`) already.
+        if capped and (found.get("output") or "").startswith(head := capped_banner(capped)):
+            found = {**found, "output": found["output"][len(head):].lstrip("\n")}
         if isinstance(before, set):
-            new = [record for record in held if record["identity"] not in before]
+            new = [record for record in judged_ if record["identity"] not in before]
             said = [f"unprepared in its {generation} prepare, which main's did not leave so: "
                     f"{record['identity']}" + (f": {record['error']}" if record.get("error") else "")
                     for record in new]
             red = ({"exitCode": 1, "output": "\n".join([*said, found.get("output") or ""]),
                     "new_unprepared": sorted(record["identity"] for record in new)} if new else {})
-        elif before == UNREAD and held and not found.get("exitCode"):
+        elif before == UNREAD and judged_ and not found.get("exitCode"):
             red = {"exitCode": 1, "kind": stale, "failed": [], "output": (
-                f"not graded: it left {len(held)} cells unprepared in its {generation} prepare, and main's "
-                "runs of it were not read whole; it runs again")}
+                f"not graded: it left {len(judged_)} cells unprepared in its {generation} prepare, and "
+                "main's runs of it were not read whole; it runs again")}
         else:
             red = {}
-        judged.append(as_ran({**found, "unprepared": cells, **red}, stale))
+        said = ({"capped": capped, "output": "\n".join([capped_banner(capped), red.get(
+            "output", found.get("output") or "")])} if capped else {})
+        judged.append(as_ran({**found, "unprepared": cells, **red, **said}, stale))
     return judged
+
+
+def capped_banner(capped: list[str]) -> str:
+    """What a row whose prepare's cap left `capped` says first (`graded`)."""
+    return "\n".join([
+        f"{len(capped)} left unprepared by its prepare's time cap, each run unprepared on its GPU (its "
+        "group's prepare is too long: cut it finer or make its tests cheaper to prepare):", *capped])
 
 
 def nothing_timed(row: dict) -> dict:
@@ -483,14 +511,14 @@ def run(ci, python: str, tests: list[str], split: str, out: Path, deadline: floa
             process(
                 ci, python, name, ci.cut_of(group), verdict, deadline - (time.monotonic() - began),
                 unit=ci.row(python, name, group), threads=str(max(1, len(os.sched_getaffinity(0)))),
-                users=users, variant=row_variant, cache=cache, common=common(), recorded=True,
+                users=users, variant=row_variant, cache=cache, common=common(), recorded=True, capped=True,
                 # The node's one GPU, counted as a node's prepare counts its own (tests/lane_environment.py).
                 environ={wire.TRUTHS: str(truths), wire.TOPOLOGY: str(topology), "CUDA_VISIBLE_DEVICES": "0"},
                 kept={name: kept[(name, group)]} if (name, group) in kept else None,
                 judged=lambda found, truths=truths, before_=before_, generation=generation: graded(
                     found, unprepared_in(truths, (wire.UNPREPARED, wire.DEFERRED), ci.grading.owning),
                     before_, generation, lambda named: ci.grading.owning(ci.parsed_row(named)[1]),
-                    ci.grading.STALE))
+                    ci.grading.STALE, wire.CAPPED))
             rows_ += [nothing_timed(found) for found in json.loads(verdict.read_text())["rows"]]
     out.write_text(json.dumps({"rows": rows_}))
     # Its rows its verdict: a red one the suite's red exit, as every task's (.armada.json's task.redExit).

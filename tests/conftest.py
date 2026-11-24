@@ -380,6 +380,16 @@ def compiled_ahead(request):
     (`tier_wire.unit_needs`), by which the lane sizes its worker; its run reads them, tracing, lowering and
     compiling none, and runs a test so recorded unprepared, every site judged, named in its summary. Outside
     a part with a store, nothing."""
+    if tier_wire.preparing() and tier_wire.past_cap():
+        # Past its prepare's cap (tests/tier_wire.py's `PREPARE_BY`), any test (a flow's, which opens its own
+        # store, too): named unprepared where its prepare's records are read, its run compiling it on its GPU;
+        # the programs prepared before it kept.
+        from truths_ahead import UNPREPARED, reasoned
+
+        digest = hashlib.sha256(request.node.nodeid.encode()).hexdigest()[:24]
+        reasoned(Path(os.environ[tier_wire.TRUTHS]) / "capped" / digest / UNPREPARED, request.node.nodeid,
+                 tier_wire.CAPPED, tier_wire.capped("the test"))
+        pytest.skip(tier_wire.capped("the test"))
     store = _sites_store(request.node)
     if store is None:
         if tier_wire.TRUTHS in os.environ and not tier_wire.preparing():
