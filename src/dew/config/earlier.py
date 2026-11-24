@@ -111,29 +111,36 @@ def earlier_grouped_pins(record: Mapping[str, object]) -> Mapping[str, object]:
     itself), and both its arms compute the loss alike (check 1, tests/linear_ce_matrix.py), so the resumed
     run's loss is its chunked program's. A pin of another of the grouped products' kernels named none of
     SYRK's. Carried to 1.0 (ledger 1552)."""
-    fields = record.get("fields")
-    if not isinstance(fields, Mapping):
-        return record
-    diagnostics = fields.get("diagnostics")
-    named = _records.class_record(diagnostics) if isinstance(diagnostics, Mapping) else None
-    pins = named[1] if named is not None else diagnostics if isinstance(diagnostics, Mapping) else fields
-    kernels = pins.get("kernels")
+    found = _kernel_pins(record)
+    kernels = None if found is None else found[2].get("kernels")
     pinned = kernels.get("grouped_matmul") if isinstance(kernels, Mapping) else None
     if pinned not in ("mosaic", "xla"):
         return record
     return chosen_kernel(record, "syrk", pinned)
 
 
+def _kernel_pins(record: Mapping[str, object]) -> tuple[Mapping, object, Mapping] | None:
+    """A saved run's record's fields, its diagnostics (a mapping, a class record, or absent) and the mapping
+    that holds its kernel pins (`kernels`): its diagnostics' fields, its diagnostics, or, a record of
+    before its diagnostics held them, its own fields; None where it holds no fields."""
+    fields = record.get("fields")
+    if not isinstance(fields, Mapping):
+        return None
+    diagnostics = fields.get("diagnostics")
+    named = _records.class_record(diagnostics) if isinstance(diagnostics, Mapping) else None
+    pins = named[1] if named is not None else diagnostics if isinstance(diagnostics, Mapping) else fields
+    return fields, diagnostics, pins
+
+
 def chosen_kernel(record: Mapping[str, object], choice: str, kernel: str) -> Mapping[str, object]:
     """A saved run's record whose kernel choices name `kernel` for `choice` (`Diagnostics.kernels`, or the
     run's `kernels` a record of before its diagnostics states, which `earlier_retired` moves there), where
     the run named none of its own for it, which stands."""
-    fields = record.get("fields")
-    if not isinstance(fields, Mapping):
+    found = _kernel_pins(record)
+    if found is None:
         return record
-    diagnostics = fields.get("diagnostics")
+    fields, diagnostics, pins = found
     named = _records.class_record(diagnostics) if isinstance(diagnostics, Mapping) else None
-    pins = named[1] if named is not None else diagnostics if isinstance(diagnostics, Mapping) else fields
     kernels = pins.get("kernels")
     # A choice the run left unset (written None, as a record of its kernels writes each it names none for)
     # takes `kernel`; one it named stands.
