@@ -354,8 +354,15 @@ def history_scale(layer: nn.Module, name: str, shape: tuple[int, ...]) -> jax.Ar
 
 def recorded(layer: nn.Module, name: str, rows: Array) -> None:
     """`rows`' largest magnitude (`projections.nvfp4_amax`) sown as `layer`'s projection `name`'s this call
-    (`NVFP4_AMAX`), where the call keeps it: what its history rolls in (`rolled`)."""
-    layer.sow(NVFP4_AMAX, name, projections.nvfp4_amax(rows))
+    (`noted_amax`)."""
+    noted_amax(layer, name, projections.nvfp4_amax(rows))
+
+
+def noted_amax(layer: nn.Module, name: str, amax: Array) -> None:
+    """`amax`, the largest magnitude among the rows `layer`'s projection `name` quantized this call, sown as
+    its (`NVFP4_AMAX`) where the call keeps it, from `layer`'s own call (no transformation's body): what its
+    history rolls in (`rolled`)."""
+    layer.sow(NVFP4_AMAX, name, amax)
 
 
 def rolled(histories: Mapping, amaxes: Mapping) -> dict:

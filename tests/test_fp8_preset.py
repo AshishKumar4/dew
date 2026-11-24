@@ -874,6 +874,78 @@ def test_a_delayed_nvfp4_models_every_taken_projection_reads_its_own_history():
     assert [path for path, _ in histories] == [path for path, _ in recorded]
 
 
+def _expert_layers():
+    """Each expert module a delayed-scaling NVFP4 recipe's experts role reaches (row 12721), its inputs: its
+    layer built, a routing's weights and indices, and the routing a capacity drops slots of."""
+    from dew.nn import gpt_oss, moe
+
+    rng = np.random.default_rng(12721)
+    x = jnp.asarray(rng.normal(size=(64, 128)), jnp.bfloat16)
+    # A dropped slot's row its largest: a token routed to expert 0 beyond its capacity.
+    x = x.at[-1].set(1e4)
+    indices = jnp.asarray(np.stack([np.zeros(64, np.int32), rng.integers(1, 4, 64)], axis=-1))
+    weights = jnp.full(indices.shape, 0.5, jnp.bfloat16)
+    return {
+        "experts": (moe.ExpertMLP(num_experts=4, hidden_features=128, out_features=128,
+                                  capacity_factor=1.0, dispatch="global"), (x, weights, indices)),
+        "gpt-oss": (gpt_oss.GptOssExperts(128, 128, 4, capacity_factor=1.0, dispatch="global"),
+                    (x, weights, indices)),
+    }
+
+
+@pytest.mark.parametrize("name", ["experts", "gpt-oss"])
+def test_a_delayed_nvfp4_expert_layer_records_its_admitted_rows_alone(name):
+    """Every expert module under a delayed-scaling NVFP4 recipe that takes the experts (row 12721), a
+    gpt-oss bank too, holds a history for each projection it quantizes and runs under it; what it records
+    for the projection reading its tokens is the largest magnitude among the rows a capacity admits, a
+    dropped slot's row (its largest by far) never among them (`moe.admitted_amax`), sown outside the
+    dispatch's transformations (`dense.noted_amax`) path for path with its histories."""
+    from dew.nn.dense import NVFP4_AMAX, NVFP4_HISTORY
+
+    layer, (x, weights, indices) = _expert_layers()[name]
+    with generation.run_precision(_delayed_nvfp4()):
+        variables = layer.init(jax.random.key(0), x, weights, indices)
+        held = {key: tree for key, tree in variables.items() if key != NVFP4_AMAX}
+        _, sown = layer.apply(held, x, weights, indices, mutable=[NVFP4_AMAX])
+    histories = jax.tree_util.tree_flatten_with_path(held[NVFP4_HISTORY])[0]
+    recorded = dict(jax.tree_util.tree_flatten_with_path(sown[NVFP4_AMAX],
+                                                         is_leaf=lambda leaf: isinstance(leaf, tuple))[0])
+    assert histories and [path for path, _ in histories] == list(recorded)
+    first = np.asarray(recorded[histories[0][0]][0])
+    admitted = np.asarray(x[:-1], np.float32)
+    assert float(first) == float(np.max(np.abs(admitted))), (first, np.max(np.abs(admitted)))
+
+
+@pytest.mark.mesh(devices=4)
+def test_a_meshed_delayed_nvfp4_expert_layer_records_what_one_device_does():
+    """An expert layer under a delayed-scaling NVFP4 recipe exchanging its slots over a 4-way expert axis
+    (`moe._exchange_shard`, its rounds a `fori_loop`) records each projection's largest magnitude over
+    every device's and round's rows, bitwise what it records on one device (row 12721): returned by its
+    dispatch and reduced over the mesh (`jax.lax.pmax`), no tracer of the map's leaking."""
+    from dew.mesh import DEFAULT_RULES
+    from dew.nn import moe
+    from dew.nn.dense import NVFP4_AMAX
+    from dew.training import MeshSpec
+
+    rng = np.random.default_rng(4)
+    x = jnp.asarray(rng.normal(size=(64, 128)), jnp.bfloat16)
+    indices = jnp.asarray(rng.integers(0, 4, (64, 2)), jnp.int32)
+    weights = jnp.full(indices.shape, 0.5, jnp.bfloat16)
+    found = {}
+    for dispatch, devices in (("global", 1), ("exchange", 4)):
+        layer = moe.ExpertMLP(num_experts=4, hidden_features=128, out_features=128, dispatch=dispatch)
+        mesh = MeshSpec(expert=devices).build(jax.devices()[:devices])
+        with (jax.set_mesh(mesh), nn.logical_axis_rules(DEFAULT_RULES),
+              generation.run_precision(_delayed_nvfp4())):
+            variables = layer.init(jax.random.key(0), x, weights, indices)
+            held = {key: tree for key, tree in variables.items() if key != NVFP4_AMAX}
+            _, sown = jax.jit(functools.partial(layer.apply, mutable=[NVFP4_AMAX]))(held, x, weights, indices)
+        found[dispatch] = jax.tree.map(np.asarray, sown[NVFP4_AMAX])
+    assert jax.tree.structure(found["global"]) == jax.tree.structure(found["exchange"])
+    assert jax.tree.all(jax.tree.map(lambda one, other: bool(np.array_equal(one, other)),
+                                     found["global"], found["exchange"]))
+
+
 def test_a_rolled_history_takes_its_steps_largest_newest():
     """A training step's update of a delayed-scaling NVFP4 run's histories (`dense.rolled`, row 12721):
     each history a step recorded shifted by one along its steps, the step's largest newest and its oldest
