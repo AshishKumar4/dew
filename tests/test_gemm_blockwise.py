@@ -345,6 +345,105 @@ def test_an_ungated_mlps_recipe_chain_is_its_two_recipe_projections_apart(rows):
         np.testing.assert_array_equal(np.asarray(got).view(bits), np.asarray(want).view(bits), err_msg=name)
 
 
+def _swiglu(gate, up):
+    """A gated MLP's SwiGLU of its rounded gate and up, in fp32."""
+    return jax.nn.silu(gate.astype(jnp.float32)) * up.astype(jnp.float32)
+
+
+@pytest.mark.parametrize("rows", [256, 384])
+def test_a_gated_blockwise_chain_through_the_template_is_its_three_projections_apart(rows):
+    """A gated MLP's three blockwise FP8 projections chained (`projections.blockwise_chain`'s `gate`), on an
+    H100, interpreted, through the template named: the gate's product stored and read by the up projection's
+    epilogue as a tile beside its sum, their SwiGLU quantized there as the down projection's rows; its value
+    and every gradient bitwise the three projections apart with SwiGLU between them in XLA (row 12689)."""
+    group_blocks = jnp.asarray([rows // 128], jnp.int32)
+    rng = np.random.default_rng(12689)
+    x = jnp.asarray(rng.normal(size=(rows, 256)), jnp.bfloat16)
+    gate, up = (jnp.asarray(rng.normal(size=(1, 256, 384)) / 16, jnp.bfloat16) for _ in range(2))
+    down = jnp.asarray(rng.normal(size=(1, 384, 256)) / 16, jnp.bfloat16)
+    cotangent = jnp.asarray(rng.normal(size=(rows, 256)), jnp.bfloat16)
+
+    def chained(x, gate, up, down):
+        return projections.blockwise_chain(x, up, down, _swiglu, out_dtype=jnp.bfloat16, gate=gate,
+                                           interpret_on_cpu=True)
+
+    def apart(x, gate, up, down):
+        def projected(rows, matrix):
+            return projections.blockwise_fp8_projection(rows, matrix, group_blocks, out_dtype=jnp.bfloat16,
+                                                        interpret_on_cpu=True)
+
+        hidden = _swiglu(projected(x, gate), projected(x, up)).astype(jnp.bfloat16)
+        return projected(hidden, down)
+
+    with generation.assumed("sm90"), generation.chosen(blockwise_fp8="mosaic"), generation.routes() as routes:
+        fused = jax.jit(with_gradients(chained))(x, gate, up, down, cotangent)
+        separate = jax.jit(with_gradients(apart))(x, gate, up, down, cotangent)
+    for name, got, want in zip(("value", "d_x", "d_gate", "d_up", "d_down"), fused, separate, strict=True):
+        assert got.dtype == want.dtype, (name, got.dtype, want.dtype)
+        bits = np.dtype(f"uint{8 * got.dtype.itemsize}")
+        np.testing.assert_array_equal(np.asarray(got).view(bits), np.asarray(want).view(bits), err_msg=name)
+    assert ("blockwise_fp8", "mosaic") in {(route.choice, route.kernel) for route in routes}
+
+
+def test_a_gated_mlps_recipe_chain_is_its_three_recipe_projections_apart():
+    """Under a run's blockwise FP8 recipe, a gated MLP's chain (`projections.recipe_chain`'s `gate`) of 200
+    rows: its value and every gradient bitwise its three `recipe_projection` calls apart with SwiGLU between
+    them in XLA (row 12689)."""
+
+    rng = np.random.default_rng(12690)
+    x = jnp.asarray(rng.normal(size=(200, 256)), jnp.bfloat16)
+    gate, up = (jnp.asarray(rng.normal(size=(256, 384)) / 16, jnp.bfloat16) for _ in range(2))
+    down = jnp.asarray(rng.normal(size=(384, 256)) / 16, jnp.bfloat16)
+    cotangent = jnp.asarray(rng.normal(size=(200, 256)), jnp.bfloat16)
+
+    _assert_gated_chain_is_apart(_swiglu, x, gate, up, down, cotangent)
+
+
+
+@pytest.mark.parametrize("activation", ["nonzero at zero", "nonfinite derivative at zero"])
+def test_a_padded_gated_recipe_chain_keeps_its_padding_out_of_every_gradient(activation):
+    """A gated recipe chain of one row (127 padding rows in its 128-row block) through an activation whose
+    padding is not inert, nonzero at zero (`where(gate == 0, 256, up)`, which would set the down kernel
+    gradient's token-block scale and round the real row away) or of a nonfinite derivative there
+    (`sqrt(gate) + up`): its value and every gradient bitwise the three recipe projections apart, the
+    padding held out of the backward (`_chain_backward`'s `live`, row 12689's review)."""
+
+    act = {"nonzero at zero": lambda gate, up: jnp.where(gate == 0, 256.0, up),
+           "nonfinite derivative at zero": lambda gate, up: jnp.sqrt(gate) + up}[activation]
+    rng = np.random.default_rng(12693)
+    x = jnp.asarray(np.abs(rng.normal(size=(1, 256))), jnp.bfloat16)
+    gate = jnp.asarray(np.abs(rng.normal(size=(256, 384))) / 16, jnp.bfloat16)
+    up = jnp.asarray(rng.normal(size=(256, 384)) / 4096, jnp.bfloat16)
+    down = jnp.asarray(rng.normal(size=(384, 256)) / 16, jnp.bfloat16)
+    cotangent = jnp.asarray(rng.normal(size=(1, 256)), jnp.bfloat16)
+
+    _assert_gated_chain_is_apart(act, x, gate, up, down, cotangent)
+
+
+def _assert_gated_chain_is_apart(activation, x, gate, up, down, cotangent) -> None:
+    """A gated recipe chain's value and every gradient (`projections.recipe_chain`'s `gate`) bitwise its
+    three `recipe_projection` calls apart with `activation` between them in XLA, each finite, under a run's
+    blockwise FP8 recipe (row 12689)."""
+    from dew.nn.precision import FP8, projection_role
+
+    def chained(x, gate, up, down):
+        return projections.recipe_chain(x, up, down, activation, out_dtype=jnp.bfloat16, gate=gate)
+
+    def apart(x, gate, up, down):
+        def projected(rows, matrix):
+            return projections.recipe_projection(rows, matrix, out_dtype=jnp.bfloat16)
+
+        return projected(activation(projected(x, gate), projected(x, up)).astype(jnp.bfloat16), down)
+
+    with generation.run_precision(FP8), projection_role("mlp"):
+        fused = jax.jit(with_gradients(chained))(x, gate, up, down, cotangent)
+        separate = jax.jit(with_gradients(apart))(x, gate, up, down, cotangent)
+    for name, got, want in zip(("value", "d_x", "d_gate", "d_up", "d_down"), fused, separate, strict=True):
+        assert np.all(np.isfinite(np.asarray(got, np.float32))), name
+        bits = np.dtype(f"uint{8 * got.dtype.itemsize}")
+        np.testing.assert_array_equal(np.asarray(got).view(bits), np.asarray(want).view(bits), err_msg=name)
+
+
 @pytest.mark.parametrize("activation", ["nonzero at zero", "nonfinite derivative at zero"])
 def test_a_padded_recipe_chain_keeps_its_padding_out_of_every_gradient(activation):
     """A recipe chain of one row (127 padding rows in its 128-row block) through an activation whose padding

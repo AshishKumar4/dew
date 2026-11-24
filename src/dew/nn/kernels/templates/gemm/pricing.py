@@ -197,10 +197,12 @@ def best_splits(walk: "SplitWalk | None", stages: int) -> int:
 
 
 def epilogue_registers(family: mosaic.Family, share: int, columns: int, stored: tuple, *,
-                       vectors: int = 0, tile_count: int = 0, has_hook: bool = False,
+                       vectors: int = 0, tiles: tuple = (), has_hook: bool = False,
                        staging: tuple[int, int] | None = None) -> int:
     """Extra consumer-thread registers held across epilogue hook evaluation and staged stores:
-    the single owner shared by `_Mosaic._epilogue_registers` and `syrk_registers` (row 11982)."""
+    the single owner shared by `_Mosaic._epilogue_registers` and `syrk_registers` (row 11982). `tiles`,
+    the dtypes of the `[rows, columns]` tiles beside the accumulator's chunk while its hook runs, each at the
+    width its issuer loads it in (`Issuer.side_bytes`, row 12689)."""
     from dew.nn.kernels.templates import resources, stores
 
     scalar = family.scalar_registers()
@@ -214,9 +216,9 @@ def epilogue_registers(family: mosaic.Family, share: int, columns: int, stored: 
     if not has_hook:
         return max(0, max((_staging(dtype) for dtype in stored), default=0) - scalar)
     accumulator = -(-share * family.chunk_columns(columns) // resources.THREADS)
-    tiles = tile_count * accumulator
+    held = sum(-(-accumulator * family.side_bytes(dtype) // 4) for dtype in tiles)
     live = [-(-accumulator * jnp.dtype(dtype).itemsize // 4) for dtype in stored]
-    hook = max(0, resources.CONTROL_REGISTERS + vectors + tiles - scalar) + sum(live[1:])
+    hook = max(0, resources.CONTROL_REGISTERS + vectors + held - scalar) + sum(live[1:])
     staged = max((max(0, _staging(dtype) - scalar) + sum(live[i + 1:])
                   for i, dtype in enumerate(stored)), default=0)
     return max(hook, staged)

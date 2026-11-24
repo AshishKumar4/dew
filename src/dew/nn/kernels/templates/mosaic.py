@@ -1280,6 +1280,13 @@ class Issuer[Accumulator](abc.ABC):
     """The registers a consumer thread holds beside its tile where its products take a row bound (`bounded`):
     none where its instructions take none."""
 
+    def side_bytes(self, dtype) -> int:
+        """The bytes a register holds a value of an epilogue's `[rows, columns]` side tile of `dtype` in, as
+        `side_tile` loads it: its own width in Mosaic GPU's fragmented arrays (a bf16 tile two values a
+        register: an H100's gated blockwise chain, its gate a bf16 side, compiled at 168 registers, row
+        12689)."""
+        return jnp.dtype(dtype).itemsize
+
     def bounded(self, rows: jax.Array) -> Self:
         """This issuer, its products issued for a tile's rows before `rows` alone (an int32, one value across
         the issuing warpgroup: a ragged group's rows in its last tile), the accumulator's rows kept past it,
