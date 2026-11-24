@@ -142,6 +142,31 @@ def test_a_site_past_its_prepares_cap_is_named_unprepared_and_not_compiled(tmp_p
     assert not list(tmp_path.rglob("site.json"))
 
 
+def test_a_site_its_cap_passes_as_it_draws_is_named_unprepared_and_left_untried(tmp_path, monkeypatch):
+    """A dry prepare whose cap passes as a site draws stops at its next draw (`tier_wire.stop_past_cap`), so
+    one site's draws (a Gemma-sized vocabulary's logits, drawn and widened on the CPU) never outlast what the
+    cap keeps for the process's end: the site is named unprepared by its label, untried (its store's
+    `preparing`), and nothing of it is kept."""
+    import json
+    import time
+
+    import tier_wire
+
+    label = "a site whose cap passes as it draws"
+    monkeypatch.setenv(tier_wire.PREPARE_BY, repr(time.monotonic() + 600.0))
+
+    def capping(seed):
+        monkeypatch.setenv(tier_wire.PREPARE_BY, repr(time.monotonic() - 1.0))
+        return _cancelling(seed)
+
+    with compiled_truths(tmp_path, prepare=True, stamp="here") as store:
+        assert_as_exact(_combined, _combined, capping, label, seeds=8)
+        assert label not in store.tried
+    held = json.loads((tmp_path / UNPREPARED).read_text())
+    assert [(reason["where"], reason["cell"]) for reason in held["reasons"]] == [(tier_wire.CAPPED, label)]
+    assert not list(tmp_path.rglob("site.json"))
+
+
 def test_a_prepared_sites_reference_as_written_is_prepared_and_fails_dews_arm_in_its_run(tmp_path):
     """The combination XLA's fusions rewrite (`test_reference_error_written._combined`, row 6909), one
     function as both arms, its site prepared into a store (`truths_ahead.compiled_truths`, a GPU tier part's)

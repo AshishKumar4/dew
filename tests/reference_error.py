@@ -1261,20 +1261,21 @@ def _prepare_site(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_f
                          "which no program compiled ahead holds")
     if store is not None and store.prepare:
         import tier_wire
+        from arm_store import compile_site
 
-        if tier_wire.past_cap():
-            # Past its prepare's cap (tests/tier_wire.py's `PREPARE_BY`): no site more compiled, each named
-            # unprepared by its label (a flow's cell may hold many, as test_norm_swiglu's configs), its run
-            # compiling it on its GPU; the sites before it kept.
+        try:
+            tier_wire.stop_past_cap()
+            compile_site(store, dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn,
+                         terms=terms, also=also, orders=orders, plain=plain, library_fn=library_fn)
+        except tier_wire.PastCap:
+            # Past its prepare's cap (tests/tier_wire.py's `PREPARE_BY`), before the site or between its
+            # draws: named unprepared by its label (a flow's cell may hold many, as test_norm_swiglu's
+            # configs), its run compiling it on its GPU; the sites before it kept.
             from truths_ahead import reasoned
 
             test = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0]
             reasoned(store.directory / tier_wire.UNPREPARED, test, tier_wire.CAPPED,
                      tier_wire.capped("the site"), label)
-            return plain, True
-        from arm_store import compile_site
-        compile_site(store, dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, terms=terms,
-                     also=also, orders=orders, plain=plain, library_fn=library_fn)
         return plain, True
     return plain, False
 

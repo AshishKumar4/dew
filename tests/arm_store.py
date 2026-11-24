@@ -29,6 +29,7 @@ from check1_wire import QUALIFY
 from float64_terms import POWER, evaluated, evaluated_on, static, traced
 from reference_error import _of_float64, _site, _SiteTerms, _sizing_seeds, _truth_program
 from store_wire import COMPILED
+from tier_wire import stop_past_cap
 from truths_ahead import AT_RUN, CompiledTruths, arm_role, named
 
 from dew.parity_stages import staged_units
@@ -84,6 +85,7 @@ def _compile_arms(store: CompiledTruths, arms: Mapping[str, tuple[Callable, bool
         _refuse_numpy_arms(draw, *(fn for _, fn, _ in named_arms.values()))
     inputs: dict[str, tuple] = {}
     for seed in itertools.chain(range(staged_units(seeds)), sizing):
+        stop_past_cap()
         drawn = drawn_on_the_host(draw, seed)
         for ordered in (drawn,) if orders is None else orders(drawn):
             inputs.setdefault(named("arms", ordered), ordered)
@@ -359,6 +361,7 @@ def compile_site(store: CompiledTruths, dew_fn, reference_fn, draw, label: str, 
         truth = truth_fn if truth_fn is not None else reference_fn
         shaped = {}
         for seed in range(staged_units(seeds)):
+            stop_past_cap()
             inputs = drawn_on_the_host(draw, seed)
             shaped.setdefault(named("truth", widened(inputs)), inputs)
 

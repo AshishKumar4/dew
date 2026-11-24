@@ -51,6 +51,20 @@ def past_cap(environ: Mapping[str, str] = os.environ) -> bool:
     return bool(environ.get(PREPARE_BY)) and time.monotonic() > float(environ[PREPARE_BY])
 
 
+class PastCap(Exception):
+    """A dry prepare past its cap between a site's draws (`stop_past_cap`): the site it stops is left to its
+    run (`reference_error._prepare_site`)."""
+
+
+def stop_past_cap(environ: Mapping[str, str] = os.environ) -> None:
+    """Raise `PastCap` where a dry prepare of `environ` is past its cap (`past_cap`): a site's draw is the
+    finest step a prepare stops at, as one site's draws can outlast what the cap keeps for its process's
+    end (a Gemma-sized vocabulary's logits drawn and widened on the CPU, its group's task killed at its
+    deadline with every report lost)."""
+    if past_cap(environ):
+        raise PastCap
+
+
 def capped(why: str) -> str:
     """The reason a test or cell left unprepared by its prepare's cap gives (`CAPPED`, its where)."""
     return f"not prepared: {why} ran past its group's prepare time cap; its run compiles it on its GPU"

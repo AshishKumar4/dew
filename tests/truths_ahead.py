@@ -47,7 +47,7 @@ from typing import Any
 import jax
 import numpy as np
 from store_wire import COMPILED, SITE_IN_PROGRESS
-from tier_wire import UNPREPARED
+from tier_wire import UNPREPARED, PastCap
 from tool_support import load
 
 
@@ -157,7 +157,12 @@ class CompiledTruths:
         compiles written; a cell's later failure, its every tried site finished, checks what its prepare
         gives in their place (`gpu_flow.run_cells`)."""
         self.tried.update(labels)
-        yield
+        try:
+            yield
+        except PastCap:
+            # Stopped by its cap between draws (`tier_wire.stop_past_cap`): untried, its run prepares it.
+            self.tried.difference_update(labels)
+            raise
         self.done.update(labels)
 
     def judged_its_zeros(self, error: BaseException, before: frozenset[str] = frozenset()) -> bool:
