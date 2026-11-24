@@ -608,11 +608,11 @@ layer-at-a-time sites' (`RUN_SEEDS`), whose judgement the map judge widens where
 
 @pytest.mark.parametrize(("dtype", "clip", "periodic"), [
     pytest.param("float32", 0.0, False, id="fp32",
-                 marks=pytest.mark.check1_shards(seeds=ACCUMULATING_SEEDS, per_task=32)),
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
     pytest.param("bfloat16", 1.0, False, id="bf16-clipped",
-                 marks=pytest.mark.check1_shards(seeds=ACCUMULATING_SEEDS, per_task=32)),
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
     pytest.param("float32", 0.0, True, id="periodic",
-                 marks=pytest.mark.check1_shards(seeds=ACCUMULATING_SEEDS, per_task=32)),
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
 ])
 def test_an_accumulating_scanned_step_matches_unrolled(dtype, clip, periodic):
     """A scanned step pooling its gradient in its backward (`Transaction._planned_accumulation`) over a
