@@ -2327,7 +2327,7 @@ def _rounded_accumulators(kept: dict, count: int, epilogue, acc, sides, *, dtype
         if var in jaxpr.outvars:
             # Returned at its own width: the output is the accumulator, whatever its derivative reads.
             out = jaxpr.outvars.index(var)
-            return kept.get(out) if jnp.dtype(dtypes[out]) == var.aval.dtype else None
+            return kept.get(out) if jnp.dtype(dtypes[out]) == acc.dtype else None
         rounded = _rounding(jaxpr, var)
         if rounded is None or rounded not in jaxpr.outvars:
             return None
