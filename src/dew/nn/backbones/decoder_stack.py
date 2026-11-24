@@ -516,12 +516,12 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
             x = _updated_in_backward(run, x, attention_metadata=attention_metadata, remat=remat)
         else:
             x = _scanned_run(run, x, step, store, inputs, count=count, periodic=periodic, fetching=fetching,
-                             decode=decode, remat=remat)
+                             train=train, decode=decode, remat=remat)
     return x
 
 
 def _scanned_run(run: nn.Module, x, step: Callable, store, inputs, *, count: int, periodic: bool,
-                 fetching: bool, decode: bool, remat: RematPolicy | None):
+                 fetching: bool, train: bool, decode: bool, remat: RematPolicy | None):
     """A run of `count` like layers (a periodic run's repeats of its period) under flax's scan, each
     iteration calling `step` on its layer (`_scanned_runs`)."""
     # A longer run's layers share keys or own them, so they only read the store: a provider
@@ -535,13 +535,16 @@ def _scanned_run(run: nn.Module, x, step: Callable, store, inputs, *, count: int
     # A served quantized run's scales read as the unrolled stack reads them (`held_scales`).
     quantized = (not run.is_mutable_collection('params')
                  and holds_quantized(run.variables.get('params', {})))
-    # A run whose params it reads alone (a decode, an evaluation) hands its experts' kernels to each
-    # iteration whole beside its index, which the grouped matmul reads in place
-    # (`dew.nn.moe.Layered`), as a bank's run does (`_apart`): sliced by the scan, each layer's
-    # experts were copied out every step, 45% of a Qwen3-30B-A3B decode step on an H100 (row 1346).
-    # A fetched run's kernels lie in host memory, of which each iteration fetches its layer's alone
-    # (`fetched`): handed whole, every iteration would copy every layer's to the device.
-    experts = (not quantized and not fetching and not run.is_mutable_collection('params')
+    # A decoding run whose params it reads alone hands its experts' kernels to each iteration whole beside
+    # its index, which the grouped matmul reads in place (`dew.nn.moe.Layered`), as a bank's run does
+    # (`_apart`): sliced by the scan, each layer's experts were copied out every step, 45% of a
+    # Qwen3-30B-A3B decode step on an H100 (row 1346). A training or non-decode run scans them on their layer
+    # axis: broadcast whole as a scan constant, reverse mode accumulates full-stack cotangents per layer and
+    # narrow copies never follow a scan's constants. A fetched run's kernels lie in host memory, of which
+    # each iteration fetches its layer's alone (`fetched`): handed whole, every iteration would copy every
+    # layer's to the device.
+    experts = (decode and not train and not quantized and not fetching
+               and not run.is_mutable_collection('params')
                and holds_experts(run.variables.get('params', {})))
     whole = tuple(name for name, held in ((LAYER_ROWS, rows), (BANKED_EXPERTS, experts)) if held)
 
