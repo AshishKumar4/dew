@@ -511,7 +511,7 @@ def test_a_runs_stacked_packed_banks_decode_as_each_layers_bank_does():
 
 
 @pytest.mark.parametrize("part", ["values", pytest.param(
-    "gradients", marks=pytest.mark.check1_shards(seeds=8, per_task=4))])
+    "gradients", marks=pytest.mark.check1_shards(seeds=8, per_task=2))])
 def test_a_layers_paired_and_scaled_expert_products_are_one_launch_as_exact_as_apart(part, request):
     """A stack's layer's gate and up projections over a scaled stream (`Gathered.scales`, Llama 4's scaled
     input) are, on an H100's routes, one paired launch (`paired_projections`) taking both whole stacks, the
@@ -520,7 +520,8 @@ def test_a_layers_paired_and_scaled_expert_products_are_one_launch_as_exact_as_a
     outputs and its gradients of the tokens, both stacks and the scales are as exact as the products of the
     rows gathered and scaled and the layer's matrices sliced, each multiplied apart, both from float64
     truth (check 1; row 12306). The kernels run interpreted on this CPU, as the H100's: the binding and the
-    values one case, the gradients another, their draws in map tasks of four (214 s together)."""
+    values one case (16 s), the gradients another, their draws in map tasks of two (128 s a task of four).
+    """
     from generation_support import here
     from map_judge import marked_seeds
     from reference_error import as_given, assert_as_exact, with_gradients
