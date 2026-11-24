@@ -126,7 +126,7 @@ from dew.checkpoints._state_trees import (
     _variable_trees,
     _with,
     _with_ema_deltas,
-    decodes_done,
+    ahead_done,
 )
 from dew.checkpoints._step_records import counted_processes, gather_positions, read_position, step_record
 from dew.checkpoints.averaging import (
@@ -2476,7 +2476,7 @@ class Checkpoints:
         cut = ([] if self._manager is None else [("Checkpoint projection", self._project)])
         cut.append(("Checkpoint deletion", self._deleted))
         return [*(("Checkpoint wait", writer.wait_until_finished) for writer in opened),
-                ("Checkpoint restore decodes", decodes_done), *cut,
+                ("Checkpoint compiles ahead", ahead_done), *cut,
                 ("Checkpoint detach", detached), *(("Checkpoint close", writer.close) for writer in opened)]
 
     def wait(self) -> None:
@@ -2488,6 +2488,6 @@ class Checkpoints:
         with region("checkpoint.wait"):
             attempted([*(("Checkpoint wait", writer.wait_until_finished)
                          for writer in (self._manager, self._local_manager) if writer is not None),
-                       ("Checkpoint restore decodes", decodes_done)])
+                       ("Checkpoint compiles ahead", ahead_done)])
             self._pending = None
             self._project()

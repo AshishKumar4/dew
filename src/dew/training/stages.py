@@ -469,8 +469,9 @@ class StageLocal:
         key = ("stage-whole", sites, jax.tree.structure(stacked),
                tuple((leaf.shape, np.dtype(leaf.dtype), leaf.sharding) for leaf in leaves),
                jax.tree.structure(placements), tuple(jax.tree.leaves(placements)))
-        fn = program(_layered_entries, static_argnums=0, out_shardings=placements, donate_argnums=(1,))
-        compile_ahead(key, fn, sites, stacked, what="a stage-local stored unstack")
+        compile_ahead(key, lambda: program(_layered_entries, static_argnums=0, out_shardings=placements,
+                                           donate_argnums=(1,)),
+                      sites, stacked, what="a stage-local stored unstack")
 
     def whole(self, variables, *, consumed: bool = False):
         """`variables` with each stacked run back on its stored layers, each layer on every stage
@@ -523,8 +524,9 @@ def _stacked_ahead(count: int, row_shape: tuple[int, ...], dtype, row_sharding: 
 
     abstract = [jax.ShapeDtypeStruct(row_shape, dtype, sharding=row_sharding)] * count
     key = ("stage-restack", count, row_shape, np.dtype(dtype), row_sharding, within, piece_sharding)
-    fn = program(_stacked_piece, static_argnames="within", donate_argnums=0, out_shardings=piece_sharding)
-    compile_ahead(key, fn, abstract, what="a stage-local restore stack", within=within)
+    compile_ahead(key, lambda: program(_stacked_piece, static_argnames="within", donate_argnums=0,
+                                       out_shardings=piece_sharding),
+                  abstract, what="a stage-local restore stack", within=within)
 
 
 def _layered_entries(sites: tuple[DecoderBank, ...], stacked: tuple[Mapping, ...]) -> tuple[dict, ...]:
