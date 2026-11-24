@@ -947,9 +947,10 @@ values a remat rung's checkpoint keeps or recomputes by its policy's names, whic
 by the `op_name` of the op that made each."""
 
 FIXED_SCOPE = "dew_fixed_remat"
-"""The name scope of the body of a checkpoint whose policy no rung sets (`fixed_remat`: a scanned run's rows,
-`dew.nn.backbones.decoder_stack`; an in-backward run's layer; a looped pass, `dew.nn.backbones.looping`):
-values made within it no rung keeps or drops by its names, whatever blocks they sit in."""
+"""The name scope of the body of a checkpoint whose policy no rung sets (`fixed_remat`: a scanned layer read
+from host memory and an in-backward run's layer, `dew.nn.backbones.decoder_stack`; a looped pass,
+`dew.nn.backbones.looping`): values made within it no rung keeps or drops by its names, whatever blocks they
+sit in."""
 
 
 def fixed_remat[**Given, Value](function: Callable[Given, Value]) -> Callable[Given, Value]:

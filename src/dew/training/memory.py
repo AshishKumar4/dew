@@ -762,12 +762,12 @@ def resident_on(*trees: TrainState | Batch) -> dict[Hashable, int]:
 
 def limit_exited(executable: jax.stages.Compiled | None) -> bool:
     """Whether `executable` is a compile XLA stopped at its buffer assignment, past the limit it compiled
-    under (`LIMIT_EXIT`): one that emitted no device code (`CompiledMemory.generated_code`), its memory
-    stated as a whole compile's, which runs nowhere and is no plan's nor any held step's. A whole binary
-    (one held, compiled ahead or read from the persistent cache, which keys no limit) runs whatever limit a
-    later compile asks, and is judged by its memory alone."""
+    under (`LIMIT_EXIT`), as it states (`CompiledMemory.stopped`): its memory stated as a whole compile's,
+    it runs nowhere and is no plan's nor any held step's. A whole binary (one held, compiled ahead or read
+    from the persistent cache, which keys no limit) runs whatever limit a later compile asks, and is judged
+    by its memory alone."""
     memory = None if executable is None else compiled_memory(executable)
-    return memory is not None and memory.generated_code == 0 and memory.summed > 0
+    return memory is not None and memory.stopped
 
 
 def unlimited(options: jax.stages.CompilerOptions | None) -> jax.stages.CompilerOptions | None:
@@ -940,9 +940,9 @@ def step_fits_admitted(executable: jax.stages.Compiled | None, mesh: Mesh, held:
                        ) -> tuple[bool, int | None, tuple[int, int, int] | None]:
     """`step_fits`, with the terms this process admitted the step by (`step_admitted`), read within the
     one agreement, so a process whose read fails ends every process's check with its error. A compile XLA
-    stopped past the limit it compiled under (`limit_exited`) runs nowhere: its headroom is at most that
-    limit, as `options` state it, less its sum, and never zero or more, whatever the allocator reads, so no
-    process admits it; a whole binary is judged by its memory alone."""
+    stopped past the limit it compiled under (`CompiledMemory.stopped`) runs nowhere: its headroom is at most
+    that limit, as `options` state it, less its sum, and never zero or more, whatever the allocator reads or
+    where it reads none, so no process admits it; a whole binary is judged by its memory alone."""
     local = [device for device in mesh.devices.flat if device.process_index == jax.process_index()]
     if executable is None:
         return fits_everywhere(lambda: -1)[0], None, None
@@ -951,8 +951,11 @@ def step_fits_admitted(executable: jax.stages.Compiled | None, mesh: Mesh, held:
     def read() -> int | None:
         headroom, terms[0] = step_admitted(executable, local, held, built, placed=placed)
         memory, limit = compiled_memory(executable), (options or {}).get(LIMIT_EXIT)
-        if headroom is not None and memory is not None and limit_exited(executable):
-            headroom = min(headroom, (limit if isinstance(limit, int) else 0) - memory.summed, -1)
+        if memory is not None and memory.stopped:
+            # Short by its sum past the limit it stopped at, where `options` state it; refused whatever the
+            # allocator reads, or where it reads none.
+            short = min((limit if isinstance(limit, int) else 0) - memory.summed, -1)
+            headroom = short if headroom is None else min(headroom, short)
         return headroom
 
     fit, headroom = fits_everywhere(read)

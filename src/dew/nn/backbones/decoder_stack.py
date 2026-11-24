@@ -524,12 +524,8 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
 
             policy = _rows_recomputed(remat)
 
-            # Under a rung that keeps names the rows' policy is the rung's; under none or one recomputing
-            # named residuals itself it is their own, no rung's (`_rows_recomputed`, `fixed_remat`).
-            own = remat is None or bool(remat.recompute)
-
             def scanned(layer, carry, index, *, store=store, step=step, rows=rows, inputs=inputs,
-                        policy=policy, own=own):
+                        policy=policy):
                 # The iteration's per-layer input, its layers along axis 2.
                 per_layer_input = jax.tree.map(
                     lambda leaf: jax.lax.dynamic_index_in_dim(leaf, index, axis=2, keepdims=False), inputs)
@@ -544,7 +540,10 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
                     return nn.map_variables(layered, (LAYER_ROWS, *rows), init=False, mutable=False,
                                             trans_in_fn=functools.partial(_rows_joined, index=index))(
                         layer, carry)
-                rematted = nn.remat(fixed_remat(read) if own else read, policy=policy, prevent_cse=False)
+                # Under no scope of its own: the rows' policy keeps what a rung keeps by its names, every
+                # product besides under none or one recomputing named residuals (`_rows_recomputed`), each
+                # value a rung's to keep or drop as a block's; the rows it read it never keeps.
+                rematted = nn.remat(read, policy=policy, prevent_cse=False)
                 return rematted(layer, carry, index), None
             # A parameter its module boxed (`nn.with_logical_partitioning`) stacks with an unnamed layer
             # axis, which the run's view cuts off again per layer (`_rows`).

@@ -1408,11 +1408,13 @@ class FitSearch[LossT, EffectsT]:
                                                defaults=self.own_defaults()) for rung in group]
         if deferred:
             # Their release deferred, every rung parting the stacks stays a rung the search asks before it
-            # refuses the step, the start's own among them (the ladder leaves the start out): one missed
-            # by less than the last remat rung's miss may fit parted where that one did not.
-            rungs.append(dataclasses.replace(start, narrow=narrow, ns_group=1))
-            if ns_group is None:
-                rungs += [rung for group in self.ladder(start, narrow, 1, remat_set=self.remat_set,
+            # refuses the step, the start's own among them (the ladder leaves the start out), with and
+            # without the narrow copies where its step reads them: one missed by less than the last remat
+            # rung's miss may fit parted where that one did not.
+            copies = start.narrow and any(candidate.copies for candidate in self.lowered.values())
+            for held in dict.fromkeys((narrow, *((not narrow,) if copies else ()))):
+                rungs.append(dataclasses.replace(start, narrow=held, ns_group=1))
+                rungs += [rung for group in self.ladder(start, held, 1, remat_set=self.remat_set,
                                                         defaults=self.own_defaults()) for rung in group]
         for rung in rungs:
             if rung in self.asked:

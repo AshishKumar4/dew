@@ -4,6 +4,7 @@ batch signature; and the limit a GPU compile stops past, which gives back the st
 (`compile_limit`, row 12465)."""
 
 import gc
+import weakref
 
 import jax
 import jax.numpy as jnp
@@ -11,7 +12,6 @@ import numpy as np
 import optax
 import pytest
 from affine_run import FEATURES, Regression
-from jax.extend.backend import get_backend
 
 from dew.distributed.placement import Layout, MeshSpec
 from dew.training import FitPolicy, Trainer
@@ -89,20 +89,23 @@ def test_a_fit_meeting_shape_after_shape_holds_no_step_past_its_budget(monkeypat
     from dew.training import memory
     from dew.training.observe import Observe
 
-    def steps_live() -> int:
-        """The live executables the backend holds of the run's steps, its traced step's module."""
-        gc.collect()
-        return sum(1 for executable in get_backend().live_executables()
-                   if "step" in executable.hlo_modules()[0].name)
-
     def trained(budget: int | None):
         with monkeypatch.context() as patched:
             if budget is not None:
                 patched.setattr(memory, "HELD_CODE_BYTES", budget)
-            live = Observe(1, lambda state: steps_live())
             trainer = Trainer(Regression(), optax.sgd(0.1), key=jax.random.key(0))
-            state = trainer.fit(_shaped((16, 8, 32)), steps=6, log_every=100, observe=live)
-        return [count for _, count in live.values], jax.device_get(state.variables)
+            # Each executable this run's steps ran (`Trainer.executable`), and how many of them live at each
+            # step, garbage collected.
+            ran: dict[int, weakref.ref] = {}
+
+            def live(state) -> int:
+                ran.setdefault(id(trainer.executable), weakref.ref(trainer.executable))
+                gc.collect()
+                return sum(1 for held in ran.values() if held() is not None)
+
+            observed = Observe(1, live)
+            state = trainer.fit(_shaped((16, 8, 32)), steps=6, log_every=100, observe=observed)
+        return [count for _, count in observed.values], jax.device_get(state.variables)
 
     bounded, held = trained(1)
     whole, kept = trained(None)
@@ -112,46 +115,55 @@ def test_a_fit_meeting_shape_after_shape_holds_no_step_past_its_budget(monkeypat
 
 @pytest.mark.gpu(reason="an allocator's live reading, which only an attached GPU states")
 def test_a_placed_steps_compile_limit_gives_back_the_state_it_reuses():
-    """A placed run's step, compiled where its GPU has free memory short of its state and its temporaries
-    together but not of its temporaries alone, compiles whole within its limit and is admitted at its first
-    compile: the limit gives back the bytes the placed state holds (`compile_limit`, `Candidate.resident`),
-    which the step reuses where they lie (row 12465). Read off the shapes the step was lowered over, the
-    state held nothing, and XLA stopped the step at its buffer assignment past a limit it fit within
-    (review of row 12465)."""
+    """A placed run's step, compiled cold where its GPU has free memory short of its state and its
+    temporaries together but not of its temporaries alone, compiles whole within its limit, is admitted at
+    its first compile and runs: the limit gives back the bytes the placed state holds (`compile_limit`,
+    `Candidate.resident`), which the step reuses where they lie (row 12465). Read off the shapes the step was
+    lowered over, the state held nothing, and XLA stopped the step at its buffer assignment past a limit it
+    fit within (review of row 12465). Its figures are read off the same step compiled ahead for a GPU of its
+    generation, no binary of the step itself made before."""
     from token_support import token_rows
 
     from dew.distributed.batches import shard_batch
+    from dew.nn.kernels.generation import compile_only_gpus, device_generation
     from dew.objectives.lm import LMObjective
     from dew.optim import Adam, OptimConfig
     from dew.registry import models
+    from dew.training.ahead import compile_ahead
     from dew.training.memory import step_room
 
     device = jax.local_devices()[0]
     model = models.build("causal_transformer", vocab_size=32768, emb_features=1024, num_layers=1, num_heads=8,
                          num_kv_heads=2, head_dim=64, mlp_features=1024, max_seq_len=8, dtype="float32")
+    rows = token_rows(32768, 1, 9)
 
-    def placed():
-        trainer = Trainer(LMObjective(model, 8, ema_decay=0.9),
-                          OptimConfig(optimizer=Adam(), learning_rate=1e-3), key=jax.random.key(0),
-                          mesh=MeshSpec(), layout=Layout(min_shard=2 ** 30),
-                          fit=FitPolicy(split=1, remat="none"))
-        state, _, _ = trainer.place()
-        return trainer, state, shard_batch(trainer.device_mesh, token_rows(32768, 1, 9))
+    def built(mesh) -> Trainer:
+        optimizer = OptimConfig(optimizer=Adam(), learning_rate=1e-3)
+        return Trainer(LMObjective(model, 8, ema_decay=0.9), optimizer, key=jax.random.key(0), mesh=mesh,
+                       layout=Layout(min_shard=2 ** 30), fit=FitPolicy(split=1, remat="none"))
 
-    roomy, state, batch = placed()
-    roomy.compile(state, batch)
-    [first] = roomy.plan["probes"]
-    argument, beside, temp = first["argument"], first["beside"], first["temp"]
-    del roomy, state, batch
+    ahead = compile_ahead(built(MeshSpec().build(compile_only_gpus(device_generation(), 1, 2 ** 36))),
+                          rows)
+    argument, beside = ahead.argument_bytes, ahead.output_bytes - ahead.alias_bytes + (1 << 20)
     # Room for its temporaries twice over beside what it places, and half its state: short of the state
     # and temporaries together, so a limit that gives the state back nothing stops it.
-    trainer, state, batch = placed()
-    target = beside + 2 * temp + argument // 2
-    assert target < argument + beside + temp, (argument, beside, temp)
-    room = step_room(device)
-    assert room is not None and room > target, (room, target)
-    filler = [jnp.zeros((1 << 28,), jnp.float32) for _ in range((room - target) >> 30)]
-    trainer.compile(state, batch)
-    probes = trainer.plan["probes"]
-    assert probes[0]["fits"] and trainer.plan["split"] == 1, probes
-    del filler
+    target = beside + 2 * ahead.temp_bytes + argument // 2
+    assert target + (1 << 27) < argument + beside + ahead.temp_bytes, ahead
+    cached = jax.config.jax_enable_compilation_cache
+    jax.config.update("jax_enable_compilation_cache", val=False)
+    try:
+        trainer = built(MeshSpec())
+        state, _, _ = trainer.place()
+        batch = shard_batch(trainer.device_mesh, rows)
+        room = step_room(device)
+        assert room is not None and room > target, (room, target)
+        filler = [jnp.zeros((1 << 24,), jnp.float32) for _ in range((room - target) >> 26)]
+        filled = step_room(device)
+        assert filled is not None and target <= filled < target + (1 << 27), (target, filled)
+        step = trainer.compile(state, batch)
+        probes = trainer.plan["probes"]
+        assert probes[0]["fits"] and trainer.plan["split"] == 1, probes
+        jax.block_until_ready(step(state, batch)[1])
+        del filler
+    finally:
+        jax.config.update("jax_enable_compilation_cache", cached)
