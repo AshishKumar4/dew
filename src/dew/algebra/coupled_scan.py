@@ -245,20 +245,48 @@ def _floored(value: scaled.Scaled) -> scaled.Scaled:
                          SUMS_REACH)
 
 
-ORDINARY = 2.0 ** -96
-"""The least magnitude a float running sum is taken at for its scaled twin (`_ordinary`): every term it
-flushed, under float32's least normal, at most 2^-120 together over a chunk of 64, beneath its rounding."""
+ORDINARY = 2.0 ** -90
+"""The least magnitude a float result is taken at for its scaled twin (`_taken`): every term it flushed,
+under float32's least normal, at most 2^-118 together over 256 terms, beneath its rounding."""
 
 
-def _ordinary(running, twin: scaled.Scaled) -> scaled.Scaled:
-    """A decayed sum the float running product's (its FMA-contracted rounding, as the token walk's) where it
-    is finite and ordinary (`ORDINARY`), or zero where its scaled twin is; else the twin's, past the float's
-    range."""
+def _taken(running, twin: scaled.Scaled):
+    """Where a float result is its own (`_ordinary`, `_landed`): finite, and ordinary (`ORDINARY`) or zero
+    where its scaled twin is; no term of it then overflowed, and those it flushed are beneath its rounding."""
     zero = (running == 0) & (twin.significand == 0)
-    taken = jnp.isfinite(running) & ((jnp.abs(running) >= ORDINARY) | zero)
+    return jnp.isfinite(running) & ((jnp.abs(running) >= ORDINARY) | zero)
+
+
+def _ordinary(running, twin: scaled.Scaled, faint) -> scaled.Scaled:
+    """A decayed sum the float running product's (its FMA-contracted rounding, as the token walk's) where it
+    is its own (`_taken`) and no decay of the chunk is `faint` (beneath float32's least normal, which the
+    float's products would have read as zero); else its scaled twin's, past the float's range."""
+    taken = _taken(running, twin) & ~faint
     exact = scaled.scaled(jnp.where(taken, running, 0.0))
     return scaled.Scaled(jnp.where(taken, exact.significand, twin.significand),
                          jnp.where(taken, exact.exponent, twin.exponent), SUMS_REACH)
+
+
+def _landed(running, twin: scaled.Scaled, flushed=False):
+    """A result the float computation's (matrix products' rounding, as the token walk's) where it is its own
+    (`_taken`) and no decayed sum's product with a value it went on to multiply flushed (`flushed`,
+    `_weighed`); else its scaled twin's landed once, past the float's range."""
+    return jnp.where(_taken(running, twin) & ~flushed, running, scaled.landed(twin))
+
+
+def _weighed(values, sums: scaled.Scaled):
+    """`values` weighed by their decayed sums (`scaled.applied`: no intermediate leaves the range its result
+    does not), and where a product flushed beneath float32's least normal though neither factor is zero, as
+    0 or 1 (`_reached`)."""
+    weighed = scaled.applied(values, sums)
+    flushed = (values != 0) & (sums.significand != 0) & (jnp.abs(weighed) < np.finfo(weighed.dtype).tiny)
+    return weighed, flushed.astype(weighed.dtype)
+
+
+def _reached(product) -> jax.Array:
+    """Which entries a matrix product of flushed products' indicators (`_weighed`) and nonzero values'
+    reached (`_landed`'s `flushed`)."""
+    return product > 0
 
 
 def _decayed_sums(alpha: scaled.Scaled, mu: scaled.Scaled, lam) -> tuple:
@@ -272,6 +300,9 @@ def _decayed_sums(alpha: scaled.Scaled, mu: scaled.Scaled, lam) -> tuple:
     own = jnp.eye(tokens + 1, dtype=jnp.bool_)[1:]
     weights = scaled.scaled(lam)
     floats = (scaled.landed(alpha), scaled.landed(mu), lam)
+    tiny = np.finfo(lam.dtype).tiny
+    faint = jnp.any(jnp.stack([(jnp.abs(running) < tiny) & (twin.significand != 0)
+                               for running, twin in ((floats[0], alpha), (floats[1], mu))]))
 
     def token(carried, step):
         scaled_parts, float_parts = carried
@@ -299,7 +330,7 @@ def _decayed_sums(alpha: scaled.Scaled, mu: scaled.Scaled, lam) -> tuple:
                seeded(zeros, first, jnp.ones((), lam.dtype)))
     ((_, last, _), (_, last_f, _)), (g, kept, g_f, kept_f) = lax.scan(
         token, carried, (alpha, mu, weights, own, *floats))
-    return tuple(_ordinary(running, scaled.Scaled(*twin, SUMS_REACH))
+    return tuple(_ordinary(running, scaled.Scaled(*twin, SUMS_REACH), faint)
                  for running, twin in ((g_f, g), (last_f, last), (kept_f, kept)))
 
 
@@ -365,18 +396,17 @@ def _prepared(first, second, lam, b, u, c, q, r, cut, *, base2: bool) -> Chunked
         entering_momentum=_sliced(ends, 0), momentum_kept=_sliced(last, 0))
 
 
-def _sum(*terms) -> jax.Array:
-    """The terms' sum landed once (`scaled.landed`), each a float or a scaled value: a term past the
-    format's range where the sum is not cancels before it is rounded (2^127 entering both states under
-    decays and write gates of one: `b_2 M_0` is -2^128 where the memory leaving is -2^127,
-    ReviewMomentum1454)."""
+def _sum(*terms) -> scaled.Scaled:
+    """The terms' sum in scaled arithmetic, each a float or a scaled value: a term past the format's range
+    where the sum is not cancels before it is rounded (2^127 entering both states under decays and write
+    gates of one: `b_2 M_0` is -2^128 where the memory leaving is -2^127, ReviewMomentum1454)."""
     total = None
     for term in terms:
         term = term if isinstance(term, scaled.Scaled) else scaled.scaled(term)
         total = term if total is None else scaled.add(total, term)
     if total is None:
         raise ValueError("a sum of no terms")
-    return scaled.landed(total)
+    return total
 
 
 def _column(value: scaled.Scaled) -> scaled.Scaled:
@@ -421,10 +451,12 @@ def _read(vectors, state) -> scaled.Scaled:
 def _inputs(chunk: Chunked, pair):
     """A chunk's inputs `W` from the pair entering it: the system solved (a unit lower-triangular solve)
     against each token's input and its correction's reads of the entering memory and momentum, each weighed
-    by its scaled factor, their sum landed once (`_sum`)."""
-    corrected = _sum(chunk.inputs, scaled.mul(_read(chunk.corrections, pair[0]), _column(chunk.kept_before)),
-                     scaled.mul(_read(chunk.corrections, pair[1]), _column(chunk.momentum_before)))
-    return solve_triangular(chunk.system, corrected, lower=True, unit_diagonal=True)
+    by its factor: the float sum where it is its own, else its scaled twin's (`_landed`)."""
+    twin = _sum(chunk.inputs, scaled.mul(_read(chunk.corrections, pair[0]), _column(chunk.kept_before)),
+                scaled.mul(_read(chunk.corrections, pair[1]), _column(chunk.momentum_before)))
+    running = (chunk.inputs + scaled.applied(chunk.corrections @ pair[0], _column(chunk.kept_before))
+               + scaled.applied(chunk.corrections @ pair[1], _column(chunk.momentum_before)))
+    return solve_triangular(chunk.system, _landed(running, twin), lower=True, unit_diagonal=True)
 
 
 def _stepped(state, chunk: Chunked, issue=None):
@@ -437,8 +469,12 @@ def _stepped(state, chunk: Chunked, issue=None):
     w = _inputs(chunk, pair)
     written = _summed(lambda key, value: key[:, None] * value[None, :], (chunk.keys, w), pair[0].shape,
                       chunk.memory_sums)
-    memory = _sum(scaled.mul(scaled.scaled(pair[0]), chunk.kept),
-                  scaled.mul(scaled.scaled(pair[1]), chunk.entering_momentum), written)
+    twin = _sum(scaled.mul(scaled.scaled(pair[0]), chunk.kept),
+                scaled.mul(scaled.scaled(pair[1]), chunk.entering_momentum), written)
+    weighed, flushed = _weighed(w, _column(chunk.memory_sums))
+    running = (scaled.applied(pair[0], chunk.kept) + scaled.applied(pair[1], chunk.entering_momentum)
+               + chunk.keys.T @ weighed)
+    memory = _landed(running, twin, _reached((chunk.keys != 0).astype(w.dtype).T @ flushed))
     momentum = scaled.applied(pair[1], chunk.momentum_kept) + chunk.momentum_keys.T @ w
     return decay, jnp.stack([memory, momentum])
 
@@ -457,7 +493,11 @@ def _mapped(chunk: Chunked, state, issue=None):
                      (chunk.dots.shape[0], w.shape[-1]), weights)
     memory = scaled.mul(_read(chunk.queries, pair[0]), _column(chunk.kept_to))
     momentum = scaled.mul(_read(chunk.queries, pair[1]), _column(chunk.momentum))
-    return _sum(memory, momentum, scored, chunk.free)
+    scores, flushed = _weighed(chunk.dots, chunk.sums)
+    running = (scaled.applied(chunk.queries @ pair[0], _column(chunk.kept_to))
+               + scaled.applied(chunk.queries @ pair[1], _column(chunk.momentum)) + scores @ w + chunk.free)
+    reached = _reached(flushed @ (w != 0).astype(w.dtype))
+    return _landed(running, _sum(memory, momentum, scored, chunk.free), reached)
 
 
 def _replayed(declaration, names: Sequence[str], parts: linear_scan.Coupled, chunk: Mapping, pair) -> tuple:
