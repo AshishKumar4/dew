@@ -285,10 +285,12 @@ def test_cutlass_eligibility_reads_the_dew_cutlass_build_installed_now(tmp_path,
     assert ampere["sm80"] == "sm80" and grouped_cutlass.cutlass_built_for("sm80") == "sm80"
 
 
-def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
+def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes, stacked=False):
     """Where the installed dew-cutlass holds this GPU's kernels, the projection's forward and both
     gradients through CUTLASS's launches, chosen by name and the forward's kernel pinned, are as exact as
-    XLA's ragged dot from float64, unrouted rows and empty groups included."""
+    XLA's ragged dot from float64, unrouted rows and empty groups included. `stacked`, its matrices the
+    second layer of a stack the call reads from its layer's first (a scanned stack's, `gemm._grouped`),
+    which a pinned CUTLASS launch takes as a slice of the stack (row 4074's review)."""
     # The wheel is optional: a process without it, or whose wheel holds no kernel for its GPU, runs the
     # template's launches, which the suite checks apart.
     here = generation.gpu_target().generation
@@ -308,12 +310,18 @@ def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
     built = grouped_cutlass.cutlass_built_for(here)
     pinned = {grouped_cutlass.CutlassGmm: grouped_cutlass.cutlass_tile(built, jnp.bfloat16)}
 
+    def layer_of_a_stack(x, w):
+        stack = jnp.stack([jnp.zeros_like(w), w])
+        return gemm.gemm(x, stack, jnp.asarray(group_sizes, jnp.int32), layer=jnp.int32(1),
+                         out_dtype=jnp.bfloat16)
+
     def through_cutlass(x, w, dy):
         with generation.chosen(grouped_matmul="cutlass"), tuning.pinned(pinned):
-            return with_gradients(projection("pallas"))(x, w, dy)
+            return with_gradients(layer_of_a_stack if stacked else projection("pallas"))(x, w, dy)
 
     assert_as_exact(jax.jit(through_cutlass), jax.jit(with_gradients(projection("xla"))), draw,
-                    f"cutlass {sizes}", seeds=SEEDS, truth_fn=with_gradients(projection("xla", jnp.float64)))
+                    f"cutlass {sizes}{' stacked' if stacked else ''}", seeds=SEEDS,
+                    truth_fn=with_gradients(projection("xla", jnp.float64)))
 
 
 def the_template_sums_16_bit_products_into_fp32_as_exactly_as_xla(depth):

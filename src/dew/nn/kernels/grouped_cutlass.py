@@ -71,7 +71,8 @@ class _Cutlass(_GroupedLaunch[tiling.Tiles]):
         """Whether its kernels take the call wherever dew_cutlass holds them (`eligible` adds the installed
         library's generations): bf16 operands, bf16 or fp32 out, int32 sizes, every extent a multiple of 8
         elements (16-byte aligned rows of every operand and output, as its TMA copies and each group's
-        pointers need), no hooks or exact sums, compiled (no interpreter), its stack read whole."""
+        pointers need), no hooks or exact sums, compiled (no interpreter). A stack's layer it reads as a slice
+        of its matrices (`CutlassGmm._fwd`)."""
         operands = [value for name, value in ba.arguments.items()
                     if name in ('tokens', 'kernel', 'cotangent')]
         extents = {extent for operand in operands for extent in operand.shape[1:]}
@@ -79,7 +80,7 @@ class _Cutlass(_GroupedLaunch[tiling.Tiles]):
                 and jnp.dtype(ba.arguments['out_dtype']) in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32))
                 and ba.arguments['sizes'].dtype == jnp.int32 and all(extent % 8 == 0 for extent in extents)
                 and ba.arguments['hooks'] == NO_HOOKS and not ba.arguments.get('exact_sums')
-                and not ba.arguments['interpret'] and ba.arguments.get('first') is None)
+                and not ba.arguments['interpret'])
 
     def space(self, ba) -> tuple[tiling.Tiles, ...]:
         tile = self.tile(ba)
@@ -110,10 +111,15 @@ class CutlassGmm(_Cutlass):
              trans_rhs: bool, interpret: bool,
              hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
              dense: bool = False, config: tiling.Tiles, return_residuals: bool = False):
-        # No hooks, side operands, second matrix, stack read from a first matrix or exact sums: the launch is
-        # not eligible for them (`_Cutlass.eligible`); a dense call is one group, as any.
-        del prologue_operands, epilogue_operands, paired, first, gather, scatter, interpret, hooks, exact_sums
+        # No hooks, side operands, second matrix or exact sums: the launch is not eligible for them
+        # (`_Cutlass.eligible`); a dense call is one group, as any.
+        del prologue_operands, epilogue_operands, paired, gather, scatter, interpret, hooks, exact_sums
         del dense, config, joined, beside, chained
+        if first is not None:
+            # A stacked layer's call (a scanned stack's, `gemm._grouped`) reads its groups' matrices from the
+            # stack's `first`: the library takes one array of them, so it gets the layer's as a slice, the
+            # copy a stack read whole made before the scanned default (row 4074's review).
+            kernel = jax.lax.dynamic_slice_in_dim(kernel, first, sizes.shape[0])
         importlib.import_module('dew_cutlass').registered()
         width = kernel.shape[1] if trans_rhs else kernel.shape[2]
         out = jax.ShapeDtypeStruct((tokens.shape[0], width), jnp.dtype(out_dtype))

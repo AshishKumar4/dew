@@ -236,12 +236,13 @@ def test_the_gemm_kernels_run_on_this_gpu():
              when(generation.triton_runs(), "needs a GPU the Pallas kernels compile for",
                   gemm_template.a_dense_products_exact_sums_survive_one_row_tile),
              native={"launch": "dense", "pass": "forward"}),
-        *(Cell(f"CUTLASS runs the projection as exactly as XLA where chosen: {sizes}",
+        *(Cell(f"CUTLASS runs the projection as exactly as XLA where chosen: {sizes}"
+               + (", a stack's layer" if stacked else ""),
                functools.partial(grouped_gemm.cutlass_runs_the_projection_as_exactly_as_xla_where_chosen,
-                                 sizes),
-               fault="CUTLASS's launches, which no CPU runs" if sizes == "ragged" else None,
-               native={"launch": "cutlass", "groups": sizes})
-          for sizes in grouped_gemm.SIZES if any(grouped_gemm.SIZES[sizes])),
+                                 sizes, stacked),
+               fault="CUTLASS's launches, which no CPU runs" if sizes == "ragged" and not stacked else None,
+               native={"launch": "cutlass", "groups": sizes, "stacked": stacked})
+          for sizes in grouped_gemm.SIZES if any(grouped_gemm.SIZES[sizes]) for stacked in (False, True)),
         *(Cell(f"the template sums 16-bit products into fp32 as exactly as XLA: depth {depth}",
                functools.partial(grouped_gemm.the_template_sums_16_bit_products_into_fp32_as_exactly_as_xla,
                                  depth),
