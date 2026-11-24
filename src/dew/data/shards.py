@@ -54,8 +54,8 @@ def streamed(
         return grain.MapDataset.source(()).to_iter_dataset()
     shards = _shards(manifest, partition=partition, loading=loading)
     # The cut its places were dealt from, which its position holds (`_Passing`): the manifest's own, or
-    # the changed rule that cut it finer here (`ShardManifest.subdivided_by`).
-    dealt = manifest.cut or (manifest.subdivided_by if shards != tuple(manifest.shards) else None)
+    # the changed rule that cut it finer here (`_changed_cut`).
+    dealt = manifest.cut or _changed_cut(manifest, shards)
     if places is not None:
         reader = _Taken(manifest.reader)
         return _ShardPass(grain.MapDataset.source(places), reader, cycle_length, loading, described,
@@ -152,7 +152,17 @@ def cut(manifest: ShardManifest, *, partition: DataPartition, loading: Loading) 
     if shards == manifest.shards:
         return manifest
     return dataclasses.replace(manifest, shards=shards, subdivide=None, counted=None,
-                               cut=manifest.subdivided_by)
+                               cut=_changed_cut(manifest, shards))
+
+
+def _changed_cut(manifest: ShardManifest, shards: tuple[Shard, ...]) -> str | None:
+    """The changed rule `manifest`'s shards were cut finer by into `shards` (`ShardManifest.subdivided_by`),
+    where its cut differs from the first rule's: ranges of as many records each, which the even cut's are
+    where its readers' count divides its records (`dew.data.sources.base.EVEN_CUT`), so a position the
+    first rule saved resumes there (Train 1248's review). None where it was not cut, or cut alike."""
+    if shards == tuple(manifest.shards) or len({shard.rows for shard in shards}) <= 1:
+        return None
+    return manifest.subdivided_by
 
 
 def _shards(manifest: ShardManifest, *, partition: DataPartition, loading: Loading) -> tuple[Shard, ...]:
