@@ -17,6 +17,7 @@ from dew.distributed.batches import shard_batch
 from dew.nn.backbones.layer_names import group_layers
 from dew.nn.kernels.generation import compile_only_gpus
 from dew.nn.kernels.options import program
+from dew.objectives.base import Ratio
 from dew.objectives.lm import LMObjective
 from dew.optim import AdamW, OptimConfig, ParamGroup
 from dew.registry import models
@@ -620,9 +621,10 @@ class _Penalized(LMObjective):
 
     def loss(self, variables, batch, step):
         stats, aux = super().loss(variables, batch, step)
+        assert isinstance(stats, Ratio), type(stats)
         penalty = sum(jnp.sum(jnp.square(leaf.astype(jnp.float32))) for leaf in jax.tree.leaves(
             variables["params"]))
-        return stats.replace(total=stats.total + 1e-3 * penalty * stats.mass), aux
+        return Ratio(stats.total + 1e-3 * penalty * stats.mass, stats.mass), aux
 
 
 @pytest.mark.mesh(devices=2)
