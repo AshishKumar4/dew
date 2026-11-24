@@ -48,11 +48,10 @@ This page is generated from the maintainers' findings ledger as each change land
 - resources.operand_fragments counts every part of a multi-part shared operand live at once. [6494]
 - A 4B decision start's cold fit spends 152.8 s (template) and 162.2 s (vendor) in 12 traces of templates/report.py's certification program pulled_back…. [6593]
 - Pallas's interpreter compiles a thread map's body once per leased CPU client. [7087]
-- A forked turned call (Mamba-3 MIMO's TURNED over entered_draw's table with entry writes) fails its selector's eligibility on an H100. [12631]
 
 ## Models and interop
 
-- Every recurrence transition and state family. [1300, 1448, 1450, 1451, 1452, 1454, 1455, 1457, 1458, 1459, 1460, 1646, 12414, 12425]
+- Every recurrence transition and state family. [1300, 1448, 1450, 1451, 1452, 1454, 1455, 1457, 1458, 1459, 1460, 1646]
 - Every nn and interop primitive, seam, contract and derivative has one owner. [11980, 5625]
 - Owner-approved Audit 4 API cleanup. [11937]
 - Owner-approved Audit 4 API cleanup. [11938]
