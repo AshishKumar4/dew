@@ -12,6 +12,7 @@ import numpy as np
 import scipy.special
 from flax import linen as nn
 from flax.core import meta
+from flax.linen.dtypes import promote_dtype
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
@@ -332,10 +333,13 @@ class GatedMLP(nn.Module):
         so do an activation not named (an ungated MLP's one of `UNGATED`'s, a gated one's its gated
         product's: the chain calls it on its rows flattened and padded, which only an elementwise function
         keeping its dtype reads as the projections apart do), projections whose promoted operands are not of
-        one dtype (the chain rounds once, in the rows'), and a sequence axis splitting the rows (the chain
-        flattens them, past the hidden activation's placement)."""
+        one dtype (the chain rounds once, in the rows'), nor float32 or narrower (its quantizing epilogue
+        writes no float64), projections promoting their operands otherwise than flax's `promote_dtype` (the
+        chain promotes nothing), and a sequence axis splitting the rows (the chain flattens them, past the
+        hidden activation's placement)."""
         named = isinstance(self.activation, str) and (len(projections_) == 3 or self.activation in UNGATED)
-        if not (named and plain_denses(projections_)):
+        if not (named and plain_denses(projections_)
+                and all(projection.promote_dtype is promote_dtype for projection in projections_)):
             return None
         found = projections_of(projections_)
         mesh = jax.sharding.get_abstract_mesh().shape
@@ -350,8 +354,9 @@ class GatedMLP(nn.Module):
         rows = promoted[-1][0]
         hidden, down = _promoted(down_proj, rows, meta.unbox(down_proj.get_variable('params', 'kernel')),
                                  None)[:2]
-        if len({array.dtype for inputs, kernel, _ in promoted for array in (inputs, kernel)}
-               | {hidden.dtype, down.dtype}) != 1:
+        if (len({array.dtype for inputs, kernel, _ in promoted for array in (inputs, kernel)}
+                | {hidden.dtype, down.dtype}) != 1
+                or not jnp.issubdtype(rows.dtype, jnp.floating) or rows.dtype.itemsize > 4):
             return None
         gate = promoted[0][1] if len(promoted) == 2 else None
         out = recipe_chain(rows.reshape(-1, rows.shape[-1]), promoted[-1][1], down, activation,
