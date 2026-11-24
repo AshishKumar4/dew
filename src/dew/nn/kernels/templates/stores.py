@@ -47,7 +47,11 @@ chunk stores rows of whole 16-byte units in each output's dtype (8 bf16 columns,
 
 TMA_BOX_ELEMENTS = 256
 """The most elements a tensor map's box takes along a dimension (`cuTensorMapEncodeTiled`'s `boxDim`): a
-staged chunk's stored row is at most this many of its dtype's."""
+packed chunk's buffer is at most this many of its dtype's along each axis."""
+
+TMA_SMEM_ALIGNMENT = 128
+"""The bytes a tensor copy's shared-memory address is aligned to (CUDA's asynchronous copies, Table 26): a
+packed chunk's buffer is a whole number of them, so each of a stack of them starts aligned."""
 
 
 class Output(NamedTuple):
@@ -74,34 +78,45 @@ class Output(NamedTuple):
 
 
 def staged_columns(columns: int, dtypes, *, swizzle: int = STAGED_BYTES,
-                   packed: tuple[Output, ...] = ()) -> int:
+                   packed: tuple[Output, ...] = (), piece: int | None = None) -> int:
     """The columns of each chunk a consumer stages a `columns`-wide output tile in: the most that divide the
     tile within `swizzle` bytes of the widest output, a swizzled row's (`STAGED_BYTES` by default; a
     192-column tile's bf16 output in chunks of 64); where outputs are stored packed (`packed`, each
     `Output`'s divisor and form), the least multiple of it dividing the tile whose stored rows each stage
-    (`_packed_refusal`: a 128-column tile's NVFP4 scales, 8 bytes a row, stage at 256), the tile's width
-    where none does (which `staging_refusal` refuses)."""
-    chunk = math.gcd(columns, swizzle // max(jnp.dtype(dtype).itemsize for dtype in dtypes))
+    (`_packed_refusal`: a 128-column tile's NVFP4 scales, 8 bytes a row, stage at 256) within the `piece`
+    its issuer emits at once (`Issuer.chunk_columns`: a tcgen05 tile's 64), the tile's width where none does
+    (which `staging_refusal` refuses)."""
     if not packed:
-        return chunk
-    return next((wider for wider in range(chunk, columns + 1, chunk)
-                 if not columns % wider and _packed_refusal(wider, packed) is None), columns)
+        return math.gcd(columns, swizzle // max(jnp.dtype(dtype).itemsize for dtype in dtypes))
+    within = piece or columns
+    chunk = math.gcd(within, swizzle // max(jnp.dtype(dtype).itemsize for dtype in dtypes))
+    return next((wider for wider in range(chunk, within + 1, chunk)
+                 if not within % wider and _packed_refusal(wider, packed) is None), columns)
 
 
 def _packed_refusal(chunk: int, packed: tuple[Output, ...]) -> str | None:
     """Why a chunk of `chunk` tile columns stores no whole rows of each of `packed`'s outputs, None where
-    it does: each one's divisor dividing the chunk, each stored row whole `TMA_STORE_BYTES`-byte units (by
-    its dtype's bits: a packed fp4's half byte) and at most `TMA_BOX_ELEMENTS` of its elements: a chunk's
-    `chunk // divisor` columns, a transposed one's (`Output.transposed`) its share's rows."""
+    it does: each one's divisor dividing the chunk; its buffer (`[rows, chunk // divisor]`, a transposed
+    one's `[chunk // divisor, rows]`, `Output.transposed`) at most `TMA_BOX_ELEMENTS` along each axis, its
+    stored row (the inner axis) whole `TMA_STORE_BYTES`-byte units by its dtype's bits (a packed fp4's half
+    byte), and the buffer whole `TMA_SMEM_ALIGNMENT`-byte units, so each buffer of their stack starts
+    aligned for its tensor copy."""
     for output in packed:
-        name = jnp.dtype(output.dtype).name
-        stored = output.shape[0] if output.transposed else chunk // output.divisor
-        if chunk % output.divisor or stored * jax.dtypes.itemsize_bits(output.dtype) % (8 * TMA_STORE_BYTES):
+        name, bits = jnp.dtype(output.dtype).name, jax.dtypes.itemsize_bits(output.dtype)
+        rows = output.shape[0]
+        if chunk % output.divisor:
+            return f"a chunk of {chunk} columns holds no whole {output.divisor}-column blocks"
+        stored = chunk // output.divisor
+        outer, inner = (stored, rows) if output.transposed else (rows, stored)
+        if inner * bits % (8 * TMA_STORE_BYTES):
             return (f"a chunk of {chunk} columns stored {output.divisor} a column in {name} is no whole "
                     f"{TMA_STORE_BYTES}-byte TMA rows")
-        if stored > TMA_BOX_ELEMENTS:
-            return (f"a chunk of {chunk} columns stores {stored} {name} a row, past a tensor map's "
-                    f"{TMA_BOX_ELEMENTS}")
+        if max(outer, inner) > TMA_BOX_ELEMENTS:
+            return (f"a chunk of {chunk} columns stages a {outer} x {inner} {name} buffer, past a tensor "
+                    f"map's {TMA_BOX_ELEMENTS} a dimension")
+        if outer * inner * bits % (8 * TMA_SMEM_ALIGNMENT):
+            return (f"a chunk of {chunk} columns stages a {outer} x {inner} {name} buffer of no whole "
+                    f"{TMA_SMEM_ALIGNMENT} bytes, so its stack's next starts unaligned")
     return None
 
 
@@ -117,7 +132,7 @@ def output_staging(columns: int, dtypes, staging: tuple[int, int] | None = None,
     `Output.divisor`) holds its chunk's stored columns."""
     if (refusal := staging_refusal(columns, dtypes, staging, piece=piece, packed=packed)) is not None:
         raise ValueError(refusal)
-    chunk, buffers = ((staged_columns(columns, dtypes, packed=packed), OUTPUT_BUFFERS)
+    chunk, buffers = ((staged_columns(columns, dtypes, packed=packed, piece=piece), OUTPUT_BUFFERS)
                       if staging is None else staging)
     return chunk, min(columns // chunk, buffers)
 
@@ -133,7 +148,7 @@ def staging_refusal(columns: int, dtypes, staging: tuple[int, int] | None = None
     output's chunk of 4 columns, 8 bytes a row, is refused here rather than by the tensor map it lowers
     to. Outputs stored packed (`packed`, whose dtypes `dtypes` are) are refused where a chunk, stated or
     derived, stores no whole rows of them (`_packed_refusal`): a 128-column tile's NVFP4 scales."""
-    chunk, buffers = ((staged_columns(columns, dtypes, packed=packed), OUTPUT_BUFFERS)
+    chunk, buffers = ((staged_columns(columns, dtypes, packed=packed, piece=piece), OUTPUT_BUFFERS)
                       if staging is None else staging)
     if chunk < 1 or columns % chunk or (piece or columns) % chunk or buffers < 1:
         return (f"a {columns}-column output tile emitted {piece or columns} columns at once stages in no "
@@ -219,6 +234,11 @@ def staged(smem, value: jax.Array, ref, place: tuple, *, write: Callable = writt
     its stores."""
     buffers, width = smem.shape[0], smem.shape[-2 if transposed else -1]
     row_start, first, stored, column, *ladder = place
+    if isinstance(ref, Scattered) and (divisor > 1 or transposed):
+        raise ValueError("a scattered output's rows land a row at a time as computed, none packed")
+    if transposed and not (isinstance(first, int) and first == 0):
+        raise ValueError("a transposed output stores its share's rows whole from its first: a share starting "
+                         f"mid-tile (a grouped tile's, first {first}) takes none")
     chunks = column_chunks(value, width * divisor)
     waits = buffer_waits(len(chunks), buffers) if waits is None else waits
     for chunk, (start, piece) in enumerate(chunks):
@@ -236,10 +256,9 @@ def transposed_rows(smem, value: jax.Array, o_gmem, row_start, column, *, write:
     the share's rows contiguous, `write`'s packing: `Output.transposed`) and stored whole to `o_gmem`
     (`[columns, rows]`) at `column` and the share's first row `row_start`, one TMA copy its own store group:
     its rows its box's inner extent, which no partial ladder takes in whole 16-byte units, so a share stores
-    all its rows, the tensor's bound clipping those past its last. A call whose share stores fewer
-    mid-tensor (a grouped tile's) takes no transposed output."""
-    if isinstance(o_gmem, Scattered):
-        raise ValueError("a scattered output's rows land a row at a time, never transposed")
+    all its rows, the tensor's bound clipping those past its last. Its caller (`staged`) refuses a share
+    whose first row is no static 0 (a grouped tile's, its group's first row traced), so only a dense call's
+    shares reach here, each whole or ending at the tensor's last row (`gemm.mosaic_gpu._stored_rows`)."""
     write(smem, value)
     plgpu.commit_smem()
     plgpu.copy_smem_to_gmem(smem, o_gmem.at[pl.ds(column, smem.shape[0]), pl.ds(row_start, smem.shape[1])])

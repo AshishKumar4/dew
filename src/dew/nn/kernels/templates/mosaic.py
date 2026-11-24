@@ -396,13 +396,13 @@ own)."""
 
 def refuse_staging(family, chunks: tuple[int, int] | None, outputs: tuple = ()) -> tuple[tuple, ...]:
     """Refuses `chunks` (`Family.output_staging`'s) where `family` stages each output tile whole, and any of
-    `outputs` stored packed (`stores.Output`'s divisor or transposed form, which chunked staging alone
-    stores); `outputs` as `(shape, dtype)` pairs."""
+    `outputs` stored packed or written by its own write (`stores.Output`'s divisor, transposed form or write,
+    which chunked staging alone takes); `outputs` as `(shape, dtype)` pairs."""
     if chunks is not None:
         raise ValueError(f"{family.name} stages each output tile whole, in no chunks: {chunks}")
     plain = tuple(map(Output.of, outputs))
-    if any(output.divisor > 1 or output.transposed for output in plain):
-        raise ValueError(f"{family.name} stages each output tile whole, none stored packed")
+    if any(output.divisor > 1 or output.transposed or output.write is not None for output in plain):
+        raise ValueError(f"{family.name} stages each output tile whole as its issuer writes it, none packed")
     return tuple((output.shape, output.dtype) for output in plain)
 
 
