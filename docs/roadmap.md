@@ -8,7 +8,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Kernels and performance
 
-- GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 5851]
+- GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666]
 - One recurrence algebra, the template for every form and product, and port retirement. [2076, 3426, 3427]
 - Family toolkit: resources derived and checked against ptxas, one planner, one traversal. [2987, 6008, 6010, 12416, 12423, 12424, 12426]
 - The kernel challenge's lessons in the templates. [5271]
@@ -21,11 +21,9 @@ This page is generated from the maintainers' findings ledger as each change land
 - Carried JAX fixes upstream. [4689, 4690, 4693, 4698, 5403, 5808, 5809, 5810, 5811, 5813, 5814, 5815, 5816, 5817, 5820, 5822, 5823, 5825, 5827, 5829, 5831, 5832, 5833, 5834, 5835, 5836, 5837, 5839, 5841, 5842, 5843, 5845, 5846, 5847, 5848, 10742]
 - Convolution repairs above their owner. [5665]
 - The attention forward's derivation ranking does not predict its time on most cells measured. [6216]
-- The register model's proposals miss ptxas by up to about 100 registers either way on the GEMM's gate launches. [7095]
-- Tests/test_mamba3.py::test_the_chunked_form_is_as_exact_as_the_recurrence passes vacuously on main. [7401]
 - Log-linear attention 6.6x fla's forward on a GH200. [10525]
 - The recurrence suite's wall: every case within CI's group target. [12088, 12429]
-- Attention tests to the bible's §6 and §7 test rules. [12432, 12438]
+- Attention tests to the bible's §6 and §7 test rules. [12432]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
@@ -42,34 +40,35 @@ This page is generated from the maintainers' findings ledger as each change land
 - Certification admits a spill only where every STL/LDL of its SASS sits at loop depth 0 (prologue/epilogue) or in call slow-path code. [12387]
 - Memory Planner Miss-Driven ≤2-Step Search, Fast XLA Sizing & Cold-Compile Elimination. [12462]
 - ReviewGemmConfirm's review of #3913. [12630]
-- Review of #12466's emitted-op counter. [12648]
 - Review of the two-consumer mma.sync family. [12652]
 - Review of the two-consumer mma.sync family. [12653]
-- The sm120 GEMM gate's 3-stage 128x256x32 two-consumer mma.sync.fed tiles at staging (32, 2) spill under the CUDA 12.9 build's ptxas alone, at the register cap…. [12667]
 - The fork takes no static register cap for a Mosaic GPU kernel. [12686]
 - Sm120's scaled GEMM forwards are derived at a tile their compile spills. [12687]
+- Mosaic GPU async_copy's 1D bulk shortcut (jax fork, launch_context.py is_simple_contiguous_copy) clips a contiguous slice at the whole buffer's end, linearly. [12692]
+- The Mosaic GPU decode merge's device bytes (merged._launch_for_block's geometry) charge each block's columns of every slice three times, once a pass, where its…. [12699]
 - Exact on every path, every edge and every derivative order. [2656]
 - MoE transport, role-aware low precision and observability. [4515]
 - resources.operand_fragments counts every part of a multi-part shared operand live at once. [6494]
 - A 4B decision start's cold fit spends 152.8 s (template) and 162.2 s (vendor) in 12 traces of templates/report.py's certification program pulled_back…. [6593]
 - Pallas's interpreter compiles a thread map's body once per leased CPU client. [7087]
 - A turned training step's kept certified configs (report.certifications, pulled, not refused) compile one Mosaic kernel its lowered program does not run. [12646]
+- Attention (shared key runs broadcast against the batch). [12701]
 
 ## Models and interop
 
 - Every recurrence transition and state family. [1300, 1448, 1450, 1451, 1452, 1454, 1455, 1457, 1458, 1459, 1460, 1646]
-- The suite's wall. [5478, 11903, 12431, 12433, 12644]
-- Every nn and interop primitive, seam, contract and derivative has one owner. [11980, 5625]
+- The suite's wall. [5478, 12431, 12433, 12644]
 - Owner-approved Audit 4 API cleanup. [11937]
-- Owner-approved Audit 4 API cleanup. [11938]
 - The remaining releases' media towers. [851, 879]
 - Formats read and written. [871, 2548]
 - Looped residuals: InfiLoop on Dory. [1314]
 - Stacks, scans and looped models. [1568]
+- Every nn and interop primitive, seam, contract and derivative has one owner. [5625]
 
 ## Training and parallelism
 
 - Time to first step: the compile path's re-derivations. [5556]
+- A single process driving two H100s (Mesh fsdp=2, CUDA 12, driver 570.148.08, NCCL_RUNTIME_CONNECT=0, Dew's default XLA_FLAGS) deadlocks at the first execution…. [12714]
 - Owner-approved Audit 4 API cleanup. [11935]
 - CI time: every test within 120 seconds. [12484, 12641]
 - Distributed and memory training modes. [156, 873, 1306, 617]
@@ -89,7 +88,6 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## RL and serving
 
-- Owner-approved Audit 4 API cleanup. [11939]
 - RL: lossless records, composed methods and real publication. [533, 579, 886, 729, 605]
 - DeepCrossAttention (DCA, arXiv:2502.06785v2) composable depth-residual capability. [12440]
 - Dory: the release qualified and its tests' oracles. [596]
@@ -99,8 +97,6 @@ This page is generated from the maintainers' findings ledger as each change land
 ## Algebra
 
 - One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 705, 5234, 5235]
-- Owner-approved (2026-11-22): retire the last two `Algebra()`-tagged custom VJPs in `src/dew/nn/ngpt.py:91` (`join`) and `src/dew/nn/ngpt.py:160`…. [11940]
-- Src/dew/algebra/program.py:823-827 (_within) rewrites a sub-jaxpr inside an equation by equation.replace(params=params) and recomputes neither equation.effects…. [12217]
 - Released checkpoints judged on GPUs. [1703, 11674]
 - Bit-level synthesis in dew.algebra. [3733]
 - ReviewGemmConfirm's review of #3913. [12629]

@@ -643,6 +643,62 @@ def constrained[T](x: T, spec: jax.sharding.PartitionSpec | Callable[[], jax.sha
     return jax.lax.with_sharding_constraint(x, auto_part(spec() if callable(spec) else spec, mesh))
 
 
+def gathered_over[T](x: T, spec: jax.sharding.PartitionSpec, axis: str) -> T:
+    """`x`, placed as `spec`, gathered whole over the mesh's `axis` and placed as before on every other: under
+    an Explicit `axis` resharded from its type's spec without it (`jax.sharding.reshard`), else constrained to
+    `spec` without it (`constrained`). Where `axis` holds one device or `spec` places nothing on it (a
+    forward's whole placement, a leaf split over other axes alone), `x` as it is. Its transpose places a
+    gradient back as `spec`, reduced over `axis` (`dew.nn.backbones.looping`'s gathered block)."""
+    mesh = jax.sharding.get_abstract_mesh()
+    if mesh.empty or mesh.shape.get(axis, 1) == 1 or axis not in _named(spec):
+        return x
+    if axis in mesh.explicit_axes:
+        return jax.sharding.reshard(x, _without(jax.typeof(x).sharding.spec, axis))
+    return constrained(x, _without(spec, axis))
+
+
+def _named(spec: jax.sharding.PartitionSpec) -> set[str]:
+    """The mesh axes `spec` places a dimension on."""
+    return {name for entry in spec if entry is not None
+            for name in ((entry,) if isinstance(entry, str) else tuple(entry))}
+
+
+@dataclasses.dataclass(frozen=True)
+class GatheredOver:
+    """A layout (`layout`) placing every leaf of a looped block's layers (`span`, `[first, end)`, under the
+    decoder's variables `scope`, `('params', ...)`) whole over `axis` as `gathered_over` takes it, every
+    other where `layout` does: what a pass of a gathered loop traces under (`placing`), so a projection
+    mapped per shard takes its gathered weight as it lies (`dew.nn.kernels.projections.shard_placement`) and
+    gathers it again in no pass. A layer is met by any module name running it, its own (`layers_3`) or a
+    scanned run's within the block (`layers_1_2`, `dew.nn.backbones.layer_names.group_layers`)."""
+
+    layout: ParameterLayout
+    scope: tuple[str, ...]
+    span: tuple[int, int]
+    axis: str
+
+    def leaf_spec(self, mesh, path, value) -> jax.sharding.PartitionSpec:
+        from dew.nn.backbones.layer_names import group_layers
+
+        spec = self.layout.leaf_spec(mesh, path, value)
+        names = tuple(key.key if isinstance(key, jax.tree_util.DictKey) else key for key in path)
+        at = len(self.scope)
+        runs = (group_layers(names[at]) if len(names) > at and isinstance(names[at], str)
+                and names[:at] == self.scope else None)
+        first, end = self.span
+        held = runs is not None and first <= runs.start and runs.stop <= end
+        return _without(spec, self.axis) if held else spec
+
+
+def _without(spec: jax.sharding.PartitionSpec, axis: str) -> jax.sharding.PartitionSpec:
+    """`spec` with `axis` dropped from every dimension that names it."""
+    def kept(entry):
+        names = () if entry is None else (entry,) if isinstance(entry, str) else tuple(entry)
+        names = tuple(name for name in names if name != axis)
+        return None if not names else names[0] if len(names) == 1 else names
+    return jax.sharding.PartitionSpec(*map(kept, spec))
+
+
 def placed_axes(mesh: jax.sharding.AbstractMesh) -> list[str]:
     """The axes of `mesh` a constraint traced here places (`automatic_axes`, those above one device no
     `shard_map` holds): not an Explicit axis, which an array's type places, nor, inside a pipeline's stage

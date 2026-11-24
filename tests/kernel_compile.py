@@ -299,7 +299,14 @@ def lowered_for(fn, args, generation: str, expected: Expected | None = None, *, 
                    for arg, spec in zip(args, specs, strict=True))
     # Deviceless Mosaic lowering defaults to Hopper's limit, not this target's.
     # Its bound checks the total allocation, including barriers outside the scratch estimate.
-    with (assumed(generation), jax.sharding.use_abstract_mesh(mesh.abstract_mesh),
+    # On one GPU, on the mesh's concrete device, as a run's start lowers on its compile-only GPU
+    # (`jax.set_mesh`): certification then lowers each launch on the mesh the program's call does
+    # (`report._certifying_placement`), and the program reads those lowerings back (the Pallas lowering
+    # cache keys both), where an abstract mesh alone left certification a mesh of its own and the program
+    # lowered every kernel again (a GEMM gate node's lowerings 33 missed and 1 hit, now 20 and 14; 118.9 s
+    # to 111.0 s). Many devices' certification lowers on a mesh of its own whatever the program's.
+    placing = jax.set_mesh(mesh) if mesh.size == 1 else jax.sharding.use_abstract_mesh(mesh.abstract_mesh)
+    with (assumed(generation), placing,
           mgpu_core.artificial_shared_memory_limit(gpu_target(generation).shared_limit)):
         return jax.jit(fn).trace(*placed).lower()
 

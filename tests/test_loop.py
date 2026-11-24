@@ -4,9 +4,11 @@ unrolls to as that stack does, to the bit; decoding, scanned runs and
 checkpointed passes, which compute it another way, are on par with it from
 float64 over drawn models and tokens (check 1)."""
 
+import collections
 import dataclasses
 import functools
 import json
+import re
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -26,7 +28,7 @@ from model_support import (
     unrolled as layer_at_a_time,
     with_logit_cotangent,
 )
-from reference_error import assert_as_exact, dew_path, with_gradients
+from reference_error import as_given, assert_as_exact, dew_path, with_gradients
 
 from dew.batch import leaves_by_path
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -51,7 +53,7 @@ def tokens(rng, length=12, rows=2):
     return jax.random.randint(rng, (rows, length), 0, VOCAB)
 
 
-SEEDS = {'decode': 64, 'scanned': 64, 'block decode': 32}
+SEEDS = {'decode': 64, 'scanned': 64, 'block decode': 32, 'gathered': 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada):
 the most any of a site's cases took; a site that `check1_shards` shards, its mark states them
 (`marked_seeds`)."""
@@ -179,11 +181,7 @@ def test_checkpointed_passes_preserve_logits_and_gradients(backprop_steps, stack
     checkpointed = plain.clone(loop=dataclasses.replace(loop, remat=True))
 
     def result(model):
-        def run(tree, ids, cotangent):
-            pulled = with_gradients(lambda tree: model.apply(tree, ids, train=True))
-            logits, gradients = pulled(tree, cotangent)
-            return {'logits': logits, 'gradients': gradients}
-        return jax.jit(run)
+        return jax.jit(_logits_and_gradients(model))
 
     # Eight rows of sixteen tokens: a norm's scale sums its gradient over enough of them to resolve.
     draw = with_logit_cotangent(drawn(plain, 16, 8), VOCAB, 0x100)
@@ -1127,3 +1125,188 @@ def test_a_scanned_block_loop_serves_with_a_per_pass_cache(rng):
         served, alone = ticket.result().host(), task([prompt], 4, key=0).host()
         np.testing.assert_array_equal(served.tokens[0, served.prompt_width:],
                                       alone.tokens[0, alone.prompt_width:])
+
+
+def _logits_and_gradients(model):
+    """`model`'s training logits and the gradient of a cotangent on them, a function of its variables, its
+    tokens and that cotangent: what a site comparing two ways of running a loop holds on par."""
+    def run(tree, ids, cotangent):
+        pulled = with_gradients(lambda tree: model.apply(tree, ids, train=True))
+        logits, gradients = pulled(tree, cotangent)
+        return {'logits': logits, 'gradients': gradients}
+    return run
+
+
+def _collectives_in_loops(text: str) -> collections.Counter:
+    """The collectives (`all-gather`, `reduce-scatter`, `all-reduce`, their async starts) in a compiled
+    program's `while` loops, their bodies and every computation they call, from its HLO `text`."""
+    computations, current = {}, None
+    for line in text.splitlines():
+        header = re.match(r"^(?:ENTRY )?%?([\w.\-]+) .*\{$", line)
+        if header and not line.startswith(" "):
+            current = computations.setdefault(header.group(1), [])
+        elif current is not None:
+            current.append(line)
+    bodies = [match.group(1) for lines in computations.values() for line in lines
+              if " while(" in line
+              for match in [re.search(r"body=%?([\w.\-]+)", line)] if match]
+    # Every computation a body calls, at any depth: each name on its lines that names a computation.
+    seen, pending = set(), list(bodies)
+    while pending:
+        name = pending.pop()
+        if name not in seen:
+            seen.add(name)
+            pending.extend(called for line in computations[name]
+                           for called in re.findall(r"%([\w.\-]+)", line) if called in computations)
+    return collections.Counter(op for name in seen for line in computations[name]
+                               for op in re.findall(r"\b(all-gather|reduce-scatter|all-reduce)(?:-start)?\(",
+                                                    line))
+
+
+def _gathered_case(*, gathered: bool, remat: bool):
+    """A four-layer decoder looping its layers [1, 3) four times (`Loop.gathered`), recomputing each pass and
+    each layer where `remat`, and its gradient of a cotangent on its logits as a function of its variables,
+    its tokens and the cotangent."""
+    from dew.nn.backbones.decoder_block import REMAT_POLICIES
+
+    # No step norm: a pass reads its block's parameters alone (the decoder's norm, read between passes,
+    # keeps its placement).
+    model = tiny(num_layers=4, loop=Loop(4, layers=(1, 3), remat=remat, gathered=gathered, step_norm=False),
+                 **({"remat": REMAT_POLICIES["full"]} if remat else {}))
+    return model, with_gradients(lambda variables, ids: model.apply(variables, ids))
+
+
+@pytest.mark.mesh(devices=8)
+@pytest.mark.parametrize("boxed", [False, True], ids=["arrays", "boxed"])
+@pytest.mark.parametrize("remat", [False, True], ids=["plain", "recomputed"])
+def test_a_gathered_loop_reads_its_block_gathered_once(remat, boxed):
+    """A looped block whose parameters fully sharded data parallelism splits, with `Loop.gathered`, reads
+    them gathered once before its passes: its training step's pass loop (the `while` of its three later
+    passes), its body and all it calls, holds no all-gather, where the same step without it gathers there
+    each pass, and no more of the passes' gradient reductions, each pass and layer recomputed or not
+    (row 12722: the gather is not sunk back into a checkpointed body), its variables arrays or as its init
+    boxes them (`flax.core.meta`'s logical axes). Every leaf split eight ways (`Layout(min_shard=1)`)."""
+    from dew.distributed.placement import Layout
+    from dew.mesh import DEFAULT_RULES
+    from dew.nn.sharding import placing
+    from dew.training import MeshSpec
+
+    mesh = MeshSpec(fsdp=8).build(jax.devices()[:8])
+    layout = Layout(min_shard=1)
+    found = {}
+    for gathered in (False, True):
+        model, gradient = _gathered_case(gathered=gathered, remat=remat)
+        variables, ids = model_draw(model, (8, 12), VOCAB)(0)
+        if boxed:
+            variables = model.init(jax.random.key(0), ids)
+        variables = jax.device_put(variables, layout.shardings(mesh, nn.unbox(variables)))
+        cotangent = jnp.ones((8, 12, VOCAB), jnp.float32)
+        with jax.set_mesh(mesh), nn.logical_axis_rules(DEFAULT_RULES), placing(layout):
+            text = jax.jit(gradient).lower(variables, ids, cotangent).compile().as_text()
+        found[gathered] = _collectives_in_loops(text)
+    assert found[False]["all-gather"] and not found[True]["all-gather"], found
+    # The passes' gradient reductions as without it (`Loop.gathered`), none added.
+    assert found[True]["all-reduce"] + found[True]["reduce-scatter"] <= (
+        found[False]["all-reduce"] + found[False]["reduce-scatter"]), found
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_gathered_loop_trains_the_same_model():
+    """A gathered loop's logits and every gradient, its block's parameters' summed across passes before
+    their one reduce-scatter, are on par with the same loop's reading them where they lie (check 1, both
+    from the loop's float64 twin): the same sums in another order (row 12722). Every leaf split eight ways
+    over the FSDP axis (`Layout(min_shard=1)`)."""
+    from dew.distributed.placement import Layout
+    from dew.mesh import DEFAULT_RULES
+    from dew.nn.sharding import placing
+    from dew.training import MeshSpec
+
+    mesh = MeshSpec(fsdp=8).build(jax.devices()[:8])
+    layout = Layout(min_shard=1)
+    loop = Loop(4, layers=(1, 3))
+    apart = tiny(num_layers=4, loop=loop, dtype="float32")
+    gathered = apart.clone(loop=dataclasses.replace(loop, gathered=True))
+
+    def result(model, *, placed: bool = True):
+        run = _logits_and_gradients(model)
+
+        @as_given
+        def ran(tree, ids, cotangent):
+            # Run as given (`as_given`): placed on the mesh and traced under its layout outside any jit.
+            if not placed:
+                return jax.jit(run)(tree, ids, cotangent)
+            tree = jax.device_put(tree, layout.shardings(mesh, tree))
+            with jax.set_mesh(mesh), nn.logical_axis_rules(DEFAULT_RULES), placing(layout):
+                return jax.jit(run)(tree, ids, cotangent)
+        return ran
+
+    draw = with_logit_cotangent(drawn(apart, 16, 8), VOCAB, 12722)
+    assert_as_exact(result(gathered), result(apart), draw, "a gathered loop's logits and gradients",
+                    seeds=SEEDS['gathered'], truth_fn=result(apart.clone(dtype=jnp.float64), placed=False))
+
+
+def test_a_gathered_loop_traced_under_no_layout_is_the_loop():
+    """Under no traced layout (an initialization, a server's forward), a gathered loop reads its block where
+    it lies: its program is the plain loop's, equation for equation (`Loop.gathered`)."""
+    programs = []
+    for gathered in (False, True):
+        model, gradient = _gathered_case(gathered=gathered, remat=False)
+        variables, ids = model_draw(model, (2, 12), VOCAB)(0)
+        programs.append(str(jax.make_jaxpr(gradient)(variables, ids, jnp.ones((2, 12, VOCAB)))))
+    assert programs[0] == programs[1]
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_gathered_loop_on_one_fsdp_device_is_the_loop():
+    """On a mesh whose FSDP axis holds one device (data parallel alone), a gathered loop lowers to the
+    plain loop's program, operation for operation (`Loop.gathered`: nothing to gather, no scope lifted for
+    it)."""
+    from dew.distributed.placement import Layout
+    from dew.mesh import DEFAULT_RULES
+    from dew.nn.sharding import placing
+    from dew.training import MeshSpec
+
+    mesh = MeshSpec().build(jax.devices()[:8])
+    layout = Layout(min_shard=1)
+    programs = []
+    for gathered in (False, True):
+        model, gradient = _gathered_case(gathered=gathered, remat=False)
+        variables, ids = model_draw(model, (8, 12), VOCAB)(0)
+        variables = jax.device_put(variables, layout.shardings(mesh, variables))
+        with jax.set_mesh(mesh), nn.logical_axis_rules(DEFAULT_RULES), placing(layout):
+            programs.append(jax.jit(gradient).lower(variables, ids, jnp.ones((8, 12, VOCAB))).as_text())
+    assert programs[0] == programs[1]
+
+
+@pytest.mark.mesh(devices=8)
+@pytest.mark.parametrize("layer_scan", ["plain", "scanned"])
+def test_a_gathered_loops_mapped_projections_take_their_weights_as_they_lie(layer_scan):
+    """A gathered loop's projections mapped per shard on an H100 (`projections.shard_placement`, a launch
+    per device on its own rows) read their block's weights where the gathered loop placed them
+    (`sharding.GatheredOver`): its traced gradient gathers no weight in any map, where the plain loop's
+    gathers in each pass's (row 12722), its layers run one by one or as one scanned run (`layers_0_1`). The
+    whole stack loops: every mapped projection is the block's."""
+    from reference_error import equations
+
+    from dew.distributed.placement import Layout
+    from dew.mesh import DEFAULT_RULES
+    from dew.nn.kernels import generation
+    from dew.nn.sharding import placing
+    from dew.training import MeshSpec
+
+    mesh = MeshSpec(fsdp=8).build(jax.devices()[:8])
+    layout = Layout(min_shard=1)
+    found = {}
+    for gathered in (False, True):
+        # Computing in bf16 at widths the GEMM template takes, Mosaic GPU's named: products a launch takes
+        # (`projections.launched`). The whole stack loops, so every mapped projection is the block's.
+        model = tiny(num_layers=2, loop=Loop(4, layers=(0, 2), gathered=gathered, step_norm=False),
+                     dtype="bfloat16", emb_features=128, mlp_features=256)
+        gradient = with_gradients(lambda variables, ids, model=model: model.apply(variables, ids))
+        variables, ids = model_draw(model, (8, 16), VOCAB)(0)
+        logits = jax.eval_shape(model.apply, variables, ids)
+        with (jax.set_mesh(mesh), nn.logical_axis_rules(DEFAULT_RULES), placing(layout),
+              generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic", layer_scan=layer_scan)):
+            graph = jax.make_jaxpr(gradient)(variables, ids, jnp.ones(logits.shape, logits.dtype))
+        found[gathered] = sum(equation.primitive.name == "all_gather" for equation in equations(graph))
+    assert found[False] and not found[True], found

@@ -20,8 +20,7 @@ from jax.extend.mlir.dialects import arith, memref, scf
 
 from dew.algebra import scan as prefix_scan
 from dew.nn.kernels import recurrence_algebra as algebra
-from dew.nn.kernels.templates import emission, mosaic, native, product, resources, scan, swizzling
-from dew.nn.kernels.templates.cost import Work
+from dew.nn.kernels.templates import mosaic, native, product, resources, scan, swizzling
 from dew.nn.kernels.templates.recurrence.intra import _named, intra_rows, pair_streams, systems
 from dew.nn.kernels.templates.recurrence.mainloop import (
     Call,
@@ -140,25 +139,10 @@ def own_bands(queries, staged: tuple, betas, bands, *, products: tuple[str, ...]
     (chunk_kda_fwd_intra_token_parallel) walks the pairs at or before a token alone; the bands a tile in the
     accumulator's layout took every offset of every row, its shifted reads whole tiles and its sums over a key
     block's columns a warp's shuffles, 70% of an emulated GH200's intra_own issues (M-JS-145h)."""
-    (keyed, decayed), outputs = staged, len(products)
-    chunk, keys = keyed.shape
-    # Each row's pairs at or before it in its sub-chunk, each over the block's columns: its key and decay
-    # read, its decay's multiply and (`unit_pairs`) the decayed key's, and each output's row read (the
-    # system's its key and write strength, and their multiply), its multiplies (one where `unit_pairs`, two
-    # else) and an add; then each output's sum over the quad (two shuffles and two adds) and its band's
-    # entry read, added and written.
-    pairs = chunk * (algebra.SUB + 1) // 2
-    columns = pairs * keys
-    system = "system" in products
-    work = Work(operations=columns * ((2 if unit_pairs else 3) * outputs + 1 + unit_pairs + system)
-                + pairs * outputs * 5,
-                shared_bytes=columns * (keyed.dtype.itemsize * (1 + system) + 4
-                                        + (queries.dtype.itemsize if queries is not None else 0))
-                + 4 * pairs * system + 8 * pairs * outputs)
+    keyed, decayed = staged
     refs = tuple(ref for ref in (queries, keyed, decayed, betas, bands) if ref is not None)
-    body = emission.stating(lambda *refs: work)(
-        lambda ctx, *refs: _own_bands(*refs, products=products, unit_pairs=unit_pairs))
-    plgpu.inline_mgpu(arg_types=(plgpu.RefType(),) * len(refs), return_type=())(body)(*refs)
+    plgpu.inline_mgpu(arg_types=(plgpu.RefType(),) * len(refs), return_type=())(
+        lambda ctx, *refs: _own_bands(*refs, products=products, unit_pairs=unit_pairs))(*refs)
 
 
 def _own_bands(*refs, products: tuple[str, ...], unit_pairs: bool) -> None:
@@ -430,13 +414,8 @@ def _diagonal_copied(source, view, *, strict: bool | None = None, scale: float =
     diagonal blocks of `view` `[C, C]`, each thread its run of entries: as it is (a landing of the view's
     dtype), or, given `strict`, an fp32 sum of the blocks taken as `algebra.block_masked` takes it (the pair
     with itself dropped where `strict`, else every word `scale`d) and rounded once to the view's dtype."""
-    chunk, sub = source.shape
-    entries = chunk * sub
-    work = Work(operations=entries * (1 if strict is None else 3),
-                shared_bytes=entries * source.dtype.itemsize, device_bytes=entries * view.dtype.itemsize)
-    body = emission.stating(lambda *_: work)(
-        lambda ctx, from_ref, to_ref: _copied(from_ref, to_ref, strict=strict, scale=scale))
-    plgpu.inline_mgpu(arg_types=(plgpu.RefType(), plgpu.RefType()), return_type=())(body)(source, view)
+    plgpu.inline_mgpu(arg_types=(plgpu.RefType(), plgpu.RefType()), return_type=())(
+        lambda ctx, from_ref, to_ref: _copied(from_ref, to_ref, strict=strict, scale=scale))(source, view)
 
 
 def _copied(source_ref, view_ref, *, strict: bool | None, scale: float) -> None:
