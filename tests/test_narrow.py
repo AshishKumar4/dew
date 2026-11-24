@@ -576,13 +576,16 @@ def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monk
     free, limit = 2 ** 39, 2 ** 40
 
     def built() -> tuple[Trainer, dict]:
-        objective, batch = _decoder(remat="full")
+        # Sixteen rows (two per device on 8-way data parallel) give the scanned step at remat="full" enough
+        # temporaries to leave room past twice the window's accumulator beside it (`memory.placeable_beside`).
+        objective, batch = _decoder(remat="full", rows=16)
         return Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=MeshSpec(),
                        layout=Layout(min_shard=1, tolerance=1.0), update=UpdateBatch(batches=2),
                        fit=FitPolicy(split=1)), batch
 
     def streamed() -> Loader:
-        return Loader(train=lambda partition: repeated_token_batch(64, 8, 9), val=None, records=None, batch=8)
+        return Loader(train=lambda partition: repeated_token_batch(64, 16, 9), val=None, records=None,
+                      batch=16)
 
     def need(*, copies: bool) -> int:
         """The bytes the run's fit needs placed with or without its copies (its state and the batches it
@@ -681,21 +684,23 @@ def test_a_fresh_plan_refused_with_its_copies_built_deletes_them_before_it_is_se
     def streamed() -> Loader:
         return Loader(train=lambda partition: repeated_token_batch(64, 8, 9), val=None, records=None, batch=8)
 
-    narrow, _, _ = _trained(ADAM_3, copies=True, steps=1, remat="full", mesh=device)
-    copies = sorted(leaf.nbytes for leaf in jax.tree.leaves(narrow.compute))
-    del narrow
     # The fresh plan's need with its copies, the state and its batches among it, and its temporaries, as a
-    # roomy allocator's run measured them.
+    # roomy allocator's run measured them, and the copies its step builds as its scan holds the layers.
     free, limit = 2 ** 39, 2 ** 40
     gc.collect()
     allocating(monkeypatch, limit, limit, limit - free)
     roomy = built()
     with chosen(narrow_copies="on"):
-        roomy.fit(streamed(), steps=1)
+        trained = roomy.fit(streamed(), steps=1)
     probe = roomy.plan["probes"][0]
-    assert probe["narrow"] and probe["fits"] and copies, (probe, copies)
     need, temporaries = free - probe["headroom"], probe["temp"]
-    del roomy
+    _, batch = _decoder(remat="full")
+    with chosen(narrow_copies="on"):
+        staged = roomy.staged(trained)
+        stepped, *_ = roomy.compile(staged, batch)(staged, batch)
+    copies = sorted(leaf.nbytes for leaf in jax.tree.leaves(stepped.compute))
+    assert probe["narrow"] and probe["fits"] and copies, (probe, copies)
+    del roomy, trained, staged, stepped, batch
     options.unhold()
     # Free in all, the need and half the temporaries: the plan made before the state is placed holds. The
     # pool's growth one byte short of the temporaries, and its blocks, the state and copies on it, the
@@ -759,8 +764,18 @@ def test_a_fresh_fit_whose_placed_pool_holds_its_step_in_two_microbatches_splits
                         lambda device: {"bytes_limit": limit, "bytes_in_use": limit - free})
     # One device, whose batch of 8 rows splits in two.
     device = MeshSpec().build(jax.devices()[:1])
-    one, two = (free - _trained(ADAM_3, copies=False, steps=1, split=split, remat="full",
-                                mesh=device)[2].plan["probes"][0]["headroom"] for split in (1, 2))
+    stream = Loader(train=lambda partition: repeated_token_batch(64, 8, 9), val=None, records=None, batch=8)
+
+    def measured(split: int) -> int:
+        # Measured through the same fit and default stack as the run below.
+        objective, _ = _decoder(remat="full")
+        trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=device,
+                          layout=Layout(min_shard=1, tolerance=1.0), fit=FitPolicy(split=split))
+        with chosen(narrow_copies='off'):
+            trainer.fit(stream, steps=1)
+        return free - trainer.plan["probes"][0]["headroom"]
+
+    one, two = measured(1), measured(2)
     assert two < one, (one, two)
     objective, batch = _decoder(remat="full")
     run = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=device,
@@ -775,7 +790,6 @@ def test_a_fresh_fit_whose_placed_pool_holds_its_step_in_two_microbatches_splits
     grown = {"bytes_limit": total, "bytes_in_use": 0, "pool_bytes": total - room,
              "largest_free_block_bytes": room}
     monkeypatch.setattr(jax.Device, "memory_stats", lambda device: grown)
-    stream = Loader(train=lambda partition: repeated_token_batch(64, 8, 9), val=None, records=None, batch=8)
     with chosen(narrow_copies='off'):
         run.fit(stream, steps=2)
     assert run.plan["split"] == 2, run.plan["probes"]
