@@ -9,6 +9,7 @@ Its layouts are its operands' dtype's (`Layout.MMA_ACC(dtype)`), so a bundle is 
 import abc
 import dataclasses
 import functools
+import operator
 from collections.abc import Callable, Iterator, Sequence
 from typing import Any, Self
 
@@ -49,9 +50,9 @@ def _staging(block: tuple, swizzle: int | None) -> tuple:
     return swizzled(shape, dtype) if swizzle is None else swizzling.swizzle_transforms(dtype, swizzle)
 
 
-def _at(index_map, lo, step):
-    """A stream's block indices at step `step` of a walk from `lo`."""
-    return index_map(step + lo)
+def _at(index_map, placed: Callable, trip):
+    """A stream's block indices at a pipeline's trip `trip`: the walk's step `placed(trip)` (`walk`)."""
+    return index_map(placed(trip))
 
 
 def _gathered_walk(streams, segments, carry, interpret: bool):
@@ -865,11 +866,6 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         del producer  # no producer role of its own
         self.pingponged(pingpong)
         _most(self, consumers)
-        if consumers > 1 and len(outputs) > 1:
-            # Their staging opens together once a tile (`finished`), each output's beside the others', which
-            # a launch's plan charges one output at a time (`resources.scratch_bytes`' tiles after its walks).
-            raise NotImplementedError(f"two {self.name} consumers stage one output a tile, not "
-                                      f"{len(outputs)}")
         # Each tile's pipeline fills and drains before its output copy. Synchronize at that lifetime
         # boundary so the output's shared memory can reuse the pipeline's slots. Two consumers stage their
         # rows side by side in one collective scope, opened once a tile where both finish it (`finished`):
@@ -957,37 +953,40 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         def slots_of(refs) -> rings.WholeSlots:
             return rings.WholeSlots(dict(zip(names, refs, strict=True)))
 
+        # Each pipeline's step, its trips' steps (a trip's place in the walk), and its trips.
+        walks = [(step, functools.partial(operator.add, lo), hi - lo) for step, lo, hi in segments]
         if streams.pipeline.consumers > 1 and len(segments) > 1:
-            # Consumers running one pipeline together meet at each of its steps, so they walk one grid: a
+            # Consumers running one pipeline together meet at each of its trips, so they walk one grid: a
             # pipeline of its own a segment would meet unpaired where their segments' boundaries differ (a
-            # causal call's masked segment one consumer's keys end sooner in). One pipeline over the walk's
-            # whole range, each step its segment's, its first segment's start and last one's end each
-            # consumer's alike (`walk_own`'s streamed range). A step reads no fragments ahead of its own:
-            # its boundary would be called under its segment's choice.
-            segments = (_dispatched(segments), segments[0][1], segments[-1][2]),
+            # causal call's masked segment one consumer's keys end sooner in). One pipeline over the
+            # segments' steps alone, laid end to end, each trip its segment's step (`_placed`): no trip loads
+            # a gap's tile or an empty segment's, and the trips are each consumer's alike where its segments
+            # hold as many steps. A trip reads no fragments ahead of its own: its boundary would be called
+            # under its segment's choice.
+            walks = [_placed(segments)]
             prefetching = False
-        for step, lo, hi in segments:
-            if isinstance(lo, int) and isinstance(hi, int) and hi <= lo:
+        for step, placed, trips in walks:
+            if isinstance(trips, int) and trips <= 0:
                 # No steps: the carry and its zero accumulators as they start (`emit_pipeline` takes no
                 # empty grid).
                 continue
 
-            def body(indices, *refs, step=step, lo=lo):
-                (index,) = indices
+            def body(indices, *refs, step=step, placed=placed):
+                (trip,) = indices
                 if prefetching:
                     *slots, (carried, accumulators), prefetched, boundary = refs
                     (carried, accumulators), following = step(
-                        index + lo, slots_of(slots), carried, accumulators, prefetched=prefetched,
+                        placed(trip), slots_of(slots), carried, accumulators, prefetched=prefetched,
                         boundary=boundary)
                     return (carried, accumulators), following
                 carried, accumulators = refs[-1]
-                return step(index + lo, slots_of(refs[:-1]), carried, accumulators)
+                return step(placed(trip), slots_of(refs[:-1]), carried, accumulators)
 
             specs = _specs(streams.pipeline,
-                           {name: functools.partial(_at, streams.views[name][1], lo) for name in names})
+                           {name: functools.partial(_at, streams.views[name][1], placed) for name in names})
             # Two consumers run one pipeline, each copying its share of every block (`thread_axis`).
             pipeline = plgpu.emit_pipeline(
-                body, grid=(hi - lo,), in_specs=specs, max_concurrent_steps=streams.pipeline.stages,
+                body, grid=(trips,), in_specs=specs, max_concurrent_steps=streams.pipeline.stages,
                 init_carry=carry, prefetch=prefetched_of if prefetching else None,
                 thread_axis=None if streams.pipeline.consumers == 1 else "wg")
             carry = pipeline(*(streams.views[name][0] for name in names))
@@ -1087,7 +1086,12 @@ class Mma(MmaIssuer, CpAsync):
         mosaic.refuse_staging(self, chunks)
         # Each output tile staged at the swizzle its accumulator's stores pass the banks fewest times at
         # (`stored_swizzle`), copied out a 16-byte piece a thread over whole tiles (`persist`'s store,
-        # `stores.swizzled_rows_out`); two consumers' rows of it side by side (`persist`).
+        # `stores.swizzled_rows_out`); two consumers' rows of it side by side (`persist`), one output a tile:
+        # their staging opens together once a tile, each output's beside the others', which a launch's plan
+        # charges one output at a time (`resources.scratch_bytes`' tiles after its walks).
+        if consumers > 1 and len(outputs) > 1:
+            raise NotImplementedError(f"two {self.name} consumers stage one output a tile, not "
+                                      f"{len(outputs)}")
         side = () if consumers == 1 else (consumers,)
         return [swizzling.staged((*side, *shape), dtype, self.stored_swizzle(shape, dtype)) if len(shape) == 2
                 else plgpu.SMEM((*side, *shape), dtype) for shape, dtype in outputs]
@@ -1116,18 +1120,30 @@ class Mma(MmaIssuer, CpAsync):
         return min(stagings, key=lambda swizzle: (passes(swizzle), -swizzle))
 
 
-def _dispatched(segments: tuple) -> Callable:
-    """One step taking each of `segments`' steps `(step, lo, hi)` at its own place: the step of the segment
-    whose range holds its index, nothing where none does (a gap between segments, its tiles loaded and
-    unread)."""
-    def step(index, slots, carried, accumulators):
-        held = [((index >= lo) & (index < hi)).astype(jnp.int32) * (at + 1)
-                for at, (_, lo, hi) in enumerate(segments)]
-        branches = [lambda carried, accumulators: (carried, accumulators),
-                    *(functools.partial(each, index, slots) for each, _, _ in segments)]
-        return lax.switch(sum(held), branches, carried, accumulators)
+def _placed(segments: tuple) -> tuple[Callable, Callable, jax.Array | int]:
+    """`segments`' steps `(step, lo, hi)` laid end to end as one pipeline's trips: a step taking each trip
+    at its walk step by its segment's own step, the walk step of each trip, and their trips (the segments'
+    steps alone: no trip is a gap's or an empty segment's)."""
+    lengths = [hi - lo for _, lo, hi in segments]
+    offsets = [sum(lengths[:at]) for at in range(len(segments))]
 
-    return step
+    def held(trip):
+        # Each segment's whether it holds the trip: exactly one, an empty one none.
+        return [(trip >= offset) & (trip < offset + length)
+                for offset, length in zip(offsets, lengths, strict=True)]
+
+    def placed(trip):
+        return sum(inside.astype(jnp.int32) * (lo + trip - offset)
+                   for inside, (_, lo, _), offset in zip(held(trip), segments, offsets, strict=True))
+
+    def step(index, slots, carried, accumulators):
+        # The trip's segment, read off its walk step's place among the segments' (`placed`'s inverse).
+        which = sum(((index >= lo) & (index < hi)).astype(jnp.int32) * at
+                    for at, (_, lo, hi) in enumerate(segments))
+        return lax.switch(which, [functools.partial(each, index, slots) for each, _, _ in segments],
+                          carried, accumulators)
+
+    return step, placed, sum(lengths)
 
 
 def _most(family: "CpAsync", consumers: int, *, clustered: bool = False) -> None:
