@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 import test_decision_laya as laya
 from decision_support import decision_rows
+from model_support import attending
 from reference_error import as_given, assert_as_exact, dew_programs, indexed_recording, recording
 from steady_state import steady_state
 
@@ -42,10 +43,12 @@ CASES = json.loads((FIXTURES / "cases.json").read_text())
 
 
 @pytest.fixture(scope="module")
+@attending("xla")
 def decide() -> Decide:
-    return Decide.from_pretrained(TINY, attention_impl="xla")
+    return Decide.from_pretrained(TINY)
 
 
+@attending("xla")
 def test_a_decision_source_loads_through_pretrained_and_its_declared_pipeline(decide, tmp_path):
     """A Laya component release loads through the public source loader, including a subfolder,
     and its declared task retains the same answers through export."""
@@ -55,7 +58,7 @@ def test_a_decision_source_loads_through_pretrained_and_its_declared_pipeline(de
     from dew.interop import Pretrained
 
     copytree(TINY, tmp_path / "release")
-    bundle = Pretrained.load(tmp_path, subfolder="release", dtype="float32", attention_impl="xla")
+    bundle = Pretrained.load(tmp_path, subfolder="release", dtype="float32")
     task = replace(Decide.of(bundle), name=decide.name)
     request = CASES["quickstart"]
     assert task.systemone(request) == decide.systemone(request)
@@ -75,8 +78,10 @@ _ANSWERED = """
 import json
 import sys
 from dew.decision import Decide
-task = Decide.from_pretrained("dew/tiny-laya", subfolder="release", attention_impl="xla")
-print(json.dumps(task.systemone(json.loads(sys.argv[1]))))
+from dew.nn.kernels import generation
+task = Decide.from_pretrained("dew/tiny-laya", subfolder="release")
+with generation.chosen(attention="xla"):
+    print(json.dumps(task.systemone(json.loads(sys.argv[1]))))
 """
 
 
@@ -119,6 +124,7 @@ def assert_same_rounded_answers(found: dict, expected: dict, case: str) -> None:
             assert abs(value - reference["probabilities"][option]) <= 1e-4, (case, name, option)
 
 
+@attending("xla")
 def test_systemone_answers_what_layas_agent_answers(decide):
     """Laya's `Agent.system_one` on every case (answers.json), with Laya's
     entropy confidence selected (`assert_same_rounded_answers`)."""
@@ -128,6 +134,7 @@ def test_systemone_answers_what_layas_agent_answers(decide):
         assert_same_rounded_answers(laya.systemone(request, details=True), expected[case], case)
 
 
+@attending("xla")
 @pytest.mark.parametrize("request_body", [
     {"questions": CASES["quickstart"]["questions"]},
     {"state": "x", "questions": {}},
@@ -165,6 +172,7 @@ def test_images_decode_from_every_form_a_request_carries():
             decoded_images(bad)
 
 
+@attending("xla")
 def test_strict_answers_drop_the_extensions_and_hold_jevs_fields(decide):
     """A text backbone refuses images it cannot read; a strict answer drops
     them, as Jev's endpoint knows no images, and holds Jev's fields alone."""
@@ -176,6 +184,7 @@ def test_strict_answers_drop_the_extensions_and_hold_jevs_fields(decide):
         decide.systemone(CASES["quickstart"], strict=True, details=True)
 
 
+@attending("xla")
 def test_a_small_budget_splits_passes_without_moving_a_logit(decide):
     """Every question of every case at a budget of two rows a pass, scored by the task's server over drawn
     weights, as exact as Laya's float32 one-row run against its float64 run (check 1,
@@ -223,6 +232,7 @@ def every_case_row(task: Decide) -> list:
                                                        for name, wire in request["questions"].items()})]
 
 
+@attending("xla")
 def test_a_pass_packs_rows_into_windows_and_answers_each_as_it_is_alone(decide):
     """A pass packs its rows first-fit into windows, as a run's windows hold them (`Decide.packing`),
     several a window and each attending its own tokens alone: each row's logits on par with the row
@@ -234,8 +244,8 @@ def test_a_pass_packs_rows_into_windows_and_answers_each_as_it_is_alone(decide):
     plan = task.planned()
     assert all(plan.add(row) for row in rows) and len(set(plan.windows())) < len(rows)
     with jax.enable_x64(new_val=True):
-        wide = replace(Decide.from_pretrained(TINY, dtype="float64", param_dtype="float64",
-                                              attention_impl="xla"), layout=task.layout)
+        wide = replace(Decide.from_pretrained(TINY, dtype="float64", param_dtype="float64"),
+                       layout=task.layout)
 
     draw = drawn_about(decide.variables)
 
@@ -256,6 +266,7 @@ def test_a_pass_packs_rows_into_windows_and_answers_each_as_it_is_alone(decide):
                     truth_fn=alone(wide))
 
 
+@attending("xla")
 def test_a_tournament_takes_each_group_winner_to_the_final(decide):
     """Fourteen options in groups of at most four: four groups, their
     winners the final's options, and each winner its group's own answer."""
@@ -273,6 +284,7 @@ def test_a_tournament_takes_each_group_winner_to_the_final(decide):
     assert final.probabilities.shape == (4,)
 
 
+@attending("xla")
 def test_a_questions_tournament_is_its_own_beside_a_longer_one(decide):
     """Each question plays its own rounds: beside a question of fourteen options, which takes two rounds
     of groups of three, one of five options plays one round and waits for the final with its two
@@ -291,6 +303,7 @@ def test_a_questions_tournament_is_its_own_beside_a_longer_one(decide):
     assert len(beside["intent"].options) <= 3
 
 
+@attending("xla")
 def test_finalists_play_one_round_keep_each_groups_best_and_answer_over_every_option(decide):
     """A released engine's knock-out (`Finalists`, StartLux-Decision a99977d93): fourteen options in groups
     of at most four, the first ones longer (4, 4, 3, 3), asked together; each group's two best, in group
@@ -362,6 +375,7 @@ def test_a_fitted_temperature_is_the_log_loss_minimum():
     assert log_loss(scored, fitted) < log_loss(scored, fitted / 1.01)
 
 
+@attending("xla")
 def test_calibrating_on_the_distributions_the_model_gives_keeps_its_temperatures(decide):
     """Held-out answers whose gold is a distribution rather than one option:
     where every gold is the distribution the uncalibrated model gives, log
@@ -503,6 +517,7 @@ TEMPERED_SEEDS = 16
 """Check 1's declared seeds for the tempered probabilities, sized by `seeds_for` (2026-10-21, on armada)."""
 
 
+@attending("xla")
 def test_score_is_a_validation_pass_through_the_task_s_temperatures(decide):
     """The pass divides each question's logits by the temperature its answer
     uses, which the released checkpoint sets away from 1: every row chooses
@@ -555,6 +570,7 @@ def test_score_is_a_validation_pass_through_the_task_s_temperatures(decide):
         assert decide.score(examples) == scores
 
 
+@attending("xla")
 def test_an_evaluation_runs_the_modules_the_objective_holds_now(decide):
     """A substitution at the same shapes that changes the arithmetic, as a
     narrowed or quantized head does, is what the next evaluation runs, as an
@@ -579,6 +595,7 @@ def test_an_evaluation_runs_the_modules_the_objective_holds_now(decide):
     np.testing.assert_array_equal(logits(objective), expected)
 
 
+@attending("xla")
 def test_an_objective_from_a_calibrated_task_validates_without_its_temperatures(decide):
     """The temperatures fit the released logits, which training moves, so a
     run's validation divides by none: exactly what identity temperatures
@@ -628,6 +645,7 @@ def test_an_example_refuses_gold_that_scores_no_option_of_its_question(kind, que
         Example.of({**row, kind: {**row[kind], question: gold}})
 
 
+@attending("xla")
 def test_a_task_saves_in_layas_layout_and_reads_back_the_same(decide, tmp_path):
     """`save_pretrained` writes what `from_pretrained` reads: Laya's tensors
     under Laya's names (all but the action head and the unused temperature
@@ -660,11 +678,12 @@ def test_a_task_saves_in_layas_layout_and_reads_back_the_same(decide, tmp_path):
     assert agent["temperature"] == published["temperature"]
     assert agent["head_layers"] == published["head_layers"]
     assert agent["temperature_by_options"] == {**published["temperature_by_options"], "choice:11+": 0.5}
-    again = replace(Decide.from_pretrained(tmp_path, attention_impl="xla"), name=decide.name)
+    again = replace(Decide.from_pretrained(tmp_path), name=decide.name)
     for request in CASES.values():
         assert again.systemone(request) == decide.systemone(request)
 
 
+@attending("xla")
 def test_a_laya_release_names_no_encoder_where_its_task_holds_only_a_local_tokenizer(decide, tmp_path):
     """A task whose release named no encoder, its tokenizer read from a directory on this machine, writes
     Laya's config without an encoder rather than that directory's path, which a pushed release would
@@ -673,6 +692,7 @@ def test_a_laya_release_names_no_encoder_where_its_task_holds_only_a_local_token
     assert "encoder" not in json.loads((tmp_path / "rl_agent_config.json").read_text())
 
 
+@attending("xla")
 def test_a_laya_tasks_release_bundle_saves_and_exports_the_tasks_release(decide, tmp_path):
     """Each decision format has one writer (export review #5): a Laya task's release bundle
     (`PretrainedDecision.of`), as a joint or slot task's, saves the files the task saves, byte for byte,
@@ -695,6 +715,7 @@ def test_a_laya_tasks_release_bundle_saves_and_exports_the_tasks_release(decide,
         np.testing.assert_array_equal(np.asarray(exported[name]), tensor, err_msg=name, strict=True)
 
 
+@attending("xla")
 def test_a_laya_release_loaded_and_saved_again_states_the_dtype_its_task_computed_in(decide, tmp_path):
     """A Laya task's release states the dtype the task computes in; loaded and saved again, its bundle
     restates it, so the second release loads computing as the task did, where its record dropped it and a
@@ -709,6 +730,7 @@ def test_a_laya_release_loaded_and_saved_again_states_the_dtype_its_task_compute
     assert again.task == first.task
 
 
+@attending("xla")
 def test_a_task_under_lora_saves_its_factors_merged_and_reads_back_the_same(decide, tmp_path):
     """A ModernBERT task whose backbone runs under LoRA, its factors moved off
     zero, saves in Laya's layout with the factors merged into their kernels
@@ -731,7 +753,7 @@ def test_a_task_under_lora_saves_its_factors_merged_and_reads_back_the_same(deci
                       variables=joined({"backbone": moved, "head": part(decide.variables, "head")}))
 
     adapted.save_pretrained(tmp_path)
-    again = replace(Decide.from_pretrained(tmp_path, attention_impl="xla"), name=decide.name)
+    again = replace(Decide.from_pretrained(tmp_path), name=decide.name)
     changed = False
     for case, request in CASES.items():
         expected = adapted.systemone(request, details=True)
@@ -740,6 +762,7 @@ def test_a_task_under_lora_saves_its_factors_merged_and_reads_back_the_same(deci
     assert changed
 
 
+@attending("xla")
 def test_dew_export_writes_a_decision_run_in_the_tasks_own_release(decide, tmp_path):
     """`dew export` writes a decision run through its task's release writer
     (`Decide.save_pretrained`): the run of a step's training over Laya's tiny
@@ -767,6 +790,7 @@ def test_dew_export_writes_a_decision_run_in_the_tasks_own_release(decide, tmp_p
         assert (tmp_path / "export" / name).read_bytes() == (tmp_path / "release" / name).read_bytes(), name
 
 
+@attending("xla")
 def test_a_released_checkpoint_keeps_its_option_budget(decide, tmp_path):
     """A task whose options keep 4 tokens each, not the layout's 48, saves
     that budget and reads it back: the reloaded task answers a question of
@@ -775,7 +799,7 @@ def test_a_released_checkpoint_keeps_its_option_budget(decide, tmp_path):
 
     tight = replace(decide, layout=replace(decide.layout, option_tokens=4))
     tight.save_pretrained(tmp_path)
-    again = Decide.from_pretrained(tmp_path, attention_impl="xla")
+    again = Decide.from_pretrained(tmp_path)
     assert again.layout.option_tokens == 4
     question = {"q": Choice("Which team handles it?", {
         "billing": "invoices, refunds, chargebacks, double charges and any dispute about money taken",
@@ -786,6 +810,7 @@ def test_a_released_checkpoint_keeps_its_option_budget(decide, tmp_path):
     assert not np.array_equal(decide(state, question)["q"].probabilities, expected)
 
 
+@attending("xla")
 def test_a_released_checkpoint_states_the_layout_its_task_was_trained_with(decide, tmp_path):
     """A task whose layout Laya's config cannot state (a row order, blocks, a framing of the rows as a
     chat) exports and reads back with the layout it was trained with, which the release states beside
@@ -799,18 +824,19 @@ def test_a_released_checkpoint_states_the_layout_its_task_was_trained_with(decid
         # The layout as the task reads it, a row a question for Laya's head (`SegmentLayout.shared_for`).
         layout = replace(decide, layout=replace(decide.layout, **chosen)).layout
         replace(decide, layout=layout).save_pretrained(tmp_path / str(number))
-        again = Decide.from_pretrained(tmp_path / str(number), attention_impl="xla")
+        again = Decide.from_pretrained(tmp_path / str(number))
         assert again.layout == layout, chosen
         stated = json.loads((tmp_path / str(number) / "rl_agent_config.json").read_text())
         assert stated["max_len"] == layout.max_len and stated["option_tokens"] == layout.option_tokens
         # Laya's readers refuse a layout they would lay out otherwise (row 4599).
         assert stated["option_layout"] not in LAYA_OPTION_LAYOUTS
     (tmp_path / "0" / "dew_release.json").unlink()
-    assert Decide.from_pretrained(tmp_path / "0", attention_impl="xla").layout == SegmentLayout.marker_row(
+    assert Decide.from_pretrained(tmp_path / "0").layout == SegmentLayout.marker_row(
         max_len=decide.layout.max_len, head_max_len=decide.layout.head_max_len,
         option_tokens=decide.layout.option_tokens, parallel=decide.layout.parallel)
 
 
+@attending("xla")
 def test_a_released_checkpoint_states_the_calibration_laya_cannot(decide, tmp_path):
     """A task that abstains below a confidence, or maps its probabilities through a binning, exports with
     that calibration beside Laya's temperatures and answers as it did once read back, where the
@@ -824,7 +850,7 @@ def test_a_released_checkpoint_states_the_calibration_laya_cannot(decide, tmp_pa
     # Laya's readers refuse a calibration they would answer otherwise by (row 4599).
     stated = json.loads((tmp_path / "rl_agent_config.json").read_text())
     assert stated["option_layout"] not in LAYA_OPTION_LAYOUTS
-    again = replace(Decide.from_pretrained(tmp_path, attention_impl="xla"), name=gated.name)
+    again = replace(Decide.from_pretrained(tmp_path), name=gated.name)
     assert again.calibration.abstention == gated.calibration.abstention
     assert again.calibration.binning == gated.calibration.binning
     # With details, which report whether each answer abstained.
@@ -859,6 +885,7 @@ class Recorded:
         return accumulated
 
 
+@attending("xla")
 @pytest.mark.mesh
 def test_a_task_whose_weights_span_a_mesh_scores_on_that_mesh(decide):
     """A task whose weights are placed on a mesh of every device scores its examples there, its rows
@@ -876,8 +903,8 @@ def test_a_task_whose_weights_span_a_mesh_scores_on_that_mesh(decide):
     mesh = MeshSpec().build(jax.devices())
     task = replace(decide, budget=Budget(rows=3))
     with jax.enable_x64(new_val=True):
-        wide = replace(Decide.from_pretrained(TINY, dtype="float64", param_dtype="float64",
-                                              attention_impl="xla"), budget=task.budget)
+        wide = replace(Decide.from_pretrained(TINY, dtype="float64", param_dtype="float64"),
+                       budget=task.budget)
 
     def evaluated(on: Decide) -> np.ndarray:
         found: list = []
@@ -935,6 +962,7 @@ def trained_runs(decide, tmp_path, count: int, *, name: str = "run", examples=No
     return runs
 
 
+@attending("xla")
 def test_runs_that_share_a_head_average_as_the_checkpoints_average_them_and_refit_their_temperatures(
         decide, tmp_path):
     """Runs trained apart from one held head average: the task's weights are the runs' fp32 mean as
@@ -970,6 +998,7 @@ def test_runs_that_share_a_head_average_as_the_checkpoints_average_them_and_refi
     assert calibrated.calibration == two.calibrated(held_out).calibration
 
 
+@attending("xla")
 def test_runs_whose_data_hold_other_widths_average_padded_to_the_widest(decide, tmp_path):
     """The options a pass pads to are no part of a run's weights (`DecideSettings.options`): runs whose
     data hold other widths average, the average padding each pass to the widest either recorded."""
@@ -982,6 +1011,7 @@ def test_runs_whose_data_hold_other_widths_average_padded_to_the_widest(decide, 
     assert average.options == budgets[0].options
 
 
+@attending("xla")
 def test_a_run_continued_from_its_runs_release_averages_with_its_start(decide, tmp_path):
     """A run exported as a release (`Decide.save_pretrained`), a run continued from that release and the
     run it started from average as one task's (`Decide.averaged`). transformers writes the release's
@@ -997,11 +1027,12 @@ def test_a_run_continued_from_its_runs_release_averages_with_its_start(decide, t
     held = Decide.from_run(start).tokenizer.pinned
     assert {path: hashlib.sha256((folder / path).read_bytes()).hexdigest() for path in held.files} != dict(
         held.files)
-    continued = trained_runs(Decide.from_pretrained(str(release), attention_impl="xla"), tmp_path, 1,
+    continued = trained_runs(Decide.from_pretrained(str(release)), tmp_path, 1,
                              name="continued")[0]
     assert Decide.averaged([start, continued]).weights.averaged
 
 
+@attending("xla")
 def test_runs_of_other_task_settings_or_a_single_run_do_not_average(decide, tmp_path):
     """Runs average where their recorded task settings are one task's: a run whose head trained under
     dropout averages with one that trained none, as dropout says how a head trains and not what it
@@ -1023,6 +1054,7 @@ def test_runs_of_other_task_settings_or_a_single_run_do_not_average(decide, tmp_
         Decide.averaged(runs)
 
 
+@attending("xla")
 @pytest.mark.parametrize("kind", ["marker", "state-first"])
 def test_an_averaged_task_of_any_layout_saves_reloads_and_serves_as_it_was(decide, tmp_path, kind):
     """An average of runs, its temperatures refit on held-out answers, saves to a directory of its own
@@ -1062,6 +1094,7 @@ def test_an_averaged_task_of_any_layout_saves_reloads_and_serves_as_it_was(decid
 
 
 
+@attending("xla")
 def test_a_tournaments_rounds_are_asked_from_the_whole_request(decide):
     """Each round of a tournament asks its questions from the request it plays (`Decide.__call__`'s
     `request`), so a row that summarizes its request (`RequestSummary`) summarizes the request the caller
@@ -1105,6 +1138,7 @@ def test_options_knocked_out_with_no_probability_share_the_residual_evenly():
     assert combined == {option: share / total for option, share in shares.items()}
 
 
+@attending("xla")
 def test_a_batch_of_requests_takes_no_one_requests_request_images_or_context(decide):
     """A batch of requests, each its own whole request, refuses a `request` of its parts (train 658's
     review, row 4605) and the context of one request, which it would read for none of them; each request's
@@ -1156,6 +1190,7 @@ def saved_before_runs_held_tokenizers(run: str) -> None:
     shutil.rmtree(Path(run) / "tokenizer")
 
 
+@attending("xla")
 def test_a_runs_tokenizer_is_held_in_the_run_and_compared_by_its_files(decide, tmp_path, monkeypatch):
     """A decision run holds its tokenizer's files in the run itself, found by their hashes: served with the
     place it read them from gone and this host's cache fresh, it loads them from the run and answers as it

@@ -26,10 +26,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
 from residual_orders import model_axes, orders, permuted, residual_width
 
 from dew.interop import Pretrained
+from dew.nn.kernels import generation
 
 
 def main(fixture: Path, out: Path, count: int, seed: int, group: int) -> None:
-    loaded = Pretrained.load(fixture, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(fixture, dtype="float32")
     axes = model_axes(loaded.model)
     drawn = orders(residual_width(loaded.variables, axes), count, seed, group)
     # A new directory, so no order keeps a truth written for weights drawn before.
@@ -44,7 +45,7 @@ def main(fixture: Path, out: Path, count: int, seed: int, group: int) -> None:
                 shutil.copy(fixture / name, out / str(k) / name)
     # A quantized format may pack an equal value in other bits (FP4's two
     # zeros), so order 0 is held to the fixture as loaded, value for value.
-    again = Pretrained.load(out / "0", dtype="float32", attention_impl="reference")
+    again = Pretrained.load(out / "0", dtype="float32")
     same = jax.tree.map(lambda a, b: bool(np.array_equal(a, b)), again.variables, loaded.variables)
     assert all(jax.tree.leaves(same)), "order 0 does not load as the fixture"
     print("wrote", count, "orders to", out)
@@ -92,10 +93,11 @@ def symmetric(fixture: Path, drawn: Path) -> None:
 
 
 if __name__ == "__main__":
-    if sys.argv[1:2] == ["symmetric"] and len(sys.argv) == 4:
-        symmetric(Path(sys.argv[2]), Path(sys.argv[3]))
-        raise SystemExit(0)
-    if len(sys.argv) not in (5, 6):
-        raise SystemExit(__doc__)
-    main(Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]),
-         int(sys.argv[5]) if len(sys.argv) == 6 else 1)
+    with generation.chosen(attention="reference"):
+        if sys.argv[1:2] == ["symmetric"] and len(sys.argv) == 4:
+            symmetric(Path(sys.argv[2]), Path(sys.argv[3]))
+            raise SystemExit(0)
+        if len(sys.argv) not in (5, 6):
+            raise SystemExit(__doc__)
+        main(Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]),
+             int(sys.argv[5]) if len(sys.argv) == 6 else 1)

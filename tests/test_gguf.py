@@ -20,6 +20,7 @@ import jax
 import numpy as np
 import pytest
 import torch
+from model_support import attending
 from reference_error import as_given, assert_as_exact
 
 from dew.interop import Pretrained, gguf as dew_gguf
@@ -199,6 +200,7 @@ def test_tensors_are_the_ones_transformers_reads(tmp_path, architecture, qtype):
     assert config["tie_word_embeddings"] is True
 
 
+@attending("reference")
 def test_load_pretrained_reads_the_file_and_its_tokenizer(tmp_path):
     """The whole load: logits against transformers over the same GGUF, and the
     tokenizer the file carries, since the directory ships none: Dew's logits as
@@ -218,7 +220,7 @@ def test_load_pretrained_reads_the_file_and_its_tokenizer(tmp_path):
 
     with pytest.raises(ValueError):
         Pretrained.load(tmp_path, gguf_file="model.gguf", single_file="model.safetensors")
-    pretrained = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference",
+    pretrained = Pretrained.load(tmp_path, dtype="float32",
                                  gguf_file="model.gguf")
     reference = AutoModelForCausalLM.from_pretrained(str(tmp_path), gguf_file="model.gguf",
                                                      dtype=torch.float32)
@@ -253,7 +255,7 @@ import sys
 sys.modules["torch"] = None
 import numpy as np
 from dew.interop import Pretrained
-loaded = Pretrained.load(sys.argv[1], dtype="float32", attention_impl="reference", gguf_file="model.gguf")
+loaded = Pretrained.load(sys.argv[1], dtype="float32", gguf_file="model.gguf")
 print(np.asarray(loaded.processor("Hello, GGUF").tokens).tolist()[0])
 """
     run = subprocess.run([sys.executable, "-c", script, str(tmp_path)], capture_output=True, text=True,
@@ -269,7 +271,7 @@ import json, sys
 from dew.interop import Pretrained
 from dew.lora import LoRA
 
-loaded = Pretrained.load("dew/tiny-gguf", dtype="float32", attention_impl="reference", gguf_file="model.gguf")
+loaded = Pretrained.load("dew/tiny-gguf", dtype="float32", gguf_file="model.gguf")
 adapted = loaded.adapt(LoRA(rank=2, modules=("q_proj",)), key=0)
 adapted.adapter.save(adapted.variables, sys.argv[1])
 print(json.dumps([loaded.revision, loaded.origin]))
@@ -312,6 +314,7 @@ FILE_SEEDS = 8
 them is the fp32 forward's rounding."""
 
 
+@attending("reference")
 @pytest.mark.network
 @pytest.mark.parametrize("name", RELEASED)
 def test_released_gguf_logits_match_transformers(name):
@@ -324,7 +327,7 @@ def test_released_gguf_logits_match_transformers(name):
     from _dew_torch.precision import float64, float64_twin
 
     pretrained = Pretrained.load(REPO, revision=REVISION, gguf_file=name, dtype="float32",
-                                 attention_impl="reference", max_seq_len=64)
+                                 max_seq_len=64)
     reference = AutoModelForCausalLM.from_pretrained(REPO, revision=REVISION, gguf_file=name,
                                                      dtype=torch.float32)
     reference.set_attn_implementation("eager")
@@ -535,6 +538,7 @@ def write_source(directory, case: str, rng: np.random.Generator):
     return tensors
 
 
+@attending("reference")
 @pytest.mark.parametrize("case", sorted(SOURCES))
 def test_a_gemma_or_moe_file_loads_the_model_it_was_converted_from(tmp_path, case):
     """llama.cpp's conversion is undone: the file reads back as its source's tensors bit for bit (Gemma's
@@ -557,7 +561,7 @@ def test_a_gemma_or_moe_file_loads_the_model_it_was_converted_from(tmp_path, cas
     for field, value in fields.items():
         assert config.get(field, value) == value, field
 
-    loaded = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference", gguf_file="model.gguf")
+    loaded = Pretrained.load(tmp_path, dtype="float32", gguf_file="model.gguf")
     def built(dtype):
         return AutoModelForCausalLM.from_pretrained(str(tmp_path), dtype=dtype, attn_implementation="eager",
                                                     experts_implementation="eager").eval()

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from model_support import flat_tree
+from model_support import attending, flat_tree
 
 from dew.interop import Pretrained, PretrainedDecoder, hf_decoders
 from dew.interop.codecs import SIDECARS
@@ -116,17 +116,18 @@ WRITTEN = ("qwen3-moe-tiny", "qwen2-moe-tiny", "qwen3-next-tiny", "deepseek-v2-t
 release's own bytes held before (export review, finding 1)."""
 
 
+@attending("reference")
 @pytest.mark.parametrize("name", WRITTEN)
 def test_a_routed_or_hybrid_model_writes_its_release_from_its_own_fields_and_reads_back_as_itself(
         name, tmp_path):
     """A routed or hybrid decoder its family's layout holds (`source_layout`) is written from its fields
     alone (`PretrainedDecoder.from_model`): its config reads back as the same model, and every parameter
     and router state as the leaf it was written from."""
-    loaded = Pretrained.load(str(FIXTURES / name), dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(str(FIXTURES / name), dtype="float32")
     layout = source_layout(loaded.model)
     assert layout, layout.reason
     PretrainedDecoder.from_model(loaded.model, loaded.variables, tokenizer="byte").save(tmp_path)
-    again = Pretrained.load(str(tmp_path), dtype="float32", attention_impl="reference")
+    again = Pretrained.load(str(tmp_path), dtype="float32")
     assert again.model == loaded.model
     for collection in ("params", "moe"):
         written = flat_tree(loaded.variables.get(collection, {}))

@@ -313,7 +313,7 @@ def mamba2_model():
     the model draws replace."""
     from dew.interop.pretrained import Pretrained
 
-    return Pretrained.load(HF_TINY, dtype="float32", attention_impl="reference")
+    return Pretrained.load(HF_TINY, dtype="float32")
 
 
 def padded_layout(length: int) -> tuple[np.ndarray, np.ndarray]:

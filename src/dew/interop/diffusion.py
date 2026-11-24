@@ -33,7 +33,6 @@ from dew.registry import resolve_dtype
 
 if TYPE_CHECKING:
     from dew.interop.streaming import LazyTree, WeightLayout
-    from dew.nn.attention import AttentionImpl
 
 
 def flag(config: Mapping[str, object], name: str, *, default: bool) -> bool:
@@ -48,8 +47,8 @@ def flag(config: Mapping[str, object], name: str, *, default: bool) -> bool:
     return False if value is None else _records.boolean(value, name)
 
 
-def unet_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
-                attention_impl: AttentionImpl = "auto") -> NativeFields[UNet2DCondition]:
+def unet_fields(config: Mapping[str, object], *,
+                dtype: DTypeLike | None = "float32") -> NativeFields[UNet2DCondition]:
     """Read a Diffusers UNet config into the fields `UNet2DCondition` takes.
 
     A control whose active value this UNet cannot compute raises rather than
@@ -158,7 +157,6 @@ def unet_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "floa
         attention_norm_epsilon=1e-5 if flax_semantics else 1e-6,
         approximate_gelu=flax_semantics,
         dtype=resolve_dtype(dtype),
-        attention_impl=attention_impl,
     )
 
 
@@ -307,8 +305,8 @@ def unet_layouts(shapes: Mapping[str, tuple[int, ...]], model: UNet2DCondition) 
 
 
 
-def sd3_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
-               attention_impl: AttentionImpl = "auto") -> NativeFields[SD3Transformer]:
+def sd3_fields(config: Mapping[str, object], *,
+               dtype: DTypeLike | None = "float32") -> NativeFields[SD3Transformer]:
     """Read a published `SD3Transformer2DModel` config into native model fields.
 
     Every geometry control the source declares is read. A control whose active
@@ -334,8 +332,7 @@ def sd3_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float
         pooled_projection_dim=_records.integer(config["pooled_projection_dim"], "pooled_projection_dim"),
         sample_size=_records.integer(config["sample_size"], "sample_size"),
         pos_embed_max_size=_records.integer(config["pos_embed_max_size"], "pos_embed_max_size"),
-        dual_attention_layers=tuple(dual), qk_norm=qk_norm, dtype=resolve_dtype(dtype),
-        attention_impl=attention_impl)
+        dual_attention_layers=tuple(dual), qk_norm=qk_norm, dtype=resolve_dtype(dtype))
 
 
 _SD3_EMBEDDERS = {
@@ -423,8 +420,8 @@ def _sd3_path(name: str) -> tuple[str, ...] | None:
     raise ValueError(f"unknown tensor name {name!r}")
 
 
-def flux_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
-                attention_impl: AttentionImpl = "auto") -> NativeFields[FluxTransformer]:
+def flux_fields(config: Mapping[str, object], *,
+                dtype: DTypeLike | None = "float32") -> NativeFields[FluxTransformer]:
     """Read a published `FluxTransformer2DModel` config into native model fields.
 
     Every geometry control the source declares is read, including whether it
@@ -451,13 +448,12 @@ def flux_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "floa
         joint_attention_dim=_records.integer(config["joint_attention_dim"], "joint_attention_dim"),
         pooled_projection_dim=_records.integer(config["pooled_projection_dim"], "pooled_projection_dim"),
         guidance_embeds=_records.boolean(config.get("guidance_embeds", False), "guidance_embeds"),
-        axes_dims_rope=tuple(axes), dtype=resolve_dtype(dtype),
-        attention_impl=attention_impl)
+        axes_dims_rope=tuple(axes), dtype=resolve_dtype(dtype))
 
 
 
-def flux2_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
-                 attention_impl: AttentionImpl = "auto") -> NativeFields[Flux2Transformer]:
+def flux2_fields(config: Mapping[str, object], *,
+                 dtype: DTypeLike | None = "float32") -> NativeFields[Flux2Transformer]:
     """Read a published `Flux2Transformer2DModel` config into native model
     fields, refusing a patch size the pipeline does not use."""
     if _records.integer(config.get("patch_size", 1), "patch_size") != 1:
@@ -485,7 +481,7 @@ def flux2_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "flo
         rope_theta=_records.number(config.get("rope_theta", 2000), "rope_theta"),
         eps=_records.number(config.get("eps", 1e-6), "eps"),
         guidance_embeds=_records.boolean(config.get("guidance_embeds", True), "guidance_embeds"),
-        dtype=resolve_dtype(dtype), attention_impl=attention_impl)
+        dtype=resolve_dtype(dtype))
 
 
 _FLUX2_EMBEDDERS = {
@@ -528,8 +524,8 @@ def flux2_path(name: str, rank: int) -> tuple[str, ...]:
     raise ValueError(f"unknown tensor name {name!r}")
 
 
-def z_image_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
-                   attention_impl: AttentionImpl = "auto") -> NativeFields[ZImageTransformer]:
+def z_image_fields(config: Mapping[str, object], *,
+                   dtype: DTypeLike | None = "float32") -> NativeFields[ZImageTransformer]:
     """Read a published `ZImageTransformer2DModel` config into native model
     fields, refusing what the port does not compute: another patch size,
     grouped keys and values, no query and key norms, or the Omni model's
@@ -562,7 +558,6 @@ def z_image_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "f
         axes_dims=axes,
         axes_lens=lengths,
         dtype=resolve_dtype(dtype),
-        attention_impl=attention_impl,
     )
 
 
@@ -606,8 +601,8 @@ def z_image_path(name: str, rank: int) -> tuple[str, ...]:
     raise ValueError(f"unknown tensor name {name!r}")
 
 
-def wan_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
-               attention_impl: AttentionImpl = "auto") -> NativeFields[WanTransformer]:
+def wan_fields(config: Mapping[str, object], *,
+               dtype: DTypeLike | None = "float32") -> NativeFields[WanTransformer]:
     """Read a published `WanTransformer3DModel` config into native model
     fields, refusing what the text-to-video port does not compute: the
     image-to-video models' image embedder and added key and value
@@ -642,7 +637,6 @@ def wan_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float
         eps=_records.number(config.get("eps", 1e-6), "eps"),
         rope_max_seq_len=_records.integer(config.get("rope_max_seq_len", 1024), "rope_max_seq_len"),
         dtype=resolve_dtype(dtype),
-        attention_impl=attention_impl,
     )
 
 
@@ -758,8 +752,8 @@ def sd3_layouts(shapes: Mapping[str, tuple[int, ...]]) -> tuple[WeightLayout, ..
               for name, shape in shapes.items() if name == "pos_embed.pos_embed"))
 
 
-def qwen_image_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
-                      attention_impl: AttentionImpl = "auto") -> NativeFields[QwenImageTransformer]:
+def qwen_image_fields(config: Mapping[str, object], *,
+                      dtype: DTypeLike | None = "float32") -> NativeFields[QwenImageTransformer]:
     """Read a published `QwenImage21Transformer2DModel` config into native fields.
 
     Every control the class declares is read. Its pipeline hands the latent
@@ -787,7 +781,7 @@ def qwen_image_fields(config: Mapping[str, object], *, dtype: DTypeLike | None =
         mlp_ratio=_records.integer(config.get("mlp_ratio", 3), "mlp_ratio"),
         axes_dims_rope=tuple(axes), eps=_records.number(config.get("eps", 1e-6), "eps"),
         causal_condition=_records.boolean(config.get("causal_condition", True), "causal_condition"),
-        dtype=resolve_dtype(dtype), attention_impl=attention_impl)
+        dtype=resolve_dtype(dtype))
 
 
 _QWEN_IMAGE_EMBEDDERS = {

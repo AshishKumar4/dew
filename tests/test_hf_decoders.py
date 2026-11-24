@@ -107,6 +107,7 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import jax
@@ -123,7 +124,15 @@ from interop_support import (
     transformers_arms,
     transformers_model,
 )
-from model_support import flat_tree, llada_draw, llada_fields, prediction_logits
+from model_support import (
+    attending,
+    flat_tree,
+    llada_draw,
+    llada_fields,
+    prediction_logits,
+    scanning,
+    unrolled,
+)
 from reference_error import ahead_arm, as_given, assert_as_exact, declared_seeds, recording
 
 from dew.interop import Pretrained, PretrainedDecoder
@@ -179,7 +188,7 @@ def test_the_metadata_fields_are_transformers_and_reading_a_config_imports_none_
 def fp32_decoder(directory, **kwargs):
     """The fixture as a model plus variables, in fp32 on the reference kernel."""
     pretrained = Pretrained.load(str(directory), dtype='float32',
-                                 attention_impl='reference', **kwargs)
+                                 **kwargs)
     return pretrained.model, pretrained.variables
 
 
@@ -194,11 +203,12 @@ def recorded_logit_difference(model, variables, directory) -> float:
     return float(np.max(np.abs(logits - reference)))
 
 
+@attending("reference")
 def test_llama_checkpoint_with_training_metadata_keeps_reference_logits(tmp_path):
     original = FIXTURES / "llama-tiny"
     directory = respelled(original, tmp_path / "checkpoint",
                           lambda config: {**config, "is_llama_config": True, "rope_interleaved": False})
-    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(directory, dtype="float32")
     ids = np.load(original / "input_ids.npy")
     actual = np.asarray(loaded.model.apply(loaded.variables, ids))
     expected = np.load(original / "logits.npy")
@@ -236,6 +246,7 @@ BIASED_SEEDS = 8
 paired with Dew's logits on the CPU."""
 
 
+@attending("reference")
 @pytest.mark.parametrize("name, head", [("llama-tiny", "causal"), ("nemotron-h-tiny", "causal"),
                                         ("modernbert-tiny", "masked")])
 def test_a_biased_mlp_loads_and_exports_where_the_reference_reads_mlp_bias(name, head, tmp_path):
@@ -264,7 +275,7 @@ def test_a_biased_mlp_loads_and_exports_where_the_reference_reads_mlp_bias(name,
     reference.save_pretrained(source)
     draw = fixture_ids(FIXTURES / name)
 
-    loaded = Pretrained.load(source, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(source, dtype="float32")
     theirs, truth = transformers_arms(reference.eval(), lambda model, ids: model(ids).logits)
     assert_as_exact(lambda ids: loaded.model.apply(loaded.variables, ids), theirs, draw,
                     f"{name} logits with MLP biases", seeds=BIASED_SEEDS, truth_fn=truth)
@@ -276,7 +287,7 @@ def test_a_biased_mlp_loads_and_exports_where_the_reference_reads_mlp_bias(name,
     PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path / "from_model")
     exports = [tmp_path / "export", tmp_path / "from_model"]
     for export in exports:
-        again = Pretrained.load(export, dtype="float32", attention_impl="reference")
+        again = Pretrained.load(export, dtype="float32")
         reloaded = np.asarray(again.model.apply(again.variables, ids))
         np.testing.assert_array_equal(reloaded, ours)
 
@@ -308,7 +319,7 @@ def a_float32_decoder_under_the_accurate_policy_is_as_exact_as_transformers_on_a
     with ahead_on_the_host():
         # Loaded on the host in a GPU tier prepare, which computes nothing on its GPU (rows 7858, 7859), its
         # weights host arrays (`on_host`), the step's inputs (`ahead_arm`).
-        loaded = Pretrained.load(str(directory), dtype="float32", attention_impl="xla", on_host=True)
+        loaded = Pretrained.load(str(directory), dtype="float32", on_host=True)
     reference = AutoModelForCausalLM.from_pretrained(directory, attn_implementation="eager").eval()
     wide = float64_twin(reference)
     named = dict(reference.named_parameters())
@@ -365,6 +376,7 @@ def a_float32_decoder_under_the_accurate_policy_is_as_exact_as_transformers_on_a
                     truth_fn=transformers(wide, float64))
 
 
+@attending("reference")
 @pytest.mark.parametrize(("name", "stale"), [
     ("qwen2-tiny", {"use_mrope": True}),
     ("mamba2-tiny", {"rms_norm": False, "intermediate_size": 3, "norm_before_gate": True}),
@@ -397,13 +409,14 @@ def test_a_field_the_reference_does_not_read_leaves_its_logits_whatever_it_holds
             return reference(torch.from_numpy(ids).long()).logits.numpy()
 
     def ours(source):
-        loaded = Pretrained.load(source, dtype="float32", attention_impl="reference")
+        loaded = Pretrained.load(source, dtype="float32")
         return np.asarray(loaded.model.apply(loaded.variables, ids))
 
     np.testing.assert_array_equal(theirs(directory), theirs(FIXTURES / name))
     np.testing.assert_array_equal(ours(directory), ours(FIXTURES / name))
 
 
+@attending("reference")
 @pytest.mark.parametrize("family", ["qwen3_moe", "deepseek_v3"])
 def test_an_expert_schedule_that_routes_no_layer_loads_as_the_dense_model_the_reference_builds(
         tmp_path, family):
@@ -434,12 +447,13 @@ def test_an_expert_schedule_that_routes_no_layer_loads_as_the_dense_model_the_re
     ids = np.arange(12, dtype=np.int32).reshape(1, 12) % 64
     with torch.no_grad():
         expected = model(torch.tensor(ids, dtype=torch.long)).logits.float().numpy()
-    loaded = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(tmp_path, dtype="float32")
     assert loaded.model.mixture is None
     actual = np.asarray(loaded.model.apply(loaded.variables, ids))
     np.testing.assert_allclose(actual, expected, atol=1e-4, rtol=0)
 
 
+@attending("reference")
 def test_an_olmo3_model_with_a_llama3_ramp_on_one_kind_writes_back_what_transformers_reads(tmp_path):
     """OLMo3 rotates each layer kind through its own rope_parameters entry, so a Llama-3 ramp on
     the full layers beside plain sliding ones loads, writes back in that spelling, and
@@ -456,11 +470,11 @@ def test_an_olmo3_model_with_a_llama3_ramp_on_one_kind_writes_back_what_transfor
     ids = np.load(FIXTURES / "olmo3-tiny" / "input_ids.npy")
     from dew.interop import PretrainedDecoder
 
-    loaded = Pretrained.load(source, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(source, dtype="float32")
     expected = np.asarray(loaded.model.apply(loaded.variables, ids))
     # The native writer, which spells the config from the model, not the source's own file.
     PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path / "export")
-    reloaded = Pretrained.load(tmp_path / "export", dtype="float32", attention_impl="reference")
+    reloaded = Pretrained.load(tmp_path / "export", dtype="float32")
     np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)), expected)
     reference = Olmo3ForCausalLM.from_pretrained(tmp_path / "export", torch_dtype=torch.float32).eval()
     with torch.no_grad():
@@ -520,6 +534,7 @@ def _respelled(name, tmp_path, edit):
     return respelled(FIXTURES / name, tmp_path / name, edit)
 
 
+@attending("reference")
 @pytest.mark.parametrize(("name", "change"), [
     ("opt-tiny", {"activation_dropout": 0.1}), ("opt-tiny", {"layer_norm_elementwise_affine": False}),
     ("opt-tiny", {"layerdrop": 0.1}), ("bloom-tiny", {"apply_residual_connection_post_layernorm": True}),
@@ -535,6 +550,7 @@ def test_a_checkpoint_asking_what_its_family_does_not_compute_is_refused(name, c
         fp32_decoder(_respelled(name, tmp_path, lambda config: {**config, **change}))
 
 
+@attending("reference")
 @pytest.mark.parametrize(("name", "embedding"), [("opt-tiny", "model.decoder.embed_tokens.weight"),
                                                  ("bloom-tiny", "transformer.word_embeddings.weight")])
 def test_a_tied_checkpoint_keeping_its_embedding_under_the_head_name_alone_loads_the_same_model(
@@ -548,8 +564,8 @@ def test_a_tied_checkpoint_keeping_its_embedding_under_the_head_name_alone_loads
     tensors = load_shards(FIXTURES / name)
     tensors["lm_head.weight"] = tensors.pop(embedding)
     save_hf_layout(tensors, fixture_config(name), tmp_path)
-    head_only = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
-    stored = Pretrained.load(FIXTURES / name, dtype="float32", attention_impl="reference")
+    head_only = Pretrained.load(tmp_path, dtype="float32")
+    stored = Pretrained.load(FIXTURES / name, dtype="float32")
     assert jax.tree.structure(head_only.variables) == jax.tree.structure(stored.variables)
     for ours, theirs in zip(jax.tree.leaves(head_only.variables), jax.tree.leaves(stored.variables),
                             strict=True):
@@ -575,6 +591,7 @@ _YARN_SOURCES = (
 )
 
 
+@attending("reference")
 @pytest.mark.parametrize("name, edit", [
     # Gemma3TextConfig: GELU, global base 1e6 and local 1e4 by default.
     ("gemma3-tiny", _without("rope_parameters", "hidden_activation", "attn_logit_softcapping")),
@@ -651,6 +668,7 @@ def test_a_source_spelled_another_way_computes_the_reference_logits(name, edit, 
     assert np.max(np.abs(ours - theirs)) < 1e-4
 
 
+@attending("reference")
 @pytest.mark.parametrize("name, edit", [
     # LLaDA-MoE's config classes default the rotary's base and factor to -1, which names no rotary.
     *[(name, _without(field)) for name in ("llada-moe-tiny", "llada-moe-v2-tiny")
@@ -677,6 +695,7 @@ def test_a_deepseek_config_that_routes_no_layer_reads_its_routers_fields_to_no_e
     assert dense["mixture"] is None
 
 
+@attending("reference")
 def test_a_dense_llada_config_without_a_base_rotates_at_its_classs_10000(tmp_path):
     """LLaDA's ModelConfig, which its config class starts from, rotates at 10000; the release states
     its own 500000. Without a base the fixture computes what it computes at 10000."""
@@ -687,6 +706,7 @@ def test_a_dense_llada_config_without_a_base_rotates_at_its_classs_10000(tmp_pat
                                   np.asarray(stated[0].apply(stated[1], ids)))
 
 
+@attending("reference")
 def test_a_plain_rotary_gpt_oss_exports_a_plain_record_that_reloads_to_its_logits(tmp_path):
     """GptOssConfig reads an omitted rope record as YaRN; a GPT OSS loaded with a plain one exports a
     plain one, which reloads to the logits it computed."""
@@ -760,6 +780,7 @@ def test_a_field_left_out_reads_as_its_config_class_fills_it(name):
     assert not differing, f"{name} reads {differing} otherwise than its class where they are left out"
 
 
+@attending("reference")
 @pytest.mark.parametrize("name, theta", [
     ("llama31-tiny", 10000.0),
     *_YARN_SOURCES,
@@ -829,6 +850,7 @@ FP32_SEEDS = 8
 `seeds_for` paired with Dew's logits on the CPU."""
 
 
+@attending("reference")
 @pytest.mark.parametrize("name", [name for name in TINY + ROUTED + HYBRID if name not in (
     'bloom-tiny',
     'falcon-mha-tiny',
@@ -875,6 +897,7 @@ HYBRID_SEEDS = 8
 sized by `seeds_for` paired with the export's logits on the CPU."""
 
 
+@attending("reference")
 @pytest.mark.parametrize("name", HYBRID[1:])
 def test_nemotron_h_fused_experts_export_the_source_layout(name, tmp_path):
     """The native 3-D layout and transformers' per-expert save layout compute the same model: the packed
@@ -895,8 +918,8 @@ def test_nemotron_h_fused_experts_export_the_source_layout(name, tmp_path):
     source.mkdir()
     (source / "config.json").write_text(json.dumps(fixture_config(name)))
     save_file(packed, source / "model.safetensors")
-    loaded = Pretrained.load(source, dtype="float32", attention_impl="reference")
-    expected = Pretrained.load(FIXTURES / name, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(source, dtype="float32")
+    expected = Pretrained.load(FIXTURES / name, dtype="float32")
     for path, tensor in flat_tree(expected.variables).items():
         np.testing.assert_array_equal(tensor, flat_tree(loaded.variables)[path])
     destination = tmp_path / "export"
@@ -910,6 +933,7 @@ def test_nemotron_h_fused_experts_export_the_source_layout(name, tmp_path):
                     fixture_ids(FIXTURES / name), f"{name} packed logits", seeds=HYBRID_SEEDS, truth_fn=truth)
 
 
+@attending("reference")
 @pytest.mark.parametrize("name", HYBRID)
 def test_nemotron_h_export_preserves_the_source_config_weights_and_logits(name, tmp_path):
     """The loaded hybrid exports in its source layout, as Mamba-2 and Qwen3-Next do: transformers reads
@@ -918,7 +942,7 @@ def test_nemotron_h_export_preserves_the_source_config_weights_and_logits(name, 
     from dew.interop.sources import load_shards
 
     directory = FIXTURES / name
-    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(directory, dtype="float32")
     destination = tmp_path / "nemotron-h"
     loaded.save(destination)
     assert json.loads((destination / "config.json").read_text()) == fixture_config(name)
@@ -926,7 +950,7 @@ def test_nemotron_h_export_preserves_the_source_config_weights_and_logits(name, 
     assert source.keys() == exported.keys()
     for name, tensor in source.items():
         np.testing.assert_array_equal(tensor, exported[name])
-    restored = Pretrained.load(destination, dtype="float32", attention_impl="reference")
+    restored = Pretrained.load(destination, dtype="float32")
     ids = np.load(directory / "input_ids.npy")
     np.testing.assert_array_equal(loaded.model.apply(loaded.variables, ids),
                                   restored.model.apply(restored.variables, ids))
@@ -936,14 +960,14 @@ def test_nemotron_h_export_preserves_the_source_config_weights_and_logits(name, 
                     truth_fn=truth)
 
 
+@attending("reference")
 def test_the_bf16_gemma_forward_still_tracks_the_reference():
     """gemma3-tiny is the fixture with an attention scale (query_pre_attn_scalar
     16 on head_dim 32), and bf16 is the recipe's default compute dtype. Against
     the fp32 reference logits the observed difference is 5.7e-02 on the
     reference kernel, tolerance 1e-01; dropping the scale moves them by 1.06."""
     directory = FIXTURES / "gemma3-tiny"
-    pretrained = Pretrained.load(str(directory), dtype='bfloat16',
-                                 attention_impl='reference')
+    pretrained = Pretrained.load(str(directory), dtype='bfloat16')
     model, variables = pretrained.model, pretrained.variables
     reference = np.load(directory / "logits.npy")
 
@@ -956,6 +980,7 @@ def test_the_bf16_gemma_forward_still_tracks_the_reference():
     assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
 
 
+@attending("reference")
 @pytest.mark.parametrize("name", [name for name in TINY if name not in (
     'falcon-mha-tiny',
     'falcon-tiny',
@@ -991,6 +1016,7 @@ def test_export_round_trips_the_weights_and_the_config(name, tmp_path):
     assert not (export / "tokenizer_config.json").exists()
 
 
+@attending("reference")
 def test_an_export_with_a_local_tokenizer_is_the_directory_alone(tmp_path):
     """The tokenizer is named by a path that is gone once the export is
     written, as it is on any other machine. No file of the export holds
@@ -1033,7 +1059,7 @@ def test_an_export_with_a_local_tokenizer_is_the_directory_alone(tmp_path):
     generation = json.loads((export / "generation_config.json").read_text())
     (export / "generation_config.json").write_text(json.dumps({**generation, "tokenizer_name": str(source)}))
     again = tmp_path / "again"
-    Pretrained.load(export, dtype="float32", attention_impl="reference").save(again)
+    Pretrained.load(export, dtype="float32").save(again)
     assert_portable(again)
 
     expected = AutoTokenizer.from_pretrained(str(TOKENIZER), local_files_only=True).encode("The trainer")
@@ -1043,7 +1069,7 @@ def test_an_export_with_a_local_tokenizer_is_the_directory_alone(tmp_path):
         "from dew.interop import Pretrained\n"
         "export = sys.argv[1]\n"
         "ids = AutoTokenizer.from_pretrained(export, local_files_only=True).encode('The trainer')\n"
-        "bundle = Pretrained.load(export, dtype='float32', attention_impl='reference')\n"
+        "bundle = Pretrained.load(export, dtype='float32')\n"
         "print(json.dumps({'ids': ids, 'processor': bundle.processor is not None,\n"
         "                  'decoded': bundle.processor.decode(np.asarray([ids]))[0]}))\n")
     result = subprocess.run([sys.executable, "-c", probe, str(again)], capture_output=True, text=True,
@@ -1066,7 +1092,7 @@ def biased_qwen3(rng):
     through the round-trip, so every bias gets its own draw.
     """
     config = {**translate_config(fixture_config("qwen3-tiny")), 'attention_bias': True}
-    built = {**config, 'dtype': 'float32', 'attention_impl': 'reference'}
+    built = {**config, 'dtype': 'float32'}
     model = models.build('causal_transformer', **built)
     leaves, structure = jax.tree_util.tree_flatten_with_path(
         nn.unbox(model.init(rng, jnp.zeros((1, 4), jnp.int32))))
@@ -1076,6 +1102,7 @@ def biased_qwen3(rng):
         for index, (path, leaf) in enumerate(leaves)])
 
 
+@attending("reference")
 @pytest.mark.network
 def test_qwen3_0_6b_matches_the_reference_on_the_real_weights():
     """The real thing: 28 layers of Qwen3-0.6B, fp32, against torch's top 32."""
@@ -1084,7 +1111,7 @@ def test_qwen3_0_6b_matches_the_reference_on_the_real_weights():
     ids = np.asarray(prompt['input_ids'], np.int32)[None]
 
     pretrained = Pretrained.load(prompt['repo'], dtype='float32',
-                                 attention_impl='reference',
+
                                  max_seq_len=int(ids.shape[1]))
     model, variables = pretrained.model, pretrained.variables
     logits = np.asarray(model.apply(variables, jnp.asarray(ids)), np.float32)[0]
@@ -1126,12 +1153,14 @@ def assert_transformers_reads_the_export(model, variables, export, tmp_path) -> 
     assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
 
 
+@attending("reference")
 def test_our_export_loads_in_transformers_with_the_same_logits(tmp_path):
     """The export is a real HF checkpoint: transformers reads it and agrees."""
     model, variables = fp32_decoder(FIXTURES / "qwen3-tiny")
     assert_transformers_reads_the_export(model, variables, tmp_path / "exported", tmp_path)
 
 
+@attending("reference")
 def test_a_biased_qwen3_export_carries_its_biases_into_transformers(tmp_path, rng):
     """Qwen3Attention builds q, k, v and o with bias=config.attention_bias
     (modeling_qwen3.py:225-236), so the reference applies the biases where dew
@@ -1149,6 +1178,7 @@ def test_a_biased_qwen3_export_carries_its_biases_into_transformers(tmp_path, rn
 MIXED = ("sliding_attention", "full_attention")
 
 
+@attending("reference")
 @pytest.mark.parametrize(
     "fixture, changes, model_type",
     [
@@ -1189,13 +1219,14 @@ def _diffusion_fp32(name):
     directory = FIXTURES / name
     config = translate_config(fixture_config(name))
     assert config["mask_token_id"] == 120
-    model = models.build("causal_transformer", config, dtype="float32", attention_impl="reference")
+    model = models.build("causal_transformer", config, dtype="float32")
     assert model.mask_token_id == 120
     variables = translate_weights(load_file(str(directory / "model.safetensors")), config)
     return (model, variables, np.load(directory / "input_ids.npy"),
             np.load(directory / "logits.npy"), np.load(directory / "logits_f64.npy"))
 
 
+@attending("reference")
 @pytest.mark.parametrize("name", ["llada-tiny", "dream-tiny"])
 def test_the_diffusion_fixtures_exercise_full_attention(name):
     """The release's own logits over the fixture's tokens (LLaDA's modeling_llada.py at 0f2787f, Dream's
@@ -1211,12 +1242,13 @@ LLADA_MOE = ('llada-moe-tiny', 'llada-moe-v2-tiny', 'llada2-tiny', 'llada21-tiny
 
 
 @pytest.fixture(scope='module', params=LLADA_MOE)
+@attending("reference")
 def llada_moe_source(request):
     """A LLaDA-MoE release's synthetic checkpoint, its forward's fields (`llada_fields`), one of its
     recording's draws for a single forward, and its recording of the release over seeds
     (tools/llada_moe_reference.py, `record_case`)."""
     name = request.param
-    source = Pretrained.load(FIXTURES / name, dtype='float32', attention_impl='reference')
+    source = Pretrained.load(FIXTURES / name, dtype='float32')
     path = FIXTURES / name / 'released.npz'
     return name, source, llada_draw(0, source.model.vocab_size)['ids'], llada_fields(name, 2, 16), (
         recording(path), declared_seeds(path)[name])
@@ -1238,6 +1270,7 @@ def assert_released_logits(name, source, fields, recorded, forward, label):
                     f'{name} {label}', seeds=seeds, truth_fn=truth)
 
 
+@attending("reference")
 def test_llada_moe_logits_match_the_released_model_code(llada_moe_source):
     """The pinned release's own fp32 forward, including its router and block mask, over its
     recording's seeds of two 16-token rows, whole blocks of 2.2's routing block."""
@@ -1246,6 +1279,7 @@ def test_llada_moe_logits_match_the_released_model_code(llada_moe_source):
     assert_released_logits(name, source, fields, recorded, forward, 'released logits')
 
 
+@attending("reference")
 @pytest.mark.mesh(devices=4)
 def test_llada_moe_expert_and_sequence_shards_match_released_logits(llada_moe_source):
     from dew.mesh import mesh_axes
@@ -1253,7 +1287,7 @@ def test_llada_moe_expert_and_sequence_shards_match_released_logits(llada_moe_so
 
     name, _, _, fields, recorded = llada_moe_source
     mesh = MeshSpec(expert=2, sequence=2).build(jax.devices()[:4])
-    source = Pretrained.load(FIXTURES / name, dtype='float32', attention_impl='reference',
+    source = Pretrained.load(FIXTURES / name, dtype='float32',
                               mesh=mesh, layout=Layout(min_shard=1, tolerance=1.0))
     kernels = [value for path, value in flat_tree(source.variables['params']).items()
                if '.experts.' in path]
@@ -1263,6 +1297,7 @@ def test_llada_moe_expert_and_sequence_shards_match_released_logits(llada_moe_so
         assert_released_logits(name, source, fields, recorded, forward, 'sharded released logits')
 
 
+@attending("reference")
 def test_llada_moe_routing_limits_change_the_forward(llada_moe_source):
     """The expert bias, group limit and 2.2 block shortlist each bind on real hidden states."""
     from dataclasses import replace
@@ -1306,6 +1341,7 @@ def llada22_routes(source, tokens, **fields) -> dict:
             for layer, values in state['router'].items()}
 
 
+@attending("reference")
 def test_llada22_block_routing_is_each_requests_own():
     """LLaDA2.2 routes each block of `block_size` places together. The release cuts its blocks from
     the batch flattened into one stream, so there a row's experts depend on the rows beside it; Dew
@@ -1315,7 +1351,7 @@ def test_llada22_block_routing_is_each_requests_own():
     it routes to alone: their blocks do not meet, and the padding votes for none. (The recorded draws
     are two 16-token rows, whole blocks, where Dew's routing is the release's.) Eight requests of
     5 to 15 tokens make the stream's blocks straddle rows and padding throughout."""
-    source = Pretrained.load(FIXTURES / 'llada22-tiny', dtype='float32', attention_impl='reference')
+    source = Pretrained.load(FIXTURES / 'llada22-tiny', dtype='float32')
     assert source.model.mixture.routing_block == 4
     vocabulary = source.model.vocab_size
     requests = [llada_draw(seed, vocabulary)['ids'][seed % 2, :length]
@@ -1332,6 +1368,7 @@ def test_llada22_block_routing_is_each_requests_own():
                                           err_msg=f'request {row}, {layer}')
 
 
+@attending("reference")
 def test_a_block_router_refuses_a_cached_decode_by_name():
     """A block's shortlist is chosen from every token in it, which a cached decode step holding one
     token of its block cannot see, so a causal decoder with a block router refuses autoregressive
@@ -1340,7 +1377,7 @@ def test_a_block_router_refuses_a_cached_decode_by_name():
 
     from dew.sampling.text import generate
 
-    source = Pretrained.load(FIXTURES / 'llada22-tiny', dtype='float32', attention_impl='reference')
+    source = Pretrained.load(FIXTURES / 'llada22-tiny', dtype='float32')
     causal = source.model.clone(causal=True)
     unblocked = causal.clone(mixture=replace(causal.mixture, routing_block=None, block_experts=None))
     assert unblocked.generation_refusal() is None and causal.generation_refusal() is not None
@@ -1348,11 +1385,12 @@ def test_a_block_router_refuses_a_cached_decode_by_name():
         generate(causal, source.variables, jnp.ones((1, 4), jnp.int32), 2, key=0)
 
 
+@attending("reference")
 def test_llada22_block_routing_is_each_packed_documents_own():
     """Two documents packed in one row, 6 and 7 tokens, route every token to the experts it routes to
     alone: each document's blocks are counted from its own first token, so neither a block nor its
     shortlist spans the boundary."""
-    source = Pretrained.load(FIXTURES / 'llada22-tiny', dtype='float32', attention_impl='reference')
+    source = Pretrained.load(FIXTURES / 'llada22-tiny', dtype='float32')
     vocabulary = source.model.vocab_size
     documents = [llada_draw(3, vocabulary)['ids'][0, :6], llada_draw(4, vocabulary)['ids'][1, :7]]
     packed = np.concatenate(documents)[None]
@@ -1367,6 +1405,7 @@ def test_llada22_block_routing_is_each_packed_documents_own():
         start += len(document)
 
 
+@attending("reference")
 @pytest.mark.parametrize('derived', [False, True], ids=['source-layout', 'native-layout'])
 def test_llada_moe_trained_exports_reload_and_run(llada_moe_source, tmp_path, derived):
     name, source, ids, fields, _ = llada_moe_source
@@ -1385,7 +1424,7 @@ def test_llada_moe_trained_exports_reload_and_run(llada_moe_source, tmp_path, de
         PretrainedDecoder.from_model(model, trained).save(tmp_path)
     else:
         source.save(tmp_path, variables=trained, max_shard_size='30KB')
-    reloaded = Pretrained.load(tmp_path, dtype='float32', attention_impl='reference')
+    reloaded = Pretrained.load(tmp_path, dtype='float32')
     actual = jax.jit(lambda tokens: reloaded.model.apply(reloaded.variables, tokens, **fields))
     expected = jax.jit(lambda tokens: model.apply(trained, tokens, **fields))
     # Saving and loading is an identity, so the reference is exact at every draw: each its seed's own
@@ -1402,10 +1441,12 @@ def test_llada_moe_trained_exports_reload_and_run(llada_moe_source, tmp_path, de
 
 
 @pytest.fixture(scope='module')
+@attending("reference")
 def glm5_next_source():
-    return Pretrained.load(FIXTURES / 'glm5-next-tiny', dtype='float32', attention_impl='reference')
+    return Pretrained.load(FIXTURES / 'glm5-next-tiny', dtype='float32')
 
 
+@attending("reference")
 def test_glm5_next_logits_and_prediction_depth_match_reference(glm5_next_source):
     source = glm5_next_source
     ids = jnp.asarray(np.load(source.source / 'input_ids.npy'), jnp.int32)
@@ -1418,6 +1459,7 @@ def test_glm5_next_logits_and_prediction_depth_match_reference(glm5_next_source)
     assert scaled_difference(np.asarray(mtp), np.load(source.source / 'mtp_logits.npy')) < 1e-4
 
 
+@attending("reference")
 def test_glm5_prediction_index_reuse_does_not_change_forward_or_sft(glm5_next_source):
     source = glm5_next_source
     ids = jnp.asarray(np.load(source.source / "input_ids.npy")[:, :6], jnp.int32)
@@ -1454,16 +1496,19 @@ def assert_padded_speculation_is_greedy(source) -> None:
     inputs = ModelInputs(jnp.asarray(tokens), {"attention_mask": jnp.asarray(valid)})
     task = source.text_generation(sampling=Sampling(temperature=0))
     ordinary = task(inputs, max_new_tokens=7, key=0).host()
-    speculative = task(inputs, max_new_tokens=7, key=0, strategy=Speculative(block=3)).host()
+    speculative = task(inputs, max_new_tokens=7, key=0,
+                       sampling=replace(task.sampling, strategy=Speculative(block=3))).host()
     np.testing.assert_array_equal(speculative.tokens, ordinary.tokens)
     np.testing.assert_array_equal(speculative.lengths, ordinary.lengths)
     np.testing.assert_array_equal(speculative.terminated, ordinary.terminated)
 
 
+@attending("reference")
 def test_glm5_prediction_index_reuse_preserves_public_padded_greedy_generation(glm5_next_source):
     assert_padded_speculation_is_greedy(glm5_next_source)
 
 
+@attending("reference")
 @pytest.mark.check1_shards(seeds=8, per_task=2)
 def test_glm5_next_prefill_and_token_steps_match_parallel(glm5_next_source):
     """A prefill and single-token steps on par with the parallel forward at each step's width from float64
@@ -1476,6 +1521,7 @@ GLM5_DECODE_SEEDS = 8
 """GLM-5 next's cached decode's declared check-1 seeds, sized by `seeds_for` on armada."""
 
 
+@attending("reference")
 @pytest.mark.parametrize("mode", ["frozen", "trainable"])
 def test_scalar_mode_survives_scanning_and_rematerialized_backward(mode):
     """Frozen HF buffers and trainable Google scalars retain each view's math."""
@@ -1484,16 +1530,17 @@ def test_scalar_mode_survives_scanning_and_rematerialized_backward(mode):
     fields = {**translate_config(fixture_config("gemma4-moe-tiny")), "layer_scalar": mode}
     variables = translate_weights(load_file(str(GEMMA4_MOE / "model.safetensors")), fields)
     plain = base.clone(layer_scalar=mode)
-    scanned = plain.clone(scan_layers=True, remat="full")
+    scanned = plain.clone(remat="full")
     ids = jnp.asarray(np.load(GEMMA4_MOE / "input_ids.npy"), jnp.int32)
 
     def loss(model, params):
         return jnp.mean(model.apply({**variables, "params": params}, ids) ** 2)
 
-    expected, expected_grad = jax.jit(jax.value_and_grad(lambda params: loss(plain, params)))(
+    expected, expected_grad = unrolled(jax.jit(jax.value_and_grad(lambda params: loss(plain, params))))(
         variables["params"]
     )
-    value, gradient = jax.jit(jax.value_and_grad(lambda params: loss(scanned, params)))(variables["params"])
+    value, gradient = scanning(jax.jit(jax.value_and_grad(lambda params: loss(scanned, params))))(
+        variables["params"])
     np.testing.assert_allclose(value, expected, atol=1e-5, rtol=0)
     for actual, wanted in zip(jax.tree.leaves(gradient), jax.tree.leaves(expected_grad), strict=True):
         np.testing.assert_allclose(actual, wanted, atol=1e-4, rtol=1e-5)
@@ -1578,6 +1625,7 @@ STEP_SEEDS = 8
 by `seeds_for` paired with Dew's step on the CPU."""
 
 
+@attending("reference")
 def test_a_nemotron_h_prediction_step_loads_computes_the_reference_and_trains(tmp_path):
     """Nemotron 3 Ultra's prediction step over the latent-MoE fixture loads as
     `mtp_0`: the attention block's mixer and pre-norm, the routed block in
@@ -1633,6 +1681,7 @@ def test_a_nemotron_h_prediction_step_loads_computes_the_reference_and_trains(tm
     assert all(jax.tree.leaves(moved)), moved
 
 
+@attending("reference")
 def test_a_nemotron_h_load_keeps_its_prediction_steps_whole(tmp_path):
     """A Nemotron-H prediction step is its blocks together, an attention block and a routed one under
     `mtp.layers.{0,1}.*` (`step_depth`): `prediction_depths=1` keeps a one-step source whole, and of a
@@ -1641,7 +1690,7 @@ def test_a_nemotron_h_load_keeps_its_prediction_steps_whole(tmp_path):
     from safetensors.numpy import load_file, save_file
 
     def load(directory, **options):
-        return Pretrained.load(str(directory), dtype="float32", attention_impl="reference", **options)
+        return Pretrained.load(str(directory), dtype="float32", **options)
 
     def same(loaded, other) -> bool:
         ours, theirs = flat_tree(loaded.variables), flat_tree(other.variables)
@@ -1687,6 +1736,7 @@ def test_nemotron_h_reads_the_prediction_step_transformers_reads(step):
     assert list(blocks) == list(reference.mtp_layers_block_type)
 
 
+@attending("reference")
 @pytest.mark.parametrize("name", ["nemotron-h-tiny", "nemotron-h-moe-tiny"])
 def test_a_nemotron_h_trunk_whose_config_names_a_step_loads_as_the_trunk(name, tmp_path):
     """transformers saves the trunk alone whatever depth the config names:
@@ -1700,6 +1750,7 @@ def test_a_nemotron_h_trunk_whose_config_names_a_step_loads_as_the_trunk(name, t
     np.testing.assert_array_equal(np.asarray(model.apply(variables, ids)), np.asarray(plain.apply(held, ids)))
 
 
+@attending("reference")
 def test_a_float64_decoder_saves_and_reloads_in_float64(tmp_path):
     """A decoder computing in float64 end to end, as Dory's and nGPT's runs do: its bundle and a
     run's record of it name float64, and the checkpoint it saves loads back in float64 to the same
@@ -1707,8 +1758,7 @@ def test_a_float64_decoder_saves_and_reloads_in_float64(tmp_path):
     from dew.registry import ModelConfig, to_record
 
     with jax.enable_x64(new_val=True):
-        loaded = Pretrained.load(str(FIXTURES / "qwen3-tiny"), dtype="float64", param_dtype="float64",
-                                 attention_impl="reference")
+        loaded = Pretrained.load(str(FIXTURES / "qwen3-tiny"), dtype="float64", param_dtype="float64")
         bundle = PretrainedDecoder.from_model(loaded.model, loaded.variables)
         record = json.loads(json.dumps(bundle.model_config))
         assert models.build("causal_transformer", **record) == loaded.model
@@ -1716,8 +1766,7 @@ def test_a_float64_decoder_saves_and_reloads_in_float64(tmp_path):
         run = json.loads(json.dumps(to_record(ModelConfig.from_model(loaded.model), ModelConfig)))
         assert ModelConfig.from_dict(run).build() == loaded.model
         bundle.save(tmp_path / "float64")
-        again = Pretrained.load(str(tmp_path / "float64"), dtype="float64", param_dtype="float64",
-                                attention_impl="reference")
+        again = Pretrained.load(str(tmp_path / "float64"), dtype="float64", param_dtype="float64")
         pairs = zip(jax.tree.leaves(again.variables), jax.tree.leaves(loaded.variables), strict=True)
         for ours, theirs in pairs:
             np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))

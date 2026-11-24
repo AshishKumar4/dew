@@ -37,10 +37,12 @@ import test_staging as staging
 import test_trainer as trainer
 import test_training_transactions as transactions
 from gpu_flow import Cell, cells_of, isolated, run_cells
+from model_support import attending
 
 pytestmark = pytest.mark.gpu(reason="each property a training step shows on a GPU alone")
 
 
+@attending("xla")
 def test_a_runs_training_reads_this_gpu(tmp_path_factory):
     """Every training cell above on this GPU (`gpu_flow.run_cells`), each run as the suite runs a test
     (`gpu_flow.isolated`), each one's failure kept and all raised together."""

@@ -58,7 +58,7 @@ def main(config: Config, data: Dataset | Loader | None = None):
         num_layers=4,
         num_heads=4,
         dtype=jnp.bfloat16,
-        attention_impl="auto",
+
     )
     objective = DiffusionObjective(
         model,

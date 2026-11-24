@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import jax
 import numpy as np
 import pytest
+from model_support import attending
 from sharded import assert_sharded
 from tool_support import run_from
 
@@ -37,6 +38,7 @@ def slot_release(tmp_path, readout, n_slots=32):
     return source, stored
 
 
+@attending("xla")
 @pytest.mark.parametrize("readout", ["slot_lm", "head", "fresh_head"])
 @pytest.mark.parametrize("n_slots", [16, 32, 512])
 def test_a_slot_release_loads_its_readout_and_exports_the_same_task(tmp_path, readout, n_slots):
@@ -44,7 +46,7 @@ def test_a_slot_release_loads_its_readout_and_exports_the_same_task(tmp_path, re
     the available label rows; the byte tokenizer has all letters but no single-token pairs.
     All three become decision tasks and survive a native task export with their parameters."""
     source, stored = slot_release(tmp_path, readout, n_slots)
-    bundle = Pretrained.load(source, dtype="float32", attention_impl="xla")
+    bundle = Pretrained.load(source, dtype="float32")
     task = Decide.of(bundle)
     [row] = task.layout.rows(task.tokenizer, task.specials, "Refund requested.",
                             {"team": Choice("Which team?", ["billing", "technical"])})
@@ -61,8 +63,8 @@ def test_a_slot_release_loads_its_readout_and_exports_the_same_task(tmp_path, re
         assert np.count_nonzero(bundle.head_variables["params"]["k"]) == 0
     else:
         assert not jax.tree.leaves(bundle.head_variables)
-    shapes = Pretrained.load(source, dtype="float32", attention_impl="xla", weights=False)
-    host = Pretrained.load(source, dtype="float32", attention_impl="xla", on_host=True)
+    shapes = Pretrained.load(source, dtype="float32", weights=False)
+    host = Pretrained.load(source, dtype="float32", on_host=True)
     for abstract, held, original in zip(jax.tree.leaves((shapes.variables, shapes.head_variables)),
                                        jax.tree.leaves((host.variables, host.head_variables)),
                                        jax.tree.leaves((bundle.variables, bundle.head_variables)),
@@ -74,7 +76,7 @@ def test_a_slot_release_loads_its_readout_and_exports_the_same_task(tmp_path, re
         np.testing.assert_array_equal(held, original)
     exported = tmp_path / "exported"
     bundle.save(exported)
-    restored = Decide.from_pretrained(exported, dtype="float32", attention_impl="xla")
+    restored = Decide.from_pretrained(exported, dtype="float32")
     overflow = Choice("Which one?", [f"option{index}" for index in range(min(n_slots, 26) + 1)])
     for reader in (task, restored):
         with pytest.raises(ValueError):
@@ -90,7 +92,7 @@ _REOPENED = """
 import sys
 import numpy as np
 from dew.interop import Pretrained
-bundle = Pretrained.load("dew/tiny-slot", dtype="float32", attention_impl="xla")
+bundle = Pretrained.load("dew/tiny-slot", dtype="float32")
 np.savez(sys.argv[1], revision=np.asarray(bundle.revision),
          **{name: np.asarray(value) for name, value in bundle.head_variables["params"].items()})
 """
@@ -165,6 +167,7 @@ OVERRIDES = {
 full attention off or on, and a Gemma 2 release's turned from its full layers to its sliding ones."""
 
 
+@attending("reference")
 @pytest.mark.parametrize("case", sorted(OVERRIDES))
 def test_a_loads_attention_override_lays_the_rows_its_backbone_reads_and_saves_as_that_release(
         tmp_path, case):
@@ -194,7 +197,7 @@ def test_a_loads_attention_override_lays_the_rows_its_backbone_reads_and_saves_a
             (source / "config.json").write_text(json.dumps(stated))
         return source
 
-    load = {"dtype": "float32", "attention_impl": "reference"}
+    load = {"dtype": "float32"}
     bundle = Pretrained.load(release("released", released), **load,
                              modeling_overrides={"attention": overridden})
     declared = Decide.from_pretrained(release("declared", None, overridden), **load)
@@ -210,15 +213,16 @@ def test_a_loads_attention_override_lays_the_rows_its_backbone_reads_and_saves_a
             np.testing.assert_array_equal(actual, wanted)
 
 
+@attending("xla")
 @pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize("readout", ["slot_lm", "head", "fresh_head"])
 @pytest.mark.parametrize("n_slots", [16, 32, 512])
 def test_a_loaded_readout_uses_its_own_layout_beside_the_backbone(tmp_path, readout, n_slots):
     source, _ = slot_release(tmp_path, readout, n_slots)
-    bundle = Pretrained.load(source, dtype="float32", attention_impl="xla", on_host=True)
+    bundle = Pretrained.load(source, dtype="float32", on_host=True)
     mesh = MeshSpec(fsdp=2).build(devices=jax.devices()[:2])
     for minimum in (1, 2048):
-        placed = Pretrained.load(source, dtype="float32", attention_impl="xla", mesh=mesh,
+        placed = Pretrained.load(source, dtype="float32", mesh=mesh,
                                  layout=Layout(min_shard=minimum, tolerance=1.0))
         assert_sharded(placed.variables, mesh)
         if minimum == 1 and readout != "slot_lm":
@@ -230,22 +234,24 @@ def test_a_loaded_readout_uses_its_own_layout_beside_the_backbone(tmp_path, read
             np.testing.assert_array_equal(actual, expected)
 
 
+@attending("xla")
 @pytest.mark.parametrize("readout", ["head", "fresh_head"])
 def test_a_bfloat16_readout_keeps_its_storage_through_the_released_format(tmp_path, readout):
     import jax.numpy as jnp
 
     source, _ = slot_release(tmp_path, readout, 16)
-    bundle = Pretrained.load(source, dtype="bfloat16", param_dtype="bfloat16", attention_impl="xla")
+    bundle = Pretrained.load(source, dtype="bfloat16", param_dtype="bfloat16")
     assert all(leaf.dtype == jnp.bfloat16 for leaf in jax.tree.leaves(bundle.head_variables))
     exported = tmp_path / "exported"
     bundle.save(exported)
-    restored = Pretrained.load(exported, dtype="bfloat16", param_dtype="auto", attention_impl="xla")
+    restored = Pretrained.load(exported, dtype="bfloat16", param_dtype="auto")
     for actual, expected in zip(jax.tree.leaves((restored.variables, restored.head_variables)),
                                jax.tree.leaves((bundle.variables, bundle.head_variables)), strict=True):
         assert actual.dtype == expected.dtype
         np.testing.assert_array_equal(actual, expected)
 
 
+@attending("xla")
 def test_a_block_slot_source_trains_checkpoints_exports_and_serves_its_updated_readout(tmp_path):
     import optax
     from decision_support import decision_rows
@@ -263,7 +269,7 @@ def test_a_block_slot_source_trains_checkpoints_exports_and_serves_its_updated_r
         "attention": {"full_attention": "block_bidirectional", "linear_attention": "causal"}}
     (source / "config.json").write_text(json.dumps(config))
     (source / "readout.json").unlink()
-    bundle = Pretrained.load(source, dtype="float32", attention_impl="xla")
+    bundle = Pretrained.load(source, dtype="float32")
     task = bundle.pipeline()
     task = replace(task, layout=replace(task.layout, max_len=512))
     request = {"state": "Refund requested.", "questions": {
@@ -285,7 +291,7 @@ def test_a_block_slot_source_trains_checkpoints_exports_and_serves_its_updated_r
     updated = replace(bundle, variables=part(trained.variables, "backbone"),
                       head_variables=part(trained.variables, "head"))
     updated.save(tmp_path / "updated")
-    exported = Decide.from_pretrained(tmp_path / "updated", dtype="float32", attention_impl="xla")
+    exported = Decide.from_pretrained(tmp_path / "updated", dtype="float32")
     question = {"team": Choice("Which team?", ["billing", "technical"])}
     rows = loaded.layout.rows(loaded.tokenizer, loaded.specials, request["state"], question)
     # Both loads hold one layout of the weights, the run's packed and the export's apart packed alike
@@ -339,6 +345,7 @@ def test_a_slot_draw_transfers_only_selected_host_rows_and_matches_a_device_draw
     np.testing.assert_array_equal(host["params"]["slots"][:3], table[[65, 66, 67]])
 
 
+@attending("xla")
 @pytest.mark.parametrize("readout", ["slot_lm", "head"])
 def test_a_slot_release_states_the_window_and_the_prompt_its_layout_accepted(tmp_path, readout):
     """A slot release's layout is its prompt over its labels and blocks and the window the task accepted:
@@ -351,33 +358,34 @@ def test_a_slot_release_states_the_window_and_the_prompt_its_layout_accepted(tmp
     from dew.decision.layout import Framing
 
     source, _ = slot_release(tmp_path, readout)
-    bundle = Pretrained.load(source, dtype="float32", attention_impl="xla")
+    bundle = Pretrained.load(source, dtype="float32")
     assert bundle.layout.max_len == 32768
     layout = replace(bundle.layout, max_len=4096)
     replace(bundle, layout=layout).save(tmp_path / "narrow")
-    assert Pretrained.load(tmp_path / "narrow", dtype="float32", attention_impl="xla").layout == layout
+    assert Pretrained.load(tmp_path / "narrow", dtype="float32").layout == layout
     assert Release.load(tmp_path / "narrow") == Release(max_length=4096)
     assert set(json.loads((tmp_path / "narrow" / "readout.json").read_text())) <= {
         "readout", "head_dim", "n_slots", "attention"}
     other = replace(bundle.layout, max_len=2048, framing=Framing(system="Answer plainly.", prefill="",
                                                                  thinking=False))
     replace(bundle, layout=other).save(tmp_path / "other")
-    assert Pretrained.load(tmp_path / "other", dtype="float32", attention_impl="xla").layout == other
+    assert Pretrained.load(tmp_path / "other", dtype="float32").layout == other
     (tmp_path / "narrow" / "dew_release.json").unlink()
-    assert Pretrained.load(tmp_path / "narrow", dtype="float32", attention_impl="xla").layout.max_len == 32768
+    assert Pretrained.load(tmp_path / "narrow", dtype="float32").layout.max_len == 32768
 
 
+@attending("xla")
 def test_a_slot_release_reads_the_labels_its_layout_states_in_their_order(tmp_path):
     """A slot release whose layout writes its labels in another order than its source's canonical one (B, A,
     C, D) reads them in that order: exported, its readout and its layout reload with those labels, the rows
     a question asks under them, and the task answers it as the release it was exported from (row 4484)."""
     source, _ = slot_release(tmp_path, "slot_lm", n_slots=4)
-    bundle = Pretrained.load(source, dtype="float32", attention_impl="xla")
+    bundle = Pretrained.load(source, dtype="float32")
     labels = replace(bundle.layout.labels, names=("B", "A", "C", "D"))
     head = bundle.head.clone(label_ids=labels.ids(bundle.decision_tokenizer, 4))
     chosen = replace(bundle, layout=replace(bundle.layout, labels=labels), head=head)
     chosen.save(tmp_path / "saved")
-    restored = Pretrained.load(tmp_path / "saved", dtype="float32", attention_impl="xla")
+    restored = Pretrained.load(tmp_path / "saved", dtype="float32")
     assert restored.layout.labels == labels and restored.head.label_ids == head.label_ids
     asked = {"team": Choice("Which team?", ["billing", "technical", "fraud"])}
     answers = [Decide.of(each, name="release")("Refund requested.", asked)["team"]
@@ -386,11 +394,12 @@ def test_a_slot_release_reads_the_labels_its_layout_states_in_their_order(tmp_pa
     assert answers[0].probabilities.tolist() == answers[1].probabilities.tolist()
 
 
+@attending("xla")
 def test_a_slot_pointer_heads_release_of_labels_written_two_ways_is_refused(tmp_path):
     """A pointer head (`SlotReadout`) reads one label id a slot: a release of it whose layout writes each
     label two ways is refused where it is written, as no reader of it could answer (review of row 4484)."""
     source, _ = slot_release(tmp_path, "head", n_slots=4)
-    bundle = Pretrained.load(source, dtype="float32", attention_impl="xla")
+    bundle = Pretrained.load(source, dtype="float32")
     labels = replace(bundle.layout.labels, variants=("{}", "{}"), names=("B", "A", "C", "D"))
     chosen = replace(bundle, layout=replace(bundle.layout, labels=labels))
     with pytest.raises(ValueError):

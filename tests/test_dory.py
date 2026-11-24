@@ -18,7 +18,7 @@ from decision_support import decision_rows
 from float64_terms import float64_forward
 from interop_support import assert_reloads, assert_same_stored_tensors, token_draw
 from map_judge import marked_seeds
-from model_support import as_stepped
+from model_support import as_stepped, attending
 from reference_error import (
     as_given,
     assert_as_exact,
@@ -37,7 +37,7 @@ from dew.data.dataset import Loader, replayed
 from dew.decision import Choice, DecisionModel, DecisionObjective, Example, JointSchemaHead
 from dew.decision.layout import SegmentLayout
 from dew.inference import TextGeneration
-from dew.inference.serving import Server
+from dew.inference.serving import PagedKV, Server
 from dew.interop import Pretrained, PretrainedDecoder, hf_decoders
 from dew.interop.sources import load_shards
 from dew.lora import LoRA
@@ -45,7 +45,6 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.inputs import ModelInputs
 from dew.nn.kernels import generation
-from dew.nn.kv_cache import KVCache
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.nn.mixers.mlp import MLPMixer
 from dew.nn.ngpt import stepped
@@ -62,10 +61,10 @@ TOOL = load_tool('dory_reference')
 
 
 def load(**fields):
-    """The tiny Dory loaded (float32, XLA's attention, unless `fields` state otherwise), in a prepare on the
-    host (`ahead_on_the_host`), its weights committed to no device."""
+    """The tiny Dory loaded (float32, unless `fields` state otherwise), in a prepare on the host
+    (`ahead_on_the_host`), its weights committed to no device."""
     with ahead_on_the_host():
-        return Pretrained.load(TINY, **{'dtype': 'float32', 'attention_impl': 'xla', **fields})
+        return Pretrained.load(TINY, **{'dtype': 'float32', **fields})
 
 
 def with_cache(model: CausalTransformer, mode: str) -> CausalTransformer:
@@ -116,6 +115,7 @@ def assert_logits_as_vllms(dew, loaded: Pretrained, label: str, *, stream: int, 
     assert_as_exact(dew, reference, draw, label, seeds=LOGITS_SEEDS, truth_fn=truth)
 
 
+@attending("xla")
 @pytest.mark.compiles_at_run(
     reason="its float64 forward against the transcription's recorded float64 logits, no check-1 site")
 @pytest.mark.parametrize('loops', [1, 2, 4])
@@ -133,6 +133,7 @@ def test_dorys_float64_forward_computes_the_transcriptions_function(loops):
                                roundings=roundings)
 
 
+@attending("xla")
 @pytest.mark.compiles_at_run(reason="float64 logits under each order against the identity's, no check-1 site")
 def test_the_release_tests_symmetries_keep_dorys_function_and_redraw_its_sums():
     """The orders the release is held to vLLM under (tools/dory_vllm_reference.py's `symmetry`: the
@@ -160,6 +161,7 @@ def test_the_release_tests_symmetries_keep_dorys_function_and_redraw_its_sums():
         assert not np.array_equal(np.asarray(loaded.model.apply(ordered, ids)), plain), index
 
 
+@attending("xla")
 @pytest.mark.parametrize('loops', [1, 2, 4])
 def test_the_looped_stack_and_its_output_table_compute_vllms_logits_at_each_loop_count(loops):
     """The tiny Dory's logits with its recurrent block run once, twice (its own count) and four
@@ -182,6 +184,7 @@ def test_the_looped_stack_and_its_output_table_compute_vllms_logits_at_each_loop
                            stream=0xD02, loops=loops)
 
 
+@attending("xla")
 @pytest.mark.compiles_at_run(reason="bf16 keys against the recorded reference's rounding, no check-1 site")
 def test_bf16_keys_rotate_and_normalize_where_vllm_rounds():
     """In bf16 the first layer's keys, the projections of the same embeddings, rotate as vLLM's
@@ -189,7 +192,7 @@ def test_bf16_keys_rotate_and_normalize_where_vllm_rounds():
     fp32, so the keys a prefill caches sit within a quarter of the reference's own bf16 error of
     its keys (`assert_rounds_where_the_reference_does`); fp32 tables, which round only the turn,
     sit a whole bf16 rounding apart."""
-    loaded = Pretrained.load(TINY, dtype='bfloat16', attention_impl='xla')
+    loaded = Pretrained.load(TINY, dtype='bfloat16')
     ids = REFERENCE['input_ids']
     cache = loaded.model.apply(loaded.variables, ids.shape[0], method=CausalTransformer.init_cache,
                                mutable=['cache'])[1]['cache']
@@ -198,6 +201,7 @@ def test_bf16_keys_rotate_and_normalize_where_vllm_rounds():
     assert_rounds_where_the_reference_does(keys, REFERENCE['keys_bf16'], REFERENCE['keys_f64'], 'bf16 keys')
 
 
+@attending("xla")
 @pytest.mark.parametrize('loops', [None, 4])
 @pytest.mark.parametrize('mode', ['per_loop', 'last_loop'])
 def test_a_cached_greedy_continuation_reads_each_cache_as_vllm_keeps_it(mode, loops):
@@ -265,6 +269,7 @@ def test_a_cached_greedy_continuation_reads_each_cache_as_vllm_keeps_it(mode, lo
                         seeds=LOGITS_SEEDS, truth_fn=truth)
 
 
+@attending("xla")
 @pytest.mark.compiles_at_run(reason="a step's program's structure, no check-1 site")
 @pytest.mark.parametrize('mode', ['per_loop', 'last_loop'])
 def test_a_cached_step_runs_its_later_passes_as_one_body(mode):
@@ -289,6 +294,7 @@ def test_a_cached_step_runs_its_later_passes_as_one_body(mode):
     assert (four, eight) == (3 - kept, 7 - kept) and body == deep
 
 
+@attending("xla")
 @pytest.mark.compiles_at_run(reason="what each pass sows against its predecessors', no check-1 site")
 @pytest.mark.parametrize('mode, loops', [('per_loop', 4), ('last_loop', 4)])
 def test_what_each_scanned_pass_sows_extends_what_the_passes_before_it_sowed(mode, loops):
@@ -329,15 +335,16 @@ def test_what_each_scanned_pass_sows_extends_what_the_passes_before_it_sowed(mod
     assert longer and set(four) <= set(five)
 
 
-@pytest.mark.parametrize('attention_impl', ['xla', 'reference'])
-def test_packed_documents_read_only_themselves_through_every_pass(attention_impl):
+@pytest.mark.parametrize('kernel', ['xla', 'reference'])
+def test_packed_documents_read_only_themselves_through_every_pass(kernel):
     """Rows of two and three documents, each restarting its positions, give each document the
     logits vLLM computes of it alone, within the rule: no pass of the loop, nor the input its
     passes reinject, reads another document, and the window of 5 crosses a document's start in
     every row."""
-    loaded = load(attention_impl=attention_impl)
+    loaded = load()
     positions, segments = REFERENCE['packed_positions'], REFERENCE['packed_segments']
 
+    @attending(kernel)
     def packed(ids):
         return loaded.model.apply(loaded.variables, ids, positions=positions, segment_ids=segments)
 
@@ -364,6 +371,7 @@ def ragged_prompts() -> list[list[int]]:
     return [row[:length].tolist() for row, length in rows]
 
 
+@attending("xla")
 @pytest.mark.compiles_at_run(reason="decoded tokens side by side against alone, no check-1 site")
 @pytest.mark.parametrize('mode', ['per_loop', 'last_loop'])
 def test_prompts_of_two_lengths_decode_side_by_side_as_each_does_alone(mode):
@@ -379,10 +387,11 @@ def test_prompts_of_two_lengths_decode_side_by_side_as_each_does_alone(mode):
     np.testing.assert_array_equal(generated.tokens[:, generated.prompt_width:], REFERENCE[f'ragged_{mode}'])
 
 
+@attending("xla")
 @pytest.mark.parametrize(('mode', 'options'), [
     ('per_loop', {}),
-    ('per_loop', {'kv_cache': KVCache(page_size=4, pages=40), 'chunk': 2, 'prefix_cache': True}),
-    ('last_loop', {}), ('last_loop', {'kv_cache': KVCache(page_size=4, pages=40)})],
+    ('per_loop', {'cache': PagedKV(page_size=4, pages=40, prefix_cache=True), 'chunk': 2}),
+    ('last_loop', {}), ('last_loop', {'cache': PagedKV(page_size=4, pages=40)})],
     ids=['per_loop-dense', 'per_loop-paged-chunked-prefix', 'last_loop-dense', 'last_loop-paged'])
 @pytest.mark.compiles_at_run(reason="a server's tokens against the reference's continuation, no check-1 site")
 def test_a_server_draws_each_prompt_as_the_reference_continues_it(mode, options):
@@ -399,9 +408,10 @@ def test_a_server_draws_each_prompt_as_the_reference_continues_it(mode, options)
     for ticket, continuation in zip(tickets, expected, strict=True):
         served = ticket.result().host()
         np.testing.assert_array_equal(served.tokens[0, served.prompt_width:], continuation)
-    assert (server.prefix_hits > 0) == bool(options.get('prefix_cache'))
+    assert (server.prefix_hits > 0) == ('cache' in options and bool(options['cache'].prefix_cache))
 
 
+@attending("xla")
 @pytest.mark.parametrize('change', [
     {'n_recurrent_loops': 1}, {'n_input_layers': 1, 'n_recurrent_layers': 1, 'n_output_layers': 6}],
     ids=['one-pass', 'mlp-block'])
@@ -411,10 +421,10 @@ def test_a_shared_cache_no_pass_rewrites_serves_prompts_in_pieces(tmp_path, chan
     which keep no cache, takes its prompts in pieces of two and reuses a cached prefix: each prompt
     served continues as the model alone continues it."""
     shared = changed(tmp_path / 'changed', {**change, 'recurrent_kv_cache_mode': 'last_loop'})
-    loaded = Pretrained.load(shared, dtype='float32', attention_impl='xla')
+    loaded = Pretrained.load(shared, dtype='float32')
     task = TextGeneration(loaded.model, loaded.variables, sampling=Sampling(temperature=0.0))
-    server = Server.from_task(task, slots=2, capacity=32, kv_cache=KVCache(page_size=4, pages=40), chunk=2,
-                              prefix_cache=True)
+    server = Server.from_task(task, slots=2, capacity=32,
+                              cache=PagedKV(page_size=4, pages=40, prefix_cache=True), chunk=2)
     prompts = [*ragged_prompts(), ragged_prompts()[1]]
     tickets = [server.submit(prompt, 6, key=index) for index, prompt in enumerate(prompts)]
     server.run()
@@ -425,8 +435,9 @@ def test_a_shared_cache_no_pass_rewrites_serves_prompts_in_pieces(tmp_path, chan
     assert server.prefix_hits > 0
 
 
+@attending("xla")
 @pytest.mark.parametrize('options', [
-    {'chunk': 2}, {'kv_cache': KVCache(page_size=4, pages=40), 'prefix_cache': True}],
+    {'chunk': 2}, {'cache': PagedKV(page_size=4, pages=40, prefix_cache=True)}],
     ids=['chunked', 'prefix'])
 def test_a_shared_loop_cache_takes_each_prompt_whole(options):
     """A last-loop cache holds the last pass's keys of every token before a call, so a prompt's
@@ -442,6 +453,7 @@ DORY_GRADIENT_SEEDS = {'trained': 32, 'truncated': 32}
 every checkpoint tensor, through every pass or through the last pass alone."""
 
 
+@attending("xla")
 @pytest.mark.parametrize(('name', 'loops', 'backprop_steps'), [('trained', 2, None), ('truncated', 3, 1)])
 def test_the_gradient_of_each_tensor_is_the_references(name, loops, backprop_steps):
     """The gradient of a loss over the logits in every tensor the checkpoint holds, its projections,
@@ -508,6 +520,7 @@ def test_a_step_computes_in_the_widest_of_its_operands():
             assert traced.out_avals[0].dtype == np.float32
 
 
+@attending("xla")
 @pytest.mark.compiles_at_run(
     reason="float64 logits and gradients against the transcription's float64, no check-1 site")
 def test_a_float64_model_computes_in_float64():
@@ -539,6 +552,7 @@ def test_a_float64_model_computes_in_float64():
                                    roundings=backward)
 
 
+@attending("xla")
 @pytest.mark.compiles_at_run(reason="which gradients a cut loop moves, no check-1 site")
 def test_a_cut_loop_trains_the_layers_before_it_through_the_input_every_pass_reads():
     """Cutting the loop before its last pass moves no forward value and no gradient past the
@@ -571,6 +585,7 @@ def test_a_cut_loop_trains_the_layers_before_it_through_the_input_every_pass_rea
                               uncut['layers_1']['self_attn']['down_proj']['kernel'])
 
 
+@attending("xla")
 def test_a_cut_loops_backward_memory_falls_with_its_backprop_steps():
     """The cut is static (`backprop_steps`): at six passes the gradient's compiled program keeps no
     residual of a pass before the cut, so its temporary bytes fall as the passes it trains through do,
@@ -654,6 +669,7 @@ sized apart, the reference compared with itself: sized by `seeds_for` on armada'
 eg-sized2 at 0aed05577f7), where each run sized it again."""
 
 
+@attending("xla")
 def test_a_lora_on_every_projection_trains_resumes_saves_and_merges(tmp_path):
     """A rank-2 adapter on all eight projections of every layer, the attention's output gate
     (`g_proj`) apart from the feed-forward's `gate_proj`: one step moves every B factor, so the
@@ -714,7 +730,7 @@ def test_a_lora_on_every_projection_trains_resumes_saves_and_merges(tmp_path):
     assert_as_exact(adapted_logits, peft_logits(torch.float32), draw, 'the adapter as PEFT merges it',
                     seeds=PEFT_MERGED_SEEDS, truth_fn=peft_logits(torch.float64))
     adapted.save(tmp_path / 'merged', variables=resumed)
-    merged = Pretrained.load(tmp_path / 'merged', dtype='float32', attention_impl='xla')
+    merged = Pretrained.load(tmp_path / 'merged', dtype='float32')
     # Merging folds each adapter into its projection's weight, a rounding of its own: the merged
     # model's logits are on par with the adapted model's over drawn ids, both from the adapted
     # model's float64 forward (check 1).
@@ -734,6 +750,7 @@ EXAMPLES = [Example(state, {'team': INTENT}, {'team': label})
                                  ('double charge', 'billing'), ('cannot log in', 'technical'))]
 
 
+@attending("xla")
 def test_dorys_vocabulary_rows_contracted_with_its_final_states_give_its_logits():
     """The rows a joint schema head's lexical prior gathers (`output_table`): the head's matrix rows
     times each token's logit gain, which contracted with the final states give Dory's logits."""
@@ -746,6 +763,7 @@ def test_dorys_vocabulary_rows_contracted_with_its_final_states_give_its_logits(
     assert_logits_as_vllms(contracted, loaded, "Dory's vocabulary rows", stream=0xD05)
 
 
+@attending("xla")
 @pytest.mark.check1_shards(seeds=128, per_task=32)
 def test_a_joint_decision_head_reads_dorys_vocabulary_rows_and_trains(tmp_path, request):
     """The joint schema head over Dory's vocabulary rows (`output_table`), over the release's own
@@ -824,6 +842,7 @@ def test_the_released_config_round_trips_through_dews_fields():
     assert hf_decoders.translate_config(written) == fields
 
 
+@attending("xla")
 @pytest.mark.parametrize('change', [
     {'tie_word_embeddings': True}, {'mlp_bias': True}, {'n_input_layers': 1},
     {'recurrent_kv_cache_mode': 'each'}, {'initializer_range': 0.0},
@@ -839,9 +858,10 @@ def test_a_config_dory_refuses_is_refused(tmp_path, change):
     cover the layers, a layer kind it does not run, no loop, a tied head, biases, an unknown cache
     mode, a zero initializer range and a rope it does not compute."""
     with pytest.raises(ValueError):
-        Pretrained.load(changed(tmp_path / 'changed', change), dtype='float32', attention_impl='xla')
+        Pretrained.load(changed(tmp_path / 'changed', change), dtype='float32')
 
 
+@attending("xla")
 @pytest.mark.parametrize('variant', sorted(TOOL.VARIANTS))
 def test_a_config_the_release_does_not_take_computes_vllms_logits(tmp_path, variant):
     """Configs DoryConfig accepts over the tiny tensors that the release does not take: a partial
@@ -849,8 +869,7 @@ def test_a_config_the_release_does_not_take_computes_vllms_logits(tmp_path, vari
     or gate logit scale of zero, whose gains start without dividing by it, a loop whose block
     starts at an MLP and ends at an attention, and a loop over no layer."""
     with ahead_on_the_host():
-        loaded = Pretrained.load(changed(tmp_path / variant, TOOL.VARIANTS[variant]), dtype='float32',
-                                 attention_impl='xla')
+        loaded = Pretrained.load(changed(tmp_path / variant, TOOL.VARIANTS[variant]), dtype='float32')
 
     def logits(ids):
         return loaded.model.apply(loaded.variables, ids)
@@ -858,26 +877,27 @@ def test_a_config_the_release_does_not_take_computes_vllms_logits(tmp_path, vari
     assert_logits_as_vllms(logits, loaded, f'Dory logits, {variant}', stream=0xD06)
 
 
+@attending("xla")
 @pytest.mark.compiles_at_run(reason="a reload bit for bit, no check-1 site")
 def test_a_dory_written_from_dew_alone_reloads_as_itself(tmp_path):
     """A Dory written from the model and its variables alone (`PretrainedDecoder.from_model`), not
     through the source's bindings, states DoryConfig's own fields, one rope record per attention
     kind and its partial rotary included, under the released tensor names, and reloads to the same
     logits. A model Dory does not compute, nGPT with no reinjecting loop, is refused."""
-    loaded = Pretrained.load(changed(tmp_path / 'source', TOOL.VARIANTS['partial_rotary']), dtype='float32',
-                             attention_impl='xla')
+    loaded = Pretrained.load(changed(tmp_path / 'source', TOOL.VARIANTS['partial_rotary']), dtype='float32')
     PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path / 'written')
     config = json.loads((tmp_path / 'written' / 'config.json').read_text())
     assert config['rope_parameters'] == TOOL.VARIANTS['partial_rotary']['rope_parameters']
     assert 'rope_theta' not in config and 'rope_local_base_freq' not in config
     assert sorted(load_shards(tmp_path / 'written')) == sorted(load_shards(TINY))
-    again = Pretrained.load(tmp_path / 'written', dtype='float32', attention_impl='xla')
+    again = Pretrained.load(tmp_path / 'written', dtype='float32')
     np.testing.assert_array_equal(again.model.apply(again.variables, REFERENCE['input_ids']),
                                   loaded.model.apply(loaded.variables, REFERENCE['input_ids']))
     with pytest.raises(ValueError):
         PretrainedDecoder.from_model(loaded.model.clone(loop=None), loaded.variables)
 
 
+@attending("xla")
 @pytest.mark.compiles_at_run(reason="refusals, no check-1 site")
 def test_what_ngpts_arithmetic_does_not_reach_is_refused():
     """nGPT's arithmetic lives in the attention and the dense gated feed-forward, in a block's
@@ -895,6 +915,7 @@ def test_what_ngpts_arithmetic_does_not_reach_is_refused():
             model.clone(**refused).init(jax.random.key(0), ids)
 
 
+@attending("xla")
 def test_the_releases_tokenizer_loads_with_the_checkpoint():
     """The tiny Dory ships a tokenizer as the release does, under a model type transformers does
     not register, whose 'mlp' layer types its untyped config would refuse; it loads with the
@@ -908,11 +929,12 @@ def test_the_releases_tokenizer_loads_with_the_checkpoint():
         str(TINY / 'tokenizer.json')).encode(text).ids
 
 
+@attending("reference")
 @pytest.mark.compiles_at_run(reason="a reload bit for bit, no check-1 site")
 def test_a_saved_checkpoint_reloads_bit_for_bit(tmp_path):
     """A loaded Dory saves its config and tensors as the released checkpoint names them, and the
     saved checkpoint rebuilds the same model and tensors."""
-    loaded = Pretrained.load(TINY, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(TINY, dtype='float32')
     loaded.save(tmp_path)
     assert_same_stored_tensors(load_shards(tmp_path), load_shards(TINY))
     assert json.loads((tmp_path / 'config.json').read_text())['model_type'] == 'dory'
@@ -1041,6 +1063,7 @@ def assert_decodes_as_recorded(stored, site: str, model: CausalTransformer, weig
     assert_as_exact(as_given(dew), reference, drawn, label, seeds=seeds, truth_fn=recorded_truth)
 
 
+@attending("xla")
 def test_the_release_qualification_holds_dew_to_a_reference_kept_as_row_distances():
     """The release test's path on the tiny Dory, both caches: the transcription in fp32 under each of the
     release recorder's orders, kept as each row's distance from its float64 run alone, as the release's

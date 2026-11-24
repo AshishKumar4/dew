@@ -27,7 +27,6 @@
     "ssm_attention_ratio": "3:1",
     "bidirectional_ssm": true,
     "use_2d_fusion": true,
-    "attention_impl": "auto",
     "dtype": "float32"
    }
   },

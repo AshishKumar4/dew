@@ -15,6 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from model_support import attending
 from run_kinds import (
     TINY_LAYA,
     cli_settings,
@@ -109,6 +110,7 @@ def test_a_saved_run_scores_a_split_at_its_own_cadence_and_writes_its_local_tier
     assert min(scalars(runs / "other")) == 1
 
 
+@attending("reference")
 def test_dew_export_reads_the_step_a_ranking_chose(tmp_path):
     """`dew export --step best` exports the step the run's ranking kept best, not its latest (row
     2242): ranked by the highest validation perplexity, which the first of three steps scores
@@ -125,7 +127,7 @@ def test_dew_export_reads_the_step_a_ranking_chose(tmp_path):
     assert main(["export", str(run), str(exported), "--step", "best"]) == 0
     checkpoints, best = Checkpoints(str(run)), 1
     assert checkpoints.latest == 3
-    loaded = Pretrained.load(str(exported), dtype="float32", attention_impl="reference").variables["params"]
+    loaded = Pretrained.load(str(exported), dtype="float32").variables["params"]
     assert_tree_equal(loaded, checkpoints.variables(step=best)["params"])
 
 
@@ -379,6 +381,7 @@ def test_a_run_saved_with_its_attention_form_reads_as_the_precision_it_named(tmp
         RunConfig.read(written)
 
 
+@attending("reference")
 @pytest.mark.mesh(devices=8)
 def test_a_runs_numerics_are_named_on_the_command_line_in_its_record_and_at_a_load(tmp_path):
     """A run's numerics are reachable by name (ledger 2500, review row 2589): `dew train --set
@@ -400,7 +403,7 @@ def test_a_runs_numerics_are_named_on_the_command_line_in_its_record_and_at_a_lo
         written["fields"]["trainer"] = {**written["fields"]["trainer"], "precision": name}
         assert RunConfig.read(written).trainer.precision == numerics
     llama = Path(__file__).parent / "fixtures" / "hf" / "llama-tiny"
-    loaded = Pretrained.load(llama, precision="accurate", attention_impl="reference")
+    loaded = Pretrained.load(llama, precision="accurate")
     assert loaded.model.dtype == jnp.float32 and loaded.numerics == ACCURATE
     assert loaded.pipeline().precision == ACCURATE and loaded.text_generation().precision == ACCURATE
     with pytest.raises(ValueError):

@@ -195,11 +195,15 @@ def test_an_episode_schedulers_cohort_draws_what_its_policy_draws_whole(kind, se
 
     model = MODELS[kind]().with_kv_cache(KVCache(page_size=PAGE))
     # Every token but the pad ends a turn, so each episode runs its turns and its contexts grow past pages.
+    # The collector's policy runs over its task's (`Sampling.with_defaults_of`): a task searching beams keeps
+    # its search where the collector's names none, and the cohort's layout is laid for it (Train 1208's review
+    # F1: the task's strategy was dropped, its turns sampled over pages).
     sampling = replace(GREEDY if searched else SAMPLED, eos_token_ids=tuple(range(1, VOCAB)))
     initialized = jax.jit(model.init)
     for seed in range(4):
         variables = nn.unbox(initialized(jax.random.key(seed), jnp.ones((1, 2), jnp.int32)))
-        policy = TextGeneration(model, variables, **({"strategy": Beam(width=2)} if searched else {}))
+        policy = TextGeneration(model, variables,
+                                sampling=Sampling(strategy=Beam(width=2) if searched else None))
         acquisition = RolloutScheduler.episodes(
             policy, conversations, lambda episode: 1.0,
             objective=GRPOObjective(model, seq_len=PROMPT + RESPONSE), max_prompt_tokens=PROMPT,
@@ -248,6 +252,28 @@ def test_an_episode_schedulers_cohort_over_a_model_declaring_no_pages_is_served_
             np.testing.assert_array_equal(scheduled[name], drawn[name], err_msg=name)
 
 
+def test_a_served_cohort_under_its_tasks_inherited_controls_draws_what_its_whole_cohort_draws():
+    """A served cohort whose task binds controls the collector's sampling leaves at their defaults (its
+    stopping, `MaxNewTokens(2)`) draws under the policy the two make (`EpisodeCollector._effective`), its
+    server made with it and its turns held to it, what the cohort drawing each turn whole draws, every
+    episode recording that policy; where the server was held to the collector's own and refused the
+    cohort's first turn (the API02 review)."""
+    from dew.sampling.decoding import MaxNewTokens
+
+    model = attention_model()
+    variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
+    bound = Sampling(stopping=(MaxNewTokens(2),))
+    policy = TextGeneration(model, variables, sampling=bound)
+    served, whole = (EpisodeCollector(policy, conversations, lambda episode: 1.0, PROMPT, RESPONSE, TURNS,
+                                      sampling=GREEDY, **changes)
+                     for changes in ({"kv_cache": KVCache(page_size=2)}, {}))
+    drawn = collected(served, variables)
+    np.testing.assert_array_equal(drawn["tokens"], collected(whole, variables)["tokens"])
+    assert (drawn["tokens"] >= 0).sum(axis=1).max() == 2
+    episodes = served.episodes(Snapshot(variables, 0, 0, jax.random.key(23)), [Task("31")], GROUPS)
+    assert {episode.sampling for episode in episodes} == {GREEDY.with_defaults_of(bound)}
+
+
 def test_a_served_row_whose_context_does_not_continue_its_last_turn_is_prefilled_whole(caplog):
     """A served cohort's row whose next context does not begin with the history its last turn left (a
     context the environment rewrote) is prefilled whole, its draws the policy's whole draws, and says so: a
@@ -257,7 +283,7 @@ def test_a_served_row_whose_context_does_not_continue_its_last_turn_is_prefilled
     model = attention_model()
     variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     turns = _ServedTurns.over(TextGeneration(model, variables), collector(
-        model, variables, GREEDY, kv_cache=KVCache(page_size=2)), rows=2)
+        model, variables, GREEDY, kv_cache=KVCache(page_size=2)), GREEDY, rows=2)
     policy = TextGeneration(model, variables)
 
     def laid(contexts):

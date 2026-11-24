@@ -106,8 +106,10 @@ def test_the_label_terms_hold_every_order(edge):
 @pytest.mark.parametrize(("edge", "head"), [
     pytest.param("normal", "whole", id="normal-whole",
                  marks=pytest.mark.check1_shards(seeds=512, per_task=256)),
-    pytest.param("normal", "tiled", id="normal-tiled"),
-    pytest.param("normal", "fused", id="normal-fused"),
+    pytest.param("normal", "tiled", id="normal-tiled",
+                 marks=pytest.mark.check1_shards(seeds=512, per_task=128)),
+    pytest.param("normal", "fused", id="normal-fused",
+                 marks=pytest.mark.check1_shards(seeds=512, per_task=256)),
     pytest.param("near the largest", "whole", id="near the largest-whole"),
     pytest.param("near the largest", "tiled", id="near the largest-tiled"),
     pytest.param("near the largest", "fused", id="near the largest-fused"),
@@ -120,9 +122,10 @@ def test_the_lm_heads_hold_every_order_of_their_gradient(head, edge, request):
     head's per-token cross entropy and log partition of `hidden @ table.T`, whole, in tiles, or summed with
     its gradient taken in the forward. Every order, their own forward derivatives among them (a tangent that
     transposes to the hand-written backward, row 2690), finite wherever float64 is a normal float32 and
-    the plain formula, the whole logits' log-softmax, is. The whole head's orders on training's mesh are
-    drawn by CI's map tasks at their largest sized count, 512 (its second orders' sizing), 256 a task:
-    sized in one process they took 132 s alone and 300 s packed (row 8429)."""
+    the plain formula, the whole logits' log-softmax, is. Each head's orders on training's mesh are drawn by
+    CI's map tasks at their largest sized count, 512 (its second orders' sizing), 256 a task, the tiled
+    head's 128: sized in one process the whole head's took 132 s alone and 300 s packed (row 8429), the
+    tiled's 176 s and the fused's 106 s alone (row 10523), the tiled's 134 s a task of 256."""
     targets = jnp.asarray([[0, 3, 10, 2], [7, 1, 4, 9]], jnp.int32)
     weights = jnp.ones(targets.shape, jnp.float32)
 

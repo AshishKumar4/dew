@@ -77,7 +77,7 @@ Dew runs LLaDA and Dream through this masked-token path, starting from their rel
 ```python
 from dew.interop import PretrainedMaskedDecoder
 
-llada = PretrainedMaskedDecoder.load(fixtures / "llada-tiny", dtype=jnp.float32, attention_impl="xla")
+llada = PretrainedMaskedDecoder.load(fixtures / "llada-tiny", dtype=jnp.float32)
 masked_task = llada.text_generation()
 result = masked_task([[1, 2, 3]], 8, key=7, steps=16, n=2)
 print(result.host().tokens)
@@ -107,15 +107,14 @@ from tempfile import TemporaryDirectory
 
 from dew.interop import PretrainedBlockDecoder
 
-gemma = PretrainedBlockDecoder.load(fixtures / "diffusion-gemma-workflow", dtype=jnp.float32,
-                                    attention_impl="xla", max_seq_len=32)
+gemma = PretrainedBlockDecoder.load(fixtures / "diffusion-gemma-workflow", dtype=jnp.float32, max_seq_len=32)
 prompt = gemma.processor(["<bos> t5 t7 t9 t11"])
 block_task = gemma.block_generation()
 generated = block_task(prompt, 7, key=jax.random.key(11))
 print(block_task.decode(generated))
 with TemporaryDirectory() as checkpoint:
     gemma.save(checkpoint)
-    restored = PretrainedBlockDecoder.load(checkpoint, dtype=jnp.float32, attention_impl="xla",
+    restored = PretrainedBlockDecoder.load(checkpoint, dtype=jnp.float32,
                                            max_seq_len=32)
     replay = restored.block_generation()(prompt, 7, key=jax.random.key(11))
     np.testing.assert_array_equal(replay.tokens, generated.tokens)
@@ -140,7 +139,7 @@ from dew.objectives.diffusion import BlockDiffusionObjective
 from dew.data.dataset import Loader
 
 sft_source = fixtures / "diffusion-gemma-sft"
-sft_bundle = PretrainedBlockDecoder.load(sft_source, dtype=jnp.float32, attention_impl="xla", max_seq_len=32)
+sft_bundle = PretrainedBlockDecoder.load(sft_source, dtype=jnp.float32, max_seq_len=32)
 with np.load(sft_source / "reference.npz") as reference:
     train_tokens = np.tile(reference["tokens"], (jax.device_count(), 1))
 block_data = Loader(train=lambda partition: iter([{"text": train_tokens}]), val=None,

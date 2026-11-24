@@ -15,7 +15,7 @@ from arm_arithmetic import float64_held
 from attention_oracle import attention_on_par, exact_attention, float64_weights
 from contract_support import normal_drawn
 from generation_support import COMPILES_ON_CPU, here, interprets
-from model_support import as_stepped
+from model_support import as_stepped, attending
 from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, assert_fp32_reduction_bound
 from scenario_contract import covering
 from sharded import assert_runs_per_shard
@@ -441,6 +441,7 @@ def test_a_grouped_query_attends_as_its_heads_do_alone(implementation):
                     alone, draw, f"grouped {implementation}", seeds=GROUPED_SEEDS)
 
 
+@attending("xla")
 @pytest.mark.parametrize("generation", ["sm80", "sm90"])
 def test_a_windowed_layers_decode_step_reads_its_window_through_the_decode_kernel(generation):
     """A causal transformer whose layers slide a window of 16 keys over a 64-slot cache, its decode
@@ -451,7 +452,7 @@ def test_a_windowed_layers_decode_step_reads_its_window_through_the_decode_kerne
 
     model = CausalTransformer(vocab_size=64, num_layers=2, emb_features=64, num_heads=4, num_kv_heads=2,
                               max_seq_len=64, layer_types=("sliding_attention",) * 2,
-                              kinds={"sliding_attention": {"window": 16}}, attention_impl="xla",
+                              kinds={"sliding_attention": {"window": 16}},
                               dtype=jnp.bfloat16)
     tokens = jnp.zeros((2, 1), jnp.int32)
     variables = jax.eval_shape(lambda: model.init(jax.random.key(0), tokens))
@@ -470,6 +471,7 @@ WINDOWED_DECODE_SEEDS = 8
 """A windowed decode's declared check-1 seeds against its whole passes, sized by `seeds_for` paired."""
 
 
+@attending("xla")
 def test_a_windowed_decode_step_attends_as_its_whole_pass():
     """A windowed layer's decode, its keys from each row's first under a window of 5 over a 64-slot
     cache at widths the decode kernel takes (heads 16 wide), gives what its whole passes give at each
@@ -480,7 +482,7 @@ def test_a_windowed_decode_step_attends_as_its_whole_pass():
 
     model = CausalTransformer(vocab_size=64, num_layers=2, emb_features=64, num_heads=4, num_kv_heads=2,
                               max_seq_len=64, layer_types=("sliding_attention",) * 2,
-                              kinds={"sliding_attention": {"window": 5}}, attention_impl="xla")
+                              kinds={"sliding_attention": {"window": 5}})
     variables = model.init(jax.random.key(0), jnp.zeros((2, 12), jnp.int32))
     forward = jax.jit(lambda held: model.apply(variables, held))
     cache = model.apply(variables, 2, method=CausalTransformer.init_cache, mutable=["cache"])[1]["cache"]
@@ -700,6 +702,7 @@ def attention_the_decode_kernel_takes_differentiates_as_the_folded_attention():
                     seeds=DECODE_DERIVATIVE_SEEDS, truth_fn=derivatives(exact))
 
 
+@attending("xla")
 @pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize("axes, rows, heads", [({"data": 2}, 2, 4), ({"tensor": 2}, 4, 2)],
                          ids=["rows", "heads"])
@@ -720,8 +723,7 @@ def test_a_decode_step_launches_the_decode_kernel_on_each_shard_of_its_mesh(axes
                             devices=jax.devices()[:math.prod(axes.values())])
     mesh = gpu_mesh(devices, "sm80")
     model = CausalTransformer(vocab_size=32, emb_features=64, num_layers=1, num_heads=4, num_kv_heads=4,
-                              head_dim=64, mlp_features=64, max_seq_len=64, dtype="bfloat16",
-                              attention_impl="xla")
+                              head_dim=64, mlp_features=64, max_seq_len=64, dtype="bfloat16")
     tokens = jax.ShapeDtypeStruct((4, 1), jnp.int32)
     with assumed("sm80"):
         params = jax.eval_shape(model.init, jax.random.key(0), tokens)
@@ -973,9 +975,11 @@ def flash_reads_a_cache_calls_documents_as_exactly_as_jax_nn_reads_its_mask(with
     gradients on par with jax.nn's xla attention over the cache's mask over drawn inputs (check 1, the
     truth float64 attention over the mask), padding rows zero."""
 
-    positions, filled, mask = cache_call(window)
-    documents = cache_documents(positions, filled)
-    real = jnp.asarray(positions >= 0)[:, :, None, None]
+    # Formed on the host: a GPU tier part's prepare runs this cell where its device computes nothing.
+    with jax.default_device(jax.devices("cpu")[0]):
+        positions, filled, mask = cache_call(window)
+        documents = cache_documents(positions, filled)
+        real = jnp.asarray(positions >= 0)[:, :, None, None]
 
     def draw(seed):
         rng = np.random.default_rng([8, seed])

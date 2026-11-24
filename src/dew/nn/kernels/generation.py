@@ -225,6 +225,10 @@ class Choice(enum.StrEnum):
     GEMM_EPILOGUE = 'gemm_epilogue'
     GEMM_PROLOGUE = 'gemm_prologue'
     GROUPED_MATMUL = 'grouped_matmul'
+    LAYER_SCAN = 'layer_scan'
+    """How a decoder's stack compiles, decided without a selector (`dew.nn.backbones.decoder_stages.scanned`):
+    "scanned" runs each run of like layers and each period's repeats under one scanned body; "plain", the
+    default until row 4074 makes the scan it, runs every layer unrolled."""
     LOW_RANK = 'low_rank'
     MXFP8 = 'mxfp8'
     NARROW_COPIES = 'narrow_copies'
@@ -244,7 +248,8 @@ class Choice(enum.StrEnum):
 CHOICES = frozenset(choice.value for choice in Choice)
 """The choices' names (`Choice`), those `chosen` may name (`dew.kernels.choices`)."""
 
-SITE_KERNELS: dict[Choice, frozenset[str]] = {Choice.NARROW_COPIES: frozenset({'on', 'off'})}
+SITE_KERNELS: dict[Choice, frozenset[str]] = {Choice.NARROW_COPIES: frozenset({'on', 'off'}),
+                                               Choice.LAYER_SCAN: frozenset({'plain', 'scanned'})}
 """The kernels of each choice a site decides without a selector (`chosen_kernel`), which `chosen` names
 among: a selector's are its op's own, which its selection refuses a name outside of (`selection.select`);
 one of these a site reads by name alone, a misspelt name read as not its kernel (`narrow_copies="of"`,

@@ -7,6 +7,7 @@ where indexing the answered rows first compiled a program a count of them (a run
 sized validation splits compiled 1,999 programs before and 12 after)."""
 
 import numpy as np
+from model_support import attending
 
 from dew.artifacts import Decisions
 from dew.data import Memory
@@ -28,12 +29,13 @@ def asked(options: int, count: int) -> list[dict]:
     return [{"example": Example(f"state {index}", {"q": question}, {"q": "o0"})} for index in range(count)]
 
 
+@attending("xla")
 def test_every_validation_split_reads_in_its_trainings_shapes():
     """A run training on a question of 3 options and validating on splits of 2 and 7 reads every split's
     batch in one shape, its option width the widest any of them asks, as training's batch is: one
     forward program for all of them."""
     backbone = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2, mlp_features=48,
-                                 max_seq_len=128, attention_impl="xla")
+                                 max_seq_len=128)
     objective = DecisionObjective(backbone, tokenizer=ByteTokenizer(), specials=SPECIALS, layout=LAYOUT,
                                   shuffle_options=False)
 
@@ -59,6 +61,7 @@ def test_every_validation_split_reads_in_its_trainings_shapes():
     assert shapes["two"]["options"][-1] >= 7
 
 
+@attending("xla")
 def test_a_run_measures_its_widths_over_examples_it_reads_once_each():
     """A decision run over examples its read holds in memory, with no step that states their widths, has
     its objective measure them as it lays the examples out, over training and validation alike: the run
@@ -74,7 +77,7 @@ def test_a_run_measures_its_widths_over_examples_it_reads_once_each():
             return super().encode(text, add_special_tokens=add_special_tokens)
 
     backbone = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2, mlp_features=48,
-                                 max_seq_len=128, attention_impl="xla")
+                                 max_seq_len=128)
     objective = DecisionObjective(backbone, tokenizer=Counting(), specials=SPECIALS, layout=LAYOUT,
                                   shuffle_options=False)
 

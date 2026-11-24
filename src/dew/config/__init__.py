@@ -99,7 +99,6 @@ if TYPE_CHECKING:
     from _typeshed import DataclassInstance
 
     from dew.interop import Pretrained
-    from dew.nn.attention import AttentionImpl
     from dew.nn.cross_pass import CrossPass
     from dew.training.phase_passes import SampledPasses
     from dew.training.trainer import Trainer
@@ -610,11 +609,12 @@ class RunConfig:
     it trains, which the resume must keep (`check_resume`), and so does `trainer.quantization`, which
     changes the forward pass the weights train through."""
 
-    EXECUTED: ClassVar[tuple[str, ...]] = ("scan_layers", "loop_remat")
+    EXECUTED: ClassVar[tuple[str, ...]] = ("loop_remat",)
     """The model and source fields, by name, that say how a model's layers execute and not what they
-    compute or store: a decoder's runs under one scan or a layer at a time hold the same layers on disk
-    (`layers_N`) and compute the same step, so a run resumes under either (`check_resume`), as it does
-    with a looped block's passes recomputed in its backward or held (`loop_remat`), memory alone. A source's
+    compute or store: a looped block's passes recomputed in its backward or held (`loop_remat`), memory
+    alone, compute the same step, so a run resumes under either (`check_resume`). A model's own fields that
+    say how it runs, its recompute (`remat`) among them, are its class's to mark (`dew._records.RUNS`), which
+    a resume reads by its class (`registry.computing_fields`). A source's
     weights packed or decoded (`SourceOptions.packed_weights`) are not: packed, its banks are no trainable
     parameters and hold no optimizer moments, so a resume across them is refused by name."""
 
@@ -827,18 +827,10 @@ class RunConfig:
         return {**self.source.keywords(), **self.trainer.source_placement(frozen=frozen),
                 "param_dtype": stored}
 
-    def source_attention(self) -> "AttentionImpl":
-        """The attention implementation a run that starts from a source loads it with: its model's
-        `attention_impl` field, auto unless set, refused unless it names one (`AttentionImpl`). Every run
-        kind that loads a source reads it here."""
-        from dew.nn.attention import attention_implementation
-
-        return attention_implementation(str(self.model.fields.get("attention_impl", "auto")))
-
     def built_fresh(self) -> None:
         """Refuse `source` in a run whose model is built from `model`, loading no source: what it says
-        `Pretrained.load` builds of a source (`source_keywords`), how it scans its layers among it, reaches
-        nothing such a run builds, whose own fields say it (its model's `scan_layers`)."""
+        `Pretrained.load` builds of a source (`source_keywords`), reaches nothing such a run builds, whose
+        own fields say it."""
         if self.source != SourceOptions():
             raise ValueError(f"--source says what a run builds of the source it loads, and this "
                              f"{type(self).__name__} loads none: its model is built from --model, whose "

@@ -12,7 +12,7 @@ from saved_positions_support import named
 
 from dew.data import Memory, Phase, Steps
 from dew.data.compile import compile
-from dew.data.dataset import DataPartition, Loading
+from dew.data.dataset import Checkpointable, Closeable, DataPartition, Loading
 from dew.data.pipeline import Pipeline, mix
 
 
@@ -215,6 +215,87 @@ def test_a_position_another_grain_wrote_resumes_where_its_iterators_read_it():
     try:
         with pytest.raises(ValueError):
             stream.set_state(_edited(saved, unreadable))
+    finally:
+        stream.close()
+
+
+@dataclasses.dataclass(frozen=True)
+class Unopened(Memory):
+    """A store whose records refuse to open once `refused` holds the error (a store whose manifest a later
+    write left unreadable), an error of its own whatever position is restored."""
+
+    refused: list[ValueError] = dataclasses.field(default_factory=list, compare=False)
+
+    def records(self, read):
+        if self.refused:
+            raise self.refused[0]
+        return super().records(read)
+
+
+def test_a_position_another_grain_wrote_whose_read_fails_to_open_raises_that_failure():
+    """A position another Grain wrote is refused as that Grain's only where its iterators refuse its
+    state: a read that fails to open (its store's own error) raises that error, never a version's refusal
+    naming Grains that read alike (row 12178: every open's failure was refused as the other Grain's)."""
+    from dew.data.plan import PlanChanged
+
+    refused: list[ValueError] = []
+    chain = Pipeline(Unopened({"id": np.arange(1, 25, dtype=np.int32)}, identity="ids", refused=refused)
+                     ).repeat().batch(2)
+    saved, _ = _saved(chain)
+
+    def other_grain(decoded):
+        decoded["dew_data_plan"]["rules"]["grain"] = "0.0.1"
+
+    stream = compile(chain, read="streamed", loading=Loading(workers=0)).train(DataPartition())
+    assert isinstance(stream, Checkpointable) and isinstance(stream, Closeable)
+    unreadable = ValueError("the store's manifest is unreadable")
+    refused.append(unreadable)
+    try:
+        with pytest.raises(ValueError) as raised:
+            stream.set_state(_edited(saved, other_grain))
+        assert raised.value is unreadable and not isinstance(raised.value, PlanChanged), raised.value
+    finally:
+        stream.close()
+
+
+@pytest.mark.parametrize("lost", ["rows", "place"])
+def test_a_position_whose_own_cursor_holds_no_rows_is_refused_as_corrupt_never_restarted(lost):
+    """A saved position another Grain wrote whose own sequential cursor, Dew's, holds no `rows` or no
+    `place` is refused as corrupt (`MalformedPosition`), never taken for an earlier Dew's interleave nor as
+    the other Grain's (`PlanChanged`), which a relaxed resume would answer by reading the data afresh
+    (review of row 12178: every error the restore raised was taken as a version's, so a corrupt cursor
+    restarted a run's data; review of d21: a cursor without its place was read as an interleave's)."""
+    from dew import _position
+    from dew.data.plan import PlanChanged
+
+    chain = Pipeline(Memory({"id": np.arange(1, 25, dtype=np.int32)}, identity="ids")).repeat().batch(2)
+    saved, _ = _saved(chain)
+    cut = []
+
+    def corrupt(node):
+        if isinstance(node, dict):
+            if {"place", "rows"} <= node.keys():
+                del node[lost]
+                cut.append(node)
+            for value in list(node.values()):
+                corrupt(value)
+        elif isinstance(node, list):
+            for value in node:
+                corrupt(value)
+
+    def other_grain_corrupt(decoded):
+        decoded["dew_data_plan"]["rules"]["grain"] = "0.0.1"
+        corrupt(decoded)
+
+    edited = _edited(saved, other_grain_corrupt)
+    assert cut, "the saved position holds a sequential cursor"
+    stream = compile(chain, read="streamed", loading=Loading(workers=0)).train(DataPartition())
+    assert isinstance(stream, Checkpointable) and isinstance(stream, Closeable)
+    try:
+        with pytest.raises(ValueError) as raised:
+            stream.set_state(edited)
+        assert not isinstance(raised.value, PlanChanged), raised.value
+        assert isinstance(raised.value, _position.MalformedPosition), raised.value
     finally:
         stream.close()
 

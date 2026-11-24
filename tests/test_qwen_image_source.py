@@ -26,6 +26,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import extract_fixture
+from model_support import attending
 from qwen_image_draws import case_draw, pipeline_draw, prompts_of
 from recorded_runs import assert_arms_as_recorded
 from reference_error import (
@@ -73,7 +74,7 @@ def packed_of(value: jax.Array) -> jax.Array:
 def transformer_case(source, name: str):
     directory = source / name
     config = json.loads((directory / "transformer" / "config.json").read_text())
-    model = QwenImageTransformer(**qwen_image_fields(config, attention_impl="xla"))
+    model = QwenImageTransformer(**qwen_image_fields(config))
     params, layouts = read_transformer(component_tensors(directory, "transformer"), qwen_image_path)
     return model, params, layouts
 
@@ -123,6 +124,7 @@ def judged(site: str, draw, dew, truth=None, leaves=None):
                     truth_fn=held)
 
 
+@attending("xla")
 @pytest.mark.parametrize("name", CASES)
 def test_native_qwen_image_matches_the_source_forward_and_every_gradient(name, source, record):
     """The prediction, the latent's and the prompt's gradients and every parameter's, under each of the
@@ -134,6 +136,7 @@ def test_native_qwen_image_matches_the_source_forward_and_every_gradient(name, s
            jax.jit(qwen_walk(source, record, name, wide=True)))
 
 
+@attending("xla")
 def test_a_padded_row_is_its_own_prompt_alone(source, record):
     """Padding a row behind a longer prompt changes nothing it reads: the
     padded keys are excluded and its image sits after its own text. The
@@ -169,13 +172,12 @@ def cudnn_case():
     cuDNN takes, its pullback over a padded prompt `(dew, reference, truth, draw)`: cuDNN's, xla's, and
     the float64 twin's on xla, over latents, contexts and probes drawn by seed."""
     model = QwenImageTransformer(in_channels=4, out_channels=4, num_layers=2, heads=2, head_dim=64,
-                                 context_in_dim=16, axes_dims_rope=(16, 24, 24), dtype=jnp.bfloat16,
-                                 attention_impl="cudnn")
+                                 context_in_dim=16, axes_dims_rope=(16, 24, 24), dtype=jnp.bfloat16)
     mask = jnp.arange(25)[None] < jnp.asarray([[25], [13]])
     times = jnp.asarray([731.0, 42.0])
     # One program (row 6857): run op by op, the initializer compiled hundreds of small programs on the GPU the
     # cell holds.
-    params = jax.jit(model.init)(jax.random.PRNGKey(0), jnp.zeros((2, 4, 6, 4)), times,
+    params = attending("cudnn")(jax.jit(model.init))(jax.random.PRNGKey(0), jnp.zeros((2, 4, 6, 4)), times,
                                  DenoisingCondition(jnp.zeros((2, 25, 16)), mask=mask))["params"]
 
     @jax.jit
@@ -192,10 +194,10 @@ def cudnn_case():
             return [output, *jax.tree.leaves(vjp(probe.astype(output.dtype)))]
         return run
 
-    twin = model.clone(attention_impl="xla", dtype=jnp.float64)
-    return (pullback(model, params, jnp.float32),
-            pullback(model.clone(attention_impl="xla"), params, jnp.float32),
-            pullback(twin, widened(params), jnp.float64), draw)
+    twin = model.clone(dtype=jnp.float64)
+    return (attending("cudnn")(pullback(model, params, jnp.float32)),
+            attending("xla")(pullback(model, params, jnp.float32)),
+            attending("xla")(pullback(twin, widened(params), jnp.float64)), draw)
 
 
 def cudnn_attends_a_padded_batch_as_xla_does():
@@ -227,10 +229,11 @@ def test_every_declared_qwen_image_tensor_is_mapped(source):
 
 
 @pytest.fixture(scope="module")
+@attending("xla")
 def loaded(source):
     from dew.interop.pretrained import Pretrained
 
-    return Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla")
+    return Pretrained.load(str(source / "pipeline"), dtype="float32")
 
 
 def encoded(pipeline):
@@ -245,6 +248,7 @@ def encoded(pipeline):
     return encode
 
 
+@attending("xla")
 def test_published_qwen_image_prompt_encoding_matches_the_source_pipeline(loaded, record):
     """The conditioner composes what `encode_prompt` composes: the template,
     the last layer before the final norm, the system turn dropped. Each row
@@ -378,6 +382,7 @@ def pipeline_walked(pipeline, record, *, alone: bool = False):
     return walk
 
 
+@attending("xla")
 def test_published_qwen_image_pipeline_walk_matches_the_source(loaded, record):
     """`Pretrained.load().text_to_image()` reproduces the source's own call:
     its 40 default steps, no guidance, the sigmas its call lays out shifted
@@ -392,6 +397,7 @@ def test_published_qwen_image_pipeline_walk_matches_the_source(loaded, record):
     judged("pipeline walk", pipeline_draw(record), pipeline_walked(loaded, record))
 
 
+@attending("xla")
 def test_a_published_qwen_image_prompt_walked_alone_matches_the_source(loaded, record):
     """Each prompt walks alone, the call one image makes, which XLA compiles differently from the batch
     (see the one-row grid walk in test_samplers.py), on par with the source's call for it from float64
@@ -400,6 +406,7 @@ def test_a_published_qwen_image_prompt_walked_alone_matches_the_source(loaded, r
     judged("pipeline walk", pipeline_draw(record), pipeline_walked(loaded, record, alone=True))
 
 
+@attending("xla")
 def test_a_trained_qwen_image_step_exports_and_reloads(source, loaded, record, tmp_path):
     """A real flow-matching step over the published source, then a resume and
     an export.
@@ -442,7 +449,7 @@ def test_a_trained_qwen_image_step_exports_and_reloads(source, loaded, record, t
         assert written.keys() == published.keys()
         for name, tensor in published.items():
             np.testing.assert_array_equal(written[name], tensor)
-    again = Pretrained.load(str(export), dtype="float32", attention_impl="xla")
+    again = Pretrained.load(str(export), dtype="float32")
     rebuilt = QwenImageConditioner.from_pretrained(
         str(export), dtype="float32", **{key: value for key, value in
                                           again.inputs.conditions["conditioning"].encoder.recorded_fields().items()
@@ -505,6 +512,7 @@ def pipeline_arms(_):
     return export_arms(loaded, variables, EXPORT)
 
 
+@attending("xla")
 def test_diffusers_reads_a_qwen_image_export(tmp_path):
     """Qwen-Image 2.1's classes are Diffusers 6256aa76's, which this environment does not install, so their
     reading of an export is recorded (tools/qwen_image_export_reference.py): the committed pipeline with

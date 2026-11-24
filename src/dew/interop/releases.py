@@ -213,17 +213,25 @@ def bundle_plan(bundle: Pretrained, variables: Mapping[str, object] | None = Non
     source layout as the bundle writes it (`Pretrained.parts`, with the source's own modules a load ran),
     its processor's or tokenizer's files and generation config, and the record of the run behind it where
     it has one (`dew.interop.release.release_record`)."""
+    from dew.inference.tasks import TextSettings
     from dew.interop import sources
+    from dew.interop.generation_config import unconfigured
     from dew.interop.release import release_record
 
     values = bundle.variables if variables is None else variables
+    # A run's policy transformers' generation config holds no field of, which its reader would run without:
+    # refused before a file is written (`unconfigured`), the bundle itself serving it natively.
+    dropped = unconfigured(bundle.settings.sampling) if isinstance(bundle.settings, TextSettings) else []
+    if dropped:
+        raise ValueError(f"this run's policy holds {' and '.join(dropped)}, which transformers' generation "
+                         "config holds no field of: release a policy without it, or the run natively")
     # Either may refuse the bundle, each before a file is written.
     parts = bundle.parts(values)
     files = {} if bundle.code is None else sources.code_modules(bundle.code)
     assets = Assets(tokenizer=bundle.processor if bundle.tokenizer is None else bundle.tokenizer,
                     generation_config=dict(bundle.generation_config), named=bundle.names_tokenizer)
     envelope = (Release() if bundle.settings is None
-                else release_record(bundle.settings, bundle.numerics, bundle.model, values))
+                else release_record(bundle.settings, bundle.numerics, bundle.model, values, bundle.kernels))
     return ReleasePlan(Placed(parts, files), assets=assets, envelope=envelope)
 
 

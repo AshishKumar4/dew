@@ -36,6 +36,7 @@ import torch
 import transformers
 from interop_support import token_draw
 from jax.sharding import PartitionSpec as P
+from model_support import attending
 from reference_error import as_given, assert_as_exact, equations, torch_with_gradients, with_gradients
 
 from _dew_torch.precision import float64, float64_twin
@@ -442,7 +443,7 @@ def test_an_unregistered_causal_lm_loads_as_transformers_own_forward(tokens, tmp
     model = saved_cohere(tmp_path)
     with pytest.warns(TransformersTierWarning):
         loaded = Pretrained.load(tmp_path, dtype="float32")
-    assert loaded.model.graph.attention_impl == "auto"
+    assert loaded.model.graph.dew_attention
 
     dew_fn = loss_and_gradients(loaded, model, {name: jnp.asarray(leaf)
                                                 for name, leaf in loaded.variables["params"].items()})
@@ -478,7 +479,7 @@ def test_a_source_whose_probe_cannot_run_qualifies_on_its_full_config_and_runs_a
     model.save_pretrained(tmp_path)
     with pytest.warns(TransformersTierWarning):
         loaded = Pretrained.load(tmp_path, dtype="float32")
-    assert loaded.model.graph.attention_impl == "auto"
+    assert loaded.model.graph.dew_attention
     forward = jax.jit(lambda ids: loaded.model.apply(loaded.variables, ids))
     wide = float64_twin(model, lambda: transformers.BertLMHeadModel(config).to(torch.float64)).eval()
 
@@ -556,7 +557,7 @@ def test_a_packed_row_trains_each_document_as_transformers_runs_it_alone(family,
     model.save_pretrained(tmp_path)
     with pytest.warns(TransformersTierWarning):
         loaded = Pretrained.load(tmp_path, dtype="float32")
-    assert loaded.model.graph.attention_impl == "auto"
+    assert loaded.model.graph.dew_attention
     objective = LMObjective(loaded, seq_len=SEQ, ema_decay=None)
     names = [name for name, _ in model.named_parameters()]
 
@@ -679,25 +680,25 @@ def test_a_probe_whose_attention_logits_lie_far_apart_reads_its_causal_mask():
     assert admission.attends, admission.why
 
 
+@attending("reference")
 def test_a_type_whose_attention_asks_no_interface_runs_its_own_and_reads_no_packing(tmp_path):
     """OpenAI GPT's layers compute their attention in their own code, asking transformers' attention
     interface nothing: the torchax route, which a load asks for though the type has a family of its own,
-    runs that attention as transformers does, so it names no Dew kernel (`attention_impl`) and reads no
-    packed rows (`Lacks`)."""
+    runs that attention as transformers does, so it runs no Dew kernel (`TorchGraph.dew_attention`) and
+    reads no packed rows (`Lacks`)."""
     torch.manual_seed(0)
     config = transformers.OpenAIGPTConfig(n_embd=64, n_layer=2, n_head=4, vocab_size=TINY["vocab_size"],
                                           n_positions=64)
     transformers.OpenAIGPTLMHeadModel(config).save_pretrained(tmp_path)
     with pytest.warns(TransformersTierWarning):
         loaded = Pretrained.load(tmp_path, dtype="float32", fallback="torchax")
-    assert loaded.model.graph.attention_impl is None
+    assert not loaded.model.graph.dew_attention
     ids, segments, _, _ = packed_rows(0)
     with pytest.raises(Lacks):
         loaded.model.apply(loaded.variables, jnp.asarray(ids), segment_ids=jnp.asarray(segments),
                            method="logits")
-    # Refused before the load warns of its tier.
-    with pytest.raises(ValueError):
-        Pretrained.load(tmp_path, dtype="float32", fallback="torchax", attention_impl="reference")
+
+
 @pytest.mark.parametrize("route", ["tier 3", "fallback"])
 def test_a_load_without_weights_reads_none_and_states_their_shapes(route, tmp_path):
     """Without its weights a tier-3 source is built from its config alone, its weight files never read

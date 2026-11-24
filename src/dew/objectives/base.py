@@ -1307,6 +1307,11 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         return ()
 
+    def _updates_in_backward(self) -> bool:
+        """Whether each stacked layer run this objective's loss differentiates is differentiated once,
+        so its backward may update it in place (`dew.nn.in_backward`)."""
+        return True
+
     def stage_sites(self, store: Variables, stages: int) -> tuple[DecoderBank, ...]:
         """Where the runs a pipeline over `stages` stages stacks lie in `store`, the variables a
         stage-local state is made from: the trainer keeps each stacked by stage on the stage's own
@@ -2049,22 +2054,28 @@ class Objective(ABC, Generic[Loss, Effects]):
         """Return the model and task settings that let a saved step be rebuilt.
 
         It records the objective's import path, its `recorded_model`'s record,
-        `task_settings`, field by field, and the numerics the step trained under
-        (`generation.run_precision`), which a loaded task's calls trace under
-        (`dew.inference.tasks.InItsForm.traced`). An objective that declares no task
-        settings returns None; a custom research method can still restore its
-        raw state.
+        `task_settings`, field by field, the numerics the step trained under
+        (`generation.run_precision`) and the attention kernel it pinned, if any, which a
+        loaded task's calls trace under (`dew.inference.tasks.InItsForm.traced`). An
+        objective that declares no task settings returns None; a custom research method
+        can still restore its raw state.
         """
+        from dew import _cache
         from dew.nn.kernels import generation
         from dew.registry import ModelConfig, import_path, record_fields, to_record
 
         settings = self.task_settings()
         if settings is None:
             return None
+        # The attention kernel the run pins (`Diagnostics.kernels`, which `RunConfig.traced` names), where
+        # it pins one: a loaded task traces under it (`SavedRun.kernels`), an execution choice beside the
+        # model and objective, which a resume compares alone (the API02 review).
+        pinned = dict(_cache.KERNEL_CHOICES.value).get('attention', 'auto')
         return {'objective': import_path(type(self)),
                 'model': to_record(ModelConfig.from_model(self.recorded_model()), ModelConfig),
                 **record_fields(settings, type(settings)),
-                'precision': to_record(generation.numerics(), Numerics)}
+                'precision': to_record(generation.numerics(), Numerics),
+                **({} if pinned == 'auto' else {'kernels': {'attention': pinned}})}
 
     def build_task(self, variables: Variables, *,
                    processor: Processor | None | Omitted = OMITTED) -> Task | SavedTask:

@@ -22,6 +22,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import attending
 from reference_error import as_given, assert_as_exact, dew_path, widened, with_gradients
 
 from dew.lora import LoRA
@@ -84,7 +85,7 @@ def selection_draw(length, top_k, segments=None, cotangent=False, dtype=jnp.floa
     return draw
 
 
-def attending(length, rope=ROPE, **options):
+def selection_arms(length, rope=ROPE, **options):
     """The selection's two arms on a draw's operands and indices (`selection_draw`):
     `sparse_latent_attention` over the indices, under `options`, and the expanded reference under
     their mask."""
@@ -110,7 +111,7 @@ def test_the_selection_attends_as_the_masked_expanded_reference():
     smaller than k carries unselected slots, which read nothing. The block
     size of 5 splits 23 queries unevenly, so padding rides the last block."""
     length, top_k = 23, 6
-    sparse, dense = attending(length, block=5)
+    sparse, dense = selection_arms(length, block=5)
     assert_as_exact(_pulled(sparse), _pulled(dense), selection_draw(length, top_k, cotangent=True),
                     'selection', seeds=SEEDS['selection'])
 
@@ -122,7 +123,7 @@ def test_the_template_reads_the_selection_as_the_masked_expanded_reference():
     mask (check 1), exercising both batch page offsets and a query whose causal set is smaller than k
     reading its named slots alone (row 9023)."""
     length, top_k = 2, 2
-    sparse, dense = attending(length, rope=32)
+    sparse, dense = selection_arms(length, rope=32)
     with generation.assumed("sm80"), generation.chosen(sparse_attention="template"):
         assert_as_exact(_pulled(sparse), _pulled(dense),
                         selection_draw(length, top_k, cotangent=True, dtype=jnp.bfloat16, batch=2, rank=32,
@@ -153,11 +154,12 @@ def test_packed_documents_select_inside_their_own_document():
     def on_real(attend):
         return jax.jit(lambda *drawn: jnp.where((segments != 0)[..., None, None], attend(*drawn), 0))
 
-    sparse, dense = attending(length)
+    sparse, dense = selection_arms(length)
     assert_as_exact(on_real(sparse), on_real(dense), selection_draw(length, top_k, segments),
                     'packed selection', seeds=SEEDS['packed selection'])
 
 
+@attending("reference")
 def test_the_layer_runs_the_selection_and_matches_its_masked_kernel():
     """The V3.2 layer past its top-k takes the sparse path; an open `qk`
     collection sends the same call through the masked dense kernel, on par
@@ -165,7 +167,7 @@ def test_the_layer_runs_the_selection_and_matches_its_masked_kernel():
     layer = MultiHeadLatentAttention(
         emb_features=32, num_heads=HEADS, max_seq_len=64, q_lora_rank=16, kv_lora_rank=RANK,
         qk_nope_head_dim=NOPE, qk_rope_head_dim=ROPE, v_head_dim=VALUE,
-        index_topk=5, index_n_heads=2, index_head_dim=16, attention_impl="reference")
+        index_topk=5, index_n_heads=2, index_head_dim=16)
     variables = layer.init(jax.random.key(3), jnp.zeros((2, 21, 32)))
 
     def masked(variables, hidden):
@@ -181,6 +183,7 @@ def hidden_draw(seed):
     return (jax.random.normal(jax.random.fold_in(jax.random.key(2), seed), (2, 21, 32)),)
 
 
+@attending("reference")
 def test_an_adapter_dropping_out_kv_b_proj_keeps_the_masked_kernel():
     """LoRA dropout on kv_b_proj draws a mask per token and latent dimension.
     The absorbed path applies kv_b_proj to the identity, where the same draw
@@ -192,7 +195,7 @@ def test_an_adapter_dropping_out_kv_b_proj_keeps_the_masked_kernel():
     layer = MultiHeadLatentAttention(
         emb_features=32, num_heads=HEADS, max_seq_len=64, q_lora_rank=16, kv_lora_rank=RANK,
         qk_nope_head_dim=NOPE, qk_rope_head_dim=ROPE, v_head_dim=VALUE,
-        index_topk=5, index_n_heads=2, index_head_dim=16, attention_impl="reference")
+        index_topk=5, index_n_heads=2, index_head_dim=16)
     adapter = LoRA(rank=4, modules=("kv_b_proj",), alpha=8.0, dropout=np.float32(0.5)).apply(
         layer, layer.init(jax.random.key(3), jnp.zeros((2, 21, 32))), key=3)
     adapted, variables = adapter.model, adapter.variables
@@ -208,6 +211,7 @@ def test_an_adapter_dropping_out_kv_b_proj_keeps_the_masked_kernel():
                     seeds=SEEDS['dropped-out adapter'], truth_fn=partial(masked, widened(variables)))
 
 
+@attending("reference")
 @pytest.mark.parametrize("quantized", ["input", "frozen"])
 def test_a_quantized_kv_b_proj_keeps_the_masked_kernel(quantized):
     """A checkpoint's FP8 input scale at kv_b_proj, or a frozen FP8 product
@@ -218,7 +222,7 @@ def test_a_quantized_kv_b_proj_keeps_the_masked_kernel(quantized):
     layer = MultiHeadLatentAttention(
         emb_features=32, num_heads=HEADS, max_seq_len=64, q_lora_rank=16, kv_lora_rank=RANK,
         qk_nope_head_dim=NOPE, qk_rope_head_dim=ROPE, v_head_dim=VALUE,
-        index_topk=5, index_n_heads=2, index_head_dim=16, attention_impl="reference")
+        index_topk=5, index_n_heads=2, index_head_dim=16)
     hidden = jax.random.normal(jax.random.key(2), (2, 21, 32))
     variables = layer.init(jax.random.key(3), hidden)
     if quantized == "input":
@@ -248,7 +252,7 @@ def latent_layer() -> MultiHeadLatentAttention:
     return MultiHeadLatentAttention(
         emb_features=32, num_heads=HEADS, max_seq_len=64, q_lora_rank=16, kv_lora_rank=RANK,
         qk_nope_head_dim=NOPE, qk_rope_head_dim=ROPE, v_head_dim=VALUE,
-        index_topk=5, index_n_heads=2, index_head_dim=16, attention_impl="reference")
+        index_topk=5, index_n_heads=2, index_head_dim=16)
 
 
 def produced_shapes(jaxpr) -> set[tuple[int, ...]]:
@@ -264,6 +268,7 @@ def produced_shapes(jaxpr) -> set[tuple[int, ...]]:
     return shapes
 
 
+@attending("reference")
 @pytest.mark.parametrize("weight_only", [False, True], ids=["act", "weight"])
 def test_a_qwix_quantized_kv_b_proj_attends_as_its_latents_allow(weight_only):
     """Qwix's fake-quantized products at kv_b_proj (`dew.quantization.Quantization`). Quantizing their
@@ -293,6 +298,7 @@ def test_a_qwix_quantized_kv_b_proj_attends_as_its_latents_allow(weight_only):
                     truth_fn=as_given(lambda variables, hidden: masked(widened(variables), hidden)))
 
 
+@attending("reference")
 def test_a_provider_dew_did_not_configure_keeps_kv_b_proj_on_the_masked_kernel():
     """A model quantized through `quantize_with` by a provider of its caller's own, under the caller's
     opaque cache key (here 7), computes under no Dew quantization whose rules a layer can read, so MLA

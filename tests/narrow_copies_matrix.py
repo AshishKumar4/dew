@@ -34,11 +34,12 @@ from dew.nn.kernels import generation
 from dew.training import FitPolicy, UpdateBatch
 
 SEEDS = 8
-CHOICES = frozenset({"narrow_copies"})
-"""The `generation.CHOICES` entries the cells run: each cell names `narrow_copies` and nothing else."""
+CHOICES = frozenset({"narrow_copies", "layer_scan"})
+"""The `generation.CHOICES` entries the cells run: each cell names `narrow_copies`, and `layer_scan` by its
+form (`_stack`: a scanned stack's cells scan it, a plain one's run a layer at a time)."""
 KERNELS = {}
-"""The kernels the cells run under test, by name: none, as `narrow_copies` is no `selection.Op` but the
-step's own choice of where its weights are narrowed, which has no kernels to list."""
+"""The kernels the cells run under test, by name: none, as neither choice is a `selection.Op`: the step's own
+choices of where its weights are narrowed and how its stack compiles, which have no kernels to list."""
 ROWS, LENGTH, VOCAB = 16, 9, 64
 """A drawn batch's rows and their tokens, and the decoder's vocabulary: two microbatches' whole rows on each
 of the test mesh's eight row shards."""
@@ -47,6 +48,12 @@ WINDOWS = {"one": {}, "accumulated": {"update": UpdateBatch(batches=2)}, "split"
 one batch read in two parts."""
 STEPS = 2
 """Updates each run takes."""
+
+
+def _stack(form: str) -> str:
+    """How the case's decoder compiles its stack (`generation.Choice.LAYER_SCAN`): scanned where `form` is,
+    a layer at a time otherwise."""
+    return "scanned" if form == "scanned" else "plain"
 
 
 @functools.cache
@@ -59,7 +66,7 @@ def _objective(form: str, dtype: str):
     scanned = form == "scanned"
     model = CausalTransformer(vocab_size=VOCAB, emb_features=32, num_layers=4 if scanned else 2, num_heads=2,
                               num_kv_heads=1, mlp="swiglu", mlp_features=64, max_seq_len=16, qk_norm=True,
-                              tie_embeddings=True, dtype=jnp.dtype(dtype), scan_layers=scanned)
+                              tie_embeddings=True, dtype=jnp.dtype(dtype))
     return LMObjective(model, seq_len=LENGTH - 1, pad_id=0)
 
 
@@ -68,7 +75,7 @@ def _trainer(case: dict[str, str], copies: bool, dtype: str | None = None):
     case's where None)."""
     from dew.training import Trainer
 
-    with generation.chosen(narrow_copies="on" if copies else "off"):
+    with generation.chosen(narrow_copies="on" if copies else "off", layer_scan=_stack(case["form"])):
         trainer = Trainer(_objective(case["form"], dtype or case["dtype"]), optax.adamw(1e-2),
                           key=jax.random.key(0), **WINDOWS[case["window"]])
         return trainer, trainer.initial_state()
@@ -81,7 +88,7 @@ def _copied(dtype: str, form: str, window: str) -> frozenset[str]:
     case = {"dtype": dtype, "form": form, "window": window}
     trainer, state = _trainer(case, copies=True)
     batch = {TEXT_KEY: jnp.ones((ROWS, LENGTH), jnp.int32)}
-    with generation.chosen(narrow_copies="on"):
+    with generation.chosen(narrow_copies="on", layer_scan=_stack(form)):
         state, *_ = trainer.compile(state, batch)(jax.tree.map(jnp.copy, state), batch)
     return frozenset("/".join(str(key.key) for key in path[1:])
                      for path, _ in jax.tree_util.tree_flatten_with_path(state.compute or {})[0])
@@ -116,7 +123,7 @@ def _run(case: tuple[tuple[str, str], ...], copies: bool, dtype: str | None = No
         # The fp32 parameters and optimizer state the runs start from, widened: the truth's arithmetic.
         state = jax.tree.map(lambda leaf: leaf.astype(jnp.float64)
                              if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, state)
-    with generation.chosen(narrow_copies="on" if copies else "off"):
+    with generation.chosen(narrow_copies="on" if copies else "off", layer_scan=_stack(dict(case)["form"])):
         step = trainer.compile(state, {TEXT_KEY: jnp.zeros((ROWS, LENGTH), jnp.int32)})
 
     @as_given

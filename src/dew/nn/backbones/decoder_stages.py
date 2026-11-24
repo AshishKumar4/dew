@@ -33,6 +33,18 @@ from .layer_plan import run_period, scan_groups
 if TYPE_CHECKING:
     from .causal_transformer import CausalTransformer
 
+
+def scanned() -> bool:
+    """Whether a decoder's stack runs its like and periodic runs under the scan
+    (`generation.chosen(layer_scan="scanned")`, `Choice.LAYER_SCAN`) or every layer unrolled, the default
+    until the scanned path's open rows close (12076 to 12080; row 4074 then makes the scan the default:
+    Qwen3.5-4B's periodic stack lowers unrolled to 112k operations): how it compiles, by its structure alone,
+    never a model's field."""
+    from dew.nn.kernels.generation import Choice, chosen_kernel
+
+    return chosen_kernel(Choice.LAYER_SCAN, "plain") == "scanned"
+
+
 def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer_input,
           attention_metadata=None, span: tuple[int, int] | None = None, prior_bank=None):
     """Run the layer stack over `x` as the plain loop, as scanned runs, or as a pipeline over the stages.
@@ -44,7 +56,7 @@ def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer
 
     `init` draws like runs under the scan and then unstacks them, so the
     tree is the plain loop's; under a stage mesh or with `decode`, init
-    runs the plain loop. With `scan_layers` or a stage axis, the stack runs
+    runs the plain loop. Scanned (`scanned`) or over a stage axis, the stack runs
     under a `StackView`, which stacks the leaves while the loops run. The
     loops carry one residual dtype, so the stream enters in the dtype it
     settles in (`residual_dtype`). A store built bank by bank
@@ -80,7 +92,7 @@ def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer
             run = nn.map_variables(stacked, mapped_collections=True, trans_in_fn=view.stack,
                                    trans_out_fn=view.unstack, init=True, mutable=True)
             return run(decoder, view, x, train, decode, per_layer_input, attention_metadata, prior_bank)
-    if decoder.is_initializing() or (stages == 1 and not decoder.scan_layers):
+    if decoder.is_initializing() or (stages == 1 and not scanned()):
         return run_stack(
             decoder.layers, decoder.block, decoder.specs,
             tuple((index, 1) for index in range(first, end)), x,
@@ -204,7 +216,7 @@ def one_stage_runs(decoder: CausalTransformer, first: int, end: int, *, banked: 
     groups = decoder.groups if (first, end) == (0, decoder.num_layers) else tuple(
         (first + start, count)
         for start, count in scan_groups(decoder.scan_keys[first:end], decoder.bank_layers))
-    if decoder.scan_layers and not (banked or decoder.provides or 'streaming' in decoder.variables
+    if scanned() and not (banked or decoder.provides or 'streaming' in decoder.variables
                                     or on_host(decoder.variables.get('params', {}))):
         groups = tuple((first + start, count)
                        for start, count in scan_groups(decoder.scan_keys[first:end], periodic=True))
@@ -220,5 +232,5 @@ def stage_view(decoder: CausalTransformer, stages: int) -> StackView:
     split = split_stages(decoder.specs, stages)
     start, count = split.prefix, split.per_stage
     groups = (scan_groups(decoder.scan_keys[start:start + count], decoder.bank_layers)
-              if decoder.scan_layers else tuple((index, 1) for index in range(count)))
+              if scanned() else tuple((index, 1) for index in range(count)))
     return StackView(groups, stages=stages, offset=start)

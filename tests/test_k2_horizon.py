@@ -11,6 +11,7 @@ import jax
 import numpy as np
 import pytest
 from interop_support import assert_reloads, assert_same_stored_tensors, reference_read
+from model_support import attending
 from reference_error import assert_as_exact
 
 from dew.interop import Pretrained, PretrainedDecoder
@@ -23,13 +24,14 @@ MOVA = ROOT / 'k2-horizon-mova-tiny'
 
 
 def load():
-    return Pretrained.load(TINY, dtype='float32', attention_impl='reference')
+    return Pretrained.load(TINY, dtype='float32')
 
 
 def fixture(name):
     return np.load(TINY / f'{name}.npy')
 
 
+@attending("reference")
 def test_the_loaded_model_norms_over_two_groups_of_the_width():
     """The fixture's norms each split the width into two groups, which the shared reference flow's
     logits then hold to the remote code (tests/test_hf_reference_decoders.py)."""
@@ -37,6 +39,7 @@ def test_the_loaded_model_norms_over_two_groups_of_the_width():
         ('input_layernorm', 'post_attention_layernorm', 'norm'), 2)
 
 
+@attending("reference")
 def test_a_grouped_model_saves_in_the_remote_codes_layout(tmp_path):
     """The checkpoint writes back bit for bit under a config naming the remote
     code, and reloads to the same logits."""
@@ -55,6 +58,7 @@ YARN_EXPORT_SEEDS = 8
 sized by `seeds_for` paired with Dew's logits on the CPU."""
 
 
+@attending("reference")
 def test_a_single_group_exports_as_llama_with_its_yarn(tmp_path):
     """The 0.9B's shape, one group under YaRN, exports as Llama, whose norm
     is the same product in fp32 and whose rotary builds the same YaRN:
@@ -99,13 +103,14 @@ def test_each_release_translates_to_the_dense_block_it_ships(size, groups, layer
         assert fields.get('rope_scaling') is None and fields['rope_theta'] == 1e7
 
 
+@attending("reference")
 def test_the_mova_release_routes_its_sparse_layers_values_and_mlp_and_saves_in_its_layout(tmp_path):
     """The MoVA fixture's first layer is dense and the other two route their MLP and their values: the
     loaded model reads one mixture over layers 1 and 2 and value experts beside it, its gate a softplus
     at beta log 2 on its own projection. It writes back bit for bit under its remote code's config,
     each value expert and the routers' biases under the release's names, and reloads to the same
     logits."""
-    loaded = Pretrained.load(MOVA, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(MOVA, dtype='float32')
     model = loaded.model
     assert model.mixture.layers == (1, 2) and model.mixture.bias and model.mixture.scaling == 2.5
     assert (model.value_experts.experts, model.value_experts.top_k) == (4, 2)
@@ -121,10 +126,11 @@ def test_the_mova_release_routes_its_sparse_layers_values_and_mlp_and_saves_in_i
     assert_reloads(loaded, tmp_path, np.load(MOVA / 'input_ids.npy'))
 
 
+@attending("reference")
 def test_value_experts_sit_on_the_routed_layers_and_a_gate_activation_on_a_gate():
     """Value experts without a mixture route no layer, and an output gate's activation needs the gate:
     both are refused, as is an activation the attention does not know."""
-    loaded = Pretrained.load(MOVA, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(MOVA, dtype='float32')
     ids = np.load(MOVA / 'input_ids.npy')
     for fields in ({'mixture': None}, {'output_gate': False}, {'output_gate_activation': 'tanh'}):
         with pytest.raises(ValueError):

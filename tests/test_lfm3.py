@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from interop_support import respelled
+from model_support import attending
 from release_support import under_release
 from run_kinds import stated
 from safetensors.numpy import load_file
@@ -50,11 +51,12 @@ def release_cache(tmp_path, monkeypatch) -> Path:
     return snapshot
 
 
+@attending("reference")
 @pytest.mark.parametrize('fixture', [TINY, VL], ids=['decoder', 'wrapper'])
 def test_a_saved_source_writes_the_releases_tensors_back(tmp_path, fixture):
     """A load and a save write every tensor the release stores under its own name, bit for bit, and its
     config's model type: LFM3's decoder, and LFM3-VL's wrapper, its trunk's, projector's and decoder's."""
-    loaded = Pretrained.load(fixture, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(fixture, dtype='float32')
     loaded.save(tmp_path / 'saved')
     stored = load_file(fixture / 'model.safetensors')
     written = load_file(tmp_path / 'saved' / 'model.safetensors')
@@ -65,6 +67,7 @@ def test_a_saved_source_writes_the_releases_tensors_back(tmp_path, fixture):
     assert json.loads((tmp_path / 'saved' / 'config.json').read_text())['model_type'] == model_type
 
 
+@attending("reference")
 @pytest.mark.parametrize('sandwich', [True, False], ids=['sandwich', 'plain'])
 def test_a_native_decoder_saves_as_lfm3_and_reloads_the_same_model(tmp_path, sandwich, release_cache):
     """A model built in Dew (`PretrainedDecoder.from_model`) is an LFM3 by its convolution kind, ahead of
@@ -73,7 +76,7 @@ def test_a_native_decoder_saves_as_lfm3_and_reloads_the_same_model(tmp_path, san
     sliding layers at their own bases."""
     from dew.interop import PretrainedDecoder
 
-    loaded = Pretrained.load(TINY, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(TINY, dtype='float32')
     model, variables = loaded.model, loaded.variables
     if not sandwich:
         model = model.clone(sandwich_norms=False)
@@ -86,10 +89,11 @@ def test_a_native_decoder_saves_as_lfm3_and_reloads_the_same_model(tmp_path, san
         # The release's own tensor names, its attention's gate_proj beside its feed-forward's w1.
         written = load_file(tmp_path / 'saved' / 'model.safetensors')
         assert sorted(written) == sorted(load_file(TINY / 'model.safetensors'))
-    restored = Pretrained.load(tmp_path / 'saved', dtype='float32', attention_impl='reference')
+    restored = Pretrained.load(tmp_path / 'saved', dtype='float32')
     np.testing.assert_array_equal(np.asarray(restored.model.apply(restored.variables, ids)), expected)
 
 
+@attending("reference")
 @pytest.mark.parametrize("arm", ["plain", "looped"])
 def test_plain_and_looped_lfm3_train_through_a_decision_run(tmp_path, release_cache, arm):
     """Plain and looped LFM3 (LiquidAI/LFM3-1.7B at da90f4c, whose config, code and weights are
@@ -109,7 +113,7 @@ def test_plain_and_looped_lfm3_train_through_a_decision_run(tmp_path, release_ca
     from dew.interop import PretrainedDecoder
 
     # The tiny release at the vocabulary of a tokenizer a decision layout reads its specials from.
-    model = Pretrained.load(TINY, dtype='float32', attention_impl='reference').model.clone(vocab_size=289)
+    model = Pretrained.load(TINY, dtype='float32').model.clone(vocab_size=289)
     variables = nn.unbox(model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32)))
     PretrainedDecoder.from_model(model, variables).save(tmp_path / 'release')
     for name in ('tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja'):
@@ -184,6 +188,7 @@ def wrapped(directory: Path, **wrapper: object) -> Path:
     return directory
 
 
+@attending("reference")
 def test_an_lfm3_vl_wrapper_loads_whole_and_its_language_model_alone(tmp_path):
     """LFM3-VL's wrapper (LiquidAI/LFM3-VL-2B) holds an LFM3 decoder beside its vision trunk and projector:
     a load reads all three, and on ids without placeholders computes its decoder's own logits bit for
@@ -193,12 +198,12 @@ def test_an_lfm3_vl_wrapper_loads_whole_and_its_language_model_alone(tmp_path):
     from dew.interop.hf_decoders import translate_wrapper_config
 
     ids = jnp.asarray(fixture('input_ids'), jnp.int32)
-    alone = Pretrained.load(TINY, dtype='float32', attention_impl='reference')
+    alone = Pretrained.load(TINY, dtype='float32')
     expected = np.asarray(alone.model.apply(alone.variables, ids))
     source = wrapped(tmp_path / 'wrapper')
-    text = Pretrained.load(source, dtype='float32', attention_impl='reference', text_only=True)
+    text = Pretrained.load(source, dtype='float32', text_only=True)
     np.testing.assert_array_equal(np.asarray(text.model.apply(text.variables, ids)), expected)
-    whole = Pretrained.load(source, dtype='float32', attention_impl='reference')
+    whole = Pretrained.load(source, dtype='float32')
     np.testing.assert_array_equal(np.asarray(whole.model.apply(whole.variables, ids)), expected)
     with pytest.raises(ValueError):
         Pretrained.load(wrapped(tmp_path / 'd1', d1_attention='set', d1_set_size=16), text_only=True)
@@ -213,7 +218,7 @@ def test_an_lfm3_vl_wrapper_loads_whole_and_its_language_model_alone(tmp_path):
     record = translate_wrapper_config(stated)
     assert (record['text_model_type'], record['image_token_id'], record['video_token_id']) == ('lfm3', 125030,
                                                                                                125029)
-    reread = Pretrained.load(bare, dtype='float32', attention_impl='reference', text_only=True)
+    reread = Pretrained.load(bare, dtype='float32', text_only=True)
     np.testing.assert_array_equal(np.asarray(reread.model.apply(reread.variables, ids)), expected)
 
 
@@ -253,6 +258,7 @@ def test_the_released_lfm3_vl_and_d1_headers_load_whole_or_refuse_d1s_attention(
                         text_only=True)
 
 
+@attending("reference")
 def test_a_saved_remote_code_release_keeps_the_modules_its_auto_map_names(tmp_path):
     """A release whose config names its own code (`auto_map`), which Dew maps natively and never runs,
     saves those modules and every module they import relatively, as transformers resolves them, beside
@@ -264,7 +270,7 @@ def test_a_saved_remote_code_release_keeps_the_modules_its_auto_map_names(tmp_pa
     source = respelled(TINY, tmp_path / 'release', lambda config: {**config, 'auto_map': dict(code.auto_map)})
     for file, text in {**RELEASED, 'unrelated.py': 'raise ImportError\n'}.items():
         (source / file).write_text(text)
-    loaded = Pretrained.load(source, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(source, dtype='float32')
     loaded.save(tmp_path / 'saved')
     assert json.loads((tmp_path / 'saved' / 'config.json').read_text())['auto_map'] == dict(code.auto_map)
     assert {path.name for path in (tmp_path / 'saved').glob('*.py')} == set(RELEASED)
@@ -272,6 +278,7 @@ def test_a_saved_remote_code_release_keeps_the_modules_its_auto_map_names(tmp_pa
         assert (tmp_path / 'saved' / file).read_text() == text
 
 
+@attending("reference")
 def test_a_component_keeps_the_code_beside_its_config_and_none_outside_its_source(tmp_path):
     """A release loaded from a component folder (`subfolder`) keeps the code beside that folder's config,
     not the source root's; a module whose relative import names a path outside the source refuses the
@@ -282,8 +289,7 @@ def test_a_component_keeps_the_code_beside_its_config_and_none_outside_its_sourc
     for file, text in RELEASED.items():
         (component / file).write_text(text)
     (tmp_path / 'release' / 'modeling_lfm3.py').write_text('raise ImportError\n')
-    loaded = Pretrained.load(tmp_path / 'release', subfolder='decoder', dtype='float32',
-                             attention_impl='reference')
+    loaded = Pretrained.load(tmp_path / 'release', subfolder='decoder', dtype='float32')
     loaded.save(tmp_path / 'saved')
     assert {path.name: path.read_text() for path in (tmp_path / 'saved').glob('*.py')} == RELEASED
     (component / 'lfm3_conv.py').write_text('from .../victim import conv\n')
@@ -293,6 +299,7 @@ def test_a_component_keeps_the_code_beside_its_config_and_none_outside_its_sourc
     assert not (tmp_path / 'escaped' / 'victim.py').exists()
 
 
+@attending("reference")
 def test_a_native_export_writes_its_familys_release_code_beside_itself(tmp_path, release_cache):
     """A model built in Dew of a family whose reference is a release's own code (`release_code`) exports
     with that release's auto_map and the modules it names and imports, at the commit Dew is held to,
@@ -300,12 +307,13 @@ def test_a_native_export_writes_its_familys_release_code_beside_itself(tmp_path,
     from dew.interop import PretrainedDecoder
 
     code = LFM3.release_code
-    loaded = Pretrained.load(TINY, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(TINY, dtype='float32')
     PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path / 'saved')
     assert json.loads((tmp_path / 'saved' / 'config.json').read_text())['auto_map'] == dict(code.auto_map)
     assert {path.name for path in (tmp_path / 'saved').glob('*.py')} == set(RELEASED)
 
 
+@attending("reference")
 @pytest.mark.network
 def test_an_export_writes_the_releases_own_modules_at_its_commit(tmp_path):
     """The network's half (ledger 2038): a model built in Dew exports with its release's own modules at the
@@ -317,7 +325,7 @@ def test_an_export_writes_the_releases_own_modules_at_its_commit(tmp_path):
     from dew.interop import PretrainedDecoder
 
     code = LFM3.release_code
-    loaded = Pretrained.load(TINY, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(TINY, dtype='float32')
     PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path / 'saved')
     written = {path.name: path.read_bytes() for path in (tmp_path / 'saved').glob('*.py')}
     released = {file: Path(hf_hub_download(str(code.source), file, revision=code.revision))
@@ -325,6 +333,7 @@ def test_an_export_writes_the_releases_own_modules_at_its_commit(tmp_path):
     assert written == {file: path.read_bytes() for file, path in released.items()}
 
 
+@attending("reference")
 def test_an_lfm3_vl_processor_lays_out_its_releases_own_processor_output(tmp_path):
     """LFM3-VL's processor is its release's own code (Lfm3VlProcessor and its image and video processors
     at f83d2b0), which a load that trusts the source's code runs (`trust_remote_code`, `Processor`): over a
@@ -357,7 +366,7 @@ def lfm3_vl_processor_lays_out_its_releases_own_output(directory: str) -> None:
     with run_from('remote_code_reference', 'tools') as reference:
         for file in reference.RELEASES['lfm3-vl-tiny'][2]:
             shutil.copy(reference.release_file('lfm3-vl-tiny', file), source / file)
-    loaded = Pretrained.load(source, dtype='float32', attention_impl='reference', trust_remote_code=True)
+    loaded = Pretrained.load(source, dtype='float32', trust_remote_code=True)
     release = AutoProcessor.from_pretrained(str(source), trust_remote_code=True, local_files_only=True)
     loaded.save(tmp_path / 'saved')
     saved = AutoProcessor.from_pretrained(str(tmp_path / 'saved'), trust_remote_code=True,
@@ -408,6 +417,7 @@ def lfm3_vl_processor_lays_out_its_releases_own_output(directory: str) -> None:
         dew.pipeline(str(untrusted), dtype='float32').processor('w5 <|image|>', images=[image])
 
 
+@attending("reference")
 def test_a_sources_record_runs_its_code_only_under_its_callers_trust(tmp_path):
     """A source's record (`SourceReference`), which a run keeps for its processor, keeps whether its load
     ran the source's own code (`remote_code`), and a record written before the field reads as not
@@ -428,7 +438,7 @@ def test_a_sources_record_runs_its_code_only_under_its_callers_trust(tmp_path):
     with run_from('remote_code_reference', 'tools') as reference:
         for file in reference.RELEASES['lfm3-vl-tiny'][2]:
             shutil.copy(reference.release_file('lfm3-vl-tiny', file), source / file)
-    model = Pretrained.load(source, dtype='float32', attention_impl='reference',
+    model = Pretrained.load(source, dtype='float32',
                             trust_remote_code=False).model
     recorded = SourceReference(str(source), remote_code=True)
     with pytest.raises(ValueError):

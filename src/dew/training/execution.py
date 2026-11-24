@@ -164,9 +164,13 @@ def unscanned(sites) -> str | None:
     loops = [".".join(site.namespace) or "<root>" for site in sites if not site.scanned]
     if not loops:
         return None
-    return (f"a host layout streams a scanned stack; the decoder at {', '.join(loops)} runs a plain loop "
-            "(scan_layers=False), whose layer fetches the compiler hoists together, so set "
-            "scan_layers=True (and bank_layers to bound a run) on it")
+    return (f"{PLAIN_LOOP}; the decoder at {', '.join(loops)} runs a plain loop, whose layer fetches the "
+            "compiler hoists together, so run it scanned, dew.kernels.use(layer_scan='scanned') (and set "
+            "bank_layers to bound a run)")
+
+
+PLAIN_LOOP = "a host layout streams a scanned stack"
+"""How `unscanned`'s refusal begins, which a layout's choice says as a warning (`streaming.said`)."""
 
 
 def resident(placement, sites, accelerator):
@@ -517,7 +521,7 @@ class HostExecution:
         with on_mesh(self.accelerator):
             compiled = owned_program(whole, step=self.step_options(variables, batch))
             arguments = (primal, frozen, rest, placed, here)
-            refusals: list[RuntimeError] = []
+            refusals: list[Exception] = []
             executable = compiled_if_it_fits(compiled.lower(*arguments), compiled.options, refusals,
                                              relower=lambda: compiled.lower(*arguments))
         return executable, arguments

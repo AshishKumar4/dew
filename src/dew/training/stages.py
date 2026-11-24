@@ -286,9 +286,13 @@ class StageLocal:
 
     def rows_placement(self, placement):
         """`placement`'s stored layers' own: each row the spec its stacked leaf gives it past the stack,
-        on every stage."""
-        return self.layered(placement, lambda path, sharding, shape: [
-            _sharded(sharding, self.mesh, sharding.spec[len(shape):])] * math.prod(shape))
+        on every stage (`_row_shardings`)."""
+        return self.layered(placement, self._row_shardings)
+
+    def _row_shardings(self, path, sharding: NamedSharding, shape: tuple[int, ...]) -> list[NamedSharding]:
+        """A stacked leaf's rows' shardings (`RowCut`): each the spec its `sharding` gives it past the
+        `shape` of its stack, on every stage."""
+        return [_sharded(sharding, self.mesh, sharding.spec[len(shape):])] * math.prod(shape)
 
     @contextlib.contextmanager
     def held(self, *within: contextlib.AbstractContextManager) -> Iterator[None]:
@@ -427,11 +431,38 @@ class StageLocal:
         (`Trainer.stored`'s), their stacked arrays donated where they are `consumed`. It costs what a
         state that held every layer on every device held throughout; variables that hold no stacked run are
         returned as they are."""
-        if not self.holds(variables):
+        entries: list[tuple[DecoderBank, Mapping]] = []
+
+        def collect(site: DecoderBank, where: str, node: Mapping) -> Mapping:
+            # Each stacked run taken out in the one walk, its place held for the layers it becomes.
+            if not (self._stacks(site, where) and "stages" in node):
+                return node
+            entries.append((site, node["stages"]))
+            rest = {key: value for key, value in node.items() if key != "stages"}
+            return _Unstacked(len(entries) - 1, rest)
+
+        template = _walked(variables, self.sites, collect)
+        if not entries:
             return variables
-        placement = self.rows_placement(jax.tree.map(lambda leaf: leaf.sharding, variables))
-        return program(_layered_arrays, static_argnums=0, out_shardings=placement,
-                       donate_argnums=(1,) if consumed else ())(self, variables)
+        sites, stacked = tuple(site for site, _ in entries), tuple(held for _, held in entries)
+        placements = tuple(site.view.layer_form({"stages": jax.tree.map(lambda leaf: leaf.sharding, held)},
+                                                self._row_shardings)
+                           for site, held in entries)
+        unstacked = (program(_layered_entries, static_argnums=0, out_shardings=placements,
+                             donate_argnums=(1,) if consumed else ())(sites, stacked)
+                     if jax.tree.leaves(stacked) else _layered_entries(sites, stacked))
+        return jax.tree.map(lambda held: {**held, **unstacked[held.index]} if isinstance(held, _Unstacked)
+                            else held, template, is_leaf=lambda node: isinstance(node, _Unstacked))
+
+
+class _Unstacked(dict):
+    """A stacked run's place in a tree `StageLocal.whole` takes apart: the rest of its node, beside which
+    its layers go, and its entry's `index` among the runs it unstacks. A dict of its own kind, which no
+    pytree registry flattens, so the tree's one map back finds it whole."""
+
+    def __init__(self, index: int, rest: Mapping):
+        super().__init__(rest)
+        self.index = index
 
 
 _MIRRORS = ("variables", "opt_state", "ema", "compute")
@@ -448,8 +479,9 @@ def _stacked_piece(rows: list[jax.Array], *, within: tuple[int, ...]) -> jax.Arr
     return _stacked_rows(rows, (1, *within))
 
 
-def _layered_arrays(local: StageLocal, tree):
-    return local.layered(tree)
+def _layered_entries(sites: tuple[DecoderBank, ...], stacked: tuple[Mapping, ...]) -> tuple[dict, ...]:
+    return tuple(site.view.layer_form({"stages": held}, _layer_rows)
+                 for site, held in zip(sites, stacked, strict=True))
 
 
 def whole_reading(optimizer: optax.GradientTransformation | None, shapes, local: StageLocal) -> list[str]:
@@ -554,9 +586,15 @@ def _expressions(layered, stacked, inputs: Sequence, outputs: Sequence) -> list[
     within one bound of the exact sum, though not to one value, so a comparison after them may decide
     otherwise at its threshold (the admission row 4036 asked for, a global-norm clip stage-local). Row
     r of a stack of n rows is read against row r of every stacked input of n rows; a stack of another
-    count is no row's."""
+    count is no row's. A program that acts beside what it returns (an effect: a callback's read of a whole
+    stack, or of a layer's own leaf), the layer's or the stack's, is compared by no result, wherever it
+    acts."""
     from dew.training.staging import flattened
 
+    if layered.jaxpr.effects or stacked.jaxpr.effects:
+        # Either program's: an effect over a layer's leaf the stack reads otherwise is no row of it either.
+        return ["it acts beside what it returns (a callback), which no result compares and a stage holding "
+                "its own layers would act on otherwise"]
     numbering = _Numbering()
     lay_equations, lay_results = flattened(layered.jaxpr, layered.jaxpr.invars, layered.consts)
     stack_equations, stack_results = flattened(stacked.jaxpr, stacked.jaxpr.invars, stacked.consts)
@@ -745,8 +783,7 @@ class _Numbering:
         scans; a branch's each program's results, one where they agree, else the branch's choice among
         them, row by row of a stack. A loop that scans a stack along its rows' first axis (`lax.map` over
         layers, `batch_size` rows a step where the rows lie over two axes) reads its next rows at each step
-        (`_step_rows`), its stacked results the rows again; a stack its rows do not divide among the steps is
-        none it reads. None for a longer loop."""
+        (`_step_rows`), its stacked results the rows again. None for a longer loop."""
         from dew.training.staging import flattened
 
         def run(closed, values: list, held: list) -> list[tuple] | None:
@@ -768,15 +805,7 @@ class _Numbering:
             # A stack scanned along its rows' first axis (`lax.map` over layers, `batch_size` rows a step
             # where its rows lie over two axes): each step its next rows, a stack of the rest of its rows'
             # axes or one row, the loop as long as that axis.
-            # A loop of no steps over a stack, or one whose steps act beside what they return (a callback's
-            # read of a whole stack), is none it reads row by row.
-            stacks = any(isinstance(value, tuple) for value in scanned)
-            if stacks and (length == 0 or equation.effects or scan_body(equation).effects):
-                return None
-            divided = all(not isinstance(value, tuple)
-                          or (len(value) == length if lead == 1 else len(value) % length == 0)
-                          for value, lead in zip(scanned, along, strict=True))
-            if length > UNROLLED or not divided:
+            if length > UNROLLED:
                 return None
             carry = list(zip(operands[consts:consts + carries], leads[consts:consts + carries], strict=True))
             steps: dict[int, list[tuple]] = {}
@@ -883,8 +912,9 @@ def _step_rows(rows: tuple, lead: int, step: int, length: int) -> tuple:
 def _moved(equation, operands: list, leads: list) -> tuple | None:
     """A stack's rows moved whole, each row as it was: a reshape that keeps every row's own shape after
     its rows' axes (merging, splitting or adding them, a value of no stack becoming a stack of one row,
-    one row its value again), a squeeze of its rows' axes of one row, a slice of rows along its one axis
-    of them, or a concatenation of stacks along it. None for any other equation."""
+    one row its value again), a squeeze of its rows' axes of one row, a slice along its first axis of rows,
+    each index of it the rows of its other axes of rows, or a concatenation of stacks alike along it (a
+    remainder `lax.map` maps apart). None for any other equation."""
     primitive, params = equation.primitive, equation.params
     if primitive not in (jax.lax.reshape_p, jax.lax.squeeze_p, jax.lax.slice_p, jax.lax.concatenate_p):
         return None
@@ -906,18 +936,20 @@ def _moved(equation, operands: list, leads: list) -> tuple | None:
             # One row, its value again.
             return (number[0], None) if isinstance(number, tuple) else None
         return ((number,) if lead is None else number), len(rows)
-    if lead != 1:
+    if lead is None:
         return None
+    # Each index of the first axis of rows holds the rows of the others, in order.
+    inner = math.prod(shape[1:lead])
     if primitive is jax.lax.slice_p:
         strides = params["strides"]
         start, limit = tuple(params["start_indices"]), tuple(params["limit_indices"])
         whole = start[1:] == (0,) * (len(shape) - 1) and limit[1:] == shape[1:]
         if (strides is not None and any(stride != 1 for stride in strides)) or not whole:
             return None
-        return number[start[0]:limit[0]], 1
+        return number[start[0] * inner:limit[0] * inner], lead
     if primitive is jax.lax.concatenate_p and params["dimension"] == 0 and all(
-            isinstance(operand, tuple) for operand in operands) and all(held == 1 for held in leads):
-        return tuple(row for operand in operands for row in operand), 1
+            isinstance(operand, tuple) for operand in operands) and all(held == lead for held in leads):
+        return tuple(row for operand in operands for row in operand), lead
     return None
 
 

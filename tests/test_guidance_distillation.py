@@ -12,6 +12,7 @@ import pytest
 from diffusion_stubs import batch_for
 from diffusion_support import images_of, saved_after_one_step
 from interop_support import extract_fixture
+from model_support import attending
 
 from dew.config import ObjectiveConfig, TrainerConfig
 from dew.config.diffusion import DiffusionRunConfig
@@ -42,6 +43,7 @@ FLUX = {
 
 
 @pytest.fixture(scope="module", params=[Flow(), EDM(regime="pixel")], ids=["flow", "edm"])
+@attending("xla")
 def runs(tmp_path_factory, request):
     """A tiny guidance-embedded Flux teacher, trained a step and saved, and
     the config of a student that distills it: under flow matching, whose
@@ -50,7 +52,7 @@ def runs(tmp_path_factory, request):
     root = tmp_path_factory.mktemp("guidance")
     extract_fixture(FIXTURES / "flux_source.tar.xz", root / "flux")
     teacher = DiffusionRunConfig(
-        model=ModelConfig("flux_transformer", {**FLUX, "dtype": "float32", "attention_impl": "xla"}),
+        model=ModelConfig("flux_transformer", {**FLUX, "dtype": "float32"}),
         data=images_of("tfds://oxford_flowers102", 8), preset=request.param, val_metrics=(),
         trainer=TrainerConfig(checkpoint_dir=str(root)),
         text=TextCondition(encoder="diffusion_text", checkpoint=str(root / "flux" / "pipeline")),
@@ -63,6 +65,7 @@ def runs(tmp_path_factory, request):
     return root, student, batch
 
 
+@attending("xla")
 def test_a_student_whose_process_reads_raw_outputs_otherwise_is_refused(runs):
     """The student regresses onto the teacher's raw output, so their schedules and prediction
     transforms are one configuration, not only one class: a student whose EDM sigma_data or flow
@@ -76,6 +79,7 @@ def test_a_student_whose_process_reads_raw_outputs_otherwise_is_refused(runs):
     assert isinstance(student.build(), GuidanceDistillationObjective)
 
 
+@attending("xla")
 def test_the_loss_is_the_papers_equation(runs):
     """Per row a scale w ~ U(1, 6); the student reads it as its guidance and
     matches u + w (c - u) of the teacher's two branches on the same noised
@@ -119,6 +123,7 @@ def test_the_loss_is_the_papers_equation(runs):
     assert all(program.module is module for program, module in zip(task.program_key(), modules, strict=True))
 
 
+@attending("xla")
 def test_a_saved_student_samples_one_branch_at_its_conditioners_guidance(runs, tmp_path):
     _, config, batch = runs
     task, state, _ = saved_after_one_step(config, batch, tmp_path / "student", 1e-2)

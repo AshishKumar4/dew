@@ -26,6 +26,7 @@ from dew._position import PER_SHARE, PlanChanged, unplaced
 from dew._records import (
     ADDED,
     JSON,
+    earlier_described_fields,
     earlier_spelling,
     json_value,
     listed,
@@ -100,9 +101,11 @@ def earlier_readers(stages: Sequence[Stage],
 def _read_saved(saved: Mapping[str, object],
                 earlier: Sequence[Callable[[JSON], JSON]] = ()) -> Mapping[str, object]:
     """A saved data plan in the shapes Dew describes now: its classes by the paths they have now
-    (`moved_paths`, row 5996), and descriptions of classes the live steps' classes read as they are now
-    (`earlier`, `ReadsEarlier`, row 6140)."""
-    read = record(moved_paths(json_value(saved, "saved data plan")), "saved data plan")
+    (`moved_paths`, row 5996), their descriptions without the fields their classes lost since
+    (`earlier_described_fields`, row 11938), and descriptions of classes the live steps' classes read as
+    they are now (`earlier`, `ReadsEarlier`, row 6140)."""
+    read = record(earlier_described_fields(moved_paths(json_value(saved, "saved data plan"))),
+                  "saved data plan")
     for reader in earlier:
         read = record(reader(json_value(read, "saved data plan")), "saved data plan")
     return read

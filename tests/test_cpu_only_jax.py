@@ -290,8 +290,17 @@ def test_a_run_refuses_gpus_holding_tensor_memory_under_a_cublas_that_frees_it_t
     architecture holds tensor memory, by its compute capability (a B200's or B300's, and an SM 10.0 part no
     table names), under a cuBLAS below 13.2, and passes it under 13.2 or newer; GPUs without tensor memory (an
     RTX PRO 6000, an H100) pass under either, and a host with a B200 among them is refused (ledger 5671); a
-    process with no CUDA plugin selected no cuBLAS."""
+    process with no CUDA plugin selected no cuBLAS. cuBLAS's version is asked where a GPU holds tensor memory
+    alone: GPUs of none never load it (an emulated H100 pair, whose cuBLAS cannot start, ran on)."""
     from dew._devices import unsafe_cublas
 
     devices = [_Device("gpu", kind, capability) for kind, capability in gpus] + [_Device("cpu", "cpu")]
-    assert (unsafe_cublas(devices, cublas, "570.124.06") is not None) == refused
+    asked = []
+
+    def selected():
+        asked.append(True)
+        return cublas
+
+    assert (unsafe_cublas(devices, selected, "570.124.06") is not None) == refused
+    holds = any(capability.startswith("10.") for _, capability in gpus)
+    assert bool(asked) == holds, (gpus, asked)

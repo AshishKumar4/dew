@@ -68,7 +68,8 @@ class OffloadConfig:
     depths: list[int] = field(default_factory=lambda: [4, 8, 16])
     width: str = "tiny"
     dtype: str = "float32"
-    attention_impl: str = "xla"
+    attention: str = "xla"
+    """The attention kernel every program runs (`generation.chosen(attention=...)`)."""
     bank_layers: int | None = None
     batch: int = 1
     prompt: int = 16
@@ -184,13 +185,12 @@ def bytes_of(tree, space: str | None = None) -> int:
 
 
 def build(config: OffloadConfig, depth: int) -> CausalTransformer:
-    fields = {**WIDTHS[config.width], "num_layers": depth, "scan_layers": True,
+    fields = {**WIDTHS[config.width], "num_layers": depth,
               "bank_layers": config.bank_layers, "tie_embeddings": True,
               "mlp": "swiglu"}
     if config.cache_length is not None:
         fields["max_seq_len"] = config.cache_length
-    return from_record(CausalTransformer, {**fields, "dtype": config.dtype,
-                                           "attention_impl": config.attention_impl})
+    return from_record(CausalTransformer, {**fields, "dtype": config.dtype})
 
 
 def shapes_of(model: CausalTransformer, tokens, dtype: str) -> dict:
@@ -344,4 +344,8 @@ def main(config: OffloadConfig) -> None:
 
 
 if __name__ == "__main__":
-    main(tyro.cli(OffloadConfig))
+    from dew.nn.kernels import generation
+
+    chosen = tyro.cli(OffloadConfig)
+    with generation.chosen(attention=chosen.attention):
+        main(chosen)

@@ -39,7 +39,7 @@ from ..cross_pass import CrossPass
 from ..derivatives import formed_together
 from ..host_memory import fetched, fetched_at, on_host
 from ..hyper_connections import Carried
-from ..inspection import counted, current_positions, watched_positions
+from ..inspection import counted, current_component, current_positions, watched_positions
 from ..kv_cache import cache_at_layer, cache_from_layer
 from ..mla import INDEXER_COLLECTION
 from ..moe import BANKED_EXPERTS, ROUTER_COLLECTION, at_iteration, experts_apart, holds_experts
@@ -541,10 +541,16 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
                         layer, carry)
                 return nn.remat(read, policy=policy, prevent_cse=False)(layer, carry, index), None
             # A parameter its module boxed (`nn.with_logical_partitioning`) stacks with an unnamed layer
-            # axis, which the run's view cuts off again per layer (`_rows`).
+            # axis, which the run's view cuts off again per layer (`_rows`). A decode step's rows it
+            # broadcasts exist before the scan and it outputs nothing broadcast, so flax's trace of its body
+            # for what it broadcasts is not taken (`check_constancy_invariants`): that check refuses a body
+            # holding an effect that reads the carry, an interpreted launch's (row 12077: a quantized paged
+            # step). Every other call keeps it, whose trace its random streams advance through, so an init
+            # draws as it did.
             x, _ = nn.scan(scanned, variable_axes={nn.DenyList(LAYER_ROWS) if rows else True: 0},
                            variable_broadcast=LAYER_ROWS if rows else False, split_rngs={True: True},
-                           length=repeats, metadata_params={nn.PARTITION_NAME: None})(
+                           length=repeats, metadata_params={nn.PARTITION_NAME: None},
+                           check_constancy_invariants=not decode)(
                 run, x, jnp.arange(repeats))
     return x
 
@@ -606,7 +612,7 @@ def _updated_in_backward(run: nn.Module, x, *, attention_metadata, remat: RematP
         applied, policy=_KEPT_WITHOUT_A_RUNG.checkpoint_policy(), prevent_cse=False)
 
     return in_backward.scanned_run(
-        run.path, layer, weights, held.get(in_backward.MASTERS),
+        (*current_component(), *run.path), layer, weights, held.get(in_backward.MASTERS),
         {name: held[name] for name in current.moments}, in_backward.norms_of(held[in_backward.NORMS]), x,
         (keys, constants), (attention_metadata,))
 

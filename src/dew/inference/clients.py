@@ -180,7 +180,8 @@ def _ollama_budget(options: object, budget: int, seed: int | None,
         if sampling.eos_token_ids is not None:
             raise ValueError("Ollama text completion cannot implement native EOS-token IDs")
         unmatched = sampling.active(("repetition_penalty", "presence_penalty", "frequency_penalty",
-                                     "no_repeat_ngram_size", "min_new_tokens", "typical_p", "stop"))
+                                     "no_repeat_ngram_size", "min_new_tokens", "typical_p", "stop",
+                                     "logits", "stopping", "strategy"))
         if unmatched:
             raise ValueError(f"Ollama text completion cannot implement {unmatched} as Dew does: its "
                              "penalties read a window of recent tokens, and it strips stop strings "
@@ -532,7 +533,8 @@ class OpenAICompletion:
         if not isinstance(sampling, Sampling):
             raise TypeError("sampling must be a Sampling value")
         # The pad id only shapes Dew's padded rows; a remote completion comes back unpadded.
-        unmatched = sampling.active(("no_repeat_ngram_size", "min_new_tokens", "typical_p", "stop"))
+        unmatched = sampling.active(("no_repeat_ngram_size", "min_new_tokens", "typical_p", "stop", "logits",
+                                     "stopping", "strategy"))
         if unmatched:
             raise ValueError(f"remote text completion cannot implement {unmatched} as Dew does; "
                              "an OpenAI-compatible server strips stop strings from the text")

@@ -42,6 +42,7 @@ from affine_run import (
 )
 from flax import linen as nn
 from flax.core import FrozenDict, freeze as frozen_dict
+from model_support import attending
 from recording import RecordingTracker, preempting
 from reference_error import as_given, assert_as_exact
 from steady_state import steady_state
@@ -1614,6 +1615,7 @@ def test_a_cooldown_branch_scores_what_a_run_decayed_there_scores_and_leaves_the
         np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
 
 
+@attending("xla")
 def test_a_cooldown_branchs_scoring_artifacts_keep_apart_from_the_runs_at_its_step(tmp_path):
     """A run that keeps every evaluation's scoring artifacts (`scored_to`) keeps a cooldown branch's,
     scored at the step it branched at, under `cooldown/` beside the run's own at that step
@@ -1628,7 +1630,7 @@ def test_a_cooldown_branchs_scoring_artifacts_keep_apart_from_the_runs_at_its_st
     train = from_grain(grain.MapDataset.source(list(held_tokens()) * 4), "indexed-tokens").batch(16)
     held = from_iter(held_tokens, identity="streamed-tokens").batch(8).read("streamed").workers(0)
     model = CausalTransformer(vocab_size=8, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
-                              max_seq_len=8, attention_impl="xla")
+                              max_seq_len=8)
     objective = LMObjective(model, seq_len=4)
     Trainer(objective, optax.inject_hyperparams(optax.adam)(learning_rate=1e-3), key=0).fit(
         train.read("indexed").workers(0), validation=held, steps=4, eval_every=2, metrics=(Perplexity(),),

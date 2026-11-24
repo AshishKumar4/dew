@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from model_support import attending
 from selection_margins import MARGIN, margin
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
@@ -86,6 +87,7 @@ def test_a_mixture_routes_where_any_layer_it_holds_is_not_hashed(mixture, routed
     assert selection_margins.routes({"num_layers": 3, "mixture": mixture}) == routed
 
 
+@attending("reference")
 def test_a_deepseek_v4_decoder_shows_every_selection_it_makes():
     """DeepSeek V4's tiny release selects by its compressed sparse attention's indexer and routes its
     layers past the hashed ones by score: the capture holds a selection from each compressed sparse
@@ -96,7 +98,7 @@ def test_a_deepseek_v4_decoder_shows_every_selection_it_makes():
 
     from dew.interop import Pretrained
 
-    loaded = Pretrained.load(FIXTURES / "deepseek-v4-tiny", dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(FIXTURES / "deepseek-v4-tiny", dtype="float32")
     config = loaded.model_config
     assert selection_margins.selects(config)
     ids = jnp.asarray(np.random.default_rng(0x2739).integers(0, loaded.model.vocab_size, (2, 12)),

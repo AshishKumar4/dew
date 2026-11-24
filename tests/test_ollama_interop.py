@@ -51,6 +51,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import attending
 from token_support import write_token_corpus
 
 from dew.config.lm import LMRunConfig
@@ -143,7 +144,7 @@ def train_and_export(root: Path) -> Path:
     assert int(state.step) == STEPS
 
     model = models.build(config.model.name, {**FIELDS, "vocab_size": meta["vocab_size"]},
-                         dtype="float32", attention_impl="xla")
+                         dtype="float32")
     export = root / "export"
     PretrainedDecoder.from_model(model, state.variables, tokenizer=tokenizer).save(str(export))
     return export
@@ -181,7 +182,7 @@ def imported(tmp_path_factory):
         pytest.skip(f"no ollama daemon at {daemon_url()}: {failure}")
 
     root = tmp_path_factory.mktemp("ollama-interop")
-    export = train_and_export(root)
+    export = attending("xla")(train_and_export)(root)
     name = f"dew-interop-{uuid.uuid4().hex[:8]}"
     try:
         done = create(name, export, root)
@@ -193,6 +194,7 @@ def imported(tmp_path_factory):
 
 
 @pytest.fixture(scope="module")
+@attending("xla")
 def client(imported):
     """`OllamaCompletion` bound to the imported model and an injected SDK
     client. The SDK is the `inference-clients` extra, so a checkout without
@@ -202,6 +204,7 @@ def client(imported):
     return OllamaCompletion(name, ollama.Client(host=daemon_url()))
 
 
+@attending("xla")
 def test_the_daemon_draws_dews_own_greedy_continuation(imported, client):
     """The conversion repacked the computation, it did not change it.
 
@@ -218,7 +221,7 @@ def test_the_daemon_draws_dews_own_greedy_continuation(imported, client):
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(str(export), local_files_only=True)
-    loaded = Pretrained.load(str(export), dtype="float32", attention_impl="xla")
+    loaded = Pretrained.load(str(export), dtype="float32")
 
     for prompt in PROMPTS:
         head = tokenizer.encode(prompt, add_special_tokens=False)
@@ -242,6 +245,7 @@ def drawn_logprobs(logits, head: list[int], drawn: list[int]) -> list[float]:
     return [float(normalised[offset, token]) for offset, token in enumerate(drawn)]
 
 
+@attending("xla")
 def test_the_daemon_reports_dews_own_logprobs(imported, client):
     """Tighter than the token identity above, and it drifts first.
 
@@ -268,7 +272,7 @@ def test_the_daemon_reports_dews_own_logprobs(imported, client):
 
     _, export, _ = imported
     tokenizer = AutoTokenizer.from_pretrained(str(export), local_files_only=True)
-    loaded = Pretrained.load(str(export), dtype="float32", attention_impl="xla")
+    loaded = Pretrained.load(str(export), dtype="float32")
     rounded = jax.tree.map(lambda leaf: leaf.astype(jnp.float16).astype(leaf.dtype)
                            if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, loaded.variables)
     with float64():

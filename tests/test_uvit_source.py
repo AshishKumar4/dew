@@ -12,6 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import attending
 from recorded_runs import assert_arms_as_recorded
 from torch_layout import QKV, dew_leaf, join_qkv, node, split_qkv, torch_leaf
 
@@ -153,7 +154,7 @@ def computing(case: str):
     model = UViT(output_channels=config["in_chans"], patch_size=config["patch_size"],
                  emb_features=config["embed_dim"], num_layers=config["depth"], num_heads=config["num_heads"],
                  mlp_ratio=config["mlp_ratio"], mlp_time_embed=config["mlp_time_embed"], conv=config["conv"],
-                 text_tokens=config["num_clip_token"], image_size=config["img_size"], attention_impl="xla")
+                 text_tokens=config["num_clip_token"], image_size=config["img_size"])
 
     def dew(dtype, inputs) -> dict:
         params: dict = {}
@@ -185,6 +186,7 @@ def pipeline_arms(case: str):
     return FIXTURES / f"{case}.npz", drawing(case), computing(case), OUTPUTS
 
 
+@attending("xla")
 @pytest.mark.parametrize("case", list(CASES))
 def test_the_output_and_every_gradient_are_as_exact_as_u_vits(case):
     """Dew's output and gradients as exact as U-ViT's float32 against float64 (check 1)."""

@@ -9,7 +9,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
-from model_support import TINY_DECODER
+from model_support import TINY_DECODER, scanning, stacked_as, unrolled
 from reference_error import assert_as_exact, dew_path, widened
 from token_support import token_rows
 
@@ -30,9 +30,11 @@ VOCAB, SEQ, BATCH = 128, 8, 8
 TINY_SHARD = 1
 """The smallest leaf the layout shards, so the tiny decoder's are."""
 
-def decoder(*, scan: bool, dtype: str = "float32", num_layers: int = 3, **wider):
+def decoder(*, dtype: str = "float32", num_layers: int = 3, **wider):
+    """The tiny decoder `wider` widens, which scans its run of like layers (a plain arm runs it under
+    `unrolled`)."""
     fields = {**TINY_DECODER, "vocab_size": VOCAB, "max_seq_len": SEQ, "num_layers": num_layers, **wider}
-    return models.build("causal_transformer", **fields, dtype=dtype, scan_layers=scan)
+    return models.build("causal_transformer", **fields, dtype=dtype)
 
 
 def trainer(model, optimizer: OptimConfig, *, key: int = 0) -> Trainer:
@@ -67,6 +69,7 @@ worst on CUDA, the reference's own arithmetic against itself deciding the same r
 row 10145)."""
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize("barriered", [False, True], ids=["marked", "barriered"])
 def test_a_run_updating_in_its_backward_moves_as_the_whole_steps_update_would(barriered):
     """A scanned run of three layers that updates in its backward (`dew.nn.in_backward.scanned_run`) under
@@ -77,8 +80,8 @@ def test_a_run_updating_in_its_backward_moves_as_the_whole_steps_update_would(ba
     barrier (`dew._cache.BARRIERED`, row 8378)."""
     from dew.nn import in_backward
 
-    scanned = decoder(scan=True)
-    plain, wide = scanned.clone(scan_layers=False), scanned.clone(scan_layers=False, dtype=jnp.float64)
+    scanned = decoder()
+    plain, wide = scanned, scanned.clone(dtype=jnp.float64)
     ids = jnp.zeros((2, SEQ), jnp.int32)
     # Stored a layer at a time, as both stacks read them: the scan stacks its run as it reads it.
     layered = nn.unbox(scanned.init(jax.random.key(0), ids))["params"]
@@ -117,9 +120,11 @@ def test_a_run_updating_in_its_backward_moves_as_the_whole_steps_update_would(ba
     from dew import _cache
 
     with _cache.BARRIERED(new_value=barriered):
-        assert_as_exact(jax.jit(in_backward_step), dew_path(jax.jit(whole_step(plain, layered))), draw,
-                        "a run updating in its backward", seeds=RUN_SEEDS,
-                        truth_fn=jax.jit(whole_step(wide, widened(layered))), conditioning=RUN_CONDITIONING)
+        # The whole step's arms a layer at a time (`unrolled`).
+        assert_as_exact(jax.jit(in_backward_step), dew_path(unrolled(jax.jit(whole_step(plain, layered)))),
+                        draw, "a run updating in its backward", seeds=RUN_SEEDS,
+                        truth_fn=unrolled(jax.jit(whole_step(wide, widened(layered)))),
+                        conditioning=RUN_CONDITIONING)
 
 
 SHARED_SEEDS = 64
@@ -169,6 +174,7 @@ EIGHT_BIT = OptimConfig(optimizer=AdamW(weight_decay=0.1, state_dtype="int8"), l
 backward writes as a float cotangent: its step takes the whole gradient first."""
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.mesh(devices=8)
 @pytest.mark.parametrize("optimizer, wider", [(ADAMW, {}), (GROUPED, {}),
                                               (EIGHT_BIT, {"emb_features": 64, "mlp_features": 256})],
@@ -178,7 +184,7 @@ def test_a_scanned_steps_runs_train_under_each_update(optimizer, wider):
     gradient alone (adamw, whole or by groups) updates its runs in their backward (`Transaction.planned`),
     and one keeping its layers' moments in 8 bits takes the whole gradient first. Each moves the runs'
     weights, advances the optimizer's count once a step, and its loss falls."""
-    run = trainer(decoder(scan=True, **wider), optimizer)
+    run = trainer(decoder(**wider), optimizer)
     state, _, _ = run.place()
     before = jax.device_get(state.variables["params"]["stages"])
     batch = shard_batch(run.device_mesh, token_rows(VOCAB, BATCH, SEQ + 1))
@@ -194,6 +200,7 @@ def test_a_scanned_steps_runs_train_under_each_update(optimizer, wider):
     assert int(jax.device_get(moved.updates)) == 3
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize("generation, dtype, width", [("sm90", "float32", None), ("sm80", "bfloat16", None),
                                                      ("sm80", "bfloat16", 512), ("sm90", "bfloat16", 512)])
 def test_a_scanned_step_holds_no_more_than_a_layer_at_a_time(generation, dtype, width):
@@ -212,7 +219,7 @@ def test_a_scanned_step_holds_no_more_than_a_layer_at_a_time(generation, dtype, 
 
     def built(optimizer: OptimConfig):
         gpu = compile_only_gpus(generation, 1, 80 * 2**30)
-        model = decoder(scan=True, dtype=dtype, num_layers=LAYERS, **wider)
+        model = decoder(dtype=dtype, num_layers=LAYERS, **wider)
         run = Trainer(LMObjective(model, SEQ), optimizer, key=jax.random.key(0), mesh=MeshSpec().build(gpu),
                       layout=Layout(min_shard=TINY_SHARD), fit=FitPolicy(split=1), checkpoints=None,
                       tracker=None)
@@ -254,6 +261,7 @@ one): each cell took 466 to 595 s whole (CI 11-14), and one site over the three 
 task compiling every cell's arms."""
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.mesh(devices=8)
 @pytest.mark.parametrize(("optimizer", "fields"), [
     pytest.param(ADAMW, {}, id="adamw", marks=pytest.mark.check1_shards(seeds=256, per_task=64)),
@@ -272,13 +280,14 @@ def test_a_scanned_step_updating_in_its_backward_trains_as_a_layer_at_a_time(opt
     first holds more than a layer at a time does."""
     from test_stage_local import decoder as stage_decoder, draw, initials, stepped
 
-    scanned, plain = stage_decoder(scan_layers=True, **fields), stage_decoder(**fields)
+    scanned, plain = stage_decoder(**fields), stage_decoder(**fields)
     # No average beside them: an EMA two steps old is its draw's, whose rounding both arms share.
     initial = initials(plain, optimizer, ema=None)
     one_stage = MeshSpec(fsdp=2)
     updating = stepped(scanned, optimizer, one_stage, 2, initial, ema=None)
-    whole = stepped(plain, optimizer, one_stage, 2, initial, ema=None)
-    truth = stepped(plain, optimizer, MeshSpec(), 1, initial, exact=True, ema=None)
+    # The steps a layer at a time (`unrolled`), the plain loop's.
+    whole = unrolled(stepped(plain, optimizer, one_stage, 2, initial, ema=None))
+    truth = unrolled(stepped(plain, optimizer, MeshSpec(), 1, initial, exact=True, ema=None))
     assert_as_exact(updating, whole, draw, "a scanned step updating in its backward", seeds=PLANNED_SEEDS,
                     truth_fn=truth)
 
@@ -409,7 +418,7 @@ def test_a_scanned_step_whose_collection_is_not_finite_moves_no_weight():
     runs nor any other, and is reported not finite: the walk reads the forward's statistics and collections
     as the commit does. It read the loss alone, and its layers moved where the commit rejected the step (the
     round-3 head review's F1)."""
-    objective = type("Overflowing", (CollectionWriting,), {"scale": 1e4})(decoder(scan=True), SEQ)
+    objective = type("Overflowing", (CollectionWriting,), {"scale": 1e4})(decoder(), SEQ)
     run = Trainer(objective, ADAMW, key=jax.random.key(0), mesh=MeshSpec(fsdp=2),
                   layout=Layout(min_shard=TINY_SHARD), checkpoints=None, tracker=None, skip_nonfinite=True)
     run.device_mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
@@ -422,3 +431,140 @@ def test_a_scanned_step_whose_collection_is_not_finite_moves_no_weight():
     for old, new in zip(jax.tree.leaves(before), jax.tree.leaves(jax.device_get(moved.variables["params"])),
                         strict=True):
         np.testing.assert_array_equal(new, old)
+
+
+@pytest.mark.parametrize("grouped, input_lm, context_backbone, seeds", [
+    pytest.param(False, 0.0, False, 32, id="decision",
+                 marks=pytest.mark.check1_shards(seeds=32, per_task=32)),
+    pytest.param(True, 0.0, False, 32, id="decision-grouped",
+                 marks=pytest.mark.check1_shards(seeds=32, per_task=32)),
+    pytest.param(False, 0.25, False, 160, id="decision-input-lm",
+                 marks=pytest.mark.check1_shards(seeds=160, per_task=32)),
+    # Its judgement resolved past 32 draws alone, within 160 (the map judge's units).
+    pytest.param(False, 0.0, True, 160, id="decision-context-backbone",
+                 marks=pytest.mark.check1_shards(seeds=160, per_task=32)),
+])
+def test_a_decision_step_over_a_scanned_backbone_trains_as_its_ordinary_backward(grouped, input_lm,
+                                                                                   context_backbone, seeds):
+    """A decision objective's scanned backbone, which its step updates in its backward
+    (`dew.nn.in_backward`), runs inside `component('backbone')`, so its plan keys its run under
+    `backbone/stages/...` (row 12076: the run's path lacked `backbone`, raising `KeyError: 'stages'`), and two
+    steps leave every parameter on par with the same steps through the ordinary backward of an unscanned
+    backbone (check 1, against one device's float64), its parameters grouped or not. With `input_lm` or a
+    context the backbone encodes in its own pass, the loss differentiates the backbone twice a step, so the
+    step updates none in its backward (`Objective._updates_in_backward`) and trains as the ordinary scan
+    does, on par alike (review of row 12076's fix: finite values alone were checked); a loss that
+    differentiated a run twice and said nothing is refused
+    (`test_a_loss_differentiating_a_scanned_run_twice_is_refused_its_update_in_the_backward`)."""
+    from arm_forms import as_given
+    from decision_support import decision_rows
+    from test_stage_local import wide
+
+    from dew.data.dataset import DataPartition
+    from dew.data.text import ByteTokenizer
+    from dew.decision import Choice, DecisionObjective, Example, Specials
+    from dew.decision.layout import SegmentLayout
+    from dew.distributed.batches import shard_batch
+    from dew.nn.cross_attention import CrossAttention
+
+    team = Choice("Which team?", ["billing", "technical"])
+    examples = [
+        Example(text, {"team": team}, {"team": label}, context={"plan": "pro"} if context_backbone else None)
+        for text, label in (("charged twice", 0), ("site down", 1))
+    ] * 2
+
+    def backbone(*, dtype: str = "float32"):
+        model = decoder(dtype=dtype, vocab_size=256, max_seq_len=32, num_layers=3)
+        return model.with_cross_attention(CrossAttention(layer_ids=(0,), context_length=16)) if (
+            context_backbone) else model
+    # eps=1e-4 keeps AdamW from magnifying 1e-8 rounding noise on DecisionHead's shift-invariant k_proj.bias.
+    adamw = AdamW(weight_decay=0.1, eps=1e-4)
+    optimizer = (
+        OptimConfig(optimizer=adamw, learning_rate=1e-2,
+                    param_groups=(ParamGroup("backbone", ("*backbone*",), learning_rate_multiplier=2.0),
+                                  ParamGroup("rest", ("*",))))
+        if grouped else OptimConfig(optimizer=adamw, learning_rate=1e-2)
+    )
+    layout = SegmentLayout.state_first_row(max_len=32, head_max_len=24, option_tokens=6)
+    opts = {"tokenizer": ByteTokenizer(), "specials": Specials(None, 10, 0, "\x00", 255),
+            "layout": layout, "input_lm": input_lm,
+            "context_encoder": "backbone" if context_backbone else "table"}
+    seed = DecisionObjective(backbone(), **opts)
+    batch = next(decision_rows(examples, 2, objective=seed.data()).train(DataPartition()))
+
+    def built(*, exact: bool = False) -> Trainer:
+        model = backbone(dtype="float64" if exact else "float32")
+        run = Trainer(DecisionObjective(model, **opts), optimizer, key=jax.random.key(0), mesh=MeshSpec(),
+                      layout=Layout(min_shard=2**30), fit=FitPolicy(split=1), checkpoints=None, tracker=None)
+        run.device_mesh = MeshSpec().build(jax.devices()[:1])
+        run.validate(steps=2)
+        return run
+
+    with jax.enable_x64(new_val=False):
+        start = unrolled(built)().initial_state()
+    init, made = jax.jit(seed.init), {}
+
+    def initial(drawn: int):
+        # Each seed's own variables, the optimizer state every draw starts from.
+        if drawn not in made:
+            with jax.enable_x64(new_val=False):
+                variables = nn.unbox(init(jax.random.key(drawn)))
+                variables = jax.tree.map(lambda held, new: jnp.asarray(new, held.dtype), start.variables,
+                                         variables)
+                made[drawn] = dataclasses.replace(start, variables=variables)
+        return made[drawn]
+
+    def stepped(*, scan: bool, exact: bool = False):
+        # Its stack scanned or a layer at a time, compiled and stepped under that choice (`stacked_as`).
+        compiled = []
+
+        @as_given
+        @stacked_as("scanned" if scan else "plain")
+        def run(drawn):
+            if not compiled:
+                compiled.append(built(exact=exact))
+            steps = compiled[0]
+            first = initial(int(drawn))
+            state = steps.staged(wide(first) if exact else jax.tree.map(jnp.copy, first))
+            placed = shard_batch(steps.device_mesh, batch)
+            if len(compiled) == 1:
+                compiled.append(steps.compile(state, placed))
+            for _ in range(2):
+                state, *_ = compiled[1](state, placed)
+            # The backbone's moments beside the weights: an update in its backward writes them apart. The
+            # head's, which both arms update alike, include a shift-invariant bias's second moment, the
+            # square of rounding noise its gradient is, which no draw resolves.
+            stored = steps.stored(state)
+            moments = jax.tree_util.tree_map_with_path(
+                lambda path, leaf: leaf if "backbone" in jax.tree_util.keystr(path) else None,
+                stored.opt_state)
+            return jax.device_get({"params": stored.variables["params"], "opt_state": moments})
+        return run
+
+    assert_as_exact(stepped(scan=True), stepped(scan=False), lambda drawn: (np.int64(drawn),),
+                    "a decision step over a scanned backbone", seeds=seeds,
+                    truth_fn=stepped(scan=False, exact=True))
+
+
+def test_a_loss_differentiating_a_scanned_run_twice_is_refused_its_update_in_the_backward():
+    """A loss that runs a scanned stack twice and differentiates both (a language model's loss counted
+    twice) would take the sum of two updates as its weights were its step to update the stack in its
+    backward (`dew.nn.in_backward`): its plan, handling the run twice, is refused by name
+    (`Objective._updates_in_backward`), never trained silently (row 12076's review)."""
+    from dew.data.dataset import Loader
+
+    class Twice(LMObjective):
+        def loss(self, variables, batch, step):
+            stats, aux = super().loss(variables, batch, step)
+            again, _ = super().loss(variables, batch, step)
+            return jax.tree.map(lambda first, second: first + second, stats, again), aux
+
+    objective = Twice(decoder(), SEQ)
+    tokens = token_rows(VOCAB, 2, SEQ + 1)
+    data = Loader(train=lambda partition: iter([tokens, tokens]), val=None, records=2, batch=2)
+    run = Trainer(objective, OptimConfig(optimizer=AdamW(), learning_rate=1e-2), key=jax.random.key(0),
+                  mesh=MeshSpec(), layout=Layout(min_shard=2**30), fit=FitPolicy(split=1), checkpoints=None,
+                  tracker=None)
+    run.device_mesh = MeshSpec().build(jax.devices()[:1])
+    with pytest.raises(ValueError):
+        scanning(run.fit)(data, steps=1, log_every=1)

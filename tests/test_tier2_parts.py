@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 import torch
 from interop_support import assert_pads_as, clearing_selections, token_draw, torch_logits
+from model_support import attending
 from reference_error import as_given, assert_as_exact
 
 from _dew_torch.precision import float64, float64_twin
@@ -229,6 +230,7 @@ def write_source(directory, name: str, edit=lambda code: code, source: tuple | N
 
 
 @pytest.fixture(scope="module")
+@attending("reference")
 def sources(tmp_path_factory):
     """Each source's repository written once (`write_source`) and loaded from it as a native decoder,
     shared by the tests reading it, which a group keyed by the source holds together (`shared_setup`)."""
@@ -238,12 +240,13 @@ def sources(tmp_path_factory):
         if name not in made:
             directory = tmp_path_factory.mktemp("sources") / name
             write_source(directory, name)
-            made[name] = directory, Pretrained.load(directory, dtype="float32", attention_impl="reference",
+            made[name] = directory, Pretrained.load(directory, dtype="float32",
                                                     trust_remote_code=True)
         return made[name]
     return source
 
 
+@attending("reference")
 @pytest.mark.shared_setup("tier2_sources", by=r"[a-z-]+")
 @pytest.mark.parametrize("name", sorted(SOURCES))
 def test_a_model_of_known_parts_loads_natively_from_its_own_code(sources, name):
@@ -272,6 +275,7 @@ def test_a_model_of_known_parts_loads_natively_from_its_own_code(sources, name):
                     truth_fn=torch_logits(wide, float64))
 
 
+@attending("reference")
 @pytest.mark.shared_setup("tier2_sources", by=r"[a-z-]+")
 @pytest.mark.parametrize("name", sorted(SOURCES))
 def test_a_model_loaded_from_parts_pads_the_row_its_own_table_pads(sources, name):
@@ -292,11 +296,12 @@ def test_a_model_loaded_from_parts_pads_the_row_its_own_table_pads(sources, name
                    wide.get_input_embeddings(), TINY["pad_token_id"], name, seeds=8)
 
 
+@attending("reference")
 def test_a_remote_type_is_refused_without_its_code(tmp_path):
     """A type transformers has no class for runs its repository's code only where the load opts in."""
     write_source(tmp_path / "renamed", "renamed")
     with pytest.raises(ValueError):
-        Pretrained.load(tmp_path / "renamed", dtype="float32", attention_impl="reference")
+        Pretrained.load(tmp_path / "renamed", dtype="float32")
 
 
 def test_a_part_whose_code_differs_is_not_assembled(tmp_path):
@@ -328,8 +333,7 @@ from pathlib import Path
 from dew.interop import Pretrained
 for source, subfolder in zip(sys.argv[2::2], sys.argv[3::2], strict=True):
     try:
-        Pretrained.load(source, subfolder=subfolder or None, dtype="float32", attention_impl="reference",
-                        trust_remote_code=True)
+        Pretrained.load(source, subfolder=subfolder or None, dtype="float32", trust_remote_code=True)
     except ValueError:
         outcome = "refused"
     else:
@@ -397,6 +401,7 @@ def test_each_code_folder_at_one_commit_is_verified_on_its_own(tmp_path):
     assert _offline_loads(tmp_path, ("dew/renamed", "hooked")) == [("refused", 1)]
 
 
+@attending("reference")
 @pytest.mark.shared_setup("tier2_sources", by=r"[a-z-]+")
 @pytest.mark.parametrize("name", sorted(SOURCES))
 def test_a_model_loaded_from_parts_saves_under_its_own_names_and_reloads(sources, tmp_path, name):
@@ -407,7 +412,7 @@ def test_a_model_loaded_from_parts_saves_under_its_own_names_and_reloads(sources
     (source, loaded), destination = sources(name), tmp_path / "export"
     loaded.save(destination)
     assert set(load_file(destination / "model.safetensors")) == set(load_file(source / "model.safetensors"))
-    restored = Pretrained.load(destination, dtype="float32", attention_impl="reference",
+    restored = Pretrained.load(destination, dtype="float32",
                                trust_remote_code=True)
     ids = np.random.default_rng(1607).integers(0, TINY["vocab_size"], (2, 12)).astype(np.int32)
     np.testing.assert_array_equal(np.asarray(restored.model.apply(restored.variables, ids)),
@@ -472,6 +477,7 @@ def test_a_training_only_behavior_is_not_assembled(tmp_path):
         verify_mapping(config, remote=tmp_path / "hooked")
 
 
+@attending("reference")
 def test_an_embedding_dews_lookup_does_not_compute_is_refused_at_load(tmp_path):
     """A source whose table scales its gradient by token frequency, its tensors under Llama's own
     names, is refused by the load whatever convention its eval logits would match: remote code is
@@ -485,7 +491,7 @@ def test_an_embedding_dews_lookup_does_not_compute_is_refused_at_load(tmp_path):
 
     write_source(tmp_path / "scaled", "renamed", scaled)
     with pytest.raises(ValueError):
-        Pretrained.load(tmp_path / "scaled", dtype="float32", attention_impl="reference",
+        Pretrained.load(tmp_path / "scaled", dtype="float32",
                         trust_remote_code=True)
 
 
@@ -656,6 +662,7 @@ def with_prediction_depth(directory, layers: int, width: int, extra: tuple[str, 
     save_file(tensors, path, metadata={"format": "pt"})
 
 
+@attending("reference")
 def test_a_released_prediction_depth_is_left_unread_and_its_copies_follow_the_trunk(tmp_path):
     """GLM-4.7-Flash's release stores a prediction depth past its trunk, which its own code builds none
     of and its load leaves unread: a load reads the trunk alone, whether it keeps the depth or not
@@ -673,8 +680,8 @@ def test_a_released_prediction_depth_is_left_unread_and_its_copies_follow_the_tr
     scatter_weights(model)
     model.save_pretrained(tmp_path / "release")
     with_prediction_depth(tmp_path / "release", config.num_hidden_layers, config.hidden_size)
-    kept = Pretrained.load(tmp_path / "release", dtype="float32", attention_impl="reference")
-    trunk = Pretrained.load(tmp_path / "release", dtype="float32", attention_impl="reference",
+    kept = Pretrained.load(tmp_path / "release", dtype="float32")
+    trunk = Pretrained.load(tmp_path / "release", dtype="float32",
                             prediction_depths=0)
     ids = np.random.default_rng(0).integers(0, config.vocab_size, (2, 12)).astype(np.int32)
     np.testing.assert_array_equal(np.asarray(kept.model.apply(kept.variables, ids)),
@@ -682,7 +689,7 @@ def test_a_released_prediction_depth_is_left_unread_and_its_copies_follow_the_tr
     table = kept.variables["params"]["embed_tokens"]["embedding"]
     kept.save(tmp_path / "saved", variables={**kept.variables, "params": {
         **kept.variables["params"], "embed_tokens": {"embedding": np.asarray(table) * 2}}})
-    reloaded = Pretrained.load(tmp_path / "saved", dtype="float32", attention_impl="reference")
+    reloaded = Pretrained.load(tmp_path / "saved", dtype="float32")
     np.testing.assert_array_equal(np.asarray(reloaded.variables["params"]["embed_tokens"]["embedding"]),
                                   np.asarray(table) * 2)
     copy = f"model.layers.{config.num_hidden_layers}.embed_tokens.weight"
@@ -692,7 +699,7 @@ def test_a_released_prediction_depth_is_left_unread_and_its_copies_follow_the_tr
     # for the save (ledger 3141).
     model.save_pretrained(tmp_path / "fused")
     with_prediction_depth(tmp_path / "fused", config.num_hidden_layers, config.hidden_size, fused=True)
-    fused = Pretrained.load(tmp_path / "fused", dtype="float32", attention_impl="reference")
+    fused = Pretrained.load(tmp_path / "fused", dtype="float32")
     np.testing.assert_array_equal(np.asarray(fused.model.apply(fused.variables, ids)),
                                   np.asarray(trunk.model.apply(trunk.variables, ids)))
     fused.save(tmp_path / "fused-saved")
@@ -704,10 +711,11 @@ def test_a_released_prediction_depth_is_left_unread_and_its_copies_follow_the_tr
     with_prediction_depth(tmp_path / "unknown", config.num_hidden_layers, config.hidden_size,
                           ("unknown.weight",))
     with pytest.raises(ValueError):
-        Pretrained.load(tmp_path / "unknown", dtype="float32", attention_impl="reference")
+        Pretrained.load(tmp_path / "unknown", dtype="float32")
 
 
 @pytest.fixture(scope="module")
+@attending("reference")
 def built_ins(tmp_path_factory):
     """Each built-in type's checkpoint written once at the probe's scatter (its prediction depth past the
     trunk too) and loaded from it as a native decoder, shared by the tests reading it, which a group keyed
@@ -730,11 +738,12 @@ def built_ins(tmp_path_factory):
             if fields.get("num_nextn_predict_layers"):
                 with_prediction_depth(directory, config.num_hidden_layers, config.hidden_size)
             del model
-            made[case] = directory, Pretrained.load(directory, dtype="float32", attention_impl="reference")
+            made[case] = directory, Pretrained.load(directory, dtype="float32")
         return made[case]
     return built_in
 
 
+@attending("reference")
 @pytest.mark.shared_setup("tier2_built_in", by=r"[a-z0-9_-]+")
 @pytest.mark.parametrize("case", sorted(BUILT_IN))
 def test_a_built_in_type_of_known_parts_loads_natively(built_ins, case):
@@ -856,6 +865,7 @@ def test_a_released_config_of_a_new_hybrid_verifies_from_parts(released):
     assert isinstance(verdict, VerifiedMapping) and verdict.family == "parts"
 
 
+@attending("reference")
 @pytest.mark.shared_setup("tier2_built_in", by=r"[a-z0-9_-]+")
 @pytest.mark.parametrize("case", ["apertus", "glm4", "laguna", "jamba", "falcon_h1-norm-first", "axk2"])
 def test_a_learned_activation_and_a_fused_projection_save_as_stored(built_ins, tmp_path, case):
@@ -895,6 +905,7 @@ class GroupedConfig(LlamaConfig):
 '''
 
 
+@attending("reference")
 @pytest.mark.parametrize("renamed_first", [False, True])
 def test_a_conversion_that_renames_by_another_keys_presence_reads_the_checkpoints_inventory(tmp_path,
                                                                                           renamed_first):
@@ -956,7 +967,7 @@ def test_a_conversion_that_renames_by_another_keys_presence_reads_the_checkpoint
     verified = verify_mapping(config, remote=tmp_path / "older")
     assert isinstance(verified, VerifiedMapping) and verified.family == "parts"
     verified.translate(config, older.keys())
-    loads = [Pretrained.load(tmp_path / folder, dtype="float32", attention_impl="reference",
+    loads = [Pretrained.load(tmp_path / folder, dtype="float32",
                              trust_remote_code=True) for folder in ("older", "newer")]
     jax.tree.map(np.testing.assert_array_equal, loads[0].variables, loads[1].variables)
 
@@ -1064,6 +1075,7 @@ BIASED_CONV_SEEDS = 8
 """The biased convolution's declared check-1 seeds, sized by `seeds_for` on armada."""
 
 
+@attending("reference")
 def test_a_biased_short_convolution_reads_its_padded_slots_as_its_source_does(tmp_path):
     """LFM2's biased convolution zeroes its padded slots' input before its projections, so their bias
     product reaches the real tokens' history after them (ledger 3165): tier 2 assembles it, and a
@@ -1083,7 +1095,7 @@ def test_a_biased_short_convolution_reads_its_padded_slots_as_its_source_does(tm
     model = built(torch.float32)
     scatter_weights(model)
     model.save_pretrained(tmp_path)
-    loaded = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference", max_seq_len=32)
+    loaded = Pretrained.load(tmp_path, dtype="float32", max_seq_len=32)
     assert isinstance(verify_mapping(model.config.to_dict()), VerifiedMapping)
     mask = np.ones((2, 12), bool)
     mask[1, :5] = False
@@ -1222,6 +1234,7 @@ def test_attention_fields_join_the_kinds_of_the_layers_that_state_them():
         parts._with_attention_fields({**fields, "layer_types": ("conv", "full_attention") * 2}, {1: pairs})
 
 
+@attending("reference")
 def test_a_decoder_norming_its_rotated_heads_decodes_through_its_cache_as_transformers_generates(tmp_path):
     """Hunyuan's attention norms each head's queries and keys after their rotation, so a cached key is
     normed as it is written: a cached greedy continuation of a decoder assembled from its parts draws the
@@ -1236,7 +1249,7 @@ def test_a_decoder_norming_its_rotated_heads_decodes_through_its_cache_as_transf
     model = AutoModelForCausalLM.from_config(config, dtype=torch.float32)
     scatter_weights(model)
     model.save_pretrained(tmp_path)
-    loaded = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(tmp_path, dtype="float32")
     source = AutoModelForCausalLM.from_pretrained(tmp_path, dtype=torch.float32, attn_implementation="eager",
                                                   experts_implementation="eager").eval()
     ids = torch.as_tensor(np.random.default_rng(0x3078).integers(3, config.vocab_size, (1, 6)))
@@ -1365,13 +1378,14 @@ def _slot_release(tmp_path, edit=lambda code: code):
     return alone, release
 
 
+@attending("reference")
 def test_a_slot_release_over_a_model_of_parts_loads_its_backbone_by_its_own_code(tmp_path):
     """A slot release whose backbone is a repository of remote code reads that code where the load opts
     in, as the backbone alone does: its decoder verifies from parts and holds the backbone's own
     variables, and it computes the backbone's logits."""
     alone, release = _slot_release(tmp_path)
-    backbone = Pretrained.load(alone, dtype="float32", attention_impl="reference", trust_remote_code=True)
-    loaded = Pretrained.load(release, dtype="float32", attention_impl="reference", trust_remote_code=True)
+    backbone = Pretrained.load(alone, dtype="float32", trust_remote_code=True)
+    loaded = Pretrained.load(release, dtype="float32", trust_remote_code=True)
     for ours, theirs in zip(jax.tree.leaves(loaded.variables), jax.tree.leaves(backbone.variables),
                             strict=True):
         np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
@@ -1396,6 +1410,7 @@ def _counted(path):
     return edit
 
 
+@attending("reference")
 @pytest.mark.parametrize("kind", ["alone", "release"])
 def test_one_load_of_local_remote_code_probes_it_once(tmp_path, kind):
     """A load verifies the remote code it runs once: a local repository's code, which no commit names,
@@ -1414,5 +1429,5 @@ def test_one_load_of_local_remote_code_probes_it_once(tmp_path, kind):
     config = json.loads((sources["alone"] / "config.json").read_text())
     probe = ran(lambda: verify_mapping(config, remote=sources["alone"]))
     assert probe > 0
-    assert ran(lambda: Pretrained.load(sources[kind], dtype="float32", attention_impl="reference",
+    assert ran(lambda: Pretrained.load(sources[kind], dtype="float32",
                                        trust_remote_code=True)) == probe

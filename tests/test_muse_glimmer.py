@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 import safetensors.torch as safetensors_torch
 import torch
+from model_support import attending
 
 from dew.interop import Pretrained
 
@@ -69,20 +70,22 @@ def checkpoint(tmp_path_factory):
     return directory, ids.numpy(), logits.numpy()
 
 
+@attending("reference")
 def test_the_text_decoder_computes_the_reference_logits(checkpoint):
     """Sliding and NoPE full layers, the own gate projection, the per-site norms and the softcapped,
     scaled head: Dew's fp32 logits lie within 1e-4 of the reference's float64 ones."""
     directory, ids, truth = checkpoint
-    pretrained = Pretrained.load(str(directory), dtype="float32", attention_impl="reference")
+    pretrained = Pretrained.load(str(directory), dtype="float32")
     ours = np.asarray(pretrained.model.apply(pretrained.variables, ids))
     assert np.max(np.abs(ours - truth)) < 1e-4
 
 
+@attending("reference")
 def test_the_export_writes_back_the_source_tensors_and_config(checkpoint, tmp_path):
     """Saving the loaded model writes every source tensor back unchanged, and a config that loads to
     the same model and the same logits."""
     directory, ids, _ = checkpoint
-    pretrained = Pretrained.load(str(directory), dtype="float32", attention_impl="reference")
+    pretrained = Pretrained.load(str(directory), dtype="float32")
     pretrained.save(tmp_path)
     written = safetensors_torch.load_file(str(tmp_path / "model.safetensors"))
     source = safetensors_torch.load_file(str(directory / "model.safetensors"))
@@ -93,7 +96,7 @@ def test_the_export_writes_back_the_source_tensors_and_config(checkpoint, tmp_pa
     for key in ("layer_rope_theta", "post_norm_eps", "qk_scale_factor", "final_logit_softcapping",
                 "output_multiplier"):
         assert exported[key] == pytest.approx(TEXT[key]), key
-    reloaded = Pretrained.load(str(tmp_path), dtype="float32", attention_impl="reference")
+    reloaded = Pretrained.load(str(tmp_path), dtype="float32")
     np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)),
                                   np.asarray(pretrained.model.apply(pretrained.variables, ids)))
 
@@ -195,6 +198,7 @@ def wrapper_logits(model, ids, image=None, video=None):
         return {"logits": model(input_ids=torch.from_numpy(np.asarray(ids)).long(), **media).logits.numpy()}
 
 
+@attending("reference")
 def test_a_muse_glimmer_wrapper_loads_whole_and_computes_its_logits(wrapper):
     """The wrapper loads as its trunk, adapter, projection and decoder, each released tensor mapped and
     exported bit for bit, and its logits over drawn ids, an unfilled video placeholder among them (as
@@ -209,7 +213,7 @@ def test_a_muse_glimmer_wrapper_loads_whole_and_computes_its_logits(wrapper):
     from reference_error import as_given, assert_as_exact
 
     directory, reference, truth = wrapper
-    loaded = Pretrained.load(str(directory), dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(str(directory), dtype="float32")
     exported = loaded.export()
     # Untied, as the wrapper's config leaves its head (transformers ties by its unset field).
     stored = {name: tensor.detach().numpy() for name, tensor in reference.state_dict().items()}
@@ -251,7 +255,7 @@ def test_a_muse_glimmer_wrapper_loads_whole_and_computes_its_logits(wrapper):
                         f"Muse Glimmer {media}", seeds=WRAPPER_SEEDS[media],
                         truth_fn=as_given(lambda *inputs: wrapper_logits(truth, *inputs)))
 
-    text = Pretrained.load(str(directory), dtype="float32", attention_impl="reference", text_only=True)
+    text = Pretrained.load(str(directory), dtype="float32", text_only=True)
     ids = np.random.default_rng(0x1883).integers(3, IMAGE_TOKEN, (1, 20)).astype(np.int32)
     np.testing.assert_array_equal(np.asarray(text.model.apply(text.variables, ids)),
                                   np.asarray(loaded.model.apply(loaded.variables, ids)))

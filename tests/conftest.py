@@ -368,6 +368,26 @@ def _named_records(request, directory: Path) -> None:
             request.config.stash.setdefault(key, []).append(json.loads((directory / name).read_text()))
 
 
+@pytest.fixture
+def scanned_stacks():
+    """The test's decoders scanning their stacks (`generation.chosen(layer_scan="scanned")`) for the whole
+    test: a test of the scanned path while it is no default (row 4074)."""
+    from dew.nn.kernels import generation
+
+    with generation.chosen(layer_scan="scanned"):
+        yield
+
+
+@pytest.fixture
+def stack_scan(request):
+    """How the test's decoders compile their stacks (`generation.Choice.LAYER_SCAN`), its parameter:
+    "scanned" or "plain", in effect for the whole test."""
+    from dew.nn.kernels import generation
+
+    with generation.chosen(layer_scan=request.param):
+        yield request.param
+
+
 @pytest.fixture(autouse=True)
 def compiled_ahead(request):
     """A GPU tier part's test's check-1 sites on the part's store of programs compiled ahead

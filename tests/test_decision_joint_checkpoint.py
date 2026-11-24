@@ -17,6 +17,7 @@ import optax
 import pytest
 from decision_support import decision_rows
 from interop_support import allocated_bytes, written_tensors
+from model_support import attending
 from one_draw import assert_as_exact_as_the_reference
 from PIL import Image
 from reference_error import upstream_fixture
@@ -53,14 +54,15 @@ LAYA_TINY = FIXTURES / "laya" / "tiny"
 CASES = json.loads((FIXTURES / "laya" / "cases.json").read_text())
 
 
+@attending("xla")
 def test_a_shapes_only_readout_load_avoids_eager_native_buffers(monkeypatch):
     """The standalone joint readout needs no backbone: its shapes-only load retains every
     parameter's geometry while allocating fewer native-layout buffers than its eager load."""
-    expected = Pretrained.load(TINY, dtype="float32", attention_impl="xla", on_host=True)
+    expected = Pretrained.load(TINY, dtype="float32", on_host=True)
     _, eager_bytes = allocated_bytes(monkeypatch, lambda: Pretrained.load(
-        TINY, dtype="float32", attention_impl="xla", on_host=True))
+        TINY, dtype="float32", on_host=True))
     loaded, deferred_bytes = allocated_bytes(monkeypatch, lambda: Pretrained.load(
-        TINY, dtype="float32", attention_impl="xla", weights=False))
+        TINY, dtype="float32", weights=False))
     assert eager_bytes > 0 and deferred_bytes < eager_bytes
     assert jax.tree.structure(loaded.variables) == jax.tree.structure(expected.variables)
     for actual, wanted in zip(jax.tree.leaves(loaded.variables), jax.tree.leaves(expected.variables),
@@ -173,11 +175,12 @@ def test_a_joint_schema_read_in_context_is_the_schema_the_row_holds(tokenizer):
                                                                      read.media)
 
 
+@attending("xla")
 def test_a_padded_batch_scores_every_row_as_it_scores_alone(tokenizer):
     """All five cases in one batch, padded to the longest row and the most
     questions and options: padding reaches none of the head's pooling or
     attention, so each question scores as it does alone."""
-    loaded = Pretrained.load(TINY, dtype="float32", attention_impl="xla")
+    loaded = Pretrained.load(TINY, dtype="float32")
     table = load_file(BACKBONE / "model.safetensors")["lm_head.weight"]
     rows = laid_out(tokenizer)
     inputs = DecisionInputs.collate([row for _, row in rows.values()], 0)
@@ -212,6 +215,7 @@ def joint_logits(decide) -> np.ndarray:
     return np.concatenate(found)
 
 
+@attending("xla")
 def test_a_joint_release_answers_as_its_own_model(tmp_path):
     """`Decide.from_pretrained` reads a joint-head release, the Qwen 3.5
     backbone with the head beside it. Dew's backbone and head together are
@@ -227,7 +231,7 @@ def test_a_joint_release_answers_as_its_own_model(tmp_path):
     tools/joint_checkpoint_reference.py --fla)."""
     for source in [*BACKBONE.iterdir(), TINY / "joint_head_config.json", TINY / "joint_head.safetensors"]:
         (tmp_path / source.name).symlink_to(source.resolve())
-    decide = replace(Decide.from_pretrained(tmp_path, attention_impl="xla"), confidence=TopProbability())
+    decide = replace(Decide.from_pretrained(tmp_path), confidence=TopProbability())
     layouts = json.loads((TINY / "layouts.json").read_text())
     keys, reference, truth = [], [], []
     with np.load(TINY / "logits.npz") as logits:
@@ -261,6 +265,7 @@ def test_a_joint_release_answers_as_its_own_model(tmp_path):
                                      "the joint head over Dew's Qwen 3.5")
 
 
+@attending("xla")
 def test_a_joint_release_saves_as_the_release_it_was_read_from(tmp_path):
     """A loaded joint-head release writes its own format back: the head's sizes, and every head
     tensor under the release's name, shape and dtype with its stored values, beside the backbone.
@@ -269,7 +274,7 @@ def test_a_joint_release_saves_as_the_release_it_was_read_from(tmp_path):
     release.mkdir()
     for source in [*BACKBONE.iterdir(), TINY / "joint_head_config.json", TINY / "joint_head.safetensors"]:
         (release / source.name).symlink_to(source.resolve())
-    bundle = Pretrained.load(release, dtype="float32", attention_impl="xla")
+    bundle = Pretrained.load(release, dtype="float32")
     bundle.save(tmp_path / "saved")
     assert json.loads((tmp_path / "saved" / "joint_head_config.json").read_text()) == json.loads(
         (TINY / "joint_head_config.json").read_text())
@@ -278,7 +283,7 @@ def test_a_joint_release_saves_as_the_release_it_was_read_from(tmp_path):
     for name, tensor in stored.items():
         assert written[name].dtype == tensor.dtype, name
         np.testing.assert_array_equal(written[name], tensor, err_msg=name, strict=True)
-    restored = Pretrained.load(tmp_path / "saved", dtype="float32", attention_impl="xla")
+    restored = Pretrained.load(tmp_path / "saved", dtype="float32")
     for actual, expected in zip(jax.tree.leaves((restored.variables, restored.head_variables)),
                                 jax.tree.leaves((bundle.variables, bundle.head_variables)), strict=True):
         np.testing.assert_array_equal(actual, expected)
@@ -304,13 +309,14 @@ def released(kind: str, directory: Path) -> Path:
     return directory
 
 
+@attending("xla")
 @pytest.mark.parametrize("kind", ["joint", "slot", "slot_lm", "laya"])
 def test_a_decision_release_exports_every_tensor_it_saves(tmp_path, kind):
     """A release's `export` is every tensor its `save` writes, the readout's beside the backbone's, by
     its name in the release's files, so a weight push (`NCCLPush`) sends the whole task, where an
     inherited export once gave the backbone's tensors alone; `backbone` exports the backbone alone,
     the saved backbone's tensors."""
-    bundle = Pretrained.load(released(kind, tmp_path / "release"), dtype="float32", attention_impl="xla")
+    bundle = Pretrained.load(released(kind, tmp_path / "release"), dtype="float32")
     exported = bundle.export()
     bundle.save(tmp_path / "saved")
     written = written_tensors(tmp_path / "saved")
@@ -328,6 +334,7 @@ def test_a_decision_release_exports_every_tensor_it_saves(tmp_path, kind):
             np.testing.assert_array_equal(alone[name], np.asarray(tensor), err_msg=name, strict=True)
 
 
+@attending("xla")
 @pytest.mark.parametrize("kind", ["joint", "slot", "slot_lm", "laya"])
 def test_a_decision_releases_export_reads_its_readout_home_only_as_each_tensor_is_read(tmp_path, kind):
     """A release's export (`PretrainedDecision.export`) reads no array home as it is made, listed or
@@ -340,7 +347,7 @@ def test_a_decision_releases_export_reads_its_readout_home_only_as_each_tensor_i
     from dew import _coordination
     from dew.interop.safetensors_io import tensor_specs
 
-    bundle = Pretrained.load(released(kind, tmp_path / "release"), dtype="float32", attention_impl="xla")
+    bundle = Pretrained.load(released(kind, tmp_path / "release"), dtype="float32")
     moves = ("host_to_device", "device_to_device")
     with guarded(allow=moves):
         exported = bundle.export()
@@ -365,6 +372,7 @@ def test_a_decision_releases_export_reads_its_readout_home_only_as_each_tensor_i
         assert not {"readout_head.pt", "joint_head.safetensors"} & written, written
 
 
+@attending("xla")
 def test_a_run_trains_a_loaded_tasks_own_tree_and_a_release_trains_unpacked(tmp_path):
     """A loaded task holds its backbone's projections packed to serve (`Decide._served`, ledger 2299); a
     run trained from it reads the model's own tree, the projections split back (`unpacked`), as a run
@@ -377,14 +385,15 @@ def test_a_run_trains_a_loaded_tasks_own_tree_and_a_release_trains_unpacked(tmp_
     def backbone(variables):
         return jax.tree.structure(variables["params"]["backbone"])
 
-    bundle = Pretrained.load(release, dtype="float32", attention_impl="xla")
+    bundle = Pretrained.load(release, dtype="float32")
     own = backbone(Decide.released(bundle).variables)
-    task = Decide.from_pretrained(release, attention_impl="xla")
+    task = Decide.from_pretrained(release)
     assert backbone(task.variables) != own
     trained = DecisionObjective(task, layout=SegmentLayout.joint_row(max_len=1024)).init(jax.random.key(0))
     assert backbone(trained) == own
 
 
+@attending("xla")
 @pytest.mark.parametrize("frozen", ["trunk", "keys and values"])
 def test_a_run_that_held_weights_frozen_serves_as_its_weights_unsplit_do(tmp_path, frozen):
     """A run that held its trunk frozen, or some members of a projection group (each attention layer's
@@ -402,7 +411,7 @@ def test_a_run_that_held_weights_frozen_serves_as_its_weights_unsplit_do(tmp_pat
         (release / source.name).symlink_to(source.resolve())
     trains = {"trunk": lambda path: path[1] == "head",
               "keys and values": lambda path: not {"k_proj", "v_proj"} & set(path)}[frozen]
-    bundle = Pretrained.load(release, dtype="float32", attention_impl="xla")
+    bundle = Pretrained.load(release, dtype="float32")
     start = Decide.released(bundle)
     objective = DecisionObjective(replace(start, variables=freeze(start.variables, trains)),
                                   layout=SegmentLayout.joint_row(max_len=1024))
@@ -438,6 +447,7 @@ def test_a_run_that_held_weights_frozen_serves_as_its_weights_unsplit_do(tmp_pat
 
 
 @pytest.fixture(scope="module")
+@attending("xla")
 def joint_runs(tmp_path_factory):
     """A joint-head release's runs (1505): its Qwen 3.5 backbone, joint head and layout trained together
     on rows of several questions, two steps, and a run of the first step alone, the two-step run's
@@ -463,7 +473,7 @@ def _joint_runs(tmp_path):
                 for state, label, hurry in answered * 2]
     # Training pads every row to the layout's max_len, which holds every row whole; the release serves up
     # to 16384. The runs score no split, which nothing here reads.
-    objective = DecisionObjective(Decide.from_pretrained(release, attention_impl="xla"),
+    objective = DecisionObjective(Decide.from_pretrained(release),
                                   layout=SegmentLayout.joint_row(max_len=768))
     data = decision_rows(examples, 8, objective=objective.data())
     start = jax.jit(objective.init)(jax.random.key(0))
@@ -479,6 +489,7 @@ def _joint_runs(tmp_path):
             "asked": {"team": team, "urgent": urgent}, "directory": tmp_path}
 
 
+@attending("xla")
 @pytest.mark.shared_setup("joint_runs")
 def test_a_joint_release_fine_tunes_and_reloads_from_its_run(joint_runs):
     """A joint-head release is a whole task to fine-tune (`joint_runs`): its runs stop where they were
@@ -501,6 +512,7 @@ def test_a_joint_release_fine_tunes_and_reloads_from_its_run(joint_runs):
         np.testing.assert_array_equal(answer.probabilities, again.probabilities)
 
 
+@attending("xla")
 @pytest.mark.shared_setup("joint_runs")
 def test_a_trained_joint_task_on_a_multimodal_backbone_exports_and_reloads_as_itself(joint_runs, tmp_path):
     """A task trained from a joint-head release over Qwen 3.5's multimodal backbone (`joint_runs`), its
@@ -517,7 +529,7 @@ def test_a_trained_joint_task_on_a_multimodal_backbone_exports_and_reloads_as_it
     trained = objective.pipeline(state)
     trained.save_pretrained(tmp_path / "exported")
     assert json.loads((tmp_path / "exported" / "config.json").read_text())["model_type"] == "qwen3_5"
-    reloaded = Decide.from_pretrained(tmp_path / "exported", attention_impl="xla")
+    reloaded = Decide.from_pretrained(tmp_path / "exported")
     served = Decide.of(PretrainedDecision.of(replace(trained, variables=jax.tree.map(np.asarray,
                                                                                     trained.variables))))
     assert reloaded.model == served.model and reloaded.layout == served.layout
@@ -531,6 +543,7 @@ def test_a_trained_joint_task_on_a_multimodal_backbone_exports_and_reloads_as_it
             np.testing.assert_array_equal(answer.probabilities, again.probabilities)
 
 
+@attending("xla")
 @pytest.mark.shared_setup("joint_runs")
 def test_two_joint_release_runs_average_into_a_task_that_reloads(joint_runs):
     """Two runs of a joint-head release (`joint_runs`) average into one task, its temperatures refit on
@@ -558,13 +571,14 @@ def test_two_joint_release_runs_average_into_a_task_that_reloads(joint_runs):
                 np.testing.assert_equal(dataclasses.asdict(found[name]), dataclasses.asdict(answers[name]))
 
 
+@attending("xla")
 def test_a_joint_release_serves_a_requests_images_as_urls_or_pictures_alike(tmp_path):
     """`systemone` reads a request's images as data URLs or as pictures, answers the two alike and as a
     call with them does, counts their tokens in its usage, and answers otherwise than without them. Its
     parity with the release's own model over pictures is the harness's (tests/test_release_parity.py)."""
     for source in [*BACKBONE.iterdir(), TINY / "joint_head_config.json", TINY / "joint_head.safetensors"]:
         (tmp_path / source.name).symlink_to(source.resolve())
-    decide = Decide.from_pretrained(tmp_path, attention_impl="xla")
+    decide = Decide.from_pretrained(tmp_path)
     pictures = [Image.fromarray(array) for array in np.load(BACKBONE / "images.npy")]
     request = CASES["quickstart"]
     questions = {name: Question.from_wire(wire) for name, wire in request["questions"].items()}
@@ -588,6 +602,7 @@ def test_a_joint_release_serves_a_requests_images_as_urls_or_pictures_alike(tmp_
     assert decide.systemone(request)["answers"] != served["answers"]
 
 
+@attending("xla")
 def test_a_joint_release_exports_with_the_layout_and_calibration_it_was_given(tmp_path):
     """The joint head's files state no layout, so a release whose layout is not its default (a window of
     its own, a framing of its rows) exports it beside them (`dew.config.Release`) and reads it back,
@@ -602,14 +617,14 @@ def test_a_joint_release_exports_with_the_layout_and_calibration_it_was_given(tm
     release.mkdir()
     for source in [*BACKBONE.iterdir(), TINY / "joint_head_config.json", TINY / "joint_head.safetensors"]:
         (release / source.name).symlink_to(source.resolve())
-    bundle = Pretrained.load(release, dtype="float32", attention_impl="xla")
+    bundle = Pretrained.load(release, dtype="float32")
     layout = replace(bundle.layout, max_len=2048, framing=Framing(system="Decide from the schema.",
                                                                    prefill="", thinking=False))
     chosen = replace(bundle, layout=layout, calibration=replace(bundle.calibration,
                                                                 abstention=Abstention(default=0.99)),
                      numerics=ACCURATE)
     chosen.save(tmp_path / "saved")
-    restored = Pretrained.load(tmp_path / "saved", dtype="float32", attention_impl="xla")
+    restored = Pretrained.load(tmp_path / "saved", dtype="float32")
     assert restored.layout == layout and restored.calibration == chosen.calibration
     assert Decide.of(restored, name="release").precision == ACCURATE
     request = CASES["quickstart"]

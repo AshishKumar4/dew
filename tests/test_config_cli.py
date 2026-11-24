@@ -12,6 +12,7 @@ from typing import Annotated
 
 import pytest
 from diffusion_support import images_of
+from model_support import attending
 
 from dew.config import RunConfig
 from dew.config.diffusion import DiffusionRunConfig
@@ -373,6 +374,7 @@ def test_the_cli_sets_a_token_budget_the_datas_token_batches_divide():
     assert RunConfig.from_dict(json.loads(json.dumps(config.to_dict()))) == config
 
 
+@attending("xla")
 @pytest.mark.parametrize("size", [(16, 16), (16, 8)], ids=["square", "wide-grid"])
 def test_a_jepa_run_without_probes_trains_and_validates_its_loss(tmp_path, size):
     """A checkpointed JEPA recipe validates without class probes or a representation preview, over
@@ -393,8 +395,7 @@ def test_a_jepa_run_without_probes_trains_and_validates_its_loss(tmp_path, size)
 
     run = JepaRunConfig(
         model=ModelConfig("jepa_encoder", {"patch_size": 2, "emb_features": 16, "num_layers": 1,
-                                           "num_heads": 2, "mlp_ratio": 2, "dtype": "float32",
-                                           "attention_impl": "xla"}),
+                                           "num_heads": 2, "mlp_ratio": 2, "dtype": "float32"}),
         predictor={"num_layers": 1, "predictor_features": 8}, num_target_blocks=2,
         data=prepared(train), validation=prepared(held),
         trainer=TrainerConfig(checkpoint_dir=str(tmp_path), horizon=Horizon(steps=1), log_every=1,
@@ -406,6 +407,7 @@ def test_a_jepa_run_without_probes_trains_and_validates_its_loss(tmp_path, size)
     assert not any("probe" in name for report in reports for name in report)
 
 
+@attending("xla")
 @pytest.mark.parametrize("precision", ["bf16-mixed", "16-mixed"])
 def test_a_jepa_runs_predictor_computes_as_its_encoder_where_the_run_derives_the_dtype(precision):
     """A JEPA run whose encoder record states no dtype computes in the dtype its numerics derive
@@ -423,7 +425,7 @@ def test_a_jepa_runs_predictor_computes_as_its_encoder_where_the_run_derives_the
     root = REPO_ROOT / "tests" / "fixtures" / "tfds" / "dew_images" / "1.0.0"
     run = JepaRunConfig(
         model=ModelConfig("jepa_encoder", {"patch_size": 2, "emb_features": 16, "num_layers": 1,
-                                           "num_heads": 2, "mlp_ratio": 2, "attention_impl": "xla"}),
+                                           "num_heads": 2, "mlp_ratio": 2}),
         predictor={"num_layers": 1, "predictor_features": 8}, num_target_blocks=2,
         data=TFDS("dew_images", path=str(root), split="all").pipe(presets.images, 16, batch=8),
         trainer=TrainerConfig(precision=numerics_of(precision), horizon=Horizon(steps=1)))
@@ -431,13 +433,13 @@ def test_a_jepa_runs_predictor_computes_as_its_encoder_where_the_run_derives_the
     expected = {"bf16-mixed": jnp.bfloat16, "16-mixed": jnp.float16}[precision]
     assert jnp.dtype(objective.encoder.dtype) == jnp.dtype(expected)
     assert jnp.dtype(objective.predictor.dtype) == jnp.dtype(expected)
-    assert objective.predictor.attention_impl == objective.encoder.attention_impl == "xla"
     assert (objective.predictor.num_layers, objective.predictor.predictor_features) == (1, 8)
     assert objective.predictor.emb_features == objective.encoder.emb_features == 16
     # The options its encoder marks as shared (`FROM_ENCODER`), each set off its class's default here.
     assert (objective.predictor.num_heads, objective.predictor.mlp_ratio) == (2, 2)
 
 
+@attending("xla")
 def test_a_jepa_run_trains_its_lora_factors_and_ramps_their_momentum_over_its_updates(tmp_path):
     """`--lora` adapts the run's encoder: its factors train under `params` over a frozen draw of it.
     The target's momentum ramps over the run's updates, its steps over its accumulation: falling from
@@ -456,8 +458,7 @@ def test_a_jepa_run_trains_its_lora_factors_and_ramps_their_momentum_over_its_up
                   split="all")
     run = JepaRunConfig(
         model=ModelConfig("jepa_encoder", {"patch_size": 2, "emb_features": 16, "num_layers": 1,
-                                           "num_heads": 2, "mlp_ratio": 2, "dtype": "float32",
-                                           "attention_impl": "xla"}),
+                                           "num_heads": 2, "mlp_ratio": 2, "dtype": "float32"}),
         objective=ObjectiveConfig("jepa", {"momentum": (1.0, 0.0)}),
         predictor={"num_layers": 1, "predictor_features": 8}, num_target_blocks=2,
         lora=LoRA(rank=2, modules=("up_proj",)),
@@ -480,6 +481,7 @@ def test_a_jepa_run_trains_its_lora_factors_and_ramps_their_momentum_over_its_up
             np.testing.assert_array_equal(np.asarray(target), 0.5 * np.asarray(online))
 
 
+@attending("xla")
 def test_a_jepa_run_of_epochs_over_a_streamed_read_ramps_its_momentum_over_its_progress(tmp_path):
     """A JEPA run of `--trainer.horizon.epochs` over a streamed read, whose order counts no updates ahead, is
     bounded in examples once its data compiles (`Loader.examples`), so the target's momentum ramps over the
@@ -493,8 +495,7 @@ def test_a_jepa_run_of_epochs_over_a_streamed_read_ramps_its_momentum_over_its_p
                   split="all")
     run = JepaRunConfig(
         model=ModelConfig("jepa_encoder", {"patch_size": 2, "emb_features": 16, "num_layers": 1,
-                                           "num_heads": 2, "mlp_ratio": 2, "dtype": "float32",
-                                           "attention_impl": "xla"}),
+                                           "num_heads": 2, "mlp_ratio": 2, "dtype": "float32"}),
         predictor={"num_layers": 1, "predictor_features": 8}, num_target_blocks=2,
         # Every image decodes (no rejecting step), so a pass's source examples are its shards' rows.
         data=images.pipe(presets.images, 16, batch=8, rejects=False).read("streamed")
