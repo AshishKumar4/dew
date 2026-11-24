@@ -1811,14 +1811,16 @@ class Transport[Allocated, Opened](abc.ABC):
         return streams
 
     def walk_own[R](self, streams, views: dict, own: tuple, streamed: tuple, wg,
-                    walk: Callable[..., R], *, between=None, counted=0) -> R:
+                    walk: Callable[..., R], *, between=None, counted=0, common: bool = False) -> R:
         """Consumer `wg`'s walk of its own steps `own` (`lo`, `hi`) among its program's `streamed` ones,
         `walk(streams, lo, hi, first)` its walk of steps `lo` to `hi` counted from `first`: on a layout with a
         producer, the steps before and after its own passed (`passed`, `between()` after each), which its
         partners read; on one whose consumers feed their rings (`ConsumerFed.walk_own`), every streamed step
         over its own feed (`fed`), a step none of its own masked by its step, `counted` turns past the rings'
-        first (`after_walk.Decided`'s second pass). Returns `walk`'s value."""
-        del views, wg
+        first (`after_walk.Decided`'s second pass); on one whose consumers run one pipeline together
+        (`CpAsync.walk_own`), `common` states that every consumer's segments of its walk are the same steps,
+        which keeps a pipeline a segment. Returns `walk`'s value."""
+        del views, wg, common
         lo, hi = own
         first = streamed[0] - counted
         self.passed(streams, streamed[0], lo, first=first, between=between)

@@ -249,6 +249,10 @@ class Streams:
     them: a walk loads them in turn whatever its consumer's own segments (`CpAsync.walk`). Its callers'
     invariants: the streamed range is every consumer's alike, and a step's rendezvous across consumers (a
     sum across them, `across.summed_across`) is reached by every consumer at that step."""
+    common: bool = False
+    """Whether every consumer's segments of a walk are the same steps (`walk_own`'s `common`, its caller's
+    statement: no bound derived from its consumer): a walk of several then runs a pipeline a segment, each
+    keeping its prefetch, its consumers meeting paired at every one."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -976,7 +980,8 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
             # consumer's step at each of its trips that of its own segment holding it, none where none does
             # (a gap, a step past its own segments). Segments ordered and apart; a trip reads no fragments
             # ahead of its own where its consumer's segments are not the agreed range itself (its boundary
-            # would be called under its segment's choice).
+            # would be called under its segment's choice). Segments every consumer's alike (`common`) each
+            # run a pipeline of their own, as one consumer's do, keeping their prefetch.
             if streams.agreed is None:
                 if len(segments) > 1:
                     raise NotImplementedError(f"two {self.name} consumers' walk of several segments "
@@ -984,7 +989,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
             else:
                 lo, hi = streams.agreed
                 whole = len(segments) == 1 and segments[0][1] is lo and segments[0][2] is hi
-                if not whole:
+                if not whole and not streams.common:
                     walks = [(_dispatched(segments), functools.partial(operator.add, lo), hi - lo)]
                     prefetching = False
         for step, placed, trips in walks:
@@ -1018,7 +1023,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         del streams, lo, hi, first, between
 
     def walk_own[R](self, streams, views: dict, own: tuple, streamed: tuple, wg,
-                    walk: Callable[..., R], *, between=None, counted=0) -> R:
+                    walk: Callable[..., R], *, between=None, counted=0, common: bool = False) -> R:
         # Two consumers run one collective pipeline (`thread_axis`), whose meets pair their steps: each
         # walks every streamed step, its step masking those outside its own range, as a consumer-fed
         # family's do (`ConsumerFed.walk_own`; a causal attention program's two consumers reach different
@@ -1027,7 +1032,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
             return super().walk_own(streams, views, own, streamed, wg, walk, between=between, counted=counted)
         del views, own, wg, between, counted
         lo, hi = streamed
-        return walk(dataclasses.replace(streams, agreed=(lo, hi)), lo, hi, lo)
+        return walk(dataclasses.replace(streams, agreed=(lo, hi), common=common), lo, hi, lo)
 
     def loaded(self, copies, *, issued: jax.Array | bool = True, axes: tuple | None = None) -> None:
         # Through registers (no TMA before Hopper), in a layout of the tile's rank: a side vector's the
