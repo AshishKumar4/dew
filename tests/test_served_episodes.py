@@ -148,25 +148,32 @@ def test_a_served_cohort_draws_what_its_policy_draws_whole(kind, sampling):
     # Each arm's contexts and actions by the bytes of the weights it drew them over: the draws check 1 takes.
     discrete: dict[str, dict[bytes, tuple[np.ndarray, np.ndarray]]] = {"served": {}, "whole": {}}
 
+    def weighed(variables) -> bytes:
+        leaves = jax.tree.leaves(variables)
+        return hashlib.sha256(b"".join(np.asarray(leaf).tobytes() for leaf in leaves)).digest()
+
     def likelihoods(arm, name):
         @as_given
         def run(variables):
             drawn = collected(arm, variables)
-            key = hashlib.sha256(b"".join(np.asarray(leaf).tobytes() for leaf in jax.tree.leaves(variables)))
-            discrete[name][key.digest()] = (drawn["contexts"], drawn["tokens"])
+            discrete[name][weighed(variables)] = (drawn["contexts"], drawn["tokens"])
             return {held: drawn[held] for held in names}
         return run
 
     @as_given
     def truth(variables):
-        # The actions the whole policy drew, teacher-forced in the float64 twin: drawn as its arm draws them,
-        # in float32 outside the truth's x64 over the weights the gate widened (float32's exactly), by the
-        # arm's own program (row 12407: under x64 the collection compiled and ran a second time).
-        with jax.enable_x64(new_val=False):
-            drawn = collected(whole, jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float32), variables))
+        # The actions the whole policy drew, teacher-forced in the float64 twin: its arm's, over the weights
+        # the gate widened (float32's exactly), or drawn as its arm draws them, in float32 outside the
+        # truth's x64 (row 12407: under x64 the collection compiled and ran each draw a second time).
+        narrow = jax.tree.map(lambda leaf: np.asarray(leaf, np.float32), variables)
+        drawn = discrete["whole"].get(weighed(narrow))
+        if drawn is None:
+            with jax.enable_x64(new_val=False):
+                collection = collected(whole, narrow)
+            drawn = (collection["contexts"], collection["tokens"])
         with jax.enable_x64(new_val=True):
             wide = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), variables)
-            return truth_score(wide, drawn["contexts"], drawn["tokens"])
+            return truth_score(wide, *drawn)
 
     assert_as_exact(likelihoods(served, "served"), likelihoods(whole, "whole"), draw,
                     f"served {kind} episodes", seeds=SEEDS, truth_fn=truth)
