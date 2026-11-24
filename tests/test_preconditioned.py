@@ -24,13 +24,15 @@ from dew.nn.kernels.preconditioned import (
 )
 from dew.nn.precision import l2norm
 
-SHAPE = (2, 40, 2, 4, 16, 8)
+SHAPE = (2, 40, 8, 16, 16, 8)
 """Rows, tokens, key heads, value heads, keys and values: two whole chunks of 16 tokens and a part one,
-each pair of value heads sharing a key head's moment."""
+each pair of value heads sharing a key head's moment; eight key heads, so a draw's centers' gradient, each a
+key head's sum over every token and key, holds eight (two held its pooled ratio's interval past 1.5 at 80
+draws)."""
 CHUNK = 16
-WALKED = (2, 160, 2, 2, 64, 8)
+WALKED = (2, 160, 8, 8, 16, 8)
 """ATK's walk on the template (`diagonal.diagonal_scan` 'mosaic_gpu'): its 128 channels a program's
-(two key heads of 64 keys), 160 tokens three spans of an interpreted walk's 64."""
+(eight key heads of 16 keys), 160 tokens three spans of an interpreted walk's 64."""
 DOCUMENTS = ((0, 11, 30), (5, 17))
 """Each row's packed documents' first tokens."""
 WALKED_DOCUMENTS = ((0, 50, 130), (20, 64, 100))
