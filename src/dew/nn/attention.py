@@ -48,6 +48,7 @@ from .attention_masks import (
     with_key_starts,
 )
 from .attention_parallel import (
+    exchanges_heads,
     four_dimensional,
     on_attention_shards,
     pad_rows,
@@ -748,13 +749,22 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
         block_groups = image_groups = None
     if sliding_window is None:
         places = None
+    visibility = None
     if shards > 1:
         spanned = {"block_groups": block_groups, "image_groups": image_groups, "key_valid": key_valid,
                    "key_runs": key_runs, "places": places, "query_slots": query_slots}
-        causal, sliding_window, mask, key_value_seq_lengths, materialized = _sequence_sharded(
-            query.shape[-3], key.shape[-3], causal=causal, sliding_window=sliding_window, mask=mask,
-            segment_ids=segment_ids, lengths=key_value_seq_lengths, starts=key_value_seq_starts,
-            spanned=spanned)
+        ids = {"segment_ids": segment_ids, "key_value_seq_starts": key_value_seq_starts, **spanned}
+        ids = {name: x for name, x in ids.items() if x is not None}
+        materialized = False
+        if ids and exchanges_heads(query, key, shards, masked=True):
+            # The all-to-all gives each device whole sequences, so the ids travel whole beside them and its
+            # kernel reads them as on one device: no dense [B, 1, S, S] mask (row 1495).
+            visibility = ids
+        else:
+            causal, sliding_window, mask, key_value_seq_lengths, materialized = _sequence_sharded(
+                query.shape[-3], key.shape[-3], causal=causal, sliding_window=sliding_window, mask=mask,
+                segment_ids=segment_ids, lengths=key_value_seq_lengths, starts=key_value_seq_starts,
+                spanned=spanned)
         if materialized:
             implementation = kernel_for_materialized_mask(
                 implementation, query, key, dtype=dtype, precision=precision,
@@ -767,10 +777,11 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
         in_key=in_key)
     if shards > 1:
         out = sequence_parallel_attention(
-            kernel, query, key, value, shards, causal=causal,
+            functools.partial(kernel, max_segments=max_segments) if visibility else kernel,
+            query, key, value, shards, causal=causal,
             sliding_window=sliding_window, mask=mask, bias=dense_bias(bias), sinks=sinks,
             key_value_seq_lengths=key_value_seq_lengths,
-            dropout_rate=dropout_rate if dropping else 0.0, dropout_seed=words)
+            dropout_rate=dropout_rate if dropping else 0.0, dropout_seed=words, visibility=visibility)
     else:
         out = kernel(query, key, value, causal=causal, sliding_window=sliding_window,
                      mask=mask, bias=bias, sinks=sinks, segment_ids=segment_ids,

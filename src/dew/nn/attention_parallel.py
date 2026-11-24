@@ -58,7 +58,7 @@ def unstripe(x, shards: int, axis: int = 1):
 
 def sequence_parallel_attention(kernel, query, key, value, shards: int, *, causal,
                                 sliding_window, mask, bias, sinks, key_value_seq_lengths=None,
-                                dropout_rate=0.0, dropout_seed=None):
+                                dropout_rate=0.0, dropout_seed=None, visibility=None):
     """Run `kernel` over a sequence the mesh's sequence axis splits.
 
     `exchanged_heads_attention` (Ulysses) takes a call whose query heads divide
@@ -71,19 +71,37 @@ def sequence_parallel_attention(kernel, query, key, value, shards: int, *, causa
     docs/guides/multi-node.md), and it never sends more bytes. A call with no
     mask takes the exchange that sends fewer (`all_to_all_moves_less`).
     A dropping call drops what one device would in either (`template.DropPlaces`).
+    `visibility`, the per-token ids a single device's kernel reads (documents, block and image groups, key
+    validity, runs, places, slots, key starts), the all-to-all alone takes (`exchanges_heads`): each device
+    holds whole sequences, so they travel whole beside them and no dense mask is built.
     """
+    masked = causal or sliding_window is not None or mask is not None or bool(visibility)
+    if exchanges_heads(query, key, shards, masked=masked):
+        return exchanged_heads_attention(
+            kernel, query, key, value, shards, causal=causal, sliding_window=sliding_window, mask=mask,
+            bias=bias, sinks=sinks, key_value_seq_lengths=key_value_seq_lengths, dropout_rate=dropout_rate,
+            dropout_seed=dropout_seed, visibility=visibility)
+    if visibility:
+        raise LayoutRefused(
+            "per-token visibility ids travel whole beside whole sequences, which the all-to-all exchange "
+            "alone gives; this call's heads or lengths do not divide for it, so its caller takes the "
+            "visibility as a mask (`dew.nn.attention._sequence_sharded`)")
+    return gathered_keys_attention(kernel, query, key, value, shards, causal=causal,
+                                   sliding_window=sliding_window, mask=mask, bias=bias, sinks=sinks,
+                                   key_value_seq_lengths=key_value_seq_lengths, dropout_rate=dropout_rate,
+                                   dropout_seed=dropout_seed)
+
+
+def exchanges_heads(query, key, shards: int, *, masked: bool) -> bool:
+    """Whether `sequence_parallel_attention` takes the all-to-all (`exchanged_heads_attention`) for a call
+    of these query and key shapes over `shards` sequence shards: its query heads divide by tensor times
+    sequence and its lengths by the shards, and it is `masked` (causal, windowed, or reading a mask or
+    visibility ids) or the exchange sends fewer bytes (`all_to_all_moves_less`)."""
     tensor = tensor_shards(query)
     heads, kv_heads = query.shape[-2], key.shape[-2]
-    masked = causal or sliding_window is not None or mask is not None
     exchangeable = (heads % (tensor * shards) == 0
                     and query.shape[-3] % shards == 0 and key.shape[-3] % shards == 0)
-    run = (exchanged_heads_attention
-           if exchangeable and (masked or all_to_all_moves_less(heads, kv_heads, tensor, shards))
-           else gathered_keys_attention)
-    return run(kernel, query, key, value, shards, causal=causal,
-               sliding_window=sliding_window, mask=mask, bias=bias, sinks=sinks,
-               key_value_seq_lengths=key_value_seq_lengths, dropout_rate=dropout_rate,
-               dropout_seed=dropout_seed)
+    return exchangeable and (masked or all_to_all_moves_less(heads, kv_heads, tensor, shards))
 
 
 def all_to_all_moves_less(heads: int, kv_heads: int, tensor: int, shards: int) -> bool:
@@ -222,7 +240,7 @@ def four_dimensional(x):
 
 def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
                               sliding_window, mask, bias, sinks, key_value_seq_lengths=None,
-                              dropout_rate=0.0, dropout_seed=None):
+                              dropout_rate=0.0, dropout_seed=None, visibility=None):
     """DeepSpeed Ulysses: trade a slice of the sequence for a slice of the heads.
 
     One all-to-all per operand over the sequence axis turns each shard's S/n
@@ -236,7 +254,9 @@ def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
     Heads split over tensor first and sequence within it, so H divides by
     tensor times sequence; key and value heads repeat only to the least common
     multiple of their count and that split. A mask or bias head dimension,
-    learned sinks and key lengths split with what they belong to. Batch rows
+    learned sinks and key lengths split with what they belong to; `visibility`'s per-token ids (keyword
+    arguments of `kernel`, each an array or a tuple of them) split their rows as the queries do and
+    arrive whole along the sequence, as the kernel reads them on one device. Batch rows
     split over every batch axis that still divides them, in mesh order, and are
     attended alike where it does not. A dropping call draws each shard's
     weights at their global rows and heads, its sequences whole
@@ -273,6 +293,12 @@ def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
     if key_value_seq_lengths is not None:
         extras['key_value_seq_lengths'] = (key_value_seq_lengths, query_split(
             ("activation_batch",), key_value_seq_lengths, queries, query.shape))
+    for name, ids in (visibility or {}).items():
+        # Whole along the sequence beside the whole sequences the exchange gives: a leaf of the batch's
+        # rows split as the query's own, any other whole.
+        extras[name] = (ids, jax.tree.map(
+            lambda leaf: P(_entry(queries, 0) if jnp.ndim(leaf) and leaf.shape[0] == query.shape[0]
+                           else None), ids))
     if dropout_seed is not None:
         # Each shard's global rows and heads, split as its query rows and the exchanged heads.
         extras['dropout_seed'] = (dropout_seed, P(None))
