@@ -870,6 +870,7 @@ class Tiles:
     resident: int
 
 
+@dataclasses.dataclass(frozen=True)
 class Selective(base.Template[Tiles]):
     """Mamba's selective scan on the recurrence template (`selective_scan`), its config derived from the
     device's facts (`derived`), its launches named for the compile's reports (`report.launching`), so a launch
@@ -884,7 +885,9 @@ class Selective(base.Template[Tiles]):
     # a gradient's call is tuned and certified as reverse mode runs it (`tuning.KernelOp.moded`, row 12340).
     CARRIES_DERIVATIVE: ClassVar[bool] = True
     # 2: the backward's exp2, its token-only products and its scans' fused joins (row 1300) change its speed
-    # at every config, so a pick measured before them stops matching (`tuning.KernelOp.revision`).
+    # at every config, so a pick measured before them stops matching (`tuning.KernelOp.revision`): a field,
+    # as the op's identity reads its fields (`tuning._identity`); a class attribute alone, the instance kept
+    # KernelOp's 1 (row 12421).
     revision: int = 2
 
     def _fwd(self, x, dt, A, B, C, D, state=None, starts=None, *, forked: Forked | None = None,
