@@ -188,6 +188,33 @@ def test_band_pairs_join_from_the_largest_whatever_their_order():
     np.testing.assert_array_equal(np.asarray(contract(MEAN, masses, values)), [2.0 ** -104])
 
 
+def test_a_bin_whose_high_part_cancels_keeps_its_low_part():
+    """Scalar terms `2^23 + 2^23 + 1 - 2^23 - 2^23` beside a term whose keys' band pairs cancel to zero
+    (`2^32 - 2^32 + 0`, taking the sum banded) sum to 1: the five land in one exponent bin, `2^24 + 1` rounds
+    its 1 into the low part and the two subtractions cancel the high part, and the bin renormalizes, so its
+    1 joins the total, where its high part 0 read as an empty bin and gave inf (review of #3979, P0)."""
+    form = Form(("", "", "", "", "", "k", "k"), (
+        (1, (((0, 1),),)), (1, (((1, 1),),)), (1, (((2, 1),),)), (-1, (((3, 1),),)), (-1, (((4, 1),),)),
+        (1, (((5, 1),), ((6, 1),)))), "")
+    big, one = jnp.float32(2.0 ** 23), jnp.float32(1.0)
+    keys = jnp.asarray([2.0 ** 32, 2.0 ** 32, 2.0 ** -90], jnp.float32)
+    weights = jnp.asarray([1.0, -1.0, 0.0], jnp.float32)
+    np.testing.assert_array_equal(np.asarray(contract(form, big, big, one, big, big, keys, weights)), 1.0)
+
+
+def test_a_residue_beneath_the_terms_largest_reaches_its_quotient():
+    """Three factors over three keys, `2^381 - 2^381 + 2^-360`, over a divisor of `2^-300` is `2^-60`: the
+    bins reach as far beneath the terms' largest as three factors' products lie (`_span`), where a fixed
+    reach of 640 binades dropped the `2^-360` and the quotient was 0 (review of #3979, P0)."""
+    form = Form(("k", "k", "k", "", "", ""), ((1, (((0, 1),), ((1, 1),), ((2, 1),))),), "",
+                divisor=((1, (((3, 1), (4, 1), (5, 1)),)),), divided="")
+    factor = jnp.asarray([2.0 ** 127, 2.0 ** 127, 2.0 ** -120], jnp.float32)
+    negated = jnp.asarray([2.0 ** 127, -(2.0 ** 127), 2.0 ** -120], jnp.float32)
+    small = jnp.float32(2.0 ** -100)
+    np.testing.assert_array_equal(np.asarray(contract(form, factor, factor, negated, small, small, small)),
+                                  2.0 ** -60)
+
+
 def test_a_non_finite_row_leaves_the_others_banded():
     """Beside a row whose value is infinite (its mean IEEE's, `inf`), a row whose values cancel past the
     format keeps its `2^-32`: the banded sum reads non-finite values as none and the IEEE result is laid over

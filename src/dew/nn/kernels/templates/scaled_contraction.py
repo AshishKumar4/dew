@@ -130,16 +130,23 @@ BIN = 24
 """The binades an exponent bin of the banded sum spans (`_banded`): fp32's significand, so a bin's
 contributions, each within it, add as a double float whose cancellations are exact."""
 
-SPAN = 640
-"""The binades beneath its top (`HEADROOM` over the terms' largest) the banded sum's bins reach: past two
-fp32 operands' products of the format's largest (2^254) to its least subnormal (2^-149) and its count."""
+REACH = 278
+"""The binades one fp32 factor's exponents span, its largest's (127) to its least subnormal's (-149) and the
+one a significand rounds up into: a term of `n` factors' products lie within `n` of them (`_span`)."""
 
 HEADROOM = 64
 """The binades a contraction's sum may rise above its term's exponent: its factors' significands within
 `[2^-n, 2^n]` and its count's (at most 2^31) bits, beneath 64 for every term a form names."""
 
 
-def _band(groups: tuple) -> int:
+def _span(terms: tuple[Term, ...]) -> int:
+    """The binades beneath its top (`HEADROOM` over the terms' largest) the banded sum's bins reach: a term's
+    products of `n` factors lie within `n REACH` binades, so a part that cancels leaves no residue a quotient
+    could raise back that the bins drop (review of #3979: three factors' `2^-360` beneath `2^381`)."""
+    return REACH * max(1, *(sum(power != 0 for group in groups for _, power in group) for _, groups in terms))
+
+
+def _band(groups: tuple, span: int) -> int:
     """The binades a group's band spans in a term of `groups` (each `_held`'s group, its factors counted):
     a band pair's product of significands each within `[2^-(band + n), 2^n]` stays a normal fp32
     (`2^-120`); 0 where the term's groups and factors leave no band of at least 8, or more band pairs than
@@ -147,7 +154,7 @@ def _band(groups: tuple) -> int:
     factors = sum(len(group) for group in groups)
     width = (120 - factors) // len(groups)
     # Its pairs counted in int32 (`_banded`): a term of more groups than that holds taken unbanded too.
-    return width if width >= 8 and (SPAN // width + 1) ** len(groups) < 2 ** 31 else 0
+    return width if width >= 8 and (span // width + 1) ** len(groups) < 2 ** 31 else 0
 
 
 def _dtype(arrays) -> jnp.dtype:
@@ -187,12 +194,14 @@ def _sum(arrays, form: Form, terms: tuple[Term, ...], out: str, dtype):
     high, low, exponent = _descending(parts)
     plain = jnp.where(special, landed, high + low), jnp.where(special, joined, exponent)
     # A band past the first in a group of a term a band holds: the sum again a band pair at a time.
+    span = _span(terms)
     wide = [functools.reduce(jnp.maximum, [jnp.max(-offset, initial=0) for _, _, offset, _ in parts])
-            >= _band(groups) for (_, groups), parts in zip(terms, held, strict=True) if _band(groups)]
+            >= _band(groups, span)
+            for (_, groups), parts in zip(terms, held, strict=True) if _band(groups, span)]
     if not wide:
         return plain
     banded = jax.lax.cond(functools.reduce(jnp.logical_or, wide),
-                          lambda: _banded(terms, held, scales, contracted), lambda: plain)
+                          lambda: _banded(terms, held, scales, contracted, span), lambda: plain)
     return jnp.where(special, landed, banded[0]), jnp.where(special, joined, banded[1])
 
 
@@ -212,32 +221,36 @@ def _descending(parts: list) -> tuple[jax.Array, jax.Array, jax.Array]:
         for at in range(len(parts))])
 
 
-def _banded(terms: tuple[Term, ...], held: list, scales: list, contracted) -> tuple[jax.Array, jax.Array]:
+def _banded(terms: tuple[Term, ...], held: list, scales: list, contracted, span: int
+            ) -> tuple[jax.Array, jax.Array]:
     """`_sum`'s terms contracted a band of each group at a time (`_band`: a finite value whose offset
     beneath its group's largest lies in `[-(i + 1) band, -i band)` in band `i`, raised `2^(i band)`; one
-    past `SPAN` none), each band pair's sum added into the exponent bin of its magnitude at each output
-    (`BIN` binades from `HEADROOM` over the terms' largest, `SPAN` beneath it, as double floats at the bin's
-    power), the bins joined from the largest down (`windows.joined`): so whatever order the pairs come in, a
-    part beneath pairs that cancel keeps its bin's double float. A term no band holds adds its one sum.
-    Each term's pairs one `lax.while_loop` (its program one contraction whatever the bands), its count
-    within `SPAN // band + 1` a group, the loops' carries typed from the terms' own reductions."""
+    past `span` none), each band pair's sum added into the exponent bin of its magnitude at each output
+    (`BIN` binades from `HEADROOM` over the terms' largest, `span` beneath it, `_span`, as double floats at
+    the bin's power, renormalized as each adds), the bins joined from the largest down (`windows.joined`):
+    so whatever order the pairs come in, a part beneath pairs that cancel keeps its bin's double float. A
+    term no band holds adds its one sum. Each term's pairs one `lax.while_loop` (its program one contraction
+    whatever the bands), its count within `span // band + 1` a group, the loops' carries typed from the
+    terms' own reductions."""
     top = functools.reduce(jnp.maximum, scales) + HEADROOM
-    bins = SPAN // BIN + 1
+    bins = span // BIN + 1
     zero = (top - top).astype(jnp.float32)
     state = (jnp.zeros((bins, *zero.shape), jnp.float32) + zero,) * 2
 
     def added(state, summed, power):
         """`summed * 2^power` at each output added into its bin."""
-        binade = jnp.where(summed != 0, power + binade_of(summed), top - SPAN - BIN)
+        binade = jnp.where(summed != 0, power + binade_of(summed), top - span - BIN)
         index = jnp.clip((top - 1 - binade) // BIN, 0, bins - 1)
         laid = jnp.arange(bins, dtype=jnp.int32).reshape(bins, *(1,) * zero.ndim)
         reference = top - (laid + 1) * BIN
         contribution = jnp.where(index == laid, power2(summed, power - reference), 0)
+        # Renormalized, so a bin whose high part cancels holds its low part high (`windows.joined` reads a
+        # zero high part as an empty double float).
         high, error = two_sum(state[0], contribution)
-        return high, state[1] + error
+        return two_sum(high, state[1] + error)
 
     for t, ((sign, groups), parts) in enumerate(zip(terms, held, strict=True)):
-        width = _band(groups)
+        width = _band(groups, span)
         finite = [jnp.where(jnp.isfinite(significand), significand, 0) for _, significand, _, _ in parts]
         offsets = [offset for _, _, offset, _ in parts]
         if not width:
@@ -245,7 +258,7 @@ def _banded(terms: tuple[Term, ...], held: list, scales: list, contracted) -> tu
                                         for significand, offset in zip(finite, offsets, strict=True)])
             state = added(state, sign * summed, scales[t])
             continue
-        most = SPAN // width
+        most = span // width
         bands = [(-offset) // width for _, _, offset, _ in parts]
         counts = [jnp.minimum(jnp.max(band, initial=0), most) + 1 for band in bands]
         pairs = functools.reduce(jnp.multiply, counts)
