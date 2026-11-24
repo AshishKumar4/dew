@@ -42,7 +42,15 @@ from dew.nn.dense import Dense, packed_matrix
 from dew.nn.derivatives import KernelGlue, Protected, contracted, declared_tangent, with_tangents_formed_at
 from dew.nn.residuals import Residual
 
-from .activations import GatedActivation, gated_hook, gated_product, logistic, relu2, swiglu_clamped
+from .activations import (
+    GatedActivation,
+    gated_hook,
+    gated_product,
+    logistic,
+    relu2,
+    rounded_gated,
+    swiglu_clamped,
+)
 from .blocks import normal_kernel
 from .flops import MissingFlopsCount, counted_flops, projection_flops
 from .kernels import formats, gemm, generation, projections
@@ -790,9 +798,10 @@ def paired_projections(x: jax.Array | Gathered, first: jax.Array | Layered, seco
     indices each at its own. `Gathered` rows are read and scaled where they lie, as `expert_projection`
     reads them."""
     compute, paired = _paired(x, first, second, dtype)
-    if paired is None:
-        return _apart(x, (first, second), group_sizes, compute, implementation, precision)
-    return _paired_call(paired, group_sizes, compute, implementation, precision)
+    first_rows, second_rows = (_apart(x, (first, second), group_sizes, compute, implementation, precision)
+                               if paired is None else
+                               _paired_call(paired, group_sizes, compute, implementation, precision))
+    return first_rows, second_rows
 
 
 def gated_experts(x: jax.Array | Gathered, gate: jax.Array | Layered, up: jax.Array | Layered,
@@ -824,13 +833,8 @@ def gated_experts(x: jax.Array | Gathered, gate: jax.Array | Layered, up: jax.Ar
         return _computed(expert_projection(hidden, down, group_sizes, compute, implementation, precision,
                                            scatter=scatter), compute)
     hook = gated_hook(activation, limit)
-
-    def projected(gate_sums, up_sums):
-        gate_rows, up_rows = gate_sums.astype(compute), up_sums.astype(compute)
-        return gate_rows, up_rows, hook(gate_rows, up_rows)
-
     gate_rows, up_rows, hidden = _paired_call(
-        paired, group_sizes, compute, implementation, precision, epilogue=projected,
+        paired, group_sizes, compute, implementation, precision, epilogue=rounded_gated(hook, compute),
         named=(Residual.GATE_PROJ, Residual.UP_PROJ, None))
     # Named where a remat policy reads them too, as the down projection's operands (`fused_products`).
     gate_rows, up_rows = (checkpoint_name(gate_rows, Residual.GATE_PROJ),
@@ -1452,7 +1456,8 @@ class ExpertMLP(nn.Module):
             return checkpoint_name(linear(hidden, kernels[1], slots), Residual.DOWN_PROJ)
         # The gate and up projections read the same rows: one paired product, their gated product its
         # epilogue and the down projection's prologue (`gated_experts`).
-        return checkpoint_name(gated_experts(tokens, *kernels, sizes, dtype, self.implementation,
+        gate, up, down = kernels
+        return checkpoint_name(gated_experts(tokens, gate, up, down, sizes, dtype, self.implementation,
                                              self.precision, self.activation, self.swiglu_limit, slots),
                                Residual.DOWN_PROJ)
 
