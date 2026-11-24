@@ -21,7 +21,7 @@ from dew.objectives.lm import LMObjective
 from dew.optim import Muon, OptimConfig, ParamGroup
 from dew.training import Trainer
 from dew.training.memory import MemoryMiss, recompute_more, recompute_record
-from dew.training.planning import FitSearch
+from dew.training.planning import FitSearch, Probe
 
 MUON_ROW = 512
 """The tokens a row of `muon_long`'s holds."""
@@ -117,6 +117,7 @@ class Scripted(FitSearch):
         place = self.place()
         self.compiled.append(place)
         short = self.need(*place) - self.room
+        self.probes.append(Probe(split, 1, self.current(), short <= 0, -short, 0, 0))
         if short > 0:
             self.misses[(self.rung(), split)] = MemoryMiss(split, 0, short * self.factor, self.factor)
         return short <= 0
@@ -153,3 +154,18 @@ def test_a_parted_step_past_the_stacks_count_is_asked_before_the_search_gives_up
     parted = [at for at, (_, group) in enumerate(asked) if group == 1]
     assert joined and parted and max(joined) < min(parted), asked
     assert asked[parted[0]] == (0, 1) and asked[-1][1] == 1 and search.place() == asked[-1], asked
+
+
+def test_a_frontier_below_a_plan_settled_joined_reads_the_parted_steps_beneath_it():
+    """A search that settles joined on a higher rung, its start's parted step deferred (its miss past the
+    stacks' count), leaves that parted step, which fits, to the frontier a plan made offline reads beneath
+    it (`FitSearch.below`, `dew.training.ahead.compile_ahead(frontier=True)`'s lighter plans): the run's
+    speed is chosen among them (review of row 12463: the frontier read the joined rungs alone)."""
+    search = Scripted(lambda place, group: {(0, None): 100, (0, 1): 90}.get((place, group), 90), room=90,
+                      count=5)
+    origin = search.rung_now()
+    assert search.searched([1], 0) == 1
+    settled, place = search.rung_now(), search.place()
+    assert search.compiled == [(0, None), place] and place[0] > 0, search.compiled
+    lighter = search.below([1], origin, settled)
+    assert (0, 1) in search.compiled[2:] and any(probe.fits for probe in lighter), search.compiled

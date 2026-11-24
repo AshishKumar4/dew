@@ -171,9 +171,9 @@ class Candidate:
     a step kept apart from its trace (`dew.training._candidates.candidate_for`) sets again on the links of
     the trace that reads it."""
     joined: int = 0
-    """The most bytes a device holds at once of the Newton-Schulz stacks of one shape its updates join two or
-    more of where its run states no group (`dew.newton_schulz.joining`), 0 where they join none: all its
-    plan's release would part (`FitSearch.searched`) could free."""
+    """What the Newton-Schulz stacks of one shape its updates join two or more of where its run states no
+    group hold by count (`dew.newton_schulz.joined_held`), every Muon transform's together, 0 where they
+    join none: an estimate that orders its plan's release (`Parting`) and rules none out."""
     resident: Mapping[Hashable, int] = dataclasses.field(default_factory=dict)
     """The bytes the state it was lowered from held on each of this process's devices as it was lowered
     (`resident_on`), read off the placed arrays before their shapes stood for them (`prepared`): the
@@ -1472,17 +1472,23 @@ class FitSearch[LossT, EffectsT]:
         whatever the frontier above it asked since (`above`). Every rung's twin under XLA's defaults is read,
         whichever split's options it differs from (`step_options` reads a microbatch's size): where it is the
         step's own program at its split, its entry states the same figures as the own one's. None where the
-        plan is no rung of that climb (the run's own, or one past a release the climb does not read). The
-        objective is left at the last rung read, the run's to restore."""
+        plan is no rung of that climb (the run's own, or one past a release the climb does not read). Where
+        the step joins Newton-Schulz stacks its run states no group for, each place is read joined and then
+        with them parted (`Parting`), the configured rung's own parted step among them, as the search may
+        settle joined above a parted step that fits (review of row 12463). The objective is left at the last
+        rung read, the run's to restore."""
         self.at(origin)
         # The climb as the configured run reads it: one that set its own remat climbs its head alone, whatever
         # remat a record then moved it to.
         explicit = remat_stated(self.objective)
-        start = dataclasses.replace(origin, ns_group=plan.ns_group)
+        groups = (None, 1) if origin.ns_group is None and self.stacks_held() else (plan.ns_group,)
+        start = dataclasses.replace(origin, ns_group=groups[0])
         copies = start.narrow and any(candidate.copies for candidate in self.lowered.values())
-        order = [*([dataclasses.replace(start, narrow=False)] if copies else []),
-                 *(rung for group in self.ladder(start, start.narrow, start.ns_group, remat_set=explicit,
-                                                 defaults=(False, True)) for rung in group)]
+        places = [*([dataclasses.replace(start, narrow=False)] if copies else []),
+                  *(rung for places in self.ladder(start, start.narrow, start.ns_group, remat_set=explicit,
+                                                   defaults=(False, True)) for rung in places)]
+        order = [*(dataclasses.replace(start, ns_group=group) for group in groups[1:]),
+                 *(dataclasses.replace(place, ns_group=group) for place in places for group in groups)]
         if plan not in order:
             return ()
         # A rung read here that misses is no checkpoint's rung missing (`fits_here`).
