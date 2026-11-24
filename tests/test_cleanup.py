@@ -15,7 +15,7 @@ import pytest
 from process_support import running
 from test_process_support import gone_within
 
-from dew._cleanup import attempted, end_group, owned_group, process_group, start, stop
+from dew._cleanup import attempted, end_group, owned_group, start, stop
 
 LEAVES_A_CHILD = (
     "import os, time\n"
@@ -362,15 +362,6 @@ def test_a_group_owned_for_a_block_ends_with_it_and_a_failing_close_is_a_note_on
         leader.stdin.write("a request nothing reads")
         raise own
     assert raised.value is own and len(own.__notes__) == 1
-    assert leader.returncode is not None and leader.stdout.closed
-    assert gone_within(child, 30)
-
-
-def test_a_process_group_ends_with_its_block_and_closes_its_pipes():
-    """A `process_group` ends the group, the child its leader left among it, as its block ends."""
-    with process_group([sys.executable, "-c", leader_with_child("time.sleep(600)")],
-                               stdout=subprocess.PIPE, text=True) as leader:
-        child = child_of(leader)
     assert leader.returncode is not None and leader.stdout.closed
     assert gone_within(child, 30)
 

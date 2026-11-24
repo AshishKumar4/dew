@@ -60,8 +60,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Protocol
 
-from dew import _cgroups
-from dew._cleanup import exit_code, groups_ended, owned_group, signal_group
+from dew import _cgroups, _cleanup
+from dew._cleanup import exit_code, groups_ended, owned_group
 from dew._files import inside
 from dew._records import JSON, finite
 from dew.data.prompts import PromptRecord
@@ -509,9 +509,10 @@ class ContainerRunner:
             # The pull and the container start count against the deadline, so
             # a cold image is a timeout, not an unbounded wait.
             deadline = started + limits.wall_seconds
-            process = subprocess.Popen(self.command(program, limits, directory, name, cidfile),
-                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                       stderr=subprocess.PIPE, start_new_session=True)
+            # The client's group has a lifeline (`_cleanup.start`): a trainer killed however it dies takes the
+            # client with it, where a group of its own alone outlived it (row 12772).
+            process = _cleanup.start(self.command(program, limits, directory, name, cidfile),
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             stalled: subprocess.TimeoutExpired | None = None
             try:
                 streams, stopped = _collected(process, program.stdin.encode(), deadline, limits.message_bytes)
@@ -520,7 +521,7 @@ class ContainerRunner:
                     # The client dies first so it makes no further API call;
                     # `rm --force` then removes the container whether it is
                     # still being created, created or running.
-                    signal_group(process, signal.SIGKILL)
+                    _cleanup.stop([process], settle=0.0)
                     try:
                         subprocess.run([self.runtime, "rm", "--force", name], capture_output=True,
                                        timeout=_REMOVAL_SECONDS, check=False)
