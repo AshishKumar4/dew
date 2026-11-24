@@ -1533,18 +1533,67 @@ class CausalTransformer(LinearProducts):
         under a chosen template refused, row 4101). A banked store answers from
         its bank's first row without fetching it.
         """
-        layer = self.layers[first]
+        return self.scan_probe(
+            x, train=train, decode=decode, per_layer_input=per_layer_input,
+            attention_metadata=attention_metadata, first=first)[0]
+
+    @nn.nowrap
+    def scan_probe(self, x, *, train: bool, decode: bool, per_layer_input,
+                   attention_metadata=None, first: int = 0, prior_bank=None,
+                   runs: Sequence[tuple[int, int, int]] = ()) -> tuple[jnp.dtype, bool]:
+        """Layer `first`'s settled residual dtype (`residual_dtype`) and whether any scanned run among
+        `runs` (`(start, count, period)`) captures a non-array intermediate leaf, which no scan stacks.
+
+        When `runs` is given (a caller's own `capture_intermediates` filter on an unbanked stack), steps
+        abstractly through each run's representative layers up to the last scanned run (`count > 1`) in one
+        `jax.eval_shape`, returning only layer `first`'s output so non-array captures never fail shape
+        inference; otherwise probes layer `first` alone.
+        """
+        from flax.linen import module as flax_module
+
         streams = x.streams if isinstance(x, Carried) else x
         assert self.scope is not None, "a bound decoder's stack"
         opened = self.scope.mutable
-        output = jax.eval_shape(lambda held: layer.apply(
-            held, x, mutable=opened, rngs={'params': jax.random.key(0)},
-            train=train, decode=decode, kv_store={} if self.provides else None,
-            per_layer_input=None if per_layer_input is None else per_layer_input.layer(first),
-            attention_metadata=attention_metadata), self._layer_shapes_at(first))
-        output = output if opened is False else output[0]
+        capture = (flax_module._context.capture_stack[-1]
+                   if runs and flax_module._context.capture_stack else False)
+        if runs:
+            last = max(position for position, (_, count, _) in enumerate(runs) if count > 1)
+            steps = tuple((index, count > 1) for start, count, period in runs[:last + 1]
+                          for index in range(start, start + period))
+        else:
+            steps = ((first, False),)
+        non_array = False
+
+        def probed(shapes):
+            nonlocal non_array
+            kv_store = {} if self.provides else None
+            carry = x
+            first_out = None
+            extra = {} if prior_bank is None else {'prior_bank': prior_bank}
+            for (index, scanned_run), held in zip(steps, shapes, strict=True):
+                result = self.layers[index].apply(
+                    held, carry, mutable=opened, capture_intermediates=capture,
+                    rngs={'params': jax.random.key(0)},
+                    train=train, decode=decode, kv_store=kv_store,
+                    per_layer_input=None if per_layer_input is None else per_layer_input.layer(index),
+                    attention_metadata=attention_metadata, **extra)
+                if opened is False:
+                    carry = result
+                else:
+                    carry, mutated = result
+                    if scanned_run and _INTERMEDIATES in mutated and any(
+                            not isinstance(leaf, jax.Array)
+                            for leaf in jax.tree.leaves(mutated[_INTERMEDIATES])):
+                        non_array = True
+                if first_out is None:
+                    first_out = carry
+                if non_array:
+                    break
+            return first_out
+
+        output = jax.eval_shape(probed, tuple(self._layer_shapes_at(index) for index, _ in steps))
         output = output.streams if isinstance(output, Carried) else output
-        return jnp.result_type(streams.dtype, output.dtype)
+        return jnp.result_type(streams.dtype, output.dtype), non_array
 
     def first_layer_shapes(self) -> dict:
         """Return the stack's first layer's variables as shape/dtype structs (`layer_shapes`)."""
@@ -1561,6 +1610,7 @@ class CausalTransformer(LinearProducts):
         """
         return self._layer_shapes_at(self.groups[run][0], run=run)
 
+    @nn.nowrap
     def _layer_shapes_at(self, index: int, *, run: int | None = None) -> dict:
         """Layer `index`'s stored variables as shape/dtype structs (`layer_shapes`), skipping captured
         intermediates, which are outputs a layer never reads (and may hold non-array returns, row 11882)."""

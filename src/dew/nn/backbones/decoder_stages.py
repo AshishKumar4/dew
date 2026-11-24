@@ -111,6 +111,7 @@ def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer
         # (`decoder_cache._banked_runs`), each run's layers' under the run's name, as the run's scan
         # carries it; a cache handed in a layer at a time goes back so.
         banked = (*banked, 'cache')
+    probe_runs: tuple[tuple[int, int, int], ...] = ()
     if stages == 1 and staged:
         if span is not None:
             raise LayoutRefused(f"a loop over layers {span} runs part of the stack, and a stage-local "
@@ -123,11 +124,12 @@ def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer
         if span is not None and banked and not set(groups).issubset(decoder.groups):
             raise LayoutRefused(f"a loop over layers {span} runs part of the stack, and a store banked "
                                 f"by run holds whole runs; {list(banked)} arrived banked")
-        if not any(count > 1 for _, count in groups) or (
-                not banked and 'streaming' not in decoder.variables and captures_any_method(decoder)):
-            # No run scans, or a capture of any method keeps what no scan stacks (a method's non-array
-            # return): each layer runs as the plain stack runs it.
+        if not any(count > 1 for _, count in groups):
+            # No run scans: each layer runs as the plain stack runs it, without probing a scan carry dtype.
             return unrolled()
+        if not banked and 'streaming' not in decoder.variables and captures_any_method(decoder):
+            probe_runs = tuple((start, count, period)
+                               for (start, count), period in zip(groups, periods, strict=True))
         view, split = (StackView(groups, banked=banked, periods=periods),
                        StageSplit(0, decoder.num_layers, 0))
     else:
@@ -135,9 +137,13 @@ def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer
             raise LayoutRefused("a looped pass reads the bank its pass before left in every layer, which "
                                 "a pipeline over the stage axis does not carry: run the loop on one stage")
         view, split = pipelined(decoder, x, stages, decode=decode, banked=banked, span=span)
-    dtype = decoder.residual_dtype(
+    dtype, non_array = decoder.scan_probe(
         x, train=train, decode=decode, per_layer_input=per_layer_input,
-        attention_metadata=attention_metadata, first=first)
+        attention_metadata=attention_metadata, first=first, prior_bank=prior_bank, runs=probe_runs)
+    if non_array:
+        # A capture of any method kept what no scan stacks (a method's non-array return): each layer runs
+        # as the plain stack runs it.
+        return unrolled()
     # A carried collapse stays fp32, as the reference keeps it.
     x = x._replace(streams=x.streams.astype(dtype)) if isinstance(x, Carried) else x.astype(dtype)
     run = nn.map_variables(stacked, mapped_collections=True, trans_in_fn=view.stack,
