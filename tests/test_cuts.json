@@ -502,10 +502,10 @@
 "tests/test_attention_route.py::test_a_call_named_onto_the_template_lowers_for_a_gpu[bias-sm80-full-training-accurate]",
 "tests/test_attention_route.py::test_a_call_named_onto_the_template_lowers_for_a_gpu[bias-sm90-full-training-accurate]",
 "tests/test_attention_route.py::test_a_call_named_onto_the_template_lowers_for_a_gpu[fp32-128-causal-training-fast]",
-"tests/test_attention_route.py::test_a_call_named_onto_the_template_lowers_for_a_gpu[fp32-64-full-inference-accurate]",
+"tests/test_attention_route.py::test_a_call_named_onto_the_template_lowers_for_a_gpu[fp32-64-full-inference-fast]",
 "tests/test_attention_route.py::test_a_call_named_onto_the_template_lowers_for_a_gpu[fp32-64-full-training-fast]",
-"tests/test_attention_route.py::test_a_call_whose_queries_hold_no_key_runs_attends_to_no_key[template]",
-"tests/test_attention_route.py::test_a_dropped_out_call_draws_over_the_keys_its_block_groups_mean[block-causal-documents-window]",
+"tests/test_attention_route.py::test_a_call_no_triton_config_fits_lowers_on_another_mainloop[sm120]",
+"tests/test_attention_route.py::test_a_dense_bias_named_onto_the_template_is_on_par_with_the_reference_path[a bias a row-deterministic]",
 "tests/test_attention_route.py::test_a_named_template_call_keeps_the_kernel_contract_on_a_data_and_head_mesh[lengths-and-starts-two-key-heads]",
 "tests/test_attention_route.py::test_a_named_template_call_keeps_the_kernel_contract_on_a_data_and_head_mesh[own-documents-blocks-one-key-head]",
 "tests/test_attention_route.py::test_a_named_template_call_keeps_the_kernel_contract_on_a_data_and_head_mesh[own-documents-blocks-two-key-heads]",
@@ -852,6 +852,9 @@
 "tests/test_chunked_cross_entropy.py::test_the_fused_head_takes_the_whole_heads_loss_and_gradients_under_the_float64_rule[uncapped-float32]",
 "tests/test_chunked_cross_entropy.py::test_the_softcap_gradient_survives_saturated_logits",
 "tests/test_chunked_cross_entropy.py::test_the_whole_logits_head_computes_what_the_tiled_one_does[None-float32]"
+],
+"tests/test_codec_checkpoints.py": [
+"tests/test_codec_checkpoints.py::test_a_quantized_checkpoint_saves_its_own_bytes[modelopt/tiny]"
 ],
 "tests/test_compile_ahead.py": [
 "tests/test_compile_ahead.py::test_a_compile_only_gpu_holds_the_accumulator_a_step_builds_once",
@@ -1700,9 +1703,6 @@
 "tests/test_gemm_degenerate.py::test_a_degenerate_call_is_xlas[width no tile divides-paired]",
 "tests/test_gemm_degenerate.py::test_a_degenerate_call_is_xlas[width no tile divides-plain]"
 ],
-"tests/test_gemm_formed.py": [
-"tests/test_gemm_formed.py::test_a_composed_mlps_training_step_compiles_within_its_resources[sm90]"
-],
 "tests/test_gemm_gather.py": [
 "tests/test_gemm_gather.py::test_a_gathered_kernel_gradient_reads_each_operands_rows_where_its_table_says[sm90-2]",
 "tests/test_gemm_gather.py::test_a_kernel_gradient_no_launch_reads_through_its_tables_runs_a_launch_on_its_gathered_rows",
@@ -2482,9 +2482,9 @@
 "tests/test_merged.py": [
 "tests/test_merged.py::test_a_finished_split_merge_vmaps_query_params_and_keys_hooks_by_dtype_and_context",
 "tests/test_merged.py::test_a_finished_split_merge_with_output_hooks_compiles_spill_free_and_matches_emitted_bytes[sm120-output]",
-"tests/test_merged.py::test_a_finished_split_merge_with_output_hooks_compiles_spill_free_and_matches_emitted_bytes[sm90-output]",
-"tests/test_merged.py::test_a_padded_merge_and_its_derivatives_are_on_par[fold-jitted]",
-"tests/test_merged.py::test_a_padded_merge_and_its_derivatives_are_on_par[natural-jitted]",
+"tests/test_merged.py::test_a_finished_split_merge_with_output_hooks_compiles_spill_free_and_matches_emitted_bytes[sm80-output]",
+"tests/test_merged.py::test_a_finished_split_merge_with_output_hooks_compiles_spill_free_and_matches_emitted_bytes[sm90-query]",
+"tests/test_merged.py::test_a_padded_merge_and_its_derivatives_are_on_par[fold-op-by-op]",
 "tests/test_merged.py::test_a_padded_merge_batched_is_each_batchs_own",
 "tests/test_merged.py::test_a_padded_merge_compiles_as_one_launch[sm100-shapes-finished]",
 "tests/test_merged.py::test_a_padded_merge_compiles_as_one_launch[sm100-shapes-long]",
@@ -3998,9 +3998,6 @@
 "tests/test_trainer.py::test_a_generator_declared_to_replay_resumes_on_the_batches_the_whole_run_reads",
 "tests/test_trainer.py::test_a_share_of_a_run_with_no_planned_length_is_refused",
 "tests/test_trainer.py::test_an_explicit_state_starts_a_token_count_with_its_own_reader"
-],
-"tests/test_training_dtypes.py": [
-"tests/test_training_dtypes.py::test_x64_router_bias_storage_survives_updates_and_restart[float32]"
 ],
 "tests/test_training_transactions.py": [
 "tests/test_training_transactions.py::test_a_masked_diffusion_run_clips_its_attention_at_its_pooled_maxima[whole]",
