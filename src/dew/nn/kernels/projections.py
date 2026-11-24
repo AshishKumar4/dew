@@ -176,13 +176,9 @@ def recipe_chain(rows: jax.Array, up: jax.Array, down: jax.Array, activation: Ca
                          whole=(1, 2, 3))
     count = rows.shape[0]
     laid = jnp.pad(rows, ((0, -count % SCALE_DEPTH), (0, 0)))
-    # Its padding zero rows the backward keeps out of every gradient (`_chain_backward`'s live rows),
-    # compiled for a GPU (never interpreted: a run's recipe).
-    interpret = False
-    w_ins = (up[None],) if gate is None else (gate[None], up[None])
-    blocks = jnp.full((1,), laid.shape[0] // SCALE_DEPTH, jnp.int32)
-    return _blockwise_chain(laid, w_ins, down[None], blocks, activation, jnp.dtype(out_dtype), interpret,
-                            count)[:count]
+    # Its padding zero rows the backward keeps out of every gradient (`_chain_backward`'s live rows).
+    return _chained(laid, up[None], down[None], activation, out_dtype=out_dtype,
+                    gate=None if gate is None else gate[None], live=count, interpret=False)[:count]
 
 
 def _projected_apart(rows, matrix, group_sizes, *, out_dtype, bias, along) -> jax.Array:
@@ -363,10 +359,16 @@ def blockwise_chain(x: jax.Array, w_up: jax.Array, w_down: jax.Array, activation
                          "scales are stored transposed, each share's rows whole")
     if gate is not None and gate.shape != w_up.shape:
         raise ValueError(f"a gated chain's gate is its up projection's shape {w_up.shape}, not {gate.shape}")
+    return _chained(x, w_up, w_down, activation, out_dtype=out_dtype, gate=gate, live=x.shape[0],
+                    interpret=interpret_on_cpu)
+
+
+def _chained(x, w_up, w_down, activation, *, out_dtype, gate, live: int, interpret: bool) -> jax.Array:
+    """The chain's declared-derivative call (`_blockwise_chain`) of one group of `x`'s whole blocks, its
+    first `live` rows the caller's: `blockwise_chain`'s, every row; `recipe_chain`'s, the rows it padded."""
     group_blocks = jnp.full((1,), x.shape[0] // SCALE_DEPTH, jnp.int32)
     w_ins = (w_up,) if gate is None else (gate, w_up)
-    return _blockwise_chain(x, w_ins, w_down, group_blocks, activation, jnp.dtype(out_dtype),
-                            interpret_on_cpu, x.shape[0])
+    return _blockwise_chain(x, w_ins, w_down, group_blocks, activation, jnp.dtype(out_dtype), interpret, live)
 
 
 def mxfp8_projection(x: jax.Array, w: jax.Array, group_blocks: jax.Array, *, out_dtype,
