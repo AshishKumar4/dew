@@ -534,6 +534,22 @@ def unqualified(monkeypatch):
 
 
 @pytest.fixture
+def interpreted_as_an_a100():
+    """An interpreted call in a CPU process states the GPU it emulates (`generation.assumed`): the
+    Pallas-Triton mainloop's tiles and their costs are an A100's, its target's facts, where a CPU has none.
+    Its files ask for it (`pytestmark = pytest.mark.usefixtures("interpreted_as_an_a100")`)."""
+    from generation_support import interprets
+
+    from dew.nn.kernels import generation
+
+    if not interprets():
+        yield
+        return
+    with generation.assumed("sm80"):
+        yield
+
+
+@pytest.fixture
 def without_deterministic_ops(monkeypatch):
     """The cuda lane runs the whole suite under --xla_gpu_deterministic_ops,
     under which Dew's fused kernels take their ordered schedules (a
