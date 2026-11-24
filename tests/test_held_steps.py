@@ -4,7 +4,6 @@ batch signature; and the limit a GPU compile stops past, which gives back the st
 (`compile_limit`, row 12465)."""
 
 import gc
-import weakref
 
 import jax
 import jax.numpy as jnp
@@ -12,6 +11,7 @@ import numpy as np
 import optax
 import pytest
 from affine_run import FEATURES, Regression
+from jax.extend.backend import get_backend
 
 from dew.distributed.placement import Layout, MeshSpec
 from dew.training import FitPolicy, Trainer
@@ -33,7 +33,6 @@ def test_a_runs_held_steps_let_the_one_used_least_recently_go_first_past_their_b
     assert list(held) == ["small", "large"] and held.bytes == 25 and released == ["middle"]
     held.hold("larger", "L", 40)
     assert list(held) == ["larger"] and released == ["middle", "small", "large"]
-    assert held.made == 4 and held.met == {"small", "middle", "large", "larger"}
 
 
 def test_a_runs_held_steps_stay_whole_under_threads_holding_and_reading_at_once():
@@ -83,41 +82,31 @@ def _shaped(rows: tuple[int, ...]):
 def test_a_fit_meeting_shape_after_shape_holds_no_step_past_its_budget(monkeypatch):
     """A fit whose run holds no more device code than its latest step's (`HELD_CODE_BYTES`) meets three
     batch shapes and then each again: each shape it meets lets the steps of the one before go, the runner
-    its fit held (`FitRun.compiled`) and the executable its compiler held (`FitSearch.executables`), so the
-    executable of its first shape is freed while the fit runs on, and each shape met again compiles again;
-    it trains as a run that held every step (review of row 12385: the fit's runners held every executable
-    the compiler let go until the fit ended)."""
+    its fit held (`FitRun.compiled`) and the executable its compiler held (`FitSearch.executables`), so at
+    no step does the backend hold more than the step it runs and the one before it, which the loop ran
+    last; and it trains as a run that held every step, which holds all three at once (review of row
+    12385: the fit's runners held every executable the compiler let go until the fit ended)."""
     from dew.training import memory
+    from dew.training.observe import Observe
+
+    def steps_live() -> int:
+        """The live executables the backend holds of the run's steps, its traced step's module."""
+        gc.collect()
+        return sum(1 for executable in get_backend().live_executables()
+                   if "step" in executable.hlo_modules()[0].name)
 
     def trained(budget: int | None):
-        tables, executables, freed = [], [], []
-        compiled_for = Trainer._compiled_for
-
-        def watched(self, compiled, *args, **kwargs):
-            made = compiled.made
-            stepped = compiled_for(self, compiled, *args, **kwargs)
-            if compiled.made > made:
-                tables.append(compiled)
-                executables.append(weakref.ref(self.executable))
-                gc.collect()
-                # Whether the first shape's executable is freed, with this compile's step about to run.
-                freed.append(executables[0]() is None)
-            return stepped
-
         with monkeypatch.context() as patched:
             if budget is not None:
                 patched.setattr(memory, "HELD_CODE_BYTES", budget)
-            patched.setattr(Trainer, "_compiled_for", watched)
+            live = Observe(1, lambda state: steps_live())
             trainer = Trainer(Regression(), optax.sgd(0.1), key=jax.random.key(0))
-            state = trainer.fit(_shaped((16, 8, 32)), steps=6, log_every=100)
-        return tables[-1], freed, jax.device_get(state.variables)
+            state = trainer.fit(_shaped((16, 8, 32)), steps=6, log_every=100, observe=live)
+        return [count for _, count in live.values], jax.device_get(state.variables)
 
-    bounded, freed, held = trained(1)
-    whole, _, kept = trained(None)
-    assert bounded.made == 6 and len(bounded) == 1, (bounded.made, list(bounded))
-    assert whole.made == 3 and len(whole) == 3, (whole.made, list(whole))
-    # Freed once the third shape's step compiled, the second's the step the loop last ran.
-    assert freed[2:] == [True] * 4, freed
+    bounded, held = trained(1)
+    whole, kept = trained(None)
+    assert max(bounded) <= 2 < max(whole), (bounded, whole)
     jax.tree.map(np.testing.assert_array_equal, held, kept)
 
 

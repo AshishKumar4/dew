@@ -1979,7 +1979,7 @@ class Trainer(Generic[Loss, Effects]):
         if run.train is not None:
             run.train.close()
         branched = FitRun(run.started, run.startup, current=run.current, partition=run.partition,
-                          reads=run.reads, compiled=run.compiled, marked=run.marked)
+                          reads=run.reads, compiled=run.compiled, passes=run.passes, marked=run.marked)
         # The branch's own clock of committed tokens, from the run's, which a schedule's stages end at
         # as the run's do (`_scheduled`), read off the devices where its steps may have reached what it
         # reads next (`FitPlan.committed`); the stages it begins are its own, the run's kept as they were.
@@ -2266,7 +2266,7 @@ class Trainer(Generic[Loss, Effects]):
         """
         state = self._staged(state, run.current)
         signature = self.phase_passes.key(batch_signature(batch))
-        if signature not in compiled and self.phase_passes.begins(compiled.met) and (
+        if signature not in compiled and self.phase_passes.begins(run.passes) and (
                 not occupied(state.window)):
             # A phase of other passes begins at an update's end: its step is planned afresh, at the split
             # the run was given or the planner's for its own passes, over the state as a fresh state holds
@@ -2291,9 +2291,12 @@ class Trainer(Generic[Loss, Effects]):
             began = time.perf_counter()
             with region("compile"), run.held():
                 step = self.compile(state, batch, trials)
-            # Charged as every process charges it (`FitRun.compiled`).
-            charge = max(from_every_process(code_bytes(self.executable)))
+            planned = None if self._compiled is None else self._compiled.planned
+            sampled = None if planned is None or planned.sampled is None else planned.sampled.executable
+            # Charged its step's code and its sampled step's, as every process charges it (`FitRun.compiled`).
+            charge = max(from_every_process(code_bytes(self.executable, sampled)))
             compiled.hold(signature, (step, self.step_flops), charge)
+            run.passes.add(self.phase_passes.current)
             seconds = time.perf_counter() - began
             settled_heap(run, compiled=True)
             links = {axis: AxisLink(link.bytes_per_second, link.spread) for axis, link in self.links.items()}

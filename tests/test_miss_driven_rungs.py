@@ -7,9 +7,10 @@ by the probes its plan or refusal records."""
 
 import jax
 import numpy as np
+import pytest
 
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
-from dew.nn.kernels.generation import compile_only_gpus
+from dew.nn.kernels.generation import chosen, compile_only_gpus
 from dew.objectives.lm import LMObjective
 from dew.optim import Adam, Muon, OptimConfig
 from dew.registry import models
@@ -52,22 +53,26 @@ def test_a_miss_whose_joined_stacks_hold_less_than_it_was_short_of_parts_them_af
     assert ahead is not None or any(probe["ns_group"] == 1 for probe in probes), probes
 
 
-def test_a_search_asks_first_the_rung_its_miss_reads_as_dropping_what_it_was_short_of():
+@pytest.mark.parametrize("stack", ["plain", "scanned"])
+def test_a_search_asks_first_the_rung_its_miss_reads_as_dropping_what_it_was_short_of(stack):
     """A step of one row, which no split shrinks, whose MLPs' forward values hold most of its temporaries,
     that misses its devices at no remat on an H100 between what 'save_dot_except_mlp' needs and what
     'minimal' needs, asks 'save_dot_except_mlp' next, the rung its miss reads as dropping what it was short
     of (`RecomputeStatement`), passing over 'minimal', which drops too little, and is admitted there: two
-    compiles, where the climb a rung at a time compiled 'minimal' between them."""
+    compiles, where the climb a rung at a time compiled 'minimal' between them; its stack a layer at a time
+    or scanned, whose body's values the rung's policy keeps or drops as an unscanned block's
+    (`dew.nn.protocols.RUNG_SCOPE`)."""
     model = models.build("causal_transformer", vocab_size=256, emb_features=256, num_layers=4, num_heads=4,
                          num_kv_heads=2, head_dim=64, mlp_features=8192, max_seq_len=1024, dtype="bfloat16",
                          attention_impl="xla")
-    rung = {name: _ahead(model.clone(remat=REMAT_POLICIES[name]), Adam(), 1024, 1, 2 ** 34)[0]
-            for name in ("minimal", "save_dot_except_mlp")}
-    assert all(ahead is not None for ahead in rung.values()), rung
-    lighter, dropping = (_needed(ahead) for ahead in rung.values() if ahead is not None)
-    # Its devices between the two rungs' needs: 'minimal' misses there, 'save_dot_except_mlp' fits.
-    assert dropping < lighter, (dropping, lighter)
-    ahead, probes = _ahead(model, Adam(), 1024, 1, (dropping + lighter) // 2)
+    with chosen(layer_scan=stack):
+        rung = {name: _ahead(model.clone(remat=REMAT_POLICIES[name]), Adam(), 1024, 1, 2 ** 34)[0]
+                for name in ("minimal", "save_dot_except_mlp")}
+        assert all(ahead is not None for ahead in rung.values()), rung
+        lighter, dropping = (_needed(ahead) for ahead in rung.values() if ahead is not None)
+        # Its devices between the two rungs' needs: 'minimal' misses there, 'save_dot_except_mlp' fits.
+        assert dropping < lighter, (dropping, lighter)
+        ahead, probes = _ahead(model, Adam(), 1024, 1, (dropping + lighter) // 2)
     assert ahead is not None and ahead.plan["remat"] == "save_dot_except_mlp", probes
     asked = [probe["remat"] for probe in probes]
     assert asked == [None, "save_dot_except_mlp"], probes

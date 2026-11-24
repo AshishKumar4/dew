@@ -707,8 +707,7 @@ class StepCompiler[L, E]:
         # program, its options and its devices, held for the run alone and bounded by their code's bytes
         # (`HeldExecutables`): `executables`, its run's compiler's, where it plans a later phase off the loop
         # (`dew.training.ahead.LaterPlans`).
-        # A held executable's key leads with its program's (`compiled_key`).
-        held = HeldExecutables(released=lambda key: forget_program(key[0] if isinstance(key, tuple) else key))
+        held = HeldExecutables(released=lambda key: forget_program(key.program))
         self._executables = held if executables is None else executables
         # A fresh run's first step planned over its state's shapes before the state is placed
         # (`planned_unplaced`), by the signature of the batch it was planned over: its first compile's.

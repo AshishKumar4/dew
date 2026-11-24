@@ -499,8 +499,9 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
             # a whole-bank device accumulator. Remat retains the original
             # host operand and refetches only this layer in backward
             # (MaxText layers/decoders.py:544-565).
-            step = nn.remat(nn.map_variables(
-                step, mapped_collections=True, trans_in_fn=fetched, init=False, mutable=True))
+            # Its policy no rung's: the whole layer recomputed in the backward (`fixed_remat`).
+            step = nn.remat(fixed_remat(nn.map_variables(
+                step, mapped_collections=True, trans_in_fn=fetched, init=False, mutable=True)))
         if count == 1:
             x, written = step(run, x, None if inputs is None else inputs.layer(0), store)
             if store is not None:
@@ -523,8 +524,12 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
 
             policy = _rows_recomputed(remat)
 
+            # Under a rung that keeps names the rows' policy is the rung's; under none or one recomputing
+            # named residuals itself it is their own, no rung's (`_rows_recomputed`, `fixed_remat`).
+            own = remat is None or bool(remat.recompute)
+
             def scanned(layer, carry, index, *, store=store, step=step, rows=rows, inputs=inputs,
-                        policy=policy):
+                        policy=policy, own=own):
                 # The iteration's per-layer input, its layers along axis 2.
                 per_layer_input = jax.tree.map(
                     lambda leaf: jax.lax.dynamic_index_in_dim(leaf, index, axis=2, keepdims=False), inputs)
@@ -539,8 +544,7 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
                     return nn.map_variables(layered, (LAYER_ROWS, *rows), init=False, mutable=False,
                                             trans_in_fn=functools.partial(_rows_joined, index=index))(
                         layer, carry)
-                # Its policy the rows' own, no rung's (`fixed_remat`).
-                rematted = nn.remat(fixed_remat(read), policy=policy, prevent_cse=False)
+                rematted = nn.remat(fixed_remat(read) if own else read, policy=policy, prevent_cse=False)
                 return rematted(layer, carry, index), None
             # A parameter its module boxed (`nn.with_logical_partitioning`) stacks with an unnamed layer
             # axis, which the run's view cuts off again per layer (`_rows`).

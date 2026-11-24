@@ -165,7 +165,36 @@ decoder's layout choice on stand-in H100s, row 8411), so 32 keep two fits' whole
 where 4 kept none and each fit traced its ladder again."""
 
 _CANDIDATES: collections.OrderedDict[Hashable, Candidate] = collections.OrderedDict()
+_BY_PROGRAM: dict[Hashable, set[Hashable]] = {}
+"""The keys of the kept steps (`_CANDIDATES`) by their program (`program_key`), read as each is kept, so a
+program let go drops its steps without reading any other's (`forget_program`)."""
+_BY_LOWERING: dict[int, Hashable] = {}
+"""The key of each kept step by its lowering's identity (`forget_unplanned`)."""
 _KEEPING = threading.Lock()
+
+
+def _kept(key: Hashable, candidate: Candidate) -> None:
+    """Keep `candidate` under `key` and its indexes, under `_KEEPING`, the oldest past `KEPT_CANDIDATES`
+    let go."""
+    _dropped(key)
+    _CANDIDATES[key] = candidate
+    _BY_PROGRAM.setdefault(program_key(candidate.lowered), set()).add(key)
+    _BY_LOWERING[id(candidate.lowered)] = key
+    while len(_CANDIDATES) > KEPT_CANDIDATES:
+        _dropped(next(iter(_CANDIDATES)))
+
+
+def _dropped(key: Hashable) -> None:
+    """Let the step kept at `key` go, with its indexes, under `_KEEPING`; nothing where none is kept."""
+    candidate = _CANDIDATES.pop(key, None)
+    if candidate is None:
+        return
+    program = known_program_key(candidate.lowered)
+    keys = _BY_PROGRAM.get(program, set())
+    keys.discard(key)
+    if not keys:
+        _BY_PROGRAM.pop(program, None)
+    _BY_LOWERING.pop(id(candidate.lowered), None)
 
 
 class _Kept:
@@ -175,6 +204,8 @@ class _Kept:
     def released(self) -> None:
         with _KEEPING:
             _CANDIDATES.clear()
+            _BY_PROGRAM.clear()
+            _BY_LOWERING.clear()
 
 
 _KEPT = _Kept()
@@ -211,8 +242,9 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
     states traces its own."""
     # Read as the candidate is made, at the rung the search put the objective at (row 3873).
     stated = stepping.step_key()
-    # What this state's arrays hold where they lie, a step lowered for other devices none of this process's.
-    resident = resident_on(state) if mesh is None else {}
+    # What the state's and batch's arrays hold where they lie, the step's arguments XLA counts; a step
+    # lowered for other devices none of this process's.
+    resident = resident_on(state, batch) if mesh is None else {}
     # What the step traces from beside its arguments and the trainer's settings: the compiles' refusals
     # its kernels' derivation reads (a relowering after a spill reads its proposal's), and the context.
     key = None if stated is None else (
@@ -236,10 +268,8 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
         with _KEEPING:
             # Registered as it is published, under one lock, so no release clears the cache between them.
             held_until_release(_KEPT)
-            _CANDIDATES[key] = dataclasses.replace(candidate, micro=_shapes(candidate.micro), sampled=None,
-                                                   spread=spread_axes())
-            while len(_CANDIDATES) > KEPT_CANDIDATES:
-                _CANDIDATES.popitem(last=False)
+            _kept(key, dataclasses.replace(candidate, micro=_shapes(candidate.micro), sampled=None,
+                                           spread=spread_axes()))
     return candidate
 
 
@@ -249,20 +279,17 @@ def forget(lowered: jax.stages.Lowered) -> None:
     (`Planned.guided`), whether compiled from `lowered` or taken from its run's compiler's executables
     (`FitSearch.executables`), so no kept lowering holds the superseded executable alive beside the guided
     one (JAX keeps each executable of a lowering while it lives)."""
-    forget_program(program_key(lowered), lowered)
+    forget_program(program_key(lowered))
 
 
-def forget_program(target: Hashable, lowered: jax.stages.Lowered | None = None) -> None:
+def forget_program(target: Hashable) -> None:
     """Drop every step this process keeps for a trainer built anew (`candidate_for`) whose program is
-    `target` (`program_key`), or whose lowering is `lowered`: one whose executable its run's compiler let go
+    `target` (`program_key`): one whose executable its run's compiler let go
     (`dew.training.planning.HeldExecutables`), so no kept lowering holds its device code past that bound,
-    or which a guided compile supersedes (`forget`)."""
+    or which a guided compile supersedes (`forget`). By the program's own index, no other step read."""
     with _KEEPING:
-        # By the key each kept lowering's program was read under, none rendered here: one whose key no one
-        # read keyed no executable (`known_program_key`).
-        for key in [key for key, kept in _CANDIDATES.items()
-                    if kept.lowered is lowered or known_program_key(kept.lowered) == target]:
-            del _CANDIDATES[key]
+        for key in list(_BY_PROGRAM.get(target, ())):
+            _dropped(key)
 
 
 def forget_unplanned(lowerings: Sequence[jax.stages.Lowered],
@@ -271,10 +298,10 @@ def forget_unplanned(lowerings: Sequence[jax.stages.Lowered],
     `lowerings` but `planned`'s (every one, where None), by the lowering itself: a search's losing and
     frontier rungs, whose lowerings key their executables while they live
     (`dew.training.planning.FitSearch.released_unplanned`)."""
-    dropped = {id(lowered) for lowered in lowerings if lowered is not planned}
     with _KEEPING:
-        for key in [key for key, kept in _CANDIDATES.items() if id(kept.lowered) in dropped]:
-            del _CANDIDATES[key]
+        for lowered in lowerings:
+            if lowered is not planned and (key := _BY_LOWERING.get(id(lowered))) is not None:
+                _dropped(key)
 
 
 def _sampled[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], candidate: Candidate, batch: Batch,

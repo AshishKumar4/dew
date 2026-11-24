@@ -500,6 +500,9 @@ class FitRun:
     step too: bounded by their device code as the compiler's executables are (`CodeBounded`), each charged
     the most any process's code for it holds, so every process lets the same steps go and compiles a shape
     it met again together; the step being run is held by its caller."""
+    passes: set[int | None] = dataclasses.field(default_factory=set)
+    """The pass count of each step it compiled (`PhasePasses.current`, None for the objective's own), which a
+    step of a phase no step ran begins afresh by (`PhasePasses.begins`), whatever steps `compiled` let go."""
     cooling: Mapping[str, object] | None = None
     """The cooldown branch the run is to run at its current step before it reads on, resolved
     (`dew.training.cooldown.Pending`): one its checkpoints kept unfinished, as the pool agreed it, or

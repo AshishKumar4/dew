@@ -601,7 +601,9 @@ def test_a_step_whose_admission_refuses_every_candidate_is_refused_by_its_search
     """A fit search whose every candidate's admission refuses it (`dew.communicators.CommunicatorRoom`: the
     runtime's need past the room the pool left) asks each candidate as a step that misses, and refuses the
     step naming that admission, never ending at the first candidate's (row 12131's review: a losing rung's
-    admission ended the search)."""
+    admission ended the search), nor recording any rung it asked as fitting (`PlanRefused.asked`, what the
+    search says of each rung, `FitSearch.said`; review of row 12131: a refused rung with no shortfall was
+    said to fit)."""
     import numpy as np
     import optax
 
@@ -628,6 +630,8 @@ def test_a_step_whose_admission_refuses_every_candidate_is_refused_by_its_search
     finally:
         communicators.hold(held)
     assert isinstance(refused.value.__cause__, CommunicatorRoom), refused.value.__cause__
+    outcomes = [asked["outcome"] for asked in refused.value.asked]
+    assert outcomes and "fits" not in outcomes, refused.value.asked
 
 
 @pytest.mark.parametrize("fetched", [False, True], ids=["called", "fetched"])
