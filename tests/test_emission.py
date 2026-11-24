@@ -893,8 +893,9 @@ def test_an_atomic_add_counts_its_bytes_reduced_where_global_and_an_a100_prices_
     assert work.global_reductions == launched * 64 * 64 * 4
     reductions = cost.rates(ampere, device=False).reductions
     assert reductions == 3.0 * ampere.loaded_clock_hz
-    busiest = 2 * 64 * 64 * 4 / reductions + (ampere.launch_seconds or 0.0)
+    busiest = 2 * ((work.global_reductions / launched) / reductions) + (ampere.launch_seconds or 0.0)
     for resident in (1, 2):
-        assert cost.launch_seconds(work, launched, ampere, resident=resident) == pytest.approx(busiest)
+        priced = cost.launch_seconds(work, launched, ampere, resident=resident)
+        assert priced == busiest, (resident, priced, busiest)
     assert cost.rates(hopper, device=False).reductions is None
     assert work.global_reductions in cost.units(work, cost.rates(hopper, device=False))[1]
