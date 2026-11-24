@@ -1721,7 +1721,7 @@ def _weighted_swizzles(call: Call, keyed: int) -> dict:
     """`_weighted`'s streams a block of their row (a tile slices only whole swizzle rows): the keys and a
     decay a key dimension's prefix, each part's widest swizzle at `keyed` columns, and the values at their
     block (`_weighted_value_block`) where it walks them."""
-    walked = {name: keyed for name in ("keys", *PREFIX_STREAMS)}
+    walked = dict.fromkeys(("keys", *PREFIX_STREAMS), keyed)
     if call.per_key:
         walked.update(values=_weighted_value_block(call, keyed))
     return {part: resources.widest_swizzle(operand.stored, walked[name])
