@@ -189,7 +189,7 @@ def record_case(label: str, draw, evaluate, *, store_inputs: bool = True,
                 summary: bool = False, dew=None, start: int = FEWEST_SEEDS,
                 examples: bool = False, scale=None, judged: bool = False,
                 kept_in: Path | None = None, resumed_from: Path | None = None,
-                followed: bool = False) -> dict[str, np.ndarray]:
+                followed: bool = False, unweighted: int | None = None) -> dict[str, np.ndarray]:
     """`label`'s recording: `draw(seed)` gives a seed's inputs (a dict of arrays), `evaluate(inputs)` the
     reference's outputs and their float64 truth (dicts). The recorded reference alone sizes the count
     (`seeds_for`), recording the draws its doublings take, and the recording keeps exactly the confirmed
@@ -225,7 +225,10 @@ def record_case(label: str, draw, evaluate, *, store_inputs: bool = True,
     outputs in hand (`_weighed`): each leaf's heavy elements over the weighed check's draws
     (`<label>.heavy.<leaf>`) and the reference's weighed evidence a draw, a recording of its own under
     `<label>.weighed` whose leaves are the classes' (`dew.parity.Conditioning.recorded_evidence`). Its
-    unweighted sizing that never resolves declares the cap, MOST_SEEDS (docs/design/testing.md).
+    unweighted sizing that never resolves declares the cap, MOST_SEEDS (docs/design/testing.md); a site a
+    reading of its records has shown so (`unweighted`, a count no greater than MOST_SEEDS) declares that count
+    and keeps its draws, its paired ladder not run (multimodal-qwen35's: every slice of its GPU recording
+    climbed the ladder again to the cap).
     With `kept_in`, a directory, each seed's evaluation and scale is saved there as
     it is made, and with `resumed_from`, an interrupted run's `kept_in`, found there in place of being made
     again (`_Kept`): the recording a run resumed makes is the one an uninterrupted run makes. With `followed`,
@@ -250,21 +253,14 @@ def record_case(label: str, draw, evaluate, *, store_inputs: bool = True,
     reference, arm = (live, recorded) if judged else (recorded, live)
 
     def sizing(stage: str):
-        """A line a doubling, flushed: a long recording (a GPU's, chunked) shows how far its sizing is."""
-        def told(count: int, index: int, counts: int) -> None:
-            print(f"{label}: {stage} sizing at {count} seeds ({index} of at most {counts}, from {start})",
-                  flush=True)
-        return told
+        return _sizing(label, stage, start)
 
-    try:
-        confirmed = seeds_for(reference, recorded_draw, label, start=start,
-                              truth_fn=as_given(lambda index, inputs: record(int(index))[2]),
-                              dew_fn=arm, examples=examples, progress=sizing("its"))
-    except Inconclusive:
-        # A weighed site whose unweighted sizing never resolves declares the cap (docs/design/testing.md).
-        if scale is None:
-            raise
-        confirmed = MOST_SEEDS
+    if unweighted is not None and unweighted > MOST_SEEDS:
+        raise ValueError(f"{label}: a declared count of {unweighted} seeds is past the cap, MOST_SEEDS "
+                         f"({MOST_SEEDS})")
+    confirmed = unweighted if unweighted is not None else _confirmed(
+        label, reference, recorded_draw, record, start=start, arm=arm, examples=examples,
+        progress=sizing("its"), weighs=scale is not None)
     # The recording is the confirmed count's draws and their redraw, no more.
     kept = staged_units(confirmed)
     weighed = 0
@@ -281,11 +277,7 @@ def record_case(label: str, draw, evaluate, *, store_inputs: bool = True,
     kept_records = [] if streamed else [records[seed] for seed in range(kept)]
     decided = _decided(label, held.decisions, kept) if followed else {}
     # The weighed check's own entries, the same whether the outputs are kept or summarized.
-    weighing = {} if scaled is None else {
-        f"{label}.conditioning": np.asarray(weighed, np.int32),
-        **{f"{label}.scale.{name}": np.stack([scaled(seed)[name]
-                                             for seed in range(staged_units(weighed))])
-           for name in scaled(0)}}
+    weighing = {} if scaled is None else _weighing(label, weighed, scaled)
     if summary:
         # A weighed check that draws past the unweighted one's stages reads the reference and its truth's
         # sketch at every draw of its own, so the evidence covers the further of the two.
@@ -304,6 +296,36 @@ def record_case(label: str, draw, evaluate, *, store_inputs: bool = True,
     print(f"{label}: declared {confirmed} seeds; recorded {kept} draws", flush=True)
     return result
 
+
+def _sizing(label: str, stage: str, start: int):
+    """A line a doubling, flushed: a long recording (a GPU's, chunked) shows how far its sizing is."""
+    def told(count: int, index: int, counts: int) -> None:
+        print(f"{label}: {stage} sizing at {count} seeds ({index} of at most {counts}, from {start})",
+              flush=True)
+    return told
+
+
+def _confirmed(label: str, reference, recorded_draw, record, *, start: int, arm, examples: bool, progress,
+               weighs: bool) -> int:
+    """The count the recorded reference confirms (`seeds_for`), where no count is declared; a weighed
+    site whose unweighted sizing never resolves declares the cap (docs/design/testing.md)."""
+    try:
+        return seeds_for(reference, recorded_draw, label, start=start,
+                         truth_fn=as_given(lambda index, inputs: record(int(index))[2]),
+                         dew_fn=arm, examples=examples, progress=progress)
+    except Inconclusive:
+        if not weighs:
+            raise
+        return MOST_SEEDS
+
+
+def _weighing(label: str, weighed: int, scaled) -> dict[str, np.ndarray]:
+    """The weighed check's own entries (`record_case`'s `scale`): its declared count and each draw's scale,
+    the same whether the outputs are kept or summarized."""
+    return {f"{label}.conditioning": np.asarray(weighed, np.int32),
+            **{f"{label}.scale.{name}": np.stack([scaled(seed)[name]
+                                                  for seed in range(staged_units(weighed))])
+               for name in scaled(0)}}
 
 def _followed_case(label: str, followed: bool, dew, scale, summary: bool) -> None:
     """A followed recording's case (`record_case`'s `followed`, docs/design/testing.md: a quantized
