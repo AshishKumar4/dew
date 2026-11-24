@@ -719,10 +719,13 @@ def test_a_padded_merges_launch_work_counts_common_passes_unmasked_bytes_and_spa
     mosaic_work = merged.launch_work(spec, pad_p, pad_s, 4, 80, mosaic)
     assert mosaic_work.device_bytes == _mosaic_expected_bytes(
         rows=2 * 4 * 8, slices=16, width=80, read_width=128, block=mosaic_block)
+    # Each block's chunk loads its own valid columns (block 0's first `mosaic_block`, block 1's the next,
+    # none past 80) and its maxima and totals: the emitted roles' walks hold 80 columns over the blocks
+    # they cover, not the 128 padded ones.
     roles_pad = _mosaic_emitted_roles(spec, pad_p, pad_s, 4, 80, mosaic_block, target=mosaic)
-    pad_blocks = 128 // mosaic_block
-    assert roles_pad[0].walks[0].device_bytes == float(8 * ((80 / pad_blocks) * 4 + 2 * 4))
-    assert roles_pad[0].walks[0].device_bytes < float(8 * ((128 / pad_blocks) * 4 + 2 * 4))
+    covered = min(80, len(roles_pad) * mosaic_block)
+    assert sum(role.walks[0].device_bytes for role in roles_pad) == float(
+        8 * (covered * 4 + len(roles_pad) * 2 * 4))
     triton_block = merged._channel_block(spec, pad_p, pad_s, 4, 80, sm75)
     triton_work = merged.launch_work(spec, pad_p, pad_s, 4, 80, sm75)
     assert triton_work.device_bytes == _traced_merge_bytes(
@@ -1201,8 +1204,10 @@ def test_a_finished_split_merge_with_output_hooks_compiles_spill_free_and_matche
         roles_base = _mosaic_emitted_roles(
             spec, padded, stacked, queries, width, block, target=target, out_dtype=jnp.bfloat16,
             out_heads=out_heads)
-        per_block_hook = float((width / blocks) * gate.dtype.itemsize + head.dtype.itemsize)
-        assert roles_hooked[0].fixed.device_bytes - roles_base[0].fixed.device_bytes == per_block_hook
+        # Block 0's hook reads its own valid columns of the gate and the head's one word, which every lane
+        # reads at one address.
+        first_block_hook = float(min(block, width) * gate.dtype.itemsize + head.dtype.itemsize)
+        assert roles_hooked[0].fixed.device_bytes - roles_base[0].fixed.device_bytes == first_block_hook
 
 
 def test_a_finished_merge_reads_its_output_parameters_as_a_launch_keeps_them():
