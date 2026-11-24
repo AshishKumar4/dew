@@ -2417,16 +2417,21 @@ def test_a_cutlass_launch_under_a_checked_shard_map_varies_as_its_operands_do(mo
 
 
 def _stand_in_cutlass(monkeypatch) -> None:
-    """dew_cutlass's targets and its sm90 build named for a CPU's trace (no CPU runs its kernels): what a
-    route to CUTLASS and its launch read of the wheel."""
+    """A dew_cutlass wheel for a CPU's trace (no CPU runs its kernels): its targets, its sm90 build (every
+    Hopper part runs it, `architecture`) and that build's one kernel, what a route to CUTLASS and its launch
+    read of the wheel (`generation.cutlass_built`, `grouped_cutlass.cutlass_tile`)."""
+    import importlib.machinery
     import types
 
     kernel = types.SimpleNamespace(tile=(128, 256, 64), stages=4, consumers=256, cluster=2,
                                    instructions="wgmma")
-    monkeypatch.setitem(sys.modules, "dew_cutlass", types.SimpleNamespace(
-        TARGETS=("dew_cutlass_gmm", "dew_cutlass_tgmm"), registered=lambda: None,
-        KERNELS={("sm90", "bfloat16"): kernel, ("sm90", "float32"): kernel}))
-    monkeypatch.setattr(generation, "cutlass_built", lambda: {"sm90": "sm90"})
+    wheel = types.ModuleType("dew_cutlass")
+    vars(wheel).update(
+        __spec__=importlib.machinery.ModuleSpec("dew_cutlass", None, origin="stand-in://dew_cutlass/sm90"),
+        TARGETS=("dew_cutlass_gmm", "dew_cutlass_tgmm"),
+        KERNELS={("sm90", "bfloat16"): kernel, ("sm90", "float32"): kernel}, registered=lambda: None,
+        architecture=lambda major, minor: "sm90" if major == 9 else None)
+    monkeypatch.setitem(sys.modules, "dew_cutlass", wheel)
 
 
 def test_a_call_naming_cutlass_takes_its_rows_through_a_prologue(monkeypatch):
