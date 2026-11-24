@@ -11,10 +11,10 @@ from collections.abc import Callable, Sequence
 
 import numpy as np
 from jax._src.interpreters import mlir as jax_mlir
-from jax._src.lib.mlir import ir
-from jax._src.lib.mlir.dialects import arith, func
 from jax._src.pallas.mosaic_gpu import primitives as gpu_primitives
 from jax.experimental.mosaic.gpu import fragmented_array, utils as mgpu_utils
+from jax.extend.mlir import ir
+from jax.extend.mlir.dialects import arith, func
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates.cost import Work
@@ -48,7 +48,8 @@ _MEMORY = frozenset({"memref.load", "memref.store", "vector.load", "vector.store
 
 _FREE_PREFIXES = ("vector.", "llvm.mlir.", "builtin.unrealized_conversion_cast", "gpu.thread_id",
                   "gpu.block_id", "gpu.block_dim", "gpu.grid_dim", "nvvm.read.ptx.sreg", "nvvm.barrier",
-                  "nvvm.fence", "nvvm.shfl.sync", "nvvm.elect.sync")
+                  "nvvm.fence", "nvvm.shfl.sync", "nvvm.elect.sync", "nvvm.mbarrier", "nvvm.cp.async.commit",
+                  "nvvm.cp.async.wait", "nvvm.cp.async.mbarrier")
 """Ops that move a value between registers or name a thread's place (a shuffle's lanes, a barrier's wait),
 which compute nothing a unit's rate prices: register moves, addresses (`llvm.getelementptr`'s arithmetic),
 a thread's indices, synchronization and a shuffle's exchange, which `emission` prices for no reduction
@@ -223,6 +224,12 @@ class _Lanes:
             return Work(shared_bytes=moved) if _shared(address.type) else Work(device_bytes=moved)
         if name in _FREE or name.startswith(_FREE_PREFIXES):
             return Work()
+        if name == "llvm.inline_asm":
+            return _assembly(ir.StringAttr(op.attributes["asm_string"]).value, issued, moving)
+        if name == "nvvm.cp.async.shared.global":
+            # Each active lane's copy of `size` bytes from device into shared memory.
+            copied = ir.IntegerAttr(op.attributes["size"]).value * moving
+            return Work(device_bytes=copied, shared_bytes=copied)
         typed = op.operands[-1].type if name in ("arith.cmpf", "arith.cmpi", "arith.select") else (
             op.results[0].type if op.results else None)
         if typed is None:
@@ -243,6 +250,54 @@ class _Lanes:
         if name in _INTEGER:
             return Work(integer_operations=elements) if isinstance(typed, ir.VectorType) else Work()
         raise Uncounted(f"no rule counts {name}")
+
+
+_PTX_FLOAT = ("fma.", "mul.", "add.", "sub.", "max.", "min.", "neg.", "abs.")
+_PTX_SPECIAL = ("ex2.", "lg2.", "rcp.", "rsqrt.", "sqrt.", "tanh.", "sin.", "cos.")
+_PTX_FREE = ("shfl.", "mov.", "setp.", "selp.", "bar.", "barrier.", "fence.", "membar.", "elect.", "vote.",
+             "activemask.")
+_PTX_INTEGER = ("lop3.", "shf.", "prmt.", "and.", "or.", "xor.", "not.", "shl.", "shr.", "bfe.", "bfi.",
+                "add.", "sub.", "min.", "max.", "abs.", "neg.")
+_PTX_MULTIPLY = ("mul.", "mad.")
+
+
+def _assembly(text: str, issued: float, moving: float) -> Work:
+    """Inline PTX's work, an instruction at a time: float arithmetic on the fp32 lanes (a packed pair's, `x2`,
+    two an instruction), special functions on their units, integer arithmetic and bit manipulation on the
+    integer units (a multiply on the FMA pipe), a conversion at the conversions' rate, a load or store its
+    active lanes' bytes; a shuffle, a move, a predicate and synchronization free (scalar, a lane's
+    exchange); a global atomic its word read and written by each lane that runs it. Raises `Uncounted` for
+    any other instruction."""
+    work = Work()
+    for line in text.replace("{", ";").replace("}", ";").split(";"):
+        words = line.split()
+        if words and words[0].startswith("@"):
+            words = words[1:]
+        if not words or words[0].startswith("."):
+            continue
+        mnemonic = words[0]
+        elements = 2 if "x2" in mnemonic else 1
+        if mnemonic.startswith(_PTX_FREE):
+            continue
+        floating = any(kind in mnemonic for kind in ("f32", "f16", "bf16", "f64"))
+        if mnemonic.startswith(_PTX_FLOAT) and floating:
+            work = work + Work(operations=elements * issued)
+        elif mnemonic.startswith(_PTX_SPECIAL):
+            work = work + Work(exponentials=elements * issued)
+        elif mnemonic.startswith("cvt."):
+            work = work + Work(conversions=elements * issued)
+        elif mnemonic.startswith(_PTX_MULTIPLY):
+            work = work + Work(integer_multiply_adds=elements * issued)
+        elif mnemonic.startswith(_PTX_INTEGER):
+            work = work + Work(integer_operations=elements * issued)
+        elif mnemonic.startswith(("atom.", "red.")) and ".global" in mnemonic:
+            work = work + Work(device_bytes=8 * moving)
+        elif mnemonic.startswith(("ld.", "st.")):
+            moved = 4 * moving
+            work = work + (Work(shared_bytes=moved) if ".shared" in mnemonic else Work(device_bytes=moved))
+        else:
+            raise Uncounted(f"no rule counts the PTX instruction {mnemonic}")
+    return work
 
 
 def _lane_values(name: str, op, operands: list[np.ndarray]) -> np.ndarray | None:
