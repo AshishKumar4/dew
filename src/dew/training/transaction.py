@@ -19,7 +19,7 @@ import contextvars
 import dataclasses
 import functools
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
-from typing import Generic
+from typing import Generic, NamedTuple
 
 import jax
 import jax.extend.core as jcore
@@ -1663,8 +1663,7 @@ class Transaction:
             return jax.tree.map(pooled, held, gradient), {}
 
         read = {in_backward.MASTERS: previous.gradient, in_backward.NORMS: self._run_norms(params, runs)}
-        return _Planned(in_backward.InBackward(update=accumulate, moments=(), pooling=True), read,
-                        pooling=pooling)
+        return _Planned(in_backward.InBackward(update=accumulate, moments=()), read, pooling=pooling)
 
     def planned(self, state: TrainState) -> _Planned | None:
         """The plan by which the runs a one-stage scanned state holds stacked update or accumulate in their
@@ -1816,13 +1815,17 @@ class Transaction:
         handled = [_state_path(path) for path in probe.handled]
         if not handled:
             return True
-        roots: dict[jcore.Var, tuple[str, ...]] = {}
+        if probe.batched:
+            # One call standing for each lane's would pool the sum into itself once a lane.
+            return False
+        roots: dict[jcore.Var, _Root] = {}
         for (path, _), value in zip(jax.tree_util.tree_flatten_with_path(trainable)[0], program.invars,
                                     strict=True):
             names = tuple(str(entry.key) for entry in path[1:] if isinstance(entry, jax.tree_util.DictKey))
             root = next((run for run in handled if names[:len(run)] == run), None)
             if root is not None:
-                roots[value] = root
+                collection = path[0].key if isinstance(path[0], jax.tree_util.DictKey) else None
+                roots[value] = _Root(root, collection == in_backward.MASTERS)
         reads: collections.Counter[tuple[str, ...]] = collections.Counter()
         refused: set[tuple[str, ...]] = set()
         _run_reads(program, roots, reads, refused)
@@ -2039,30 +2042,47 @@ _PASSED = frozenset({"sharding_constraint", "optimization_barrier", "copy", "res
 fusion (a barrier), copied, laid out anew (a stage-local stack's layers reshaped to a run's) or cast,
 which a run's variables pass through as themselves (`_run_reads`)."""
 
+_DRAWS = frozenset({"random_bits", "threefry2x32"})
+"""The primitives that draw random bits: a run whose layers draw them (dropout) keys its masks otherwise
+than Linen's scan does (`dew.nn.backbones.decoder_stack._updated_in_backward`), so it pools none."""
 
-def _run_reads(program: jcore.Jaxpr, roots: Mapping[jcore.Var, tuple[str, ...]],
+
+class _Root(NamedTuple):
+    """A run's variable in a loss's program (`_run_reads`): its run's path, and whether it is the window's
+    sum the run pools into (`dew.nn.in_backward.MASTERS`), which only the run's own rule reads."""
+
+    run: tuple[str, ...]
+    sum: bool
+
+
+def _run_reads(program: jcore.Jaxpr, roots: Mapping[jcore.Var, _Root],
                reads: collections.Counter[tuple[str, ...]], refused: set[tuple[str, ...]]
-               ) -> dict[jcore.Var, tuple[str, ...]]:
-    """Count in `reads` each equation of `program` that reads a run's variables (`roots`: each by its run)
-    as one read of that run: a custom derivative's call (a scanned run's own, `dew.nn.in_backward`) one
-    read, a call (`called`) through its program, its results that are the run's variables still the run's;
-    any other equation reading them (a loop, a branch, a term on the weights) puts the run in `refused`.
-    The variables of each run among `program`'s results."""
+               ) -> dict[jcore.Var, _Root]:
+    """Count in `reads` each equation of `program` that reads a run's variables (`roots`) as one read of
+    that run: the run's own rule (a custom derivative that reads its sum, `dew.nn.in_backward.scanned_run`)
+    one read, where its layers draw no random bits; a call through its program, but a nested jit, whose
+    cached program a later trace reads without calling the run again; and its variables through
+    placements, layouts and casts (`_PASSED`) as themselves. Any other equation reading them (a loop, a
+    branch, another custom derivative, a term on the weights) puts the run in `refused`. The variables of
+    each run among `program`'s results."""
     held = dict(roots)
     for equation in program.eqns:
-        runs = {held[value] for value in equation.invars if computed(value) and value in held}
-        if not runs:
+        read = [held[value] for value in equation.invars if computed(value) and value in held]
+        if not read:
             continue
-        if "custom_vjp" in equation.primitive.name:
+        runs = {root.run for root in read}
+        name = equation.primitive.name
+        if name.startswith("custom_vjp") and any(root.sum for root in read):
             reads.update(runs)
+            if any(_draws(inner) for inner in jcore.jaxprs_in_params(equation.params)):
+                refused |= runs
             continue
-        if equation.primitive.name in _PASSED:
-            # Each result its operand, placed or held apart: still the run's.
+        if name in _PASSED:
             held.update({value: held[given]
                          for value, given in zip(equation.outvars, equation.invars, strict=False)
                          if computed(given) and given in held})
             continue
-        body = called(equation)
+        body = None if name.startswith(("custom", "pjit", "jit")) else called(equation)
         if body is None:
             refused |= runs
             continue
@@ -2073,6 +2093,13 @@ def _run_reads(program: jcore.Jaxpr, roots: Mapping[jcore.Var, tuple[str, ...]],
                      for value, inside in zip(equation.outvars, body.outvars, strict=True)
                      if computed(inside) and inside in through})
     return held
+
+
+def _draws(program: jcore.Jaxpr) -> bool:
+    """Whether `program`, or any program it holds, draws random bits (`_DRAWS`)."""
+    return any(equation.primitive.name in _DRAWS
+               or any(_draws(inner) for inner in jcore.jaxprs_in_params(equation.params))
+               for equation in program.eqns)
 
 
 def gradients_read(program: jcore.Jaxpr, read: Sequence[frozenset[int]]) -> list[frozenset[int]]:

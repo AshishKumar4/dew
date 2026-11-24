@@ -572,27 +572,7 @@ def _updates_in_backward(run: nn.Module, specs: Sequence[LayerSpec], *, train: b
     held = run.variables
     if LAYER_ROWS in held or any(name not in held for name in (*current.moments, in_backward.NORMS)):
         return False
-    if current.pooling and _drops_out(run):
-        return False
     return not any(run.is_mutable_collection(name) for name in (*WRITTEN, "intermediates"))
-
-
-def _drops_out(module: nn.Module, seen: frozenset[int] = frozenset()) -> bool:
-    """Whether `module`, a run's layer, or any module it holds (a stage's blocks, a block's mixers and their
-    context) drops anything out: a field naming a dropout rate above zero, whose masks a layer applied on
-    its own draws otherwise than Linen's scan does (`_updated_in_backward`)."""
-    seen = seen | {id(module)}
-    for field in dataclasses.fields(module):
-        if field.name == "parent":
-            continue
-        value = getattr(module, field.name)
-        if "dropout" in field.name and isinstance(value, int | float) and value > 0:
-            return True
-        held = value if isinstance(value, tuple | list) else (value,)
-        if any(isinstance(child, nn.Module) and id(child) not in seen and _drops_out(child, seen)
-               for child in held):
-            return True
-    return False
 
 
 _KEPT_WITHOUT_A_RUNG = REMAT_POLICIES['minimal_with_scan_and_conv']

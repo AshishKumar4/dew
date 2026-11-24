@@ -27,6 +27,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.interpreters import batching
 
 from dew.nn.derivatives import Surrogate, contracted, declared_derivative, with_gradients_formed
 from dew.nn.finite import zeroed_unless
@@ -64,9 +65,9 @@ class InBackward:
                      tuple[Tree, dict[str, Tree]]]
     moments: tuple[str, ...]
     handled: list[tuple[str, ...]] = dataclasses.field(default_factory=list)
-    pooling: bool = False
-    """Whether `update` pools each layer's gradient into a window's sum (`dew.training.transaction`): a run
-    whose layers draw dropout keys its masks as the ordinary scan does, and pools none."""
+    batched: list[tuple[str, ...]] = dataclasses.field(default_factory=list)
+    """The paths of the runs traced under a batching transform (`jax.vmap`), whose one call stands for
+    each lane's: a plan that pools them into one sum writes it once a lane (`dew.training.transaction`)."""
 
 
 _PLAN: contextvars.ContextVar[InBackward | None] = contextvars.ContextVar("dew_in_backward", default=None)
@@ -224,6 +225,8 @@ def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: 
     current = plan()
     assert current is not None, "a run updates in its backward only inside a step's plan"
     current.handled.append(path)
+    if any(isinstance(leaf, batching.BatchTracer) for leaf in jax.tree.leaves((weights, masters, x))):
+        current.batched.append(path)
     traced = _Traced()
     # What every layer reads crosses the rule as its arrays; its other leaves (a static field of the
     # attention metadata) are the rule's own.
