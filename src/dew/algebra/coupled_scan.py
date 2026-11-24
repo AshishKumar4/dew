@@ -178,12 +178,13 @@ def _bounded(declaration, names: Sequence[str], chunk: Mapping, parts: linear_sc
                       "ranges")
 
 
-def _finite(declared):
+def _finite(declared: float | tuple[float, float]) -> float | tuple[float, float]:
     """A declared range (`Scan.ranges`) with an interval's infinite ends held at float64's largest."""
     if not isinstance(declared, tuple):
         return declared
+    low, high = declared
     largest = float(np.finfo(np.float64).max)
-    return tuple(min(max(end, -largest), largest) for end in declared)
+    return max(low, -largest), min(high, largest)
 
 
 def _decayed_sums(alpha, mu, lam):
