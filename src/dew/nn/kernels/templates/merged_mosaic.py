@@ -101,23 +101,21 @@ def _columns(tile_block: int, block: int, width: int, c_start, stride: int):
         yield ok, mgpu_arith.muli(mgpu_arith.extsi(i64, col), mgpu_utils.c(stride, i64))
 
 
-def _mgpu_load_chunk(padded_ref, stacked_ref, b, q, h, start, c_start, col_ok, *, chunk: int,
-                     tile_block: int, slices: int, read_width: int, blocks: int = 1, tile_layout, tile_1d):
-    """Predicated coalesced GMEM load of one `[chunk, tile_block]` output chunk (gated by `col_ok` and
-    `sl < slices`) and its replicated `[chunk, tile_block]` maxima and totals (row 9795)."""
+def _mgpu_load_chunk(padded_ref, stacked_ref, b, q, h, start, c_start, *, chunk: int, block: int,
+                     tile_block: int, slices: int, read_width: int, tile_layout):
+    """Predicated coalesced GMEM load of one `[chunk, tile_block]` output chunk (gated by each column's place
+    in the block and the row's `read_width`, `_columns`, and by `sl < slices`) and its replicated
+    `[chunk, tile_block]` maxima and totals (row 9795): its columns' validity of the block's start and the
+    thread's place, which a kernel's count reads lane by lane (`inline_work`)."""
     scalar = plgpu.Layout.WG_SPLAT(())
     out_ty = plgpu.ShapeDtypeStruct((chunk, tile_block), padded_ref.dtype, layout=tile_layout)
     stat_ty = plgpu.ShapeDtypeStruct((chunk, tile_block), stacked_ref.dtype, layout=tile_layout)
 
-    def body(ctx, p_ref, s_ref, b_v, q_v, h_v, start_v, c_start_v, col_ok_v):
+    def body(ctx, p_ref, s_ref, b_v, q_v, h_v, start_v, c_start_v):
         del ctx
-        pos0 = mgpu_ir.DenseI64ArrayAttr.get([0])
         i32, i64 = mgpu_ir.IntegerType.get_signless(32), mgpu_ir.IntegerType.get_signless(64)
         b_i, q_i, h_i = (v.registers.item() for v in (b_v, q_v, h_v))
         st_i, cs_i = start_v.registers.item(), c_start_v.registers.item()
-        _, tid_col, unique = _thread_col(tile_block)
-        reps = tile_block // unique
-        col_ok_regs = col_ok_v.registers.reshape(reps)
 
         p_elem = mgpu_ir.MemRefType(p_ref.type).element_type
         p_strides, _ = mgpu_ir.MemRefType(p_ref.type).get_strides_and_offset()
@@ -148,12 +146,9 @@ def _mgpu_load_chunk(padded_ref, stacked_ref, b, q, h, start, c_start, col_ok, *
             m_regs[s_idx, ...] = mgpu_vector.from_elements(s_vec, [m_val])
             t_regs[s_idx, ...] = mgpu_vector.from_elements(s_vec, [t_val])
             p_sl_base = mgpu_arith.addi(p_row, mgpu_arith.muli(sl64, mgpu_utils.c(p_strides[1], i64)))
-            for rep in range(reps):
-                local_col = mgpu_arith.addi(tid_col, mgpu_utils.c(rep * unique, i32))
-                col = mgpu_arith.addi(cs_i, local_col)
-                col_bit = mgpu_vector.extract(col_ok_regs[rep], dynamic_position=[], static_position=pos0)
+            columns = _columns(tile_block, block, read_width, cs_i, p_strides[4])
+            for rep, (col_bit, col_off) in enumerate(columns):
                 ok = mgpu_arith.andi(sl_ok, col_bit)
-                col_off = mgpu_arith.muli(mgpu_arith.extsi(i64, col), mgpu_utils.c(p_strides[4], i64))
                 loaded = _predicated_load(p_base, mgpu_arith.addi(p_sl_base, col_off), ok, p_elem, p_zero)
                 p_regs[s_idx, rep, ...] = mgpu_vector.from_elements(p_vec, [loaded])
 
@@ -162,9 +157,9 @@ def _mgpu_load_chunk(padded_ref, stacked_ref, b, q, h, start, c_start, col_ok, *
                 mgpu_fragments.FragmentedArray(_registers=t_regs, _layout=p_mgpu, _is_signed=None))
 
     return plgpu.inline_mgpu(
-        arg_types=(plgpu.RefType(), plgpu.RefType(), *(scalar,) * 5, tile_1d),
+        arg_types=(plgpu.RefType(), plgpu.RefType(), *(scalar,) * 5),
         return_type=(out_ty, stat_ty, stat_ty),
-    )(body)(padded_ref, stacked_ref, b, q, h, start, c_start, col_ok)
+    )(body)(padded_ref, stacked_ref, b, q, h, start, c_start)
 
 
 def _mgpu_load_initial(init_m_ref, init_t_ref, init_acc_ref, b, h, q, c_start, *, block: int,
@@ -377,9 +372,6 @@ def launch(padded, stacked, *extra, units: windows.Units, queries: int, width: i
         q, b = lax.rem(bq, queries), lax.div(bq, queries)
         c_block = lax.axis_index("block")
         c_start = c_block * block
-        local_cols = jax.lax.broadcasted_iota(jnp.int32, (tile_block,), 0)
-        read_col_ok = plgpu.layout_cast(
-            (local_cols < block) & (c_start + local_cols < min(width, read_width)), tile_1d)
         init_refs, param_refs, out_refs = (
             rest[:n_init], rest[n_init:n_init + n_params], rest[n_init + n_params:])
         if has_initial:
@@ -394,9 +386,9 @@ def launch(padded, stacked, *extra, units: windows.Units, queries: int, width: i
 
         def read(start):
             out, maximum, total = _mgpu_load_chunk(
-                padded_ref, stacked_ref, b, q, h, start, c_start, read_col_ok, chunk=chunk,
-                tile_block=tile_block, slices=slices, read_width=min(width, read_width), blocks=blocks,
-                tile_layout=tile_layout, tile_1d=tile_1d)
+                padded_ref, stacked_ref, b, q, h, start, c_start, chunk=chunk, block=block,
+                tile_block=tile_block, slices=slices, read_width=min(width, read_width),
+                tile_layout=tile_layout)
             if init_state is not None:
                 slice_pos = plgpu.layout_cast(
                     start + jax.lax.broadcasted_iota(jnp.int32, (chunk, tile_block), 0), tile_layout)

@@ -145,6 +145,7 @@ class _Lanes:
     and constants decide them (a thread's index, its warp, its lane), None where data does."""
 
     values: dict = dataclasses.field(default_factory=dict)
+    partial: dict = dataclasses.field(default_factory=dict)
 
     def region(self, region, active: np.ndarray) -> Work:
         work = Work()
@@ -161,15 +162,17 @@ class _Lanes:
                 raise Uncounted("an scf.for whose trips its operands state only at run time")
             return _repeated(self.region(op.regions[0], active), trips)
         if name == "scf.if":
-            taken = self.read(op.operands[0])
-            if taken is None:
-                # Data decides it: each branch's most, as `emission` takes an unknown conditional.
+            maybe, surely = self.bounds(op.operands[0])
+            if maybe.all() and not surely.any():
+                # Data decides it on every lane: each branch's most, as `emission` takes an unknown
+                # conditional.
                 branches = [self.region(region, active) for region in op.regions if region.blocks]
                 return functools.reduce(_most, branches, Work())
-            taken = taken.astype(bool)
-            work = self.region(op.regions[0], active & taken)
+            # Each branch over the lanes that may take it: a lane its place decides takes one, a lane data
+            # decides may take either.
+            work = self.region(op.regions[0], active & maybe)
             if len(op.regions) > 1 and op.regions[1].blocks:
-                work = work + self.region(op.regions[1], active & ~taken)
+                work = work + self.region(op.regions[1], active & ~surely)
             return work
         if op.regions:
             raise Uncounted(f"{name}'s regions")
@@ -178,6 +181,15 @@ class _Lanes:
 
     def read(self, value) -> np.ndarray | None:
         return self.values.get(value)
+
+    def bounds(self, value) -> tuple[np.ndarray, np.ndarray]:
+        """A predicate's lanes that may hold it and that surely do: its lanes where known, else what an
+        `and` or `or` of a known predicate bounds (a column's validity and a data-decided slice's: false
+        wherever the column is invalid), else every lane may and none surely does."""
+        known = self.values.get(value)
+        if known is not None:
+            return known != 0, known != 0
+        return self.partial.get(value, (np.ones(LANES, dtype=bool), np.zeros(LANES, dtype=bool)))
 
     def evaluate(self, op) -> None:
         """Its results' lanes where its operands' are known."""
@@ -205,6 +217,11 @@ class _Lanes:
             return
         read = [self.read(operand) for operand in op.operands]
         operands = [lanes for lanes in read if lanes is not None]
+        if len(operands) != len(read) and name in ("arith.andi", "arith.ori") and _predicate(produced.type):
+            (maybe_a, surely_a), (maybe_b, surely_b) = (self.bounds(operand) for operand in op.operands)
+            self.partial[produced] = ((maybe_a & maybe_b, surely_a & surely_b) if name == "arith.andi"
+                                      else (maybe_a | maybe_b, surely_a | surely_b))
+            return
         if not operands or len(operands) != len(read):
             return
         found = _lane_values(name, op, operands)
@@ -361,6 +378,10 @@ def _repeated(work: Work, count: int) -> Work:
 def _most(first: Work, second: Work) -> Work:
     return Work(**{field.name: max(getattr(first, field.name), getattr(second, field.name))
                    for field in dataclasses.fields(Work) if field.name not in ("span", "chains")})
+
+
+def _predicate(value_type: ir.Type) -> bool:
+    return isinstance(value_type, ir.IntegerType) and value_type.width == 1
 
 
 def _elements(value_type: ir.Type) -> int:
