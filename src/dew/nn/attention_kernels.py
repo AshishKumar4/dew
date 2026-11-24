@@ -14,6 +14,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew import _facts
 from dew._devices import deterministic_ops_requested
 
 from .kernels import decode_attention, generation
@@ -84,7 +85,7 @@ def flash_architectures() -> tuple[str, ...] | None:
     return importlib.import_module('dew_flash_attn').ARCHITECTURES
 
 
-@generation.traced_fact
+@_facts.traced_fact
 def flash_lowered() -> bool:
     """Whether FlashAttention's call lowers here for the call's target: the installed wheel holds code for
     it, on this process's own GPU (`gpu_placed`) or, within `assumed`, for the assumed GPU's compile-only

@@ -16,6 +16,7 @@ import jax
 from jax._src import config as jax_config
 
 from dew._cache import holding
+from dew._facts import Held
 from dew._records import JSON
 from dew._stated import tree_shape
 from dew.algebra.program import replaying
@@ -106,7 +107,7 @@ class TracedDraw[Tree, Built, Rest]:
 KEPT_DRAWS = 8
 """The traced draws a process keeps for a later call to read (`traced_draw`'s `kept`), the latest of them."""
 
-_TRACED: collections.OrderedDict[Hashable, TracedDraw] = collections.OrderedDict()
+_TRACED: collections.OrderedDict[Hashable, Held[TracedDraw]] = collections.OrderedDict()
 
 
 def held_signature[Tree](tree: Tree) -> Hashable:

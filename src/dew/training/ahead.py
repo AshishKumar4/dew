@@ -1324,11 +1324,11 @@ class LaterPlans:
     touched. Each holds every executable it compiled, those that missed on the devices the running phase holds
     among them (`FitSearch.provisional`), and the phase's boundary waits for it (`waited`), whose plan, made
     there against the devices' allocators as they stand, finds each candidate's trace (`candidate_for`) and
-    executable (`dew.nn.kernels.options.held`) made: the GPUs no longer idle while it compiles (336 s at a 4B
-    decision run's second phase on a GH200, M-MC-3q). One thread, joined: each phase's at its boundary, every
-    phase's as the run ends, however it ends. A phase whose plan failed off the loop says so at its boundary,
-    which plans it as it would have. A pooled run, a host-master or rollout run, one that tunes its kernels or
-    runs PGLE plans its phases at their boundaries."""
+    executable (`FitSearch.executables`, the run's compiler's) made: the GPUs no longer idle while it compiles
+    (336 s at a 4B decision run's second phase on a GH200, M-MC-3q). One thread, joined: each phase's at its
+    boundary, every phase's as the run ends, however it ends. A phase whose plan failed off the loop says so
+    at its boundary, which plans it as it would have. A pooled run, a host-master or rollout run, one that
+    tunes its kernels or runs PGLE plans its phases at their boundaries."""
 
     def __init__(self, futures: Mapping[int, Future[Release]]) -> None:
         self.futures = dict(futures)
@@ -1374,7 +1374,7 @@ class LaterPlans:
 
     def waited(self, passes: int | None) -> Release:
         """The plan of the phase whose step runs `passes` waited for, so the executables it compiled, which
-        the process holds (`dew.nn.kernels.options.held`), are there for the boundary's plan, and what drops
+        the run's compiler holds (`FitSearch.executables`), are there for the boundary's plan, and what drops
         every one of them but those the boundary's plan takes, which the boundary calls once it takes one
         (`FitSearch.released_unplanned`); one that failed said, the boundary planning it as it would have."""
         future = self.futures.pop(passes, None) if passes is not None else None
@@ -1412,7 +1412,7 @@ def _kept(planned: Planned | None) -> None:
 def _phase_plan[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], state: TrainState, batch: Batch,
                                  passes: int) -> Release:
     """A plan of `trainer`'s step at `passes` over `state`'s shapes and `batch` (`LaterPlans`), on a compiler
-    and objective of its own, its executables held by the process (`dew.nn.kernels.options.hold`), those it
+    and objective of its own, its executables held by the run's compiler (`FitSearch.executables`), those it
     compiled before a refusal where no candidate fit the devices as they stand off the loop among them, which
     the boundary judges again."""
     from dew.training.compiler import StepCompiler
@@ -1420,7 +1420,7 @@ def _phase_plan[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], state: Train
 
     phases = trainer.phase_passes.apart(passes)
     compiler = StepCompiler(phases.base, trainer._compiler.links(trainer.device_mesh), None, phases,
-                            trainer.fit_policy.remat)
+                            trainer.fit_policy.remat, executables=trainer._compiler._executables)
     stepping = dataclasses.replace(trainer._stepping(phases.base, compiler), shape=trainer._afresh_shape())
     try:
         compiler._plan(stepping, state, batch, None, provisional=True)

@@ -445,7 +445,7 @@ def test_a_program_holds_at_most_its_bound_kept_and_compiled_over_shapes_togethe
             program(jax.ShapeDtypeStruct((size,), jnp.float32))
     for size in range(3, 8):
         program(jnp.zeros((size,), jnp.float32))
-    assert len(program._executables) + len(program._shaped) <= 3
+    assert len(program._compiles) <= 3
     # The latest kept, which the bound never lets go: called again, it compiles nothing.
     with Compiles(None) as compiles:
         program(jnp.zeros((7,), jnp.float32))

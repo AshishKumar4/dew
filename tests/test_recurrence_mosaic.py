@@ -1503,7 +1503,7 @@ def test_a_refusals_roles_travel_with_it_into_derivations_and_handed_plans():
     """A kernel's refusal keeps the roles its spill stood in (`report.Refused`): refusals of one config that
     differ in them alone are two derivations' inputs (`report.derivation_inputs`), whose ladders step
     apart (`Mosaic._consumers_spilled`), and a plan handing its refusals to another process
-    (`refusal_entries` into `refuse`) states them again there (base review 60efbe75f F2: a cache key
+    (`refusal_snapshot` into `refuse`) states them again there (base review 60efbe75f F2: a cache key
     without them stood for either)."""
     bound = template.MOSAIC.bind(*resource_operands('qwen3.5-27b-gdn', jnp.bfloat16, 1, 256), None, bound=1.0)
     tiles, kernel = mainloop.Tiles(32, 3, 128, 2, chunk=64), 'recurrence_output'
@@ -1512,7 +1512,7 @@ def test_a_refusals_roles_travel_with_it_into_derivations_and_handed_plans():
         with report.refusals(), generation.assumed('sm90'):
             report.refuse_launch(template.MOSAIC, bound, tiles, {kernel}, {kernel: roles})
             keys.append(report.derivation_inputs(template.MOSAIC, bound, template.Mosaic.launched()))
-            handed = report.refusal_entries()
+            handed = report.refusal_snapshot()
         with report.refusals(), generation.assumed('sm90'):
             report.refuse(handed)
             assert report.spilled_in(template.MOSAIC, bound, tiles, target) == {kernel: roles}

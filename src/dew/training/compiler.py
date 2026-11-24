@@ -32,7 +32,6 @@ from dew.nn.kernels.options import (
     OuterProgram,
     abstract_signature,
     collecting,
-    hold,
     lowering,
     owned_program,
     shapes_of,
@@ -674,7 +673,8 @@ class StepCompiler[L, E]:
     (`ahead`), until a compile takes it. Everything else a compile reads is its call's."""
 
     def __init__(self, objective: Objective[L, E], links: Mapping[str, Link] | None,
-                 ahead: AheadOfTime | None, phase_passes: PhasePasses[L, E], remat: Remat = "auto"):
+                 ahead: AheadOfTime | None, phase_passes: PhasePasses[L, E], remat: Remat = "auto",
+                 executables: dict[Hashable, jax.stages.Compiled] | None = None):
         self.objective = objective
         # What the step may recompute (`FitPolicy.remat`), which each search climbs its ladder within; a
         # later phase's planner takes the objective as a climb left it (`dew.training.ahead`).
@@ -694,6 +694,10 @@ class StepCompiler[L, E]:
         self._base_rung: tuple[tuple[nn.Module, ...], tuple[int, int] | None, bool, dict[str, JSON]] | None
         self._base_rung = None
         self._resumed_links: dict[str, float | None] = {}
+        # The executables its searches hold for each other and its refits (`FitSearch.executables`), by the
+        # program, its options and its devices, held for the run alone: `executables`, its run's compiler's,
+        # where it plans a later phase off the loop (`dew.training.ahead.LaterPlans`).
+        self._executables: dict[Hashable, jax.stages.Compiled] = {} if executables is None else executables
         # A fresh run's first step planned over its state's shapes before the state is placed
         # (`planned_unplaced`), by the signature of the batch it was planned over: its first compile's.
         self._unplaced: Unplaced | None = None
@@ -1055,7 +1059,7 @@ class StepCompiler[L, E]:
         does not fit the placed devices, or none fitted before the state was placed, that compile plans once
         the state is placed, from the plan's rung and split (`_plans`), not from the ladder's foot, its
         search finding the executables this one compiled, which the process holds
-        (`dew.nn.kernels.options.held`). What it searched over (`planned_over`), its plan held or none
+        (`FitSearch.executables`). What it searched over (`planned_over`), its plan held or none
         found, which the fit searching it keeps (`FitRun.searched`): no fit searches it twice before placing
         its state."""
         batch = self.counted(batch)
@@ -1399,7 +1403,7 @@ class StepCompiler[L, E]:
             self.objective, mesh, self._xla_defaults, self._narrow, self._ns_group,
             None if self._base_rung is None
             else self._base_rung[1], resumed, remat=self.remat, ahead=self.ahead,
-            provisional=provisional, stated_remat=stated, unplaced=unplaced)
+            provisional=provisional, stated_remat=stated, unplaced=unplaced, executables=self._executables)
         if search.provisional:
             # Its programs held until a plan is taken in its place, or its run abandons it, even where it
             # refuses (`Unplaced.release`, `dew.training.ahead.LaterPlans`).
@@ -1469,7 +1473,7 @@ class StepCompiler[L, E]:
             # The guided executable in the unguided one's place, as JAX's jit keeps its program's under
             # AutoPGLE: the one the run steps, the unguided one freed with the search and the step kept
             # for a refit. An empty profile replaces nothing, and every kept lowering stays.
-            hold(asked, planned.executable)
+            self._executables[asked] = planned.executable
             forget(unguided)
         return planned
 
