@@ -354,7 +354,9 @@ class _Lanes:
             case "arith.extsi" | "arith.extui" | "arith.index_cast" | "arith.index_castui" | "arith.trunci":
                 return offsets[0]
             case "llvm.getelementptr" if all(each is not None for each in offsets):
-                return _element_offsets(op, offsets, len(op.operands) < 2 or op.operands[1] in self.values)
+                index = op.operands[1] if len(op.operands) > 1 else None
+                return _element_offsets(op, offsets, index is None or index in self.values
+                                        or index not in self.varying)
         return None
 
     def issued(self, op, active: np.ndarray) -> Work:
@@ -719,7 +721,8 @@ def _element_offsets(op, offsets: list, known: bool) -> np.ndarray | None:
     one index's, read signed at its width as LLVM reads it, times its element's stride (a dynamic index
     `offsets[1]`, a constant one a uniform term), so each index of a chain of them keeps its lanes; None for
     several indices (a struct's or array's walk), an element whose stride is no rule's (`_stride`), or a
-    narrow index known only up to a uniform term (not `known`: its wrap at its width depends on that term)."""
+    narrow index its lanes hold apart known only up to a uniform term (not `known`: its wrap at its width
+    depends on that term; an index every lane holds alike moves no lane from another)."""
     indices = ir.DenseI32ArrayAttr(op.attributes["rawConstantIndices"])
     if len(indices) != 1:
         return None

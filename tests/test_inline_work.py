@@ -347,7 +347,7 @@ def test_an_elements_stride_is_stated_only_where_its_layout_is_its_payload():
     vector of three (padded to four) state none, their lanes left unknown."""
     from dew.nn.kernels.templates import inline_work
 
-    with ir.Context():
+    with ir.Context(), ir.Location.unknown():
         i32, f16 = ir.IntegerType.get_signless(32), ir.F16Type.get()
         assert inline_work._stride(i32) == 4 and inline_work._stride(ir.VectorType.get([4], f16)) == 8
         bits = ir.VectorType.get([8], ir.IntegerType.get_signless(1))
