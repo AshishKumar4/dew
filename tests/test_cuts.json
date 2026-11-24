@@ -499,13 +499,13 @@
 "tests/test_attention_prologues.py::test_the_mosaic_forward_takes_its_query_prologue_where_it_loads_the_query_interpreted[tcgen05.chunks-sm100-64-training-rounded]"
 ],
 "tests/test_attention_route.py": [
-"tests/test_attention_route.py::test_a_call_named_onto_the_template_lowers_for_a_gpu[bias-sm90-causal-inference-accurate]",
-"tests/test_attention_route.py::test_a_call_named_onto_the_template_lowers_for_a_gpu[fp32-128-causal-inference-fast]",
-"tests/test_attention_route.py::test_a_call_named_onto_the_template_lowers_for_a_gpu[fp32-128-full-training-fast]",
+"tests/test_attention_route.py::test_a_call_named_onto_the_template_lowers_for_a_gpu[bias-sm80-full-training-accurate]",
+"tests/test_attention_route.py::test_a_call_named_onto_the_template_lowers_for_a_gpu[bias-sm90-full-training-accurate]",
+"tests/test_attention_route.py::test_a_call_named_onto_the_template_lowers_for_a_gpu[fp32-128-causal-training-fast]",
+"tests/test_attention_route.py::test_a_call_named_onto_the_template_lowers_for_a_gpu[fp32-64-full-inference-accurate]",
 "tests/test_attention_route.py::test_a_call_named_onto_the_template_lowers_for_a_gpu[fp32-64-full-training-fast]",
-"tests/test_attention_route.py::test_a_call_whose_visibility_spans_express_holds_no_dense_mask[training-filled]",
-"tests/test_attention_route.py::test_a_named_template_call_keeps_the_kernel_contract_on_a_data_and_head_mesh[cross-documents-two-key-heads]",
-"tests/test_attention_route.py::test_a_named_template_call_keeps_the_kernel_contract_on_a_data_and_head_mesh[lengths-and-starts-one-key-head]",
+"tests/test_attention_route.py::test_a_call_whose_queries_hold_no_key_runs_attends_to_no_key[template]",
+"tests/test_attention_route.py::test_a_dropped_out_call_draws_over_the_keys_its_block_groups_mean[block-causal-documents-window]",
 "tests/test_attention_route.py::test_a_named_template_call_keeps_the_kernel_contract_on_a_data_and_head_mesh[lengths-and-starts-two-key-heads]",
 "tests/test_attention_route.py::test_a_named_template_call_keeps_the_kernel_contract_on_a_data_and_head_mesh[own-documents-blocks-one-key-head]",
 "tests/test_attention_route.py::test_a_named_template_call_keeps_the_kernel_contract_on_a_data_and_head_mesh[own-documents-blocks-two-key-heads]",
@@ -1493,9 +1493,6 @@
 ],
 "tests/test_dpo.py": [
 "tests/test_dpo.py::test_packed_pairs_train_as_each_pair_a_row[gated delta net hybrid-shared]"
-],
-"tests/test_dream_walk.py": [
-"tests/test_dream_walk.py::test_a_dream_release_walks_its_responses_as_its_own_sampling_does[dream]"
 ],
 "tests/test_dreamer.py": [
 "tests/test_dreamer.py::test_a_dreamer_run_resumed_from_its_checkpoint_owes_its_steps_and_with_its_replay_ends_alike[prefilled-replay]",
@@ -2508,6 +2505,9 @@
 "tests/test_mesh_axes.py::test_a_sequence_split_holds_the_state_in_shares_and_trains_what_one_device_trains[sequence2]",
 "tests/test_mesh_axes.py::test_an_fsdp_step_splits_leading_dimensions_and_moves_no_activation[fused-projections]",
 "tests/test_mesh_axes.py::test_the_tensor_axis_changes_no_value"
+],
+"tests/test_miss_driven_rungs.py": [
+"tests/test_miss_driven_rungs.py::test_a_search_asks_first_the_rung_its_miss_reads_as_dropping_what_it_was_short_of[rows]"
 ],
 "tests/test_mixed_step.py": [
 "tests/test_mixed_step.py::test_a_mixed_call_decodes_and_prefills_as_the_separate_calls_do[no qk norm-True-paged]",
