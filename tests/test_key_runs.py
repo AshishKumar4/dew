@@ -14,6 +14,7 @@ from model_support import TINY_DECODER, attending
 from dew.batch import coordinates
 from dew.decision.layout import _parallel
 from dew.decision.model import key_runs
+from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
 VOCAB = 37
@@ -196,3 +197,44 @@ def test_a_cached_call_reads_its_runs_and_its_keys_validity_as_the_mask_they_mea
     template = decoder.clone(dtype=jnp.bfloat16)
     with generation.assumed("sm80"), generation.chosen(attention="template"):
         jax.eval_shape(lambda: read(template, **spanned))
+
+
+SHARED_RUNS = {
+    # Every query's runs `[R, 2]`: keys 0 to 2 and 3 (the second run empty).
+    "every query's": np.asarray([[0, 2], [1, 1], [3, 4]], np.int32),
+    # Every row's `[Q, R, 2]`: each query its own key and the first.
+    "every row's": np.asarray([[[0, 1], [q, q + 1]] for q in range(4)], np.int32),
+}
+
+
+@pytest.mark.parametrize("rows", [2, 4], ids=["two rows", "four rows, the queries' count"])
+@pytest.mark.parametrize("runs", sorted(SHARED_RUNS))
+@pytest.mark.parametrize("implementation", ["reference", "template"])
+def test_shared_runs_are_every_rows_as_their_broadcast_is(runs, rows, implementation):
+    """Key runs every row shares (`[Q, R, 2]`) or every query (`[R, 2]`) attend as the same runs given a row
+    apiece (`[B, Q, R, 2]`), whatever the batch's length beside the runs' or the queries' count, where their
+    leading length was read as the batch's (row 12701: two rows beside three runs refused to broadcast, four
+    beside four queries attended as 16 rows)."""
+    shared = jnp.asarray(SHARED_RUNS[runs])
+    rowed = jnp.broadcast_to(shared, (rows, 4, *shared.shape[-2:]))
+    query = jax.random.normal(jax.random.key(0), (rows, 4, 4, 8), jnp.float32)
+    key, value = (jax.random.normal(jax.random.key(seed), (rows, 4, 2, 8), jnp.float32) for seed in (1, 2))
+
+    def attend(given):
+        return scaled_dot_product_attention(query, key, value, causal=True, key_runs=given,
+                                            implementation=implementation)
+
+    np.testing.assert_array_equal(np.asarray(attend(shared)), np.asarray(attend(rowed)))
+
+
+@pytest.mark.parametrize("shape", [(4, 2, 3), (3, 2, 2), (2, 4, 2, 2, 2)], ids=str)
+def test_runs_of_no_form_it_reads_are_refused_by_name(shape):
+    """Key runs of none of the forms `[B, Q, R, 2]`, `[Q, R, 2]`, `[R, 2]` over the call's four queries (a
+    last axis not a pair, three queries for four, a rank of five) are refused by name, never read as rows
+    (row 12701)."""
+    query = jnp.zeros((2, 4, 4, 8), jnp.float32)
+    key = jnp.zeros((2, 4, 2, 8), jnp.float32)
+    with pytest.raises(ValueError, match="key_runs of shape"):
+        scaled_dot_product_attention(query, key, key, causal=True, key_runs=jnp.zeros(shape, jnp.int32),
+                                     implementation="reference")
+
