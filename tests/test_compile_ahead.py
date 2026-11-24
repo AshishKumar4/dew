@@ -47,6 +47,18 @@ from dew.training.targets import AheadTarget, LowerFor
 
 VOCAB, SEQ_LEN, BATCH = 96, 16, 8
 TINY_SHARD = 256
+LADDER_VOCAB = 16384
+"""The vocabulary of `fine_tune`'s step whose need at one microbatch on its own rung exceeds both its need
+at two and the rung above's at one (`needing_microbatches`): its head's logits, which a second microbatch
+halves and the head's tile cuts, outweigh the 32 MiB workspace cuBLASLt takes for a scanned stack's sliced
+layer GEMMs on an H100, which neither lowers (at `VOCAB`, measured on sm90: 34,286,874 B whole and with
+its head tiled alike). At 65,536 the tiled head's own sliced GEMM takes that workspace too, and the rung
+above needs more than the step whole."""
+TILED_VOCAB = 65536
+"""The vocabulary of `fine_tune`'s step whose need at 'full' with its head tiled is less at two
+microbatches, and at two for the offloaded sibling, than at one (`need_ahead`), each of those GEMMs'
+workspaces one beside logits that a second microbatch halves (measured on sm90: 142,980,378 B and
+142,982,682 B against 159,718,890 B; at `LADDER_VOCAB`, 42,357,274 B against 40,261,610 B)."""
 
 
 def this_gpu() -> tuple[str, int | None, int]:
@@ -88,11 +100,11 @@ def gpus(generation: str, count: int = 1, limit: int = 2**36) -> tuple:
 
 
 def fine_tune(mesh, *, ahead=None, width: int | None = None, split=1, remat=None, inspection=None,
-              tracker=None, dtype: str | None = None):
+              tracker=None, dtype: str | None = None, vocab: int = VOCAB):
     """A tiny decoder's fine-tuning trainer on `mesh`: its attention the run's kernel (`attending`)."""
     fields = {**TINY_DECODER, **({} if width is None else {"emb_features": width}),
               **({} if remat is None else {"remat": remat}), **({} if dtype is None else {"dtype": dtype})}
-    model = models.build("causal_transformer", vocab_size=VOCAB, **fields, num_kv_heads=2)
+    model = models.build("causal_transformer", vocab_size=vocab, **fields, num_kv_heads=2)
     return Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0), mesh=mesh,
                    layout=Layout(min_shard=TINY_SHARD), fit=FitPolicy(split=split), ahead=ahead,
                    inspection=inspection, tracker=tracker)
@@ -110,10 +122,11 @@ def need_ahead(generation: str, *, split: int, remat: str | None, tiled: bool = 
     from dew.training.ahead import compile_ahead
 
     room = 2**36
-    trainer = fine_tune(MeshSpec().build(gpus(generation, limit=room)), split=split, remat=remat)
+    trainer = fine_tune(MeshSpec().build(gpus(generation, limit=room)), split=split, remat=remat,
+                        vocab=TILED_VOCAB)
     if tiled:
         trainer.objective.tile_head()
-    ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1))
+    ahead = compile_ahead(trainer, token_rows(TILED_VOCAB, BATCH, SEQ_LEN + 1))
     return room - record(ahead.plan, "plan")["probes"][0]["headroom"]
 
 
@@ -729,10 +742,10 @@ def _need(split: int, *, up: bool = False) -> int:
     from dew.training.ahead import compile_ahead
     from dew.training.memory import recompute_more
 
-    trainer = fine_tune(MeshSpec().build(gpus("sm90")), split=split)
+    trainer = fine_tune(MeshSpec().build(gpus("sm90")), split=split, vocab=LADDER_VOCAB)
     if up:
         assert recompute_more(trainer.objective)
-    plan = record(compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1)).plan, "plan")
+    plan = record(compile_ahead(trainer, token_rows(LADDER_VOCAB, BATCH, SEQ_LEN + 1)).plan, "plan")
     return ROOMY - listed(plan["probes"], "probes", read=record, what="probes")[0]["headroom"]
 
 
@@ -766,8 +779,9 @@ def admitted(tmp_path_factory, needing_microbatches):
         # The module's own data and Hub caches, as each test's (`own_settings`), its rung records `records`.
         lane_environment.per_test_settings(patch, tmp_path_factory.mktemp)
         patch.setenv("DEW_RUNG_RECORDS", str(records))
-        trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=needing_microbatches)), split="auto")
-        ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1))
+        trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=needing_microbatches)), split="auto",
+                            vocab=LADDER_VOCAB)
+        ahead = compile_ahead(trainer, token_rows(LADDER_VOCAB, BATCH, SEQ_LEN + 1))
     return records, trainer, ahead, needing_microbatches
 
 
@@ -916,8 +930,8 @@ def test_compiling_ahead_with_its_frontier_lists_each_rung_above_its_plan_at_few
 
     records, _, earlier, limit = admitted
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(records))
-    trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=limit)), split="auto")
-    ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), frontier=True)
+    trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=limit)), split="auto", vocab=LADDER_VOCAB)
+    ahead = compile_ahead(trainer, token_rows(LADDER_VOCAB, BATCH, SEQ_LEN + 1), frontier=True)
     plan = record(ahead.plan, "plan")
     probes = listed(plan["probes"], "probes", read=record, what="probes")
     # A sibling that offloads what the ladder's top recomputes sits at that top's split (row 1932).
@@ -966,8 +980,9 @@ def test_a_frontier_at_the_ladders_top_lists_its_offloaded_sibling_at_its_last_f
         sibling = need_ahead("sm90", split=2, remat="minimal_offloaded", tiled=True)
         capacity = max(two, sibling)
         assert capacity < one, (one, two, sibling)
-    trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=capacity)), split="auto", remat="full")
-    ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), frontier=True)
+    trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=capacity)), split="auto", remat="full",
+                        vocab=TILED_VOCAB)
+    ahead = compile_ahead(trainer, token_rows(TILED_VOCAB, BATCH, SEQ_LEN + 1), frontier=True)
     plan = record(ahead.plan, "plan")
     frontier = listed(plan["frontier"], "frontier", read=record, what="frontier")
     full, offloaded = (remat_record(REMAT_POLICIES[name]) for name in ("full", "minimal_offloaded"))
@@ -1003,9 +1018,10 @@ def test_a_fused_tiled_heads_plan_compiled_ahead_with_its_frontier_restores_the_
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "rungs"))
     one, room = (need_ahead("sm90", split=split, remat="full", tiled=True) for split in (1, 2))
     assert room < one, (one, room)
-    trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=room)), split="auto", remat="full")
+    trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=room)), split="auto", remat="full",
+                        vocab=TILED_VOCAB)
     trainer.objective.tile_head()
-    ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), frontier=True)
+    ahead = compile_ahead(trainer, token_rows(TILED_VOCAB, BATCH, SEQ_LEN + 1), frontier=True)
     plan = record(ahead.plan, "plan")
     whole = [probe for probe in plan["probes"]
              if probe["split"] == 1 and probe["head_tile"] is not None]
@@ -1181,7 +1197,7 @@ def test_a_compile_only_gpu_holds_the_accumulator_a_step_builds_once(tmp_path, m
     prefetched next to the step (the 2113 review: the sum was counted among the arguments and again
     beside them, so an offline plan could refuse a step that fits). The pool charges what the first call
     builds by allocation, each shard rounded up (`allocated_bytes`), past what its arguments count; the
-    same step run here builds the same buffers."""
+    same step run here, its state held as the step holds it, builds the same buffers."""
     from dew.distributed.batches import batch_shardings, prefetched_bytes
     from dew.distributed.placement import allocated_bytes, placed_bytes
     from dew.training.ahead import compile_ahead, step_batch
@@ -1196,7 +1212,10 @@ def test_a_compile_only_gpu_holds_the_accumulator_a_step_builds_once(tmp_path, m
     batch = step_batch(trainer, rows)
     prefetched = prefetched_bytes(batch, batch_shardings(trainer.device_mesh, batch))
     temporaries = ahead.temp_bytes * temporaries_factor(trainer.device_mesh)
-    run = fine_tune(MeshSpec().build(jax.devices()[:1]), split=2).fit(rows, steps=1)
+    # The run's state as its step holds it (`Trainer.staged`): `fit` hands it back stored, a scanned stack's
+    # layers each on its own name again, whose leaves the pool charges apart.
+    stepper = fine_tune(MeshSpec().build(jax.devices()[:1]), split=2)
+    run = stepper.staged(stepper.fit(rows, steps=1))
     built = [part for part in (run.compute, run.window) if part is not None]
     assert probe["fits"] is True
     assert probe["headroom"] == (capacity - ahead.argument_bytes - (ahead.output_bytes - ahead.alias_bytes)
