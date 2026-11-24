@@ -1262,6 +1262,10 @@ class Issuer[Accumulator](abc.ABC):
         write states its own (`WgmmaIssuer`). The walk's ring waits and releases are its own, outside it."""
         return self.issued_when(~idle, acc, issue)
 
+    bound_registers: int = 0
+    """The registers a consumer thread holds beside its tile where its products take a row bound (`bounded`):
+    none where its instructions take none."""
+
     def bounded(self, rows: jax.Array) -> Self:
         """This issuer, its products issued for a tile's rows before `rows` alone (an int32, one value across
         the issuing warpgroup: a ragged group's rows in its last tile), the accumulator's rows kept past it,

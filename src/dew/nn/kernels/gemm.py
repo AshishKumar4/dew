@@ -947,11 +947,14 @@ def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, 
 
     def portable(lhs, rhs, group_sizes, prologue_arrays, tables):
         lhs, rhs = gathered(lhs, rhs, tables)
-        routed = _routed(group_sizes, lhs.shape[0])
         if prologue is not None:
             sides = _rows(prologue_arrays, prologue_axes, group_sizes, lhs.shape[0])
             lhs = prologue(lhs, *sides).astype(lhs.dtype)
-        lhs = jnp.where(routed[:, None], lhs, 0)
+        if not dense:
+            # A row past the routed ones multiplies nothing. A dense call routes every row, and its mask
+            # was a select XLA kept, the rows read and written again before the product: 0.7 to 23% of an
+            # A100's dense kernel gradients (M-NG-45-a100's XLA arm, 0.068 ms of the 4B key's 0.293).
+            lhs = jnp.where(_routed(group_sizes, lhs.shape[0])[:, None], lhs, 0)
         wide = at_least_fp32(compute)  # an fp64 product's sum in fp64
         # Each group's rows contracted, XLA's ragged dot's own weight gradient (its transpose's form) on the
         # operands as they are: a pullback from a matrix made here would hand a vmapped call (a pipeline

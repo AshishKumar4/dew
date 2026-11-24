@@ -427,7 +427,8 @@ def test_a_dense_kernel_gradient_xla_takes_is_its_own_dot():
     """A dense kernel gradient the selector gives XLA (an A100's declared cell, `grouped_matmul.DECLARED`,
     which DENSE1 timed as XLA's dot) runs XLA's own dot over its rows, as a dense forward does (`xla_dot`): no
     ragged dot of one group, which took an A100's gate_up weight gradient 470 ms against the template's 11.4
-    (W121-a100)."""
+    (W121-a100), and its rows read as they are: a dense call routes every row, and a mask of them was a select
+    XLA kept, up to 23% of the A100's XLA kernel gradient (M-NG-45-a100's 4B key)."""
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     with generation.assumed("sm80"), generation.routes() as routes:
         graph = jax.make_jaxpr(lambda x, dy: gemm.gemm_t(x, dy, None, out_dtype=jnp.bfloat16))(
@@ -435,6 +436,7 @@ def test_a_dense_kernel_gradient_xla_takes_is_its_own_dot():
     assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"xla"}, routes
     names = {equation.primitive.name for equation in equations(graph, platform="cuda")}
     assert "dot_general" in names and "ragged_dot_general" not in names, names
+    assert "select_n" not in names, names
     assert graph.out_avals[0].shape == (1, 256, 384)
 
 @pytest.mark.parametrize("product", ["forward", "input gradient", "kernel gradient"])
@@ -2256,6 +2258,18 @@ def test_sm100_pair_tiles_refuse_depth_splits_in_legal_and_derivation():
         assert pricing.granular_tile(fam, t64, jnp.bfloat16, target=sm100, stream_blocks=scales)
         assert not pricing.granular_tile(
             fam, dataclasses.replace(t64, programs=3), jnp.bfloat16, target=sm100, stream_blocks=scales)
+
+
+def test_the_planner_prices_mma_syncs_row_bound_where_its_grouped_kernel_issues_it():
+    """A one-consumer grouped mma.sync tile, whose products take a row bound, is priced its issuer's own
+    registers for it (`MmaIssuer.bound_registers`); a dense call, whose products take none, none (row 12304).
+    """
+    tile = tiling.Tiles(128, 128, 32, 3, 1, warpgroups=1, family="mma.sync")
+    with generation.assumed("sm80"):
+        family = pricing.family_of(tile, jnp.bfloat16)
+        priced = {dense: pricing.bounded_registers(family, tile, jnp.bfloat16, dense=dense, staged_rows=False)
+                  for dense in (False, True)}
+    assert family.bound_registers > 0 and priced == {False: family.bound_registers, True: 0}, priced
 
 
 @INTERPRETS
