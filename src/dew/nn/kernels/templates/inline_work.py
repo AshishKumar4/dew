@@ -147,8 +147,10 @@ class _Lanes:
     values: dict = dataclasses.field(default_factory=dict)
     partial: dict = dataclasses.field(default_factory=dict)
     # The values that differ between lanes: a thread's index, what any op computes of one, a region's
-    # results where its condition or what it yields does.
+    # results where its condition or what it yields does; and of those, each one's lanes up to a term every
+    # lane holds alike where its arithmetic states them (an address: a base pointer plus a lane's column).
     varying: set = dataclasses.field(default_factory=set)
+    relative: dict = dataclasses.field(default_factory=dict)
 
     def region(self, region, active: np.ndarray) -> Work:
         work = Work()
@@ -239,10 +241,42 @@ class _Lanes:
                                       else (maybe_a | maybe_b, surely_a | surely_b))
             return
         if not operands or len(operands) != len(read):
+            relative = self.relative_of(name, op)
+            if relative is not None:
+                self.relative[produced] = relative
             return
         found = _lane_values(name, op, operands)
         if found is not None:
             self.values[produced] = found
+
+    def offsets(self, value) -> np.ndarray | None:
+        """`value`'s lanes up to a term every lane holds alike: its lanes where known, none where no lane's
+        place decides it (a scalar operand's, a base pointer's), what `relative_of` derived, else None."""
+        if (known := self.values.get(value)) is not None:
+            return known
+        if value not in self.varying:
+            return np.zeros(LANES, dtype=np.int64)
+        return self.relative.get(value)
+
+    def relative_of(self, name: str, op) -> np.ndarray | None:
+        """An address's arithmetic over values known up to a uniform term: sums and differences of them,
+        a product by a constant every lane holds, a cast, and an element pointer of one index."""
+        offsets = [self.offsets(operand) for operand in op.operands]
+        match name:
+            case "arith.addi" | "llvm.add" if all(each is not None for each in offsets):
+                return offsets[0] + offsets[1]
+            case "arith.subi" if all(each is not None for each in offsets):
+                return offsets[0] - offsets[1]
+            case "arith.muli" | "llvm.mul":
+                for constant, other in ((0, 1), (1, 0)):
+                    held = self.values.get(op.operands[constant])
+                    if held is not None and np.all(held == held[0]) and offsets[other] is not None:
+                        return offsets[other] * held[0]
+            case "arith.extsi" | "arith.extui" | "arith.index_cast" | "arith.index_castui" | "arith.trunci":
+                return offsets[0]
+            case "llvm.getelementptr" if len(offsets) <= 2 and all(each is not None for each in offsets):
+                return offsets[-1] if len(offsets) == 2 else offsets[0]
+        return None
 
     def issued(self, op, active: np.ndarray) -> Work:
         """What `op` issues over the `active` lanes: an op computes for every lane of a warp any lane of which
@@ -257,9 +291,14 @@ class _Lanes:
             stores = name in ("memref.store", "vector.store", "llvm.store")
             address = op.operands[1] if stores else op.operands[0]
             indices = op.operands[2 if stores else 1:] if name.startswith(("memref.", "vector.")) else ()
-            uniform = address not in self.varying and not any(index in self.varying for index in indices)
-            # A lane-uniform address's access moves its bytes once, however many lanes make it.
-            moved = _bytes(value) * (float(bool(moving)) if uniform else moving)
+            # Each distinct address the active lanes access moves its bytes once, however many lanes access
+            # it (a head's scalar every lane reads, a column two lanes hold in a replicated layout); where
+            # no lane's address is known up to a common term, each active lane's.
+            places = [self.offsets(each) for each in (address, *indices)]
+            known = [each for each in places if each is not None]
+            distinct = (float(np.unique(np.stack(known)[:, active], axis=1).shape[1])
+                        if active.any() and len(known) == len(places) else moving)
+            moved = _bytes(value) * distinct
             return Work(shared_bytes=moved) if _shared(address.type) else Work(device_bytes=moved)
         if name in _FREE or name.startswith(_FREE_PREFIXES):
             return Work()
