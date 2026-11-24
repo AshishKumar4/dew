@@ -173,7 +173,7 @@ def recipe_chain(rows: jax.Array, up: jax.Array, down: jax.Array, activation: Ca
         return on_shards(chained, jax.sharding.PartitionSpec(along, None), (rows, up, down), whole=(1, 2))
     count = rows.shape[0]
     laid = jnp.pad(rows, ((0, -count % SCALE_DEPTH), (0, 0)))
-    return blockwise_chain(laid, up[None], down[None], activation, out_dtype=out_dtype)[:count]
+    return blockwise_chain(laid, up[None], down[None], activation, out_dtype=out_dtype, live=count)[:count]
 
 
 def _projected_apart(rows, matrix, group_sizes, *, out_dtype, bias, along) -> jax.Array:
@@ -281,33 +281,42 @@ def _chain_value(x, w_up, w_down, group_blocks, activation, out_dtype, interpret
     return out, up
 
 
-def _chain(x, w_up, w_down, group_blocks, activation, out_dtype, interpret):
+def _chain(x, w_up, w_down, group_blocks, activation, out_dtype, interpret, live):
+    del live  # a padded row's forward is its own row's, which the caller drops
     return _chain_value(x, w_up, w_down, group_blocks, activation, out_dtype, interpret)[0]
 
 
-def _chain_forward(x, w_up, w_down, group_blocks, activation, out_dtype, interpret):
+def _chain_forward(x, w_up, w_down, group_blocks, activation, out_dtype, interpret, live):
+    del live
     out, up = _chain_value(x, w_up, w_down, group_blocks, activation, out_dtype, interpret)
     return out, (x, w_up, w_down, group_blocks, up)
 
 
-def _chain_backward(activation, out_dtype, interpret, residuals, cotangent):
+def _chain_backward(activation, out_dtype, interpret, live, residuals, cotangent):
     """The two blockwise projections' own reverse modes (`_projection_backward`) through the activation's
-    derivative at the up projection's rounded product: the recipe's surrogate of each, as the two apart."""
+    derivative at the up projection's rounded product: the recipe's surrogate of each, as the two apart.
+    Rows past the first `live` (a caller's padding, `recipe_chain`) hold zeros in the down projection's
+    rows and the up projection's cotangent, as the projections apart pad them: each kernel gradient
+    quantizes its rows along the tokens, which an activation of the padding (nonzero, or of a nonfinite
+    derivative at zero) would enter."""
     x, w_up, w_down, group_blocks, up = residuals
+    kept = (jnp.arange(x.shape[0]) < live)[:, None]
     activated, pulled = jax.vjp(lambda value: activation(value).astype(out_dtype), up)
+    activated = jnp.where(kept, activated, jnp.zeros((), activated.dtype))
     d_activated, d_w_down, _ = _projection_backward(out_dtype, interpret, (activated, w_down, group_blocks),
                                                     cotangent)
     (d_up,) = pulled(d_activated.astype(activated.dtype))
+    d_up = jnp.where(kept, d_up, jnp.zeros((), d_up.dtype))
     d_x, d_w_up, _ = _projection_backward(out_dtype, interpret, (x, w_up, group_blocks), d_up)
     return d_x, d_w_up, d_w_down, None
 
 # The chain's gradient (`blockwise_chain`): the recipe's surrogate of each projection (`Surrogate`).
 _blockwise_chain = contracted("test_a_blockwise_fp8_chain_holds_every_reverse_order")(
-    declared_derivative(Surrogate(), _chain, _chain_forward, _chain_backward, nondiff_argnums=(4, 5, 6)))
+    declared_derivative(Surrogate(), _chain, _chain_forward, _chain_backward, nondiff_argnums=(4, 5, 6, 7)))
 
 
 def blockwise_chain(x: jax.Array, w_up: jax.Array, w_down: jax.Array, activation, *, out_dtype,
-                    interpret_on_cpu: bool = False) -> jax.Array:
+                    live: int | None = None, interpret_on_cpu: bool = False) -> jax.Array:
     """`blockwise_fp8_projection(activation(blockwise_fp8_projection(x, w_up)), w_down)` of `x`'s rows
     (`[rows, depth]`, whole 128-row blocks, one group of them; `w_up` `[1, depth, hidden]`, `w_down` `[1,
     hidden, width]`), each product rounded to `out_dtype`, the activation of the rounded up projection rounded
@@ -315,12 +324,15 @@ def blockwise_chain(x: jax.Array, w_up: jax.Array, w_down: jax.Array, activation
     projection's rows quantized in the up projection's epilogue, its codes and scales stored there
     (`quantized.blockwise_fp8_epilogue`, the scales `[hidden / 128, rows]`), no pass of their own between the
     two (row 8547). Bitwise the two apart, forward and reverse (`_chain_backward`: each projection's own
-    surrogate); `activation` is an elementwise function of an `out_dtype` array, the MLP's."""
+    surrogate); `activation` is an elementwise function of an `out_dtype` array, the MLP's. `live`, the rows
+    that are the caller's (the first; every row where None), the rest padding its reverse mode keeps out of
+    every gradient (`_chain_backward`)."""
     if w_up.shape[0] != 1 or w_down.shape[0] != 1 or x.shape[0] % SCALE_DEPTH:
         raise ValueError("a blockwise chain is one group's of whole 128-row blocks: its rows' quantized "
                          "scales are stored transposed, each share's rows whole")
     group_blocks = jnp.full((1,), x.shape[0] // SCALE_DEPTH, jnp.int32)
-    return _blockwise_chain(x, w_up, w_down, group_blocks, activation, jnp.dtype(out_dtype), interpret_on_cpu)
+    return _blockwise_chain(x, w_up, w_down, group_blocks, activation, jnp.dtype(out_dtype), interpret_on_cpu,
+                            x.shape[0] if live is None else live)
 
 
 def mxfp8_projection(x: jax.Array, w: jax.Array, group_blocks: jax.Array, *, out_dtype,
