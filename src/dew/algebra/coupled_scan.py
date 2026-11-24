@@ -22,7 +22,7 @@ past float32's least normal is kept, and no sum is divided by another's (`_expon
 weighs is brought into it once, the memory's and the outputs' terms summed in scaled arithmetic and landed
 once (`_sum`, `_summed`): a term past float32's range where the result is not cancels before it is rounded,
 as the token walk's running state does, and a read of the entering pair (`_read`) a key at a time, weighed
-after. The solve's products (`L W`, the inverse's) are float32's, their terms the token walk's own reads of
+after. The solve's products (`L W`) are float32's, their terms the token walk's own reads of
 the state it has summed. The chunk's adjoint is its token walk's
 (`replay`), differentiated, as the single state's is. A packed document's first token (`Scan.reset`)
 enters a zero pair: its decays and its correction zero, the walk's pair selected to zero.
@@ -290,7 +290,7 @@ LOCAL_REACH = SUMS_REACH + 2048
 
 class Chunked(NamedTuple):
     """A chunk's values that read no state (`_prepared`), its decayed sums scaled values (`_decayed_sums`)
-    each brought into its term once, none divided by another's factor: the system's inverse `(I - L)^-1`,
+    each brought into its term once, none divided by another's factor: the system `I - L`,
     the tokens' inputs `U` and corrections `C`, the entering memory's and momentum's factors a token back
     (`A_{t-1}`, `b_{t-1}`), the queries' dots with the keys and their sums `g(s, t)`, the entering memory's
     factors to each token (`A_t`), the queries and the momentum's factors to each token (`b_t`), the free
@@ -298,7 +298,7 @@ class Chunked(NamedTuple):
     (`m(s, C)`, at most one), and the entering memory's, momentum's and momentum's own factors there (`A_C`,
     `b_C`, `m(0, C)`)."""
 
-    inverse: jax.Array
+    system: jax.Array
     inputs: jax.Array
     corrections: jax.Array
     kept_before: scaled.Scaled
@@ -322,11 +322,11 @@ def _prepared(first, second, lam, b, u, c, q, r, cut, *, base2: bool) -> Chunked
     alpha, mu = _exponential(first, base2, cut), _exponential(second, base2, cut)
     g, last, kept = _decayed_sums(alpha, mu, lam)
     before = _shifted(g, 0.0)
-    eye = jnp.eye(lam.shape[-1], dtype=lam.dtype)
-    system = eye - scaled.applied(c @ b.T, _sliced(before, (..., slice(1, None))))
+    lower = scaled.applied(c @ b.T, _sliced(before, (..., slice(1, None))))
+    system = jnp.eye(lam.shape[-1], dtype=lam.dtype) - lower
     ends = _sliced(g, -1)
     return Chunked(
-        inverse=solve_triangular(system, eye, lower=True, unit_diagonal=True), inputs=u, corrections=c,
+        system=system, inputs=u, corrections=c,
         kept_before=_shifted(kept, 1.0), momentum_before=_sliced(before, (..., 0)), dots=q @ b.T,
         sums=_sliced(g, (..., slice(1, None))), kept_to=kept, queries=q,
         momentum=_sliced(g, (..., 0)), free=r, keys=b, memory_sums=_sliced(ends, slice(1, None)),
@@ -388,12 +388,12 @@ def _read(vectors, state) -> scaled.Scaled:
 
 
 def _inputs(chunk: Chunked, pair):
-    """A chunk's inputs `W` from the pair entering it: the system's inverse applied to each token's input
-    and its correction's reads of the entering memory (decayed, at most one) and momentum (read first, then
-    weighed by its scaled factor), their sum landed once (`_sum`)."""
+    """A chunk's inputs `W` from the pair entering it: the system solved (a unit lower-triangular solve)
+    against each token's input and its correction's reads of the entering memory and momentum, each weighed
+    by its scaled factor, their sum landed once (`_sum`)."""
     corrected = _sum(chunk.inputs, scaled.mul(_read(chunk.corrections, pair[0]), _column(chunk.kept_before)),
                      scaled.mul(_read(chunk.corrections, pair[1]), _column(chunk.momentum_before)))
-    return chunk.inverse @ corrected
+    return solve_triangular(chunk.system, corrected, lower=True, unit_diagonal=True)
 
 
 def _stepped(state, chunk: Chunked, issue=None):

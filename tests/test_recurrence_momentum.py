@@ -208,18 +208,21 @@ def test_a_coupled_momentum_runs_in_a_shard_map_that_checks_varying_axes():
 
 def test_a_chunks_writes_past_float32s_range_cancel_as_the_token_walks():
     """ReviewMomentum1454's local write (row 12693): two tokens of queries and keys along the first key,
-    erase keys along the second, every decay and write gate one, the memory entering 2^127 along the first
-    key and the momentum none, values -2^127 then 0: the chunked op's outputs and final pair are the decode
-    step's, finite, where its first write weighed by its sum to the chunk's end, -2 2^127, overflowed before
-    the memory entering joined it."""
+    erase keys along the second, the memory's decays and the write gates one, the momentum's 1/8 then one,
+    the memory entering 2^127 along the first key and the momentum none, values -2^127 then 0: the chunked
+    op's outputs and final pair are the decode step's, finite, where its first write weighed by its sum to the
+    chunk's end, -2 2^127, overflowed before the memory entering joined it (the entering momentum's factors,
+    -1/8 and -1/4, which a chunk-wide divisor read, divided by nothing)."""
     hooks = recurrence.Hooks(decay='scalar', coupled='momentum', erase='untied', write_bound=1.0, scale=1.0)
     along = jnp.zeros((1, 2, 1, 2), jnp.float32).at[..., 0].set(1.0)
     erase = jnp.zeros((1, 2, 1, 2), jnp.float32).at[..., 1].set(1.0)
     value = jnp.asarray([-(2.0 ** 127), 0.0], jnp.float32).reshape(1, 2, 1, 1)
     zero, one = jnp.zeros((1, 2, 1), jnp.float32), jnp.ones((1, 2, 1), jnp.float32)
     state = jnp.zeros((1, 1, 2, 2, 1), jnp.float32).at[:, :, 0, 0, 0].set(2.0 ** 127)
-    out, final = chunk(hooks, Chunk(along, along, value, log_decay=zero, beta=one, momentum_decay=zero,
-                                    erase_key=erase, state=state), chunk_size=CHUNK)
+    momentum_decay = jnp.asarray([np.log(0.125), 0.0], jnp.float32).reshape(1, 2, 1)
+    given = Chunk(along, along, value, log_decay=zero, beta=one, momentum_decay=momentum_decay, erase_key=erase,
+                  state=state)
+    out, final = chunk(hooks, given, chunk_size=CHUNK)
 
     def one_token(state, token):
         q, p, v, a, b, mu = token
@@ -227,7 +230,7 @@ def test_a_chunks_writes_past_float32s_range_cancel_as_the_token_walks():
                                                                 beta=b, momentum_decay=mu, erase_key=p))
         return state, read
 
-    tokens = tuple(jnp.moveaxis(x, 1, 0) for x in (along, erase, value, zero, one, zero))
+    tokens = tuple(jnp.moveaxis(x, 1, 0) for x in (along, erase, value, zero, one, momentum_decay))
     stepped_final, stepped = jax.lax.scan(one_token, state, tokens)
     for got, want in ((out, jnp.moveaxis(stepped, 0, 1)), (final, stepped_final)):
         assert np.isfinite(np.asarray(want)).all()

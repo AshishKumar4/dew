@@ -141,7 +141,8 @@ def test_a_state_of_no_rank_is_refused_named():
 def test_a_float32_pairs_walk_over_float64_tokens_carries_it_wide():
     """ReviewMomentum1454's x64 case: a pair declared float32 replayed token by token (`Derived.replay`) and
     differentiated (`Derived.backward`) over float64 tokens carries the pair in float64, its outputs and the
-    pair leaving it float64, where a carry typed as the entering float32 pair failed the scan."""
+    pair leaving it float64 and the entering pair's cotangent its own float32, where a carry typed as the
+    entering float32 pair failed the scan."""
     with jax.enable_x64(new_val=True):
         forms = scan.derive_scan(DECLARED, saturation=SATURATION)
         tokens = draws(packed=True)(0)
@@ -151,4 +152,4 @@ def test_a_float32_pairs_walk_over_float64_tokens_carries_it_wide():
         outputs, leaving = forms.replay(chunk, entering)
         cotangents = jnp.ones_like(leaving), jnp.ones_like(outputs)
         d_entering, _ = forms.backward(chunk, (None, entering), *cotangents)
-    assert {outputs.dtype, leaving.dtype, d_entering.dtype} == {jnp.dtype(jnp.float64)}
+    assert (outputs.dtype, leaving.dtype, d_entering.dtype) == (jnp.float64, jnp.float64, jnp.float32)
