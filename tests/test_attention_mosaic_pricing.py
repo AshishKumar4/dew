@@ -66,8 +66,9 @@ def test_a_launch_past_its_registers_or_at_a_rate_unstated_is_never_priced_whole
         assert flagged == [True], (cell, candidates, prices)
     with generation.assumed("sm90"):
         target = generation.gpu_target()
-    part = target.part and dataclasses.replace(target.part, bytes_per_second=None)
-    blind = dataclasses.replace(target, memory_bandwidth=None, part=part)
+    measured = {name: dataclasses.replace(part, bytes_per_second=None)
+                for name, part in target.measured.items()}
+    blind = dataclasses.replace(target, memory_bandwidth=None, measured=measured)
     assert blind.memory_rate is None
     _, _, _, candidates, prices, _ = _priced(("sm90", "Qwen3-8B"), target=blind)
     assert candidates and all(unpriced for unpriced, _ in prices), prices

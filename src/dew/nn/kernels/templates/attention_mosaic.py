@@ -2109,11 +2109,10 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             budgeted = bundle_of(config, ba.arguments["query"].dtype, target=target).budgets_registers
             launches = self._launch_models(ba, config, target) if budgeted else ()
             unpriced = any(registers > model.cap(1) for _, registers, model in launches)
-            resident = self.resident(ba, config, target)
             # Each kernel at its launch's residency: the dQ launch's kernels `DQ_KERNEL`'s, the rest the
-            # dK/dV launch's, its model the last.
+            # dK/dV launch's, its model the last; the launch's on a family that budgets no registers.
             residency = ({dq: max(1, launches[0 if dq else -1][2].most) for dq in (True, False)}
-                         if launches else {})
+                         if launches else dict.fromkeys((True, False), self.resident(ba, config, target)))
             rates = [cost.rates(target, device=device) for device in (False, True)]
             latency = cost.step_latency(target, device=False)
             total = 0.0
@@ -2123,7 +2122,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                     return None
                 dq = assembled.kernel_of(kernel.params.get("name") or "")[0].startswith(DQ_KERNEL)
                 total += cost.launch_seconds(work, emission.launch_programs(kernel), target,
-                                             resident=residency.get(dq, resident))
+                                             resident=residency[dq])
                 unpriced = (unpriced or any(any(cost.units(work, at)[1]) for at in rates)
                             or bool(cost.spanned(work, latency)[1]))
         return unpriced, total
