@@ -4,6 +4,8 @@ These run the whole compiled path, so a component that were only recorded and
 never executed, or executed on the host, would not change what comes back.
 """
 
+from dataclasses import replace
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -86,21 +88,18 @@ def model():
 
 
 def test_defaults_reproduce_the_plain_greedy_walk_when_no_component_is_given(model):
-    """Absent components change nothing: the default call, explicit `None`
-    components and an explicit `Sample()` all draw the same tokens. An empty
-    chain is a different request, because it runs no transform at all."""
+    """Absent components change nothing: the default policy and one naming
+    `Sample()` draw the same tokens. An empty chain is a different request,
+    because it runs no transform at all."""
     module, params = model
     prompt = jnp.asarray([[1, 2, 3], [4, 5, 6]], jnp.int32)
     policy = Sampling(temperature=0)
     plain = generate(module, params, prompt, 4, key=jax.random.key(1), sampling=policy)
-    explicit = generate(module, params, prompt, 4, key=jax.random.key(1), sampling=policy,
-                        logits=None, stopping=None, strategy=None)
-    chosen = generate(module, params, prompt, 4, key=jax.random.key(1), sampling=policy,
-                      strategy=Sample())
-    bare = generate(module, params, prompt, 4, key=jax.random.key(1), sampling=policy, logits=())
+    chosen = generate(module, params, prompt, 4, key=jax.random.key(1),
+                      sampling=replace(policy, strategy=Sample()))
+    bare = generate(module, params, prompt, 4, key=jax.random.key(1), sampling=replace(policy, logits=()))
     assert not np.array_equal(np.asarray(bare.tokens), np.asarray(plain.tokens))
     np.testing.assert_array_equal(np.asarray(plain.tokens), walk(module, params, prompt, 4))
-    np.testing.assert_array_equal(np.asarray(explicit.tokens), np.asarray(plain.tokens))
     np.testing.assert_array_equal(np.asarray(chosen.tokens), np.asarray(plain.tokens))
     np.testing.assert_array_equal(np.asarray(plain.behavior_log_probs), 0.0)
     assert plain.lengths.tolist() == [4, 4] and plain.terminated.tolist() == [False, False]
@@ -121,7 +120,7 @@ def test_a_plain_callable_transform_runs_inside_the_compiled_loop(model, array_b
         lean, decoding.SuppressTokens(jnp.asarray([1, 3], jnp.int32)), decoding.Greedy()
     ) if array_backed else (lean, decoding.Greedy())
     drawn = generate(module, params, prompt, 5, key=jax.random.key(0),
-                     sampling=Sampling(temperature=0), logits=processors)
+                     sampling=Sampling(temperature=0, logits=processors))
 
     def transformed(ids, logits):
         values = np.asarray(logits) + np.asarray(bias)
@@ -147,9 +146,9 @@ def test_a_partial_carries_its_array_configuration_without_recompiling(model):
     first = jnp.asarray(np.eye(VOCAB, dtype=np.float32)[2] * 20.0)
     second = jnp.asarray(np.eye(VOCAB, dtype=np.float32)[7] * 20.0)
     def draw(bias):
-        return generate(
-            module, params, prompt, 3, key=jax.random.key(0), sampling=Sampling(temperature=0),
-            logits=(jax.tree_util.Partial(shifted, bias), decoding.Greedy()))
+        chain = (jax.tree_util.Partial(shifted, bias), decoding.Greedy())
+        return generate(module, params, prompt, 3, key=jax.random.key(0),
+                        sampling=Sampling(temperature=0, logits=chain))
     np.testing.assert_array_equal(np.asarray(draw(first).tokens)[0, 3:], [2, 2, 2])
     np.testing.assert_array_equal(np.asarray(draw(second).tokens)[0, 3:], [7, 7, 7])
 
@@ -173,8 +172,10 @@ def test_other_values_of_shape_free_controls_run_the_walk_the_first_compiled(mod
                  decoding.EpsilonCutoff(1e-4 * scale), decoding.EtaCutoff(1e-4 * scale),
                  decoding.TopH(1 / scale), decoding.Temperature(scale), decoding.TopP(1 / scale),
                  decoding.MinP(0.01 * scale))
-        return generate(module, params, prompt, 6, key=jax.random.key(0), logits=chain,
-                        stopping=(decoding.MaxNewTokens(budget), decoding.MaxLength(4 + budget)))
+        return generate(module, params, prompt, 6, key=jax.random.key(0),
+                        sampling=Sampling(logits=chain,
+                                          stopping=(decoding.MaxNewTokens(budget),
+                                                    decoding.MaxLength(4 + budget))))
 
     first = draw(1.0, 4)
     # The generation program is `dew.sampling.text._checked`'s.
@@ -207,9 +208,9 @@ def test_an_explicit_chain_runs_in_the_order_it_is_written(model):
 
     scaled = decoding.Temperature(0.5)
     first = generate(module, params, prompt, 1, key=jax.random.key(0),
-                     logits=(add, scaled, decoding.TopK(1)))
+                     sampling=Sampling(logits=(add, scaled, decoding.TopK(1))))
     second = generate(module, params, prompt, 1, key=jax.random.key(0),
-                      logits=(scaled, add, decoding.TopK(1)))
+                      sampling=Sampling(logits=(scaled, add, decoding.TopK(1))))
     assert int(np.asarray(first.tokens)[0, -1]) == before
     assert int(np.asarray(second.tokens)[0, -1]) == after
 
@@ -222,9 +223,10 @@ def test_any_sequence_of_components_decodes_as_its_tuple_does(model):
     module, params = model
     prompt = jnp.asarray([[1, 2, 3]], jnp.int32)
     transforms, criteria = (decoding.Temperature(0.5), decoding.TopK(2)), (decoding.MaxNewTokens(3),)
-    given = generate(module, params, prompt, 4, key=jax.random.key(0), logits=UserList(transforms),
-                     stopping=UserList(criteria))
-    written = generate(module, params, prompt, 4, key=jax.random.key(0), logits=transforms, stopping=criteria)
+    given = generate(module, params, prompt, 4, key=jax.random.key(0),
+                     sampling=Sampling(logits=UserList(transforms), stopping=UserList(criteria)))
+    written = generate(module, params, prompt, 4, key=jax.random.key(0),
+                       sampling=Sampling(logits=transforms, stopping=criteria))
     np.testing.assert_array_equal(np.asarray(given.tokens), np.asarray(written.tokens))
     np.testing.assert_array_equal(np.asarray(given.lengths), np.asarray(written.lengths))
 
@@ -242,12 +244,13 @@ def test_a_length_limit_truncates_a_row_and_a_stop_terminates_it(model):
     sampling = Sampling(temperature=0, pad_token_id=11)
     for stopping, terminated in (((decoding.MaxNewTokens(2),), False), ((decoding.MaxLength(5),), False),
                                  ((at_two,), True)):
-        drawn = generate(module, params, prompt, 5, key=jax.random.key(0), sampling=sampling,
-                         stopping=stopping)
+        drawn = generate(module, params, prompt, 5, key=jax.random.key(0),
+                         sampling=replace(sampling, stopping=stopping))
         assert drawn.lengths.tolist() == [2, 2]
         assert drawn.terminated.tolist() == [terminated, terminated]
-    searched = generate(module, params, prompt[:1], 5, key=jax.random.key(0), sampling=sampling,
-                        stopping=(decoding.MaxNewTokens(2),), strategy=Beam(width=2))
+    searched = generate(module, params, prompt[:1], 5, key=jax.random.key(0),
+                        sampling=replace(sampling, stopping=(decoding.MaxNewTokens(2),),
+                                         strategy=Beam(width=2)))
     assert searched.lengths.tolist() == [2] and searched.terminated.tolist() == [False]
 
 
@@ -264,8 +267,8 @@ def test_a_float64_decoders_beam_searches_in_float64(model, chain):
         wide = module.clone(dtype=jnp.float64)
         values = float64_held(params)
         searched = generate(wide, values, prompt, 2, key=jax.random.key(0),
-                            sampling=Sampling(temperature=0, pad_token_id=11),
-                            **({"logits": ()} if chain == "none" else {}), strategy=Beam(width=2))
+                            sampling=Sampling(temperature=0, pad_token_id=11, strategy=Beam(width=2),
+                                              logits=() if chain == "none" else None))
         assert searched.lengths.tolist() == [2] and searched.raw_log_probs.dtype == jnp.float64
         found = np.asarray(searched.raw_log_probs)[0]
         assert np.all(found != found.astype(np.float32).astype(np.float64))
@@ -281,7 +284,7 @@ def test_a_callers_criterion_ends_the_row_it_names(model):
         return state.step >= 2
 
     drawn = generate(module, params, prompt, 5, key=jax.random.key(0),
-                     sampling=Sampling(temperature=0, pad_token_id=11), stopping=(after_two,))
+                     sampling=Sampling(temperature=0, pad_token_id=11, stopping=(after_two,)))
     assert drawn.lengths.tolist() == [2, 2]
     assert drawn.terminated.tolist() == [True, True]
     np.testing.assert_array_equal(np.asarray(drawn.tokens)[:, 5:], 11)
@@ -299,7 +302,7 @@ def test_raw_likelihoods_stay_pre_transform_while_behavior_follows_the_chain(mod
     prompt = jnp.asarray([[1, 2, 3]], jnp.int32)
     penalty = decoding.RepetitionPenalty(1.6)
     drawn = generate(module, params, prompt, 4, key=jax.random.key(3),
-                     sampling=Sampling(temperature=1.0), logits=(penalty,))
+                     sampling=Sampling(temperature=1.0, logits=(penalty,)))
     tokens = np.asarray(drawn.tokens)
     for step in range(4):
         logits = np.asarray(module.apply(params, jnp.asarray(tokens[:, :3 + step]))[:, -1])
@@ -321,11 +324,11 @@ def test_an_undefined_distribution_raises_instead_of_returning_a_token(model):
     prompt = jnp.asarray([[1, 2, 3]], jnp.int32)
     everything = decoding.SuppressTokens(jnp.arange(VOCAB, dtype=jnp.int32))
     with pytest.raises(checkify.JaxRuntimeError):
-        generate(module, params, prompt, 2, key=jax.random.key(0), logits=(everything,))
+        generate(module, params, prompt, 2, key=jax.random.key(0), sampling=Sampling(logits=(everything,)))
     # A row that keeps one token is defined, and that token is what it draws.
     kept = decoding.SuppressTokens(jnp.asarray([index for index in range(VOCAB) if index != 5],
                                                jnp.int32))
-    drawn = generate(module, params, prompt, 2, key=jax.random.key(0), logits=(kept,))
+    drawn = generate(module, params, prompt, 2, key=jax.random.key(0), sampling=Sampling(logits=(kept,)))
     np.testing.assert_array_equal(np.asarray(drawn.tokens)[0, 3:], [5, 5])
     np.testing.assert_array_equal(np.asarray(drawn.behavior_log_probs), 0.0)
 
@@ -340,8 +343,9 @@ def test_min_new_tokens_holds_the_eos_back_and_the_row_still_terminates(model):
     policy = Sampling(temperature=0, eos_token_ids=eos, pad_token_id=12)
     immediate = generate(module, params, prompt, 5, key=jax.random.key(0), sampling=policy)
     assert immediate.lengths.tolist() == [1] and immediate.terminated.tolist() == [True]
-    held = generate(module, params, prompt, 5, key=jax.random.key(0), sampling=policy,
-                    logits=(decoding.MinNewTokens(3, jnp.asarray([eos], jnp.int32)),))
+    held = generate(module, params, prompt, 5, key=jax.random.key(0),
+                    sampling=replace(policy,
+                                     logits=(decoding.MinNewTokens(3, jnp.asarray([eos], jnp.int32)),)))
     tokens = np.asarray(held.tokens)[0, 3:]
     assert int(held.lengths[0]) >= 3
     assert not np.any(tokens[:3] == eos)
@@ -373,8 +377,7 @@ def test_stop_strings_end_a_row_on_text_it_never_decodes_on_the_host(tmp_path, m
         return jnp.where(jnp.arange(VOCAB)[None, :] == pick[:, None], 0.0, -jnp.inf)
 
     drawn = generate(module, params, prompt, 4, key=jax.random.key(0),
-                     sampling=Sampling(pad_token_id=0), logits=(scripted,),
-                     stopping=(criterion,))
+                     sampling=Sampling(pad_token_id=0, logits=(scripted,), stopping=(criterion,)), )
     assert drawn.lengths.tolist() == [2] and drawn.terminated.tolist() == [True]
     np.testing.assert_array_equal(np.asarray(drawn.tokens)[0, 3:5], order[:2])
     np.testing.assert_array_equal(np.asarray(drawn.behavior_log_probs)[0, :2], 0.0)
@@ -394,9 +397,9 @@ def test_a_padded_prompt_gives_a_history_transform_the_same_row_as_an_unpadded_o
                          {"attention_mask": jnp.asarray([[False, True, True, True],
                                                          [True, True, True, True]])})
     together = generate(module, params, padded, 4, key=jax.random.key(0),
-                        sampling=Sampling(temperature=0), logits=chain)
+                        sampling=Sampling(temperature=0, logits=chain))
     alone = generate(module, params, jnp.asarray([[1, 2, 3]], jnp.int32), 4,
-                     key=jax.random.key(0), sampling=Sampling(temperature=0), logits=chain)
+                     key=jax.random.key(0), sampling=Sampling(temperature=0, logits=chain))
     np.testing.assert_array_equal(np.asarray(together.tokens)[0, 4:],
                                   np.asarray(alone.tokens)[0, 3:])
     np.testing.assert_allclose(np.asarray(together.behavior_log_probs)[0],
@@ -414,7 +417,8 @@ def test_sampling_defaults_and_explicit_policies_generate_the_same_outputs(model
     explicit = (decoding.Temperature(0.5), decoding.TopK(5), decoding.TopP(0.95), decoding.MinP(0.2))
     prompt = jnp.asarray([[1, 2, 3]], jnp.int32)
     a = generate(module, params, prompt, 3, key=jax.random.key(0), sampling=sampling)
-    b = generate(module, params, prompt, 3, key=jax.random.key(0), sampling=sampling, logits=explicit)
+    b = generate(module, params, prompt, 3, key=jax.random.key(0),
+                 sampling=replace(sampling, logits=explicit))
     for field in ("tokens", "lengths", "terminated", "behavior_log_probs", "raw_log_probs"):
         np.testing.assert_array_equal(np.asarray(getattr(a, field)), np.asarray(getattr(b, field)))
 

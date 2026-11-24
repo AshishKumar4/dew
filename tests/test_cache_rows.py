@@ -61,7 +61,7 @@ MODELS = {
     "attention": lambda: decoder(),
     "scanned": lambda: CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=2,
                                          num_heads=2, head_dim=8, mlp_features=32, max_seq_len=12,
-                                         dtype="float32", scan_layers=True),
+                                         dtype="float32"),
     "mla": lambda: decoder("mla"),
     "sparse_mla": sparse_mla,
     "recurrent": lambda: decoder("recurrent"),
@@ -73,6 +73,7 @@ MODELS = {
 
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize("kind", list(MODELS))
 def test_gathered_cache_rows_decode_like_the_prefixes_they_came_from(kind):
     """Duplicated and reordered rows keep their own history: after the gather
@@ -112,7 +113,7 @@ def test_beam_branching_reuses_one_prefill_without_mixing_prompts():
     from dew.sampling import Beam
 
     found = generate(model, params, prompts, 4, key=jax.random.key(0),
-                     sampling=Sampling(pad_token_id=0), strategy=Beam(width=1), n=1)
+                     sampling=Sampling(pad_token_id=0, strategy=Beam(width=1)), n=1)
     np.testing.assert_array_equal(np.asarray(found.tokens)[:, :3], np.asarray(prompts))
     # Width one is the greedy walk, so a mixed prefix shows up immediately.
     np.testing.assert_array_equal(np.asarray(found.tokens)[:, 3:], walk(model, params, prompts, 4)[:, 3:])

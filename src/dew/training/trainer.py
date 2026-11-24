@@ -325,8 +325,8 @@ class Trainer(Generic[Loss, Effects]):
         (`AheadOfTime.runnable`).
         `tune_kernels` opts in to the tuner (`dew.nn.kernels.tuning.tune`), else each launch takes its derived
         config. It measures each of Dew's own launches that declares variants to time (`KernelOp`: the
-        kernel templates, `attention_impl="template"`, the norms, SwiGLU and decode attention); tokamax's
-        flash kernel (`attention_impl="triton"`) runs at tokamax's heuristic config, which it does not
+        kernel templates, `generation.chosen(attention="template")`, the norms, SwiGLU and decode attention);
+        tokamax's flash kernel (`attention="triton"`) runs at tokamax's heuristic config, which it does not
         measure. `record` makes each step return in its metrics what each
         evaluation, replays too, sampled or passed as a boundary (`taken_record`). `links` states an axis's
         `Link` by name in place of measuring it (`_links`). `param_dtype`, a dtype's name, stores the

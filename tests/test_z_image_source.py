@@ -32,6 +32,7 @@ from interop_support import (
     fixture_arrays,
     source_transformer,
 )
+from model_support import attending
 from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
 
 from dew.interop.diffusion import z_image_fields, z_image_path
@@ -92,12 +93,14 @@ def z_image_walk(model, params, lengths):
     return walk
 
 
+@attending("xla")
 @pytest.mark.parametrize("name", CASES)
 def test_every_published_tensor_maps_and_exports_bit_identical(source, name):
     _, params, layouts = load(source, name)
     assert_transformer_exports(source, name, layouts, params)
 
 
+@attending("xla")
 @pytest.mark.parametrize("name", [
     "padded", "exact",
     # The deep case's 512 draws in map tasks of 128 (117.8 s whole, alone on a 25/17 worker; IG2504M), every
@@ -194,20 +197,22 @@ def test_the_flow_and_its_gradients_match_the_source(source, arrays, record, nam
 
 
 @pytest.fixture(scope="module")
+@attending("xla")
 def pipeline(source):
     from dew.interop.pretrained import Pretrained
 
-    return Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla")
+    return Pretrained.load(str(source / "pipeline"), dtype="float32")
 
 
 @pytest.fixture(scope="module")
+@attending("xla")
 def streamed(source):
     """The pipeline loaded onto a mesh, its weights streamed as recipes and
     placed a leaf at a time (tests/test_pipeline_streaming.py)."""
     from dew.interop.pretrained import Pretrained
     from dew.training import MeshSpec
 
-    return Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla", mesh=MeshSpec())
+    return Pretrained.load(str(source / "pipeline"), dtype="float32", mesh=MeshSpec())
 
 
 PIPELINE_SEEDS = {"prompts": 8, "walk": 8}
@@ -253,6 +258,7 @@ def widened_call(pipe, run):
         return run(pipe)
 
 
+@attending("xla")
 def test_prompt_encoding_matches_the_source_pipeline(pipeline, source, record):
     """The conditioner reads what `_encode_prompt` reads: the chat template with thinking on, the
     output of the encoder's second-to-last layer, and the real tokens, which the mask marks; on par
@@ -295,6 +301,7 @@ def test_prompt_encoding_matches_the_source_pipeline(pipeline, source, record):
                         wide, lambda pipe: source_encoded(pipe, prompts_of(seed)))))
 
 
+@attending("xla")
 @pytest.mark.parametrize("load", ["pipeline", "streamed"])
 def test_pipeline_walk_matches_the_source(load, source, record, request):
     """`Pretrained.load().text_to_image()` reproduces the source's call: its 50 default steps guided
@@ -386,6 +393,7 @@ def _holed_safetensors(path: Path, held: dict[str, np.ndarray],
         file.truncate(8 + len(encoded) + offset)
 
 
+@attending("xla")
 def test_supplied_weights_rebind_a_tied_text_encoder_without_reading_its_table(source, tmp_path):
     """Supplied variables rebound over a published pipeline (`load_diffusion_source(variables=...)`) take
     the text encoder's layouts from its stored tensors' headers alone: its tied head, stored beside its
@@ -413,10 +421,10 @@ def test_supplied_weights_rebind_a_tied_text_encoder_without_reading_its_table(s
                        {name: value for name, value in stored.items() if name != "model.embed_tokens.weight"},
                        {name: ((rows, width), np.dtype(np.float32))
                         for name in ("model.embed_tokens.weight", "lm_head.weight")})
-    published = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla")
+    published = load_diffusion_source(str(directory), dtype="float32")
     tracemalloc.start()
     try:
-        load_diffusion_source(str(directory), dtype="float32", attention_impl="xla",
+        load_diffusion_source(str(directory), dtype="float32",
                               variables=published.variables)
         _, peak = tracemalloc.get_traced_memory()
     finally:

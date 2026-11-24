@@ -107,7 +107,7 @@ gradients of 256 rows by 128 by 128."""
 def _reported(generation: str, layers: int = 1, *, scanned: bool = False):
     """A grouped GEMM's forward and backward, `layers` times over one shape (as a model's same-shape layers
     each call it, its kernels lowered once, `tuning.lowered_once`), unrolled or under a scan (`scanned`, as
-    `scan_layers=True` runs a stack of like layers), beside a Triton kernel, lowered on this CPU for
+    a decoder runs a stack of like layers), beside a Triton kernel, lowered on this CPU for
     `generation`'s GPU, with the routes its dispatches reported (`routes`)."""
     from dew.nn.kernels import gemm
 
@@ -139,6 +139,7 @@ def templated_calls(record) -> dict[str, int]:
     return {entry["name"]: entry["calls"] for entry in record["launches"] if entry["kind"] == "mosaic_gpu"}
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize("stacked", ["one", "unrolled", "scanned"])
 @pytest.mark.parametrize("generation", ["sm80", "sm90"])
 def test_a_steps_kernel_report_names_its_launches_and_the_flop_count_sizes_them_as_it_does(generation,
@@ -415,13 +416,14 @@ def test_a_hybrid_language_model_step_lowers_for_every_gpu(generation):
     _step_lowered(generation)
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize("generation", ["sm80", "sm90"])
 def test_a_scanned_stacks_kernel_report_counts_every_layers_launches_as_the_flop_count_does(generation):
-    """A bf16 language model of two like layers, its stack scanned (`scan_layers=True`, as host and bank
-    layouts require) or unrolled, its training step lowered for the GPU through `lower_for`
-    (`--trainer.lower-for`'s dry run): its kernel report counts each kernel's launches and FLOPs alike both
-    ways, every layer's, and as the FLOP count of the same program counts them (row 2933: a scan's body
-    once, its kernels at half)."""
+    """A bf16 language model of two like layers, its stack scanned (`generation.chosen(layer_scan="scanned")`,
+    as host and bank layouts require) or unrolled (`layer_scan="plain"`), its training step lowered for the
+    GPU through `lower_for` (`--trainer.lower-for`'s dry run): its kernel report counts each kernel's
+    launches and FLOPs alike both ways, every layer's, and as the FLOP count of the same program counts
+    them (row 2933: a scan's body once, its kernels at half)."""
     import optax
 
     from dew.nn.backbones import CausalTransformer
@@ -431,13 +433,16 @@ def test_a_scanned_stacks_kernel_report_counts_every_layers_launches_as_the_flop
     from dew.training._lowering import Lowered
 
     def reported(scanned: bool) -> tuple[dict, object]:
+        from model_support import stacked
+
         model = CausalTransformer(vocab_size=256, emb_features=128, num_layers=2, num_heads=2,
-                                  mlp_features=256, max_seq_len=128, dtype=jnp.bfloat16, scan_layers=scanned)
-        trainer = Trainer(LMObjective(model, 128), optax.adamw(1e-4), key=jax.random.key(0),
-                          lower_for=generation)
-        state = jax.eval_shape(trainer.initial_state, trainer.objective.initializer, trainer.key)
-        with pytest.raises(Lowered) as lowered:
-            trainer.compile(state, {"text": jax.ShapeDtypeStruct((jax.device_count(), 129), jnp.int32)})
+                                  mlp_features=256, max_seq_len=128, dtype=jnp.bfloat16)
+        with stacked(scanned):
+            trainer = Trainer(LMObjective(model, 128), optax.adamw(1e-4), key=jax.random.key(0),
+                              lower_for=generation)
+            state = jax.eval_shape(trainer.initial_state, trainer.objective.initializer, trainer.key)
+            with pytest.raises(Lowered) as lowered:
+                trainer.compile(state, {"text": jax.ShapeDtypeStruct((jax.device_count(), 129), jnp.int32)})
         return lowered.value.kernels.record(), hlo_flops(lowered.value.lowered.as_text(dialect="hlo"))
 
     (scanned, counted), (unrolled, alike) = reported(scanned=True), reported(scanned=False)

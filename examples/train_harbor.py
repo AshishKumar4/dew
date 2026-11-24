@@ -46,7 +46,8 @@ import tyro
 
 from dew.data import HFTokenizer
 from dew.data.dataset import Loader
-from dew.inference import NativeRolloutServer, Publication, SafetensorsReload, Server, TextGeneration
+from dew.inference import NativeRolloutServer, PagedKV, Publication, Server, TextGeneration
+from dew.inference.rollouts import SafetensorsReload
 from dew.interop import PretrainedDecoder
 from dew.interop.gateway import Gateway
 from dew.interop.harbor import HARBOR_KEY, Harbor
@@ -278,7 +279,7 @@ def smoke_setup(config: Config, source) -> tuple[SmokeGateway, Path, tuple[Path,
         slots=config.prompts * config.groups,
         capacity=config.width,
         # A group's samples repeat their prompt: its pages are prefilled once.
-        kv_cache="shared",
+        cache=PagedKV(shared=True),
     )
     fake = SmokeGateway(
         NativeRolloutServer(engine), HFTokenizer(str(FIXTURES / "diffusion-gemma-workflow"))

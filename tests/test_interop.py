@@ -21,6 +21,7 @@ import numpy as np
 import pytest
 from lane_environment import outside_suite
 from flax import linen as nn
+from model_support import attending
 
 import dew
 from dew.interop import load_params, save_params
@@ -335,6 +336,7 @@ def assert_parameter_storage(reference, actual, is_parameter):
         np.testing.assert_array_equal(after, before.astype(dtype), err_msg=str(names))
 
 
+@attending("xla")
 @pytest.mark.parametrize("family", [
     "llama-tiny", "gemma4-tiny-mm", "gemma-4-audio-tiny", "diffusion-gemma-workflow",
 ])
@@ -343,8 +345,8 @@ def test_public_parameter_storage_is_independent_of_compute_and_roundtrips(tmp_p
     from dew.nn.diffusion_gemma import DiffusionGemma
 
     directory = Path(__file__).resolve().parent / "fixtures" / "hf" / family
-    masters = Pretrained.load(directory, dtype="bfloat16", attention_impl="xla")
-    native = Pretrained.load(directory, dtype="float32", param_dtype="bfloat16", attention_impl="xla")
+    masters = Pretrained.load(directory, dtype="bfloat16")
+    native = Pretrained.load(directory, dtype="float32", param_dtype="bfloat16")
     master_model = masters.model.text if isinstance(masters.model, DiffusionGemma) else masters.model
     native_model = native.model.text if isinstance(native.model, DiffusionGemma) else native.model
     assert jnp.dtype(master_model.dtype) == jnp.dtype(jnp.bfloat16)
@@ -352,7 +354,7 @@ def test_public_parameter_storage_is_independent_of_compute_and_roundtrips(tmp_p
     assert_parameter_storage(masters.variables, native.variables, lambda path: path[0] == "params")
     destination = tmp_path / "export"
     native.save(destination)
-    restored = Pretrained.load(destination, dtype="float32", param_dtype="bfloat16", attention_impl="xla")
+    restored = Pretrained.load(destination, dtype="float32", param_dtype="bfloat16")
     assert jax.tree.structure(native.variables) == jax.tree.structure(restored.variables)
     for before, after in zip(
         jax.tree.leaves(native.variables), jax.tree.leaves(restored.variables), strict=True
@@ -361,7 +363,7 @@ def test_public_parameter_storage_is_independent_of_compute_and_roundtrips(tmp_p
         np.testing.assert_array_equal(before, after)
 
     if family == "llama-tiny":
-        widened = Pretrained.load(destination, dtype="float32", attention_impl="xla")
+        widened = Pretrained.load(destination, dtype="float32")
         for before, after in zip(jax.tree.leaves(native.variables),
                                  jax.tree.leaves(widened.variables), strict=True):
             assert np.asarray(after).dtype == np.float32
@@ -414,6 +416,7 @@ TRAINED_EXPORT_SEEDS = 8
 pooled seeds resolve."""
 
 
+@attending("reference")
 def test_a_trained_lm_run_exports_and_reloads_at_its_own_logits(tmp_path):
     """The whole way out of a run directory: run.json and the checkpoint in,
     a Hugging Face directory out, and `Pretrained.load` reads it back at the
@@ -437,7 +440,7 @@ def test_a_trained_lm_run_exports_and_reloads_at_its_own_logits(tmp_path):
     assert {entry.name for entry in destination.iterdir()} == {
         "config.json", "dew_release.json", "generation_config.json", "model.safetensors"}
     assert json.loads((destination / "generation_config.json").read_text())["tokenizer_name"] == "byte"
-    reloaded = Pretrained.load(destination, dtype="float32", attention_impl="reference")
+    reloaded = Pretrained.load(destination, dtype="float32")
     ids = jnp.asarray([[3, 4, 5, 6]], jnp.int32)
     np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)),
                                   np.asarray(exported.model.apply(exported.variables, ids)))
@@ -466,7 +469,7 @@ from dew.objectives.{module} import {objective}
 from dew.training import Trainer
 
 model = CausalTransformer(vocab_size=256, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
-                          max_seq_len=16, dtype=jnp.float32, attention_impl="xla")
+                          max_seq_len=16, dtype=jnp.float32)
 objective = {objective}(model, 8, ema_decay=None, processor=RunProcessor(ByteTokenizer()))
 rows = [{{"text": np.arange(9, dtype=np.int32)}} for _ in range(8)]
 data = compile(Pipeline(Memory(rows)).repeat().batch(8), read="memory", loading=Loading(workers=0))

@@ -53,7 +53,6 @@ if TYPE_CHECKING:
     from flax import linen as nn
 
     from dew.interop.layouts import SourceLayout, Unwritable
-    from dew.nn.attention import AttentionImpl
 
 VISION_PREFIX = "model.encoder.vision_tower."
 PROJECTION_PREFIX = "model.encoder.embed_vision."
@@ -83,7 +82,7 @@ def text_config(config: Mapping[str, object]) -> Mapping[str, object]:
 
 
 def build(config: Mapping[str, object], *, dtype: str | None = "bfloat16",
-          attention_impl: AttentionImpl = "auto", max_seq_len: int | None = None) -> DiffusionGemma:
+          max_seq_len: int | None = None) -> DiffusionGemma:
     """Build the native `DiffusionGemma` module from a checkpoint's config, without allocating parameters.
 
     `config` is the `diffusion_gemma` wrapper config; any other config, or
@@ -94,7 +93,7 @@ def build(config: Mapping[str, object], *, dtype: str | None = "bfloat16",
     fields["causal"] = True
     if max_seq_len is not None:
         fields["max_seq_len"] = max_seq_len
-    precise = NativeFields(CausalTransformer, {**fields, "dtype": dtype, "attention_impl": attention_impl})
+    precise = NativeFields(CausalTransformer, {**fields, "dtype": dtype})
     text = from_record(CausalTransformer, precise)
     conditioner = None
     if config.get("vision_config") is not None:

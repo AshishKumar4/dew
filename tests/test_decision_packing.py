@@ -1,6 +1,7 @@
 """Decision rows packed into windows: each row decides as it does alone, and a run is one program."""
 
 import collections
+import contextlib
 import copy
 import functools
 import itertools
@@ -17,6 +18,7 @@ from arm_arithmetic import ahead_on_the_host
 from attention_oracle import traced_attention_terms
 from decision_support import decision_rows
 from float64_terms import float64_terms
+from model_support import attending
 from optim_support import in_float64
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact, dew_path
@@ -34,6 +36,7 @@ from dew.decision.task import laid_out
 from dew.interop import Pretrained
 from dew.nn.attention_blocks import NormalAttention
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.kernels import generation
 from dew.objectives.base import Step
 from dew.training.trainer import Trainer
 
@@ -63,13 +66,13 @@ EXAMPLES = [
 def qwen35(length: int) -> Pretrained:
     # Loaded on the host in a GPU tier prepare, whose compile-only GPU runs no load's checks (row 11788).
     with ahead_on_the_host():
-        return Pretrained.load(str(QWEN35), dtype="float32", attention_impl="reference", max_seq_len=length)
+        return Pretrained.load(str(QWEN35), dtype="float32", max_seq_len=length)
 
 
-def attending(length: int, implementation: str = "xla") -> CausalTransformer:
-    """A decoder of attention alone, which the parallel layout's key runs need, on `implementation`."""
+def attention_decoder(length: int) -> CausalTransformer:
+    """A decoder of attention alone, which the parallel layout's key runs need."""
     return CausalTransformer(vocab_size=256, emb_features=32, num_layers=2, num_heads=2, mlp_features=48,
-                             max_seq_len=length, attention_impl=implementation)
+                             max_seq_len=length)
 
 
 ROWS = SegmentLayout.state_first_row(max_len=256, head_max_len=64, option_tokens=8)
@@ -79,10 +82,9 @@ ARMS = {
     "joint": (SegmentLayout.joint_row(max_len=1536), qwen35,
              lambda: JointSchemaHead(64, width=32, routing_layers=1, layers=1, heads=2, feedforward=64)),
     "marker": (ROWS, qwen35, lambda: DecisionHead(64, layers=1)),
-    # The parallel arm's decoder on the attention template, which reads the layout's key runs as its spans
-    # (`DecisionModel._read`, row 1835).
-    "parallel": (replace(ROWS, parallel=True), functools.partial(attending, implementation="template"),
-                 lambda: DecisionHead(32, layers=1)),
+    # The parallel arm's decoder, which reads the layout's key runs as its spans on the attention template
+    # (`ARM_KERNELS`; `DecisionModel._read`, row 1835).
+    "parallel": (replace(ROWS, parallel=True), attention_decoder, lambda: DecisionHead(32, layers=1)),
     # A row a question, packed beside others (`shared_state=1`): rows over one state are
     # tests/test_decision_state_once.py's.
     "readout": (replace(ROWS, head_max_len=128, option_tokens=24, labels=LABELS, shared_state=1), qwen35,
@@ -91,6 +93,10 @@ ARMS = {
 """Joint rows under the joint schema head and rows of one question under the marker head,
 both over Qwen3.5; parallel options, whose key runs Gated DeltaNet refuses, over the attention template;
 options under labels read at each row's answer cue by the backbone's own logits, over Qwen3.5."""
+
+ARM_KERNELS = {"parallel": "template"}
+"""The attention kernel an arm's packed and lone rows run on (`generation.chosen(attention=...)`), the
+selector's own where it names none: the parallel arm's the template, which reads its key runs as spans."""
 
 
 def objective_for(arm: str) -> DecisionObjective:
@@ -356,10 +362,10 @@ def test_a_packed_window_of_marked_rows_decides_each_row_as_the_row_alone():
     packed_rows_decided_alone("marker")
 
 
-@pytest.mark.check1_shards(seeds=8, per_task=8)
+@pytest.mark.check1_shards(seeds=64, per_task=16)
 def test_a_packed_window_of_parallel_rows_decides_each_row_as_the_row_alone():
     """A packed window decides each row as the row alone (`packed_rows_decided_alone`) through the
-    parallel arm, its seeds drawn by CI's map tasks (`check1_shards`)."""
+    parallel arm, its seeds drawn by CI's map tasks (`check1_shards`): `PACKING_SEEDS`' 64, 16 a task."""
     packed_rows_decided_alone("parallel")
 
 
@@ -390,10 +396,9 @@ def packed_rows_decided_alone(arm: str) -> None:
     at the layer: against the token recurrence in float64 on packed documents (test_fla_gdn), and trained
     natively on a GPU (tests/test_gpu_recurrence.py's port cells)."""
     objective = objective_for(arm)
-    assert_rows_decided_alone(objective, (objective.model.backbone.clone(dtype=jnp.float64,
-                                                                         attention_impl="reference"),
+    assert_rows_decided_alone(objective, (objective.model.backbone.clone(dtype=jnp.float64),
                                           objective.model.head.clone(dtype=jnp.float64)), PACKING_SEEDS[arm],
-                              arm, PACKING_WINDOWS.get(arm, 2))
+                              arm, PACKING_WINDOWS.get(arm, 2), kernel=ARM_KERNELS.get(arm))
 
 
 def test_a_labelled_readout_reads_each_packed_row_at_its_own_answer_cue():
@@ -414,22 +419,19 @@ def test_a_labelled_readout_reads_each_packed_row_at_its_own_answer_cue():
 def a_bf16_joint_head_on_flash_reads_each_packed_row_alone(without_deterministic_ops):
     """The joint schema head in bf16 on flash: its routing and field layers read the window's tokens
     by documents, flash's packed sequences of the keys' own offsets, its padded questions and slots
-    reading nothing. Each packed row's logits and the gradients are the row's alone within the
-    float64 gate, the truth the head in float64 on the xla kernel. A head that read the window
-    through a dense mask would not run on flash at all."""
+    reading nothing; its decoder in bf16 on flash too, as a run names one kernel for every attention it
+    traces (`generation.chosen(attention='flash')`, row 11938). Each packed row's logits and the
+    gradients are the row's alone within the float64 gate, the truth the model in float64 on the
+    reference kernel. A head that read the window through a dense mask would not run on flash at all."""
     layout = SegmentLayout.joint_row(max_len=1536)
-
-    def objective_on(implementation: str) -> DecisionObjective:
-        return DecisionObjective(
-            attending(layout.max_len), tokenizer=TOKENIZER, specials=SPECIALS, layout=layout,
-            head=JointSchemaHead(32, width=128, routing_layers=1, layers=1, heads=2, feedforward=64,
-                                 dtype=jnp.bfloat16, attention_impl=implementation),
-            loss=LogLoss(), shuffle_options=False)
-
-    objective = objective_on("flash")
-    head = objective.model.head.clone(dtype=jnp.float64, attention_impl="xla")
-    assert_rows_decided_alone(objective, (objective.model.backbone.clone(dtype=jnp.float64), head),
-                              PACKING_SEEDS["flash"], "flash", drawn_by=objective_on("xla"))
+    head = JointSchemaHead(32, width=128, routing_layers=1, layers=1, heads=2, feedforward=64,
+                           dtype=jnp.bfloat16)
+    objective = DecisionObjective(
+        attention_decoder(layout.max_len).clone(dtype=jnp.bfloat16), tokenizer=TOKENIZER, specials=SPECIALS,
+        layout=layout, head=head, loss=LogLoss(), shuffle_options=False)
+    assert_rows_decided_alone(objective, (objective.model.backbone.clone(dtype=jnp.float64),
+                                          objective.model.head.clone(dtype=jnp.float64)),
+                              PACKING_SEEDS["flash"], "flash", kernel="flash")
 
 
 def asked(batch, logits) -> np.ndarray:
@@ -459,7 +461,7 @@ def rows_alone(decide, batch):
     return np.concatenate([logits[place] for place in every]), grads
 
 
-PACKING_SEEDS = {"joint": 256, "marker": 8, "parallel": 8, "flash": 8, "readout": 8}
+PACKING_SEEDS = {"joint": 256, "marker": 8, "parallel": 64, "flash": 8, "readout": 8}
 """Check 1's declared seeds for each arm's packed window: the most paired sizing (`seeds_for` with the
 packed window as `dew_fn`) gives on any platform the site runs on, each with its confirming block, the
 largest declared as docs/design/testing.md's check 1 rules (d28b1c318). The joint arm and the flash head
@@ -472,7 +474,11 @@ readout arm's 8 is an A100's (SF-readout-sizing), an H100's and armada's. The GP
 the head's gradients whose float64 truth is zero by symmetry, which both arms err at by 0 to 3 fp32
 ulps: the marker and parallel arms' scorer_out bias, shared by a question's options, and the joint arm's
 attention key biases (ledger 1548). Twice the rows a draw took the same counts on an A100 (node receipts
-SF-packing-scale2-sizing), each draw twice the work."""
+SF-packing-scale2-sizing), each draw twice the work. The parallel arm's 64 since its head runs on the
+template too (row 11938: one kernel a run names, `ARM_KERNELS`), whose 64-row tiles round its scorer's
+inputs otherwise: 8 read its scorer_out bias Inconclusive (pooled 1.105, [0.760, 1.694] over 40), and 64,
+128 and 256 each passed on armada (run-tests IG-PAR-* at API02c), the plain pair unsizable where the site
+judges by its terms (`seeds_for`'s "not the plain pair's")."""
 
 
 PACKING_WINDOWS = {"marker": 1}
@@ -482,12 +488,15 @@ packs several rows, and its draw at two windows took 0.50 s on armada against 0.
 
 
 def assert_rows_decided_alone(objective, wide_modules, seeds: int, arm: str, count: int = 2, *,
-                              drawn_by=None) -> None:
+                              kernel: str | None = None) -> None:
     """`count` packed windows of the examples decide each row's questions as the row does alone where
     its window packed it (`rows_alone`), logits and every parameter's gradient on par with it (check 1)
     over drawn parameters, the truth `wide_modules`, the backbone and head in float64, over the rows
     in windows of their own, a leaf zero by algebra sized by the terms its sum adds; its site `arm`'s own
-    (`packed window: <arm>`), as two arms' cells share a GPU flow's one store of programs."""
+    (`packed window: <arm>`), as two arms' cells share a GPU flow's one store of programs. The packed and
+    lone rows run their attention on `kernel` where given (`generation.chosen`), the selector's pick
+    where not; the float64 truth, its parameters' draw among them, on the selector's, which takes the
+    reference path for float64 (`dew.nn.attention`'s narrowing rule) and runs on the host's CPU."""
     # The windows laid out on the host in a GPU tier prepare (`ahead_on_the_host`, rows 7858, 7859: made on
     # its compile-only GPU, they left the cell unprepared).
     with ahead_on_the_host():
@@ -504,16 +513,21 @@ def assert_rows_decided_alone(objective, wide_modules, seeds: int, arm: str, cou
     wide.substitute(wide_modules)
     decide = jax.jit(lambda variables, batch: decided(objective, variables, batch, segments))
 
+    chosen = (contextlib.nullcontext if kernel is None
+              else functools.partial(generation.chosen, attention=kernel))
+
     @as_given
     def packed(variables):
-        logits, grads = decide(variables, batch)
+        with chosen():
+            logits, grads = decide(variables, batch)
         return asked(batch, logits), grads
 
     # One of Dew's own paths: packing invariance, both arms one `decide` under one rewrite, one program.
     @dew_path
     @as_given
     def alone(variables):
-        return rows_alone(lambda one: decide(variables, one), batch)
+        with chosen():
+            return rows_alone(lambda one: decide(variables, one), batch)
 
     # The rows' float fields (the targets a smoothed label reads) in float64, as the truth computes.
     wide_rows = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64)
@@ -543,17 +557,9 @@ def assert_rows_decided_alone(objective, wide_modules, seeds: int, arm: str, cou
     # A logit sums within its row's window; a parameter's gradient over every window's tokens, in
     # another order than the rows alone. Drawn unboxed: the terms read an attention's kernels as arrays
     # (`AttentionTerms`), which an init can box with their logical axes (row 4465).
-    # Drawn by `drawn_by` where the objective's kernels run on a GPU alone: its parameters the same, its draw
-    # made on the host (`drawn_on_the_host`, row 11788: a flash head's init refused on the host's CPU).
-    initializer = objective if drawn_by is None else drawn_by
-    if drawn_by is not None:
-        # The twin's parameters are the objective's own: the same tree, shapes and dtypes, traced where the
-        # objective's kernels run, so a parameter the objective alone declares fails here, not drawn apart.
-        def declared(drawing):
-            # The key made in the trace: an eager one is an array on a device a compile-only run has not.
-            return jax.eval_shape(lambda: nn.unbox(drawing.init(jax.random.key(0))))
-        assert declared(drawn_by) == declared(objective)
-    initialized = jax.jit(lambda key: nn.unbox(initializer.init(key)))
+    # Drawn on the selector's kernels, which the host's CPU runs (row 11788: a flash head's init refused
+    # there), `kernel` the rows' alone.
+    initialized = jax.jit(lambda key: nn.unbox(objective.init(key)))
     # A leaf whose float64 truth cancels, an algebraic zero's, is sized by the terms its sums add
     # (`terms`), so each arm's rounding of them is on par, on every backend.
     assert_as_exact(packed, alone, lambda seed: (initialized(jax.random.key(seed)),),
@@ -613,6 +619,7 @@ def test_a_batch_of_requests_holds_each_row_and_its_padding_within_the_sequence_
     assert int(np.max(laid.segments)) == laid.max_segments == 1
 
 
+@attending("reference")
 def test_a_one_question_head_reads_joint_rows_only_of_one_question():
     """The marker head reads one question a row: over joint rows of a schema that asks several, the run
     is refused before a row is read; a schema of one question reads as rows of one."""
@@ -631,6 +638,7 @@ def test_a_one_question_head_reads_joint_rows_only_of_one_question():
         reader.close()
 
 
+@attending("xla")
 @pytest.mark.parametrize("causal", [True, False])
 def test_a_joint_head_given_no_layout_reads_every_question_of_a_request_in_one_row(causal):
     """A decision objective given the joint head and no layout lays a request out
@@ -640,7 +648,7 @@ def test_a_joint_head_given_no_layout_reads_every_question_of_a_request_in_one_r
     the joint row does."""
     example = EXAMPLES[4]
     backbone = CausalTransformer(vocab_size=256, emb_features=32, num_layers=2, num_heads=2, mlp_features=48,
-                                 max_seq_len=2048, attention_impl="xla", causal=causal)
+                                 max_seq_len=2048, causal=causal)
     head = JointSchemaHead(32, width=32, routing_layers=1, layers=1, heads=2, feedforward=64)
 
     def objective(**layout):
@@ -660,6 +668,7 @@ def test_a_joint_head_given_no_layout_reads_every_question_of_a_request_in_one_r
     np.testing.assert_array_equal(scores(defaulted), expected)
 
 
+@attending("xla")
 @pytest.mark.parametrize("questions", [1, 2])
 def test_single_option_questions_fit_the_packing_bounds(questions):
     """A fitting singleton-choice schema packs even where a two-option row cannot fit."""
@@ -669,9 +678,9 @@ def test_single_option_questions_fit_the_packing_bounds(questions):
     length = len(encoded.tokens) if questions == 1 else 500
     layout = SegmentLayout.joint_row(max_len=length)
     assert layout.fits(encoded)
-    objective = DecisionObjective(attending(length), tokenizer=TOKENIZER, specials=SPECIALS, layout=layout,
-                                  head=JointSchemaHead(32, width=32, routing_layers=1, layers=1,
-                                                       heads=2, feedforward=64), shuffle_options=False)
+    head = JointSchemaHead(32, width=32, routing_layers=1, layers=1, heads=2, feedforward=64)
+    objective = DecisionObjective(attention_decoder(length), tokenizer=TOKENIZER, specials=SPECIALS,
+                                  layout=layout, head=head, shuffle_options=False)
     data = decision_rows([example], 1, [example], objective=objective.data())
     (batch,) = list(data.val(DataPartition()))
     batch = jax.tree.map(np.asarray, dict(batch))
@@ -701,6 +710,7 @@ class Counting(ByteTokenizer):
         return super().encode(text, add_special_tokens=add_special_tokens)
 
 
+@attending("xla")
 @pytest.mark.parametrize("arm", ["joint", "marker"])
 def test_a_reader_tokenizes_each_text_of_its_rows_once(arm):
     """A reader lays each record out twice, to fit it and to train on it, and
@@ -710,7 +720,7 @@ def test_a_reader_tokenizes_each_text_of_its_rows_once(arm):
     lays out again."""
     layout, _, head = ARMS[arm]
     tokenizer = Counting()
-    objective = DecisionObjective(attending(layout.max_len), tokenizer=tokenizer, specials=SPECIALS,
+    objective = DecisionObjective(attention_decoder(layout.max_len), tokenizer=tokenizer, specials=SPECIALS,
                                   layout=layout, head=head(), loss=LogLoss())
     data = decision_rows(EXAMPLES, 2, objective=objective.data())
     reader = data.train(DataPartition())
@@ -726,6 +736,7 @@ PACKED_SEEDS = 256
 variables, sized paired by `seeds_for` on armada."""
 
 
+@attending("xla")
 @pytest.mark.check1_shards(seeds=256, per_task=64)
 def test_a_packed_loss_counts_only_real_scored_questions():
     """Different joint-row lengths and label counts contribute question charges, not token,
@@ -744,7 +755,7 @@ def test_a_packed_loss_counts_only_real_scored_questions():
                  "q2": Noul("x"), "q3": Choice("x", ["0", "1", "2", "3"])}, {"q0": "yes"}),
     ]
     layout = SegmentLayout.joint_row(max_len=1536)
-    objective = DecisionObjective(attending(layout.max_len), tokenizer=TOKENIZER, specials=SPECIALS,
+    objective = DecisionObjective(attention_decoder(layout.max_len), tokenizer=TOKENIZER, specials=SPECIALS,
                                   layout=layout, head=JointSchemaHead(32, width=32, routing_layers=1,
                                       layers=1, heads=2, feedforward=64), shuffle_options=False)
     data = decision_rows(examples, 3, examples, objective=objective.data())

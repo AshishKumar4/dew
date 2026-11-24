@@ -10,6 +10,7 @@ import optax
 import pytest
 from arm_arithmetic import summed_as_run
 from map_judge import drawing
+from model_support import attending
 from placement_parity import layouts_agree, x64
 
 from dew.checkpoints import _filled
@@ -185,7 +186,7 @@ def _decoder(*, scanned=False, remat=None, mixture=False, rows=8, dex=False, see
     from dew.objectives.routing import ExpertBalance
     model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=4 if scanned else 2, num_heads=2,
                               num_kv_heads=1, mlp="swiglu", mlp_features=64, max_seq_len=16, qk_norm=True,
-                              tie_embeddings=True, dtype=dtype, scan_layers=scanned, remat=remat,
+                              tie_embeddings=True, dtype=dtype, remat=remat,
                               mixture={"experts": 4, "top_k": 2} if mixture else None)
     if dex:
         from dew.nn.dex import DifferentialExtension
@@ -224,7 +225,8 @@ def _trained(optimizer, *, copies, steps=3, mesh=None, padded=0, accumulation=1,
                                 dtype=jnp.float64 if wide else jnp.bfloat16)
     long = longer and {TEXT_KEY: jnp.asarray(np.random.default_rng(1).integers(1, 64, (longer, 9)),
                                              jnp.int32)}
-    with chosen(narrow_copies='on' if copies else 'off'):
+    # A `scanned` decoder's stack scans, any other's runs a layer at a time (`generation.Choice.LAYER_SCAN`).
+    with chosen(narrow_copies='on' if copies else 'off', layer_scan='scanned' if scanned else 'plain'):
         trainer = Trainer(objective, optimizer, key=jax.random.key(seed), mesh=mesh or MeshSpec(),
                           layout=Layout(min_shard=1, tolerance=1.0), update=UpdateBatch(batches=accumulation),
                           fit=FitPolicy(split=split), param_dtype="float64" if wide else None)
@@ -1006,6 +1008,7 @@ def test_a_fit_over_a_state_holding_a_packed_collection_of_attribute_leaves_step
     np.testing.assert_array_equal(np.asarray(held.scale), np.ones(4))
 
 
+@attending("template")
 @pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
 def test_a_forwards_parameter_reads_are_its_drawn_forwards(dtype):
     """A decoder's forward whose every launch taking a parameter runs a template where a GPU runs it (the
@@ -1026,7 +1029,7 @@ def test_a_forwards_parameter_reads_are_its_drawn_forwards(dtype):
 
     model = models.build("causal_transformer", vocab_size=64, emb_features=128, num_layers=2, num_heads=2,
                          num_kv_heads=1, head_dim=64, mlp_features=256, max_seq_len=128, dtype=dtype,
-                         attention_impl="template", mixture={"experts": 4, "top_k": 2, "layers": (1,)})
+                         mixture={"experts": 4, "top_k": 2, "layers": (1,)})
     tokens = jax.ShapeDtypeStruct((2, 128), jnp.int32)
     variables = jax.eval_shape(model.init, jax.random.key(0), tokens)
     objective, step = LMObjective(model, 127), Step(jnp.asarray(0), jax.random.key(1), None)

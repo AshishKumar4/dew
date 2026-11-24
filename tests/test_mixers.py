@@ -22,7 +22,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
-from model_support import TINY_DECODER, decode_logits
+from model_support import TINY_DECODER, attending, decode_logits
 from reference_error import assert_as_exact, logits_operands, widened, with_gradients
 from residual_orders import orders, permuted, residual_width
 from selection_margins import MARGIN, capturing, clearing, margin
@@ -706,6 +706,7 @@ def test_every_attention_mixer_computes_or_refuses_each_policy_it_is_asked(kind,
     assert all(np.any(np.asarray(leaves[path], np.float32)) for path in added)
 
 
+@attending("reference")
 def test_wide_logits_reach_the_reference_attention_and_are_refused_elsewhere():
     """Wide logits (`MixerContext.wide_logits`, the dispatcher's `wide_logits`) are arithmetic only the
     reference attention performs (`reference_only`): 'auto' and xla route a call asking them to it, and
@@ -736,7 +737,7 @@ def test_wide_logits_reach_the_reference_attention_and_are_refused_elsewhere():
         resolve_implementation("cudnn", q, k, wide_logits=True)
     assert "arithmetic" in {refusal.code for refusal in refused.value.refusals}
     context = MixerContext(emb_features=64, num_heads=2, num_kv_heads=2, head_dim=32, max_seq_len=8,
-                           attention_impl="reference", wide_logits=True)
+                           wide_logits=True)
     layer = CausalSelfAttention(ctx=context)
     x = jnp.ones((1, 4, 64))
     variables = layer.init(jax.random.key(22), x)
@@ -752,6 +753,7 @@ LOCAL_SPANS = {"causal": ({}, np.ones((4, 4), bool)),
 chunks of two places, each over four tokens; a windowed or chunked block runs `local_attention`."""
 
 
+@attending("reference")
 @pytest.mark.parametrize("span", list(LOCAL_SPANS))
 def test_a_blocks_call_stating_its_keys_validity_alone_hides_those_keys(span):
     """A causal attention block called with its keys' validity (`AttentionMetadata.key_valid`) and no
@@ -763,7 +765,7 @@ def test_a_blocks_call_stating_its_keys_validity_alone_hides_those_keys(span):
 
     entries, within = LOCAL_SPANS[span]
     context = MixerContext(emb_features=64, num_heads=2, num_kv_heads=2, head_dim=32, max_seq_len=8,
-                           attention_impl="reference", **entries)
+                           **entries)
     layer = CausalSelfAttention(ctx=context)
     x = jax.random.normal(jax.random.key(23), (2, 4, 64))
     variables = layer.init(jax.random.key(22), x)

@@ -18,6 +18,7 @@ import pytest
 from diffusion_support import as_a_step, float64_gradient, moved_weights, objective_gradient
 from flax import linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
+from model_support import attending
 from reference_error import as_given, assert_as_exact, stacked_on_host
 from safetensors.numpy import load_file
 
@@ -46,13 +47,14 @@ REFERENCES = FIXTURE / "reference"
 
 
 @pytest.fixture(scope="module")
+@attending("xla")
 def source():
     return loaded_source()
 
 
 def loaded_source():
     """The SFT fixture's model, batch, the reference's own draws on a step, and its recorded values."""
-    loaded = Pretrained.load(FIXTURE, dtype="float32", attention_impl="xla", max_seq_len=32)
+    loaded = Pretrained.load(FIXTURE, dtype="float32", max_seq_len=32)
     with np.load(FIXTURE / "reference.npz") as arrays:
         reference = {name: arrays[name] for name in arrays.files}
     batch = {"text": reference["tokens"], "canvas_mask": reference["canvas_mask"],
@@ -74,6 +76,7 @@ def objective(loaded, *, variables=None, **kwargs):
                                    variables=values, **kwargs)
 
 
+@attending("xla")
 def test_the_block_objectives_head_takes_the_fit_ladders_tile():
     """The block objective runs its head by the policy every token objective takes
     (`dew.objectives.lm.head`): it keeps the whole logits until the fit ladder tiles it, and its program
@@ -234,6 +237,7 @@ def assert_tree_close(actual, expected, tolerance):
         np.testing.assert_allclose(left, right, atol=tolerance, rtol=0)
 
 
+@attending("xla")
 def test_official_sft_loss_and_every_parameter_gradient(source):
     """fp32 loss and all parameter gradients against Google's real SFTDiffusion.
 
@@ -257,6 +261,7 @@ def test_official_sft_loss_and_every_parameter_gradient(source):
     assert_tree_close(updated, reference_update, 2e-6)
 
 
+@attending("xla")
 def test_disabling_encoder_gradient_matches_the_reference_control(source):
     loaded, batch, step, _ = source
     obj = objective(loaded, stop_gradient_from_denoiser_to_encoder=True)
@@ -274,6 +279,7 @@ def test_disabling_encoder_gradient_matches_the_reference_control(source):
     )
 
 
+@attending("xla")
 @pytest.mark.parametrize("probability,reference_key", [(0., "sc_off_loss"), (1., "sc_on_loss")])
 def test_both_self_conditioning_branches_match_the_official_adapter(source, probability, reference_key):
     loaded, batch, step, reference = source
@@ -285,6 +291,7 @@ def test_both_self_conditioning_branches_match_the_official_adapter(source, prob
     np.testing.assert_allclose(loss, reference[reference_key], atol=1e-5, rtol=0)
 
 
+@attending("xla")
 def test_loss_weights_apply_after_independent_row_normalization(source):
     loaded, batch, step, reference = source
     obj = objective(loaded, encoder_loss_weight=0.3, decoder_loss_weight=2.7)
@@ -298,6 +305,7 @@ def test_loss_weights_apply_after_independent_row_normalization(source):
     assert abs(float(loss) - wrong) > 1e-3
 
 
+@attending("xla")
 def test_a_block_step_passes_a_decoder_that_reads_the_runs_progress_the_steps(source):
     """A block diffusion step passes a DiffusionGemma whose decoder reads the run's progress the step's,
     at the encoder's pass and each denoising pass (`BlockDiffusionObjective.passes_progress`; review of
@@ -315,6 +323,7 @@ def test_a_block_step_passes_a_decoder_that_reads_the_runs_progress_the_steps(so
     assert started != halfway
 
 
+@attending("xla")
 def test_scoring_reports_the_denoiser_cross_entropy_of_every_canvas_target(source):
     """A validation pass scores each row's selected canvas under the same draw
     training makes from the key, so the weights are the reference's selected
@@ -329,6 +338,7 @@ def test_scoring_reports_the_denoiser_cross_entropy_of_every_canvas_target(sourc
     np.testing.assert_allclose(row_means, reference["canvas_loss"], atol=1e-5, rtol=0)
 
 
+@attending("xla")
 def test_sparse_canvas_targets_train_and_score_their_physical_canvas(source):
     loaded, _, step, _ = source
     # Another batch than the reference's: the step draws its own, not the reference's tape.
@@ -350,6 +360,7 @@ def test_sparse_canvas_targets_train_and_score_their_physical_canvas(source):
     assert any(float(jnp.linalg.norm(leaf)) > 1e-6 for leaf in jax.tree.leaves(gradient))
 
 
+@attending("xla")
 def test_canvas_sampling_is_uniform_over_noncontiguous_partial_canvases(source):
     loaded, _, step, _ = source
     # Another batch than the reference's: the step draws its own, not the reference's tape.
@@ -369,6 +380,7 @@ def test_canvas_sampling_is_uniform_over_noncontiguous_partial_canvases(source):
     assert np.all((selected.sum(axis=0)[[1, 3]] >= 16) & (selected.sum(axis=0)[[1, 3]] <= 48))
 
 
+@attending("xla")
 def test_the_model_the_trainer_substitutes_is_the_one_the_losses_run(source):
     """The trainer rematerializes or quantizes a step by substituting the
     modules `program_key` names. The losses run the clone sized to the SFT
@@ -404,17 +416,19 @@ def text_run(source):
     return obj, batch, dataset(batch), jax.random.key(int(reference["run_seed"])), variables
 
 
+@attending("xla")
 @pytest.mark.check1_shards(seeds=512, per_task=80)
 def test_a_text_sft_trainers_gradient_is_the_objectives(source):
     """The text SFT trainer's gradient is the objective's at the step's draws over drawn batches
     (`varied`), the float64 twin of the loaded fixture the truth (`assert_the_objectives_gradient`)."""
     obj, batch, _, run_key, variables = text_run(source)
     with jax.enable_x64(new_val=True):
-        wide = objective(Pretrained.load(FIXTURE, dtype="float64", attention_impl="xla", max_seq_len=32))
+        wide = objective(Pretrained.load(FIXTURE, dtype="float64", max_seq_len=32))
     assert_the_objectives_gradient(obj, wide, batch, run_key, variables, UPDATE_SEEDS["text"],
                                    batches=varied(batch, UPDATE_ROWS))
 
 
+@attending("xla")
 def test_a_text_sft_runs_own_path_takes_the_trainers_update(source):
     """The text SFT run's own path takes the trainer's update to the bit
     (`assert_the_runs_path_takes_the_trainers_update`)."""
@@ -422,6 +436,7 @@ def test_a_text_sft_runs_own_path_takes_the_trainers_update(source):
     assert_the_runs_path_takes_the_trainers_update(obj, batch, data, run_key, variables)
 
 
+@attending("xla")
 def test_real_trainer_update_and_checkpoint_resume(source, tmp_path):
     loaded = source[0]
     obj, _, data, run_key, _ = text_run(source)
@@ -443,6 +458,7 @@ def test_real_trainer_update_and_checkpoint_resume(source, tmp_path):
 
 
 @pytest.fixture(scope="module")
+@attending("xla")
 def image_source():
     return loaded_image_source()
 
@@ -450,7 +466,7 @@ def image_source():
 def loaded_image_source():
     """Native SFT behavior over the real loaded multimodal generation fixture."""
     directory = FIXTURE.parent / "diffusion-gemma-workflow"
-    loaded = Pretrained.load(directory, dtype="float32", attention_impl="xla", max_seq_len=32)
+    loaded = Pretrained.load(directory, dtype="float32", max_seq_len=32)
     with np.load(directory / "reference.npz") as reference:
         pixels = jnp.asarray(reference["pixels"])
     pixels = jnp.concatenate([pixels, pixels[..., ::-1]], axis=-1)
@@ -474,6 +490,7 @@ def loaded_image_source():
     return loaded, inputs, obj, variables, step
 
 
+@attending("xla")
 def test_model_inputs_text_matches_raw_loss_and_gradients(source):
     loaded, batch, step, _ = source
     obj = objective(loaded)
@@ -484,6 +501,7 @@ def test_model_inputs_text_matches_raw_loss_and_gradients(source):
     assert_tree_close(prepared, raw, 0)
 
 
+@attending("xla")
 def test_image_sft_uses_media_validity_groups_and_positions(image_source):
     _, inputs, obj, variables, step = image_source
     evaluate = jax.jit(jax.value_and_grad(
@@ -510,6 +528,7 @@ def test_image_sft_uses_media_validity_groups_and_positions(image_source):
         assert abs(float(evaluate(variables, changed)[0] - loss)) > 1e-6, name
 
 
+@attending("xla")
 def test_media_placeholders_never_become_text_targets(image_source):
     _, inputs, obj, variables, step = image_source
     indices = inputs.token_fields["image_indices"].at[0, 8].set(0)
@@ -527,6 +546,7 @@ def test_media_placeholders_never_become_text_targets(image_source):
 
 
 
+@attending("xla")
 def test_denoiser_image_gradient_obeys_encoder_detachment(image_source):
     loaded, inputs, _, variables, step = image_source
     norms = []
@@ -551,6 +571,7 @@ def image_run(inputs):
     return batch, data, jax.random.key(2)
 
 
+@attending("xla")
 @pytest.mark.check1_shards(seeds=512, per_task=64)
 def test_an_image_sft_trainers_gradient_is_the_objectives(image_source):
     """The image SFT trainer's gradient is the objective's at the step's draws, the float64 twin of the
@@ -560,11 +581,12 @@ def test_an_image_sft_trainers_gradient_is_the_objectives(image_source):
     batch, _, run_key = image_run(inputs)
     with jax.enable_x64(new_val=True):
         wide = Pretrained.load(FIXTURE.parent / "diffusion-gemma-workflow", dtype="float64",
-                               attention_impl="xla", max_seq_len=32)
+                               max_seq_len=32)
         twin = BlockDiffusionObjective(wide.model, prompt_length=8, variables=wide.variables)
     assert_the_objectives_gradient(obj, twin, batch, run_key, variables, UPDATE_SEEDS["image"])
 
 
+@attending("xla")
 def test_an_image_sft_runs_own_path_takes_the_trainers_update(image_source):
     """The image SFT run's own path takes the trainer's update to the bit
     (`assert_the_runs_path_takes_the_trainers_update`)."""
@@ -573,6 +595,7 @@ def test_an_image_sft_runs_own_path_takes_the_trainers_update(image_source):
     assert_the_runs_path_takes_the_trainers_update(obj, batch, data, run_key, variables)
 
 
+@attending("xla")
 def test_image_sft_trainer_resumes_where_its_uninterrupted_run_lands(image_source, tmp_path):
     """Native lifecycle evidence, not an official image-conditioned SFT oracle: an image-conditioned block
     SFT run trains its conditioner, and resumed from its checkpoint lands bit for bit where the same run
@@ -595,6 +618,7 @@ def test_image_sft_trainer_resumes_where_its_uninterrupted_run_lands(image_sourc
     assert int(resumed.updates) == 2
 
 
+@attending("xla")
 def test_image_sft_run_published_reads_back_and_generates_as_its_run(image_source, tmp_path):
     """Native lifecycle evidence, not an official image-conditioned SFT oracle: an image-conditioned block
     SFT run's trained weights published as its source's checkpoint read back as the same objective, its
@@ -603,7 +627,7 @@ def test_image_sft_run_published_reads_back_and_generates_as_its_run(image_sourc
     batch, data, run_key = image_run(inputs)
     resumed = Trainer(obj, optax.sgd(0.001), key=run_key).fit(data, steps=1, log_every=1)
     replace(loaded, model=obj.model).save(tmp_path / "published", variables=resumed.variables)
-    readback = Pretrained.load(tmp_path / "published", dtype="float32", attention_impl="xla", max_seq_len=32)
+    readback = Pretrained.load(tmp_path / "published", dtype="float32", max_seq_len=32)
     restored = BlockDiffusionObjective(readback.model, prompt_length=8, variables=readback.variables)
     # Each program compiled once, as a run's are: run op by op, the init and the two losses compiled each
     # of their operations apart, a third of the test (row 3978).
@@ -629,6 +653,7 @@ def test_image_sft_run_published_reads_back_and_generates_as_its_run(image_sourc
     assert np.all(np.asarray(generated.decoder_steps) > 0)
 
 
+@attending("xla")
 def test_a_frozen_split_moves_only_what_the_filter_keeps(source):
     """Starting variables `freeze` split keep their split, as LMObjective's
     do: the frozen collection holds what the filter rejects, the loss is the
@@ -660,6 +685,7 @@ def test_a_frozen_split_moves_only_what_the_filter_keeps(source):
     assert "frozen" not in obj.pipeline(state, ema=False).variables
 
 
+@attending("xla")
 def test_a_canvas_rows_context_reads_an_id_its_vocabulary_also_pads_with(source):
     """A conversation's context may hold the id its rows pad with (id 0, Qwen's "!"): the canvas row
     marks its context's own ids (`ResponseCanvases`' prompt_mask), so block SFT reads that id as the
@@ -744,6 +770,7 @@ def sown_passes(obj, variables, batch, step):
     return encoded["qk"], first, second
 
 
+@attending("xla")
 def test_the_block_objective_observes_the_maxima_of_its_three_passes(source):
     """The fixture's model norms its queries and keys, so QK-Clip refuses it at any threshold (`dew.optim`).
     What the objective owes a clipping step is the observation: `Aux.qk_stats` holds the passes' own maxima
@@ -759,6 +786,7 @@ def test_the_block_objective_observes_the_maxima_of_its_three_passes(source):
                  jax.tree.map(np.asarray, expected))
 
 
+@attending("xla")
 def test_an_image_conditioned_run_observes_its_vision_tower_beside_its_passes(image_source):
     """An image's conditioner runs its vision tower in the encoder pass alone, and that tower's attention
     sows its maxima as the text layers' do. The merge keeps them by module path, beside the text layers'

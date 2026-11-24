@@ -18,7 +18,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from model_support import decoder
+from model_support import attending, decoder
 
 from dew.sampling import Sampling, Speculative, TreeShape, TreeSpeculative, decoding, generate
 
@@ -41,7 +41,7 @@ def test_speculation_reproduces_the_greedy_walk_on_a_real_model(kind):
     prompts = jnp.asarray([[1, 2, 3], [7, 8, 9]], jnp.int32)
     params = jax.jit(model.init)(jax.random.key(0), prompts)
     drawn = generate(model, params, prompts, 6, key=jax.random.key(1),
-                     sampling=Sampling(temperature=0), strategy=Speculative(block=3))
+                     sampling=Sampling(temperature=0, strategy=Speculative(block=3)))
 
     walked = np.asarray(prompts)
     for _ in range(6):
@@ -82,7 +82,7 @@ def longrope_drafter():
     from dew.nn.mixers.attention import AttentionMixer
     from dew.nn.rope import LongRopeScaling, YarnScaling
 
-    model = Pretrained.load(DSPARK, weights=False, dtype="float32", attention_impl="reference").model
+    model = Pretrained.load(DSPARK, weights=False, dtype="float32").model
     drafter = model.dspark.layer_type
     head = model.head_dim or model.emb_features // model.num_heads
     pairs = int(head * (model.partial_rotary_factor or 1.0)) // 2
@@ -138,6 +138,7 @@ LONGROPE_CASES = [(np.asarray([[1, 2, 3], [7, 8, 9]], np.int32), 6),
 with its budget."""
 
 
+@attending("reference")
 @pytest.mark.parametrize("case", range(len(LONGROPE_CASES)))
 @pytest.mark.parametrize("kind", ["attention", "recurrent", "dspark"])
 def test_speculation_across_a_longrope_rebuild_reproduces_the_greedy_walk(kind, case):
@@ -151,7 +152,7 @@ def test_speculation_across_a_longrope_rebuild_reproduces_the_greedy_walk(kind, 
     held, steps = LONGROPE_CASES[case]
     prompts = jnp.asarray(held)
     speculated = generate(model, params, prompts, steps, key=jax.random.key(1),
-                          sampling=Sampling(temperature=0), strategy=Speculative(block=3))
+                          sampling=Sampling(temperature=0, strategy=Speculative(block=3)))
     np.testing.assert_array_equal(np.asarray(speculated.tokens)[:, prompts.shape[1]:],
                                   greedy_walk(model, params, prompts, steps))
     np.testing.assert_array_equal(np.asarray(speculated.lengths), steps)
@@ -163,6 +164,7 @@ def longrope_speculator(kind: str):
     return model, jax.jit(model.init)(jax.random.key(0), jnp.asarray(LONGROPE_CASES[0][0]))
 
 
+@attending("reference")
 @pytest.mark.parametrize("kind", ["attention", "recurrent", "dspark"])
 def test_a_speculative_block_holds_a_longrope_rebuild_once(kind):
     """A block's program holds the rebuild, a whole prefill of the history, once: its candidates' verify
@@ -224,6 +226,7 @@ CROSSING_SEEDS = {"depth": 8, "drafter": 8}
 either check took, sized by `seeds_for` paired on armada."""
 
 
+@attending("reference")
 @pytest.mark.parametrize("drafting", LONGROPE_DRAFTING)
 def test_a_block_across_a_longrope_change_answers_each_token_as_the_walk_does(drafting):
     """A stretch verified from before LongRoPE's change to past it answers each of its tokens as the
@@ -276,6 +279,7 @@ def test_a_block_across_a_longrope_change_answers_each_token_as_the_walk_does(dr
                     seeds=CROSSING_SEEDS[drafting], truth_fn=truth)
 
 
+@attending("reference")
 @pytest.mark.parametrize("drafting", LONGROPE_DRAFTING)
 def test_a_longrope_crossing_reseeds_the_drafter_as_a_prefill_of_its_history_does(drafting):
     """A verified stretch that crosses the table change leaves the decoder state a prefill of the whole
@@ -358,13 +362,14 @@ def test_tree_speculation_reproduces_the_greedy_walk_to_the_end_of_its_cache(sha
     prompts = jnp.asarray([[1, 2, 3], [7, 8, 9]], jnp.int32)
     params = jax.jit(model.init)(jax.random.key(0), prompts)
     budget = model.max_seq_len - prompts.shape[1]
-    drawn = generate(model, params, prompts, budget, key=jax.random.key(1), sampling=Sampling(temperature=0),
-                     strategy=TreeSpeculative(TREES[shape]))
+    drawn = generate(model, params, prompts, budget, key=jax.random.key(1),
+                     sampling=Sampling(temperature=0, strategy=TreeSpeculative(TREES[shape])))
     np.testing.assert_array_equal(np.asarray(drawn.tokens)[:, prompts.shape[1]:],
                                   greedy_walk(model, params, prompts, budget))
     np.testing.assert_array_equal(np.asarray(drawn.lengths), budget)
 
 
+@attending("reference")
 @pytest.mark.parametrize("kind", ["attention", "recurrent", "dspark"])
 def test_tree_speculation_across_a_longrope_rebuild_reproduces_the_greedy_walk(kind):
     """A tree drafted by a prediction depth's picks or by a block drafter's, a pass a leaf's path
@@ -375,7 +380,7 @@ def test_tree_speculation_across_a_longrope_rebuild_reproduces_the_greedy_walk(k
     held, steps = LONGROPE_CASES[0]
     prompts = jnp.asarray(held)
     speculated = generate(model, params, prompts, steps, key=jax.random.key(1),
-                          sampling=Sampling(temperature=0), strategy=TreeSpeculative(TreeShape.widths(2, 1)))
+                          sampling=Sampling(temperature=0, strategy=TreeSpeculative(TreeShape.widths(2, 1))))
     np.testing.assert_array_equal(np.asarray(speculated.tokens)[:, prompts.shape[1]:],
                                   greedy_walk(model, params, prompts, steps))
     np.testing.assert_array_equal(np.asarray(speculated.lengths), steps)
@@ -415,8 +420,8 @@ def test_an_eos_inside_a_block_ends_the_row_on_the_token_that_drew_it():
         return jnp.where((state.step == 1)[:, None], forced, logits)
 
     drawn = generate(model, params, prompt, 6, key=jax.random.key(1),
-                     sampling=Sampling(temperature=0, eos_token_ids=eos, pad_token_id=0),
-                     logits=(script, decoding.Greedy()), strategy=Speculative(block=3))
+                     sampling=Sampling(temperature=0, eos_token_ids=eos, pad_token_id=0,
+                                       logits=(script, decoding.Greedy()), strategy=Speculative(block=3)))
     assert int(drawn.lengths[0]) == 2 and bool(drawn.terminated[0])
     assert int(np.asarray(drawn.tokens)[0, 4]) == eos
     np.testing.assert_array_equal(np.asarray(drawn.tokens)[0, 5:], 0)
@@ -451,7 +456,7 @@ def test_a_blocks_tokens_are_drawn_as_the_target_draws_them():
 
     def counts(seed):
         drawn = generate(model, params, rows, 2, key=jax.random.key(seed),
-                         sampling=Sampling(temperature=LAW_TEMPERATURE), strategy=Speculative(block=3))
+                         sampling=Sampling(temperature=LAW_TEMPERATURE, strategy=Speculative(block=3)))
         tokens = np.asarray(drawn.tokens)[:, 3:5]
         return np.bincount(tokens[:, 0] * vocab + tokens[:, 1], minlength=vocab * vocab)
 
@@ -475,8 +480,8 @@ def test_a_trees_tokens_are_drawn_as_the_target_draws_them():
 
     def counts(seed):
         drawn = generate(model, params, rows, 2, key=jax.random.key(seed),
-                         sampling=Sampling(temperature=LAW_TEMPERATURE),
-                         strategy=TreeSpeculative(TreeShape.widths(3, 2)))
+                         sampling=Sampling(temperature=LAW_TEMPERATURE,
+                                           strategy=TreeSpeculative(TreeShape.widths(3, 2))))
         tokens = np.asarray(drawn.tokens)[:, 3:5]
         return np.bincount(tokens[:, 0] * vocab + tokens[:, 1], minlength=vocab * vocab)
 

@@ -54,7 +54,7 @@ def check_checkpoint(checkpoint, output, revision):
     ids = tokenizer('The capital of France is', return_tensors='np')['input_ids'].astype(np.int32)
     expected, generated = torch_logits(reference, ids), torch_generated(reference, ids, 6)
     del reference
-    loaded = Pretrained.load(checkpoint, dtype='float32', attention_impl='reference', max_seq_len=64,
+    loaded = Pretrained.load(checkpoint, dtype='float32', max_seq_len=64,
                              revision=revision)
     loaded = dataclasses.replace(loaded, model=loaded.model.clone(precision=jax.lax.Precision.HIGHEST))
     actual = np.asarray(loaded.model.apply(loaded.variables, jnp.asarray(ids)))
@@ -97,4 +97,7 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    from dew.nn.kernels import generation
+
+    with generation.chosen(attention='reference'):
+        main()

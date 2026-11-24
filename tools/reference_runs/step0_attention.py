@@ -74,6 +74,7 @@ def dew_side(args) -> None:
     import jax.numpy as jnp
 
     from dew.interop import Pretrained
+    from dew.nn.kernels import generation
 
     rows = first_batch(args)
     targets = jnp.asarray(rows[:, 1:].reshape(-1))
@@ -81,14 +82,14 @@ def dew_side(args) -> None:
               for path in sorted(Path(args.hidden_dir).glob("torch-*.npy"))}
     table = None
     for implementation in IMPLEMENTATIONS:
-        pretrained = Pretrained.load(args.model, dtype="bfloat16", param_dtype="float32",
-                                     attention_impl=implementation)
+        pretrained = Pretrained.load(args.model, dtype="bfloat16", param_dtype="float32")
         model = pretrained.model
 
         def states(variables, tokens, model=model):
             return model.apply(variables, tokens, method="hidden_states")
 
-        values = jax.jit(states)(pretrained.variables, jnp.asarray(rows[:, :-1]))
+        with generation.chosen(attention=implementation):
+            values = jax.jit(states)(pretrained.variables, jnp.asarray(rows[:, :-1]))
         hidden[f"dew-{implementation}"] = np.asarray(jnp.asarray(values, jnp.float32))
         if table is None:
             head = model.apply(pretrained.variables, method="output_table")

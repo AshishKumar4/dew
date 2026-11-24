@@ -8,6 +8,8 @@ from pathlib import Path
 import pytest
 from release_parity import ReleaseParity, assert_answers_as_its_engine
 
+from dew.nn.kernels import generation
+
 SLOT = Path(__file__).parent / "fixtures" / "slot_readout" / "tiny"
 
 
@@ -46,7 +48,7 @@ RELEASES = [
                     blocks=attention == "block")
       for mode in ("slot_lm", "head") for attention in ("causal", "block")),
     *(ReleaseParity(f"joint {site}", joint_release, JOINT / "parity.npz", site, JOINT / "requests.json",
-                    every_slot=True, attention_impl="xla")
+                    every_slot=True, attention="xla")
       for site in ("joint", "joint_head", "joint_images")),
 ]
 """Every release declared, at every site its engine's recording holds."""
@@ -56,4 +58,5 @@ RELEASES = [
 def test_each_release_answers_as_its_own_engine(parity, tmp_path):
     """A release loaded through Dew's public loader lays the recorded requests out as its engine did,
     exactly, and answers them, and the gradients the engine took, as it did (check 1)."""
-    assert_answers_as_its_engine(parity, tmp_path)
+    with generation.chosen(attention=parity.attention):
+        assert_answers_as_its_engine(parity, tmp_path)

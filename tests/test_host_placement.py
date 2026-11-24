@@ -31,7 +31,7 @@ import optax
 import pytest
 from affine_run import BATCH, Counting, Features, Spread, val_batches
 from flax import linen as nn
-from model_support import float64_twin
+from model_support import attending, float64_twin, stacked
 from placement_parity import layouts_agree, x64
 from process_support import run_pool
 from reference_error import assert_as_exact
@@ -178,7 +178,7 @@ def pair(**overrides):
     """The plain decoder, its banked twin, and the weights of both."""
     fields = {**SHAPE, **overrides}
     plain = models.build("causal_transformer", **fields)
-    scanned = models.build("causal_transformer", **fields, scan_layers=True)
+    scanned = models.build("causal_transformer", **fields)
     tokens = jnp.asarray(
         np.random.default_rng(0).integers(1, VOCAB, size=(2, PROMPT)), jnp.int32)
     return plain, scanned, nn.unbox(plain.init(jax.random.key(0), tokens)), tokens
@@ -190,7 +190,25 @@ def stores(scanned, variables, **kwargs):
             HeldBanks(variables).place(scanned, layout=BANKS, **kwargs))
 
 
-@pytest.mark.parametrize("shape", sorted(SHAPES))
+CHECK1_SHARDS = {
+    "test_a_host_resident_bank_scores_what_a_resident_bank_scores[gated_delta_net]": {"seeds": 32,
+                                                                                     "per_task": 8},
+}
+"""The cells whose draws run as CI's map tasks (`check1_shards`), by node id: the gated delta net's fetched
+stack, its resident banks and its plain loop over 32 draws took 136 s in one task in train 1190's CI, 8 a
+task (row 11916)."""
+
+
+def _scored_shapes() -> list:
+    """`SHAPES`' names as parameters, each marked from `CHECK1_SHARDS` by its node id."""
+    test = "test_a_host_resident_bank_scores_what_a_resident_bank_scores"
+    marked = {name: [pytest.mark.check1_shards(**counts)] for name, counts in CHECK1_SHARDS.items()}
+    return [pytest.param(shape, id=shape, marks=marked.get(f"{test}[{shape}]", []))
+            for shape in sorted(SHAPES)]
+
+
+@pytest.mark.usefixtures("scanned_stacks")
+@pytest.mark.parametrize("shape", _scored_shapes())
 def test_a_host_resident_bank_scores_what_a_resident_bank_scores(shape):
     """The logits of a stack whose banks are in host memory, against the same
     banks on the device and against the plain loop.
@@ -229,6 +247,7 @@ def test_a_host_resident_bank_scores_what_a_resident_bank_scores(shape):
                     also={"resident banks": lambda drawn: scanned.apply(resident, jnp.asarray(drawn))})
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize("shape", sorted(SHAPES))
 def test_a_host_resident_bank_decodes_through_the_cache_it_allocates(shape):
     """A prefill and greedy steps through a fetched stack: the same
@@ -282,6 +301,7 @@ def placements_agree(model, placed, resident, tokens, label: str):
                     seeds=HOST_SCAN_SEEDS, truth_fn=wide_logits)
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_layout_offloads_only_the_layers_it_names():
     """Banks the patterns do not name stay on the device, and a stack split
     between the two places computes what the resident one computes (check 1)."""
@@ -296,6 +316,7 @@ def test_a_layout_offloads_only_the_layers_it_names():
     placements_agree(scanned, split, resident, tokens, "a stack split between host and device")
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_banked_training_preserves_each_layers_dropout_rng_lineage():
     """Lifted staging and remat must not split or fold a different RNG stream.
     Compare every layer's two dropout masks to the original Linen scan, not
@@ -317,6 +338,7 @@ def test_banked_training_preserves_each_layers_dropout_rng_lineage():
         np.testing.assert_array_equal(np.asarray(a) == 0, np.asarray(b) == 0)
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_checkpoint_restores_bank_by_bank_into_host_memory(tmp_path):
     """A run's saved weights read one bank at a time compute what the same
     checkpoint read into resident banks computes (check 1), and unstack to the
@@ -328,12 +350,14 @@ def test_a_checkpoint_restores_bank_by_bank_into_host_memory(tmp_path):
     trainer = Trainer(LMObjective(plain, SHAPE["max_seq_len"] - 1, head_chunks=1),
                       optax.sgd(0.1), key=jax.random.PRNGKey(0), layout=DEVICE,
                       checkpoints=checkpoints)
-    state, _, _ = trainer.place()
     batch = {"text": jnp.tile(
         jnp.arange(1, SHAPE["max_seq_len"] + 1, dtype=jnp.int32)[None],
         (jax.device_count(), 1))}
-    # Saved as a run saves it, each layer stored (`Trainer.stored`), as its step holds it stacked.
-    state = trainer.stored(trainer.compile(state, batch)(state, batch)[0])
+    # Saved as a run saves it, each layer stored (`Trainer.stored`), as its step holds it stacked: the plain
+    # decoder's run a layer at a time, as it trained.
+    with stacked(scanned=False):
+        state, _, _ = trainer.place()
+        state = trainer.stored(trainer.compile(state, batch)(state, batch)[0])
     checkpoints.save(int(state.step), state, None, metrics={"loss": 1.0})
     checkpoints.wait()
 
@@ -353,6 +377,7 @@ WORKER = Path(__file__).with_name("host_banks_worker.py")
 
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.distributed
 @pytest.mark.mesh
 def test_a_pool_reads_its_own_shards_of_a_host_resident_bank(tmp_path):
@@ -386,6 +411,7 @@ def test_a_pool_reads_its_own_shards_of_a_host_resident_bank(tmp_path):
         assert any(value["shard"] != value["shape"] for value in banks.values())
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_banked_store_packed_for_serving_or_adapted_exports_as_its_layers_do(tmp_path):
     """A scanned decoder's banked store (`HeldBanks.place`) exports as the plain decoder's per-layer tree
     does, tensor for tensor: packed for serving (`inference_projections`, its q, k and v one kernel a bank's
@@ -467,6 +493,8 @@ def test_a_packed_rows_members_each_read_home_their_own_share():
     assert read == [(3, 2), (3, 4), (3, 1)]
 
 
+@attending("reference")
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize("kind", ["root", "multimodal"])
 def test_synthetic_banks_keep_namespace_values_across_bank_sizes(kind):
     from bank_support import SelectedReads, fixture, host_layout, identical, scores, unpack

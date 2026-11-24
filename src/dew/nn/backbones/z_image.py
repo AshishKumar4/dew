@@ -27,7 +27,6 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.activations import silu
-from dew.nn.attention import AttentionImpl
 from dew.nn.blocks import modulation, sinusoidal_time
 from dew.nn.dense import Dense
 from dew.nn.flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
@@ -79,7 +78,6 @@ class ZImageBlock(nn.Module):
     modulation: bool = True
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: AttentionImpl = "auto"
 
     @nn.nowrap
     def _feed_forward(self, name=None):
@@ -90,7 +88,7 @@ class ZImageBlock(nn.Module):
     def _attention(self):
         return JointAttention(self.heads, self.features // self.heads, bias=False, epsilon=1e-5,
                               dtype=self.dtype, precision=self.precision,
-                              attention_impl=self.attention_impl, name="attention")
+                              name="attention")
 
     @property
     def modulation_features(self) -> int:
@@ -155,7 +153,6 @@ class ZImageTransformer(nn.Module):
     axes_lens: Sequence[int] = (1536, 512, 512)
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: AttentionImpl = "auto"
 
     @nn.nowrap
     def projections(self, input_channels: int, text_features: int) -> dict[str, tuple[int, int]]:
@@ -205,7 +202,7 @@ class ZImageTransformer(nn.Module):
         named by `where` (or unbound, `parent=None`, where a FLOP count reads it): one factory, so the
         count and the execution build the same block."""
         return ZImageBlock(self.dim, self.n_heads, epsilon=self.norm_eps, dtype=self.dtype,
-                           precision=self.precision, attention_impl=self.attention_impl, **where)
+                           precision=self.precision, **where)
 
     def _embedded_time(self, time, dtype):
         """`TimestepEmbedder` of the source's time, (1000 - time) / 1000 times

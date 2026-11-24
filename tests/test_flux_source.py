@@ -23,6 +23,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import extract_fixture, packed, torch_arms, unpacked
+from model_support import attending
 from reference_error import GateFailure, as_given, assert_as_exact, torch_with_gradients, with_gradients
 
 from dew.interop.diffusion import component_tensors, flux_fields, flux_path, read_transformer
@@ -46,7 +47,7 @@ def flux_walk(source, name: str, grid: tuple[int, int]):
     latent, the context, the pooled embedding and every parameter under the draw's `probe`, its
     cotangent (`with_gradients`)."""
     config = json.loads((source / name / "transformer" / "config.json").read_text())
-    model = FluxTransformer(**flux_fields(config, attention_impl="xla"))
+    model = FluxTransformer(**flux_fields(config))
     params, layouts = read_transformer(component_tensors(source / name, "transformer"), flux_path)
 
     @jax.jit
@@ -63,6 +64,7 @@ def flux_walk(source, name: str, grid: tuple[int, int]):
     return walk, {entry.name: entry for entry in layouts}
 
 
+@attending("xla")
 @pytest.mark.parametrize("name", CASES)
 def test_native_flux_matches_the_source_forward_and_every_gradient(name, source):
     """The forward, the three input gradients and every parameter's, each
@@ -201,6 +203,7 @@ def pipelines(source):
     return narrow, wide
 
 
+@attending("xla")
 def test_published_flux_prompt_encoding_matches_the_source_pipeline(source, pipeline_record, pipelines):
     """The conditioner composes what `encode_prompt` composes, on par with it over drawn prompts (check 1),
     its float64 run the truth.
@@ -213,7 +216,7 @@ def test_published_flux_prompt_encoding_matches_the_source_pipeline(source, pipe
 
     from dew.interop.pretrained import Pretrained
 
-    loaded = Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla")
+    loaded = Pretrained.load(str(source / "pipeline"), dtype="float32")
     encoder = loaded.inputs.conditions["conditioning"].encoder
     params = loaded.variables["encoders"]["conditioning"]
 
@@ -245,6 +248,7 @@ def test_published_flux_prompt_encoding_matches_the_source_pipeline(source, pipe
                         seeds=PIPELINE_SEEDS, truth_fn=truth)
 
 
+@attending("xla")
 @pytest.mark.parametrize("streamed", [False, True])
 def test_published_flux_pipeline_walk_matches_the_source(source, pipeline_record, pipelines, streamed):
     """`Pretrained.load().text_to_image()` reproduces the source's own call, on par with it over drawn
@@ -259,7 +263,7 @@ def test_published_flux_pipeline_walk_matches_the_source(source, pipeline_record
     from dew.interop.pretrained import Pretrained
     from dew.training import MeshSpec
 
-    loaded = Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla",
+    loaded = Pretrained.load(str(source / "pipeline"), dtype="float32",
                              **({"mesh": MeshSpec()} if streamed else {}))
     task = loaded.text_to_image()
     assert task.steps == pipeline_record["default_steps"]
@@ -293,6 +297,7 @@ def test_published_flux_pipeline_walk_matches_the_source(source, pipeline_record
     assert_as_exact(walked, reference, draw, "Flux pipeline walk", seeds=PIPELINE_SEEDS, truth_fn=truth)
 
 
+@attending("xla")
 def test_a_trained_flux_step_exports_and_reloads(source, pipeline_record, tmp_path):
     """A real coupled-loss step over the published Flux source, then a resume
     and an export.
@@ -314,7 +319,7 @@ def test_a_trained_flux_step_exports_and_reloads(source, pipeline_record, tmp_pa
 
     export = tmp_path / "export"
     loaded.save(export, variables=state.variables)
-    again = Pretrained.load(str(export), dtype="float32", attention_impl="xla")
+    again = Pretrained.load(str(export), dtype="float32")
     with np.load(source / "flux_transformer.npz") as arrays:
         grid = pipeline_record["size"] // 4
         latent = jnp.asarray(unpacked(np.asarray(arrays["pipeline.x_T"]), grid, grid))
@@ -360,6 +365,7 @@ def test_a_trained_flux_step_exports_and_reloads(source, pipeline_record, tmp_pa
                              "trained Flux")
 
 
+@attending("xla")
 def test_each_records_guidance_reaches_the_model_and_survives_the_shared_seams(
         source, pipeline_record):
     """A row's own distilled guidance, through the ordinary seams.
@@ -374,7 +380,7 @@ def test_each_records_guidance_reaches_the_model_and_survives_the_shared_seams(
     from dew.objectives import Step
     from dew.objectives.diffusion import DiffusionObjective
 
-    loaded = Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla")
+    loaded = Pretrained.load(str(source / "pipeline"), dtype="float32")
     encoder = loaded.inputs.conditions["conditioning"].encoder
     params = loaded.variables["encoders"]["conditioning"]
     rows = [dict(pipeline_record["prompts"][0], guidance=2.0),

@@ -67,14 +67,16 @@ def main():
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--dtype", choices=("float32", "bfloat16"), default="float32")
     parser.add_argument("--case", choices=("dense", "sparse", "shared"), default="dense")
-    parser.add_argument("--scan", action="store_true")
+    parser.add_argument("--scan", action="store_true",
+                        help="the decoder's like layers under one scan "
+                             "(generation.chosen(layer_scan='scanned'))")
     parser.add_argument("--remat", choices=sorted(REMAT_POLICIES), default=None)
     parser.add_argument("--mixer", choices=("attention", "mamba2"), default="attention")
     parser.add_argument("--vocab", type=int, default=256)
     parser.add_argument("--heads", type=int, default=4)
     parser.add_argument("--kv-heads", type=int, default=2)
     parser.add_argument("--mlp", type=int, default=None, help="the MLP's width, twice the model's if absent")
-    parser.add_argument("--attention-impl", default="xla")
+    parser.add_argument("--attention", default="xla", help="the attention kernel (`generation.chosen`)")
     args = parser.parse_args()
     mixer = None if args.mixer == "attention" else mixers.build("mamba2", {
         "num_heads": 2 * args.width // 64, "head_dim": 64, "state_size": 128, "n_groups": 1,
@@ -83,8 +85,8 @@ def main():
         vocab_size=args.vocab, emb_features=args.width, num_layers=args.depth,
         num_heads=args.heads, num_kv_heads=args.kv_heads,
         mlp_features=2 * args.width if args.mlp is None else args.mlp,
-        max_seq_len=args.length, dtype=jnp.dtype(args.dtype), attention_impl=args.attention_impl,
-        scan_layers=args.scan, remat=args.remat, mixer=mixer,
+        max_seq_len=args.length, dtype=jnp.dtype(args.dtype),
+        remat=args.remat, mixer=mixer,
         mixture=Mixture(experts=4, top_k=2) if args.case == "sparse" else None,
         kv_shared_layers=tuple(range(args.depth // 2, args.depth)) if args.case == "shared" else None)
     objective = LMObjective(model, args.length)
@@ -142,4 +144,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    from dew.nn.kernels import generation
+
+    attention = sys.argv[sys.argv.index("--attention") + 1] if "--attention" in sys.argv else "xla"
+    with generation.chosen(layer_scan="scanned" if "--scan" in sys.argv else "plain", attention=attention):
+        main()

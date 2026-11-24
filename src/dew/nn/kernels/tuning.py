@@ -142,7 +142,8 @@ class Untunable(ValueError):
         super().__init__(
             f"tune_kernels measures Dew's own kernel launches, and this step launches none: its Triton "
             f"kernels ({named}) are another library's, which keep their heuristic. Route its attention to "
-            "Dew's template (model.attention_impl='template') to measure it, or run without tune_kernels.")
+            "Dew's template (dew.kernels.use(attention='template'), a run's diagnostics.kernels) to "
+            "measure it, or run without tune_kernels.")
         self.kernels = kernels
 
     def __reduce__(self):
@@ -1715,16 +1716,16 @@ def pinned(configs: Mapping[type[KernelOp], Hashable]) -> Iterator[None]:
     """Each launch of a kernel `configs` names, traced within, takes that
     config where its space at the launch's key holds it, any stored pick
     or heuristic set aside: for the float64 gate at every config of a space,
-    and for a lab that times one."""
+    and for a lab that times one. An enclosing block's pins of other kinds
+    hold within it too, a kind it pins again taking its own (M-NA-5: a
+    decode's pin of its attention forward dropped a lab's pin of its merged
+    launch)."""
+    held = {**dict(_cache.KERNEL_PINS.value), **configs}
     # In one order whatever order `configs` names them, so equal pins are one trace context (the head
     # review of row 12169).
-    with _cache.KERNEL_PINS(tuple(sorted(configs.items(), key=lambda pin: _kind_name(pin[0])))):
+    with _cache.KERNEL_PINS(tuple(sorted(held.items(), key=lambda pin: _named(pin[0])))):
         yield
 
-
-def _kind_name(kind: type) -> str:
-    """A kernel kind's import path, by which the pins in a block are ordered (`pinned`)."""
-    return f"{kind.__module__}.{kind.__qualname__}"
 
 @contextlib.contextmanager
 def pinned_where_taken[Op: KernelOp](op: Op, ba: tokamax.BoundArguments) -> Iterator[Op]:

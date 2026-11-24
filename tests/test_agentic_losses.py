@@ -16,6 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import attending
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.progress import END
@@ -91,7 +92,7 @@ class Fixed(GRPOObjective):
 
 def _objective(reference, **options):
     model = CausalTransformer(vocab_size=8, emb_features=8, num_layers=1, num_heads=1,
-                              mlp_features=8, max_seq_len=WIDTH, dtype="float32", attention_impl="xla")
+                              mlp_features=8, max_seq_len=WIDTH, dtype="float32")
     return Fixed(model, WIDTH - 1, epsilon_low=float(reference["epsilon_low"]),
                  epsilon_high=float(reference["epsilon_high"]),
                  dual_clip=float(reference["dual_clip"]), **options)
@@ -122,6 +123,7 @@ def _check(reference, name, loss, grad, metrics=None):
             assert metrics[f"actor/{key}"] == pytest.approx(float(reference[f"{name}_{key}"]), abs=TOLERANCE)
 
 
+@attending("xla")
 @pytest.mark.parametrize("policy_loss", ["ppo", "gspo", "cispo"])
 @pytest.mark.parametrize(("aggregation", "suffix"), [("token-mean", "token"), ("session-mean", "sequence")])
 def test_each_policy_loss_matches_verl_over_packed_chains(reference, policy_loss, aggregation, suffix):
@@ -131,6 +133,7 @@ def test_each_policy_loss_matches_verl_over_packed_chains(reference, policy_loss
     _check(reference, f"{policy_loss}_{suffix}", loss, grad, metrics)
 
 
+@attending("xla")
 def test_gspo_pools_each_chain_on_its_own(reference):
     """Pooling the whole row instead of its chain moves the GSPO loss."""
     loss, _, _ = _run(reference, policy_loss="gspo")
@@ -142,6 +145,7 @@ def test_gspo_pools_each_chain_on_its_own(reference):
     assert abs(float(merged.mean()[0]) - loss) > 1e-3
 
 
+@attending("xla")
 def test_token_corrections_match_verl_rollout_correction(reference):
     """TIS caps the proximal/behavior ratio, IcePop zeroes it outside the band."""
     loss, grad, metrics = _run(reference, behavior_importance=float(reference["tis_cap"]))
@@ -156,6 +160,7 @@ def test_token_corrections_match_verl_rollout_correction(reference):
     assert metrics["mismatch/k3_kl"] == pytest.approx(float(reference["offpolicy_k3_kl"]), abs=1e-6)
 
 
+@attending("xla")
 def test_the_bypass_band_masks_tokens_and_weighs_none(reference):
     """Without old_log_probs the band is verl's bypass-mode token rejection
     (token_k1 on current against behavior, no IS weight): the loss equals
@@ -173,6 +178,7 @@ def test_the_bypass_band_masks_tokens_and_weighs_none(reference):
     assert metrics["masked/band"] == pytest.approx(expected, abs=1e-6)
 
 
+@attending("xla")
 @pytest.mark.parametrize("name", ["sequence", "geometric"])
 @pytest.mark.parametrize(("aggregation", "suffix"), [("token-mean", "token"), ("session-mean", "sequence")])
 def test_sequence_masks_match_verl_rejection(reference, name, aggregation, suffix):
@@ -187,6 +193,7 @@ def test_sequence_masks_match_verl_rejection(reference, name, aggregation, suffi
     assert metrics[f"masked/{name}"] == pytest.approx(expected, abs=1e-6)
 
 
+@attending("xla")
 def test_rollout_mean_matches_agent_lightning_per_rollout_mean(reference):
     """Chains 0 and 3 are one rollout, placed in different rows. Agent
     Lightning divides by the row count where Dew divides by the rollout

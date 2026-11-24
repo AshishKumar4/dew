@@ -9,6 +9,7 @@ from pathlib import Path
 import jax.numpy as jnp
 import numpy as np
 from flax.traverse_util import unflatten_dict
+from model_support import attending
 from recorded_runs import assert_as_exact_as_recorded
 
 FIXTURE = Path(__file__).parent / "fixtures" / "maxtext" / "gpt3.npz"
@@ -91,7 +92,7 @@ def decoder(dtype):
         "norm_bias": True,
         "norm_eps": 1e-5, "scale_offset": True, "attention_bias": True, "qk_norm": False,
         "position_embedding": "learned", "position_embedding_size": SHAPE["positions"],
-        "max_seq_len": SHAPE["positions"], "tie_embeddings": True, "attention_impl": "reference",
+        "max_seq_len": SHAPE["positions"], "tie_embeddings": True,
         "dtype": jnp.dtype(dtype).name})
 
 
@@ -104,6 +105,7 @@ def dew(dtype, inputs) -> dict:
     return {OUTPUTS[0]: decoder(dtype).apply(dew_variables(inputs), inputs["ids"])}
 
 
+@attending("reference")
 def test_dews_gpt3_computes_maxtexts_logits():
     """Dew's float32 logits of MaxText's GPT-3 are as exact as MaxText's own float32 run against its
     float64 run (check 1 over the recorded seeds), Dew's float64 run held to that run's recorded

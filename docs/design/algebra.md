@@ -108,15 +108,14 @@ reference's error, past the gate's 1.5).
 ### 1.3 Custom derivatives and surrogate gradients
 
 Dew holds 58 custom-derivative sites (the inventory of 2026-11-01, by class: 24 kernel, 26 numerics, 8 surrogate),
-and two more since: nGPT's join and normed hidden (`ngpt.stepped`, `ngpt.normed_hidden`, row 1308), which reverse in
-two passes only to restructure the norm's algebra (§0's example). They stay hand-written: the one-pass form's
-new intermediates are sums of the raw rows and of the joined rows `start + |alpha scale| (end - start)` against
-the cotangent, and neither the cotangent nor the learned rate has a range the program proves or declares, so no
-reordering to that form meets the dominance rule (§6.3). Autodiff's own backward is no safer: it forms the same
-unscaled products (the pullback of `x r` to `r` is `sum(g x)`), and over residual, branch and cotangent scales
-of 1 to 1e38 in fp32 the hand backward was never non-finite where autodiff's was finite, and finite in 137 cases
-where autodiff's was not (row 4124). The engine sees through every site (a `Protected` body it reads and leaves as written): it rewrites inside each custom VJP's and
-JVP's forward and backward bodies, by the site's declared class:
+and two more since, retired again: nGPT's join and normed hidden (`ngpt.stepped`, `ngpt.normed_hidden`, row
+1308) reversed in two passes only to restructure the norm's algebra (§0's example), and since row 11940 run as
+their formulas, every derivative JAX's: their contract (`test_ngpts_join_and_normed_hidden_hold_every_order`)
+holds every order finite against float64 at the normal, least-normal and largest edges with no rule of their
+own, so no hand-written algebra derivative is left in `src/dew`.
+
+The engine sees through every site (a `Protected` body it reads and leaves as written): it rewrites inside each
+custom VJP's and JVP's forward and backward bodies, by the site's declared class:
 
 - **Kernel** (the norm and SwiGLU kernels, the GEMM and attention templates, the recurrence kernels, the paged and
   Splash attention kernels): the launches are opaque leaves and their XLA glue is `KernelGlue`, rewritten freely.
@@ -1312,7 +1311,8 @@ def surrogate(forward, derivative, *, nondiff_argnums=()) -> Callable: ...
 - Every custom-derivative site declares itself through one of the three declarations, in place of a bare
   `jax.custom_vjp` or `jax.custom_jvp`. `linear_tangent` takes its caller's declared kind: `KernelGlue` at a
   kernel site, `Protected` at a numerics one (`sampling.flow`'s KL, `nn.precision`'s products), and `Algebra`
-  at nGPT's join and normed hidden, which the compile-time sets rewrite and which stay (§1.3). A bare custom
+  where a derivative is written only to restructure algebra, which no site in `src/dew` is since row 11940
+  (§1.3). A bare custom
   derivative in `src/dew` fails the slop check (SLOP026), so the inventory of §1.3 stays complete.
 - `surrogate(forward, derivative)`: the forward runs as written and its tangent is `derivative`'s, both bodies
   `Surrogate`. No rule set holds a rule relating a `Surrogate` span to autodiff's derivative of its forward, so the

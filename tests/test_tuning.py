@@ -115,6 +115,17 @@ print(json.dumps([found, settled]))
 """
 
 
+def test_a_pin_of_another_kind_within_a_pinned_block_keeps_the_blocks_pins():
+    """A block pinning one kind of launch (`tuning.pinned`) within another pinning another: each launch of
+    either kind takes its pin, the inner block's adding to the outer's (M-NA-5: a decode's inner pin of its
+    attention forward dropped a lab's outer pin of its merged launch, and every arm the lab timed ran
+    Triton's)."""
+    with (tuning.pinned({norm_swiglu.RmsForward: norm_swiglu.RowsConfig(1, 1)}),
+          tuning.pinned({norm_swiglu.SwigluForward: norm_swiglu.BlockConfig(4096, 8)})):
+        nested = launches(step(), *operands(15))
+    assert nested["rms_norm_forward"] == ((15,), 1) and nested["swiglu_forward"] == ((1,), 8), nested
+
+
 def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
     """The four launches of a norm seam and SwiGLU step are recorded as it
     traces (`tuning.seen`), keyed with their token axis at a power of two. Each

@@ -11,7 +11,6 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.batch import Variables
 from dew.nn.activations import silu
-from dew.nn.attention import AttentionImpl
 from dew.nn.attention_blocks import BasicTransformerBlock
 from dew.nn.blocks import ResidualBlock, sinusoidal_time
 from dew.nn.conv import Conv
@@ -66,7 +65,6 @@ class _SpatialAttention(nn.Module):
     linear_projection: bool
     dtype: Dtype
     precision: PrecisionLike = None
-    attention_impl: AttentionImpl = "auto"
     norm_groups: int = 32
     norm_epsilon: float = 1e-5
     approximate_gelu: bool = True
@@ -116,7 +114,7 @@ class _SpatialAttention(nn.Module):
                 self.precision, qkv_bias=False,
                 first_attention="context" if self.stage.cross_only else "self", norm="layer",
                 norm_epsilon=1e-5, approximate_gelu=self.approximate_gelu,
-                attention_impl=self.attention_impl, name=f"layer_{index}")
+                name=f"layer_{index}")
 
         def run(blocks, x, context):
             for block in blocks:
@@ -158,7 +156,6 @@ class _Level(nn.Module):
     dropout: float
     dtype: Dtype
     precision: PrecisionLike = None
-    attention_impl: AttentionImpl = "auto"
     norm_groups: int = 32
     norm_epsilon: float = 1e-5
     attention_norm_epsilon: float = 1e-5
@@ -196,7 +193,6 @@ class _Level(nn.Module):
                     self.linear_projection,
                     self.dtype,
                     self.precision,
-                    self.attention_impl,
                     norm_groups=self.norm_groups,
                     norm_epsilon=self.attention_norm_epsilon,
                     approximate_gelu=self.approximate_gelu,
@@ -254,7 +250,6 @@ class UNet2DCondition(nn.Module):
     dropout: float = 0.0
     dtype: Dtype = jnp.float32
     precision: PrecisionLike = None
-    attention_impl: AttentionImpl = "auto"
     norm_groups: int = 32
     norm_epsilon: float = 1e-5
     attention_norm_epsilon: float = 1e-5
@@ -357,7 +352,7 @@ class UNet2DCondition(nn.Module):
         for index, stage in enumerate(self.stages):
             x, outputs = operations.level(_Level(
                 stage, self.blocks_per_level, "down", index + 1 < len(self.stages),
-                self.linear_projection, self.dropout, self.dtype, self.precision, self.attention_impl,
+                self.linear_projection, self.dropout, self.dtype, self.precision,
                 norm_groups=self.norm_groups, norm_epsilon=self.norm_epsilon,
                 attention_norm_epsilon=self.attention_norm_epsilon, approximate_gelu=self.approximate_gelu,
                 name=f"down_{index}"), x, time, context, train=train)
@@ -379,7 +374,6 @@ class UNet2DCondition(nn.Module):
                 self.linear_projection,
                 self.dtype,
                 self.precision,
-                self.attention_impl,
                 norm_groups=self.norm_groups,
                 norm_epsilon=self.attention_norm_epsilon,
                 approximate_gelu=self.approximate_gelu,
@@ -407,7 +401,6 @@ class UNet2DCondition(nn.Module):
                 self.dropout,
                 self.dtype,
                 self.precision,
-                self.attention_impl,
                 norm_groups=self.norm_groups,
                 norm_epsilon=self.norm_epsilon,
                 attention_norm_epsilon=self.attention_norm_epsilon,

@@ -20,7 +20,7 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype
 
-from dew.nn.attention import AttentionImpl, scaled_dot_product_attention
+from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.dit import TextContext, masked_mean
 from dew.nn.dropout import Dropout
 from dew.nn.flops import MissingFlopsCount, attention_flops, patch_lengths
@@ -61,7 +61,6 @@ class Block(nn.Module):
     res_balance: float = 0.3
     attn_balance: float = 0.3
     clip_act: float | None = 256.0
-    attention_impl: AttentionImpl = "auto"
 
     @nn.nowrap
     def _residual_conv(self, **scope):
@@ -119,7 +118,7 @@ class Block(nn.Module):
             # then query, key and value interleaved.
             qkv = qkv.reshape(batch, height * width, heads, self.features // heads, 3)
             q, k, v = (part[..., 0] for part in jnp.split(normalize(qkv, axes=(3,)), 3, axis=-1))
-            y = scaled_dot_product_attention(q, k, v, implementation=self.attention_impl)
+            y = scaled_dot_product_attention(q, k, v)
             y = MPConv(self.features, (1, 1), name="attn_proj")(y.reshape(x.shape))
             x = mp_sum(x, y, t=self.attn_balance)
         if self.clip_act is not None:
@@ -150,7 +149,6 @@ class EDM2UNet(nn.Module):
     attn_balance: float = 0.3
     clip_act: float | None = 256.0
     dtype: Dtype | None = None
-    attention_impl: AttentionImpl = "auto"
 
     @property
     def channels(self) -> list[int]:
@@ -199,7 +197,7 @@ class EDM2UNet(nn.Module):
         channels = self.channels
         block = {"channels_per_head": self.channels_per_head, "dropout": self.dropout,
                  "res_balance": self.res_balance, "attn_balance": self.attn_balance,
-                 "clip_act": self.clip_act, "attention_impl": self.attention_impl}
+                 "clip_act": self.clip_act}
         skips = []
         for level, features in enumerate(channels):
             size = x.shape[1] if level == 0 else skips[-1].shape[1] // 2

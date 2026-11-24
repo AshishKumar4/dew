@@ -169,6 +169,7 @@ def refused_where_traced(objective, batch) -> bool:
     return False
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_fixed_router_is_found_by_what_its_step_differentiates_wherever_it_is_stored():
     """A fixed router is trained where the step differentiates its scores' parameters, whatever path a
     store holds them under, and a loss balances it where any term of it reads the routers, the objective's
@@ -195,11 +196,11 @@ def test_a_fixed_router_is_found_by_what_its_step_differentiates_wherever_it_is_
 
     fixed = decoder().clone(mixture=Mixture(experts=2, top_k=1, bias=True))
     with pytest.raises(UntrainedRouter):
-        lowered(LMObjective(fixed.clone(num_layers=4, scan_layers=True), 8))
-    lowered(LMObjective(fixed.clone(num_layers=4, scan_layers=True), 8,
+        lowered(LMObjective(fixed.clone(num_layers=4), 8))
+    lowered(LMObjective(fixed.clone(num_layers=4), 8,
                         balance=ExpertBalance(aux_loss_alpha=0.2)))
     # A periodic run's router, its period's layer inside the run's scan, meets its routing as sown.
-    periodic = fixed.clone(num_layers=4, scan_layers=True,
+    periodic = fixed.clone(num_layers=4,
                            layer_types=("sliding_attention", "full_attention") * 2,
                            kinds={"sliding_attention": {"window": 4}})
     with pytest.raises(UntrainedRouter):

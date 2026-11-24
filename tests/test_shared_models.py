@@ -7,6 +7,7 @@ import threading
 from pathlib import Path
 
 import pytest
+from model_support import attending
 from tool_support import load, run_from
 
 SITE = Path(__file__).resolve().parents[1] / "site"
@@ -18,6 +19,7 @@ def service():
         yield module
 
 
+@attending("reference")
 def test_image_transport_keeps_native_pixels_and_preparation_keys(service, tmp_path):
     import numpy as np
 
@@ -54,6 +56,7 @@ def stood_in(client):
         sys.modules.update(held)
 
 
+@attending("reference")
 def test_the_live_sampler_cell_runs_whole_through_the_stand_ins_as_dew_runs_it(service, tmp_path,
                                                                                  monkeypatch):
     """The live editor's cell (site/src/data/sampler.py), run whole through the live kernel's stand-ins,
@@ -149,6 +152,7 @@ def live_kernel(service, tmp_path, served=None):
     return client, pipe, native
 
 
+@attending("reference")
 def test_a_live_cell_takes_dews_arguments_and_is_refused_only_what_the_service_does_not_serve(
         service, tmp_path, monkeypatch):
     """The live kernel's stand-ins take what Dew's own calls take, read from Dew (site/live/container/
@@ -296,6 +300,7 @@ def test_a_guest_refused_before_it_sends_hears_why(service, tmp_path):
         shared.server_close()
 
 
+@attending("reference")
 def test_a_guest_whose_request_outlasts_its_connection_stays_admitted_until_the_engine_settles_it(
         service, tmp_path, monkeypatch):
     """A guest's image request the engine runs when its connection's wait runs out keeps the guest's one
@@ -327,6 +332,7 @@ def test_a_guest_whose_request_outlasts_its_connection_stays_admitted_until_the_
             assert "result" in reply(lines)
 
 
+@attending("reference")
 def test_a_guest_whose_queued_request_times_out_frees_its_admission_and_its_request_never_runs(
         service, tmp_path, monkeypatch):
     """A guest's request still queued behind a running one when its connection's wait runs out is
@@ -356,6 +362,7 @@ def test_a_guest_whose_queued_request_times_out_frees_its_admission_and_its_requ
     assert [held for passed in holding.passed for held in passed] == [6, 7]
 
 
+@attending("reference")
 def test_a_guest_whose_request_fails_in_the_engine_hears_why_and_is_admitted_again(service, tmp_path):
     """A request whose pass fails stops the engine: its connection hears the failure and nothing after it,
     and the guest is admitted again."""

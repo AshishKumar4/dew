@@ -23,7 +23,6 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.attention import AttentionImpl
 from dew.nn.blocks import Modulation, sinusoidal_time
 from dew.nn.conv import Conv
 from dew.nn.dense import Dense
@@ -88,7 +87,6 @@ class SD3Transformer(TextStream, nn.Module):
     qk_norm: str | None = None
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: AttentionImpl = "auto"
 
     @nn.nowrap
     def image_lengths(self, sample_shape: tuple[int, ...], rows: int) -> np.ndarray:
@@ -137,7 +135,7 @@ class SD3Transformer(TextStream, nn.Module):
         return DoubleStreamBlock(
             self.features, self.heads, self.head_dim, qk_norm=self.qk_norm is not None,
             context_pre_only=index == self.num_layers - 1, dual_attention=index in self.dual_attention_layers,
-            attention_impl=self.attention_impl, dtype=self.dtype, precision=self.precision, **where)
+            dtype=self.dtype, precision=self.precision, **where)
 
     @nn.nowrap
     def _output_modulation(self):

@@ -12,6 +12,7 @@ import numpy as np
 import optax
 import pytest
 from decision_support import decision_rows
+from model_support import attending
 from starlette.testclient import TestClient
 from tool_support import load
 
@@ -33,10 +34,12 @@ def example():
 
 
 @pytest.fixture(scope="module")
+@attending("xla")
 def decide() -> Decide:
-    return Decide.from_pretrained(FIXTURES / "tiny", attention_impl="xla")
+    return Decide.from_pretrained(FIXTURES / "tiny")
 
 
+@attending("xla")
 def test_the_endpoint_answers_what_systemone_answers(example, decide):
     """`POST /v1/systemone` returns the task's own Jev response, field for field."""
     with TestClient(example.app(example.served(decide))) as client:
@@ -46,6 +49,7 @@ def test_the_endpoint_answers_what_systemone_answers(example, decide):
         assert client.get("/health").json() == {"model": decide.name}
 
 
+@attending("xla")
 @pytest.mark.parametrize("body", [
     b"{not json", b"[1, 2]",
     json.dumps({"questions": REQUEST["questions"]}).encode(),
@@ -57,6 +61,7 @@ def test_a_request_jev_would_refuse_gets_a_422_with_its_reason(example, decide, 
     assert response.status_code == 422 and response.json()["error"]
 
 
+@attending("xla")
 def test_an_api_key_is_required_once_set(example, decide):
     with TestClient(example.app(example.served(decide), api_key="secret")) as client:
         def status(key: str | None) -> int:
@@ -66,6 +71,7 @@ def test_an_api_key_is_required_once_set(example, decide):
         assert (status(None), status("wrong"), status("secret")) == (401, 401, 200)
 
 
+@attending("xla")
 def test_a_strict_endpoint_drops_the_images_jev_does_not_know(example, decide):
     body = {**REQUEST, "images": ["aGVsbG8="]}
     with TestClient(example.app(example.served(decide))) as client:
@@ -106,6 +112,7 @@ class Counted:
         return self.task.answer(payload, outputs)
 
 
+@attending("xla")
 def test_concurrent_requests_are_answered_together_each_with_its_own_response(example, decide):
     """Six requests posted at once, one of them a body Jev refuses: the refused one gets its own 422
     at admission, and the five's rows are answered in at most two passes, the first one's wait for
@@ -133,6 +140,7 @@ def test_concurrent_requests_are_answered_together_each_with_its_own_response(ex
             assert discrete(response.json()) == discrete(json.loads(json.dumps(decide.systemone(body))))
 
 
+@attending("xla")
 def test_a_reload_under_concurrent_requests_pairs_each_answer_with_one_tasks_weights_and_calibration(
         example, decide):
     """A reload, while eight threads post requests one after another, swaps the task and its weights at
@@ -171,6 +179,7 @@ def test_a_reload_under_concurrent_requests_pairs_each_answer_with_one_tasks_wei
         assert response.json() == json.loads(json.dumps(alone[response.json()["model"]].systemone(body)))
 
 
+@attending("xla")
 def test_the_served_weights_are_restored_in_the_dtype_they_serve_in(example):
     """The endpoint restores a task's weights in the dtype it serves in unless told another, so a run
     trained in float32 takes the memory it is served in (ledger 1889): its leaves' dtypes are a
@@ -189,6 +198,7 @@ def test_the_served_weights_are_restored_in_the_dtype_they_serve_in(example):
     assert dtypes(stated) == dtypes(wide)
 
 
+@attending("xla")
 def test_a_saved_run_records_its_widths_and_a_server_of_it_compiles_its_passes_up_front(decide, tmp_path):
     """A fit records the most options a question its data holds, as its layout steps bound them
     (`Loader.widths`, `DecisionObjective.bind_widths`), with its checkpoint, over data that states none
@@ -220,6 +230,7 @@ def test_a_saved_run_records_its_widths_and_a_server_of_it_compiles_its_passes_u
     assert not ScoringServer.from_task(*before.scoring()).programs
 
 
+@attending("xla")
 def test_a_scoring_server_compiles_its_passes_up_front_and_none_while_it_serves(decide):
     """A scoring server (`ScoringServer.from_task`) over a task whose budget declares the questions and
     options a pass pads to (`Budget`), the run's widest, compiles every pass's program up front, a few
@@ -274,6 +285,7 @@ def test_a_server_handed_the_programs_an_earlier_one_kept_compiles_none_and_answ
     assert taken["responses"] == kept["responses"]
 
 
+@attending("xla")
 def test_a_budget_names_the_lengths_and_window_counts_its_passes_compile(decide):
     """A budget names the shapes a server compiles (`Budget.lengths`, `Budget.counts`): by default the
     layout's window and three halvings, each at one window, the powers of 8 and the most its tokens and
@@ -313,6 +325,7 @@ def test_a_budget_names_the_lengths_and_window_counts_its_passes_compile(decide)
             Budget(**refused)
 
 
+@attending("xla")
 def test_a_call_over_known_rows_compiles_the_shapes_its_passes_take_alone(decide):
     """A call over rows it holds (`Decide.logits`) compiles the programs its passes take and none other: a
     few short requests take one of the budget's shapes; compiled first over those rows
@@ -340,6 +353,7 @@ def test_a_call_over_known_rows_compiles_the_shapes_its_passes_take_alone(decide
     assert compiled(lambda: ahead.logits(rows)) == 0
 
 
+@attending("xla")
 def test_a_call_over_requests_scores_in_a_servers_passes_over_its_programs(decide):
     """`Decide`'s call over requests scores them in the passes a scoring server runs (`RowScoring`, one
     path for a call and a server, ledger 2514): over a task whose budget declares its widths, after its
@@ -369,6 +383,7 @@ def test_a_call_over_requests_scores_in_a_servers_passes_over_its_programs(decid
         assert discrete(answers) == discrete(declared(state, questions))
 
 
+@attending("xla")
 def test_a_tasks_later_calls_trace_and_compile_nothing(decide):
     """A task's later call of a request its first one shaped traces no program and compiles none
     (`Compiles`), its call's server included, and answers as the first did."""
@@ -385,6 +400,7 @@ def test_a_tasks_later_calls_trace_and_compile_nothing(decide):
             np.testing.assert_array_equal(answer.probabilities, first[name].probabilities)
 
 
+@attending("xla")
 def test_a_tasks_scorings_hold_one_plan(decide):
     """Every scoring of a task, its Jev bodies' (`Decide.scoring`, `systemone`'s) and its calls', holds one
     task without weights, whose plan (its passes' shapes, each pass length's window bounds and its packs)
@@ -394,6 +410,7 @@ def test_a_tasks_scorings_hold_one_plan(decide):
     assert first.decide.pass_shapes is second.decide.pass_shapes
 
 
+@attending("xla")
 def test_a_scoring_pass_looks_at_every_waiting_request(decide):
     """A pass takes rows from every waiting request while its plan takes them, not from a bounded few: a
     hundred short requests one pass's windows hold are answered in one step, where a pass of 64 requests
@@ -412,6 +429,7 @@ def test_a_scoring_pass_looks_at_every_waiting_request(decide):
     assert all(future.done() for future in futures)
 
 
+@attending("xla")
 def test_a_reload_after_a_cancelled_request_plans_the_next_pass_with_the_new_task(decide):
     """A request cancelled while it waits leaves the queue as its pass is chosen, and with it any plan of its
     row, so the request after it, laid out by the task a reload put in place, is planned by that task: a
@@ -434,6 +452,7 @@ def test_a_reload_after_a_cancelled_request_plans_the_next_pass_with_the_new_tas
     assert answered.result() == alone
 
 
+@attending("xla")
 def test_a_scoring_server_reports_the_share_of_each_pass_shapes_tokens_its_rows_held(decide):
     """A served task counts, per pass shape, the tokens its passes computed, `rows` windows of `length`
     tokens each, and the real tokens of the rows they scored (`PassTokens`, row 2772): the share of each
@@ -468,6 +487,7 @@ def test_a_scoring_server_reports_the_share_of_each_pass_shapes_tokens_its_rows_
         f"served/passes/{shape.rows}x{shape.length}/passes" for shape in shapes}
 
 
+@attending("xla")
 def test_a_pass_that_overruns_a_window_count_runs_the_rest_in_a_pass_of_its_own(decide):
     """A server's pass whose rows fill every window of a declared count (`Decide.pass_shapes`: 1, 8, 64 and
     the most, a length's) and take one past it runs the rows in that count's windows and leaves the rest

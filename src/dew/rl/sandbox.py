@@ -61,7 +61,7 @@ from types import MappingProxyType
 from typing import Protocol
 
 from dew import _cgroups
-from dew._cleanup import exit_code, groups_ended, process_group, signal_group
+from dew._cleanup import exit_code, groups_ended, owned_group, signal_group
 from dew._files import inside
 from dew._records import JSON, finite
 from dew.data.prompts import PromptRecord
@@ -119,19 +119,21 @@ def _observation(value: object) -> Observation:
 def launched(command: tuple[str, ...], limits: SandboxLimits,
              directory: str) -> contextlib.AbstractContextManager[subprocess.Popen[bytes]]:
     """`command` started in `directory` under `limits`, in its own session, with piped streams, whose
-    process group ends and whose streams close with the block, however it ends (`process_group`).
+    process group ends and whose streams close with the block, however it ends, and outlives no owner, a
+    killed one's too (`owned_group`: its lifeline ends the group, what the worker forked among it, where a
+    parent-death signal, which a fork clears, ended the worker alone, row 12172, and fired as the thread that
+    started it ended, the models review).
 
-    The launcher applies RLIMIT_CPU, RLIMIT_AS and no core dumps, installs the
-    parent-death signal, then execs the command with a minimal environment, which carries a measured
-    parent's coverage startup alone.
+    The launcher applies RLIMIT_CPU, RLIMIT_AS and no core dumps, then execs the command with a minimal
+    environment, which carries a measured parent's coverage startup alone.
     """
     launcher = str(Path(__file__).with_name("_sandbox_exec.py"))
     # A measured parent's coverage startup passes on (`_sandbox_exec.saved_coverage`); nothing else does.
     traced = {name: os.environ[name] for name in ("COVERAGE_PROCESS_CONFIG", "COVERAGE_PROCESS_START")
               if name in os.environ}
-    return process_group(
-        [sys.executable, "-I", launcher, str(limits.cpu_seconds), str(limits.memory_bytes),
-         str(os.getpid()), *command], cwd=directory,
+    return owned_group(
+        [sys.executable, "-I", launcher, str(limits.cpu_seconds), str(limits.memory_bytes), *command],
+        cwd=directory,
         env={"PATH": os.defpath, "LANG": "C.UTF-8", "PYTHONUNBUFFERED": "1", **traced},
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 

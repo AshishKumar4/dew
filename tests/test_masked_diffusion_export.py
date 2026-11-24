@@ -37,7 +37,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from interop_support import assert_restores
-from model_support import cached_round_trips, flat_tree
+from model_support import attending, cached_round_trips, flat_tree
 
 from dew.data import Memory
 from dew.data.compile import compile
@@ -84,6 +84,7 @@ def test_transformers_reads_the_trained_export(trip):
     assert difference < LOGITS, f"max |logit difference| {difference:.3e}"
 
 
+@attending("reference")
 @pytest.mark.parametrize("fixture", ["llada-tiny", "dream-tiny"])
 def test_the_derived_config_writer_round_trips_each_family(fixture, tmp_path):
     """The other writer: `PretrainedDecoder.from_model` derives the config from a
@@ -91,12 +92,11 @@ def test_the_derived_config_writer_round_trips_each_family(fixture, tmp_path):
     It has to write names its own family reads back, so LLaDA's leaves go
     out under the release's OLMo-style spellings and Dream's config carries
     the split o_proj bias its reference builds."""
-    source = Pretrained.load(str(FIXTURES / fixture), dtype="float32",
-                             attention_impl="reference")
+    source = Pretrained.load(str(FIXTURES / fixture), dtype="float32")
 
     PretrainedDecoder.from_model(source.model, source.variables).save(tmp_path)
     written = json.loads((tmp_path / "config.json").read_text())
-    reloaded = Pretrained.load(str(tmp_path), dtype="float32", attention_impl="reference")
+    reloaded = Pretrained.load(str(tmp_path), dtype="float32")
 
     assert written["mask_token_id"] == source.model.mask_token_id
     assert reloaded.model == source.model, "the derived config rebuilds a different model"
@@ -110,6 +110,7 @@ def test_the_derived_config_writer_round_trips_each_family(fixture, tmp_path):
     assert generated.shape == (1, 6) and np.all(generated[:, 4:] != source.model.mask_token_id)
 
 
+@attending("reference")
 @pytest.mark.parametrize("fixture", ["llada-tiny", "dream-tiny"])
 def test_a_masked_diffusion_run_exports_and_reloads_as_a_masked_decoder(fixture, tmp_path):
     """A run of `MaskedDiffusionObjective` from a loaded checkpoint, read back
@@ -130,7 +131,7 @@ def test_a_masked_diffusion_run_exports_and_reloads_as_a_masked_decoder(fixture,
     from dew.objectives.diffusion.masked import MaskedDiffusionObjective
     from dew.training import Trainer
 
-    source = Pretrained.load(str(FIXTURES / fixture), dtype="float32", attention_impl="reference")
+    source = Pretrained.load(str(FIXTURES / fixture), dtype="float32")
     ids = np.load(FIXTURES / fixture / "input_ids.npy")
     objective = MaskedDiffusionObjective(source.model, MDLM(mask_id=source.model.mask_token_id)(),
                                          int(ids.shape[1]), ema_decay=None, variables=source.variables)
@@ -145,7 +146,7 @@ def test_a_masked_diffusion_run_exports_and_reloads_as_a_masked_decoder(fixture,
 
     exported = Pretrained.from_run(tmp_path / "run")
     exported.save(tmp_path / "export")
-    reloaded = Pretrained.load(str(tmp_path / "export"), dtype="float32", attention_impl="reference")
+    reloaded = Pretrained.load(str(tmp_path / "export"), dtype="float32")
 
     assert isinstance(exported, PretrainedMaskedDecoder) and isinstance(reloaded, PretrainedMaskedDecoder)
     assert reloaded.model.mask_token_id == source.model.mask_token_id

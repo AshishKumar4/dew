@@ -19,17 +19,16 @@ import numpy as np
 import optax
 import pytest
 from block_support import VOCAB, block_causal, model, wrapped
-from model_support import TINY_DECODER, model_draw
+from model_support import TINY_DECODER, attending, model_draw
 from reference_error import as_given, assert_as_exact
 from serving_support import Served, assert_served_as_exact
 
 from dew.batch import BLOCKS_FIELD, TEXT_KEY, coordinates, prefix_blocks
 from dew.data.chat import Role
 from dew.data.steps.blocks import Blocks
-from dew.inference.serving import Server
+from dew.inference.serving import PagedKV, Server
 from dew.inference.tasks import TextGeneration
 from dew.nn.inputs import ModelInputs
-from dew.nn.kv_cache import KVCache
 from dew.nn.mixers import AttentionMixer
 from dew.nn.visibility import prompt_blocks, served_blocks
 from dew.objectives.lm import LMObjective
@@ -107,10 +106,11 @@ def test_the_stage_makes_each_documents_first_tokens_the_blocks_of_its_packed_ro
     np.testing.assert_array_equal(Blocks(prefix=2).map(two)["text_block_groups"], [1, 1, -1, 2, 2, -1])
 
 
+@attending("reference")
 def test_a_prefix_run_trains_the_block_mask_on_par_with_float64():
     decoder = blocky()
     objective = LMObjective(decoder, SEQ, prefix=PREFIX)
-    wide = decoder.clone(dtype=jnp.float64, attention_impl="reference")
+    wide = decoder.clone(dtype=jnp.float64)
 
     init = jax.jit(decoder.init)
 
@@ -436,9 +436,9 @@ def test_a_prefix_runs_stage_keeps_the_blocks_a_record_carries(prefix):
 
 WHOLE = {"slots": 2, "capacity": 64, "admission": 2}
 """A dense server prefilling each prompt whole, its three requests queued past its two slots."""
-PIECES = {"slots": 2, "capacity": 64, "kv_cache": KVCache(page_size=16, pages=8), "chunk": 2}
+PIECES = {"slots": 2, "capacity": 64, "cache": PagedKV(page_size=16, pages=8), "chunk": 2}
 """A paged server prefilling in pieces of 2 tokens, shorter than the prompts' blocks."""
-SHARED = {"slots": 2, "capacity": 64, "kv_cache": KVCache(page_size=4, pages=40), "prefix_cache": True}
+SHARED = {"slots": 2, "capacity": 64, "cache": PagedKV(page_size=4, pages=40, prefix_cache=True)}
 """A paged server sharing its full pages of 4 prompt tokens with a later prompt that agrees with them."""
 
 
@@ -463,6 +463,7 @@ def served_blocky(prefix=None, images: bool = False) -> TextGeneration:
                           sampling=Sampling(temperature=0, pad_token_id=0), prefix=prefix)
 
 
+@attending("reference")
 @pytest.mark.parametrize("prefix, serving", [(PREFIX, WHOLE), (PREFIX, PIECES), ("prompt", PIECES)],
                          ids=["first-tokens", "first-tokens-in-pieces", "prompt-in-pieces"])
 def test_a_served_prefix_run_scores_what_each_request_scores_alone(prefix, serving):
@@ -475,6 +476,7 @@ def test_a_served_prefix_run_scores_what_each_request_scores_alone(prefix, servi
     assert_served_as_exact(served_blocky(prefix), THREE, label, serving=serving, seeds=(SEEDS[label],) * 2)
 
 
+@attending("reference")
 @pytest.mark.parametrize("requests, serving, prefix, images", [
     (CARRIED, WHOLE, None, False), (CARRIED, PIECES, None, False), (CARRIED, PIECES, PREFIX, False),
     (SCATTERED, PIECES, None, False), (MEDIA, PIECES, None, True)],
@@ -505,6 +507,7 @@ REACHING = (-1, 2, -1, -1, -1, -1, -1, -1, 2, -1, -1, -1)
 """A block of the second and ninth tokens, so its first member reads what the ninth reads, the sixth too."""
 
 
+@attending("reference")
 @pytest.mark.parametrize("requests, prefix, hits", [
     ((Served(8, {BLOCKS_FIELD: LONG_BLOCK}), Served(8, {BLOCKS_FIELD: SHORT_BLOCK}),
       Served(8, {BLOCKS_FIELD: LONG_BLOCK})), None, (0, 0, 4)),
@@ -604,6 +607,7 @@ def test_a_prefix_run_and_a_batch_of_blocks_are_admitted_by_one_rule():
     assert admits(chunked(2, unchunked=True)) == (True, True)
 
 
+@attending("reference")
 def test_a_prefix_run_trains_and_serves_through_a_wrapper_of_a_block_reading_decoder():
     """A wrapper answers for its decoder's block reading (`DecoderWrapper`): its prefix run is built, scored
     as the bare decoder's objective scores it (check 1, float64 from the widened decoder), and served the
@@ -612,7 +616,7 @@ def test_a_prefix_run_trains_and_serves_through_a_wrapper_of_a_block_reading_dec
     wrapper = wrapped(decoder)
     objective = LMObjective(wrapper, SEQ, prefix=PREFIX)
     bare = LMObjective(decoder, SEQ, prefix=PREFIX)
-    wide = LMObjective(decoder.clone(dtype=jnp.float64, attention_impl="reference"), SEQ, prefix=PREFIX)
+    wide = LMObjective(decoder.clone(dtype=jnp.float64), SEQ, prefix=PREFIX)
     draw = model_draw(wrapper, (BATCH, ROW), VOCAB)
 
     def language_model(variables):
@@ -656,8 +660,8 @@ def test_a_shared_prefix_page_inside_a_block_is_reused_only_with_a_block_of_the_
     decoder = blocky().clone(max_seq_len=128)
     variables = decoder.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
     task = TextGeneration(decoder, variables, sampling=Sampling(temperature=0, pad_token_id=0), prefix=8)
-    server = Server.from_task(task, slots=2, capacity=64, kv_cache=KVCache(page_size=4, pages=40),
-                              prefix_cache=True)
+    server = Server.from_task(task, slots=2, capacity=64,
+                              cache=PagedKV(page_size=4, pages=40, prefix_cache=True))
     prompts = [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], [1, 2, 3, 4, 5, 6, 7, 8, 12, 13, 14],
                [1, 2, 3, 4, 20, 21, 22, 23, 24]]
     reused, tickets = [], []
@@ -690,6 +694,7 @@ def harness_batches(ids, xp=np) -> list[list[tuple]]:
             [alone, (context, rest[:2]), (other, rest[:1])]]
 
 
+@attending("reference")
 @pytest.mark.parametrize("prefix", [PREFIX, "prompt"])
 def test_a_prefix_runs_harness_scores_a_continuation_as_its_generation_reads_it(prefix):
     """lm-eval's likelihood of a prefix run's continuation is read through the blocks a server makes of
@@ -704,7 +709,7 @@ def test_a_prefix_runs_harness_scores_a_continuation_as_its_generation_reads_it(
 
     decoder = blocky()
     assert LMObjective(decoder, 1).shares_prefixes()
-    wide = decoder.clone(dtype=jnp.float64, attention_impl="reference")
+    wide = decoder.clone(dtype=jnp.float64)
     draw = model_draw(decoder, (1, ROW), VOCAB)
     def forked(requests) -> bool:
         _, forks = _scoring_inputs([[*context.tolist(), *rest.tolist()] for context, rest in requests],

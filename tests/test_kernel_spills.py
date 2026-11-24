@@ -26,6 +26,7 @@ from jax.experimental.layout import Format, Layout
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend.mlir import ir
 from kernel_compile import Uncounted
+from model_support import attending
 from process_support import fresh, keeping_picks
 
 from dew.inputs import Field, InputSpec
@@ -668,14 +669,14 @@ def _thunk(calls: int, kernels: list[bytes]) -> bytes:
 
 
 def _templated(**fields):
-    """A one-layer decoder whose attention is the template's (`attention_impl="template"`), bfloat16: its
+    """A one-layer decoder in bfloat16, its attention the template's under its tests (`attending`): its
     forward selects and reports kernels, a draw's premise."""
     from dew.registry import models
 
     return models.build("causal_transformer", **{"vocab_size": 260, "emb_features": 128, "num_layers": 1,
                                                   "num_heads": 2, "num_kv_heads": 1, "head_dim": 64,
                                                   "mlp_features": 256, "max_seq_len": 32, "dtype": "bfloat16",
-                                                  "attention_impl": "template", **fields})
+                                                  **fields})
 
 
 def _drawn_objective(kind: str):
@@ -714,6 +715,7 @@ def _drawn_objective(kind: str):
 
 
 @pytest.mark.parametrize("kind", ["lm", "decision", "ppo", "distillation"])
+@attending("template")
 def test_an_objectives_draw_of_its_variables_selects_no_kernel(kind):
     """An objective's draw of its variables (`Objective.initializer`, its `init` within `drawing`) runs
     forwards over one-row batches no step runs, for the variables its modules make, none of their values

@@ -22,7 +22,7 @@ from architecture_cases import CASES as ARCHITECTURES, LM, SEQ_LEN, TEXT_FEATURE
 from arm_arithmetic import float64_held
 from checkpoint_cases import LENGTH, PATHS, ROWS, loaded, tokens
 from flax import linen as nn
-from model_support import float64_twin, floating_gradient, stepped_outputs
+from model_support import attending, float64_twin, floating_gradient, stacked, stepped_outputs
 from reference_error import assert_as_exact, dew_path
 from tool_support import load
 
@@ -235,28 +235,34 @@ def _steps_its_gradient(name: str, model, variables, inputs, **apply) -> None:
                     truth_fn=lambda *drawn: _stepped(judged(twin), wide, drawn, **apply))
 
 
+@attending("reference")
 @pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 @pytest.mark.parametrize("name", PATHS)
 def test_a_checkpoints_remat_rungs_climb_and_restore(name):
+    """A loaded checkpoint's stack a layer at a time (`stacked`) climbs the ladder and restores its rungs;
+    scanned, its scanned twin's (`test_a_scanned_checkpoints_remat_rungs_climb`)."""
     source = loaded(name)
-    _climbs_and_restores(source.model, source.variables, (tokens(name),), method="logits")
+    with stacked(scanned=False):
+        _climbs_and_restores(source.model, source.variables, (tokens(name),), method="logits")
 
 
 SCANNED = ("qwen35-tiny", "qwen35-native-tiny", "qwen35-blocks-tiny", "qwen38-moe-tiny")
 """Hybrid checkpoints whose decoders scan by period, a gated delta net's rung read in the scan's body."""
 
 
+@attending("reference")
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 @pytest.mark.parametrize("name", SCANNED)
 def test_a_scanned_checkpoints_remat_rungs_climb(name):
-    """A decoder that scans its runs (`scan_layers`, a period of delta nets and attention one body) climbs
+    """A decoder that scans its runs (`scanned_stacks`, a period of delta nets and attention one body) climbs
     the ladder as one a layer at a time does: each rung keeps fewer residual bytes than the rung below it,
     its policy reaching the scan's body, where a rung read before the body traced saved alike (row 4097)."""
     source = loaded(name)
-    _climbs_and_restores(source.model.with_scanned_layers(), source.variables, (tokens(name),),
-                         method="logits")
+    _climbs_and_restores(source.model, source.variables, (tokens(name),), method="logits")
 
 
+@attending("reference")
 @pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 @pytest.mark.parametrize("name", PATHS)
 def test_a_checkpoints_top_rung_steps_its_forward_as_it_does(name):
@@ -264,6 +270,7 @@ def test_a_checkpoints_top_rung_steps_its_forward_as_it_does(name):
     _steps_its_forward(source.model, source.variables, (tokens(name),), method="logits")
 
 
+@attending("reference")
 @pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 @pytest.mark.parametrize("name", [name for name in PATHS if name in GRADIENT_SEEDS])
 def test_a_covering_checkpoints_top_rung_steps_its_gradient_as_it_does(name):
@@ -271,6 +278,7 @@ def test_a_covering_checkpoints_top_rung_steps_its_gradient_as_it_does(name):
     _steps_its_gradient(name, source.model, source.variables, (tokens(name),), method="logits")
 
 
+@attending("reference")
 def test_a_covering_checkpoints_top_rung_steps_its_release_setting_finitely():
     """The hyper-connections' member, whose gradient is judged at another Sinkhorn setting than its
     release's (`judged`), which no float64 truth judges, steps finitely at its top rung at the release's:
@@ -288,6 +296,8 @@ CONTINUUM_SEEDS = 8
 its plain forward (`seeds_for`)."""
 
 
+@attending("xla")
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_continuum_level_composes_with_the_scan_the_ladder_and_the_cache():
     """A decoder with a continuum level (`dew.nn.continuum`) scanned at its top remat rung computes the
     logits and gradients the same decoder does unscanned and unrematerialized, and its cached decode
@@ -297,9 +307,8 @@ def test_a_continuum_level_composes_with_the_scan_the_ladder_and_the_cache():
     from dew.nn.continuum import ContinuumLevel
 
     plain = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=3, num_heads=2, head_dim=8,
-                              mlp_features=32, max_seq_len=32, attention_impl="xla",
-                              continuum=ContinuumLevel(hidden=4))
-    scanned = _rungs(plain.clone(scan_layers=True))[-1]
+                              mlp_features=32, max_seq_len=32, continuum=ContinuumLevel(hidden=4))
+    scanned = _rungs(plain)[-1]
     tokens = jnp.zeros((ROWS, LENGTH), jnp.int32)
     shapes = jax.eval_shape(lambda: nn.unbox(plain.init(jax.random.key(0), tokens)))
 
@@ -316,9 +325,16 @@ def test_a_continuum_level_composes_with_the_scan_the_ladder_and_the_cache():
             return output, pull(cotangent)[0]
         return run
 
-    assert_as_exact(jax.jit(stepped(scanned)), dew_path(jax.jit(stepped(plain))), draw,
+    # The plain arm and its truth a layer at a time (`stacked`), the scanned arm as the test runs.
+    def unscanned(function):
+        def run(*arguments):
+            with stacked(scanned=False):
+                return function(*arguments)
+        return run
+
+    assert_as_exact(jax.jit(stepped(scanned)), dew_path(unscanned(jax.jit(stepped(plain)))), draw,
                     "a scanned, rematerialized continuum decoder", seeds=CONTINUUM_SEEDS,
-                    truth_fn=stepped(float64_twin(plain)))
+                    truth_fn=unscanned(stepped(float64_twin(plain))))
 
     def decoded(model):
         def run(variables, drawn, _):
@@ -408,6 +424,7 @@ def test_a_covering_architectures_top_rung_steps_its_gradient_as_it_does(case):
     _steps_its_gradient(case.name, *_built(case))
 
 
+@attending("reference")
 @pytest.mark.parametrize("kind", ["kimi_delta_attention", "mamba", "mamba2", "gated_delta_net"])
 def test_each_residual_a_recurrent_mixer_names_is_one_a_policy_keeps(kind):
     """A decoder skips the remat rungs that keep none of its mixers' names (`MixerBase.marks`), so a kind

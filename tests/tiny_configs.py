@@ -50,6 +50,6 @@ RES, FRAMES = 16, 2
 
 
 MATRIX_DECODER = {"vocab_size": 256, "emb_features": 16, "num_layers": 2, "num_heads": 2, "num_kv_heads": 1,
-                  "mlp_features": 32, "max_seq_len": 64, "attention_impl": "reference"}
+                  "mlp_features": 32, "max_seq_len": 64}
 """A two-layer causal transformer 16 wide over the byte vocabulary: the capability matrix's decoder, and the
 scenario learning sites' (tests/test_scenario_learning.py)."""

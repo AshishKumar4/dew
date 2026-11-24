@@ -211,13 +211,14 @@ def test_a_source_binds_a_chain_only_for_controls_its_policy_lacks(task):
     altered = replace(source, generation_config={**source.generation_config,
                                                  "repetition_penalty": 2.0, "typical_p": 0.9})
     bound = altered.text_generation()
-    assert bound.logits is None and bound.n == 2
+    assert bound.sampling.logits is None and bound.n == 2
     assert (bound.sampling.repetition_penalty, bound.sampling.typical_p) == (2.0, 0.9)
     rare = replace(altered, generation_config={**altered.generation_config, "epsilon_cutoff": 0.01})
     # It binds a chain of its own, whose draws are transformers' chain's (`source_warped`).
-    assert rare.text_generation().logits is not None
+    assert rare.text_generation().sampling.logits is not None
     override = rare.text_generation(sampling=Sampling(temperature=0))
-    assert override.logits is None and override.sampling.repetition_penalty == 1.0 and override.n == 2
+    assert override.sampling.logits is None and override.n == 2
+    assert override.sampling.repetition_penalty == 1.0
     plain = override([[1, 2]], 6, key=jax.random.key(1), n=1)
     np.testing.assert_array_equal(plain.behavior_log_probs, 0)
     penalized = override([[1, 2]], 6, key=jax.random.key(1), n=1,
@@ -238,14 +239,14 @@ def test_a_sources_generation_config_becomes_its_sampling_value(task):
         "do_sample": True, "temperature": 0.7, "top_k": 5, "eos_token_id": 5, "pad_token_id": 3,
         "repetition_penalty": 1.3, "no_repeat_ngram_size": 2, "min_new_tokens": 2, "typical_p": 0.9})
     bound = source.text_generation()
-    assert bound.logits is None
+    assert bound.sampling.logits is None
     assert bound.sampling == Sampling(temperature=0.7, top_k=5, eos_token_ids=5, pad_token_id=3,
                                       repetition_penalty=1.3, no_repeat_ngram_size=2, min_new_tokens=2,
                                       typical_p=0.9)
     greedy = bound([[1, 2]], 6, key=1, n=1, sampling=replace(bound.sampling, temperature=0))
-    explicit = bound([[1, 2]], 6, key=1, n=1, logits=(
+    explicit = bound([[1, 2]], 6, key=1, n=1, sampling=replace(bound.sampling, logits=(
         decoding.RepetitionPenalty(1.3), decoding.NoRepeatNGram(2),
-        decoding.MinNewTokens(2, jnp.asarray([5], jnp.int32)), decoding.Greedy()))
+        decoding.MinNewTokens(2, jnp.asarray([5], jnp.int32)), decoding.Greedy())))
     for name in ("tokens", "lengths", "terminated", "behavior_log_probs"):
         np.testing.assert_array_equal(getattr(greedy, name), getattr(explicit, name))
 
@@ -343,8 +344,9 @@ def test_a_bucketed_budget_ends_where_the_request_does(roomy, strategy):
 
     forced = (decoding.Greedy(), decoding.ForcedEOS(jnp.array([5], jnp.int32)))
     search = None if strategy == "sample" else Beam(width=2)
-    exact = generate(roomy.model, roomy.variables, ramp(10), 3, key=0, logits=forced, strategy=search)
-    drawn = roomy(ramp(10), 3, key=0, logits=forced, strategy=search)
+    exact = generate(roomy.model, roomy.variables, ramp(10), 3, key=0,
+                     sampling=Sampling(logits=forced, strategy=search))
+    drawn = roomy(ramp(10), 3, key=0, sampling=replace(roomy.sampling, logits=forced, strategy=search))
     for field in ("tokens", "lengths", "terminated"):
         np.testing.assert_array_equal(getattr(drawn, field), getattr(exact, field), err_msg=field)
     np.testing.assert_allclose(drawn.raw_log_probs, exact.raw_log_probs, rtol=0, atol=1e-6)

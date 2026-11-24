@@ -20,6 +20,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import attending
 from recorded_runs import assert_as_exact_as_recorded
 from torch_layout import node
 
@@ -87,7 +88,7 @@ def dew_model(cls: str, config: dict):
         fields["feature_depths"] = tuple(fields["feature_depths"])
         fields["attention_configs"] = tuple(None if stage is None else Stage(**stage)
                                             for stage in fields["attention_configs"])
-    return MODELS[cls](**fields, attention_impl="reference")
+    return MODELS[cls](**fields)
 
 
 def mmdit_block(cls: str, name: str) -> bool:
@@ -234,6 +235,7 @@ def pipeline_arms(case: str):
     return FIXTURES / f"{case.replace('/', '-')}.npz", drawing(case), computing(case), OUTPUTS
 
 
+@attending("reference")
 @pytest.mark.parametrize("case", CASES)
 def test_the_output_and_every_gradient_are_as_exact_as_flaxdiffs(case):
     """Dew's output and gradients as exact as FlaxDiff's float32 against float64 (check 1)."""

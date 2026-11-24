@@ -19,7 +19,7 @@ import optax
 import pytest
 from affine_run import Replaying
 from flax import linen as nn
-from model_support import TINY_DECODER
+from model_support import TINY_DECODER, stacked
 from reference_error import as_given, assert_as_exact, assert_fp32_reduction_bound, widened
 from token_support import token_rows
 
@@ -792,13 +792,14 @@ def test_a_stage_local_lora_fit_merges_and_saves_as_every_layer_whole(tmp_path):
     assert written[0] == written[1]
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.mesh(devices=8)
 def test_a_one_stage_scan_holds_layers_adapted_otherwise_as_runs_of_their_own():
     """A LoRA run whose layers' adapters scale apart (one alpha on layers 0 and 1, another on 2 and 3, the
     factors' shapes alike) runs them as two scanned runs (`CausalTransformer.scanned_like`), and its
     one-stage state holds them so, as its forward reads them, where it planned one run of four the forward
     never read; a state stacked so, handed to a run that does not scan, is read back onto its layers."""
-    model = decoder(scan_layers=True)
+    model = decoder()
     base = model.init(jax.random.key(0), jnp.zeros((1, SEQ), jnp.int32))
     adapter = LoRA(rank=2, modules=("q_proj",), alpha=4.0).apply(model, base, key=1)
     targets = {path: (dataclasses.replace(target, alpha=8.0) if any(f"layers_{index}" in path
@@ -813,17 +814,19 @@ def test_a_one_stage_scan_holds_layers_adapted_otherwise_as_runs_of_their_own():
     assert set(state.variables["params"]["stages"]) == {"layers_0_1", "layers_2_3"}
     moved, loss, *_ = run.compile(state, batch)(state, batch)
     assert np.isfinite(float(loss))
-    plain = Adapter.bound(model.clone(scan_layers=False), adapter.variables, targets, adapter.rslora,
-                          adapter.dropout, adapter.layouts)
-    looped = trainer(plain.model, LORA_OPTIMIZER, MeshSpec(fsdp=2), 8, variables=plain.variables)
-    looped.validate(steps=1)
-    received = looped.staged(moved)
+    plain = Adapter.bound(model, adapter.variables, targets, adapter.rslora, adapter.dropout, adapter.layouts)
+    # The same stack a layer at a time (`stacked`), whose run holds no stage-local state.
+    with stacked(scanned=False):
+        looped = trainer(plain.model, LORA_OPTIMIZER, MeshSpec(fsdp=2), 8, variables=plain.variables)
+        looped.validate(steps=1)
+        received = looped.staged(moved)
     assert "stages" not in received.variables["params"]
     for name, leaves in on_host(run.stored(moved).variables["params"]).items():
         np.testing.assert_array_equal(np.asarray(jax.tree.leaves(leaves)[0]),
                                       np.asarray(jax.tree.leaves(on_host(received.variables["params"])[name])[0]))
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.mesh(devices=8)
 def test_a_periodic_one_stage_state_goes_back_onto_its_layers_for_a_run_that_does_not_scan():
     """A one-stage state a scanned periodic stack holds (sliding and full attention alternating, each
@@ -832,21 +835,23 @@ def test_a_periodic_one_stage_state_goes_back_onto_its_layers_for_a_run_that_doe
     kinds = {"layer_types": ("sliding_attention", "full_attention") * 2,
              "kinds": {"sliding_attention": {"window": 4}}}
     optimizer = OptimConfig(optimizer=AdamW(**SMOOTH), learning_rate=1e-2)
-    scanned = trainer(decoder(scan_layers=True, **kinds), optimizer, MeshSpec(fsdp=2), 8)
+    scanned = trainer(decoder(**kinds), optimizer, MeshSpec(fsdp=2), 8)
     scanned.validate(steps=1)
     batch = shard_batch(MeshSpec(fsdp=2).build(jax.devices()), token_rows(VOCAB, BATCH, SEQ + 1))
     state, _, _ = scanned.place()
     moved = scanned.compile(state, batch)(state, batch)[0]
     assert "stages" in moved.variables["params"]
-    looped = trainer(decoder(scan_layers=False, **kinds), optimizer, MeshSpec(fsdp=2), 8)
-    looped.validate(steps=1)
-    received = looped.staged(moved)
+    with stacked(scanned=False):
+        looped = trainer(decoder(**kinds), optimizer, MeshSpec(fsdp=2), 8)
+        looped.validate(steps=1)
+        received = looped.staged(moved)
     for mine, theirs in zip(jax.tree.leaves(on_host((received.variables, received.opt_state))),
                             jax.tree.leaves(on_host(((stored := scanned.stored(moved)).variables,
                                                      stored.opt_state))), strict=True):
         np.testing.assert_array_equal(mine, theirs)
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.mesh(devices=8)
 def test_a_frozen_base_scanned_under_a_rung_that_recomputes_named_residuals_keeps_the_rest():
     """Under rung 1 (`all_but_delta_memory`, a block that recomputes its delta memory alone and keeps every
@@ -855,7 +860,7 @@ def test_a_frozen_base_scanned_under_a_rung_that_recomputes_named_residuals_keep
     recomputed the whole layer, the cheapest rung cost what the dearest does in time and held no more."""
     held = {}
     for rung in ("all_but_delta_memory", "full"):
-        model = decoder(scan_layers=True, remat=rung)
+        model = decoder(remat=rung)
         base = model.init(jax.random.key(0), jnp.zeros((1, SEQ), jnp.int32))
         adapter = LoRA(rank=2, modules=("q_proj",)).apply(model, base, key=1)
         run = trainer(adapter.model, LORA_OPTIMIZER, MeshSpec(fsdp=2), 8, variables=adapter.variables)
@@ -875,6 +880,7 @@ ROWS_SEEDS = 8
 """Check 1's declared seeds for a frozen base read where it lies against one stacked each step."""
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.mesh(devices=8)
 def test_a_one_stage_scan_reads_a_frozen_base_where_it_lies():
     """A LoRA run over a decoder that scans its layers on one stage holds its adapter's factors stacked as
@@ -882,7 +888,7 @@ def test_a_one_stage_scan_reads_a_frozen_base_where_it_lies():
     iteration reading its layer's rows where they lie (`decoder_stack.LAYER_ROWS`), so the base is held
     once whatever else holds it (row 4751): its step holds fewer temporaries than the step whose state
     stacks the base too, a copy of it made each time it runs, and updates on par with it (check 1)."""
-    model = decoder(scan_layers=True)
+    model = decoder()
     base = model.init(jax.random.key(0), jnp.zeros((1, SEQ), jnp.int32))
     adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(model, base, key=1)
     batch = shard_batch(MeshSpec(fsdp=2).build(jax.devices()), token_rows(VOCAB, BATCH, SEQ + 1))
@@ -931,15 +937,16 @@ def test_a_frozen_base_read_where_it_lies_holds_no_more_than_the_layers_unscanne
     stacks among the scan's residuals (row 4751)."""
     held = {}
     for scan in (True, False):
-        model = decoder(scan_layers=scan, dtype="bfloat16")
-        base = model.init(jax.random.key(0), jnp.zeros((1, SEQ), jnp.int32))
-        adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(model, base, key=1)
-        run = trainer(adapter.model, LORA_OPTIMIZER, MeshSpec(fsdp=2), 8, variables=adapter.variables)
-        run.validate(steps=1)
-        state, _, _ = run.place()
-        batch = shard_batch(MeshSpec(fsdp=2).build(jax.devices()), token_rows(VOCAB, BATCH, SEQ + 1))
-        run.compile(state, batch)
-        held[scan] = run.executable.memory_analysis().temp_size_in_bytes
+        with stacked(scan):
+            model = decoder(dtype="bfloat16")
+            base = model.init(jax.random.key(0), jnp.zeros((1, SEQ), jnp.int32))
+            adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(model, base, key=1)
+            run = trainer(adapter.model, LORA_OPTIMIZER, MeshSpec(fsdp=2), 8, variables=adapter.variables)
+            run.validate(steps=1)
+            state, _, _ = run.place()
+            batch = shard_batch(MeshSpec(fsdp=2).build(jax.devices()), token_rows(VOCAB, BATCH, SEQ + 1))
+            run.compile(state, batch)
+            held[scan] = run.executable.memory_analysis().temp_size_in_bytes
     assert held[True] <= held[False], held
 
 
@@ -1055,13 +1062,14 @@ def test_a_local_saves_rows_on_each_stages_mesh_are_recovered_where_its_holders_
 
 
 @pytest.mark.mesh(devices=8)
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize("devices", [1, 8], ids=["1dev", "8dev"])
 def test_a_one_stage_scanned_fit_keeps_shared_frozen_arrays_alive(devices):
     """A one-stage scanned fit's state returned on its stored layers (`StageLocal.stored`, consumed) donates
     its stacked `stages` arrays alone, its unstacked collections (`FROZEN`) untouched, so the arrays it
     shares with the objective's held tree and its initial state stay readable and a second fit reads them
     (row 12079: the frozen base was donated and deleted)."""
-    model = decoder(scan_layers=True)
+    model = decoder()
     base = nn.unbox(model.init(jax.random.key(0), jnp.zeros((1, SEQ), jnp.int32)))
     adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(model, base, key=1)
     objective = LMObjective(adapter.model, SEQ, variables=adapter.variables, ema_decay=None)
