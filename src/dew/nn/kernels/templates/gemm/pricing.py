@@ -201,8 +201,11 @@ def epilogue_registers(family: mosaic.Family, share: int, columns: int, stored: 
                        staging: tuple[int, int] | None = None) -> int:
     """Extra consumer-thread registers held across epilogue hook evaluation and staged stores:
     the single owner shared by `_Mosaic._epilogue_registers` and `syrk_registers` (row 11982). `tiles`,
-    the dtypes of the `[rows, columns]` tiles beside the accumulator's chunk while its hook runs, each held
-    at its own width (a bf16 tile half a register a value, as `live` holds a stored output; row 12689)."""
+    the dtypes of the `[rows, columns]` tiles beside the accumulator's chunk while its hook runs: each at its
+    own width where the family stages its stores through shared memory (Mosaic GPU's fragmented arrays, a
+    bf16 tile two values a register: an H100's gated blockwise chain, its gate a bf16 side, compiled at 168
+    registers; row 12689), a full register a value where its epilogue stores from its own fp32 fragments
+    (`stores_through_registers`: an sm86 residual forward priced at bf16 width spilled 648 bytes)."""
     from dew.nn.kernels.templates import resources, stores
 
     scalar = family.scalar_registers()
@@ -216,7 +219,8 @@ def epilogue_registers(family: mosaic.Family, share: int, columns: int, stored: 
     if not has_hook:
         return max(0, max((_staging(dtype) for dtype in stored), default=0) - scalar)
     accumulator = -(-share * family.chunk_columns(columns) // resources.THREADS)
-    held = sum(-(-accumulator * jnp.dtype(dtype).itemsize // 4) for dtype in tiles)
+    held = sum(-(-accumulator * (4 if family.stores_through_registers else jnp.dtype(dtype).itemsize) // 4)
+               for dtype in tiles)
     live = [-(-accumulator * jnp.dtype(dtype).itemsize // 4) for dtype in stored]
     hook = max(0, resources.CONTROL_REGISTERS + vectors + held - scalar) + sum(live[1:])
     staged = max((max(0, _staging(dtype) - scalar) + sum(live[i + 1:])
