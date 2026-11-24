@@ -240,6 +240,30 @@ def test_six_groups_are_banded_a_digit_at_a_time():
                                   2.0 ** -30)
 
 
+def test_an_exponent_operand_past_any_sentinel_is_a_sums_like_any_other():
+    """`(2^E + 0) / 2^E` at `E = 2^30` (an exponent operand), its numerator beside a term whose keys cancel to
+    zero across bands (taking the sum banded), is 1: windows open on the largest sum whatever its exponent,
+    where a finite ceiling beneath `2^30` missed it and gave 0 (review of #3988, P0)."""
+    form = Form(("", "", "k", "", ""), ((1, (((0, 1), (1, 0)),)), (1, (((2, 1),),))), "",
+                divisor=((1, (((3, 1), (4, 0)),)),), divided="")
+    one, raised = jnp.float32(1.0), jnp.int32(2 ** 30)
+    keys = jnp.asarray([2.0 ** 127, -(2.0 ** 127), 2.0 ** -126, -(2.0 ** -126)], jnp.float32)
+    np.testing.assert_array_equal(np.asarray(contract(form, one, raised, keys, one, raised)), 1.0)
+
+
+def test_a_windows_sums_add_exactly():
+    """Eight ones, `2^-22`, `2^-23 + 2^-46`, then their negations but `2^-46`, beside a term whose keys cancel
+    to zero across bands, sum to `2^-46`: one window holds them all, added as exact limbs, where a double
+    float's low part rounded `3 2^-23 + 2^-46` beside 8 and gave 0 (review of #3988, P0)."""
+    values = ([1.0] * 8 + [2.0 ** -22, 2.0 ** -23 + 2.0 ** -46]
+              + [-1.0] * 8 + [-(2.0 ** -22), -(2.0 ** -23)])
+    terms = tuple((1, (((index, 1),),)) for index in range(len(values) + 1))
+    form = Form(("",) * len(values) + ("k",), terms, "")
+    keys = jnp.asarray([2.0 ** 32, -(2.0 ** 32), 2.0 ** -90, -(2.0 ** -90)], jnp.float32)
+    found = contract(form, *(jnp.float32(value) for value in values), keys)
+    np.testing.assert_array_equal(np.asarray(found), 2.0 ** -46)
+
+
 def test_a_non_finite_row_leaves_the_others_banded():
     """Beside a row whose value is infinite (its mean IEEE's, `inf`), a row whose values cancel past the
     format keeps its `2^-32`: the banded sum reads non-finite values as none and the IEEE result is laid over
@@ -275,6 +299,16 @@ def test_a_banded_sum_holds_its_rows_varying_types_in_a_shard_map():
     found = jax.jit(jax.shard_map(lambda m, v: contract(BATCHED_MEAN, m, v), mesh=mesh, in_specs=(rows, rows),
                                   out_specs=rows, check_vma=True))(masses, values)
     np.testing.assert_array_equal(np.asarray(found), [[2.0 ** -32], [2.0 ** 127]])
+    # One group's keys sharded and the other's replicated: every digit carried as the union varies (review
+    # of #3988, P1), the first device's keys banded (`2^-30` beneath two that cancel), the second's ones.
+    form = Form(("k", "k"), ((1, (((0, 1),), ((1, 1),))),), "")
+    keys = jax.device_put(jnp.asarray([2.0 ** 127, -(2.0 ** 127), 2.0 ** -30, 0.0] + [1.0] * 4, jnp.float32),
+                          NamedSharding(mesh, rows))
+    weights = jax.device_put(jnp.ones(4, jnp.float32), NamedSharding(mesh, PartitionSpec()))
+    halves = jax.jit(jax.shard_map(lambda k, w: contract(form, k, w)[None], mesh=mesh,
+                                   in_specs=(rows, PartitionSpec()), out_specs=rows,
+                                   check_vma=True))(keys, weights)
+    np.testing.assert_array_equal(np.asarray(halves), [2.0 ** -30, 4.0])
 
 
 def test_terms_that_cancel_keep_the_term_beneath_them():
