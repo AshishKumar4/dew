@@ -5,7 +5,6 @@ sequence and packed documents' resets; and pairs no coupled form holds, or whose
 bounds, refused."""
 
 import dataclasses
-import math
 
 import jax
 import jax.numpy as jnp
@@ -15,42 +14,29 @@ from reference_error import assert_as_exact
 
 from dew.algebra import SATURATION, scan
 from dew.algebra.forms import Refused
+from dew.nn.kernels.recurrence_coupled import declaration
 
 TOKENS, STATE, WIDTH, CHUNK = 96, 16, 8, 32
 
-
-def momentum(pair, q, k, v, p, log_alpha, log_mu, beta):
-    """Momentum DeltaNet's token update (fla's recurrent_momentum_delta_rule_ref): the error of the erase
-    key's read of the memory gathered into the momentum, the memory stepping along it."""
-    del q
-    h, m = pair
-    m = jnp.exp(log_mu) * m + k[:, None] * (p @ h - v)[None, :]
-    return jnp.exp(log_alpha) * h - beta * m, m
+DECLARED = declaration(1.0, STATE, WIDTH, jnp.float32, reset=True, bound=1.0)
+"""Momentum DeltaNet's pair as the chunked op declares it (`recurrence_coupled.declaration`): the error of the
+erase key's read of the memory gathered into the momentum, the memory stepping along it, packed documents'
+resets marked."""
+OPERANDS = tuple(DECLARED.operands)
 
 
-def readout(pair, q, k, v, p, log_alpha, log_mu, beta):
-    """The token's output: its query's read of the memory after the token."""
-    del k, v, p, log_alpha, log_mu, beta
-    return q @ pair[0]
+def step(pair, token):
+    """One token of the declared update and its readout, a document's first entering a zero pair."""
+    *operands, first = token
+    named = dict(zip(OPERANDS, operands, strict=False))
+    pair = DECLARED.update(tuple(jnp.where(first, 0.0, s) for s in pair), **named)
+    return pair, DECLARED.readout(pair, **named)
 
 
-OPERANDS = {"q": ("time", "state"), "k": ("time", "state"), "v": ("time", "width"), "p": ("time", "state"),
-            "log_alpha": ("time",), "log_mu": ("time",), "beta": ("time",), "reset": ("time",)}
-RANGES = {"log_alpha": (-math.inf, 0.0), "log_mu": (-math.inf, 0.0), "beta": 2.0}
-PAIR = (((STATE, WIDTH), jnp.float32),) * 2
-DECLARED = scan.Scan(momentum, readout, OPERANDS, walked="time", state=PAIR, reset="reset", ranges=RANGES)
-
-
-def tokenwise(q, k, v, p, log_alpha, log_mu, beta, reset):
-    """The recurrence token by token (`lax.scan`), each document's first token entering a zero pair: its
-    outputs and the final pair `[2, STATE, WIDTH]`."""
-    def one(pair, token):
-        *operands, first = token
-        pair = momentum(tuple(jnp.where(first, 0.0, s) for s in pair), *operands)
-        return pair, readout(pair, *operands)
-
-    zero = jnp.zeros((STATE, WIDTH), q.dtype)
-    final, outputs = jax.lax.scan(one, (zero, zero), (q, k, v, p, log_alpha, log_mu, beta, reset))
+def tokenwise(*tokens):
+    """The recurrence token by token (`lax.scan`): its outputs and the final pair `[2, STATE, WIDTH]`."""
+    zero = jnp.zeros((STATE, WIDTH), tokens[0].dtype)
+    final, outputs = jax.lax.scan(step, (zero, zero), tokens)
     return outputs, jnp.stack(final)
 
 
@@ -69,7 +55,7 @@ def draws(packed: bool):
         reset = np.zeros(TOKENS, bool)
         if packed:
             reset[[0, 17, 40, 63]] = True
-        return (*(jnp.asarray(x, jnp.float32) for x in (q, k, v, p, log_alpha, log_mu, beta)),
+        return (*(jnp.asarray(x, jnp.float32) for x in (q, k, v, log_alpha, beta, p, log_mu)),
                 jnp.asarray(reset))
     return draw
 
@@ -103,35 +89,29 @@ def test_a_coupled_chunks_replay_is_its_token_scan():
     """A chunk's replay (`Derived.replay`, the adjoint's walk) from an entering pair: each output and the pair
     leaving it the token-by-token scan's from that pair, bit for bit."""
     forms = scan.derive_scan(DECLARED, saturation=SATURATION)
-    tokens = draws(True)(0)
+    tokens = draws(packed=True)(0)
     entering = jnp.asarray(np.random.default_rng(3).standard_normal((2, STATE, WIDTH)), jnp.float32)
     chunk = {name: value[:CHUNK] for name, value in zip(OPERANDS, tokens, strict=True)}
     outputs, leaving = forms.replay(chunk, entering)
-
-    def one(pair, token):
-        *operands, first = token
-        pair = momentum(tuple(jnp.where(first, 0.0, s) for s in pair), *operands)
-        return pair, readout(pair, *operands)
-
-    pair, expected = jax.lax.scan(one, tuple(entering), tuple(chunk.values()))
+    pair, expected = jax.lax.scan(step, tuple(entering), tuple(chunk.values()))
     np.testing.assert_array_equal(np.asarray(outputs), np.asarray(expected))
     np.testing.assert_array_equal(np.asarray(leaving), np.asarray(jnp.stack(pair)))
 
 
-def uncoupled(pair, q, k, v, p, log_alpha, log_mu, beta):
+def uncoupled(pair, q, k, v, g, beta, p, mu):
     """A pair whose memory steps along the momentum entering the token, not the one it leaves: no coupled
     form's."""
     del q
     h, m = pair
-    return jnp.exp(log_alpha) * h - beta * m, jnp.exp(log_mu) * m + k[:, None] * (p @ h - v)[None, :]
+    return jnp.exp(g) * h - beta * m, jnp.exp(mu) * m + k[:, None] * (p @ h - v)[None, :]
 
 
-def per_key(pair, q, k, v, p, log_alpha, log_mu, beta):
-    """`momentum` with each key's own memory decay."""
+def per_key(pair, q, k, v, g, beta, p, mu):
+    """The declared update with each key's own memory decay."""
     del q
     h, m = pair
-    m = jnp.exp(log_mu) * m + k[:, None] * (p @ h - v)[None, :]
-    return jnp.exp(log_alpha * k)[:, None] * h - beta * m, m
+    m = jnp.exp(mu) * m + k[:, None] * (p @ h - v)[None, :]
+    return jnp.exp(g * k)[:, None] * h - beta * m, m
 
 
 @pytest.mark.parametrize(("declared", "why"), [
@@ -145,6 +125,6 @@ def test_a_pair_no_coupled_form_holds_is_refused(declared, why):
     its chunk is prepared, never walked token by token in its place."""
     del why
     forms = scan.derive_scan(declared, saturation=SATURATION)
-    chunk = {name: value[:CHUNK] for name, value in zip(OPERANDS, draws(False)(0), strict=True)}
+    chunk = {name: value[:CHUNK] for name, value in zip(OPERANDS, draws(packed=False)(0), strict=True)}
     with pytest.raises(Refused):
         forms.prepare(chunk)

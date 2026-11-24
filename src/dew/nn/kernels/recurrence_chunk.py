@@ -41,6 +41,7 @@ from dew.mesh import mesh_axes
 from dew.nn.attention_masks import repeat_kv_heads
 from dew.nn.derivatives import KernelGlue, Protected, contracted, with_gradients_formed_at
 from dew.nn.inputs import cu_seqlens
+from dew.nn.kernels import recurrence_coupled
 from dew.nn.nested import nested
 from dew.nn.precision import (
     accurate_exp,
@@ -278,16 +279,12 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     product's own range is fla's: a term whose factors meet a decay past the least normal one at a time
     reads zero as fla's does. A call names a kernel through `generation.chosen`
     alone, the recurrence template's 'mosaic_gpu' among them (row 959: the selectors decide every call). A
-    coupled momentum (`recurrence.Hooks.coupled`, its memory a pair) runs on the portable math alone
-    (`recurrence_coupled.coupled_chunk`)."""
+    coupled momentum (`recurrence.Hooks.coupled`) runs on the portable math alone (`recurrence_coupled`)."""
     given, query, key, value, g, beta, scale, dtype, work = _prologue_of(hooks, operands, dtype)
     state = operands.state
     if hooks.coupled is not None:
-        from .recurrence_coupled import coupled_chunk
-
-        out, final = coupled_chunk(hooks, given, query, key, value, g, beta, operands, chunk_size=chunk_size,
-                                   scale=scale, work=work)
-        return recurrence.normed(hooks, out, given, work).astype(dtype), final
+        return recurrence_coupled.chunked(hooks, given, query, key, value, g, beta, operands,
+                                          chunk_size=chunk_size, scale=scale, work=work, dtype=dtype)
     (query, key, value, g, beta, erase, starts, firsts, max_segments), stride = _laid(
         hooks, (query, key, value, g, beta), given, operands.starts, operands.firsts, max_segments)
     erase_left, correction = (None, None) if erase is None else erase
@@ -918,9 +915,8 @@ def _delta_forms(*, delta: bool, scale: float, per_key: bool, width: int, column
     from dew.algebra import SATURATION, scan
 
     if coupled:
-        from .recurrence_coupled import declaration
-
-        return scan.derive_scan(declaration(scale, width, columns, work, reset, bound), saturation=SATURATION)
+        return scan.derive_scan(recurrence_coupled.declaration(scale, width, columns, work, reset, bound),
+                                saturation=SATURATION)
 
     def update(h, q, k, v, g, beta, own=None, c=None, e=None, a=None):
         del q, own
