@@ -1366,11 +1366,11 @@ class FitSearch[LossT, EffectsT]:
         joins = ns_group is None and any(candidate.joins for candidate in self.lowered.values())
         # Parting the joined stacks frees their copies and what their joined iteration holds beside them,
         # which the live set tells only in part (values fused past the scope carry another op's name): asked
-        # first unless what the miss tells of them holds a small part of what the start was short of on
-        # every process (`JOINED_SHARE`), or where a miss read no live set; else asked behind the remat
-        # rungs (`parted`), never dropped. Every process reads the one answer, so all ask in one order.
-        covers = any(self.gather(
-            missed is None or JOINED_SHARE * missed[1].scoped_bytes(JOINED_SCOPE) >= missed[0]))
+        # first unless what the miss names of them, some, holds a small part of what the start was short of
+        # on every process (`JOINED_SHARE`); where a miss read no live set or names none of them, first;
+        # else behind the remat rungs (`parted`), never dropped. Every process reads the one answer.
+        named = None if missed is None else missed[1].scoped_bytes(JOINED_SCOPE)
+        covers = any(self.gather(missed is None or not named or JOINED_SHARE * named >= missed[0]))
         deferred = joins and not covers
         if deferred and missed is not None:
             _log.warning("the step's joined Newton-Schulz stacks hold %d bytes at its peak, short of the %d "
