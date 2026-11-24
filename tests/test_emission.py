@@ -798,11 +798,13 @@ def _read_twice(product, z):
 
 @pytest.mark.parametrize(("body", "fused"), [
     (lambda x, y, z: x * y + z, 128), (lambda x, y, z: jnp.maximum(x * y, z), 0),
-    (lambda x, y, z: _read_twice(x * y, z), 0)], ids=["multiply-add", "maximum", "product-read-twice"])
+    (lambda x, y, z: _read_twice(x * y, z), 0), (lambda x, y, z: lax.add(lax.mul(x[0, 0], y[0, 0]), z), 0)],
+    ids=["multiply-add", "maximum", "product-read-twice", "scalar-product-into-a-row"])
 def test_an_fp32_multiply_whose_one_use_is_an_add_counts_as_one_fused_instruction(body, fused):
     """An fp32 multiply whose result an add alone reads is one FFMA with it (ptxas's --fmad, its default):
-    the body counts both operations and the pair fused (`Work.fused_multiply_adds`), an element each; a
-    maximum of a product, or a product read twice, keeps its multiply an instruction of its own."""
+    the body counts the pair fused (`Work.fused_multiply_adds`), an element each; a maximum of a product, a
+    product read twice, or one scalar product added to a row's every element (the review of lane/toolkit
+    5cbbe66c586, P1) keeps its multiply an instruction of its own."""
     row = jax.ShapeDtypeStruct((1, 128), jnp.float32)
     role = _emitted(body, row, row, row).roles[0]
     assert role.fixed.fused_multiply_adds == fused, role.fixed
@@ -813,14 +815,35 @@ def test_an_fp32_multiply_whose_one_use_is_an_add_counts_as_one_fused_instructio
 def test_an_fp32_instruction_takes_a_lane_a_clock_a_fused_pair_one(generation_name, lanes):
     """A CUDA multiprocessor's fp32 lanes each run one instruction a clock, an FFMA's two FLOPs or a lone
     add's, maximum's or select's one (`Architecture.vector_per_clock` its lanes' FLOPs, two a lane): 1024
-    lone operations take 1024 lane-clocks, and 1024 multiplies fused with 1024 adds the same, where the lanes'
-    FLOP rate priced the lone ones at half (M-FS-70: the KDA intra launch's FMNMX, a quarter of its
+    lone operations take 1024 lane-clocks, and 1024 multiplies with their 1024 fused adds the same, where the
+    lanes' FLOP rate priced the lone ones at half (M-FS-70: the KDA intra launch's FMNMX, a quarter of its
     instructions, none fused)."""
     target = generation.gpu_target(generation_name)
     rates = cost.rates(target, device=False)
     alone = cost.units(Work(operations=1024), rates)[0][1]
-    paired = cost.units(Work(operations=2048, fused_multiply_adds=1024), rates)[0][1]
+    paired = cost.units(Work(operations=1024, fused_multiply_adds=1024), rates)[0][1]
     assert alone == paired == 1024 / (lanes * target.loaded_clock_hz), (alone, paired)
+
+
+def test_a_tpus_vector_units_take_a_fused_pairs_add_as_an_operation_of_its_own():
+    """A TPU's VPU rate is calibrated at two operations a multiply-add (`generation._TPUS`), so a pair's add
+    (`Work.fused_multiply_adds`) is an operation there beside its multiply, where a CUDA multiprocessor's
+    lanes run it within the multiply's FFMA (the review of lane/toolkit 5cbbe66c586, P1)."""
+    rates = cost.rates(generation.TARGETS["v5e"], device=False)
+    paired = cost.units(Work(operations=1024, fused_multiply_adds=1024), rates)[0][1]
+    assert paired == 2048 / rates.cuda, paired
+
+
+def test_an_unknown_branch_prices_the_most_lane_instructions_any_branch_issues():
+    """A conditional its data decides, one branch 128 multiply-adds an FFMA each, the other 256 lone adds:
+    its lanes run the costlier's 256 instructions, which a credit for the first's pairs, taken unit by unit
+    over the branches' most, would cut to 128 (the review of lane/toolkit 5cbbe66c586, P1)."""
+    def branched(row, index):
+        return lax.switch(index, [lambda row: row * row + row, lambda row: row + row + row], row)
+
+    fixed = _emitted(branched, _ROW, jax.ShapeDtypeStruct((), jnp.int32)).roles[0].fixed
+    rates = cost.rates(generation.gpu_target("sm90"), device=False)
+    assert cost.units(fixed, rates)[0][1] == 256 / rates.cuda, fixed
 
 
 def test_a_multiprocessor_issues_four_warps_instructions_a_clock_whichever_units_run_them():
