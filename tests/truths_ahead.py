@@ -94,16 +94,19 @@ class HeldName:
 
 
 class _HeldPickler(pickle.Pickler):
-    """A site's held record pickled as pickle pickles it, but a function pickle names by no module
-    (`HeldName`): a local hook of a launch (a GEMM prologue's, a derivative's span) is no function its run
-    calls (rows 9584, 9600: a held launch refused the store, its arms compiled nothing ahead)."""
+    """A site's held record pickled as pickle pickles it, but a function, or a function of a custom
+    derivative, pickle names by no module or whose state it cannot take (`HeldName`): a local hook of a
+    launch (a GEMM prologue's, a normalization's custom JVP among them, a derivative's span) is no function
+    its run calls (rows 9584, 9600: a held launch refused the store, its arms compiled nothing ahead; row
+    12657: a custom JVP's traceback refused it)."""
 
     def reducer_override(self, obj):
-        if not isinstance(obj, types.FunctionType):
+        if not isinstance(obj, types.FunctionType | jax.custom_jvp | jax.custom_vjp):
             return NotImplemented
         try:
             pickle.dumps(obj)
-        except (pickle.PicklingError, AttributeError):
+        # A closure holding what pickle refuses by type (a jaxlib Traceback a fused GEMM's hook keeps) too.
+        except (pickle.PicklingError, AttributeError, TypeError):
             return HeldName, (f"{obj.__module__}.{obj.__qualname__}",)
         return NotImplemented
 
