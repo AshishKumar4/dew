@@ -42,10 +42,41 @@ def _squash_jvp(primals, tangents):
     return r / held, dr / held / held
 
 
+@jax.custom_vjp
+def _centered(logs, center):
+    """`logs - center`, a key head's center `[Hk]` over its keys' logs `[..., Hk, Dk]`."""
+    return logs - center[:, None]
+
+
+def _centered_fwd(logs, center):
+    return _centered(logs, center), None
+
+
+def _centered_bwd(_, cotangent):
+    """`_centered`'s pullback: the logs' cotangent as it is, the centers' each key head's sum of it over its
+    rows, tokens and keys as a balanced tree (`_balanced`): summed by XLA:CPU's reduction, a draw's 1280
+    terms a key head put the centers' gradient 1.585 times fla's token walk's distance from float64 in
+    check 1, where the walk sums them a token at a time; the tree passes."""
+    terms = jnp.moveaxis(cotangent, -2, 0).reshape(cotangent.shape[-2], -1).T
+    return cotangent, -_balanced(terms)
+
+
+_centered.defvjp(_centered_fwd, _centered_bwd)
+
+
+def _balanced(terms):
+    """`terms` summed over their first axis as a balanced tree, each level a half added to the other and an
+    odd one carried: its error grows with the log of their count, a running sum's with the count."""
+    while terms.shape[0] > 1:
+        half = terms.shape[0] // 2
+        terms = jnp.concatenate([terms[:half] + terms[half:2 * half], terms[2 * half:]])
+    return terms[0]
+
+
 def _squashed(key, moment, center, x: float, eps: float):
     """The write keys `k x^{-s}` of keys `k` and their moment (the module's account), `center` a key head's,
-    broadcast over the keys' last two axes."""
-    r = jnp.log(moment + eps) - jnp.asarray(center, moment.dtype)[:, None]
+    broadcast over the keys' last two axes (`_centered`)."""
+    r = _centered(jnp.log(moment + eps), jnp.asarray(center, moment.dtype))
     return key * jnp.exp(-np.log(x) * _squash(r))
 
 CENTER = -0.2
