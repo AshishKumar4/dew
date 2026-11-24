@@ -568,3 +568,83 @@ def test_a_loss_differentiating_a_scanned_run_twice_is_refused_its_update_in_the
     run.device_mesh = MeshSpec().build(jax.devices()[:1])
     with pytest.raises(ValueError):
         scanning(run.fit)(data, steps=1, log_every=1)
+
+
+@pytest.mark.usefixtures("scanned_stacks")
+@pytest.mark.parametrize(("generation", "dtype"), [("sm90", "float32"), ("sm80", "bfloat16")])
+def test_an_accumulating_scanned_step_holds_no_extra_gradient_buffer(generation, dtype):
+    """A scanned step that accumulates its update over microbatches, its batches or its batch's split,
+    pools each layer's gradient into the window's accumulator as its backward walks the layer
+    (`Transaction._planned_accumulation`): its temporaries hold no stacked `[L, ...]` gradient beside the
+    accumulator, nor the scan's forward residuals unrematerialized, past what a one-microbatch step holds
+    (row 12080: an sm90 f32 step held 5.6 MB more, an sm80 bf16 one 2.4 MB)."""
+    from dew.training import UpdateBatch
+
+    wide = {**TINY_DECODER, "emb_features": 64, "mlp_features": 2048}
+    model = models.build("causal_transformer", vocab_size=96, **wide, num_kv_heads=2, dtype=dtype)
+
+    def ahead(accumulation: int, split: int, rows: int):
+        gpu = compile_only_gpus(generation, 1, 64 * 2**30)
+        run = Trainer(LMObjective(model, 16), OptimConfig(optimizer=AdamW(), learning_rate=1e-3),
+                      key=jax.random.key(0), mesh=MeshSpec().build(gpu),
+                      layout=Layout(min_shard=256), update=UpdateBatch(batches=accumulation),
+                      fit=FitPolicy(split=split))
+        run.validate(steps=8)
+        return compile_ahead(run, token_rows(96, rows, 17))
+
+    one = ahead(1, 1, 1)
+    accumulated = ahead(4, 1, 1)
+    split = ahead(1, 2, 2)
+    shapes = jax.eval_shape(model.init, jax.random.key(0), jnp.zeros((1, 16), jnp.int32))["params"]
+    narrow = 2 * sum(leaf.size for leaf in jax.tree.leaves(shapes))
+    assert accumulated.temp_bytes - one.temp_bytes < narrow, (accumulated.temp_bytes, one.temp_bytes, narrow)
+    assert split.temp_bytes - one.temp_bytes < narrow, (split.temp_bytes, one.temp_bytes, narrow)
+
+
+@pytest.mark.parametrize(("dtype", "clip", "periodic"), [
+    ("float32", 0.0, False),
+    ("bfloat16", 1.0, False),
+    ("float32", 0.0, True),
+], ids=["fp32", "bf16-clipped", "periodic"])
+def test_an_accumulating_scanned_step_matches_unrolled(dtype, clip, periodic):
+    """A scanned step pooling its gradient in its backward (`Transaction._planned_accumulation`) over a
+    window of accumulated and split microbatches, clipped or with narrow copies or over a periodic stack,
+    trains as the unrolled step does: its losses, parameters and optimizer state."""
+    from dew.nn.kernels.generation import chosen
+    from dew.training import UpdateBatch
+
+    extra = ({"num_layers": 4, "layer_types": ("sliding_attention", "full_attention") * 2,
+              "kinds": {"sliding_attention": {"window": 4}}}
+             if periodic else {"num_layers": 2})
+    model = decoder(dtype=dtype, **extra)
+    opt = OptimConfig(optimizer=AdamW(weight_decay=0.1), learning_rate=1e-2, clip_grads=clip)
+    batches = [token_rows(VOCAB, 4, SEQ + 1, seed=s) for s in range(4)]
+
+    def run_arm(mode: str):
+        with chosen(layer_scan=mode, narrow_copies="on" if dtype == "bfloat16" else "off"):
+            tr = Trainer(LMObjective(model, SEQ), opt, key=jax.random.key(0),
+                         mesh=MeshSpec().build(jax.devices()[:1]),
+                         layout=Layout(min_shard=2**30), update=UpdateBatch(batches=2),
+                         fit=FitPolicy(split=2), checkpoints=None, tracker=None)
+            tr.validate(steps=4)
+            state, _, _ = tr.place()
+            placed = [shard_batch(tr.device_mesh, b) for b in batches]
+            step = tr.compile(state, placed[0])
+            losses = []
+            for b in placed:
+                state, loss, *_ = step(state, b)
+                losses.append(float(loss))
+            stored = tr.stored(state)
+            params, opt_state = jax.device_get((stored.variables["params"], stored.opt_state))
+            return losses, params, opt_state, int(stored.updates)
+
+    scan_losses, scan_params, scan_opt, scan_updates = run_arm("scanned")
+    plain_losses, plain_params, plain_opt, plain_updates = run_arm("plain")
+    assert scan_updates == plain_updates == 2
+    tol = 2e-2 if dtype == "bfloat16" else 1e-4
+    np.testing.assert_allclose(scan_losses, plain_losses, rtol=tol, atol=tol)
+    for a, b in zip(jax.tree.leaves(scan_params), jax.tree.leaves(plain_params), strict=True):
+        np.testing.assert_allclose(a, b, rtol=tol, atol=tol)
+    for a, b in zip(jax.tree.leaves(scan_opt), jax.tree.leaves(plain_opt), strict=True):
+        if jnp.issubdtype(np.asarray(a).dtype, jnp.floating):
+            np.testing.assert_allclose(a, b, rtol=tol, atol=tol)
