@@ -17,7 +17,7 @@ from dew.optim import Adam, Muon, OptimConfig
 from dew.registry import models
 from dew.training import Layout, MeshSpec, Trainer
 from dew.training.ahead import AheadOfTime, compile_ahead
-from dew.training.memory import needed
+from dew.training.memory import least_limit
 from dew.training.planning import PlanRefused
 
 
@@ -38,9 +38,10 @@ def _ahead(model, optimizer, seq: int, rows: int, limit: int, variables=None
 
 
 def _needed(ahead: AheadOfTime) -> int:
-    """The least an H100 holds for `ahead`'s step to be admitted (`needed`)."""
+    """The least an H100 holds for `ahead`'s step to be admitted (`least_limit`)."""
     gpu = compile_only_gpus("sm90", 1, 2 ** 34)[0]
-    return needed(gpu, ahead.argument_bytes, ahead.output_bytes - ahead.alias_bytes, ahead.temp_bytes)
+    beside = ahead.output_bytes - ahead.alias_bytes
+    return least_limit(gpu, [(ahead.argument_bytes, beside, ahead.temp_bytes)])
 
 
 def test_a_miss_whose_joined_stacks_hold_less_than_it_was_short_of_parts_them_after_the_remat_rungs():

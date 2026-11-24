@@ -494,7 +494,7 @@ class FitRun:
     reads: dict[Signature, tuple[bool, ...]] = dataclasses.field(default_factory=dict)
     """Which leaves of a batch of each signature its compiled step reads
     (`step_reads`), which the prefetcher alone places."""
-    compiled: CodeBounded[Hashable, tuple] = dataclasses.field(default_factory=CodeBounded)
+    compiled: CodeBounded[Hashable, tuple] = dataclasses.field(default_factory=CodeBounded[Hashable, tuple])
     """The step compiled for each batch signature the run met, at each pass count its phases run
     (`Trainer._compile_key`), with its measured FLOPs (`Trainer._compiled_for`), which its cooldown branches
     step too: bounded by their device code as the compiler's executables are (`CodeBounded`), each charged
