@@ -97,7 +97,7 @@ def summaries(x, g, starts, *, shape: Walk):
             gates = [_gate(program, g_ref, t) for t in tokens]
             for x_t, (a_t, first) in zip(xs, gates, strict=True):
                 decay = _decayed(decay, a_t, first)
-                h = summed_on(h, a_t * h[0], x_t, first)
+                h = summed_on(h, a_t, x_t, first)
             return decay, h
 
         zero = jnp.zeros((shape.lanes,), jnp.float32)
@@ -151,7 +151,7 @@ def reverse_summaries(g, starts, dy, *, shape: Walk):
             for (a_t, first), dy_t in zip(reversed(gates), reversed(dys), strict=True):
                 decay = _decayed(decay, a_t, first)
                 # The cotangent the state before a document's first token takes of it: none.
-                c = tuple(cut(first, value, zero) for value in summed_on(c, a_t * c[0], a_t * dy_t, None))
+                c = tuple(cut(first, value, zero) for value in summed_on(c, a_t, a_t * dy_t, None))
             return decay, c
 
         decay, c = program.turns(body, ((zero + 1.0, zero), (zero, zero)), reverse=True)

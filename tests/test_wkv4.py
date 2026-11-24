@@ -232,6 +232,73 @@ def test_a_tokens_gradients_take_their_large_terms_weighted_first():
         assert np.isfinite(np.asarray(grad)).all()
 
 
+def _carry(alpha, beta, eps):
+    """A carry entering every row, `[ROWS, 3, WIDE]` fp32, each value given a channel."""
+    return np.stack([np.full((ROWS, WIDE), value) for value in (alpha, beta, eps)], 1).astype(np.float32)
+
+
+def _kernel_gradients(time_decay, key, value, state, starts, dy, dfinal, time_first=0.0):
+    """The kernels' gradients of every operand under `dy` and `dfinal`, the decay and bonus each one value."""
+    channel = np.full((WIDE,), 1.0, np.float32)
+    run = differentiated(routed("kernels"))
+    return run(channel * time_decay, channel * time_first, key, value, state, starts,
+               (dy.astype(np.float32), dfinal.astype(np.float32)))[1:]
+
+
+def test_a_reset_tokens_key_takes_the_maximums_cotangent_whole():
+    """ReviewRecurrenceBatch's net key gradient: one token, a document's first, its key, bonus 0 and value
+    2^100, no output cotangent and a final carry's of `(1, 0, 1)`: the key sets the maximum, so its gradient
+    is the maximum's cotangent, 1, where the numerator's share added (2^100) and taken back rounded it to
+    0."""
+    key, value = np.zeros((ROWS, 1, WIDE), np.float32), np.full((ROWS, 1, WIDE), 2.0 ** 100, np.float32)
+    dfinal = _carry(1.0, 0.0, 1.0)
+    starts = np.ones((ROWS, 1), bool)
+    _, _, dkey, _, _ = _kernel_gradients(0.0, key, value, _carry(0.0, 1.0, 0.0), starts, np.zeros(key.shape),
+                                         dfinal)
+    np.testing.assert_array_equal(np.asarray(dkey), 1.0)
+
+
+def test_a_carrys_cotangent_follows_the_frame_the_forward_rounded():
+    """ReviewRecurrenceBatch's rounded frame: a carry entering at `(1, 1, 3 2^29)`, keys, values and bonus 0
+    and a decay of -4 over 150 tokens (three spans): each step's aged maximum rounds back to 3 2^29, so the
+    carry's numerator stays 1 and a unit cotangent of the final one is the entering one's, exactly, where a
+    span's map back taken from `e^(n w)` dropped it to e^-256."""
+    key = np.zeros((ROWS, 150, WIDE), np.float32)
+    dfinal = _carry(1.0, 0.0, 0.0)
+    *_, dstate = _kernel_gradients(np.log(4.0), key, key, _carry(1.0, 1.0, 3.0 * 2.0 ** 29),
+                                   np.zeros((ROWS, 150), bool), np.zeros(key.shape), dfinal)
+    np.testing.assert_array_equal(np.asarray(dstate[:, 0]), 1.0)
+
+
+def test_a_spans_own_cotangent_past_float32s_range_composes_finite():
+    """ReviewRecurrenceBatch's span constant: a carry entering at `(0, 1, 0)`, keys of -1000, values and
+    bonus 0 and a decay of -e^-1000 (zero), output cotangents of 2^127 at the last two tokens and a final
+    numerator's of -2^127 over three spans: the numerator's cotangent is 0 past the last token and 2^127
+    before it, so the entering carry's is `(2^127, 0, 0)` exactly, where the last span's own constant from
+    none, 2^128, was infinite before it met the final carry's."""
+    key = np.full((ROWS, 150, WIDE), -1000.0, np.float32)
+    dy = np.zeros(key.shape)
+    dy[:, -2:] = 2.0 ** 127
+    *_, dstate = _kernel_gradients(-1000.0, key, np.zeros(key.shape, np.float32), _carry(0.0, 1.0, 0.0),
+                                   np.zeros((ROWS, 150), bool), dy, _carry(-(2.0 ** 127), 0.0, 0.0))
+    np.testing.assert_array_equal(np.asarray(dstate), _carry(2.0 ** 127, 0.0, 0.0))
+
+
+def test_a_document_cuts_an_infinite_cotangent_from_every_token_before_it():
+    """ReviewRecurrenceBatch's severed map: a final carry's cotangent of `(inf, 0, 0)` and a document starting
+    at token 100 of 150 (in the second span): every gradient of the tokens before it and of the entering carry
+    is exactly 0, where a span's map back multiplied the cut's zero by the infinite cotangent, NaN."""
+    rng = np.random.default_rng([1455, 4])
+    key = rng.standard_normal((ROWS, 150, WIDE)).astype(np.float32)
+    value = rng.standard_normal((ROWS, 150, WIDE)).astype(np.float32)
+    starts = np.zeros((ROWS, 150), bool)
+    starts[:, 100] = True
+    _, _, dkey, dvalue, dstate = _kernel_gradients(0.0, key, value, _carry(0.5, 1.0, 0.0), starts,
+                                                   np.zeros(key.shape), _carry(np.inf, 0.0, 0.0))
+    for grad in (dkey[:, :100], dvalue[:, :100], dstate):
+        np.testing.assert_array_equal(np.asarray(grad), 0.0)
+
+
 @pytest.mark.mesh(devices=2)
 def test_the_kernels_refuse_a_checked_shard_map_whose_values_alone_vary():
     """ReviewRecurrenceBatch's selector variation: inside a `shard_map` that checks varying axes, keys whole

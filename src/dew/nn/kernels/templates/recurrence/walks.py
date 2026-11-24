@@ -61,11 +61,13 @@ def walk(rows: int, length: int, channels: int, lanes: int, most: int, family: m
 
 
 class Program:
-    """A program's view: its row, span and channels, and its loads and stores at them."""
+    """A program's view: its row, span and channels, and its loads and stores at them; its span its grid's
+    (`block` None) or `block`, for a program walking a row's spans in turn (`launch`'s `spans`)."""
 
-    def __init__(self, shape: Walk, starts_ref):
+    def __init__(self, shape: Walk, starts_ref, block=None):
         self.shape, self.starts_ref = shape, starts_ref
-        self.row, self.block = lax.axis_index("rows"), lax.axis_index("tokens")
+        self.row = lax.axis_index("rows")
+        self.block = lax.axis_index("tokens") if block is None else block
         self.start = self.block * shape.span
         self.columns = pl.ds(lax.axis_index("channels") * shape.lanes, shape.lanes)
 
@@ -125,9 +127,12 @@ def refs_of(refs, operands) -> tuple[list, list]:
     return [None if operand is None else next(refs) for operand in operands], list(refs)
 
 
-def launch(entry, shape: Walk, name: str, out_type, operands, scratch=()):
-    """`entry` launched over `shape`'s grid on `operands` (an absent one None)."""
-    return mosaic.kernel(entry, out_type=out_type, grid=shape.grid, grid_names=("rows", "tokens", "channels"),
+def launch(entry, shape: Walk, name: str, out_type, operands, scratch=(), *, whole: bool = False):
+    """`entry` launched over `shape`'s grid on `operands` (an absent one None); `whole`, a program a row and a
+    block of channels, walking the row's spans in turn (`Program`'s `block`)."""
+    rows, spans, channels = shape.grid
+    grid = (rows, 1, channels) if whole else (rows, spans, channels)
+    return mosaic.kernel(entry, out_type=out_type, grid=grid, grid_names=("rows", "tokens", "channels"),
                          warpgroups=1, interpret=shape.interpret, family=shape.family.name,
                          compiled=mosaic.compiler_params(), name=name, scratch=scratch)(
         *(operand for operand in operands if operand is not None))
@@ -166,22 +171,26 @@ LARGE = 2.0 ** 64
 """The magnitude past which a running sum is lowered by 2^64 (`summed_on`)."""
 
 
-def summed_on(carried, decayed, term, first):
+def summed_on(carried, factor, term, first):
     """A running sum `(value, scale)`, its value `2^(64 scale)` times its `value`, walked on by one token:
-    `decayed` (its value times the token's decay, at its scale) plus `term` lowered to its scale (2^-64 a
-    step, a term so lowered below the value's precision a part it no longer holds), a document's first token
+    its value raised to its scale's range first, then times the token's `factor` (its decay) plus `term`
+    lowered to its scale (2^-64 a step, a term so lowered below the value's precision a part it no longer
+    holds), a document's first token
     `term` alone at scale zero (selected), and a value past `LARGE` lowered by 2^64, its scale raised. A sum
     from zero is a span's last value less its entering one's decayed share, at most twice float32's largest,
     so it is held in range at two steps and none of its terms is lowered unless the sum outweighs it: a sum
     that falls back below one at a raised scale is raised again first (2^64 a step, exact), so a term after
-    a cancellation is lowered no further than the sum it joins. Summed whole, two writes of 2^127 after a
-    state of -2^127 were infinite; halved, a least normal write was lost; raised and never lowered, writes of
-    2^126 and -2^126 left 2^-126 after them lowered to nothing (ReviewRecurrenceBatch)."""
-    _, scale = carried
+    a cancellation is lowered no further than the sum it joins, nor its factor applied to a sum shrunk below
+    float32's range at its scale. Summed whole, two writes of 2^127 after a state of -2^127 were infinite;
+    halved, a least normal write was lost; raised and never lowered, writes of 2^126 and -2^126 left 2^-126
+    after them lowered to nothing; raised after the factor, writes of 2^64 and -(2^64 - 2^40) times a decay
+    of e^-87.25 underflowed (ReviewRecurrenceBatch)."""
+    value, scale = carried
     for _ in range(2):
-        small = (scale >= 1.0) & (jnp.abs(decayed) < 1.0)
-        decayed = jnp.where(small, decayed * 2.0 ** 64, decayed)
+        small = (scale >= 1.0) & (jnp.abs(value) < 1.0)
+        value = jnp.where(small, value * 2.0 ** 64, value)
         scale = jnp.where(small, scale - 1.0, scale)
+    decayed = factor * value
     lowered = jnp.where(scale >= 1.0, term * 2.0 ** -64, term)
     lowered = jnp.where(scale >= 2.0, lowered * 2.0 ** -64, lowered)
     value = cut(first, decayed + lowered, term)
@@ -196,14 +205,15 @@ exponents from `LEAST` to zero, a value's within float32's range and its sums' j
 over the spans takes one bound at every level."""
 
 LEAST = -1100
-"""The least exponent a span's map keeps (`held`): below it a value is zero against any float32 it meets."""
+"""The least exponent a span's map keeps (`held`): below it a nonzero value is held at it, still nonzero
+(an infinite value times it infinite, as the walk's), and zero against any finite float32 it meets."""
 
 
 def held(value: scaled.Scaled) -> scaled.Scaled:
-    """`value` bound within `REACH`, zero below `2^LEAST`."""
-    small = value.exponent < LEAST
-    return scaled.Scaled(jnp.where(small, jnp.zeros_like(value.significand), value.significand),
-                         jnp.where(small, 0, value.exponent), REACH)
+    """`value` bound within `REACH`, a nonzero one's exponent no lower than `LEAST`: only a structural zero
+    (a cut, `cut_off`) is zero, where zeroed below `2^LEAST` a decay of e^-4096 cut an infinite state the
+    walk carries (ReviewRecurrenceBatch)."""
+    return scaled.Scaled(value.significand, jnp.maximum(value.exponent, LEAST), REACH)
 
 
 def extended(mantissa, exponent) -> scaled.Scaled:
