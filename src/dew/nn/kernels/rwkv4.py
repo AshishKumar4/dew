@@ -24,7 +24,7 @@ import numpy as np
 from jax.sharding import PartitionSpec as P
 
 from dew.nn.precision import at_least_fp32
-from dew.nn.sharding import grouped_heads, manual_map
+from dew.nn.sharding import grouped_heads, manual_map, varying
 
 from . import generation
 from .generation import INHERENT, Choice
@@ -60,7 +60,7 @@ def joined(decay, *, numerators: Callable = _weighed, denominators: Callable = _
     """The composition of a span with the span after it (`associative_scan`'s operator): the earlier one's
     past decayed by `decay` once a token of the later one, both rescaled to their larger maximum, where the
     later one begins no document; `numerators` and `denominators` weigh each value (`_weighed`'s, or another
-    form's, the template's extended floats, `templates.recurrence.wkv4`)."""
+    form's, the template's scaled values, `templates.recurrence.wkv4`)."""
 
     def join(before: SpanCarry, after: SpanCarry) -> SpanCarry:
         aged = before.top + after.tokens * decay
@@ -125,20 +125,21 @@ WKV4: Op[WkvCase] = Op(Choice.WKV4, (Kernel('mosaic_gpu', WKV4_SUPPORTS), Kernel
 the call, else the portable scan (`scanned`)."""
 
 
-def wkv4_kernel(key, value) -> str:
-    """The kernel the WKV's selector (`WKV4`) gives a call over `key` and `value` `[B, S, C]` on the target,
-    reported as its route: of the dtype the kernels run them in, their common one (a call's keys alone in
-    bf16 beside fp64 values under x64 took the kernels, which ran them in fp32, ReviewRecurrenceBatch)."""
+def wkv4_kernel(key, value, *operands) -> str:
+    """The kernel the WKV's selector (`WKV4`) gives a call over `key` and `value` `[B, S, C]` and its other
+    launch operands (`operands`) on the target, reported as its route: of the dtype the kernels run them in,
+    their common one (a call's keys alone in bf16 beside fp64 values under x64 took the kernels, which ran
+    them in fp32, ReviewRecurrenceBatch)."""
     from .templates import bundles
 
     dtype = jnp.dtype(jnp.result_type(key, value))
     on_gpu = generation.backend() == 'gpu'
     bundled = on_gpu and bundles.of(generation.device_generation(), dtype) is not None
     family = generation.family(generation.device_generation()) if bundled else None
-    # Either operand a checked `shard_map` varies refuses the kernels (replicated keys beside row-varying
-    # values among them, ReviewRecurrenceBatch).
-    varying = bool(jax.typeof(key).mat.varying or jax.typeof(value).mat.varying)
-    case = WkvCase(varying=varying, dtype=dtype, channels=key.shape[-1], family=family)
+    # Any launch operand a checked `shard_map` varies refuses the kernels (`sharding.varying`; replicated
+    # keys beside row-varying values among them, ReviewRecurrenceBatch).
+    case = WkvCase(varying=bool(varying(key, value, *operands)), dtype=dtype, channels=key.shape[-1],
+                   family=family)
     return select(WKV4, case).kernel
 
 
@@ -174,8 +175,9 @@ def wkv4(time_decay, time_first, key, value, state=None, starts=None):
         return manual_map(template, specs, (three, three))(*operands)
 
     # The decay and bonus (operands 0 and 1) are the call's parameters.
-    return _per_product(WKV4.bound(lambda product: wkv4_kernel(key, value)), run, time_decay, time_first, key,
-                        value, state, parameters=(0, 1))
+    given = [operand for operand in (time_decay, time_first, state, starts) if operand is not None]
+    chooser = WKV4.bound(lambda product: wkv4_kernel(key, value, *given))
+    return _per_product(chooser, run, time_decay, time_first, key, value, state, parameters=(0, 1))
 
 
 def scanned(time_decay, time_first, key, value, state=None, starts=None):

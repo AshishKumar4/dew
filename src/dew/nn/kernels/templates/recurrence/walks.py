@@ -14,6 +14,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
+from dew.algebra import scaled
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import mosaic, outputs, scan
 from dew.nn.kernels.templates.recurrence import conv
@@ -189,38 +190,49 @@ def summed_on(carried, decayed, term, first):
     return jnp.where(large, value * 2.0 ** -64, value), jnp.where(large, scale + 1.0, scale)
 
 
-ZERO_EXPONENT = -(2 ** 20)
-"""An extended float's exponent for zero (`extended`), far below any other's: a sum's terms aligned to the
-larger exponent leave a zero none of its own."""
+REACH = 2048
+"""The exponent bound a span's map is held within as a scaled value (`dew.algebra.scaled`, `held`): a decay's
+exponents from `LEAST` to zero, a value's within float32's range and its sums' just past it, so XLA's scan
+over the spans takes one bound at every level."""
 
-LEAST_EXPONENT = -1024
-"""The least exponent an extended float keeps (`extended`): any value past it is zero against every value a
-float32 sum holds."""
-
-
-def extended(mantissa, exponent):
-    """`mantissa 2^exponent` as an extended float `(fraction, exponent)`: the fraction in `[1/2, 1)` and the
-    exponent int32 (`jnp.frexp`), so a span's decays and sums compose (`multiplied`, `added`) whatever their
-    exponents, each step rounded once, where held as float32 they left its range; zero, or a value below
-    2^`LEAST_EXPONENT`, as `(0, ZERO_EXPONENT)`."""
-    fraction, shift = jnp.frexp(mantissa)
-    exponent = jnp.asarray(exponent).astype(jnp.int32) + shift
-    zero = (fraction == 0.0) | (exponent < LEAST_EXPONENT)
-    return jnp.where(zero, 0.0, fraction), jnp.where(zero, ZERO_EXPONENT, exponent)
+LEAST = -1100
+"""The least exponent a span's map keeps (`held`): below it a value is zero against any float32 it meets."""
 
 
-def multiplied(first, second):
-    """Two extended floats' product."""
-    return extended(first[0] * second[0], first[1] + second[1])
+def held(value: scaled.Scaled) -> scaled.Scaled:
+    """`value` bound within `REACH`, zero below `2^LEAST`."""
+    small = value.exponent < LEAST
+    return scaled.Scaled(jnp.where(small, jnp.zeros_like(value.significand), value.significand),
+                         jnp.where(small, 0, value.exponent), REACH)
 
 
-def added(first, second):
-    """Two extended floats' sum: each fraction aligned to the larger exponent (`jnp.ldexp`), summed, rounded
-    once."""
-    top = jnp.maximum(first[1], second[1])
-    return extended(jnp.ldexp(first[0], first[1] - top) + jnp.ldexp(second[0], second[1] - top), top)
+def extended(mantissa, exponent) -> scaled.Scaled:
+    """`mantissa 2^exponent` (a summary's mantissa and its whole exponent) as a scaled value
+    (`dew.algebra.scaled.Scaled`), so a span's decays and sums compose (`multiplied`, `added`) whatever their
+    exponents, each step rounded once, where held as float32 they left its range."""
+    return held(scaled.normalized(mantissa, jnp.asarray(exponent).astype(jnp.int32), REACH))
 
 
-def valued(value):
-    """An extended float as float32 (`jnp.ldexp`): zero below its least, infinite past its largest."""
-    return jnp.ldexp(value[0], value[1])
+def multiplied(first: scaled.Scaled, second: scaled.Scaled) -> scaled.Scaled:
+    """Two scaled values' product (`scaled.mul`), held (`held`)."""
+    return held(scaled.mul(first, second))
+
+
+def added(first: scaled.Scaled, second: scaled.Scaled) -> scaled.Scaled:
+    """Two scaled values' sum (`scaled.add`), held (`held`)."""
+    return held(scaled.add(first, second))
+
+
+def chosen(condition, first: scaled.Scaled, second: scaled.Scaled) -> scaled.Scaled:
+    """`first` where `condition`, else `second` (`scaled.where`), held."""
+    return held(scaled.where(condition, first, second))
+
+
+def cut_off(decay: scaled.Scaled):
+    """Whether a span's map keeps none of the value entering it: its decay zero (a document starts in it)."""
+    return decay.significand == 0
+
+
+def valued(value: scaled.Scaled):
+    """A scaled value as float32 (`scaled.landed`): zero below its least, infinite past its largest."""
+    return scaled.landed(value)

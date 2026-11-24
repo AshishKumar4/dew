@@ -7,9 +7,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from generation_support import interprets
+from jax.sharding import Mesh, PartitionSpec as P
 from reference_error import FEWEST_SEEDS, assert_as_exact
 
 from dew.nn.kernels import diagonal_scan, generation
+from dew.nn.kernels.selection import KernelRefused
 
 ROWS, CHANNELS = 2, 256
 
@@ -199,6 +201,48 @@ def test_a_least_normal_state_crosses_every_span_exactly():
     np.testing.assert_array_equal(np.asarray(out), np.broadcast_to(state[:, None], zeros.shape))
     np.testing.assert_array_equal(np.asarray(final), state)
     np.testing.assert_array_equal(np.asarray(dstate), state)
+
+
+def test_a_cancelled_sum_keeps_a_least_normal_write_after_it():
+    """ReviewRecurrenceBatch's raised-sum cancellation: writes of 2^126 and -2^126, then 2^-126, every gate
+    zero, every later write zero, over three spans: the first span's sum from zero rises past 2^64 and
+    cancels, and the least normal write after it is every later output and the final state, exactly; a sum
+    raised and never lowered back took the write lowered by 2^64 and lost it."""
+    x = np.zeros((ROWS, 150, CHANNELS), np.float32)
+    x[:, 0], x[:, 1], x[:, 2] = 2.0 ** 126, -(2.0 ** 126), 2.0 ** -126
+    zeros = np.zeros((ROWS, CHANNELS), np.float32)
+    out, final = jax.jit(routed("kernels"))(x, np.zeros(x.shape, np.float32), zeros,
+                                            np.zeros((ROWS, 150), bool))
+    np.testing.assert_array_equal(np.asarray(out[:, 2:]), 2.0 ** -126)
+    np.testing.assert_array_equal(np.asarray(final), 2.0 ** -126)
+
+
+def test_a_document_after_an_infinite_entering_state_reads_none_of_it():
+    """ReviewRecurrenceBatch's reset across spans: an infinite entering state, a document starting at the
+    first token with a write of one, every gate zero, over three spans: every output and the final state are
+    one, where the span maps' composition multiplied the infinite state by the cut's zero decay, NaN."""
+    x = np.zeros((ROWS, 150, CHANNELS), np.float32)
+    x[:, 0] = 1.0
+    starts = np.zeros((ROWS, 150), bool)
+    starts[:, 0] = True
+    state = np.full((ROWS, CHANNELS), np.inf, np.float32)
+    out, final = jax.jit(routed("kernels"))(x, np.zeros(x.shape, np.float32), state, starts)
+    np.testing.assert_array_equal(np.asarray(out), 1.0)
+    np.testing.assert_array_equal(np.asarray(final), 1.0)
+
+
+@pytest.mark.mesh(devices=2)
+def test_the_kernels_refuse_a_checked_shard_map_whose_gates_alone_vary():
+    """ReviewRecurrenceBatch's selector variation: inside a `shard_map` that checks varying axes, writes
+    whole beside gates split by row vary the call, so the kernels named refuse it, where a selector reading
+    the writes' variation alone took them."""
+    def run(x, g):
+        return routed("kernels")(x, g, None, None)[0]
+
+    mapped = jax.shard_map(run, mesh=Mesh(np.asarray(jax.devices()[:2]), ("data",)),
+                           in_specs=(P(), P("data")), out_specs=P("data"), check_vma=True)
+    with pytest.raises(KernelRefused):
+        jax.jit(mapped)(np.zeros((1, 9, CHANNELS), np.float32), np.zeros((2, 9, CHANNELS), np.float32))
 
 
 @pytest.mark.parametrize('route', list(ROUTES))

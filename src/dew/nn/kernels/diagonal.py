@@ -12,7 +12,7 @@ import numpy as np
 from jax.sharding import PartitionSpec as P
 
 from dew.nn.precision import at_least_fp32
-from dew.nn.sharding import grouped_heads, manual_map
+from dew.nn.sharding import grouped_heads, manual_map, varying
 
 from . import generation, recurrence
 from .generation import INHERENT, Choice
@@ -61,14 +61,16 @@ DIAGONAL_SCAN: Op[DiagonalCase] = Op(Choice.DIAGONAL_SCAN, (Kernel('mosaic_gpu',
 takes the call, else the portable math (the chunked op's, `DIAGONAL`)."""
 
 
-def diagonal_kernel(x) -> str:
-    """The kernel the diagonal scan's selector (`DIAGONAL_SCAN`) gives a scan over writes `x` `[B, S, D]` on
-    the target, reported as its route."""
+def diagonal_kernel(x, *operands) -> str:
+    """The kernel the diagonal scan's selector (`DIAGONAL_SCAN`) gives a scan over writes `x` `[B, S, D]` and
+    its other launch operands (`operands`: the gates, the state, the documents) on the target, reported as
+    its route: any of them a checked `shard_map` varies refuses the kernels (`sharding.varying`; the writes
+    alone read, replicated writes beside row-varying gates took them, ReviewRecurrenceBatch)."""
     from .templates import bundles
 
     on_gpu = generation.backend() == 'gpu'
     bundled = on_gpu and bundles.of(generation.device_generation(), x.dtype) is not None
-    case = DiagonalCase(varying=bool(jax.typeof(x).mat.varying), dtype=jnp.dtype(x.dtype),
+    case = DiagonalCase(varying=bool(varying(x, *operands)), dtype=jnp.dtype(x.dtype),
                         channels=x.shape[-1],
                         family=generation.family(generation.device_generation()) if bundled else None)
     return select(DIAGONAL_SCAN, case).kernel
@@ -104,7 +106,8 @@ def diagonal_scan(x, g, state=None, *, chunk_size: int = CHUNK_SIZE, starts=None
         operands = (x, g, held, *([] if starts is None else [starts]))
         return manual_map(template, (three, three, two, two)[:len(operands)], (three, two))(*operands)
 
-    return _per_product(DIAGONAL_SCAN.bound(lambda product: diagonal_kernel(x)), run, x, g, state,
+    given = [operand for operand in (g, state, starts) if operand is not None]
+    return _per_product(DIAGONAL_SCAN.bound(lambda product: diagonal_kernel(x, *given)), run, x, g, state,
                         parameters=())
 
 

@@ -39,7 +39,9 @@ from dew.nn.kernels.templates.recurrence.walks import (
     Program,
     Walk,
     added,
+    chosen,
     cut,
+    cut_off,
     extended,
     launch,
     multiplied,
@@ -211,25 +213,29 @@ def walked_back(x, g, starts, dy, entering, later, *, shape: Walk):
 
 
 def _composed(first, then):
-    """Two spans' maps, `(decay, value)` each an extended float (`walks.extended`), as one, `first`'s applied
-    first: their decays multiplied, `first`'s value times `then`'s decay plus `then`'s (`associative_scan`'s
-    operator either way)."""
+    """Two spans' maps, `(decay, value)` each a scaled value (`walks.extended`), as one, `first`'s applied
+    first: their decays multiplied, `first`'s value times `then`'s decay plus `then`'s, or `then`'s alone
+    where it cuts (`walks.cut_off`, selected: an infinite value times a cut's zero decay was NaN,
+    ReviewRecurrenceBatch) (`associative_scan`'s operator either way)."""
     decay, value = first
     then_decay, then_value = then
-    return multiplied(decay, then_decay), added(multiplied(value, then_decay), then_value)
+    joined = added(multiplied(value, then_decay), then_value)
+    return multiplied(decay, then_decay), chosen(cut_off(then_decay), then_value, joined)
 
 
 def _entering(summary: tuple, given, *, reverse: bool = False):
     """Each span's value as its walk enters it, `[B, spans, D]`: `given` `[B, D]` (the state entering the
     first span; `reverse`, the final state's cotangent entering the last) carried through the spans' maps
     (`summary`, `(mantissa, exponent, value, scale)` as `summaries` or `reverse_summaries` give them) by XLA's
-    associative scan in extended floats (`walks.extended`), so a decay below float32's range scaling a value
-    past it, or a sum from zero past its largest, composes exactly where the value entering a span is a
-    float32's (as float32 a span's decay flushed, ReviewRecurrenceBatch; halved, a least normal state)."""
+    associative scan in scaled values (`walks.extended`, `dew.algebra.scaled`), so a decay below float32's
+    range scaling a value past it, or a sum from zero past its largest, composes exactly where the value
+    entering a span is a float32's (as float32 a span's decay flushed, ReviewRecurrenceBatch; halved, a least
+    normal state), and a span a document starts in takes none of the value before it, selected."""
     mantissa, exponent, value, scale = summary
     maps = (extended(mantissa, exponent), extended(value, 64.0 * scale))
     through, written = lax.associative_scan(_composed, maps, axis=1, reverse=reverse)
-    after = valued(added(multiplied(extended(given[:, None], 0), through), written))
+    entered = added(multiplied(extended(given[:, None], 0), through), written)
+    after = valued(chosen(cut_off(through), written, entered))
     if reverse:
         return jnp.concatenate([after[:, 1:], given[:, None]], axis=1)
     return jnp.concatenate([given[:, None], after[:, :-1]], axis=1)

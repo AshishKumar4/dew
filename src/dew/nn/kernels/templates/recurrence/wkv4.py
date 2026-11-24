@@ -33,6 +33,7 @@ import jax
 import jax.numpy as jnp
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
+from dew.algebra import scaled
 from dew.nn import derivatives
 from dew.nn.kernels import tuning
 from dew.nn.kernels.templates import mosaic, scan
@@ -347,19 +348,19 @@ def _spans(shape: Walk, starts, like):
 
 
 class _Carry(NamedTuple):
-    """`rwkv4.SpanCarry` as the template's join holds it: a signed value (the numerator; reversed, both) an
-    extended float, a `(fraction, exponent)` pair (`walks.extended`), `rwkv4.joined` reading each field by
-    its name alike."""
+    """`rwkv4.SpanCarry` as the template's join holds it: a signed value (the numerator; reversed, both) a
+    scaled value (`walks.extended`, `dew.algebra.scaled.Scaled`), `rwkv4.joined` reading each field by its
+    name alike."""
 
-    numerator: jax.Array | tuple[jax.Array, jax.Array]
-    denominator: jax.Array | tuple[jax.Array, jax.Array]
+    numerator: jax.Array | scaled.Scaled
+    denominator: jax.Array | scaled.Scaled
     top: jax.Array
     tokens: jax.Array
     fresh: jax.Array
 
 
 def _weighed(kept, earlier, added_, later):
-    """Two spans' extended values (`walks.extended`) at their larger maximum, `rwkv4.joined`'s weighing."""
+    """Two spans' scaled values (`walks.extended`) at their larger maximum, `rwkv4.joined`'s weighing."""
     return added(multiplied(earlier, extended(kept, 0)), multiplied(later, extended(added_, 0)))
 
 
@@ -368,7 +369,7 @@ def _joined(carries: tuple, given: tuple, decay, shape: Walk, starts, *, reverse
     entering carry, `[B, D]` each; `reverse`, the final carry's reverse carry, entering the last span from its
     end) joined with the spans' (`carries`, from an empty past, each signed value a running sum's value and
     scale: the numerator; reversed, both) by the portable scan's operator (`rwkv4.joined`) over XLA's
-    associative scan, the signed values in extended floats (`walks.extended`): a span's from none is its
+    associative scan, the signed values scaled (`walks.extended`): a span's from none is its
     last less its entering one's decayed share, past float32's largest where every value is in it."""
     from dew.nn.kernels import rwkv4
 
