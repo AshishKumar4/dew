@@ -165,7 +165,7 @@ FED_ROWS, FED_WIDTH = 64, 128
 
 
 def _fed_products(p, x, *, interpret, consumers: int = 2, lo: int = 0, unrolled: bool = False,
-                  in_flight: int = 0, shared: bool = False, split: bool = False):
+                  in_flight: int = 0, shared: bool = False, split: bool = False, agreed: bool = True):
     """`p @ x` and `2 * p @ x` over `FED_STEPS` steps of 64 rows of `x` (`p`'s 64 columns a step), on
     warpgroup MMA without a producer (`mosaic_sm90.FED`): every consumer walks every step of one ring the
     first fills (`Family.fed`), each multiplying its share of the step's rows (two consumers: a 32-row
@@ -177,7 +177,8 @@ def _fed_products(p, x, *, interpret, consumers: int = 2, lo: int = 0, unrolled:
     `split`, its walk in segments of their own weights: an empty one, a first step's alone, a gap its next
     step falls in (walked by none), the rest past a boundary each consumer's own (a causal call's masked
     segment, which one consumer's keys end a step sooner in) at twice the weight (`_split_weights`), and an
-    empty one past the operands' blocks, which the interpreter's memory refuses a load of."""
+    empty one past the operands' blocks; its steps loaded as `walk_own` agrees them (`agreed`, else walked
+    directly)."""
     from dew.nn.kernels.templates import mosaic_sm90
     share = FED_ROWS // consumers
     family = bundles.named("mma.sync", jnp.bfloat16, None) if shared else mosaic_sm90.FED
@@ -213,8 +214,15 @@ def _fed_products(p, x, *, interpret, consumers: int = 2, lo: int = 0, unrolled:
             past = first + FED_STEPS + 3
             segments = ((step, first, first), (step, first, first + 1), (step, first + 2, middle),
                         (twice, middle, first + FED_STEPS), (step, past, past)) if split else whole
-            return family.walk(feed, segments, (), ((FED_ROWS, FED_WIDTH),), interpret, first=first,
-                               unrolled=unrolled, in_flight=in_flight)[1][0]
+            def walk(streams, lo, hi, start):
+                del lo, hi, start
+                return family.walk(streams, segments, (), ((FED_ROWS, FED_WIDTH),), interpret, first=first,
+                                   unrolled=unrolled, in_flight=in_flight)[1][0]
+
+            if shared and agreed:
+                streamed = (first, first + FED_STEPS)
+                return family.walk_own(feed, views, streamed, streamed, wg, walk)
+            return walk(feed, first, first + FED_STEPS, first)
 
         summed = family.scoped(walked, streams=allocated)
 
@@ -337,11 +345,13 @@ def test_consumers_feeding_their_own_ring_split_a_step_and_meet_before_the_store
 @INTERPRETS
 def test_two_mma_sync_consumers_walk_segments_whose_boundaries_differ_through_one_pipeline():
     """Interpreted: two mma.sync consumers sharing one pipeline walk segments from a step past 0 (empty ones,
-    one past the operands' blocks, a gap, and a boundary each consumer's own), as one pipeline over the
-    segments' steps alone, each its own segment's: exactly each segment's weighted products, no gap's or
-    empty segment's tile loaded (a pipeline of its own a segment met unpaired where their boundaries differ,
-    and hung; one over the walk's whole range loaded the gap's tiles and past the operands)."""
+    a gap, and a boundary each consumer's own), as one pipeline over the steps `walk_own` agrees, each
+    consumer's step its own segment's or none: exactly each segment's weighted products (a pipeline of its
+    own a segment met unpaired where their boundaries differ, and hung). Walked directly, several segments
+    are refused: the consumers' loads would follow segments each its own."""
     p, x = _fed_operands()
+    with pytest.raises(NotImplementedError, match="walk_own"):
+        _fed_products(p, x, interpret=INTERPRETED, consumers=2, lo=3, shared=True, split=True, agreed=False)
     got = _fed_products(p, x, interpret=INTERPRETED, consumers=2, lo=3, shared=True, split=True)
     summed = sum(weight * np.asarray(p, np.float32)[:, rows] @ np.asarray(x, np.float32)[rows]
                  for rows, weight in _split_weights(consumers=2))
