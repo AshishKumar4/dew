@@ -439,9 +439,9 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
         return carry
 
     def walk_own[R](self, streams, views: dict, own: tuple, streamed: tuple, wg,
-                    walk: Callable[..., R], *, between=None, counted=0) -> R:
+                    walk: Callable[..., R], *, between=None, counted=0, common: bool = False) -> R:
         # One role a core: no partner reads a step it passes, so it walks its own steps alone.
-        del views, wg, between
+        del views, wg, between, common
         lo, hi = own
         return walk(streams, lo, hi, streamed[0] - counted)
 

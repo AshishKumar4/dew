@@ -1489,18 +1489,18 @@ def test_a_pinned_rewalk_runs_whichever_of_its_tiles_the_pin_names(named):
         assert op.completed(ba, pinned) == pinned
 
 
-def _backward_call(shape, width: int, accurate: bool):
-    """A causal backward's op and bound arguments over `shape`'s operands, its heads `width` wide, with a
-    training forward's residuals."""
+def _backward_call(shape, width: int, accurate: bool, causal: bool = True):
+    """A causal backward's (a full one's, not `causal`) op and bound arguments over `shape`'s operands, its
+    heads `width` wide, with a training forward's residuals."""
     rows, tokens, heads, kv_heads = shape
-    spans = template.spans(tokens, tokens, rows, causal=True)
+    spans = template.spans(tokens, tokens, rows, causal=causal)
     query = jax.ShapeDtypeStruct((rows, tokens, heads, width), jnp.bfloat16)
     key = jax.ShapeDtypeStruct((rows, tokens, kv_heads, width), jnp.bfloat16)
     stats = jax.ShapeDtypeStruct((rows, heads, tokens), jnp.float32)
     residuals = (stats, stats, jax.ShapeDtypeStruct((rows, heads, tokens), jnp.int32),
                  template.Split(jax.ShapeDtypeStruct((rows, heads, tokens, width), jnp.float32), stats, stats,
                                 stats))
-    op = attention_mosaic.MosaicBackward(form="causal", keys=tokens, scale=width ** -0.5, accurate=accurate)
+    op = attention_mosaic.MosaicBackward(form=spans.form, keys=tokens, scale=width ** -0.5, accurate=accurate)
     return op, _bound(op, query, key, key, query, spans.start, spans.end, None, None, (), None, residuals)
 
 

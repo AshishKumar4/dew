@@ -41,6 +41,18 @@ def staged(family: mosaic.Family, value: jax.Array, buffers: Sequence[mosaic.Ref
     return Parts(refs, value.dtype)
 
 
+def staged_all(family: mosaic.Family,
+               operands: Sequence[tuple[jax.Array, Sequence[mosaic.Ref]]]) -> list["Parts"]:
+    """Each value of `operands` staged in shared memory as the parts its products take, one a buffer of its
+    `buffers` (`staged`'s), every part written in one batch (`Family.staged_all`: an mma.sync issuer's one
+    pair of barriers for all)."""
+    formed = [(product.formed(value, len(buffers)) if len(buffers) > 1 else (value,), buffers, value.dtype)
+              for value, buffers in operands]
+    family.staged_all([(part, buffer) for values, buffers, _ in formed
+                       for part, buffer in zip(values, buffers, strict=True)])
+    return [Parts(buffers, dtype) for _, buffers, dtype in formed]
+
+
 def _in_memory(x) -> bool:
     """Whether operand `x` is a tile in shared memory already (`Parts`, or one read transposed), which its
     product reads staging nothing."""
