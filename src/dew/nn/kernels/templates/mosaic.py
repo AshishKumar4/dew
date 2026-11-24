@@ -1629,6 +1629,12 @@ class Transport[Allocated, Opened](abc.ABC):
     """Whether its walks scope their streams apart, each in its own scope (`emit_pipeline`'s slots): a tile
     scoped after a walk then takes the larger of the two (`resources.shared_bytes`)."""
 
+    walks_streamed: bool = False
+    """Whether consumers holding their own blocks walk every streamed step together (`walk_own`'s), each
+    masking the steps outside its own: their per-step meets pair, so a sum across them after the walk
+    (`across.summed_across`) meets paired too. Where not, a consumer passes the steps outside its own
+    range (`passed`) and walks its own alone."""
+
     prefetches_fragments: bool = False
     """Whether its walk takes a step's `prefetch` (`walk`'s): the first fragments of a step's products read
     under the step before's last product, a step then given them and the boundary that reads the next's
@@ -2106,6 +2112,12 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
 
     consumers: int
     """The compute roles a program may take (sm90 two warpgroups, sm80 one)."""
+
+    @property
+    def shared_consumers(self) -> int:
+        """The most compute roles a launch may name (`consumers` where its derivation picks its own): a
+        cp.async family's two over one collective pipeline (`mosaic_sm80.CpAsync`), more than it derives."""
+        return self.consumers
 
     def for_generation(self, generation_name: str) -> "Family":
         """The bundle as a device of `generation_name` runs it (`bundles.groups`, its composition for that
