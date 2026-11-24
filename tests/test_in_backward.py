@@ -17,6 +17,7 @@ from dew.distributed.batches import shard_batch
 from dew.nn.backbones.layer_names import group_layers
 from dew.nn.kernels.generation import compile_only_gpus
 from dew.nn.kernels.options import program
+from dew.nn.precision import at_least_fp32
 from dew.objectives.base import Ratio
 from dew.objectives.lm import LMObjective
 from dew.optim import AdamW, OptimConfig, ParamGroup
@@ -623,18 +624,27 @@ class _Penalized(LMObjective):
         assert isinstance(stats, Ratio), type(stats)
         stacked = [leaf for path, leaf in jax.tree_util.tree_leaves_with_path(variables["params"])
                    if "layers" in jax.tree_util.keystr(path)]
-        penalty = sum(jnp.sum(jnp.square(leaf.astype(jnp.float32))) for leaf in stacked)
+        penalty = sum(jnp.sum(jnp.square(leaf.astype(at_least_fp32(leaf.dtype)))) for leaf in stacked)
         return Ratio(stats.total + 1e-3 * penalty * stats.mass, stats.mass), aux
 
 
 class _Branched(LMObjective):
-    """An LM whose loss runs its decoder in a branch its batch chooses (`jax.lax.cond`), the same call both
-    ways: a run read in a branch pools nothing in its backward (`Transaction._pools_once`)."""
+    """An LM whose loss runs its decoder in a branch its batch chooses (`jax.lax.cond`): a batch whose first
+    token is even is scored, an odd one's counted, its tokens' mass kept, the decoder never run, its loss
+    none. A run read in a branch pools nothing in its backward (`Transaction._pools_once`)."""
 
     def loss(self, variables, batch, step):
         def scored(held):
             return LMObjective.loss(self, held, batch, step)
-        return jax.lax.cond(batch["text"][0, 0] >= 0, scored, scored, variables)
+
+        stats, aux = jax.eval_shape(scored, variables)
+
+        def counted(held):
+            del held
+            mass = jnp.sum(batch["text"][:, 1:] != 0).astype(stats.mass.dtype)
+            return (Ratio(jnp.zeros(stats.total.shape, stats.total.dtype), mass),
+                    jax.tree.map(lambda shape: jnp.zeros(shape.shape, shape.dtype), aux))
+        return jax.lax.cond(batch["text"][0, 0] % 2 == 0, scored, counted, variables)
 
 
 class _Repeated(LMObjective):
@@ -736,12 +746,16 @@ def test_an_accumulating_scanned_step_matches_unrolled(dtype, clip, periodic, ob
         return run
 
     def draw(seed):
-        # Four batches of four rows, two updates of two batches each, a part of each batch two rows ending
-        # in padding of its own length, so no two parts count as many tokens.
+        # Four batches of four rows, two updates of two batches each, no token the padding one. Each batch
+        # splits into its even rows and its odd ones, the odd part's second row ending in padding of the
+        # batch's own length, so no two parts count as many tokens; each batch's first token even where it
+        # is the first of its update and odd where it is the second, so a branching loss takes both of its
+        # ways in one update.
         batches = []
         for at in range(4):
-            rows = token_rows(VOCAB, 4, SEQ + 1, seed=4 * seed + at)["text"]
-            rows[2:, SEQ + 1 - (at + 2):] = 0
+            rows = token_rows(VOCAB, 4, SEQ + 1, seed=4 * seed + at, low=1)["text"]
+            rows[3, SEQ + 1 - (at + 2):] = 0
+            rows[0, 0] = 2 if at % 2 == 0 else 1
             batches.append(rows)
         return np.stack(batches), np.int64(seed)
 

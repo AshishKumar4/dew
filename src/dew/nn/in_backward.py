@@ -64,9 +64,10 @@ class InBackward:
                      tuple[Tree, dict[str, Tree]]]
     moments: tuple[str, ...]
     handled: list[tuple[str, ...]] = dataclasses.field(default_factory=list)
-    pooling: bool = False
-    """Whether `update` pools each layer's gradient into a window's sum (`dew.training.transaction`): a run
-    whose layers draw dropout keys its masks as the ordinary scan does, and pools none."""
+    shapes: dict[tuple[str, ...], tuple[tuple[int, ...], ...]] = dataclasses.field(default_factory=dict)
+    """The shapes of what each run's call reads, by its path, as its trace sees them (`_registered`): under
+    a batching transform (`jax.vmap`) its lanes' axis hidden from them, which the call's program states,
+    one call standing for each lane's (`dew.training.transaction._pools_once`)."""
 
 
 _PLAN: contextvars.ContextVar[InBackward | None] = contextvars.ContextVar("dew_in_backward", default=None)
@@ -223,7 +224,6 @@ def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: 
     others none."""
     current = plan()
     assert current is not None, "a run updates in its backward only inside a step's plan"
-    current.handled.append(path)
     traced = _Traced()
     # What every layer reads crosses the rule as its arrays; its other leaves (a static field of the
     # attention metadata) are the rule's own.
@@ -328,5 +328,13 @@ def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: 
     # step's own trace the backward reads where it runs.
     updating = contracted("test_a_run_updating_in_its_backward_moves_as_its_step_would")(
         declared_derivative(Surrogate(), run, run_forward, run_backward))
-    return updating(weights, masters, dict(moments), norms, x, per_layer,
-                    tuple(arrays))
+    called = (weights, masters, dict(moments), norms, x, per_layer, tuple(arrays))
+    _registered(current, path, called)
+    return updating(*called)
+
+
+def _registered(current: InBackward, path: tuple[str, ...], called: tuple) -> None:
+    """Record a run's `path` as the model traces it in the plan (`InBackward.handled`), with the shapes of
+    what its call reads as the trace sees them (`InBackward.shapes`)."""
+    current.handled.append(path)
+    current.shapes[path] = tuple(jnp.shape(leaf) for leaf in jax.tree.leaves(called))
