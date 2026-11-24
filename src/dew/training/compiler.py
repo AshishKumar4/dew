@@ -61,6 +61,7 @@ from dew.training.memory import (
     memory_record,
     placed_beside,
     remat_admits,
+    remat_stated,
     remat_topmost,
     rung_record,
     step_fits,
@@ -1372,8 +1373,10 @@ class StepCompiler[L, E]:
             recorded = {**record(searched.rung, 'plan'), 'split': searched.split}
             source = "this process's search of the step"
         before = self.rung()
-        # Where the run was configured, before a record moves it: the ladder a frontier reads below its plan.
+        # Where the run was configured, before a record moves it: the ladder a frontier reads below its plan,
+        # and whether the run itself stated a remat policy (not one a saved plan climbed to).
         origin = Rung.of(self.objective, self._xla_defaults, self._narrow, self._ns_group)
+        stated = remat_stated(self.objective)
         if recorded is not None and not remat_admits(self.objective, record(recorded, 'plan'), self.remat):
             # A plan saved by a run of another policy (an ahead step's, a checkpoint's), which this one's
             # recomputation contradicts: searched afresh from where the run was configured.
@@ -1396,7 +1399,7 @@ class StepCompiler[L, E]:
             self.objective, mesh, self._xla_defaults, self._narrow, self._ns_group,
             None if self._base_rung is None
             else self._base_rung[1], resumed, remat=self.remat, ahead=self.ahead,
-            provisional=provisional, unplaced=unplaced)
+            provisional=provisional, stated_remat=stated, unplaced=unplaced)
         if search.provisional:
             # Its programs held until a plan is taken in its place, or its run abandons it, even where it
             # refuses (`Unplaced.release`, `dew.training.ahead.LaterPlans`).
