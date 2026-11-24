@@ -236,6 +236,10 @@ def _entering(summary: tuple, given, *, reverse: bool = False):
     through, written = lax.associative_scan(_composed, maps, axis=1, reverse=reverse)
     entered = added(multiplied(extended(given[:, None], 0), through), written)
     after = valued(chosen(cut_off(through), written, entered))
+    # A value entering that no float holds (an infinite state) decays to itself through any decay a cut does
+    # not end, as the walk carries it; the scaled algebra holds finite values alone.
+    lasting = ~jnp.isfinite(given[:, None]) & ~cut_off(through)
+    after = jnp.where(lasting, given[:, None] + valued(written), after)
     if reverse:
         return jnp.concatenate([after[:, 1:], given[:, None]], axis=1)
     return jnp.concatenate([given[:, None], after[:, :-1]], axis=1)
