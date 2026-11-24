@@ -1701,6 +1701,11 @@ def _holds_prologue(op: MosaicForward, args: tuple, residuals: Kept) -> bool:
     return holds(op) and (rare or holds(dataclasses.replace(op, scaled=True)))
 
 
+PRODUCER_FIRST = frozenset({"wgmma"})
+"""The families whose producer's layout the fused backward takes before its fed one where their consumers'
+registers are raised (`MosaicBackward._one_launch`): an H100's warpgroup MMA, measured (M-NA-8-gh200)."""
+
+
 @dataclasses.dataclass(frozen=True)
 class MosaicBackward(_Mainloop[BackwardTiles]):
     """The template's backward on this mainloop (`gradients`) over the call's own arrays (`backward` gives
@@ -2107,7 +2112,13 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # 5.54 full at Qwen3-8B's widths; at width 64, 64 x 64 on two consumers 0.47 ms against 128 x 64 on
         # one, 0.59): another layout than the dQ launch's, whose own fed layout the next launches name, and
         # at two consumers or more, one's softmax under the other's products, which one consumer has not.
-        for layout in (layout for layout in fed if layout.name != family.name):
+        # On an H100's warpgroup MMA, its producer's layout first, its consumers' registers raised past the
+        # producer's (`setmaxnreg`, honoured since post43, resources.RAISES_HONORED): M-NA-8-gh200
+        # 20261124T011529Z, the dK/dV launch 1.06 against the fed layout's 1.24 ms at width 64 and 1.86
+        # against 2.18 at 128 (Llama 3.2 1B's, Qwen3-8B's), 24/240 registers, spill-free; ET-FFED3's choice of
+        # the fed layout predates the raises.
+        producer = [family] if family.name in PRODUCER_FIRST and resources.RAISES_HONORED else []
+        for layout in (*producer, *(layout for layout in fed if layout.name != family.name)):
             def fed_fused(rows: int, walked: int, consumers: int, layout=layout) -> BackwardTiles:
                 return BackwardTiles(walked, rows, 2, consumers, fused=True, family=layout.name)
 
