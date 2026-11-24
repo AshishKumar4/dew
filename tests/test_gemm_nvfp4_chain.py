@@ -89,7 +89,7 @@ def test_a_delayed_nvfp4_chain_of_no_rows_or_a_scale_an_array_is_no_chain():
     activation's, is refused before any product (row 12721)."""
     from dew.nn.precision import DTYPE_PRESETS, LowPrecision, Numerics, projection_role
 
-    x, (up,), down, _ = _operands(12740, 128, False)
+    x, (up,), down, _ = _operands(12740, 128, gated=False)
     scales = _scales(x)
     empty = x[:0]
     delayed = Numerics(DTYPE_PRESETS["bf16-mixed"],
