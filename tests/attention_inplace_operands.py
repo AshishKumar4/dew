@@ -38,7 +38,7 @@ CALLS = {
     "shared-256": (256, 8, 4, TILES(64, 64, 2, 2, fused=True, family="wgmma.fed", shared_keys=True)),
 }
 """The one launch's forms on an H100, by head width: the queries-first launch at widths 64 and 128, on the
-fed layout and on its producer's (`attention_mosaic.PRODUCER_FIRST`), and the shared-keys launch at 256
+fed layout and on its producer's (`attention_mosaic.producer_raised`), and the shared-keys launch at 256
 (`MosaicBackward.derived`'s picks where it takes one launch), 8 query heads over 2 or 4 key heads, each
 pinned so the check holds wherever the derived default goes."""
 LENGTH = 1024
