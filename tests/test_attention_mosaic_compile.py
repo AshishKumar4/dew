@@ -2057,6 +2057,24 @@ def test_d128_fused_backward_deepens_to_3_stages_without_losing_residency(gen):
         found = compile_mosaic_kernels([case], gen)
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
+def test_an_h100s_fused_backward_takes_its_producers_layout():
+    """An H100's fast backward of a plain bf16 causal call 64 wide (Llama 3.2 1B's heads, 32 over 8, 4,096
+    tokens) derives its one launch queries first on the dQ launch's layout, whose producer gives its
+    consumers its registers (`attention_mosaic.producer_raised`: FlashAttention 3's 24/240), before the fed
+    layout whose consumers load their own rings (M-NA-8-gh200: 1.06 against 1.24 ms)."""
+    with generation.assumed("sm90"):
+        target = generation.gpu_target()
+        spans = template.spans(4096, 4096, 1, causal=True)
+        q = jax.ShapeDtypeStruct((1, 4096, 32, 64), jnp.bfloat16)
+        k = jax.ShapeDtypeStruct((1, 4096, 8, 64), jnp.bfloat16)
+        shapes = jax.tree.map(lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), _residuals(q.shape))
+        op, args = attention_mosaic._backward_call(q, k, k, spans, None, q, residuals=shapes, scale=None,
+                                                   natural=attention_mosaic.NATURAL, accurate=False)
+        derived = op.derived(op.bind(*args, interpret=False), target)
+    assert derived is not None and derived.fused and derived.queries_first, derived
+    assert derived.family == "wgmma", derived
+
+
 def test_overlapped_derived_weights_and_from_weights_match_derived_cotangents():
     """Row 5272: split `derived_weights` + `derived_from_weights` match `derived_cotangents` bit-for-bit
     (masked and unmasked), and `streamed_statistics(..., anchored=False)` excludes dead `chosen`."""
