@@ -352,14 +352,14 @@ def test_per_token_visibility_is_read_at_each_striped_querys_slot_through_the_ga
 def test_the_template_builds_no_mask_of_a_gathered_calls_visibility(name):
     """The template through the gather reads a call's per-token ids as its spans at each striped query's
     slot, so its program holds no `[rows, 1, queries, S]` mask at all, its shard's or the batch's (row
-    1495)."""
+    1495; a key length's `[rows, 1, 1, S]` is no query's)."""
     call = dict(GATHERED_VISIBLE[name], implementation="template")
     entry = with_gradients(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call))
     with jax.set_mesh(SPLIT.build()):
         program = jax.make_jaxpr(entry)(*_gathered_draw(0))
     masks = [var.aval.shape for var in _variables(program.jaxpr)
              if var.aval.dtype == jnp.bool_ and len(var.aval.shape) == 4 and var.aval.shape[1] == 1
-             and var.aval.shape[-1] == SEQ_LEN]
+             and var.aval.shape[2] > 1 and var.aval.shape[-1] == SEQ_LEN]
     assert not masks, masks
 
 
