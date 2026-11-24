@@ -1463,11 +1463,14 @@ def mxfp8_product(lhs: MxFp8, matrices: MxFp8, group_blocks: jax.Array, *, out_d
     the decoded operands' product in XLA. `gather`, int32 `[rows]`, makes the rows `lhs`'s rows at its entries
     (`gemm`'s `gather`, a mixture of experts' tokens): their codes read where they lie, their scales by the
     same table (`_block_scaled`)."""
-    return _block_scaled(lhs, matrices, group_blocks, MXFP8, interpret_on_cpu, gather).astype(out_dtype)
+    (summed,) = _block_scaled(lhs, matrices, group_blocks, MXFP8, interpret_on_cpu, gather)
+    return summed.astype(out_dtype)
 
 
 def _block_scaled(lhs, matrices, group_blocks: jax.Array, op: selection.Op, interpret: bool,
-                  gather: jax.Array | None = None, *, finishing: tuple | None = None):
+                  gather: jax.Array | None = None, *, epilogue: Callable | None = None, sides: tuple = (),
+                  side_axes: tuple = (), dtypes: tuple = (jnp.dtype(jnp.float32),),
+                  out_forms: tuple | None = None, dense: bool = False) -> tuple[jax.Array, ...]:
     """A block-scaled grouped product summed in fp32 (`mxfp8_product`'s, `nvfp4_block_product`'s): `op`
     selects the template on Blackwell's block-scaled tensor cores (`mosaic_gpu.gmm`'s `mx_scales`, the
     operands' `codes` and their block `scales`, `product.block_format`'s) where named and planned, else
@@ -1475,21 +1478,20 @@ def _block_scaled(lhs, matrices, group_blocks: jax.Array, op: selection.Op, inte
     are exact) summed as XLA sums fp32 products. Gathered rows (`gather`) are the template's gather
     (tcgen05's load warp's, row 1376) and their block scales the same table's rows of `lhs.scales`, gathered
     as every call's scales are laid out anew for the products (`mosaic_sm100.scales_tiled`), a sixteenth or a
-    thirty-second of the rows' bytes (row 4851). With `finishing` (`(epilogue, sides, side_axes, dtypes,
-    out_forms, dense)`), its outputs, a tuple, through the launch's `epilogue` of its side operands
-    (`nvfp4_block_finished`), XLA's the same function of its sums (`_finished`)."""
+    thirty-second of the rows' bytes (row 4851). Its outputs a tuple: the sums alone, or with `epilogue`
+    its outputs in `dtypes` and `out_forms` through the launch's epilogue of its `sides` (each at its
+    `side_axes`; `nvfp4_block_finished`), XLA's the same function of its sums (`_finished`)."""
     from dew.nn.kernels.templates import mosaic_sm100
 
     from .templates.gemm import quantized
 
     launch = grouped_matmul.MosaicMxGmm()
     tables = (() if gather is None else (gather,))
-    epilogue, sides, side_axes, dtypes, out_forms, dense = finishing or (None, (), (), (), None, False)
     out_forms = quantized.forms_of(out_forms, len(dtypes)) or None
     hooks = NO_HOOKS if epilogue is None else Hooks(
         epilogue=epilogue, epilogue_axes=side_axes, out_dtypes=tuple(dtype.name for dtype in dtypes),
         out_forms=out_forms)
-    stored = 'float32' if epilogue is None else dtypes[0].name
+    stored = dtypes[0].name
     # Gathered rows' block scales are the same table's rows of the rows' scales, laid out for the products:
     # planned from `mosaic_sm100.scale_tiles` alone so gathers and tiling run only in the chosen branch.
     rows_count = lhs.scales.shape[0] if gather is None else gather.shape[0]
@@ -1517,7 +1519,7 @@ def _block_scaled(lhs, matrices, group_blocks: jax.Array, op: selection.Op, inte
         summed = xla_products.xla_ragged_dot(values, jnp.swapaxes(mat_val, 1, 2), sizes,
                                              precision=jax.lax.Precision.DEFAULT,
                                              preferred_element_type=jnp.float32)
-        return summed if epilogue is None else _finished(summed, side_args, epilogue, dtypes, out_forms)
+        return _finished(summed, side_args, epilogue, dtypes, out_forms)
 
     def mosaic(lhs_codes, lhs_scales, mat_codes, mat_scales, group_blocks, *rest, interpret):
         gather_arg, side_args = rest[:len(tables)], rest[len(tables):]
@@ -1526,7 +1528,7 @@ def _block_scaled(lhs, matrices, group_blocks: jax.Array, op: selection.Op, inte
         scales = (mosaic_sm100.scales_tiled(rows_sc), mosaic_sm100.scales_tiled(mat_scales))
         out = launch(lhs_codes, mat_codes, sizes, (), side_args, None, None, *gather_arg, out_dtype=stored,
                      trans_rhs=True, interpret=interpret, scales=scales, hooks=hooks, dense=dense)
-        return out if epilogue is None else tuple(out)
+        return (out,) if epilogue is None else tuple(out)
 
     operands = (lhs.codes, lhs.scales, matrices.codes, matrices.scales, group_blocks, *tables, *sides)
     if selection.select(op, ScaledCase(tile)).kernel != 'mosaic':
@@ -1548,7 +1550,7 @@ def nvfp4_block_product(lhs: NvFp4Block, matrices: NvFp4Block, group_blocks: jax
     (`NVFP4_BLOCK_OP`) runs the template on Blackwell's block-scaled tensor cores where named
     (`mosaic_gpu.gmm`'s `mx_scales`, `kind::mxf4nvf4`), else the decoded operands' product in XLA; `gather`
     as `mxfp8_product`'s."""
-    summed = _block_scaled(lhs, matrices, group_blocks, NVFP4_BLOCK_OP, interpret_on_cpu, gather)
+    (summed,) = _block_scaled(lhs, matrices, group_blocks, NVFP4_BLOCK_OP, interpret_on_cpu, gather)
     return twice_scaled(summed, lhs.scale, matrices.scale).astype(out_dtype)
 
 
@@ -1577,9 +1579,10 @@ def nvfp4_block_finished(lhs: NvFp4Block, matrices: NvFp4Block, group_blocks: ja
         return epilogue(twice_scaled(acc, *wide[:2]), *held, *wide[2:])
 
     side_axes = (LAUNCH_AXES['epilogue'],) * len(tiles) + (('rows',),) * len(vectors)
-    return _block_scaled(lhs, matrices, group_blocks, NVFP4_BLOCK_OP, interpret_on_cpu, finishing=(
-        scaled, (*tiles, *vectors), side_axes, tuple(jnp.dtype(dtype) for dtype in out_dtypes), out_forms,
-        dense))
+    return _block_scaled(lhs, matrices, group_blocks, NVFP4_BLOCK_OP, interpret_on_cpu, epilogue=scaled,
+                         sides=(*tiles, *vectors), side_axes=side_axes,
+                         dtypes=tuple(jnp.dtype(dtype) for dtype in out_dtypes), out_forms=out_forms,
+                         dense=dense)
 
 
 def nvfp4_quantized_product(lhs: jax.Array, matrix: NvFp4, *, out_dtype,

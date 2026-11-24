@@ -67,7 +67,7 @@ def _block_max(acc: jax.Array, block: int) -> jax.Array:
     return peaks
 
 
-def _block_ids(shape: tuple[int, int], block: int) -> jax.Array:
+def _block_ids(shape: tuple[int, ...], block: int) -> jax.Array:
     """Each column's `block`-column group (`block` a power of two) of a tile of `shape`: its column's iota
     shifted, as a warpgroup's accumulator layouts lower it."""
     return jax.lax.broadcasted_iota(jnp.int32, shape, 1) >> jnp.int32(block.bit_length() - 1)
@@ -94,7 +94,7 @@ def _divided(numerator: jax.Array, denominator: jax.Array | float) -> jax.Array:
 
     layout = _EPILOGUE_LAYOUT.get() if launches.interpreting() is False else None
     if layout is None:
-        return lowered_divide(numerator, denominator, jnp.int32(0))
+        return lowered_divide(numerator, jnp.asarray(denominator, jnp.float32), jnp.int32(0))
     return inline_forms.quotients(numerator, denominator, layout)
 
 
@@ -217,7 +217,7 @@ def nvfp4_epilogue(activation=None, out_dtype=jnp.bfloat16):
 
     def quantized(acc, *sides):
         *tiles, tensor_scale = sides
-        rounded, next_rows = _activated(acc, tiles, activation, out_dtype)
+        rounded, next_rows = _activated(acc, tuple(tiles), activation, out_dtype)
         return rounded, *_nvfp4_quantize_epilogue(next_rows, tensor_scale)
 
     return quantized
