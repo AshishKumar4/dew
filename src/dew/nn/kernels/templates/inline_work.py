@@ -421,7 +421,9 @@ class _Lanes:
         raise Uncounted(f"no rule counts {name}")
 
 
-_PTX_FLOAT = ("fma.", "mul.", "add.", "sub.", "max.", "min.", "neg.", "abs.")
+# A correctly rounded division (`div.rn.f32`, `inline_forms.quotients`) one float operation, as `emission`
+# counts `precision.correctly_rounded_divide`'s.
+_PTX_FLOAT = ("fma.", "mul.", "add.", "sub.", "max.", "min.", "neg.", "abs.", "div.")
 _PTX_SPECIAL = ("ex2.", "lg2.", "rcp.", "rsqrt.", "sqrt.", "tanh.", "sin.", "cos.")
 _PTX_FREE = ("shfl.", "mov.", "setp.", "selp.", "bar.", "barrier.", "fence.", "membar.", "elect.", "vote.",
              "activemask.", "mbarrier.", "cp.async.commit_group", "cp.async.wait_group", "cp.async.wait_all",
