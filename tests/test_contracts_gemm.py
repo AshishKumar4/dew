@@ -292,12 +292,9 @@ def test_an_nvfp4_products_kernels_hold_every_order(edge, kernel="xla"):
     e2m1 = np.asarray([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
     magnitudes = np.where(codes >= 8, -1.0, 1.0) * e2m1[codes & 7]
     exponents = np.random.default_rng(3622).integers(-2, 3, size=(16, 64))
-    # Packed and decoded on the host: a GPU tier part's prepare runs this cell where its device computes
-    # nothing (the H100 and A100 flows' packed cells were deferred so, its device holding no array).
-    with jax.default_device(jax.devices("cpu")[0]):
-        matrix = formats.NvFp4.of(magnitudes.astype(np.float32),
-                                  np.exp2(exponents).astype(jnp.float8_e4m3fn), 0.5)
-        values = np.asarray(matrix.decoded().astype(jnp.float32) * matrix.factor)
+    block = jnp.asarray(np.exp2(exponents), jnp.float8_e4m3fn)
+    matrix = formats.NvFp4.of(jnp.asarray(magnitudes, jnp.float32), block, 0.5)
+    values = matrix.decoded().astype(jnp.float32) * matrix.factor
     primals = normal_draw(3623, (64, 256), scale=EDGES[edge])
     direction = normal_draw(3624, (64, 256), scale=EDGES[edge])
     (cotangent,) = normal_draw(3625, (64, 64))
