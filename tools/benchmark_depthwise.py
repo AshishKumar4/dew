@@ -169,7 +169,7 @@ def checkpoint(args):
     from dew.nn.autoencoders.kl import AutoencoderKL
     from dew.nn.autoencoders.sd_vae import StableDiffusionVAE
 
-    pipeline = dew.pipeline('dewml/hybrid-dit-176m', revision='972a6dbbf501a75b8ed0622590ce9233a2ada40d')
+    pipeline = dew.pipeline('dewml/hybrid-dit-176m', revision='a8da69cf12f2dc26464b72d609548cbd2c514b0a')
     vae = pipeline.autoencoder if isinstance(pipeline, TextToImage) else None
     if not isinstance(pipeline, TextToImage) or not isinstance(vae, StableDiffusionVAE) or not isinstance(
             vae.model, AutoencoderKL):
