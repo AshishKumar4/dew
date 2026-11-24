@@ -1606,10 +1606,11 @@ def test_the_portable_maths_products_state_ieee_float32_as_a_gpu_runs_them(hooks
 
 
 def test_a_decoder_of_equal_gated_delta_net_layers_traces_the_portable_walk_once():
-    """A Qwen3.5 toy decoder (tests/architecture_cases.py's, three equal gated delta net layers) traced for
-    its training step on the portable math: each layer's walk the one trace (`_walk_once`: the forms its
-    facts derive once, the walk one jitted function), where every layer derived its forms and traced its walk
-    again, 0.65 s a layer (a 4B decoder's plan spent 70 s of its trace there, row 5556)."""
+    """A Qwen3.5 toy decoder (tests/architecture_cases.py's, three equal gated delta net layers) traced
+    unrolled (`layer_scan='plain'`) for its training step on the portable math: each layer's walk the one
+    trace (`_walk_once`: the forms its facts derive once, the walk one jitted function), where every layer
+    derived its forms and traced its walk again, 0.65 s a layer (a 4B decoder's plan spent 70 s of its trace
+    there, row 5556)."""
     model = tiny_models.build_model("causal_transformer+qwen35", dtype="float32")
     tokens = jnp.arange(2 * 16, dtype=jnp.int32).reshape(2, 16) % 16
     params = nn.unbox(model.init(jax.random.key(0), tokens))["params"]
@@ -1617,7 +1618,7 @@ def test_a_decoder_of_equal_gated_delta_net_layers_traces_the_portable_walk_once
     def loss(params):
         return jnp.sum(model.apply({"params": params}, tokens).astype(jnp.float32))
 
-    with generation.chosen(gated_delta_rule='xla'):
+    with generation.chosen(gated_delta_rule='xla', layer_scan='plain'):
         graph = jax.make_jaxpr(jax.grad(loss))(params)
     # Each of the walk's traces (the step's forward, and the one its linearization takes) the three layers'.
     layers = collections.Counter(id(equation.params["jaxpr"]) for equation in equations(graph)

@@ -12,6 +12,7 @@ from flax import linen as nn
 
 from dew.mesh import LayoutRefused
 
+from ..dense import captures_any_method
 from ..host_memory import on_host
 from ..hyper_connections import Carried
 from ..precision import at_least_fp32
@@ -117,6 +118,16 @@ def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer
             raise LayoutRefused(f"a loop over layers {span} runs part of the stack, and a store banked "
                                 f"by run holds whole runs; {list(banked)} arrived banked")
         groups, periods = one_stage_runs(decoder, first, end, banked=bool(banked))
+        if not any(count > 1 for _, count in groups) or (
+                not banked and 'streaming' not in decoder.variables and captures_any_method(decoder)):
+            # No run scans, or a capture of any method keeps what no scan stacks (a method's non-array
+            # return): run each layer directly, without probing a scan carry dtype.
+            return run_stack(
+                decoder.layers, decoder.block, decoder.specs,
+                tuple((index, 1) for index in range(first, end)), x,
+                train=train, decode=decode, kv_store={} if decoder.provides else None,
+                per_layer_input=per_layer_input, attention_metadata=attention_metadata,
+                prior_bank=prior_bank)
         view, split = (StackView(groups, banked=banked, periods=periods),
                        StageSplit(0, decoder.num_layers, 0))
     else:
@@ -126,7 +137,7 @@ def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer
         view, split = pipelined(decoder, x, stages, decode=decode, banked=banked, span=span)
     dtype = decoder.residual_dtype(
         x, train=train, decode=decode, per_layer_input=per_layer_input,
-        attention_metadata=attention_metadata)
+        attention_metadata=attention_metadata, first=first)
     # A carried collapse stays fp32, as the reference keeps it.
     x = x._replace(streams=x.streams.astype(dtype)) if isinstance(x, Carried) else x.astype(dtype)
     run = nn.map_variables(stacked, mapped_collections=True, trans_in_fn=view.stack,

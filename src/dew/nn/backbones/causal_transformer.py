@@ -1499,29 +1499,30 @@ class CausalTransformer(LinearProducts):
         return banked_collections(self.groups, self.variables)
 
     def residual_dtype(self, x, *, train: bool, decode: bool, per_layer_input,
-                       attention_metadata=None) -> jnp.dtype:
-        """Return the dtype the residual stream settles in: `x`'s promoted with the first layer's output.
+                       attention_metadata=None, first: int = 0) -> jnp.dtype:
+        """Return the dtype the residual stream settles in: `x`'s promoted with layer `first`'s output.
 
         A scan carries one dtype through, and each pipeline stage takes the
         dtype the stage before returns. Under a bf16 policy the dense
-        feed-forward returns fp32, so the loops use fp32 from the start. The
-        first layer runs abstractly in its own scope (a placeholder 'params'
-        key, which flax draws any other stream from), with the collections the
-        call opened open and no other, so it takes the call's own path: opened
-        beyond them, an attention sowing its QK-Clip maxima decided a kernel
-        for a mask the call never builds (a cache made under a chosen template
-        refused, row 4101). A banked store answers from its first bank's first
-        row without fetching it.
+        feed-forward returns fp32, so the loops use fp32 from the start. Layer
+        `first` (the span's first layer, whose cache a loop's `PassView` exposes
+        where earlier layers' are hidden) runs abstractly in its own scope (a
+        placeholder 'params' key, which flax draws any other stream from), with
+        the collections the call opened open and no other, so it takes the
+        call's own path: opened beyond them, an attention sowing its QK-Clip
+        maxima decided a kernel for a mask the call never builds (a cache made
+        under a chosen template refused, row 4101). A banked store answers from
+        its bank's first row without fetching it.
         """
-        layer = self.layers[0]
+        layer = self.layers[first]
         streams = x.streams if isinstance(x, Carried) else x
         assert self.scope is not None, "a bound decoder's stack"
         opened = self.scope.mutable
         output = jax.eval_shape(lambda held: layer.apply(
             held, x, mutable=opened, rngs={'params': jax.random.key(0)},
             train=train, decode=decode, kv_store={} if self.provides else None,
-            per_layer_input=None if per_layer_input is None else per_layer_input.layer(0),
-            attention_metadata=attention_metadata), self.first_layer_shapes())
+            per_layer_input=None if per_layer_input is None else per_layer_input.layer(first),
+            attention_metadata=attention_metadata), self._layer_shapes_at(first))
         output = output if opened is False else output[0]
         output = output.streams if isinstance(output, Carried) else output
         return jnp.result_type(streams.dtype, output.dtype)
@@ -1539,11 +1540,19 @@ class CausalTransformer(LinearProducts):
         row of the run that holds the layer (`StackView.stage_form`), on one
         stage too. Nothing is read, fetched or sliced.
         """
+        return self._layer_shapes_at(self.groups[run][0], run=run)
+
+    def _layer_shapes_at(self, index: int, *, run: int | None = None) -> dict:
+        """Layer `index`'s stored variables as shape/dtype structs (`layer_shapes`), skipping captured
+        intermediates, which are outputs a layer never reads (and may hold non-array returns, row 11882)."""
+        if run is None:
+            run = next(position for position, (start, count) in enumerate(self.groups)
+                       if start <= index < start + count)
         banked = self.banked_collections()
-        start, count = self.groups[run]
-        first = StackView(self.groups).bank_names()[run]
-        layer = f'layers_{start}'
-        reader = self.variables.get('streaming', {}).get(first, {}).get('bank')
+        _, count = self.groups[run]
+        bank = StackView(self.groups).bank_names()[run]
+        layer = f'layers_{index}'
+        reader = self.variables.get('streaming', {}).get(bank, {}).get('bank')
         if reader is not None:
             return reader.shapes()
         stacked = count > 1
@@ -1553,15 +1562,17 @@ class CausalTransformer(LinearProducts):
 
         variables = {}
         for collection, tree in self.variables.items():
+            if collection == _INTERMEDIATES:
+                continue
             if collection in banked:
                 # A banked cache holds no entry for a layer that caches nothing.
-                if first in tree:
+                if bank in tree:
                     variables[collection] = jax.tree.map(
-                        functools.partial(shapes, drop=stacked), tree[first])
+                        functools.partial(shapes, drop=stacked), tree[bank])
                 continue
             held = {}
-            if stacked and first in tree:
-                held = jax.tree.map(functools.partial(shapes, drop=True), tree[first])
+            if stacked and bank in tree:
+                held = jax.tree.map(functools.partial(shapes, drop=True), tree[bank])
             if layer in tree:
                 held = merge(held, jax.tree.map(functools.partial(shapes, drop=False), tree[layer]))
             for name, stage in tree.get('stages', {}).items():
@@ -1569,11 +1580,11 @@ class CausalTransformer(LinearProducts):
                 # A run that holds the layer: a one-stage run its group stacks, beside the leaves its
                 # stage-local state keeps on the layer itself (a frozen base joined in), or a pipeline's run
                 # where no such layer runs before it.
-                if layers is not None and layers.start == start and (stacked or layer not in tree):
+                if layers is not None and layers.start == index and (stacked or layer not in tree):
                     # The stage axis, a run's own layer axis; a periodic run's first layer at its first
                     # position.
                     rows = 1 + (len(layers) > 1)
-                    if run_period(self.scan_keys, start, len(layers)) > 1:
+                    if run_period(self.scan_keys, index, len(layers)) > 1:
                         stage, rows = stage['layers_0'], 2
                     held = merge(held, jax.tree.map(
                         lambda leaf, rows=rows: jax.ShapeDtypeStruct(leaf.shape[rows:], leaf.dtype), stage))

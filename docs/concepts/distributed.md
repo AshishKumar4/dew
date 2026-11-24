@@ -280,7 +280,7 @@ h100s = MeshSpec(fsdp=8).build(compile_only_gpus("sm90", 8, 80 * 10**9))
 trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(lr=1e-3), key=0, mesh=h100s,
                   accumulation=4)
 report = trainer.validate({"text": rows}, steps=400)
-print(report.leaves["variables/params/layers_0/mlp/up_proj/kernel"])
+print(report.leaves["variables/params/stages/layers_0_1/mlp/up_proj/kernel"])
 print(max(report.device_bytes.values()), "bytes on the fullest device")
 print(report.batch_axes, report.collectives, report.unbound)
 ```
