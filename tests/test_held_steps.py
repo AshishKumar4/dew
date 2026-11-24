@@ -154,12 +154,13 @@ def test_a_placed_steps_compile_limit_gives_back_the_state_it_reuses():
     assert target + (1 << 27) < argument + beside + ahead.temp_bytes, ahead
     # Compiled cold, so its limit stops a compile that misses (`uncached`).
     with uncached():
-        trainer = built(MeshSpec())
+        # On this device alone, its room and its filler alike, whatever devices the worker holds.
+        trainer = built(MeshSpec().build([device]))
         state, _, _ = trainer.place()
         batch = shard_batch(trainer.device_mesh, rows)
         room = step_room(device)
         assert room is not None and room > target, (room, target)
-        filler = [jnp.zeros((1 << 24,), jnp.float32) for _ in range((room - target) >> 26)]
+        filler = [jnp.zeros((1 << 24,), jnp.float32, device=device) for _ in range((room - target) >> 26)]
         filled = step_room(device)
         assert filled is not None and target <= filled < target + (1 << 27), (target, filled)
         step = trainer.compile(state, batch)
