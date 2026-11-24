@@ -58,7 +58,11 @@ PRECISION = exact_float32(None)
 """The einsums' in float32: fp32 products at fp32 (`exact_float32`), as the reference's own contractions."""
 
 LEAST = jnp.iinfo(jnp.int32).min // 4
-"""An exponent beneath every float's, a zero's in a largest (`_held`, `_value`)."""
+"""An exponent beneath every float's: a zero part's in the plain landing's join (`_sum`)."""
+
+FLOOR = jnp.iinfo(jnp.int32).min
+"""Where no value is (a maximum's identity, read beside a flag of presence, never as an exponent: `_held`'s,
+`_banded`'s)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -122,17 +126,15 @@ def _held(form: Form, group: tuple[Factor, ...], arrays: Sequence[jax.Array], dt
     significand = jnp.broadcast_to(significand, jnp.broadcast_shapes(significand.shape, jnp.shape(exponent)))
     summed = tuple(axis for axis, letter in enumerate(letters) if letter not in form.out)
     live = (significand != 0) & jnp.isfinite(significand)
-    largest = jnp.max(jnp.where(live, exponent, LEAST), axis=summed, keepdims=True, initial=LEAST)
-    largest = jnp.where(largest == LEAST, 0, largest)
+    # Presence its own flag: an exponent operand's exponent may lie anywhere an int32 does.
+    largest = jnp.max(jnp.where(live, exponent, FLOOR), axis=summed, keepdims=True, initial=FLOOR)
+    largest = jnp.where(jnp.any(live, axis=summed, keepdims=True), largest, 0)
     return letters, significand, jnp.where(live, exponent - largest, 0), jnp.squeeze(largest, summed)
 
 
 WINDOW = 24
 """The binades a window of the banded sum spans (`_banded`): fp32's significand, so a sum within it lies in
 `[2^-23, 2)` of its top, its least bit at least `2^-46`, two exact limbs of `UNIT`."""
-
-FLOOR = jnp.iinfo(jnp.int32).min
-"""Where no sum is (`_banded`'s maximum's identity, read beside a flag of presence, never as an exponent)."""
 
 UNIT = 2 ** 23
 """The base of a window's exact limbs (`_banded`): fp32's fraction bits, so a sum within the window splits
