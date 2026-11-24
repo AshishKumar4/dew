@@ -1465,3 +1465,43 @@ def test_an_adapted_products_backward_keeps_fp32_products_whole_under_any_preset
         if own is None or own.digits >= 24:
             assert kept is preset, (preset, kept)
 
+
+
+def test_a_paired_epilogues_kept_roundings_are_its_backwards_accumulators_and_it_recomputes_no_pair():
+    """A paired product (a MoE's gate and up) whose epilogue rounds each accumulator to bf16 and returns both
+    roundings beside SwiGLU of them, the roundings named (`gemm`'s `named`, a remat policy saving them): its
+    reverse pass reads its accumulators from those kept outputs (`gemm._rounded_accumulators`) and
+    computes the pair no second time, one product fewer than the same call unnamed, its gradients bitwise
+    the unnamed call's (each accumulator read through its rounding alone, row 1376)."""
+    rng = np.random.default_rng(1376)
+    sizes = jnp.asarray([70, 0, 58], jnp.int32)
+    x = jnp.asarray(rng.integers(-3, 4, size=(128, 128)), jnp.bfloat16)
+    gate, up = (jnp.asarray(rng.integers(-3, 4, size=(3, 128, 64)), jnp.bfloat16) for _ in range(2))
+
+    def swiglu(gate_acc, up_acc):
+        gate_rows, up_rows = gate_acc.astype(jnp.bfloat16), up_acc.astype(jnp.bfloat16)
+        hidden = jax.nn.silu(gate_rows.astype(jnp.float32)) * up_rows.astype(jnp.float32)
+        return hidden.astype(jnp.bfloat16), gate_rows, up_rows
+
+    def gradient(names):
+        def loss(x, gate, up):
+            hidden, _, _ = gemm.gemm(x, gate, sizes, paired=up, epilogue=swiglu,
+                                     out_dtypes=(jnp.bfloat16,) * 3, named=names, interpret_on_cpu=True)
+            return jnp.sum(hidden.astype(jnp.float32))
+        policy = jax.checkpoint_policies.save_only_these_names("gate_proj", "up_proj")
+        return jax.grad(jax.checkpoint(loss, policy=policy), argnums=(0, 1, 2))
+
+    def products(jaxpr) -> int:
+        from dew.nn import programs
+
+        return sum(eqn.primitive.name in {"dot_general", "ragged_dot_general", "pallas_call"}
+                   for eqn in programs.equations(jaxpr))
+
+    kept, unnamed = (None, "gate_proj", "up_proj"), (None, None, None)
+    with generation.assumed("sm90"):
+        named_count, unnamed_count = (products(jax.make_jaxpr(gradient(names))(x, gate, up).jaxpr)
+                                      for names in (kept, unnamed))
+        got, expected = (gradient(names)(x, gate, up) for names in (kept, unnamed))
+    assert named_count < unnamed_count, (named_count, unnamed_count)
+    for g, e in zip(got, expected, strict=True):
+        np.testing.assert_array_equal(np.asarray(g).view(np.uint16), np.asarray(e).view(np.uint16))

@@ -1686,13 +1686,13 @@ def _cotangents(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, pr
                 plain: dict, saved: dict | None = None, scatter=None) -> tuple[tuple, tuple, tuple]:
     """Each accumulator's cotangent (one a matrix of `matrices`: the product's, and its `paired`'s), the
     epilogue side operands' and whether each accumulator's passes an output's through in `compute`'s dtype
-    (`_passes_cotangent`): the outputs' own without an epilogue (None for an output no reverse pass
-    reaches), else through the VJP of the epilogue's outputs that have a cotangent, at the accumulators
-    recomputed at their own width, where that VJP reads them (from `lhs`'s rows at `plain`'s `gather`, a
-    gathered product's), or read from the forward's named output `saved` holds where the epilogue reads its
-    accumulator through that output's rounding alone (`_rounded_accumulator`). An output no reverse pass
-    reaches is no part of the VJP, so an output formed for a product of its own (`gemm`'s `applied`)
-    recomputes nothing."""
+    (`_passes_cotangent`): the outputs' own without an epilogue (None for an output no reverse pass reaches),
+    else through the VJP of the epilogue's outputs that have a cotangent, at the accumulators recomputed at
+    their own width, where that VJP reads them (from `lhs`'s rows at `plain`'s `gather`, a gathered
+    product's), or read from the forward's named output `saved` holds where the epilogue reads its
+    accumulator through that output's rounding alone (`_rounded_accumulators`, a pair's alike). An output no
+    reverse pass reaches is no part of the VJP, so an output formed for a product of its own (`gemm`'s
+    `applied`) recomputes nothing."""
     count = len(matrices)
     if epilogue is None:
         d_accs = tuple(cotangents[:count])
@@ -1726,11 +1726,11 @@ def _cotangents(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, pr
     acc = jax.eval_shape(zero)
     # The epilogue's VJP, traced once, its accumulators' reads and pass-through cotangents read from it.
     vjp = _epilogue_vjp(kept, count, acc, sides)
-    rounded = _rounded_accumulator(saved or {}, count, epilogue, acc, sides)
+    rounded = _rounded_accumulators(saved or {}, count, epilogue, acc, sides)
     if rounded is not None and _reads_accumulators(vjp, count):
-        # The epilogue reads its accumulator through its rounding alone, which the forward kept under its
-        # name: its VJP at that rounding widened is its VJP at the accumulator (`_rounded_accumulator`).
-        accs = (rounded.astype(acc.dtype),)
+        # The epilogue reads its accumulators through their roundings alone, which the forward kept under
+        # their names: its VJP at them widened is its VJP at the accumulators (`_rounded_accumulators`).
+        accs = tuple(each.astype(acc.dtype) for each in rounded)
     elif _reads_accumulators(vjp, count):
         accs = _as_tuple(_gemm(lhs, matrices[0], group_sizes, prologue, prologue_arrays, prologue_axes, None,
                                (), (), (acc.dtype,) * count, several=count > 1,
@@ -2304,18 +2304,21 @@ def _as_cotangent(cotangent, operand):
     return cotangent if cotangent.dtype == jax.dtypes.float0 else cotangent.astype(operand.dtype)
 
 
-def _rounded_accumulator(kept: dict, count: int, epilogue, acc, sides) -> jax.Array | None:
-    """The forward's kept output (`gemm`'s `named`, by its place among the outputs) that is the epilogue's
-    one accumulator rounded to its dtype, where the epilogue reads that accumulator through the rounding
-    alone (one conversion, which is that output): every value the epilogue computes reads the rounding,
-    so its VJP at the rounding widened back is its VJP at the accumulator, exactly (a rounding to a narrower
-    dtype widened and rounded again is itself). None elsewhere (no output kept, a paired product's two
-    accumulators, an epilogue reading the accumulator otherwise)."""
-    if not kept or count != 1:
+def _rounded_accumulators(kept: dict, count: int, epilogue, acc, sides) -> tuple | None:
+    """The forward's kept outputs (`gemm`'s `named`, by their places among the outputs) that are the
+    epilogue's `count` accumulators each rounded to its dtype, where the epilogue reads each through its
+    rounding alone (one conversion, which is that output): every value the epilogue computes reads the
+    roundings, so its VJP at them widened back is its VJP at the accumulators, exactly (a rounding to a
+    narrower dtype widened and rounded again is itself). A paired product's two alike (a MoE's gate and up,
+    their activation in the epilogue, each kept: its backward reads them, the pair not recomputed, row
+    1376). None elsewhere (an accumulator's rounding not kept, an epilogue reading one otherwise)."""
+    if not kept:
         return None
-    jaxpr = jax.make_jaxpr(lambda acc, *sides: _tupled(epilogue, acc, *sides))(acc, *sides).jaxpr
-    rounded = _rounding(jaxpr, jaxpr.invars[0])
-    return next((value for at, value in kept.items() if jaxpr.outvars[at] is rounded), None)
+    jaxpr = jax.make_jaxpr(lambda *values: _tupled(epilogue, *values))(*(acc,) * count, *sides).jaxpr
+    roundings = [_rounding(jaxpr, var) for var in jaxpr.invars[:count]]
+    found = [next((value for at, value in kept.items() if jaxpr.outvars[at] is rounded), None)
+             if rounded is not None else None for rounded in roundings]
+    return None if any(value is None for value in found) else tuple(found)
 
 
 def _rounding(jaxpr, var):
