@@ -16,7 +16,7 @@ import json
 import logging
 import math
 import re
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -714,7 +714,7 @@ attempt of a plan is one compile, whole where the step can fit and stopped where
 
 
 def compile_limit(devices: Sequence, held: int, built: int,
-                  resident: Mapping[jax.Device, int] | None = None) -> int | None:
+                  resident: Mapping[Hashable, int] | None = None) -> int | None:
     """The bytes past which no step fits `devices` (`LIMIT_EXIT`), as XLA sums a step (its arguments, its
     outputs that write over none of them and its temporaries): the fit check's own arithmetic
     (`_admitted`'s margin over all the bytes the allocator can give, `available`) solved for that sum,
@@ -746,7 +746,7 @@ def step_room(device, resident: int = 0) -> int | None:
     return available(memory, unclaimed(device, memory)) + min(resident, memory.get("bytes_in_use", 0))
 
 
-def resident_on(tree: TrainState, devices: Sequence[jax.Device]) -> dict[jax.Device, int]:
+def resident_on(tree: TrainState, devices: Sequence[Hashable]) -> dict[Hashable, int]:
     """The bytes the arrays of `tree` hold on each of `devices` now, a placed state's shards on its
     devices; an abstract or donated leaf holds none."""
     held = dict.fromkeys(devices, 0)
