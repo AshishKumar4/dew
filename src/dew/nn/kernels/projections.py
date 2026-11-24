@@ -5,6 +5,8 @@ of the quantized product's derivative), else through the template's dense produc
 launch takes any of its products, else XLA's own program."""
 
 import collections
+import contextlib
+import contextvars
 import functools
 import math
 from collections.abc import Callable, Hashable
@@ -663,6 +665,22 @@ def extents(lhs_shape: tuple[int, ...], rhs_shape: tuple[int, ...], dimension_nu
             math.prod(rhs_shape[axis] for axis in range(len(rhs_shape)) if axis not in against + batched_rhs))
 
 
+_DELAYED_SCALE: contextvars.ContextVar = contextvars.ContextVar("delayed_scale", default=None)
+
+
+@contextlib.contextmanager
+def delayed_scale(tensor_scale: jax.Array):
+    """Within the block, a layer's product in the run's recipe (`recipe_general`: a `Dense`'s, through its
+    `dot_general`) quantizes its rows at `tensor_scale` (`recipe_projection`'s): a delayed-scaling NVFP4
+    run's layer, its scale its amax history's (`delayed_tensor_scale`), enters it around its own product
+    (row 12721). Read at trace time: one layer's block, one scale."""
+    token = _DELAYED_SCALE.set(tensor_scale)
+    try:
+        yield
+    finally:
+        _DELAYED_SCALE.reset(token)
+
+
 def recipe_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers, out_dtype) -> jax.Array | None:
     """A layer's product (`jax.lax.dot_general`'s `dimension_numbers`) in the run's low-precision recipe
     (`recipe_projection`), as matrices (`grouped_rows`): a dense projection's free rows against its kernel's
@@ -678,8 +696,11 @@ def recipe_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers, out_dtype)
     rows, matrices, count, shape = grouped_rows(lhs, rhs, dimension_numbers)
     groups = matrices.shape[0]
     batched = bool(dimension_numbers[1][0])
-    out = (recipe_projection(rows, matrices, jnp.full((groups,), count, jnp.int32), out_dtype=out_dtype)
-           if batched else recipe_projection(rows, matrices[0], out_dtype=out_dtype))
+    # A delayed-scaling layer's rows' tensor scale, where its block states one (`delayed_scale`).
+    scale = _DELAYED_SCALE.get()
+    out = (recipe_projection(rows, matrices, jnp.full((groups,), count, jnp.int32), out_dtype=out_dtype,
+                             tensor_scale=scale)
+           if batched else recipe_projection(rows, matrices[0], out_dtype=out_dtype, tensor_scale=scale))
     return None if out is None else out.reshape(shape)
 
 

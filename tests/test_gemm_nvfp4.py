@@ -994,7 +994,8 @@ def test_an_nvfp4_projection_at_its_rows_own_tensor_scale_is_the_current_recipes
 def test_a_delayed_nvfp4_recipe_takes_its_rows_tensor_scale_and_only_it_does():
     """A run's NVFP4 recipe under delayed tensor scaling (`LowPrecision.tensor_scaling`, opt-in, row 12721):
     its recipe projection requires the rows' tensor scale and is `nvfp4_projection` at it; the current
-    recipe refuses one; and delayed scaling is NVFP4's alone."""
+    recipe refuses one; a layer's product through its `dot_general` takes the scale its block states
+    (`projections.delayed_scale`); and delayed scaling is NVFP4's alone."""
     from dew.nn.kernels import projections
     from dew.nn.precision import DTYPE_PRESETS, NVFP4, LowPrecision, Numerics, projection_role
 
@@ -1017,3 +1018,9 @@ def test_a_delayed_nvfp4_recipe_takes_its_rows_tensor_scale_and_only_it_does():
     np.testing.assert_array_equal(np.asarray(got).view(np.uint16), np.asarray(want).view(np.uint16))
     with generation.run_precision(current), projection_role("mlp"), pytest.raises(ValueError, match="only"):
         projections.recipe_projection(x, w, out_dtype=jnp.bfloat16, tensor_scale=scale)
+    # A layer's product through its `dot_general` (`recipe_general`, a Dense's) takes the scale its block
+    # states (`delayed_scale`).
+    numbers = (((1,), (0,)), ((), ()))
+    with generation.run_precision(delayed), projection_role("mlp"), projections.delayed_scale(scale):
+        general = projections.recipe_general(x, w, numbers, jnp.bfloat16)
+    np.testing.assert_array_equal(np.asarray(general).view(np.uint16), np.asarray(want).view(np.uint16))
