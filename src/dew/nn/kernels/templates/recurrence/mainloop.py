@@ -751,8 +751,8 @@ class Launch:
     registers a consumer thread holds at its program's peak (`resources.live_registers` of the tiles it
     states), the chunks in flight, the bytes a step streams in, the programs a multiprocessor holds of it at
     once (`resources.plan`; zero where it holds none, a config past the device), its consumer roles, and the
-    bundle it issues by (`family`: the call's, or the layout a launch takes for itself, `_solving`), which
-    every check of it reads."""
+    bundle it issues by (`family`: the call's, or the layout a launch takes for itself, `widest_layout`),
+    which every check of it reads."""
 
     name: str
     programs: int
@@ -1163,15 +1163,19 @@ def _persisted(family: mosaic.Family, streams, given, live, arrays, grid: tuple,
                    outputs=(), interpret=interpret, producer=producer)
 
 
-def _solving(call: Call) -> mosaic.Family:
-    """The bundle the solve launch issues by: of the layouts the call's device takes (`bundles.layouts`), the
-    first whose programs a multiprocessor holds most (`Family.programs`, a consumer role's), the call's own
-    where none holds more. The solve's persistent programs walk a chunk at a time on their products'
-    latency, one a multiprocessor beside a producer leaving its tensor cores idle: on an H100 PCIe the 27B
-    gated delta net's took 0.235 ms on warpgroup MMA's layout without a producer (`mosaic_sm90.FED`, two
-    programs a multiprocessor) against 0.356 beside a producer, Qwen3-Next's 0.156 against 0.240, where the
-    states launch's walk took 0.187 beside a producer against 0.202 to 0.243 without one
-    (JS-fed5-h100-d82eeb171). Interpreted, the interpreted target's (`issued`)."""
+def widest_layout(call: Call) -> mosaic.Family:
+    """The bundle a launch whose walk waits on its own latency issues by, the solve's (`_solved`,
+    `intra._intra_solve`) and the own pairs' (`own_pairs.intra_own`): of the layouts the call's device takes
+    (`bundles.layouts`), the first whose programs a multiprocessor holds most (`Family.programs`, a consumer
+    role's), the call's own where none holds more. The solve's persistent programs walk a chunk at a time on
+    their products' latency, one a multiprocessor beside a producer leaving its tensor cores idle: on an H100
+    PCIe the 27B gated delta net's took 0.235 ms on warpgroup MMA's layout without a producer
+    (`mosaic_sm90.FED`, two programs a multiprocessor) against 0.356 beside a producer, Qwen3-Next's 0.156
+    against 0.240, where the states launch's walk took 0.187 beside a producer against 0.202 to 0.243
+    without one (JS-fed5-h100-d82eeb171). The own pairs issue no products and walk their pairs on their
+    loads' latency: beside a producer a GH200 held five of Kimi Linear's programs, 20 consumer warps, where
+    fla's token-parallel diagonal holds 32 (their plans, row 5260). Interpreted, the interpreted target's
+    (`issued`)."""
     if call.interpret:
         return call.family
     layouts = bundles.layouts(call.target.generation, bundle_dtype(call.given.dtype), scoped=True)
@@ -1233,7 +1237,7 @@ def _solved(k, v, hi, lo, beta, taken, call: Call, *, keeps: bool = True, applie
     (an inverse's 8 KB past half its shared memory kept it at one, SE-family-a100-0c8018352). Where it
     `applies` none, `(a,)` alone, which `_weighted` applies (`_solves_apart`)."""
     chunk = call.chunk
-    call = dataclasses.replace(call, family=_solving(call))
+    call = dataclasses.replace(call, family=widest_layout(call))
     width, value_width, family = call.width, call.value_width, call.family
     # The values a tile narrower than a block (`Call.value_block`): their own staging and landing.
     narrow = applies and call.value_block != call.block
