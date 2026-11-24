@@ -19,6 +19,12 @@ from dew.nn.backbones.layer_names import group_layers
 from dew.objectives.lm import LMObjective
 from dew.training import Layout, MeshSpec, Trainer
 
+# Every test here compares a run's checkpoint, placed and read back bank by bank, with the run's own state,
+# bit for bit: no check-1 site, its programs compiled where its run reaches them (rows 11419-11422).
+pytestmark = pytest.mark.compiles_at_run(
+    reason="a run's checkpoint placed and read back bank by bank against its state, bit for bit: no check-1 "
+           "site")
+
 DEVICE = Layout(min_shard=1, tolerance=1.)
 HOST = Layout(host=("variables",), min_shard=1, tolerance=1.)
 ROWS = [{"text": (np.arange(9, dtype=np.int32) + index) % 16} for index in range(8)]
