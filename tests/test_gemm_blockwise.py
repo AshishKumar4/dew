@@ -11,6 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from blockwise_matrix import CUBLASLT_PRECISION
 from reference_error import assert_as_exact, with_gradients
 
 from dew.nn.kernels import gemm, generation, grouped_matmul, projections, tuning
@@ -114,8 +115,10 @@ def _gradient_truth(lhs_t, rhs_t, *scales):
 def _gradient_cublaslt(*operands):
     """cuBLASLt's FP8 GEMM on the kernel gradient's codes a block at a time (`blockwise_matrix.cublaslt_arm`:
     its blocks' dots of the FP8 codes into fp32 at `CUBLASLT_PRECISION`, cuBLASLt's fast accumulation), each
-    partial scaled and added in order."""
-    return _blocked(*operands, jnp.float32, precision=blockwise_matrix.CUBLASLT_PRECISION)
+    partial scaled and added in order. The precision read as a name of this module's: a test module an arm
+    reads through is no value its prepare's statement holds (`truths_ahead.arm_role`), and the arm would run
+    unprepared."""
+    return _blocked(*operands, jnp.float32, precision=CUBLASLT_PRECISION)
 
 
 def a_blockwise_kernel_gradient_is_on_par(interpret: bool = False):
