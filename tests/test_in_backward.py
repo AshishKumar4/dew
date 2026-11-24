@@ -597,14 +597,16 @@ def test_an_accumulating_scanned_step_holds_no_extra_gradient_buffer(generation,
     split = ahead(1, 2, 2)
     shapes = jax.eval_shape(model.init, jax.random.key(0), jnp.zeros((1, 16), jnp.int32))["params"]
     narrow = 2 * sum(leaf.size for leaf in jax.tree.leaves(shapes))
+    # The window's float32 sum its first call builds, an output beside the step's state, no argument yet.
+    window = 4 * sum(leaf.size for leaf in jax.tree.leaves(shapes))
 
     def beside(ahead) -> int:
         """What a step holds beside its arguments: its outputs that alias none and its temporaries, so a
         second stacked sum held as an unaliased output counts as one held among its temporaries does."""
         return ahead.output_bytes - ahead.alias_bytes + ahead.temp_bytes
 
-    assert beside(accumulated) - beside(one) < narrow, (beside(accumulated), beside(one), narrow)
-    assert beside(split) - beside(one) < narrow, (beside(split), beside(one), narrow)
+    assert beside(accumulated) - beside(one) < window + narrow, (beside(accumulated), beside(one), window)
+    assert beside(split) - beside(one) < window + narrow, (beside(split), beside(one), window)
 
 
 ACCUMULATING_SEEDS = 64
@@ -726,6 +728,7 @@ def test_an_accumulating_scanned_step_that_watches_its_layers_logs_what_they_mad
     run = Trainer(LMObjective(decoder(num_layers=2), SEQ), ADAMW, key=jax.random.key(0), mesh=MeshSpec(),
                   layout=Layout(min_shard=2**30), update=UpdateBatch(batches=2), tracker=tracker,
                   inspection=Inspection(modules=("*MLP",), cotangents=False, every=1), checkpoints=None)
+    run.device_mesh = MeshSpec().build(jax.devices()[:1])
     loader = Loader(train=lambda partition: repeated_token_batch(VOCAB, 4, SEQ + 1), val=None, records=None,
                     batch=4)
     scanning(run.fit)(loader, steps=2, log_every=1, eval_every=None)

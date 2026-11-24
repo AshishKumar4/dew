@@ -1823,7 +1823,7 @@ class Transaction:
         if planned is not None:
             if planned.pooling is not None:
                 previous = state.accumulation
-                assert previous is not None
+                assert previous is not None and previous.gradient is not None
                 prior_mass, _, mass, _, _, denominator = _pooling_weights(previous, realized.stats)
                 planned.pooling.fill, planned.pooling.old = occupancy(previous), prior_mass / denominator
                 planned.pooling.new, planned.pooling.factor = mass / denominator, factor
