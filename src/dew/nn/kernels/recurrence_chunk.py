@@ -1137,10 +1137,12 @@ def _walk(forms, width: int, recomputed: bool, held: int = 0, documents: int = 0
         prepared = jax.vmap(forms.prepare)(operands)
 
         def one(carried, chunk):
-            return forms.step(carried, chunk), carried
+            leaving, kept = forms.step(carried, chunk)
+            return leaving, (carried, kept)
 
-        carried, entering = jax.lax.scan(one, (decayed, memory), prepared)
-        return jax.vmap(forms.mapped)(prepared, entering), carried[1], entering[1]
+        # Each chunk's state solved once, in sequence, what it kept read again by its outputs at once.
+        carried, (entering, kept) = jax.lax.scan(one, (decayed, memory), prepared)
+        return jax.vmap(forms.mapped)(prepared, entering, kept), carried[1], entering[1]
 
     def walking_one(operands, h, segments=None):
         outputs, last, kept = entered(operands, h, segments)
@@ -1428,7 +1430,7 @@ def transferred(query, key, value, g, beta, starts=None, *, chunk_size: int = CH
         start = jax.tree.map(lambda x: varying_like(x, *varying),
                              forms.init(jax.tree.map(lambda x: x[0], chunks)))
         prepared = jax.vmap(functools.partial(forms.prepare, transition=True))(chunks)
-        last, _ = jax.lax.scan(lambda walk, chunk: (forms.step(walk, chunk), None), start, prepared)
+        last, _ = jax.lax.scan(lambda walk, chunk: (forms.step(walk, chunk)[0], None), start, prepared)
         return last.transfer
 
     return jax.vmap(jax.vmap(walked))(operands)

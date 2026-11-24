@@ -133,8 +133,8 @@ def forked_steps(forms, operands, given, forked, held: int, documents: int, deca
                                    turning))
         window = forms.prepare(jax.tree.map(lambda x: x[chunk], operands), window=(origin, through))
         decay = jnp.where(continuing, memory_in[0], zero_decay)
-        left = forms.step((decay, memory), window)
-        out = forms.mapped(window, (decay, memory))
+        left, kept = forms.step((decay, memory), window)
+        out = forms.mapped(window, (decay, memory), kept)
         rows = (place >= origin) & (place <= through)
         outputs = outputs.at[chunk].set(jnp.where(rows[:, None], out, outputs[chunk]))
         table = table_stored(table, stores[chunk, through], left[1])
@@ -142,7 +142,8 @@ def forked_steps(forms, operands, given, forked, held: int, documents: int, deca
         leaving = jax.tree.map(lambda a, b: jnp.where(ends, a, b), left, leaving)
         return (memory_in, chunk, leaving), table, outputs, entering
 
-    shaped = jax.eval_shape(lambda chunk: forms.mapped(forms.prepare(chunk), (decayed, zero)),
+    # A forked walk's forms are a single state's, which keep nothing for their outputs (a pair walks none).
+    shaped = jax.eval_shape(lambda chunk: forms.mapped(forms.prepare(chunk), (decayed, zero), None),
                             jax.tree.map(lambda x: x[0], operands))
     table = varying_like(jnp.zeros((held, *given.shape[1:]), given.dtype), *reaching)
     start = (((decayed, zero), varying_like(jnp.asarray(-1), origins), (decayed, zero)), table,

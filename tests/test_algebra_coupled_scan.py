@@ -68,8 +68,9 @@ def walked(forms):
         for index in range(TOKENS // CHUNK):
             chunk = {name: value[index * CHUNK:(index + 1) * CHUNK] for name, value in values.items()}
             prepared = forms.prepare(chunk)
-            outputs.append(forms.mapped(prepared, state))
-            state = forms.step(state, prepared)
+            leaving, kept = forms.step(state, prepared)
+            outputs.append(forms.mapped(prepared, state, kept))
+            state = leaving
         return jnp.concatenate(outputs), forms.finish(state, values)
 
     return derived
@@ -136,3 +137,61 @@ def test_a_state_of_no_rank_is_refused_named():
                          state=((), jnp.float32))
     with pytest.raises(Refused):
         scan.derive_scan(declared, saturation=SATURATION)
+
+
+def test_a_float32_pairs_walk_over_float64_tokens_carries_it_wide():
+    """ReviewMomentum1454's x64 case: a pair declared float32 replayed token by token (`Derived.replay`) and
+    differentiated (`Derived.backward`) over float64 tokens carries the pair in float64, its outputs and the
+    pair leaving it float64 and the entering pair's cotangent its own float32, where a carry typed as the
+    entering float32 pair failed the scan."""
+    with jax.enable_x64(new_val=True):
+        forms = scan.derive_scan(DECLARED, saturation=SATURATION)
+        tokens = draws(packed=True)(0)
+        chunk = {name: value[:CHUNK].astype(jnp.float64) if jnp.issubdtype(value.dtype, jnp.floating)
+                 else value[:CHUNK] for name, value in zip(OPERANDS, tokens, strict=True)}
+        entering = jnp.zeros((2, STATE, WIDTH), jnp.float32)
+        outputs, leaving = forms.replay(chunk, entering)
+        cotangents = jnp.ones_like(leaving), jnp.ones_like(outputs)
+        d_entering, _ = forms.backward(chunk, (None, entering), *cotangents)
+    assert (outputs.dtype, leaving.dtype, d_entering.dtype) == (jnp.float64, jnp.float64, jnp.float32)
+
+
+def exp2_pair(pair, q, k, v, g, beta, p, mu):
+    """The declared update with base-2 decays (`exp2`), its erase key's read an einsum's."""
+    del q
+    h, m = pair
+    m = jnp.exp2(mu) * m + k[:, None] * (jnp.einsum('k,kv->v', p, h) - v)[None, :]
+    return jnp.exp2(g) * h - beta * m, m
+
+
+def test_a_replays_decay_beneath_float32s_least_normal_keeps_its_product_and_derivative():
+    """ReviewMomentum1454's replay: a memory of 2^100 decayed by 2^-130 in one token (base 2, no write):
+    the replay's memory leaving the token is 2^-30 and its derivative in the decay's exponent ln 2 2^-30,
+    each exactly, where the decay landed alone beneath the least normal flushed both to zero."""
+    declared = dataclasses.replace(DECLARED, update=exp2_pair)
+    forms = scan.derive_scan(declared, saturation=SATURATION)
+    one = {name: value[:1] for name, value in zip(OPERANDS, draws(packed=False)(0), strict=True)}
+    one.update(g=jnp.full((1,), -130.0, jnp.float32), mu=jnp.zeros((1,), jnp.float32),
+               beta=jnp.zeros((1,), jnp.float32), k=jnp.zeros_like(one["k"]))
+    entering = jnp.zeros((2, STATE, WIDTH), jnp.float32).at[0, 0, 0].set(2.0 ** 100)
+
+    def leaving(g):
+        return forms.replay({**one, "g": g}, entering)[1][0, 0, 0]
+
+    value, slope = jax.value_and_grad(leaving)(one["g"])
+    assert (float(value), float(slope[0])) == (2.0 ** -30, float(np.float32(np.log(2.0))) * 2.0 ** -30)
+
+
+def test_a_pair_takes_float64_decays_beside_float32_operands():
+    """ReviewMomentum1454's mixed widths: under x64 a pair's chunk forms and replay over float64 log decays
+    beside float32 keys, values and gates walk and replay their chunks, their outputs and the pairs their
+    walks carry float64 (the final pair the declared float32's, `Derived.finish`), where the decayed sums'
+    carries typed as the gates' float32 refused the scan."""
+    with jax.enable_x64(new_val=True):
+        forms = scan.derive_scan(DECLARED, saturation=SATURATION)
+        tokens = dict(zip(OPERANDS, draws(packed=True)(0), strict=True))
+        tokens.update(g=tokens["g"].astype(jnp.float64), mu=tokens["mu"].astype(jnp.float64))
+        outputs, final = walked(forms)(*tokens.values())
+        replayed, leaving = forms.replay({name: value[:CHUNK] for name, value in tokens.items()},
+                                         jnp.zeros((2, STATE, WIDTH), jnp.float32))
+    assert [x.dtype for x in (outputs, replayed, leaving, final)] == [jnp.float64] * 3 + [jnp.float32]
