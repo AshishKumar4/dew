@@ -171,10 +171,16 @@ def summed_on(carried, decayed, term, first):
     step, a term so lowered below the value's precision a part it no longer holds), a document's first token
     `term` alone at scale zero (selected), and a value past `LARGE` lowered by 2^64, its scale raised. A sum
     from zero is a span's last value less its entering one's decayed share, at most twice float32's largest,
-    so it is held in range at two steps and none of its terms is lowered unless the sum outweighs it:
-    summed whole, two writes of 2^127 after a state of -2^127 were infinite; halved, a least normal write was
-    lost (ReviewRecurrenceBatch)."""
+    so it is held in range at two steps and none of its terms is lowered unless the sum outweighs it: a sum
+    that falls back below one at a raised scale is raised again first (2^64 a step, exact), so a term after
+    a cancellation is lowered no further than the sum it joins. Summed whole, two writes of 2^127 after a
+    state of -2^127 were infinite; halved, a least normal write was lost; raised and never lowered, writes of
+    2^126 and -2^126 left 2^-126 after them lowered to nothing (ReviewRecurrenceBatch)."""
     _, scale = carried
+    for _ in range(2):
+        small = (scale >= 1.0) & (jnp.abs(decayed) < 1.0)
+        decayed = jnp.where(small, decayed * 2.0 ** 64, decayed)
+        scale = jnp.where(small, scale - 1.0, scale)
     lowered = jnp.where(scale >= 1.0, term * 2.0 ** -64, term)
     lowered = jnp.where(scale >= 2.0, lowered * 2.0 ** -64, lowered)
     value = cut(first, decayed + lowered, term)
