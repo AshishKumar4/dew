@@ -648,7 +648,7 @@ against the port's 0.981 on Qwen3.5-27B's gated delta net and 0.692 against 0.75
 process of its own, three rounds (JS-2075cellsd-a100-863706e94; the port's Qwen3-Next forward took 0.650 in
 two runs that followed a training run in one process, JS-2075cells-a100-491c05798).
 An H100's forward is the template's, its solve launch two programs a multiprocessor on warpgroup MMA's layout
-without a producer (`mainloop._solving`): on an H100 80GB HBM3 0.364 ms against the port's 0.514 on
+without a producer (`mainloop.widest_layout`): on an H100 80GB HBM3 0.364 ms against the port's 0.514 on
 Qwen3.5-27B's gated delta net and 0.279 against 0.327 on Qwen3-Next's (JS-solvefed-h100-92eacee68; on an
 H100 PCIe, before its states and output launches kept a producer, 0.520 against 0.691,
 JS-fed3-h100-9d3a38de3)."""

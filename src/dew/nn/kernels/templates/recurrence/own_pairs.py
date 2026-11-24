@@ -41,6 +41,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     stream_blocks,
     stream_tile,
     stream_views,
+    widest_layout,
 )
 
 
@@ -263,7 +264,10 @@ def intra_own(q, k, prefix, beta, taken, call: Call, *, scale: float, products: 
     blocks, the keys, queries and the walk's stored prefix (`intra._prefix`) a block at a time, summing each
     output's bands and storing them at its last step. In the walk, they held an H100's Kimi Linear intra
     launch at 248 registers, 1982 us against 492 (M-JS-50d); placed `[C, C]` at its last step (`banded`'s
-    selects an offset at a time), each output wrote its chunk's square for its bands' `SUB` columns."""
+    selects an offset at a time), each output wrote its chunk's square for its bands' `SUB` columns. It issues
+    by the layout whose programs a multiprocessor holds most (`mainloop.widest_layout`): no products, its walk
+    waits on its loads, beside a producer a GH200 held five programs, 20 consumer warps (its plan, row 5260)."""
+    call = dataclasses.replace(call, family=widest_layout(call))
     chunk, width, family = call.chunk, call.width, call.family
     scored = "scores" in products
     keys = key_block(call, functools.partial(_own_held, call, outputs=len(products)),
