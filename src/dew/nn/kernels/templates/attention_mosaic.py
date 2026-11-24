@@ -872,17 +872,20 @@ class MosaicForward(_Mainloop[Tiles]):
         query = ba.arguments["query"]
         families = [family for family in layouts(target.generation, query.dtype, query.shape[1])
                     if family is not skip and self.refusal(ba, family) is None]
-        choose = functools.partial(self._choose_consumers, ba, target=target) if priced else None
+        # Each offer's launch completed once (`_launchable`: its legality and rewalk's derivation), for its
+        # fit, its price and the winner alike.
+        launchable = functools.cache(lambda config: self._launchable(ba, config, target, priced=priced))
+        choose = (functools.partial(self._choose_consumers, ba, target=target, launch=launchable) if priced
+                  else None)
         for prefer_helping in (True, False):
             for family in families:
                 def fits(config: Tiles, *, helping=prefer_helping) -> bool:
                     return ((not helping or self._columns_help(ba, config, target))
-                            and self._launchable(ba, config, target, priced=priced)
-                            not in (None, *refused))
+                            and launchable(config) not in (None, *refused))
 
                 config = self._searched(ba, family, fits, choose=choose)
                 if config is not None:
-                    launched = self._launchable(ba, config, target, priced=priced)
+                    launched = launchable(config)
                     if launched is None or not priced:
                         return launched
                     return self._deepened(ba, launched, target, refused=refused)
@@ -944,14 +947,16 @@ class MosaicForward(_Mainloop[Tiles]):
             total += cost.launch_seconds(work, emission.launch_programs(kernel), target, resident=resident)
         return total
     def _choose_consumers(self, ba: tokamax.BoundArguments, candidates: list[Tiles], *,
-                          target: generation.GpuTarget) -> Tiles:
+                          target: generation.GpuTarget, launch: Callable[[Tiles], Tiles | None] | None = None
+                          ) -> Tiles:
         """Pick the fastest of `candidates`, each a consumer count at each walked tile that fits it
-        (`_derived`), priced by `price_config`, storing the choice in the tuning store beside verdicts
-        (`tuning.stored_choice` / `tuning.store_choice`) so warm starts trace nothing to price (rows 6710,
-        6216)."""
+        (`_derived`), priced by `price_config` as it launches (`launch`, `_launchable` where None), storing
+        the choice in the tuning store beside verdicts (`tuning.stored_choice` / `tuning.store_choice`) so
+        warm starts trace nothing to price (rows 6710, 6216)."""
         if len(candidates) <= 1 or not target.multiprocessors or not cost.rates(target, device=False).tensor:
             return candidates[0]
-        launched = [self._launchable(ba, config, target) or config for config in candidates]
+        launch = launch or (lambda config: self._launchable(ba, config, target))
+        launched = [launch(config) or config for config in candidates]
         key = _choice_key(self, ba, tuple(launched), target)
         stored = None if key is None else tuning.stored_choice(target.generation, key)
         if isinstance(stored, (tuple, list)):

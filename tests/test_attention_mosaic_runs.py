@@ -18,8 +18,8 @@ def test_a_forward_over_several_runs_compiles_every_config_it_certifies_spill_fr
     """A causal forward over `count` key runs a query (eight heads 64 wide over 2 x 2,048 tokens, runs traced
     as a call's operand) compiles on a compile-only H100 with no kernel its derivation certifies spilled or
     refused: its runs' union counted, one select an entry (`attention_algebra.seen`), each further run's
-    bounds priced as the rows its walk holds (`attention_mosaic_registers._runs_bounds`), and two runs' union,
-    which LLVM takes back to an or, priced with the unmasked logits its selects keep. On main three runs' walk
+    bounds priced as the rows its walk holds (`attention_mosaic_registers._runs_bounds`), and two runs'
+    walk charged a logits tile more (a conservative charge for a measured spill). On main three runs' walk
     at 64 x 128 three consumers spilled 120 bytes at its raised 160 and stepped down (FS-6766-MAIN1); two
     runs' (MoBA's top_k 2) spilled 220 where three spilled none (FS-6766-ATT1, row 6766)."""
     from fla_gdn_support import KernelCase
