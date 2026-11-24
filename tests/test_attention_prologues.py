@@ -185,18 +185,25 @@ def test_the_mosaic_forward_takes_its_query_prologue_where_it_loads_the_query_in
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("prologue", PROLOGUES)
 @pytest.mark.parametrize("kept", [template.Kept.SPLIT, template.Kept.NONE], ids=["training", "inference"])
-@pytest.mark.parametrize(("generation_name", "tokens", "heads", "kv_heads", "width"),
-                         [("sm90", 4096, 32, 8, 128), ("sm100", 12288, 16, 4, 256)],
-                         ids=["qwen3-8b-h100", "4b-b200"])
-def test_a_prologued_forward_compiles_spill_free_at_its_derived_config(generation_name, tokens, heads,
-                                                                       kv_heads, width, kept, prologue):
+def test_a_prologued_forward_compiles_spill_free_at_its_derived_config(kept, prologue):
     """An attention forward under its query and key prologues (`PROLOGUES`) over causal tokens, at the config
-    its derivation gives on a compile-only H100 (Qwen3-8B's 32 heads over 8, 128 wide, 4,096 tokens) and
-    B200 (the 4B decision call's 16 over 4, 256 wide, 12,288 tokens): every launch compiled by ptxas spilling
-    nothing, the query prologue taken in it where it holds it (`mosaic_failures`)."""
+    its derivation gives on a compile-only H100 (Qwen3-8B's 32 heads over 8, 128 wide, 4,096 tokens): every
+    launch compiled by ptxas spilling nothing (`compiled_spill_free`); a B200's cells are
+    tests/test_attention_prologues_b200.py's."""
+    compiled_spill_free("sm90", (4096, 32, 8, 128), kept, prologue)
+
+
+def compiled_spill_free(generation_name: str, shape: tuple[int, int, int, int], kept: template.Kept,
+                        prologue: str) -> None:
+    """The forward under `prologue` at `shape` (tokens, heads, key heads, width; causal) at its derived config
+    on a compile-only `generation_name`: every launch compiled by ptxas spilling nothing, the query prologue
+    taken in it where it holds it (`mosaic_failures`). A process compiles one GPU's kernels
+    (`kernel_compile.compile_mosaic_kernels`; another's in a process of its own, a cell's whole cost again),
+    so each GPU's cells are a module's of their own."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
+    tokens, heads, kv_heads, width = shape
     spans = template.spans(tokens, tokens, 1, causal=True)
     query = jax.ShapeDtypeStruct((1, tokens, heads, width), jnp.bfloat16)
     key = jax.ShapeDtypeStruct((1, tokens, kv_heads, width), jnp.bfloat16)
