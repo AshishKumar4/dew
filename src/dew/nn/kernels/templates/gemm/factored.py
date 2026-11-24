@@ -251,7 +251,7 @@ class _Transpose:
         +inf, -inf, NaN) with a chunk's (`_nonfinite_terms`, one 0/1 bf16 GEMM a class, its count below
         2**24) present or not (`_present`, never a sum that could wrap), read only where the chunk holds a
         product not finite: a finite cancellation runs none of their GEMMs where its predicate is one value
-        (unbatched, or a batch's alike); under `vmap` a batched predicate's `cond` runs both branches and
+        (unmapped under `vmap`); under `vmap` a batched predicate's `cond` runs both branches and
         selects, the same classes. Each device decides alone; their classes meet after the chunk's
         columns."""
         def counted(classes):
