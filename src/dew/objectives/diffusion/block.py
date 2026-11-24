@@ -14,6 +14,7 @@ Reference: gemma bf0b49901a428d13e9c2b2629f0eb9c153d3cbd3,
 
 from __future__ import annotations
 
+import functools
 import math
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Literal
@@ -517,8 +518,8 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
             qk = sows_appended(sows_appended(mutated[QK], first_sown[QK]), second_sown[QK])
         # The projections' largest magnitudes over every pass that ran them, the conditioning pass's among
         # them, as the maxima are (row 12721).
-        amax = None if not step.amax else sows_appended(
-            sows_appended(mutated[NVFP4_AMAX], first_sown[NVFP4_AMAX]), second_sown[NVFP4_AMAX])
+        amax = None if not step.amax else functools.reduce(
+            sows_appended, (held.get(NVFP4_AMAX, {}) for held in (mutated, first_sown, second_sown)), {})
         # The encoder's pass and the denoiser's that carries the gradient, as the step watches them.
         inspected = None if step.watched is None else {
             "encoder": mutated.get(INSPECTED, {}), "denoiser": second_sown.get(INSPECTED, {})}

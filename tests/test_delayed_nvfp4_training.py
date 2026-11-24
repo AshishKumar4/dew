@@ -133,3 +133,34 @@ def test_an_averaged_forward_reads_the_committed_histories():
                                 jax.tree.leaves(averaged.averaged[NVFP4_HISTORY]), strict=True):
         np.testing.assert_array_equal(one, other)
         np.testing.assert_array_equal(np.asarray(read), one)
+
+
+def test_a_ppo_steps_records_are_its_own_passes_its_critics_among_them():
+    """A PPO objective draws its critic apart from its actor (`PPOObjective.init`), and the critic's draw
+    keeps nothing its initializing pass recorded: a step's records are each part's own call's alone, one
+    a projection, never an initializer's activations beside them (review of row 12721: the critic's draw
+    kept its init's records, which every step's largest then took in), and its step rolls every history,
+    the actor's and the critic's."""
+    from dew.nn.dense import NVFP4_AMAX
+    from dew.objectives.base import Step
+    from dew.objectives.rl import PPOObjective, ValueHead
+
+    model = CausalTransformer(vocab_size=16, emb_features=32, num_layers=1, num_heads=2, mlp_features=64,
+                              max_seq_len=8)
+    objective = PPOObjective(model, 5, critic=ValueHead(model))
+    ids = np.tile(np.arange(6, dtype=np.int32), (jax.device_count(), 1))
+    mask = np.broadcast_to(np.arange(6) >= 3, ids.shape).astype(np.float32)
+    batch = {"input_ids": ids, "text_segment_ids": np.ones_like(ids),
+             "text_positions": np.broadcast_to(np.arange(6), ids.shape).astype(np.int32),
+             "response_mask": mask, "advantages": mask, "behavior_log_probs": np.full(ids.shape, -3.0),
+             "old_values": np.zeros_like(mask), "returns": mask}
+    with generation.run_precision(DELAYED):
+        trainer = Trainer(objective, optax.adamw(1e-3), key=0)
+        initial = trainer.initial_state()
+        observing = Step(np.int32(0), jax.random.key(1), None, amax=True)
+        _, aux = objective.loss(initial.variables, batch, observing)
+        state, *_ = trainer.compile(initial, batch)(initial, batch)
+    assert NVFP4_AMAX not in initial.variables, sorted(initial.variables)
+    calls = jax.tree.leaves(aux.amax["critic"], is_leaf=lambda node: isinstance(node, tuple))
+    assert calls and all(len(call) == 1 for call in calls), [len(call) for call in calls]
+    rolled_once(state)

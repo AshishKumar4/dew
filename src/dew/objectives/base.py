@@ -772,7 +772,9 @@ def with_projected(variables: Variables, project: Callable[[Variables], Variable
 
 def projected_draw(owner: nn.Module, variables: Variables) -> Variables:
     """A module's freshly drawn tree as training stores it: its parameters projected
-    once by `owner`'s constraint (`updated=True`), as is where it declares none."""
+    once by `owner`'s constraint (`updated=True`), as is where it declares none, and none of what its draw's
+    pass observed (`OBSERVED`), as `Objective.init` keeps none: a step's records are its own pass's."""
+    variables = {name: tree for name, tree in variables.items() if name not in OBSERVED}
     if not isinstance(owner, ProjectsParameters):
         return variables
     return with_projected(variables, functools.partial(owner.projected, updated=True))
