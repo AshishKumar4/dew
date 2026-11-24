@@ -307,3 +307,18 @@ def test_a_short_loops_trips_each_take_their_own_lanes():
             scf.YieldOp([])
 
     assert _counted(body).shared_bytes == 4 * 4
+
+
+def test_an_address_through_chained_element_pointers_keeps_each_index_lanes():
+    """A word each lane addresses through two element pointers, its own word's then a uniform index past it
+    (`llvm.getelementptr` of a lane's pointer): every lane's address its own, 128 words moved, where the
+    second index's lanes alone (one address) moved one."""
+    def body(ctx, ref, uniform):
+        del ctx
+        from jax.extend.mlir.dialects import llvm
+
+        f32 = ir.F32Type.get()
+        lane = mgpu_utils.getelementptr(mgpu_utils.memref_ptr(ref), [mgpu_utils.thread_idx()], f32)
+        llvm.load(f32, mgpu_utils.getelementptr(lane, [uniform.registers.item()], f32))
+
+    assert _counted(body, 0).shared_bytes == 4 * 128
