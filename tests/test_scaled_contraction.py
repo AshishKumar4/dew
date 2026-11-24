@@ -240,13 +240,17 @@ def test_six_groups_are_banded_a_digit_at_a_time():
                                   2.0 ** -30)
 
 
-def test_an_exponent_operand_past_any_sentinel_is_a_sums_like_any_other():
-    """`(2^E + 0) / 2^E` at `E = 2^30` (an exponent operand), its numerator beside a term whose keys cancel to
-    zero across bands (taking the sum banded), is 1: windows open on the largest sum whatever its exponent,
-    where a finite ceiling beneath `2^30` missed it and gave 0 (review of #3988, P0)."""
+@pytest.mark.parametrize("power", [2 ** 30, -(2 ** 30), np.iinfo(np.int32).min],
+                         ids=["2^30", "-2^30", "int32 least"])
+def test_an_exponent_operand_past_any_sentinel_is_a_sums_like_any_other(power):
+    """`(2^E + 0) / 2^E` at an exponent operand `E` anywhere in int32, its numerator beside a term whose keys
+    cancel to zero across bands (taking the sum banded), is 1: windows open on the largest sum whatever its
+    exponent and join it by its presence, and a window at int32's least is the last, where a finite ceiling
+    beneath `2^30` missed it (review of #3988, P0), the join's sentinel above `-2^30` dropped it, and the
+    window's floor beneath `-2^31` wrapped and looped (review of #3991, P0)."""
     form = Form(("", "", "k", "", ""), ((1, (((0, 1), (1, 0)),)), (1, (((2, 1),),))), "",
                 divisor=((1, (((3, 1), (4, 0)),)),), divided="")
-    one, raised = jnp.float32(1.0), jnp.int32(2 ** 30)
+    one, raised = jnp.float32(1.0), jnp.int32(power)
     keys = jnp.asarray([2.0 ** 127, -(2.0 ** 127), 2.0 ** -126, -(2.0 ** -126)], jnp.float32)
     np.testing.assert_array_equal(np.asarray(contract(form, one, raised, keys, one, raised)), 1.0)
 

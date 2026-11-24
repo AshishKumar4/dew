@@ -476,14 +476,16 @@ def joined(a, b):
     """Two double floats at powers of two (`_streamed`'s bands) summed, `(high, low, exponent)`: each moved to
     the larger's power (exact, or beneath the larger's `u^2`), one compensated step of the two
     (`scaled.compensated_pair`: their high parts' sum exact, its error carried with their low parts), then
-    renormalized (`two_sum`); a zero sum where both are."""
+    renormalized (`two_sum`); a zero sum where both are. Which is live its high part's presence says, no
+    exponent a sentinel: a live one at any int32 exponent is joined as itself."""
     a, b = _normal(*a), _normal(*b)
-    exponents = [jnp.where(high != 0, exponent, _NONE) for high, _, exponent in (a, b)]
-    top = jnp.maximum(*exponents)
-    moved = [(power2(high, exponent - top, reach=_REACH), power2(low, exponent - top, reach=_REACH))
-             for (high, low, _), exponent in zip((a, b), exponents, strict=True)]
+    live = [high != 0 for high, _, _ in (a, b)]
+    top = jnp.where(live[0] & live[1], jnp.maximum(a[2], b[2]), jnp.where(live[0], a[2], b[2]))
+    moved = [tuple(jnp.where(alive, power2(part, jnp.where(alive, exponent - top, 0), reach=_REACH),
+                             jnp.where(live[0] | live[1], 0, part)) for part in (high, low))
+             for (high, low, exponent), alive in zip((a, b), live, strict=True)]
     high, low = two_sum(*scaled.compensated_pair(*moved[0], *moved[1]))
-    return high, low, jnp.where(top == _NONE, 0, top)
+    return high, low, jnp.where(live[0] | live[1], top, 0)
 
 
 def _normal(high, low, exponent):

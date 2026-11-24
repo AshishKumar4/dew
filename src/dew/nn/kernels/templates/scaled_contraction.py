@@ -265,7 +265,9 @@ def _banded(terms: tuple[Term, ...], held: list, scales: list, contracted) -> tu
         return carry
 
     def binade(summed, power):
-        return power + binade_of(summed)
+        # Saturating at int32's least: an exponent operand's `-2^31` beside a sum beneath one wraps no sum up.
+        at = power + binade_of(summed)
+        return jnp.where((binade_of(summed) < 0) & (at > power), FLOOR, at)
 
     def placed(total, ceiling, opened):
         """The next window's top at each output, its largest sum beneath `ceiling` (any, where `opened`), and
@@ -289,7 +291,9 @@ def _banded(terms: tuple[Term, ...], held: list, scales: list, contracted) -> tu
             # A sum in the window exactly as limbs of `UNIT` (its value within `[2^-23, 2)` of `2^top`, its
             # least bit at least `2^-46`): the integer part of `|x| 2^23` and its fraction's bits.
             at = binade(summed, power)
-            inside = wanted & (summed != 0) & (at <= top) & (at > top - WINDOW)
+            # The window's floor saturating at int32's least, where every sum beneath its top lies inside.
+            bottom = top < FLOOR + WINDOW
+            inside = wanted & (summed != 0) & (at <= top) & (bottom | (at > top - WINDOW))
             scaled = jnp.abs(jnp.where(inside, power2(summed, power - top), 0)) * UNIT
             whole = jnp.floor(scaled)
             sign = jnp.where(summed < 0, -1, 1)
@@ -304,7 +308,9 @@ def _banded(terms: tuple[Term, ...], held: list, scales: list, contracted) -> tu
         joined = windows.joined(total, (*two_sum(high, error + rest), jnp.where(wanted, top, 0)))
         total = tuple(jnp.where(wanted, new, old) for new, old in zip(joined, total, strict=True))
         # A window's outputs past it; the others' as they were, their tops theirs again.
-        ceiling, opened = jnp.where(wanted, top - WINDOW + 1, ceiling), opened & ~wanted
+        # A window at int32's least the last: its ceiling there, beneath which no exponent lies.
+        below = jnp.where(top < FLOOR + WINDOW, FLOOR, top - WINDOW + 1)
+        ceiling, opened = jnp.where(wanted, below, ceiling), opened & ~wanted
         return (total, ceiling, opened, *placed(total, ceiling, opened))
 
     total = (zero.astype(jnp.float32), zero.astype(jnp.float32), zero)
