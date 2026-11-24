@@ -1691,11 +1691,14 @@ def climbed(monkeypatch, target: str, fields: dict, batch: dict, room_of, reques
     room = room_of(need)
     def fits(moves: int) -> bool:
         # The place's own step compiled in the room, its first compile the judge: where it misses, the
-        # search past it may find nothing more at a remat the run now states (`PlanRefused`).
-        try:
-            return planned(moves, room).plan["probes"][0]["fits"]
-        except PlanRefused as refused:
-            return refused.probes[0].fits
+        # search past it may find nothing more at a remat the run now states (`PlanRefused`). Its rung
+        # recorded apart, so no search after it reads the rung it settles (`rung_records`).
+        with pytest.MonkeyPatch.context() as apart:
+            apart.setenv("DEW_RUNG_RECORDS", str(request.getfixturevalue("tmp_path_factory").mktemp("rungs")))
+            try:
+                return planned(moves, room).plan["probes"][0]["fits"]
+            except PlanRefused as refused:
+                return refused.probes[0].fits
 
     if request.node.get_closest_marker("shards") is None:
         # Each place's fit compiled where it is asked, once (no place past the one sought is compiled).
@@ -1710,8 +1713,6 @@ def climbed(monkeypatch, target: str, fields: dict, batch: dict, room_of, reques
     # The remat rungs past the start's at the run's own head, in order: what a tight start asks next.
     preferred = [moves for moves, place in enumerate(places)
                  if moves and place[0] is None and place[2] != places[0][2]]
-    # The start's own search first, its first compile the judge of whether its own rung fits the room: a
-    # fit of its place compiled apart would record the rung it settles, which the start then reads.
     trainer = planned(0, room)
     probes = [(probe["head_tile"], probe["head_fused"], probe["remat"], probe["xla_defaults"])
               for probe in trainer.plan["probes"]]
@@ -1720,7 +1721,7 @@ def climbed(monkeypatch, target: str, fields: dict, batch: dict, room_of, reques
     # What a start asks, a probe a place at its fixed split: its own rung, which settles it where it fits
     # (a split step's scanned gradient pooled in its backward needs no more at no remat than at a remat rung,
     # row 12080's), else each remat rung at its own head and options up to the first that fits.
-    asks = ([places[0]] if trainer.plan["probes"][0]["fits"] else None if settled is None
+    asks = ([places[0]] if fitted(0) else None if settled is None
             else [places[0], *(places[moves] for moves in preferred[:settled + 1])])
     lightest = None if recomputing is not None else next(
         (place for moves, place in enumerate(places) if fitted(moves)), None)
@@ -1767,6 +1768,9 @@ def test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits(
     if climb is None:
         return
     ladder, room, plan, lightest, asks, probes = climb
+    if (shape, target) == ("decoder", "h100"):
+        # The census's climb: its start misses and a remat rung fits, as a compile-only H100 schedules it.
+        assert asks is not None and len(asks) > 1, (asks, probes, room)
     if asks is not None:
         # A tight start asks its own rung, then the remat rungs at its own head and options in order, and
         # settles the first of them that fits: no head or options rung compiled on the way (row 6740).
