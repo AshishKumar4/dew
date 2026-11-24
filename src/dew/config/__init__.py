@@ -996,6 +996,13 @@ class RunConfig:
         for name, value in values.items():
             if isinstance(value, Registered):
                 values[name] = value.recorded()
+        # A rate the run left to its optimizer (`OptimizerSpec.OWN_RATE`) follows the optimizer its flags
+        # choose, unless a flag names the rate: Gauss-Newton's whole step, never the default AdamW's.
+        start = default.optim if default is not None else OptimConfig()
+        optim = values["optim"]
+        if (isinstance(optim, OptimConfig) and start.lr == start.optimizer.OWN_RATE
+                and optim.lr == start.lr and not any(arg.startswith("--optim.lr") for arg in given)):
+            values["optim"] = dataclasses.replace(optim, lr=None)
         return cls(**values)
 
     @classmethod

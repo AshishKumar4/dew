@@ -1356,7 +1356,7 @@ model = models.build(
     mixture={"experts": 4, "top_k": 2, "layers": (1,)})
 mesh = MeshSpec(fsdp=2).build(compile_only_gpus(sys.argv[1], 2, 2**36))
 trainer = Trainer(LMObjective(model, 512), optax.adam(1e-3), key=jax.random.key(0), mesh=mesh,
-                  layout=Layout(min_shard=256))
+                  advanced=TrainerAdvanced(layout=Layout(min_shard=256)))
 with routes() as taken, chosen(attention="template"):
     ahead = compile_ahead(trainer, token_rows(1024, 8, 513))
 print(json.dumps({"kernels": sorted({(route.choice, route.kernel) for route in taken})}))
