@@ -21,7 +21,6 @@ import functools
 import math
 from collections.abc import Callable
 
-import jax
 from jax import numpy as jnp
 
 from dew.nn.kernels.templates import mosaic, resources, stores, swizzling
@@ -85,8 +84,8 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
       planner every template's derivation reads), at least those the walk keeps busy (those loading ahead,
       `Family.loads_ahead`, beside the one consumed and those whose products the family keeps in flight,
       `Family.in_flight`); a tile that cannot stage that deep gives way to the next narrower or shorter one,
-      or a shallower step. A ring its consumers feed held at that least depth takes a stage more where a
-      narrower output staging leaves it one (`_ring_staged`).
+      or a shallower step. A ring its consumers feed held at that least depth is deepened where a smaller
+      output staging leaves it room (`_ring_staged`).
     - Cluster: where the call's rows (a group's on average, a kernel gradient's output rows) hold a tile's
       on a family whose cluster takes a pair (`Family.cluster`), a pair of multiprocessors whose row tiles
       load the block they share once (a matrix, a kernel gradient's cotangent: cuBLASLt's cluster on the
@@ -205,7 +204,7 @@ def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], sha
     its stages do not fit, at the first step that plans busy, taking the least-priced busy tile under the
     shared cost model (`_tile_cost`), and whether it stages deep enough to stay busy (those its family loads
     ahead, beside the one consumed and those it keeps in flight); a ring its consumers feed at that least
-    depth restaged a stage deeper where its outputs' staging leaves room (`_ring_staged`)."""
+    depth deepened where a smaller staging of its outputs leaves room (`_ring_staged`)."""
     family = layouts[0]
     busy = 1 + family.loads_ahead + family.in_flight
     fallback = None
@@ -243,43 +242,42 @@ def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], sha
 def _ring_staged(tile: Tiles, layout: mosaic.Family, outputs: tuple, *, candidate: Callable,
                  launch_of: Callable, target, programs: int) -> Tiles:
     """`tile`, whose ring its consumers feed (`mosaic.Transport.feeds_itself`) at its least busy depth, with
-    its outputs (`outputs`, their dtypes) staged narrower where that leaves the ring a stage more: of the
-    stagings below the one a tile stages in unstated (`stores.output_staging`), the most bytes first and
-    one buffer before two on a tie, the first whose plan holds a deeper ring. Its loading consumer issues a
+    its outputs (`outputs`, their dtypes) staged in smaller buffers where that leaves the ring deeper: of the
+    stagings at the widest output's unstated chunk (`stores.output_staging`) and its halvings down to an
+    accumulator atom's columns, in one buffer or two, each output's legal (`stores.staging_refusal`) and its
+    buffers (`Family.output_staging`) smaller than the unstated ones, the most bytes first and one buffer
+    before two on a tie, the first the planner places deeper, at the deepest ring it holds there
+    (`resources.plan`) and no compile of this process refused (`candidate`). Its loading consumer issues a
     step's loads between its own products, no producer running ahead, so a ring at its least busy depth
     leaves a load's latency no slack: an RTX PRO 6000's input gradient at 128 x 256 x 32, two stages beside
     32 KB of output staging, slept on its full barriers in 14.4% of its samples (M-NG-1's ncu). The ring
     serves every step and the staging a tile's store once, CUTLASS's order (StageCountAutoCarveout: the
-    epilogue's shared memory carved out first, the ring the rest); the tile as it was where no narrower
-    staging deepens it. One buffer first: sm120's three-stage 128 x 256 forward compiled spill-free at (64,
-    1) and (32, 1), 227-229 registers, where CUDA 12.9's allocator took (32, 2) to 255 and spilled 148
-    bytes, its live values no more (row 12667); certification refuses a staging that spills all the same."""
+    epilogue's shared memory carved out first, the ring the rest). One buffer first: sm120's three-stage
+    128 x 256 forward compiled spill-free at (64, 1) and (32, 1), 227-229 registers, where CUDA 12.9's
+    allocator took (32, 2) to 255 and spilled 148 bytes, its live values no more (row 12667). The tile as
+    it was where no smaller staging deepens it."""
     columns = pricing.tile_columns(tile, layout)
     piece = layout.chunk_columns(columns)
+    shapes = tuple(((tile.share, columns), dtype) for dtype in outputs)
 
-    def staged_bits(staging: tuple[int, int] | None) -> int | None:
-        # Each output staged as its family allocates it, at its own default where `staging` is None
-        # (`RingFamily.output_staging`); None where an output stages in no such chunks.
-        if any(stores.staging_refusal(columns, (dtype,), staging, piece=piece) for dtype in outputs):
-            return None
-        return sum(math.prod(stores.output_staging(columns, (dtype,), staging, piece=piece))
-                   * jax.dtypes.itemsize_bits(dtype) for dtype in outputs)
+    def staged_bytes(staging: tuple[int, int] | None) -> int:
+        return resources.allocated(*(resources.stored_bytes(buffer.shape, buffer.dtype)
+                                     for buffer in layout.output_staging(shapes, tile.warpgroups, staging)))
 
     widest = max(stores.output_staging(columns, (dtype,), piece=piece)[0] for dtype in outputs)
-    default = staged_bits(None)
-    candidates = {(widest >> shift, count) for shift in range(widest.bit_length()) for count in (2, 1)
-                  if widest >> shift >= ACCUMULATOR_COLUMNS}
-    sized = {staging: bits for staging in candidates
-             if (bits := staged_bits(staging)) is not None and default is not None and bits < default}
-    stagings = sorted(sized, key=lambda staging: (-sized[staging], staging[1]))
-    for staging in stagings:
+    legal = [(widest >> shift, count) for shift in range(widest.bit_length()) for count in (1, 2)
+             if widest >> shift >= ACCUMULATOR_COLUMNS
+             and not any(stores.staging_refusal(columns, (dtype,), (widest >> shift, count), piece=piece)
+                         for dtype in outputs)]
+    unstated = staged_bytes(None)
+    sized = {staging: size for staging in legal if (size := staged_bytes(staging)) < unstated}
+    for staging in sorted(sized, key=lambda staging: (-sized[staging], staging[1])):
         staged = dataclasses.replace(tile, staging=staging)
-        if not candidate(staged):
-            continue
         planned = resources.plan([launch_of(staged)], layout, target, programs=programs)
-        deeper = None if planned is None else dataclasses.replace(staged, stages=planned[0].stages)
-        # A deeper tile a compile of this process refused (`report.refused`) leaves the tile as derived.
-        if deeper is not None and deeper.stages > tile.stages and candidate(deeper):
+        if planned is None or planned[0].stages <= tile.stages:
+            continue
+        deeper = dataclasses.replace(staged, stages=planned[0].stages)
+        if candidate(deeper):
             return deeper
     return tile
 

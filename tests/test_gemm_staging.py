@@ -13,6 +13,7 @@ from generation_support import INTERPRETS, lowers
 from reference_error import assert_as_exact
 
 from dew.nn.kernels import gemm, generation, grouped_matmul, tuning
+from dew.nn.kernels.templates import report
 from dew.nn.kernels.templates.gemm import pricing, tiling
 
 
@@ -180,3 +181,20 @@ def test_a_g4_dense_products_fed_ring_takes_the_stage_a_narrower_output_staging_
         assert not gmm.legal(ba, dataclasses.replace(tile, staging=None), sm120)
     with generation.assumed("sm80"):
         assert gmm.derived(ba, generation.gpu_target()).staging is None
+
+
+def test_a_refusal_at_a_fed_rings_least_depth_leaves_its_deeper_restaging_derived():
+    """A compile's refusal of a fed ring's staging at its least busy depth (a pinned or tuned neighbour's)
+    refuses that config alone: the derivation still takes the deeper ring at that staging
+    (`derivation._ring_staged` asks its refusals of the tile it proposes)."""
+    gmm = grouped_matmul.MosaicGmm()
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    ba = gmm.bind(bf16((8192, 4096)), bf16((1, 4096, 4096)), jax.ShapeDtypeStruct((1,), jnp.int32),
+                  out_dtype="bfloat16", trans_rhs=True, interpret=False, dense=True)
+    with report.refusals(), generation.assumed("sm120"):
+        sm120 = generation.gpu_target()
+        tile = gmm.derived(ba, sm120)
+        shallow = dataclasses.replace(tile, stages=2)
+        report.refuse([(report._identity(gmm, ba, sm120), shallow, frozenset({gmm.KERNEL}))])
+        assert report.refused(gmm, ba, shallow, sm120) and not gmm.legal(ba, shallow, sm120)
+        assert gmm.derived(ba, sm120) == tile, tile
