@@ -124,6 +124,24 @@ def test_a_prepared_sites_arms_report_the_routes_their_unprepared_run_reports(tm
     assert unprepared and reported(prepare=False) == unprepared, unprepared
 
 
+def test_a_site_past_its_prepares_cap_is_named_unprepared_and_not_compiled(tmp_path, monkeypatch):
+    """In a part's prepare past its cap (tests/tier_wire.py's `PREPARE_BY`), a site compiles nothing and is
+    named unprepared by its label (where `tier_wire.CAPPED`), so a flow's cell of many sites stops at the cap
+    (test_gpu_numerics' norm cell, its configs' sites, outlasted its dry prepare's task)."""
+    import json
+    import time
+
+    import tier_wire
+
+    label = "a site past its cap"
+    monkeypatch.setenv(tier_wire.PREPARE_BY, repr(time.monotonic() - 1.0))
+    with compiled_truths(tmp_path, prepare=True, stamp="here"):
+        assert_as_exact(_combined, _combined, _cancelling, label, seeds=8)
+    held = json.loads((tmp_path / UNPREPARED).read_text())
+    assert [(reason["where"], reason["cell"]) for reason in held["reasons"]] == [(tier_wire.CAPPED, label)]
+    assert not list(tmp_path.rglob("site.json"))
+
+
 def test_a_prepared_sites_reference_as_written_is_prepared_and_fails_dews_arm_in_its_run(tmp_path):
     """The combination XLA's fusions rewrite (`test_reference_error_written._combined`, row 6909), one
     function as both arms, its site prepared into a store (`truths_ahead.compiled_truths`, a GPU tier part's)
