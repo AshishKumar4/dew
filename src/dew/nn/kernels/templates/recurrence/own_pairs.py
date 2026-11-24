@@ -108,21 +108,20 @@ def by_thread(call: Call) -> bool:
 
 def own_bands(queries, staged, betas, bands, *, products: tuple[str, ...], unit_pairs: bool) -> None:
     """Each output's sub-chunks' own pairs of one key block added into `bands`, a plain fp32 shared tile
-    `[outputs, C, SUB]` (`algebra.key_diagonal_bands`' form, a row's column `e` its pair `e` tokens back, an
-    entry no thread writes zero), from the outputs' rows (`products`': the scores' the queries `queries`
-    `[C, keys]`, the system's each key scaled by its write strength `betas` `[C]`, formed as its terms take
-    it, `algebra.write_gated`'s one rounding) and the keys and the tokens' own decays `staged`
-    (`own_staging`'s, unpadded: a chunk's row `r` at `r`), a thread's own words:
-    each quad of the warpgroup's threads a sub-chunk's rows `p` and `SUB - 1 - p` and a quarter of the
-    columns each, one loop of `SUB + 1` steps over both rows' pairs at or before them alone (`p + 1` and
-    `SUB - p`, so every thread steps alike), its pair's decay the product of its tokens' own formed back from
-    its own token as the token recurrence forms it, each term the row times the key, then times the decay
-    (or, `unit_pairs`, the row times the key decayed once for every output, `algebra.decayed_key`), summed
-    over its columns and then the quad's (`utils.shfl_bfly`), the warpgroup met once when done. fla_kda's
-    token-parallel diagonal (chunk_kda_fwd_intra_token_parallel) walks the pairs at or before a token alone;
-    the bands a tile in the accumulator's layout took every offset of every row, its shifted reads whole
-    tiles and its sums over a key block's columns a warp's shuffles, 70% of an emulated GH200's intra_own
-    issues (M-JS-145h)."""
+    `[outputs, C, SUB]` (`algebra.key_diagonal_bands`' form, a row's column its earlier token's place in its
+    sub-chunk's diagonal block, an entry no thread writes zero), from the outputs' rows (`products`': the
+    scores' the queries `queries` `[C, keys]`, the system's each key scaled by its write strength `betas`
+    `[C]`, formed as its terms take it, `algebra.write_gated`'s one rounding) and the keys and the tokens' own
+    decays `staged` (`own_staging`'s, unpadded: a chunk's row `r` at `r`), a thread's own words: each quad of
+    the warpgroup's threads a sub-chunk's rows `p` and `SUB - 1 - p` and a quarter of the columns each, one
+    loop of `SUB + 1` steps over both rows' pairs at or before them alone (`p + 1` and `SUB - p`, so every
+    thread steps alike), its pair's decay the product of its tokens' own formed back from its own token as the
+    token recurrence forms it, each term the row times the key, then times the decay (or, `unit_pairs`, the
+    row times the key decayed once for every output, `algebra.decayed_key`), summed over its columns and then
+    the quad's (`utils.shfl_bfly`), the warpgroup met once when done. fla_kda's token-parallel diagonal
+    (chunk_kda_fwd_intra_token_parallel) walks the pairs at or before a token alone; the bands a tile in the
+    accumulator's layout took every offset of every row, its shifted reads whole tiles and its sums over a key
+    block's columns a warp's shuffles, 70% of an emulated GH200's intra_own issues (M-JS-145h)."""
     outputs, (chunk, keys) = len(products), staged.shape[1:]
     # Each row's pairs at or before it in its sub-chunk, each over the block's columns: its key and decay
     # read, its decay's multiply and (`unit_pairs`) the decayed key's, and each output's row read (the
@@ -242,7 +241,8 @@ def _own_span(row_words, staged_ref, bands_ref, short, long, p, columns, leader,
             for distance in (1, 2):
                 total = arith.addf(total, utils.shfl_bfly(total, distance))
             with utils.when(leader):
-                place = at(o, row, e)
+                # The pair's column in its sub-chunk's diagonal block: its earlier token's place there.
+                place = at(o, row, arith.subi(arith.remui(row, const(sub)), e))
                 memref.store(arith.addf(memref.load(bands_ref, place), total), bands_ref, place)
         scf.yield_(after + ahead)
 
@@ -253,21 +253,21 @@ def shifted_up(call: Call, e, value: jax.Array) -> jax.Array:
     return call.family.row_shifted(value, -e, period=algebra.SUB, interpret=call.interpret)
 
 
-def intra_own(q, k, prefix, beta, taken, call: Call, *, scale: float, products: tuple[str, ...]) -> tuple:
-    """Each output of the intra walk's (`products`) sub-chunks' own pairs, each its own decay, as their bands
-    `[R, HV * SUB]` in the output's form (`algebra.key_diagonal_bands`' form: a row's column `e` its pair `e`
-    tokens back, masked as the output takes it, `algebra.band_masked`), which the caller places
-    (`algebra.placed_bands`) on the sub-chunks' diagonal blocks the walk's sums leave zero
-    (`algebra.key_block_pairs` takes the keys before a sub-chunk alone), so each entry is rounded once and
-    their sum is exact (`chunk_forward.prepared`): a launch of their own, no products on the tensor cores, as
-    fla_kda's token-parallel diagonal is (chunk_kda_fwd_intra_token_parallel). It walks each chunk's key
-    blocks, the keys, queries and the walk's stored prefix (`intra._prefix`) a block at a time, summing each
-    output's bands and storing them at its last step. In the walk, they held an H100's Kimi Linear intra
-    launch at 248 registers, 1982 us against 492 (M-JS-50d); placed `[C, C]` at its last step (`banded`'s
-    selects an offset at a time), each output wrote its chunk's square for its bands' `SUB` columns. It issues
-    by the layout whose programs a multiprocessor holds most (`mainloop.widest_layout`): no products, its
-    walk waits on its loads, beside a producer a GH200 held five programs, 20 consumer warps (its plan, row
-    5260)."""
+def intra_own(q, k, prefix, beta, taken, call: Call, *, scale: float, products: tuple[str, ...],
+              into: tuple) -> None:
+    """Each output of the intra walk's (`products`) sub-chunks' own pairs, each its own decay, written in
+    place on the sub-chunks' diagonal blocks of the walk's sums `into` (in-place refs `[R, HV * C]` in the
+    outputs' forms, `jax.new_ref`'s), the entries the walk leaves zero (`algebra.key_block_pairs` takes the
+    keys before a sub-chunk alone), so each entry is rounded once (`algebra.key_diagonal_bands`' blocks,
+    masked as the output takes them, `algebra.block_masked`): a launch of their own, no products on the
+    tensor cores, as fla_kda's token-parallel diagonal is (chunk_kda_fwd_intra_token_parallel). It walks each
+    chunk's key blocks, the keys, queries and the walk's stored prefix (`intra._prefix`) a block at a time,
+    summing each output's blocks and storing them at its last step. In the walk, they held an H100's Kimi
+    Linear intra launch at 248 registers, 1982 us against 492 (M-JS-50d). Written as bands `[R, HV * SUB]`
+    of pairs by their lag, XLA placed them on the blocks by re-summing both sums whole with the bands
+    gathered, 57.5 us of a GH200's Kimi Linear forward of 936 (M-JS-258's base). It issues by the layout whose
+    programs a multiprocessor holds most (`mainloop.widest_layout`): no products, its walk waits on its loads,
+    beside a producer a GH200 held five programs, 20 consumer warps (its plan, row 5260)."""
     call = dataclasses.replace(call, family=widest_layout(call))
     chunk, width, family = call.chunk, call.width, call.family
     scored = "scores" in products
@@ -314,11 +314,16 @@ def intra_own(q, k, prefix, beta, taken, call: Call, *, scale: float, products: 
 
             @pl.when(index == steps - 1)
             def _():
+                # Each sub-chunk's diagonal block of each output, in place in the walk's sums (`into`), the
+                # entries it leaves zero.
+                sub = algebra.SUB
                 for o, (name, ref) in enumerate(zip(products, sums, strict=True)):
-                    band = family.tile_of(threaded[-1].at[o]) if threaded else bands[o]
-                    _band_form(call, name).store(
-                        ref, algebra.band_masked(band, strict=name == "system", scale=scale), row, chunk,
-                        h * algebra.SUB, algebra.SUB, family=family, smem=landing[name])
+                    for s in range(chunk // sub):
+                        block = (family.tile_of(threaded[-1].at[o, pl.ds(s * sub, sub)]) if threaded
+                                 else bands[o][s * sub:(s + 1) * sub])
+                        _band_form(call, name).store(
+                            ref, algebra.block_masked(block, strict=name == "system", scale=scale),
+                            row + s * sub, sub, h * chunk + s * sub, sub, family=family, smem=landing[name])
 
             return bands, accumulators
 
@@ -334,19 +339,18 @@ def intra_own(q, k, prefix, beta, taken, call: Call, *, scale: float, products: 
         return mosaic.Walk(views, step, steps=steps, carry=carry, prologue=prologue)
 
     blocks = pair_streams(call, keys, queries=scored)
-    out_type = tuple(_band_form(call, name).shape(call.heads * algebra.SUB) for name in products)
     # Each output's pairs a key a term, a sub-chunk's offsets: the model's.
     model = len(products) * 3 * chunk * algebra.SUB * width
     staging, landing = _own_staged(call, keys, products=products)
     inputs = (q, k, *prefix, beta, taken)
-    return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
-                         grid_names=("chunks", "heads"), blocks=blocks, stages=(1, 2),
-                         live=chunk_liveness(len(inputs) - 1), steps=steps, model=model,
-                         held=_own_held(call, keys, len(products)),
-                         staging=staging, landing=landing, name=_named("recurrence_intra_own", products),
-                         issues=False,
-                         swizzles={name: resources.widest_swizzle(dtype, keys)
-                                   for name, (_, dtype) in blocks.items()})(*inputs)
+    launch_kernel(program, call, out_type=(), grid=(call.chunks, call.heads),
+                  grid_names=("chunks", "heads"), blocks=blocks, stages=(1, 2),
+                  live=chunk_liveness(len(inputs) - 1), steps=steps, model=model,
+                  held=_own_held(call, keys, len(products)),
+                  staging=staging, landing=landing, name=_named("recurrence_intra_own", products),
+                  issues=False,
+                  swizzles={name: resources.widest_swizzle(dtype, keys)
+                            for name, (_, dtype) in blocks.items()})(*inputs, *into)
 
 
 def _band_form(call: Call, name: str):
@@ -368,7 +372,7 @@ def _own_staged(call: Call, keys: int, *, products: tuple[str, ...]) -> tuple:
                     *((swizzling.plain((chunk,), jnp.float32),) if "system" in products else ()),
                     swizzling.plain((outputs, chunk, algebra.SUB), jnp.float32))
     staging = (*own_staging(call, keys, padded=not by_thread(call)), *threaded)
-    return staging, {name: _band_form(call, name).landing(chunk, algebra.SUB) for name in products}
+    return staging, {name: _band_form(call, name).landing(algebra.SUB, algebra.SUB) for name in products}
 
 
 def _threaded(threaded: list, products: tuple[str, ...]) -> tuple:

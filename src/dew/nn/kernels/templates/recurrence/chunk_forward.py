@@ -267,14 +267,13 @@ class _Run:
 
 def _paired(q, k, decays, beta, taken, call, *, scale: float, solves: bool, prefix=None) -> tuple:
     """`intra._intra`'s scores, system where it `solves`, and prefix (`prefix` where given, the forward's
-    kept), each sub-chunk's own pairs added from a launch of their own (`own_pairs.intra_own`'s bands,
-    placed, `algebra.placed_bands`), on the entries the walk leaves zero, each rounded once: their sums exact
-    in the outputs' forms."""
+    kept), each sub-chunk's own pairs written in place on their diagonal blocks by a launch of their own
+    (`own_pairs.intra_own`), the entries the walk leaves zero, each rounded once."""
     *walked, prefix = _intra(q, k, decays, beta, taken, call, scale=scale, solves=solves, prefix=prefix)
-    own = own_pairs.intra_own(q, k, prefix, beta, taken, call, scale=scale,
-                              products=("scores", "system") if solves else ("scores",))
-    return (*(found + algebra.placed_bands(mine, chunk=call.chunk)
-              for found, mine in zip(walked, own, strict=True)), prefix)
+    into = tuple(jax.new_ref(found) for found in walked)
+    own_pairs.intra_own(q, k, prefix, beta, taken, call, scale=scale,
+                        products=("scores", "system") if solves else ("scores",), into=into)
+    return (*(ref[...] for ref in into), prefix)
 
 
 def _taken(dtype, family: mosaic.Family | None, *, per_key: bool, rounded: bool, delta: bool,
