@@ -81,21 +81,9 @@ def suffix_sums(x: jax.Array) -> jax.Array:
     takes meeting no arithmetic of it, where a product with the chunk's upper triangle of ones multiplied it
     by zero, a nonfinite one NaN in every sum (a turned gradient's entering-memory term of 2^126 times its
     cotangent, `templates.recurrence.turned`). Kimi delta attention's decay gradient's sums run in its own
-    pairs' launch (`suffix_summed`)."""
+    pairs' launch (`own_pairs._suffix_summed`)."""
     x = _wide(x)
     return jnp.flip(jnp.cumsum(jnp.flip(x, -2), axis=-2), -2)
-
-
-def suffix_summed(terms: jax.Array, start: jax.Array) -> jax.Array:
-    """Each position's sum over its tile's positions at and after it along `terms`' first axis (a chunk's
-    tokens), each column's `start` added, a running compensated pair down each column from its last position
-    (`precision.compensated_add`), each sum rounded once: the arithmetic `templates.scan.suffix_columns` runs
-    natively, a column a thread (Kimi delta attention's decay gradient finished in its own pairs' launch,
-    `own_pairs.key_pairs_own`)."""
-    terms = _wide(terms)
-    pairs = (terms, jnp.zeros_like(terms))
-    hi, lo = jax.lax.associative_scan(compensated_add, pairs, reverse=True, axis=0)
-    return compensated_add((hi, lo), (_wide(start)[None], jnp.zeros_like(hi[:1])))[0]
 
 
 def sums_before(x: jax.Array) -> jax.Array:
