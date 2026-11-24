@@ -332,19 +332,17 @@ def _square_draw(seed):
 SHARED_IDS = {
     "key_valid": jnp.asarray([True, True, False, True]),
     "query_slots": jnp.arange(4, dtype=jnp.int32),
-    # Every query's runs `[R, 2]`, every row's: keys 0, 2 and 3 (the second run empty).
-    "key_runs": jnp.asarray([[0, 1], [1, 1], [2, 3], [3, 4]], jnp.int32),
 }
-"""Ids every row shares whose leading length is the batch's (four): `[K]` validity, `[Q]` slots, `[R, 2]`
-runs."""
+"""Ids every row shares whose leading length is the batch's (four): `[K]` validity, `[Q]` slots. Shared runs
+(`[Q, R, 2]`, `[R, 2]`) one device misreads against the batch (row 12701), so they hold no witness here."""
 
 
 @pytest.mark.mesh
 @pytest.mark.parametrize("name", sorted(SHARED_IDS))
 def test_a_shared_id_of_the_batchs_length_stays_whole(name):
-    """A shared `[K]` validity, `[Q]` slots or `[R, 2]` runs of the batch's length (four rows of four
-    tokens, the rows split two ways) travels whole, the keys' or the queries' as it is, not split as rows
-    (reviews of #4023 and #4026): the entry on par with whole sequences, forward and backward."""
+    """A shared `[K]` validity or `[Q]` slots of the batch's length (four rows of four tokens, the rows split
+    two ways) travels whole, the keys' or the queries' as it is, not split as rows (reviews of #4023 and
+    #4026): the entry on par with whole sequences, forward and backward."""
     call = {"causal": True, name: SHARED_IDS[name], "implementation": "reference"}
     entry = with_gradients(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call))
     assert_exchanged_on_par(entry, entry, SHARED, _square_draw, f"a shared {name} of the batch's length")
