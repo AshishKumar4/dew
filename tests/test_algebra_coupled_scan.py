@@ -1,7 +1,8 @@
 """A coupled pair's chunk forms derived from its token update (`dew.algebra.coupled_scan`, `scan.Scan` of a
-pair state): Momentum DeltaNet's memory and momentum, stated token by token, walked in chunks through the derived
-step and outputs and held to the float64 truth (check 1) against the token-by-token scan, one sequence and
-packed documents' resets; and pairs no coupled form holds, or whose ranges no declaration bounds, refused."""
+pair state): Momentum DeltaNet's memory and momentum, stated token by token, walked in chunks through the
+derived step and outputs and held to the float64 truth (check 1) against the token-by-token scan, one
+sequence and packed documents' resets; and pairs no coupled form holds, or whose ranges no declaration
+bounds, refused."""
 
 import dataclasses
 import math
