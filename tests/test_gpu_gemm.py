@@ -48,6 +48,7 @@ import kernel_matrix
 import numpy as np
 import pytest
 import test_contracts_gemm as contracts_gemm
+import test_fed_walks as fed_walks
 import test_gemm_blockwise as gemm_blockwise
 import test_gemm_gather as gemm_gather
 import test_gemm_paired as gemm_paired
@@ -240,11 +241,11 @@ def _toolkit_cells() -> list[Cell]:
                "sm90", fault="ptxas's fold of a read path's sign op (row 4346)")
           for path in mosaic_toolkit.READS),
         *(Cell(f"consumers feeding their own ring split a step: {consumers} consumers from {lo}",
-               functools.partial(mosaic_toolkit.consumers_feeding_their_own_ring_split_a_step_on_an_h100,
+               functools.partial(fed_walks.consumers_feeding_their_own_ring_split_a_step_on_an_h100,
                                  consumers, lo), "sm90", fault=RING)
           for consumers, lo in ((1, 0), (2, 0), (2, 3))),
         *(Cell(f"consumers sharing one cp.async pipeline: {consumers} consumers{', split' * split}",
-               functools.partial(mosaic_toolkit.consumers_sharing_one_pipeline_on_an_a100, consumers, split),
+               functools.partial(fed_walks.consumers_sharing_one_pipeline_on_an_a100, consumers, split),
                "sm80", fault=SHARED)
           for consumers, split in ((1, False), (2, False), (2, True))),
     ]
