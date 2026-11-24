@@ -95,6 +95,10 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
     multiprocessor, or two consumers beside a producer (a cooperative tile), persistent over the output
     tiles in a planar snake, so the rows a band of `grid_block_n` column tiles shares and the matrix block
     the row tiles in flight share come from the L2."""
+
+    STORES_FORMS: ClassVar[bool] = False
+    """Whether its mainloop stores an output in a form of its own (`Hooks.out_forms`, `mosaic_gpu.gmm`'s
+    `out_forms`): `MosaicGmm`'s; a kernel gradient's (`mosaic_gpu.tgmm`) none."""
     config_cls: ClassVar[type[tiling.Tiles]] = tiling.Tiles
 
     def _operand_dtype(self, ba):
@@ -615,7 +619,8 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
                                   quantized.forms_of(hooks.out_forms, len(stored))),
                 family.specialized(config.share, pricing.tile_columns(config, family))) is not None:
             return False
-        if quantized.forms_refusal(hooks.out_forms, config, dense=bool(ba.arguments.get('dense'))):
+        if hooks.out_forms and (not self.STORES_FORMS or quantized.forms_refusal(
+                hooks.out_forms, config, dense=bool(ba.arguments.get('dense')))):
             return False
         sides = (('prologue_operands', hooks.prologue_axes), ('epilogue_operands', hooks.epilogue_axes))
         vectors = {(axis, jnp.dtype(side.dtype)) for name, axes_of in sides
@@ -796,6 +801,8 @@ the same 96 programs, 4.2x XLA's (W50-a100-1-M-NS-19-a100)."""
 class MosaicGmm(_Mosaic):
     """`Gmm` through the template's mainloop (`mosaic_gpu.gmm`) on a GPU family's bundle or a TPU core's,
     exact sums too: an FP8 product's running sum promoted into fp32 every step (`product.eight`)."""
+
+    STORES_FORMS: ClassVar[bool] = True
 
     ROWS: ClassVar[tuple[str, ...]] = ('tokens', 'joined')
     EXACT_SUMS: ClassVar[bool] = True
@@ -1306,6 +1313,11 @@ class MosaicGmm(_Mosaic):
                                              target=target)
         if beside:
             return out, residuals  # their columns unpadded (`_padded_extents`)
+        if hooks.out_forms:
+            from .templates.gemm import quantized
+
+            # Each output's columns along its own axes (a transposed reduced one's its first).
+            return quantized.trimmed(out, hooks.out_forms, None, width), residuals
         return jax.tree.map(lambda each: each[:, :width], out), residuals
 
     def _streamed_matrix(self, kernel, trans_rhs: bool) -> tuple:

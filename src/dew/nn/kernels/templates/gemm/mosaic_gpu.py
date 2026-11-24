@@ -374,9 +374,16 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     k = k if linked is None else linked.depth
     rows = rows if gather is None else gather.shape[0]
     dtypes = tuple(jnp.dtype(dtype) for dtype in (out_dtypes or (out_dtype,)))
+    forms = quantized.forms_of(out_forms, len(dtypes))
+    if (refusal := quantized.forms_refusal(forms, tiles, dense=dense)) is not None:
+        raise ValueError(f"{tiles}: {refusal}")
     if 0 in (k, rows):
-        return _gmm_of_no_depth(side_by_side, (rows, n), group_sizes, paired, scatter, dtypes, out_dtypes,
+        outs = _gmm_of_no_depth(side_by_side, (rows, n), group_sizes, paired, scatter, dtypes, out_dtypes,
                                 (epilogue, epilogue_operands, epilogue_axes))
+        if not forms:
+            return outs
+        stored = tuple(quantized.stored(out, form) for out, form in zip(outs, forms, strict=True))
+        return stored if out_dtypes else stored[0]
     _gmm_forms_refused(tiles, family_of(tiles, dtype), k, n, mx_scales, step_scales,
                        parts=(prologue, epilogue, paired, scales), transpose_rhs=transpose_rhs,
                        transpose_lhs=transpose_lhs, exact_sums=exact_sums)
@@ -398,7 +405,7 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
         step_scales=step_scales, scale_per=per, mx_scales=mx_scales, gather=gather, scatter=scatter,
         stored=None if scatter is None else rows, packed_rows=packed_rows, registers=registers, shared=shared,
         beside=side_by_side, beside_matrices=beside, chained=linked, packed_format=packed_format,
-        forms=quantized.forms_of(out_forms, len(dtypes)),
+        forms=forms,
         chained_operands=_chained_walked(chained, tiles, dtype, transpose_lhs, dense, interpret))
     outs = walk(multiprocessors=launched(fam, multiprocessors, walked, tail),
                 hooks=(prologue, prologue_axes, epilogue, epilogue_axes),
@@ -406,17 +413,18 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     if linked is not None:
         outs = guarded_walk(walk, outs, tiles, len(linked.depths),
                             launched(fam, multiprocessors, walked * linked.narrowed))
-    outs = _gmm_outputs(outs, dtypes, rows, tiles.splits)
+    outs = _gmm_outputs(outs, dtypes, rows, tiles.splits, forms)
     return outs if out_dtypes or beside else outs[0]
 
 
-def _gmm_outputs(outs: tuple, dtypes: tuple, rows: int, splits: int) -> tuple:
-    """`gmm`'s outputs from its walk's, each its first `rows`: a split's runs' fp32 partials summed in their
-    order (the same sums every call) and rounded once to each of `dtypes`."""
+def _gmm_outputs(outs: tuple, dtypes: tuple, rows: int, splits: int, forms: tuple = ()) -> tuple:
+    """`gmm`'s outputs from its walk's, each its first `rows` along its own rows (`quantized.trimmed`: a
+    transposed reduced output's second axis): a split's runs' fp32 partials summed in their order (the same
+    sums every call) and rounded once to each of `dtypes`."""
     if splits > 1:
         total = functools.reduce(jnp.add, tuple(outs[0]))
         outs = tuple(total.astype(dtype) for dtype in dtypes)
-    return tuple(out[:rows] for out in outs)
+    return quantized.trimmed(tuple(outs), forms, rows)
 
 
 def _joined(joined, lhs, paired, epilogue: tuple, *, parts: tuple, transpose_lhs: bool,
@@ -506,7 +514,7 @@ def launched(family: mosaic.Family, multiprocessors: int, walked: int,
 
 @tuning.lowered_once(('shape', 'tiles', 'transpose_rhs', 'dtypes', 'multiprocessors', 'interpret', 'hooks',
                       'dense', 'tail', 'exact_sums', 'transpose_lhs', 'scale_per', 'stored', 'packed_rows',
-                      'registers', 'shared', 'beside', 'chained', 'flagged', 'packed_format'))
+                      'registers', 'shared', 'beside', 'chained', 'flagged', 'packed_format', 'forms'))
 def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs: bool, dtypes: tuple,
                   multiprocessors: int, interpret, hooks: tuple, sides: tuple, dense: bool = False,
                   transpose_lhs: bool = False, paired: jax.Array | None = None,

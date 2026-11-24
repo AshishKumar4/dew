@@ -1323,7 +1323,8 @@ met yet; else the scaled blocks summed in XLA (`xla_products.step_scaled`)."""
 def blockwise_fp8_product(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Array, row_scales: jax.Array,
                           column_scales: jax.Array, *, out_dtype, epilogue: Callable | None = None,
                           out_dtypes: tuple | None = None, out_forms: tuple | None = None,
-                          interpret_on_cpu: bool = False) -> jax.Array | tuple[jax.Array, ...]:
+                          dense: bool = False, interpret_on_cpu: bool = False
+                          ) -> jax.Array | tuple[jax.Array, ...]:
     """Each group's rows of `lhs` (FP8 codes, `[rows, depth]`) times its matrix of `kernel` (FP8 codes,
     K-major `[groups, width, depth]`, as Hopper's FP8 tensor cores read it), each 128-deep block's partial,
     summed exactly in fp32, times its rows' scales (`row_scales`, `[depth / 128, rows]`) and its group's
@@ -1336,7 +1337,8 @@ def blockwise_fp8_product(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Ar
     template's epilogue, XLA's the same function of its sums: a next product's rows quantized from them,
     `quantized.blockwise_fp8_epilogue`, row 8547), each stored as `out_forms` states (`Hooks.out_forms`: an
     output broadcast across each block's columns stored one value a row a block, transposed, as a next
-    blockwise product reads its rows' scales)."""
+    blockwise product reads its rows' scales). `dense`: its one group covers every row (a padded chain's,
+    `projections.blockwise_chain`), which a transposed form's stores need (`quantized.forms_refusal`)."""
     from .templates.gemm import quantized
 
     sizes_spec = jax.ShapeDtypeStruct(group_sizes.shape, jnp.int32)
@@ -1347,13 +1349,13 @@ def blockwise_fp8_product(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Ar
         epilogue=epilogue, out_dtypes=tuple(dtype.name for dtype in dtypes) if out_dtypes else None,
         out_forms=out_forms)
     stored = dtypes[0].name if epilogue is not None else 'float32'
-    # One group's product of every row stores reduced outputs whole rows a share (`quantized.forms_refusal`).
-    whole = bool(out_forms) and group_sizes.shape[0] == 1
+    if dense and group_sizes.shape != (1,):
+        raise ValueError(f"a dense blockwise product is one group's, not {group_sizes.shape[0]}")
     # A column scale covers each column, or whole weight blocks of them, which a column tile falls within.
     tile = (_planned(launch, launch.bind(*_abstract(lhs, kernel), sizes_spec, out_dtype=stored,
                                          trans_rhs=True, interpret=interpret_on_cpu, exact_sums=True,
                                          scales=_abstract(row_scales, column_scales), hooks=hooks,
-                                         dense=whole))
+                                         dense=dense))
             if per == 1 or per % SCALE_DEPTH == 0 else None)
 
     def portable(lhs, kernel, sizes, row_scales, column_scales):
@@ -1375,7 +1377,7 @@ def blockwise_fp8_product(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Ar
     def mosaic(lhs, kernel, sizes, row_scales, column_scales, *, interpret):
         out = launch(lhs, kernel, sizes.astype(jnp.int32), out_dtype=stored, trans_rhs=True,
                      interpret=interpret, exact_sums=True, scales=(row_scales, column_scales), hooks=hooks,
-                     dense=whole)
+                     dense=dense)
         return out if epilogue is not None else finished(out)
 
     def portable_finished(*operands):

@@ -137,24 +137,25 @@ def quantize_mxfp8_epilogue():
 
 
 def _blockwise_fp8_quantized(values: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """`values` (`[rows, cols]`, `cols % SCALE_DEPTH == 0`, the bf16 values a recipe quantizes, as fp32) as
-    E4M3 codes a 1 x `SCALE_DEPTH` tile at a time and each tile's power-of-two scale (fp32, broadcast over
-    its tile's columns), bitwise `projections.rows_quantized`'s (`fake_quant.fp8_scaled_blocks`: amax floored
-    at 1e-4, the scale the ceiling power of two of amax / 448; codes E4M3 by `bits.encode_form`, ties to even,
-    saturated). Its scales are normal powers of two for every finite value, so the scaled value is the
-    product by the scale's reciprocal, exact, where a quotient would need `lowered_divide` (DeepSeek-V3's
-    blockwise FP8 recipe, row 8547)."""
-    from dew.nn.fake_quant import E4M3_MAX
+    """`values` (`[rows, cols]`, `cols % SCALE_DEPTH == 0`, fp32: the bf16 or fp32 values a recipe quantizes)
+    as E4M3 codes a 1 x `SCALE_DEPTH` tile at a time and each tile's power-of-two scale (fp32, broadcast over
+    its tile's columns), bitwise `projections.rows_quantized`'s: its scale `fake_quant.fp8_block_scale` of the
+    tile's amax, its codes E4M3 of the values over it, an IEEE quotient (`lowered_divide`, an infinite or NaN
+    scale's as the recipe's), by `bits.encode_form` (ties to even, saturated). Within a kernel the tile's
+    amax a row reduction of each tile's columns of the accumulator's layout (`_block_max`), elsewhere one
+    reduction of the tiles' view (DeepSeek-V3's blockwise FP8 recipe, row 8547)."""
+    from dew.nn.fake_quant import fp8_block_scale
+    from dew.nn.precision import lowered_divide
 
-    amax = jnp.maximum(_block_max(values, product_formats.SCALE_DEPTH), jnp.float32(1e-4))
-    word = jax.lax.bitcast_convert_type(amax * jnp.float32(1 / E4M3_MAX), jnp.uint32)
-    # 2 ** ceil(log2(amax / 448)) off its bits (`fake_quant._power_of_two_ceil`): its biased exponent, one
-    # more where any fraction bit is set; within the normal range for every finite amax past the floor.
-    biased = ((word >> jnp.uint32(23)) & jnp.uint32(0xFF)) + ((word & jnp.uint32(0x7FFFFF)) != 0).astype(
-        jnp.uint32)
-    scale = jax.lax.bitcast_convert_type(biased << jnp.uint32(23), jnp.float32)
-    inverse = jax.lax.bitcast_convert_type((jnp.uint32(254) - biased) << jnp.uint32(23), jnp.float32)
-    return encode_tile(values * inverse, bits.E4M3), scale
+    block = product_formats.SCALE_DEPTH
+    if _EPILOGUE_LAYOUT.get() is None:
+        rows, cols = values.shape
+        tiles = jnp.max(jnp.abs(values.reshape(rows, cols // block, block)), axis=-1)
+        amax = jnp.repeat(tiles, block, axis=1)
+    else:
+        amax = _block_max(values, block)
+    scale = fp8_block_scale(amax)
+    return encode_tile(lowered_divide(values, scale, jnp.int32(0)), bits.E4M3), scale
 
 
 def blockwise_fp8_epilogue(activation=None, out_dtype=jnp.bfloat16):
@@ -163,6 +164,9 @@ def blockwise_fp8_epilogue(activation=None, out_dtype=jnp.bfloat16):
     none), rounded to `out_dtype`, as E4M3 codes and 1 x 128 power-of-two scales (`_blockwise_fp8_quantized`),
     bitwise the recipe's `projections.rows_quantized` of that activation, which a separate pass formed from
     the stored product (row 8547)."""
+    if jnp.dtype(out_dtype).itemsize > 4:  # its quantizer reads fp32 (`_blockwise_fp8_quantized`)
+        raise ValueError(f"a quantizing epilogue reads fp32 at most, not {jnp.dtype(out_dtype)}")
+
     def quantized(acc):
         rounded = acc.astype(out_dtype)
         next_rows = rounded if activation is None else activation(rounded).astype(out_dtype)
@@ -232,7 +236,12 @@ def formed(config, out_forms: tuple | None):
     divisor = _reduced_divisor(out_forms)
     if divisor is None or config.staging is not None:
         return config
-    return dataclasses.replace(config, staging=(divisor, stores.OUTPUT_BUFFERS))
+    try:
+        return dataclasses.replace(config, staging=(divisor, stores.OUTPUT_BUFFERS))
+    except ValueError:
+        # A tile whose issuer emits narrower pieces than a block (tcgen05's 64 columns) stages no block a
+        # chunk: left unstated, which `forms_refusal` refuses, so its family declines the call.
+        return config
 
 
 def forms_refusal(out_forms: tuple | None, config, *, dense: bool) -> str | None:
@@ -259,3 +268,17 @@ def stored(value: jax.Array, form: tuple[int, bool] | None) -> jax.Array:
     divisor, transposed = form
     blocks = value[:, ::divisor]
     return blocks.T if transposed else blocks
+
+
+def trimmed(outs: tuple, forms: tuple, rows: int | None, columns: int | None = None) -> tuple:
+    """A call's outputs (`declared`'s) to their first `rows` rows and `columns` columns where given, along
+    each output's own axes: a transposed reduced output's rows its second axis, its columns its first, a
+    `divisor`th of them."""
+    def one(out, form):
+        if form is None:
+            return out[:rows] if columns is None else out[:rows, :columns]
+        divisor, transposed = form
+        blocks = None if columns is None else -(-columns // divisor)
+        return out[:blocks, :rows] if transposed else out[:rows, :blocks]
+
+    return tuple(one(out, form) for out, form in zip(outs, forms or (None,) * len(outs), strict=True))

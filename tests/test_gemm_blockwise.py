@@ -265,7 +265,7 @@ def test_a_blockwise_chain_through_the_template_is_its_two_projections_apart():
     cotangent = jnp.asarray(rng.normal(size=(256, 256)), jnp.bfloat16)
 
     def chained(x, up, down):
-        return projections.blockwise_chain(x, up, down, group_blocks, jax.nn.gelu, out_dtype=jnp.bfloat16,
+        return projections.blockwise_chain(x, up, down, jax.nn.gelu, out_dtype=jnp.bfloat16,
                                            interpret_on_cpu=True)
 
     def apart(x, up, down):
@@ -279,7 +279,9 @@ def test_a_blockwise_chain_through_the_template_is_its_two_projections_apart():
         fused = jax.jit(with_gradients(chained))(x, up, down, cotangent)
         separate = jax.jit(with_gradients(apart))(x, up, down, cotangent)
     for name, got, want in zip(("value", "d_x", "d_up", "d_down"), fused, separate, strict=True):
-        np.testing.assert_array_equal(np.asarray(got, np.float32), np.asarray(want, np.float32), err_msg=name)
+        assert got.dtype == want.dtype, (name, got.dtype, want.dtype)
+        bits = np.dtype(f"uint{8 * got.dtype.itemsize}")
+        np.testing.assert_array_equal(np.asarray(got).view(bits), np.asarray(want).view(bits), err_msg=name)
     assert ("blockwise_fp8", "mosaic") in {(route.choice, route.kernel) for route in routes}
 
 
@@ -287,18 +289,23 @@ def test_a_blockwise_fp8_epilogues_codes_and_scales_are_the_recipes():
     """The blockwise quantizing epilogue (`quantized.blockwise_fp8_epilogue`) on XLA's route of a product:
     its stored product rounded once, and its codes and transposed 1 x 128 scales of the activated product,
     bitwise `projections.rows_quantized` of the activation of that rounded product (row 8547), including
-    rows of zeros (amax floored at 1e-4) and a block past E4M3's range."""
+    rows of zeros (amax floored at 1e-4), a block past E4M3's range, and blocks holding an infinity and a
+    NaN beside finite and zero values."""
     from dew.nn.kernels.templates.gemm import quantized
 
     rng = np.random.default_rng(8550)
     values = rng.normal(size=(128, 256)).astype(np.float32)
     values[3] = 0.0
     values[5, :128] *= 1e4
+    values[7, 0], values[7, 1:4] = np.inf, (1.0, 0.0, -2.0)  # an infinite block's codes: the recipe's
+    values[9, 130], values[9, 131:134] = np.nan, (1.0, 0.0, -2.0)  # a NaN block's
     acc = jnp.asarray(values)
     rounded, codes, scales = quantized.blockwise_fp8_epilogue(jax.nn.relu)(acc)
     stored_scales = quantized.stored(scales, (128, True))
     want_codes, want_scales = projections.rows_quantized(jax.nn.relu(acc.astype(jnp.bfloat16)).astype(
         jnp.bfloat16))
-    np.testing.assert_array_equal(np.asarray(rounded), np.asarray(acc.astype(jnp.bfloat16)))
-    np.testing.assert_array_equal(np.asarray(codes.view(jnp.uint8)), np.asarray(want_codes.view(jnp.uint8)))
-    np.testing.assert_array_equal(np.asarray(stored_scales), np.asarray(want_scales.T))
+    np.testing.assert_array_equal(np.asarray(rounded).view(np.uint16),
+                                  np.asarray(acc.astype(jnp.bfloat16)).view(np.uint16))
+    np.testing.assert_array_equal(np.asarray(codes).view(np.uint8), np.asarray(want_codes).view(np.uint8))
+    np.testing.assert_array_equal(np.asarray(stored_scales).view(np.uint32),
+                                  np.asarray(want_scales.T).view(np.uint32))

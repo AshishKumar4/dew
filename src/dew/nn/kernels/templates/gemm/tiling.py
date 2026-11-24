@@ -140,12 +140,15 @@ class Tiles:
             return f"a stated chunk of {self.staging[0]} columns slices the accumulator's {unit}-column atoms"
         columns = self.block_n * (self.cluster if family.pairs_product else 1)
         piece = family.chunk_columns(columns)
-        forms = [each for each in dtypes if isinstance(each, stores.Output)]
+        forms = [each for each in dtypes if isinstance(each, (stores.Output, tuple))]
         if not forms:
             return stores.staging_refusal(columns, dtypes, self.staging, piece=piece)
-        return next((refusal for form in forms if (refusal := stores.staging_refusal(
-            columns, (form.dtype,), self.staging, piece=piece,
-            packed=(form,) if form.divisor > 1 or form.transposed else ())) is not None), None)
+        # Each output on its own, a packed one's chunk its own (`stores.Output.of` of a `(shape, dtype)`).
+        outputs = [stores.Output.of(each) if isinstance(each, (stores.Output, tuple))
+                   else stores.Output.of(((0, columns), each)) for each in dtypes]
+        return next((refusal for output in outputs if (refusal := stores.staging_refusal(
+            columns, (output.dtype,), self.staging, piece=piece,
+            packed=(output,) if output.divisor > 1 or output.transposed else ())) is not None), None)
 
 
 ACCUMULATOR_COLUMNS = 8

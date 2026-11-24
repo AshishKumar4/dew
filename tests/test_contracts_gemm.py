@@ -286,13 +286,12 @@ def test_a_blockwise_fp8_chain_holds_every_reverse_order(edge):
     reverse order, under a nested jit and a scan, in the rows and both matrices, finite wherever float64 is a
     normal float32 and wherever the plain product of the two through the activation is, at values whose
     products near float32's ends (row 8547). It takes no forward order: a custom VJP has none."""
-    group_blocks = jnp.asarray([2], jnp.int32)
     primals = normal_draw(8547, (256, 128), (1, 128, 256), (1, 256, 128), scale=EDGES[edge])
     direction = normal_draw(8548, (256, 128), (1, 128, 256), (1, 256, 128), scale=EDGES[edge])
     (cotangent,) = normal_draw(8549, (256, 128))
 
     def recipe(rows, up, down):
-        return projections.blockwise_chain(rows, up, down, group_blocks, jax.nn.relu, out_dtype=rows.dtype)
+        return projections.blockwise_chain(rows, up, down, jax.nn.relu, out_dtype=rows.dtype)
 
     def plain(rows, up, down):
         return jax.nn.relu(rows @ up[0]) @ down[0]
