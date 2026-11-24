@@ -966,13 +966,12 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
                      loop_passes: jax.Array | None = None, amax: bool = False):
         """Score per-token next-token cross entropy over a `[B, seq_len + 1]` batch.
 
-        Returns `Scores`: the losses, the weight of each target, whether each
-        prediction was right, the states behind them, and what `routing`,
-        `depths`, `qk_stats`, `indexer`, `layers` and `amax` (the delayed-scaling NVFP4 projections'
-        recorded largest magnitudes, `Step.amax`) asked for. `layers`
-        names the model's layers whose output states to keep, `layers_N` in
-        its tree, as a feature distillation reads them. `rows` weighs each row
-        (`Objective.row_weights`), a filled row's targets at nothing.
+        Returns `Scores`: the losses, the weight of each target, whether each prediction was right, the
+        states behind them, and what `routing`, `depths`, `qk_stats`, `indexer`, `layers` and `amax` (the
+        delayed-scaling NVFP4 projections' recorded largest magnitudes, `Step.amax`) asked for. `layers`
+        names the model's layers whose output states to keep, `layers_N` in its tree, as a feature
+        distillation reads them. `rows` weighs each row (`Objective.row_weights`), a filled row's targets
+        at nothing.
 
         A packed batch carries its rows' `coordinates` (`dew.batch.coordinates`),
         their documents and per-document positions. The last token of a
@@ -1033,9 +1032,8 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
             replay["routed_experts"] = jax.tree.map(lambda record: jnp.asarray(record)[:, :-finals], routed)
             if covered is not None:
                 replay["routed"] = jnp.asarray(covered, bool)[:, :-finals]
-        collections = (([ROUTER_COLLECTION] if routing else []) + ([QK] if qk_stats else [])
-                       + ([INDEXER_COLLECTION] if indexer else []) + ([INSPECTED] if watched else [])
-                       + ([NVFP4_AMAX] if amax else []))
+        collections = [name for name, asked in ((ROUTER_COLLECTION, routing), (QK, qk_stats),
+                       (INDEXER_COLLECTION, indexer), (INSPECTED, watched), (NVFP4_AMAX, amax)) if asked]
         stream_depth = depths and _streamed_depths(self.model)
         opened = [*collections, *(['prediction_inputs'] if stream_depth else []), *([EXITS] if exits else [])]
         adaptation = self.adaptation
@@ -1805,7 +1803,7 @@ class LMObjective(TokenScorer):
             watched=step.watched is not None,
             z_loss=self.z_loss if summed and not exits else None, logits=logits,
             predict=predict, rows=rows, exits=exits, loop_passes=loop_passes_given(batch), amax=step.amax)
-        losses, weights, log_z, correct, _, _, routing, depths, qk, kls, sums, _, _, _, passes = scores
+        losses, weights, log_z, correct, _, _, routing, depths, qk, kls, sums, _, _, _, passes, _ = scores
         width, length = at_least_fp32(losses.dtype), losses.shape[1]
 
         def shares(values: jax.Array, counts: jax.Array) -> jax.Array:

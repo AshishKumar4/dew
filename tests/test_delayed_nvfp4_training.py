@@ -4,6 +4,7 @@ largest across a step's calls and microbatches and rolls it into the history onc
 
 import jax
 import numpy as np
+import optax
 
 from dew.checkpoints import Checkpoints
 from dew.data import Memory
@@ -13,7 +14,6 @@ from dew.nn.dense import NVFP4_HISTORY
 from dew.nn.kernels import generation
 from dew.nn.precision import DTYPE_PRESETS, LowPrecision, Numerics
 from dew.objectives.lm import LMObjective
-from dew.optim import AdamW, OptimConfig
 from dew.training import Trainer
 
 SEQ = 16
@@ -27,7 +27,7 @@ def delayed_lm(split: int, checkpoints: Checkpoints | None = None) -> Trainer:
     variables hold their histories), its batch of eight rows read in `split` microbatches."""
     model = CausalTransformer(vocab_size=64, emb_features=128, num_layers=2, num_heads=2, mlp_features=256,
                               max_seq_len=SEQ)
-    return Trainer(LMObjective(model, seq_len=SEQ), OptimConfig(optimizer=AdamW(), lr=1e-3), key=0,
+    return Trainer(LMObjective(model, seq_len=SEQ), optax.adamw(1e-3), key=0,
                    split=split, checkpoints=checkpoints)
 
 
