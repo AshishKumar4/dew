@@ -1815,9 +1815,7 @@ class Transaction:
         handled = [_state_path(path) for path in probe.handled]
         if not handled:
             return True
-        if probe.batched:
-            # One call standing for each lane's would pool the sum into itself once a lane.
-            return False
+        shapes = {_state_path(path): read for path, read in probe.shapes.items()}
         roots: dict[jcore.Var, _Root] = {}
         for (path, _), value in zip(jax.tree_util.tree_flatten_with_path(trainable)[0], program.invars,
                                     strict=True):
@@ -1825,7 +1823,8 @@ class Transaction:
             root = next((run for run in handled if names[:len(run)] == run), None)
             if root is not None:
                 collection = path[0].key if isinstance(path[0], jax.tree_util.DictKey) else None
-                roots[value] = _Root(root, collection == in_backward.MASTERS)
+                roots[value] = _Root(root, collection == in_backward.MASTERS,
+                                     shapes[root])
         reads: collections.Counter[tuple[str, ...]] = collections.Counter()
         refused: set[tuple[str, ...]] = set()
         _run_reads(program, roots, reads, refused)
@@ -2048,11 +2047,13 @@ than Linen's scan does (`dew.nn.backbones.decoder_stack._updated_in_backward`), 
 
 
 class _Root(NamedTuple):
-    """A run's variable in a loss's program (`_run_reads`): its run's path, and whether it is the window's
-    sum the run pools into (`dew.nn.in_backward.MASTERS`), which only the run's own rule reads."""
+    """A run's variable in a loss's program (`_run_reads`): its run's path, whether it is the window's sum
+    the run pools into (`dew.nn.in_backward.MASTERS`), which only the run's own rule reads, and the shapes of
+    what the run's call reads as its trace saw them (`dew.nn.in_backward.InBackward.shapes`)."""
 
     run: tuple[str, ...]
     sum: bool
+    called: tuple[tuple[int, ...], ...]
 
 
 def _run_reads(program: jcore.Jaxpr, roots: Mapping[jcore.Var, _Root],
@@ -2074,7 +2075,11 @@ def _run_reads(program: jcore.Jaxpr, roots: Mapping[jcore.Var, _Root],
         name = equation.primitive.name
         if name.startswith("custom_vjp") and any(root.sum for root in read):
             reads.update(runs)
-            if any(_draws(inner) for inner in jcore.jaxprs_in_params(equation.params)):
+            # Its operands' shapes the run's own as its trace saw them, else a batching transform's lanes
+            # beside them: one call standing for each lane's.
+            given = tuple(tuple(value.aval.shape) for value in equation.invars[-len(read[0].called):])
+            if (given != read[0].called
+                    or any(_draws(inner) for inner in jcore.jaxprs_in_params(equation.params))):
                 refused |= runs
             continue
         if name in _PASSED:
