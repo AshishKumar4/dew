@@ -85,14 +85,25 @@ def _blocks_reduced(values: jax.Array, block: int, fill: jax.Array) -> list[jax.
     return [jnp.max(jnp.where(block_id == group, values, fill), axis=1) for group in range(groups)]
 
 
+def _divided(numerator: jax.Array, denominator: jax.Array | float) -> jax.Array:
+    """The IEEE fp32 quotient of a tile by one of its shape or by a constant: PTX's `div.rn.f32` inline in a
+    compiled GPU epilogue (`inline_forms.quotients`, one instruction where the software rule issued dozens an
+    element), the software rule elsewhere (`precision.lowered_divide`: XLA's arms, interpreted or not, whose
+    own division a CPU flushes and a GPU approximates; row 4023), the same quotient."""
+    from dew.nn.precision import lowered_divide
+
+    layout = _EPILOGUE_LAYOUT.get() if launches.interpreting() is False else None
+    if layout is None:
+        return lowered_divide(numerator, denominator, jnp.int32(0))
+    return inline_forms.quotients(numerator, denominator, layout)
+
+
 def _quantized_epilogue(minifloat: bits.Minifloat, acc: jax.Array,
                         scale: jax.Array | None = None) -> jax.Array:
     if scale is None:
         return encode_tile(acc, minifloat)
-    from dew.nn.precision import lowered_divide
-
     s = jax.lax.broadcast_in_dim(scale, acc.shape, (0,)) if scale.ndim == 1 else scale
-    return encode_tile(lowered_divide(acc, s, jnp.int32(0)), minifloat)
+    return encode_tile(_divided(acc, s), minifloat)
 
 
 def quantize_epilogue(minifloat: bits.Minifloat):
@@ -103,18 +114,15 @@ def quantize_epilogue(minifloat: bits.Minifloat):
 def _nvfp4_quantize_epilogue(acc: jax.Array, tensor_scale: jax.Array) -> tuple[jax.Array, jax.Array]:
     """GEMM epilogue quantizing each 16-column block of fp32 `acc` (`[rows, cols]`, `cols % 16 == 0`) to
     E2M1 nibbles (`uint8`) and E4M3 block scales (`float8_e4m3fn`, broadcast over each 16-column block) via
-    `bits.encode_form` inline PTX and `precision.lowered_divide`, bitwise matching
+    `bits.encode_form` inline PTX and IEEE division (`_divided`), bitwise matching
     `formats.NvFp4Block.quantized` at `tensor_scale` (rows 8547, 12037)."""
     from dew.nn.fake_quant import E2M1_MAX
-    from dew.nn.precision import lowered_divide
 
     block_max = _block_max(acc, product_formats.NVFP4.depth)
-    zero = jnp.int32(0)
     ts_in = tensor_scale.astype(jnp.float32)
     ts = (jax.lax.broadcast_in_dim(ts_in, acc.shape, (0,)) if ts_in.ndim == 1
           else jnp.broadcast_to(ts_in, acc.shape))
-    e2m1_max = jnp.full(acc.shape, E2M1_MAX, jnp.float32)
-    ratio = lowered_divide(lowered_divide(block_max, ts, zero), e2m1_max, zero)
+    ratio = _divided(_divided(block_max, ts), float(E2M1_MAX))
     nearest_f8 = encode_tile(ratio, bits.E4M3)
     nearest = jax.lax.bitcast_convert_type(nearest_f8, jnp.uint8).astype(jnp.uint32)
     scale_u32 = jnp.where(bits.scales_decoded(nearest) < ratio,
@@ -122,7 +130,7 @@ def _nvfp4_quantize_epilogue(acc: jax.Array, tensor_scale: jax.Array) -> tuple[j
     each = bits.scales_decoded(scale_u32)
     pos = each > jnp.float32(0.0)
     safe_each = jnp.where(pos, each, jnp.float32(1.0))
-    scaled = jnp.where(pos, lowered_divide(lowered_divide(acc, ts, zero), safe_each, zero), jnp.float32(0.0))
+    scaled = jnp.where(pos, _divided(_divided(acc, ts), safe_each), jnp.float32(0.0))
     e2m1_codes = encode_tile(scaled, bits.E2M1)
     scale_f8 = jax.lax.bitcast_convert_type(scale_u32.astype(jnp.uint8), jnp.float8_e4m3fn)
     return e2m1_codes, scale_f8

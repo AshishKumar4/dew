@@ -30,10 +30,11 @@ def _same(fused, separate, names) -> None:
 
 
 def _operands(seed: int, rows: int, gated: bool):
+    # Every contraction whole 256s, an E2M1 product's block-scaled step on tcgen05.
     rng = np.random.default_rng(seed)
     x = jnp.asarray(rng.normal(size=(rows, 256)), jnp.bfloat16)
-    matrices = [jnp.asarray(rng.normal(size=(256, 384)) / 16, jnp.bfloat16) for _ in range(1 + gated)]
-    down = jnp.asarray(rng.normal(size=(384, 256)) / 16, jnp.bfloat16)
+    matrices = [jnp.asarray(rng.normal(size=(256, 512)) / 16, jnp.bfloat16) for _ in range(1 + gated)]
+    down = jnp.asarray(rng.normal(size=(512, 256)) / 16, jnp.bfloat16)
     cotangent = jnp.asarray(rng.normal(size=(rows, 256)), jnp.bfloat16)
     return x, matrices, down, cotangent
 
@@ -154,5 +155,5 @@ def test_a_delayed_nvfp4_up_projection_compiles_for_a_b200_within_its_resources(
 
     case = KernelCase("nvfp4 chain up projection", _finished_up_projection)
     found = compile_mosaic_kernels([case], "sm100")
-    assert found and all(record.get("kernels") for record in found), found
-    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+    assert found and not mosaic_failures(found), "\n".join(mosaic_failures(found))
+    assert all(record.get("kernels") for record in found), found

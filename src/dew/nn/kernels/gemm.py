@@ -1563,19 +1563,20 @@ def nvfp4_block_finished(lhs: NvFp4Block, matrices: NvFp4Block, group_blocks: ja
     (`Hooks.out_forms`: an output broadcast across each block's columns stored one value a row a block,
     transposed). `epilogue_operands`, its side tiles (`[rows, columns]` each), the epilogue taking them after
     the sums; `epilogue_scalars`, fp32 scalars after them (a delayed recipe's next tensor scale), each a
-    tile of its value there, carried as a vector over the columns (the launch's side of one value a column,
-    as a bias's). `dense`: its one group covers every row, which a transposed form's stores need
-    (`quantized.forms_refusal`)."""
+    tile of its value there, carried as a vector over the rows (the launch's side of one value a row: a
+    register a thread where a thread holds a row, tcgen05's, where a vector over the columns held a chunk's
+    64 and spilled 7108 bytes; witness/b1-probe-3). `dense`: its one group covers every row, which a
+    transposed form's stores need (`quantized.forms_refusal`)."""
     tiles = tuple(epilogue_operands)
-    vectors = tuple(jnp.broadcast_to(jnp.asarray(scalar, jnp.float32), matrices.codes.shape[1:2])
+    vectors = tuple(jnp.broadcast_to(jnp.asarray(scalar, jnp.float32), lhs.codes.shape[:1])
                     for scalar in (lhs.scale, matrices.scale, *epilogue_scalars))
 
     def scaled(acc, *sides):
-        held, wide = sides[:len(tiles)], [jax.lax.broadcast_in_dim(vector, acc.shape, (1,))
+        held, wide = sides[:len(tiles)], [jax.lax.broadcast_in_dim(vector, acc.shape, (0,))
                                           for vector in sides[len(tiles):]]
         return epilogue(twice_scaled(acc, *wide[:2]), *held, *wide[2:])
 
-    side_axes = (LAUNCH_AXES['epilogue'],) * len(tiles) + (('columns',),) * len(vectors)
+    side_axes = (LAUNCH_AXES['epilogue'],) * len(tiles) + (('rows',),) * len(vectors)
     return _block_scaled(lhs, matrices, group_blocks, NVFP4_BLOCK_OP, interpret_on_cpu, finishing=(
         scaled, (*tiles, *vectors), side_axes, tuple(jnp.dtype(dtype) for dtype in out_dtypes), out_forms,
         dense))
