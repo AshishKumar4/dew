@@ -102,7 +102,7 @@ def asked(rows):
                      instructions="Which banking request is this?").read("memory")
 
 objective = DecisionObjective(qwen, loss=LogLoss() + 0.5 * Brier())
-state = Trainer(objective, OptimConfig(learning_rate=1e-4), key=0).fit(
+state = Trainer(objective, OptimConfig(lr=1e-4), key=0).fit(
     asked(train).shuffle(0).repeat().batch(32), steps=2_000, eval_every=500,
     validation={"val": asked(val).batch(32)}, metrics=[Accuracy(), ECE()])
 
@@ -145,7 +145,7 @@ A run saves like any other: `Decide.from_run(run)` and `dew.pipeline(run)` rebui
 `recipes/decision/train.py` fine-tunes on BANKING77 by default:
 
 ```bash
-python recipes/decision/train.py --trainer.horizon.epochs 3
+python recipes/decision/train.py --trainer.epochs 3
 ```
 
 It starts from Laya's checkpoint, or from `--pretrained Qwen/Qwen3-0.6B --lora.rank 16 --lora.modules q_proj v_proj`. A table of your own is a run file that names its chains, which `dew train` reads. `decisions` reads CSV, JSON, JSONL and parquet files and Hub datasets: each row's `text` is the state, and its `label` the answer to one choice question.
@@ -157,12 +157,12 @@ from dew.config import TrainerConfig
 from dew.data import Files
 from dew.decision import decisions
 from dew.decision.config import DecisionRunConfig
-from dew.training import Horizon
 
 train, held = Files("tickets.csv").holdout(0.1)
-run = DecisionRunConfig(data=train.pipe(decisions, question="team").read("memory").shuffle().repeat().batch(32),
+run = DecisionRunConfig(data=train.pipe(decisions,
+                                        question="team").read("memory").shuffle().repeat().batch(32),
                         validation=held.pipe(decisions, question="team").read("memory").batch(32),
-                        trainer=TrainerConfig(horizon=Horizon(epochs=4)))
+                        trainer=TrainerConfig(epochs=4))
 ```
 
 ```bash

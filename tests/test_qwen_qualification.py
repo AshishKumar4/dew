@@ -22,6 +22,7 @@ from dew.interop import Pretrained
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.sampling import Sampling, generate
+from dew.training import TrainerAdvanced
 
 ROOT = Path(__file__).parent / "fixtures" / "hf"
 
@@ -89,7 +90,7 @@ def test_a_media_source_trains_and_saves_text_without_loading_media(monkeypatch,
     batch = inputs.take_rows(jnp.arange(rows) % 2)
     data = Loader(train=lambda partition: iter([{"text": batch}]), val=None, records=rows, batch=rows)
     state = Trainer(objective, optax.sgd(1e-3), key=jax.random.key(0), mesh=MeshSpec(),
-                    layout=Layout(min_shard=2**30)).fit(data, steps=1, log_every=1)
+                    advanced=TrainerAdvanced(layout=Layout(min_shard=2**30))).fit(data, steps=1, log_every=1)
     assert any(np.any(np.asarray(before) != np.asarray(after)) for before, after in zip(
         jax.tree.leaves(loaded.variables), jax.tree.leaves(state.variables), strict=True))
     exported = tmp_path / "exported"

@@ -25,7 +25,6 @@ from dew.optim import Adam, OptimConfig
 from dew.registry import ModelConfig
 from dew.state import TrainState
 from dew.training import Trainer
-from dew.training.budget import Horizon
 
 WORLD = "dew.objectives.world_model"
 WINDOW, SIZE, BATCH = 4, 8, 8
@@ -33,7 +32,7 @@ WINDOW, SIZE, BATCH = 4, 8, 8
 TOKENIZER: dict[str, Any] = {"patch": 4, "width": 16, "depth": 1, "heads": 2, "latents": 4, "bottleneck": 4}
 DYNAMICS: dict[str, Any] = {"spatial": 2, "width": 16, "depth": 1, "heads": 2, "levels": 3, "frames": WINDOW}
 """The tokenizer's and the dynamics model's fields at a test's size; the run derives the rest."""
-OPTIM = OptimConfig(optimizer=Adam(), learning_rate=1e-3)
+OPTIM = OptimConfig(optimizer=Adam(), lr=1e-3)
 TOKENIZER_STEPS, DYNAMICS_STEPS = 3, 2
 
 
@@ -57,7 +56,7 @@ def stored(directory: Path, size: int = SIZE, *, states: bool = True, actions: i
 
 
 def trainer(root: Path, steps: int, key: int) -> TrainerConfig:
-    return TrainerConfig(checkpoint_dir=str(root), horizon=Horizon(steps=steps), log_every=1, eval_every=None,
+    return TrainerConfig(checkpoint_dir=str(root), steps=steps, log_every=1, eval_every=None,
                          checkpoint_every=None, key=key, multi_host=False)
 
 
@@ -226,13 +225,13 @@ def test_a_command_line_names_the_stage_its_record_does(tmp_path):
                      model_fields={"spatial": 2, "width": 16, "depth": 1, "heads": 2, "levels": 3,
                                    "frames": WINDOW})
     args = ["--tokenizer.run", str(tmp_path / "tokenizer"), "--tokenizer.step", "3",
-            "--optim.optimizer", "adam", "--optim.learning-rate", "1e-3",
-            "--trainer.checkpoint-dir", str(tmp_path), "--trainer.horizon.steps", "2", "--trainer.log-every",
+            "optim.optimizer:adam", "--optim.lr", "1e-3",
+            "--trainer.checkpoint-dir", str(tmp_path), "--trainer.steps", "2", "--trainer.log-every",
             "1",
             "--trainer.multi-host", "False"]
     recorded = dataclasses.replace(
         dynamics_run(tmp_path, None, tmp_path / "tokenizer"), data=None,
         tokenizer=TokenizerConfig(str(tmp_path / "tokenizer"), 3),
-        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), horizon=Horizon(steps=2), log_every=1,
+        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), steps=2, log_every=1,
                               multi_host=False))
     assert WorldModelRunConfig.cli(args, default=default) == recorded

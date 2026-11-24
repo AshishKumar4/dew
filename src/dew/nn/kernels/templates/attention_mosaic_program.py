@@ -1364,6 +1364,9 @@ class _Program[T: (Tiles, BackwardTiles)]:
     value_columns: int | None = None
     """Where a forward's values are its keys' leading columns (`MosaicForward.in_key`), the first of the key
     columns its value tile views in the key slot; None where it streams its values."""
+    training: bool = False
+    """Whether this launch is a training/backward walk where padding query rows must never see unmasked
+    interior tiles."""
 
     @property
     def ahead(self) -> bool:
@@ -1515,10 +1518,12 @@ class _Program[T: (Tiles, BackwardTiles)]:
 
         return lax.fori_loop(0, held, body, carry)
 
-    def _positions_reach(self, first, spans: _Spans, row):
-        """`reach`'s for a call whose intervals each hold `per_span` queries: the key tiles from the first any
-        of its rows' intervals starts in to the last any ends in, none seen whole where the block holds a
-        padding row (a decode step's few rows of a tile), else those every one of its intervals covers."""
+    def _positions_bounds(self, first, spans: _Spans, row):
+        """`(lo, hi, full_lo, full_hi)` key-tile bounds for a per-position decode block (`_positions`):
+        `[lo, hi)` covers every visible key, and `[full_lo, full_hi)` covers interior tiles seen whole by
+        every real query row in the block. Padding rows (`first + block_q > queries`) only disable whole
+        tiles during training/backward; inference decode masks padding rows out of status and decided
+        verdicts instead so interior tiles skip per-element masking (row 4045)."""
         block_k, big = self.tiles.block_k, jnp.iinfo(jnp.int32).max
 
         def step(carry, _, start, end, holds):
@@ -1532,13 +1537,32 @@ class _Program[T: (Tiles, BackwardTiles)]:
         lo, hi, full_lo, full_hi = self._positions(
             first, spans, row, step, (jnp.int32(big), jnp.int32(0), jnp.int32(0), jnp.int32(big)))
         lo = jnp.minimum(lo, hi)
-        if self.padded(first) is not False:
+        if self.training and self.padded(first) is not False:
             full_hi = jnp.where(self.padded(first), full_lo, full_hi)
+        return lo, hi, full_lo, full_hi
+
+    def _positions_reach(self, first, spans: _Spans, row):
+        """`reach`'s for a call whose intervals each hold `per_span` queries (`_positions_bounds`)."""
+        lo, hi, full_lo, full_hi = self._positions_bounds(first, spans, row)
 
         def whole(index):
             return (index >= full_lo) & (index < full_hi)
 
         return *self._sliced(lo, hi), whole
+
+    def reach_segmented(self, first, spans: _Spans | None, row):
+        """`reach` paired with `forward_whole_run` from one `_positions_bounds` scan on per-position decode
+        spans (`spans.lo is None`, row 4045), avoiding a duplicate span-ref scan."""
+        if spans is not None and spans.lo is None:
+            lo, hi, full_lo, full_hi = self._positions_bounds(first, spans, row)
+
+            def whole(index):
+                return (index >= full_lo) & (index < full_hi)
+
+            run = None if self.training else (full_lo, full_hi)
+            return *self._sliced(lo, hi), whole, run
+        lo, hi, whole = self.reach(first, spans, row)
+        return lo, hi, whole, self.forward_whole_run(first, spans)
 
     def bounds(self, first, spans: _Spans, row) -> tuple[tuple, jax.Array | None]:
         """A query block's intervals and its ids as `_coords` reads them (`_query_bounds`), read once before
@@ -1602,11 +1626,12 @@ class _Program[T: (Tiles, BackwardTiles)]:
         if run is None:
             return ((step, lo, hi),)
         raw_start, raw_end = run
-        end = jnp.clip(raw_end, lo, hi)
         if raw_start is None:
+            end = jnp.clip(raw_end, lo, hi)
             return ((functools.partial(step, masked=False), lo, end),
                     (functools.partial(step, masked=True), end, hi))
         start = jnp.clip(raw_start, lo, hi)
+        end = jnp.clip(jnp.maximum(raw_end, raw_start), lo, hi)
         return ((functools.partial(step, masked=True), lo, start),
                 (functools.partial(step, masked=False), start, end),
                 (functools.partial(step, masked=True), end, hi))
@@ -1619,9 +1644,10 @@ class _Program[T: (Tiles, BackwardTiles)]:
         faster a causal one at Qwen3-8B's)."""
         return None if spans is not None or not self.causal else self._whole_run(k_first, q_steps)
 
-    def forward_whole_run(self, first, spans: _Spans | None) -> tuple[None, jax.Array] | None:
-        """The key tiles `[0, whole_end)` a causal forward/dQ query block from `first` sees whole (`reach`),
-        one unbroken run from `lo` for `segmented`; None for non-causal or spans calls (rows 10790, 4839)."""
+    def forward_whole_run(self, first, spans: _Spans | None) -> tuple[jax.Array | None, jax.Array] | None:
+        """The key tiles `[0, whole_end)` a causal inference forward/dQ query block from `first` sees whole
+        (`reach`), one unbroken run for `segmented` (rows 10790, 4839); per-position decode interior runs
+        come from `reach_segmented`."""
         if spans is not None or not self.causal:
             return None
         walked = self.walked(first)
@@ -1821,18 +1847,20 @@ class BlockPlan(NamedTuple):
                 or (family.places_on_role if kept is None else kept) or value_width <= 128):
             return 0
         ed = dtype if self.out_dtype is None else self.out_dtype
-        if narrow := narrow_out_stage(family, value_width, ed):
-            return narrow
-        return stores.staged_columns(value_width, (ed,))
+        swizzle = output_stage_swizzle(family, value_width, ed) or stores.STAGED_BYTES
+        return stores.staged_columns(value_width, (ed,), swizzle=swizzle)
 
 
-def narrow_out_stage(family: mosaic.Family, value_width: int, out_dtype) -> int:
-    """64B-swizzled 32-col TMA output stage width for wide (>128) 16-bit register forwards (row 5272)."""
+def output_stage_swizzle(family: mosaic.Family, value_width: int, out_dtype) -> int | None:
+    """64B swizzle width for wide (>128) 16-bit register forwards (`stores.staged_columns`, row 5272)."""
+    swizzle = swizzling.SWIZZLE_BYTES // 2
+    itemsize = jnp.dtype(out_dtype).itemsize
     if (value_width <= 128 or not family.budgets_registers or not family.adds_through_shared
-            or family.places_on_role or jnp.dtype(out_dtype).itemsize != 2):
-        return 0
-    chunk = swizzling.swizzle_columns(out_dtype, swizzling.SWIZZLE_BYTES // 2)
-    return chunk if value_width % chunk == 0 else 0
+            or family.places_on_role or itemsize != 2
+            or stores.staged_columns(value_width, (out_dtype,), swizzle=swizzle) * itemsize != swizzle):
+        return None
+    return swizzle
+
 
 def forward_block_plan(total_v: int, columns: int | None, out_dtype, *, has_output_mod: bool,
                        training: bool) -> BlockPlan:

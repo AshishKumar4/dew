@@ -170,7 +170,7 @@ def inspected[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, 
     microbatches, and reports the step that commits. An `OptimConfig` is built over
     `steps`, the run's length, as `fit(steps=...)` builds it. The stepped state is discarded."""
     if trainer.inspection is None:
-        raise ValueError("the trainer names no inspection (Trainer(inspection=...)) to report")
+        raise ValueError("the trainer names no inspection (TrainerAdvanced(inspection=...)) to report")
     # The phase the batch was read in (`PhasePasses.at`), read off its host fields, which no step takes.
     trainer.phase_passes.at(batch)
     batch, _ = split_fields(batch)

@@ -339,28 +339,36 @@ class _PerShare(Forwarding):
         self._grain_restores(json_value(rules.get("grain"), "saved grain rule"))
 
     def _grain_restores(self, written: JSON) -> None:
-        """Restore the saved iterator state now, through the iterators that own it, where a Grain of another
-        version wrote it (`written`, its `grain` rule): a state that Grain's iterators read otherwise
-        than this Grain's is refused, naming both, where its restore refuses its form; one they read alike
-        resumes. The read opened before it, its failure (a file it cannot open) is its own, never a version's
-        (row 12178), as a cursor of Dew's own that holds no position is (`MalformedPosition`)."""
-        if written == GRAIN or self._saved is None:
+        """Restore the saved iterator state now, as its restore is asked, through the iterators that own it,
+        so what they refuse is refused where a resume asks it (`dew.training._fit`, which a relaxed one
+        reads afresh), never at the first read past it: a position of another cut of its store
+        (`dew.data.shards._Passing`), a corrupt cursor of Dew's own (`MalformedPosition`), and, where a
+        Grain of another version wrote it (`written`, its `grain` rule), a state that Grain's iterators read
+        otherwise than this Grain's, naming both; one they read alike resumes. The read opened before it,
+        its failure (a file it cannot open) is its own, never a version's (row 12178)."""
+        if self._saved is None:
             return
-        read = self._open()
+        read, saved = self._open(), self._saved
+        # Refused, the reader holds no position of it: a restart (`dew.training._fit.restarted`) reads its
+        # own position afresh.
+        self._saved = None
         try:
-            read.set_state(self._saved)
-        except _position.MalformedPosition:
-            # A corrupt cursor of Dew's own, whatever Grain wrote beside it: refused as it is.
+            read.set_state(saved)
+        except (_position.MalformedPosition, PlanChanged):
+            # A corrupt cursor of Dew's own, or a position its plan refuses (another cut of its store),
+            # whatever Grain wrote beside it: refused as it is.
             read.close()
             raise
         except (KeyError, TypeError, ValueError, IndexError) as error:
             read.close()
+            if written == GRAIN:
+                raise
             raise PlanChanged(("rules.grain",),
                               f"the saved data position's iterator state was written by grain {written}, "
                               f"which this grain {GRAIN} does not read (docs/design/data.md, the rules): "
                               f"resume with grain=={written}, or go on from the run's weights as a new run "
                               "that reads its data afresh") from error
-        self._read, self._started = read, False
+        self._read, self._started, self._saved = read, False, saved
 
     def identity(self) -> str:
         """What every share of the pool reads, which the pool agrees before it

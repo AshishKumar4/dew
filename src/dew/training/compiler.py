@@ -483,7 +483,7 @@ class HostRun:
         """Each program its steady steps call (`settled`), a sampled step's beside an unsampled one's where
         the run inspects, lowered over `held`'s and `batch`'s shapes for `platforms` where it runs on the
         accelerator and for the CPU where on its companion (`options.lowering`), none compiled: the step
-        `Trainer(lower_for=)` lowers for a target this host is not."""
+        `TrainerAdvanced(lower_for=)` lowers for a target this host is not."""
         programs: list[tuple[str, jax.stages.Lowered]] = []
         for sampled in self.bodies:
             last: list[tuple[str, jax.stages.Lowered]] = []

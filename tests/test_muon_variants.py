@@ -242,7 +242,7 @@ def test_a_flat_attentions_projections_are_the_matrices_muon_steps():
         # The run's table of the draw's axes, which a trainer holds while its optimizer steps.
         with boxed(boxed_axes(drawn)):
             split = muon_partition(params)
-            solver = OptimConfig(optimizer=Muon(), learning_rate=1e-3).build(4)
+            solver = OptimConfig(optimizer=Muon(), lr=1e-3).build(4)
             state = solver.init(params)
             gradients = jax.tree.map(lambda leaf: jnp.ones_like(leaf) / leaf.size, params)
             updates, _ = solver.update(gradients, state, params)
@@ -307,7 +307,7 @@ def test_muons_reported_update_work_is_its_compiled_updates_matrix_work(per_head
     params = decoder_params()
     opts = {**({} if per_head is None else {"per_head": per_head}),
             **({} if group is None else {"ns_group": group})}
-    config = OptimConfig(optimizer=Muon(**opts), learning_rate=LR)
+    config = OptimConfig(optimizer=Muon(**opts), lr=LR)
     solver = config.build(10)
     _, grads = drawn_tree(params, 0)
     with drawn_axes(decoder_draw()):

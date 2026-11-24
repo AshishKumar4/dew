@@ -43,7 +43,7 @@ from dew.optim import (
     weight_decay_mask,
 )
 from dew.registry import models, optimizers
-from dew.training import Inspection, Layout, MeshSpec, Observe, Trainer
+from dew.training import Inspection, Layout, MeshSpec, Observe, Trainer, TrainerAdvanced
 from dew.training.diloco import DiLoCo
 from dew.training.inspection import inspected
 
@@ -69,7 +69,8 @@ def trainer(model, optimizer, mesh: MeshSpec, devices: int, *, variables=None, e
     objective = LMObjective(model, SEQ, ema_decay=ema) if variables is None else LMObjective(
         model, SEQ, ema_decay=ema, variables=variables)
     run = Trainer(objective, optimizer, key=jax.random.key(key), mesh=mesh,
-                  layout=Layout(min_shard=TINY_SHARD, stage_local=stage_local), checkpoints=checkpoints,
+                  advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD, stage_local=stage_local)),
+                  checkpoints=checkpoints,
                   tracker=None)
     run.device_mesh = mesh.build(jax.devices()[:devices])
     return run
@@ -124,11 +125,11 @@ its gradient. At Adam's 1e-8 a gradient within rounding of zero steps by lr one 
 an error of 2 lr that no layout makes or removes, and check 1's ratio would count such gradients in
 a draw rather than the layout's rounding."""
 
-ADAM = OptimConfig(optimizer=Adam(), learning_rate=1e-3)
+ADAM = OptimConfig(optimizer=Adam(), lr=1e-3)
 """Dew's named Adam, which reads a stage-local run's stacked leaf as its stored layers, as optax's Adam given
 built does not say it does (`OptimizerSpec.STACKED`, row 3934)."""
 
-ADAM_FAST = OptimConfig(optimizer=Adam(), learning_rate=1e-2)
+ADAM_FAST = OptimConfig(optimizer=Adam(), lr=1e-2)
 """`ADAM` at a rate whose two steps move the decoder's state measurably."""
 
 
@@ -146,18 +147,18 @@ queries and keys no norm divides, LaProp's clip engaged."""
 
 OPTIMIZERS = {
     **{name: (OptimConfig(optimizer=optimizers.build(name, **SMOOTH, **SETTINGS.get(name, ({}, {}))[0]),
-                          learning_rate=1e-2), SETTINGS.get(name, ({}, {}))[1])
+                          lr=1e-2), SETTINGS.get(name, ({}, {}))[1])
        for name in sorted(optimizers.paths) if optimizers[name].STACKED},
-    "groups": (OptimConfig(optimizer=AdamW(**SMOOTH, weight_decay=0.1), learning_rate=1e-2,
+    "groups": (OptimConfig(optimizer=AdamW(**SMOOTH, weight_decay=0.1), lr=1e-2,
                            param_groups=(ParamGroup("mlp", ("*mlp*",), learning_rate_multiplier=0.5,
                                                     weight_decay=0.0),
                                          ParamGroup("rest", ("*",)))), {}),
     # Muon's variants that read a matrix's own sums or its name: the dual norm of a layer's momentum, its
     # projections' heads by their stored names, and NorMuon's neuron moments, each per stored layer.
-    "muon_adaptive": (OptimConfig(optimizer=Muon(**SMOOTH, adaptive=True), learning_rate=1e-2), {}),
+    "muon_adaptive": (OptimConfig(optimizer=Muon(**SMOOTH, adaptive=True), lr=1e-2), {}),
     "muon_per_head": (OptimConfig(optimizer=Muon(**SMOOTH, per_head={"layers_*/self_attn/q_proj/kernel": 8}),
-                                  learning_rate=1e-2), {}),
-    "normuon": (OptimConfig(optimizer=Muon(**SMOOTH, neuron_beta2=0.95), learning_rate=1e-2), {}),
+                                  lr=1e-2), {}),
+    "normuon": (OptimConfig(optimizer=Muon(**SMOOTH, neuron_beta2=0.95), lr=1e-2), {}),
     # M3 on every matrix, its matrices by its own default (rows the reduction), Adam on the vectors, each
     # stepped at its rate by a schedule, given built: M3's products batched on a stacked leaf's rows are
     # each its layer's (`_row_form`, rows 4031, 4035).
@@ -171,7 +172,7 @@ OPTIMIZERS = {
     # (`_Numbering.summed`, row 4036).
     "global_clip": (optax.chain(optax.clip_by_global_norm(0.05), optax.adam(1e-2)), {}),
     # A layer's 8 x 256 up projection is below int8's threshold of 4096 values, two layers stacked are not.
-    "int8": (OptimConfig(optimizer=AdamW(**SMOOTH, weight_decay=0.1, state_dtype="int8"), learning_rate=1e-2),
+    "int8": (OptimConfig(optimizer=AdamW(**SMOOTH, weight_decay=0.1, state_dtype="int8"), lr=1e-2),
              {"emb_features": 8, "num_heads": 2, "num_kv_heads": 1, "mlp_features": 256}),
 }
 """Each optimizer whose rules read a leaf as one layer, with the decoder fields its rule needs to act:
@@ -180,7 +181,7 @@ QK-Clip's per-layer maxima, LAMB's trust ratio and LaProp's clip; a param group'
 threshold and Muon's variants. A transformation given built is stage-local where its update is its layers'
 expression row by row (`whole_reading`), as optax's Adam's is, which the read-whole test reads."""
 
-LORA_OPTIMIZER = OptimConfig(optimizer=AdamW(**SMOOTH), learning_rate=1e-2)
+LORA_OPTIMIZER = OptimConfig(optimizer=AdamW(**SMOOTH), lr=1e-2)
 """What the LoRA cell trains its factors with."""
 
 
@@ -388,7 +389,7 @@ def test_a_stage_local_runs_episodes_score_the_model_every_layer_whole():
     def flown(variables, key):
         return {"logit": float(jnp.mean(model.apply({"params": variables["params"]}, ids)))}
 
-    run = trainer(model, OptimConfig(optimizer=AdamW(), learning_rate=1e-2), STAGED, 8)
+    run = trainer(model, OptimConfig(optimizer=AdamW(), lr=1e-2), STAGED, 8)
     run.tracker = RecordingTracker()
     trained = run.fit(stream(), steps=STEPS, log_every=1,
                       validation={"flight": EvalSuite(Episodes(flown, {"logit": Shown()}), every=STEPS)})
@@ -421,7 +422,8 @@ def test_a_headed_or_actor_critic_objectives_decoders_keep_their_runs_stage_loca
 
     def run(stage_local: bool) -> Trainer:
         return Trainer(objective, ADAM, key=jax.random.key(0), mesh=STAGED,
-                       layout=Layout(min_shard=TINY_SHARD, stage_local=stage_local), tracker=None)
+                       advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD, stage_local=stage_local)),
+                       tracker=None)
 
     # Each decoder's run alone, an LM's without an average, as a lower bound of what it spares.
     alone = sum(saving(functools.partial(trainer, model, ADAM, STAGED, 8, ema=None))
@@ -436,7 +438,7 @@ def test_a_stage_local_checkpoint_resumes_on_two_stages_and_on_one(tmp_path):
     stopped after its first step resumes from that checkpoint into the second step the uninterrupted
     run took, bit for bit."""
     model = decoder()
-    optimizer = OptimConfig(optimizer=AdamW(weight_decay=0.1), learning_rate=1e-2)
+    optimizer = OptimConfig(optimizer=AdamW(weight_decay=0.1), lr=1e-2)
 
     def fit(directory, mesh: MeshSpec, devices: int, steps: int):
         run = trainer(model, optimizer, mesh, devices, checkpoints=Checkpoints(str(directory)))
@@ -587,7 +589,7 @@ WHOLE = {"lamb": lambda: optax.lamb(1e-3), "adafactor": lambda: optax.adafactor(
          "rank-masked": lambda: optax.adamw(1e-3, mask=lambda params: jax.tree.map(lambda leaf: leaf.ndim > 1,
                                                                                      params)),
          # An OptimConfig's transformation is built over the run's length, which fit gives.
-         "adafactor-config": lambda: OptimConfig(optimizer=Optax('optax:adafactor'), learning_rate=1e-3),
+         "adafactor-config": lambda: OptimConfig(optimizer=Optax('optax:adafactor'), lr=1e-3),
          "doubled-gains": doubled_gains, "spread-sums": spread_sums,
          # A loop over a stack that carries across its rows, acts beside its results, or takes no step.
          "carried-across-rows": carried_across_rows, "mapped-beside-a-callback": mapped_beside_a_callback,
@@ -671,10 +673,11 @@ def test_a_diloco_run_over_stages_keeps_each_layer_whole_on_every_stage():
     pipelined layer whole on every stage, its outer and inner states alike, so its checkpoint holds each
     layer as one device's would."""
     def run(stage_local: bool) -> Trainer:
-        return Trainer(LMObjective(decoder(), SEQ), OptimConfig(optimizer=AdamW(), learning_rate=1e-2),
+        return Trainer(LMObjective(decoder(), SEQ), OptimConfig(optimizer=AdamW(), lr=1e-2),
                        key=jax.random.key(0), mesh=MeshSpec(diloco=2, stage=2, fsdp=2),
-                       layout=Layout(min_shard=TINY_SHARD, stage_local=stage_local),
-                       diloco=DiLoCo(every=2, rate=0.7, momentum=0.9), tracker=None)
+                       advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD, stage_local=stage_local),
+                                                diloco=DiLoCo(every=2, rate=0.7, momentum=0.9)),
+                       tracker=None)
 
     assert saving(run) == 0
 
@@ -706,10 +709,12 @@ def test_a_stage_local_runs_inspection_reports_each_stored_layer_by_its_name():
                          targets=("params",), every=1)
     logged, runs = [], []
     for stage_local in (True, False):
-        run = Trainer(LMObjective(decoder(), SEQ), OptimConfig(optimizer=AdamW(), learning_rate=1e-2),
-                      key=jax.random.key(0), mesh=STAGED, layout=Layout(min_shard=TINY_SHARD,
+        run = Trainer(LMObjective(decoder(), SEQ), OptimConfig(optimizer=AdamW(), lr=1e-2),
+                      key=jax.random.key(0), mesh=STAGED,
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD,
                                                                          stage_local=stage_local),
-                      inspection=watched, tracker=None)
+                                               inspection=watched),
+                      tracker=None)
         logged.append(inspected(run, stream().train(None).__next__(), steps=1))
         runs.append(run)
     local, replicated = logged
@@ -754,7 +759,8 @@ def test_a_distillation_runs_student_keeps_its_run_stage_local():
         objective = DistillationObjective(LMObjective(student, SEQ, ema_decay=None),
                                           LMObjective(teacher, SEQ, ema_decay=None))
         return Trainer(objective, ADAM, key=jax.random.key(0), mesh=STAGED,
-                       layout=Layout(min_shard=TINY_SHARD, stage_local=stage_local), tracker=None)
+                       advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD, stage_local=stage_local)),
+                       tracker=None)
 
     alone = saving(functools.partial(trainer, student, ADAM, STAGED, 8, ema=None))
     assert saving(run) == alone > 0
@@ -834,7 +840,7 @@ def test_a_periodic_one_stage_state_goes_back_onto_its_layers_for_a_run_that_doe
     not scan, its parameters and every moment alike, period and all."""
     kinds = {"layer_types": ("sliding_attention", "full_attention") * 2,
              "kinds": {"sliding_attention": {"window": 4}}}
-    optimizer = OptimConfig(optimizer=AdamW(**SMOOTH), learning_rate=1e-2)
+    optimizer = OptimConfig(optimizer=AdamW(**SMOOTH), lr=1e-2)
     scanned = trainer(decoder(**kinds), optimizer, MeshSpec(fsdp=2), 8)
     scanned.validate(steps=1)
     batch = shard_batch(MeshSpec(fsdp=2).build(jax.devices()), token_rows(VOCAB, BATCH, SEQ + 1))
@@ -989,7 +995,8 @@ def test_a_stage_local_state_handed_to_another_run_starts_it_on_its_stored_layer
     restarted = four.fit(stream(), steps=2, log_every=1, state=trained)
     assert int(restarted.step) == 2
     flat = Trainer(LMObjective(model, SEQ, variables=trained.variables), optimizer, key=jax.random.key(0),
-                   mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=TINY_SHARD), tracker=None)
+                   mesh=MeshSpec(fsdp=2), advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD)),
+                   tracker=None)
     started = on_host(flat.initial_state().variables)
     assert jax.tree.structure(started) == jax.tree.structure(stored)
     for mine, theirs in zip(jax.tree.leaves(started), jax.tree.leaves(stored), strict=True):
@@ -1074,7 +1081,7 @@ def test_a_one_stage_scanned_fit_keeps_shared_frozen_arrays_alive(devices):
     adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(model, base, key=1)
     objective = LMObjective(adapter.model, SEQ, variables=adapter.variables, ema_decay=None)
     run = Trainer(objective, optax.sgd(0.1), key=jax.random.key(2), mesh=MeshSpec(),
-                  layout=Layout(min_shard=2**30), checkpoints=None, tracker=None)
+                  advanced=TrainerAdvanced(layout=Layout(min_shard=2**30)), checkpoints=None, tracker=None)
     run.device_mesh = MeshSpec().build(jax.devices()[:devices])
     initial = run.initial_state()
     batch = token_rows(VOCAB, BATCH, SEQ + 1)

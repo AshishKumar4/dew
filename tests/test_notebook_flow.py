@@ -23,7 +23,6 @@ from dew.config import TrainerConfig
 from dew.config.lm import LMRunConfig
 from dew.data import Files, presets
 from dew.registry import ModelConfig
-from dew.training import Horizon
 
 rows = Path("play.jsonl")
 rows.write_text("".join(json.dumps({"text": "to be or not to be, that is the question. " * 8}) + "\\n"
@@ -35,7 +34,7 @@ run = LMRunConfig(
     data=train.repeat().pipe(presets.lm, "byte", seq_len=32, batch=4, pack=None),
     validation=held.pipe(presets.lm, "byte", seq_len=32, batch=4, pack=None),
     trainer=TrainerConfig(name="notebook", checkpoint_dir=str(Path("checkpoints").resolve()),
-                          horizon=Horizon(steps=4), log_every=1, eval_every=2, checkpoint_every=2,
+                          steps=4, log_every=1, eval_every=2, checkpoint_every=2,
                           multi_host=False, compilation_cache_dir=None))
 ''', '''
 state = run.run()
@@ -102,11 +101,11 @@ def test_a_notebook_trains_scores_checkpoints_and_reloads_a_run_dew_train_contin
     run_dir = tmp_path / "checkpoints" / "notebook"
     with Checkpoints(str(run_dir)) as checkpoints:
         assert checkpoints.committed() == [2, 4]
-    assert RunConfig.load(str(run_dir)).trainer.horizon.steps == 4
+    assert RunConfig.load(str(run_dir)).trainer.steps == 4
 
     # The run's record as a user edits it, to six steps, which `dew train` continues.
     written = json.loads((run_dir / "run.json").read_text())
-    written["fields"]["trainer"]["horizon"]["steps"] = 6
+    written["fields"]["trainer"]["steps"] = 6
     (run_dir / "run.json").write_text(json.dumps(written))
     dew_train(tmp_path, environment(), str(run_dir / "run.json"))
     assert len(logged_losses(run_dir)) == 6

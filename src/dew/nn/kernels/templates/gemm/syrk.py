@@ -408,6 +408,8 @@ def syrk(x: jax.Array, *, tiles: Tiles, transpose: bool = False, out_dtype, mult
     (row 11941)."""
     if x.ndim != 3:
         raise ValueError(f"syrk expects 3D [batches, m, k] (or [batches, k, m]), got {x.shape}")
+    if tiles.staging is not None:
+        raise ValueError(f"syrk stages its outputs at its family's own chunks, not {tiles.staging}")
     out_dtype = jnp.dtype(out_dtype)
     if not supports_out_dtype(out_dtype):
         raise ValueError(f"syrk supports 16-bit and 32-bit float outputs, got {out_dtype}")
@@ -679,7 +681,7 @@ class MosaicSyrk(TilesTemplate):
         del return_residuals
         target = generation.gpu_target()
         bound = self.bind(x, poly_coeffs, transpose=transpose, out_dtype=out_dtype, interpret=interpret)
-        mp = config.cluster if interpret else (target.multiprocessors or 1) * config.programs
+        mp = config.cluster if interpret else unit_cost.wave(target.multiprocessors, config.programs)
         regs = self.registers(bound, config, target)
         shared = regs and self.staged_bytes(bound, config, target)
         out = syrk(x, tiles=config, transpose=transpose, out_dtype=out_dtype, multiprocessors=mp,

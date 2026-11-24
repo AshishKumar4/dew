@@ -34,7 +34,7 @@ from dew.objectives.rl import GRPOObjective, RolloutScheduler, Snapshot, Synchro
 from dew.objectives.rl.episodes import EpisodeCollector, EpisodeId, EpisodeStatus, Observation
 from dew.rl.sandbox import SandboxLimits, SubprocessEnvironment
 from dew.sampling import Sampling
-from dew.training import Trainer, UpdateBatch
+from dew.training import Trainer
 
 SAMPLING = Sampling(temperature=.7, top_k=2, eos_token_ids=EOS, pad_token_id=PAD)
 
@@ -118,7 +118,7 @@ def build(harness=None, *, record=None, accumulation=1, **changes):
     model = ToolPolicy()
     objective = GRPOObjective(model, PROMPT + RESPONSE - 1, beta=.05)
     trainer = Trainer(objective, optax.sgd(.05), key=jax.random.key(19),
-                      update=UpdateBatch(batches=accumulation))
+                      accumulation=accumulation)
     collector = EpisodeCollector(
         TextGeneration(model, nn.unbox(objective.init(jax.random.key(0)))),
         harness or Harness(),

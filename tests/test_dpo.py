@@ -27,7 +27,7 @@ from dew.data.preferences import HALVES_KEY, IDS_KEY, MASK_KEY, REAL_KEY, pair_w
 from dew.objectives.base import Step
 from dew.objectives.rl import DPOObjective
 from dew.rl import preference_logsigmoid_terms
-from dew.training import FitPolicy
+from dew.training import TrainerAdvanced
 
 
 def test_preference_rewards_and_gradients_ignore_nonfinite_completion_padding():
@@ -242,7 +242,7 @@ def test_a_preference_dataset_trains_as_the_preference_config_does():
 
     def trained(data):
         trainer = Trainer(DPOObjective(TinyHead(vocab_size=8), 3), optax.sgd(0.1), key=jax.random.key(0),
-                          layout=Layout(min_shard=1, tolerance=1.0))
+                          advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)))
         return trainer.fit(data, steps=1).variables
 
     # The preset's windows, as wide as its `seq_len` lays them (`window_shape`).
@@ -507,7 +507,7 @@ def test_a_step_split_over_parts_and_shards_trains_as_each_pair_a_row(segments):
 
     def trainer_for(seed, split=2):
         objective = DPOObjective(model, half - 1, beta=0.5, segments=segments, pairs=pairs)
-        trainer = Trainer(objective, optax.sgd(rate), key=jax.random.key(seed), fit=FitPolicy(split=split),
+        trainer = Trainer(objective, optax.sgd(rate), key=jax.random.key(seed), split=split,
                           checkpoints=None, tracker=None)
         # Two devices, the data axis taking both: two data shards.
         trainer.device_mesh = MeshSpec().build(jax.devices()[:2])

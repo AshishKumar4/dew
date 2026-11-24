@@ -9,8 +9,8 @@ This page is generated from the maintainers' findings ledger as each change land
 ## Kernels and performance
 
 - GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 5851]
-- One recurrence algebra, the template for every form and product, and port retirement. [1294, 2076, 3426, 3427]
-- Family toolkit: resources derived and checked against ptxas, one planner, one traversal. [2987, 6008, 6010]
+- One recurrence algebra, the template for every form and product, and port retirement. [2076, 3426, 3427]
+- Family toolkit: resources derived and checked against ptxas, one planner, one traversal. [2987, 6008, 6010, 12416, 12423, 12424, 12426]
 - The kernel challenge's lessons in the templates. [5271]
 - 4B Real-Token MFU Breakthrough from Existing Profiles. [11941, 11942]
 - Cached and block visibility on the template's spans. [1495, 245]
@@ -19,17 +19,17 @@ This page is generated from the maintainers' findings ledger as each change land
 - The template beats FA2 and FA3, its resources the model's. [1299, 5284, 5285, 5293]
 - Inference through the templates. [3424, 3602]
 - Carried JAX fixes upstream. [4689, 4690, 4693, 4698, 5403, 5808, 5809, 5810, 5811, 5813, 5814, 5815, 5816, 5817, 5820, 5822, 5823, 5825, 5827, 5829, 5831, 5832, 5833, 5834, 5835, 5836, 5837, 5839, 5841, 5842, 5843, 5845, 5846, 5847, 5848, 10742]
-- The suite's wall. [5478, 11903]
+- The suite's wall. [5478, 11903, 12431, 12433]
 - Convolution repairs above their owner. [5665]
 - The attention forward's derivation ranking does not predict its time on most cells measured. [6216]
 - The register model's proposals miss ptxas by up to about 100 registers either way on the GEMM's gate launches. [7095]
 - Tests/test_mamba3.py::test_the_chunked_form_is_as_exact_as_the_recurrence passes vacuously on main. [7401]
 - Log-linear attention 6.6x fla's forward on a GH200. [10525]
-- The recurrence suite's wall: every case within CI's group target. [12088]
-- Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
+- The recurrence suite's wall: every case within CI's group target. [12088, 12429]
+- Attention tests to the bible's §6 and §7 test rules. [12432, 12438]
+- Low-precision and decode-size GEMMs. [483, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
-- Recurrent layers on the template's hooks, decode and conv on the toolkit, and entering memory. [1437]
 - Native TPU GEMM dispatch. [1560]
 - Flax's dot_product_attention with force_fp32_for_softmax keeps the softmax's float32 probabilities into the PV product (a float32 output), a legitimate…. [4860]
 - Attention stability: check 1 on the accurate form, finiteness on the default, everywhere. [5327]
@@ -49,7 +49,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Models and interop
 
-- Every recurrence transition and state family. [1300, 1448, 1450, 1451, 1452, 1454, 1455, 1457, 1458, 1459, 1460, 1646]
+- Every recurrence transition and state family. [1300, 1448, 1450, 1451, 1452, 1454, 1455, 1457, 1458, 1459, 1460, 1646, 12414, 12425]
 - Every nn and interop primitive, seam, contract and derivative has one owner. [11980, 5625]
 - Owner-approved Audit 4 API cleanup. [11937]
 - Owner-approved Audit 4 API cleanup. [11938]
@@ -62,8 +62,6 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - Time to first step: the compile path's re-derivations. [5556]
 - Owner-approved Audit 4 API cleanup. [11935]
-- CI time: every test within 120 seconds. [12128]
-- A checkpoint taken after a fit's ladder climbed to recompute its layers (its model record's `remat` set by the climb) is refused on resume as 'trained another…. [12135]
 - Distributed and memory training modes. [156, 873, 1306, 617]
 - A fact and a question for the step's owner. [6646]
 - Gradients held to an update placed after the backward are parameter-sized temporaries. [6698]
@@ -83,6 +81,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - Owner-approved Audit 4 API cleanup. [11939]
 - RL: lossless records, composed methods and real publication. [533, 579, 886, 729, 605]
+- DeepCrossAttention (DCA, arXiv:2502.06785v2) composable depth-residual capability. [12440]
 - Dory: the release qualified and its tests' oracles. [596]
 - Serving and RL measured where users run them. [5315, 5321]
 - A served rollout's or episode cohort's server pages its cache wherever pages serve the policy as it draws (serving.served_layout, theme 15), at every prompt…. [7420]
@@ -107,9 +106,8 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## CI and tooling
 
-- The JAX fork, releases and installs. [3569, 3376, 3378, 3379, 3380, 3382, 3384, 3385, 3388, 3390, 3391, 3397, 3403, 3404, 12273]
 - Dew's CI, test cache and compile-ahead tests. [5491, 5670]
-- The perf gate's regressions since 11-07: compile time, the 4B step's stall, a DiT's peak. [10138]
+- The JAX fork, releases and installs. [3569, 3376, 3378, 3379, 3380, 3382, 3384, 3385, 3388, 3390, 3391, 3397, 3403, 3404]
 - Tests/test_gpu_mesh.py and tests/test_gpu_systems.py each span three lanes' code. [6421]
 - Tools that import their siblings by putting tools/ on sys.path at import time. [11756]
 - Jaxlib/XLA fork (abort a GPU's NCCL cliques when an execution fails on one rank, so its peers end instead of hanging in a running collective). [12352]

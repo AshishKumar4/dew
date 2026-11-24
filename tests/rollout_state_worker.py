@@ -14,7 +14,7 @@ from test_env_rollout import Walk
 from dew.config.env import idle
 from dew.objectives.rl.control import ActorCritic, ControlPPOObjective, ControlRollout
 from dew.rl.env import Batched, TimeLimit
-from dew.training import Trainer
+from dew.training import Trainer, TrainerAdvanced
 
 
 def unjoined(directory, *, stateful: bool = True):
@@ -28,7 +28,7 @@ def unjoined(directory, *, stateful: bool = True):
     rollout = (ControlRollout(objective, walks, unroll_length=4) if stateful
                else (lambda state, batch, key: batch))
     return Trainer(objective, optax.adam(1e-3), key=0, checkpoints=Checkpoints(str(directory)),
-                   rollout=rollout)
+                   advanced=TrainerAdvanced(rollout=rollout))
 
 
 def fitted(trainer) -> dict:

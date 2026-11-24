@@ -58,7 +58,7 @@ from dew.optim import OptimConfig
 from dew.registry import models, optimizers, projectors, read_arguments, resolve_dtype, towers
 from dew.state import TrainState
 from dew.telemetry.benchmark import carried
-from dew.training import FitPolicy, Layout, MeshSpec, Trainer, UpdateBatch
+from dew.training import Layout, MeshSpec, Trainer, TrainerAdvanced
 from dew.training.ahead import AheadOfTime, compile_ahead, step_batch
 from dew.training.planning import Trials
 
@@ -80,7 +80,8 @@ class _DenoisingTextTable(ConditionEncoder[str]):
     @classmethod
     def from_pretrained(cls, checkpoint: str = "char_table", *, params: Variables | None = None,
                         tokens: int = TEXT_TOKENS, features: int = TEXT_FEATURES,
-                        pooled_features: int | None = None, guidance: float | None = None, masked: bool = False,
+                        pooled_features: int | None = None, guidance: float | None = None,
+                        masked: bool = False,
                         vocab: int = 130, seed: int = 0, dtype=None):
         table = CharTable.from_pretrained(checkpoint, params=params, tokens=tokens, vocab=vocab, seed=seed,
                                           dtype=dtype, features=max(features, pooled_features or 0))
@@ -106,14 +107,15 @@ class TrainerMesh(TypedDict):
     """The trainer's fields a case's mesh record names (`trainer_mesh`)."""
 
     mesh: MeshSpec
-    fit: FitPolicy
+    split: int
+    microbatches: int | None
 
 
 def trainer_mesh(mesh: Mapping[str, int | tuple[str, ...]]) -> TrainerMesh:
-    """The trainer's `mesh` and `fit` a case's mesh record names: its MeshSpec fields (its axes' sizes and the
-    axes it makes explicit), its step read whole (`split=1`) and, under pipeline stages, the microbatches its
-    pipeline feeds (`FitPolicy.microbatches`), one a stage where it names none. Refuses a field it lacks,
-    and microbatches where it stages none."""
+    """The trainer's `mesh`, `split` and `microbatches` a case's mesh record names: its MeshSpec fields (its
+    axes' sizes and the axes it makes explicit), its step read whole (`split=1`) and, under pipeline stages,
+    the microbatches its pipeline feeds (`Trainer`'s `microbatches`), one a stage where it names none.
+    Refuses a field it lacks, and microbatches where it stages none."""
     fields = {f.name for f in dataclasses.fields(MeshSpec)}
     unknown = sorted(set(mesh) - fields - {"microbatches"})
     if unknown:
@@ -128,7 +130,7 @@ def trainer_mesh(mesh: Mapping[str, int | tuple[str, ...]]) -> TrainerMesh:
         raise ValueError(f"a mesh's microbatches are its pipeline's, and it stages none: {mesh}")
     # A case's step is read whole, climbing the remat ladder where it must, never split to fit; a pipeline
     # feeds the microbatches its record names, else one a stage.
-    return {"mesh": spec, "fit": FitPolicy(split=1, microbatches=microbatches)}
+    return {"mesh": spec, "split": 1, "microbatches": microbatches}
 
 
 def media_values(case: Case) -> tuple[str, TowerBase, ProjectorBase, int]:
@@ -198,7 +200,8 @@ def decoder_objective(
 
 
 def decoder_trunk(case: Case, trunk: nn.Module) -> CausalTransformer:
-    """`trunk`, the decoder a canvas or a media wrapper takes, refused where the case's trunk builds another."""
+    """`trunk`, the decoder a canvas or a media wrapper takes, refused where the case's trunk builds
+    another."""
     if not isinstance(trunk, CausalTransformer):
         raise TypeError(f"{case.label}'s trunk {case.trunk} builds a {type(trunk).__name__}, not the decoder "
                         "a canvas or a media wrapper takes")
@@ -276,7 +279,8 @@ def build_objective(case: Case, *, widened: bool = False) -> Objective[Any, Any]
             preset = presets.Flow()
         elif isinstance(model, ZImageTransformer):
             keyword = "conditioning"
-            condition = Condition(_DenoisingTextTable.from_pretrained(features=model.cap_feat_dim, masked=True))
+            condition = Condition(_DenoisingTextTable.from_pretrained(features=model.cap_feat_dim,
+                                                                      masked=True))
             preset = presets.Flow()
         elif isinstance(model, Flux2Transformer):
             keyword = "conditioning"
@@ -312,11 +316,10 @@ def build_trainer(case: Case, optimizer: optax.GradientTransformation | None = N
     fields = trainer_mesh(case.mesh)
     trainer = Trainer(build_objective(case),
                       optimizer or OptimConfig(optimizer=optimizers.build(case.optimizer),
-                                               learning_rate=1e-4).build(None),
-                      key=0, mesh=fields["mesh"], update=UpdateBatch(batches=case.accumulation),
-                      fit=fields["fit"],
-                      layout=Layout(min_shard=case.fsdp_min_param_size), checkpoints=None, tracker=None,
-                      ahead=ahead)
+                                               lr=1e-4).build(None),
+                      key=0, accumulation=case.accumulation, **fields,
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=case.fsdp_min_param_size),
+                                               ahead=ahead), checkpoints=None, tracker=None)
     if case.device_order is not None:
         by_id = {device.id: device for device in jax.devices()}
         trainer.device_mesh = fields["mesh"].build([by_id[index] for index in case.device_order])
@@ -328,7 +331,8 @@ def ahead_of(case: Case, generation: str, capacity: int) -> AheadOfTime:
     `generation` of `capacity` bytes of memory (`dew.training.ahead.compile_ahead`), on any host: what a GPU
     node's prepare hands its run (`build_trainer`'s `ahead`), and what perf_gate's compile rows time."""
     trainer = build_trainer(case)
-    trainer.device_mesh = trainer_mesh(case.mesh)["mesh"].build(list(compile_only_gpus(generation, 1, capacity)))
+    trainer.device_mesh = trainer_mesh(case.mesh)["mesh"].build(list(compile_only_gpus(generation, 1,
+                                                                                       capacity)))
     return compile_ahead(trainer, global_batch(case))
 
 

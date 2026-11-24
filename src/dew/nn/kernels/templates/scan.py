@@ -15,7 +15,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
-from jax._src.lib.mlir.dialects import nvvm
+from jax._src.lib.mlir.dialects import math as mlir_math, nvvm
 from jax._src.pallas.mosaic_gpu import core as plgpu_core
 from jax.experimental.mosaic.gpu import fragmented_array as fa, utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
@@ -294,9 +294,16 @@ def _interpreted(decays, writes, carried, reverse: bool, exclusive: bool):
     return states, last
 
 
+def _fused(x, y, z):
+    """`x y + z` rounded once (`math.fma`, the hardware's FFMA): the scan's every join and apply, where a
+    multiply rounded apart from its add issued two instructions (an A100's selective backward 30.2 FMULs and
+    14.4 FADDs a token and state against mamba_ssm's 13.5 and 1.6, its FFMAs 3.8 to their 8.3; M-JS-241)."""
+    return mlir_math.fma(x, y, z)
+
+
 def _pair(first, then):
     """Two pairs `(a, b)` combined, `first`'s positions before `then`'s in the scan's order."""
-    return arith.mulf(first[0], then[0]), arith.addf(arith.mulf(then[0], first[1]), then[1])
+    return arith.mulf(first[0], then[0]), _fused(then[0], first[1], then[1])
 
 
 def _shuffled(pair, distance: int, reverse: bool):
@@ -368,10 +375,10 @@ def _scanned(a: fa.FragmentedArray, b: fa.FragmentedArray, carried: fa.Fragmente
     # The state before this thread's first position, then each of its positions'.
     [h] = carried.registers.flat
     prefix = _pair(before_warp, within)
-    entering = arith.addf(arith.mulf(prefix[0], h), prefix[1])
-    states = [arith.addf(arith.mulf(pairs[i][0], entering), pairs[i][1]) for i in range(count)]
+    entering = _fused(prefix[0], h, prefix[1])
+    states = [_fused(pairs[i][0], entering, pairs[i][1]) for i in range(count)]
     registers = a.registers.copy()
     registers.flat[0] = vector.from_elements(a_vector.type, states)
-    last = arith.addf(arith.mulf(total[0], h), total[1])
+    last = _fused(total[0], h, total[1])
     return (fa.FragmentedArray(_registers=registers, _layout=a.layout, _is_signed=None),
             fa.FragmentedArray.splat(last, ()))

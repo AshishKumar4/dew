@@ -12,6 +12,8 @@ from multiprocess_worker import make_objective
 from pool_records import BATCH, indexed_loader
 from process_support import serve_mode, worker_parser
 
+from dew.training import TrainerAdvanced
+
 
 def mode_profile_stop_failure(args) -> dict:
     """A profile window whose capture rank 0 cannot stop: its capture's directory made unwritable while the
@@ -42,7 +44,7 @@ def mode_profile_stop_failure(args) -> dict:
 
     loader = indexed_loader(args.records, BATCH // args.processes)
     trainer = Trainer(make_objective(), optax.adam(1e-3), key=jax.random.key(0),
-                      profile=ProfileWindow(str(profile_dir), steps=2, warmup=0))
+                      advanced=TrainerAdvanced(profile=ProfileWindow(str(profile_dir), steps=2, warmup=0)))
     error = None
     try:
         trainer.fit(Loader(lambda partition: iter(loader), None, batch=BATCH, records=None),

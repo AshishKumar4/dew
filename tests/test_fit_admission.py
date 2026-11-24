@@ -28,7 +28,6 @@ from dew.objectives.jepa.objective import JepaObjective
 from dew.objectives.supervised import Supervised
 from dew.registry import ModelConfig
 from dew.training import Trainer
-from dew.training.budget import Horizon
 from dew.training.observe import Observe
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -52,7 +51,7 @@ def test_a_jepa_predictor_takes_the_width_its_encoder_was_built_at(tmp_path):
                           defaults={"emb_features": 16})
     run = Built(model=encoder, predictor={"num_layers": 1, "predictor_features": 8}, num_target_blocks=2,
                 data=rows.read("memory").loading(Loading(workers=0)),
-                trainer=TrainerConfig(checkpoint_dir=str(tmp_path), horizon=Horizon(steps=1)))
+                trainer=TrainerConfig(checkpoint_dir=str(tmp_path), steps=1))
     objective = run.prepare().train("built")
     assert isinstance(objective, JepaObjective)
     assert (objective.encoder.emb_features, objective.predictor.emb_features) == (16, 16)

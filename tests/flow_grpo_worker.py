@@ -11,6 +11,7 @@ import jax
 import numpy as np
 
 from dew.telemetry.records import RECORD_TYPES
+from dew.training import TrainerAdvanced
 
 
 def reward_service():
@@ -93,7 +94,7 @@ def main() -> None:
     tracker, metric = Capture(), PixelMean()
     rollout = FlowRollout(objective, reward, groups=3, steps=3)
     trainer = Trainer(objective, optax.sgd(1e-3), key=jax.random.key(70),
-                      rollout=rollout, mesh=MeshSpec(), tracker=tracker)
+                      advanced=TrainerAdvanced(rollout=rollout), mesh=MeshSpec(), tracker=tracker)
     captions = ["red", "blue", "green", "gold"]
     # The captions stay on each process's host beside the placed rows, as a run's data keeps them.
     global_batch = {**inputs.tokenize(captions), "target": np.asarray([-0.5, -0.1, 0.1, 0.5], np.float32),

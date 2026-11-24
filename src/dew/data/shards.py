@@ -45,16 +45,20 @@ def streamed(
         raise ValueError(f"{described} holds no rows, so reading it endlessly reads nothing forever")
     if not manifest.shards:
         return grain.MapDataset.source(()).to_iter_dataset()
+    shards = _shards(manifest, partition=partition, loading=loading)
+    # The cut its places were dealt from, which its position holds (`_Passing`): the manifest's own, or
+    # the changed rule that cut it finer here (`ShardManifest.subdivided_by`).
+    dealt = manifest.cut or (manifest.subdivided_by if shards != tuple(manifest.shards) else None)
     if places is not None:
         reader = _Taken(manifest.reader)
-        return _ShardPass(grain.MapDataset.source(places), reader, cycle_length, loading, described)
-    shards = _shards(manifest, partition=partition, loading=loading)
+        return _ShardPass(grain.MapDataset.source(places), reader, cycle_length, loading, described,
+                          dealt=dealt)
     # An endless read whose shards are found empty, every place this reader can read, with no row read
     # between, reads nothing forever, which data.md §10 refuses (`_EmptyRun`), whether or not its store counts
     # its rows, as a store whose shards all state none is refused above.
     root = _dealt(shards, seed=seed, epochs=epochs)[partition.cut()]
     return _ShardPass(root, manifest.reader, cycle_length, loading, described, quota,
-                      (seed is not None, len(shards)) if epochs is None else None)
+                      (seed is not None, len(shards)) if epochs is None else None, dealt)
 
 
 def bounded(manifest: ShardManifest, *, partition: DataPartition, seed: int | None, loading: Loading,
@@ -140,7 +144,8 @@ def cut(manifest: ShardManifest, *, partition: DataPartition, loading: Loading) 
     shards = _shards(manifest, partition=partition, loading=loading)
     if shards == manifest.shards:
         return manifest
-    return dataclasses.replace(manifest, shards=shards, subdivide=None, counted=None)
+    return dataclasses.replace(manifest, shards=shards, subdivide=None, counted=None,
+                               cut=manifest.subdivided_by)
 
 
 def _shards(manifest: ShardManifest, *, partition: DataPartition, loading: Loading) -> tuple[Shard, ...]:
@@ -179,10 +184,11 @@ class _ShardPass[Place](grain.IterDataset):
 
     def __init__(self, root: grain.MapDataset, reader: Callable[..., grain.IterDataset], cycle: int,
                  loading: Loading, name: str, quota: int | None = None,
-                 endless: tuple[bool, int] | None = None):
+                 endless: tuple[bool, int] | None = None, dealt: str | None = None):
         super().__init__(root)
         self.root, self.reader = root, reader
         self.cycle, self.loading, self.name, self.quota, self.endless = cycle, loading, name, quota, endless
+        self.dealt = dealt
 
     def reachable(self) -> int | None:
         """The distinct places an endless read can read on this reader (and this loading worker's slice),
@@ -206,12 +212,12 @@ class _ShardPass[Place](grain.IterDataset):
         if not len(self.root) or self.quota == 0:
             # A worker dealt no place or no row of the bound reads nothing (Grain's interleave of no dataset
             # raises).
-            return _Passing(None)
+            return _Passing(None, self.dealt)
         reader = _Reader(self.reader, _EmptyRun(self.name, self.reachable()), self.loading)
         rows = (_Sequential(self.root, reader, self.loading) if self.cycle == 1
                 else interleaved(self.root, reader, self.cycle, self.loading))
         limited = rows if self.quota is None else experimental.LimitIterDataset(rows, self.quota)
-        return _Passing(limited.__iter__())
+        return _Passing(limited.__iter__(), self.dealt)
 
 
 def interleaved(places: grain.MapDataset, reader: Callable[..., grain.IterDataset], cycle: int,
@@ -317,11 +323,14 @@ class _Passing(grain.DatasetIterator):
     """A share's rows of its places (`_ShardPass`), or none where it was dealt none, its position its rows'
     as they hold it, or `NOTHING` where it holds none. Grain saves an unstarted loading worker's position
     in the reading process, from the share's whole read before the worker takes its slice, so a worker
-    dealt nothing restores a position of rows it never holds: it reads nothing, as it did unstarted."""
+    dealt nothing restores a position of rows it never holds: it reads nothing, as it did unstarted. A share
+    whose places were dealt from its store cut finer (`dealt`, `ShardManifest.cut`) holds that cut beside
+    its rows' position, and a position saved under another cut, or none, is refused (`PlanChanged`), its
+    places other rows; one of a share no cut dealt holds none, as before any cut was named."""
 
-    def __init__(self, rows: grain.DatasetIterator | None):
+    def __init__(self, rows: grain.DatasetIterator | None, dealt: str | None = None):
         super().__init__(() if rows is None else rows)
-        self._rows = rows
+        self._rows, self.dealt = rows, dealt
 
     def __next__(self):
         if self._rows is None:
@@ -329,11 +338,20 @@ class _Passing(grain.DatasetIterator):
         return next(self._rows)
 
     def get_state(self) -> Mapping[str, object]:
-        return NOTHING if self._rows is None else self._rows.get_state()
+        state = NOTHING if self._rows is None else self._rows.get_state()
+        return state if self.dealt is None else {"rows": state, "cut": self.dealt}
 
     def set_state(self, state: Mapping[str, object]) -> None:
-        if self._rows is not None and state != NOTHING:
-            self._rows.set_state(record(state, "a share's rows"))
+        saved = state.get("cut") if "rows" in state and "cut" in state else None
+        if saved != self.dealt:
+            raise _position.PlanChanged(
+                ("shards.cut",),
+                f"the share's position was saved under its store's {saved or 'first'} cut and it reads "
+                f"under the {self.dealt or 'first'} cut now: its places are other rows; a relaxed resume "
+                "reads its data afresh")
+        rows = record(state["rows"], "a share's rows") if saved is not None else state
+        if self._rows is not None and rows != NOTHING:
+            self._rows.set_state(record(rows, "a share's rows"))
 
     def close(self) -> None:
         if self._rows is not None:

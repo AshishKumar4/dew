@@ -17,6 +17,7 @@ from dew.config.earlier import earlier_run
 from dew.config.jepa import JepaRunConfig
 from dew.config.lm import LMRunConfig
 from dew.decision.config import DecisionRunConfig
+from dew.kernels import Kernels
 from dew.quantization import Quantization
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -108,7 +109,7 @@ def test_a_run_whose_model_named_its_attention_kernel_runs_it_as_the_runs_own(ke
     earlier = {**held, "fields": {**held["fields"], "diagnostics": diagnostics, "model": {
         **model, "fields": {**model["fields"], "attention_impl": "reference"}}}}
     run = RunConfig.read(earlier_run(earlier))
-    assert run.diagnostics.kernels == {"attention": "reference", **kernels}
+    assert run.diagnostics.kernels == Kernels(**{"attention": "reference", **kernels})
     assert "attention_impl" not in json.loads(json.dumps(run.record()))["fields"]["model"]["fields"]
 
 
@@ -123,13 +124,13 @@ def test_a_run_saved_scanning_its_stack_resumes_scanned():
     held = json.loads(PUBLISHED.read_text())
     source = {**held["fields"]["source"], "scan_layers": True}
     run = RunConfig.read(earlier_run({**held, "fields": {**held["fields"], "source": source}}))
-    assert run.diagnostics.kernels == {"layer_scan": "scanned"}
+    assert run.diagnostics.kernels == Kernels(layer_scan="scanned")
     with run.traced():
         assert scanned()
     assert not scanned()
     diagnostics = {**held["fields"]["diagnostics"], "kernels": {"layer_scan": "plain"}}
     named = {**held, "fields": {**held["fields"], "source": source, "diagnostics": diagnostics}}
-    assert RunConfig.read(earlier_run(named)).diagnostics.kernels == {"layer_scan": "plain"}
+    assert RunConfig.read(earlier_run(named)).diagnostics.kernels == Kernels(layer_scan="plain")
 
 
 WRAPPERS = [("diffusion_gemma", "text"), ("dew.nn.multimodal:MultimodalTransformer", "language_model")]
@@ -166,6 +167,39 @@ def test_a_run_saved_pinning_a_wrapped_decoders_execution_resumes_so(wrapper, fi
     assert read(saved({"vocab_size": 16, pin: value}, kernels=own))["fields"]["kernels"] == own
     plain = saved({"vocab_size": 16})
     assert read(plain) == plain
+
+@pytest.mark.parametrize("pinned", ["mosaic", "xla", "cutlass"])
+def test_a_run_saved_pinning_the_grouped_products_resumes_syrk_pinned_and_its_fp32_loss_chunked(pinned):
+    """The published run as an earlier Dew saved it (before rows 12457 and 12485: no `kernels_split` beside
+    its fields), its grouped products' kernel pinned, reads as a run pinning SYRK's alike where the pin was
+    `mosaic` or `xla`, which chose SYRK's kernel then, and none for another (`cutlass`); traced within the
+    run (`RunConfig.traced`), its fp32 tiled loss, which the pin left on the chunked program, still takes it
+    rather than refusing a pin of the fused loss it never had. A run's own SYRK pin stands."""
+    import jax.numpy as jnp
+
+    from dew.nn.kernels import generation
+    from dew.nn.protocols import OutputTable
+    from dew.objectives.lm import chunked
+
+    held = json.loads(PUBLISHED.read_text())
+    assert "kernels_split" not in held
+
+    def saved(kernels: dict) -> RunConfig:
+        diagnostics = {**held["fields"]["diagnostics"], "kernels": kernels}
+        return RunConfig.read(earlier_run({**held, "fields": {**held["fields"], "diagnostics": diagnostics}}))
+
+    run = saved({"grouped_matmul": pinned})
+    carried = {"syrk": pinned} if pinned in ("mosaic", "xla") else {}
+    assert run.diagnostics.kernels == Kernels(grouped_matmul=pinned, **carried)
+    hidden = jnp.ones((64, 64), jnp.float32)
+    head = OutputTable(jnp.ones((128, 64), jnp.float32), vocab_major=True)
+    with run.traced(), generation.assumed("sm90"), generation.routes() as routes:
+        chunked.chunked_cross_entropy(hidden, head, jnp.zeros((64,), jnp.int32), chunks=2, tile=(64, 64),
+                                      predict=False)
+    assert not any(route.choice == "linear_ce" and route.kernel == "mosaic" for route in routes), routes
+    assert saved({"grouped_matmul": "mosaic", "syrk": "xla"}).diagnostics.kernels == Kernels(
+        grouped_matmul="mosaic", syrk="xla")
+
 
 LAYOUT = ROOT / "tests" / "fixtures" / "runs" / "hybrid-dit-176m" / "layout.json"
 
