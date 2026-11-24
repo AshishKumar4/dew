@@ -795,3 +795,45 @@ def test_the_blockwise_recipes_scales_meet_its_products_in_range():
     with generation.run_precision(RECIPE_NUMERICS["blockwise_fp8"]), projection_role("mlp"):
         out = np.asarray(jax.jit(layer.apply)(params, x), np.float32)
     np.testing.assert_array_equal(out, np.full((4, 128), 2.0 ** 117, np.float32))
+
+
+
+def test_an_ungated_mlps_projections_run_as_one_recipe_chain_bitwise_their_two_apart():
+    """An ungated MLP whose two projections DeepSeek-V3's blockwise FP8 recipe takes in its role runs them as
+    one chain (`projections.recipe_chain`, row 8547): one recipe region of the recipe's derivative where the
+    two apart held one each (`dew.nn.derivatives.Surrogate`), its rows any count (laid in whole blocks), and
+    its output and every gradient, the rows' and both kernels', bitwise the two projections apart with its
+    activation between them (`projections.recipe_projection`)."""
+    from reference_error import equations
+
+    from dew.nn.activations import ungated_activation
+    from dew.nn.derivatives import Surrogate
+    from dew.nn.mlp import GatedMLP
+    from dew.nn.precision import projection_role
+
+    fp8 = RECIPE_NUMERICS["blockwise_fp8"]
+    mlp = GatedMLP(hidden_features=256, out_features=128, activation="gelu", dtype=jnp.bfloat16)
+    x = jax.random.normal(jax.random.key(0), (2, 100, 128), jnp.bfloat16)
+    variables = mlp.init(jax.random.key(1), x)
+
+    def chained(variables, x):
+        return mlp.apply(variables, x)
+
+    def apart(variables, x):
+        rows = x.reshape(-1, x.shape[-1])
+        up = projections.recipe_projection(rows, variables["params"]["up_proj"]["kernel"].astype(x.dtype),
+                                           out_dtype=x.dtype)
+        hidden = ungated_activation("gelu", up)
+        out = projections.recipe_projection(
+            hidden, variables["params"]["down_proj"]["kernel"].astype(x.dtype), out_dtype=x.dtype)
+        return out.reshape(*x.shape[:-1], out.shape[-1])
+
+    with generation.run_precision(fp8), projection_role("mlp"):
+        graph = jax.make_jaxpr(chained)(variables, x)
+        regions = [equation for equation in equations(graph) if equation.primitive.name == "marked_call"
+                   and isinstance(equation.params.get("kind"), Surrogate)]
+        assert len(regions) == 1, len(regions)
+        cotangent = jax.random.normal(jax.random.key(2), (2, 100, 128), jnp.bfloat16)
+        ran = [jax.jit(with_gradients(form))(variables, x, cotangent) for form in (chained, apart)]
+    for mine, theirs in zip(*(jax.tree.leaves(each) for each in ran), strict=True):
+        np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
