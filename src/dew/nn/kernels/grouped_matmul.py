@@ -380,10 +380,16 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
         `derivation.derived` reads them."""
 
     def derived(self, ba, target) -> tiling.Tiles | None:
-        from .templates.gemm import producers
+        from .templates.gemm import producers, quantized
         tile = self._tile(ba, target)
         if tile is None:
             return None
+        if (forms := ba.arguments['hooks'].out_forms):
+            # Outputs a form reduces staged a block a chunk (`quantized.formed`), the tile taken so where it
+            # holds them (`candidate`'s `quantized.forms_refusal`: a transposed one a dense call's).
+            tile = quantized.formed(tile, forms)
+            if not self.candidate(ba, tile, target):
+                return None
         with generation.as_target(target):
             return producers.settled(self, ba, tile, target)
 
