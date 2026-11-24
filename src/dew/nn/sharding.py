@@ -682,42 +682,6 @@ def _named(spec: jax.sharding.PartitionSpec) -> set[str]:
             for name in ((entry,) if isinstance(entry, str) else tuple(entry))}
 
 
-@dataclasses.dataclass(frozen=True)
-class GatheredOver:
-    """A layout (`layout`, on the mesh `mesh` a step traces) placing every leaf a gathered loop's passes read
-    (`held`) whole over `axis` as `gathered_over` takes it, every other where `layout` does: what a pass of
-    a gathered loop traces under (`placing`), so a projection mapped per shard takes its gathered weight as
-    it lies (`dew.nn.kernels.projections.shard_placement`) and gathers it again in no pass."""
-
-    layout: ParameterLayout
-    scope: tuple[str, ...]
-    span: tuple[int, int]
-    axis: str
-    mesh: jax.sharding.AbstractMesh
-
-    def held(self, path) -> bool:
-        """Whether the passes read the leaf at `path` (a variables tree's): one under the decoder's variables
-        `scope`, `('params', ...)`, of a layer within the block (`span`, `[first, end)`), met by any module
-        name running it, its own (`layers_3`) or a scanned run's within the block (`layers_1_2`,
-        `dew.nn.backbones.layer_names.group_layers`), or of the decoder's own, no layer's (its step and
-        reinjection norms)."""
-        from dew.nn.backbones.layer_names import group_layers
-
-        names = tuple(key.key if isinstance(key, jax.tree_util.DictKey) else key for key in path)
-        at = len(self.scope)
-        if len(names) <= at or names[:at] != self.scope or not isinstance(names[at], str):
-            return False
-        runs = group_layers(names[at])
-        first, end = self.span
-        return runs is None or (first <= runs.start and runs.stop <= end)
-
-    def leaf_spec(self, mesh, path, value) -> jax.sharding.PartitionSpec:
-        """Where the leaf at `path` lies in a pass: `layout`'s placement on the step's mesh (`self.mesh`,
-        whichever mesh a pass traces, its `axis` Explicit), without `axis` where the passes read it."""
-        spec = self.layout.leaf_spec(self.mesh, path, value)
-        return _without(spec, self.axis) if self.held(path) else spec
-
-
 def _only(spec: jax.sharding.PartitionSpec, axes: Collection[str]) -> jax.sharding.PartitionSpec:
     """`spec` with only `axes` kept in each dimension that names any."""
     def kept(entry):

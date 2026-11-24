@@ -292,7 +292,8 @@ class Loop:
     the block's; the prelude, the coda (each pass's too, under `exiting`) and the embedding and head keep
     their placement. Every operation of the passes is typed on that axis, so one with no rule for it fails
     as it traces, and a random draw in a pass (a dropout's) is refused there too: its key is typed on the
-    step's mesh.
+    step's mesh. The block's layers run one by one in each pass (a scan over them takes no reduced copy),
+    and its projections as the partitioner places them, no launch mapped per shard.
     """
     steps: int
     step_norm: bool = True

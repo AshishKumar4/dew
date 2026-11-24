@@ -1277,37 +1277,3 @@ def test_a_gathered_loop_on_one_fsdp_device_is_the_loop():
         with jax.set_mesh(mesh), nn.logical_axis_rules(DEFAULT_RULES), placing(layout):
             programs.append(jax.jit(gradient).lower(variables, ids, jnp.ones((8, 12, VOCAB))).as_text())
     assert programs[0] == programs[1]
-
-
-@pytest.mark.mesh(devices=8)
-@pytest.mark.parametrize("layer_scan", ["plain", "scanned"])
-def test_a_gathered_loops_mapped_projections_take_their_weights_as_they_lie(layer_scan):
-    """A gathered loop's projections mapped per shard on an H100 (`projections.shard_placement`, a launch
-    per device on its own rows) read their block's weights where the gathered loop placed them
-    (`sharding.GatheredOver`): its traced gradient gathers no weight in any map, where the plain loop's
-    gathers in each pass's (row 12722), its layers run one by one or as one scanned run (`layers_0_1`). The
-    whole stack loops: every mapped projection is the block's."""
-    from reference_error import equations
-
-    from dew.distributed.placement import Layout
-    from dew.mesh import DEFAULT_RULES
-    from dew.nn.kernels import generation
-    from dew.nn.sharding import placing
-    from dew.training import MeshSpec
-
-    mesh = MeshSpec(fsdp=8).build(jax.devices()[:8])
-    layout = Layout(min_shard=1)
-    found = {}
-    for gathered in (False, True):
-        # Computing in bf16 at widths the GEMM template takes, Mosaic GPU's named: products a launch takes
-        # (`projections.launched`). The whole stack loops, so every mapped projection is the block's.
-        model = tiny(num_layers=2, loop=Loop(4, layers=(0, 2), gathered=gathered, step_norm=False),
-                     dtype="bfloat16", emb_features=128, mlp_features=256)
-        gradient = with_gradients(lambda variables, ids, model=model: model.apply(variables, ids))
-        variables, ids = model_draw(model, (8, 16), VOCAB)(0)
-        logits = jax.eval_shape(model.apply, variables, ids)
-        with (jax.set_mesh(mesh), nn.logical_axis_rules(DEFAULT_RULES), placing(layout),
-              generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic", layer_scan=layer_scan)):
-            graph = jax.make_jaxpr(gradient)(variables, ids, jnp.ones(logits.shape, logits.dtype))
-        found[gathered] = sum(equation.primitive.name == "all_gather" for equation in equations(graph))
-    assert found[False] and not found[True], found
