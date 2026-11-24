@@ -1455,7 +1455,7 @@ def planned_failures(found: list, plans: dict) -> list[str]:
     from which the tiles are derived): the recurrence's shared-memory model, beside the gate's verdicts on
     each kernel (`kernel_compile.mosaic_failures`)."""
     def planned(record: dict, kernel: dict) -> int:
-        # A kernel's launches the longest names that begin its own: `recurrence_intra_solve` is no
+        # A kernel's launches the longest names that begin its own: `recurrence_intra_own` is no
         # `recurrence_intra`.
         named = [launch for launch in plans[record['name']] if kernel['kernel'].startswith(launch.name)]
         longest = max((len(launch.name) for launch in named), default=0)
@@ -1520,16 +1520,16 @@ def test_a_refusals_roles_travel_with_it_into_derivations_and_handed_plans():
 
 
 def test_a_kernel_is_held_to_its_own_launchs_plan_where_another_launchs_name_begins_its_own():
-    """`planned_failures` holds `recurrence_intra_solve` to its own launch's shared memory, not to the larger
+    """`planned_failures` holds `recurrence_intra_own` to its own launch's shared memory, not to the larger
     plan of `recurrence_intra`, whose name begins its own, and `recurrence_intra` to its own."""
     import types
 
     plans = {"case": [types.SimpleNamespace(name="recurrence_intra", shared=200_000),
-                      types.SimpleNamespace(name="recurrence_intra_solve", shared=65_568)]}
-    found = [{"name": "case", "kernels": [{"kernel": "recurrence_intra_solve", "shared": 100_000},
+                      types.SimpleNamespace(name="recurrence_intra_own", shared=65_568)]}
+    found = [{"name": "case", "kernels": [{"kernel": "recurrence_intra_own", "shared": 100_000},
                                           {"kernel": "recurrence_intra", "shared": 150_000}]}]
     failed = planned_failures(found, plans)
-    assert [failure.split(":")[0] for failure in failed] == ["case recurrence_intra_solve"]
+    assert [failure.split(":")[0] for failure in failed] == ["case recurrence_intra_own"]
 
 
 def group_name(group: tuple) -> str:
@@ -2492,9 +2492,9 @@ def test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes(target,
 
 
 def test_a_spilling_kernel_raises_only_the_launch_it_belongs_to():
-    """A kernel spilling under a launch name another launch's extends (`recurrence_intra_solve` beside
+    """A kernel spilling under a launch name another launch's extends (`recurrence_intra_own` beside
     `recurrence_intra`) is that longer launch's alone (`template._owners`), so only its producer rises."""
     launches = [types.SimpleNamespace(name=name)
-                for name in ('recurrence_intra', 'recurrence_intra_solve', 'recurrence_output')]
-    owners = template._owners({'recurrence_intra_solve__l1f2', 'recurrence_output__l3a4'}, launches)
-    assert owners == {'recurrence_intra_solve', 'recurrence_output'}
+                for name in ('recurrence_intra', 'recurrence_intra_own', 'recurrence_output')]
+    owners = template._owners({'recurrence_intra_own__l1f2', 'recurrence_output__l3a4'}, launches)
+    assert owners == {'recurrence_intra_own', 'recurrence_output'}

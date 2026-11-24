@@ -146,7 +146,7 @@ def _key_memory_back(q, k, prefix, do, corrected, dv, memory, dh, a, beta, taken
     wy_dqkg's), the system's gradient before the values' part and the inverse (`_key_values_back`'s), the
     queries' and keys' each value head's, which `gradients` sums over its key head's. `memory` and `dh` the
     memories each chunk enters and the gradient of the one it leaves (`call.memories`), `dv` the corrected
-    values' whole gradient (`_reverse`'s), `a` the inverse less its unit diagonal (`_intra_solve`'s).
+    values' whole gradient (`_reverse`'s), `a` the inverse less its unit diagonal (`intra._intra`'s).
 
     A step a key block and a value row's columns (`_key_memory_tiles`): a row whole where it fits, else
     walked a few value blocks a step, the key block's three memory sums carried across its steps, each

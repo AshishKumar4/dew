@@ -14,10 +14,7 @@ from collections.abc import Callable
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
-from jax.experimental.mosaic.gpu import utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
-from jax.extend.mlir import ir
-from jax.extend.mlir.dialects import arith, memref
 
 from dew.nn.kernels import generation, recurrence_algebra as algebra
 from dew.nn.kernels.templates import bundles, mosaic, operands, product, resources, scan, swizzling
@@ -454,8 +451,7 @@ def _read_out(call: Call, products: tuple[str, ...], totals, owned: list, solve:
     sub-chunk (`algebra.columns_before`: a row whose write gate overflows times a zero factor is a NaN past
     them), `X` the rows of blocks before it (staged, zero past them), `E_b` the identity's rows: fla_kda's
     merges, each stored less its unit diagonal, as `mainloop._weighted` takes it. The own blocks `owned`
-    (their views, a form's parts each) are read into their tiles first, each thread its run of words
-    (`own_loaded`)."""
+    (their views, a form's parts each) are staged into their tiles first (`own_loaded`)."""
     sub, chunk, family = algebra.SUB, call.chunk, call.family
     own_tiles, (place, lower, solved, stacked) = solve[0], solve[1:]
     held_once = {}
@@ -463,7 +459,6 @@ def _read_out(call: Call, products: tuple[str, ...], totals, owned: list, solve:
                                         (placed_form(call), inverse_form(call)), strict=False):
         own_loaded(call, views, tiles)
         held_once[name] = operands.Parts(tiles, form.dtype)
-    mosaic.synced(call.interpret)
     issuer = Issuer(call, {"place.exact": place, "lower": lower, "solve": solved})
     rows_of = jax.lax.broadcasted_iota(jnp.int32, (sub, chunk), 0)
     columns_of = jax.lax.broadcasted_iota(jnp.int32, (sub, chunk), 1)
@@ -538,31 +533,14 @@ def _sub_chunk_held(call: Call, block: int, outputs: int = 1) -> Held:
 
 
 def own_loaded(call: Call, views: tuple, tiles: tuple) -> None:
-    """The own blocks' compact views (`own_pairs.intra_own`'s, a part each `[C, SUB]`) read into `tiles`, each
-    thread its run of words (`_own_copied`): a launch's tile read once, after its walk."""
-    for view, tile in zip(views, tiles, strict=True):
-        if call.interpret:
-            tile[...] = view[...]
-            continue
-        plgpu.inline_mgpu(arg_types=(plgpu.RefType(), plgpu.RefType()), return_type=())(
-            lambda ctx, from_ref, to_ref: _own_copied(from_ref, to_ref))(view, tile)
-
-
-def _own_copied(source_ref, tile_ref) -> None:
-    """`own_loaded` in Mosaic GPU's terms: a thread's `C * SUB / THREADS` words, row by row."""
-    index, i32 = ir.IndexType.get(), ir.IntegerType.get_signless(32)
-    rows, columns = ir.MemRefType(source_ref.type).shape
-    run = rows * columns // scan.THREADS
-
-    def const(value):
-        return arith.constant(i32, value)
-
-    thread = arith.remui(utils.thread_idx(), const(scan.THREADS))
-    for step in range(run):
-        entry = arith.addi(arith.muli(thread, const(run)), const(step))
-        at = [arith.index_cast(index, value)
-              for value in (arith.divui(entry, const(columns)), arith.remui(entry, const(columns)))]
-        memref.store(memref.load(source_ref, at), tile_ref, at)
+    """The own blocks' compact views (`own_pairs.intra_own`'s, a part each `[C, SUB]`) staged into `tiles` for
+    the read-out's products (`Family.staged`, published together): a launch's tile read once, after its walk,
+    as an mma.sync walk takes no once streams. A thread's own copy through `inline_mgpu` stated its tiles
+    unswizzled, which the products reading them do not take (sm90 and sm80, "Failed to infer a possible set
+    of layouts"), and published none of its writes to the tensor cores."""
+    with call.family.staged_together():
+        for view, tile in zip(views, tiles, strict=True):
+            call.family.staged(view[...], tile)
 
 
 def _sub_chunk_flops(call: Call, keys: int, outputs: int) -> int:
@@ -605,8 +583,7 @@ def _sub_chunk_staged(call: Call, keys: int, *, products: tuple[str, ...]) -> tu
     # solving, the substitution's left and right operands and its rows of blocks, in the merges' form.
     placed, inverted = placed_form(call), inverse_form(call)
     solving = "system" in products
-    # The own blocks' tiles (`own_loaded`), unswizzled: a TF32 product's operand takes no swizzled fp32 tile
-    # (row 12647, `_pair_swizzles`).
+    # The own blocks' tiles (`own_loaded`), a 16-bit part each.
     own = tuple(staging_tiles(form, (chunk, sub))[0] for form in (placed, inverted)[:1 + solving])
     (place,) = staging_tiles(Operand(sub, 1, jnp.dtype(placed.stored)), (sub, chunk))
     solve = ((place, *staging_tiles(inverted, (sub, chunk), (sub, chunk), (chunk, chunk)))
