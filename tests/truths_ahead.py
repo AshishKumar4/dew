@@ -103,7 +103,8 @@ class _HeldPickler(pickle.Pickler):
             return NotImplemented
         try:
             pickle.dumps(obj)
-        except (pickle.PicklingError, AttributeError):
+        # A closure holding what pickle refuses by type (a jaxlib Traceback a fused GEMM's hook keeps) too.
+        except (pickle.PicklingError, AttributeError, TypeError):
             return HeldName, (f"{obj.__module__}.{obj.__qualname__}",)
         return NotImplemented
 
