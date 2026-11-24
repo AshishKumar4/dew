@@ -11,7 +11,7 @@ import numpy as np
 from dew.artifacts import Decisions
 from dew.data import Memory
 from dew.data.compile import fitted
-from dew.data.dataset import DataPartition
+from dew.data.dataset import Closeable, DataPartition
 from dew.data.text import ByteTokenizer
 from dew.decision import Choice, DecisionObjective, Example, decisions
 from dew.decision.layout import SegmentLayout, Specials
@@ -114,3 +114,101 @@ def test_a_scoring_rules_total_reads_its_answered_rows_alone():
         kept = rule(Decisions(np.where(fewer[..., None], probabilities, np.nan), options, labels, targets,
                               ordinal, fewer), {})
         assert alone == kept
+
+
+def test_packed_validation_splits_read_in_one_shape_and_one_bound():
+    """Packed validation splits whose windows hold 1 to 4 documents each, of 1 to 7 windows, read in the
+    run's batch of 4 every batch the same as an evaluation reads it (its rows marked, `VALID_ROWS`, where
+    the reader marked none): a split's short last batch filled out, and each declaring the most documents
+    a window of any split holds (`Coordinates.max_segments`), so a run's evaluation compiles one program
+    for them all, where each split's own most compiled one apiece (row 12474)."""
+    from dew.batch import VALID_ROWS
+    from dew.data.pipeline import ObjectiveData, Pipeline
+
+    def split(windows: int, per_window: int) -> Pipeline:
+        size = 9 // per_window
+        return Pipeline(Memory(tuple({"text": np.arange(size, dtype=np.int32)}
+                                     for _ in range(windows * per_window)))).pack(9)
+
+    train = Pipeline(Memory(tuple({"text": np.arange(9, dtype=np.int32)} for _ in range(16)))).pack(9)
+    train = train.batch(4)
+    shapes = {(1, 1), (3, 2), (7, 3), (4, 4), (5, 1)}
+    _, readers = fitted(train, {f"{windows}x{per}": split(windows, per) for windows, per in shapes},
+                        objective=ObjectiveData(), steps=2)
+    assert readers is not None
+    # On one device, and over two row shards a share.
+    for partition in (DataPartition(), DataPartition(row_multiple=2)):
+        seen = set()
+        for reader in readers.values():
+            opened = reader(partition)
+            try:
+                for batch in opened:
+                    bound = batch["text_coordinates"].max_segments
+                    seen.add((tuple(sorted({*batch, VALID_ROWS})), np.shape(batch["text"]), bound))
+            finally:
+                if isinstance(opened, Closeable):
+                    opened.close()
+        assert len(seen) == 1 and next(iter(seen))[2] == 4, (partition, seen)
+
+
+def test_a_handed_validation_passs_short_last_batch_reads_in_its_whole_ones_shape():
+    """A validation split handed as Grain batches (`native`) of 4 rows over 7 examples reads its short last
+    batch of 3 filled out to 4, its fourth row marked a repeat: one shape a pass, so its evaluation, which
+    marks a whole batch's rows itself, compiles once (row 12474: a 4 + 3 split compiled its tail)."""
+    import grain.python as grain
+
+    from dew.batch import VALID_ROWS
+    from dew.data.handed import native
+
+    rows = grain.MapDataset.source([{"x": np.full(3, index, np.float32)} for index in range(7)]).batch(4)
+    opened = native(rows, training=False)(DataPartition())
+    batches = list(opened)
+    assert [np.shape(batch["x"]) for batch in batches] == [(4, 3), (4, 3)], batches
+    assert VALID_ROWS not in batches[0]
+    assert np.asarray(batches[1][VALID_ROWS]).tolist() == [True] * 3 + [False]
+
+
+def test_a_split_whose_packing_the_read_cannot_see_widens_no_known_splits_bound():
+    """Packed splits whose bounds the read knows (2 and 4 documents a window) beside a split of windows
+    packed already, whose documents the read cannot count: the known splits share their tightest common
+    bound, 4, and the unknown one declares its window's length, 9, apart, never widening theirs to it, as a
+    sequence kernel's chunk grid follows the bound (row 12474's review)."""
+    from dew.data.pipeline import ObjectiveData, Pipeline, mix
+
+    def split(windows: int, per_window: int) -> Pipeline:
+        return Pipeline(Memory(tuple({"text": np.arange(9 // per_window, dtype=np.int32)}
+                                     for _ in range(windows * per_window)))).pack(9)
+
+    # Windows a pack makes mixed with windows a corpus holds packed already, which the read cannot count.
+    held = Memory(tuple({"text": np.arange(9, dtype=np.int32),
+                         "text_segment_ids": np.asarray([1, 1, 2, 2, 3, 3, 4, 4, 0], np.int32),
+                         "text_positions": np.asarray([0, 1, 0, 1, 0, 1, 0, 1, 0], np.int32)}
+                        for _ in range(4))).named("ready")
+    packed = Memory(tuple({"text": np.arange(8, dtype=np.int32)} for _ in range(4))).named("packed")
+    ready = mix([packed.pack(9), held])
+    train = Pipeline(Memory(tuple({"text": np.arange(9, dtype=np.int32)} for _ in range(16)))).pack(9)
+    _, readers = fitted(train.batch(4), {"two": split(3, 2), "four": split(4, 4), "ready": ready},
+                        objective=ObjectiveData(), steps=2)
+    assert readers is not None
+    declared = {}
+    for name, reader in readers.items():
+        opened = reader(DataPartition())
+        try:
+            declared[name] = {batch["text_coordinates"].max_segments for batch in opened}
+        finally:
+            if isinstance(opened, Closeable):
+                opened.close()
+    assert declared == {"two": {4}, "four": {4}, "ready": {9}}, declared
+
+
+def test_a_handed_validation_pass_passes_on_a_batch_of_no_rows_after_a_whole_one():
+    """A handed validation pass whose source yields a batch of no rows after a whole one passes it on as it
+    is, with no rows to fill out with, rather than refusing it (review of row 12474)."""
+    import grain.python as grain
+
+    from dew.data.handed import native
+
+    batches = [{"x": np.ones((4, 3), np.float32)}, {"x": np.zeros((0, 3), np.float32)}]
+    opened = native(grain.MapDataset.source(batches), training=False)(DataPartition())
+    read = list(opened)
+    assert [np.shape(batch["x"]) for batch in read] == [(4, 3), (0, 3)], read
