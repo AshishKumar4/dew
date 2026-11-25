@@ -178,7 +178,7 @@ def _sum(arrays, form: Form, terms: tuple[Term, ...], out: str, dtype):
     group's values span more than a band (`_band`) the sum taken again a band pair at a time into exponent
     bins (`_banded`), so a part beneath terms that cancel survives them. A non-finite output IEEE's, as one
     exponent lands it; a float64 sum's one exponent spans the float32 operands it takes."""
-    precision = PRECISION if dtype == jnp.float32 else jax.lax.Precision.HIGHEST
+    precision = PRECISION
     shaped = Form(form.subscripts, terms, out, units=form.units)
     held = [[part for group in groups for part in _parts(shaped, group, arrays, dtype)]
             for _, groups in terms]

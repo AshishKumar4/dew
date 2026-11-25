@@ -398,3 +398,74 @@ def test_a_product_of_a_split_activation_and_a_weight_holding_a_sum_takes_jaxs_r
         assert jax.typeof(got).sharding.spec == jax.typeof(theirs).sharding.spec
     for got, alone in zip(jax.tree.leaves(values), jax.tree.leaves(whole), strict=True):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(alone))
+
+
+@pytest.mark.parametrize("generation_name", generations("sm90", "sm100"))
+def test_grouped_gated_experts_selector_defaults_apart_and_honors_named_and_handoff_gates(generation_name):
+    """Grouped expert MLPs (`gated_mlp.fuses_grouped`, row 12847) key their own `(dtype, 'grouped')` cell on
+    `GATED_MLP`, default to `'apart'` without a receipt, run `'fused'` when named on supported 3D expert
+    kernels (both under the default grouped selector and under `grouped_matmul='mosaic'`), and hand off
+    cleanly to `'apart'` when `paired`, `down_prologue`, `hook`, `whole`, or `launched` fails."""
+    from dew.nn import gated_mlp
+
+    rows = jax.ShapeDtypeStruct((256, 128), jnp.bfloat16)
+    gate = jax.ShapeDtypeStruct((4, 128, 256), jnp.bfloat16)
+    down = jax.ShapeDtypeStruct((4, 256, 128), jnp.bfloat16)
+    hook = activations.gated_hook("swiglu")
+    with generation.assumed(generation_name):
+        case = gated_mlp.grouped_case(rows, (gate, down), None, hook)
+        assert case.cell == (generation_name, (jnp.dtype(jnp.bfloat16), "grouped"))
+        with generation.routes() as default_routes:
+            assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook)
+        assert [route.kernel for route in default_routes if route.choice == "gated_mlp"] == ["apart"]
+        with generation.chosen(gated_mlp="fused"):
+            with generation.routes() as named_routes:
+                assert gated_mlp.fuses_grouped(rows, (gate, down), None, hook)
+            assert [route.kernel for route in named_routes if route.choice == "gated_mlp"] == ["fused"]
+            assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook, paired=False)
+            assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook, down_prologue=False)
+            assert not gated_mlp.fuses_grouped(rows, (gate, down), None, None)
+            assert not gated_mlp.fuses_grouped(rows, None, None, hook)
+            assert not gated_mlp.fuses_grouped(
+                rows, (gate, down), None, activations.gated_hook("geglu_exact"))
+            assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook, whole=False)
+            with jax.enable_x64():
+                wide_rows = jax.ShapeDtypeStruct((256, 128), jnp.float64)
+                assert not gated_mlp.fuses_grouped(wide_rows, (gate, down), None, hook)
+        # Named CUTLASS refuses paired epilogue / down prologue hooks and must hand off to `apart`.
+        with generation.chosen(grouped_matmul="cutlass", gated_mlp="fused"):
+            assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook)
+        with generation.chosen(grouped_matmul="mosaic", gated_mlp="fused"):
+            assert gated_mlp.fuses_grouped(rows, (gate, down), None, hook)
+            # Explicit group_sizes, gather/scatter tables, and stacked 4D layer banks pass through cleanly.
+            sizes = jax.ShapeDtypeStruct((4,), jnp.int32)
+            table = jax.ShapeDtypeStruct((256,), jnp.int32)
+            gate_4d = jax.ShapeDtypeStruct((2, 4, 128, 256), jnp.bfloat16)
+            down_4d = jax.ShapeDtypeStruct((2, 4, 256, 128), jnp.bfloat16)
+            assert gated_mlp.fuses_grouped(rows, (gate_4d, down_4d), None, hook,
+                                           group_sizes=sizes, gather=table, scatter=table, layer=0)
+            # Forced grouped Mosaic never escapes `KernelRefused` before GATED_MLP's handoff.
+            assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook, whole=False)
+            with jax.enable_x64():
+                wide_rows = jax.ShapeDtypeStruct((256, 128), jnp.float64)
+                assert not gated_mlp.fuses_grouped(wide_rows, (gate, down), None, hook)
+
+
+def test_grouped_gated_experts_hands_off_default_a100_cutlass_down():
+    """On A100 (`sm80`), the ordinary grouped down cell chooses CUTLASS which forms the prologue in XLA, and
+    `mma.sync` takes no side-tile prologue (`takes_prologue_tiles = False`), so `fuses_grouped` hands off to
+    `'apart'` under both the default selector and forced Mosaic without escaping `KernelRefused`."""
+    from dew.nn import gated_mlp
+
+    rows = jax.ShapeDtypeStruct((256, 128), jnp.bfloat16)
+    gate = jax.ShapeDtypeStruct((4, 128, 256), jnp.bfloat16)
+    down = jax.ShapeDtypeStruct((4, 256, 128), jnp.bfloat16)
+    table = jax.ShapeDtypeStruct((256,), jnp.int32)
+    hook = activations.gated_hook("swiglu")
+    with generation.assumed("sm80"):
+        with generation.chosen(gated_mlp="fused"):
+            assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook)
+        with generation.chosen(grouped_matmul="mosaic", gated_mlp="fused"):
+            assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook)
+            assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook, gather=table)
+            assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook, scatter=table)

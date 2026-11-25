@@ -24,8 +24,9 @@ import collections
 import functools
 import hashlib
 import itertools
+import math
 import weakref
-from collections.abc import Callable, Hashable, Iterator, Sequence
+from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from typing import NamedTuple
 
 import jax
@@ -33,6 +34,7 @@ import jax.numpy as jnp
 import numpy as np
 from egglog import eq
 from jax._src import core as jax_core
+from jax.core import ShapedArray
 from jax.extend import core as jcore
 
 from dew import _cache
@@ -42,7 +44,7 @@ from dew.algebra.forms import aval
 from dew.nn.derivatives import Protected, marked_call_p
 from dew.nn.kernels import generation
 from dew.nn.kernels.generation import Choice
-from dew.nn.programs import bodies, control_flow, entrywise, purely_called
+from dew.nn.programs import bodies, control_flow, entrywise, equations, purely_called, read_by
 from dew.nn.sharding import sequence_shards
 
 REACH = 8
@@ -57,41 +59,49 @@ candidate does not bind, and is none."""
 class Candidate(NamedTuple):
     """A call the compile point may write for a region of a body: its operands and results as the body holds
     them, the call over the operands making the results (at implementation 'auto', so its kernel is the
-    selector's), its declaration (the same call on its portable path), and whether the selector gives the
-    call a kernel of Dew's."""
+    selector's), its declaration (the same call on its portable path), whether the selector gives the call a
+    kernel of Dew's, optionally the inner step body (`body`: a `scan_p`'s step jaxpr compared against
+    `declared` for recurrence recognition), an optional stable identity (`key`, included in `_region_key` when
+    outer proofs filter candidates), and an optional post-match training probe (`training_ok`)."""
 
     operands: tuple[jcore.Var, ...]
     outputs: tuple[jcore.Var, ...]
     call: Callable
     declared: functools.partial
     taken: Callable[[], bool]
+    body: jcore.Jaxpr | None = None
+    key: Hashable = None
+    training_ok: Callable[[], bool] | None = None
 
 
 class Family(NamedTuple):
-    """A kind of call (`ATTENTION`, `NORMS`): its anchor primitive and its candidates around an equation of
-    it."""
-
+    """A kind of call (`ATTENTION`, `RECURRENCES`, `NORMS`): its anchor primitive and its candidates around
+    an equation of it."""
     anchor: jcore.Primitive
     candidates: Callable[[fusion.Index, int], Iterator[Candidate]]
 
 
 def recognized(jaxpr: jcore.Jaxpr, index: fusion.Index, families: Sequence[Family],
-               held: frozenset[int] = frozenset()) -> list[fusion.Written]:
+               held: frozenset[int] = frozenset(), *,
+               _base: tuple[Hashable, Hashable] | None = None) -> list[fusion.Written]:
     """Every region of `jaxpr` (`index`'s) the e-graph proves computes a family's call and whose call takes
     a kernel of Dew's, written as that call (the module's account): `families` in order (`ATTENTION`,
-    `NORMS`), an anchor's candidates in the order its family
-    names them, the first equal one taken, no two regions sharing an equation nor one `held` (a product's
-    epilogue's). Each region's choice is held by its structure and its constants' values (`_HELD_REGIONS`),
-    the body's whole recognition by its structure and constants (`_HELD_BODIES`). A body binding none of the
-    families' anchors, at any depth of the programs it nests (`_bound`), has no region to find and is
-    answered at once, before any key of it is built: most bodies of a model built of Dew's own layers, whose
-    kernels its selectors already call (a Qwen3.5-4B training step's plan keyed and searched 7,034 bodies,
-    half of one equation, for no region, 37 of its seconds, row 5556)."""
+    `RECURRENCES`, `NORMS`), an anchor's candidates in the order its family names them, the first equal one
+    taken, no two regions sharing an equation nor one `held` (a product's epilogue's). Each region's choice
+    is held by its structure and its constants' values (`_HELD_REGIONS`), the body's whole recognition by its
+    structure and constants (`_HELD_BODIES`). A body binding none of the families' anchors, at any depth of
+    the programs it nests (`_bound`), has no region to find and is answered at once, before any key of it is
+    built: most bodies of a model built of Dew's own layers, whose kernels its selectors already call (a
+    Qwen3.5-4B training step's plan keyed and searched 7,034 bodies, half of one equation, for no region, 37
+    of its seconds, row 5556)."""
     if _bound(jaxpr).isdisjoint(family.anchor for family in families):
         return []
-    key = (_keyed(jaxpr, index), held, tuple(family.anchor for family in families), fusion.choice_context())
+    base = fusion.base_context() if _base is None else _base
+    key = (_keyed(jaxpr, index), held, tuple(family.anchor for family in families),
+           fusion.choice_context_of(base))
     def recognizing() -> list:
-        return [_positioned(jaxpr, written) for written in _recognizing(jaxpr, index, held, families)]
+        return [_positioned(jaxpr, written)
+                for written in _recognizing(jaxpr, index, held, families, _base=base)]
     found = _cache.holding(_HELD_BODIES, key, recognizing, fusion.DECISIONS_HELD)
     return [_placed(jaxpr, written) for written in found]
 
@@ -112,11 +122,10 @@ def _keyed(jaxpr: jcore.Jaxpr, index: fusion.Index) -> Hashable:
 
 
 def _body_key(jaxpr: jcore.Jaxpr, index: fusion.Index) -> Hashable:
-    """A body's structure (`program.structure`, its constants among its inputs) and its constants' values,
-    which a call's static arguments read (an epsilon, a mask)."""
-    window = jcore.Jaxpr([], [*jaxpr.constvars, *jaxpr.invars], list(jaxpr.outvars), jaxpr.eqns)
+    """A body's structure (`terms.jaxpr_digest` in-process) and its constants' values, which a call's static
+    arguments read (an epsilon, a mask)."""
     held = tuple(_digest(index.consts[var]) if var in index.consts else None for var in jaxpr.constvars)
-    return program.structure(window), held
+    return terms.jaxpr_digest(jaxpr, in_process=True), held
 
 
 def _positions(jaxpr: jcore.Jaxpr) -> dict[jcore.Var, int]:
@@ -141,7 +150,8 @@ def _placed(jaxpr: jcore.Jaxpr, held: tuple) -> fusion.Written:
 
 
 def _recognizing(jaxpr: jcore.Jaxpr, index: fusion.Index, held: frozenset[int],
-                 families: Sequence[Family]) -> list[fusion.Written]:
+                 families: Sequence[Family], *,
+                 _base: tuple[Hashable, Hashable] | None = None) -> list[fusion.Written]:
     """`recognized`'s search."""
     accurate = generation.numerics().forms == "accurate"
     found: list[fusion.Written] = []
@@ -155,7 +165,7 @@ def _recognizing(jaxpr: jcore.Jaxpr, index: fusion.Index, held: frozenset[int],
             spans = [(candidate, places) for candidate in family.candidates(index, place)
                      if (places := _between(index, candidate.operands, candidate.outputs)) is not None
                      and not claimed & set(places)]
-            written = _first_equal(jaxpr, index, spans, accurate)
+            written = _first_equal(jaxpr, index, spans, accurate, _base=_base)
             if written is not None:
                 found.append(written)
                 claimed.update(written.places)
@@ -163,7 +173,7 @@ def _recognizing(jaxpr: jcore.Jaxpr, index: fusion.Index, held: frozenset[int],
 
 
 def _first_equal(jaxpr: jcore.Jaxpr, index: fusion.Index, spans: Sequence[tuple[Candidate, tuple[int, ...]]],
-                 accurate: bool) -> fusion.Written | None:
+                 accurate: bool, *, _base: tuple[Hashable, Hashable] | None = None) -> fusion.Written | None:
     """The first of an anchor's candidates whose call takes a kernel of Dew's and whose region the e-graph
     proves computes it, written as its call; None where none is. Its regions are weighed in the order their
     first candidates come, each once: which of its candidates is equal and taken (`_chosen`), held by the
@@ -173,7 +183,7 @@ def _first_equal(jaxpr: jcore.Jaxpr, index: fusion.Index, spans: Sequence[tuple[
     for candidate, places in spans:
         regions.setdefault(places, []).append(candidate)
     for places, members in regions.items():
-        key = _region_key(jaxpr, index, places, members[0].outputs, accurate)
+        key = _region_key(jaxpr, index, places, members[0].outputs, accurate, members, _base=_base)
 
         def chose(places=places, members=members):
             # Its probes' routes are no program's: the routes a block collects are the kernels it runs.
@@ -195,42 +205,51 @@ once."""
 
 
 def _region_key(jaxpr: jcore.Jaxpr, index: fusion.Index, places: tuple[int, ...],
-                outputs: Sequence[jcore.Var], accurate: bool) -> Hashable:
+                outputs: Sequence[jcore.Var], accurate: bool, members: Sequence[Candidate], *,
+                _base: tuple[Hashable, Hashable] | None = None) -> Hashable:
     """What a region's choice reads: its structure (`program.structure`, every value it reads an input), the
     values of the constants among them (`_digest`: a statistic's divisor, an epsilon held as an array), the
-    numerics' forms and the context its kernels are chosen in (`fusion.choice_context`)."""
+    ordered candidate identities (`Candidate.key`, distinguishing regions whose outer proofs drop candidates),
+    the numerics' forms, and the context its kernels are chosen in (`fusion.choice_context`)."""
     inputs = fusion.region_inputs(jaxpr, places)
     window = jcore.Jaxpr([], list(inputs), list(outputs), [jaxpr.eqns[place] for place in places])
     held = tuple(_digest(index.consts[var]) if var in index.consts else None for var in inputs)
-    return program.structure(window), held, accurate, fusion.choice_context()
-
+    candidate_keys = tuple(candidate.key for candidate in members)
+    return program.structure(window), held, candidate_keys, accurate, fusion.choice_context_of(_base)
 
 def _digest(value) -> Hashable:
     """A constant by its type and bits (`terms.held_bits`: a typed PRNG key's its key data); a traced one (a
-    value an enclosing trace closes over), which holds no bits until it runs, by its type alone, as an input
-    is."""
+    value an enclosing trace closes over) or a non-addressable global shard, which holds no local host bits,
+    by its type alone."""
     if isinstance(value, jax_core.Tracer):
         return value.aval
+    if isinstance(value, jax.Array) and not value.is_fully_addressable:
+        return "non_addressable", value.aval
     dtype, array = terms.held_bits(value)
     return dtype, array.shape, hashlib.sha256(np.ascontiguousarray(array).tobytes()).hexdigest()
 
 
+def _training_ok(candidate: Candidate) -> bool:
+    """Whether `candidate` has no post-match training probe or its training probe passes."""
+    return candidate.training_ok is None or candidate.training_ok()
+
+
 def _chosen(index: fusion.Index, places: tuple[int, ...], members: Sequence[Candidate],
             accurate: bool) -> int | None:
-    """The first of one region's candidates whose call takes a kernel and which the e-graph proves equal to
-    the region (`_equalities`, of the taken ones alone), its place among `members`; None where none is.
-    Each in order, whether its call takes a kernel asked as it is reached (`Candidate.taken`: an attention's
-    48 candidates over 2,048 keys, each asked before any was compared, 17.8 s of one region's recognition,
-    row 6799), and one that does compared alone, where its results are its declaration's own values; the
-    e-graph only where none is, over every candidate that takes one."""
+    """The first of one region's candidates whose call takes a kernel, which the e-graph proves equal to the
+    region (`_equalities`, of the taken ones alone), and whose post-match training probe holds (`training_ok`,
+    checked only after equivalence is proven so rejected candidates stage no VJP); None where none is."""
     for number, candidate in enumerate(members):
-        if candidate.taken() and _equalities(index, [(candidate, places)], accurate, saturating=False)[0]:
+        if (candidate.taken()
+                and _equalities(index, [(candidate, places)], accurate, saturating=False)[0]
+                and _training_ok(candidate)):
             return number
     taken = [number for number, candidate in enumerate(members) if candidate.taken()]
     if not taken:
         return None
     equal = _equalities(index, [(members[number], places) for number in taken], accurate)
-    return next((number for number, same in zip(taken, equal, strict=True) if same), None)
+    return next((number for number, same in zip(taken, equal, strict=True)
+                 if same and _training_ok(members[number])), None)
 
 
 def _holds(equation: jcore.JaxprEqn, primitive: jcore.Primitive) -> bool:
@@ -293,22 +312,34 @@ def _bound(jaxpr: jcore.Jaxpr) -> frozenset[jcore.Primitive]:
     level is asked of every program beneath it, which walked anew for each equation above grew with the
     nesting's depth times the program's size. The programs beneath it are read innermost first from a
     stack of this function's own, so their nesting's depth takes none of the interpreter's."""
+    if (found := _HELD_BOUND.get(jaxpr)) is not None:
+        return found
     pending = [jaxpr]
+    scanned: dict[int, tuple[frozenset[jcore.Primitive], list[jcore.Jaxpr]]] = {}
     while pending:
         program_ = pending[-1]
         if program_ in _HELD_BOUND:
             pending.pop()
             continue
-        # One operation of Dew's is that operation alone (`_read_as`), its spans' insides unread.
-        nested = [body for equation in program_.eqns if _read_as(equation) is None
-                  for body in bodies(equation)]
+        if (entry := scanned.get(id(program_))) is None:
+            own: set[jcore.Primitive] = set()
+            nested: list[jcore.Jaxpr] = []
+            for equation in program_.eqns:
+                # One operation of Dew's is that operation alone (`_read_as`), its spans' insides unread.
+                if (read := _read_as(equation)) is not None:
+                    own.add(read)
+                else:
+                    own.add(equation.primitive)
+                    if equation.params:
+                        nested.extend(bodies(equation))
+            entry = scanned[id(program_)] = (frozenset(own), nested)
+        own_prims, nested = entry
         unread = [body for body in nested if body not in _HELD_BOUND]
         if unread:
             pending.extend(unread)
             continue
-        _HELD_BOUND[program_] = frozenset({_read_as(equation) or equation.primitive
-                                           for equation in program_.eqns}).union(
-            *(_HELD_BOUND[body] for body in nested))
+        _HELD_BOUND[program_] = own_prims.union(*(_HELD_BOUND[body] for body in nested))
+        pending.pop()
     return _HELD_BOUND[jaxpr]
 
 
@@ -368,6 +399,38 @@ barrier but no identity either
 stops the same value, and a stop on a call's operand stays outside the call."""
 
 
+def _check_joint(closed: jcore.Jaxpr, widths: Sequence[int], accurate: bool, *,
+                 saturating: bool = True) -> list[bool]:
+    """Compare program outputs against declared outputs in canonical form `closed`, falling back to e-graph
+    saturation under `rules.admitted(accurate)` only when no candidate matches directly."""
+    written = [_atom_key(atom) for atom in closed.jaxpr.outvars]
+    shared, program_at = [], 0
+    declared_at = sum(widths)
+    for width in widths:
+        shared.append(written[program_at:program_at + width] == written[declared_at:declared_at + width])
+        program_at += width
+        declared_at += width
+    if any(shared):
+        first = next(index for index, matched in enumerate(shared) if matched)
+        return [number == first for number in range(len(widths))]
+    if not saturating:
+        return shared
+    region = terms.region(closed)
+    graph, _, _ = program.graphed(region)
+    program.saturate(graph, region, rules.admitted(accurate), SATURATION)
+    # Each output's term, the program's results first, then each declaration's in the same order.
+    terms_made = region.outputs
+    equal, program_at = [], 0
+    declared_at = sum(widths)
+    for width in widths:
+        pairs = [(terms_made[program_at + n], terms_made[declared_at + n]) for n in range(width)]
+        equal.append(all(ours is not None and theirs is not None and graph.check_bool(eq(ours).to(theirs))
+                         for ours, theirs in pairs))
+        program_at += width
+        declared_at += width
+    return equal
+
+
 def _equalities(index: fusion.Index, spans: Sequence[tuple[Candidate, tuple[int, ...]]],
                 accurate: bool, *, saturating: bool = True) -> list[bool]:
     """Whether each candidate's results are its declaration's, in one e-graph of every span's equations and
@@ -377,6 +440,19 @@ def _equalities(index: fusion.Index, spans: Sequence[tuple[Candidate, tuple[int,
     not weighed: no e-graph is built; nor where not `saturating`, which weighs that alone."""
     if not spans:
         return []
+    if (scan_body := spans[0][0].body) is not None:
+        step_inputs = tuple(scan_body.invars)
+        run_body = jcore.jaxpr_as_fun(scan_body)
+
+        def joint_body(*values):
+            ours = list(run_body(*values))
+            computed = [val for _ in spans for val in ours]
+            for candidate, _ in spans:
+                computed += _declaration(candidate, step_inputs)(*values)
+            return computed
+
+        closed = normal_form.canonical(jax.make_jaxpr(joint_body)(*(_shape(var) for var in step_inputs)))
+        return _check_joint(closed, [len(scan_body.outvars)] * len(spans), accurate, saturating=saturating)
     places = sorted(set().union(*(set(span) for _, span in spans)))
     made = {var for place in places for var in index.jaxpr.eqns[place].outvars}
     inputs = list(dict.fromkeys(atom for place in places for atom in index.jaxpr.eqns[place].invars
@@ -396,34 +472,8 @@ def _equalities(index: fusion.Index, spans: Sequence[tuple[Candidate, tuple[int,
         return computed
 
     closed = normal_form.canonical(jax.make_jaxpr(joint)(*(_shape(var) for var in inputs)))
-    written = [_atom_key(atom) for atom in closed.jaxpr.outvars]
-    shared, program_at = [], 0
-    declared_at = sum(len(candidate.outputs) for candidate, _ in spans)
-    for candidate, _ in spans:
-        width = len(candidate.outputs)
-        shared.append(written[program_at:program_at + width] == written[declared_at:declared_at + width])
-        program_at += width
-        declared_at += width
-    if any(shared):
-        first = shared.index(True)
-        return [number == first for number in range(len(spans))]
-    if not saturating:
-        return shared
-    region = terms.region(closed)
-    graph, _, _ = program.graphed(region)
-    program.saturate(graph, region, rules.admitted(accurate), SATURATION)
-    # Each output's term, the program's results first, then each declaration's in the same order.
-    terms_made = region.outputs
-    equal, program_at = [], 0
-    declared_at = sum(len(candidate.outputs) for candidate, _ in spans)
-    for candidate, _ in spans:
-        pairs = [(terms_made[program_at + n], terms_made[declared_at + n])
-                 for n in range(len(candidate.outputs))]
-        equal.append(all(ours is not None and theirs is not None and graph.check_bool(eq(ours).to(theirs))
-                         for ours, theirs in pairs))
-        program_at += len(candidate.outputs)
-        declared_at += len(candidate.outputs)
-    return equal
+    return _check_joint(closed, [len(candidate.outputs) for candidate, _ in spans], accurate,
+                        saturating=saturating)
 
 
 def _atom_key(atom) -> Hashable:
@@ -436,22 +486,23 @@ _DECLARATIONS: collections.OrderedDict[Hashable, Held[Callable]] = collections.O
 `fusion.DECISIONS_HELD` held: every norm of a stack weighs the same declaration."""
 
 
-def _declaration(candidate: Candidate) -> Callable:
-    """`candidate`'s declaration as its traced program over its operands' types, run over values to its
-    results' leaves, each of Dew's choices by the platform its default branch (`forms.inlined`); traced once
-    for each call, choices and types (`_DECLARATIONS`)."""
+def _declaration(candidate: Candidate, operands: Sequence[jcore.Var] | None = None) -> Callable:
+    """`candidate`'s declaration as its traced program over `operands`' types (or `candidate.operands`), run
+    over values to its results' leaves, each of Dew's choices by the platform its default branch
+    (`forms.inlined`); traced once for each call, choices and types (`_DECLARATIONS`)."""
     declared = candidate.declared
     function = declared.func
+    args = candidate.operands if operands is None else tuple(operands)
     cells = tuple(cell.cell_contents for cell in function.__closure__ or ())
     keywords = tuple(sorted((function.__kwdefaults__ or {}).items()))
     key = (function.__code__, _typed(function.__defaults__), _typed(keywords), _typed(cells),
-           _typed(tuple(sorted(declared.keywords.items()))), _typed(tuple(candidate.operands)))
+           _typed(tuple(sorted(declared.keywords.items()))), _typed(args))
 
     def traced() -> Callable:
         # Dew's own choices by the platform read as their default branch (`forms.inlined`): its product under
         # a wide arithmetic is the product a program writes; a program's own choices stay as written.
         written = jax.make_jaxpr(lambda *values: jax.tree.leaves(forms.inlined(declared)(*values)))(
-            *(_shape(var) for var in candidate.operands))
+            *(_shape(var) for var in args))
         return jcore.jaxpr_as_fun(written)
     return _cache.holding(_DECLARATIONS, key, traced, fusion.DECISIONS_HELD)
 
@@ -1129,8 +1180,391 @@ def _traced_taken(attend: Callable, operands: Sequence[jcore.Var]) -> bool:
     return any(route.choice == Choice.ATTENTION and route.kernel not in KEPT for route in found)
 
 
+_QUERY_PASSTHROUGH = frozenset({
+    jax.lax.broadcast_in_dim_p, jax.lax.convert_element_type_p, jax.lax.reshape_p,
+    jax.lax.transpose_p, jax.lax.squeeze_p, jax.lax.slice_p, jax.lax.concatenate_p,
+})
+
+
+def _nonpositive_decay(bound: terms.Magnitude | None, proved: terms.Apart) -> bool:
+    """Whether a decay operand is statically proven nonpositive (`<= 0`, no NaN)."""
+    return proved.number and (proved.sign < 0 or bound == terms.NOTHING)
+
+
+_RECURRENCE_ROUTES: collections.OrderedDict[Hashable, Held[tuple[bool, frozenset[str]]]] = (
+    collections.OrderedDict())
+"""Selected forward or training recurrence kernels by `(kind, operand shapes/dtypes, options, context)`."""
+
+
+def _recurrence_inter_dtype(kernel: str, hooks, common):
+    """Intermediate storage dtype (`scores`, entered state, `corrected`) for selected recurrence `kernel`,
+    or None for any unrecognized kernel (which keeps the plain scan intact)."""
+    from dew.nn.kernels import recurrence_chunk
+
+    if kernel == "fla":
+        return common
+    if kernel == "mosaic_gpu":
+        rounded = recurrence_chunk.chunk_rounding(
+            hooks.delta, common, released=recurrence_chunk.simple_gla(hooks))
+        return common if (hooks.delta or rounded) else jnp.float32
+    return None
+
+
+def _norm_bits(bound: terms.Magnitude, apart: terms.Apart, half_key_bits: int) -> int:
+    """Upper log2 bound on the Euclidean norm of a last-axis vector (`terms.NOTHING` for exact zero)."""
+    if bound == terms.NOTHING:
+        return terms.NOTHING
+    return 0 if apart.unit_norm else bound + half_key_bits
+
+
+def _recurrence_bounded(
+    state_bound: terms.Magnitude | None, state_apart: terms.Apart,
+    q_bound: terms.Magnitude | None, q_apart: terms.Apart,
+    k_bound: terms.Magnitude | None, k_apart: terms.Apart,
+    v_bound: terms.Magnitude | None, v_apart: terms.Apart,
+    beta_bound: terms.Magnitude | None, beta_apart: terms.Apart, *,
+    seq_len: int, key_width: int, inter_dtype, out_dtype, scale: float | None, delta: bool, has_beta: bool,
+) -> bool:
+    """Whether the selected chunked kernel's `inter_dtype` (`_recurrence_inter_dtype`) preserves both
+    upper-range finiteness (ungated `K @ K^T`, `Q @ K^T`, contractive WY inverse, peak state/readout) and
+    lower-range non-underflow of `(Q @ K^T) @ (beta * V - K^T h)` and `q^T state` into `out_dtype`
+    (row 3450)."""
+    if (state_bound is None or q_bound is None or k_bound is None or v_bound is None
+            or not (state_apart.finite and q_apart.finite and k_apart.finite and v_apart.finite)
+            or (scale is not None and (not math.isfinite(scale) or scale <= 0.0 or scale > 1.0))
+            or (has_beta and (beta_bound is None or not beta_apart.finite))):
+        return False
+    inter_info, out_info = jnp.finfo(inter_dtype), jnp.finfo(out_dtype)
+    if int(inter_info.nmant) < int(out_info.nmant):
+        return False
+    work_cap = min(56, int(inter_info.maxexp) - 4)
+    v_cap = int(out_info.minexp) - int(inter_info.minexp)
+    key_bits = math.ceil(math.log2(max(key_width, 1)))
+    half_key_bits = (key_bits + 1) // 2
+    seq_bits = math.ceil(math.log2(max(seq_len, 1)))
+    beta_bits = 0 if not has_beta else (beta_bound or 0)
+    beta_lift = max(0, beta_bits) if (has_beta and beta_bound != terms.NOTHING) else 0
+    v_elem = terms.NOTHING if v_bound == terms.NOTHING else (0 if v_apart.unit_norm else v_bound)
+    h0_norm = terms.NOTHING if state_bound == terms.NOTHING else state_bound + half_key_bits
+    k_norm = _norm_bits(k_bound, k_apart, half_key_bits)
+    q_norm = _norm_bits(q_bound, q_apart, half_key_bits)
+    # Ungated `K @ K^T` and `Q @ K^T` stay finite even at zero `beta`/`Q`; operands stay within `v_cap`.
+    # Allow 1 bit on `v_elem + beta_lift` for `terms._bounded`'s `UNIT + 1` headroom on `sigmoid(beta)`.
+    if ((v_elem != terms.NOTHING and v_elem + beta_lift > v_cap + 1)
+            or (h0_norm != terms.NOTHING and h0_norm > v_cap)
+            or (k_norm != terms.NOTHING and (2 * k_norm > work_cap or k_norm > max(0, v_cap)))
+            or (q_norm != terms.NOTHING and (
+                q_norm > max(0, v_cap) or (k_norm != terms.NOTHING and q_norm + k_norm > work_cap)))):
+        return False
+    if delta:
+        k_norm_sq = 0 if k_apart.unit_norm else (2 * k_bound + key_bits)
+        if (not (beta_apart.number and (beta_apart.sign > 0 or beta_bound == terms.NOTHING))
+                or (k_bound != terms.NOTHING and beta_bound is not None and beta_bound != terms.NOTHING
+                    and beta_bound + k_norm_sq > terms.UNIT + 1)):
+            return False
+    write_bits = (terms.NOTHING if v_bound == terms.NOTHING or k_norm == terms.NOTHING
+                  or (has_beta and beta_bound == terms.NOTHING)
+                  else v_bound + k_norm + beta_bits + seq_bits)
+    state_peak = (write_bits if h0_norm == terms.NOTHING
+                  else h0_norm if write_bits == terms.NOTHING
+                  else max(h0_norm, write_bits) + 1)
+    return (state_peak == terms.NOTHING
+            or (state_peak + 2 <= work_cap
+                and (q_norm == terms.NOTHING or q_norm + state_peak + 2 <= work_cap)
+                and (k_norm == terms.NOTHING or k_norm + state_peak + 2 <= work_cap)))
+
+
+def _positive_scalar(atom) -> float | None:
+    """Positive finite floating scalar literal (`!= 1.0`), or None."""
+    if (not isinstance(atom, jcore.Literal) or terms.typed_key(atom.val)
+            or isinstance(atom.val, (jax.Array, jax_core.Tracer))):
+        return None
+    scalar = np.asarray(atom.val)
+    if scalar.ndim != 0 or not jnp.issubdtype(scalar.dtype, jnp.floating):
+        return None
+    factor = float(scalar)
+    return factor if factor > 0.0 and np.isfinite(factor) and factor != 1.0 else None
+
+
+def _query_scales(inner: jcore.Jaxpr, q_var: jcore.Var, key_width: int) -> tuple[float | None, ...]:
+    """Candidate query scales extracted solely along `q_var`'s forward dataflow in `inner`, beside `None`
+    and `key_width ** -0.5`."""
+    found: dict[float | None, None] = {None: None}
+    if key_width > 1:
+        found[key_width ** -0.5] = None
+
+    def walk(jaxpr: jcore.Jaxpr, active: set[jcore.Var]) -> None:
+        for equation in jaxpr.eqns:
+            if not any(isinstance(atom, jcore.Var) and atom in active for atom in equation.invars):
+                continue
+            if equation.primitive in _QUERY_PASSTHROUGH:
+                active.update(equation.outvars)
+                continue
+            body = purely_called(equation)
+            if body is not None:
+                sub_active = {inner_in for outer_in, inner_in in zip(equation.invars, body.invars,
+                                                                     strict=True)
+                              if isinstance(outer_in, jcore.Var) and outer_in in active}
+                walk(body, sub_active)
+                if any(isinstance(out, jcore.Var) and out in sub_active for out in body.outvars):
+                    active.update(equation.outvars)
+                continue
+            if equation.primitive in (jax.lax.mul_p, jax.lax.div_p) and len(equation.invars) == 2:
+                left, right = equation.invars
+                left_q = isinstance(left, jcore.Var) and left in active
+                right_q = isinstance(right, jcore.Var) and right in active
+                if left_q and not right_q and (factor := _positive_scalar(right)) is not None:
+                    scale = factor if equation.primitive is jax.lax.mul_p else 1.0 / factor
+                    if scale > 0.0 and math.isfinite(scale) and scale != 1.0:
+                        found[scale] = None
+                    active.update(equation.outvars)
+                elif (right_q and not left_q and equation.primitive is jax.lax.mul_p
+                      and (factor := _positive_scalar(left)) is not None):
+                    found[factor] = None
+                    active.update(equation.outvars)
+
+    walk(inner, {q_var})
+    return tuple(found)
+
+
+def _recurrence_step_declared(*values, hooks, roles: tuple[tuple[str, int], ...], out_dtype):
+    """Token-step reference matching a `scan_p` body's `(next_state, out_t)` signature."""
+    from dew.nn.kernels import recurrence
+
+    by_name = {name: values[pos] for name, pos in roles}
+    step = recurrence.Step(
+        state=values[0], query=by_name["query"], key=by_name["key"], value=by_name["value"],
+        log_decay=by_name.get("log_decay"), beta=by_name.get("beta"))
+    out, _, held = recurrence.step_reference(hooks, step, dtype=out_dtype)
+    return held, out
+
+
+def _recurrence_chunk_call(*values, hooks, roles: tuple[tuple[str, int], ...], out_dtype):
+    """Chunked recurrence lowering replacing a recognized `[S, B, ...]` `scan_p` equation. Nonpositive
+    decays below `RESET_DECAY` (such as `-inf` hard resets) clamp to `RESET_DECAY` so prefix sums stay
+    finite on every route (`mosaic_gpu`, `fla`, `xla`) while keeping `NaN` untouched."""
+    from dew.algebra.scan import RESET_DECAY
+    from dew.nn.kernels import recurrence_chunk
+
+    by_name = {name: jnp.swapaxes(values[pos], 0, 1) for name, pos in roles}
+    log_decay = by_name.get("log_decay")
+    if log_decay is not None:
+        floor = jnp.asarray(RESET_DECAY, log_decay.dtype)
+        log_decay = jnp.where(log_decay < floor, floor, log_decay)
+    chunk = recurrence_chunk.Chunk(
+        state=values[0], query=by_name["query"], key=by_name["key"], value=by_name["value"],
+        log_decay=log_decay, beta=by_name.get("beta"))
+    out, final = recurrence_chunk.chunk(hooks, chunk, dtype=out_dtype)
+    return final, jnp.swapaxes(out, 0, 1)
+
+
+def _recurrence_kernels(call: Callable, operands: Sequence[jcore.Var], options: Hashable, *,
+                        vjp: bool) -> tuple[bool, frozenset[str]]:
+    """`(admitted, kernels)` for `call` in forward (`vjp=False`, admitted only when a non-portable kernel
+    takes it) or training (`vjp=True`, admitted whenever VJP succeeds without `KernelRefused`)."""
+    shapes = tuple(_shape(var) for var in operands)
+    key = ("recurrence_vjp" if vjp else "recurrence_fwd",
+           tuple((aval(var).shape, aval(var).dtype) for var in operands), options, fusion.choice_context())
+
+    def probe() -> tuple[bool, frozenset[str]]:
+        from dew.nn.kernels.selection import KernelRefused
+
+        with generation.routes(alone=True) as found:
+            try:
+                out_shapes = jax.eval_shape(call, *shapes)
+                if vjp:
+                    jax.eval_shape(lambda xs, ct: jax.vjp(call, *xs)[1](ct), shapes, out_shapes)
+            except KernelRefused:
+                # A kernel named or selected that refuses this call leaves the plain scan intact.
+                return False, frozenset()
+            kernels = frozenset(route.kernel for route in found
+                                if route.choice in (Choice.GATED_DELTA_RULE, Choice.SSD)
+                                and route.kernel not in KEPT)
+            return (vjp or bool(kernels)), kernels
+
+    return _cache.holding(_RECURRENCE_ROUTES, key, probe, fusion.DECISIONS_HELD)
+
+
+def _recurrence_route_admits(
+    call: Callable, operands: Sequence[jcore.Var], options: Hashable, hooks, *,
+    state_bound: terms.Magnitude | None, state_apart: terms.Apart,
+    q_bound: terms.Magnitude | None, q_apart: terms.Apart,
+    k_bound: terms.Magnitude | None, k_apart: terms.Apart,
+    v_bound: terms.Magnitude | None, v_apart: terms.Apart,
+    beta_bound: terms.Magnitude | None, beta_apart: terms.Apart,
+    seq_len: int, key_width: int, common, out_dtype, scale: float | None, delta: bool, has_beta: bool,
+) -> bool:
+    """Validate training VJP eligibility and numerical range against each ACTUAL selected forward and
+    training kernel's intermediate arithmetic (`_recurrence_inter_dtype`), checked only after token
+    equivalence is proven; under `precision="accurate"` leaves plain token scans intact."""
+    if generation.numerics().forms == "accurate":
+        return False
+    fwd_ok, fwd_kernels = _recurrence_kernels(call, operands, options, vjp=False)
+    bwd_ok, bwd_kernels = _recurrence_kernels(call, operands, options, vjp=True)
+    if not (fwd_ok and bwd_ok):
+        return False
+    active = fwd_kernels | bwd_kernels
+    if not active:
+        return False
+    for kernel in active:
+        inter_dtype = _recurrence_inter_dtype(kernel, hooks, common)
+        if inter_dtype is None or not _recurrence_bounded(
+                state_bound, state_apart, q_bound, q_apart, k_bound, k_apart, v_bound, v_apart,
+                beta_bound, beta_apart, seq_len=seq_len, key_width=key_width, inter_dtype=inter_dtype,
+                out_dtype=out_dtype, scale=scale, delta=delta, has_beta=has_beta):
+            return False
+    return True
+
+
+def _recurrence_candidates(
+    scan_body: jcore.Jaxpr, operands: tuple[jcore.Var, ...], outputs: tuple[jcore.Var, ...],
+    xs_avals: tuple, state_aval, ys_aval, q_cands: Sequence[int], g_cands: Sequence[int | None],
+    held: Mapping[jcore.Var, terms.Magnitude | None], apart: Mapping[jcore.Var, terms.Apart],
+) -> Iterator[Candidate]:
+    """Yield `recurrence.Hooks` candidates for validated `(query, log_decay, beta, key, value)` splits."""
+    from dew.nn.kernels import recurrence
+    from dew.nn.precision import at_least_fp32
+
+    _, value_heads, key_width, value_width = state_aval.shape
+    seq_len = ys_aval.shape[0]
+    state_bound, state_apart = held.get(operands[0]), apart.get(operands[0], terms.NOWHERE)
+    operand_facts = tuple((held.get(var), apart.get(var, terms.NOWHERE)) for var in operands)
+    xs = operands[1:]
+    body_xs = scan_body.jaxpr.invars[1:]
+    for q_idx in q_cands:
+        q_heads = xs_avals[q_idx].shape[2]
+        q_bound, q_apart = held.get(xs[q_idx]), apart.get(xs[q_idx], terms.NOWHERE)
+        scales = _query_scales(scan_body.jaxpr, body_xs[q_idx], key_width)
+        for g_idx in g_cands:
+            if g_idx == q_idx:
+                continue
+            rest = [i for i in range(len(xs_avals)) if i not in (q_idx, g_idx)]
+            betas = [i for i in rest if xs_avals[i].ndim == 3 and xs_avals[i].shape[2] == value_heads]
+            if len(betas) > 1 or len(rest) - len(betas) != 2:
+                continue
+            beta_idx = betas[0] if betas else None
+            beta_bound = None if beta_idx is None else held.get(xs[beta_idx])
+            beta_apart = terms.NOWHERE if beta_idx is None else apart.get(xs[beta_idx], terms.NOWHERE)
+            kv_idxs = [i for i in rest if i != beta_idx]
+            decay = "none" if g_idx is None else ("scalar" if xs_avals[g_idx].ndim == 3 else "vector")
+            modes = ((True, False), (False, True)) if beta_idx is not None else ((False, False),)
+            for k_idx, v_idx in ((kv_idxs[0], kv_idxs[1]), (kv_idxs[1], kv_idxs[0])):
+                if (xs_avals[k_idx].shape[2:] != (q_heads, key_width)
+                        or xs_avals[v_idx].shape[2:] != (value_heads, value_width)):
+                    continue
+                common = jnp.result_type(xs_avals[q_idx].dtype, xs_avals[k_idx].dtype, xs_avals[v_idx].dtype)
+                if at_least_fp32(common) != state_aval.dtype:
+                    continue
+                k_bound, k_apart = held.get(xs[k_idx]), apart.get(xs[k_idx], terms.NOWHERE)
+                v_bound, v_apart = held.get(xs[v_idx]), apart.get(xs[v_idx], terms.NOWHERE)
+                roles_list: list[tuple[str, int]] = [("query", q_idx + 1), ("key", k_idx + 1),
+                                                     ("value", v_idx + 1)]
+                if g_idx is not None:
+                    roles_list.append(("log_decay", g_idx + 1))
+                if beta_idx is not None:
+                    roles_list.append(("beta", beta_idx + 1))
+                roles = tuple(roles_list)
+                for delta, write_gate in modes:
+                    # Both `mosaic_gpu` and `fla` narrow delta-rule `beta` to `common` (q/k/v dtype).
+                    if (delta and beta_idx is not None
+                            and jnp.result_type(common, xs_avals[beta_idx].dtype) != common):
+                        continue
+                    for scale in scales:
+                        hooks = recurrence.Hooks(decay=decay, scale=scale, delta=delta, write_gate=write_gate)
+                        declared = functools.partial(_recurrence_step_declared, hooks=hooks, roles=roles,
+                                                     out_dtype=ys_aval.dtype)
+                        call = functools.partial(_recurrence_chunk_call, hooks=hooks, roles=roles,
+                                                 out_dtype=ys_aval.dtype)
+                        opts = (hooks, roles, ys_aval.dtype)
+                        admit = functools.partial(
+                            _recurrence_route_admits, call, operands, opts, hooks,
+                            state_bound=state_bound, state_apart=state_apart,
+                            q_bound=q_bound, q_apart=q_apart, k_bound=k_bound, k_apart=k_apart,
+                            v_bound=v_bound, v_apart=v_apart, beta_bound=beta_bound, beta_apart=beta_apart,
+                            seq_len=seq_len, key_width=key_width, common=common, out_dtype=ys_aval.dtype,
+                            scale=scale, delta=delta, has_beta=beta_idx is not None)
+                        yield Candidate(
+                            operands, outputs, call, declared,
+                            lambda call=call, operands=operands, opts=opts: (
+                                _recurrence_kernels(call, operands, opts, vjp=False)[0]),
+                            body=scan_body, key=(opts, operand_facts), training_ok=admit)
+
+
+def _recurrences(index: fusion.Index, place: int) -> Iterator[Candidate]:
+    """Linear-recurrence candidates anchored on a `scan_p` equation (row 3450): verifies array avals,
+    state/output shapes, step-body equation budget (`SPAN`), shared `terms.proven` decay/range proofs, and
+    data-dependency roles (`read_by`) before offering `recurrence.Hooks` declarations to the e-graph."""
+    equation = index.jaxpr.eqns[place]
+    operands = tuple(atom for atom in equation.invars if isinstance(atom, jcore.Var))
+    if (equation.primitive is not jax.lax.scan_p or equation.effects
+            or equation.params.get("reverse")
+            or len(equation.outvars) != 2
+            or len(operands) != len(equation.invars)):
+        return
+    ft_in, ft_out = equation.params.get("ft_in"), equation.params.get("ft_out")
+    if ft_in is None or ft_out is None:
+        return
+    consts_n, carry_n, xs_n = (len(group) for group in ft_in.elts)
+    carry_out_n, ys_out_n = (len(group) for group in ft_out.elts)
+    length = equation.params["length"]
+    if (consts_n != 0 or carry_n != 1 or carry_out_n != 1 or ys_out_n != 1
+            or length < 1 or not 3 <= xs_n <= 5):
+        return
+    scan_body = equation.params["jaxpr"]
+    inner = scan_body.jaxpr
+    if not all(isinstance(var.aval, ShapedArray)
+               for var in (*operands, *equation.outvars, *inner.invars, *inner.outvars)):
+        return
+    xs = operands[1:]
+    state_var, final_var, ys_var = operands[0], equation.outvars[0], equation.outvars[1]
+    state_aval, final_aval, ys_aval = aval(state_var), aval(final_var), aval(ys_var)
+    if (state_aval.ndim != 4 or final_aval.shape != state_aval.shape or final_aval.dtype != state_aval.dtype
+            or any(d <= 0 for d in state_aval.shape)
+            or not jnp.issubdtype(state_aval.dtype, jnp.floating) or state_aval.dtype.itemsize < 4):
+        return
+    batch, value_heads, key_width, value_width = state_aval.shape
+    if (ys_aval.shape != (length, batch, value_heads, value_width)
+            or not jnp.issubdtype(ys_aval.dtype, jnp.floating)):
+        return
+    xs_avals = tuple(aval(var) for var in xs)
+    if any(a.ndim not in (3, 4) or a.shape[:2] != (length, batch) or not jnp.issubdtype(a.dtype, jnp.floating)
+           for a in xs_avals):
+        return
+    if sum(1 for _ in equations(inner)) > SPAN:
+        return
+    state_deps = read_by(inner, (inner.outvars[0],))
+    out_deps = read_by(inner, (inner.outvars[1],))
+    exp_targets = [var for eq_ in inner.eqns if _holds(eq_, jax.lax.exp_p) for var in eq_.outvars]
+    exp_deps = read_by(inner, exp_targets) if exp_targets else set()
+    body_xs = inner.invars[1:]
+    q_cands = [i for i, a in enumerate(xs_avals)
+               if a.ndim == 4 and a.shape[2] > 0 and a.shape[3] == key_width and value_heads % a.shape[2] == 0
+               and body_xs[i] not in state_deps and body_xs[i] in out_deps]
+    if not q_cands:
+        return
+    held, apart = terms.proven(index.jaxpr, consts=index.consts, targets=operands, deep=True)
+    if exp_targets:
+        g_cands: list[int | None] = [
+            i for i, a in enumerate(xs_avals)
+            if body_xs[i] in exp_deps and _nonpositive_decay(held.get(xs[i]), apart.get(xs[i], terms.NOWHERE))
+            and ((a.ndim == 3 and a.shape[2] == value_heads)
+                 or (a.ndim == 4 and a.shape[2:] == (value_heads, key_width)))
+        ]
+        if not g_cands:
+            return
+    else:
+        g_cands = [None]
+    yield from _recurrence_candidates(
+        scan_body, operands, tuple(equation.outvars), xs_avals,
+        state_aval, ys_aval, q_cands, g_cands, held, apart)
+
+
 ATTENTION = (Family(jax.lax.exp_p, _attentions),)
 """Attention, recognized before the products, so a product inside it is none of theirs."""
+
+RECURRENCES = (Family(jax.lax.scan_p, _recurrences),)
+"""Linear recurrences (`scan_p` whose step body matches `recurrence.step_reference`), lowered to
+`recurrence_chunk.chunk` before products and norms."""
 
 NORMS = (Family(jax.lax.rsqrt_p, _norms), Family(jax.lax.logistic_p, _swiglus))
 """The norms, after the products, so an epilogue's norm is the product's; a gated norm before a SwiGLU, so its

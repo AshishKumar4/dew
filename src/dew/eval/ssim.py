@@ -11,7 +11,7 @@ import jax
 import jax.numpy as jnp
 
 from dew.artifacts import ImageGrid
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import EXACT_FLOAT32, at_least_fp32
 
 from .common import PairedImageMetric
 from .psnr import frame_batch
@@ -51,7 +51,7 @@ def _ssim_single_channel(
             window_strides=(1, 1),
             padding="VALID",
             dimension_numbers=("NCHW", "OIHW", "NCHW"),
-            precision=jax.lax.Precision.HIGHEST,
+            precision=EXACT_FLOAT32,
         )
         return out[0, 0]  # (H', W')
 

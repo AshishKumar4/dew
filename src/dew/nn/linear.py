@@ -66,14 +66,7 @@ from .kernels.recurrence_chunk import (
 )
 from .kernels.selection import Kernel, Op, Requirement, select
 from .norms import gated_rms_normalized
-from .precision import (
-    L2NORM_EPS,
-    asks_default_precision,
-    at_least_fp32,
-    compensated_sum,
-    float32_dot_general,
-    l2_normed,
-)
+from .precision import L2NORM_EPS, asks_default_precision, at_least_fp32, compensated_sum, float32_dot_general
 from .sharding import (
     HEADS,
     MLP_HIDDEN,
@@ -155,8 +148,8 @@ def causal_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, 
                                   interpret=generation.backend() != 'gpu')
             out = out[0] if parts is None else out
         else:
-            out = xla_conv1d(x, kernel, activation, bias, valid=valid, segments=segments, parts=parts,
-                             dtype=dtype)
+            out = short_conv.xla_conv1d(x, kernel, activation, bias, valid=valid, segments=segments,
+                                        parts=parts, dtype=dtype)
     # The conv's output, which a remat policy may keep (`dew.nn.residuals.RESIDUALS`).
     return jax.tree.map(lambda piece: checkpoint_name(piece, Residual.CONV), out)
 
@@ -188,53 +181,6 @@ def _per_row_shard(x, kernel, activation, bias, valid, segments, parts, dtype, r
 
     return on_shards(local, row, (x, kernel, bias, valid, segments), whole={1, 2},
                      out_specs=row if parts is None else (row,) * pieces)
-
-
-def xla_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, segments=None,
-               parts: Pieces | None = None, dtype=None) -> jax.Array | tuple[jax.Array, ...]:
-    """`causal_conv1d`'s arithmetic in XLA: a CPU's and a TPU's, and the
-    oracle of the GPU's kernels."""
-    dtype = x.dtype if dtype is None else jnp.dtype(dtype)
-    _, K = kernel.shape
-    length = x.shape[1]
-    wide = jnp.promote_types(at_least_fp32(x.dtype), dtype)
-    padded = jnp.pad(x, ((0, 0), (K - 1, 0), (0, 0))).astype(wide)
-    taps = kernel.astype(wide)
-
-    def read(tap):
-        """The tokens `K - 1 - tap` before each, those of its own document."""
-        window = padded[:, tap:tap + length]
-        if segments is None:
-            return window
-        before = jnp.pad(segments, ((0, 0), (K - 1, 0)))[:, tap:tap + length]
-        return jnp.where((before == segments)[..., None], window, 0)
-
-    spread_bias = None if bias is None else short_conv.conv_bias(bias.astype(wide), x.shape[:2])
-    windows = short_conv.preactivation([read(tap) for tap in range(K)], [taps[:, tap] for tap in range(K)],
-                                       spread_bias)
-    if activation:
-        windows = silu(windows)
-    if valid is not None:
-        windows = jnp.where(valid[:, :, None], windows, 0)
-    return conv_pieces(windows, parts, dtype)
-
-
-def conv_pieces(convolved, parts, dtype):
-    """`convolved` `[B, S, D]` as `causal_conv1d` returns it for `parts`
-    (the whole, where None), in `dtype`: each piece split off in order and
-    the `head`-wide groups of a normalised one l2-normalised (`l2_normed`)."""
-    if parts is None:
-        return convolved.astype(dtype)
-    pieces, first = [], 0
-    for width, head in parts:
-        piece = convolved[..., first:first + width]
-        first += width
-        if head is not None:
-            piece = l2_normed(piece.reshape(*piece.shape[:-1], -1, head), dtype).reshape(piece.shape)
-        else:
-            piece = piece.astype(dtype)
-        pieces.append(piece)
-    return tuple(pieces)
 
 
 def _stream_order(valid):
@@ -290,7 +236,7 @@ def entered_conv1d(x, kernel, valid, documents, held, entered, *, bias=None, par
     if activation:
         windows = silu(windows)
     windows = jnp.where(real[:, :, None], windows, 0)
-    return conv_pieces(windows, parts, dtype)
+    return short_conv.conv_pieces(windows, parts, dtype)
 
 
 def document_tails(x, valid, documents, width: int, count: int):
@@ -531,7 +477,8 @@ def forked_conv(x, kernel, coordinates: Coordinates, *, history=None, bias=None,
                                dtype=wide, activation=activation)
     assert isinstance(convolved, jax.Array), "a conv of no parts is one array"
     output = jnp.take_along_axis(convolved, jnp.maximum(rank, 0)[:, :, None], axis=1)
-    return conv_pieces(jnp.where(real[:, :, None], output, 0), parts, x.dtype if dtype is None else dtype)
+    return short_conv.conv_pieces(jnp.where(real[:, :, None], output, 0), parts,
+                                  x.dtype if dtype is None else dtype)
 
 
 def fork_start(held, shape: tuple[int, ...], dtype):
@@ -853,7 +800,7 @@ def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None, parts
                               dtype=at_least_fp32(x.dtype))[:, width:]
     output = jnp.take_along_axis(convolved, jnp.maximum(rank, 0)[:, :, None], axis=1)
     output = jnp.where(valid[:, :, None], output, 0)
-    return conv_pieces(output, parts, x.dtype if dtype is None else dtype), history
+    return short_conv.conv_pieces(output, parts, x.dtype if dtype is None else dtype), history
 
 
 def decode_gated_delta_rule(query, key, value, g, beta, state, active=None):

@@ -234,9 +234,17 @@ class MixerBase:
     (`decoder_fields`)."""
 
     def publishes(self, kv_shared: bool) -> bool:
-        """Whether a layer of this kind leaves in the run's store what later layers read (DeepSeek V4's
-        CSA2 layers, `DeepseekV4Mixer.publishes`), which the stack then threads to it; none by default."""
-        return False
+        """Whether a layer of this kind leaves in the run's store what later layers read: whether it surely
+        writes a key (`publications`, DeepSeek V4's CSA2 layers), which the stack then threads to it."""
+        return bool(self.publications(kv_shared)[1])
+
+    def publications(self, kv_shared: bool) -> tuple[frozenset[str], frozenset[str]]:
+        """The store's keys a layer of this kind reads and those it surely writes (`kv_store`, beside the
+        keys and values a sharing layer reads, `CausalTransformer.kv_sharing`): a loop's coda reads its
+        block's where a key's last writer before it lies in the block (`looping._coda_reads_block`). Every
+        write a static field decides is declared, a block's hidden writer hiding its coda's read; none by
+        default."""
+        return frozenset(), frozenset()
 
     @property
     def indexed_mixers(self) -> tuple[MLAMixer, ...]:
