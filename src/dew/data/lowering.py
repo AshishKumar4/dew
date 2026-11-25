@@ -97,7 +97,6 @@ from dew.data.mixing import (
     KeyedMix,
     Streak,
     TokenDeficit,
-    _weights,
     mix_end,
     mixed_indexed,
     rewound,
@@ -1552,8 +1551,9 @@ class _Build:
         known = [length for length in lengths if length is not None]
         end = mix_end(known, source) if len(known) == len(lengths) else None
         # A token mix whose members state their counts weighs each by them (`STATED_SHARES`), as its indexed
-        # read does (`mixed_indexed`); a record mix by its weights.
-        weights = _weights(source) if stated else source.weights
+        # read does (`mixed_indexed`); a record mix by its weights: the draws its workers are shared by
+        # (`_Lowering.draws`).
+        weights = self.lowering.draws
         return KeyedMix(streams, weights, keys, source.seed, stamped=self.stamped, end=end)
 
     def member_records(self, member: Pipeline, index: int) -> int | None:
