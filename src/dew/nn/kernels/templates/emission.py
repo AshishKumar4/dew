@@ -725,7 +725,8 @@ class _Counting:
         layout = self.laid.get(equation.invars[0]) if equation.primitive in _REDUCTIONS else None
         if isinstance(layout, fragments.TiledLayout):
             threads = inline_work.WARP if self.lanes is not None else resources.THREADS
-            reduced = _laid_reduction(layout, equation.invars[0].aval, equation.params["axes"], threads)
+            reduced = _laid_reduction(layout, equation.invars[0].aval, equation.params["axes"], threads,
+                                      equation.primitive)
             if reduced is not None:
                 return reduced
         return operation_work(equation.primitive, [variable.aval for variable in equation.invars],
@@ -1242,13 +1243,24 @@ def _computes(equation) -> tuple | None:
             *(equation.params.get(name) for name in _REDUCTION_PARAMS))
 
 
-def _laid_reduction(layout: fragments.TiledLayout, value, axes: Sequence[int], threads: int) -> Work | None:
+def _redux(primitive, dtype) -> bool:
+    """Whether Mosaic GPU may lower a reduction across all of a warp's lanes by `redux.sync`, no shuffle
+    (`FragmentedArray.reduce`'s `redux_op`): a 32-bit integer's sum, maximum or minimum, and on a
+    Blackwell an fp32 maximum or minimum, which this count, knowing no architecture, takes as possible."""
+    if np.dtype(dtype).itemsize == 4 and np.issubdtype(dtype, np.integer):
+        return primitive in (lax.reduce_sum_p, lax.reduce_max_p, lax.reduce_min_p)
+    return np.dtype(dtype) == np.float32 and primitive in (lax.reduce_max_p, lax.reduce_min_p)
+
+
+def _laid_reduction(layout: fragments.TiledLayout, value, axes: Sequence[int], threads: int,
+                    primitive) -> Work | None:
     """A reduction of `value`, laid out as `layout`, along `axes`, as Mosaic GPU lowers it
     (`FragmentedArray.reduce`): each thread combines the values its registers hold of each output it keeps
     (a replicated layout's copies each thread's own), then
     exchanges them across the lanes the layout spreads `axes` over, log2 of them rounds of a shuffle of each
     32-bit word and a combine of each value, on each of the role's `threads`; None where the layout states
-    no such lowering here (a scalar's, an axis no tile holds, an exchange across warps). The attention
+    no such lowering here (a scalar's, an axis no tile holds, an exchange across warps, one across all of a
+    warp's lanes `redux.sync` may take, `_redux`). The attention
     forward's walk issues 12 SHFL a thread a step for its three row reductions of a WGMMA (sm90) or mma.sync
     (sm80) tile, two rows a thread and two rounds each (FS-REDSHFL4)."""
     shape = tuple(value.shape)
@@ -1262,6 +1274,9 @@ def _laid_reduction(layout: fragments.TiledLayout, value, axes: Sequence[int], t
         return math.prod(dim.times for dim in dims if isinstance(dim, fragments.Replicated))
 
     if spread(reduced.warp_dims) > spread(layout.warp_dims):
+        return None
+    every_lane = all(isinstance(dim, fragments.Replicated) for dim in reduced.lane_dims)
+    if every_lane and _redux(primitive, value.dtype):
         return None
     rounds = int(math.log2(spread(reduced.lane_dims) // spread(layout.lane_dims)))
     # A thread's values in and out as its registers hold them (a replicated layout's every copy's).
