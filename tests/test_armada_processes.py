@@ -172,6 +172,25 @@ def test_a_recycled_rows_last_process_that_reports_only_some_of_the_tests_left_i
     assert row["exitCode"] != 0
 
 
+def test_a_recycled_rows_test_a_later_import_no_longer_defines_is_red(ci, tmp_path, monkeypatch):
+    """A dry prepare's row whose first process selected A, B and C, recycling after A, whose later import no
+    longer defines C (A wrote the file its definition reads), is red: every test the first process selected
+    must be reported by one of its processes, whatever a later collection found."""
+    written(tmp_path, {"test_vanishing.py": "import pathlib\n"
+                                            "def test_a():\n    pathlib.Path('ran-a').touch()\n"
+                                            "def test_b():\n    pass\n"
+                                            "if not pathlib.Path('ran-a').exists():\n"
+                                            "    def test_c():\n        pass\n"})
+    interpreter(tmp_path, "3.12")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ARMADA_ARTIFACTS", str(tmp_path / "artifacts"))
+    out = tmp_path / "verdict.json"
+    ci.tested("3.12", ["tests/test_vanishing.py"], "", out, 600.0, "off", 5.0, "", {}, recorded=False,
+              recycle_at=1)
+    [row] = json.loads(out.read_text())["rows"]
+    assert row["exitCode"] != 0
+
+
 def test_a_report_its_killed_pytest_cut_short_greens_nothing_and_the_tasks_other_files_are_graded(
         ci, tmp_path, monkeypatch):
     """A file whose pytest left its JUnit report and its collection's record cut short (killed as it wrote

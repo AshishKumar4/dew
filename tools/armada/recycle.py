@@ -5,6 +5,7 @@ its caches' release nor a collection frees: a recurrence family held 1-3.6 GB pa
 pk-rsstrace), and only its end returns it. It writes the test it ended after to `RECYCLED`, which its task
 reads as its word to run again. This module imports no pytest: ci.py reads its names."""
 
+import json
 import os
 from pathlib import Path
 
@@ -12,6 +13,10 @@ RECYCLE_AT = "DEW_RECYCLE_AT"
 """What names the resident bytes past which a dry prepare's pytest ends after the test running."""
 RECYCLED = "DEW_RECYCLED"
 """What names the file a pytest that ended so writes the node id of its last test to."""
+SELECTED = "DEW_RECYCLE_SELECTED"
+"""What names the file a row's first process writes the node ids its session selected to
+(`pytest_collection_finish`): every test the row must report, whatever a later process's collection finds
+(ci.py's `tested`)."""
 CONTINUES = "DEW_CONTINUES_ROW"
 """Set in each later process of one row's task (ci.py's `tested`): the shared XLA cache's bundles it writes
 keep every program it fetched, its row's earlier processes' among them (tests/remote_cache.py)."""
@@ -29,6 +34,12 @@ def resident() -> int:
 
 def pytest_sessionstart(session) -> None:
     _session["it"] = session
+
+
+def pytest_collection_finish(session) -> None:
+    """The first process of a row writes what its session selected (`SELECTED`); a later one, nothing."""
+    if (selected := os.environ.get(SELECTED)) and not Path(selected).exists():
+        Path(selected).write_text(json.dumps([item.nodeid for item in session.items]))
 
 
 def pytest_runtest_logfinish(nodeid: str, location) -> None:

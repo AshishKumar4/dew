@@ -1434,6 +1434,9 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # process's cases kept (`earlier`), the tests they reported set aside from the next (progress.py's
     # SET_ASIDE).
     recycled = out.with_name(f"{out.name}.recycled")
+    # What its first process selected (recycle.py's `SELECTED`), written once: every test the row must report.
+    selected = out.with_name(f"{out.name}.selected")
+    selected.unlink(missing_ok=True)
     sets_aside = resumes or recycle_at is not None
     command = [*session.pytest_command(run, tests, split), *(["-p", "progress"] if sets_aside else []),
                *(["-p", "recycle"] if recycle_at is not None else [])]
@@ -1445,7 +1448,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                                        aside if sets_aside else None, group, network)
         if recycle_at is not None:
             environment = {**environment, recycle.RECYCLE_AT: str(recycle_at),
-                           recycle.RECYCLED: str(recycled)}
+                           recycle.RECYCLED: str(recycled), recycle.SELECTED: str(selected)}
         while True:
             # Each process's own sidecars: none an earlier one left reads as this one's.
             for sidecar in (recycled, report, pid, collection):
@@ -1502,15 +1505,15 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                                             reported, returncode, deadline if expired else None,
                                             running, pid.is_file(), running)
         if segments > 1:
-            # Run past a recycle: its last process must report every test it selected, the tests left, as its
-            # collection counted them (executed.py): one that dropped some unreported is no whole run of them.
-            counted = counts.get(grading.owning(name))
-            left = counted["collected"] - counted["deselected"] if counted else None
-            reported_left = len({grading.node_of(case) for case in own if case.get("classname")})
-            if left is None or reported_left < left:
-                red.append(f"its last process reported {reported_left} of the "
-                           f"{left if left is not None else 'uncounted'} tests it selected, the tests left "
-                           "after its row recycled")
+            # Run past a recycle: every test its first process selected (recycle.py's `SELECTED`) reported by
+            # one of its processes, whatever a later collection found (a test a later import no longer
+            # defines, or one a later collection dropped unreported, never ran).
+            file = grading.owning(name)
+            chosen = {node for node in (read_json(selected) or []) if grading.owning(node) == file}
+            reported_all = {grading.node_of(case) for case in [*earlier, *own] if grading.of(case, name)}
+            if not chosen or (unrun := sorted(chosen - reported_all)):
+                red.append("its processes, run past a recycle, reported not every test its first selected: "
+                           + (", ".join(unrun[:6]) if chosen else "its first process's selection unread"))
         if before := [case for case in earlier if grading.of(case, name)]:
             # Its earlier processes each reported, recycled (`tested`'s loop): their failures are its too,
             # and their cases its tests, timings and cells beside the last's.
