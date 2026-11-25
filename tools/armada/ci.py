@@ -1433,10 +1433,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # left run in a fresh process: only a process's end returns what its tests compiled. Each such
     # process's cases kept (`earlier`), the tests they reported set aside from the next (progress.py's
     # SET_ASIDE).
-    recycled = out.with_name(f"{out.name}.recycled")
-    # What its first process selected (recycle.py's `SELECTED`), written once: every test the row must report.
-    selected = out.with_name(f"{out.name}.selected")
-    selected.unlink(missing_ok=True)
+    # What its first process selected (recycle.py's `SELECTED`, written once): every test the row must report.
+    first_selected: list[str] = []
     sets_aside = resumes or recycle_at is not None
     command = [*session.pytest_command(run, tests, split), *(["-p", "progress"] if sets_aside else []),
                *(["-p", "recycle"] if recycle_at is not None else [])]
@@ -1446,6 +1444,9 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     with temp_roots.temp_root() as root:
         environment = task_environment(environ, site, root, (log, collection, unrecorded, pid),
                                        aside if sets_aside else None, group, network)
+        # recycle.py's files beside the task's temporary ones, never in its checkout, whose writes a row's
+        # record weighs.
+        recycled, selected = Path(root) / "recycled", Path(root) / "recycle-selected.json"
         if recycle_at is not None:
             environment = {**environment, recycle.RECYCLE_AT: str(recycle_at),
                            recycle.RECYCLED: str(recycled), recycle.SELECTED: str(selected)}
@@ -1462,6 +1463,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                 break
             returncode, output, expired, dump, opened, wrote, evidence = watched_pytest(
                 command, environment, left, grace, pid, python, evidence_name(python, tests, group), began)
+            if segments == 1:
+                first_selected = (read_json(selected) or {}).get("selected", [])
             done, _ = reported_cases(report)
             # Ended by recycle.py alone: pytest's interrupted exit, its report holding the test it ended
             # after. Any other end (a crash after its report, a kill) is graded as it is, never run past.
@@ -1509,8 +1512,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
             # one of its processes, whatever a later collection found (a test a later import no longer
             # defines, or one a later collection dropped unreported, never ran).
             file = grading.owning(name)
-            chosen = {node for node in (read_json(selected) or {}).get("selected", [])
-                      if grading.owning(node) == file}
+            chosen = {node for node in first_selected if grading.owning(node) == file}
             reported_all = {grading.node_of(case) for case in [*earlier, *own] if grading.of(case, name)}
             if not chosen or (never_ran := sorted(chosen - reported_all)):
                 red.append("its processes, run past a recycle, reported not every test its first selected: "
