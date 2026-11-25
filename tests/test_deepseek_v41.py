@@ -34,7 +34,7 @@ from reference_error import FACTOR, as_given, assert_as_exact, distance
 from dew.batch import coordinates
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import families, translate_config, translate_wrapper_config
-from dew.nn.deepseek_v4 import DRAFT_CONTEXT, DeepseekV4Attention, DSparkAttention
+from dew.nn.deepseek_v4 import DRAFT_CONTEXT, DeepseekV4Attention, DeepseekV4Mixer, DSparkAttention
 from dew.nn.engram import Engram
 from dew.nn.fake_quant import E2M1, E2M1_MIDPOINTS, fake_quant_fp4, fake_quant_fp8
 from dew.nn.inputs import MixerCall, ModelInputs
@@ -243,6 +243,21 @@ def test_the_candidate_pool_decides_the_logits(source):
             candidate_block_size=None))
     unpooled = plain.clone(kinds=flax.core.freeze(kinds))
     assert distance(unpooled.apply(loaded.variables, ids), TRUTH["logits"]) > FACTOR * rounding("logits")
+
+
+def test_a_candidate_pool_of_no_blocks_is_refused(source):
+    """A candidate source whose pool holds no block (`candidate_blocks` or `candidate_block_size` zero)
+    pools nothing, which would leave a restricting layer reading another source's pool: refused, so every
+    source writes the pool it declares (`DeepseekV4Mixer.publications`)."""
+    _, plain, _ = source
+    ids = jnp.ones((1, 4), jnp.int32)
+    held = next(name for name, kind in plain.kinds.items()
+                if isinstance(kind.mixer, DeepseekV4Mixer) and kind.mixer.candidates == "source")
+    for empty in ({"candidate_blocks": 0}, {"candidate_block_size": 0}):
+        kinds = dict(plain.kinds)
+        kinds[held] = dataclasses.replace(kinds[held], mixer=dataclasses.replace(kinds[held].mixer, **empty))
+        with pytest.raises(ValueError):
+            plain.clone(kinds=flax.core.freeze(kinds)).init(jax.random.key(0), ids)
 
 
 @attending("reference")

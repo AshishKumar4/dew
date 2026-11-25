@@ -460,33 +460,20 @@ def test_a_counted_loop_runs_where_its_coda_reads_none_of_its_blocks_publication
                     seeds=SEEDS["counted sharing"], truth_fn=jax.jit(fixed.clone(dtype=jnp.float64).apply))
 
 
-def _reindexed(index_sources=(2, 3, 4, 5), kv_sources=(2,), rates=None, **fields) -> CausalTransformer:
+def _reindexed_fields(index_sources=(2, 3, 4, 5)) -> dict:
     """DeepSeek V4.1's tiny release cut to six layers on a plain residual (no mHC, engram or DSpark, which
-    a loop refuses): a CSA2 Full layer at 2 publishing its entries (compressed two to one), Reindex layers
-    after it reading them and writing their selections (`index_sources` past 2), and a Reuse layer at any
-    layer from 3 they leave out, reading the latest selection (a Full layer at each of `kv_sources`, at
-    `rates` a layer where given), `fields` over its own."""
-    return CausalTransformer(**{**_reindexed_fields(_cut_config(index_sources, kv_sources, rates)),
-                                **fields})
-
-
-def _cut_config(index_sources=(2, 3, 4, 5), kv_sources=(2,), rates=None) -> dict:
-    """DeepSeek V4.1's tiny release config cut to six layers (`_reindexed`)."""
+    a loop refuses), its decoder fields: a CSA2 Full layer at 2, the candidate source, publishing its
+    entries (compressed two to one), Reindex layers after it at `index_sources` past 2 reading them and
+    writing their selections, and a Reuse layer at any layer from 3 they leave out, reading the latest
+    selection."""
     config = json.loads((FIXTURES / "deepseek-v41-tiny" / "config.json").read_text())
     text = config["text_config"]
-    own = text["compress_ratios"][:4] + [2] * 2 if rates is None else list(rates)
-    ratios = own + text["compress_ratios"][text["num_hidden_layers"]:]
-    return {**config, "text_config": {
-        **text, "num_hidden_layers": 6, "compress_ratios": ratios, "kv_source_layer_ids": list(kv_sources),
+    ratios = text["compress_ratios"][:4] + [2] * 2 + text["compress_ratios"][text["num_hidden_layers"]:]
+    config = {**config, "text_config": {
+        **text, "num_hidden_layers": 6, "compress_ratios": ratios, "kv_source_layer_ids": [2],
         "index_source_layer_ids": list(index_sources), "candidate_source_layer_id": 2,
         "engram_layer_ids": [1], "engram_num_embeddings": text["engram_num_embeddings"][:1],
         "dspark_target_layer_ids": [3, 4, 5]}}
-
-
-def _reindexed_fields(config=None) -> dict:
-    """`_reindexed`'s decoder fields, translated from `config` (the six-layer cut by default) on a plain
-    residual: no mHC, engram or DSpark, which a loop refuses."""
-    config = config or _cut_config()
     translated = {key: value for key, value in translate_config(config).items()
                   if key not in ("hyper_connections", "engram", "dspark")}
     return {**translated, "dtype": "float32"}
@@ -506,7 +493,8 @@ def test_a_block_gate_refuses_a_coda_reading_its_blocks_publications():
     selection), and a single pass, which hands on its own publications, run, the latter as the loop
     without a threshold does, bit for bit."""
     ids = jnp.ones((2, 8), jnp.int32)
-    plain, reused = _reindexed(), _reindexed(index_sources=(2, 3, 4))
+    plain = CausalTransformer(**_reindexed_fields())
+    reused = CausalTransformer(**_reindexed_fields(index_sources=(2, 3, 4)))
     assert reused.kv_shared_layers == (5,), reused.kv_shared_layers
     for valid, layers in ((plain, (2, 3)), (reused, (3, 5))):
         # Valid loops whose passes run whole, refused only where a gate on the block picks among them.
@@ -567,7 +555,8 @@ def test_a_row_exit_over_compressed_publications_stops_over_every_row():
     """A row-exit loop over a CSA2 Full layer, whose entries `[B, S // 2, D]` hold its rows but not its
     tokens: scoring under its threshold stops its passes over every row, compacting none, its logits
     finite."""
-    model = _reindexed().with_passes(3, (2, 3), exit_gate=True, exit_threshold=0.6)
+    model = CausalTransformer(**_reindexed_fields())
+    model = model.with_passes(3, (2, 3), exit_gate=True, exit_threshold=0.6)
     model = model.clone(loop=dataclasses.replace(model.loop, exit_by="row", exit_at="coda"))
     variables, ids = _gated(model_draw(model, (2, 12), model.vocab_size), model.emb_features, 0xEA0)(0)
     assert np.all(np.isfinite(np.asarray(jax.jit(model.apply)(variables, ids))))
