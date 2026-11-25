@@ -6,7 +6,6 @@ entering apart, each one's gradient summed at its own shape. A mesh that splits 
 Explicit axis, no layout traced under, or a product no launch takes leaves the product to the partitioner."""
 import contextlib
 import math
-import re
 
 import jax
 import jax.numpy as jnp
@@ -386,19 +385,35 @@ def test_a_mapped_stacks_weight_reductions_complete_per_layer(axis):
           nn.logical_axis_rules(DEFAULT_RULES), placing(LAYOUT), _declared()):
         step = jax.jit(jax.grad(loss, argnums=(0, 1))).lower(x_spec, kernels).compile(
             compiler_options=COLLECTIVES)
+    # The entry computation in its schedule's order, read from the compiled module's own schema: XLA expands
+    # the tie's barrier away, its ordering what remains of it. Each layer's weight gradient (the step's
+    # outputs after the input's) leads back to its collective, and that to the product it reduces.
+    from jax._src import hlo_reader
+
+    module = step.runtime_executable().hlo_modules()[0]
+    proto = hlo_reader.message_class("xla.HloModuleProto").FromString(module.as_serialized_hlo_module_proto())
+    entry = next(each for each in proto.computations if each.id == proto.entry_computation_id)
+    names = {each.id: each.name for each in entry.instructions}
+    opcodes = {each.name: each.opcode for each in entry.instructions}
+    operands = {each.name: [names[operand] for operand in each.operand_ids] for each in entry.instructions}
+    order = {names[each]: index for index, each in enumerate(proto.schedule.sequences[entry.id].instruction_ids)}
+    flops = {name: instruction.flops for name, instruction in hlo_instructions(step).items()}
+
+    def reaching(name: str, found) -> str:
+        frontier, seen = [name], set()
+        while frontier:
+            if (each := frontier.pop(0)) not in seen:
+                seen.add(each)
+                if found(each):
+                    return each
+                frontier.extend(operands[each])
+        raise AssertionError(f"nothing before {name} holds")
+
     expected = "reduce-scatter" if any(weight) else "all-reduce"
-    w_elems = math.prod(w_shape) // (2 if any(weight) else 1)
-    # The entry computation in its schedule's order (a compiled GPU module is scheduled): XLA expands the
-    # tie's barrier away, its ordering what remains of it.
-    instructions = hlo_instructions(step)
-    text = step.as_text()
-    entry = text[text.index("\nENTRY "):].split("\n}", 1)[0]
-    scheduled = [match[1] for match in re.finditer(r"^\s*(?:ROOT )?%?(\S+) = ", entry, re.MULTILINE)
-                 if match[1] in instructions]
-    reduces = [index for index, name in enumerate(scheduled)
-               if collective((instruction := instructions[name]).op) == expected
-               and not instruction.op.endswith("-start")
-               and sum(math.prod(shape) for shape in instruction.shapes) >= w_elems]
-    products = [index for index, name in enumerate(scheduled) if instructions[name].flops]
-    before_a_product = [index for index in reduces if any(product > index for product in products)]
-    assert len(reduces) == layers and len(before_a_product) == layers - 1, (expected, reduces, products)
+    reduced = [reaching(output, lambda each: collective(opcodes[each]) == expected
+                        and not opcodes[each].endswith("-start"))
+               for output in operands[names[entry.root_id]][1:]]
+    products = [reaching(operands[each][0], lambda each: bool(flops.get(each))) for each in reduced]
+    assert len(set(reduced)) == layers, reduced
+    assert all(order[reduced[layer]] < order[products[layer - 1]] for layer in range(1, layers)), (
+        [order[each] for each in reduced], [order[each] for each in products])

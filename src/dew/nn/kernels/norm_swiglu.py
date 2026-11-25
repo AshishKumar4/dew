@@ -122,7 +122,7 @@ ROW_BLOCKS = 12
 partial rows it writes stay a small share of what it reads."""
 MAX_PROGRAMS = 1024
 ROW_BLOCK = 4096
-"""A SwiGLU launch's heuristic columns a program, a row's block (apart or packed). Of the configs measured
+"""A SwiGLU launch's heuristic elements a program (apart or packed), a row's whole up to that many columns. Of the configs measured
 at Qwen3.5-0.8B's 24576 rows of 2 x 3584 (bf16, 2026-10-15), a whole row of 4096 with four warps was the
 fastest packed forward on an A100 80GB and an H100 and within 1% of the fastest reverse, level with the
 apart kernel's best (forward 0.323 against 0.315 ms on the A100, 0.181 against 0.178 on the H100), where
@@ -1326,72 +1326,81 @@ def _gradients(gate, up, dy):
     return dy * slope * up, dy * activated
 
 
-def _row_columns(width: int, block: int):
-    """A program's row of a `[rows, width]` launch (`_Rows`), its block of columns and their mask: a row and
-    a column index, whose offset the lowering widens to 64 bits where an operand passes 2^32 bytes, so no
-    index outgrows int32 however many elements the operands hold (row 12971: 168 x 4096 rows of 9216, 6.3e9
-    elements, overflowed a flat launch's int32 index)."""
-    columns = pl.program_id(1) * block + jnp.arange(block)
-    return pl.program_id(0), columns, columns < width
+def _row_tile(width: int, block: int) -> tuple[int, int]:
+    """A `_Rows` program's rows and columns of its `block` elements over rows of `width`: the whole row up to
+    `block` columns (a power of two), as many rows as the rest holds, so a narrow row's program takes several
+    rather than a lane apiece."""
+    columns = min(block, pl.next_power_of_2(width))
+    return block // columns, columns
+
+
+def _tile_of(rows: int, width: int, block: int, at: int = 0):
+    """A program's tile of a `[rows, width]` launch (`_Rows`, `_row_tile`), its columns from column `at`
+    (a packed row's up half), and its mask: a block of rows and one of columns, whose offset the lowering
+    widens to 64 bits where an operand passes 2^32 bytes, so no index outgrows int32 however many elements
+    the operands hold (row 12971: 168 x 4096 rows of 9216, 6.3e9 elements, overflowed a flat launch's int32
+    index)."""
+    count, columns = _row_tile(width, block)
+    first_row, first_column = pl.program_id(0) * count, pl.program_id(1) * columns
+    mask = (((first_row + jnp.arange(count)) < rows)[:, None]
+            & ((first_column + jnp.arange(columns)) < width)[None, :])
+    return pl.ds(first_row, count), pl.ds(at + first_column, columns), mask
 
 
 def _swiglu_forward(gate_ref, up_ref, y_ref, *, block: int, interpret: bool):
-    row, columns, mask = _row_columns(gate_ref.shape[1], block)
-    gate = plgpu.load(gate_ref.at[row, columns], mask=mask, other=0).astype(jnp.float32)
-    up = plgpu.load(up_ref.at[row, columns], mask=mask, other=0).astype(jnp.float32)
+    rows, columns, mask = _tile_of(*gate_ref.shape, block)
+    gate = plgpu.load(gate_ref.at[rows, columns], mask=mask, other=0).astype(jnp.float32)
+    up = plgpu.load(up_ref.at[rows, columns], mask=mask, other=0).astype(jnp.float32)
     y = _product(gate, up, gate_ref.dtype, interpret)
-    plgpu.store(y_ref.at[row, columns], y.astype(y_ref.dtype), mask=mask)
+    plgpu.store(y_ref.at[rows, columns], y.astype(y_ref.dtype), mask=mask)
 
 
 def _swiglu_backward(gate_ref, up_ref, dy_ref, dg_ref, du_ref, *, block: int, interpret: bool):
-    row, columns, mask = _row_columns(gate_ref.shape[1], block)
-    gate = plgpu.load(gate_ref.at[row, columns], mask=mask, other=0).astype(jnp.float32)
-    up = plgpu.load(up_ref.at[row, columns], mask=mask, other=0).astype(jnp.float32)
-    dy = plgpu.load(dy_ref.at[row, columns], mask=mask, other=0).astype(jnp.float32)
+    rows, columns, mask = _tile_of(*gate_ref.shape, block)
+    gate = plgpu.load(gate_ref.at[rows, columns], mask=mask, other=0).astype(jnp.float32)
+    up = plgpu.load(up_ref.at[rows, columns], mask=mask, other=0).astype(jnp.float32)
+    dy = plgpu.load(dy_ref.at[rows, columns], mask=mask, other=0).astype(jnp.float32)
     dg, du = _gradients(gate, up, dy)
-    plgpu.store(dg_ref.at[row, columns], dg.astype(dg_ref.dtype), mask=mask)
-    plgpu.store(du_ref.at[row, columns], du.astype(du_ref.dtype), mask=mask)
+    plgpu.store(dg_ref.at[rows, columns], dg.astype(dg_ref.dtype), mask=mask)
+    plgpu.store(du_ref.at[rows, columns], du.astype(du_ref.dtype), mask=mask)
 
 
 def _halves(gate_up_ref, block: int):
-    """A packed program's row of `[rows, 2 * width]`, its block of columns, their mask, and the
-    gate's and up's columns: contiguous runs, which the loads vectorize."""
-    width = gate_up_ref.shape[1] // 2
-    row, columns, mask = _row_columns(width, block)
-    return row, columns, mask, columns + width
+    """A packed program's tile of `[rows, 2 * width]` (`_tile_of`): its rows, the gate's and the up's
+    columns, contiguous runs which the loads vectorize, and their mask."""
+    rows, width = gate_up_ref.shape[0], gate_up_ref.shape[1] // 2
+    tile_rows, columns, mask = _tile_of(rows, width, block)
+    _, up_columns, _ = _tile_of(rows, width, block, at=width)
+    return tile_rows, columns, mask, up_columns
 
 
 def _packed_forward(gate_up_ref, y_ref, *, block: int, interpret: bool):
-    row, columns, mask, up_columns = _halves(gate_up_ref, block)
-    gate = plgpu.load(gate_up_ref.at[row, columns], mask=mask, other=0).astype(jnp.float32)
-    up = plgpu.load(gate_up_ref.at[row, up_columns], mask=mask, other=0).astype(jnp.float32)
+    rows, columns, mask, up_columns = _halves(gate_up_ref, block)
+    gate = plgpu.load(gate_up_ref.at[rows, columns], mask=mask, other=0).astype(jnp.float32)
+    up = plgpu.load(gate_up_ref.at[rows, up_columns], mask=mask, other=0).astype(jnp.float32)
     y = _product(gate, up, gate_up_ref.dtype, interpret)
-    plgpu.store(y_ref.at[row, columns], y.astype(y_ref.dtype), mask=mask)
+    plgpu.store(y_ref.at[rows, columns], y.astype(y_ref.dtype), mask=mask)
 
 
 def _packed_backward(gate_up_ref, dy_ref, d_ref, *, block: int, interpret: bool):
-    row, columns, mask, up_columns = _halves(gate_up_ref, block)
-    gate = plgpu.load(gate_up_ref.at[row, columns], mask=mask, other=0).astype(jnp.float32)
-    up = plgpu.load(gate_up_ref.at[row, up_columns], mask=mask, other=0).astype(jnp.float32)
-    dy = plgpu.load(dy_ref.at[row, columns], mask=mask, other=0).astype(jnp.float32)
+    rows, columns, mask, up_columns = _halves(gate_up_ref, block)
+    gate = plgpu.load(gate_up_ref.at[rows, columns], mask=mask, other=0).astype(jnp.float32)
+    up = plgpu.load(gate_up_ref.at[rows, up_columns], mask=mask, other=0).astype(jnp.float32)
+    dy = plgpu.load(dy_ref.at[rows, columns], mask=mask, other=0).astype(jnp.float32)
     dg, du = _gradients(gate, up, dy)
-    plgpu.store(d_ref.at[row, columns], dg.astype(d_ref.dtype), mask=mask)
-    plgpu.store(d_ref.at[row, up_columns], du.astype(d_ref.dtype), mask=mask)
+    plgpu.store(d_ref.at[rows, columns], dg.astype(d_ref.dtype), mask=mask)
+    plgpu.store(d_ref.at[rows, up_columns], du.astype(d_ref.dtype), mask=mask)
 
 
 @dataclasses.dataclass(frozen=True)
 class _Rows(tuning.KernelOp):
-    """An elementwise launch over `[rows, width]` operands (`_row_columns`): a program a row's block of
-    columns, the whole row up to `ROW_BLOCK` columns, four warps."""
+    """An elementwise launch over `[rows, width]` operands (`_tile_of`): a program a tile of `ROW_BLOCK`
+    elements, the whole row up to that many columns and as many rows as the rest holds, four warps."""
 
     config_cls: ClassVar[type[BlockConfig]] = BlockConfig
 
-    def _width(self, ba) -> int:
-        """The columns a row of the call's output holds."""
-        return ba.arguments['gate'].shape[1]
-
     def _get_heuristics_config(self, ba) -> BlockConfig:
-        return BlockConfig(min(ROW_BLOCK, pl.next_power_of_2(self._width(ba))), 4)
+        return BlockConfig(ROW_BLOCK, 4)
 
     def variants(self, ba) -> tuple[BlockConfig, ...]:
         return _neighbours(ba.heuristics_config, block=(128, 4 * ROW_BLOCK), warps=WARPS)
@@ -1404,8 +1413,9 @@ def _launch(kernel, name: str, operands, outputs, grid: tuple[int, ...], config:
 
 
 def _row_grid(rows: int, width: int, config: BlockConfig) -> tuple[int, int]:
-    """A `_Rows` launch's grid: a program a row's block of columns."""
-    return rows, pl.cdiv(width, config.block)
+    """A `_Rows` launch's grid: a program a tile of rows and columns (`_row_tile`)."""
+    count, columns = _row_tile(width, config.block)
+    return pl.cdiv(rows, count), pl.cdiv(width, columns)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1434,15 +1444,7 @@ class SwigluBackward(_Rows):
 
 
 @dataclasses.dataclass(frozen=True)
-class _Packed(_Rows):
-    """A packed projection's launch over `[rows, 2 * width]`, gate then up in each row (`_halves`)."""
-
-    def _width(self, ba) -> int:
-        return ba.arguments['gate_up'].shape[1] // 2
-
-
-@dataclasses.dataclass(frozen=True)
-class PackedSwigluForward(_Packed):
+class PackedSwigluForward(_Rows):
     """SwiGLU's forward launch over a packed projection's output, read in place (`_packed_forward`)."""
 
     ROWS: ClassVar[tuple[str, ...]] = ('gate_up',)
@@ -1455,7 +1457,7 @@ class PackedSwigluForward(_Packed):
 
 
 @dataclasses.dataclass(frozen=True)
-class PackedSwigluBackward(_Packed):
+class PackedSwigluBackward(_Rows):
     """The packed SwiGLU's reverse launch (`_packed_backward`): the gradient in its input's layout."""
 
     ROWS: ClassVar[tuple[str, ...]] = ('gate_up', 'dy')

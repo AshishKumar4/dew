@@ -1168,9 +1168,11 @@ def test_a_dense_kernel_gradients_balanced_tail_holds_check_1(rows, depth, width
 
 
 def a_dense_kernel_gradients_balanced_tail_holds_check_1(rows: int, depth: int, width: int, out_dtype,
-                                                         generation_name: str = "sm90") -> None:
+                                                         generation_name: str = "sm90",
+                                                         tile: tiling.Tiles | None = None) -> None:
     """`test_a_dense_kernel_gradients_balanced_tail_holds_check_1`'s check at one shape and output dtype,
-    interpreted on a CPU and compiled on a Hopper GPU."""
+    interpreted on a CPU and compiled on a Hopper GPU, at `tile` where given (its tail balanced), else at the
+    launch's derived tile."""
     draw = _dense_draw(rows, depth, width, cotangent=True)
     target = dataclasses.replace(generation.gpu_target(generation_name), multiprocessors=8, measured={})
     spec = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
@@ -1180,8 +1182,8 @@ def a_dense_kernel_gradients_balanced_tail_holds_check_1(rows: int, depth: int, 
         call = gradient.bind(spec((rows, depth)), spec((rows, width)), jax.ShapeDtypeStruct((1,), jnp.int32),
                              interpret=False, out_dtype=jnp.dtype(out_dtype).name, dense=True,
                              exact_sums=exact)
-        tile = gradient.derived(call, target)
-        assert gradient.balanced(call, tile, target), tile  # the launch's own decision, its tile pinned
+        tile = gradient.derived(call, target) if tile is None else tile
+        assert gradient.legal(call, tile, target) and gradient.balanced(call, tile, target), tile
 
     def dew(x, w, dy):
         del w

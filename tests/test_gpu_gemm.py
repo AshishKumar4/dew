@@ -72,6 +72,7 @@ from reference_error import ahead_arm, assert_as_exact
 from test_gemm_template import rms_norm as template_rms_norm
 
 from dew.nn.kernels import fused_gemm, generation
+from dew.nn.kernels.templates.gemm import tiling
 from dew.nn.norms import rms_normalized
 
 pytestmark = pytest.mark.gpu(reason="the GEMM template's and the Mosaic toolkit's kernels, compiled")
@@ -140,7 +141,6 @@ def native_hopper_cluster2_balanced_tail_holds_check_1():
     against XLA dot_general from float64 truth at Qwen3.5-4B q dX outlier shape (row 10151), its tail's
     first partials a slot a tail tile (`tail.slots`, NG29)."""
     from dew.nn.kernels import gemm, grouped_matmul, tuning
-    from dew.nn.kernels.templates.gemm import tiling
     tile = tiling.Tiles(128, 256, 64, 4, 8, warpgroups=2, cluster=2, family="wgmma")
     target = generation.gpu_target()
     launch = grouped_matmul.MosaicGmm()
@@ -170,7 +170,6 @@ def native_hopper_cluster2_balanced_tail_kernel_gradient_holds_check_1():
     from float64 truth. An fp32 output is summed exactly under the suite's precision, whose cluster tile's
     tail the launch refuses (`BALANCED_TAILS`)."""
     from dew.nn.kernels import gemm, grouped_matmul, tuning
-    from dew.nn.kernels.templates.gemm import tiling
     tile = tiling.Tiles(128, 256, 64, 4, 8, warpgroups=2, cluster=2, family="wgmma")
     launch, bf16 = grouped_matmul.MosaicTgmm(), functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     ba = launch.bind(bf16((8192, 2560)), bf16((8192, 2048)), jax.ShapeDtypeStruct((1,), jnp.int32),
@@ -225,10 +224,10 @@ CLUSTER = "a cluster's multicast of a shared block, which the interpreter loads 
 BALANCED_TAIL = "a balanced tail's partials fixed up across programs, which the interpreter runs in one order"
 """Why a dense kernel gradient's balanced tail stays on the GPU (the GEMM lane, 11-12)."""
 
-A100_BALANCED_TAILS = ((320, 192, 1408), (320, 384, 704))
-"""Dense bf16 kernel gradients' rows, depth and width whose derived tile an A100 of 8 multiprocessors
-balances its last wave at (64 x 128 and 128 x 64, two programs a multiprocessor): its 128 x 128 tile, which
-`BALANCED_TAILS`' shapes derive, holds no merge (280 registers a thread, `MosaicTgmm.balanced`)."""
+A100_BALANCED_TAILS = ((320, 192, 1408, (64, 128, 64, 3, 2)), (320, 384, 704, (128, 64, 64, 3, 4)))
+"""Dense bf16 kernel gradients' rows, depth and width, each at a one-consumer mma.sync tile (its rows,
+columns, step, stages and band; two programs a multiprocessor) whose tail an A100 of 8 multiprocessors
+balances: a 128 x 128 tile holds no merge (280 registers a thread, `MosaicTgmm.balanced`)."""
 
 
 def _toolkit_cells() -> list[Cell]:
@@ -299,8 +298,10 @@ def test_the_gemm_kernels_run_on_this_gpu(part):
           for rows, depth, width, dtype in gemm_template.BALANCED_TAILS),
         *(Cell(f"an A100's dense kernel gradient's balanced tail holds check 1: {rows}x{depth}x{width}",
                functools.partial(gemm_template.a_dense_kernel_gradients_balanced_tail_holds_check_1, rows,
-                                 depth, width, jnp.bfloat16, "sm80"), "sm80", fault=BALANCED_TAIL)
-          for rows, depth, width in A100_BALANCED_TAILS),
+                                 depth, width, jnp.bfloat16, "sm80",
+                                 tiling.Tiles(*tile, warpgroups=1, cluster=1, family="mma.sync", programs=2)),
+               "sm80", fault=BALANCED_TAIL)
+          for rows, depth, width, tile in A100_BALANCED_TAILS),
         *(Cell(f"a chained input gradient holds check 1: {case}",
                functools.partial(gemm_paired.a_chained_input_gradient_holds_check_1, case), name,
                native={"launch": "chained", "generation": name, "case": case})
