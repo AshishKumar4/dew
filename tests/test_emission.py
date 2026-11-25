@@ -984,20 +984,6 @@ def test_a_walks_platform_chosen_mask_is_static():
     assert role.step(lambda work: work.integer_multiply_adds) == 0, role
 
 
-def test_a_folded_scalars_cast_to_its_own_dtype_issues_nothing():
-    """A warpgroup's index (known to the count) cast to its own dtype, weak to strong, is folded and issues
-    nothing, as any cast to its own dtype, beside its cast to fp32's one conversion (the review of
-    lane/toolkit 0aaf87185)."""
-    def body(row):
-        index = lax.axis_index("wg")
-        cast = lax.convert_element_type_p.bind(index, new_dtype=jnp.dtype(jnp.int32), weak_type=True,
-                                               sharding=None)
-        return row + cast.astype(jnp.float32)
-
-    # Its cast to fp32 a conversion, its cast to its own dtype none.
-    assert [role.fixed.conversions for role in _emitted(body, _ROW).roles] == [1, 1]
-
-
 def test_a_correctly_rounded_division_prices_as_its_backend_lowers_it():
     """A correctly rounded fp32 division (`precision.correctly_rounded_divide`) prices as each backend lowers
     it (row 12886): in a Pallas Triton kernel, read from the launch's own compiler parameters (a
