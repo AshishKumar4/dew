@@ -29,7 +29,10 @@ class ShortConvSite(nn.Module):
     `dynamic_heads`, each token's taps add a projection of the call's dynamic input (`dynamic`, bias-free,
     `[heads * kernel]` a token) shared by each head's `features // heads` channels, and the sum divides by
     `sqrt(2 * kernel + 1)` instead. A padding token's input convolves as zero and packed documents apart;
-    a cached call convolves behind the site's history, `conv_state` `[B, kernel - 1, features]`."""
+    a cached call convolves behind the site's history, `conv_state` `[B, kernel - 1, features]`. Every tap
+    is in convolution order, the last the token itself (`causal_conv1d`'s), the dynamic projection's too;
+    a source holding them by lag, the first the token itself (Inkling 2's dynamic sites), reverses them on
+    import."""
 
     features: int
     kernel: int = 4
