@@ -1033,8 +1033,9 @@ def placed_draws(drop: Dropout | None, queries: int, keys: int) -> Dropout | Non
 
 
 def param_types(params: Iterable[Side]) -> tuple:
-    """Score-hook parameters as a launch's kernels load them: each its `Kind` and dtype (`kept_dtype`)."""
-    return tuple((param.axes, kept_dtype(param.value.dtype)) for param in params)
+    """Score-hook parameters as a launch's kernels load them: each its `Kind` (`kind_of`, a plain tuple of
+    axes named as the kind it is) and dtype (`kept_dtype`)."""
+    return tuple((kind_of(param), kept_dtype(param.value.dtype)) for param in params)
 
 
 def streams_operands(family: mosaic.Family) -> bool:
