@@ -121,3 +121,18 @@ def test_a_pool_joins_through_a_scheduler_of_the_users_own():
     pools = sorted(line for written in outputs for line in written.splitlines() if line.startswith("pool"))
     assert pools == ["pool 2 0", "pool 2 1"], outputs
 
+
+
+def test_dew_launch_shows_each_process_its_own_gpus_alone():
+    """`dew launch`'s processes on a host each see only the GPUs they take (`CUDA_VISIBLE_DEVICES`, the
+    ordinals the pool may use, in order), numbered from 0 for JAX, so a process of one GPU opens no
+    neighbour's whatever pool it joins and keeps XLA's CUDA graphs (row 12761: every rank counted the host's
+    eight)."""
+    from dew._cli.launch import Launch
+    from dew.clusters import LOCAL_DEVICES
+
+    launch = Launch(command=("python", "train.py"), processes_per_host=2,
+                    env=("CUDA_VISIBLE_DEVICES=4,5,6,7", "JAX_PLATFORMS=cuda"))
+    pool = launch.pool(["localhost"])
+    assert [(process.env["CUDA_VISIBLE_DEVICES"], process.env[LOCAL_DEVICES]) for process in pool] == [
+        ("4,5", "0,1"), ("6,7", "0,1")]

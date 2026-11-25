@@ -50,7 +50,7 @@ from dew._pool import (
     slurm_tasks_here,
     visible_gpus,
 )
-from dew.clusters import LOCAL_DEVICES, SCHEDULERS, Launched, Scheduler, detected_environment
+from dew.clusters import SCHEDULERS, Launched, Scheduler, detected_environment
 
 VARIABLE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 """What an `--env` name may be: it lands unquoted in the remote shell line."""
@@ -91,7 +91,7 @@ class Process:
     argv: tuple[str, ...]
     env: dict[str, str]
     devices: str = ""
-    """The local devices it takes, as JAX_LOCAL_DEVICE_IDS lists them."""
+    """The GPUs it takes, as its CUDA_VISIBLE_DEVICES lists them; empty where it takes every local device."""
 
     @property
     def local(self) -> bool:
@@ -344,15 +344,31 @@ class Launch:
             holds = "each with every local device" if per_host > 1 else "with every local device"
         emit(f"pool: {count} process{'es' if count > 1 else ''} on {', '.join(hosts)}, "
              f"{holds}, coordinator {address}")
-        processes = []
+        processes, ordinals = [], {}
         for rank in range(count):
             host = hosts[rank // per_host]
             first = (rank % per_host) * (devices or 0)
             env = {**shared, **Launched.environ_of(address, count, rank, None if devices is None
-                                                   else range(first, first + devices))}
+                                                   else range(devices))}
+            if devices is not None:
+                # Its GPUs alone visible to it, so it opens none of its neighbours' whatever pool it joins
+                # and, holding one, keeps XLA's CUDA graphs (row 12761); JAX numbers them from 0.
+                if host not in ordinals:
+                    ordinals[host] = self.ordinals(host)
+                env["CUDA_VISIBLE_DEVICES"] = ",".join(ordinals[host][first:first + devices])
             processes.append(Process(rank, host, self.remote_argv(host, env), env,
-                                     env.get(LOCAL_DEVICES, "")))
+                                     env.get("CUDA_VISIBLE_DEVICES", "")))
         return processes
+
+    def ordinals(self, host: str) -> list[str]:
+        """The CUDA ordinals a pool process on `host` may take, in order: those the pool's
+        CUDA_VISIBLE_DEVICES lists (--env, or this machine's own here), else the host's every GPU by its
+        driver's numbering."""
+        env = {**(os.environ if host in LOCAL_HOSTS else {}), **self.extra_env()}
+        visible = env.get("CUDA_VISIBLE_DEVICES")
+        if visible is not None:
+            return [device.strip() for device in visible.split(",") if device.strip()]
+        return [str(device) for device in range(gpu_count(host, None) or 0)]
 
     def remote_argv(self, host: str, env: dict[str, str]) -> tuple[str, ...]:
         """The argv that starts the command on `host`: the command itself
