@@ -117,17 +117,49 @@ def _conds(closed) -> list:
     return found
 
 
-def test_a_loop_runs_a_later_pass_only_where_rows_still_loop_over_those_rows_alone():
-    """A loop exiting at its threshold in scoring runs each later pass, and each exit before the last,
-    under a condition of some real token's still looping (`_Passes.stopping`, row 12924), and under
-    `exit_by='row'` each pass over the batch's halvings, the smallest holding its rows still looping
-    (`compacted`, row 12927): eight rows' pass a program for eight, four, two and one."""
+def _rows_of_products(jaxpr) -> set[int]:
+    """The leading sizes of every dot product's operands in `jaxpr`, those it holds among them."""
+    sizes = set()
+    for eqn in jaxpr.eqns:
+        if eqn.primitive.name == "dot_general":
+            sizes |= {var.aval.shape[0] for var in eqn.invars if var.aval.shape}
+        for value in eqn.params.values():
+            for each in value if isinstance(value, (tuple, list)) else (value,):
+                if isinstance(each, jex_core.ClosedJaxpr):
+                    sizes |= _rows_of_products(each.jaxpr)
+                elif isinstance(each, jex_core.Jaxpr):
+                    sizes |= _rows_of_products(each)
+    return sizes
+
+
+def test_a_loop_runs_no_pass_after_every_token_exits():
+    """Scoring under a threshold stops its passes once every token has exited (`_Passes.stopping`, row
+    12924): with a gate certain to exit at the first pass, more of its layers' outputs are what a pass that
+    did not run leaves (zero, `_sown_switch`) than with a gate that never exits, which runs every pass."""
+    looped = _decoder("qwen35-tiny").with_passes(3, (1, 3), exit_gate=True, exit_threshold=0.6)
+
+    def zeros(bias: float) -> int:
+        variables, ids = _gated(model_draw(looped, (2, 12), looped.vocab_size), looped.emb_features, 0xE92,
+                                bias=bias)(0)
+        _, captured = looped.apply(variables, ids, capture_intermediates=True, mutable=["intermediates"])
+        return sum(not np.any(np.asarray(leaf)) for leaf in jax.tree.leaves(captured))
+    assert zeros(30.0) > zeros(-30.0)
+
+
+def test_a_pass_runs_over_the_rows_still_looping_alone():
+    """Scoring whose rows exit whole (`exit_by='row'`) runs each later pass over the batch's halvings, the
+    smallest that holds its rows still looping (`compacted`, row 12927): eight rows' pass a program for
+    eight, four, two and one, each branch's products over its own rows."""
     looped = _rows_exiting()
-    variables, ids = _gated(model_draw(looped, (8, 12), looped.vocab_size), looped.emb_features, 0xE92)(0)
-    conds = _conds(jax.make_jaxpr(looped.apply)(variables, ids))
-    # Two later passes and one exit between them, stopped; each pass's compaction four sizes.
-    assert sum(len(eqn.params["branches"]) == 2 for eqn in conds) == 3
-    assert sum(len(eqn.params["branches"]) == 4 for eqn in conds) == 2
+    variables, ids = _gated(model_draw(looped, (8, 12), looped.vocab_size), looped.emb_features, 0xE95)(0)
+    buckets = [eqn for eqn in _conds(jax.make_jaxpr(looped.apply)(variables, ids))
+               if len(eqn.params["branches"]) == 4]
+    # One a later pass, each branch's products over its bucket's rows (or its rows' tokens, flattened).
+    assert len(buckets) == looped.loop.steps - 1
+    for eqn in buckets:
+        for size, branch in zip((8, 4, 2, 1), eqn.params["branches"], strict=True):
+            rows = _rows_of_products(branch.jaxpr)
+            assert size in rows or size * ids.shape[1] in rows
 
 
 def _decoded(model, prompt: int):

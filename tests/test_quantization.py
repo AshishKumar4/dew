@@ -1502,7 +1502,7 @@ def zone_cases(dtype) -> dict[str, tuple[Callable[..., jax.Array], tuple, dict]]
     return {
         "dew.nn.ssm.diagonal_recurrence": (diagonal_recurrence, (pole, normal(2, 12, 8)), {"chunk": 4}),
         "dew.nn.attention_residuals.depth_mixed": (
-            depth_mixed, (normal(2, 3, 4, 8), normal(8), normal(2, 3, 4, 8)), {}),
+            depth_mixed, (normal(2, 3, 4, 8), normal(8, 1), normal(2, 3, 4, 8)), {}),
         "dew.nn.quantizers.nearest_codewords": (nearest_codewords, (rows, codebook), {}),
         "dew.nn.kv_cache.rotated": (rotated, (normal(2, 4, 8), hadamard(8)), {}),
         "dew.lora._updated": (lora_update, (normal(8, 6), normal(8, 2), normal(2, 6)), {"scale": 2.0}),

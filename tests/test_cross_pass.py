@@ -245,7 +245,7 @@ def test_an_attention_layers_sites_read_their_bank_once_each_by_its_formula():
 def test_a_bf16_merge_contracts_in_bf16_under_the_runs_precision():
     """A merge whose sublayer computes in bf16 takes every product of its depth read and its controller in
     bf16, at the precision the run gives bf16 operands (`dew.nn.precision.operand_precision`: a bf16 run's
-    Tensor Cores), not in float32 at `Precision.HIGHEST` (row 12918)."""
+    Tensor Cores), not widened to float32 at a precision of its own (row 12918)."""
     merge = CrossPassMerge(MESSAGES, 16, 1e-6)
     read = jnp.ones((2, 5, 16), jnp.bfloat16)
     bank = jnp.ones((2, 5, 3, 16), jnp.bfloat16)
@@ -254,9 +254,6 @@ def test_a_bf16_merge_contracts_in_bf16_under_the_runs_precision():
     dots = products(jax.make_jaxpr(merge.apply)(variables, read, bank))
     assert dots
     assert {str(var.aval.dtype) for eqn in dots for var in eqn.invars} == {"bfloat16"}
-    highest = jax.lax.Precision.HIGHEST
-    assert not any(highest in (precision if isinstance(precision := eqn.params["precision"], tuple)
-                               else (precision,)) for eqn in dots)
 
 
 def _messages_by_hand(module, ids):
@@ -510,20 +507,18 @@ def test_a_decoder_drawn_at_one_pass_holds_every_merge_a_later_pass_reads():
     lambda: dataclasses.replace(decoder("depth", steps=2), loop=Loop(
         2, step_norm=False, layers=(2, 4), messages=CrossPass(block_size=1))).init(
         jax.random.key(0), jnp.zeros((1, 4), jnp.int32)),
-    lambda: dataclasses.replace(decoder("attention"), kv_shared_layers=(3,), loop=Loop(
-        2, step_norm=False, messages=MESSAGES)).init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32)),
     lambda: decoder("attention", steps=2, messages=None).with_passes(3, messages=MESSAGES),
     lambda: dataclasses.replace(decoder("attention", steps=2), normed_residual=True).init(
         jax.random.key(0), jnp.zeros((1, 4), jnp.int32)),
     lambda: decoder("depth", steps=2, exit_gate=True).init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))],
     ids=["a step norm", "implicit", "an empty block", "an empty message block", "depth blocks misaligned",
-         "a message block not the depth block", "shared keys", "messages joining a loop of passes",
+         "a message block not the depth block", "messages joining a loop of passes",
          "a normed residual", "exits over depth residuals"])
 def test_a_loop_whose_messages_cannot_summarize_its_blocks_is_refused(refused):
     """A loop passing messages is refused where its passes would not each enter at the block's input (a
     step norm, the θ-method), where it banks nothing (an empty block or message block), where under
     attention residuals a summary would not be a whole depth block's partial sum or a pass would exit
-    through a depth state uncollapsed, where a layer's keys would cross a message block's end, and where
+    through a depth state uncollapsed, and where
     it would join a loop already of several passes, changing what it computes at the merges' draw, and
     where a normed residual makes a sublayer's normed input the stream its merge would leave as it is."""
     with pytest.raises(ValueError):

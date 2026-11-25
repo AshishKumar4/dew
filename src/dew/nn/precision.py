@@ -102,6 +102,7 @@ __all__ = [
     "compensated_sum",
     "compensated_total",
     "compensates_loops",
+    "computed_dot",
     "computed_einsum",
     "configurable_precision",
     "configured_precision",
@@ -1105,6 +1106,17 @@ def computed_einsum(subscripts: str, *operands, dtype: DTypeLike) -> jax.Array:
     compute = jnp.dtype(dtype)
     return float32_einsum(subscripts, *(operand.astype(compute) for operand in operands),
                           precision=operand_precision(compute), preferred_element_type=at_least_fp32(compute))
+
+
+def computed_dot(x: jax.Array, kernel: jax.Array, *, dtype: DTypeLike) -> jax.Array:
+    """`x`'s last axis contracted with `kernel`'s first, as `computed_einsum` contracts: a layer's projection
+    in the run's numerics (a cross-pass merge's controller, `dew.nn.cross_pass`), a dot product as a dense
+    layer's is, so a quantization rule over its products' ops reads it as one (row 12918)."""
+    compute = jnp.dtype(dtype)
+    contracted = (((x.ndim - 1,), (0,)), ((), ()))
+    return float32_dot_general(x.astype(compute), kernel.astype(compute), contracted,
+                               precision=operand_precision(compute),
+                               preferred_element_type=at_least_fp32(compute))
 
 
 def _bf16_algorithm(precision: jax.lax.PrecisionLike) -> bool:

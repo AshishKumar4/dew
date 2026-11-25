@@ -15,7 +15,7 @@ is the first again, and a pretrained decoder gains passes without changing what 
     forget = tanh(h W_f),  gain = tanh(h W_g),  add = tanh(h W_a)
     out    = (1 - forget) u + σ (gain m + add)
 
-its products in the sublayer's compute dtype under the run's precision (`dew.nn.precision.computed_einsum`),
+its products in the sublayer's compute dtype under the run's precision (`dew.nn.precision.computed_dot`),
 its statistics, gates and mix in at least fp32, cast back to `u`'s dtype; `additive` drops `add`, and
 without `scale_by_input_rms` the message joins at unit scale rather than at the input's.
 """
@@ -35,7 +35,7 @@ from .dense import watched_or_owned
 from .derivatives import portable_formed
 from .flops import projection_flops
 from .norms import unweighted_rmsnorm
-from .precision import at_least_fp32, computed_einsum
+from .precision import at_least_fp32, computed_dot
 from .sharding import declared
 
 MERGE_PREFIX = "cross_pass_"
@@ -156,7 +156,7 @@ def _merged(read: jax.Array, mixed: jax.Array, controller, spec: CrossPass, eps:
     its `controller` (input and message down projections, gain, forget, and an additive's added), in
     `read`'s dtype: its two down projections one product over the joined input and message, its up
     projections one product over their joined kernels (row 12922), each in `read`'s compute dtype under
-    the run's precision (`dew.nn.precision.computed_einsum`: a bf16 run's Tensor Cores, `ACCURATE`'s exact
+    the run's precision (`dew.nn.precision.computed_dot`: a bf16 run's Tensor Cores, `ACCURATE`'s exact
     float32; row 12918), its norms' statistics, gates and mix in at least fp32."""
     input_down, message_down, *ups = controller
     compute = read.dtype
@@ -164,9 +164,9 @@ def _merged(read: jax.Array, mixed: jax.Array, controller, spec: CrossPass, eps:
     u = read.astype(wide)
     message = unweighted_rmsnorm(mixed.astype(wide), eps, implementation='xla')
     sigma = jnp.sqrt(jnp.mean(jnp.square(u), axis=-1, keepdims=True) + jnp.asarray(eps, wide))
-    state = computed_einsum('bsd,dr->bsr', jnp.concatenate([u / sigma, message], axis=-1),
-                            jnp.concatenate([input_down, message_down], axis=0), dtype=compute)
-    gates = jnp.tanh(computed_einsum('bsr,rd->bsd', state, jnp.concatenate(ups, axis=1), dtype=compute))
+    state = computed_dot(jnp.concatenate([u / sigma, message], axis=-1),
+                         jnp.concatenate([input_down, message_down], axis=0), dtype=compute)
+    gates = jnp.tanh(computed_dot(state, jnp.concatenate(ups, axis=1), dtype=compute))
     gain, forget, *added = jnp.split(gates, len(ups), axis=-1)
     sent = gain * message + (added[0] if added else 0)
     kept = (1 - forget) * u

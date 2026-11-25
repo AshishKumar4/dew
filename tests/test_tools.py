@@ -1762,7 +1762,7 @@ def test_a_precision_named_outright_outside_the_policy_is_reported(tmp_path):
               "    d = jax.numpy.dot(x, y, precision='highest')\n"
               "    return a + b + c + d + Precision.HIGHEST\n")
     assert_reported(tmp_path, "src/sparx/layer.py", source, "SLOP034", (9, 10, 11, 12))
-    assert_reported(tmp_path, "src/sparx/nn/precision.py", source, "SLOP034", ())
+    assert_reported(tmp_path / "policy", "src/sparx/nn/precision.py", source, "SLOP034", ())
 
 
 def test_a_feature_detected_by_its_exception_is_reported(tmp_path):

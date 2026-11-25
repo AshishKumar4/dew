@@ -161,7 +161,8 @@ def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer
             attention_metadata=attention_metadata)
 
     x = outside(x, 0, split.prefix)
-    x = run(decoder, view, x, train, decode, per_layer_input, attention_metadata, prior_bank, store)
+    # A loop's part's store passes in; else the run makes its own, inside the transform that maps its view.
+    x = run(decoder, view, x, train, decode, per_layer_input, attention_metadata, prior_bank, kv_store)
     return outside(x, decoder.num_layers - split.suffix, decoder.num_layers)
 
 
@@ -171,9 +172,10 @@ def stacked(decoder: CausalTransformer, view: StackView, x, train: bool, decode:
     """The stack inside `view`: scanned runs, or the pipeline over stages; compact, so the stages it builds
     are the decoder's own."""
     if view.stages == 1:
+        store = kv_store if kv_store is not None else ({} if decoder.provides else None)
         return run_stack(
             decoder.layers, decoder.block, decoder.specs, view.groups, x,
-            train=train, decode=decode, kv_store=kv_store,
+            train=train, decode=decode, kv_store=store,
             per_layer_input=per_layer_input, attention_metadata=attention_metadata,
             banked='params' in view.banked, periods=view.periods, prior_bank=prior_bank)
     return run_pipeline(
