@@ -1148,6 +1148,33 @@ def test_a_terms_arithmetic_is_what_the_kernels_counter_prices_its_operation_at(
     assert [getattr(price.work, field) for field in fields] == [getattr(counted, field) for field in fields]
 
 
+def test_an_xla_programs_division_prices_on_its_target_at_its_dtype():
+    """An XLA program's fp32 division priced for an H100 issues `div.rn.f32`'s MUFU and refinement
+    (`emission.IEEE_DIVISION`, M-FS-77) on whatever host prices it, and for a TPU an operation an element; an
+    int32 division and a bfloat16 one an operation an element on either, a division of a program of other
+    than fp32 values unproven fp32 (the review of lane/toolkit 58143d37f: the algebra priced on the
+    process's own target, every division at fp32)."""
+    hopper, tpu = generation.TARGETS["sm90"], generation.TARGETS["v5e"]
+    elements = 64 * 128
+
+    def priced(dtype, target):
+        rows = jax.ShapeDtypeStruct((64, 128), dtype)
+        closed = jax.make_jaxpr(lambda x, y: jax.lax.div(x, y))(rows, rows).jaxpr
+        return program.priced(closed, target).work
+
+    assert (priced(jnp.float32, hopper).exponentials, priced(jnp.float32, hopper).operations) == (
+        elements, 6 * elements)
+    for dtype, target in ((jnp.float32, tpu), (jnp.int32, hopper), (jnp.bfloat16, hopper)):
+        assert priced(dtype, target).exponentials == 0, (dtype, target)
+    # A masked fp32 division (its mask's bools beside its fp32 values) is fp32's.
+    rows = jax.ShapeDtypeStruct((64, 128), jnp.float32)
+    masked = jax.make_jaxpr(lambda x, y: jnp.where(y > 0, x / y, 0.0))(rows, rows).jaxpr
+    assert program.priced(masked, hopper).work.exponentials == elements
+    # A quotient a rewrite made, which no trace typed (`rules._ranged`'s of a bfloat16 program), its dtype
+    # unproven: an operation an element, as a bfloat16 one (the review of lane/toolkit f8963150b).
+    assert cost._priced(jax.lax.div_p, {}, [(64,), (64,)], (64,), hopper) == cost.Work(operations=64)
+
+
 def test_an_operation_no_rule_prices_makes_no_form_cheaper_for_taking_more_of_it():
     """An operation no rule prices (an atan2: no kernel's body holds one and no probe has measured it) is
     work at no rate (`Work.unpriced_operations`), so a form taking more of it is never cheaper

@@ -383,6 +383,14 @@ class Region[Node: (Term, Skeleton)]:
         return _interned(self.params, self.products, self.indexed, primitive, values, product)
 
     @functools.cached_property
+    def single_float32(self) -> bool:
+        """Whether every value the region's program traced is fp32 (`dtypes`; an extended dtype and a mask's
+        bool aside, `where(y > 0, a / y, 0)`'s): a division of it, traced or a rewrite's, fp32 too
+        (`cost.work`); an integer's or another float's program none."""
+        return all(np.dtype(dtype) == np.float32 for dtype in self.dtypes.values()
+                   if not jnp.issubdtype(dtype, jax.dtypes.extended) and np.dtype(dtype) != np.bool_)
+
+    @functools.cached_property
     def made_by(self) -> dict[int, Opaque[Node]]:
         """Each leaf an equation outside the language makes (`opaque`), by its index, that equation."""
         return {leaf: opaque for opaque in self.opaque for leaf in opaque.outputs}
