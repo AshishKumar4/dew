@@ -217,7 +217,12 @@ def _fused_allocations(family: mosaic.Family, config: BackwardTiles, width: int,
     stage_width = stores.staged_columns(width, (jnp.float32,)) if held and width <= 128 else width
     stage_shape = ((consumers, buffers, max(block_q, block_k), stage_width) if buffers > 1
                    else (consumers, max(block_q, block_k), stage_width))
-    stage = family.staged_memory(stage_shape, jnp.float32)
+    # The stage's fp32 rows at the narrowest swizzle where its adds read it: a wgmma accumulator's stores
+    # into it then take no select a register pair (the 128-byte swizzle's: 256 FSEL of the fused dK/dV's
+    # 3,432 instructions, a compile-only sm90's at Qwen3-8B's widths; 32-byte, 80, and 9 registers fewer;
+    # M-NA-28-gh200's 160M FSEL against FlashAttention 3's 68M, row 5272).
+    stage = family.staged_memory(stage_shape, jnp.float32,
+                                 swizzling.NARROWEST_SWIZZLE_BYTES if held else None)
     kv_swizzles = transposed_swizzles(config, "keys", "values")
     staged_swizzle = swizzling.UNSWIZZLED if family.relay_bytes(block_q, block_k) else None
     scoped = [family.staged_memory((consumers, block_k, width), dtype, kv_swizzles.get("keys")),
@@ -286,14 +291,15 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
     if q_slot.dtype == jnp.float16:
         return _sixteen_step(walk, k_smem, staged, add_dq, slots, carry, accumulators, q_first, _tile_scores(
             walk, (q_slot, do_slot), resident, rows_of(slots, q_first), coords, whole(index), shape,
-            masked=masked, whole_operands=True))
+            masked=masked, whole_operands=True, lean=True))
     cotangents_staged = staged.at[1]
     if masked is not None and _splits_scores(walk):
         _, part = _tile_scores(
             walk, (q_slot, do_slot), resident, rows_of(slots, q_first), coords, whole(index), shape,
             masked=masked,
             on_weights=lambda narrowed: family.staged(narrowed, staged.at[0]),
-            after_weights=lambda: family.looped_products(dv_acc, staged.at[0].transpose((1, 0)), do_slot))
+            after_weights=lambda: family.looped_products(dv_acc, staged.at[0].transpose((1, 0)), do_slot),
+            lean=True)
         family.staged(part, cotangents_staged)
         _, dq = family.product_with(
             cotangents_staged, k_smem, (tiles.block_q, k_smem.shape[-1]),
@@ -302,7 +308,7 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
         add_dq(q_first, dq)
         return carry, (dk_acc, dv_acc)
     narrowed, part = _tile_scores(walk, (q_slot, do_slot), resident, rows_of(slots, q_first), coords,
-                                  whole(index), shape, masked=masked)
+                                  whole(index), shape, masked=masked, lean=True)
     # Stage P and dS under one proxy fence so narrowed and part free before products (`dq_and_dkv`).
     with family.staged_together():
         family.staged(narrowed, staged.at[0])
