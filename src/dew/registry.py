@@ -647,15 +647,10 @@ def to_record(value, annotation) -> JSON:
 
 
 def _declares_callable(annotation) -> bool:
-    """Whether `annotation` declares a callable (`Callable[...]`), through an alias, `Annotated` and an
-    optional's union."""
-    if isinstance(annotation, typing.TypeAliasType):
-        return _declares_callable(annotation.__value__)
-    if typing.get_origin(annotation) is typing.Annotated:
-        return _declares_callable(typing.get_args(annotation)[0])
-    if typing.get_origin(annotation) in (types.UnionType, typing.Union):
-        return any(_declares_callable(member) for member in typing.get_args(annotation))
-    return annotation is Callable or typing.get_origin(annotation) is Callable
+    """Whether `annotation` declares a callable (`Callable[...]`), any member of its union (`_union_members`,
+    through its aliases and `Annotated`)."""
+    return any(resolve_alias(member) is Callable or typing.get_origin(resolve_alias(member)) is Callable
+               for member in _union_members(annotation))
 
 
 def _record_of(value: Recorded | DataclassInstance, annotation: Annotation) -> dict[str, JSON]:

@@ -965,7 +965,14 @@ def test_an_override_sets_a_decision_runs_context_and_a_field_of_it_in_one_point
     `context.layers`, the context's own fields under it) builds the run its whole point describes: a path
     under a section the point sets is placed in that section, the run built once, never part-set."""
     from dew.decision.config import CrossContext
+    from dew.inputs.spec import TextCondition
 
     run = decision(tmp_path, drawn=False).override({"context": {}, "context.layers": [0, 1],
                                                     "context.length": 32})
     assert isinstance(run, DecisionRunConfig) and run.context == CrossContext(layers=(0, 1), length=32)
+    # A field of a section the section it sets holds unset steps into that section's defaults, as a path
+    # into any unset section of the run does (`_unset_default`).
+    texted = decision(tmp_path, drawn=False).override({"context": {"layers": [0, 1]},
+                                                       "context.text.max_length": 32})
+    assert isinstance(texted, DecisionRunConfig) and texted.context == CrossContext(
+        layers=(0, 1), text=TextCondition(max_length=32))
