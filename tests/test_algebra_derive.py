@@ -1350,6 +1350,19 @@ def test_chunked_moments_balanced_quotient_direction_jvp_and_vjp():
             assert float(d_gc[0, 0]) == float(np.float32(-u_c / np.float32(1.5)))
 
 
+@pytest.mark.parametrize("mode", ["walk", "merge"])
+def test_chunked_covariance_retains_small_value_tangent(mode):
+    """A direction spanning 100 binades must not lose its finite covariance derivative."""
+    from dew.algebra import moments
+
+    x = jnp.asarray([[-1.0, -1.0, 1.0]], jnp.float32)
+    y = jnp.asarray([[-1.0, 1.0, 0.0]], jnp.float32)
+    w = jnp.asarray([[0.25, 0.25, 0.5]], jnp.float32)
+    dx = jnp.asarray([[0.0, 1.0, 2.0 ** 100]], jnp.float32)
+    _, tangent = jax.jvp(lambda v: moments.chunked_covariance(v, y, w, tile=1, mode=mode)[2], (x,), (dx,))
+    np.testing.assert_array_equal(tangent, [0.25])
+
+
 def test_chunked_moments_directed_overflow_mixed_zero_weight_and_direct_jvp():
     """Weight tangents stay finite when `cx * cy` overflows, mixed 2nd derivatives at zero individual and
     all-zero weights match the plain declaration, and direct `derive` forms preserve zero-weight JVP."""
