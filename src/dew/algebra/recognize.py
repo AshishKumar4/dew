@@ -1191,56 +1191,85 @@ def _nonpositive_decay(bound: terms.Magnitude | None, proved: terms.Apart) -> bo
     return proved.number and (proved.sign < 0 or bound == terms.NOTHING)
 
 
+_RECURRENCE_ROUTES: collections.OrderedDict[Hashable, Held[frozenset[str] | None]] = (
+    collections.OrderedDict())
+"""Selected forward or training recurrence kernels by `(kind, operand shapes/dtypes, options, context)`."""
+
+
+def _recurrence_inter_dtype(kernel: str, hooks, common):
+    """Intermediate storage dtype (`scores`, entered state, `corrected`) for selected recurrence `kernel`,
+    or None for any unrecognized kernel (which keeps the plain scan intact)."""
+    from dew.nn.kernels import recurrence_chunk
+
+    if kernel == "fla":
+        return common
+    if kernel == "mosaic_gpu":
+        rounded = recurrence_chunk.chunk_rounding(
+            hooks.delta, common, released=recurrence_chunk.simple_gla(hooks))
+        return common if (hooks.delta or rounded) else jnp.float32
+    return None
+
+
+def _norm_bits(bound: terms.Magnitude, apart: terms.Apart, half_key_bits: int) -> int:
+    """Upper log2 bound on the Euclidean norm of a last-axis vector (`terms.NOTHING` for exact zero)."""
+    if bound == terms.NOTHING:
+        return terms.NOTHING
+    return 0 if apart.unit_norm else bound + half_key_bits
+
+
 def _recurrence_bounded(
     state_bound: terms.Magnitude | None, state_apart: terms.Apart,
     q_bound: terms.Magnitude | None, q_apart: terms.Apart,
     k_bound: terms.Magnitude | None, k_apart: terms.Apart,
     v_bound: terms.Magnitude | None, v_apart: terms.Apart,
     beta_bound: terms.Magnitude | None, beta_apart: terms.Apart, *,
-    seq_len: int, key_width: int, common, scale: float | None, delta: bool, has_beta: bool,
+    seq_len: int, key_width: int, inter_dtype, out_dtype, scale: float | None, delta: bool, has_beta: bool,
 ) -> bool:
-    """Whether chunked WY solves, narrowed state casts (`fla_gdn`/`mosaic_gpu`), and score/readout products
-    stay strictly within `common` and fp32 range (row 3450): requires finite statically bounded `state`, `Q`,
-    `K`, `V` (and `beta` when present), contractive `0 <= beta * ||K||_2^2 <= 2` for delta-rule WY triangular
-    solves (`recurrence.Hooks.inverse_bound`), and bounded peak state and readout norms across `seq_len`."""
+    """Whether the selected chunked kernel's `inter_dtype` (`_recurrence_inter_dtype`) preserves both
+    upper-range finiteness (ungated `K @ K^T`, `Q @ K^T`, contractive WY inverse, peak state/readout) and
+    lower-range non-underflow of `(Q @ K^T) @ (beta * V - K^T h)` and `q^T state` into `out_dtype`
+    (row 3450)."""
     if (state_bound is None or q_bound is None or k_bound is None or v_bound is None
-            or not (state_apart.finite and q_apart.finite and k_apart.finite and v_apart.finite)):
+            or not (state_apart.finite and q_apart.finite and k_apart.finite and v_apart.finite)
+            or (scale is not None and (not math.isfinite(scale) or scale <= 0.0 or scale > 1.0))
+            or (has_beta and (beta_bound is None or not beta_apart.finite))):
         return False
-    if scale is not None and (not math.isfinite(scale) or scale <= 0.0):
+    inter_info, out_info = jnp.finfo(inter_dtype), jnp.finfo(out_dtype)
+    if int(inter_info.nmant) < int(out_info.nmant):
         return False
-    if has_beta and (beta_bound is None or not beta_apart.finite):
-        return False
-    work_cap = min(56, int(jnp.finfo(common).maxexp) - 4)
+    work_cap = min(56, int(inter_info.maxexp) - 4)
+    v_cap = int(out_info.minexp) - int(inter_info.minexp)
     key_bits = math.ceil(math.log2(max(key_width, 1)))
     half_key_bits = (key_bits + 1) // 2
     seq_bits = math.ceil(math.log2(max(seq_len, 1)))
-    scale_bits = max(0, math.ceil(math.log2(scale))) if scale is not None else 0
-    k_norm = terms.NOTHING if k_bound == terms.NOTHING else (
-        0 if k_apart.unit_norm else k_bound + half_key_bits)
-    q_norm = terms.NOTHING if q_bound == terms.NOTHING else (
-        scale_bits if q_apart.unit_norm else q_bound + half_key_bits + scale_bits)
-    if q_norm != terms.NOTHING and k_norm != terms.NOTHING and q_norm + k_norm > work_cap:
+    beta_bits = 0 if not has_beta else (beta_bound or 0)
+    beta_lift = max(0, beta_bits) if (has_beta and beta_bound != terms.NOTHING) else 0
+    h0_norm = terms.NOTHING if state_bound == terms.NOTHING else state_bound + half_key_bits
+    k_norm = _norm_bits(k_bound, k_apart, half_key_bits)
+    q_norm = _norm_bits(q_bound, q_apart, half_key_bits)
+    # Ungated `K @ K^T` and `Q @ K^T` stay finite even at zero `beta`/`Q`; operands stay within `v_cap`.
+    if ((v_bound != terms.NOTHING and v_bound + beta_lift > v_cap)
+            or (h0_norm != terms.NOTHING and h0_norm > v_cap)
+            or (k_norm != terms.NOTHING and (2 * k_norm > work_cap or k_norm > max(0, v_cap)))
+            or (q_norm != terms.NOTHING and (
+                q_norm > max(0, v_cap) or (k_norm != terms.NOTHING and q_norm + k_norm > work_cap)))):
         return False
     if delta:
-        if not (beta_apart.number and (beta_apart.sign > 0 or beta_bound == terms.NOTHING)):
+        k_norm_sq = 0 if k_apart.unit_norm else (2 * k_bound + key_bits)
+        if (not (beta_apart.number and (beta_apart.sign > 0 or beta_bound == terms.NOTHING))
+                or (k_bound != terms.NOTHING and beta_bound is not None and beta_bound != terms.NOTHING
+                    and beta_bound + k_norm_sq > terms.UNIT + 1)):
             return False
-        if k_bound != terms.NOTHING and beta_bound is not None and beta_bound != terms.NOTHING:
-            k_norm_sq = 0 if k_apart.unit_norm else (2 * k_bound + key_bits)
-            if beta_bound + k_norm_sq > terms.UNIT + 1:
-                return False
-    h0_norm = terms.NOTHING if state_bound == terms.NOTHING else state_bound + half_key_bits
-    beta_bits = 0 if not has_beta else (beta_bound or 0)
     write_bits = (terms.NOTHING if v_bound == terms.NOTHING or k_norm == terms.NOTHING
                   or (has_beta and beta_bound == terms.NOTHING)
                   else v_bound + k_norm + beta_bits + seq_bits)
     state_peak = (write_bits if h0_norm == terms.NOTHING
                   else h0_norm if write_bits == terms.NOTHING
                   else max(h0_norm, write_bits) + 1)
-    if state_peak == terms.NOTHING:
-        return True
-    return (state_peak + 2 <= work_cap
-            and (q_norm == terms.NOTHING or q_norm + state_peak + 2 <= work_cap)
-            and (k_norm == terms.NOTHING or k_norm + state_peak + 2 <= work_cap))
+    return (state_peak == terms.NOTHING
+            or (state_peak + 2 <= work_cap
+                and (q_norm == terms.NOTHING or q_norm + state_peak + 2 <= work_cap)
+                and (k_norm == terms.NOTHING or k_norm + state_peak + 2 <= work_cap)))
 
 
 def _positive_scalar(atom) -> float | None:
@@ -1327,45 +1356,61 @@ def _recurrence_chunk_call(*values, hooks, roles: tuple[tuple[str, int], ...], o
     return final, jnp.swapaxes(out, 0, 1)
 
 
-def _recurrence_taken(call: Callable, operands: Sequence[jcore.Var], options: Hashable) -> bool:
-    """Whether Dew's recurrence selector gives `call` a non-XLA kernel in forward (row 3450)."""
+def _recurrence_kernels(call: Callable, operands: Sequence[jcore.Var], options: Hashable, *,
+                        vjp: bool) -> frozenset[str] | None:
+    """Non-portable recurrence kernels selected for `call` in forward (`vjp=False`, None if none/refused) or
+    training (`vjp=True`, None if `KernelRefused`, empty set if backward uses portable `'xla'`)."""
     shapes = tuple(_shape(var) for var in operands)
-    key = ("recurrence", tuple((aval(var).shape, aval(var).dtype) for var in operands), options,
-           fusion.choice_context())
+    key = ("recurrence_vjp" if vjp else "recurrence_fwd",
+           tuple((aval(var).shape, aval(var).dtype) for var in operands), options, fusion.choice_context())
 
-    def probe() -> bool:
+    def probe() -> frozenset[str] | None:
         from dew.nn.kernels.selection import KernelRefused
 
         with generation.routes(alone=True) as found:
             try:
-                jax.eval_shape(call, *shapes)
-            except KernelRefused:
-                return False
-            return any(route.choice in (Choice.GATED_DELTA_RULE, Choice.SSD) and route.kernel not in KEPT
-                       for route in found)
-
-    return _cache.holding(_TAKEN, key, probe, fusion.DECISIONS_HELD)
-
-
-def _recurrence_vjp_ok(call: Callable, operands: Sequence[jcore.Var], options: Hashable) -> bool:
-    """Whether `call`'s reverse-mode VJP traces without `KernelRefused` (checked only after token equivalence
-    is proven so rejected candidates never trace a backward pass)."""
-    shapes = tuple(_shape(var) for var in operands)
-    key = ("recurrence_vjp", tuple((aval(var).shape, aval(var).dtype) for var in operands), options,
-           fusion.choice_context())
-
-    def probe() -> bool:
-        from dew.nn.kernels.selection import KernelRefused
-
-        with generation.routes(alone=True):
-            try:
                 out_shapes = jax.eval_shape(call, *shapes)
-                jax.eval_shape(lambda xs, ct: jax.vjp(call, *xs)[1](ct), shapes, out_shapes)
+                if vjp:
+                    jax.eval_shape(lambda xs, ct: jax.vjp(call, *xs)[1](ct), shapes, out_shapes)
             except KernelRefused:
-                return False
-        return True
+                return None
+            kernels = frozenset(route.kernel for route in found
+                                if route.choice in (Choice.GATED_DELTA_RULE, Choice.SSD)
+                                and route.kernel not in KEPT)
+            return kernels if (vjp or kernels) else None
 
-    return _cache.holding(_TAKEN, key, probe, fusion.DECISIONS_HELD)
+    return _cache.holding(_RECURRENCE_ROUTES, key, probe, fusion.DECISIONS_HELD)
+
+
+def _recurrence_route_admits(
+    call: Callable, operands: Sequence[jcore.Var], options: Hashable, hooks, *,
+    state_bound: terms.Magnitude | None, state_apart: terms.Apart,
+    q_bound: terms.Magnitude | None, q_apart: terms.Apart,
+    k_bound: terms.Magnitude | None, k_apart: terms.Apart,
+    v_bound: terms.Magnitude | None, v_apart: terms.Apart,
+    beta_bound: terms.Magnitude | None, beta_apart: terms.Apart,
+    seq_len: int, key_width: int, common, out_dtype, scale: float | None, delta: bool, has_beta: bool,
+) -> bool:
+    """Validate training VJP eligibility and numerical range against each ACTUAL selected forward and
+    training kernel's intermediate arithmetic (`_recurrence_inter_dtype`), checked only after token
+    equivalence is proven; under `precision="accurate"` leaves plain token scans intact."""
+    if generation.numerics().forms == "accurate":
+        return False
+    fwd_kernels = _recurrence_kernels(call, operands, options, vjp=False)
+    bwd_kernels = _recurrence_kernels(call, operands, options, vjp=True)
+    if fwd_kernels is None or bwd_kernels is None:
+        return False
+    active = fwd_kernels | bwd_kernels
+    if not active:
+        return False
+    for kernel in active:
+        inter_dtype = _recurrence_inter_dtype(kernel, hooks, common)
+        if inter_dtype is None or not _recurrence_bounded(
+                state_bound, state_apart, q_bound, q_apart, k_bound, k_apart, v_bound, v_apart,
+                beta_bound, beta_apart, seq_len=seq_len, key_width=key_width, inter_dtype=inter_dtype,
+                out_dtype=out_dtype, scale=scale, delta=delta, has_beta=has_beta):
+            return False
+    return True
 
 
 def _recurrence_candidates(
@@ -1380,6 +1425,7 @@ def _recurrence_candidates(
     _, value_heads, key_width, value_width = state_aval.shape
     seq_len = ys_aval.shape[0]
     state_bound, state_apart = held.get(operands[0]), apart.get(operands[0], terms.NOWHERE)
+    operand_facts = tuple((held.get(var), apart.get(var, terms.NOWHERE)) for var in operands)
     xs = operands[1:]
     body_xs = scan_body.jaxpr.invars[1:]
     for q_idx in q_cands:
@@ -1421,25 +1467,24 @@ def _recurrence_candidates(
                             and jnp.result_type(common, xs_avals[beta_idx].dtype) != common):
                         continue
                     for scale in scales:
-                        if not _recurrence_bounded(
-                                state_bound, state_apart, q_bound, q_apart, k_bound, k_apart,
-                                v_bound, v_apart, beta_bound, beta_apart,
-                                seq_len=seq_len, key_width=key_width, common=common, scale=scale,
-                                delta=delta, has_beta=beta_idx is not None):
-                            continue
                         hooks = recurrence.Hooks(decay=decay, scale=scale, delta=delta, write_gate=write_gate)
                         declared = functools.partial(_recurrence_step_declared, hooks=hooks, roles=roles,
                                                      out_dtype=ys_aval.dtype)
                         call = functools.partial(_recurrence_chunk_call, hooks=hooks, roles=roles,
                                                  out_dtype=ys_aval.dtype)
                         opts = (hooks, roles, ys_aval.dtype)
+                        admit = functools.partial(
+                            _recurrence_route_admits, call, operands, opts, hooks,
+                            state_bound=state_bound, state_apart=state_apart,
+                            q_bound=q_bound, q_apart=q_apart, k_bound=k_bound, k_apart=k_apart,
+                            v_bound=v_bound, v_apart=v_apart, beta_bound=beta_bound, beta_apart=beta_apart,
+                            seq_len=seq_len, key_width=key_width, common=common, out_dtype=ys_aval.dtype,
+                            scale=scale, delta=delta, has_beta=beta_idx is not None)
                         yield Candidate(
                             operands, outputs, call, declared,
-                            lambda call=call, operands=operands, opts=opts: _recurrence_taken(
-                                call, operands, opts),
-                            body=scan_body, key=opts,
-                            training_ok=lambda call=call, operands=operands, opts=opts: _recurrence_vjp_ok(
-                                call, operands, opts))
+                            lambda call=call, operands=operands, opts=opts: (
+                                _recurrence_kernels(call, operands, opts, vjp=False) is not None),
+                            body=scan_body, key=(opts, operand_facts), training_ok=admit)
 
 
 def _recurrences(index: fusion.Index, place: int) -> Iterator[Candidate]:

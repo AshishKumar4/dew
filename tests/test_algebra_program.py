@@ -2400,16 +2400,15 @@ def test_body_key_handles_float0_dag_scaling_equation_context_and_scoped_array_g
     assert arr_ref() is None
 
 
-def test_body_key_distinguishes_factory_callable_dataclasses_and_norm_rejects_permuting_reshape():
-    """Factory-made callable dataclasses with identical qualnames and fields never collide in structural body
-    keys (`terms.body_key` / `dew.jit` with `pure_callback`), and `_NormTrack` rejects permuting reshapes
-    (`dimensions != identity`) that swap batch/head axes of a norm denominator."""
+def test_body_key_distinguishes_callable_dataclasses_and_norm_rejects_bad_layouts():
+    """Executable callable dataclasses (factory-made AND same-class stateless `eq=False` distinguishing by
+    `self is first`) never reuse structurally in `_STRUCTURAL_CLOSED` and keep distinct in-process digests;
+    `_NormTrack` rejects both permuting reshapes and singleton-axis broadcast expansion."""
     import dataclasses
 
     import dew
 
-    # 1. Zero-field callable dataclasses from one factory keep distinct callback semantics via dew.jit.
-    def make_callback(offset: float):
+    def make_factory_callback(offset: float):
         @dataclasses.dataclass(frozen=True)
         class OffsetCallback:
             def __call__(self, arr):
@@ -2417,8 +2416,15 @@ def test_body_key_distinguishes_factory_callable_dataclasses_and_norm_rejects_pe
 
         return OffsetCallback()
 
-    cb1, cb2 = make_callback(1.0), make_callback(2.0)
+    @dataclasses.dataclass(frozen=True, eq=False)
+    class IdentityCallback:
+        def __call__(self, arr):
+            return arr + np.float32(1.0 if self is id_first else 2.0)
+
+    id_first, id_second = IdentityCallback(), IdentityCallback()
     rms_shapes = (jax.ShapeDtypeStruct((256, 256), jnp.bfloat16), jax.ShapeDtypeStruct((256,), jnp.bfloat16))
+    x_in = jnp.ones((256, 256), jnp.bfloat16)
+    w_in = jnp.ones((256,), jnp.bfloat16)
 
     def make_body(cb):
         def fn(x, w):
@@ -2427,19 +2433,19 @@ def test_body_key_distinguishes_factory_callable_dataclasses_and_norm_rejects_pe
 
         return fn
 
-    f1, f2 = make_body(cb1), make_body(cb2)
-    c1, c2 = jax.make_jaxpr(f1)(*rms_shapes), jax.make_jaxpr(f2)(*rms_shapes)
-    assert terms.body_key(c1) != terms.body_key(c2)
-    assert terms.jaxpr_digest(c1, in_process=True) != terms.jaxpr_digest(c2, in_process=True)
-    x_in = jnp.ones((256, 256), jnp.bfloat16)
-    w_in = jnp.ones((256,), jnp.bfloat16)
-    with generation.assumed("sm90"):
-        r1 = program._closed(c1, accurate=False, saturation=algebra.SATURATION, kernels=True)
-        r2 = program._closed(c2, accurate=False, saturation=algebra.SATURATION, kernels=True)
-    assert r1.jaxpr != r2.jaxpr
-    y1, y2 = dew.jit(f1)(x_in, w_in), dew.jit(f2)(x_in, w_in)
-    np.testing.assert_array_equal(np.asarray(y1), np.full((256, 256), 2.0, np.float32))
-    np.testing.assert_array_equal(np.asarray(y2), np.full((256, 256), 3.0, np.float32))
+    for cb1, cb2 in ((make_factory_callback(1.0), make_factory_callback(2.0)), (id_first, id_second)):
+        f1, f2 = make_body(cb1), make_body(cb2)
+        c1, c2 = jax.make_jaxpr(f1)(*rms_shapes), jax.make_jaxpr(f2)(*rms_shapes)
+        assert terms.body_key(c1) is None and terms.body_key(c2) is None
+        assert terms.jaxpr_digest(c1, in_process=True) != terms.jaxpr_digest(c2, in_process=True)
+        with generation.assumed("sm90"):
+            r1 = program._closed(c1, accurate=False, saturation=algebra.SATURATION, kernels=True)
+            r2 = program._closed(c2, accurate=False, saturation=algebra.SATURATION, kernels=True)
+        assert r1.jaxpr != r2.jaxpr
+        y1, y2 = dew.jit(f1)(x_in, w_in), dew.jit(f2)(x_in, w_in)
+        np.testing.assert_array_equal(np.asarray(y1), np.full((256, 256), 2.0, np.float32))
+        np.testing.assert_array_equal(np.asarray(y2), np.full((256, 256), 3.0, np.float32))
+
     # 2. A same-shape permuting reshape `(0, 2, 1, 3)` on a norm denominator proves no unit bound.
     def swapped_norm(x):
         denom = jnp.sum(jnp.square(x), axis=-1, keepdims=True) + jnp.float32(1e-6)
@@ -2447,7 +2453,18 @@ def test_body_key_distinguishes_factory_callable_dataclasses_and_norm_rejects_pe
         return x * jax.lax.rsqrt(swapped)
 
     closed_swap = jax.make_jaxpr(swapped_norm)(jax.ShapeDtypeStruct((4, 2, 2, 8), jnp.float32))
-    held, apart = terms.proven(closed_swap.jaxpr, targets=closed_swap.jaxpr.outvars, deep=True)
-    out_var = closed_swap.jaxpr.outvars[0]
-    assert held[out_var] is None
-    assert not apart[out_var].unit_norm
+    swap_out = closed_swap.jaxpr.outvars[0]
+    held_s, apart_s = terms.proven(closed_swap.jaxpr, targets=(swap_out,), deep=True)
+    assert held_s[swap_out] is None and not apart_s[swap_out].unit_norm
+
+    # 3. Normalizing a singleton `[4, 2, 2, 1]` numerator and expanding its reciprocal to `[4, 2, 2, 64]`
+    # produces 64 copies of a unit scalar (squared norm 64) and must NOT be certified as `unit_norm`.
+    def expanded_singleton_norm(x):
+        denom = jnp.sum(jnp.square(x), axis=-1, keepdims=True) + jnp.float32(1e-6)
+        inv = jax.lax.broadcast_in_dim(jax.lax.rsqrt(denom), (4, 2, 2, 64), (0, 1, 2, 3))
+        return x * inv
+
+    closed_exp = jax.make_jaxpr(expanded_singleton_norm)(jax.ShapeDtypeStruct((4, 2, 2, 1), jnp.float32))
+    exp_out = closed_exp.jaxpr.outvars[0]
+    held_e, apart_e = terms.proven(closed_exp.jaxpr, targets=(exp_out,), deep=True)
+    assert held_e[exp_out] is None and not apart_e[exp_out].unit_norm

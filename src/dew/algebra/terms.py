@@ -754,8 +754,12 @@ def _in_process_param_key(value, *, reject_device: bool) -> Hashable:
         return ("partial", _in_process_param_key(value.func, reject_device=reject_device),
                 _in_process_param_key(value.args, reject_device=reject_device),
                 _in_process_param_key(value.keywords, reject_device=reject_device))
-    if isinstance(value, types.FunctionType):
+    if isinstance(value, (types.FunctionType, types.BuiltinFunctionType)):
         return "object", _named(kind), value
+    if callable(value) and not isinstance(value, (type, np.dtype)):
+        if reject_device:
+            raise _Unshareable
+        return "object", _named(kind), _Identity(value)
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return _dataclass_param_key(value, kind, reject_device=reject_device)
     if isinstance(value, (tuple, list)):
@@ -769,12 +773,6 @@ def _in_process_param_key(value, *, reject_device: bool) -> Hashable:
             (_in_process_param_key(name, reject_device=reject_device),
              _in_process_param_key(part, reject_device=reject_device))
             for name, part in value.items()), key=repr))
-    if callable(value) and not isinstance(value, (type, np.dtype)):
-        try:
-            hash(value)
-        except TypeError:
-            return "object", _named(kind), _Identity(value)
-        return "object", _named(kind), value
     return _parameter_key_other(value, kind)
 
 
@@ -1247,13 +1245,15 @@ class _NormTrack:
             self.pos_norm[out] = (entry[0], moved)
 
     def _unit_check(self, scaled: jcore.Var | jcore.Literal, divisor: jcore.Var | jcore.Literal,
-                    table: Mapping[jcore.Var, tuple[jcore.Var, tuple[int | None, ...]]]) -> tuple[bool, bool]:
+                    table: Mapping[jcore.Var, tuple[jcore.Var, tuple[int | None, ...]]],
+                    out_shape: tuple[int, ...]) -> tuple[bool, bool]:
         if not (isinstance(scaled, jcore.Var) and isinstance(divisor, jcore.Var)):
             return False, False
         if (entry := table.get(divisor)) is None:
             return False, False
         src, kept = entry
-        if self._canon(scaled) is not src or not _aligned_unit_axes(kept, len(_shape(scaled))):
+        if (self._canon(scaled) is not src or _shape(scaled) != out_shape
+                or not _aligned_unit_axes(kept, len(out_shape))):
             return False, False
         return True, bool(kept) and kept[-1] is None
 
@@ -1313,13 +1313,15 @@ class _NormTrack:
                 (self.inv_norm if prim is jax.lax.rsqrt_p else self.pos_norm)[out] = (entry[0], entry[1])
             return None
         if prim is jax.lax.mul_p and len(invars) == 2:
-            hit0, last0 = self._unit_check(invars[0], invars[1], self.inv_norm)
-            hit1, last1 = (False, False) if hit0 else self._unit_check(invars[1], invars[0], self.inv_norm)
+            out_shape = tuple(out_aval.shape)
+            hit0, last0 = self._unit_check(invars[0], invars[1], self.inv_norm, out_shape)
+            hit1, last1 = ((False, False) if hit0
+                           else self._unit_check(invars[1], invars[0], self.inv_norm, out_shape))
             if hit0 or hit1:
                 return UNIT + 1, _held_apart(
                     Apart(None, 0, number=True, finite=True, unit_norm=last0 or last1), out_aval.dtype)
         if prim is jax.lax.div_p and len(invars) == 2:
-            hit, last = self._unit_check(invars[0], invars[1], self.pos_norm)
+            hit, last = self._unit_check(invars[0], invars[1], self.pos_norm, tuple(out_aval.shape))
             if hit:
                 return UNIT + 1, _held_apart(
                     Apart(None, 0, number=True, finite=True, unit_norm=last), out_aval.dtype)
