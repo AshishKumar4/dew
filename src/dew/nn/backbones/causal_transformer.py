@@ -518,7 +518,8 @@ class CausalTransformer(LinearProducts):
             partial_rotary_factor=self._kind_rotary(kind),
             sinks=self.attention_sinks if kind.sinks is None else kind.sinks,
             qk_norm=self.qk_norm if kind.qk_norm is None else kind.qk_norm,
-            mixer=kind.mixer)
+            mixer=kind.mixer,
+            depth_sites=kind.depth_sites)
 
     def _kind_rotary(self, kind: LayerKind) -> float | None:
         """The fraction of a kind's head its rotary turns, None for all of
@@ -947,6 +948,7 @@ class CausalTransformer(LinearProducts):
             hyper_connections=None if spec.streams is None else self.hyper_connections,
             streams_at_ends=(False, False) if spec.streams is None else spec.streams,
             residual_site=spec.residual_site,
+            depth_sites=spec.kind.depth_sites,
             cross_pass=self.loop.messages if spec.messaged and self.loop is not None else None,
             dropout_rate=self.dropout_rate,
             remat=self.remat,

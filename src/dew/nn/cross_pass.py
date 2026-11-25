@@ -123,35 +123,41 @@ class CrossPassMerge(nn.Module):
         return merged_sites((self,), read, bank)[0]
 
 
-def merged_sites(merges: Sequence[CrossPassMerge], read: jax.Array, bank: jax.Array) -> tuple[jax.Array, ...]:
+def merged_sites(merges: Sequence[CrossPassMerge], read: jax.Array | tuple[jax.Array, ...], bank: jax.Array
+                 ) -> tuple[jax.Array, ...]:
     """Each of `merges`' merge of `bank` `[B, S, blocks, D]` into `read` `[B, S, D]` (a block's input sites
-    of one sublayer input, `DecoderBlock`'s), in `read`'s dtype: the bank read and normalized once for them
-    all and every site's depth query scored in one product (`depth_read`, row 12923), each site's controller
-    its own (`_merged`). Each merge's parameters are its own as `CrossPassMerge` declares them, so a saved
-    decoder loads as it is."""
+    of one sublayer input, `DecoderBlock`'s), or into each site's own of `read` given one a site (a layer
+    reading its depth a site at a time, `DecoderBlock.depth_sites`), in the reads' dtype: the bank read and
+    normalized once for them all and every site's depth query scored in one product (`depth_read`, row
+    12923), each site's controller its own (`_merged`). Each merge's parameters are its own as
+    `CrossPassMerge` declares them, so a saved decoder loads as it is."""
     first = merges[0]
     if any(merge.spec != first.spec or merge.norm_eps != first.norm_eps for merge in merges):
         raise ValueError("merges read one bank together only under one message spec and norm epsilon")
+    reads = read if isinstance(read, tuple) else (read,) * len(merges)
+    if len(reads) != len(merges):
+        raise ValueError(f"{len(reads)} reads for {len(merges)} sites' merges")
     spec, eps, depth = first.spec, first.norm_eps, first.depth
     if any(watched_or_owned(merge) or watched_or_owned(merge.depth) for merge in merges):
         # A merge a quantization may own (a rule over its depth mixture's path among them) or a caller
         # watches, it or its depth mixture, runs as it is, each apart.
-        return tuple(_merged(read, merge.depth(bank), merge.controller(), spec, eps) for merge in merges)
+        return tuple(_merged(each, merge.depth(bank), merge.controller(), spec, eps)
+                     for each, merge in zip(reads, merges, strict=True))
 
     # The read's and the bank's cotangents leave only with the merges' parameters' gradients formed, their
     # states recomputed from their operands in the reverse mode (`portable_formed`): XLA otherwise puts the
     # controllers' low-rank products' and the depth queries' gradients off to the step's end, holding those
     # states live across layers and an exit-gated loop's unrolled passes (row 11713).
-    def merged(read, bank, parameters):
-        wide = at_least_fp32(read.dtype)
+    def merged(reads, bank, parameters):
+        wide = at_least_fp32(reads[0].dtype)
         queries = jnp.stack([scale.astype(wide) * kernel[:, 0].astype(wide)
                              for scale, kernel, *_ in parameters], axis=1)
-        mixed = depth_read(bank.astype(read.dtype), queries, norm_eps=depth.norm_eps,
+        mixed = depth_read(bank.astype(reads[0].dtype), queries, norm_eps=depth.norm_eps,
                            normalize_values=depth.normalize_values)
-        return tuple(_merged(read, mixed[:, :, site], controller, spec, eps)
-                     for site, (_, _, *controller) in enumerate(parameters))
+        return tuple(_merged(each, mixed[:, :, site], controller, spec, eps)
+                     for site, (each, (_, _, *controller)) in enumerate(zip(reads, parameters, strict=True)))
     parameters = tuple((merge.depth.scale, merge.depth.kernel, *merge.controller()) for merge in merges)
-    return portable_formed(merged)(read, bank, parameters)
+    return portable_formed(merged)(reads, bank, parameters)
 
 
 def _merged(read: jax.Array, mixed: jax.Array, controller, spec: CrossPass, eps: float) -> jax.Array:
