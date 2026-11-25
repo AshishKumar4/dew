@@ -988,14 +988,16 @@ def test_a_laid_out_row_reduction_issues_its_butterfly_once(laid_out, rounds, wh
     assert fixed.operations == 64 * 64 - held + rounds * held + 64, (fixed, held)
 
 
-@pytest.mark.parametrize("target", ["sm90", "sm100"])
+@pytest.mark.parametrize("target", ["sm90", "sm100", "sm100 placed"])
 def test_a_replicated_rows_reduction_combines_each_copy(target):
     """A 1 x 64 fp32 row a row at a time (`swizzling._row_layout`: two values a lane, every warp of the
     warpgroup a copy) summed along it: each of the 128 threads combines its two values, then five rounds
     across the warp's 32 lanes, a shuffle and a combine each, 768 combines where the row's 64 elements
     alone counted 576 (the review of lane/toolkit ca6da710b, P2). Its maximum alike on a Hopper, and on a
     datacenter Blackwell by one `redux.sync` across the warp, the elements' price (the review of 8d026cf4a,
-    P2; Mosaic GPU's float `redux` is compute capability 10.x's alone, train 1286's review)."""
+    P2; Mosaic GPU's float `redux` is compute capability 10.x's alone, train 1286's review), assumed or
+    placed on a compile-only mesh's abstract device unassumed, whose capability Mosaic GPU reads (the
+    review of lane/toolkit 4d9a4198c)."""
     from dew.nn.kernels.templates import swizzling
 
     def body(out_ref, smem):
@@ -1003,12 +1005,16 @@ def test_a_replicated_rows_reduction_combines_each_copy(target):
         out_ref[...] = reduce(row, axis=1)
 
     butterfly = Work(operations=128 * (1 + 5), shuffles=128 * 5)
+    generation_named = target.split()[0]
+    placed = (jax.sharding.use_abstract_mesh(generation.gpu_mesh(jax.sharding.AbstractMesh((1,), ("data",)),
+                                                                generation_named))
+              if target.endswith("placed") else generation.assumed(generation_named))
     for reduce, work in ((jnp.sum, butterfly),
-                         (jnp.max, Work(operations=64) if target == "sm100" else butterfly)):
+                         (jnp.max, Work(operations=64) if generation_named == "sm100" else butterfly)):
         launch = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((1,), jnp.float32), num_threads=1,
                               thread_name="wg", scratch_types=[plgpu.SMEM((1, 64), jnp.float32)])
         traced = jax.make_jaxpr(launch)().jaxpr
-        with generation.assumed(target):
+        with placed:
             fixed = emission.emitted(traced, 1, "wg", forms=emission.ACCURATE_FORMS).roles[0].fixed
         assert (fixed.operations, fixed.shuffles) == (work.operations, work.shuffles), (reduce, fixed)
 
@@ -1096,17 +1102,27 @@ def test_a_compile_only_gpu_mesh_lowers_for_cuda_unassumed():
 
 def test_a_devices_lowering_platform_is_one_rule_for_concrete_and_abstract_gpus():
     """The platform JAX lowers for on a GPU device, one rule (`programs.lowering_platform`) the count reads
-    too (`generation.lowering_platform`): a client's ROCm build's `rocm`, an abstract device's (a compile-only
-    mesh's, no client) `cuda` where it states an NVIDIA compute capability and None where it states none
-    (train 1286's review: generation's own rule read a concrete ROCm device as unnamed)."""
+    too (`generation.lowering_platform`): a client's ROCm, oneAPI or CUDA build's by its version, else `cuda`
+    where the device states an NVIDIA compute capability (a compile-only client's, an abstract device's of
+    a compile-only mesh, no client) and None where it states none (train 1286's review: generation's own
+    rule read a concrete ROCm device as unnamed; the review of lane/toolkit 4d9a4198c: any other client
+    read as CUDA's)."""
     from types import SimpleNamespace
 
     from jax._src.mesh import AbstractDevice
 
     from dew.nn import programs
 
-    rocm = SimpleNamespace(platform="gpu", client=SimpleNamespace(platform_version="rocm 6.4.1"))
-    assert programs.lowering_platform(rocm) == "rocm"
+    def device(version: str, capability: str | None = None):
+        return SimpleNamespace(platform="gpu", client=SimpleNamespace(platform_version=version),
+                               compute_capability=capability)
+
+    assert programs.lowering_platform(device("rocm 6.4.1", "gfx942")) == "rocm"
+    assert programs.lowering_platform(device("oneapi 2025.1")) == "oneapi"
+    assert programs.lowering_platform(device("cuda 12090", "9.0")) == "cuda"
+    # A compile-only client's version, its device kind, names no platform: its capability does.
+    assert programs.lowering_platform(device("NVIDIA H100", "9.0")) == "cuda"
+    assert programs.lowering_platform(device("a GPU")) is None
     assert programs.lowering_platform(AbstractDevice("NVIDIA H100", 132, "gpu", "9.0")) == "cuda"
     assert programs.lowering_platform(AbstractDevice("a GPU", 1, "gpu")) is None
 
