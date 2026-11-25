@@ -613,9 +613,9 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
     def added_into(self, acc, value, interpret: bool):
         raise NotImplementedError(f"{self._HOME}; nothing adds a register tile into one")
 
-    def product_with[T](self, lhs, rhs, shape: tuple[int, int], between: Callable[[], T], *,
-                        pending: int = 0) -> tuple[T, jax.Array]:
-        del lhs, rhs, shape, between, pending
+    def product_with[T](self, lhs, rhs, shape: tuple[int, int],
+                        between: Callable[[], T]) -> tuple[T, jax.Array]:
+        del lhs, rhs, shape, between
         raise NotImplementedError(f"{self._HOME}; a fresh product takes the launch's, not its own")
 
     def registers_product(self, lhs, rhs):
@@ -1395,10 +1395,8 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
         return self.summed((lhs.shape[0], rhs.shape[1]), lambda acc: self.register_products(
             acc, (lhs,), rhs))
 
-    def product_with[T](self, lhs, rhs, shape: tuple[int, int], between: Callable[[], T], *,
-                        pending: int = 0) -> tuple[T, jax.Array]:
-        if pending:
-            raise ValueError(f"{type(self).__name__}.product_with takes pending=0, got {pending}")
+    def product_with[T](self, lhs, rhs, shape: tuple[int, int],
+                        between: Callable[[], T]) -> tuple[T, jax.Array]:
         held: list[T] = []
 
         def issue(acc: Accumulator) -> Accumulator:
