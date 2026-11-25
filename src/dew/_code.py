@@ -239,13 +239,13 @@ def _held(value) -> Sequence[object]:
         found.append(current)
         if dataclasses.is_dataclass(current) and not isinstance(current, type):
             pending.extend(getattr(current, field.name) for field in dataclasses.fields(current))
-        elif not isinstance(current, type) and stated_class(type(current)) and hasattr(current, "__dict__"):
-            # A plain class of Dew's holds its values as attributes (an objective's criterion, its model).
-            pending.extend(vars(current).values())
         elif isinstance(current, (tuple, list, frozenset, set)):
             pending.extend(current)
         elif isinstance(current, Mapping):
             pending.extend(current.values())
+        elif not isinstance(current, type) and stated_class(type(current)):
+            # A plain class of Dew's holds its values as attributes (an objective's criterion, its model).
+            pending.extend(vars(current).values())
     return found
 
 
