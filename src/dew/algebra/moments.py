@@ -161,9 +161,10 @@ _TANGENT_DIV = ratios.Ratio(
     ((1.0, (("v", 0), ("v", 1))),), ((1.0, (("v", 2),)),), 0, reduced=True, units=windows.Units())
 """Elementwise `dtw * numerator / sn` along a leading unit axis (`_safe_tangent_div`)."""
 
-_TANGENT_QUAD = ratios.Ratio(
-    ((1.0, (("v", 0), ("v", 1), ("v", 2))),), ((1.0, (("v", 3),)),), 0, reduced=True, units=windows.Units())
-"""Elementwise `dtw * cx * cy / sn` along a leading unit axis (`_safe_tangent_quad`)."""
+_TANGENT_COV = ratios.Ratio(
+    ((1.0, (("v", 0), ("v", 1), ("v", 2))), (-1.0, (("v", 0), ("v", 3)))),
+    ((1.0, (("v", 4),)),), 0, reduced=True, units=windows.Units())
+"""Elementwise `(dtw * cx * cy - dtw * cov) / sn` along a leading unit axis (`_safe_tangent_cov`)."""
 
 
 def _safe_tangent_div(dtw: jax.Array, numerator: jax.Array, sn: jax.Array) -> jax.Array:
@@ -172,10 +173,11 @@ def _safe_tangent_div(dtw: jax.Array, numerator: jax.Array, sn: jax.Array) -> ja
     return ratios.ratio([dtw[None], numerator[None], sn[None]], _TANGENT_DIV)
 
 
-def _safe_tangent_quad(dtw: jax.Array, cx: jax.Array, cy: jax.Array, sn: jax.Array) -> jax.Array:
-    """Range-safe `dtw * cx * cy / sn` via singleton `ratios.ratio_p`, keeping primal and higher-order
-    mixed derivatives in one scaled-product operation without primal-only normalization."""
-    return ratios.ratio([dtw[None], cx[None], cy[None], sn[None]], _TANGENT_QUAD)
+def _safe_tangent_cov(dtw: jax.Array, cx: jax.Array, cy: jax.Array, cov: jax.Array,
+                      sn: jax.Array) -> jax.Array:
+    """Range-safe `(dtw * cx * cy - dtw * cov) / sn` via one singleton `ratios.ratio_p`, subtracting both
+    signed terms unlanded before dividing by `sn` so overflow, underflow, and cancellation stay exact."""
+    return ratios.ratio([dtw[None], cx[None], cy[None], cov[None], sn[None]], _TANGENT_COV)
 
 
 def _cov_tangent_tile(
@@ -196,26 +198,7 @@ def _cov_tangent_tile(
     pw_cy = _weighted_term(tw, jnp.where((tw > 0) | jnp.isfinite(cy), cy, 0.0), sn)
     pw_cx = _weighted_term(tw, jnp.where((tw > 0) | jnp.isfinite(cx), cx, 0.0), sn)
     cov_term = jnp.where(pos, cov[..., None], 0.0)
-    limits = jnp.finfo(cx.dtype)
-    half_max = jnp.asarray(0.5 * limits.max, cx.dtype)
-    tiny = jnp.asarray(limits.tiny, cx.dtype)
-    cx_sg, cy_sg = jax.lax.stop_gradient(cx), jax.lax.stop_gradient(cy)
-    big_sg = jnp.maximum(jnp.abs(cx_sg), jnp.abs(cy_sg))
-    sml_sg = jnp.minimum(jnp.abs(cx_sg), jnp.abs(cy_sg))
-    prod_ovf = (big_sg > 1.0) & (sml_sg > half_max / jnp.maximum(big_sg, 1.0))
-    prod_unf = (big_sg != 0) & (sml_sg != 0) & (big_sg * sml_sg < tiny)
-    prod_split = prod_ovf | prod_unf
-    cx_safe = jnp.where(prod_split, 0.0, cx)
-    cy_safe = jnp.where(prod_split, 0.0, cy)
-    d_cov_no = _safe_tangent_div(jnp.where(prod_split, 0.0, dtw),
-                                 cx_safe * cy_safe - jnp.where(prod_split, 0.0, cov_term),
-                                 jnp.where(prod_split, 1.0, sn))
-    dtw_sp = jnp.where(prod_split, dtw, 0.0)
-    sn_sp = jnp.where(prod_split, sn, 1.0)
-    d_cov_sp = (_safe_tangent_quad(dtw_sp, jnp.where(prod_split, cx, 0.0),
-                                   jnp.where(prod_split, cy, 0.0), sn_sp)
-                - _safe_tangent_div(dtw_sp, jnp.where(prod_split, cov_term, 0.0), sn_sp))
-    d_cov_w = jnp.where(prod_split, d_cov_sp, d_cov_no)
+    d_cov_w = _safe_tangent_cov(dtw, cx, cy, cov_term, sn)
     d_cov_raw = jnp.sum(pw_cy * dtx + pw_cx * dty + d_cov_w, axis=-1)
     return d_mx, d_my, d_cov_raw, jnp.sum(pw_cy, axis=-1), jnp.sum(pw_cx, axis=-1), jnp.sum(dtw, axis=-1)
 
