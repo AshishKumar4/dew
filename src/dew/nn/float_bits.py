@@ -231,8 +231,17 @@ def widened_exactly(x: jax.typing.ArrayLike, dtype: DTypeLike) -> jax.Array:
     def apply(_, moving):
         # Traced where JAX evaluates the map, which may lie outside its caller's x64 scope (`float64_sum`'s).
         with jax.enable_x64(new_val=True) if resolved == np.dtype(np.float64) else contextlib.nullcontext():
+            sharding = jax.typeof(moving).sharding
+            if isinstance(sharding, jax.sharding.NamedSharding) and (
+                    sharding.spec.reduced or sharding.spec.unreduced):
+                axes = frozenset(sharding.spec.reduced) | frozenset(sharding.spec.unreduced)
+                spec = sharding.spec.update(partitions=())
+                with jax.sharding.use_abstract_mesh(sharding.mesh):
+                    return jax.shard_map(
+                        lambda part: _widened_bits(part, resolved),
+                        mesh=sharding.mesh, in_specs=spec, out_specs=spec,
+                        axis_names=axes, check_vma=False)(moving)
             return _widened_bits(moving, resolved)
-
     # Its type strong, as an explicit conversion's: a weak one would yield to a strong float32 it meets.
     return linear_map(apply, lambda _, cotangent: cast_back(cotangent, source), (), x,
                       out_aval=source.update(dtype=resolved, weak_type=False), summed_first=True)
@@ -244,6 +253,13 @@ def cast_back(cotangent: jax.Array, source: ShapedArray) -> jax.Array:
     pullback runs in."""
     wide = cotangent.dtype == np.dtype(np.float64)
     with jax.enable_x64(new_val=True) if wide else contextlib.nullcontext():
+        sharding = source.sharding
+        if isinstance(sharding, jax.sharding.NamedSharding) and (
+                sharding.spec.reduced or sharding.spec.unreduced):
+            # `jax.linear_transpose` typechecks cotangents against `out_avals` instead of
+            # `out_avals.to_ct_aval()`, rejecting `{U:...}` for a `{R:...}` source; `astype`'s
+            # `convert_element_type` preserves the cotangent's sharding and unreduced/reduced axes.
+            return cotangent if cotangent.dtype == jax.dtypes.float0 else cotangent.astype(source.dtype)
         # The source's own aval: its placement, manual axes and weakness, which the transpose restores.
         (back,) = jax.linear_transpose(lambda moving: moving.astype(cotangent.dtype), source)(cotangent)
     return back
