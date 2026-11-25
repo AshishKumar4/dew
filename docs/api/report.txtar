@@ -412,7 +412,6 @@ dew.config.DecoderRunConfig
   suites: Annotated[collections.abc.Mapping[str, dew.config.Suite], PrimitiveConstructorSpec] = builtins.dict()
   val_summaries: Annotated[tuple[dew.scores.Summary, ...], PrimitiveConstructorSpec] = ()
   loop: Annotated[dew.nn.backbones.decoder_stack.Loop | None, Suppress] = None
-  earlier_loop: Annotated[dew.config.earlier.LoopChange | None, Suppress] = None
   passes: Annotated[PassPolicy | None, Suppress] = None
 dew.config.MetricConfig
   name: str
@@ -476,18 +475,6 @@ dew.config.diffusion.FlowRolloutConfig
   groups: int = 4
   steps: int = 11
   train_steps: int | None = None
-dew.config.earlier.LoopChange
-  layers: tuple[int, int] | None = None
-  backprop_steps: int | None = None
-  remat: bool = False
-  implicit: bool = False
-  theta_per_pass: bool = False
-  exit_gate: bool = False
-  exit_threshold: float | None = None
-  messages: bool = False
-  message_block_size: int | None = None
-  message_rank: int | None = None
-  message_additive: bool | None = None
 dew.config.env.EnvConfig
   name: str
   fields: JsonDict = builtins.dict()
@@ -565,7 +552,6 @@ dew.config.lm.LMRunConfig
   suites: Annotated[collections.abc.Mapping[str, dew.config.Suite], PrimitiveConstructorSpec] = builtins.dict()
   val_summaries: Annotated[tuple[dew.scores.Summary, ...], PrimitiveConstructorSpec] = ()
   loop: Annotated[dew.nn.backbones.decoder_stack.Loop | None, Suppress] = None
-  earlier_loop: Annotated[dew.config.earlier.LoopChange | None, Suppress] = None
   passes: Annotated[PassPolicy | None, Suppress] = None
   tokenizer: str = 'byte'
   prompt: str = ''
@@ -682,7 +668,6 @@ dew.decision.config.DecisionRunConfig
   suites: Annotated[collections.abc.Mapping[str, dew.config.Suite], PrimitiveConstructorSpec] = builtins.dict()
   val_summaries: Annotated[tuple[dew.scores.Summary, ...], PrimitiveConstructorSpec] = ()
   loop: Annotated[dew.nn.backbones.decoder_stack.Loop | None, Suppress] = None
-  earlier_loop: Annotated[dew.config.earlier.LoopChange | None, Suppress] = None
   passes: Annotated[PassPolicy | None, Suppress] = None
   pretrained: str = 'convaiinnovations/laya'
   subfolder: str | None = None

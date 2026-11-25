@@ -913,7 +913,7 @@ def test_a_resume_compares_a_model_kind_named_remat(tmp_path):
 def test_a_resume_recomputes_its_loop_freely_as_a_saved_run_did(tmp_path):
     """A run's loop's recompute (`Loop.remat`) says how its passes execute, not what they compute: a run
     resumes with it changed, and refused a loop that computes otherwise (more passes); a saved run whose
-    earlier record changed its checkpoint's loop's recompute alone (`loop_remat`, `LoopChange.remat`)
+    earlier record changed its checkpoint's loop's recompute alone (`loop_remat`, `_LoopChange.remat`)
     resumes stating no loop, and one that changed what it computes (an exit gate) is refused (row 11937's
     review: it was refused as a changed loop)."""
     from test_decision_recipe import QWEN

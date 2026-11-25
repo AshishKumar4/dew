@@ -1051,17 +1051,17 @@ def test_a_run_saved_before_its_retired_and_unsettable_fields_loads_as_it_traine
     assert earlier_run(opaque)["fields"]["payload"] == payload
     for record, additive in ((earlier, False), (today, True)):
         stated = {**record, "fields": {**record["fields"], "loop_message_additive": additive}}
-        loop = earlier_run(stated)["fields"]["earlier_loop"]
+        loop = earlier_run(stated)["fields"]["_earlier_loop"]
         assert loop["fields"]["message_additive"] is additive, (record is today, additive)
 
 def test_a_run_saved_with_its_loops_choices_flat_loads_and_loops_as_it_did(tmp_path):
     """A decoder run saved while it changed its checkpoint's loop a choice at a time, by flat fields
     (`loop_steps`, `loop_layers`, `loop_exit_gate`, its sampled count's `loop_steps_*`; row 11937 states a
-    run's loop whole and its passes apart), loads: its changes its loop's (`LoopChange`), its count its
+    run's loop whole and its passes apart), loads: its changes its loop's (`_LoopChange`), its count its
     passes, and it loops a checkpoint with no loop as it did, its gate's exit objective weighed as before."""
     from test_decision_recipe import QWEN
 
-    from dew.config.earlier import LoopChange
+    from dew.config.earlier import _LoopChange
     from dew.config.lm import LMRunConfig
     from dew.interop import Pretrained
     from dew.nn.backbones.decoder_stack import Loop
@@ -1073,7 +1073,7 @@ def test_a_run_saved_with_its_loops_choices_flat_loads_and_loops_as_it_did(tmp_p
     path.write_text(json.dumps({**today, "fields": {**today["fields"], "loop_steps": 2, "loop_layers": [1, 2],
                                                     "loop_exit_gate": True}}))
     loaded = LMRunConfig.load(str(path))
-    assert loaded.earlier_loop == LoopChange(layers=(1, 2), exit_gate=True) and loaded.passes == 2
+    assert loaded._earlier_loop == _LoopChange(layers=(1, 2), exit_gate=True) and loaded.passes == 2
     assert loaded.exit_settings() == {"exit_entropy": EXIT_ENTROPY}
     looped = loaded.looped(Pretrained.load(QWEN, dtype="float32"))
     assert looped.model.language_model.loop == Loop(2, step_norm=False, layers=(1, 2), exit_gate=True)

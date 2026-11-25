@@ -924,7 +924,7 @@ EARLIER_LOOP_FIELDS = ("loop_layers", "loop_backprop_steps", "loop_remat", "loop
                        "loop_theta_per_pass", "loop_exit_gate", "loop_exit_threshold", "loop_messages",
                        "loop_message_block_size", "loop_message_rank", "loop_message_additive")
 """A decoder run's flat fields that changed its checkpoint's loop one choice at a time, which an earlier Dew
-recorded (`DecoderRunConfig` before row 11937), read as their `LoopChange`."""
+recorded (`DecoderRunConfig` before row 11937), read as their `_LoopChange`."""
 
 EARLIER_PASS_FIELDS = ("loop_steps", "loop_steps_sample", "loop_steps_mean", "loop_steps_dispersion",
                        "loop_steps_max")
@@ -932,11 +932,11 @@ EARLIER_PASS_FIELDS = ("loop_steps", "loop_steps_sample", "loop_steps_mean", "lo
 
 
 @dataclasses.dataclass(frozen=True)
-class LoopChange:
+class _LoopChange:
     """The changes a decoder run saved by an earlier Dew made to its checkpoint's loop, one choice at a
     time (`EARLIER_LOOP_FIELDS`), each None or false keeping the checkpoint's own, which its run's `loop`
     holds where its record is read (`earlier_run`): a run states its loop whole since row 11937
-    (`DecoderRunConfig.loop`). Read only from a saved record (`DecoderRunConfig.earlier_loop`); carried to
+    (`DecoderRunConfig.loop`). Read only from a saved record (`DecoderRunConfig._earlier_loop`); carried to
     1.0 (ledger 1552)."""
 
     layers: tuple[int, int] | None = None
@@ -995,7 +995,7 @@ class LoopChange:
 
 def _earlier_loop(fields: Mapping[str, JSON]) -> dict[str, JSON]:
     """A decoder run's fields with its earlier flat loop fields (`EARLIER_LOOP_FIELDS`,
-    `EARLIER_PASS_FIELDS`) read as its `earlier_loop`, their `LoopChange`, and its `passes`."""
+    `EARLIER_PASS_FIELDS`) read as its `_earlier_loop`, their `_LoopChange`, and its `passes`."""
     kept = {key: value for key, value in fields.items()
             if key not in EARLIER_LOOP_FIELDS and key not in EARLIER_PASS_FIELDS}
     # A choice stated: a value, or a flag set; the messages' additive term's false its own choice.
@@ -1003,7 +1003,7 @@ def _earlier_loop(fields: Mapping[str, JSON]) -> dict[str, JSON]:
                if fields.get(key) is not None
                and (fields[key] is not False or key == "loop_message_additive")}
     if changed:
-        kept["earlier_loop"] = {"class": registry.import_path(LoopChange), "fields": changed}
+        kept["_earlier_loop"] = {"class": registry.import_path(_LoopChange), "fields": changed}
     if fields.get("loop_steps_sample") is not None:
         kept["passes"] = {"class": "dew.training.phase_passes:SampledPasses", "fields": {
             "mean": fields.get("loop_steps_mean"), "dispersion": fields.get("loop_steps_dispersion"),

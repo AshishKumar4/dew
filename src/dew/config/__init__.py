@@ -49,7 +49,7 @@ from dew.config.earlier import (
     LAYOUT_UNSETTABLE,
     MARKERS,
     MASKED_DECAY_MARK,
-    LoopChange,
+    _LoopChange,
     earlier_run,
     unmarked,
 )
@@ -763,9 +763,11 @@ class RunConfig:
     def _fields_record(self) -> dict[str, JSON]:
         """The record of every field but the chains (`to_dict`), which an override of the others
         writes without encoding the chains."""
+        # A private field (a saved record's translation, `_earlier_loop`) recorded where it holds one alone.
         with registry.recording():
             return {field.name: to_record(getattr(self, field.name), declared_type(type(self), field.name))
-                    for field in dataclasses.fields(self) if field.name not in CHAINS}
+                    for field in dataclasses.fields(self) if field.name not in CHAINS
+                    and not (field.name.startswith("_") and getattr(self, field.name) == field.default)}
 
     @classmethod
     def from_dict(cls, values: Mapping[str, object]) -> Self:
@@ -1710,9 +1712,10 @@ class DecoderRunConfig(RunConfig):
     one of its choices). A loop that gives its layers parameters of their own (an implicit loop's θ, an exit
     gate, the messages' merges) draws them at their zeros beside the loaded weights, so the decoder
     starts as the one loaded computes (`Pretrained.with_model`). None keeps the checkpoint's own."""
-    earlier_loop: Annotated[LoopChange | None, tyro.conf.Suppress] = None
+    _earlier_loop: Annotated[_LoopChange | None, tyro.conf.Suppress] = dataclasses.field(
+        default=None, kw_only=True)
     """A saved run's changes to its checkpoint's loop, a choice at a time, as a Dew before the run stated its
-    loop whole recorded them (`dew.config.earlier.LoopChange`), which its record alone holds
+    loop whole recorded them (`dew.config.earlier._LoopChange`), which its record alone holds
     (`dew.config.earlier_run`); a run states its `loop`. Carried to 1.0 (ledger 1552)."""
     passes: Annotated[PassPolicy | None, tyro.conf.Suppress] = None
     """The passes the loop runs each step (`PassPolicy`): one count (an int); one count a phase of the
@@ -1724,9 +1727,9 @@ class DecoderRunConfig(RunConfig):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        if self.loop is not None and self.earlier_loop is not None:
+        if self.loop is not None and self._earlier_loop is not None:
             raise ValueError("a run states its loop whole (loop), or a saved run's record its changes to its "
-                             "checkpoint's (earlier_loop), not both")
+                             "checkpoint's (_earlier_loop), not both")
         if isinstance(self.passes, tuple) and self.data is not None:
             # Refused before anything loads: a count a phase the data reads in.
             phases = self.data.phase_count
@@ -1754,7 +1757,7 @@ class DecoderRunConfig(RunConfig):
     @property
     def loops(self) -> bool:
         """Whether the run asks anything of a loop (`looped`)."""
-        return self.loop is not None or self.earlier_loop is not None or self.passes is not None
+        return self.loop is not None or self._earlier_loop is not None or self.passes is not None
 
     def exit_settings(self) -> dict[str, float]:
         """The exit objective's weight an objective that trains a gate the run's loop draws (`Loop.exit_gate`)
@@ -1763,7 +1766,7 @@ class DecoderRunConfig(RunConfig):
         (a hazard of one half every pass), trained by nothing. None where the run states no gated loop."""
         from dew.nn.backbones.looping import EXIT_ENTROPY
 
-        held = self.loop if self.loop is not None else self.earlier_loop
+        held = self.loop if self.loop is not None else self._earlier_loop
         if held is None or not held.exit_gate:
             return {}
         stated = {} if self.objective is None else self.objective.fields
@@ -1777,11 +1780,13 @@ class DecoderRunConfig(RunConfig):
 
     def _resumed_as(self) -> Self:
         """`RunConfig._resumed_as`: its loop's passes recomputed in its backward or held (`Loop.remat`),
-        memory alone, read as held; and a saved run's change to its checkpoint's loop (`earlier_loop`) so,
+        memory alone, read as held; and a saved run's change to its checkpoint's loop (`_earlier_loop`) so,
         none where it changed that alone."""
         loop = None if self.loop is None else dataclasses.replace(self.loop, remat=False)
-        earlier = None if self.earlier_loop is None else dataclasses.replace(self.earlier_loop, remat=False)
-        return dataclasses.replace(self, loop=loop, earlier_loop=None if earlier == LoopChange() else earlier)
+        earlier = (None if self._earlier_loop is None
+                   else dataclasses.replace(self._earlier_loop, remat=False))
+        return dataclasses.replace(self, loop=loop,
+                                   _earlier_loop=None if earlier == _LoopChange() else earlier)
 
     def looped(self, start: "Pretrained") -> "Pretrained":
         """`start` with its block run as the run asks: under the run's loop (`loop`), at the run's pass
@@ -1792,9 +1797,9 @@ class DecoderRunConfig(RunConfig):
             return start
         from dew.nn.protocols import Looped, Looping
 
-        if self.earlier_loop is not None:
+        if self._earlier_loop is not None:
             # A saved run's loop changed a choice at a time, as an earlier Dew recorded it (`earlier_run`).
-            return self.earlier_loop.applied(start, self.passes, self.trainer.key)
+            return self._earlier_loop.applied(start, self.passes, self.trainer.key)
         model = start.model
         if not isinstance(model, Looping):
             raise ValueError(f"this {type(model).__name__} runs no loop: a run's loop or passes need a "
