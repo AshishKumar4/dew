@@ -361,6 +361,33 @@ def test_a_forms_inline_block_compiles_for_an_h100(form):
     assert not (failed := mosaic_failures(compile_mosaic_kernels([case], "sm90"))), failed
 
 
+def test_equal_calls_of_an_inline_form_take_one_body():
+    """Two calls of an inline form on equal operands (`inline_forms.satfinite_bf16`, `split_groups` at one
+    group) take one inline body, which `inline_work.body_work` counts once and holds by the body: a body
+    made afresh each call was counted afresh at every part (Train 1289's review, row 12991)."""
+    from jax._src.pallas.mosaic_gpu import primitives as gpu
+
+    from dew.nn import programs
+    from dew.nn.kernels.templates import bundles, inline_forms
+
+    layout = bundles.of("sm90", jnp.bfloat16).layout
+
+    def body(x_ref, out_ref):
+        tile = plgpu.layout_cast(x_ref[...], layout)
+        out_ref[...] = (inline_forms.satfinite_bf16(tile, layout).astype(jnp.float32)
+                        + inline_forms.satfinite_bf16(tile * 2, layout).astype(jnp.float32))
+        first, _ = inline_forms.split_groups(tile, 8, layout)
+        again, _ = inline_forms.split_groups(tile * 2, 8, layout)
+        out_ref[:, :32] = first + again
+
+    launch = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((64, 64), jnp.float32), num_threads=1,
+                          thread_name="wg")
+    traced = jax.make_jaxpr(launch)(jnp.zeros((64, 64), jnp.float32)).jaxpr
+    bodies = [equation.params["mgpu_fn"] for equation in programs.equations(traced)
+              if equation.primitive is gpu.inline_mgpu_p]
+    assert len(bodies) == 4 and len(set(map(id, bodies))) == 2, bodies
+
+
 @pytest.mark.parametrize("generation", ["sm90", "sm100", "sm120"])
 def test_a_saturating_narrowing_compiles_and_counts_a_conversion_a_pair(generation):
     """An fp32 tile narrowed to bf16 saturating (`inline_forms.satfinite_bf16`, PTX's
