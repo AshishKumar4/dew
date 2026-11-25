@@ -63,8 +63,9 @@ def test_a_dry_prepares_tests_past_its_recycle_bound_run_on_in_fresh_processes_a
     """A dry prepare's pytest that holds more than its bound (`tested`'s `recycle_at`, recycle.py) ends after
     the test running, and the tests left run in a fresh process, each test once, so what a process compiled
     is returned at its end: here a bound every process passes, each test its own process. The row is one,
-    every test's case in it, and red where a test of any of its processes failed; recorded by none
-    (`run_keys.record`), as what each process read is no one record's."""
+    every test's case in it, and red where a test of any of its processes failed; recorded as a blind watch's
+    (`run_keys.record`'s `opened` None), keyed by none, as what each process read is no one record's, its red
+    still beginning its next epoch and its green still writing its baseline."""
     middle = "    assert False\n" if failing else "    pass\n"
     written(tmp_path, {"test_heavy.py": "import os\n"
                                         "def ran():\n"
@@ -78,10 +79,12 @@ def test_a_dry_prepares_tests_past_its_recycle_bound_run_on_in_fresh_processes_a
     monkeypatch.setenv("ARMADA_ARTIFACTS", str(tmp_path / "artifacts"))
     out = tmp_path / "verdict.json"
     recorded = []
-    monkeypatch.setattr(ci.run_keys, "record", lambda *args: recorded.append(args))
+    monkeypatch.setattr(ci.run_keys, "record", lambda *args: recorded.append(args) or set())
     ci.tested("3.12", ["tests/test_heavy.py"], "", out, 600.0, "off", 5.0, "", {}, recycle_at=1)
     [row] = json.loads(out.read_text())["rows"]
-    assert recorded == []
+    # Recorded as a blind watch's (no inputs, so no key), its red's epoch and its green's baseline kept.
+    [(_, [recorded_row], *_, opened, _, _, _)] = recorded
+    assert opened is None and recorded_row["name"] == row["name"]
     assert len(set((tmp_path / "pids").read_text().split())) == 3
     assert sorted(row["tests"]) == [f"tests/test_heavy.py::test_{name}" for name in "abc"]
     assert row["exitCode"] == (1 if failing else 0)
@@ -103,6 +106,26 @@ def test_a_dry_prepares_process_that_crashes_after_its_report_ends_its_row_red(c
     [row] = json.loads(out.read_text())["rows"]
     assert row["exitCode"] == 1
     assert sorted(row["tests"]) == ["tests/test_crashes.py::test_a"]
+
+
+def test_a_recycled_rows_last_process_that_leaves_no_report_is_red(ci, tmp_path, monkeypatch):
+    """A dry prepare's row whose first process recycled after reporting, its last exiting 0 with no report of
+    its own (here its JUnit file removed as it exits), is red: an earlier process's cases are no evidence its
+    last one reported."""
+    written(tmp_path, {"test_unreported.py": "import atexit, os, sys\n"
+                                             "def test_a():\n    pass\n"
+                                             "def test_b():\n"
+                                             "    report = next(arg.split('=', 1)[1] for arg in sys.argv\n"
+                                             "                  if arg.startswith('--junitxml='))\n"
+                                             "    atexit.register(lambda: os.remove(report))\n"})
+    interpreter(tmp_path, "3.12")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ARMADA_ARTIFACTS", str(tmp_path / "artifacts"))
+    out = tmp_path / "verdict.json"
+    ci.tested("3.12", ["tests/test_unreported.py"], "", out, 600.0, "off", 5.0, "", {}, recorded=False,
+              recycle_at=1)
+    [row] = json.loads(out.read_text())["rows"]
+    assert row["exitCode"] != 0
 
 
 def test_a_report_its_killed_pytest_cut_short_greens_nothing_and_the_tasks_other_files_are_graded(

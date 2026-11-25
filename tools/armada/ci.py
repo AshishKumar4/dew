@@ -1476,7 +1476,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     peaks = [found for found in (progress.task_peak(host), peak_before) if found is not None]
     peak = max(peaks, default=None)
     cases, reported = reported_cases(report)
-    cases, reported = earlier + cases, reported or bool(earlier)
+    # Its last process's report is what says it reported: an earlier one's cases are no evidence of it.
+    cases = earlier + cases
     # How collection found each file: a file with no row is green only where every test it holds was set aside
     # by the selection, as pytest reported it (executed.py); a run that wrote no report greens nothing.
     counts = read_json(collection) or {}
@@ -1543,9 +1544,11 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     carried = set(wrote).union(*(written or []))
     if written is not None:
         written.append(set(wrote))
-    # A row run in more than one process is recorded by none: what each read is no one record's.
-    if recording and segments == 1 and (unnamed := run_keys.record(python, ran, log, common, network, opened,
-                                                                   unlisted, carried, began_in)):
+    # A row run in more than one process keeps no key, as a blind watch's (`opened` None): what each read is
+    # no one record's. Its red still begins its next epoch and its green still writes its baseline.
+    if recording and (unnamed := run_keys.record(python, ran, log, common, network,
+                                                 opened if segments == 1 else None, unlisted, carried,
+                                                 began_in)):
         out.write_text(json.dumps({"rows": rows + unbaselined(python, ran, unnamed)}))
     return 0
 
