@@ -1426,7 +1426,10 @@ def _system_back(a, k, v, dw, du, hi, lo, beta, taken, call: Call):
                                rhs_transposed=True, rhs_staged=True),
              product_fragments(call, (held, chunk, call.value_block), (held, call.value_block, chunk),
                                rhs_transposed=True, rhs_staged=True))],
-        [f32(chunk, chunk)] * 4 + masks(chunk, chunk)
+        # The adjoint's (`_wy_inverse_adjoint`): each product's fp32 sum beside the narrow one it read, then
+        # its result beside the pairs' decays. Four fp32 squares counted here, an sm120's gated delta net
+        # training claimed 260 registers, refused at every value block, where ptxas took 175 (row 13064).
+        [f32(chunk, chunk)] * 2 + held_tile(held, chunk, chunk) + masks(chunk, chunk)
         + largest_live_set(
             product_fragments(call, (held, chunk, chunk), (held, chunk, chunk), rhs_transposed=True,
                               lhs_staged=True),
