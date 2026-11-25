@@ -1397,13 +1397,14 @@ def test_recurrence_recognition_guards_range_tracers_tokens_and_training_vjp():
 
     # 3. Effect-free token-carry scans with 3 scanned arrays compile cleanly without touching `AbstractToken`.
     def token_scan(a, b, c):
-        return jax.lax.scan(lambda tok, xs: (jax.lax.after_all(tok), xs[0] + xs[1] + xs[2]),
-                            jax.lax.create_token(), (a, b, c))
+        _, ys = jax.lax.scan(lambda tok, xs: (jax.lax.after_all(tok), xs[0] + xs[1] + xs[2]),
+                             jax.lax.create_token(), (a, b, c))
+        return ys
 
     xs_tok = tuple(jnp.ones((4, 2), jnp.float32) for _ in range(3))
     with generation.assumed("sm90"):
         assert dew.jit(token_scan).trace(*xs_tok) is not None
-    _, tok_ys = dew.jit(token_scan)(*xs_tok)
+    tok_ys = dew.jit(token_scan)(*xs_tok)
     np.testing.assert_array_equal(np.asarray(tok_ys), np.full((4, 2), 3.0, np.float32))
 
     # 4. Forward-only forced Mosaic fp32 per-key delta scan (rejected in accurate training) stays as scan so
@@ -1435,5 +1436,7 @@ def test_recurrence_recognition_guards_range_tracers_tokens_and_training_vjp():
     with (generation.assumed("sm90"), generation.run_precision(Numerics(forms="accurate")),
           generation.chosen(gated_delta_rule="mosaic_gpu")):
         assert not _routes("gated_delta_rule", lambda: dew.jit(fp32_per_key_scan).trace(*f32_shapes))
-        vjp_out = jax.eval_shape(lambda *a: jax.vjp(dew.jit(fp32_per_key_scan), *a)[0], *f32_shapes)
-        assert vjp_out[1].shape == (seq, batch, hv, dv)
+        vjp_out, vjp_grads = jax.eval_shape(
+            lambda *a: (lambda p, pull: (p, pull(p)))(*jax.vjp(dew.jit(fp32_per_key_scan), *a)),
+            *f32_shapes)
+        assert vjp_out[1].shape == (seq, batch, hv, dv) and len(vjp_grads) == len(f32_shapes)
