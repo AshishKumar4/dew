@@ -599,6 +599,26 @@ def test_a_named_template_refuses_a_state_row_no_bulk_copy_takes(states):
     assert [refusal.code for refusal in refused.value.refusals] == ["state rows"]
 
 
+@pytest.mark.parametrize("b_dtype, c_dtype", [(jnp.float8_e4m3fn, jnp.float4_e2m1fn),
+                                              (jnp.float4_e2m1fn, jnp.float8_e4m3fn)], ids=["fp8 B", "fp4 B"])
+def test_a_named_template_refuses_either_state_rows_no_bulk_copy_takes(b_dtype, c_dtype):
+    """An fp8 and an fp4 state operand at 16 states, B's or C's: the fp4 rows (8 bytes) no bulk copy's 16
+    divide, so the call naming the template is refused for them in either order, as its streams copy B and C
+    each in its own dtype (the review of toolkit/views-copies 0a632c088: the case read one of the two,
+    chosen by bytes an element, which an fp8 and an fp4 tie at)."""
+    from dew.nn.kernels.selection import KernelRefused
+
+    rows, length, channels, states = 1, selective.CHUNK, selective.block_scan.THREADS, 16
+    inputs = (*(jax.ShapeDtypeStruct(shape, jnp.float32) for shape in (
+        (rows, length, channels), (rows, length, channels), (channels, states))),
+        jax.ShapeDtypeStruct((rows, length, states), b_dtype), jax.ShapeDtypeStruct((rows, length, states),
+                                                                                   jnp.float32),
+        jax.ShapeDtypeStruct((channels,), jnp.float32))
+    with pytest.raises(KernelRefused) as refused:
+        jax.eval_shape(dispatched("fast", named=True, c_dtype=c_dtype, target="sm90"), *inputs)
+    assert "state rows" in [refusal.code for refusal in refused.value.refusals]
+
+
 @COMPILES_ON_CPU
 @lowers('sm90')
 @pytest.mark.parametrize('packed', [False, True], ids=['one sequence', 'packed'])
