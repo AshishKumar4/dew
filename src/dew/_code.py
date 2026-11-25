@@ -204,7 +204,7 @@ def provenance(values: Sequence[object]) -> frozenset[str] | None:
 def _slots(kind: type) -> tuple[str, ...]:
     """The attribute slots `kind` and its bases declare (`__slots__`), their own `__dict__` and weak
     reference slots left out."""
-    declared = (getattr(klass, "__slots__", ()) for klass in kind.__mro__)
+    declared = (vars(klass).get("__slots__", ()) for klass in kind.__mro__)
     return tuple(name for names in declared for name in ((names,) if isinstance(names, str) else names)
                  if name not in ("__dict__", "__weakref__"))
 
@@ -267,7 +267,8 @@ def _held(value) -> Sequence[object]:
         elif not isinstance(current, type) and stated_class(type(current)):
             # A plain class of Dew's holds its values as attributes (an objective's criterion, its model): in
             # its `__dict__`, and in the slots its classes declare where they do (a slotted class has none).
-            pending.extend(getattr(current, "__dict__", {}).values())
+            if type(current).__dictoffset__:
+                pending.extend(vars(current).values())
             pending.extend(getattr(current, name) for name in _slots(type(current)) if hasattr(current, name))
     return found
 

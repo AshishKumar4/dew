@@ -366,13 +366,13 @@ def test_a_kept_closure_holds_the_lookups_of_its_own_walk_alone(tmp_path):
 
 def test_a_slotted_instance_of_a_class_of_dews_is_walked_by_its_slots():
     """A value of a class of Dew's that declares slots and so holds no `__dict__` (`dew._cache.Same`) is
-    walked by its slots (`dew._code.states_its_code`): a function it holds is code no class states, and a
-    class of Dew's it holds is its class's (row 13015's train: a run's rung key raised reading its
+    walked by its slots (`dew._code.provenance`): a function it holds is code no class states, all of Dew's,
+    and a value of Dew's it holds is its class's (row 13015's train: a run's rung key raised reading its
     `__dict__`)."""
     from dew._cache import Same
-    from dew._code import states_its_code
+    from dew._code import provenance
 
-    assert states_its_code([Same(Same(1))]) and not states_its_code([Same(lambda: None)])
+    assert provenance([Same(Same(1))]) == {"dew._cache"} and provenance([Same(lambda: None)]) is None
 
 
 def test_a_callable_instance_of_a_class_of_dews_is_its_class_code_and_any_other_callable_is_all_of_it():
