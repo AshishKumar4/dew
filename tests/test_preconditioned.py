@@ -164,19 +164,33 @@ def sixteen_bit_forward(seed):
     return sixteen_bit_read_erase(seed)[:-1]
 
 
+def but_beta(fn):
+    """`with_gradients(fn)` for `fn(query, key, value, log_decay, beta, state, reads)`, its write gates closed
+    over: every input's gradient but theirs."""
+    def run(query, key, value, log_decay, beta, state, reads, cotangent):
+        out, pull = jax.vjp(lambda q, k, v, g, s, r: fn(q, k, v, g, beta, s, r), query, key, value, log_decay,
+                            state, reads)
+        return out, *pull(cotangent)
+    return run
+
+
 def test_a_read_erase_under_a_decay_a_key_dimension_on_the_template_is_its_head_decays():
     """The delta rule erasing along reads of its own under a decay a key dimension (PKDA's) on the template,
     16-bit (the system's rows the reads' in its own pairs and the intra walk, its weights the reads' and its
     decayed keys the keys' apart: `chunk_forward._paired`, `_key_weighted`; its backward's the same,
     `key_backward.gradients`' reads), each key's decay the head's: its output, final memory and every
-    operand's gradient, the reads' among them, on par from float64 with the same call under that decay a
-    head (check 1, the truth its recurrence a token at a time), whose read erase check 1 holds to the
-    recurrence at the accurate forms: a system whose rows and columns trade the reads and the keys, weights
-    formed from the keys, or a gradient landing on the other, lands far past it. fla's recorded PKDA sites
-    hold it once M-JS-266b's fixture lands (row 12696)."""
-    assert_as_exact(jax.jit(with_gradients(with_key_decays)), jax.jit(with_gradients(read_erased_forward)),
+    operand's gradient but the write gates', the reads' among them, on par from float64 with the same call
+    under that decay a head (check 1, the truth its recurrence a token at a time), whose read erase check 1
+    holds to the recurrence at the accurate forms: a system whose rows and columns trade the reads and the
+    keys, weights formed from the keys, or a gradient landing on the other, lands far past it. The write
+    gates' gradient a decay a key dimension's backward sums from three launches' parts where a decay a
+    head's sums two, 1.87 times the latter's distance on Kimi's delta attention itself (scratch jsf-beta2,
+    the reads along the keys, no read erase): held where its reference is that backward's, Kimi's
+    (`test_a_read_erase_along_its_keys_under_distinct_key_decays_trains_as_kimis_delta_attention`), and by
+    fla's recorded PKDA sites once M-JS-266b's fixture lands (row 12696)."""
+    assert_as_exact(jax.jit(but_beta(with_key_decays)), jax.jit(but_beta(read_erased_forward)),
                     sixteen_bit_read_erase, "a key decay's read erase on the template", seeds=SEEDS,
-                    truth_fn=jax.jit(with_gradients(read_erased)))
+                    truth_fn=jax.jit(but_beta(read_erased)))
 
 
 def along_its_keys(query, key, value, log_decay, beta, state):
