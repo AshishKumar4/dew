@@ -1,5 +1,5 @@
 --index-url https://pypi.org/simple
---extra-index-url https://pypi.dewml.dev/staging/0.12.0.1.post132/8327a4896a2ad806/simple/
+--extra-index-url https://pypi.dewml.dev/staging/0.12.0.1.post134/9c522ce511e20612/simple/
 --extra-index-url https://pypi.dewml.dev/simple
 
 absl-py==2.5.1 \
@@ -2688,8 +2688,8 @@ jaraco-functools==4.6.0 \
     # via
     #   cheroot
     #   keyring
-jax==0.12.0.1.post132 \
-    --hash=sha256:d5d6682e2453721348899961fb5a7af55c88fd96aba30e615d81672544060d10
+jax==0.12.0.1.post134 \
+    --hash=sha256:62964386c97e0d9db1d4c7e82b7294975f5258d454431e744a4ed0b36f53b63e
     # via
     #   -c constraints.txt
     #   dewml (pyproject.toml)
