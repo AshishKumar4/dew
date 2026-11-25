@@ -11,23 +11,27 @@ from reference_error import assert_computes_the_oracle
 
 from dew.data import Memory
 from dew.data.pipeline import Pipeline
+from dew.nn.kernels.generation import compile_only_gpus
 from dew.objectives.base import Aux, Objective, Ratio, Weighted
 from dew.state import TrainState
-from dew.training import Trainer
+from dew.training import MeshSpec, Trainer
+from dew.training.ahead import compile_ahead
 
-WIDTH, ROWS = 64, 2048
-"""Narrow layers over many rows: the step's activations, which a backward keeps, outweigh its gradients."""
+WIDTH, ROWS = 64, 256
+"""The width and rows of a float64 step on a CPU, whose arithmetic the replay witnesses compare."""
 
 
 class Deep(nn.Module):
-    """Four tanh layers of WIDTH in float64, whose activations a backward keeps."""
+    """Four tanh layers of the input's width in `dtype`, whose activations a backward keeps."""
+
+    dtype: jnp.dtype = jnp.float64
 
     @nn.compact
     def __call__(self, x):
-        x = x.astype(jnp.float64)
+        width, x = x.shape[-1], x.astype(self.dtype)
         for _ in range(4):
-            x = jnp.tanh(nn.Dense(WIDTH, dtype=jnp.float64, param_dtype=jnp.float64)(x))
-        return nn.Dense(WIDTH, dtype=jnp.float64, param_dtype=jnp.float64)(x)
+            x = jnp.tanh(nn.Dense(width, dtype=self.dtype, param_dtype=self.dtype)(x))
+        return nn.Dense(width, dtype=self.dtype, param_dtype=self.dtype)(x)
 
 
 class Squared(Objective):
@@ -36,22 +40,22 @@ class Squared(Objective):
     loss of two terms each over its own rows (those whose first, or second, input is positive), whose
     masses differ from microbatch to microbatch."""
 
-    def __init__(self, weighted: bool, terms: int = 1):
-        self.model, self.weighted, self.terms = Deep(), weighted, terms
+    def __init__(self, weighted: bool, terms: int = 1, dtype: jnp.dtype = jnp.float64, width: int = WIDTH):
+        self.model, self.weighted, self.terms, self.width = Deep(dtype), weighted, terms, width
 
     def fresh_variables(self, key, held):
-        return self.model.init(key, jnp.zeros((1, WIDTH)))
+        return self.model.init(key, jnp.zeros((1, self.width)))
 
     def loss(self, variables, batch, step):
         x = batch["x"]
-        errors = self.model.apply(variables, x) - x[:, ::-1].astype(jnp.float64)
+        errors = self.model.apply(variables, x) - x[:, ::-1].astype(self.model.dtype)
         squares = errors ** 2
         if self.terms == 2:
-            first, second = (x[:, 0] > 0).astype(jnp.float64), (x[:, 1] > 0.5).astype(jnp.float64)
-            terms = (Ratio(jnp.sum(squares * first[:, None]), jnp.sum(first) * WIDTH),
-                     Ratio(jnp.sum(jnp.abs(errors) * second[:, None]), jnp.sum(second) * WIDTH))
+            first, second = (x[:, 0] > 0).astype(errors.dtype), (x[:, 1] > 0.5).astype(errors.dtype)
+            terms = (Ratio(jnp.sum(squares * first[:, None]), jnp.sum(first) * self.width),
+                     Ratio(jnp.sum(jnp.abs(errors) * second[:, None]), jnp.sum(second) * self.width))
             return Weighted(terms, (1.0, 0.25)), Aux({})
-        term = Ratio(jnp.sum(squares), jnp.asarray(squares.size, jnp.float64))
+        term = Ratio(jnp.sum(squares), jnp.asarray(squares.size, errors.dtype))
         return (Weighted((term,), (1.0,)) if self.weighted else term), Aux({})
 
 
@@ -69,18 +73,27 @@ def parameters(state: TrainState) -> np.ndarray:
     return np.concatenate([np.ravel(leaf) for leaf in jax.tree.leaves(state.variables["params"])])
 
 
+def need_ahead(weighted: bool) -> int:
+    """The bytes a float32 step of `Squared` over 4096 rows of 256, read in two microbatches, needs
+    compiled ahead for an H100 (`compile_ahead`): its activations outweigh its gradients, as a model's do."""
+    trainer = Trainer(Squared(weighted, dtype=jnp.float32, width=256), optax.sgd(0.1),
+                      key=jax.random.key(0), mesh=MeshSpec().build(compile_only_gpus("sm90", 1, 80 * 2**30)),
+                      split=2)
+    ahead = compile_ahead(trainer, {"x": np.zeros((4096, 256), np.float32)})
+    return ahead.plan["pool"]["limit"] - ahead.plan["probes"][-1]["headroom"]
+
+
 def test_a_replayed_window_trains_as_the_pooled_one_and_needs_no_more():
     """A step whose `Weighted` loss of one term its window replays trains as the same loss written as a
-    `Ratio`, which the window pools, to the rounding of its sums, and its compiled step needs (its
-    arguments and temporaries) no more than a sixth over the pooled one: the replay realizes the current
-    microbatch again where its gradient is read, where it held this microbatch's forward residuals
-    through a backward of their own and the replay of the others (a 4B decision step whose loss weighs a
-    consistency term: 28.4 GiB a step against 18.5 GiB, at 8 layers)."""
-    (pooled, pooled_state), (replayed, replayed_state) = fitted(weighted=False), fitted(weighted=True)
-    assert_computes_the_oracle(parameters(replayed_state), parameters(pooled_state),
-                               "replayed against pooled", roundings=ROWS * WIDTH)
-    probes = [trainer.plan["probes"][-1] for trainer in (pooled, replayed)]
-    needs = [probe["temp"] + probe["argument"] for probe in probes]
+    `Ratio`, which the window pools, to the rounding of its sums, and compiled for an H100 it needs no
+    more than a sixth over the pooled one: the replay realizes the current microbatch again where its
+    gradient is read, where it held this microbatch's forward residuals through a backward of their own
+    and the replay of the others (a 4B decision step whose loss weighs a consistency term: 28.4 GiB a step
+    against 18.5 GiB, at 8 layers)."""
+    (_, pooled), (_, replayed) = fitted(weighted=False), fitted(weighted=True)
+    assert_computes_the_oracle(parameters(replayed), parameters(pooled), "replayed against pooled",
+                               roundings=ROWS * WIDTH)
+    needs = [need_ahead(weighted=False), need_ahead(weighted=True)]
     assert needs[1] <= needs[0] * 7 // 6, needs
 
 
