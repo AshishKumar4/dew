@@ -146,6 +146,7 @@ def test_a_restore_keeps_the_runners_files_beside_the_verdict_and_no_other_of_it
     and the runner's own files beside each (`SIDECARS`, the recorder's children), and removes any other entry
     the process made, one named as the verdict but for its suffix among them: a later process importing a
     `<out>.py` would run a module the commit does not hold (row 13000's review)."""
+    written(tmp_path, {"test_kept.py": ""})
     commit(tmp_path, "the commit")
     before = ci.untracked()
     out = tmp_path / "tests/result"

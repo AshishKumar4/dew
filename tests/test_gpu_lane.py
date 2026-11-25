@@ -836,7 +836,7 @@ def test_a_reused_row_is_named_the_commits_only_as_its_grade_leaves_it_green(ci,
 
     def run(code: int) -> dict:
         ci.tested("3.12", ["tests/test_gpu_a.py"], "", out, 60.0, "on", 5.0, "common", {},
-                  variant="@prepare-sm90",
+                  variant=ci.prepares.variant("sm90", users=False),
                   judged=lambda rows: [{**each, "exitCode": code, "unprepared": ["a @ x"]} for each in rows])
         [row] = json.loads(out.read_text())["rows"]
         return row
