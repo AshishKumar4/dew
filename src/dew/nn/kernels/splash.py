@@ -64,7 +64,7 @@ from dew.nn.derivatives import KernelGlue, contracted, with_gradients_formed
 from dew.nn.kernels import generation, launches, tuning
 from dew.nn.kernels.options import program
 from dew.nn.kernels.templates import attention_algebra, product
-from dew.nn.precision import compensated_sum, configured_precision, float32_einsum, products_dtype
+from dew.nn.precision import compensated_sum, configured_precision, products_dtype
 
 # Dew: a hidden key's logit -inf, not upstream's finite -0.7 * float32's largest, which outweighed a row's
 # own keys below it (a causal first query's one key at -3e38 read the hidden keys' values); a row's state
@@ -1291,86 +1291,31 @@ def _splash_portable(
     blocks: BlockSizes,
     call: _Call,
 ) -> jax.Array:
-    """Portable XLA equivalent of `_forward` for forward-mode and higher-order differentiation (row 2654)."""
+    """Portable XLA equivalent of `_forward` for forward-mode and higher-order differentiation (row 2654):
+    the reference attention (`dew.nn.attention.reference_attention`, row 12848) over the call's dense mask
+    (`_splash_mask`) as `_forward` walks it: its query scaled already, its masked logits `call.mask_value`
+    and its walk's starting maximum that value (the sinks where it has them), the tiles it skips never
+    visited, its values' product in fp32, and each product at the precision the kernel's own takes it
+    (`_dot`), never the caller's ambient one, which rounds fp32 operands to bf16 on a TPU (a key 2^-9 from
+    another kept its own score's tangent)."""
+    from dew.nn.attention import Products, reference_attention
+
     del dq_mask_info, dkv_mask_info
-    num_q_heads, q_seq_len, head_dim_qk = q.shape
-    num_kv_heads, kv_seq_len, head_dim_v = v.shape
-    groups = num_q_heads // num_kv_heads
     wide = jnp.promote_types(q.dtype, jnp.float32)
-    q_grouped = q.reshape(num_kv_heads, groups, q_seq_len, head_dim_qk)
-    # Each product at the precision the kernel's own takes it (`_dot`), never the caller's ambient one, which
-    # rounds fp32 operands to bf16 on a TPU: a key 2^-9 from another kept its own score's tangent.
-    scores_precision = programs.mosaic_tpu_dot_precision(q.dtype, k.dtype, blocks.block_q, head_dim_qk,
-                                                         blocks.block_kv_compute)
-    values_precision = programs.mosaic_tpu_dot_precision(jnp.float32, jnp.float32, blocks.block_q,
-                                                         blocks.block_kv_compute, head_dim_v)
-    visited, entry = _splash_mask(fwd_mask_info, segment_ids, q_seq_len=q_seq_len, kv_seq_len=kv_seq_len,
+    products = Products(
+        programs.mosaic_tpu_dot_precision(q.dtype, k.dtype, blocks.block_q, q.shape[-1],
+                                          blocks.block_kv_compute),
+        programs.mosaic_tpu_dot_precision(jnp.float32, jnp.float32, blocks.block_q, blocks.block_kv_compute,
+                                          v.shape[-1]))
+    visited, entry = _splash_mask(fwd_mask_info, segment_ids, q_seq_len=q.shape[1], kv_seq_len=k.shape[1],
                                   blocks=blocks, call=call)
-    if visited is None:
-        logits = float32_einsum("hgqd,hkd->hgqk", q_grouped, k, precision=scores_precision,
-                                preferred_element_type=wide).reshape(num_q_heads, q_seq_len, kv_seq_len)
-    else:
-        # Omitted `block_mask == 0` tiles' keys masked out per query block before the scores' contraction, as
-        # their values are below: an omitted key's NaN met a score cotangent of zero in the transpose, `0 *
-        # NaN`, and poisoned dQ's derivatives (row 2654).
-        q_tiles = q_seq_len // blocks.block_q
-        seen = jnp.swapaxes(visited[:, ::blocks.block_q, :], 0, 1)
-        q_by_tile = jnp.swapaxes(q.reshape(num_q_heads, q_tiles, blocks.block_q, head_dim_qk), 0, 1)
-        k_q = jnp.repeat(k, groups, axis=0)
-
-        def _block_scores(_, pair):
-            q_qb, seen_qb = pair
-            k_safe = jnp.where(seen_qb[..., None], k_q, jnp.zeros((), k_q.dtype))
-            return None, float32_einsum("hqd,hkd->hqk", q_qb, k_safe, precision=scores_precision,
-                                        preferred_element_type=wide)
-
-        _, scored = lax.scan(_block_scores, None, (q_by_tile, seen))
-        logits = jnp.swapaxes(scored, 0, 1).reshape(num_q_heads, q_seq_len, kv_seq_len)
-    if call.attn_logits_soft_cap is not None:
-        logits = jnp.tanh(logits / call.attn_logits_soft_cap) * call.attn_logits_soft_cap
-    if entry is not None:
-        logits = jnp.where(entry, logits, call.mask_value)
-    if visited is not None:
-        logits = jnp.where(visited, logits, -jnp.inf)
-    m = jnp.max(logits, axis=-1, initial=-jnp.inf)
-    # The walk's starting maximum, `_forward`'s: the sink, else the mask value, beneath which a logit's weight
-    # underflows as the kernel's does (a mask value of 0 over logits of -200: zeros, not their mean).
-    m = jnp.maximum(m, call.mask_value if sinks is None else sinks[:, None].astype(wide))
-    safe = jnp.where(jnp.isfinite(m), m, 0.0)
-    p = jnp.exp(logits - safe[..., None])
-    total = jnp.sum(p, axis=-1)
-    if sinks is not None:
-        total = total + jnp.where(jnp.isfinite(m), jnp.exp(sinks[:, None].astype(wide) - safe), 0.0)
-    weights = jnp.where(total[..., None] > 0, p / jnp.where(total > 0, total, 1.0)[..., None], 0.0)
-    if visited is not None:
-        # Mask omitted `block_mask == 0` tiles out of `v` per query block before contraction so an omitted
-        # tile's non-finite values or tangent directions never produce `0 * NaN` (row 2654).
-        q_blocks = q_seq_len // blocks.block_q
-        vis_blocks = jnp.swapaxes(
-            jnp.broadcast_to(visited[:, ::blocks.block_q, :], (num_q_heads, q_blocks, kv_seq_len)), 0, 1
-        )
-        w_blocks = jnp.swapaxes(
-            weights.reshape(num_q_heads, q_blocks, blocks.block_q, kv_seq_len), 0, 1
-        )
-        v_q = jnp.repeat(v.astype(wide), groups, axis=0)
-
-        def _block_out(_, pair):
-            w_qb, vis_qb = pair
-            v_safe = jnp.where(vis_qb[..., None], v_q, 0.0)
-            return None, float32_einsum("hqk,hkd->hqd", w_qb, v_safe, precision=values_precision,
-                                        preferred_element_type=wide)
-
-        _, out_blocks = lax.scan(_block_out, None, (w_blocks, vis_blocks))
-        out = jnp.swapaxes(out_blocks, 0, 1).reshape(num_q_heads, q_seq_len, head_dim_v)
-    else:
-        out = float32_einsum(
-            "hgqk,hkd->hgqd",
-            weights.reshape(num_kv_heads, groups, q_seq_len, kv_seq_len),
-            v.astype(wide),
-            precision=values_precision,
-            preferred_element_type=wide,
-        ).reshape(num_q_heads, q_seq_len, head_dim_v)
-    return out.astype(q.dtype)
+    out = reference_attention(
+        jnp.swapaxes(q, 0, 1)[None], jnp.swapaxes(k, 0, 1)[None], jnp.swapaxes(v, 0, 1).astype(wide)[None],
+        mask=entry, sinks=None if sinks is None else sinks.astype(wide), softcap=call.attn_logits_soft_cap,
+        precision=products, mask_fill=call.mask_value, query_scale=1.0,
+        logit_floor=call.mask_value if sinks is None else None,
+        skipped=None if visited is None else jnp.logical_not(visited[:, ::blocks.block_q, :]))
+    return jnp.swapaxes(out[0], 0, 1).astype(q.dtype)
 
 
 def _build_splash_op(blocks: BlockSizes, call: _Call, precision: str | None) -> Callable:
