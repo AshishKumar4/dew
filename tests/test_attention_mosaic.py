@@ -340,13 +340,14 @@ def _check_spans(label: str, spans: template.KeySpans | Callable[[], template.Ke
 
     accurate, config = _backward_form(form)
     where = target or _INTERPRETED.get()
+    # The forward at the call forms' tiles 64 wide, else at its derivation's (two consumers' hooked sums 128
+    # wide pass their registers, and a hooked training forward's natural walk theirs 64 wide), resolved
+    # before the arm (`_device_at`).
+    pinned = pins or (_form_tiles() if width == 64 and not (backward and score) else None, config)
 
     def ours(query, key, value, dout, params, initial):
         built_spans = make_spans()
         hooks = hooked(params, initial)
-        # The forward at the call forms' tiles 64 wide, else at its derivation's (two consumers' hooked sums
-        # 128 wide pass their registers, and a hooked training forward's natural walk theirs 64 wide).
-        pinned = pins or (_form_tiles() if width == 64 and not (backward and score) else None, config)
         with _device_at(interpret, where), _pinned(*pinned):
             if not backward:
                 return attention_mosaic.forward(query, key, value, built_spans, hooks, natural=natural,

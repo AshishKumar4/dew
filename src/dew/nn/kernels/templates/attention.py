@@ -36,6 +36,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.typing import DTypeLike
+from numpy.lib.array_utils import normalize_axis_tuple
 
 from dew._hashing import fmix32
 from dew.nn.aligned import aligned_sum
@@ -2093,14 +2094,17 @@ def raised_sum(grad: jax.Array, shift: jax.Array, axes: tuple[int, ...]) -> jax.
     if not axes:
         return shifted(grad, shift)
     shift = jnp.broadcast_to(shift, jnp.broadcast_shapes(shift.shape, (1,) * grad.ndim))
-    # The sum is elementwise over every other axis: taken a slab of them at a time where its digits would
-    # hold more than `RAISED_ELEMENTS` entries at once (row 10694: a tile bias's gradient over 4 rows of
-    # 8 heads' 2048 x 2048 logits asked 5.47 GiB of an A100's 40 at once).
+    axes = normalize_axis_tuple(axes, grad.ndim)
+    # The sum is elementwise over every other axis: taken a slab of one of them at a time where its digits
+    # would hold more than `RAISED_ELEMENTS` entries at once (row 10694: a tile bias's gradient over 4 rows
+    # of 8 heads' 2048 x 2048 logits asked 5.47 GiB of an A100's 40 at once), along the kept axis whose
+    # divisors give the fewest slabs that fit (every slab of one size; the cap best effort where no axis's
+    # do).
     kept = [axis for axis in range(grad.ndim) if axis not in axes and grad.shape[axis] > 1]
-    slabs = _slabs(grad.size, grad.shape[kept[-1]]) if kept else 1
-    if slabs == 1:
+    if not kept or grad.size <= RAISED_ELEMENTS:
         return _raised(grad, shift, axes)
-    axis = kept[-1]
+    slabs, axis = min((_slabs(grad.size, grad.shape[axis]), -axis) for axis in kept)
+    axis = -axis
 
     def split(x):
         # `x` in `slabs` along `axis`, the slab its leading axis; one of no extent there each slab's whole.
