@@ -554,8 +554,10 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         # store, `rows_whole`, it does).
         return not self.rows_whole and not launches.interpreting()
 
-    def product_with[T](self, lhs, rhs, shape: tuple[int, int],
-                        between: Callable[[], T]) -> tuple[T, jax.Array]:
+    def product_with[T](self, lhs, rhs, shape: tuple[int, int], between: Callable[[], T], *,
+                        pending: int = 0) -> tuple[T, jax.Array]:
+        if pending:
+            raise ValueError(f"{type(self).__name__}.product_with is synchronous (pending={pending})")
         out = self.products(self.zeros(shape), lhs, rhs)
         return between(), out
 
