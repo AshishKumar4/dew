@@ -580,7 +580,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                     narrowed=tuple(form.divisor if form is not None and form.narrowed else 1
                                    for form in forms),
                     hook_columns=None if epilogue is None else hook_chunk(
-                        family, part[1], tuple(form.unit for form in forms if form is not None)),
+                        family, part[0], part[1], dtypes, forms, tiles.staging),
                     epilogue=epilogue, flags=(flags_gmem, pair, tiles.sharing),
                     sides=tuple(zip(side_gmems, epilogue_axes, side_smems, side_barriers, strict=True)),
                     partials=None if tail is None else (workspace, ready))

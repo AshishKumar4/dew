@@ -221,13 +221,29 @@ def best_splits(walk: "SplitWalk | None", stages: int) -> int:
     return min([1, *filter(walk.holds, counts)], key=walk.seconds)
 
 
-def hook_chunk(family: mosaic.Family, columns: int, units: tuple[int, ...] = ()) -> int:
+def hook_chunk(family: mosaic.Family, share: int, columns: int, dtypes: tuple = (), forms: tuple = (),
+               staging: tuple[int, int] | None = None) -> int:
     """The columns an epilogue's hook takes at a time on `family` (`Issuer.hook_columns`), the kernel's
-    (`mosaic_gpu._finished`) and its register model's (`epilogue_registers`): whole where its stores take no
-    chunk (`mosaic.Transport.stores_chunks`: sm80's whole-tile staging) or a chunk would hold no whole unit
-    of an output's form (`units`, `quantized.Form.unit`: a reduced output's block, a narrowed one's runs)."""
+    (`mosaic_gpu._finished`) and its register model's (`epilogue_registers`): whole stores' chunks of its
+    outputs (`stores.output_staging` of `dtypes` stored as `forms` state, `share` rows a consumer's), so each
+    chunk's values fill whole staged buffers (a narrowed output's 128 tile columns, 64 of its own); the whole
+    tile where its stores take no chunk (`mosaic.Transport.stores_chunks`: sm80's whole-tile staging) or no
+    such chunk divides it."""
+    from dew.nn.kernels.templates import stores
+
     chunk = family.hook_columns(columns)
-    return columns if not family.stores_chunks or any(chunk % unit for unit in units) else chunk
+    if not family.stores_chunks or chunk >= columns or not dtypes:
+        return columns
+    dtypes = tuple(jnp.dtype(dtype) for dtype in dtypes)
+    packed = tuple(stores.Output((share, columns), dtype, divisor=form.divisor, transposed=form.transposed,
+                                 narrowed=bool(form.narrowed))
+                   for dtype, form in zip(dtypes, forms or (None,) * len(dtypes), strict=True)
+                   if form is not None)
+    piece = family.chunk_columns(columns)
+    if stores.staging_refusal(columns, dtypes, staging, piece=piece, packed=packed) is not None:
+        return columns
+    chunk = math.lcm(chunk, stores.output_staging(columns, dtypes, staging, piece=piece, packed=packed)[0])
+    return chunk if chunk < columns and columns % chunk == 0 else columns
 
 
 def epilogue_registers(family: mosaic.Family, share: int, columns: int, stored: tuple, *,
