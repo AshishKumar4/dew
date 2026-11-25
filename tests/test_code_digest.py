@@ -393,7 +393,7 @@ def test_a_callable_instance_of_a_class_of_dews_is_its_class_code_and_any_other_
 
 RUNG_CODE = """
 import json
-from dew._code import op_provenance, provenance_code, whole_digest
+from dew._code import op_provenance, provenance, provenance_code, whole_digest
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.kernels.templates.attention import Capped
 from dew.nn.kernels.templates.attention_triton import TritonForward
@@ -416,11 +416,12 @@ model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads
 lm = LMObjective(model, 4)
 criterion = Supervised(model, lambda outputs, batch: outputs.sum(), inputs="text")
 whole = [whole_digest()]
+launch = op_provenance(TritonForward(score_mod=Capped(30.0)), {})
 print(json.dumps({"lm": _code(lm, lm.program_key(), None),
                   "opaque": [_code(Fitted(), (), None) == whole,
                              _code(criterion, criterion.program_key(), None) == whole],
-                  "capped": provenance_code("dew.nn.kernels.templates.report",
-                                            op_provenance(TritonForward(score_mod=Capped(30.0)), {}))}))
+                  "launch": provenance_code("dew.nn.kernels.templates.report", launch) == whole,
+                  "capped": provenance_code("dew.nn.kernels.templates.report", provenance([Capped(30.0)]))}))
 """
 
 
@@ -429,9 +430,10 @@ def test_a_rung_records_code_is_its_step_its_objective_and_its_models_and_none_e
     Dew's: a file no step's code imports leaves an LM's alike, and its model's module moves it. An objective
     whose loss is code no value names keys on all of Dew's: a user's subclass (a model-free `Residuals`'s),
     and one of Dew's holding a user's criterion. Every file's digest made each rung test's CI key every file
-    of Dew's (22% of the suite's rows). A kernel launch holding a hook of a class of Dew's (`Capped` as a
-    Triton forward's score hook, `op_provenance`), keyed by every file before, keys on its class's module: an
-    edit there moves its records' code, an unrelated file's leaves it."""
+    of Dew's (22% of the suite's rows). A hook of a class of Dew's (`Capped`), keyed by every file before,
+    keys on its class's module: an edit there moves its code, an unrelated file's leaves it; a launch holding
+    it (a Triton forward's score hook, `op_provenance`) holds it prepared, its runner a function, and keys on
+    all of Dew's as before."""
     tree = tmp_path / "src"
     for name in ("dew", "_dew_torch"):
         shutil.copytree(REPO_ROOT / "src" / name, tree / name, ignore=shutil.ignore_patterns("__pycache__"))
@@ -442,7 +444,7 @@ def test_a_rung_records_code_is_its_step_its_objective_and_its_models_and_none_e
 
     (package / "_spare_rung.py").write_text("")
     before = codes()
-    assert before["opaque"] == [True, True]
+    assert before["opaque"] == [True, True] and before["launch"]
     assert codes(package / "_spare_rung.py") == before
     hooked = codes(package / "nn" / "kernels" / "templates" / "attention.py")
     assert hooked["capped"] != before["capped"]
