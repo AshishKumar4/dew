@@ -189,19 +189,19 @@ def provenance(values: Sequence[object]) -> frozenset[str] | None:
     """The modules of Dew's defining `values` and every value they hold (a dataclass's fields', a
     collection's members): a class's own module, any other value's class's, none for a library's or the
     user's own, whose release or source states it. None, the whole package, where any is a callable no class
-    of Dew's states (`_stated`): a function (a hook, a prepared one), a bound method, a library's wrapper (a
-    `functools.partial`) or an instance of a class made in a function. A kernel's identity traces a hook at
-    one tile alone (`attention.hook_program`), and no value names the code a wrapper calls (row 10743). A
-    callable instance of a class of Dew's at its module's top level (a Flax module, a template's hook such as
-    `Capped`) is its class's code, as any other instance is, its fields walked as theirs are."""
+    of Dew's states (`stated_class`): a function (a hook, a prepared one), a bound method, a library's
+    wrapper (a `functools.partial`) or an instance of a class made in a function. A kernel's identity traces
+    a hook at one tile alone (`attention.hook_program`), and no value names the code a wrapper calls (row
+    10743). A callable instance of a class of Dew's at its module's top level (a Flax module, a template's
+    hook such as `Capped`) is its class's code, as any other instance is, its fields walked as theirs are."""
     held = [part for value in values for part in _held(value)]
-    if any(callable(part) and not isinstance(part, type) and not _stated(type(part)) for part in held):
+    if any(callable(part) and not isinstance(part, type) and not stated_class(type(part)) for part in held):
         return None
     modules = {(part if isinstance(part, type) else type(part)).__module__ for part in held}
     return frozenset(module for module in modules if _path(module) is not None)
 
 
-def _stated(kind: type) -> bool:
+def stated_class(kind: type) -> bool:
     """Whether `kind`'s code is a module of Dew's, which defines it at its top level, so an instance's code is
     that module's and what it imports (`code_digest`)."""
     return _path(kind.__module__) is not None and "<locals>" not in kind.__qualname__
@@ -225,8 +225,9 @@ def provenance_code(root: str, provenance: frozenset[str] | None) -> list[str]:
 
 
 def _held(value) -> Sequence[object]:
-    """`value` and every value it holds: a dataclass's fields', a sequence's or a set's members, a mapping's
-    values, each once however often it is held, so a graph that holds itself (a cyclic hook graph's) ends."""
+    """`value` and every value it holds: a dataclass's fields', a plain class of Dew's attributes, a
+    sequence's or a set's members, a mapping's values, each once however often it is held, so a graph that
+    holds itself (a cyclic hook graph's) ends."""
     found: list[object] = []
     seen: set[int] = set()
     pending = [value]
@@ -238,6 +239,9 @@ def _held(value) -> Sequence[object]:
         found.append(current)
         if dataclasses.is_dataclass(current) and not isinstance(current, type):
             pending.extend(getattr(current, field.name) for field in dataclasses.fields(current))
+        elif not isinstance(current, type) and stated_class(type(current)) and hasattr(current, "__dict__"):
+            # A plain class of Dew's holds its values as attributes (an objective's criterion, its model).
+            pending.extend(vars(current).values())
         elif isinstance(current, (tuple, list, frozenset, set)):
             pending.extend(current)
         elif isinstance(current, Mapping):

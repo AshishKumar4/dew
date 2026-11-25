@@ -26,7 +26,7 @@ import jax
 from jax.sharding import Mesh
 
 from dew import _cache
-from dew._code import provenance, provenance_code
+from dew._code import provenance, provenance_code, stated_class, whole_digest
 from dew._devices import device_memory
 from dew._records import JSON, json_value, record
 from dew._stated import Unestablished, stated
@@ -102,10 +102,13 @@ def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], spl
 
 def _code(objective: object, modules: Sequence[object], step: object) -> list[str]:
     """The digests of the code that builds a step (`provenance_code`): the step's compiler and the modules of
-    Dew's defining the `objective` (its class and every base, a model-free objective's loss its base's), the
-    values it holds, its program's `modules` and a custom `step`, each with every module of Dew's it can
-    import; the whole package's where any is a function no class states. Not every file of Dew's: a run
-    keying a rung on them all read all 794, so its tests' CI key was every file (22% of the suite's rows)."""
+    Dew's defining the `objective` (its class and every base) and what it holds, its program's `modules` and
+    a custom `step`, each with every module of Dew's it can import. All of Dew's where any is a function no
+    class states, or the objective's class is none of Dew's (a user's subclass): its loss is code no value
+    names, which may call any of Dew's. Not every file of Dew's otherwise: a run keying a rung on them all
+    read all 794, so its tests' CI key was every file (22% of the suite's rows)."""
+    if objective is not None and not stated_class(type(objective)):
+        return [whole_digest()]
     built = [] if objective is None else [objective, *type(objective).__mro__]
     return provenance_code("dew.training.compiler", provenance([*built, *modules, step]))
 

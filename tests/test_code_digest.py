@@ -387,11 +387,13 @@ def test_a_callable_instance_of_a_class_of_dews_is_its_class_code_and_any_other_
 
 RUNG_CODE = """
 import json
+from dew._code import op_provenance, provenance_code, whole_digest
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.kernels.templates.attention import Capped
+from dew.nn.kernels.templates.attention_triton import TritonForward
 from dew.objectives.lm import LMObjective
 from dew.objectives.residuals import Residuals
-from dew._code import provenance, provenance_code
-from dew.nn.kernels.templates.attention import Capped
+from dew.objectives.supervised import Supervised
 from dew.training.rungs import _code
 
 
@@ -403,22 +405,27 @@ class Fitted(Residuals):
         return batch["x"] - variables["params"]["p"]
 
 
-lm = LMObjective(CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=1, mlp_features=8,
-                                   max_seq_len=8), 4)
+model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=1, mlp_features=8,
+                          max_seq_len=8)
+lm = LMObjective(model, 4)
+criterion = Supervised(model, lambda outputs, batch: outputs.sum())
+whole = [whole_digest()]
 print(json.dumps({"lm": _code(lm, lm.program_key(), None),
-                  "fitted": _code(Fitted(), Fitted().program_key(), None),
-                  "capped": provenance_code("dew.nn.kernels.templates.report", provenance([Capped(30.0)]))}))
+                  "opaque": [_code(Fitted(), (), None) == whole,
+                             _code(criterion, criterion.program_key(), None) == whole],
+                  "capped": provenance_code("dew.nn.kernels.templates.report",
+                                            op_provenance(TritonForward(score_mod=Capped(30.0)), {}))}))
 """
 
 
 def test_a_rung_records_code_is_its_step_its_objective_and_its_models_and_none_else(tmp_path):
     """A rung record keys on the code that builds its step (`dew.training.rungs._code`), not every file of
-    Dew's: a file no step's code imports leaves an LM's and a model-free objective's alike, the LM's model's
-    module moves the LM's, and a model-free objective's base (`Residuals`, which nothing of Dew's imports,
-    its loss its own) moves that objective's and leaves the LM's. Every file's digest made each rung test's
-    CI key every file of Dew's (22% of the suite's rows). A kernel launch's records holding a hook of Dew's
-    class (`Capped`), keyed by every file before, now key on its class's module: an edit there moves them,
-    an unrelated file's leaves them."""
+    Dew's: a file no step's code imports leaves an LM's alike, and its model's module moves it. An objective
+    whose loss is code no value names keys on all of Dew's: a user's subclass (a model-free `Residuals`'s),
+    and one of Dew's holding a user's criterion. Every file's digest made each rung test's CI key every file
+    of Dew's (22% of the suite's rows). A kernel launch holding a hook of a class of Dew's (`Capped` as a
+    Triton forward's score hook, `op_provenance`), keyed by every file before, keys on its class's module: an
+    edit there moves its records' code, an unrelated file's leaves it."""
     tree = tmp_path / "src"
     for name in ("dew", "_dew_torch"):
         shutil.copytree(REPO_ROOT / "src" / name, tree / name, ignore=shutil.ignore_patterns("__pycache__"))
@@ -432,11 +439,9 @@ def test_a_rung_records_code_is_its_step_its_objective_and_its_models_and_none_e
 
     (package / "_spare_rung.py").write_text("")
     before = codes()
+    assert before["opaque"] == [True, True]
     assert codes(package / "_spare_rung.py") == before
     hooked = codes(package / "nn" / "kernels" / "templates" / "attention.py")
     assert hooked["capped"] != before["capped"]
     model = codes(package / "nn" / "backbones" / "causal_transformer.py")
-    assert model["lm"] != before["lm"]
-    base = codes(package / "objectives" / "residuals.py")
-    assert base["fitted"] != model["fitted"] and base["lm"] == model["lm"]
-
+    assert model["lm"] != hooked["lm"]
