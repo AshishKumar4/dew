@@ -505,8 +505,13 @@ class _Counting:
     of its warpgroup's warps where it is one's (`warps`)."""
 
     def __init__(self, axis: str | None, index: int, loops: int = 0, warp: tuple | None = None,
-                 forms: Mapping | None = None, arrivals: _Arrivals | None = None, lanes: int | None = None):
+                 forms: Mapping | None = None, arrivals: _Arrivals | None = None, lanes: int | None = None,
+                 charged: set[int] | None = None):
         self.axis, self.index, self.warp, self.forms = axis, index, warp, forms
+        # The static equations (by identity) whose work it charged once (`equation`): a scan's trips, a
+        # loop's trial and a branch's run the same body, its invariant computed once (the review of
+        # lane/toolkit a1b861d7f2d).
+        self.charged = set() if charged is None else charged
         # The warp of its warpgroup whose 32 lanes run its body where a warp mesh's role runs it
         # (`plgpu.warp_map`), None where its warpgroup's 128 do.
         self.lanes = lanes
@@ -684,7 +689,8 @@ class _Counting:
             # Of the program's constants alone: computed once outside every loop (or folded by its compile),
             # its work the program's once, never a step's (the review of train 1261, F6). A call of them runs
             # on, its body's folds the values a later guard reads.
-            if primitive in _ARITHMETIC:
+            if primitive in _ARITHMETIC and id(equation) not in self.charged:
+                self.charged.add(id(equation))
                 self.fixed = _then(self.fixed, operation_work(
                     primitive, [variable.aval for variable in equation.invars],
                     [variable.aval for variable in equation.outvars], params, forms=self.forms))
@@ -788,7 +794,8 @@ class _Counting:
                 inputs[len(consts) + counter] = _Place(at, start, stop, parity)
                 inputs[len(consts) + bound] = stop
             trial = _Counting(self.axis, self.index, loops=len(self.loops) + 1, warp=self.warp,
-                              forms=self.forms, arrivals=self.arrivals, lanes=self.lanes)
+                              forms=self.forms, arrivals=self.arrivals, lanes=self.lanes,
+                              charged=self.charged)
             trial.run(body, inputs, static=static)
             self.arrivals.left(trial.landing)
             return trial
@@ -875,7 +882,8 @@ class _Counting:
         trials = []
         for branch in branches:
             trial = _Counting(self.axis, self.index, loops=len(self.loops), warp=self.warp,
-                              forms=self.forms, arrivals=self.arrivals, lanes=self.lanes)
+                              forms=self.forms, arrivals=self.arrivals, lanes=self.lanes,
+                              charged=self.charged)
             trial.run(branch, operands, static=given[1:])
             if self.loops:
                 self.arrivals.left(trial.landing)

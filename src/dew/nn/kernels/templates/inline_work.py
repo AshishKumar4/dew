@@ -478,6 +478,9 @@ def _assembly(text: str, active: np.ndarray, operand: Callable) -> Work:
         words = line.split()
         running = active
         guard = None
+        # Whether a predicate guards it, apart from whether its lanes are known (`guard`): only unpredicated
+        # adds fuse (the review of lane/toolkit a1b861d7f2d, F1).
+        predicated = bool(words) and words[0].startswith("@")
         if words and words[0].startswith("@"):
             negated = words[0].startswith("@!")
             guard, words = words[0].lstrip("@!"), words[1:]
@@ -495,13 +498,13 @@ def _assembly(text: str, active: np.ndarray, operand: Callable) -> Work:
             predicates[words[1].strip(",")] = _set(words, lanes_of, bounds_of)
             work, adding = work + closed(adding) + _instruction(words, issued, moving), None
             continue
-        if words and words[0].startswith("mov.") and guard is None and len(words) == 3 and (
+        if not predicated and words and words[0] == "mov.b32" and len(words) == 3 and (
                 _ptx_integer(words[2]) is not None):
-            # An immediate's move: an add accumulating into its register issues the IADD3 it starts.
+            # An immediate's move: an add accumulating into its register issues the IADD3 it starts (the
+            # unpredicated 32-bit sequence `BitForm` writes an IADD3 as).
             work, adding = work + closed(adding), (words[1].strip(","), 1, False, issued)
             continue
-        if words and words[0].startswith(("add.", "sub.")) and guard is None and len(words) == 4 and not any(
-                kind in words[0] for kind in ("f32", "f16", "bf16", "f64")):
+        if not predicated and words and words[0] in ("add.u32", "sub.u32") and len(words) == 4:
             out, first = words[1].strip(","), words[2].strip(",")
             if adding is not None and out == first == adding[0] and adding[1] < 3:
                 issued_already, adding = adding[2], (out, adding[1] + 1, True, adding[3])
@@ -660,13 +663,9 @@ def _lane_values(name: str, op, operands: list[np.ndarray]) -> np.ndarray | None
             return first - last
         case "arith.muli":
             return first * last
-        case "arith.floordivsi":
-            return np.where(last == 0, 0, first // np.where(last == 0, 1, last))
-        case "arith.divsi" | "arith.remsi":
-            # LLVM's sdiv and srem truncate toward zero, the remainder taking the dividend's sign.
-            divisor = np.where(last == 0, 1, last)
-            quotient = np.abs(first) // np.abs(divisor) * np.sign(first) * np.sign(divisor)
-            return np.where(last == 0, 0, quotient if name == "arith.divsi" else first - divisor * quotient)
+        case ("arith.floordivsi" | "arith.divsi" | "arith.remsi" | "arith.shrsi" | "arith.minsi"
+              | "arith.maxsi"):
+            return _signed(name, first, last, _width(op.results[0].type))
         case "arith.divui" | "arith.remui" | "arith.shrui" | "arith.minui" | "arith.maxui":
             return _unsigned(name, first, last, _width(op.results[0].type))
         case "arith.andi":
@@ -677,12 +676,6 @@ def _lane_values(name: str, op, operands: list[np.ndarray]) -> np.ndarray | None
             return first ^ last
         case "arith.shli":
             return first << last
-        case "arith.shrsi":
-            return first >> last
-        case "arith.minsi":
-            return np.minimum(first, last)
-        case "arith.maxsi":
-            return np.maximum(first, last)
         case "arith.cmpi":
             width = _width(op.operands[0].type)
             return None if width is None else _compared(int(op.attributes["predicate"].value), first, last,
@@ -690,6 +683,27 @@ def _lane_values(name: str, op, operands: list[np.ndarray]) -> np.ndarray | None
         case "arith.select":
             return np.where(first.astype(bool), operands[1], last)
     return None
+
+
+def _signed(name: str, first: np.ndarray, last: np.ndarray, width: int | None) -> np.ndarray | None:
+    """A signed integer op over lanes held as their bits (a truncation's unsigned, `_lane_values`): its
+    operands read signed at `width` bits (Python's integers, so 64 bits' least overflows nothing), its result
+    held signed at them again; None where the width is unknown (the review of lane/toolkit a1b861d7f2d, F7).
+    LLVM's sdiv and srem truncate toward zero, the remainder taking the dividend's sign; floordivsi floors."""
+    if width is None:
+        return None
+    first, last = (_at_width(side, width, signed=True) for side in (first, last))
+    divisor = np.where(last == 0, 1, last)
+    floored = first // divisor
+    # Toward zero: a floored quotient one up where the division is inexact and its signs differ.
+    truncated = floored + ((first % divisor != 0) & ((first < 0) != (divisor < 0)))
+    signed = {"arith.floordivsi": lambda: np.where(last == 0, 0, floored),
+              "arith.divsi": lambda: np.where(last == 0, 0, truncated),
+              "arith.remsi": lambda: np.where(last == 0, 0, first - divisor * truncated),
+              "arith.shrsi": lambda: first >> last,
+              "arith.minsi": lambda: np.minimum(first, last),
+              "arith.maxsi": lambda: np.maximum(first, last)}[name]()
+    return _at_width(signed, width, signed=True).astype(np.int64)
 
 
 def _unsigned(name: str, first: np.ndarray, last: np.ndarray, width: int | None) -> np.ndarray | None:
