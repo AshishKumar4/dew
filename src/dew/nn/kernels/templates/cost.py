@@ -335,9 +335,10 @@ def latency_bound(work: Work, at: Rates, target: generation.GpuTarget, *, held: 
     slots' seconds over, M-NA-21's one warp a scheduler 4.56); 0 where the target states no interval or no
     warps are held."""
     multiprocessor = target.architecture.multiprocessor
-    interval = None if multiprocessor is None else multiprocessor.issue_interval
-    if interval is None or held <= 0 or at.issue in (None, math.inf):
+    if (multiprocessor is None or multiprocessor.issue_interval is None or held <= 0
+            or at.issue in (None, math.inf)):
         return 0.0
+    interval = multiprocessor.issue_interval
     # Each scheduler issues one warp's instruction a clock, 32 threads' (`Multiprocessor.issue_per_clock`).
     schedulers = multiprocessor.issue_per_clock / 32
     return issued(work) / at.issue * max(1.0, interval / (held / schedulers))
