@@ -122,11 +122,12 @@ ROW_BLOCKS = 12
 partial rows it writes stay a small share of what it reads."""
 MAX_PROGRAMS = 1024
 ROW_BLOCK = 4096
-"""A SwiGLU launch's heuristic elements a program (apart or packed), a row's whole up to that many columns. Of the configs measured
-at Qwen3.5-0.8B's 24576 rows of 2 x 3584 (bf16, 2026-10-15), a whole row of 4096 with four warps was the
-fastest packed forward on an A100 80GB and an H100 and within 1% of the fastest reverse, level with the
-apart kernel's best (forward 0.323 against 0.315 ms on the A100, 0.181 against 0.178 on the H100), where
-512 columns, the largest power of two dividing the width, lost 3 to 10%."""
+"""A SwiGLU launch's heuristic elements a program (apart or packed), a row's whole up to that many
+columns. Of the configs measured at Qwen3.5-0.8B's 24576 rows of 2 x 3584 (bf16, 2026-10-15), a whole row
+of 4096 with four warps was the fastest packed forward on an A100 80GB and an H100 and within 1% of the
+fastest reverse, level with the apart kernel's best (forward 0.323 against 0.315 ms on the A100, 0.181
+against 0.178 on the H100), where 512 columns, the largest power of two dividing the width, lost 3 to
+10%."""
 
 
 def _neighbours[C: (RowsConfig, ReverseConfig, BlockConfig)](config: C,
@@ -1395,9 +1396,12 @@ def _packed_backward(gate_up_ref, dy_ref, d_ref, *, block: int, interpret: bool)
 @dataclasses.dataclass(frozen=True)
 class _Rows(tuning.KernelOp):
     """An elementwise launch over `[rows, width]` operands (`_tile_of`): a program a tile of `ROW_BLOCK`
-    elements, the whole row up to that many columns and as many rows as the rest holds, four warps."""
+    elements, the whole row up to that many columns and as many rows as the rest holds, four warps. Its
+    picks' revision 2: a config's block a tile of elements, which a packed launch's revision 1 timed as a
+    row's columns alone (row 12971)."""
 
     config_cls: ClassVar[type[BlockConfig]] = BlockConfig
+    revision: int = 2
 
     def _get_heuristics_config(self, ba) -> BlockConfig:
         return BlockConfig(ROW_BLOCK, 4)

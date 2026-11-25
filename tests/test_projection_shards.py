@@ -396,7 +396,8 @@ def test_a_mapped_stacks_weight_reductions_complete_per_layer(axis):
     names = {each.id: each.name for each in entry.instructions}
     opcodes = {each.name: each.opcode for each in entry.instructions}
     operands = {each.name: [names[operand] for operand in each.operand_ids] for each in entry.instructions}
-    order = {names[each]: index for index, each in enumerate(proto.schedule.sequences[entry.id].instruction_ids)}
+    scheduled = proto.schedule.sequences[entry.id].instruction_ids
+    order = {names[each]: index for index, each in enumerate(scheduled)}
     flops = {name: instruction.flops for name, instruction in hlo_instructions(step).items()}
 
     def reaching(name: str, found) -> str:
