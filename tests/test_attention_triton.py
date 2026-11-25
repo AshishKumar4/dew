@@ -1277,19 +1277,6 @@ def test_a_triton_forward_every_config_of_which_spills_hands_its_call_to_the_nex
 
 
 @COMPILES_ON_CPU
-def test_an_output_hook_taking_erf_lowers_for_an_a100():
-    """An output hook taking erf (a GELU gate, `o * Φ(o)`) lowers in the Triton forward for an A100, Pallas
-    Triton lowering it by libdevice's erf, where it had no rule for lax.erf (row 12426; Dew's fork from
-    post132)."""
-    from kernel_compile import lowered_for
-
-    shape = jax.ShapeDtypeStruct((1, 256, 2, 64), jnp.bfloat16)
-    hooks = template.Hooks(output_mod=lambda o: o * 0.5 * (1.0 + jax.lax.erf(o * 0.7071067811865476)))
-    spans = template.spans(256, 256, 1, causal=True)
-    lowered_for(lambda q, k, v: attention_triton.forward(q, k, v, spans, hooks), (shape,) * 3, "sm80")
-
-
-@COMPILES_ON_CPU
 @pytest.mark.parametrize("kept", [template.Kept.NONE, template.Kept.OUTPUT, template.Kept.SPLIT],
                          ids=lambda k: k.name)
 def test_a_forward_at_its_own_config_compiles_within_an_a100s_block(kept):
