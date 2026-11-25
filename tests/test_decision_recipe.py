@@ -1071,7 +1071,7 @@ def test_every_head_that_reads_the_base_resumes_a_decision_run_held_as_shapes_to
     run = dataclasses.replace(base, head=head, calibrate=False)
     if name == "joint":
         # A joint row's layout is 16,384 tokens long unless the run states one: its step over 8 such rows
-        # compiled in 34 s of the case's 165 s on armada (row 8770). The other heads read their base's 512.
+        # compiled in 34 s of the case's 165 s on armada (row 8770).
         run = dataclasses.replace(run, rows=RowBudgets(max_len=512))
     trainer = dataclasses.replace(run.trainer, name=name, checkpoint_dir=str(tmp_path / "runs"),
                                   steps=4, checkpoint_every=1, eval_every=None, log_every=1,
