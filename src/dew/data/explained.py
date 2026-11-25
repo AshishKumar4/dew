@@ -57,7 +57,7 @@ class TrainingRead:
     pools_of: Callable[[DataPartition], Mapping[str, Workers]] = dataclasses.field(
         default=lambda partition: {}, compare=False)
     """Each corpus's worker stage as a reader of a share (`DataPartition`) builds it: a corpus streamed from
-    whole files takes no more workers than its shards over the run's shares (`_Build.capacities`), so a
+    whole files takes no more workers than its shards over the run's shares (`_Build.whole_files`), so a
     read cut over more shares deals it fewer."""
     faster: Read | None = None
     """`memory`, where another read was taken and every source can be read into memory, its chain lowering

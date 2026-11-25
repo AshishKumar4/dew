@@ -1400,25 +1400,41 @@ class _Build:
         sharing restores only under the same, a corpus a mixture keeps across an edit included."""
         return {key: stage.count for key, stage in self.pool_stages(pipeline, partition).items()}
 
-    def pool_stages(self, pipeline: Pipeline, partition: DataPartition) -> dict[str, Workers]:
+    def pool_stages(self, pipeline: Pipeline, partition: DataPartition,
+                    files: Mapping[tuple, tuple[int | None, ...]] | None = None) -> dict[str, Workers]:
         """The worker stage each corpus reads in (`pools`), its count and the buffer its reader is built
-        with: a corpus's own written stage, else its share of its mixture's."""
+        with: a corpus's own written stage, else its share of its mixture's, by each mixture's whole-file
+        shards (`whole_files`) as `files` holds them where given (`whole_files_of`), read where not."""
         build = self.owning(pipeline)
         source = pipeline.source
         if build.pool is None or build.in_order:
             return {}
         if not isinstance(source, Combined):
             return {"/".join(str(key) for key in build.corpus): build.pool}
-        builds = build.member_builds(build.capacities(pipeline, partition))
+        shards = build.whole_files(pipeline) if files is None else files.get(build.corpus, ())
+        builds = build.member_builds(_capacities(shards, partition))
         return {key: stage for child, member in zip(source.pipelines, builds, strict=True)
-                for key, stage in member.pool_stages(child, partition).items()}
+                for key, stage in member.pool_stages(child, partition, files).items()}
 
-    def capacities(self, pipeline: Pipeline, partition: DataPartition) -> tuple[int | None, ...]:
-        """The most of a shared pool's workers each corpus `pipeline` mixes can take where its read streams
-        (`allocation`): its shards over `partition`'s shares where its store cannot cut them finer (whole
-        compressed files, each a worker's own), so no corpus is dealt more workers than it holds shards for
-        each, which the cut refuses (`dew.data.shards._shards`); None, no bound, for a corpus of mixtures or
-        one whose shards subdivide."""
+    def whole_files_of(self, pipeline: Pipeline) -> dict[tuple, tuple[int | None, ...]]:
+        """Each mixture's whole-file shards `pipeline` reads (`whole_files`), by the corpus key its build
+        reads them under: what `pool_stages` deals any share's workers by, read once."""
+        build = self.owning(pipeline)
+        source = pipeline.source
+        if build.pool is None or build.in_order or not isinstance(source, Combined):
+            return {}
+        shards = build.whole_files(pipeline)
+        found = {build.corpus: shards}
+        for child, member in zip(source.pipelines, build.member_builds(_capacities(shards, DataPartition())),
+                                 strict=True):
+            found.update(member.whole_files_of(child))
+        return found
+
+    def whole_files(self, pipeline: Pipeline) -> tuple[int | None, ...]:
+        """The shards each corpus `pipeline` mixes is read in where its read streams and its store cannot cut
+        them finer (whole compressed files, each a worker's own), so no corpus is dealt more workers than it
+        holds shards for each, which the cut refuses (`dew.data.shards._shards`); None for a corpus of
+        mixtures or one whose shards subdivide; none where the read is not a streamed mixture's in workers."""
         if self.pool is None or self.read != "streamed" or not isinstance(pipeline.source, Combined):
             return ()
         found: list[int | None] = []
@@ -1427,7 +1443,7 @@ class _Build:
                 found.append(None)
                 continue
             manifest = base.stream_manifest(child.source, positioned=False)
-            found.append(None if manifest.subdivide is not None else len(manifest.shards) // partition.count)
+            found.append(None if manifest.subdivide is not None else len(manifest.shards))
         return tuple(found)
 
     def stage_seed(self, pipeline: Pipeline, at: int, partition: DataPartition) -> int:
@@ -1453,7 +1469,7 @@ class _Build:
         read-ahead: a mix of hundreds of corpora holds what a read of one does, and a corpus whose share
         is no thread reads on the thread that draws from it."""
         nested = children(pipeline)
-        builds = self.member_builds(self.capacities(pipeline, partition))
+        builds = self.member_builds(_capacities(self.whole_files(pipeline), partition))
         builds = [dataclasses.replace(build, loading=dataclasses.replace(
             build.loading, threads=build.loading.threads // len(nested),
             read_buffer=build.loading.read_buffer // len(nested))) for build in builds]
@@ -2384,6 +2400,12 @@ def _split_spans(pipeline: Pipeline, build: _Build) -> Iterator[list[tuple[int, 
                 spans = build.spans.get(resolved) or _TokenSplit(read, split).spans
             build.spans.setdefault(resolved, spans)
             yield spans
+
+
+def _capacities(shards: tuple[int | None, ...], partition: DataPartition) -> tuple[int | None, ...]:
+    """The most of a pool's workers (`allocation`) a share's reader deals each corpus: its whole-file shards
+    (`_Build.whole_files`) over `partition`'s shares."""
+    return tuple(None if count is None else count // partition.count for count in shards)
 
 
 def worker_stage(pipeline: Pipeline, loading: Loading) -> Workers:

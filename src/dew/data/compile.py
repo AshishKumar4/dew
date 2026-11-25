@@ -1246,9 +1246,9 @@ def _compiled(
         tail=tail(train, build),
         order_records=ordered,
         # As a reader of each share is built (`_Build.pool_stages`): a whole-file corpus's pool bounded by its
-        # shards over the run's shares (`_Build.capacities`).
+        # shards over the run's shares, which are read here, once (`_Build.whole_files_of`).
         reading=TrainingRead(read, chooser, build.loading, worker_stage(train, build.loading),
-                             functools.partial(build.pool_stages, train),
+                             functools.partial(build.pool_stages, train, files=build.whole_files_of(train)),
                              faster=_faster((train,) if validation is None else (train, validation), build)),
     )
 

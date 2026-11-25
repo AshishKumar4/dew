@@ -882,9 +882,9 @@ class Trainer(Generic[Loss, Effects]):
                 lambda rows, path: jax.ShapeDtypeStruct((len(rows), *rows[0].shape), rows[0].dtype)))
         share = DataPartition.of(self.device_mesh) if positioned else None
         template = _waiting_restored(self._configured(placed_shapes(abstract, shardings)))
+        _refuse_lost_reference(template, checkpoints, resume)
         state, position = self._staging.restore(checkpoints, template, resume, share)
         _refuse_lost_waiting(state, checkpoints, resume)
-        _lost_reference_histories(state, checkpoints, resume)
         state = restored(state, resume, self._shape.examples)
         _rollout_resumed(self.rollout, checkpoints, resume, state.key.sharding)
         self._compiler.resume_rung(checkpoints.rung(resume))
@@ -2357,34 +2357,30 @@ class Trainer(Generic[Loss, Effects]):
 
 
 def _waiting_restored(template: TrainState) -> TrainState:
-    """`template` with what a checkpoint an earlier Dew wrote holds none of held concretely, placed, as a
-    restore keeps a leaf the template holds concretely where the checkpoint lacks it (`Checkpoints.restore`);
-    one that holds it restores it over this: what waits to roll into its amax histories (`NVFP4_PENDING`) as
-    nothing waiting, and a frozen reference's histories (`Objective.ema_is_reference`, which no average held
-    before) as its fresh start's, none recorded (`_lost_reference_histories` says where it took them)."""
-    def placed(tree, value: float):
-        return jax.tree.map(
-            lambda leaf: jax.device_put(jnp.full(leaf.shape, value, leaf.dtype), leaf.sharding), tree)
-
-    if NVFP4_PENDING in template.variables:
-        template = dataclasses.replace(template, variables={
-            **template.variables, NVFP4_PENDING: placed(template.variables[NVFP4_PENDING], -1.0)})
-    if template.ema is not None and NVFP4_HISTORY in template.ema:
-        fresh = placed(template.ema[NVFP4_HISTORY], 0.0)
-        template = dataclasses.replace(template, ema={**template.ema, NVFP4_HISTORY: fresh})
-    return template
+    """`template` with what waits to roll into its amax histories (`NVFP4_PENDING`) held as nothing waiting,
+    placed: a checkpoint an earlier Dew wrote holds no such collection, and a restore keeps a leaf the
+    template holds concretely where the checkpoint lacks it (`Checkpoints.restore`); one that holds it
+    restores it over this."""
+    if NVFP4_PENDING not in template.variables:
+        return template
+    nothing = jax.tree.map(lambda leaf: jax.device_put(jnp.full(leaf.shape, -1.0, leaf.dtype), leaf.sharding),
+                           template.variables[NVFP4_PENDING])
+    return dataclasses.replace(template, variables={**template.variables, NVFP4_PENDING: nothing})
 
 
-def _lost_reference_histories(state: TrainState, checkpoints: Checkpoints, step: int | str) -> None:
-    """Say where a frozen reference restored from a checkpoint an earlier Dew wrote, which kept no reference
-    histories (`NVFP4_HISTORY` under `ema`, row 13057), takes them as a fresh start's, none recorded
-    (`_waiting_restored`): its start's where its run began from an initialization, which records none."""
-    if state.ema is None or NVFP4_HISTORY not in state.ema:
+def _refuse_lost_reference(template: TrainState, checkpoints: Checkpoints, step: int | str) -> None:
+    """Refuse a frozen reference's restore (`Objective.ema_is_reference`) from a checkpoint an earlier Dew
+    wrote, which kept no amax histories of the reference (`NVFP4_HISTORY` under `ema`, row 13057): its start's
+    histories are recorded nowhere, a trained start's among them, which set the reference's scales and so its
+    loss, and no live history stands for them."""
+    if template.ema is None or NVFP4_HISTORY not in template.ema:
         return
     if NVFP4_HISTORY not in (checkpoints.stored(step).get("ema") or {}):
-        _log.warning("the checkpoint at step %s in %s holds no amax histories of its frozen reference (an "
-                     "earlier Dew kept none): the reference reads a fresh start's, which is its own start's "
-                     "where its run began from an initialization", step, checkpoints.directory)
+        raise ValueError(
+            f"the checkpoint at step {step} in {checkpoints.directory} holds no amax histories of its "
+            f"frozen reference: the Dew that wrote it kept the reference's delayed-scaling NVFP4 histories "
+            f"nowhere, so its reference cannot be restored as it scaled; resume it with the Dew that wrote "
+            f"it, or start the run again from its weights")
 
 
 def _refuse_lost_waiting(state: TrainState, checkpoints: Checkpoints, step: int | str) -> None:

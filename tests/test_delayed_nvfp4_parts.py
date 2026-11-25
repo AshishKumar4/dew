@@ -134,11 +134,10 @@ def test_a_run_resumed_partway_through_a_held_update_rolls_what_its_taken_calls_
             legacy.place()
 
 
-def test_a_reference_an_earlier_dew_saved_resumes_with_a_fresh_starts_histories(tmp_path):
+def test_a_reference_an_earlier_dew_saved_is_refused_and_one_this_dew_saved_resumes(tmp_path):
     """A frozen reference's checkpoint an earlier Dew wrote, which kept no histories of the reference (its
-    average held none, row 13057), resumes: the reference reads a fresh start's histories, none recorded, as
-    its run began from an initialization, never the live ones its run rolled; one this Dew wrote restores its
-    own."""
+    average held none, row 13057), is refused: the reference's start histories, a trained start's among them,
+    are recorded nowhere, and no live history stands for them; one this Dew wrote restores its own."""
     from dew.checkpoints import Checkpoints
 
     with generation.run_precision(DELAYED):
@@ -152,12 +151,13 @@ def test_a_reference_an_earlier_dew_saved_resumes_with_a_fresh_starts_histories(
         legacy.save(2, dataclasses.replace(state, ema={key: value for key, value in state.ema.items()
                                                        if key != NVFP4_HISTORY}))
         legacy.wait()
-        resumed = run("legacy").place()[0]
-    for read, live in zip(jax.tree.leaves(resumed.averaged[NVFP4_HISTORY]), histories(resumed), strict=True):
-        assert not np.asarray(read).any() and live[..., 0].min() > 0, (read, live)
-    for read, kept in zip(jax.tree.leaves(state.ema[NVFP4_HISTORY]),
-                          jax.tree.leaves(source.place()[0].ema[NVFP4_HISTORY]), strict=True):
-        np.testing.assert_array_equal(np.asarray(read), np.asarray(kept))
+        earlier = run("legacy")
+        with pytest.raises(ValueError):
+            earlier.place()
+        again = run("current")
+        kept = again.stored(again.place()[0]).ema[NVFP4_HISTORY]
+    for read, written in zip(jax.tree.leaves(kept), jax.tree.leaves(state.ema[NVFP4_HISTORY]), strict=True):
+        np.testing.assert_array_equal(np.asarray(read), np.asarray(written))
 
 
 def test_a_ppo_steps_records_are_its_own_passes_its_critics_among_them():
