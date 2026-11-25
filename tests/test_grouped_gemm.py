@@ -1238,23 +1238,25 @@ def test_a_blackwells_projection_and_its_gradients_hold_check_1(sizes, out):
 
 
 def _dense_case(generation_name: str, made: grouped_cells.Made, matrix: tuple[int, int], rows: int,
-                dtype=jnp.bfloat16) -> grouped_matmul.GroupedCase:
+                dtype=jnp.bfloat16, stored=None) -> grouped_matmul.GroupedCase:
     """The `GroupedCase` of a dense product of `dtype` operands on `generation_name` making `made` of `matrix`
-    `[in, out]` over `rows` tokens."""
+    `[in, out]` over `rows` tokens into `stored` (the receipts' own output dtype, `grouped_cells.STORED`,
+    where None)."""
     from dew.nn.kernels.templates.product import declared
 
     width_in, width_out = matrix
+    stored = jnp.dtype(grouped_cells.STORED[made] if stored is None else stored)
     shaped = functools.partial(jax.ShapeDtypeStruct, dtype=dtype)
     sizes = jax.ShapeDtypeStruct((1,), jnp.int32)
-    product = declared(dtype, None, outputs=(dtype,))
+    product = declared(dtype, None, outputs=(stored,))
     with generation.assumed(generation_name):
         if made == grouped_cells.Made.KERNEL_GRADIENT:
             call = grouped_matmul.tgmm_call(shaped((rows, width_in)), shaped((rows, width_out)), sizes,
-                                            out_dtype=dtype, interpret=False, dense=True)
+                                            out_dtype=stored, interpret=False, dense=True)
         else:
             transposed = made == grouped_cells.Made.INPUT_GRADIENT
             tokens = shaped((rows, width_out if transposed else width_in))
-            call = grouped_matmul.gmm_call(tokens, shaped((1, width_in, width_out)), sizes, out_dtype=dtype,
+            call = grouped_matmul.gmm_call(tokens, shaped((1, width_in, width_out)), sizes, out_dtype=stored,
                                            trans_rhs=transposed, interpret=False, dense=True)
         return grouped_matmul.grouped_case(*call, product=product, whole=True)
 
@@ -1268,9 +1270,9 @@ def _route(case: grouped_matmul.GroupedCase) -> str:
 def test_a_timed_product_is_recognized_over_its_receipts_rows_and_arithmetic_alone():
     """A receipt is evidence for the products it timed alone (`grouped_cells.Timed`, row 6794): each product a
     receipt timed (`grouped_cells.timings`) is recognized as its matrix over that receipt's rows
-    (`Kind.span`) in the arithmetic it timed, and not past those rows (a fine-tune's 2,048 took the 4B key's
-    cell and its launches made the step's products 1.75 ms slower) nor in another arithmetic (a float32
-    call's TF32 kernel)."""
+    (`Kind.span`) in the arithmetic and output dtype it timed, and not past those rows (a fine-tune's 2,048
+    took the 4B key's cell and its launches made the step's products 1.75 ms slower) nor in another
+    arithmetic (a float32 call's TF32 kernel) or output dtype (another staging and memory)."""
     for timing in grouped_cells.timings():
         if timing.formed:
             continue
@@ -1279,8 +1281,13 @@ def test_a_timed_product_is_recognized_over_its_receipts_rows_and_arithmetic_alo
         others = grouped_cells.MEASURED[timing.generation, timing.made, False]
         if not any(timed.holds(timing.matrix, rows - 1) for timed in others):
             assert _dense_case(timing.generation, timing.made, timing.matrix, rows - 1).kind.matrix is None
-        wide = _dense_case(timing.generation, timing.made, timing.matrix, rows, dtype=jnp.float32)
+        wide = _dense_case(timing.generation, timing.made, timing.matrix, rows, dtype=jnp.float32,
+                           stored=jnp.float32)
         assert wide.kind.matrix is None, timing
+        if timing.timed.stored is not None:
+            other = "bfloat16" if timing.timed.stored == "float32" else "float32"
+            assert _dense_case(timing.generation, timing.made, timing.matrix, rows,
+                               stored=other).kind.matrix is None, timing
 
 
 @pytest.mark.parametrize("board", grouped_cells.SCOREBOARDS, ids=lambda board: board.evidence.split()[0])

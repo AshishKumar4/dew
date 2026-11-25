@@ -267,6 +267,14 @@ class Form(NamedTuple):
         """The tile columns its epilogue narrows whole (`divisor` runs of `narrowed`), else its `divisor`."""
         return self.divisor * self.narrowed if self.narrowed else self.divisor
 
+    def __repr__(self) -> str:
+        # A launch's pick key reads its forms' repr (`grouped_launch._GroupedLaunch.traced`): a form that
+        # narrows nothing keys as it did before `narrowed` was a field.
+        if not self.narrowed:
+            return f"Form(divisor={self.divisor!r}, transposed={self.transposed!r}, packed={self.packed!r})"
+        return (f"Form(divisor={self.divisor!r}, transposed={self.transposed!r}, packed={self.packed!r}, "
+                f"narrowed={self.narrowed!r})")
+
 
 def forms_of(out_forms: tuple | None, dtypes: tuple) -> tuple:
     """Each of a call's outputs' form (`Hooks.out_forms`, each a `Form` or its fields' tuple), the outputs'

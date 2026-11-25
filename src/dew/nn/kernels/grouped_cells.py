@@ -79,11 +79,15 @@ class Timed(NamedTuple):
     fewest: int
     most: int
     dtype: str = 'bfloat16'
+    stored: str | None = None
+    """The output's dtype it timed, which a launch's staging and memory read; None where its record states
+    none."""
 
-    def holds(self, matrix: tuple, rows: int, dtype: str = 'bfloat16') -> bool:
-        """Whether a product of `matrix` over `rows` tokens of `dtype` operands is one these receipts
-        timed."""
-        return matrix in self.matrices and self.fewest <= rows <= self.most and dtype == self.dtype
+    def holds(self, matrix: tuple, rows: int, dtype: str = 'bfloat16', stored: str | None = None) -> bool:
+        """Whether a product of `matrix` over `rows` tokens of `dtype` operands, stored in `stored`, is one
+        these receipts timed."""
+        return (matrix in self.matrices and self.fewest <= rows <= self.most and dtype == self.dtype
+                and self.stored in (None, stored))
 
     @property
     def span(self) -> tuple[int, int]:
@@ -119,6 +123,11 @@ GEMM scoreboard times at 8,192 tokens."""
 
 Ranged = tuple[float, float, float]
 """A route's times over a receipt's rounds, in milliseconds: the least, the median and the most."""
+
+STORED = {Made.FORWARD: 'bfloat16', Made.INPUT_GRADIENT: 'bfloat16', Made.KERNEL_GRADIENT: 'float32'}
+"""The output dtype the dense receipts' products store (`SCOREBOARDS`, `FOUR_B_CELLS`): bf16 forwards and
+input gradients from bf16 operands, fp32 kernel gradients (the scoreboard's harness, em70r gemm_cells; the
+4B's dW into fp32, records/scoreboard.md)."""
 
 TEMPLATE, REFERENCE = 'mosaic', 'xla'
 """The routes a scoreboard's cell goes to (`Scoreboard.winner`), by the grouped selector's kernels' names."""
@@ -187,7 +196,7 @@ class Scoreboard(NamedTuple):
     def timings(self) -> tuple[Timing, ...]:
         """Each product it timed (`Timing`), the template's where at parity, XLA's otherwise."""
         return tuple(Timing(self.generation, made, PROJECTIONS[name],
-                            Timed(frozenset({PROJECTIONS[name]}), self.rows, self.rows),
+                            Timed(frozenset({PROJECTIONS[name]}), self.rows, self.rows, stored=STORED[made]),
                             TEMPLATE if self.at_parity(made, name) else REFERENCE, self.why(made, name))
                      for made, projections in self.times.items() for name in projections)
 
@@ -380,7 +389,7 @@ def timings() -> tuple[Timing, ...]:
     """Every product a receipt timed (`Timing`): the 4B's (`FOUR_B_CELLS`), the normed projections'
     (`NORMED`) and each scoreboard's (`SCOREBOARDS`), the one source `MEASURED` and
     `grouped_matmul.DECLARED` both read."""
-    return (*(Timing(generation, made, matrix, FOUR_B_TIMED, winner, evidence)
+    return (*(Timing(generation, made, matrix, FOUR_B_TIMED._replace(stored=STORED[made]), winner, evidence)
               for (generation, made, matrix), (winner, evidence) in FOUR_B_CELLS.items()),
             *(Timing(generation, made, matrix, timed, TEMPLATE, evidence, formed=True)
               for timed, evidence, generations in NORMED for generation in generations

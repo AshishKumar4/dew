@@ -2157,13 +2157,14 @@ def grouped_case(launches, arguments, options, *, product: Product, whole: bool)
     name = call.target.generation
 
     arithmetic = jnp.dtype(arguments[0].dtype).name
+    stored = jnp.dtype(options['out_dtype']).name
 
     def timed(*, formed: bool) -> Timed | None:
-        """The receipt timing this product's matrix over its rows in its arithmetic, formed or not, None
-        where none did."""
+        """The receipt timing this product's matrix over its rows in its arithmetic and output dtype, formed
+        or not, None where none did."""
         return None if matrix is None else next(
             (timed for timed in MEASURED.get((name, made, formed), ())
-             if timed.holds(matrix, rows, arithmetic)), None)
+             if timed.holds(matrix, rows, arithmetic, stored)), None)
 
     formed_by = timed(formed=True) if options['hooks'].prologue is not None else None
     formed = formed_by is not None

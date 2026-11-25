@@ -140,7 +140,7 @@ class _GroupedLaunch[Config: Hashable](base.Template[Config]):
         from .templates.gemm import quantized
 
         traced = math.lcm(TRACED_TILE, *(form.unit for form in quantized.forms_of(
-            value.out_forms, value.out_dtypes or ()) if form is not None))
+            value.out_forms, value.out_dtypes or ()) if form is not None and form.narrowed))
 
         def program(hook, axes_of: tuple, dtypes: tuple, tiles: int = 1,
                     extent: int = TRACED_TILE) -> str | None:
