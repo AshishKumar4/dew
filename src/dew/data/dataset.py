@@ -40,7 +40,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from dew import _cgroups as cgroups, _position
 from dew._records import JSON, boolean, integer, integers, json_value, listed, record, strings, text
 from dew.batch import DRAWS, EXAMPLES_CONSUMED, PHASE, VALID_ROWS, Batch, Draws, Phase, padded_rows
-from dew.data.explained import Reading, Sized, explained
+from dew.data.explained import TrainingRead, Sized, explained
 from dew.mesh import LayoutRefused, batch_axes
 from dew.registry import from_record, to_record
 
@@ -912,7 +912,7 @@ class Loader:
     """A read of phases' batches on the step clock, each from the record it starts at (`PhasedStream.stages`),
     which its steps a count of records takes are counted through (`steps_through`); none for one of one
     batch, or on the token clock, whose phases begin where the run's commits reach them."""
-    reading: Reading | None = None
+    reading: TrainingRead | None = None
     """How its training read reads, as its compile chose and sized it (`explain`); None for data handed as it
     is read."""
 

@@ -90,7 +90,7 @@ from dew.data.dataset import (
     phase_stages,
 )
 from dew.data.epochs import epoch_records, order_records, tail
-from dew.data.explained import Chooser, Reading
+from dew.data.explained import Chooser, TrainingRead
 from dew.data.facts import laid_out, merge_facts, row_lengths
 from dew.data.handed import Handed, native_loader
 from dew.data.handoff import record_stage_of
@@ -1152,7 +1152,7 @@ def _compiled(
 ) -> Loader:
     """The readers of `staged`, each training batch's packed windows laid out
     as `packed` declares them and each validation batch's as its own packs do
-    (`_held_coordinated`), and how its training read reads, its read chosen by `chooser` (`Reading`)."""
+    (`_held_coordinated`), and how its training read reads, its read chosen by `chooser` (`TrainingRead`)."""
     train, validation, original, build = staged.train, staged.validation, staged.original, staged.build
     counts, validation_counts = staged.counts, staged.validation_counts
     read, seed, batch, global_order = (
@@ -1244,7 +1244,7 @@ def _compiled(
         widths=_bound_widths(original),
         tail=tail(train, build),
         order_records=ordered,
-        reading=Reading(read, chooser, build.loading, _workers(train, build.loading), build.pools(train),
+        reading=TrainingRead(read, chooser, build.loading, _workers(train, build.loading), build.pools(train),
                         faster=_faster((train,) if validation is None else (train, validation), build)),
     )
 
@@ -1252,7 +1252,7 @@ def _compiled(
 def _faster(branches: tuple[Pipeline, ...], build: _Build) -> Read | None:
     """`memory`, where the run's `branches` (its training branch, then its validation's) are read otherwise,
     every source they read can be read into memory and both lower there, as the analysis's own refusals
-    state (`_lowers`): an interleave of a stream's shards in either does not (`Reading.faster`); None
+    state (`_lowers`): an interleave of a stream's shards in either does not (`TrainingRead.faster`); None
     otherwise. One read serves both, so a read either refuses is none to name."""
     if build.read == "memory" or _unsupported(branches, "memory") or not _lowers(branches, "memory"):
         return None

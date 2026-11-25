@@ -1,5 +1,5 @@
 """What `Loader.explain` renders: how a compiled read reads its training batches, as its compile chose
-and sized them (`Reading`, `Sized`) and as its plan records them (`dew.data.plan.Plan`). Every line is a
+and sized them (`TrainingRead`, `Sized`) and as its plan records them (`dew.data.plan.Plan`). Every line is a
 fact the compile recorded; nothing here reads, measures or decides."""
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ class Sized:
 
 
 @dataclasses.dataclass(frozen=True)
-class Reading:
+class TrainingRead:
     """How a compile reads its training batches: the read and who chose it, the loading its readers run
     with as automatic loading sized it, the worker processes the read runs in, each corpus's own where a
     read that drops records reads in workers of each corpus's (`dew.data.lowering._Build.pools`), and
@@ -94,7 +94,7 @@ def explained(loader: Loader) -> str:
     return "\n".join(lines)
 
 
-def _loading_lines(reading: Reading) -> list[str]:
+def _loading_lines(reading: TrainingRead) -> list[str]:
     """The workers and buffers `reading` reads in, and what automatic loading measured to size them."""
     loading = reading.loading
     held = (f"each holding {loading.ahead} batches ready" if reading.workers else "in the training process")
@@ -109,7 +109,7 @@ def _loading_lines(reading: Reading) -> list[str]:
     return lines
 
 
-def _rows_held(loader: Loader, reading: Reading) -> list[str]:
+def _rows_held(loader: Loader, reading: TrainingRead) -> list[str]:
     """The bytes of an epoch's rows as the read's sampled batches hold them, where they were sampled and the
     records counted: the rows its steps make, not the source records a memory read holds first."""
     sized = reading.loading.sized
