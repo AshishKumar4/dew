@@ -99,5 +99,6 @@ def test_a_key_decays_solve_is_enclosed_as_its_own_bundle_rounds_it():
     def stored(solving):
         return staged(rw.solved_blocks(system, solving), lane)
 
-    assert within(stored(lane.solving()), np.full(pairs.shape, -1.0))[1, 0]
-    assert not within(stored(lane), np.full(pairs.shape, -1.0))[1, 0]
+    native = np.full(pairs.shape, -1.0)
+    assert within(native, stored(lane.solving()))[1, 0]
+    assert not within(native, stored(lane))[1, 0]
