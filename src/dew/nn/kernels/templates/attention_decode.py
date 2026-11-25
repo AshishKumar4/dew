@@ -285,8 +285,9 @@ def _priced_slices(query, key, value, spans: KeySpans, hooks: Hooks | None, sing
                 return None
             merge = _merge_seconds(query, value, spans, tile, count, target=target, initial=initial)
             prices[count, tile] = (walk + merge, sliced_op, sliced_ba)
+    # The least price, then the fewer slices, then the smaller key tile.
     (count, tile), (_, chosen_op, chosen_ba) = min(
-        prices.items(), key=lambda item: (item[1][0], item[0][0], item[0][1].block_k))
+        prices.items(), key=lambda priced: (priced[1][0], priced[0][0], priced[0][1].block_k))
     return count, tile, chosen_op, chosen_ba
 
 
