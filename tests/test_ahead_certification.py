@@ -135,3 +135,42 @@ print(json.dumps({"started": started, "compiled_on": compiled_on, "certified": c
     # alike, never the host's: a certification is one a launch and device, so none twice (rows 6791, 6824,
     # 7212).
     assert result["certified"] and {each[1] for each in result["certified"]} == {result["first"]}, result
+
+def test_a_scanned_compile_ahead_carries_the_unstack_its_fit_returns_through(tmp_path):
+    """A one-stage scanned run compiled ahead (`compile_ahead` with `fit=`, as the GPU test's QUIET_BUILD
+    builds it) carries in `AheadOfTime.starts` the donated `_layered_entries` unstack programs
+    `Trainer.fit` runs as it returns its state on its stored layers, so a run loading it compiles none of them
+    (row 7322: a loading A100 run compiled them on its GPU)."""
+    script = """
+import dataclasses
+import json
+import jax
+from test_compile_ahead import BATCH, SEQ_LEN, VOCAB, fine_tune
+from token_support import token_rows
+from dew.data import Memory
+from dew.distributed.placement import placed_shapes
+from dew.nn.kernels import options
+from dew.nn.kernels.generation import assumed, chosen, compile_only_gpus
+from dew.training import Inspection, MeshSpec
+from dew.training.ahead import compile_ahead
+
+gen, sms, mem, share = "sm80", 108, 40 * 2**30, 0.75
+with chosen(attention="xla"):
+    target = MeshSpec().build(compile_only_gpus(gen, 1, mem, multiprocessors=sms, share=share))
+    trainer = fine_tune(target, split=2, inspection=Inspection(every=2), dtype="bfloat16")
+    validation = {"val": Memory(token_rows(VOCAB, 2 * BATCH, SEQ_LEN + 1, seed=1)).batch(BATCH)}
+    fit = {"steps": 6, "log_every": 5, "eval_every": 3, "validation": validation}
+    ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), fit=fit)
+    a100 = dataclasses.replace(ahead.target, device_kind="NVIDIA A100-SXM4-40GB")
+    with assumed(a100, portable=False):
+        start = trainer._started()
+        placed = placed_shapes(start.abstract, start.shardings)
+        with options.lowering(("cuda",)) as lowered:
+            trainer._staging.stored(dataclasses.replace(placed, compute=None), consumed=True)
+digests = [options.stated_digest(program) for _, program in lowered]
+print(json.dumps({"unstacks": len(digests), "carried": [digest in ahead.starts for digest in digests]}))
+"""
+    untuned = f"{os.environ.get('XLA_FLAGS', '')} --xla_gpu_autotune_level=0".strip()
+    result = fresh(script, cache_dir=tmp_path / "cache", platforms="cpu",
+                   variables={"CUDA_VISIBLE_DEVICES": ""}, flags=untuned)
+    assert result["unstacks"] >= 2 and all(result["carried"]), result

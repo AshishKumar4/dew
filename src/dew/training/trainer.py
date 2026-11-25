@@ -1245,6 +1245,7 @@ class Trainer(Generic[Loss, Effects]):
             # One boundary lookup at setup: the prefetch worker and the step scopes share whichever profiler
             # owns the capture.
             tracer = profiler if profiler is not None else telemetry_profile.active_profile()
+            ahead = self._compiler.ahead
             try:
                 # A run handed a step compiled ahead runs every program compiled with it as compiled
                 # (`_taking`).
@@ -1276,7 +1277,8 @@ class Trainer(Generic[Loss, Effects]):
             raise Preempted(run.preempted)
         # One stage's scan holds its runs stacked for its step alone: the state a run returns holds them on
         # their stored layers, as every reader by layer name reads them, at no device's cost but the copy.
-        return trained if self._staging.stages > 1 else self._staging.stored(trained, consumed=True)
+        with contextlib.nullcontext() if ahead is None else ahead.taking():
+            return trained if self._staging.stages > 1 else self._staging.stored(trained, consumed=True)
 
     def _fit_plan(
         self,
