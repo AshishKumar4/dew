@@ -1533,6 +1533,6 @@ def test_recurrence_recognition_candidate_cache_wy_state_bounds_literal_guard_an
         return jax.lax.scan(
             step, _bounded_box(state),
             (_l2norm(q), _l2norm(k), _bounded_box(v), jnp.minimum(g, 0.0), jax.nn.sigmoid(beta)))
-    with jax.enable_x64(True), generation.assumed("sm90"):
+    with jax.enable_x64(new_val=True), generation.assumed("sm90"):
         f64_shapes = tuple(jax.ShapeDtypeStruct(s.shape, jnp.float64) for s in qkv_shapes)
         assert dew.jit(scan_f64_subnormal_div).trace(*f64_shapes) is not None

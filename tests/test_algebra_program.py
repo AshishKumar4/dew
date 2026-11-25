@@ -2438,8 +2438,8 @@ def test_body_key_distinguishes_factory_callable_dataclasses_and_norm_rejects_pe
         r2 = program._closed(c2, accurate=False, saturation=algebra.SATURATION, kernels=True)
     assert r1.jaxpr != r2.jaxpr
     y1, y2 = dew.jit(f1)(x_in, w_in), dew.jit(f2)(x_in, w_in)
-    np.testing.assert_allclose(np.asarray(y2 - y1), np.ones((256, 256), np.float32), atol=1e-5)
-
+    np.testing.assert_array_equal(np.asarray(y1), np.full((256, 256), 2.0, np.float32))
+    np.testing.assert_array_equal(np.asarray(y2), np.full((256, 256), 3.0, np.float32))
     # 2. A same-shape permuting reshape `(0, 2, 1, 3)` on a norm denominator proves no unit bound.
     def swapped_norm(x):
         denom = jnp.sum(jnp.square(x), axis=-1, keepdims=True) + jnp.float32(1e-6)

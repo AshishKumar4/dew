@@ -707,7 +707,8 @@ def _dataclass_param_key(value, kind: type, *, reject_device: bool) -> Hashable:
     non-field attributes (so factory-made callable dataclasses with identical qualnames never collide)."""
     fields = dataclasses.fields(value)
     field_names = {field.name for field in fields}
-    extra_dict = hasattr(value, "__dict__") and not set(value.__dict__).issubset(field_names)
+    inst_dict = value.__dict__ if any("__dict__" in cls.__dict__ for cls in kind.__mro__) else None
+    extra_dict = inst_dict is not None and not set(inst_dict).issubset(field_names)
     extra_slots = any(
         not set((slots,) if isinstance(slots, str) else slots).issubset(
             field_names | {"__dict__", "__weakref__"})

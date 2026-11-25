@@ -229,6 +229,11 @@ def _digest(value) -> Hashable:
     return dtype, array.shape, hashlib.sha256(np.ascontiguousarray(array).tobytes()).hexdigest()
 
 
+def _training_ok(candidate: Candidate) -> bool:
+    """Whether `candidate` has no post-match training probe or its training probe passes."""
+    return candidate.training_ok is None or candidate.training_ok()
+
+
 def _chosen(index: fusion.Index, places: tuple[int, ...], members: Sequence[Candidate],
             accurate: bool) -> int | None:
     """The first of one region's candidates whose call takes a kernel, which the e-graph proves equal to the
@@ -237,14 +242,14 @@ def _chosen(index: fusion.Index, places: tuple[int, ...], members: Sequence[Cand
     for number, candidate in enumerate(members):
         if (candidate.taken()
                 and _equalities(index, [(candidate, places)], accurate, saturating=False)[0]
-                and (candidate.training_ok is None or candidate.training_ok())):
+                and _training_ok(candidate)):
             return number
     taken = [number for number, candidate in enumerate(members) if candidate.taken()]
     if not taken:
         return None
     equal = _equalities(index, [(members[number], places) for number in taken], accurate)
     return next((number for number, same in zip(taken, equal, strict=True)
-                 if same and (members[number].training_ok is None or members[number].training_ok())), None)
+                 if same and _training_ok(members[number])), None)
 
 
 def _holds(equation: jcore.JaxprEqn, primitive: jcore.Primitive) -> bool:
