@@ -1013,10 +1013,12 @@ inside another (`dew.nn.kernels.options._Structure`)."""
 
 @dataclasses.dataclass(eq=False)
 class _Held:
-    """A launch's held trace (`lowered_once`): its program, its outputs' structure and the kernels it named
-    (`report.naming`); the facts it read are its holder's (`_cache.holding`)."""
+    """A launch's held trace (`lowered_once`): its program, the constants its trace hoisted out of it, which
+    it takes ahead of its operands (a scalar the launch made of a static), its outputs' structure and the
+    kernels it named (`report.naming`); the facts it read are its holder's (`_cache.holding`)."""
 
     jaxpr: jax_core.Jaxpr
+    consts: tuple
     outputs: _Structure
     named: tuple
 
@@ -1026,8 +1028,8 @@ class _Held:
         kernels' calls carry the launch they are bound for as they were traced. The trace's own, so a trace
         its holder lets go of releases its jit with it."""
         (outputs,) = self.outputs
-        run = jax_core.jaxpr_as_fun(self.jaxpr)
-        return owned_program(lambda *operands: jax.tree.unflatten(outputs, run(*operands)))
+        run, consts = jax_core.jaxpr_as_fun(self.jaxpr), self.consts
+        return owned_program(lambda *operands: jax.tree.unflatten(outputs, run(*consts, *operands)))
 
 
 LAUNCHES_HELD = 4096
@@ -1113,7 +1115,8 @@ def lowered_once(static: tuple[str, ...], *, configured: tuple[str, ...] = (), a
                         raise ValueError(f"{launch.__qualname__} builds {sorted(strays)}, which it does not "
                                          f"say it builds ({sorted(builds or ())}): it was given none of "
                                          "their config")
-                    made.append(_Held(program.jaxpr, (jax.tree.structure(program.out_info),), tuple(named)))
+                    made.append(_Held(program.jaxpr, tuple(program._consts),
+                                      (jax.tree.structure(program.out_info),), tuple(named)))
                     return made[-1]
 
                 found = _cache.holding(held, key, making, LAUNCHES_HELD)
