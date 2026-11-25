@@ -367,59 +367,81 @@ class RemoteCache:
                                                and (bool(loaded) or len(written) < len(every)))
                 fetched = every if keeps else loaded
                 self.sealed.add(file)
+                # A run that loaded none of it and compiled none writes nothing, whatever it fetched (a recut
+                # group's borrowed programs, `_siblings`, among them).
+                if not loaded and not written and file not in self.blind:
+                    return
                 # What it keeps: the fetched programs its run loaded (a recut group's, borrowed from its
                 # file's other cuts, `_siblings`, written under its own cut once), and those it compiled.
                 wanted = {*written, *fetched}
                 if not wanted or wanted == self.queued.get(file) or wanted == self.held.get(file):
                     return
-            chunks, dropped = self._chunks([*fetched, *written])
-            # A kept bundle that leaves no room for what its run compiled drops what the run did not load.
-            if keeps and dropped & set(written):
-                fetched = loaded
-                wanted = {*written, *fetched}
-                chunks, _ = self._chunks([*fetched, *written])
+            # Laid out by the programs' sizes alone, no payload read: one bundle's payloads read once, for the
+            # chunks it sends.
+            layout, displaced = self._layout([*fetched, *written])
+            # A kept bundle that leaves no room for a program its run compiled drops what the run did not
+            # load, where that makes room for it.
+            if keeps and displaced & set(written):
+                pruned, still = self._layout([*loaded, *written])
+                if displaced & set(written) - still:
+                    fetched, layout = loaded, pruned
+                    wanted = {*written, *fetched}
         except UNREACHABLE as error:
             self._failed(error)
             return
         with self.state:
             self.queued[file] = wanted
-            kept = {key for entries in chunks for key, _ in entries}
+            kept = {key for keys in layout for key in keys}
             if not kept or kept == self.held.get(file, set()):
                 return  # nothing new fits: the Worker's bundle stays as it is
             self.held[file] = kept
             held = self.chunked.get(file, [])
-            changed = [index for index, entries in enumerate(chunks)
-                       if index >= len(held) or [key for key, _ in entries] != held[index]]
-            self.chunked[file] = [[key for key, _ in entries] for entries in chunks]
-        for index in changed:
-            self.uploads.put((self._chunk(file, index), packed(chunks[index])))
+            changed = [index for index, keys in enumerate(layout)
+                       if index >= len(held) or keys != held[index]]
+            self.chunked[file] = [list(keys) for keys in layout]
+        try:
+            for index in changed:
+                self.uploads.put((self._chunk(file, index), packed(self._payloads(layout[index]))))
+        except UNREACHABLE as error:
+            self._failed(error)
+            return
         # The chunks it held past those it now fills, deleted, so the next fetch ends where this bundle does.
         for index in range(len(chunks), len(held)):
             self.uploads.put((self._chunk(file, index), None))
 
-    def _chunks(self, keys: list[str]) -> tuple[list[list[tuple[str, bytes]]], set[str]]:
-        """`keys`' programs of the directory in chunks of at most `MAX_BYTES` (`CHUNKS` of them), in order,
-        and those past the bound that went without."""
-        chunks: list[list[tuple[str, bytes]]] = [[]]
-        size, dropped = 0, set()
+    def _payloads(self, keys: list[str]) -> list[tuple[str, bytes]]:
+        """`keys`' programs as the directory holds them, one gone since its layout (JAX's cache evicts) going
+        without."""
+        entries = []
+        for key in keys:
+            try:
+                entries.append((key, (self.directory / f"{key}{SUFFIX}").read_bytes()))
+            except FileNotFoundError:
+                continue
+        return entries
+
+    def _layout(self, keys: list[str]) -> tuple[list[list[str]], set[str]]:
+        """`keys`' programs of the directory laid out by their sizes in chunks of at most `MAX_BYTES`
+        (`CHUNKS` of them), in order, no payload read; and those a full layout displaced. A program past the
+        bound, which no chunk holds, goes without and is none displaced."""
+        layout: list[list[str]] = [[]]
+        size, displaced = 0, set()
         for key in dict.fromkeys(keys):
             path = self.directory / f"{key}{SUFFIX}"
             if not path.exists():
                 continue
             cost = HEADER.size + len(key.encode()) + path.stat().st_size
             if cost > MAX_BYTES:  # a program past the bound goes without; the rest may fit
-                dropped.add(key)
                 continue
             if size + cost > MAX_BYTES:
-                if len(chunks) == CHUNKS:
-                    dropped.add(key)
+                if len(layout) == CHUNKS:
+                    displaced.add(key)
                     continue
-                chunks.append([])
+                layout.append([])
                 size = 0
-            value = path.read_bytes()
-            size += HEADER.size + len(key.encode()) + len(value)
-            chunks[-1].append((key, value))
-        return chunks, dropped
+            size += cost
+            layout[-1].append(key)
+        return layout, displaced
 
     def _uploading(self) -> None:
         while True:

@@ -560,6 +560,41 @@ def test_a_run_of_part_of_a_files_tests_keeps_its_bundle_whole_and_writes_nothin
     assert kept == {f"jit_{name}-2" for name in "vwxyz"}
 
 
+def test_a_kept_bundle_full_makes_room_for_what_its_part_compiled_and_never_for_an_unsendable_program(
+        cache_worker, tmp_path, monkeypatch):
+    """A part's run whose kept bundle leaves no room for a program it compiled drops what it did not load to
+    make room for it; a program too large for any chunk drops nothing; and a run that loaded none and
+    compiled none writes nothing, whatever it fetched."""
+    url, stored, _ = cache_worker
+    value = b"v" * 60
+    monkeypatch.setattr(remote_cache, "CHUNKS", 1)
+    each_cost = remote_cache.HEADER.size + len("jit_a-1") + len(value)
+    monkeypatch.setattr(remote_cache, "MAX_BYTES", 4 * each_cost)
+    bundle = "/jax/cpu/bundles/tests/full.py"
+
+    def ran(name: str, load: str, compile_: tuple[str, bytes] | None) -> set[str]:
+        stored[bundle] = remote_cache.packed([(f"jit_{each}-1", value) for each in "abcd"])
+        cache = remote_cache.RemoteCache(tmp_path / name, url, "token", "jax/cpu")
+        cache.opened("tests/full.py")
+        if load:
+            loaded(tmp_path / name, load)
+        if compile_:
+            compiled(tmp_path / name, *compile_)
+        cache.closed("tests/full.py")
+        cache.drain()
+        return {key for key, _ in remote_cache.unpacked(stored[bundle])[0]}
+
+    assert ran("room", "jit_a-1", ("jit_e-1", value)) == {"jit_a-1", "jit_e-1"}
+    whole = {f"jit_{each}-1" for each in "abcd"}
+    assert ran("huge", "jit_a-1", ("jit_x-1", b"x" * remote_cache.MAX_BYTES)) == whole
+    held = stored[bundle]
+    idle = remote_cache.RemoteCache(tmp_path / "idle", url, "token", "jax/cpu")
+    idle.opened("tests/full.py")
+    idle.closed("tests/full.py")
+    idle.drain()
+    assert stored[bundle] is held
+
+
 def test_a_bundle_that_runs_again_after_another_keeps_what_it_loaded_in_each_stint(cache_worker, tmp_path):
     """A file's bundle closed, another's run, then the first's again (A, B, A): a fetched program the first
     loads only in its second stint stays in its bundle with the one it loaded in its first (review,
