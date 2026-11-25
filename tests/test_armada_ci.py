@@ -15,8 +15,17 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-from armada_support import (apart, armada_task, cached, cached_checkout, cached_runs, commit, interpreter,
-                             loaded, written)
+from armada_support import (
+    apart,
+    armada_task,
+    cached,
+    cached_checkout,
+    cached_runs,
+    commit,
+    interpreter,
+    loaded,
+    written,
+)
 from tool_support import git, load
 
 ROOT = Path(__file__).resolve().parents[1]
