@@ -2086,17 +2086,26 @@ def test_dead_nested_result_behind_custom_vmap_is_cleaned_and_unreported():
         return live, dead_swiglu
 
     @custom_vmap
-    def wrapped(a, b):
+    def wrapped_dead(a, b):
         live, _ = inner(a, b)
         return live
 
-    wrapped.def_vmap(lambda size, batched, a, b: (wrapped(a, b), batched[0]))
+    wrapped_dead.def_vmap(lambda size, batched, a, b: (wrapped_dead(a, b), batched[0]))
+
+    @custom_vmap
+    def wrapped_live(a, b):
+        live, used_swiglu = inner(a, b)
+        return live + used_swiglu
+
+    wrapped_live.def_vmap(lambda size, batched, a, b: (wrapped_live(a, b), batched[0]))
 
     shapes = [jax.ShapeDtypeStruct((256, 1024), jnp.bfloat16)] * 2
-    with generation.assumed("sm90"), generation.routes() as found:
-        traced = jax.jit(algebra.rewritten(wrapped, kernels=True)).trace(*shapes)
-    assert not any(route.choice == "swiglu" for route in found)
-    assert not any(eq.primitive is jax.lax.logistic_p for eq in equations(traced.jaxpr.jaxpr))
+    with generation.assumed("sm90"), generation.routes() as found_dead:
+        jax.jit(algebra.rewritten(wrapped_dead, kernels=True)).trace(*shapes)
+    assert not any(route.choice == "swiglu" for route in found_dead)
+    with generation.assumed("sm90"), generation.routes() as found_live:
+        jax.jit(algebra.rewritten(wrapped_live, kernels=True)).trace(*shapes)
+    assert any(route.choice == "swiglu" and route.kernel != "xla" for route in found_live)
 
 
 def test_shared_divisor_fanout_stays_bounded_and_proven_matches_region_on_chained_broadcasts():

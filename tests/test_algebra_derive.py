@@ -1086,14 +1086,18 @@ def test_chunked_moments_preserves_zero_weight_derivatives_and_extreme_anchor_di
 
     # Opposite-sign extreme anchors (`2^127 - (-2^127)` would overflow float32 if subtracted unscaled).
     big = np.float32(2.0 ** 127)
+    near_big = (float(big), float(np.nextafter(big, np.float32(0.0))))
     for x_pair, y_pair in (([-big, big], [-1.0, 1.0]), ([big, -big], [1.0, -1.0])):
         x_ext = jnp.asarray([x_pair], jnp.float32)
         y_ext = jnp.asarray([y_pair], jnp.float32)
-        w_ext = jnp.asarray([[0.25, 0.25]], jnp.float32)
-        for mode in ("walk", "merge"):
-            mx, my, cov = moments.chunked_covariance(x_ext, y_ext, w_ext, tile=1, mode=mode)
-            assert np.all(np.isfinite(np.asarray(mx))) and float(mx[0]) == 0.0
-            assert np.all(np.isfinite(np.asarray(my))) and float(my[0]) == 0.0
-            assert np.all(np.isfinite(np.asarray(cov)))
-            # Within 1 ULP of exact 2^127 (sqrt(0.125) rounds by <= 0.5 ULP in fp32).
-            assert abs(float(cov[0]) - float(big)) <= float(np.spacing(big))
+        for w_pair, exact_only in (([0.5, 0.5], True), ([0.25, 0.25], False)):
+            w_ext = jnp.asarray([w_pair], jnp.float32)
+            for mode in ("walk", "merge"):
+                mx, my, cov = moments.chunked_covariance(x_ext, y_ext, w_ext, tile=1, mode=mode)
+                assert np.all(np.isfinite(np.asarray(mx))) and float(mx[0]) == 0.0
+                assert np.all(np.isfinite(np.asarray(my))) and float(my[0]) == 0.0
+                assert np.all(np.isfinite(np.asarray(cov)))
+                if exact_only:
+                    assert float(cov[0]) == float(big)
+                else:
+                    assert float(cov[0]) in near_big

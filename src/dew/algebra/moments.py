@@ -102,7 +102,7 @@ def _run_chunked(kind: Literal["weighted", "masked", "covariance"], operands: di
     empty = forms.init(shapes)
     if mode == "walk":
         state, _ = jax.lax.scan(lambda carry, chunk: (forms.step(carry, chunk), None), empty, tiled)
-        result = forms.finish(state, first, shapes=shapes)
+        finished = forms.finish(state, first, shapes=shapes)
     else:
         partials = jax.vmap(lambda chunk: forms.step(empty, chunk))(tiled)
         while partials[0].shape[0] > 1:
@@ -116,10 +116,10 @@ def _run_chunked(kind: Literal["weighted", "masked", "covariance"], operands: di
                 merged = jax.tree.map(lambda a, b: jnp.concatenate([a, b], axis=0), merged, tail)
             partials = merged
         final = jax.tree.map(lambda state: state[0], partials)
-        result = forms.finish(final, first, shapes=shapes)
+        finished = forms.finish(final, first, shapes=shapes)
     if out_dtype is not None:
-        result = jax.tree.map(lambda value: value.astype(out_dtype), result)
-    return result
+        finished = jax.tree.map(lambda value: value.astype(out_dtype), finished)
+    return finished
 
 
 def _floating_dtype(*arrays: jax.Array):
