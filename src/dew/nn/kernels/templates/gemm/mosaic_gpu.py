@@ -798,8 +798,7 @@ def _gmm_finished(accs: tuple, tile: tuple, wg, store, *, family: mosaic.Family,
         origins={'rows': pl.ds(part_row, part[0]), 'columns': pl.ds(column, part[1])},
         group=_side_group(group, g), nonfinite=nonfinite,
         place=(part_row, first, stored, column, min(part[0], m), TMA_ROWS if dense else 1),
-        reading=reading._replace(narrowed=tuple(None if divisor == 1 else (divisor, ni * (part[1] // divisor))
-                                                for divisor in reading.narrowed)))
+        reading=reading, column_tile=ni)
     if partials is None or partials[0] is None:
         finished(*accs)
         return
@@ -874,7 +873,7 @@ def _fixed_loaded(family: mosaic.Family, prologue_gmems, prologue_axes: tuple, f
 
 
 def _finished(*accs, family: mosaic.Family, wg, epilogue, o_gmems: tuple, store, sides: tuple, origins: dict,
-              group, place: tuple, nonfinite=None, reading=NO_READ_OUT) -> None:
+              group, place: tuple, nonfinite=None, reading=NO_READ_OUT, column_tile=0) -> None:
     """Dew: a consumer's share of a `gmm` tile from its accumulators (`accs`), read out a chunk of columns
     at a time (`mosaic.Issuer.chunks`: all of them at once where its registers hold them): its epilogue on
     its side tiles' same columns (`sides`, each its global ref, axes, staging and barrier, loaded at
@@ -885,8 +884,8 @@ def _finished(*accs, family: mosaic.Family, wg, epilogue, o_gmems: tuple, store,
     written there: the stored value's, converted once, as a finite fp32 sum can overflow its output's dtype
     (base review b1ab251ac F1: 65536, the joined sum where the products' was 65504, an fp16 infinity), of its
     stored rows alone: another group's, by this entry's matrix, may overflow (base review d0bc7dee6 F3). An
-    output `reading` narrows (its divisor and first column, `_gmm_finished`'s) stored at its own column; a
-    hook takes `reading.columns` at a time (`read_out`), its issuer's own read-out where None."""
+    output `reading` narrows stored at its own column (`column_tile` times its stored width); a hook takes
+    `reading.columns` at a time (`read_out`), its issuer's own read-out where None."""
     family.loaded([(gmem.at[axes.named(side_axes, origins | axes.at_group(side_axes, gmem.shape, group))],
                     smem.at[wg], barrier.at[wg])
                    for gmem, side_axes, smem, barrier in sides],
@@ -914,8 +913,8 @@ def _finished(*accs, family: mosaic.Family, wg, epilogue, o_gmems: tuple, store,
                     kept = family.iota(value.shape, 0) - first
                     stored_rows = (kept >= 0) & (kept < stored)
                     seen = seen | jnp.any(stored_rows & jnp.isnan(value * 0))
-                own = reading.narrowed[output] if reading.narrowed else None
-                at = column + start if own is None else own[1] + start // own[0]
+                own = reading.narrowed[output] if reading.narrowed else 1
+                at = column + start if own == 1 else column_tile * (width // own) + start // own
                 store(output, value, o_gmem, (row_start, first, stored, at, *ladder), within=(start, width))
     if nonfinite is not None:
         nonfinite[...] = jnp.broadcast_to(seen.astype(jnp.int32), (1,))

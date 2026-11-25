@@ -289,13 +289,18 @@ def cast_rounded(x: jax.Array, dtype: Dtype) -> jax.Array:
 def gated_hook(activation: str, limit: float | None = None) -> Callable[[jax.Array, jax.Array], jax.Array]:
     """A gated MLP's product of its gate and up projections as a GEMM hook traces it (`dew.nn.gated_mlp`):
     the projections clamped by `limit` (`swiglu_clamped`), then `gated_product`'s arithmetic of
-    `activation`'s gate ('swiglu', 'geglu', 'geglu_exact'), each rounding a cast pair (`cast_rounded`)."""
+    `activation`'s gate ('swiglu', 'geglu', 'geglu_exact'), each rounding a cast pair (`cast_rounded`),
+    declared column-local (`templates.gemm.hooks.ColumnLocal`)."""
+    from dew.nn.kernels.templates.gemm.hooks import ColumnLocal
+
     product = _gated(_gate_function(activation, 'xla'), cast_rounded)
 
     def hook(gate: jax.Array, up: jax.Array) -> jax.Array:
         return product(*swiglu_clamped(gate, up, limit))
 
-    return hook
+    # Entrywise in its operands, so a GEMM reads its tile, or its derivative's, out a chunk of columns at a
+    # time (`ColumnLocal`: the paired backward's pulled d_hidden, row 1958).
+    return ColumnLocal(hook)
 
 
 def _gated(activate: Callable[[jax.Array], jax.Array], rounding: Callable = rounded_to

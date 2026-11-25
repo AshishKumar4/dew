@@ -68,3 +68,21 @@ def test_a_hooked_product_over_a_chunked_tile_is_its_programs(hook, out_dtypes):
     assert_as_exact(jax.jit(_template(hook, out_dtypes)), jax.jit(_reference(hook, out_dtypes)), _draw,
                     f"chunked hook {hook.__name__}", seeds=SEEDS,
                     truth_fn=_reference(hook, (jnp.float64,) * len(out_dtypes), wide=jnp.float64))
+
+
+def test_a_hooks_declared_locality_holds_through_the_forms_a_launch_takes_it_in():
+    """A hook's `ColumnLocal` declaration reads through the form every launch holds it in
+    (`tuning.prepared`) and its side tiles' dimensions of one given back (`Hooks.after`), and an
+    undeclared hook, a gated MLP's own (`activations.gated_hook`, declared) aside, reads as none."""
+    from dew.nn import activations
+    from dew.nn.kernels.templates.gemm.hooks import Hooks, column_local
+
+    def plain(acc, side):
+        return acc + side
+
+    for declared in (False, True):
+        hook = ColumnLocal(plain) if declared else plain
+        held = Hooks(epilogue=tuning.prepared(hook), epilogue_axes=(('rows', 'columns'),),
+                     epilogue_broadcast=((1,),))
+        assert column_local(held.after()) is declared
+    assert column_local(tuning.prepared(activations.gated_hook("swiglu")))
