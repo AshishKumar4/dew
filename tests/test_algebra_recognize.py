@@ -1304,7 +1304,7 @@ def _gdn_make_scan(step_fn, *, clamp_g: bool = True, reverse: bool = False,
     """Helper scan wrapper configuring decay/range/reverse variations for recurrence tests."""
     def run(state, q, k, v, g, beta):
         s_in, v_in = (
-            (_bounded_box(state, 0.125).astype(q.dtype).astype(jnp.float32), _bounded_box(v))
+            (_bounded_box(state, 0.125).astype(q.dtype).astype(state.dtype), _bounded_box(v))
             if bound_state_v else (state, v))
         q_in, k_in, b_in = (
             (_l2norm(q), _l2norm(k), jax.nn.sigmoid(beta)) if bound_inputs else (q, k, beta))

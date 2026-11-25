@@ -574,9 +574,9 @@ def _parameter_key_other(value, kind: type) -> Hashable:
         return ("partitions", parameter_key(tuple(value)), parameter_key(value.unreduced),
                 parameter_key(value.reduced), parameter_key(value.unreduced_kind))
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        fields = dataclasses.fields(value)
-        return "record", _named(kind), tuple((field.name, parameter_key(getattr(value, field.name)))
-                                             for field in fields)
+        return (("object", _named(kind), _Identity(value)) if kind.__eq__ is object.__eq__ else
+                ("record", _named(kind), tuple((f.name, parameter_key(getattr(value, f.name)))
+                                               for f in dataclasses.fields(value))))
     if isinstance(value, (tuple, list)):
         # A named tuple's type names its fields, which its parts take in order.
         return "sequence", _named(kind), tuple(parameter_key(part) for part in value)
@@ -771,7 +771,7 @@ def _in_process_param_key(value, *, reject_device: bool) -> Hashable:
         return "mapping", tuple(sorted(((_in_process_param_key(k, reject_device=reject_device),
                                          _in_process_param_key(v, reject_device=reject_device))
                                         for k, v in value.items()), key=repr))
-    if callable(value) and not isinstance(value, (type, np.dtype)):
+    if callable(value) and not isinstance(value, (type, np.dtype, jax.sharding.Mesh)):
         if reject_device:
             raise _Unshareable
         if kind.__eq__ is object.__eq__:
