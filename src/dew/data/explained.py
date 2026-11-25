@@ -53,11 +53,10 @@ class Reading:
     workers: int
     pools: Mapping[str, int] = dataclasses.field(default_factory=dict)
     faster: Read | None = None
-    """`memory`, where its sources chose another read and every one of them can be read into memory, which
-    the rows its read samples at their bytes (`Sized`) fit in the budget the read may hold: a memory read
-    takes each record from RAM after one load of the corpus, with no read of its store per record, and runs
-    the deterministic steps before its order once (data.md, the read modes). A position is saved under its
-    read, so another resumes none of it: it is named, never taken."""
+    """`memory`, where another read was taken and every source can be read into memory, its chain lowering
+    there: a memory read takes each record from RAM after one load of the corpus, with no read of its store
+    per record. Whether the corpus fits is not known: its sources' bytes before its steps are not measured.
+    A position is saved under its read, so another resumes none of it: it is named, never taken."""
 
 
 _CHOSEN: Mapping[Chooser, str] = {
@@ -79,9 +78,10 @@ def explained(loader: Loader) -> str:
         lines.append(f"read: {reading.read}, {_CHOSEN[reading.chooser]}")
         lines.extend(_loading_lines(reading))
         if reading.faster is not None:
-            lines.append(f"faster: a {reading.faster} read, each record from RAM after one load of the "
-                         f"corpus; ask for it with .read({reading.faster!r}): a position saved under the "
-                         f"{reading.read} read does not resume under it")
+            lines.append(f"faster where the corpus fits in host memory: a {reading.faster} read, each record "
+                         f"from RAM after one load of it; ask for it with .read({reading.faster!r}): a "
+                         f"position saved under the {reading.read} read does not resume under it")
+            lines.extend(_rows_held(loader, reading))
     if (plan := loader.plan) is not None:
         lines.append(f"order: {'one global order' if plan.lowering == 'global' else 'cut per share'}")
         lines.extend(f"  {name}: {json.dumps(value, sort_keys=True, separators=(',', ':'))}"
@@ -107,3 +107,14 @@ def _loading_lines(reading: Reading) -> list[str]:
                      f"Python a batch, the slowest {sized.slowest * 1e3:.2f} ms, {sized.batch_bytes} bytes; "
                      f"{sized.cpus} CPUs, {sized.budget / 2**30:.2f} GiB to hold")
     return lines
+
+
+def _rows_held(loader: Loader, reading: Reading) -> list[str]:
+    """The bytes of an epoch's rows as the read's sampled batches hold them, where they were sampled and the
+    records counted: the rows its steps make, not the source records a memory read holds first."""
+    sized = reading.loading.sized
+    if sized is None or loader.records is None:
+        return []
+    rows, budget = loader.records * sized.batch_bytes / loader.batch / 2**30, sized.budget / 2**30
+    return [f"  an epoch's rows hold {rows:.2f} GiB as batched, against {budget:.2f} GiB this read may "
+            "hold; the sources' own bytes are not measured"]

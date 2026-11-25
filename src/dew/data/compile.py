@@ -47,6 +47,7 @@ from dew.data.analysis import (
     _in_memory,
     _leaves,
     _Lowering,
+    _lowers,
     _manifest,
     _measures,
     _member_keys,
@@ -57,7 +58,7 @@ from dew.data.analysis import (
     _promoted,
     _stated,
     _steps,
-    _store,
+    _unsupported,
     _until,
     _volatile,
     _written,
@@ -1244,20 +1245,17 @@ def _compiled(
         tail=tail(train, build),
         order_records=ordered,
         reading=Reading(read, chooser, build.loading, _workers(train, build.loading), build.pools(train),
-                        faster=_faster(original, build, records)),
+                        faster=_faster(original, build)),
     )
 
 
-def _faster(original: Pipeline, build: _Build, records: int | None) -> Read | None:
-    """`memory`, where `original` is read otherwise, every source it reads can be read into memory, and its
-    `records`, at the bytes its sampled batches' rows hold (`Sized`), fit in what the read may hold
-    (`Reading.faster`); None otherwise, or where nothing measured its rows or counts its records."""
-    sized = build.loading.sized
-    if build.read == "memory" or sized is None or records is None:
+def _faster(original: Pipeline, build: _Build) -> Read | None:
+    """`memory`, where `original` is read otherwise, every source it reads can be read into memory and its
+    chain lowers there, as the analysis's own refusals state (`_lowers`): an interleave of a stream's shards
+    does not (`Reading.faster`); None otherwise."""
+    if build.read == "memory" or _unsupported((original,), "memory") or not _lowers((original,), "memory"):
         return None
-    if not all(_store(source).supports("memory") for _, source in _leaves(original)):
-        return None
-    return "memory" if records * sized.batch_bytes <= sized.budget * build.batch else None
+    return "memory"
 
 
 def _fixed_fields(pipeline: Pipeline, host: Sequence[HostStep]) -> Mapping[str, tuple[int | None, ...]]:
