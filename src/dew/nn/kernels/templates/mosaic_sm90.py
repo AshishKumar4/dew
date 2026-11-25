@@ -73,6 +73,13 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
         # pulled backward at 128 x 64 where 128 x 256's whole-tile hook modelled 400 registers, M-NG-23).
         return min(columns, mosaic.HOOK_COLUMNS)
 
+    def chunks(self, accumulators: tuple, columns: int | None = None):
+        # Each chunk's slice stated in the accumulator's layout, which inference keeps for what its hook
+        # broadcasts across it (a row-scaled forward's row vector: unannotated, its search failed).
+        for first, values in super().chunks(accumulators, columns):
+            yield first, (values if columns is None else tuple(plgpu.layout_cast(value, self.layout)
+                                                                for value in values))
+
     def entry_floor(self, tiles) -> int:
         widest = max((columns for _, columns, dtype in tiles if jnp.dtype(dtype) == jnp.float32), default=0)
         accumulator = min(widest, self.widest_product or widest) * self.rows // resources.THREADS

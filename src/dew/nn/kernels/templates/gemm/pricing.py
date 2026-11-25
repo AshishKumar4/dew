@@ -226,13 +226,14 @@ def hook_chunk(family: mosaic.Family, share: int, columns: int, dtypes: tuple = 
     """The columns an epilogue's hook takes at a time on `family` (`Issuer.hook_columns`), the kernel's
     (`mosaic_gpu._finished`) and its register model's (`epilogue_registers`): whole stores' chunks of its
     outputs (`stores.output_staging` of `dtypes` stored as `forms` state, `share` rows a consumer's), so each
-    chunk's values fill whole staged buffers (a narrowed output's 128 tile columns, 64 of its own); the whole
-    tile where its stores take no chunk (`mosaic.Transport.stores_chunks`: sm80's whole-tile staging) or no
-    such chunk divides it."""
+    chunk's values fill whole staged buffers; the whole tile where its stores take no chunk
+    (`mosaic.Transport.stores_chunks`: sm80's whole-tile staging), an output a form narrows or transposes
+    stores its tile whole, or no such chunk divides it."""
     from dew.nn.kernels.templates import stores
 
     chunk = family.hook_columns(columns)
-    if not family.stores_chunks or chunk >= columns or not dtypes:
+    if (not family.stores_chunks or chunk >= columns or not dtypes
+            or any(form is not None and (form.narrowed or form.transposed) for form in forms)):
         return columns
     dtypes = tuple(jnp.dtype(dtype) for dtype in dtypes)
     packed = tuple(stores.Output((share, columns), dtype, divisor=form.divisor, transposed=form.transposed,

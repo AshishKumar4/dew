@@ -31,7 +31,7 @@ from dew.nn.kernels.templates.gemm.tiling import ACCUMULATOR_COLUMNS, CONSUMERS,
 def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, multiprocessors: int, target,
             candidate, launch_of, grouped: bool, depths: tuple[int, ...] | None = None, ragged: bool = False,
             units: tuple[int, int, int] = (1, 1, 1), dense: bool = False,
-            programs: int | None = None, outputs: tuple = ()) -> Tiles | None:
+            programs: int | None = None, outputs: tuple = (), hooked: bool = False) -> Tiles | None:
     """The one tile a GEMM mainloop runs on an instruction family's `layouts` (`bundles.layouts`, its bundles
     in preference order, which share its facts but their loaders and registers) for a call whose output has
     `rows` rows (a group's, on average, where `grouped`: a product's rows split among its groups) and `width`
@@ -45,7 +45,8 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
     `candidate(tile)` is the launch's legality apart from its resources (its granularity, its blocks dividing
     the call, its side operands' copies), and `launch_of(tile)` the launch whose ring and residency the
     planner sizes (`resources.plan`: its allocations a stage, its registers within a consumer's) on `target`;
-    `outputs`, the dtypes its tiles store, where the derivation states their staging (`_ring_staged`).
+    `outputs`, the dtypes its tiles store, where the derivation states their staging (`_ring_staged`);
+    `hooked`, whether an epilogue's hook computes them (its side tiles and outputs beside the ring).
 
     - Layout: at each shape and step, the first layout whose planner holds it (`resources.placed`): a
       producer's where its consumers' registers hold the tile, else one whose first consumer issues the
@@ -117,7 +118,7 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
         held_tile = functools.partial(_held_tile, role=role, steps=steps, shaped=shaped,
                                       candidate=candidate, launch_of=launch_of, layouts=layouts,
                                       target=target, programs=programs, price_of=price_of,
-                                      outputs=outputs)
+                                      outputs=outputs, hooked=hooked)
         # Qwen3-8B's gate/up so takes 128 x 128, its 192-wide tile's rows shortened to 64 by its stages
         # (64 x 192 ran 1.21-1.30x XLA's time against 128 x 128's 1.10-1.14, FSA100POST32). Where no width
         # stages busy at its balance, the widest staging busy at all, then the widest that holds.
@@ -199,7 +200,7 @@ def _tile_cost(tile: Tiles, *, family: mosaic.Family, target, dtype, rows: int, 
 
 def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], shaped: Callable,
                candidate: Callable, launch_of: Callable, layouts: tuple, target, programs: int,
-               price_of: Callable, outputs: tuple = ()) -> tuple["Tiles | None", bool]:
+               price_of: Callable, outputs: tuple = (), hooked: bool = False) -> tuple["Tiles | None", bool]:
     """`derived`'s tile at a width: the rows its registers or VMEM hold there (`held_rows`), shortened where
     its stages do not fit, at the first step that plans busy, taking the least-priced busy tile under the
     shared cost model (`_tile_cost`), and whether it stages deep enough to stay busy (those its family loads
@@ -223,10 +224,10 @@ def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], sha
             if not candidate(tile):
                 # A tile a compile of this process found spilling (`report.refused`) gives way to the next.
                 continue
-            if outputs and ((tile.stages < busy and layout.stores_chunks)
+            if outputs and ((tile.stages < busy and hooked and layout.stores_chunks)
                             or (tile.stages == busy and layout.feeds_itself)):
-                # A ring short of busy where its outputs stage in chunks (a hooked epilogue's outputs and side
-                # tiles beside it: the paired backward's pulled launch, three outputs and two sides, row
+                # A hooked epilogue's ring short of busy where its outputs stage in chunks (its outputs and
+                # side tiles beside it: the paired backward's pulled launch, three outputs and two sides, row
                 # 1958), or one its consumers feed at its least busy depth, deepened by a smaller staging of
                 # its outputs.
                 tile = _ring_staged(tile, layout, outputs, candidate=candidate, launch_of=launch_of,
