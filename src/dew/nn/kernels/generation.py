@@ -407,7 +407,13 @@ slowest of add, shift, logic and comparison) and the integer multiply-adds its F
 every compute capability from 7.5 to 12.1 alike (the CUDA C++ Best Practices Guide 13.5's §12.1.1 Table 5:
 shl.b32, xor.b32 and mad.lo.s32 at 64; add.s32 at 128, min.s32 at 64 to 128)."""
 _AMPERE = Architecture(('mma.sync',), {'16bit': 2048, 'tf32': 1024},
-                       Multiprocessor(resident_threads=2048, resident_blocks=32, register_raises=None),
+                       # A warp's issue interval in a walk, 8.7 clocks on an A100: M-NA-9's attention
+                       # backwards under ncu (sm__inst_executed a multiprocessor a clock over the warps each
+                       # scheduler held), the template's at one warp a scheduler and FA2's at two alike, d64
+                       # 6.9 and 6.6, d128 9.1 and 8.0, d256 12.0 and 11.0: their geometric mean, the
+                       # interval growing with the head width's mix.
+                       Multiprocessor(resident_threads=2048, resident_blocks=32, register_raises=None,
+                                      issue_interval=8.7),
                        vector_per_clock=128, exponentials_per_clock=CUDA_EXPONENTIALS,
                        integer_per_clock=INTEGER_PER_CLOCK, integer_multiply_adds_per_clock=INTEGER_PER_CLOCK,
                        global_reduction_bytes_per_clock=3.0)
