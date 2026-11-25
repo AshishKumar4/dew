@@ -587,11 +587,16 @@ def _unset_default(owner: "RunConfig | DataclassInstance | type[DataclassInstanc
                    ) -> "DataclassInstance | None":
     """The value an optional record field `group` of `owner` takes where it holds none and a path steps into
     it (`trainer.layout.min_shard` of an unset `TrainerConfig.layout`): its one dataclass's defaults; None
-    for a field of no such type (row 9635)."""
+    for a field of no such type (row 9635), or of one with no default to take, a field it needs stated (a
+    decision run's `CrossContext.layers`)."""
     annotation = registry.declared_type(owner if isinstance(owner, type) else type(owner), group)
     kinds = [kind for kind in typing.get_args(annotation)
              if isinstance(kind, type) and dataclasses.is_dataclass(kind)]
-    return kinds[0]() if len(kinds) == 1 and type(None) in typing.get_args(annotation) else None
+    if len(kinds) != 1 or type(None) not in typing.get_args(annotation):
+        return None
+    stated = [field.name for field in dataclasses.fields(kinds[0]) if field.init
+              and field.default is dataclasses.MISSING and field.default_factory is dataclasses.MISSING]
+    return None if stated else kinds[0]()
 
 
 def _placed(config: "RunConfig", path: str) -> tuple[list[str], dict[str, JSON]]:
