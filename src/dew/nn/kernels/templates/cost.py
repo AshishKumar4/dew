@@ -180,9 +180,10 @@ class Work:
     envelope; its walking roles', a launch's) beyond the most any one of them issues: none of them issues
     another's mix (the review of lane/toolkit c9307c11146), so `issued` takes it off."""
     shuffles: float = 0.0
-    """The lane instructions exchanging values among a warp's lanes (SHFL: an inline body's `shfl.sync`, a
-    kernel's row reduction's butterfly), each an issue slot a lane (`issued`); the shuffle pipe's own rate,
-    a quarter of a multiprocessor's issue (32 lanes a clock), unpriced."""
+    """The lane instructions exchanging values among a warp's lanes (SHFL: an inline body's `shfl.sync`, its
+    PTX's `shfl.`), each an issue slot a lane (`issued`); the shuffle pipe's own rate, a quarter of a
+    multiprocessor's issue (32 lanes a clock), unpriced. A kernel's reductions' butterflies are not counted
+    here: the lanes a row spans are its layout's, which its jaxpr does not state (row 12889)."""
     global_reductions: float = 0.0
     """The bytes a body reduces into global memory an element at a time through L2's atomic units
     (`red.global`: mma.sync's dQ adds, `atomic_store_p`), each its own memory instruction a lane, at the

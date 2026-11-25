@@ -429,7 +429,7 @@ class _Lanes:
 
 _PTX_FLOAT = ("fma.", "mul.", "add.", "sub.", "max.", "min.", "neg.", "abs.")
 _PTX_SPECIAL = ("ex2.", "lg2.", "rcp.", "rsqrt.", "sqrt.", "tanh.", "sin.", "cos.")
-_PTX_FREE = ("shfl.", "mov.", "bar.", "barrier.", "fence.", "membar.", "elect.", "vote.",
+_PTX_FREE = ("mov.", "bar.", "barrier.", "fence.", "membar.", "elect.", "vote.",
              "activemask.", "mbarrier.", "cp.async.commit_group", "cp.async.wait_group", "cp.async.wait_all",
              "cp.async.mbarrier")
 _PTX_INTEGER = ("lop3.", "shf.", "prmt.", "and.", "or.", "xor.", "not.", "shl.", "shr.", "bfe.", "bfi.",
@@ -553,6 +553,9 @@ def _instruction(words: list[str], issued: float, moving: float) -> Work:
     mnemonic = words[0]
     elements = 2 if "x2" in mnemonic else 1
     floating = any(kind in mnemonic for kind in ("f32", "f16", "bf16", "f64"))
+    if mnemonic.startswith("shfl."):
+        # A lane exchange (`across.uniform`'s `shfl.sync.idx`): a shuffle on every lane of its warps.
+        return Work(shuffles=issued)
     if mnemonic.startswith(("setp.", "selp.")):
         # A compare's or a select's one issue: FSETP or FSEL on the fp32 lanes, ISETP or SEL on the ALU.
         return Work(operations=elements * issued) if floating else Work(integer_operations=elements * issued)
