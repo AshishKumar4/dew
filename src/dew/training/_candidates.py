@@ -279,9 +279,11 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
                 # Its links decide as its trace decided them: the key holds their figures (`held_context`).
                 spread_over(kept.spread)
                 sampled = _sampled(stepping, kept, batch, placement, replicated, split, platforms)
-                return dataclasses.replace(kept, sampled=sampled, resident=resident)
-    candidate = dataclasses.replace(_candidate(stepping, shaped, rows, schedule, placement, replicated, split,
-                                               narrow, mesh=mesh, platforms=platforms), resident=resident)
+                return dataclasses.replace(kept, sampled=sampled, resident=resident,
+                                           arguments=_arguments(kept, rows, mesh))
+    candidate = _candidate(stepping, shaped, rows, schedule, placement, replicated, split, narrow, mesh=mesh,
+                           platforms=platforms)
+    candidate = dataclasses.replace(candidate, resident=resident, arguments=_arguments(candidate, rows, mesh))
     if key is not None:
         # Kept detached from this trainer: its batch as shapes, its inspection's step none (`_sampled`
         # builds the reader's own).
@@ -337,6 +339,16 @@ def _sampled[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], candidate: Ca
     given = placed_shapes(batch, placement)
     return functools.partial(lambda *arguments: watched.trace(*arguments).lower(lowering_platforms=platforms),
                              *apart(candidate.prepared), given, part)
+
+
+def _arguments(candidate: Candidate, rows: Batch, mesh: Mesh | AbstractMesh | None) -> dict[Hashable, int]:
+    """The bytes `candidate`'s step's arguments (its prepared state's trees and the batch, `rows`, as
+    placed) take of each of this process's devices' own memory, as XLA counts them; none for a step lowered
+    for other devices (`mesh`)."""
+    if mesh is not None:
+        return {}
+    arguments = [*apart(candidate.prepared), rows]
+    return {device: placed_bytes(arguments, device=device, memory="device") for device in jax.local_devices()}
 
 
 def _candidate[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: TrainState, batch: Batch,
