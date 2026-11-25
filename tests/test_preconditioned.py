@@ -258,7 +258,8 @@ def read_erased_on_the_template(query, key, value, log_decay, beta, state, reads
     template under the run's fast forms at an H100's facts, its queries, keys and reads repeated `group`
     times over their heads first (each value head a key head of its own where `group` is the call's)."""
     query, key, reads = (jnp.repeat(x, group, axis=2) for x in (query, key, reads))
-    hooks = Hooks(decay='scalar', erase='read', scale=query.shape[-1] ** -0.5)
+    hooks = Hooks(decay='vector' if log_decay.ndim == 4 else 'scalar', erase='read',
+                  scale=query.shape[-1] ** -0.5)
     fast = dataclasses.replace(generation.numerics(), forms='fast')
     with (generation.assumed("sm90" if INTERPRETED else None, interpreted=INTERPRETED),
           generation.run_precision(fast), generation.chosen(gated_delta_rule="mosaic_gpu")):
@@ -322,8 +323,9 @@ def test_a_read_erase_under_a_decay_a_key_dimension_runs_its_forward_alone_on_th
 
     with generation.routes() as found:
         jax.eval_shape(loss, *drawn)
+    # Beside its forward's route, its derivative's portable tangent's (`_per_product`).
     assert {route.kernel for route in found if route.choice == generation.Choice.GATED_DELTA_RULE} == {
-        'mosaic_gpu'}
+        'mosaic_gpu', 'xla'}
     with pytest.raises(KernelRefused):
         jax.eval_shape(jax.grad(loss, argnums=(0, 1, 2)), *drawn)
 
