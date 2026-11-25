@@ -5,7 +5,6 @@ run keeps, its plan, its step compiled ahead and the executable it runs, is the 
 then. A program with no template launch compiles as jit compiles it."""
 
 import collections
-import contextlib
 import dataclasses
 import functools
 import gc
@@ -1027,25 +1026,14 @@ def test_a_program_lowered_before_another_compile_refused_its_config_is_relowere
     assert misses and all(miss.stepped for miss in misses), misses
 
 
-@contextlib.contextmanager
-def _compiled_into(directory: str):
-    """The process's compilation cache named `directory` for the block: the store certification keeps its
-    verdicts in beside it (`tuning.stored_verdict`), as a run naming its own cache does."""
-    before = jax.config.jax_compilation_cache_dir
-    jax.config.update("jax_compilation_cache_dir", directory)
-    try:
-        yield
-    finally:
-        jax.config.update("jax_compilation_cache_dir", before)
-
-
 def _aside(devices, lowered_first, relowered):
     """`report.lowered_aside` of a lowering's first call `lowered_first` and its retry `relowered` over
     `devices`, its launches certified aside on a compile-only H100 within a `refusals` scope of its own and
-    over a verdict store of its own (a compilation cache of its own, beside which the verdicts are kept:
-    `tuning.stored_verdict`): its misses, its refused launches and the retries it made. A host's store keeps
+    over a verdict store of its own (`tuning.verdicts_kept_in`): its misses, its refused launches and the
+    retries it made. A host's store keeps
     an earlier run's verdict of the same launch, which certification reads in place of compiling it again, so
     a second run on the host retried nothing (row 12915)."""
+    from dew.nn.kernels import tuning
     from dew.nn.kernels.generation import compile_only_gpus
 
     retries: list[int] = []
@@ -1054,7 +1042,7 @@ def _aside(devices, lowered_first, relowered):
         retries.append(1)
         return relowered()
 
-    with (tempfile.TemporaryDirectory() as store, _compiled_into(store),
+    with (tempfile.TemporaryDirectory() as store, tuning.verdicts_kept_in(store),
           report.refusals(), generation.assumed("sm90"), report.certifying(compile_only_gpus("sm90")[0]),
           jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
         report.lowered_aside(lowered_first, retried, lambda value: value)
