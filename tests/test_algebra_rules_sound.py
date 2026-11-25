@@ -30,7 +30,7 @@ from egglog import EGraph, String, Vec, declarations as decl, get_callable_args,
 from jax import lax
 from reference_error import assert_as_exact
 
-from dew.algebra import carry, cost, rules, terms
+from dew.algebra import carry, cost, program, rules, terms
 
 SHAPES = ((), (2,), (3,), (2, 3), (3, 2), (2, 2), (2, 3, 2), (2, 2, 3))
 """The universe of shapes each term of a rule takes."""
@@ -863,20 +863,8 @@ def test_every_dtype_fact_matches_jax_traced_output_dtype():
         is_base = named in region.literal_keys or get_callable_args(term, terms.Term.leaf) is not None
         if is_base and named in region.dtypes:
             leaf_facts.append(set_(rules.dtype(term)).to(String(np.dtype(region.dtypes[named]).name)))
-    for idx, (prim, params) in enumerate(region.params):
-        if prim is lax.convert_element_type_p:
-            dt_name = np.dtype(params["new_dtype"]).name
-            leaf_facts.append(set_(rules.param_dtype(i64(idx))).to(String(dt_name)))
-        elif prim is lax.dot_general_p and idx in region.products:
-            dt_name = np.dtype(region.products[idx].made).name
-            leaf_facts.append(set_(rules.param_dtype(i64(idx))).to(String(dt_name)))
-        elif prim is lax.is_finite_p:
-            leaf_facts.append(set_(rules.param_dtype(i64(idx))).to(String("bool")))
-        elif (op := terms.OPERATIONS.get(prim)) is not None and op.kind in ("unary", "binary"):
-            if (out_dt := params.get("out_dtype")) is not None:
-                leaf_facts.append(set_(rules.param_dtype(i64(idx))).to(String(np.dtype(out_dt).name)))
-            else:
-                leaf_facts.append(rules.same_dtype(i64(idx)))
+    leaf_facts.extend(fact for idx, (prim, params) in enumerate(region.params)
+                      if (fact := program.dtype_parameter(region, idx, prim, params)) is not None)
     graph.register(*leaf_facts)
     graph.run(rules.FACTS.saturate())
     for term, _ in region.shapes:

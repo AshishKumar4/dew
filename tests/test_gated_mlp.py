@@ -39,6 +39,7 @@ def _apart(activation, limit, *, truth: bool = False):
     return run
 
 
+
 @pytest.mark.parametrize(("form", "generation_name"), [
     pytest.param("fused", g.values[0], marks=g.marks, id=f"fused-{g.values[0]}")
     for g in generations("sm90", "sm100")
@@ -116,9 +117,10 @@ def test_a_gated_mlp_runs_fused_where_named_and_its_products_apart_where_no_rece
             assert kernels(plain, gated_mlp="fused") == []
 
 
+@pytest.mark.parametrize("form", ["fused", "wide"])
 @pytest.mark.parametrize("generation_name", generations("sm90", "sm100"))
-def test_a_gated_mlp_named_fused_on_a_data_split_mesh_runs_its_products_per_shard(generation_name):
-    """A `GatedMLP` named fused on a run's mesh of two compile-only GPUs whose data axis splits its rows,
+def test_a_named_gated_mlp_on_a_data_split_mesh_runs_its_products_per_shard(generation_name, form):
+    """A named MLP in a two-device row split runs its products on each device's own rows,
     lowered as a training step traces it (the trainer's layout, `placing`, under the default rules), runs
     its three products fused on each device's own rows (`gated_mlp._placement`: a map per shard, its kernels
     gathered whole there), as a projection's product maps its rows (`projections.mapped_shards`), where the
@@ -139,13 +141,14 @@ def test_a_gated_mlp_named_fused_on_a_data_split_mesh_runs_its_products_per_shar
     # A run's mesh (`MeshSpec`'s axes): the data axis two devices, every other one.
     mesh = Expected(tuple((axis, 2 if axis == DATA_AXIS else 1) for axis in MESH_AXES),
                     (None, PartitionSpec(DATA_AXIS)), frozenset())
-    with layer_scope(grouped_matmul="mosaic", gated_mlp="fused"), generation.routes() as routes:
+    with layer_scope(grouped_matmul="mosaic", gated_mlp=form), generation.routes() as routes:
         lowered = lowered_for(layer.apply, (params, x), generation_name, mesh)
-    assert [route.kernel for route in routes if route.choice == "gated_mlp"] == ["fused"]
+    assert [route.kernel for route in routes if route.choice == "gated_mlp"] == [form]
     assert lowered.out_info.shape == (2, 64, FEATURES)
     read = {shape for call in kernel_calls(lowered) if call.kind == "mosaic_gpu" for shape in call.operands}
     # A device's 64 rows of the 128 and its hidden rows; each kernel whole, the template's one group of it.
-    assert {(64, FEATURES), (64, HIDDEN), (1, FEATURES, HIDDEN), (1, HIDDEN, FEATURES)} <= read, read
+    gate_width = 2 * HIDDEN if form == "wide" else HIDDEN
+    assert {(64, FEATURES), (64, HIDDEN), (1, FEATURES, gate_width), (1, HIDDEN, FEATURES)} <= read, read
     assert not {(128, FEATURES), (128, HIDDEN)} & read, read
 
 
@@ -173,6 +176,42 @@ def test_a_gated_mlps_case_runs_at_the_dtype_its_products_run_and_asks_nothing_a
 
     plain = GatedMLP(hidden_features=HIDDEN, out_features=FEATURES, dtype=jnp.bfloat16)
     assert routes_of(plain) == routes_of(plain.clone(gate_multiplier=0.5))
+
+
+def test_a_mixed_gate_up_mlp_keeps_its_projection_dtypes_when_wide_is_named():
+    from dew.nn.mlp import GatedMLP
+
+    layer = GatedMLP(HIDDEN, FEATURES)
+    x = jax.ShapeDtypeStruct((64, FEATURES), jnp.bfloat16)
+    params = {"params": {"gate_proj": {"kernel": jax.ShapeDtypeStruct((FEATURES, HIDDEN), jnp.bfloat16)},
+                         "up_proj": {"kernel": jax.ShapeDtypeStruct((FEATURES, HIDDEN), jnp.float32)},
+                         "down_proj": {"kernel": jax.ShapeDtypeStruct((HIDDEN, FEATURES), jnp.bfloat16)}}}
+    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic", gated_mlp="wide"),
+          generation.routes() as routes):
+        value = jax.eval_shape(layer.apply, params, x)
+    assert value.dtype == jnp.float32
+    assert [route.kernel for route in routes if route.choice == "gated_mlp"] == ["apart"]
+
+
+def test_saving_only_the_up_projection_keeps_the_wide_residual():
+    from jax._src.ad_checkpoint import saved_residuals
+
+    from dew.nn.gated_mlp import wide_products
+    from dew.nn.residuals import Residual
+
+    rows, gate, up, down, _ = _draw(0)
+
+    def block(x, gate, up, down):
+        return wide_products(x, (gate, up, down), "swiglu")
+
+    shape = (rows.shape[0], 2 * gate.shape[-1])
+    with generation.chosen(grouped_matmul="xla"):
+        keep_up = jax.checkpoint_policies.save_only_these_names(Residual.UP_PROJ)
+        drop_all = jax.checkpoint_policies.nothing_saveable
+        kept = saved_residuals(jax.checkpoint(block, policy=keep_up), rows, gate, up, down)
+        dropped = saved_residuals(jax.checkpoint(block, policy=drop_all), rows, gate, up, down)
+    assert shape in {aval.shape for aval, _ in kept}
+    assert shape not in {aval.shape for aval, _ in dropped}
 
 
 @pytest.mark.parametrize("generation_name", ["sm90", "sm100"])

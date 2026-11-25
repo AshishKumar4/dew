@@ -24,7 +24,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.core import meta
-from flax.linen.dtypes import canonicalize_dtype
+from flax.linen.dtypes import canonicalize_dtype, promote_dtype
 from flax.typing import PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
@@ -296,18 +296,21 @@ def gated_case(x: jax.Array, projections_: Sequence[nn.Module], activation: str,
     found = projections_of(projections_)
     # A kernel a wrapper owns the products of (a served model's quantized kernel, `found.intercepted`) is
     # the wrapper's to read, never an array of the products' dtype.
-    kernels = (tuple(meta.unbox(projection.get_variable('params', 'kernel')) for projection in projections_)
-               if found.held and not found.intercepted else None)
-    # The gate's and the down projection's kernels promote with the rows, as `gated_mlp` promotes them.
-    dtype = canonicalize_dtype(x, *(() if kernels is None else (kernels[0], kernels[2])), dtype=gate.dtype)
+    kernels = found.leaves.kernels if found.leaves is not None and not found.intercepted else None
+    dtype = canonicalize_dtype(x, *(() if kernels is None else (kernels[0],)), dtype=gate.dtype)
+    uniform = all((p.dtype, p.precision, p.promote_dtype) == (gate.dtype, gate.precision, promote_dtype)
+                  for p in projections_)
+    if uniform and kernels is not None and gate.dtype is None:
+        # An apart down projection takes the gated product's dtype, not the original input's.
+        up = canonicalize_dtype(x, kernels[1])
+        uniform = up == dtype and jnp.result_type(dtype, kernels[2].dtype) == dtype
     # Where the rows run per shard (`_placement`), the products are each shard's, of its rows and the
     # kernels gathered whole in the map.
     placement = None if kernels is None else _placement(x, projections_, kernels)
     rows = (x.size // x.shape[-1], x.shape[-1]) if placement is None else placement[2].shape
     return GatedCase(
         projections=found,
-        uniform=len({(projection.dtype, projection.precision, projection.promote_dtype)
-                     for projection in projections_}) == 1,
+        uniform=uniform,
         biased=any(projection.use_bias for projection in projections_),
         rows=jax.ShapeDtypeStruct(rows, dtype),
         kernels=None if kernels is None else (jax.ShapeDtypeStruct(kernels[0].shape, dtype),
@@ -442,11 +445,10 @@ def wide_products(rows: jax.Array, kernels: tuple[jax.Array, jax.Array, jax.Arra
     if hook is None:
         raise ValueError(f"gated activation {activation!r} has no elementwise hook for wide_products")
     saved = not _recomputes_gate_up()
-    name = names[0] if names is not None else Residual.GATE_PROJ
+    labels = names[:2] if names is not None else (Residual.GATE_PROJ, Residual.UP_PROJ)
     combined = wide.interleaved(kernels[0], kernels[1])
-    gated = wide.gated_product(rows, combined, hook, out_dtype=dtype, saved=saved, name=str(name),
-                               precision=precision, interpret_on_cpu=interpret_on_cpu)
-    hidden = gated[1] if isinstance(gated, tuple) else gated
+    hidden = wide.gated_product(rows, combined, hook, out_dtype=dtype, saved=saved, name=labels,
+                                precision=precision, interpret_on_cpu=interpret_on_cpu)
     out = gemm.gemm(hidden, kernels[2], out_dtype=dtype, precision=precision,
                     interpret_on_cpu=interpret_on_cpu)
     return out if names is None else checkpoint_name(out, names[2])

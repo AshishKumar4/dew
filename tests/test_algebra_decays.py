@@ -391,3 +391,16 @@ def test_a_balanced_pair_keeps_a_normal_factor_after_decay():
     between[SUB - 1:, 1, 0] = 1.0
     found = scan._paired(jnp.asarray(left), jnp.asarray(right), jnp.asarray(between))
     assert float(found[SUB + 1, 0]) == 2.0 ** -46
+
+
+def test_a_decayed_dot_retains_finite_read_cotangents():
+    from dew.nn.kernels.recurrence_algebra import SUB
+
+    left, right = (np.zeros((SUB + 1, 2), np.float32) for _ in range(2))
+    left[SUB, 0], right[0, 0] = 2.0 ** 80, 1.0
+    decay = np.ones((SUB + 1, SUB + 1, 2), np.float32)
+    _, pulled = jax.vjp(lambda reads: scan._paired(reads, right, decay)[SUB, 0], jnp.asarray(left))
+    (gradient,) = pulled(jnp.float32(2.0 ** 100))
+    expected = np.zeros_like(left)
+    expected[SUB, 0] = 2.0 ** 100
+    np.testing.assert_array_equal(gradient, expected)

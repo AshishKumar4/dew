@@ -99,7 +99,8 @@ class Gated:
 
 
 def gated_product(rows: jax.Array, wide: jax.Array, hook: Callable, *, out_dtype, saved: bool = False,
-                  name: str | None = "gate_up", precision=None, interpret_on_cpu: bool = False) -> jax.Array:
+                  name: str | tuple[str, ...] | None = "gate_up", precision=None,
+                  interpret_on_cpu: bool = False) -> jax.Array:
     """`rows` (`[tokens, in]`) through a gated MLP's gate and up projections held as one wide matrix (`[in, 2
     * hidden]`, their columns interleaved a `GROUP` at a time, `interleaved`): one product, one accumulator,
     whose epilogue writes their gated product `hook(gate, up)` alone (`[tokens, hidden]` in `out_dtype`, each

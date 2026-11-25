@@ -662,7 +662,7 @@ def _reuse() -> tuple[RuleFamily, ...]:
         roots += [
             rule(
                 eq(t).to(a.binary("div", v.unary("sqrt", rooted), divided)),
-                eq(reciprocal).to(stock("rsqrt")), positive(v), eq(shape(v)).to(shape(t)),
+                eq(reciprocal).to(stock("rsqrt")), positive(v),
                 eq(floor).to(log2_floor(v)), eq(bound).to(log2_bound(v)), *common, *normal,
                 *dividend_guard).then(union(t).with_(a.binary("mul", rsq, multiplied))),
             rule(

@@ -794,6 +794,23 @@ def graphed(region: terms.Region) -> tuple[EGraph, terms.Term, list[terms.Term]]
     return graph, bundle, roots
 
 
+def dtype_parameter(region: terms.Region, index: int, primitive, params):
+    """What an equation's parameters say about its result dtype, or None if its constructor decides."""
+    if primitive is jax.lax.convert_element_type_p:
+        dtype = params["new_dtype"]
+    elif primitive is jax.lax.dot_general_p and (product := region.products.get(index)) is not None:
+        dtype = product.made
+    elif primitive is jax.lax.is_finite_p:
+        dtype = jnp.bool_
+    elif (op := terms.OPERATIONS.get(primitive)) is not None and op.kind in ("unary", "binary"):
+        dtype = params.get("out_dtype")
+        if dtype is None:
+            return rules.same_dtype(i64(index))
+    else:
+        return None
+    return set_(rules.param_dtype(i64(index))).to(String(np.dtype(dtype).name))
+
+
 def stated(graph: EGraph, region: terms.Region, *registered) -> None:
     """The facts `region`'s parameters and literals state, registered in `graph` (`graphed`'s) beside
     `registered` in one call (egglog's every call its own program: 200 facts took 98 ms one at a time, 53 at
@@ -811,21 +828,8 @@ def stated(graph: EGraph, region: terms.Region, *registered) -> None:
     for index, (primitive, params) in enumerate(region.params):
         if primitive in arithmetic and params.get("out_dtype") is None:
             facts.append(rules.plain(i64(index)))
-        if primitive is jax.lax.convert_element_type_p and "new_dtype" in params:
-            facts.append(set_(rules.param_dtype(i64(index))).to(String(np.dtype(params["new_dtype"]).name)))
-        elif primitive is jax.lax.dot_general_p:
-            if (prod := region.products.get(index)) is not None:
-                facts.append(set_(rules.param_dtype(i64(index))).to(String(np.dtype(prod.made).name)))
-        elif primitive is jax.lax.is_finite_p:
-            facts.append(set_(rules.param_dtype(i64(index))).to(String("bool")))
-        elif (op := terms.OPERATIONS.get(primitive)) is not None:
-            if op.kind == "unary":
-                facts.append(rules.same_dtype(i64(index)))
-            elif op.kind == "binary":
-                if (out_dt := params.get("out_dtype")) is not None:
-                    facts.append(set_(rules.param_dtype(i64(index))).to(String(np.dtype(out_dt).name)))
-                else:
-                    facts.append(rules.same_dtype(i64(index)))
+        if (fact := dtype_parameter(region, index, primitive, params)) is not None:
+            facts.append(fact)
         if primitive is jax.lax.broadcast_in_dim_p:
             rank, laid = len(params["shape"]), tuple(params["broadcast_dimensions"])
             missing = [axis for axis in range(rank) if axis not in laid]

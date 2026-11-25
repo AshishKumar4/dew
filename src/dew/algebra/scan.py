@@ -50,7 +50,7 @@ from jax.extend import core as jcore
 
 from dew import _cache
 from dew._cache import ALGEBRA
-from dew.algebra import carry, cost, derive, linear_scan, program, terms
+from dew.algebra import carry, cost, derive, linear_scan, program, ratios, terms, windows
 from dew.algebra.forms import Derived, Refused, aval, environment, evaluate
 from dew.nn import float_bits
 from dew.nn.derivatives import Protected, contracted, declared_tangent
@@ -1164,40 +1164,39 @@ def _paired(left, right, between, issue: Callable | None = None, role: str = "sc
     return jnp.where(active, _factored(left, right, between, joined, issue, role, back=back), 0.0)
 
 
-def _channel_shift(left: jax.Array, right: jax.Array, left_decay: jax.Array, right_decay: jax.Array) -> jax.Array:
-    """Balance the dot's per-channel factors without pushing a live entry past either range limit,
-    both before and after its reference decay. A pair of floor exponents bounds their product below."""
-    limits = jnp.finfo(left.dtype)
-    minexp, maxexp = int(limits.minexp), int(limits.maxexp - 1)
-    cap = min(-minexp, maxexp)
+_DECAYED_PAIR = ratios.Ratio(
+    ((1.0, tuple(("v", index) for index in range(4))),), (), 0, reduced=True, units=windows.Units())
 
-    def bounds(block: jax.Array, decay: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
-        plain = jax.lax.stop_gradient(block)
-        _, exponent, fraction, _, binade = float_bits.float_bits(plain)
-        _, decay_exp, decay_fraction, _, decay_binade = float_bits.float_bits(jax.lax.stop_gradient(decay))
-        live = jnp.isfinite(plain) & ((exponent != 0) | (fraction != 0))
-        decayed = live & ((decay_exp != 0) | (decay_fraction != 0))
-        binade = binade.astype(jnp.int32)
-        floor = jnp.minimum(jnp.where(live, binade, maxexp),
-                            jnp.where(decayed, binade + decay_binade.astype(jnp.int32), maxexp))
-        return jnp.any(live, axis=0), jnp.min(floor, axis=0), jnp.max(jnp.where(live, binade, minexp), axis=0)
 
-    has_l, min_l, max_l = bounds(left, left_decay)
-    has_r, min_r, max_r = bounds(right, right_decay)
-    s_lo = jnp.maximum(jnp.int32(-cap), jnp.maximum(max_l - maxexp, minexp - min_r))
-    s_hi = jnp.minimum(jnp.int32(cap), jnp.minimum(min_l - minexp, maxexp - max_r))
-    s_raw = ((min_l + max_l) - (min_r + max_r)) // 4
-    valid = has_l & has_r & (s_lo <= s_hi)
-    return jax.lax.stop_gradient(
-        jnp.where(valid, jnp.clip(s_raw, jnp.minimum(s_lo, s_hi), s_hi), jnp.int32(0)))
+def _cross_pair(left, right, left_decay, right_decay, issue: Callable, role: str):
+    """Use the unscaled dot unless a live reference factor would be subnormal or flush.
+
+    A ratio then sums all four factors together, also in the contraction's JVP and transpose.
+    Balancing the dot inputs instead can move an otherwise finite cotangent past the format.
+    """
+    def is_tiny_product(operand, decay, product):
+        def nonzero(value):
+            _, _, exponent, fraction = float_bits.raw_fields(value)
+            return (exponent != 0) | (fraction != 0)
+
+        return jnp.any((jnp.abs(product) < jnp.finfo(product.dtype).tiny) & nonzero(operand) & nonzero(decay))
+
+    decayed_left, decayed_right = left * left_decay, right * right_decay
+    tiny = is_tiny_product(left, left_decay, decayed_left) | is_tiny_product(right, right_decay, decayed_right)
+
+    def unlanded():
+        return ratios.ratio([left.T[:, :, None], right.T[:, None, :],
+                             left_decay.T[:, :, None], right_decay.T[:, None, :]], _DECAYED_PAIR)
+
+    return lax.cond(tiny, unlanded, lambda: issue(role, decayed_left, decayed_right.T))
 
 
 def _factored(left, right, between, joined, issue: Callable, role: str, *, back: bool = False):
     """A per-key decay's pairs `sum_k left_ik right_jk between_ijk` over sub-chunks of `SUB` rows
     (`recurrence_algebra.SUB`, fla's BC): a pair of an earlier sub-chunk's key `j` and a later one's row `i`
     is the product of the row decayed to the reference `p` before its sub-chunk and the key decayed from it,
-    `(left_i 2^-s between_ip) (right_j 2^+s between_pj)` with a provably safe per-channel power-of-two shift
-    `s` (`_channel_shift`, row 12888), a matrix product `issue` makes; a sub-chunk's own pairs elementwise
+    with a dot unless a factor underflows; then the pair's four factors are summed unlanded (row 12888).
+    A sub-chunk's own pairs are elementwise
     via `twice_scaled` over its keys (at most SUB^2 K a sub-chunk, not C^2 K), by the pairing's own decays
     (`joined`: `between` less a strict pairing's diagonal). Decays a token `back` (`between_before`, row `i`
     `between`'s row `i - 1`) factor as `between_back_ip between_back_(p+1)j`, the key's factor read at the
@@ -1227,10 +1226,8 @@ def _factored(left, right, between, joined, issue: Callable, role: str, *, back:
                 reference = first - 1
                 left_blk, right_blk = left[own].astype(work), right[keys].astype(work)
                 left_decay, right_decay = between[own, reference], between[reference + back, keys]
-                shift = _channel_shift(left_blk, right_blk, left_decay, right_decay)
-                left_scaled = left_blk * float_bits.exact_power2(-shift, work)[None, :]
-                right_scaled = right_blk * float_bits.exact_power2(shift, work)[None, :]
-                blocks.append(issue(role, left_scaled * left_decay, (right_scaled * right_decay).T))
+                blocks.append(_cross_pair(left_blk, right_blk, left_decay.astype(work),
+                                          right_decay.astype(work), issue, role))
         rows.append(jnp.concatenate(blocks, axis=1))
     return jnp.concatenate(rows, axis=0)
 
