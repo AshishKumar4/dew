@@ -398,7 +398,7 @@ def _check_joint(closed: jcore.Jaxpr, widths: Sequence[int], accurate: bool, *,
         program_at += width
         declared_at += width
     if any(shared):
-        first = shared.index(True)
+        first = next(index for index, matched in enumerate(shared) if matched)
         return [number == first for number in range(len(widths))]
     if not saturating:
         return shared
@@ -1185,11 +1185,11 @@ def _scan_scales(scan_body: jcore.Jaxpr, key_width: int) -> tuple[float | None, 
     for equation in equations(scan_body.jaxpr):
         for atom in equation.invars:
             if isinstance(atom, jcore.Literal) and not terms.typed_key(atom.val):
-                arr = np.asarray(atom.val)
-                if arr.ndim == 0 and jnp.issubdtype(arr.dtype, jnp.floating):
-                    val = float(arr)
-                    if val > 0.0 and np.isfinite(val) and val != 1.0:
-                        found[val] = None
+                scalar = np.asarray(atom.val)
+                if scalar.ndim == 0 and jnp.issubdtype(scalar.dtype, jnp.floating):
+                    factor = float(scalar)
+                    if factor > 0.0 and np.isfinite(factor) and factor != 1.0:
+                        found[factor] = None
     return tuple(found)
 
 
@@ -1197,9 +1197,11 @@ def _recurrence_step_declared(*values, hooks, roles: tuple[tuple[str, int], ...]
     """Token-step reference matching a `scan_p` body's `(next_state, out_t)` signature."""
     from dew.nn.kernels import recurrence
 
-    kwargs = {name: values[pos] for name, pos in roles}
-    out, _, held = recurrence.step_reference(hooks, recurrence.Step(state=values[0], **kwargs),
-                                             dtype=out_dtype)
+    by_name = {name: values[pos] for name, pos in roles}
+    step = recurrence.Step(
+        state=values[0], query=by_name["query"], key=by_name["key"], value=by_name["value"],
+        log_decay=by_name.get("log_decay"), beta=by_name.get("beta"))
+    out, _, held = recurrence.step_reference(hooks, step, dtype=out_dtype)
     return held, out
 
 
@@ -1207,9 +1209,11 @@ def _recurrence_chunk_call(*values, hooks, roles: tuple[tuple[str, int], ...], o
     """Chunked recurrence lowering replacing a recognized `[S, B, ...]` `scan_p` equation."""
     from dew.nn.kernels import recurrence_chunk
 
-    scanned = {name: jnp.swapaxes(values[pos], 0, 1) for name, pos in roles}
-    out, final = recurrence_chunk.chunk(hooks, recurrence_chunk.Chunk(state=values[0], **scanned),
-                                        dtype=out_dtype)
+    by_name = {name: jnp.swapaxes(values[pos], 0, 1) for name, pos in roles}
+    chunk = recurrence_chunk.Chunk(
+        state=values[0], query=by_name["query"], key=by_name["key"], value=by_name["value"],
+        log_decay=by_name.get("log_decay"), beta=by_name.get("beta"))
+    out, final = recurrence_chunk.chunk(hooks, chunk, dtype=out_dtype)
     return final, jnp.swapaxes(out, 0, 1)
 
 
@@ -1289,18 +1293,23 @@ def _recurrences(index: fusion.Index, place: int) -> Iterator[Candidate]:
     and data-dependency roles (query reaches output alone, log-decay reaches `exp_p`) before offering
     `recurrence.Hooks` declarations to the step-body e-graph."""
     equation = index.jaxpr.eqns[place]
+    operands = tuple(atom for atom in equation.invars if isinstance(atom, jcore.Var))
     if (equation.primitive is not jax.lax.scan_p or equation.effects
             or equation.params.get("reverse")
-            or equation.params.get("num_consts", 0) != 0
-            or equation.params.get("num_carry") != 1
             or len(equation.outvars) != 2
-            or any(not isinstance(atom, jcore.Var) for atom in equation.invars)):
+            or len(operands) != len(equation.invars)):
         return
+    ft_in, ft_out = equation.params.get("ft_in"), equation.params.get("ft_out")
+    if ft_in is None or ft_out is None:
+        return
+    consts_n, carry_n, xs_n = (len(group) for group in ft_in.elts)
+    carry_out_n, ys_out_n = (len(group) for group in ft_out.elts)
     length = equation.params["length"]
-    xs = tuple(equation.invars[1:])
-    if length < 1 or not 3 <= len(xs) <= 5:
+    if (consts_n != 0 or carry_n != 1 or carry_out_n != 1 or ys_out_n != 1
+            or length < 1 or not 3 <= xs_n <= 5):
         return
-    state_var, final_var, ys_var = equation.invars[0], equation.outvars[0], equation.outvars[1]
+    xs = operands[1:]
+    state_var, final_var, ys_var = operands[0], equation.outvars[0], equation.outvars[1]
     state_aval, final_aval, ys_aval = aval(state_var), aval(final_var), aval(ys_var)
     if (state_aval.ndim != 4 or final_aval.shape != state_aval.shape or final_aval.dtype != state_aval.dtype
             or any(d <= 0 for d in state_aval.shape)
@@ -1335,7 +1344,7 @@ def _recurrences(index: fusion.Index, place: int) -> Iterator[Candidate]:
     if not g_cands:
         g_cands = [None]
     yield from _recurrence_candidates(
-        scan_body, tuple(equation.invars), tuple(equation.outvars), xs_avals,
+        scan_body, operands, tuple(equation.outvars), xs_avals,
         state_aval, ys_aval, q_cands, g_cands, _scan_scales(scan_body, key_width))
 
 

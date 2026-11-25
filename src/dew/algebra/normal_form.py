@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import itertools
 from collections.abc import Callable, Hashable, Sequence
 from typing import NamedTuple
 
@@ -258,36 +259,11 @@ more for, so a float32 result rounded again rounds as the narrow operation does.
 backend computes a narrow one its own way (XLA:GPU's logistic in the operand's dtype)."""
 
 
-def _normal(equation: jcore.JaxprEqn, operands: list, widened: _Made,
-            laid: _Made, entrywise_of: _Made) -> list:
-    """`equation` bound over `operands` in the form recognition compares (`canonical`): a square a value
-    times itself, bit for bit; a narrow float's elementwise equation (`ROUNDED_ONCE`) its float32 one
-    rounded once to the narrow dtype; a gradient's stop or a checkpoint's name its operand
-    (`VALUE_IDENTITIES`); a float32 rounded to a narrow float's digits in place
-    (`reduce_precision`) a round trip through that dtype; a value widened exactly and rounded back to its
-    own dtype that value itself (`widened`, each exact widening's result by its source); a value less a
-    constant zero that value; a reshape that only adds unit axes the broadcast it is; and an elementwise
-    equation over values one layout made from equal shapes, beside scalars, that equation before the
-    layout (`laid`, each laid value by its source and layout). Every other equation as it is."""
+def _normal_arith(equation: jcore.JaxprEqn, operands: list, widened: _Made,
+                  laid: _Made, entrywise_of: _Made) -> list | None:
+    """Arithmetic normalizations for `_normal`: casts, squares, narrow `reduce_precision`, uniform-constant
+    operands, products' stated precision, and narrow-float rounded-once ops; None to bind as written."""
     primitive = equation.primitive
-    if primitive in VALUE_IDENTITIES:
-        return list(operands)
-    if (primitive is jax.lax.sub_p and _zero(operands[1])
-            and jnp.shape(operands[0]) == aval(equation.outvars[0]).shape):
-        return [operands[0]]
-    if (primitive in (jax.lax.div_p, jax.lax.mul_p) and _one(operands[1])
-            and jnp.shape(operands[0]) == aval(equation.outvars[0]).shape):
-        return [operands[0]]
-    if primitive in (jax.lax.broadcast_in_dim_p, jax.lax.reshape_p):
-        return [_laid(equation, operands[0], laid)]
-    if primitive is jax.lax.transpose_p:
-        pushed = _pushed_transpose(equation, operands[0], widened, laid, entrywise_of)
-        if pushed is not None:
-            return [pushed]
-    if entrywise(primitive) and len(equation.outvars) == 1:
-        lifted = _lifted(equation, operands, widened, laid, entrywise_of)
-        if lifted is not None:
-            return [lifted]
     if primitive is jax.lax.convert_element_type_p:
         return [_converted(operands[0], equation.params["new_dtype"], widened)]
     if primitive is jax.lax.square_p or (
@@ -315,11 +291,47 @@ def _normal(equation: jcore.JaxprEqn, operands: list, widened: _Made,
             and all(jnp.result_type(value) == out for value in operands)):
         wide = [_converted(value, jnp.float32, widened) for value in operands]
         return [_converted(equation.primitive.bind(*wide, **equation.params), out, widened)]
+    return None
+
+
+def _normal(equation: jcore.JaxprEqn, operands: list, widened: _Made,
+            laid: _Made, entrywise_of: _Made) -> list:
+    """`equation` bound over `operands` in the form recognition compares (`canonical`): a square a value
+    times itself, bit for bit; a narrow float's elementwise equation (`ROUNDED_ONCE`) its float32 one
+    rounded once to the narrow dtype; a gradient's stop or a checkpoint's name its operand
+    (`VALUE_IDENTITIES`); a float32 rounded to a narrow float's digits in place
+    (`reduce_precision`) a round trip through that dtype; a value widened exactly and rounded back to its
+    own dtype that value itself (`widened`, each exact widening's result by its source); a value less a
+    constant zero that value; a reshape that only adds unit axes the broadcast it is; a transpose pushed into
+    broadcasts where each source keeps its own axis order; and an elementwise equation over values one layout
+    made from equal shapes, beside scalars, that equation before the layout (`laid`). Every other equation as
+    it is."""
+    primitive = equation.primitive
+    if primitive in VALUE_IDENTITIES:
+        return list(operands)
+    if (primitive is jax.lax.sub_p and _zero(operands[1])
+            and jnp.shape(operands[0]) == aval(equation.outvars[0]).shape):
+        return [operands[0]]
+    if (primitive in (jax.lax.div_p, jax.lax.mul_p) and _one(operands[1])
+            and jnp.shape(operands[0]) == aval(equation.outvars[0]).shape):
+        return [operands[0]]
+    if primitive in (jax.lax.broadcast_in_dim_p, jax.lax.reshape_p):
+        return [_laid(equation, operands[0], laid)]
+    if primitive is jax.lax.transpose_p:
+        pushed = _pushed_transpose(equation, operands[0], widened, laid, entrywise_of)
+        if pushed is not None:
+            return [pushed]
+    if entrywise(primitive) and len(equation.outvars) == 1:
+        lifted = _lifted(equation, operands, widened, laid, entrywise_of)
+        if lifted is not None:
+            return [lifted]
+    if (made := _normal_arith(equation, operands, widened, laid, entrywise_of)) is not None:
+        return made
     bound = equation.primitive.bind(*operands, **equation.params)
     if (not equation.primitive.multiple_results and entrywise(primitive) and not equation.effects
             and isinstance(bound, jax_core.Tracer)):
         entrywise_of[bound] = (equation, list(operands))
-    return bound if equation.primitive.multiple_results else [bound]
+    return list(bound) if equation.primitive.multiple_results else [bound]
 
 
 def _stated(params: dict, operands: Sequence) -> dict:
@@ -551,7 +563,7 @@ def _can_push_transpose(value, inv: tuple[int, ...], laid: _Made, entrywise_of: 
     if value in laid:
         _, (_, dimensions) = laid[value]
         moved = tuple(inv[axis] for axis in dimensions)
-        return all(a < b for a, b in zip(moved, moved[1:], strict=False))
+        return all(a < b for a, b in itertools.pairwise(moved))
     if value in entrywise_of:
         _, operands = entrywise_of[value]
         return all(_can_push_transpose(op, inv, laid, entrywise_of) for op in operands)

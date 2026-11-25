@@ -411,21 +411,23 @@ def test_grouped_gated_experts_selector_defaults_apart_and_honors_named_and_hand
     gate = jax.ShapeDtypeStruct((4, 128, 256), jnp.bfloat16)
     down = jax.ShapeDtypeStruct((4, 256, 128), jnp.bfloat16)
     hook = activations.gated_hook("swiglu")
-    with generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic"):
-        case = gated_mlp.grouped_case(rows, (gate, down), None, hook)
-        assert case.cell == (generation_name, (jnp.dtype(jnp.bfloat16), "grouped"))
-        with generation.routes() as default_routes:
-            assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook)
-        assert [route.kernel for route in default_routes if route.choice == "gated_mlp"] == ["apart"]
+    with generation.assumed(generation_name):
+        with generation.chosen(grouped_matmul="mosaic"):
+            case = gated_mlp.grouped_case(rows, (gate, down), None, hook)
+            assert case.cell == (generation_name, (jnp.dtype(jnp.bfloat16), "grouped"))
+            with generation.routes() as default_routes:
+                assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook)
+            assert [route.kernel for route in default_routes if route.choice == "gated_mlp"] == ["apart"]
+            with generation.chosen(gated_mlp="fused"):
+                with generation.routes() as named_routes:
+                    assert gated_mlp.fuses_grouped(rows, (gate, down), None, hook)
+                assert [route.kernel for route in named_routes if route.choice == "gated_mlp"] == ["fused"]
+                assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook, paired=False)
+                assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook, down_prologue=False)
+                assert not gated_mlp.fuses_grouped(rows, (gate, down), None, None)
+                assert not gated_mlp.fuses_grouped(rows, None, None, hook)
+                assert not gated_mlp.fuses_grouped(
+                    rows, (gate, down), None, activations.gated_hook("geglu_exact"))
+        wide_rows = jax.ShapeDtypeStruct((256, 128), jnp.float64)
         with generation.chosen(gated_mlp="fused"):
-            with generation.routes() as named_routes:
-                assert gated_mlp.fuses_grouped(rows, (gate, down), None, hook)
-            assert [route.kernel for route in named_routes if route.choice == "gated_mlp"] == ["fused"]
-            assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook, paired=False)
-            assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook, down_prologue=False)
-            assert not gated_mlp.fuses_grouped(rows, (gate, down), None, None)
-            assert not gated_mlp.fuses_grouped(rows, None, None, hook)
-            assert not gated_mlp.fuses_grouped(
-                rows, (gate, down), None, activations.gated_hook("geglu_exact"))
-            wide_rows = jax.ShapeDtypeStruct((256, 128), jnp.float64)
             assert not gated_mlp.fuses_grouped(wide_rows, (gate, down), None, hook)

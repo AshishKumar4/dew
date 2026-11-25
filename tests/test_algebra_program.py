@@ -2173,24 +2173,24 @@ def test_structural_closed_reuses_const_free_body_preserving_debug_info_and_repo
     rewrite reports while keeping each body's own `debug_info` and computing identical values."""
     from jax._src import core as jax_core
 
-    from dew.nn.kernels import report as kernel_report
+    from dew.nn.kernels.templates import report as kernel_report
 
-    def norm_a(x, w):
-        mean_sq = jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)
-        return (x.astype(jnp.float32) * jax.lax.rsqrt(mean_sq + 1e-6)).astype(x.dtype) * w
+    def make_norm(name: str):
+        def norm(x, w):
+            mean_sq = jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)
+            return (x.astype(jnp.float32) * jax.lax.rsqrt(mean_sq + 1e-6)).astype(x.dtype) * w
 
-    def norm_b(x, w):
-        mean_sq = jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)
-        return (x.astype(jnp.float32) * jax.lax.rsqrt(mean_sq + 1e-6)).astype(x.dtype) * w
+        norm.__name__ = name
+        return norm
 
     shapes = (jax.ShapeDtypeStruct((256, 256), jnp.bfloat16), jax.ShapeDtypeStruct((256,), jnp.bfloat16))
-    ca, cb = jax.make_jaxpr(norm_a)(*shapes), jax.make_jaxpr(norm_b)(*shapes)
+    ca, cb = jax.make_jaxpr(make_norm("norm_a"))(*shapes), jax.make_jaxpr(make_norm("norm_b"))(*shapes)
     assert ca is not cb and ca.debug_info != cb.debug_info
     with generation.assumed("sm90"):
         with generation.routes() as routes_a, kernel_report.recording():
-            out_a = program._closed(ca, False, algebra.SATURATION, True)
+            out_a = program._closed(ca, accurate=False, saturation=algebra.SATURATION, kernels=True)
         with generation.routes() as routes_b, kernel_report.recording():
-            out_b = program._closed(cb, False, algebra.SATURATION, True)
+            out_b = program._closed(cb, accurate=False, saturation=algebra.SATURATION, kernels=True)
     assert out_a is not ca and out_b is not cb
     assert out_a.debug_info == ca.debug_info
     assert out_b.debug_info == cb.debug_info

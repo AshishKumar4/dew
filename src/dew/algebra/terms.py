@@ -505,6 +505,16 @@ def parameter_key(value) -> Hashable:
         return _abstract_key(value)
     if kind is list:
         return "sequence", "builtins.list", tuple(parameter_key(part) for part in value)
+    if isinstance(value, jcore.Jaxpr):
+        digest, opaques = jaxpr_digest(value)
+        consts = tuple(parameter_key(const) for const in value.consts) if value.consts else ()
+        return "jaxpr", digest, opaques, consts
+    return _parameter_key_other(value, kind)
+
+
+def _parameter_key_other(value, kind: type) -> Hashable:
+    """`parameter_key` fallback for NumPy scalars/arrays, enums, layouts, shardings, dataclasses, mappings,
+    and opaque objects."""
     if isinstance(value, (bool, str)):
         return kind.__name__, value
     if isinstance(value, (int, np.integer)):
@@ -524,10 +534,6 @@ def parameter_key(value) -> Hashable:
                 hashlib.sha256(np.ascontiguousarray(array).tobytes()).hexdigest())
     if isinstance(value, ShapedArray):
         return _abstract_key(value)
-    if isinstance(value, jcore.Jaxpr):
-        digest, opaques = jaxpr_digest(value)
-        consts = tuple(parameter_key(const) for const in value.consts) if value.consts else ()
-        return "jaxpr", digest, opaques, consts
     if value is Layout.AUTO:
         # The layout XLA chooses, one singleton.
         return "layout", "auto"
@@ -553,11 +559,11 @@ def parameter_key(value) -> Hashable:
                 parameter_key(value.reduced), parameter_key(value.unreduced_kind))
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         fields = dataclasses.fields(value)
-        return "record", _named(type(value)), tuple((field.name, parameter_key(getattr(value, field.name)))
-                                                    for field in fields)
+        return "record", _named(kind), tuple((field.name, parameter_key(getattr(value, field.name)))
+                                             for field in fields)
     if isinstance(value, (tuple, list)):
         # A named tuple's type names its fields, which its parts take in order.
-        return "sequence", _named(type(value)), tuple(parameter_key(part) for part in value)
+        return "sequence", _named(kind), tuple(parameter_key(part) for part in value)
     if isinstance(value, (set, frozenset)):
         return "set", tuple(sorted((parameter_key(part) for part in value), key=repr))
     if isinstance(value, Mapping):
@@ -570,8 +576,8 @@ def parameter_key(value) -> Hashable:
     except TypeError:
         # A function JAX wraps (a derivative rule's `WrappedFun`) hashes its parts, an `Unhashable` tree among
         # them: keyed by its identity.
-        return "object", _named(type(value)), _Identity(value)
-    return "object", _named(type(value)), value
+        return "object", _named(kind), _Identity(value)
+    return "object", _named(kind), value
 
 
 _JAXPR_DIGESTS: weakref.WeakKeyDictionary[jcore.Jaxpr, tuple[str, tuple[Hashable, ...]]] = (
@@ -582,7 +588,7 @@ _JAXPR_DIGESTS: weakref.WeakKeyDictionary[jcore.Jaxpr, tuple[str, tuple[Hashable
 def _collect_opaque(key: Hashable, opaques: list[Hashable]) -> Hashable:
     """Hoist any `("object", cls, held)` entries out of `key` into `opaques`, replacing each with a
     deterministic positional reference so the remaining key hashes cross-process without object addresses."""
-    if type(key) is not tuple:
+    if not isinstance(key, tuple):
         return key
     if len(key) == 3 and key[0] == "object":
         slot = len(opaques)
@@ -647,9 +653,9 @@ def jaxpr_digest(jaxpr: jcore.Jaxpr) -> tuple[str, tuple[Hashable, ...]]:
     for atom in jaxpr.outvars:
         feed_atom(atom)
     feed(("effects", _collect_opaque(parameter_key(jaxpr.effects), opaques) if jaxpr.effects else ()))
-    result = (hasher.hexdigest(), tuple(opaques))
-    _JAXPR_DIGESTS[jaxpr] = result
-    return result
+    digest = (hasher.hexdigest(), tuple(opaques))
+    _JAXPR_DIGESTS[jaxpr] = digest
+    return digest
 
 
 class _Identity:
