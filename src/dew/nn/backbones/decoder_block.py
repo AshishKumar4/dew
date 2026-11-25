@@ -772,6 +772,7 @@ class DecoderBlock(nn.Module):
     residual_multiplier: float = 1.0  # each sublayer's output scaled before it joins the residual
     residual_site: ResidualSite | None = None  # Kimi K3's place in the depth mixture
     depth_sites: bool = False  # each mixer input site its own depth query and norm (`LayerKind`)
+    mixer_conv: int | None = None  # taps of a short convolution over its mixer's output
     feedforward_conv: int | None = None  # taps of a short convolution over its feed-forward output
     cross_pass: CrossPass | None = None
     """The messages a looped pass merges into the block's sublayer inputs (`Loop.messages`): a merge for
@@ -1014,6 +1015,14 @@ class DecoderBlock(nn.Module):
         self.dropout = Dropout(rate=self.dropout_rate)
         if self.cross_pass is not None:
             self.cross_pass_merges = self._cross_pass_merges(self.cross_pass)
+        self._output_convs()
+
+    def _output_convs(self):
+        """Its short convolutions over its mixer's and feed-forward's outputs on the residual's width
+        (`LayerKind.mixer_conv`, `feedforward_conv`), each its own decode history."""
+        if self.mixer_conv is not None:
+            self.attn_conv = ShortConvSite(self.emb_features, self.mixer_conv, dtype=self.dtype,
+                                           name='attn_conv')
         if self.feedforward_conv is not None:
             if self.feedforward is None:
                 raise ValueError("a feed-forward's convolution convolves its output: the layer has none")
@@ -1075,6 +1084,7 @@ class DecoderBlock(nn.Module):
         holders = {'self_attn': self.self_attn,
                    **({'engram': self.engram_layer} if self.engram is not None else {}),
                    **({CROSS_ATTENTION: self.cross_attention} if self.cross is not None else {}),
+                   **({'attn_conv': self.attn_conv} if self.mixer_conv is not None else {}),
                    **({'mlp_conv': self.mlp_conv} if self.feedforward_conv is not None else {})}
         held = {name: cache_of(holder, rows) for name, holder in holders.items()}
         return {name: spec for name, spec in held.items() if spec}
@@ -1195,6 +1205,9 @@ class DecoderBlock(nn.Module):
         mixed = self._mix(
             normed, decode, kv_store, attention_metadata, prediction_phase, train,
             mixer_routes, None if per_layer_input is None else per_layer_input.depth, site_inputs)
+        if self.mixer_conv is not None:
+            # On the residual's width past its projection, behind its own history (Inkling 2's `attn_sconv`).
+            mixed = self.attn_conv(mixed, MixerCall(attention_metadata, decode))
         if self.wiring.output_norms:
             mixed = residual_normed(self.attention_output_norm, mixed)
         attention_branch = self._branch(mixed, train, "attention")

@@ -26,10 +26,9 @@ from dew.nn.precision import at_least_fp32, float32_dot_general
 
 @dataclasses.dataclass(frozen=True)
 class ShortConvs:
-    """An attention layer's causal short convolutions (`ShortConvSite`): its projected keys' and values'
-    (before their head clip and norm) and its gated output's (before its output projection), each `kernel`
-    taps, its keys' and values' with per-token dynamic taps a key head where `dynamic` (Inkling 2's
-    global layers, modeling_inkling2_loop.py:463-526)."""
+    """An attention layer's causal short convolutions (`ShortConvSite`) of its projected keys and values,
+    before their head clip and norm, each `kernel` taps, with per-token dynamic taps a key head where
+    `dynamic` (Inkling 2's global layers' `k_sconv`, `v_sconv`)."""
 
     kernel: int = 4
     dynamic: bool = False

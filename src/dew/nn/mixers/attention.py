@@ -420,7 +420,8 @@ class CausalSelfAttention(nn.Module):
     other."""
     short_convs: ShortConvs | None = None
     """Its causal short convolutions (`ShortConvs`): its projected keys' and values' before their head
-    clip and norm, its gated output's before its output projection, each its own decode history."""
+    clip and norm, each its own decode history (its output's, on the residual's width, is its block's:
+    `LayerKind.mixer_conv`)."""
     projected_sinks: bool = False
     """Each query's own value-free sink logit a head, a bias-free projection of its input (`sink_proj`,
     `[B, Q, H]` in fp32; Inkling 2's), in place of a head's static ones (`MixerContext.attention_sinks`):
@@ -607,7 +608,7 @@ class CausalSelfAttention(nn.Module):
 
     def _short_convs(self, convs: ShortConvs):
         """Its short convolutions' sites (`short_convs`): its keys' and values' where it projects its own
-        (dynamic taps a key head where `convs.dynamic`), and its output's."""
+        (dynamic taps a key head where `convs.dynamic`)."""
         if self.ctx.k_eq_v or self.ctx.value_experts is not None or self.ctx.ngpt is not None:
             raise ValueError("short convolutions run over a layer's own projected keys, values and gated "
                              "output: not keys that are values, routed values or nGPT's normed output")
@@ -617,8 +618,6 @@ class CausalSelfAttention(nn.Module):
                                         dtype=self.ctx.dtype, name='k_conv')
             self.v_conv = ShortConvSite(self.ctx.num_kv_heads * self.value_dim, convs.kernel, heads,
                                         dtype=self.ctx.dtype, name='v_conv')
-        self.out_conv = ShortConvSite(self.ctx.num_heads * self.value_dim, convs.kernel, dtype=self.ctx.dtype,
-                                      name='out_conv')
 
     def _ngpt_gains(self, ngpt: NGPT):
         """nGPT's query gain and, under an output gate, the gate's logit gain, one a feature of the
@@ -997,8 +996,7 @@ class CausalSelfAttention(nn.Module):
 
     def _conv_sites(self) -> dict[str, ShortConvSite]:
         """Its short convolutions' sites by name (`short_convs`), each holding its own decode history."""
-        own = {} if self.ctx.kv_shared else {'k_conv': self.k_conv, 'v_conv': self.v_conv}
-        return {**own, 'out_conv': self.out_conv}
+        return {} if self.ctx.kv_shared else {'k_conv': self.k_conv, 'v_conv': self.v_conv}
 
     def _group_fields(self) -> tuple[str, ...]:
         """The `AttentionMetadata` fields of groups the layer reads (`group_fields`)."""
@@ -1140,7 +1138,7 @@ class CausalSelfAttention(nn.Module):
                                  "which take no dense bias, a head's sinks alone and no convolution's "
                                  "history: serve this layer by the dense cache")
             attention = self._mixed_attended(query, key, value, positions, attention_metadata)
-            return self._output(attention, gate, B, S, own_value, progress, call)
+            return self._output(attention, gate, B, S, own_value, progress)
         sinks = self.sink_proj(x).astype(jnp.float32) if self.projected_sinks else self.sinks
         if self._runs_local(attention_metadata, decode) and not (self.ctx.attention_dropout_rate and train):
             attention = checkpoint_name(local_attention(
@@ -1154,7 +1152,7 @@ class CausalSelfAttention(nn.Module):
                 force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
                 sinks=sinks,
                 softcap=self.ctx.attn_logit_softcap), Residual.CONTEXT)
-            return self._output(attention, gate, B, S, own_value, progress, call)
+            return self._output(attention, gate, B, S, own_value, progress)
         refused = self._unhonoured(attention_metadata, "general")
         if refused:
             raise ValueError(f"{self.name}: only a serving step's decode reads {', '.join(refused)}")
@@ -1172,7 +1170,7 @@ class CausalSelfAttention(nn.Module):
             relative = self._relative_bias(x, places, masking.key_places)
             bias = relative if bias is None else bias + relative
         attention = self._attended(masking, positions, append, sinks, train, bias=bias)
-        return self._output(attention, gate, B, S, own_value, progress, call)
+        return self._output(attention, gate, B, S, own_value, progress)
 
     @property
     def _whole_norm(self) -> bool:
@@ -2017,8 +2015,7 @@ class CausalSelfAttention(nn.Module):
         return tuple(name for name in sorted(self.reads - self.honours[route])
                      if getattr(metadata, name) is not None)
 
-    def _output(self, attention, gate, batch: int, length: int, own_value, progress,
-                call: MixerCall = PLAIN_CALL):
+    def _output(self, attention, gate, batch: int, length: int, own_value, progress):
         """Take the differential on the chosen heads where the layer carries DEX (`dew.nn.dex`), its lambda
         annealed over the call's `progress` (`AttentionMetadata.progress`), exclude the own value where
         the layer does and the call has one (None for a read of another sequence), gate the attended
@@ -2049,9 +2046,6 @@ class CausalSelfAttention(nn.Module):
         joined = attention.reshape(batch, length, self.ctx.num_heads * self.value_dim)
         if self.ctx.ngpt is not None:
             joined = l2norm(joined)
-        if self.short_convs is not None:
-            # After the gate and before the projection, outside every attention kernel's output hook.
-            joined = self.out_conv(joined, call)
         return checkpoint_name(self.o_proj(joined), Residual.O_PROJ)
 
 
@@ -2109,7 +2103,7 @@ class AttentionMixer(MixerBase):
     projected_sinks: bool = False
     """Each query's own projected sink (`CausalSelfAttention.projected_sinks`)."""
     short_convs: ShortConvs | None = None
-    """Causal short convolutions at its keys, values and output (`CausalSelfAttention.short_convs`)."""
+    """Causal short convolutions at its keys and values (`CausalSelfAttention.short_convs`)."""
 
     # `CausalSelfAttention` reads the mixed call's `Admitted` layout, and its cached keys by their documents.
     mixed_step = True
