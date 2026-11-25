@@ -34,13 +34,15 @@ for sm90, 580 s on an armada container (2026-11-22; 80 to 322 s on a GPU node's 
 PREPARE_TARGETS = 4
 """How many of the plan's targets a dry prepare's task may take before its file is prepared in groups
 (`groups_of`), as the tier's run cuts it, each group a task of its own."""
-PREPARE_SHARE = 0.5
-"""The most of its task's deadline (the session's `DEADLINE`) a dry prepare's group is cut to take
-(`groups_of`): a prepare's time varies with its container, and a group cut to its whole deadline ran past it
-(train 1247: seven of 178 groups, each cut to about 1,580 s, killed at their deadline)."""
+PREPARE_WALL = 600.0
+"""The most a dry prepare's process runs, its end's margin included (`process`), whatever its task has left:
+under a train's wall bound, 626 to 696 s (its 900 s target less its warm-up and plan, its finish and a
+margin). Its groups are cut to its cap (`cap_after`), which holds a group however unevenly its count cut
+(`prepared_cut`) spreads its work (rows 12873, 12429-12439, 12643, 12759: groups cut to 480 s, capped only at
+their task's 1,680 s, ran 665 to 1,650 s and set their trains' walls)."""
 CUT_SHORT = 0.9
-"""The share of its deadline past which a timed row ran out of its time (`planned`): what it took is no more
-than a floor of its work, which counts twice."""
+"""The share of a dry prepare's cap (`cap_after`) past which a timed row ran out of its time (`planned`):
+what it took is no more than a floor of its work, which counts twice."""
 TOPOLOGY_SCRIPT = ("import sys; from pathlib import Path; sys.path.insert(0, 'tests'); "
                    "import generation_support; "
                    "generation_support.node_topology(Path(sys.argv[1]), sys.argv[2])")
@@ -157,11 +159,11 @@ def parsed(row_variant: str) -> tuple[str, bool]:
     return named.removesuffix(USERS), named.endswith(USERS)
 
 
-def groups_of(seconds: float | None, target: float, deadline: float) -> int:
+def groups_of(seconds: float | None, target: float, bound: float) -> int:
     """How many groups a file whose prepare took `seconds` (None: never timed) is prepared in: one, or as
-    many as hold it within `PREPARE_TARGETS` of the plan's `target` each and `PREPARE_SHARE` of a task's
-    `deadline`."""
-    budget = min(PREPARE_TARGETS * target, PREPARE_SHARE * deadline)
+    many as hold it within `PREPARE_TARGETS` of the plan's `target` each and a dry prepare's cap (`bound`,
+    `cap_after`)."""
+    budget = min(PREPARE_TARGETS * target, bound)
     return 1 if seconds is None else max(1, math.ceil(seconds / budget))
 
 
@@ -176,6 +178,8 @@ def process(ci, python: str, file: str, group: str, verdict: Path, left: float, 
     settling, its reader's last ten seconds); with none left, it is not started, its row saying so. A dry
     prepare's (`capped`) runs under its time cap and its memory's (tests/tier_wire.py's `PREPARE_BY` and
     `PREPARE_HOLDS`); a part's never, whose run reads every program it prepares."""
+    # A dry prepare's within PREPARE_WALL, so no group of it sets a train's wall.
+    left = min(left, PREPARE_WALL) if capped else left
     if (mine := left - ci.session.GRACE - ci.SETTLE - 10.0) <= 0:
         why = "not prepared: its lane's prepare had no time left for it"
         verdict.write_text(json.dumps({"rows": [ci.stale_row(python, file, ci.varied(group, variant), why)]}))
@@ -185,7 +189,7 @@ def process(ci, python: str, file: str, group: str, verdict: Path, left: float, 
     # prepared is kept, its end in time to upload it: a cap of the time it has but its end's.
     # A part's clears any cap it inherits (its environment's, its caller's).
     # Of memory, a share of each limit binding it (`held_caps`), its end's the rest.
-    cap = {wire.PREPARE_BY: repr(time.monotonic() + max(mine - CAP_MARGIN, mine / 2)) if capped else "",
+    cap = {wire.PREPARE_BY: repr(time.monotonic() + cap_after(ci, left)) if capped else "",
            wire.PREPARE_HOLDS: held_caps(ci) if capped else ""}
     # A dry prepare's tests run in as many processes as keep each under `RECYCLE_AT` (recycle.py).
     return ci.tested(python, [file], group, verdict, mine, cache, ci.session.GRACE, common,
@@ -198,6 +202,14 @@ def process(ci, python: str, file: str, group: str, verdict: Path, left: float, 
 CAP_MARGIN = 240.0
 """What a dry prepare keeps of its time past its cap (`process`) for its process's end: the test or cell
 running at its cap, its programs' upload to the shared cache, its report."""
+
+
+def cap_after(ci, left: float) -> float:
+    """The seconds into a dry prepare given `left` past which it starts no further test (`process`'s cap):
+    what it has but its end's (its grace, its group's settling, its reader's last ten seconds) and
+    `CAP_MARGIN`, or half of that where the margin would take more."""
+    mine = left - ci.session.GRACE - ci.SETTLE - 10.0
+    return max(mine - CAP_MARGIN, mine / 2)
 
 
 RECYCLE_AT = 3 << 30
@@ -227,26 +239,26 @@ def held_caps(ci) -> str:
 
 
 def planned(files: list[tuple[str, bool, int]], took: Callable[[str, str], tuple[float, float] | None],
-            target: float, varied: str, deadline: float) -> list[tuple[str, str]]:
+            target: float, varied: str, bound: float) -> list[tuple[str, str]]:
     """The dry prepares' rows (`run`), each a file and its group: each GPU tier file of `files`
     (`tier_files`) for each generation of `PREPARED`, its lane's process and, where it holds a test of a
     user's process, that process's, each a row (`variant`, after `varied`, ci.py's `VARIED`). A file is
-    prepared in groups of its tests (`G/N`, `prepared_cut`), each a row: as many as its prepare's
-    work needs to hold each within `PREPARE_TARGETS` targets and `PREPARE_SHARE` of a task's `deadline`
+    prepared in groups of its tests (`G/N`, `prepared_cut`), each a row: as many as its prepare's work
+    needs to hold each within `PREPARE_TARGETS` targets and a dry prepare's cap, `bound` (`cap_after`)
     (`took`, by file and variant: the rows ci.py's `measured_cut` sums, and the longest of them, past
-    `CUT_SHORT` of the deadline a floor that counts twice), and before any run of it is timed one a
-    `gpu`-marked test, so no first prepare of a file sets a train's wall (Main, 2026-11-22:
-    tests/test_gpu_flows.py's ten flows, whole, ran past a task's 1,575 s). A timed file is cut as its work
-    needs, never by a record's count of its tests, which a parametrization since may have outgrown: a group
-    its task finds no prepared test for prepares nothing."""
+    `CUT_SHORT` of the cap a floor that counts twice, as a capped row stops at it whatever is left), and
+    before any run of it is timed one a `gpu`-marked test, so no first prepare of a file sets a train's
+    wall (Main, 2026-11-22: tests/test_gpu_flows.py's ten flows, whole, ran past a task's 1,575 s). A
+    timed file is cut as its work needs, never by a record's count of its tests, which a parametrization
+    since may have outgrown: a group its task finds no prepared test for prepares nothing."""
     found = []
     for name, users, tests in files:
         for generation in PREPARED:
             processes = (False, True) if users else (False,)
-            timed = [seconds * (2 if longest >= CUT_SHORT * deadline else 1) for each in processes
+            timed = [seconds * (2 if longest >= CUT_SHORT * bound else 1) for each in processes
                      if (measured := took(name, variant(generation, users=each))) is not None
                      for seconds, longest in [measured]]
-            count = groups_of(max(timed), target, deadline) if timed else tests
+            count = groups_of(max(timed), target, bound) if timed else tests
             cuts = [f"{index}/{count}" for index in range(1, count + 1)] if count > 1 else [""]
             found += [(name, f"{cut}{varied}{variant(generation, users=each)}")
                       for cut in cuts for each in processes]
@@ -364,7 +376,7 @@ def entries(ci, python: str, timings: dict, target: float, cache: str, stamped: 
         return None if found is None else (sum(found), max(found))
     parted = ci.run_keys.parted_record()
     files = tier_files(ci.test_files(), {name: list(tests) for name, tests in parted.items()})
-    rows_ = planned(files, took, target, ci.VARIED, ci.session.DEADLINE)
+    rows_ = planned(files, took, target, ci.VARIED, cap_after(ci, PREPARE_WALL))
     if not rows_:
         return []
     missed: dict[str, int] = {}

@@ -368,10 +368,11 @@ def test_a_cell_its_prepares_cap_left_is_named_and_counted_but_reds_no_row(ci):
 
 @pytest.mark.parametrize("capped", [False, True])
 def test_only_a_dry_prepare_runs_under_a_time_cap(ci, tmp_path, monkeypatch, capped):
-    """A dry prepare's process (prepares.py's `process`, `capped`) runs under a cap (tests/tier_wire.py's
-    `PREPARE_BY`, on the monotonic clock) its end's margin short of the time it has, past which it starts
-    nothing more; a GPU tier part's prepare (ci.py's `gpu_prepared`), whose run reads every program it
-    prepares, never."""
+    """A dry prepare's process (prepares.py's `process`, `capped`) runs within `PREPARE_WALL` whatever its
+    task has left, so none sets a train's wall, under a cap (tests/tier_wire.py's `PREPARE_BY`, on the
+    monotonic clock) its end's margin short of that, past which it starts nothing more; a GPU tier part's
+    prepare (ci.py's `gpu_prepared`), whose run reads every program it prepares, has all its caller gives
+    it and no cap."""
     import time
 
     seen = {}
@@ -387,8 +388,10 @@ def test_only_a_dry_prepare_runs_under_a_time_cap(ci, tmp_path, monkeypatch, cap
     if not capped:
         # Cleared, so a cap the caller's environment carries reaches no part's prepare.
         assert seen["environ"][wire.PREPARE_BY] == "" and not wire.past_cap(seen["environ"])
+        assert seen["seconds"] == 1500.0 - ci.session.GRACE - ci.SETTLE - 10.0
         return
     cap = float(seen["environ"][wire.PREPARE_BY])
+    assert seen["seconds"] + ci.session.GRACE + ci.SETTLE + 10.0 == ci.prepares.PREPARE_WALL
     assert began + seen["seconds"] - ci.prepares.CAP_MARGIN <= cap <= time.monotonic() + seen["seconds"]
 
 
@@ -474,11 +477,11 @@ def test_a_kept_prepare_rows_token_keeps_its_group_and_a_slow_prepare_is_cut_by_
     """A kept dry prepare's token (`kept_token`, its group a process variant's, `@prepare-<gen>`) reads back
     its file, its whole group and where its green run is kept (`kept_of`, the locator after the last `@`). The
     plan's dry prepares (`entries`) cut a file by its work, at the plan's target of 120 s each group within
-    480 s (`PREPARE_TARGETS` targets, under `PREPARE_SHARE` of a task's deadline): the rows `measured_cut`
-    sums (`measured_rows`), never an older cut's, and where the longest of them ran out of its time (past
-    `CUT_SHORT` of it) twice what they took, a floor of its work (train 1247: seven groups cut to their whole
-    deadline were killed at it, and timed so, would be cut alike again); never capped by a record's count of
-    its tests. Before any run is timed, one group a `gpu`-marked test of the record."""
+    260 s (`PREPARE_TARGETS` targets, under a dry prepare's cap, `cap_after` of `PREPARE_WALL`): the rows
+    `measured_cut` sums (`measured_rows`), never an older cut's, and where the longest of them ran out of its
+    time (past `CUT_SHORT` of the cap) twice what they took, a floor of its work (train 1247: seven groups cut
+    to their whole deadline were killed at it, and timed so, would be cut alike again); never capped by a
+    record's count of its tests. Before any run is timed, one group a `gpu`-marked test of the record."""
     token = ci.kept_token("tests/test_gpu_a.py", "1/2@prepare-sm90-users", "AuthenticAMD-25-17:feed")
     assert ci.kept_of([token]) == ([], {("tests/test_gpu_a.py", "1/2@prepare-sm90-users"):
                                         ("AuthenticAMD-25-17", "feed")})
@@ -492,11 +495,11 @@ def test_a_kept_prepare_rows_token_keeps_its_group_and_a_slow_prepare_is_cut_by_
                                                            for group, seconds in rows.items()}},
                                     120.0, "off", {})
         return [entry["split"] for entry in found if entry["tests"] == f"prepare:{name}"]
-    # Timed at two cuts: the two groups' 400 s, one group; the whole file's older 1,583 s, which ran out of
-    # its time, doubles nothing.
-    assert planned({"": 1583.0, "1/2": 200.0, "2/2": 200.0}) == ["@prepare-sm90"]
-    # Two groups killed at their deadline: 6,332 s of work at least, fourteen groups of six tests' record.
-    assert len(planned({"1/2": 1583.0, "2/2": 1583.0})) == 14
+    # Timed at two cuts: the two groups' 400 s, two groups of the 260 s cap; the whole file's older 1,583 s,
+    # which ran out of its time, doubles nothing.
+    assert planned({"": 1583.0, "1/2": 200.0, "2/2": 200.0}) == ["1/2@prepare-sm90", "2/2@prepare-sm90"]
+    # Two groups past the cap: 6,332 s of work at least, twenty-five groups of six tests' record.
+    assert len(planned({"1/2": 1583.0, "2/2": 1583.0})) == 25
     assert planned({}) == [f"{index}/6@prepare-sm90" for index in range(1, 7)]
     text = ("import pytest\n@pytest.mark.gpu\ndef test_a(): pass\ndef test_cpu(): pass\n"
             "@pytest.mark.gpu(reason='x')\nclass TestB:\n"
