@@ -1150,10 +1150,8 @@ def _equation_layouts(equation, given: list, found: dict) -> list:
     primitive, params, outs = equation.primitive, equation.params, equation.outvars
     unknown = [None] * len(outs)
     if primitive is gpu_core.layout_cast_p:
-        try:
-            return [params["new_layout"].to_mgpu()]
-        except (AttributeError, TypeError, ValueError, NotImplementedError):
-            return unknown
+        # As its lowering reads it (`new_layout.to_mgpu()`).
+        return [params["new_layout"].to_mgpu()]
     if primitive is gpu.wgmma_accumulator_deref_p:
         return [fragments.WGMMA_LAYOUT]
     if primitive is gpu.mma_p:
@@ -1168,7 +1166,8 @@ def _equation_layouts(equation, given: list, found: dict) -> list:
             return unknown
         untiled = len(shape) - len(layout.base_tile_shape)
         axes = tuple(params["axes"])
-        if any(axis < untiled for axis in axes):
+        if any(axis < untiled for axis in axes) or len(axes) == len(shape):
+            # A reduction to a scalar holds no tiled layout.
             return unknown
         return [layout.reduce(tuple(axis - untiled for axis in axes))]
     if primitive in _OPERATIONS or primitive in SPECIAL_FUNCTIONS or primitive in (
@@ -1179,7 +1178,12 @@ def _equation_layouts(equation, given: list, found: dict) -> list:
         return [next(iter(held))] if len(held) == 1 else unknown
     if primitive is pallas.run_scoped_p:
         body = params["jaxpr"]
-        return _laid_out(getattr(body, "jaxpr", body), [None] * len(body.invars), found)
+        return _laid_out(body, [None] * len(body.invars), found)
+    if primitive is mpmd.mpmd_map_p:
+        # A warp mesh's or a kernel's regions, each its own body over its refs.
+        for region in params["jaxprs"]:
+            _laid_out(region, [None] * len(region.invars), found)
+        return unknown
     if primitive in (pjit.jit_p, jax_core.closed_call_p):
         body = params["jaxpr"]
         return _laid_out(body.jaxpr, given, found)
@@ -1231,6 +1235,10 @@ def _butterfly(layout: fragments.TiledLayout, value, axes: Sequence[int], thread
     (sm80) tile, two rows a thread and two rounds each (FS-REDSHFL3)."""
     shape = tuple(value.shape)
     untiled = len(shape) - len(layout.base_tile_shape)
+    kept = tuple(size for axis, size in enumerate(shape) if axis not in axes)
+    if not kept or any(axis < untiled for axis in axes):
+        # To a scalar, or along an axis each thread holds whole: none its layout states.
+        return Work()
     reduced = layout.reduce(tuple(axis - untiled for axis in axes))
 
     def spread(dims) -> int:
@@ -1239,7 +1247,6 @@ def _butterfly(layout: fragments.TiledLayout, value, axes: Sequence[int], thread
     lanes = spread(reduced.lane_dims) // spread(layout.lane_dims)
     if lanes <= 1 or spread(reduced.warp_dims) > spread(layout.warp_dims):
         return Work()
-    kept = tuple(size for axis, size in enumerate(shape) if axis not in axes)
     words = math.ceil(reduced.vector_length * np.dtype(value.dtype).itemsize / 4)
     exchanged = int(math.log2(lanes)) * math.prod(reduced.registers_shape(kept)) * words * threads
     return Work(shuffles=exchanged, operations=exchanged)
