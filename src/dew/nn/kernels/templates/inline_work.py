@@ -365,7 +365,7 @@ class _Lanes:
 
     def issued(self, op, active: np.ndarray) -> Work:
         """What `op` issues over the `active` lanes: an op computes for every lane of a warp any lane of which
-        runs it; a memory op moves its active lanes' bytes and issues on its warps' every lane."""
+        runs it; a memory op moves its active lanes' bytes."""
         name = op.name
         warps = active.reshape(-1, WARP).any(axis=1).sum()
         issued, moving = float(warps * WARP), float(active.sum())
@@ -384,10 +384,7 @@ class _Lanes:
             distinct = (float(np.unique(np.stack(known)[:, active], axis=1).shape[1])
                         if active.any() and len(known) == len(places) else moving)
             moved = _bytes(value) * distinct
-            # Each lane of its warps issues it, an aligned 16 bytes an instruction (LDS.128's widest).
-            accesses = issued * math.ceil(_bytes(value) / 16)
-            return (Work(shared_bytes=moved, accesses=accesses) if _shared(address.type)
-                    else Work(device_bytes=moved, accesses=accesses))
+            return Work(shared_bytes=moved) if _shared(address.type) else Work(device_bytes=moved)
         if name.startswith("nvvm.shfl.sync"):
             return Work(shuffles=issued)
         if name in _FREE or name.startswith(_FREE_PREFIXES):
@@ -586,16 +583,14 @@ def _instruction(words: list[str], issued: float, moving: float) -> Work:
         # A lane's copy of its operand's bytes (16 where it states none) from device into shared memory.
         sizes = [int(word.strip(",")) for word in words[1:] if word.strip(",").isdigit()]
         copied = (sizes[0] if sizes else 16) * moving
-        return Work(device_bytes=copied, shared_bytes=copied, accesses=issued)
+        return Work(device_bytes=copied, shared_bytes=copied)
     elif mnemonic.startswith(("atom.", "red.")) and ".global" in mnemonic:
         # Its word read and written, an atomic's and a reduction's alike, at its type's bytes.
         moved = _ptx_bytes(mnemonic) * 2 * moving
-        return Work(device_bytes=moved, accesses=issued)
+        return Work(device_bytes=moved)
     elif mnemonic.startswith(("ld.", "st.")):
         moved = _ptx_bytes(mnemonic) * moving
-        accesses = issued * math.ceil(_ptx_bytes(mnemonic) / 16)
-        return (Work(shared_bytes=moved, accesses=accesses) if ".shared" in mnemonic
-                else Work(device_bytes=moved, accesses=accesses))
+        return Work(shared_bytes=moved) if ".shared" in mnemonic else Work(device_bytes=moved)
     raise Uncounted(f"no rule counts the PTX instruction {mnemonic}")
 
 
