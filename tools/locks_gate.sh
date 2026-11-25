@@ -4,15 +4,17 @@
 # them again only where an input of theirs differs from its merge-base with it, and else passes, saying so:
 # each resolve fetches every staged wheel Dew's index lists from GitHub's releases, and in train 1273's
 # suspect 35 lint runs resolving at once were refused (REFUSED_STREAM) on 30, main's own among them, which
-# blamed main and hid the heads' reds. A run given none (check.sh by hand) always resolves.
+# blamed main and hid the heads' reds. A run given none (check.sh by hand, CI's run of a push to main, whose
+# merge-base with main is itself) always resolves. uv.toml, which uv pip compile reads, is an input.
 set -eu
 INPUTS="tools/lock_environment.sh tools/locks_gate.sh pyproject.toml constraints.txt .python-version locks
-uv.lock"
+uv.lock uv.toml"
 if [ -n "${BASE_GIVEN:-}" ]; then
   sh tools/base_history.sh
   base=$(git merge-base HEAD "$BASE")
   # shellcheck disable=SC2086 # the inputs are one path each
-  if git diff --quiet "$base" -- $INPUTS && [ -z "$(git ls-files --others --exclude-standard -- $INPUTS)" ]
+  untracked=$(git ls-files --others --exclude-standard -- $INPUTS)
+  if git diff --quiet "$base" -- $INPUTS && [ -z "$untracked" ]
   then
     echo "locks: no lock input differs from $(git rev-parse --short=9 "$base"), $BASE's merge-base: kept"
     exit 0
