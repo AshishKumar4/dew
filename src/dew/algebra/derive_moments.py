@@ -75,6 +75,11 @@ def max_of(term: Term) -> i64: ...
 
 
 @function(merge=lambda old, new: old)
+def sqrt_max_of(term: Term) -> i64: ...
+"""The literal index of `0.5 * sqrt(finfo(dtype).max)` in `term`'s floating dtype."""
+
+
+@function(merge=lambda old, new: old)
 def ratio_floor_of(term: Term) -> i64: ...
 """The literal index of `min(sqrt(finfo(dtype).tiny), 0.25 * finfo(dtype).eps)` in `term`'s floating dtype."""
 
@@ -274,6 +279,17 @@ def anchor_slot(term: Term) -> i64: ...
 
 
 @function
+def moment_hi(term: Term) -> Term: ...
+"""The carried scaled overflow band of a zero-mass central second moment, kept separate from the unscaled
+plain band so large entries never underflow small entries in the same tile or merge."""
+
+
+@function(merge=lambda old, new: old)
+def hi_slot(term: Term) -> i64: ...
+"""The state slot holding `term`'s zero-mass scaled overflow band (`moment_hi`)."""
+
+
+@function
 def moment_scale(term: Term) -> Term: ...
 """The carried zero-mass scale factor (`>= 1`) of a central second moment, rewritten alongside `stepped`
 and `merged` so zero-mass quadratic tangents cancel before unscaling."""
@@ -345,8 +361,11 @@ def _m_tile_anchor(ref: Term, x: Term, axes: Vec[i64]) -> Term: ...
 @function
 def _m_pair_scale(ref: Term, dx: Term, dy: Term) -> Term: ...
 @function
-def _m_shift_c(ref: Term, c: Term, sc: Term, n: Term, dx: Term, dy: Term, ux: Term, uy: Term,
-               scale_out: Term, sign: i64) -> Term: ...
+def _m_shift_plain(ref: Term, c: Term, n: Term, dx: Term, dy: Term, ux: Term, uy: Term,
+                   sign: i64) -> Term: ...
+@function
+def _m_shift_hi(ref: Term, hi: Term, sc: Term, n: Term, dx: Term, dy: Term, ux: Term, uy: Term,
+                scale_out: Term, sign: i64) -> Term: ...
 @function
 def _m_combine_zero_u(ref: Term, either: Term, n0: Term, ax0: Term, ux0: Term, n1: Term, ax1: Term,
                       ux1: Term) -> Term: ...
@@ -369,22 +388,28 @@ def _m_combine_corr_body(ref: Term, both: Term, extreme: Term, k_min: Term, safe
 def _m_combine_s(ref: Term, n0: Term, sc0: Term, ax0: Term, ay0: Term, n1: Term, sc1: Term, ax1: Term,
                  ay1: Term) -> Term: ...
 @function
-def _m_combine_zero_c(ref: Term, either: Term, c0: Term, sc0: Term, n0: Term, ax0: Term, ux0: Term,
-                      ay0: Term, uy0: Term, c1: Term, sc1: Term, n1: Term, ax1: Term, ux1: Term,
-                      ay1: Term, uy1: Term, sign: i64) -> Term: ...
+def _m_combine_hi(ref: Term, hi0: Term, sc0: Term, n0: Term, ax0: Term, ux0: Term, ay0: Term, uy0: Term,
+                  hi1: Term, sc1: Term, n1: Term, ax1: Term, ux1: Term, ay1: Term, uy1: Term,
+                  sign: i64) -> Term: ...
+@function
+def _m_combine_zero_c(ref: Term, either: Term, c0: Term, n0: Term, ax0: Term, ux0: Term, ay0: Term,
+                      uy0: Term, c1: Term, n1: Term, ax1: Term, ux1: Term, ay1: Term, uy1: Term,
+                      sign: i64) -> Term: ...
 @function
 def _m_combine_one_c(ref: Term, either: Term, both: Term, safe_max: Term, c_kept: Term, c_drop: Term,
-                     s_drop: Term, p_kept: Term, n_drop: Term, dx_eff: Term, bx: Term, dy_eff: Term,
-                     by: Term, drop_ux: Term, drop_uy: Term, sign: i64) -> Term: ...
+                     hi_drop: Term, s_drop: Term, p_kept: Term, n_drop: Term, dx_eff: Term, bx: Term,
+                     dy_eff: Term, by: Term, drop_ux: Term, drop_uy: Term, sign: i64) -> Term: ...
 @function
-def _m_combine_c(ref: Term, c0: Term, sc0: Term, n0: Term, ax0: Term, ux0: Term, ay0: Term, uy0: Term,
-                 c1: Term, sc1: Term, n1: Term, ax1: Term, ux1: Term, ay1: Term, uy1: Term,
-                 sign: i64) -> Term: ...
+def _m_combine_c(ref: Term, c0: Term, hi0: Term, sc0: Term, n0: Term, ax0: Term, ux0: Term, ay0: Term,
+                 uy0: Term, c1: Term, hi1: Term, sc1: Term, n1: Term, ax1: Term, ux1: Term, ay1: Term,
+                 uy1: Term, sign: i64) -> Term: ...
 @function
 def _m_finish_u(tag: String, ref: Term, n0: Term, ax0: Term, ux0: Term) -> Term: ...
 @function
-def _m_finish_c(tag: String, ref: Term, c0: Term, sc0: Term, n0: Term, ax0: Term, ux0: Term, ay0: Term,
-                uy0: Term, sign: i64) -> Term: ...
+def _m_finish_c(tag: String, ref: Term, c0: Term, hi0: Term, sc0: Term, n0: Term, ax0: Term, ux0: Term,
+                ay0: Term, uy0: Term, sign: i64) -> Term: ...
+@function
+def _m_wcov_ovf(ref: Term, x: Term, y: Term, axes: Vec[i64], lift_x: i64, fill_x: i64) -> Term: ...
 @function
 def _m_wcov_scale(ref: Term, x: Term, y: Term, axes: Vec[i64], lift_x: i64, fill_x: i64) -> Term: ...
 @function
@@ -404,8 +429,8 @@ def _m_wcov_raw(ref: Term, dx: Term, dy_s: Term, sc_x: Term, weight: Term, axes:
 def _m_wcov_term(ref: Term, big_d: Term, small_d: Term, sc_x: Term, weight: Term, axes: Vec[i64], p: i64,
                  lift_x: i64, fill_x: i64) -> Term: ...
 @function
-def _m_wcov_tile(ref: Term, x: Term, y: Term, weight: Term, axes: Vec[i64], p: i64, lift_x: i64,
-                 fill_x: i64, sign: i64) -> Term: ...
+def _m_wcov_tile(tag: String, ref: Term, x: Term, y: Term, weight: Term, axes: Vec[i64], p: i64,
+                 lift_x: i64, fill_x: i64, sign: i64) -> Term: ...
 @function
 def _m_mcov_raw(ref: Term, dx: Term, dy_s: Term, mask: Term, axes: Vec[i64], p: i64, lift_x: i64,
                 fill_x: i64) -> Term: ...
@@ -416,10 +441,11 @@ def _m_mcov_tile(ref: Term, x: Term, y: Term, mask: Term, z: Term, axes: Vec[i64
 
 MOMENT_SSA = (
     _m_part, _m_diff, _m_double_if, _m_prod_div, _m_ext_mul, _m_ext_mul_body, _m_ext_corr,
-    _m_ext_corr_body, _m_zero_anchor, _m_tile_anchor, _m_pair_scale, _m_shift_c, _m_combine_zero_u,
-    _m_combine_u, _m_combine_u_body, _m_combine_base, _m_combine_corr, _m_combine_corr_body, _m_combine_s,
-    _m_combine_zero_c, _m_combine_one_c, _m_combine_c, _m_finish_u, _m_finish_c, _m_wcov_scale, _m_safe_x,
-    _m_wmul_first, _m_wmean, _m_mmean, _m_wcov_raw, _m_wcov_term, _m_wcov_tile, _m_mcov_raw, _m_mcov_tile,
+    _m_ext_corr_body, _m_zero_anchor, _m_tile_anchor, _m_pair_scale, _m_shift_plain, _m_shift_hi,
+    _m_combine_zero_u, _m_combine_u, _m_combine_u_body, _m_combine_base, _m_combine_corr,
+    _m_combine_corr_body, _m_combine_s, _m_combine_hi, _m_combine_zero_c, _m_combine_one_c, _m_combine_c,
+    _m_finish_u, _m_finish_c, _m_wcov_ovf, _m_wcov_scale, _m_safe_x, _m_wmul_first, _m_wmean, _m_mmean,
+    _m_wcov_raw, _m_wcov_term, _m_wcov_tile, _m_mcov_raw, _m_mcov_tile,
 )
 
 
@@ -649,15 +675,16 @@ def _moment_ops() -> tuple[dict[str, i64], dict[str, tuple]]:
 def _moment_ref_consts(ref: Term) -> tuple[dict[str, i64], dict[str, Term], tuple, dict[str, tuple]]:
     """Scalar literal indices, broadcast constants, and binding clauses keyed by count reduction `ref`."""
     to_n = var("to_n", Vec[i64])
-    fill_n, z_n, o_n, h_n, q_n, m_n, r_flr = vars_("fill_n z_n o_n h_n q_n m_n r_flr", i64)
-    lits = {"zero": z_n, "one": o_n, "half": h_n, "qmax": q_n, "fmax": m_n, "rflr": r_flr}
+    fill_n, z_n, o_n, h_n, q_n, m_n, sq_n, r_flr = vars_("fill_n z_n o_n h_n q_n m_n sq_n r_flr", i64)
+    lits = {"zero": z_n, "one": o_n, "half": h_n, "qmax": q_n, "fmax": m_n, "sqmax": sq_n, "rflr": r_flr}
     consts = {name: Term.literal(idx).shaped(String("broadcast_in_dim"), fill_n)
               for name, idx in lits.items()}
     fill_bind = (eq(to_n).to(rules.shape(ref)), eq(fill_n).to(filled(to_n)))
     lit_binds = {
         "zero": (eq(z_n).to(zero_of(ref)),), "one": (eq(o_n).to(one_of(ref)),),
         "half": (eq(h_n).to(half_of(ref)),), "qmax": (eq(q_n).to(quarter_max_of(ref)),),
-        "fmax": (eq(m_n).to(max_of(ref)),), "rflr": (eq(r_flr).to(ratio_floor_of(ref)),),
+        "fmax": (eq(m_n).to(max_of(ref)),), "sqmax": (eq(sq_n).to(sqrt_max_of(ref)),),
+        "rflr": (eq(r_flr).to(ratio_floor_of(ref)),),
     }
     return lits, consts, fill_bind, lit_binds
 
@@ -812,13 +839,14 @@ def _moment_one_side_scale(either: Term, both: Term, safe_max: Term, n_drop: Ter
 
 
 def _moment_ssa_anchor_rules(ops: dict[str, i64], binds: dict[str, tuple]) -> list:
-    """Linear SSA rules for closest-to-zero anchors, overflow scales, and scaled parallel-axis shifts."""
-    ref, a0, a1, x, dx, dy, c, sc, n, ux, uy, scale_out = vars_(
-        "ref a0 a1 x dx dy c sc n ux uy scale_out", Term)
+    """Linear SSA rules for closest-to-zero anchors, overflow scales, and split plain/scaled shifts."""
+    ref, a0, a1, x, dx, dy, c, hi, sc, n, ux, uy, scale_out = vars_(
+        "ref a0 a1 x dx dy c hi sc n ux uy scale_out", Term)
     axes = var("axes", Vec[i64])
     p_min, p_max = vars_("p_min p_max", i64)
     _, consts, fill_bind, lit_binds = _moment_ref_consts(ref)
-    zero_n, one_n, qmax_n, fmax_n = consts["zero"], consts["one"], consts["qmax"], consts["fmax"]
+    zero_n, one_n, qmax_n = consts["zero"], consts["one"], consts["qmax"]
+    fmax_n, sqmax_n = consts["fmax"], consts["sqmax"]
     seen0 = fmax_n.compare(String("ge"), a0.unary(String("abs"), ops["abs"]), ops["ge"])
     seen1 = fmax_n.compare(String("ge"), a1.unary(String("abs"), ops["abs"]), ops["ge"])
     a0_g, a1_g = seen0.select(zero_n, a0), seen1.select(zero_n, a1)
@@ -834,18 +862,23 @@ def _moment_ssa_anchor_rules(ops: dict[str, i64], binds: dict[str, tuple]) -> li
         String("and"),
         as_.compare(String("gt"), qmax_n.binary(String("div"), ab.binary(String("max"), one_n, ops["max"]),
                                                 ops["div"]), ops["gt"]), ops["and"])
-    tc = c.binary(String("mul"), sc.binary(String("div"), scale_out, ops["div"]), ops["mul"])
-    tsh = n.binary(String("mul"), dbig.binary(String("div"), scale_out, ops["div"]), ops["mul"]).binary(
+    hi_dy = ady.compare(String("gt"), sqmax_n, ops["gt"])
+    hi_dx = adx.compare(String("gt"), sqmax_n, ops["gt"])
+    need_sc = ab.compare(String("gt"), sqmax_n, ops["gt"]).binary(String("or"), ovf_p, ops["or"])
+    tsh_p = ovf_p.select(n, zero_n).binary(String("mul"), ovf_p.select(dx, zero_n), ops["mul"]).binary(
+        String("mul"), ovf_p.select(dy, zero_n), ops["mul"])
+    tux_p = hi_dy.select(dy, zero_n).binary(String("mul"), hi_dy.select(ux, zero_n), ops["mul"])
+    tuy_p = hi_dx.select(dx, zero_n).binary(String("mul"), hi_dx.select(uy, zero_n), ops["mul"])
+    plain_sum = tsh_p.binary(String("add"), tux_p, ops["add"]).binary(String("add"), tuy_p, ops["add"])
+    tc = hi.binary(String("mul"), sc.binary(String("div"), scale_out, ops["div"]), ops["mul"])
+    tsh_h = ovf_p.select(zero_n, n).binary(
+        String("mul"), dbig.binary(String("div"), scale_out, ops["div"]), ops["mul"]).binary(
         String("mul"), dsml, ops["mul"])
-    big_dy = ady.compare(String("gt"), one_n, ops["gt"])
-    big_dx = adx.compare(String("gt"), one_n, ops["gt"])
-    tux = big_dy.select(
-        ux.binary(String("div"), scale_out, ops["div"]).binary(String("mul"), dy, ops["mul"]),
-        dy.binary(String("div"), scale_out, ops["div"]).binary(String("mul"), ux, ops["mul"]))
-    tuy = big_dx.select(
-        uy.binary(String("div"), scale_out, ops["div"]).binary(String("mul"), dx, ops["mul"]),
-        dx.binary(String("div"), scale_out, ops["div"]).binary(String("mul"), uy, ops["mul"]))
-    shift_sum = tsh.binary(String("add"), tux, ops["add"]).binary(String("add"), tuy, ops["add"])
+    tux_h = hi_dy.select(zero_n, dy).binary(String("div"), scale_out, ops["div"]).binary(
+        String("mul"), ux, ops["mul"])
+    tuy_h = hi_dx.select(zero_n, dx).binary(String("div"), scale_out, ops["div"]).binary(
+        String("mul"), uy, ops["mul"])
+    hi_sum = tsh_h.binary(String("add"), tux_h, ops["add"]).binary(String("add"), tuy_h, ops["add"])
     made = [
         rewrite(_m_zero_anchor(ref, a0, a1)).to(
             seen0.select(a1, seen1.select(a0, z_both)),
@@ -854,15 +887,20 @@ def _moment_ssa_anchor_rules(ops: dict[str, i64], binds: dict[str, tuple]) -> li
             z_tile, *fill_bind, *lit_binds["zero"], *_need(binds, "min", "max"),
             eq(p_min).to(reduce_min_on(axes)), eq(p_max).to(reduce_max_on(axes))),
         rewrite(_m_pair_scale(ref, dx, dy)).to(
-            ovf_p.select(one_n, ab), *fill_bind, *_need(lit_binds, "one", "qmax"),
-            *_need(binds, "abs", "ge", "gt", "and", "max", "div")),
+            need_sc.select(one_n, ab), *fill_bind, *_need(lit_binds, "one", "qmax", "sqmax"),
+            *_need(binds, "abs", "ge", "gt", "and", "or", "max", "div")),
     ]
     for sign_i, op in ((1, "add"), (-1, "sub")):
-        s_ops = ("abs", "ge", "gt", "add", "mul", "div") if sign_i == 1 else (
-            "abs", "ge", "gt", "add", "sub", "mul", "div")
-        made.append(rewrite(_m_shift_c(ref, c, sc, n, dx, dy, ux, uy, scale_out, i64(sign_i))).to(
-            tc.binary(String(op), shift_sum, ops[op]),
-            *fill_bind, *lit_binds["one"], *_need(binds, *s_ops)))
+        s_ops = ("abs", "ge", "gt", "and", "max", "add", "mul", "div") if sign_i == 1 else (
+            "abs", "ge", "gt", "and", "max", "add", "sub", "mul", "div")
+        made += [
+            rewrite(_m_shift_plain(ref, c, n, dx, dy, ux, uy, i64(sign_i))).to(
+                c.binary(String(op), plain_sum, ops[op]),
+                *fill_bind, *_need(lit_binds, "zero", "one", "qmax", "sqmax"), *_need(binds, *s_ops)),
+            rewrite(_m_shift_hi(ref, hi, sc, n, dx, dy, ux, uy, scale_out, i64(sign_i))).to(
+                tc.binary(String(op), hi_sum, ops[op]),
+                *fill_bind, *_need(lit_binds, "zero", "one", "qmax", "sqmax"), *_need(binds, *s_ops)),
+        ]
     return made
 
 
@@ -932,9 +970,9 @@ def _moment_ssa_combine_u_rules(ops: dict[str, i64], binds: dict[str, tuple]) ->
 
 
 def _moment_ssa_combine_one_c_rules(ops: dict[str, i64], binds: dict[str, tuple]) -> list:
-    """Linear SSA rules for one-sided zero-mass recentering of scaled central second moments."""
+    """Linear SSA rules for one-sided zero-mass recentering of plain and scaled central second moments."""
     ref, either, both, safe_max = vars_("ref either both safe_max", Term)
-    ck_v, cd_v, s_drop, p_kept, n_drop = vars_("ck_v cd_v s_drop p_kept n_drop", Term)
+    ck_v, cd_v, hi_drop, s_drop, p_kept, n_drop = vars_("ck_v cd_v hi_drop s_drop p_kept n_drop", Term)
     dx_eff, bx, dy_eff, by, drop_ux, drop_uy = vars_("dx_eff bx dy_eff by drop_ux drop_uy", Term)
     _, consts, fill_bind, lit_binds = _moment_ref_consts(ref)
     zero_n, one_n, half_n, qmax_n = consts["zero"], consts["one"], consts["half"], consts["qmax"]
@@ -948,7 +986,8 @@ def _moment_ssa_combine_one_c_rules(ops: dict[str, i64], binds: dict[str, tuple]
         g = g1(term)
         return small_s.select(g, g.binary(String("div"), smax_lo, ops["div"]))
 
-    c_in = scale_in(cd_v)
+    c_plain_out = scale_in(cd_v).binary(String("div"), smax_hi, ops["div"])
+    hi_in = scale_in(hi_drop)
     n_in = small_s.select(n_hi, n_lo.binary(String("div"), smax_lo, ops["div"]))
     ux_in, uy_in = scale_in(drop_ux), scale_in(drop_uy)
     adx, ady = dx_eff.unary(String("abs"), ops["abs"]), dy_eff.unary(String("abs"), ops["abs"])
@@ -960,7 +999,7 @@ def _moment_ssa_combine_one_c_rules(ops: dict[str, i64], binds: dict[str, tuple]
     h_x, h_y = bx.select(one_n, half_n), by.select(one_n, half_n)
     k_c = k_pad.binary(String("mul"), h_x, ops["mul"]).binary(String("mul"), h_y, ops["mul"])
     k_ux, k_uy = k_pad.binary(String("mul"), h_x, ops["mul"]), k_pad.binary(String("mul"), h_y, ops["mul"])
-    term_c = c_in.binary(String("mul"), s_drop.binary(String("mul"), k_c, ops["mul"]).binary(
+    term_hi = hi_in.binary(String("mul"), s_drop.binary(String("mul"), k_c, ops["mul"]).binary(
         String("div"), sc_1, ops["div"]), ops["mul"])
     term_shift = n_in.binary(String("mul"), d_big.binary(String("mul"), k_pad, ops["mul"]).binary(
         String("div"), sc_1, ops["div"]), ops["mul"]).binary(String("mul"), d_sml, ops["mul"])
@@ -974,11 +1013,11 @@ def _moment_ssa_combine_one_c_rules(ops: dict[str, i64], binds: dict[str, tuple]
     term_uy = big_dx.select(
         uy_in.binary(String("div"), sc_1, ops["div"]).binary(String("mul"), dx_pad, ops["mul"]),
         dx_pad.binary(String("div"), sc_1, ops["div"]).binary(String("mul"), uy_in, ops["mul"]))
-    # Group canceling pairs before unscaling; `k_pad = 0.25` when `sc_1 > qmax` keeps every term
-    # `<= 0.25 * finfo.max` so every sign pattern cancels without overflow even at `L = 2^127`.
-    num_pos = term_c.binary(String("sub"), term_ux, ops["sub"]).binary(
+    # Plain zero-mass band bypasses `sc_1` completely so large shifts never underflow small terms; the
+    # scaled band cancels against shift/cross terms before unscaling.
+    num_pos = term_hi.binary(String("sub"), term_ux, ops["sub"]).binary(
         String("add"), term_shift.binary(String("sub"), term_uy, ops["sub"]), ops["add"])
-    num_neg = term_c.binary(String("add"), term_ux, ops["add"]).binary(
+    num_neg = term_hi.binary(String("add"), term_ux, ops["add"]).binary(
         String("add"), term_uy.binary(String("sub"), term_shift, ops["sub"]), ops["add"])
     one_ops = ("abs", "ge", "gt", "max", "add", "sub", "mul", "div")
     made = []
@@ -986,36 +1025,23 @@ def _moment_ssa_combine_one_c_rules(ops: dict[str, i64], binds: dict[str, tuple]
         unscaled = _m_double_if(by, _m_double_if(bx, num_s.binary(String("div"), k_pad, ops["div"]))).binary(
             String("div"), smax_hi, ops["div"]).binary(String("mul"), sc_1, ops["mul"])
         c_one_rhs = p_kept.binary(String("mul"), ck_v, ops["mul"]).binary(
-            String("add"), unscaled, ops["add"])
+            String("add"), c_plain_out.binary(String("add"), unscaled, ops["add"]), ops["add"])
         made.append(rewrite(_m_combine_one_c(
-            ref, either, both, safe_max, ck_v, cd_v, s_drop, p_kept, n_drop, dx_eff, bx, dy_eff, by,
-            drop_ux, drop_uy, i64(sign_i))).to(
+            ref, either, both, safe_max, ck_v, cd_v, hi_drop, s_drop, p_kept, n_drop, dx_eff, bx, dy_eff,
+            by, drop_ux, drop_uy, i64(sign_i))).to(
             c_one_rhs, *fill_bind, *_need(lit_binds, "zero", "one", "half", "qmax"),
             *_need(binds, *one_ops)))
     return made
 
 
-def _moment_ssa_combine_c_rules(ops: dict[str, i64], binds: dict[str, tuple]) -> list:
-    """Linear SSA rules combining normalized central second moments and their zero-mass scale slots."""
-    ref, c0, sc0, n0, ax0, ux0, ay0, uy0 = vars_("ref c0 sc0 n0 ax0 ux0 ay0 uy0", Term)
-    c1, sc1, n1, ax1, ux1, ay1, uy1 = vars_("c1 sc1 n1 ax1 ux1 ay1 uy1", Term)
-    either, both, extreme, keep0, n_min, safe_max = vars_("either both extreme keep0 n_min safe_max", Term)
-    p0, p1, p_prod, dx_eff, big_x, dy_eff, big_y = vars_("p0 p1 p_prod dx_eff big_x dy_eff big_y", Term)
-    k_min, eff_p, big_d, small_d = vars_("k_min eff_p big_d small_d", Term)
+def _moment_ssa_combine_zero_rules(ops: dict[str, i64], binds: dict[str, tuple]) -> list:
+    """Linear SSA rules combining zero-mass plain band, scaled overflow band, and scale slot."""
+    ref, c0, hi0, sc0, n0, ax0, ux0, ay0, uy0 = vars_("ref c0 hi0 sc0 n0 ax0 ux0 ay0 uy0", Term)
+    c1, hi1, sc1, n1, ax1, ux1, ay1, uy1 = vars_("c1 hi1 sc1 n1 ax1 ux1 ay1 uy1", Term)
+    either = var("either", Term)
     _, consts, fill_bind, lit_binds = _moment_ref_consts(ref)
     zero_n, one_n, fmax_n = consts["zero"], consts["one"], consts["fmax"]
-    k0_p, either_p, both_p, ext_p, smax_p, p0_p, p1_p, nmin_p, nd_p = _moment_combine_parts(ref, n0, n1, ops)
-    c_kept, c_drop = keep0.select(c1, c0), keep0.select(c0, c1)
-    pk_c, pd_c = keep0.select(p1, p0), keep0.select(p0, p1)
-    base_norm = pk_c.binary(String("mul"), c_kept, ops["mul"]).binary(
-        String("add"), pd_c.binary(String("mul"), c_drop, ops["mul"]), ops["add"])
-    base_ext = c_kept.binary(
-        String("add"), _m_ext_mul(ref, extreme, n_min, safe_max, c_drop), ops["add"])
-    x_ge_y = dx_eff.unary(String("abs"), ops["abs"]).compare(
-        String("ge"), dy_eff.unary(String("abs"), ops["abs"]), ops["ge"])
-    corr_norm = both.select(zero_n, eff_p).binary(
-        String("mul"), both.select(zero_n, big_d), ops["mul"]).binary(
-        String("mul"), both.select(zero_n, small_d), ops["mul"])
+    either_p = _m_part(String("either"), ref, n0, n1)
     merged_ax, merged_ay = _m_zero_anchor(ref, ax0, ax1), _m_zero_anchor(ref, ay0, ay1)
     seen0 = fmax_n.compare(String("ge"), ax0.unary(String("abs"), ops["abs"]), ops["ge"])
     seen1 = fmax_n.compare(String("ge"), ax1.unary(String("abs"), ops["abs"]), ops["ge"])
@@ -1030,6 +1056,64 @@ def _moment_ssa_combine_c_rules(ops: dict[str, i64], binds: dict[str, tuple]) ->
         String("sub"), seen_n.select(zero_n, merged_ay), ops["sub"]))
     s_sh = _m_pair_scale(ref, dax0, day0).binary(String("max"), _m_pair_scale(ref, dax1, day1), ops["max"])
     s_01 = sc0.binary(String("max"), sc1, ops["max"]).binary(String("max"), s_sh, ops["max"])
+    made = [
+        rewrite(_m_combine_s(ref, n0, sc0, ax0, ay0, n1, sc1, ax1, ay1)).to(
+            either_p.select(s_01, one_n), *fill_bind, *_need(lit_binds, "zero", "one", "fmax"),
+            *_need(binds, "abs", "ge", "sub", "max")),
+    ]
+    for sign_i in (1, -1):
+        c_zero_rhs = _m_shift_plain(
+            ref, either.select(c0, zero_n), either.select(n0, zero_n), either.select(dax0, zero_n),
+            either.select(day0, zero_n), either.select(ux0, zero_n), either.select(uy0, zero_n),
+            i64(sign_i)).binary(
+            String("add"),
+            _m_shift_plain(ref, either.select(c1, zero_n), either.select(n1, zero_n),
+                           either.select(dax1, zero_n), either.select(day1, zero_n),
+                           either.select(ux1, zero_n), either.select(uy1, zero_n), i64(sign_i)),
+            ops["add"])
+        hi_zero_rhs = _m_shift_hi(
+            ref, either_p.select(hi0, zero_n), sc0, either_p.select(n0, zero_n),
+            either_p.select(dax0, zero_n), either_p.select(day0, zero_n), either_p.select(ux0, zero_n),
+            either_p.select(uy0, zero_n), s_01, i64(sign_i)).binary(
+            String("add"),
+            _m_shift_hi(ref, either_p.select(hi1, zero_n), sc1, either_p.select(n1, zero_n),
+                        either_p.select(dax1, zero_n), either_p.select(day1, zero_n),
+                        either_p.select(ux1, zero_n), either_p.select(uy1, zero_n), s_01, i64(sign_i)),
+            ops["add"])
+        made += [
+            rewrite(_m_combine_zero_c(ref, either, c0, n0, ax0, ux0, ay0, uy0, c1, n1, ax1, ux1, ay1,
+                                      uy1, i64(sign_i))).to(
+                c_zero_rhs, *fill_bind, *_need(lit_binds, "zero", "fmax"),
+                *_need(binds, "abs", "ge", "sub", "add")),
+            rewrite(_m_combine_hi(ref, hi0, sc0, n0, ax0, ux0, ay0, uy0, hi1, sc1, n1, ax1, ux1, ay1,
+                                  uy1, i64(sign_i))).to(
+                either_p.select(hi_zero_rhs, zero_n), *fill_bind, *_need(lit_binds, "zero", "fmax"),
+                *_need(binds, "abs", "ge", "sub", "max", "add")),
+        ]
+    return made
+
+
+def _moment_ssa_combine_c_rules(ops: dict[str, i64], binds: dict[str, tuple]) -> list:
+    """Linear SSA rules combining normalized central second moments across all mass regimes."""
+    ref, c0, hi0, sc0, n0, ax0, ux0, ay0, uy0 = vars_("ref c0 hi0 sc0 n0 ax0 ux0 ay0 uy0", Term)
+    c1, hi1, sc1, n1, ax1, ux1, ay1, uy1 = vars_("c1 hi1 sc1 n1 ax1 ux1 ay1 uy1", Term)
+    both, extreme, keep0, n_min, safe_max = vars_("both extreme keep0 n_min safe_max", Term)
+    p0, p1, p_prod, dx_eff, big_x, dy_eff, big_y = vars_("p0 p1 p_prod dx_eff big_x dy_eff big_y", Term)
+    k_min, eff_p, big_d, small_d = vars_("k_min eff_p big_d small_d", Term)
+    _, consts, fill_bind, lit_binds = _moment_ref_consts(ref)
+    zero_n, fmax_n = consts["zero"], consts["fmax"]
+    k0_p, either_p, both_p, ext_p, smax_p, p0_p, p1_p, nmin_p, nd_p = _moment_combine_parts(ref, n0, n1, ops)
+    c_kept, c_drop = keep0.select(c1, c0), keep0.select(c0, c1)
+    pk_c, pd_c = keep0.select(p1, p0), keep0.select(p0, p1)
+    base_norm = pk_c.binary(String("mul"), c_kept, ops["mul"]).binary(
+        String("add"), pd_c.binary(String("mul"), c_drop, ops["mul"]), ops["add"])
+    base_ext = c_kept.binary(
+        String("add"), _m_ext_mul(ref, extreme, n_min, safe_max, c_drop), ops["add"])
+    x_ge_y = dx_eff.unary(String("abs"), ops["abs"]).compare(
+        String("ge"), dy_eff.unary(String("abs"), ops["abs"]), ops["ge"])
+    corr_norm = both.select(zero_n, eff_p).binary(
+        String("mul"), both.select(zero_n, big_d), ops["mul"]).binary(
+        String("mul"), both.select(zero_n, small_d), ops["mul"])
     c_base = _m_combine_base(ref, ext_p, k0_p, nmin_p, smax_p, c0, c1, p0_p, p1_p)
     c_corr = _m_combine_corr(
         ref, both_p, ext_p, nmin_p, smax_p, p0_p.binary(String("mul"), p1_p, ops["mul"]),
@@ -1054,9 +1138,6 @@ def _moment_ssa_combine_c_rules(ops: dict[str, i64], binds: dict[str, tuple]) ->
     dy1_v = _m_diff(String("val"), ref, g1p(day), g1p(kay), zero_n, g1p(kuy))
     dy1_b = _m_diff(String("big"), ref, g1p(day), g1p(kay), zero_n, g1p(kuy))
     made = [
-        rewrite(_m_combine_s(ref, n0, sc0, ax0, ay0, n1, sc1, ax1, ay1)).to(
-            either_p.select(s_01, one_n), *fill_bind, *_need(lit_binds, "zero", "one", "fmax"),
-            *_need(binds, "abs", "ge", "sub", "max")),
         rewrite(_m_combine_base(ref, extreme, keep0, n_min, safe_max, c0, c1, p0, p1)).to(
             extreme.select(base_norm, base_ext), *_need(binds, "add", "mul")),
         rewrite(_m_combine_corr(ref, both, extreme, n_min, safe_max, p_prod, dx_eff, big_x,
@@ -1070,40 +1151,25 @@ def _moment_ssa_combine_c_rules(ops: dict[str, i64], binds: dict[str, tuple]) ->
             *fill_bind, *lit_binds["zero"], *_need(binds, "mul")),
     ]
     for sign_i, op in ((1, "add"), (-1, "sub")):
-        c_zero_rhs = _m_shift_c(
-            ref, either.select(c0, zero_n), sc0, either.select(n0, zero_n), either.select(dax0, zero_n),
-            either.select(day0, zero_n), either.select(ux0, zero_n), either.select(uy0, zero_n), s_01,
-            i64(sign_i)).binary(
-            String("add"),
-            _m_shift_c(ref, either.select(c1, zero_n), sc1, either.select(n1, zero_n),
-                       either.select(dax1, zero_n), either.select(day1, zero_n),
-                       either.select(ux1, zero_n), either.select(uy1, zero_n), s_01, i64(sign_i)),
-            ops["add"])
         c_one_call = _m_combine_one_c(
-            ref, either_p, both_p, smax_p, k0_p.select(c1, c0), k0_p.select(c0, c1), k0_p.select(sc0, sc1),
-            k0_p.select(p1_p, p0_p), nd_p, dx1_v, dx1_b, dy1_v, dy1_b, k0_p.select(ux0, ux1),
-            k0_p.select(uy0, uy1), i64(sign_i))
+            ref, either_p, both_p, smax_p, k0_p.select(c1, c0), k0_p.select(c0, c1), k0_p.select(hi0, hi1),
+            k0_p.select(sc0, sc1), k0_p.select(p1_p, p0_p), nd_p, dx1_v, dx1_b, dy1_v, dy1_b,
+            k0_p.select(ux0, ux1), k0_p.select(uy0, uy1), i64(sign_i))
         c_both_rhs = c_base.binary(String(op), c_corr, ops[op])
         c_ops = ("abs", "ge", "min", "mul", "add") if sign_i == 1 else (
             "abs", "ge", "min", "mul", "add", "sub")
-        made += [
-            rewrite(_m_combine_zero_c(ref, either, c0, sc0, n0, ax0, ux0, ay0, uy0, c1, sc1, n1, ax1,
-                                      ux1, ay1, uy1, i64(sign_i))).to(
-                c_zero_rhs, *fill_bind, *_need(lit_binds, "zero", "fmax"),
-                *_need(binds, "abs", "ge", "sub", "max", "add")),
-            rewrite(_m_combine_c(ref, c0, sc0, n0, ax0, ux0, ay0, uy0, c1, sc1, n1, ax1, ux1, ay1,
-                                 uy1, i64(sign_i))).to(
-                either_p.select(_m_combine_zero_c(ref, either_p, c0, sc0, n0, ax0, ux0, ay0, uy0,
-                                                  c1, sc1, n1, ax1, ux1, ay1, uy1, i64(sign_i)),
-                                both_p.select(c_one_call, c_both_rhs)),
-                *fill_bind, *_need(lit_binds, "zero", "fmax"), *_need(binds, *c_ops)),
-        ]
+        made.append(rewrite(_m_combine_c(ref, c0, hi0, sc0, n0, ax0, ux0, ay0, uy0, c1, hi1, sc1, n1, ax1,
+                                         ux1, ay1, uy1, i64(sign_i))).to(
+            either_p.select(_m_combine_zero_c(ref, either_p, c0, n0, ax0, ux0, ay0, uy0, c1, n1, ax1,
+                                              ux1, ay1, uy1, i64(sign_i)),
+                            both_p.select(c_one_call, c_both_rhs)),
+            *fill_bind, *_need(lit_binds, "zero", "fmax"), *_need(binds, *c_ops)))
     return made
 
 
 def _moment_ssa_finish_rules(ops: dict[str, i64], binds: dict[str, tuple]) -> list:
     """Linear SSA finish rules recentering and unscaling zero-mass partials with positive mass exact."""
-    ref, c0, sc0, n0, ax0, ux0, ay0, uy0 = vars_("ref c0 sc0 n0 ax0 ux0 ay0 uy0", Term)
+    ref, c0, hi0, sc0, n0, ax0, ux0, ay0, uy0 = vars_("ref c0 hi0 sc0 n0 ax0 ux0 ay0 uy0", Term)
     _, consts, fill_bind, lit_binds = _moment_ref_consts(ref)
     zero_n, fmax_n = consts["zero"], consts["fmax"]
     pos_f = n0.compare(String("gt"), zero_n, ops["gt"])
@@ -1126,29 +1192,31 @@ def _moment_ssa_finish_rules(ops: dict[str, i64], binds: dict[str, tuple]) -> li
             *fill_bind, *_need(lit_binds, "zero", "fmax"), *_need(binds, "abs", "ge", "gt", "add", "mul")),
     ]
     for sign_i in (1, -1):
-        cov_zero = _m_shift_c(ref, z0(c0), sc0, z0(n0), z0(ax0_g), z0(ay0_g), z0(ux0), z0(uy0), s_f,
-                              i64(sign_i)).binary(String("mul"), s_f, ops["mul"])
+        cov_zero = _m_shift_plain(
+            ref, z0(c0), z0(n0), z0(ax0_g), z0(ay0_g), z0(ux0), z0(uy0), i64(sign_i)).binary(
+            String("add"),
+            _m_shift_hi(ref, z0(hi0), sc0, z0(n0), z0(ax0_g), z0(ay0_g), z0(ux0), z0(uy0), s_f,
+                        i64(sign_i)).binary(String("mul"), s_f, ops["mul"]),
+            ops["add"])
         made += [
-            rewrite(_m_finish_c(String("cov"), ref, c0, sc0, n0, ax0, ux0, ay0, uy0, i64(sign_i))).to(
+            rewrite(_m_finish_c(String("cov"), ref, c0, hi0, sc0, n0, ax0, ux0, ay0, uy0, i64(sign_i))).to(
                 pos_f.select(cov_zero, c0), *fill_bind, *_need(lit_binds, "zero", "fmax"),
-                *_need(binds, "abs", "ge", "gt", "max", "mul")),
-            rewrite(_m_finish_c(String("sum"), ref, c0, sc0, n0, ax0, ux0, ay0, uy0, i64(sign_i))).to(
+                *_need(binds, "abs", "ge", "gt", "max", "add", "mul")),
+            rewrite(_m_finish_c(String("sum"), ref, c0, hi0, sc0, n0, ax0, ux0, ay0, uy0, i64(sign_i))).to(
                 pos_f.select(cov_zero, c0.binary(String("mul"), n0, ops["mul"])),
                 *fill_bind, *_need(lit_binds, "zero", "fmax"),
-                *_need(binds, "abs", "ge", "gt", "max", "mul")),
+                *_need(binds, "abs", "ge", "gt", "max", "add", "mul")),
         ]
     return made
 
 
-def _moment_ssa_tile_rules(ops: dict[str, i64], binds: dict[str, tuple]) -> list:
-    """Linear SSA rules for tile-local weighted and masked means, residuals, and central second moments."""
-    ref, x, y, w, mask, z, dx, dy_s, big_d, small_d, sc_x = vars_(
-        "ref x y w mask z dx dy_s big_d small_d sc_x", Term)
+def _moment_ssa_tile_scale_rules(ops: dict[str, i64], binds: dict[str, tuple]) -> list:
+    """Linear SSA rules detecting per-element zero-mass overflow and its tile scale factor."""
+    ref, x, y = vars_("ref x y", Term)
     axes = var("axes", Vec[i64])
-    p, p_max, lift_x, fill_x = vars_("p p_max lift_x fill_x", i64)
+    p_max, lift_x, fill_x = vars_("p_max lift_x fill_x", i64)
     lits, consts, fill_bind, lit_binds = _moment_ref_consts(ref)
     zero_n, one_n = consts["zero"], consts["one"]
-    zero_x = Term.literal(lits["zero"]).shaped(String("broadcast_in_dim"), fill_x)
     one_x = Term.literal(lits["one"]).shaped(String("broadcast_in_dim"), fill_x)
     qmax_x = Term.literal(lits["qmax"]).shaped(String("broadcast_in_dim"), fill_x)
     pos = ref.compare(String("gt"), zero_n, ops["gt"])
@@ -1164,7 +1232,30 @@ def _moment_ssa_tile_rules(ops: dict[str, i64], binds: dict[str, tuple]) -> list
         sml_el.compare(String("gt"), qmax_x.binary(String("div"), big_el.binary(String("max"), one_x,
                                                                                 ops["max"]), ops["div"]),
                        ops["gt"]), ops["and"])
-    sc_raw = ovf_el.select(one_x, big_el).reduce(String("max"), axes, p_max)
+    sc_raw = _m_wcov_ovf(ref, x, y, axes, lift_x, fill_x).select(one_x, big_el).reduce(
+        String("max"), axes, p_max)
+    return [
+        rewrite(_m_wcov_ovf(ref, x, y, axes, lift_x, fill_x)).to(
+            ovf_el, *_need(lit_binds, "one", "qmax"),
+            *_need(binds, "sub", "abs", "max", "min", "gt", "and", "div")),
+        rewrite(_m_wcov_scale(ref, x, y, axes, lift_x, fill_x)).to(
+            pos.select(sc_raw, one_n), *fill_bind, *_need(lit_binds, "zero", "one"),
+            *_need(binds, "sub", "abs", "max", "gt"), eq(p_max).to(reduce_max_on(axes))),
+    ]
+
+
+def _moment_ssa_tile_rules(ops: dict[str, i64], binds: dict[str, tuple]) -> list:
+    """Linear SSA rules for tile-local weighted and masked means, residuals, and central second moments."""
+    ref, x, y, w, mask, z, dx, dy_s, big_d, small_d, sc_x = vars_(
+        "ref x y w mask z dx dy_s big_d small_d sc_x", Term)
+    axes = var("axes", Vec[i64])
+    p, lift_x, fill_x = vars_("p lift_x fill_x", i64)
+    lits, consts, fill_bind, lit_binds = _moment_ref_consts(ref)
+    zero_n, one_n = consts["zero"], consts["one"]
+    zero_x = Term.literal(lits["zero"]).shaped(String("broadcast_in_dim"), fill_x)
+    one_x = Term.literal(lits["one"]).shaped(String("broadcast_in_dim"), fill_x)
+    pos = ref.compare(String("gt"), zero_n, ops["gt"])
+    pos_x = pos.shaped(String("broadcast_in_dim"), lift_x)
     safe_x = _m_safe_x(ref, lift_x)
     mf = _m_wmul_first(ref, w, lift_x, fill_x)
     pw_w = w.binary(String("div"), safe_x, ops["div"])
@@ -1183,9 +1274,6 @@ def _moment_ssa_tile_rules(ops: dict[str, i64], binds: dict[str, tuple]) -> list
     arm_mf_c = _m_prod_div(zero_x, one_x, t1_w, small_d, mf.select(one_x, safe_x))
     arm_df_c = pw_w.binary(String("mul"), big_s, ops["mul"]).binary(String("mul"), small_d, ops["mul"])
     made = [
-        rewrite(_m_wcov_scale(ref, x, y, axes, lift_x, fill_x)).to(
-            pos.select(sc_raw, one_n), *fill_bind, *_need(lit_binds, "zero", "one", "qmax"),
-            *_need(binds, "sub", "abs", "max", "min", "gt", "and", "div"), eq(p_max).to(reduce_max_on(axes))),
         rewrite(_m_safe_x(ref, lift_x)).to(
             pos.select(one_n, ref).shaped(String("broadcast_in_dim"), lift_x),
             *fill_bind, *_need(lit_binds, "zero", "one"), *_need(binds, "gt")),
@@ -1229,7 +1317,11 @@ def _moment_ssa_tile_rules(ops: dict[str, i64], binds: dict[str, tuple]) -> list
         String("broadcast_in_dim"), lift_x)
     ax_ml, ay_ml = ax_m.shaped(String("broadcast_in_dim"), lift_x), ay_m.shaped(
         String("broadcast_in_dim"), lift_x)
+    ovf_x = _m_wcov_ovf(ref, x, y, axes, lift_x, fill_x)
     sc_tile_x = _m_wcov_scale(ref, x, y, axes, lift_x, fill_x).shaped(String("broadcast_in_dim"), lift_x)
+    dx_w = x.binary(String("sub"), ax_wl, ops["sub"])
+    dx_plain = pos_x.select(ovf_x.select(dx_w, zero_x), dx_w)
+    dx_hi = pos_x.select(ovf_x.select(zero_x, dx_w), zero_x)
     corr_w = pos.select(zero_n, _m_wmean(String("res"), ref, x, w, axes, p, lift_x, fill_x).binary(
         String("mul"), _m_wmean(String("res"), ref, y, w, axes, p, lift_x, fill_x), ops["mul"]))
     corr_m = _m_mmean(String("res"), ref, x, mask, z, axes, p, lift_x, fill_x).binary(
@@ -1240,10 +1332,13 @@ def _moment_ssa_tile_rules(ops: dict[str, i64], binds: dict[str, tuple]) -> list
         dy_m = mask.select(z, y.binary(String("sub"), ay_ml, ops["sub"]) if sign_i == 1 else
                            ay_ml.binary(String("sub"), y, ops["sub"]))
         made += [
-            rewrite(_m_wcov_tile(ref, x, y, w, axes, p, lift_x, fill_x, i64(sign_i))).to(
-                _m_wcov_raw(ref, x.binary(String("sub"), ax_wl, ops["sub"]), dy_w, sc_tile_x, w, axes, p,
-                            lift_x, fill_x).binary(String(op), corr_w, ops[op]),
-                *fill_bind, *lit_binds["zero"], *_need(binds, "gt", "sub", "mul", op)),
+            rewrite(_m_wcov_tile(String("plain"), ref, x, y, w, axes, p, lift_x, fill_x, i64(sign_i))).to(
+                _m_wcov_raw(ref, dx_plain, dy_w, one_x, w, axes, p, lift_x, fill_x).binary(
+                    String(op), corr_w, ops[op]),
+                *fill_bind, *_need(lit_binds, "zero", "one"), *_need(binds, "gt", "sub", "mul", op)),
+            rewrite(_m_wcov_tile(String("hi"), ref, x, y, w, axes, p, lift_x, fill_x, i64(sign_i))).to(
+                pos.select(_m_wcov_raw(ref, dx_hi, dy_w, sc_tile_x, w, axes, p, lift_x, fill_x), zero_n),
+                *fill_bind, *lit_binds["zero"], *_need(binds, "gt", "sub")),
             rewrite(_m_mcov_tile(ref, x, y, mask, z, axes, p, lift_x, fill_x, i64(sign_i))).to(
                 pos.select(zero_n, _m_mcov_raw(
                     ref, mask.select(z, x.binary(String("sub"), ax_ml, ops["sub"])), dy_m, mask,
@@ -1311,18 +1406,18 @@ def _moment_first_decoupled(slot) -> list:
 
 
 def _moment_second_decoupled(slot) -> list:
-    """Step, merge, and finish rules for normalized central second moments `(c, scale)`."""
+    """Step, merge, and finish rules for normalized central second moments `(c, hi, scale)`."""
     t, u, sx, sy, n, x, y, w, mask, z, d, c, cov = vars_("t u sx sy n x y w mask z d c cov", Term)
     axes = var("axes", Vec[i64])
     to_x, to_n, to_c = vars_("to_x to_n to_c", Vec[i64])
     layout = var("layout", String)
     p, p_div, p_lift, a, sign = vars_("p p_div p_lift a sign", i64)
-    i, i_sc, i_n, i_sx, i_sy, i_ax, i_ay = vars_("i i_sc i_n i_sx i_sy i_ax i_ay", i64)
+    i, i_hi, i_sc, i_n, i_sx, i_sy, i_ax, i_ay = vars_("i i_hi i_sc i_n i_sx i_sy i_ax i_ay", i64)
     z_n, o_n, fill_n, fill_x, lift_x = vars_("z_n o_n fill_n fill_x lift_x", i64)
     shape = rules.shape
     shared = (
         moment_second_of(t, sx, sy, n, a, sign),
-        eq(i).to(slot(t)), eq(i_sc).to(scale_slot(t)), eq(i_n).to(slot(n)),
+        eq(i).to(slot(t)), eq(i_hi).to(hi_slot(t)), eq(i_sc).to(scale_slot(t)), eq(i_n).to(slot(n)),
         eq(i_sx).to(slot(sx)), eq(i_sy).to(slot(sy)),
         eq(i_ax).to(anchor_slot(sx)), eq(i_ay).to(anchor_slot(sy)),
         eq(z_n).to(zero_of(n)), eq(z_n).to(zero_of(sx)), eq(z_n).to(zero_of(sy)), eq(z_n).to(zero_of(t)),
@@ -1333,18 +1428,25 @@ def _moment_second_decoupled(slot) -> list:
         eq(to_x).to(shape(x)), eq(shape(y)).to(to_x),
         eq(fill_x).to(filled(to_x)), eq(lift_x).to(unreduced(to_x, a)), *shared,
     )
+    zero_n = Term.literal(z_n).shaped(String("broadcast_in_dim"), fill_n)
     one_n = Term.literal(o_n).shaped(String("broadcast_in_dim"), fill_n)
     one_bind = (eq(o_n).to(one_of(n)), eq(fill_n).to(filled(to_n)))
-    n0, sc0 = Term.state(i_n, 0), Term.state(i_sc, 0)
+    n0, hi0, sc0 = Term.state(i_n, 0), Term.state(i_hi, 0), Term.state(i_sc, 0)
     ax0, ay0 = Term.state(i_ax, 0), Term.state(i_ay, 0)
-    s0 = (Term.state(i, 0), sc0, n0, ax0, Term.state(i_sx, 0), ay0, Term.state(i_sy, 0))
-    s1 = (Term.state(i, 1), Term.state(i_sc, 1), Term.state(i_n, 1), Term.state(i_ax, 1),
+    s0 = (Term.state(i, 0), hi0, sc0, n0, ax0, Term.state(i_sx, 0), ay0, Term.state(i_sy, 0))
+    s1 = (Term.state(i, 1), Term.state(i_hi, 1), Term.state(i_sc, 1), Term.state(i_n, 1), Term.state(i_ax, 1),
           Term.state(i_sx, 1), Term.state(i_ay, 1), Term.state(i_sy, 1))
+    h0, h1 = s0[1:], s1[1:]
     sc_w = _m_wcov_scale(n, x, y, axes, lift_x, fill_x)
     ax_w = _m_wmean(String("avg"), n, x, w, axes, p, lift_x, fill_x)
+    ux_w = _m_wmean(String("res"), n, x, w, axes, p, lift_x, fill_x)
     ay_w = _m_wmean(String("avg"), n, y, w, axes, p, lift_x, fill_x)
+    uy_w = _m_wmean(String("res"), n, y, w, axes, p, lift_x, fill_x)
     ax_m = _m_mmean(String("avg"), n, x, mask, z, axes, p, lift_x, fill_x)
+    ux_m = _m_mmean(String("res"), n, x, mask, z, axes, p, lift_x, fill_x)
     ay_m = _m_mmean(String("avg"), n, y, mask, z, axes, p, lift_x, fill_x)
+    uy_m = _m_mmean(String("res"), n, y, mask, z, axes, p, lift_x, fill_x)
+    hi_w = _m_wcov_tile(String("hi"), n, x, y, w, axes, p, lift_x, fill_x, sign)
     cov_done = _m_finish_c(String("cov"), n, *s0, sign)
     c_lifted = cov_done.shaped(layout, p_lift)
     return [
@@ -1358,15 +1460,21 @@ def _moment_second_decoupled(slot) -> list:
         rewrite(moment_scale(t).merged()).to(
             _m_combine_s(n, n0, sc0, ax0, ay0, Term.state(i_n, 1), Term.state(i_sc, 1),
                          Term.state(i_ax, 1), Term.state(i_ay, 1)), *shared),
+        rewrite(moment_hi(t).stepped()).to(
+            _m_combine_hi(n, *h0, hi_w, sc_w, n, ax_w, ux_w, ay_w, uy_w, sign),
+            central_moment(t, sx, sy, n, x, y, w, a, sign), eq(shape(w)).to(to_x), *step_extra),
+        rewrite(moment_hi(t).stepped()).to(
+            _m_combine_hi(n, *h0, zero_n, one_n, n, ax_m, ux_m, ay_m, uy_m, sign),
+            masked_central_moment(t, sx, sy, n, x, y, mask, z, a, sign), eq(shape(mask)).to(to_x),
+            *step_extra, *one_bind),
+        rewrite(moment_hi(t).merged()).to(_m_combine_hi(n, *h0, *h1, sign), *shared),
         rewrite(t.stepped()).to(
-            _m_combine_c(n, *s0, _m_wcov_tile(n, x, y, w, axes, p, lift_x, fill_x, sign), sc_w, n,
-                         ax_w, _m_wmean(String("res"), n, x, w, axes, p, lift_x, fill_x),
-                         ay_w, _m_wmean(String("res"), n, y, w, axes, p, lift_x, fill_x), sign),
+            _m_combine_c(n, *s0, _m_wcov_tile(String("plain"), n, x, y, w, axes, p, lift_x, fill_x, sign),
+                         hi_w, sc_w, n, ax_w, ux_w, ay_w, uy_w, sign),
             central_moment(t, sx, sy, n, x, y, w, a, sign), eq(shape(w)).to(to_x), *step_extra),
         rewrite(t.stepped()).to(
-            _m_combine_c(n, *s0, _m_mcov_tile(n, x, y, mask, z, axes, p, lift_x, fill_x, sign), one_n, n,
-                         ax_m, _m_mmean(String("res"), n, x, mask, z, axes, p, lift_x, fill_x),
-                         ay_m, _m_mmean(String("res"), n, y, mask, z, axes, p, lift_x, fill_x), sign),
+            _m_combine_c(n, *s0, _m_mcov_tile(n, x, y, mask, z, axes, p, lift_x, fill_x, sign), zero_n,
+                         one_n, n, ax_m, ux_m, ay_m, uy_m, sign),
             masked_central_moment(t, sx, sy, n, x, y, mask, z, a, sign), eq(shape(mask)).to(to_x),
             *step_extra, *one_bind),
         rewrite(t.merged()).to(_m_combine_c(n, *s0, *s1, sign), *shared),
@@ -1382,8 +1490,7 @@ def _moment_second_decoupled(slot) -> list:
 def moment_decoupled(slot) -> list:
     """Normalized anchored Chan-Golub-LeVeque step, merge, and finish rules for weighted and masked central
     second moments (`central_moment`, `masked_central_moment`), decomposed into linear SSA egglog helpers so
-    each rule RHS stays O(1) in AST size while deriving the exact same normalized `(anchor, ux, c, scale)`
-    forms."""
+    each rule RHS stays O(1) in AST size while deriving `(anchor, ux, c, hi, scale)` forms."""
     ops, binds = _moment_ops()
     return [
         *_moment_ssa_prob_rules(ops, binds),
@@ -1391,8 +1498,10 @@ def moment_decoupled(slot) -> list:
         *_moment_ssa_anchor_rules(ops, binds),
         *_moment_ssa_combine_u_rules(ops, binds),
         *_moment_ssa_combine_one_c_rules(ops, binds),
+        *_moment_ssa_combine_zero_rules(ops, binds),
         *_moment_ssa_combine_c_rules(ops, binds),
         *_moment_ssa_finish_rules(ops, binds),
+        *_moment_ssa_tile_scale_rules(ops, binds),
         *_moment_ssa_tile_rules(ops, binds),
         *_moment_first_decoupled(slot),
         *_moment_second_decoupled(slot),
@@ -1417,6 +1526,7 @@ def register_moment_resources(graph: EGraph, region: terms.Region, reductions: t
     halfs: dict[np.dtype, int] = {}
     qmaxs: dict[np.dtype, int] = {}
     fmaxs: dict[np.dtype, int] = {}
+    sqmaxs: dict[np.dtype, int] = {}
     rflrs: dict[np.dtype, int] = {}
     done_fill: set[tuple[int, ...]] = set()
     for reduction in reductions:
@@ -1426,10 +1536,11 @@ def register_moment_resources(graph: EGraph, region: terms.Region, reductions: t
                 float_info = jnp.finfo(dtype)
                 fmax_val = np.asarray(float_info.max, dtype)
                 qmax_val = fmax_val * np.asarray(0.25, dtype)
+                sqmax_val = np.asarray(0.5 * math.sqrt(float(float_info.max)), dtype)
                 rflr_val = np.asarray(min(math.sqrt(float(float_info.tiny)),
                                           0.25 * float(float_info.eps)), dtype)
-                for table, value in ((zeros, 0.0), (ones, 1.0), (halfs, 0.5),
-                                     (qmaxs, qmax_val), (fmaxs, fmax_val), (rflrs, rflr_val)):
+                for table, value in ((zeros, 0.0), (ones, 1.0), (halfs, 0.5), (qmaxs, qmax_val),
+                                     (fmaxs, fmax_val), (sqmaxs, sqmax_val), (rflrs, rflr_val)):
                     region.literals.append(np.asarray(value, dtype))
                     table[dtype] = len(region.literals) - 1
                     literal = Term.literal(i64(table[dtype]))
@@ -1440,6 +1551,7 @@ def register_moment_resources(graph: EGraph, region: terms.Region, reductions: t
                           set_(half_of(reduction)).to(i64(halfs[dtype])),
                           set_(quarter_max_of(reduction)).to(i64(qmaxs[dtype])),
                           set_(max_of(reduction)).to(i64(fmaxs[dtype])),
+                          set_(sqrt_max_of(reduction)).to(i64(sqmaxs[dtype])),
                           set_(ratio_floor_of(reduction)).to(i64(rflrs[dtype]))))
         to = tuple(region.shape(reduction))
         if to not in done_fill:

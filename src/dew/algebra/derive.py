@@ -68,10 +68,12 @@ from dew.algebra.derive_moments import (
     anchored_first,
     boolean,
     filled,
+    hi_slot,
     identity_broadcast,
     inserts_axis,
     is_square,
     moment_anchor,
+    moment_hi,
     moment_scale,
     nonnegative,
     plain_local,
@@ -453,6 +455,7 @@ def _shapes():
         rule(eq(extent).to(shape(x)), eq(y).to(x.merged())).then(set_(shape(y)).to(extent)),
         rule(eq(extent).to(shape(x)), eq(y).to(x.finished())).then(set_(shape(y)).to(extent)),
         rule(eq(extent).to(shape(x)), eq(y).to(moment_anchor(x))).then(set_(shape(y)).to(extent)),
+        rule(eq(extent).to(shape(x)), eq(y).to(moment_hi(x))).then(set_(shape(y)).to(extent)),
         rule(eq(extent).to(shape(x)), eq(y).to(moment_scale(x))).then(set_(shape(y)).to(extent)),
         rule(eq(w).to(x.compare(name, y, p)), eq(extent).to(shape(x)), eq(shape(y)).to(extent)).then(
             set_(shape(w)).to(extent)),
@@ -644,7 +647,8 @@ DECOUPLED_RESCALED = rules.Rules("decoupled rescaled", "reorders", _decoupled(re
 PLAIN = _plain()
 
 
-_READINGS = (Term.stepped, Term.merged, Term.finished, Term.held, moment_anchor, moment_scale, *MOMENT_SSA)
+_READINGS = (Term.stepped, Term.merged, Term.finished, Term.held, moment_anchor, moment_hi, moment_scale,
+             *MOMENT_SSA)
 
 
 def _priced(region: terms.Region, schedule) -> DagCostModel[cost.Seconds]:
@@ -750,8 +754,9 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
     def init(shapes):
         made = forms(shapes)
         avals = [jax.ShapeDtypeStruct(*shapes[name]) for name in names]
-        slot_terms = (*made.reductions, *made.anchors, *made.scales)
-        slot_floors = (*made.floors, *(math.inf,) * len(made.anchors), *(1.0,) * len(made.scales))
+        slot_terms = (*made.reductions, *made.anchors, *made.scales, *made.scales)
+        slot_floors = (*made.floors, *(math.inf,) * len(made.anchors), *(0.0,) * len(made.scales),
+                       *(1.0,) * len(made.scales))
         typed = jax.eval_shape(lambda *values: tuple(evaluated(made.region, reduction,
                                                                [*made.consts, *values], {})
                                                      for reduction in slot_terms), *avals)
@@ -825,6 +830,7 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
         made = forms(shapes)
         return (*((_role(reduction), made.region.shape(reduction)) for reduction in made.reductions),
                 *(("anchor", made.region.shape(term)) for term in made.anchors),
+                *(("hi", made.region.shape(term)) for term in made.scales),
                 *(("scale", made.region.shape(term)) for term in made.scales))
 
     return Derived(init, step, merge, finish, mapped,
@@ -879,9 +885,11 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
             raise Refused("an output along the walked axis reads a walked reduction: no tile holds it")
     roots = ([reduction.stepped() for reduction in reductions]
              + [moment_anchor(term).stepped() for term in anchors]
+             + [moment_hi(term).stepped() for term in scales]
              + [moment_scale(term).stepped() for term in scales]
              + [reduction.merged() for reduction in reductions]
              + [moment_anchor(term).merged() for term in anchors]
+             + [moment_hi(term).merged() for term in scales]
              + [moment_scale(term).merged() for term in scales]
              + [term.finished() for term, is_along in zip(outputs, along, strict=True)
                 if term is not None and not is_along])
@@ -931,8 +939,8 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
     report = program.AlgebraReport(region.equations, tuple(saturated.fired), saturated.fired,
                                    saturated.limits, saturated.iterations, program.node_count(graph),
                                    saturated.limited, before.value, after.value, time.perf_counter() - began)
-    extra_pad = (None,) * (len(anchors) + len(scales))
-    count = len(reductions) + len(anchors) + len(scales)
+    extra_pad = (None,) * (len(anchors) + 2 * len(scales))
+    count = len(reductions) + len(anchors) + 2 * len(scales)
     steps, merges, finished = chosen[:count], chosen[count:2 * count], iter(chosen[2 * count:])
     finishes = tuple(None if term is None or is_along else next(finished)
                      for term, is_along in zip(outputs, along, strict=True))
@@ -981,11 +989,13 @@ def _register_reduction_slots(graph: EGraph, region: terms.Region, reductions: t
             graph.register(set_(rules.shape(Term.state(i64(a_index), i64(side)))).to(
                 Vec[i64](*(i64(size) for size in region.shape(term)))))
     for offset, term in enumerate(scales):
-        s_index = len(reductions) + len(anchors) + offset
-        graph.register(set_(scale_slot(term)).to(i64(s_index)))
-        for side in (0, 1):
-            graph.register(set_(rules.shape(Term.state(i64(s_index), i64(side)))).to(
-                Vec[i64](*(i64(size) for size in region.shape(term)))))
+        h_index = len(reductions) + len(anchors) + offset
+        s_index = h_index + len(scales)
+        graph.register(set_(hi_slot(term)).to(i64(h_index)), set_(scale_slot(term)).to(i64(s_index)))
+        for slot_index in (h_index, s_index):
+            for side in (0, 1):
+                graph.register(set_(rules.shape(Term.state(i64(slot_index), i64(side)))).to(
+                    Vec[i64](*(i64(size) for size in region.shape(term)))))
     _lift(graph, region, reductions)
     if anchors or scales or any(_holds(graph, summed(reduction)) and not _holds(graph, local_of(reduction))
                                 and graph.lookup_function_value(anchored(reduction)) is None

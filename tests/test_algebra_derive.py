@@ -1344,14 +1344,22 @@ def test_zero_mass_scaled_covariance_ad_and_clamp_explicit_sharding():
             np.testing.assert_array_equal(np.asarray(gx), np.zeros((1, 2), np.float32))
             np.testing.assert_array_equal(np.asarray(gy), np.zeros((1, 2), np.float32))
 
-    # Multi-tile zero-mass + positive-mass witnesses, finite scaled derivatives, and `2^127` sign cancel.
+    # Multi-tile zero-mass + positive-mass witnesses, finite scaled derivatives, `2^127` sign cancel, and
+    # small zero-mass entries beside large entries in the same tile and across tiles (`L=2^63` and `2^127`).
     huge = np.float32(2.0 ** 127)
+    mid_big = np.float32(2.0 ** 63)
+    small = np.float32(2.0 ** -45)
     for x_vals, y_vals, w_vals, dw_vals, expect in (
         ([big, 0.0, big], [big, 0.0, big], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0], 0.0),
         ([big, 0.0, 0.0], [big, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0], 0.0),
         ([big, 0.0], [big, 0.0], [0.0, 0.0], [2.0 ** -70, 0.0], float(big)),
         ([big, 0.0], [big, 0.0], [0.0, 1.0], [2.0 ** -70, 0.0], float(big)),
         ([huge, huge], [huge, -huge], [0.0, 1.0], [1.0, 0.0], 0.0),
+        ([-mid_big, mid_big, small], [-mid_big, mid_big, small], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0],
+         float(small * small)),
+        ([-huge, huge, small], [-huge, huge, small], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0], float(small * small)),
+        ([-mid_big, mid_big, small, 0.0], [-mid_big, mid_big, small, 0.0], [0.0, 0.0, 0.0, 1.0],
+         [0.0, 0.0, 1.0, 0.0], float(small * small)),
     ):
         xc = jnp.asarray([x_vals], jnp.float32)
         yc = jnp.asarray([y_vals], jnp.float32)
@@ -1361,6 +1369,20 @@ def test_zero_mass_scaled_covariance_ad_and_clamp_explicit_sharding():
             val, dval = jax.jvp(
                 lambda w_, x_=xc, y_=yc, m=mode: direct_eval(x_, y_, w_, tile=1, mode=m), (wc,), (dwc,))
             assert float(val) == 0.0 and float(dval) == expect
+    for large in (mid_big, huge):
+        xs_mix = jnp.asarray([[-large, large, small]], jnp.float32)
+        ws_mix = jnp.asarray([[0.0, 0.0, 0.0]], jnp.float32)
+        dws_mix = jnp.asarray([[0.0, 0.0, 1.0]], jnp.float32)
+        val, dval = jax.jvp(lambda w_, x_=xs_mix: direct_eval(x_, x_, w_, tile=3, mode="walk"),
+                            (ws_mix,), (dws_mix,))
+        assert float(val) == 0.0 and float(dval) == float(small * small)
+    gw_mix = jax.grad(lambda w_: direct_eval(
+        jnp.asarray([[-mid_big, mid_big, small]], jnp.float32),
+        jnp.asarray([[-mid_big, mid_big, small]], jnp.float32), w_, tile=3, mode="walk"))(
+        jnp.asarray([[0.0, 0.0, 0.0]], jnp.float32))
+    np.testing.assert_array_equal(
+        np.asarray(gw_mix), np.asarray([[float(mid_big * mid_big), float(mid_big * mid_big),
+                                         float(small * small)]], np.float32))
 
     # `Term.clamp` under `AxisType.Explicit` matches JAX's native `clamp` placement rather than copying a
     # split bound's sharding onto a replicated middle operand.
