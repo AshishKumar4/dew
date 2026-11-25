@@ -23,6 +23,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax import lax
 from jax._src import ad_util, core as jax_core, hijax, pjit
+from jax._src.lax import control_flow
 from jax._src.pallas import mpmd, pallas_call, primitives as pallas
 from jax._src.pallas.mosaic import primitives as tpu
 from jax._src.pallas.mosaic_gpu import core as gpu_core, primitives as gpu
@@ -257,14 +258,16 @@ convert; exp2, sqrt and rsqrt their approximate forms. A sin's and a cos's accur
 reduction for large arguments, which a static count misstates: unpriced, with log1p and pow, which Mosaic
 GPU lowers in neither form. An fp32 division its one form (`MOSAIC_DIVISION`)."""
 
+_F32, _BF16, _F16, _E4M3, _S32 = (np.dtype(jnp.float32), np.dtype(jnp.bfloat16), np.dtype(jnp.float16),
+                                   np.dtype(jnp.float8_e4m3fn), np.dtype(jnp.int32))
 CONVERSION_FORMS: Mapping = {
-    ("f32", "bf16"): Work(conversions=0.5), ("f32", "f16"): Work(conversions=0.5),
-    ("f32", "f8"): Work(conversions=0.5),
-    ("bf16", "f32"): Work(integer_operations=1), ("f16", "f32"): Work(operations=1),
-    ("f8", "f32"): Work(conversions=0.5, operations=1), ("f32", "int"): Work(conversions=1, operations=2),
-    ("int", "f32"): Work(conversions=1), ("bf16", "f16"): Work(integer_operations=1, conversions=0.5)}
+    (_F32, _BF16): Work(conversions=0.5), (_F32, _F16): Work(conversions=0.5),
+    (_F32, _E4M3): Work(conversions=0.5),
+    (_BF16, _F32): Work(integer_operations=1), (_F16, _F32): Work(operations=1),
+    (_E4M3, _F32): Work(conversions=0.5, operations=1), (_F32, _S32): Work(conversions=1, operations=2),
+    (_S32, _F32): Work(conversions=1), (_BF16, _F16): Work(integer_operations=1, conversions=0.5)}
 """An element type conversion's issue an element in a Mosaic GPU kernel, by its source's and its target's
-kinds (`_kind`: fp32, bf16, a 16-bit float, an 8-bit float, an integer), from sm90's SASS of a kernel of one
+exact dtypes, from sm90's SASS of a kernel of one
 (FS-CONV-SASS1): a narrowing to a 16- or 8-bit float one F2FP a packed pair (`cvt.rn.bf16x2.f32`,
 `cvt.rn.f16x2.f32`, `cvt.rn.satfinite.e4m3x2.f32`); a bf16 widened by its bits, a PRMT and an IMAD.U32 a
 pair; an fp16 by an HADD2.F32 an element; an e4m3 unpacked to fp16 pairs (F2FP.UNPACK_B) and widened alike;
@@ -292,9 +295,10 @@ _FREE = frozenset({
     pallas.program_id_p, tpu.dma_wait_p, gpu.wait_gmem_to_smem_p, pjit.reshard_p, lax.gather_p,
     lax.dynamic_slice_p, lax.dynamic_update_slice_p, lax.concatenate_p, lax.pad_p, lax.rev_p, lax.split_p,
     lax.stack_p, lax.tile_p, lax.unstack_p, gpu.commit_group_p, ad_util.stop_gradient_p, jax_core.pvary_p,
-    jax_core.reduced_vary_cast_p})
+    jax_core.reduced_vary_cast_p, control_flow.platform_index_p})
 """What moves no data between memories and computes nothing a unit's rate prices: synchronization, layouts,
-a value's type cast along manual mesh axes (to vary, or from reduced: no value changes),
+a value's type cast along manual mesh axes (to vary, or from reduced: no value changes), the platform a
+program lowers for (`platform_index`, which its compile resolves),
 indices, a value's elements rearranged among a role's registers (a gather's, a slice's, a concatenation's;
 every layout move the Pallas fuser tiles: a dynamic slice and its update, whose index arithmetic is scalar,
 which nothing counts, a split, a stack, a tile and an unstack, so a fused prologue's stage holds no
@@ -718,7 +722,8 @@ class _Counting:
         if (primitive in programs.SCALAR_FOLDED and values and (operands := programs.admitted(
                 values, [atom.aval.dtype for atom in equation.invars])) is not None):
             if primitive is lax.convert_element_type_p:
-                self.add(Work(conversions=1))
+                self.add(operation_work(primitive, [atom.aval for atom in equation.invars],
+                                        [atom.aval for atom in equation.outvars], params, forms=self.forms))
             return _folded(equation, operands)
         if (placed := _placed(primitive, values)) is not None:
             return [placed]
@@ -1047,17 +1052,18 @@ def _expanded(equation) -> tuple[jax_core.Jaxpr, Sequence] | None:
     return traced.jaxpr, traced.consts
 
 
-def _kind(dtype) -> str:
-    """A dtype's kind as a kernel's conversion reads it (`CONVERSION_FORMS`): fp32, bf16, another 16-bit
-    float, an 8-bit float, an integer, or its own name."""
-    dtype = np.dtype(dtype)
-    if dtype == np.float32:
-        return "f32"
-    if dtype == jnp.bfloat16:
-        return "bf16"
-    if jnp.issubdtype(dtype, jnp.floating):
-        return {2: "f16", 1: "f8"}.get(dtype.itemsize, dtype.name)
-    return "int" if jnp.issubdtype(dtype, jnp.integer) and dtype.itemsize == 4 else dtype.name
+@functools.lru_cache(maxsize=64)
+def _software_division(operands: tuple, target: generation.GpuTarget, forms: str | None) -> Work:
+    """A correctly rounded division's software form (`precision._correctly_rounded_divide`, XLA's and Mosaic
+    GPU's lowering) over operands of `(shape, dtype)` `operands`, traced for `target` (its platform's
+    arithmetic chosen as its program's is) and counted as a kernel's body is, through its protected and
+    marked calls, with a Mosaic GPU kernel's `forms` (by name) or none (row 12886); once an operand set."""
+    with generation.assumed(target):
+        traced = jax.make_jaxpr(precision._correctly_rounded_divide)(
+            *(jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in operands))
+        held = {"approximate": APPROXIMATE_FORMS, "accurate": ACCURATE_FORMS}.get(forms or "")
+        counted = emitted(traced.jaxpr, 1, None, forms=held).roles[0]
+    return counted.fixed + sum(counted.walks, Work())
 
 
 def _divides_on_cuda(outputs: Sequence, target: generation.GpuTarget | None) -> bool:
@@ -1133,11 +1139,9 @@ def operation_work(primitive, inputs: Sequence, outputs: Sequence, params: Mappi
     if primitive is precision.correctly_rounded_divide_p:
         if (native := (forms or {}).get(primitive)) is not None:
             return repeated(native, sum(_elements(aval) for aval in outputs))
-        traced = jax.make_jaxpr(precision._correctly_rounded_divide)(
-            *(jax.ShapeDtypeStruct(aval.shape, aval.dtype) for aval in inputs))
-        with generation.assumed(target or generation.gpu_target()):
-            counted = emitted(traced.jaxpr, 1, None, forms=forms).roles[0]
-        return counted.fixed + sum(counted.walks, Work())
+        kinds = {id(APPROXIMATE_FORMS): "approximate", id(ACCURATE_FORMS): "accurate"}
+        return _software_division(tuple((tuple(aval.shape), np.dtype(aval.dtype)) for aval in inputs),
+                                  target or generation.gpu_target(), kinds.get(id(forms)))
     if primitive is lax.div_p and forms is not None and _divides_on_cuda(outputs, target) and (
             (form := forms.get(primitive)) is not None):
         return repeated(form, sum(_elements(aval) for aval in outputs))
@@ -1157,7 +1161,7 @@ def operation_work(primitive, inputs: Sequence, outputs: Sequence, params: Mappi
             # Its own dtype (a weak type made strong): no instruction (FS-CONV-SASS2's fp32 to fp32).
             return Work()
         if forms in (APPROXIMATE_FORMS, ACCURATE_FORMS):
-            form = CONVERSION_FORMS.get((_kind(inputs[0].dtype), _kind(outputs[0].dtype)))
+            form = CONVERSION_FORMS.get((np.dtype(inputs[0].dtype), np.dtype(outputs[0].dtype)))
             if form is not None:
                 return repeated(form, elements)
         return Work(conversions=elements)
