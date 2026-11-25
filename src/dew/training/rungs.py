@@ -27,7 +27,7 @@ import jax
 from jax.sharding import Mesh
 
 from dew import _cache
-from dew._code import provenance, provenance_code, stated_class, whole_digest
+from dew._code import held, provenance, provenance_code, stated_class, whole_digest
 from dew._devices import device_memory
 from dew._records import JSON, json_value, record
 from dew._stated import Unestablished, stated
@@ -59,7 +59,7 @@ RECORD_VERSION = 3
 
 def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], splits: Sequence[int],
              mesh: Mesh, step: Callable[..., StepFn] | None = None, remat: str = "auto", *,
-             settings: StepSettings | None = None) -> dict[str, JSON] | None:
+             settings: StepSettings) -> dict[str, JSON] | None:
     """What a recorded rung was decided for, read before the step traces: the
     configuration of the `modules` its programs run at the rung it starts from
     (`Objective.program_key`) and a custom `step`, as an identity states them
@@ -102,32 +102,40 @@ def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], spl
             'xla_flags': ' '.join(flags)}
 
 
-def _code(settings: StepSettings | None, modules: Sequence[object],
-          step: Callable[..., StepFn] | None) -> list[str]:
+_DATA = frozenset({"builtins", "numpy", "jax", "jaxlib", "ml_dtypes"})
+"""The packages whose instances a step's settings hold as data, no code of their own run as it builds."""
+
+
+def _code(settings: StepSettings, modules: Sequence[object], step: Callable[..., StepFn] | None) -> list[str]:
     """The digests of the code that builds a step (`provenance_code`): the step's compiler and the modules of
     Dew's defining what its `settings` hold (its objective, every base of its class among them, a model-free
     objective's loss its base's, and what its optimizer was made from), its program's `modules` and a custom
-    `step`, each with every module of Dew's it can import. All of Dew's where any is a function no class
-    states (an optimizer handed in as a transformation, a user's criterion), or the objective's class is
-    none of Dew's (a user's subclass): their code is no value's, and may call any of Dew's. Not every file
-    of Dew's otherwise: a run keying a rung on them all read all 794, so its tests' CI key was every file
-    (22% of the suite's rows)."""
-    if settings is None:
-        return provenance_code("dew.training.compiler", provenance([*modules, step]))
+    `step`, each with every module of Dew's it can import. All of Dew's where any of them is code no class of
+    Dew's states, which may call any of Dew's: the objective's class none of Dew's (a user's subclass), a
+    function (an optimizer handed in as a transformation, a user's criterion), an instance of a class of a
+    user's or a library's (an optimizer spec or schedule of a user's own), or an optimizer an import path
+    names outside Optax (`dew.optim.Optax`, its factory found by the registry, which no closure follows).
+    Not every file of Dew's otherwise: a run keying a rung on them all read all 794, so its tests' CI key was
+    every file (22% of the suite's rows)."""
+    from dew.optim import Optax
+
     objective = settings.objective
-    if not stated_class(type(objective)):
-        return [whole_digest()]
     # The optimizer as built is functions, what it was made from (`optimizer_source`) states its code; the
     # meshes are devices, which the key states apart (a mesh is callable, a context of JAX's).
-    held = [getattr(settings, field.name) for field in dataclasses.fields(settings)
-            if field.name not in ("built_optimizer", "device_mesh", "state_mesh")]
-    return provenance_code("dew.training.compiler",
-                           provenance([*held, *type(objective).__mro__, *modules, step]))
+    values = [*(getattr(settings, field.name) for field in dataclasses.fields(settings)
+                if field.name not in ("built_optimizer", "device_mesh", "state_mesh")), *modules, step]
+    parts = held(values)
+    if not stated_class(type(objective)) or any(
+            not isinstance(part, type) and not stated_class(type(part))
+            and type(part).__module__.partition(".")[0] not in _DATA for part in parts) or any(
+            isinstance(part, Optax) and not part.path.startswith("optax:") for part in parts):
+        return [whole_digest()]
+    return provenance_code("dew.training.compiler", provenance([*values, *type(objective).__mro__]))
 
 
 def recorded_rung(modules: Sequence[object], arguments: tuple[TrainState, Batch], splits: Sequence[int],
                   mesh: Mesh, step: Callable[..., StepFn] | None = None, remat: str = "auto", *,
-                  settings: StepSettings | None = None) -> tuple[Path | None, dict[str, JSON], JSON]:
+                  settings: StepSettings) -> tuple[Path | None, dict[str, JSON], JSON]:
     """Where the rung of the step over `arguments` on `mesh` is recorded, its key
     (`rung_key`), and the rung the record holds (None if there is none). A
     process of a pool keeps no record: its processes agree on the rung; nor does a step its key states

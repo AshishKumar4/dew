@@ -194,10 +194,10 @@ def provenance(values: Sequence[object]) -> frozenset[str] | None:
     a hook at one tile alone (`attention.hook_program`), and no value names the code a wrapper calls (row
     10743). A callable instance of a class of Dew's at its module's top level (a Flax module, a template's
     hook such as `Capped`) is its class's code, as any other instance is, its fields walked as theirs are."""
-    held = [part for value in values for part in _held(value)]
-    if any(callable(part) and not isinstance(part, type) and not stated_class(type(part)) for part in held):
+    parts = held(values)
+    if any(callable(part) and not isinstance(part, type) and not stated_class(type(part)) for part in parts):
         return None
-    modules = {(part if isinstance(part, type) else type(part)).__module__ for part in held}
+    modules = {(part if isinstance(part, type) else type(part)).__module__ for part in parts}
     return frozenset(module for module in modules if _path(module) is not None)
 
 
@@ -222,6 +222,11 @@ def provenance_code(root: str, provenance: frozenset[str] | None) -> list[str]:
     if provenance is None:
         return [whole_digest()]
     return [code_digest(module) for module in (root, *sorted(provenance))]
+
+
+def held(values: Sequence[object]) -> list[object]:
+    """Every value `values` hold (`_held`), each value's own first."""
+    return [part for value in values for part in _held(value)]
 
 
 def _held(value) -> Sequence[object]:

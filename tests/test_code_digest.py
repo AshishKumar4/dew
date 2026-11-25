@@ -405,7 +405,7 @@ from dew.nn.kernels.templates.attention_triton import TritonForward
 from dew.objectives.lm import LMObjective
 from dew.objectives.residuals import Residuals
 from dew.objectives.supervised import Supervised
-from dew.optim import Adam, OptimConfig
+from dew.optim import Adam, OptimConfig, Optax
 from dew.training import Trainer
 from dew.training.rungs import _code
 
@@ -424,10 +424,13 @@ lm = LMObjective(model, 4)
 configured = Trainer(lm, OptimConfig(optimizer=Adam(), lr=1e-3), key=jax.random.key(0))._settings()
 handed = Trainer(lm, optax.sgd(1e-2), key=jax.random.key(0))._settings()
 criterion = Supervised(model, lambda outputs, batch: outputs.sum(), inputs="text")
+pathed = dataclasses.replace(configured, optimizer_source=OptimConfig(optimizer=Optax(path="mine:factory"),
+                                                                      lr=1e-3))
 whole = [whole_digest()]
 launch = op_provenance(TritonForward(score_mod=Capped(30.0)), {})
 print(json.dumps({"lm": _code(configured, lm.program_key(), None),
                   "opaque": [_code(handed, lm.program_key(), None) == whole,
+                             _code(pathed, lm.program_key(), None) == whole,
                              _code(dataclasses.replace(configured, objective=Fitted()), (), None) == whole,
                              _code(dataclasses.replace(configured, objective=criterion), (), None) == whole],
                   "launch": provenance_code("dew.nn.kernels.templates.report", launch) == whole,
@@ -439,12 +442,12 @@ def test_a_rung_records_code_is_its_step_its_objective_and_its_models_and_none_e
     """A rung record keys on the code that builds its step (`dew.training.rungs._code`), not every file of
     Dew's, as the compiler hands it the run's settings: a file no step's code imports leaves an LM's whose
     optimizer is a config alike, and its model's module moves it. A step whose code no value names keys on
-    all of Dew's: an optimizer handed in as a transformation, a user's objective (a model-free `Residuals`'s
-    subclass), and one of Dew's holding a user's criterion. Every file's digest made each rung test's CI
-    key every file of Dew's (22% of the suite's rows). A hook of a class of Dew's (`Capped`), keyed by
-    every file before, keys on its class's module: an edit there moves its code, an unrelated file's leaves
-    it; a launch holding it (a Triton forward's score hook, `op_provenance`) holds it prepared, its runner
-    a function, and keys on all of Dew's as before."""
+    all of Dew's: an optimizer handed in as a transformation or named by an import path outside Optax, a
+    user's objective (a model-free `Residuals`'s subclass), and one of Dew's holding a user's criterion.
+    Every file's digest made each rung test's CI key every file of Dew's (22% of the suite's rows). A hook
+    of a class of Dew's (`Capped`), keyed by every file before, keys on its class's module: an edit there
+    moves its code, an unrelated file's leaves it; a launch holding it (a Triton forward's score hook,
+    `op_provenance`) holds it prepared, its runner a function, and keys on all of Dew's as before."""
     tree = tmp_path / "src"
     for name in ("dew", "_dew_torch"):
         shutil.copytree(REPO_ROOT / "src" / name, tree / name, ignore=shutil.ignore_patterns("__pycache__"))
@@ -455,7 +458,7 @@ def test_a_rung_records_code_is_its_step_its_objective_and_its_models_and_none_e
 
     (package / "_spare_rung.py").write_text("")
     before = codes()
-    assert before["opaque"] == [True, True, True] and before["launch"]
+    assert before["opaque"] == [True, True, True, True] and before["launch"]
     assert codes(package / "_spare_rung.py") == before
     hooked = codes(package / "nn" / "kernels" / "templates" / "attention.py")
     assert hooked["capped"] != before["capped"]
