@@ -46,7 +46,7 @@ def naive(query, key, value, g, level_scales, *, starts=None):
         return jnp.concatenate(pieces)
     length = query.shape[1]
     work = jnp.promote_types(value.dtype, jnp.float32)
-    q, k = (jnp.repeat(x.astype(work), HEADS // GROUPS, axis=2) for x in (query, key))
+    q, k = (jnp.repeat(x.astype(work), value.shape[2] // query.shape[2], axis=2) for x in (query, key))
     running = jnp.cumsum(g.astype(work), axis=1).transpose(0, 2, 1)
     causal = np.tril(np.ones((length, length), bool))
     decay = jnp.exp(jnp.where(causal, running[..., :, None] - running[..., None, :], -jnp.inf))
@@ -57,16 +57,16 @@ def naive(query, key, value, g, level_scales, *, starts=None):
     return (jnp.einsum('bhlc,bchp->blhp', scores, value.astype(work)) * WIDTH ** -0.5).astype(value.dtype)
 
 
-def draw(seed: int):
-    """fp32 operands from `seed`: unit queries and keys, a log decay `log sigmoid`, level weights about
-    one, and a cotangent of the output."""
+def draw(seed: int, groups: int = GROUPS, heads: int = HEADS):
+    """fp32 operands from `seed`, `groups` key heads serving `heads` value heads: unit queries and keys, a
+    log decay `log sigmoid`, level weights about one, and a cotangent of the output."""
     normal = np.random.default_rng([seed, 3]).standard_normal
-    q, k = (normal((ROWS, LENGTH, GROUPS, WIDTH)) for _ in range(2))
+    q, k = (normal((ROWS, LENGTH, groups, WIDTH)) for _ in range(2))
     q, k = (x / np.linalg.norm(x, axis=-1, keepdims=True) for x in (q, k))
-    v = normal((ROWS, LENGTH, HEADS, VALUES))
-    g = np.log(sigmoid(normal((ROWS, LENGTH, HEADS)) + 2.0))
-    weights = 1.0 + 0.3 * normal((ROWS, LENGTH, HEADS, levels(LENGTH)))
-    return *(hosted(x) for x in (q, k, v, g, weights)), hosted(normal((ROWS, LENGTH, HEADS, VALUES)))
+    v = normal((ROWS, LENGTH, heads, VALUES))
+    g = np.log(sigmoid(normal((ROWS, LENGTH, heads)) + 2.0))
+    weights = 1.0 + 0.3 * normal((ROWS, LENGTH, heads, levels(LENGTH)))
+    return *(hosted(x) for x in (q, k, v, g, weights)), hosted(normal((ROWS, LENGTH, heads, VALUES)))
 
 
 @pytest.mark.parametrize('packed', (False, True))
@@ -80,6 +80,16 @@ def test_the_masked_form_is_as_exact_as_flas_level_by_level(packed):
         log_linear_attention
     assert_packed_on_par(dew, naive, draw, 'log-linear attention', packed=packed, documents=DOCUMENTS,
                          length=LENGTH, seeds=SEEDS[packed])
+
+
+def test_key_heads_serve_their_own_value_heads_packed():
+    """Two key heads, each serving two value heads, over packed documents: the output and every operand's
+    gradient on par with fla's reference (check 1), so each value head reads its own key head's scores
+    (the within-block scores formed once a key head, its value heads mapped inside it: head `g H/G + p`)."""
+    dew = functools.partial(log_linear_attention, max_segments=max(map(len, DOCUMENTS)))
+    assert_packed_on_par(dew, naive, functools.partial(draw, groups=2, heads=4),
+                         'log-linear attention, two key heads', packed=True, documents=DOCUMENTS,
+                         length=LENGTH, seeds=SEEDS[True])
 
 
 @pytest.mark.parametrize("read", ["overflowing", "overflowing at a level of zero weight", "a NaN"])
