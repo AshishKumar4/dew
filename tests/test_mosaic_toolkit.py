@@ -1437,16 +1437,21 @@ def test_mma_sync_products_within_a_row_bound_keep_the_accumulator_past_it(m_war
     full = c + np.asarray(a, np.float32) @ np.asarray(b, np.float32)
     starts, on_gpu = np.arange(64)[:, None] // 16 * 16, here() != "cpu"
     run = jax.jit(_bounded, static_argnames=("family", "interpret"))
-    for bounds, constant in (((-1, 65), -1), ((0, 64), 65), ((1, 47), 16), ((16, 17), 47)):
+    cases = (((-1, 65), -1), ((0, 64), 65), ((1, 47), 16), ((16, 17), 47))
+    # Every bound's arm called before any is judged, so a GPU tier's prepare, whose arms give zeros, reaches
+    # each (row 10697: it stopped at the first one's check).
+    got = []
+    for bounds, constant in cases:
         operands, bounded = (a, b, c, np.asarray(bounds, np.int32)), family.bounded(constant)
         if on_gpu:
-            got = ahead_arm(jax.jit(functools.partial(_bounded, family=bounded, interpret=False)),
-                            f"bounded products: {m_warps} warps at {constant}")(*operands)
+            got.append(ahead_arm(jax.jit(functools.partial(_bounded, family=bounded, interpret=False)),
+                                 f"bounded products: {m_warps} warps at {constant}")(*operands))
         else:
             with generation.assumed("sm80"):
-                got = run(*operands, family=bounded, interpret=INTERPRETED)
+                got.append(run(*operands, family=bounded, interpret=INTERPRETED))
+    for (bounds, constant), found in zip(cases, got, strict=True):
         expected = [np.where(starts < bound, full, c) for bound in (*bounds, constant)]
-        np.testing.assert_array_equal(np.asarray(got), np.stack(expected))
+        np.testing.assert_array_equal(np.asarray(found), np.stack(expected))
     if on_gpu:
         return
     shapes = [jax.ShapeDtypeStruct(x.shape, x.dtype) for x in (a, b, c, np.zeros(2, np.int32))]
@@ -1933,6 +1938,9 @@ def test_a_product_issued_within_a_staged_block_is_refused():
 
 @pytest.mark.gpu(reason="compiles a launch under each lowering semantics and runs it on this GPU")
 @pytest.mark.generations("sm90", "sm100")
+@pytest.mark.skipif(not here().startswith("sm") or not generation.architecture(here()).tma,
+                    reason="copies its tiles out by TMA, which a GPU before Hopper has none of (row 10697: "
+                           "an A100's compile of it aborted its file's process)")
 @pytest.mark.parametrize("semantics", [plgpu.LoweringSemantics.Lane, plgpu.LoweringSemantics.Warpgroup],
                          ids=["lane", "warpgroup"])
 def test_a_launch_runs_a_flags_branch_and_its_negations_branch_each_alone(semantics):
