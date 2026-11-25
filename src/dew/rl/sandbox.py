@@ -517,11 +517,13 @@ class ContainerRunner:
             try:
                 streams, stopped = _collected(process, program.stdin.encode(), deadline, limits.message_bytes)
             finally:
-                if exit_code(process) is None:
-                    # The client dies first so it makes no further API call;
-                    # `rm --force` then removes the container whether it is
-                    # still being created, created or running.
-                    _cleanup.stop([process], settle=0.0)
+                running = exit_code(process) is None
+                # The client's group ends, and its lifeline with it, whichever way the run ended; a running
+                # client dies first so it makes no further API call.
+                _cleanup.stop([process], settle=0.0)
+                if running:
+                    # `rm --force` then removes the container whether it is still being created, created or
+                    # running.
                     try:
                         subprocess.run([self.runtime, "rm", "--force", name], capture_output=True,
                                        timeout=_REMOVAL_SECONDS, check=False)

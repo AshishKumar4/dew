@@ -342,9 +342,9 @@ def run_loop(model, x, *, train: bool, decode: bool, passes=None, **inputs):
     if first:
         x = model.stack(x, span=(0, first), train=train, decode=decode, **inputs)
 
-    def every_pass(module, x, inputs, *, outer_mesh=None):
+    def every_pass(module, x, inputs, passes):
         # The block's passes, first and later, and what each exits.
-        run = _Passes(module, train=train, decode=decode, inputs=inputs, outer_mesh=outer_mesh)
+        run = _Passes(module, train=train, decode=decode, inputs=inputs)
         run.injected = x
         first_pass = run.run_block if run.shared is None else nn.map_variables(
             run.run_block, mapped_collections=WRITTEN, trans_in_fn=run.shared.first,
@@ -354,13 +354,17 @@ def run_loop(model, x, *, train: bool, decode: bool, passes=None, **inputs):
         return x, run.exited
 
     layout = placed_layout()
-    if (loop.gathered and not model.is_initializing() and layout is not None
-            and jax.sharding.get_abstract_mesh().shape.get(FSDP_AXIS, 1) > 1):
-        x, exited = _gathered_passes(model, every_pass, x, inputs, functools.partial(
+    # A decode (a server's step) and a store banked by run (each run's bank read by the scan the gathered
+    # passes do not run) read the block where it lies.
+    if (loop.gathered and not decode and not model.is_initializing() and layout is not None
+            and jax.sharding.get_abstract_mesh().shape.get(FSDP_AXIS, 1) > 1
+            and not model.banked_collections((first, end))):
+        # Under `exiting` every pass runs the coda too, whose layers are gathered with the block's.
+        x, exited = _gathered_passes(model, every_pass, x, inputs, passes, functools.partial(
             _gathered_params, layout=layout, mesh=jax.sharding.get_abstract_mesh(),
-            scope=('params', *model.scope.path), span=(first, end)))
+            scope=('params', *model.scope.path), span=(first, layers if loop.exiting else end)))
     else:
-        x, exited = every_pass(model, x, inputs)
+        x, exited = every_pass(model, x, inputs, passes)
     if loop.reinject:
         x = model.norm(x)
     if end < layers:
@@ -370,15 +374,15 @@ def run_loop(model, x, *, train: bool, decode: bool, passes=None, **inputs):
     return _handed_on(model, exited, x, loop.exit_threshold)
 
 
-def _gathered_passes(model, every_pass: Callable, x, inputs: dict, gathered: Callable):
+def _gathered_passes(model, every_pass: Callable, x, inputs: dict, passes, gathered: Callable):
     """`every_pass(model, x, inputs)` traced with every Auto axis Explicit (`sharding.explicit_over`), every
     parameter the passes read gathered whole once before the first over the FSDP axis and every axis the
     stream's tokens are split over (a hybrid run's data axis, a sequence axis), a matrix reduced over them
     (`gathered`, `_gathered_params`), so each pass's gradient of it stays unreduced, the passes' sum of it
     reduced once after the loop (`Loop.gathered`): a product's gradient sums over every axis its tokens
-    split. `inputs`' arrays held whole on every device, and what the passes write (their sown and cached
-    collections) placed back on the mesh the step traces (`sharding.typed_on`), as the coda each pass runs
-    under `exiting` runs there (`_Passes.coda`). The passes' operations are typed on the mesh: a
+    split. `inputs`' arrays and a count of `passes` given per call held whole on every device, and what the
+    passes write (their sown and cached collections) placed back on the mesh the step traces
+    (`sharding.typed_on`). The passes' operations are typed on the mesh: a
     projection takes no launch mapped per shard there (`projections.rows_split`), the partitioner's product
     running it."""
     from dew.nn.kernels import generation
@@ -386,16 +390,17 @@ def _gathered_passes(model, every_pass: Callable, x, inputs: dict, gathered: Cal
     whole = jax.sharding.PartitionSpec()
     mesh = jax.sharding.get_abstract_mesh()
 
-    def passes(module, x):
-        held = jax.tree.map(lambda value: jax.sharding.reshard(value, whole)
-                            if isinstance(value, jax.Array) else value, inputs)
-        return every_pass(module, x, held, outer_mesh=mesh)
+    def held(module, x):
+        # What the passes read from outside the region placed on its mesh: the inputs and a count of passes.
+        inside = jax.tree.map(lambda value: jax.sharding.reshard(value, whole)
+                              if isinstance(value, jax.Array) else value, (inputs, passes))
+        return every_pass(module, x, *inside)
 
     def run_inside(x):
         token_axes = {name for entry in jax.typeof(x).sharding.spec.partitions[:x.ndim - 1]
                       for name in mesh_axes(entry)}
         mapped = nn.map_variables(
-            passes, mapped_collections=True, init=False, mutable=True,
+            held, mapped_collections=True, init=False, mutable=True,
             trans_in_fn=functools.partial(gathered, axes=token_axes | {FSDP_AXIS}),
             trans_out_fn=lambda variables: {
                 name: tree if name == 'params' else typed_on(tree, mesh)
@@ -414,8 +419,10 @@ def _gathered_params(variables: Mapping[str, Mapping], *, layout, mesh, scope: t
     gathered loop's passes read gathered whole over `axes` from where `layout` places it on the step's
     `mesh` (`sharding.gathered_over`, `Layout.leaf_spec`): a layer's within the block (`span`, `[first,
     end)`), met by any module name running it, its own (`layers_3`) or a run's (`layers_1_2`,
-    `layer_names.group_layers`), and the decoder's own, no layer's (its step and reinjection norms); every
-    other (the prelude's and the coda's layers) as it is, which no pass reads on the Explicit mesh. Each
+    `layer_names.group_layers`; the coda's too where every pass exits through it, `Loop.exiting`), and the
+    decoder's own, no layer's (its step and reinjection norms, and the final norm and head an exiting pass
+    reads); every other (the prelude's layers, the coda's where only the last pass runs it) as it is, which
+    no pass reads. Each
     leaves its box (`flax.core.meta`'s) unconstrained (`dew.batch.unboxed`): its logical axes would place it
     by a constraint, which an Explicit axis takes none of, and a gathered one's back on the FSDP axis."""
     first, end = span
@@ -443,7 +450,6 @@ class _Passes:
     train: bool
     decode: bool
     inputs: dict
-    outer_mesh: jax.sharding.AbstractMesh | None = None
     injected: jax.Array | None = None
     exited: list = dataclasses.field(default_factory=list)
     span: tuple[int, int] = dataclasses.field(init=False)
@@ -484,18 +490,11 @@ class _Passes:
         return _entered(module, x, bank, self.injected, stop=stop, normed=normed, theta=theta)
 
     def coda(self, module, x):
-        """A pass's exit state from its output `x`: the coda run on it, under the step's view; in a gathered
-        loop's passes (`outer_mesh`, the mesh the step traces) on that mesh's Auto axes, where its layers'
-        parameters lie ungathered (`_gathered_passes`)."""
+        """A pass's exit state from its output `x`: the coda run on it, under the step's view."""
         _, end = self.span
         layers = self.model.num_layers
         if end == layers:
             return x
-        if self.outer_mesh is not None and self.outer_mesh.auto_axes:
-            return jax.sharding.auto_axes(
-                lambda x, inputs: module.stack(x, span=(end, layers), train=self.train,
-                                               decode=self.decode, **inputs),
-                axes=self.outer_mesh.auto_axes, out_sharding=jax.typeof(x).sharding)(x, self.inputs)
         return module.stack(x, span=(end, layers), train=self.train, decode=self.decode, **self.inputs)
 
     def fixed(self, x, bank):

@@ -290,11 +290,13 @@ class Loop:
     must allow (an opt-in for a block that fits). The gradient is the same sum, summed in another order. It
     gathers the parameters as the step reads them: a run's narrow copies (`dew.training.narrow`), the compute
     dtype's, where it holds them, else the stored dtype, a quantized stored kernel's as it is stored. The
-    decoder's own parameters the passes read (its step and reinjection norms) are gathered with the block's;
-    the prelude, the coda (each pass's too, under `exiting`, which runs on the step's own mesh) and the
-    embedding and head keep their placement. Every operation of the passes is typed on the mesh, so one with
-    no rule for it fails as it traces. The block's layers run one by one in each pass (a scan over them takes
-    no reduced copy), and its projections as the partitioner places them, no launch mapped per shard.
+    decoder's own parameters the passes read (its step and reinjection norms) are gathered with the block's,
+    and under `exiting`, where every pass runs the coda, the final norm and the head, theirs too; the prelude,
+    and the coda, final norm and head the last pass alone runs, keep their placement. A decode (a server's
+    step) and a store banked by run read the block where it lies, as without it. Every operation of the passes
+    is typed on the mesh, so one with no rule for it fails as it traces. The block's layers run one by one in
+    each pass (a scan over them takes no reduced copy), and its projections as the partitioner places them, no
+    launch mapped per shard.
     """
     steps: int
     step_norm: bool = True

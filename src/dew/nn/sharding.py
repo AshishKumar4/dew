@@ -694,25 +694,10 @@ def typed_on[T](tree: T, mesh: jax.sharding.AbstractMesh) -> T:
     return jax.tree.map(back, tree)
 
 
-def _named(spec: jax.sharding.PartitionSpec) -> set[str]:
-    """The mesh axes `spec` places a dimension on."""
-    return {name for entry in spec.partitions if entry is not None
-            for name in ((entry,) if isinstance(entry, str) else tuple(entry))}
-
-
 def _only(spec: jax.sharding.PartitionSpec, axes: Collection[str]) -> jax.sharding.PartitionSpec:
     """`spec` with only `axes` kept in each dimension that names any."""
     def kept(entry):
         names = tuple(name for name in mesh_axes(entry) if name in axes)
-        return None if not names else names[0] if len(names) == 1 else names
-    return jax.sharding.PartitionSpec(*map(kept, spec.partitions))
-
-
-def _without(spec: jax.sharding.PartitionSpec, axis: str) -> jax.sharding.PartitionSpec:
-    """`spec` with `axis` dropped from every dimension that names it."""
-    def kept(entry):
-        names = () if entry is None else (entry,) if isinstance(entry, str) else tuple(entry)
-        names = tuple(name for name in names if name != axis)
         return None if not names else names[0] if len(names) == 1 else names
     return jax.sharding.PartitionSpec(*map(kept, spec.partitions))
 

@@ -1169,16 +1169,21 @@ def _collectives_in_loops(text: str) -> collections.Counter:
                                                     line))
 
 
-def _gathered_case(*, gathered: bool, remat: bool, exiting: bool = False):
+def _gathered_case(*, gathered: bool, remat: bool, exiting: bool = False, counted: bool = False):
     """A four-layer decoder looping its layers [1, 3) four times (`Loop.gathered`), recomputing each pass and
-    each layer where `remat`, every pass exiting through the coda where `exiting` (`Loop.exit_gate`, each
-    pass's step normed), and its gradient of a cotangent on its logits as a function of its variables, its
-    tokens and the cotangent."""
+    each layer where `remat`, every pass exiting through the coda where `exiting` (`Loop.exit_gate`, its
+    exits weighed into the output, each pass's step normed), running a count of passes the call computes
+    where `counted` (`loop_passes`, three), and its gradient of a cotangent on its logits as a function of
+    its variables, its tokens and the cotangent."""
     from dew.nn.backbones.decoder_block import REMAT_POLICIES
 
     loop = Loop(4, layers=(1, 3), remat=remat, gathered=gathered, step_norm=exiting, exit_gate=exiting)
     model = tiny(num_layers=4, loop=loop, **({"remat": REMAT_POLICIES["full"]} if remat else {}))
-    return model, with_gradients(lambda variables, ids: model.apply(variables, ids))
+
+    def forward(variables, ids):
+        count = jnp.full((), 3, jnp.int32) if counted else None
+        return model.apply(variables, ids, loop_passes=count)
+    return model, with_gradients(forward)
 
 
 GATHERED_MESHES = {"fsdp": {"fsdp": 8}, "hybrid": {"fsdp": 4}, "tensor": {"fsdp": 4, "tensor": 2},
@@ -1188,25 +1193,27 @@ four), beside a tensor split and beside a sequence split."""
 
 
 @pytest.mark.mesh(devices=8)
-@pytest.mark.parametrize(("mesh_shape", "remat", "boxed", "exiting"), [
-    pytest.param("fsdp", False, False, False, id="fsdp-plain-arrays"),
-    pytest.param("fsdp", False, True, False, id="fsdp-plain-boxed"),
-    pytest.param("fsdp", True, False, False, id="fsdp-recomputed-arrays"),
-    pytest.param("fsdp", True, True, False, id="fsdp-recomputed-boxed"),
-    pytest.param("fsdp", False, False, True, id="fsdp-exiting"),
-    pytest.param("fsdp", True, False, True, id="fsdp-recomputed-exiting"),
-    pytest.param("hybrid", False, False, False, id="hybrid"),
-    pytest.param("tensor", False, True, False, id="tensor-boxed"),
-    pytest.param("sequence", False, False, False, id="sequence"),
+@pytest.mark.parametrize(("mesh_shape", "remat", "boxed", "case"), [
+    pytest.param("fsdp", False, False, {}, id="fsdp-plain-arrays"),
+    pytest.param("fsdp", False, True, {}, id="fsdp-plain-boxed"),
+    pytest.param("fsdp", True, False, {}, id="fsdp-recomputed-arrays"),
+    pytest.param("fsdp", True, True, {}, id="fsdp-recomputed-boxed"),
+    pytest.param("fsdp", False, False, {"exiting": True}, id="fsdp-exiting"),
+    pytest.param("fsdp", True, False, {"exiting": True}, id="fsdp-recomputed-exiting"),
+    pytest.param("fsdp", False, False, {"counted": True}, id="fsdp-counted"),
+    pytest.param("hybrid", False, False, {}, id="hybrid"),
+    pytest.param("tensor", False, True, {}, id="tensor-boxed"),
+    pytest.param("sequence", False, False, {}, id="sequence"),
 ])
-def test_a_gathered_loop_reads_its_block_gathered_once(mesh_shape, remat, boxed, exiting):
+def test_a_gathered_loop_reads_its_block_gathered_once(mesh_shape, remat, boxed, case):
     """A looped block whose parameters fully sharded data parallelism splits, with `Loop.gathered`, reads
     them gathered once before its passes, and reduces its matrices' gradients once after them: its training
     step's pass loop (the `while` of its three later passes), its body and all it calls, gathers no matrix
     and reduces none (all-reduce or reduce-scatter), where the same step without it gathers and reduces its
     matrices there each pass; each pass and layer recomputed or not (row 12722: the gather is not sunk back
     into a checkpointed body), its variables arrays or as its init boxes them (`flax.core.meta`'s logical
-    axes), each pass exiting through the coda or not, on each of `GATHERED_MESHES`. A tensor split's
+    axes), each pass exiting through the coda or not, its passes counted per call or not
+    (`_gathered_case`), on each of `GATHERED_MESHES`. A tensor split's
     reductions of activations stay in the loop, as without it. Every leaf split (`Layout(min_shard=1)`)."""
     from dew.distributed.placement import Layout
     from dew.mesh import DEFAULT_RULES
@@ -1217,7 +1224,7 @@ def test_a_gathered_loop_reads_its_block_gathered_once(mesh_shape, remat, boxed,
     layout = Layout(min_shard=1)
     found = {}
     for gathered in (False, True):
-        model, gradient = _gathered_case(gathered=gathered, remat=remat, exiting=exiting)
+        model, gradient = _gathered_case(gathered=gathered, remat=remat, **case)
         variables, ids = model_draw(model, (8, 12), VOCAB)(0)
         if boxed:
             variables = model.init(jax.random.key(0), ids)
@@ -1237,14 +1244,19 @@ def test_a_gathered_loop_reads_its_block_gathered_once(mesh_shape, remat, boxed,
 
 
 @pytest.mark.mesh(devices=8)
-@pytest.mark.parametrize("mesh_shape", [pytest.param("fsdp", id="fsdp"), pytest.param("hybrid", id="hybrid"),
-                                        pytest.param("tensor", id="tensor"),
-                                        pytest.param("sequence", id="sequence")])
-def test_a_gathered_loop_trains_the_same_model(mesh_shape):
+@pytest.mark.parametrize(("mesh_shape", "loop"), [
+    pytest.param("fsdp", Loop(4, layers=(1, 3)), id="fsdp"),
+    pytest.param("hybrid", Loop(4, layers=(1, 3)), id="hybrid"),
+    pytest.param("tensor", Loop(4, layers=(1, 3)), id="tensor"),
+    pytest.param("sequence", Loop(4, layers=(1, 3)), id="sequence"),
+    pytest.param("fsdp", Loop(2, layers=(1, 3), exit_gate=True), id="fsdp-two-passes-exiting"),
+])
+def test_a_gathered_loop_trains_the_same_model(mesh_shape, loop):
     """A gathered loop's logits and every gradient, its block's parameters' summed unreduced across
     passes before their one reduction, are on par with the same loop's reading them where they lie
     (check 1, both from the loop's float64 twin): the same sums in another order (row 12722), on each of
-    `GATHERED_MESHES`. Every leaf split (`Layout(min_shard=1)`)."""
+    `GATHERED_MESHES`, and where each of two passes, unrolled, exits through the coda its gate weighs into the
+    output. Every leaf split (`Layout(min_shard=1)`)."""
     from dew.distributed.placement import Layout
     from dew.mesh import DEFAULT_RULES
     from dew.nn.sharding import placing
@@ -1252,7 +1264,6 @@ def test_a_gathered_loop_trains_the_same_model(mesh_shape):
 
     mesh = MeshSpec(**GATHERED_MESHES[mesh_shape]).build(jax.devices()[:8])
     layout = Layout(min_shard=1)
-    loop = Loop(4, layers=(1, 3))
     apart = tiny(num_layers=4, loop=loop, dtype="float32")
     gathered = apart.clone(loop=dataclasses.replace(loop, gathered=True))
 
