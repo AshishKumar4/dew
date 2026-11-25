@@ -244,16 +244,15 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
         slices, tile = priced
         if slices == 1:
             return planned(config, op, ba, 1)
-        # The priced tile certified alone at the call's own launch (a refusal recorded); where it is refused,
-        # its streaming walk's own config at those slices, certified (`_streamed`).
-        proposed = _proposed(query, key, value, spans, walked, scale=scale, target=target, table=table,
-                             sources=sources, scales=scales, splits=slices, chosen=chosen, in_key=in_key)
-        if proposed is not None:
-            # Completed and legal at the call's own bound arguments (`_launchable`: its rules, a recorded
-            # refusal among them) before it is certified, and the certified config taken there too.
-            _, sliced_op, sliced_ba = proposed
-            launched = sliced_op._launchable(sliced_ba, tile, target)
-            certified = None if launched is None else sliced_op._certified(sliced_ba, launched)
+        # The priced tile completed and legal at the call's own bound arguments (`_launchable`: its rules, a
+        # recorded refusal among them), certified, and the certified config taken there too; else its
+        # streaming walk's own config at those slices, certified (`_streamed`).
+        sliced_op, sliced_ba = _bound(query, key, value, spans, walked, scale=scale, table=table,
+                                      sources=sources, scales=scales, splits=slices, chosen=chosen,
+                                      in_key=in_key)
+        launched = sliced_op._launchable(sliced_ba, tile, target)
+        if launched is not None:
+            certified = sliced_op._certified(sliced_ba, launched)
             if (isinstance(certified, attention_mosaic.Tiles)
                     and sliced_op.takes(sliced_ba, certified, target)
                     and sliced_op.pinnable(sliced_ba, certified)):
@@ -283,23 +282,21 @@ def _priced_slices(query, key, value, spans: KeySpans, hooks: Hooks | None, sing
     346.0 us on 2 slices of K128 and 309.3 on 4 of K64 at two programs a multiprocessor (M-NA-21-gh200),
     which a walk priced at its device bytes alone ranked level and its programs' issue intervals rank right
     (FS-5274-LAT1)."""
-    proposed = functools.partial(_proposed, query, key, value, spans, hooks, scale=scale, target=target,
-                                 table=table, sources=sources, scales=scales, chosen=chosen, in_key=in_key)
-    first = proposed(splits=1)
-    if first is None:
-        return None
+    bound = functools.partial(_bound, query, key, value, spans, hooks, scale=scale, table=table,
+                              sources=sources, scales=scales, chosen=chosen, in_key=in_key)
     # The certified single tile priced only where it launches at these spans too.
-    _, op, ba = first
+    op, ba = bound(splits=1)
     alone = None if op._launchable(ba, single, target) is None else op.price_config(ba, single, target,
                                                                                      issued=True)
     if alone is None:
         return None
     prices = {(1, single): alone}
     for count in counts:
-        proposal = proposed(splits=count)
-        if proposal is None:
+        sliced_op, sliced_ba = bound(splits=count)
+        derived = sliced_op.derived(sliced_ba, target)
+        if derived is None:
             continue
-        tiles, sliced_op, sliced_ba = proposal
+        tiles = sliced_op.streamings(sliced_ba, derived, target)
         for tile in tiles:
             walk = sliced_op.price_config(sliced_ba, tile, target, issued=True)
             if walk is None:
@@ -310,18 +307,15 @@ def _priced_slices(query, key, value, spans: KeySpans, hooks: Hooks | None, sing
     return min(prices, key=lambda chosen_plan: (prices[chosen_plan], chosen_plan[0], chosen_plan[1].block_k))
 
 
-def _proposed(query, key, value, spans: KeySpans, hooks: Hooks | None, *, scale: float | None,
-              target: generation.GpuTarget, table, sources, scales, splits: int, chosen: Walk, in_key: bool):
-    """The key tiles a launch of `splits` slices may stream at (`MosaicForward.streamings` of its derived
-    config), its op and bound arguments, certifying none: a price's proposals. None where none derives."""
+def _bound(query, key, value, spans: KeySpans, hooks: Hooks | None, *, scale: float | None, table, sources,
+           scales, splits: int, chosen: Walk, in_key: bool) -> tuple:
+    """A split walk's op over `splits` slices and its bound arguments, deriving none."""
     op, args = attention_mosaic._forward_call(query, key, value, spans, hooks, scale=scale, natural=False,
                                               out_dtype=jnp.float32, masked=hooks is None or hooks.output_mod
                                               is None, splits=splits, table=table, sources=sources,
                                               subtracted=True, scales=scales, scaled=chosen.scaled,
                                               bounded=chosen.bounded, in_key=in_key)
-    ba = op.bind(*args, residuals=Kept.OUTPUT, interpret=False)
-    derived = op.derived(ba, target)
-    return None if derived is None else (op.streamings(ba, derived, target), op, ba)
+    return op, op.bind(*args, residuals=Kept.OUTPUT, interpret=False)
 
 
 def _merge_seconds(query, value, spans: KeySpans, config: attention_mosaic.Tiles, slices: int, *,
