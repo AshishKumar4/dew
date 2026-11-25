@@ -396,8 +396,7 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
 def _transition(hooks: recurrence.Hooks, correction) -> tuple[bool, jax.Array | None]:
     """Whether a call's transition is its own (`PortCase.transition`), and the reads its keys erase along
     where the template takes them (`Hooks.erase` 'read', `chunk_forward.forward`'s `reads`, the laid
-    correction's reader negated): its training under a decay a key dimension the portable math's
-    (`mainloop_backward.fast_backward_form`)."""
+    correction's reader negated)."""
     reading = hooks.erase == 'read' and correction is not None
     reads = -correction if reading else None
     own = hooks.erase not in ('tied', 'read') or hooks.value_decay or (hooks.erase == 'read' and not reading)

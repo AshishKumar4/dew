@@ -169,8 +169,7 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None
     given (`recurrence.Hooks.erase` 'read', the preconditioned delta rules'): `S' = (I - beta k b^T) D S +
     beta k v^T`, the system's rows and the weights the reads' (`beta b k^T`, `w = X (b beta exp g)`), the
     memory's writes and the scores the keys' (`_solved`; under a decay a key dimension `_paired` and
-    `_key_weighted`), whose fast backward takes a decay a head's alone
-    (`mainloop_backward.fast_backward_form`)."""
+    `_key_weighted`)."""
     out, final, _ = kept_forward(q, k, v, g, beta, h0, starts=starts, firsts=firsts,
                                  max_segments=max_segments, scale=scale, delta=delta, tiles=tiles, wide=wide,
                                  family=family, interpret=interpret, keeps=False,

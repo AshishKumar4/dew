@@ -63,7 +63,7 @@ from dew.nn.precision import compensated_sum
 
 
 def fast_backward_form(delta: bool, rounded: bool, dtype, *, per_key: bool = False,
-                       wide: bool = False, reads: bool = False) -> bool:
+                       wide: bool = False) -> bool:
     """Whether the fast backward takes a call's form: the delta rule, fla's DAG at fla's rounding, a decay a
     head's or a key dimension's (fla_kda's, `key_backward`); or a bf16 call without it and a decay a head or
     none, the same DAG without the delta rule's: `rounded` (the SSD's under the run's fast forms, its route's)
@@ -76,11 +76,9 @@ def fast_backward_form(delta: bool, rounded: bool, dtype, *, per_key: bool = Fal
     call's held in three parts whose output is fp32 (`wide`: an epilogue reads it, Mamba2's gated norm), its
     gradient fp32 where the launches read it in bf16 (rounded so, Mamba2's step's gradient under its norm was
     2.2e-3 from float64 against the portable math's 3.1e-7), take none. A decay a key dimension's form takes
-    each sub-chunk's own pairs each their own decay (`algebra.key_diagonal_pairs_back`). Keys erasing along
-    reads of their own (`reads`, `chunk_forward.forward`'s) it takes under a decay a head alone: a decay a
-    key dimension's launches split no gradient between the keys and the reads (`key_backward`)."""
+    each sub-chunk's own pairs each their own decay (`algebra.key_diagonal_pairs_back`)."""
     dtype = jnp.dtype(dtype)
-    if per_key and (reads or (dtype == jnp.float32 and not rounded)):
+    if per_key and dtype == jnp.float32 and not rounded:
         return False
     if delta:
         return True
@@ -163,8 +161,7 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
     (`_tabled_gradients`, `_entered_gradient`), None for another. Under reads of their own (`reads`,
     `chunk_forward.forward`'s) the system's rows and weights are theirs, `dreads` their gradient."""
     dtype = jnp.result_type(q, k, v)
-    if not fast_backward_form(delta, rounded, dtype, per_key=g.ndim == 4, wide=jnp.dtype(do.dtype) != dtype,
-                              reads=reads is not None):
+    if not fast_backward_form(delta, rounded, dtype, per_key=g.ndim == 4, wide=jnp.dtype(do.dtype) != dtype):
         raise NotImplementedError("the fast backward takes the delta rule (under a decay a key dimension "
                                   "not in fp32 three-part form), or a bf16 or fp32 call without it and a "
                                   "decay a head (a bf16 call's output gradient bf16 where not rounded)")
@@ -183,11 +180,14 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
         # zero. Applied as the decay's gradient is finished (`key_backward.gradients`).
         clamp = (run.laid(zero_padded(g.astype(jnp.float32), 3, width)).reshape(rows, -1) if call.clamped
                  else None)
-        (dq, dk, dv, dg, dbeta, dh0, taken), key_kept = key_backward.gradients(run, laid_do, dht, tiles,
-                                                                               clamp=clamp)
+        (dq, dk, dv, dg, dbeta, dh0, taken, d_reads), key_kept = key_backward.gradients(run, laid_do, dht,
+                                                                                        tiles, clamp=clamp)
         dg = run.unlaid(dg.reshape(rows, heads, width))[..., :run.key_width]
         grads = _unlaid(run, (q, k, v, g, beta), dq, dk, dv, dg, run.unlaid(dbeta), dh0, starts)
-        return (*_tabled_gradients(run, grads, taken), None, _entered_gradient(run, taken), None), key_kept
+        # The reads' gradient a key head's, laid back as the keys' are (`_unlaid`).
+        dreads = (None if d_reads is None or reads is None else run.unlaid(
+            d_reads.reshape(rows, heads // call.group, width))[..., :run.key_width].astype(reads.dtype))
+        return (*_tabled_gradients(run, grads, taken), None, _entered_gradient(run, taken), dreads), key_kept
     local = _local_back(run.q, run.k, laid_do, *run.prefix, run.taken, call, scale=run.scale)
     # Without the delta rule the walk gates the values where their columns are the call's own. Padded, it
     # read a padded copy of them (0.061 ms of Nemotron-H 4B's SSD training on an H100) and its gate took

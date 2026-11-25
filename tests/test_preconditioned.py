@@ -27,7 +27,6 @@ from dew.nn.kernels.preconditioned import (
 )
 from dew.nn.kernels.recurrence import Hooks
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
-from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop_backward, template
 from dew.nn.kernels.templates.recurrence.mainloop import Tiles
 from dew.nn.precision import l2norm
@@ -167,15 +166,60 @@ def sixteen_bit_forward(seed):
 
 def test_a_read_erase_under_a_decay_a_key_dimension_on_the_template_is_its_head_decays():
     """The delta rule erasing along reads of its own under a decay a key dimension (PKDA's) on the template,
-    its 16-bit forward (the system's rows the reads' in its own pairs and the intra walk, its weights the
-    reads' and its decayed keys the keys' apart: `chunk_forward._paired`, `_key_weighted`), each key's decay
-    the head's, on par from float64 with the same call under that decay a head (check 1, the truth its
-    recurrence a token at a time), whose read erase check 1 holds to the recurrence at the accurate forms: a
-    system whose rows and columns trade the reads and the keys, or weights formed from the keys, lands far
-    past it. Its training is the portable math's (`mainloop_backward.fast_backward_form`); fla's recorded
-    PKDA sites hold it once M-JS-266b's fixture lands (row 12696)."""
-    assert_as_exact(jax.jit(with_key_decays), jax.jit(read_erased_forward), sixteen_bit_forward,
-                    "a key decay's read erase on the template", seeds=SEEDS, truth_fn=jax.jit(read_erased))
+    16-bit (the system's rows the reads' in its own pairs and the intra walk, its weights the reads' and its
+    decayed keys the keys' apart: `chunk_forward._paired`, `_key_weighted`; its backward's the same,
+    `key_backward.gradients`' reads), each key's decay the head's: its output, final memory and every
+    operand's gradient, the reads' among them, on par from float64 with the same call under that decay a
+    head (check 1, the truth its recurrence a token at a time), whose read erase check 1 holds to the
+    recurrence at the accurate forms: a system whose rows and columns trade the reads and the keys, weights
+    formed from the keys, or a gradient landing on the other, lands far past it. fla's recorded PKDA sites
+    hold it once M-JS-266b's fixture lands (row 12696)."""
+    assert_as_exact(jax.jit(with_gradients(with_key_decays)), jax.jit(with_gradients(read_erased_forward)),
+                    sixteen_bit_read_erase, "a key decay's read erase on the template", seeds=SEEDS,
+                    truth_fn=jax.jit(with_gradients(read_erased)))
+
+
+def along_its_keys(query, key, value, log_decay, beta, state):
+    """`read_erased_forward` reading along its own keys: the keys' gradient their reads' and their own
+    summed by the derivative."""
+    return read_erased_forward(query, key, value, log_decay, beta, state, key)
+
+
+def kimis(query, key, value, log_decay, beta, state):
+    """Kimi's delta attention (the delta rule erasing along its keys) under a decay a key dimension on the
+    template, as `read_erased_on_the_template` runs the read erase."""
+    fast = dataclasses.replace(generation.numerics(), forms='fast')
+    with (generation.assumed("sm90" if INTERPRETED else None, interpreted=INTERPRETED),
+          generation.run_precision(fast), generation.chosen(gated_delta_rule="mosaic_gpu")):
+        return chunk(Hooks(decay='vector', scale=query.shape[-1] ** -0.5),
+                     Chunk(query, key, value, log_decay=log_decay, beta=beta, state=state))
+
+
+def recurrence_along_its_keys(query, key, value, log_decay, beta, state):
+    """`read_erased` reading along its own keys: Kimi's delta attention a token at a time."""
+    return read_erased(query, key, value, log_decay, beta, state, key)
+
+
+def key_decayed_along_its_keys(seed):
+    """`sixteen_bit_read_erase`'s draw of a seed with each key its own log decay, a sigmoid's log about the
+    head's, its reads gone (the call reads along its keys)."""
+    q, k, v, g, beta, state, _, cotangents = sixteen_bit_read_erase(seed)
+    normal = np.random.default_rng([1459, 4, seed]).standard_normal
+    keyed = hosted(-softplus(-(normal((*g.shape, k.shape[-1])) + 3.0)))
+    return q, k, v, keyed, beta, state, cotangents
+
+
+def test_a_read_erase_along_its_keys_under_distinct_key_decays_trains_as_kimis_delta_attention():
+    """The delta rule erasing along reads of its own under a decay a key dimension, each key its own decay,
+    reading along its own keys on the template (16-bit): its output, final memory and every operand's
+    gradient, the keys' its reads' and its own summed (`key_backward.gradients`' reads, the system's rows'
+    and the weights' on the reads, the columns' and the memory's on the keys), on par from float64 with Kimi's
+    delta attention on the template (check 1, the truth the recurrence a token at a time), which check 1
+    holds to fla's recorded sites (`test_recurrence_mosaic_gradient`): a read's decay taken from another
+    key's, or a term lost between the reads' gradient and the keys', moves it far past (row 1459)."""
+    assert_as_exact(jax.jit(with_gradients(along_its_keys)), jax.jit(with_gradients(kimis)),
+                    key_decayed_along_its_keys, "a key decay's read erase along its keys", seeds=SEEDS,
+                    truth_fn=jax.jit(with_gradients(recurrence_along_its_keys)))
 
 
 def read_erase_operands(seed):
@@ -334,11 +378,10 @@ def test_a_read_erase_along_its_keys_under_distinct_key_decays_is_kimis_delta_at
         np.testing.assert_array_equal(np.asarray(found, np.float32), np.asarray(expected, np.float32))
 
 
-def test_a_read_erase_under_a_decay_a_key_dimension_runs_its_forward_alone_on_the_template():
-    """PKDA's 16-bit call naming the template runs its forward there (its keys' erase along reads of their
-    own under a decay a key dimension, `chunk_forward._paired`), and its gradient, which the template's fast
-    backward does not take (`mainloop_backward.fast_backward_form`), is refused where it is traced: a kernel
-    a call names insists on it (`selection.KernelRefused`)."""
+def test_a_read_erase_under_a_decay_a_key_dimension_trains_on_the_template():
+    """PKDA's 16-bit training call naming the template runs there (its keys' erase along reads of their own
+    under a decay a key dimension: `chunk_forward._paired` and `key_backward.gradients`' reads): the
+    kernels its traced routes name, beside the portable tangent's."""
     drawn = operands(per_key=True, shape=TEMPLATED)(0)[:-1]
     drawn = (*(x.astype(jnp.bfloat16) for x in drawn[:3]), *drawn[3:])
 
@@ -346,12 +389,10 @@ def test_a_read_erase_under_a_decay_a_key_dimension_runs_its_forward_alone_on_th
         return templated(*given)[0].astype(jnp.float32).sum()
 
     with generation.routes() as found:
-        jax.eval_shape(loss, *drawn)
-    # Beside its forward's route, its derivative's portable tangent's (`_per_product`).
+        jax.eval_shape(jax.grad(loss, argnums=(0, 1, 2)), *drawn)
+    # Beside its routes, its derivative's portable tangent's (`_per_product`).
     assert {route.kernel for route in found if route.choice == generation.Choice.GATED_DELTA_RULE} == {
         'mosaic_gpu', 'xla'}
-    with pytest.raises(KernelRefused):
-        jax.eval_shape(jax.grad(loss, argnums=(0, 1, 2)), *drawn)
 
 
 def test_atks_walk_on_the_template_is_as_exact_over_packed_spans():

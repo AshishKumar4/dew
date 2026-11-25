@@ -1049,7 +1049,8 @@ def key_memory_sums(out_grads: TileLoad, corrected: TileLoad, value_grads: TileL
 
 def key_memory_block(query: Tile, key: Tile, gates: tuple, last: tuple, sums: tuple, lower: Tile, betas,
                      system, scale: float, dtype, issue: Issue, *, emit: Callable[[str, jax.Array], None],
-                     columns: Callable[[jax.Array], jax.Array] | None = None) -> tuple[jax.Array, jax.Array]:
+                     columns: Callable[[jax.Array], jax.Array] | None = None,
+                     read: Tile | None = None) -> tuple[jax.Array, jax.Array]:
     """One key block's part of a decay a key dimension's backward (`templates.recurrence.key_backward`), its
     queries `query` and keys `key` `[C, BK]`, their prefix from the chunk's start `gates` `[C, BK]` and the
     chunk's last token's `last` as a row's vectors (each its limbs, `Call.prefix_limbs`), and its memory
@@ -1065,7 +1066,10 @@ def key_memory_block(query: Tile, key: Tile, gates: tuple, last: tuple, sums: tu
     (kda-lower5-sm90 at 6e03eb57e). Each sum over the value blocks issued into one accumulator
     (`key_memory_sums`, `memory_gradients`'): a list of each block's products, their accumulators at once,
     spilled 744 bytes a thread on an H100 (kda-gate3 at ee3734584). `columns`, where given, sums a tile's
-    columns (the mainloop's, `summed_pairs`')."""
+    columns (the mainloop's, `summed_pairs`'). Under an erase along reads of their own (`read`, the block's
+    `[C, BK]`: `recurrence.Hooks.erase` 'read', the weights `X (b beta exp2 g)`), the weights' terms are the
+    reads': `emit('dk', ...)` the memory's alone and `emit('dr', ...)` the reads' through the weights, the
+    system's, the log decay's and the write gates' terms on the reads."""
     decays = raised(*gates)
     to_last = range_decay(tuple(limb[None, :] for limb in last), gates)
     query_sum, key_sum, weight_sum = sums
@@ -1089,8 +1093,13 @@ def key_memory_block(query: Tile, key: Tile, gates: tuple, last: tuple, sums: tu
     # `dbeta_p` as fla's `dw = -dw.astype(dtype)` does (row 8716).
     d_weight_narrow = d_weight.astype(dtype)
     d_gated = -(d_weight_narrow.astype(jnp.float32) + issue("weights_merge", lower.T, d_weight_narrow))
-    emit("dk", d_key + d_gated * decays * betas[:, None])
-    gated = keys * decays
+    through = d_gated * decays * betas[:, None]
+    if read is None:
+        emit("dk", d_key + through)
+    else:
+        emit("dk", d_key)
+        emit("dr", through)
+    gated = (keys if read is None else read.value().astype(jnp.float32)) * decays
     gated_rows = Transposed(write_gated(gated, betas).astype(dtype))
     system = system - issue("weights_merge", d_weight_narrow, gated_rows)
     emit("dg", d_decay + gated * d_gated * betas[:, None])

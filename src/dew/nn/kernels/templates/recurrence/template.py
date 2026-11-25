@@ -294,8 +294,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     forms = {"max_segments": max_segments, "delta": delta, "wide": wide, "rounded": rounded, "apart": apart,
              "values_gated": values_gated, "unit_pairs": unit_pairs, "decay_bound": decay_bound}
     # The fast backward where its launches hold on the device (a derived launch spills nothing), else none.
-    fast = (mainloop_backward.fast_backward_form(delta, rounded, dtype, per_key=g.ndim == 4, wide=wide,
-                                                 reads=reads is not None)
+    fast = (mainloop_backward.fast_backward_form(delta, rounded, dtype, per_key=g.ndim == 4, wide=wide)
             and backward_holds(query, key, value, g, beta, state, tiles=tiles, family=issuing,
                                target=Mosaic.launched(), starts=starts, ranged=run["ranged"], skip=skip,
                                forked=table, reads=reads, **forms))
@@ -472,7 +471,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         delta = arguments.get("delta", True)
         fast = (backward or training_forward) and mainloop_backward.fast_backward_form(
             delta, arguments.get("rounded", False), dtype, per_key=arguments["g"].ndim == 4,
-            wide=arguments.get("wide", False), reads=arguments.get("reads") is not None)
+            wide=arguments.get("wide", False))
         # The skip fused into the output and reverse walk where given (its tiles their registers'), and the
         # reads the keys erase along, streamed by the solve and the weights' backward.
         skip, reads = arguments.get("skip"), arguments.get("reads")
@@ -969,8 +968,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         forms = mainloop_backward.fast_backward_form(arguments.get("delta", True),
                                                      arguments.get("rounded", False), dtype,
                                                      per_key=arguments["g"].ndim == 4,
-                                                     wide=arguments.get("wide", False),
-                                                     reads=arguments.get("reads") is not None)
+                                                     wide=arguments.get("wide", False))
         if not forms:
             return False
         fits = self.fits(ba, target)
