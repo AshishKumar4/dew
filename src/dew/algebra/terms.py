@@ -507,9 +507,19 @@ def parameter_key(value) -> Hashable:
         return "sequence", "builtins.list", tuple(parameter_key(part) for part in value)
     if isinstance(value, jcore.Jaxpr):
         digest, opaques = jaxpr_digest(value)
-        consts = tuple(parameter_key(const) for const in value.consts) if value.consts else ()
+        consts = tuple(_nested_const_key(const) for const in value.consts) if value.consts else ()
         return "jaxpr", digest, opaques, consts
     return _parameter_key_other(value, kind)
+
+
+def _array_key(value, kind: type) -> Hashable:
+    """Cross-process array digest (`parameter_key`), never transferring non-addressable global shards."""
+    if isinstance(value, jax.Array) and not value.is_fully_addressable:
+        return "object", _named(kind), _Identity(value)
+    # The key type's printed form, which a key kept in another process can read.
+    _, array = held_bits(value)
+    return ("array", str(value.dtype), array.shape, str(array.dtype),
+            hashlib.sha256(np.ascontiguousarray(array).tobytes()).hexdigest())
 
 
 def _parameter_key_other(value, kind: type) -> Hashable:
@@ -528,10 +538,7 @@ def _parameter_key_other(value, kind: type) -> Hashable:
     if isinstance(value, enum.Enum):
         return "enum", _named(kind), value.name
     if isinstance(value, (np.ndarray, jax.Array)) and not isinstance(value, jax_core.Tracer):
-        # The key type's printed form, which a key kept in another process can read.
-        _, array = held_bits(value)
-        return ("array", str(value.dtype), array.shape, str(array.dtype),
-                hashlib.sha256(np.ascontiguousarray(array).tobytes()).hexdigest())
+        return _array_key(value, kind)
     if isinstance(value, ShapedArray):
         return _abstract_key(value)
     if value is Layout.AUTO:
@@ -584,6 +591,82 @@ _JAXPR_DIGESTS: weakref.WeakKeyDictionary[jcore.Jaxpr, tuple[str, tuple[Hashable
     weakref.WeakKeyDictionary())
 """Structural `(blake2b_hex, opaque_objects)` digest per `jcore.Jaxpr`, held while the jaxpr lives."""
 
+_BODY_KEYS: weakref.WeakKeyDictionary[jcore.Jaxpr, tuple[str, tuple[Hashable, ...]] | None] = (
+    weakref.WeakKeyDictionary())
+"""In-process structural key per const-free `jcore.Jaxpr` (`body_key`), None when unshareable."""
+
+
+class _Unshareable(Exception):
+    """Raised internally by `body_key` when a body holds nested consts or device arrays."""
+
+
+def _nested_const_key(const) -> Hashable:
+    """Key a nested `Jaxpr.consts` entry without transferring device arrays to host."""
+    if isinstance(const, jax.Array) and not isinstance(const, jax_core.Tracer):
+        return "object", _named(type(const)), _Identity(const)
+    return parameter_key(const)
+
+
+def _extended_dtype(dtype) -> Hashable | None:
+    """Return an opaque entry for extended JAX dtypes (such as typed PRNG specs) that share a tag."""
+    return ("object", "extended_dtype", dtype) if jnp.issubdtype(dtype, jax.dtypes.extended) else None
+
+
+def _in_process_param_key(value, *, reject_device: bool) -> Hashable:
+    """In-process structural key for an equation parameter preserving executable callable, primitive, and
+    extended-dtype identities while never copying `jax.Array` device buffers to host."""
+    kind = type(value)
+    if value is None or kind is bool or kind is str:
+        return kind.__name__, value
+    if kind is int:
+        return "int", value
+    if kind is float:
+        return "float", value.hex()
+    if kind is tuple or kind is list:
+        return "sequence", f"builtins.{kind.__name__}", tuple(
+            _in_process_param_key(part, reject_device=reject_device) for part in value)
+    if isinstance(value, ShapedArray):
+        return _abstract_key(value), _extended_dtype(value.dtype)
+    if isinstance(value, jcore.Jaxpr):
+        if reject_device and (value.consts or value.constvars):
+            raise _Unshareable
+        sub = (_body_digest(value, reject_device=reject_device) if reject_device
+               else jaxpr_digest(value, in_process=True))
+        consts = tuple(_nested_const_key(c) for c in value.consts) if value.consts else ()
+        return "jaxpr", sub, consts
+    if isinstance(value, jax.Array) and not isinstance(value, jax_core.Tracer):
+        if reject_device:
+            raise _Unshareable
+        return "object", _named(kind), _Identity(value)
+    if isinstance(value, functools.partial):
+        return ("partial", _in_process_param_key(value.func, reject_device=reject_device),
+                _in_process_param_key(value.args, reject_device=reject_device),
+                _in_process_param_key(value.keywords, reject_device=reject_device))
+    if isinstance(value, types.FunctionType):
+        return "object", _named(kind), value
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return "record", _named(kind), tuple(
+            (field.name, _in_process_param_key(getattr(value, field.name), reject_device=reject_device))
+            for field in dataclasses.fields(value))
+    if isinstance(value, (tuple, list)):
+        return "sequence", _named(kind), tuple(
+            _in_process_param_key(part, reject_device=reject_device) for part in value)
+    if isinstance(value, (set, frozenset)):
+        return "set", tuple(sorted(
+            (_in_process_param_key(part, reject_device=reject_device) for part in value), key=repr))
+    if isinstance(value, Mapping):
+        return "mapping", tuple(sorted((
+            (_in_process_param_key(name, reject_device=reject_device),
+             _in_process_param_key(part, reject_device=reject_device))
+            for name, part in value.items()), key=repr))
+    if callable(value) and not isinstance(value, (type, np.dtype)):
+        try:
+            hash(value)
+        except TypeError:
+            return "object", _named(kind), _Identity(value)
+        return "object", _named(kind), value
+    return _parameter_key_other(value, kind)
+
 
 def _collect_opaque(key, opaques: list[Hashable]) -> Hashable:
     """Hoist any `("object", cls, held)` entries out of `key` into `opaques`, replacing each with a
@@ -597,13 +680,12 @@ def _collect_opaque(key, opaques: list[Hashable]) -> Hashable:
     return tuple(_collect_opaque(part, opaques) for part in key)
 
 
-def jaxpr_digest(jaxpr: jcore.Jaxpr) -> tuple[str, tuple[Hashable, ...]]:
-    """Structural `(hex_digest, opaques)` of `jaxpr` (constvars/invars avals, equations, parameters,
-    contexts, literals, outvars, and effects; excluding `jaxpr.consts` values), memoized per `Jaxpr` object.
-    Plain data (`ast.literal_eval`-safe and `_stated._plain`-safe) whenever `opaques` is empty, while
-    preserving in-process equality and `_Identity` soundness for opaque parameters such as `WrappedFun`."""
-    if (cached := _JAXPR_DIGESTS.get(jaxpr)) is not None:
-        return cached
+def _body_digest(jaxpr: jcore.Jaxpr, *, in_process: bool = True,
+                 reject_device: bool = False) -> tuple[str, tuple[Hashable, ...]]:
+    """Compute `(blake2b_hex, opaques)` for `jaxpr`. With `in_process=True`, executable callables,
+    primitive objects, and extended dtypes stay by exact identity in `opaques`; with `reject_device=True`,
+    any `jax.Array` literal/parameter or nested `consts` raises `_Unshareable` without touching device
+    buffers."""
     hasher = hashlib.blake2b(digest_size=20)
     opaques: list[Hashable] = []
     ctx_keys: dict[int, Hashable] = {}
@@ -613,19 +695,30 @@ def jaxpr_digest(jaxpr: jcore.Jaxpr) -> tuple[str, tuple[Hashable, ...]]:
         hasher.update(repr(part).encode())
         hasher.update(b"\0")
 
+    def aval_key(given) -> Hashable:
+        if in_process and isinstance(given, ShapedArray):
+            return _collect_opaque((_abstract_key(given), _extended_dtype(given.dtype)), opaques)
+        return _collect_opaque(parameter_key(given), opaques)
+
     def feed_atom(atom) -> None:
         if isinstance(atom, jcore.Literal):
+            if isinstance(atom.val, jax.Array) and not isinstance(atom.val, jax_core.Tracer):
+                if reject_device:
+                    raise _Unshareable
+                feed(("lit_device", _collect_opaque(("object", "jax.Array", _Identity(atom.val)), opaques),
+                      aval_key(atom.aval)))
+                return
             dtype, value = held_bits(atom.val)
             raw = np.ascontiguousarray(value).tobytes()
-            feed(("lit", str(dtype), value.shape, len(raw),
-                  _collect_opaque(parameter_key(atom.aval), opaques)))
+            ext = _collect_opaque(_extended_dtype(dtype), opaques) if in_process else None
+            feed(("lit", str(dtype), ext, value.shape, len(raw), aval_key(atom.aval)))
             hasher.update(raw)
             hasher.update(b"\0")
         else:
             feed(("var", position[atom]))
 
     def var_key(var: jcore.Var) -> Hashable:
-        return isinstance(var, jcore.DropVar), _collect_opaque(parameter_key(var.aval), opaques)
+        return isinstance(var, jcore.DropVar), aval_key(var.aval)
 
     feed(("constvars", tuple(var_key(var) for var in jaxpr.constvars)))
     feed(("invars", tuple(var_key(var) for var in jaxpr.invars)))
@@ -639,11 +732,19 @@ def jaxpr_digest(jaxpr: jcore.Jaxpr) -> tuple[str, tuple[Hashable, ...]]:
                 ctx.compute_type, ctx.threefry_partitionable, ctx.xla_metadata,
                 str(ctx.cur_layout_mode), ctx.remove_size_one_mesh_axis)), opaques)
             ctx_keys[id(ctx)] = ctx_key
-        params_key = (_collect_opaque(parameters_key(equation.primitive, equation.params)[1], opaques)
-                      if equation.params else ())
+        if equation.params:
+            raw_params = (
+                tuple((name, _in_process_param_key(part, reject_device=reject_device))
+                      for name, part in sorted(equation.params.items()))
+                if in_process else parameters_key(equation.primitive, equation.params)[1]
+            )
+            params_key = _collect_opaque(raw_params, opaques)
+        else:
+            params_key = ()
         effects_key = _collect_opaque(parameter_key(equation.effects), opaques) if equation.effects else ()
-        feed((_named(type(equation.primitive)), equation.primitive.name, params_key, ctx_key, effects_key,
-              len(equation.invars),
+        prim_key = (_collect_opaque(("object", "primitive", equation.primitive), opaques) if in_process
+                    else (_named(type(equation.primitive)), equation.primitive.name))
+        feed((prim_key, params_key, ctx_key, effects_key, len(equation.invars),
               tuple(var_key(var) for var in equation.outvars)))
         for atom in equation.invars:
             feed_atom(atom)
@@ -653,9 +754,37 @@ def jaxpr_digest(jaxpr: jcore.Jaxpr) -> tuple[str, tuple[Hashable, ...]]:
     for atom in jaxpr.outvars:
         feed_atom(atom)
     feed(("effects", _collect_opaque(parameter_key(jaxpr.effects), opaques) if jaxpr.effects else ()))
-    digest = (hasher.hexdigest(), tuple(opaques))
-    _JAXPR_DIGESTS[jaxpr] = digest
+    return hasher.hexdigest(), tuple(opaques)
+
+
+def jaxpr_digest(jaxpr: jcore.Jaxpr, *, in_process: bool = False) -> tuple[str, tuple[Hashable, ...]]:
+    """Structural `(hex_digest, opaques)` of `jaxpr` (constvars/invars avals, equations, parameters,
+    contexts, literals, outvars, and effects; excluding `jaxpr.consts` values). Plain data when `in_process`
+    is False and `opaques` is empty; with `in_process=True` preserves exact primitive, callable, and
+    extended-dtype identities without touching device buffers."""
+    if not in_process and (cached := _JAXPR_DIGESTS.get(jaxpr)) is not None:
+        return cached
+    digest = _body_digest(jaxpr, in_process=in_process, reject_device=False)
+    if not in_process:
+        _JAXPR_DIGESTS[jaxpr] = digest
     return digest
+
+
+def body_key(closed: jcore.Jaxpr) -> tuple[str, tuple[Hashable, ...]] | None:
+    """Exact in-process structural key for whole-body rewrite reuse (`program._STRUCTURAL_CLOSED`), or None
+    when `closed` (or any nested body) holds constants or concrete `jax.Array` buffers: preserves primitive,
+    callback-closure, and extended PRNG dtype identities while never copying device buffers to host."""
+    if closed.consts or closed.constvars:
+        return None
+    if closed in _BODY_KEYS:
+        return _BODY_KEYS[closed]
+    try:
+        made: tuple[str, tuple[Hashable, ...]] | None = _body_digest(
+            closed, in_process=True, reject_device=True)
+    except _Unshareable:
+        made = None
+    _BODY_KEYS[closed] = made
+    return made
 
 
 class _Identity:

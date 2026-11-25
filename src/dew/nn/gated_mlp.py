@@ -80,17 +80,62 @@ class GatedCase:
         return device_generation(), (self.dtype, 'grouped') if self.grouped else self.dtype
 
     def launched(self) -> bool:
-        """Whether the template launches the up product and the down product (`projections.launches`), asked
-        only where the fused MLP is being chosen (its last requirement), so a call that runs its products
-        apart reports no route of a product it never launches."""
+        """Whether the template launches the up product and the down product (`projections.launches` for
+        dense, or the paired-epilogue and down-prologue grouped launches via `_grouped_launched` for grouped
+        experts), asked only where the fused MLP is being chosen (its last requirement), so a call that runs
+        its products apart reports no route of a product it never launches."""
+        from dew.nn.kernels.selection import KernelRefused
+
         if self.kernels is None or self.hook is None:
             return False
         gate, down = self.kernels
         hidden = jax.ShapeDtypeStruct((self.rows.shape[0], gate.shape[-1]), self.dtype)
+        if self.grouped:
+            return _grouped_launched(self.rows, gate, down, hidden, self.dtype, self.precision, self.hook,
+                                     whole=self.whole)
+        try:
+            launched = all(projections.launches(rows, kernel, self.dtype, self.precision, whole=self.whole)
+                           for rows, kernel in ((self.rows, gate), (hidden, down)))
+        except KernelRefused:
+            return False
+        if not launched:
+            return False
         tile = jax.ShapeDtypeStruct((128, 128), self.dtype)
-        return (all(projections.launches(rows, kernel, self.dtype, self.precision, whole=self.whole)
-                    for rows, kernel in ((self.rows, gate), (hidden, down)))
-                and hook_lowers(self.hook, (tile, tile), gpu_target()))
+        return hook_lowers(self.hook, (tile, tile), gpu_target())
+
+
+def _grouped_launched(rows: jax.ShapeDtypeStruct, gate: jax.ShapeDtypeStruct, down: jax.ShapeDtypeStruct,
+                      hidden: jax.ShapeDtypeStruct, dtype: jnp.dtype, precision: PrecisionLike,
+                      hook: Callable[[jax.Array, jax.Array], jax.Array], *, whole: bool) -> bool:
+    """Whether `grouped_matmul.GROUPED` selects a non-XLA launch taking the paired gate+up epilogue and the
+    down-projection prologue for a grouped expert MLP (row 12847)."""
+    from dew.nn.kernels import generation, grouped_matmul, selection
+    from dew.nn.kernels.selection import KernelRefused
+    from dew.nn.kernels.templates.gemm.hooks import Hooks
+    from dew.nn.kernels.templates.product import declared
+
+    if gate.ndim != 3 or down.ndim != 3:
+        return False
+    sizes = jax.ShapeDtypeStruct((gate.shape[0],), jnp.int32)
+    pair_hooks = Hooks(epilogue=activations.rounded_gated(hook, dtype), out_dtypes=(dtype.name,) * 3)
+    pair_product = declared(dtype, precision, outputs=(dtype,) * 3, operands=(dtype, dtype))
+    pair_call = grouped_matmul.gmm_call(rows, gate, sizes, paired=gate, out_dtype=dtype, trans_rhs=False,
+                                        hooks=pair_hooks, interpret=False, promoted=pair_product.promoted,
+                                        dense=False)
+    down_hooks = Hooks(prologue=hook, prologue_axes=(('rows', 'depth'),), prologue_broadcast=((),))
+    down_product = declared(dtype, precision, outputs=(dtype,), operands=(dtype, dtype))
+    down_call = grouped_matmul.gmm_call(hidden, down, sizes, prologue_operands=(hidden,), out_dtype=dtype,
+                                        trans_rhs=False, hooks=down_hooks, interpret=False,
+                                        promoted=down_product.promoted, dense=False)
+    with generation.routes(alone=True):
+        try:
+            for call, product in ((pair_call, pair_product), (down_call, down_product)):
+                case = grouped_matmul.grouped_case(*call, product=product, whole=whole)
+                if selection.selected(grouped_matmul.GROUPED, case).name in ('xla', 'apart'):
+                    return False
+        except KernelRefused:
+            return False
+    return True
 
 
 FUSED_SUPPORTS: tuple[Requirement[GatedCase], ...] = (

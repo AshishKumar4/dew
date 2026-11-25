@@ -2168,6 +2168,21 @@ def test_jaxpr_parameter_key_hashes_structure_and_isolates_opaques_and_consts():
         _stated._plain(kv1, "custom_vjp_jaxpr")
 
 
+def _bf16_rms(x, w):
+    """Plain RMSNorm in fp32 statistics for structural body-cache tests."""
+    mean_sq = jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)
+    return (x.astype(jnp.float32) * jax.lax.rsqrt(mean_sq + 1e-6)).astype(x.dtype) * w
+
+
+def _named_bf16_rms(name: str):
+    """Freshly named RMSNorm function so each `make_jaxpr` carries distinct `debug_info`."""
+    def norm(x, w):
+        return _bf16_rms(x, w)
+
+    norm.__name__ = name
+    return norm
+
+
 def test_structural_closed_reuses_const_free_body_preserving_debug_info_and_reports():
     """Fresh structurally identical const-free bodies hit `program._STRUCTURAL_CLOSED`, replaying routes and
     rewrite reports while keeping each body's own `debug_info` and computing identical values."""
@@ -2175,16 +2190,9 @@ def test_structural_closed_reuses_const_free_body_preserving_debug_info_and_repo
 
     from dew.nn.kernels.templates import report as kernel_report
 
-    def make_norm(name: str):
-        def norm(x, w):
-            mean_sq = jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)
-            return (x.astype(jnp.float32) * jax.lax.rsqrt(mean_sq + 1e-6)).astype(x.dtype) * w
-
-        norm.__name__ = name
-        return norm
-
     shapes = (jax.ShapeDtypeStruct((256, 256), jnp.bfloat16), jax.ShapeDtypeStruct((256,), jnp.bfloat16))
-    ca, cb = jax.make_jaxpr(make_norm("norm_a"))(*shapes), jax.make_jaxpr(make_norm("norm_b"))(*shapes)
+    ca = jax.make_jaxpr(_named_bf16_rms("norm_a"))(*shapes)
+    cb = jax.make_jaxpr(_named_bf16_rms("norm_b"))(*shapes)
     assert ca is not cb and ca.debug_info != cb.debug_info
     with generation.assumed("sm90"):
         with generation.routes() as routes_a, kernel_report.recording():
@@ -2206,3 +2214,105 @@ def test_structural_closed_reuses_const_free_body_preserving_debug_info_and_repo
         assert "div" in reuse_prims
         assert algebra.rules.heads("div", [None, "sqrt"])
         assert not algebra.rules.heads("div", [None, None])
+
+
+def test_structural_closed_isolates_callbacks_device_consts_and_prng_impls():
+    """`program._STRUCTURAL_CLOSED` and `terms.body_key` distinguish `pure_callback` closures from the same
+    factory, same-tag `define_prng_impl` specs with distinct implementations, and decline structural sharing
+    without touching device memory when a nested `pjit` holds a concrete `jax.Array`."""
+    from jax.core import eval_jaxpr
+    from jax.extend import random as jrandom
+
+    def make_cb_body(offset: float):
+        def bump(x):
+            return x + np.asarray(offset, dtype=x.dtype)
+
+        def body(x, w):
+            normed = _bf16_rms(x, w)
+            return jax.pure_callback(bump, jax.ShapeDtypeStruct(normed.shape, normed.dtype), normed)
+
+        return body
+
+    shapes = (jax.ShapeDtypeStruct((256, 256), jnp.bfloat16), jax.ShapeDtypeStruct((256,), jnp.bfloat16))
+    cb1, cb5 = jax.make_jaxpr(make_cb_body(1.0))(*shapes), jax.make_jaxpr(make_cb_body(5.0))(*shapes)
+    assert terms.body_key(cb1) != terms.body_key(cb5)
+    with generation.assumed("sm90"):
+        r1 = program._closed(cb1, accurate=False, saturation=algebra.SATURATION, kernels=True)
+        r5 = program._closed(cb5, accurate=False, saturation=algebra.SATURATION, kernels=True)
+    assert r1 is not cb1 and r5 is not cb5 and r1.jaxpr is not r5.jaxpr
+    eq1 = next(eq for eq in r1.jaxpr.eqns if eq.primitive.name == "pure_callback")
+    eq5 = next(eq for eq in r5.jaxpr.eqns if eq.primitive.name == "pure_callback")
+    assert eq1.params["callback"] is not eq5.params["callback"]
+    x_in, w_in = jnp.ones((256, 256), jnp.bfloat16), jnp.ones((256,), jnp.bfloat16)
+    cpu1 = program._closed(cb1, accurate=False, saturation=algebra.SATURATION, kernels=True)
+    cpu5 = program._closed(cb5, accurate=False, saturation=algebra.SATURATION, kernels=True)
+    assert float(eval_jaxpr(cpu1.jaxpr, cpu1.consts, x_in, w_in)[0][0, 0]) == 2.0
+    assert float(eval_jaxpr(cpu5.jaxpr, cpu5.consts, x_in, w_in)[0][0, 0]) == 6.0
+
+    # Nested `jit` holding a concrete device `jax.Array` declines structural sharing without host copy.
+    captured = jnp.ones((256,), jnp.bfloat16)
+
+    @jax.jit
+    def inner_with_const(x):
+        return x + captured
+
+    def outer_const_free(x, w):
+        return inner_with_const(_bf16_rms(x, w))
+
+    nested_closed = jax.make_jaxpr(outer_const_free)(*shapes)
+    assert not nested_closed.consts
+    assert terms.body_key(nested_closed) is None
+
+    # Same-tag `define_prng_impl` specs with distinct `random_bits` implementations get distinct keys.
+    def make_prng(fill: int):
+        return jrandom.define_prng_impl(
+            key_shape=(2,),
+            seed=lambda seed: jnp.zeros((2,), jnp.uint32),
+            split=lambda key, shape: jnp.broadcast_to(key, (*shape, 2)),
+            random_bits=lambda key, bit_width, shape: jnp.full(shape, fill, jnp.uint32),
+            fold_in=lambda key, word: key,
+            name="shared_test_name",
+            tag="shared_test_tag",
+        )
+    impl_a, impl_b = make_prng(11), make_prng(29)
+    key_a, key_b = jax.random.key(0, impl=impl_a), jax.random.key(0, impl=impl_b)
+
+    def draw_and_norm(k, x, w):
+        return jax.random.bits(k, (4,), jnp.uint32), _bf16_rms(x, w)
+
+    p_a = jax.make_jaxpr(draw_and_norm)(jax.typeof(key_a), *shapes)
+    p_b = jax.make_jaxpr(draw_and_norm)(jax.typeof(key_b), *shapes)
+    assert terms.body_key(p_a) != terms.body_key(p_b)
+    with generation.assumed("sm90"):
+        rp_a = program._closed(p_a, accurate=False, saturation=algebra.SATURATION, kernels=True)
+        rp_b = program._closed(p_b, accurate=False, saturation=algebra.SATURATION, kernels=True)
+    assert rp_a is not p_a and rp_b is not p_b and rp_a.jaxpr is not rp_b.jaxpr
+    assert rp_a.in_avals[0].dtype != rp_b.in_avals[0].dtype
+    cpu_a = program._closed(p_a, accurate=False, saturation=algebra.SATURATION, kernels=True)
+    cpu_b = program._closed(p_b, accurate=False, saturation=algebra.SATURATION, kernels=True)
+    assert int(eval_jaxpr(cpu_a.jaxpr, cpu_a.consts, key_a, x_in, w_in)[0][0]) == 11
+    assert int(eval_jaxpr(cpu_b.jaxpr, cpu_b.consts, key_b, x_in, w_in)[0][0]) == 29
+
+
+def test_structural_closed_keys_on_drawing_context_in_both_orders():
+    """Fresh structurally identical bodies traced under `generation.drawing()` and live `assumed('sm90')`
+    never share a `_STRUCTURAL_CLOSED` entry in either cache order."""
+    from dew.nn.kernels.templates import report as kernel_report
+
+    shapes = (jax.ShapeDtypeStruct((256, 256), jnp.bfloat16), jax.ShapeDtypeStruct((256,), jnp.bfloat16))
+    d1, n1 = (jax.make_jaxpr(_named_bf16_rms(name))(*shapes) for name in ("draw_first", "real_after"))
+    n2, d2 = (jax.make_jaxpr(_named_bf16_rms(name))(*shapes) for name in ("real_first", "draw_after"))
+    with generation.assumed("sm90"):
+        with generation.drawing(), generation.routes() as draw_r1, kernel_report.recording():
+            out_d1 = program._closed(d1, accurate=False, saturation=algebra.SATURATION, kernels=True)
+        with generation.routes() as real_r1, kernel_report.recording():
+            out_n1 = program._closed(n1, accurate=False, saturation=algebra.SATURATION, kernels=True)
+        with generation.routes() as real_r2, kernel_report.recording():
+            out_n2 = program._closed(n2, accurate=False, saturation=algebra.SATURATION, kernels=True)
+        with generation.drawing(), generation.routes() as draw_r2, kernel_report.recording():
+            out_d2 = program._closed(d2, accurate=False, saturation=algebra.SATURATION, kernels=True)
+    assert not any(r.choice == "rms_norm" and r.kernel != "xla" for r in draw_r1)
+    assert any(r.choice == "rms_norm" and r.kernel != "xla" for r in real_r1)
+    assert any(r.choice == "rms_norm" and r.kernel != "xla" for r in real_r2)
+    assert not any(r.choice == "rms_norm" and r.kernel != "xla" for r in draw_r2)
+    assert out_d1 is d1 and out_n1 is not n1 and out_n2 is not n2 and out_d2 is d2
