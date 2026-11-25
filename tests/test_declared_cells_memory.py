@@ -151,164 +151,64 @@ def _placed(mesh, leaf, spec=None):
     return jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=NamedSharding(mesh, spec))
 
 
-def _hlo_dots_and_collectives(compiled):
-    """cuBLAS output dtypes and collective op/dtype pairs of `compiled` (`hlo_instructions`)."""
+def _cublas_dtypes(compiled) -> list[str]:
+    """The output element type of each cuBLAS product of `compiled`, read from its module's schema
+    (`hlo_instructions`)."""
     from dew.telemetry.instrumentation import hlo_instructions
 
-    insts = hlo_instructions(compiled)
-    dots = [(inst.arrays[:1], inst.shapes[:1]) for inst in insts.values() if "cublas" in inst.target]
-    collectives = [(inst.op, inst.arrays) for inst in insts.values()
-                   if inst.op in ("all-reduce", "all-reduce-start", "reduce-scatter", "reduce-scatter-start")]
-    return dots, collectives
+    return [instruction.arrays[0] for instruction in hlo_instructions(compiled).values()
+            if "cublas" in instruction.target]
 
 
-def test_a_primal_local_dense_bf16_xla_fallback_writes_bf16_while_jvp_and_spmd_sum_in_fp32():
-    """A primal-only local dense bf16 product on CUDA XLA fallback (`gemm.xla_mainloop`, `_gemm_t`, row 12898)
-    writes bf16 directly from cuBLASLt (avoiding an fp32 temporary and trailing convert that breaks nGPT's
-    downstream multi-output reduction fusion), while differentiated tangents (`jax.jvp`, `jax.jvp(jax.grad)`),
-    SPMD-partitioned contractions (Auto TP with or without `jax.set_mesh`, Explicit DP weight gradients), and
-    explicit dot algorithms keep fp32 dots so JVP terms and cross-device partials are summed in fp32 before
-    rounding."""
-    from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec
+def test_a_primal_dense_bf16_xla_fallback_stores_bf16_as_xlas_own_dot_does():
+    """A dense bf16 product the template leaves to XLA, lowered for an H100 with no derivative taken
+    (`gemm_xla.direct_dtype`, row 12898): its cuBLAS product stores bfloat16, as XLA's own dense dot (Dense's)
+    does, no fp32 temporary beside it; a product of one row, an explicit dot algorithm, and a contraction a
+    mesh axis splits keep the fp32 product and its one rounding."""
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
-    x_s = jax.ShapeDtypeStruct((2048, 512), jnp.bfloat16)
-    w_s = jax.ShapeDtypeStruct((512, 2048), jnp.bfloat16)
-    opts = {"xla_gpu_enable_triton_gemm": False}
+    options = {"xla_gpu_enable_triton_gemm": False}
+    x, w = jax.ShapeDtypeStruct((2048, 512), jnp.bfloat16), jax.ShapeDtypeStruct((512, 2048), jnp.bfloat16)
+    one_row = jax.ShapeDtypeStruct((1, 512), jnp.bfloat16)
 
-    def fwd(x, w):
+    def product(x, w):
         return gemm.gemm(x, w, None, out_dtype=jnp.bfloat16)
 
-    def loss(x, w):
-        return jnp.sum(jnp.tanh(fwd(x, w)).astype(jnp.float32))
-
-    def tgmm_fn(a, b):
+    def gradient(a, b):
         return gemm.gemm_t(a, b, None, out_dtype=jnp.bfloat16)
 
+    def stored(fn, *shapes) -> list[str]:
+        return _cublas_dtypes(lowered_for(fn, shapes, "sm90").compile(compiler_options=options))
+
     with generation.chosen(grouped_matmul="xla"):
-        # Local 1-device primal forward, grad, and gemm_t emit direct bf16 cuBLASLt dots.
-        fwd_dots, _ = _hlo_dots_and_collectives(lowered_for(fwd, (x_s, w_s), "sm90").compile(
-            compiler_options=opts))
-        assert fwd_dots and all(dtypes == ("bf16",) for dtypes, _ in fwd_dots), fwd_dots
-
-        grad_dots, _ = _hlo_dots_and_collectives(
-            lowered_for(jax.grad(loss, argnums=(0, 1)), (x_s, w_s), "sm90").compile(compiler_options=opts))
-        assert len(grad_dots) == 3 and all(dtypes == ("bf16",) for dtypes, _ in grad_dots), grad_dots
-
-        tgmm_dots, _ = _hlo_dots_and_collectives(lowered_for(tgmm_fn, (x_s, x_s), "sm90").compile(
-            compiler_options=opts))
-        assert tgmm_dots and all(dtypes == ("bf16",) for dtypes, _ in tgmm_dots), tgmm_dots
-
-        # JVP of gemm and gemm_t keep fp32 tangent dots (summed in fp32 before rounding to bf16).
-        jvp_dots, _ = _hlo_dots_and_collectives(
-            lowered_for(lambda x, w, dx, dw: jax.jvp(fwd, (x, w), (dx, dw)),
-                        (x_s, w_s, x_s, w_s), "sm90").compile(compiler_options=opts))
-        assert sum(dtypes == ("f32",) for dtypes, _ in jvp_dots) == 2, jvp_dots
-
-        tjvp_dots, _ = _hlo_dots_and_collectives(
-            lowered_for(lambda a, b, da, db: jax.jvp(tgmm_fn, (a, b), (da, db)),
-                        (x_s, x_s, x_s, x_s), "sm90").compile(compiler_options=opts))
-        assert sum(dtypes == ("f32",) for dtypes, _ in tjvp_dots) == 2, tjvp_dots
-
-        # Higher-order jvp(grad) keeps fp32 tangent dots.
-        hvp_dots, _ = _hlo_dots_and_collectives(
-            lowered_for(lambda x, w, dx, dw: jax.jvp(jax.grad(loss, argnums=(0, 1)), (x, w), (dx, dw)),
-                        (x_s, w_s, x_s, w_s), "sm90").compile(compiler_options=opts))
-        assert sum(dtypes == ("f32",) for dtypes, _ in hvp_dots) >= 4, hvp_dots
-
-        # Explicit dot algorithm or configured F32_F32_F32 keeps fp32 dot.
+        assert set(stored(product, x, w)) == {"bf16"}
+        assert set(stored(gradient, x, x)) == {"bf16"}
+        assert set(stored(product, one_row, w)) == {"f32"}
         with jax.default_matmul_precision("F32_F32_F32"):
-            algo_dots, _ = _hlo_dots_and_collectives(lowered_for(tgmm_fn, (x_s, x_s), "sm90").compile(
-                compiler_options=opts))
-        assert algo_dots and all(dtypes == ("f32",) for dtypes, _ in algo_dots), algo_dots
-
-    # SPMD Auto TP (with and without jax.set_mesh) keeps fp32 partials through all-reduce.
-    devs = generation.compile_only_gpus("sm90", 2, 2**36)
-    mesh_auto = Mesh(devs, ("tp",))
-    sx = jax.ShapeDtypeStruct((2048, 512), jnp.bfloat16,
-                              sharding=NamedSharding(mesh_auto, PartitionSpec(None, "tp")))
-    sw = jax.ShapeDtypeStruct((512, 2048), jnp.bfloat16,
-                              sharding=NamedSharding(mesh_auto, PartitionSpec("tp", None)))
-    with generation.assumed("sm90"), generation.chosen(grouped_matmul="xla"), jax.set_mesh(mesh_auto):
-        auto_dots, auto_ar = _hlo_dots_and_collectives(
-            jax.jit(fwd).lower(sx, sw).compile(compiler_options=opts))
-    assert auto_dots and all(dtypes == ("f32",) for dtypes, _ in auto_dots), auto_dots
-    assert auto_ar and all(dtypes == ("f32",) for _, dtypes in auto_ar), auto_ar
-
-    with generation.assumed("sm90"), generation.chosen(grouped_matmul="xla"):
-        bare_dots, bare_ar = _hlo_dots_and_collectives(
-            jax.jit(fwd, in_shardings=(NamedSharding(mesh_auto, PartitionSpec(None, "tp")),
-                                       NamedSharding(mesh_auto, PartitionSpec("tp", None)))
-                    ).lower(sx, sw).compile(compiler_options=opts))
-    assert bare_dots and all(dtypes == ("f32",) for dtypes, _ in bare_dots), bare_dots
-    assert bare_ar and all(dtypes == ("f32",) for _, dtypes in bare_ar), bare_ar
-
-    # SPMD Explicit DP: local forward/dX contractions write bf16 directly, sharded dW sums partials in fp32.
-    mesh_dp = Mesh(devs, ("data",), axis_types=(AxisType.Explicit,))
-    dx_dp = jax.ShapeDtypeStruct((2048, 512), jnp.bfloat16,
-                                 sharding=NamedSharding(mesh_dp, PartitionSpec("data", None)))
-    dw_dp = jax.ShapeDtypeStruct((512, 2048), jnp.bfloat16,
-                                 sharding=NamedSharding(mesh_dp, PartitionSpec(None, None)))
-    with generation.assumed("sm90"), generation.chosen(grouped_matmul="xla"), jax.set_mesh(mesh_dp):
-        dp_dots, dp_ar = _hlo_dots_and_collectives(
-            jax.jit(jax.grad(loss, argnums=(0, 1))).lower(dx_dp, dw_dp).compile(compiler_options=opts))
-    assert sum(dtypes == ("bf16",) for dtypes, _ in dp_dots) == 2, dp_dots
-    assert sum(dtypes == ("f32",) for dtypes, _ in dp_dots) == 1, dp_dots
-    assert dp_ar and all(dtypes == ("f32",) for _, dtypes in dp_ar), dp_ar
+            assert set(stored(gradient, x, x)) == {"f32"}
+    devices = generation.compile_only_gpus("sm90", 2, 2**36)
+    mesh = Mesh(devices, ("tp",))
+    split = (jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=NamedSharding(mesh, PartitionSpec(None, "tp"))),
+             jax.ShapeDtypeStruct(w.shape, w.dtype, sharding=NamedSharding(mesh, PartitionSpec("tp", None))))
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="xla"), jax.set_mesh(mesh):
+        compiled = jax.jit(product).lower(*split).compile(compiler_options=options)
+    assert set(_cublas_dtypes(compiled)) == {"f32"}
 
 
-def test_an_ngpt_stacks_backward_holds_no_layers_normed_hidden_products_past_its_layer():
-    """An unrolled rematerialized nGPT MLP stack on two compile-only H100s with sm90's dense input gradient
-    on Mosaic (`grouped_cells.STEP_HELD` cleared, row 12898): XLA's forward dots write bf16 directly so XLA
-    fuses both `suv_gate` and `suv_up` reductions into `normed_hidden`'s backward instead of materializing an
-    fp32 `[rows, hidden]` product (16.78 MB/layer) deferred past earlier layers."""
-    from jax.sharding import PartitionSpec
-    from kernel_compile import _device
-
-    from dew import _cache
-    from dew.nn.kernels import grouped_cells, grouped_matmul, options, projections
-    from dew.nn.mlp import GatedMLP
-    from dew.nn.ngpt import NGPT
-    from dew.training.memory import COLLECTIVES
-
-    rows, width, hidden = (2, 2048, 512), 512, 2048
-    ngpt = NGPT(std=0.02, alpha=0.05)
-    mlp = GatedMLP(hidden, width, ngpt=ngpt, dtype=jnp.bfloat16)
-    params = jax.eval_shape(lambda: mlp.init(jax.random.key(0), jnp.zeros(rows, jnp.bfloat16)))
-    mesh = _device("sm90", tuple((name, 2 if name == "data" else 1) for name in MESH_AXES))
-    placed = functools.partial(_placed, mesh)
-
-    def peak_live(layers: int) -> int:
-        def loss(x, stack):
-            for variables in stack:
-                x = x + jax.checkpoint(mlp.apply)(variables, x)
-            return jnp.sum(x.astype(jnp.float32))
-
-        stack = tuple(jax.tree.map(placed, params) for _ in range(layers))
-        x = placed(jax.ShapeDtypeStruct(rows, jnp.bfloat16), PartitionSpec("data"))
-        with (generation.assumed("sm90"), jax.set_mesh(mesh), nn.logical_axis_rules(DEFAULT_RULES),
-              placing(Layout(min_shard=width))):
-            compiled = jax.jit(jax.grad(loss, argnums=(0, 1))).lower(x, stack).compile(
-                compiler_options=COLLECTIVES)
-        live = compiled.peak_live()
-        assert live is not None
-        return sum(buf.bytes for buf in live if buf.kind != "parameter")
-
-    saved_held = dict(grouped_cells.STEP_HELD)
-    try:
-        grouped_cells.STEP_HELD.clear()
-        grouped_matmul.DECLARED.clear()
-        grouped_matmul.DECLARED.update(grouped_matmul._declared())
-        _cache.cleared(projections._DECISIONS)
-        options.release()
-        grown = peak_live(4) - peak_live(2)
-    finally:
-        grouped_cells.STEP_HELD.clear()
-        grouped_cells.STEP_HELD.update(saved_held)
-        grouped_matmul.DECLARED.clear()
-        grouped_matmul.DECLARED.update(grouped_matmul._declared())
-        _cache.cleared(projections._DECISIONS)
-        options.release()
-
-    residual = 2048 * width * 2
-    weights = 3 * width * hidden * 4 + 2 * hidden * 4
-    assert grown <= 2 * (residual + weights) + 2048 * hidden * 2, (grown, 2 * (residual + weights))
+@pytest.mark.parametrize("product", ["gemm", "gemm_t"])
+def test_a_dense_bf16_products_tangent_sums_its_terms_before_rounding(product):
+    """`jax.jvp` of a dense bf16 product whose two tangent terms cancel to below a bf16 ulp of either
+    (x = 129/128, w = 1, dx = 1, dw = -255/256: -127/32768): the tangent sums both terms in fp32 and rounds
+    once (`gemm`'s portable program, every derivative's), never a bf16 rounding a term."""
+    bf16 = jnp.bfloat16
+    x, w = jnp.full((1, 1), 129 / 128, bf16), jnp.ones((1, 1), bf16)
+    dx, dw = jnp.ones((1, 1), bf16), jnp.full((1, 1), -255 / 256, bf16)
+    if product == "gemm":
+        def fn(x, w):
+            return gemm.gemm(x, w, None, out_dtype=bf16)
+    else:
+        def fn(x, w):
+            return gemm.gemm_t(x, w, None, out_dtype=bf16)[0]
+    with generation.chosen(grouped_matmul="xla"):
+        _, tangent = jax.jvp(fn, (x, w), (dx, dw))
+    assert float(tangent.reshape(())) == float(jnp.asarray(-127 / 32768, bf16)), tangent

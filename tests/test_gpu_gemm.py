@@ -193,6 +193,32 @@ def native_hopper_cluster2_balanced_tail_kernel_gradient_holds_check_1():
                     seeds=8, truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
 
 
+def an_xla_fallbacks_dense_bf16_product_holds_check_1_against_xlas_own_dot():
+    """A dense bf16 product the template leaves to XLA, no derivative taken, stores bf16 directly
+    (`gemm_xla.direct_dtype`, row 12898): check 1 against XLA's own dense dot (Dense's, the reference's bf16
+    product) from float64 truth, over draws whose rows cancel to below a bf16 ulp of their terms."""
+    from dew.nn.kernels import gemm
+
+    def draw(seed):
+        rng = np.random.default_rng(12898 + seed)
+        x = rng.normal(size=(512, 1024))
+        w = rng.normal(size=(1024, 768)) / np.sqrt(1024)
+        x[:, 512:] = -x[:, :512] * (1 + 2.0 ** -9)  # each row's second half nearly cancels its first
+        w[512:] = w[:512]
+        return x.astype(jnp.bfloat16), w.astype(jnp.bfloat16)
+
+    def dew_fn(x, w):
+        with generation.chosen(grouped_matmul="xla"):
+            return gemm.gemm(x, w, None, out_dtype=jnp.bfloat16)
+
+    def plain(x, w, *, wide=None, out=jnp.bfloat16):
+        return jax.lax.dot(x.astype(wide or x.dtype), w.astype(wide or w.dtype),
+                           preferred_element_type=wide).astype(out)
+
+    assert_as_exact(jax.jit(dew_fn), jax.jit(plain), draw, "xla fallback dense bf16 512x1024x768", seeds=8,
+                    truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
+
+
 def _syrk_and_tail_cells():
     return [
         # The family's cells as its own grid states them, each pinned to its GPU (`gpu_flow.cells_of`).
@@ -200,6 +226,9 @@ def _syrk_and_tail_cells():
                   native=lambda case: {"launch": "syrk", "form": case[1]},
                   fault=lambda case: ("native SYRK upper-triangle mirror store (row 11941)"
                                       if case[1] == "gram" else None)),
+        Cell("an XLA fallback's dense bf16 product holds check 1 against XLA's own dot",
+             an_xla_fallbacks_dense_bf16_product_holds_check_1_against_xlas_own_dot, "sm90", fault=CUBLAS_BF16,
+             native={"launch": "xla fallback", "pass": "forward"}),
         Cell("native Hopper cluster=2 balanced tail holds check 1",
              native_hopper_cluster2_balanced_tail_holds_check_1, "sm90", fault=BALANCED_TAIL,
              native={"launch": "cluster2 tail", "pass": "forward"}),
@@ -220,6 +249,9 @@ SHARED = "a collective cp.async pipeline's meets, which the interpreter takes as
 
 CLUSTER = "a cluster's multicast of a shared block, which the interpreter loads whole in each program"
 """Why a pair of multiprocessors' cooperative tile stays on the GPU (the GEMM lane, 11-12)."""
+
+CUBLAS_BF16 = "cuBLASLt's dense bf16 product stored in bf16, which no CPU dot computes"
+"""Why the XLA fallback's direct bf16 product stays on the GPU (the GEMM lane, 11-25)."""
 
 BALANCED_TAIL = "a balanced tail's partials fixed up across programs, which the interpreter runs in one order"
 """Why a dense kernel gradient's balanced tail stays on the GPU (the GEMM lane, 11-12)."""

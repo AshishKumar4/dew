@@ -3,6 +3,7 @@
 
 import dataclasses
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -54,9 +55,13 @@ def direct_dtype(lhs, lhs_axis: int, rhs, rhs_axis: int, out_dtype, precision: P
     asks for an explicit dot algorithm (`_PLAIN_PRECISIONS`), and the contraction is local to each device
     (`_local_contraction`, so no SPMD partials are rounded before their reduction). cuBLASLt accumulates bf16
     products in fp32 and rounds once in its epilogue without writing an fp32 temporary or trailing convert
-    that breaks downstream reduction fusion; `wide` otherwise."""
+    that breaks downstream reduction fusion: XLA's own dense bf16 dot (Dense's), the reference's arithmetic.
+    A product of one row or column stays `wide`: XLA reduces it as a vector, its products rounded to the
+    dot's dtype before their sum (`DotStrengthReduction`). `wide` otherwise."""
     if (jnp.dtype(lhs.dtype) == jnp.bfloat16 and jnp.dtype(rhs.dtype) == jnp.bfloat16
             and jnp.dtype(out_dtype) == jnp.bfloat16
+            and math.prod(lhs.shape[:lhs_axis] + lhs.shape[lhs_axis + 1:]) > 1
+            and math.prod(rhs.shape[:rhs_axis] + rhs.shape[rhs_axis + 1:]) > 1
             and precision_names(effective_precision(precision)) <= _PLAIN_PRECISIONS
             and _local_contraction(lhs, lhs_axis, rhs, rhs_axis)):
         return jnp.bfloat16
