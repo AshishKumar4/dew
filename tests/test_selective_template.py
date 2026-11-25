@@ -676,12 +676,15 @@ def test_a_forked_backwards_compiled_shared_memory_is_its_described_scratch():
 @pytest.mark.parametrize('target', [pytest.param(name, marks=lowers(name)) for name in ('sm80', 'sm90')])
 def test_a_forked_calls_training_step_compiles(target):
     """The selective scan's training step over a forked call (`FORKED`'s, each row's documents from its
-    table) compiled for an A100 and an H100 (`kernel_compile`): both launches lower (`failures`; a spill is
-    its residency's, row 12905), where a document's state taken up from its table selected each vector of
-    it on a scalar (its slot's load), which no warpgroup lowering broadcasts (a GH200's forked exactness
-    test, 2026-11-19, and both compiles failed so, row 12904)."""
+    table) compiled for an A100 and an H100 (`kernel_compile`): both launches lower, and on an H100 none
+    spills (`mosaic_failures`), where a document's state taken up from its table selected each vector of it
+    on a scalar (its slot's load), which no warpgroup lowering broadcasts (a GH200's forked exactness test,
+    2026-11-19, and both compiles failed so, row 12904), and the backward's plan counted none of its
+    documents' token vectors, its thread spilling 288 bytes on an H100 (row 12905). An A100's at the plan's 8
+    tokens and two programs spills 8 bytes past them (1,200 before), which `Selective.derived` steps down from
+    on its compile's refusal (row 12905 open)."""
     from fla_gdn_support import KernelCase
-    from kernel_compile import compile_mosaic_kernels, failures
+    from kernel_compile import compile_mosaic_kernels, failures, mosaic_failures
 
     forked = FORKED["shared and chained"]
     rows, length, channels, states = 2, 2048, 256, 16
@@ -702,10 +705,47 @@ def test_a_forked_calls_training_step_compiles(target):
         return trained, operands
 
     (record,) = compile_mosaic_kernels([KernelCase('selective forked training', call)], target)
-    assert not failures([record]), failures([record])
+    refused = (mosaic_failures if target == 'sm90' else failures)([record])
+    assert not refused, refused
     names = [kernel['kernel'] for kernel in record['kernels']]
     assert [name for name in names if 'selective_scan_backward' in name], names
     assert [name for name in names if 'selective_scan' in name and 'backward' not in name], names
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize('target', [pytest.param(name, marks=lowers(name)) for name in ('sm80', 'sm90')])
+def test_a_routed_forked_training_step_compiles_spill_free(target):
+    """A forked call's training step through the selective scan's dispatch (`recurrence_chunk.selective_scan`,
+    the template named) compiled for an A100 and an H100: its config the template's derived one
+    (`Selective.derived`, which steps its backward's tokens down on its compile's refusal), so its backward
+    spills nowhere (`mosaic_failures`), where the backward's own plan on an A100, 8 tokens at two programs,
+    spills 8 bytes (row 12905; the head review of fa36a9f8a's routed witness)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    forked = FORKED["shared and chained"]
+    rows, length, channels, states = 2, 2048, 256, 16
+    operands = (jax.ShapeDtypeStruct((rows, length, channels), jnp.bfloat16),) * 2 + (
+        jax.ShapeDtypeStruct((channels, states), jnp.float32),
+        *(jax.ShapeDtypeStruct((rows, length, states), jnp.bfloat16),) * 2,
+        jax.ShapeDtypeStruct((channels,), jnp.float32),
+        jax.ShapeDtypeStruct((rows, 1, channels, states), jnp.float32))
+
+    def call():
+        def trained(*given):
+            def scanned(*operands):
+                with generation.chosen(selective_scan="mosaic_gpu"):
+                    return recurrence_chunk.selective_scan(*operands, forked.firsts, portable=portable,
+                                                           loads=forked.loads, stores=forked.stores,
+                                                           held=forked.held)[0]
+            out, pull = jax.vjp(scanned, *given)
+            return pull(out)
+
+        return trained, operands
+
+    (record,) = compile_mosaic_kernels([KernelCase('selective forked training, routed', call)], target)
+    assert not mosaic_failures([record]), mosaic_failures([record])
+    assert [kernel for kernel in record['kernels'] if 'selective_scan_backward' in kernel['kernel']], record
 
 
 @lowers('sm90')
