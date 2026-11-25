@@ -1207,7 +1207,7 @@ def test_a_b200s_packed_documents_take_cudnn_only_where_its_receipt_timed_them(t
 ], ids=["v2-limiting-parent", "v1-nested", "v2-container"])
 def test_a_process_is_held_to_its_control_groups_least_memory_limit(tmp_path, groups, limits, least):
     """A CPU call's memory share reads the limits on this process's control groups (`/proc/self/cgroup`),
-    its own group's and every ancestor's (`generation.cgroup_memory_limits`): a parent's tighter limit
+    its own group's and every ancestor's (`_cgroups.memory_limits`): a parent's tighter limit
     under cgroup v2, a nested group's under v1's memory controller, and a container's own group, its mount's
     root, where the group its process names is not mounted."""
     (tmp_path / "proc/self").mkdir(parents=True)
@@ -1215,7 +1215,9 @@ def test_a_process_is_held_to_its_control_groups_least_memory_limit(tmp_path, gr
     for path, limit in limits.items():
         (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / path).write_text(limit + "\n")
-    assert min(generation.cgroup_memory_limits(str(tmp_path))) == least
+    from dew import _cgroups
+
+    assert min(_cgroups.memory_limits(tmp_path / "sys/fs/cgroup", tmp_path / "proc/self/cgroup")) == least
 
 
 @pytest.mark.parametrize("filled", [False, True], ids=["blocks", "filled"])
