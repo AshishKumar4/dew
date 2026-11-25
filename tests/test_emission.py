@@ -1165,6 +1165,22 @@ def test_an_fp32_division_in_a_kernel_issues_a_reciprocal_and_its_refinement():
     assert priced(jnp.int32, hopper, emission.ACCURATE_FORMS) == Work(integer_operations=128)
 
 
+def test_xlas_fp32_log_issues_more_than_its_division_and_its_exponential():
+    """XLA's own fp32 logarithm is libdevice's polynomial, no MUFU at all: nineteen fp32 instructions, a
+    conversion and four integer ones an element, more issue than its IEEE division's MUFU.RCP and six or its
+    exponential's MUFU.EX2, its range reduction's six and a shift, each more than a square root's MUFU.RSQ
+    beside two FMULs and an FSETP (the SASS of XLA's fusions for an H100 and an A100 alike, M-FS-78). So the
+    algebra takes a log over a division only where it saves one."""
+    hopper = generation.gpu_target("sm90")
+    row = jax.ShapeDtypeStruct((128,), jnp.float32)
+
+    def issued(primitive, operands) -> float:
+        return cost.issued(emission.operation_work(primitive, [row] * operands, [row], {}, hopper))
+
+    assert issued(lax.log_p, 1) > max(issued(lax.div_p, 2), issued(lax.exp_p, 1))
+    assert min(issued(lax.div_p, 2), issued(lax.exp_p, 1)) > issued(lax.sqrt_p, 1)
+
+
 @pytest.mark.parametrize(("body", "fused"), [
     (lambda x, y, z: x * y + z, 128), (lambda x, y, z: jnp.maximum(x * y, z), 0),
     (lambda x, y, z: _read_twice(x * y, z), 0), (lambda x, y, z: lax.add(lax.mul(x[0, 0], y[0, 0]), z), 0),
