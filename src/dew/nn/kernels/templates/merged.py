@@ -19,6 +19,7 @@ block's outputs, the row's statistics stored by the first block alone; a row a p
 row, where programs each of a block of channels formed them a block (four times a row at a decode step of
 one row on an A100, M-ET-87 at 7598a24655f). A call with an initial state merges it beside the slices on
 the law's path (`merged_split`)."""
+import collections
 import dataclasses
 import functools
 from collections.abc import Callable, Sequence
@@ -38,7 +39,7 @@ from dew import _cache
 from dew.algebra import windows
 from dew.nn import programs
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
-from dew.nn.kernels import generation, launches, options, tuning
+from dew.nn.kernels import generation, launches, tuning
 from dew.nn.kernels.templates import (
     attention_algebra as algebra,
     cost,
@@ -47,7 +48,15 @@ from dew.nn.kernels.templates import (
     mosaic,
     report,
 )
-from dew.nn.kernels.templates.attention import Initial, Kind, Param, kept_dtype, output_hooked, ungrouped_rows
+from dew.nn.kernels.templates.attention import (
+    Initial,
+    Kind,
+    Param,
+    hook_program,
+    kept_dtype,
+    output_hooked,
+    ungrouped_rows,
+)
 
 _OUTPUT_KINDS = (Kind.HEAD, Kind.QUERY, Kind.OUTPUT)
 
@@ -403,39 +412,29 @@ def _compute_planned_block(units: windows.Units, padded: jax.ShapeDtypeStruct,
     return chosen, candidates[chosen][0]
 
 
-@functools.cache
-def _planned_block_cached(units: windows.Units, padded: jax.ShapeDtypeStruct,
-                          stacked: jax.ShapeDtypeStruct, queries: int, width: int,
-                          target: generation.GpuTarget, has_initial: bool, raw_scale: float | None,
-                          out_dtype, out_heads: int | None, output_mod: Callable | None,
-                          output_kinds: tuple[Kind, ...],
-                          output_specs: tuple[jax.ShapeDtypeStruct, ...],
-                          trace_context) -> tuple[int, cost.Work]:
-    del trace_context
-    return _compute_planned_block(units, padded, stacked, queries, width, target, has_initial, raw_scale,
-                                  out_dtype, out_heads, output_mod, output_kinds, output_specs)
-
-def _holdable_hook(hook: Callable | None) -> bool:
-    """Whether `hook` (bare or `tuning.Prepared`) may be cached without retaining closures or arrays."""
-    if hook is None:
-        return True
-    source = hook.source if isinstance(hook, tuning.Prepared) else hook
-    return tuning.holdable(source)
-
-
 def _planned_block(units: windows.Units, padded: jax.ShapeDtypeStruct, stacked: jax.ShapeDtypeStruct,
                    queries: int, width: int, target: generation.GpuTarget, has_initial: bool = False,
                    raw_scale: float | None = None, out_dtype=None, out_heads: int | None = None,
                    output_mod: Callable | None = None, output_kinds: tuple[Kind, ...] = (),
                    output_specs: tuple[jax.ShapeDtypeStruct, ...] = ()) -> tuple[int, cost.Work]:
     """The channels a program of `_kernel` merges and that launch's total device work (`_launch_for_block`),
-    cached on `units` and the active trace context (rows 8809, 5385) when `output_mod` is holdable."""
-    if not _holdable_hook(output_mod):
-        return _compute_planned_block(units, padded, stacked, queries, width, target, has_initial, raw_scale,
-                                      out_dtype, out_heads, output_mod, output_kinds, output_specs)
-    return _planned_block_cached(units, padded, stacked, queries, width, target, has_initial, raw_scale,
-                                 out_dtype, out_heads, output_mod, output_kinds, output_specs,
-                                 options.trace_context())
+    held through `_cache.holding` (the one owner of what a process derives once and the facts it read, row
+    12420) by the call's shapes, the target, the output hook as what it computes (`hook_program`) and the
+    context a kernel of Dew's is chosen in (`fusion.choice_context`), the latest `PLANNED_HELD`."""
+    from dew.algebra import fusion
+
+    hooked = hook_program("output_mod", output_mod, output_kinds,
+                          tuple(str(spec.dtype) for spec in output_specs), width=width)
+    key = (units, padded, stacked, queries, width, target, has_initial, raw_scale, out_dtype, out_heads,
+           output_kinds, output_specs, hooked, fusion.choice_context())
+    return _cache.holding(_PLANNED, key, lambda: _compute_planned_block(
+        units, padded, stacked, queries, width, target, has_initial, raw_scale, out_dtype, out_heads,
+        output_mod, output_kinds, output_specs), PLANNED_HELD)
+
+
+_PLANNED: collections.OrderedDict = collections.OrderedDict()
+PLANNED_HELD = 256
+"""The merge blocks `_planned_block` holds, the least recently read dropped first."""
 
 
 def _channel_block(units: algebra.Forward | windows.Units, padded: jax.ShapeDtypeStruct,
