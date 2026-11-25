@@ -522,6 +522,27 @@ def test_a_tasks_peak_bounds_its_tests_and_a_heavy_files_tasks_run_large(ci, tmp
     assert all("size" not in entry for entry in ci.plan(240.0, {"files": {}}))
 
 
+def test_every_dry_prepare_task_runs_large_whatever_its_tests_cpu_peaks(ci, tmp_path, monkeypatch):
+    """A GPU tier file's dry prepare (prepares.py's `entries`) compiles its programs on the CPU, so its every
+    task, a kept one's that compiles a row its lookup misses among them, is planned on a large container
+    (ci.py's `PREPARE_SIZE`), though its tests' recorded peaks, their CPU runs', are light: one prepare
+    peaked at a medium's whole 10 GiB and was killed beside other tasks (train 1269). The file's own CPU
+    rows keep armada's own sizing."""
+    (tmp_path / ".armada.json").write_text(json.dumps({"target": 240, "environment": {}}))
+    # The prepare's recipe (prepares.py's `RECIPE`), which keys its rows, beside a GPU tier file.
+    for name in ci.prepares.RECIPE:
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text("")
+    (tmp_path / "tests" / "test_gpu_flow.py").write_text(
+        "import pytest\n\n@pytest.mark.gpu\ndef test_a(): pass\n")
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps({"tests/test_gpu_flow.py::test_a": 1.0}))
+    commit(tmp_path, "main")
+    entries = [entry for entry in ci.plan(240.0, {"files": {}}) if entry["python"] == ci.PYTHONS[0]]
+    prepares = [entry for entry in entries if entry["tests"].startswith(ci.prepares.TOKEN)]
+    assert prepares and [entry.get("size") for entry in prepares] == ["large"] * len(prepares)
+    assert all("size" not in entry for entry in entries if entry not in prepares)
+
+
 def test_a_killed_tasks_peak_raises_its_files_tests_and_heavy_tasks_run_large(ci, tmp_path, monkeypatch):
     """A red row whose pytest left no case (killed before it reported) raises its file's tests' peaks to its
     own, never lowering one; and `sized` puts any task that runs a heavy file's tests on a large
