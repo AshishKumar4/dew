@@ -522,13 +522,12 @@ def _key_memory_held(call: Call, keys: int, values: int, *, reads: bool = False)
     merging = largest_live_set(
         product_fragments(call, (held, chunk, chunk), (held, chunk, keys)),
         product_fragments(call, (held, chunk, keys), (held, keys, chunk), rhs_transposed=True))
-    # Under `reads`, three fp32 key-block tiles more, as ptxas holds them: priced as their fp32 value alone,
-    # or with their given-dtype tile beside it, Kimi Linear's PKDA training's launch derived the same tiles
-    # and spilled 32 bytes a thread on an sm86 and 184 on an sm120 (46 registers; scratch jsf-pkdagate2 and
-    # -3), its fast backward held.
+    # Under `reads`, the reads read beside the queries and keys, and in fp32 beside them where the weights'
+    # terms are formed: priced as the fp32 tile alone, Kimi Linear's PKDA training spilled 32 bytes on an
+    # sm86 and 184 on an sm120 (scratch jsf-pkdagate2).
     return Held(carried=[f32(chunk, chunk), f32(chunk, 1)] + (sums if walked else []), phases=(
         apart + fresh + memory,
-        [f32(chunk, keys)] * (4 + 3 * reads) + apart + fresh + held_tile(held, chunk, keys) * 2
+        [f32(chunk, keys)] * (4 + reads) + apart + fresh + held_tile(held, chunk, keys) * (2 + reads)
         + [f32(chunk, chunk)] * merged + merging))
 
 
