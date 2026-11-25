@@ -955,7 +955,7 @@ def test_a_compile_only_gpu_mesh_lowers_for_cuda_unassumed():
     """A call placed on a compile-only GPU mesh, nothing assumed, lowers for CUDA as its abstract device's
     compute capability states, a registered GPU backend or none, so its platform choice counts its `cuda`
     branch (the review of lane/toolkit ee127f37c)."""
-    mesh = jax.sharding.Mesh(np.array(generation.compile_only_gpus("sm90")), ("data",))
+    mesh = jax.sharding.AbstractMesh((1,), ("data",))
 
     def chosen(row):
         return lax.platform_dependent(row, cuda=lambda row: row, default=lambda row: row * 2.0 + 1.0)
