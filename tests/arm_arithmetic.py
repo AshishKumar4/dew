@@ -376,8 +376,9 @@ class Written:
 
     def _on_tpu(self, inputs, options):
         """The TPU's compiled twin of a call on `inputs`, None where the TPU compiles none (`ran_on`)."""
-        leaves, structure = jax.tree.flatten(inputs)
-        key = (tuple(map(jax.typeof, leaves)), structure, tuple(sorted(options.items())))
+        # Arrays by their types, any other leaf (an option's flag) by its value.
+        leaves, structure = jax.tree.flatten((inputs, options))
+        key = (tuple(jax.typeof(leaf) if isinstance(leaf, jax.Array) else leaf for leaf in leaves), structure)
         if key not in self._compiled:
             try:
                 self._compiled[key] = self.program("tpu").lower(*inputs, **options).compile()
