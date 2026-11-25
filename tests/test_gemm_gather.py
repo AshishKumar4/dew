@@ -952,13 +952,14 @@ def test_producers_rungs_keeps_top_after_stated_cap_start():
         assert start_cap not in ladder, (start_cap, ladder)
 
 
-def test_a_refused_gathered_tile_still_offers_its_ladders_next_rung():
+@pytest.mark.parametrize("depth", [512, 511], ids=["whole", "padded"])
+def test_a_refused_gathered_tile_leaves_its_launch_a_config_it_takes(depth):
     """A gathered paired product on an H100 (an MoE gate/up, 512 tokens gathered to 1024 rows over two
     experts, its gated epilogue's three outputs) whose tile a compile refused spilling, and the first rungs of
     its producer's ladder too (`producers.rungs`), each modelled past its consumers' budget: the launch still
     offers a config no compile refused and its launch takes, the tile refused where its ladder settles on a
-    rung it does not take (train 1286, row 12972: the refused tile offered again, its offer refused, the
-    call Exhausted)."""
+    rung it does not take, at a depth its tiles divide and at one they pad (train 1286, row 12972: the
+    refused tile offered again, its offer refused, the call Exhausted)."""
     from dew.nn.activations import gated_hook, rounded_gated
     from dew.nn.kernels.templates import report
     from dew.nn.kernels.templates.gemm import producers
@@ -971,8 +972,8 @@ def test_a_refused_gathered_tile_still_offers_its_ladders_next_rung():
         return gemm.gemm(tokens, first, sizes, compute=bf16, out_dtype=bf16, out_dtypes=(bf16,) * 3,
                          paired=second, gather=table, epilogue=rounded_gated(gated_hook("swiglu"), bf16))
 
-    shapes = (jax.ShapeDtypeStruct((512, 512), bf16), jax.ShapeDtypeStruct((2, 512, 512), bf16),
-              jax.ShapeDtypeStruct((2, 512, 512), bf16))
+    shapes = (jax.ShapeDtypeStruct((512, depth), bf16), jax.ShapeDtypeStruct((2, depth, 512), bf16),
+              jax.ShapeDtypeStruct((2, depth, 512), bf16))
     with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"), tuning.seen() as launches:
         jax.make_jaxpr(paired)(*shapes)
     [ba] = [bound for _, bound in launches.taken if bound.arguments.get("paired") is not None

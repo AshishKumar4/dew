@@ -451,7 +451,9 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
         run partial (`_partial_axes`)."""
         from .templates.gemm import derivation, hooks, quantized
 
-        ba = self._aligned(ba, target, whole_tiles=True)
+        # A compile's refusals are the call's own (`report.refuse_launch` of its bound arguments), read so
+        # beside the padded call's sizing and legality (row 12972: a gathered depth of 511, padded to 512).
+        call, ba = ba, self._aligned(ba, target, whole_tiles=True)
         rows, depth, width = self._generated_extents(ba)
         # A call storing an output a form reduces stages each output a block of the form's at a time
         # (`quantized.formed`), each tile planned and taken so.
@@ -463,8 +465,10 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
             tile = derivation.derived(tried, rows=rows, depth=depth, width=width,
                                       dtype=ba.arguments['tokens'].dtype,
                                       multiprocessors=_multiprocessors(target), target=target,
-                                      candidate=lambda tile: (self.candidate(ba, formed(tile), target)
-                                                              and (admits is None or admits(tile))),
+                                      candidate=lambda tile: (
+                                          self.candidate(ba, formed(tile), target)
+                                          and not self._refused(call, formed(tile), target)
+                                          and (admits is None or admits(tile))),
                                       launch_of=lambda tile: self.launch_of(ba, formed(tile), target),
                                       grouped=depth is not None, depths=self._step_sizes(ba),
                                       dense=bool(ba.arguments.get('dense')),
