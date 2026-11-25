@@ -67,6 +67,7 @@ from dew.nn.kv_cache import (
     DOCUMENTS,
     TABLE,
     Append,
+    CacheSpec,
     KVCache,
     KVSpec,
     KVStore,
@@ -94,6 +95,7 @@ from dew.nn.qsa import QSA, QSAIndexer, qsa_selection
 from dew.nn.residuals import QKV_RESIDUALS, Residual
 from dew.nn.rope import LongRopeScaling, axis_halves, axis_tables, rotary_freqs, rotate
 from dew.nn.sharding import HEADS, KV_HEADS, LogicalAxes, constrain, declared
+from dew.nn.short_conv_site import ShortConvs, ShortConvSite
 from dew.nn.value_experts import RoutedValues
 from dew.nn.visibility import windowed
 
@@ -416,6 +418,9 @@ class CausalSelfAttention(nn.Module):
     """Each query and key head's length clipped (`QKClip`), where a head norm (`MixerContext.qk_norm`)
     would sit: after the projections, before any rotation and the temperature; a layer takes one or the
     other."""
+    short_convs: ShortConvs | None = None
+    """Its causal short convolutions (`ShortConvs`): its projected keys' and values' before their head
+    clip and norm, its gated output's before its output projection, each its own decode history."""
     projected_sinks: bool = False
     """Each query's own value-free sink logit a head, a bias-free projection of its input (`sink_proj`,
     `[B, Q, H]` in fp32; Inkling 2's), in place of a head's static ones (`MixerContext.attention_sinks`):
@@ -589,6 +594,8 @@ class CausalSelfAttention(nn.Module):
                 raise ValueError("a layer's sinks are a head's or each query's own: take one")
             self.sink_proj = dense(self.ctx.num_heads, name='sink_proj', use_bias=False,
                                    kernel_axes=ATTENTION_AXES['gate_proj'])
+        if self.short_convs is not None:
+            self._short_convs(self.short_convs)
         if self.relative_bias is not None:
             bias = self.relative_bias
             self.relative = dense(self.ctx.num_heads * bias.rank, name='relative', use_bias=False,
@@ -597,6 +604,21 @@ class CausalSelfAttention(nn.Module):
                                              (self.ctx.num_heads, bias.rank), jnp.float32)
             self.relative_bank = self.param('relative_bank', nn.initializers.zeros, (bias.rank, bias.extent),
                                             jnp.float32)
+
+    def _short_convs(self, convs: ShortConvs):
+        """Its short convolutions' sites (`short_convs`): its keys' and values' where it projects its own
+        (dynamic taps a key head where `convs.dynamic`), and its output's."""
+        if self.ctx.k_eq_v or self.ctx.value_experts is not None or self.ctx.ngpt is not None:
+            raise ValueError("short convolutions run over a layer's own projected keys, values and gated "
+                             "output: not keys that are values, routed values or nGPT's normed output")
+        heads = self.ctx.num_kv_heads if convs.dynamic else None
+        if not self.ctx.kv_shared:
+            self.k_conv = ShortConvSite(self.ctx.num_kv_heads * self.ctx.head_dim, convs.kernel, heads,
+                                        dtype=self.ctx.dtype, name='k_conv')
+            self.v_conv = ShortConvSite(self.ctx.num_kv_heads * self.value_dim, convs.kernel, heads,
+                                        dtype=self.ctx.dtype, name='v_conv')
+        self.out_conv = ShortConvSite(self.ctx.num_heads * self.value_dim, convs.kernel, dtype=self.ctx.dtype,
+                                      name='out_conv')
 
     def _ngpt_gains(self, ngpt: NGPT):
         """nGPT's query gain and, under an output gate, the gate's logit gain, one a feature of the
@@ -800,7 +822,7 @@ class CausalSelfAttention(nn.Module):
         return stashed
 
     def _projected_kv(self, x, whole: bool, projected=None,
-                      sites: Mapping[str, jax.Array] | None = None):
+                      sites: Mapping[str, jax.Array] | None = None, call: MixerCall = PLAIN_CALL):
         """Project the keys and values, norm them, and split them into heads.
 
         `whole` norms the key projection before the head split, which is
@@ -809,9 +831,9 @@ class CausalSelfAttention(nn.Module):
         'v' site's, where a looped pass merged its message into each apart.
         """
         batch, length, _ = x.shape
+        keys = x if sites is None else sites['k']
+        values = keys if sites is None else sites.get('v', keys)
         if projected is None:
-            keys = x if sites is None else sites['k']
-            values = keys if sites is None else sites.get('v', keys)
             key = self.k_proj(keys)
             # Gemma 4's global layers use the raw key projection as the
             # values before its norm (modeling_gemma4.py); MoVA's are routed experts'.
@@ -819,6 +841,11 @@ class CausalSelfAttention(nn.Module):
                      else self.v_proj(values))
         else:
             key, value = projected
+        if self.short_convs is not None:
+            # Each convolved over the call's tokens behind its own history, before its norm (`short_convs`).
+            dynamic = self.short_convs.dynamic
+            key = self.k_conv(key, call, keys if dynamic else None)
+            value = self.v_conv(value, call, values if dynamic else None)
         if self.ctx.key_multiplier is not None:
             # Before its norm and rotation, as Falcon-H1's keys (`k_proj(x) * key_multiplier`).
             key = scaled(key, self.ctx.key_multiplier)
@@ -956,14 +983,22 @@ class CausalSelfAttention(nn.Module):
                 INDEX_PLACES: Opened((rows, capacity, *axes), jnp.int32)}
 
     @nn.nowrap
-    def cache_spec(self, rows: int) -> dict[str, Opened]:
+    def cache_spec(self, rows: int) -> CacheSpec:
         """The layer's decode cache for `rows` rows: a causal layer's own keys and values with their
         cursor (`open_kv_cache`), and QSA's indexer keys beside them; none for a layer sharing another's
-        keys or a bidirectional one, which reads its causal model's."""
+        keys or a bidirectional one, which reads its causal model's. Its short convolutions' histories
+        beside them, each under its site's name (`short_convs`)."""
+        convs = {} if self.short_convs is None else {
+            name: site.cache_spec(rows) for name, site in self._conv_sites().items()}
         if not self.ctx.causal or self.ctx.kv_shared:
-            return {}
+            return convs
         indexed = {} if self.qsa is None else self._indexed(rows)
-        return {**self._kv_spec(rows).leaves(), **cursor(rows), **indexed}
+        return {**self._kv_spec(rows).leaves(), **cursor(rows), **indexed, **convs}
+
+    def _conv_sites(self) -> dict[str, ShortConvSite]:
+        """Its short convolutions' sites by name (`short_convs`), each holding its own decode history."""
+        own = {} if self.ctx.kv_shared else {'k_conv': self.k_conv, 'v_conv': self.v_conv}
+        return {**own, 'out_conv': self.out_conv}
 
     def _group_fields(self) -> tuple[str, ...]:
         """The `AttentionMetadata` fields of groups the layer reads (`group_fields`)."""
@@ -1068,7 +1103,7 @@ class CausalSelfAttention(nn.Module):
         if self.ctx.kv_shared:
             key, value, positions, *held = self._shared_kv(kv_store, decode)
         else:
-            key, value = self._projected_kv(x, self._whole_norm, projected_kv, call.site_inputs)
+            key, value = self._projected_kv(x, self._whole_norm, projected_kv, call.site_inputs, call)
 
         kv_len = key.shape[-3]
         positions, append, prefix = self._step_positions(key, positions, segment_ids, attention_metadata,
@@ -1100,12 +1135,12 @@ class CausalSelfAttention(nn.Module):
                 kv_store[self.ctx.kv_store_key] = (key, value, positions, places, {})
         query = self._tuned(query, places)
         if decode and attention_metadata is not None and attention_metadata.admitted is not None:
-            if self.relative_bias is not None or self.projected_sinks:
+            if self.relative_bias is not None or self.projected_sinks or self.short_convs is not None:
                 raise ValueError(f"{self.name}: a server's mixed step attends its rows' caches by pages, "
-                                 "which take no dense bias and a head's sinks alone: serve this layer by the "
-                                 "dense cache")
+                                 "which take no dense bias, a head's sinks alone and no convolution's "
+                                 "history: serve this layer by the dense cache")
             attention = self._mixed_attended(query, key, value, positions, attention_metadata)
-            return self._output(attention, gate, B, S, own_value, progress)
+            return self._output(attention, gate, B, S, own_value, progress, call)
         sinks = self.sink_proj(x).astype(jnp.float32) if self.projected_sinks else self.sinks
         if self._runs_local(attention_metadata, decode) and not (self.ctx.attention_dropout_rate and train):
             attention = checkpoint_name(local_attention(
@@ -1119,7 +1154,7 @@ class CausalSelfAttention(nn.Module):
                 force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
                 sinks=sinks,
                 softcap=self.ctx.attn_logit_softcap), Residual.CONTEXT)
-            return self._output(attention, gate, B, S, own_value, progress)
+            return self._output(attention, gate, B, S, own_value, progress, call)
         refused = self._unhonoured(attention_metadata, "general")
         if refused:
             raise ValueError(f"{self.name}: only a serving step's decode reads {', '.join(refused)}")
@@ -1137,7 +1172,7 @@ class CausalSelfAttention(nn.Module):
             relative = self._relative_bias(x, places, masking.key_places)
             bias = relative if bias is None else bias + relative
         attention = self._attended(masking, positions, append, sinks, train, bias=bias)
-        return self._output(attention, gate, B, S, own_value, progress)
+        return self._output(attention, gate, B, S, own_value, progress, call)
 
     @property
     def _whole_norm(self) -> bool:
@@ -1236,6 +1271,8 @@ class CausalSelfAttention(nn.Module):
         if self.ctx.kv_shared:
             raise ValueError("a KV-sharing layer projects no keys or values of its own to read a context "
                              "with")
+        if self.short_convs is not None:
+            raise ValueError("a layer convolving its keys and values over its own tokens reads no context's")
         group = self._group()
         projected = None
         if group is not None and self._packed():
@@ -1980,7 +2017,8 @@ class CausalSelfAttention(nn.Module):
         return tuple(name for name in sorted(self.reads - self.honours[route])
                      if getattr(metadata, name) is not None)
 
-    def _output(self, attention, gate, batch: int, length: int, own_value, progress):
+    def _output(self, attention, gate, batch: int, length: int, own_value, progress,
+                call: MixerCall = PLAIN_CALL):
         """Take the differential on the chosen heads where the layer carries DEX (`dew.nn.dex`), its lambda
         annealed over the call's `progress` (`AttentionMetadata.progress`), exclude the own value where
         the layer does and the call has one (None for a read of another sequence), gate the attended
@@ -2011,6 +2049,9 @@ class CausalSelfAttention(nn.Module):
         joined = attention.reshape(batch, length, self.ctx.num_heads * self.value_dim)
         if self.ctx.ngpt is not None:
             joined = l2norm(joined)
+        if self.short_convs is not None:
+            # After the gate and before the projection, outside every attention kernel's output hook.
+            joined = self.out_conv(joined, call)
         return checkpoint_name(self.o_proj(joined), Residual.O_PROJ)
 
 
@@ -2059,12 +2100,25 @@ class AttentionMixer(MixerBase):
     temperature_tuning: tuple[float, float] | None = None
     """A (floor_scale, attn_scale) that scales each query by its position (`temperature_scale`,
     arXiv 2501.19399), as Llama 4's unrotated layers do; None scales none."""
+    temperature_form: Literal['floored', 'log_ratio'] = 'floored'
+    """How `temperature_tuning` grows (`CausalSelfAttention.temperature_form`)."""
+    qk_clip: QKClip | None = None
+    """Each head's length clipped in place of a head norm (`CausalSelfAttention.qk_clip`)."""
+    relative_bias: RelativeBias | None = None
+    """An input-conditioned relative-position bias (`CausalSelfAttention.relative_bias`)."""
+    projected_sinks: bool = False
+    """Each query's own projected sink (`CausalSelfAttention.projected_sinks`)."""
+    short_convs: ShortConvs | None = None
+    """Causal short convolutions at its keys, values and output (`CausalSelfAttention.short_convs`)."""
 
     # `CausalSelfAttention` reads the mixed call's `Admitted` layout, and its cached keys by their documents.
     mixed_step = True
     packed_cache = True
 
     def mixed_refusal(self, ctx: MixerContext) -> str | None:
+        if self.relative_bias is not None or self.projected_sinks or self.short_convs is not None:
+            return ("a mixed step attends its rows' caches by pages, which take no dense bias, a head's "
+                    "sinks alone and no convolution's history")
         return mixed_attention_refusal(ctx, alibi=self.alibi)
 
     def __post_init__(self):

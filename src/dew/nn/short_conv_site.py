@@ -9,6 +9,7 @@ arithmetic, a window of the last `k` inputs times each token's taps, masked as t
 
 from __future__ import annotations
 
+import dataclasses
 import math
 
 import jax
@@ -21,6 +22,21 @@ from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
 from dew.nn.kv_cache import Opened, cache_variables, compute_dtype, kept, stated
 from dew.nn.linear import DepthwiseConv1d, held_conv1d
 from dew.nn.precision import at_least_fp32, float32_dot_general
+
+
+@dataclasses.dataclass(frozen=True)
+class ShortConvs:
+    """An attention layer's causal short convolutions (`ShortConvSite`): its projected keys' and values'
+    (before their head clip and norm) and its gated output's (before its output projection), each `kernel`
+    taps, its keys' and values' with per-token dynamic taps a key head where `dynamic` (Inkling 2's
+    global layers, modeling_inkling2_loop.py:463-526)."""
+
+    kernel: int = 4
+    dynamic: bool = False
+
+    def __post_init__(self):
+        if self.kernel < 2:
+            raise ValueError(f"a short convolution reads the token before its own too, got {self.kernel}")
 
 
 class ShortConvSite(nn.Module):
@@ -106,4 +122,12 @@ class ShortConvSite(nn.Module):
         own = self.dynamic(dynamic_input).astype(wide).reshape(batch, length, heads, 1, k)
         weights = taps.astype(wide).reshape(heads, features // heads, k)[None, None] + own
         convolved = jnp.sum(windows.reshape(batch, length, heads, features // heads, k) * weights, axis=-1)
-        return convolved.reshape(batch, length, features), padded[:, -(k - 1):].astype(x.dtype)
+        if tokens.valid is None or not tokens.right_padded:
+            history = padded[:, -(k - 1):]
+        else:
+            # A right-padded row's last real inputs, as the static convolution keeps them (`held_conv1d`):
+            # its padding enters no history.
+            real = jnp.sum(jnp.asarray(tokens.valid, jnp.int32), axis=1)
+            index = real[:, None] + jnp.arange(k - 1)[None]
+            history = jnp.take_along_axis(padded, index[..., None], axis=1)
+        return convolved.reshape(batch, length, features), history.astype(x.dtype)
