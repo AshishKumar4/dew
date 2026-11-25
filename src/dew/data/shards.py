@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import grain.experimental as experimental
 import grain.python as grain
+from grain._src.python.dataset.transformations.shuffle import ShuffleMapDataset
 
 from dew import _position
 from dew._records import boolean, integer, integers, listed, record
@@ -201,25 +202,14 @@ def shuffled(index: int, max_index: int, seed: int) -> int:
     return experimental.index_shuffle(index, max_index=max_index, seed=seed, rounds=4)
 
 
-class _Shuffled(grain.MapDataset):
-    """Grain's shuffle of `parent` (`MapDataset.shuffle`, `ShuffleMapDataset._shuffled_index`): each pass's
-    order its `index_shuffle` under `seed` plus the pass, each place answered once a process (`shuffled`)."""
+class _Shuffled(ShuffleMapDataset):
+    """Grain's shuffle of a parent (`MapDataset.shuffle`), its seed, statistics and element spec Grain's own,
+    each pass's place answered once a process (`shuffled`)."""
 
-    def __init__(self, parent: grain.MapDataset, seed: int):
-        super().__init__(parent)
-        if not 0 <= seed < 2 ** 32:
-            raise ValueError(f"a shuffle's seed is an integer in [0, 2**32), got {seed}")
-        self._places, self._seed = parent, seed
-
-    def __len__(self) -> int:
-        return len(self._places)
-
-    def __getitem__(self, index):
-        if isinstance(index, slice):
-            return self.slice(index)
-        length = len(self._places)
+    def _shuffled_index(self, index: int) -> int:
+        length = len(self._parent)
         epoch, place = divmod(index, length)
-        return self._places[shuffled(place, length - 1, (self._seed + epoch) % 2 ** 32) + epoch * length]
+        return shuffled(place, length - 1, (self._seed + epoch) % 2**32) + epoch * length
 
 
 def _dealt(shards: tuple[Shard, ...], *, seed: int | None, epochs: int | None) -> grain.MapDataset:
@@ -228,7 +218,7 @@ def _dealt(shards: tuple[Shard, ...], *, seed: int | None, epochs: int | None) -
     (endlessly where None)."""
     root = grain.MapDataset.source(shards)
     if seed is not None:
-        root = _Shuffled(root, seed)
+        root = _Shuffled(root, seed=seed)
     if epochs != 1:
         root = root.repeat(epochs)
     return root

@@ -432,6 +432,6 @@ def test_a_streams_shards_are_dealt_in_graines_shuffled_order_every_pass(places)
 
     for seed in (0, 7, 2**32 - 1):
         grains = grain.MapDataset.source(range(places)).shuffle(seed=seed).repeat(3)
-        dealt = _Shuffled(grain.MapDataset.source(range(places)), seed).repeat(3)
+        dealt = _Shuffled(grain.MapDataset.source(range(places)), seed=seed).repeat(3)
         assert [dealt[index] for index in range(3 * places)] == [grains[index] for index in range(3 * places)]
         assert list(dealt[1::2]) == list(grains[1::2])
