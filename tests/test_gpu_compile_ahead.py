@@ -475,8 +475,9 @@ def test_a_fresh_state_placed_on_a_gpu_draws_the_bits_of_jaxs_default_lowering()
             return (np.asarray(jax.random.key_data(jax.random.key(seed))),)
 
     def placed(data):
-        key = jax.random.wrap_key_data(data)
-        return floats(trainer(key).place()[0].variables)
+        # `place` stacks a one-stage scanned run under `stages`; `stored` reads its stored `layers_N`.
+        run = trainer(jax.random.wrap_key_data(data))
+        return floats(run.stored(run.place()[0]).variables)
 
     drawn_here, replayed = jax.jit(initial), float64_replay(initial)
     assert_as_exact(as_given(placed), as_given(lambda data: floats(drawn_here(data))), drawn,
