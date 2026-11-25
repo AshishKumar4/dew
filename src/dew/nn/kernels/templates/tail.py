@@ -40,6 +40,12 @@ class Tail:
         return int(np.count_nonzero(self.bounds()[1:-1] % self.steps))
 
     @property
+    def tiles(self) -> int:
+        """The tail's tiles (its iterations, a tile's steps each), each a slot of its first program's partial
+        (`slots`, `mosaic.Family.fixed_up`'s `firsts`)."""
+        return -(-self.iterations // self.steps)
+
+    @property
     def segments(self) -> int:
         """The tiles (whole or in part) a program walks at most: its waves' and its range's."""
         return self.waves + -(-self.iterations // self.partitions // self.steps) + 1
@@ -68,7 +74,7 @@ class Tail:
         tile = jnp.where(whole, segment * programs + program, self.waves * programs + tail_tile)
         # The tail tile's slot of its first program's partial (`mosaic.Family.fixed_up`'s `firsts`): a slot a
         # tile, which a segment past the tail's tiles (walking none) reads as its last.
-        slot = jnp.minimum(jnp.where(whole, 0, tail_tile), -(-self.iterations // self.steps) - 1)
+        slot = jnp.minimum(jnp.where(whole, 0, tail_tile), self.tiles - 1)
         return (jnp.minimum(tile, tiles - 1), start, jnp.maximum(end - start, 0),
                 (first, jnp.minimum(gathered, self.partitions), slot))
 

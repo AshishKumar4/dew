@@ -615,7 +615,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                                          parts=(tail, scales if scales is not None else packed_format,
                                                 mx_scales, gather, chained), beside=beside))
     return kernel(*(operands if dense else (table, *operands)), *prologue_operands, *epilogue_operands,
-                  *_workspace(tail, tail_workspace(tiles, family, pair * pairs, tail), interpret))
+                  *_workspace(tail, (tiles, family, pair * pairs), interpret))
 
 
 def _gmm_forms_refused(tiles: Tiles, family: mosaic.Family, k: int, n: int, mx_scales, step_scales, *,
@@ -1077,13 +1077,14 @@ def _outputs(o_gmems: tuple, scatter_gmem, interpret: bool) -> tuple:
     return o_gmems
 
 
-def _workspace(tail, shape: tuple, interpret) -> tuple:
+def _workspace(tail, launch: tuple, interpret) -> tuple:
     """Dew: a balanced tail's partials (`tail.Tail`): each program's, of the tile its range starts inside,
     and each tail tile's first program's (`Family.fixed_up`'s `firsts`, `tail.slots`), a consumer's share of a
     tile each, a ref the kernel writes in place, the last of its operands; none without a tail. Its slots
     are written only where programs share a tile, so it is no declared output, which would leave the rest
     unwritten (NSNAN-2), and it starts uninitialized (`mosaic.workspace`)."""
-    return () if tail is None else (mosaic.workspace(shape, jnp.float32, interpret=interpret),)
+    return () if tail is None else (mosaic.workspace(tail_workspace(*launch, tail), jnp.float32,
+                                                     interpret=interpret),)
 
 
 def _scale_refs(refs: tuple, step_scales, mx_scales, gather, scatter) -> tuple:
@@ -2226,7 +2227,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                            cost=unit_cost.estimate(2 * k * m * n, lhs, rhs, *prologue_operands, out_type))
     return kernel(*groups, lhs, rhs, *(table for table in tables if table is not None), *(step_scales or ()),
                   *prologue_operands,
-                  *_workspace(tail, tail_workspace(tiles, family, pair * pairs, tail), interpret))
+                  *_workspace(tail, (tiles, family, pair * pairs), interpret))
 
 def _tgmm_finished(wg, tile: tuple, summed, store, *, active, family: mosaic.Family, tiles: Tiles, m: int,
                    o_gmem, partials) -> None:

@@ -177,17 +177,12 @@ def tail_workspace(tiles: "Tiles", family: mosaic.Family, programs: int,
     """A balanced tail's fp32 partials' shape, the one its planner bounds (`dense_tail`) and its launches
     allocate (`mosaic_gpu._workspace`): a slot each of a launch's `programs` (cluster pairs of
     `tiles.cluster`), the partial of the tile its range starts inside, then one each of the tail's tiles
-    (`tail_slots`), its first program's partial of it (`Family.fixed_up`'s `firsts`), each a consumer's
+    (`tail.Tail.tiles`), its first program's partial of it (`Family.fixed_up`'s `firsts`), each a consumer's
     share of the tile's rows by its columns (a tail's tile is no ping-pong one, `fixes_up`): a slot a tile,
     not a second one a program, where the tail's tiles are fewer than its programs (a GH200's 128 x 256
     outlier's 66 pairs and 14 tiles: 21 MiB where two a program held 33, past cuBLAS's 32, NG29)."""
-    return (tiles.cluster, programs // tiles.cluster + tail_slots(tail), tiles.warpgroups, tiles.share,
+    return (tiles.cluster, programs // tiles.cluster + tail.tiles, tiles.warpgroups, tiles.share,
             tile_columns(tiles, family))
-
-
-def tail_slots(tail: tail_of.Tail) -> int:
-    """The tiles of a balanced tail (its iterations, a tile's steps each), each a slot of its workspace."""
-    return -(-tail.iterations // tail.steps)
 
 
 def within_workspace(target: generation.GpuTarget | None, held: float) -> bool:
