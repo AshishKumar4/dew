@@ -68,11 +68,11 @@ def _kernel(body, predicate):
 
 @pytest.mark.parametrize("operation", [jnp.exp, jnp.sqrt, lax.rsqrt, jnp.tanh], ids=lambda f: f.__name__)
 def test_a_square_root_counts_on_the_special_function_units_as_an_exponential_does(operation):
-    """A row's sqrt or rsqrt counts one special-function operation an element and no operation of the CUDA
-    cores, as an exp or a tanh does: each an fp32 MUFU on sm80, sm90 and sm100 (`emission.SPECIAL_FUNCTIONS`,
-    their SASS), where a square root counted on the CUDA cores."""
+    """A row's sqrt or rsqrt counts one special-function operation an element, as an exp or a tanh does: each
+    an fp32 MUFU on sm80, sm90 and sm100 (`emission.SPECIAL_FUNCTIONS`, their SASS; XLA's beside the fp32
+    instructions refining it, `XLA_FORMS`), where a square root counted on the CUDA cores alone."""
     role = _emitted(operation, _ROW).roles[0]
-    assert (role.fixed.exponentials, role.fixed.operations) == (128, 0), role.fixed
+    assert role.fixed.exponentials == 128, role.fixed
 
 
 @pytest.mark.parametrize("operation", [jnp.exp, jnp.log, jnp.tanh, jax.nn.sigmoid], ids=lambda f: f.__name__)
