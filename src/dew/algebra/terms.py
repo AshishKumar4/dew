@@ -1680,11 +1680,12 @@ def value_of(term: Term, value: Callable[[Term], jax.Array], region_: Region, le
         if (args := get_callable_args(term, constructor)) is not None:
             # An operation's name stands between its two operands.
             return bound(args[0], args[2], args[3])
-    for constructor, primitive in ((Term.select, jax.lax.select_n_p), (Term.clamp, jax.lax.clamp_p)):
-        if (args := get_callable_args(term, constructor)) is not None:
-            # A clamp binds as itself, its derivative JAX's own (zero at a bound, where a maximum and a
-            # minimum would halve it).
-            return primitive.bind(*_aligned_explicit(*(value(operand) for operand in args)))
+    if (args := get_callable_args(term, Term.select)) is not None:
+        return jax.lax.select_n_p.bind(*_aligned_explicit(*(value(operand) for operand in args)))
+    if (args := get_callable_args(term, Term.clamp)) is not None:
+        # A clamp binds as itself, its derivative JAX's own (zero at a bound, where a maximum and a
+        # minimum would halve it), keeping JAX's placement from its middle operand.
+        return jax.lax.clamp_p.bind(*jax_core.auto_insert_reshard(*(value(operand) for operand in args)))
     # Each other constructor's primitive parameters, by index, last after its operand and its other arguments.
     for constructor in (Term.unary, Term.convert, Term.shaped, Term.reduce):
         if (args := get_callable_args(term, constructor)) is not None:
@@ -1706,10 +1707,11 @@ def value_of(term: Term, value: Callable[[Term], jax.Array], region_: Region, le
 
 
 def _aligned_explicit(*operands: jax.Array) -> tuple[jax.Array, ...]:
-    """Align operands of a multi-input primitive (`select_n`, `clamp`): `auto_insert_reshard` plus resharding
-    any replicated operand (`explicit_spec is None`) onto the explicit placement shared by split siblings of
-    the same shape, which JAX's `select_n` requires under `AxisType.Explicit`."""
+    """Align operands of `select_n`: `auto_insert_reshard` plus resharding any replicated operand
+    (`explicit_spec is None`) onto the explicit placement shared by split siblings of the same shape, which
+    JAX's `select_n` requires under `AxisType.Explicit`."""
     from dew.nn.sharding import explicit_spec
+
     aligned = tuple(jax_core.auto_insert_reshard(*operands))
     specs = [explicit_spec(operand) if isinstance(operand, jax.Array) else None for operand in aligned]
     found = next(((spec, operand.shape) for operand, spec in zip(aligned, specs, strict=True)

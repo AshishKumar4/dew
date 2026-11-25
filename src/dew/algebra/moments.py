@@ -66,19 +66,27 @@ def weighted_covariance(x: jax.Array, y: jax.Array, w: jax.Array) -> tuple[jax.A
     return _weighted_cov_with_total(x, y, w)[:3]
 
 
-@functools.cache
-def declaration(kind: Literal["weighted", "masked", "covariance"], rank: int = 2) -> derive.Reduction:
-    """`derive.Reduction` for `kind` over `rank`-D arrays walked along their last axis."""
+def _reduction(kind: Literal["weighted", "masked", "covariance"], rank: int, *,
+               with_total: bool = False) -> derive.Reduction:
+    """Build one `derive.Reduction` for `kind` over `rank`-D arrays walked along their last axis, optionally
+    exposing total weight `n` as the final declared output (reusing the same reduction contract)."""
     axes = (*(f"d{i}" for i in range(rank - 1)), "walked")
     if kind == "weighted":
-        return derive.Reduction(weighted_moments, {"x": axes, "w": axes}, walked="walked",
-                                ranges={"w": (0.0, math.inf)})
+        fn = _weighted_moments_with_total if with_total else weighted_moments
+        return derive.Reduction(fn, {"x": axes, "w": axes}, walked="walked", ranges={"w": (0.0, math.inf)})
     if kind == "masked":
         return derive.Reduction(masked_moments, {"x": axes, "mask": axes}, walked="walked")
     if kind == "covariance":
-        return derive.Reduction(weighted_covariance, {"x": axes, "y": axes, "w": axes}, walked="walked",
+        fn = _weighted_cov_with_total if with_total else weighted_covariance
+        return derive.Reduction(fn, {"x": axes, "y": axes, "w": axes}, walked="walked",
                                 ranges={"w": (0.0, math.inf)})
     raise ValueError(f"unknown central-moment declaration kind: {kind!r}")
+
+
+@functools.cache
+def declaration(kind: Literal["weighted", "masked", "covariance"], rank: int = 2) -> derive.Reduction:
+    """`derive.Reduction` for `kind` over `rank`-D arrays walked along their last axis."""
+    return _reduction(kind, rank, with_total=False)
 
 
 @functools.cache
@@ -91,14 +99,7 @@ def derived(kind: Literal["weighted", "masked", "covariance"], rank: int = 2, *,
 @functools.cache
 def _derived_with_total(kind: Literal["weighted", "covariance"], rank: int = 2) -> Derived:
     """Derived forms exposing total weight `n` as the final declared output (no extra reduction slot)."""
-    axes = (*(f"d{i}" for i in range(rank - 1)), "walked")
-    if kind == "weighted":
-        red = derive.Reduction(_weighted_moments_with_total, {"x": axes, "w": axes}, walked="walked",
-                               ranges={"w": (0.0, math.inf)})
-    else:
-        red = derive.Reduction(_weighted_cov_with_total, {"x": axes, "y": axes, "w": axes}, walked="walked",
-                               ranges={"w": (0.0, math.inf)})
-    return derive.derive(red, accurate=False, saturation=SATURATION)
+    return derive.derive(_reduction(kind, rank, with_total=True), accurate=False, saturation=SATURATION)
 
 
 def _tiled(operands: dict[str, jax.Array], tile: int) -> dict[str, jax.Array]:

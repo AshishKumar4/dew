@@ -72,9 +72,12 @@ from dew.algebra.derive_moments import (
     inserts_axis,
     is_square,
     moment_anchor,
+    moment_scale,
     nonnegative,
     plain_local,
     positive_guard,
+    scale_slot,
+    scaled_second,
     unit_array,
     unreduced,
 )
@@ -450,6 +453,7 @@ def _shapes():
         rule(eq(extent).to(shape(x)), eq(y).to(x.merged())).then(set_(shape(y)).to(extent)),
         rule(eq(extent).to(shape(x)), eq(y).to(x.finished())).then(set_(shape(y)).to(extent)),
         rule(eq(extent).to(shape(x)), eq(y).to(moment_anchor(x))).then(set_(shape(y)).to(extent)),
+        rule(eq(extent).to(shape(x)), eq(y).to(moment_scale(x))).then(set_(shape(y)).to(extent)),
         rule(eq(w).to(x.compare(name, y, p)), eq(extent).to(shape(x)), eq(shape(y)).to(extent)).then(
             set_(shape(w)).to(extent)),
         rule(eq(extent).to(shape(y)), eq(w).to(x.select(y, z))).then(set_(shape(w)).to(extent)),
@@ -640,7 +644,7 @@ DECOUPLED_RESCALED = rules.Rules("decoupled rescaled", "reorders", _decoupled(re
 PLAIN = _plain()
 
 
-_READINGS = (Term.stepped, Term.merged, Term.finished, Term.held, moment_anchor, *MOMENT_SSA)
+_READINGS = (Term.stepped, Term.merged, Term.finished, Term.held, moment_anchor, moment_scale, *MOMENT_SSA)
 
 
 def _priced(region: terms.Region, schedule) -> DagCostModel[cost.Seconds]:
@@ -690,6 +694,8 @@ class _Forms:
     (`_floors`); None for every other."""
     anchors: tuple[Term, ...] = ()
     """First-moment reductions carrying a companion base-mean anchor slot (`moment_anchor`)."""
+    scales: tuple[Term, ...] = ()
+    """Central second-moment reductions carrying a companion zero-mass scale slot (`moment_scale`)."""
 
 
 def context() -> tuple:
@@ -744,8 +750,8 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
     def init(shapes):
         made = forms(shapes)
         avals = [jax.ShapeDtypeStruct(*shapes[name]) for name in names]
-        slot_terms = (*made.reductions, *made.anchors)
-        slot_floors = (*made.floors, *(None,) * len(made.anchors))
+        slot_terms = (*made.reductions, *made.anchors, *made.scales)
+        slot_floors = (*made.floors, *(0.0,) * len(made.anchors), *(1.0,) * len(made.scales))
         typed = jax.eval_shape(lambda *values: tuple(evaluated(made.region, reduction,
                                                                [*made.consts, *values], {})
                                                      for reduction in slot_terms), *avals)
@@ -818,7 +824,8 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
     def slots(shapes) -> tuple[tuple[str, tuple[int, ...]], ...]:
         made = forms(shapes)
         return (*((_role(reduction), made.region.shape(reduction)) for reduction in made.reductions),
-                *(("anchor", made.region.shape(term)) for term in made.anchors))
+                *(("anchor", made.region.shape(term)) for term in made.anchors),
+                *(("scale", made.region.shape(term)) for term in made.scales))
 
     return Derived(init, step, merge, finish, mapped,
                    {"rounding": "reorders", "walked": declaration.walked, "exponent": declaration.exponent,
@@ -863,7 +870,8 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
     found = [term for term, _ in region.shapes if _holds(graph, summed(term)) or _holds(graph, peaked(term))]
     reductions = tuple({terms.key(term): term for term in found}.values())
     anchors = tuple(term for term in reductions if _holds(graph, anchored_first(term)))
-    _register_reduction_slots(graph, region, reductions, anchors)
+    scales = tuple(term for term in reductions if _holds(graph, scaled_second(term)))
+    _register_reduction_slots(graph, region, reductions, anchors, scales)
     outputs = list(region.outputs)
     along = [term is not None and _walked(graph, term) for term in outputs]
     for term, is_along in zip(outputs, along, strict=True):
@@ -871,8 +879,10 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
             raise Refused("an output along the walked axis reads a walked reduction: no tile holds it")
     roots = ([reduction.stepped() for reduction in reductions]
              + [moment_anchor(term).stepped() for term in anchors]
+             + [moment_scale(term).stepped() for term in scales]
              + [reduction.merged() for reduction in reductions]
              + [moment_anchor(term).merged() for term in anchors]
+             + [moment_scale(term).merged() for term in scales]
              + [term.finished() for term, is_along in zip(outputs, along, strict=True)
                 if term is not None and not is_along])
     declared = Term.bundle(Vec[Term](*region.roots()))
@@ -921,8 +931,8 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
     report = program.AlgebraReport(region.equations, tuple(saturated.fired), saturated.fired,
                                    saturated.limits, saturated.iterations, program.node_count(graph),
                                    saturated.limited, before.value, after.value, time.perf_counter() - began)
-    extra_pad = (None,) * len(anchors)
-    count = len(reductions) + len(anchors)
+    extra_pad = (None,) * (len(anchors) + len(scales))
+    count = len(reductions) + len(anchors) + len(scales)
     steps, merges, finished = chosen[:count], chosen[count:2 * count], iter(chosen[2 * count:])
     finishes = tuple(None if term is None or is_along else next(finished)
                      for term, is_along in zip(outputs, along, strict=True))
@@ -936,7 +946,7 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
             raise Refused("a merge reads a walked operand: no tile is there to read")
     return _Forms(region, reductions, tuple(steps), tuple(merges), finishes, tuple(along), tuple(outputs),
                   walked_leaves, tuple(closed.consts), report, (*accumulated, *extra_pad),
-                  (*added, *extra_pad), (*merged, *extra_pad), floors, anchors)
+                  (*added, *extra_pad), (*merged, *extra_pad), floors, anchors, scales)
 
 
 def _decoupled_through(graph: EGraph, region: terms.Region, facts: Schedule, decoupled: rules.Rules) -> None:
@@ -951,8 +961,8 @@ def _decoupled_through(graph: EGraph, region: terms.Region, facts: Schedule, dec
 
 
 def _register_reduction_slots(graph: EGraph, region: terms.Region, reductions: tuple[Term, ...],
-                              anchors: tuple[Term, ...]) -> None:
-    """Assign state slots, companion anchor slots, retypes, state shapes, and broadcast layouts."""
+                              anchors: tuple[Term, ...], scales: tuple[Term, ...]) -> None:
+    """Assign state slots, companion anchor/scale slots, retypes, state shapes, and broadcast layouts."""
     anchored_keys = {terms.key(term) for term in anchors}
     for index, reduction in enumerate(reductions):
         graph.register(set_(slot(reduction)).to(i64(index)))
@@ -970,11 +980,18 @@ def _register_reduction_slots(graph: EGraph, region: terms.Region, reductions: t
         for side in (0, 1):
             graph.register(set_(rules.shape(Term.state(i64(a_index), i64(side)))).to(
                 Vec[i64](*(i64(size) for size in region.shape(term)))))
+    for offset, term in enumerate(scales):
+        s_index = len(reductions) + len(anchors) + offset
+        graph.register(set_(scale_slot(term)).to(i64(s_index)))
+        for side in (0, 1):
+            graph.register(set_(rules.shape(Term.state(i64(s_index), i64(side)))).to(
+                Vec[i64](*(i64(size) for size in region.shape(term)))))
     _lift(graph, region, reductions)
-    if anchors or any(_holds(graph, summed(reduction)) and not _holds(graph, local_of(reduction))
-                      and graph.lookup_function_value(anchored(reduction)) is None
-                      for reduction in reductions):
+    if anchors or scales or any(_holds(graph, summed(reduction)) and not _holds(graph, local_of(reduction))
+                                and graph.lookup_function_value(anchored(reduction)) is None
+                                for reduction in reductions):
         derive_moments.register_moment_resources(graph, region, reductions, walked)
+
 
 def _register_param_moves(graph: EGraph, region: terms.Region) -> None:
     """Register how each parameter in `region.params` moves, inserts, reduces, or contracts axes."""

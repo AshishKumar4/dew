@@ -1292,3 +1292,92 @@ def test_chunked_moments_balances_unequal_scales_value_gradients_and_explicit_sh
             ref_ms, ref_vs = moments.weighted_moments(xv, wv)
             np.testing.assert_array_equal(np.asarray(ms), np.asarray(ref_ms))
             np.testing.assert_array_equal(np.asarray(vs), np.asarray(ref_vs))
+
+
+def test_zero_mass_scaled_covariance_ad_and_clamp_explicit_sharding():
+    """Origin-anchored scaled zero-mass covariance (`moment_scale`) preserves exact direct `derive` JVP/VJP
+    without midpoint-shift overflow on orthogonal/mixed extreme tiles, and `Term.clamp` preserves JAX's
+    middle-operand placement under `AxisType.Explicit`."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec as P
+
+    from dew.algebra import moments, terms
+    from dew.nn.sharding import explicit_spec
+
+    forms_cov = derive.derive(moments.declaration("covariance"), accurate=False, saturation=SATURATION)
+
+    def direct_eval(x_, y_, w_, *, tile: int, mode: str):
+        shapes = dict.fromkeys(("x", "y", "w"), ((1, tile), jnp.float32))
+        ntiles = x_.shape[1] // tile
+        tiles = [{"x": x_[:, i * tile:(i + 1) * tile], "y": y_[:, i * tile:(i + 1) * tile],
+                  "w": w_[:, i * tile:(i + 1) * tile]} for i in range(ntiles)]
+        if mode == "walk":
+            state = forms_cov.init(shapes)
+            for part in tiles:
+                state = forms_cov.step(state, part)
+        else:
+            empty = forms_cov.init(shapes)
+            partials = [forms_cov.step(empty, part) for part in tiles]
+            state = partials[0]
+            for part in partials[1:]:
+                state = forms_cov.merge(state, part, shapes=shapes)
+        return forms_cov.finish(state, tiles[0], shapes=shapes)[2].sum()
+
+    # Orthogonal zero-mass witness: `x = [2^70, 0], y = [0, 2^70], w = [0, 0]` has zero exact derivative in
+    # both weight directions and both direct JVP and direct VJP at `tile=1` (step & merge) and `tile=2`.
+    big = np.float32(2.0 ** 70)
+    xo = jnp.asarray([[big, 0.0]], jnp.float32)
+    yo = jnp.asarray([[0.0, big]], jnp.float32)
+    wo = jnp.asarray([[0.0, 0.0]], jnp.float32)
+    for tile in (1, 2):
+        for mode in ("walk", "merge"):
+            def fn(w_, t=tile, m=mode):
+                return direct_eval(xo, yo, w_, tile=t, mode=m)
+
+            for dw_vals in ([1.0, 0.0], [0.0, 1.0]):
+                val, dval = jax.jvp(fn, (wo,), (jnp.asarray([dw_vals], jnp.float32),))
+                assert float(val) == 0.0 and float(dval) == 0.0
+            gw = jax.grad(fn)(wo)
+            np.testing.assert_array_equal(np.asarray(gw), np.zeros((1, 2), np.float32))
+            gx, gy = jax.grad(
+                lambda x_, y_, t=tile, m=mode: direct_eval(x_, y_, wo, tile=t, mode=m),
+                argnums=(0, 1))(xo, yo)
+            np.testing.assert_array_equal(np.asarray(gx), np.zeros((1, 2), np.float32))
+            np.testing.assert_array_equal(np.asarray(gy), np.zeros((1, 2), np.float32))
+
+    # Multi-tile zero-mass + positive-mass witnesses, finite scaled derivative, and `2^127` sign cancel.
+    huge = np.float32(2.0 ** 127)
+    for x_vals, y_vals, w_vals, dw_vals, expect in (
+        ([big, 0.0, big], [big, 0.0, big], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0], 0.0),
+        ([big, 0.0, 0.0], [big, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0], 0.0),
+        ([big, 0.0], [big, 0.0], [0.0, 1.0], [2.0 ** -70, 0.0], float(big)),
+        ([huge, huge], [huge, -huge], [0.0, 1.0], [1.0, 0.0], 0.0),
+    ):
+        xc = jnp.asarray([x_vals], jnp.float32)
+        yc = jnp.asarray([y_vals], jnp.float32)
+        wc = jnp.asarray([w_vals], jnp.float32)
+        dwc = jnp.asarray([dw_vals], jnp.float32)
+        for mode in ("walk", "merge"):
+            val, dval = jax.jvp(
+                lambda w_, x_=xc, y_=yc, m=mode: direct_eval(x_, y_, w_, tile=1, mode=m), (wc,), (dwc,))
+            assert float(val) == 0.0 and float(dval) == expect
+
+    # `Term.clamp` under `AxisType.Explicit` matches JAX's native `clamp` placement rather than copying a
+    # split bound's sharding onto a replicated middle operand.
+    lo_v = jnp.asarray([[0.0, 0.0], [0.0, 0.0]], jnp.float32)
+    mid_v = jnp.asarray([[-1.0, 2.0], [0.5, 4.0]], jnp.float32)
+    hi_v = jnp.asarray([[1.0, 1.0], [1.0, 1.0]], jnp.float32)
+    region = terms.Region(jax.make_jaxpr(jax.lax.clamp)(lo_v, mid_v, hi_v).jaxpr)
+    out_term = region.outputs[0]
+    assert out_term is not None
+    mesh = jax.make_mesh((1,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:1])
+    split = NamedSharding(mesh, P("data", None))
+    replicated = NamedSharding(mesh, P(None, None))
+    with jax.set_mesh(mesh):
+        lo_s = jax.device_put(lo_v, split)
+        mid_r = jax.device_put(mid_v, replicated)
+        hi_r = jax.device_put(hi_v, replicated)
+        ref_out = jax.jit(jax.lax.clamp)(lo_s, mid_r, hi_r)
+        got_out = jax.jit(lambda a, b, c: terms.evaluated(region, out_term, [a, b, c], {}))(
+            lo_s, mid_r, hi_r)
+        np.testing.assert_array_equal(np.asarray(got_out), np.asarray(ref_out))
+        assert explicit_spec(got_out) == explicit_spec(ref_out)
