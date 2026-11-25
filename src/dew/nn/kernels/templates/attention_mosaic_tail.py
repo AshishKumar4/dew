@@ -16,6 +16,7 @@ from jax.extend.mlir import ir
 WGMMA = plgpu.Layout.WGMMA
 """wgmma's accumulators' layout, a tile's registers' the body reads and writes."""
 
+
 @dataclasses.dataclass(frozen=True, eq=False)
 class SaturatedBf16:
     """`saturated_bf16`'s body: each register's pair of fp32 entries narrowed to bf16 by one
