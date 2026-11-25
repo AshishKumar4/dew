@@ -176,7 +176,7 @@ def test_a_primal_dense_bf16_xla_fallback_stores_bf16_as_xlas_own_dot_does():
     (`gemm_xla.direct_dtype`, row 12898): its cuBLAS product stores bfloat16, as XLA's own dense dot (Dense's)
     does, no fp32 temporary beside it; a product of one row, an explicit dot algorithm, and a contraction a
     mesh axis splits keep the fp32 product and its one rounding."""
-    from jax.sharding import Mesh, NamedSharding, PartitionSpec
+    from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec
 
     options = {"xla_gpu_enable_triton_gemm": False}
     x, w = jax.ShapeDtypeStruct((2048, 512), jnp.bfloat16), jax.ShapeDtypeStruct((512, 2048), jnp.bfloat16)
@@ -205,6 +205,12 @@ def test_a_primal_dense_bf16_xla_fallback_stores_bf16_as_xlas_own_dot_does():
     with generation.assumed("sm90"), generation.chosen(grouped_matmul="xla"), jax.set_mesh(mesh):
         compiled = jax.jit(product).lower(*split).compile(compiler_options=options)
     assert set(_cublas_dtypes(compiled)) == {"f32"}
+    # Two rows an explicit data axis splits: each device's product is one row's, a vector's, kept wide.
+    rows = Mesh(devices, ("data",), axis_types=(AxisType.Explicit,))
+    pair = (jax.ShapeDtypeStruct((2, 512), jnp.bfloat16, sharding=NamedSharding(rows, PartitionSpec("data"))),
+            jax.ShapeDtypeStruct(w.shape, w.dtype, sharding=NamedSharding(rows, PartitionSpec())))
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="xla"), jax.set_mesh(rows):
+        assert set(_dot_dtypes(jax.jit(product).trace(*pair).lower())) == {"f32"}
 
 
 def a_dense_bf16_products_tangent_sums_its_terms_before_rounding(product: str) -> None:

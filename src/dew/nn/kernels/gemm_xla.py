@@ -49,6 +49,22 @@ def _local_contraction(lhs, lhs_axis: int, rhs, rhs_axis: int) -> bool:
     return not any(mesh.shape[axis] > 1 for mesh in meshes for axis in mesh.auto_axes)
 
 
+def _local_extent(operand, contracted: int) -> int:
+    """The elements of `operand` along its axes but `contracted` each device holds: its extents over the
+    mesh axes an explicit placement splits each by (`explicit_spec`), as XLA's partitioner leaves the dot
+    each device runs."""
+    placed = explicit_spec(operand)
+    mesh = jax.typeof(operand).sharding.mesh
+    extent = 1
+    for axis, size in enumerate(operand.shape):
+        if axis == contracted:
+            continue
+        entry = None if placed is None or axis >= len(placed.spec) else placed.spec[axis]
+        names = () if entry is None else (entry,) if isinstance(entry, str) else tuple(entry)
+        extent *= size // math.prod(mesh.shape[name] for name in names)
+    return extent
+
+
 def direct_dtype(lhs, lhs_axis: int, rhs, rhs_axis: int, out_dtype, precision: PrecisionLike, wide):
     """Output dtype for a primal-only CUDA dense XLA dot (`xla_mainloop`, `_gemm_t`, row 12898): bfloat16
     directly, XLA's own dense bf16 dot (Dense's, the reference's arithmetic, owner 11-25), where both operands
@@ -56,13 +72,13 @@ def direct_dtype(lhs, lhs_axis: int, rhs, rhs_axis: int, out_dtype, precision: P
     algorithm (`_PLAIN_PRECISIONS`), and no partitioning the trace sees splits the contraction
     (`_local_contraction`): cuBLASLt then accumulates in fp32 and stores bf16, no fp32 temporary or trailing
     convert breaking a downstream reduction's fusion, with whatever the reference's own dot does past that (a
-    split only lowering applies, cuBLASLt's split-K reduction). A product of one row or column stays `wide`:
-    XLA reduces it as a vector, its products rounded to the dot's dtype before their sum. Every derivative's
-    tangent (`portable`) keeps the fp32 product and its one rounding; `wide` otherwise."""
+    split only lowering applies, cuBLASLt's split-K reduction). A product of one row or column a device
+    (`_local_extent`) stays `wide`: XLA reduces it as a vector, its products rounded to the dot's dtype
+    before their sum. Every derivative's tangent (`portable`) keeps the fp32 product and its one rounding;
+    `wide` otherwise."""
     if (jnp.dtype(lhs.dtype) == jnp.bfloat16 and jnp.dtype(rhs.dtype) == jnp.bfloat16
             and jnp.dtype(out_dtype) == jnp.bfloat16
-            and math.prod(lhs.shape[:lhs_axis] + lhs.shape[lhs_axis + 1:]) > 1
-            and math.prod(rhs.shape[:rhs_axis] + rhs.shape[rhs_axis + 1:]) > 1
+            and _local_extent(lhs, lhs_axis) > 1 and _local_extent(rhs, rhs_axis) > 1
             and precision_names(effective_precision(precision)) <= _PLAIN_PRECISIONS
             and _local_contraction(lhs, lhs_axis, rhs, rhs_axis)):
         return jnp.bfloat16

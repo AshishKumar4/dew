@@ -955,9 +955,10 @@ def test_producers_rungs_keeps_top_after_stated_cap_start():
 def test_a_refused_gathered_tile_still_offers_its_ladders_next_rung():
     """A gathered paired product on an H100 (an MoE gate/up, 512 tokens gathered to 1024 rows over two
     experts, its gated epilogue's three outputs) whose tile a compile refused spilling, and the first rungs of
-    its producer's ladder too (`producers.rungs`): the launch still offers a config, the ladder's next rung,
-    which its launch takes (train 1286, row 12972: every rung's modelled registers past the consumers'
-    budget, the rung certification held refused when the call took it, and the call Exhausted)."""
+    its producer's ladder too (`producers.rungs`), each modelled past its consumers' budget: the launch still
+    offers a config no compile refused and its launch takes, the tile refused where its ladder settles on a
+    rung it does not take (train 1286, row 12972: the refused tile offered again, its offer refused, the
+    call Exhausted)."""
     from dew.nn.activations import gated_hook, rounded_gated
     from dew.nn.kernels.templates import report
     from dew.nn.kernels.templates.gemm import producers

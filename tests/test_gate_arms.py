@@ -217,8 +217,7 @@ def test_a_written_twin_of_a_cublas_reference_keeps_its_compiler_options():
     compiles as written alone."""
     import generation_support
     from arm_arithmetic import as_written
-    from arm_forms import _written_twin, own_options, with_own_options
-    from arm_forms import _Paired
+    from arm_forms import _Paired, _written_twin, own_options, with_own_options
     from arm_store import _arm_compile
     from jax.sharding import NamedSharding, PartitionSpec
     from kernel_compile import _device
@@ -233,20 +232,31 @@ def test_a_written_twin_of_a_cublas_reference_keeps_its_compiler_options():
     reference = without_ynn(fp8_dot, compiler_options=generation_support.CUBLAS)
     twin = _written_twin(jax.jit(fp8_dot), reference)
     live = twin.without.wrapped if isinstance(twin, _Paired) else twin.wrapped
-    assert live.own_options == generation_support.CUBLAS
+    plain = _written_twin(jax.jit(fp8_dot), jax.jit(fp8_dot))
+    plain_live = plain.without.wrapped if isinstance(plain, _Paired) else plain.wrapped
     assert own_options(jax.jit(fp8_dot)) is None
 
     mesh = _device("sm90")
     placed = tuple(jax.ShapeDtypeStruct(each.shape, each.dtype, sharding=NamedSharding(mesh, PartitionSpec()))
                    for each in shapes)
 
-    def targets(fn) -> set[str]:
+    def targets(compiled) -> set[str]:
         with generation.assumed("sm90"), jax.set_mesh(mesh):
-            compiled = _arm_compile(jax.jit, as_written("gpu"))(fn, out_shardings=None)
             executable = compiled.trace(*placed).lower().compile()
         return {each.target for each in hlo_instructions(executable).values()} - {""}
 
-    assert targets(with_own_options(fp8_dot, generation_support.CUBLAS)) == {"__cublas$lt$matmul$f8"}
+    def held(fn):
+        return _arm_compile(jax.jit, as_written("gpu"))(fn, out_shardings=None)
+
+    with generation.assumed("sm90"), jax.set_mesh(mesh):
+        live_program, plain_program = live.program("gpu"), plain_live.program("gpu")
+    # The live twin's program and a prepare's held arm compile the reference's cuBLASLt FP8 product; the
+    # same arm of no options of its own takes XLA's own GEMM as written.
+    cublas = {"__cublas$lt$matmul$f8"}
+    # A held arm of its own, the plain one's function unregistered.
+    registered = with_own_options(lambda lhs, rhs: fp8_dot(lhs, rhs), generation_support.CUBLAS)
+    assert targets(live_program) == targets(held(registered)) == cublas
+    assert targets(plain_program) == targets(held(fp8_dot)) != cublas
 
 
 def test_an_arm_of_the_cpu_lanes_options_is_built_by_where_its_calls_are_placed():
