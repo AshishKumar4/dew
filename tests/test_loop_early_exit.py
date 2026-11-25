@@ -178,29 +178,85 @@ def _decoded(model, prompt: int):
     return run
 
 
+def _tokens_exiting(**loop) -> CausalTransformer:
+    """Qwen 3.5's tiny decoder looping its block [1, 3) three times before its coda, its gate on the
+    block's output exiting each token at its threshold, the loop's other fields as `loop` states."""
+    looped = _decoder("qwen35-tiny").with_passes(3, (1, 3), exit_gate=True, exit_threshold=0.6)
+    return looped.clone(loop=dataclasses.replace(looped.loop, exit_at="block", **loop))
+
+
 @attending("reference")
 @pytest.mark.parametrize(("bias", "site"), [(30.0, "first pass"), (-30.0, "last pass")])
-def test_a_shared_cache_decodes_each_row_at_its_exiting_pass(bias, site):
-    """The loop decoding under a cache its passes share (`Loop.shared_cache`), its gate on the block's
-    output and its rows exiting whole, a row's cache its exiting pass's writes (row 12928): a gate certain
-    to exit decodes what the decoder looping once does, and one that never exits what the loop running
-    every pass without a threshold does (check 1, each against its own in float64)."""
-    looped = _rows_exiting(shared_cache=True)
+def test_a_shared_cache_decodes_each_token_at_its_exiting_pass(bias, site):
+    """The loop decoding a token a call under a cache its passes share (`Loop.shared_cache`), its gate on
+    the block's output exiting each token, a row's cache its token's exiting pass's writes and the coda's
+    its one run's (row 12928): a gate certain to exit decodes what the decoder looping once does, and one
+    that never exits what the loop running every pass without a threshold does (check 1, each against its
+    own in float64)."""
+    looped = _tokens_exiting(shared_cache=True)
     reference = (looped.clone(loop=dataclasses.replace(looped.loop, steps=1)) if bias > 0
                  else looped.clone(loop=dataclasses.replace(looped.loop, exit_threshold=None)))
     draw = _gated(model_draw(looped, (2, 10), looped.vocab_size), looped.emb_features, 0xE93, bias=bias)
-    assert_as_exact(_decoded(looped, 6), _decoded(reference, 6), draw, f"decoding exiting at the {site}",
-                    seeds=SEEDS[site], truth_fn=_decoded(reference.clone(dtype=jnp.float64), 6))
+    assert_as_exact(_decoded(looped, 1), _decoded(reference, 1), draw, f"decoding exiting at the {site}",
+                    seeds=SEEDS[site], truth_fn=_decoded(reference.clone(dtype=jnp.float64), 1))
 
 
-def test_a_gate_on_the_block_exits_by_row():
-    """A gate on the block's output runs the coda once on its tokens' states, which a token's own exit
-    would make a causal prefix of mixed passes: refused, as a gate placement without a gate is."""
+@attending("reference")
+def test_a_tokens_exit_and_output_read_no_later_token():
+    """A loop exiting each token at its threshold, its gate on the block's output and its coda run once on
+    the tokens' chosen states: a row's tokens after `t` changed, its tokens up to `t` keep their exit
+    gates' logits, the passes they exit at and their logits, bit for bit (a causal LM's every token scores
+    its prefix alone)."""
+    looped = _tokens_exiting()
+    variables, ids = _gated(model_draw(looped, (2, 12), looped.vocab_size), looped.emb_features, 0xE96)(0)
+    changed = ids.at[:, 7:].set((ids[:, 7:] + 1) % looped.vocab_size)
+    run = jax.jit(looped.apply)
+    np.testing.assert_array_equal(np.asarray(run(variables, ids))[:, :7],
+                                  np.asarray(run(variables, changed))[:, :7])
+
+    def gates(tokens):
+        _, exits = looped.apply(variables, tokens, mutable=["exits"])
+        return [np.asarray(each)[:, :7] for each in exits["exits"]["logits"]]
+    for kept, moved in zip(gates(ids), gates(changed), strict=True):
+        np.testing.assert_array_equal(kept, moved)
+
+
+@attending("reference")
+def test_a_packed_documents_exit_and_output_read_no_neighbour():
+    """A row packing a second document after the first, under a loop exiting each token at its threshold:
+    the first document's logits stay as they are, bit for bit, whatever the second holds; a row's exit
+    (`exit_by='row'`) would pool its documents, and a packed call refuses it."""
+    looped = _tokens_exiting()
+    variables, ids = _gated(model_draw(looped, (2, 12), looped.vocab_size), looped.emb_features, 0xE97)(0)
+    segments = jnp.asarray([[1] * 7 + [2] * 5] * 2, jnp.int32)
+    neighbour = ids.at[:, 7:].set((ids[:, 7:] + 1) % looped.vocab_size)
+    packed = jax.jit(lambda v, tokens, s: looped.apply(v, tokens, segment_ids=s))
+    np.testing.assert_array_equal(np.asarray(packed(variables, ids, segments))[:, :7],
+                                  np.asarray(packed(variables, neighbour, segments))[:, :7])
+    rows = _rows_exiting()
     with pytest.raises(ValueError):
-        Loop(3, exit_gate=True, exit_at="block")
+        rows.apply(variables, ids, segment_ids=segments)
+
+
+def test_a_rows_exit_is_refused_where_a_token_is_scored_causally():
+    """A row's exit gate pools the row's tokens, its later ones deciding its earlier ones' passes: an LM
+    loss that reads each pass's exit refuses it, and so does decode (its row the tokens so far); a row's
+    gate without a gate, refused as any gate placement is."""
+    from dew.batch import TEXT_KEY
+    from dew.objectives.base import Step
+    from dew.objectives.lm import LMObjective
+
+    rows = _rows_exiting()
+    variables, ids = model_draw(rows, (2, 13), rows.vocab_size)(0)
+    objective = LMObjective(rows, 12, exit_entropy=0.25, token_accuracy=False)
+    step = Step(step=jnp.asarray(0), key=jax.random.key(0), ema=None)
+    with pytest.raises(ValueError):
+        objective.loss(variables, {TEXT_KEY: ids}, step)
+    made, decode = decode_steps(rows)
+    with pytest.raises(ValueError):
+        decode(variables, made(variables, 2), ids[:, :1])
     with pytest.raises(ValueError):
         Loop(3, exit_by="row")
-    Loop(3, exit_gate=True, exit_at="block", exit_by="row")
 
 
 def _sharing(steps: int) -> CausalTransformer:

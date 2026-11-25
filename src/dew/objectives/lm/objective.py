@@ -812,8 +812,12 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         pass weights that weigh a pass before the last (`PassWeights.over`)."""
         if not isinstance(model, Looped) or model.loop is None:
             return False
-        return self.exit_entropy is not None or (
+        reads = self.exit_entropy is not None or (
             self.pass_weights is not None and self.pass_weights.over(model.loop.steps) is not None)
+        if reads and model.loop.exit_by == "row":
+            raise ValueError("a row's exit pools its later tokens into its earlier tokens' passes, and an LM "
+                             "scores each token causally: exit by token (Loop.exit_by='token')")
+        return reads
 
     def _prediction_rows(self, model: CountedPredictions,
                           batch: Batch) -> list[tuple[np.ndarray, np.ndarray]]:

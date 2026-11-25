@@ -535,6 +535,14 @@ class _Passes:
         # its state (a collection) holds a row of each (`compacted`).
         self.compacts = (self.stops and not self.decode and loop.exit_by == "row"
                          and model.scope is not None and model.scope.mutable is False)
+        if loop.exit_gate and loop.exit_by == "row":
+            # A row's gate pools its tokens: whole-row scoring's (`Loop.exit_by`).
+            coordinates = (None if (metadata := self.inputs.get('attention_metadata')) is None
+                           else metadata.coordinates)
+            if self.decode or (coordinates is not None and coordinates.max_segments > 1):
+                raise ValueError("a row's exit gate pools the row's tokens, which in decode are the tokens "
+                                 "so far and in a packed row its documents': exit by token there "
+                                 "(Loop.exit_by='token')")
         # A threshold reading a gate on the block's output runs no pass's coda (`Loop.exit_at`).
         self.exit_outputs = loop.exiting and (model.is_mutable_collection(EXITS) or model.is_initializing()
                                               or (self.exit_states and not self.gates_block))
@@ -602,7 +610,8 @@ class _Passes:
         """Every later pass, the cut static: the passes before it scanned, the one it cuts, alone, and
         those after it scanned; under a shared cache the last after the scan, as the first runs. A loop
         that may stop at its threshold (`stops`) runs `stopping` instead."""
-        if self.stops:
+        if self.stops and (not self.decode or x.shape[1] == 1):
+            # A cached call of several tokens runs every pass (`Loop`'s doc).
             return self.stopping(x, bank)
         loop, shared = self.loop, self.shared
         # A coda reading the block's publications reads the last pass's, which it leaves traced unrolled, and

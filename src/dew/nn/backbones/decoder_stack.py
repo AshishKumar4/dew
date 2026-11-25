@@ -229,25 +229,25 @@ class Loop:
     (`'coda'`, Ouro's), or on the block's own output, normed as the stack's
     output is (`CausalTransformer.exit_states`: under attention residuals
     the depth state collapsed through the output site), so a threshold's
-    pass runs the coda once, on the states it selects (`'block'`); a loss
-    that weighs every pass still runs each pass's coda for its head. `exit_by`
-    pools it: each token's own hazard (`'token'`), or one a row, the gate of
-    the row's exit states' mean over its real tokens (`AttentionMetadata.valid`),
-    every token of the row exiting at its pass (`'row'`), which the exit
-    objective trains as it does a token's: each token weighs the passes by its
-    row's distribution, so training and a threshold read one distribution. A
-    gate on the block exits by row: a coda over a causal prefix of mixed
-    passes would compute what no pass does.
+    pass runs the coda once, on the states it selects (`'block'`), each
+    token's coda reading its prefix's own selected states; a loss that
+    weighs every pass still runs each pass's coda for its head. `exit_by`
+    pools it: each token's own hazard, causal (`'token'`), or one a row, the
+    gate of the row's exit states' mean over its real tokens
+    (`AttentionMetadata.valid`), every token of the row exiting at its pass
+    (`'row'`): whole-row scoring's (a decision's), whose later tokens decide
+    its earlier ones' passes, refused where a token is scored causally (an
+    LM's loss, `LMObjective`), in a packed row (its documents' tokens would
+    decide each other's) and in decode (its row is the tokens so far).
     Under `exit_threshold` scoring (no cache, no training) stops its passes
     once every real token has exited (`looping._Passes.stopping`), its output
     unchanged, and under `exit_by='row'` it runs each later pass over the rows
     still looping alone, gathered into a smaller batch (`looping.compacted`).
-    A cached call skips passes only under `shared_cache` and `exit_at='block'`,
-    each row's cache its exiting pass's writes (one token a call; a call of
-    several tokens exiting by token reads its tokens' passes in parallel,
-    which the decode it continues does not, and is refused); over per-pass
-    caches every pass runs, as a later token reading an earlier one's pass
-    would find nothing it skipped.
+    A cached call of one token a row skips passes only under `shared_cache`
+    and `exit_at='block'`, each row's cache its token's exiting pass's writes
+    and the coda's cache its one run's; a call of several tokens, and a loop
+    over per-pass caches, runs every pass, as a later token reading an
+    earlier one's pass would find nothing it skipped.
 
     `remat` checkpoints each pass of the block, the first included, with one
     Flax lifted checkpoint. Backpropagation keeps each pass's input and
@@ -387,10 +387,7 @@ class Loop:
         if (self.exit_at, self.exit_by) != ("coda", "token") and not self.exit_gate:
             raise ValueError(f"exit_at={self.exit_at!r} and exit_by={self.exit_by!r} place and pool the exit "
                              "gate, which the loop does not draw (exit_gate)")
-        if self.exit_at == "block" and self.exit_by == "token":
-            raise ValueError("a gate on the block's output runs the coda once on the states each token's own "
-                             "pass left, a causal prefix of mixed passes: exit_at='block' exits by row "
-                             "(exit_by='row')")
+
 
 
 @dataclasses.dataclass
