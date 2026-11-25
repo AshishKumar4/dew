@@ -842,14 +842,16 @@ def test_a_spilled_backward_takes_its_models_next_plan(target):
         jax.ShapeDtypeStruct((5120, 16), jnp.float32),
         *(jax.ShapeDtypeStruct((8, 2048, 16), jnp.bfloat16),) * 2, jax.ShapeDtypeStruct((5120,), jnp.float32))
     facts = generation.gpu_target(target)
-    plans = selective.backward_plans(facts)
+    # The model's order (`backward_plans`): 8 tokens at three programs and 16 at two each two steps a token's
+    # (2 p + 32) / (p programs), more programs first, then 4 at four's 2.5.
+    plans = [(8, 3), (16, 2), (4, 4)]
     with generation.assumed(facts):
         bound = selective.SELECTIVE.bind(*operands)
         identity = report._identity(selective.SELECTIVE, bound, facts)
         derived = selective.SELECTIVE.derived(bound, facts)
         assert (derived.positions, derived.resident) == plans[0]
         refused = [derived]
-        for plan in plans[1:3]:
+        for plan in plans[1:]:
             with report.refusals():
                 report.refuse([(identity, tiles, {'selective_scan_backward'}) for tiles in refused])
                 stepped = selective.SELECTIVE.derived(bound, facts)
