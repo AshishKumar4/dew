@@ -184,13 +184,16 @@ def test_a_padded_batch_scores_every_row_as_it_scores_alone(tokenizer):
     table = load_file(BACKBONE / "model.safetensors")["lm_head.weight"]
     rows = laid_out(tokenizer)
     inputs = DecisionInputs.collate([row for _, row in rows.values()], 0)
+    # Each batch's scores one compiled program: applied op by op, each of the head's operations compiles on
+    # its own (row 7232).
+    apply = jax.jit(loaded.model.apply)
     with np.load(TINY / "states.npz") as states:
         length = inputs.tokens.shape[1]
         padded = np.stack([np.pad(states[case], ((0, length - len(states[case])), (0, 0))) for case in rows])
-        batched = np.asarray(loaded.model.apply(loaded.variables, padded, inputs, table))
+        batched = np.asarray(apply(loaded.variables, padded, inputs, table))
         for index, (case, (_, row)) in enumerate(rows.items()):
-            alone = np.asarray(loaded.model.apply(loaded.variables, states[case][None],
-                                                 DecisionInputs.collate([row], 0), table))
+            alone = np.asarray(apply(loaded.variables, states[case][None], DecisionInputs.collate([row], 0),
+                                     table))
             for slot, laid in enumerate(row.questions):
                 width = len(laid.options)
                 np.testing.assert_allclose(batched[index, slot, :width], alone[0, slot, :width], atol=2e-5)
@@ -199,7 +202,7 @@ def test_a_padded_batch_scores_every_row_as_it_scores_alone(tokenizer):
         scores = loaded.model.apply(loaded.variables, padded, inputs, rows_of_table)
         return jax.numpy.sum(jax.numpy.where(jax.numpy.isfinite(scores), scores, 0.0))
 
-    gradient = np.asarray(jax.grad(total)(jax.numpy.asarray(table)))
+    gradient = np.asarray(jax.jit(jax.grad(total))(jax.numpy.asarray(table)))
     assert np.all(np.isfinite(gradient)) and np.any(gradient)
 
 
