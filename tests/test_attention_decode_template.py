@@ -1321,7 +1321,8 @@ def test_a_decode_step_with_output_hooks_compiles_spill_free(generation_name, st
     sm80/sm90/sm100/sm120 for both batched single-slice and one-row split-KV, with split-KV carrying
     `output_mod` directly on the `merged_padded` primitive; an H100's head and query gates too (whose one
     query a merge of one slice finishes). Each cell traces and compiles its own step alone (row 12697: a
-    cell traced every step and compiled the last loop's, the batched step never)."""
+    cell traced every step and compiled the last loop's, the batched step never), a split step certifying
+    no config of the one-slice launch it never runs."""
     from fla_gdn_support import KernelCase
     from jax.core import ShapedArray
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
@@ -1340,6 +1341,12 @@ def test_a_decode_step_with_output_hooks_compiles_spill_free(generation_name, st
             assert isinstance(padded, ShapedArray) and padded.shape[1] == 1
         found = compile_mosaic_kernels([KernelCase(step, lambda: (call, operands))], generation_name)
     assert found and not (failed := mosaic_failures(found)), "\n".join(failed)
+    if step == "split":
+        # A split plan certifies its split walks alone (`_split` the last of a walk kernel's suffixes, a
+        # scaled or natural one's too), no config of the one-slice launch it never runs.
+        walks = [name.split("__")[0] for record in found for certified in record.get("certifications", [])
+                 if certified["op"] == "MosaicForward" for name in certified["kernels"]]
+        assert walks and all(name.endswith("_split") for name in walks), walks
 
 
 def test_softcap_folds_into_base2_and_decode_segments_interior_tiles():
