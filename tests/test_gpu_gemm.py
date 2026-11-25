@@ -231,8 +231,7 @@ def _syrk_and_tail_cells():
              an_xla_fallbacks_dense_bf16_product_holds_check_1_against_xlas_own_dot, "sm90",
              fault=CUBLAS_BF16, native={"launch": "xla fallback", "pass": "forward"}),
         *(Cell(f"an XLA fallback's {product} tangent sums its terms before rounding",
-               functools.partial(
-                   declared_cells_memory.a_dense_bf16_products_tangent_sums_its_terms_before_rounding, product),
+               functools.partial(TANGENT_SUMS, product),
                "sm90", fault=CUBLAS_BF16,
                native={"launch": "xla fallback", "pass": f"{product} tangent"})
           for product in ("gemm", "gemm_t")),
@@ -256,6 +255,9 @@ SHARED = "a collective cp.async pipeline's meets, which the interpreter takes as
 
 CLUSTER = "a cluster's multicast of a shared block, which the interpreter loads whole in each program"
 """Why a pair of multiprocessors' cooperative tile stays on the GPU (the GEMM lane, 11-12)."""
+
+TANGENT_SUMS = declared_cells_memory.a_dense_bf16_products_tangent_sums_its_terms_before_rounding
+"""The tangent's cancellation check (tests/test_declared_cells_memory.py), run on CUDA's fallback."""
 
 CUBLAS_BF16 = "cuBLASLt's dense bf16 product stored in bf16, which no CPU dot computes"
 """Why the XLA fallback's direct bf16 product stays on the GPU (the GEMM lane, 11-25)."""
