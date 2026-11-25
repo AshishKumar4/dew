@@ -1224,24 +1224,42 @@ def test_an_integer_power_prices_as_its_multiplies_and_a_negative_ones_division(
     assert priced(lax.integer_pow_p, 1, y=-2) == multiply + divide
 
 
-@pytest.mark.parametrize("forms", [emission.ACCURATE_FORMS, emission.APPROXIMATE_FORMS],
-                         ids=["accurate", "approximate"])
-def test_a_kernels_erf_and_atan2_issue_their_polynomials(forms):
+@pytest.mark.parametrize("approx", [False, True], ids=["accurate", "approximate"])
+def test_a_kernels_erf_and_atan2_issue_their_polynomials(approx):
     """A Mosaic GPU kernel's fp32 erf issues the polynomial its PTX holds an element whatever `approx_math`
     (math.erf: one ex2.approx beside 21 fp32 instructions, its FMAs, selects and compares, and two integer
-    ones), and its atan2 of two operands a reciprocal's MUFU and a division's form beside 30 fp32
-    instructions and three integer ones (FS-ERF-FORMS1, sm90's PTX): never one operation an element, nor
-    unpriced (row 12426, whose fork patch lowers both at warpgroup semantics)."""
-    hopper = generation.gpu_target("sm90")
-    row = jax.ShapeDtypeStruct((128,), jnp.float32)
+    ones), and its atan2 a reciprocal's MUFU and a division's form beside 30 fp32 instructions and three
+    integer ones (FS-ERF-FORMS1, sm90's PTX), as a traced kernel's count reads them (`launch_work`): never
+    one operation an element, nor unpriced (row 12426, whose fork patch lowers both at warpgroup semantics).
+    A bfloat16 one is unmeasured: its erf one operation an element, its atan2 unpriced (the review of
+    lane/toolkit 8e40bc612)."""
+    def work(operation, dtype) -> Work:
+        row = jax.ShapeDtypeStruct((128,), dtype)
 
-    def priced(primitive, operands) -> Work:
-        return emission.operation_work(primitive, [row] * operands, [row], {}, hopper, forms=forms)
+        def body(rows, out, staged):
+            staged[...] = operation(rows[...])
+            out[...] = staged[...]
 
-    assert priced(lax.erf_p, 1) == Work(exponentials=128, operations=21 * 128, integer_operations=2 * 128)
-    atan2 = priced(lax.atan2_p, 2)
-    assert (atan2.exponentials, atan2.unpriced_operations) == (2 * 128, 0), atan2
-    assert atan2.operations == (30 + emission.MOSAIC_DIVISION.operations) * 128, atan2
+        launch = plgpu.kernel(body, out_type=row, num_threads=1, thread_name="wg",
+                              scratch_types=[plgpu.SMEM((128,), dtype)],
+                              compiler_params=plgpu.CompilerParams(approx_math=approx))
+        traced = jax.make_jaxpr(launch)(row).jaxpr
+        (kernel,) = [equation for equation in programs.equations(traced)
+                     if equation.primitive.name in ("mpmd_map", "pallas_call")]
+        return emission.launch_work(kernel, Stated(steps=0, bytes_accessed=0))
+
+    with generation.assumed("sm90"):
+        copied = work(lambda rows: rows, jnp.float32)
+        erf = work(lax.erf, jnp.float32)
+        atan2 = work(lambda rows: lax.atan2(rows, rows), jnp.float32)
+        narrow = {name: work(operation, jnp.bfloat16) for name, operation in (
+            ("copied", lambda rows: rows), ("erf", lax.erf), ("atan2", lambda rows: lax.atan2(rows, rows)))}
+    added = {unit: (getattr(erf, unit) - getattr(copied, unit), getattr(atan2, unit) - getattr(copied, unit))
+             for unit in ("exponentials", "operations", "integer_operations", "unpriced_operations")}
+    assert added == {"exponentials": (128, 2 * 128), "operations": (21 * 128, (30 + 7) * 128),
+                     "integer_operations": (2 * 128, 3 * 128), "unpriced_operations": (0, 0)}, added
+    assert narrow["erf"].operations - narrow["copied"].operations == 128, narrow
+    assert narrow["atan2"].unpriced_operations - narrow["copied"].unpriced_operations == 128, narrow
 
 
 def test_xlas_fp32_log_issues_more_than_its_division_and_its_exponential():
