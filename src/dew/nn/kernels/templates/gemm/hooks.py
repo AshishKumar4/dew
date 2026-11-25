@@ -7,6 +7,7 @@ from typing import NamedTuple, Protocol, runtime_checkable
 
 import jax
 import jax.extend.core as jax_core
+import jax.extend.linear_util as lu
 import jax.numpy as jnp
 import numpy as np
 from jax._src.pallas.mosaic import core as tpu_core, lowering as mosaic_tpu_lowering
@@ -191,8 +192,8 @@ def _entrywise(jaxpr, rows: int, columns: int) -> bool:
 
 def _rule(value) -> bool:
     """Whether an equation's parameter is a rule each trace builds its own of, from one source (a custom
-    derivative's `jvp_jaxpr_fun`: a wrapped function, compared by identity alone)."""
-    return callable(value) or hasattr(value, 'call_wrapped')
+    derivative's `jvp_jaxpr_fun`: a `linear_util.WrappedFun`, compared by identity alone)."""
+    return callable(value) or isinstance(value, lu.WrappedFun)
 
 
 def _same(first, second) -> bool:
