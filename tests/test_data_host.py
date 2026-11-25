@@ -102,20 +102,25 @@ def test_a_groups_cache_read_past_its_sampled_charge_leaves_no_more_than_its_lim
     assert Host.current(tmp_path, membership).memory == 2**20
 
 
-def test_a_cgroup_named_with_a_line_separator_is_read_as_named(tmp_path):
-    """Linux names a group as it was made, any character but '/' and a newline, and /proc/self/cgroup states
-    each hierarchy's line ending in a newline alone: a group whose name holds U+2028, which Python's
-    `splitlines` splits on, is the process's own group and its limit binds, where its line read as two failed
+@pytest.mark.parametrize("name", [b"batch\xe2\x80\xa8worker", b"batch\rworker", b"batch\xffworker"],
+                         ids=["line separator", "carriage return", "not utf-8"])
+def test_a_cgroup_named_with_a_line_separator_is_read_as_named(tmp_path, name):
+    """Linux names a group as it was made, any byte but '/' and a newline, and /proc/self/cgroup states each
+    hierarchy's line as those bytes ending in a newline alone: a group whose name holds U+2028, which
+    `str.splitlines` splits on, a carriage return, which a text read turns into a newline, or a byte no UTF-8
+    decodes, is the process's own group and its limit binds, where its line read as two, or not at all, failed
     loading's sizing outright (row 13056)."""
+    import os
+
     from dew import _cgroups
     from dew.data.dataset import Host
 
-    name = "batch\u2028worker"
     membership = tmp_path / "cgroup"
-    membership.write_text(f"0::/{name}\n")
-    (tmp_path / name).mkdir()
-    (tmp_path / name / "memory.max").write_text(f"{2**20}\n")
-    assert _cgroups.own(tmp_path, membership) == tmp_path / name
+    membership.write_bytes(b"0::/" + name + b"\n")
+    group = tmp_path / os.fsdecode(name)
+    group.mkdir()
+    (group / "memory.max").write_text(f"{2**20}\n")
+    assert _cgroups.own(tmp_path, membership) == group
     assert Host.current(tmp_path, membership).memory == 2**20
 
 
