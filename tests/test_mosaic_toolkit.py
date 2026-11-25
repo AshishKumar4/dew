@@ -2291,3 +2291,29 @@ def test_a_staged_outputs_launch_states_its_cost():
     [estimate] = [equation.params["cost_estimate"] for equation in equations(traced.jaxpr)
                   if "cost_estimate" in equation.params]
     assert (estimate.bytes_accessed, estimate.flops, estimate.transcendentals) == (stored, 0, 0)
+
+
+@pytest.mark.parametrize("family", [bundles.MmaFed(jnp.bfloat16), bundles.MmaProduced(jnp.bfloat16),
+                                    mosaic_sm80.Mma(jnp.bfloat16), "wgmma"],
+                         ids=["mma.sync fed", "mma.sync produced", "mma.sync on cp.async", "wgmma"])
+def test_a_staged_batch_is_fenced_for_asynchronous_product_readers_alone(family):
+    """A consumer's staged batch for products to read (`Family.staged_all`) takes the async proxy's fence
+    (`plgpu.commit_smem`) where its products read shared memory asynchronously (wgmma's), and none where
+    they read it through the warpgroup's own ldmatrix, mma.sync's on any movement: TMA rings its consumer
+    or a producer fills as on cp.async (a Kimi intra walk's three fences a step on a GH200, M-JS-272)."""
+    from jax._src.pallas.mosaic_gpu import primitives as gpu
+
+    from dew.nn.kernels.templates import mosaic_sm90
+
+    family = mosaic_sm90.WGMMA if family == "wgmma" else family
+
+    def body(out_ref, source, staging):
+        value = plgpu.load(source, layout=family.layout, optimized=False)
+        family.staged_all([(value, staging)])
+
+    tile = plgpu.SMEM((64, 64), jnp.bfloat16)
+    launch = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((1,), jnp.float32), num_threads=1,
+                          thread_name="wg", scratch_types=[tile, tile])
+    fences = [equation for equation in equations(jax.make_jaxpr(launch)().jaxpr)
+              if equation.primitive is gpu.commit_smem_p]
+    assert bool(fences) == (family is mosaic_sm90.WGMMA), fences
