@@ -52,7 +52,8 @@ environment it runs under. XLA reads a process's flags once, so tests that must 
 conftest runs the marked GPU tests and skips the others, as without it it skips the marked ones, so both
 processes select and cut a file alike and each test runs in one."""
 
-RECIPE = ("tools/armada/prepares.py", "tests/tier_wire.py", "tests/generation_support.py")
+RECIPE = ("tools/armada/prepares.py", "tests/tier_wire.py", "tests/generation_support.py",
+          "tools/armada/recycle.py")
 """What a dry prepare runs beside the tests it records (the topology's writer runs in a process of its own),
 which keys its rows besides every row's shared inputs (ci.py's `prepare_shared`)."""
 
@@ -186,15 +187,24 @@ def process(ci, python: str, file: str, group: str, verdict: Path, left: float, 
     # Of memory, a share of each limit binding it (`held_caps`), its end's the rest.
     cap = {wire.PREPARE_BY: repr(time.monotonic() + max(mine - CAP_MARGIN, mine / 2)) if capped else "",
            wire.PREPARE_HOLDS: held_caps(ci) if capped else ""}
+    # A dry prepare's tests run in as many processes as keep each under `RECYCLE_AT` (recycle.py).
     return ci.tested(python, [file], group, verdict, mine, cache, ci.session.GRACE, common,
                      {"JAX_PLATFORMS": "cpu", wire.PREPARE: "1", "OMP_NUM_THREADS": threads,
                       **(VARIANTS["users"][1] if users else {}), wire.UNIT: unit, **cap, **(environ or {})},
-                     recorded=recorded, variant=variant, kept=kept, judged=judged)
+                     recorded=recorded, variant=variant, kept=kept, judged=judged,
+                     recycle_at=RECYCLE_AT if capped else None)
 
 
 CAP_MARGIN = 240.0
 """What a dry prepare keeps of its time past its cap (`process`) for its process's end: the test or cell
 running at its cap, its programs' upload to the shared cache, its report."""
+
+
+RECYCLE_AT = 3 << 30
+"""The resident bytes past which a dry prepare's pytest ends between two tests, its task running the tests
+left in a fresh process (`process`, recycle.py): a process keeps what its tests compiled until it ends (a
+recurrence family 1-3.6 GB past every release), so a group of heavy families grew to its container's whole
+memory. Under `PREPARE_HOLDS`' 75% of a 10 GiB container, with room for one family's growth past it."""
 
 
 HELD_SHARE = 0.75

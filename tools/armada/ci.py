@@ -186,6 +186,7 @@ coverage_report = _loaded(HERE / "coverage_report.py")
 r2 = records.r2
 watched = _loaded(HERE / "watched.py")
 progress = _loaded(HERE / "progress.py")
+recycle = _loaded(HERE / "recycle.py")
 natives = _loaded(HERE / "natives.py")
 host, stalls, temp_roots = (_loaded(HERE / f"{name}.py") for name in ("host", "stalls", "temp_roots"))
 partition = _loaded(HERE / "partition.py")
@@ -1395,7 +1396,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
            common: str, environ: Mapping[str, str], coverage: Path | None = None,
            network: bool = False, kept: Mapping[str, tuple[str, str]] | None = None, recorded: bool = True,
            variant: str = "", judged: Callable[[list[dict]], list[dict]] | None = None,
-           written: list[set[str]] | None = None) -> int:
+           written: list[set[str]] | None = None, recycle_at: int | None = None) -> int:
     """`task` on the inputs `common` hashes, its pytest under `environ` beside this process's, a green row
     reused as the cache's policy (`policy`) allows. With `network`, the network-marked tests alone, with the
     Hub open, recorded on the network lane's class (`device_class`). A check-1
@@ -1428,19 +1429,47 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     recording = (recorded and coverage is None and not (environ and check1_wire().CENSUS in environ)
                  and not done_before)
     began_in = epochs_first(python, tests, group, common, network, ends, recording)
-    command = [*session.pytest_command(run, tests, split), *(["-p", "progress"] if resumes else [])]
+    # A dry prepare's pytest past `recycle_at` resident ends between two tests (recycle.py), and the tests
+    # left run in a fresh process: only a process's end returns what its tests compiled. Each such
+    # process's cases kept (`earlier`), the tests they reported set aside from the next (progress.py's
+    # SET_ASIDE).
+    recycled = out.with_name(f"{out.name}.recycled")
+    sets_aside = resumes or recycle_at is not None
+    command = [*session.pytest_command(run, tests, split), *(["-p", "progress"] if sets_aside else []),
+               *(["-p", "recycle"] if recycle_at is not None else [])]
+    earlier: list[ET.Element] = []
+    outputs: list[str] = []
     with temp_roots.temp_root() as root:
         environment = task_environment(environ, site, root, (log, collection, unrecorded, pid),
-                                       aside if resumes else None, group, network)
-        # What is left of the task's end, read once as its pytest starts (`unstarted` where none is).
-        if (left := ends - time.monotonic()) <= 0:
-            return unstarted(out, rows, python, tests, group)
-        returncode, output, expired, dump, opened, wrote, evidence = watched_pytest(
-            command, environment, left, grace, pid, python, evidence_name(python, tests, group), began)
+                                       aside if sets_aside else None, group, network)
+        if recycle_at is not None:
+            environment = {**environment, recycle.RECYCLE_AT: str(recycle_at),
+                           recycle.RECYCLED: str(recycled)}
+        while True:
+            recycled.unlink(missing_ok=True)
+            # What is left of the task's end, read once as its pytest starts (`unstarted` where none is).
+            if (left := ends - time.monotonic()) <= 0:
+                if not earlier:
+                    return unstarted(out, rows, python, tests, group)
+                # Its time spent before the tests left could start: they are the deadline's, its last
+                # process's report already among `earlier`.
+                report.unlink(missing_ok=True)
+                expired = True
+                break
+            returncode, output, expired, dump, opened, wrote, evidence = watched_pytest(
+                command, environment, left, grace, pid, python, evidence_name(python, tests, group), began)
+            if not recycled.is_file() or expired:
+                break
+            done, _ = reported_cases(report)
+            earlier += done
+            outputs.append(output)
+            aside.write_text(json.dumps(sorted({*done_before, *(grading.node_of(case) for case in earlier)})))
+    output = "\n".join([*outputs, output])
     # This attempt's peak, and an earlier attempt's where it ran tests this row carries (`progress.resumed`).
     peaks = [found for found in (progress.task_peak(host), peak_before) if found is not None]
     peak = max(peaks, default=None)
     cases, reported = reported_cases(report)
+    cases, reported = earlier + cases, reported or bool(earlier)
     # How collection found each file: a file with no row is green only where every test it holds was set aside
     # by the selection, as pytest reported it (executed.py); a run that wrote no report greens nothing.
     counts = read_json(collection) or {}

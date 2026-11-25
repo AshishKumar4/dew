@@ -57,6 +57,33 @@ def test_a_resumed_task_runs_whole_a_file_whose_process_ended_red_after_its_test
     assert rows == {"3.12:tests/test_crashing.py": 0, "3.12:tests/test_other.py": 0}
 
 
+@pytest.mark.parametrize("failing", [False, True])
+def test_a_dry_prepares_tests_past_its_recycle_bound_run_on_in_fresh_processes_as_one_row(ci, tmp_path,
+                                                                                         monkeypatch, failing):
+    """A dry prepare's pytest that holds more than its bound (`tested`'s `recycle_at`, recycle.py) ends after
+    the test running, and the tests left run in a fresh process, each test once, so what a process compiled
+    is returned at its end: here a bound every process passes, each test its own process. The row is one,
+    every test's case in it, and red where a test of any of its processes failed."""
+    middle = "    assert False\n" if failing else "    pass\n"
+    written(tmp_path, {"test_heavy.py": "import os\n"
+                                        "def ran():\n"
+                                        "    with open('pids', 'a') as pids:\n"
+                                        "        pids.write(f'{os.getpid()} ')\n"
+                                        "def test_a():\n    ran()\n"
+                                        f"def test_b():\n    ran()\n{middle}"
+                                        "def test_c():\n    ran()\n"})
+    interpreter(tmp_path, "3.12")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ARMADA_ARTIFACTS", str(tmp_path / "artifacts"))
+    out = tmp_path / "verdict.json"
+    ci.tested("3.12", ["tests/test_heavy.py"], "", out, 600.0, "off", 5.0, "", {}, recorded=False,
+              recycle_at=1)
+    [row] = json.loads(out.read_text())["rows"]
+    assert len(set((tmp_path / "pids").read_text().split())) == 3
+    assert sorted(row["tests"]) == [f"tests/test_heavy.py::test_{name}" for name in "abc"]
+    assert row["exitCode"] == (1 if failing else 0)
+
+
 def test_a_report_its_killed_pytest_cut_short_greens_nothing_and_the_tasks_other_files_are_graded(
         ci, tmp_path, monkeypatch):
     """A file whose pytest left its JUnit report and its collection's record cut short (killed as it wrote
