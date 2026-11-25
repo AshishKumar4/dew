@@ -936,6 +936,33 @@ def test_a_kernels_conversion_issues_as_its_assembler_lowers_it(source, target, 
                                    generation.gpu_target("sm90")) == unchanged
 
 
+def test_a_platform_choice_counts_the_branch_its_target_runs():
+    """A body choosing its work by the platform it lowers for (`lax.platform_dependent`) counts the branch the
+    priced target's platform takes, a CUDA GPU's `cuda` branch or else the default, never the most of the
+    branches: here CUDA's none and the default's two operations an element (the review of lane/toolkit
+    2da46a78b)."""
+    def chosen(row):
+        return lax.platform_dependent(row, cuda=lambda row: row, default=lambda row: row * 2.0 + 1.0)
+
+    with generation.assumed("sm90"):
+        fixed = _emitted(chosen, _ROW).roles[0].fixed
+    assert fixed.operations == 0, fixed
+
+
+def test_a_folded_scalars_cast_to_its_own_dtype_issues_nothing():
+    """A warpgroup's index (known to the count) cast to its own dtype, weak to strong, is folded and issues
+    nothing, as any cast to its own dtype, beside its cast to fp32's one conversion (the review of
+    lane/toolkit 0aaf87185)."""
+    def body(row):
+        index = lax.axis_index("wg")
+        cast = lax.convert_element_type_p.bind(index, new_dtype=jnp.dtype(jnp.int32), weak_type=True,
+                                               sharding=None)
+        return row + cast.astype(jnp.float32)
+
+    # Its cast to fp32 a conversion, its cast to its own dtype none.
+    assert [role.fixed.conversions for role in _emitted(body, _ROW).roles] == [1, 1]
+
+
 def test_a_correctly_rounded_division_prices_as_its_backend_lowers_it():
     """A correctly rounded fp32 division (`precision.correctly_rounded_divide`) prices as each backend lowers
     it (row 12886): in a Pallas Triton kernel, read from the launch's own compiler parameters (a
