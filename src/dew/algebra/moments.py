@@ -149,30 +149,27 @@ def _eval_derived(forms: Derived, tiled: dict[str, jax.Array], mode: Literal["wa
     return forms.finish(final, first, shapes=shapes)
 
 
-_MEAN_NUMERATOR = ((1.0, (("v", 0), ("v", 1))),)
-_MEAN_FORM = ratios.Ratio(
-    _MEAN_NUMERATOR, ((1.0, (("v", 1),)),), 0, reduced=True, units=windows.Units())
-_MEAN_ZERO = ratios.Ratio(_MEAN_NUMERATOR, (), 0, reduced=True, units=windows.Units())
+def _weighted_sum(*indices: int) -> ratios.Summed:
+    return ratios.Summed(((1.0, tuple(("v", index) for index in indices)),), reduced=True)
 
 
-def _weighted_sum(*values: int) -> ratios.Summed:
-    return ratios.Summed(((1.0, tuple(("v", index) for index in (*values, 2))),), reduced=True)
+_MEAN_FORM = ratios.Ratio(_weighted_sum(0, 1).terms, _weighted_sum(2).terms, 0,
+                         reduced=True, units=windows.Units())
 
 
-_MASS, _X, _Y, _XY = _weighted_sum(), _weighted_sum(0), _weighted_sum(1), _weighted_sum(0, 1)
-_COV_FORM = ratios.Ratio(
-    (), _MASS.terms, 0, reduced=True, units=windows.Units(), power=2,
-    products=((1.0, (_XY, _MASS)), (-1.0, (_X, _Y))),
-)
-"""Anchored covariance (sum(w cx cy) * sum(w) - sum(w cx) * sum(w cy)) / sum(w)**2.
-Differentiating the form keeps both residual means and their tangents unlanded until cancellation."""
+def _covariance_form(second: int, weight: int) -> ratios.Ratio:
+    """Covariance about a fixed anchor: P/D - R Sx Sy/D³, where P sums w cx cy, Sx and Sy sum the
+    weighted centers, D is the safe mass and R = 2D - sum(w). For positive mass R = D, so this is the
+    usual centered covariance; at zero mass D = 1 and this is the declaration's denominator-one polynomial.
+    One form holds both cases and all correction products until their sum lands."""
+    mass, correction = _weighted_sum(weight + 1), _weighted_sum(weight + 2)
+    joint, sx, sy = _weighted_sum(0, second, weight), _weighted_sum(0, weight), _weighted_sum(second, weight)
+    return ratios.Ratio((), mass.terms, 0, reduced=True, units=windows.Units(), power=3,
+                        products=((1.0, (joint, mass, mass)), (-1.0, (sx, sy, correction))))
 
-_COV_ZERO = ratios.Ratio(
-    (), (), 0, reduced=True, units=windows.Units(),
-    products=((1.0, (_XY,)), (-2.0, (_X, _Y)), (1.0, (_MASS, _X, _Y))),
-)
-"""Covariance when the denominator is fixed to one: sum(w (x - sum(w x)) (y - sum(w y))).
-Keep the weight-dependent terms even at zero mass: differentiating them gives the mixed derivatives."""
+
+_COV_FORM = _covariance_form(1, 2)
+_VAR_FORM = _covariance_form(0, 1)
 
 
 def _ratio_jvp_only(primals: Sequence[jax.Array], tangents: Sequence,
@@ -197,11 +194,6 @@ def _move_tangent(tangent, shape: tuple[int, ...]):
     return jnp.moveaxis(jnp.broadcast_to(tangent, shape), -1, 0)
 
 
-def _mask_tangent(mask: jax.Array, tangent):
-    """Zero a live tangent outside `mask`, leaving `SymbolicZero` intact."""
-    return tangent if isinstance(tangent, SymbolicZero) else jnp.where(mask, tangent, 0.0)
-
-
 def _streamed_tangents(
     x: jax.Array, y: jax.Array, w: jax.Array,
     dx, dy, dw,
@@ -217,13 +209,14 @@ def _streamed_tangents(
     dx0 = _move_tangent(dx, shape)
     dy0 = dx0 if same_xy else _move_tangent(dy, shape)
     dw0 = _move_tangent(dw, shape)
-    pos = n > 0
-    pos0 = pos[None]
-    unit0 = jnp.zeros((shape[-1],) + (1,) * (len(shape) - 1), w0.dtype).at[0].set(1.0)
-    w_pos = jnp.where(pos0, w0, unit0)
-    dx_pos, dy_pos, dw_pos = (_mask_tangent(pos0, t) for t in (dx0, dy0, dw0))
-    w_zero = jnp.where(pos0, 0.0, w0)
-    dx_zero, dy_zero, dw_zero = (_mask_tangent(~pos0, t) for t in (dx0, dy0, dw0))
+    pos = (n > 0)[None]
+    unit0 = (jnp.arange(shape[-1]) == 0).reshape((shape[-1],) + (1,) * (len(shape) - 1)).astype(w0.dtype)
+    safe = jnp.where(pos, w0, unit0)
+    # Form the two branches independently: computing 2D - T directly could overflow where D == T.
+    correction = jnp.where(pos, w0, 2 * unit0 - w0)
+    held = isinstance(dw0, SymbolicZero)
+    dsafe = dw0 if held else jnp.where(pos, dw0, 0.0)
+    dcorrection = dw0 if held else jnp.where(pos, dw0, -dw0)
 
     # A fixed anchor preserves translation invariance at every derivative order, without subtracting a
     # rounded mean tangent from each sample. A row that would overflow with this anchor uses zero instead.
@@ -232,24 +225,23 @@ def _streamed_tangents(
         shifted = vals0 - anchor
         return jnp.where(jnp.any(jnp.isinf(shifted), axis=0, keepdims=True), vals0, shifted)
 
-    def tangent(out: jax.Array, present: tuple, empty: tuple, positive: tuple, zero: tuple,
-                forms: tuple[ratios.Ratio, ratios.Ratio]):
-        moving = tuple(i for i, direction in enumerate(positive) if not isinstance(direction, SymbolicZero))
+    def tangent(out: jax.Array, primals: tuple, directions: tuple, form: ratios.Ratio):
+        moving = tuple(i for i, direction in enumerate(directions) if not isinstance(direction, SymbolicZero))
         if not moving:
             return SymbolicZero(jax.typeof(out).to_tangent_aval())
-        return jnp.where(pos, _ratio_jvp_only(present, positive, forms[0], moving),
-                         _ratio_jvp_only(empty, zero, forms[1], moving))
+        return _ratio_jvp_only(primals, directions, form, moving)
 
     cx0 = centered(x0, mu_x)
-    cy0 = cx0 if same_xy else centered(y0, mu_y)
-    mean = (_MEAN_FORM, _MEAN_ZERO)
-    d_mx = tangent(mu_x, (cx0, w_pos), (x0, w_zero), (dx_pos, dw_pos), (dx_zero, dw_zero), mean)
-    d_my = d_mx if same_xy else tangent(
-        mu_y, (cy0, w_pos), (y0, w_zero), (dy_pos, dw_pos), (dy_zero, dw_zero), mean)
-    d_cov = tangent(cov, (cx0, cy0, w_pos), (x0, y0, w_zero),
-                    (dx_pos, dy_pos, dw_pos), (dx_zero, dy_zero, dw_zero), (_COV_FORM, _COV_ZERO))
-    d_n_out = SymbolicZero(jax.typeof(n).to_tangent_aval()) if isinstance(dw0, SymbolicZero) else jnp.sum(
-        dw0, axis=0)
+    d_mx = tangent(mu_x, (cx0, w0, safe), (dx0, dw0, dsafe), _MEAN_FORM)
+    if same_xy:
+        d_my = d_mx
+        d_cov = tangent(cov, (cx0, w0, safe, correction), (dx0, dw0, dsafe, dcorrection), _VAR_FORM)
+    else:
+        cy0 = centered(y0, mu_y)
+        d_my = tangent(mu_y, (cy0, w0, safe), (dy0, dw0, dsafe), _MEAN_FORM)
+        d_cov = tangent(cov, (cx0, cy0, w0, safe, correction),
+                        (dx0, dy0, dw0, dsafe, dcorrection), _COV_FORM)
+    d_n_out = SymbolicZero(jax.typeof(n).to_tangent_aval()) if held else jnp.sum(dw0, axis=0)
     return d_mx, d_my, d_cov, d_n_out
 
 

@@ -170,7 +170,14 @@ def _products_summed(operands, form: Ratio):
     products = []
     for coefficient, sums in form.products:
         fraction, power = math.frexp(coefficient)
-        product = (jnp.asarray(2 * fraction, dtype), jnp.zeros((), dtype), jnp.asarray(power - 1, jnp.int32))
+        if sums and abs(fraction) == 0.5:
+            hi, lo, exponent = values[sums[0]]
+            sums = sums[1:]
+            if fraction < 0:
+                hi, lo = -hi, -lo
+            product = hi, lo, exponent if power == 1 else exponent + (power - 1)
+        else:
+            product = (jnp.asarray(2 * fraction, dtype), jnp.zeros((), dtype), jnp.asarray(power - 1, jnp.int32))
         for each in sums:
             product = _times(product, values[each])
         products.append(product)
