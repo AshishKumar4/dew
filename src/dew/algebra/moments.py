@@ -232,7 +232,8 @@ def _chunked_weighted_jvp(tile: int, mode: Literal["walk", "merge"], primals, ta
     x, w = primals
     dx, dw = tangents
     mean, var = _run_chunked_weighted(x, w, tile, mode)
-    n = _total_weight(jnp.broadcast_shapes(x.shape, w.shape), w, tile, mode)
+    shape = tuple(int(size) for size in jnp.broadcast_shapes(x.shape, w.shape))
+    n = _total_weight(shape, w, tile, mode)
     d_mean, _, d_var = _tiled_tangents(x, x, w, dx, dx, dw, mean, mean, var, n, tile, mode)
     return (mean, var), (d_mean, d_var)
 
@@ -251,7 +252,8 @@ def _chunked_cov_jvp(tile: int, mode: Literal["walk", "merge"], primals, tangent
     x, y, w = primals
     dx, dy, dw = tangents
     mean_x, mean_y, cov = _run_chunked_cov(x, y, w, tile, mode)
-    n = _total_weight(jnp.broadcast_shapes(x.shape, y.shape, w.shape), w, tile, mode)
+    shape = tuple(int(size) for size in jnp.broadcast_shapes(x.shape, y.shape, w.shape))
+    n = _total_weight(shape, w, tile, mode)
     d_mx, d_my, d_cov = _tiled_tangents(x, y, w, dx, dy, dw, mean_x, mean_y, cov, n, tile, mode)
     return (mean_x, mean_y, cov), (d_mx, d_my, d_cov)
 

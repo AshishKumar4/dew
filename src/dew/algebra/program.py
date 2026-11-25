@@ -477,7 +477,7 @@ def _windows(jaxpr: jcore.Jaxpr) -> list[tuple[jcore.Jaxpr, list[jcore.Var]]]:
     heads = [equation for equation in jaxpr.eqns if heads_window(equation)]
     if not heads:
         return []
-    rsqrts, reciprocals = _reuse_siblings(jaxpr, heads)
+    rsqrts, reciprocals, fma_readers = _reuse_siblings(jaxpr, heads)
     order = {id(equation): index for index, equation in enumerate(jaxpr.eqns)}
     live_clusters: list[dict[int, jcore.JaxprEqn] | None] = []
     owners: dict[int, set[int]] = {}
@@ -492,7 +492,7 @@ def _windows(jaxpr: jcore.Jaxpr) -> list[tuple[jcore.Jaxpr, list[jcore.Var]]]:
                     window[id(operand)] = operand
                     frontier.append((operand, depth + 1))
         if head.primitive is jax.lax.div_p:
-            _pull_reuse_siblings(head, maker, rsqrts, reciprocals, window)
+            _pull_reuse_siblings(head, maker, rsqrts, reciprocals, fma_readers, window)
         _merge_cluster(live_clusters, owners, capped, window)
     clusters = [cluster for cluster in live_clusters if cluster is not None]
     read: dict[jcore.Var, set[int]] = {}
@@ -592,18 +592,29 @@ def _is_unit_literal(atom) -> bool:
 
 def _reuse_siblings(
     jaxpr: jcore.Jaxpr, heads: Sequence[jcore.JaxprEqn],
-) -> tuple[dict[jcore.Var, list[jcore.JaxprEqn]], dict[jcore.Var, list[jcore.JaxprEqn]]]:
-    """Index sibling `rsqrt(v)` and `1 / y` equations in `jaxpr` when any window head is a division."""
+) -> tuple[dict[jcore.Var, list[jcore.JaxprEqn]], dict[jcore.Var, list[jcore.JaxprEqn]],
+           dict[jcore.Var, list[jcore.JaxprEqn]]]:
+    """Index sibling `rsqrt(v)`, `1 / y`, and immediate FMA-eligible `add`/`sub` consumers in `jaxpr`
+    when any window head is a division."""
     rsqrts: dict[jcore.Var, list[jcore.JaxprEqn]] = {}
     reciprocals: dict[jcore.Var, list[jcore.JaxprEqn]] = {}
-    if any(head.primitive is jax.lax.div_p for head in heads):
+    fma_readers: dict[jcore.Var, list[jcore.JaxprEqn]] = {}
+    div_outs = {head.outvars[0] for head in heads if head.primitive is jax.lax.div_p}
+    if div_outs:
         for equation in jaxpr.eqns:
             if equation.primitive is jax.lax.rsqrt_p and isinstance(equation.invars[0], jcore.Var):
                 rsqrts.setdefault(equation.invars[0], []).append(equation)
             elif (equation.primitive is jax.lax.div_p and isinstance(equation.invars[1], jcore.Var)
                   and _is_unit_literal(equation.invars[0])):
                 reciprocals.setdefault(equation.invars[1], []).append(equation)
-    return rsqrts, reciprocals
+            elif equation.primitive is jax.lax.add_p:
+                for atom in equation.invars:
+                    if isinstance(atom, jcore.Var) and atom in div_outs:
+                        fma_readers.setdefault(atom, []).append(equation)
+            elif (equation.primitive is jax.lax.sub_p and isinstance(equation.invars[0], jcore.Var)
+                  and equation.invars[0] in div_outs):
+                fma_readers.setdefault(equation.invars[0], []).append(equation)
+    return rsqrts, reciprocals, fma_readers
 
 
 _REUSE_MAKERS = (jax.lax.max_p, jax.lax.add_p, jax.lax.reduce_sum_p)
@@ -612,10 +623,11 @@ _REUSE_MAKERS = (jax.lax.max_p, jax.lax.add_p, jax.lax.reduce_sum_p)
 def _pull_reuse_siblings(head: jcore.JaxprEqn, maker: Callable,
                          rsqrts: Mapping[jcore.Var, Sequence[jcore.JaxprEqn]],
                          reciprocals: Mapping[jcore.Var, Sequence[jcore.JaxprEqn]],
+                         fma_readers: Mapping[jcore.Var, Sequence[jcore.JaxprEqn]],
                          window: dict[int, jcore.JaxprEqn]) -> None:
     """Pull sibling `rsqrt(v)` and `1 / y` equations sharing a division head's radicand or divisor (directly
-    or through chained `broadcast_in_dim`s), along with the connecting chain equations beyond `WINDOW`, into
-    `window` up to `CLUSTER`."""
+    or through chained `broadcast_in_dim`s), connecting chain equations beyond `WINDOW`, and any immediate
+    FMA-eligible `add`/`sub` consumer of a matched division head into `window` up to `CLUSTER`."""
     divisor = head.invars[1]
     if not isinstance(divisor, jcore.Var):
         return
@@ -644,16 +656,21 @@ def _pull_reuse_siblings(head: jcore.JaxprEqn, maker: Callable,
             if id(eq_item) not in window and len(window) < CLUSTER:
                 window[id(eq_item)] = eq_item
 
+    matched = False
     for rad, needed in rad_chain:
         siblings = rsqrts.get(rad, ())
         if siblings:
+            matched = True
             _add((*needed, *siblings))
     for div_var, needed in div_chain:
         siblings = reciprocals.get(div_var, ())
         if siblings:
+            matched = True
             div_maker = maker(div_var)
             extra = (div_maker,) if div_maker is not None and div_maker.primitive in _REUSE_MAKERS else ()
             _add((*needed, *extra, *siblings))
+    if matched:
+        _add(fma_readers.get(head.outvars[0], ()))
 
 
 def _region(closed: jcore.Jaxpr, *, accurate: bool, saturation: Saturation,
