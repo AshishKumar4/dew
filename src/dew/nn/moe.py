@@ -857,7 +857,7 @@ def gated_experts(x: jax.Array | Gathered, gate: jax.Array | Layered, up: jax.Ar
     with _named(implementation):
         # A packed bank's matrices are its codes, of no product's shape a launch reads (`None`).
         fused = paired is not None and fuses_grouped(
-            jax.ShapeDtypeStruct((_dispatched(x), gate_stack.shape[-2]), compute),
+            jax.ShapeDtypeStruct((_sorted_rows(x), gate_stack.shape[-2]), compute),
             None if packed else (jax.ShapeDtypeStruct(gate_stack.shape, compute),
                                  jax.ShapeDtypeStruct(down_stack.shape, compute)),
             precision, hook, paired=down_layer is paired[-1],
@@ -913,7 +913,7 @@ def _paired_call(paired: tuple, group_sizes: jax.Array, compute: Dtype, implemen
     return tuple(_computed(output, compute) for output in outputs)
 
 
-def _dispatched(x: jax.Array | Gathered) -> int:
+def _sorted_rows(x: jax.Array | Gathered) -> int:
     """The expert-sorted rows `x` holds: a gathered read's rows, else its own."""
     return x.rows.shape[0] if isinstance(x, Gathered) else x.shape[0]
 
