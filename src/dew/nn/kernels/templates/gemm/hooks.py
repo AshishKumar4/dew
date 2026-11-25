@@ -189,6 +189,12 @@ def _entrywise(jaxpr, rows: int, columns: int) -> bool:
     return True
 
 
+def _rule(value) -> bool:
+    """Whether an equation's parameter is a rule each trace builds its own of, from one source (a custom
+    derivative's `jvp_jaxpr_fun`: a wrapped function, compared by identity alone)."""
+    return callable(value) or hasattr(value, 'call_wrapped')
+
+
 def _same(first, second) -> bool:
     """Whether two traces of one hook at two extents compute alike: equation for equation the same
     primitive, the same parameters but the extents they state (`SHAPE_PARAMS`), nested ones alike, the same
@@ -207,8 +213,7 @@ def _same(first, second) -> bool:
                 if not all(_same(a, b) for a, b in zip(inner, jax_core.jaxprs_in_params({name: twin}),
                                                        strict=True)):
                     return False
-            elif value != twin and not (callable(value) and callable(twin)):
-                # A rule's callables (a custom derivative's) are each trace's own, of one source.
+            elif value != twin and not (_rule(value) and _rule(twin)):
                 return False
         for a, b in zip(one.invars, other.invars, strict=True):
             literal = isinstance(a, jax_core.Literal)
