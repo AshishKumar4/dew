@@ -36,6 +36,7 @@ from dew.nn.kernels.generation import INHERENT, Choice, device_generation, gpu_t
 from dew.nn.kernels.selection import Kernel, Op, Requirement, select, selected
 from dew.nn.kernels.templates.gemm import wide
 from dew.nn.kernels.templates.gemm.hooks import hook_lowers
+from dew.nn.kernels.templates.hooks import Hook, Side
 from dew.nn.residuals import RECOMPUTED, Residual
 from dew.nn.sharding import automatic_axes, on_shards
 

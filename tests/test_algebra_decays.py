@@ -377,3 +377,17 @@ def test_a_per_key_paired_faint_product_keeps_value_and_gradient_within_and_acro
     assert float(out_faint[0, 1, 0, 0]) == -1.0
     dk_faint = jax.jit(jax.grad(lambda k_: run("xla", q, k_, v, r)[0, 1, 0, 0].astype(jnp.float32)))(k)
     assert float(dk_faint[0, 0, 0, 0]) == float(np.float32(-(2.0 ** 100)))
+
+
+def test_a_balanced_pair_keeps_a_normal_factor_after_decay():
+    from dew.nn.kernels.recurrence_algebra import SUB
+
+    left, right = (np.zeros((SUB + 2, 2), np.float32) for _ in range(2))
+    left[SUB:, 0] = [2.0 ** -80, 2.0 ** 80]
+    right[:2, 0] = [2.0 ** -20, 2.0 ** 120]
+    between = np.zeros((SUB + 2, SUB + 2, 2), np.float32)
+    between[SUB:, SUB - 1, 0] = 1.0
+    between[SUB - 1:, 0, 0] = 2.0 ** -106
+    between[SUB - 1:, 1, 0] = 1.0
+    found = scan._paired(jnp.asarray(left), jnp.asarray(right), jnp.asarray(between))
+    assert float(found[SUB + 1, 0]) == 2.0 ** -46

@@ -1164,24 +1164,26 @@ def _paired(left, right, between, issue: Callable | None = None, role: str = "sc
     return jnp.where(active, _factored(left, right, between, joined, issue, role, back=back), 0.0)
 
 
-def _channel_shift(left_blk: jax.Array, right_blk: jax.Array) -> jax.Array:
-    """Safe per-channel power-of-two shift `s` (`int32`, stopped for AD) balancing `left_blk * 2^-s` and
-    `right_blk * 2^+s` without overflowing or underflowing any finite nonzero entry of either block."""
-    limits = jnp.finfo(left_blk.dtype)
+def _channel_shift(left: jax.Array, right: jax.Array, left_decay: jax.Array, right_decay: jax.Array) -> jax.Array:
+    """Balance the dot's per-channel factors without pushing a live entry past either range limit,
+    both before and after its reference decay. A pair of floor exponents bounds their product below."""
+    limits = jnp.finfo(left.dtype)
     minexp, maxexp = int(limits.minexp), int(limits.maxexp - 1)
     cap = min(-minexp, maxexp)
 
-    def bounds(block: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+    def bounds(block: jax.Array, decay: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
         plain = jax.lax.stop_gradient(block)
-        _, biased, fraction, _, exp = float_bits.float_bits(plain)
-        exp32 = exp.astype(jnp.int32)
-        finite_nz = jnp.isfinite(plain) & ((biased != 0) | (fraction != 0))
-        return (jnp.any(finite_nz, axis=0),
-                jnp.min(jnp.where(finite_nz, exp32, jnp.int32(maxexp)), axis=0),
-                jnp.max(jnp.where(finite_nz, exp32, jnp.int32(minexp)), axis=0))
+        _, exponent, fraction, _, binade = float_bits.float_bits(plain)
+        _, decay_exp, decay_fraction, _, decay_binade = float_bits.float_bits(jax.lax.stop_gradient(decay))
+        live = jnp.isfinite(plain) & ((exponent != 0) | (fraction != 0))
+        decayed = live & ((decay_exp != 0) | (decay_fraction != 0))
+        binade = binade.astype(jnp.int32)
+        floor = jnp.minimum(jnp.where(live, binade, maxexp),
+                            jnp.where(decayed, binade + decay_binade.astype(jnp.int32), maxexp))
+        return jnp.any(live, axis=0), jnp.min(floor, axis=0), jnp.max(jnp.where(live, binade, minexp), axis=0)
 
-    has_l, min_l, max_l = bounds(left_blk)
-    has_r, min_r, max_r = bounds(right_blk)
+    has_l, min_l, max_l = bounds(left, left_decay)
+    has_r, min_r, max_r = bounds(right, right_decay)
     s_lo = jnp.maximum(jnp.int32(-cap), jnp.maximum(max_l - maxexp, minexp - min_r))
     s_hi = jnp.minimum(jnp.int32(cap), jnp.minimum(min_l - minexp, maxexp - max_r))
     s_raw = ((min_l + max_l) - (min_r + max_r)) // 4
@@ -1224,11 +1226,11 @@ def _factored(left, right, between, joined, issue: Callable, role: str, *, back:
             else:
                 reference = first - 1
                 left_blk, right_blk = left[own].astype(work), right[keys].astype(work)
-                shift = _channel_shift(left_blk, right_blk)
+                left_decay, right_decay = between[own, reference], between[reference + back, keys]
+                shift = _channel_shift(left_blk, right_blk, left_decay, right_decay)
                 left_scaled = left_blk * float_bits.exact_power2(-shift, work)[None, :]
                 right_scaled = right_blk * float_bits.exact_power2(shift, work)[None, :]
-                blocks.append(issue(role, left_scaled * between[own, reference],
-                                    (right_scaled * between[reference + back, keys]).T))
+                blocks.append(issue(role, left_scaled * left_decay, (right_scaled * right_decay).T))
         rows.append(jnp.concatenate(blocks, axis=1))
     return jnp.concatenate(rows, axis=0)
 

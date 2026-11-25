@@ -97,7 +97,8 @@ def _priced(primitive, params, shapes: list[tuple[int, ...]], made: tuple[int, .
     """Price the traced widths, without borrowing the synthetic vector dtype as evidence of fp32 work."""
     out_dt = VALUE if dtype is None else dtype
     known = (None,) * len(shapes) if in_dtypes is None else in_dtypes
-    inputs = [jax.ShapeDtypeStruct(s, out_dt if dt is None else dt) for s, dt in zip(shapes, known, strict=True)]
+    inputs = [jax.ShapeDtypeStruct(s, out_dt if dt is None else dt)
+              for s, dt in zip(shapes, known, strict=True)]
     return _operation_work(primitive, inputs, [jax.ShapeDtypeStruct(made, out_dt)], params, on,
                            fp32=dtype == VALUE)
 
