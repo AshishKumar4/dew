@@ -137,20 +137,23 @@ def a_fused_projection_trains_its_producer_and_epilogue():
 
 def native_hopper_cluster2_balanced_tail_holds_check_1():
     """Native Hopper `cluster=2` dense forward with a verified nonempty balanced `Tail` holds check 1
-    against XLA dot_general from float64 truth at Qwen3.5-4B q dX outlier shape (row 10151)."""
+    against XLA dot_general from float64 truth (row 10151), at a 128 x 128 tile whose partials' workspace
+    the reference's holds on the GPU's whole wave (`GpuTarget.reference_workspace`; a 128 x 256 tile's over
+    a GH200's 132 multiprocessors, 33 MiB, is past it, row 12850): 2048 x 8192 by 1280, 80 super-tiles a
+    wave and a part."""
     from dew.nn.kernels import gemm, grouped_matmul, tuning
     from dew.nn.kernels.templates.gemm import tiling
-    tile = tiling.Tiles(128, 256, 64, 4, 8, warpgroups=2, cluster=2, family="wgmma")
+    tile = tiling.Tiles(128, 128, 64, 4, 8, warpgroups=2, cluster=2, family="wgmma")
     target = generation.gpu_target()
     launch = grouped_matmul.MosaicGmm()
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
-    ba = launch.bind(bf16((2048, 8192)), bf16((1, 8192, 2560)), jax.ShapeDtypeStruct((1,), jnp.int32),
+    ba = launch.bind(bf16((2048, 8192)), bf16((1, 8192, 1280)), jax.ShapeDtypeStruct((1,), jnp.int32),
                      out_dtype="bfloat16", trans_rhs=False, interpret=False, dense=True)
     assert launch.legal(ba, tile, target) and launch._tail(ba, tile, target)[1] is not None
     def draw(seed):
         rng = np.random.default_rng(10151 + seed)
         return ((rng.normal(size=(2048, 8192)) / np.sqrt(8192)).astype(jnp.bfloat16),
-                (rng.normal(size=(8192, 2560)) / np.sqrt(8192)).astype(jnp.bfloat16))
+                (rng.normal(size=(8192, 1280)) / np.sqrt(8192)).astype(jnp.bfloat16))
 
     def dew_fn(x, w):
         with generation.chosen(grouped_matmul="mosaic"), tuning.pinned({grouped_matmul.MosaicGmm: tile}):
@@ -159,7 +162,7 @@ def native_hopper_cluster2_balanced_tail_holds_check_1():
     def plain(x, w, *, wide=jnp.float32, out=jnp.bfloat16):
         return jax.lax.dot(x.astype(wide), w.astype(wide), preferred_element_type=wide).astype(out)
 
-    assert_as_exact(jax.jit(dew_fn), jax.jit(plain), draw, "hopper cluster=2 balanced tail 2048x8192x2560",
+    assert_as_exact(jax.jit(dew_fn), jax.jit(plain), draw, "hopper cluster=2 balanced tail 2048x8192x1280",
                     seeds=8, truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
 
 def _syrk_and_tail_cells():
@@ -466,6 +469,9 @@ def test_an_adapted_products_backward_keeps_a_narrow_presets_fp32_products_wide(
 
     preset = jax.lax.DotAlgorithmPreset.F16_F16_F32
     x = np.zeros((8, 16), np.float16)
+    # Every arm computed before any is checked: a GPU tier's prepare computes nothing, so a check between
+    # them stops it before the next arm (row 12871).
+    gradients = []
     for kernel_entry, a_entry, scale, out_dtype, cotangent in (
             (2.0 ** -10, 0.0, 1.0, np.float32, 2.0 ** 16), (0.0, 2.0 ** -10, 2.0 ** 16, np.float16, 1.0)):
         kernel = np.full((16, 8), kernel_entry, np.float16)
@@ -481,6 +487,7 @@ def test_an_adapted_products_backward_keeps_a_narrow_presets_fp32_products_wide(
             return pull(dy)[0]
 
         label = f"an adapted product's rows gradient into {np.dtype(out_dtype)}"
-        d_x = ahead_arm(jax.jit(rows_gradient), label)(x, kernel, a, b, dy)
+        gradients.append((scale, out_dtype, ahead_arm(jax.jit(rows_gradient), label)(x, kernel, a, b, dy)))
+    for scale, out_dtype, d_x in gradients:
         assert np.all(np.isfinite(np.asarray(d_x, np.float32))), (out_dtype, d_x[0])
         assert np.asarray(d_x[0, 0], np.float32) == 64.0 * (4.0 if scale > 1 else 1.0), (out_dtype, d_x[0])

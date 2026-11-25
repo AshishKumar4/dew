@@ -170,8 +170,9 @@ def a_joined_layers_training_step_is_on_par(case: tuple[str, ...]) -> None:
         # whose device computes nothing, reaches the site with nothing computed (row 10990).
         # Initialized by XLA's products: a draw runs on the host's CPU and its own kernels
         # (`arm_arithmetic.ahead_on_the_host`), where the template the cell names refuses the call
-        # (row 12378).
-        with generation.chosen(grouped_matmul="xla"):
+        # (row 12378); its routes its own, none of the step's the cell reads (row 12868: a GH200's qkv
+        # cells read the init's XLA products as the step's).
+        with generation.chosen(grouped_matmul="xla"), generation.routes(alone=True):
             params = layer.init(jax.random.key(4), jnp.zeros((*ROWS, FEATURES), dtype))
         if combination["join"] in ("gate_up", "qkv"):
             params = jax.tree.map(lambda leaf: leaf + 0.1 * jax.random.normal(jax.random.key(6), leaf.shape),

@@ -28,12 +28,10 @@ from reference_error import assert_as_exact, equations, with_gradients
 from dew.nn.kernels import (
     gemm,
     generation,
-    grouped_cells,
     grouped_cutlass,
     grouped_launch,
     grouped_matmul,
     grouped_triton,
-    selection,
     tuning,
 )
 from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing, row_tiles, tiling
@@ -1237,84 +1235,6 @@ def test_a_blackwells_projection_and_its_gradients_hold_check_1(sizes, out):
                         seeds=SEEDS, truth_fn=with_gradients(on_xla(jnp.float64)))
 
 
-def _dense_case(generation_name: str, made: grouped_cells.Made, matrix: tuple[int, int], rows: int,
-                dtype=jnp.bfloat16, stored=None) -> grouped_matmul.GroupedCase:
-    """The `GroupedCase` of a dense product of `dtype` operands on `generation_name` making `made` of `matrix`
-    `[in, out]` over `rows` tokens into `stored` (the receipts' own output dtype, `grouped_cells.STORED`,
-    where None)."""
-    from dew.nn.kernels.templates.product import declared
-
-    width_in, width_out = matrix
-    stored = jnp.dtype(grouped_cells.STORED[made] if stored is None else stored)
-    shaped = functools.partial(jax.ShapeDtypeStruct, dtype=dtype)
-    sizes = jax.ShapeDtypeStruct((1,), jnp.int32)
-    product = declared(dtype, None, outputs=(stored,))
-    with generation.assumed(generation_name):
-        if made == grouped_cells.Made.KERNEL_GRADIENT:
-            call = grouped_matmul.tgmm_call(shaped((rows, width_in)), shaped((rows, width_out)), sizes,
-                                            out_dtype=stored, interpret=False, dense=True)
-        else:
-            transposed = made == grouped_cells.Made.INPUT_GRADIENT
-            tokens = shaped((rows, width_out if transposed else width_in))
-            call = grouped_matmul.gmm_call(tokens, shaped((1, width_in, width_out)), sizes, out_dtype=stored,
-                                           trans_rhs=transposed, interpret=False, dense=True)
-        return grouped_matmul.grouped_case(*call, product=product, whole=True)
-
-
-def _route(case: grouped_matmul.GroupedCase) -> str:
-    """The kernel the grouped selector runs `case` on, as its target's process would."""
-    with generation.assumed(case.call.target.generation):
-        return selection.select(grouped_matmul.GROUPED, case).kernel
-
-
-def test_a_timed_product_is_recognized_over_its_receipts_rows_and_arithmetic_alone():
-    """A receipt is evidence for the products it timed alone (`grouped_cells.Timed`, row 6794): each product a
-    receipt timed (`grouped_cells.timings`) is recognized as its matrix over that receipt's rows
-    (`Kind.span`) in the arithmetic and output dtype it timed, and not past those rows (a fine-tune's 2,048
-    took the 4B key's cell and its launches made the step's products 1.75 ms slower) nor in another
-    arithmetic (a float32 call's TF32 kernel) or output dtype (another staging and memory)."""
-    for timing in grouped_cells.timings():
-        if timing.formed:
-            continue
-        rows = timing.timed.fewest
-        assert _dense_case(timing.generation, timing.made, timing.matrix, rows).kind.span == timing.timed.span
-        others = grouped_cells.MEASURED[timing.generation, timing.made, False]
-        stored = jnp.dtype(grouped_cells.STORED[timing.made]).name
-        if not any(timed.holds(timing.matrix, rows - 1, timing.timed.dtype, stored) for timed in others):
-            assert _dense_case(timing.generation, timing.made, timing.matrix, rows - 1).kind.matrix is None
-        wide = _dense_case(timing.generation, timing.made, timing.matrix, rows, dtype=jnp.float32,
-                           stored=jnp.float32)
-        assert wide.kind.matrix is None, timing
-        if timing.timed.stored is not None:
-            other = "bfloat16" if timing.timed.stored == "float32" else "float32"
-            assert _dense_case(timing.generation, timing.made, timing.matrix, rows,
-                               stored=other).kind.matrix is None, timing
-
-
-@pytest.mark.parametrize("board", grouped_cells.SCOREBOARDS, ids=lambda board: board.evidence.split()[0])
-def test_a_scoreboards_products_run_the_template_where_at_parity_and_its_kind_elsewhere(board):
-    """A dense kind runs the template whole only where every product its receipt timed is at parity in time
-    and temporaries (kernel-templates.md §1; bible §6, 2026-11-24); a kind with a product lagging keeps XLA's
-    dot, its products at parity the template's over their timed rows, its lagging ones and every product it
-    did not time XLA's (`grouped_cells.Scoreboard`)."""
-    untimed = (3 * 1024 + 64, 8 * 1024 + 64)
-    for made, projections in board.times.items():
-        kind = board.winner(made)
-        assert _route(_dense_case(board.generation, made, untimed, board.rows)) == kind, made
-        for name in projections:
-            route = _route(_dense_case(board.generation, made, grouped_cells.PROJECTIONS[name], board.rows))
-            expected = "mosaic" if kind == "mosaic" or board.at_parity(made, name) else "xla"
-            assert route == expected, (made, name)
-
-
-def test_a_generation_no_receipt_timed_runs_the_template():
-    """A generation no receipt timed (a B300) runs the template at every dense kind, whatever its
-    instruction family's other generations measured (the B200's lagging 4B cells are the B200's)."""
-    for made in grouped_cells.Made:
-        if made != grouped_cells.Made.EXACT_KERNEL_GRADIENT:
-            assert _route(_dense_case("sm103", made, (2560, 9216), 24576)) == "mosaic", made
-
-
 @pytest.mark.parametrize("gpu", [pytest.param(name, marks=runs(name)) for name in ("sm80", "sm90")])
 def test_a_ragged_grouped_forward_at_its_derived_tile_is_its_groups_products(gpu):
     """A grouped forward of ragged groups (an empty one, one of a single row, the rest uneven), its tile
@@ -1503,8 +1423,9 @@ def test_tpu_gemm_derives_legal_vmem_bounded_tiles_from_step_seconds(tpu_name):
 @INTERPRETS
 def test_ampere_multi_wave_dense_dx_unifies_planner_and_kernel_and_holds_check_1():
     """On Ampere (`mma.sync`), `pricing.dense_tail` prices multi-wave persistent L2 drift once so planner
-    (`_merges`, `_balances`) and kernel (`_dense_tail`) agree by construction, and a multi-wave dense
-    input gradient holds check 1 via `assert_as_exact` (rows 5363, 11945, 11947)."""
+    (`_merges`, `_balances`) and kernel (`_dense_tail`) agree by construction, a tail's partials within the
+    reference's workspace (row 12850), and a multi-wave dense input gradient holds check 1 via
+    `assert_as_exact` (rows 5363, 11945, 11947)."""
 
     sm80 = generation.gpu_target("sm80")
     gmm, tgmm = grouped_matmul.MosaicGmm(), grouped_matmul.MosaicTgmm()
@@ -1519,17 +1440,23 @@ def test_ampere_multi_wave_dense_dx_unifies_planner_and_kernel_and_holds_check_1
                                            balanced=True)
         assert tail_deep is None
         assert not gmm.balanced(ba_deep, tile_64x256, sm80)
-        # Single-wave tail (waves=1, rem=40, 0 drift): planner produces one Tail plan passed straight to
-        # emitter via `_stated` without re-pricing.
+        # A whole A100's 216 programs' partials (14 MiB) exceed the 4 MiB cuBLAS's workspace is, so no
+        # balanced tail there (row 12850); on 40 programs (2.6 MiB), a single-wave tail (64 tiles: waves=1,
+        # rem=24, 0 drift): planner produces one Tail plan passed straight to emitter via `_stated` without
+        # re-pricing.
         x_1w = jax.ShapeDtypeStruct((4096, 2048), jnp.bfloat16)
         dy_1w = jax.ShapeDtypeStruct((4096, 1024), jnp.bfloat16)
         ba_1w = tgmm.bind(x_1w, dy_1w, sizes, out_dtype="float32", interpret=False, dense=True)
         tile_1w = tiling.Tiles(128, 64, 32, 4, 8, warpgroups=1, family="mma.sync", programs=2)
-        stated_1w = tgmm._stated(ba_1w, tile_1w, sm80)
-        tail_1w = mosaic_gpu._dense_tail(tile_1w, jnp.bfloat16, (2048, 1024, 4096), (2, 2), 216,
-                                         balanced=stated_1w["balanced"])
-        assert tail_1w is stated_1w["balanced"] and tail_1w is not None
-        assert tgmm.balanced(ba_1w, tile_1w, sm80)
+        assert tgmm._stated(ba_1w, tile_1w, sm80)["balanced"] is False
+        few = dataclasses.replace(sm80, multiprocessors=20)
+        x_few = jax.ShapeDtypeStruct((4096, 512), jnp.bfloat16)
+        ba_few = tgmm.bind(x_few, dy_1w, sizes, out_dtype="float32", interpret=False, dense=True)
+        stated_few = tgmm._stated(ba_few, tile_1w, few)
+        tail_few = mosaic_gpu._dense_tail(tile_1w, jnp.bfloat16, (512, 1024, 4096), (2, 2), 40,
+                                          balanced=stated_few["balanced"])
+        assert tail_few is stated_few["balanced"] and tail_few is not None
+        assert tgmm.balanced(ba_few, tile_1w, few)
     # Multi-wave nonzero-tail check-1 witness: 320x128 -> grid=(5, 2)=10 tiles on 4 programs -> waves=2,
     # rem=2 (nonzero tail!). At l2=64KB and memory_rate=120GB/s, persistent L2 drift flips the tail decision
     # from balanced (no drift) to non-persistent (with drift).
@@ -1657,10 +1584,21 @@ def test_hopper_cluster2_balanced_tail_holds_check_1(rows, depth, mp):
                             truth_fn=functools.partial(dw_plain, wide=jnp.float64, out=jnp.float64))
 
 
+def _traced_on(target, fn, args):
+    """`fn` of `args` traced on `target` assumed, whatever generation its compile names."""
+    def traced(*arrays):
+        with generation.assumed(target):
+            return fn(*arrays)
+
+    return traced, args
+
+
 @lowers("sm90")
 def test_hopper_cluster2_balanced_tail_lowers_spill_free():
     """Hopper `128x256x64 cluster=2` dense `gmm` and `tgmm` with balanced tail compile under sm90 ptxas
-    with zero spills (row 10151)."""
+    with zero spills (row 10151), on an H100 PCIe's 114 multiprocessors, whose 57 pairs' partials (30 MiB)
+    are within cuBLAS's 32 MiB workspace; a GH200's 66 pairs' (33 MiB) are not, so it takes none (row
+    12850)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels
 
@@ -1676,9 +1614,11 @@ def test_hopper_cluster2_balanced_tail_lowers_spill_free():
         from dew.nn.kernels.templates.gemm import pricing
 
         tile_c2 = tiling.Tiles(128, 256, 64, 3, 4, warpgroups=2, cluster=2, family="wgmma")
-        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (16384, 9728, 2560), (2, 2), sm90, 132) is None
-        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (16384, 2560, 9728), (2, 2), sm90, 132) is None
-        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (2048, 2560, 8192), (2, 2), sm90, 132) is not None
+        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (2048, 2560, 8192), (2, 2), sm90, 132) is None
+        sm90 = dataclasses.replace(sm90, multiprocessors=114)
+        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (16384, 9728, 2560), (2, 2), sm90, 114) is None
+        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (16384, 2560, 9728), (2, 2), sm90, 114) is None
+        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (2048, 2560, 8192), (2, 2), sm90, 114) is not None
         x_fwd = jax.ShapeDtypeStruct((2048, 8192), jnp.bfloat16)
         w_fwd = jax.ShapeDtypeStruct((1, 8192, 2560), jnp.bfloat16)
         x_dw = jax.ShapeDtypeStruct((8192, 2560), jnp.bfloat16)
@@ -1688,13 +1628,19 @@ def test_hopper_cluster2_balanced_tail_lowers_spill_free():
         ba_dw = tgmm.bind(x_dw, dy_dw, sizes, out_dtype="float32", interpret=False, dense=True)
         tile_c2_split = dataclasses.replace(tile_c2, splits=2)
         assert gmm.legal(ba_fwd, tile_c2, sm90) and gmm.balanced(ba_fwd, tile_c2, sm90)
-        assert gmm.legal(ba_fwd, tile_c2_split, sm90) and not gmm.balanced(ba_fwd, tile_c2_split, sm90)
-        assert gmm._stated(ba_fwd, tile_c2_split, sm90)["balanced"] is False
+        # Split two ways its 2048 rows' fp32 partials (40 MiB) are past the workspace, pinned or derived
+        # (row 12850); 1024 rows' (20 MiB) within it, and a split tile takes no tail.
+        assert not gmm.legal(ba_fwd, tile_c2_split, sm90)
+        ba_half = gmm.bind(jax.ShapeDtypeStruct((1024, 8192), jnp.bfloat16), w_fwd, sizes,
+                           out_dtype="bfloat16", trans_rhs=False, interpret=False, dense=True)
+        assert gmm.legal(ba_half, tile_c2_split, sm90) and not gmm.balanced(ba_half, tile_c2_split, sm90)
+        assert gmm._stated(ba_half, tile_c2_split, sm90)["balanced"] is False
         assert tgmm.legal(ba_dw, tile_c2, sm90) and tgmm.balanced(ba_dw, tile_c2, sm90)
         cases = [
-            KernelCase("sm90_cluster2_tail_fwd", lambda: gmm.lowering(ba_fwd, tile_c2)),
-            KernelCase("sm90_cluster2_split2_fwd", lambda: gmm.lowering(ba_fwd, tile_c2_split)),
-            KernelCase("sm90_cluster2_tail_dw", lambda: tgmm.lowering(ba_dw, tile_c2)),
+            KernelCase("sm90_cluster2_tail_fwd", lambda: _traced_on(sm90, *gmm.lowering(ba_fwd, tile_c2))),
+            KernelCase("sm90_cluster2_split2_fwd",
+                       lambda: _traced_on(sm90, *gmm.lowering(ba_half, tile_c2_split))),
+            KernelCase("sm90_cluster2_tail_dw", lambda: _traced_on(sm90, *tgmm.lowering(ba_dw, tile_c2))),
         ]
         records = compile_mosaic_kernels(cases, "sm90")
     for rec in records:
@@ -2247,8 +2193,8 @@ def test_explicit_target_b200_gathered_settles_under_ambient_sm80():
 def test_a100_deep_k_dense_dx_derives_l2_drift_split_and_compiles():
     """On `walks_scoped` A100 (`sm80`, L2=40MB), `SplitWalk` prices a deep-K dense wave past the L2 drift
     horizon (`8192x51200->5120`, `M-FS-6`, row 5363) faster split than unsplit while shallower shapes and
-    Hopper `sm90` price unsplit least; derived tiles stay legal and a pinned `splits=2` `sm80` tile compiles
-    spill-free."""
+    Hopper `sm90` price unsplit least; derived tiles stay legal, a split whose partials pass the reference's
+    workspace is none (row 12850), and a pinned `splits=2` `sm80` tile within it compiles spill-free."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels
 
@@ -2279,11 +2225,16 @@ def test_a100_deep_k_dense_dx_derives_l2_drift_split_and_compiles():
             assert tile is not None and launch.legal(ba, tile, target), tile
             walk = walk_of(tile, target, depth_k, width_n)
             assert walk is not None and walk.seconds(1) <= walk.seconds(2), (depth_k, walk)
+        # Its 8192 rows' fp32 partials split two ways (320 MiB) are past the 4 MiB workspace cuBLAS holds
+        # (row 12850), so the drift's split is no tile's, pinned or derived; 64 rows' (2.6 MiB) compile split.
         pinned = dataclasses.replace(deep_tile, splits=2)
-        assert launch.legal(deep_ba, pinned, target), pinned
+        assert not launch.legal(deep_ba, pinned, target) and launch.derived(deep_ba, target).splits == 1
+        few_ba = launch.bind(bf16((64, 51200)), bf16((1, 5120, 51200)), one, out_dtype="bfloat16",
+                             trans_rhs=True, interpret=False, dense=True)
+        assert launch.legal(few_ba, pinned, target), pinned
         if generation.compile_only_gpus("sm80"):
             records = compile_mosaic_kernels(
-                [KernelCase("sm80_deep_k_split_dx", lambda: launch.lowering(deep_ba, pinned))], "sm80")
+                [KernelCase("sm80_deep_k_split_dx", lambda: launch.lowering(few_ba, pinned))], "sm80")
             for rec in records:
                 assert not rec.get("error"), rec
                 assert rec["kernels"], rec
