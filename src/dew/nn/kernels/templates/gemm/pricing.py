@@ -162,7 +162,21 @@ def dense_tail(tiles: "Tiles", dtype, extents: tuple[int, int, int], itemsizes: 
     waves, rem = divmod(grid[0] * grid[1], pairs)
     if tiles.cluster > 1 and (waves > 1 or rem > pairs // 2):
         return None
+    # Its partials' workspace is the launch's beside its operands and output, no more than the reference's
+    # (`GpuTarget.reference_workspace`): a GH200's 128 x 256 tiles' over 132 programs, 33 MiB, held past
+    # cuBLAS's 32 (M-NG-45b's 34.6 MB temporaries a cell, row 12850).
+    bound = target.reference_workspace
+    shape = tail_workspace(tiles, programs, tiles.warpgroups, (tiles.share, tile_columns(tiles, family)))
+    if bound is not None and math.prod(shape) * 4 > bound:
+        return None
     return balanced_tail(tiles, grid, -(-k // tiles.block_k), itemsizes, target, programs, dtype=dtype)
+
+
+def tail_workspace(tiles: "Tiles", programs: int, consumers: int, part: tuple[int, int]) -> tuple[int, ...]:
+    """A balanced tail's fp32 partials' shape (`mosaic_gpu._workspace`): each of a launch's `programs`
+    (cluster pairs of `tiles.cluster`), two tiles' (the one its range starts inside and the one it walks the
+    first step of), each consumer's `part` of the tile (its rows by the tile's columns)."""
+    return (tiles.cluster, programs // tiles.cluster, 2, consumers, *part)
 
 
 def handoff_steps(tiles: "Tiles", target, itemsizes: tuple[int, int]) -> float:
@@ -188,12 +202,15 @@ def split_count(tiles: "Tiles", *, groups: int, rows: int, depth: int, width: in
 
 
 def best_splits(walk: "SplitWalk | None", stages: int) -> int:
-    """The split count `walk` prices least among whole-step shares keeping at least `stages + 1` steps."""
+    """The split count `walk` prices least among whole-step shares keeping at least `stages + 1` steps whose
+    partials the launch holds within the reference's workspace (`SplitWalk.holds`: an A100's 2048 x 2048
+    kernel gradient at 4,096 rows split two ways held 32 MiB of fp32 partials where cuBLAS holds 4, a
+    four-layer step's peak 80 MiB against XLA's 64, row 12850)."""
     if walk is None:
         return 1
     steps = walk.steps
     counts = sorted({-(-steps // -(-steps // count)) for count in range(1, steps // (stages + 1) + 1)})
-    return min([1, *counts], key=walk.seconds)
+    return min([1, *filter(walk.holds, counts)], key=walk.seconds)
 
 
 def epilogue_registers(family: mosaic.Family, share: int, columns: int, stored: tuple, *,
@@ -306,6 +323,16 @@ class SplitWalk:
     stored: float
     drift_horizon: float = 0.0
     drift_extra: float = 0.0
+    partial_bytes: float = 0.0
+    """One slice's fp32 partials of the output, which a split launch holds `splits` of until their sum."""
+    workspace: float | None = None
+    """The most a launch holds beside its operands and output (`GpuTarget.reference_workspace`), which a
+    split's partials stay within (`best_splits`); None where the target states none."""
+
+    def holds(self, splits: int) -> bool:
+        """Whether `splits` slices' partials stay within the reference's workspace (`workspace`): one
+        slice holds none, its tile summed in registers."""
+        return splits == 1 or self.workspace is None or splits * self.partial_bytes <= self.workspace
 
     def walk(self, splits: int) -> float:
         """The busiest program's walk at `splits` slices a tile, in steps: its waves' share of every tile's
@@ -385,7 +412,8 @@ def split_walk(tiles: "Tiles", *, groups: int, rows: int, depth: int, width: int
                      held * width * 4 / bandwidth / step_seconds,
                      0.0 if launch_seconds is None else launch_seconds / step_seconds,
                      held * width * stored / bandwidth / step_seconds,
-                     drift_horizon, drift_extra)
+                     drift_horizon, drift_extra, held * width * 4.0,
+                     None if target is None else target.reference_workspace)
 
 
 def decode_contraction(tiles: "Tiles", target, *, rows: int, groups: int, depth: int, width: int,

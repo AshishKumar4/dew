@@ -1503,8 +1503,9 @@ def test_tpu_gemm_derives_legal_vmem_bounded_tiles_from_step_seconds(tpu_name):
 @INTERPRETS
 def test_ampere_multi_wave_dense_dx_unifies_planner_and_kernel_and_holds_check_1():
     """On Ampere (`mma.sync`), `pricing.dense_tail` prices multi-wave persistent L2 drift once so planner
-    (`_merges`, `_balances`) and kernel (`_dense_tail`) agree by construction, and a multi-wave dense
-    input gradient holds check 1 via `assert_as_exact` (rows 5363, 11945, 11947)."""
+    (`_merges`, `_balances`) and kernel (`_dense_tail`) agree by construction, a tail's partials within the
+    reference's workspace (row 12850), and a multi-wave dense input gradient holds check 1 via
+    `assert_as_exact` (rows 5363, 11945, 11947)."""
 
     sm80 = generation.gpu_target("sm80")
     gmm, tgmm = grouped_matmul.MosaicGmm(), grouped_matmul.MosaicTgmm()
@@ -1519,17 +1520,23 @@ def test_ampere_multi_wave_dense_dx_unifies_planner_and_kernel_and_holds_check_1
                                            balanced=True)
         assert tail_deep is None
         assert not gmm.balanced(ba_deep, tile_64x256, sm80)
-        # Single-wave tail (waves=1, rem=40, 0 drift): planner produces one Tail plan passed straight to
-        # emitter via `_stated` without re-pricing.
+        # A whole A100's 216 programs' partials (14 MiB) exceed the 4 MiB cuBLAS's workspace is, so no
+        # balanced tail there (row 12850); on 40 programs (2.6 MiB), a single-wave tail (64 tiles: waves=1,
+        # rem=24, 0 drift): planner produces one Tail plan passed straight to emitter via `_stated` without
+        # re-pricing.
         x_1w = jax.ShapeDtypeStruct((4096, 2048), jnp.bfloat16)
         dy_1w = jax.ShapeDtypeStruct((4096, 1024), jnp.bfloat16)
         ba_1w = tgmm.bind(x_1w, dy_1w, sizes, out_dtype="float32", interpret=False, dense=True)
         tile_1w = tiling.Tiles(128, 64, 32, 4, 8, warpgroups=1, family="mma.sync", programs=2)
-        stated_1w = tgmm._stated(ba_1w, tile_1w, sm80)
-        tail_1w = mosaic_gpu._dense_tail(tile_1w, jnp.bfloat16, (2048, 1024, 4096), (2, 2), 216,
-                                         balanced=stated_1w["balanced"])
-        assert tail_1w is stated_1w["balanced"] and tail_1w is not None
-        assert tgmm.balanced(ba_1w, tile_1w, sm80)
+        assert tgmm._stated(ba_1w, tile_1w, sm80)["balanced"] is None
+        few = dataclasses.replace(sm80, multiprocessors=20)
+        x_few = jax.ShapeDtypeStruct((4096, 512), jnp.bfloat16)
+        ba_few = tgmm.bind(x_few, dy_1w, sizes, out_dtype="float32", interpret=False, dense=True)
+        stated_few = tgmm._stated(ba_few, tile_1w, few)
+        tail_few = mosaic_gpu._dense_tail(tile_1w, jnp.bfloat16, (512, 1024, 4096), (2, 2), 40,
+                                          balanced=stated_few["balanced"])
+        assert tail_few is stated_few["balanced"] and tail_few is not None
+        assert tgmm.balanced(ba_few, tile_1w, few)
     # Multi-wave nonzero-tail check-1 witness: 320x128 -> grid=(5, 2)=10 tiles on 4 programs -> waves=2,
     # rem=2 (nonzero tail!). At l2=64KB and memory_rate=120GB/s, persistent L2 drift flips the tail decision
     # from balanced (no drift) to non-persistent (with drift).

@@ -612,6 +612,19 @@ class GpuTarget:
         return architecture(self.generation) or Architecture(())
 
     @property
+    def reference_workspace(self) -> int | None:
+        """The device memory XLA hands one cuBLAS GEMM as its workspace on this GPU, its library's rule by
+        compute capability: 32 MiB from Hopper on, 4 MiB before (xla/service/gpu/matmul_utils.h's
+        `kHopperWorkspace` and `kDefaultWorkspace`, applied by xla/backends/gpu/transforms/gemm_rewriter.cc).
+        A template's launch holds no more beside its operands and outputs (a split's fp32 partials, a
+        balanced tail's), its peak memory on par with the reference's (kernel-templates.md §1); None off a
+        CUDA GPU."""
+        found = capability(self.generation)
+        if found is None:
+            return None
+        return (32 if found >= (9, 0) else 4) * 2**20
+
+    @property
     def tensor_rates(self) -> Mapping[str, int]:
         return self.architecture.tensor_rates
 

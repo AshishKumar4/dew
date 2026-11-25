@@ -80,7 +80,13 @@ from dew.nn.kernels.templates.gemm import (
     sides_padded,
 )
 from dew.nn.kernels.templates.gemm.chained import Chained, Partition, flag_row, flags_declared, guarded_walk
-from dew.nn.kernels.templates.gemm.pricing import dense_tail, family_of, tile_columns, tile_rows
+from dew.nn.kernels.templates.gemm.pricing import (
+    dense_tail,
+    family_of,
+    tail_workspace,
+    tile_columns,
+    tile_rows,
+)
 from dew.nn.kernels.templates.gemm.row_tiles import TMA_ROWS
 from dew.nn.kernels.templates.gemm.tiling import GMM, GUARDED_GMM, TGMM, Tiles
 from dew.nn.kernels.templates.product import SCALE_DEPTH, block_format
@@ -608,7 +614,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                                          parts=(tail, scales if scales is not None else packed_format,
                                                 mx_scales, gather, chained), beside=beside))
     return kernel(*(operands if dense else (table, *operands)), *prologue_operands, *epilogue_operands,
-                  *_workspace(tail, (pair, pairs, 2, consumers, *part), interpret))
+                  *_workspace(tail, tail_workspace(tiles, pair * pairs, consumers, part), interpret))
 
 
 def _gmm_forms_refused(tiles: Tiles, family: mosaic.Family, k: int, n: int, mx_scales, step_scales, *,
@@ -2219,7 +2225,8 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                            resident=tiles.programs, scalars=len(groups),
                            cost=unit_cost.estimate(2 * k * m * n, lhs, rhs, *prologue_operands, out_type))
     return kernel(*groups, lhs, rhs, *(table for table in tables if table is not None), *(step_scales or ()),
-                  *prologue_operands, *_workspace(tail, (pair, pairs, 2, consumers, *part), interpret))
+                  *prologue_operands,
+                  *_workspace(tail, tail_workspace(tiles, pair * pairs, consumers, part), interpret))
 
 def _tgmm_finished(wg, tile: tuple, summed, store, *, active, family: mosaic.Family, tiles: Tiles, m: int,
                    o_gmem, partials) -> None:
