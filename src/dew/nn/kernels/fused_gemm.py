@@ -676,7 +676,9 @@ def _tile_jvp(whole_jvp, arrays: list, types: tuple, axes: tuple):
 
 
 def _jvp_on_tile(whole_jvp, derivative, types, axes, base, *sides):
-    if not _on_tiles():
+    # Mosaic can stage a proposal on small synthetic tiles before entering a launch context.
+    whole = all(array.shape == aval.shape for array, aval in zip((base, *sides), types, strict=False))
+    if whole and not _on_tiles():
         return whole_jvp(base, *sides)
     return functools.partial(_prologue_tile, derivative, types, axes, base, *sides)
 
