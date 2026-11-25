@@ -898,6 +898,20 @@ class _Counting:
                     self.charged.add(site)
                     self.invariants[site] = work
 
+    def branched(self, trials: Sequence["_Counting"]) -> None:
+        """The invariants a conditional's branches found (`trials`, one runs), under their envelope as its
+        work is: the most of each unit any branch's new invariants take, the conditional's own invariant at
+        its site, once; every branch's charges its own, so a visit again finds them charged (the review of
+        lane/toolkit 1d6a2c24b: two arms' invariants charged together)."""
+        found = [sum((work for site, work in trial.invariants.items() if site not in self.charged), Work())
+                 for trial in trials]
+        for trial in trials:
+            self.charged |= trial.charged
+        if any(work != Work() for work in found):
+            site = tuple(self.sites)
+            self.charged.add(site)
+            self.invariants[site] = self.invariants.get(site, Work()) + most(found)
+
     @property
     def counted(self) -> Work:
         """Its work outside its walks and its invariants (`invariants`), together."""
@@ -925,7 +939,7 @@ class _Counting:
                 self.arrivals.left(trial.landing)
             trials.append(trial)
         self.fixed = self.fixed + most([trial.fixed for trial in trials])
-        self.kept(trials)
+        self.branched(trials)
         if any(trial.walks for trial in trials):
             self.walks.append(most([_mean(trial.walks) for trial in trials if trial.walks]))
         if self.loops:
