@@ -56,6 +56,7 @@ from dew.nn.kernels.templates.attention import (
     kernel_dot,
     kernel_rows,
     key_tiles,
+    kinds_of,
     launch_arguments,
     output_split,
     padded_call,
@@ -721,8 +722,8 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
         acc0 = jnp.pad(call.rows(initial.acc),
                        ((0, 0),) * 3 + ((0, call.value.shape[-1] - value.shape[-1]),))
     op = TritonForward(score_mod=hooks.score.fn, output_mod=hooks.output.fn,
-                       score_kinds=tuple(param.axes for param in hooks.score.sides),
-                       output_kinds=tuple(param.axes for param in hooks.output.sides),
+                       score_kinds=kinds_of(hooks.score.sides),
+                       output_kinds=kinds_of(hooks.output.sides),
                        score_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.score.sides),
                        output_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.output.sides),
                        output_width=call.value.shape[-1],
@@ -1327,7 +1328,7 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     # The prologues taken as XLA's program before the launch (`prologues_taken`).
     query, key, hooks = prologues_taken(query, key, hooks)
     if residuals is None:
-        plain = Hooks() if hooks is None else Hooks(hooks.score.fn, hooks.score.sides, hooks.initial)
+        plain = Hooks() if hooks is None else Hooks(score=hooks.score, initial=hooks.initial)
         _, maxima, totals, anchors, sums = forward(query, key, value, spans, plain, scale=scale,
                                                    residuals=Kept.SPLIT, natural=natural, interpret=interpret)
         residuals = maxima, totals, anchors, sums

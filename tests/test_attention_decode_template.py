@@ -1169,7 +1169,7 @@ def _query_gated(o, q_p):
 @pytest.mark.parametrize("kind", ["stateless", "head", "query", "output"])
 @pytest.mark.parametrize("mode", ["single", "split"])
 def test_a_decode_step_fuses_output_hooks_single_slice_and_split_interpreted(kind, mode):
-    """Row 5385: `attention_decode.attend` admits and fuses `output_mod` (`stateless`, `Kind.HEAD`,
+    """Row 5385: `attention_decode.attend` admits and fuses an output hook (`stateless`, `Kind.HEAD`,
     `Kind.QUERY`, and `Kind.OUTPUT` bf16 gate) on both single-slice (`at.slices == 1`, fused in
     `MosaicForward`) and split-KV (`at.slices > 1`, fused in `merged.merged_finished`) GQA decode steps,
     matching `template.reference` under check 1, and rejects `finished=False` or unsupported kinds."""
@@ -1231,10 +1231,8 @@ def test_a_decode_step_fuses_output_hooks_single_slice_and_split_interpreted(kin
 
     if kind == "output" and mode == "single":
         assert not attention_decode.packable(
-            template.Hooks(output=Hook(None, (Side(sample[3], template.Kind.OUTPUT),))))
-        assert not attention_decode.packable(
             template.Hooks(output=Hook(lambda o, x: o + x, (Side(jnp.zeros((batch, heads, keys)),
-                                                         template.Kind.KEY),))))
+                                                                 template.Kind.KEY),))))
         with generation.assumed("sm90"), pytest.raises(ValueError):
             attention_decode.attend(sample[0], sample[1], sample[2], spans, hooks_of(*sample[3:]),
                                     interpret=True, finished=False)

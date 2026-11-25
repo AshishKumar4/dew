@@ -150,8 +150,7 @@ def doubled(acc):
 
 @dataclasses.dataclass(frozen=True)
 class Case:
-    """One call of the template: its hooks' functions, their side operands (`hooks.Side`) from the drawn
-    inputs, its outputs."""
+    """One call of the template: its hooks, their sides (`hooks.Side`) from the drawn inputs, its outputs."""
     prologue: object = None
     prologue_sides: object = lambda x, w, ms, nw, b, u, s: ()
     epilogue: object = None
@@ -230,8 +229,8 @@ def _plain(case, *, truth: bool = False):
     def run(x, w, ms, nw, b, u, s):
         drawn, h = (x, w, ms, nw, b, u, s), x
         if case.prologue is not None:
-            h = operand(case.prologue(x, *(side.value for side in case.prologue_sides(*drawn))),
-                        jnp.bfloat16)
+            sides = (side.value for side in case.prologue_sides(*drawn))
+            h = operand(case.prologue(x, *sides), jnp.bfloat16)
         wide = jnp.promote_types(x.dtype, jnp.float32)
         matrix = operand(w, jnp.bfloat16).astype(h.dtype)
         if case.dense:
@@ -549,8 +548,7 @@ def test_the_prologues_rounding_is_in_its_derivative():
 
     def loss(scale, *, interpret):
         out = gemm.gemm(x, w, jnp.asarray([1]), prologue=Hook(casted, (Side(scale, ("depth",)),)),
-                        out_dtype=jnp.float32,
-                            interpret_on_cpu=interpret)
+                        out_dtype=jnp.float32, interpret_on_cpu=interpret)
         return jnp.sum(out * ct)
 
     def plain(scale):
@@ -599,7 +597,7 @@ def test_a_dense_product_whose_extents_no_tile_divides_holds_check_1(transpose_r
     def dew(x, w, ms, nw, b):
         return gemm.gemm(x, w, None, prologue=Hook(normed, (Side(ms, ("rows",)), Side(nw, ("depth",)))),
                          epilogue=Hook(biased, (Side(b, ("columns",)),)), out_dtype=jnp.bfloat16,
-                             transpose_rhs=transpose_rhs, interpret_on_cpu=True)
+                         transpose_rhs=transpose_rhs, interpret_on_cpu=True)
 
     def plain(x, w, ms, nw, b, wide=jnp.float32, out=jnp.bfloat16):
         # A 16-bit output: an fp32 one's cotangent makes the kernel gradient an fp32 product, XLA's.
@@ -2334,8 +2332,7 @@ def test_an_integer_side_operand_takes_no_gradient():
     def gradient(*, interpret):
         def loss(x, w):
             out = gemm.gemm(x, w, jnp.asarray(SIZES), prologue=Hook(selected, (Side(mask, ("rows",)),)),
-                            out_dtype=jnp.float32,
-                                interpret_on_cpu=interpret)
+                            out_dtype=jnp.float32, interpret_on_cpu=interpret)
             return jnp.sum(out)
         return jax.jit(jax.grad(loss))
 

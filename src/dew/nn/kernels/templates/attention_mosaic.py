@@ -48,6 +48,7 @@ from dew.nn.kernels.templates.attention import (
     head_width,
     kept_dtype,
     key_prologue_taken,
+    kinds_of,
     logit_scale,
     prologued,
     prologues_taken,
@@ -1655,8 +1656,8 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
         out_dtype = jnp.float32 if out_dtype is None else out_dtype
         subtracted = True
     op = MosaicForward(score_mod=hooks.score.fn, output_mod=hooks.output.fn,
-                       score_kinds=tuple(param.axes for param in hooks.score.sides),
-                       output_kinds=tuple(param.axes for param in hooks.output.sides),
+                       score_kinds=kinds_of(hooks.score.sides),
+                       output_kinds=kinds_of(hooks.output.sides),
                        score_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.score.sides),
                        output_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.output.sides),
                        score_reduces=hook_reduces(hooks), output_width=head_width(value.shape[3]),
@@ -1666,7 +1667,7 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                        splits=splits, subtracted=subtracted, per_span=spans.per_span,
                        parts=parts, rounds=hooks.rounds, scaled=scaled, bounded=bounded, in_key=in_key,
                        query_mod=hooks.query.fn,
-                       query_kinds=tuple(param.axes for param in hooks.query.sides),
+                       query_kinds=kinds_of(hooks.query.sides),
                        query_dtypes=tuple(jnp.dtype(param.value.dtype).name for param in hooks.query.sides),
                        query_width=query.shape[3], query_dtype=jnp.dtype(query.dtype).name)
     args = (query, key, value, spans.start, spans.end, spans.query_ids, spans.key_ids,
@@ -2352,7 +2353,7 @@ def _backward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
     interval a query (`KeySpans.per_query`)."""
     hooks, spans = Hooks() if hooks is None else hooks, spans.per_query()
     op = MosaicBackward(score_mod=hooks.score.fn,
-                        score_kinds=tuple(param.axes for param in hooks.score.sides),
+                        score_kinds=kinds_of(hooks.score.sides),
                         score_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.score.sides),
                         score_reduces=hook_reduces(hooks), form=spans.form, keys=spans.keys,
                         scale=logit_scale(query.shape[3], scale), natural=natural,

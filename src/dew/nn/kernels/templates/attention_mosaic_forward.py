@@ -58,6 +58,7 @@ from dew.nn.kernels.templates.attention import (
     by_power,
     head_width,
     kept,
+    kinds_of,
     output_hooked,
     output_split,
     padded_call,
@@ -1103,7 +1104,7 @@ def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, sp
                      draw=None if hooked.drop is None else hooked.drop.draw(row, head), held=held)
     if training and score_places(hooks)[0]:
         coords = coords._replace(q_pos=family.as_tile(coords.q_pos))
-    streamed = riding(family, tuple(param.axes for param in hooks.score.sides), "keys")
+    streamed = riding(family, kinds_of(hooks.score.sides), "keys")
     laid = zip(hooked.score, hooks.score.sides, params_held, strict=True)
     params = tuple(_param(family, ref, param.axes, row, head, first, s, k_first, held=kept,
                           slot=slots[score_stream(index)] if index in streamed else None, at=(share, 0))
@@ -1278,7 +1279,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, stored
     # The queries' intervals and ids, and the score hook's parameters of the query tile, read once, before
     # the walk (`_query_bounds`, `held_params`).
     held = None if spans is None else program.bounds(first, spans, row)
-    kinds = tuple(param.axes for param in hooks.score.sides)
+    kinds = kinds_of(hooks.score.sides)
     params_held = held_params(family, hooked.score, kinds, row, head, first, tiles.block_q)
 
     # The values' tiles as the products read them: a quantized call's in the query's dtype (`_Codes`), an
@@ -1818,7 +1819,7 @@ def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, s
     pl.when(consumer > 0)(turn)
     held = None if spans is None else program.bounds(first, spans, place[0])
     row, head = place[:2]
-    kinds = tuple(param.axes for param in hooks.score.sides)
+    kinds = kinds_of(hooks.score.sides)
     params_held = held_params(family, hooked.score, kinds, row, head, first, tiles.block_q)
 
     def step(index, slots, arg, accumulators):

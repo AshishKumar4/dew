@@ -47,7 +47,14 @@ from dew.nn.kernels.templates import (
     mosaic,
     report,
 )
-from dew.nn.kernels.templates.attention import Initial, Kind, kept_dtype, output_hooked, ungrouped_rows
+from dew.nn.kernels.templates.attention import (
+    Initial,
+    Kind,
+    kept_dtype,
+    kinds_of,
+    output_hooked,
+    ungrouped_rows,
+)
 from dew.nn.kernels.templates.hooks import Side
 
 _OUTPUT_KINDS = (Kind.HEAD, Kind.QUERY, Kind.OUTPUT)
@@ -61,8 +68,8 @@ def output_hook_refusal(output_mod: Callable | None, output_params: tuple[Side, 
         return "output_params require an output_mod"
     bad = [param.axes for param in output_params if param.axes not in _OUTPUT_KINDS]
     if bad:
-        return (f"merged_finished supports {[k.value for k in _OUTPUT_KINDS]} output_params, "
-                f"got {[k.value for k in bad]}")
+        return (f"merged_finished supports {[kind.name for kind in _OUTPUT_KINDS]} output_params, "
+                f"got {bad}")
     return None
 
 
@@ -215,7 +222,7 @@ def merged_finished(spec: algebra.Forward, padded: jax.Array, stacked: jax.Array
     _validate_output_hook(output_mod, output_params)
     init_extra = () if initial is None else (initial.m, initial.total, initial.acc)
     out_extra = tuple(param.value for param in output_params)
-    out_kinds = tuple(param.axes for param in output_params)
+    out_kinds = kinds_of(output_params)
     raw_scale = spec.scale if (initial is not None and spec.raw) else None
     (out,) = _merged(algebra.units_of(spec), queries, width, raw_scale, jnp.dtype(out_dtype), out_heads,
                      output_mod, out_kinds, padded, stacked, *init_extra, *out_extra)

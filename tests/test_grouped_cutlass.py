@@ -12,6 +12,7 @@ import pytest
 from reference_error import equations
 
 from dew.nn.kernels import gemm, generation, grouped_cutlass
+from dew.nn.kernels.templates.gemm import sides as hook_sides
 from dew.nn.kernels.templates.gemm.hooks import Hooks
 from dew.nn.kernels.templates.hooks import Hook, Side
 
@@ -93,7 +94,7 @@ def test_a_cutlass_launch_forms_a_singleton_sides_rows_as_xla_forms_them():
     def prologue(x, s):
         return x * s.sum(axis=1, keepdims=True)
 
-    squeezed, axes, positions = gemm._launchable((scale,), (("rows", None),))
+    squeezed, axes, positions = hook_sides.launchable((scale,), (("rows", None),))
     hooks = Hooks(prologue, axes, prologue_broadcast=positions)
     formed = grouped_cutlass._formed(rows, squeezed, hooks)
     want = prologue(rows, scale).astype(jnp.bfloat16)

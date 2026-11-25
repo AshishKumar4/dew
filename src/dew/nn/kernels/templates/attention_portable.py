@@ -36,6 +36,7 @@ from dew.nn.kernels.templates.attention import (
     interpreted_dot,
     interpreted_rows,
     key_tiles,
+    kinds_of,
     padded_call,
     prescaled,
     prologues_taken,
@@ -272,8 +273,8 @@ def padded_walk(spec: algebra.Forward, call: PaddedCall, hooks: Hooks, *, block_
                    jnp.pad(call.rows(state.acc), widened))
     return forward(
         spec, call.query, call.key, call.value, call.start, call.end, call.query_ids, call.key_ids,
-        call.score_params, tuple(param.axes for param in hooks.score.sides), call.output_params,
-        tuple(param.axes for param in hooks.output.sides), initial, block_q=block_q, block_k=block_k,
+        call.score_params, kinds_of(hooks.score.sides), call.output_params,
+        kinds_of(hooks.output.sides), initial, block_q=block_q, block_k=block_k,
         output_mod=hooks.output.fn, residuals=residuals, drop=hooks.drop)
 
 
@@ -637,8 +638,7 @@ def backward(config: Tiles, query: jax.Array, key: jax.Array, value: jax.Array, 
     # Its gradients the query's and key's under their prologues (`attention_route._pulled` takes them back).
     query, key, hooks = prologues_taken(query, key, hooks)
     if residuals is None:
-        plain = Hooks() if hooks is None else Hooks(hooks.score.fn, hooks.score.sides, hooks.initial,
-                                                    drop=hooks.drop)
+        plain = Hooks() if hooks is None else Hooks(score=hooks.score, initial=hooks.initial, drop=hooks.drop)
         _, maxima, totals, anchors, sums = xla_mainloop(config, query, key, value, spans, plain, scale=scale,
                                                         residuals=True, natural=natural)
         residuals = maxima, totals, anchors, sums

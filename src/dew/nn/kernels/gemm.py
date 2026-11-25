@@ -58,9 +58,9 @@ from dew.nn.derivatives import (
 )
 from dew.nn.kernels import generation, grouped_matmul, selection, xla_products
 from dew.nn.kernels.formats import MxFp8, NvFp4, NvFp4Block, TernaryWeights
-from dew.nn.kernels.templates import axes as side_axes_of, product as product_of
+from dew.nn.kernels.templates import product as product_of
 from dew.nn.kernels.templates.axes import GROUPS
-from dew.nn.kernels.templates.gemm import epilogue_vjp, rows_permuted, scattered, tiling
+from dew.nn.kernels.templates.gemm import epilogue_vjp, rows_permuted, scattered, sides as hook_sides, tiling
 from dew.nn.kernels.templates.gemm.factored import factored
 from dew.nn.kernels.templates.gemm.hooks import NO_HOOKS, ColumnLocal, Formed, Hooks, column_local
 from dew.nn.kernels.templates.hooks import NO_HOOK, Hook, Side
@@ -72,9 +72,6 @@ from dew.nn.sharding import automatic_axes, explicit_spec, varying_like
 if TYPE_CHECKING:
     from .templates import base
 
-LAUNCH_AXES = {'prologue': ('rows', 'depth'), 'epilogue': ('rows', 'columns')}
-"""The launch axes each hook's side operands may follow; `groups` too beside them (`_split`), which a launch
-reads at its tile's group (`axes.GROUPS`) and XLA's program at each row (`axes.at_rows`)."""
 
 
 _UNBUILT: contextvars.ContextVar[bool] = contextvars.ContextVar('gemm_unbuilt', default=False)
@@ -150,8 +147,8 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights,
                             gather=gather, scatter=scatter, interpret_on_cpu=interpret_on_cpu,
                             refused=(transpose_rhs, prologue.fn, prologue.sides, paired, prologue_jvp,
                                      out_dtypes, applied, beside, selected))
-    prologue_arrays, prologue_axes = _split(prologue.sides, 'prologue', group_sizes)
-    epilogue_arrays, epilogue_axes = _split(epilogue.sides, 'epilogue', group_sizes)
+    prologue_arrays, prologue_axes = hook_sides.split(prologue.sides, 'prologue', group_sizes)
+    epilogue_arrays, epilogue_axes = hook_sides.split(epilogue.sides, 'epilogue', group_sizes)
     prologue, epilogue = prologue.fn, epilogue.fn
     _gemm_refused(group_sizes, gather=gather, scatter=scatter, compute=compute, applied=applied,
                   prologue=prologue, lhs=lhs,
@@ -353,9 +350,9 @@ def _packed_gemm(lhs, matrix: NvFp4 | TernaryWeights, group_sizes, *, epilogue: 
         summed = ternary_weight_product(lhs, matrix, group_sizes, quantize_activations=False,
                                         out_dtype=jnp.float32, interpret_on_cpu=interpret_on_cpu)
     if epilogue.fn is not None:
-        arrays, axes = _split(epilogue.sides, 'epilogue', group_sizes)
+        arrays, axes = hook_sides.split(epilogue.sides, 'epilogue', group_sizes)
         sizes = jnp.asarray([summed.shape[0]], jnp.int32) if group_sizes is None else group_sizes
-        [summed] = _tupled(epilogue.fn, summed, *_rows(arrays, axes, sizes, summed.shape[0]))
+        [summed] = _tupled(epilogue.fn, summed, *hook_sides.rows(arrays, axes, sizes, summed.shape[0]))
     return scattered(summed.astype(out_dtype), scatter)
 
 
@@ -878,15 +875,15 @@ def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, pro
     `gather`: the reverse pass of gathered tokens and of a scattered product's cotangent, row 1376)."""
     if gather is not None and group_sizes is None:
         raise ValueError("gathered rows are a grouped call's")
-    prologue_arrays, prologue_axes = _split(prologue.sides, 'prologue', group_sizes)
+    prologue_arrays, prologue_axes = hook_sides.split(prologue.sides, 'prologue', group_sizes)
     return _gemm_t(lhs, rhs, group_sizes, prologue.fn, prologue_arrays, prologue_axes, out_dtype=out_dtype,
                    precision=precision, interpret_on_cpu=interpret_on_cpu, gather=gather)
 
 
 def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, out_dtype,
             precision: PrecisionLike, interpret_on_cpu: bool, gather: tuple | None = None) -> jax.Array:
-    """`gemm_t` of side operands checked (`_split`), its groups the call's, each operand multiplied whole: in
-    the wider of their dtypes (a wider cotangent never rounded to the rows')."""
+    """`gemm_t` of side operands checked (`sides.split`), its groups the call's, each operand multiplied
+    whole: in the wider of their dtypes (a wider cotangent never rounded to the rows')."""
     dense = group_sizes is None
     compute = jnp.promote_types(lhs.dtype, rhs.dtype)
     group_sizes = jnp.full((1,), lhs.shape[0], jnp.int32) if dense else group_sizes.astype(jnp.int32)
@@ -903,7 +900,7 @@ def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, 
         # each operand's values its own dtype's.
         counts = _part_counts(lhs.dtype, rhs.dtype, precision)
         parted = declared(jnp.bfloat16, precision, outputs=(jnp.float32,))
-        sides, axes, broadcast = _launchable(prologue_arrays, prologue_axes)
+        sides, axes, broadcast = hook_sides.launchable(prologue_arrays, prologue_axes)
         # A prologue rewrites the rows as they are, so the rows run whole, one part: their own 16 bits.
         hooked = Hooks(prologue, axes, prologue_broadcast=broadcast)
         if (counts is not None and (prologue is None or counts[0] == 1) and _parts_launched(
@@ -953,7 +950,7 @@ def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, 
     def portable(lhs, rhs, group_sizes, prologue_arrays, tables):
         lhs, rhs = gathered(lhs, rhs, tables)
         if prologue is not None:
-            sides = _rows(prologue_arrays, prologue_axes, group_sizes, lhs.shape[0])
+            sides = hook_sides.rows(prologue_arrays, prologue_axes, group_sizes, lhs.shape[0])
             lhs = prologue(lhs, *sides).astype(lhs.dtype)
         if not dense:
             # A row past the routed ones multiplies nothing. A dense call routes every row, and its mask
@@ -1290,22 +1287,15 @@ def blockwise_fp8_finished(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.A
     output broadcast across each block's columns stored one value a row a block, transposed, as a next
     blockwise product reads its rows' scales). `dense`: its one group covers every row (a padded chain's,
     `projections.blockwise_chain`), which a transposed form's stores need (`quantized.forms_refusal`).
-    The epilogue's side operands (`hooks.Side`s on the output's `('rows', 'columns')`, `_tiles`), its side
-    tiles, which it takes after the sum (a gated MLP's rounded gate product, its up product's SwiGLU taken
-    here, row 12689)."""
+    The epilogue's side operands (`hooks.Side`s on the output's `('rows', 'columns')`, `sides.tiles`), its
+    side tiles, which it takes after the sum (a gated MLP's rounded gate product, its up product's SwiGLU
+    taken here, row 12689)."""
     return _blockwise_fp8(lhs, kernel, group_sizes, row_scales, column_scales,
                           dtypes=tuple(jnp.dtype(dtype) for dtype in out_dtypes), epilogue=epilogue.fn,
-                          sides=_tiles(epilogue), out_forms=out_forms, dense=dense,
+                          sides=hook_sides.tiles(epilogue), out_forms=out_forms, dense=dense,
                           interpret=interpret_on_cpu)
 
 
-def _tiles(epilogue: Hook) -> tuple[jax.Array, ...]:
-    """A finished product's epilogue's side operands, each a tile of the output's (`[rows, columns]`,
-    `LAUNCH_AXES['epilogue']`), as the launch takes them."""
-    if any(tuple(side.axes) != LAUNCH_AXES['epilogue'] for side in epilogue.sides):
-        raise ValueError(f"a finished product's epilogue takes side tiles on {LAUNCH_AXES['epilogue']}, not "
-                         f"{[side.axes for side in epilogue.sides]}")
-    return tuple(side.value for side in epilogue.sides)
 
 
 def _blockwise_fp8(lhs, kernel, group_sizes, row_scales, column_scales, *, dtypes: tuple,
@@ -1322,7 +1312,7 @@ def _blockwise_fp8(lhs, kernel, group_sizes, row_scales, column_scales, *, dtype
     out_forms = quantized.forms_of(out_forms, dtypes) or None
     several = epilogue is not None
     hooks = NO_HOOKS if not several else Hooks(
-        epilogue=epilogue, epilogue_axes=(LAUNCH_AXES['epilogue'],) * len(sides),
+        epilogue=epilogue, epilogue_axes=(hook_sides.LAUNCH_AXES['epilogue'],) * len(sides),
         out_dtypes=tuple(dtype.name for dtype in dtypes), out_forms=out_forms)
     stored = dtypes[0].name if several else 'float32'
     if dense and group_sizes.shape != (1,):
@@ -1578,14 +1568,14 @@ def nvfp4_block_finished(lhs: NvFp4Block, matrices: NvFp4Block, group_blocks: ja
     sums scaled there before any function of them, XLA's the same function of its sums (a next product's
     rows quantized from them, `quantized.nvfp4_epilogue`, row 12721), each stored as `out_forms` states
     (`Hooks.out_forms`: an output broadcast across each block's columns stored one value a row a block,
-    transposed). The epilogue's side operands, its side tiles (`[rows, columns]` each, `_tiles`), it takes
-    after the sums; `epilogue_scalars`, fp32 scalars after them (a delayed recipe's next tensor scale, refused
-    unless one scalar as every tensor scale is, `bits.nvfp4_given_scale`), each a
-    tile of its value there, carried as a vector over the rows (the launch's side of one value a row: a
+    transposed). The epilogue's side operands, its side tiles (`[rows, columns]` each, `sides.tiles`), it
+    takes after the sums; `epilogue_scalars`, fp32 scalars after them (a delayed recipe's next tensor scale,
+    refused unless one scalar as every tensor scale is, `bits.nvfp4_given_scale`), each a tile of its value
+    there, carried as a vector over the rows (the launch's side of one value a row: a
     register a thread where a thread holds a row, tcgen05's, where a vector over the columns held a chunk's
     64 and spilled 7108 bytes; witness/b1-probe-3). `dense`: its one group covers every row, which a
     transposed form's stores need (`quantized.forms_refusal`)."""
-    tiles = _tiles(epilogue)
+    tiles = hook_sides.tiles(epilogue)
     vectors = tuple(jnp.broadcast_to(bits.nvfp4_given_scale(scalar), lhs.codes.shape[:1])
                     for scalar in (lhs.scale, matrices.scale, *epilogue_scalars))
 
@@ -1594,7 +1584,7 @@ def nvfp4_block_finished(lhs: NvFp4Block, matrices: NvFp4Block, group_blocks: ja
                                           for vector in sides[len(tiles):]]
         return epilogue.fn(twice_scaled(acc, *wide[:2]), *held, *wide[2:])
 
-    side_axes = (LAUNCH_AXES['epilogue'],) * len(tiles) + (('rows',),) * len(vectors)
+    side_axes = (hook_sides.LAUNCH_AXES['epilogue'],) * len(tiles) + (('rows',),) * len(vectors)
     return _block_scaled(lhs, matrices, group_blocks, NVFP4_BLOCK_OP, interpret_on_cpu, epilogue=scaled,
                          sides=(*tiles, *vectors), side_axes=side_axes,
                          dtypes=tuple(jnp.dtype(dtype) for dtype in out_dtypes), out_forms=out_forms,
@@ -1721,8 +1711,8 @@ def _gemm_call(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, 
     and the product it declares: one construction for the launch it runs and for a reverse pass's question
     of which launch a call would run (`_keeps_launch`), its operands arrays or, a question's, abstract
     (`jax.ShapeDtypeStruct`, `side_by_side`'s)."""
-    before_sides, before_axes, before_broadcast = _launchable(prologue_arrays, prologue_axes)
-    after_sides, after_axes, after_broadcast = _launchable(epilogue_arrays, epilogue_axes)
+    before_sides, before_axes, before_broadcast = hook_sides.launchable(prologue_arrays, prologue_axes)
+    after_sides, after_axes, after_broadcast = hook_sides.launchable(epilogue_arrays, epilogue_axes)
     # Matrices side by side state one dtype, each one's output's (`gmm_call`'s `beside`); an epilogue stating
     # its outputs' forms (`hooks.Formed`: a wide product's narrowed gated product), each stored so.
     stated = tuple(dtype.name for dtype in dtypes) if several and not beside else None
@@ -1776,7 +1766,8 @@ def _cotangents(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, pr
         outs = _tupled(epilogue, *args)
         return tuple(outs[at] for at in reached)
 
-    rows = functools.partial(_rows, axes_of=epilogue_axes, group_sizes=group_sizes, rows=acc_shape[0])
+    rows = functools.partial(hook_sides.rows, axes_of=epilogue_axes, group_sizes=group_sizes,
+                             rows=acc_shape[0])
     sides = jax.eval_shape(rows, epilogue_arrays)
     # The accumulator the products sum in: fp32, an fp64 product's fp64 (`xla_mainloop`). The epilogue's
     # derivative reads it at that width (a row scale's gradient sums it times the cotangent), so it is
@@ -2100,7 +2091,7 @@ def _kernel_gradient(lhs, d_product, matrix, group_sizes, prologue, prologue_arr
             options = {**options, 'gather': None if tables[1] is None else (None, tables[1])}
         operand = (rows.astype(compute) if prologue is None else prologue(
             rows.astype(compute),
-            *_rows(prologue_arrays, prologue_axes, group_sizes, rows.shape[0])).astype(compute))
+            *hook_sides.rows(prologue_arrays, prologue_axes, group_sizes, rows.shape[0])).astype(compute))
         gradient = _gemm_t(operand, d_product, sizes, None, (), (), out_dtype=matrix.dtype, **options)
     gradient = jnp.swapaxes(gradient, 1, 2) if plain['transpose_rhs'] else gradient
     if plain['first'] is None:
@@ -2120,7 +2111,7 @@ def _prologue_keeps_launch(lhs, rhs, group_sizes, prologue, prologue_arrays, pro
     dense = group_sizes is None
     sizes = jnp.full((1,), lhs.shape[0], jnp.int32) if dense else group_sizes.astype(jnp.int32)
     product = declared(lhs.dtype, options['precision'], outputs=(out_dtype,), operands=(lhs.dtype, rhs.dtype))
-    sides, axes, broadcast = _launchable(prologue_arrays, prologue_axes)
+    sides, axes, broadcast = hook_sides.launchable(prologue_arrays, prologue_axes)
     kernels = []
     for hooks, after in ((NO_HOOKS, ()),
                          (Hooks(prologue, axes, prologue_broadcast=broadcast), sides)):
@@ -2243,7 +2234,7 @@ def _apart(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, prologu
                            (dtype,), several=False, summed_as=summed_as, **options)
                      for matrix, dtype in zip(matrices, kept, strict=True))
     if epilogue is not None:
-        sides = _rows(epilogue_arrays, epilogue_axes, group_sizes, lhs.shape[0])
+        sides = hook_sides.rows(epilogue_arrays, epilogue_axes, group_sizes, lhs.shape[0])
         products = _tupled(epilogue, *products, *sides)
     outs = tuple(out.astype(dtype) for out, dtype in zip(products, dtypes, strict=True))
     return outs if several else outs[0]
@@ -2292,8 +2283,8 @@ def xla_mainloop(config: XlaConfig, lhs, rhs, group_sizes, prologue, prologue_ar
     rows = ((lhs, *(each for each, _ in chained)) if chained else (lhs,) * len(matrices) if joined is None
             else (lhs, joined))
     epilogue = mosaic_gpu.joined_sum if joined is not None else epilogue
-    prologue_arrays = _rows(prologue_arrays, prologue_axes, group_sizes, lhs.shape[0])
-    epilogue_arrays = _rows(epilogue_arrays, epilogue_axes, group_sizes, lhs.shape[0])
+    prologue_arrays = hook_sides.rows(prologue_arrays, prologue_axes, group_sizes, lhs.shape[0])
+    epilogue_arrays = hook_sides.rows(epilogue_arrays, epilogue_axes, group_sizes, lhs.shape[0])
     if compute is not None:
         # Summed and kept at least fp32 (an fp64 product's in fp64), the accumulator the epilogue reads.
         wide = at_least_fp32(compute)
@@ -2362,8 +2353,8 @@ def _prologue_cotangents(prologue, lhs, arrays, axes_of, group_sizes, d_operand,
     def multiplied(x, *sides):
         # A groups axis's value at each row, kept as a row operand's is; its transpose sums each group's rows.
         sides = tuple(kept(side, axes.index(GROUPS)) if GROUPS in axes else side
-                      for side, axes in zip(_rows(sides, axes_of, group_sizes, lhs.shape[0]), axes_of,
-                                            strict=True))
+                      for side, axes in zip(hook_sides.rows(sides, axes_of, group_sizes, lhs.shape[0]),
+                                            axes_of, strict=True))
         return prologue(x.astype(dtype), *sides).astype(dtype)
 
     _, pull = jax.vjp(multiplied, *inputs)
@@ -2467,45 +2458,6 @@ def _grouped(lhs, rhs, group_sizes, layer=None):
     return stack.reshape(layers * groups, *stack.shape[2:]), sizes, first
 
 
-def _split(sides: tuple[Side, ...], hook: str, group_sizes: jax.Array | None) -> tuple[tuple, tuple]:
-    """A hook's side operands' arrays and their axes (`hooks.Side`), each checked: one axis per dimension,
-    each a launch axis the hook's operands follow, `groups` beside no rows (one value a group of the call's,
-    a dense product's one group: `axes.GROUPS`) or None for a dimension of one, at least one a launch
-    axis."""
-    groups = 1 if group_sizes is None else group_sizes.shape[0]
-    arrays, axes_of = [], []
-    for side in sides:
-        array, axes = side.value, tuple(side.axes)
-        named = [axis for axis in axes if axis not in (None, GROUPS)]
-        if (len(axes) != array.ndim or not named or any(axis not in LAUNCH_AXES[hook] for axis in named)
-                or any(extent != 1 for axis, extent in zip(axes, array.shape, strict=True) if axis is None)):
-            raise ValueError(f"a {hook} side operand of shape {array.shape} does not take axes {axes}: one "
-                             f"per dimension, each one of {LAUNCH_AXES[hook]}, {GROUPS!r} beside one, or "
-                             f"None for a dimension of one")
-        if GROUPS in axes and ('rows' in axes or axes.count(GROUPS) != 1
-                               or array.shape[axes.index(GROUPS)] != groups):
-            raise ValueError(f"a {hook} side operand of shape {array.shape} on axes {axes} names groups "
-                             f"once, beside no rows, at the call's {groups} groups")
-        arrays.append(array)
-        axes_of.append(axes)
-    return tuple(arrays), tuple(axes_of)
-
-
-def _rows(arrays: tuple, axes_of: tuple, group_sizes: jax.Array, rows: int) -> tuple:
-    """The side operands as XLA's program reads them: a `groups` axis as `rows` rows, each its group's
-    value (`axes.at_rows`), every other operand as it is."""
-    return tuple(side_axes_of.at_rows(array, axes, group_sizes, rows) if GROUPS in axes else array
-                 for array, axes in zip(arrays, axes_of, strict=True))
-
-
-def _launchable(arrays: tuple, axes_of: tuple) -> tuple[tuple, tuple, tuple]:
-    """The side operands and axes a launch takes, each dimension of one squeezed out, and each one's
-    positions of them, which the launch gives the hook back (`Hooks`)."""
-    positions = tuple(tuple(i for i, axis in enumerate(axes) if axis is None) for axes in axes_of)
-    squeezed = tuple(jnp.squeeze(array, where) if where else array
-                     for array, where in zip(arrays, positions, strict=True))
-    named = tuple(tuple(axis for axis in axes if axis is not None) for axes in axes_of)
-    return squeezed, named, positions if any(positions) else ()
 
 
 def _routed(group_sizes: jax.Array, rows: int) -> jax.Array:

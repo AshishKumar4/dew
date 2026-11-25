@@ -698,6 +698,11 @@ class Kind(tuple, enum.Enum):
     of 1 every head shares."""
 
 
+def kinds_of(sides: tuple[Side, ...]) -> tuple[Kind, ...]:
+    """Each of a hook's side operands' kind: its axes, as `Kind` names them."""
+    return tuple(Kind(side.axes) for side in sides)
+
+
 def scored(tile: jax.Array, kind: Kind) -> jax.Array:
     """A score side operand's values over its own tile axes (its kind's queries and keys, as a launch loads
     them) as the score tile's `[queries, keys]`: a singleton along the axis it does not vary on (`hooks.laid`
@@ -1960,7 +1965,7 @@ def launch_arguments(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
                                  (0, call.value.shape[-1] - value_width)))
     operands = (call.query, call.key, call.value, padded_dout)
     rows = (call.start, call.end, call.query_ids, call.key_ids, call.score_params)
-    kinds = tuple(param.axes for param in hooks.score.sides)
+    kinds = kinds_of(hooks.score.sides)
     dtypes = tuple(kept_dtype(param.value.dtype) for param in hooks.score.sides)
     maxima, totals, anchors, split = residuals
     key_index = call.rows(anchors.astype(jnp.int32))

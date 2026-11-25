@@ -385,9 +385,9 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
 
         grads = attention_triton.backward(query, key, value, spans, _spread(hooks, query), dout,
                                           residuals=residuals, rounded=rounded, interpret=interpret, **form)
-        return dataclasses.replace(grads, score=dataclasses.replace(grads.score, sides=tuple(
+        return dataclasses.replace(grads, score_params=tuple(
             shared_sum(grad, param) if param.axes in SPREAD else grad
-            for grad, param in zip(grads.score_params, hooks.score.sides, strict=True))))
+            for grad, param in zip(grads.score_params, hooks.score.sides, strict=True)))
     portable, plain = _plain()
     return portable.backward(plain, *call, residuals=residuals, rounded=rounded, **form)
 
