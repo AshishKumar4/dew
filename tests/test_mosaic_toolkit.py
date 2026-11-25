@@ -1713,7 +1713,7 @@ def test_a_staged_batch_holds_each_value_in_its_buffer():
 
 
 def _barriers(call) -> int:
-    """The barriers (`gpu.barrier`, `nvvm.barrier`) in the typed module `call` lowers to for an A100."""
+    """The warpgroup barriers (`nvvm.barrier`) in the typed module `call` lowers to for an A100."""
     import jax.experimental.mosaic.gpu as mgpu
     from kernel_compile import lowered_for
 
@@ -1728,19 +1728,20 @@ def _barriers(call) -> int:
             for region in pending.pop().regions:
                 for block in region.blocks:
                     for inner in block.operations:
-                        found += inner.operation.name in ("gpu.barrier", "nvvm.barrier")
+                        found += inner.operation.name == "nvvm.barrier"
                         pending.append(inner.operation)
     return found
 
 
 @COMPILES_ON_CPU
-def test_an_mma_sync_staged_batch_takes_one_barrier_pair_where_its_stores_took_one_each():
-    """Lowered for an A100: three tiles staged by an mma.sync issuer whose warps split a tile's columns take
-    one pair of warpgroup barriers in one batch (`Family.staged_all`), four fewer than a store apiece's pair
-    each (`staged`; a Kimi intra step's 20 a trip, FS-INTRA-BAR1)."""
-    apiece, batch = (_barriers(functools.partial(_staged_three, interpret=False, batched=batched))
-                     for batched in (False, True))
-    assert batch >= 2 and apiece - batch == 4, (apiece, batch)
+@pytest.mark.parametrize("batched", [False, True], ids=["apiece", "batch"])
+def test_three_mma_sync_staged_stores_take_a_barrier_at_each_end_and_one_between_each_two(batched):
+    """Lowered for an A100: three tiles staged by an mma.sync issuer whose warps split a tile's columns, a
+    store apiece (`staged`) or in one batch (`Family.staged_all`), take four warpgroup barriers, one before
+    the first store, one after the last and one between each two: the fork drops a collective barrier that
+    repeats one before it (`core._drop_repeated_barriers`), where each store's own pair and the staging's
+    beside it took 12 apiece and 8 in a batch (a Kimi intra step's 20 a trip, FS-INTRA-BAR1; row 13053)."""
+    assert _barriers(functools.partial(_staged_three, interpret=False, batched=batched)) == 4
 
 
 def test_a_staged_batch_refuses_a_buffer_twice():
