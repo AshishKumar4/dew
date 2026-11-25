@@ -310,6 +310,30 @@ def test_a_read_erase_under_a_decay_a_head_trains_on_the_template(kernel, taken)
     assert kernels == {taken, 'xla'}, kernels
 
 
+def test_a_read_erase_along_its_keys_under_distinct_key_decays_is_kimis_delta_attention():
+    """The delta rule erasing along reads of its own under a decay a key dimension, each key its own decay
+    (16-bit), reading along its own keys, is Kimi's delta attention: on the template
+    its forward (the system's rows from the reads' stream, its weights from the reads' launch and its
+    decayed keys from the keys', `chunk_forward._key_weighted`) the same, bit for bit, as the template's
+    forward of the delta rule erasing along its keys, which check 1 holds to fla's recorded sites
+    (`test_recurrence_mosaic`): a read's decay taken from another key's, or the reads' path decaying them
+    otherwise than the keys', moves the output past it (head review of 675cd1ecc). A swap of the system's
+    rows and columns, the same here, `test_a_read_erase_under_a_decay_a_key_dimension_on_the_template_is_its
+    _head_decays` sees."""
+    q, k, v, g, beta, state, _ = sixteen_bit_forward(0)
+    # Each key its own log decay, a sigmoid's log about the head's.
+    normal = np.random.default_rng([1459, 3]).standard_normal
+    keyed = hosted(-softplus(-(normal((*g.shape, k.shape[-1])) + 3.0)))
+    read = read_erased_forward(q, k, v, keyed, beta, state, k)
+    fast = dataclasses.replace(generation.numerics(), forms='fast')
+    with (generation.assumed("sm90" if INTERPRETED else None, interpreted=INTERPRETED),
+          generation.run_precision(fast), generation.chosen(gated_delta_rule="mosaic_gpu")):
+        tied = chunk(Hooks(decay='vector', scale=q.shape[-1] ** -0.5),
+                     Chunk(q, k, v, log_decay=keyed, beta=beta, state=state))
+    for found, expected in zip(read, tied, strict=True):
+        np.testing.assert_array_equal(np.asarray(found, np.float32), np.asarray(expected, np.float32))
+
+
 def test_a_read_erase_under_a_decay_a_key_dimension_runs_its_forward_alone_on_the_template():
     """PKDA's 16-bit call naming the template runs its forward there (its keys' erase along reads of their
     own under a decay a key dimension, `chunk_forward._paired`), and its gradient, which the template's fast
