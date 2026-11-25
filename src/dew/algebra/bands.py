@@ -14,6 +14,7 @@ import jax.numpy as jnp
 
 from dew.algebra import scaled
 from dew.nn.float_bits import raw_fields
+from dew.nn.precision import two_sum
 
 
 def placed_totals(values, exponent, dtype, *, may_round: bool):
@@ -22,15 +23,12 @@ def placed_totals(values, exponent, dtype, *, may_round: bool):
         held = scaled.scaled(values.astype(dtype))
         return held.significand, jnp.zeros_like(held.significand), exponent + held.exponent
 
-    # Both halves of an int32 total fit in float32; keep their relative scale without adding them.
+    # Both halves fit in float32. Round their sum with its exact residual before the multiplier sees it.
+    high = jnp.ldexp((values >> 16).astype(dtype), 16)
     low = (values & 65535).astype(dtype)
-    high = scaled.scaled((values >> 16).astype(dtype))
-    lower = scaled.scaled(low)
-    has_high = high.significand != 0
-    upper_exp = high.exponent + 16
-    return (jnp.where(has_high, high.significand, lower.significand),
-            jnp.where(has_high, jnp.ldexp(low, -upper_exp), 0.0),
-            exponent + jnp.where(has_high, upper_exp, lower.exponent))
+    rounded, residual = two_sum(high, low)
+    held = scaled.scaled(rounded)
+    return held.significand, jnp.ldexp(residual, -held.exponent), exponent + held.exponent
 
 
 def summed(load, chunks: int, *, axis: int, width: int, lower: int, bins: int, dtype, may_round: bool):
@@ -90,4 +88,5 @@ def summed(load, chunks: int, *, axis: int, width: int, lower: int, bins: int, d
         return values, exponents
 
     values, exponent = jax.vmap(compressed)(sums.reshape(-1, bins), indices.reshape(-1, bins))
-    return placed_totals(values.reshape(sums.shape), exponent.reshape(sums.shape), dtype, may_round=may_round), count
+    totals = placed_totals(values.reshape(sums.shape), exponent.reshape(sums.shape), dtype, may_round=may_round)
+    return totals, count

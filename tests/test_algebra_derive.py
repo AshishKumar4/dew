@@ -1430,12 +1430,17 @@ def test_mixed_covariance_pullback_keeps_faint_stationary_coefficients(mode):
 
 
 def test_a_dyadic_bin_keeps_integer_totals_past_float32_precision():
-    from dew.algebra import bands
+    from dew.algebra import bands, windows
 
-    exact = [(1 << 24) + 1, -(1 << 24) - 1, (1 << 31) - 1, -(1 << 31), 1, 0]
+    exact = [(1 << 24) + 1, -(1 << 24) - 1, (1 << 31) - 1, -(1 << 31), 1, 0, -1]
     high, low, exponent = bands.placed_totals(jnp.asarray(exact, jnp.int32), 0, jnp.float32, may_round=True)
     found = np.ldexp(np.asarray(high, np.float64) + np.asarray(low, np.float64), np.asarray(exponent))
     np.testing.assert_array_equal(found, exact)
+
+    opposite = bands.placed_totals(jnp.int32(-1), 0, jnp.float32, may_round=True)
+    prod, rest, scale = windows._times((high, low, exponent), opposite)
+    negative = np.ldexp(np.asarray(prod, np.float64) + np.asarray(rest, np.float64), np.asarray(scale))
+    np.testing.assert_array_equal(negative, -np.asarray(exact))
 
 
 @pytest.mark.parametrize(("rows", "states"), [(0, 4), (1, 65536)])
