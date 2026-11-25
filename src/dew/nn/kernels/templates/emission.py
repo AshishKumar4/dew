@@ -1061,8 +1061,10 @@ def _expanded(equation) -> tuple[jax_core.Jaxpr, Sequence] | None:
 
 def _platform_branch(platforms) -> int:
     """The branch of a `lax.platform_dependent` whose platforms (`platform_index`'s `platforms`, a branch's
-    names, or None for its default) hold the priced target's: a CUDA multiprocessor's `cuda`, else a TPU's."""
-    name = "cuda" if generation.gpu_target().architecture.multiprocessor is not None else "tpu"
+    names, or None for its default) hold the priced platform's (`generation.backend`: a GPU's `cuda`, a TPU's,
+    a CPU's)."""
+    priced = generation.backend()
+    name = "cuda" if priced == "gpu" else priced
     named = [index for index, names in enumerate(platforms) if names is not None and name in names]
     defaults = [index for index, names in enumerate(platforms) if names is None]
     if not named and not defaults:
@@ -1131,7 +1133,8 @@ def _static(equation, given: Sequence[bool]) -> bool:
     conversions among them (FS-SOLVE-SASS2), their floor division and its truncating form to one binary
     (M-JS-258, row 4123). A value the count holds concretely of a thread's place or a trip's (a warpgroup's
     index, a step's parity, a scan's carry) is none of them."""
-    if equation.primitive is lax.iota_p:
+    if equation.primitive in (lax.iota_p, control_flow.platform_index_p):
+        # An iota's, and the platform its program's compile chooses for (`_platform_branch`).
         return True
     return equation.primitive in _PURE and bool(given) and all(given)
 
