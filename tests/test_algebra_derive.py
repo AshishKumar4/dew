@@ -1139,8 +1139,8 @@ def test_chunked_moments_preserves_scaled_tangent_under_large_total_weight():
     """Moment and covariance tangents stay finite and exact via `dew.algebra.ratios.ratio` across huge total
     weights (`x=[0, 2^-60]`, `w=[0, 2^100]`), underflowing centered products, zero coefficients at min-normal
     weight (`x=[0]`, `w=[2^-126]`, `dw=[4]`), mixed forward-over-reverse derivatives across weight binades
-    (`w=[2^-60, 2^60]`, `dw=[2^70, -2^70]`), underflowing value weights, and cancelling `cx*cy - cov`
-    (row 12992)."""
+    (`w=[2^-60, 2^60]`, `dw=[2^70, -2^70]`), uniform and non-uniform shifts under underflowing recentering
+    weights, and cancelling `cx*cy - cov` (row 12992)."""
     from dew.algebra import moments
 
     x_u = jnp.asarray([[0.0, np.float32(2.0 ** -60)]], jnp.float32)
@@ -1158,6 +1158,8 @@ def test_chunked_moments_preserves_scaled_tangent_under_large_total_weight():
     x_vx = jnp.asarray([[np.float32(2.0 ** -30), 0.0]], jnp.float32)
     w_vx = jnp.asarray([[np.float32(2.0 ** -30), np.float32(2.0 ** 100)]], jnp.float32)
     dx_vx = jnp.asarray([[np.float32(2.0 ** 100), 0.0]], jnp.float32)
+    dx_unif = jnp.asarray([[np.float32(2.0 ** 100), np.float32(2.0 ** 100)]], jnp.float32)
+    dx_nonunif = jnp.asarray([[0.0, np.float32(2.0 ** 100)]], jnp.float32)
     x_cn = jnp.asarray([[np.float32(2.0 ** 50), np.float32(-(2.0 ** 50))]], jnp.float32)
     w_cn = jnp.asarray([[np.float32(2.0 ** 50), np.float32(2.0 ** 50)]], jnp.float32)
     for mode in ("walk", "merge"):
@@ -1197,6 +1199,21 @@ def test_chunked_moments_preserves_scaled_tangent_under_large_total_weight():
                 lambda x_, t=tile, m=mode: moments.chunked_moments(x_, w_vx, tile=t, mode=m),
                 (x_vx,), (dx_vx,))
             assert float(dv_vx[0]) == float(np.float32(2.0 ** -59))
+            _, (_, _, dc_unif) = jax.jvp(
+                lambda x_, t=tile, m=mode: moments.chunked_covariance(x_, x_vx, w_vx, tile=t, mode=m),
+                (x_mix,), (dx_unif,))
+            assert float(dc_unif[0]) == 0.0
+            _, (_, _, dc_nu) = jax.jvp(
+                lambda x_, t=tile, m=mode: moments.chunked_covariance(x_, x_vx, w_vx, tile=t, mode=m),
+                (x_mix,), (dx_nonunif,))
+            assert float(dc_nu[0]) == float(np.float32(-(2.0 ** -60)))
+            _, pb_cx = jax.vjp(
+                lambda x_, t=tile, m=mode: moments.chunked_covariance(x_, x_vx, w_vx, tile=t, mode=m)[2],
+                x_mix)
+            (gx_cx,) = pb_cx(jnp.asarray([np.float32(2.0 ** 100)], jnp.float32))
+            np.testing.assert_array_equal(
+                np.asarray(gx_cx),
+                np.asarray([[np.float32(2.0 ** -60), np.float32(-(2.0 ** -60))]], np.float32))
             _, (_, dv_cn) = jax.jvp(
                 lambda w_, t=tile, m=mode: moments.chunked_moments(x_cn, w_, tile=t, mode=m),
                 (w_cn,), (dw_u,))
