@@ -53,6 +53,26 @@ def test_a_bodys_lane_work_counts_over_the_warpgroup():
     assert _counted(body) == Work(operations=128, shared_bytes=2 * 4 * 128)
 
 
+def test_a_shuffle_issues_on_every_lane_of_its_warps():
+    """A body each lane of which exchanges its word with its butterfly partner (`shfl.sync.bfly`) issues a
+    shuffle a lane, as the SASS of a kernel's does (KDA's intra_own: 102,400 lane shuffles a program counted
+    against 102,656 SHFL executed, M-JS-272), where shuffles counted nothing."""
+    from jax.extend.mlir.dialects import nvvm
+
+    def body(ctx, ref):
+        del ctx
+        index = ir.IndexType.get()
+        thread = arith.index_cast(index, mgpu_utils.thread_idx())
+        word = memref.load(ref, [thread])
+        i32 = ir.IntegerType.get_signless(32)
+        exchanged = nvvm.shfl_sync(ir.F32Type.get(), arith.constant(i32, -1), word, arith.constant(i32, 1),
+                                   arith.constant(i32, 31), nvvm.ShflKind.bfly)
+        memref.store(exchanged, ref, [thread])
+
+    counted = _counted(body)
+    assert counted.shuffles == 128 and cost.issued(counted) == 128, counted
+
+
 def test_a_branch_a_lanes_place_decides_issues_for_its_warps_and_moves_its_lanes_bytes():
     """A branch the first 16 lanes take issues for their one warp, all 32 of its lanes, and moves the 16
     lanes' words alone."""

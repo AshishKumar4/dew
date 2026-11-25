@@ -936,6 +936,25 @@ def test_a_kernels_conversion_issues_as_its_assembler_lowers_it(source, target, 
                                    generation.gpu_target("sm90")) == unchanged
 
 
+def test_a_kernels_row_reduction_issues_its_butterfly():
+    """A Mosaic GPU kernel's reduction over a tile's rows' last axis issues, an output, its quad's butterfly:
+    each row's columns held on four lanes (WGMMA's and mma.sync's accumulators), two rounds of a shuffle and
+    a combine a lane beside each lane's own columns' (the attention forward's walk at 64 x 128 on sm90 and
+    64 x 64 on sm80: 12 SHFL a step for its three row reductions of 64 rows, FS-REDSHFL3), where it issued
+    no shuffle; another axis's, and XLA's, as before."""
+    tile, rows = jax.ShapeDtypeStruct((64, 128), jnp.float32), jax.ShapeDtypeStruct((64,), jnp.float32)
+    params = {"axes": (1,), "out_sharding": None}
+    in_kernel = emission.operation_work(lax.reduce_max_p, [tile], [rows], params,
+                                        generation.gpu_target("sm90"), forms=emission.ACCURATE_FORMS)
+    assert in_kernel == Work(operations=64 * 128 + 4 * 64, shuffles=8 * 64), in_kernel
+    assert emission.operation_work(lax.reduce_max_p, [tile], [rows], params,
+                                   generation.gpu_target("sm90")) == Work(operations=64 * 128)
+    columns = jax.ShapeDtypeStruct((128,), jnp.float32)
+    assert emission.operation_work(lax.reduce_max_p, [tile], [columns], {"axes": (0,), "out_sharding": None},
+                                   generation.gpu_target("sm90"), forms=emission.ACCURATE_FORMS) == Work(
+        operations=64 * 128)
+
+
 @pytest.mark.parametrize(("platform", "operations"), [("sm90", 0), ("cpu", 128), ("v5e", 256)])
 def test_a_platform_choice_counts_the_branch_its_target_runs(platform, operations):
     """A body choosing its work by the platform it lowers for (`lax.platform_dependent`) counts the branch the
