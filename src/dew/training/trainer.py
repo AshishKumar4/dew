@@ -63,7 +63,7 @@ from dew.distributed.batches import (
 )
 from dew.distributed.host import snapshot
 from dew.distributed.placement import Layout, MeshSpec, Placement, Validation, device_mesh, placed_shapes
-from dew.held_updates import holds_back, waiting
+from dew.held_updates import holds_back, input_held, waiting
 from dew.inputs import Field, InputSpec
 from dew.mesh import STAGE_AXIS, LayoutRefused, LogicalAxes
 from dew.nn.dense import NVFP4_HISTORY, NVFP4_PENDING, pending_amax
@@ -473,9 +473,7 @@ class Trainer(Generic[Loss, Effects]):
         with self._staging.held():
             opt_state = self.optimizer.init(params["params"])
         ema = self.objective.ema
-        # Its decay at the start, a constant however the state's draw is traced.
-        with jax.ensure_compile_time_eval():
-            reference = ema is not None and float(ema.decay(0)) >= 1.0
+        reference = ema is not None and self.objective.ema_is_reference
         if NVFP4_HISTORY in params and holds_back(opt_state):
             # What the calls an optimizer applies no update in record waits for the one that does (row 12994).
             params = {**params, NVFP4_PENDING: pending_amax(params[NVFP4_HISTORY])}
@@ -491,10 +489,12 @@ class Trainer(Generic[Loss, Effects]):
             # The average starts equal to the parameters but as its own buffers, copied by the transfer: the
             # step donates the state, and a buffer can be donated once.
             # No amax history is averaged: an averaged forward reads the committed one (`with_ema`); but a
-            # reference, an average that starts at unit decay (DPO's, GRPO's), holds its start's histories
-            # with its start's weights (row 12993).
+            # frozen reference (`Objective.ema_is_reference`: DPO's, GRPO's) holds its start's histories with
+            # its start's weights (row 12993).
+            # What waits to roll (`NVFP4_PENDING`) is the live run's, never averaged.
             ema=None if ema is None else jax.tree.map(transferred_copy, select(
-                params, lambda path: (path[0] != NVFP4_HISTORY or reference) and ema.select(path))),
+                params, lambda path: path[0] != NVFP4_PENDING and (path[0] != NVFP4_HISTORY or reference)
+                and ema.select(path))),
             key=run_key,
             consumed=None if self._shape.examples is None else jnp.zeros((), jnp.int32),
             deferred=waiting(opt_state))
@@ -873,8 +873,9 @@ class Trainer(Generic[Loss, Effects]):
                 self.objective, abstract.variables,
                 lambda rows, path: jax.ShapeDtypeStruct((len(rows), *rows[0].shape), rows[0].dtype)))
         share = DataPartition.of(self.device_mesh) if positioned else None
-        template = self._configured(placed_shapes(abstract, shardings))
+        template = _waiting_restored(self._configured(placed_shapes(abstract, shardings)))
         state, position = self._staging.restore(checkpoints, template, resume, share)
+        _refuse_lost_waiting(state, checkpoints, resume)
         state = restored(state, resume, self._shape.examples)
         _rollout_resumed(self.rollout, checkpoints, resume, state.key.sharding)
         self._compiler.resume_rung(checkpoints.rung(resume))
@@ -2342,3 +2343,32 @@ class Trainer(Generic[Loss, Effects]):
 
     # ------------------------------------------------------------------ Validation
     # ------------------------------------------------------------------
+
+
+def _waiting_restored(template: TrainState) -> TrainState:
+    """`template` with what waits to roll into its amax histories (`NVFP4_PENDING`) held as nothing waiting,
+    placed: a checkpoint an earlier Dew wrote holds no such collection, and a restore keeps a leaf the
+    template holds concretely where the checkpoint lacks it (`Checkpoints.restore`); one that holds it
+    restores it over this."""
+    if NVFP4_PENDING not in template.variables:
+        return template
+    nothing = jax.tree.map(lambda leaf: jax.device_put(jnp.full(leaf.shape, -1.0, leaf.dtype), leaf.sharding),
+                           template.variables[NVFP4_PENDING])
+    return dataclasses.replace(template, variables={**template.variables, NVFP4_PENDING: nothing})
+
+
+def _refuse_lost_waiting(state: TrainState, checkpoints: Checkpoints, step: int | str) -> None:
+    """Refuse a restored state whose optimizer holds an input it took (an `optax.MultiSteps` window part
+    filled) while nothing waits to roll into its amax histories (`NVFP4_PENDING`): every call taken in
+    records a largest for each projection it ran, so this is a checkpoint an earlier Dew wrote mid-window,
+    without what its taken calls recorded, which no restore can recover (row 12994)."""
+    if NVFP4_PENDING not in state.variables or not bool(input_held(state.opt_state)):
+        return
+    if all(bool((leaf < 0).all()) for leaf in jax.tree.leaves(state.variables[NVFP4_PENDING])):
+        raise ValueError(
+            f"the checkpoint at step {step} in {checkpoints.directory} was written partway through an "
+            f"update its optimizer holds back, by a Dew that kept no record of the amax its taken calls "
+            f"recorded ({NVFP4_PENDING!r}), so the delayed-scaling NVFP4 histories that update rolls cannot "
+            f"be restored; resume it from a checkpoint written where an update applied, or with the Dew "
+            f"that wrote it")
+

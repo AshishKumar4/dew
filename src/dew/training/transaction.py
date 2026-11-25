@@ -36,7 +36,7 @@ from dew.data.dataset import rows_of
 from dew.gauss_newton import solves_equations
 from dew.held_updates import holds_back, input_taken, refuse_untold, update_applied
 from dew.nn import in_backward
-from dew.nn.dense import NVFP4_HISTORY, NVFP4_PENDING, rolled, with_largest
+from dew.nn.dense import NVFP4_HISTORY, NVFP4_PENDING, rolled, rolled_waiting
 from dew.nn.finite import all_finite, leaf_finite, zeroed_unless
 from dew.nn.inspection import (
     PROBES,
@@ -1443,12 +1443,13 @@ class Transaction:
                 # applies (`done`): a gated step's rejection keeps them as they were. An optimizer that holds
                 # updates back keeps what its held calls recorded waiting (`NVFP4_PENDING`), and the call
                 # that applies one rolls the largest of them and its own.
-                largest = amax
                 if NVFP4_PENDING in params:
-                    largest, waiting = with_largest(params[NVFP4_PENDING], amax, done)
-                    params = {**params, NVFP4_PENDING: waiting}
-                params = {**params, NVFP4_HISTORY: _chosen(done, rolled(params[NVFP4_HISTORY], largest),
-                                                           params[NVFP4_HISTORY])}
+                    histories, waiting = rolled_waiting(params[NVFP4_HISTORY], params[NVFP4_PENDING], amax,
+                                                        done, input_taken(current.opt_state, opt_state))
+                    params = {**params, NVFP4_HISTORY: histories, NVFP4_PENDING: waiting}
+                else:
+                    params = {**params, NVFP4_HISTORY: _chosen(done, rolled(params[NVFP4_HISTORY], amax),
+                                                               params[NVFP4_HISTORY])}
             averaged = current.ema
             if self.objective.ema is not None:
                 if averaged is None:

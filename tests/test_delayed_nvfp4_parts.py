@@ -1,10 +1,14 @@
 """A delayed-scaling NVFP4 run's amax histories beside the parts of a run that hold weights of their own
 (row 12721): an average of the weights, which reads the committed histories, and a critic drawn apart."""
 
+import dataclasses
+
 import jax
+import jax.numpy as jnp
 import numpy as np
 import optax
-from delayed_nvfp4 import DELAYED, data, delayed_lm, histories, rolled_once
+import pytest
+from delayed_nvfp4 import DELAYED, Referenced, data, delayed_lm, histories, rolled_once
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.dense import NVFP4_HISTORY
@@ -27,19 +31,22 @@ def test_an_averaged_forward_reads_the_committed_histories():
 
 
 def test_a_reference_keeps_the_histories_it_started_with():
-    """A run whose average is a frozen reference (unit decay: DPO's, GRPO's) holds its start's amax histories
-    with its start's weights: a forward over the reference (`TrainState.averaged`) reads the histories the
-    run began with, bit for bit, while the run's own roll on (row 12993: the reference read the live
-    histories beside its frozen weights)."""
+    """A run whose average is a frozen reference (`Objective.ema_is_reference`: DPO's, GRPO's) holds its
+    start's amax histories with its start's weights: a forward over the reference (`TrainState.averaged`)
+    reads the histories the run began with, bit for bit, while the run's own roll on (row 12993: the
+    reference read the live histories beside its frozen weights)."""
     with generation.run_precision(DELAYED):
-        trainer = delayed_lm(1, ema_decay=1.0)
+        trainer = delayed_lm(1, ema_decay=1.0, objective=Referenced)
         started = histories(trainer.place()[0])
         trained = trainer.fit(data(), steps=2)
-    rolled_on = histories(trained)
-    for start, read, now in zip(started, jax.tree.leaves(trained.averaged[NVFP4_HISTORY]), rolled_on,
+    for start, read, now in zip(started, jax.tree.leaves(trained.averaged[NVFP4_HISTORY]), histories(trained),
                                 strict=True):
         np.testing.assert_array_equal(np.asarray(read), start)
         assert now[..., 0].min() > 0, now
+
+
+def _every_second() -> optax.GradientTransformation:
+    return optax.MultiSteps(optax.adamw(1e-3), 2).gradient_transformation()
 
 
 def test_an_optimizer_holding_updates_back_rolls_the_largest_of_every_call_it_held():
@@ -48,22 +55,63 @@ def test_an_optimizer_holding_updates_back_rolls_the_largest_of_every_call_it_he
     wait (`NVFP4_PENDING`) where it applies nothing, so the history after two calls is the history a run
     reading both calls' rows as one step's two microbatches rolls (row 12994: the second rolled its own
     alone)."""
-    from delayed_nvfp4 import SEQ
-
-    from dew.objectives.lm import LMObjective
-
-    def trainer(optimizer, split: int) -> Trainer:
-        model = CausalTransformer(vocab_size=64, emb_features=128, num_layers=2, num_heads=2,
-                                  mlp_features=256, max_seq_len=SEQ)
-        return Trainer(LMObjective(model, seq_len=SEQ), optimizer, key=0, split=split)
-
     with generation.run_precision(DELAYED):
-        every_second = optax.MultiSteps(optax.adamw(1e-3), 2).gradient_transformation()
-        held = trainer(every_second, 1).fit(data(), steps=2)
-        joined = trainer(optax.adamw(1e-3), 2).fit(data(32), steps=1)
+        held = delayed_lm(1, optimizer=_every_second()).fit(data(), steps=2)
+        joined = delayed_lm(2).fit(data(32), steps=1)
     for one, other in zip(histories(held), histories(joined), strict=True):
         np.testing.assert_array_equal(one, other)
         assert one[..., 0].min() > 0 and not one[..., 1:].any(), one
+
+
+def test_what_waits_rolls_once_an_update_applies_and_a_skipped_input_waits_for_none():
+    """What waits to roll (`rolled_waiting`): a call the optimizer skips adds nothing, even its largest
+    magnitude; the call that applies an update rolls the larger of its own and what waited, a projection an
+    earlier call ran and it did not among them, a recorded zero as any magnitude; nothing waits after, and a
+    history nothing waited for keeps as it was (row 12994's review)."""
+    from dew.nn.dense import pending_amax, rolled_waiting
+
+    started = {"ran": jnp.zeros((3,)), "earlier": jnp.zeros((3,)), "zero": jnp.zeros((3,)),
+               "never": jnp.asarray([5.0, 4.0, 3.0])}
+    yes, no = jnp.asarray(a=True), jnp.asarray(a=False)
+    waiting = pending_amax(started)
+    _, waiting = rolled_waiting(started, waiting, {"ran": 2.0, "earlier": 7.0, "zero": 0.0}, no, yes)
+    _, waiting = rolled_waiting(started, waiting, {"ran": 9.0}, no, no)
+    rolled, after = rolled_waiting(started, waiting, {"ran": 3.0}, yes, yes)
+    assert {name: np.asarray(value).tolist() for name, value in rolled.items()} == {
+        "ran": [3.0, 0.0, 0.0], "earlier": [7.0, 0.0, 0.0], "zero": [0.0, 0.0, 0.0], "never": [5.0, 4.0, 3.0]}
+    assert all(float(value) == -1.0 for value in jax.tree.leaves(after))
+
+
+def test_a_run_resumed_partway_through_a_held_update_rolls_what_its_taken_calls_recorded(tmp_path):
+    """A run whose optimizer holds updates back, resumed from a checkpoint written partway through one,
+    restores what its taken call recorded (`NVFP4_PENDING`) and rolls the histories the uninterrupted run
+    rolls; a checkpoint an earlier Dew wrote, which holds none, resumes where an update applied, nothing
+    waiting, and is refused partway through one, whose records it lost (row 12994's review)."""
+    from dew.checkpoints import Checkpoints
+    from dew.nn.dense import NVFP4_PENDING
+
+    with generation.run_precision(DELAYED):
+        whole = delayed_lm(1, optimizer=_every_second()).fit(data(), steps=4)
+        delayed_lm(1, Checkpoints(str(tmp_path / "run")), optimizer=_every_second()).fit(
+            data(), steps=3, checkpoint_every=1)
+        resumed = delayed_lm(1, Checkpoints(str(tmp_path / "run")), optimizer=_every_second()).fit(
+            data(), steps=4, checkpoint_every=1)
+        for one, other in zip(histories(resumed), histories(whole), strict=True):
+            np.testing.assert_array_equal(one, other)
+        for step, held in ((2, False), (3, True)):
+            source = delayed_lm(1, Checkpoints(str(tmp_path / "run")), optimizer=_every_second())
+            state = source.checkpoints.restore(source.place()[0], step)[0]
+            legacy = Checkpoints(str(tmp_path / f"legacy-{step}"))
+            legacy.save(step, dataclasses.replace(state, variables={
+                name: value for name, value in state.variables.items() if name != NVFP4_PENDING}))
+            legacy.wait()
+            again = delayed_lm(1, Checkpoints(str(tmp_path / f"legacy-{step}")), optimizer=_every_second())
+            if held:
+                with pytest.raises(ValueError):
+                    again.place()
+            else:
+                waits = again.place()[0].variables[NVFP4_PENDING]
+                assert all(float(leaf.max()) == -1.0 for leaf in jax.tree.leaves(waits))
 
 
 def test_a_ppo_steps_records_are_its_own_passes_its_critics_among_them():

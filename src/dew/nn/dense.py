@@ -327,33 +327,39 @@ a training step takes the largest of across its calls and microbatches and rolls
 
 NVFP4_PENDING = 'nvfp4_pending'
 """The collection of the largest magnitudes a delayed-scaling NVFP4 run recorded in calls an optimizer that
-holds updates back (`optax.MultiSteps`) applied none of, which the call that applies one rolls in with its
-own (row 12994): each history's (`NVFP4_HISTORY`) mirror, float32 `[]` (`[layers]` in a scanned stack),
-zero where none waits. A run whose optimizer applies every update holds none."""
+holds updates back (`optax.MultiSteps`) took in but applied no update in, which the call that applies one
+rolls in with its own (`rolled_waiting`, row 12994): each history's (`NVFP4_HISTORY`) mirror, float32 `[]`
+(`[layers]` in a scanned stack), -1 where nothing waits (a magnitude is never below zero, and zero is one). A
+run whose optimizer applies every update holds none."""
 
 
 def pending_amax(histories: Mapping) -> dict:
-    """An `NVFP4_PENDING` collection for `histories` with none waiting: each history's newest place, zero."""
-    return {name: pending_amax(value) if isinstance(value, Mapping) else jnp.zeros_like(value[..., 0])
+    """An `NVFP4_PENDING` collection for `histories` with nothing waiting: each history's newest place, -1."""
+    return {name: pending_amax(value) if isinstance(value, Mapping) else jnp.full_like(value[..., 0], -1.0)
             for name, value in histories.items()}
 
 
-def with_largest(pending: Mapping, amaxes: Mapping, applied: jax.Array) -> tuple[dict, dict]:
-    """The largest magnitudes a step rolls (`rolled`) and the `NVFP4_PENDING` collection it leaves: each
-    history `amaxes` holds a largest for takes the larger of it and what waited, which rolls where the step
-    `applied` its update and waits on otherwise; every other waits as it was."""
-    def at(name, value):
-        if isinstance(value, Mapping):
-            return with_largest(value, amaxes.get(name, {}), applied)
-        if name not in amaxes:
-            return None, value
-        largest = jnp.maximum(value, jnp.reshape(jnp.asarray(amaxes[name], value.dtype), value.shape))
-        return largest, jnp.where(applied, jnp.zeros_like(largest), largest)
+def rolled_waiting(histories: Mapping, pending: Mapping, amaxes: Mapping, applied: jax.Array,
+                   taken: jax.Array) -> tuple[dict, dict]:
+    """`histories` and their `NVFP4_PENDING` collection `pending` after a step under an optimizer that holds
+    updates back: each history `amaxes` holds a largest for waits on the larger of it and what waited where
+    the optimizer `taken` the step's input (a skipped input's records wait for no update); where the step
+    `applied` an update, every history something waits for rolls it in, newest (`rolled`), a projection an
+    earlier call ran and this one did not among them, and nothing waits after."""
+    def at(name, history):
+        if isinstance(history, Mapping):
+            return rolled_waiting(history, pending[name], amaxes.get(name, {}), applied, taken)
+        waiting = pending[name]
+        if name in amaxes:
+            recorded = jnp.reshape(jnp.asarray(amaxes[name], waiting.dtype), waiting.shape)
+            waiting = jnp.where(taken, jnp.maximum(waiting, recorded), waiting)
+        newest = jnp.reshape(waiting.astype(history.dtype), (*history.shape[:-1], 1))
+        moved = jnp.concatenate([newest, history[..., :-1]], axis=-1)
+        rolls = jnp.reshape(applied & (waiting >= 0), (*history.shape[:-1], 1))
+        return jnp.where(rolls, moved, history), jnp.where(applied, jnp.full_like(waiting, -1.0), waiting)
 
-    pairs = {name: at(name, value) for name, value in pending.items()}
-    # A history no call of the step ran rolls nothing (`rolled`): it is no key of what rolls.
-    rolling = {name: pair[0] for name, pair in pairs.items() if pair[0] is not None}
-    return rolling, {name: pair[1] for name, pair in pairs.items()}
+    pairs = {name: at(name, value) for name, value in histories.items()}
+    return {name: pair[0] for name, pair in pairs.items()}, {name: pair[1] for name, pair in pairs.items()}
 
 
 def amax_history(layer: nn.Module, name: str, shape: tuple[int, ...]) -> nn.Variable | None:

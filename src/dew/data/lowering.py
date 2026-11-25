@@ -146,6 +146,7 @@ from dew.data.pipeline import (
     Windows,
     Workers,
     accounts,
+    allocation,
     chains,
     children,
     consumed_by,
@@ -1397,15 +1398,34 @@ class _Build:
         streams = self.read == "streamed" or cached
         return self.elastic or (self.training and not self.global_order and not streams)
 
-    def child(self, index: int, capacities: Sequence[int | None] = ()) -> _Build:
+    def child(self, index: int) -> _Build:
         """The build of the `index`th corpus a mixture, phases or a concatenation reads, by its own
-        analysis, keyed by the name it goes by there (`_member_key`), its share of the pool within each
-        member's `capacities` (`dew.data.pipeline.allocation`, `capacities`)."""
+        analysis, keyed by the name it goes by there (`_member_key`), at its share of the pool."""
+        return self._member(index, None if self.pool is None else self._shares[index])
+
+    def member_builds(self, capacities: Sequence[int | None]) -> list[_Build]:
+        """Every member's build (`child`), the pool shared out once for them all within each member's
+        `capacities` (`dew.data.pipeline.allocation`, `capacities`)."""
+        if self.pool is None or not capacities:
+            return [self.child(index) for index in range(len(self.lowering.children))]
+        counts = allocation(self.pool.count, self._weights, tuple(capacities))
+        return [self._member(index, Workers(count, self.pool.buffer)) for index, count in enumerate(counts)]
+
+    @functools.cached_property
+    def _weights(self) -> tuple[float, ...]:
+        """A mixture's draw weights (`_Lowering.draws`), which its members share its workers by; phases' and
+        a concatenation's, each read in turn, equal."""
+        return tuple(self.lowering.draws) or (1.0,) * len(self.lowering.children)
+
+    @functools.cached_property
+    def _shares(self) -> tuple[Workers, ...]:
+        """Each member's share of the pool (`allocation`), worked out once for the build: a member's build
+        asked of each of a thousand corpora worked it out whole for each."""
+        assert self.pool is not None
+        return tuple(Workers(count, self.pool.buffer) for count in allocation(self.pool.count, self._weights))
+
+    def _member(self, index: int, pool: Workers | None) -> _Build:
         members = strings(self.lowering.order["members"], "mixture members")
-        # A mixture's members share its workers by their draw weights (`_Lowering.draws`); phases' and a
-        # concatenation's, each read in turn, equally.
-        weights = list(self.lowering.draws) or [1.0] * len(members)
-        pool = None if self.pool is None else self.pool.shared(weights, index, capacities)
         loading = self.loading if pool is None else dataclasses.replace(self.loading, workers=pool.count)
         # A member's own mixes stamp nothing: only the phase's mix draws what other phases read on.
         return dataclasses.replace(self, lowering=self.lowering.children[index], loading=loading, pool=pool,
@@ -1452,9 +1472,9 @@ class _Build:
             return {}
         if not isinstance(source, Combined):
             return {"/".join(str(key) for key in build.corpus): build.pool.count}
-        capacities = build.capacities(pipeline, partition)
-        return {key: count for index, child in enumerate(source.pipelines)
-                for key, count in build.child(index, capacities).pools(child, partition).items()}
+        builds = build.member_builds(build.capacities(pipeline, partition))
+        return {key: count for child, member in zip(source.pipelines, builds, strict=True)
+                for key, count in member.pools(child, partition).items()}
 
     def capacities(self, pipeline: Pipeline, partition: DataPartition) -> tuple[int | None, ...]:
         """The most of a shared pool's workers each corpus `pipeline` mixes can take where its read streams
@@ -1496,8 +1516,7 @@ class _Build:
         read-ahead: a mix of hundreds of corpora holds what a read of one does, and a corpus whose share
         is no thread reads on the thread that draws from it."""
         nested = children(pipeline)
-        capacities = self.capacities(pipeline, partition)
-        builds = [self.child(index, capacities) for index in range(len(nested))]
+        builds = self.member_builds(self.capacities(pipeline, partition))
         builds = [dataclasses.replace(build, loading=dataclasses.replace(
             build.loading, threads=build.loading.threads // len(nested),
             read_buffer=build.loading.read_buffer // len(nested))) for build in builds]

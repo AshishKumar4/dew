@@ -20,14 +20,24 @@ DELAYED = Numerics(DTYPE_PRESETS["bf16-mixed"], low_precision=LowPrecision(recip
 """A run's numerics in the delayed-scaling NVFP4 recipe, which takes the feed-forward's projections."""
 
 
-def delayed_lm(split: int, checkpoints: Checkpoints | None = None, ema_decay: float | None = None) -> Trainer:
+class Referenced(LMObjective):
+    """An LM whose average is a frozen reference, as a preference or GRPO objective's is
+    (`Objective.ema_is_reference`)."""
+
+    ema_is_reference = True
+
+
+def delayed_lm(split: int, checkpoints: Checkpoints | None = None, ema_decay: float | None = None, *,
+               optimizer: optax.GradientTransformation | None = None,
+               objective: type[LMObjective] = LMObjective) -> Trainer:
     """A two-layer LM whose feed-forward projections the delayed recipe takes, initialized under it (so its
     variables hold their histories), its batch of sixteen rows read in `split` microbatches, keeping an
-    average of its weights at `ema_decay` where given."""
+    average of its weights at `ema_decay` where given, by `optimizer` (AdamW where none is given) and as
+    `objective` (an `LMObjective` class)."""
     model = CausalTransformer(vocab_size=64, emb_features=128, num_layers=2, num_heads=2, mlp_features=256,
                               max_seq_len=SEQ)
-    return Trainer(LMObjective(model, seq_len=SEQ, ema_decay=ema_decay), optax.adamw(1e-3), key=0,
-                   split=split, checkpoints=checkpoints)
+    return Trainer(objective(model, seq_len=SEQ, ema_decay=ema_decay), optimizer or optax.adamw(1e-3),
+                   key=0, split=split, checkpoints=checkpoints)
 
 
 def data(rows: int = 16) -> Pipeline:
