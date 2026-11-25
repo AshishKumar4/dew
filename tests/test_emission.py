@@ -11,7 +11,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from kernel_compile import lowered_for
 from reference_error import ahead_arm
 
-from dew.nn import precision, programs
+from dew.nn import programs
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import cost, emission, mosaic
 from dew.nn.kernels.templates.cost import Stated, Work
@@ -925,26 +925,6 @@ def test_an_fp32_division_in_a_kernel_issues_a_reciprocal_and_its_refinement():
         assert priced(jnp.float32, tpu, forms) == Work(operations=128)
     assert priced(jnp.float32, hopper, None) == Work(operations=128)
     assert priced(jnp.int32, hopper, emission.ACCURATE_FORMS) == Work(integer_operations=128)
-
-
-def test_a_correctly_rounded_division_prices_as_it_lowers():
-    """A correctly rounded fp32 division (`precision.correctly_rounded_divide`) prices as each backend lowers
-    it: a Pallas Triton kernel's native `div.rn.f32` (`emission.TRITON_FORMS`), one MUFU beside five FFMAs and
-    an FCHK an element on its common path (FS-DIV-SASS5); XLA's and a Mosaic GPU kernel's its software
-    division (`precision._correctly_rounded_divide`), its significands' and residual's divisions among its
-    bit arithmetic, above a plain division's MUFU and refinement, never one operation an element."""
-    hopper = generation.gpu_target("sm90")
-    row = jax.ShapeDtypeStruct((128,), jnp.float32)
-
-    def priced(forms) -> Work:
-        return emission.operation_work(precision.correctly_rounded_divide_p, [row, row], [row], {}, hopper,
-                                       forms=forms)
-
-    assert priced(emission.TRITON_FORMS) == Work(exponentials=128, operations=6 * 128)
-    software = priced(emission.ACCURATE_FORMS)
-    plain = emission.operation_work(lax.div_p, [row, row], [row], {}, hopper, forms=emission.ACCURATE_FORMS)
-    assert software.exponentials >= 128 and cost.issued(software) > cost.issued(plain), (software, plain)
-    assert cost.issued(priced(None)) > 128
 
 
 @pytest.mark.parametrize(("body", "fused"), [

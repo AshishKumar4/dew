@@ -256,14 +256,6 @@ convert; exp2, sqrt and rsqrt their approximate forms. A sin's and a cos's accur
 reduction for large arguments, which a static count misstates: unpriced, with log1p and pow, which Mosaic
 GPU lowers in neither form. An fp32 division its one form (`MOSAIC_DIVISION`)."""
 
-TRITON_FORMS: Mapping = {**{function: Work(exponentials=1) for function in APPROXIMATED},
-                         precision.correctly_rounded_divide_p: Work(exponentials=1, operations=6)}
-"""A Pallas Triton kernel's forms: each special function one exponential an element, as a kernel of no
-measured forms (`operation_work`'s rule where it has none); a correctly rounded fp32 division its native
-`div.rn.f32` (`precision.triton_lowerings`), on its common path a MUFU.RCP beside five FFMAs and an FCHK an
-element, its slow path, a subnormal's or an extreme's, a call a count takes as not run (sm90's SASS of a
-hand-written kernel of one, FS-DIV-SASS5)."""
-
 
 _FREE = frozenset({
     lax.axis_index_p, gpu.barrier_arrive_p, gpu.barrier_wait_p, lax.bitcast_convert_type_p,
@@ -1039,19 +1031,6 @@ def _divides_on_cuda(outputs: Sequence, target: generation.GpuTarget | None) -> 
             and all(aval.dtype == jnp.float32 for aval in outputs))
 
 
-def _expansion_work(expansion: Callable, inputs: Sequence, target: generation.GpuTarget | None,
-                    forms: Mapping | None) -> Work:
-    """What an operation lowered as `expansion` (a function of arrays, its MLIR lowering's) computes over
-    operands of the avals `inputs`: its traced equations' work, each by `operation_work`, summed (a
-    straight-line expansion's)."""
-    traced = jax.make_jaxpr(expansion)(*(jax.ShapeDtypeStruct(aval.shape, aval.dtype) for aval in inputs))
-    total = Work()
-    for equation in traced.jaxpr.eqns:
-        total = total + operation_work(equation.primitive, [atom.aval for atom in equation.invars],
-                                       [atom.aval for atom in equation.outvars], equation.params, target,
-                                       forms=forms)
-    return total
-
 
 def _operated(primitive, inputs: Sequence, outputs: Sequence) -> Work:
     """An elementwise operation's work, one an output element, a clamp's two (a maximum and a minimum: no
@@ -1110,15 +1089,8 @@ def operation_work(primitive, inputs: Sequence, outputs: Sequence, params: Mappi
     nothing (`_FREE`: a layout change, a barrier); any other primitive's output elements unpriced
     (`Work.unpriced_operations`). With `forms` (a kernel's: `APPROXIMATE_FORMS`, `ACCURATE_FORMS`), a special
     function issues its form an output element, one with none unpriced. An fp32 division on a CUDA target
-    issues its kernel's form (`MOSAIC_DIVISION`), XLA's own unmeasured an operation an element, as other
-    widths' and a TPU's; a correctly rounded one its native form where a kernel's forms state one
-    (`TRITON_FORMS`),
-    else the software division it lowers to (`precision._correctly_rounded_divide`, XLA's and Mosaic GPU's
-    lowering), counted equation by equation."""
-    if primitive is precision.correctly_rounded_divide_p:
-        if (native := (forms or {}).get(primitive)) is not None:
-            return repeated(native, sum(_elements(aval) for aval in outputs))
-        return _expansion_work(precision._correctly_rounded_divide, inputs, target, forms)
+    issues its kernel's form (`MOSAIC_DIVISION`); XLA's own, other widths', a TPU's and a correctly rounded
+    one's, unmeasured, an operation an element (row 12886)."""
     if primitive is lax.div_p and forms is not None and _divides_on_cuda(outputs, target) and (
             (form := forms.get(primitive)) is not None):
         return repeated(form, sum(_elements(aval) for aval in outputs))
@@ -1235,7 +1207,7 @@ def _launched(kernel, stated: Stated) -> "Launched":
     issuing = counted.issued(issue_slots, stated.steps, programs)
     # A Mosaic GPU program's warps: a core map's (`plgpu.kernel`) or a call compiled with Mosaic GPU's
     # parameters (`forms_of`); another backend's unknown.
-    mosaic = kernel.primitive is mpmd.mpmd_map_p or forms in (APPROXIMATE_FORMS, ACCURATE_FORMS)
+    mosaic = kernel.primitive is mpmd.mpmd_map_p or forms is not None
     return Launched(dataclasses.replace(work, issue_excess=max(0.0, issue_slots(work) - issuing)),
                     _warps(counted) if mosaic else 0.0)
 
@@ -1278,11 +1250,8 @@ launch's lowering cache holds (`tuning.lowered_once`) answers with the body it t
 def forms_of(compiler_params) -> Mapping | None:
     """The special functions' forms a kernel compiled with `compiler_params` lowers them to (a kernel
     equation's own, `launch_work`; a launch's family's, `Family.compiled_with`): a Mosaic GPU kernel's
-    approximate forms where they ask `approx_math`, its accurate ones elsewhere; a Pallas Triton kernel's its
-    own (`TRITON_FORMS`); None for another backend's (a Mosaic TPU kernel), counted by `operation_work`'s one
-    rule."""
-    if isinstance(compiler_params, Mapping) and "triton" in compiler_params:
-        return TRITON_FORMS
+    approximate forms where they ask `approx_math`, its accurate ones elsewhere; None for another backend's (a
+    Mosaic TPU or Triton kernel), counted by `operation_work`'s one rule."""
     held = compiler_params.get("mosaic_gpu") if isinstance(compiler_params, Mapping) else compiler_params
     if not isinstance(held, gpu_core.CompilerParams):
         return None
