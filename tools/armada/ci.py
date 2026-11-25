@@ -874,6 +874,9 @@ def plan(target: float, timings: dict, census: bool = False, reach: dict | None 
     # What every entry carries to its task (.armada.json's command): the cache's policy, the census, and
     # main's commit, which a task's checkout cannot find (`mainline`).
     stamped = {"cache": cache, "census": "1" if census else "0", "main": mainline() or ""}
+    # Its lookups key a limit as a medium container's task reads it (`digests.PLANNED_LIMITS`): none binds
+    # here.
+    os.environ.setdefault(digests.PLANNED_LIMITS, json.dumps({"limit:memory": str(session.MEDIUM_MEMORY)}))
     every = test_files()
     # Every file's check-1 sites its marks shard, refused where one site's map tasks outnumber what its
     # judges' job takes (`refused_sites`).
@@ -1367,7 +1370,8 @@ def unrun(python: str, tests: list[str], group: str, site: re.Match[str] | None,
         tests, stale_rows = afforded(python, tests, group, kept, deadline - (time.monotonic() - began))
         rows += stale_rows
     rows = judged(rows) if judged else rows
-    if token := os.environ.get("DEW_XLA_CACHE_TOKEN"):
+    # A reused row named main's commit's only where the run keeps records (`RECORDS`).
+    if (token := os.environ.get("DEW_XLA_CACHE_TOKEN")) and os.environ.get(RECORDS) != "off":
         unnamed = {found["name"] for found in rows if found["name"] in named and found["exitCode"] == 0
                    and not run_keys.baselined(python, found["name"], named[found["name"]][0], token, found)}
         for found in rows:
@@ -1404,17 +1408,23 @@ class Processes:
     first_selected: list[str]
 
 
+RECORDS = "DEW_RECORDS"
+"""Where a task's run is told to keep no record ("off"): a suspect's (ops queue/suspect.sh), whose cache-off
+and repeated runs wrote each row's records again on keys a train's run holds."""
+
+
 def ran_in_processes(base: list[str], resumes: bool,
                      environment_of: Callable[[Path | None], dict[str, str]], recycle_at: int | None,
                      root: Path, ends: float, grace: float, files: tuple[Path, Path, Path],
                      named: tuple[str, list[str], str], began: float, aside: Path,
                      done_before: Mapping[str, float]) -> Processes | None:
-    """A task's pytest command (`base`, its set-aside and recycling plugins added), run again in a fresh process after each that recycle.py ended past
-    `recycle_at` resident (its files beside the task's temporary ones in `root`, never in its checkout, whose
-    writes a row's record weighs), the tests each reported set aside from the next (progress.py's SET_ASIDE
-    file, `aside`); None where its time ran out before its first began. Only a process that ended as
-    recycle.py ends one (pytest's interrupted exit, its report holding the test it ended after) is run past:
-    any other end (a crash after its report, a kill) is the last."""
+    """A task's pytest command (`base`, its set-aside and recycling plugins added), run again in a fresh
+    process after each that recycle.py ended past `recycle_at` resident (its files beside the task's
+    temporary ones in `root`, never in its checkout, whose writes a row's record weighs), the tests each
+    reported set aside from the next (progress.py's SET_ASIDE file, `aside`); None where its time ran out
+    before its first began. Only a process that ended as recycle.py ends one (pytest's interrupted exit,
+    its report holding the test it ended after) is run past: any other end (a crash after its report, a
+    kill) is the last."""
     report, pid, collection = files
     python, tests, group = named
     # A resuming task's, or a dry prepare's, tests set aside as they pass; a dry prepare's run past a recycle.
@@ -1521,7 +1531,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # A traced run's rows, timed under tracing, are no rows to reuse, nor the census's, nor a resumed one's,
     # whose earlier attempt's opens no record holds; no other read their epochs (`epochs_first`).
     recording = (recorded and coverage is None and not (environ and check1_wire().CENSUS in environ)
-                 and not done_before)
+                 and not done_before and os.environ.get(RECORDS) != "off")
     began_in = epochs_first(python, tests, group, common, network, ends, recording)
     with temp_roots.temp_root() as root:
         processes = ran_in_processes(

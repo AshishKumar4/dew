@@ -121,9 +121,25 @@ def digested(source: bytes, path: str) -> dict[str, bytes] | None:
 
         visit_AsyncFunctionDef = visit_FunctionDef
 
+        def visit_If(self, node: ast.If) -> ast.AST:
+            # An `if TYPE_CHECKING:` block never runs: its imports and names are a type checker's alone, so
+            # none of it is a run's input (2026-11-25: such an import's edit re-keyed most rows that imported
+            # its module, unrun).
+            if checking(node.test):
+                node.body = [ast.Pass()]
+            self.generic_visit(node)
+            return node
+
     top = ast.dump(Hollow().visit(tree)) + json.dumps(shapes(code))
     digests = {name: hashlib.sha256("\n".join(dumps).encode()).digest() for name, dumps in found.items()}
     return {**digests, followed.TOP: hashlib.sha256(top.encode()).digest()}
+
+
+def checking(test: ast.expr) -> bool:
+    """Whether `test` is typing's TYPE_CHECKING (`TYPE_CHECKING`, `typing.TYPE_CHECKING`), false whenever a
+    module runs."""
+    return (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING"
+            or isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING")
 
 
 def compiled(source: bytes, path: str) -> types.CodeType | str:
@@ -147,6 +163,11 @@ def shapes(module: types.CodeType) -> list[list]:
                 found.append([const.co_qualname, const.co_flags if outer else list(const.co_cellvars)])
                 pending.append(const)
     return sorted(found, key=json.dumps)
+
+
+PLANNED_LIMITS = "DEW_PLANNED_LIMITS"
+"""Where a planner finds the execution limits of the tasks it plans (JSON, followed.py's LIMITS names to their
+values), which `contents` keys a limit by where none binds it (`plan` sets it)."""
 
 
 HARNESS = "tools/armada/"
@@ -181,7 +202,12 @@ def contents(name: str) -> bytes:
     probe answers of it (`probed`), never its bytes, which no probe reads. An import's search of a checkout
     directory for a name (followed.py's `LOOKUP`) is what that search finds there (`looked_up`)."""
     if name.startswith("limit:"):
-        return hashlib.sha256(host().limit(name).encode()).digest()
+        limit = host().limit(name)
+        # A planner, bound by no limit, keys a limit as the task it plans runs under (`PLANNED_LIMITS`), else
+        # its key of every row that read one was never a task's (2026-11-25: 24% of a plan's rows).
+        if limit == "max" and (planned := os.environ.get(PLANNED_LIMITS)):
+            limit = json.loads(planned).get(name, limit)
+        return hashlib.sha256(limit.encode()).digest()
     if name.startswith(followed.PROBED):
         return probed(Path(name.removeprefix(followed.PROBED)))
     if name.startswith(followed.LOOKUP):
@@ -192,6 +218,10 @@ def contents(name: str) -> bytes:
             return MISSING
         return code_of(path) if executed == followed.WHOLE else unit(path, executed)
     path = Path(name)
+    # A fetched fixture's store holds each file under its sha256 (tools/fetched_fixtures.py's LOCAL): such a
+    # file is its name, there or not, as a planner holds no store; and the store's directory no input.
+    if (stored := Path(os.path.normpath(name))).is_relative_to(fetched.LOCAL):
+        return hashlib.sha256(stored.as_posix().encode()).digest()
     manifest = fetched.manifest(path) if path.name else None
     if manifest is not None and manifest.is_file():
         return bytes.fromhex(json.loads(manifest.read_text())["sha256"])
@@ -199,7 +229,8 @@ def contents(name: str) -> bytes:
         return hashlib.sha256(path.read_bytes()).digest()
     if path.is_dir():
         entries = sorted(entry.name for entry in path.iterdir()
-                         if not entry.name.startswith(".") and not built(entry))
+                         if not entry.name.startswith(".") and not built(entry)
+                         and Path(os.path.normpath(entry)) != Path(fetched.LOCAL))
         return hashlib.sha256("\n".join(entries).encode()).digest()
     return MISSING
 

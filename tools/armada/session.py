@@ -658,12 +658,17 @@ def entries(path: Path = DURATIONS) -> dict[str, Entry]:
     return json.loads(path.read_text()) if path.is_file() else {}
 
 
-LARGE_FROM = 5 * 2**30
+MEDIUM_MEMORY = 10 * 2**30
+"""The memory a medium container's tasks run under (armada's `tasksMemoryOf`, its 12 GiB less the 2 GiB the
+container keeps): what a task's `limit:memory` reads there, which a planner keys it as (ci.py's `plan`)."""
+
+
+LARGE_FROM = MEDIUM_MEMORY // 2
 """A file's peak (`heavy_files`) past which its tasks run on a large container: half the memory a medium's
-tasks run under (armada's `tasksMemoryOf`, its 12 GiB less the 2 GiB the container keeps), so no two such
-tasks share a medium, which armada packs light tasks into by each task's own measures alone, and a regrouped
-file's new task has none (row 6003: a group's four ranks peaked at 7.17 GiB, and two packed on a medium had a
-rank killed). Through armada's own per-entry `size`; a large task armada still packs only by its measures."""
+tasks run under (`MEDIUM_MEMORY`), so no two such tasks share a medium, which armada packs light tasks into
+by each task's own measures alone, and a regrouped file's new task has none (row 6003: a group's four ranks
+peaked at 7.17 GiB, and two packed on a medium had a rank killed). Through armada's own per-entry `size`; a
+large task armada still packs only by its measures."""
 
 
 PEAK_MOVES = 0.25
