@@ -388,14 +388,14 @@ class SplitWalk:
     partial_bytes: float = 0.0
     """One slice's fp32 partials of the output as its launch declares them (its rows padded, gathered or
     scattered), which a split launch holds `splits` of until their sum."""
-    workspace: float | None = None
-    """The most a launch holds beside its operands and output (`GpuTarget.reference_workspace`), which a
-    split's partials stay within (`best_splits`); None where the target states none."""
+    target: "generation.GpuTarget | None" = None
+    """The GPU the walk runs on, whose reference workspace a split's partials stay within (`best_splits`,
+    `within_workspace`); None where none is stated."""
 
     def holds(self, splits: int) -> bool:
-        """Whether `splits` slices' partials stay within the reference's workspace (`workspace`): one
+        """Whether `splits` slices' partials stay within the reference's workspace (`within_workspace`): one
         slice holds none, its tile summed in registers."""
-        return splits == 1 or self.workspace is None or splits * self.partial_bytes <= self.workspace
+        return splits == 1 or within_workspace(self.target, splits * self.partial_bytes)
 
     def walk(self, splits: int) -> float:
         """The busiest program's walk at `splits` slices a tile, in steps: its waves' share of every tile's
@@ -477,8 +477,7 @@ def split_walk(tiles: "Tiles", *, groups: int, rows: int, depth: int, width: int
                      0.0 if launch_seconds is None else launch_seconds / step_seconds,
                      held * width * stored / bandwidth / step_seconds,
                      drift_horizon, drift_extra,
-                     held * width * 4.0 if partial_bytes is None else partial_bytes,
-                     None if target is None else target.reference_workspace)
+                     held * width * 4.0 if partial_bytes is None else partial_bytes, target)
 
 
 def decode_contraction(tiles: "Tiles", target, *, rows: int, groups: int, depth: int, width: int,
