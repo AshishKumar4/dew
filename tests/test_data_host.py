@@ -63,6 +63,19 @@ def test_a_cgroups_reclaimable_page_cache_is_room_for_automatic_loading(tmp_path
     assert host.memory == 2 * 2**30 - int(1.9 * 2**30) + int(1.5 * 2**30)
 
 
+def test_a_v1_memory_controllers_limit_bounds_automatic_loading(tmp_path):
+    """Under cgroup v1 a group's memory limit is its memory controller's (`memory.limit_in_bytes`, at that
+    controller's own mount), which bounds automatic loading as a v2 limit does, where the host read v2's
+    alone and sized a v1 container's loading by the machine's memory (row 13035)."""
+    from dew.data.dataset import Host
+
+    membership = tmp_path / "cgroup"
+    membership.write_text("4:cpu,cpuacct:/job\n5:memory:/job\n")
+    (tmp_path / "memory/job").mkdir(parents=True)
+    (tmp_path / "memory/job/memory.limit_in_bytes").write_text(f"{2**20}\n")
+    assert Host.current(tmp_path, membership).memory == 2**20
+
+
 def test_a_process_reads_its_cgroups_limits_through_the_reader_a_tool_loads_before_dew(tmp_path):
     """The cgroup reader Dew's loading sizes by is the one a tool loads by its path before Dew is
     importable, as CI's host keys do (row 4161): in a fresh interpreter that imports none of Dew, it
