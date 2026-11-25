@@ -295,14 +295,6 @@ def identity(record: Mapping) -> str:
     return f"{named} [{record['cell']}]" if record.get("cell") else named
 
 
-def placed(cell: str) -> tuple[str, str]:
-    """An unprepared cell's test and where in it, as `identity` names them (a deferred cell's label
-    dropped)."""
-    named = cell.rsplit(" [", 1)[0] if cell.endswith("]") else cell
-    test, _, where = named.rpartition(" @ ")
-    return test, where
-
-
 def as_ran(row: dict, stale: str) -> dict:
     """A dry prepare's `row`, red as its whole group as it ran (`group`), however it went red: the land queue
     grades such a row again by its group alone (ops queue/suspect_items.py), whose task runs it as a
@@ -323,8 +315,9 @@ def graded(rows: list[dict], unprepared: Mapping[str, list[dict]], before: set[s
     any unprepared `stale`, not graded and run again, never green. A reused row is graded again against the
     baseline that stands now, and every red row is its group's as it ran (`as_ran`). A cell its prepare's
     time cap left (where `capped_at`, tests/tier_wire.py's `CAPPED`) is named and counted (`capped`, kept
-    with a reused row) but judged by neither, and a test main's run left at its cap was never tried there,
-    so this run's cells of it are held to nothing, as main's runs are where main has none."""
+    with a reused row) but judged by neither, and a test main's run skipped whole at its cap (its node id at
+    the cap, unlabeled: tests/conftest.py's skip) was never tried there, so this run's cells of it are held
+    to nothing, as main's runs are where main has none; a cell or site main capped exempts no sibling."""
     judged = []
     for found in rows:
         own = unprepared.get(file_of(found["name"]), [])
@@ -340,9 +333,11 @@ def graded(rows: list[dict], unprepared: Mapping[str, list[dict]], before: set[s
         if isinstance(before, set):
             # Main's decision_laya prepare capped its five tests, which a run that reached them failed
             # alike at main's commit (2026-11-25): no run of main's says how they go.
-            untried = {test for test, where in map(placed, before) if where == capped_at}
+            whole = f" @ {capped_at}"
+            untried = {cell[:-len(whole)] for cell in before if cell.endswith(whole)}
             new = [record for record in judged_ if record["identity"] not in before
-                   and placed(record["identity"])[0] not in untried]
+                   and not any(record.get("test") == test or record["identity"].startswith(f"{test} @ ")
+                               for test in untried)]
             said = [f"unprepared in its {generation} prepare, which main's did not leave so: "
                     f"{record['identity']}" + (f": {record['error']}" if record.get("error") else "")
                     for record in new]
