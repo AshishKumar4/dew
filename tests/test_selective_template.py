@@ -633,6 +633,46 @@ def test_the_backward_holds_its_registers_at_the_residency_it_launches(packed):
 
 
 @COMPILES_ON_CPU
+@lowers('sm80')
+def test_a_forked_backwards_compiled_shared_memory_is_its_described_scratch():
+    """The selective scan's forked backward compiled for an A100 (`kernel_compile`) at 16 tokens a thread, a
+    block of 2,048: the shared memory its launch asks for is its described scratch's
+    (`selective.backward_scratch`, which `Selective.staged_bytes` prices), so its allocation and its block's
+    geometry cannot drift from the planner's (row 6131; the review of lane/toolkit 57aba49e3). It lowers
+    (`failures`); its spill at 16 tokens is its residency's (row 12905)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, failures
+
+    from dew.nn.kernels.templates import resources
+
+    forked = FORKED["shared and chained"]
+    rows, length, channels, states = 2, 4096, 256, 16
+    operands = (jax.ShapeDtypeStruct((rows, length, channels), jnp.bfloat16),) * 2 + (
+        jax.ShapeDtypeStruct((channels, states), jnp.float32),
+        *(jax.ShapeDtypeStruct((rows, length, states), jnp.bfloat16),) * 2,
+        jax.ShapeDtypeStruct((channels,), jnp.float32),
+        # The table's one given state a row (`FORKED`'s), as the forked exactness test gives it.
+        jax.ShapeDtypeStruct((rows, 1, channels, states), jnp.float32))
+    family = bundles.of("sm80", jnp.bfloat16)
+
+    def call():
+        def trained(*given):
+            def scanned(*operands):
+                return selective.selective_scan(*operands, family=family, plan=(16, 2), forked=forked)[0]
+
+            out, pull = jax.vjp(scanned, *given)
+            return pull(out)
+
+        return trained, operands
+
+    (record,) = compile_mosaic_kernels([KernelCase('selective forked backward', call)], 'sm80')
+    assert not failures([record]), failures([record])
+    (backward,) = [kernel for kernel in record['kernels'] if 'selective_scan_backward' in kernel['kernel']]
+    scratch = selective.backward_scratch(states, selective.block_positions(length, 16), forked=True)
+    assert backward['shared'] == resources.shared_bytes(family, resources.Scope(program=scratch)), backward
+
+
+@COMPILES_ON_CPU
 @pytest.mark.parametrize('target', [pytest.param(name, marks=lowers(name)) for name in ('sm80', 'sm90')])
 def test_a_forked_calls_training_step_compiles(target):
     """The selective scan's training step over a forked call (`FORKED`'s, each row's documents from its
@@ -704,6 +744,30 @@ def _bound(length: int):
         *(jax.ShapeDtypeStruct((1, length, 16), jnp.bfloat16),) * 2,
         jax.ShapeDtypeStruct((256,), jnp.float32))
     return selective.SELECTIVE.bind(*operands, interpret=True)
+
+
+def test_a_configs_shared_memory_covers_its_backward_launchs():
+    """A config's staged shared memory (`Selective.staged_bytes`, which `legal` holds to a program's share)
+    is the larger of its launches', its backward's scratch too (its block's exchange, its states' rows and,
+    forked, its documents' token rows), as its backward allocates them, where its forward's chunk alone was
+    priced (row 6131: the planner and the emitter read one description). An A100's forked call at 16 tokens
+    a chunk and 16 a thread (a backward block of 2,048) stages 52,224 bytes, its forward 25,600."""
+    from dew.nn.kernels.templates import bundles, resources
+
+    forked = FORKED["shared and chained"]
+    rows, length, channels, states = 2, 4096, 256, 16
+    operands = (jax.ShapeDtypeStruct((rows, length, channels), jnp.bfloat16),) * 2 + (
+        jax.ShapeDtypeStruct((channels, states), jnp.float32),
+        *(jax.ShapeDtypeStruct((rows, length, states), jnp.bfloat16),) * 2,
+        jax.ShapeDtypeStruct((channels,), jnp.float32))
+    facts = generation.gpu_target("sm80")
+    with generation.assumed(facts):
+        bound = selective.SELECTIVE.bind(*operands, forked=forked, interpret=True)
+        staged = selective.SELECTIVE.staged_bytes(bound, selective.Tiles(16, 16, 2), facts)
+    assert staged == 52224, staged
+    scratch = selective.backward_scratch(states, selective.block_positions(length, 16), forked=True)
+    family = bundles.of("sm80", jnp.bfloat16)
+    assert resources.shared_bytes(family, resources.Scope(program=scratch)) == staged
 
 
 @pytest.mark.check1_shards(seeds=8, per_task=4)

@@ -391,6 +391,17 @@ def backward_fits(target: generation.GpuTarget) -> list[tuple[int, int]]:
     return fits
 
 
+def backward_scratch(states: int, positions: int, *, forked: bool) -> tuple:
+    """The backward's shared memory at a block of `positions` tokens and `states`, which it allocates and
+    `Selective.staged_bytes` prices (row 6131): its block scans' warps' aggregates, its block's exchange
+    (`block_scan.exchange_scratch`), its states' two rows and, `forked`, its documents' token rows
+    (`DocumentsBack`: the states entered, the lasts, the two parts of `dm` and the `G` each first token
+    takes)."""
+    scratch = (block_scan.scratch(), block_scan.exchange_scratch(positions),
+               plgpu.SMEM((2, states), jnp.float32))
+    return (*scratch, plgpu.SMEM((5, positions), jnp.float32)) if forked else scratch
+
+
 def block_positions(length: int, positions: int) -> int:
     """The tokens a backward block of a scan `length` tokens long takes: its threads' `positions` each where
     the length is long enough, else the fewest whole tokens a thread covering it."""
@@ -700,12 +711,7 @@ def _backward_launched(entry, x, dt, b, c, parameters, entered, resets, dy, dfin
     out_type = (sized(x.shape, x.dtype), sized(x.shape, dt.dtype),
                 sized((rows, states, channels), jnp.float32), sized((rows, channels), jnp.float32),
                 sized((rows, states, channels), jnp.float32))
-    scratch = (block_scan.scratch(), block_scan.exchange_scratch(positions),
-               plgpu.SMEM((2, states), jnp.float32))
-    if scan.forked:
-        # The documents' token rows (`DocumentsBack`): the states entered, the lasts, the two parts of `dm`
-        # and the `G` each first token takes.
-        scratch = (*scratch, plgpu.SMEM((5, positions), jnp.float32))
+    scratch = backward_scratch(states, positions, forked=scan.forked)
     launched = mosaic.kernel(entry, out_type=out_type, grid=(rows, programs),
                              grid_names=("rows", "channels"),
                              warpgroups=1, interpret=interpret, family=scan.family.name,
@@ -972,17 +978,22 @@ class Selective(base.Template[Tiles]):
         return resources.entry_registers(1, config.resident)
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
-        """The forward's shared memory at the config's chunk (`forward_allocations`), as the toolkit counts a
-        program's (`resources.shared_bytes`)."""
+        """The shared memory of the config's launches, as the toolkit counts a program's
+        (`resources.shared_bytes`), the larger of them: the forward's at its chunk (`forward_allocations`)
+        and the backward's at its block (`backward_scratch`, no reduction across warps), each what its
+        kernel allocates (row 6131)."""
         from dew.nn.kernels.templates import bundles
 
         arguments = ba.arguments
         x, dt, b, c = (arguments[name] for name in ("x", "dt", "B", "C"))
         family = bundles.of(self._facts(ba, target).generation, x.dtype)
         assert family is not None, f"no bundle of the template claims {target.generation} (`eligible`)"
-        return resources.shared_bytes(family, forward_scope(family, config.chunk, b.shape[-1],
-                                                            (x.dtype, dt.dtype, b.dtype, c.dtype),
-                                                            arguments.get("starts") is not None))
+        forward = resources.shared_bytes(family, forward_scope(family, config.chunk, b.shape[-1],
+                                                               (x.dtype, dt.dtype, b.dtype, c.dtype),
+                                                               arguments.get("starts") is not None))
+        scratch = backward_scratch(b.shape[-1], block_positions(x.shape[1], config.positions),
+                                   forked=arguments.get("forked") is not None)
+        return max(forward, resources.shared_bytes(family, resources.Scope(program=scratch, reduces=False)))
 
     def eligible(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
         """Whether a bundle of the template claims the call's GPU (interpreted, the interpreted bundle)."""
