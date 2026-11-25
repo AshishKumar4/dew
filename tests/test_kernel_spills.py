@@ -10,8 +10,10 @@ import functools
 import gc
 import os
 import subprocess
+import tempfile
 import time
 import weakref
+from unittest import mock
 
 import flax.linen as nn
 import jax
@@ -1027,8 +1029,11 @@ def test_a_program_lowered_before_another_compile_refused_its_config_is_relowere
 
 def _aside(devices, lowered_first, relowered):
     """`report.lowered_aside` of a lowering's first call `lowered_first` and its retry `relowered` over
-    `devices`, its launches certified aside on a compile-only H100 within a `refusals` scope of its own: its
-    misses, its refused launches and the retries it made."""
+    `devices`, its launches certified aside on a compile-only H100 within a `refusals` scope of its own and
+    over a verdict store of its own (`tuning._verdicts_path`): its misses, its refused launches and the
+    retries it made. A host's store keeps an earlier run's verdict of the same launch, which certification
+    reads in place of compiling it again, so a second run on the host retried nothing (row 12915)."""
+    from dew.nn.kernels import tuning
     from dew.nn.kernels.generation import compile_only_gpus
 
     retries: list[int] = []
@@ -1037,7 +1042,10 @@ def _aside(devices, lowered_first, relowered):
         retries.append(1)
         return relowered()
 
-    with (report.refusals(), generation.assumed("sm90"), report.certifying(compile_only_gpus("sm90")[0]),
+    with (tempfile.TemporaryDirectory() as store,
+          mock.patch.object(tuning, "_verdicts_path", lambda target: os.path.join(store, f"{target}.json")),
+          mock.patch.dict(tuning._VERDICTS, clear=True), mock.patch.dict(tuning._CHOICES, clear=True),
+          report.refusals(), generation.assumed("sm90"), report.certifying(compile_only_gpus("sm90")[0]),
           jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
         report.lowered_aside(lowered_first, retried, lambda value: value)
         return report.misses(), report.refused_launches(), retries
