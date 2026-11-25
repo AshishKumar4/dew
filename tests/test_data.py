@@ -311,6 +311,12 @@ def test_a_loader_explains_the_read_its_readers_run():
 
     written = compile(rows.workers(2, buffer=4), seed=5, steps=10**6, loading=auto)
     assert written.reading.workers == Workers(2, 4) and "each holding 4 batches" in written.explain()
+    # One read serves every phase: a later phase the memory read refuses names none (review of row 1563).
+    from dew.data.pipeline import Phase, Steps, phases
+
+    phased = phases(Phase(Pipeline(Memory(_Indexed(30), shard_rows=8)).repeat().batch(4), Steps(2)),
+                    Phase(Pipeline(Memory(_Indexed(30), shard_rows=8)).interleave(2).repeat().batch(4)))
+    assert compile(phased, steps=10**6, loading=Loading(workers=0), read="streamed").reading.faster is None
     interleaved = Pipeline(Memory(_Indexed(30), shard_rows=8)).interleave(2)
     plain = Pipeline(Memory(_Indexed(30), shard_rows=8)).repeat().batch(4)
     streamed = {"alone": compile(plain, steps=10**6, loading=Loading(workers=0), read="streamed"),
