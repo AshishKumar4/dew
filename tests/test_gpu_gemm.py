@@ -165,14 +165,16 @@ def native_hopper_cluster2_balanced_tail_holds_check_1():
 
 def native_hopper_cluster2_balanced_tail_kernel_gradient_holds_check_1():
     """The Qwen3.5-4B q outlier's kernel gradient (8192 rows, 2560 by 2048: 80 tiles over a GH200's 66
-    pairs, 14 of them a balanced tail) at a pinned 128 x 256 cluster tile, its tail tiles' first partials a
-    slot a tile (`tail.slots`, NG29): check 1 against XLA's from float64 truth."""
+    pairs, 14 of them a balanced tail) into bf16, as a bf16 model's weights take it, at a pinned 128 x 256
+    cluster tile, its tail tiles' first partials a slot a tile (`tail.slots`, NG29): check 1 against XLA's
+    from float64 truth. An fp32 output is summed exactly under the suite's precision, whose cluster tile's
+    tail the launch refuses (`BALANCED_TAILS`)."""
     from dew.nn.kernels import gemm, grouped_matmul, tuning
     from dew.nn.kernels.templates.gemm import tiling
     tile = tiling.Tiles(128, 256, 64, 4, 8, warpgroups=2, cluster=2, family="wgmma")
     launch, bf16 = grouped_matmul.MosaicTgmm(), functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     ba = launch.bind(bf16((8192, 2560)), bf16((8192, 2048)), jax.ShapeDtypeStruct((1,), jnp.int32),
-                     out_dtype="float32", interpret=False, dense=True)
+                     out_dtype="bfloat16", interpret=False, dense=True, exact_sums=False)
     target = generation.gpu_target()
     assert launch.legal(ba, tile, target) and launch.balanced(ba, tile, target)
 
@@ -183,13 +185,13 @@ def native_hopper_cluster2_balanced_tail_kernel_gradient_holds_check_1():
 
     def dew_fn(x, dy):
         with generation.chosen(grouped_matmul="mosaic"), tuning.pinned({grouped_matmul.MosaicTgmm: tile}):
-            return gemm.gemm_t(x, dy, None, out_dtype=jnp.float32)[0]
+            return gemm.gemm_t(x, dy, None, out_dtype=jnp.bfloat16)[0]
 
-    def plain(x, dy, *, wide=jnp.float32):
-        return jnp.dot(x.T.astype(wide), dy.astype(wide))
+    def plain(x, dy, *, wide=jnp.float32, out=jnp.bfloat16):
+        return jnp.dot(x.T.astype(wide), dy.astype(wide)).astype(out)
 
     assert_as_exact(jax.jit(dew_fn), jax.jit(plain), draw, "hopper cluster=2 balanced tail dW 2560x8192x2048",
-                    seeds=8, truth_fn=functools.partial(plain, wide=jnp.float64))
+                    seeds=8, truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
 
 
 def _syrk_and_tail_cells():
@@ -222,6 +224,11 @@ CLUSTER = "a cluster's multicast of a shared block, which the interpreter loads 
 
 BALANCED_TAIL = "a balanced tail's partials fixed up across programs, which the interpreter runs in one order"
 """Why a dense kernel gradient's balanced tail stays on the GPU (the GEMM lane, 11-12)."""
+
+A100_BALANCED_TAILS = ((320, 192, 1408), (320, 384, 704))
+"""Dense bf16 kernel gradients' rows, depth and width whose derived tile an A100 of 8 multiprocessors
+balances its last wave at (64 x 128 and 128 x 64, two programs a multiprocessor): its 128 x 128 tile, which
+`BALANCED_TAILS`' shapes derive, holds no merge (280 registers a thread, `MosaicTgmm.balanced`)."""
 
 
 def _toolkit_cells() -> list[Cell]:
@@ -293,9 +300,7 @@ def test_the_gemm_kernels_run_on_this_gpu(part):
         *(Cell(f"an A100's dense kernel gradient's balanced tail holds check 1: {rows}x{depth}x{width}",
                functools.partial(gemm_template.a_dense_kernel_gradients_balanced_tail_holds_check_1, rows,
                                  depth, width, jnp.bfloat16, "sm80"), "sm80", fault=BALANCED_TAIL)
-          # An A100's 128 x 128 tiles balance a tail at these (200 rows' two steps a tile walk whole).
-          for rows, depth, width, dtype in gemm_template.BALANCED_TAILS
-          if rows == 320 and dtype == jnp.bfloat16),
+          for rows, depth, width in A100_BALANCED_TAILS),
         *(Cell(f"a chained input gradient holds check 1: {case}",
                functools.partial(gemm_paired.a_chained_input_gradient_holds_check_1, case), name,
                native={"launch": "chained", "generation": name, "case": case})

@@ -180,11 +180,11 @@ def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
             assert taken_op.config == kept
 
     # The picks a GPU measured, stored for this device, as a fresh process finds them: each launch's
-    # variant beside its heuristic (16 rows and 4 warps a norm program, a step's 1024 elements a SwiGLU's).
+    # variant beside its heuristic (16 rows and 4 warps a norm program, a row's 128 columns a SwiGLU's).
     picked = {norm_swiglu.RmsForward: norm_swiglu.RowsConfig(8, 4),
               norm_swiglu.RmsBackward: norm_swiglu.ReverseConfig(16, 1, 8),
-              norm_swiglu.SwigluForward: norm_swiglu.BlockConfig(2048, 4),
-              norm_swiglu.SwigluBackward: norm_swiglu.BlockConfig(512, 4)}
+              norm_swiglu.SwigluForward: norm_swiglu.BlockConfig(256, 4),
+              norm_swiglu.SwigluBackward: norm_swiglu.BlockConfig(128, 8)}
     assert all(picked[type(ba.op)] in ba.op.keyed(ba).autotuning_configs for ba in found)
     timing = tokamax.BenchmarkData(compile_time_ms=1.0, lower_time_ms=1.0, evaluation_times_ms=(1.0,),
                                    metadata={})
@@ -201,7 +201,7 @@ def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
     heuristics = json.loads(json.dumps(heuristics))
     for rows in ("13", "15"):
         assert stored[rows]["rms_norm_forward"] == [[-(-int(rows) // 8)], 4]
-        assert stored[rows]["swiglu_backward"] == [[int(rows), 1], 4]
+        assert stored[rows]["swiglu_backward"] == [[int(rows), 1], 8]
         assert stored[rows]["rms_norm_backward"] == [[1], 8]
     assert stored["40"] == heuristics["40"]
     assert tuned is True
