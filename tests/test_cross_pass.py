@@ -14,6 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from jax.extend import core as jex_core
 from map_judge import marked_seeds
 from model_support import (
     TINY_DECODER,
@@ -30,7 +31,7 @@ from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_stack import Loop
 from dew.nn.backbones.embeddings import prepared_embeddings
-from dew.nn.cross_pass import MERGE_PREFIX, MESSAGES_UNWRITTEN, CrossPass, CrossPassMerge
+from dew.nn.cross_pass import MERGE_PREFIX, MESSAGES_UNWRITTEN, CrossPass, CrossPassMerge, merged_sites
 from dew.optim import AdamW
 from dew.training import TrainerAdvanced
 
@@ -173,6 +174,89 @@ def test_a_merge_is_its_formula(spec):
 
     assert_as_exact(jax.jit(merge.apply), by_hand(jnp.float32), draw, "a merge", seeds=SEEDS["merge"],
                     truth_fn=by_hand(jnp.float64))
+
+
+def equations(closed) -> list:
+    """Every equation of `closed`'s jaxpr, those of the jaxprs its equations hold among them."""
+    found = []
+
+    def walk(jaxpr):
+        for eqn in jaxpr.eqns:
+            found.append(eqn)
+            for value in eqn.params.values():
+                for each in value if isinstance(value, (tuple, list)) else (value,):
+                    if isinstance(each, jex_core.ClosedJaxpr):
+                        walk(each.jaxpr)
+                    elif isinstance(each, jex_core.Jaxpr):
+                        walk(each)
+    walk(closed.jaxpr)
+    return found
+
+
+def products(closed) -> list:
+    """`closed`'s dot products, every jaxpr's it holds."""
+    return [eqn for eqn in equations(closed) if eqn.primitive.name == "dot_general"]
+
+
+def test_an_attention_layers_sites_read_their_bank_once_each_by_its_formula():
+    """Three merges of one bank into one sublayer input, as an attention layer's query, key and value sites
+    run them (`merged_sites`), each its own parameters drawn off its init: each computes its own formula
+    (`merged_by_hand`, check 1 against it in float64), the bank read by the products one site's read takes
+    for them all (its keys' scores and its mixture, each over every site's query: row 12923), and each
+    site's controller as many as that read (its down and up projections over the joined kernels, where
+    apart it took five: row 12922)."""
+    merges = tuple(CrossPassMerge(MESSAGES, 16, 1e-6, name=f"site_{index}") for index in range(3))
+    shape = (2, 5, 3, 16)
+
+    def draw(seed):
+        rng = np.random.default_rng([0xC406, seed])
+        read = rng.normal(size=shape[:2] + shape[3:]).astype(np.float32)
+        bank = rng.normal(size=shape).astype(np.float32)
+        def drawn(leaf):
+            return jnp.asarray(rng.normal(scale=0.3, size=leaf.shape), leaf.dtype)
+        params = tuple(jax.tree.map(drawn, nn.unbox(merge.init(jax.random.key(seed), read, bank)))["params"]
+                       for merge in merges)
+        return params, read, bank
+
+    def ours(params, read, bank):
+        bound = tuple(merge.bind({"params": each}) for merge, each in zip(merges, params, strict=True))
+        return merged_sites(bound, read, bank)
+
+    def by_hand(dtype):
+        def formula(params, read, bank):
+            return tuple(merged_by_hand(each, read, bank, MESSAGES, 1e-6, dtype) for each in params)
+        return jax.jit(formula)
+
+    assert_as_exact(jax.jit(ours), by_hand(jnp.float32), draw, "an attention layer's sites",
+                    seeds=SEEDS["merge"], truth_fn=by_hand(jnp.float64))
+    # Counted against one site traced alike, however this platform's programs form a product (`accumulated`).
+    params, read, bank = draw(0)
+
+    def reading(dots):
+        return sum(any(var.aval.shape == shape for var in eqn.invars) for eqn in dots)
+    one = products(jax.make_jaxpr(merges[0].apply)({"params": params[0]}, read, bank))
+    together = products(jax.make_jaxpr(ours)(params, read, bank))
+    # A site's controller as many products as its depth read: one down, one up (two scores and a sum).
+    assert len(one) - reading(one) == reading(one)
+    assert reading(together) == reading(one)
+    assert len(together) == reading(one) + len(merges) * (len(one) - reading(one))
+
+
+def test_a_bf16_merge_contracts_in_bf16_under_the_runs_precision():
+    """A merge whose sublayer computes in bf16 takes every product of its depth read and its controller in
+    bf16, at the precision the run gives bf16 operands (`dew.nn.precision.operand_precision`: a bf16 run's
+    Tensor Cores), not in float32 at `Precision.HIGHEST` (row 12918)."""
+    merge = CrossPassMerge(MESSAGES, 16, 1e-6)
+    read = jnp.ones((2, 5, 16), jnp.bfloat16)
+    bank = jnp.ones((2, 5, 3, 16), jnp.bfloat16)
+    variables = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16),
+                             nn.unbox(merge.init(jax.random.key(0), read, bank)))
+    dots = products(jax.make_jaxpr(merge.apply)(variables, read, bank))
+    assert dots
+    assert {str(var.aval.dtype) for eqn in dots for var in eqn.invars} == {"bfloat16"}
+    highest = jax.lax.Precision.HIGHEST
+    assert not any(highest in (precision if isinstance(precision := eqn.params["precision"], tuple)
+                               else (precision,)) for eqn in dots)
 
 
 def _messages_by_hand(module, ids):

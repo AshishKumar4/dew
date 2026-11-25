@@ -109,7 +109,7 @@ Scope is per rule, because the rules are not all about the same thing:
   derives to a literal (CONTRIBUTING's banned assertion 2).
 - SLOP034 is about `src/<package>`: no contraction names its precision
   outright (`Precision.HIGHEST`, `precision='highest'`) outside
-  `nn/precision.py`, whose policy gives a layer's products the run's
+  `nn/precision.py` and the arithmetic catalog beneath it, whose policy gives a layer's products the run's
   (`computed_einsum`) and names each genuinely exact boundary
   (`exact_float32`), so a run's numerics reach every model contraction.
 - SLOP029 is about `tests`: no test's every assertion is that a process
@@ -1841,12 +1841,13 @@ def detections(module: Module) -> Iterator[Finding]:
                           "the version that has it")
 
 
-PRECISION_POLICY = "nn/precision.py"
+PRECISION_POLICY = ("nn/precision.py", "nn/programs.py")
 NAMED_OUTRIGHT = ("a precision named outright; take the run's (dew.nn.precision.computed_einsum) or name an "
                   "exact boundary (dew.nn.precision.exact_float32)")
 """SLOP034's finding."""
-"""The one module of `src/<package>` that names a contraction's precision outright (SLOP034): its policy,
-`computed_einsum` a layer's products' and `exact_float32` a genuinely exact boundary's (row 12921)."""
+"""The modules of `src/<package>` that name a contraction's precision outright (SLOP034): its policy,
+`computed_einsum` a layer's products' and `exact_float32` a genuinely exact boundary's, and the arithmetic
+catalog beneath it, which names the algorithms each precision lowers to (row 12921)."""
 
 
 def precisions(module: Module) -> Iterator[Finding]:
@@ -1855,7 +1856,7 @@ def precisions(module: Module) -> Iterator[Finding]:
     'highest' as a call's `precision=`. A layer's product takes the run's (`computed_einsum`) and an exact
     boundary says so (`exact_float32`), so a bf16 run's Tensor Cores and `ACCURATE`'s float32 reach every
     model contraction (the owner, 2026-11-25)."""
-    if module.relative == f"src/{module.package}/{PRECISION_POLICY}":
+    if module.relative in {f"src/{module.package}/{policy}" for policy in PRECISION_POLICY}:
         return
     for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
         if isinstance(node, ast.Attribute) and node.attr == "HIGHEST":

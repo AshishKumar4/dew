@@ -874,13 +874,13 @@ class _Passes:
 
 def compacted(ran: Callable, module, carry, normed, rows: jax.Array, passes: _Passes):
     """`ran`'s pass (`_Passes.stopped_pass`) over the rows of `carry` (its state and bank) still looping
-    (`rows` those already exited), gathered into the smallest of the batch's halvings that holds them
-    (`[B, B // 2, ..., 1]`, one program a size under `lax.switch`), with every array of the call's inputs,
-    the prelude's publications, the block's input and the step norm's `normed` whose leading axis is the
-    batch, and scattered back: a pass over fewer rows computes fewer, a row that exited none (row 12927).
-    A row in the bucket beside them runs the pass too, its state no output reads."""
+    (`rows` those already exited), gathered into the smallest of the batch's halvings that holds them (`[B,
+    B // 2, ..., 1]`, one program a size under `lax.switch`), with every array of the call's inputs, the
+    prelude's publications, the block's input and the step norm's `normed` whose leading axes are the
+    call's rows and tokens, and scattered back: a pass over fewer rows computes fewer, a row that exited
+    none (row 12927). A row in the bucket beside them runs the pass too, its state no output reads."""
     x, _ = carry
-    batch = x.shape[0]
+    batch, length = x.shape[:2]
     sizes = [batch]
     while sizes[-1] > 1:
         sizes.append(sizes[-1] // 2)
@@ -889,13 +889,17 @@ def compacted(ran: Callable, module, carry, normed, rows: jax.Array, passes: _Pa
     order = jnp.argsort(rows, stable=True)
     index = jnp.sum(jnp.asarray(sizes) >= looping) - 1
 
+    def rowed(leaf) -> bool:
+        # A row's array: its leading axes the call's rows and tokens (a state, its bank, an input, a mask, a
+        # publication), not a table of the tokens' (a position's rotation), whatever its sizes.
+        return isinstance(leaf, jax.Array) and leaf.shape[:2] == (batch, length)
+
     def taken(tree, picked):
-        return jax.tree.map(lambda leaf: leaf[picked] if isinstance(leaf, jax.Array) and leaf.ndim
-                            and leaf.shape[0] == batch else leaf, tree)
+        return jax.tree.map(lambda leaf: leaf[picked] if rowed(leaf) else leaf, tree)
 
     def put(whole, part, picked):
-        return jax.tree.map(lambda full, each: full.at[picked].set(each) if isinstance(full, jax.Array)
-                            and full.ndim and full.shape[0] == batch else each, whole, part)
+        return jax.tree.map(lambda full, each: full.at[picked].set(each) if rowed(full) else each,
+                            whole, part)
 
     def bucket(size: int):
         def run(module, carry):
