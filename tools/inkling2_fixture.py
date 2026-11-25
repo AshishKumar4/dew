@@ -6,7 +6,7 @@ transformers predates: it runs in the suite's environment with that transformers
 
     uv venv --system-site-packages -p .venv-3.12/bin/python .venv-inkling2
     uv pip install -p .venv-inkling2 -r tools/inkling2_fixture.requirements.txt
-    PYTHONPATH=src:tools:tests .venv-inkling2/bin/python tools/inkling2_fixture.py [--recording]
+    PYTHONPATH=src:tools:tests .venv-inkling2/bin/python tools/inkling2_fixture.py [--quantized] [--recording]
 
 tests/fixtures/hf/inkling2-tiny/ is a random Inkling2LoopForCausalLM at `TEXT`, the release's text config
 (thinkingmachines/Inkling-2-Mini's config.json) at eight layers: two global, one inside the loop's core
@@ -16,7 +16,9 @@ is the release's wrapper over it and its model.safetensors holds the weights in 
 layout (`release_tensors`), which transformers' conversion (conversion_mapping.py `inkling2_loop_text`)
 reads back to the same weights, as the write checks. `--recording` records instead its logits over check 1's
 seeds, whole and at the shapes a cached decode computes them (`STEPPED`), against its float64 twin, as
-recorded_logits.npz there (`recorded_references.record_logits`).
+recorded_logits.npz there (`recorded_references.record_logits`). `--quantized` writes or records
+inkling2-tiny-nvfp4 instead: the same model with its experts stored as the release stores them
+(`quantized_experts`), which transformers dequantizes on read (`Inkling2LoopDequantizeExperts`).
 """
 
 import argparse
@@ -29,6 +31,10 @@ import torch
 
 REVISION = '3a96649547593bacad4b65d43442ccdf15d0ae0f'
 TINY = Path(__file__).resolve().parents[1] / 'tests' / 'fixtures' / 'hf' / 'inkling2-tiny'
+QUANTIZED = TINY.parent / 'inkling2-tiny-nvfp4'
+NVFP4_LAYERS = 6
+"""The layers whose experts the quantized fixture stores NVFP4, the rest MXFP8, as the release stores its
+first 20 of 24."""
 SHAPE = (2, 40)
 """The ids' shape check 1 draws in."""
 STEPPED = 24
@@ -68,7 +74,8 @@ _SPELLINGS = (
     (r'\.self_attn\.relative_position_bias\.linear\.', '.attn.wr_du.'),
     (r'\.self_attn\.relative_position_bias\.norm\.', '.attn.rel_l2_clip.'),
     (r'\.self_attn\.relative_position_bias\.proj$', '.attn.rel_logits_proj.proj'),
-    (r'\.self_attn\.o_proj\.linear\.', '.attn.wo_ud.'), (r'\.self_attn\.o_proj\.gate_proj\.', '.attn.gate_attn.'),
+    (r'\.self_attn\.o_proj\.linear\.', '.attn.wo_ud.'),
+    (r'\.self_attn\.o_proj\.gate_proj\.', '.attn.gate_attn.'),
     (r'\.self_attn\.sink_proj\.', '.attn.attn_sink_proj.'),
     (r'\.post_attention_convolution\.conv1d\.', '.attn_sconv.'),
     (r'\.post_mlp_convolution\.conv1d\.', '.mlp_sconv.'),
@@ -112,7 +119,8 @@ def release_tensors(model, vocabulary: int) -> dict[str, torch.Tensor]:
             continue
         if name.endswith('.mlp.experts.gate_up_proj'):
             experts, rows, width = tensor.shape
-            tensor = tensor.reshape(experts, 2, rows // 2, width).transpose(1, 2).reshape(experts, rows, width)
+            halves = tensor.reshape(experts, 2, rows // 2, width)
+            tensor = halves.transpose(1, 2).reshape(experts, rows, width)
         for pattern, spelling in _SPELLINGS:
             name = re.sub(pattern, spelling, name)
         stored[name] = tensor
@@ -132,11 +140,13 @@ def write_tiny() -> None:
     torch.manual_seed(0)
     model = modeling.Inkling2LoopForCausalLM(config).float().eval()
     scatter_weights(model, 1234)
-    save_file(release_tensors(model, TEXT['vocab_size']), TINY / 'model.safetensors', metadata={'format': 'pt'})
+    save_file(release_tensors(model, TEXT['vocab_size']), TINY / 'model.safetensors',
+              metadata={'format': 'pt'})
     wrapper = {'architectures': ['Inkling2LoopForConditionalGeneration'], 'model_type': 'inkling2_loop',
                'text_config': TEXT}
     (TINY / 'config.json').write_text(json.dumps(wrapper, indent=2) + '\n')
-    read = modeling.Inkling2LoopForCausalLM.from_pretrained(TINY, dtype=torch.float32).state_dict()
+    read = modeling.Inkling2LoopForCausalLM.from_pretrained(TINY, config=config,
+                                                            dtype=torch.float32).state_dict()
     written = model.state_dict()
     differing = sorted(set(read) ^ set(written)) or [name for name in written
                                                      if not torch.equal(read[name], written[name])]
@@ -144,25 +154,66 @@ def write_tiny() -> None:
         raise SystemExit(f"transformers reads the written release back otherwise: {differing}")
 
 
+def quantized_experts(name: str, shape: tuple[int, int, int], nvfp4: bool,
+                      generator: torch.Generator) -> dict[str, torch.Tensor]:
+    """One random expert bank `[experts, rows, columns]` in the release's storage of it: NVFP4's packed E2M1
+    pairs under an F8_E4M3 scale per 16 and a per-expert `amax` over `outer_scale_denominator`, or MXFP8's
+    F8_E4M3 values under a U8 exponent per 32, at the magnitudes `scatter_weights` draws."""
+    experts, rows, columns = shape
+    if not nvfp4:
+        values = torch.randn(experts, rows, columns, generator=generator).to(torch.float8_e4m3fn)
+        exponents = torch.randint(121, 125, (experts, rows, columns // 32), generator=generator)
+        return {name: values, f'{name}_scale': exponents.to(torch.uint8)}
+    codes = torch.randint(0, 256, (experts, rows, columns // 2), generator=generator).to(torch.uint8)
+    scales = torch.rand(experts, rows, columns // 16, generator=generator) * 2 + 0.25
+    return {name: codes, f'{name}_scale': scales.to(torch.float8_e4m3fn),
+            f'{name}_amax': torch.rand(experts, generator=generator) + 1,
+            f'{name}_outer_scale_denominator': torch.tensor([6.0 * 448.0])}
+
+
+def write_quantized() -> None:
+    """inkling2-tiny with its experts stored quantized (`quantized_experts`), its config stating the
+    release's `quantization_config`."""
+    from safetensors.torch import load_file, save_file
+
+    QUANTIZED.mkdir(parents=True, exist_ok=True)
+    generator = torch.Generator().manual_seed(11)
+    stored = {}
+    for name, tensor in load_file(TINY / 'model.safetensors').items():
+        found = re.fullmatch(r'model\.llm\.layers\.(\d+)\.mlp\.experts\.w(13|2)_weight', name)
+        if found is None:
+            stored[name] = tensor
+        else:
+            nvfp4 = int(found[1]) < NVFP4_LAYERS
+            stored.update(quantized_experts(name, tuple(tensor.shape), nvfp4, generator))
+    save_file(stored, QUANTIZED / 'model.safetensors', metadata={'format': 'pt'})
+    wrapper = {**json.loads((TINY / 'config.json').read_text()),
+               'quantization_config': {'quant_method': 'modelopt', 'quant_algo': 'NVFP4'}}
+    (QUANTIZED / 'config.json').write_text(json.dumps(wrapper, indent=2) + '\n')
+
+
 def draw(seed: int) -> dict[str, np.ndarray]:
     """Check 1's ids, uniform over the embedding's rows."""
     return {'input_ids': np.random.default_rng(seed).integers(0, TEXT['vocab_size'], SHAPE).astype(np.int32)}
 
 
-def write_recording() -> None:
-    """inkling2-tiny as transformers reads it, fp32 on eager attention, and its float64 twin, recorded over
-    check 1's seeds, whole and stepped."""
+def write_recording(directory: Path) -> None:
+    """The fixture at `directory` as transformers reads it, its experts dequantized where stored quantized,
+    fp32 on eager attention, and its float64 twin, recorded over check 1's seeds, whole and stepped."""
     import transformers
     from recorded_references import record_logits
 
     from _dew_torch.precision import float64_twin
 
-    _, modeling = _modeling()
+    configuration, modeling = _modeling()
+    config = configuration.Inkling2LoopTextConfig(**TEXT)
     model = modeling.Inkling2LoopForCausalLM.from_pretrained(
-        TINY, dtype=torch.float32, attn_implementation='eager').eval()
+        directory, config=config, dtype=torch.float32, attn_implementation='eager').eval()
     truth = float64_twin(model, lambda: modeling.Inkling2LoopForCausalLM(model.config))
-    command = 'PYTHONPATH=src:tools:tests .venv-inkling2/bin/python tools/inkling2_fixture.py --recording'
-    record_logits(TINY, model, truth, command, draw=draw, stepped=STEPPED,
+    flag = ' --quantized' if directory == QUANTIZED else ''
+    command = ('PYTHONPATH=src:tools:tests .venv-inkling2/bin/python tools/inkling2_fixture.py'
+               f'{flag} --recording')
+    record_logits(directory, model, truth, command, draw=draw, stepped=STEPPED,
                   reference='Inkling2LoopForCausalLM (transformers)',
                   revision=f'huggingface/transformers@{REVISION}', license='Apache-2.0',
                   transformers=transformers.__version__, torch=torch.__version__)
@@ -170,9 +221,14 @@ def write_recording() -> None:
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
+    parser.add_argument('--quantized', action='store_true',
+                        help="the fixture whose experts are stored as the release stores them")
     parser.add_argument('--recording', action='store_true',
                         help="record the tiny model's logits over the seeds")
-    if parser.parse_args().recording:
-        write_recording()
+    arguments = parser.parse_args()
+    if arguments.recording:
+        write_recording(QUANTIZED if arguments.quantized else TINY)
+    elif arguments.quantized:
+        write_quantized()
     else:
         write_tiny()
