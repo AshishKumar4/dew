@@ -1204,7 +1204,9 @@ def test_an_inspecting_search_past_a_miss_compiles_no_sampled_step_for_a_step_th
 
     model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
                               max_seq_len=16)
+    # Its split and recomputation stated, so its search climbs its head's rungs alone.
     trainer = one_device(Trainer(LMObjective(model, seq_len=16), optax.sgd(1e-2), key=jax.random.key(0),
+                                 split=1, remat="minimal",
                                  advanced=TrainerAdvanced(inspection=Inspection(modules=("*Attention",),
                                                                                 cotangents=True))))
     state, _, _ = trainer.place()
