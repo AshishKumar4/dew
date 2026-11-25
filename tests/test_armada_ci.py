@@ -16,7 +16,8 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-from armada_support import apart, armada_task, cached, cached_checkout, commit, interpreter, loaded, written
+from armada_support import (apart, armada_task, cached, cached_checkout, cached_runs, commit, interpreter,
+                             loaded, written)
 from tool_support import git, load
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1037,20 +1038,6 @@ def test_every_row_carries_its_cases_reports_and_a_reused_row_keeps_them(ci, tmp
     assert (tmp_path / "runs").read_text() == "x", "the second task reused the rows"
 
 
-def cached_runs(ci, root: Path, monkeypatch, cache_worker) -> Callable[[], int]:
-    """The checkout's one 3.12 task, run green on one CPU class against the shared test cache as armada
-    starts it (`armada_task`) under the cache's policy (`cached_checkout`): each call, how many times its
-    test has run, which it counts in `runs`."""
-    verdict = cached_checkout(ci, root, monkeypatch, cache_worker)
-
-    def run(policy: str = "on") -> int:
-        rows = armada_task(ci, monkeypatch, verdict, policy)
-        assert [row["exitCode"] for row in rows] == [0]
-        return len((root / "runs").read_text())
-
-    return run
-
-
 @pytest.mark.parametrize(("changed", "policy"), [
     ({"src/pkg/mod.py": "VALUE = 2\n"}, "on"), ({"docs/page.md": "page\n"}, "on"),
     ({"tutorials/notes.ipynb": "{}\n"}, "on"), ({"tools/tool.py": "VALUE = 2\n"}, "on"),
@@ -1490,60 +1477,6 @@ def test_a_test_files_or_conftests_comments_and_docstrings_rerun_it_not_and_its_
         (tmp_path / "tests/test_a.py").write_text(text)
         commit(tmp_path, "the test reads itself")
         assert run() == runs
-
-
-def test_a_modules_type_checking_block_keys_no_row_and_its_running_code_does(
-        ci, tmp_path, monkeypatch, cache_worker):
-    """A module's `if TYPE_CHECKING:` block never runs, so an edit to it (an import a type checker alone
-    reads) reruns no row that executed the module; an edit to its code that runs at import reruns it."""
-    counted = "    with open('runs', 'a') as runs: runs.write('x')\n"
-    checked = "from typing import TYPE_CHECKING\n\nif TYPE_CHECKING:\n    import {}\n\nLIMIT = {}\n"
-    written(tmp_path, {"helper.py": checked.format("os", 1),
-                       "test_a.py": "from helper import LIMIT\n\n\ndef test_a():\n" + counted
-                                    + "    assert LIMIT\n"})
-    run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
-    commit(tmp_path, "base")
-    assert run() == 1
-    for text, runs in ((checked.format("json", 1), 1), (checked.format("json", 2), 2)):
-        (tmp_path / "tests/helper.py").write_text(text)
-        commit(tmp_path, "helper edited")
-        assert run() == runs
-
-
-def test_a_fetched_fixtures_store_is_keyed_by_its_names_whether_a_host_holds_it_or_not(
-        ci, tmp_path, monkeypatch):
-    """A fetched fixture's store (tools/fetched_fixtures.py's LOCAL) holds each file under its sha256, which a
-    task's environment fills and a planner's lacks: a stored file is keyed by its name, there or not, and a
-    listing of the fixtures' directory reads alike with the store in it or not; another listed entry
-    re-keys it."""
-    monkeypatch.chdir(tmp_path)
-    fixtures = tmp_path / "tests/fixtures"
-    fixtures.mkdir(parents=True)
-    (fixtures / "model.json").write_text("{}\n")
-    stored = f"tests/fixtures/fetched/{'a' * 64}.npz"
-    absent = (ci.digests.contents("tests/fixtures"), ci.digests.contents(stored))
-    (tmp_path / stored).parent.mkdir(parents=True)
-    (tmp_path / stored).write_bytes(b"payload")
-    assert (ci.digests.contents("tests/fixtures"), ci.digests.contents(stored)) == absent
-    assert ci.digests.contents(f"tests/fixtures/fetched/{'b' * 64}.npz") != absent[1]
-    (fixtures / "other.json").write_text("{}\n")
-    assert ci.digests.contents("tests/fixtures") != absent[0]
-
-
-def test_a_planner_keys_an_unbound_limit_as_its_tasks_container_does(ci, monkeypatch):
-    """A planner bound by no limit (its limit "max") keys a limit a run read as the planned tasks' container
-    reads it (`digests.PLANNED_LIMITS`, set by `plan`), so a row that read its memory limit is the same key on
-    both; a bound limit is keyed as read, whatever the plan says."""
-    limits = {"limit:memory": "max"}
-    monkeypatch.setattr(ci.digests, "host", lambda: types.SimpleNamespace(limit=limits.__getitem__))
-    monkeypatch.delenv(ci.digests.PLANNED_LIMITS, raising=False)
-    unplanned = ci.digests.contents("limit:memory")
-    monkeypatch.setenv(ci.digests.PLANNED_LIMITS, json.dumps({"limit:memory": str(ci.session.MEDIUM_MEMORY)}))
-    planned = ci.digests.contents("limit:memory")
-    limits["limit:memory"] = str(ci.session.MEDIUM_MEMORY)
-    assert planned == ci.digests.contents("limit:memory") != unplanned
-    limits["limit:memory"] = str(2 * ci.session.MEDIUM_MEMORY)
-    assert ci.digests.contents("limit:memory") != planned
 
 
 def test_a_run_that_writes_a_checkout_file_it_read_keeps_no_key_by_any_writer(ci, tmp_path, monkeypatch,

@@ -154,7 +154,7 @@ def test_a_run_parses_each_shared_dependency_once(gate, tmp_path, monkeypatch) -
 
     store = types.SimpleNamespace(recorded=lambda key, token: {}, written=lambda *a: True)
     monkeypatch.setattr(ast, "parse", counted)
-    monkeypatch.setattr(gate, "releases", lambda: {})
+    monkeypatch.setattr(gate, "releases", dict)
     monkeypatch.setattr(gate, "records", lambda: store)
     monkeypatch.setattr(sys, "argv", ["check_tool_types"])
     monkeypatch.setattr(sys, "prefix", "/tmp/fake-venv")

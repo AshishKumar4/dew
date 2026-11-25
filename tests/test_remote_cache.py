@@ -600,9 +600,14 @@ def test_a_kept_bundle_full_makes_room_for_what_its_part_compiled_and_never_for_
     evicted = remote_cache.RemoteCache(tmp_path / "evicted", url, "token", "jax/cpu")
     evicted.opened("tests/full.py")
     compiled(tmp_path / "evicted", "jit_f-1", value)
-    real_payloads = evicted._payloads
-    monkeypatch.setattr(evicted, "_payloads", lambda keys: (
-        (tmp_path / "evicted" / f"jit_f-1{remote_cache.SUFFIX}").unlink(), real_payloads(keys))[1])
+    program, read = tmp_path / "evicted" / f"jit_f-1{remote_cache.SUFFIX}", Path.read_bytes
+
+    def evicting(path: Path) -> bytes:
+        if path == program:
+            path.unlink()  # JAX's cache evicts it after the bundle's layout listed it
+        return read(path)
+
+    monkeypatch.setattr(Path, "read_bytes", evicting)
     evicted.closed("tests/full.py")
     assert evicted.failures == 1 and stored[bundle] is held
     monkeypatch.undo()
