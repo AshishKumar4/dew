@@ -1178,16 +1178,30 @@ class LowPrecision:
     routes), which a run's numerics check where they take effect (`generation.run_precision`), multiplies
     the projections whose role is among `roles` (`PROJECTION_ROLES`), each where its widths take the
     recipe's blocks; every other product keeps the run's dtypes, the routers, norms, embeddings and heads
-    among them, as every published low-precision recipe keeps them."""
+    among them, as every published low-precision recipe keeps them. `tensor_scaling`, NVFP4's activations'
+    tensor scale: "current" (the default), each tensor's own largest magnitude, exactly; "delayed" (opt-in,
+    NVFP4 alone), the largest of the last `amax_history` steps' (Transformer Engine's delayed scaling), which
+    the run's state holds and hands each projection (`recipe_projection`'s `tensor_scale`): a scale known
+    before the tensor is, so the product forming it may quantize it in its epilogue (row 12721)."""
 
     recipe: str = "blockwise_fp8"
     roles: tuple[str, ...] = ("mixer", "mlp", "experts")
+    tensor_scaling: str = "current"
+    amax_history: int = 16
 
     def __post_init__(self):
         object.__setattr__(self, "roles", tuple(self.roles))
         unknown = sorted(set(self.roles) - set(PROJECTION_ROLES))
         if unknown:
             raise ValueError(f"a recipe's roles are among {PROJECTION_ROLES}, not {unknown}")
+        if self.tensor_scaling not in ("current", "delayed"):
+            raise ValueError(f"tensor_scaling is 'current' or 'delayed', not {self.tensor_scaling!r}")
+        if self.tensor_scaling == "delayed" and self.recipe != "nvfp4":
+            raise ValueError(f"delayed tensor scaling is NVFP4's alone, not {self.recipe!r}'s")
+        if (not isinstance(self.amax_history, int) or isinstance(self.amax_history, bool)
+                or self.amax_history < 1):
+            raise ValueError(f"an amax history holds a whole number of steps, at least one, not "
+                             f"{self.amax_history!r}")
 
 
 @contextlib.contextmanager
