@@ -31,7 +31,7 @@ import json
 import logging
 import math
 from collections.abc import Callable, Collection, Hashable, Sequence
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, ClassVar, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -393,7 +393,10 @@ def stated_operation(equation) -> Callable | None:
 @dataclasses.dataclass(frozen=True)
 class Surrogate:
     """A surrogate's bodies (`surrogate`): rewritten within, never related to autodiff's derivative of its
-    forward."""
+    forward. `held` is False for a surrogate whose trace mutates state or reads an untraced context
+    (`dew.nn.in_backward.RunRule`), which `_SPANS` never caches."""
+
+    held: ClassVar[bool] = True
 
 
 @dataclasses.dataclass(frozen=True)
@@ -570,7 +573,7 @@ def _span_key(kind: Kind, function: Callable, structure, flat: Sequence) -> Hash
     from dew.nn.kernels import options
     from dew.nn.kernels.templates import report
 
-    if report.launch_tracing():
+    if report.launch_tracing() or (isinstance(kind, Surrogate) and not kind.held):
         # Within a launch's trace (a Mosaic kernel's body): the launch's own, which its held trace holds
         # (`tuning.lowered_once`); keyed here, its pending launch would miss at every launch and pin its
         # frames (row 11002's review, F4). Asked without the launch's digest, whose identity traces the
