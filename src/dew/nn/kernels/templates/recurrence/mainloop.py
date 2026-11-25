@@ -1937,6 +1937,17 @@ def _prefetched(call: Call, prefix: tuple, beta_ref, head, n) -> tuple:
     return ends, rows, None if beta_ref is None else family.rows_of(beta_ref.at[head, span]), memory
 
 
+def _prefetched_ends(call: Call, prefix: tuple, head, n) -> tuple:
+    """`_states`' chunk `n`'s prefix under a decay a key dimension: its last token's halves for each key
+    slice, as the memory's rows' vectors (`Call.block`: the memory's decay across the chunk,
+    `_gated_write`), loaded a step ahead (`sequence_walk`'s `prefetch`). Read in the step, after the
+    memory's stores, their load was 14% of a GH200's Kimi Linear states launch's samples, the next
+    instruction waiting on it (M-JS-272)."""
+    family, last = call.family, n * call.chunk + call.chunk - 1
+    return tuple(tuple(family.rows_of(ref.at[last, pl.ds(head * call.width + i * call.block, call.block)])
+                       for ref in prefix) for i in range(call.width // call.block))
+
+
 def _keys_gated_write(call: Call, slots, keys: Operand, values: Operand, loaded, state, issue, role: int,
                       bv: int) -> list:
     """`_states`' step's memory where the write's gate takes the keys' side (`Call.gated_keys`): each key
@@ -1951,18 +1962,16 @@ def _keys_gated_write(call: Call, slots, keys: Operand, values: Operand, loaded,
         [algebra.raised(*memory)[:, None]] * (call.width // call.block), call.held.dtype, issue)
 
 
-def _gated_write(call: Call, corrected, loaded, prefix: tuple, last, head) -> tuple:
+def _gated_write(call: Call, corrected, loaded) -> tuple:
     """`_states`' step's write gated to its chunk's end and each key slice's decay `[block, 1]` across the
-    chunk: under a decay a key dimension the corrected values as they are and each slice's rows' decays at
-    the chunk's last token (`prefix`, its one ref `[R, HV * Dk]`); under one a head the chunk's write
-    gated by `algebra.scalar_write` and its last prefix, a row's vector each slice's rows take, from
-    `loaded` (`_states`' prefetch, a step ahead)."""
-    family, slices = call.family, call.width // call.block
+    chunk, from `loaded` (`_states`' prefetch, a step ahead): under a decay a key dimension the corrected
+    values as they are and each slice's rows' decays at the chunk's last token (`_prefetched_ends`); under
+    one a head the chunk's write gated by `algebra.scalar_write` and its last prefix, a row's vector each
+    slice's rows take (`_prefetched`)."""
+    slices = call.width // call.block
+    assert loaded is not None, "a states walk prefetches its prefix"
     if call.per_key:
-        columns = [pl.ds(head * call.width + i * call.block, call.block) for i in range(slices)]
-        return corrected, [algebra.raised(*(family.rows_of(ref.at[last, span]) for ref in prefix))[:, None]
-                           for span in columns]
-    assert loaded is not None, "a decay a head's walk prefetches its prefix"
+        return corrected, [algebra.raised(*limbs)[:, None] for limbs in loaded]
     (ending, ending_low), (gate, low), _, memory = loaded
     return (algebra.scalar_write(corrected, ending, gate, ending_low, low),
             [algebra.raised(*memory)[:, None]] * slices)
@@ -2096,7 +2105,8 @@ def _states(k, w, u, prefix: tuple, beta, h0, sequences, taken, call: Call, tile
         chunks = family.opened(streams["walked"], views)
         entering = family.opened(streams["once"], initial_views)
 
-        prefetch = functools.partial(_prefetched, call, prefix_refs, None if delta else beta_ref, h)
+        prefetch = (functools.partial(_prefetched_ends, call, prefix_refs, h) if call.per_key
+                    else functools.partial(_prefetched, call, prefix_refs, None if delta else beta_ref, h))
         # Each key slice of the memory and, where stored, the corrected values, a store each in flight.
         before_store = walk_stores(family, width // call.block + int(stores_corrected))
 
@@ -2107,7 +2117,7 @@ def _states(k, w, u, prefix: tuple, beta, h0, sequences, taken, call: Call, tile
             return functools.partial(_states_step, lands, issue, scratch, column, role)
 
         def _states_step(lands, issue, scratch, column, role, n, slots, state, accumulators, loaded=None):
-            span, last = pl.ds(n * chunk, chunk), n * chunk + chunk - 1
+            span = pl.ds(n * chunk, chunk)
             for i, part in enumerate(state):
                 before_store()
                 memories.store(h_ref, part, memory(n, i), call.block, column, bv, family=family,
@@ -2123,13 +2133,14 @@ def _states(k, w, u, prefix: tuple, beta, h0, sequences, taken, call: Call, tile
 
                 corrected = algebra.corrected(tile, weights, state, held.dtype, issue)
             else:
-                betas = family.rows_of(beta_ref.at[h, span]) if loaded is None else loaded[2]
+                # A decay a key dimension's prefetch its prefix's alone (`_prefetched_ends`).
+                betas = family.rows_of(beta_ref.at[h, span]) if call.per_key else loaded[2]
                 written = algebra.weighted("apply_u", None, tile, betas, issue)
                 corrected = algebra.corrected(written, None, state, held.dtype, issue)
             before_store()
             held.store(corrected_ref, corrected, n * chunk, chunk, h * value_width + column, bv,
                        family=family, smem=lands["corrected"], wait=False)
-            gated, decay = _gated_write(call, corrected, loaded, prefix_refs, last, h)
+            gated, decay = _gated_write(call, corrected, loaded)
             # An fp32 call's last real token's write outside the product; a 16-bit call's is fla's product.
             separate = (_last_write(call, keys, k_ref, n * chunk, taken_ref[n] - 1, h // keyed * width,
                                     column_sums(call, scratch), gated) if held.parts > 1 else None)
@@ -2141,7 +2152,7 @@ def _states(k, w, u, prefix: tuple, beta, h0, sequences, taken, call: Call, tile
         sequence_walk(call, initial, "initial", (entering, initial_views), (chunks, views), step, sequence,
                       lambda role, i: final_ref.at[pl.ds(memory(row, i), call.block),
                                                    pl.ds(walked + role * bv, bv)], bv,
-                      prefetch=None if call.per_key else prefetch,
+                      prefetch=prefetch,
                       landing=lambda role: roled(role)[1].get("final"), walkers=walkers, producer=producer,
                       table=taken_by(table, table_refs, stored_ref, call, h, lambda role: walked + role * bv,
                                      bv, row, lambda role: roled(role)[1].get("table")))
