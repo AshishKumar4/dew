@@ -208,6 +208,76 @@ def test_a_compile_only_gpu_prepare_holds_a_reference_of_its_own_compiler_option
     assert not (tmp_path / "store" / UNPREPARED).exists(), (tmp_path / "store" / UNPREPARED).read_text()
 
 
+def test_a_prepared_written_twin_of_a_cublas_reference_keeps_its_compiler_options(tmp_path, monkeypatch):
+    """A library reference compiled with caller `compiler_options` (`generation_support.cublas_compiled`'s
+    `CUBLAS`, turning Triton GEMMs off) keeps those options on its as-written twin too, both live
+    (`arm_forms._written_twin`) and in a compile-only sm90 prepare (`arm_store._compile_arms`, written=True):
+    dropping them let XLA's Triton GEMM hijack the FP8 dot into a split-K fusion instead of cuBLASLt's
+    `__cublas$lt$matmul$f8` (rows 12983, 12984)."""
+    import generation_support
+    import model_flows
+    import tier_wire
+    from arm_forms import _written_twin
+    from dew.telemetry.instrumentation import hlo_instructions
+    from dew.training import ahead
+    from truths_ahead import prepared
+
+    monkeypatch.setenv(model_flows.TOPOLOGY, str(generation_support.node_topology(tmp_path / "topology.bin",
+                                                                                   gpu="sm90")))
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+
+    def fp8_dot(lhs, rhs):
+        return jnp.dot(lhs, rhs, precision=jax.lax.Precision.DEFAULT, preferred_element_type=jnp.float32)
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (rng.normal(size=(256, 128)).astype(jnp.float8_e4m3fn),
+                rng.normal(size=(128, 256)).astype(jnp.float8_e4m3fn))
+
+    def truth(lhs, rhs):
+        return jnp.dot(lhs.astype(jnp.float64), rhs.astype(jnp.float64), preferred_element_type=jnp.float64)
+
+    reference = generation_support.cublas_compiled(fp8_dot, draw(0), "__cublas$lt$matmul$f8")
+
+    compiled_sites: dict[str, list[tuple[set[str], list]]] = {}
+    current_label = [""]
+    orig_of = ahead.Executable.of
+
+    @staticmethod
+    def spy_of(compiled):
+        instructions = tuple(hlo_instructions(compiled).values())
+        targets = {each.target for each in instructions} - {""}
+        dots = [each for each in instructions if each.op == "dot" or "dot" in each.fused]
+        compiled_sites.setdefault(current_label[0], []).append((targets, dots))
+        return orig_of(compiled)
+
+    from truths_ahead import CompiledTruths
+    orig_site = CompiledTruths.compile_site
+
+    def spy_site(self, label, *args, **kwargs):
+        current_label[0] = label
+        return orig_site(self, label, *args, **kwargs)
+
+    monkeypatch.setattr(ahead.Executable, "of", spy_of)
+    monkeypatch.setattr(CompiledTruths, "compile_site", spy_site)
+
+    with prepared(tmp_path / "store", stamp="cublas-written", target=generation_support.node_target()):
+        assert_as_exact(jax.jit(fp8_dot), reference, draw, "fp8 cublas site", seeds=32, truth_fn=truth)
+
+    assert not (tmp_path / "store" / UNPREPARED).exists(), (tmp_path / "store" / UNPREPARED).read_text()
+    main_key = "fp8 cublas site, its arms"
+    written_key = "fp8 cublas site, its arms as written"
+    assert main_key in compiled_sites and written_key in compiled_sites, sorted(compiled_sites)
+    # Main site holds dew + reference (last is reference); written site holds reference as written alone.
+    ref_targets, ref_dots = compiled_sites[main_key][-1]
+    written_targets, written_dots = compiled_sites[written_key][-1]
+    assert ref_targets == {"__cublas$lt$matmul$f8"} and not ref_dots, (ref_targets, ref_dots)
+    assert written_targets == {"__cublas$lt$matmul$f8"} and not written_dots, (written_targets, written_dots)
+    twin = _written_twin(jax.jit(fp8_dot), reference)
+    live_written = twin.without.wrapped if hasattr(twin, "without") else twin.wrapped
+    assert getattr(live_written, "own_options", None) == generation_support.CUBLAS
+
+
 def test_an_arm_of_the_cpu_lanes_options_is_built_by_where_its_calls_are_placed():
     """`arm_forms.without_ynn` takes XLA:CPU's options (WITHOUT_YNN) where the context places its calls on a
     CPU, and none where it places them on a GPU, whatever the process's default backend: a GPU tier part's

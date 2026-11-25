@@ -175,10 +175,13 @@ def without_ynn(fn, **jit_options):
 
     if getattr(fn, "without_ynn", False):
         return fn
+    own = jit_options.get("compiler_options")
     if placed_platform() == "cpu":
-        jit_options["compiler_options"] = {**switched_off(), **(jit_options.get("compiler_options") or {})}
+        jit_options["compiler_options"] = {**switched_off(), **(own or {})}
     compiled = jax.jit(fn, **jit_options)
     compiled.without_ynn = True
+    if own:
+        compiled.own_compiler_options = dict(own)
     return compiled
 
 
@@ -372,6 +375,7 @@ def _compiled(fn, compile, pairing=None, *, reference: bool = False, written: bo
     run = unrewritten if reference and not _declared(fn) else _as_is
     if isinstance(fn, _RunToRun):
         return _RunToRun(_compiled(fn.fn, compile, pairing, reference=reference, written=written), fn.why)
+    own = getattr(fn, "own_compiler_options", None) if written else None
     fn = _own_function(fn) if written else fn
     if _given(fn) or getattr(fn, "without_ynn", False):
         return run(fn)
@@ -386,8 +390,8 @@ def _compiled(fn, compile, pairing=None, *, reference: bool = False, written: bo
     if isinstance(fn, _Windowed):
         return _Windowed(_compiled(fn.fn, compile, pairing, reference=reference, written=written))
     if written:
-        return run(Written(fn)) if compile is jax.jit else _Paired(pairing, run(Written(fn, compile)),
-                                                                   run(Written(fn)))
+        return run(Written(fn, own_options=own)) if compile is jax.jit else _Paired(
+            pairing, run(Written(fn, compile, own_options=own)), run(Written(fn, own_options=own)))
     return run(compile(fn)) if compile is jax.jit else _Paired(pairing, run(compile(fn)), run(jax.jit(fn)))
 
 
