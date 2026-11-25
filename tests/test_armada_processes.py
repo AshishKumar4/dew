@@ -141,6 +141,25 @@ def test_a_restored_modules_cached_bytecode_goes_with_its_rewrite(ci, tmp_path):
     assert not list((tmp_path / "tests/__pycache__").glob("helper.*.pyc"))
 
 
+def test_a_restore_keeps_the_runners_files_beside_the_verdict_and_no_other_of_its_name(ci, tmp_path):
+    """A checkout restored after a process (`restored`) keeps the task's verdict, each process's numbered one,
+    and the runner's own files beside each (`SIDECARS`, the recorder's children), and removes any other entry
+    the process made, one named as the verdict but for its suffix among them: a later process importing a
+    `<out>.py` would run a module the commit does not hold (row 13000's review)."""
+    commit(tmp_path, "the commit")
+    before = ci.untracked()
+    out = tmp_path / "tests/result"
+    kept = [out.with_name(f"result.0.{name}") for name in ci.SIDECARS] + [tmp_path / "tests/result.0"]
+    for path in [*kept, out.with_name("result.py"), out.with_name("result.0.py")]:
+        path.write_text("")
+    (tmp_path / "tests/result.0.lifetime.log.children").mkdir()
+    (tmp_path / "tests/result.0.lifetime.log.children/1.log").write_text("")
+    ci.restored(set(), before, out)
+    assert all(path.exists() for path in kept)
+    assert (tmp_path / "tests/result.0.lifetime.log.children/1.log").exists()
+    assert not out.with_name("result.py").exists() and not out.with_name("result.0.py").exists()
+
+
 @pytest.mark.parametrize(("source", "hook"), [
     # A crash at its exit, after its report: graded as it ended, nothing run past it.
     ("import atexit, os\ndef test_a():\n    atexit.register(lambda: os._exit(3))\n"

@@ -1256,14 +1256,19 @@ def reused_rows(python: str, tests: list[str], group: str, common: str, network:
     return rows
 
 
+SIDECARS = ("lifetime.log", "collected.json", "junit.xml", "unrecorded.json", "pid")
+"""What a task's pytest writes beside its verdict, each `<out>.<sidecar>` (`task_files`): the recorder's log
+(its children's in `<log>.children`), collection's record, pytest's report, the files the durations record
+does not wholly name, and its process id."""
+
+
 def task_files(out: Path) -> tuple[Path, Path, Path, Path, Path]:
     """The files beside a task's verdict `out` that its pytest writes, none left from an earlier run: the
     recorder's log of the process's whole life (lifetime.py), its children's beside it, read once the group
     has exited (`record`); how collection found each file (executed.py); pytest's report; the files the
     durations record does not wholly name (split.py); and its process id, whose stacks are read at its
     deadline (executed.py, `stalls.dumped`)."""
-    log, collection, report, unrecorded, pid = (out.with_name(f"{out.name}.{suffix}") for suffix in (
-        "lifetime.log", "collected.json", "junit.xml", "unrecorded.json", "pid"))
+    log, collection, report, unrecorded, pid = (out.with_name(f"{out.name}.{suffix}") for suffix in SIDECARS)
     for stale in (report, log, collection, unrecorded, pid):
         stale.unlink(missing_ok=True)
     shutil.rmtree(log.with_name(f"{log.name}.children"), ignore_errors=True)
@@ -1703,7 +1708,7 @@ def restored(wrote: set[str], before: set[str], out: Path) -> None:
     not hold): each tracked file it wrote checked out again, and each entry the checkout neither tracks nor
     ignores that was not there before it (`before`, `untracked`) removed, then each directory it made that
     this leaves empty (one imports as a namespace package), but the task's own outputs: its verdict `out`,
-    every file named after it beside it (each process's `out.N`, a process's recorder's sidecars) and its
+    each process's beside it (`out.N`), the runner's files beside each (`SIDECARS`) and its
     artifacts (ARMADA_ARTIFACTS), which outlive it. Each module it checks out loses the bytecode cached for
     it."""
     listed = subprocess.run(["git", "ls-files", "-z", "--", *sorted(wrote)], capture_output=True, text=True,
@@ -1719,7 +1724,10 @@ def restored(wrote: set[str], before: set[str], out: Path) -> None:
     artifacts = os.environ.get("ARMADA_ARTIFACTS")
     roots = [Path(artifacts).resolve()] if artifacts else []
     verdicts = out.resolve()
-    ours = re.compile(rf"{re.escape(verdicts.name)}(\..+)?")
+    # Its verdict, each process's numbered one, and the runner's own files beside each (`SIDECARS`, the
+    # recorder's children, the set-aside list): no other file sharing the verdict's name (a `<out>.py`).
+    own = "|".join(re.escape(name) for name in (*SIDECARS, "lifetime.log.children", "set-aside.json"))
+    ours = re.compile(rf"{re.escape(verdicts.name)}(\.\d+)*(\.({own}))?")
     checkout = Path.cwd().resolve()
     emptied: set[Path] = set()
     for made in sorted(untracked() - before):
