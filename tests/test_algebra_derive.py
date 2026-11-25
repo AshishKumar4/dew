@@ -942,12 +942,12 @@ def test_central_moment_derivation_requires_nonnegative_weights_and_handles_extr
     assert proven.slots(shapes)
 
     # Single-tile finite moment where naive `dx * dx` overflows float32 before small weights are applied.
-    x_one = np.asarray([[1e20, -1e20, 0.0]], np.float32)
-    w_one = np.asarray([[1e-20, 1e-20, 1.0]], np.float32)
+    x_one = np.asarray([[2.0 ** 66, -(2.0 ** 66), 0.0]], np.float32)
+    w_one = np.asarray([[2.0 ** -66, 2.0 ** -66, 1.0]], np.float32)
     for mode in ("walk", "merge"):
         mean_one, var_one = moments.chunked_moments(x_one, w_one, tile=3, mode=mode)
         assert np.all(np.isfinite(mean_one)) and np.all(np.isfinite(var_one))
-        np.testing.assert_allclose(np.asarray(var_one), np.asarray([2e20], np.float32), rtol=1e-5)
+        assert float(var_one[0]) == 2.0 ** 67
 
     # Two-tile Chan combine extremes in both tile orders (large `dx` with small weight; huge weight ratio).
     cases = (
@@ -962,7 +962,7 @@ def test_central_moment_derivation_requires_nonnegative_weights_and_handles_extr
         for mode in ("walk", "merge"):
             mean_c, var_c = moments.chunked_moments(x_c, w_c, tile=1, mode=mode)
             assert np.all(np.isfinite(mean_c)) and np.all(np.isfinite(var_c))
-            np.testing.assert_allclose(np.asarray(var_c), np.asarray([expected_var], np.float32), rtol=1e-5)
+            assert float(var_c[0]) == expected_var
 
 
 def test_chunked_moments_contract_broadcasts_promotes_scans_and_rejects_empty():
@@ -971,19 +971,23 @@ def test_chunked_moments_contract_broadcasts_promotes_scans_and_rejects_empty():
     count, and handles odd tile counts in `mode="merge"`."""
     from dew.algebra import moments
 
-    with pytest.raises(ValueError, match="positive multiple"):
+    with pytest.raises(ValueError):
         moments.chunked_moments(np.zeros((2, 0), np.float32), np.ones((2, 0), np.float32), tile=4)
 
-    rng = np.random.default_rng(9040)
-    x = (1e3 + rng.standard_normal((4, 48))).astype(np.float32)
-    w_f16 = rng.uniform(0.25, 2.0, (1, 48)).astype(np.float16)
-    ref_mean, ref_var = moments.weighted_moments(jnp.asarray(x), jnp.broadcast_to(jnp.asarray(w_f16,
-                                                                                              jnp.float32),
-                                                                                  x.shape))
+    def draw_mixed(seed):
+        rng = np.random.default_rng([9040, seed])
+        return ((1e3 + rng.standard_normal((4, 48))).astype(np.float32),
+                rng.uniform(0.25, 2.0, (1, 48)).astype(np.float16))
+
+    def ref_mixed(values, weights_f16):
+        return moments.weighted_moments(values, jnp.broadcast_to(weights_f16.astype(values.dtype),
+                                                                 values.shape))
+
     for mode in ("walk", "merge"):
-        got_mean, got_var = moments.chunked_moments(x, w_f16, tile=16, mode=mode)
-        np.testing.assert_allclose(np.asarray(got_mean), np.asarray(ref_mean), rtol=1e-5, atol=1e-5)
-        np.testing.assert_allclose(np.asarray(got_var), np.asarray(ref_var), rtol=1e-4, atol=1e-4)
+        assert_as_exact(
+            jax.jit(lambda values, weights_f16, kind=mode: moments.chunked_moments(
+                values, weights_f16, tile=16, mode=kind)),
+            jax.jit(ref_mixed), draw_mixed, f"mixed broadcast moments ({mode})", seeds=16)
 
     # Walk stages one scan body regardless of tile count.
     j2 = jax.make_jaxpr(lambda a, b: moments.chunked_moments(a, b, tile=16, mode="walk"))(

@@ -680,10 +680,7 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
         return _magnitude(atom.val) if isinstance(atom, jcore.Literal) else magnitudes[key(env[atom])]
 
     def apart_of(atom) -> Apart:
-        if isinstance(atom, jcore.Literal):
-            return _held_apart(_constant_apart(atom.val), atom.val.dtype if typed_key(atom.val)
-                               else np.asarray(atom.val).dtype)
-        return apart.get(atom, NOWHERE)
+        return _apart_of(atom, apart)
 
     # Each value a broadcast made, by its source and the axes it laid the source's along, so a broadcast of
     # one is read as one broadcast of the source (exact: a layout alone), whose axes a hoist reads.
@@ -764,6 +761,14 @@ def _prove_equation(equation: jcore.JaxprEqn, magnitude_of: Callable[..., Magnit
     return (bound if proved.finite else None), proved
 
 
+def _apart_of(atom, apart: Mapping[jcore.Var, Apart]) -> Apart:
+    """`atom`'s proven `Apart` from `apart`, or its constant `Apart` for a literal."""
+    if isinstance(atom, jcore.Literal):
+        return _held_apart(_constant_apart(atom.val), atom.val.dtype if typed_key(atom.val)
+                           else np.asarray(atom.val).dtype)
+    return apart.get(atom, NOWHERE)
+
+
 def proven(jaxpr: jcore.Jaxpr) -> tuple[dict[jcore.Var, Magnitude | None], dict[jcore.Var, Apart]]:
     """What `jaxpr` proves of each variable (`held` magnitudes and `apart`), its constants taken as inputs,
     without building terms or interning parameters (`dew.algebra.program._held`)."""
@@ -778,11 +783,7 @@ def proven(jaxpr: jcore.Jaxpr) -> tuple[dict[jcore.Var, Magnitude | None], dict[
         return _magnitude(atom.val) if isinstance(atom, jcore.Literal) else held.get(atom)
 
     def apart_of(atom) -> Apart:
-        if isinstance(atom, jcore.Literal):
-            return _held_apart(_constant_apart(atom.val), atom.val.dtype if typed_key(atom.val)
-                               else np.asarray(atom.val).dtype)
-        return apart.get(atom, NOWHERE)
-
+        return _apart_of(atom, apart)
     for equation in jaxpr.eqns:
         operation = OPERATIONS.get(equation.primitive)
         if (operation is not None and len(equation.outvars) == 1

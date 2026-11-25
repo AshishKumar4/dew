@@ -95,7 +95,7 @@ def _tiled(operands: dict[str, jax.Array], tile: int) -> dict[str, jax.Array]:
 def _run_chunked(kind: Literal["weighted", "masked", "covariance"], operands: dict[str, jax.Array], *,
                  tile: int, mode: Literal["walk", "merge"] = "merge"):
     tiled = _tiled(operands, tile)
-    first = {name: arr[0] for name, arr in tiled.items()}
+    first = {name: tile_stack[0] for name, tile_stack in tiled.items()}
     rank = next(iter(first.values())).ndim
     forms = derived(kind, rank)
     shapes = {name: (value.shape, value.dtype) for name, value in first.items()}
@@ -106,15 +106,15 @@ def _run_chunked(kind: Literal["weighted", "masked", "covariance"], operands: di
     partials = jax.vmap(lambda chunk: forms.step(empty, chunk))(tiled)
     while partials[0].shape[0] > 1:
         count = partials[0].shape[0]
-        pairs = count // 2
-        left = jax.tree.map(lambda arr: arr[:2 * pairs:2], partials)
-        right = jax.tree.map(lambda arr: arr[1:2 * pairs:2], partials)
+        limit = 2 * (count // 2)
+        left = jax.tree.map(lambda state, end=limit: state[:end:2], partials)
+        right = jax.tree.map(lambda state, end=limit: state[1:end:2], partials)
         merged = jax.vmap(lambda a, b: forms.merge(a, b, shapes=shapes))(left, right)
         if count % 2:
-            tail = jax.tree.map(lambda arr: arr[-1:], partials)
+            tail = jax.tree.map(lambda state: state[-1:], partials)
             merged = jax.tree.map(lambda a, b: jnp.concatenate([a, b], axis=0), merged, tail)
         partials = merged
-    final = jax.tree.map(lambda arr: arr[0], partials)
+    final = jax.tree.map(lambda state: state[0], partials)
     return forms.finish(final, first, shapes=shapes)
 
 

@@ -374,16 +374,29 @@ def _splices(window: jcore.Jaxpr, yielded: list[jcore.Var], done: Rewrite,
     leaves = [fusion.typed(var.aval, weak=True) for var in window.invars if isinstance(var.aval, ShapedArray)]
     if len(leaves) != len(window.invars):
         return {}
-    chosen = []
+    changed_forms: list[terms.Term] = []
     for out, root in zip(yielded, done.region.outputs, strict=True):
         made_at = id(made_by[out])
         if root is None or made_at in taken:
             continue
         form = done.picked.get(terms.key(root))
-        if form is None or terms.key(form) == terms.key(root):
+        if form is not None and terms.key(form) != terms.key(root):
+            changed_forms.append(form)
+    shared = ({terms.key(sub) for form in changed_forms for sub in terms.subterms(form)}
+              if changed_forms else set())
+    chosen = []
+    seen_at: set[int] = set()
+    for out, root in zip(yielded, done.region.outputs, strict=True):
+        made_at = id(made_by[out])
+        if root is None or made_at in taken or made_at in seen_at:
             continue
-        if made_at not in {at for _, _, at in chosen}:
-            chosen.append((out, form, made_at))
+        form = done.picked.get(terms.key(root))
+        if form is None:
+            continue
+        if terms.key(form) == terms.key(root) and terms.key(root) not in shared:
+            continue
+        seen_at.add(made_at)
+        chosen.append((out, form, made_at))
     while chosen:
         traced = jax.make_jaxpr(lambda *values, forms=tuple(form for _, form, _ in chosen):
                                 terms.forms_value(done.region, list(forms), list(values)))(*leaves)
@@ -642,7 +655,9 @@ def _region(closed: jcore.Jaxpr, *, accurate: bool, saturation: Saturation,
     graph.push()
     saturated = saturate(graph, region, firing, saturation)
     nodes = node_count(graph)
-    forms, after = extracted(graph, bundle, priced)
+    # Cross-root sharing (`reuse`: `a / sqrt(v)` sharing a sibling `rsqrt(v)`) ties greedy per-class
+    # extraction (`sqrt` and `rsqrt` price alike per class); exact DAG extraction sees the shared node.
+    forms, after = extracted(graph, bundle, priced, exact=saturated.fired.get("reuse", 0) > 0)
     changed = any(terms.key(form) != terms.key(root) for root, form in zip(roots, forms, strict=True))
     graph.pop()
     before = after

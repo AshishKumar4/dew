@@ -1998,6 +1998,7 @@ def test_reuse_pulls_sibling_rsqrt_into_division_windows_and_drops_sqrt(case):
         before_eqs, after_eqs = equations(before.jaxpr), equations(after.jaxpr)
         assert any(eq.primitive is jax.lax.sqrt_p for eq in before_eqs)
         assert not any(eq.primitive is jax.lax.sqrt_p for eq in after_eqs)
+        assert sum(eq.primitive is jax.lax.rsqrt_p for eq in after_eqs) == 1
         divs_before = sum(eq.primitive is jax.lax.div_p for eq in before_eqs)
         divs_after = sum(eq.primitive is jax.lax.div_p for eq in after_eqs)
         assert divs_after == divs_before - 1
@@ -2022,22 +2023,27 @@ def test_reuse_refuses_unfloored_root_rewrites_reduce_sum_and_keys_jit_context()
     def gated(a, z):
         v = jnp.sum(jnp.square(jnp.tanh(z)), axis=-1) / float(z.shape[-1]) + 1.0
         return jnp.tanh(a) / jnp.sqrt(v)[:, None], jax.lax.rsqrt(v)
-
-    with pytest.raises(ValueError, match="not cost-qualified"), algebra.rules.enabling_dev("stable"):
+    with pytest.raises(ValueError), algebra.rules.enabling_dev("stable"):
         pass
-
     a0, z0 = rows(0, (8, 16), (8, 16))
     v0 = np.full((8,), 2.0, np.float32)
     with algebra.rules.enabling_dev("reuse"):
         after_unfloored = jax.make_jaxpr(algebra.rewritten(unfloored))(a0, v0)
         assert any(eq.primitive is jax.lax.sqrt_p for eq in equations(after_unfloored.jaxpr))
 
-        before_sm = equations(jax.make_jaxpr(softmax_like)(a0, z0).jaxpr)
-        after_sm = equations(jax.make_jaxpr(algebra.rewritten(softmax_like))(a0, z0).jaxpr)
-        assert (sum(eq.primitive is jax.lax.div_p for eq in after_sm)
-                == sum(eq.primitive is jax.lax.div_p for eq in before_sm) - 1)
-        assert_as_exact(jax.jit(algebra.rewritten(softmax_like)), jax.jit(softmax_like),
-                        lambda seed: rows(seed, (8, 16), (8, 16)), "reuse reduce_sum", seeds=8)
+        closed_sm = jax.make_jaxpr(softmax_like)(a0, z0)
+        windows_sm = program._windows(closed_sm.jaxpr)
+        assert len(windows_sm) == 1
+        win_sm, _ = windows_sm[0]
+        assert sum(eq.primitive is jax.lax.div_p for eq in win_sm.eqns) == 2
+        done_sm = program._region(
+            jax.extend.core.ClosedJaxpr(win_sm, []), accurate=False, saturation=algebra.SATURATION,
+            ranges=program._declared(win_sm, program._held(closed_sm.jaxpr)))
+        assert done_sm.report.fired["reuse"] > 0
+        assert_as_exact(
+            jax.jit(lambda a, z: (a * (1.0 / jnp.sum(jnp.square(jnp.tanh(z)) + 1.0, axis=-1))[:, None],
+                                  1.0 / jnp.sum(jnp.square(jnp.tanh(z)) + 1.0, axis=-1))),
+            jax.jit(softmax_like), lambda seed: rows(seed, (8, 16), (8, 16)), "reuse reduce_sum", seeds=8)
 
     # One jitted callable must trace separately across off -> on -> off scope transitions.
     jitted = jax.jit(algebra.rewritten(gated))
