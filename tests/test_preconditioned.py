@@ -174,25 +174,6 @@ def but_beta(fn):
     return run
 
 
-def test_a_read_erase_under_a_decay_a_key_dimension_on_the_template_is_its_head_decays():
-    """The delta rule erasing along reads of its own under a decay a key dimension (PKDA's) on the template,
-    16-bit (the system's rows the reads' in its own pairs and the intra walk, its weights the reads' and its
-    decayed keys the keys' apart: `chunk_forward._paired`, `_key_weighted`; its backward's the same,
-    `key_backward.gradients`' reads), each key's decay the head's: its output, final memory and every
-    operand's gradient but the write gates', the reads' among them, on par from float64 with the same call
-    under that decay a head (check 1, the truth its recurrence a token at a time), whose read erase check 1
-    holds to the recurrence at the accurate forms: a system whose rows and columns trade the reads and the
-    keys, weights formed from the keys, or a gradient landing on the other, lands far past it. The write
-    gates' gradient a decay a key dimension's backward sums from three launches' parts where a decay a
-    head's sums two, 1.87 times the latter's distance on Kimi's delta attention itself (scratch jsf-beta2,
-    the reads along the keys, no read erase): held where its reference is that backward's, Kimi's
-    (`test_a_read_erase_along_its_keys_under_distinct_key_decays_trains_as_kimis_delta_attention`), and by
-    fla's recorded PKDA sites once M-JS-266b's fixture lands (row 12696)."""
-    assert_as_exact(jax.jit(but_beta(with_key_decays)), jax.jit(but_beta(read_erased_forward)),
-                    sixteen_bit_read_erase, "a key decay's read erase on the template", seeds=SEEDS,
-                    truth_fn=jax.jit(but_beta(read_erased)))
-
-
 def along_its_keys(query, key, value, log_decay, beta, state):
     """`read_erased_forward` reading along its own keys: the keys' gradient their reads' and their own
     summed by the derivative."""
@@ -221,19 +202,6 @@ def key_decayed_along_its_keys(seed):
     normal = np.random.default_rng([1459, 4, seed]).standard_normal
     keyed = hosted(-softplus(-(normal((*g.shape, k.shape[-1])) + 3.0)))
     return q, k, v, keyed, beta, state, cotangents
-
-
-def test_a_read_erase_along_its_keys_under_distinct_key_decays_trains_as_kimis_delta_attention():
-    """The delta rule erasing along reads of its own under a decay a key dimension, each key its own decay,
-    reading along its own keys on the template (16-bit): its output, final memory and every operand's
-    gradient, the keys' its reads' and its own summed (`key_backward.gradients`' reads, the system's rows'
-    and the weights' on the reads, the columns' and the memory's on the keys), on par from float64 with Kimi's
-    delta attention on the template (check 1, the truth the recurrence a token at a time), which check 1
-    holds to fla's recorded sites (`test_recurrence_mosaic_gradient`): a read's decay taken from another
-    key's, or a term lost between the reads' gradient and the keys', moves it far past (row 1459)."""
-    assert_as_exact(jax.jit(with_gradients(along_its_keys)), jax.jit(with_gradients(kimis)),
-                    key_decayed_along_its_keys, "a key decay's read erase along its keys", seeds=SEEDS,
-                    truth_fn=jax.jit(with_gradients(recurrence_along_its_keys)))
 
 
 def read_erase_operands(seed):
@@ -531,3 +499,37 @@ def test_the_rule_runs_in_a_shard_map_that_checks_varying_axes():
     found, split, whole = jax.jit(mapped)(*given), pulled(mapped), pulled(chunked)
     assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves((found, split)))
     np.testing.assert_array_equal(np.sign(np.asarray(split[-1])), np.sign(np.asarray(whole[-1])))
+
+
+KEY_DECAY_CASES = {
+    'head decays': (but_beta(with_key_decays), but_beta(read_erased_forward), but_beta(read_erased),
+                    sixteen_bit_read_erase),
+    'along its keys': (with_gradients(along_its_keys), with_gradients(kimis),
+                       with_gradients(recurrence_along_its_keys), key_decayed_along_its_keys),
+}
+"""The template's read erase under a decay a key dimension (PKDA's), its reference and truth (its
+recurrence a token at a time in float64) and draw: each key's decay the head's against the same call under
+that decay a head, every leaf but the write gates' gradient; each key its own decay, reading along its keys,
+against Kimi's delta attention, every leaf."""
+
+
+@pytest.mark.parametrize('case', KEY_DECAY_CASES)
+def test_a_key_decays_read_erase_on_the_template_is_as_exact_as_its_reference(case):
+    """The delta rule erasing along reads of its own under a decay a key dimension (PKDA's) on the template,
+    16-bit (the system's rows the reads' in its own pairs and the intra walk, its weights the reads' and its
+    decayed keys the keys' apart, `chunk_forward._paired` and `_key_weighted`; its backward's the same,
+    `key_backward.gradients`' reads), its output, final memory and operands' gradients on par from float64
+    with a reference (check 1): 'head decays', each key's decay the head's, against the same call under that
+    decay a head, whose read erase check 1 holds to the recurrence at the accurate forms: a system whose rows
+    and columns trade the reads and the keys, weights formed from the keys, or a gradient landing on the
+    other, lands far past it; every leaf but the write gates' gradient, which a decay a key dimension's
+    backward sums from three launches' parts where a decay a head's sums two, 1.87 times the latter's
+    distance on Kimi's delta attention itself against the gated delta net (scratch jsf-beta2, no read
+    erase). 'along its keys', each key its own decay, reading along its keys, against Kimi's delta attention
+    on the template, every leaf, the keys' gradient its reads' and its own summed, which check 1 holds to
+    fla's recorded sites (`test_recurrence_mosaic_gradient`): a read's decay taken from another key's, or a
+    term lost between the reads' gradient and the keys', moves it far past. fla's recorded PKDA sites hold
+    it once M-JS-266b's fixture lands (rows 1459, 12696)."""
+    dew, reference, truth, draw = KEY_DECAY_CASES[case]
+    assert_as_exact(jax.jit(dew), jax.jit(reference), draw,
+                    f"a key decay's read erase on the template: {case}", seeds=SEEDS, truth_fn=jax.jit(truth))
