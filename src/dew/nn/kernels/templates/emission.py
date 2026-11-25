@@ -664,8 +664,8 @@ class _Counting:
                                                       jaxpr.outvars)
                                    for atom in atoms if isinstance(atom, jax_core.Var))
         products: set = set()
-        # Each arithmetic equation's outputs by what it computes (`_computes`): one repeating it computes
-        # nothing, as the lowering's CSE merges it (Mosaic GPU's `canonicalize,cse`).
+        # Each reduction's outputs by what it computes (`_computes`): one repeating it computes nothing, as
+        # the lowering's CSE merges it (Mosaic GPU's `canonicalize,cse`).
         computed: dict = {}
         for equation in jaxpr.eqns:
             computes = _computes(equation)
@@ -722,14 +722,15 @@ class _Counting:
     def computed(self, equation) -> Work:
         """An arithmetic equation's work (`operation_work`), a reduction's beside it its exchange across the
         lanes its operand's layout spreads it over where its provenance names that layout (`_butterfly`)."""
-        work = operation_work(equation.primitive, [variable.aval for variable in equation.invars],
-                              [variable.aval for variable in equation.outvars], equation.params,
-                              forms=self.forms)
         layout = self.laid.get(equation.invars[0]) if equation.primitive in _REDUCTIONS else None
         if isinstance(layout, fragments.TiledLayout):
             threads = inline_work.WARP if self.lanes is not None else resources.THREADS
-            work = work + _butterfly(layout, equation.invars[0].aval, equation.params["axes"], threads)
-        return work
+            reduced = _laid_reduction(layout, equation.invars[0].aval, equation.params["axes"], threads)
+            if reduced is not None:
+                return reduced
+        return operation_work(equation.primitive, [variable.aval for variable in equation.invars],
+                              [variable.aval for variable in equation.outvars], equation.params,
+                              forms=self.forms)
 
     def moved(self, equation, values: list, live: collections.Counter) -> list | None:
         """A read or write of a ref in device memory (`emitted`'s `device`) counted as the bytes it moves,
@@ -1130,19 +1131,25 @@ def layouts(jaxpr) -> dict:
 def _laid_out(jaxpr, given: Sequence, found: dict) -> list:
     """The layouts of `jaxpr`'s outputs, its inputs' `given`, each value's noted in `found` (a value two
     visits lay out apart, a body's two calls', none)."""
-    known = {var: layout for var, layout in zip(jaxpr.invars, given, strict=True) if layout is not None}
+    known: dict = {}
+
+    def note(var, layout) -> None:
+        # Each visit's layout of `var` joins its others': one visit's unknown or another layout, none.
+        if isinstance(var, jax_core.DropVar):
+            return
+        found[var] = layout if found.get(var, layout) == layout else None
+        if layout is not None:
+            known[var] = layout
 
     def of(atom):
         return known.get(atom) if isinstance(atom, jax_core.Var) else None
 
+    for var, layout in zip(jaxpr.invars, given, strict=True):
+        note(var, layout)
     for equation in jaxpr.eqns:
         laid = _equation_layouts(equation, [of(atom) for atom in equation.invars], found)
         for var, layout in zip(equation.outvars, laid, strict=True):
-            if layout is None or isinstance(var, jax_core.DropVar):
-                continue
-            known[var] = layout
-            if found.setdefault(var, layout) != layout:
-                found[var] = None
+            note(var, layout)
     return [of(atom) for atom in jaxpr.outvars]
 
 
@@ -1196,61 +1203,61 @@ def _equation_layouts(equation, given: list, found: dict) -> list:
         consts = params["cond_nconsts"] + params["body_nconsts"]
         carried = list(given[consts:])
         body_consts = given[params["cond_nconsts"]:consts]
-        for _ in range(2):
+        # Each pass keeps a carry's layout its trip keeps (a carry only loses one), so passes stop by the
+        # carries' count; each pass's facts join the others' (`_laid_out`), so the fixed point's stand.
+        while True:
             out = _laid_out(params["body_jaxpr"].jaxpr, [*body_consts, *carried], found)
             kept = [before if before == after else None for before, after in zip(carried, out, strict=True)]
             if kept == carried:
-                break
+                return carried
             carried = kept
-        return carried
     if primitive is lax.scan_p:
         consts, carried, xs = map(list, params["ft_in"].update(given).unpack())
-        for _ in range(2):
+        while True:
             out = _laid_out(params["jaxpr"].jaxpr, [*consts, *carried, *([None] * len(xs))], found)
             kept = [before if before == after else None
                     for before, after in zip(carried, out[:len(carried)], strict=True)]
             if kept == carried:
-                break
+                return carried + [None] * (len(outs) - len(carried))
             carried = kept
-        return carried + [None] * (len(outs) - len(carried))
     return unknown
 
 
 def _computes(equation) -> tuple | None:
-    """What an arithmetic equation computes, a key two equations of one body computing the same share: its
-    primitive, its parameters and its operands (each variable itself, each literal its value); None for any
-    other equation, which may move data or synchronize."""
-    if equation.primitive not in _ARITHMETIC:
+    """What a reduction of a variable computes, a key two reductions of one body computing the same share:
+    its primitive, its axes and its operand (the variable itself); None for any other equation. Only
+    reductions merge here: a repeated product's readers decide its fusion (`_Counting.fused`), which a
+    merge would have to rewrite."""
+    if equation.primitive not in _REDUCTIONS or not isinstance(equation.invars[0], jax_core.Var):
         return None
-    operands = tuple(atom if isinstance(atom, jax_core.Var) else ("literal", repr(atom.val))
-                     for atom in equation.invars)
-    return equation.primitive, repr(sorted(equation.params.items(), key=str)), operands
+    return equation.primitive, tuple(equation.params["axes"]), equation.invars[0]
 
 
-def _butterfly(layout: fragments.TiledLayout, value, axes: Sequence[int], threads: int) -> Work:
-    """A reduction's exchange across the lanes its `value`'s `layout` spreads `axes` over, as Mosaic GPU
-    lowers it (`FragmentedArray.reduce`): log2 of those lanes rounds, each a shuffle of every 32-bit word of
-    each register the result holds and a combine of it, on each of the role's `threads`; none where no lane
-    holds another's part, and a reduction across warps (through shared memory) unpriced here. The attention
+def _laid_reduction(layout: fragments.TiledLayout, value, axes: Sequence[int], threads: int) -> Work | None:
+    """A reduction of `value`, laid out as `layout`, along `axes`, as Mosaic GPU lowers it
+    (`FragmentedArray.reduce`): each thread combines the values it holds of each output it keeps, then
+    exchanges them across the lanes the layout spreads `axes` over, log2 of them rounds of a shuffle of each
+    32-bit word and a combine of each value, on each of the role's `threads`; None where the layout states
+    no such lowering here (a scalar's, an axis no tile holds, an exchange across warps). The attention
     forward's walk issues 12 SHFL a thread a step for its three row reductions of a WGMMA (sm90) or mma.sync
-    (sm80) tile, two rows a thread and two rounds each (FS-REDSHFL3)."""
+    (sm80) tile, two rows a thread and two rounds each (FS-REDSHFL4)."""
     shape = tuple(value.shape)
     untiled = len(shape) - len(layout.base_tile_shape)
     kept = tuple(size for axis, size in enumerate(shape) if axis not in axes)
     if not kept or any(axis < untiled for axis in axes):
-        # To a scalar, or along an axis each thread holds whole: none its layout states.
-        return Work()
+        return None
     reduced = layout.reduce(tuple(axis - untiled for axis in axes))
 
     def spread(dims) -> int:
         return math.prod(dim.times for dim in dims if isinstance(dim, fragments.Replicated))
 
-    lanes = spread(reduced.lane_dims) // spread(layout.lane_dims)
-    if lanes <= 1 or spread(reduced.warp_dims) > spread(layout.warp_dims):
-        return Work()
-    words = math.ceil(reduced.vector_length * np.dtype(value.dtype).itemsize / 4)
-    exchanged = int(math.log2(lanes)) * math.prod(reduced.registers_shape(kept)) * words * threads
-    return Work(shuffles=exchanged, operations=exchanged)
+    if spread(reduced.warp_dims) > spread(layout.warp_dims):
+        return None
+    rounds = int(math.log2(spread(reduced.lane_dims) // spread(layout.lane_dims)))
+    held = math.prod(reduced.registers_shape(kept)) * reduced.vector_length * threads
+    words = math.prod(reduced.registers_shape(kept)) * math.ceil(
+        reduced.vector_length * np.dtype(value.dtype).itemsize / 4) * threads
+    return Work(operations=_elements(value) - held + rounds * held, shuffles=rounds * words)
 
 
 def _divides_on_cuda(outputs: Sequence, target: generation.GpuTarget | None) -> bool:
