@@ -460,16 +460,19 @@ def test_a_counted_loop_runs_where_its_coda_reads_none_of_its_blocks_publication
                     seeds=SEEDS["counted sharing"], truth_fn=jax.jit(fixed.clone(dtype=jnp.float64).apply))
 
 
-def _reindexed(**fields) -> CausalTransformer:
+def _reindexed(index_sources=(2, 3, 4, 5), kv_sources=(2,), rates=None, **fields) -> CausalTransformer:
     """DeepSeek V4.1's tiny release cut to six layers on a plain residual (no mHC, engram or DSpark, which
-    a loop refuses): a CSA2 Full layer at 2 publishing its entries (compressed two to one) and Reindex
-    layers after it reading them and writing their selections, `fields` over its own."""
+    a loop refuses): a CSA2 Full layer at 2 publishing its entries (compressed two to one), Reindex layers
+    after it reading them and writing their selections (`index_sources` past 2), and a Reuse layer at any
+    layer from 3 they leave out, reading the latest selection (a Full layer at each of `kv_sources`, at
+    `rates` a layer where given), `fields` over its own."""
     config = json.loads((FIXTURES / "deepseek-v41-tiny" / "config.json").read_text())
     text = config["text_config"]
-    ratios = text["compress_ratios"][:4] + [2] * 2 + text["compress_ratios"][text["num_hidden_layers"]:]
+    own = text["compress_ratios"][:4] + [2] * 2 if rates is None else list(rates)
+    ratios = own + text["compress_ratios"][text["num_hidden_layers"]:]
     config = {**config, "text_config": {
-        **text, "num_hidden_layers": 6, "compress_ratios": ratios, "kv_source_layer_ids": [2],
-        "index_source_layer_ids": [2, 3, 4, 5], "candidate_source_layer_id": 2,
+        **text, "num_hidden_layers": 6, "compress_ratios": ratios, "kv_source_layer_ids": list(kv_sources),
+        "index_source_layer_ids": list(index_sources), "candidate_source_layer_id": 2,
         "engram_layer_ids": [1], "engram_num_embeddings": text["engram_num_embeddings"][:1],
         "dspark_target_layer_ids": [3, 4, 5]}}
     translated = {key: value for key, value in translate_config(config).items()
@@ -485,21 +488,37 @@ def _block_gated(model: CausalTransformer, layers: tuple[int, int], steps: int =
 def test_a_block_gate_refuses_a_coda_reading_its_blocks_publications():
     """A gate on the block's output runs the coda once over its tokens' exiting states, so a coda reading a
     key its block's last writer left (`MixerBase.publications`) is refused: Reindex layers after a looped
-    Full layer reading its entries, and a Reuse layer after a looped Reindex layer reading its selection.
+    Full layer reading its entries, and a Reuse layer after looped Reindex layers reading their selection,
+    each loop running without the gate.
     A coda that reads only what it writes itself (each Reindex after a looped Reindex writing its own
     selection), and a single pass, which hands on its own publications, run, the latter as the loop
     without a threshold does, bit for bit."""
     ids = jnp.ones((2, 8), jnp.int32)
-    plain = _reindexed()
-    for refused in (_block_gated(plain, (2, 3)), _block_gated(plain.clone(kv_shared_layers=(5,)), (3, 5))):
+    plain, reused = _reindexed(), _reindexed(index_sources=(2, 3, 4))
+    assert reused.kv_shared_layers == (5,), reused.kv_shared_layers
+    for valid, layers in ((plain, (2, 3)), (reused, (3, 5))):
+        # Valid loops whose passes run whole, refused only where a gate on the block picks among them.
+        valid.with_passes(2, layers).init(jax.random.key(0), ids)
         with pytest.raises(ValueError):
-            refused.init(jax.random.key(0), ids)
+            _block_gated(valid, layers).init(jax.random.key(0), ids)
     _block_gated(plain, (3, 4)).init(jax.random.key(0), ids)
     once = _block_gated(plain, (2, 3), steps=1)
     variables = once.init(jax.random.key(0), ids)
     free = once.clone(loop=dataclasses.replace(once.loop, exit_threshold=None))
     np.testing.assert_array_equal(np.asarray(jax.jit(once.apply)(variables, ids)),
                                   np.asarray(jax.jit(free.apply)(variables, ids)))
+
+
+def test_a_block_gate_refuses_a_coda_restricted_to_its_blocks_candidates():
+    """A looped Full layer pooling the candidates (the candidate source) before a coda whose own Full layer
+    writes fresh entries, index keys and selection but no candidates, its layers restricted to the pooled
+    candidates: the coda reads the block's pool alone (`MixerBase.publications`), and a gate on the block's
+    output is refused; the loop without it runs."""
+    ids = jnp.ones((2, 8), jnp.int32)
+    model = _reindexed(kv_sources=(2, 3), rates=(0, 0, 2, 2, 2, 2))
+    model.with_passes(2, (2, 3)).init(jax.random.key(0), ids)
+    with pytest.raises(ValueError):
+        _block_gated(model, (2, 3)).init(jax.random.key(0), ids)
 
 
 def test_a_row_exit_over_compressed_publications_stops_over_every_row():
@@ -543,3 +562,20 @@ def test_a_cached_block_gate_collects_exits_where_no_earlier_coda_runs():
     with pytest.raises(ValueError):
         block.apply({**variables, "cache": made(variables, 2)}, ids[:, :1], decode=True,
                     mutable=["cache", "intermediates"], capture_intermediates=lambda module, method: True)
+
+
+def test_a_parallel_layer_publishes_what_its_branches_do():
+    """A parallel layer's publications are its branches' in the order they run (`ParallelMixer`): a key one
+    branch writes before the next reads it is the layer's own, not a read from the layers before it, and it
+    writes what any branch writes, so a looped Full branch's entries are its coda's to refuse."""
+    from dew.nn.deepseek_v4 import DeepseekV4Mixer
+    from dew.nn.mixers.parallel import ParallelBranch, ParallelMixer
+
+    full = DeepseekV4Mixer(compressor="csa2")
+    reindex = DeepseekV4Mixer(compressor="csa2", reindex=True)
+    reads, writes = ParallelMixer(branches=(ParallelBranch("full", full), ParallelBranch("reindex", reindex))
+                                  ).publications(kv_shared=False)
+    assert not reads and writes == full.publications(kv_shared=False)[1]
+    reads, _ = ParallelMixer(branches=(ParallelBranch("reindex", reindex), ParallelBranch("full", full))
+                             ).publications(kv_shared=False)
+    assert reads == reindex.publications(kv_shared=False)[0]
