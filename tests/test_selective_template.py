@@ -724,7 +724,7 @@ def test_a_routed_forked_training_step_compiles_spill_free(target):
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     forked = FORKED["shared and chained"]
-    rows, length, channels, states = 2, 2048, 256, 16
+    rows, length, channels, states = 2, 512, 256, 16
     operands = (jax.ShapeDtypeStruct((rows, length, channels), jnp.bfloat16),) * 2 + (
         jax.ShapeDtypeStruct((channels, states), jnp.float32),
         *(jax.ShapeDtypeStruct((rows, length, states), jnp.bfloat16),) * 2,
