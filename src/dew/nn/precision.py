@@ -70,6 +70,7 @@ from dew.nn.sharding import explicit_spec
 __all__ = [
     "ACCURATE",
     "DTYPE_PRESETS",
+    "EXACT_FLOAT32",
     "FP8",
     "FP32_SUMS",
     "L2NORM_EPS",
@@ -1349,6 +1350,11 @@ def numerics_of(given: Numerics | str) -> Numerics:
         return Numerics(DTYPE_PRESETS[given])
     raise ValueError(f"a run's precision is a Numerics record, 'default', one of {sorted(NUMERICS_PRESETS)} "
                      f"or a dtype preset of {sorted(DTYPE_PRESETS)}, not {given!r}")
+
+
+EXACT_FLOAT32 = jax.lax.Precision.HIGHEST
+"""The precision a genuinely exact boundary names, IEEE float32 whatever JAX's configured precision
+(`exact_float32`'s where its call states none): each user names its reason where it reads it (row 12921)."""
 
 
 def exact_float32(precision: jax.lax.PrecisionLike) -> jax.lax.PrecisionLike:

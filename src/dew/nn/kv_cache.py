@@ -55,7 +55,7 @@ from dew.nn.host_memory import fetched, fetched_at, on_host, placed_like, stored
 from dew.nn.kernels import decode_attention, generation
 from dew.nn.kernels.generation import INHERENT, Choice, backend
 from dew.nn.kernels.selection import Kernel, Op, Requirement, select
-from dew.nn.precision import at_least_fp32, declares_fp32_products, divided, exact_float32, float32_einsum
+from dew.nn.precision import EXACT_FLOAT32, at_least_fp32, declares_fp32_products, divided, float32_einsum
 from dew.nn.protocols import computes_in
 from dew.nn.scatter import DROPPED
 from dew.nn.sharding import manual_map, sequence_shards
@@ -475,7 +475,7 @@ def rotated(values: jax.Array, rotation: jax.Array) -> jax.Array:
     """`values` `[..., head_dim]` times the rotation, computed in float32 (a float64 value's in float64), in
     `values`' dtype."""
     product = float32_einsum("...d,de->...e", values.astype(jnp.promote_types(values.dtype, jnp.float32)),
-                             rotation, precision=exact_float32(None))
+                             rotation, precision=EXACT_FLOAT32)
     return product.astype(values.dtype)
 
 

@@ -1744,27 +1744,6 @@ def test_a_sleeps_boundary_is_found_through_calls_as_python_resolves_them(tmp_pa
         "        time.sleep(1)\n"), "SLOP018", (25, 30, 39, 44, 47, 50, 57, 64, 66))
 
 
-def test_a_precision_named_outright_outside_the_policy_is_reported(tmp_path):
-    """SLOP034: JAX's `Precision.HIGHEST`, through any name its enum is imported as, or 'highest' as a
-    call's `precision=`, in the package's source outside its precision policy (`nn/precision.py`); a
-    docstring or comment naming it, a local class of that name, and the policy's own file are not."""
-    source = ("import jax\n"
-              "from jax import lax\n"
-              "from jax.lax import Precision as P\n"
-              "class Precision:\n"
-              "    HIGHEST = 1\n"
-              "def product(x, y):\n"
-              "    \"\"\"At Precision.HIGHEST, as the reference.\"\"\"\n"
-              "    # precision='highest' here would be outright\n"
-              "    a = jax.numpy.dot(x, y, precision=jax.lax.Precision.HIGHEST)\n"
-              "    b = jax.numpy.dot(x, y, precision=lax.Precision.HIGHEST)\n"
-              "    c = jax.numpy.dot(x, y, precision=P.HIGHEST)\n"
-              "    d = jax.numpy.dot(x, y, precision='highest')\n"
-              "    return a + b + c + d + Precision.HIGHEST\n")
-    assert_reported(tmp_path, "src/sparx/layer.py", source, "SLOP034", (9, 10, 11, 12))
-    assert_reported(tmp_path / "policy", "src/sparx/nn/precision.py", source, "SLOP034", ())
-
-
 def test_a_feature_detected_by_its_exception_is_reported(tmp_path):
     """SLOP019: a handler of the ImportError, ModuleNotFoundError or AttributeError a missing feature
     raises, by any name it is imported as, that carries on instead of raising, in the package's

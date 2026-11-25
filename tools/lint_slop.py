@@ -107,11 +107,8 @@ Scope is per rule, because the rules are not all about the same thing:
   `xla_compiled` waits for a compile slot, whatever its pool's width.
 - SLOP033 is about tests (tools/lint_assertions.py): no test pins a choice Dew
   derives to a literal (CONTRIBUTING's banned assertion 2).
-- SLOP034 is about `src/<package>`: no contraction names its precision
-  outright (`Precision.HIGHEST`, `precision='highest'`) outside
-  `nn/precision.py` and the arithmetic catalog beneath it, whose policy gives a layer's products the run's
-  (`computed_einsum`) and names each genuinely exact boundary
-  (`exact_float32`), so a run's numerics reach every model contraction.
+- SLOP034 (tools/lint_precisions.py): no contraction in `src/<package>`
+  names its precision outright outside its precision policy.
 - SLOP029 is about `tests`: no test's every assertion is that a process
   failed, read from its exit status alone (a `returncode`, `subprocess.call`
   or `os.system` unequal to 0, equal to 1, an uncaught error's, or tested for
@@ -170,6 +167,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import lint_assertions as assertion_rules
 import lint_derivatives as derivative_rules
 import lint_divisors as divisor_rules
+import lint_precisions as precision_rules
 import lint_promotions as promotion_rules
 import lint_scopes as scopes
 import lint_tolerances as tolerance_rules
@@ -680,6 +678,13 @@ def divisions(module: Module) -> Iterator[Finding]:
     """SLOP024: a JAX array divided by a constant whose reciprocal rounds (tools/lint_divisors.py)."""
     for line, col, message in divisor_rules.divisions(module.path, module.tree, _parent(module)):
         yield Finding(module.relative, line, col, "SLOP024", message)
+
+
+def precisions(module: Module) -> Iterator[Finding]:
+    """SLOP034: a precision named outright outside the precision policy (tools/lint_precisions.py)."""
+    found = precision_rules.precisions(module.relative, module.package, module.tree, _parent(module))
+    for line, col, message in found:
+        yield Finding(module.relative, line, col, "SLOP034", message)
 
 
 def size(module: Module) -> Iterator[Finding]:
@@ -1841,37 +1846,6 @@ def detections(module: Module) -> Iterator[Finding]:
                           "the version that has it")
 
 
-PRECISION_POLICY = ("nn/precision.py", "nn/programs.py")
-NAMED_OUTRIGHT = ("a precision named outright; take the run's (dew.nn.precision.computed_einsum) or name an "
-                  "exact boundary (dew.nn.precision.exact_float32)")
-"""SLOP034's finding."""
-"""The modules of `src/<package>` that name a contraction's precision outright (SLOP034): its policy,
-`computed_einsum` a layer's products' and `exact_float32` a genuinely exact boundary's, and the arithmetic
-catalog beneath it, which names the algorithms each precision lowers to (row 12921)."""
-
-
-def precisions(module: Module) -> Iterator[Finding]:
-    """SLOP034: a contraction precision named outright outside the package's precision policy
-    (`PRECISION_POLICY`): JAX's `Precision.HIGHEST` read through any name its enum is imported as, or
-    'highest' as a call's `precision=`. A layer's product takes the run's (`computed_einsum`) and an exact
-    boundary says so (`exact_float32`), so a bf16 run's Tensor Cores and `ACCURATE`'s float32 reach every
-    model contraction (the owner, 2026-11-25)."""
-    if module.relative in {f"src/{module.package}/{policy}" for policy in PRECISION_POLICY}:
-        return
-    for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
-        if isinstance(node, ast.Attribute) and node.attr == "HIGHEST":
-            named = scopes.resolved(node.value, table)
-            if named.startswith("jax.") and named.endswith(".Precision"):
-                yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP034", NAMED_OUTRIGHT)
-        elif isinstance(node, ast.Call):
-            for keyword in node.keywords:
-                value = keyword.value
-                if (keyword.arg == "precision" and isinstance(value, ast.Constant)
-                        and isinstance(value.value, str) and value.value.lower() == "highest"):
-                    yield Finding(module.relative, value.lineno, value.col_offset + 1, "SLOP034",
-                                  NAMED_OUTRIGHT)
-
-
 COMPILE_POINT = (("nn/kernels/options.py", "OuterProgram"), ("nn/nested.py", "nested"))
 """The two places of `src/<package>` that compile by a bare jit (SLOP025), each `path` below it and the
 definition the jit is in: Dew's one compile point, through which every program compiles
@@ -2047,39 +2021,6 @@ bounds hold a draw's discrete choices to float64's, and live with it."""
 INVENTORY = "tools/tolerance_inventory.json"
 RULE = "tools/lint_tolerances.py"
 """SLOP020's reading of a file (`tolerance_rules`), whose change may grow what the inventory holds."""
-
-
-def _tolerance_comparisons(module: Module) -> Iterator[tuple[ast.expr | ast.stmt, str]]:
-    """SLOP020's comparisons in a module (`tolerance_rules.comparisons`), its imports read from its own
-    package and its calls resolved as SLOP018 resolves them. A function imported by a bare module name
-    from a file beside it, as tests import their support (`from test_pipeline_core import delivered`),
-    is read as that file's own reading proves it (`_support_functions`), as the same function defined in
-    the test would be."""
-    parent = tuple(_parent(module))
-    tables = {id(node): table for node, table in scopes.scoped(module.tree.body, {}, list(parent))}
-
-    def imported(called: str) -> tolerance_rules.Imported | None:
-        source, _, name = called.rpartition(".")
-        path = module.path.parent / f"{source}.py"
-        if not source or "." in source or not path.is_file():
-            return None
-        return _support_functions(path, parent, path.stat().st_mtime_ns).get(name)
-
-    return tolerance_rules.comparisons(module.tree, tables, _Calls(module.tree), imported)
-
-
-@functools.cache
-def _support_functions(path: Path, parent: tuple[str, ...], modified: int
-                       ) -> dict[str, tolerance_rules.Imported]:
-    """What the file at `path` proves of each of its module-level functions
-    (`tolerance_rules.support_functions`), read as of its modification time `modified`."""
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    tables = {id(node): table for node, table in scopes.scoped(tree.body, {}, list(parent))}
-    calls = _Calls(tree)
-    # A name the module binds twice, or to anything but its one definition, is no one's.
-    bound = calls.bindings[id(tree)]
-    return {name: found for name, found in tolerance_rules.support_functions(tree, tables, calls).items()
-            if isinstance(bound.get(name), ast.FunctionDef | ast.AsyncFunctionDef)}
 
 
 def _inventory(checkout: Path) -> dict:
@@ -2293,7 +2234,7 @@ def tolerances(module: Module) -> Iterator[Finding]:
     (`ratchet` holds every commit's inventory to its parents')."""
     if not module.relative.startswith(("tests/", "tools/")) or module.relative in GATE:
         return
-    found = sorted(_tolerance_comparisons(module),
+    found = sorted(tolerance_rules.read(module.path, module.tree, _parent(module), _Calls),
                    key=lambda pair: (pair[0].lineno, pair[0].col_offset))
     inventory = _inventory(_checkout(module))
     entry = inventory.get("files", {}).get(module.relative)

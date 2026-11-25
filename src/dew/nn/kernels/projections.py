@@ -40,7 +40,7 @@ from dew.nn.kernels.gemm import (
     nvfp4_block_product,
 )
 from dew.nn.kernels.templates.product import MXFP8 as MX_BLOCKS, NVFP4 as NVFP4_BLOCKS, SCALE_DEPTH, declared
-from dew.nn.precision import biased, biased_value, exact_float32
+from dew.nn.precision import EXACT_FLOAT32, biased, biased_value
 from dew.nn.sharding import (
     RESIDUAL,
     automatic_axes,
@@ -585,7 +585,7 @@ def _nvfp4_backward(out_dtype, interpret, residuals, cotangent):
     # An FP4 backward's exact fp32 products: the decoded codes times their scales, held whole.
     d_w = gemm_t((rows.decoded() * rows.scale).T.astype(jnp.float32),
                  (cotangents.decoded() * cotangents.scale).T.astype(jnp.float32), sizes, out_dtype=w.dtype,
-                 precision=exact_float32(None), interpret_on_cpu=interpret)
+                 precision=EXACT_FLOAT32, interpret_on_cpu=interpret)
     return (*with_gradients_formed(d_x, d_w), None, None)
 
 # The NVFP4 recipe's gradient (`nvfp4_projection`): a derivative of Dew's choosing (`Surrogate`); its tensor

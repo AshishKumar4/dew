@@ -196,12 +196,11 @@ def test_a_shared_cache_decodes_each_row_at_its_exiting_pass(bias, site):
 def test_a_gate_on_the_block_exits_by_row():
     """A gate on the block's output runs the coda once on its tokens' states, which a token's own exit
     would make a causal prefix of mixed passes: refused, as a gate placement without a gate is."""
-    with pytest.raises(ValueError) as raised:
+    with pytest.raises(ValueError):
         Loop(3, exit_gate=True, exit_at="block")
-    assert "exit_by='row'" in str(raised.value)
-    with pytest.raises(ValueError) as raised:
+    with pytest.raises(ValueError):
         Loop(3, exit_by="row")
-    assert "exit_gate" in str(raised.value)
+    Loop(3, exit_gate=True, exit_at="block", exit_by="row")
 
 
 def _sharing(steps: int) -> CausalTransformer:

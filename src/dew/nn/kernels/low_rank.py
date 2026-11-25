@@ -11,7 +11,7 @@ from jax.custom_derivatives import zero_from_primal
 from dew.nn.derivatives import KernelGlue, contracted, declared_derivative, with_gradients_formed
 from dew.nn.kernels import generation, selection, xla_products
 from dew.nn.kernels.gemm import gemm_t, joined_depths
-from dew.nn.precision import at_least_fp32, effective_precision, exact_float32, refuse_recipe
+from dew.nn.precision import EXACT_FLOAT32, at_least_fp32, effective_precision, refuse_recipe
 from dew.nn.programs import dot_arithmetic
 from dew.nn.sharding import excess_axes, summed_to
 
@@ -172,10 +172,10 @@ def _kept(precision: PrecisionLike) -> PrecisionLike:
     except ValueError:
         # JAX's own refusal of fp32 operands for the algorithm (an FP8 preset takes FP8 operands alone): it
         # keeps no fp32 operand whole. A narrow product's fp32 sum, exact.
-        return exact_float32(None)
+        return EXACT_FLOAT32
     narrow = arithmetic is not None and arithmetic.digits < jnp.finfo(jnp.float32).nmant + 1
     # A narrow product's fp32 sum, exact: its operands' digits would round them back.
-    return exact_float32(None) if narrow else precision
+    return EXACT_FLOAT32 if narrow else precision
 
 
 # The launches' derivative glue (`derivatives.KernelGlue`): an operand no reverse pass reaches is a symbolic
