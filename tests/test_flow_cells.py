@@ -232,6 +232,24 @@ def test_a_cell_that_computes_in_a_parts_prepare_is_deferred_to_its_run(tmp_path
     assert raised.value.labels == ["computes"]
 
 
+def test_two_cells_preparing_one_site_label_fail_the_prepare(tmp_path, monkeypatch):
+    """In a GPU tier part's prepare, a second site of a label another cell's prepare began
+    (`truths_ahead.SiteCollision`) fails its flow there, never deferred to the run, which would read the
+    first site's programs as its own (row 13030: two attention-stability cells of one label, the second's
+    run a MissingTruth); the first cell's prepare passes."""
+    import store_wire
+    import tier_wire
+    from truths_ahead import compiled_truths
+
+    def site():
+        store_wire.COMPILED.get().compile_site("one label", {}, {})
+
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    with compiled_truths(tmp_path, prepare=True, stamp="a"), pytest.raises(CellsFailed) as raised:
+        run_cells([Cell("first", site), Cell("second", site)])
+    assert raised.value.labels == ["second"]
+
+
 def test_a_cell_past_its_prepares_cap_is_deferred_to_its_run_and_not_run(tmp_path, monkeypatch):
     """In a part's prepare past its cap (`tier_wire.PREPARE_BY`), a flow runs the cells before it and defers
     each after, unrun, to its run (`tier_wire.DEFERRED`, where `tier_wire.CAPPED`), its flow passing its

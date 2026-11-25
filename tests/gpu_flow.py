@@ -162,13 +162,16 @@ def _deferred(label: str, error: BaseException, frames: list[tuple[str, int]],
     and then raised, checked what its prepare gives in their place (`CompiledTruths.judged_its_zeros`, a
     test's rule too) and passes its prepare unrecorded, its run judging it (row 8555: every such cell was
     named unprepared, falsely)."""
-    if tried_before is None:
+    import truths_ahead
+
+    # Two sites of one label: the second's run would read the first's programs (row 13030), a defect of the
+    # cells, which no run computes past.
+    if tried_before is None or isinstance(error, truths_ahead.SiteCollision):
         return False
     import os
 
     import store_wire
     import tier_wire
-    import truths_ahead
 
     store = store_wire.COMPILED.get()
     if not store.judged_its_zeros(error, tried_before):

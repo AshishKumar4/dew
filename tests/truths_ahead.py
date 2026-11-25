@@ -51,6 +51,12 @@ from tier_wire import UNPREPARED, PastCap
 from tool_support import load
 
 
+class SiteCollision(ValueError):
+    """A second check-1 site of one label in one store of compiled truths (`CompiledTruths.compile_site`),
+    which would replace the first's programs, so a run read either site's as the other's: a test defect,
+    refused where its prepare meets it, never deferred to the run (`gpu_flow._deferred`, row 13030)."""
+
+
 class MissingTruth(AssertionError):
     """A check-1 site under a store of programs compiled ahead (`compiled_truths`) whose prepare compiled its
     programs for another commit, for other shapes, or of another arm than the run's: a red with its reason,
@@ -270,7 +276,7 @@ class CompiledTruths:
         from dew.nn.kernels.templates import report
 
         if label in self.begun:
-            raise ValueError(f"{label}: two sites of one label in one store of compiled truths, where the "
+            raise SiteCollision(f"{label}: two sites of one label in one store of compiled truths, where the "
                              "second would replace the first's: each needs its own")
         self.begun.add(label)
         site = self.path(label)
