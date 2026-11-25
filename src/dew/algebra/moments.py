@@ -12,7 +12,7 @@ from typing import Literal
 import jax
 import jax.numpy as jnp
 
-from dew.algebra import derive, program
+from dew.algebra import derive, program, ratios, windows
 from dew.algebra.forms import Derived
 from dew.nn import float_bits
 from dew.nn.derivatives import Protected, contracted, declared_tangent
@@ -167,13 +167,12 @@ def _primal_exponent(value: jax.Array) -> jax.Array:
     return jnp.where(valid, exponent.astype(jnp.int32), jnp.int32(0))
 
 
-def _shifted_tangent_div(dtw: jax.Array, numerator: jax.Array, sn: jax.Array,
-                         extra_shift: jax.Array | int = 0) -> jax.Array:
-    """Linear-in-`dtw` evaluation of `dtw * numerator * 2**extra_shift / sn` using `dew.nn.precision.power2`:
-    balances `k_dtw` and `q = power2(numerator, k_num) / u_sn` so both factors move in the same direction
-    (`>= 1` when `|R| >= 1`, `<= 1` when `|R| < 1`), moves `/ u_sn` onto `power2(dtw, k_dtw)` when `e_total
-    <= 0` and `e_num <= minexp` (preventing both subnormal flush on XLA:CPU and upward scaling of numerator
-    tangents), and puts positive shift onto zero `numerator` to avoid `inf * 0`."""
+def _safe_tangent_div(dtw: jax.Array, numerator: jax.Array, sn: jax.Array) -> jax.Array:
+    """Linear-in-`dtw` evaluation of `dtw * numerator / sn` using `dew.nn.precision.power2`: balances
+    `k_dtw` and `q = power2(numerator, k_n) / u_den` so both factors move in the same direction (`>= 1` when
+    `|R| >= 1`, `<= 1` when `|R| < 1`), halves `u_sn` when `k_num > 0` so `power2(dx, k_num - 1)` cannot
+    overflow ahead of `/ u_den`, moves `/ u_sn` onto `scaled_dtw` when `e_sn >= 0` and `e_num <= minexp`,
+    and puts positive shift onto zero `numerator` to avoid `inf * 0`."""
     minexp = int(jnp.finfo(numerator.dtype).minexp)
     e_sn = _primal_exponent(sn)
     u_sn = power2(sn, -e_sn)
@@ -182,7 +181,7 @@ def _shifted_tangent_div(dtw: jax.Array, numerator: jax.Array, sn: jax.Array,
     e_num = _primal_exponent(numerator)
     m_q = jnp.abs(power2(plain_num, -e_num)) / jax.lax.stop_gradient(u_sn)
     q_ge_1 = m_q >= 1.0
-    e_total = extra_shift - e_sn
+    e_total = -e_sn
     e_r = e_num + e_total - jnp.where(q_ge_1, jnp.int32(0), jnp.int32(1))
     need = -e_num + jnp.where(q_ge_1, jnp.int32(0), jnp.int32(1))
     drop = -e_num - jnp.where(q_ge_1, jnp.int32(1), jnp.int32(0))
@@ -192,22 +191,25 @@ def _shifted_tangent_div(dtw: jax.Array, numerator: jax.Array, sn: jax.Array,
     k_dtw = e_total - k_num
     div_on_dtw = (~zero_num) & (e_r < 0) & (drop >= 0) & (e_total <= 0) & (e_num <= minexp)
     scaled_dtw = power2(dtw, k_dtw)
+    k_n = jnp.where(k_num > 0, k_num - jnp.int32(1), k_num)
+    u_den = jnp.where(k_num > 0, u_sn * 0.5, u_sn)
     on_dtw = (jnp.where(div_on_dtw, scaled_dtw, 0.0) / u_sn) * jnp.where(div_on_dtw, numerator, 0.0)
     on_num = (jnp.where(div_on_dtw, 0.0, scaled_dtw)
-              * (power2(jnp.where(div_on_dtw, 0.0, numerator), k_num) / u_sn))
+              * (power2(jnp.where(div_on_dtw, 0.0, numerator), k_n) / u_den))
     return jnp.where(div_on_dtw, on_dtw, on_num)
 
 
-def _safe_tangent_quad(dtw: jax.Array, big_c: jax.Array, sml_c: jax.Array, sn: jax.Array) -> jax.Array:
-    """Linear-in-`dtw` evaluation of `dtw * big_c * sml_c / sn` via `power2` normalization of `big_c` into
-    `[0.5, 1)` when `e_sml > 0` (preventing `u_big * sml_c` overflow at `1.5*2^127`) and `[1, 2)` otherwise
-    (preventing underflow or subnormal flush of minimum-normal `sml_c`)."""
-    e_big = _primal_exponent(big_c)
-    e_sml = _primal_exponent(sml_c)
-    nonzero_big = jax.lax.stop_gradient(big_c) != 0
-    shift_big = jnp.where(nonzero_big & (e_sml > 0), e_big + 1, e_big)
-    u_big = power2(big_c, -shift_big)
-    return _shifted_tangent_div(dtw, u_big * sml_c, sn, extra_shift=shift_big)
+def _safe_tangent_quad(dtw: jax.Array, cx: jax.Array, cy: jax.Array, sn: jax.Array) -> jax.Array:
+    """Range-safe `dtw * cx * cy / sn` via singleton `ratios.ratio_p`, keeping primal and higher-order
+    mixed derivatives in one scaled-product operation without primal-only exponent scaling of `cx`."""
+    form = ratios.Ratio(
+        numerator=((1.0, (("v", 0), ("v", 1), ("v", 2))),),
+        denominator=((1.0, (("v", 3),)),),
+        axis=dtw.ndim,
+        reduced=True,
+        units=windows.Units(),
+    )
+    return ratios.ratio([dtw[..., None], cx[..., None], cy[..., None], sn[..., None]], form)
 
 
 def _cov_tangent_tile(
@@ -223,31 +225,30 @@ def _cov_tangent_tile(
     mu_y_pos = jnp.where(pos, mu_y[..., None], 0.0)
     cx = tx - mu_x[..., None]
     cy = ty - mu_y[..., None]
-    d_mx = jnp.sum(_weighted_term(tw, dtx, sn) + _shifted_tangent_div(dtw, tx - mu_x_pos, sn), axis=-1)
-    d_my = jnp.sum(_weighted_term(tw, dty, sn) + _shifted_tangent_div(dtw, ty - mu_y_pos, sn), axis=-1)
+    d_mx = jnp.sum(_weighted_term(tw, dtx, sn) + _safe_tangent_div(dtw, tx - mu_x_pos, sn), axis=-1)
+    d_my = jnp.sum(_weighted_term(tw, dty, sn) + _safe_tangent_div(dtw, ty - mu_y_pos, sn), axis=-1)
     pw_cy = _weighted_term(tw, jnp.where((tw > 0) | jnp.isfinite(cy), cy, 0.0), sn)
     pw_cx = _weighted_term(tw, jnp.where((tw > 0) | jnp.isfinite(cx), cx, 0.0), sn)
     cov_term = jnp.where(pos, cov[..., None], 0.0)
     limits = jnp.finfo(cx.dtype)
     half_max = jnp.asarray(0.5 * limits.max, cx.dtype)
     tiny = jnp.asarray(limits.tiny, cx.dtype)
-    x_ge_y = jnp.abs(cx) >= jnp.abs(cy)
-    big_c = jnp.where(x_ge_y, cx, cy)
-    sml_c = jnp.where(x_ge_y, cy, cx)
-    big_sg, sml_sg = jax.lax.stop_gradient(big_c), jax.lax.stop_gradient(sml_c)
-    prod_ovf = (jnp.abs(big_sg) > 1.0) & (jnp.abs(sml_sg) > half_max / jnp.maximum(jnp.abs(big_sg), 1.0))
-    prod_unf = (big_sg != 0) & (sml_sg != 0) & (jnp.abs(big_sg * sml_sg) < tiny)
+    cx_sg, cy_sg = jax.lax.stop_gradient(cx), jax.lax.stop_gradient(cy)
+    big_sg = jnp.maximum(jnp.abs(cx_sg), jnp.abs(cy_sg))
+    sml_sg = jnp.minimum(jnp.abs(cx_sg), jnp.abs(cy_sg))
+    prod_ovf = (big_sg > 1.0) & (sml_sg > half_max / jnp.maximum(big_sg, 1.0))
+    prod_unf = (big_sg != 0) & (sml_sg != 0) & (big_sg * sml_sg < tiny)
     prod_split = prod_ovf | prod_unf
     cx_safe = jnp.where(prod_split, 0.0, cx)
     cy_safe = jnp.where(prod_split, 0.0, cy)
-    d_cov_no = _shifted_tangent_div(jnp.where(prod_split, 0.0, dtw),
-                                    cx_safe * cy_safe - jnp.where(prod_split, 0.0, cov_term),
-                                    jnp.where(prod_split, 1.0, sn))
+    d_cov_no = _safe_tangent_div(jnp.where(prod_split, 0.0, dtw),
+                                 cx_safe * cy_safe - jnp.where(prod_split, 0.0, cov_term),
+                                 jnp.where(prod_split, 1.0, sn))
     dtw_sp = jnp.where(prod_split, dtw, 0.0)
     sn_sp = jnp.where(prod_split, sn, 1.0)
-    d_cov_sp = (_safe_tangent_quad(dtw_sp, jnp.where(prod_split, big_c, 0.0),
-                                   jnp.where(prod_split, sml_c, 0.0), sn_sp)
-                - _shifted_tangent_div(dtw_sp, jnp.where(prod_split, cov_term, 0.0), sn_sp))
+    d_cov_sp = (_safe_tangent_quad(dtw_sp, jnp.where(prod_split, cx, 0.0),
+                                   jnp.where(prod_split, cy, 0.0), sn_sp)
+                - _safe_tangent_div(dtw_sp, jnp.where(prod_split, cov_term, 0.0), sn_sp))
     d_cov_w = jnp.where(prod_split, d_cov_sp, d_cov_no)
     d_cov_raw = jnp.sum(pw_cy * dtx + pw_cx * dty + d_cov_w, axis=-1)
     return d_mx, d_my, d_cov_raw, jnp.sum(pw_cy, axis=-1), jnp.sum(pw_cx, axis=-1), jnp.sum(dtw, axis=-1)

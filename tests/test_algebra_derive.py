@@ -1272,6 +1272,24 @@ def test_chunked_moments_balanced_quotient_direction_jvp_and_vjp():
                     (x_tiny,), (dx_ov,))
                 np.testing.assert_array_equal(
                     np.asarray(d_gw), np.asarray([[np.float32(expected), 0.0]], np.float32))
+            x_qu = jnp.asarray([[np.float32(2.0 ** -70), 0.0]], jnp.float32)
+            y_qu = jnp.asarray([[np.float32(2.0 ** -71), 0.0]], jnp.float32)
+            w_qu = jnp.asarray([[0.0, 1.0]], jnp.float32)
+            dx_qu = jnp.asarray([[np.float32(2.0 ** 70), 0.0]], jnp.float32)
+            _, d_gcov = jax.jvp(
+                lambda x_, t=tile, m=mode: jax.grad(
+                    lambda w__: moments.chunked_covariance(x_, y_qu, w__, tile=t, mode=m)[2].sum())(w_qu),
+                (x_qu,), (dx_qu,))
+            np.testing.assert_array_equal(
+                np.asarray(d_gcov), np.asarray([[np.float32(0.5), 0.0]], np.float32))
+            w_up = jnp.asarray([[0.0, np.float32(1.5 * 2.0 ** -70)]], jnp.float32)
+            dx_up = jnp.asarray([[np.float32(2.25 * 2.0 ** 57), 0.0]], jnp.float32)
+            _, d_gup = jax.jvp(
+                lambda x_, t=tile, m=mode: jax.grad(
+                    lambda w__: moments.chunked_moments(x_, w__, tile=t, mode=m)[0].sum())(w_up),
+                (x_qu,), (dx_up,))
+            np.testing.assert_array_equal(
+                np.asarray(d_gup), np.asarray([[np.float32(1.5 * 2.0 ** 127), 0.0]], np.float32))
 
 
 def test_chunked_moments_directed_overflow_mixed_zero_weight_and_direct_jvp():
