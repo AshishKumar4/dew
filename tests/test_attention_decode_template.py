@@ -925,15 +925,17 @@ def test_a_walk_its_compile_refused_plans_a_config_its_launch_pins(dtype):
     assert chosen != refused
 
 
-def test_a_split_walk_its_compile_refused_plans_and_traces_another_config():
+@pytest.mark.parametrize("lengths", [False, True], ids=["full", "lengths"])
+def test_a_split_walk_its_compile_refused_plans_and_traces_another_config(lengths):
     """A split decode step whose priced walk a compile refused (its kernel spilled, `report.refuse_launch`)
-    plans another config of its slices and its step traces: the priced tile is certified alone, a refused
-    one falling to its streaming walk's own config at those slices, never pinned as refused (the review of
-    b11a701f4f0: a refused priced tile returned as its own decided terminal and raised `Unpinnable`)."""
+    plans another config of its slices and its step traces, a cache's lengths or none: the priced tile is
+    completed and legal at the call's own spans before it is certified, a refused one falling to its
+    streaming walk's own config at those slices, never pinned as refused (the reviews of b11a701f4f0 and
+    97072e2e343: a refused priced tile, priced over a cache's whole extent, raised `Unpinnable`)."""
     keys = 4096
     query = jnp.zeros((1, 1, 32, 64), jnp.bfloat16)
     key = value = jnp.zeros((1, keys, 8, 64), jnp.bfloat16)
-    spans = template.spans(1, keys, 1)
+    spans = template.spans(1, keys, 1, lengths=jnp.full((1,), keys, jnp.int32) if lengths else None)
     with generation.assumed("sm90"):
         work, rows, row_spans, _ = attention_decode.planned(query, key, value, spans, template.Hooks())
         plan = work["plain"]

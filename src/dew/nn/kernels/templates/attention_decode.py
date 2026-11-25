@@ -249,9 +249,14 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
         proposed = _proposed(query, key, value, spans, walked, scale=scale, target=target, table=table,
                              sources=sources, scales=scales, splits=slices, chosen=chosen, in_key=in_key)
         if proposed is not None:
+            # Completed and legal at the call's own bound arguments (`_launchable`: its rules, a recorded
+            # refusal among them) before it is certified, and the certified config taken there too.
             _, sliced_op, sliced_ba = proposed
-            certified = sliced_op._certified(sliced_ba, tile)
-            if isinstance(certified, attention_mosaic.Tiles):
+            launched = sliced_op._launchable(sliced_ba, tile, target)
+            certified = None if launched is None else sliced_op._certified(sliced_ba, launched)
+            if (isinstance(certified, attention_mosaic.Tiles)
+                    and sliced_op.takes(sliced_ba, certified, target)
+                    and sliced_op.pinnable(sliced_ba, certified)):
                 return planned(certified, sliced_op, sliced_ba, slices)
     else:
         # The most slices whose programs keep the device's stream in flight at once (`MosaicForward.streamed`,
@@ -278,19 +283,20 @@ def _priced_slices(query, key, value, spans: KeySpans, hooks: Hooks | None, sing
     346.0 us on 2 slices of K128 and 309.3 on 4 of K64 at two programs a multiprocessor (M-NA-21-gh200),
     which a walk priced at its device bytes alone ranked level and its programs' issue intervals rank right
     (FS-5274-LAT1)."""
-    proposals = {count: _proposed(query, key, value, spans, hooks, scale=scale, target=target, table=table,
-                                  sources=sources, scales=scales, splits=count, chosen=chosen, in_key=in_key)
-                 for count in (1, *counts)}
-    first = proposals[1]
+    proposed = functools.partial(_proposed, query, key, value, spans, hooks, scale=scale, target=target,
+                                 table=table, sources=sources, scales=scales, chosen=chosen, in_key=in_key)
+    first = proposed(splits=1)
     if first is None:
         return None
+    # The certified single tile priced only where it launches at these spans too.
     _, op, ba = first
-    alone = op.price_config(ba, single, target, issued=True)
+    alone = None if op._launchable(ba, single, target) is None else op.price_config(ba, single, target,
+                                                                                     issued=True)
     if alone is None:
         return None
     prices = {(1, single): alone}
     for count in counts:
-        proposal = proposals[count]
+        proposal = proposed(splits=count)
         if proposal is None:
             continue
         tiles, sliced_op, sliced_ba = proposal
