@@ -357,3 +357,79 @@ def test_a_kept_closure_holds_the_lookups_of_its_own_walk_alone(tmp_path):
     after = fresh(FOOTPRINT, "whole", platforms="cpu", cache_dir=tmp_path / "after")
     assert alone == after
 
+
+def test_a_callable_instance_of_a_class_of_dews_is_its_class_code_and_any_other_callable_is_all_of_it():
+    """A value's provenance (`dew._code.provenance`) holds a callable instance of a class of Dew's at its
+    module's top level by that class's module, as any other instance (a Flax module, a template's
+    `Capped` hook); a function, a `functools.partial` over one of Dew's, an instance of a class made in a
+    function, and a class of Dew's holding a function, are code no class states: all of Dew's (None)."""
+    import functools
+
+    from dew._code import provenance
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.kernels.templates import attention as template
+
+    def local():
+        class Made:
+            def __call__(self):
+                return None
+
+        return Made()
+
+    model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=1, mlp_features=8,
+                              max_seq_len=8)
+    assert provenance([template.Capped(30.0)]) == {"dew.nn.kernels.templates.attention"}
+    assert "dew.nn.backbones.causal_transformer" in (provenance([model]) or ())
+    assert [provenance([held]) for held in (
+        local(), provenance, functools.partial(provenance, ()),
+        template.Biased(lambda logits, q, k: logits))] == [None] * 4
+
+
+RUNG_CODE = """
+import json
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.objectives.lm import LMObjective
+from dew.objectives.residuals import Residuals
+from dew.training.rungs import _code
+
+
+class Fitted(Residuals):
+    def fresh_variables(self, key, held):
+        return {"params": {"p": 0.0}}
+
+    def residuals(self, variables, batch, step):
+        return batch["x"] - variables["params"]["p"]
+
+
+lm = LMObjective(CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=1, mlp_features=8,
+                                   max_seq_len=8), 4)
+print(json.dumps({"lm": _code(lm, lm.program_key(), None),
+                  "fitted": _code(Fitted(), Fitted().program_key(), None)}))
+"""
+
+
+def test_a_rung_records_code_is_its_step_its_objective_and_its_models_and_none_else(tmp_path):
+    """A rung record keys on the code that builds its step (`dew.training.rungs._code`), not every file of
+    Dew's: a file no step's code imports leaves an LM's and a model-free objective's alike, the LM's model's
+    module moves the LM's, and a model-free objective's base (`Residuals`, which nothing of Dew's imports,
+    its loss its own) moves that objective's and leaves the LM's. Every file's digest made each rung test's
+    CI key every file of Dew's (22% of the suite's rows)."""
+    tree = tmp_path / "src"
+    for name in ("dew", "_dew_torch"):
+        shutil.copytree(REPO_ROOT / "src" / name, tree / name, ignore=shutil.ignore_patterns("__pycache__"))
+    package = tree / "dew"
+
+    def codes(*edits: Path) -> dict:
+        for path in edits:
+            path.write_text(path.read_text() + "\n# edited\n")
+        return fresh(RUNG_CODE, source=tree, platforms="cpu", cache_dir=tmp_path / "xla",
+                     variables={"XDG_CACHE_HOME": str(tmp_path)})
+
+    (package / "_spare_rung.py").write_text("")
+    before = codes()
+    assert codes(package / "_spare_rung.py") == before
+    model = codes(package / "nn" / "backbones" / "causal_transformer.py")
+    assert model["lm"] != before["lm"]
+    base = codes(package / "objectives" / "residuals.py")
+    assert base["fitted"] != model["fitted"] and base["lm"] == model["lm"]
+

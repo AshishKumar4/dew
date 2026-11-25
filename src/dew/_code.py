@@ -188,14 +188,23 @@ def _contents_at(relative: str) -> str:
 def provenance(values: Sequence[object]) -> frozenset[str] | None:
     """The modules of Dew's defining `values` and every value they hold (a dataclass's fields', a
     collection's members): a class's own module, any other value's class's, none for a library's or the
-    user's own, whose release or source states it. None, the whole package, where any is a function (a
-    hook, a prepared one): a kernel's identity traces a hook at one tile alone
-    (`attention.hook_program`), and no value names the code a wrapper calls (row 10743)."""
+    user's own, whose release or source states it. None, the whole package, where any is a callable no class
+    of Dew's states (`_stated`): a function (a hook, a prepared one), a bound method, a library's wrapper (a
+    `functools.partial`) or an instance of a class made in a function. A kernel's identity traces a hook at
+    one tile alone (`attention.hook_program`), and no value names the code a wrapper calls (row 10743). A
+    callable instance of a class of Dew's at its module's top level (a Flax module, a template's hook such as
+    `Capped`) is its class's code, as any other instance is, its fields walked as theirs are."""
     held = [part for value in values for part in _held(value)]
-    if any(callable(part) and not isinstance(part, type) for part in held):
+    if any(callable(part) and not isinstance(part, type) and not _stated(type(part)) for part in held):
         return None
     modules = {(part if isinstance(part, type) else type(part)).__module__ for part in held}
     return frozenset(module for module in modules if _path(module) is not None)
+
+
+def _stated(kind: type) -> bool:
+    """Whether `kind`'s code is a module of Dew's, which defines it at its top level, so an instance's code is
+    that module's and what it imports (`code_digest`)."""
+    return _path(kind.__module__) is not None and "<locals>" not in kind.__qualname__
 
 
 def op_provenance(op, arguments: Mapping[str, object]) -> frozenset[str] | None:

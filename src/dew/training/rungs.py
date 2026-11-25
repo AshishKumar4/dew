@@ -26,7 +26,7 @@ import jax
 from jax.sharding import Mesh
 
 from dew import _cache
-from dew._code import whole_digest
+from dew._code import provenance, provenance_code
 from dew._devices import device_memory
 from dew._records import JSON, json_value, record
 from dew._stated import Unestablished, stated
@@ -56,15 +56,16 @@ RECORD_VERSION = 3
 
 
 def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], splits: Sequence[int],
-             mesh: Mesh, step: Callable[..., StepFn] | None = None, remat: str = "auto"
-             ) -> dict[str, JSON] | None:
+             mesh: Mesh, step: Callable[..., StepFn] | None = None, remat: str = "auto", *,
+             objective: object = None) -> dict[str, JSON] | None:
     """What a recorded rung was decided for, read before the step traces: the
     configuration of the `modules` its programs run at the rung it starts from
     (`Objective.program_key`) and a custom `step`, as an identity states them
-    (`dew._stated.stated`), the code that builds them
-    (`dew._code.whole_digest`), the step's `arguments` (their tree's structure and each leaf's
-    abstract value and placement, stated alike), the `splits` its plan chooses among (one where the run
-    pins it), the mesh and its devices' kind and allocator limit, the kernels their
+    (`dew._stated.stated`), the code that builds them (`_code`): the step's compiler, the `objective` whose
+    loss it traces, its classes' and what it holds, and those modules, each with every module of Dew's it
+    can import, all of Dew's where any is a function, the step's `arguments` (their tree's structure and
+    each leaf's abstract value and placement, stated alike), the `splits` its plan chooses among (one where
+    the run pins it), the mesh and its devices' kind and allocator limit, the kernels their
     generation runs (`gpu_target`), what a model reads from context as it traces
     (`trace_context`), the libraries that compile it and the allocator and
     XLA_FLAGS settings it compiles under, and the recomputation the run's fit policy asks (`remat`,
@@ -92,15 +93,26 @@ def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], spl
     # builds for two GPUs of a generation (their multiprocessors) never share a record.
     target = (repr(gpu_target()) if jax.default_backend() == 'gpu' or assumption() is not None
               else jax.default_backend())
-    program = json.dumps([RECORD_VERSION, traced, whole_digest(), list(splits), dict(mesh.shape),
-                          target, jax.__version__, importlib.metadata.version('jaxlib'), allocator, remat])
+    code = _code(objective, modules, step)
+    program = json.dumps([RECORD_VERSION, traced, code, list(splits), dict(mesh.shape), target,
+                          jax.__version__, importlib.metadata.version('jaxlib'), allocator, remat])
     return {'program': hashlib.sha256(program.encode()).hexdigest(), 'devices': devices_seen,
             'xla_flags': ' '.join(settings)}
 
 
+def _code(objective: object, modules: Sequence[object], step: object) -> list[str]:
+    """The digests of the code that builds a step (`provenance_code`): the step's compiler and the modules of
+    Dew's defining the `objective` (its class and every base, a model-free objective's loss its base's), the
+    values it holds, its program's `modules` and a custom `step`, each with every module of Dew's it can
+    import; the whole package's where any is a function no class states. Not every file of Dew's: a run
+    keying a rung on them all read all 794, so its tests' CI key was every file (22% of the suite's rows)."""
+    built = [] if objective is None else [objective, *type(objective).__mro__]
+    return provenance_code("dew.training.compiler", provenance([*built, *modules, step]))
+
+
 def recorded_rung(modules: Sequence[object], arguments: tuple[TrainState, Batch], splits: Sequence[int],
-                  mesh: Mesh, step: Callable[..., StepFn] | None = None, remat: str = "auto"
-                  ) -> tuple[Path | None, dict[str, JSON], JSON]:
+                  mesh: Mesh, step: Callable[..., StepFn] | None = None, remat: str = "auto", *,
+                  objective: object = None) -> tuple[Path | None, dict[str, JSON], JSON]:
     """Where the rung of the step over `arguments` on `mesh` is recorded, its key
     (`rung_key`), and the rung the record holds (None if there is none). A
     process of a pool keeps no record: its processes agree on the rung; nor does a step its key states
@@ -111,7 +123,7 @@ def recorded_rung(modules: Sequence[object], arguments: tuple[TrainState, Batch]
     directory = rung_records()
     if directory is None or jax.process_count() > 1:
         return None, {}, None
-    key = rung_key(modules, arguments, splits, mesh, step, remat)
+    key = rung_key(modules, arguments, splits, mesh, step, remat, objective=objective)
     if key is None:
         return None, {}, None
     path = directory / f"{hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()}.json"
