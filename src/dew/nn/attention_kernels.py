@@ -736,15 +736,13 @@ the template's forward and training step (`DECLARED`); a full or windowed call n
 for the grid's other rounds, its margins 1.09 to 1.60 against five-round receipts' spread of up to 1.33. Its
 calls of packed documents those of 12288 tokens, 16/4 at width 256, causal (Qwen3.5-4B's decision row), the
 one shape their receipt timed.
-Elsewhere a 16-bit call's: up to 32768 tokens, from FlashAttention against the template from
-1024 to 32768 tokens at widths 64 and 128, causal and full, its forward and training step, FlashAttention
-faster at every one on an A100 and a GH200 (M-ET-51: W126-a100, W126-sm90), and at width 256 on an RTX PRO
-6000 (a gated Qwen3.5 step's attention, 2.72 against 4.55 ms, G4-ET-ATT-SCOREBOARD). A shorter call is
-FlashAttention's too: on the A100 its forward's lead grows as the calls shorten (at width 128, causal, 1.44
-times at 32768 tokens to 1.75 at 1024; at width 64 full 1.02 to 1.17), its training step's stays near two to
-three times (1.87 to 2.82 at 1024), far from a crossover; a longer one is not, where the forward's lead
-falls toward 1.02. An fp32 call's: a training step's attention at Qwen3-8B's widths, 1 x 1024 (CELLS-h100,
-CELLS-a100)."""
+Elsewhere a 16-bit call's: up to 32768 tokens at widths 64 and 128, causal and full, its forward and
+training step, an interim placeholder no receipt holds (M-ET-51 meant to time FlashAttention against the
+template from 1024 to 32768 tokens on an A100 and a GH200; its GH200 half timed out unmeasured and neither
+half's sums survive, its record's provenance correction of 2026-11-20), until the cost model prices the
+case (row 4123) or Attention measures it again; and at width 256 on an RTX PRO 6000 (a gated Qwen3.5
+step's attention, 2.72 against 4.55 ms, G4-ET-ATT-SCOREBOARD). An fp32 call's: a training step's attention
+at Qwen3-8B's widths, 1 x 1024 (CELLS-h100, CELLS-a100)."""
 
 
 FLASH = Kernel[AttentionCase]('flash', FLASH_SUPPORTS, reverse_only=True)

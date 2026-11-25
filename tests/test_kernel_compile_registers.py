@@ -258,29 +258,42 @@ def test_compile_mosaic_kernels_reports_both_xla_uniquified_triton_cubins():
 @lowers("sm100")
 def test_report_binaries_distinguishes_sm100_tmem_mosaic_cubins_from_non_tmem_triton_cubins():
     """Row 7263: `assembled.binaries(..., decoded=True)` sets `uses_tmem=True` on an sm100 Mosaic GPU TMEM
-    cubin, `uses_tmem=False` on an sm100 fp32 Triton cubin that allocates no TMEM, and `uses_tmem=None` when
-    `decoded=False`."""
-    import jax.numpy as jnp
+    cubin (tcgen05's persistent walk, its accumulators in tensor memory), `uses_tmem=False` on an sm100
+    Triton cubin that allocates no TMEM (an fp32 row doubled, named as a template launch), and
+    `uses_tmem=None` when `decoded=False`; each the least kernel of its kind, where an attention forward
+    and an fp32 decode's four Triton kernels took 122 s (row 12717; the decode alone 66 s, FS-12717-TRITON1;
+    these two 21 s, FS-12717-TMEM3)."""
+    import functools
+
+    import numpy as np
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import triton as pltriton
+    from test_mosaic_toolkit import _persisted_operands, _persisted_products
 
     from dew.nn.kernels import generation
-    from dew.nn.kernels.templates import attention as template, attention_mosaic, attention_route
+    from dew.nn.kernels.templates import mosaic_sm100
 
-    q_m = jax.ShapeDtypeStruct((1, 256, 2, 64), jnp.bfloat16)
-    spans_m = template.spans(256, 256, 1, causal=True)
+    family = mosaic_sm100.RINGS
+    operands = tuple(jax.ShapeDtypeStruct(np.shape(each), each.dtype)
+                     for each in _persisted_operands(family.rows))
     with generation.assumed("sm100"):
-        exe_m = kc.lowered_for(lambda q, k, v: attention_mosaic.forward(q, k, v, spans_m),
-                               (q_m, q_m, q_m), "sm100").compile()
+        exe_m = kc.lowered_for(functools.partial(_persisted_products, family=family, interpret=False),
+                               operands, "sm100").compile()
     mosaic_decoded = [b for b in assembled.binaries(exe_m, decoded=True) if b.kind == "mosaic_gpu"]
     mosaic_raw = [b for b in assembled.binaries(exe_m, decoded=False) if b.kind == "mosaic_gpu"]
     assert mosaic_decoded and any(b.uses_tmem is True for b in mosaic_decoded), mosaic_decoded
     assert mosaic_raw and all(b.uses_tmem is None for b in mosaic_raw), mosaic_raw
 
-    q_t = jax.ShapeDtypeStruct((2, 1, 32, 256), jnp.float32)
-    k_t = jax.ShapeDtypeStruct((2, 4096, 8, 256), jnp.float32)
-    spans_t = template.spans(1, 4096, 2, causal=False)
+    def doubled(x_ref, o_ref):
+        o_ref[...] = x_ref[...] * 2
+
+    row = jax.ShapeDtypeStruct((1024,), jnp.float32)
     with generation.assumed("sm100"):
-        exe_t = kc.lowered_for(lambda q, k, v: attention_route.attend(q, k, v, spans_t, natural=False),
-                               (q_t, k_t, k_t), "sm100").compile()
+        # Named as a template launch is (`assembled.LAUNCH_SUFFIX`): `binaries` reads a Triton launch's
+        # cubin by its name.
+        doubling = pl.pallas_call(doubled, out_shape=row, compiler_params=pltriton.CompilerParams(),
+                                  name="doubled__l0123456789")
+        exe_t = kc.lowered_for(doubling, (row,), "sm100").compile()
     triton_decoded = [b for b in assembled.binaries(exe_t, decoded=True) if b.kind == "triton"]
     triton_raw = [b for b in assembled.binaries(exe_t, decoded=False) if b.kind == "triton"]
     assert triton_decoded and all(b.uses_tmem is False for b in triton_decoded), triton_decoded

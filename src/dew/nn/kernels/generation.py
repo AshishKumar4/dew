@@ -260,7 +260,12 @@ class Multiprocessor:
     `block_shared`, the static shared memory a block declares without opting in), the threads of a warp
     (`warp_threads`), the allocator's `register_step` a thread (256 a warp), the shared memory the driver
     reserves for each resident block (`reserved_shared`), the bytes its shared memory serves a clock
-    (`shared_bytes_per_clock`), and the range its warpgroups' `setmaxnreg` moves a thread's registers in
+    (`shared_bytes_per_clock`), the threads' instructions its warp schedulers issue a clock
+    (`issue_per_clock`: four schedulers, each one warp's instruction a clock, CUDA C++ Programming Guide 12.6
+    §16.6.1 to §16.8.1 for compute capabilities 7.x to 9.0; 10.x and 12.x, which no edition of it describes,
+    taken alike), the clocks between one warp's issues in a walk (`issue_interval`: its instructions'
+    dependent latency over a walk's mix, so `issue_interval` warps a scheduler keep it issuing; measured, None
+    where not), and the range its warpgroups' `setmaxnreg` moves a thread's registers in
     (`register_raises`, None before Hopper). The defaults are the facts every CUDA compute capability from 7.5
     to 12.x shares (CUDA C++ Programming Guide §5.1, Tables 33 and 34; 128 bytes a clock measured 126 to 128
     on an A100 and an H800, Luo et al. 2025, "Dissecting the NVIDIA Hopper Architecture through
@@ -278,6 +283,8 @@ class Multiprocessor:
     register_step: int = 8
     reserved_shared: int = 1024
     shared_bytes_per_clock: int = 128
+    issue_per_clock: int = 4 * 32
+    issue_interval: float | None = None
     register_raises: RegisterRaises | None = SETMAXNREG
 
     def raises(self) -> RegisterRaises:
@@ -400,7 +407,13 @@ slowest of add, shift, logic and comparison) and the integer multiply-adds its F
 every compute capability from 7.5 to 12.1 alike (the CUDA C++ Best Practices Guide 13.5's §12.1.1 Table 5:
 shl.b32, xor.b32 and mad.lo.s32 at 64; add.s32 at 128, min.s32 at 64 to 128)."""
 _AMPERE = Architecture(('mma.sync',), {'16bit': 2048, 'tf32': 1024},
-                       Multiprocessor(resident_threads=2048, resident_blocks=32, register_raises=None),
+                       # A warp's issue interval in a walk, 8.7 clocks on an A100: M-NA-9's attention
+                       # backwards under ncu (sm__inst_executed a multiprocessor a clock over the warps each
+                       # scheduler held), the template's at one warp a scheduler and FA2's at two alike, d64
+                       # 6.9 and 6.6, d128 9.1 and 8.0, d256 12.0 and 11.0: their geometric mean, the
+                       # interval growing with the head width's mix.
+                       Multiprocessor(resident_threads=2048, resident_blocks=32, register_raises=None,
+                                      issue_interval=8.7),
                        vector_per_clock=128, exponentials_per_clock=CUDA_EXPONENTIALS,
                        integer_per_clock=INTEGER_PER_CLOCK, integer_multiply_adds_per_clock=INTEGER_PER_CLOCK,
                        global_reduction_bytes_per_clock=3.0)
@@ -420,7 +433,11 @@ _TURING = Architecture((), {'16bit': 1024}, Multiprocessor(resident_threads=1024
 # Hopper issues wgmma (sm_90a) and mma.sync, its TMA multicast to a pair of multiprocessors a cluster (the
 # pair CUTLASS's grouped GEMM and cuBLASLt take on an H100).
 _HOPPER = Architecture(('wgmma', 'mma.sync'), {'16bit': 4096, 'tf32': 2048, '8bit': 8192},
-                       Multiprocessor(resident_threads=2048, resident_blocks=32),
+                       # A warp's issue interval in a walk, 4.6 clocks on a GH200: M-NA-21's decode walk
+                       # (Q16/K128, three stages, one warpgroup a program and one resident, one warp a
+                       # scheduler) 345.1 us over its 75.66 us of issue slots, 4.56; M-FS-70's KDA intra
+                       # launch at two warps a scheduler 57% not issued, 2 / 0.43 = 4.65.
+                       Multiprocessor(resident_threads=2048, resident_blocks=32, issue_interval=4.6),
                        vector_per_clock=256, exponentials_per_clock=CUDA_EXPONENTIALS,
                        integer_per_clock=INTEGER_PER_CLOCK, integer_multiply_adds_per_clock=INTEGER_PER_CLOCK,
                        tma=True, dependent_launch=True, cluster=2)

@@ -601,12 +601,13 @@ def _split(ba: tokamax.BoundArguments) -> bool:
 def _derived[T: (Tiles, BackwardTiles)](launch: Template[T], ba: tokamax.BoundArguments,
                                        target: generation.GpuTarget, tiles: Callable[[int, int, int], T], *,
                                        held: int, walked: int) -> T | None:
-    """A launch's tile from the facts (design §7, as the Mosaic mainloop's `attention_mosaic._derived`), no
-    space ranked: the tile a program holds whole (a forward's queries, a backward's keys, the dK/dV launch's
-    accumulated rows) `BLOCK`, four warps of `ROWS` each, FlashAttention 2's 128 a program, and
-    the tile it walks the largest of `EXTENTS` whose program holds (`legal`: the block's shared memory
-    and a thread's registers), stepping down the held tile only where no walked one does; each dividing the
-    call's padded extent it lies along (`held`, `walked`; a longer tile holds padding alone).
+    """A launch's tile from the facts (design §7, as the Mosaic mainloop's
+    `attention_mosaic_derivation._derived`), no space ranked: the tile a program holds whole (a forward's
+    queries, a backward's keys, the dK/dV launch's accumulated rows) `BLOCK`, four warps of `ROWS` each,
+    FlashAttention 2's 128 a program, and the tile it walks the largest of `EXTENTS` whose program holds
+    (`legal`: the block's shared memory and a thread's registers), stepping down the held tile only where no
+    walked one does; each dividing the call's padded extent it lies along (`held`, `walked`; a longer tile
+    holds padding alone).
     `tiles(held, walked, warps)` builds the config. At width 128, bf16: a forward takes 128 by 64, the order
     measured within 6% of the fastest on an A100 and an H100 (ATT-ZERO3-a100, ATT-ZERO4-h100), a training walk
     64 by 64, the tile measured fastest of it where its anchor row puts 128 rows past a thread's registers

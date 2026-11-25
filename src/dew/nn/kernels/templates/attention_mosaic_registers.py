@@ -113,6 +113,17 @@ def _mask_places(family: mosaic.Family, block_q: int, block_k: int) -> list:
     return [] if family.folds_indices(block_k) else [(block_q, block_k, jnp.int32)] * 3
 
 
+def _runs_bounds(family: mosaic.Family, block_q: int, runs: int) -> int:
+    """The registers a walk of a call of `runs` key runs a query (`ForwardRegisters.runs`) holds across its
+    key loop past one run's: each further run's start and end rows (`Family.row_registers`), loaded once and
+    kept, its compares formed and counted per tile (`attention_algebra.seen`: one select an entry, no
+    logits tile more a run, FS-6766-MAIN2). An H100's rewalk at 64 x 64, three consumers (FS-6766-REWALK2,
+    main 36cfd3203): 24 loads at six runs, two rows a thread by start and end, 18 of them spilled at its 128
+    registers with the float state they displaced, 8 bytes at three runs; MoBA's three runs certified its
+    forward four times (row 6766)."""
+    return 2 * max(runs - 1, 0) * family.row_registers(block_q, jnp.int32)
+
+
 def _converted(block_k: int, *widths: int) -> list[list[tuple]]:
     """A quantized call's phases converting a slot of codes beside its sums (`Family.converted`, chunked to
     an 8-bit swizzle width `swizzling.swizzle_columns(jnp.int8, swizzling.SWIZZLE_BYTES)`, rows 5449,
@@ -154,6 +165,7 @@ def _role_forward_registers(family: mosaic.Family, block_q: int, block_k: int, d
 def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, residuals: bool, *,
                       natural: bool = False, params: tuple = (), width: int | None = None, parts: int = 1,
                       scaled: bool = False, codes: bool = False, positions: int = 0, per_span: int = 1,
+                      runs: int = 1,
                       merged: bool = False, started: bool = False, dropped: bool = False,
                       weight_parts: int = 1, scaled_products: bool = False,
                       block_plan: BlockPlan | None = None, masked: bool = False) -> int:
@@ -217,6 +229,13 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
             step.append((block_k, value_width * family.rhs_copies, dtype))
     masks = _mask_places(family, block_q, block_k)
     step += masks
+    if runs == 2:
+        # A conservative charge of a logits tile more for two runs' walk, sized to a measured spill: an H100's
+        # walk at 64 x 128, three consumers, spilled 220 bytes at two traced runs where three and four spilled
+        # none (MoBA's top_k 2, its own chunk and one selected; FS-6766-ATT1, probe dynruns4 at 0461980dd).
+        # The cause is inferred, not read in its SASS: LLVM taking two runs' count back to their or
+        # (`zext a + zext b != 0`), whose select becomes a select a run, each reading the unmasked logits.
+        step.append(logits)
     # The step's tiles the exponential's raised small weights are formed beside: a 16-bit call's step (an
     # inference walk's logits and weights and its masks' places; a training walk's spilled 224 to 248 bytes
     # at 238 of 240 priced so, et-scaledneed5); an fp32 call's parts walk its logits alone, its weights'
@@ -258,7 +277,7 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
     epilogue = _epilogue_registers(family, carried, block_q, value_width, dtype, residuals=residuals,
                                    plan=block_plan, masked=masked)
     held = _held_registers(family, block_q, params, residuals=residuals, natural=natural) + (
-        _started_rows(family, block_q) if started else 0)
+        _started_rows(family, block_q) if started else 0) + _runs_bounds(family, block_q, runs)
     walked = max(max(resources.live_registers(family, carried, *phases, *products), scored) + held, epilogue)
     return max(walked, _reach_registers(family, block_q, positions, per_span)) if positions else walked
 
@@ -387,6 +406,9 @@ class ForwardRegisters:
     codes: bool = False
     positions: int = 0
     per_span: int = 1
+    runs: int = 1
+    """The key runs a query's visible keys are the union of (`MosaicForward.registered`'s `start`): a walk
+    of more than one holds each further run's bounds across its key loop (`_runs_bounds`)."""
     merged: bool = False
     started: bool = False
     dropped: bool = False
@@ -427,7 +449,8 @@ class ForwardRegisters:
             family, tiles, value_width, self.dtype, self.residuals,
             natural=tiles.natural_form or self.natural, params=self.params, width=width, parts=self.parts,
             scaled=self.scaled, codes=self.codes,
-            positions=self.positions, per_span=self.per_span, merged=self.merged, started=self.started,
+            positions=self.positions, per_span=self.per_span, runs=self.runs, merged=self.merged,
+            started=self.started,
             dropped=self.dropped, weight_parts=self.weight_parts,
             scaled_products=self.scaled_products, block_plan=plan, masked=masked))
 
