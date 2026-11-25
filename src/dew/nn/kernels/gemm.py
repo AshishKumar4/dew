@@ -44,7 +44,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax.typing import PrecisionLike
-from jax.ad_checkpoint import checkpoint_name
 from jax.custom_derivatives import zero_from_primal
 
 from dew.algebra import bits
@@ -61,7 +60,8 @@ from dew.nn.kernels.templates import axes as side_axes_of, product as product_of
 from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import epilogue_vjp, rows_permuted, scattered, tiling
 from dew.nn.kernels.templates.gemm.factored import factored
-from dew.nn.kernels.templates.gemm.hooks import NO_HOOKS, ColumnLocal, Formed, Hooks, column_local
+from dew.nn.kernels.templates.gemm.hooks import (NO_HOOKS, ColumnLocal, Formed, Hooks, Residualized,
+                                                  column_local, held_outputs)
 from dew.nn.kernels.templates.product import SCALE_DEPTH, bf16_part_count, declared, formed, terms
 from dew.nn.precision import accumulated, asks_default_precision, at_least_fp32, exact_products, twice_scaled
 from dew.nn.programs import read_by
@@ -167,8 +167,11 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights,
     plain = {'transpose_rhs': transpose_rhs, 'interpret_on_cpu': interpret_on_cpu, 'precision': precision,
              'dense': dense}
 
+    # An epilogue's residual outputs (`Residualized`) written where a derivative is taken alone.
+    residuals = epilogue.residuals if isinstance(epilogue, Residualized) else 0
+
     def value(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather, scatter,
-              applied, beside):
+              applied, beside, epilogue=epilogue, dtypes=dtypes):
         if applied is not None:
             return _gemm(applied, rhs, group_sizes, None, (), (), epilogue, epilogue_arrays, epilogue_axes,
                          dtypes, several=several, paired=paired, first=first, scatter=scatter, **plain)
@@ -182,37 +185,32 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights,
         del applied
         config = XlaConfig(transpose_rhs, precision, compute if straight else None, dense)
         lhs = lhs if gather is None else lhs[gather]
-        return scattered(xla_mainloop(config, lhs if straight else lhs.astype(compute), rhs, group_sizes,
-                                       prologue, prologue_arrays, prologue_axes, epilogue, epilogue_arrays,
-                                       epilogue_axes, dtypes, several, paired=paired, first=first,
-                                       beside=beside), scatter)
+        out = scattered(xla_mainloop(config, lhs if straight else lhs.astype(compute), rhs, group_sizes,
+                                      prologue, prologue_arrays, prologue_axes, epilogue, epilogue_arrays,
+                                      epilogue_axes, dtypes, several, paired=paired, first=first,
+                                      beside=beside), scatter)
+        return tuple(out[residuals:]) if residuals else out
 
     def forward(*operands):
-        out = value(*operands)
-        return _named_residuals(out, named, several) if any(named) else (out, ())
+        return held_outputs(value(*operands), named, several, residuals)
 
     call = _Call(prologue, prologue_axes, epilogue, epilogue_axes, dtypes, several, compute, plain,
                  tuple(at for at, name in enumerate(named) if name is not None))
 
     def backward(saved, operands, cotangent, live):
+        # A residual output takes no cotangent: no caller reads it.
+        cotangent = (None,) * residuals + tuple(cotangent) if residuals else cotangent
         return _pulled(call, operands, cotangent, live, saved)
 
+    primal = (functools.partial(value, epilogue=epilogue.unsaved(), dtypes=dtypes[residuals:])
+              if residuals else None)
     # A named residual is the forward's as it ran, a remat policy's to keep (`linear_tangent`'s `nested`).
     differentiable = contracted("test_a_grouped_gemm_holds_every_order")(
         generation.linear_tangent(forward, grouped_matmul.GROUPED.bound(backward), portable,
                                    live_cotangents=True, zero_cotangents=True, unread=(9,),
-                                   kind=KernelGlue(), nested=not any(named)))
+                                   kind=KernelGlue(), nested=not any(named), primal=primal))
     return differentiable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather,
                           scatter, None if applied is None else jax.lax.stop_gradient(applied), beside)
-
-
-def _named_residuals(out, named: tuple, several: bool) -> tuple:
-    """`gemm`'s forward's outputs `out` (several, or one) and what it saves: each output `named` names a
-    residual under its name (`checkpoint_name`), the one array the output and the residual are."""
-    outs = [checkpoint_name(each, name) if name is not None else each
-            for each, name in zip(out if several else (out,), named, strict=True)]
-    kept = tuple(each for each, name in zip(outs, named, strict=True) if name is not None)
-    return (tuple(outs) if several else outs[0]), kept
 
 
 @dataclasses.dataclass(frozen=True)

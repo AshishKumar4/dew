@@ -8,6 +8,7 @@ from typing import NamedTuple, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
+from jax.ad_checkpoint import checkpoint_name
 from jax._src.pallas.mosaic import core as tpu_core, lowering as mosaic_tpu_lowering
 from jax._src.pallas.mosaic_gpu import (
     core as plgpu_core,  # the lowering's semantics (`_lowers`)
@@ -74,6 +75,31 @@ class Formed(Protocol):
 
     @property
     def out_forms(self) -> tuple: ...
+
+
+@runtime_checkable
+class Residualized(Protocol):
+    """An epilogue whose first `residuals` outputs a reverse pass alone reads (`wide.Gated`'s saved rounded
+    product): `gemm` writes them where a derivative is taken, under their names (its `named`), returns the
+    rest, and runs `unsaved()`, the epilogue without them, where none is (`linear_tangent`'s `primal`), so
+    an inference's launch stores none."""
+
+    @property
+    def residuals(self) -> int: ...
+
+    def unsaved(self) -> Callable: ...
+
+
+def held_outputs(out, named: tuple, several: bool, residuals: int = 0) -> tuple:
+    """`gemm`'s forward's outputs `out` (several, or one) and what it saves: each output `named` names a
+    residual under its name (`checkpoint_name`), the one array the output and the residual are; the first
+    `residuals` (`Residualized`'s) saved alone, not returned."""
+    if not any(named):
+        return out, ()
+    outs = [checkpoint_name(each, name) if name is not None else each
+            for each, name in zip(out if several else (out,), named, strict=True)]
+    kept = tuple(each for each, name in zip(outs, named, strict=True) if name is not None)
+    return (tuple(outs[residuals:]) if several else outs[0]), kept
 
 
 def _unsqueezing(hook, positions: tuple, tiles: int = 1):

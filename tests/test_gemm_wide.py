@@ -65,12 +65,11 @@ def test_a_wide_matrix_holds_its_gate_and_up_columns_a_run_at_a_time():
 @pytest.mark.parametrize("saved", [False, True], ids=["recomputed", "saved"])
 def test_a_wide_gated_product_holds_check_1_against_its_projections_apart(generation_name, saved):
     """The wide product through the template named, interpreted as each GPU family runs it: its gated
-    product (and, saved, its rounded wide product) and the rows', gate's and up's gradients hold check 1
+    product and the rows', gate's and up's gradients (saved, read from its rounded wide product) hold check 1
     against the two projections apart and their SwiGLU in XLA, from float64; the launch the template's."""
     def dew(x, gate, up):
-        out = wide.gated_product(x, wide.interleaved(gate, up), _swiglu, out_dtype=jnp.bfloat16,
-                                 saved=saved, name="gate_up" if saved else None, interpret_on_cpu=True)
-        return out[1] if saved else out
+        return wide.gated_product(x, wide.interleaved(gate, up), _swiglu, out_dtype=jnp.bfloat16,
+                                  saved=saved, interpret_on_cpu=True)
 
     plain = _apart
     truth = functools.partial(_apart, wide_dtype=jnp.float64, out=jnp.float64)
@@ -83,16 +82,21 @@ def test_a_wide_gated_product_holds_check_1_against_its_projections_apart(genera
                         truth_fn=with_gradients(truth))
 
 
-def test_a_saved_wide_product_is_its_gate_and_up_interleaved():
-    """A saved wide product's first output (`wide.gated_product`'s `saved`) is the product of the rows and
-    the wide matrix rounded, its gate's and up's columns interleaved as the matrix's are, and its second their
-    SwiGLU, so the reverse pass reads the hook's operands from the first."""
-    x, gate, up, _ = _draw(1)
-    joined = wide.interleaved(gate, up)
-    kept, hidden = wide.gated_product(x, joined, _swiglu, out_dtype=jnp.bfloat16, saved=True)
-    np.testing.assert_array_equal(kept, jnp.dot(x, joined, preferred_element_type=jnp.float32).astype(
-        jnp.bfloat16))
-    np.testing.assert_array_equal(hidden, _swiglu(*wide.deinterleaved(kept)).astype(jnp.bfloat16))
+def test_a_saved_wide_products_residual_is_stored_where_a_derivative_is_taken_alone():
+    """A saved wide product (`wide.gated_product`'s `saved`) lowered for an H100: its launch stores the gated
+    product alone where no derivative is taken (an inference's), and its rounded product beside it in a
+    gradient's forward, the residual its reverse pass reads (`hooks.Residualized`)."""
+    from jax.extend import custom_call_targets
+    from kernel_compile import stated_outputs
+
+    product, shapes = _wide_4b(True)
+    devices = jax.sharding.Mesh(np.array(generation.compile_only_gpus("sm90")), ("data",))
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90")):
+        stored = {name: sorted(count for count, _ in stated_outputs(jax.jit(fn).trace(*shapes).lower(),
+                                                                   custom_call_targets.MOSAIC_GPU) if count)
+                  for name, fn in (("inference", product), ("gradient", _gradient_of(product)))}
+    assert stored["inference"] == [1], stored
+    assert 2 in stored["gradient"], stored
 
 
 @pytest.mark.parametrize(("family", "block_n", "refused"), [
@@ -118,9 +122,9 @@ def test_a_tpu_launch_stores_no_narrowed_output():
     assert quantized.forms_refusal((quantized.Form(2, narrowed=wide.GROUP),), tile, dense=True) is not None
 
 
-def _wide_gated_4b(saved):
+def _wide_4b(saved):
     """Qwen3.5-4B's gate and up as one wide product (8192 x 2560 by 2560 x 18432) through the template
-    named, its rounded product stored beside the gated one where `saved` (a training forward's)."""
+    named, `saved` (`wide.gated_product`'s), and its operands' shapes."""
     def product(x, joined):
         with generation.chosen(grouped_matmul="mosaic"):
             return wide.gated_product(x, joined, _swiglu, out_dtype=jnp.bfloat16, saved=saved)
@@ -129,14 +133,29 @@ def _wide_gated_4b(saved):
                      jax.ShapeDtypeStruct((2560, 2 * 9216), jnp.bfloat16))
 
 
+def _gradient_of(product):
+    """The rows' gradient of `product`'s sum: a training step's forward and reverse launches."""
+    def gradient(x, joined):
+        return jax.grad(lambda x: product(x, joined).astype(jnp.float32).sum())(x)
+
+    return gradient
+
+
+def _wide_gated_4b(saved):
+    """`_wide_4b`'s product, or where `saved` its gradient, whose forward stores the rounded product beside
+    the gated one (a training step's)."""
+    product, shapes = _wide_4b(saved)
+    return (_gradient_of(product) if saved else product), shapes
+
+
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("generation_name", ["sm80", "sm90", "sm100"])
 @pytest.mark.parametrize("saved", [False, True], ids=["forward", "saved"])
 def test_a_wide_gated_product_compiles_within_each_familys_resources(generation_name, saved):
-    """The 4B's wide gated product (`_wide_gated_4b`), its narrowed output alone or beside the whole rounded
-    product, compiled by Mosaic for each compile-only GPU family through ptxas (tests/kernel_compile.py): a
-    template kernel within its shared memory, no register spilled, its epilogue's split of the accumulator a
-    selection of registers."""
+    """The 4B's wide gated product (`_wide_gated_4b`), its narrowed output alone or, saved, its gradient's
+    forward beside the whole rounded product and its reverse launches, compiled by Mosaic for each
+    compile-only GPU family through ptxas (tests/kernel_compile.py): a template kernel within its shared
+    memory, no register spilled, its epilogue's split of the accumulator a selection of registers."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
