@@ -32,7 +32,6 @@ from dew.nn.kernels import (
     grouped_launch,
     grouped_matmul,
     grouped_triton,
-    selection,
     tuning,
 )
 from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing, row_tiles, tiling
