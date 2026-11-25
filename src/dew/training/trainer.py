@@ -295,7 +295,7 @@ class TrainerAdvanced(Generic[Loss, Effects]):
     """A looped model's pass count drawn per microbatch (`dew.training.phase_passes`)."""
 
 
-def _objective_axes(objective: Objective) -> Callable[[], dict[tuple[str, ...], LogicalAxes]]:
+def _objective_axes(objective: Objective[Loss, Effects]) -> Callable[[], dict[tuple[str, ...], LogicalAxes]]:
     """Read `objective`'s declared parameter axes (`Objective.parameter_axes`) without closing over its
     `Trainer`, so `declaring` never pins a dropped trainer and its compiled executables through its
     optimizer."""

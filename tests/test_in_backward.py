@@ -1036,15 +1036,16 @@ def test_a_scanned_runs_gated_backward_is_not_cached_across_gates():
     in the second."""
     from dew.nn import in_backward
 
-    def update(path, index, gradient, weights, moments):
-        return jax.tree.map(lambda w, g: w - 0.5 * g, weights, gradient), {}
-
     def layer(weights, x, key, metadata):
         return jnp.tanh(x @ weights["kernel"])
 
     def stepped(kernel, x, due):
         norms = {"sumsq": jnp.zeros((3,), kernel.dtype), "nonfinite": jnp.zeros((3,), kernel.dtype)}
-        with in_backward.planned(in_backward.InBackward(update=update, moments=())):
+        plan = in_backward.InBackward(
+            update=lambda path, index, gradient, weights, moments: (
+                {"kernel": weights["kernel"] - 0.5 * gradient["kernel"]}, {}),
+            moments=())
+        with in_backward.planned(plan):
             y, pullback = jax.vjp(
                 lambda w: jnp.sum(in_backward.scanned_run(("layers_0_2",), layer, {"kernel": w}, None, {},
                                                           norms, x, None, (None,))),
