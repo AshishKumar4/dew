@@ -70,7 +70,6 @@ def triton() -> tuple[str, ...] | None:
     if (build := ptxas_build(os.path.join(cuda_path, "bin", "ptxas"))) is None:
         return None
     if (libraries := nvjitlink_libraries()) is None:
-        _log.info("certification stores no Pallas-Triton kernel's verdict: the linker cache cannot be listed")
         return None
     named = (((distribution.metadata.get("Name") or "").lower(), distribution)
              for distribution in importlib.metadata.distributions())
@@ -97,7 +96,9 @@ def nvjitlink_libraries() -> list[str] | None:
     try:
         listed = subprocess.run([ldconfig, "-p"], capture_output=True, text=True, timeout=60,
                                 check=True).stdout
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as error:
+        _log.info("the linker cache cannot be listed (%s %s): no Triton launch's verdict is stored", ldconfig,
+                  error)
         return None
     # The loader splits LD_LIBRARY_PATH at ':' and ';', an empty entry the working directory; one it
     # expands (`$ORIGIN`, `$LIB`, `$PLATFORM`) is no directory this reads: the inventory unknown.
