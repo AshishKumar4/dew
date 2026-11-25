@@ -1443,19 +1443,18 @@ class Issuer[Accumulator](abc.ABC):
         TPU core's copy into its scalar memory."""
         return ref[0]
 
-    def key_magnitudes(self, tile) -> jax.Array:
-        """Each key's largest value magnitude, fp32, from a values tile `tile` `[keys, columns]` in shared
-        memory: read transposed, its keys an accumulator tile's columns, and reduced over its own columns,
-        so the vector is in a column's layout (`column`, a logits tile's keys'), as
-        `attention_algebra.weighed_reach` reads it; no pass over the values outside the launch. In the values'
-        own dtype until the reduction is done (a magnitude's maximum is exact in any), so the tile holds half
-        an fp32 tile's registers. A value narrower than the accumulator layout's rows is read in four warps of
-        a quarter of its rows each, whose column vector is the accumulator's (`swizzling.rows_read`): a
-        32-wide value is no 64-row tile of an H100's mma.sync, wgmma or tcgen05 layout (IG-FINAL3-h100's
-        cast). A value no finite number weighs nothing (`attention_algebra.magnitudes`)."""
+    def keys_read(self, tile) -> tuple[jax.Array, int]:
+        """A values tile `tile` `[keys, columns]` in shared memory read for its keys' largest magnitudes, and
+        the axis its columns lie along, which the one rule reduces (`attention_algebra.magnitudes`): read
+        transposed, its keys an accumulator tile's columns, so the reduction over its columns is in a
+        column's layout (`column`, a logits tile's keys'), as `attention_algebra.weighed_reach` reads it; no
+        pass over the values outside the launch. In the values' own dtype (a magnitude's maximum is exact in
+        any), so the tile holds half an fp32 tile's registers. A value narrower than the accumulator layout's
+        rows is read in four warps of a quarter of its rows each, whose column vector is the accumulator's
+        (`swizzling.rows_read`): a 32-wide value is no 64-row tile of an H100's mma.sync, wgmma or tcgen05
+        layout (IG-FINAL3-h100's cast)."""
         layout = swizzling.rows_read(self.layout, tile.shape[1])
-        values = plgpu.load(tile.transpose((1, 0)), layout=layout, optimized=False)
-        return jnp.max(jnp.where(jnp.abs(values) < jnp.inf, jnp.abs(values), 0), axis=0).astype(jnp.float32)
+        return plgpu.load(tile.transpose((1, 0)), layout=layout, optimized=False), 0
 
     column_scratch: int
     """The fp32 entries of shared memory a consumer's `column_sums` takes: a reduction across the warps

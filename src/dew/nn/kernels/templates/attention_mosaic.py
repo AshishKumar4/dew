@@ -445,7 +445,7 @@ class MosaicForward(_Mainloop[Tiles]):
         computed = query.dtype if scales is not None else value.dtype
         # Only memory-bound walks (`streams`) and paged/quantized cache walks decide in-kernel; compute-bound
         # prefill/training forwards use `algebra.may_scale`'s single native-dtype max pass (~4-8 us) so the
-        # hot forward inner loop pays no per-tile `key_magnitudes` SMEM read, cross-warp barrier, `_bounded`
+        # hot forward inner loop pays no per-tile `keys_read` SMEM read, cross-warp barrier, `_bounded`
         # reduction, or scaled-walk register bloat (row 5272).
         if (not config.natural_form and residuals is not Kept.SPLIT and not self.scaled
                 and self.rounds is None and algebra.headroom(computed)

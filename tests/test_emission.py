@@ -735,6 +735,116 @@ def test_a_steps_mask_of_its_tiles_indices_issues_nothing_and_one_of_its_place_c
     assert selected == selected_placed == 128, (selected, selected_placed)
 
 
+def _static_multiply(factor: int) -> jax.Array:
+    """`iota * factor` as a row's floats: an integer multiply of iotas and literals alone, 128 of them."""
+    return (lax.iota(jnp.int32, 128) * factor).astype(jnp.float32)
+
+
+def test_static_work_a_loop_reaches_is_hoisted_once_whichever_trips_reach_it():
+    """Static work (iotas and literals) inside a loop is computed once outside it, as the compiler hoists
+    it, whichever of its trips or arms reach it (row 12767): a walk whose parity picks `iota * 3` or
+    `iota * 5` computes both, 256 multiplies; a two-trip scan whose second trip alone takes `iota * 3`
+    computes it, 128; a two-trip scan whose arms its data decides computes both, 256."""
+    def parity(row, trips):
+        def step(index, row):
+            mosaic.step_index(index)
+            return row + lax.cond(index % 2 == 1, lambda: _static_multiply(3), lambda: _static_multiply(5))
+
+        return lax.fori_loop(0, trips, step, row)
+
+    def later(row):
+        def step(index, row):
+            return lax.cond(index == 1, lambda row: row + _static_multiply(3), lambda row: row, row)
+
+        return lax.fori_loop(0, 2, step, row)
+
+    def decided(row):
+        def step(row, _):
+            return lax.cond(row[0] > 0, lambda row: row + _static_multiply(3),
+                            lambda row: row + _static_multiply(5), row), None
+
+        return lax.scan(step, row, None, length=2)[0]
+
+    walked = _emitted(parity, _ROW, _TRIPS).roles[0].fixed
+    assert walked.integer_multiply_adds == 2 * 128, walked
+    assert _emitted(later, _ROW).roles[0].fixed.integer_multiply_adds == 128
+    assert _emitted(decided, _ROW).roles[0].fixed.integer_multiply_adds == 2 * 128
+
+
+def test_static_work_hoisted_from_an_arms_loop_stays_in_its_arm():
+    """A one-shot conditional its data decides, each arm a two-trip scan adding `iota * 3` or `iota * 5`:
+    hoisting a multiply out of its arm's scan leaves it in its arm, so the conditional's arms' envelope takes
+    one arm's, 128 multiplies, never both arms' 256 (the review of lane/toolkit 55ba7911d, P1)."""
+    def scanned(factor: int):
+        def arm(row):
+            return lax.scan(lambda row, _: (row + _static_multiply(factor), None), row, None, length=2)[0]
+
+        return arm
+
+    def body(row):
+        return lax.cond(row[0] > 0, scanned(3), scanned(5), row)
+
+    assert _emitted(body, _ROW).roles[0].fixed.integer_multiply_adds == 128
+
+
+_TRIPLED_ROW: list = []
+
+
+def _tripled_row():
+    """An operation of the construct's own (`scaled.primitive`) whose value adds `iota * 3` to its row: its
+    expansion, which a count traces (`emission._expanded`), holds a static multiply."""
+    if not _TRIPLED_ROW:
+        from dew.algebra import scaled
+
+        _TRIPLED_ROW.append(scaled.primitive(
+            "tripled_row", lambda row: row + (lax.iota(jnp.int32, row.shape[0]) * 3).astype(row.dtype),
+            lambda row: row))
+    return _TRIPLED_ROW[0]
+
+
+def test_an_expanded_operations_static_work_in_a_loop_is_hoisted_once():
+    """A four-trip scan applying an operation the count expands (`scaled.primitive`'s) whose expansion
+    multiplies an iota: the multiply hoisted once, 128 multiplies, its expansion's sites one across the
+    scan's trips (the review of lane/toolkit 55ba7911d, P2: each visit retraced, its sites new or a freed
+    trace's reused)."""
+    tripled = _tripled_row()
+
+    def body(row):
+        return lax.scan(lambda row, _: (tripled.bind(row), None), row, None, length=4)[0]
+
+    assert _emitted(body, _ROW).roles[0].fixed.integer_multiply_adds == 128
+
+
+def test_static_work_outside_loops_runs_on_its_path_once_a_call():
+    """Static work outside every loop runs where its path does: in a conditional its data decides, its arm's
+    under the arms' envelope with the arm's other work (`iota * 3`'s multiply, conversion and add against
+    one add: 384 issues; against three adds, 384 too, never 640), and once at each call of a cached jitted
+    body (two calls, 256 multiplies) (row 12767)."""
+    def chosen(first, other):
+        def body(row):
+            return lax.cond(row[0] > 0, first, other, row)
+
+        return cost.issued(_emitted(body, _ROW).roles[0].fixed)
+
+    def tripled_row(row):
+        return row + _static_multiply(3)
+
+    # The predicate and its branch index alone, which each conditional below issues beside its arms.
+    baseline = chosen(lambda row: row, lambda row: row)
+    against_one = chosen(tripled_row, lambda row: row + 1.0)
+    against_three = chosen(tripled_row, lambda row: ((row + 1.0) + 2.0) + 3.0)
+    assert against_one - baseline == against_three - baseline == 3 * 128, (baseline, against_one,
+                                                                           against_three)
+
+    tripled = jax.jit(lambda x: x * 3)
+
+    def called(row):
+        indices = lax.iota(jnp.int32, 128)
+        return row + (tripled(indices) + tripled(indices + 1)).astype(jnp.float32)
+
+    assert _emitted(called, _ROW).roles[0].fixed.integer_multiply_adds == 2 * 128
+
+
 @pytest.mark.parametrize("held", ["step", "scope", "branch"])
 def test_a_steps_mask_of_a_runtime_value_counts_its_integer_operations_each_step(held):
     """A walk step's mask of its tile's indices offset by its parity (`index % 2`, a value the count holds
@@ -879,6 +989,44 @@ def test_a_walks_issue_latency_follows_the_warps_its_steps_spread_over():
     # Each warpgroup's work outside its walk (a guard's cast) shares its program's warps, so the bounds
     # differ by it; their steps' chains order them (the exact arithmetic, `test_a_walk_issuing_one_warp_*`).
     assert halved < twice and halved < alone, (alone, twice, halved)
+
+
+def test_a_launch_states_the_residency_its_plan_compiled_it_for():
+    """A Mosaic GPU launch compiled for two programs a multiprocessor (`mosaic.compiler_params(resident=2)`,
+    its `min_blocks_per_sm`) states it (`emission.resident_of`), and a program's launches price at it by
+    default (`emission.launches_seconds`): a grid of two programs a GH200 multiprocessor, issue-bound, prices
+    as one wave of two, apart from two waves of one; one compiled for none states one (row 4123: the KDA
+    recurrence's launches priced at one resident where their plans ran two, M-FS-73b's join median 0.65
+    against 0.78 at their plans')."""
+    from dew.nn.kernels.templates import mosaic as mosaic_templates
+
+    target = generation.gpu_target("NVIDIA GH200 480GB")
+    assert target.multiprocessors is not None
+    row = jax.ShapeDtypeStruct((128,), jnp.float32)
+
+    def doubled(x_ref, o_ref):
+        o_ref[...] = lax.fori_loop(0, 64, lambda index, value: value * 2.0 + 1.0, x_ref[...])
+
+    def launched(params):
+        launch = plgpu.kernel(doubled, out_type=row, grid=(2 * target.multiprocessors,), grid_names=("p",),
+                              num_threads=1, thread_name="wg", compiler_params=params)
+        counted = emission.costed(launch, Stated(steps=0, bytes_accessed=0))
+        traced = jax.make_jaxpr(counted)(row).jaxpr
+        (kernel,) = [equation for equation in programs.equations(traced)
+                     if "cost_estimate" in equation.params]
+        return traced, kernel
+
+    traced, kernel = launched(mosaic_templates.compiler_params(resident=2))
+    assert emission.resident_of(kernel) == 2
+    work = emission.work_of(kernel)
+    assert work is not None
+
+    def at(resident: int) -> float:
+        return cost.launch_seconds(work, emission.launch_programs(kernel), target, resident=resident,
+                                   warps=emission.warps_of(kernel) or 0.0)
+
+    assert emission.launches_seconds(traced, target) == at(2) != at(1), (at(1), at(2))
+    assert emission.resident_of(launched(None)[1]) == 1
 
 
 def test_a_programs_launches_price_in_sequence_and_an_uncounted_one_leaves_it_unknown():

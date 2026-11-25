@@ -120,7 +120,7 @@ def emitted(body: jax_core.Jaxpr, warpgroups: int, axis: str | None, *, device: 
         for index in range(warpgroups):
             counting = _Counting(axis, index, forms=forms, arrivals=arrivals)
             counting.run(body, values)
-            roles.append(Role(counting.fixed, tuple(counting.walks)))
+            roles.append(Role(counting.held(), tuple(counting.walks)))
         return roles
 
     roles = counted()
@@ -507,8 +507,20 @@ class _Counting:
     of its warpgroup's warps where it is one's (`warps`)."""
 
     def __init__(self, axis: str | None, index: int, loops: int = 0, warp: tuple | None = None,
-                 forms: Mapping | None = None, arrivals: _Arrivals | None = None, lanes: int | None = None):
+                 forms: Mapping | None = None, arrivals: _Arrivals | None = None, lanes: int | None = None,
+                 hoisted: dict[tuple, Work] | None = None, sites: Sequence = (),
+                 expansions: dict[int, tuple] | None = None):
         self.axis, self.index, self.warp, self.forms = axis, index, warp, forms
+        # Static work inside a loop, by its site: computed once outside every loop, as the compiler hoists
+        # it, whichever trip or arm of whichever trial reaches it (`hoist`, row 12767), so every count within
+        # that loop shares it; a conditional's arm outside every loop hoists into its own, its arm's (the
+        # review of lane/toolkit 55ba7911d). A site is its call path, the equations being counted within
+        # (`sites`) and its own, so a cached body's two calls are two sites.
+        self.hoisted = {} if hoisted is None else hoisted
+        self.sites = list(sites)
+        # Each expanded equation's expansion as the count first traced it (`expanded`), the equation held so
+        # its identity names it for the count's length, so its equations' sites hold across visits.
+        self.expansions = {} if expansions is None else expansions
         # The warp of its warpgroup whose 32 lanes run its body where a warp mesh's role runs it
         # (`plgpu.warp_map`), None where its warpgroup's 128 do.
         self.lanes = lanes
@@ -613,7 +625,11 @@ class _Counting:
             values = [read(atom) for atom in equation.invars]
             given = [isinstance(atom, jax_core.Literal) or atom in self.static for atom in equation.invars]
             self.returned = None
-            outputs = self.moved(equation, values, live) or self.equation(equation, values, given)
+            self.sites.append(id(equation))
+            try:
+                outputs = self.moved(equation, values, live) or self.equation(equation, values, given)
+            finally:
+                self.sites.pop()
             held.update(zip(equation.outvars, outputs, strict=True))
             # A body it ran here states its outputs' provenance (a call's, a scope's, a branch's); else the
             # operation's own (`_static`).
@@ -683,8 +699,13 @@ class _Counting:
                 and all(value is not None for value in values[1:])):
             return [values[1 + int(values[0])]]
         if _static(equation, given):
-            # Of the program's constants alone: folded by its compile or computed once outside every loop. A
-            # call of them runs on, its body's folds the values a later guard reads.
+            # Of the program's constants alone: hoisted out of every loop it lies in, computed once (`hoist`),
+            # else where its path runs it. A call of them runs on, its body's folds the values a later guard
+            # reads.
+            if primitive in _ARITHMETIC:
+                self.hoist(operation_work(primitive, [variable.aval for variable in equation.invars],
+                                          [variable.aval for variable in equation.outvars], params,
+                                          forms=self.forms))
             return unknown
         if primitive in _ARITHMETIC:
             self.add(operation_work(primitive, [variable.aval for variable in equation.invars],
@@ -733,7 +754,7 @@ class _Counting:
             return region(self, equation, values, given) or unknown
         elif primitive is derivatives.marked_call_p and isinstance(params["kind"], _MARKS):
             return self.marked(params, values, given)
-        elif (expanded := _expanded(equation)) is not None:
+        elif (expanded := self.expanded(equation)) is not None:
             # The expansion's constants are its trace's own.
             return self.run(expanded[0], values, expanded[1], given, [True] * len(expanded[1]))
         elif primitive not in _FREE:
@@ -785,7 +806,8 @@ class _Counting:
                 inputs[len(consts) + counter] = _Place(at, start, stop, parity)
                 inputs[len(consts) + bound] = stop
             trial = _Counting(self.axis, self.index, loops=len(self.loops) + 1, warp=self.warp,
-                              forms=self.forms, arrivals=self.arrivals, lanes=self.lanes)
+                              forms=self.forms, arrivals=self.arrivals, lanes=self.lanes,
+                              hoisted=self.hoisted, sites=self.sites, expansions=self.expansions)
             trial.run(body, inputs, static=static)
             self.arrivals.left(trial.landing)
             return trial
@@ -813,9 +835,12 @@ class _Counting:
         steps, marks = [], 0.0
         barriers = [_barrier(var) for var in inner.invars]
         for warp in range(count):
+            # Each warp's static work its own (its instructions), its sites marked by its warp.
             counted = _Counting(self.axis, self.index, loops=len(self.loops), warp=(name, warp),
                                 forms=self.forms, arrivals=self.arrivals,
-                                lanes=warp if isinstance(mesh, gpu_core.WarpMesh) else self.lanes)
+                                lanes=warp if isinstance(mesh, gpu_core.WarpMesh) else self.lanes,
+                                hoisted=self.hoisted, sites=[*self.sites, (name, warp)],
+                                expansions=self.expansions)
             counted.run(inner, barriers)
             if self.loops:
                 self.arrivals.left(counted.landing)
@@ -857,6 +882,30 @@ class _Counting:
         else:
             self.fixed = self.fixed + found.work
 
+    def held(self) -> Work:
+        """Its work outside its walks and what it hoisted out of its loops (`hoisted`), together."""
+        total = self.fixed
+        for work in self.hoisted.values():
+            total = total + work
+        return total
+
+    def expanded(self, equation) -> tuple[jax_core.Jaxpr, Sequence] | None:
+        """`equation`'s expansion (`_expanded`), traced once for the count: a loop's trips and trials visit
+        one, so its equations' sites (`hoist`) are one across them (the review of lane/toolkit 55ba7911d)."""
+        if id(equation) not in self.expansions:
+            self.expansions[id(equation)] = (equation, _expanded(equation))
+        return self.expansions[id(equation)][1]
+
+    def hoist(self, work: Work) -> None:
+        """Static work (of the program's constants alone) at the equation being counted: inside a loop, its
+        site's once (`hoisted`, the compiler's hoisting out of every loop, whatever trip or arm reaches it
+        and however often); outside every loop, its path's own, beside the rest of its work (under a
+        conditional's arms' envelope, a call's at each call)."""
+        if not self.loops:
+            self.fixed = _then(self.fixed, work)
+        else:
+            self.hoisted.setdefault(tuple(self.sites), work)
+
     def cond(self, branches, values: list, given: list[bool]) -> list:
         """A conditional: its branch where its index is concrete (a role's, by its warpgroup), else every
         branch's envelope, unit by unit (the most of each any branch issues, as the custom call's FLOP count
@@ -871,13 +920,17 @@ class _Counting:
             return taken
         trials = []
         for branch in branches:
+            # Inside a loop its arms' hoisted work leaves the loop with every trip's (shared); outside every
+            # loop an arm's stays in the arm (its own), under the arms' envelope with the arm's other work.
             trial = _Counting(self.axis, self.index, loops=len(self.loops), warp=self.warp,
-                              forms=self.forms, arrivals=self.arrivals, lanes=self.lanes)
+                              forms=self.forms, arrivals=self.arrivals, lanes=self.lanes,
+                              hoisted=self.hoisted if self.loops else {}, sites=self.sites,
+                              expansions=self.expansions)
             trial.run(branch, operands, static=given[1:])
             if self.loops:
                 self.arrivals.left(trial.landing)
             trials.append(trial)
-        self.fixed = self.fixed + most([trial.fixed for trial in trials])
+        self.fixed = self.fixed + most([trial.fixed if self.loops else trial.held() for trial in trials])
         if any(trial.walks for trial in trials):
             self.walks.append(most([_mean(trial.walks) for trial in trials if trial.walks]))
         if self.loops:
@@ -1197,11 +1250,22 @@ def warps_of(kernel) -> float | None:
     return None if launched is None else launched.warps
 
 
+def resident_of(kernel) -> int:
+    """The programs a multiprocessor holds of a kernel equation's launch as its plan compiled it: its Mosaic
+    GPU parameters' `min_blocks_per_sm` (`mosaic.compiler_params`' `resident`), one where it states none."""
+    params = kernel.params.get("compiler_params")
+    held = params.get("mosaic_gpu") if isinstance(params, Mapping) else params
+    if not isinstance(held, gpu_core.CompilerParams):
+        return 1
+    return max(1, held.min_blocks_per_sm)
+
+
 def launches_seconds(jaxpr: jax_core.Jaxpr, target: generation.GpuTarget, *,
-                     resident: Callable[[jax_core.JaxprEqn], int] = lambda kernel: 1) -> float | None:
+                     resident: Callable[[jax_core.JaxprEqn], int] = resident_of) -> float | None:
     """A traced program's native launches priced on `target`, in sequence: each kernel's work as its costed
     launch counted it (`work_of`), over its programs (`launch_programs`) at the residency its plan gives it
-    (`resident`; one by default) and the warps it issues over (`warps_of`), through `cost.launch_seconds`,
+    (`resident`; its compiled plan's by default, `resident_of`) and the warps it issues over (`warps_of`),
+    through `cost.launch_seconds`,
     through the calls it makes (`_expanded`); None where any launch's work its emission does not count, or a
     launch lies under a loop or a branch, whose trips or taken arm no sequence states (the review of
     lane/toolkit 61dd3c7d2): its price unknown, never 0. What XLA runs beside them is the algebra's to price

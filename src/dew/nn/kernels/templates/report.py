@@ -1387,13 +1387,18 @@ def _certifying_placement(device) -> tuple[jax.sharding.Mesh, frozenset]:
     them, `sharding.manual_map`'s), so the launch lowers to the jaxpr and the mesh its program's call does
     (the GPU it states and each jit's recorded mesh among them) and the program reads its kernels' lowerings
     back (the Pallas lowering cache keys both: a shard's launch on two GPUs certified on a mesh of its own was
-    lowered twice, rows 6327 and 12462); else a mesh of its own on `device`, as a program of no mesh or of
-    other devices."""
+    lowered twice, rows 6327 and 12462), where the call holds every axis of more than one device manual, as a
+    kernel's launch needs (`sharding.per_shard`: it reads its operands whole, each device its own rows); else
+    a mesh of its own on `device`, as a program of no mesh, of other devices, or certified outside its call's
+    map (a run's compile: a recurrence's states launch certified there on its program's two-device data axis,
+    automatic, was refused, train 1275)."""
     from jax._src import mesh as mesh_lib
 
     placed = mesh_lib.get_concrete_mesh()
-    if not placed.empty and device in placed.devices.flat:
-        return placed, frozenset(jax.sharding.get_abstract_mesh().manual_axes)
+    manual = frozenset(jax.sharding.get_abstract_mesh().manual_axes)
+    if (not placed.empty and device in placed.devices.flat
+            and all(size == 1 or name in manual for name, size in placed.shape.items())):
+        return placed, manual
     return jax.sharding.Mesh([device], ("launch",)), frozenset()
 
 
