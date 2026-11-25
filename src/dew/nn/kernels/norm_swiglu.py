@@ -1326,7 +1326,7 @@ def _gradients(gate, up, dy):
     return dy * slope * up, dy * activated
 
 
-def _row_block(width: int, block: int):
+def _row_columns(width: int, block: int):
     """A program's row of a `[rows, width]` launch (`_Rows`), its block of columns and their mask: a row and
     a column index, whose offset the lowering widens to 64 bits where an operand passes 2^32 bytes, so no
     index outgrows int32 however many elements the operands hold (row 12971: 168 x 4096 rows of 9216, 6.3e9
@@ -1336,7 +1336,7 @@ def _row_block(width: int, block: int):
 
 
 def _swiglu_forward(gate_ref, up_ref, y_ref, *, block: int, interpret: bool):
-    row, columns, mask = _row_block(gate_ref.shape[1], block)
+    row, columns, mask = _row_columns(gate_ref.shape[1], block)
     gate = plgpu.load(gate_ref.at[row, columns], mask=mask, other=0).astype(jnp.float32)
     up = plgpu.load(up_ref.at[row, columns], mask=mask, other=0).astype(jnp.float32)
     y = _product(gate, up, gate_ref.dtype, interpret)
@@ -1344,7 +1344,7 @@ def _swiglu_forward(gate_ref, up_ref, y_ref, *, block: int, interpret: bool):
 
 
 def _swiglu_backward(gate_ref, up_ref, dy_ref, dg_ref, du_ref, *, block: int, interpret: bool):
-    row, columns, mask = _row_block(gate_ref.shape[1], block)
+    row, columns, mask = _row_columns(gate_ref.shape[1], block)
     gate = plgpu.load(gate_ref.at[row, columns], mask=mask, other=0).astype(jnp.float32)
     up = plgpu.load(up_ref.at[row, columns], mask=mask, other=0).astype(jnp.float32)
     dy = plgpu.load(dy_ref.at[row, columns], mask=mask, other=0).astype(jnp.float32)
@@ -1357,7 +1357,7 @@ def _halves(gate_up_ref, block: int):
     """A packed program's row of `[rows, 2 * width]`, its block of columns, their mask, and the
     gate's and up's columns: contiguous runs, which the loads vectorize."""
     width = gate_up_ref.shape[1] // 2
-    row, columns, mask = _row_block(width, block)
+    row, columns, mask = _row_columns(width, block)
     return row, columns, mask, columns + width
 
 
@@ -1381,7 +1381,7 @@ def _packed_backward(gate_up_ref, dy_ref, d_ref, *, block: int, interpret: bool)
 
 @dataclasses.dataclass(frozen=True)
 class _Rows(tuning.KernelOp):
-    """An elementwise launch over `[rows, width]` operands (`_row_block`): a program a row's block of
+    """An elementwise launch over `[rows, width]` operands (`_row_columns`): a program a row's block of
     columns, the whole row up to `ROW_BLOCK` columns, four warps."""
 
     config_cls: ClassVar[type[BlockConfig]] = BlockConfig

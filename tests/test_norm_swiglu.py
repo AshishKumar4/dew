@@ -1295,7 +1295,7 @@ def test_a_context_choice_of_the_norm_forces_it_over_a_calls_own():
 def test_a_swiglu_past_two_to_the_31_elements_compiles_for_an_h100():
     """The apart SwiGLU's forward and reverse launches over 168 x 4096 rows of 9216 (6.3e9 elements an
     operand, past int32's 2^31), traced, lowered and compiled for a compile-only H100: a program a row's
-    block of columns (`norm_swiglu._row_block`), where a flat launch's int32 index overflowed at its trace
+    block of columns (`norm_swiglu._row_columns`), where a flat launch's int32 index overflowed at its trace
     (row 12971)."""
     from jax.sharding import NamedSharding
 
