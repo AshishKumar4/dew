@@ -1542,6 +1542,14 @@ def _weighted_held(call: Call, block: int) -> Held:
 
 
 @building(lambda launch: ("recurrence_weighted", "recurrence_decayed_keys"))
+def _last_prefix(call: Call, prefix_refs: tuple, row, column, keyed: int) -> tuple:
+    """`_weighted`'s key block's last token's prefix, a column's vector a limb from `column` on, read from
+    global memory ahead of its step's slots' wait, its latency the wait's: read after the values' weights,
+    the next instruction waited on it, 3% of a GH200's Kimi Linear weighted launch's samples (M-JS-272)."""
+    ends = pl.ds(column, keyed)
+    return tuple(call.family.columns_of(ref.at[row + call.chunk - 1, ends]) for ref in prefix_refs)
+
+
 def _weighted(k, v, a, prefix: tuple, beta, taken, call: Call):
     """`(w [R, HV * Dk], u [R, HV * Dv])` as `call.held` (`algebra.weighted`): the inverse against the decayed
     write-gated keys and against the write-gated values, under the decay's `prefix` (`chunk_forward._Run`'s);
@@ -1594,11 +1602,8 @@ def _weighted(k, v, a, prefix: tuple, beta, taken, call: Call):
         def step(index, slots, carry, accumulators, loaded=None, *, keys: bool = True, values: bool = True):
             """A step: under a decay a key dimension its value block (where `values`) and its key block
             (where `keys`), else every block of both."""
-            # Under a decay a key dimension the key block's last token's prefix, read from global memory
-            # ahead of the slots' wait, its latency the wait's: read after the values' weights, the next
-            # instruction waited on it, 3% of a GH200's Kimi Linear weighted launch's samples (M-JS-272).
-            last = (tuple(family.columns_of(ref.at[row + chunk - 1, pl.ds(h * width + index * keyed, keyed)])
-                          for ref in prefix_refs) if call.per_key and keys else None)
+            key_step = call.per_key and keys
+            last = _last_prefix(call, prefix_refs, row, h * width + index * keyed, keyed) if key_step else ()
             # Every slot waited for each step, the values' too, which the first step alone reads: a load no
             # step waits for leaves its barrier's phases unobserved (the interpreter refuses it).
             slots.acquire_all()
