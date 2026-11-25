@@ -1286,13 +1286,16 @@ def test_a_gathered_loop_trains_the_same_model(mesh_shape, loop):
 
 
 @pytest.mark.mesh(devices=8)
+@pytest.mark.parametrize("placed", ["within", "returned"])
 @pytest.mark.parametrize("sum_", ["reduced", "unreduced"])
-def test_a_sum_a_gathered_region_writes_out_is_placed_back_taken(sum_):
+def test_a_sum_a_gathered_region_writes_out_is_placed_back_taken(sum_, placed):
     """A value a gathered loop's Explicit region (`sharding.explicit_over`) writes out as a pass's sown value
     is (`sharding.typed_on`), whose placement carries a sum over the FSDP axis the step's mesh leaves Auto, is
     placed back on that mesh with the sum taken: a matrix gathered reduced (`gathered_over`), the copy it
     is; a product's partial sums over the axis (`unreduced`), their total. Its sum over an Auto axis is no
-    placement there, which JAX refused, with its kind too where no axis was left (the row 12849 review)."""
+    placement there, which JAX refused, with its kind too where no axis was left (the row 12849 review):
+    placed back within the region, as a pass's sown value is, or returned from it, `explicit_over` placing
+    it back outside the region's mesh."""
     from dew.nn.sharding import explicit_over, gathered_over, typed_on
     from dew.training import MeshSpec
 
@@ -1312,7 +1315,10 @@ def test_a_sum_a_gathered_region_writes_out_is_placed_back_taken(sum_):
             return jnp.einsum("bd,be->de", rows, rows,
                               out_sharding=jax.sharding.PartitionSpec(unreduced={"fsdp"}))
 
-        out = jax.jit(lambda rows: explicit_over(lambda rows: typed_on(inside(rows), outer), rows))(rows)
+        def region(rows):
+            return explicit_over(lambda rows: typed_on(inside(rows), outer) if placed == "within"
+                                 else inside(rows), rows)
+        out = jax.jit(region)(rows)
     expected = weight if sum_ == "reduced" else columns.T @ columns
     np.testing.assert_array_equal(np.asarray(out), expected)
 

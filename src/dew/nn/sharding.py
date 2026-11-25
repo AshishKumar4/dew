@@ -704,9 +704,11 @@ def typed_on[T](tree: T, mesh: jax.sharding.AbstractMesh) -> T:
     def back(value):
         if not isinstance(value, jax.Array) or jax.typeof(value).sharding.mesh == mesh:
             return value
-        spec = jax.typeof(value).sharding.spec
-        if (spec.reduced | spec.unreduced) - explicit:
-            value = jax.sharding.reshard(value, taken(spec))
+        sharding = jax.typeof(value).sharding
+        if (sharding.spec.reduced | sharding.spec.unreduced) - explicit:
+            # On the mesh it is typed on, whichever mesh the context holds.
+            with jax.sharding.use_abstract_mesh(sharding.mesh.abstract_mesh):
+                value = jax.sharding.reshard(value, taken(sharding.spec))
         with jax.sharding.use_abstract_mesh(mesh):
             return jax.sharding.reshard(value, taken(kept_axes(jax.typeof(value).sharding.spec,
                                                                explicit.__contains__)))
