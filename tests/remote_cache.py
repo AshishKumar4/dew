@@ -414,15 +414,10 @@ class RemoteCache:
             self.uploads.put((self._chunk(file, index), None))
 
     def _payloads(self, keys: list[str]) -> list[tuple[str, bytes]]:
-        """`keys`' programs as the directory holds them, one gone since its layout (JAX's cache evicts) going
-        without; one that cannot be read (OSError) fails the whole."""
-        entries = []
-        for key in keys:
-            try:
-                entries.append((key, (self.directory / f"{key}{SUFFIX}").read_bytes()))
-            except FileNotFoundError:
-                continue
-        return entries
+        """`keys`' programs as the directory holds them. One gone since its layout (JAX's cache evicts) or
+        that cannot be read fails the whole (OSError): the close sends nothing and holds nothing, so the
+        next lays its bundle out again."""
+        return [(key, (self.directory / f"{key}{SUFFIX}").read_bytes()) for key in keys]
 
     def _layout(self, keys: list[str]) -> tuple[list[list[str]], set[str]]:
         """`keys`' programs of the directory laid out by their sizes in chunks of at most `MAX_BYTES`

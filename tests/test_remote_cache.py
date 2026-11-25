@@ -563,7 +563,8 @@ def test_a_run_of_part_of_a_files_tests_keeps_its_bundle_whole_and_writes_nothin
 def test_a_kept_bundle_full_makes_room_for_what_its_part_compiled_and_never_for_an_unsendable_program(
         cache_worker, tmp_path, monkeypatch):
     """A part's run whose kept bundle leaves no room for a program it compiled drops what it did not load to
-    make room for it; a program too large for any chunk drops nothing; and a run that loaded none and
+    make room for it; a program too large for any chunk drops nothing; a program evicted between its layout
+    and its read sends and holds nothing, the next close sending it; and a run that loaded none and
     compiled none writes nothing, whatever it fetched."""
     url, stored, _ = cache_worker
     value = b"v" * 60
@@ -587,6 +588,23 @@ def test_a_kept_bundle_full_makes_room_for_what_its_part_compiled_and_never_for_
     assert ran("room", "jit_a-1", ("jit_e-1", value)) == {"jit_a-1", "jit_e-1"}
     whole = {f"jit_{each}-1" for each in "abcd"}
     assert ran("huge", "jit_a-1", ("jit_x-1", b"x" * remote_cache.MAX_BYTES)) == whole
+    held = stored[bundle]
+    # A program gone between its layout and its read: nothing sent, nothing held, so the next close sends.
+    evicted = remote_cache.RemoteCache(tmp_path / "evicted", url, "token", "jax/cpu")
+    evicted.opened("tests/full.py")
+    compiled(tmp_path / "evicted", "jit_f-1", value)
+    real_payloads = evicted._payloads
+    monkeypatch.setattr(evicted, "_payloads", lambda keys: (
+        (tmp_path / "evicted" / f"jit_f-1{remote_cache.SUFFIX}").unlink(), real_payloads(keys))[1])
+    evicted.closed("tests/full.py")
+    assert evicted.failures == 1 and stored[bundle] is held
+    monkeypatch.undo()
+    monkeypatch.setattr(remote_cache, "CHUNKS", 1)
+    monkeypatch.setattr(remote_cache, "MAX_BYTES", 4 * each_cost)
+    compiled(tmp_path / "evicted", "jit_f-1", value)
+    evicted.closed("tests/full.py")
+    evicted.drain()
+    assert "jit_f-1" in {key for key, _ in remote_cache.unpacked(stored[bundle])[0]}
     held = stored[bundle]
     idle = remote_cache.RemoteCache(tmp_path / "idle", url, "token", "jax/cpu")
     idle.opened("tests/full.py")
