@@ -28,7 +28,7 @@ from dew._builds import (
     newest_build,
     runs_on,
 )
-from dew._pool import answered, cuda_driver, named_platforms, runs_on_gpu, visible_gpus
+from dew._pool import answered, cuda_driver, named_platforms, runs_on_gpu
 from dew._records import JSON
 
 _log = logging.getLogger(__name__)
@@ -232,19 +232,23 @@ def ungraph_multi_gpu() -> None:
     established (row 12714). `import dew` sets it before the backend opens, as `unpartition_gpu_pool`."""
     if backend_open() or not cuda_plugin():
         return
-    if multi_gpu_ungraphed(os.environ, lambda: _pool.listed_gpus(("nvidia-smi", "-L"), 10)):
+    if multi_gpu_ungraphed(os.environ, _pool.local_gpus):
         _gpu_default("xla_gpu_enable_command_buffer", MULTI_GPU_UNGRAPHED)
 
 
-def multi_gpu_ungraphed(env: Mapping[str, str], listed: Callable[[], int | None]) -> bool:
+def multi_gpu_ungraphed(env: Mapping[str, str],
+                        opens: Callable[[str, Mapping[str, str]], tuple[int, ...] | None]) -> bool:
     """Whether a CUDA process of environment `env` graphs no command (`ungraph_multi_gpu`): its XLA_FLAGS
-    name no commands to graph, and it drives more than one GPU, those CUDA_VISIBLE_DEVICES lists where set,
-    else those `listed` counts (nvidia-smi's; None uncounted)."""
+    name no commands to graph, and it may open more than one GPU, those `opens` counts as its restriction
+    already stands (`dew._pool.local_gpus`: its CUDA_VISIBLE_DEVICES, else every GPU its driver counts; None
+    uncounted). A place a pool would pin it to (`dew launch`'s JAX_LOCAL_DEVICE_IDS, a Slurm task's local
+    rank) narrows nothing: the process takes it only where it joins its pool, which a one-task Slurm step and
+    a run stating `multi_host=False` do not, and a process that opens two GPUs alone hung (row 12761's
+    review)."""
     if _flag(env.get("XLA_FLAGS", ""), "xla_gpu_enable_command_buffer") is not None:
         return False
-    visible = env.get("CUDA_VISIBLE_DEVICES")
-    gpus = visible_gpus(visible) if visible is not None else listed()
-    return gpus is not None and gpus > 1
+    gpus = opens(_pool.ALL_GPUS, env)
+    return gpus is not None and len(gpus) > 1
 
 
 def divide_exactly() -> None:

@@ -16,6 +16,7 @@ from dew.objectives.lm import LMObjective
 
 @pytest.mark.gpu(reason="a CPU-owned run's host companion and its accelerator are two meshes only on a GPU")
 @pytest.mark.compiles_at_run(reason="a LoRA run's save across its two meshes, no check-1 site")
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_cpu_owned_lora_run_saves_across_its_two_meshes(tmp_path):
     """A LoRA run whose variables the CPU owns holds its moving leaves on the host companion and its frozen
     base on the accelerator: its save's refusal of a non-finite state reads both, one program a placement,
