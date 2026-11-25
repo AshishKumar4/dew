@@ -1342,10 +1342,11 @@ def test_a_decode_step_with_output_hooks_compiles_spill_free(generation_name, st
         found = compile_mosaic_kernels([KernelCase(step, lambda: (call, operands))], generation_name)
     assert found and not (failed := mosaic_failures(found)), "\n".join(failed)
     if step == "split":
-        # A split plan certifies its split walk alone, no config of the one-slice launch it never runs.
-        walks = [name for record in found for certified in record.get("certifications", [])
+        # A split plan certifies its split walks alone (`_split` the last of a walk kernel's suffixes, a
+        # scaled or natural one's too), no config of the one-slice launch it never runs.
+        walks = [name.split("__")[0] for record in found for certified in record.get("certifications", [])
                  if certified["op"] == "MosaicForward" for name in certified["kernels"]]
-        assert walks and all(name.startswith("attention_forward_split") for name in walks), walks
+        assert walks and all(name.endswith("_split") for name in walks), walks
 
 
 def test_softcap_folds_into_base2_and_decode_segments_interior_tiles():

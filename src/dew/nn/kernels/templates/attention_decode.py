@@ -271,8 +271,13 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
                 return planned(certified, sliced_op, sliced_ba, slices)
     else:
         # The most slices whose programs keep the device's stream in flight at once (`MosaicForward.streamed`,
-        # at most those it holds), where the cost model prices no step of them.
-        found = streamed()
+        # at most those it holds), where the cost model prices no step of them: sized at its stateless walk's
+        # derived tile, uncertified as the priced path's are, a pin's or a pick's certified.
+        sizing_op, sizing_ba = _bound(query, key, value, spans, walked, scale=scale, table=table,
+                                      sources=sources, scales=scales, splits=1, chosen=chosen, in_key=in_key)
+        sizing = None if chosen_by_caller else sizing_op.remaining(sizing_ba)
+        found = (streamed() if sizing is None
+                 else (sizing_op.streaming(sizing_ba, sizing, target), sizing_op, sizing_ba))
         slices = 1 if found is None else max(1, min(
             processors * found[1].streamed(found[2], found[0], target) // programs, longest))
     # The sliced launch's own op, at its slices, certified (`_certified_stream`).
