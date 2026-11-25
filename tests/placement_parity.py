@@ -41,12 +41,16 @@ def floats(state) -> dict[str, np.ndarray]:
 def assert_same_leaf(mine, theirs, err_msg: str = "") -> None:
     """Two leaves alike to the bit: their dtypes first, a typed PRNG key's its implementation (two may print
     one tag, `rbg` and `unsafe_rbg`), then their words, a key's its key data
-    (`dew.algebra.terms.held_bits`), each apart, so neither stands for the other."""
+    (`dew.algebra.terms.held_bits`), word for word, so neither stands for the other: a zero's sign and a
+    NaN's payload apart too."""
     from dew.algebra.terms import held_bits
 
     (mine_dtype, mine_bits), (their_dtype, their_bits) = held_bits(mine), held_bits(theirs)
     assert mine_dtype == their_dtype, (err_msg, mine_dtype, their_dtype)
-    np.testing.assert_array_equal(mine_bits, their_bits, err_msg=err_msg)
+    if mine_bits.shape != their_bits.shape or mine_bits.tobytes() != their_bits.tobytes():
+        # The values that differ, where they do; where none does, the words still do (row 13061).
+        np.testing.assert_array_equal(mine_bits, their_bits, err_msg=err_msg)
+        raise AssertionError(f"{err_msg}: equal values held in other words (a zero's sign, a NaN's payload)")
 
 
 def layouts_agree(run, draw, label: str, layout, reference, seeds: int = LAYOUT_SEEDS):

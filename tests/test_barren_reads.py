@@ -464,6 +464,16 @@ def test_a_skewed_mix_of_whole_compressed_files_reads_in_its_workers_and_resumes
     data = compile(mix([corpus("heavy"), corpus("light")], [97.0, 3.0], seed=1).batch(1), read="streamed",
                    loading=loading)
     assert_resumes_where_it_stopped(lambda: data.train(DataPartition()), _batches, 4, 4)
+    # Each corpus's workers as a share's reader is built: of two shares, the heavy corpus's two files give
+    # each share's reader one worker of it, which the loader's explanation names (row 13060: it named one
+    # share's two for every run).
+    def heavy(partition: DataPartition) -> int:
+        (count,) = [stage.count for key, stage in data.reading.pools_of(partition).items() if "heavy" in key]
+        return count
+
+    halves = DataPartition(0, 2)
+    assert (heavy(DataPartition()), heavy(halves)) == (2, 1)
+    assert "share 0 of 2" in data.explain(halves)
 
 
 def test_a_streamed_weighted_mixture_read_in_loading_workers_reads():

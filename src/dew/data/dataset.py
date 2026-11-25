@@ -916,12 +916,13 @@ class Loader:
     """How its training read reads, as its compile chose and sized it (`explain`); None for data handed as it
     is read."""
 
-    def explain(self) -> str:
+    def explain(self, partition: DataPartition | None = None) -> str:
         """The training read as its compile lowered and sized it, a line a fact: its batch, its read and who
-        chose it, the workers and buffers it reads in and what automatic loading measured to size them, a
-        faster read its sources could take, and its plan's order, steps, derived facts and caches. It
-        renders what the compile recorded and reads nothing."""
-        return explained(self)
+        chose it, the workers and buffers it reads in, each corpus's as a reader of `partition`'s share builds
+        them (one share's where None, said so), and what automatic loading measured to size them, a faster
+        read its sources could take, and its plan's order, steps, derived facts and caches. It renders what
+        the compile recorded and reads nothing."""
+        return explained(self, partition)
 
     @property
     def each_token_batch(self) -> tuple[int | None, ...]:

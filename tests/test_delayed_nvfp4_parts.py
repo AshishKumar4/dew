@@ -134,6 +134,32 @@ def test_a_run_resumed_partway_through_a_held_update_rolls_what_its_taken_calls_
             legacy.place()
 
 
+def test_a_reference_an_earlier_dew_saved_resumes_with_a_fresh_starts_histories(tmp_path):
+    """A frozen reference's checkpoint an earlier Dew wrote, which kept no histories of the reference (its
+    average held none, row 13057), resumes: the reference reads a fresh start's histories, none recorded, as
+    its run began from an initialization, never the live ones its run rolled; one this Dew wrote restores its
+    own."""
+    from dew.checkpoints import Checkpoints
+
+    with generation.run_precision(DELAYED):
+        def run(name: str) -> Trainer:
+            return delayed_lm(1, Checkpoints(str(tmp_path / name)), ema_decay=1.0, objective=Referenced)
+
+        run("current").fit(data(), steps=2, checkpoint_every=2)
+        source = run("current")
+        state = source.stored(source.checkpoints.restore(source.place()[0], 2)[0])
+        legacy = Checkpoints(str(tmp_path / "legacy"))
+        legacy.save(2, dataclasses.replace(state, ema={key: value for key, value in state.ema.items()
+                                                       if key != NVFP4_HISTORY}))
+        legacy.wait()
+        resumed = run("legacy").place()[0]
+    for read, live in zip(jax.tree.leaves(resumed.averaged[NVFP4_HISTORY]), histories(resumed), strict=True):
+        assert not np.asarray(read).any() and live[..., 0].min() > 0, (read, live)
+    for read, kept in zip(jax.tree.leaves(state.ema[NVFP4_HISTORY]),
+                          jax.tree.leaves(source.place()[0].ema[NVFP4_HISTORY]), strict=True):
+        np.testing.assert_array_equal(np.asarray(read), np.asarray(kept))
+
+
 def test_a_ppo_steps_records_are_its_own_passes_its_critics_among_them():
     """A PPO objective draws its critic apart from its actor (`PPOObjective.init`), and the critic's draw
     keeps nothing its initializing pass recorded: a step's records are each part's own call's alone, one
