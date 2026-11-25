@@ -685,7 +685,19 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
         layouts = self._families(ba, target)
         if not layouts:
             return ba
-        family = layouts[0]
+        extents, grown = self._aligned_extents(ba, layouts[0], target, whole_tiles=whole_tiles)
+        if grown == extents:
+            return ba
+        padded = {name: _grown(value, dims, grown) for name, value, dims in self._padded_dims(ba)}
+        return type(ba)(ba.op, {**ba.arguments, **padded})
+
+    def _aligned_extents(self, ba, family: mosaic.Family, target, *,
+                         whole_tiles: bool = False) -> tuple[dict[str, int], dict[str, int]]:
+        """The call's depth and width (`_padded_extents`) and each as its launch runs it on `family`
+        (`_aligned`, the one decision `_aligned` pads by and a split's partials are sized by,
+        `MosaicGmm._slice_bytes`): in whole units of its tiles (`_whole_extents`), or as it is where the
+        launch runs its last step or column tile partial (`_partial_axes`, judged on the call's shapes, no
+        operand padded); `whole_tiles`, every axis whole. Chained products' depths run as bound."""
         extents, whole = self._whole_extents(ba, family)
         if ba.arguments.get('chained'):
             # Chained products meet at whole steps (`chained_refusal`): their depths run as bound, neither
@@ -693,15 +705,16 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
             # depth of 80 padded to 128 was derived on, and refused as bound).
             whole = {**whole, 'depth': extents['depth']}
         if whole == extents:
-            return ba
+            return extents, whole
+        def shaped(leaf):
+            return jax.ShapeDtypeStruct(leaf.shape, leaf.dtype) if isinstance(leaf, jax.Array) else leaf
+
+        shapes = type(ba)(ba.op, jax.tree.map(shaped, ba.arguments))
         depth_partial, width_partial = ((False, False) if whole_tiles
-                                        else self._partial_axes(ba, family, target))
+                                        else self._partial_axes(shapes, family, target))
         partial = {'depth': depth_partial, 'width': width_partial}
-        grown = {axis: extent if partial.get(axis) else whole[axis] for axis, extent in extents.items()}
-        if grown == extents:
-            return ba
-        padded = {name: _grown(value, dims, grown) for name, value, dims in self._padded_dims(ba)}
-        return type(ba)(ba.op, {**ba.arguments, **padded})
+        return extents, {axis: extent if partial.get(axis) else whole[axis]
+                         for axis, extent in extents.items()}
 
     def _whole_extents(self, ba, family: mosaic.Family) -> tuple[dict[str, int], dict[str, int]]:
         """The call's depth and width (`_padded_extents`) and each in whole units of `family`'s tiles, as
@@ -1088,12 +1101,11 @@ class MosaicGmm(_Mosaic):
         rows = ba.arguments['tokens'].shape[0] if gather is None else gather.shape[0]
         width = ba.arguments['kernel'].shape[1 if ba.arguments['trans_rhs'] else 2]
         if layouts := self._families(ba, target):
-            # The width `_aligned` launches: its whole column units, or as it is where it runs its last
-            # column tile partial (`_partial_axes`).
-            extents, whole = self._whole_extents(ba, layouts[0])
-            if 'width' in whole:
-                partial = whole != extents and self._partial_axes(ba, layouts[0], target)[1]
-                width = extents['width'] if partial else whole['width']
+            width = self._aligned_extents(ba, layouts[0], target)[1].get('width', width)
+        if ba.arguments.get('scatter') is not None and not config.swapped:
+            # A scattered launch declares its partials at the product's rows, unwalked
+            # (`mosaic_gpu._declared`'s `stored`).
+            return rows * width * 4
         unswapped = dataclasses.replace(config, swapped=False)
         family = pricing.family_of(unswapped, dtype, target)
         unit = mosaic_gpu.row_unit(family, dtype)
