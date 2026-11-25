@@ -230,8 +230,11 @@ class Loop:
     output is (`CausalTransformer.exit_states`: under attention residuals
     the depth state collapsed through the output site), so a threshold's
     pass runs the coda once, on the states it selects (`'block'`), each
-    token's coda reading its prefix's own selected states; a loss that
-    weighs every pass still runs each pass's coda for its head. `exit_by`
+    token's coda reading its prefix's own selected states: by token, a
+    prefix of mixed passes, which a coda trained on one pass's states at a
+    time (a loss weighing each pass's exit through its coda) has not seen
+    unless trained so; a loss that weighs every pass still runs each pass's
+    coda for its head. `exit_by`
     pools it: each token's own hazard, causal (`'token'`), or one a row, the
     gate of the row's exit states' mean over its real tokens
     (`AttentionMetadata.valid`), every token of the row exiting at its pass

@@ -192,12 +192,17 @@ def _check_reads(model: nn.Module) -> None:
     """Refuse a model next-token scoring cannot read.
 
     A state may see only the tokens up to its own, so a model that says its
-    states attend both ways (`TokenModel`) is refused. The loss scores the
+    states attend both ways (`TokenModel`) is refused, and so is a loop whose
+    row's exit pools its tokens (`Loop.exit_by='row'`). The loss scores the
     final states through the head (`chunked.reads_states`), or else the
     logits a model gives from its tokens (`Logits`).
     """
     if isinstance(model, TokenModel) and not model.causal:
         raise Lacks("causal", "LMObjective requires a causal model for next-token likelihoods")
+    loop = model.loop if isinstance(model, Looped) else None
+    if loop is not None and loop.exit_gate and loop.exit_by == "row":
+        raise ValueError("a row's exit pools its later tokens into its earlier tokens' passes, and an LM "
+                         "scores each token causally: exit by token (Loop.exit_by='token')")
     refuse_without_logits(model, "LMObjective")
 
 
@@ -812,12 +817,8 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         pass weights that weigh a pass before the last (`PassWeights.over`)."""
         if not isinstance(model, Looped) or model.loop is None:
             return False
-        reads = self.exit_entropy is not None or (
+        return self.exit_entropy is not None or (
             self.pass_weights is not None and self.pass_weights.over(model.loop.steps) is not None)
-        if reads and model.loop.exit_by == "row":
-            raise ValueError("a row's exit pools its later tokens into its earlier tokens' passes, and an LM "
-                             "scores each token causally: exit by token (Loop.exit_by='token')")
-        return reads
 
     def _prediction_rows(self, model: CountedPredictions,
                           batch: Batch) -> list[tuple[np.ndarray, np.ndarray]]:

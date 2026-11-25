@@ -188,11 +188,11 @@ def _tokens_exiting(**loop) -> CausalTransformer:
 @attending("reference")
 @pytest.mark.parametrize(("bias", "site"), [(30.0, "first pass"), (-30.0, "last pass")])
 def test_a_shared_cache_decodes_each_token_at_its_exiting_pass(bias, site):
-    """The loop decoding a token a call under a cache its passes share (`Loop.shared_cache`), its gate on
-    the block's output exiting each token, a row's cache its token's exiting pass's writes and the coda's
-    its one run's (row 12928): a gate certain to exit decodes what the decoder looping once does, and one
-    that never exits what the loop running every pass without a threshold does (check 1, each against its
-    own in float64)."""
+    """The loop decoding ten tokens in sequence, a token a call, under a cache its passes share
+    (`Loop.shared_cache`), its gate on the block's output exiting each token, a row's cache its token's
+    exiting pass's writes and the coda's its one run's (row 12928): a gate certain to exit decodes what the
+    decoder looping once does, and one that never exits what the loop running every pass without a
+    threshold does (check 1, each against its own in float64)."""
     looped = _tokens_exiting(shared_cache=True)
     reference = (looped.clone(loop=dataclasses.replace(looped.loop, steps=1)) if bias > 0
                  else looped.clone(loop=dataclasses.replace(looped.loop, exit_threshold=None)))
@@ -240,18 +240,16 @@ def test_a_packed_documents_exit_and_output_read_no_neighbour():
 
 def test_a_rows_exit_is_refused_where_a_token_is_scored_causally():
     """A row's exit gate pools the row's tokens, its later ones deciding its earlier ones' passes: an LM
-    loss that reads each pass's exit refuses it, and so does decode (its row the tokens so far); a row's
-    gate without a gate, refused as any gate placement is."""
-    from dew.batch import TEXT_KEY
-    from dew.objectives.base import Step
+    objective refuses it, whether or not its loss reads each pass's exit (its threshold's evaluation leaks
+    alike), and so does decode (its row the tokens so far); a row's gate without a gate, refused as any gate
+    placement is."""
     from dew.objectives.lm import LMObjective
 
     rows = _rows_exiting()
     variables, ids = model_draw(rows, (2, 13), rows.vocab_size)(0)
-    objective = LMObjective(rows, 12, exit_entropy=0.25, token_accuracy=False)
-    step = Step(step=jnp.asarray(0), key=jax.random.key(0), ema=None)
-    with pytest.raises(ValueError):
-        objective.loss(variables, {TEXT_KEY: ids}, step)
+    for exit_entropy in (None, 0.25):
+        with pytest.raises(ValueError):
+            LMObjective(rows, 12, exit_entropy=exit_entropy, token_accuracy=False)
     made, decode = decode_steps(rows)
     with pytest.raises(ValueError):
         decode(variables, made(variables, 2), ids[:, :1])
