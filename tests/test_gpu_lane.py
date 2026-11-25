@@ -389,6 +389,13 @@ def test_a_cell_its_prepares_cap_left_is_named_and_counted_but_reds_no_row(ci):
     red = graded([capped, lowered])
     assert (red["exitCode"], red["new_unprepared"]) == (1, [ci.prepares.identity(lowered)])
     assert graded([named])["new_unprepared"] == [ci.prepares.identity(named)]
+    # A test main's run left at its cap was never tried there: this run's cells of it red nothing, a cell of
+    # another test still does, and a node id merely holding the cap's words is no capped test.
+    other = {"test": "tests/test_gpu_vae.py::test_other", "where": "cell one", "error": "lowered"}
+    assert graded([lowered], before={ci.prepares.identity(capped)})["exitCode"] == 0
+    assert graded([lowered, other], before={ci.prepares.identity(capped)})["new_unprepared"] == [
+        ci.prepares.identity(other)]
+    assert graded([lowered], before={ci.prepares.identity(named)})["exitCode"] == 1
 
 
 @pytest.mark.parametrize("capped", [False, True])
