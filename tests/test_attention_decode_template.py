@@ -1067,6 +1067,26 @@ def test_a_decode_step_of_no_split_is_priced_at_its_keys_reads():
     assert fallback.device_bytes >= 2 * keys * kv_heads * width * jnp.dtype(jnp.bfloat16).itemsize
 
 
+def test_a_g4s_one_row_decode_fills_its_multiprocessors_past_two_slices():
+    """One row of one query, 32 heads over 8 key heads 64 wide in bf16, over 32768 keys on an RTX PRO 6000
+    (188 multiprocessors, no issue interval stated): its walk splits into more than two slices, its eight
+    key heads' programs filling the device, where a walk priced at its bytes alone (level over every slice
+    count) planned two, 16 programs, 281 of a step's 288 us (M-NA-35-decodec-g4)."""
+    target = generation.gpu_target("NVIDIA RTX PRO 6000 Blackwell Server Edition")
+    query = jax.ShapeDtypeStruct((1, 1, 32, 64), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, 32768, 8, 64), jnp.bfloat16)
+    found = {}
+
+    def plan(query, key):
+        found["work"] = attention_decode.planned(query, key, key, attention_decode.key_spans(1, 32768, 1),
+                                                 template.Hooks())[0]
+        return query
+
+    with generation.assumed(target):
+        jax.make_jaxpr(plan)(query, key)
+    assert found["work"]["plain"].slices > 2, found["work"]
+
+
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("width", [128, 256])
 @pytest.mark.parametrize("generation_name", ["sm80", "sm90", "sm100", "sm120"])

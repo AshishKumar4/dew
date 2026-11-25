@@ -764,7 +764,13 @@ class MosaicForward(_Mainloop[Tiles]):
         which traces none) prices, and chooses, as its live call does. A heuristic proxy of the live call's
         price, not that price less a common cost: a score hook's work scales with each candidate's entries
         alike, but its absence can change the surrogate's own schedule (an output hook's rewalk in place, a
-        transcendental hook's approximate math)."""
+        transcendental hook's approximate math). None with `issued` where `target` states no issue
+        interval: its walk's latency unpriced, its price its bytes' alone, level over every slice count (a
+        G4's decode planned 2 slices, 16 of its 188 multiprocessors, 281 of a step's 288 us,
+        M-NA-35-decodec-g4)."""
+        multiprocessor = target.architecture.multiprocessor
+        if issued and (multiprocessor is None or multiprocessor.issue_interval is None):
+            return None
         hooks = ("score_params", "output_params", "query_params")
         names = ("query", "key", "value", "start", "end", "query_ids", "key_ids", "score_params",
                  "output_params", "initial", "drop", "table", "sources", "scales", "query_params")
