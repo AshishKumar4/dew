@@ -423,11 +423,13 @@ def _m_wmean(tag: String, ref: Term, values: Term, weight: Term, axes: Vec[i64],
 def _m_mmean(tag: String, ref: Term, values: Term, mask: Term, z: Term, axes: Vec[i64], p: i64,
              lift_x: i64, fill_x: i64) -> Term: ...
 @function
-def _m_wcov_raw(ref: Term, dx: Term, dy_s: Term, sc_x: Term, weight: Term, axes: Vec[i64], p: i64,
+def _m_wcov_raw(ref: Term, dx: Term, dy_s: Term, weight: Term, axes: Vec[i64], p: i64,
                 lift_x: i64, fill_x: i64) -> Term: ...
 @function
-def _m_wcov_term(ref: Term, big_d: Term, small_d: Term, sc_x: Term, weight: Term, axes: Vec[i64], p: i64,
+def _m_wcov_term(ref: Term, big_d: Term, small_d: Term, weight: Term, axes: Vec[i64], p: i64,
                  lift_x: i64, fill_x: i64) -> Term: ...
+@function
+def _m_wcov_hi(dx: Term, dy_s: Term, sc_x: Term, weight: Term, axes: Vec[i64], p: i64) -> Term: ...
 @function
 def _m_wcov_tile(tag: String, ref: Term, x: Term, y: Term, weight: Term, axes: Vec[i64], p: i64,
                  lift_x: i64, fill_x: i64, sign: i64) -> Term: ...
@@ -445,7 +447,7 @@ MOMENT_SSA = (
     _m_combine_zero_u, _m_combine_u, _m_combine_u_body, _m_combine_base, _m_combine_corr,
     _m_combine_corr_body, _m_combine_s, _m_combine_hi, _m_combine_zero_c, _m_combine_one_c, _m_combine_c,
     _m_finish_u, _m_finish_c, _m_wcov_ovf, _m_wcov_scale, _m_safe_x, _m_wmul_first, _m_wmean, _m_mmean,
-    _m_wcov_raw, _m_wcov_term, _m_wcov_tile, _m_mcov_raw, _m_mcov_tile,
+    _m_wcov_raw, _m_wcov_term, _m_wcov_hi, _m_wcov_tile, _m_mcov_raw, _m_mcov_tile,
 )
 
 
@@ -702,6 +704,21 @@ def _moment_tile_consts(
     return axes, lift_x, fill_x, consts, tile, pos, fill_bind, lit_binds
 
 
+def _moment_pair_ovf(
+    ab: Term, as_: Term, one: Term, half: Term, qmax: Term, fmax: Term, ops: dict[str, i64],
+    factor: Term | None = None,
+) -> Term:
+    """Overflow predicate `|a * b| > 0.375 * finfo.max` (scaled by `factor` where halved) from `ab >= as_`."""
+    thresh = half.binary(String("mul"), fmax.binary(String("sub"), qmax, ops["sub"]), ops["mul"])
+    if factor is not None:
+        thresh = thresh.binary(String("mul"), factor, ops["mul"])
+    return ab.compare(String("gt"), one, ops["gt"]).binary(
+        String("and"),
+        as_.compare(String("gt"), thresh.binary(
+            String("div"), ab.binary(String("max"), one, ops["max"]), ops["div"]), ops["gt"]),
+        ops["and"])
+
+
 def _need(table: dict[str, tuple], *names: str) -> tuple:
     return tuple(clause for name in names for clause in table[name])
 
@@ -858,7 +875,7 @@ def _moment_ssa_anchor_rules(ops: dict[str, i64], binds: dict[str, tuple]) -> li
     axes = var("axes", Vec[i64])
     p_min, p_max = vars_("p_min p_max", i64)
     _, consts, fill_bind, lit_binds = _moment_ref_consts(ref)
-    zero_n, one_n, qmax_n = consts["zero"], consts["one"], consts["qmax"]
+    zero_n, one_n, half_n, qmax_n = consts["zero"], consts["one"], consts["half"], consts["qmax"]
     fmax_n, sqmax_n = consts["fmax"], consts["sqmax"]
     seen0 = fmax_n.compare(String("ge"), a0.unary(String("abs"), ops["abs"]), ops["ge"])
     seen1 = fmax_n.compare(String("ge"), a1.unary(String("abs"), ops["abs"]), ops["ge"])
@@ -871,27 +888,27 @@ def _moment_ssa_anchor_rules(ops: dict[str, i64], binds: dict[str, tuple]) -> li
     x_ge_y = adx.compare(String("ge"), ady, ops["ge"])
     dbig, dsml = x_ge_y.select(dy, dx), x_ge_y.select(dx, dy)
     ab, as_ = x_ge_y.select(ady, adx), x_ge_y.select(adx, ady)
-    ovf_p = ab.compare(String("gt"), one_n, ops["gt"]).binary(
-        String("and"),
-        as_.compare(String("gt"), qmax_n.binary(String("div"), ab.binary(String("max"), one_n, ops["max"]),
-                                                ops["div"]), ops["gt"]), ops["and"])
-    hi_dy = ady.compare(String("gt"), sqmax_n, ops["gt"])
-    hi_dx = adx.compare(String("gt"), sqmax_n, ops["gt"])
+    ovf_p = _moment_pair_ovf(ab, as_, one_n, half_n, qmax_n, fmax_n, ops)
+    hi_dy = ovf_p.binary(String("or"), ady.compare(String("gt"), sqmax_n, ops["gt"]), ops["or"])
+    hi_dx = ovf_p.binary(String("or"), adx.compare(String("gt"), sqmax_n, ops["gt"]), ops["or"])
     need_sc = ab.compare(String("gt"), sqmax_n, ops["gt"]).binary(String("or"), ovf_p, ops["or"])
-    tsh_p = ovf_p.select(n, zero_n).binary(String("mul"), ovf_p.select(dx, zero_n), ops["mul"]).binary(
-        String("mul"), ovf_p.select(dy, zero_n), ops["mul"])
+    tsh_p = ovf_p.select(n, zero_n).binary(String("mul"), ovf_p.select(dbig, zero_n), ops["mul"]).binary(
+        String("mul"), ovf_p.select(dsml, zero_n), ops["mul"])
     tux_p = hi_dy.select(dy, zero_n).binary(String("mul"), hi_dy.select(ux, zero_n), ops["mul"])
     tuy_p = hi_dx.select(dx, zero_n).binary(String("mul"), hi_dx.select(uy, zero_n), ops["mul"])
     plain_sum = tsh_p.binary(String("add"), tux_p, ops["add"]).binary(String("add"), tuy_p, ops["add"])
     tc = hi.binary(String("mul"), sc.binary(String("div"), scale_out, ops["div"]), ops["mul"])
+    # Balance `(dbig / scale_out) * dsml` before multiplying by `n` so high-band shifts keep `> 0.375` range.
     tsh_h = ovf_p.select(zero_n, n).binary(
-        String("mul"), dbig.binary(String("div"), scale_out, ops["div"]), ops["mul"]).binary(
-        String("mul"), dsml, ops["mul"])
+        String("mul"),
+        dbig.binary(String("div"), scale_out, ops["div"]).binary(String("mul"), dsml, ops["mul"]),
+        ops["mul"])
     tux_h = hi_dy.select(zero_n, dy).binary(String("div"), scale_out, ops["div"]).binary(
         String("mul"), ux, ops["mul"])
     tuy_h = hi_dx.select(zero_n, dx).binary(String("div"), scale_out, ops["div"]).binary(
         String("mul"), uy, ops["mul"])
     hi_sum = tsh_h.binary(String("add"), tux_h, ops["add"]).binary(String("add"), tuy_h, ops["add"])
+    s_ops = ("abs", "ge", "gt", "and", "or", "max", "add", "sub", "mul", "div")
     made = [
         rewrite(_m_zero_anchor(ref, a0, a1)).to(
             seen0.select(a1, seen1.select(a0, z_both)),
@@ -900,19 +917,19 @@ def _moment_ssa_anchor_rules(ops: dict[str, i64], binds: dict[str, tuple]) -> li
             z_tile, *fill_bind, *lit_binds["zero"], *_need(binds, "min", "max"),
             eq(p_min).to(reduce_min_on(axes)), eq(p_max).to(reduce_max_on(axes))),
         rewrite(_m_pair_scale(ref, dx, dy)).to(
-            need_sc.select(one_n, ab), *fill_bind, *_need(lit_binds, "one", "qmax", "sqmax"),
-            *_need(binds, "abs", "ge", "gt", "and", "or", "max", "div")),
+            need_sc.select(one_n, ab), *fill_bind, *_need(lit_binds, "one", "half", "qmax", "fmax", "sqmax"),
+            *_need(binds, "abs", "ge", "gt", "and", "or", "max", "sub", "mul", "div")),
     ]
     for sign_i, op in ((1, "add"), (-1, "sub")):
-        s_ops = ("abs", "ge", "gt", "and", "max", "add", "mul", "div") if sign_i == 1 else (
-            "abs", "ge", "gt", "and", "max", "add", "sub", "mul", "div")
         made += [
             rewrite(_m_shift_plain(ref, c, n, dx, dy, ux, uy, i64(sign_i))).to(
                 c.binary(String(op), plain_sum, ops[op]),
-                *fill_bind, *_need(lit_binds, "zero", "one", "qmax", "sqmax"), *_need(binds, *s_ops)),
+                *fill_bind, *_need(lit_binds, "zero", "one", "half", "qmax", "fmax", "sqmax"),
+                *_need(binds, *s_ops)),
             rewrite(_m_shift_hi(ref, hi, sc, n, dx, dy, ux, uy, scale_out, i64(sign_i))).to(
                 tc.binary(String(op), hi_sum, ops[op]),
-                *fill_bind, *_need(lit_binds, "zero", "one", "qmax", "sqmax"), *_need(binds, *s_ops)),
+                *fill_bind, *_need(lit_binds, "zero", "one", "half", "qmax", "fmax", "sqmax"),
+                *_need(binds, *s_ops)),
         ]
     return made
 
@@ -989,6 +1006,7 @@ def _moment_ssa_combine_one_c_rules(ops: dict[str, i64], binds: dict[str, tuple]
     dx_eff, bx, dy_eff, by, drop_ux, drop_uy = vars_("dx_eff bx dy_eff by drop_ux drop_uy", Term)
     _, consts, fill_bind, lit_binds = _moment_ref_consts(ref)
     zero_n, one_n, half_n, qmax_n = consts["zero"], consts["one"], consts["half"], consts["qmax"]
+    fmax_n, sqmax_n = consts["fmax"], consts["sqmax"]
     _, small_s, smax_hi, smax_lo, n_hi, n_lo = _moment_one_side_scale(
         either, both, safe_max, n_drop, zero_n, one_n, ops)
 
@@ -1006,43 +1024,60 @@ def _moment_ssa_combine_one_c_rules(ops: dict[str, i64], binds: dict[str, tuple]
     adx, ady = dx_eff.unary(String("abs"), ops["abs"]), dy_eff.unary(String("abs"), ops["abs"])
     x_ge_y = adx.compare(String("ge"), ady, ops["ge"])
     d_big, d_sml = x_ge_y.select(dy_eff, dx_eff), x_ge_y.select(dx_eff, dy_eff)
+    ab, as_ = x_ge_y.select(ady, adx), x_ge_y.select(adx, ady)
+    h_x, h_y = bx.select(one_n, half_n), by.select(one_n, half_n)
+    ovf_sh = _moment_pair_ovf(ab, as_, one_n, half_n, qmax_n, fmax_n, ops,
+                              h_x.binary(String("mul"), h_y, ops["mul"]))
+    hi_dy = ovf_sh.binary(String("or"), by.binary(
+        String("or"), ady.compare(String("gt"), sqmax_n, ops["gt"]), ops["or"]), ops["or"])
+    hi_dx = ovf_sh.binary(String("or"), bx.binary(
+        String("or"), adx.compare(String("gt"), sqmax_n, ops["gt"]), ops["or"]), ops["or"])
+    sh_plain = _m_double_if(by, _m_double_if(bx, _m_prod_div(
+        zero_n, one_n, ovf_sh.select(n_in, zero_n).binary(String("mul"), d_big, ops["mul"]), d_sml, smax_hi)))
+    ux_plain = _m_prod_div(zero_n, one_n, hi_dy.select(ux_in, zero_n), dy_eff, smax_hi)
+    uy_plain = _m_prod_div(zero_n, one_n, hi_dx.select(uy_in, zero_n), dx_eff, smax_hi)
+    plain_pos = c_plain_out.binary(String("sub"), ux_plain, ops["sub"]).binary(
+        String("add"), sh_plain.binary(String("sub"), uy_plain, ops["sub"]), ops["add"])
+    plain_neg = c_plain_out.binary(String("add"), ux_plain, ops["add"]).binary(
+        String("add"), uy_plain.binary(String("sub"), sh_plain, ops["sub"]), ops["add"])
     sc_1 = s_drop.binary(String("max"), _m_pair_scale(ref, dx_eff, dy_eff), ops["max"])
     qtr_n = half_n.binary(String("mul"), half_n, ops["mul"])
     k_pad = sc_1.compare(String("gt"), qmax_n, ops["gt"]).select(one_n, qtr_n)
-    h_x, h_y = bx.select(one_n, half_n), by.select(one_n, half_n)
     k_c = k_pad.binary(String("mul"), h_x, ops["mul"]).binary(String("mul"), h_y, ops["mul"])
     k_ux, k_uy = k_pad.binary(String("mul"), h_x, ops["mul"]), k_pad.binary(String("mul"), h_y, ops["mul"])
     term_hi = hi_in.binary(String("mul"), s_drop.binary(String("mul"), k_c, ops["mul"]).binary(
         String("div"), sc_1, ops["div"]), ops["mul"])
-    term_shift = n_in.binary(String("mul"), d_big.binary(String("mul"), k_pad, ops["mul"]).binary(
-        String("div"), sc_1, ops["div"]), ops["mul"]).binary(String("mul"), d_sml, ops["mul"])
+    term_shift = ovf_sh.select(zero_n, n_in).binary(
+        String("mul"),
+        d_big.binary(String("mul"), k_pad, ops["mul"]).binary(String("div"), sc_1, ops["div"]).binary(
+            String("mul"), d_sml, ops["mul"]), ops["mul"])
     dy_pad = dy_eff.binary(String("mul"), k_ux, ops["mul"])
     dx_pad = dx_eff.binary(String("mul"), k_uy, ops["mul"])
     big_dy = ady.binary(String("mul"), k_ux, ops["mul"]).compare(String("gt"), one_n, ops["gt"])
     big_dx = adx.binary(String("mul"), k_uy, ops["mul"]).compare(String("gt"), one_n, ops["gt"])
+    ux_hi, uy_hi = hi_dy.select(zero_n, ux_in), hi_dx.select(zero_n, uy_in)
     term_ux = big_dy.select(
-        ux_in.binary(String("div"), sc_1, ops["div"]).binary(String("mul"), dy_pad, ops["mul"]),
-        dy_pad.binary(String("div"), sc_1, ops["div"]).binary(String("mul"), ux_in, ops["mul"]))
+        ux_hi.binary(String("div"), sc_1, ops["div"]).binary(String("mul"), dy_pad, ops["mul"]),
+        dy_pad.binary(String("div"), sc_1, ops["div"]).binary(String("mul"), ux_hi, ops["mul"]))
     term_uy = big_dx.select(
-        uy_in.binary(String("div"), sc_1, ops["div"]).binary(String("mul"), dx_pad, ops["mul"]),
-        dx_pad.binary(String("div"), sc_1, ops["div"]).binary(String("mul"), uy_in, ops["mul"]))
-    # Plain zero-mass band bypasses `sc_1` completely so large shifts never underflow small terms; the
-    # scaled band cancels against shift/cross terms before unscaling.
+        uy_hi.binary(String("div"), sc_1, ops["div"]).binary(String("mul"), dx_pad, ops["mul"]),
+        dx_pad.binary(String("div"), sc_1, ops["div"]).binary(String("mul"), uy_hi, ops["mul"]))
+    # Plain band and safe shifts/cross terms bypass `sc_1`; overflowing terms cancel before unscaling.
     num_pos = term_hi.binary(String("sub"), term_ux, ops["sub"]).binary(
         String("add"), term_shift.binary(String("sub"), term_uy, ops["sub"]), ops["add"])
     num_neg = term_hi.binary(String("add"), term_ux, ops["add"]).binary(
         String("add"), term_uy.binary(String("sub"), term_shift, ops["sub"]), ops["add"])
-    one_ops = ("abs", "ge", "gt", "max", "add", "sub", "mul", "div")
+    one_ops = ("abs", "ge", "gt", "and", "or", "max", "add", "sub", "mul", "div")
     made = []
-    for sign_i, num_s in ((1, num_pos), (-1, num_neg)):
+    for sign_i, plain_s, num_s in ((1, plain_pos, num_pos), (-1, plain_neg, num_neg)):
         unscaled = _m_double_if(by, _m_double_if(bx, num_s.binary(String("div"), k_pad, ops["div"]))).binary(
             String("div"), smax_hi, ops["div"]).binary(String("mul"), sc_1, ops["mul"])
         c_one_rhs = p_kept.binary(String("mul"), ck_v, ops["mul"]).binary(
-            String("add"), c_plain_out.binary(String("add"), unscaled, ops["add"]), ops["add"])
+            String("add"), plain_s.binary(String("add"), unscaled, ops["add"]), ops["add"])
         made.append(rewrite(_m_combine_one_c(
             ref, either, both, safe_max, ck_v, cd_v, hi_drop, s_drop, p_kept, n_drop, dx_eff, bx, dy_eff,
             by, drop_ux, drop_uy, i64(sign_i))).to(
-            c_one_rhs, *fill_bind, *_need(lit_binds, "zero", "one", "half", "qmax"),
+            c_one_rhs, *fill_bind, *_need(lit_binds, "zero", "one", "half", "qmax", "fmax", "sqmax"),
             *_need(binds, *one_ops)))
     return made
 
@@ -1228,7 +1263,8 @@ def _moment_ssa_tile_scale_rules(ops: dict[str, i64], binds: dict[str, tuple]) -
     ref, x, y = vars_("ref x y", Term)
     p_max = var("p_max", i64)
     axes, lift_x, fill_x, consts, tile, pos, fill_bind, lit_binds = _moment_tile_consts(ref, ops)
-    one_n, one_x, qmax_x = consts["one"], tile["one"], tile["qmax"]
+    one_n, one_x, half_x = consts["one"], tile["one"], tile["half"]
+    qmax_x, fmax_x = tile["qmax"], tile["fmax"]
     dx_z = x.binary(String("sub"), _m_tile_anchor(ref, x, axes).shaped(String("broadcast_in_dim"), lift_x),
                     ops["sub"])
     dy_z = y.binary(String("sub"), _m_tile_anchor(ref, y, axes).shaped(String("broadcast_in_dim"), lift_x),
@@ -1236,17 +1272,13 @@ def _moment_ssa_tile_scale_rules(ops: dict[str, i64], binds: dict[str, tuple]) -
     ax_el, ay_el = dx_z.unary(String("abs"), ops["abs"]), dy_z.unary(String("abs"), ops["abs"])
     big_el = ax_el.binary(String("max"), ay_el, ops["max"])
     sml_el = ax_el.binary(String("min"), ay_el, ops["min"])
-    ovf_el = big_el.compare(String("gt"), one_x, ops["gt"]).binary(
-        String("and"),
-        sml_el.compare(String("gt"), qmax_x.binary(String("div"), big_el.binary(String("max"), one_x,
-                                                                                ops["max"]), ops["div"]),
-                       ops["gt"]), ops["and"])
+    ovf_el = _moment_pair_ovf(big_el, sml_el, one_x, half_x, qmax_x, fmax_x, ops)
     sc_raw = _m_wcov_ovf(ref, x, y, axes, lift_x, fill_x).select(one_x, big_el).reduce(
         String("max"), axes, p_max)
     return [
         rewrite(_m_wcov_ovf(ref, x, y, axes, lift_x, fill_x)).to(
-            ovf_el, *_need(lit_binds, "one", "qmax"),
-            *_need(binds, "sub", "abs", "max", "min", "gt", "and", "div")),
+            ovf_el, *_need(lit_binds, "one", "half", "qmax", "fmax"),
+            *_need(binds, "sub", "abs", "max", "min", "gt", "and", "mul", "div")),
         rewrite(_m_wcov_scale(ref, x, y, axes, lift_x, fill_x)).to(
             pos.select(sc_raw, one_n), *fill_bind, *_need(lit_binds, "zero", "one"),
             *_need(binds, "sub", "abs", "max", "gt"), eq(p_max).to(reduce_max_on(axes))),
@@ -1274,10 +1306,13 @@ def _moment_ssa_tile_rules(ops: dict[str, i64], binds: dict[str, tuple]) -> list
     ay_m = _m_mmean(String("avg"), ref, y, mask, z, axes, p, lift_x, fill_x)
     x_ge_y = dx.unary(String("abs"), ops["abs"]).compare(
         String("ge"), dy_s.unary(String("abs"), ops["abs"]), ops["ge"])
-    big_s = big_d.binary(String("div"), sc_x, ops["div"])
-    t1_w = mf.select(zero_x, w).binary(String("mul"), big_s, ops["mul"])
+    t1_w = mf.select(zero_x, w).binary(String("mul"), big_d, ops["mul"])
     arm_mf_c = _m_prod_div(zero_x, one_x, t1_w, small_d, mf.select(one_x, safe_x))
-    arm_df_c = pw_w.binary(String("mul"), big_s, ops["mul"]).binary(String("mul"), small_d, ops["mul"])
+    arm_df_c = pw_w.binary(String("mul"), big_d, ops["mul"]).binary(String("mul"), small_d, ops["mul"])
+    # High-band tile elements satisfy `|dx * dy| > 0.375 * finfo.max`, so `(big / sc) * small` stays in
+    # `(0.375, finfo.max]` and never underflows small weight tangents before `finish` unscales.
+    prod_hi = x_ge_y.select(dy_s, dx).binary(String("div"), sc_x, ops["div"]).binary(
+        String("mul"), x_ge_y.select(dx, dy_s), ops["mul"])
     made = [
         rewrite(_m_safe_x(ref, lift_x)).to(
             pos.select(one_n, ref).shaped(String("broadcast_in_dim"), lift_x),
@@ -1306,13 +1341,15 @@ def _moment_ssa_tile_rules(ops: dict[str, i64], binds: dict[str, tuple]) -> list
                 z, x.binary(String("sub"), ax_m.shaped(String("broadcast_in_dim"), lift_x), ops["sub"])),
                 ops["mul"]).reduce(String("sum"), axes, p),
             *_need(lit_binds, "zero", "one"), *_need(binds, "div", "mul", "sub")),
-        rewrite(_m_wcov_raw(ref, dx, dy_s, sc_x, w, axes, p, lift_x, fill_x)).to(
-            _m_wcov_term(ref, x_ge_y.select(dy_s, dx), x_ge_y.select(dx, dy_s), sc_x, w, axes, p, lift_x,
-                         fill_x),
+        rewrite(_m_wcov_raw(ref, dx, dy_s, w, axes, p, lift_x, fill_x)).to(
+            _m_wcov_term(ref, x_ge_y.select(dy_s, dx), x_ge_y.select(dx, dy_s), w, axes, p, lift_x, fill_x),
             *_need(binds, "abs", "ge")),
-        rewrite(_m_wcov_term(ref, big_d, small_d, sc_x, w, axes, p, lift_x, fill_x)).to(
+        rewrite(_m_wcov_term(ref, big_d, small_d, w, axes, p, lift_x, fill_x)).to(
             mf.select(arm_df_c, arm_mf_c).reduce(String("sum"), axes, p),
             *_need(lit_binds, "zero", "one"), *_need(binds, "mul", "div")),
+        rewrite(_m_wcov_hi(dx, dy_s, sc_x, w, axes, p)).to(
+            w.binary(String("mul"), prod_hi, ops["mul"]).reduce(String("sum"), axes, p),
+            *_need(binds, "abs", "ge", "div", "mul")),
         rewrite(_m_mcov_raw(ref, dx, dy_s, mask, axes, p, lift_x, fill_x)).to(
             pw_m.binary(String("mul"), x_ge_y.select(dy_s, dx), ops["mul"]).binary(
                 String("mul"), x_ge_y.select(dx, dy_s), ops["mul"]).reduce(String("sum"), axes, p),
@@ -1336,13 +1373,14 @@ def _moment_ssa_tile_rules(ops: dict[str, i64], binds: dict[str, tuple]) -> list
             String("sub"), y, ops["sub"])
         dy_m = mask.select(z, y.binary(String("sub"), ay_ml, ops["sub"]) if sign_i == 1 else
                            ay_ml.binary(String("sub"), y, ops["sub"]))
+        dy_hi = pos_x.select(ovf_x.select(zero_x, dy_w), zero_x)
         made += [
             rewrite(_m_wcov_tile(String("plain"), ref, x, y, w, axes, p, lift_x, fill_x, i64(sign_i))).to(
-                _m_wcov_raw(ref, dx_plain, dy_w, one_x, w, axes, p, lift_x, fill_x).binary(
+                _m_wcov_raw(ref, dx_plain, dy_w, w, axes, p, lift_x, fill_x).binary(
                     String(op), corr_w, ops[op]),
-                *fill_bind, *_need(lit_binds, "zero", "one"), *_need(binds, "gt", "sub", "mul", op)),
+                *fill_bind, *lit_binds["zero"], *_need(binds, "gt", "sub", "mul", op)),
             rewrite(_m_wcov_tile(String("hi"), ref, x, y, w, axes, p, lift_x, fill_x, i64(sign_i))).to(
-                pos.select(_m_wcov_raw(ref, dx_hi, dy_w, sc_tile_x, w, axes, p, lift_x, fill_x), zero_n),
+                pos.select(_m_wcov_hi(dx_hi, dy_hi, sc_tile_x, w, axes, p), zero_n),
                 *fill_bind, *lit_binds["zero"], *_need(binds, "gt", "sub")),
             rewrite(_m_mcov_tile(ref, x, y, mask, z, axes, p, lift_x, fill_x, i64(sign_i))).to(
                 pos.select(zero_n, _m_mcov_raw(
