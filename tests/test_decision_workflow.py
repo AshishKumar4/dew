@@ -197,7 +197,7 @@ def recorded(cell: Cell, backbone: Path, root: Path, examples: int | None = None
              "trainer.examples": str(kept(cell) if examples is None else examples),
              **({"trainer.stop": {"class": "dew.training.budget:Pause", "fields": {"fraction": SHARE}}}
                 if cell.bound == "share" else {}),
-             **({"context_layers": CONTEXT_LAYERS} if cell.context else {})}
+             **({"context": {"layers": CONTEXT_LAYERS}} if cell.context else {})}
     return Recorded(saved_record(run_of(cell, backbone, root), root, "cell"),
                     cli_settings(root, "cell", given), devices=1)
 
