@@ -475,6 +475,18 @@ dew.config.diffusion.FlowRolloutConfig
   groups: int = 4
   steps: int = 11
   train_steps: int | None = None
+dew.config.earlier.LoopChange
+  layers: tuple[int, int] | None = None
+  backprop_steps: int | None = None
+  remat: bool = False
+  implicit: bool = False
+  theta_per_pass: bool = False
+  exit_gate: bool = False
+  exit_threshold: float | None = None
+  messages: bool = False
+  message_block_size: int | None = None
+  message_rank: int | None = None
+  message_additive: bool | None = None
 dew.config.env.EnvConfig
   name: str
   fields: JsonDict = builtins.dict()
@@ -928,6 +940,28 @@ dew.lora.LoRA
   dropout: float = 0.0
   source: str | None = None
   weight_name: str | None = None
+dew.nn.backbones.decoder_stack.Loop
+  steps: int
+  step_norm: bool = True
+  backprop_steps: int | None = None
+  exit_gate: bool = False
+  layers: tuple[int, int] | None = None
+  remat: bool = False
+  reinject: bool = False
+  shared_cache: bool = False
+  implicit: bool = False
+  exit_threshold: float | None = None
+  exits: bool = False
+  theta_passes: int | None = None
+  messages: dew.nn.cross_pass.CrossPass | None = None
+  gathered: bool = False
+dew.nn.cross_pass.CrossPass
+  block_size: int = 4
+  rank: int = 64
+  additive: bool = True
+  normalize_values: bool = True
+  scale_by_input_rms: bool = True
+  norm_eps: float | None = None
 dew.nn.dex.DifferentialExtension
   layers: tuple[tuple[int, tuple[int, ...]], ...]
   lambda_init: float | None = None
@@ -1155,6 +1189,11 @@ dew.training.inspection.Inspection
   modules: tuple[str, ...] = ()
   cotangents: bool = False
   histogram: bool = False
+dew.training.phase_passes.SampledPasses
+  mean: float
+  dispersion: float
+  cap: int
+  law: str = 'lognormal-poisson'
 dew.training.profiling.ProfileWindow
   directory: str
   steps: int
