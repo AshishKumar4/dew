@@ -231,7 +231,8 @@ MUFU.RCP beside five FMULs and two FSETPs (sm90's SASS, FS-DIV-SASS1 and FS-DIV-
 POLYNOMIAL_FORMS: Mapping = {
     lax.erf_p: Work(exponentials=1, operations=21, integer_operations=2),
     lax.atan2_p: MOSAIC_DIVISION + Work(exponentials=1, operations=30, integer_operations=3)}
-"""The polynomials a Mosaic GPU kernel issues an element for an fp32 erf and atan2 whatever `approx_math`
+"""The polynomials a Mosaic GPU kernel issues an element for an fp32 erf and atan2 (fp32 alone: an fp64 one
+lowers to libdevice's `__nv_erf`, `__nv_atan2`) whatever `approx_math`
 (math.erf's and math.atan2's lowering, from the PTX of a warpgroup kernel of one fp32 tile on sm90,
 FS-ERF-FORMS1): an erf one ex2.approx beside 21 fp32 instructions (seven FMAs, nine selects, a multiply, a
 subtraction, an absolute value, a negation and a compare) and two integer ones; an atan2 of two operands a
@@ -1321,12 +1322,17 @@ def _laid_reduction(layout: fragments.TiledLayout, value, axes: Sequence[int], t
 
 def _fp32_on_cuda(outputs: Sequence, target: generation.GpuTarget | None, fp32: bool | None = None) -> bool:
     """Whether an operation of results `outputs` is an fp32 one on a CUDA multiprocessor (`target`, else the
-    process's own), whose forms Dew measured (a division's, XLA's special functions'): by `fp32` where a
-    caller states it (the algebra's evidence, whose terms hold no dtype), else by its results' dtypes; fp64's
-    and narrower floats' unmeasured."""
+    process's own), whose forms Dew measured (a division's, XLA's special functions'): `_fp32`, on a CUDA
+    target."""
     held = target or generation.gpu_target()
-    typed = all(aval.dtype == jnp.float32 for aval in outputs) if fp32 is None else fp32
-    return held.architecture.multiprocessor is not None and typed
+    return held.architecture.multiprocessor is not None and _fp32(outputs, fp32)
+
+
+def _fp32(outputs: Sequence, fp32: bool | None = None) -> bool:
+    """Whether an operation of results `outputs` is an fp32 one: by `fp32` where a caller states it (the
+    algebra's evidence, whose terms hold no dtype), else by its results' dtypes; fp64's and narrower floats'
+    unmeasured. A kernel's own forms are a CUDA kernel's whatever process counts them."""
+    return all(aval.dtype == jnp.float32 for aval in outputs) if fp32 is None else fp32
 
 
 
@@ -1395,9 +1401,10 @@ def operation_work(primitive, inputs: Sequence, outputs: Sequence, params: Mappi
     its native form where a kernel's forms state one (a Triton kernel's, `TRITON_FORMS`), else the software
     division it lowers to (XLA's and Mosaic GPU's, `precision._correctly_rounded_divide`), counted as a
     kernel's body is, through its calls (row 12886). An integer power issues its repeated squaring's
-    multiplies, a negative one beside the division of one by them (row 12948). A kernel's erf and atan2 issue
-    the polynomials its forms state (`POLYNOMIAL_FORMS`). Whether an operation is fp32 its results' dtypes
-    say, or `fp32` where a caller states it (the algebra's terms hold no dtype)."""
+    multiplies, a negative one beside the division of one by them (row 12948). A kernel's fp32 erf and atan2
+    issue the polynomials its forms state (`POLYNOMIAL_FORMS`); another's erf one operation and atan2
+    unpriced, unmeasured (an fp64 one lowers to libdevice's own). Whether an operation is fp32 its results'
+    dtypes say, or `fp32` where a caller states it (the algebra's terms hold no dtype)."""
     if primitive is precision.correctly_rounded_divide_p:
         if (native := (forms or {}).get(primitive)) is not None:
             return repeated(native, sum(_elements(aval) for aval in outputs))
@@ -1414,7 +1421,8 @@ def operation_work(primitive, inputs: Sequence, outputs: Sequence, params: Mappi
         squarings = repeated(squared, max(power.bit_length() + power.bit_count() - 2, 0))
         return squarings if params["y"] >= 0 else squarings + operation_work(
             lax.div_p, [*inputs, *inputs], outputs, {}, target, forms=forms, fp32=fp32)
-    if primitive in POLYNOMIAL_FORMS and (form := (forms or {}).get(primitive)) is not None:
+    if (primitive in POLYNOMIAL_FORMS and (form := (forms or {}).get(primitive)) is not None
+            and _fp32(outputs, fp32)):
         return repeated(form, sum(_elements(aval) for aval in outputs))
     if primitive in _OPERATIONS:
         return _operated(primitive, inputs, outputs)
