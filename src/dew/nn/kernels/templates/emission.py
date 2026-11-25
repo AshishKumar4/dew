@@ -1197,11 +1197,22 @@ def warps_of(kernel) -> float | None:
     return None if launched is None else launched.warps
 
 
+def resident_of(kernel) -> int:
+    """The programs a multiprocessor holds of a kernel equation's launch as its plan compiled it: its Mosaic
+    GPU parameters' `min_blocks_per_sm` (`mosaic.compiler_params`' `resident`), one where it states none."""
+    params = kernel.params.get("compiler_params")
+    held = params.get("mosaic_gpu") if isinstance(params, Mapping) else params
+    if not isinstance(held, gpu_core.CompilerParams):
+        return 1
+    return max(1, getattr(held, "min_blocks_per_sm", None) or 1)
+
+
 def launches_seconds(jaxpr: jax_core.Jaxpr, target: generation.GpuTarget, *,
-                     resident: Callable[[jax_core.JaxprEqn], int] = lambda kernel: 1) -> float | None:
+                     resident: Callable[[jax_core.JaxprEqn], int] = resident_of) -> float | None:
     """A traced program's native launches priced on `target`, in sequence: each kernel's work as its costed
     launch counted it (`work_of`), over its programs (`launch_programs`) at the residency its plan gives it
-    (`resident`; one by default) and the warps it issues over (`warps_of`), through `cost.launch_seconds`,
+    (`resident`; its compiled plan's by default, `resident_of`) and the warps it issues over (`warps_of`),
+    through `cost.launch_seconds`,
     through the calls it makes (`_expanded`); None where any launch's work its emission does not count, or a
     launch lies under a loop or a branch, whose trips or taken arm no sequence states (the review of
     lane/toolkit 61dd3c7d2): its price unknown, never 0. What XLA runs beside them is the algebra's to price
