@@ -45,7 +45,7 @@ from dew.artifacts import Artifacts
 from dew.batch import Batch, Variables, without
 from dew.nn import categorical
 from dew.nn.precision import accumulated, at_least_fp32
-from dew.nn.protocols import OutputTable, StatesVocabulary
+from dew.nn.protocols import OutputTable, StatesVocabulary, logits_width
 from dew.objectives.base import (
     OMITTED,
     TEACHER,
@@ -174,14 +174,14 @@ class DistillationObjective(Objective[Loss, Effects], Generic[Loss, Effects]):
             raise ValueError("selected distillation scores the sampled tokens at temperature 1")
         if tokenizers is not None:
             _refuse_other_tokenizers(*tokenizers)
-        # The selected term holds no logits whose widths the step compares, so the models' declared
-        # vocabularies are (`StatesVocabulary`).
+        # The selected term holds no logits whose widths the step compares, so the widths the models declare
+        # are (`logits_width`: the ids each head scores, fewer than its table's rows where it states so).
         models = (student.model, teacher.model)
         if divergence == "selected" and all(isinstance(model, StatesVocabulary) for model in models) and (
-                models[0].vocab_size != models[1].vocab_size):
+                logits_width(models[0]) != logits_width(models[1])):
             raise ValueError(f"the selected term reads one id's likelihood on both sides, so the teacher and "
-                             f"the student share a vocabulary; the student scores {models[0].vocab_size} ids "
-                             f"and the teacher {models[1].vocab_size}")
+                             f"the student share a vocabulary; the student scores {logits_width(models[0])} "
+                             f"ids and the teacher {logits_width(models[1])}")
         for name, value, ok in (("alpha", alpha, lambda v: 0 <= v <= 1),
                                 ("temperature", temperature, lambda v: v > 0),
                                 ("beta", beta, lambda v: v >= 0)):
