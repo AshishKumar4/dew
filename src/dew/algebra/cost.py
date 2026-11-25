@@ -94,26 +94,12 @@ def _operation_work(primitive, inputs, outputs, params, on: generation.GpuTarget
 def _priced(primitive, params, shapes: list[tuple[int, ...]], made: tuple[int, ...],
             on: generation.GpuTarget | None = None, dtype=None, *,
             in_dtypes: list[np.dtype | None] | None = None) -> Work:
-    """An equation's arithmetic as the kernels' counter prices its primitive (`_operation_work`) on `on`, its
-    operands of `shapes` at `in_dtypes` (or `VALUE` where unknown) and its output of `made` at `dtype`; a
-    division (or `integer_pow(..., -1)` reciprocal) at `dtype` (`emission.IEEE_DIVISION` for fp32), or one
-    operation per element where `dtype` is unproven."""
-    if primitive is jax.lax.integer_pow_p and params.get("y") == -1:
-        if dtype is None:
-            return Work(operations=float(math.prod(made)))
-        in_dt = in_dtypes[0] if (in_dtypes and in_dtypes[0] is not None) else dtype
-        avals = [jax.ShapeDtypeStruct(shapes[0], in_dt), jax.ShapeDtypeStruct(shapes[0], in_dt)]
-        return _operation_work(jax.lax.div_p, avals, [jax.ShapeDtypeStruct(made, dtype)], {}, on)
-    if primitive is jax.lax.div_p:
-        if dtype is None:
-            return Work(operations=float(math.prod(made)))
-        dts = [dt if dt is not None else dtype for dt in (in_dtypes or [dtype] * len(shapes))]
-        in_avals = [jax.ShapeDtypeStruct(s, d) for s, d in zip(shapes, dts, strict=True)]
-        return _operation_work(primitive, in_avals, [jax.ShapeDtypeStruct(made, dtype)], params, on)
-    dts = [dt if dt is not None else VALUE for dt in (in_dtypes or [VALUE] * len(shapes))]
-    out_dt = dtype if dtype is not None else VALUE
-    in_avals = [jax.ShapeDtypeStruct(s, d) for s, d in zip(shapes, dts, strict=True)]
-    return _operation_work(primitive, in_avals, [jax.ShapeDtypeStruct(made, out_dt)], params, on)
+    """Price the traced widths, without borrowing the synthetic vector dtype as evidence of fp32 work."""
+    out_dt = VALUE if dtype is None else dtype
+    known = (None,) * len(shapes) if in_dtypes is None else in_dtypes
+    inputs = [jax.ShapeDtypeStruct(s, out_dt if dt is None else dt) for s, dt in zip(shapes, known, strict=True)]
+    return _operation_work(primitive, inputs, [jax.ShapeDtypeStruct(made, out_dt)], params, on,
+                           fp32=dtype == VALUE)
 
 
 def _result_dtype(primitive, params, in_dtypes: list[np.dtype | None],

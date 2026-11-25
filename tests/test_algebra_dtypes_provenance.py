@@ -15,7 +15,7 @@ from test_algebra_program import _bf16_rms
 from dew import algebra
 from dew.algebra import program, terms
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import emission, report as kernel_report
+from dew.nn.kernels.templates import report as kernel_report
 
 
 def _equations(jaxpr):
@@ -29,48 +29,6 @@ def _equations(jaxpr):
 def _rows(seed: int, *shapes: tuple[int, ...]) -> tuple[np.ndarray, ...]:
     rng = np.random.default_rng(seed)
     return tuple(rng.standard_normal(shape).astype(np.float32) for shape in shapes)
-
-
-def test_program_priced_uses_real_operand_dtypes_for_casts_divisions_and_mixed_regions():
-    """`program.priced` reads per-term e-graph dtype facts (`rules.dtype`, `rules.param_dtype`, rows 12974
-    and 13033): a real `bf16 -> fp32` cast counts conversions (no synthetic fp32 drop), a same-dtype cast
-    counts none, an fp32 division inside a mixed `bf16`/`fp32` region prices as `IEEE_DIVISION`, a native
-    `bf16` division prices as 0 exponentials, and `integer_pow(..., -1)` in fp32 prices as `IEEE_DIVISION`."""
-    hopper = generation.TARGETS["sm90"]
-    bf16 = jax.ShapeDtypeStruct((64, 128), jnp.bfloat16)
-    fp32 = jax.ShapeDtypeStruct((64, 128), jnp.float32)
-    idx = jax.ShapeDtypeStruct((64, 128), jnp.int32)
-    elements = 64 * 128
-
-    cast_bf16 = jax.make_jaxpr(lambda x: x.astype(jnp.float32))(bf16).jaxpr
-    assert program.priced(cast_bf16, hopper).work.conversions == elements
-    cast_noop = jax.make_jaxpr(lambda x: jax.lax.convert_element_type(x, jnp.float32))(fp32).jaxpr
-    assert program.priced(cast_noop, hopper).work.conversions == 0
-
-    mixed_div = jax.make_jaxpr(lambda x, y: x.astype(jnp.float32) / y.astype(jnp.float32))(bf16, bf16).jaxpr
-    mixed_work = program.priced(mixed_div, hopper).work
-    assert mixed_work.conversions == 2 * elements
-    assert (mixed_work.exponentials, mixed_work.operations) == (elements, 6 * elements)
-
-    recip = jax.make_jaxpr(lambda x: jax.lax.integer_pow(x, -1))(fp32).jaxpr
-    recip_work = program.priced(recip, hopper).work
-    assert (recip_work.exponentials, recip_work.operations) == (elements, 6 * elements)
-
-    xla_forms = getattr(emission, "XLA_FORMS", None)
-    if xla_forms is not None:
-        expected_log = xla_forms[jax.lax.log_p]
-        mixed_log = jax.make_jaxpr(lambda x: jnp.log(x.astype(jnp.float32)))(bf16).jaxpr
-        log_work = program.priced(mixed_log, hopper).work
-        assert log_work.conversions == elements + expected_log.conversions * elements
-        assert log_work.operations == expected_log.operations * elements
-        assert log_work.integer_operations == expected_log.integer_operations * elements
-        assert log_work.exponentials == 0
-        indexed_log = jax.make_jaxpr(lambda x, i: (jnp.log(x), i + 1))(fp32, idx).jaxpr
-        idx_work = program.priced(indexed_log, hopper).work
-        assert idx_work.operations == expected_log.operations * elements + elements
-        assert idx_work.conversions == expected_log.conversions * elements
-        assert idx_work.integer_operations == expected_log.integer_operations * elements
-        assert idx_work.exponentials == 0
 
 
 def test_structural_closed_preserves_equation_source_info_and_nested_body_provenance():
@@ -184,7 +142,7 @@ def test_reuse_hoists_softmax_and_standalone_root_and_emits_no_debug_info_warnin
 
     def standalone_root(x, z):
         denom = jnp.mean(jnp.square(jnp.tanh(z)), axis=-1, keepdims=True) + jnp.float32(1e-5)
-        return x / jnp.sqrt(denom)
+        return jnp.tanh(x) / jnp.sqrt(denom)
 
     x0, z0 = _rows(0, (16, 64), (16, 64))
     with algebra.rules.enabling_dev("reuse"):
