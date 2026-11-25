@@ -938,14 +938,18 @@ def test_a_kernels_conversion_issues_as_its_assembler_lowers_it(source, target, 
                                    generation.gpu_target("sm90")) == unchanged
 
 
-def _row_reduced(laid_out) -> Work:
+def _row_reduced(laid_out, called: bool = False) -> Work:
     """A one-warpgroup Mosaic GPU kernel's fixed work: a 64 x 64 fp32 tile it loads from shared memory and
-    lays out as `laid_out` (a `layout_cast`'s, or none), then reduces along its rows, twice."""
+    lays out as `laid_out` (a `layout_cast`'s, or none), then reduces along its rows, twice (in a jitted
+    helper its tile an argument of, where `called`)."""
+    def rows(tile):
+        return jnp.max(tile, axis=1) + jnp.max(tile, axis=1)
+
     def body(out_ref, smem):
         tile = smem[...]
         if laid_out is not None:
             tile = plgpu.layout_cast(tile, laid_out)
-        out_ref[...] = jnp.max(tile, axis=1) + jnp.max(tile, axis=1)
+        out_ref[...] = jax.jit(rows)(tile) if called else rows(tile)
 
     launch = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((64,), jnp.float32), num_threads=1,
                           thread_name="wg", scratch_types=[plgpu.SMEM((64, 64), jnp.float32)])
@@ -953,23 +957,27 @@ def _row_reduced(laid_out) -> Work:
     return emission.emitted(traced, 1, "wg", forms=emission.ACCURATE_FORMS).roles[0].fixed
 
 
-@pytest.mark.parametrize(("laid_out", "rounds"), [(plgpu.Layout.WGMMA, 2), (plgpu.Layout.WGMMA_TRANSPOSED, 3),
-                                                   (None, 0)], ids=["wgmma", "transposed", "unknown"])
-def test_a_laid_out_row_reduction_issues_its_butterfly_once(laid_out, rounds):
+@pytest.mark.parametrize(("laid_out", "rounds", "called"), [
+    (plgpu.Layout.WGMMA, 2, False), (plgpu.Layout.WGMMA_TRANSPOSED, 3, False), (None, 0, False),
+    (plgpu.Layout.WGMMA, 2, True)], ids=["wgmma", "transposed", "unknown", "wgmma-in-a-call"])
+def test_a_laid_out_row_reduction_issues_its_butterfly_once(laid_out, rounds, called):
     """A kernel's reduction along a tile's rows, its tile's layout named by its provenance (here a
     `layout_cast`), issues its butterfly across the lanes that layout spreads a row over, as Mosaic GPU
     lowers it: log2 of them rounds of a shuffle and a combine of each 32-bit word of the result's registers
     a thread (WGMMA's four lanes, two rounds; WGMMA_TRANSPOSED's eight, three); none where no provenance
-    names the layout (inference's choice). The same reduction twice issues it once, as the lowering's CSE
-    merges them. Where shuffles went uncounted (row 12889)."""
-    fixed = _row_reduced(laid_out)
+    names the layout (inference's choice). Each thread first combines the values it holds of each of its
+    rows, so a reduction combines its elements less the values a thread keeps, then a round's each. The same
+    reduction twice issues it once, as the lowering's CSE merges them; a jitted helper's reduction of its
+    laid-out argument alike. Where shuffles went uncounted (row 12889); the two maxima's sum 64 more."""
+    fixed = _row_reduced(laid_out, called)
     if laid_out is None:
-        assert fixed.shuffles == 0, fixed
+        assert fixed.shuffles == 0 and fixed.operations == 64 * 64 + 64, fixed
         return
     result = laid_out.to_mgpu().reduce((1,))
-    # Each fp32 register one 32-bit word, each shuffled once a round.
-    words = math.prod(result.registers_shape((64,))) * result.vector_length
-    assert fixed.shuffles == rounds * words * 128, (fixed, words)
+    # Each fp32 value one 32-bit word, each shuffled once a round, on each of the warpgroup's 128 threads.
+    held = math.prod(result.registers_shape((64,))) * result.vector_length * 128
+    assert fixed.shuffles == rounds * held, (fixed, held)
+    assert fixed.operations == 64 * 64 - held + rounds * held + 64, (fixed, held)
 
 
 def test_an_attention_forwards_walk_issues_its_row_reductions_butterflies():
@@ -1108,13 +1116,15 @@ def test_an_fp32_division_in_a_kernel_issues_a_reciprocal_and_its_refinement():
 
 @pytest.mark.parametrize(("body", "fused"), [
     (lambda x, y, z: x * y + z, 128), (lambda x, y, z: jnp.maximum(x * y, z), 0),
-    (lambda x, y, z: _read_twice(x * y, z), 0), (lambda x, y, z: lax.add(lax.mul(x[0, 0], y[0, 0]), z), 0)],
-    ids=["multiply-add", "maximum", "product-read-twice", "scalar-product-into-a-row"])
+    (lambda x, y, z: _read_twice(x * y, z), 0), (lambda x, y, z: lax.add(lax.mul(x[0, 0], y[0, 0]), z), 0),
+    (lambda x, y, z: (x * y + z) * (x * y), 128)],
+    ids=["multiply-add", "maximum", "product-read-twice", "scalar-product-into-a-row", "product-repeated"])
 def test_an_fp32_multiply_whose_one_use_is_an_add_counts_as_one_fused_instruction(body, fused):
     """An fp32 multiply whose result an add alone reads is one FFMA with it (ptxas's --fmad, its default):
     the body counts the pair fused (`Work.fused_multiply_adds`), an element each; a maximum of a product, a
     product read twice, or one scalar product added to a row's every element (the review of lane/toolkit
-    5cbbe66c586, P1) keeps its multiply an instruction of its own."""
+    5cbbe66c586, P1) keeps its multiply an instruction of its own. A product computed twice, once into an add,
+    once read alone, is two products, the first fused (the review of lane/toolkit f69e7b74a, P1)."""
     row = jax.ShapeDtypeStruct((1, 128), jnp.float32)
     role = _emitted(body, row, row, row).roles[0]
     assert role.fixed.fused_multiply_adds == fused, role.fixed
