@@ -162,10 +162,11 @@ def spec_axes(spec: jax.sharding.PartitionSpec) -> set[str]:
 
 
 def kept_axes(spec: jax.sharding.PartitionSpec, keep: Callable[[str], bool]) -> jax.sharding.PartitionSpec:
-    """`spec` with each dimension placed on the mesh axes `keep` admits of its own, in their order, as a
-    tuple, None where it keeps none; an entry left to the partitioner (`UNCONSTRAINED`) as it is, and the
-    sums `spec` still carries (`reduced`, `unreduced`) kept. The one filter of a spec's axes: a constraint's
-    Auto axes (`dew.nn.sharding.auto_part`), a leaf's placement without the state axes
+    """`spec` with each dimension placed on the mesh axes `keep` admits of its own, in their order (one
+    axis's spelled by its name, as `PartitionSpec` canonicalizes it), None where it keeps none; an entry
+    left to the partitioner (`UNCONSTRAINED`) as it is, and the sums `spec` still carries (`reduced`,
+    `unreduced`) kept. The one filter of a spec's axes: a constraint's Auto axes
+    (`dew.nn.sharding.auto_part`), a leaf's placement without the state axes
     (`dew.distributed.placement`), an Explicit region's own (`dew.nn.sharding.gathered_over`)."""
     def kept(entry):
         if entry is jax.sharding.PartitionSpec.UNCONSTRAINED:

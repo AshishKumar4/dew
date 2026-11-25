@@ -689,13 +689,19 @@ def explicit_over[T](fn: Callable[[jax.Array], T], x: jax.Array) -> T:
 
 def typed_on[T](tree: T, mesh: jax.sharding.AbstractMesh) -> T:
     """`tree` with each array typed on another mesh than `mesh` (one `explicit_over` traced) placed back on
-    `mesh` as its type places it over `mesh`'s Explicit axes, every other leaf as it is."""
+    `mesh` as its type places it over `mesh`'s Explicit axes, its sums still to take (`reduced`,
+    `unreduced`) over those alone, as JAX's own conversion between meshes keeps them: a sum over an axis
+    `mesh` leaves Auto is taken on the way (an unreduced one reduced, a reduced copy kept whole); every other
+    leaf as it is."""
+    explicit = frozenset(mesh.explicit_axes)
+
     def back(value):
         if not isinstance(value, jax.Array) or jax.typeof(value).sharding.mesh == mesh:
             return value
         with jax.sharding.use_abstract_mesh(mesh):
-            spec = jax.typeof(value).sharding.spec
-            return jax.sharding.reshard(value, kept_axes(spec, set(mesh.explicit_axes).__contains__))
+            spec = kept_axes(jax.typeof(value).sharding.spec, explicit.__contains__)
+            return jax.sharding.reshard(value, spec.update(reduced=spec.reduced & explicit,
+                                                           unreduced=spec.unreduced & explicit))
     return jax.tree.map(back, tree)
 
 
