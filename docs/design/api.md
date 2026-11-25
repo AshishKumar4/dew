@@ -317,9 +317,9 @@ with or without `text_only`. A run passes both through `--source.text-only` and
 `modeling_overrides` through `--source.attention`, each layer kind causal or block_bidirectional,
 and its differential extension through `--source.dex`, the `DifferentialExtension`'s record as JSON
 (`dew.nn.dex`); a diffusion pipeline, which no override reaches, refuses them. How a decoder runs its
-layers is none of a source's choices: under `generation.chosen(layer_scan="scanned")` it scans its runs of
-like layers, its periodic pattern among them, by its structure, its stored tree unchanged, and a layer at a
-time otherwise, the default until row 4074 makes the scan it. `dew.pipeline` takes
+layers is none of a source's choices: it scans its runs of like layers, its periodic pattern among them, by
+its structure, its stored tree unchanged, and runs a layer at a time under
+`dew.kernels.use(layer_scan="plain")`. `dew.pipeline` takes
 the same choices for a source as `options=SourceOptions(...)`, and refuses them for a run directory,
 whose record holds its own.
 

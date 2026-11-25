@@ -18,13 +18,14 @@ from typing import Literal, NamedTuple, get_args
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import tokamax
 from flax.linen.dtypes import promote_dtype
 from jax.ad_checkpoint import checkpoint_name
 from jax.typing import DTypeLike
 
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent, with_tangents_formed_at
-from dew.nn.programs import own_preset
+from dew.nn.programs import holes, own_preset
 from dew.nn.residuals import Residual
 
 from .attention_kernels import (
@@ -1181,11 +1182,17 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         bias = dense_bias(bias)
     call = functools.partial(
         _attention_kernel, dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
-        causal=causal, sliding_window=sliding_window, mask=mask, masked=masked, softcap=softcap,
-        segment_ids=segment_ids, max_segments=max_segments, lengths=lengths, starts=starts,
-        block_groups=block_groups, image_groups=image_groups, key_valid=key_valid, key_runs=key_runs,
-        places=places, query_slots=query_slots, dropout_rate=dropout_rate, dropout_seed=dropout_seed,
-        dropout_places=dropout_places, wide_logits=wide_logits, scale_logits=scale_logits, in_key=in_key)
+        causal=causal, sliding_window=sliding_window, softcap=softcap, max_segments=max_segments,
+        dropout_rate=dropout_rate, wide_logits=wide_logits, scale_logits=scale_logits, in_key=in_key)
+    # Every array operand (masks, segment ids, lengths, spans, dropout) passes into `forward_differentiable`
+    # as an argument, as the decode kernel passes its lengths and starts above: a closed-over integer or bool
+    # tracer stays in a nested derivative's `custom_jvp` call as a constant (M-DD-13b, and a scanned
+    # in-backward step over packed decision rows).
+    operands, operands_of = holes(
+        {"mask": mask, "masked": masked, "segment_ids": segment_ids, "lengths": lengths, "starts": starts,
+         "block_groups": block_groups, "image_groups": image_groups, "key_valid": key_valid,
+         "key_runs": key_runs, "places": places, "query_slots": query_slots, "dropout_seed": dropout_seed,
+         "dropout_places": dropout_places}, lambda leaf: isinstance(leaf, jax.Array | np.ndarray))
     live = visible_rows(query.shape[-3], key.shape[-3], causal, sliding_window, mask, segment_ids, lengths,
                         starts, block_groups=block_groups, image_groups=image_groups, key_valid=key_valid,
                         key_runs=key_runs, places=places, query_slots=query_slots)
@@ -1197,24 +1204,28 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
             # A call no derivative is taken of on the template where it measured faster, a differentiated
             # one's forward and derivatives xla's (`attention_kernels.template_infers`).
             def on(implementation):
-                def run(query, key, value, bias, sinks):
-                    return call(query, key, value, bias=bias, sinks=sinks, implementation=implementation)
+                def run(query, key, value, bias, sinks, *extra):
+                    return call(query, key, value, bias=bias, sinks=sinks, implementation=implementation,
+                                **operands_of(extra))
                 return run
 
             primal = 'template' if template_infers(query.dtype, query.shape[-1], causal) else 'xla'
-            return forward_differentiable(on(primal), on('xla'), query, key, value, bias, sinks,
+            return forward_differentiable(on(primal), on('xla'), query, key, value, bias, sinks, *operands,
                                           primal_alone=True, parameters=(3, 4))
 
-        def fused(query, key, value, bias, sinks):
-            return call(query, key, value, bias=bias, sinks=sinks, implementation=kernel, mask_fill=fill)
+        def fused(query, key, value, bias, sinks, *extra):
+            return call(query, key, value, bias=bias, sinks=sinks, implementation=kernel, mask_fill=fill,
+                        **operands_of(extra))
 
         if not FORWARD_MODE.get() or not reverse_only(kernel):
-            return fused(query, key, value, bias, sinks)
+            return fused(query, key, value, bias, sinks, *operands)
 
-        def reference(query, key, value, bias, sinks):
-            return call(query, key, value, bias=bias, sinks=sinks, implementation='reference', mask_fill=fill)
+        def reference(query, key, value, bias, sinks, *extra):
+            return call(query, key, value, bias=bias, sinks=sinks, implementation='reference',
+                        mask_fill=fill, **operands_of(extra))
 
-        return forward_differentiable(fused, reference, query, key, value, bias, sinks, parameters=(3, 4))
+        return forward_differentiable(fused, reference, query, key, value, bias, sinks, *operands,
+                                      parameters=(3, 4))
 
     if mask_fill is None:
         return _read_nothing(ran(), live)

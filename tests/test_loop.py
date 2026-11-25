@@ -1105,6 +1105,28 @@ def test_a_count_of_passes_given_per_call_weighs_the_passes_that_ran():
         PassWeights.of((0.25, 0.25, 0.25, 0.25)).ran(ran)
 
 
+@attending("xla")
+def test_a_scanned_block_loop_serves_with_a_per_pass_cache(rng):
+    """A looped decoder whose looped block scans (`layers=(1, 3)`, two equal layers under the default
+    layer scan) serves prompts under a per-pass cache (`PassView` hiding `layers_0` in later passes):
+    probing the residual dtype reads the span's first layer's cache, never `layers_0`'s."""
+    from dew.inference import TextGeneration
+    from dew.inference.serving import Server
+    from dew.sampling import Sampling
+
+    model = tiny(num_layers=4, max_seq_len=32, loop=Loop(2, layers=(1, 3)), dtype="float32")
+    prompts = [[1, 2, 3, 4], [5, 6, 7, 8, 9, 10]]
+    variables = nn.unbox(model.init(rng, jnp.asarray([prompts[0]], jnp.int32)))
+    task = TextGeneration(model, variables, sampling=Sampling(temperature=0.0))
+    server = Server.from_task(task, slots=2, capacity=32)
+    tickets = [server.submit(prompt, 4, key=index) for index, prompt in enumerate(prompts)]
+    server.run()
+    for ticket, prompt in zip(tickets, prompts, strict=True):
+        served, alone = ticket.result().host(), task([prompt], 4, key=0).host()
+        np.testing.assert_array_equal(served.tokens[0, served.prompt_width:],
+                                      alone.tokens[0, alone.prompt_width:])
+
+
 def _logits_and_gradients(model):
     """`model`'s training logits and the gradient of a cotangent on them, a function of its variables, its
     tokens and that cotangent: what a site comparing two ways of running a loop holds on par."""

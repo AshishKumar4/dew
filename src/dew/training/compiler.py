@@ -69,6 +69,7 @@ from dew.training.memory import (
     local_devices,
     memory_record,
     remat_admits,
+    remat_stated,
     remat_topmost,
     rung_record,
     step_fits,
@@ -1104,8 +1105,9 @@ class StepCompiler[L, E]:
         start copies let go (`freed`, `Start.freed`), and a placed plan is judged on no more than its
         devices' free bytes (their largest block), so a candidate the search saw miss by more than that misses
         there. Refused only where the search measured every candidate a search on the placed devices could
-        reach: each rung it asked at every split (`PlanRefused.candidates`), none passed over, its rungs'
-        variants chosen from no miss (`PlanRefused.variants`), its search begun at the base rung (no record
+        reach: each rung it asked at every split (`PlanRefused.candidates`), none passed over, each lighter
+        form of them measured or measured to free nothing (`PlanRefused.variants`,
+        `FitSearch.unmeasured_lighter`), its search begun at the base rung (no record
         or checkpoint naming one, which a placed search of other shardings may not read,
         `PlanRefused.recorded_start`), what the start frees known (none where an aliased held array leaves it
         unknown, `Start.freed`), every miss measured and each beyond that room on some process (a
@@ -1390,8 +1392,10 @@ class StepCompiler[L, E]:
             recorded = {**record(searched.rung, 'plan'), 'split': searched.split}
             source = "this process's search of the step"
         before = self.rung()
-        # Where the run was configured, before a record moves it: the ladder a frontier reads below its plan.
+        # Where the run was configured, before a record moves it: the ladder a frontier reads below its plan,
+        # and whether the run itself stated a remat policy (not one a saved plan climbed to).
         origin = Rung.of(self.objective, self._xla_defaults, self._narrow, self._ns_group)
+        stated = remat_stated(self.objective)
         if recorded is not None and not remat_admits(self.objective, record(recorded, 'plan'), self.remat):
             # A plan saved by a run of another policy (an ahead step's, a checkpoint's), which this one's
             # recomputation contradicts: searched afresh from where the run was configured.
@@ -1414,7 +1418,7 @@ class StepCompiler[L, E]:
             self.objective, mesh, self._xla_defaults, self._narrow, self._ns_group,
             None if self._base_rung is None
             else self._base_rung[1], resumed, remat=self.remat, ahead=self.ahead,
-            provisional=provisional, unplaced=unplaced, executables=self._executables)
+            provisional=provisional, stated_remat=stated, unplaced=unplaced, executables=self._executables)
         if search.provisional:
             # Its programs held until a plan is taken in its place, or its run abandons it, even where it
             # refuses (`Unplaced.release`, `dew.training.ahead.LaterPlans`).

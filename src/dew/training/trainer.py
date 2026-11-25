@@ -626,7 +626,7 @@ class Trainer(Generic[Loss, Effects]):
     def _staging(self) -> StageLocal:
         """Where the step keeps each pipelined run stacked by stage (`StageLocal.of`); none for a CPU-owned
         state, which streams its stack's banks, nor a DiLoCo run, whose groups' copies stack apart."""
-        built = self._config is not None and self._config.optimizer.STACKED
+        built = self._config is not None and self._config.stacked()
         return StageLocal.of(self.objective, self.device_mesh, optimizer=None if built else self.optimizer,
                              local=self.layout.stage_local and self.diloco is None and not self.host_master)
 

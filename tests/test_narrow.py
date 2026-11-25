@@ -276,7 +276,9 @@ def test_a_phase_planned_afresh_builds_its_window_over_the_outgoing_one():
     finer = Trainer(trainer.objective, optax.sgd(0.5), key=jax.random.key(0), mesh=device,
                     advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)), split=4)
     batch = _decoder(rows=16)[1]
-    stepped, *_ = finer.compile(fresh, batch)(fresh, batch)
+    # Its stack run as the outgoing step ran it, a layer at a time (`_trained`).
+    with chosen(layer_scan="plain"):
+        stepped, *_ = finer.compile(fresh, batch)(fresh, batch)
     assert int(stepped.window_size) == 4
     # Every leaf of the outgoing window went to the new one's build, donated, or was let go; the leaves the
     # new window allocated afresh are its split-sized parts alone, none of the gradient's shapes.
@@ -302,7 +304,9 @@ def test_a_phase_planned_afresh_is_planned_at_its_own_split_past_the_window_it_h
                       advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)))
     planner._compiler.afresh = True  # as the boundary sets it (`Trainer._compiled_for`)
     batch = _decoder(rows=16)[1]
-    stepped, *_ = planner.compile(fresh, batch)(fresh, batch)
+    # Its stack run as the outgoing step ran it, a layer at a time (`_trained`).
+    with chosen(layer_scan="plain"):
+        stepped, *_ = planner.compile(fresh, batch)(fresh, batch)
     assert planner.plan["split"] == 1 and stepped.window is None
     assert all(leaf.is_deleted() for leaf in donor)
 
@@ -573,13 +577,16 @@ def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monk
     free, limit = 2 ** 39, 2 ** 40
 
     def built() -> tuple[Trainer, dict]:
-        objective, batch = _decoder(remat="full")
+        # Sixteen rows (two per device on 8-way data parallel) give the scanned step at remat="full" enough
+        # temporaries to leave room past twice the window's accumulator beside it (`memory.placeable_beside`).
+        objective, batch = _decoder(remat="full", rows=16)
         return Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=MeshSpec(),
                        advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)), accumulation=2,
                        split=1), batch
 
     def streamed() -> Loader:
-        return Loader(train=lambda partition: repeated_token_batch(64, 8, 9), val=None, records=None, batch=8)
+        return Loader(train=lambda partition: repeated_token_batch(64, 16, 9), val=None, records=None,
+                      batch=16)
 
     def need(*, copies: bool) -> int:
         """The bytes the run's fit needs placed with or without its copies (its state and the batches it
@@ -678,21 +685,23 @@ def test_a_fresh_plan_refused_with_its_copies_built_deletes_them_before_it_is_se
     def streamed() -> Loader:
         return Loader(train=lambda partition: repeated_token_batch(64, 8, 9), val=None, records=None, batch=8)
 
-    narrow, _, _ = _trained(ADAM_3, copies=True, steps=1, remat="full", mesh=device)
-    copies = sorted(leaf.nbytes for leaf in jax.tree.leaves(narrow.compute))
-    del narrow
     # The fresh plan's need with its copies, the state and its batches among it, and its temporaries, as a
-    # roomy allocator's run measured them.
+    # roomy allocator's run measured them, and the copies its step builds as its scan holds the layers.
     free, limit = 2 ** 39, 2 ** 40
     gc.collect()
     allocating(monkeypatch, limit, limit, limit - free)
     roomy = built()
     with chosen(narrow_copies="on"):
-        roomy.fit(streamed(), steps=1)
+        trained = roomy.fit(streamed(), steps=1)
     probe = roomy.plan["probes"][0]
-    assert probe["narrow"] and probe["fits"] and copies, (probe, copies)
     need, temporaries = free - probe["headroom"], probe["temp"]
-    del roomy
+    _, batch = _decoder(remat="full")
+    with chosen(narrow_copies="on"):
+        staged = roomy.staged(trained)
+        stepped, *_ = roomy.compile(staged, batch)(staged, batch)
+    copies = sorted(leaf.nbytes for leaf in jax.tree.leaves(stepped.compute))
+    assert probe["narrow"] and probe["fits"] and copies, (probe, copies)
+    del roomy, trained, staged, stepped, batch
     # Free in all, the need and half the temporaries: the plan made before the state is placed holds. The
     # pool's growth one byte short of the temporaries, and its blocks, the state and copies on it, the
     # rest: half the temporaries and what is placed beside them, no block for them.
@@ -750,29 +759,65 @@ def test_a_fresh_fit_whose_placed_pool_holds_its_step_in_two_microbatches_splits
 
     from dew.data.dataset import Loader
     from dew.training import Layout, MeshSpec, Trainer
+    from dew.training.memory import admitted
 
     free, limit = 2 ** 39, 2 ** 40
     monkeypatch.setattr(jax.Device, "memory_stats",
                         lambda device: {"bytes_limit": limit, "bytes_in_use": limit - free})
-    # One device, whose batch of 8 rows splits in two.
+    # One device, whose batch of 16 rows splits in two, with enough activations at remat="full" for one
+    # microbatch's temporaries to stand past twice two microbatches' window accumulator beside the step
+    # (`memory.placeable_beside`).
+    rows = 16
     device = MeshSpec().build(jax.devices()[:1])
-    one, two = (free - _trained(ADAM_3, copies=False, steps=1, split=split, remat="full",
-                                mesh=device)[2].plan["probes"][0]["headroom"] for split in (1, 2))
+    stream = Loader(train=lambda partition: repeated_token_batch(64, rows, 9), val=None, records=None,
+                    batch=rows)
+
+    def measured(split: int) -> tuple[int, int, int]:
+        # Measured through the same fit and default stack as the run below.
+        objective, _ = _decoder(remat="full", rows=rows)
+        trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=device,
+                          advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)), split=split)
+        with chosen(narrow_copies='off'):
+            trainer.fit(stream, steps=1)
+        probe = trainer.plan["probes"][0]
+        return free - probe["headroom"], probe["temp"], probe["beside"]
+
+    (one, temp_one, beside_one), (two, temp_two, beside_two) = measured(1), measured(2)
     assert two < one, (one, two)
-    objective, batch = _decoder(remat="full")
+    objective, batch = _decoder(remat="full", rows=rows)
     run = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=device,
                   advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)))
     with chosen(narrow_copies='off'):
         state = max(run.validate(batch).device_bytes.values())
-    # The pool's largest free block, and what it can still grow by, between the step's needs at two
-    # microbatches and at one: twice what a request placed beside the step takes, so each splits it
-    # (`memory.placeable_beside`).
-    room = (one + two) // 2
     total = 2 * (state + one)
-    grown = {"bytes_limit": total, "bytes_in_use": 0, "pool_bytes": total - room,
-             "largest_free_block_bytes": room}
+
+    def pool(room: int) -> dict[str, int]:
+        # A pool grown to hold all but `room`, its largest free block and what it can still grow by.
+        return {"bytes_limit": total, "bytes_in_use": 0, "pool_bytes": total - room,
+                "largest_free_block_bytes": room}
+
+    def admits(room: int, temp: int, beside: int) -> bool:
+        # Whether the planner's admission of a placed step (`memory.admitted`) places `temp` temporaries
+        # beside `beside` bytes on the allocator reading `pool(room)`.
+        monkeypatch.setattr(jax.Device, "memory_stats", lambda device: pool(room))
+        headroom = admitted(jax.devices()[:1], 0, beside, temp)
+        assert headroom is not None
+        return headroom >= 0
+
+    def least(temp: int, beside: int) -> int:
+        # The least room in which the admission places the step, which grows with the room.
+        low, high = 0, total
+        while low < high:
+            middle = (low + high) // 2
+            low, high = (low, middle) if admits(middle, temp, beside) else (middle + 1, high)
+        return low
+
+    # The room between the least each microbatch count's step is placed in: one microbatch refused, two
+    # placed.
+    placed_one, placed_two = least(temp_one, beside_one), least(temp_two, beside_two)
+    assert placed_two < placed_one, ((one, temp_one, beside_one), (two, temp_two, beside_two))
+    grown = pool((placed_one + placed_two) // 2)
     monkeypatch.setattr(jax.Device, "memory_stats", lambda device: grown)
-    stream = Loader(train=lambda partition: repeated_token_batch(64, 8, 9), val=None, records=None, batch=8)
     with chosen(narrow_copies='off'):
         run.fit(stream, steps=2)
     assert run.plan["split"] == 2, run.plan["probes"]

@@ -35,7 +35,6 @@ from sharded import collectives
 from token_support import write_token_corpus
 
 from dew import _cache
-from dew._records import JSON
 from dew.checkpoints import Checkpoints
 from dew.data import Loading, Memory, presets
 from dew.data.compile import compile
@@ -50,7 +49,7 @@ from dew.nn.kernels import options
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.lm import LMObjective
 from dew.objectives.lm.chunked import chunked_tile
-from dew.optim import Muon, Optax, OptimConfig
+from dew.optim import Optax, OptimConfig
 from dew.registry import mixers
 from dew.state import TrainState, apart
 from dew.telemetry.compiles import Compiles
@@ -1390,20 +1389,21 @@ def token_files(directory):
     return write_token_corpus(directory / "tokens", tokens, tokens, vocab_size=32)
 
 
-def windows(corpus):
-    """Windows of four tokens a token apart in a run's order, in batches of eight, validating on the
+def windows(corpus, *, seq_len: int = 4):
+    """Windows of `seq_len` tokens a token apart in a run's order, in batches of eight, validating on the
     first 32 windows a window apart."""
-    train = TokenFiles(corpus.train).shuffle(7).repeat().pipe(presets.token_windows, seq_len=4, stride=1,
-                                                               batch=8)
-    held = TokenFiles(corpus.val).pipe(presets.token_windows, seq_len=4, batch=8, records=32)
+    train = TokenFiles(corpus.train).shuffle(7).repeat().pipe(presets.token_windows, seq_len=seq_len,
+                                                               stride=1, batch=8)
+    held = TokenFiles(corpus.val).pipe(presets.token_windows, seq_len=seq_len, batch=8, records=32)
     return compile(train, validation=held, read="memory", seed=7,
                    loading=Loading(workers=0, threads=1, read_buffer=1))
 
 
-def windowed(directory, split, remat=None, objective=LMObjective, accumulation=1):
-    model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=2, num_heads=1, mlp_features=16,
-                              max_seq_len=8, remat=remat)
-    return one_device(Trainer(objective(model, seq_len=4), optax.adam(1e-2), key=jax.random.key(0),
+def windowed(directory, split, remat=None, objective=LMObjective, accumulation=1, *,
+             seq_len: int = 4, num_layers: int = 2):
+    model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=num_layers, num_heads=1,
+                              mlp_features=16, max_seq_len=max(8, seq_len), remat=remat)
+    return one_device(Trainer(objective(model, seq_len=seq_len), optax.adam(1e-2), key=jax.random.key(0),
                               accumulation=accumulation, split=split,
                               advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)),
                               checkpoints=Checkpoints(str(directory / "run"))))
@@ -1460,17 +1460,22 @@ def test_a_checkpoint_whose_step_climbed_to_recompute_its_layers_resumes_at_that
     a resume was refused as another computation, `model.fields.remat`)."""
     corpus = token_files(tmp_path)
 
+    # Four layers over 32-token windows, where saved residuals outweigh a scanned block's recompute scratch
+    # and the state's bytes.
+    shape = {"seq_len": 32, "num_layers": 4}
+
     def run():
-        return windowed(tmp_path / "climbed", 1)
+        return windowed(tmp_path / "climbed", 1, **shape)
 
     def fitted(trainer, steps):
-        trainer.fit(windows(corpus), steps=steps, log_every=100, checkpoint_every=1)
+        trainer.fit(windows(corpus, seq_len=32), steps=steps, log_every=100, checkpoint_every=1)
         return trainer
 
     free(monkeypatch, LIMIT)
-    own = LIMIT - fitted(windowed(tmp_path / "own", 1), 1).plan["probes"][0]["headroom"]
+    own = LIMIT - fitted(windowed(tmp_path / "own", 1, **shape), 1).plan["probes"][0]["headroom"]
     free(monkeypatch, LIMIT)
-    full = LIMIT - fitted(windowed(tmp_path / "full", 1, remat="full"), 1).plan["probes"][0]["headroom"]
+    full = LIMIT - fitted(windowed(tmp_path / "full", 1, remat="full", **shape),
+                          1).plan["probes"][0]["headroom"]
     assert full < own, (full, own)
     free(monkeypatch, (own + full) // 2)
     climbed = fitted(run(), 1)
@@ -1633,7 +1638,7 @@ H100 = 2 ** 40
 """The allocator limit of the compile-only H100 a census shape's need at each rung is read on: past any."""
 
 
-def climbed(monkeypatch, target: str, fields: dict, batch: dict, room_of, request
+def climbed(monkeypatch, target: str, fields: dict, batch: dict, room_of, request, tmp_path
             ) -> tuple[list, int, tuple, tuple | None, tuple | None, list[tuple]] | None:
     """A census shape's step at four microbatches on `target` ('cpu', its devices' memory stated through
     `free`; 'h100', a compile-only H100 compiled ahead, what a GPU start plans for): the places of the fit
@@ -1720,6 +1725,8 @@ def climbed(monkeypatch, target: str, fields: dict, batch: dict, room_of, reques
     # The remat rungs past the start's at the run's own head, in order: what a tight start asks next.
     preferred = [moves for moves, place in enumerate(places)
                  if moves and place[0] is None and place[2] != places[0][2]]
+    # The needs above record the rungs they settle in this process; start the climb cold.
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "cold"))
     trainer = planned(0, room)
     probes = [(probe["head_tile"], probe["head_fused"], probe["remat"], probe["xla_defaults"])
               for probe in trainer.plan["probes"]]
@@ -1758,7 +1765,7 @@ remat at their own head, each read as asked (`climbed`): no other rung's need is
                  marks=pytest.mark.shards(units=18, per_task=2)),
 ])
 def test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits(monkeypatch, shape, target,
-                                                                                    request):
+                                                                                    request, tmp_path):
     """A start whose step fits at its own rung settles it in one compile; one that does not asks the remat
     rungs at its own head first and settles the first of them that fits (row 6740: a tight cold start's
     second compile), where an
@@ -1773,7 +1780,7 @@ def test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits(
     469 s, its judge 168 s after (row 8524), 3 a task 299 s for its first, the heaviest (row 8557)."""
     fields, batch, room_of = CENSUS[shape]
     with row_names_port("gated_delta_rule", "fla"):
-        climb = climbed(monkeypatch, target, fields, batch, room_of, request)
+        climb = climbed(monkeypatch, target, fields, batch, room_of, request, tmp_path)
     if climb is None:
         return
     ladder, room, plan, lightest, asks, probes = climb
@@ -1962,8 +1969,9 @@ def test_trials_step_a_copy_of_the_state_and_hand_back_a_fresh_one(owned):
 def test_a_run_trains_only_its_requested_steps_without_timing_a_frontier(monkeypatch, tmp_path):
     """A fit trains its requested steps without spending extra updates on a speed comparison."""
     corpus, whole = token_files(tmp_path), windowed(tmp_path / "whole", 1)
-    free(monkeypatch, needs(monkeypatch, whole, lambda: whole.fit(windows(corpus), steps=1,
-                                                                  checkpoint_every=None)) - 1)
+    need = needs(monkeypatch, whole, lambda: whole.fit(windows(corpus), steps=1, checkpoint_every=None))
+    assert whole.validation is not None
+    free_until_placed(monkeypatch, max(whole.validation.device_bytes.values()) + need - 1)
     trainer = windowed(tmp_path / "timed", "auto")
     with Compiles("step") as compiles:
         state = trainer.fit(windows(corpus), steps=3, checkpoint_every=None)
@@ -2278,75 +2286,29 @@ def test_a_fits_start_traces_its_loss_once_for_its_fit_check_and_its_plan(monkey
     assert len(traced) == 1, [program.where for program in traced]
 
 
-def muon_lm(remat: str | None = None, **opts) -> Trainer:
-    """A four-layer LM trained by Muon over one microbatch a step of two rows: its layers' matrices of one
-    shape are stacks its Newton-Schulz joins where `opts` states no group, wide enough beside the rows'
-    activations that the update's iteration holds the step's peak; recomputing as `remat` names where
-    given."""
-    model = CausalTransformer(vocab_size=64, emb_features=128, num_layers=4, num_heads=2, mlp_features=256,
-                              max_seq_len=SEQ, **({} if remat is None else {"remat": REMAT_POLICIES[remat]}))
-    config = OptimConfig(optimizer=Muon(**opts), lr=1e-2)
-    return one_device(Trainer(LMObjective(model, seq_len=SEQ), config, key=jax.random.key(0),
-                              split=1))
+def test_a_run_starting_from_a_saved_remat_rung_climbs_past_it_when_tight(monkeypatch):
+    """A run that leaves its remat open and starts a compile from a saved plan at a lighter remat rung
+    (`StepCompiler._plans`) still climbs to a heavier rung when the saved rung does not fit: moving the
+    objective to the saved plan must not mark remat as user-stated (`FitSearch.stated_remat`)."""
+    fields = {"seq": LONG, "width": 32, "layers": 4, "split": 4}
 
+    def measured(remat=None) -> int:
+        trainer = lm(**fields, **({} if remat is None else {"remat": REMAT_POLICIES[remat]}))
+        return needs(monkeypatch, trainer, lambda: trained(trainer, steps=0, batch=LONG_BATCH))
 
-def fitted_once(trainer: Trainer) -> None:
-    """`trainer` fit one step of two of BATCH's rows, its plan made as a fit makes it."""
-    trainer.fit(Pipeline(Memory({"text": np.asarray(BATCH["text"][:2])})).repeat().batch(2), steps=1)
+    none_need, middle_need, full_need = (measured(), measured("save_dot_except_mlp"), measured("full"))
+    assert full_need < middle_need < none_need, (full_need, middle_need, none_need)
+    trainer = lm(**fields)
+    state, _, _ = trainer.place()
+    # First compile climbs to 'save_dot_except_mlp' and records it in `StepCompiler._plans`.
+    free(monkeypatch, middle_need)
+    trainer.compile(state, LONG_BATCH)
+    assert trainer.plan["remat"] == "save_dot_except_mlp", trainer.plan
+    # Second compile in tighter room starts from that saved plan and climbs past it to 'full'.
+    free(monkeypatch, (middle_need + full_need) // 2)
+    trainer.compile(state, LONG_BATCH)
+    assert trainer.plan["remat"] == "full", trainer.plan
 
-
-@functools.cache
-def muon_needs() -> tuple[int, int, JSON]:
-    """The rooms the cells below free for the Muon step (`muon_lm`) before its state is placed
-    (`free_until_placed`), and the parted step's remat. Each holds the bytes of the arguments the devices
-    hold none of yet, which a fit plans its step beside before placing them, and lies past what the step
-    needs beside what a device holds with its Newton-Schulz stacks parted (`ns_group` 1): the first half way
-    from there to what it needs with them joined, the second half way from the most of that and of what it
-    needs with them grouped by four recomputing 'minimal', the first rung of that group's climb that frees
-    anything, to what it needs grouped by four. Freed as `free` frees, without the arguments and never taken
-    by them, no rung of that plan fitted and the placed devices' room passed the joined step: the fit
-    searched its ladder again once placed (row 8606: 129 s a cell). Measured once."""
-    with pytest.MonkeyPatch.context() as monkeypatch:
-        joined = needs(monkeypatch, trainer := muon_lm(), lambda: fitted_once(trainer))
-        grouped = needs(monkeypatch, trainer := muon_lm(ns_group=4), lambda: fitted_once(trainer))
-        recomputing = needs(monkeypatch, trainer := muon_lm("minimal", ns_group=4),
-                            lambda: fitted_once(trainer))
-        parted = needs(monkeypatch, trainer := muon_lm(ns_group=1), lambda: fitted_once(trainer))
-    assert parted < joined and max(parted, recomputing) < grouped, (parted, recomputing, grouped, joined)
-    arguments = trainer.plan["probes"][0]["argument"]
-    return ((joined + parted) // 2 + arguments, (grouped + max(parted, recomputing)) // 2 + arguments,
-            trainer.plan["remat"])
-
-
-@pytest.mark.shared_setup("muon_needs")
-def test_a_muon_step_that_fits_only_with_its_stacks_parted_parts_them_before_recomputing(monkeypatch):
-    """A Muon step whose joined Newton-Schulz stacks' copies leave it short of the devices' room, and which
-    fits with them parted, its split fixed: its plan parts them, joining one at a time (`ns_group` 1, the
-    climb's release after the narrow copies, `FitSearch.searched`), and recomputes nothing more, where it
-    climbed the remat rungs (row 5889: the joined copies held 11.3 GB of a 4B step's peak for 82 ms a
-    step)."""
-    room, _, remat = muon_needs()
-    free_until_placed(monkeypatch, room)
-    planned = muon_lm()
-    fitted_once(planned)
-    assert planned.plan["ns_group"] == 1, planned.plan
-    assert planned.plan["remat"] == remat, planned.plan
-
-
-@pytest.mark.shared_setup("muon_needs")
-def test_a_muon_run_that_states_its_stacks_group_keeps_it(monkeypatch):
-    """A Muon run that states its Newton-Schulz group keeps it, in the room where an unstated run's plan
-    parts its stacks, and its own step fits recomputing: its group joins every stack, as the joined step
-    does, and the planner asks no step of it to join them one at a time (`FitSearch.searched`), recomputing
-    instead (row 8696: in all of the room no release was ever asked, so a stated group overridden failed
-    nothing)."""
-    _, room, _ = muon_needs()
-    free_until_placed(monkeypatch, room)
-    stated = muon_lm(ns_group=4)
-    fitted_once(stated)
-    groups = [probe["ns_group"] for probe in stated.plan["probes"]]
-    assert stated.plan["ns_group"] is None and stated.plan["remat"] is not None, stated.plan
-    assert groups and 1 not in groups, groups
 
 def lowered_and_compiled(run: Callable[[], object]) -> tuple[int, int]:
     """How many times `run` lowered the step (JAX's lowering of `jit(step)`) and compiled it (`Compiles`)."""

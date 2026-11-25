@@ -385,11 +385,12 @@ class StageLocal:
     def saved(self, state: TrainState) -> TrainState:
         """`state` as a checkpoint holds it, every layer `layers_N`, each row an array on its own
         stage's devices made from that stage's shards: a device copies its own rows, and nothing
-        moves between stages."""
+        moves between stages. Compiles the restore restack (`restored`) and, on one stage, the fit's
+        donated unstack (`whole`) ahead off the step, so a resume compiles nothing new."""
         def cut(path, leaf: jax.Array, shape: tuple[int, ...]) -> list[jax.Array]:
             sharding = leaf.sharding
             assert isinstance(sharding, NamedSharding), "a stacked leaf is placed on the stage axis"
-            rows = []
+            rows, count = [], math.prod(shape) // self.stages
             for stage in range(self.stages):
                 devices = stage_mesh(self.mesh, stage)
                 held = set(devices.devices.flat)
@@ -400,10 +401,18 @@ class StageLocal:
                     dtype=leaf.dtype)
                 row = _sharded(sharding, devices, sharding.spec[len(shape):])
                 # Each row a checkpoint holds on its own stage's devices, on part of a pool (`apart`).
-                rows.extend(program(_cut_piece, static_argnames="stacked", out_shardings=(row,) * (
-                    math.prod(shape) // self.stages))(piece, stacked=len(shape)))
+                rows.extend(program(_cut_piece, static_argnames="stacked", out_shardings=(row,) * count)(
+                    piece, stacked=len(shape)))
+                _stacked_ahead(count, leaf.shape[len(shape):], leaf.dtype, row, shape[1:],
+                               _piece_sharding(row, devices, len(shape)))
             return rows
-        return self.state(state, lambda tree: self.layered(tree, cut))
+
+        def saved_tree(tree):
+            if self.stages == 1:
+                self._whole_ahead(tree)
+            return self.layered(tree, cut)
+
+        return self.state(state, saved_tree)
 
     def restored(self, tree):
         """`saved`'s inverse of one of a state's trees, read onto `checkpointed`'s placement: each
@@ -418,19 +427,14 @@ class StageLocal:
                 assert isinstance(devices, NamedSharding) and isinstance(devices.mesh, Mesh), (
                     "a stage's rows are read onto its own devices")
                 # A stage's rows are the restore's own arrays, no other leaf's: its piece takes them over.
-                piece = _sharded(row, devices.mesh, (None, *[None] * (len(shape) - 1), *row.spec))
-                pieces.append(program(_stacked_piece, static_argnames="within", donate_argnums=0,
-                                      out_shardings=piece)(held, within=shape[1:]))
+                restack = _restack(_piece_sharding(row, devices.mesh, len(shape)))
+                pieces.append(restack(held, within=shape[1:]))
             return jax.make_array_from_single_device_arrays(
                 (*shape, *rows[0].shape), self._stacked_sharding(row, len(shape)),
                 [shard.data for piece in pieces for shard in piece.addressable_shards], dtype=rows[0].dtype)
         return self.staged(tree, stack)
 
-    def whole(self, variables, *, consumed: bool = False):
-        """`variables` with each stacked run back on its stored layers, each layer on every stage
-        (`Trainer.stored`'s), their stacked arrays donated where they are `consumed`. It costs what a
-        state that held every layer on every device held throughout; variables that hold no stacked run are
-        returned as they are."""
+    def _whole_entries(self, variables):
         entries: list[tuple[DecoderBank, Mapping]] = []
 
         def collect(site: DecoderBank, where: str, node: Mapping) -> Mapping:
@@ -441,15 +445,46 @@ class StageLocal:
             rest = {key: value for key, value in node.items() if key != "stages"}
             return _Unstacked(len(entries) - 1, rest)
 
-        template = _walked(variables, self.sites, collect)
+        return _walked(variables, self.sites, collect), entries
+
+    def _whole_ahead(self, variables) -> None:
+        """Compile a one-stage fit's donated unstack (`whole(..., consumed=True)`) ahead where a save runs,
+        so a resume of a run killed before its fit returns finds it in the persistent cache."""
+        from dew.checkpoints._state_trees import compile_ahead
+
+        _, entries = self._whole_entries(variables)
+        if not entries:
+            return
+        sites = tuple(site for site, _ in entries)
+        stacked = tuple(jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype,
+                                                                       sharding=leaf.sharding), held)
+                        for _, held in entries)
+        leaves = jax.tree.leaves(stacked)
+        if not leaves:
+            return
+        placements = self._placements(entries)
+        key = ("stage-whole", sites, jax.tree.structure(stacked),
+               tuple((leaf.shape, np.dtype(leaf.dtype), leaf.sharding) for leaf in leaves),
+               jax.tree.structure(placements), tuple(jax.tree.leaves(placements)))
+        compile_ahead(key, lambda: _unstack(placements, consumed=True), sites, stacked,
+                      what="a stage-local stored unstack")
+
+    def _placements(self, entries) -> tuple:
+        """Where each stacked run's layers go back (`whole`'s, and its unstack compiled ahead's)."""
+        return tuple(site.view.layer_form({"stages": jax.tree.map(lambda leaf: leaf.sharding, held)},
+                                          self._row_shardings)
+                     for site, held in entries)
+
+    def whole(self, variables, *, consumed: bool = False):
+        """`variables` with each stacked run back on its stored layers, each layer on every stage
+        (`Trainer.stored`'s), their stacked arrays donated where they are `consumed`. It costs what a
+        state that held every layer on every device held throughout; variables that hold no stacked run are
+        returned as they are."""
+        template, entries = self._whole_entries(variables)
         if not entries:
             return variables
         sites, stacked = tuple(site for site, _ in entries), tuple(held for _, held in entries)
-        placements = tuple(site.view.layer_form({"stages": jax.tree.map(lambda leaf: leaf.sharding, held)},
-                                                self._row_shardings)
-                           for site, held in entries)
-        unstacked = (program(_layered_entries, static_argnums=0, out_shardings=placements,
-                             donate_argnums=(1,) if consumed else ())(sites, stacked)
+        unstacked = (_unstack(self._placements(entries), consumed=consumed)(sites, stacked)
                      if jax.tree.leaves(stacked) else _layered_entries(sites, stacked))
         return jax.tree.map(lambda held: {**held, **unstacked[held.index]} if isinstance(held, _Unstacked)
                             else held, template, is_leaf=lambda node: isinstance(node, _Unstacked))
@@ -477,6 +512,37 @@ def _cut_piece(piece: jax.Array, *, stacked: int) -> tuple[jax.Array, ...]:
 def _stacked_piece(rows: list[jax.Array], *, within: tuple[int, ...]) -> jax.Array:
     """A stage's rows stacked into its piece of the leaf, `[1, *within, ...]`."""
     return _stacked_rows(rows, (1, *within))
+
+
+def _piece_sharding(row: NamedSharding, mesh, stacked: int) -> NamedSharding:
+    """A stage's piece of a leaf stacked over `stacked` leading dimensions, on `mesh`, its rows' placement
+    after them."""
+    return _sharded(row, mesh, (None, *[None] * (stacked - 1), *row.spec))
+
+
+def _restack(piece_sharding: NamedSharding):
+    """The program a restore stacks a stage's rows into its piece by (`restored`), its rows donated: the
+    one its restack compiled ahead compiles (`_stacked_ahead`)."""
+    return program(_stacked_piece, static_argnames="within", donate_argnums=0, out_shardings=piece_sharding)
+
+
+def _unstack(placements: tuple, *, consumed: bool):
+    """The program `StageLocal.whole` takes its stacked runs back onto their layers by, at `placements`,
+    their stacked arrays donated where `consumed`: the one its unstack compiled ahead compiles."""
+    return program(_layered_entries, static_argnums=0, out_shardings=placements,
+                   donate_argnums=(1,) if consumed else ())
+
+
+def _stacked_ahead(count: int, row_shape: tuple[int, ...], dtype, row_sharding: NamedSharding,
+                   within: tuple[int, ...], piece_sharding: NamedSharding) -> None:
+    """Compile a stage piece's restore restack (`_restack`) ahead, off the step, so a resume finds it in
+    the persistent compilation cache (`compile_ahead`)."""
+    from dew.checkpoints._state_trees import compile_ahead
+
+    abstract = [jax.ShapeDtypeStruct(row_shape, dtype, sharding=row_sharding)] * count
+    key = ("stage-restack", count, row_shape, np.dtype(dtype), row_sharding, within, piece_sharding)
+    compile_ahead(key, lambda: _restack(piece_sharding), abstract, what="a stage-local restore stack",
+                  within=within)
 
 
 def _layered_entries(sites: tuple[DecoderBank, ...], stacked: tuple[Mapping, ...]) -> tuple[dict, ...]:
