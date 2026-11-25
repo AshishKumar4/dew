@@ -1389,10 +1389,11 @@ def test_a_stationary_weight_direction_cannot_erase_another_samples_tangent(mode
 def test_chunked_covariance_keeps_both_independent_value_directions(mode):
     from dew.algebra import moments
 
-    w = jnp.asarray([[0.5, 0.25, 0.25]], jnp.float32)
+    big, small = 2.0 ** 125, 2.0 ** -40
+    w = jnp.asarray([[0.5, 0.25, 0.25, 0.0], [0.25, 0.25, 0.25, 0.25]], jnp.float32)
     x = jnp.zeros_like(w)
-    large = jnp.asarray([[2.0 ** 125, 2.0 ** -40, 0.0]], jnp.float32)
-    small = jnp.asarray([[1.0, 0.0, 2.0]], jnp.float32)
+    dx = jnp.asarray([[big, small, 0.0, 0.0], [big, big, 0.0, small]], jnp.float32)
+    dy = jnp.asarray([[2.0 ** 50, 0.0, 2.0 ** 51, 2.0 ** -126], [big, 0.0, big, small]], jnp.float32)
 
     def covariance(a, b):
         return moments.chunked_covariance(a, b, w, tile=1, mode=mode)[2]
@@ -1401,8 +1402,10 @@ def test_chunked_covariance_keeps_both_independent_value_directions(mode):
         return jax.jvp(lambda y: jax.jvp(lambda x_: covariance(x_, y), (x,), (inner,))[1],
                        (x,), (outer,))[1]
 
-    np.testing.assert_array_equal(mixed(large, small), [-2.0 ** -42])
-    np.testing.assert_array_equal(mixed(small, large), [-2.0 ** -42])
+    expected = [-2.0 ** 8, -2.0 ** 83]
+    checked = jax.jit(mixed)
+    np.testing.assert_array_equal(checked(dx, dy), expected)
+    np.testing.assert_array_equal(checked(dy, dx), expected)
 
 
 def test_chunked_moments_directed_overflow_mixed_zero_weight_and_direct_jvp():

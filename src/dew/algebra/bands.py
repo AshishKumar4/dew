@@ -1,0 +1,64 @@
+"""Carry the lower bands of a scaled sum through a product of independent sums.
+
+Split each double-float component into integer digits on a common dyadic grid. Each bin is
+summed exactly and kept separate; no float rounding of the large bin can erase a small one
+before the product's other terms cancel it.
+"""
+
+from __future__ import annotations
+
+import math
+
+import jax
+import jax.numpy as jnp
+
+from dew.algebra import scaled
+from dew.nn.float_bits import raw_fields
+
+
+def summed(load, chunks: int, *, axis: int, width: int, lower: int, bins: int, dtype):
+    """Sum scaled double-float terms from ``load(chunk)`` into exact dyadic bins along ``axis``.
+
+    Width leaves enough headroom for all the digits of a bin in a signed word and in the
+    result dtype. A bin becomes a significand and the power of two of its grid position.
+    """
+    info = scaled.format_of(dtype)
+    digit_mask = (1 << width) - 1
+    parts = (info.mantissa + 2 * width - 1) // width
+
+    def digits(value, exponent):
+        held = scaled.scaled(value)
+        _, sign, biased, fraction = raw_fields(held.significand)
+        word = fraction | ((biased != 0).astype(fraction.dtype) << info.mantissa)
+        placed = held.exponent + exponent - info.mantissa
+        first, offset = jnp.divmod(placed - lower, width)
+        columns = []
+        for part in range(parts):
+            shift = part * width - offset
+            digit = jnp.where(shift >= 0, word >> jnp.maximum(shift, 0).astype(word.dtype),
+                              word << jnp.maximum(-shift, 0).astype(word.dtype)) & digit_mask
+            columns.append((first + part, jnp.where(sign != 0, -digit.astype(jnp.int32),
+                                                    digit.astype(jnp.int32))))
+        return columns
+
+    def of_chunk(index, carry):
+        for high, low, exponent in load(index):
+            for value in (high, low):
+                for places, parts in digits(value, exponent):
+                    slots, values = (jnp.moveaxis(part, axis, -1) for part in (places, parts))
+                    shape = jnp.broadcast_shapes(carry.shape[:-1], slots.shape[:-1])
+                    slots = jnp.broadcast_to(slots, (*shape, slots.shape[-1])).reshape(math.prod(shape), -1)
+                    values = jnp.broadcast_to(values, (*shape, values.shape[-1])).reshape(math.prod(shape), -1)
+                    taken = jnp.broadcast_to(carry, (*shape, bins)).reshape(math.prod(shape), bins)
+                    carry = jax.vmap(lambda row, at, digit: row.at[at].add(digit, mode="drop",
+                                                                            wrap_negative_indices=False))(
+                        taken, slots, values).reshape(*shape, bins)
+        return carry
+
+    shape = jnp.broadcast_shapes(*(part.shape for term in load(0) for part in term))
+    rows = tuple(size for at, size in enumerate(shape) if at != axis)
+    initial = jnp.zeros((*rows, bins), jnp.int32)
+    digits = of_chunk(0, initial) if chunks == 1 else jax.lax.fori_loop(0, chunks, of_chunk, initial)
+    held = scaled.scaled(digits.astype(dtype))
+    exponent = held.exponent + jnp.arange(bins, dtype=jnp.int32) * width + lower
+    return held.significand, jnp.zeros_like(held.significand), exponent

@@ -160,7 +160,7 @@ def _safe_mass(weight: int) -> ratios.Summed:
 
 
 _MEAN_FORM = ratios.Ratio(_weighted_sum(0, 1).terms, _safe_mass(1).terms, 0,
-                         reduced=True, units=windows.Units(), direction_groups=((1,), (0,)))
+                         reduced=True, units=windows.Units(), track_directions=True)
 
 
 def _covariance_form(second: int, weight: int) -> ratios.Ratio:
@@ -174,7 +174,7 @@ def _covariance_form(second: int, weight: int) -> ratios.Ratio:
     joint, sx, sy = _weighted_sum(0, second, weight), _weighted_sum(0, weight), _weighted_sum(second, weight)
     return ratios.Ratio((), mass.terms, 0, reduced=True, units=windows.Units(), power=3,
                         products=((1.0, (joint, mass, mass)), (-1.0, (sx, sy, correction))),
-                        direction_groups=((weight,), *((i,) for i in range(weight))))
+                        track_directions=True)
 
 
 _COV_FORM = _covariance_form(1, 2)

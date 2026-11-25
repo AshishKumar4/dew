@@ -17,21 +17,18 @@ import numpy as np
 from jax.interpreters import ad, batching
 from jax.sharding import PartitionSpec
 
-from dew.algebra import scaled
+from dew.algebra import bands, scaled, windows
 from dew.algebra.windows import (
     Units,
     _arrays,
-    _factor_values,
     _laid_to,
     _landed,
-    _NONE,
     _quotient,
     _quotients_summed,
     _raised,
     _streamed,
     _Sum,
     _times,
-    _windows,
     _without_axis,
     chunk_width,
 )
@@ -56,8 +53,8 @@ class Ratio:
     `Summed`), its `numerator` then none: a derivative's whose denominator moves, `(dP D - q P dD) / D^(q+1)`
     (`_ratio_jvp`), each sum formed once, unlanded, so no quotient is landed apart from the terms it cancels
     against (the merge P0's base review 9, F2: a landed quotient of 2^-156 lost the derivative's -2^-66).
-    Derivatives stream their active direction by the ordered operand roles in direction_groups, so
-    cancellation within a stationary coefficient cannot erase another state's direction.
+    With track_directions, a single affine direction is streamed with its coefficients. Independent
+    directional sums keep their dyadic bands until all products have met the final reduction.
     A zero lands as +0. A value (`scaled._valued`)."""
 
     numerator: tuple
@@ -69,8 +66,8 @@ class Ratio:
     across: tuple[int, ...] = ()
     power: int = 1
     products: tuple = ()
-    direction_groups: tuple[tuple[int, ...], ...] = ()
-    directions: tuple[tuple[int, ...], ...] = ()
+    track_directions: bool = False
+    directions: tuple[int, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -158,79 +155,104 @@ def _product_of(coefficient, sums, values, dtype):
     return product
 
 
+def _carries_direction(each: Summed, active: frozenset[int]) -> bool:
+    return each.reduced and not each.over and any(
+        active.intersection(factor[1:]) for _, factors in each.terms for factor in factors)
+
+
+def _directional_sums(form: Ratio) -> tuple[Summed, ...]:
+    """Preserve bands when independent directions occur in different sums of a product."""
+    active = frozenset(form.directions)
+    sums = [tuple(each for each in term if _carries_direction(each, active)) for _, term in form.products]
+    return tuple(dict.fromkeys(each for term in sums for each in term)) if any(len(term) > 1 for term in sums) else ()
+
+
 def _directional_products(form: Ratio):
-    """Each product's equivalent choices of an entrywise direction and the sums held beside it."""
+    """Each product's one affine sum, separated from its coefficients."""
     if not form.reduced or not any(form.directions):
         return ()
-    groups = tuple(frozenset(indices) for indices in form.directions)
-    split = []
+    active = frozenset(form.directions)
+    plans = []
     for coefficient, sums in form.products:
-        operands = [{index for _, factors in each.terms for factor in factors for index in factor[1:]}
-                    for each in sums]
-        choices: dict[int, tuple] = {}
-        for group, indices in enumerate(groups):
-            moving = [at for at, read in enumerate(operands) if indices & read]
-            if len(moving) == 1:
-                (at,) = moving
-                direction = sums[at]
-                if direction.reduced and not direction.over:
-                    choices.setdefault(at, (group, coefficient, direction, sums[:at] + sums[at + 1:]))
-        if not choices:
+        chosen = tuple(at for at, each in enumerate(sums) if _carries_direction(each, active))
+        if len(chosen) != 1:
             return ()
-        split.append(tuple(choices.values()))
-    return split
+        (at,) = chosen
+        plans.append((coefficient, sums[at], sums[:at] + sums[at + 1:]))
+    return plans
 
 
-def _direction_spreads(operands, form: Ratio, groups: set[int]):
-    """The span of nonzero binades in each active direction, per row and before any state sum lands."""
-    axis = form.axis
-    spreads = {}
-    for group in sorted(groups):
-        lower, upper = [], []
-        for index in form.directions[group]:
-            factor = scaled.scaled(operands[index])
-            live = (factor.significand != 0) & jnp.isfinite(factor.significand)
-            lower.append(jnp.min(jnp.where(live, factor.exponent, -_NONE), axis=axis, keepdims=True))
-            upper.append(jnp.max(jnp.where(live, factor.exponent, _NONE), axis=axis, keepdims=True))
-        least = functools.reduce(jnp.minimum, lower)
-        most = functools.reduce(jnp.maximum, upper)
-        spreads[group] = jnp.maximum(0, most - least)
-    return spreads
-
-
-def _directions_summed(plans, values, operands, arrays, count: int, rank: int, form: Ratio, dtype):
-    """Cancel coefficients before reducing samples; keep the most widely separated direction entrywise
-    if an equivalent mixed contraction can stream either operand."""
+def _directions_summed(plans, values, arrays, count: int, rank: int, form: Ratio, dtype):
+    """Cancel a linear direction's coefficients before reducing across samples."""
     load, chunks = arrays
-    spreads = _direction_spreads(operands, form, {group for choices in plans if len(choices) > 1
-                                                for group, _, _, _ in choices})
-    summed = []
-    for choices in plans:
-        best = None
-        if len(choices) > 1:
-            ordered = jnp.broadcast_arrays(*(spreads[group] for group, _, _, _ in choices))
-            best = jnp.argmax(jnp.stack(ordered), axis=0)
-        for at, (_, coefficient, direction, sums) in enumerate(choices):
-            hi, lo, exponent = (jnp.expand_dims(part, form.axis)
-                                for part in _product_of(coefficient, sums, values, dtype))
-            if best is not None:
-                kept = best == at
-                hi, lo, exponent = jnp.where(kept, hi, 0), jnp.where(kept, lo, 0), jnp.where(kept, exponent, 0)
-            summed.append((_Sum(direction.terms, form.axis, (), count), (hi, lo, exponent)))
+    summed = [(_Sum(direction.terms, form.axis, (), count), tuple(jnp.expand_dims(part, form.axis)
+               for part in _product_of(coefficient, sums, values, dtype)))
+              for coefficient, direction, sums in plans]
 
     def summands_of(chunk):
         inputs, valid = load(chunk)
-        factors = _factor_values(inputs, form.units, rank)
+        factors = windows._factor_values(inputs, form.units, rank)
         terms = []
         for each, multiplier in summed:
             for parts in each._placed_summands(inputs, factors, valid, dtype, empty_exponent=0):
                 hi, lo, exponent = _times(parts, multiplier)
-                terms.append((hi, lo, jnp.where(hi != 0, exponent, _NONE)))
+                terms.append((hi, lo, jnp.where(hi != 0, exponent, windows._NONE)))
         return [jax.lax.optimization_barrier(tuple(terms))]
 
     bits = (count * sum(len(each.terms) for each, _ in summed)).bit_length()
-    (value,) = _windows(summands_of, chunks, [(form.axis,)], [bits], dtype)
+    (value,) = windows._windows(summands_of, chunks, [(form.axis,)], [bits], dtype)
     return tuple(jnp.squeeze(part, form.axis) for part in value)
+
+
+def _banded_sum(each: Summed, arrays, count: int, rank: int, form: Ratio, dtype):
+    """An independent direction's exact dyadic bins, computed once before multiplying other sums."""
+    load, chunks = arrays
+    info = scaled.format_of(dtype)
+    width = max(1, min(16, info.mantissa - (2 * count * len(each.terms)).bit_length()))
+    powers = [(math.frexp(coefficient)[1], len(factors)) for coefficient, factors in each.terms]
+    lower = min(exponent - (degree + 2) * info.reach - info.mantissa for exponent, degree in powers)
+    upper = max(exponent + (degree + 1) * (info.largest + 2) for exponent, degree in powers)
+    summation = _Sum(each.terms, form.axis, (), count)
+
+    def terms(chunk):
+        inputs, valid = load(chunk)
+        factors = windows._factor_values(inputs, form.units, rank)
+        return summation._placed_summands(inputs, factors, valid, dtype, empty_exponent=0)
+
+    return bands.summed(terms, chunks, axis=form.axis, width=width, lower=lower,
+                        bins=(upper - lower) // width + 1, dtype=dtype)
+
+
+def _band_products(products, values, expanded, dtype):
+    """Multiply independent sums over their bin combinations, without materializing a sample grid."""
+    plans = [(coefficient, sums, math.prod(expanded[each][0].shape[-1] for each in sums if each in expanded))
+             for coefficient, sums in products]
+    length = max(steps for _, _, steps in plans)
+    width = chunk_width(length)
+
+    def block(chunk):
+        term = chunk * width + jnp.arange(width, dtype=jnp.int32)
+        found = []
+        for coefficient, sums, steps in plans:
+            taken = {}
+            index = term
+            for place, each in enumerate(sums):
+                if each in expanded:
+                    size = expanded[each][0].shape[-1]
+                    index, pos = jnp.divmod(index, size)
+                    taken[place] = tuple(jnp.take(part, pos, axis=-1) for part in expanded[each])
+                else:
+                    taken[place] = tuple(part[..., None] for part in values[each])
+            hi, lo, exponent = _product_of(coefficient, tuple(taken), taken, dtype)
+            live = (term < steps) & (hi != 0)
+            found.append((jnp.where(live, hi, 0), jnp.where(live, lo, 0),
+                          jnp.where(live, exponent, windows._NONE)))
+        return [jax.lax.optimization_barrier(tuple(found))]
+
+    rank = next(iter(expanded.values()))[0].ndim - 1
+    bits = sum(steps for _, _, steps in plans).bit_length()
+    (value,) = windows._windows(block, -(-length // width), [(rank,)], [bits], dtype)
+    return tuple(jnp.squeeze(part, rank) for part in value)
 
 
 def _products_summed(operands, form: Ratio):
@@ -245,10 +267,10 @@ def _products_summed(operands, form: Ratio):
     count = -(-states // chunk_width(states)) * chunk_width(states)
     # The denominator's own sum where a product takes it (the quotient rule's `D`), formed once for both.
     own = Summed(form.denominator, reduced=True) if form.denominator else None
-    directional = _directional_products(form)
-    products = (sums for choices in directional for _, _, _, sums in choices) if directional else (
-        sums for _, sums in form.products)
-    distinct = list(dict.fromkeys(each for sums in products for each in sums))
+    expanded = _directional_sums(form) if form.reduced else set()
+    directional = () if expanded else _directional_products(form)
+    products = (sums for _, _, sums in directional) if directional else (sums for _, sums in form.products)
+    distinct = list(dict.fromkeys(each for sums in products for each in sums if each not in expanded))
     reduced = [each for each in distinct if each.reduced and each != own]
     entrywise = [each for each in distinct if not each.reduced]
     over_states = [_Sum(each.terms, form.axis, each.over, count) for each in reduced]
@@ -268,8 +290,11 @@ def _products_summed(operands, form: Ratio):
         values = {each: tuple(jnp.expand_dims(part, form.axis) for part in value) if each.reduced else value
                   for each, value in values.items()}
     dtype = laid[0].dtype
+    if expanded:
+        values_by_band = {each: _banded_sum(each, arrays, count, rank, form, dtype) for each in expanded}
+        return _band_products(form.products, values, values_by_band, dtype), denominator
     if directional:
-        return _directions_summed(directional, values, laid, arrays, count, rank, form, dtype), denominator
+        return _directions_summed(directional, values, arrays, count, rank, form, dtype), denominator
     products = [_product_of(coefficient, sums, values, dtype) for coefficient, sums in form.products]
     if len(products) == 1:
         return products[0], denominator
@@ -408,10 +433,7 @@ def _compacted(operands: list, form: Ratio):
     return ([operands[index] for index in sorted(read)],
             dataclasses.replace(form, numerator=_remapped(form.numerator, to),
                                 denominator=_remapped(form.denominator, to),
-                                direction_groups=tuple(tuple(to(i) for i in group if i in read)
-                                                       for group in form.direction_groups),
-                                directions=tuple(tuple(to(i) for i in group if i in read)
-                                                 for group in form.directions),
+                                directions=tuple(to(i) for i in form.directions if i in read),
                                 products=tuple((coefficient, tuple(dataclasses.replace(
                                     each, terms=_remapped(each.terms, to)) for each in sums))
                                     for coefficient, sums in form.products)))
@@ -463,16 +485,9 @@ def _ratio_jvp(primals, tangents, *, form: Ratio):
     products = _canonical(products)
     if not products:
         return value, ad.Zero(jax.typeof(value).to_tangent_aval())
-    # A tangent of a direction keeps the original operand's group. This makes the contraction's order
-    # independent of differentiation order; mass slots remain entrywise even after differentiating a value.
-    groups = tuple((*group, *(tangent_of[i] for i in group if i in tangent_of))
-                   for group in form.direction_groups)
-    directions = tuple((*prior, *(tangent_of[i] for i in group if i in tangent_of))
-                       for group, prior in zip(form.direction_groups,
-                                               form.directions or ((),) * len(groups), strict=True))
+    directions = (*form.directions, *tangent_of.values()) if form.track_directions else ()
     derived_form = _classic(dataclasses.replace(form, numerator=(), products=products,
-                                                power=form.power + bool(moved), direction_groups=groups,
-                                                directions=directions))
+                                                power=form.power + bool(moved), directions=directions))
     return value, ratio(operands, derived_form)
 
 
