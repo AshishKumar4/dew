@@ -875,11 +875,13 @@ def _moment_ssa_combine_u_rules(ops: dict[str, i64], binds: dict[str, tuple]) ->
     _, consts, fill_bind, lit_binds = _moment_ref_consts(ref)
     zero_n, one_n, fmax_n = consts["zero"], consts["one"], consts["fmax"]
     k0_p, either_p, both_p, ext_p, smax_p, p0_p, p1_p, nmin_p, nd_p = _moment_combine_parts(ref, n0, n1, ops)
-    a_new = _m_zero_anchor(ref, ax0, ax1)
+    merged_a = _m_zero_anchor(ref, ax0, ax1)
     seen0 = fmax_n.compare(String("ge"), ax0.unary(String("abs"), ops["abs"]), ops["ge"])
     seen1 = fmax_n.compare(String("ge"), ax1.unary(String("abs"), ops["abs"]), ops["ge"])
-    seen_n = fmax_n.compare(String("ge"), a_new.unary(String("abs"), ops["abs"]), ops["ge"])
-    a0_g, a1_g, an_g = seen0.select(zero_n, ax0), seen1.select(zero_n, ax1), seen_n.select(zero_n, a_new)
+    seen_n = fmax_n.compare(String("ge"), merged_a.unary(String("abs"), ops["abs"]), ops["ge"])
+    a0_g = seen0.select(zero_n, ax0)
+    a1_g = seen1.select(zero_n, ax1)
+    an_g = seen_n.select(zero_n, merged_a)
     d0_z = either.select(seen0.select(zero_n, a0_g.binary(String("sub"), an_g, ops["sub"])), zero_n)
     d1_z = either.select(seen1.select(zero_n, a1_g.binary(String("sub"), an_g, ops["sub"])), zero_n)
     u_zero_rhs = ux0.binary(String("add"), ux1, ops["add"]).binary(
@@ -897,14 +899,13 @@ def _moment_ssa_combine_u_rules(ops: dict[str, i64], binds: dict[str, tuple]) ->
     u_both = base_u.binary(String("add"), extreme.select(shift_norm, shift_ext), ops["add"])
     smax_1, small_s, smax_hi, smax_lo, n_hi, n_lo = _moment_one_side_scale(
         either, both, safe_max, n_drop, zero_n, one_n, ops)
+    seen_d = fmax_n.compare(String("ge"), drop_a.unary(String("abs"), ops["abs"]), ops["ge"])
 
     def g1(term: Term) -> Term:
-        return either.select(zero_n, both.select(term, zero_n))
+        return either.select(zero_n, both.select(seen_d.select(zero_n, term), zero_n))
 
-    seen_d = fmax_n.compare(String("ge"), drop_a.unary(String("abs"), ops["abs"]), ops["ge"])
-    drop_ag = seen_d.select(zero_n, drop_a)
-    d_zero = _m_diff(String("val"), ref, g1(kept_a), g1(drop_ag), zero_n, zero_n)
-    big_z = _m_diff(String("big"), ref, g1(kept_a), g1(drop_ag), zero_n, zero_n)
+    d_zero = _m_diff(String("val"), ref, g1(kept_a), g1(drop_a), zero_n, zero_n)
+    big_z = _m_diff(String("big"), ref, g1(kept_a), g1(drop_a), zero_n, zero_n)
     u_shift_hi = _m_double_if(big_z, n_hi).binary(String("mul"), d_zero, ops["mul"]).binary(
         String("div"), smax_hi, ops["div"])
     u_shift_lo = _m_double_if(big_z, n_lo.binary(String("div"), smax_lo, ops["div"])).binary(
@@ -1015,18 +1016,18 @@ def _moment_ssa_combine_c_rules(ops: dict[str, i64], binds: dict[str, tuple]) ->
     corr_norm = both.select(zero_n, eff_p).binary(
         String("mul"), both.select(zero_n, big_d), ops["mul"]).binary(
         String("mul"), both.select(zero_n, small_d), ops["mul"])
-    ax_new, ay_new = _m_zero_anchor(ref, ax0, ax1), _m_zero_anchor(ref, ay0, ay1)
+    merged_ax, merged_ay = _m_zero_anchor(ref, ax0, ax1), _m_zero_anchor(ref, ay0, ay1)
     seen0 = fmax_n.compare(String("ge"), ax0.unary(String("abs"), ops["abs"]), ops["ge"])
     seen1 = fmax_n.compare(String("ge"), ax1.unary(String("abs"), ops["abs"]), ops["ge"])
-    seen_n = fmax_n.compare(String("ge"), ax_new.unary(String("abs"), ops["abs"]), ops["ge"])
+    seen_n = fmax_n.compare(String("ge"), merged_ax.unary(String("abs"), ops["abs"]), ops["ge"])
     dax0 = seen0.select(zero_n, seen0.select(zero_n, ax0).binary(
-        String("sub"), seen_n.select(zero_n, ax_new), ops["sub"]))
+        String("sub"), seen_n.select(zero_n, merged_ax), ops["sub"]))
     day0 = seen0.select(zero_n, seen0.select(zero_n, ay0).binary(
-        String("sub"), seen_n.select(zero_n, ay_new), ops["sub"]))
+        String("sub"), seen_n.select(zero_n, merged_ay), ops["sub"]))
     dax1 = seen1.select(zero_n, seen1.select(zero_n, ax1).binary(
-        String("sub"), seen_n.select(zero_n, ax_new), ops["sub"]))
+        String("sub"), seen_n.select(zero_n, merged_ax), ops["sub"]))
     day1 = seen1.select(zero_n, seen1.select(zero_n, ay1).binary(
-        String("sub"), seen_n.select(zero_n, ay_new), ops["sub"]))
+        String("sub"), seen_n.select(zero_n, merged_ay), ops["sub"]))
     s_sh = _m_pair_scale(ref, dax0, day0).binary(String("max"), _m_pair_scale(ref, dax1, day1), ops["max"])
     s_01 = sc0.binary(String("max"), sc1, ops["max"]).binary(String("max"), s_sh, ops["max"])
     c_base = _m_combine_base(ref, ext_p, k0_p, nmin_p, smax_p, c0, c1, p0_p, p1_p)
@@ -1046,12 +1047,12 @@ def _moment_ssa_combine_c_rules(ops: dict[str, i64], binds: dict[str, tuple]) ->
     seen_d = fmax_n.compare(String("ge"), dax.unary(String("abs"), ops["abs"]), ops["ge"])
 
     def g1p(term: Term) -> Term:
-        return either_p.select(zero_n, both_p.select(term, zero_n))
+        return either_p.select(zero_n, both_p.select(seen_d.select(zero_n, term), zero_n))
 
-    dx1_v = _m_diff(String("val"), ref, g1p(seen_d.select(zero_n, dax)), g1p(kax), zero_n, g1p(kux))
-    dx1_b = _m_diff(String("big"), ref, g1p(seen_d.select(zero_n, dax)), g1p(kax), zero_n, g1p(kux))
-    dy1_v = _m_diff(String("val"), ref, g1p(seen_d.select(zero_n, day)), g1p(kay), zero_n, g1p(kuy))
-    dy1_b = _m_diff(String("big"), ref, g1p(seen_d.select(zero_n, day)), g1p(kay), zero_n, g1p(kuy))
+    dx1_v = _m_diff(String("val"), ref, g1p(dax), g1p(kax), zero_n, g1p(kux))
+    dx1_b = _m_diff(String("big"), ref, g1p(dax), g1p(kax), zero_n, g1p(kux))
+    dy1_v = _m_diff(String("val"), ref, g1p(day), g1p(kay), zero_n, g1p(kuy))
+    dy1_b = _m_diff(String("big"), ref, g1p(day), g1p(kay), zero_n, g1p(kuy))
     made = [
         rewrite(_m_combine_s(ref, n0, sc0, ax0, ay0, n1, sc1, ax1, ay1)).to(
             either_p.select(s_01, one_n), *fill_bind, *_need(lit_binds, "zero", "one", "fmax"),

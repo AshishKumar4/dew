@@ -1300,7 +1300,7 @@ def test_zero_mass_scaled_covariance_ad_and_clamp_explicit_sharding():
     middle-operand placement under `AxisType.Explicit`."""
     from jax.sharding import AxisType, NamedSharding, PartitionSpec as P
 
-    from dew.algebra import moments, terms
+    from dew.algebra import forms, moments, terms
     from dew.nn.sharding import explicit_spec
 
     forms_cov = derive.derive(moments.declaration("covariance"), accurate=False, saturation=SATURATION)
@@ -1378,7 +1378,7 @@ def test_zero_mass_scaled_covariance_ad_and_clamp_explicit_sharding():
         mid_r = jax.device_put(mid_v, replicated)
         hi_r = jax.device_put(hi_v, replicated)
         ref_out = jax.jit(jax.lax.clamp)(lo_s, mid_r, hi_r)
-        got_out = jax.jit(lambda a, b, c: terms.evaluated(region, out_term, [a, b, c], {}))(
+        got_out = jax.jit(lambda a, b, c: forms.evaluated(region, out_term, [a, b, c], {}))(
             lo_s, mid_r, hi_r)
         np.testing.assert_array_equal(np.asarray(got_out), np.asarray(ref_out))
         assert explicit_spec(got_out) == explicit_spec(ref_out)
