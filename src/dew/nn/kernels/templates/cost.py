@@ -271,9 +271,12 @@ def rates(target: generation.GpuTarget, *, device: bool) -> Rates:
     # forms were compared without it (row 8729); an unmeasured TPU's is none.
     architecture, held, tpu = target.architecture, target.architecture.multiprocessor, generation.tpu(target)
     tensor = rate(target.tensor_rate("16bit"))
-    if tensor is None and device:
-        tensor = target.bf16_peak
-    eight = rate(target.tensor_rate("8bit")) or tensor
+    eight = rate(target.tensor_rate("8bit"))
+    if device:
+        # Whole-device pricing where no rate a clock is stated (a TPU7x's): its catalogued peaks.
+        tensor = tensor if tensor is not None else target.bf16_peak
+        eight = eight if eight is not None else target.fp8_peak
+    eight = eight or tensor
     kept = target.vmem_rate if device and tpu else math.inf
     staged = target.vmem_rate if tpu else rate(None if held is None else held.shared_bytes_per_clock)
     vector = architecture.vector_per_clock
