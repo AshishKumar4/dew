@@ -13,13 +13,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from fla_gdn_support import KernelCase
 from generation_support import COMPILES_FOR_TPU, COMPILES_ON_CPU, INTERPRETS, lowers
 from jax.sharding import AbstractDevice, AbstractMesh, AxisType, Mesh
-from kernel_compile import gate_generations, lowered_for
+from kernel_compile import compile_mosaic_kernels, gate_generations, lowered_for, mosaic_failures
 from test_attention_mosaic import (
     BACKWARD_HOOKS,
+    CALLS,
     FORWARD_HOOKS,
     SHAPES,
+    _backward_call,
     _bound,
     _check_backward,
     _forward_call,
@@ -35,6 +38,7 @@ from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
     attention as template,
     attention_mosaic,
+    attention_mosaic_derivation,
     attention_mosaic_program,
     attention_mosaic_registers,
     attention_route,
@@ -605,8 +609,8 @@ def test_a_short_training_calls_backward_compiles_spill_free_for_an_a100(tokens,
     """A bf16 training step's template attention over fewer tokens than a role's 64 rows, four query heads
     over two 32 wide, its backward one launch or, under --xla_gpu_deterministic_ops, two, lowered and
     compiled by ptxas for an A100 on this CPU, within its shared memory and spilling nothing: a backward's
-    tiles hold a role's rows of keys however few the call's (`attention_mosaic._role_rows`), where a
-    forward's few-query tile (`query_rows`) under 64 query rows lowered in neither launch ("Cannot cast to
+    tiles hold a role's rows of keys however few the call's (`attention_mosaic_derivation._role_rows`), where
+    a forward's few-query tile (`query_rows`) under 64 query rows lowered in neither launch ("Cannot cast to
     layout" of 16 key rows to a consumer's 64; at 32 the one launch's "cannot relayout"; row 5326)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
@@ -1473,16 +1477,20 @@ def test_fused_dkv_width64_derives_and_compiles_spill_free_on_sm80_and_sm100(gen
     key = jax.ShapeDtypeStruct((1, queries, 2, 64), jnp.bfloat16)
     shapes = jax.tree.map(lambda array: jax.ShapeDtypeStruct(array.shape, array.dtype),
                           _residuals(query.shape))
-    op_b, ba_b, cfg = _gated_backward(gen, 64, accurate=False)
-    assert cfg is not None and cfg.fused, (gen, cfg)
+    op_b, ba_b, derived = _gated_backward(gen, 64, accurate=False)
+    assert isinstance(derived, attention_mosaic.BackwardTiles), derived
     with generation.assumed(gen):
+        # The derived launch where fused (a B200's walk), else the fused one its derivation priced beside the
+        # two it took (`MosaicBackward.candidates`: an A100's, row 12752).
+        cfg = derived if derived.fused else next(
+            config for config in op_b.candidates(ba_b, generation.gpu_target(gen)) if config.fused)
         if gen == "sm100":
             t_sm100 = generation.gpu_target(gen)
             shallow = dataclasses.replace(cfg, stages=2)
             deep = op_b._deepened(ba_b, shallow, t_sm100)
             assert deep.stages > shallow.stages and cfg.stages == deep.stages, (shallow, deep, cfg)
             assert op_b.resident(ba_b, deep, t_sm100) == op_b.resident(ba_b, shallow, t_sm100)
-        case = _fast_backward_compile_case(f"{gen}-fused-d64", query, key, spans, shapes)
+        case = _fast_backward_compile_case(f"{gen}-fused-d64", query, key, spans, shapes, cfg)
         found = compile_mosaic_kernels([case], gen)
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
@@ -1574,19 +1582,22 @@ def test_derived_one_consumer_heights_are_compared_by_choose():
     def fits(cfg):
         return (cfg.block_q == 128 and cfg.block_k == 32) or (cfg.block_q == 64 and cfg.block_k == 64)
 
-    picked = attention_mosaic._derived(family, jnp.bfloat16, 512, 512, tiles, fits, overlapped=True,
-                                       walks=program.walked_extents, choose=choose)
+    derive = attention_mosaic_derivation._derived
+    picked = derive(family, jnp.bfloat16, 512, 512, tiles, fits, overlapped=True,
+                    walks=program.walked_extents, choose=choose)
     assert picked is not None and (picked.block_q, picked.block_k) == (64, 64), (picked, seen)
     assert any({(c.block_q, c.block_k) for c in group} >= {(128, 32), (64, 64)} for group in seen), seen
 
 
-def _fast_backward_compile_case(name: str, q, k, spans, shapes):
-    """Build a `KernelCase` for fast-form Mosaic backward compilation."""
+def _fast_backward_compile_case(name: str, q, k, spans, shapes, config=None):
+    """Build a `KernelCase` for fast-form Mosaic backward compilation, at `config` where given (pinned), else
+    the derived one."""
     from fla_gdn_support import KernelCase
 
     def backward(query, key, value, dout, residuals):
-        grads = attention_mosaic.backward(query, key, value, spans, None, dout,
-                                          residuals=residuals, accurate=False)
+        with tuning.pinned({attention_mosaic.MosaicBackward: config} if config is not None else {}):
+            grads = attention_mosaic.backward(query, key, value, spans, None, dout,
+                                              residuals=residuals, accurate=False)
         return grads.query, grads.key, grads.value
 
     return KernelCase(name, lambda: (backward, (q, k, k, q, shapes)))
@@ -1609,13 +1620,14 @@ def test_d128_fused_backward_deepens_to_3_stages_without_losing_residency(gen):
                                                    scale=None, natural=attention_mosaic.NATURAL,
                                                    accurate=False)
         ba = op.bind(*args, interpret=False)
-        cfg = op.derived(ba, target)
-        assert cfg is not None and cfg.fused and op.takes(ba, cfg, target), (gen, cfg)
+        # The fused launch the derivation prices beside the two (`MosaicBackward.candidates`).
+        cfg = next(config for config in op.candidates(ba, target) if config.fused)
+        assert op.takes(ba, cfg, target), (gen, cfg)
         shallow = dataclasses.replace(cfg, stages=2)
         deep = op._deepened(ba, shallow, target)
         assert deep.stages > shallow.stages and cfg.stages == deep.stages, (gen, shallow, deep, cfg)
         assert op.resident(ba, deep, target) == op.resident(ba, shallow, target)
-        case = _fast_backward_compile_case(f"{gen}-fused-d128-3stage", q, k, spans, shapes)
+        case = _fast_backward_compile_case(f"{gen}-fused-d128-3stage", q, k, spans, shapes, cfg)
         found = compile_mosaic_kernels([case], gen)
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
@@ -1952,8 +1964,7 @@ def test_mma_sync_fused_32x32_backward_derives_and_compiles_spill_free(gen):
             natural=attention_mosaic.NATURAL, accurate=False)
         ba = op.bind(*args, interpret=False)
         target = generation.gpu_target()
-        cfg = op.derived(ba, target)
-        assert cfg is not None and cfg.fused, (gen, cfg)
+        cfg = next(config for config in op.candidates(ba, target) if config.fused)
         pin = attention_mosaic.BackwardTiles(32, 32, 2, 1, fused=True, family=cfg.family)
         assert op.takes(ba, pin, target), (gen, pin)
         bad = attention_mosaic.BackwardTiles(96, 64, 2, 1, fused=True, family=cfg.family)
@@ -2000,3 +2011,49 @@ def test_sm90_d256_gqa_forward_and_shared_keys_backward_compile_spill_free():
         _fast_backward_compile_case("sm90-d256-gqa-bwd", q, k, spans, res),
     ], "sm90")
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
+PAIRED = attention_mosaic.BackwardTiles(64, 64, 2, 2, fused=True, family="mma.sync")
+"""An A100's fast backward in one launch on two consumers sharing one cp.async pipeline (`mosaic_sm80`'s
+`shared_consumers`), each its own 64 keys of a 128-key block, a query tile's dQ summed between them before
+its one add (`attention_mosaic_fused.dq_summed`)."""
+
+
+@INTERPRETS
+@pytest.mark.parametrize("call", CALLS)
+def test_an_a100s_one_launch_on_two_paired_consumers_holds_check_1_interpreted(call,
+                                                                                 without_deterministic_ops):
+    """`PAIRED` over every query tile the block's readers read (a tile none of a consumer's keys sees
+    masked whole, the consumers' segments the same, `attention_mosaic_fused._walked_run`): within check 1 of
+    the reference from float64 over grouped heads, causal and full, under the interpreter."""
+    _check_backward(call, SHAPES["interpreted"], form=None, config=PAIRED, interpret=True, width=64,
+                    target=generation.gpu_target("sm80"))
+
+
+def test_an_a100s_two_consumers_are_legal_on_its_paired_launch_alone():
+    """An A100's two consumers past its derivations' one (`mosaic_sm80`'s `shared_consumers`) are legal on
+    the paired launch (`PAIRED`: queries first, each consumer its own keys, their dQ summed) and on no launch
+    whose consumers share a key block (`shared_keys`, `_coop_launch`, which loads its block by one)."""
+    with generation.assumed("sm80"):
+        target = generation.gpu_target()
+        op, ba = _backward_call((1, 512, 8, 2), 64, accurate=False)
+        assert op.legal(ba, PAIRED, target)
+        assert not op.legal(ba, dataclasses.replace(PAIRED, shared_keys=True), target)
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("causal", [True, False], ids=["causal", "full"])
+def test_an_a100s_fast_backward_on_two_paired_consumers_compiles(causal, without_deterministic_ops):
+    """An A100's fast backward at Llama 3.2 1B's head width (8 query heads over 2, 512 tokens, causal and
+    full) at its derived tiles on two paired consumers (`PAIRED`'s) is legal and lowers and compiles on a
+    compile-only A100 within its resources: the collective pipeline's two warpgroups walking the same
+    segments, their staged scores and the sum's parts and barriers in one block."""
+    with generation.assumed("sm80"):
+        target = generation.gpu_target()
+        op, ba = _backward_call((1, 512, 8, 2), 64, accurate=False, causal=causal)
+        fused = next(config for config in op.candidates(ba, target) if config.fused)
+        config = dataclasses.replace(fused, consumers=PAIRED.consumers)
+        assert op.legal(ba, config, target), config
+        case = KernelCase(f"paired backward {config}", lambda: op.lowering(ba, config))
+        found = compile_mosaic_kernels([case], "sm80")
+    assert not (failed := mosaic_failures(found)), "\n".join(failed)

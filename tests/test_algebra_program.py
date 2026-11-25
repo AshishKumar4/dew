@@ -1100,7 +1100,9 @@ def test_a_products_mode_prices_it():
     half, tf32, highest = (product(None, jnp.bfloat16), product(jax.lax.Precision.DEFAULT, jnp.float32),
                            product(jax.lax.Precision.HIGHEST, jnp.float32))
     flops = 2.0 * 64 ** 3
-    assert (half.flops, tf32.tf32_flops, highest.operations) == (flops, flops, flops)
+    # The CUDA cores' FFMAs, a multiply an instruction and its add fused into it (`Work.fused_multiply_adds`).
+    assert (half.flops, tf32.tf32_flops, highest.operations, highest.fused_multiply_adds) == (
+        flops, flops, flops / 2, flops / 2)
     # A dot algorithm by its fields is its preset's: three 16-bit products.
     spelled = jax.lax.DotAlgorithm(jnp.bfloat16, jnp.bfloat16, jnp.float32, num_primitive_operations=3)
     assert product(spelled, jnp.float32) == product(jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X3, jnp.float32)

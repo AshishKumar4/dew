@@ -22,6 +22,7 @@ from dew.nn.kernels import generation
 from dew.nn.kernels.templates import (
     attention as template,
     attention_mosaic,
+    attention_mosaic_derivation,
     attention_route,
     report,
     resources,
@@ -449,7 +450,8 @@ def test_a_fewer_rows_ladder_walks_the_query_blocks_its_derivation_walks():
         layout = op._named(target.generation, query.dtype, query.shape[1])[derived.family]
         assert 32 in fewer_rows(layout), fewer_rows(layout)
         config = dataclasses.replace(derived, block_q=128, block_k=32)
-        walked = {block for block in attention_mosaic._sides(32, layout, query.dtype, query.shape[1])
+        sides = attention_mosaic_derivation._sides(32, layout, query.dtype, query.shape[1])
+        walked = {block for block in sides
                   if block < 128 and op.takes(ba, dataclasses.replace(config, block_q=block), target)
                   and op._regime(ba, dataclasses.replace(config, block_q=block), target)
                   == op._regime(ba, config, target)}

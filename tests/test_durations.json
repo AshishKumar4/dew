@@ -81492,7 +81492,7 @@ null,
 "tests/test_attention_mosaic_certification.py::test_a_fewer_rows_ladder_walks_the_query_blocks_its_derivation_walks": [
 0.645,
 1.005,
-1714388992
+1255198720
 ],
 "tests/test_attention_mosaic_certification.py::test_a_ladder_holds_no_rung_its_assembler_caps_otherwise": [
 0.343,
@@ -81502,7 +81502,7 @@ null,
 "tests/test_attention_mosaic_certification.py::test_a_ladder_that_spills_throughout_certifies_its_ends_alone": [
 48.504,
 63.206,
-1139183616
+2068115456
 ],
 "tests/test_attention_mosaic_certification.py::test_a_launch_is_certified_by_its_kernels_verdict_in_a_tree_edited_outside_them": [
 73.51,
@@ -81739,11 +81739,6 @@ null,
 24.095,
 1255198720
 ],
-"tests/test_attention_mosaic_compile.py::test_a_fewer_rows_ladder_walks_the_query_blocks_its_derivation_walks": [
-0.645,
-1.005,
-1255198720
-],
 "tests/test_attention_mosaic_compile.py::test_a_hook_that_forms_a_unit_axis_compiles_for_an_h100[0]": [
 31.285,
 43.593,
@@ -81753,36 +81748,6 @@ null,
 33.241,
 47.998,
 770162688
-],
-"tests/test_attention_mosaic_compile.py::test_a_ladder_holds_no_rung_its_assembler_caps_otherwise": [
-0.343,
-1.014,
-770162688
-],
-"tests/test_attention_mosaic_compile.py::test_a_ladder_that_spills_throughout_certifies_its_ends_alone": [
-48.504,
-63.206,
-2068115456
-],
-"tests/test_attention_mosaic_compile.py::test_a_launch_is_certified_by_its_kernels_verdict_in_a_tree_edited_outside_them": [
-73.51,
-null,
-2243141632
-],
-"tests/test_attention_mosaic_compile.py::test_a_launch_is_certified_once_a_machine": [
-31.454,
-null,
-2243141632
-],
-"tests/test_attention_mosaic_compile.py::test_a_launchs_kernels_are_named_alike_on_every_part_of_one_generation_and_size": [
-12.461,
-14.9,
-2243141632
-],
-"tests/test_attention_mosaic_compile.py::test_a_launchs_stored_verdict_is_read_where_its_ptxas_build_assembles_and_not_another": [
-46.16,
-null,
-1138864128
 ],
 "tests/test_attention_mosaic_compile.py::test_a_paged_decode_step_compiles_spill_free_at_its_plans_tiles[p1-sm100]": [
 219.299,

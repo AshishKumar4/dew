@@ -352,8 +352,12 @@ def test_a_split_steps_merge_and_its_state_are_on_par_on_this_gpu(form):
     nan_pad = jnp.full((*padded.shape[:-1], 32), jnp.nan, padded.dtype)
     padded_wide = jnp.concatenate([padded, nan_pad], axis=-1)
     with_pad = jax.jit(lambda p, s: tuple(ours(p, s)))(padded_wide, stacked)
-    for lhs, rhs in zip(one_block, with_pad, strict=True):
+    # And on Mosaic GPU's merge where Pallas Triton serves the unhooked one (`merged.MOSAIC_SLOWER`).
+    with tuning.pinned({merged.MergedPadded: merged.MergeConfig(64)}):
+        mosaic_pad = jax.jit(lambda p, s: tuple(ours(p, s)))(padded_wide, stacked)
+    for lhs, rhs, pinned in zip(one_block, with_pad, mosaic_pad, strict=True):
         np.testing.assert_array_equal(np.asarray(lhs), np.asarray(rhs))
+        np.testing.assert_array_equal(np.asarray(lhs), np.asarray(pinned))
 
 
 def test_the_decode_matrix_holds_on_this_gpu():

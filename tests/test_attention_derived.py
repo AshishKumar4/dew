@@ -627,7 +627,7 @@ def test_forward_declined_checks_feasibility_without_pricing(tmp_path):
 
 
 def test_compute_bound_forward_skips_in_kernel_decided_and_uses_fast_may_scale():
-    """Compute-bound forwards (`not streams`) skip in-kernel `decided` (avoiding per-tile `key_magnitudes`
+    """Compute-bound forwards (`not streams`) skip in-kernel `decided` (avoiding per-tile `keys_read`
     SMEM reads and scaled register bloat) while streaming calls retain `decided`, and 1-kernel `may_scale`
     soundly bounds normal, non-finite, empty, and overflowing inputs (rows 5272, 5274)."""
     from dew.nn.kernels import generation

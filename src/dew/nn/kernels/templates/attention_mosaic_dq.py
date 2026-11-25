@@ -57,6 +57,9 @@ from dew.nn.kernels.templates.attention_mosaic_scores import (
 from dew.nn.kernels.templates.hooks import Side
 
 DQ_ROWS = ("residual", "mass", "keyed_mass", "keyed_shift")
+DQ_KERNEL = "attention_dq"
+"""The dQ launch's kernels' name, each of its columns' a suffix of it: what a price of the backward's launches
+reads a kernel's launch by (`MosaicBackward.price_config`)."""
 """The row sums a dQ launch writes (`gradient.DqSums`' fields, `[B, H, Qp]` fp32 each, in the order of its
 rows array), after them each summed dQ parameter's gradient (`DqSums.grads`) and then its weights' pullback
 (`DqSums.weighed`): `dq_rows` lays a pass's sums out so, `dq_sums` reads them back."""
@@ -260,7 +263,7 @@ def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, s
     width = query.shape[-1] // columns
     launched = [_dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, spans,
                             score_params, drop, walk=walk, share=(column * width, width),
-                            name="attention_dq" + ("" if columns == 1 else f"_columns{column}"))
+                            name=DQ_KERNEL + ("" if columns == 1 else f"_columns{column}"))
                 for column in range(columns)]
     if columns == 1:
         return launched[0]

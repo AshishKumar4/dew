@@ -203,7 +203,7 @@ def product_work(rows: int, depth: int, columns: int, *, count: int = 1, dtype=j
     (`dew.algebra.linear_scan`, at the precision they run at), Dew's fp32 products."""
     field, passes = product_mode(precision, dtype, dtype, on or target())
     held = Work(kernels=float(count), kept_bytes=kept(rows * columns * count, np.dtype(dtype).itemsize))
-    return dataclasses.replace(held, **{field: 2.0 * rows * depth * columns * count * passes})
+    return held + kernel_cost.multiplied(field, 2.0 * rows * depth * columns * count * passes)
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
