@@ -332,20 +332,36 @@ def _square_draw(seed):
 SHARED_IDS = {
     "key_valid": jnp.asarray([True, True, False, True]),
     "query_slots": jnp.arange(4, dtype=jnp.int32),
+    # Every query's runs `[R, 2]` and every row's `[Q, R, 2]`, each of the batch's leading length.
+    "key_runs": jnp.asarray([[0, 1], [1, 1], [2, 3], [3, 4]], jnp.int32),
+    "key_runs by query": jnp.asarray([[[0, 1], [q, q + 1]] for q in range(4)], jnp.int32),
 }
-"""Ids every row shares whose leading length is the batch's (four): `[K]` validity, `[Q]` slots. Shared runs
-(`[Q, R, 2]`, `[R, 2]`) one device misreads against the batch (row 12701), so they hold no witness here."""
+"""Ids every row shares whose leading length is the batch's (four): `[K]` validity, `[Q]` slots, `[R, 2]` and
+`[Q, R, 2]` runs (row 12701)."""
 
 
 @pytest.mark.mesh
 @pytest.mark.parametrize("name", sorted(SHARED_IDS))
 def test_a_shared_id_of_the_batchs_length_stays_whole(name):
-    """A shared `[K]` validity or `[Q]` slots of the batch's length (four rows of four tokens, the rows split
-    two ways) travels whole, the keys' or the queries' as it is, not split as rows (reviews of #4023 and
-    #4026): the entry on par with whole sequences, forward and backward."""
-    call = {"causal": True, name: SHARED_IDS[name], "implementation": "reference"}
+    """A shared `[K]` validity, `[Q]` slots or `[R, 2]` and `[Q, R, 2]` runs of the batch's length (four rows
+    of four tokens, the rows split two ways) travels whole, the keys' or the queries' as it is, not split as
+    rows (reviews of #4023 and #4026, row 12701): the entry on par with whole sequences, forward and
+    backward."""
+    call = {"causal": True, name.split(" by ")[0]: SHARED_IDS[name], "implementation": "reference"}
     entry = with_gradients(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call))
     assert_exchanged_on_par(entry, entry, SHARED, _square_draw, f"a shared {name} of the batch's length")
+
+
+@pytest.mark.mesh
+def test_runs_of_another_batch_are_refused_before_the_exchange():
+    """Runs a row apiece `[2, Q, R, 2]` beside a batch of four, its rows split two ways, are refused before
+    the all-to-all, where replicated whole each shard read its own two rows' runs as its rows' and rows two
+    and three took rows zero and one's visibility (review of #4035)."""
+    runs = jnp.broadcast_to(jnp.asarray([[0, 2]], jnp.int32), (2, 4, 1, 2))
+    query, key, value, _ = _square_draw(0)
+    with jax.set_mesh(SHARED.build()), pytest.raises(ValueError):
+        jax.jit(lambda q, k, v: scaled_dot_product_attention(
+            q, k, v, causal=True, key_runs=runs, implementation="reference")).trace(query, key, value)
 
 
 @pytest.mark.mesh
