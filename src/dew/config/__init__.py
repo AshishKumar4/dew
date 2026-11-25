@@ -51,6 +51,7 @@ from dew.config.earlier import (
     MARKERS,
     MASKED_DECAY_MARK,
     TYPED_OPTIMIZER,
+    _LoopChange,
     earlier_run,
     unmarked,
 )
@@ -73,6 +74,7 @@ from dew.data.plan import PLAN_VERSIONS, SCHEDULE, PlanOrderChanged, read_by
 from dew.distributed.placement import MeshSpec
 from dew.interop.weights import AUTO
 from dew.lora import LoRA
+from dew.nn.backbones.decoder_stack import Loop
 from dew.nn.kernels import generation
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.optim import OptimConfig, ParamGroup
@@ -100,6 +102,7 @@ from dew.training.ahead import AheadOfTime, CompiledAhead, fit_plan
 from dew.training.budget import Pause
 from dew.training.display import TrainingDisplay
 from dew.training.evaluation import EvalSuite, Split
+from dew.training.phase_passes import PassPolicy, SampledPasses
 from dew.training.profiling import ProfileReport, ProfileWindow
 from dew.training.quantization import quantize_trunk
 from dew.training.rollout import Rollout
@@ -110,8 +113,6 @@ if TYPE_CHECKING:
     from _typeshed import DataclassInstance
 
     from dew.interop import Pretrained
-    from dew.nn.cross_pass import CrossPass
-    from dew.training.phase_passes import SampledPasses
     from dew.training.trainer import Trainer
 
 
@@ -655,15 +656,6 @@ class RunConfig:
     it trains, which the resume must keep (`check_resume`), and so does `trainer.quantization`, which
     changes the forward pass the weights train through."""
 
-    EXECUTED: ClassVar[tuple[str, ...]] = ("loop_remat",)
-    """The model and source fields, by name, that say how a model's layers execute and not what they
-    compute or store: a looped block's passes recomputed in its backward or held (`loop_remat`), memory
-    alone, compute the same step, so a run resumes under either (`check_resume`). A model's own fields that
-    say how it runs, its recompute (`remat`) among them, are its class's to mark (`dew._records.RUNS`), which
-    a resume reads by its class (`registry.computing_fields`). A source's
-    weights packed or decoded (`SourceOptions.packed_weights`) are not: packed, its banks are no trainable
-    parameters and hold no optimizer moments, so a resume across them is refused by name."""
-
     BUILT: ClassVar[tuple[str, ...]] = ("source.param_dtype", "source.step", "data_plan_version")
     """The fields, by their dotted paths, a run may leave None for its build or its pinning to resolve,
     whose resolution a later Dew, or a later state of what it reads, may change: the storage of the
@@ -773,9 +765,11 @@ class RunConfig:
     def _fields_record(self) -> dict[str, JSON]:
         """The record of every field but the chains (`to_dict`), which an override of the others
         writes without encoding the chains."""
+        # A private field (a saved record's translation, `_earlier_loop`) recorded where it holds one alone.
         with registry.recording():
             return {field.name: to_record(getattr(self, field.name), declared_type(type(self), field.name))
-                    for field in dataclasses.fields(self) if field.name not in CHAINS}
+                    for field in dataclasses.fields(self) if field.name not in CHAINS
+                    and not (field.name.startswith("_") and getattr(self, field.name) == field.default)}
 
     @classmethod
     def from_dict(cls, values: Mapping[str, object]) -> Self:
@@ -903,8 +897,7 @@ class RunConfig:
         if recorded is None:
             raise ValueError(f"the run to resume is no {type(self).__name__}; resume it as the run it "
                              "records, or train under another name")
-        before, now = (_records.without_fields(record, self.EXECUTED)
-                       for record in (recorded._fields_record(), self._fields_record()))
+        before, now = (run._resumed_as()._fields_record() for run in (recorded, self))
         # A field the saved run left to its build and its record holds unresolved, which no checkpoint
         # states either (`earlier_checkpointed`), is the one this build resolves (`BUILT`).
         unresolved = {path for path in self.BUILT if "." not in path and before.get(path) is None}
@@ -927,6 +920,16 @@ class RunConfig:
         if changed:
             raise ValueError(f"the run to resume trained other {', '.join(changed)}; resume it as it "
                              "recorded them, or train under another name")
+
+    def _resumed_as(self) -> Self:
+        """This run as a resume compares it (`check_resume`): with the fields that say how its layers execute
+        and not what they compute or store read as their defaults, a subclass's; memory alone, they compute
+        the same step, so a run resumes under either. A model's own fields that say how it runs, its
+        recompute (`remat`) among them, are its class's to mark (`dew._records.RUNS`), which a resume reads by
+        its class (`registry.computing_fields`). A source's weights packed or decoded
+        (`SourceOptions.packed_weights`) are not: packed, its banks are no trainable parameters and hold no
+        optimizer moments, so a resume across them is refused by name."""
+        return self
 
     def _saved_as(self, saved: Mapping[str, object]) -> Self | None:
         """The saved run whose record is `saved` read as this class reads it (`from_dict`), a field the
@@ -1699,216 +1702,121 @@ class RunConfig:
 
 @dataclasses.dataclass(frozen=True)
 class DecoderRunConfig(RunConfig):
-    """A run over a loaded decoder, which may run a block of its layers in passes: the pass count, the
-    block, the passes trained through and their recomputation (`CausalTransformer.with_passes`), each
-    the run's choice over the checkpoint's own. The language-model and the decision runs take it."""
+    """A run over a loaded decoder, which may run a block of its layers in passes: the loop it runs
+    (`CausalTransformer.loop`) and the pass counts its steps take, each the run's choice over the
+    checkpoint's own. The language-model and the decision runs take it."""
 
-    loop_steps: int | tuple[int, ...] | None = None
-    """The passes a looped checkpoint runs its block (`CausalTransformer.loop`), such
-    as Ouro's at 1, 2 or 4; or one count a phase of the run's data (`dew.data.phases`,
-    `Trainer`'s `phase_passes`), a pass count that grows over the run, each phase's step
-    compiled with its own and the run handing on the last; None keeps the checkpoint's own."""
-    loop_layers: tuple[int, int] | None = None
-    """The block of layers [first, end) that `loop_steps` repeats: a pretrained
-    decoder with no loop gains one over its own layers, as Qwen 3.5's middle block
-    repeated twice; None keeps a looped checkpoint's block."""
-    loop_backprop_steps: int | None = None
-    """Train through the last k passes of the loop alone, with earlier passes
-    cut from backpropagation; None keeps the loop's own choice."""
-    loop_remat: bool = False
-    """Checkpoint every pass of the loop, including the first, and recompute
-    it in the backward pass; requires a loop and leaves decoding unchanged.
-    False keeps a checkpoint's own choice."""
-    loop_implicit: bool = False
-    """Relax each later pass toward the block's input by a per-channel θ drawn
-    at zero (`Loop.implicit`), so the looped decoder starts as the one loaded
-    computes; False keeps a checkpoint's own choice."""
-    loop_theta_per_pass: bool = False
-    """Give each later pass of an implicit loop (`loop_implicit`, or a checkpoint's own) a θ of its own
-    (`Loop.theta_passes`), rows for the largest count the run takes (`loop_steps`, or a phase's largest,
-    else the checkpoint's own count), each drawn at zero, or each a checkpoint's one θ (`looping`); a loop
-    that is not implicit refuses it. False keeps a checkpoint's own choice."""
-    loop_exit_gate: bool = False
-    """Weigh each pass's exit by a gate drawn at zeros over its states (`Loop.exit_gate`), which the
-    objective's `exit_entropy` trains as Ouro does, at `EXIT_ENTROPY` where the run states none
-    (`exit_settings`); False keeps a checkpoint's own choice."""
-    loop_exit_threshold: float | None = None
-    """Exit each token at the first pass whose cumulative exit probability reaches this
-    (`Loop.exit_threshold`); None keeps a checkpoint's own choice."""
-    loop_steps_sample: str | None = None
-    """Draw the loop's pass count afresh for each microbatch from this named law, bounded to
-    `loop_steps_max` (`dew.training.phase_passes.SampledPasses`: 'lognormal-poisson', of mean
-    `loop_steps_mean` and dispersion `loop_steps_dispersion`), the model holding and handing on the cap;
-    None runs one count a step."""
-    loop_steps_mean: float | None = None
-    """The sampled pass count's mean before its bound (`loop_steps_sample`)."""
-    loop_steps_dispersion: float | None = None
-    """The standard deviation of the sampled pass count's log rate (`loop_steps_sample`)."""
-    loop_steps_max: int | None = None
-    """The sampled pass count's cap (`loop_steps_sample`), the count the model holds."""
-    loop_messages: bool = False
-    """Couple the loop's passes through the bank of block summaries each leaves the next (`Loop.messages`,
-    `dew.nn.cross_pass`): every pass enters the block at its input, and each later pass merges the bank
-    into its sublayers' inputs through gates drawn at zero, so the looped decoder starts as the one loaded
-    computes; False keeps a checkpoint's own choice."""
-    loop_message_block_size: int | None = None
-    """The layers each banked summary closes (`CrossPass.block_size`); None its default."""
-    loop_message_rank: int | None = None
-    """The rank of each merge's controller (`CrossPass.rank`); None its default."""
-    loop_message_additive: bool | None = None
-    """Whether each merge's message adds a term of its own beside the gained summary
-    (`CrossPass.additive`): `--loop-message-additive True` keeps it and `False` drops it, over a checkpoint's
-    own choice; unstated, a checkpoint's own choice is kept, and the default taken where it holds no
-    messages (row 11742: stating it on was read as unstated, so a checkpoint that dropped it kept it
-    dropped)."""
+    loop: Annotated[Loop | None, tyro.conf.Suppress] = None
+    """The loop the decoder runs (`dew.nn.backbones.decoder_stack.Loop`: its block, passes, recompute, exits,
+    θ and messages), in place of the checkpoint's own: a pretrained decoder with no loop gains it over its
+    own layers, as Qwen 3.5's middle block repeated twice (`Loop(2, layers=(8, 16), step_norm=False)`),
+    and a looped one's loop is replaced whole (`dataclasses.replace(its_loop, exit_gate=True)` changes
+    one of its choices). A loop that gives its layers parameters of their own (an implicit loop's θ, an exit
+    gate, the messages' merges) draws them at their zeros beside the loaded weights, so the decoder
+    starts as the one loaded computes (`Pretrained.with_model`). None keeps the checkpoint's own."""
+    _earlier_loop: Annotated[_LoopChange | None, tyro.conf.Suppress] = dataclasses.field(
+        default=None, kw_only=True)
+    """A saved run's changes to its checkpoint's loop, a choice at a time, as a Dew before the run stated its
+    loop whole recorded them (`dew.config.earlier._LoopChange`), which its record alone holds
+    (`dew.config.earlier_run`); a run states its `loop`. Carried to 1.0 (ledger 1552)."""
+    passes: Annotated[PassPolicy | None, tyro.conf.Suppress] = None
+    """The passes the loop runs each step (`PassPolicy`): one count (an int); one count a phase of the
+    run's data (a tuple, `dew.data.phases`, `Trainer`'s `phase_passes`), each phase's step compiled with its
+    own and the run handing on the last; or a count drawn afresh for each microbatch (`SampledPasses`,
+    `Trainer`'s `sampled_passes`), the model holding and handing on its cap. Over the loop's own count
+    (`loop`, else the checkpoint's), whose block, recompute, exits, θ and messages it keeps. None runs
+    the loop's own count."""
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        stated = (self.loop_message_block_size, self.loop_message_rank)
-        if not self.loop_messages and (any(field is not None for field in stated)
-                                       or self.loop_message_additive is not None):
-            raise ValueError("--loop-message-block-size, --loop-message-rank and --loop-message-additive "
-                             "shape the messages --loop-messages passes")
-        sampling = (self.loop_steps_mean, self.loop_steps_dispersion, self.loop_steps_max)
-        if self.loop_steps_sample is None and any(field is not None for field in sampling):
-            raise ValueError("--loop-steps-mean, --loop-steps-dispersion and --loop-steps-max state a "
-                             "sampled pass count's law, which --loop-steps-sample names")
-        if self.loop_steps_sample is not None:
-            # Stated whole before anything loads; the law checks its own fields (`sampled_passes`).
-            if any(field is None for field in sampling):
-                raise ValueError("--loop-steps-sample draws from a law of a mean, a dispersion and a cap: "
-                                 "state --loop-steps-mean, --loop-steps-dispersion and --loop-steps-max")
-            if self.loop_steps is not None:
-                raise ValueError("a run states its loop's pass counts once: --loop-steps, or a count drawn "
-                                 "per microbatch (--loop-steps-sample), whose cap the model holds")
-            self.sampled_passes()
-        if isinstance(self.loop_steps, tuple) and self.data is not None:
+        if self.loop is not None and self._earlier_loop is not None:
+            raise ValueError("a run states its loop whole (loop), or a saved run's record its changes to its "
+                             "checkpoint's (_earlier_loop), not both")
+        if isinstance(self.passes, tuple) and self.data is not None:
             # Refused before anything loads: a count a phase the data reads in.
             phases = self.data.phase_count
-            if len(self.loop_steps) != phases:
-                raise ValueError(f"loop_steps names {len(self.loop_steps)} pass counts, one a phase, and the "
-                                 f"run's data reads {phases} phase(s)")
+            if len(self.passes) != phases:
+                raise ValueError(f"passes names {len(self.passes)} pass counts, one a phase, and the run's "
+                                 f"data reads {phases} phase(s)")
 
     @property
     def handed_passes(self) -> int | None:
         """The pass count the run's model holds and hands on: the last phase's, where the run names one a
-        phase (`loop_steps`), a sampled count's cap (`loop_steps_max`), else `loop_steps`."""
-        if self.loop_steps_sample is not None:
-            return self.loop_steps_max
-        return self.loop_steps[-1] if isinstance(self.loop_steps, tuple) else self.loop_steps
-
-    def sampled_passes(self) -> "SampledPasses | None":
-        """The law the run draws its pass count from per microbatch (`loop_steps_sample`), None where it
-        draws none."""
-        from dew.training.phase_passes import SampledPasses
-
-        if self.loop_steps_sample is None:
-            return None
-        assert self.loop_steps_mean is not None and self.loop_steps_dispersion is not None
-        assert self.loop_steps_max is not None
-        return SampledPasses(self.loop_steps_mean, self.loop_steps_dispersion, self.loop_steps_max,
-                             law=self.loop_steps_sample)
+        phase, a sampled count's cap, else the count the run states (`passes`); None runs the loop's own."""
+        if isinstance(self.passes, SampledPasses):
+            return self.passes.cap
+        return self.passes[-1] if isinstance(self.passes, tuple) else self.passes
 
     def built[LossT, EffectsT](self, objective: Objective[LossT, EffectsT],
                                mesh: MeshSpec | jax.sharding.Mesh, rollout: Rollout | None,
                                **resources) -> "Trainer[LossT, EffectsT]":
         """`RunConfig.built`, its steps run each phase's pass count where the run names one a phase, or one
-        drawn per microbatch (`sampled_passes`)."""
-        phased = ({"phase_passes": self.loop_steps} if isinstance(self.loop_steps, tuple) else
-                  {"sampled_passes": sampled} if (sampled := self.sampled_passes()) is not None else {})
+        drawn per microbatch (`passes`)."""
+        phased = ({"phase_passes": self.passes} if isinstance(self.passes, tuple) else
+                  {"sampled_passes": self.passes} if isinstance(self.passes, SampledPasses) else {})
         return super().built(objective, mesh, rollout, **phased, **resources)
 
     @property
     def loops(self) -> bool:
         """Whether the run asks anything of a loop (`looped`)."""
-        return (self.loop_steps is not None or self.loop_layers is not None
-                or self.loop_backprop_steps is not None or self.loop_remat or self.loop_implicit
-                or self.loop_theta_per_pass or self.loop_exit_gate or self.loop_exit_threshold is not None
-                or self.loop_steps_sample is not None or self.loop_messages)
+        return self.loop is not None or self._earlier_loop is not None or self.passes is not None
 
     def exit_settings(self) -> dict[str, float]:
-        """The exit objective's weight an objective that trains a gate the run draws (`loop_exit_gate`)
+        """The exit objective's weight an objective that trains a gate the run's loop draws (`Loop.exit_gate`)
         takes: `EXIT_ENTROPY` (`dew.nn.backbones.looping`) where the run's objective states none, none
         derived where it states one; refused where it states None, which would leave the gate at its draw
-        (a hazard of one half every pass), trained by nothing. None where the run draws no gate."""
+        (a hazard of one half every pass), trained by nothing. None where the run states no gated loop."""
         from dew.nn.backbones.looping import EXIT_ENTROPY
 
-        if not self.loop_exit_gate:
+        held = self.loop if self.loop is not None else self._earlier_loop
+        if held is None or not held.exit_gate:
             return {}
         stated = {} if self.objective is None else self.objective.fields
         if "exit_entropy" not in stated:
             return {"exit_entropy": EXIT_ENTROPY}
         if stated["exit_entropy"] is None:
-            raise ValueError("--loop-exit-gate draws a gate the objective's exit_entropy trains, and the run "
-                             "sets it to None, which trains nothing: state a weight, or leave it out for "
+            raise ValueError("the run's loop draws an exit gate the objective's exit_entropy trains, and the "
+                             "run sets it to None, which trains nothing: state a weight, or leave it out for "
                              f"{EXIT_ENTROPY}")
         return {}
 
+    def _resumed_as(self) -> Self:
+        """`RunConfig._resumed_as`: its loop's passes recomputed in its backward or held (`Loop.remat`),
+        memory alone, read as held; and a saved run's change to its checkpoint's loop (`_earlier_loop`) so,
+        none where it changed that alone."""
+        loop = None if self.loop is None else dataclasses.replace(self.loop, remat=False)
+        earlier = (None if self._earlier_loop is None
+                   else dataclasses.replace(self._earlier_loop, remat=False))
+        return dataclasses.replace(self, loop=loop,
+                                   _earlier_loop=None if earlier == _LoopChange() else earlier)
+
     def looped(self, start: "Pretrained") -> "Pretrained":
-        """`start` with its block run as the run asks (`looping`), as loaded where it asks nothing."""
+        """`start` with its block run as the run asks: under the run's loop (`loop`), at the run's pass
+        count (`handed_passes`), each over the checkpoint's own where the run states none; as loaded where
+        it asks nothing. A run's loop with a θ row a later pass (`Loop.theta_passes`) over a checkpoint
+        holding one θ reads that θ in every row, so the loop computes what the checkpoint's did."""
         if not self.loops:
             return start
-        from dew.nn.protocols import Looped
+        from dew.nn.protocols import Looped, Looping
 
-        counts = self.loop_steps if isinstance(self.loop_steps, tuple) else (self.handed_passes,)
-        rows = max((count for count in counts if count is not None), default=None)
-        own = start.model.loop if isinstance(start.model, Looped) else None
-        if own is not None and own.theta_passes is not None:
-            # A checkpoint holding rows already keeps them: a count of fewer passes reads the first, and
-            # one of more is refused by its loop, no row held for its later passes.
-            rows = own.theta_passes
-        elif rows is None and own is not None:
-            # The checkpoint's own count, where the run keeps it.
-            rows = own.steps
-        return looping(start, self.handed_passes, self.loop_layers, backprop_steps=self.loop_backprop_steps,
-                       remat=self.loop_remat or None, implicit=self.loop_implicit or None,
-                       exit_gate=self.loop_exit_gate or None, exit_threshold=self.loop_exit_threshold,
-                       theta_passes=rows if self.loop_theta_per_pass else None,
-                       messages=self.messages(None if own is None else own.messages), key=self.trainer.key)
-
-    def messages(self, held: "CrossPass | None") -> "CrossPass | None":
-        """The messages the run's loop passes (`loop_messages`), None where it keeps a checkpoint's own: the
-        checkpoint's own messages where it holds them (`held`), else the defaults, with what the run
-        states in their place (a block size, a rank, `--loop-message-additive`), so a checkpoint's
-        others, which shape no parameter, are kept, not reset (row 10855)."""
-        if not self.loop_messages:
-            return None
-        from dew.nn.cross_pass import CrossPass
-
-        stated = {"block_size": self.loop_message_block_size, "rank": self.loop_message_rank,
-                  "additive": self.loop_message_additive}
-        return dataclasses.replace(CrossPass() if held is None else held,
-                                   **{name: value for name, value in stated.items() if value is not None})
-
-
-def looping(start: "Pretrained", steps: int | None, layers: tuple[int, int] | None, *,
-            backprop_steps: int | None = None, remat: bool | None = None,
-            implicit: bool | None = None, exit_gate: bool | None = None,
-            exit_threshold: float | None = None, theta_passes: int | None = None,
-            messages: "CrossPass | None" = None, key: int | jax.Array = 0) -> "Pretrained":
-    """A loaded checkpoint whose block runs `steps` passes: a looped one's own block, or `layers`,
-    which gives a decoder with no loop one over its own layers. Refused where neither names a block,
-    or a new block's passes are not stated. `backprop_steps` and `remat` choose
-    the loop's backward memory, `implicit` its later passes' rule (`Loop.implicit`), and `exit_gate` and
-    `exit_threshold` its exits (`Loop.exit_gate`) and `theta_passes` its θ's rows (`Loop.theta_passes`),
-    each row a checkpoint's one θ where it held one, so the loop computes what the checkpoint's did, a
-    source held as shapes alone rowed as its shape, and `messages` couples its passes (`Loop.messages`);
-    None keeps a looped checkpoint's own value. A loop that gives its layers parameters of their own (an
-    implicit loop's θ, an exit gate, the messages' merges) draws them from `key` beside the loaded
-    weights, fresh (`Pretrained.with_model`)."""
-    from dew.nn.protocols import Looping
-
-    looped = (start.model.with_passes(steps, layers, backprop_steps=backprop_steps, remat=remat,
-                                      implicit=implicit, exit_gate=exit_gate,
-                                      exit_threshold=exit_threshold, theta_passes=theta_passes,
-                                      messages=messages)
-              if isinstance(start.model, Looping) else None)
-    if looped is None:
-        raise ValueError(f"this {type(start.model).__name__} has no loop: --loop-layers names the block of "
-                         "its layers to repeat and --loop-steps how many times")
-    if theta_passes is not None:
-        start = dataclasses.replace(start, variables=_theta_rows(start.variables, theta_passes))
-    return start.with_model(looped, key=key)
+        if self._earlier_loop is not None:
+            # A saved run's loop changed a choice at a time, as an earlier Dew recorded it (`earlier_run`).
+            return self._earlier_loop.applied(start, self.passes, self.trainer.key)
+        model = start.model
+        if not isinstance(model, Looping):
+            raise ValueError(f"this {type(model).__name__} runs no loop: a run's loop or passes need a "
+                             "decoder that loops its layers")
+        if self.loop is not None:
+            model = model.with_loop(self.loop)
+            if self.loop.theta_passes is not None:
+                start = dataclasses.replace(start, variables=_theta_rows(start.variables,
+                                                                         self.loop.theta_passes))
+        counted = model if self.handed_passes is None else model.with_passes(self.handed_passes)
+        unlooped = isinstance(model, Looped) and model.loop is None
+        if counted is None or unlooped:
+            raise ValueError(f"this {type(model).__name__} has no loop: state the run's loop (`Loop`, its "
+                             "block of layers and passes) beside its passes")
+        return start.with_model(counted, key=self.trainer.key)
 
 
 def _theta_rows(variables, passes: int):
@@ -1937,4 +1845,4 @@ def _theta_rows(variables, passes: int):
 
 __all__ = ["DecoderRunConfig", "Diagnostics", "LowerTarget", "MetricConfig", "ObjectiveConfig", "Prepared",
            "Release", "RunConfig", "SourceOptions", "Suite", "TrainerConfig",
-           "flag_selected", "looping"]
+           "flag_selected"]

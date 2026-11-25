@@ -1760,6 +1760,12 @@ class CausalTransformer(LinearProducts):
                                                    layers=layers or self.loop.layers, **options))
 
     @nn.nowrap
+    def with_loop(self, loop: Loop) -> Self:
+        """This model running `loop` in place of its own, whole (`Looping.with_loop`): its block, passes,
+        recompute, exits, θ and messages as `loop` states them."""
+        return self.clone(loop=loop)
+
+    @nn.nowrap
     def projected(self, params, *, updated: bool):
         """`ProjectsParameters`: before a training step's update, every AltUp layer's prediction
         coefficients clamped to `altup.coef_clip`, as the reference clamps its stored weight before

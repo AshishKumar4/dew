@@ -219,7 +219,7 @@ class LMRunConfig(DecoderRunConfig):
     def __post_init__(self) -> None:
         super().__post_init__()
         if self.pretrained is None and self.loops:
-            raise ValueError("--loop-* run a --pretrained checkpoint's block in passes; a fresh decoder "
+            raise ValueError("a run's loop and passes run a --pretrained checkpoint's block; a fresh decoder "
                              "states its loop in --model")
         if self.objective.name == objectives.paths["block_diffusion"] and self.pretrained is None:
             raise ValueError("block_diffusion fine-tuning requires --pretrained")

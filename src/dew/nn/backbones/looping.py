@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -39,14 +39,13 @@ from flax.core.scope import DenyList
 from flax.linen.transforms import lift_direct_transform
 from jax.sharding import NamedSharding
 
-from dew.batch import sows_appended
-from dew.mesh import FSDP_AXIS
+from dew.batch import sows_appended, unboxed
+from dew.mesh import FSDP_AXIS, mesh_axes
 from dew.nn.dense import captures_any_method
-from dew.quantization import holds_quantized
 
 from ..precision import at_least_fp32, softplus
 from ..protocols import EXIT_PASSES, EXITS, fixed_remat
-from ..sharding import GatheredOver, gathered_over, placed_layout, placing
+from ..sharding import explicit_over, gathered_over, placed_layout, typed_on
 from .decoder_stack import BY_CALL, WRITTEN, Loop, PassView, SharedPassView
 from .layer_names import group_layers
 
@@ -343,7 +342,7 @@ def run_loop(model, x, *, train: bool, decode: bool, passes=None, **inputs):
     if first:
         x = model.stack(x, span=(0, first), train=train, decode=decode, **inputs)
 
-    def every_pass(module, x):
+    def every_pass(module, x, inputs, passes):
         # The block's passes, first and later, and what each exits.
         run = _Passes(module, train=train, decode=decode, inputs=inputs)
         run.injected = x
@@ -355,19 +354,18 @@ def run_loop(model, x, *, train: bool, decode: bool, passes=None, **inputs):
         return x, run.exited
 
     layout = placed_layout()
-    if (loop.gathered and not model.is_initializing() and layout is not None
-            and jax.sharding.get_abstract_mesh().shape.get(FSDP_AXIS, 1) > 1):
-        # Every pass reads the block's parameters gathered once before the first (`Loop.gathered`), and
-        # traces under a layout placing them so (`GatheredOver`): a projection mapped per shard takes them
-        # as they lie, gathering none again.
-        names = tuple(f'layers_{index}' for index in range(first, end))
-        every_pass = nn.map_variables(every_pass, mapped_collections='params', init=False, mutable=False,
-                                      trans_in_fn=functools.partial(_gathered_block, names=names,
-                                                                    path=model.scope.path, layout=layout))
-        with placing(GatheredOver(layout, ('params', *model.scope.path), (first, end), FSDP_AXIS)):
-            x, exited = every_pass(model, x)
+    # The layers the passes run: the block's, and under `exiting`, where every pass runs the coda, the coda's.
+    read = (first, layers if loop.exiting else end)
+    # A decode (a server's step) and a store banked by run over any layer the passes run (each run's bank read
+    # by the scan the gathered passes do not run) read the block where it lies.
+    if (loop.gathered and not decode and not model.is_initializing() and layout is not None
+            and jax.sharding.get_abstract_mesh().shape.get(FSDP_AXIS, 1) > 1
+            and not model.banked_collections(read)):
+        x, exited = _gathered_passes(model, every_pass, x, inputs, passes, functools.partial(
+            _gathered_params, layout=layout, mesh=jax.sharding.get_abstract_mesh(),
+            scope=('params', *model.scope.path), span=read))
     else:
-        x, exited = every_pass(model, x)
+        x, exited = every_pass(model, x, inputs, passes)
     if loop.reinject:
         x = model.norm(x)
     if end < layers:
@@ -377,28 +375,68 @@ def run_loop(model, x, *, train: bool, decode: bool, passes=None, **inputs):
     return _handed_on(model, exited, x, loop.exit_threshold)
 
 
-def _gathered_block(variables: Mapping[str, Mapping], *, names: tuple[str, ...], path: tuple[str, ...],
-                    layout) -> dict:
-    """`variables`' `params` with the block's layers (`names` under the decoder's scope `path`) each leaf
-    gathered whole over the FSDP axis from where `layout` places it (`sharding.gathered_over`,
-    `Layout.leaf_spec`, read of the leaf unboxed), every other parameter as it is (`Loop.gathered`): the
-    prelude's, the coda's, the embedding's and head's, and a layer holding a quantized stored kernel
-    (`holds_quantized`), which keeps its placement. A gathered leaf leaves its box (`flax.core.meta`'s), whose
-    logical axes would place it back on the FSDP axis where the layer reads it."""
+def _gathered_passes(model, every_pass: Callable, x, inputs: dict, passes, gathered: Callable):
+    """`every_pass(model, x, inputs)` traced with every Auto axis Explicit (`sharding.explicit_over`), every
+    parameter the passes read gathered whole once before the first over the FSDP axis and every axis the
+    stream's tokens are split over (a hybrid run's data axis, a sequence axis), a matrix reduced over them
+    (`gathered`, `_gathered_params`), so each pass's gradient of it stays unreduced, the passes' sum of it
+    reduced once after the loop (`Loop.gathered`): a product's gradient sums over every axis its tokens
+    split. `inputs`' arrays and a count of `passes` given per call held whole on every device, and what the
+    passes write (their sown and cached collections) placed back on the mesh the step traces
+    (`sharding.typed_on`). The passes' operations are typed on the mesh: a
+    projection takes no launch mapped per shard there (`projections.rows_split`), the partitioner's product
+    running it."""
+    from dew.nn.kernels import generation
+
+    whole = jax.sharding.PartitionSpec()
     mesh = jax.sharding.get_abstract_mesh()
-    params = dict(variables['params'])
 
-    def gathered(name: str, tree):
-        def leaf(where, value):
-            keys = tuple(jax.tree_util.DictKey(key) for key in ('params', *path, name)) + tuple(where)
-            raw = meta.unbox(value)
-            return gathered_over(raw, layout.leaf_spec(mesh, keys, raw), FSDP_AXIS)
-        return jax.tree_util.tree_map_with_path(leaf, tree,
-                                                is_leaf=lambda value: isinstance(value, meta.AxisMetadata))
+    def held(module, x):
+        # What the passes read from outside the region placed on its mesh: the inputs and a count of passes.
+        inside = jax.tree.map(lambda value: jax.sharding.reshard(value, whole)
+                              if isinstance(value, jax.Array) else value, (inputs, passes))
+        return every_pass(module, x, *inside)
 
-    for name in names:
-        if name in params and not holds_quantized(params[name]):
-            params[name] = gathered(name, params[name])
+    def run_inside(x):
+        token_axes = {name for entry in jax.typeof(x).sharding.spec.partitions[:x.ndim - 1]
+                      for name in mesh_axes(entry)}
+        mapped = nn.map_variables(
+            held, mapped_collections=True, init=False, mutable=True,
+            trans_in_fn=functools.partial(gathered, axes=token_axes | {FSDP_AXIS}),
+            trans_out_fn=lambda variables: {
+                name: tree if name == 'params' else typed_on(tree, mesh)
+                for name, tree in variables.items()})
+        return mapped(model, x)
+    # The block's layers run one by one in each pass: a scan over a run of them reads its layers' stacked
+    # parameters as the scan's inputs, which Flax's lifted scan places by their spec's dimensions alone
+    # (`flax.core.axes_scan.build_shaped_array`), refusing a reduced one.
+    with generation.chosen(layer_scan="plain"):
+        return explicit_over(run_inside, x)
+
+
+def _gathered_params(variables: Mapping[str, Mapping], *, layout, mesh, scope: tuple[str, ...],
+                     span: tuple[int, int], axes: Collection[str]) -> dict:
+    """`variables`' `params` (a decoder's, under its variables `scope`, `('params', ...)`) with each leaf a
+    gathered loop's passes read gathered whole over `axes` from where `layout` places it on the step's
+    `mesh` (`sharding.gathered_over`, `Layout.leaf_spec`): a layer's within the block (`span`, `[first,
+    end)`), met by any module name running it, its own (`layers_3`) or a run's (`layers_1_2`,
+    `layer_names.group_layers`; the coda's too where every pass exits through it, `Loop.exiting`), and the
+    decoder's own, no layer's (its step and reinjection norms, and the final norm and head an exiting pass
+    reads); every other (the prelude's layers, the coda's where only the last pass runs it) as it is, which
+    no pass reads. Each
+    leaves its box (`flax.core.meta`'s) unconstrained (`dew.batch.unboxed`): its logical axes would place it
+    by a constraint, which an Explicit axis takes none of, and a gathered one's back on the FSDP axis."""
+    first, end = span
+
+    def leaf(where, value):
+        keys = tuple(jax.tree_util.DictKey(key) for key in scope) + tuple(where)
+        runs = group_layers(where[0].key) if isinstance(where[0], jax.tree_util.DictKey) else None
+        raw = unboxed(value)
+        held = runs is None or (first <= runs.start and runs.stop <= end)
+        return gathered_over(raw, layout.leaf_spec(mesh, keys, raw), axes) if held else raw
+
+    params = jax.tree_util.tree_map_with_path(leaf, variables.get('params', {}),
+                                              is_leaf=lambda value: isinstance(value, meta.AxisMetadata))
     return {**variables, 'params': params}
 
 

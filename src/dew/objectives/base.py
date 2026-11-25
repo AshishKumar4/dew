@@ -1026,8 +1026,8 @@ class Objective(ABC, Generic[Loss, Effects]):
     own, beside its bases' (`resumed_freely`)."""
     executed: ClassVar[tuple[str, ...]] = ()
     """The settings that say how its programs execute and not what they compute (a head's tiling, which a
-    fit's ladder sets), which a resume may change, as a model's `RunConfig.EXECUTED` fields; a class's own,
-    beside its bases' (`resumed_freely`)."""
+    fit's ladder sets), which a resume may change, as a model's own run fields (`dew._records.RUNS`); a
+    class's own, beside its bases' (`resumed_freely`)."""
     ema_is_reference: ClassVar[bool] = False
     """Whether the objective's average is the frozen reference its loss compares against (an RL
     policy's), which validation, `pipeline` and a saved run's loader never read as the trained weights."""

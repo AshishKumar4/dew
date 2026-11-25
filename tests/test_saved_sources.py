@@ -865,11 +865,12 @@ def test_a_multimodal_run_passing_messages_reloads_from_its_native_release_as_it
     from saved_run_kinds import MULTIMODAL, multimodal
 
     from dew.interop import Pretrained
+    from dew.nn.backbones.decoder_stack import Loop
     from dew.nn.cross_pass import CrossPass
     from dew.nn.multimodal import MultimodalTransformer
 
-    looped = dataclasses.replace(multimodal(tmp_path, drawn=False), loop_steps=2, loop_layers=(0, 2),
-                                 loop_messages=True, loop_message_block_size=1)
+    looped = dataclasses.replace(multimodal(tmp_path, drawn=False), loop=Loop(
+        2, step_norm=False, layers=(0, 2), messages=CrossPass(block_size=1)))
     state, _ = trained(looped, tmp_path, "messaged", trainer={"checkpoint_final": True})
     loaded = Pretrained.load(str(released_run(tmp_path / "runs" / "messaged")), dtype="float32")
     assert isinstance(loaded.model, MultimodalTransformer)
@@ -888,3 +889,51 @@ def test_a_multimodal_run_passing_messages_reloads_from_its_native_release_as_it
     with pytest.raises(ValueError):
         loaded.with_model(loaded.model.with_passes(messages=CrossPass(block_size=1, rank=8)), key=0)
 
+
+def test_a_resume_compares_a_model_kind_named_remat(tmp_path):
+    """A model's layer kind named `remat` (`CausalTransformer.kinds`) says what it computes: a resume that
+    widens its window is refused (`RunConfig.check_resume`), where a run's loop's recompute
+    (`DecoderRunConfig._resumed_as`, the loop's field, not every field of its name) is not (row 11937's
+    review)."""
+    from dew.config import RunConfig, earlier_run
+    from dew.nn.backbones.layer_plan import LayerKind
+
+    run = lm(tmp_path, drawn=False)
+
+    def kinded(window: int) -> RunConfig:
+        return dataclasses.replace(run, model=dataclasses.replace(run.model, fields={
+            **run.model.fields, "layer_types": ("remat",), "kinds": {"remat": LayerKind(window=window)}}))
+
+    saved = earlier_run(json.loads(json.dumps(kinded(4).record())))
+    kinded(4).check_resume(saved)
+    with pytest.raises(ValueError):
+        kinded(8).check_resume(saved)
+
+
+def test_a_resume_recomputes_its_loop_freely_as_a_saved_run_did(tmp_path):
+    """A run's loop's recompute (`Loop.remat`) says how its passes execute, not what they compute: a run
+    resumes with it changed, and refused a loop that computes otherwise (more passes); a saved run whose
+    earlier record changed its checkpoint's loop's recompute alone (`loop_remat`, `_LoopChange.remat`)
+    resumes stating no loop, and one that changed what it computes (an exit gate) is refused (row 11937's
+    review: it was refused as a changed loop)."""
+    from test_decision_recipe import QWEN
+
+    from dew.config import earlier_run
+    from dew.nn.backbones.decoder_stack import Loop
+
+    run = dataclasses.replace(lm(tmp_path, drawn=False), pretrained=str(QWEN))
+    loop = Loop(2, step_norm=False, layers=(0, 1))
+    looped = dataclasses.replace(run, loop=loop)
+    saved = earlier_run(json.loads(json.dumps(looped.record())))
+    dataclasses.replace(looped, loop=dataclasses.replace(loop, remat=True)).check_resume(saved)
+    with pytest.raises(ValueError):
+        dataclasses.replace(looped, loop=dataclasses.replace(loop, steps=3)).check_resume(saved)
+    record = json.loads(json.dumps(run.record()))
+    for change, refused in (({"loop_remat": True}, False),
+                            ({"loop_remat": True, "loop_exit_gate": True}, True)):
+        earlier = earlier_run({**record, "fields": {**record["fields"], **change}})
+        if refused:
+            with pytest.raises(ValueError):
+                run.check_resume(earlier)
+        else:
+            run.check_resume(earlier)

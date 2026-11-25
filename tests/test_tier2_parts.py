@@ -387,7 +387,9 @@ def test_each_code_folder_at_one_commit_is_verified_on_its_own(tmp_path):
     """A commit names a whole repository, whose folders (`subfolder`) may each hold code of their own:
     two folders at one commit, each beside the same config, one the renamed Llama and the other the same
     code that trains otherwise than it evaluates (`_hooked`), are verified each, so the second is refused
-    after the first's verification is recorded, as it is refused alone."""
+    after the first's verification is recorded, as it is refused alone. Both loads run in turn in one process
+    of their own, each verification read from and recorded in Dew's cache on disk (a process each took
+    125 s in a train's CI, row 12640)."""
     from interop_support import hub_cache
 
     (tmp_path / "repo").mkdir()
@@ -397,8 +399,8 @@ def test_each_code_folder_at_one_commit_is_verified_on_its_own(tmp_path):
                for folder in ("plain", "hooked")]
     assert configs[0] == configs[1]
     hub_cache(tmp_path / "hub", "dew/renamed", tmp_path / "repo")
-    assert _offline_loads(tmp_path, ("dew/renamed", "plain")) == [("loaded", 1)]
-    assert _offline_loads(tmp_path, ("dew/renamed", "hooked")) == [("refused", 1)]
+    assert _offline_loads(tmp_path, ("dew/renamed", "plain"), ("dew/renamed", "hooked")) == [
+        ("loaded", 1), ("refused", 1)]
 
 
 @attending("reference")

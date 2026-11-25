@@ -410,22 +410,8 @@ dew.config.DecoderRunConfig
   val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
   suites: Annotated[collections.abc.Mapping[str, dew.config.Suite], PrimitiveConstructorSpec] = builtins.dict()
   val_summaries: Annotated[tuple[dew.scores.Summary, ...], PrimitiveConstructorSpec] = ()
-  loop_steps: int | tuple[int, ...] | None = None
-  loop_layers: tuple[int, int] | None = None
-  loop_backprop_steps: int | None = None
-  loop_remat: bool = False
-  loop_implicit: bool = False
-  loop_theta_per_pass: bool = False
-  loop_exit_gate: bool = False
-  loop_exit_threshold: float | None = None
-  loop_steps_sample: str | None = None
-  loop_steps_mean: float | None = None
-  loop_steps_dispersion: float | None = None
-  loop_steps_max: int | None = None
-  loop_messages: bool = False
-  loop_message_block_size: int | None = None
-  loop_message_rank: int | None = None
-  loop_message_additive: bool | None = None
+  loop: Annotated[dew.nn.backbones.decoder_stack.Loop | None, Suppress] = None
+  passes: Annotated[PassPolicy | None, Suppress] = None
 dew.config.MetricConfig
   name: str
   fields: JsonDict = builtins.dict()
@@ -564,22 +550,8 @@ dew.config.lm.LMRunConfig
   val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
   suites: Annotated[collections.abc.Mapping[str, dew.config.Suite], PrimitiveConstructorSpec] = builtins.dict()
   val_summaries: Annotated[tuple[dew.scores.Summary, ...], PrimitiveConstructorSpec] = ()
-  loop_steps: int | tuple[int, ...] | None = None
-  loop_layers: tuple[int, int] | None = None
-  loop_backprop_steps: int | None = None
-  loop_remat: bool = False
-  loop_implicit: bool = False
-  loop_theta_per_pass: bool = False
-  loop_exit_gate: bool = False
-  loop_exit_threshold: float | None = None
-  loop_steps_sample: str | None = None
-  loop_steps_mean: float | None = None
-  loop_steps_dispersion: float | None = None
-  loop_steps_max: int | None = None
-  loop_messages: bool = False
-  loop_message_block_size: int | None = None
-  loop_message_rank: int | None = None
-  loop_message_additive: bool | None = None
+  loop: Annotated[dew.nn.backbones.decoder_stack.Loop | None, Suppress] = None
+  passes: Annotated[PassPolicy | None, Suppress] = None
   tokenizer: str = 'byte'
   prompt: str = ''
   max_new_tokens: int = 128
@@ -694,22 +666,8 @@ dew.decision.config.DecisionRunConfig
   val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
   suites: Annotated[collections.abc.Mapping[str, dew.config.Suite], PrimitiveConstructorSpec] = builtins.dict()
   val_summaries: Annotated[tuple[dew.scores.Summary, ...], PrimitiveConstructorSpec] = ()
-  loop_steps: int | tuple[int, ...] | None = None
-  loop_layers: tuple[int, int] | None = None
-  loop_backprop_steps: int | None = None
-  loop_remat: bool = False
-  loop_implicit: bool = False
-  loop_theta_per_pass: bool = False
-  loop_exit_gate: bool = False
-  loop_exit_threshold: float | None = None
-  loop_steps_sample: str | None = None
-  loop_steps_mean: float | None = None
-  loop_steps_dispersion: float | None = None
-  loop_steps_max: int | None = None
-  loop_messages: bool = False
-  loop_message_block_size: int | None = None
-  loop_message_rank: int | None = None
-  loop_message_additive: bool | None = None
+  loop: Annotated[dew.nn.backbones.decoder_stack.Loop | None, Suppress] = None
+  passes: Annotated[PassPolicy | None, Suppress] = None
   pretrained: str = 'convaiinnovations/laya'
   subfolder: str | None = None
   revision: str | None = None
@@ -969,6 +927,28 @@ dew.lora.LoRA
   dropout: float = 0.0
   source: str | None = None
   weight_name: str | None = None
+dew.nn.backbones.decoder_stack.Loop
+  steps: int
+  step_norm: bool = True
+  backprop_steps: int | None = None
+  exit_gate: bool = False
+  layers: tuple[int, int] | None = None
+  remat: bool = False
+  reinject: bool = False
+  shared_cache: bool = False
+  implicit: bool = False
+  exit_threshold: float | None = None
+  exits: bool = False
+  theta_passes: int | None = None
+  messages: dew.nn.cross_pass.CrossPass | None = None
+  gathered: bool = False
+dew.nn.cross_pass.CrossPass
+  block_size: int = 4
+  rank: int = 64
+  additive: bool = True
+  normalize_values: bool = True
+  scale_by_input_rms: bool = True
+  norm_eps: float | None = None
 dew.nn.dex.DifferentialExtension
   layers: tuple[tuple[int, tuple[int, ...]], ...]
   lambda_init: float | None = None
@@ -1198,6 +1178,11 @@ dew.training.inspection.Inspection
   modules: tuple[str, ...] = ()
   cotangents: bool = False
   histogram: bool = False
+dew.training.phase_passes.SampledPasses
+  mean: float
+  dispersion: float
+  cap: int
+  law: str = 'lognormal-poisson'
 dew.training.profiling.ProfileWindow
   directory: str
   steps: int

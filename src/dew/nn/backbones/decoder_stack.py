@@ -32,7 +32,7 @@ from dew._cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.batch import Variables, merge, part, sows_appended
 from dew.mesh import STAGE_AXIS, LayoutRefused, row_axes
 from dew.nn.dense import NVFP4_AMAX
-from dew.nn.inspection import QK
+from dew.nn.inspection import INDEXER_COLLECTION, QK
 from dew.nn.protocols import StagedStacks, fixed_remat
 from dew.quantization import held_scales, holds_quantized
 
@@ -44,7 +44,6 @@ from ..hyper_connections import Carried
 from ..inspection import counted, current_component, current_positions, watched_positions
 from ..kernels import generation
 from ..kv_cache import cache_at_layer, cache_from_layer
-from ..mla import INDEXER_COLLECTION
 from ..moe import BANKED_EXPERTS, ROUTER_COLLECTION, at_iteration, experts_apart, holds_experts
 from ..residuals import RESIDUALS
 from ..sharding import constrained, microbatched, microbatches, pipeline_stage, pipeline_stages
@@ -279,16 +278,25 @@ class Loop:
     compares it (not `PASSED`).
 
     With `gathered`, a block whose parameters fully sharded data parallelism splits (the run's FSDP axis,
-    `dew.mesh.FSDP_AXIS`) reads them gathered whole over that axis once, before its first pass, and every
-    pass reads that one copy (`looping.run_loop`): no all-gather inside the passes' loop, forward or
-    recomputed, where each pass gathered its own (`steps` times the block's gathers). The passes' weight
-    gradients are still reduced over the data each pass, as without it: on an Auto mesh the loop's carried
-    gradient of the copy is placed whole, so each pass's partial sum is reduced into it. The copy held whole
-    over that axis throughout the loop, which the block's memory must allow (an opt-in for a block that
-    fits). The gradient is the same sum, summed in another order. It gathers the parameters as
-    the step reads them: a run's narrow copies (`dew.training.narrow`), the compute dtype's, where it holds
-    them, else the stored dtype. The prelude, the coda (each pass's too, under `exiting`) and the embedding
-    and head keep their placement, as does a quantized stored kernel.
+    `dew.mesh.FSDP_AXIS`) reads them gathered whole over that axis, and every other its tokens are split over
+    (a hybrid run's data axis, a sequence axis), once, before its first pass, and every pass reads that one
+    copy (`looping.run_loop`): no all-gather inside the passes' loop, forward or recomputed, where each pass
+    gathered its own (`steps` times the block's gathers). Nor a matrix's gradient reduction: the passes run
+    with every axis of the mesh Explicit and each matrix's copy reduced over those axes
+    (`sharding.gathered_over`), so each pass's gradient of it stays its devices' partial sum, the passes'
+    partial sums are added where they lie, and their total is reduced once, after the loop (one reduce-scatter
+    where each pass reduced its own); a vector's (a norm's scale, a bias), held replicated, is reduced each
+    pass, as without it. The copy held whole over those axes throughout the loop, which the block's memory
+    must allow (an opt-in for a block that fits). The gradient is the same sum, summed in another order. It
+    gathers the parameters as the step reads them: a run's narrow copies (`dew.training.narrow`), the compute
+    dtype's, where it holds them, else the stored dtype, a quantized stored kernel's as it is stored. The
+    decoder's own parameters the passes read (its step and reinjection norms) are gathered with the block's,
+    and under `exiting`, where every pass runs the coda, the final norm and the head, theirs too; the prelude,
+    and the coda, final norm and head the last pass alone runs, keep their placement. A decode (a server's
+    step) and a store banked by run read the block where it lies, as without it. Every operation of the passes
+    is typed on the mesh, so one with no rule for it fails as it traces. The block's layers run one by one in
+    each pass (a scan over them takes no reduced copy), and its projections as the partitioner places them, no
+    launch mapped per shard.
     """
     steps: int
     step_norm: bool = True

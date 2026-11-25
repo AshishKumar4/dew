@@ -599,6 +599,45 @@ def test_an_input_lm_term_is_the_backbones_own_next_token_loss_over_the_rows_bes
 
 
 @attending("xla")
+def test_a_consistency_term_divides_the_groups_answers_at_the_passes_the_loss_weighs():
+    """A consistency term over a looped backbone's passes traces the groups' divergence at each pass its loss
+    weighs (`DecisionObjective._weighed`): under an exit gate's objective (`exit_entropy`, which weighs no
+    pass's divergence) the last alone, so the term adds to a three-pass loss's program the group sums
+    (`categorical.group_divergence`'s segment sums, a scatter-add each) it adds to a one-pass loss's; under
+    `pass_weights` three times those. Every pass's was traced under `exit_entropy` and two of them dropped
+    unread (row 12866)."""
+    from reference_error import equations
+
+    from dew.nn.backbones.decoder_stack import Loop
+
+    head = JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
+    step = Step(jnp.asarray(0), jax.random.key(1), None)
+
+    def added(steps: int, **weighing) -> int:
+        """The group sums the consistency term adds to a loss over a loop of `steps` passes."""
+        backbone = tiny_backbone().clone(max_seq_len=LAYOUT.max_len,
+                                         loop=Loop(steps=steps, exit_gate="exit_entropy" in weighing))
+        counted = []
+        for consistency in (0.0, 0.5):
+            objective = DecisionObjective(backbone, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
+                                          head=head, consistency=consistency, **weighing)
+            reader = decision_rows([NEGATED, NEGATED], None, objective=objective.data(),
+                                   tokens=LAYOUT.max_len)
+            [batch] = list(itertools.islice(reader.train(DataPartition()), 1))
+
+            def loss(variables, objective=objective, batch=batch):
+                return objective.loss(variables, batch, step)
+            graph = jax.make_jaxpr(loss)(objective.init(jax.random.key(0)))
+            counted.append(sum(1 for equation in equations(graph)
+                               if equation.primitive.name == "scatter-add"))
+        return counted[1] - counted[0]
+
+    once = added(1, exit_entropy=0.1)
+    assert once and added(3, exit_entropy=0.1) == once
+    assert added(3, pass_weights=(0.2, 0.3, 0.5)) == 3 * once
+
+
+@attending("xla")
 def test_a_decision_run_training_an_exit_gate_steps_at_one_pass_of_a_sampled_count():
     """A decision run training a looped backbone's exit gate (`exit_entropy`) under a sampled pass count
     (`SampledPasses`) whose law draws one pass plans and steps (row 9691: the step of one pass held no
