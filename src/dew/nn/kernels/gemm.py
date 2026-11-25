@@ -61,8 +61,16 @@ from dew.nn.kernels.templates import product as product_of
 from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import epilogue_vjp, rows_permuted, scattered, tiling
 from dew.nn.kernels.templates.gemm.factored import factored
-from dew.nn.kernels.templates.gemm.hooks import (NO_HOOKS, ColumnLocal, Formed, Hooks, Residualized,
-                                                  column_local, held_outputs, kept as hooks_kept)
+from dew.nn.kernels.templates.gemm.hooks import (
+    NO_HOOKS,
+    ColumnLocal,
+    Formed,
+    Hooks,
+    Residualized,
+    column_local,
+    held_outputs,
+    kept_outputs,
+)
 from dew.nn.kernels.templates.product import SCALE_DEPTH, bf16_part_count, declared, formed, terms
 from dew.nn.precision import accumulated, asks_default_precision, at_least_fp32, exact_products, twice_scaled
 from dew.nn.programs import read_by
@@ -196,7 +204,7 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights,
         return held_outputs(value(*operands), named, several, residuals)
 
     call = _Call(prologue, prologue_axes, epilogue, epilogue_axes, dtypes, several, compute, plain,
-                 hooks_kept(named, residuals))
+                 kept_outputs(named, residuals))
 
     def backward(saved, operands, cotangent, live):
         # A residual output takes no cotangent: no caller reads it.
