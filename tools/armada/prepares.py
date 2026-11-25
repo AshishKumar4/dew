@@ -183,9 +183,9 @@ def process(ci, python: str, file: str, group: str, verdict: Path, left: float, 
     # Past its cap a dry prepare starts no further test or cell (tests/tier_wire.py's `past_cap`), so what it
     # prepared is kept, its end in time to upload it: a cap of the time it has but its end's.
     # A part's clears any cap it inherits (its environment's, its caller's).
-    # Of memory, a share of each limit binding it (`HELD_SHARE`), its end's the rest.
+    # Of memory, a share of each limit binding it (`held_caps`), its end's the rest.
     cap = {wire.PREPARE_BY: repr(time.monotonic() + max(mine - CAP_MARGIN, mine / 2)) if capped else "",
-           wire.PREPARE_HOLDS: repr(HELD_SHARE) if capped else ""}
+           wire.PREPARE_HOLDS: held_caps(ci) if capped else ""}
     return ci.tested(python, [file], group, verdict, mine, cache, ci.session.GRACE, common,
                      {"JAX_PLATFORMS": "cpu", wire.PREPARE: "1", "OMP_NUM_THREADS": threads,
                       **(VARIANTS["users"][1] if users else {}), wire.UNIT: unit, **cap, **(environ or {})},
@@ -202,6 +202,18 @@ HELD_SHARE = 0.75
 nothing more (`process`, tests/tier_wire.py's `PREPARE_HOLDS`): the rest is the test, cell or draw running as
 it passes it, its process's end and its programs' upload. A starting margin, not a bound: one compile's
 allocation within a unit may outgrow it."""
+
+
+def held_caps(ci) -> str:
+    """The working set each cgroup level binding this task may hold in its dry prepare (tests/tier_wire.py's
+    `PREPARE_HOLDS`): `HELD_SHARE` of the memory limit of its own cgroup and of each ancestor that states one,
+    under DEW_CGROUP_ROOT (host.py's), as `path=bytes` pairs. Read here, in the task, so its pytest reads no
+    limit, which would key every prepare row by its host's (followed.py's `LIMITS`); "" where none states
+    one."""
+    reader, root = ci.host.cgroups(), ci.host.cgroup_root()
+    return os.pathsep.join(f"{level}={int(limit * HELD_SHARE)}"
+                           for level in reader.levels(reader.own(root), root)
+                           if (limit := reader.memory(level)) is not None)
 
 
 def planned(files: list[tuple[str, bool, int]], took: Callable[[str, str], tuple[float, float] | None],
