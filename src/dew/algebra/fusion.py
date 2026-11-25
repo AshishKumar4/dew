@@ -199,6 +199,7 @@ class Index:
         self.escaping = {var for var in jaxpr.outvars if isinstance(var, jcore.Var)}
         self.key: Hashable | None = None
         self.constants: frozenset[jcore.Var] | None = None
+        self.barriers: frozenset[int] | None = None
         self.walks: dict[tuple[str, jcore.Var, int], dict[jcore.Var, int]] = {}
 
 
@@ -538,10 +539,9 @@ def _takes(fused_gemm, jaxpr: jcore.Jaxpr, region: Region) -> RegionDecision:
     residency it takes without (`fused_gemm.Analysis.resident`: KERNEL-TEMPLATES-13, row 9032); and whether
     its launch may be the template's without its prologue (`RegionDecision`). The prices are a roofline on the
     part's rates (each stage's units overlapped, plus the fixed launch), not the derived tile's walk: on a
-    cell where the launch measured slower than XLA's dot (`grouped_matmul.DECLARED`, every dense cell:
-    DENSE1, 1.05 to 2.9 times XLA's) they favour fusion more than measurement does, so a region whose launch
-    the selector gives XLA is never fused by price alone; a call naming the template (an A/B's arm) fuses
-    it."""
+    cell where the launch is not declared for the template (`grouped_matmul.DECLARED`, per generation) they
+    favour fusion more than measurement does, so a region whose launch the selector gives XLA is never fused
+    by price alone; a call naming the template (an A/B's arm) fuses it."""
     inputs = _shapes(region.inputs)
     # A region of a program staged under x64 (the CPU arithmetic's float64 sums) is analyzed under it, its
     # 64-bit values as it states them.

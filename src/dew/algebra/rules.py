@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import collections
 import contextlib
-import contextvars
 import dataclasses
 import importlib
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -600,8 +599,9 @@ def _reuse() -> tuple[RuleFamily, ...]:
                 rule(
                     eq(t).to(a.binary("div", y.shaped("broadcast_in_dim", laid), divided)),
                     eq(r).to(one.binary("div", y, inverted)), unit(one), plain(inverted),
-                    eq(shape(r)).to(shape(y)), eq(extent).to(shape(t)), eq(floor).to(log2_floor(y)),
-                    eq(bound).to(log2_bound(y)), *common, *normal, *dividend_guard).then(
+                    eq(shape(r)).to(shape(y)), eq(extent).to(shape(y.shaped("broadcast_in_dim", laid))),
+                    eq(floor).to(log2_floor(y)), eq(bound).to(log2_bound(y)), *common, *normal,
+                    *dividend_guard).then(
                     union(t).with_(a.binary("mul", r_laid, multiplied)), set_(shape(r_laid)).to(extent)),
             ]
     roots = []
@@ -616,14 +616,16 @@ def _reuse() -> tuple[RuleFamily, ...]:
             rule(
                 eq(t).to(a.binary("div", v.unary("sqrt", rooted).shaped("broadcast_in_dim", laid), divided)),
                 eq(r).to(v.unary("rsqrt", reciprocal)), positive(v), eq(shape(r)).to(shape(v)),
-                eq(extent).to(shape(t)), eq(floor).to(log2_floor(v)), eq(bound).to(log2_bound(v)),
-                *common, *normal, *dividend_guard).then(
+                eq(extent).to(shape(v.unary("sqrt", rooted).shaped("broadcast_in_dim", laid))),
+                eq(floor).to(log2_floor(v)), eq(bound).to(log2_bound(v)), *common, *normal,
+                *dividend_guard).then(
                 union(t).with_(a.binary("mul", r_laid, multiplied)), set_(shape(r_laid)).to(extent)),
             rule(
                 eq(t).to(a.binary("div", v.shaped("broadcast_in_dim", laid).unary("sqrt", rooted), divided)),
                 eq(r).to(v.unary("rsqrt", reciprocal)), positive(v), eq(shape(r)).to(shape(v)),
-                eq(extent).to(shape(t)), eq(floor).to(log2_floor(v)), eq(bound).to(log2_bound(v)),
-                *common, *normal, *dividend_guard).then(
+                eq(extent).to(shape(v.shaped("broadcast_in_dim", laid))),
+                eq(floor).to(log2_floor(v)), eq(bound).to(log2_bound(v)), *common, *normal,
+                *dividend_guard).then(
                 union(t).with_(a.binary("mul", r_laid, multiplied)), set_(shape(r_laid)).to(extent)),
         ]
     return (
@@ -856,10 +858,7 @@ equation one of them matches (`heads`, `program.WINDOW` deep), so a rule is reac
 registered; a set that only aids the others (`Rules.aid`: commutativity leaves every price as it was) or runs
 at dev time alone (`Rules.dev`) opens none unless enabled via `enabling_dev`."""
 _DEV_HEADS: dict[str, dict[str, set[tuple[str, ...]]]] = {}
-"""Window heads for each dev-time rule set (`Rules.dev`), active only while named in `_DEV_ENABLED`."""
-_DEV_ENABLED: contextvars.ContextVar[frozenset[str]] = contextvars.ContextVar(
-    "dew_algebra_dev_enabled", default=frozenset())
-"""Dev-time rule sets (`Rules.dev`) temporarily enabled in the current context (`enabling_dev`)."""
+"""Window heads for each dev-time rule set (`Rules.dev`), active only while named in `ALGEBRA.value.dev`."""
 
 
 def _operation(pattern) -> declarations.CallDecl | None:
@@ -978,7 +977,7 @@ def heads(primitive: str, operands: Sequence[str | None]) -> bool:
     made = collections.Counter(operand for operand in operands if operand is not None)
     if any(not collections.Counter(needed) - made for needed in _HEADS.get(primitive, ())):
         return True
-    enabled = _DEV_ENABLED.get()
+    enabled = ALGEBRA.value.dev
     if not enabled:
         return False
     return any(not collections.Counter(needed) - made
@@ -1012,23 +1011,23 @@ def reorderable(region: terms.Region) -> bool:
 
 @contextlib.contextmanager
 def enabling_dev(*names: str) -> Iterator[None]:
-    """Enable registered dev-time rule sets `names` (both their rules and their window heads) in the current
-    context without mutating global registries."""
-    unknown = [name for name in names if name not in RULES or not RULES[name].dev]
-    if unknown:
-        raise ValueError(f"not registered dev-time rule sets: {unknown}")
-    token = _DEV_ENABLED.set(_DEV_ENABLED.get() | frozenset(names))
-    try:
+    """Enable registered cost-qualified dev-time rule sets `names` (both their rules and their window heads)
+    in JAX's trace context (`ALGEBRA.value.dev`) without mutating global registries; `bounded` sets such as
+    `stable`, which require measured candidate selection (`dew.algebra.error.choose`), are refused."""
+    invalid = [name for name in names
+               if name not in RULES or not RULES[name].dev or RULES[name].rounding == "bounded"]
+    if invalid:
+        raise ValueError(f"not cost-qualified dev-time rule sets: {invalid}")
+    with ALGEBRA(dataclasses.replace(ALGEBRA.value, dev=ALGEBRA.value.dev | frozenset(names))):
         yield
-    finally:
-        _DEV_ENABLED.reset(token)
 
 
 def admitted(accurate: bool, *, dev: bool = False) -> tuple[Rules, ...]:
     """The rule sets a program's numerics admit: every set under default numerics, the `exact` ones alone
     under the accurate numerics (`precision="accurate"`); the dev-time sets (`Rules.dev`) only where `dev`
-    or named in `enabling_dev`; none the pass leaves out (`dew._cache.Passes`' `without`, a receipt's arm)."""
-    enabled = _DEV_ENABLED.get()
+    or named in `enabling_dev` (`ALGEBRA.value.dev`); none the pass leaves out (`dew._cache.Passes`'
+    `without`, a receipt's arm)."""
+    enabled = ALGEBRA.value.dev
     return tuple(rules for rules in RULES.values()
                  if (dev or not rules.dev or rules.name in enabled)
                  and (dev or not accurate or rules.rounding == "exact")

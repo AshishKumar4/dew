@@ -854,8 +854,10 @@ def test_central_moment_derivation_handles_keepdims_scalar_1d_and_square_op():
         mean = jnp.sum(w * x, axis=0) / n
         return jnp.sum(w * ((x - mean) ** 2), axis=0) / n
 
-    forms_kd = derive.derive(derive.Reduction(keepdims_var, {"x": ("r", "k"), "w": ("r", "k")}, walked="k"),
-                             accurate=False, saturation=SATURATION)
+    forms_kd = derive.derive(
+        derive.Reduction(keepdims_var, {"x": ("r", "k"), "w": ("r", "k")}, walked="k",
+                         ranges={"w": (0.0, float("inf"))}),
+        accurate=False, saturation=SATURATION)
     rng = np.random.default_rng(9039)
     x = (1e3 + rng.standard_normal((4, 64))).astype(np.float32)
     w = rng.uniform(0.5, 2.0, (4, 64)).astype(np.float32)
@@ -875,8 +877,10 @@ def test_central_moment_derivation_handles_keepdims_scalar_1d_and_square_op():
                       np.random.default_rng(seed + 100).uniform(0.5, 2.0, (4, 64)).astype(np.float32)),
         "keepdims variance", seeds=16)
 
-    forms_1d = derive.derive(derive.Reduction(scalar_1d_var, {"x": ("k",), "w": ("k",)}, walked="k"),
-                             accurate=False, saturation=SATURATION)
+    forms_1d = derive.derive(
+        derive.Reduction(scalar_1d_var, {"x": ("k",), "w": ("k",)}, walked="k",
+                         ranges={"w": (0.0, float("inf"))}),
+        accurate=False, saturation=SATURATION)
     shapes_1d = {"x": ((32,), jnp.float32), "w": ((32,), jnp.float32)}
     assert_as_exact(
         jax.jit(lambda x_, w_: forms_1d.finish(
@@ -907,7 +911,84 @@ def test_uncovered_moments_and_misaligned_mean_broadcasts_are_refused():
 
     shapes = {"x": ((8, 8), jnp.float32), "w": ((8, 8), jnp.float32)}
     for fn in (third_moment, misaligned_square):
-        forms = derive.derive(derive.Reduction(fn, {"x": ("r", "k"), "w": ("r", "k")}, walked="k"),
-                              accurate=False, saturation=SATURATION)
+        forms = derive.derive(
+            derive.Reduction(fn, {"x": ("r", "k"), "w": ("r", "k")}, walked="k",
+                             ranges={"w": (0.0, float("inf"))}),
+            accurate=False, saturation=SATURATION)
         with pytest.raises(derive.Refused):
             forms.init(shapes)
+
+
+def test_central_moment_derivation_requires_nonnegative_weights_and_handles_extreme_ranges():
+    """Central-moment derivation refuses unproven/signed weights, accepts weights proven nonnegative in the
+    declaration (`maximum(w, 0)`), and keeps finite single-tile and Chan-combine weighted moments finite and
+    accurate without overflow or count-ratio underflow in either tile order."""
+    from dew.algebra import moments
+
+    unproven = derive.derive(
+        derive.Reduction(moments.weighted_moments, {"x": ("r", "k"), "w": ("r", "k")}, walked="k"),
+        accurate=False, saturation=SATURATION)
+    with pytest.raises(derive.Refused):
+        unproven.init({"x": ((2, 4), jnp.float32), "w": ((2, 4), jnp.float32)})
+
+    def clamped_var(x, raw_w):
+        w = jnp.maximum(raw_w, 0.0)
+        return moments.weighted_moments(x, w)
+
+    proven = derive.derive(
+        derive.Reduction(clamped_var, {"x": ("r", "k"), "raw_w": ("r", "k")}, walked="k"),
+        accurate=False, saturation=SATURATION)
+    shapes = {"x": ((2, 4), jnp.float32), "raw_w": ((2, 4), jnp.float32)}
+    assert proven.slots(shapes)
+
+    # Single-tile finite moment where naive `dx * dx` overflows float32 before small weights are applied.
+    x_one = np.asarray([[1e20, -1e20, 0.0]], np.float32)
+    w_one = np.asarray([[1e-20, 1e-20, 1.0]], np.float32)
+    for mode in ("walk", "merge"):
+        mean_one, var_one = moments.chunked_moments(x_one, w_one, tile=3, mode=mode)
+        assert np.all(np.isfinite(mean_one)) and np.all(np.isfinite(var_one))
+        np.testing.assert_allclose(np.asarray(var_one), np.asarray([2e20], np.float32), rtol=1e-5)
+
+    # Two-tile Chan combine extremes in both tile orders (large `dx` with small weight; huge weight ratio).
+    cases = (
+        (np.asarray([[0.0, 2.0 ** 70]], np.float32), np.asarray([[1.0, 2.0 ** -70]], np.float32), 2.0 ** 70),
+        (np.asarray([[2.0 ** 70, 0.0]], np.float32), np.asarray([[2.0 ** -70, 1.0]], np.float32), 2.0 ** 70),
+        (np.asarray([[2.0 ** 60, 0.0]], np.float32), np.asarray([[2.0 ** -40, 2.0 ** 120]], np.float32),
+         2.0 ** -40),
+        (np.asarray([[0.0, 2.0 ** 60]], np.float32), np.asarray([[2.0 ** 120, 2.0 ** -40]], np.float32),
+         2.0 ** -40),
+    )
+    for x_c, w_c, expected_var in cases:
+        for mode in ("walk", "merge"):
+            mean_c, var_c = moments.chunked_moments(x_c, w_c, tile=1, mode=mode)
+            assert np.all(np.isfinite(mean_c)) and np.all(np.isfinite(var_c))
+            np.testing.assert_allclose(np.asarray(var_c), np.asarray([expected_var], np.float32), rtol=1e-5)
+
+
+def test_chunked_moments_contract_broadcasts_promotes_scans_and_rejects_empty():
+    """`chunked_moments` rejects empty walked extents with `ValueError`, promotes mixed floating dtypes and
+    broadcasts compatible weight shapes, stages `mode="walk"` through one `lax.scan` body independent of tile
+    count, and handles odd tile counts in `mode="merge"`."""
+    from dew.algebra import moments
+
+    with pytest.raises(ValueError, match="positive multiple"):
+        moments.chunked_moments(np.zeros((2, 0), np.float32), np.ones((2, 0), np.float32), tile=4)
+
+    rng = np.random.default_rng(9040)
+    x = (1e3 + rng.standard_normal((4, 48))).astype(np.float32)
+    w_f16 = rng.uniform(0.25, 2.0, (1, 48)).astype(np.float16)
+    ref_mean, ref_var = moments.weighted_moments(jnp.asarray(x), jnp.broadcast_to(jnp.asarray(w_f16,
+                                                                                              jnp.float32),
+                                                                                  x.shape))
+    for mode in ("walk", "merge"):
+        got_mean, got_var = moments.chunked_moments(x, w_f16, tile=16, mode=mode)
+        np.testing.assert_allclose(np.asarray(got_mean), np.asarray(ref_mean), rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(np.asarray(got_var), np.asarray(ref_var), rtol=1e-4, atol=1e-4)
+
+    # Walk stages one scan body regardless of tile count.
+    j2 = jax.make_jaxpr(lambda a, b: moments.chunked_moments(a, b, tile=16, mode="walk"))(
+        np.ones((2, 32), np.float32), np.ones((2, 32), np.float32)).jaxpr
+    j8 = jax.make_jaxpr(lambda a, b: moments.chunked_moments(a, b, tile=16, mode="walk"))(
+        np.ones((2, 128), np.float32), np.ones((2, 128), np.float32)).jaxpr
+    assert any(eq.primitive is jax.lax.scan_p for eq in j2.eqns)
+    assert len(j2.eqns) == len(j8.eqns)

@@ -971,3 +971,37 @@ def test_a_gated_product_across_a_barrier_is_never_fused(barred):
     if barred is checkpointed_swiglu:
         assert any(equation.primitive is primitives.remat_p for equation in equations(made.jaxpr.jaxpr))
 
+
+def test_swiglu_recognition_stays_local_on_deep_residual_chains_and_barriers():
+    """On a deep multi-layer residual chain with checkpoint barriers and non-SwiGLU `logistic` anchors,
+    `recognize._swiglus` / `_extras` / `_walked_forward` stop at barriers and stay within `REACH` / `SPAN`
+    without traversing downstream layers while still recognizing a genuine SwiGLU (row 12465)."""
+    from dew.algebra import fusion, recognize
+
+    @jax.checkpoint
+    def block(x, scale):
+        return x + jax.nn.sigmoid(x) * scale
+
+    def deep_program(x, up, scale):
+        h = x
+        for _ in range(16):
+            h = block(h, scale)
+            # Residual non-SwiGLU logistic followed by a deep elementwise tail.
+            g = jax.nn.sigmoid(h)
+            h = h + g * (h + 1.0)
+        return gated_product_of(h, up)
+
+    shapes = [jax.ShapeDtypeStruct(ROWS, jnp.bfloat16)] * 3
+    closed = jax.make_jaxpr(deep_program)(*shapes)
+    index = fusion.Index(closed.jaxpr)
+    barriers = recognize._barriers(index)
+    assert barriers
+    # Forward walks from inputs before a barrier never cross past it.
+    first_var = closed.jaxpr.invars[0]
+    reached = recognize._forward(index, first_var, 2 * recognize.REACH)
+    assert closed.jaxpr.outvars[0] not in reached
+    # The genuine SwiGLU at the end is still recognized cleanly on an assumed H100.
+    with generation.assumed("sm90"):
+        found = recognize.recognized(closed.jaxpr, index, recognize.NORMS)
+    assert len(found) == 1
+    assert found[0].outputs == tuple(closed.jaxpr.outvars)

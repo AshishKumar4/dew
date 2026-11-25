@@ -316,15 +316,16 @@ def _deriving(accurate: bool, saturation: Saturation) -> Hashable:
             rules.admitted_names(accurate))
 
 
-def _held(jaxpr: jcore.Jaxpr) -> terms.Region:
-    """What `jaxpr` proves of each value (`terms.Region.held`, its magnitudes, and `terms.Region.apart`, the
-    rest), its structure's alone (`terms.Skeleton`), its constants taken as inputs: what its windows read
-    of the values they take from outside them."""
-    opened = jaxpr.replace(constvars=[], invars=[*jaxpr.constvars, *jaxpr.invars])
-    return terms.region(opened, forms=terms.Skeleton)
+def _held(jaxpr: jcore.Jaxpr) -> tuple[dict[jcore.Var, terms.Magnitude | None], dict[jcore.Var, terms.Apart]]:
+    """What `jaxpr` proves of each value (`terms.proven`: its magnitudes and `Apart`), its constants taken as
+    inputs: what its windows read of the values they take from outside them."""
+    return terms.proven(jaxpr)
 
 
-def _declared(window: jcore.Jaxpr, proven: terms.Region | None) -> dict[int, terms.Proven]:
+def _declared(
+    window: jcore.Jaxpr,
+    proven: tuple[dict[jcore.Var, terms.Magnitude | None], dict[jcore.Var, terms.Apart]] | None,
+) -> dict[int, terms.Proven]:
     """What `window`'s inputs hold (`terms.Proven`, by input index): each one as the program proves it
     (`_held`), its magnitude's bound as its power of two where the program bounds one and the rest
     (`terms.Apart`), so a bound a window cuts its equations below holds within it (a scale's under a
@@ -334,11 +335,12 @@ def _declared(window: jcore.Jaxpr, proven: terms.Region | None) -> dict[int, ter
     declared: dict[int, terms.Proven] = {}
     if proven is None:
         return declared
+    held, apart = proven
     for index, var in enumerate(window.invars):
-        bound = proven.held.get(var)
+        bound = held.get(var)
         magnitude = (None if bound is None or bound >= 1024
                      else 0.0 if bound == terms.NOTHING else math.ldexp(1.0, bound))
-        declared[index] = terms.Proven(magnitude, proven.apart.get(var, terms.NOWHERE))
+        declared[index] = terms.Proven(magnitude, apart.get(var, terms.NOWHERE))
     return declared
 
 
@@ -464,7 +466,8 @@ def _windows(jaxpr: jcore.Jaxpr) -> list[tuple[jcore.Jaxpr, list[jcore.Var]]]:
         return []
     rsqrts, reciprocals = _reuse_siblings(jaxpr, heads)
     order = {id(equation): index for index, equation in enumerate(jaxpr.eqns)}
-    clusters: list[dict[int, jcore.JaxprEqn]] = []
+    live_clusters: list[dict[int, jcore.JaxprEqn] | None] = []
+    owners: dict[int, list[int]] = {}
     for head in heads:
         window, frontier = {id(head): head}, [(head, 0)]
         while frontier:
@@ -476,11 +479,8 @@ def _windows(jaxpr: jcore.Jaxpr) -> list[tuple[jcore.Jaxpr, list[jcore.Var]]]:
                     frontier.append((operand, depth + 1))
         if head.primitive is jax.lax.div_p:
             _pull_reuse_siblings(head, maker, rsqrts, reciprocals, window)
-        sharing = [cluster for cluster in clusters if cluster.keys() & window.keys()]
-        if sharing and len(set(window).union(*(cluster.keys() for cluster in sharing))) <= CLUSTER:
-            clusters = [cluster for cluster in clusters if all(cluster is not shared for shared in sharing)]
-            window = {key: member for cluster in [*sharing, window] for key, member in cluster.items()}
-        clusters.append(window)
+        _merge_cluster(live_clusters, owners, window)
+    clusters = [cluster for cluster in live_clusters if cluster is not None]
     read: dict[jcore.Var, set[int]] = {}
     for equation in jaxpr.eqns:
         for atom in equation.invars:
@@ -511,6 +511,35 @@ def _windows(jaxpr: jcore.Jaxpr) -> list[tuple[jcore.Jaxpr, list[jcore.Var]]]:
                 yielded.append(out)
         windows.append((jcore.Jaxpr([], list(outside), outputs, equations), yielded))
     return windows
+
+
+def _merge_cluster(live_clusters: list[dict[int, jcore.JaxprEqn] | None],
+                   owners: dict[int, list[int]], window: dict[int, jcore.JaxprEqn]) -> None:
+    """Join `window` into any live clusters sharing an equation where the union stays within `CLUSTER`,
+    indexed by `owners` so lookup is O(window) rather than O(clusters)."""
+    shared_ids = sorted({cid for key in window for cid in owners.get(key, ())
+                         if live_clusters[cid] is not None})
+    if shared_ids:
+        union_keys = set(window)
+        for cid in shared_ids:
+            shared = live_clusters[cid]
+            if shared is not None:
+                union_keys.update(shared)
+        if len(union_keys) <= CLUSTER:
+            merged: dict[int, jcore.JaxprEqn] = {}
+            for cid in shared_ids:
+                shared = live_clusters[cid]
+                if shared is not None:
+                    merged.update(shared)
+                    live_clusters[cid] = None
+            merged.update(window)
+            window = merged
+    new_id = len(live_clusters)
+    live_clusters.append(window)
+    for key in window:
+        kept = [cid for cid in owners.get(key, ()) if live_clusters[cid] is not None]
+        kept.append(new_id)
+        owners[key] = kept
 
 
 def _is_unit_literal(atom) -> bool:
@@ -970,7 +999,8 @@ def _opening(equation: jcore.JaxprEqn) -> jcore.Jaxpr | None:
     return body if body is not None and not body.consts else None
 
 
-def _rewritten(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels: bool) -> jcore.Jaxpr:
+def _rewritten(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels: bool,
+               *, _cleaned: bool = False) -> jcore.Jaxpr:
     """`closed`'s bodies rewritten in place (`_within`), then its own math (`_windowed`) with each Algebra
     span's body opened into it (`_opened`), so a window reaches across the span's boundary, where the run's
     numerics admit a rewrite of it (`_saturating`), then, with `kernels`, its products fused with their
@@ -978,8 +1008,9 @@ def _rewritten(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kern
     of Dew's takes them (`fusion.fused_program`), whatever the numerics admit: accurate forms limit
     reassociation alone (row 4730). The program with its spans kept as traced where no window's form lands
     (`closed` itself where nothing changed). The pass reads the program without its unread work (`_read`),
-    so nothing it discards is derived, written as a kernel, certified or built."""
-    read = _read(closed)
+    so nothing it discards is derived, written as a kernel, certified or built; nested bodies visited after
+    an enclosing `_read` (`_cleaned`) skip redundant recursive DCE passes."""
+    read = closed if _cleaned else _read(closed)
     made = _within(read, accurate, saturation, kernels)
     if _saturating(accurate):
         spans: list[_Span] = []
@@ -1084,7 +1115,8 @@ def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels
 
     def rewrite() -> _Body:
         with kernel_report.recording() as regions:
-            made, record = fusion.recorded(lambda: _rewritten(closed, accurate, saturation, kernels))
+            made, record = fusion.recorded(
+                lambda: _rewritten(closed, accurate, saturation, kernels, _cleaned=True))
         fresh.append(_Body(None if made is closed else made, record, tuple(regions.rewritten)))
         return fresh[0]
 

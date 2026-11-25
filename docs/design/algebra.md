@@ -180,10 +180,10 @@ glue is (§6.2), reorderings over its values held by the dominance rule alone (�
     keeps its value, so each rule reads a divisor an epsilon floors (a maximum's, a sum's, or a `reduce_sum`'s,
     directly or broadcast along trailing axes) and fires only where its divisor is held away from zero (its
     floor, `rules.log2_floor`) and bounded (`log2_bound`: the reciprocal a normal float above the narrowest
-    float's least normal power, `rules.least`) and either the divisor is at least 1 (`floor >= 0`, so its
-    reciprocal is in `(0, 1]` and can never overflow any finite dividend) or the dividend is bounded with the
-    product under the reach (§6.3). Window formation (`program._windows`) pulls sibling `rsqrt` and unit
-    reciprocal equations sharing a division head's radicand or divisor into the window;
+    float's least normal power, `rules.least`) and either `|y| >= 1` (`floor >= 0`, so `0 < |1/y| <= 1` can
+    never overflow any finite dividend, with positivity required for reciprocal-root reuse) or the dividend
+    is bounded with the product under the reach (§6.3). Window formation (`program._windows`) pulls sibling
+    `rsqrt` and unit reciprocal equations sharing a division head's radicand or divisor into the window;
   - **decoupled reductions** (dev time): dependent nonlinear reductions broken with correction terms (the
     running-max rescale of online softmax, log-sum-exp merges and folds, and Chan-Golub-LeVeque central-moment
     merges for weighted and masked variance and bilinear covariance in `derive.py` / `moments.py`, row 9036);

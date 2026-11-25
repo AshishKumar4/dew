@@ -1977,9 +1977,9 @@ def test_a_checkpoints_body_holding_a_span_of_a_constant_lowers_as_written():
 def test_reuse_pulls_sibling_rsqrt_into_division_windows_and_drops_sqrt(case):
     """When `reuse` is active, `program._windows` pulls sibling `rsqrt(v)` equations into `a / sqrt(v)`'s
     window (same-shape, broadcast after `sqrt`, `sqrt` after broadcast, and unbounded dividend `a` when
-    `v >= 1`, i.e. `floor >= 0`), eliminating `sqrt` and `div` while holding check 1 against float64."""
+    `|v| >= 1`, i.e. `floor >= 0`), eliminating `sqrt` and `div` while holding check 1 against float64."""
     def fn(a, z):
-        v = jnp.mean(jnp.square(jnp.tanh(z)), axis=-1) + 1.0
+        v = jnp.sum(jnp.square(jnp.tanh(z)), axis=-1) / float(z.shape[-1]) + 1.0
         r = jax.lax.rsqrt(v)
         if case == "same_shape":
             q = jnp.tanh(a[:, 0]) / jnp.sqrt(v)
@@ -2005,10 +2005,11 @@ def test_reuse_pulls_sibling_rsqrt_into_division_windows_and_drops_sqrt(case):
                         lambda seed: rows(seed, (16, 32), (16, 32)), f"reuse {case}", seeds=8)
 
 
-def test_reuse_refuses_unfloored_root_and_matches_broadcast_reduce_sum_reciprocal():
-    """An unfloored divisor `v` (able to approach zero) is never rewritten from `a / sqrt(v)` to
-    `a * rsqrt(v)`, while a floored `reduce_sum` reciprocal `1 / y` is pulled into `a / y[:, None]`'s window
-    and matched by `reuse` in the e-graph."""
+def test_reuse_refuses_unfloored_root_rewrites_reduce_sum_and_keys_jit_context():
+    """An unfloored divisor `v` is never rewritten from `a / sqrt(v)` to `a * rsqrt(v)`, a floored
+    `reduce_sum` reciprocal `1 / y` rewrites `a / y[:, None]` end-to-end through `algebra.rewritten`,
+    `enabling_dev` refuses accuracy-measured `bounded` sets (`stable`), and one `jax.jit(rewritten(fn))`
+    callable traces separately across off -> on -> off `enabling_dev("reuse")` transitions."""
     def unfloored(a, v):
         pos = jnp.abs(v)
         return jnp.tanh(a) / jnp.sqrt(pos)[:, None], jax.lax.rsqrt(pos)
@@ -2018,20 +2019,32 @@ def test_reuse_refuses_unfloored_root_and_matches_broadcast_reduce_sum_reciproca
         inv = 1.0 / y
         return a / y[:, None], inv
 
-    a0 = np.ones((8, 16), np.float32)
+    def gated(a, z):
+        v = jnp.sum(jnp.square(jnp.tanh(z)), axis=-1) / float(z.shape[-1]) + 1.0
+        return jnp.tanh(a) / jnp.sqrt(v)[:, None], jax.lax.rsqrt(v)
+
+    with pytest.raises(ValueError, match="not cost-qualified"), algebra.rules.enabling_dev("stable"):
+        pass
+
+    a0, z0 = rows(0, (8, 16), (8, 16))
     v0 = np.full((8,), 2.0, np.float32)
     with algebra.rules.enabling_dev("reuse"):
-        after = jax.make_jaxpr(algebra.rewritten(unfloored))(a0, v0)
-        assert any(eq.primitive is jax.lax.sqrt_p for eq in equations(after.jaxpr))
+        after_unfloored = jax.make_jaxpr(algebra.rewritten(unfloored))(a0, v0)
+        assert any(eq.primitive is jax.lax.sqrt_p for eq in equations(after_unfloored.jaxpr))
 
-        closed = jax.make_jaxpr(softmax_like)(a0, a0)
-        windows = algebra.program._windows(closed.jaxpr)
-        assert windows and any(
-            any(eq.primitive is jax.lax.div_p and algebra.program._is_unit_literal(eq.invars[0])
-                for eq in win.eqns)
-            for win, _ in windows)
-        proven = algebra.program._held(closed.jaxpr)
-        win, _ = windows[0]
-        done = algebra.program._region(win, accurate=False, saturation=algebra.SATURATION,
-                                       ranges=algebra.program._declared(win, proven))
-        assert done.report.fired["reuse"] > 0
+        before_sm = equations(jax.make_jaxpr(softmax_like)(a0, z0).jaxpr)
+        after_sm = equations(jax.make_jaxpr(algebra.rewritten(softmax_like))(a0, z0).jaxpr)
+        assert (sum(eq.primitive is jax.lax.div_p for eq in after_sm)
+                == sum(eq.primitive is jax.lax.div_p for eq in before_sm) - 1)
+        assert_as_exact(jax.jit(algebra.rewritten(softmax_like)), jax.jit(softmax_like),
+                        lambda seed: rows(seed, (8, 16), (8, 16)), "reuse reduce_sum", seeds=8)
+
+    # One jitted callable must trace separately across off -> on -> off scope transitions.
+    jitted = jax.jit(algebra.rewritten(gated))
+    off_before = equations(jitted.trace(a0, z0).jaxpr.jaxpr)
+    assert any(eq.primitive is jax.lax.sqrt_p for eq in off_before)
+    with algebra.rules.enabling_dev("reuse"):
+        on_inside = equations(jitted.trace(a0, z0).jaxpr.jaxpr)
+        assert not any(eq.primitive is jax.lax.sqrt_p for eq in on_inside)
+    off_after = equations(jitted.trace(a0, z0).jaxpr.jaxpr)
+    assert any(eq.primitive is jax.lax.sqrt_p for eq in off_after)

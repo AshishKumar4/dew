@@ -367,6 +367,8 @@ class Region[Node: (Term, Skeleton)]:
     floors: dict[Hashable, Apart] = dataclasses.field(default_factory=dict)
     """`apart` of each term held away from zero, by term text: a number whose floor (`Apart.floor`) is
     known, the floor and side a guarded reuse reads of a divisor (`rules.log2_floor`, `rules.positive`)."""
+    nonnegative: frozenset[Hashable] = frozenset()
+    """Keys of terms proven nonnegative numbers (`Apart.number` and `Apart.sign > 0`)."""
     extents: dict[Hashable, tuple[int, ...]] = dataclasses.field(init=False)
 
     def __post_init__(self):
@@ -709,19 +711,8 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
             out = equation.outvars[0]
             env[out] = term
             shapes.append((term, _shape(out)))
-            operands = [magnitude_of(atom) for atom in equation.invars]
-            name = symbol(equation.primitive)
-            held_apart = [apart_of(atom) for atom in equation.invars]
-            # An exponential of a value at most 0 is at most 1 in the reals, at most 2 as computed: a native
-            # exponential is not certified under 1 (`ex2.approx`'s relative error, 2**-22.5, is more than an
-            # ulp of 1), so it is given one power.
-            exponentiated = name in ("exp", "exp2") and held_apart[0].sign < 0
-            bound = UNIT + 1 if exponentiated else _bounded(equation, operands, held_apart)
-            apart[out] = _apart(equation, held_apart, operands, bound)
-            # A bound is stated of a value proven finite alone, as a rewrite's side condition reads it (row
-            # 5780; owner, 2026-11-14): a NaN's tanh is no number, and a product of a value that overflowed
-            # reads the bound its real factors have and computes an infinity.
-            _typed(dtypes, magnitudes, term, out, bound if apart[out].finite else None)
+            bound, apart[out] = _prove_equation(equation, magnitude_of, apart_of)
+            _typed(dtypes, magnitudes, term, out, bound)
             depths[out] = 1 + max((depths.get(atom, 0) for atom in equation.invars
                                    if not isinstance(atom, jcore.Literal)), default=0)
             continue
@@ -746,7 +737,62 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
                   {var: magnitudes.get(key(node)) for var, node in env.items()},
                   {var: apart.get(var, NOWHERE) for var in env},
                   {key(node): held for var, node in env.items()
-                   if (held := apart.get(var, NOWHERE)).number and held.floor is not None})
+                   if (held := apart.get(var, NOWHERE)).number and held.floor is not None},
+                  frozenset({
+                      *(key(node) for var, node in env.items()
+                        if (held := apart.get(var, NOWHERE)).number and held.sign > 0),
+                      *(key(forms.literal(index)) for index, value in enumerate(literals)
+                        if (held := _constant_apart(value)).number and held.sign > 0),
+                  }))
+
+
+def _prove_equation(equation: jcore.JaxprEqn, magnitude_of: Callable[..., Magnitude | None],
+                    apart_of: Callable[..., Apart]) -> tuple[Magnitude | None, Apart]:
+    """The finite magnitude bound and `Apart` proven of `equation`'s single output from its operands'."""
+    operands = [magnitude_of(atom) for atom in equation.invars]
+    name = symbol(equation.primitive)
+    held_apart = [apart_of(atom) for atom in equation.invars]
+    # An exponential of a value at most 0 is at most 1 in the reals, at most 2 as computed: a native
+    # exponential is not certified under 1 (`ex2.approx`'s relative error, 2**-22.5, is more than an ulp
+    # of 1), so it is given one power.
+    exponentiated = name in ("exp", "exp2") and held_apart[0].sign < 0
+    bound = UNIT + 1 if exponentiated else _bounded(equation, operands, held_apart)
+    proved = _apart(equation, held_apart, operands, bound)
+    # A bound is stated of a value proven finite alone, as a rewrite's side condition reads it (row 5780;
+    # owner, 2026-11-14): a NaN's tanh is no number, and a product of a value that overflowed reads the
+    # bound its real factors have and computes an infinity.
+    return (bound if proved.finite else None), proved
+
+
+def proven(jaxpr: jcore.Jaxpr) -> tuple[dict[jcore.Var, Magnitude | None], dict[jcore.Var, Apart]]:
+    """What `jaxpr` proves of each variable (`held` magnitudes and `apart`), its constants taken as inputs,
+    without building terms or interning parameters (`dew.algebra.program._held`)."""
+    held: dict[jcore.Var, Magnitude | None] = {}
+    apart: dict[jcore.Var, Apart] = {}
+    for var in (*jaxpr.constvars, *jaxpr.invars):
+        held[var] = None
+        if isinstance(var.aval, ShapedArray):
+            apart[var] = _held_apart(WHOLE, var.aval.dtype)
+
+    def magnitude_of(atom) -> Magnitude | None:
+        return _magnitude(atom.val) if isinstance(atom, jcore.Literal) else held.get(atom)
+
+    def apart_of(atom) -> Apart:
+        if isinstance(atom, jcore.Literal):
+            return _held_apart(_constant_apart(atom.val), atom.val.dtype if typed_key(atom.val)
+                               else np.asarray(atom.val).dtype)
+        return apart.get(atom, NOWHERE)
+
+    for equation in jaxpr.eqns:
+        operation = OPERATIONS.get(equation.primitive)
+        if (operation is not None and len(equation.outvars) == 1
+                and len(equation.invars) == WRITTEN[operation.kind].arity):
+            out = equation.outvars[0]
+            held[out], apart[out] = _prove_equation(equation, magnitude_of, apart_of)
+            continue
+        for var in equation.outvars:
+            held[var] = None
+    return held, apart
 
 
 BOUNDED = _symbols(lambda operation: operation.bounded)
