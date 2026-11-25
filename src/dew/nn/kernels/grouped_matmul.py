@@ -45,6 +45,7 @@ from .grouped_cells import (
     MEASURED,
     REFERENCE,
     SCOREBOARDS,
+    STEP_HELD,
     TEMPLATE,
     TOGETHER,
     Kind,
@@ -2150,6 +2151,8 @@ def _declared() -> dict[tuple[str | None, Kind], tuple[selection.Kernel[GroupedC
         for made in board.times:
             if board.winner(made) == REFERENCE:
                 cells[board.generation, Kind(dense=True, made=made)] = (XLA, board.why(made))
+            elif (held := STEP_HELD.get((board.generation, made))) is not None:
+                cells[board.generation, Kind(dense=True, made=made)] = (XLA, f"{board.why(made)}; but {held}")
             elif (witness := lagging.get((board.generation, made))) is not None:
                 fewest, most = witness.timed.span
                 cells[board.generation, Kind(dense=True, made=made)] = (XLA, (

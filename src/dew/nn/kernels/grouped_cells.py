@@ -357,6 +357,17 @@ SCOREBOARDS = (M_NG_45_A100, M_NG_27_GH200, M_FS_51_G4, M_NG_1_G4)
 product it timed is at parity, its products at parity the template's (`Scoreboard`): an A100's, a GH200's
 and an RTX PRO 6000's at 8,192 tokens (records/scoreboard.md's GEMM rows)."""
 
+STEP_HELD: dict[tuple[str, Made], str] = {
+    ('sm90', Made.INPUT_GRADIENT): (
+        "tests/step_memory.py (lane/gemm 75fd93d24bd): a trainer step over two and four rematerialized "
+        "blocks on two compile-only H100s, its dense input gradients the template's, holds layers' "
+        "cotangents past their layer (attention and Kimi delta attention blocks: live growth 63-113 MB past "
+        "what the forward saves and the gradients hold), which XLA's dot there does not"),
+}
+"""Kinds the template's products are at parity in, in time and each product's temporaries (`SCOREBOARDS`),
+whose step holds more with them (a trainer step's peak, `tests/step_memory.py`): XLA's dot keeps them until
+a receipt of the step's memory clears them, each with its evidence (kernel-templates.md §1: peak memory)."""
+
 M_FS_34 = {
     'sm86': ("M-FS-34 / LF-P0-sm86-a10 (an A10, main 45131ca01, XLA tuned on the GPU): the template "
              "1.277x, 1.583x and 1.488x XLA's dot (forward, input and kernel gradient, medians of 13 "
