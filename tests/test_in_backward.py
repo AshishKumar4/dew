@@ -2,6 +2,8 @@
 4796): the same step as the one that takes the whole gradient first, without holding it."""
 
 import dataclasses
+import gc
+import weakref
 from collections.abc import Mapping
 
 import jax
@@ -989,3 +991,70 @@ def test_an_accumulating_scanned_step_that_watches_its_layers_logs_what_they_mad
     scanning(run.fit)(loader, steps=2, log_every=1, eval_every=None)
     logged = {name for row in tracker.rows.values() for name in row}
     assert any(name.startswith("inspect/activations/") for name in logged), sorted(logged)
+
+
+def test_a_dropped_scanned_trainer_holds_no_executable_of_its_step():
+    """A scanned trainer whose step updates in its backward (`dew.nn.in_backward`), then dropped: neither
+    the trainer nor its compiled step's executable outlives it, nor do the process's trace caches
+    (`derivatives._SPANS`, `projections._DECISIONS`) or its optimizer (`declaring`) keep them alive
+    (row 12980: `in_backward._PLAN` entered `options.trace_context()` with `Transaction.planned`'s update
+    closure, which held `Trainer` through `Trainer._boxed_axes`)."""
+    from test_plan import live_executables
+
+    from dew.nn import in_backward
+    from dew.nn.kernels import options
+    from dew.training.ahead import step_batch
+
+    before = live_executables().get("jit_step", 0)
+    mesh = MeshSpec().build(jax.devices()[:1])
+    run = Trainer(LMObjective(decoder(num_layers=2), SEQ), optax.adam(1e-3), key=jax.random.key(0),
+                  mesh=mesh, split=1, advanced=TrainerAdvanced(layout=Layout(min_shard=256)))
+    batch = step_batch(run, token_rows(VOCAB, BATCH, SEQ + 1))
+    state, _, _ = run.place()
+    step = run.compile(state, batch)
+    state, *_ = step(state, batch)
+    kept_optimizer = run.optimizer
+    held_trainer, held_executable = weakref.ref(run), weakref.ref(run.executable)
+    del run, step, state
+    gc.collect()
+    assert held_trainer() is None
+    assert held_executable() is None
+    assert live_executables().get("jit_step", 0) <= before
+    del kept_optimizer
+
+    # `in_backward`'s per-trace contexts leave `options.trace_context()` unchanged.
+    baseline = options.trace_context()
+    plan = in_backward.InBackward(update=lambda path, index, g, w, m: (w, dict(m)), moments=())
+    with in_backward.planned(plan), in_backward.gated(jnp.asarray(True), jnp.asarray(True)):
+        assert options.trace_context() == baseline
+
+
+def test_a_scanned_runs_gated_backward_is_not_cached_across_gates():
+    """`in_backward.scanned_run`'s own rule (`RunRule`) is never held in `derivatives._SPANS`: its forward
+    mutates `_Traced` as it traces and its backward reads the untraced `_GATE` context, so tracing the same
+    run under an open gate then a closed gate applies the update in the first and leaves weights untouched
+    in the second."""
+    from dew.nn import in_backward
+
+    def update(path, index, gradient, weights, moments):
+        return jax.tree.map(lambda w, g: w - 0.5 * g, weights, gradient), {}
+
+    def layer(weights, x, key, metadata):
+        return jnp.tanh(x @ weights["kernel"])
+
+    def stepped(kernel, x, due):
+        norms = {"sumsq": jnp.zeros((3,), kernel.dtype), "nonfinite": jnp.zeros((3,), kernel.dtype)}
+        with in_backward.planned(in_backward.InBackward(update=update, moments=())):
+            y, pullback = jax.vjp(
+                lambda w: jnp.sum(in_backward.scanned_run(("layers_0_2",), layer, {"kernel": w}, None, {},
+                                                          norms, x, None, (None,))),
+                kernel)
+            with in_backward.gated(due):
+                return pullback(jnp.ones_like(y))[0]
+
+    kernel = jnp.ones((3, 4, 4), jnp.float32)
+    x = jnp.ones((2, 4), jnp.float32)
+    opened = stepped(kernel, x, jnp.asarray(True))
+    closed = stepped(kernel, x, jnp.asarray(False))
+    np.testing.assert_array_equal(np.asarray(closed), np.asarray(kernel))
+    assert not np.allclose(np.asarray(opened), np.asarray(kernel))
