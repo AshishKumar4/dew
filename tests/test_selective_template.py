@@ -637,9 +637,10 @@ def test_a_forked_backwards_compiled_shared_memory_is_its_described_scratch():
     """The selective scan's forked backward compiled for an A100 (`kernel_compile`) at 16 tokens a thread, a
     block of 2,048: the shared memory its launch asks for is its described scratch's
     (`selective.backward_scratch`, which `Selective.staged_bytes` prices), so its allocation and its block's
-    geometry cannot drift from the planner's (row 6131; the review of lane/toolkit 57aba49e3)."""
+    geometry cannot drift from the planner's (row 6131; the review of lane/toolkit 57aba49e3). It lowers
+    (`failures`); its spill at 16 tokens is its residency's (row 12905)."""
     from fla_gdn_support import KernelCase
-    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+    from kernel_compile import compile_mosaic_kernels, failures
 
     from dew.nn.kernels.templates import resources
 
@@ -664,7 +665,7 @@ def test_a_forked_backwards_compiled_shared_memory_is_its_described_scratch():
         return trained, operands
 
     (record,) = compile_mosaic_kernels([KernelCase('selective forked backward', call)], 'sm80')
-    assert not mosaic_failures([record]), mosaic_failures([record])
+    assert not failures([record]), failures([record])
     (backward,) = [kernel for kernel in record['kernels'] if 'selective_scan_backward' in kernel['kernel']]
     scratch = selective.backward_scratch(states, selective.block_positions(length, 16), forked=True)
     assert backward['shared'] == resources.shared_bytes(family, resources.Scope(program=scratch)), backward
