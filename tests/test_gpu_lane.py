@@ -395,10 +395,11 @@ def test_only_a_dry_prepare_runs_under_a_time_cap(ci, tmp_path, monkeypatch, cap
 @pytest.mark.parametrize(("limit", "holds"), [("10737418240\n", str(int(10737418240 * 0.75))),
                                               ("max\n", ""), (None, "")])
 def test_a_dry_prepare_holds_no_more_than_its_container_allows(ci, tmp_path, monkeypatch, limit, holds):
-    """A dry prepare's process (prepares.py's `process`, `capped`) runs under a memory cap (tests/tier_wire.py's
-    `PREPARE_HOLDS`) of its container's limit (its cgroup's `memory.max`) less its end's share (`HELD_SHARE`),
-    so a group whose programs outgrow its container is capped rather than killed with every report; none where
-    its container states no limit (`max`) or no cgroup is read, and a part's prepare never."""
+    """A dry prepare's process (prepares.py's `process`, `capped`) runs under a memory cap
+    (tests/tier_wire.py's `PREPARE_HOLDS`) of its container's limit (its cgroup's `memory.max`) less its end's
+    share (`HELD_SHARE`), so a group whose programs outgrow its container is capped rather than killed with
+    every report; none where its container states no limit (`max`) or no cgroup is read, and a part's prepare
+    never."""
     stated = tmp_path / "memory.max"
     if limit is not None:
         stated.write_text(limit)
@@ -419,9 +420,9 @@ def test_a_dry_prepare_holds_no_more_than_its_container_allows(ci, tmp_path, mon
 
 
 def test_a_process_past_the_memory_it_may_hold_is_past_its_cap():
-    """A dry prepare's process holding more than its memory cap (tests/tier_wire.py's `PREPARE_HOLDS`) is past
-    its cap (`past_cap`), so it starts no further test, cell or draw; one holding less, or under no memory cap,
-    is not."""
+    """A dry prepare's process holding more than its memory cap (tests/tier_wire.py's `PREPARE_HOLDS`) is
+    past its cap (`past_cap`), so it starts no further test, cell or draw; one holding less, or under no
+    memory cap, is not."""
     holds = tier_wire.held()
     assert holds > 0
     assert tier_wire.past_cap({tier_wire.PREPARE_HOLDS: str(holds // 2)})
