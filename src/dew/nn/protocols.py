@@ -1252,6 +1252,20 @@ class StatesVocabulary(Protocol):
 
 
 @runtime_checkable
+class LogitsWidth(Protocol):
+    """A model whose head scores fewer tokens than its table holds rows: its logits' width (Inkling 2's
+    200058 of 201024 rows, `CausalTransformer.output_vocab`)."""
+
+    @property
+    def logits_width(self) -> int: ...
+
+
+def logits_width(model: StatesVocabulary) -> int:
+    """The width of `model`'s logits: its own where it states one (`LogitsWidth`), else its vocabulary's."""
+    return model.logits_width if isinstance(model, LogitsWidth) else model.vocab_size
+
+
+@runtime_checkable
 class Bounded(StatesVocabulary, Protocol):
     """A model that declares its vocabulary and cache capacity, which the host
     checks read to refuse an id outside the vocabulary or a request that would
