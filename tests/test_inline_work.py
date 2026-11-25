@@ -120,6 +120,43 @@ def test_a_guard_reads_a_signed_quotient_truncated_and_a_logical_shift_unsigned(
         operations=64, shared_bytes=2 * 4 * 64)
 
 
+def test_adds_under_a_predicate_and_its_negation_each_issue_on_their_warps():
+    """`@p add.u32` and `@!p add.u32` into one register, `p` the first warp's: each issues on its own warps
+    (one, then three), neither fused into the other as an unpredicated IADD3's adds are (the review of
+    lane/toolkit a1b861d7f2d, F1: the second dropped, 32 lanes' issues counted of 128), beside the setp's
+    and the immediate's move's warpgroup-wide issues."""
+    def body(ctx, ref):
+        del ctx, ref
+        i32 = ir.IntegerType.get_signless(32)
+        thread = arith.remui(mgpu_utils.thread_idx(), arith.constant(i32, 128))
+        mgpu_utils.inline_ptx("""{
+            .reg .pred p;
+            .reg .b32 r;
+            setp.lt.u32 p, $1, 32;
+            mov.b32 r, 0;
+            @p add.u32 r, r, 1;
+            @!p add.u32 r, r, 2;
+            mov.b32 $0, r;
+            }""", thread, result_types=i32, has_side_effects=True)
+
+    assert _counted(body) == Work(integer_operations=128 + 128 + 32 + 96)
+
+
+def test_a_narrow_signed_quotient_reads_its_operands_at_their_width():
+    """`(tid - 65)` truncated to i8 (its bits held unsigned, -65 as 191) divided signed by 2 is -32 on the
+    lanes whose value is -65 or -64, the first two (the review of lane/toolkit a1b861d7f2d, F7: 191 / 2, 95,
+    on none)."""
+    def body(ctx, ref):
+        del ctx
+        i8, i32 = ir.IntegerType.get_signless(8), ir.IntegerType.get_signless(32)
+        narrow = arith.trunci(i8, arith.subi(mgpu_utils.thread_idx(), arith.constant(i32, 65)))
+        halved = arith.divsi(narrow, arith.constant(i8, 2))
+        with mgpu_utils.when(arith.cmpi(arith.CmpIPredicate.eq, halved, arith.constant(i8, -32))):
+            _scaled(ref)
+
+    assert _counted(body) == Work(operations=32, shared_bytes=2 * 4 * 2)
+
+
 def test_a_static_loop_counts_its_trips_and_a_concrete_operand_its_lanes():
     """A loop of four static trips counts its body four times; a branch on an operand the kernel passes
     concretely (a bound of 64 lanes) takes its lanes, two warps'."""

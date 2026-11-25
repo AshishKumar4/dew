@@ -738,6 +738,21 @@ def test_a_steps_mask_of_its_tiles_indices_issues_once_and_one_of_its_place_each
     assert selected == selected_placed == 128, (selected, selected_placed)
 
 
+def test_a_scans_invariant_counts_once_and_its_trips_work_each_trip():
+    """A static scan of 4 trips adding `iota // 16` (iotas and literals alone) to its carried row computes the
+    division once and the add each trip: its integer operations those of one trip, its fp32 adds four times
+    one trip's (the review of lane/toolkit a1b861d7f2d, F6: the invariant charged a trip apiece)."""
+    def scanned(trips: int):
+        def step(row, _):
+            return row + (lax.iota(jnp.int32, 128) // 16).astype(jnp.float32), None
+
+        return lambda row: lax.scan(step, row, None, length=trips)[0]
+
+    once, four = (_emitted(scanned(trips), _ROW).roles[0].fixed for trips in (1, 4))
+    assert four.integer_operations == once.integer_operations > 0, (once, four)
+    assert four.operations == 4 * once.operations > 0, (once, four)
+
+
 @pytest.mark.parametrize("held", ["step", "scope", "branch"])
 def test_a_steps_mask_of_a_runtime_value_counts_its_integer_operations_each_step(held):
     """A walk step's mask of its tile's indices offset by its parity (`index % 2`, a value the count holds
