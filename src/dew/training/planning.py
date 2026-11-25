@@ -451,9 +451,9 @@ class PlanRefused(RuntimeError):
         self.probes, self.allocators = tuple(probes), tuple(allocators)
         # Each rung the search asked past its start, in order, with what it found there (`FitSearch.said`).
         self.asked = tuple(asked)
-        # The splits the search asked of each rung, and whether it chose a variant of its rungs from what
-        # its misses read (its Newton-Schulz stacks parted, its narrow copies dropped), which a search on
-        # more room may choose otherwise (`dew.training.compiler.StepCompiler.refuse_unplaced`).
+        # The splits the search asked of each rung, and whether a rung it measured has a lighter form it did
+        # not (its Newton-Schulz stacks parted, its narrow copies dropped), which a search on more room may
+        # reach (`FitSearch.unmeasured_lighter`, `dew.training.compiler.StepCompiler.refuse_unplaced`).
         self.candidates, self.variants = tuple(candidates), variants
         # Whether the search began at a rung a record or a resumed checkpoint named (`StepCompiler._planned`).
         self.recorded_start = False
@@ -983,8 +983,10 @@ class FitSearch[LossT, EffectsT]:
     one 38.88 GiB block its pool could give of 70.88 GiB free, 22.41 GiB short, fits). A candidate holds
     none of them (`Candidate.held`), so one cached for a
     placed state serves an unplaced one."""
-    variants: bool = False
-    """Whether its search chose a variant of its rungs from what its misses read (`searched`)."""
+    parting: Parting | None = None
+    """How its search parted its joined Newton-Schulz stacks (`searched`), None before it climbed."""
+    copies_futile: bool = False
+    """Whether its search measured dropping its narrow copies to free nothing (`searched`)."""
     asked: list[Rung] = dataclasses.field(default_factory=list)
     """The rungs its search asked past the one it stood on first (`searched`), which a plan made offline
     asks none of again (`below`)."""
@@ -1072,8 +1074,8 @@ class FitSearch[LossT, EffectsT]:
         self.kernels = {"spills": spills, "refused": refused, "rewrites": rewrites, "passes": passes}
         if split is None:
             allocators = [device_memory(device) for device in local_devices(self.mesh)]
-            raise PlanRefused(self.probes, allocators, candidates, self.variants, self.outcomes) from (
-                self.refusals[-1] if self.refusals else None)
+            raise PlanRefused(self.probes, allocators, candidates, self.unmeasured_lighter(),
+                              self.outcomes) from (self.refusals[-1] if self.refusals else None)
         return self.found(split), tuple(self.probes)
 
     def above(self, candidates: Sequence[int], split: int) -> tuple[Probe, ...]:
@@ -1413,7 +1415,7 @@ class FitSearch[LossT, EffectsT]:
         missed = self.short(named[0])
         # What its joined Newton-Schulz stacks hold by count, every process's the same (0: it joins none, or
         # its run states their group): what orders each rung's parted variant (`Parting`).
-        parting = Parting(self.stacks_count() if group is None else 0, self.gather)
+        parting = self.parting = Parting(self.stacks_count() if group is None else 0, self.gather)
 
         def parted(rung: Rung) -> int | None:
             # `rung`, just asked joined and missed, asked parted at once where its miss leaves it so; a miss
@@ -1422,7 +1424,6 @@ class FitSearch[LossT, EffectsT]:
             variant = parting.after(rung, joined)
             if variant is None or variant in self.asked:
                 return None
-            self.variants = True
             split = ask(variant, "the step does not fit the devices with its Newton-Schulz stacks joined; "
                         "compiling it again joining one at a time (%s)")
             if split is None:
@@ -1454,7 +1455,8 @@ class FitSearch[LossT, EffectsT]:
                         "again without them (%s)")
             if split is None:
                 narrow = not self.freed(kept, self.rung())
-                self.variants = True
+                # Measured to free nothing, the copies' drop is a lighter form no later rung needs asked.
+                self.copies_futile = narrow
                 if narrow:
                     # Dropped, the step fell no less short at the split both missed at: on a GPU the step
                     # casts its weights whole either way (a GH200: 68.352 MB without its copies, 68.344 MB
@@ -1483,7 +1485,6 @@ class FitSearch[LossT, EffectsT]:
         for variant in parting.tail():
             if variant in self.asked:
                 continue
-            self.variants = True
             split = ask(variant, "no rung fits the devices with its Newton-Schulz stacks joined; compiling "
                         "one again joining them one at a time (%s)")
             if split is not None:
@@ -1535,6 +1536,24 @@ class FitSearch[LossT, EffectsT]:
             if next((split for split in sorted(candidates) if self.fits_here(split)), None) is not None:
                 found.append(self.probes[-1])
         return tuple(found)
+
+    def unmeasured_lighter(self) -> bool:
+        """Whether a rung the search measured has a lighter form a search on more room may reach that it
+        did not measure, at any split it asked (`PlanRefused.variants`): the rung without its narrow copies
+        where the step reads them, or with its joined Newton-Schulz stacks parted, unless the search
+        measured that change to free nothing (`copies_futile`, `Parting.futile`), which a search on other
+        room measures alike (owner, 2026-11-25: a 4B start on two H100s measured every form of its rungs and
+        missed each by 10.98 GiB, and its placed search asked them all again)."""
+        measured = {json.dumps(probe.rung, sort_keys=True) for probe in self.probes}
+        copies = not self.copies_futile and any(candidate.copies for candidate in self.lowered.values())
+        parts = self.parting is not None and self.parting.estimate > 0 and not self.parting.futile
+        for probe in self.probes:
+            lighter = [*([{**probe.rung, "narrow": False}] if copies and probe.rung.get("narrow") else []),
+                       *([{**probe.rung, "ns_group": 1}] if parts and probe.rung.get("ns_group") is None
+                         else [])]
+            if any(json.dumps(rung, sort_keys=True) not in measured for rung in lighter):
+                return True
+        return False
 
     def stacks_held(self) -> int:
         """What the Newton-Schulz stacks the step's updates join hold by count (`Candidate.joined`), the most

@@ -221,3 +221,23 @@ def test_a_miss_that_measured_nothing_parts_no_stacks_at_once():
     search = Scripted(lambda place, group: None if place == 0 else 90, room=90, count=20)
     assert search.searched([1], 0) == 1
     assert [group for _, group in search.compiled] == [None, None], search.compiled
+
+
+def test_a_refused_search_that_measured_every_lighter_form_of_its_rungs_says_so():
+    """A search refused with every rung's parted form measured, or parting measured to free nothing, says
+    a search on more room could reach no form it did not measure (`FitSearch.unmeasured_lighter`), which
+    lets a start refuse before it places its state rather than search the placed devices again (owner,
+    2026-11-25: a 4B start on two H100s measured every form of its rungs, each 10.98 GiB short, and its
+    placed search asked them all again, 49 minutes); one that left a rung's parted form unmeasured, parting
+    not measured futile, says it could."""
+    futile = Scripted(lambda place, group: 100, room=90, count=20)
+    assert futile.searched([1], 0) is None
+    assert not futile.unmeasured_lighter(), futile.compiled
+    deferred = Scripted(lambda place, group: 200, room=90, count=20)
+    assert deferred.searched([1], 0) is None
+    assert any(group == 1 for _, group in deferred.compiled) and not deferred.unmeasured_lighter(), (
+        deferred.compiled)
+    walked = Scripted(lambda place, group: 100 if group is None else 95, room=90, count=20)
+    walked.probes.append(Probe(1, 1, {**walked.current(), "head_tile": 4}, fits=False, headroom=-10, temp=0,
+                               argument=0))
+    assert walked.searched([1], 0) is None and walked.unmeasured_lighter(), walked.compiled

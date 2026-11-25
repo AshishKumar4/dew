@@ -1102,8 +1102,9 @@ class StepCompiler[L, E]:
         start copies let go (`freed`, `Start.freed`), and a placed plan is judged on no more than its
         devices' free bytes (their largest block), so a candidate the search saw miss by more than that misses
         there. Refused only where the search measured every candidate a search on the placed devices could
-        reach: each rung it asked at every split (`PlanRefused.candidates`), none passed over, its rungs'
-        variants chosen from no miss (`PlanRefused.variants`), its search begun at the base rung (no record
+        reach: each rung it asked at every split (`PlanRefused.candidates`), none passed over, each lighter
+        form of them measured or measured to free nothing (`PlanRefused.variants`,
+        `FitSearch.unmeasured_lighter`), its search begun at the base rung (no record
         or checkpoint naming one, which a placed search of other shardings may not read,
         `PlanRefused.recorded_start`), what the start frees known (none where an aliased held array leaves it
         unknown, `Start.freed`), every miss measured and each beyond that room on some process (a
