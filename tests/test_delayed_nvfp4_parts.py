@@ -58,7 +58,7 @@ def test_an_optimizer_holding_updates_back_rolls_the_largest_of_every_call_it_he
         return Trainer(LMObjective(model, seq_len=SEQ), optimizer, key=0, split=split)
 
     with generation.run_precision(DELAYED):
-        held = trainer(optax.MultiSteps(optax.adamw(1e-3), 2), 1).fit(data(), steps=2)
+        held = trainer(optax.MultiSteps(optax.adamw(1e-3), 2).gradient_transformation(), 1).fit(data(), steps=2)
         joined = trainer(optax.adamw(1e-3), 2).fit(data(32), steps=1)
     for one, other in zip(histories(held), histories(joined), strict=True):
         np.testing.assert_array_equal(one, other)
