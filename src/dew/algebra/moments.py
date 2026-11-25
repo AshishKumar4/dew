@@ -149,40 +149,35 @@ def _eval_derived(forms: Derived, tiled: dict[str, jax.Array], mode: Literal["wa
     return forms.finish(final, first, shapes=shapes)
 
 
+_MEAN_NUMERATOR = ((1.0, (("v", 0), ("v", 1))),)
 _MEAN_FORM = ratios.Ratio(
-    ((1.0, (("v", 0), ("v", 1))),), ((1.0, (("v", 1),)),), 0, reduced=True, units=windows.Units())
-"""Streamed weighted mean `sum(w * r) / sum(w)` along axis 0 (`_streamed_tangents`)."""
+    _MEAN_NUMERATOR, ((1.0, (("v", 1),)),), 0, reduced=True, units=windows.Units())
+_MEAN_ZERO = ratios.Ratio(_MEAN_NUMERATOR, (), 0, reduced=True, units=windows.Units())
 
-_WEIGHT = ((1.0, (("v", 2),)),)
+
+def _weighted_sum(*values: int) -> ratios.Summed:
+    return ratios.Summed(((1.0, tuple(("v", index) for index in (*values, 2))),), reduced=True)
+
+
+_MASS, _X, _Y, _XY = _weighted_sum(), _weighted_sum(0), _weighted_sum(1), _weighted_sum(0, 1)
 _COV_FORM = ratios.Ratio(
-    (), _WEIGHT, 0, reduced=True, units=windows.Units(), power=2,
-    products=(
-        (1.0, (ratios.Summed(((1.0, (("v", 0), ("v", 1), ("v", 2))),), reduced=True),
-               ratios.Summed(_WEIGHT, reduced=True))),
-        (-1.0, (ratios.Summed(((1.0, (("v", 0), ("v", 2))),), reduced=True),
-                ratios.Summed(((1.0, (("v", 1), ("v", 2))),), reduced=True))),
-    ),
+    (), _MASS.terms, 0, reduced=True, units=windows.Units(), power=2,
+    products=((1.0, (_XY, _MASS)), (-1.0, (_X, _Y))),
 )
 """Anchored covariance (sum(w cx cy) * sum(w) - sum(w cx) * sum(w cy)) / sum(w)**2.
 Differentiating the form keeps both residual means and their tangents unlanded until cancellation."""
 
-_MEAN_ZERO = ratios.Ratio(
-    ((1.0, (("v", 0), ("v", 1))),), (), 0, reduced=True, units=windows.Units())
-"""Streamed `sum(x * dw)` along axis 0 at the all-zero-weight (`n == 0`) boundary."""
-
 _COV_ZERO = ratios.Ratio(
-    ((1.0, (("v", 0), ("v", 1), ("v", 2))),), (), 0, reduced=True, units=windows.Units())
-"""Streamed `sum(x * y * dw)` along axis 0 at the all-zero-weight (`n == 0`) boundary."""
+    (), (), 0, reduced=True, units=windows.Units(),
+    products=((1.0, (_XY,)), (-2.0, (_X, _Y)), (1.0, (_MASS, _X, _Y))),
+)
+"""Covariance when the denominator is fixed to one: sum(w (x - sum(w x)) (y - sum(w y))).
+Keep the weight-dependent terms even at zero mass: differentiating them gives the mixed derivatives."""
 
 
 def _ratio_jvp_only(primals: Sequence[jax.Array], tangents: Sequence,
-                    form: ratios.Ratio) -> jax.Array | None:
-    """Exact tangent of `ratios.ratio(primals, form)` along non-`SymbolicZero` `tangents`, or None if none
-    move: every moving value and weight contribution cancels unlanded inside one `Ratio`, and omitting
-    `SymbolicZero` operands keeps partial reverse-mode transposes strictly linear."""
-    moving = [index for index, tangent in enumerate(tangents) if not isinstance(tangent, SymbolicZero)]
-    if not moving:
-        return None
+                    form: ratios.Ratio, moving: tuple[int, ...]) -> jax.Array:
+    """Take a ratio's derivative only in the moving operands, keeping its transpose linear."""
     active_set = frozenset(moving)
 
     def evaluate(*active: jax.Array) -> jax.Array:
@@ -227,7 +222,8 @@ def _streamed_tangents(
     unit0 = jnp.zeros((shape[-1],) + (1,) * (len(shape) - 1), w0.dtype).at[0].set(1.0)
     w_pos = jnp.where(pos0, w0, unit0)
     dx_pos, dy_pos, dw_pos = (_mask_tangent(pos0, t) for t in (dx0, dy0, dw0))
-    dw_zero = None if isinstance(dw0, SymbolicZero) else jnp.where(pos0, 0.0, dw0)
+    w_zero = jnp.where(pos0, 0.0, w0)
+    dx_zero, dy_zero, dw_zero = (_mask_tangent(~pos0, t) for t in (dx0, dy0, dw0))
 
     # A fixed anchor preserves translation invariance at every derivative order, without subtracting a
     # rounded mean tangent from each sample. A row that would overflow with this anchor uses zero instead.
@@ -236,28 +232,25 @@ def _streamed_tangents(
         shifted = vals0 - anchor
         return jnp.where(jnp.any(jnp.isinf(shifted), axis=0, keepdims=True), vals0, shifted)
 
-    def mean_tangent(vals0: jax.Array, shifted: jax.Array, d_vals_pos) -> jax.Array | None:
-        d_pos = _ratio_jvp_only((shifted, w_pos), (d_vals_pos, dw_pos), _MEAN_FORM)
-        if d_pos is None and dw_zero is None:
-            return None
-        zero_branch = 0.0 if dw_zero is None else ratios.ratio([vals0, dw_zero], _MEAN_ZERO)
-        return jnp.where(pos, 0.0 if d_pos is None else d_pos, zero_branch)
+    def tangent(out: jax.Array, present: tuple, empty: tuple, positive: tuple, zero: tuple,
+                forms: tuple[ratios.Ratio, ratios.Ratio]):
+        moving = tuple(i for i, direction in enumerate(positive) if not isinstance(direction, SymbolicZero))
+        if not moving:
+            return SymbolicZero(jax.typeof(out).to_tangent_aval())
+        return jnp.where(pos, _ratio_jvp_only(present, positive, forms[0], moving),
+                         _ratio_jvp_only(empty, zero, forms[1], moving))
 
     cx0 = centered(x0, mu_x)
     cy0 = cx0 if same_xy else centered(y0, mu_y)
-    d_mx = mean_tangent(x0, cx0, dx_pos)
-    d_my = d_mx if same_xy else mean_tangent(y0, cy0, dy_pos)
-    d_cov_pos = _ratio_jvp_only((cx0, cy0, w_pos), (dx_pos, dy_pos, dw_pos), _COV_FORM)
-    if d_cov_pos is None and dw_zero is None:
-        d_cov = SymbolicZero(jax.typeof(cov).to_tangent_aval())
-    else:
-        cov_zero = 0.0 if dw_zero is None else ratios.ratio([x0, y0, dw_zero], _COV_ZERO)
-        d_cov = jnp.where(pos, 0.0 if d_cov_pos is None else d_cov_pos, cov_zero)
-    d_mx_out = SymbolicZero(jax.typeof(mu_x).to_tangent_aval()) if d_mx is None else d_mx
-    d_my_out = SymbolicZero(jax.typeof(mu_y).to_tangent_aval()) if d_my is None else d_my
+    mean = (_MEAN_FORM, _MEAN_ZERO)
+    d_mx = tangent(mu_x, (cx0, w_pos), (x0, w_zero), (dx_pos, dw_pos), (dx_zero, dw_zero), mean)
+    d_my = d_mx if same_xy else tangent(
+        mu_y, (cy0, w_pos), (y0, w_zero), (dy_pos, dw_pos), (dy_zero, dw_zero), mean)
+    d_cov = tangent(cov, (cx0, cy0, w_pos), (x0, y0, w_zero),
+                    (dx_pos, dy_pos, dw_pos), (dx_zero, dy_zero, dw_zero), (_COV_FORM, _COV_ZERO))
     d_n_out = SymbolicZero(jax.typeof(n).to_tangent_aval()) if isinstance(dw0, SymbolicZero) else jnp.sum(
         dw0, axis=0)
-    return d_mx_out, d_my_out, d_cov, d_n_out
+    return d_mx, d_my, d_cov, d_n_out
 
 
 def _chunked_weighted_primal(x: jax.Array, w: jax.Array, tile: int,
