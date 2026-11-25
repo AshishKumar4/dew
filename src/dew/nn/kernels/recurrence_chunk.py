@@ -395,9 +395,9 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
 
 def _transition(hooks: recurrence.Hooks, correction) -> tuple[bool, jax.Array | None]:
     """Whether a call's transition is its own (`PortCase.transition`), and the reads its keys erase along
-    where the template takes them (`Hooks.erase` 'read', `chunk_forward.forward`'s `reads`, the laid
-    correction's reader negated)."""
-    reading = hooks.erase == 'read' and correction is not None
+    where the template takes them (`Hooks.erase` 'read' of reads declared unit, `Hooks.unit_reads`,
+    `chunk_forward.forward`'s `reads`, the laid correction's reader negated): undeclared, a transition."""
+    reading = hooks.erase == 'read' and hooks.unit_reads and correction is not None
     reads = -correction if reading else None
     own = hooks.erase not in ('tied', 'read') or hooks.value_decay or (hooks.erase == 'read' and not reading)
     return bool(own), reads
@@ -1444,13 +1444,13 @@ def _unit_pairs(hooks: recurrence.Hooks) -> bool:
     fold their decays against (`mainloop.Call.unit_pairs`): keys of unit norm (the op's `l2norm`, or as
     `write_bound` declares: `Hooks.inverse_bound`'s contract), queries so (`l2norm`, or as `unit_queries`
     declares), and under the delta rule each system row's write gate at most one (`write_bound`), its rows
-    the keys: a read erase's rows are its reads, which no hook bounds (`Hooks.erase` 'read'). Keys alone
-    bounded, a query of 2^100 times a key of 2^-100 decayed by 2^-60 lost its term, the decayed key 2^-160
-    rounding to zero (#3703 review); a read of 2^100 so (`test_a_read_past_its_keys_range_keeps_its_faint_
-    decayed_pair`)."""
+    the keys or a read erase's reads, declared so (`unit_reads`). Keys alone bounded, a query of 2^100 times
+    a key of 2^-100 decayed by 2^-60 lost its term, the decayed key 2^-160 rounding to zero (#3703 review);
+    an undeclared read erase takes the portable math (`_transition`)."""
     keys = hooks.l2norm or hooks.write_bound is not None
     gates = not hooks.delta or (hooks.write_bound is not None and hooks.write_bound <= 1)
-    return keys and (hooks.l2norm or hooks.unit_queries) and gates and hooks.erase != 'read'
+    reads = hooks.erase != 'read' or hooks.unit_reads
+    return keys and (hooks.l2norm or hooks.unit_queries) and gates and reads
 
 
 def kernel_routed(query, key, value, g, beta, *, write_bound: float | None = None,

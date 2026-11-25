@@ -197,8 +197,9 @@ def recurrence_along_its_keys(query, key, value, log_decay, beta, state):
 
 def key_decayed_along_its_keys(seed):
     """`sixteen_bit_read_erase`'s draw of a seed with each key its own log decay, a sigmoid's log about the
-    head's, its reads gone (the call reads along its keys)."""
-    q, k, v, g, beta, state, _, cotangents = sixteen_bit_read_erase(seed)
+    head's, its reads gone (the call reads along its keys, normalized: its reads declared unit)."""
+    q, k, v, g, beta, state, reads, cotangents = sixteen_bit_read_erase(seed)
+    k = reads
     normal = np.random.default_rng([1459, 4, seed]).standard_normal
     keyed = hosted(-softplus(-(normal((*g.shape, k.shape[-1])) + 3.0)))
     return q, k, v, keyed, beta, state, cotangents
@@ -284,7 +285,8 @@ def read_erased_on_the_template(query, key, value, log_decay, beta, state, reads
     template under the run's fast forms at an H100's facts, its queries, keys and reads repeated `group`
     times over their heads first (each value head a key head of its own where `group` is the call's)."""
     query, key, reads = (jnp.repeat(x, group, axis=2) for x in (query, key, reads))
-    hooks = Hooks(decay='vector' if log_decay.ndim == 4 else 'scalar', erase='read',
+    # Its reads unit keys (`read_erase_operands`'), declared so: the template takes no other read erase.
+    hooks = Hooks(decay='vector' if log_decay.ndim == 4 else 'scalar', erase='read', unit_reads=True,
                   scale=query.shape[-1] ** -0.5)
     fast = dataclasses.replace(generation.numerics(), forms='fast')
     with (generation.assumed("sm90" if INTERPRETED else None, interpreted=INTERPRETED),

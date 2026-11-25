@@ -50,6 +50,7 @@ from test_recurrence_stability import (
 
 from dew.nn.kernels import generation, recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk
+from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates.recurrence import template
 
 pytestmark = pytest.mark.kernel
@@ -500,58 +501,45 @@ def faint_read(length: int, width: int) -> tuple:
     return reads, values, beta, decay
 
 
-def test_a_read_past_its_keys_range_keeps_its_faint_decayed_pair():
-    """A delta rule erasing along reads of its own under a decay a key dimension, its keys and queries unit
-    and its write gates at most one (`Hooks(l2norm=True, write_bound=1)`), keeps a pair whose read restores
-    what its decay took: token 0 writes `2^60` along a key whose channel 0 is `2^-100`, channel 0 decays by
-    `2^-60` at token 1, whose read `2^100` along it finds `1` and corrects its write to `-1`, which token 1's
-    query reads (every later write gate zero). The template's own pairs folded each decay into the key before
-    the read, `2^-160` rounding to zero, its output zero (`recurrence_chunk._unit_pairs`: the reads take no
-    bound; head review of 675cd1ecc)."""
-    length, width = 64, 32
-    hooks = recurrence.Hooks(decay='vector', erase='read', l2norm=True, write_bound=1.0, scale=1.0)
-    unit = np.eye(width, dtype=np.float32)
-    keys = np.tile(unit[3], (1, length, 1, 1))
-    keys[0, 0, 0] = 2.0 ** -100 * unit[0] + unit[1]
-    keys[0, 1, 0] = unit[2]
-    queries = np.tile(unit[3], (1, length, 1, 1))
-    queries[0, 1, 0] = unit[2]
-    reads, values, beta, decay = faint_read(length, width)
-    operands = Chunk(*(jnp.asarray(x, jnp.bfloat16) for x in (queries, keys, values)),
-                     log_decay=jnp.asarray(decay), beta=jnp.asarray(beta, jnp.bfloat16),
-                     erase_read=jnp.asarray(reads, jnp.bfloat16))
-    with generation.assumed("sm90", interpreted=True):
-        out, _ = chunk_on('mosaic_gpu', hooks, operands)
-    expected = np.zeros((1, length, 1, width), np.float32)
-    expected[0, 1, 0, 0] = -1.0
-    np.testing.assert_array_equal(np.asarray(out, np.float32), expected)
-
-
-def test_a_read_past_its_keys_range_keeps_its_faint_decayed_pairs_gradient():
-    """The same read erase's gradient (`test_a_read_past_its_keys_range_keeps_its_faint_decayed_pair`'s form,
-    unnormalized): token 0 writes `2^60` along a key on channel 1, token 1 decays channel 0 by `2^-60` and
-    reads `2^100` along it, its write along channel 2, which its query reads. Token 1's output in value column
-    0 moves `-2^100` times token 0's key's channel 0: the read finds that channel's write decayed to `2^-60`
-    of it and corrects the write by `2^100` of that. The template's own pairs' transpose took the pairs'
-    gradient `-2^60` times the read `2^100` before its decay, `-2^160`, a nonfinite gradient
-    (`algebra.key_diagonal_pairs_back`'s `bounded`; head review of 5b2aba881)."""
-    length, width = 64, 32
-    hooks = recurrence.Hooks(decay='vector', erase='read', scale=1.0)
+def faint_read_call(length: int, width: int):
+    """`faint_read`'s read erase, its keys and queries, and its call `(q, k, v, r) -> output` on `kernel` (the
+    delta rule's, `chunk_on`) under a decay a key dimension, its reads undeclared (`Hooks.unit_reads`): token
+    0 writes `2^60` along a key on channel 1, token 1 decays channel 0 by `2^-60`, reads `2^100` along it and
+    writes along channel 2, which its query reads."""
     unit = np.eye(width, dtype=np.float32)
     keys = np.zeros((1, length, 1, width), np.float32)
     keys[0, 0, 0], keys[0, 1, 0] = unit[1], unit[2]
     queries = np.zeros_like(keys)
     queries[0, 1, 0] = unit[2]
     reads, values, beta, decay = faint_read(length, width)
-    d_out = jnp.zeros((1, length, 1, width), jnp.bfloat16).at[0, 1, 0, 0].set(1.0)
+    hooks = recurrence.Hooks(decay='vector', erase='read', scale=1.0)
 
-    def out(q, k, v, r):
+    def run(kernel, q, k, v, r):
         operands = Chunk(q, k, v, log_decay=jnp.asarray(decay), beta=jnp.asarray(beta, jnp.bfloat16),
                          erase_read=r)
-        return chunk_on('mosaic_gpu', hooks, operands)[0]
+        return chunk_on(kernel, hooks, operands)[0]
 
+    return tuple(jnp.asarray(x, jnp.bfloat16) for x in (queries, keys, values, reads)), run
+
+
+def test_a_read_past_its_keys_range_takes_the_portable_math_which_keeps_its_faint_pair():
+    """A read erase whose reads no hook declares at most one in size (`Hooks.unit_reads`) takes the portable
+    math, the template refusing it where a call names it (its own pairs' factors at most one, which an
+    unbounded read breaks: a read of `2^100` against a pair's decay `2^-60` and its pairs' gradient of
+    `-2^60` was `-2^160` in their transpose, a nonfinite gradient; folded into the key before the read,
+    `2^-160` rounded to zero, its output zero; heads review of 675cd1ecc and 5b2aba881). On the portable
+    math (`faint_read_call`) token 1's output in value column 0 is `-1`, the read finding token 0's write
+    decayed and correcting its own by it, and moves `-2^100` times token 0's key's channel 0."""
+    length, width = 64, 32
+    operands, run = faint_read_call(length, width)
+    d_out = jnp.zeros((1, length, 1, width), jnp.bfloat16).at[0, 1, 0, 0].set(1.0)
     with generation.assumed("sm90", interpreted=True):
-        _, pull = jax.vjp(out, *(jnp.asarray(x, jnp.bfloat16) for x in (queries, keys, values, reads)))
+        with pytest.raises(KernelRefused):
+            run('mosaic_gpu', *operands)
+        out, pull = jax.vjp(functools.partial(run, 'xla'), *operands)
         grads = pull(d_out)
+    expected = np.zeros((1, length, 1, width), np.float32)
+    expected[0, 1, 0, 0] = -1.0
+    np.testing.assert_array_equal(np.asarray(out, np.float32), expected)
     assert all(np.isfinite(np.asarray(grad, np.float32)).all() for grad in grads)
     assert float(grads[1][0, 0, 0, 0]) == -(2.0 ** 100)

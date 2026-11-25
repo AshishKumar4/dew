@@ -112,7 +112,9 @@ class Hooks:
     `unit_queries` declares the queries a layer hands the op l2-normalized, each of at most unit norm (an
     epsilon's normalization gives less), as `write_bound` declares its keys: with both, and write gates at
     most one, every row of the template's own pairs is at most one in size, so it may decay each key once for
-    every product (`templates.recurrence.mainloop.Call.unit_pairs`).
+    every product (`templates.recurrence.mainloop.Call.unit_pairs`). `unit_reads` declares so the reads a
+    read erase's keys erase along (`erase` 'read'), which the template's read erase takes alone: its own
+    pairs' factors at most one, a read of `2^100` across a pair's decay of `2^-128` lost its terms.
     `decay_bound`, a finite negative number where given, is the least log decay a token a layer proves
     (Kimi delta attention's `lower_bound` times a sigmoid), which a decay a key dimension's template prefix
     reads (`templates.recurrence.mainloop.Call.prefix_limbs`); None where it proves none. The
@@ -149,6 +151,7 @@ class Hooks:
     output: OutputNorm | None = None
     write_bound: float | None = None
     unit_queries: bool = False
+    unit_reads: bool = False
     decay_bound: float | None = None
     reads: Reads = 'after'
     own_weight: bool = False
@@ -226,9 +229,10 @@ class Hooks:
         if self.decay not in ('none', 'scalar', 'vector'):
             raise ValueError(f"a decay is 'none', 'scalar' or 'vector', not {self.decay!r}")
         decay_bound(self.decay_bound)
-        if not isinstance(self.unit_queries, bool):
-            raise TypeError(f"unit_queries declares the queries normalized or not, a bool: not "
-                            f"{self.unit_queries!r}")
+        for name in ('unit_queries', 'unit_reads'):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"{name} declares its operand normalized or not, a bool: not "
+                                f"{getattr(self, name)!r}")
         if self.gates is not None and self.decay != 'scalar':
             raise ValueError('the gates form one log decay a head: their decay is scalar')
         if self.rated and (self.decay != 'scalar' or self.gates is not None):
