@@ -401,6 +401,13 @@ def test_a_cell_its_prepares_cap_left_is_named_and_counted_but_reds_no_row(ci):
     assert graded([], before=whole, found=found)["exitCode"] == 0
     for masks in ({ci.prepares.identity(capped)}, {ci.prepares.identity(named)}):
         assert graded([lowered], before=masks)["exitCode"] == 1
+    # Parameter ids sharing a start: main skipping test_flow[x] exempts no cell of test_flow[x] @ y],
+    # fresh or reused.
+    sharing = {"test": "tests/test_gpu_vae.py::test_flow[x] @ y]", "where": "a site", "error": "e"}
+    skipped_x = {ci.prepares.identity({**skipped, "test": "tests/test_gpu_vae.py::test_flow[x]"})}
+    assert graded([sharing], before=skipped_x)["exitCode"] == 1
+    reused_sharing = {"name": name, "exitCode": 0, "output": "", "unprepared": [ci.prepares.identity(sharing)]}
+    assert graded([], before=skipped_x, found=reused_sharing)["exitCode"] == 1
 
 
 @pytest.mark.parametrize("capped", [False, True])
