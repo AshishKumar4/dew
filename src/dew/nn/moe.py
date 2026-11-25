@@ -865,8 +865,8 @@ def gated_experts(x: jax.Array | Gathered, gate: jax.Array | Layered, up: jax.Ar
                                  jax.ShapeDtypeStruct(down_stack.shape[-3:], compute)),
             precision, hook, paired=paired is not None and down_layer is paired[-1],
             down_prologue=not isinstance(down_stack, formats.NvFp4) and not _recipe_takes_experts(down_stack))
-    # The selector fuses a pair alone (its `paired` requirement).
-    if paired is None or not fused:
+    # The selector fuses a pair alone, of a gated product with a hook (its `paired` and `hook` requirements).
+    if paired is None or hook is None or not fused:
         gate_scale, up_scale, down_scale = scales or (None, None, None)
         gate_rows, up_rows = (_apart(x, (gate, up), group_sizes, compute, implementation, precision,
                                      (gate_scale, up_scale))
