@@ -70,8 +70,8 @@ def own_staging(call: Call, keys: int) -> tuple:
 def _own_rows(call: Call, keyed, decayed, keys: jax.Array, prefix: tuple) -> None:
     """A key block's keys and its tokens' own decays (`algebra.token_decays` of its separated prefix
     `prefix`, each row against the row before, shifted in registers once a block) stored in `keyed` (in its
-    dtype, the operands': exact) and `decayed` for `own_bands`' reads, which stay in a row's sub-chunk: the
-    last block's reads done first, and the writes seen before this block's (`mosaic.synced`)."""
+    dtype: exact) and `decayed`, the last block's reads of them done first and the writes seen before this
+    block's (`mosaic.synced`): `own_bands`' tiles, and `shifted_keys`' rows of its staged tile."""
     family = call.family
     whole = algebra.separated(*prefix)
     earlier = tuple(family.row_shifted(half, 1, period=algebra.SUB, interpret=call.interpret)
@@ -80,6 +80,7 @@ def _own_rows(call: Call, keyed, decayed, keys: jax.Array, prefix: tuple) -> Non
     plgpu.store(keyed, keys.astype(keyed.dtype), optimized=False)
     plgpu.store(decayed, algebra.token_decays(whole, earlier), optimized=False)
     mosaic.synced(call.interpret)
+
 
 
 def own_zeroed(call: Call, staged) -> None:
@@ -103,15 +104,8 @@ def shifted_keys(call: Call, staged, keys: jax.Array, prefix: tuple):
     intra's 532 M (M-JS-118)."""
     chunk, family = call.chunk, call.family
     width, pad = keys.shape[1], staged.shape[1] - call.chunk
-    whole = algebra.separated(*prefix)
-    earlier = tuple(family.row_shifted(half, 1, period=algebra.SUB, interpret=call.interpret)
-                    for half in whole)
-    # The last block's shifted reads done before its rows are written again, and the writes seen before
-    # this block's reads (`mosaic.synced`).
-    mosaic.synced(call.interpret)
-    for index, value in enumerate((keys, algebra.token_decays(whole, earlier))):
-        plgpu.store(staged.at[index, pl.ds(pad, chunk), pl.ds(0, width)], value, optimized=False)
-    mosaic.synced(call.interpret)
+    rows = (staged.at[index, pl.ds(pad, chunk), pl.ds(0, width)] for index in range(2))
+    _own_rows(call, *rows, keys, prefix)
     return lambda e: tuple(family.tile_of(staged.at[index, pl.ds(pad - e, chunk), pl.ds(0, width)])
                            for index in range(2))
 
