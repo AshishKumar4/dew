@@ -1985,7 +1985,8 @@ def test_the_backward_is_on_par_under_every_score_hook_interpreted(hooks, form):
 def test_the_backward_is_on_par_under_a_hook_of_one_value_a_draw_interpreted(hooks, form):
     """`test_the_backward_is_on_par_under_every_score_hook_interpreted` under the hooks whose site draws past
     one task (`SHARDED_HOOKS`), its draws sharded across the CPU suite's tasks, eight a task (row 12778: a
-    task of sixteen took 883 s in a loaded train's CI, past its 579 s bound)."""
+    task of sixteen took 883 s in a loaded train's CI, past its 579 s bound, and 586 s in train CI's run
+    20261125T151058Z)."""
     _check_hooked_backward(hooks, form=form, interpret=True)
 
 
