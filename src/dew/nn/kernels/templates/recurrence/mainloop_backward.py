@@ -550,7 +550,7 @@ def _entered_views(call: Call, entered_ref, h, walked, walked_width: int) -> dic
     `walked`: step `f` the chunk `chunks - 1 - f`'s slice, as `_reverse_views`' steps, its ring prefetching it
     for the memory decay's sum. Read from global memory in the step, its load stalled the walk's consumer a
     quarter of Kimi Linear's reverse walk on an emulated B200 (754k cycles, a load of the accumulator's layout
-    at the walk's every key slice, HS's tip2 ranking, nvgpu-lean run 20261114203056-aebe0292)."""
+    at the walk's every key slice)."""
     slices = call.width // call.block
     whole = call.memories.views(entered_ref, 0, call.chunks * call.heads * call.width, walked, walked_width)
     views: dict = {}
