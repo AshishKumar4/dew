@@ -6,12 +6,13 @@ OneJev 81ce62f, rendered as its engine renders them), its options' spans the lin
 answer at its last token, and its state cut only where its segments say."""
 
 import dataclasses
+import itertools
 import json
 from pathlib import Path
 from typing import Literal
 
 import pytest
-from merging_tokenizer import MERGED_ID, Merging
+from merging_tokenizer import MERGED_ID, Merging, RankedPairs
 
 from dew._records import JSON
 from dew.data.text import ByteTokenizer, HFTokenizer
@@ -444,6 +445,61 @@ def test_a_state_cut_in_a_row_encoded_whole_takes_the_longest_cut_whose_row_fits
     assert list(row(state, len(fitting.tokens)).tokens) == list(fitting.tokens)
 
 
+def test_a_state_cut_under_cascading_merges_takes_the_longest_cut_whose_row_fits():
+    """A question row encoded whole under a ranked BPE whose merges cascade (`RankedPairs`: the twenty
+    letters A to T paired left to right, then each four of them from A's on), its state four unmergeable
+    characters, an "A" and a "q", the letters B to T written after it: with the "A" kept the letters after
+    it pair from A's and join in fours, five tokens, without it ten, so a cut of four characters overflows
+    the room by four tokens, more than its longest token's characters but one, and the cut keeping the "A"
+    fits. The cut is that one: no bound of its tokens' lengths stops the walk short of it (review of row
+    11839: a ranked BPE's walk stopped once a cut overflowed by its longest token's characters but one)."""
+    _, _, _, *question = release().segments
+    letters = [chr(ord("A") + at) for at in range(20)]
+    pairs = list(itertools.pairwise(letters))
+    fours = [(letters[at] + letters[at + 1], letters[at + 2] + letters[at + 3]) for at in range(0, 20, 4)]
+    tokenizer = RankedPairs([*pairs, *fours])
+    after = "".join(letters[1:])
+    assert len(tokenizer.encode(after)) == 10 and len(tokenizer.encode("A" + after)) == 5
+
+    def row(state: str, max_len: int):
+        layout = SegmentLayout.state_first_row(max_len=max_len, labels=release().labels, unit="whole",
+                                               segments=(Text("S:"), State(), Text(after), *question))
+        [laid] = layout.rows(tokenizer, SPECIALS, state, {"team": TEAM})
+        return laid
+
+    # The room the row holds with no state: the state's "xxxxA" fits it, its "xxxx" overflows it by four.
+    room = len(row("", 1 << 16).tokens)
+    assert len(row("xxxx", 1 << 16).tokens) == room + 4 and len(row("xxxxA", 1 << 16).tokens) <= room
+    assert list(row("xxxxAq", room).tokens) == list(row("xxxxA", 1 << 16).tokens)
+
+
+def test_a_long_state_cut_in_a_merging_row_encoded_whole_encodes_few_cuts_past_its_room():
+    """A question row encoded whole over a vocabulary that merges three characters into one token (one
+    merge takes back two tokens, `Offsets.taken_back`), its state 4000 characters and its room a few dozen:
+    the state is cut to the longest that fits, its walk past its share stopping once a cut overflows by
+    more than a merge takes back, so the row's offsets are read a few times, not once a character (row
+    11839: a subword cut walked every longer cut, each row encoded whole)."""
+    _, _, _, *question = release().segments
+
+    class Counting(Merging):
+        """The merging vocabulary of "xyz", counting the texts it reads the offsets of: its one merge, which
+        nothing cascades from, takes back its three characters but one, which it declares
+        (`dew.data.text.taken_back`)."""
+
+        read = 0
+        taken_back = 2
+
+        def offsets(self, text: str):
+            self.read += 1
+            return super().offsets(text)
+
+    layout = SegmentLayout.state_first_row(max_len=256, labels=release().labels, unit="whole",
+                                           segments=(Text("S:"), State(), Text("\n"), *question))
+    tokenizer = Counting(b"xyz")
+    [laid] = layout.rows(tokenizer, SPECIALS, "a" * 4000, {"team": TEAM})
+    assert len(laid.tokens) == 256 and tokenizer.read < 24, (len(laid.tokens), tokenizer.read)
+
+
 def test_a_long_state_cut_in_a_byte_row_encoded_whole_encodes_few_cuts_past_its_room():
     """A question row encoded whole over the byte vocabulary, its state 4000 characters and its room a few
     dozen: the state is cut to the longest that fits, its walk past its share stopping at the first cut that
@@ -452,9 +508,12 @@ def test_a_long_state_cut_in_a_byte_row_encoded_whole_encodes_few_cuts_past_its_
     _, _, _, *question = release().segments
 
     class Counting(ByteTokenizer):
-        """The byte vocabulary, counting the texts it reads the offsets of."""
+        """The byte vocabulary, counting the texts it reads the offsets of: its encoding the byte
+        vocabulary's, which it declares (`dew.data.text.taken_back`), as its offsets are no longer the byte
+        vocabulary's own by name."""
 
         read = 0
+        taken_back = 0
 
         def offsets(self, text: str):
             self.read += 1

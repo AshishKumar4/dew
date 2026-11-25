@@ -115,8 +115,10 @@ jobs:
         ARMADA_TOKEN: ${{ secrets.ARMADA_TOKEN }}
       run: |
         base=$(git merge-base HEAD origin/main)
-        # A push to main's gates start after a train's (the land queue's, at 10), as its suite does.
-        case "$GITHUB_REF_NAME" in main) priority=--priority=5 ;; *) priority= ;; esac
+        # A push to main's gates start after a train's (the land queue's, at 10), as its suite does. Its
+        # merge-base with main is itself, which no gate can compare a change to: its locks are resolved again
+        # (BASE_GIVEN empty, tools/locks_gate.sh), where a branch's are only where it changed a lock input.
+        case "$GITHUB_REF_NAME" in main) priority=--priority=5 given= ;; *) priority= given=1 ;; esac
         # Any CPU the region gives: the suite's pin and every other host model the fleet has (AMD's 25/1, 25/17
         # and 26/17; armada's --cpu takes a list, no wildcard), as a gate reads text and types and its verdict is one
         # on any host (2026-11-13: small lint maps pinned alone ran out 8 minutes on 25/1 placements; 2026-11-23:
@@ -132,8 +134,8 @@ jobs:
         # (tools/check_tool_types.py); with none, every run typed every tool cold, its shards at the item timeout.
         grep -v -e '^#' -e '^$' tools/check_gates | cut -f1 | armada map --commit=${{ github.sha }} --items=- --size=medium \
           $priority --cpu="$cpus" --label="lint-$GITHUB_REF_NAME" --secrets=DEW_XLA_CACHE_TOKEN --json -- \
-          sh -c 'venv=$PWD/.venv-$(tr -d "\n" < .python-version); PYTHON=$venv/bin/python PATH=$venv/bin:$PATH BASE="$1" sh tools/check.sh --gate "$2"' \
-          sh "$base" '{item}' > "$RUNNER_TEMP/lint.jsonl" || status=$?
+          sh -c 'venv=$PWD/.venv-$(tr -d "\n" < .python-version); PYTHON=$venv/bin/python PATH=$venv/bin:$PATH BASE="$1" BASE_GIVEN="$3" sh tools/check.sh --gate "$2"' \
+          sh "$base" '{item}' "$given" > "$RUNNER_TEMP/lint.jsonl" || status=$?
         python3 tools/armada/gates_told.py "$RUNNER_TEMP/lint.jsonl" || status=1
         exit "$status"
 

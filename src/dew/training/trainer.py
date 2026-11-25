@@ -36,7 +36,7 @@ from dew._cleanup import attempted
 from dew._coordination import agree_process_phase, agreed, agreed_same, broadcast_from_process_zero
 from dew._records import JSON
 from dew.batch import Batch, at_path, owned_dicts, placed_at, select, unboxed
-from dew.checkpoints import Checkpoints, Envelope, Ranking, Resume, _Laid
+from dew.checkpoints import Checkpoints, Resume
 from dew.data.dataset import (
     Checkpointable,
     Closeable,
@@ -99,15 +99,7 @@ from dew.state import MODEL_STATE, Accumulation, TrainState, apart, drawn_in, oc
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import StepFlops
 from dew.telemetry.profile import region
-from dew.telemetry.records import (
-    AxisLink,
-    CheckpointRequested,
-    DataRestarted,
-    FitEnded,
-    FitStarted,
-    Record,
-    StepCompiled,
-)
+from dew.telemetry.records import AxisLink, DataRestarted, FitStarted, Record, StepCompiled
 from dew.training import streaming
 from dew.training._candidates import RunShape, Stepping, StepSettings, as_placed, prepared_for
 from dew.training._fit import (
@@ -120,7 +112,6 @@ from dew.training._fit import (
     Start,
     _rollout_admitted,
     _rollout_resumed,
-    _rollout_saved,
     afresh,
     check_inputs,
     clocked,
@@ -145,14 +136,14 @@ from dew.training._fit import (
     validation_read,
     waited_read,
 )
-from dew.training._lowering import Lowered
 from dew.training._windows import Windowing, empty_window
+from dew.training._written import read_taken, reported_outcome, saved_checkpoint, saved_local_checkpoint
 from dew.training.budget import Horizon, Pause, Plateau
 from dew.training.cadence import Counted
 from dew.training.compiler import Compiled, CompiledStep, StepCompiler, freshly_held, planned_over
 from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, resolved, schedule_ended
 from dew.training.diloco import DiLoCo, dropped, grouped, rated, rates_set, windowed
-from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
+from dew.training.display import TRAINER_SHOWN, TrainingDisplay
 from dew.training.distributed import (
     HELD_APART,
     Produced,
@@ -169,7 +160,7 @@ from dew.training.distributed import (
 )
 from dew.training.evaluation import EvalSuite, Evaluator, episodic
 from dew.training.inspection import Inspection
-from dew.training.interval import Interval, Reading, Taken, TokenClock, copied, leaf_paths, logged_scalars
+from dew.training.interval import Interval, TokenClock, copied, leaf_paths
 from dew.training.memory import (
     CodeBounded,
     first_run,
@@ -184,7 +175,7 @@ from dew.training.observe import Observe
 from dew.training.phase_passes import PhasePasses, SampledPasses
 from dew.training.planning import Candidate, Planned, Trials, read_whole, released, splits
 from dew.training.policy import FitPolicy, Remat, UpdateBatch
-from dew.training.profiling import ProfileWindow, owned_capture, pgle_runs, reported_window, waited_export
+from dew.training.profiling import ProfileWindow, owned_capture, pgle_runs, waited_export
 from dew.training.rollout import Rollout, _branched, _reported, _rollout_metrics
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process, signal_wake
 from dew.training.selection import Best, rankings
@@ -202,8 +193,6 @@ from dew.training.transaction import (
 )
 
 _log = logging.getLogger(__name__)
-_input_log = logging.getLogger("dew.training.input")
-"""Where a run says what its input costs its steps, once (`_written`)."""
 
 if TYPE_CHECKING:
     from dew.telemetry.profile import Profiler
@@ -714,13 +703,14 @@ class Trainer(Generic[Loss, Effects]):
         placing anything, so a run is checked on a CPU host before a costly launch.
 
         The state is a fresh run's: its parameters, optimizer state and EMA, and, given one global `batch` as
-        the run reads it, the accumulation its steps pool where `accumulation` is above 1, read in the first
-        of the splits its plan may take whose devices hold it, the trainer's own where it fixes one
-        (`splits`). It leaves out the narrow copies a step may read (`TrainState.compute`), which the plan
-        drops first where the step does not fit with them. An `OptimConfig` is built over `steps`, as
-        `fit(steps=...)` builds it. A trainer on compile-only GPUs
-        (`dew.nn.kernels.generation.compile_only_gpus`) checks it against the memory stated for them, on a
-        host that holds none.
+        the run reads it (its arrays as the run places them, `placed_abstract`, as a fit's check and plan
+        read its first), the
+        accumulation its steps pool where `accumulation` is above 1, read in the first of the splits its plan
+        may take whose devices hold it, the trainer's own where it fixes one (`splits`). It leaves out the
+        narrow copies a step may read (`TrainState.compute`), which the plan drops first where the step does
+        not fit with them. An `OptimConfig` is built over `steps`, as `fit(steps=...)` builds it. A trainer
+        on compile-only GPUs (`dew.nn.kernels.generation.compile_only_gpus`) checks it against the memory
+        stated for them, on a host that holds none.
 
         Raises what `fit` raises before placing the state: `LayoutRefused` for a state over a device's memory
         or a layout that replicates too much of the model, and ValueError for rules that name an axis the
@@ -730,7 +720,8 @@ class Trainer(Generic[Loss, Effects]):
         state = jax.eval_shape(self._staged_start)
         if batch is None:
             return self._validated(state)[1]
-        return self._fitting(state, marked(DataPartition(), self._counted_batch)(batch))
+        return self._fitting(state, placed_abstract(
+            self.device_mesh, marked(DataPartition(), self._counted_batch)(batch), whole=True))
 
     def _validated(self, state: TrainState) -> tuple[Placement[TrainState], Validation]:
         """`state`'s placement and what `Layout.validate` reads of the state it places, as the
@@ -1424,7 +1415,7 @@ class Trainer(Generic[Loss, Effects]):
                     self._later = LaterPlans.started(self, batch, state)
                 # Written off the loop, which never waits on it (row 2313), its clock the step it sees done.
                 interval.seen()
-                self._read_taken(run, wait=False)
+                read_taken(self, run, wait=False)
                 if self._unproven:
                     # A step's failure on the devices surfaces at the next program that reads its
                     # outputs, the loss counters, so a newly compiled step's first run is awaited here,
@@ -1491,7 +1482,7 @@ class Trainer(Generic[Loss, Effects]):
         error = primary
         # A run's last log is written at its cleanup, a failed run's only where no write waits on a step
         # its peers may never finish (`LogWriter.raise_failure`).
-        unread = functools.partial(self._read_taken, run, agree=False)
+        unread = functools.partial(read_taken, self, run, agree=False)
         exported = waited_export(profile, profiler)
         primed, run.primed = run.primed, None
         unopened = None if primed is None else _closer(primed[1])
@@ -1510,7 +1501,7 @@ class Trainer(Generic[Loss, Effects]):
         run.source, run.train, run.taken = None, None, None
         close = stop_trace = cleanups = unread = None
         run.other += time.perf_counter() - paused
-        return self._reported_outcome(error, run)
+        return reported_outcome(self, error, run)
 
     def _starting(self, run: FitRun, dataset: Loader, initial: TrainState | None, resume: Resume
                   ) -> tuple[int, bytes | None,
@@ -1919,7 +1910,7 @@ class Trainer(Generic[Loss, Effects]):
         paused = not ending and plan.paused(current, real, interval.consumed)
         ranked = bool((plan.validation or plan.best or plan.stop) and run.checkpoint_due)
         if not ending and (evaluation_due or ranked):
-            self._read_taken(run)
+            read_taken(self, run)
             with run.outside_window(), run.held(), region("evaluate"):
                 # A checkpoint that ranks the steps reads every suite's score.
                 names = None if ranked else due
@@ -1961,9 +1952,9 @@ class Trainer(Generic[Loss, Effects]):
         if stopping:
             self._take(plan, run, interval, state, unlogged=True)
             if checkpoints is not None and interval.resumable != current:
-                self._read_taken(run)
-                run.other += self._saved_checkpoint(
-                    checkpoints, current, state, position, interval,
+                read_taken(self, run)
+                run.other += saved_checkpoint(
+                    self, checkpoints, current, state, position, interval,
                     training_best=not plan.validation and not plan.best, run=run)
             if paused:
                 run.paused = current
@@ -2080,7 +2071,7 @@ class Trainer(Generic[Loss, Effects]):
             return
         if unlogged:
             # The latest logging step's log, which the loop reads a step late, goes first.
-            self._read_taken(run)
+            read_taken(self, run)
         loss, aux, accepted = run.stepped
         run.taken = interval.take(run.current, loss, aux, accepted, copied(state),
                                   {} if self.rollout is None else dict(_rollout_metrics(self.rollout)),
@@ -2110,18 +2101,18 @@ class Trainer(Generic[Loss, Effects]):
         candidate = bool(winners) or (run.stopped and checkpoints is not None)
         if (checkpoints is not None and interval.last_saved != current
                 and (run.checkpoint_due or candidate or (final and plan.checkpoint_final) or full)):
-            self._read_taken(run)
+            read_taken(self, run)
             # A save of weights alone is no step to resume from, so not the run's last (`FitRun.ends_here`).
-            run.other += self._saved_checkpoint(
-                checkpoints, current, state, position, interval, scores=scores, ranking=ranking,
+            run.other += saved_checkpoint(
+                self, checkpoints, current, state, position, interval, scores=scores, ranking=ranking,
                 training_best=not plan.validation and not plan.best, run=run,
                 weights_only=not run.checkpoint_due and not run.stopped and not full
                 and not (final and plan.checkpoint_final) and bool(winners)
                 and all(rank.weights_only for rank in winners) and not run.ends_here(interval))
             run.last_checkpoint = time.perf_counter()
         if run.local_due and checkpoints is not None and run.last_local_saved != current:
-            self._read_taken(run)
-            run.other += self._saved_local_checkpoint(checkpoints, current, state, position, interval, run)
+            read_taken(self, run)
+            run.other += saved_local_checkpoint(self, checkpoints, current, state, position, interval, run)
             run.last_local_saved = current
 
     def _wind_down(self, plan: FitPlan, run: FitRun, interval: Interval, state: TrainState,
@@ -2133,7 +2124,7 @@ class Trainer(Generic[Loss, Effects]):
         plateau's (`_between_steps`)."""
         profile, checkpoints, current, loss = self.profile, self.checkpoints, run.current, run.loss
         self._take(plan, run, interval, state, unlogged=True)
-        self._read_taken(run)
+        read_taken(self, run)
         if run.notice is not None and run.cooling is None:
             # A last step's cooldown asks the notice between its steps; `_closed` closes it then.
             run.notice.close()
@@ -2187,8 +2178,8 @@ class Trainer(Generic[Loss, Effects]):
             state, cut = self._cooled(plan, run, interval, state, shardings, position, run.cooling)
             if cut and checkpoints is not None and interval.resumable != current:
                 # Whatever the final-save policy, the step the branch resumes from is written whole.
-                run.other += self._saved_checkpoint(checkpoints, current, state, position, interval,
-                                                    training_best=False, run=run)
+                run.other += saved_checkpoint(self, checkpoints, current, state, position, interval,
+                                              training_best=False, run=run)
             run.preempted = current if cut else None
         if plan.observe:
             plan.observe.last(current, state)
@@ -2302,7 +2293,7 @@ class Trainer(Generic[Loss, Effects]):
         # Trials here serve only explicitly enabled AutoPGLE, never frontier timing.
         trials = Trials(state, batch)
         if signature not in compiled:
-            self._read_taken(run)
+            read_taken(self, run)
             # A process whose reader changed a field or a shape would compile
             # a program whose collectives its peers' never meet.
             agreed_same("training batch layout", lambda: batch_layout(batch))
@@ -2324,161 +2315,6 @@ class Trainer(Generic[Loss, Effects]):
         # The step compiled for this batch's signature, which a profile window that stops after it names.
         run.signature = run.signatures.get(signature)
         return (*self._compiler.drawn(compiled[signature], interval, run.current), trials.state)
-
-    def _saved_checkpoint(
-        self,
-        checkpoints: Checkpoints,
-        step: int,
-        state: TrainState,
-        position: bytes | None,
-        interval: Interval,
-        *,
-        scores: Mapping[str, float] | None = None,
-        ranking: Sequence[Ranking] = (),
-        training_best: bool = True,
-        run: FitRun,
-        weights_only: bool = False,
-    ) -> float:
-        """Write one checkpoint with the interval's mean loss and `run`'s stop control, its stream
-        placing nothing meanwhile (`FitRun.held`), report it and start the next interval.
-
-        Returns the seconds it took, the reading of the interval's loss included: that read waits
-        on the device, and the wait is time the steps did not have."""
-        paused = time.perf_counter()
-        self._display.status("writing a checkpoint")
-        metadata = dict(scores or {})
-        if interval.steps and interval.book is not None:
-            metadata.setdefault('train/loss', float(jax.device_get(interval.book.loss) / interval.steps))
-            if not ranking and training_best:
-                ranking = (Ranking('train/loss', metadata['train/loss']),)
-        envelope = self._checkpoint_envelope(state, position, interval, run, weights_only=weights_only)
-        # The run holds the tokenizer its declaration states the files of (`Checkpoints.save`).
-        write = functools.partial(checkpoints.save, step, metrics=metadata, ranking=ranking,
-                                  weights_only=weights_only, tokenizer=self.objective.run_tokenizer(),
-                                  **envelope)
-        with run.outside_window(), run.held():
-            self._report(CheckpointRequested(checkpoints.directory), step, write)
-        interval.saved(step, resumable=not weights_only)
-        self._display.status("")
-        return time.perf_counter() - paused
-
-    def _checkpoint_envelope(self, state: TrainState, position: bytes | None, interval: Interval, run: FitRun,
-                             *, weights_only: bool = False) -> Envelope:
-        """What a checkpoint of `state` holds on every tier, each tier's save adding its own metadata: one
-        envelope a persistent and a local save submit (row 4126)."""
-        control, share = {**run.stop_control, **interval.token_control}, DataPartition.of(self.device_mesh)
-        # The rung beside the layout's host fields, which a resume lays out alike (`resumed_layout`).
-        laid = _Laid(rung={**self._compiler.checkpoint_rung(), "host": list(self.layout.host)},
-                     training=self.phase_passes.training_record(self.objective), boxed=self._boxed_axes(),
-                     held_apart=self._staging.apart)
-        return {"state": self._staging.saved(state), "saved": position, "share": share, "control": control,
-                "artifact": self._artifact(),
-                "rollout": None if weights_only else _rollout_saved(self.rollout), "_laid": laid}
-
-    def _saved_local_checkpoint(self, checkpoints: Checkpoints, step: int, state: TrainState,
-                                position: bytes | None, interval: Interval, run: FitRun) -> float:
-        """Write one checkpoint to the local directory with `run`'s stop control, its stream placing
-        nothing meanwhile (`FitRun.held`), and report it.
-
-        Returns the seconds it took. The local copy carries no metadata; it is the one a restarted
-        node reads back, not the run's record."""
-        paused = time.perf_counter()
-        self._display.status("writing a local checkpoint")
-        write = functools.partial(checkpoints.save_local, step,
-                                  **self._checkpoint_envelope(state, position, interval, run))
-        with run.outside_window(), run.held():
-            self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step, write)
-        self._display.status("")
-        return time.perf_counter() - paused
-
-    def _read_taken(self, run: FitRun, *, agree: bool = True, wait: bool = True) -> None:
-        """Hand the log the loop took (`Taken`) to the run's writer, which reads it on the host and reports
-        one logging interval off the step loop (`LogWriter`, `_written`), and raise a write's failure: of
-        every write, waiting for each, where `wait`, as before a compile, an evaluation, a save or the end,
-        which read the run's state anyway; else of those done, as each logging tick does, which never waits.
-
-        The failures are agreed here, on the loop, at a point every process reaches alike, so a tracker that
-        failed on rank zero, or a losses' streak, stops its peers here rather than at their next collective;
-        a failed run's cleanup raises without agreeing, waiting only on writes that wait on no device, since
-        its peers may never agree and its steps never end."""
-        taken, run.taken = run.taken, None
-        if taken is not None:
-            run.writer.submit(functools.partial(self._read_log, run, taken),
-                              functools.partial(self._written, run, taken), taken.ready)
-        elif not (wait and run.writer.unchecked):
-            return
-        check = functools.partial(run.writer.raise_failure, wait=wait, ready_only=not agree)
-        with region("log"):
-            if agree:
-                agreed("training reporting", check)
-            else:
-                check()
-
-    def _read_log(self, run: FitRun, taken: Taken) -> tuple[Reading, float]:
-        """`taken` on the host, its losses checked, and its interval's seconds, on the writer's reader
-        thread (`LogWriter`), whose clock it moves."""
-        read, elapsed, run.writer.since = taken.read(self._display, run.writer.since)
-        return read, elapsed
-
-    def _written(self, run: FitRun, taken: Taken, reading: tuple[Reading, float]) -> None:
-        """Report `taken`'s interval's scalars (`logged_scalars`) on rank zero, on the writer's reporter
-        thread (`_read_taken`); every other rank has nothing to report."""
-        if jax.process_index() != 0:
-            return
-        read, elapsed = reading
-        scalars = {**logged_scalars(read, taken.counts, elapsed, self.device_mesh.devices.size,
-                                    rollout=self.rollout is not None, update_flops=run.update_flops),
-                   **run.startup.scalars()}
-        if run.unworked and elapsed > 0 and taken.counts.waited > elapsed / 2:
-            # Said once: a per-share stream read in the process starves the step.
-            run.unworked = False
-            _input_log.warning("the step waits on its input for more than half its time, read by a per-share "
-                               "stream in the training process: state its loading workers (.workers(n)), or "
-                               "read it .elastic(), whose order any count of workers keeps")
-        self._display.interval(taken.step, scalars)
-        if self.tracker is not None:
-            self.tracker.log(scalars, taken.step)
-
-    def _reported_outcome(self, error: BaseException | None, run: FitRun) -> BaseException | None:
-        """Agree the run's cleanup, report its goodput and its outcome.
-
-        Every rank reaches the cleanup agreement, so a rank that failed alone
-        is heard here. Goodput is only reported for a run that reached this
-        point without an error, since its numbers describe a run that ran.
-        """
-        try:
-            agree_process_phase(error, phase="fit cleanup")
-        except BaseException as failure:
-            if error is None:
-                error = failure
-        error = reported_window(self._report, self._display.note, run.profiled, error)
-        if error is None:
-            def report_goodput() -> None:
-                if jax.process_index() == 0:
-                    wall = time.perf_counter() - run.started
-                    # A run that logged no step reports its start here (`Startup.scalars`).
-                    scalars = {**goodput(wall, run.first_step, run.other),
-                               **run.startup.scalars()}
-                    self._display.summary(run.current, wall, scalars,
-                                          None if run.loss is None else float(jax.device_get(run.loss)))
-                    if self.tracker is not None:
-                        self.tracker.log(scalars, run.current)
-
-            try:
-                agreed("goodput reporting", report_goodput)
-            except BaseException as failure:
-                error = failure
-        try:
-            outcome = FitEnded.outcome(time.perf_counter() - run.started, error,
-                                       preempted=run.preempted is not None,
-                                       lowered=isinstance(error, Lowered))
-            self._report(outcome, run.current)
-        except BaseException as failure:
-            if error is None:
-                error = failure
-            else:
-                error.add_note(f'Reporting fit outcome failed: {failure!r}')
-        return error
 
     def _report(self, value: Record, step: int, after: Callable[[], None] | None = None) -> None:
         """Hand one record to the tracker on rank zero, then agree with the pool.

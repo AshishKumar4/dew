@@ -17,15 +17,12 @@ tools/check_gates runs it as the test-types gate.
 
 import argparse
 import collections
-import json
-import os
 import subprocess
 import sys
 import tempfile
-import tomllib
 from pathlib import Path
 
-from tools.check_tool_types import PYRIGHT
+from tools.check_tool_types import pyright_report
 
 RULE = "reportAttributeAccessIssue"
 
@@ -55,31 +52,26 @@ def touched(merge: str, cwd: Path | None = None) -> dict[str, str | None]:
     return found
 
 
-def findings(tree: Path, files: dict[str, str], python: str) -> collections.Counter[tuple[str, str]]:
+def findings(tree: Path, files: dict[str, str], environment: Path) -> collections.Counter[tuple[str, str]]:
     """Pyright's attribute findings in `files` (each path in `tree` by the name it is counted under), each
-    (its name, its message) by how often: `tree`'s pyproject.toml's pyright settings, every other rule off,
-    its own src, tests and tools resolved ahead of `python`'s installed packages."""
+    (its name, its message) by how often: `tree`'s own configuration (check_tool_types.py's
+    `pyright_report`, its execution environments with it), every other rule off, its imports resolved in
+    the virtual environment `environment` beneath the tree's own source (named in the configuration, which
+    pyproject's own `venv` would otherwise name)."""
     tree = tree.resolve()
     present = {path: name for path, name in files.items() if (tree / path).is_file()}
     if not present:
         return collections.Counter()
-    settings = tomllib.loads((tree / "pyproject.toml").read_text())["tool"]["pyright"]
-    configuration = {"pythonVersion": settings["pythonVersion"], "typeCheckingMode": "off", RULE: "error",
-                     "stubPath": str(tree / settings["stubPath"]),
-                     "extraPaths": [str(tree / path) for path in settings["extraPaths"]]}
     with tempfile.NamedTemporaryFile("w", suffix=".json", dir=tree, delete=False) as handle:
-        json.dump(configuration, handle)
+        written = Path(handle.name)
     try:
-        done = subprocess.run(["uvx", PYRIGHT, "-p", handle.name, "--pythonpath", python, "--outputjson",
-                               *present], cwd=tree, capture_output=True, text=True,
-                              env={**os.environ, "NODE_OPTIONS": "--max-old-space-size=8192"})
+        diagnostics = pyright_report(tree, {"typeCheckingMode": "off", RULE: "error",
+                                            "venvPath": str(environment.parent), "venv": environment.name},
+                                     list(present), written)
     finally:
-        os.unlink(handle.name)
-    report = json.loads(done.stdout or "{}")
-    if "generalDiagnostics" not in report:
-        raise SystemExit(f"test-types: pyright gave no report: {done.stderr[-2000:]}")
+        written.unlink()
     return collections.Counter((present[str(Path(each["file"]).relative_to(tree))], each["message"])
-                               for each in report["generalDiagnostics"] if each.get("rule") == RULE)
+                               for each in diagnostics if each.get("rule") == RULE)
 
 
 def main() -> int:
@@ -96,8 +88,9 @@ def main() -> int:
         before = Path(scratch) / "base"
         git("worktree", "add", "-q", "--detach", str(before), merge, cwd=top)
         try:
-            new = findings(top, {name: name for name in files}, sys.executable) - findings(
-                before, {old: name for name, old in files.items() if old is not None}, sys.executable)
+            environment = Path(sys.prefix)
+            new = findings(top, {name: name for name in files}, environment) - findings(
+                before, {old: name for name, old in files.items() if old is not None}, environment)
         finally:
             git("worktree", "remove", "--force", str(before), cwd=top)
     for (name, message), count in sorted(new.items()):

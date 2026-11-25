@@ -806,6 +806,17 @@ def _runs(seeds: np.ndarray) -> str:
     return ", ".join(f"{run[0]}-{run[-1]}" for run in np.split(ordered, breaks))
 
 
+def oracle_held(answered, exact_run, roundings: int, label: str):
+    """A recorder's evaluation of a seed's `arrays`: the reference's and the truth's leaves its worker
+    answers (`answered(arrays)`), the truth held to Dew's float64 path first (`held_to_the_oracle`)."""
+    def evaluate(arrays):
+        reference, truth = answered(arrays)
+        held_to_the_oracle(exact_run, arrays, truth, roundings, label)
+        return reference, truth
+
+    return evaluate
+
+
 def held_to_the_oracle(exact_run, arrays, truth: dict, roundings: int, label: str) -> None:
     """Dew's float64 path `exact_run` on a seed's `arrays` held to the oracle's `truth`, leaf by leaf, within
     float64's rounding of `roundings` operations (`assert_computes_the_oracle`): a recorder's cross-check

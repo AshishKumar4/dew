@@ -29,13 +29,26 @@ IGNORING = ("ptxas info    : (C7507) Potential Performance Loss: 'setmaxnreg' ig
 challenge's C7507 (notes/ptxas-re.md §4, 'setmaxnreg' ignored), its threads left at the entry's registers."""
 
 
+DIVERGED = ("ptxas info    : (C7520) Potential Performance Loss: wgmma.mma_async instructions are serialized "
+            "due to program dependence on compiler-inserted WG.AR in divergent path in the function "
+            "'dew_gmm__la5e5fcdee4_mosaic_gpu_kernel'\n"
+            "ptxas info    : Compiling entry function 'dew_gmm__la5e5fcdee4_mosaic_gpu_kernel' for 'sm_90a'\n"
+            "ptxas info    : Used 168 registers, used 16 barriers, 1 bytes smem\n"
+            "    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads")
+"""ptxas's report of M-FS-74's Qwen3.5-4B q input gradient (CUDA 12.9 and 13.0 alike, FS-QDX-SASS3):
+spill-free, every HGMMA of its walk waited, its merge of a shared tile's partials branching on a verdict held
+lane by lane (row 10151)."""
+
+
 @pytest.mark.parametrize(("notes", "registers", "code", "named"),
-                         [(SERIALIZING, 152, "C7512", "serialize"), (IGNORING, 168, "C7507", "setmaxnreg")])
+                         [(SERIALIZING, 152, "C7512", "serialize"), (DIVERGED, 168, "C7520", "serialize"),
+                          (IGNORING, 168, "C7507", "setmaxnreg")])
 def test_a_kernel_ptxas_notes_a_performance_loss_of_fails_the_gate(notes, registers, code, named):
     """A Mosaic GPU kernel ptxas notes a performance loss of fails the compile gate (`mosaic_failures`), its
-    registers and spills clean: one whose warpgroup MMAs it serializes (C7510 to C7515: each HGMMA waited, as
-    a spill-free 152-register recurrence output was) runs its MMAs one at a time (row 3615; the kernel
-    challenge's C7511 at 112 registers, C7512 at 96), and one whose setmaxnreg it ignores (C7507: code after
+    registers and spills clean: one whose warpgroup MMAs it serializes (C7510 to C7515 and C7520: each HGMMA
+    waited, as a spill-free 152-register recurrence output was, and a GEMM whose merge branched on a verdict
+    held lane by lane) runs its MMAs one at a time (rows 3615, 10151; the kernel challenge's C7511 at 112
+    registers, C7512 at 96), and one whose setmaxnreg it ignores (C7507: code after
     the warp roles' split reachable from both budgets, every raise and decrease dropped) keeps its consumers
     at the entry's registers, never the ones its tile was sized for (row 4071)."""
     read = kc.ptxas_read(notes)
@@ -245,29 +258,42 @@ def test_compile_mosaic_kernels_reports_both_xla_uniquified_triton_cubins():
 @lowers("sm100")
 def test_report_binaries_distinguishes_sm100_tmem_mosaic_cubins_from_non_tmem_triton_cubins():
     """Row 7263: `assembled.binaries(..., decoded=True)` sets `uses_tmem=True` on an sm100 Mosaic GPU TMEM
-    cubin, `uses_tmem=False` on an sm100 fp32 Triton cubin that allocates no TMEM, and `uses_tmem=None` when
-    `decoded=False`."""
-    import jax.numpy as jnp
+    cubin (tcgen05's persistent walk, its accumulators in tensor memory), `uses_tmem=False` on an sm100
+    Triton cubin that allocates no TMEM (an fp32 row doubled, named as a template launch), and
+    `uses_tmem=None` when `decoded=False`; each the least kernel of its kind, where an attention forward
+    and an fp32 decode's four Triton kernels took 122 s (row 12717; the decode alone 66 s, FS-12717-TRITON1;
+    these two 21 s, FS-12717-TMEM3)."""
+    import functools
+
+    import numpy as np
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import triton as pltriton
+    from test_mosaic_toolkit import _persisted_operands, _persisted_products
 
     from dew.nn.kernels import generation
-    from dew.nn.kernels.templates import attention as template, attention_mosaic, attention_route
+    from dew.nn.kernels.templates import mosaic_sm100
 
-    q_m = jax.ShapeDtypeStruct((1, 256, 2, 64), jnp.bfloat16)
-    spans_m = template.spans(256, 256, 1, causal=True)
+    family = mosaic_sm100.RINGS
+    operands = tuple(jax.ShapeDtypeStruct(np.shape(each), each.dtype)
+                     for each in _persisted_operands(family.rows))
     with generation.assumed("sm100"):
-        exe_m = kc.lowered_for(lambda q, k, v: attention_mosaic.forward(q, k, v, spans_m),
-                               (q_m, q_m, q_m), "sm100").compile()
+        exe_m = kc.lowered_for(functools.partial(_persisted_products, family=family, interpret=False),
+                               operands, "sm100").compile()
     mosaic_decoded = [b for b in assembled.binaries(exe_m, decoded=True) if b.kind == "mosaic_gpu"]
     mosaic_raw = [b for b in assembled.binaries(exe_m, decoded=False) if b.kind == "mosaic_gpu"]
     assert mosaic_decoded and any(b.uses_tmem is True for b in mosaic_decoded), mosaic_decoded
     assert mosaic_raw and all(b.uses_tmem is None for b in mosaic_raw), mosaic_raw
 
-    q_t = jax.ShapeDtypeStruct((2, 1, 32, 256), jnp.float32)
-    k_t = jax.ShapeDtypeStruct((2, 4096, 8, 256), jnp.float32)
-    spans_t = template.spans(1, 4096, 2, causal=False)
+    def doubled(x_ref, o_ref):
+        o_ref[...] = x_ref[...] * 2
+
+    row = jax.ShapeDtypeStruct((1024,), jnp.float32)
     with generation.assumed("sm100"):
-        exe_t = kc.lowered_for(lambda q, k, v: attention_route.attend(q, k, v, spans_t, natural=False),
-                               (q_t, k_t, k_t), "sm100").compile()
+        # Named as a template launch is (`assembled.LAUNCH_SUFFIX`): `binaries` reads a Triton launch's
+        # cubin by its name.
+        doubling = pl.pallas_call(doubled, out_shape=row, compiler_params=pltriton.CompilerParams(),
+                                  name="doubled__l0123456789")
+        exe_t = kc.lowered_for(doubling, (row,), "sm100").compile()
     triton_decoded = [b for b in assembled.binaries(exe_t, decoded=True) if b.kind == "triton"]
     triton_raw = [b for b in assembled.binaries(exe_t, decoded=False) if b.kind == "triton"]
     assert triton_decoded and all(b.uses_tmem is False for b in triton_decoded), triton_decoded

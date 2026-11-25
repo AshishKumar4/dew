@@ -30,7 +30,7 @@ from typing_extensions import get_protocol_members
 from dew import _records
 from dew._cache import Same
 from dew._records import EARLIER_LAYOUTS, JSON
-from dew.data.text import ByteTokenizer, HFTokenizer, Offsets, Tokenizer
+from dew.data.text import HFTokenizer, Offsets, Tokenizer, taken_back
 from dew.data.tokens import share_tokens
 from dew.decision.questions import Choice, Noul, Question, Score, kind_of
 from dew.decision.renderer import Chunk, Point, Rendered, Unit, render as rendered_chunks, stream_point
@@ -1309,12 +1309,18 @@ class SegmentLayout(Layout):
                 return ""
             return text[:ends[count - 1]] if copy.keep != "end" else text[starts[len(own) - count]:]
 
-        def own_fits(at: int, count: int) -> bool:
-            # A capped copy's slice, re-encoded alone, holds no more than its cap (`_state_caps`): a slice at
-            # a character boundary may encode to more tokens than it was counted by.
+        def own_over(at: int, count: int) -> int:
+            # How many tokens a capped copy's slice, re-encoded alone, holds past its cap (`_state_caps`),
+            # none or fewer where it fits: a slice at a character boundary may encode to more tokens than
+            # it was counted by.
             cap = caps[at]
             sliced = piece(at, count)
-            return cap is None or not sliced or len(encoder.encode(sliced, add_special_tokens=False)) <= cap
+            if cap is None or not sliced:
+                return 0
+            return len(encoder.encode(sliced, add_special_tokens=False)) - cap
+
+        def own_fits(at: int, count: int) -> bool:
+            return own_over(at, count) <= 0
 
         for at, copy in enumerate(copies):
             while copy.keep != "all" and kept[at] > 0 and not own_fits(at, kept[at]):
@@ -1328,27 +1334,27 @@ class SegmentLayout(Layout):
             laid = built([piece(at) for at in range(len(copies))])
         # A merge across a cut may let a longer cut fit than the share counted: each copy takes the
         # longest that still fits, its own cap and the row's length both held. A subword row's encoding,
-        # and its slice's, need not grow with its cut (a merge across a later boundary can take fewer
-        # tokens than one across an earlier, by as many as its merges join), so the walk asks every longer
-        # cut, each one row encoded (rows 9060, 11739: it stopped 4 tokens past the room). A byte
-        # vocabulary encodes a text as its characters' bytes, so its rows and slices grow with every
-        # character a cut keeps: its walk stops at the first that overflows (row 11739's review: it
-        # walked a long state's every prefix, each encoded whole).
-        # Its tokens the byte vocabulary's own: a subclass encoding otherwise (merging bytes) may not grow.
-        grows = getattr(encoder.encode, "__func__", None) is ByteTokenizer.encode
+        # and its slice's, need not grow with its cut: a ranked BPE's merges cascade, one more character
+        # turning the parity of every later pair, so a longer cut can take back any number of tokens
+        # (rows 9060, 11739: the walk stopped 4 tokens past the room). Its walk asks every longer cut;
+        # one whose vocabulary proves a bound (`dew.data.text.taken_back`: none for bytes) stops once a
+        # cut overflows the room, or its cap, by more (row 11839: a byte walk past a long state's room,
+        # each row encoded).
+        bound = taken_back(encoder)
         for at, copy in enumerate(copies):
             if len(laid.tokens) > self.max_len or copy.keep == "all":
                 continue
             for count in range(kept[at] + 1, lengths[at] + 1):
-                if not own_fits(at, count):
-                    if grows:
+                over = own_over(at, count)
+                if over > 0:
+                    if bound is not None and over > bound:
                         break
                     continue
                 longer = built([piece(other, count if other == at else kept[other])
                                 for other in range(len(copies))])
                 if len(longer.tokens) <= self.max_len:
                     kept[at], laid = count, longer
-                elif grows:
+                elif bound is not None and len(longer.tokens) - self.max_len > bound:
                     break
         alone = [len(encoder.encode(own, add_special_tokens=False)) if (own := piece(at)) else 0
                  for at in range(len(copies))]

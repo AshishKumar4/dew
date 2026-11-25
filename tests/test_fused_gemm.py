@@ -262,15 +262,16 @@ def test_a_scattered_regions_fused_price_counts_its_sides_permutation():
 def test_a_scattered_regions_permutation_prices_each_sides_bytes_and_table():
     """The region `fused` prices for a scattered product whose consumer adds an fp32 residual of its rows
     holds its permutation pass's every byte, the residual read and written and the int32 scatter table
-    read, and its price (`fused_gemm.priced`, which `analysis` reads) charges its fused arm exactly one
-    XLA pass of them over the same region without it, its unfused arm nothing (rows 12419, 12630)."""
+    read, and the seconds its analysis reads (`fused_gemm.analysis`, a pass's decision) charge its fused arm
+    exactly one XLA pass of them over the same region priced without it, its unfused arm nothing: the
+    residual a tileable side whose launch charge the two prices share (rows 12419, 12630)."""
     sizes = jax.ShapeDtypeStruct((4,), jnp.int32)
     x = jax.ShapeDtypeStruct((8192, 4096), jnp.bfloat16)
     w = jax.ShapeDtypeStruct((4, 4096, 4096), jnp.bfloat16)
     rows = jax.ShapeDtypeStruct((8192,), jnp.int32)
     residual = jax.ShapeDtypeStruct((8192, 4096), jnp.float32)
 
-    def region(x, w, sizes, rows, residual):
+    def region_of(x, w, sizes, rows, residual):
         product = fused_gemm.product(x, w, sizes, out_dtype=jnp.float32, scatter=rows)
         return (product + residual).astype(jnp.bfloat16)
 
@@ -278,7 +279,7 @@ def test_a_scattered_regions_permutation_prices_each_sides_bytes_and_table():
     token = fused_gemm._PRICED.set(regions)
     try:
         with generation.assumed("sm90"), gemm.unbuilt():
-            jax.eval_shape(functools.partial(fused_gemm.fused, region), x, w, sizes, rows, residual)
+            jax.eval_shape(functools.partial(fused_gemm.fused, region_of), x, w, sizes, rows, residual)
     finally:
         fused_gemm._PRICED.reset(token)
     permuted = 2 * 8192 * 4096 * 4 + 8192 * 4
@@ -286,12 +287,12 @@ def test_a_scattered_regions_permutation_prices_each_sides_bytes_and_table():
     assert region.permuted_bytes == permuted, region
     with generation.assumed("sm90"):
         target = generation.gpu_target()
-        fused, unfused, _ = fused_gemm.priced(region, target)
+        found = fused_gemm.analysis(region_of, x, w, sizes, rows, residual)
         bare = dataclasses.replace(region, permuted_bytes=0.0)
         bare_fused, bare_unfused, _ = fused_gemm.priced(bare, target)
         pass_seconds = algebra_cost.fused(target)(cost.Work(device_bytes=permuted, kernels=1.0))
-    assert unfused == bare_unfused, (unfused, bare_unfused)
-    assert fused == bare_fused + pass_seconds, (fused, bare_fused, pass_seconds)
+    assert found.unfused_seconds == bare_unfused, (found, bare_unfused)
+    assert found.fused_seconds == bare_fused + pass_seconds, (found, bare_fused, pass_seconds)
 
 
 def _chained(function, wide):

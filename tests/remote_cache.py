@@ -163,6 +163,8 @@ class RemoteCache:
         """The programs the remote's bundles put in the directory, and the bundles it took."""
         self.bytes_fetched = self.bytes_uploaded = 0
         """The bundles' bytes read and sent, which the summary reports."""
+        self.programs_dropped = 0
+        """The programs a bundle held that were not the bytes written (`unpacked`), compiled again."""
         if not self.writes.watching:
             # No program a run compiles could be told from the rest without listing the directory at every
             # switch: the task compiles without the remote.
@@ -316,7 +318,9 @@ class RemoteCache:
                 break
             with self.lock:
                 self.bytes_fetched += len(bundle)
-            found = unpacked(bundle)
+            found, dropped = unpacked(bundle)
+            with self.lock:
+                self.programs_dropped += dropped
             chunks.append([key for key, _ in found])
             entries += found
         with self.state:
@@ -325,9 +329,10 @@ class RemoteCache:
 
     def _siblings(self, file: str) -> list[tuple[str, bytes]]:
         """`siblings` of `file` on the Worker, unless the remote was given up, each bundle read counted."""
-        entries, read = siblings(self.store, self._key, file, lambda: self.given_up)
+        entries, read, dropped = siblings(self.store, self._key, file, lambda: self.given_up)
         with self.lock:
             self.bytes_fetched += read
+            self.programs_dropped += dropped
         return entries
 
     def _seeded(self, key: str, value: bytes) -> bool:
@@ -418,6 +423,8 @@ class RemoteCache:
                 f"({self.bytes_fetched / 1e6:.1f} MB read), {used} of those listed loaded, "
                 f"{self.uploaded} bundles uploaded "
                 f"({self.bytes_uploaded / 1e6:.1f} MB)"
+                + (f", {self.programs_dropped} fetched programs dropped as not the bytes written"
+                   if self.programs_dropped else "")
                 + ("" if self.available else ", given up as unreachable"))
 
     def drain(self, seconds: float = DRAIN_SECONDS) -> None:
@@ -462,14 +469,14 @@ def seeded(directory: Path, key: str, value: bytes) -> bool:
 
 
 def siblings(store: r2.Store, key: Callable[[str], str], file: str,
-             stopped: Callable[[], bool]) -> tuple[list[tuple[str, bytes]], int]:
+             stopped: Callable[[], bool]) -> tuple[list[tuple[str, bytes]], int, int]:
     """For split group `file` with no bundle of its own, the entries of up to SIBLINGS groups of its file's
     other cuts whose share of the file overlaps its own, the nearest overlap first, together within
-    MAX_BYTES, and the bytes read; none for a file that is no split group, nor once `stopped`. `key` is a
-    bundle's key on the Worker."""
+    MAX_BYTES, the bytes read and the programs dropped (`unpacked`); none for a file that is no split group,
+    nor once `stopped`. `key` is a bundle's key on the Worker."""
     group = GROUP.match(file)
     if group is None or stopped():
-        return [], 0
+        return [], 0, 0
     index, count = int(group["index"]), int(group["count"])
     start, end = (index - 1) / count, index / count
     overlaps = []
@@ -481,7 +488,7 @@ def siblings(store: r2.Store, key: Callable[[str], str], file: str,
         low, high = (at - 1) / of, at / of
         if low < end and high > start:
             overlaps.append((min(end, high) - max(start, low), name))
-    entries, left = [], MAX_BYTES
+    entries, left, dropped = [], MAX_BYTES, 0
     for _, name in sorted(overlaps, reverse=True)[:SIBLINGS]:
         if stopped() or left <= 0:
             break
@@ -491,8 +498,10 @@ def siblings(store: r2.Store, key: Callable[[str], str], file: str,
             continue
         if bundle is not None:
             left -= len(bundle)
-            entries += unpacked(bundle)
-    return entries, MAX_BYTES - left
+            found, lost = unpacked(bundle)
+            entries += found
+            dropped += lost
+    return entries, MAX_BYTES - left, dropped
 
 
 PREFETCHED = ".prefetched"
@@ -517,21 +526,21 @@ def taken_prefetched(directory: Path, key: str) -> dict | None:
     return record
 
 
-def prefetch(directory: Path, url: str, token: str, prefix: str, bundles: list[str]) -> int:
+def prefetch(directory: Path, url: str, token: str, prefix: str, bundles: list[str]) -> tuple[int, int]:
     """`bundles` (each a test file's in its partition, `bundle`) fetched from the Worker into `directory`,
     each chunk of each, or, for a recut group with no bundle of its own, its file's other cuts' it overlaps
     (`siblings`), each recorded there (`PREFETCHED`), so a run on a GPU that opens them finds them there and
     asks nothing (Main, 2026-11-08: a cold on-demand A100 started each part's files fetching them as they
     ran, and a tier's groups are recut as its GPU seconds move): the programs written. A remote that cannot
     be reached stops it where it is, the bundles fetched so far recorded, and the run fetches the rest
-    itself."""
+    itself. How many programs it wrote, and how many it dropped as not the bytes written (`unpacked`)."""
     store = r2.Store(url, token, "dew-ci-xla-cache", TIMEOUT_SECONDS)
     directory.mkdir(parents=True, exist_ok=True)
 
     def key(name: str) -> str:
         return f"{prefix.strip('/')}/bundles/{name}"
 
-    written = 0
+    written = dropped = 0
     try:
         for name in bundles:
             chunks, borrowed = [], []
@@ -539,11 +548,13 @@ def prefetch(directory: Path, url: str, token: str, prefix: str, bundles: list[s
                 body = store.get(chunk(key(name), index), limit=MAX_BYTES)
                 if body is None:
                     break
-                entries = unpacked(body)
+                entries, lost = unpacked(body)
+                dropped += lost
                 written += sum(seeded(directory, program, value) for program, value in entries)
                 chunks.append([program for program, _ in entries])
             if not chunks:
-                entries, _ = siblings(store, key, name, lambda: False)
+                entries, _, lost = siblings(store, key, name, lambda: False)
+                dropped += lost
                 written += sum(seeded(directory, program, value) for program, value in entries)
                 borrowed = [program for program, _ in entries]
             if chunks or borrowed:
@@ -554,7 +565,7 @@ def prefetch(directory: Path, url: str, token: str, prefix: str, bundles: list[s
                 staged.replace(path)
     except UNREACHABLE as error:
         logger.warning("the shared XLA cache is unreachable (%s); the run fetches the rest", error)
-    return written
+    return written, dropped
 
 
 def chunk(key: str, index: int) -> str:
@@ -578,8 +589,9 @@ def packed(entries: list[tuple[str, bytes]]) -> bytes:
                     + value for key, value in entries)
 
 
-def unpacked(bundle: bytes) -> list[tuple[str, bytes]]:
-    """The `(key, value)` entries of a `packed` bundle, or ValueError where it is not one whole: more
+def unpacked(bundle: bytes) -> tuple[list[tuple[str, bytes]], int]:
+    """The `(key, value)` entries of a `packed` bundle and how many it dropped, or ValueError where it is
+    not one whole: more
     than `MAX_BYTES`, an entry its lengths run past, or a key that is no file name in one directory
     (empty, `.` or `..`, a separator or NUL in it, or too long for its `-cache` file's name). An entry whose
     value is not the bytes its digest was taken of is dropped and said, its program compiled again: JAX's
@@ -587,7 +599,7 @@ def unpacked(bundle: bytes) -> list[tuple[str, bytes]]:
     train's base run aborted in jaxlib reading back a cached program's result)."""
     if len(bundle) > MAX_BYTES:
         raise ValueError(f"a bundle of more than {MAX_BYTES} bytes")
-    entries, at = [], 0
+    entries, at, dropped = [], 0, 0
     while at < len(bundle):
         if at + HEADER.size > len(bundle):
             raise ValueError(f"a bundle's entry header at {at} runs past its {len(bundle)} bytes")
@@ -604,9 +616,10 @@ def unpacked(bundle: bytes) -> list[tuple[str, bytes]]:
         if hashlib.sha256(value).digest() != digest:
             logger.warning("the shared XLA cache's program %s is not the bytes it was written with; it is "
                            "dropped and compiled again", key)
+            dropped += 1
             continue
         entries.append((key, value))
-    return entries
+    return entries, dropped
 
 
 def prefix(kind: str | None = None, backend: str | None = None) -> str:
@@ -689,9 +702,10 @@ def main(arguments: list[str]) -> int:
     kind = topologies.TopologyDescription.deserialize(Path(topology).read_bytes()).devices[0].device_kind
     bundles = [bundle(file, group or None, None)
                for file, _, group in (item.partition("#") for item in items)]
-    written = prefetch(Path(default_compilation_cache_dir()), os.environ["DEW_XLA_CACHE_URL"],
-                       os.environ["DEW_XLA_CACHE_TOKEN"], prefix(kind, "gpu"), bundles)
-    print(f"shared XLA cache: {written} programs fetched ahead for {len(bundles)} bundles")
+    written, dropped = prefetch(Path(default_compilation_cache_dir()), os.environ["DEW_XLA_CACHE_URL"],
+                                os.environ["DEW_XLA_CACHE_TOKEN"], prefix(kind, "gpu"), bundles)
+    print(f"shared XLA cache: {written} programs fetched ahead for {len(bundles)} bundles"
+          + (f", {dropped} dropped as not the bytes written" if dropped else ""))
     return 0
 
 

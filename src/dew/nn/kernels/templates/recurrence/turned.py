@@ -81,12 +81,25 @@ def call(launch: Callable, query, key, value, g, beta, state, skip, turn, starts
     so a gradient's components in a frame, up to its norm, stay finite where the true frame's are; its turns'
     in the crossing form (`turn_gradient`) from frames each root's first token composes (`_forked_frames`),
     its final memory's cotangent turned into them."""
-    if documents is not None:
-        # A forked call's documents begin at their first slots (`documents`' `firsts`), whatever `starts` it
-        # gave (base review fbb1c2f71 F4: a call giving its firsts alone read as one document).
-        starts = _first_tokens(documents[0], value.shape[1])
+    starts = _documents_starts(starts, documents, value.shape[1])
     rule = _turned(launch, scale, group, held)
     return rule(query, key, value, g, beta, state, skip, entry, turn, starts, documents, context)
+
+
+def bound(query, key, value, state, entry, turn, starts, documents) -> tuple:
+    """The operands `call` gives its launch, `(query, key, state, entry, turning)`: its queries, keys, memory
+    entering and entry keys in its documents' frames and a forked call's load rotation (`_framed`), so a
+    selector binds the launch that runs (`recurrence_chunk._turned_launch`)."""
+    framed, turning, _ = _framed(query, key, state, entry, turn,
+                                 _documents_starts(starts, documents, value.shape[1]), documents)
+    return (*framed, turning)
+
+
+def _documents_starts(starts, documents, length: int):
+    """A call's documents' first tokens: a forked call's documents begin at their first slots (`documents`'
+    `firsts`), whatever `starts` it gave (base review fbb1c2f71 F4: a call giving its firsts alone read as one
+    document); another's `starts`."""
+    return starts if documents is None else _first_tokens(documents[0], length)
 
 
 def _first_tokens(firsts, length: int) -> jax.Array:

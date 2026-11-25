@@ -65,28 +65,31 @@ def test_a_runs_held_steps_stay_whole_under_threads_holding_and_reading_at_once(
     assert len(released) == len(set(released)) == 4 * 2000 - len(held)
 
 
-def _shaped(rows: tuple[int, ...]):
-    """The affine run's stream, its batches `rows[step % len(rows)]` rows each."""
-    from affine_run import Replaying
+def _ramped():
+    """The affine run's records, its batch ramped from 8 rows a step to 32 by 8 each step (`Ramp`): four
+    batch shapes, each a step of its own, then 32 rows a step on."""
+    from dew.data import Loading, Memory
+    from dew.data.compile import compile
+    from dew.data.dataset import Ramp, ramped
+    from dew.data.pipeline import Pipeline
 
-    from dew.data.dataset import Loader
-
-    def batch_at(step: int) -> dict:
-        x = np.random.default_rng(step).normal(size=(rows[step % len(rows)], FEATURES)).astype(np.float32)
-        return {"x": x, "y": 2 * x[:, :2]}
-
-    return Loader(train=lambda partition: Replaying(batch_at), val=None, batch=max(rows), records=None)
+    x = np.random.default_rng(0).normal(size=(256, FEATURES)).astype(np.float32)
+    records = [{"x": row, "y": 2 * row[:2]} for row in x]
+    chain = Pipeline(Memory(records)).repeat().batch(32)
+    # Three increments over 24 records: each stage's 8 records a step of its own (`Ramp`'s stage length).
+    return ramped(compile(chain, loading=Loading(workers=0)), Ramp(start=8, increment=8, samples=24))
 
 
 @pytest.mark.gpu(reason="device code's bytes, which a GPU's executables state and the CPU's do not")
 @pytest.mark.compiles_at_run(reason="a fit's steps compiled as it meets each shape, no check-1 site")
 def test_a_fit_meeting_shape_after_shape_holds_no_step_past_its_budget(monkeypatch):
-    """A fit whose run holds no more device code than its latest step's (`HELD_CODE_BYTES`) meets three
-    batch shapes and then each again: each shape it meets lets the steps of the one before go, the runner
-    its fit held (`FitRun.compiled`) and the executable its compiler held (`FitSearch.executables`), so at
-    no step does the backend hold more than the step it runs and the one before it, which the loop ran
-    last; and it trains as a run that held every step, which holds all three at once (review of row
-    12385: the fit's runners held every executable the compiler let go until the fit ended)."""
+    """A fit whose run holds no more device code than its latest step's (`HELD_CODE_BYTES`) meets four
+    batch shapes as its batch ramps (`_ramped`): each shape it meets lets the steps of the one before go,
+    the runner its fit held (`FitRun.compiled`) and the executable its compiler held
+    (`FitSearch.executables`), so at no step does the backend hold more than the step it runs and the one
+    before it, which the loop ran last; and it trains as a run that held every step, which holds all four
+    at once (review of row 12385: the fit's runners held every executable the compiler let go until the
+    fit ended)."""
     from dew.training import memory
     from dew.training.observe import Observe
 
@@ -105,7 +108,7 @@ def test_a_fit_meeting_shape_after_shape_holds_no_step_past_its_budget(monkeypat
                 return sum(1 for held in ran.values() if held() is not None)
 
             observed = Observe(1, live)
-            state = trainer.fit(_shaped((16, 8, 32)), steps=6, log_every=100, observe=observed)
+            state = trainer.fit(_ramped(), steps=6, log_every=100, observe=observed)
         return [count for _, count in observed.values], jax.device_get(state.variables)
 
     bounded, held = trained(1)
@@ -154,14 +157,18 @@ def test_a_placed_steps_compile_limit_gives_back_the_state_it_reuses():
     assert target + (1 << 27) < argument + beside + ahead.temp_bytes, ahead
     # Compiled cold, so its limit stops a compile that misses (`uncached`).
     with uncached():
-        trainer = built(MeshSpec())
+        # On this device alone, its room and its filler alike, whatever devices the worker holds.
+        trainer = built(MeshSpec().build([device]))
         state, _, _ = trainer.place()
         batch = shard_batch(trainer.device_mesh, rows)
         room = step_room(device)
         assert room is not None and room > target, (room, target)
-        filler = [jnp.zeros((1 << 24,), jnp.float32) for _ in range((room - target) >> 26)]
+        filler = [jnp.zeros((1 << 24,), jnp.float32, device=device) for _ in range((room - target) >> 26)]
+        # Within a 64 MiB chunk of the target, the allocator's own reservations aside: still room for the
+        # temporaries beside what the step places, short of the state with them.
         filled = step_room(device)
-        assert filled is not None and target <= filled < target + (1 << 27), (target, filled)
+        assert filled is not None and target - (1 << 26) < filled < target + (1 << 26), (target, filled)
+        assert beside + ahead.temp_bytes < filled < argument + beside + ahead.temp_bytes, (filled, ahead)
         step = trainer.compile(state, batch)
         probes = trainer.plan["probes"]
         assert probes[0]["fits"] and trainer.plan["split"] == 1, probes

@@ -282,7 +282,7 @@ KERNEL_CELLS = (kernels.flash_through_dews_attention_refuses_rows_it_would_misre
                 kernels.single_query_cudnn_decode_matches_float64_attention_and_gradients,
                 kernels.a_kernels_requirements_are_what_the_kernel_takes_on_this_gpu)
 """test_kernels' fused and Triton kernels on a GPU of cuDNN's bf16 floor (sm80) or later; its mesh cell
-is the two-GPU flow's (tests/test_gpu_mesh.py)."""
+is the two-GPU flow's (tests/test_gpu_mesh_attention.py)."""
 
 LIBRARY_AXES = ("implementation", "kernel", "causal", "sunk", "window", "sinks", "as_mask", "call", "case")
 """A library kernel's native axes, the parameters of its checks a GPU alone shows (Main, 11-11): a library's
@@ -352,8 +352,12 @@ def test_a_split_steps_merge_and_its_state_are_on_par_on_this_gpu(form):
     nan_pad = jnp.full((*padded.shape[:-1], 32), jnp.nan, padded.dtype)
     padded_wide = jnp.concatenate([padded, nan_pad], axis=-1)
     with_pad = jax.jit(lambda p, s: tuple(ours(p, s)))(padded_wide, stacked)
-    for lhs, rhs in zip(one_block, with_pad, strict=True):
+    # And on Mosaic GPU's merge where Pallas Triton serves the unhooked one (`merged.MOSAIC_SLOWER`).
+    with tuning.pinned({merged.MergedPadded: merged.MergeConfig(64)}):
+        mosaic_pad = jax.jit(lambda p, s: tuple(ours(p, s)))(padded_wide, stacked)
+    for lhs, rhs, pinned in zip(one_block, with_pad, mosaic_pad, strict=True):
         np.testing.assert_array_equal(np.asarray(lhs), np.asarray(rhs))
+        np.testing.assert_array_equal(np.asarray(lhs), np.asarray(pinned))
 
 
 def test_the_decode_matrix_holds_on_this_gpu():

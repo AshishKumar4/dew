@@ -20,7 +20,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from attention_oracle import attention_on_par, exact_value_and_grads, kept, packed_ids, qkv, value_and_grads
+import tier_wire
+from arm_arithmetic import drawn_on_the_host
+from attention_oracle import attention_on_par, exact_value_and_grads, kept, qkv, value_and_grads
 from reference_error import FEWEST_SEEDS
 
 from dew.nn.attention import scaled_dot_product_attention
@@ -37,8 +39,11 @@ def masked():
 
 
 def padded():
-    """Two packed rows of 256 that end in padding."""
-    segment_ids = packed_ids((100, 84, 50), (30, 190, 10))
+    """Two packed rows of 256 that end in padding, host ids (a GPU tier part's prepare computes nothing on
+    its compile-only device)."""
+    rows = [np.pad(np.repeat(np.arange(1, len(lengths) + 1), lengths), (0, 256 - sum(lengths)))
+            for lengths in ((100, 84, 50), (30, 190, 10))]
+    segment_ids = np.stack(rows).astype(np.int32)
     return {"causal": True, "segment_ids": segment_ids}, None
 
 
@@ -90,9 +95,12 @@ def _on_par(implementation: str, case: str, structure: dict, dtype, seeds: int) 
     shape = (2, 256, 4, 64)
     extra = {"max_segments": 4} if implementation == "flash" else {}
 
-    def draw(seed):
+    def drawn(seed):
         cotangent = jax.random.normal(jax.random.fold_in(jax.random.key(93), seed), shape, dtype)
         return (*qkv(shape, dtype, seed=seed), cotangent)
+
+    def draw(seed):
+        return drawn_on_the_host(drawn, seed)
 
     def attended(implementation, **options):
         def attend(q, k, v):
@@ -117,9 +125,11 @@ def _on_par(implementation: str, case: str, structure: dict, dtype, seeds: int) 
 def a_row_that_sees_no_key_reads_nothing_on_the_fused_gpu_kernels(implementation, case,
                                                                          without_deterministic_ops):
     """Each fused GPU kernel, bf16: a row that sees no key has a zero output and query gradient, and its
-    output and gradients are on par (check 1) with the bf16 reference attention's from float64."""
-    structure = run(implementation, case, jnp.bfloat16)[3]
-    _on_par(implementation, case, structure, jnp.bfloat16, FEWEST_SEEDS)
+    output and gradients are on par (check 1) with the bf16 reference attention's from float64; a GPU tier
+    part's prepare compiles its sites alone, its run checking the dead rows too."""
+    _on_par(implementation, case, CASES[case]()[0], jnp.bfloat16, FEWEST_SEEDS)
+    if not tier_wire.preparing():
+        run(implementation, case, jnp.bfloat16)
 
 
 @pytest.mark.parametrize("implementation", ["reference", "xla", "template"])

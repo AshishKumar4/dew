@@ -67,7 +67,7 @@ def pytest_runtest_logreport(report) -> None:
                 import host
 
                 peak = task_peak(host)
-                progress.write(json.dumps({"node": report.nodeid, "seconds": seconds,
+                progress.write(json.dumps({"node": report.nodeid, "seconds": seconds, "pid": str(os.getpid()),
                                            **({"cold": True} if cold else {}),
                                            **({"peak": peak} if peak is not None else {})}) + "\n")
 
@@ -84,20 +84,48 @@ def task_peak(host: types.ModuleType) -> int | None:
 
 
 
-def resumed(tests: list[str], owning: Callable[[str], str]) -> tuple[dict[str, float], set[str], int | None]:
+SEALED = "sealed"
+"""A PROGRESS line's key marking a test an attempt set aside as an earlier one passed it (`resumed`)."""
+ENDED = "ended"
+"""A PROGRESS line's key naming a pytest process that exited, beside its exit code (`ended`)."""
+
+
+def ended(pid: str | None, code: int) -> None:
+    """Keep, among this task's progress, that the pytest of process `pid` exited with `code`: written by ci.py
+    as the process exits, before anything else of it is read, so an attempt resumed after sets aside the
+    tests a process passed only where it exited 0, or never exited (the fleet recalled the task while it
+    ran); a process that failed after its tests passed (an exit's crash) keeps none (`resumed`). Nothing
+    outside a task, nor for a process whose id was never written."""
+    artifacts = os.environ.get("ARMADA_ARTIFACTS")
+    if not artifacts or not pid:
+        return
+    Path(artifacts).mkdir(parents=True, exist_ok=True)
+    with (Path(artifacts) / PROGRESS).open("a") as progress:
+        progress.write(json.dumps({ENDED: pid, "code": code}) + "\n")
+
+
+def resumed(tests: list[str], owning: Callable[[str], str],
+            sealed: bool) -> tuple[dict[str, float], set[str], int | None]:
     """The tests of `tests` (each node's file as `owning` reads it) an earlier attempt of this task passed
     before the fleet recalled it (armada keeps a recalled attempt's artifacts and hands them to the next as
     ARMADA_RESUME, #4544), each with its seconds, as this plugin kept them, and those of them that ran
     cold (`cold`), and the most memory those attempts had held by then (`peak`), which bounds them, as
     this attempt's own cgroup did not run them; copied into this attempt's progress, so a second recall
-    keeps them too. Read by ci.py, which runs a task's pytest. None outside a resumed task."""
+    keeps them too. With `sealed` (a whole file's process), only those of a process that exited 0 (`ended`),
+    as one recalled before its end may yet have failed after them (its exit's crash): its file runs whole
+    again; else (a split group's) those of a process that did not exit other than 0. Read by ci.py, which
+    runs a task's pytest. None outside a resumed task."""
     kept = Path(os.environ.get("ARMADA_RESUME", "/nonexistent")) / PROGRESS
     if not kept.is_file():
         return {}, set(), None
+    lines = [json.loads(line) for line in kept.read_text().splitlines()]
+    ends = {found[ENDED]: found.get("code") for found in lines if ENDED in found}
     passed, cold, peaks = {}, set(), []
-    for line in kept.read_text().splitlines():
-        found = json.loads(line)
-        if owning(found["node"]) in tests:
+    for found in lines:
+        pid = found.get("pid")
+        # A line carried from an earlier resumed attempt was set aside there by these rules: kept as it was.
+        kept_by = found.get(SEALED) or ends.get(pid) == 0 or (not sealed and ends.get(pid) is None)
+        if "node" in found and owning(found["node"]) in tests and kept_by:
             passed[found["node"]] = float(found["seconds"])
             if found.get("cold"):
                 cold.add(found["node"])
@@ -107,7 +135,7 @@ def resumed(tests: list[str], owning: Callable[[str], str]) -> tuple[dict[str, f
     artifacts = os.environ.get("ARMADA_ARTIFACTS")
     if artifacts and passed:
         Path(artifacts).mkdir(parents=True, exist_ok=True)
-        lines = ({"node": node, "seconds": seconds, **({"cold": True} if node in cold else {}),
+        lines = ({"node": node, "seconds": seconds, SEALED: True, **({"cold": True} if node in cold else {}),
                   **({"peak": peak} if peak is not None else {})}
                  for node, seconds in passed.items())
         with (Path(artifacts) / PROGRESS).open("a") as carried:

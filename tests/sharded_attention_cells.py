@@ -1,5 +1,5 @@
-"""A cell of the two-GPU flow (tests/test_gpu_mesh.py): sharded cuDNN attention compiles once across
-processes. jax partitions its cuDNN call through
+"""A cell of Attention's two-GPU flow (tests/test_gpu_mesh_attention.py): sharded cuDNN attention compiles
+once across processes. jax partitions its cuDNN call through
 `custom_partitioning`, whose lowering on several devices names the partitioner by a process address
 (`str(id(...))` in the custom call's backend config), which the persistent cache key keeps; Dew runs
 the kernel per shard (`dew.nn.attention_parallel.on_attention_shards`), where jax lowers no partitioner."""

@@ -112,7 +112,7 @@ def walk(forms, values, chunks: range, state, axes: dict = OPERANDS):
         chunk = chunk_of(values, index, axes)
         prepared = forms.prepare(chunk, transition=transition)
         outputs.append(forms.mapped(prepared, state))
-        state = forms.step(state, prepared)
+        state = forms.step(state, prepared)[0]
     return outputs, state
 
 
@@ -221,7 +221,7 @@ def test_a_readout_that_weighs_the_states_rows_computes_the_token_scan():
                      for name, value in values.items()}
             prepared = forms.prepare(chunk)
             outputs.append(forms.mapped(prepared, state))
-            state = forms.step(state, prepared)
+            state = forms.step(state, prepared)[0]
         return jnp.concatenate(outputs)
 
     def tokens(x, dt, B, C, a):
@@ -554,7 +554,7 @@ def test_two_delta_rule_walks_merged_through_an_issuer_give_the_final_state(upda
             state = forms.init(chunk_of(values, 0, operands))
             for index in chunks:
                 prepared = forms.prepare(chunk_of(values, index, operands), issue, transition=True)
-                state = forms.step(state, prepared, issue)
+                state = forms.step(state, prepared, issue)[0]
             states.append(state)
         return forms.finish(forms.merge(*states, values, issue), values)
 
@@ -582,7 +582,7 @@ def test_a_long_chunks_token_loop_is_split_by_its_construction(target):
             values = operands(x, dt, B, C)
             prepared = forms.prepare(values)
             state = forms.init({})
-            return forms.mapped(prepared, state), forms.finish(forms.step(state, prepared), values)
+            return forms.mapped(prepared, state), forms.finish(forms.step(state, prepared)[0], values)
 
         assert_as_exact(jax.jit(derived), jax.jit(tokenwise), long_draw, f"ssd's 256 tokens on {target}",
                         seeds=8)
@@ -596,7 +596,7 @@ def test_a_token_loop_carries_its_state_in_its_operands_wider_type():
         wide = tuple(value.astype(jnp.float64) for value in long_draw(0))
         values = operands(*wide)
         prepared = forms.prepare(values)
-        outputs, (_, state) = forms.mapped(prepared, forms.init({})), forms.step(forms.init({}), prepared)
+        outputs, (_, state) = forms.mapped(prepared, forms.init({})), forms.step(forms.init({}), prepared)[0]
         expected = tokenwise(*wide)
     assert (outputs.dtype, state.dtype) == (expected[0].dtype, expected[1].dtype) == (jnp.float64,) * 2
 
@@ -651,9 +651,9 @@ def test_a_derived_scans_products_are_its_issuers_each_by_its_role(update_fn, op
     chunk = chunk_of(dict(zip(operands, draw_fn(0), strict=True)), 0, operands)
     state = forms.init(())
     plain = forms.prepare(chunk)
-    expected = forms.mapped(plain, state), forms.step(state, plain)
+    expected = forms.mapped(plain, state), forms.step(state, plain)[0]
     issued = forms.prepare(chunk, issue)
-    made = forms.mapped(issued, state, issue), forms.step(state, issued, issue)
+    made = forms.mapped(issued, state, None, issue), forms.step(state, issued, issue)[0]
     np.testing.assert_array_equal(np.asarray(made[0]), np.asarray(expected[0]))
     np.testing.assert_array_equal(np.asarray(made[1][1]), np.asarray(expected[1][1]))
     assert {"gram", "inverse_merge", "correct", "carry", "readout_memory"} <= set(roles), roles
@@ -702,7 +702,7 @@ def test_the_delta_rules_carry_from_a_ranged_state_computes_its_token_scan(updat
 
         def carried(*values, forms=forms):
             prepared = forms.prepare(dict(zip(names, values[:-1], strict=True)))
-            return forms.step((jnp.zeros((KEY,), jnp.float32), values[-1]), prepared)[1]
+            return forms.step((jnp.zeros((KEY,), jnp.float32), values[-1]), prepared)[0][1]
 
         label = f"{update_fn.__name__} carry, {'a ranged' if 'state' in declared else 'an unranged'} state"
         assert_as_exact(jax.jit(carried), jax.jit(tokens), draw, label, seeds=16)
@@ -731,7 +731,7 @@ def test_a_delta_rules_carry_stays_finite_wherever_the_token_scan_is():
     assert np.all(np.isfinite(np.asarray(expected))) and np.all(np.isfinite(np.asarray(h)))
     entering = (jnp.zeros((KEY,), jnp.float32), jnp.full((KEY, VALUE), 2.0 ** 120))
     prepared = forms.prepare(chunk)
-    outputs, (_, leaving) = forms.mapped(prepared, entering), forms.step(entering, prepared)
+    outputs, (_, leaving) = forms.mapped(prepared, entering), forms.step(entering, prepared)[0]
     assert np.all(np.isfinite(np.asarray(outputs))) and np.all(np.isfinite(np.asarray(leaving)))
 
 
@@ -931,13 +931,13 @@ def test_a_walk_through_a_vanished_decay_differentiates_and_merges_finite(decays
     forms = scalar_ssd()
 
     def final(g):
-        return jnp.sum(forms.step(forms.init({}), forms.prepare(ones_chunk(g)))[1])
+        return jnp.sum(forms.step(forms.init({}), forms.prepare(ones_chunk(g)))[0][1])
 
     g = jnp.asarray(decays, jnp.float32)
     value, gradient = jax.value_and_grad(final)(g)
     _, tangent = jax.jvp(jax.grad(final), (g,), (jnp.ones_like(g),))
     start = forms.init(ones_chunk(g))
-    merged = forms.merge(start, forms.step(start, forms.prepare(ones_chunk(g))), None)
+    merged = forms.merge(start, forms.step(start, forms.prepare(ones_chunk(g)))[0], None)
     leaves = (value, gradient, tangent, *jax.tree.leaves(merged))
     assert all(np.isfinite(np.asarray(leaf)).all() for leaf in leaves)
 
@@ -951,7 +951,7 @@ def test_a_walk_carries_its_state_in_one_dtype(dtype):
         forms = scalar_ssd(dtype)
         prepared = jax.vmap(forms.prepare)(jax.tree.map(lambda leaf: jnp.stack([leaf, leaf]),
                                                        ones_chunk(jnp.zeros((4,), dtype), dtype)))
-        state, _ = jax.lax.scan(lambda carried, chunk: (forms.step(carried, chunk), None), forms.init({}),
+        state, _ = jax.lax.scan(lambda carried, chunk: (forms.step(carried, chunk)[0], None), forms.init({}),
                                 prepared)
         final = forms.finish(state, {})
         assert final.dtype == dtype and np.isfinite(np.asarray(final, np.float64)).all()
@@ -970,7 +970,7 @@ def adjoint(forms, chunk_of_values, count: int):
         init = forms.init({})
         states = [init if entering is None else (init[0], entering)]
         for index in range(count):
-            states.append(forms.step(states[-1], forms.prepare(chunk_of_values(values, index))))
+            states.append(forms.step(states[-1], forms.prepare(chunk_of_values(values, index)))[0])
         d_state, grads = d_final, []
         for index in reversed(range(count)):
             chunk = chunk_of_values(values, index)
@@ -1293,7 +1293,7 @@ def test_a_pre_decay_walks_carry_follows_its_updates_parts(update_fn, wide, carr
         if wide is not None:
             drawn[wide] = drawn[wide].astype(jnp.float64)
         chunk = chunk_of(drawn, 0, RWKV)
-        looped = forms.step(forms.init({}), forms.prepare(chunk))[1]
+        looped = forms.step(forms.init({}), forms.prepare(chunk))[0][1]
         _, replayed = forms.replay(chunk, jnp.zeros((KEY, VALUE), jnp.float32))
     assert (looped.dtype, replayed.dtype) == (jnp.dtype(carried),) * 2
 
@@ -1461,7 +1461,7 @@ def test_a_reset_walk_in_chunks_computes_the_token_scan_of_each_document(rule, r
             chunk = chunked(given, index)
             prepared = forms.prepare(chunk)
             outputs.append(forms.mapped(prepared, state))
-            state = forms.step(state, prepared)
+            state = forms.step(state, prepared)[0]
         return jnp.concatenate(outputs), forms.finish(state, given)
 
     def draws(seed):
@@ -1484,7 +1484,7 @@ def test_two_reset_walks_merged_give_the_final_state():
         for chunks in (range(half), range(half, 2 * half)):
             state = forms.init(chunked(given, 0))
             for index in chunks:
-                state = forms.step(state, forms.prepare(chunked(given, index)))
+                state = forms.step(state, forms.prepare(chunked(given, index)))[0]
             states.append(state)
         return forms.finish(forms.merge(*states, given), given)
 
@@ -1566,7 +1566,7 @@ def test_a_derived_chunk_computes_what_its_token_update_states(update, dtype):
         chunk = {"g": jnp.zeros((2,), dtype), "b": jnp.full((2, 2), 1.9, dtype), "v": jnp.ones((2, 3), dtype),
                  "q": jnp.ones((2, 2), dtype)}
         prepared = made.prepare(chunk)
-        outputs, final = made.mapped(prepared, made.init({})), made.step(made.init({}), prepared)[1]
+        outputs, final = made.mapped(prepared, made.init({})), made.step(made.init({}), prepared)[0][1]
 
         def token(h, values):
             h = update(h, **values)

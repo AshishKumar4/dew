@@ -296,12 +296,15 @@ CASES = (
     ('sm80', '64', 'mha', 'causal', 'plain', 'two', 'bfloat16', 'accurate'),
     ('sm90', '64', 'gqa-8-4', 'causal', 'key-bias', 'two', 'bfloat16', 'fast'),
     ('sm80', '64', 'gqa-8-2', 'documents', 'plain', 'one', 'bfloat16', 'fast'),
-    ('sm80', '256', 'gqa-8-4', 'causal', 'plain', 'one', 'bfloat16', 'fast'),
+    ('sm80', '256', 'gqa-8-4', 'causal', 'plain', 'two', 'bfloat16', 'fast'),
+    ('sm80', '256', 'mha', 'documents', 'plain', 'one', 'bfloat16', 'fast'),
 )
 """The cells' cases, each its axis values in `AXES`' order: the cases ledger rows name and every pair of axis
 values the route serves (`kernel_matrix.covering("attention")`, regenerated where the axes or the route's
 support change; a pair the route newly serves its covering's cell for it added, the others kept: an A100's
-one-launch backward, which the register rule's calibration found within its registers, 65610c7ed30)."""
+one-launch backward, which the register rule's calibration found within its registers, 65610c7ed30; its
+causal width-256 one priced past its two launches since, row 12752, that cell two and the covering's
+width-256 one-launch cell added)."""
 
 
 @cell("attention", covers=lambda case: dict(zip(AXES["attention"], case, strict=True)))

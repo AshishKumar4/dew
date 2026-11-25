@@ -793,6 +793,29 @@ class ProportionalSelection(pygrain.DatasetSelectionMap):
                 f"seed={self._proportions.seed}, length={self._length})")
 
 
+@runtime_checkable
+class _SlicedInPlace(Protocol):
+    """A dataset a loading worker's copy slices itself (Grain's `SupportsInPlaceSlicing`)."""
+
+    def set_slice(self, selection: slice, sequential_slice: bool = False) -> None: ...
+
+
+def sliced(dataset: pygrain.IterDataset | pygrain.MapDataset, selection: slice,
+           sequential_slice: bool) -> None:
+    """A loading worker's copy of `dataset` cut to its `selection` in place, as Grain cuts a worker's
+    (`prefetch._set_slice_iter_dataset`): by the first dataset on each path from it toward its sources that
+    slices itself. A mix that slices itself to name its draws hands its corpora on so (row 12843: it called
+    a `set_slice` Grain's datasets do not define)."""
+    if isinstance(dataset, _SlicedInPlace):
+        dataset.set_slice(selection, sequential_slice)
+        return
+    if not dataset.parents:
+        raise ValueError(f"a loading worker cannot cut {type(dataset).__name__}, a source that slices "
+                         "nothing")
+    for parent in dataset.parents:
+        sliced(parent, selection, sequential_slice)
+
+
 class TokenDeficit(pygrain.IterDataset[Batch]):
     """Pick the corpus furthest below its token share, with index-order ties."""
 
@@ -826,7 +849,8 @@ class TokenDeficit(pygrain.IterDataset[Batch]):
     def set_slice(self, selection: slice, sequential_slice: bool = False) -> None:
         # The worker's slice names its mix read's draws (`node_of`); its corpora take it as before.
         self._slice = selection
-        super().set_slice(selection, sequential_slice)
+        for corpus in self._corpora:
+            sliced(corpus, selection, sequential_slice)
 
     def __iter__(self) -> pygrain.DatasetIterator[Batch]:
         group = _MixReads(self._corpora)
@@ -1156,7 +1180,8 @@ class KeyedMix(pygrain.IterDataset[Batch]):
     def set_slice(self, selection: slice, sequential_slice: bool = False) -> None:
         # The worker's slice names its mix read's draws (`node_of`); its corpora take it as before.
         self._slice = selection
-        super().set_slice(selection, sequential_slice)
+        for corpus in self._corpora:
+            sliced(corpus, selection, sequential_slice)
 
     def __iter__(self) -> pygrain.DatasetIterator[Batch]:
         group = _MixReads(self._corpora)

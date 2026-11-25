@@ -96,6 +96,41 @@ def test_a_stores_digest_follows_its_code_and_an_unreviewed_import_keys_the_whol
     assert now["certification"] != kept["certification"]
 
 
+READ = """
+import json, sys
+from pathlib import Path
+from dew import _code
+source = str(_code.SOURCE)
+opened, listed = set(), set()
+
+
+def heard(event, arguments):
+    named = arguments[0] if arguments and isinstance(arguments[0], str) else None
+    if named is None or not named.startswith(source):
+        return
+    if event == "open" and named.endswith(".py"):
+        opened.add(str(Path(named).relative_to(source)))
+    elif event in ("os.scandir", "os.listdir"):
+        listed.add(named)
+
+
+sys.addaudithook(heard)
+_code.code_digest("dew.communicators")
+held = _code.closure("dew.communicators")[0]
+print(json.dumps({"opened": sorted(opened), "listed": sorted(listed),
+                  "closure": sorted(_code._snapshot()[name] for name in held)}))
+"""
+
+
+def test_a_digest_reads_its_closures_files_alone(tmp_path):
+    """A code digest reads the files of its closure alone and lists no directory of Dew's: a test of a
+    record's code then reads, and so is keyed by, the code its record keys on (2026-11-23: a snapshot reading
+    every file whole made each such test's CI key every file, and any edit ran 61% of the suite again)."""
+    found = fresh(READ, platforms="cpu", cache_dir=tmp_path / "xla")
+    assert found["opened"] and set(found["opened"]) <= set(found["closure"])
+    assert found["listed"] == []
+
+
 IMPORTED = """
 import json, sys
 import {module}
@@ -174,6 +209,36 @@ print(json.dumps({"digest": digest, "kept": sorted(os.listdir(kept)) if os.path.
 """
 
 
+KEPT_AGAIN = """
+import json, sys
+from dew._code import code_digest
+print(json.dumps(code_digest("dew.communicators")))
+"""
+
+
+def test_a_kept_closure_is_walked_again_where_a_lookup_it_made_finds_another_file(tmp_path):
+    """A kept closure is held to its walk's lookups as well as its modules' contents: a module added that a
+    guarded import of the closure would now find (an absent name the walk looked up) walks it again, its
+    module in the digest, while an edit beside the closure keeps it."""
+    tree = tmp_path / "src"
+    for name in ("dew", "_dew_torch"):
+        shutil.copytree(REPO_ROOT / "src" / name, tree / name, ignore=shutil.ignore_patterns("__pycache__"))
+    (tree / "dew" / "_guarded.py").write_text("try:\n    from dew import _maybe\nexcept ImportError:\n"
+                                              "    _maybe = None\n")
+    communicators = tree / "dew" / "communicators.py"
+    communicators.write_text(communicators.read_text() + "\nfrom dew import _guarded\n")
+
+    def digest() -> str:
+        return fresh(KEPT_AGAIN, source=tree, platforms="cpu", cache_dir=tmp_path / "xla")
+
+    first = digest()
+    (tree / "dew" / "training" / "rungs.py").write_text((tree / "dew" / "training" / "rungs.py").read_text()
+                                                        + "\n# edited\n")
+    assert digest() == first
+    (tree / "dew" / "_maybe.py").write_text("VALUE = 1\n")
+    assert digest() != first
+
+
 def test_a_closure_is_kept_beside_the_compilation_cache_and_an_unwritable_one_keeps_none(tmp_path):
     """A walked closure is kept beside the compilation cache the verdicts it keys live in (the directory
     JAX_COMPILATION_CACHE_DIR names), and a later start's digest is the same; a cache where it cannot be
@@ -189,3 +254,106 @@ def test_a_closure_is_kept_beside_the_compilation_cache_and_an_unwritable_one_ke
     assert len(first["kept"]) == 1 and first["logged"] == [] and again == first
     assert refused["digest"] == first["digest"]
     assert len(refused["logged"]) == 1 and "not kept" in refused["logged"][0], refused
+
+
+WALKED = """
+import json, sys
+from dew import _code
+walks = []
+walked = _code.closure
+_code.closure = lambda *roots: walks.append(roots) or walked(*roots)
+if len(sys.argv) > 1:
+    _code.SELECTED = {**_code.SELECTED, sys.argv[1]: "UNQUANTIZED"}
+_code.code_digest("dew.communicators")
+print(json.dumps(len(walks)))
+"""
+
+
+def test_a_kept_closure_is_walked_again_where_how_closures_are_walked_changed(tmp_path):
+    """A closure is kept under how it was walked as well as its roots: a site the walker follows by its table
+    added (`SELECTED`) walks it again, though its code imports no walker, while a start under the same
+    walker reads it walking nothing."""
+    cache = tmp_path / "xla"
+    assert fresh(WALKED, platforms="cpu", cache_dir=cache) == 1
+    assert fresh(WALKED, platforms="cpu", cache_dir=cache) == 0
+    assert fresh(WALKED, "dew.added:site:module", platforms="cpu", cache_dir=cache) == 1
+
+
+MADE_A_PACKAGE = """
+import json, sys
+import dew.communicators
+from dew import _code
+if len(sys.argv) > 1:
+    module = _code.SOURCE / "dew" / "communicators.py"
+    package = module.with_suffix("")
+    package.mkdir()
+    module.rename(package / "__init__.py")
+print(json.dumps(_code.code_digest("dew.communicators")))
+"""
+
+
+def test_a_digest_of_a_module_made_a_package_after_its_import_is_its_processs_alone(tmp_path):
+    """A module made a package after a process imported it keys that process's records by a digest no other
+    process computes: its imports were read from a file the digest no longer hashes. Unchanged, a later
+    start's digest is the same."""
+    tree = tmp_path / "src"
+    for name in ("dew", "_dew_torch"):
+        shutil.copytree(REPO_ROOT / "src" / name, tree / name, ignore=shutil.ignore_patterns("__pycache__"))
+
+    def digest(*arguments: str) -> str:
+        return fresh(MADE_A_PACKAGE, *arguments, source=tree, platforms="cpu", cache_dir=tmp_path / "xla")
+
+    kept = digest()
+    assert digest() == kept
+    assert digest("made") != kept
+
+
+WHOLE = """
+import importlib, json
+from dew._code import code_digest, whole_digest
+importlib.import_module("dew.extra-name")
+import dew.shadowed
+print(json.dumps([whole_digest(), code_digest("dew.extra-name")]))
+"""
+
+
+def test_the_whole_packages_digest_reads_a_file_whose_name_is_no_identifier(tmp_path):
+    """The whole package's digest reads every Python file of Dew's, one whose name no import statement can
+    state among them, which importlib loads by its name (`dew/extra-name.py`), whose own digest names it
+    too; and a module file a package of its name shadows, imported, keys a digest every start computes
+    alike (row 3944's review: the shadowed file read as a module imported from another file)."""
+    tree = tmp_path / "src"
+    for name in ("dew", "_dew_torch"):
+        shutil.copytree(REPO_ROOT / "src" / name, tree / name, ignore=shutil.ignore_patterns("__pycache__"))
+    (tree / "dew" / "extra-name.py").write_text("VALUE = 1\n")
+    (tree / "dew" / "shadowed").mkdir()
+    (tree / "dew" / "shadowed" / "__init__.py").write_text("VALUE = 1\n")
+    (tree / "dew" / "shadowed.py").write_text("VALUE = 2\n")
+    first = fresh(WHOLE, source=tree, platforms="cpu")
+    assert fresh(WHOLE, source=tree, platforms="cpu") == first
+    (tree / "dew" / "extra-name.py").write_text("VALUE = 2\n")
+    again = fresh(WHOLE, source=tree, platforms="cpu")
+    assert again[0] != first[0] and again[1] != first[1]
+
+
+FOOTPRINT = """
+import json, os, sys
+from pathlib import Path
+from dew import _code
+from dew._cache import read_kept
+if len(sys.argv) > 1:
+    _code.whole_digest()
+_code.code_digest("dew.communicators")
+[kept] = (Path(os.environ["JAX_COMPILATION_CACHE_DIR"]) / "dew-code").iterdir()
+print(json.dumps(sorted(read_kept(kept)["looked"])))
+"""
+
+
+def test_a_kept_closure_holds_the_lookups_of_its_own_walk_alone(tmp_path):
+    """A kept closure is held to the names its own walk looked up, whatever else the process looked up
+    before it (the whole package's digest looks up every module): a closure kept after one holds the same
+    lookups as one kept first."""
+    alone = fresh(FOOTPRINT, platforms="cpu", cache_dir=tmp_path / "alone")
+    after = fresh(FOOTPRINT, "whole", platforms="cpu", cache_dir=tmp_path / "after")
+    assert alone == after
+

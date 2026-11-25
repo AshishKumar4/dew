@@ -745,6 +745,8 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     walks_scoped = True  # `emit_pipeline` allocates each walk's slots in its own scope
 
+    stores_narrowed = True  # a narrowed output staged whole at its stored shape, at its caller's place
+
     walks_streamed = True  # consumers of one collective pipeline walk every streamed step (`walk_own`)
 
     @property
@@ -783,7 +785,6 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     copies_in_pieces = False  # its pipeline loads a step's block whole, or gathers its rows
 
-    adds_vectors = False  # its atomic adds take no layout replicating a vector's entries (a [bk] key sum's)
 
     adds_through_shared = False  # `added`'s atomic adds go from registers (`red.global`), its `smem` unread
     stages_vectors = False
@@ -908,6 +909,8 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         opened: list = []
 
         def store(output, value, ref, place):
+            # A narrowed output (`stores.Output.narrowed`) is staged whole at its stored shape, its `place`
+            # its own columns (its caller's), as a chunk-staging family's stores take it (`stores.staged`).
             # Interpreted pipelines use barrier-tracked copies, not cp.async groups.
             if not interpret:
                 plgpu.wait_gmem_to_smem(0)
