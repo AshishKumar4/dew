@@ -13,12 +13,14 @@ REFUSED = ["qwen3.5-27b-gdn bfloat16 training"]
 @pytest.mark.parametrize("group, refused, spilled, fails", [
     (PACKED, REFUSED, {"recurrence_keys_back"}, False),
     (PACKED, REFUSED, {"recurrence_keys_back", "recurrence_system_back"}, True),
+    (PACKED, REFUSED, {"recurrence_keys_back_extra"}, True),
     (PACKED, REFUSED, set(), True),
     (PACKED, ["qwen3.5-27b-gdn bfloat16 fast backward packed"], set(), True),
     (PACKED, [], set(), True),
     (ONE_ROW, REFUSED, {"recurrence_keys_back"}, True),
     (ONE_ROW, [], set(), False),
-], ids=["its declared spill", "another launch's spill beside it", "no spill", "its backward's model",
+], ids=["its declared spill", "another launch's spill beside it", "a launch its name begins", "no spill",
+        "its backward's model",
         "nothing refused", "one row's, undeclared", "one row's, holding"])
 def test_a_declared_refusal_covers_its_own_launchs_spill_alone(group, refused, spilled, fails):
     """Qwen3.5-27B's packed training on an sm120, declared refused for its keys' backward's spill (row 13064):

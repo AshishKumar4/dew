@@ -236,7 +236,9 @@ def production_refusals(target, group: tuple, refused: list[str], spilled: set[s
             return False
         if "fast backward" in case:
             return not declared.spills
-        return bool(spilled) and all(kernel.startswith(tuple(declared.spills)) for kernel in spilled)
+        # A launch's kernel its name, or its name and a variant's suffix (`name__...`).
+        return bool(spilled) and all(any(kernel == launch or kernel.startswith(launch + "__")
+                                         for launch in declared.spills) for kernel in spilled)
 
     return [f"{case}: its fast backward does not hold, no open row declaring it" if "fast backward" in case
             else f"{case}: no tiles derived (spilled: {sorted(spilled)})"
