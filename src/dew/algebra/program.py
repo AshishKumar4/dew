@@ -171,17 +171,32 @@ class _Scope(NamedTuple):
     deriving: Hashable
     kernels_key: Hashable
     fusion_base: tuple[Hashable, Hashable] | None
+    structural_safe: bool
+
+
+def _holds_device_array(value) -> bool:
+    """Whether `value` contains any concrete `jax.Array` (checked before storing a context in a cache key)."""
+    if isinstance(value, jax.Array):
+        return True
+    if isinstance(value, (tuple, list, frozenset, set)):
+        return any(_holds_device_array(part) for part in value)
+    if isinstance(value, Mapping):
+        return any(_holds_device_array(k) or _holds_device_array(v) for k, v in value.items())
+    return False
 
 
 def _scope_for(accurate: bool, saturation: Saturation, kernels: bool) -> _Scope:
     """Compute derivation and kernel-choice keys once for the current trace and mesh context."""
     deriving = _deriving(accurate, saturation)
     if not kernels:
-        return _Scope(deriving, None, None)
+        return _Scope(deriving, None, None, True)
     from dew._cache import KERNEL_CHOICES, KERNEL_PINS
+    from dew._devices import deterministic_ops_requested
 
     base = fusion.base_context()
-    return _Scope(deriving, (base[0], KERNEL_CHOICES.value, KERNEL_PINS.value), base)
+    kernels_key = (base[0], KERNEL_CHOICES.value, KERNEL_PINS.value, generation.draws(),
+                   deterministic_ops_requested())
+    return _Scope(deriving, kernels_key, base, not _holds_device_array(base))
 
 
 def _passed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels: bool) -> jcore.Jaxpr:
@@ -1214,14 +1229,17 @@ def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels
         return fresh[0]
 
     def resolve() -> _Body:
-        if closed.consts or closed.constvars:
+        if not scope.structural_safe:
             return rewrite()
-        struct_key = (terms.jaxpr_digest(closed), key, bool(_cleaned))
+        body_digest = terms.body_key(closed)
+        if body_digest is None:
+            return rewrite()
+        context_key = fusion.choice_context_of(scope.fusion_base) if kernels else None
+        struct_key = (body_digest, key, context_key, bool(_cleaned))
         hit = _cache.holding(_STRUCTURAL_CLOSED, struct_key, rewrite, STRUCTURAL_HELD)
         if hit.made is None or hit.made.debug_info == closed.debug_info:
             return hit
         return _Body(hit.made.replace(debug_info=closed.debug_info), hit.record, hit.rewrites)
-
     # Held with the facts its rewrite read while each answers alike (`_cache.holding`).
     body = _cache.holding(rewrites, key, resolve, fusion.DECISIONS_HELD)
     reused = not fresh

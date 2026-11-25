@@ -851,16 +851,15 @@ def _identities() -> tuple[RuleFamily, ...]:
 
 FACTS = _facts()
 RULES: dict[str, Rules] = {}
-_HEADS: dict[str, set[tuple[str, ...]]] = {}
-"""What each registered rule's left side reads at its head (`_head`), by the operation it heads at: the
-operations that make its operands, where the left side states them. The program pass opens a window at an
-equation one of them matches (`heads`, `program.WINDOW` deep), so a rule is reachable from the moment it is
-registered; a set that only aids the others (`Rules.aid`: commutativity leaves every price as it was) or runs
-at dev time alone (`Rules.dev`) opens none unless enabled via `enabling_dev`."""
-_DEV_HEADS: dict[str, dict[str, set[tuple[str, ...]]]] = {}
-"""Window heads for each dev-time rule set (`Rules.dev`), active only while named in `ALGEBRA.value.dev`."""
-_HEAD_PATTERNS: dict[str, list[tuple[tuple[str, int], ...]]] = {}
-_DEV_PATTERNS: dict[str, dict[str, list[tuple[tuple[str, int], ...]]]] = {}
+_HEAD_PATTERNS: dict[str, set[tuple[tuple[str, int], ...]]] = {}
+"""What each registered rule's left side reads at its head (`_head`), indexed by root operation to required
+operand-producer multisets (as sorted `(symbol, count)` tuples). The program pass opens a window at an
+equation one of them matches (`heads`, `program.WINDOW` deep), and derives active root primitives directly
+from its keys (`head_primitives`); a set that only aids the others (`Rules.aid`) or runs at dev time alone
+(`Rules.dev`) opens none unless enabled via `enabling_dev`."""
+_DEV_PATTERNS: dict[str, dict[str, set[tuple[tuple[str, int], ...]]]] = {}
+"""Window head patterns for each dev-time rule set (`Rules.dev`), active only while named in
+`ALGEBRA.value.dev`."""
 
 
 def _operation(pattern) -> declarations.CallDecl | None:
@@ -928,24 +927,17 @@ def register(rules: Rules) -> None:
                          f"of the language, so no window of a program opens for it")
     RULES[rules.name] = rules
     for root, made in (head for _, head in found if head is not None):
-        bucket = _HEADS.setdefault(root, set())
-        if made not in bucket:
-            bucket.add(made)
-            _HEAD_PATTERNS.setdefault(root, []).append(tuple(collections.Counter(made).items()))
+        _HEAD_PATTERNS.setdefault(root, set()).add(tuple(sorted(collections.Counter(made).items())))
     if rules.dev:
-        dev_heads: dict[str, set[tuple[str, ...]]] = {}
-        dev_patterns: dict[str, list[tuple[tuple[str, int], ...]]] = {}
+        dev_patterns: dict[str, set[tuple[tuple[str, int], ...]]] = {}
         for family in rules.families:
             for written in family.rules:
                 head = _head(written)
                 if head is not None:
-                    bucket = dev_heads.setdefault(head[0], set())
-                    if head[1] not in bucket:
-                        bucket.add(head[1])
-                        dev_patterns.setdefault(head[0], []).append(
-                            tuple(collections.Counter(head[1]).items()))
-        _DEV_HEADS[rules.name] = dev_heads
+                    dev_patterns.setdefault(head[0], set()).add(
+                        tuple(sorted(collections.Counter(head[1]).items())))
         _DEV_PATTERNS[rules.name] = dev_patterns
+
 
 _MEASURED = ("measured M-DC-1 (four diffusion training steps, GH200) and M-DC-3 (six GPU flows' training and "
              "decode programs, a DPO step, GH200 and A100): within each cell's A/A")
@@ -979,14 +971,15 @@ register(Rules.declared("joined", "reorders", _joined(),
 
 
 def head_primitives() -> frozenset[str]:
-    """Operation symbols where any active registered rule's left side heads (`_HEADS`, enabled dev sets)."""
+    """Operation symbols where any active registered rule's left side heads (`_HEAD_PATTERNS`, enabled dev
+    sets)."""
     enabled = ALGEBRA.value.dev
     if not enabled:
-        return frozenset(_HEADS)
-    return frozenset(_HEADS).union(*(_DEV_HEADS.get(name, ()) for name in enabled))
+        return frozenset(_HEAD_PATTERNS)
+    return frozenset(_HEAD_PATTERNS).union(*(_DEV_PATTERNS.get(name, ()) for name in enabled))
 
 
-def _matches_head(patterns: Sequence[tuple[tuple[str, int], ...]],
+def _matches_head(patterns: set[tuple[tuple[str, int], ...]],
                   operands: Sequence[str | None]) -> bool:
     """Whether `operands` satisfies any pre-counted required producer multiset in `patterns`."""
     for needed in patterns:

@@ -221,12 +221,15 @@ def _folded(equation: jcore.JaxprEqn, operands: list) -> list | None:
         # In the result's dtype, which a weak operand (a Python number) takes where it is broadcast.
         operand = np.asarray(operands[0], out.dtype)
         dimensions = equation.params["broadcast_dimensions"]
+        if len(dimensions) > 1:
+            order = tuple(sorted(range(len(dimensions)), key=dimensions.__getitem__))
+            if order != tuple(range(len(dimensions))):
+                operand = np.transpose(operand, order)
         placed = operand[tuple(slice(None) if axis in dimensions else np.newaxis
                                for axis in range(len(shape)))]
         return [np.broadcast_to(placed, shape)]
     if not entrywise(primitive):
         return host_evaluated(primitive, operands, equation.params)
-    # A scalar operand as it is (a weak one keeps its weak type, which the bind reads).
     compacts = [terms.compact(np.asarray(value)) if np.ndim(value) else value for value in operands]
     # Broadcast as the operands broadcast, an axis of none beside one of one element keeping none.
     common = np.broadcast_shapes(*(np.shape(value) for value in compacts if np.ndim(value)))
@@ -555,43 +558,57 @@ def _inv_perm(perm: tuple[int, ...]) -> tuple[int, ...]:
     return tuple(inv)
 
 
-def _can_push_transpose(value, inv: tuple[int, ...], laid: _Made, entrywise_of: _Made) -> bool:
+def _can_push_transpose(value, inv: tuple[int, ...], laid: _Made, entrywise_of: _Made,
+                        memo: dict[int, bool]) -> bool:
     """Whether `transpose(..., perm)` can push bit-exactly through `value` into broadcasts without creating
-    any new transpose."""
+    any new transpose, memoized per tracer identity so shared DAG operands are visited once."""
     if jnp.ndim(value) == 0:
         return True
+    key = id(value)
+    if key in memo:
+        return memo[key]
     if value in laid:
         _, (_, dimensions) = laid[value]
         moved = tuple(inv[axis] for axis in dimensions)
-        return all(a < b for a, b in itertools.pairwise(moved))
-    if value in entrywise_of:
+        ok = all(a < b for a, b in itertools.pairwise(moved))
+    elif value in entrywise_of:
         _, operands = entrywise_of[value]
-        return all(_can_push_transpose(op, inv, laid, entrywise_of) for op in operands)
-    return False
+        ok = all(_can_push_transpose(op, inv, laid, entrywise_of, memo) for op in operands)
+    else:
+        ok = False
+    memo[key] = ok
+    return ok
 
 
 def _push_transpose(value, perm: tuple[int, ...], inv: tuple[int, ...],
-                    widened: _Made, laid: _Made, entrywise_of: _Made):
+                    widened: _Made, laid: _Made, entrywise_of: _Made, memo: dict[int, object]):
     """Push `transpose(..., perm)` through `value` (`_can_push_transpose` holds), rebuilding broadcasts and
-    entrywise equations in transposed shape."""
+    entrywise equations in transposed shape once per shared tracer."""
     if jnp.ndim(value) == 0:
         return value
+    key = id(value)
+    if key in memo:
+        return memo[key]
     if value in laid:
         source, (bcast_shape, dimensions) = laid[value]
         new_shape = tuple(bcast_shape[axis] for axis in perm)
         moved = tuple(inv[axis] for axis in dimensions)
         if jnp.shape(source) == new_shape and moved == tuple(range(len(new_shape))):
-            return source
-        made = jax.lax.broadcast_in_dim(source, new_shape, moved)
-        if made is not source and isinstance(made, jax_core.Tracer):
-            laid[made] = (source, (new_shape, moved))
+            made = source
+        else:
+            made = jax.lax.broadcast_in_dim(source, new_shape, moved)
+            if made is not source and isinstance(made, jax_core.Tracer):
+                laid[made] = (source, (new_shape, moved))
+        memo[key] = made
         return made
     inner_eqn, inner_ops = entrywise_of[value]
-    pushed = [_push_transpose(op, perm, inv, widened, laid, entrywise_of) for op in inner_ops]
+    pushed = [_push_transpose(op, perm, inv, widened, laid, entrywise_of, memo) for op in inner_ops]
     core = jax.eval_shape(lambda *vs: inner_eqn.primitive.bind(*vs, **inner_eqn.params), *pushed)
     rebuilt = inner_eqn.replace(outvars=[jcore.Var(aval(inner_eqn.outvars[0]).update(
         shape=core.shape, sharding=core.sharding))])
-    return _normal(rebuilt, pushed, widened, laid, entrywise_of)[0]
+    made = _normal(rebuilt, pushed, widened, laid, entrywise_of)[0]
+    memo[key] = made
+    return made
 
 
 def _pushed_transpose(equation: jcore.JaxprEqn, operand, widened: _Made, laid: _Made,
@@ -605,9 +622,9 @@ def _pushed_transpose(equation: jcore.JaxprEqn, operand, widened: _Made, laid: _
             and jax.typeof(operand).sharding == out.sharding):
         return operand
     inv = _inv_perm(perm)
-    if not _can_push_transpose(operand, inv, laid, entrywise_of):
+    if not _can_push_transpose(operand, inv, laid, entrywise_of, {}):
         return None
-    made = _push_transpose(operand, perm, inv, widened, laid, entrywise_of)
+    made = _push_transpose(operand, perm, inv, widened, laid, entrywise_of, {})
     return made if jax.typeof(made).sharding == out.sharding else None
 
 
