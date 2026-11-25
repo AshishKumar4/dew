@@ -22,6 +22,8 @@ from dew.nn.dense import Dense
 from dew.nn.joined import joined_dense
 from dew.nn.kernels import generation
 from dew.nn.sharding import boxed, placing
+from dew.telemetry.instrumentation import hlo_instructions
+from dew.telemetry.trace import collective
 
 LAYOUT = Layout(min_shard=1)
 """The layout the cases' programs trace under: Dew's own, every leaf split however small (its least share
@@ -350,8 +352,9 @@ def test_a_mapped_stacks_weight_reductions_complete_per_layer(axis):
     under the trainer's collective combiner (`dew.training.memory.COLLECTIVES`) on two compile-only H100s:
     each layer's weight-gradient collective (`all-reduce` on `data`, `reduce-scatter` on `fsdp`) completes
     before its input cotangent enters the layer below (`sharding.on_shards` tying them with
-    `formed_together`, row 12898), so XLA's combiner cannot merge all four layers' unreduced weight
-    gradients into one collective at the step's end."""
+    `formed_together`, row 12898): every layer above the first has a collective of its own whose result the
+    layers below's products read, where XLA's combiner had merged all four layers' unreduced weight
+    gradients into one collective at the step's end, which no product waits on."""
     from kernel_compile import _device
 
     from dew.training.memory import COLLECTIVES
@@ -384,6 +387,24 @@ def test_a_mapped_stacks_weight_reductions_complete_per_layer(axis):
             compiler_options=COLLECTIVES)
     expected = "reduce-scatter" if any(weight) else "all-reduce"
     w_elems = math.prod(w_shape) // (2 if any(weight) else 1)
-    reduces = [shapes for op, shapes in collectives(step)
-               if op == expected and sum(math.prod(shape) for shape in shapes) >= w_elems]
-    assert len(reduces) == layers, (expected, reduces)
+    instructions = hlo_instructions(step)
+    users: dict[str, list[str]] = {}
+    for name, instruction in instructions.items():
+        for operand in instruction.operands:
+            users.setdefault(operand, []).append(name)
+
+    def read_by_a_product(name: str) -> bool:
+        seen, frontier = set(), list(users.get(name, ()))
+        while frontier:
+            if (each := frontier.pop()) not in seen:
+                seen.add(each)
+                if instructions[each].flops:
+                    return True
+                frontier.extend(users.get(each, ()))
+        return False
+
+    reduces = [name for name, instruction in instructions.items()
+               if collective(instruction.op) == expected and not instruction.op.endswith("-start")
+               and sum(math.prod(shape) for shape in instruction.shapes) >= w_elems]
+    awaited = [name for name in reduces if read_by_a_product(name)]
+    assert len(awaited) == layers - 1, (expected, reduces, awaited)
