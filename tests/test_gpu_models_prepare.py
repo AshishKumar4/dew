@@ -27,7 +27,6 @@ from arm_store import _Ahead, _compile_arms, _stored_arm, armed
 from generation_support import node_target, node_topology
 from gpu_flow import Cell, run_cells
 from truths_ahead import (
-    DEFERRED,
     PROGRAMS,
     UNPREPARED,
     CompiledTruths,
@@ -110,7 +109,7 @@ assert m_dew_prep == m_dew_run, f"ModernBERT dew arm_role drifted across devices
 # lowering on no deviceless prepare), its arms' site never reached, each arm compiled on the GPU.
 c_sample = drawn_on_the_host(run_causal[2], 0)
 if not ro.holds(armed(c_label)):
-    deferred = json.loads((sm90_store / DEFERRED).read_text())
+    deferred = json.loads((sm90_store / tier_wire.DEFERRED).read_text())
     assert any(reason["error"].startswith(CAUSAL_CELL) for reason in deferred["reasons"]), deferred
 elif ro.at_run(armed(c_label)) is None:
     c_programs = AheadPrograms.load(ro.path(armed(c_label)) / PROGRAMS).programs
