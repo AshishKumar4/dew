@@ -67,8 +67,10 @@ def _sizes(specs: list[jax.ShapeDtypeStruct], seed: int, rows: int) -> jax.Array
     return jnp.asarray(sizes)
 
 
-TRACED_TILE = 16
-"""The square tile a launch's hooks are traced at to key its picks (`_GroupedLaunch.traced`)."""
+TRACED_TILE = 64
+"""The square tile a launch's hooks are traced at to key its picks (`_GroupedLaunch.traced`): one a hook
+traces whole, the least a wide product's epilogue splits (`templates.gemm.wide.UNIT`: a pair of 32-column
+runs; at 16 its split had no whole run to read)."""
 
 
 class _GroupedLaunch[Config: Hashable](base.Template[Config]):

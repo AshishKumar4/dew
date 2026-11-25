@@ -122,12 +122,12 @@ TEMPLATE, REFERENCE = 'mosaic', 'xla'
 class Scoreboard(NamedTuple):
     """One receipt's dense products on one GPU `generation` at `rows` tokens, the template against XLA's dot
     (cuBLAS/cuBLASLt, compiled and autotuned on the GPU), each product's routes' rounds (`times`: by what it
-    made, each projection's template's then XLA's `Ranged`), and the receipt (`evidence`). A kind takes the
-    template where the geomean of its timed products is at or under XLA's (`winner`), whole: the template
-    replaces the reference route on parity and the products it lags at are its derivation's to climb (bible
-    §6, 2026-11-24: "templates should replace ref routes on parity"; kernel-templates.md §7). A kind still
-    XLA's keeps each product the template ran clearly faster, its rounds' range under XLA's (`ahead`), a
-    cell of its own over the receipt's rows (`Kind.span`)."""
+    made, each projection's template's then XLA's `Ranged`), and the receipt (`evidence`). A product holds the
+    template where its rounds lie at or under XLA's, overlapping them or wholly under (`at_parity`), a cell of
+    its own over the receipt's rows (`Kind.span`); a kind takes the template whole only once every product
+    it timed does, the template matching or beating the best kernel at every shape it serves
+    (kernel-templates.md §1; bible §6, 2026-11-24: "templates should replace ref routes on parity"), and keeps
+    XLA's dot otherwise, its lagging products its derivation's to climb (`winner`)."""
 
     generation: str
     rows: int
@@ -139,25 +139,27 @@ class Scoreboard(NamedTuple):
         ratios = [template[1] / reference[1] for template, reference in self.times[made].values()]
         return math.exp(sum(map(math.log, ratios)) / len(ratios))
 
-    def winner(self, made: Made) -> str:
-        """The route a kind making `made` takes: `TEMPLATE` where its `geomean` is at most 1, else
-        `REFERENCE`."""
-        return TEMPLATE if self.geomean(made) <= 1 else REFERENCE
-
-    def ahead(self, made: Made, projection: str) -> bool:
-        """Whether every round of the template's at `projection` making `made` ran faster than every one of
-        XLA's."""
+    def at_parity(self, made: Made, projection: str) -> bool:
+        """Whether the template's rounds at `projection` making `made` lie at or under XLA's: none of them
+        past every one of XLA's."""
         template, reference = self.times[made][projection]
-        return template[2] < reference[0]
+        return template[0] <= reference[2]
+
+    def winner(self, made: Made) -> str:
+        """The route a kind making `made` takes: `TEMPLATE` where every product it timed is at parity
+        (`at_parity`), else `REFERENCE`."""
+        return TEMPLATE if all(self.at_parity(made, name) for name in self.times[made]) else REFERENCE
 
     def why(self, made: Made, projection: str | None = None) -> str:
         """The receipt's reading for `projection`'s cell, or for its kind's where None."""
         if projection is None:
-            return (f"{self.evidence}: the template {self.geomean(made):.3f}x XLA's dot, geomean of "
-                    f"{len(self.times[made])} projections at {self.rows} tokens")
+            behind = sum(not self.at_parity(made, name) for name in self.times[made])
+            return (f"{self.evidence}: the template behind XLA's dot at {behind} of {len(self.times[made])} "
+                    f"projections at {self.rows} tokens (geomean {self.geomean(made):.3f}x)")
         template, reference = self.times[made][projection]
+        apart = 'every round faster' if template[2] < reference[0] else 'rounds overlapping'
         return (f"{self.evidence}: {projection} the template {template[1] / reference[1]:.3f}x XLA's dot "
-                f"({template[1]:.4f} against {reference[1]:.4f} ms, every round faster)")
+                f"({template[1]:.4f} against {reference[1]:.4f} ms, {apart})")
 
     def timed(self, made: Made) -> Timed:
         """The products it timed making `made`, as a cell reads them (`MEASURED`)."""
@@ -316,9 +318,9 @@ M_NG_1_G4 = Scoreboard('sm120', 8192, (
     },
 })
 SCOREBOARDS = (M_NG_45_A100, M_NG_45B_GH200, M_FS_51_G4, M_NG_1_G4)
-"""The receipts timing a generation's dense projections against XLA's dot, each kind's route by its geomean
-and a kind XLA keeps the products the template clearly won (`Scoreboard`): an A100's, a GH200's and an RTX
-PRO 6000's at 8,192 tokens (records/scoreboard.md's GEMM rows)."""
+"""The receipts timing a generation's dense projections against XLA's dot, each kind XLA's until every
+product it timed is at parity, its products at parity the template's (`Scoreboard`): an A100's, a GH200's
+and an RTX PRO 6000's at 8,192 tokens (records/scoreboard.md's GEMM rows)."""
 
 M_FS_34 = {
     'sm86': ("M-FS-34 / LF-P0-sm86-a10 (an A10, main 45131ca01, XLA tuned on the GPU): the template "

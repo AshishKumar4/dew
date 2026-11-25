@@ -79,11 +79,17 @@ def _stored_dtypes(ba) -> tuple:
 
 def _stored_bytes(ba, rows: int, width: int) -> float:
     """The bytes a product's epilogue moves an element of its `rows` x `width` output
-    (`pricing.split_walk`'s `stored`): each output's dtype's, and its epilogue operands' bytes over the
-    output's elements (an [rows, columns] operand's an element, a column vector's a row's share)."""
+    (`pricing.split_walk`'s `stored`): each output's dtype's over the tile columns a stored value holds (its
+    form's divisor, `Hooks.out_forms`: a packed output's two codes a byte, a reduced one's a value a block, a
+    narrowed one's half the tile), and its epilogue operands' bytes over the output's elements (an [rows,
+    columns] operand's an element, a column vector's a row's share)."""
     from .templates import cost
+    from .templates.gemm import quantized
 
-    written = sum(jnp.dtype(dtype).itemsize for dtype in _stored_dtypes(ba))
+    dtypes = _stored_dtypes(ba)
+    forms = quantized.forms_of(ba.arguments['hooks'].out_forms, dtypes) or (None,) * len(dtypes)
+    written = sum(jnp.dtype(dtype).itemsize / (1 if form is None else form.divisor)
+                  for dtype, form in zip(dtypes, forms, strict=True))
     return written + cost.stored(*ba.arguments.get('epilogue_operands', ())) / max(rows * width, 1)
 
 def _matrix_extents(ba) -> tuple[int, int]:
@@ -2066,8 +2072,8 @@ each its own."""
 
 
 def _declared() -> dict[tuple[str | None, Kind], tuple[selection.Kernel[GroupedCase], str]]:
-    """`DECLARED`, from the receipts that hold its cells (`grouped_cells`): each scoreboard's kinds and the
-    products the template clearly won on a kind XLA keeps (`SCOREBOARDS`), the A10's and L4's kinds
+    """`DECLARED`, from the receipts that hold its cells (`grouped_cells`): each scoreboard's kinds and, on a
+    kind XLA keeps, the products the template timed at parity (`SCOREBOARDS`), the A10's and L4's kinds
     (`M_FS_34`), the A100's grouped forward (`M_EM_2`), products in one launch timed apart (`TOGETHER`), and
     the products other receipts timed (normed projections formed, M-EM-65 and M-EM-67; the 4B's,
     `FOUR_B_CELLS`) where their winner is not their kind's route, none returning to XLA on a kind a
@@ -2081,7 +2087,7 @@ def _declared() -> dict[tuple[str | None, Kind], tuple[selection.Kernel[GroupedC
                 continue
             cells[board.generation, Kind(dense=True, made=made)] = (XLA, board.why(made))
             for projection in projections:
-                if board.ahead(made, projection):
+                if board.at_parity(made, projection):
                     cells[board.generation, Kind(dense=True, made=made,
                                                  matrix=grouped_cells.PROJECTIONS[projection],
                                                  span=(board.rows, board.rows))] = (
@@ -2116,11 +2122,12 @@ DECLARED = _declared()
 template's default on a generation, each with its receipt (owner, bible da64ae5; "whatever is the
 best/fastest remains the route until our templates catch up", ops 361caffc; bible §6 2026-11-24: "templates
 should replace ref routes on parity"): (device generation, kind of call) to (that route's kernel, the
-receipt). A kind takes the template once its receipt's geomean is at or under XLA's, whole
-(`grouped_cells.Scoreboard`), and a generation no receipt timed takes the template; a product of a matrix a
-receipt timed (`MEASURED`) over its rows is a cell of its own where its winner is not its kind's route, its
-kind's otherwise (`GroupedCase.cell`). The list shrinks as the template climbs: no product returns to XLA on
-a kind the template took.
+receipt). A kind takes the template once every product its receipt timed is at parity, whole
+(`grouped_cells.Scoreboard`: the template matching or beating the best kernel at every shape it serves,
+kernel-templates.md §1), and a generation no receipt timed takes the template; on a kind XLA keeps, a product
+of a matrix a receipt timed (`MEASURED`) at parity over its rows is the template's, a cell of its own, and
+any other its kind's (`GroupedCase.cell`). The list shrinks as the template climbs: no product returns to
+XLA on a kind the template took.
 A cell's route holds no more of a step's memory than the template's: each product's reverse mode returns
 its rows' cotangent only with its kernel gradient formed (`derivatives.with_gradients_formed`, row 6027),
 whichever route forms it (tests/test_declared_cells_memory.py). Nothing is ranked at runtime. A

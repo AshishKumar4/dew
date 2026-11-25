@@ -1286,32 +1286,33 @@ def _route(generation_name: str, made: str, matrix: tuple[int, int], rows: int) 
 
 
 @pytest.mark.parametrize(("generation_name", "made", "matrix", "rows", "kernel"), [
-    # The A100's forward is at parity (geomean 0.9999): the template's whole, the 4B down it timed 1.05x
-    # XLA's too (its derivation's to climb).
-    ("sm80", "forward", (3072, 8192), 8192, "mosaic"),
-    ("sm80", "forward", (9216, 2560), 8192, "mosaic"),
-    # Its input gradient is behind (1.074): XLA's, but where every round of the template's ran faster.
-    ("sm80", "input_gradient", (3072, 8192), 8192, "xla"),
+    # The A100's forward: 8 of 13 projections behind (geomean 0.9999), so XLA's kind; the products at parity
+    # the template's (gate_up's every round faster, the 4B up's overlapping), over their timed rows alone.
+    ("sm80", "forward", (3072, 8192), 8192, "xla"),
+    ("sm80", "forward", (9216, 2560), 8192, "xla"),
+    ("sm80", "forward", (4096, 28672), 8192, "mosaic"),
+    ("sm80", "forward", (2560, 9216), 8192, "mosaic"),
+    ("sm80", "forward", (4096, 28672), 4096, "xla"),
     ("sm80", "input_gradient", (25600, 5120), 8192, "mosaic"),
-    ("sm80", "input_gradient", (25600, 5120), 4096, "xla"),
-    # The GH200's kernel gradient is at parity (0.997): the template's whole, the 4B up's 24,576-token cell
-    # (M-EM-52, 1.042x) with it; its forward behind (1.006), XLA's but where the template clearly won.
-    ("sm90", "kernel_gradient", (3072, 8192), 8192, "mosaic"),
-    ("sm90", "kernel_gradient", (4096, 28672), 8192, "mosaic"),
-    ("sm90", "kernel_gradient", (2560, 9216), 24576, "mosaic"),
-    ("sm90", "forward", (3072, 8192), 8192, "xla"),
+    # The GH200's kernel gradient: 7 of 13 behind (geomean 0.997), XLA's kind, the 4B down's the template's;
+    # the 4B up's 24,576-token cell (M-EM-52, 1.042x) its kind's.
+    ("sm90", "kernel_gradient", (3072, 8192), 8192, "xla"),
+    ("sm90", "kernel_gradient", (4096, 28672), 8192, "xla"),
+    ("sm90", "kernel_gradient", (9216, 2560), 8192, "mosaic"),
+    ("sm90", "kernel_gradient", (2560, 9216), 24576, "xla"),
     ("sm90", "forward", (4096, 24576), 8192, "mosaic"),
-    ("sm90", "forward", (4096, 4096), 8192, "xla"),
-    # The 4B's up input gradient: the template's at 24,576 tokens (M-EM-36), its kind's XLA at 8,192 where
-    # M-NG-45b timed it behind.
+    # The 4B's up input gradient: the template's at 24,576 tokens (M-EM-36), XLA's at 8,192 where M-NG-45b
+    # timed it behind.
     ("sm90", "input_gradient", (2560, 9216), 24576, "mosaic"),
     ("sm90", "input_gradient", (2560, 9216), 8192, "xla"),
+    # The RTX PRO 6000's forward: the 4B key's 1.27x and the downs behind, XLA's kind; qkv's the template's.
+    ("sm120", "forward", (3072, 8192), 8192, "xla"),
+    ("sm120", "forward", (2560, 1024), 8192, "xla"),
+    ("sm120", "forward", (4096, 6144), 8192, "mosaic"),
+    ("sm120", "input_gradient", (3072, 8192), 8192, "xla"),
     # A B200's cells its receipts timed losing hold XLA on a generation whose kinds are the template's.
     ("sm100", "kernel_gradient", (2560, 9216), 24576, "xla"),
     ("sm100", "kernel_gradient", (9216, 2560), 24576, "mosaic"),
-    # The RTX PRO 6000's forward at parity (0.978), its input gradient behind (1.091).
-    ("sm120", "forward", (3072, 8192), 8192, "mosaic"),
-    ("sm120", "input_gradient", (3072, 8192), 8192, "xla"),
     # An A10 and an L4 behind at every kind; a B300 no receipt timed, the template's.
     ("sm86", "forward", (3072, 8192), 8192, "xla"),
     ("sm89", "kernel_gradient", (3072, 8192), 8192, "xla"),
@@ -1319,10 +1320,10 @@ def _route(generation_name: str, made: str, matrix: tuple[int, int], rows: int) 
 ])
 def test_a_generations_receipts_hold_its_dense_cells(generation_name, made, matrix, rows, kernel):
     """A dense product's route is its generation's receipts' (`grouped_cells.SCOREBOARDS`): a kind the
-    template's, whole, where its receipt's geomean is at or under XLA's dot (bible §6, 2026-11-24: templates
-    replace reference routes on parity), a kind XLA keeps the products the template clearly won over the
-    rows they were timed at, and a generation no receipt timed the template's, whatever its instruction
-    family's other generations measured."""
+    template's whole only where every product its receipt timed is at parity (kernel-templates.md §1; bible
+    §6, 2026-11-24: templates replace reference routes on parity), a kind XLA keeps the products the template
+    timed at parity over the rows they were timed at, and a generation no receipt timed the template's,
+    whatever its instruction family's other generations measured."""
     assert _route(generation_name, made, matrix, rows) == kernel
 
 
