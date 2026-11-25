@@ -286,6 +286,7 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
         (row 11982)."""
         from .templates.axes import held as held_axes
         from .templates.gemm import pricing, quantized
+        from .templates.gemm.hooks import column_local
 
         hooks = ba.arguments['hooks']
         family = pricing.family_of(config, ba.arguments['tokens'].dtype, target)
@@ -305,7 +306,11 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
                                           hooked=pricing.hook_chunk(
                                               family, config.share, columns, out_dtypes,
                                               quantized.forms_of(hooks.out_forms, out_dtypes),
-                                              config.staging))
+                                              config.staging, local=column_local(
+                                                  hooks.after(), hooks.accumulators,
+                                                  tuple((held_axes(axes), side.dtype) for side, axes in zip(
+                                                      ba.arguments.get('epilogue_operands', ()),
+                                                      hooks.epilogue_axes, strict=True)))))
 
     def _step_sizes(self, ba) -> tuple[int, ...] | None:
         del ba

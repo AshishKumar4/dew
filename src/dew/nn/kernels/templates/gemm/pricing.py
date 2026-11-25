@@ -222,29 +222,31 @@ def best_splits(walk: "SplitWalk | None", stages: int) -> int:
 
 
 def hook_chunk(family: mosaic.Family, share: int, columns: int, dtypes: tuple = (), forms: tuple = (),
-               staging: tuple[int, int] | None = None) -> int:
-    """The columns an epilogue's hook takes at a time on `family` (`Issuer.hook_columns`), the kernel's
-    (`mosaic_gpu._finished`) and its register model's (`epilogue_registers`): whole stores' chunks of its
-    outputs (`stores.output_staging` of `dtypes` stored as `forms` state, `share` rows a consumer's), so each
-    chunk's values fill whole staged buffers; the whole tile where its stores take no chunk
-    (`mosaic.Transport.stores_chunks`: sm80's whole-tile staging), an output a form narrows or transposes
-    stores its tile whole, or no such chunk divides it."""
+               staging: tuple[int, int] | None = None, *, local: bool = False) -> int:
+    """The columns an epilogue's hook takes at a time on `family`, the kernel's (`mosaic_gpu._finished`) and
+    its register model's (`epilogue_registers`): where the hook is column-local (`local`,
+    `hooks.column_local`) and its family's stores take chunks (`mosaic.Transport.stores_chunks`), a hook's
+    chunk (`Issuer.hook_columns`) widened to whole staged chunks of each of its outputs (each output's own
+    `stores.output_staging` of its dtype and form, `share` rows a consumer's), so a chunk's values fill
+    whole buffers; elsewhere, an output a form narrows or transposes among them, or no such chunk dividing
+    the tile, the issuer's own read-out (`chunk_columns`: a register accumulator's whole, tcgen05's 64)."""
     from dew.nn.kernels.templates import stores
 
+    native = family.chunk_columns(columns)
     chunk = family.hook_columns(columns)
-    if (not family.stores_chunks or chunk >= columns or not dtypes
+    forms = forms or (None,) * len(dtypes)
+    if (not local or not family.stores_chunks or chunk >= native or not dtypes
             or any(form is not None and (form.narrowed or form.transposed) for form in forms)):
-        return columns
-    dtypes = tuple(jnp.dtype(dtype) for dtype in dtypes)
-    packed = tuple(stores.Output((share, columns), dtype, divisor=form.divisor, transposed=form.transposed,
-                                 narrowed=bool(form.narrowed))
-                   for dtype, form in zip(dtypes, forms or (None,) * len(dtypes), strict=True)
-                   if form is not None)
-    piece = family.chunk_columns(columns)
-    if stores.staging_refusal(columns, dtypes, staging, piece=piece, packed=packed) is not None:
-        return columns
-    chunk = math.lcm(chunk, stores.output_staging(columns, dtypes, staging, piece=piece, packed=packed)[0])
-    return chunk if chunk < columns and columns % chunk == 0 else columns
+        return native
+    piece = native
+    for dtype, form in zip(dtypes, forms, strict=True):
+        dtype = jnp.dtype(dtype)
+        packed = () if form is None else (stores.Output((share, columns), dtype, divisor=form.divisor),)
+        if stores.staging_refusal(columns, (dtype,), staging, piece=piece, packed=packed) is not None:
+            return native
+        chunk = math.lcm(chunk, stores.output_staging(columns, (dtype,), staging, piece=piece,
+                                                      packed=packed)[0])
+    return chunk if chunk < native and native % chunk == 0 else native
 
 
 def epilogue_registers(family: mosaic.Family, share: int, columns: int, stored: tuple, *,

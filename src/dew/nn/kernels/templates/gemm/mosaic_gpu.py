@@ -80,6 +80,7 @@ from dew.nn.kernels.templates.gemm import (
     sides_padded,
 )
 from dew.nn.kernels.templates.gemm.chained import Chained, Partition, flag_row, flags_declared, guarded_walk
+from dew.nn.kernels.templates.gemm.hooks import column_local
 from dew.nn.kernels.templates.gemm.pricing import (
     dense_tail,
     family_of,
@@ -531,6 +532,11 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                                 packed_format=packed_format, forms=forms)
     bounded = None if when is None else chained  # each product its own accumulator (`guarded_walk`)
     matrices, streamed, accumulators = _gmm_streamed(paired, scales, joined, bounded)
+    # The columns its epilogue's hook takes at a time, as its register model counts them.
+    hooked = None if epilogue is None else hook_chunk(
+        family, part[0], part[1], dtypes, forms, tiles.staging, local=column_local(
+            epilogue, accumulators, tuple((axes.held(side_axes), side.dtype) for side_axes, side
+                                          in zip(epilogue_axes, epilogue_operands, strict=True))))
     # A pair's tiles: g groups' boundaries, and the unrouted rows.
     grid = (pl.cdiv(m, block_m * pair) + (0 if dense else g), pl.cdiv(n, block_n))
     def body(*gmems):
@@ -579,8 +585,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                     whole=any(form is not None and form.transposed for form in forms),
                     narrowed=tuple(form.divisor if form is not None and form.narrowed else 1
                                    for form in forms),
-                    hook_columns=None if epilogue is None else hook_chunk(
-                        family, part[0], part[1], dtypes, forms, tiles.staging),
+                    hook_columns=hooked,
                     epilogue=epilogue, flags=(flags_gmem, pair, tiles.sharing),
                     sides=tuple(zip(side_gmems, epilogue_axes, side_smems, side_barriers, strict=True)),
                     partials=None if tail is None else (workspace, ready))

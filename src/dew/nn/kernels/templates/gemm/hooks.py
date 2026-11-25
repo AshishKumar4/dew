@@ -6,6 +6,7 @@ import functools
 from typing import Protocol, runtime_checkable
 
 import jax
+import jax.extend.core as jax_core
 import jax.numpy as jnp
 from jax._src.pallas.mosaic import core as tpu_core, lowering as mosaic_tpu_lowering
 from jax._src.pallas.mosaic_gpu import (
@@ -13,6 +14,7 @@ from jax._src.pallas.mosaic_gpu import (
     lowering as mosaic_gpu_lowering,
 )
 
+from dew.nn import programs
 from dew.nn.derivatives import marked_call_p
 from dew.nn.kernels import generation, launches
 from dew.nn.programs import equations
@@ -138,6 +140,51 @@ def _lowers(hook, tiles: tuple, sides, rules, *, layout=None) -> bool:
         traced = jax.make_jaxpr(hook)(*tiles, *sides)
     return all(equation.primitive in rules or equation.primitive is marked_call_p
                for equation in equations(traced.jaxpr))
+
+
+COLUMN_LOCAL_ROWS, COLUMN_LOCAL_COLUMNS = 8, 24
+"""The extents a hook is traced at to read whether it is column-local (`column_local`), apart so a vector's
+axis reads off its length."""
+
+
+def column_local(hook, accumulators: int, sides: tuple) -> bool:
+    """Whether an epilogue `hook` computes each output column from that column of its `accumulators` and its
+    side tiles alone (`sides`, each its held axes and dtype), so its tile may be read out a chunk of columns
+    at a time (`pricing.hook_chunk`): traced on `[rows, columns]` tiles, every equation, nested ones too,
+    entrywise on tiles, row vectors, column vectors or scalars (`programs.entrywise`), or a broadcast of a
+    scalar, a row vector along the columns or a column vector along the rows; none reduces, gathers,
+    reverses or numbers the columns. A hook subtracting its rows' maxima reads every column and is not."""
+    rows, columns = COLUMN_LOCAL_ROWS, COLUMN_LOCAL_COLUMNS
+    shapes = {('rows', 'columns'): (rows, columns), ('rows',): (rows,), ('columns',): (columns,), (): ()}
+    try:
+        traced = jax.make_jaxpr(hook)(
+            *(jax.ShapeDtypeStruct((rows, columns), jnp.float32),) * accumulators,
+            *(jax.ShapeDtypeStruct(shapes[tuple(held_axes)], dtype) for held_axes, dtype in sides))
+    except (KeyError, TypeError, ValueError):
+        return False
+    allowed = set(shapes.values())
+
+    def local(jaxpr) -> bool:
+        for equation in jaxpr.eqns:
+            avals = [variable.aval for variable in (*equation.invars, *equation.outvars)]
+            if any(getattr(aval, 'shape', None) not in allowed for aval in avals):
+                return False
+            nested = list(jax_core.jaxprs_in_params(equation.params))
+            if nested:
+                if programs.control_flow(equation.primitive) or not all(map(local, nested)):
+                    return False
+            elif equation.primitive is jax.lax.broadcast_in_dim_p:
+                operand = equation.invars[0].aval.shape
+                dimensions = tuple(equation.params['broadcast_dimensions'])
+                if operand not in ((), (rows,), (columns,), (rows, columns)) or dimensions not in (
+                        (), (0,), (1,), (0, 1)) or (operand == (rows,) and dimensions != (0,)) or (
+                        operand == (columns,) and dimensions not in ((0,), (1,))):
+                    return False
+            elif not programs.entrywise(equation.primitive):
+                return False
+        return True
+
+    return local(traced.jaxpr)
 
 
 def lowering_rules(target) -> dict:
