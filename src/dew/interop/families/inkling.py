@@ -257,8 +257,8 @@ _NAMES: Renames = (
     ('mlp_norm', 'post_attention_layernorm'), ('attn_sconv', 'attn_conv'), ('mlp_sconv', 'mlp_conv'),
     *((f'controllers.{theirs}', f'cross_pass_{site}') for site, theirs in _SITES.items()),
     ('mlp.gate.bias', 'mlp.gate.e_score_correction_bias'))
-"""The release's names (model.safetensors.index.json of thinkingmachines/Inkling-2-Mini, its text decoder
-under `model.llm.`) onto the shared decoder's and this family's own (`_LAYER_LEAVES`), as transformers'
+"""The release's names (model.safetensors.index.json of thinkingmachines/Inkling-2-Mini at c9d0283, its text
+decoder under `model.llm.`) onto the shared decoder's and this family's own (`_LAYER_LEAVES`), as transformers'
 conversion reads them (conversion_mapping.py `inkling2_text`, `inkling2_loop_text`)."""
 
 _LAYER_LEAVES: Leaves = {

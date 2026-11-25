@@ -32,7 +32,7 @@ def test_a_head_scores_its_first_rows_alone(tied):
     logits = np.asarray(jax.jit(narrow.apply)(variables, ids))
     assert logits.shape[-1] == SCORED == logits_width(narrow)
     np.testing.assert_array_equal(logits, np.asarray(jax.jit(full.apply)(variables, ids))[..., :SCORED])
-    table = narrow.apply(variables, method=lambda module: module.output_table())
+    table = narrow.bind(variables).output_table()
     assert table.rows().shape[0] == SCORED
     with pytest.raises(ValueError):
         _decoder(tied=tied, output_vocab=ROWS + 1)
