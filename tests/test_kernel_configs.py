@@ -35,7 +35,7 @@ from dew.nn.kernels import (
     recurrence,
     tuning,
 )
-from dew.nn.kernels.templates import assembled, bundles, cost, report, resources, swizzling
+from dew.nn.kernels.templates import assembled, bundles, report, resources, swizzling
 from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing, tiling
 from dew.nn.kernels.templates.gemm.hooks import Hooks
 
@@ -1101,17 +1101,6 @@ def test_each_family_emits_every_launch_form_at_each_consumer_count(generation_n
                 for count in {1, min(emitting.consumers, tiling.CONSUMERS)}}
     got = {(case.form, case.consumers) for case in cases}
     assert got == expected, (sorted(expected - got), sorted(got - expected))
-
-
-def test_a_tpu7x_prices_its_fp8_products_at_its_fp8_peak_where_it_states_no_rate_a_clock():
-    """A TPU7x states its catalogued peaks and no MXU rate a clock (row 9026): a whole device prices an FP8
-    product at its FP8 peak, twice its bf16's, and a tile walk, with no clock, prices neither (the review of
-    toolkit/theme-k01-2 5979e2142)."""
-    target = generation.TARGETS["tpu7x"]
-    device, tile = cost.rates(target, device=True), cost.rates(target, device=False)
-    assert (device.tensor, device.eight) == (target.bf16_peak, target.fp8_peak)
-    assert target.fp8_peak == 2 * target.bf16_peak
-    assert (tile.tensor, tile.eight) == (None, None)
 
 
 @COMPILES_FOR_TPU

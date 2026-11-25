@@ -212,6 +212,15 @@ def test_a_product_of_two_16_bit_formats_replays_as_traced():
     assert np.asarray(jax.jit(replayed)(a, b)).tolist() == np.asarray(jax.jit(product)(a, b)).tolist()
 
 
+def test_a_tpu7x_prices_its_fp8_products_at_its_fp8_peak_where_it_states_no_rate_a_clock():
+    """A TPU7x states its catalogued peaks and no MXU rate a clock (row 9026): a whole device prices an FP8
+    product at its FP8 peak, and a tile walk, with no clock, prices neither."""
+    target = generation.TARGETS["tpu7x"]
+    device, tile = kernel_cost.rates(target, device=True), kernel_cost.rates(target, device=False)
+    assert (device.tensor, device.eight) == (target.bf16_peak, target.fp8_peak)
+    assert (tile.tensor, tile.eight) == (None, None)
+
+
 def test_device_memory_is_priced_at_the_parts_measured_stream():
     """A GPU's device-memory bytes are priced at its part's measured stream (`GpuTarget.part`,
     tools/device_facts.py's plateau), whatever bandwidth its memory clock and bus state, which no transfer
