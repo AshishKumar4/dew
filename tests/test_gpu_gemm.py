@@ -466,6 +466,9 @@ def test_an_adapted_products_backward_keeps_a_narrow_presets_fp32_products_wide(
 
     preset = jax.lax.DotAlgorithmPreset.F16_F16_F32
     x = np.zeros((8, 16), np.float16)
+    # Every arm computed before any is checked: a GPU tier's prepare computes nothing, so a check between
+    # them stops it before the next arm (row 12871).
+    gradients = []
     for kernel_entry, a_entry, scale, out_dtype, cotangent in (
             (2.0 ** -10, 0.0, 1.0, np.float32, 2.0 ** 16), (0.0, 2.0 ** -10, 2.0 ** 16, np.float16, 1.0)):
         kernel = np.full((16, 8), kernel_entry, np.float16)
@@ -481,6 +484,7 @@ def test_an_adapted_products_backward_keeps_a_narrow_presets_fp32_products_wide(
             return pull(dy)[0]
 
         label = f"an adapted product's rows gradient into {np.dtype(out_dtype)}"
-        d_x = ahead_arm(jax.jit(rows_gradient), label)(x, kernel, a, b, dy)
+        gradients.append((scale, out_dtype, ahead_arm(jax.jit(rows_gradient), label)(x, kernel, a, b, dy)))
+    for scale, out_dtype, d_x in gradients:
         assert np.all(np.isfinite(np.asarray(d_x, np.float32))), (out_dtype, d_x[0])
         assert np.asarray(d_x[0, 0], np.float32) == 64.0 * (4.0 if scale > 1 else 1.0), (out_dtype, d_x[0])
