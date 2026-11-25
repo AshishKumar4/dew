@@ -39,7 +39,15 @@ from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers import AttentionMixer
 from dew.nn.mlp import GatedMLP
 from dew.nn.norms import cosine
-from dew.nn.precision import accumulated, at_least_fp32, capped_logits, divided, scaled_logits, span_means
+from dew.nn.precision import (
+    accumulated,
+    at_least_fp32,
+    capped_logits,
+    computed_einsum,
+    divided,
+    scaled_logits,
+    span_means,
+)
 from dew.nn.scatter import DROPPED, gather_positions
 from dew.registry import Record, component, from_record, import_path, record_fields
 
@@ -603,8 +611,9 @@ class LabelReadout(Head):
             jnp.zeros(ids.shape, _wide(table.matrix.dtype, self.dtype)) if table.bias is None
             else drawn(jnp.take(table.bias, ids.reshape(-1)).reshape(ids.shape))))
         answers = table.states(answer_states(states, inputs))
-        answers = answers.astype(_wide(jnp.result_type(answers, rows), self.dtype))
-        logits = jnp.einsum("bqd,kvd->bqkv", answers, rows[:width], precision=jax.lax.Precision.HIGHEST)
+        # In the readout's compute dtype under the run's precision, summed in at least fp32 (row 12919).
+        compute = _compute(answers.dtype, self.dtype)
+        logits = computed_einsum("bqd,kvd->bqkv", answers, rows[:width], dtype=compute)
         capped = capped_logits(scaled_logits(logits, None, bias[:width]), table.softcap)
         return _past_labels(jax.nn.logsumexp(capped, axis=-1), width)
 
@@ -681,18 +690,25 @@ class SlotReadout(Head):
         q = self.param("q", nn.initializers.normal(self.features ** -0.5), (self.head_dim, self.features),
                        drawn_dtype)
         k = self.param("k", nn.initializers.zeros, (self.head_dim, self.features), drawn_dtype)
-        states = states.astype(_wide(jnp.result_type(states, slots), self.dtype))
         answers = answer_states(states, inputs)
         lines = states if spanned is None else spanned.astype(states.dtype)
-        pooled = span_means(lines, inputs.option_spans[:, :, :real])
-        highest = jax.lax.Precision.HIGHEST
-        score = jnp.einsum("bqd,kd->bqk", answers, slots[:real], precision=highest)
-        query = jnp.einsum("bqd,hd->bqh", answers, q, precision=highest)
-        key = jnp.einsum("bqkd,hd->bqkh", pooled, k, precision=highest)
+        # Pooled in at least fp32, each product in the readout's compute dtype under the run's precision,
+        # summed in at least fp32 (row 12919).
+        pooled = span_means(lines.astype(at_least_fp32(lines.dtype)), inputs.option_spans[:, :, :real])
+        compute = _compute(states.dtype, self.dtype)
+        score = computed_einsum("bqd,kd->bqk", answers, slots[:real], dtype=compute)
+        query = computed_einsum("bqd,hd->bqh", answers, q, dtype=compute)
+        key = computed_einsum("bqkd,hd->bqkh", pooled, k, dtype=compute)
         # IEEE division: XLA takes a division by a constant as a product with its rounded reciprocal.
-        scores = score + divided(jnp.einsum("bqh,bqkh->bqk", query, key, precision=highest),
+        scores = score + divided(computed_einsum("bqh,bqkh->bqk", query, key, dtype=compute),
                                  math.sqrt(self.head_dim))
         return _past_labels(scores, width)
+
+
+def _compute(dtype, stated: Dtype | None) -> jnp.dtype:
+    """The dtype a readout's products take their operands in: the readout's own where it states one, else
+    its states' (a bf16 run's bf16, `ACCURATE`'s float32)."""
+    return jnp.dtype(dtype if stated is None else stated)
 
 
 def _wide(dtype, floor: Dtype | None) -> jnp.dtype:

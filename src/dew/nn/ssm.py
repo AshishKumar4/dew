@@ -21,7 +21,7 @@ from dew.nn.dense import Dense
 from .conv import Conv
 from .flops import conv_flops, projection_flops
 from .inputs import sequence_blocks
-from .precision import at_least_fp32, float32_dot_general, float32_einsum
+from .precision import at_least_fp32, exact_float32, float32_dot_general, float32_einsum
 
 
 def affine_spans(left, right, multiply=operator.mul, add=operator.add):
@@ -134,7 +134,7 @@ def diagonal_recurrence(pole: jax.Array, inputs: jax.Array, chunk: int = SCAN_CH
     states = width // 2
     length = min(chunk, steps)
     chunks = -(-steps // length)
-    highest = jax.lax.Precision.HIGHEST
+    highest = exact_float32(None)
     powers = _powers(pole, length)
     blocks = sequence_blocks(inputs, length).reshape(batch, chunks, length, 2, states)
     blocks = blocks.transpose(0, 1, 3, 2, 4)

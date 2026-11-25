@@ -21,6 +21,7 @@ import jax
 import jax.numpy as jnp
 
 from dew.nn.conv import Conv
+from dew.nn.precision import exact_float32
 
 
 def _avg_pool(x: jax.Array, window_shape: tuple[int, int], strides: tuple[int, int],
@@ -87,7 +88,7 @@ class BasicConv2d(nn.Module):
                  strides=self.strides,
                  padding=self.padding,
                  use_bias=False,
-                 precision=jax.lax.Precision.HIGHEST)(x)
+                 precision=exact_float32(None))(x)
         x = nn.BatchNorm(use_running_average=True, epsilon=0.001)(x)
         return jax.nn.relu(x)
 

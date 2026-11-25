@@ -107,6 +107,11 @@ Scope is per rule, because the rules are not all about the same thing:
   `xla_compiled` waits for a compile slot, whatever its pool's width.
 - SLOP033 is about tests (tools/lint_assertions.py): no test pins a choice Dew
   derives to a literal (CONTRIBUTING's banned assertion 2).
+- SLOP034 is about `src/<package>`: no contraction names its precision
+  outright (`Precision.HIGHEST`, `precision='highest'`) outside
+  `nn/precision.py`, whose policy gives a layer's products the run's
+  (`computed_einsum`) and names each genuinely exact boundary
+  (`exact_float32`), so a run's numerics reach every model contraction.
 - SLOP029 is about `tests`: no test's every assertion is that a process
   failed, read from its exit status alone (a `returncode`, `subprocess.call`
   or `os.system` unequal to 0, equal to 1, an uncaught error's, or tested for
@@ -1836,6 +1841,36 @@ def detections(module: Module) -> Iterator[Finding]:
                           "the version that has it")
 
 
+PRECISION_POLICY = "nn/precision.py"
+NAMED_OUTRIGHT = ("a precision named outright; take the run's (dew.nn.precision.computed_einsum) or name an "
+                  "exact boundary (dew.nn.precision.exact_float32)")
+"""SLOP034's finding."""
+"""The one module of `src/<package>` that names a contraction's precision outright (SLOP034): its policy,
+`computed_einsum` a layer's products' and `exact_float32` a genuinely exact boundary's (row 12921)."""
+
+
+def precisions(module: Module) -> Iterator[Finding]:
+    """SLOP034: a contraction precision named outright outside the package's precision policy
+    (`PRECISION_POLICY`): JAX's `Precision.HIGHEST` read through any name its enum is imported as, or
+    'highest' as a call's `precision=`. A layer's product takes the run's (`computed_einsum`) and an exact
+    boundary says so (`exact_float32`), so a bf16 run's Tensor Cores and `ACCURATE`'s float32 reach every
+    model contraction (the owner, 2026-11-25)."""
+    if module.relative == f"src/{module.package}/{PRECISION_POLICY}":
+        return
+    for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
+        if isinstance(node, ast.Attribute) and node.attr == "HIGHEST":
+            named = scopes.resolved(node.value, table)
+            if named.startswith("jax.") and named.endswith(".Precision"):
+                yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP034", NAMED_OUTRIGHT)
+        elif isinstance(node, ast.Call):
+            for keyword in node.keywords:
+                value = keyword.value
+                if (keyword.arg == "precision" and isinstance(value, ast.Constant)
+                        and isinstance(value.value, str) and value.value.lower() == "highest"):
+                    yield Finding(module.relative, value.lineno, value.col_offset + 1, "SLOP034",
+                                  NAMED_OUTRIGHT)
+
+
 COMPILE_POINT = (("nn/kernels/options.py", "OuterProgram"), ("nn/nested.py", "nested"))
 """The two places of `src/<package>` that compile by a bare jit (SLOP025), each `path` below it and the
 definition the jit is in: Dew's one compile point, through which every program compiles
@@ -2359,7 +2394,7 @@ def compile_pools(module: Module) -> Iterator[Finding]:
 
 
 CONTRACT_RULES = (contracts, probes, names, imports, calls, authorities, waits, detections, compile_points,
-                  pallas_launches, owned_constructs, derivative_contracts)
+                  pallas_launches, owned_constructs, derivative_contracts, precisions)
 UNIVERSAL_RULES = (suppressions, swallowed, comments, size, jax_private, compile_pools)
 
 

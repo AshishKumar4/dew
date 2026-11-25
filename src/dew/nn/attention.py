@@ -82,6 +82,7 @@ from .precision import (
     capped_logits,
     configurable_precision,
     configured_precision,
+    exact_float32,
     exact_products,
     float32_einsum,
 )
@@ -1248,7 +1249,7 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
         mask = combined_attention_mask(query.shape[-3], key.shape[-3], causal, sliding_window, masked)
         # The accurate form's products are IEEE fp32 (`attention_route.FORMS`), never a GPU's TF32.
         if generation.numerics().forms == "accurate":
-            precision = jax.lax.Precision.HIGHEST
+            precision = exact_float32(None)
         return reference_attention(query, key, value, mask=mask, bias=bias, sinks=sinks, softcap=softcap,
                                    dtype=dtype, precision=precision,
                                    force_fp32_for_softmax=force_fp32_for_softmax, wide_logits=wide_logits,

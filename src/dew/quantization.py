@@ -92,6 +92,7 @@ from dew.nn.precision import (
     accumulated,
     at_least_fp32,
     correctly_rounded_divide,
+    exact_float32,
     float32_einsum,
     twice_scaled,
     uncontracted,
@@ -737,7 +738,7 @@ def _frozen_fp8_tangent(primals, tangents, value):
         rows, row_scales = (jax.lax.stop_gradient(leaf) for leaf in residuals[:2])
         decoded = rows.astype(jnp.float32) * row_scales.astype(jnp.float32)
         return accumulated(functools.partial(jax.lax.dot_general, dimension_numbers=(((1,), (1,)), ((), ())),
-                                             precision=jax.lax.Precision.HIGHEST),
+                                             precision=exact_float32(None)),
                            direction.astype(jnp.float32), decoded, preferred_element_type=jnp.float32)
 
     def transposed(residuals, cotangent):

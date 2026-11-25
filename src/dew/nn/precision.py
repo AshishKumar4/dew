@@ -102,6 +102,7 @@ __all__ = [
     "compensated_sum",
     "compensated_total",
     "compensates_loops",
+    "computed_einsum",
     "configurable_precision",
     "configured_precision",
     "correctly_rounded_divide",
@@ -1092,6 +1093,18 @@ def float32_einsum(subscripts: str, *operands, precision: jax.lax.PrecisionLike 
         return _held(bf16_einsum(subscripts, *operands, **kwargs), preferred_element_type, *operands)
     return accumulated(functools.partial(jnp.einsum, subscripts, precision=precision, **kwargs), *operands,
                        preferred_element_type=preferred_element_type)
+
+
+def computed_einsum(subscripts: str, *operands, dtype: DTypeLike) -> jax.Array:
+    """`jnp.einsum` of `operands` cast to `dtype`, the compute dtype the run computes the layer in, summed in
+    at least fp32 at the precision the run's policy gives such operands (`operand_precision`: a bf16 run's
+    Tensor Core product at the `BF16_BF16_F32` algorithm, `Numerics.matmul`'s configured level otherwise,
+    `ACCURATE`'s exact float32): the product a model layer's small contractions take (a cross-pass merge's
+    controller and its depth read, `dew.nn.cross_pass`; `DepthAttention`'s; a decision readout's), in the
+    run's numerics and no level of their own (row 12918)."""
+    compute = jnp.dtype(dtype)
+    return float32_einsum(subscripts, *(operand.astype(compute) for operand in operands),
+                          precision=operand_precision(compute), preferred_element_type=at_least_fp32(compute))
 
 
 def _bf16_algorithm(precision: jax.lax.PrecisionLike) -> bool:

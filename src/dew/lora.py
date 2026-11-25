@@ -83,7 +83,7 @@ from dew.nn.flops import (
     projection_flops,
 )
 from dew.nn.kernels import low_rank, selection
-from dew.nn.precision import accumulated, at_least_fp32, biased, float32_dot_general
+from dew.nn.precision import accumulated, at_least_fp32, biased, exact_float32, float32_dot_general
 from dew.nn.protocols import (
     Adapted,
     Counted,
@@ -752,7 +752,7 @@ def _updated(kernel: jax.Array, a: jax.Array, b: jax.Array, scale: float) -> jax
     """`kernel` plus `scale` times the factors' product, summed in at least fp32 at full precision
     and stored in the kernel's dtype, as PEFT's `merge_and_unload` does."""
     dtype = at_least_fp32(kernel.dtype)
-    delta = accumulated(functools.partial(jnp.tensordot, axes=1, precision=jax.lax.Precision.HIGHEST),
+    delta = accumulated(functools.partial(jnp.tensordot, axes=1, precision=exact_float32(None)),
                         a.astype(dtype), b.astype(dtype))
     return (kernel.astype(dtype) + scale * delta).astype(kernel.dtype)
 

@@ -49,7 +49,7 @@ from jax.typing import DTypeLike
 from dew.mesh import SEQUENCE_AXIS, logical_spec, mesh_axes
 
 from .flops import conv_flops
-from .precision import biased, exact_products
+from .precision import at_least_fp32, biased, exact_products
 from .sharding import auto_part, constrained, placed_axes
 
 # A linear boundary must survive in tangents and cotangents too: dropping it
@@ -130,9 +130,9 @@ def _polyphase_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> j
     into those grids along the batch, each grid takes the dilation-1
     convolution with its own zero border, and the grids interleave back.
     The image is padded with zeros to a multiple of `dilation` first, which
-    are the zeros 'SAME' padding reads there anyway. The convolution runs at
-    full precision, so an fp32 model keeps fp32 accumulation and bf16 rounds
-    once, from fp32."""
+    are the zeros 'SAME' padding reads there anyway. The convolution sums in
+    at least fp32 at the run's precision (`Numerics.matmul`: `ACCURATE`'s
+    exact float32), so bf16 rounds once, from fp32 (row 12920)."""
     batch, height, width, features = lhs.shape
     rows, columns = -(-height // dilation), -(-width // dilation)
     padded = jnp.pad(lhs, ((0, 0), (0, rows * dilation - height), (0, columns * dilation - width), (0, 0)))
@@ -140,7 +140,7 @@ def _polyphase_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> j
     output = jax.lax.conv_general_dilated(
         grids.reshape(batch * dilation * dilation, rows, columns, features), rhs, (1, 1), 'SAME',
         dimension_numbers=('NHWC', 'HWIO', 'NHWC'), feature_group_count=features,
-        precision=jax.lax.Precision.HIGHEST)
+        preferred_element_type=at_least_fp32(lhs.dtype)).astype(lhs.dtype)
     output = output.reshape(batch, dilation, dilation, rows, columns, features).transpose(0, 3, 1, 4, 2, 5)
     return output.reshape(batch, rows * dilation, columns * dilation, features)[:, :height, :width]
 

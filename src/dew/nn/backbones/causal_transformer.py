@@ -1455,12 +1455,14 @@ class CausalTransformer(LinearProducts):
         return normed.astype(wide) / jnp.asarray(self.logits_scaling, wide)
 
     def stack(self, x, *, train: bool, decode: bool, per_layer_input, attention_metadata=None,
-              span: tuple[int, int] | None = None, prior_bank=None):
+              span: tuple[int, int] | None = None, prior_bank=None, kv_store=None):
         """Run the layer stack over `x` as the plain loop, as scanned runs, or as a pipeline over the stages
         (`decoder_stages.stack`), each layer of a looped block that passes messages reading `prior_bank`
-        (`Loop.messages`)."""
+        (`Loop.messages`), its layers' providers' publications read from and left in `kv_store` (a loop's
+        part's, `dew.nn.backbones.looping`; a fresh one where None)."""
         return decoder_stages.stack(self, x, train=train, decode=decode, per_layer_input=per_layer_input,
-                                    attention_metadata=attention_metadata, span=span, prior_bank=prior_bank)
+                                    attention_metadata=attention_metadata, span=span, prior_bank=prior_bank,
+                                    kv_store=kv_store)
 
     def residual_summary(self, x) -> jax.Array:
         """The `[B, S, D]` summary of the residual `x` a block of a looped pass leaves its pass after

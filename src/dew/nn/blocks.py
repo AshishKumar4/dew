@@ -21,7 +21,7 @@ from .conv import Conv
 from .flops import projection_flops
 from .kernels.generation import linear_tangent
 from .norms import GroupNorm, RMSNorm
-from .precision import at_least_fp32, float32_dot_general, float32_einsum
+from .precision import at_least_fp32, exact_float32, float32_dot_general, float32_einsum
 from .rope import sinusoid_frequencies, sinusoids
 from .sharding import LogicalAxes, constrain, explicit_spec, rows_taken, whole_spec
 
@@ -390,7 +390,7 @@ def torch_bicubic_resize(x, height: int, width: int, *, antialias: bool = False)
     dtype = np.dtype(at_least_fp32(x.dtype))
     rows = _torch_bicubic_weights(x.shape[1], height, antialias, dtype)
     columns = _torch_bicubic_weights(x.shape[2], width, antialias, dtype)
-    return float32_einsum("oh,bhwc,pw->bopc", rows, x, columns, precision=jax.lax.Precision.HIGHEST)
+    return float32_einsum("oh,bhwc,pw->bopc", rows, x, columns, precision=exact_float32(None))
 
 
 class Upsample(nn.Module):

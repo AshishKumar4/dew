@@ -46,13 +46,17 @@ def scanned() -> bool:
 
 
 def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer_input,
-          attention_metadata=None, span: tuple[int, int] | None = None, prior_bank=None):
+          attention_metadata=None, span: tuple[int, int] | None = None, prior_bank=None, kv_store=None):
     """Run the layer stack over `x` as the plain loop, as scanned runs, or as a pipeline over the stages.
 
     `span` runs layers [first, end) alone, as a `Loop` over a block runs its
     prelude, its block and its coda; on one stage, with no banked store.
     `prior_bank` is a looped pass's bank of its pass before's block summaries
     (`dew.nn.cross_pass`), which every layer reads alike; a pipeline takes none.
+    `kv_store` is the store a span's layers read their providers' keys, values
+    and publications from and leave their own in, a loop's part's (prelude,
+    pass, coda: `dew.nn.backbones.looping`), filled in place; a fresh one
+    where None.
 
     `init` draws like runs under the scan and then unstacks them, so the
     tree is the plain loop's; under a stage mesh or with `decode`, init
@@ -70,20 +74,22 @@ def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer
     stored = off_stages(decoder, type(decoder).stack, functools.partial(stage_view, decoder))
     if stored is not None:
         return stored(decoder, x, train=train, decode=decode, per_layer_input=per_layer_input,
-                      attention_metadata=attention_metadata, span=span, prior_bank=prior_bank)
+                      attention_metadata=attention_metadata, span=span, prior_bank=prior_bank,
+                      kv_store=kv_store)
     if decoder.residual_in_fp32 and isinstance(x, Carried):
         x = x._replace(streams=x.streams.astype(at_least_fp32(x.streams.dtype)))
     elif decoder.residual_in_fp32:
         x = x.astype(at_least_fp32(x.dtype))
     stages = pipeline_stages()
     first, end = (0, decoder.num_layers) if span is None else span
+    store = kv_store if kv_store is not None else ({} if decoder.provides else None)
 
     def unrolled():
         # Each layer run directly, in the stream's own dtype: no scan carries it.
         return run_stack(
             decoder.layers, decoder.block, decoder.specs,
             tuple((index, 1) for index in range(first, end)), x,
-            train=train, decode=decode, kv_store={} if decoder.provides else None,
+            train=train, decode=decode, kv_store=store,
             per_layer_input=per_layer_input, attention_metadata=attention_metadata, prior_bank=prior_bank)
 
     # A seeded initialization (PTQ's abstract annotation pass) reads the
@@ -146,7 +152,6 @@ def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer
     # The layers outside the run the stages repeat (none on one stage) run on every stage, as the
     # plain loop runs them, around the pipeline; a provider among them fills the store a later one
     # reads.
-    store = {} if decoder.provides else None
 
     def outside(x, first: int, last: int):
         return x if first == last else run_stack(
@@ -156,19 +161,19 @@ def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer
             attention_metadata=attention_metadata)
 
     x = outside(x, 0, split.prefix)
-    x = run(decoder, view, x, train, decode, per_layer_input, attention_metadata, prior_bank)
+    x = run(decoder, view, x, train, decode, per_layer_input, attention_metadata, prior_bank, store)
     return outside(x, decoder.num_layers - split.suffix, decoder.num_layers)
 
 
 @nn.compact
 def stacked(decoder: CausalTransformer, view: StackView, x, train: bool, decode: bool, per_layer_input,
-            attention_metadata=None, prior_bank=None):
+            attention_metadata=None, prior_bank=None, kv_store=None):
     """The stack inside `view`: scanned runs, or the pipeline over stages; compact, so the stages it builds
     are the decoder's own."""
     if view.stages == 1:
         return run_stack(
             decoder.layers, decoder.block, decoder.specs, view.groups, x,
-            train=train, decode=decode, kv_store={} if decoder.provides else None,
+            train=train, decode=decode, kv_store=kv_store,
             per_layer_input=per_layer_input, attention_metadata=attention_metadata,
             banked='params' in view.banked, periods=view.periods, prior_bank=prior_bank)
     return run_pipeline(
