@@ -120,7 +120,7 @@ def emitted(body: jax_core.Jaxpr, warpgroups: int, axis: str | None, *, device: 
         for index in range(warpgroups):
             counting = _Counting(axis, index, forms=forms, arrivals=arrivals)
             counting.run(body, values)
-            roles.append(Role(counting.counted, tuple(counting.walks)))
+            roles.append(Role(counting.fixed, tuple(counting.walks)))
         return roles
 
     roles = counted()
@@ -508,17 +508,11 @@ class _Counting:
 
     def __init__(self, axis: str | None, index: int, loops: int = 0, warp: tuple | None = None,
                  forms: Mapping | None = None, arrivals: _Arrivals | None = None, lanes: int | None = None,
-                 charged: set[tuple[int, ...]] | None = None, sites: Sequence[int] = ()):
+                 repeating: bool = False):
         self.axis, self.index, self.warp, self.forms = axis, index, warp, forms
-        # The static equations whose work it charged once (`equation`), each by its call path: the
-        # equations it is counting within (`sites`, each by identity) and its own. A scan's trips run one
-        # body at one site, its invariant computed once; two calls of one cached body are two sites (the
-        # reviews of lane/toolkit a1b861d7f2d and 61dd3c7d2). Their work is held apart from what a trial's
-        # parent keeps or discards of its work (`invariants`): a trial counts on a copy, its parent taking
-        # every trial's invariants once (`kept`), the role's work its own work and its invariants together.
-        self.charged = set() if charged is None else charged
-        self.sites = list(sites)
-        self.invariants: dict[tuple[int, ...], Work] = {}
+        # Whether it counts a scan's later trip (`scanned`), its static work charged at the first (the reviews
+        # of lane/toolkit a1b861d7f2d to f7b349470).
+        self.repeating = repeating
         # The warp of its warpgroup whose 32 lanes run its body where a warp mesh's role runs it
         # (`plgpu.warp_map`), None where its warpgroup's 128 do.
         self.lanes = lanes
@@ -623,11 +617,7 @@ class _Counting:
             values = [read(atom) for atom in equation.invars]
             given = [isinstance(atom, jax_core.Literal) or atom in self.static for atom in equation.invars]
             self.returned = None
-            self.sites.append(id(equation))
-            try:
-                outputs = self.moved(equation, values, live) or self.equation(equation, values, given)
-            finally:
-                self.sites.pop()
+            outputs = self.moved(equation, values, live) or self.equation(equation, values, given)
             held.update(zip(equation.outvars, outputs, strict=True))
             # A body it ran here states its outputs' provenance (a call's, a scope's, a branch's); else the
             # operation's own (`_static`).
@@ -698,13 +688,15 @@ class _Counting:
             return [values[1 + int(values[0])]]
         if _static(equation, given):
             # Of the program's constants alone: computed once outside every loop (or folded by its compile),
-            # its work the program's once, never a step's (the review of train 1261, F6). A call of them runs
-            # on, its body's folds the values a later guard reads.
-            if primitive in _ARITHMETIC and (site := tuple(self.sites)) not in self.charged:
-                self.charged.add(site)
-                self.invariants[site] = operation_work(
+            # its work charged where it stands, never a step's (the review of train 1261, F6): beside a
+            # trip's or an arm's other work, under the envelope a loop's trips or a conditional's arms take,
+            # once for a scan's trips (`repeating`); a scan whose later trip takes another arm of a
+            # conditional its data decides charges that arm's static work nowhere. A call of them runs on,
+            # its body's folds the values a later guard reads.
+            if primitive in _ARITHMETIC and not self.repeating:
+                self.fixed = _then(self.fixed, operation_work(
                     primitive, [variable.aval for variable in equation.invars],
-                    [variable.aval for variable in equation.outvars], params, forms=self.forms)
+                    [variable.aval for variable in equation.outvars], params, forms=self.forms))
             return unknown
         if primitive in _ARITHMETIC:
             self.add(operation_work(primitive, [variable.aval for variable in equation.invars],
@@ -806,14 +798,13 @@ class _Counting:
                 inputs[len(consts) + bound] = stop
             trial = _Counting(self.axis, self.index, loops=len(self.loops) + 1, warp=self.warp,
                               forms=self.forms, arrivals=self.arrivals, lanes=self.lanes,
-                              charged=set(self.charged), sites=self.sites)
+                              repeating=self.repeating)
             trial.run(body, inputs, static=static)
             self.arrivals.left(trial.landing)
             return trial
 
         steady, odd = trip("steady", 0), trip("steady", 1)
-        self.fixed = self.fixed + steady.fixed
-        self.kept([steady, odd])
+        trials = [steady, odd]
         self.walks.extend(steady.walks)
         found = _Loop(_mean([steady.loops[-1].work, odd.loops[-1].work]), steady.loops[-1].marks)
         self.ended(found, walks=True)
@@ -821,9 +812,12 @@ class _Counting:
             # The first and last trips each take their own work in place of a steady one's.
             for at in _PLACES[1:]:
                 edges = [trip(at, parity) for parity in (0, 1)]
-                self.kept(edges)
+                trials += edges
                 taken = _mean([edge.loops[-1].work for edge in edges])
                 self.fixed = self.fixed + taken + repeated(found.work, -1)
+        # What its trips do outside their steps, its static work among it (computed once, outside the
+        # loop), whichever trips reach it: the most any trip does.
+        self.fixed = self.fixed + most([trial.fixed for trial in trials])
 
     def warps(self, equation, values: list, given: list[bool]) -> None:
         """A warpgroup's warps each running its role (`plgpu.warp_map`'s `mpmd_map`: tcgen05's load and
@@ -836,26 +830,20 @@ class _Counting:
         ((name, count),) = mesh.shape.items()
         steps, marks = [], 0.0
         barriers = [_barrier(var) for var in inner.invars]
-        # Each warp computes its body's invariants itself: its count starts from the charges before the map.
-        before, warps = set(self.charged), []
         for warp in range(count):
             counted = _Counting(self.axis, self.index, loops=len(self.loops), warp=(name, warp),
                                 forms=self.forms, arrivals=self.arrivals,
                                 lanes=warp if isinstance(mesh, gpu_core.WarpMesh) else self.lanes,
-                                charged=set(before), sites=self.sites)
+                                repeating=self.repeating)
             counted.run(inner, barriers)
-            warps.append(counted)
             if self.loops:
                 self.arrivals.left(counted.landing)
-            # Each warp's invariants its own, computed by each.
-            self.fixed = self.fixed + counted.counted
+            self.fixed = self.fixed + counted.fixed
             if counted.walks:
                 steps.append(_mean(counted.walks))
             if self.loops:
                 self.loops[-1].work = self.loops[-1].work + counted.loops[-1].work
                 marks = max(marks, counted.loops[-1].marks)
-        for counted in warps:
-            self.charged |= counted.charged
         if steps:
             self.walks.append(sum(steps, Work()))
         if self.loops:
@@ -872,8 +860,12 @@ class _Counting:
         # none.
         static = [*given[:len(consts)], *([False] * (len(carried) + len(xs)))]
         self.loops.append(_Loop())
-        for _ in range(length):
+        # Its static work computed once, before its first trip: its later trips charge none (`repeating`).
+        was = self.repeating
+        for trip in range(length):
+            self.repeating = was or trip > 0
             carried = self.run(body, [*consts, *carried, *([None] * len(xs))], static=static)[:len(carried)]
+        self.repeating = was
         self.ended(self.loops.pop(), walks=False)
         return [*carried, *([None] * (len(body.outvars) - len(carried)))]
 
@@ -887,35 +879,6 @@ class _Counting:
             self.walks.append(repeated(found.work, 1 / found.marks))
         else:
             self.fixed = self.fixed + found.work
-
-    def kept(self, trials: Sequence["_Counting"]) -> None:
-        """The invariants `trials` found (a loop's trips, steady, odd and at its edges; a conditional's
-        branches), its own now, each once: a trial counts on a copy of its charges, so whatever of its work
-        its parent keeps or discards, each invariant it found is the program's once."""
-        for trial in trials:
-            for site, work in trial.invariants.items():
-                if site not in self.charged:
-                    self.charged.add(site)
-                    self.invariants[site] = work
-
-    def branched(self, trials: Sequence["_Counting"]) -> None:
-        """The invariants a conditional's branches found (`trials`, one runs), under their envelope as its
-        work is: the most of each unit any branch's new invariants take, the conditional's own invariant at
-        its site, once; every branch's charges its own, so a visit again finds them charged (the review of
-        lane/toolkit 1d6a2c24b: two arms' invariants charged together)."""
-        found = [sum((work for site, work in trial.invariants.items() if site not in self.charged), Work())
-                 for trial in trials]
-        for trial in trials:
-            self.charged |= trial.charged
-        if any(work != Work() for work in found):
-            site = tuple(self.sites)
-            self.charged.add(site)
-            self.invariants[site] = self.invariants.get(site, Work()) + most(found)
-
-    @property
-    def counted(self) -> Work:
-        """Its work outside its walks and its invariants (`invariants`), together."""
-        return sum(self.invariants.values(), self.fixed)
 
     def cond(self, branches, values: list, given: list[bool]) -> list:
         """A conditional: its branch where its index is concrete (a role's, by its warpgroup), else every
@@ -933,13 +896,12 @@ class _Counting:
         for branch in branches:
             trial = _Counting(self.axis, self.index, loops=len(self.loops), warp=self.warp,
                               forms=self.forms, arrivals=self.arrivals, lanes=self.lanes,
-                              charged=set(self.charged), sites=self.sites)
+                              repeating=self.repeating)
             trial.run(branch, operands, static=given[1:])
             if self.loops:
                 self.arrivals.left(trial.landing)
             trials.append(trial)
         self.fixed = self.fixed + most([trial.fixed for trial in trials])
-        self.branched(trials)
         if any(trial.walks for trial in trials):
             self.walks.append(most([_mean(trial.walks) for trial in trials if trial.walks]))
         if self.loops:
