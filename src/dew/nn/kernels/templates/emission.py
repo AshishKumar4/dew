@@ -228,12 +228,22 @@ MOSAIC_DIVISION = Work(exponentials=1, operations=7)
 """An fp32 division in a Mosaic GPU kernel, an element: `div.full.f32`, with or without `approx_math`, its
 MUFU.RCP beside five FMULs and two FSETPs (sm90's SASS, FS-DIV-SASS1 and FS-DIV-SASS5)."""
 
+POLYNOMIAL_FORMS: Mapping = {
+    lax.erf_p: Work(exponentials=1, operations=21, integer_operations=2),
+    lax.atan2_p: MOSAIC_DIVISION + Work(exponentials=1, operations=30, integer_operations=3)}
+"""The polynomials a Mosaic GPU kernel issues an element for an fp32 erf and atan2 whatever `approx_math`
+(math.erf's and math.atan2's lowering, from the PTX of a warpgroup kernel of one fp32 tile on sm90,
+FS-ERF-FORMS1): an erf one ex2.approx beside 21 fp32 instructions (seven FMAs, nine selects, a multiply, a
+subtraction, an absolute value, a negation and a compare) and two integer ones; an atan2 of two operands a
+reciprocal's MUFU and an fp32 division (`MOSAIC_DIVISION`) beside 30 fp32 instructions and three integer
+ones. Both forms tables of a kernel hold them (row 12426)."""
+
 APPROXIMATE_FORMS: Mapping = {
     lax.exp_p: Work(exponentials=1, operations=1), lax.exp2_p: Work(exponentials=1),
     lax.log_p: Work(exponentials=1, operations=1), lax.log2_p: Work(exponentials=1),
     lax.tanh_p: Work(exponentials=1), lax.sin_p: Work(exponentials=1), lax.cos_p: Work(exponentials=1),
     lax.sqrt_p: Work(exponentials=1, operations=3), lax.rsqrt_p: Work(exponentials=1, operations=3),
-    lax.logistic_p: Work(exponentials=2, operations=3), lax.div_p: MOSAIC_DIVISION}
+    lax.logistic_p: Work(exponentials=2, operations=3), lax.div_p: MOSAIC_DIVISION, **POLYNOMIAL_FORMS}
 """Each special function's issue an element in a Mosaic GPU kernel compiled with `approx_math` (attention's):
 the hardware's approximate form, one MUFU (an exp's and a log's beside the multiply scaling it to base 2; a
 logistic's two, its exp and its reciprocal, beside a negation, a multiply and an add), counted from the PTX
@@ -250,7 +260,7 @@ ACCURATE_FORMS: Mapping = {
     lax.tanh_p: Work(exponentials=2, operations=13, integer_operations=3),
     lax.logistic_p: Work(exponentials=2, operations=9, conversions=1, integer_operations=1),
     lax.sqrt_p: Work(exponentials=1, operations=3), lax.rsqrt_p: Work(exponentials=1, operations=3),
-    lax.div_p: MOSAIC_DIVISION}
+    lax.div_p: MOSAIC_DIVISION, **POLYNOMIAL_FORMS}
 """Each special function's issue an element in a Mosaic GPU kernel compiled without `approx_math` (every
 GEMM launch's), from the same PTX (FS-APPROX-FORMS3, sm90 and sm100): an exp the MUFU beside seven fp32
 instructions (its range reduction's four FMAs, an add, a negation and a multiply), a saturating convert and a
@@ -1337,7 +1347,7 @@ def _operated(primitive, inputs: Sequence, outputs: Sequence) -> Work:
     return Work(integer_operations=count)
 
 
-_ARITHMETIC = _OPERATIONS | _REDUCTIONS | SPECIAL_FUNCTIONS | {lax.convert_element_type_p}
+_ARITHMETIC = _OPERATIONS | _REDUCTIONS | SPECIAL_FUNCTIONS | {lax.convert_element_type_p, lax.atan2_p}
 """The primitives a kernel body's count prices by `operation_work`: its elementwise arithmetic, a product
 apart (`_Counting.equation`'s, a TPU core's)."""
 
@@ -1385,8 +1395,9 @@ def operation_work(primitive, inputs: Sequence, outputs: Sequence, params: Mappi
     its native form where a kernel's forms state one (a Triton kernel's, `TRITON_FORMS`), else the software
     division it lowers to (XLA's and Mosaic GPU's, `precision._correctly_rounded_divide`), counted as a
     kernel's body is, through its calls (row 12886). An integer power issues its repeated squaring's
-    multiplies, a negative one beside the division of one by them (row 12948). Whether an operation is fp32
-    its results' dtypes say, or `fp32` where a caller states it (the algebra's terms hold no dtype)."""
+    multiplies, a negative one beside the division of one by them (row 12948). A kernel's erf and atan2 issue
+    the polynomials its forms state (`POLYNOMIAL_FORMS`). Whether an operation is fp32 its results' dtypes
+    say, or `fp32` where a caller states it (the algebra's terms hold no dtype)."""
     if primitive is precision.correctly_rounded_divide_p:
         if (native := (forms or {}).get(primitive)) is not None:
             return repeated(native, sum(_elements(aval) for aval in outputs))
@@ -1403,6 +1414,8 @@ def operation_work(primitive, inputs: Sequence, outputs: Sequence, params: Mappi
         squarings = repeated(squared, max(power.bit_length() + power.bit_count() - 2, 0))
         return squarings if params["y"] >= 0 else squarings + operation_work(
             lax.div_p, [*inputs, *inputs], outputs, {}, target, forms=forms, fp32=fp32)
+    if primitive in POLYNOMIAL_FORMS and (form := (forms or {}).get(primitive)) is not None:
+        return repeated(form, sum(_elements(aval) for aval in outputs))
     if primitive in _OPERATIONS:
         return _operated(primitive, inputs, outputs)
     if primitive in _REDUCTIONS:
