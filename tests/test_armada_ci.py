@@ -10,7 +10,6 @@ import subprocess
 import sys
 import threading
 import time
-import types
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from pathlib import Path
