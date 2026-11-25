@@ -1051,7 +1051,7 @@ def test_a_run_saved_before_its_retired_and_unsettable_fields_loads_as_it_traine
     assert earlier_run(opaque)["fields"]["payload"] == payload
     for record, additive in ((earlier, False), (today, True)):
         stated = {**record, "fields": {**record["fields"], "loop_message_additive": additive}}
-        loop = earlier_run(stated)["fields"]["loop"]
+        loop = earlier_run(stated)["fields"]["earlier_loop"]
         assert loop["fields"]["message_additive"] is additive, (record is today, additive)
 
 def test_a_run_saved_with_its_loops_choices_flat_loads_and_loops_as_it_did(tmp_path):
@@ -1073,7 +1073,7 @@ def test_a_run_saved_with_its_loops_choices_flat_loads_and_loops_as_it_did(tmp_p
     path.write_text(json.dumps({**today, "fields": {**today["fields"], "loop_steps": 2, "loop_layers": [1, 2],
                                                     "loop_exit_gate": True}}))
     loaded = LMRunConfig.load(str(path))
-    assert loaded.loop == LoopChange(layers=(1, 2), exit_gate=True) and loaded.passes == 2
+    assert loaded.earlier_loop == LoopChange(layers=(1, 2), exit_gate=True) and loaded.passes == 2
     assert loaded.exit_settings() == {"exit_entropy": EXIT_ENTROPY}
     looped = loaded.looped(Pretrained.load(QWEN, dtype="float32"))
     assert looped.model.language_model.loop == Loop(2, step_norm=False, layers=(1, 2), exit_gate=True)

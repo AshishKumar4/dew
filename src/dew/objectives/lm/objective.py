@@ -76,8 +76,8 @@ from dew.nn.continuum import feedforward_levels
 from dew.nn.cross_attention import crosses_alone
 from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops, parameter_flops
 from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, ModelInputs, pad_token_rows, rotate_rows
-from dew.nn.inspection import INSPECTED, QK, current_positions, watched_positions
-from dew.nn.mla import INDEXER, INDEXER_COLLECTION
+from dew.nn.inspection import INDEXER_COLLECTION, INSPECTED, QK, current_positions, watched_positions
+from dew.nn.mla import INDEXER
 from dew.nn.moe import ROUTER_COLLECTION
 from dew.nn.precision import at_least_fp32
 from dew.nn.progress import END, Progress, progressed

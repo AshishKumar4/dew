@@ -654,11 +654,12 @@ class RunConfig:
     it trains, which the resume must keep (`check_resume`), and so does `trainer.quantization`, which
     changes the forward pass the weights train through."""
 
-    EXECUTED: ClassVar[tuple[str, ...]] = ("remat",)
-    """The fields, by name, at any depth of a run's record, that say how a model's layers execute and not
-    what they compute or store: a looped block's passes recomputed in its backward or held (a run's
-    `Loop.remat`, `DecoderRunConfig.loop`), memory alone, compute the same step, so a run resumes under
-    either (`check_resume`). A model's own fields that
+    EXECUTED: ClassVar[tuple[tuple[str, ...], ...]] = (("loop", "fields", "remat"),
+                                                       ("earlier_loop", "fields", "remat"))
+    """The paths into a run's record of the fields that say how a model's layers execute and not what they
+    compute or store: a looped block's passes recomputed in its backward or held (the run's loop's
+    `Loop.remat`, `DecoderRunConfig.loop`, and a saved run's `LoopChange.remat`), memory alone, compute the
+    same step, so a run resumes under either (`check_resume`). A model's own fields that
     say how it runs, its recompute (`remat`) among them, are its class's to mark (`dew._records.RUNS`), which
     a resume reads by its class (`registry.computing_fields`). A source's
     weights packed or decoded (`SourceOptions.packed_weights`) are not: packed, its banks are no trainable
@@ -903,7 +904,7 @@ class RunConfig:
         if recorded is None:
             raise ValueError(f"the run to resume is no {type(self).__name__}; resume it as the run it "
                              "records, or train under another name")
-        before, now = (_records.without_fields(record, self.EXECUTED)
+        before, now = (self._computing(record)
                        for record in (recorded._fields_record(), self._fields_record()))
         # A field the saved run left to its build and its record holds unresolved, which no checkpoint
         # states either (`earlier_checkpointed`), is the one this build resolves (`BUILT`).
@@ -927,6 +928,11 @@ class RunConfig:
         if changed:
             raise ValueError(f"the run to resume trained other {', '.join(changed)}; resume it as it "
                              "recorded them, or train under another name")
+
+    def _computing(self, record: dict[str, JSON]) -> dict[str, JSON]:
+        """A run's fields' `record` as a resume compares it: without the fields that say how its layers
+        execute (`EXECUTED`)."""
+        return _records.without_paths(record, self.EXECUTED)
 
     def _saved_as(self, saved: Mapping[str, object]) -> Self | None:
         """The saved run whose record is `saved` read as this class reads it (`from_dict`), a field the
@@ -1703,16 +1709,18 @@ class DecoderRunConfig(RunConfig):
     (`CausalTransformer.loop`) and the pass counts its steps take, each the run's choice over the
     checkpoint's own. The language-model and the decision runs take it."""
 
-    loop: Annotated[Loop | LoopChange | None, tyro.conf.Suppress] = None
+    loop: Annotated[Loop | None, tyro.conf.Suppress] = None
     """The loop the decoder runs (`dew.nn.backbones.decoder_stack.Loop`: its block, passes, recompute, exits,
     θ and messages), in place of the checkpoint's own: a pretrained decoder with no loop gains it over its
     own layers, as Qwen 3.5's middle block repeated twice (`Loop(2, layers=(8, 16), step_norm=False)`),
     and a looped one's loop is replaced whole (`dataclasses.replace(its_loop, exit_gate=True)` changes
     one of its choices). A loop that gives its layers parameters of their own (an implicit loop's θ, an exit
     gate, the messages' merges) draws them at their zeros beside the loaded weights, so the decoder
-    starts as the one loaded computes (`Pretrained.with_model`). None keeps the checkpoint's own. A saved
-    run's record read from before a run stated its loop whole holds its changes to the checkpoint's
-    (`dew.config.earlier.LoopChange`, read only from a record, carried to 1.0)."""
+    starts as the one loaded computes (`Pretrained.with_model`). None keeps the checkpoint's own."""
+    earlier_loop: Annotated[LoopChange | None, tyro.conf.Suppress] = None
+    """A saved run's changes to its checkpoint's loop, a choice at a time, as a Dew before the run stated its
+    loop whole recorded them (`dew.config.earlier.LoopChange`), which its record alone holds
+    (`dew.config.earlier_run`); a run states its `loop`. Carried to 1.0 (ledger 1552)."""
     passes: Annotated[PassPolicy | None, tyro.conf.Suppress] = None
     """The passes the loop runs each step (`PassPolicy`): one count (an int); one count a phase of the
     run's data (a tuple, `dew.data.phases`, `Trainer`'s `phase_passes`), each phase's step compiled with its
@@ -1723,6 +1731,9 @@ class DecoderRunConfig(RunConfig):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        if self.loop is not None and self.earlier_loop is not None:
+            raise ValueError("a run states its loop whole (loop), or a saved run's record its changes to its "
+                             "checkpoint's (earlier_loop), not both")
         if isinstance(self.passes, tuple) and self.data is not None:
             # Refused before anything loads: a count a phase the data reads in.
             phases = self.data.phase_count
@@ -1750,7 +1761,7 @@ class DecoderRunConfig(RunConfig):
     @property
     def loops(self) -> bool:
         """Whether the run asks anything of a loop (`looped`)."""
-        return self.loop is not None or self.passes is not None
+        return self.loop is not None or self.earlier_loop is not None or self.passes is not None
 
     def exit_settings(self) -> dict[str, float]:
         """The exit objective's weight an objective that trains a gate the run's loop draws (`Loop.exit_gate`)
@@ -1759,7 +1770,8 @@ class DecoderRunConfig(RunConfig):
         (a hazard of one half every pass), trained by nothing. None where the run states no gated loop."""
         from dew.nn.backbones.looping import EXIT_ENTROPY
 
-        if self.loop is None or not self.loop.exit_gate:
+        held = self.loop if self.loop is not None else self.earlier_loop
+        if held is None or not held.exit_gate:
             return {}
         stated = {} if self.objective is None else self.objective.fields
         if "exit_entropy" not in stated:
@@ -1770,6 +1782,17 @@ class DecoderRunConfig(RunConfig):
                              f"{EXIT_ENTROPY}")
         return {}
 
+    def _computing(self, record: dict[str, JSON]) -> dict[str, JSON]:
+        """`RunConfig._computing`, and a saved run's change to its checkpoint's loop that changed how it
+        executes alone (`LoopChange.remat`) read as no change: a run resumed stating none resumes it."""
+        held = super()._computing(record)
+        with registry.recording():
+            idle = to_record(LoopChange(), declared_type(type(self), "earlier_loop"))
+        if held.get("earlier_loop") == _records.without_paths({"earlier_loop": idle},
+                                                                self.EXECUTED)["earlier_loop"]:
+            held = {**held, "earlier_loop": None}
+        return held
+
     def looped(self, start: "Pretrained") -> "Pretrained":
         """`start` with its block run as the run asks: under the run's loop (`loop`), at the run's pass
         count (`handed_passes`), each over the checkpoint's own where the run states none; as loaded where
@@ -1779,9 +1802,9 @@ class DecoderRunConfig(RunConfig):
             return start
         from dew.nn.protocols import Looped, Looping
 
-        if isinstance(self.loop, LoopChange):
+        if self.earlier_loop is not None:
             # A saved run's loop changed a choice at a time, as an earlier Dew recorded it (`earlier_run`).
-            return self.loop.applied(start, self.passes, self.trainer.key)
+            return self.earlier_loop.applied(start, self.passes, self.trainer.key)
         model = start.model
         if not isinstance(model, Looping):
             raise ValueError(f"this {type(model).__name__} runs no loop: a run's loop or passes need a "

@@ -24,7 +24,7 @@ import re
 import typing
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from numbers import Real
-from typing import TYPE_CHECKING, overload
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -537,18 +537,20 @@ def earlier_described_fields(value: JSON) -> JSON:
     return planned(value)
 
 
-@overload
-def without_fields(value: dict[str, JSON], names: Collection[str]) -> dict[str, JSON]: ...
-@overload
-def without_fields(value: JSON, names: Collection[str]) -> JSON: ...
-def without_fields(value: JSON, names: Collection[str]) -> JSON:
-    """`value` without a field of `names` in any record it nests, a list's records among them; a record
-    stays the record it is."""
-    if isinstance(value, list):
-        return [without_fields(part, names) for part in value]
-    if isinstance(value, dict):
-        return {key: without_fields(part, names) for key, part in value.items() if key not in names}
-    return value
+def without_paths(record: dict[str, JSON], paths: Collection[tuple[str, ...]]) -> dict[str, JSON]:
+    """`record` without the value at each of `paths` (keys into the records it nests) that it holds, every
+    other value as it is: a field of a field's record (`RunConfig.EXECUTED`, a loop's `remat`), not every
+    key of its name at any depth, which a model's own records may hold saying what it computes."""
+    def without(value: JSON, path: tuple[str, ...]) -> JSON:
+        if not isinstance(value, dict) or path[0] not in value:
+            return value
+        if len(path) == 1:
+            return {key: part for key, part in value.items() if key != path[0]}
+        return {**value, path[0]: without(value[path[0]], path[1:])}
+
+    for path in paths:
+        record = without(record, path)
+    return record
 
 
 def annotations_of(owner: type, **options) -> Mapping[str, object]:

@@ -411,7 +411,8 @@ dew.config.DecoderRunConfig
   val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
   suites: Annotated[collections.abc.Mapping[str, dew.config.Suite], PrimitiveConstructorSpec] = builtins.dict()
   val_summaries: Annotated[tuple[dew.scores.Summary, ...], PrimitiveConstructorSpec] = ()
-  loop: Annotated[dew.nn.backbones.decoder_stack.Loop | dew.config.earlier.LoopChange | None, Suppress] = None
+  loop: Annotated[dew.nn.backbones.decoder_stack.Loop | None, Suppress] = None
+  earlier_loop: Annotated[dew.config.earlier.LoopChange | None, Suppress] = None
   passes: Annotated[PassPolicy | None, Suppress] = None
 dew.config.MetricConfig
   name: str
@@ -563,7 +564,8 @@ dew.config.lm.LMRunConfig
   val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
   suites: Annotated[collections.abc.Mapping[str, dew.config.Suite], PrimitiveConstructorSpec] = builtins.dict()
   val_summaries: Annotated[tuple[dew.scores.Summary, ...], PrimitiveConstructorSpec] = ()
-  loop: Annotated[dew.nn.backbones.decoder_stack.Loop | dew.config.earlier.LoopChange | None, Suppress] = None
+  loop: Annotated[dew.nn.backbones.decoder_stack.Loop | None, Suppress] = None
+  earlier_loop: Annotated[dew.config.earlier.LoopChange | None, Suppress] = None
   passes: Annotated[PassPolicy | None, Suppress] = None
   tokenizer: str = 'byte'
   prompt: str = ''
@@ -679,7 +681,8 @@ dew.decision.config.DecisionRunConfig
   val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
   suites: Annotated[collections.abc.Mapping[str, dew.config.Suite], PrimitiveConstructorSpec] = builtins.dict()
   val_summaries: Annotated[tuple[dew.scores.Summary, ...], PrimitiveConstructorSpec] = ()
-  loop: Annotated[dew.nn.backbones.decoder_stack.Loop | dew.config.earlier.LoopChange | None, Suppress] = None
+  loop: Annotated[dew.nn.backbones.decoder_stack.Loop | None, Suppress] = None
+  earlier_loop: Annotated[dew.config.earlier.LoopChange | None, Suppress] = None
   passes: Annotated[PassPolicy | None, Suppress] = None
   pretrained: str = 'convaiinnovations/laya'
   subfolder: str | None = None
