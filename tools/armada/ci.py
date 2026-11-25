@@ -1509,7 +1509,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
             # one of its processes, whatever a later collection found (a test a later import no longer
             # defines, or one a later collection dropped unreported, never ran).
             file = grading.owning(name)
-            chosen = {node for node in (read_json(selected) or []) if grading.owning(node) == file}
+            chosen = {node for node in (read_json(selected) or {}).get("selected", [])
+                      if grading.owning(node) == file}
             reported_all = {grading.node_of(case) for case in [*earlier, *own] if grading.of(case, name)}
             if not chosen or (never_ran := sorted(chosen - reported_all)):
                 red.append("its processes, run past a recycle, reported not every test its first selected: "

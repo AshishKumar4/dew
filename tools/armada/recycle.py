@@ -39,7 +39,7 @@ def pytest_sessionstart(session) -> None:
 def pytest_collection_finish(session) -> None:
     """The first process of a row writes what its session selected (`SELECTED`); a later one, nothing."""
     if (selected := os.environ.get(SELECTED)) and not Path(selected).exists():
-        Path(selected).write_text(json.dumps([item.nodeid for item in session.items]))
+        Path(selected).write_text(json.dumps({"selected": [item.nodeid for item in session.items]}))
 
 
 def pytest_runtest_logfinish(nodeid: str, location) -> None:
