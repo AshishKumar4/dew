@@ -1104,8 +1104,9 @@ def _bounded_box(x, limit: float = 1.0):
 
 def _gdn_scan_natural(state, q, k, v, g, beta):
     """Plain-JAX `jax.lax.scan` gated delta rule written with natural `[K, V]` outer product, flipped
-    `state * (k * decay)` order, L2-normalized Q/K, sigmoid `beta`, bounded state/V, and `minimum(g, 0.0)`."""
-    s_in, v_in = _bounded_box(state, 0.125), _bounded_box(v)
+    `state * (k * decay)` order, L2-normalized Q/K, sigmoid `beta`, bf16-lossless bounded state, bounded V,
+    and `minimum(g, 0.0)`."""
+    s_in, v_in = _bounded_box(state, 0.125).astype(q.dtype).astype(jnp.float32), _bounded_box(v)
     q_n, k_n, neg_g, b_n = _l2norm(q), _l2norm(k), jnp.minimum(g, 0.0), jax.nn.sigmoid(beta)
 
     def step(s, xs):
@@ -1119,10 +1120,10 @@ def _gdn_scan_natural(state, q, k, v, g, beta):
 
 def _gdn_scan_grouped_scaled(state, g, v, q, beta, k):
     """Plain-JAX `jax.lax.scan` gated delta rule with permuted operand order, grouped key/value heads
-    (`Hv = 2 * Hk`), explicit query scaling `Dk ** -0.5`, L2-normalized Q/K, sigmoid `beta`, bounded state/V,
-    and `-jax.nn.softplus(g)` nonpositive decay."""
+    (`Hv = 2 * Hk`), explicit query scaling `Dk ** -0.5`, L2-normalized Q/K, sigmoid `beta`, bf16-lossless
+    bounded state, bounded V, and `-jax.nn.softplus(g)` nonpositive decay."""
     scale = 64.0 ** -0.5
-    s_in, v_in = _bounded_box(state, 0.125), _bounded_box(v)
+    s_in, v_in = _bounded_box(state, 0.125).astype(q.dtype).astype(jnp.float32), _bounded_box(v)
     q_n, k_n, neg_g, b_n = _l2norm(q), _l2norm(k), -jax.nn.softplus(g), jax.nn.sigmoid(beta)
 
     def step(s, xs):
@@ -1191,7 +1192,7 @@ def test_a_plain_gated_delta_net_scan_runs_dews_recurrence_kernel_through_dew_ji
         fn, shapes = _gdn_scan_grouped_scaled, (state_s, g_s, v_s, q_s, b_s, k_s)
 
     def own(state, q, k, v, g, beta):
-        s_in, v_in = _bounded_box(state, 0.125), _bounded_box(v)
+        s_in, v_in = _bounded_box(state, 0.125).astype(q.dtype).astype(jnp.float32), _bounded_box(v)
         q_n, k_n, b_n = _l2norm(q), _l2norm(k), jax.nn.sigmoid(beta)
         neg_g = jnp.minimum(g, 0.0) if case == "natural" else -jax.nn.softplus(g)
         out, final = recurrence_chunk.chunk(
@@ -1209,7 +1210,7 @@ def test_a_plain_gated_delta_net_scan_runs_dews_recurrence_kernel_through_dew_ji
 
     def draw(seed: int):
         rng = np.random.default_rng(101 + seed)
-        state = jnp.asarray(rng.standard_normal((batch, hv, dk, dv)).astype(np.float32) * 0.02)
+        state = jnp.asarray(rng.standard_normal((batch, hv, dk, dv)) * 0.02, jnp.bfloat16).astype(jnp.float32)
         q = jnp.asarray(rng.standard_normal((seq, batch, hk, dk)), jnp.bfloat16)
         k = jnp.asarray(rng.standard_normal((seq, batch, hk, dk)), jnp.bfloat16)
         v = jnp.asarray(rng.standard_normal((seq, batch, hv, dv)) * 0.2, jnp.bfloat16)
@@ -1250,7 +1251,8 @@ def test_recognized_recurrence_preserves_neginf_hard_reset():
 
     def draw(seed: int):
         rng = np.random.default_rng(707 + seed)
-        state = jnp.asarray(rng.standard_normal((batch, hv, dk, dv)).astype(np.float32) * 0.0002)
+        state = jnp.asarray(
+            rng.standard_normal((batch, hv, dk, dv)) * 0.0002, jnp.bfloat16).astype(jnp.float32)
         q = jnp.asarray(rng.standard_normal((seq, batch, hv, dk)), jnp.bfloat16)
         k = jnp.asarray(rng.standard_normal((seq, batch, hv, dk)), jnp.bfloat16)
         v = jnp.asarray(rng.standard_normal((seq, batch, hv, dv)) * 0.002, jnp.bfloat16)
@@ -1301,7 +1303,9 @@ def _gdn_make_scan(step_fn, *, clamp_g: bool = True, reverse: bool = False,
                    bound_inputs: bool = True, bound_state_v: bool = True, mixed_concat_g: bool = False):
     """Helper scan wrapper configuring decay/range/reverse variations for recurrence tests."""
     def run(state, q, k, v, g, beta):
-        s_in, v_in = (_bounded_box(state, 0.125), _bounded_box(v)) if bound_state_v else (state, v)
+        s_in, v_in = (
+            (_bounded_box(state, 0.125).astype(q.dtype).astype(jnp.float32), _bounded_box(v))
+            if bound_state_v else (state, v))
         q_in, k_in, b_in = (
             (_l2norm(q), _l2norm(k), jax.nn.sigmoid(beta)) if bound_inputs else (q, k, beta))
         if mixed_concat_g:
@@ -1416,40 +1420,54 @@ def test_recurrence_recognition_guards_range_tracers_tokens_and_training_vjp():
     tok_ys = dew.jit(token_scan)(*xs_tok)
     np.testing.assert_array_equal(np.asarray(tok_ys), np.full((4, 2), 3.0, np.float32))
 
-    # 4. Forward-only forced Mosaic fp32 per-key delta scan (rejected in accurate training) stays as scan so
-    # VJP traces cleanly without `KernelRefused`.
-    def fp32_per_key_scan(state, q, k, v, g, beta):
+    # 4a. Under `Numerics(forms="accurate")`, an otherwise-eligible bf16 GDN scan stays as a plain scan.
+    with generation.assumed("sm90"), generation.run_precision(Numerics(forms="accurate")):
+        assert not _routes("gated_delta_rule", lambda: dew.jit(_gdn_scan_natural).trace(*std_shapes))
+
+    # 4b. Under default numerics, bf16 per-key GLA (delta=False, write_gate=True) takes `mosaic_gpu` in
+    # forward (`inter_dtype=fp32`) but raises `KernelRefused` in training VJP (`fast_backward_form` rejects
+    # per-key without delta): verify forward eligibility + direct VJP refusal, then confirm `dew.jit` leaves
+    # the scan intact so `jax.vjp` traces cleanly without hitting the accurate-mode skip.
+    from dew.nn.kernels import recurrence, recurrence_chunk
+    from dew.nn.kernels.selection import KernelRefused
+
+    def bf16_per_key_gla_scan(state, q, k, v, g, beta):
         s_in, v_in = _bounded_box(state, 0.125), _bounded_box(v)
         q_n, k_n, neg_g, b_n = _l2norm(q), _l2norm(k), jnp.minimum(g, 0.0), jax.nn.sigmoid(beta)
 
         def step(s, xs):
             qt, kt, vt, gt, bt = xs
+            qf, kf, vf, bf = (x.astype(jnp.float32) for x in (qt, kt, vt, bt))
             decay = jnp.exp(gt)
-            write = bt[..., None]
-            scaled_k = (kt * decay)[..., :, None]
-            corrected = vt - jnp.sum(scaled_k * s, axis=-2)
-            outer = (kt * write)[..., :, None] * corrected[..., None, :]
-            out = (jnp.sum((qt * decay)[..., :, None] * s, axis=-2)
-                   + jnp.sum(qt[..., :, None] * outer, axis=-2))
-            return s * decay[..., :, None] + outer, out
+            outer = (kf * bf[..., None])[..., :, None] * vf[..., None, :]
+            out = (jnp.sum((qf * decay)[..., :, None] * s, axis=-2)
+                   + jnp.sum(qf[..., :, None] * outer, axis=-2))
+            return s * decay[..., :, None] + outer, out.astype(vt.dtype)
 
         return jax.lax.scan(step, s_in, (q_n, k_n, v_in, neg_g, b_n))
 
-    f32_shapes = (
-        jax.ShapeDtypeStruct((batch, hv, dk, dv), jnp.float32),
-        jax.ShapeDtypeStruct((seq, batch, hv, dk), jnp.float32),
-        jax.ShapeDtypeStruct((seq, batch, hv, dk), jnp.float32),
-        jax.ShapeDtypeStruct((seq, batch, hv, dv), jnp.float32),
-        jax.ShapeDtypeStruct((seq, batch, hv, dk), jnp.float32),
-        jax.ShapeDtypeStruct((seq, batch, hv), jnp.float32),
-    )
-    with (generation.assumed("sm90"), generation.run_precision(Numerics(forms="accurate")),
-          generation.chosen(gated_delta_rule="mosaic_gpu")):
-        assert not _routes("gated_delta_rule", lambda: dew.jit(fp32_per_key_scan).trace(*f32_shapes))
+    gla_hooks = recurrence.Hooks(decay="vector", delta=False, write_gate=True)
+
+    def direct_gla(state, q, k, v, g, beta):
+        out, final = recurrence_chunk.chunk(
+            gla_hooks, recurrence_chunk.Chunk(
+                state=state, query=jnp.swapaxes(q, 0, 1), key=jnp.swapaxes(k, 0, 1),
+                value=jnp.swapaxes(v, 0, 1), log_decay=jnp.swapaxes(g, 0, 1),
+                beta=jnp.swapaxes(beta, 0, 1)), dtype=jnp.bfloat16)
+        return final, jnp.swapaxes(out, 0, 1)
+
+    gla_shapes = (*std_shapes[:4], jax.ShapeDtypeStruct((seq, batch, hv, dk), jnp.float32), std_shapes[5])
+    with generation.assumed("sm90"), generation.chosen(gated_delta_rule="mosaic_gpu"):
+        assert set(_routes("gated_delta_rule", lambda: jax.eval_shape(direct_gla, *gla_shapes))) == {
+            "mosaic_gpu"}
+        with pytest.raises(KernelRefused):
+            jax.eval_shape(
+                lambda *a: (lambda p, pull: (p, pull(p)))(*jax.vjp(direct_gla, *a)), *gla_shapes)
+        assert not _routes("gated_delta_rule", lambda: dew.jit(bf16_per_key_gla_scan).trace(*gla_shapes))
         vjp_out, vjp_grads = jax.eval_shape(
-            lambda *a: (lambda p, pull: (p, pull(p)))(*jax.vjp(dew.jit(fp32_per_key_scan), *a)),
-            *f32_shapes)
-        assert vjp_out[1].shape == (seq, batch, hv, dv) and len(vjp_grads) == len(f32_shapes)
+            lambda *a: (lambda p, pull: (p, pull(p)))(*jax.vjp(dew.jit(bf16_per_key_gla_scan), *a)),
+            *gla_shapes)
+        assert vjp_out[1].shape == (seq, batch, hv, dv) and len(vjp_grads) == len(gla_shapes)
 
 
 def test_recurrence_recognition_candidate_cache_wy_state_bounds_literal_guard_and_f64_scale():
@@ -1478,11 +1496,13 @@ def test_recurrence_recognition_candidate_cache_wy_state_bounds_literal_guard_an
         return next_s, out.astype(vt.dtype)
 
     def scan_both_unit(state, q, v, k, g, beta):
-        return jax.lax.scan(step_qvk, _bounded_box(state, 0.125),
+        s_in = _bounded_box(state, 0.125).astype(q.dtype).astype(jnp.float32)
+        return jax.lax.scan(step_qvk, s_in,
                             (_l2norm(q), _l2norm(v), _l2norm(k), jnp.minimum(g, 0.0), jax.nn.sigmoid(beta)))
 
     def scan_only_k_unit(state, q, v, k, g, beta):
-        return jax.lax.scan(step_qvk, _bounded_box(state, 0.125),
+        s_in = _bounded_box(state, 0.125).astype(q.dtype).astype(jnp.float32)
+        return jax.lax.scan(step_qvk, s_in,
                             (_l2norm(q), _bounded_box(v), _l2norm(k), jnp.minimum(g, 0.0),
                              jax.nn.sigmoid(beta)))
     with generation.assumed("sm90"):
@@ -1492,7 +1512,8 @@ def test_recurrence_recognition_candidate_cache_wy_state_bounds_literal_guard_an
     # 2. Non-contractive `256*tanh(k)` WY solve and unconstrained fp32 entering state stay as token scans.
     def scan_big_tanh_k(state, q, k, v, g, beta):
         k_big = jnp.asarray(256.0, k.dtype) * jnp.tanh(k)
-        return jax.lax.scan(_gdn_make_step(batch, hv), _bounded_box(state, 0.125),
+        s_in = _bounded_box(state, 0.125).astype(q.dtype).astype(jnp.float32)
+        return jax.lax.scan(_gdn_make_step(batch, hv), s_in,
                             (_l2norm(q), k_big, _bounded_box(v), jnp.minimum(g, 0.0), jax.nn.sigmoid(beta)))
     unbounded_state_scan = _gdn_make_scan(_gdn_make_step(batch, hv), bound_state_v=False)
     qkv_shapes = (std_shapes[0], std_shapes[1], std_shapes[3], std_shapes[2], std_shapes[4], std_shapes[5])
@@ -1516,7 +1537,8 @@ def test_recurrence_recognition_candidate_cache_wy_state_bounds_literal_guard_an
     def scan_literal_nan_guard(state, q, k, v, g, beta):
         diff = jax.lax.sub(g, np.float32(1.0))
         neg_g = jax.lax.select(diff != diff, jax.lax.add(g, np.float32(1.0)), jnp.minimum(g, 0.0))
-        return jax.lax.scan(_gdn_make_step(batch, hv), _bounded_box(state, 0.125),
+        s_in = _bounded_box(state, 0.125).astype(q.dtype).astype(jnp.float32)
+        return jax.lax.scan(_gdn_make_step(batch, hv), s_in,
                             (_l2norm(q), _l2norm(k), _bounded_box(v), neg_g, jax.nn.sigmoid(beta)))
     with generation.assumed("sm90"):
         assert _routes("gated_delta_rule", lambda: dew.jit(scan_literal_nan_guard).trace(*qkv_shapes))
@@ -1568,7 +1590,8 @@ def test_recurrence_recognition_guards_fla_zero_gate_gram_overflow_score_underfl
         inv = jax.lax.rsqrt(jnp.sum(k1.astype(jnp.float32) ** 2, axis=-1, keepdims=True) + 1e-6)
         inv_exp = jnp.broadcast_to(inv.astype(k.dtype), k.shape)
         k_exp = k1 * inv_exp
-        return jax.lax.scan(step, _bounded_box(state, 0.125),
+        s_in = _bounded_box(state, 0.125).astype(q.dtype).astype(jnp.float32)
+        return jax.lax.scan(step, s_in,
                             (_l2norm(q), k_exp, _bounded_box(v), jnp.minimum(g, 0.0), jax.nn.sigmoid(beta)))
 
     # 3. Finite tiny Q=K=2^-68 * tanh(x) with V=2^44: token scan returns normal 2^-92, FLA flushes Q·K to 0.
@@ -1583,7 +1606,7 @@ def test_recurrence_recognition_guards_fla_zero_gate_gram_overflow_score_underfl
 
     # 4. Large entering state `h_0 = [0, 2^50]` with unit K and tiny Q: `-K^T h_0` lifts flushed score.
     def scan_large_state_tiny_q(state, q, k, v, g, beta):
-        s_big = _bounded_box(state, float(2 ** 50))
+        s_big = _bounded_box(state, float(2 ** 50)).astype(q.dtype).astype(jnp.float32)
         q_t = jnp.tanh(q) * jnp.asarray(2.0 ** -105, jnp.bfloat16)
         return jax.lax.scan(step, s_big, (q_t, _l2norm(k), jnp.zeros_like(v), jnp.minimum(g, 0.0),
                                           jax.nn.sigmoid(beta)))
@@ -1609,3 +1632,59 @@ def test_recurrence_recognition_guards_fla_zero_gate_gram_overflow_score_underfl
         np.testing.assert_array_equal(np.asarray(got_fin3), np.asarray(ref_fin3))
         np.testing.assert_array_equal(np.asarray(got_out3, np.float32), np.asarray(ref_out3, np.float32))
         assert float(np.asarray(got_out3, np.float32)[0, 0, 0, 0]) == float(jnp.bfloat16(2.0 ** -92))
+
+
+def test_recurrence_recognition_preserves_fp32_entering_state_cancellation():
+    """`RECURRENCES` preserves token scans when the selected route (`fla`/`mosaic_gpu`) narrows a live fp32
+    entering state to bf16 before the readout dot, isolating region cache keys by entering-state source dtype
+    and preserving exact `-2^-19` cancellation where forced FLA flushes to zero."""
+    import dew
+    from dew.nn.kernels import recurrence, recurrence_chunk
+
+    seq, batch, hv, dk, dv = 64, 1, 2, 64, 64
+    qkv_shapes = (
+        jax.ShapeDtypeStruct((batch, hv, dk, dv), jnp.float32),
+        jax.ShapeDtypeStruct((seq, batch, hv, dk), jnp.bfloat16),
+        jax.ShapeDtypeStruct((seq, batch, hv, dk), jnp.bfloat16),
+        jax.ShapeDtypeStruct((seq, batch, hv, dv), jnp.bfloat16),
+        jax.ShapeDtypeStruct((seq, batch, hv), jnp.float32),
+        jax.ShapeDtypeStruct((seq, batch, hv), jnp.bfloat16),
+    )
+    step = _gdn_make_step(batch, hv)
+
+    def scan_bf16_state_warm(state, q, k, v, g, beta):
+        s_in = _bounded_box(state, 0.125).astype(q.dtype).astype(jnp.float32)
+        return jax.lax.scan(step, s_in, (_bounded_box(q, 0.125), _bounded_box(k, 0.125), _bounded_box(v),
+                                         jnp.minimum(g, 0.0), jax.nn.sigmoid(beta)))
+
+    def scan_fp32_state_cancel(state, q, k, v, g, beta):
+        return jax.lax.scan(step, _bounded_box(state, 0.125),
+                            (_bounded_box(q, 0.125), _bounded_box(k, 0.125), _bounded_box(v),
+                             jnp.minimum(g, 0.0), jax.nn.sigmoid(beta)))
+
+    with generation.assumed("sm90"), generation.chosen(gated_delta_rule="fla"):
+        assert _routes("gated_delta_rule", lambda: dew.jit(scan_bf16_state_warm).trace(*qkv_shapes))
+        assert not _routes("gated_delta_rule", lambda: dew.jit(scan_fp32_state_cancel).trace(*qkv_shapes))
+    with generation.assumed("sm90"):
+        assert not _routes("gated_delta_rule", lambda: dew.jit(scan_fp32_state_cancel).trace(*qkv_shapes))
+
+    s_cancel = jnp.zeros((batch, hv, dk, dv), jnp.float32).at[:, :, 0, 0].set(np.float32(0.0625)).at[
+        :, :, 1, 0].set(np.float32(-(0.0625 + 2.0 ** -16)))
+    q_cancel = jnp.zeros((seq, batch, hv, dk), jnp.bfloat16).at[0, :, :, :2].set(jnp.bfloat16(0.125))
+    z_k = jnp.zeros((seq, batch, hv, dk), jnp.bfloat16)
+    z_v = jnp.zeros((seq, batch, hv, dv), jnp.bfloat16)
+    z_g = jnp.zeros((seq, batch, hv), jnp.float32)
+    z_b = jnp.zeros((seq, batch, hv), jnp.bfloat16)
+    with generation.chosen(gated_delta_rule="fla"):
+        fla_out, _ = recurrence_chunk.chunk(
+            recurrence.Hooks(decay="scalar", delta=True),
+            recurrence_chunk.Chunk(
+                state=s_cancel, query=jnp.swapaxes(q_cancel, 0, 1), key=jnp.swapaxes(z_k, 0, 1),
+                value=jnp.swapaxes(z_v, 0, 1), log_decay=jnp.swapaxes(z_g, 0, 1),
+                beta=jnp.swapaxes(jax.nn.sigmoid(z_b), 0, 1)), dtype=jnp.bfloat16)
+        assert float(np.asarray(fla_out, np.float32)[0, 0, 0, 0]) == 0.0
+        ref_fin, ref_out = jax.jit(scan_fp32_state_cancel)(s_cancel, q_cancel, z_k, z_v, z_g, z_b)
+        got_fin, got_out = dew.jit(scan_fp32_state_cancel)(s_cancel, q_cancel, z_k, z_v, z_g, z_b)
+        np.testing.assert_array_equal(np.asarray(got_fin), np.asarray(ref_fin))
+        np.testing.assert_array_equal(np.asarray(got_out, np.float32), np.asarray(ref_out, np.float32))
+        assert float(np.asarray(got_out, np.float32)[0, 0, 0, 0]) == float(jnp.bfloat16(-(2.0 ** -19)))

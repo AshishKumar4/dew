@@ -712,25 +712,23 @@ def _body_key_of(jaxpr: jcore.Jaxpr) -> _SubKey | None:
 
 def _dataclass_param_key(value, kind: type, *, reject_device: bool) -> Hashable:
     """In-process structural key for a dataclass instance preserving exact class identity, identity-equality
-    (`eq=False` / `object.__eq__`), and non-field attributes while guarding nested `jax.Array` fields."""
-    fields = dataclasses.fields(value)
-    field_names = {field.name for field in fields}
-    inst_dict = value.__dict__ if any("__dict__" in cls.__dict__ for cls in kind.__mro__) else None
-    extra_dict = inst_dict is not None and not set(inst_dict).issubset(field_names)
-    extra_slots = any(
-        not set((slots,) if isinstance(slots, str) else slots).issubset(
-            field_names | {"__dict__", "__weakref__"})
-        for cls in kind.__mro__ if (slots := cls.__dict__.get("__slots__")) is not None)
-    if extra_dict or extra_slots:
+    (`eq=False` / `object.__eq__`), and non-field attributes while declining opaque objects in body keys."""
+    if kind.__eq__ is object.__eq__:
         if reject_device:
             raise _Unshareable
         return "object", _named(kind), _Identity(value)
-    field_keys = tuple(
-        (field.name, _in_process_param_key(getattr(value, field.name), reject_device=reject_device))
-        for field in fields)
-    if kind.__eq__ is object.__eq__:
+    fields = dataclasses.fields(value)
+    names = {field.name for field in fields}
+    inst = value.__dict__ if any("__dict__" in cls.__dict__ for cls in kind.__mro__) else None
+    extra_slots = any(
+        not set((s,) if isinstance(s, str) else s).issubset(names | {"__dict__", "__weakref__"})
+        for cls in kind.__mro__ if (s := cls.__dict__.get("__slots__")) is not None)
+    if (inst is not None and not set(inst).issubset(names)) or extra_slots:
+        if reject_device:
+            raise _Unshareable
         return "object", _named(kind), _Identity(value)
-    return "record", ("object", "class", kind), field_keys
+    return "record", ("object", "class", kind), tuple(
+        (f.name, _in_process_param_key(getattr(value, f.name), reject_device=reject_device)) for f in fields)
 
 
 def _in_process_param_key(value, *, reject_device: bool) -> Hashable:
@@ -741,9 +739,6 @@ def _in_process_param_key(value, *, reject_device: bool) -> Hashable:
         return kind.__name__, value
     if kind is float:
         return "float", value.hex()
-    if kind in (tuple, list):
-        return "sequence", f"builtins.{kind.__name__}", tuple(
-            _in_process_param_key(part, reject_device=reject_device) for part in value)
     if isinstance(value, ShapedArray):
         return _abstract_key(value), _extended_dtype(value.dtype)
     if isinstance(value, jcore.Jaxpr):
@@ -777,6 +772,8 @@ def _in_process_param_key(value, *, reject_device: bool) -> Hashable:
                                          _in_process_param_key(v, reject_device=reject_device))
                                         for k, v in value.items()), key=repr))
     if callable(value) and not isinstance(value, (type, np.dtype)):
+        if reject_device:
+            raise _Unshareable
         if kind.__eq__ is object.__eq__:
             return "object", _named(kind), _Identity(value)
         try:

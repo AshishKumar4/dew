@@ -1185,6 +1185,57 @@ _QUERY_PASSTHROUGH = frozenset({
     jax.lax.transpose_p, jax.lax.squeeze_p, jax.lax.slice_p, jax.lax.concatenate_p,
 })
 
+_STATE_PASSTHROUGH = frozenset({
+    jax.lax.broadcast_in_dim_p, jax.lax.reshape_p, jax.lax.transpose_p,
+    jax.lax.squeeze_p, jax.lax.slice_p, jax.lax.dynamic_slice_p, jax.lax.stop_gradient_p,
+})
+
+
+def _dtype_lossless_in(src_dtype, dst_dtype) -> bool:
+    """Whether every finite value (normal or subnormal) of floating `src_dtype` is exact in `dst_dtype`."""
+    src_dt, dst_dt = jnp.dtype(src_dtype), jnp.dtype(dst_dtype)
+    if src_dt == dst_dt:
+        return True
+    if not (jnp.issubdtype(src_dt, jnp.floating) and jnp.issubdtype(dst_dt, jnp.floating)):
+        return False
+    src, dst = jnp.finfo(src_dt), jnp.finfo(dst_dt)
+    return (int(src.nmant) <= int(dst.nmant)
+            and int(src.minexp) >= int(dst.minexp)
+            and int(src.minexp) - int(src.nmant) >= int(dst.minexp) - int(dst.nmant)
+            and int(src.maxexp) <= int(dst.maxexp)
+            and float(src.min) >= float(dst.min)
+            and float(src.max) <= float(dst.max))
+
+
+def _state_source_dtype(index: fusion.Index, var: jcore.Var):
+    """Narrowest floating source dtype losslessly widened into `var` through pure view/copy ops."""
+    current = aval(var).dtype
+    cur: jcore.Var = var
+    seen: set[jcore.Var] = set()
+    while cur not in seen:
+        seen.add(cur)
+        place = index.producer.get(cur)
+        if place is None:
+            break
+        eq_ = index.jaxpr.eqns[place]
+        if not eq_.invars:
+            break
+        src = eq_.invars[0]
+        if not isinstance(src.aval, ShapedArray):
+            break
+        if eq_.primitive in _STATE_PASSTHROUGH:
+            if not isinstance(src, jcore.Var):
+                break
+            cur = src
+        elif eq_.primitive is jax.lax.convert_element_type_p and _dtype_lossless_in(src.aval.dtype, current):
+            current = src.aval.dtype
+            if not isinstance(src, jcore.Var):
+                break
+            cur = src
+        else:
+            break
+    return current
+
 
 def _nonpositive_decay(bound: terms.Magnitude | None, proved: terms.Apart) -> bool:
     """Whether a decay operand is statically proven nonpositive (`<= 0`, no NaN)."""
@@ -1196,17 +1247,23 @@ _RECURRENCE_ROUTES: collections.OrderedDict[Hashable, Held[tuple[bool, frozenset
 """Selected forward or training recurrence kernels by `(kind, operand shapes/dtypes, options, context)`."""
 
 
-def _recurrence_inter_dtype(kernel: str, hooks, common):
-    """Intermediate storage dtype (`scores`, entered state, `corrected`) for selected recurrence `kernel`,
-    or None for any unrecognized kernel (which keeps the plain scan intact)."""
+def _recurrence_inter_precision(kernel: str, hooks, common):
+    """`(inter_dtype, inter_nmant)` for selected recurrence `kernel` (`scores`, entered state, `corrected`),
+    or None for any unrecognized kernel (which keeps the plain scan intact). Accounts for TF32/2-part fp32
+    rounding so an IEEE fp32 scan is never narrowed."""
     from dew.nn.kernels import recurrence_chunk
 
+    common_dt = jnp.dtype(common)
     if kernel == "fla":
-        return common
+        return common_dt, (10 if common_dt == jnp.float32 else int(jnp.finfo(common_dt).nmant))
     if kernel == "mosaic_gpu":
         rounded = recurrence_chunk.chunk_rounding(
-            hooks.delta, common, released=recurrence_chunk.simple_gla(hooks))
-        return common if (hooks.delta or rounded) else jnp.float32
+            hooks.delta, common_dt, released=recurrence_chunk.simple_gla(hooks))
+        if common_dt == jnp.float32:
+            return common_dt, (10 if rounded else 23)
+        if hooks.delta or rounded:
+            return common_dt, int(jnp.finfo(common_dt).nmant)
+        return jnp.dtype(jnp.float32), 23
     return None
 
 
@@ -1223,19 +1280,23 @@ def _recurrence_bounded(
     k_bound: terms.Magnitude | None, k_apart: terms.Apart,
     v_bound: terms.Magnitude | None, v_apart: terms.Apart,
     beta_bound: terms.Magnitude | None, beta_apart: terms.Apart, *,
-    seq_len: int, key_width: int, inter_dtype, out_dtype, scale: float | None, delta: bool, has_beta: bool,
+    seq_len: int, key_width: int, inter_dtype, inter_nmant: int, state_source_dtype, out_dtype,
+    scale: float | None, delta: bool, has_beta: bool,
 ) -> bool:
-    """Whether the selected chunked kernel's `inter_dtype` (`_recurrence_inter_dtype`) preserves both
-    upper-range finiteness (ungated `K @ K^T`, `Q @ K^T`, contractive WY inverse, peak state/readout) and
-    lower-range non-underflow of `(Q @ K^T) @ (beta * V - K^T h)` and `q^T state` into `out_dtype`
-    (row 3450)."""
+    """Whether the selected chunked kernel's intermediate precision (`_recurrence_inter_precision`) preserves
+    lossless entering-state reads, upper-range finiteness (ungated `K @ K^T`, `Q @ K^T`, contractive WY
+    inverse, peak state/readout), and lower-range non-underflow into `out_dtype` (row 3450)."""
     if (state_bound is None or q_bound is None or k_bound is None or v_bound is None
             or not (state_apart.finite and q_apart.finite and k_apart.finite and v_apart.finite)
             or (scale is not None and (not math.isfinite(scale) or scale <= 0.0 or scale > 1.0))
             or (has_beta and (beta_bound is None or not beta_apart.finite))):
         return False
     inter_info, out_info = jnp.finfo(inter_dtype), jnp.finfo(out_dtype)
-    if int(inter_info.nmant) < int(out_info.nmant):
+    if inter_nmant < int(out_info.nmant):
+        return False
+    if state_bound != terms.NOTHING and (
+            not _dtype_lossless_in(state_source_dtype, inter_dtype)
+            or int(jnp.finfo(state_source_dtype).nmant) > inter_nmant):
         return False
     work_cap = min(56, int(inter_info.maxexp) - 4)
     v_cap = int(out_info.minexp) - int(inter_info.minexp)
@@ -1387,7 +1448,7 @@ def _recurrence_kernels(call: Callable, operands: Sequence[jcore.Var], options: 
 
 def _recurrence_route_admits(
     call: Callable, operands: Sequence[jcore.Var], options: Hashable, hooks, *,
-    state_bound: terms.Magnitude | None, state_apart: terms.Apart,
+    state_bound: terms.Magnitude | None, state_apart: terms.Apart, state_source_dtype,
     q_bound: terms.Magnitude | None, q_apart: terms.Apart,
     k_bound: terms.Magnitude | None, k_apart: terms.Apart,
     v_bound: terms.Magnitude | None, v_apart: terms.Apart,
@@ -1395,7 +1456,7 @@ def _recurrence_route_admits(
     seq_len: int, key_width: int, common, out_dtype, scale: float | None, delta: bool, has_beta: bool,
 ) -> bool:
     """Validate training VJP eligibility and numerical range against each ACTUAL selected forward and
-    training kernel's intermediate arithmetic (`_recurrence_inter_dtype`), checked only after token
+    training kernel's intermediate arithmetic (`_recurrence_inter_precision`), checked only after token
     equivalence is proven; under `precision="accurate"` leaves plain token scans intact."""
     if generation.numerics().forms == "accurate":
         return False
@@ -1407,11 +1468,13 @@ def _recurrence_route_admits(
     if not active:
         return False
     for kernel in active:
-        inter_dtype = _recurrence_inter_dtype(kernel, hooks, common)
-        if inter_dtype is None or not _recurrence_bounded(
+        precision = _recurrence_inter_precision(kernel, hooks, common)
+        if precision is None or not _recurrence_bounded(
                 state_bound, state_apart, q_bound, q_apart, k_bound, k_apart, v_bound, v_apart,
-                beta_bound, beta_apart, seq_len=seq_len, key_width=key_width, inter_dtype=inter_dtype,
-                out_dtype=out_dtype, scale=scale, delta=delta, has_beta=has_beta):
+                beta_bound, beta_apart, seq_len=seq_len, key_width=key_width,
+                inter_dtype=precision[0], inter_nmant=precision[1],
+                state_source_dtype=state_source_dtype, out_dtype=out_dtype,
+                scale=scale, delta=delta, has_beta=has_beta):
             return False
     return True
 
@@ -1420,6 +1483,7 @@ def _recurrence_candidates(
     scan_body: jcore.Jaxpr, operands: tuple[jcore.Var, ...], outputs: tuple[jcore.Var, ...],
     xs_avals: tuple, state_aval, ys_aval, q_cands: Sequence[int], g_cands: Sequence[int | None],
     held: Mapping[jcore.Var, terms.Magnitude | None], apart: Mapping[jcore.Var, terms.Apart],
+    state_source_dtype,
 ) -> Iterator[Candidate]:
     """Yield `recurrence.Hooks` candidates for validated `(query, log_decay, beta, key, value)` splits."""
     from dew.nn.kernels import recurrence
@@ -1479,6 +1543,7 @@ def _recurrence_candidates(
                         admit = functools.partial(
                             _recurrence_route_admits, call, operands, opts, hooks,
                             state_bound=state_bound, state_apart=state_apart,
+                            state_source_dtype=state_source_dtype,
                             q_bound=q_bound, q_apart=q_apart, k_bound=k_bound, k_apart=k_apart,
                             v_bound=v_bound, v_apart=v_apart, beta_bound=beta_bound, beta_apart=beta_apart,
                             seq_len=seq_len, key_width=key_width, common=common, out_dtype=ys_aval.dtype,
@@ -1487,7 +1552,8 @@ def _recurrence_candidates(
                             operands, outputs, call, declared,
                             lambda call=call, operands=operands, opts=opts: (
                                 _recurrence_kernels(call, operands, opts, vjp=False)[0]),
-                            body=scan_body, key=(opts, operand_facts), training_ok=admit)
+                            body=scan_body, key=(opts, operand_facts, state_source_dtype),
+                            training_ok=admit)
 
 
 def _recurrences(index: fusion.Index, place: int) -> Iterator[Candidate]:
@@ -1556,7 +1622,7 @@ def _recurrences(index: fusion.Index, place: int) -> Iterator[Candidate]:
         g_cands = [None]
     yield from _recurrence_candidates(
         scan_body, operands, tuple(equation.outvars), xs_avals,
-        state_aval, ys_aval, q_cands, g_cands, held, apart)
+        state_aval, ys_aval, q_cands, g_cands, held, apart, _state_source_dtype(index, state_var))
 
 
 ATTENTION = (Family(jax.lax.exp_p, _attentions),)
