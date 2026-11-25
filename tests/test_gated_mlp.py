@@ -411,7 +411,6 @@ def test_grouped_gated_experts_selector_defaults_apart_and_honors_named_and_hand
     rows = jax.ShapeDtypeStruct((256, 128), jnp.bfloat16)
     gate = jax.ShapeDtypeStruct((4, 128, 256), jnp.bfloat16)
     down = jax.ShapeDtypeStruct((4, 256, 128), jnp.bfloat16)
-    wide_rows = jax.ShapeDtypeStruct((256, 128), jnp.float64)
     hook = activations.gated_hook("swiglu")
     with generation.assumed(generation_name):
         case = gated_mlp.grouped_case(rows, (gate, down), None, hook)
@@ -429,10 +428,17 @@ def test_grouped_gated_experts_selector_defaults_apart_and_honors_named_and_hand
             assert not gated_mlp.fuses_grouped(rows, None, None, hook)
             assert not gated_mlp.fuses_grouped(
                 rows, (gate, down), None, activations.gated_hook("geglu_exact"))
-            assert not gated_mlp.fuses_grouped(wide_rows, (gate, down), None, hook)
             assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook, whole=False)
+            with jax.enable_x64():
+                wide_rows = jax.ShapeDtypeStruct((256, 128), jnp.float64)
+                assert not gated_mlp.fuses_grouped(wide_rows, (gate, down), None, hook)
+        # Named CUTLASS refuses paired epilogue / down prologue hooks and must hand off to `apart`.
+        with generation.chosen(grouped_matmul="cutlass", gated_mlp="fused"):
+            assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook)
         with generation.chosen(grouped_matmul="mosaic", gated_mlp="fused"):
             assert gated_mlp.fuses_grouped(rows, (gate, down), None, hook)
             # Forced grouped Mosaic never escapes `KernelRefused` before GATED_MLP's handoff.
-            assert not gated_mlp.fuses_grouped(wide_rows, (gate, down), None, hook)
             assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook, whole=False)
+            with jax.enable_x64():
+                wide_rows = jax.ShapeDtypeStruct((256, 128), jnp.float64)
+                assert not gated_mlp.fuses_grouped(wide_rows, (gate, down), None, hook)

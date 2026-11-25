@@ -42,7 +42,7 @@ from dew.algebra.forms import aval
 from dew.nn.derivatives import Protected, marked_call_p
 from dew.nn.kernels import generation
 from dew.nn.kernels.generation import Choice
-from dew.nn.programs import bodies, control_flow, entrywise, equations, purely_called, read_by
+from dew.nn.programs import bodies, called, control_flow, entrywise, equations, purely_called, read_by
 from dew.nn.sharding import sequence_shards
 
 REACH = 8
@@ -1228,39 +1228,87 @@ def _op_signs(primitive: jcore.Primitive, in_signs: list[tuple[bool, bool]],
     return False, False
 
 
+def _literal_finite(value) -> bool:
+    """Whether host constant `value` is finite (`False` for device arrays, NaNs, infinities, or PRNG keys)."""
+    if terms.typed_key(value) or (isinstance(value, jax.Array) and not isinstance(value, jax_core.Tracer)):
+        return False
+    array = np.asarray(value)
+    return bool(jnp.issubdtype(array.dtype, jnp.integer) or (
+        jnp.issubdtype(array.dtype, jnp.floating) and np.isfinite(array).all()))
+
+
+def _atom_finite(atom, finite: dict[jcore.Var, bool]) -> bool:
+    """Whether `atom` is proven finite (a finite host literal or a tracked finite variable)."""
+    return _literal_finite(atom.val) if isinstance(atom, jcore.Literal) else finite.get(atom, False)
+
+
+def _nan_guarded_branch(pred_atom, true_atom, made_eq: dict[jcore.Var, jcore.JaxprEqn],
+                        finite: dict[jcore.Var, bool]) -> bool:
+    """Whether `select_n(pred_atom, false_val, true_atom)` enters `true_atom` only when `true_atom` is NaN
+    (e.g. `lax.logaddexp(x, 0.0)`'s `where(isnan(x - 0.0), x + 0.0, ...)`)."""
+    if not isinstance(pred_atom, jcore.Var) or (pred_eq := made_eq.get(pred_atom)) is None:
+        return False
+    if pred_eq.primitive is not jax.lax.ne_p or pred_eq.invars[0] != pred_eq.invars[1]:
+        return False
+    tested = pred_eq.invars[0]
+    if not isinstance(tested, jcore.Var) or (diff_eq := made_eq.get(tested)) is None:
+        return False
+    if diff_eq.primitive is not jax.lax.sub_p:
+        return False
+    u, v = diff_eq.invars
+    if not _atom_finite(v, finite):
+        return False
+    if true_atom == u:
+        return True
+    if isinstance(true_atom, jcore.Var) and (add_eq := made_eq.get(true_atom)) is not None:
+        return add_eq.primitive is jax.lax.add_p and tuple(add_eq.invars) in ((u, v), (v, u))
+    return False
+
+
 def _eval_signs(jaxpr: jcore.Jaxpr, env: dict[jcore.Var, tuple[bool, bool]],
-                target: jcore.Var, *, depth: int = 0) -> tuple[bool, bool]:
+                finite: dict[jcore.Var, bool], target: jcore.Var, *, depth: int = 0) -> tuple[bool, bool]:
     """Compute `(nonneg, nonpos)` for `target` along its backward dependency slice in `jaxpr`, peeling
-    transparent `purely_called` helpers (`jax.nn.softplus`, `jax.nn.log_sigmoid`, etc.)."""
+    `called` primal bodies (`jit`, `custom_jvp_call` such as `jax.nn.softplus` / `jax.nn.log_sigmoid`)."""
     if depth > 6:
         return False, False
     if target in env:
         return env[target]
     needed = read_by(jaxpr, (target,))
     signs = dict(env)
-    made_by: dict[jcore.Var, jcore.Primitive] = {}
+    is_finite = dict(finite)
+    made_eq: dict[jcore.Var, jcore.JaxprEqn] = {}
     for equation in jaxpr.eqns:
         if not any(out in needed for out in equation.outvars):
             continue
         in_signs = [
             _literal_signs(atom.val) if isinstance(atom, jcore.Literal) else signs.get(atom, (False, False))
             for atom in equation.invars]
-        body = purely_called(equation)
-        if body is not None and len(equation.outvars) == 1:
-            inner_env = dict(zip(body.invars, in_signs, strict=True))
+        in_finite = [_atom_finite(atom, is_finite) for atom in equation.invars]
+        body = called(equation)
+        if body is not None and len(equation.outvars) == 1 and len(body.consts) == len(body.constvars):
+            inner_env = {cv: _literal_signs(c) for cv, c in zip(body.constvars, body.consts, strict=True)}
+            inner_env.update(zip(body.invars, in_signs, strict=True))
+            inner_fin = {cv: _literal_finite(c) for cv, c in zip(body.constvars, body.consts, strict=True)}
+            inner_fin.update(zip(body.invars, in_finite, strict=True))
             out_var = body.outvars[0]
             out_sign = (_literal_signs(out_var.val) if isinstance(out_var, jcore.Literal)
-                        else _eval_signs(body, inner_env, out_var, depth=depth + 1))
+                        else _eval_signs(body, inner_env, inner_fin, out_var, depth=depth + 1))
             signs[equation.outvars[0]] = out_sign
             continue
         if len(equation.outvars) != 1:
             continue
         out = equation.outvars[0]
-        made_by[out] = equation.primitive
+        made_eq[out] = equation
+        if equation.primitive in _SIGN_PRESERVING:
+            is_finite[out] = in_finite[0]
         if (equation.primitive in (jax.lax.log_p, jax.lax.log2_p)
                 and isinstance(equation.invars[0], jcore.Var)
-                and made_by.get(equation.invars[0]) is jax.lax.logistic_p):
+                and (src := made_eq.get(equation.invars[0])) is not None
+                and src.primitive is jax.lax.logistic_p):
             signs[out] = (False, True)
+        elif (equation.primitive is jax.lax.select_n_p and len(in_signs) == 3
+              and _nan_guarded_branch(equation.invars[0], equation.invars[2], made_eq, is_finite)):
+            signs[out] = in_signs[1]
         else:
             signs[out] = _op_signs(equation.primitive, in_signs, equation)
     return signs.get(target, (False, False))
@@ -1270,7 +1318,8 @@ def _proven_nonpositive(index: fusion.Index, var: jcore.Var) -> bool:
     """Whether `var` is statically proven `<= 0` in `index.jaxpr` (contraction domain for chunked
     recurrences, row 3450)."""
     env = {cvar: _literal_signs(const) for cvar, const in index.consts.items()}
-    return _eval_signs(index.jaxpr, env, var)[1]
+    finite = {cvar: _literal_finite(const) for cvar, const in index.consts.items()}
+    return _eval_signs(index.jaxpr, env, finite, var)[1]
 
 
 def _positive_scalar(atom) -> float | None:

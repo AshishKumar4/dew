@@ -189,14 +189,14 @@ def _scope_for(accurate: bool, saturation: Saturation, kernels: bool) -> _Scope:
     """Compute derivation and kernel-choice keys once for the current trace and mesh context."""
     deriving = _deriving(accurate, saturation)
     if not kernels:
-        return _Scope(deriving, None, None, True)
+        return _Scope(deriving, None, None, structural_safe=True)
     from dew._cache import KERNEL_CHOICES, KERNEL_PINS
     from dew._devices import deterministic_ops_requested
 
     base = fusion.base_context()
-    kernels_key = (base[0], KERNEL_CHOICES.value, KERNEL_PINS.value, generation.draws(),
-                   deterministic_ops_requested())
-    return _Scope(deriving, kernels_key, base, not _holds_device_array(base))
+    kernels_key = (base[0], generation.backend(), generation.assumption(), KERNEL_CHOICES.value,
+                   KERNEL_PINS.value, generation.draws(), deterministic_ops_requested())
+    return _Scope(deriving, kernels_key, base, structural_safe=not _holds_device_array(base))
 
 
 def _passed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels: bool) -> jcore.Jaxpr:

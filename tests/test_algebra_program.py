@@ -2168,6 +2168,21 @@ def test_jaxpr_parameter_key_hashes_structure_and_isolates_opaques_and_consts():
         _stated._plain(kv1, "custom_vjp_jaxpr")
 
 
+def _bf16_rms(x, w):
+    """Plain RMSNorm in fp32 statistics for structural body-cache tests."""
+    mean_sq = jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)
+    return (x.astype(jnp.float32) * jax.lax.rsqrt(mean_sq + 1e-6)).astype(x.dtype) * w
+
+
+def _named_bf16_rms(name: str):
+    """Freshly named RMSNorm function so each `make_jaxpr` carries distinct `debug_info`."""
+    def norm(x, w):
+        return _bf16_rms(x, w)
+
+    norm.__name__ = name
+    return norm
+
+
 def test_structural_closed_reuses_const_free_body_preserving_debug_info_and_reports():
     """Fresh structurally identical const-free bodies hit `program._STRUCTURAL_CLOSED`, replaying routes and
     rewrite reports while keeping each body's own `debug_info` and computing identical values."""
@@ -2175,16 +2190,9 @@ def test_structural_closed_reuses_const_free_body_preserving_debug_info_and_repo
 
     from dew.nn.kernels.templates import report as kernel_report
 
-    def make_norm(name: str):
-        def norm(x, w):
-            mean_sq = jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)
-            return (x.astype(jnp.float32) * jax.lax.rsqrt(mean_sq + 1e-6)).astype(x.dtype) * w
-
-        norm.__name__ = name
-        return norm
-
     shapes = (jax.ShapeDtypeStruct((256, 256), jnp.bfloat16), jax.ShapeDtypeStruct((256,), jnp.bfloat16))
-    ca, cb = jax.make_jaxpr(make_norm("norm_a"))(*shapes), jax.make_jaxpr(make_norm("norm_b"))(*shapes)
+    ca = jax.make_jaxpr(_named_bf16_rms("norm_a"))(*shapes)
+    cb = jax.make_jaxpr(_named_bf16_rms("norm_b"))(*shapes)
     assert ca is not cb and ca.debug_info != cb.debug_info
     with generation.assumed("sm90"):
         with generation.routes() as routes_a, kernel_report.recording():
@@ -2206,12 +2214,6 @@ def test_structural_closed_reuses_const_free_body_preserving_debug_info_and_repo
         assert "div" in reuse_prims
         assert algebra.rules.heads("div", [None, "sqrt"])
         assert not algebra.rules.heads("div", [None, None])
-
-
-def _bf16_rms(x, w):
-    """Plain RMSNorm in fp32 statistics for structural body-cache tests."""
-    mean_sq = jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)
-    return (x.astype(jnp.float32) * jax.lax.rsqrt(mean_sq + 1e-6)).astype(x.dtype) * w
 
 
 def test_structural_closed_isolates_callbacks_device_consts_and_prng_impls():
@@ -2244,8 +2246,8 @@ def test_structural_closed_isolates_callbacks_device_consts_and_prng_impls():
     x_in, w_in = jnp.ones((256, 256), jnp.bfloat16), jnp.ones((256,), jnp.bfloat16)
     cpu1 = program._closed(cb1, accurate=False, saturation=algebra.SATURATION, kernels=True)
     cpu5 = program._closed(cb5, accurate=False, saturation=algebra.SATURATION, kernels=True)
-    assert float(eval_jaxpr(cpu1.jaxpr, cpu1.consts, x_in, w_in)[0][0, 0]) == pytest.approx(2.0, abs=0.05)
-    assert float(eval_jaxpr(cpu5.jaxpr, cpu5.consts, x_in, w_in)[0][0, 0]) == pytest.approx(6.0, abs=0.05)
+    assert float(eval_jaxpr(cpu1.jaxpr, cpu1.consts, x_in, w_in)[0][0, 0]) == 2.0
+    assert float(eval_jaxpr(cpu5.jaxpr, cpu5.consts, x_in, w_in)[0][0, 0]) == 6.0
 
     # Nested `jit` holding a concrete device `jax.Array` declines structural sharing without host copy.
     captured = jnp.ones((256,), jnp.bfloat16)
@@ -2297,16 +2299,9 @@ def test_structural_closed_keys_on_drawing_context_in_both_orders():
     never share a `_STRUCTURAL_CLOSED` entry in either cache order."""
     from dew.nn.kernels.templates import report as kernel_report
 
-    def make_fresh_norm(tag: str):
-        def fn(x, w):
-            return _bf16_rms(x, w)
-
-        fn.__name__ = tag
-        return fn
-
     shapes = (jax.ShapeDtypeStruct((256, 256), jnp.bfloat16), jax.ShapeDtypeStruct((256,), jnp.bfloat16))
-    d1, n1 = (jax.make_jaxpr(make_fresh_norm(name))(*shapes) for name in ("draw_first", "real_after"))
-    n2, d2 = (jax.make_jaxpr(make_fresh_norm(name))(*shapes) for name in ("real_first", "draw_after"))
+    d1, n1 = (jax.make_jaxpr(_named_bf16_rms(name))(*shapes) for name in ("draw_first", "real_after"))
+    n2, d2 = (jax.make_jaxpr(_named_bf16_rms(name))(*shapes) for name in ("real_first", "draw_after"))
     with generation.assumed("sm90"):
         with generation.drawing(), generation.routes() as draw_r1, kernel_report.recording():
             out_d1 = program._closed(d1, accurate=False, saturation=algebra.SATURATION, kernels=True)

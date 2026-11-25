@@ -103,6 +103,15 @@ class GatedCase:
             return False
 
 
+def _paired_epilogue(hook: Callable[[jax.Array, jax.Array], jax.Array], dtype: jnp.dtype):
+    """Paired gate+up epilogue returning cast `(gate, up, hook(gate, up))`."""
+    def projected(gate_acc, up_acc):
+        gate_out, up_out = gate_acc.astype(dtype), up_acc.astype(dtype)
+        return gate_out, up_out, hook(gate_out, up_out)
+
+    return projected
+
+
 def _grouped_launched(rows: jax.ShapeDtypeStruct, gate: jax.ShapeDtypeStruct, down: jax.ShapeDtypeStruct,
                       hidden: jax.ShapeDtypeStruct, dtype: jnp.dtype, precision: PrecisionLike,
                       hook: Callable[[jax.Array, jax.Array], jax.Array], *, whole: bool) -> bool:
@@ -116,12 +125,7 @@ def _grouped_launched(rows: jax.ShapeDtypeStruct, gate: jax.ShapeDtypeStruct, do
     if gate.ndim != 3 or down.ndim != 3:
         return False
     sizes = jax.ShapeDtypeStruct((gate.shape[0],), jnp.int32)
-
-    def epilogue(gate_acc, up_acc):
-        gate_out, up_out = gate_acc.astype(dtype), up_acc.astype(dtype)
-        return gate_out, up_out, hook(gate_out, up_out)
-
-    pair_hooks = Hooks(epilogue=epilogue, out_dtypes=(dtype.name,) * 3)
+    pair_hooks = Hooks(epilogue=_paired_epilogue(hook, dtype), out_dtypes=(dtype.name,) * 3)
     pair_product = declared(dtype, precision, outputs=(dtype,) * 3, operands=(dtype, dtype))
     pair_call = grouped_matmul.gmm_call(rows, gate, sizes, paired=gate, out_dtype=dtype, trans_rhs=False,
                                         hooks=pair_hooks, interpret=False, promoted=pair_product.promoted,
@@ -310,12 +314,8 @@ def fused_products(rows: jax.Array, kernels: tuple[jax.Array, jax.Array, jax.Arr
     `gemm`'s."""
     dtype = rows.dtype
     hook = activations.gated_hook(activation, limit)
-
-    def projected(gate_acc, up_acc):
-        gate, up = gate_acc.astype(dtype), up_acc.astype(dtype)
-        return gate, up, hook(gate, up)
-
-    gate, up, hidden = gemm.gemm(rows, kernels[0], paired=kernels[1], epilogue=projected, out_dtype=dtype,
+    gate, up, hidden = gemm.gemm(rows, kernels[0], paired=kernels[1],
+                                 epilogue=_paired_epilogue(hook, dtype), out_dtype=dtype,
                                  out_dtypes=(dtype,) * 3, precision=precision,
                                  interpret_on_cpu=interpret_on_cpu)
     if names is not None:

@@ -1219,23 +1219,30 @@ def test_a_plain_gated_delta_net_scan_runs_dews_recurrence_kernel_through_dew_ji
 
 
 def test_recognized_recurrence_preserves_neginf_hard_reset():
-    """A recognized GDN scan whose nonpositive decay hits `-inf` mid-sequence stays finite and resets the
-    state cleanly on both the portable math and interpreted `mosaic_gpu` routes: scaling the entering state
-    and pre-reset values changes neither the final state nor any post-reset output."""
+    """A recognized GDN scan whose nonpositive decay hits `-inf` mid-sequence stays finite, resets the state
+    cleanly on both the portable math and interpreted `mosaic_gpu` routes (scaling the entering state and
+    pre-reset values changes neither the final state nor any post-reset output), and passes check 1 against
+    the plain scan."""
+    from reference_error import assert_as_exact
+
     import dew
 
     seq, batch, hv, dk, dv = 64, 1, 2, 64, 64
-    rng = np.random.default_rng(707)
-    state = jnp.asarray(rng.standard_normal((batch, hv, dk, dv)).astype(np.float32) * 0.2)
-    q = jnp.asarray(rng.standard_normal((seq, batch, hv, dk)) * (dk ** -0.5), jnp.bfloat16)
-    k = jnp.asarray(rng.standard_normal((seq, batch, hv, dk)) * (dk ** -0.5), jnp.bfloat16)
-    v = jnp.asarray(rng.standard_normal((seq, batch, hv, dv)) * 0.5, jnp.bfloat16)
-    g = jnp.asarray(rng.uniform(-0.5, -0.05, (seq, batch, hv)).astype(np.float32)).at[16, :, :].set(-jnp.inf)
-    beta = jnp.asarray(rng.uniform(0.1, 0.5, (seq, batch, hv)), jnp.bfloat16)
+
+    def draw(seed: int):
+        rng = np.random.default_rng(707 + seed)
+        state = jnp.asarray(rng.standard_normal((batch, hv, dk, dv)).astype(np.float32) * 0.2)
+        q = jnp.asarray(rng.standard_normal((seq, batch, hv, dk)) * (dk ** -0.5), jnp.bfloat16)
+        k = jnp.asarray(rng.standard_normal((seq, batch, hv, dk)) * (dk ** -0.5), jnp.bfloat16)
+        v = jnp.asarray(rng.standard_normal((seq, batch, hv, dv)) * 0.5, jnp.bfloat16)
+        g = jnp.asarray(rng.uniform(-0.5, -0.05, (seq, batch, hv)).astype(np.float32))
+        g = g.at[16, :, :].set(-jnp.inf)
+        beta = jnp.asarray(rng.uniform(0.1, 0.5, (seq, batch, hv)), jnp.bfloat16)
+        return state, q, k, v, g, beta
+
+    state, q, k, v, g, beta = draw(0)
     big_state = state * 100.0
     big_v = v.at[:16].set((v[:16].astype(jnp.float32) * 100.0).astype(jnp.bfloat16))
-
-    ref_final, ref_out = jax.jit(_gdn_scan_natural)(state, q, k, v, g, beta)
     xla_fn = jax.jit(functools.partial(_recurrence_rewritten, _gdn_scan_natural))
     xla_final, xla_out = xla_fn(state, q, k, v, g, beta)
     xla_big_final, xla_big_out = xla_fn(big_state, q, k, big_v, g, beta)
@@ -1250,9 +1257,8 @@ def test_recognized_recurrence_preserves_neginf_hard_reset():
     np.testing.assert_array_equal(np.asarray(xla_out[16:]), np.asarray(xla_big_out[16:]))
     np.testing.assert_array_equal(np.asarray(mos_final), np.asarray(mos_big_final))
     np.testing.assert_array_equal(np.asarray(mos_out[16:]), np.asarray(mos_big_out[16:]))
-    np.testing.assert_allclose(np.asarray(xla_final), np.asarray(ref_final), atol=1e-4, rtol=1e-4)
-    np.testing.assert_allclose(np.asarray(xla_out, np.float32), np.asarray(ref_out, np.float32),
-                               atol=2e-2, rtol=2e-2)
+    assert_as_exact(xla_fn, jax.jit(_gdn_scan_natural), draw, "dew.jit gated delta scan (-inf reset)",
+                    seeds=8, truth_fn=lambda *a: _gdn_scan_f64_truth(*a, scale=None, softplus=False))
 
 
 def test_non_matching_or_barred_recurrence_scans_stay_as_written():
@@ -1278,7 +1284,8 @@ def test_non_matching_or_barred_recurrence_scans_stay_as_written():
             qt, kt, vt, gt, bt = xs
             if perturb_iota:
                 iota = jax.lax.broadcasted_iota(jnp.float32, (batch, hv), 0)
-                gt = gt - (iota - jax.lax.broadcast_in_dim(iota, (batch, hv), (1, 0)))
+                # Broadcast to a distinct rank so JAX's same-shape forwarding rule does not drop it.
+                gt = gt - (iota - jax.lax.broadcast_in_dim(iota, (1, batch, hv), (2, 1))[0])
             next_s, out = _gdn_step_math(
                 s.astype(jnp.float32) if narrow_state else s,
                 qt.astype(jnp.float32), kt.astype(jnp.float32), vt.astype(jnp.float32),
@@ -1286,34 +1293,25 @@ def test_non_matching_or_barred_recurrence_scans_stay_as_written():
             return (next_s.astype(s.dtype) if narrow_state else next_s), out.astype(vt.dtype)
         return step
 
-    def reversed_scan(state, q, k, v, g, beta):
-        return jax.lax.scan(make_step(), state, (q, k, v, jnp.minimum(g, 0.0), beta), reverse=True)
+    def make_scan(step_fn, *, clamp_g: bool = True, reverse: bool = False):
+        def run(state, q, k, v, g, beta):
+            return jax.lax.scan(step_fn, state, (q, k, v, jnp.minimum(g, 0.0) if clamp_g else g, beta),
+                                reverse=reverse)
 
-    def bf16_state_scan(state, q, k, v, g, beta):
-        return jax.lax.scan(make_step(narrow_state=True), state, (q, k, v, jnp.minimum(g, 0.0), beta))
+        return run
 
-    def barred_scan(state, q, k, v, g, beta):
-        return jax.lax.scan(jax.checkpoint(make_step()), state, (q, k, v, jnp.minimum(g, 0.0), beta))
-
-    def wrong_sign_scan(state, q, k, v, g, beta):
-        return jax.lax.scan(make_step(subtract=False), state, (q, k, v, jnp.minimum(g, 0.0), beta))
-
-    def unconstrained_decay_scan(state, q, k, v, g, beta):
-        return jax.lax.scan(make_step(), state, (q, k, v, g, beta))
-
-    def transposed_iota_scan(state, q, k, v, g, beta):
-        return jax.lax.scan(make_step(perturb_iota=True), state, (q, k, v, jnp.minimum(g, 0.0), beta))
-
+    cases = [
+        (make_scan(make_step(), reverse=True), std_shapes),
+        (make_scan(make_step(narrow_state=True)), (state_bf16, q_s, k_s, v_s, g_s, b_bf16)),
+        (make_scan(jax.checkpoint(make_step())), std_shapes),
+        (make_scan(make_step(subtract=False)), std_shapes),
+        (make_scan(make_step(), clamp_g=False), std_shapes),
+        (_gdn_scan_natural, (state_f32, q_s, k_s, v_s, g_s, b_f32)),
+        (make_scan(make_step(perturb_iota=True)), std_shapes),
+    ]
     with generation.assumed("sm90"):
-        assert not _routes("gated_delta_rule", lambda: dew.jit(reversed_scan).trace(*std_shapes))
-        assert not _routes("gated_delta_rule", lambda: dew.jit(bf16_state_scan).trace(
-            state_bf16, q_s, k_s, v_s, g_s, b_bf16))
-        assert not _routes("gated_delta_rule", lambda: dew.jit(barred_scan).trace(*std_shapes))
-        assert not _routes("gated_delta_rule", lambda: dew.jit(wrong_sign_scan).trace(*std_shapes))
-        assert not _routes("gated_delta_rule", lambda: dew.jit(unconstrained_decay_scan).trace(*std_shapes))
-        assert not _routes("gated_delta_rule", lambda: dew.jit(_gdn_scan_natural).trace(
-            state_f32, q_s, k_s, v_s, g_s, b_f32))
-        assert not _routes("gated_delta_rule", lambda: dew.jit(transposed_iota_scan).trace(*std_shapes))
+        for fn, shapes in cases:
+            assert not _routes("gated_delta_rule", lambda f=fn, s=shapes: dew.jit(f).trace(*s))
 
     # Deep shared diamond DAG before transpose stays linear in graph size under `normal_form.canonical`.
     def diamond_transpose(a, b):
@@ -1324,5 +1322,5 @@ def test_non_matching_or_barred_recurrence_scans_stay_as_written():
 
     closed = jax.make_jaxpr(diamond_transpose)(jax.ShapeDtypeStruct((4,), jnp.float32),
                                                jax.ShapeDtypeStruct((4,), jnp.float32))
-    canon = normal_form.canonical(closed.jaxpr, closed.consts)
+    canon = normal_form.canonical(closed)
     assert not any(eq_.primitive is jax.lax.transpose_p for eq_ in canon.jaxpr.eqns)
