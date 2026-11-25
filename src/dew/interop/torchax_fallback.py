@@ -37,7 +37,7 @@ import json
 import math
 import warnings
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from types import FunctionType
 from typing import TYPE_CHECKING, Self
@@ -71,12 +71,13 @@ from dew.interop.streaming import SourceLeaf
 from dew.interop.weights import AUTO, checkpoint_dtype
 from dew.mesh import LogicalAxes
 from dew.nn.attention import AttentionImpl, chosen_attention
+from dew.nn.backbones.decoder_stack import Loop
 from dew.nn.inputs import document_reach
 from dew.nn.kernels import generation
 from dew.nn.kv_cache import CURSOR, cache_positions, cursor, filled_slots, put_opened
 from dew.nn.precision import at_least_fp32, broadcast_summed, configured_precision, exact_float32, scaled
 from dew.nn.programs import purely_called
-from dew.nn.protocols import Lacks, OutputTable
+from dew.nn.protocols import ExitPasses, Lacks, OutputTable
 from dew.nn.sharding import parameter_path
 from dew.registry import resolve_dtype
 
@@ -1040,8 +1041,8 @@ class TorchGraph:
                  tokens: jax.Array, *, train: bool, key: jax.Array | None = None,
                  precision: jax.lax.PrecisionLike = None, laid: Coordinates | None = None,
                  visible: jax.Array | None = None, key_places: jax.Array | None = None,
-                 head_input: jax.Array | None = None,
-                 recomputed: bool = False) -> tuple[jax.Array, jax.Array]:
+                 head_input: jax.Array | None = None, recomputed: bool = False,
+                 loop: Loop | None = None) -> tuple[jax.Array, jax.Array]:
         """The logits and the output head's input states for `tokens`, in Dew's torchax
         environment (`_environment`), every product at `precision` (`configured_precision`):
         torch's operators state none. Each broadcast of a value narrower than fp32 sums
@@ -1052,14 +1053,15 @@ class TorchGraph:
         window counts (`_Attending`). `head_input`, where
         given, is the output head's input in place of the states the forward computes, so the
         logits are the head's over it, every step the forward takes after the head included. `recomputed`
-        recomputes each decoder layer in the backward (`TorchCausalLM.remat`)."""
+        recomputes each decoder layer in the backward (`TorchCausalLM.remat`); `loop` runs a block of the
+        layers over its own output (`TorchCausalLM.loop`)."""
         documents, max_segments = _documents(laid)
         positions = None if laid is None else laid.places()
         valid = None if laid is None or laid.valid is None else jnp.asarray(laid.valid, bool)
         arguments = (dict(params), dict(buffers), tokens, key, positions, documents, valid, visible,
                      key_places, head_input, None, None)
         (logits, hidden), _ = self._run(arguments, train=train, precision=precision,
-                                        max_segments=max_segments, recomputed=recomputed)
+                                        max_segments=max_segments, recomputed=recomputed, loop=loop)
         return logits, hidden
 
     def step(self, params: Mapping[str, jax.Array], buffers: Mapping[str, jax.Array], tokens: jax.Array, *,
@@ -1076,10 +1078,11 @@ class TorchGraph:
         return logits, written
 
     def _run(self, arguments: tuple, *, train: bool, precision: jax.lax.PrecisionLike, max_segments: int,
-             recomputed: bool = False):
+             recomputed: bool = False, loop: Loop | None = None):
         layers: list = []
         traced, shapes, draws = self.traced(*arguments, train=train, precision=precision,
-                                            max_segments=max_segments, layers=layers if recomputed else None)
+                                            max_segments=max_segments, layers=layers if recomputed else None,
+                                            loop=loop)
         self.certify(traced, arguments, train=train, max_segments=max_segments)
         outputs = jax.tree.unflatten(jax.tree.structure(shapes),
                                      _accumulating(traced, *jax.tree.leaves(arguments), recomputed=layers))
@@ -1118,12 +1121,14 @@ class TorchGraph:
                valid: jax.typing.ArrayLike | None = None, visible: jax.typing.ArrayLike | None = None,
                key_places: jax.typing.ArrayLike | None = None, head_input: jax.typing.ArrayLike | None = None,
                cache: tuple | None = None, reach: jax.typing.ArrayLike | None = None, *, train: bool,
-               precision: jax.lax.PrecisionLike = None, max_segments: int = 1, layers: list | None = None):
+               precision: jax.lax.PrecisionLike = None, max_segments: int = 1, layers: list | None = None,
+               loop: Loop | None = None):
         """The forward over these arguments traced once (`jax.make_jaxpr`), its output shapes, and the
         draws it made (`_Draws`): on torchax's device, a key's, or on the host, fixed by the trace. Its
         outputs are the forward's and, for a decoding call (`cache`, the held caches, slots and filled
         slots of `_Cached`), every layer's cache after it. Where `layers` is given, each decoder layer
-        traces as a program of its own, which `layers` takes (`_layers_apart`)."""
+        traces as a program of its own, which `layers` takes (`_layers_apart`); `loop` runs a block of
+        the layers over its own output (`_looped_layers`)."""
         env = _environment()
         draws = _Draws()
 
@@ -1139,9 +1144,13 @@ class TorchGraph:
             self.module.train(train)
             apart = (contextlib.nullcontext() if layers is None
                      else _layers_apart(self.module._model, env, draws, layers))
+            if loop is not None and cache is not None:
+                raise ValueError("a tier-3 loop runs uncached: a cache keeps one entry a layer, and its "
+                                 "block's layers run once a pass")
+            looped = contextlib.nullcontext() if loop is None else _looped_layers(self.module._model, loop)
             try:
                 with (env, env.override_property(prng=key) if key is not None else contextlib.nullcontext(),
-                      draws, attending, _reaching(reach), apart):
+                      draws, attending, _reaching(reach), looped, apart):
                     outputs = env.t2j_iso(self.module.functional_call(_forward, *arguments))
             finally:
                 self.module.eval()
@@ -1319,6 +1328,61 @@ def _evaluated(evaluate, inner: Jaxpr, *inputs: jax.Array) -> list[jax.Array]:
     return evaluate(inner.jaxpr, inner.consts, inputs)
 
 
+def _decoder_layers(model):
+    """`model`'s decoder and its layers (`get_decoder().layers`), refused where it holds no list of them."""
+    import torch
+
+    held = model.get_decoder()
+    if not isinstance(stack := vars(held).get('_modules', {}).get('layers'), torch.nn.ModuleList):
+        raise ValueError(f"tier 3 runs a source's decoder layers apart, and {type(held).__name__} holds no "
+                         "`layers` list")
+    return held, stack
+
+
+@contextlib.contextmanager
+def _looped_layers(model, loop: Loop) -> Iterator[None]:
+    """`model`'s block of decoder layers `loop.layers` (the whole stack where None) run `loop.steps` times
+    over its own output while it traces: past the block's last layer, its later passes over that layer's
+    output, each layer called with the arguments its first pass took (the call's positions and masks),
+    the decoder's final norm (`norm`) between passes under `step_norm`. Each layer is called as a module,
+    so another seam over its forward (`_layers_apart`) runs at every pass."""
+    import torch
+
+    held, stack = _decoder_layers(model)
+    first, end = loop.layers or (0, len(stack))
+    if not 0 <= first < end <= len(stack):
+        raise ValueError(f"a loop's block of layers lies in the decoder's {len(stack)}, not [{first}, {end})")
+    norm = vars(held).get('_modules', {}).get('norm')
+    if loop.step_norm and norm is None:
+        raise ValueError(f"a loop's step norm is the decoder's final norm, and {type(held).__name__} holds "
+                         "no `norm`")
+    block = list(stack)[first:end]
+    passing = []
+
+    def passes(module, args, kwargs, output):
+        if passing:
+            return output
+        passing.append(True)
+        try:
+            for _ in range(loop.steps - 1):
+                state = output if isinstance(output, torch.Tensor) else output[0]
+                if loop.step_norm:
+                    state = norm(state)
+                for layer in block:
+                    given = ((state, *args[1:]), kwargs) if args else ((), {**kwargs, 'hidden_states': state})
+                    output = layer(*given[0], **given[1])
+                    state = output if isinstance(output, torch.Tensor) else output[0]
+            return output
+        finally:
+            passing.clear()
+
+    hook = block[-1].register_forward_hook(passes, with_kwargs=True)
+    try:
+        yield
+    finally:
+        hook.remove()
+
+
 @contextlib.contextmanager
 def _layers_apart(model, env, draws, layers: list) -> Iterator[None]:
     """Each of `model`'s decoder layers (its decoder's `layers`), while it traces, as a program of its own
@@ -1330,10 +1394,7 @@ def _layers_apart(model, env, draws, layers: list) -> Iterator[None]:
 
     from dew.nn.nested import nested
 
-    held = model.get_decoder()
-    if not isinstance(stack := getattr(held, 'layers', None), torch.nn.ModuleList):
-        raise ValueError(f"tier 3 recomputes a source's decoder layers, and {type(held).__name__} holds no "
-                         "`layers` list")
+    _, stack = _decoder_layers(model)
 
     def apart(forward):
         def call(*args, **kwargs):
@@ -1452,6 +1513,48 @@ class TorchCausalLM(nn.Module):
     backward from its inputs alone (`jax.checkpoint` over the layer's own program, `_layers_apart`),
     keeping nothing inside it: `REMAT_POLICIES['full']`. torch's code marks none of the residuals a
     named policy keeps, so this is the one rung a tier-3 model climbs (`recompute_more`)."""
+
+    loop: Loop | None = None
+    """A block of the source's decoder layers run `loop.steps` times over its own output (`Loop`), the
+    layers before and after it once, every pass reading the call's positions and masks, the decoder's
+    final norm (its `norm`) between passes under `step_norm` (`_looped_layers`). A tier-3 source holds no
+    exit gate, cross-pass messages or θ rows Dew would draw, so a loop stating any is refused, as is one
+    a cached call would run (its cache keeps one entry a layer)."""
+
+    @property
+    def exiting(self) -> bool:
+        return False
+
+    @nn.nowrap
+    def exit_passes(self, collections: Mapping[str, Mapping]) -> ExitPasses:
+        """None of its passes exits (`loop` states no gate): no states, no logits."""
+        return ExitPasses((), (), ())
+
+    @nn.nowrap
+    def with_passes(self, steps: int | None = None, layers: tuple[int, int] | None = None, *,
+                    backprop_steps: int | None = None, remat: bool | None = None,
+                    implicit: bool | None = None, exit_gate: bool | None = None,
+                    exit_threshold: float | None = None, exits: bool | None = None,
+                    theta_passes: int | None = None, messages=None) -> Self | None:
+        """The source at `steps` passes of its block `layers` (`Looping.with_passes`), None where the loop
+        asks what a tier-3 source cannot run (`loop`)."""
+        if any(value not in (None, False) for value in (backprop_steps, remat, implicit, exit_gate,
+                                                         exit_threshold, exits, theta_passes, messages)):
+            return None
+        held = self.loop or Loop()
+        loop = replace(held, steps=held.steps if steps is None else steps,
+                                   layers=held.layers if layers is None else layers)
+        return self.with_loop(loop)
+
+    @nn.nowrap
+    def with_loop(self, loop: Loop) -> Self:
+        """The source running `loop` whole (`loop`'s refusals)."""
+        stated, plain = vars(loop), vars(Loop())
+        unrun = sorted(name for name in stated
+                       if name not in ('steps', 'layers', 'step_norm') and stated[name] != plain[name])
+        if unrun:
+            raise ValueError(f"a tier-3 source loops its layers alone, and this loop states {unrun}")
+        return self.clone(loop=loop)
 
     @nn.nowrap
     def recompute_record(self) -> JSON:
@@ -1677,7 +1780,8 @@ class TorchCausalLM(nn.Module):
         key = self.make_rng("dropout") if train and self.has_rng("dropout") else None
         return self.graph(params, buffers, jnp.asarray(tokens), train=train, key=key,
                           precision=self._products(compute), laid=laid, visible=visible,
-                          key_places=key_places, head_input=head_input, recomputed=self.remat and train)
+                          key_places=key_places, head_input=head_input, recomputed=self.remat and train,
+                          loop=self.loop)
 
     def _operands(self, held) -> tuple[dict[str, jax.Array], dict[str, jax.Array], Dtype]:
         """The forward's parameters at `dtype`, its buffers, and the dtype its products take: `dtype`, or
