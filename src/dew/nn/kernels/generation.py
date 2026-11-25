@@ -1143,6 +1143,40 @@ def gpu_mesh(mesh: Mesh | AbstractMesh, generation: str) -> AbstractMesh:
 BF16_GPU = 80
 
 
+def _cuda_version_string(encoded: int) -> str | None:
+    """An NVIDIA CUDA runtime or toolkit version integer (`1000 * major + 10 * minor`, XLA's
+    `ParseCudaVersion`: 12090 -> '12.9.0') as `GpuDeviceInfoProto` states it, None where not positive."""
+    if encoded <= 0:
+        return None
+    return f"{encoded // 1000}.{encoded % 1000 // 10}.0"
+
+
+def _cuda_toolkit_versions() -> tuple[str | None, str | None]:
+    """The CUDA runtime and compile-time toolkit versions the installed JAX CUDA plugin carries
+    (`jax._src.lib.cuda_versions`), as `GpuDeviceInfoProto` states them (`runtime_version`,
+    `compile_time_toolkit_version`): what XLA's `cuda_executor.cc` reads from `cudaRuntimeGetVersion` and
+    `CUDA_VERSION`. `(None, None)` where no CUDA plugin is installed."""
+    try:
+        from jax._src.lib import cuda_versions
+    except ImportError:
+        return None, None
+    if cuda_versions is None:
+        return None, None
+
+    def read(name: str) -> str | None:
+        reader = getattr(cuda_versions, name, None)
+        if reader is None:
+            return None
+        try:
+            return _cuda_version_string(int(reader()))
+        except RuntimeError:
+            return None
+
+    toolkit = read("cuda_runtime_build_version")
+    runtime = read("cuda_runtime_get_version") or toolkit
+    return runtime, toolkit
+
+
 def target_config(target: GpuTarget, memory: int | None = None) -> str:
     """The `gpu_device_info` XLA compiles for, from the GPU `target` a build states (`built_target`: its
     CUDA generation's, its multiprocessors its own where stated): its compute capability, the shared memory
@@ -1156,7 +1190,10 @@ def target_config(target: GpuTarget, memory: int | None = None) -> str:
     never none: XLA's memory-driven passes compiled a recurrence's gradient for a GPU of 0 bytes to values
     O(1) wrong (a GH200 running a step compiled ahead for compile-only sm90 GPUs of no stated memory, row
     8768). Its L2 where the target states it (`l2_bytes`): XLA fuses by it, and a compile-only A100 stating
-    none fused a recurrence gradient's sums apart from its host's compile of it (row 9609)."""
+    none fused a recurrence gradient's sums apart from its host's compile of it (row 9609). Its CUDA runtime
+    and compile-time toolkit versions from the installed CUDA plugin (`_cuda_toolkit_versions`): XLA's
+    `GemmRewriter` requires runtime >= 12.0.0 to emit `__cublas$lt$matmul$f8`, and a compile-only sm90 stating
+    none (`0.0.0`) widened FP8 dots to fp16 `__cublas$lt$matmul` (rows 12983, 12984)."""
     generation = target.generation
     version = capability(generation)
     shared, multiprocessors = target.shared_limit, target.multiprocessors
@@ -1170,6 +1207,11 @@ def target_config(target: GpuTarget, memory: int | None = None) -> str:
     major, minor = version
     multiprocessor = target.multiprocessor
     l2 = "" if target.l2_bytes is None else f"\n  l2_cache_size: {target.l2_bytes}"
+    runtime, toolkit = _cuda_toolkit_versions()
+    versions = "".join(
+        f'\n  {field}: "{value}"'
+        for field, value in (("runtime_version", runtime), ("compile_time_toolkit_version", toolkit))
+        if value is not None)
     return f"""gpu_device_info {{
   threads_per_block_limit: {multiprocessor.block_threads}
   threads_per_warp: {multiprocessor.warp_threads}
@@ -1191,7 +1233,7 @@ def target_config(target: GpuTarget, memory: int | None = None) -> str:
     feature_extension: {"ACCELERATED_FEATURES" if major >= 9 else "NONE"}
   }}
   registers_per_core_limit: {multiprocessor.registers}
-  registers_per_block_limit: {multiprocessor.block_registers}
+  registers_per_block_limit: {multiprocessor.block_registers}{versions}
 }}
 platform_name: "CUDA"
 device_description_str: "{target.device_kind}"

@@ -121,3 +121,29 @@ def test_an_adapted_steps_cell_names_its_kernels_over_its_whole_step():
     recorded = {(route.choice, route.kernel) for route in routes}
     unnamed = sorted(pair for pair in recorded if pair[0] not in matrix.CHOICES and pair[1] != "xla")
     assert ("low_rank", "fused") in recorded and not unnamed, (sorted(recorded), unnamed)
+
+
+def test_a_joined_qkv_cells_draw_keeps_its_init_routes_out_of_the_steps_routes(monkeypatch):
+    """The joined qkv cell (`join_matrix.a_joined_layers_training_step_is_on_par`) initializes its layer by
+    XLA's products on the host without leaking `('grouped_matmul', 'xla')` into the cell's outer `routes`,
+    where the step names `grouped_matmul='mosaic'` (row 12868)."""
+    import jax
+    import join_matrix
+    import numpy as np
+    from arm_arithmetic import ahead_on_the_host
+    from jax.sharding import Mesh
+    from test_joined import row_joins
+
+    case = ("sm90", "qkv", "none", "bias", "plain", "float16")
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+
+    def traced_step(choice, step, draw, _truth, _label, **_):
+        with ahead_on_the_host(wherever=True):
+            operands = jax.eval_shape(draw, 0)
+        for joins in (True, False):
+            with row_joins(choice, joins=joins):
+                jax.eval_shape(step, *operands)
+
+    monkeypatch.setattr(join_matrix, "assert_joined_as_exact", traced_step)
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        join_matrix.a_joined_layers_training_step_is_on_par(case)
