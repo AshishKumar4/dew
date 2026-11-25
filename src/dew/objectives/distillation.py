@@ -176,12 +176,12 @@ class DistillationObjective(Objective[Loss, Effects], Generic[Loss, Effects]):
             _refuse_other_tokenizers(*tokenizers)
         # The selected term holds no logits whose widths the step compares, so the widths the models declare
         # are (`logits_width`: the ids each head scores, fewer than its table's rows where it states so).
-        models = (student.model, teacher.model)
-        if divergence == "selected" and all(isinstance(model, StatesVocabulary) for model in models) and (
-                logits_width(models[0]) != logits_width(models[1])):
+        learner, source = student.model, teacher.model
+        if divergence == "selected" and isinstance(learner, StatesVocabulary) and isinstance(
+                source, StatesVocabulary) and logits_width(learner) != logits_width(source):
             raise ValueError(f"the selected term reads one id's likelihood on both sides, so the teacher and "
-                             f"the student share a vocabulary; the student scores {logits_width(models[0])} "
-                             f"ids and the teacher {logits_width(models[1])}")
+                             f"the student share a vocabulary; the student scores {logits_width(learner)} "
+                             f"ids and the teacher {logits_width(source)}")
         for name, value, ok in (("alpha", alpha, lambda v: 0 <= v <= 1),
                                 ("temperature", temperature, lambda v: v > 0),
                                 ("beta", beta, lambda v: v >= 0)):
