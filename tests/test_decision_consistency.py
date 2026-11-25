@@ -599,6 +599,37 @@ def test_an_input_lm_term_is_the_backbones_own_next_token_loss_over_the_rows_bes
 
 
 @attending("xla")
+def test_a_consistency_term_divides_the_groups_answers_at_the_passes_the_loss_weighs(monkeypatch):
+    """A consistency term over a looped backbone's passes (three) forms the groups' divergence at each pass
+    its loss weighs (`DecisionObjective._weighed`): at the last alone under an exit gate's objective
+    (`exit_entropy`, which weighs no pass's divergence), at all three under `pass_weights`, where every
+    pass's was formed under `exit_entropy` and two of them dropped unread (row 12866)."""
+    from dew.nn.backbones.decoder_stack import Loop
+
+    backbone = tiny_backbone().clone(max_seq_len=LAYOUT.max_len, loop=Loop(steps=3, exit_gate=True))
+    head = JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
+    gated = DecisionObjective(backbone, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT, head=head,
+                              exit_entropy=0.1, consistency=0.5)
+    weighed = DecisionObjective(backbone.clone(loop=Loop(steps=3)), tokenizer=TOKENIZER, specials=SPECIALS,
+                                layout=LAYOUT, head=head, consistency=0.5, pass_weights=(0.2, 0.3, 0.5))
+    reader = decision_rows([NEGATED, NEGATED], None, objective=gated.data(), tokens=LAYOUT.max_len)
+    [batch] = list(itertools.islice(reader.train(DataPartition()), 1))
+    step = Step(jnp.asarray(0), jax.random.key(1), None)
+    divided = []
+    divergence = categorical.group_divergence
+
+    def counted(logits, *rest):
+        divided.append(logits.shape)
+        return divergence(logits, *rest)
+
+    monkeypatch.setattr(categorical, "group_divergence", counted)
+    for objective, count in ((gated, 1), (weighed, 3)):
+        divided.clear()
+        objective.loss(objective.init(jax.random.key(0)), batch, step)
+        assert len(divided) == count, (objective, divided)
+
+
+@attending("xla")
 def test_a_decision_run_training_an_exit_gate_steps_at_one_pass_of_a_sampled_count():
     """A decision run training a looped backbone's exit gate (`exit_entropy`) under a sampled pass count
     (`SampledPasses`) whose law draws one pass plans and steps (row 9691: the step of one pass held no

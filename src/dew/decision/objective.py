@@ -798,7 +798,10 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         # members' answers over the canonical options (`categorical.group_divergence`).
         options = inputs.options | ~jnp.any(inputs.options, axis=-1, keepdims=True)
         groups, canonical = jnp.asarray(batch["groups"]), jnp.asarray(batch["canonical"])
-        divided = [categorical.group_divergence(logits, groups, canonical, options) for logits in passes]
+        # Each pass the loss weighs (`_weighed`): every one under `pass_weights`, else the last alone
+        # (row 12866).
+        weighed = passes if self._weights is not None else passes[-1:]
+        divided = [categorical.group_divergence(logits, groups, canonical, options) for logits in weighed]
         divergence, members = self._weighed([divergence for divergence, _ in divided], ran), divided[-1][1]
         term = Ratio(self.row_mean(divergence, batch).total, self.row_mean(members, batch).total)
         return (Weighted((loss, term), (1.0, self.consistency)),
