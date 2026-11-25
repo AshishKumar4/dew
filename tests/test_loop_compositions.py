@@ -102,6 +102,7 @@ def test_a_drawn_pass_count_read_in_parts_computes_its_batchs_statistics_at_each
 
         def loss(self, variables, batch, step):
             stats, aux = super().loss(variables, batch, step)
+            assert isinstance(stats, Ratio), type(stats)
             counted = (jnp.sum(batch[LOOP_PASSES]).astype(jnp.float32) if step.batch_statistics is None
                        else step.batch_statistics[0])
             return Ratio(counted * jax.lax.stop_gradient(stats.mass), jax.lax.stop_gradient(stats.mass)), aux
