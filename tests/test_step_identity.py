@@ -1164,4 +1164,3 @@ def test_a_step_holding_a_typed_key_is_stated_by_its_key_data_and_implementation
         assert next(reader)["id"].shape == (2,)
     finally:
         reader.close()
-

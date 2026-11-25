@@ -269,4 +269,3 @@ def test_two_keys_of_one_data_and_two_implementations_are_told_apart():
     assert_same_leaf(rbg, jax.random.wrap_key_data(data, impl="rbg"))
     with pytest.raises(AssertionError):
         assert_same_leaf(rbg, unsafe)
-

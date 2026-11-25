@@ -482,9 +482,9 @@ def test_a_streamed_weighted_mixture_read_in_loading_workers_reads():
 
 def test_a_window_shuffled_stream_holds_the_index_of_its_current_file_alone(tmp_path):
     """A stream of thirty JSON-lines files read by index through a shuffle window
-    (`dew.data.shards._SequentialIterator.window`) holds the records' places of the file it stands in alone, each it stood past closed as it passed: a
-    window that ended at a file's last record left that file's held, so a read held one table a file for
-    every file it ever read (row 12996)."""
+    (`dew.data.shards._SequentialIterator.window`) holds the records' places of the file it stands in
+    alone, each it stood past closed as it passed: a window that ended at a file's last record left that
+    file's held, so a read held one table a file for every file it ever read (row 12996)."""
     import gc
 
     from dew.data.sources import files
@@ -502,4 +502,3 @@ def test_a_window_shuffled_stream_holds_the_index_of_its_current_file_alone(tmp_
     finally:
         reader.close()
     assert len(set(read)) > 100 and len(held) <= 2
-
