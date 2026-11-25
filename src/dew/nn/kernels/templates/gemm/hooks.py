@@ -3,7 +3,8 @@ its side tiles, as `grouped_matmul`'s launches bind them and their kernels trace
 
 import dataclasses
 import functools
-from typing import Protocol, runtime_checkable
+from collections.abc import Callable
+from typing import NamedTuple, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -138,6 +139,65 @@ def _lowers(hook, tiles: tuple, sides, rules, *, layout=None) -> bool:
         traced = jax.make_jaxpr(hook)(*tiles, *sides)
     return all(equation.primitive in rules or equation.primitive is marked_call_p
                for equation in equations(traced.jaxpr))
+
+
+@dataclasses.dataclass(frozen=True)
+class ColumnLocal:
+    """An epilogue or prologue `hook` its caller declares column-local: evaluated on any slice of its tile's
+    columns (and its side tiles' same columns) it computes that slice of its result, its extents read
+    nowhere, and so does its pullback where a reverse pass forms it (`gemm._prologue_pulled`, which declares
+    its prologue's VJP only where the prologue is declared; `activations.gated_hook`, entrywise). A launch
+    reads such an epilogue's tile out a chunk of columns at a time (`read_out`, `pricing.hook_chunk`); any
+    other its issuer's own read-out (a register accumulator's whole, tcgen05's 64 columns)."""
+
+    hook: Callable
+
+    def __call__(self, *tiles):
+        return self.hook(*tiles)
+
+
+def column_local(hook) -> bool:
+    """Whether `hook` is declared column-local (`ColumnLocal`) as a launch holds it: through the form every
+    launch takes it in (`tuning.Prepared`'s source; the algebra's rewrite computes its function) and its side
+    tiles' dimensions of one given back (`_unsqueezed`, across whatever columns its tile has)."""
+    from dew.nn.kernels import tuning
+
+    while not isinstance(hook, ColumnLocal):
+        if isinstance(hook, tuning.Prepared):
+            hook = hook.source
+        elif isinstance(hook, functools.partial) and hook.func is _unsqueezed:
+            hook = hook.args[0]
+        else:
+            return False
+    return True
+
+
+class ReadOut(NamedTuple):
+    """How a launch's epilogue reads its tile out (`read_out`): each output's divisor where its form narrows
+    it, 1 elsewhere (`narrowed`; a tile's own columns by `mosaic_gpu._gmm_finished`), and the columns its
+    hook takes at a time (`columns`, `pricing.hook_chunk`), None for its issuer's own read-out."""
+
+    narrowed: tuple = ()
+    columns: int | None = None
+
+
+NO_READ_OUT = ReadOut()
+"""A launch's read-out where its caller states none: no output narrowed, its issuer's own chunks."""
+
+
+def read_out(family, part: tuple[int, int], dtypes: tuple, forms: tuple, staging, epilogue) -> ReadOut:
+    """A launch's `ReadOut` on `family` at a consumer's `part` of its tile (rows, columns), its outputs'
+    `dtypes` and `forms` (none where empty), its `staging`, and its `epilogue` (a `ColumnLocal` one read out
+    a chunk at a time): the one decision its kernel (`mosaic_gpu._finished`) and its register model
+    (`grouped_matmul._epilogue_registers`) both read."""
+    from dew.nn.kernels.templates.gemm import pricing
+
+    forms = tuple(forms) or (None,) * len(dtypes)
+    narrowed = tuple(1 if form is None or not form.narrowed else form.divisor for form in forms)
+    if epilogue is None:
+        return ReadOut(narrowed)
+    return ReadOut(narrowed, pricing.hook_chunk(family, part[0], part[1], dtypes, forms, staging,
+                                                local=column_local(epilogue)))
 
 
 def lowering_rules(target) -> dict:

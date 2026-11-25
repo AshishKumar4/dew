@@ -80,6 +80,7 @@ from dew.nn.kernels.templates.gemm import (
     sides_padded,
 )
 from dew.nn.kernels.templates.gemm.chained import Chained, Partition, flag_row, flags_declared, guarded_walk
+from dew.nn.kernels.templates.gemm.hooks import NO_READ_OUT, read_out
 from dew.nn.kernels.templates.gemm.pricing import (
     dense_tail,
     family_of,
@@ -530,6 +531,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                                 packed_format=packed_format, forms=forms)
     bounded = None if when is None else chained  # each product its own accumulator (`guarded_walk`)
     matrices, streamed, accumulators = _gmm_streamed(paired, scales, joined, bounded)
+    reading = read_out(family, part, dtypes, forms, tiles.staging, epilogue)
     # A pair's tiles: g groups' boundaries, and the unrouted rows.
     grid = (pl.cdiv(m, block_m * pair) + (0 if dense else g), pl.cdiv(n, block_n))
     def body(*gmems):
@@ -576,11 +578,10 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                     _gmm_finished, accs, wg=wg, store=store, family=family, part=part,
                     share_row=tiles.share_row(wg), m=m, g=g, dense=dense, row_tile=block_m * pair,
                     whole=any(form is not None and form.transposed for form in forms),
-                    narrowed=tuple(form.divisor if form is not None and form.narrowed else 1
-                                   for form in forms),
+                    reading=reading,
                     epilogue=epilogue, flags=(flags_gmem, pair, tiles.sharing),
                     sides=tuple(zip(side_gmems, epilogue_axes, side_smems, side_barriers, strict=True)),
-                    partials=None if tail is None else (workspace, ready))
+                    partials=None if tail is None else (workspace, ready, pairs))
                 _stored(finished, tile, out, beside)
             walks = (tiles.splits * grid[0] * grid[1],) if tail is None else (tail.segments, pairs)
             family.persist(streams, walks, schedule, issue, finish, consumers=consumers,
@@ -614,7 +615,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                                          parts=(tail, scales if scales is not None else packed_format,
                                                 mx_scales, gather, chained), beside=beside))
     return kernel(*(operands if dense else (table, *operands)), *prologue_operands, *epilogue_operands,
-                  *_workspace(tail, tail_workspace(tiles, family, pair * pairs), interpret))
+                  *_workspace(tail, (tiles, family, pair * pairs), interpret))
 
 
 def _gmm_forms_refused(tiles: Tiles, family: mosaic.Family, k: int, n: int, mx_scales, step_scales, *,
@@ -769,7 +770,7 @@ def _declared(lhs, rhs, gather, shape: tuple[int, int, int | None], splits: int,
 
 def _gmm_finished(accs: tuple, tile: tuple, wg, store, *, family: mosaic.Family, part: tuple, share_row,
                   m: int, g: int, dense: bool, row_tile: int, epilogue, o_gmems: tuple, sides: tuple,
-                  partials, flags: tuple = (None, 1, 1), whole: bool = False, narrowed: tuple = ()) -> None:
+                  partials, flags: tuple = (None, 1, 1), whole: bool = False, reading=NO_READ_OUT) -> None:
     """Dew: a consumer's share of a `gmm` tile stored (`_finished`) from its accumulators: at once, or,
     a balanced tail's tile (`partials`: its workspace and readiness flags), once its program's partial and
     the other programs' are added (`mosaic.Family.fixed_up`); with `flags` (`chained.flags_declared`'s, the
@@ -797,16 +798,14 @@ def _gmm_finished(accs: tuple, tile: tuple, wg, store, *, family: mosaic.Family,
         origins={'rows': pl.ds(part_row, part[0]), 'columns': pl.ds(column, part[1])},
         group=_side_group(group, g), nonfinite=nonfinite,
         place=(part_row, first, stored, column, min(part[0], m), TMA_ROWS if dense else 1),
-        narrowed=tuple(None if divisor == 1 else (divisor, ni * (part[1] // divisor))
-                       for divisor in narrowed))
+        reading=reading, column_tile=ni)
     if partials is None or partials[0] is None:
         finished(*accs)
         return
-    workspace, ready = partials
-    first, gathered = gathered
-    cta = mosaic.cluster_index(pair)
-    family.fixed_up(accs[0], workspace.at[cta, :, 0, wg], None if ready is None else ready.at[cta, :, wg],
-                    program, first, gathered, finished, firsts=workspace.at[cta, :, 1, wg])
+    (workspace, ready, pairs), (first, gathered, slot), cta = partials, gathered, mosaic.cluster_index(pair)
+    held, firsts = tail_of.slots(workspace, cta, wg, pairs)
+    family.fixed_up(accs[0], held, None if ready is None else ready.at[cta, :, wg], program, first, gathered,
+                    finished, firsts=firsts, slot=slot)
 
 
 def _stored_rows(group, part_row, rows: int, m: int, *, dense: bool, row_tile: int) -> tuple:
@@ -873,7 +872,7 @@ def _fixed_loaded(family: mosaic.Family, prologue_gmems, prologue_axes: tuple, f
 
 
 def _finished(*accs, family: mosaic.Family, wg, epilogue, o_gmems: tuple, store, sides: tuple, origins: dict,
-              group, place: tuple, nonfinite=None, narrowed: tuple = ()) -> None:
+              group, place: tuple, nonfinite=None, reading=NO_READ_OUT, column_tile=0) -> None:
     """Dew: a consumer's share of a `gmm` tile from its accumulators (`accs`), read out a chunk of columns
     at a time (`mosaic.Issuer.chunks`: all of them at once where its registers hold them): its epilogue on
     its side tiles' same columns (`sides`, each its global ref, axes, staging and barrier, loaded at
@@ -884,8 +883,8 @@ def _finished(*accs, family: mosaic.Family, wg, epilogue, o_gmems: tuple, store,
     written there: the stored value's, converted once, as a finite fp32 sum can overflow its output's dtype
     (base review b1ab251ac F1: 65536, the joined sum where the products' was 65504, an fp16 infinity), of its
     stored rows alone: another group's, by this entry's matrix, may overflow (base review d0bc7dee6 F3). An
-    output `narrowed` names (its divisor and first column, `_gmm_finished`'s) is stored at its own column, a
-    chunk's a `divisor`-th of its tile column."""
+    output `reading` narrows stored at its own column (`column_tile` times its stored width); a hook takes
+    `reading.columns` at a time (`read_out`), its issuer's own read-out where None."""
     family.loaded([(gmem.at[axes.named(side_axes, origins | axes.at_group(side_axes, gmem.shape, group))],
                     smem.at[wg], barrier.at[wg])
                    for gmem, side_axes, smem, barrier in sides],
@@ -894,7 +893,8 @@ def _finished(*accs, family: mosaic.Family, wg, epilogue, o_gmems: tuple, store,
     row_start, first, stored, column, *ladder = place
     seen = jnp.zeros((), jnp.bool_)
     layout = family.layout if family.budgets_registers else None
-    for start, chunk in family.chunks(accs):
+    width = accs[0].shape[-1]
+    for start, chunk in family.chunks(accs, reading.columns):
         columns = {'columns': slice(start, start + chunk[0].shape[-1])}
         # The epilogue and each output's store in the accumulator's layout: a form's write reads it (a
         # packed output's pairs, `quantized.paired`).
@@ -912,9 +912,9 @@ def _finished(*accs, family: mosaic.Family, wg, epilogue, o_gmems: tuple, store,
                     kept = family.iota(value.shape, 0) - first
                     stored_rows = (kept >= 0) & (kept < stored)
                     seen = seen | jnp.any(stored_rows & jnp.isnan(value * 0))
-                own = narrowed[output] if narrowed else None
-                at = column + start if own is None else own[1] + start // own[0]
-                store(output, value, o_gmem, (row_start, first, stored, at, *ladder))
+                own = reading.narrowed[output] if reading.narrowed else 1
+                at = column + start if own == 1 else column_tile * (width // own) + start // own
+                store(output, value, o_gmem, (row_start, first, stored, at, *ladder), within=(start, width))
     if nonfinite is not None:
         nonfinite[...] = jnp.broadcast_to(seen.astype(jnp.int32), (1,))
 
@@ -1077,13 +1077,15 @@ def _outputs(o_gmems: tuple, scatter_gmem, interpret: bool) -> tuple:
     return o_gmems
 
 
-def _workspace(tail, shape: tuple, interpret) -> tuple:
-    """Dew: a balanced tail's partials (`tail.Tail`): each program's, a consumer's share of a tile each, of
-    the tile its range starts inside and of the one it walks the first step of (`Family.fixed_up`'s
-    `firsts`), a ref the kernel writes in place, the last of its operands; none without a tail. Its slots
+def _workspace(tail, launch: tuple, interpret) -> tuple:
+    """Dew: a balanced tail's partials (`tail.Tail`): each program's, of the tile its range starts inside,
+    and each tail tile's first program's (`Family.fixed_up`'s `firsts`, `tail.slots`), a consumer's share of a
+    tile each, a ref the kernel writes in place, the last of its operands; none without a tail. Its slots
     are written only where programs share a tile, so it is no declared output, which would leave the rest
     unwritten (NSNAN-2), and it starts uninitialized (`mosaic.workspace`)."""
-    return () if tail is None else (mosaic.workspace(shape, jnp.float32, interpret=interpret),)
+    tiles, family, programs = launch
+    return () if tail is None else (
+        mosaic.workspace(tail_workspace(tiles, family, programs, tail), jnp.float32, interpret=interpret),)
 
 
 def _scale_refs(refs: tuple, step_scales, mx_scales, gather, scatter) -> tuple:
@@ -2201,7 +2203,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                                         family.summed_window(tiles.block_k))
 
             finish = functools.partial(_tgmm_finished, family=family, tiles=tiles, m=m, o_gmem=o_gmem,
-                                       partials=None if tail is None else (workspace, ready))
+                                       partials=None if tail is None else (workspace, ready, pairs))
             walks = (g * grid[0] * grid[1],) if tail is None else (tail.segments, pairs)
             family.persist(streams, walks, schedule, issue, finish, consumers=consumers,
                            axis="programs", outputs=allocations.outputs, interpret=bool(interpret),
@@ -2226,7 +2228,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                            cost=unit_cost.estimate(2 * k * m * n, lhs, rhs, *prologue_operands, out_type))
     return kernel(*groups, lhs, rhs, *(table for table in tables if table is not None), *(step_scales or ()),
                   *prologue_operands,
-                  *_workspace(tail, tail_workspace(tiles, family, pair * pairs), interpret))
+                  *_workspace(tail, (tiles, family, pair * pairs), interpret))
 
 def _tgmm_finished(wg, tile: tuple, summed, store, *, active, family: mosaic.Family, tiles: Tiles, m: int,
                    o_gmem, partials) -> None:
@@ -2241,12 +2243,11 @@ def _tgmm_finished(wg, tile: tuple, summed, store, *, active, family: mosaic.Fam
     if partials is None:
         _stored_chunks(family, summed, lambda value, at: store(0, value, out_gmem, at), place)
         return
-    workspace, ready = partials
-    first, gathered = gathered
+    (workspace, ready, pairs), (first, gathered, slot) = partials, gathered
     cta = mosaic.cluster_index(tiles.cluster)
-    family.fixed_up(summed, workspace.at[cta, :, 0, wg], None if ready is None else ready.at[cta, :, wg],
-                    program, first, gathered, lambda value: store(0, value, out_gmem, place),
-                    firsts=workspace.at[cta, :, 1, wg])
+    held, firsts = tail_of.slots(workspace, cta, wg, pairs)
+    family.fixed_up(summed, held, None if ready is None else ready.at[cta, :, wg], program, first, gathered,
+                    lambda value: store(0, value, out_gmem, place), firsts=firsts, slot=slot)
 
 
 def ragged_rows(m: int, *, prologue, k_major: bool) -> bool:

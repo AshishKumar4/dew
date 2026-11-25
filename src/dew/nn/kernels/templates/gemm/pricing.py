@@ -165,17 +165,23 @@ def dense_tail(tiles: "Tiles", dtype, extents: tuple[int, int, int], itemsizes: 
     # Its partials' workspace is the launch's beside its operands and output, no more than the reference's
     # (`GpuTarget.reference_workspace`): a GH200's 128 x 256 tiles' over 132 programs, 33 MiB, held past
     # cuBLAS's 32 (M-NG-45b's 34.6 MB temporaries a cell, row 12850).
-    if not within_workspace(target, math.prod(tail_workspace(tiles, family, programs)) * 4):
+    tail = balanced_tail(tiles, grid, -(-k // tiles.block_k), itemsizes, target, programs, dtype=dtype)
+    held = None if tail is None else math.prod(tail_workspace(tiles, family, programs, tail)) * 4
+    if held is None or not within_workspace(target, held):
         return None
-    return balanced_tail(tiles, grid, -(-k // tiles.block_k), itemsizes, target, programs, dtype=dtype)
+    return tail
 
 
-def tail_workspace(tiles: "Tiles", family: mosaic.Family, programs: int) -> tuple[int, ...]:
+def tail_workspace(tiles: "Tiles", family: mosaic.Family, programs: int,
+                   tail: tail_of.Tail) -> tuple[int, ...]:
     """A balanced tail's fp32 partials' shape, the one its planner bounds (`dense_tail`) and its launches
-    allocate (`mosaic_gpu._workspace`): each of a launch's `programs` (cluster pairs of `tiles.cluster`), two
-    tiles' (the one its range starts inside and the one it walks the first step of), each consumer's share
-    of the tile's rows by its columns (a tail's tile is no ping-pong one, `fixes_up`)."""
-    return (tiles.cluster, programs // tiles.cluster, 2, tiles.warpgroups, tiles.share,
+    allocate (`mosaic_gpu._workspace`): a slot each of a launch's `programs` (cluster pairs of
+    `tiles.cluster`), the partial of the tile its range starts inside, then one each of the tail's tiles
+    (`tail.Tail.tiles`), its first program's partial of it (`Family.fixed_up`'s `firsts`), each a consumer's
+    share of the tile's rows by its columns (a tail's tile is no ping-pong one, `fixes_up`): a slot a tile,
+    not a second one a program, where the tail's tiles are fewer than its programs (a GH200's 128 x 256
+    outlier's 66 pairs and 14 tiles: 21 MiB where two a program held 33, past cuBLAS's 32, NG29)."""
+    return (tiles.cluster, programs // tiles.cluster + tail.tiles, tiles.warpgroups, tiles.share,
             tile_columns(tiles, family))
 
 
@@ -221,13 +227,43 @@ def best_splits(walk: "SplitWalk | None", stages: int) -> int:
     return min([1, *filter(walk.holds, counts)], key=walk.seconds)
 
 
+def hook_chunk(family: mosaic.Family, share: int, columns: int, dtypes: tuple = (), forms: tuple = (),
+               staging: tuple[int, int] | None = None, *, local: bool = False) -> int:
+    """The columns an epilogue's hook takes at a time on `family` (`hooks.read_out`, the one decision its
+    kernel and its register model read): where the hook is column-local (`local`, `hooks.ColumnLocal`) and
+    its family's stores take chunks (`mosaic.Transport.stores_chunks`), a hook's chunk
+    (`Issuer.hook_columns`) widened to whole staged chunks of each of its outputs (each output's own
+    `stores.output_staging` of its dtype and form, `share` rows a consumer's), so a chunk's values fill whole
+    buffers; elsewhere, an output a form narrows or transposes among them, or no such chunk dividing the
+    tile, the issuer's own read-out (`chunk_columns`: a register accumulator's whole, tcgen05's 64)."""
+    from dew.nn.kernels.templates import stores
+
+    native = family.chunk_columns(columns)
+    chunk = family.hook_columns(columns)
+    forms = forms or (None,) * len(dtypes)
+    if (not local or not family.stores_chunks or chunk >= native or not dtypes
+            or any(form is not None and (form.narrowed or form.transposed) for form in forms)):
+        return native
+    piece = native
+    for dtype, form in zip(dtypes, forms, strict=True):
+        dtype = jnp.dtype(dtype)
+        packed = () if form is None else (stores.Output((share, columns), dtype, divisor=form.divisor),)
+        if stores.staging_refusal(columns, (dtype,), staging, piece=piece, packed=packed) is not None:
+            return native
+        chunk = math.lcm(chunk, stores.output_staging(columns, (dtype,), staging, piece=piece,
+                                                      packed=packed)[0])
+    return chunk if chunk < native and native % chunk == 0 else native
+
+
 def epilogue_registers(family: mosaic.Family, share: int, columns: int, stored: tuple, *,
                        vectors: int = 0, tiles: tuple = (), has_hook: bool = False,
-                       staging: tuple[int, int] | None = None) -> int:
+                       staging: tuple[int, int] | None = None, hooked: int | None = None) -> int:
     """Extra consumer-thread registers held across epilogue hook evaluation and staged stores:
     the single owner shared by `_Mosaic._epilogue_registers` and `syrk_registers` (row 11982). `tiles`,
     the dtypes of the `[rows, columns]` tiles beside the accumulator's chunk while its hook runs, each at the
-    width its issuer loads it in (`Issuer.side_bytes`, row 12689)."""
+    width its issuer loads it in (`Issuer.side_bytes`, row 12689). A hook's temporaries are a chunk's:
+    `hooked` columns where its kernel takes them so (`hook_chunk`), its issuer's read-out (`chunk_columns`)
+    elsewhere, beside the accumulator the mainloop's model holds whole."""
     from dew.nn.kernels.templates import resources, stores
 
     scalar = family.scalar_registers()
@@ -240,7 +276,8 @@ def epilogue_registers(family: mosaic.Family, share: int, columns: int, stored: 
 
     if not has_hook:
         return max(0, max((_staging(dtype) for dtype in stored), default=0) - scalar)
-    accumulator = -(-share * family.chunk_columns(columns) // resources.THREADS)
+    chunk = family.chunk_columns(columns) if hooked is None else hooked
+    accumulator = -(-share * chunk // resources.THREADS)
     held = sum(-(-accumulator * family.side_bytes(dtype) // 4) for dtype in tiles)
     live = [-(-accumulator * jnp.dtype(dtype).itemsize // 4) for dtype in stored]
     hook = max(0, resources.CONTROL_REGISTERS + vectors + held - scalar) + sum(live[1:])
