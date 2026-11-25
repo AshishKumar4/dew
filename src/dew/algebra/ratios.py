@@ -56,8 +56,8 @@ class Ratio:
     `Summed`), its `numerator` then none: a derivative's whose denominator moves, `(dP D - q P dD) / D^(q+1)`
     (`_ratio_jvp`), each sum formed once, unlanded, so no quotient is landed apart from the terms it cancels
     against (the merge P0's base review 9, F2: a landed quotient of 2^-156 lost the derivative's -2^-66).
-    Where join_directions is set, the derivative sums terms carrying a direction before reducing over
-    states, so cancellation within a stationary coefficient cannot erase another state's direction.
+    Derivatives stream their active direction by the ordered operand roles in direction_groups, so
+    cancellation within a stationary coefficient cannot erase another state's direction.
     A zero lands as +0. A value (`scaled._valued`)."""
 
     numerator: tuple
@@ -69,7 +69,7 @@ class Ratio:
     across: tuple[int, ...] = ()
     power: int = 1
     products: tuple = ()
-    join_directions: bool = False
+    direction_groups: tuple[tuple[int, ...], ...] = ()
     directions: tuple[tuple[int, ...], ...] = ()
 
 
@@ -378,6 +378,8 @@ def _compacted(operands: list, form: Ratio):
     return ([operands[index] for index in sorted(read)],
             dataclasses.replace(form, numerator=_remapped(form.numerator, to),
                                 denominator=_remapped(form.denominator, to),
+                                direction_groups=tuple(tuple(to(i) for i in group if i in read)
+                                                       for group in form.direction_groups),
                                 directions=tuple(tuple(to(i) for i in group if i in read)
                                                  for group in form.directions),
                                 products=tuple((coefficient, tuple(dataclasses.replace(
@@ -431,14 +433,16 @@ def _ratio_jvp(primals, tangents, *, form: Ratio):
     products = _canonical(products)
     if not products:
         return value, ad.Zero(jax.typeof(value).to_tangent_aval())
-    directions = ()
-    if form.join_directions:
-        # Earlier directions can still have the largest coefficients when this direction is taken.
-        # Their replacements belong to the same group, considered first in each product.
-        directions = (*[(*group, *(tangent_of[i] for i in group if i in tangent_of))
-                        for group in form.directions], tuple(tangent_of.values()))
+    # A tangent of a direction keeps the original operand's group. This makes the contraction's order
+    # independent of differentiation order; mass slots remain entrywise even after differentiating a value.
+    groups = tuple((*group, *(tangent_of[i] for i in group if i in tangent_of))
+                   for group in form.direction_groups)
+    directions = tuple((*prior, *(tangent_of[i] for i in group if i in tangent_of))
+                       for group, prior in zip(form.direction_groups,
+                                               form.directions or ((),) * len(groups), strict=True))
     derived_form = _classic(dataclasses.replace(form, numerator=(), products=products,
-                                                power=form.power + bool(moved), directions=directions))
+                                                power=form.power + bool(moved), direction_groups=groups,
+                                                directions=directions))
     return value, ratio(operands, derived_form)
 
 

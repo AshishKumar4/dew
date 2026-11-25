@@ -1378,6 +1378,12 @@ def test_a_stationary_weight_direction_cannot_erase_another_samples_tangent(mode
     np.testing.assert_array_equal(first, [-2.0 ** -40])
     np.testing.assert_array_equal(second, [-2.0 ** -39])
 
+    def value_direction(weight):
+        return jax.jvp(lambda v: moments.chunked_moments(v, weight, tile=1, mode=mode)[1], (x,), (x,))[1]
+
+    _, reversed_second = jax.jvp(value_direction, (w,), (dw,))
+    np.testing.assert_array_equal(reversed_second, second)
+
 
 def test_chunked_moments_directed_overflow_mixed_zero_weight_and_direct_jvp():
     """Weight tangents stay finite when `cx * cy` overflows, mixed 2nd derivatives at zero individual and
