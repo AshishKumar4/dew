@@ -83,6 +83,7 @@ from dew.nn.protocols import (
     StatesVocabulary,
     forward_method,
     head_table,
+    logits_width,
 )
 
 
@@ -171,10 +172,10 @@ def final_read(model, variables, *args, **kwargs):
 
 def _refuse_unlike_logits(model, read) -> None:
     """Refuse what a model's forward gave (`final_read`'s read, beside its sown collections where any were
-    opened) unless it is `[B, S, vocab]`, `vocab` its `vocab_size` where it declares one
-    (`StatesVocabulary`)."""
+    opened) unless it is `[B, S, vocab]`, `vocab` the width of its logits where it declares its vocabulary
+    (`logits_width`: a head scoring fewer ids than its table holds rows, `output_vocab`, scores those)."""
     logits = read[0] if isinstance(read, tuple) else read
-    vocabulary = model.vocab_size if isinstance(model, StatesVocabulary) else None
+    vocabulary = logits_width(model) if isinstance(model, StatesVocabulary) else None
     if jnp.ndim(logits) != 3 or (isinstance(vocabulary, int) and jnp.shape(logits)[-1] != vocabulary):
         raise ValueError(f"a {type(model).__name__} has no `logits`, so its `__call__` is read as its "
                          f"logits, [B, S, vocab{'' if vocabulary is None else f' = {vocabulary}'}], and "
