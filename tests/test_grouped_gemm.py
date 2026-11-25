@@ -1528,7 +1528,7 @@ def test_ampere_multi_wave_dense_dx_unifies_planner_and_kernel_and_holds_check_1
         dy_1w = jax.ShapeDtypeStruct((4096, 1024), jnp.bfloat16)
         ba_1w = tgmm.bind(x_1w, dy_1w, sizes, out_dtype="float32", interpret=False, dense=True)
         tile_1w = tiling.Tiles(128, 64, 32, 4, 8, warpgroups=1, family="mma.sync", programs=2)
-        assert tgmm._stated(ba_1w, tile_1w, sm80)["balanced"] is None
+        assert tgmm._stated(ba_1w, tile_1w, sm80)["balanced"] is False
         few = dataclasses.replace(sm80, multiprocessors=20)
         x_few = jax.ShapeDtypeStruct((4096, 512), jnp.bfloat16)
         ba_few = tgmm.bind(x_few, dy_1w, sizes, out_dtype="float32", interpret=False, dense=True)
@@ -1664,10 +1664,21 @@ def test_hopper_cluster2_balanced_tail_holds_check_1(rows, depth, mp):
                             truth_fn=functools.partial(dw_plain, wide=jnp.float64, out=jnp.float64))
 
 
+def _traced_on(target, fn, args):
+    """`fn` of `args` traced on `target` assumed, whatever generation its compile names."""
+    def traced(*arrays):
+        with generation.assumed(target):
+            return fn(*arrays)
+
+    return traced, args
+
+
 @lowers("sm90")
 def test_hopper_cluster2_balanced_tail_lowers_spill_free():
     """Hopper `128x256x64 cluster=2` dense `gmm` and `tgmm` with balanced tail compile under sm90 ptxas
-    with zero spills (row 10151)."""
+    with zero spills (row 10151), on an H100 PCIe's 114 multiprocessors, whose 57 pairs' partials (30 MiB)
+    are within cuBLAS's 32 MiB workspace; a GH200's 66 pairs' (33 MiB) are not, so it takes none (row
+    12850)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels
 
@@ -1683,9 +1694,11 @@ def test_hopper_cluster2_balanced_tail_lowers_spill_free():
         from dew.nn.kernels.templates.gemm import pricing
 
         tile_c2 = tiling.Tiles(128, 256, 64, 3, 4, warpgroups=2, cluster=2, family="wgmma")
-        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (16384, 9728, 2560), (2, 2), sm90, 132) is None
-        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (16384, 2560, 9728), (2, 2), sm90, 132) is None
-        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (2048, 2560, 8192), (2, 2), sm90, 132) is not None
+        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (2048, 2560, 8192), (2, 2), sm90, 132) is None
+        sm90 = dataclasses.replace(sm90, multiprocessors=114)
+        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (16384, 9728, 2560), (2, 2), sm90, 114) is None
+        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (16384, 2560, 9728), (2, 2), sm90, 114) is None
+        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (2048, 2560, 8192), (2, 2), sm90, 114) is not None
         x_fwd = jax.ShapeDtypeStruct((2048, 8192), jnp.bfloat16)
         w_fwd = jax.ShapeDtypeStruct((1, 8192, 2560), jnp.bfloat16)
         x_dw = jax.ShapeDtypeStruct((8192, 2560), jnp.bfloat16)
@@ -1699,9 +1712,10 @@ def test_hopper_cluster2_balanced_tail_lowers_spill_free():
         assert gmm._stated(ba_fwd, tile_c2_split, sm90)["balanced"] is False
         assert tgmm.legal(ba_dw, tile_c2, sm90) and tgmm.balanced(ba_dw, tile_c2, sm90)
         cases = [
-            KernelCase("sm90_cluster2_tail_fwd", lambda: gmm.lowering(ba_fwd, tile_c2)),
-            KernelCase("sm90_cluster2_split2_fwd", lambda: gmm.lowering(ba_fwd, tile_c2_split)),
-            KernelCase("sm90_cluster2_tail_dw", lambda: tgmm.lowering(ba_dw, tile_c2)),
+            KernelCase("sm90_cluster2_tail_fwd", lambda: _traced_on(sm90, *gmm.lowering(ba_fwd, tile_c2))),
+            KernelCase("sm90_cluster2_split2_fwd",
+                       lambda: _traced_on(sm90, *gmm.lowering(ba_fwd, tile_c2_split))),
+            KernelCase("sm90_cluster2_tail_dw", lambda: _traced_on(sm90, *tgmm.lowering(ba_dw, tile_c2))),
         ]
         records = compile_mosaic_kernels(cases, "sm90")
     for rec in records:

@@ -188,7 +188,7 @@ Exact-sum promotion and FP8 block scales (DeepSeek-V3's 1×128 and 128×128; sm1
 "Written once" means each template's algebra is a small set of equivalent formulations, each written once and available to every mainloop. The derivation (§7) takes one per device and shape from facts (the exponential unit's rate, the call's batch and heads, the depth against the output's tiles), never by a measured ranking (a few legal values priced by the one cost model are §7's), and each one passes both checks. Examples:
 - attention: FA4's lazy rescale and partial software exp2, which pay where the exponential unit is the bottleneck, as on Blackwell; the D forms (§8);
 - recurrence: the fused or split solve, and sequential or composed state passing;
-- GEMM: split-K or stream-K, and two-level accumulation.
+- GEMM: split-K or stream-K, and two-level accumulation. A launch's fp32 partials (a split's slices, a stream-K tail's programs) stay within the workspace the reference's library holds for one GEMM (XLA hands cuBLAS 4 MiB before Hopper and 32 MiB from it, `GpuTarget.reference_workspace`), so its peak memory is the reference's (§1).
 
 A device that needs a formulation the set lacks gets it added to the algebra once, for every backend, never as a device-specific kernel.
 
