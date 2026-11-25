@@ -220,7 +220,7 @@ def write_recording(directory: Path) -> None:
     record_logits(directory, model, truth, command, draw=draw, stepped=STEPPED,
                   reference='Inkling2LoopForCausalLM (transformers)',
                   revision=f'huggingface/transformers@{REVISION}', license='Apache-2.0',
-                  transformers=transformers.__version__, torch=torch.__version__)
+                  transformers=transformers.__version__)
 
 
 if __name__ == '__main__':
