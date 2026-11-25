@@ -147,16 +147,20 @@ def test_a_reference_an_earlier_dew_saved_is_refused_and_one_this_dew_saved_resu
         run("current").fit(data(), steps=2, checkpoint_every=2)
         source = run("current")
         state = source.stored(source.checkpoints.restore(source.place()[0], 2)[0])
-        legacy = Checkpoints(str(tmp_path / "legacy"))
-        legacy.save(2, dataclasses.replace(state, ema={key: value for key, value in state.ema.items()
-                                                       if key != NVFP4_HISTORY}))
-        legacy.wait()
+        # A current checkpoint whose reference histories hold values of their own, which a restore reads back.
+        seeded = dataclasses.replace(state, ema={**state.ema, NVFP4_HISTORY: jax.tree.map(
+            lambda leaf: leaf + 1.0, state.ema[NVFP4_HISTORY])})
+        unkept = {key: value for key, value in state.ema.items() if key != NVFP4_HISTORY}
+        for name, ema in (("legacy", unkept), ("seeded", seeded.ema)):
+            written = Checkpoints(str(tmp_path / name))
+            written.save(2, dataclasses.replace(state, ema=ema))
+            written.wait()
         earlier = run("legacy")
         with pytest.raises(ValueError):
             earlier.place()
-        again = run("current")
+        again = run("seeded")
         kept = again.stored(again.place()[0]).ema[NVFP4_HISTORY]
-    for read, written in zip(jax.tree.leaves(kept), jax.tree.leaves(state.ema[NVFP4_HISTORY]), strict=True):
+    for read, written in zip(jax.tree.leaves(kept), jax.tree.leaves(seeded.ema[NVFP4_HISTORY]), strict=True):
         np.testing.assert_array_equal(np.asarray(read), np.asarray(written))
 
 
