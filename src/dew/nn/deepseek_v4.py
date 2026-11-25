@@ -1123,22 +1123,19 @@ class DeepseekV4Mixer(MixerBase):
         return self._built(DeepseekV4Attention, ctx)
 
     def publications(self, kv_shared: bool) -> tuple[frozenset[str], frozenset[str]]:
-        """`MixerBase.publications`: a CSA2 Reuse layer (sharing) reads the entries and selection; a Reindex
-        layer reads the entries and index keys, and the candidates where it restricts to them, and writes
-        its selection; a Full layer, reading the candidates where it restricts too, writes its entries,
-        index keys and selection; either writes its candidates where
-        a candidate source pools them, `candidates='source'`: `DeepseekV4Attention`, `_published`)."""
+        """`MixerBase.publications`, of the roles a CSA2 layer runs (`DeepseekV4Attention.setup`): a Reuse
+        layer (sharing) reads the entries and selection; a Reindex layer reads the entries and index keys,
+        and the candidates where it restricts to them, and writes its selection; a Full layer writes its
+        entries, index keys and selection, and the candidate pool where it is its source."""
         if self.compressor != 'csa2':
             return frozenset(), frozenset()
         if kv_shared:
             return frozenset({_CSA2_ENTRIES, _CSA2_SELECTED}), frozenset()
-        restricted = {_CSA2_CANDIDATES} if self.candidates == 'restrict' else set()
-        pooled = ({_CSA2_CANDIDATES} if self.candidates == 'source' and self.candidate_blocks
-                  and self.candidate_block_size else set())
         if self.reindex:
-            return (frozenset({_CSA2_ENTRIES, _CSA2_INDEX_KEYS, *restricted}),
-                    frozenset({_CSA2_SELECTED, *pooled}))
-        return frozenset(restricted), frozenset({_CSA2_ENTRIES, _CSA2_INDEX_KEYS, _CSA2_SELECTED, *pooled})
+            restricted = {_CSA2_CANDIDATES} if self.candidates == 'restrict' else set()
+            return frozenset({_CSA2_ENTRIES, _CSA2_INDEX_KEYS, *restricted}), frozenset({_CSA2_SELECTED})
+        pooled = {_CSA2_CANDIDATES} if self.candidates == 'source' else set()
+        return frozenset(), frozenset({_CSA2_ENTRIES, _CSA2_INDEX_KEYS, _CSA2_SELECTED, *pooled})
 
     def drafter(self, ctx: MixerContext) -> Callable[..., nn.Module]:
         """This kind's attention as a DSpark stage's (`DSparkAttention`)."""

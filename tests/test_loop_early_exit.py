@@ -466,18 +466,30 @@ def _reindexed(index_sources=(2, 3, 4, 5), kv_sources=(2,), rates=None, **fields
     after it reading them and writing their selections (`index_sources` past 2), and a Reuse layer at any
     layer from 3 they leave out, reading the latest selection (a Full layer at each of `kv_sources`, at
     `rates` a layer where given), `fields` over its own."""
+    return CausalTransformer(**{**_reindexed_fields(_cut_config(index_sources, kv_sources, rates)),
+                                **fields})
+
+
+def _cut_config(index_sources=(2, 3, 4, 5), kv_sources=(2,), rates=None) -> dict:
+    """DeepSeek V4.1's tiny release config cut to six layers (`_reindexed`)."""
     config = json.loads((FIXTURES / "deepseek-v41-tiny" / "config.json").read_text())
     text = config["text_config"]
     own = text["compress_ratios"][:4] + [2] * 2 if rates is None else list(rates)
     ratios = own + text["compress_ratios"][text["num_hidden_layers"]:]
-    config = {**config, "text_config": {
+    return {**config, "text_config": {
         **text, "num_hidden_layers": 6, "compress_ratios": ratios, "kv_source_layer_ids": list(kv_sources),
         "index_source_layer_ids": list(index_sources), "candidate_source_layer_id": 2,
         "engram_layer_ids": [1], "engram_num_embeddings": text["engram_num_embeddings"][:1],
         "dspark_target_layer_ids": [3, 4, 5]}}
+
+
+def _reindexed_fields(config=None) -> dict:
+    """`_reindexed`'s decoder fields, translated from `config` (the six-layer cut by default) on a plain
+    residual: no mHC, engram or DSpark, which a loop refuses."""
+    config = config or _cut_config()
     translated = {key: value for key, value in translate_config(config).items()
                   if key not in ("hyper_connections", "engram", "dspark")}
-    return CausalTransformer(**{**translated, "dtype": "float32", **fields})
+    return {**translated, "dtype": "float32"}
 
 
 def _block_gated(model: CausalTransformer, layers: tuple[int, int], steps: int = 2) -> CausalTransformer:
@@ -510,12 +522,42 @@ def test_a_block_gate_refuses_a_coda_reading_its_blocks_publications():
 
 
 def test_a_block_gate_refuses_a_coda_restricted_to_its_blocks_candidates():
-    """A looped Full layer pooling the candidates (the candidate source) before a coda whose own Full layer
-    writes fresh entries, index keys and selection but no candidates, its layers restricted to the pooled
-    candidates: the coda reads the block's pool alone (`MixerBase.publications`), and a gate on the block's
-    output is refused; the loop without it runs."""
+    """A looped Full layer pooling the candidates (the candidate source, layer 2) before a coda whose own
+    Full layer (3, natively a Full of the same rate with no candidate role) writes fresh entries, index keys
+    and selection but no candidates, its Reindex layers restricted to the pooled candidates: the coda reads
+    the block's pool alone (`MixerBase.publications`), and a gate on the block's output is refused; the loop
+    without it runs."""
     ids = jnp.ones((2, 8), jnp.int32)
-    model = _reindexed(kv_sources=(2, 3), rates=(0, 0, 2, 2, 2, 2))
+    fields = _reindexed_fields()
+    source = fields["kinds"]["csa2_ratio_2"]
+    plain = source.copy()
+    plain["mixer"] = {**source["mixer"], "fields": {
+        key: value for key, value in {**source["mixer"]["fields"], "candidates": None}.items()
+        if key not in ("candidate_blocks", "candidate_block_size")}}
+    layer_types = list(fields["layer_types"])
+    layer_types[3] = "csa2_ratio_2_plain"
+    model = CausalTransformer(**{**fields, "kinds": {**fields["kinds"], "csa2_ratio_2_plain": plain},
+                                 "layer_types": tuple(layer_types)})
+    model.with_passes(2, (2, 3)).init(jax.random.key(0), ids)
+    with pytest.raises(ValueError):
+        _block_gated(model, (2, 3)).init(jax.random.key(0), ids)
+
+
+def test_a_block_gate_refuses_a_coda_reading_a_parallel_layers_publications():
+    """A looped parallel layer whose branch is a CSA2 Full publisher (`ParallelMixer`, its publications its
+    branches'): the decoder threads its store, the loop without a gate runs, and a gate on the block before
+    Reindex layers reading its entries is refused."""
+    from dew.nn.mixers.parallel import ParallelBranch, ParallelMixer
+
+    ids = jnp.ones((2, 8), jnp.int32)
+    fields = _reindexed_fields()
+    source = fields["kinds"]["csa2_ratio_2"]
+    full = source.value.mixer
+    sliding = fields["kinds"]["sliding_attention"].value.mixer
+    parallel = source.copy()
+    parallel["mixer"] = ParallelMixer(branches=(ParallelBranch("csa2", full),
+                                                ParallelBranch("window", sliding)))
+    model = CausalTransformer(**{**fields, "kinds": {**fields["kinds"], "csa2_ratio_2": parallel}})
     model.with_passes(2, (2, 3)).init(jax.random.key(0), ids)
     with pytest.raises(ValueError):
         _block_gated(model, (2, 3)).init(jax.random.key(0), ids)
@@ -562,20 +604,3 @@ def test_a_cached_block_gate_collects_exits_where_no_earlier_coda_runs():
     with pytest.raises(ValueError):
         block.apply({**variables, "cache": made(variables, 2)}, ids[:, :1], decode=True,
                     mutable=["cache", "intermediates"], capture_intermediates=lambda module, method: True)
-
-
-def test_a_parallel_layer_publishes_what_its_branches_do():
-    """A parallel layer's publications are its branches' in the order they run (`ParallelMixer`): a key one
-    branch writes before the next reads it is the layer's own, not a read from the layers before it, and it
-    writes what any branch writes, so a looped Full branch's entries are its coda's to refuse."""
-    from dew.nn.deepseek_v4 import DeepseekV4Mixer
-    from dew.nn.mixers.parallel import ParallelBranch, ParallelMixer
-
-    full = DeepseekV4Mixer(compressor="csa2")
-    reindex = DeepseekV4Mixer(compressor="csa2", reindex=True)
-    reads, writes = ParallelMixer(branches=(ParallelBranch("full", full), ParallelBranch("reindex", reindex))
-                                  ).publications(kv_shared=False)
-    assert not reads and writes == full.publications(kv_shared=False)[1]
-    reads, _ = ParallelMixer(branches=(ParallelBranch("reindex", reindex), ParallelBranch("full", full))
-                             ).publications(kv_shared=False)
-    assert reads == reindex.publications(kv_shared=False)[0]
