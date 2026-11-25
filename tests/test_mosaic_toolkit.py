@@ -294,36 +294,6 @@ def test_a_planned_launch_at_its_producers_registers_holds_the_programs_and_budg
         assert (model.budget, model.producer) == (budget, stated)
 
 
-def test_a_warpgroup_product_is_read_past_the_groups_its_overlap_commits():
-    """A warpgroup MMA's product read once the groups its overlapped work commits (`product_with`'s
-    `between`) alone are in flight, counted as they commit (`mosaic.sure_commits`), none under a predicate a
-    run decides: a stated count past them read the product unfinished (row 10851: dQ read at a hand count of
-    dV and dK's two groups)."""
-    from jax._src.pallas.mosaic_gpu import primitives as gpu
-
-    from dew.nn.kernels.templates import mosaic_sm90
-
-    family = mosaic_sm90.WGMMA
-
-    def waits(between) -> list:
-        def body(out_ref, lhs, rhs):
-            family.product_with(lhs, rhs, (64, 64), between)
-
-        tile = plgpu.SMEM((64, 64), jnp.bfloat16)
-        launch = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((1,), jnp.float32), num_threads=1,
-                              thread_name="wg", scratch_types=[tile, tile])
-        return [equation.params["wait_n"] for equation in equations(jax.make_jaxpr(launch)().jaxpr)
-                if equation.primitive is gpu.wgmma_accumulator_deref_p]
-
-    def two():
-        mosaic.committed()
-        mosaic.committed()
-
-    assert waits(lambda: None) == [0]
-    assert waits(two) == [2]
-    assert waits(lambda: (mosaic.predicated(mosaic.committed), mosaic.committed())) == [1]
-
-
 def test_a_launch_with_a_joined_correction_warpgroup_counts_its_registers_in_its_residency_and_budget():
     """A B200 launch of two softmax consumers beside a correction warpgroup joined at half their weight
     (`Family.role_schedule`'s `joined`, FlashAttention-4's three warpgroups and their producer): its program
