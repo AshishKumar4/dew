@@ -624,6 +624,13 @@ class MosaicForward(_Mainloop[Tiles]):
         # because `staged_bytes` calls `_products` -> `product_scratch`, which requires `ahead=True`.
         if family.places_on_role and not self._ahead(ba, config, target):
             return False
+        # A launch that reads its values from the key's slot (`reads_key_slot`) reads that slot within the
+        # step that waits on it, which a walk issuing its logits a step ahead (`_ahead`: tcgen05's chunks)
+        # already read the step before (`rings.Slots`' `following`): its program raises as it traces (a B200's
+        # in-key forward priced tcgen05.chunks at 64 x 64 on two consumers as a rewalk's candidate and raised,
+        # where its derivation offered it none to price before row 6216).
+        if self.reads_key_slot(family) and self._ahead(ba, config, target):
+            return False
         if not super().legal(ba, config, target):
             return False
         if decides and self.staged_bytes(ba, config, target, decides=True) > self.program_shared(config,
