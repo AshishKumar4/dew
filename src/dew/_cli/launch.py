@@ -352,7 +352,7 @@ class Launch:
             pinned = devices is not None and runs_on_gpu(self.host_env(host))
             taken = None if devices is None else range(devices) if pinned else range(first, first + devices)
             env = {**shared, **Launched.environ_of(address, count, rank, taken)}
-            if pinned:
+            if pinned and devices is not None:
                 env["CUDA_VISIBLE_DEVICES"] = ",".join(self.ordinals(host, first, devices))
             processes.append(Process(rank, host, self.remote_argv(host, env), env,
                                      env.get("CUDA_VISIBLE_DEVICES", "")))
