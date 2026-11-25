@@ -840,7 +840,8 @@ class RunConfig:
         record = self._fields_record()
         # The shallower paths first: a path under a section no run holds unset that the same point sets
         # (`context`, then `context.encoder`) is placed in the run as the point sets that section.
-        for path, value in sorted(point.items(), key=lambda item: item[0].count(".")):
+        for path in sorted(point, key=lambda path: path.count(".")):
+            value = point[path]
             if path in chained:
                 continue
             try:

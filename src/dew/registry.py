@@ -2260,13 +2260,12 @@ _IMPORTABLE = (type, types.FunctionType, types.BuiltinFunctionType, types.Method
 """What `import_path` names by its own path (`Importable`), as an instance check reads it."""
 
 
-def imported_argument[Value](annotation: type[Value]) -> tyro.constructors.PrimitiveConstructorSpec[Value]:
+def imported_argument() -> tyro.constructors.PrimitiveConstructorSpec[Callable[..., Configured]]:
     """A callable field written on the command line as its import path, `module:name` (`imported`): the
-    function it names, or the class, which the field's own class reads as its instance at its defaults
-    (`dew.config.lm.PromptRollout.reward`); written back as the import path of the function, or of the
-    instance's class. A run's record holds the callable's own record (`to_record`). Use it as the field's
-    metadata: `Annotated[Reward, imported_argument(Reward)]`."""
-    del annotation
+    function or the class it names, a class read by the field's own class as its instance at its defaults
+    is called (`dew.config.lm.PromptRollout.reward`); written back as the import path of the function or
+    the class, or of an instance's class. A run's record holds the callable's own record (`to_record`). Use
+    it as the field's metadata: `Annotated[Reward, imported_argument()]`."""
     return tyro.constructors.PrimitiveConstructorSpec(
         nargs=1,
         metavar="MODULE:NAME",

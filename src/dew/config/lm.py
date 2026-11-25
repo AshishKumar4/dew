@@ -90,7 +90,7 @@ class PromptRollout:
     `served`, where given, draws the completions ahead of the trainer from Dew's own server
     (`ServedRollout`, `--rollout.served.slots 8`) in place of each step's own generation."""
 
-    reward: Annotated[Reward, imported_argument(Reward)]
+    reward: Annotated[Reward, imported_argument()]
     groups: int = 4
     max_new_tokens: int = 32
     estimator: str | None = None

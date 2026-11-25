@@ -559,7 +559,7 @@ dew.config.lm.LMRunConfig
   pretrained: str | None = None
   rollout: Annotated[PromptRollout, tyro.conf.subcommand('rollout')] | None = None
 dew.config.lm.PromptRollout
-  reward: Annotated[Reward, imported_argument(Reward)]
+  reward: Annotated[Reward, imported_argument()]
   groups: int = 4
   max_new_tokens: int = 32
   estimator: str | None = None
