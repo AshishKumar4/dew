@@ -337,11 +337,16 @@ def test_a_banked_loop_of_several_runs_decodes_through_its_passes():
 
 @pytest.mark.mesh(devices=8)
 @pytest.mark.usefixtures("scanned_stacks")
-def test_a_gathered_loop_over_banks_serves_on_a_mesh_as_its_loop():
+@pytest.mark.parametrize(("num_layers", "loop"), [
+    pytest.param(6, {"layers": (2, 4)}, id="banked-block"),
+    pytest.param(4, {"layers": (0, 1), "exit_gate": True}, id="banked-coda"),
+])
+def test_a_gathered_loop_over_banks_serves_on_a_mesh_as_its_loop(num_layers, loop):
     """A gathered loop (`Loop.gathered`) over a store banked by run, traced as a server on an FSDP mesh
     traces it (`placing(FORWARD)`, `Server`'s): its scores and its prefill's decode logits are the same
     loop's not gathered, bit for bit, each pass reading its run's bank where it lies, where the gathered
-    passes' plain layers asked a lone layer for weights its run's bank holds (the row 12722 review)."""
+    passes' plain layers asked a lone layer for weights its run's bank holds (the row 12722 review): a bank
+    in the block, and a block of one layer whose every pass exits through a banked coda."""
     from dew.nn.backbones.decoder_stack import Loop
     from dew.nn.sharding import FORWARD, placing
     from dew.training import MeshSpec
@@ -349,8 +354,8 @@ def test_a_gathered_loop_over_banks_serves_on_a_mesh_as_its_loop():
     mesh = MeshSpec(fsdp=8).build(jax.devices()[:8])
     found = {}
     for gathered in (False, True):
-        _, scanned, variables, tokens = pair(num_layers=6, bank_layers=2,
-                                             loop=Loop(2, layers=(2, 4), gathered=gathered))
+        _, scanned, variables, tokens = pair(num_layers=num_layers, bank_layers=2,
+                                             loop=Loop(2, gathered=gathered, **loop))
         resident = HeldBanks(variables).place(scanned, mesh=mesh, layout=DEVICE)
 
         def prefilled(store, tokens, model=scanned):

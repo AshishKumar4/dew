@@ -354,15 +354,16 @@ def run_loop(model, x, *, train: bool, decode: bool, passes=None, **inputs):
         return x, run.exited
 
     layout = placed_layout()
-    # A decode (a server's step) and a store banked by run (each run's bank read by the scan the gathered
-    # passes do not run) read the block where it lies.
+    # The layers the passes run: the block's, and under `exiting`, where every pass runs the coda, the coda's.
+    read = (first, layers if loop.exiting else end)
+    # A decode (a server's step) and a store banked by run over any layer the passes run (each run's bank read
+    # by the scan the gathered passes do not run) read the block where it lies.
     if (loop.gathered and not decode and not model.is_initializing() and layout is not None
             and jax.sharding.get_abstract_mesh().shape.get(FSDP_AXIS, 1) > 1
-            and not model.banked_collections((first, end))):
-        # Under `exiting` every pass runs the coda too, whose layers are gathered with the block's.
+            and not model.banked_collections(read)):
         x, exited = _gathered_passes(model, every_pass, x, inputs, passes, functools.partial(
             _gathered_params, layout=layout, mesh=jax.sharding.get_abstract_mesh(),
-            scope=('params', *model.scope.path), span=(first, layers if loop.exiting else end)))
+            scope=('params', *model.scope.path), span=read))
     else:
         x, exited = every_pass(model, x, inputs, passes)
     if loop.reinject:
