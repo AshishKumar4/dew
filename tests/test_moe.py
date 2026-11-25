@@ -705,12 +705,17 @@ def test_a_gated_expert_layer_is_bitwise_its_projections_apart(limit):
         operands = draw(seed)
         return (*operands, jax.random.normal(jax.random.key(seed), cotangent.shape, jnp.bfloat16))
 
-    with jax.enable_x64(new_val=True), _chained():
-        def truth(x, gate, up, down, cotangent):
-            wide = [jnp.asarray(each, jnp.float64) for each in (x, gate, up, down, cotangent)]
-            return rows_gradient(apart)(*wide)
-        assert_as_exact(jax.jit(rows_gradient(gated)), jax.jit(rows_gradient(apart)), drawn,
-                        "a gated expert layer's rows' gradient", seeds=8, truth_fn=truth)
+    def chained(*operands):
+        # The chain traced where it runs on a CPU (`_chained`), its float64 truth and the arm apart as
+        # they run anywhere.
+        with _chained():
+            return rows_gradient(gated)(*operands)
+
+    def truth(x, gate, up, down, cotangent):
+        wide = [jnp.asarray(each, jnp.float64) for each in (x, gate, up, down, cotangent)]
+        return rows_gradient(apart)(*wide)
+    assert_as_exact(jax.jit(chained), jax.jit(rows_gradient(apart)), drawn,
+                    "a gated expert layer's rows' gradient", seeds=8, truth_fn=truth)
 
 
 @pytest.mark.parametrize("named", [False, True], ids=["unnamed", "named fused"])
