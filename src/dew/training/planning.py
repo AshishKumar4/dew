@@ -813,25 +813,49 @@ class Parting:
     hold more than it counts: a spectral preconditioning's SVD). Each rung's own: one parted leaves the next
     rung asked joined first, which may fit as it is, and one whose parting freed nothing leaves the next
     rung's to its own miss (owner, 2026-11-23, row 12463: a 4B cold start parted its stacks before the remat
-    rung its miss needed, three compiles where two were its contract)."""
+    rung its miss needed, three compiles where two were its contract). A parted rung's miss measures what
+    parting freed (`measured`), which then stands in for the count: parting that freed nothing is asked at
+    no later rung at once, and of the deferred variants only the last rung's is asked (owner, 2026-11-25:
+    a 4B cold start on two H100s parted every rung of its climb, freeing 0 bytes of its 10.98 GiB miss, six
+    6-11 minute compiles where three were the climb's)."""
     estimate: int
-    """What the step's joined stacks hold by count, every process's the same; 0 where it joins none."""
+    """What the step's joined stacks free where parted: their count (`joined_bytes`), every process's the
+    same, until a parted rung measures it (`measured`); 0 where it joins none."""
     gather: Callable[[object], list]
     """How every process's verdict is read (`FitSearch.gather`), so each asks the same rungs."""
     deferred: list[Rung] = dataclasses.field(default_factory=list)
     """The parted variants a miss past the count left for the climb's end, in the order it reached them."""
+    futile: bool = False
+    """Whether a parted rung's miss measured parting to free nothing on some process (`measured`)."""
 
     def after(self, rung: Rung, shortfall: int | None) -> Rung | None:
         """`rung`, asked joined and missed by `shortfall` (None where it measured no miss), parted, where it
-        is asked at once; None where its parted variant is deferred, or where the step joins no stacks or
-        its rung parts them already."""
+        is asked at once: every process's miss measured and within what parting frees, which no parted rung
+        measured to free nothing; None where its parted variant is deferred, or where the step joins no
+        stacks or its rung parts them already."""
         if not self.estimate or rung.ns_group is not None:
             return None
         parted = dataclasses.replace(rung, ns_group=1)
-        if any(self.gather(shortfall is not None and shortfall > self.estimate)):
+        if self.futile or any(self.gather(shortfall is None or shortfall > self.estimate)):
             self.deferred.append(parted)
             return None
         return parted
+
+    def measured(self, joined: int | None, parted: int | None) -> None:
+        """A rung's parted variant missed by `parted` where the rung joined missed by `joined` (None where a
+        miss measured nothing): what parting freed, the least any process measured, stands in for the
+        count; none freed, or none measured, makes parting futile."""
+        freed = self.gather(None if joined is None or parted is None else joined - parted)
+        if any(value is None or value <= 0 for value in freed):
+            self.futile = True
+        else:
+            self.estimate = min(freed)
+
+    def tail(self) -> list[Rung]:
+        """The deferred variants the climb asks before it gives up, in its order: every one, or where
+        parting was measured to free nothing, the last rung's alone, whose recomputation leaves the stacks
+        the most of its peak."""
+        return self.deferred[-1:] if self.futile else list(self.deferred)
 
 
 class Lower(Protocol):
@@ -1392,13 +1416,18 @@ class FitSearch[LossT, EffectsT]:
         parting = Parting(self.stacks_count() if group is None else 0, self.gather)
 
         def parted(rung: Rung) -> int | None:
-            # `rung`, just asked joined and missed, asked parted at once where its miss leaves it so.
-            variant = parting.after(rung, self.shortfall(named[-1]))
+            # `rung`, just asked joined and missed, asked parted at once where its miss leaves it so; a miss
+            # of it measures what parting freed (`Parting.measured`).
+            joined = self.shortfall(named[-1])
+            variant = parting.after(rung, joined)
             if variant is None or variant in self.asked:
                 return None
             self.variants = True
-            return ask(variant, "the step does not fit the devices with its Newton-Schulz stacks joined; "
-                       "compiling it again joining one at a time (%s)")
+            split = ask(variant, "the step does not fit the devices with its Newton-Schulz stacks joined; "
+                        "compiling it again joining one at a time (%s)")
+            if split is None:
+                parting.measured(joined, self.shortfall(named[-1]))
+            return split
 
         if (split := parted(start)) is not None:
             self.said(named)
@@ -1449,8 +1478,9 @@ class FitSearch[LossT, EffectsT]:
                 self.said(named)
                 return split
         # Every rung asked joined missed: each parted variant a miss past the stacks' count deferred, in the
-        # climb's order, before the search gives up (the count orders, and rules none out).
-        for variant in parting.deferred:
+        # climb's order, before the search gives up (the count orders, and rules none out), or the last
+        # rung's alone where parting was measured to free nothing (`Parting.tail`).
+        for variant in parting.tail():
             if variant in self.asked:
                 continue
             self.variants = True

@@ -89,10 +89,11 @@ def test_a_runs_param_groups_count_every_muon_transforms_joined_stacks():
 class Scripted(FitSearch):
     """A search over a small LM's ladder whose compiles are a table (`need`: the bytes a rung needs, by its
     place among the remat rungs a climb visits and whether it parts its stacks), judged against `room`, a
-    miss short by the difference; its stacks holding `count` bytes by count. Every rung it compiled, in
-    order (`compiled`), as `(place, ns_group)`."""
+    miss short by the difference, a need of None a miss that measured nothing (an allocation failure XLA
+    reports no figure for); its stacks holding `count` bytes by count. Every rung it compiled, in order
+    (`compiled`), as `(place, ns_group)`."""
 
-    def __init__(self, need: Callable[[int, int | None], int], room: int, count: int):
+    def __init__(self, need: Callable[[int, int | None], int | None], room: int, count: int):
         model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=2, num_heads=2, mlp_features=64,
                                   max_seq_len=16)
         climber = LMObjective(model, seq_len=16)
@@ -116,7 +117,11 @@ class Scripted(FitSearch):
     def fits_here(self, split: int) -> bool:
         place = self.place()
         self.compiled.append(place)
-        short = self.need(*place) - self.room
+        need = self.need(*place)
+        if need is None:
+            self.probes.append(Probe(split, 1, self.current(), fits=False, headroom=None, temp=0, argument=0))
+            return False
+        short = need - self.room
         self.probes.append(Probe(split, 1, self.current(), short <= 0, -short, 0, 0))
         if short > 0:
             self.misses[(self.rung(), split)] = MemoryMiss(split, 0, short * self.factor, self.factor)
@@ -126,8 +131,8 @@ class Scripted(FitSearch):
 def test_each_rung_is_asked_joined_before_its_stacks_part():
     """Parting is each rung's own: a start whose parted step missed leaves the next remat rung asked with
     its stacks joined, where it fits, the parted program's padding and lost batching not taken; and a
-    start whose parting freed nothing leaves the next rung, whose miss is within the stacks' count, parted
-    at once (review of row 12463: the parted group, once taken, held for every rung after, and once
+    start whose parting freed some of its miss leaves the next rung, whose miss is within what it freed,
+    parted at once (review of row 12463: the parted group, once taken, held for every rung after, and once
     dropped, for none)."""
     joined_fits = Scripted(lambda place, group: {(0, None): 100, (0, 1): 95}.get((place, group), 90),
                            room=90, count=20)
@@ -135,8 +140,8 @@ def test_each_rung_is_asked_joined_before_its_stacks_part():
     asked = joined_fits.compiled
     assert asked[:2] == [(0, None), (0, 1)] and len(asked) == 3 and asked[2][0] > 0 and asked[2][1] is None, (
         asked)
-    parted_fits = Scripted(lambda place, group: 100 if place == 0 else 95 if group is None else 90, room=90,
-                           count=20)
+    parted_fits = Scripted(lambda place, group: (100 if group is None else 98) if place == 0
+                           else 92 if group is None else 90, room=90, count=20)
     assert parted_fits.searched([1], 0) == 1
     asked = parted_fits.compiled
     assert [group for _, group in asked] == [None, 1, None, 1] and asked[2][0] == asked[3][0] > 0, asked
@@ -191,3 +196,28 @@ def test_a_process_whose_trace_noted_no_stacks_reads_the_frontier_its_peers_read
     # beneath the plan (its head's tiles, XLA's defaults) misses joined and fits parted.
     assert search.compiled[2] == (0, 1) and lighter, search.compiled
     assert all(probe.rung["ns_group"] == 1 and probe.fits for probe in lighter), search.compiled
+
+
+def test_parting_measured_to_free_nothing_is_asked_at_no_later_rung_but_the_last():
+    """A start whose parted step frees nothing of its miss, though the miss is within the stacks' count,
+    measures parting futile: every later rung is asked joined alone, and before the search gives up only
+    the last rung's parted step, where it fits (owner, 2026-11-25: a 4B cold start on two H100s parted
+    every rung of its climb, 83.29 GiB both ways against 72.31 GiB, six 6-11 minute compiles where three
+    were its climb's)."""
+    search = Scripted(lambda place, group: 100 if place == 0 or group is None else 90, room=90, count=20)
+    assert search.searched([1], 0) == 1
+    asked = search.compiled
+    parted = [at for at, (_, group) in enumerate(asked) if group == 1]
+    assert parted == [1, len(asked) - 1] and len(asked) > 4, asked
+    refused = Scripted(lambda place, group: 100, room=90, count=20)
+    assert refused.searched([1], 0) is None
+    assert sum(group == 1 for _, group in refused.compiled) == 2, refused.compiled
+
+
+def test_a_miss_that_measured_nothing_parts_no_stacks_at_once():
+    """A start whose miss measured no shortfall (an allocation failure XLA reports no figure for) asks the
+    next rung joined, not its own parted at once: an unmeasured miss is not one within the stacks' count
+    (owner, 2026-11-25: such misses parted every rung of a 4B climb)."""
+    search = Scripted(lambda place, group: None if place == 0 else 90, room=90, count=20)
+    assert search.searched([1], 0) == 1
+    assert [group for _, group in search.compiled] == [None, None], search.compiled
