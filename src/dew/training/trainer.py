@@ -63,10 +63,10 @@ from dew.distributed.batches import (
 )
 from dew.distributed.host import snapshot
 from dew.distributed.placement import Layout, MeshSpec, Placement, Validation, device_mesh, placed_shapes
-from dew.held_updates import waiting
+from dew.held_updates import holds_back, waiting
 from dew.inputs import Field, InputSpec
 from dew.mesh import STAGE_AXIS, LayoutRefused, LogicalAxes
-from dew.nn.dense import NVFP4_HISTORY
+from dew.nn.dense import NVFP4_HISTORY, NVFP4_PENDING, pending_amax
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels.options import Compiling, attempting, shapes_of
 from dew.nn.kernels.templates import report
@@ -472,6 +472,12 @@ class Trainer(Generic[Loss, Effects]):
         with self._staging.held():
             opt_state = self.optimizer.init(params["params"])
         ema = self.objective.ema
+        # Its decay at the start, a constant however the state's draw is traced.
+        with jax.ensure_compile_time_eval():
+            reference = ema is not None and float(ema.decay(0)) >= 1.0
+        if NVFP4_HISTORY in params and holds_back(opt_state):
+            # What the calls an optimizer applies no update in record waits for the one that does (row 12994).
+            params = {**params, NVFP4_PENDING: pending_amax(params[NVFP4_HISTORY])}
         state = TrainState(
             step=jnp.zeros((), jnp.int32),
             microstep=jnp.zeros((), jnp.int32),
@@ -483,9 +489,11 @@ class Trainer(Generic[Loss, Effects]):
             variables=params, opt_state=opt_state,
             # The average starts equal to the parameters but as its own buffers, copied by the transfer: the
             # step donates the state, and a buffer can be donated once.
-            # No amax history is averaged: an averaged forward reads the committed one (`with_ema`).
+            # No amax history is averaged: an averaged forward reads the committed one (`with_ema`); but a
+            # reference, an average that starts at unit decay (DPO's, GRPO's), holds its start's histories
+            # with its start's weights (row 12993).
             ema=None if ema is None else jax.tree.map(transferred_copy, select(
-                params, lambda path: path[0] != NVFP4_HISTORY and ema.select(path))),
+                params, lambda path: (path[0] != NVFP4_HISTORY or reference) and ema.select(path))),
             key=run_key,
             consumed=None if self._shape.examples is None else jnp.zeros((), jnp.int32),
             deferred=waiting(opt_state))

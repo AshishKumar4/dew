@@ -30,11 +30,11 @@ def delayed_lm(split: int, checkpoints: Checkpoints | None = None, ema_decay: fl
                    split=split, checkpoints=checkpoints)
 
 
-def data() -> Pipeline:
-    """Rows of sixteen, each step's its own: every microbatch of a split in two whole rows on each of a
-    CPU mesh's eight data shards."""
+def data(rows: int = 16) -> Pipeline:
+    """Batches of `rows`, sixteen by default, each step's its own: every microbatch of a split in two whole
+    rows on each of a CPU mesh's eight data shards."""
     text = (np.arange(128 * (SEQ + 1)).reshape(128, SEQ + 1) * 7 % 64).astype(np.int32)
-    return Pipeline(Memory({"text": text})).batch(16)
+    return Pipeline(Memory({"text": text})).batch(rows)
 
 
 def histories(state) -> list[np.ndarray]:
