@@ -1511,9 +1511,9 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
             file = grading.owning(name)
             chosen = {node for node in (read_json(selected) or []) if grading.owning(node) == file}
             reported_all = {grading.node_of(case) for case in [*earlier, *own] if grading.of(case, name)}
-            if not chosen or (unrun := sorted(chosen - reported_all)):
+            if not chosen or (never_ran := sorted(chosen - reported_all)):
                 red.append("its processes, run past a recycle, reported not every test its first selected: "
-                           + (", ".join(unrun[:6]) if chosen else "its first process's selection unread"))
+                           + (", ".join(never_ran[:6]) if chosen else "its first process's selection unread"))
         if before := [case for case in earlier if grading.of(case, name)]:
             # Its earlier processes each reported, recycled (`tested`'s loop): their failures are its too,
             # and their cases its tests, timings and cells beside the last's.
