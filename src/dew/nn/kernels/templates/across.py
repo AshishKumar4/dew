@@ -24,9 +24,11 @@ def arrived(counter, contributors) -> jax.Array:
     one to the count by an atomic that releases the warpgroup's writes before it (a barrier first, so every
     thread's are) and acquires every earlier arrival's; the last, which reads `contributors - 1` before its
     add, sets the count back to zero for the next launch, and a barrier's reduction tells every thread of
-    the warpgroup which it is. One atomic and no wait: a program spinning on a peer the GPU never scheduled
-    hangs (row 4732), where an atomic ticket's last arriver merges (CUTLASS's and Triton's split-K
-    semaphores alike)."""
+    the warpgroup which it is, as its warp's lane 0 holds it (`uniform`): ptxas holds the reduction's verdict
+    lane by lane, so the merge's branch on it was divergent to it and serialized every warpgroup MMA of the
+    launch (C7520, a GEMM whose programs share tiles at 1.23x XLA's time, row 10151). One atomic and no wait:
+    a program spinning on a peer the GPU never scheduled hangs (row 4732), where an atomic ticket's last
+    arriver merges (CUTLASS's and Triton's split-K semaphores alike)."""
     scalar = plgpu.Layout.WG_SPLAT(())
 
     def ticket(ctx, ref, count):
@@ -53,7 +55,7 @@ def arrived(counter, contributors) -> jax.Array:
 
     inline = plgpu.inline_mgpu(arg_types=(plgpu.RefType(), scalar),
                                return_type=plgpu.ShapeDtypeStruct((), jnp.dtype(jnp.int32), layout=scalar))
-    return inline(ticket)(counter, jnp.asarray(contributors, jnp.int32))
+    return uniform(inline(ticket)(counter, jnp.asarray(contributors, jnp.int32)))
 
 
 def uniform(value) -> jax.Array:
