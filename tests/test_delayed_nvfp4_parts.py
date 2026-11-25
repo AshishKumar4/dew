@@ -112,7 +112,8 @@ def test_a_run_resumed_partway_through_a_held_update_rolls_what_its_taken_calls_
             holds none."""
             source = delayed_lm(1, Checkpoints(str(tmp_path / ("applied" if step == 2 else "held"))),
                                 optimizer=_every_second())
-            state = source.checkpoints.restore(source.place()[0], step)[0]
+            # Its layers on `layers_N`, as a checkpoint holds them (`Trainer.stored`).
+            state = source.stored(source.checkpoints.restore(source.place()[0], step)[0])
             variables = {key: value for key, value in state.variables.items() if key != NVFP4_PENDING}
             if waiting is not None:
                 variables[NVFP4_PENDING] = waiting(state.variables[NVFP4_PENDING])
