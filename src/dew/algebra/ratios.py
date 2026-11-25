@@ -164,7 +164,9 @@ def _directional_sums(form: Ratio) -> tuple[Summed, ...]:
     """Preserve bands when independent directions occur in different sums of a product."""
     active = frozenset(form.directions)
     sums = [tuple(each for each in term if _carries_direction(each, active)) for _, term in form.products]
-    return tuple(dict.fromkeys(each for term in sums for each in term)) if any(len(term) > 1 for term in sums) else ()
+    if not any(len(term) > 1 for term in sums):
+        return ()
+    return tuple(dict.fromkeys(each for term in sums for each in term))
 
 
 def _directional_products(form: Ratio):
@@ -207,12 +209,12 @@ def _directions_summed(plans, values, arrays, count: int, rank: int, form: Ratio
 def _banded_sum(each: Summed, arrays, count: int, rank: int, form: Ratio, dtype):
     """An independent direction's exact dyadic bins, computed once before multiplying other sums."""
     load, chunks = arrays
-    info = scaled.format_of(dtype)
-    capacity = min(jnp.iinfo(jnp.int32).bits - 1, info.mantissa + 1)
+    number = scaled.format_of(dtype)
+    capacity = min(jnp.iinfo(jnp.int32).bits - 1, number.mantissa + 1)
     width = max(1, min(16, capacity - (2 * count * len(each.terms)).bit_length()))
     powers = [(math.frexp(coefficient)[1], len(factors)) for coefficient, factors in each.terms]
-    lower = min(exponent - (degree + 2) * info.reach - info.mantissa for exponent, degree in powers)
-    upper = max(exponent + (degree + 1) * (info.largest + 2) for exponent, degree in powers)
+    lower = min(exponent - (degree + 2) * number.reach - number.mantissa for exponent, degree in powers)
+    upper = max(exponent + (degree + 1) * (number.largest + 2) for exponent, degree in powers)
     summation = _Sum(each.terms, form.axis, (), count)
 
     def terms(chunk):

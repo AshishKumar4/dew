@@ -22,15 +22,15 @@ def summed(load, chunks: int, *, axis: int, width: int, lower: int, bins: int, d
     Width leaves enough headroom for all the digits of a bin in a signed word and in the
     result dtype. A bin becomes a significand and the power of two of its grid position.
     """
-    info = scaled.format_of(dtype)
+    mantissa = scaled.format_of(dtype).mantissa
     digit_mask = (1 << width) - 1
-    parts = (info.mantissa + 2 * width - 1) // width
+    parts = (mantissa + 2 * width - 1) // width
 
     def digits(value, exponent):
         held = scaled.scaled(value)
         _, sign, biased, fraction = raw_fields(held.significand)
-        word = fraction | ((biased != 0).astype(fraction.dtype) << info.mantissa)
-        placed = held.exponent + exponent - info.mantissa
+        word = fraction | ((biased != 0).astype(fraction.dtype) << mantissa)
+        placed = held.exponent + exponent - mantissa
         first, offset = jnp.divmod(placed - lower, width)
         columns = []
         for part in range(parts):
@@ -47,9 +47,10 @@ def summed(load, chunks: int, *, axis: int, width: int, lower: int, bins: int, d
                 for places, parts in digits(value, exponent):
                     slots, values = (jnp.moveaxis(part, axis, -1) for part in (places, parts))
                     shape = jnp.broadcast_shapes(carry.shape[:-1], slots.shape[:-1])
-                    slots = jnp.broadcast_to(slots, (*shape, slots.shape[-1])).reshape(math.prod(shape), slots.shape[-1])
-                    values = jnp.broadcast_to(values, (*shape, values.shape[-1])).reshape(math.prod(shape),
-                                                                                         values.shape[-1])
+                    slots = jnp.broadcast_to(slots, (*shape, slots.shape[-1]))
+                    values = jnp.broadcast_to(values, (*shape, values.shape[-1]))
+                    slots = slots.reshape(math.prod(shape), slots.shape[-1])
+                    values = values.reshape(math.prod(shape), values.shape[-1])
                     taken = jnp.broadcast_to(carry, (*shape, bins)).reshape(math.prod(shape), bins)
                     carry = jax.vmap(lambda row, at, digit: row.at[at].add(digit, mode="drop",
                                                                             wrap_negative_indices=False))(
@@ -59,8 +60,8 @@ def summed(load, chunks: int, *, axis: int, width: int, lower: int, bins: int, d
     shape = jnp.broadcast_shapes(*(part.shape for term in load(0) for part in term))
     rows = tuple(size for at, size in enumerate(shape) if at != axis)
     initial = jnp.zeros((*rows, bins), jnp.int32)
-    digits = of_chunk(0, initial) if chunks == 1 else jax.lax.fori_loop(0, chunks, of_chunk, initial)
-    live = digits != 0
+    sums = of_chunk(0, initial) if chunks == 1 else jax.lax.fori_loop(0, chunks, of_chunk, initial)
+    live = sums != 0
     positions = jnp.cumsum(live, axis=-1, dtype=jnp.int32)
     count = positions[..., -1]
     indices = jnp.where(live, positions - 1, bins)
@@ -71,6 +72,7 @@ def summed(load, chunks: int, *, axis: int, width: int, lower: int, bins: int, d
         exponents = jnp.zeros_like(powers).at[index].set(powers, mode="drop")
         return values, exponents
 
-    values, exponent = jax.vmap(compressed)(digits.reshape(-1, bins), indices.reshape(-1, bins))
-    held = scaled.scaled(values.reshape(digits.shape).astype(dtype))
-    return (held.significand, jnp.zeros_like(held.significand), held.exponent + exponent.reshape(digits.shape)), count
+    values, exponent = jax.vmap(compressed)(sums.reshape(-1, bins), indices.reshape(-1, bins))
+    held = scaled.scaled(values.reshape(sums.shape).astype(dtype))
+    placed = held.exponent + exponent.reshape(sums.shape)
+    return (held.significand, jnp.zeros_like(held.significand), placed), count
