@@ -1379,11 +1379,11 @@ def operation_work(primitive, inputs: Sequence, outputs: Sequence, params: Mappi
     function issues its form an output element, one with none unpriced; without, an fp32 one on a CUDA
     target XLA's own (`XLA_FORMS`, M-FS-78), any other one exponential an element. An fp32 division on a
     CUDA target issues its kernel's form (`MOSAIC_DIVISION`), XLA's own `div.rn.f32`'s (`IEEE_DIVISION`,
-    M-FS-77);
-    other widths' and a TPU's, unmeasured, an operation an element. A correctly rounded one issues its
-    native form where a kernel's forms state one (a Triton kernel's, `TRITON_FORMS`), else the software
+    M-FS-77); other widths' and a TPU's, unmeasured, an operation an element. A correctly rounded one issues
+    its native form where a kernel's forms state one (a Triton kernel's, `TRITON_FORMS`), else the software
     division it lowers to (XLA's and Mosaic GPU's, `precision._correctly_rounded_divide`), counted as a
-    kernel's body is, through its calls (row 12886)."""
+    kernel's body is, through its calls (row 12886). An integer power issues its repeated squaring's
+    multiplies, a negative one beside the division of one by them (row 12948)."""
     if primitive is precision.correctly_rounded_divide_p:
         if (native := (forms or {}).get(primitive)) is not None:
             return repeated(native, sum(_elements(aval) for aval in outputs))
@@ -1393,6 +1393,13 @@ def operation_work(primitive, inputs: Sequence, outputs: Sequence, params: Mappi
     if primitive is lax.div_p and _fp32_on_cuda(outputs, target) and (
             (form := IEEE_DIVISION if forms is None else forms.get(primitive)) is not None):
         return repeated(form, sum(_elements(aval) for aval in outputs))
+    if primitive is lax.integer_pow_p:
+        # Repeated squaring's multiplies, as jax lowers it, and a negative power's reciprocal of them.
+        power = abs(params["y"])
+        squared = _operated(lax.mul_p, inputs, outputs)
+        squarings = repeated(squared, max(power.bit_length() + power.bit_count() - 2, 0))
+        return squarings if params["y"] >= 0 else squarings + operation_work(
+            lax.div_p, [*inputs, *inputs], outputs, {}, target, forms=forms)
     if primitive in _OPERATIONS:
         return _operated(primitive, inputs, outputs)
     if primitive in _REDUCTIONS:
