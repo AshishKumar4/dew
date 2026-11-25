@@ -393,11 +393,11 @@ def test_a_cell_its_prepares_cap_left_is_named_and_counted_but_reds_no_row(ci):
 
 @pytest.mark.parametrize("capped", [False, True])
 def test_only_a_dry_prepare_runs_under_a_time_cap(ci, tmp_path, monkeypatch, capped):
-    """A dry prepare's process (prepares.py's `process`, `capped`) runs within `PREPARE_WALL` whatever its
-    task has left, so none sets a train's wall, under a cap (tests/tier_wire.py's `PREPARE_BY`, on the
-    monotonic clock) its end's margin short of that, past which it starts nothing more; a GPU tier part's
-    prepare (ci.py's `gpu_prepared`), whose run reads every program it prepares, has all its caller gives
-    it and no cap."""
+    """A dry prepare's process (prepares.py's `process`, `capped`) runs under a cap (tests/tier_wire.py's
+    `PREPARE_BY`, on the monotonic clock) past which it starts nothing more (`cap_after`): its end's
+    `CAP_MARGIN` short of the time it has past its grace, settling and reader, 260 s into `PREPARE_WALL`'s
+    600 s, or half that time where the margin would take more; a GPU tier part's prepare (ci.py's
+    `gpu_prepared`), whose run reads every program it prepares, has all its caller gives it and no cap."""
     import time
 
     seen = {}
@@ -406,18 +406,39 @@ def test_only_a_dry_prepare_runs_under_a_time_cap(ci, tmp_path, monkeypatch, cap
         seen["seconds"], seen["environ"] = seconds, args[3]
         return 0
     monkeypatch.setattr(ci, "tested", tested)
-    began = time.monotonic()
-    ci.prepares.process(ci, "3.12", "tests/test_gpu_vae.py", "", tmp_path / "v.json", 1500.0, unit="u",
-                        threads="1", users=False, variant="@prepare-sm90", capped=capped)
+    monkeypatch.setattr(time, "monotonic", lambda: 1000.0)
     wire = ci.tier_wire()
-    if not capped:
-        # Cleared, so a cap the caller's environment carries reaches no part's prepare.
-        assert seen["environ"][wire.PREPARE_BY] == "" and not wire.past_cap(seen["environ"])
-        assert seen["seconds"] == 1500.0 - ci.session.GRACE - ci.SETTLE - 10.0
-        return
-    cap = float(seen["environ"][wire.PREPARE_BY])
-    assert seen["seconds"] + ci.session.GRACE + ci.SETTLE + 10.0 == ci.prepares.PREPARE_WALL
-    assert began + seen["seconds"] - ci.prepares.CAP_MARGIN <= cap <= time.monotonic() + seen["seconds"]
+    for left, after in ((ci.prepares.PREPARE_WALL, 260.0), (200.0, 50.0)):
+        ci.prepares.process(ci, "3.12", "tests/test_gpu_vae.py", "", tmp_path / "v.json", left, unit="u",
+                            threads="1", users=False, variant="@prepare-sm90", capped=capped)
+        assert seen["seconds"] == left - ci.session.GRACE - ci.SETTLE - 10.0
+        if capped:
+            assert float(seen["environ"][wire.PREPARE_BY]) == 1000.0 + after
+        else:
+            # Cleared, so a cap the caller's environment carries reaches no part's prepare.
+            assert seen["environ"][wire.PREPARE_BY] == "" and not wire.past_cap(seen["environ"])
+
+
+def test_a_dry_prepare_task_runs_within_its_wall_whatever_its_deadline(ci, tmp_path, monkeypatch,
+                                                                       cache_worker):
+    """A dry prepare task (prepares.py's `run`) takes at most `PREPARE_WALL` whatever its deadline: its
+    topology, its baseline's lookup and its rows' processes all within it, so none sets a train's wall."""
+    url, _, _ = cache_worker
+    cached(monkeypatch, url)
+    monkeypatch.setattr(ci, "mainline", lambda: "f" * 40)
+    interpreter(tmp_path, "3.12")
+    dry_checkout(tmp_path)
+    seen = []
+
+    def tested(python, files, group, verdict, seconds, *args, **kwargs):
+        seen.append(seconds)
+        verdict.write_text(json.dumps({"rows": []}))
+        return 0
+    monkeypatch.setattr(ci, "tested", tested)
+    ci.prepares.run(ci, "3.12", ["prepare:tests/test_gpu_vae.py"], "@prepare-sm90", tmp_path / "v.json",
+                    1680.0, "off")
+    [seconds] = seen
+    assert seconds <= ci.prepares.PREPARE_WALL - ci.session.GRACE - ci.SETTLE - 10.0
 
 
 def cgroup_tree(root, levels):

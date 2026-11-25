@@ -1703,16 +1703,23 @@ def restored(wrote: set[str], before: set[str], out: Path) -> None:
     not hold): each tracked file it wrote checked out again, and each entry the checkout neither tracks nor
     ignores that was not there before it (`before`, `untracked`) removed, then each directory it made that
     this leaves empty (one imports as a namespace package), but the task's own outputs: its verdict `out`,
-    each process's beside it (`out.N` and theirs) and its artifacts (ARMADA_ARTIFACTS), which outlive it."""
+    every file named after it beside it (each process's `out.N`, a process's recorder's sidecars) and its
+    artifacts (ARMADA_ARTIFACTS), which outlive it. Each module it checks out loses the bytecode cached for
+    it."""
     listed = subprocess.run(["git", "ls-files", "-z", "--", *sorted(wrote)], capture_output=True, text=True,
                             check=False) if wrote else None
     tracked = set(listed.stdout.split("\0")) - {""} if listed and listed.returncode == 0 else set()
     if tracked:
         subprocess.run(["git", "checkout", "-q", "--", *sorted(tracked)], check=True)
+    # A restored module's bytecode, which the process that rewrote it may have cached (its source's size and
+    # second matching the restored one's), gone too, so the next process compiles the commit's source.
+    for name in sorted(each for each in tracked if each.endswith(".py")):
+        for cached in (Path(name).parent / "__pycache__").glob(f"{Path(name).stem}.*.pyc"):
+            cached.unlink(missing_ok=True)
     artifacts = os.environ.get("ARMADA_ARTIFACTS")
     roots = [Path(artifacts).resolve()] if artifacts else []
     verdicts = out.resolve()
-    ours = re.compile(rf"{re.escape(verdicts.name)}(\.\d+(\..+)?)?")
+    ours = re.compile(rf"{re.escape(verdicts.name)}(\..+)?")
     checkout = Path.cwd().resolve()
     emptied: set[Path] = set()
     for made in sorted(untracked() - before):

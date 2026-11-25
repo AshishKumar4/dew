@@ -35,7 +35,7 @@ PREPARE_TARGETS = 4
 """How many of the plan's targets a dry prepare's task may take before its file is prepared in groups
 (`groups_of`), as the tier's run cuts it, each group a task of its own."""
 PREPARE_WALL = 600.0
-"""The most a dry prepare's process runs, its end's margin included (`process`), whatever its task has left:
+"""The most a dry prepare's task runs, its processes' ends included (`run`), whatever its deadline:
 under a train's wall bound, 626 to 696 s (its 900 s target less its warm-up and plan, its finish and a
 margin). Its groups are cut to its cap (`cap_after`), which holds a group however unevenly its count cut
 (`prepared_cut`) spreads its work (rows 12873, 12429-12439, 12643, 12759: groups cut to 480 s, capped only at
@@ -179,8 +179,6 @@ def process(ci, python: str, file: str, group: str, verdict: Path, left: float, 
     settling, its reader's last ten seconds); with none left, it is not started, its row saying so. A dry
     prepare's (`capped`) runs under its time cap and its memory's (tests/tier_wire.py's `PREPARE_BY` and
     `PREPARE_HOLDS`); a part's never, whose run reads every program it prepares."""
-    # A dry prepare's within PREPARE_WALL, so no group of it sets a train's wall.
-    left = min(left, PREPARE_WALL) if capped else left
     if (mine := left - ci.session.GRACE - ci.SETTLE - 10.0) <= 0:
         why = "not prepared: its lane's prepare had no time left for it"
         verdict.write_text(json.dumps({"rows": [ci.stale_row(python, file, ci.varied(group, variant), why)]}))
@@ -550,6 +548,9 @@ def run(ci, python: str, tests: list[str], split: str, out: Path, deadline: floa
     that declares it compiles at run is neither. A row left no time is said stale. The fixtures are the task's
     own fetch's (ci.py's `task`)."""
     began = time.monotonic()
+    # The whole task within PREPARE_WALL, its topology, baseline lookups and restorations as well as its
+    # processes, so no dry prepare task sets a train's wall.
+    deadline = min(deadline, PREPARE_WALL)
     names, kept = ci.kept_of([test.removeprefix(TOKEN) for test in tests])
     units = [(name, split) for name in names] + list(kept)
     wire, rows_ = ci.tier_wire(), []

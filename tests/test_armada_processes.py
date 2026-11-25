@@ -3,6 +3,8 @@ whose process ended red set aside by no resumed attempt, and a report a killed p
 none."""
 
 import json
+import subprocess
+import sys
 
 import pytest
 from armada_support import commit, interpreter, lifetime_task, loaded, written
@@ -123,6 +125,20 @@ def test_a_recycled_rows_later_process_runs_on_the_commits_checkout(ci, tmp_path
               recorded=True)
     [row] = json.loads(out.read_text())["rows"]
     assert row["exitCode"] == 0, row["output"]
+
+
+def test_a_restored_modules_cached_bytecode_goes_with_its_rewrite(ci, tmp_path):
+    """A module a process rewrote and imported, checked out again (`restored`), leaves none of the bytecode
+    that process cached for it: its rewrite's size and second may match the restored source's, so the next
+    process would run the rewrite (row 13000's review)."""
+    (tmp_path / "tests/helper.py").write_text("WORD = 'good'\n")
+    commit(tmp_path, "the commit")
+    (tmp_path / "tests/helper.py").write_text("WORD = 'evil'\n")
+    subprocess.run([sys.executable, "-c", "import helper"], cwd=tmp_path / "tests", check=True)
+    assert list((tmp_path / "tests/__pycache__").glob("helper.*.pyc"))
+    ci.restored({"tests/helper.py"}, ci.untracked(), tmp_path / "verdict.json")
+    assert (tmp_path / "tests/helper.py").read_text() == "WORD = 'good'\n"
+    assert not list((tmp_path / "tests/__pycache__").glob("helper.*.pyc"))
 
 
 @pytest.mark.parametrize(("source", "hook"), [
