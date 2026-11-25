@@ -122,7 +122,10 @@ def test_structural_closed_preserves_equation_source_info_and_nested_body_proven
     assert "inner_right_scope" in str(sub_r.jaxpr.eqns[0].source_info.name_stack)
 
     def trace_once():
-        return jax.make_jaxpr(fn_left)(*shapes)
+        def fresh_fn(x, weight):
+            with jax.named_scope("left_branch"):
+                return inner_left(_bf16_rms(x, weight)) + jnp.bfloat16(2.0)
+        return jax.make_jaxpr(fresh_fn)(*shapes)
 
     c1, c2 = trace_once(), trace_once()
     assert c1 is not c2 and terms.provenance_key(c1) == terms.provenance_key(c2)

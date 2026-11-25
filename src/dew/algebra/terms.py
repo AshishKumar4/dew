@@ -1042,6 +1042,26 @@ def region(closed: jcore.Jaxpr, ranges: Ranges = None, *,
     return _region(closed, ranges, Term)
 
 
+def _merge_proven(out_var: jcore.Var, bound: Magnitude | None, proved: Apart,
+                  ext: float | tuple[float, float] | Proven | None) -> tuple[Magnitude | None, Apart]:
+    """Join an equation's locally proven `(bound, apart)` with an enclosing program's proven entry `ext`."""
+    if ext is None or not isinstance(out_var.aval, ShapedArray):
+        return bound, proved
+    ext_bound = _declared(ext)
+    ext_apart = _held_apart(_declared_apart(ext), out_var.aval.dtype)
+    floors = [f for f in (proved.floor, ext_apart.floor) if f is not None]
+    floor = max(floors) if floors else None
+    sign = proved.sign if proved.sign != 0 else ext_apart.sign
+    merged = _held_apart(Apart(
+        floor, sign, proved.number or ext_apart.number,
+        proved.finite or ext_apart.finite, proved.unit_norm or ext_apart.unit_norm,
+    ), out_var.aval.dtype)
+    bounds = [b for b in (bound if proved.finite else None,
+                          ext_bound if ext_apart.finite else None) if b is not None]
+    best = min(bounds) if bounds else None
+    return (best if merged.finite else None), merged
+
+
 def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
                                     forms: type[Node]) -> Region[Node]:
     """`region`'s terms, each of `forms`."""
@@ -1094,14 +1114,17 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
     laid: dict[jcore.Var, tuple[jcore.Var, tuple[int, ...]]] = {}
     softmax = _SoftmaxTrack()
     opaque: list[Opaque] = []
-    for equation in jaxpr.eqns:
+    n_invars = len(jaxpr.invars)
+
+    for eq_idx, equation in enumerate(jaxpr.eqns):
         composed, facts = _propagate_facts(equation, laid, magnitude_of, apart_of)
         if composed is not None and facts is not None:
             origin, params_ = composed
             out = equation.outvars[0]
             env[out] = read(origin).shaped("broadcast_in_dim", param(equation.primitive, params_))
             shapes.append((env[out], _shape(out)))
-            bound, apart[out] = softmax.step(equation, *facts, apart_of)
+            bound, proved = softmax.step(equation, *facts, apart_of)
+            bound, apart[out] = _merge_proven(out, bound, proved, declared.get(n_invars + eq_idx))
             _typed(dtypes, magnitudes, env[out], out, bound)
             depths[out] = depths.get(origin, 0) + 1
             continue
@@ -1110,7 +1133,8 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
             out = equation.outvars[0]
             env[out] = term
             shapes.append((term, _shape(out)))
-            bound, apart[out] = softmax.step(equation, *facts, apart_of)
+            bound, proved = softmax.step(equation, *facts, apart_of)
+            bound, apart[out] = _merge_proven(out, bound, proved, declared.get(n_invars + eq_idx))
             _typed(dtypes, magnitudes, term, out, bound)
             depths[out] = 1 + max((depths.get(atom, 0) for atom in equation.invars
                                    if not isinstance(atom, jcore.Literal)), default=0)

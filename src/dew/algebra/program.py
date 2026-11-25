@@ -288,13 +288,13 @@ def _windowed(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation,
     kept in `spliced`, by the id of the equation each replaces, where given (`_reclosed` reads them)."""
     made_by = {var: equation for equation in jaxpr.eqns for var in equation.outvars}
     spliced = {} if spliced is None else spliced
-    windows = _windows(jaxpr)
+    windows = _window_clusters(jaxpr)
     deriving = ((_deriving(accurate, saturation) if _deriving_key is None else _deriving_key)
                 if windows else None)
     held = _held(jaxpr) if windows else None
-    for window, yielded in windows:
+    for window, yielded, origins in windows:
         began = time.perf_counter()
-        done, reused = _derived(window, accurate, saturation, deriving, _declared(window, held))
+        done, reused = _derived(window, accurate, saturation, deriving, _declared(window, held, origins))
         seconds = time.perf_counter() - began
         landed = _splices(window, yielded, done, made_by, spliced) if done.picked else {}
         spliced.update(landed)
@@ -371,22 +371,30 @@ def _held(jaxpr: jcore.Jaxpr) -> tuple[dict[jcore.Var, terms.Magnitude | None], 
 def _declared(
     window: jcore.Jaxpr,
     proven: tuple[dict[jcore.Var, terms.Magnitude | None], dict[jcore.Var, terms.Apart]] | None,
+    eq_origins: Sequence[jcore.Var] = (),
 ) -> dict[int, terms.Proven]:
-    """What `window`'s inputs hold (`terms.Proven`, by input index): each one as the program proves it
-    (`_held`), its magnitude's bound as its power of two where the program bounds one and the rest
-    (`terms.Apart`), so a bound a window cuts its equations below holds within it (a scale's under a
-    broadcast, three equations below the sum that reads it), and no more: a value the program proves no
-    number (a NaN's tanh made outside the window) bounds nothing the window makes of it, where the window
-    took every input for a finite real (spec alignment, 8993)."""
+    """What `window`'s inputs and internal equations hold (`terms.Proven`, inputs at `0..len(invars)-1` and
+    proven internal equation outputs at `len(invars) + eq_idx`): each as the enclosing program proves it
+    (`_held`), so multi-hop proofs whose origin lies outside `WINDOW` (e.g. `_SoftmaxTrack` across
+    `reduce_max -> sub -> exp -> reduce_sum`) stay proven inside the window."""
     declared: dict[int, terms.Proven] = {}
     if proven is None:
         return declared
     held, apart = proven
-    for index, var in enumerate(window.invars):
+
+    def entry_for(var: jcore.Var) -> terms.Proven:
         bound = held.get(var)
         magnitude = (None if bound is None or bound >= 1024
                      else 0.0 if bound == terms.NOTHING else math.ldexp(1.0, bound))
-        declared[index] = terms.Proven(magnitude, apart.get(var, terms.NOWHERE))
+        return terms.Proven(magnitude, apart.get(var, terms.NOWHERE))
+
+    for index, var in enumerate(window.invars):
+        declared[index] = entry_for(var)
+    base = len(window.invars)
+    for eq_idx, orig_var in enumerate(eq_origins):
+        entry = entry_for(orig_var)
+        if entry.bound is not None or entry.apart.floor is not None or entry.apart.sign != 0:
+            declared[base + eq_idx] = entry
     return declared
 
 
@@ -500,11 +508,16 @@ def _placed(window: jcore.Jaxpr, traced: jcore.Jaxpr, kept: list) -> dict[int, l
 
 
 def _windows(jaxpr: jcore.Jaxpr) -> list[tuple[jcore.Jaxpr, list[jcore.Var]]]:
+    """`jaxpr`'s windows, each cluster a jaxpr of its own and its yielded variables (`_window_clusters`)."""
+    return [(window, yielded) for window, yielded, _ in _window_clusters(jaxpr)]
+
+
+def _window_clusters(jaxpr: jcore.Jaxpr) -> list[tuple[jcore.Jaxpr, list[jcore.Var], list[jcore.Var]]]:
     """`jaxpr`'s windows, each cluster a jaxpr of its own: each head a rule may lower the price at
     (`rules.heads`) with the equations of the language that make its operands, `WINDOW` deep, windows that
     share an equation joined up to `CLUSTER` equations; its inputs each value it reads from outside it, its
     outputs each value it makes that the program reads outside it (the values the rewrite may compute anew),
-    in program order; and those values as `jaxpr` names them. None where `jaxpr` holds no head."""
+    in program order; those values as `jaxpr` names them; and each internal equation's original output var."""
     active = rules.head_primitives()
     candidates = [(equation, name) for equation in jaxpr.eqns
                   if (name := terms.spoken_as(equation)) is not None and name in active]
@@ -575,7 +588,9 @@ def _windows(jaxpr: jcore.Jaxpr) -> list[tuple[jcore.Jaxpr, list[jcore.Var]]]:
         win_debug = (jaxpr.debug_info._replace(arg_names=None, result_paths=None)
                      if jaxpr.debug_info is not None
                      else jcore.DebugInfo("algebra_window", "window", None, None))
-        windows.append((jcore.Jaxpr([], list(outside), outputs, equations, debug_info=win_debug), yielded))
+        origins = [member.outvars[0] for member in members]
+        windows.append((jcore.Jaxpr([], list(outside), outputs, equations, debug_info=win_debug),
+                        yielded, origins))
     return windows
 
 
