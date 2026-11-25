@@ -365,8 +365,11 @@ STEP_HELD: dict[tuple[str, Made], str] = {
         "what the forward saves and the gradients hold), which XLA's dot there does not"),
 }
 """Kinds the template's products are at parity in, in time and each product's temporaries (`SCOREBOARDS`),
-whose step holds more with them (a trainer step's peak, `tests/step_memory.py`): XLA's dot keeps them until
-a receipt of the step's memory clears them, each with its evidence (kernel-templates.md §1: peak memory)."""
+held on XLA's dot by evidence about the step around them, each with it (kernel-templates.md §1: peak
+memory). The GH200's dense input gradient's step leaks were the mapped projections' and XLA's dot's
+(row 12898: fixed in `sharding.on_shards` and `gemm.xla_mainloop`); it stays held until a GEMM-routed
+step's two route-reading tests read their route (tests/test_lowering.py's launch count,
+tests/test_miss_driven_rungs.py's checkpoint names through a reshape)."""
 
 M_FS_34 = {
     'sm86': ("M-FS-34 / LF-P0-sm86-a10 (an A10, main 45131ca01, XLA tuned on the GPU): the template "
