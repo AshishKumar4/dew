@@ -438,14 +438,18 @@ recurrence's distance from float64 (M-JS-96), which no cell saw (the recurrence 
 def test_the_recurrences_run_on_this_gpu(family):
     """A family's recurrence cells on this GPU (`gpu_flow.run_cells`) a GPU runs (`gpu_flow.covering`: each
     kept for a GPU-only fault by name, the fewest others covering its native axes, every other the CPU's,
-    interpreted and through the compile gate), each one's failure kept and all raised together. JAX's
-    compiled programs released after each family: a dry prepare runs a group's families in one process, which
-    kept every one's (a process of four template stability families killed for memory in its fifth, scratch
-    jsf-rss-split3; clearing after each, none, jsf-rss-clear3; train 1274's prepare-sm90, 10 GiB)."""
+    interpreted and through the compile gate), each one's failure kept and all raised together. Every
+    compiled program and held trace released after each family (`conftest.release`: JAX's, the float64
+    terms walk's and Dew's own programs'): a dry prepare runs a group's families in one process, which kept
+    every one's (a process of four template stability families killed for memory in its fifth, scratch
+    jsf-rss-split3; clearing JAX's caches after each, none, jsf-rss-clear3; train 1274's prepare-sm90, 10
+    GiB; row 12881)."""
+    import conftest
+
     try:
         run_cells(covering(FAMILIES[family]()))
     finally:
-        jax.clear_caches()
+        conftest.release()
 
 
 def test_the_recurrence_matrix_holds_on_this_gpu():
