@@ -874,9 +874,6 @@ def plan(target: float, timings: dict, census: bool = False, reach: dict | None 
     # What every entry carries to its task (.armada.json's command): the cache's policy, the census, and
     # main's commit, which a task's checkout cannot find (`mainline`).
     stamped = {"cache": cache, "census": "1" if census else "0", "main": mainline() or ""}
-    # Its lookups key a limit as a medium container's task reads it (`digests.PLANNED_LIMITS`): none binds
-    # here.
-    os.environ.setdefault(digests.PLANNED_LIMITS, json.dumps({"limit:memory": str(session.MEDIUM_MEMORY)}))
     every = test_files()
     # Every file's check-1 sites its marks shard, refused where one site's map tasks outnumber what its
     # judges' job takes (`refused_sites`).
