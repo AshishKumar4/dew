@@ -1165,6 +1165,24 @@ def test_an_fp32_division_in_a_kernel_issues_a_reciprocal_and_its_refinement():
     assert priced(jnp.int32, hopper, emission.ACCURATE_FORMS) == Work(integer_operations=128)
 
 
+@pytest.mark.parametrize("forms", [None, emission.ACCURATE_FORMS], ids=["xla", "kernel"])
+def test_an_integer_power_prices_as_its_multiplies_and_a_negative_ones_division(forms):
+    """`x ** y` issues as its lowering does: repeated squaring's multiplies (`x ** 2` one, `x ** 5` three:
+    x², x⁴, x⁴·x), and a negative power those beside the reciprocal (`x ** -1` an fp32 division of one by x:
+    XLA's div.rn.f32, a kernel's div.full.f32), never one operation whatever its exponent (row 12948)."""
+    hopper = generation.gpu_target("sm90")
+    row = jax.ShapeDtypeStruct((128,), jnp.float32)
+
+    def priced(primitive, operands, **params) -> Work:
+        return emission.operation_work(primitive, [row] * operands, [row], params, hopper, forms=forms)
+
+    multiply, divide = priced(lax.mul_p, 2), priced(lax.div_p, 2)
+    assert priced(lax.integer_pow_p, 1, y=2) == multiply
+    assert priced(lax.integer_pow_p, 1, y=5) == multiply + multiply + multiply
+    assert priced(lax.integer_pow_p, 1, y=-1) == divide
+    assert priced(lax.integer_pow_p, 1, y=-2) == multiply + divide
+
+
 def test_xlas_fp32_log_issues_more_than_its_division_and_its_exponential():
     """XLA's own fp32 logarithm is libdevice's polynomial, no MUFU at all: nineteen fp32 instructions, a
     conversion and four integer ones an element, more issue than its IEEE division's MUFU.RCP and six or its
