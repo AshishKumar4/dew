@@ -24,8 +24,9 @@ import collections
 import functools
 import hashlib
 import itertools
+import math
 import weakref
-from collections.abc import Callable, Hashable, Iterator, Sequence
+from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from typing import NamedTuple
 
 import jax
@@ -33,6 +34,7 @@ import jax.numpy as jnp
 import numpy as np
 from egglog import eq
 from jax._src import core as jax_core
+from jax.core import ShapedArray
 from jax.extend import core as jcore
 
 from dew import _cache
@@ -42,7 +44,7 @@ from dew.algebra.forms import aval
 from dew.nn.derivatives import Protected, marked_call_p
 from dew.nn.kernels import generation
 from dew.nn.kernels.generation import Choice
-from dew.nn.programs import bodies, called, control_flow, entrywise, equations, purely_called, read_by
+from dew.nn.programs import bodies, control_flow, entrywise, equations, purely_called, read_by
 from dew.nn.sharding import sequence_shards
 
 REACH = 8
@@ -1169,164 +1171,51 @@ def _traced_taken(attend: Callable, operands: Sequence[jcore.Var]) -> bool:
     return any(route.choice == Choice.ATTENTION and route.kernel not in KEPT for route in found)
 
 
-_SIGN_PRESERVING = frozenset({
-    jax.lax.broadcast_in_dim_p, jax.lax.reshape_p, jax.lax.transpose_p, jax.lax.squeeze_p,
-    jax.lax.slice_p, jax.lax.dynamic_slice_p, jax.lax.concatenate_p, jax.lax.stop_gradient_p,
-})
-_NONNEG_UNARY = frozenset({
-    jax.lax.abs_p, jax.lax.exp_p, jax.lax.exp2_p, jax.lax.logistic_p, jax.lax.sqrt_p, jax.lax.rsqrt_p,
-})
 _QUERY_PASSTHROUGH = frozenset({
     jax.lax.broadcast_in_dim_p, jax.lax.convert_element_type_p, jax.lax.reshape_p,
     jax.lax.transpose_p, jax.lax.squeeze_p, jax.lax.slice_p, jax.lax.concatenate_p,
 })
 
 
-def _literal_signs(value) -> tuple[bool, bool]:
-    """`(nonneg, nonpos)` proven of a host constant (`0` is `(True, True)`, `NaN` or device array is
-    `(False, False)`)."""
-    if terms.typed_key(value) or (isinstance(value, jax.Array) and not isinstance(value, jax_core.Tracer)):
-        return False, False
-    array = np.asarray(value)
-    if not jnp.issubdtype(array.dtype, jnp.floating) and not jnp.issubdtype(array.dtype, jnp.signedinteger):
-        return jnp.issubdtype(array.dtype, jnp.unsignedinteger), False
-    if np.isnan(array).any():
-        return False, False
-    return bool((array >= 0).all()), bool((array <= 0).all())
+def _nonpositive_decay(bound: terms.Magnitude | None, proved: terms.Apart) -> bool:
+    """Whether a decay operand is statically proven nonpositive (`<= 0`, no NaN)."""
+    return proved.number and (proved.sign < 0 or bound == terms.NOTHING)
 
 
-def _op_signs(primitive: jcore.Primitive, in_signs: list[tuple[bool, bool]],
-              equation: jcore.JaxprEqn) -> tuple[bool, bool]:
-    """Transfer `(nonneg, nonpos)` across an elementary JAX primitive."""
-    if primitive in _NONNEG_UNARY:
-        return True, False
-    if primitive in _SIGN_PRESERVING:
-        return in_signs[0]
-    if primitive is jax.lax.convert_element_type_p:
-        src_dt, dst_dt = aval(equation.invars[0]).dtype, aval(equation.outvars[0]).dtype
-        if jnp.issubdtype(src_dt, jnp.floating) and jnp.issubdtype(dst_dt, jnp.floating):
-            return in_signs[0]
-        return False, False
-    if primitive is jax.lax.neg_p:
-        return in_signs[0][1], in_signs[0][0]
-    if primitive is jax.lax.log1p_p:
-        return in_signs[0][0], False
-    if primitive is jax.lax.min_p:
-        return in_signs[0][0] and in_signs[1][0], in_signs[0][1] or in_signs[1][1]
-    if primitive is jax.lax.max_p:
-        return in_signs[0][0] or in_signs[1][0], in_signs[0][1] and in_signs[1][1]
-    if primitive is jax.lax.add_p:
-        return in_signs[0][0] and in_signs[1][0], in_signs[0][1] and in_signs[1][1]
-    if primitive is jax.lax.sub_p:
-        return in_signs[0][0] and in_signs[1][1], in_signs[0][1] and in_signs[1][0]
-    if primitive in (jax.lax.mul_p, jax.lax.div_p):
-        nn1, np1 = in_signs[0]
-        nn2, np2 = in_signs[1]
-        return (nn1 and nn2) or (np1 and np2), (nn1 and np2) or (np1 and nn2)
-    if primitive is jax.lax.select_n_p and len(in_signs) == 3:
-        return in_signs[1][0] and in_signs[2][0], in_signs[1][1] and in_signs[2][1]
-    return False, False
-
-
-def _literal_finite(value) -> bool:
-    """Whether host constant `value` is finite (`False` for device arrays, NaNs, infinities, or PRNG keys)."""
-    if terms.typed_key(value) or (isinstance(value, jax.Array) and not isinstance(value, jax_core.Tracer)):
+def _recurrence_bounded(
+    q_bound: terms.Magnitude | None, k_bound: terms.Magnitude | None,
+    beta_bound: terms.Magnitude | None, beta_apart: terms.Apart, *,
+    key_width: int, common, scale: float | None, delta: bool, has_beta: bool,
+) -> bool:
+    """Whether chunked WY and score products stay within `common` and fp32 range (row 3450): requires
+    statically bounded finite `Q` and `K` (`Q·K` and `K·K` below the dtype cap), plus bounded `beta`
+    (contractive `0 <= beta <= 2` for delta-rule WY triangular solves)."""
+    if q_bound is None or k_bound is None:
         return False
-    array = np.asarray(value)
-    return bool(jnp.issubdtype(array.dtype, jnp.integer) or (
-        jnp.issubdtype(array.dtype, jnp.floating) and np.isfinite(array).all()))
-
-
-def _atom_finite(atom, finite: dict[jcore.Var, bool]) -> bool:
-    """Whether `atom` is proven finite (a finite host literal or a tracked finite variable)."""
-    return _literal_finite(atom.val) if isinstance(atom, jcore.Literal) else finite.get(atom, False)
-
-
-def _nan_guarded_branch(pred_atom, true_atom, made_eq: dict[jcore.Var, jcore.JaxprEqn],
-                        finite: dict[jcore.Var, bool]) -> bool:
-    """Whether `select_n(pred_atom, false_val, true_atom)` enters `true_atom` only when `true_atom` is NaN
-    (e.g. `lax.logaddexp(x, 0.0)`'s `where(isnan(x - 0.0), x + 0.0, ...)`)."""
-    if not isinstance(pred_atom, jcore.Var) or (pred_eq := made_eq.get(pred_atom)) is None:
+    cap = min(60, int(jnp.finfo(common).maxexp) - 2)
+    key_bits = math.ceil(math.log2(max(key_width, 1)))
+    scale_bits = max(0, math.ceil(math.log2(scale))) if scale is not None and scale > 0 else 0
+    if q_bound != terms.NOTHING and k_bound != terms.NOTHING:
+        if q_bound + k_bound + key_bits + scale_bits > cap:
+            return False
+    if k_bound != terms.NOTHING and 2 * k_bound + key_bits > cap:
         return False
-    if pred_eq.primitive is not jax.lax.ne_p or pred_eq.invars[0] != pred_eq.invars[1]:
-        return False
-    tested = pred_eq.invars[0]
-    if not isinstance(tested, jcore.Var) or (diff_eq := made_eq.get(tested)) is None:
-        return False
-    if diff_eq.primitive is not jax.lax.sub_p:
-        return False
-    u, v = diff_eq.invars
-    if not _atom_finite(v, finite):
-        return False
-    if true_atom == u:
+    if not has_beta:
         return True
-    if isinstance(true_atom, jcore.Var) and (add_eq := made_eq.get(true_atom)) is not None:
-        return add_eq.primitive is jax.lax.add_p and tuple(add_eq.invars) in ((u, v), (v, u))
-    return False
-
-
-def _eval_signs(jaxpr: jcore.Jaxpr, env: dict[jcore.Var, tuple[bool, bool]],
-                finite: dict[jcore.Var, bool], target: jcore.Var, *, depth: int = 0) -> tuple[bool, bool]:
-    """Compute `(nonneg, nonpos)` for `target` along its backward dependency slice in `jaxpr`, peeling
-    `called` primal bodies (`jit`, `custom_jvp_call` such as `jax.nn.softplus` / `jax.nn.log_sigmoid`)."""
-    if depth > 6:
-        return False, False
-    if target in env:
-        return env[target]
-    needed = read_by(jaxpr, (target,))
-    signs = dict(env)
-    is_finite = dict(finite)
-    made_eq: dict[jcore.Var, jcore.JaxprEqn] = {}
-    for equation in jaxpr.eqns:
-        if not any(out in needed for out in equation.outvars):
-            continue
-        in_signs = [
-            _literal_signs(atom.val) if isinstance(atom, jcore.Literal) else signs.get(atom, (False, False))
-            for atom in equation.invars]
-        in_finite = [_atom_finite(atom, is_finite) for atom in equation.invars]
-        body = called(equation)
-        if body is not None and len(equation.outvars) == 1 and len(body.consts) == len(body.constvars):
-            inner_env = {cv: _literal_signs(c) for cv, c in zip(body.constvars, body.consts, strict=True)}
-            inner_env.update(zip(body.invars, in_signs, strict=True))
-            inner_fin = {cv: _literal_finite(c) for cv, c in zip(body.constvars, body.consts, strict=True)}
-            inner_fin.update(zip(body.invars, in_finite, strict=True))
-            out_var = body.outvars[0]
-            out_sign = (_literal_signs(out_var.val) if isinstance(out_var, jcore.Literal)
-                        else _eval_signs(body, inner_env, inner_fin, out_var, depth=depth + 1))
-            signs[equation.outvars[0]] = out_sign
-            continue
-        if len(equation.outvars) != 1:
-            continue
-        out = equation.outvars[0]
-        made_eq[out] = equation
-        if equation.primitive in _SIGN_PRESERVING:
-            is_finite[out] = in_finite[0]
-        if (equation.primitive in (jax.lax.log_p, jax.lax.log2_p)
-                and isinstance(equation.invars[0], jcore.Var)
-                and (src := made_eq.get(equation.invars[0])) is not None
-                and src.primitive is jax.lax.logistic_p):
-            signs[out] = (False, True)
-        elif (equation.primitive is jax.lax.select_n_p and len(in_signs) == 3
-              and _nan_guarded_branch(equation.invars[0], equation.invars[2], made_eq, is_finite)):
-            signs[out] = in_signs[1]
-        else:
-            signs[out] = _op_signs(equation.primitive, in_signs, equation)
-    return signs.get(target, (False, False))
-
-
-def _proven_nonpositive(index: fusion.Index, var: jcore.Var) -> bool:
-    """Whether `var` is statically proven `<= 0` in `index.jaxpr` (contraction domain for chunked
-    recurrences, row 3450)."""
-    env = {cvar: _literal_signs(const) for cvar, const in index.consts.items()}
-    finite = {cvar: _literal_finite(const) for cvar, const in index.consts.items()}
-    return _eval_signs(index.jaxpr, env, finite, var)[1]
+    if beta_bound is None:
+        return False
+    if delta:
+        if beta_bound != terms.NOTHING and beta_bound > terms.UNIT + 1:
+            return False
+        return beta_apart.number and (beta_apart.sign > 0 or beta_bound == terms.NOTHING)
+    return (beta_bound == terms.NOTHING or k_bound == terms.NOTHING
+            or beta_bound + k_bound + key_bits <= cap)
 
 
 def _positive_scalar(atom) -> float | None:
     """Positive finite floating scalar literal (`!= 1.0`), or None."""
-    if not isinstance(atom, jcore.Literal) or terms.typed_key(atom.val):
-        return None
-    if isinstance(atom.val, jax.Array) and not isinstance(atom.val, jax_core.Tracer):
+    if (not isinstance(atom, jcore.Literal) or terms.typed_key(atom.val)
+            or isinstance(atom.val, (jax.Array, jax_core.Tracer))):
         return None
     scalar = np.asarray(atom.val)
     if scalar.ndim != 0 or not jnp.issubdtype(scalar.dtype, jnp.floating):
@@ -1406,7 +1295,9 @@ def _recurrence_chunk_call(*values, hooks, roles: tuple[tuple[str, int], ...], o
 
 
 def _recurrence_taken(call: Callable, operands: Sequence[jcore.Var], options: Hashable) -> bool:
-    """Whether Dew's recurrence selector gives `call` a non-XLA kernel (`mosaic_gpu`, `fla`, `ssd`)."""
+    """Whether Dew's recurrence selector gives `call` a non-XLA kernel in forward AND its reverse-mode VJP
+    traces without `KernelRefused` (row 3450)."""
+    shapes = tuple(_shape(var) for var in operands)
     key = ("recurrence", tuple((aval(var).shape, aval(var).dtype) for var in operands), options,
            fusion.choice_context())
 
@@ -1415,11 +1306,17 @@ def _recurrence_taken(call: Callable, operands: Sequence[jcore.Var], options: Ha
 
         with generation.routes(alone=True) as found:
             try:
-                jax.eval_shape(call, *(_shape(var) for var in operands))
+                out_shapes = jax.eval_shape(call, *shapes)
             except KernelRefused:
                 return False
-        return any(route.choice in (Choice.GATED_DELTA_RULE, Choice.SSD) and route.kernel not in KEPT
-                   for route in found)
+            if not any(route.choice in (Choice.GATED_DELTA_RULE, Choice.SSD) and route.kernel not in KEPT
+                       for route in found):
+                return False
+            try:
+                jax.eval_shape(lambda xs, ct: jax.vjp(call, *xs)[1](ct), shapes, out_shapes)
+            except KernelRefused:
+                return False
+        return True
 
     return _cache.holding(_TAKEN, key, probe, fusion.DECISIONS_HELD)
 
@@ -1427,15 +1324,18 @@ def _recurrence_taken(call: Callable, operands: Sequence[jcore.Var], options: Ha
 def _recurrence_candidates(
     scan_body: jcore.Jaxpr, operands: tuple[jcore.Var, ...], outputs: tuple[jcore.Var, ...],
     xs_avals: tuple, state_aval, ys_aval, q_cands: Sequence[int], g_cands: Sequence[int | None],
+    held: Mapping[jcore.Var, terms.Magnitude | None], apart: Mapping[jcore.Var, terms.Apart],
 ) -> Iterator[Candidate]:
     """Yield `recurrence.Hooks` candidates for validated `(query, log_decay, beta, key, value)` splits."""
     from dew.nn.kernels import recurrence
     from dew.nn.precision import at_least_fp32
 
     _, value_heads, key_width, value_width = state_aval.shape
+    xs = operands[1:]
     body_xs = scan_body.jaxpr.invars[1:]
     for q_idx in q_cands:
         q_heads = xs_avals[q_idx].shape[2]
+        q_bound = held.get(xs[q_idx])
         scales = _query_scales(scan_body.jaxpr, body_xs[q_idx], key_width)
         for g_idx in g_cands:
             if g_idx == q_idx:
@@ -1445,6 +1345,8 @@ def _recurrence_candidates(
             if len(betas) > 1 or len(rest) - len(betas) != 2:
                 continue
             beta_idx = betas[0] if betas else None
+            beta_bound = None if beta_idx is None else held.get(xs[beta_idx])
+            beta_apart = terms.NOWHERE if beta_idx is None else apart.get(xs[beta_idx], terms.NOWHERE)
             kv_idxs = [i for i in rest if i != beta_idx]
             decay = "none" if g_idx is None else ("scalar" if xs_avals[g_idx].ndim == 3 else "vector")
             modes = ((True, False), (False, True)) if beta_idx is not None else ((False, False),)
@@ -1455,6 +1357,7 @@ def _recurrence_candidates(
                 common = jnp.result_type(xs_avals[q_idx].dtype, xs_avals[k_idx].dtype, xs_avals[v_idx].dtype)
                 if at_least_fp32(common) != state_aval.dtype:
                     continue
+                k_bound = held.get(xs[k_idx])
                 roles_list: list[tuple[str, int]] = [("query", q_idx + 1), ("key", k_idx + 1),
                                                      ("value", v_idx + 1)]
                 if g_idx is not None:
@@ -1468,6 +1371,11 @@ def _recurrence_candidates(
                             and jnp.result_type(common, xs_avals[beta_idx].dtype) != common):
                         continue
                     for scale in scales:
+                        if not _recurrence_bounded(
+                                q_bound, k_bound, beta_bound, beta_apart,
+                                key_width=key_width, common=common, scale=scale,
+                                delta=delta, has_beta=beta_idx is not None):
+                            continue
                         hooks = recurrence.Hooks(decay=decay, scale=scale, delta=delta, write_gate=write_gate)
                         declared = functools.partial(_recurrence_step_declared, hooks=hooks, roles=roles,
                                                      out_dtype=ys_aval.dtype)
@@ -1482,9 +1390,9 @@ def _recurrence_candidates(
 
 
 def _recurrences(index: fusion.Index, place: int) -> Iterator[Candidate]:
-    """Linear-recurrence candidates anchored on a `scan_p` equation (row 3450): verifies state/output
-    shapes, step-body equation budget (`SPAN`), contraction decay domain (`<= 0`), and data-dependency
-    roles (`read_by`) before offering `recurrence.Hooks` declarations to the step-body e-graph."""
+    """Linear-recurrence candidates anchored on a `scan_p` equation (row 3450): verifies array avals,
+    state/output shapes, step-body equation budget (`SPAN`), shared `terms.proven` decay/range proofs, and
+    data-dependency roles (`read_by`) before offering `recurrence.Hooks` declarations to the e-graph."""
     equation = index.jaxpr.eqns[place]
     operands = tuple(atom for atom in equation.invars if isinstance(atom, jcore.Var))
     if (equation.primitive is not jax.lax.scan_p or equation.effects
@@ -1501,6 +1409,11 @@ def _recurrences(index: fusion.Index, place: int) -> Iterator[Candidate]:
     if (consts_n != 0 or carry_n != 1 or carry_out_n != 1 or ys_out_n != 1
             or length < 1 or not 3 <= xs_n <= 5):
         return
+    scan_body = equation.params["jaxpr"]
+    inner = scan_body.jaxpr
+    if not all(isinstance(var.aval, ShapedArray)
+               for var in (*operands, *equation.outvars, *inner.invars, *inner.outvars)):
+        return
     xs = operands[1:]
     state_var, final_var, ys_var = operands[0], equation.outvars[0], equation.outvars[1]
     state_aval, final_aval, ys_aval = aval(state_var), aval(final_var), aval(ys_var)
@@ -1516,8 +1429,6 @@ def _recurrences(index: fusion.Index, place: int) -> Iterator[Candidate]:
     if any(a.ndim not in (3, 4) or a.shape[:2] != (length, batch) or not jnp.issubdtype(a.dtype, jnp.floating)
            for a in xs_avals):
         return
-    scan_body = equation.params["jaxpr"]
-    inner = scan_body.jaxpr
     if sum(1 for _ in equations(inner)) > SPAN:
         return
     state_deps = read_by(inner, (inner.outvars[0],))
@@ -1530,12 +1441,13 @@ def _recurrences(index: fusion.Index, place: int) -> Iterator[Candidate]:
                and body_xs[i] not in state_deps and body_xs[i] in out_deps]
     if not q_cands:
         return
+    held, apart = terms.proven(index.jaxpr, consts=index.consts, targets=xs, deep=True)
     if exp_targets:
         g_cands: list[int | None] = [
             i for i, a in enumerate(xs_avals)
-            if body_xs[i] in exp_deps and _proven_nonpositive(index, xs[i]) and (
-                (a.ndim == 3 and a.shape[2] == value_heads)
-                or (a.ndim == 4 and a.shape[2:] == (value_heads, key_width)))
+            if body_xs[i] in exp_deps and _nonpositive_decay(held.get(xs[i]), apart.get(xs[i], terms.NOWHERE))
+            and ((a.ndim == 3 and a.shape[2] == value_heads)
+                 or (a.ndim == 4 and a.shape[2:] == (value_heads, key_width)))
         ]
         if not g_cands:
             return
@@ -1543,7 +1455,7 @@ def _recurrences(index: fusion.Index, place: int) -> Iterator[Candidate]:
         g_cands = [None]
     yield from _recurrence_candidates(
         scan_body, operands, tuple(equation.outvars), xs_avals,
-        state_aval, ys_aval, q_cands, g_cands)
+        state_aval, ys_aval, q_cands, g_cands, held, apart)
 
 
 ATTENTION = (Family(jax.lax.exp_p, _attentions),)

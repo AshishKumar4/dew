@@ -437,8 +437,35 @@ def test_grouped_gated_experts_selector_defaults_apart_and_honors_named_and_hand
             assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook)
         with generation.chosen(grouped_matmul="mosaic", gated_mlp="fused"):
             assert gated_mlp.fuses_grouped(rows, (gate, down), None, hook)
+            # Explicit group_sizes, gather/scatter tables, and stacked 4D layer banks pass through cleanly.
+            sizes = jax.ShapeDtypeStruct((4,), jnp.int32)
+            table = jax.ShapeDtypeStruct((256,), jnp.int32)
+            gate_4d = jax.ShapeDtypeStruct((2, 4, 128, 256), jnp.bfloat16)
+            down_4d = jax.ShapeDtypeStruct((2, 4, 256, 128), jnp.bfloat16)
+            assert gated_mlp.fuses_grouped(rows, (gate_4d, down_4d), None, hook,
+                                           group_sizes=sizes, gather=table, scatter=table, layer=0)
             # Forced grouped Mosaic never escapes `KernelRefused` before GATED_MLP's handoff.
             assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook, whole=False)
             with jax.enable_x64():
                 wide_rows = jax.ShapeDtypeStruct((256, 128), jnp.float64)
                 assert not gated_mlp.fuses_grouped(wide_rows, (gate, down), None, hook)
+
+
+def test_grouped_gated_experts_hands_off_default_a100_cutlass_down():
+    """On default A100 (`sm80`), the ordinary grouped down cell chooses CUTLASS which forms the prologue in
+    XLA, so `fuses_grouped` hands off to `'apart'` unless `grouped_matmul='mosaic'` is selected; with Mosaic
+    forced and gather/scatter tables (unsupported on `mma.sync`), `fuses_grouped` hands off cleanly."""
+    from dew.nn import gated_mlp
+
+    rows = jax.ShapeDtypeStruct((256, 128), jnp.bfloat16)
+    gate = jax.ShapeDtypeStruct((4, 128, 256), jnp.bfloat16)
+    down = jax.ShapeDtypeStruct((4, 256, 128), jnp.bfloat16)
+    table = jax.ShapeDtypeStruct((256,), jnp.int32)
+    hook = activations.gated_hook("swiglu")
+    with generation.assumed("sm80"):
+        with generation.chosen(gated_mlp="fused"):
+            assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook)
+        with generation.chosen(grouped_matmul="mosaic", gated_mlp="fused"):
+            assert gated_mlp.fuses_grouped(rows, (gate, down), None, hook)
+            assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook, gather=table)
+            assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook, scatter=table)
