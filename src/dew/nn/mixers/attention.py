@@ -39,6 +39,7 @@ from dew.nn.attention_masks import (
     repeat_kv_heads,
     visibility_mask,
 )
+from dew.nn.attention_terms import QKClip, RelativeBias, clipped, log_ratio_scale, relative_logits
 from dew.nn.blocks import normal_kernel
 from dew.nn.cross_attention import sow_context_logits, with_context_logits
 from dew.nn.dense import Dense
@@ -405,8 +406,19 @@ class CausalSelfAttention(nn.Module):
     them for its kind (`MixerContext`)."""
     qk_norm_weight: bool = True  # False: Llama 4's weightless L2 norm (Llama4TextL2Norm)
     temperature_tuning: tuple[float, float] | None = None
-    """A (floor_scale, attn_scale) that scales each query by its position
-    (`temperature_scale`), rotated or not: Llama 4's unrotated layers'."""
+    """A (floor_scale, attn_scale) that scales each query by its position, rotated or not, in the form
+    `temperature_form` names: Llama 4's unrotated layers'."""
+    temperature_form: Literal['floored', 'log_ratio'] = 'floored'
+    """How `temperature_tuning` grows with the position: Llama 4's floored ratio plus one
+    (`temperature_scale`), or the log of the ratio past the floor (`log_ratio_scale`, Inkling 2's global
+    layers)."""
+    qk_clip: QKClip | None = None
+    """Each query and key head's length clipped (`QKClip`), where a head norm (`MixerContext.qk_norm`)
+    would sit: after the projections, before any rotation and the temperature; a layer takes one or the
+    other."""
+    relative_bias: RelativeBias | None = None
+    """An input-conditioned relative-position bias (`RelativeBias`): an fp32 `[B, H, Q, K]` dense bias,
+    O(Q K) memory at a prefill, added to the call's own before the softmax."""
     gate_projection: Literal['query', 'own', 'head'] = 'query'
     """Where the output gate comes from: the doubled query projection
     (Qwen3.5), a `gate_proj` of its own over the layer's input (Muse
@@ -540,6 +552,20 @@ class CausalSelfAttention(nn.Module):
             self.q_norm = norm(name='q_norm')
             if not self.ctx.kv_shared:
                 self.k_norm = norm(name='k_norm')
+        if self.qk_clip is not None:
+            if self.ctx.qk_norm:
+                raise ValueError("qk_clip and qk_norm each bound a head's queries and keys: take one")
+            if self.qk_clip.query_scale:
+                self.q_clip_scale = self.param('q_clip_scale', nn.initializers.ones,
+                                               (self.ctx.num_heads, self.ctx.head_dim), jnp.float32)
+        if self.relative_bias is not None:
+            bias = self.relative_bias
+            self.relative = dense(self.ctx.num_heads * bias.rank, name='relative', use_bias=False,
+                                  kernel_axes=ATTENTION_AXES['gate_proj'])
+            self.relative_scale = self.param('relative_scale', nn.initializers.ones,
+                                             (self.ctx.num_heads, bias.rank), jnp.float32)
+            self.relative_bank = self.param('relative_bank', nn.initializers.zeros, (bias.rank, bias.extent),
+                                            jnp.float32)
         if self.ctx.ngpt is not None:
             self._ngpt_gains(self.ctx.ngpt)
         if self.ctx.dex is not None:
@@ -791,6 +817,8 @@ class CausalSelfAttention(nn.Module):
         key = key.reshape(batch, length, self.ctx.num_kv_heads, self.ctx.head_dim)
         if self.ctx.qk_norm and not whole and not self.qk_norm_after_rotary:
             key = self.k_norm(key, axes=KV_HEADS)
+        if self.qk_clip is not None:
+            key = clipped(key, self.qk_clip.threshold, self.qk_clip.eps)
         if self.ctx.v_norm:
             value = self.values_norm(value, axes=KV_HEADS)
         return constrain(key, KV_HEADS), constrain(value, KV_HEADS)
@@ -827,9 +855,30 @@ class CausalSelfAttention(nn.Module):
         no normalization undoes it. A scalar a position, rotated kind or not."""
         if self.temperature_tuning is None:
             return query
-        scale = temperature_scale(places, *self.temperature_tuning, dtype=at_least_fp32(query.dtype))
+        scale = self._temperature(places, at_least_fp32(query.dtype))
         return query * (scale[..., None, None] if scale.ndim == 2
                         else scale[None, :, None, None]).astype(query.dtype)
+
+    def _temperature(self, places, dtype) -> jax.Array:
+        """Each place's query multiplier under `temperature_tuning`, in the form `temperature_form` names."""
+        assert self.temperature_tuning is not None, "a temperature is read where the layer tunes one"
+        form = temperature_scale if self.temperature_form == 'floored' else log_ratio_scale
+        return form(places, *self.temperature_tuning, dtype=dtype)
+
+    def _relative_bias(self, x, places, key_places) -> jax.Array:
+        """`relative_bias`'s fp32 `[B, H, Q, K]` bias of the queries' input `x` at their `places` against
+        the keys at `key_places` (`relative_logits`)."""
+        spec = self.relative_bias
+        assert spec is not None, "a relative bias is read where the layer computes one"
+        B, S, _ = x.shape
+        states = self.relative(x).reshape(B, S, self.ctx.num_heads, spec.rank)
+        states = (clipped(states, spec.clip, 1e-6, self.relative_scale) if spec.clip is not None
+                  else (states.astype(jnp.float32) * self.relative_scale).astype(states.dtype))
+        if spec.temperature and self.temperature_tuning is not None:
+            scale = self._temperature(places, at_least_fp32(states.dtype))
+            states = states * (scale[..., None, None] if scale.ndim == 2
+                               else scale[None, :, None, None]).astype(states.dtype)
+        return relative_logits(states, self.relative_bank, places, key_places)
 
     def _rotary_angles(self, rotary_positions, heads: jax.Array, tokens: Coordinates | None = None,
                        places=None):
@@ -1035,6 +1084,9 @@ class CausalSelfAttention(nn.Module):
                 kv_store[self.ctx.kv_store_key] = (key, value, positions, places, {})
         query = self._tuned(query, places)
         if decode and attention_metadata is not None and attention_metadata.admitted is not None:
+            if self.relative_bias is not None:
+                raise ValueError(f"{self.name}: a server's mixed step attends its rows' caches by pages, "
+                                 "which take no dense bias: serve a relative bias's layer by the dense cache")
             attention = self._mixed_attended(query, key, value, positions, attention_metadata)
             return self._output(attention, gate, B, S, own_value, progress)
         sinks = self.sinks
@@ -1064,6 +1116,9 @@ class CausalSelfAttention(nn.Module):
         if attention_metadata is not None and attention_metadata.position_bias is not None:
             position_bias = attention_metadata.position_bias
             bias = position_bias if bias is None else bias + position_bias
+        if self.relative_bias is not None:
+            relative = self._relative_bias(x, places, masking.key_places)
+            bias = relative if bias is None else bias + relative
         attention = self._attended(masking, positions, append, sinks, train, bias=bias)
         return self._output(attention, gate, B, S, own_value, progress)
 
@@ -1128,6 +1183,9 @@ class CausalSelfAttention(nn.Module):
             gate = gate.reshape(B, S, self.ctx.num_heads, -1)
         if self.ctx.qk_norm and not self._whole_norm and not self.qk_norm_after_rotary:
             query = self.q_norm(query, axes=HEADS)
+        if self.qk_clip is not None:
+            query = clipped(query, self.qk_clip.threshold, self.qk_clip.eps,
+                            self.q_clip_scale if self.qk_clip.query_scale else None)
         # o_proj's sum returns to the residual placement in the block.
         return constrain(query, HEADS), gate, projected_kv
 
@@ -1887,7 +1945,10 @@ class CausalSelfAttention(nn.Module):
         """
         if (self.ctx.sliding_window is None and self.ctx.attention_chunk is None) or not self.ctx.causal:
             return False
-        if self.alibi or decode or (not self.is_initializing() and self.is_mutable_collection(QK)):
+        # A bias over the logits (ALiBi's, a relative bias's) is the general kernel's, which local
+        # attention takes none of.
+        if (self.alibi or self.relative_bias is not None or decode
+                or (not self.is_initializing() and self.is_mutable_collection(QK))):
             return False
         return metadata is None or (not self._unhonoured(metadata, "local") and all(
             getattr(metadata, name) is None for name in self._group_fields()))
