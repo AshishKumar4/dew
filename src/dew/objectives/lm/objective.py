@@ -74,6 +74,7 @@ from dew.inputs import Field, InputSpec
 from dew.nn.backbones.looping import exit_objective, never_exiting
 from dew.nn.continuum import feedforward_levels
 from dew.nn.cross_attention import crosses_alone
+from dew.nn.dense import NVFP4_AMAX
 from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops, parameter_flops
 from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, ModelInputs, pad_token_rows, rotate_rows
 from dew.nn.inspection import INSPECTED, QK, current_positions, watched_positions
@@ -517,6 +518,9 @@ class Scores(NamedTuple):
     moved: Mapping | None = None
     exits: tuple[tuple[jax.Array, ...], tuple[jax.Array, ...], tuple[jax.Array, ...] | None,
                  tuple[jax.Array | bool, ...]] | None = None
+    amax: dict | None = None
+    """What the delayed-scaling NVFP4 projections recorded (`dew.nn.dense.NVFP4_AMAX`), where `token_scores`
+    was asked for it (`amax`), else None."""
 
 
 def _refuse_stacked(collections: Sequence[str], *, depths: bool, layers: Sequence[int], routes,
@@ -959,15 +963,15 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
                      routes: tuple[jax.Array | Mapping[str, jax.Array], jax.Array | None] | None = None,
                      predict: bool | None = None, z_loss: float | None = None, logits: bool = False,
                      progress: Progress = END, rows: jax.Array | None = None, exits: bool = False,
-                     loop_passes: jax.Array | None = None):
+                     loop_passes: jax.Array | None = None, amax: bool = False):
         """Score per-token next-token cross entropy over a `[B, seq_len + 1]` batch.
 
-        Returns `Scores`: the losses, the weight of each target, whether each
-        prediction was right, the states behind them, and what `routing`,
-        `depths`, `qk_stats`, `indexer` and `layers` asked for. `layers`
-        names the model's layers whose output states to keep, `layers_N` in
-        its tree, as a feature distillation reads them. `rows` weighs each row
-        (`Objective.row_weights`), a filled row's targets at nothing.
+        Returns `Scores`: the losses, the weight of each target, whether each prediction was right, the
+        states behind them, and what `routing`, `depths`, `qk_stats`, `indexer`, `layers` and `amax` (the
+        delayed-scaling NVFP4 projections' recorded largest magnitudes, `Step.amax`) asked for. `layers`
+        names the model's layers whose output states to keep, `layers_N` in its tree, as a feature
+        distillation reads them. `rows` weighs each row (`Objective.row_weights`), a filled row's targets
+        at nothing.
 
         A packed batch carries its rows' `coordinates` (`dew.batch.coordinates`),
         their documents and per-document positions. The last token of a
@@ -1028,8 +1032,8 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
             replay["routed_experts"] = jax.tree.map(lambda record: jnp.asarray(record)[:, :-finals], routed)
             if covered is not None:
                 replay["routed"] = jnp.asarray(covered, bool)[:, :-finals]
-        collections = (([ROUTER_COLLECTION] if routing else []) + ([QK] if qk_stats else [])
-                       + ([INDEXER_COLLECTION] if indexer else []) + ([INSPECTED] if watched else []))
+        collections = [name for name, asked in ((ROUTER_COLLECTION, routing), (QK, qk_stats),
+                       (INDEXER_COLLECTION, indexer), (INSPECTED, watched), (NVFP4_AMAX, amax)) if asked]
         stream_depth = depths and _streamed_depths(self.model)
         opened = [*collections, *(['prediction_inputs'] if stream_depth else []), *([EXITS] if exits else [])]
         adaptation = self.adaptation
@@ -1052,6 +1056,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         qk = gathered.get(QK, {}) if qk_stats else None
         kls = gathered.get(INDEXER_COLLECTION) if indexer else None
         inspected = gathered.get(INSPECTED, {}) if watched else None
+        recorded = gathered.get(NVFP4_AMAX, {}) if amax else None
         kept = tuple(self._layer_states().layer_state(gathered, index) for index in layers)
         predict = self.token_accuracy if predict is None else predict
         table = self.fused_head(params) if z_loss is not None else None
@@ -1063,27 +1068,28 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         depth_scores = []
         if depths:
             with self._watched(prepared, watched):
-                depth_scores, (sown, qk, kls, inspected) = self._depth_pass(
+                depth_scores, (sown, qk, kls, inspected, recorded) = self._depth_pass(
                     params, gathered['prediction_inputs']['states'] if stream_depth else hidden, inputs,
-                    targets, prepared, roles, losses.dtype, table, rows, (sown, qk, kls, inspected),
-                    (routing, qk_stats, indexer, watched), train=train, rngs=rngs, collections=collections,
-                    packing=packing)
+                    targets, prepared, roles, losses.dtype, table, rows, (sown, qk, kls, inspected, recorded),
+                    (routing, qk_stats, indexer, watched, amax), train=train, rngs=rngs,
+                    collections=collections, packing=packing)
         passes = self._exit_scores(params, gathered, targets, (losses, correct), before) if exits else None
         return Scores(losses, weights, log_z, correct, hidden, kept, sown, depth_scores, qk, kls, total,
-                      whole, inspected, moved, passes)
+                      whole, inspected, moved, passes, recorded)
 
     def _depth_pass(self, params, source, inputs, targets, prepared, roles, dtype, table, rows, records,
                     asked, *, train, rngs, collections: list[str], packing: dict):
         """The prediction depths' scores (`_depth_scores`) from the trunk's `source` states, and the
-        trunk's `records` (`(sown, qk, kls, inspected)`) with the depths' added to each the call `asked`
-        for: a routed depth balances, counts and indexes like a trunk layer, and a watched one sows its
-        summary under its own path (`mtp_<d>`), over the positions its caller names. Depth d's state at p
+        trunk's `records` (`(sown, qk, kls, inspected, amax)`) with the depths' added to each the call
+        `asked` for: a routed depth balances, counts and indexes like a trunk layer, a watched one sows its
+        summary under its own path (`mtp_<d>`), over the positions its caller names, and a delayed-scaling
+        NVFP4 one records its projections' largest under theirs. Depth d's state at p
         scores the target d further out, so its targets are the shifted row's from d on."""
         states = self.model.apply(params, source, inputs, train=train, rngs=rngs, method="mtp_hidden_states",
                                   mutable=collections or False, **packing)
         if collections:
             states, depth_sown = states
-            names = (ROUTER_COLLECTION, QK, INDEXER_COLLECTION, INSPECTED)
+            names = (ROUTER_COLLECTION, QK, INDEXER_COLLECTION, INSPECTED, NVFP4_AMAX)
             records = tuple({**(held or {}), **depth_sown.get(name, {})} if wanted else held
                             for held, name, wanted in zip(records, names, asked, strict=True))
         return self._depth_scores(params, states, targets, prepared, roles, dtype, table, rows), records
@@ -1700,12 +1706,12 @@ class LMObjective(TokenScorer):
                 progress=self.progress(step))
         statistics, kl = self._warmup_statistics(gathered[INDEXER_COLLECTION], prepared, batch)
         reported: dict[str, jax.Array | Ratio] = {"indexer_kl": kl}
-        qk, inspected = step.observed(gathered)
+        qk, inspected, amax = step.observed(gathered)
         if step.qk_stats:
             peak = _global_qk_max(qk)
             if peak is not None:
                 reported["qk/max_logit"] = peak
-        return statistics, Aux(reported, qk_stats=qk, inspected=inspected)
+        return statistics, Aux(reported, qk_stats=qk, inspected=inspected, amax=amax)
 
     def _warmup_statistics(self, sown, prepared: ModelInputs, batch: Batch) -> tuple[Ratio, Ratio]:
         """The warm-up's loss, the indexer's weighted KL over the queries it
@@ -1796,8 +1802,8 @@ class LMObjective(TokenScorer):
             qk_stats=step.qk_stats, indexer=self.indexer is not None, layers=layers,
             watched=step.watched is not None,
             z_loss=self.z_loss if summed and not exits else None, logits=logits,
-            predict=predict, rows=rows, exits=exits, loop_passes=loop_passes_given(batch))
-        losses, weights, log_z, correct, _, _, routing, depths, qk, kls, sums, _, _, _, passes = scores
+            predict=predict, rows=rows, exits=exits, loop_passes=loop_passes_given(batch), amax=step.amax)
+        losses, weights, log_z, correct, _, _, routing, depths, qk, kls, sums, _, _, _, passes, _ = scores
         width, length = at_least_fp32(losses.dtype), losses.shape[1]
 
         def shares(values: jax.Array, counts: jax.Array) -> jax.Array:
@@ -1876,8 +1882,8 @@ class LMObjective(TokenScorer):
             peak = _global_qk_max(qk)
             if peak is not None:
                 reported["qk/max_logit"] = peak
-        return _Scored(statistics, Aux(reported, qk_stats=qk, effects=effects, inspected=scores.inspected),
-                       scores, units)
+        return _Scored(statistics, Aux(reported, qk_stats=qk, effects=effects, inspected=scores.inspected,
+                                       amax=scores.amax), scores, units)
 
     def evaluate(self, params, batch, step: Step):
         """Score the complete batch teacher-forced, using EMA when present; the

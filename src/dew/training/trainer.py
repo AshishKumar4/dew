@@ -66,6 +66,7 @@ from dew.distributed.placement import Layout, MeshSpec, Placement, Validation, d
 from dew.held_updates import waiting
 from dew.inputs import Field, InputSpec
 from dew.mesh import STAGE_AXIS, LayoutRefused, LogicalAxes
+from dew.nn.dense import NVFP4_HISTORY
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels.options import Compiling, attempting, shapes_of
 from dew.nn.kernels.templates import report
@@ -482,7 +483,9 @@ class Trainer(Generic[Loss, Effects]):
             variables=params, opt_state=opt_state,
             # The average starts equal to the parameters but as its own buffers, copied by the transfer: the
             # step donates the state, and a buffer can be donated once.
-            ema=None if ema is None else jax.tree.map(transferred_copy, select(params, ema.select)),
+            # No amax history is averaged: an averaged forward reads the committed one (`with_ema`).
+            ema=None if ema is None else jax.tree.map(transferred_copy, select(
+                params, lambda path: path[0] != NVFP4_HISTORY and ema.select(path))),
             key=run_key,
             consumed=None if self._shape.examples is None else jnp.zeros((), jnp.int32),
             deferred=waiting(opt_state))
