@@ -289,12 +289,13 @@ def test_the_gemm_kernels_run_on_this_gpu(part):
                f"{jnp.dtype(dtype).name}",
                functools.partial(gemm_template.a_dense_kernel_gradients_balanced_tail_holds_check_1, rows,
                                  depth, width, dtype), "sm90", fault=BALANCED_TAIL)
-          for rows, depth, width in gemm_template.BALANCED_TAILS for dtype in (jnp.bfloat16, jnp.float32)),
+          for rows, depth, width, dtype in gemm_template.BALANCED_TAILS),
         *(Cell(f"an A100's dense kernel gradient's balanced tail holds check 1: {rows}x{depth}x{width}",
                functools.partial(gemm_template.a_dense_kernel_gradients_balanced_tail_holds_check_1, rows,
                                  depth, width, jnp.bfloat16, "sm80"), "sm80", fault=BALANCED_TAIL)
           # An A100's 128 x 128 tiles balance a tail at these (200 rows' two steps a tile walk whole).
-          for rows, depth, width in gemm_template.BALANCED_TAILS if rows == 320),
+          for rows, depth, width, dtype in gemm_template.BALANCED_TAILS
+          if rows == 320 and dtype == jnp.bfloat16),
         *(Cell(f"a chained input gradient holds check 1: {case}",
                functools.partial(gemm_paired.a_chained_input_gradient_holds_check_1, case), name,
                native={"launch": "chained", "generation": name, "case": case})

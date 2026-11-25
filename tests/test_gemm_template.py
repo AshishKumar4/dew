@@ -1147,14 +1147,15 @@ def test_a_kernel_gradients_tail_is_priced_in_its_parts_steps_whatever_multiproc
         assert len(decided) == 1, steps
 
 
-BALANCED_TAILS = ((320, 128, 2816), (200, 128, 2816), (320, 256, 1408))
-"""The dense kernel gradients' rows, depth and width whose 11 output tiles leave a Hopper part of 8
-multiprocessors' last wave at most half full: at rows a step does not divide, and at a tile of 256 x 128."""
+BALANCED_TAILS = tuple((*shape, dtype) for shape in ((320, 128, 2816), (200, 128, 2816), (320, 256, 1408))
+                       for dtype in (jnp.bfloat16, jnp.float32) if (*shape, dtype)[2:] != (1408, jnp.float32))
+"""Dense kernel gradients' rows, depth, width and dtype whose 11 output tiles leave a Hopper part of 8
+multiprocessors' last wave at most half full, which their launch balances: at rows a step does not divide,
+and at a tile of 256 x 128 (exactly summed into fp32 there, a cluster tile, whose tail it refuses)."""
 
 
 @runs("sm90")
-@pytest.mark.parametrize("out_dtype", [jnp.bfloat16, jnp.float32], ids=["bf16", "fp32, exact sums"])
-@pytest.mark.parametrize(("rows", "depth", "width"), BALANCED_TAILS)
+@pytest.mark.parametrize(("rows", "depth", "width", "out_dtype"), BALANCED_TAILS)
 def test_a_dense_kernel_gradients_balanced_tail_holds_check_1(rows, depth, width, out_dtype):
     """A dense kernel gradient on a Hopper part of 8 multiprocessors whose 11 output tiles leave its last
     wave at most half full (`pricing.balanced_tail`, its hand-off unmeasured, so the tail is taken at

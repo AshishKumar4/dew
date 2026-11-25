@@ -1083,8 +1083,9 @@ def _workspace(tail, launch: tuple, interpret) -> tuple:
     tile each, a ref the kernel writes in place, the last of its operands; none without a tail. Its slots
     are written only where programs share a tile, so it is no declared output, which would leave the rest
     unwritten (NSNAN-2), and it starts uninitialized (`mosaic.workspace`)."""
-    return () if tail is None else (mosaic.workspace(tail_workspace(*launch, tail), jnp.float32,
-                                                     interpret=interpret),)
+    tiles, family, programs = launch
+    return () if tail is None else (
+        mosaic.workspace(tail_workspace(tiles, family, programs, tail), jnp.float32, interpret=interpret),)
 
 
 def _scale_refs(refs: tuple, step_scales, mx_scales, gather, scatter) -> tuple:
