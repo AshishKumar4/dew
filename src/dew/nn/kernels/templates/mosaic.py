@@ -404,13 +404,17 @@ own)."""
 def refuse_staging(family, chunks: tuple[int, int] | None, outputs: tuple = ()) -> tuple[tuple, ...]:
     """Refuses `chunks` (`Family.output_staging`'s) where `family` stages each output tile whole, and any of
     `outputs` stored packed or written by its own write (`stores.Output`'s divisor, transposed form or write,
-    which chunked staging alone takes); `outputs` as `(shape, dtype)` pairs."""
+    which chunked staging alone takes), or narrowed where the family places none (`stores_narrowed`);
+    `outputs` as `(shape, dtype)` pairs, a narrowed one's its stored shape (a `divisor`-th of its columns)."""
     if chunks is not None:
         raise ValueError(f"{family.name} stages each output tile whole, in no chunks: {chunks}")
     plain = tuple(map(Output.of, outputs))
-    if any(output.divisor > 1 or output.transposed or output.write is not None for output in plain):
+    if any(output.narrowed and not family.stores_narrowed for output in plain):
+        raise ValueError(f"{family.name} stores no output narrower than its tile")
+    if any((output.divisor > 1 and not output.narrowed) or output.transposed or output.write is not None
+           for output in plain):
         raise ValueError(f"{family.name} stages each output tile whole as its issuer writes it, none packed")
-    return tuple((output.shape, output.dtype) for output in plain)
+    return tuple(((output.shape[0], output.shape[1] // output.divisor), output.dtype) for output in plain)
 
 
 def then_read(read: Callable, after: Callable | None) -> Callable:
@@ -1565,6 +1569,12 @@ class Transport[Allocated, Opened](abc.ABC):
     """Whether a program copies its stored output tiles out through its registers (no TMA store before
     Hopper: `mosaic_sm80.Mma.persist`), so its epilogue holds its share of the stored tile beside the
     accumulator (`resources.tile_registers`)."""
+
+    stores_narrowed: bool = False
+    """Whether its stores take an output its epilogue computes narrower than the tile (`stores.Output`'s
+    `narrowed`: a `divisor`-th of its columns, placed at the column its caller gives, its own): a
+    chunk-staging family's (`ring_family.RingFamily`'s, `stores.staged`) and a whole-tile one that places it
+    (`mosaic_sm80.CpAsync`'s); `refuse_staging` refuses one elsewhere."""
 
     copy_extent: int | None = None
     """The most elements one asynchronous copy moves along a dimension of its box after the copy's tiling

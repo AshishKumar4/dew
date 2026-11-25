@@ -331,7 +331,8 @@ class SplitWalk:
                                     self.multiprocessors) / self.step_seconds
         base = max(busiest, stream)
         if self.drift_horizon > 0.0 and slice_steps > self.drift_horizon:
-            base += -(-programs // self.wave) * (slice_steps - self.drift_horizon) * self.drift_extra
+            waves = unit_cost.spread(programs, self.wave)
+            base += waves * (slice_steps - self.drift_horizon) * self.drift_extra
         return base
 
     def seconds(self, splits: int) -> float:

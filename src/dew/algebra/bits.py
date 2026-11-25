@@ -1001,6 +1001,16 @@ def nvfp4_tensor_scale(largest: jax.Array, quotient=None) -> jax.Array:
     return jnp.where(largest > 0, jnp.maximum(over, least_normal), np.float32(1))
 
 
+def nvfp4_given_scale(tensor) -> jax.Array:
+    """A tensor scale given in place of a tensor's own (a delayed-scaling recipe's, row 12721) as fp32: the
+    one boundary every given scale passes (`nvfp4_coded`'s, an operand's stored one, a product epilogue's),
+    refused unless one scalar, so no array of them quantizes each row at its own and scales each column by
+    another's."""
+    if jnp.ndim(tensor) != 0:
+        raise ValueError(f"an NVFP4 tensor scale is one scalar, not a {jnp.shape(tensor)} array")
+    return jnp.asarray(tensor, jnp.float32)
+
+
 def nvfp4_coded(x: jax.Array, tensor: jax.Array | None = None) -> tuple[jax.Array, jax.Array, jax.Array]:
     """A tile `x` `[depth, columns]` of float32 values as NVFP4: its E2M1 codes (`[depth, columns]` uint32,
     a code each), its block scales (`[depth / 16, columns]` float8_e4m3fn,
@@ -1025,11 +1035,9 @@ def nvfp4_coded(x: jax.Array, tensor: jax.Array | None = None) -> tuple[jax.Arra
             return correctly_rounded_divide(numerator, denominator)
         return (jnp.asarray(numerator, x.dtype) / jnp.asarray(denominator, x.dtype)).astype(jnp.float32)
 
-    if tensor is not None and jnp.ndim(tensor) != 0:
-        raise ValueError(f"an NVFP4 tensor scale is one scalar, not a {jnp.shape(tensor)} array")
     magnitude = jnp.abs(x)
     tensor = (nvfp4_tensor_scale(jnp.max(magnitude), quotient) if tensor is None
-              else jnp.asarray(tensor, jnp.float32))
+              else nvfp4_given_scale(tensor))
     blocks = jnp.max(magnitude.reshape(-1, NVFP4.depth, x.shape[-1]), axis=1)
     ratio = quotient(quotient(blocks, tensor), np.float32(E2M1_MAX))
     nearest = encoded(jax.lax.bitcast_convert_type(ratio, jnp.uint32), E4M3)

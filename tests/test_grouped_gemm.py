@@ -33,6 +33,7 @@ from dew.nn.kernels import (
     grouped_launch,
     grouped_matmul,
     grouped_triton,
+    selection,
     tuning,
 )
 from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing, row_tiles, tiling
@@ -1236,41 +1237,82 @@ def test_a_blackwells_projection_and_its_gradients_hold_check_1(sizes, out):
                         seeds=SEEDS, truth_fn=with_gradients(on_xla(jnp.float64)))
 
 
-def _dense_cell(generation_name: str, made: str, matrix: tuple[int, int], rows: int) -> grouped_cells.Kind:
-    """The cell (`GroupedCase.cell`'s kind) of a 16-bit dense product on `generation_name` making `made` of
-    `matrix` `[in, out]` over `rows` tokens."""
+def _dense_case(generation_name: str, made: grouped_cells.Made, matrix: tuple[int, int], rows: int,
+                dtype=jnp.bfloat16, stored=None) -> grouped_matmul.GroupedCase:
+    """The `GroupedCase` of a dense product of `dtype` operands on `generation_name` making `made` of `matrix`
+    `[in, out]` over `rows` tokens into `stored` (the receipts' own output dtype, `grouped_cells.STORED`,
+    where None)."""
     from dew.nn.kernels.templates.product import declared
 
     width_in, width_out = matrix
-    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    stored = jnp.dtype(grouped_cells.STORED[made] if stored is None else stored)
+    shaped = functools.partial(jax.ShapeDtypeStruct, dtype=dtype)
     sizes = jax.ShapeDtypeStruct((1,), jnp.int32)
-    product = declared(jnp.bfloat16, None, outputs=(jnp.bfloat16,))
+    product = declared(dtype, None, outputs=(stored,))
     with generation.assumed(generation_name):
-        if made == "kernel_gradient":
-            call = grouped_matmul.tgmm_call(bf16((rows, width_in)), bf16((rows, width_out)), sizes,
-                                            out_dtype=jnp.bfloat16, interpret=False, dense=True)
+        if made == grouped_cells.Made.KERNEL_GRADIENT:
+            call = grouped_matmul.tgmm_call(shaped((rows, width_in)), shaped((rows, width_out)), sizes,
+                                            out_dtype=stored, interpret=False, dense=True)
         else:
-            transposed = made == "input_gradient"
-            tokens = bf16((rows, width_out if transposed else width_in))
-            call = grouped_matmul.gmm_call(tokens, bf16((1, width_in, width_out)), sizes,
-                                           out_dtype=jnp.bfloat16, trans_rhs=transposed, interpret=False,
-                                           dense=True)
-        return grouped_matmul.grouped_case(*call, product=product, whole=True).cell[1]
+            transposed = made == grouped_cells.Made.INPUT_GRADIENT
+            tokens = shaped((rows, width_out if transposed else width_in))
+            call = grouped_matmul.gmm_call(tokens, shaped((1, width_in, width_out)), sizes, out_dtype=stored,
+                                           trans_rhs=transposed, interpret=False, dense=True)
+        return grouped_matmul.grouped_case(*call, product=product, whole=True)
 
 
-@pytest.mark.parametrize("made", ("forward", "input_gradient", "kernel_gradient"))
-def test_a_receipts_matrix_is_a_cell_of_its_own_over_the_rows_it_timed_alone(made):
-    """A receipt is evidence for the products it timed alone (`grouped_cells.Timed`, row 6794): each matrix
-    Hopper's receipts timed is a cell of its own (`Kind.matrix`) over the receipt's fewest to most rows and
-    no further (a fine-tune's 2,048 took the 4B key's cell and its launches made the step's products 1.75
-    ms slower), and a matrix no receipt timed never is."""
-    (timed,) = grouped_cells.MEASURED[("wgmma", grouped_cells.Made(made), False)]
-    for matrix in timed.matrices:
-        for rows, held in ((timed.fewest, True), (timed.most, True), (timed.fewest - 1, False),
-                           (timed.most + 1, False)):
-            assert (_dense_cell("sm90", made, matrix, rows).matrix == matrix) is held, (matrix, rows)
-    untimed = (timed.fewest + 1, timed.fewest + 3)
-    assert _dense_cell("sm90", made, untimed, timed.fewest).matrix is None
+def _route(case: grouped_matmul.GroupedCase) -> str:
+    """The kernel the grouped selector runs `case` on, as its target's process would."""
+    with generation.assumed(case.call.target.generation):
+        return selection.select(grouped_matmul.GROUPED, case).kernel
+
+
+def test_a_timed_product_is_recognized_over_its_receipts_rows_and_arithmetic_alone():
+    """A receipt is evidence for the products it timed alone (`grouped_cells.Timed`, row 6794): each product a
+    receipt timed (`grouped_cells.timings`) is recognized as its matrix over that receipt's rows
+    (`Kind.span`) in the arithmetic and output dtype it timed, and not past those rows (a fine-tune's 2,048
+    took the 4B key's cell and its launches made the step's products 1.75 ms slower) nor in another
+    arithmetic (a float32 call's TF32 kernel) or output dtype (another staging and memory)."""
+    for timing in grouped_cells.timings():
+        if timing.formed:
+            continue
+        rows = timing.timed.fewest
+        assert _dense_case(timing.generation, timing.made, timing.matrix, rows).kind.span == timing.timed.span
+        others = grouped_cells.MEASURED[timing.generation, timing.made, False]
+        stored = jnp.dtype(grouped_cells.STORED[timing.made]).name
+        if not any(timed.holds(timing.matrix, rows - 1, timing.timed.dtype, stored) for timed in others):
+            assert _dense_case(timing.generation, timing.made, timing.matrix, rows - 1).kind.matrix is None
+        wide = _dense_case(timing.generation, timing.made, timing.matrix, rows, dtype=jnp.float32,
+                           stored=jnp.float32)
+        assert wide.kind.matrix is None, timing
+        if timing.timed.stored is not None:
+            other = "bfloat16" if timing.timed.stored == "float32" else "float32"
+            assert _dense_case(timing.generation, timing.made, timing.matrix, rows,
+                               stored=other).kind.matrix is None, timing
+
+
+@pytest.mark.parametrize("board", grouped_cells.SCOREBOARDS, ids=lambda board: board.evidence.split()[0])
+def test_a_scoreboards_products_run_the_template_where_at_parity_and_its_kind_elsewhere(board):
+    """A dense kind runs the template whole only where every product its receipt timed is at parity in time
+    and temporaries (kernel-templates.md §1; bible §6, 2026-11-24); a kind with a product lagging keeps XLA's
+    dot, its products at parity the template's over their timed rows, its lagging ones and every product it
+    did not time XLA's (`grouped_cells.Scoreboard`)."""
+    untimed = (3 * 1024 + 64, 8 * 1024 + 64)
+    for made, projections in board.times.items():
+        kind = board.winner(made)
+        assert _route(_dense_case(board.generation, made, untimed, board.rows)) == kind, made
+        for name in projections:
+            route = _route(_dense_case(board.generation, made, grouped_cells.PROJECTIONS[name], board.rows))
+            expected = "mosaic" if kind == "mosaic" or board.at_parity(made, name) else "xla"
+            assert route == expected, (made, name)
+
+
+def test_a_generation_no_receipt_timed_runs_the_template():
+    """A generation no receipt timed (a B300) runs the template at every dense kind, whatever its
+    instruction family's other generations measured (the B200's lagging 4B cells are the B200's)."""
+    for made in grouped_cells.Made:
+        if made != grouped_cells.Made.EXACT_KERNEL_GRADIENT:
+            assert _route(_dense_case("sm103", made, (2560, 9216), 24576)) == "mosaic", made
 
 
 @pytest.mark.parametrize("gpu", [pytest.param(name, marks=runs(name)) for name in ("sm80", "sm90")])

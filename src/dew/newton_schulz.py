@@ -297,7 +297,8 @@ def newton_schulz(x: jax.Array, coeffs, steps: int, eps: float,
 
     def stepped(matrices: jax.Array, a: jax.Array, triple: jax.Array) -> jax.Array:
         # One product (the docstring's): the iterate's term on the Gram side.
-        return applied(symmetric_polynomial(a, triple), matrices)
+        # `a` is a Gram, symmetric by construction (the AOL scale kept bitwise symmetric, row 12024).
+        return applied(symmetric_polynomial(a, triple, symmetric=True), matrices)
 
     def base(matrices: jax.Array, triple: jax.Array) -> jax.Array:
         return stepped(matrices, gram(matrices), triple)

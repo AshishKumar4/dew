@@ -40,18 +40,17 @@ from . import generation, selection
 from .formats import TernaryWeights
 from .generation import INHERENT
 from .grouped_cells import (
-    B200_GRID,
-    EM35D,
-    M_EM_36,
-    M_EM_52,
-    M_EM_65,
-    M_EM_67,
+    M_EM_2,
+    M_FS_34,
     MEASURED,
-    NORMED_08B,
-    NORMED_4B_8B,
+    REFERENCE,
+    SCOREBOARDS,
+    TEMPLATE,
     TOGETHER,
     Kind,
     Made,
+    Timed,
+    timings,
 )
 from .grouped_cutlass import CutlassGmm, CutlassTgmm
 from .grouped_launch import INTERPRETED, _GroupedLaunch
@@ -75,11 +74,17 @@ def _stored_dtypes(ba) -> tuple:
 
 def _stored_bytes(ba, rows: int, width: int) -> float:
     """The bytes a product's epilogue moves an element of its `rows` x `width` output
-    (`pricing.split_walk`'s `stored`): each output's dtype's, and its epilogue operands' bytes over the
-    output's elements (an [rows, columns] operand's an element, a column vector's a row's share)."""
+    (`pricing.split_walk`'s `stored`): each output's dtype's over the tile columns a stored value holds (its
+    form's divisor, `Hooks.out_forms`: a packed output's two codes a byte, a reduced one's a value a block, a
+    narrowed one's half the tile), and its epilogue operands' bytes over the output's elements (an [rows,
+    columns] operand's an element, a column vector's a row's share)."""
     from .templates import cost
+    from .templates.gemm import quantized
 
-    written = sum(jnp.dtype(dtype).itemsize for dtype in _stored_dtypes(ba))
+    dtypes = _stored_dtypes(ba)
+    forms = quantized.forms_of(ba.arguments['hooks'].out_forms, dtypes) or (None,) * len(dtypes)
+    written = sum(jnp.dtype(dtype).itemsize / (1 if form is None else form.divisor)
+                  for dtype, form in zip(dtypes, forms, strict=True))
     return written + cost.stored(*ba.arguments.get('epilogue_operands', ())) / max(rows * width, 1)
 
 def _matrix_extents(ba) -> tuple[int, int]:
@@ -622,7 +627,7 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
         stored = _stored_dtypes(ba)
         if not self._granular(ba, config, family, target) or config.staging_refusal(
                 quantized.outputs((config.share, pricing.tile_columns(config, family)), stored,
-                                  quantized.forms_of(hooks.out_forms, len(stored))),
+                                  quantized.forms_of(hooks.out_forms, stored)),
                 family.specialized(config.share, pricing.tile_columns(config, family))) is not None:
             return False
         if hooks.out_forms and (not self.STORES_FORMS or quantized.forms_refusal(
@@ -837,7 +842,7 @@ class MosaicGmm(_Mosaic):
             epilogue_axes=hooks.epilogue_axes,
             epilogue_dtypes=tuple(side.dtype for side in ba.arguments.get('epilogue_operands', ())),
             dtypes=_stored_dtypes(ba),
-            forms=quantized.forms_of(hooks.out_forms, len(_stored_dtypes(ba))),
+            forms=quantized.forms_of(hooks.out_forms, _stored_dtypes(ba)),
             paired=ba.arguments.get('paired') is not None, step_scaled=self.STEP_SCALED,
             block_scaled=self.BLOCK_SCALED, gathered=ba.arguments.get('gather') is not None,
             interpret=bool(ba.arguments['interpret']), joined=ba.arguments.get('joined') is not None)
@@ -1816,16 +1821,18 @@ class MosaicMxGmm(_ScaledGmm):
     by its scale in the products (`product.block_format`)
     (`mosaic_gpu.gmm`'s `mx_scales`, `mosaic.Issuer.scaled_products`), its block scales streamed beside its
     rings (`gmm_allocations`' `block_scaled`) on a family whose products take them (tcgen05's), its tiles
-    whole 128s of rows, columns and depth, and no split, swap, hook or exact sums."""
+    whole 128s of rows, columns and depth, and no split, swap, prologue, pair or exact sums: an epilogue
+    reads its sums (`gemm.nvfp4_block_finished`'s, its outputs in their forms, row 12721)."""
 
     BLOCK_SCALED: ClassVar[bool] = True
     SCALES: ClassVar[str] = 'mx_scales'
 
     def _fp8(self, ba, dtype, family: mosaic.Family) -> bool:
         # Its products scale each block in the instruction, which sums in fp32 itself: no step promoted. Its
-        # operands FP8 (MXFP8) or E2M1 (NVFP4), `product.block_format`'s.
+        # operands FP8 (MXFP8) or E2M1 (NVFP4), `product.block_format`'s. An epilogue reads its sums as any
+        # product's; no prologue forms its codes.
         return (jnp.dtype(dtype) in family.block_formats
-                and ba.arguments['trans_rhs'] and ba.arguments['hooks'] == NO_HOOKS
+                and ba.arguments['trans_rhs'] and ba.arguments['hooks'].prologue is None
                 and ba.arguments.get('paired') is None and not ba.arguments.get('exact_sums'))
 
     def candidate(self, ba, config: tiling.Tiles, target) -> bool:
@@ -1934,7 +1941,7 @@ class GroupedCase:
     whether they see its operands whole (`whole`: no automatic mesh axis splits them,
     `dew.nn.sharding.automatic_axes`), the `product` it declares, its `extents`, its launches bound to it
     (`call`) and the `kind` of call it is (`Kind`, as `gmm_call` and `tgmm_call` state it), which with the
-    device's instruction family is its cell (`DECLARED`)."""
+    device's generation is its cell (`DECLARED`)."""
 
     placed: bool
     whole: bool
@@ -1960,7 +1967,14 @@ class GroupedCase:
 
     @property
     def cell(self) -> tuple[str | None, Kind]:
-        return generation.family(self.call.target.generation), self.kind
+        """Its cell among `DECLARED`: its target's generation, whose receipts alone time it (one instruction
+        family's generations part in speed against their references, `grouped_cells`), and its kind; a
+        product a receipt timed whose matrix holds no cell of its own (its winner its kind's route) its
+        kind's."""
+        name = self.call.target.generation
+        if self.kind.matrix is None or (name, self.kind) in DECLARED:
+            return name, self.kind
+        return name, self.kind._replace(matrix=None, span=None, formed=False)
 
 
 _Need = selection.Requirement[GroupedCase]
@@ -2052,77 +2066,52 @@ PRODUCTS_APART = selection.Kernel[GroupedCase](
 each its own."""
 
 
-DECLARED: dict[tuple[str | None, Kind], tuple[selection.Kernel[GroupedCase], str]] = {
-    **{(receipt.family, Kind(dense=True, made=receipt.made, together=True, matrix=matrix)): (
-        {MOSAIC.name: MOSAIC, APART.name: PRODUCTS_APART}[receipt.winner], receipt.evidence)
-       for receipt in TOGETHER for matrix in receipt.timed.matrices},
-    **{(family, Kind(dense=True, made=made, matrix=matrix, formed=True)): (MOSAIC, M_EM_65)
-       for family in ('mma.sync', 'wgmma') for made in (Made.FORWARD, Made.KERNEL_GRADIENT)
-       for matrix in NORMED_08B},
-    **{('wgmma', Kind(dense=True, made=made, matrix=matrix, formed=True)): (MOSAIC, M_EM_67)
-       for made in (Made.FORWARD, Made.KERNEL_GRADIENT) for matrix in NORMED_4B_8B},
-    ('mma.sync', Kind(dense=True, made=Made.FORWARD)):
-        (XLA, "DENSE1 (A100, a55c8ffb2, one program a multiprocessor): Mosaic 1.923x and Triton 1.947x "
-             "XLA's dot (cuBLAS), geomean of 10 projections at 8192 tokens; M-FS-9 (RTX PRO 6000, "
-             "d7014761a, mma.sync.fed at two 64 x 64 programs a multiprocessor): Mosaic 1.99x, Triton "
-             "1.09x, geomean of 13"),
-    ('mma.sync', Kind(dense=True, made=Made.INPUT_GRADIENT)):
-        (XLA, "DENSE1 (A100, one program a multiprocessor): Mosaic 2.881x, Triton 1.839x XLA's dot; "
-             "M-FS-9 (RTX PRO 6000): Mosaic 3.00x, Triton 1.10x"),
-    ('mma.sync', Kind(dense=True, made=Made.KERNEL_GRADIENT)):
-        (XLA, "DENSE1 (A100, one program a multiprocessor): Mosaic 1.964x, Triton 1.735x XLA's dot; "
-             "M-FS-9 (RTX PRO 6000): Mosaic 1.72x, Triton 1.28x"),
-    ('mma.sync', Kind(dense=False, made=Made.FORWARD)):
-        (CUTLASS, "M-EM-2 (A100-SXM4-40GB at 1095 MHz, base/kernels 59b96a9b4c2, 400 role-swapped pairs, A/A "
-                 "within 0.993-1.008): the template 1.07x CUTLASS's time, geomean of 5 grouped MoE rows "
-                 "(Qwen3-30B-A3B up 1.193, down 1.090; Mixtral up 0.795, down 1.090; GPT-OSS-20B up 1.244)"),
-    ('wgmma', Kind(dense=True, made=Made.FORWARD)):
-        (XLA, "DENSE1 (H100, a55c8ffb2): Mosaic 1.067x and Triton 1.616x XLA's dot (cuBLAS), geomean of "
-             "10 projections at 8192 tokens"),
-    ('wgmma', Kind(dense=True, made=Made.INPUT_GRADIENT)):
-        (XLA, "DENSE1 (H100): Mosaic 1.048x, Triton 1.738x XLA's dot"),
-    ('wgmma', Kind(dense=True, made=Made.KERNEL_GRADIENT)):
-        (XLA, "DENSE1 (H100): Mosaic 1.049x, Triton 1.149x XLA's dot"),
-    ('wgmma', Kind(dense=True, made=Made.FORWARD, matrix=(2560, 9216))): (
-        MOSAIC, f"{M_EM_36}: the template 0.866x XLA's dot"),
-    ('wgmma', Kind(dense=True, made=Made.FORWARD, matrix=(9216, 2560))): (
-        XLA, f"{M_EM_36}: the template 1.01x XLA's dot"),
-    ('wgmma', Kind(dense=True, made=Made.FORWARD, matrix=(2560, 1024))): (
-        MOSAIC, f"{M_EM_36}: the template 0.96x XLA's dot"),
-    ('wgmma', Kind(dense=True, made=Made.FORWARD, matrix=(2560, 64))): (
-        XLA, f"{M_EM_36}: the template 1.294x XLA's dot"),
-    ('wgmma', Kind(dense=True, made=Made.INPUT_GRADIENT, matrix=(2560, 9216))): (
-        MOSAIC, f"{M_EM_36}: the template 0.943x XLA's dot"),
-    ('wgmma', Kind(dense=True, made=Made.INPUT_GRADIENT, matrix=(9216, 2560))): (
-        MOSAIC, f"{M_EM_36}: the template 0.912x XLA's dot"),
-    ('wgmma', Kind(dense=True, made=Made.INPUT_GRADIENT, matrix=(2560, 1024))): (
-        MOSAIC, f"{M_EM_36}: the template 0.949x XLA's dot"),
-    ('wgmma', Kind(dense=True, made=Made.INPUT_GRADIENT, matrix=(2560, 64))): (
-        MOSAIC, f"{M_EM_36}: the template 0.93x XLA's dot"),
-    ('wgmma', Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 9216))): (
-        XLA, f"{M_EM_52}: the template 1.042x XLA's dot (1.559 against 1.496 ms)"),
-    ('wgmma', Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(9216, 2560))): (
-        MOSAIC, f"{M_EM_52}: the template 0.755x XLA's dot (1.493 against 1.977 ms)"),
-    ('wgmma', Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 1024))): (
-        MOSAIC, f"{M_EM_52}: the template 0.784x XLA's dot (0.189 against 0.241 ms)"),
-    ('wgmma', Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 64))): (
-        MOSAIC, f"{M_EM_52}: the template 0.39x XLA's dot (0.053 against 0.136 ms)"),
-    ('tcgen05', Kind(dense=True, made=Made.FORWARD, matrix=(2560, 64))): (
-        XLA, f"{B200_GRID}: the template 1.216x XLA's dot (em35d 1.225x)"),
-    ('tcgen05', Kind(dense=True, made=Made.INPUT_GRADIENT, matrix=(2560, 9216))): (
-        XLA, f"{EM35D}: the template 1.009x XLA's dot"),
-    ('tcgen05', Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 9216))): (
-        XLA, f"{B200_GRID}: the template 1.355x XLA's dot (em35d 1.303x)"),
-    ('tcgen05', Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 1024))): (
-        XLA, f"{B200_GRID}: the template 1.148x XLA's dot (em35d 1.326x)"),
-}
+def _declared() -> dict[tuple[str | None, Kind], tuple[selection.Kernel[GroupedCase], str]]:
+    """`DECLARED`, from the receipts that hold its cells (`grouped_cells`): each scoreboard's kinds
+    (`SCOREBOARDS`), the A10's and L4's (`M_FS_34`), the A100's grouped forward (`M_EM_2`), products in one
+    launch timed apart (`TOGETHER`), and every product a receipt timed (`grouped_cells.timings`, the one
+    record its recognition reads too) where its winner is not its kind's route, none returning to XLA on a
+    kind a scoreboard put on the template."""
+    cells: dict[tuple[str | None, Kind], tuple[selection.Kernel[GroupedCase], str]] = {}
+    replaced = set()
+    for board in SCOREBOARDS:
+        for made in board.times:
+            if board.winner(made) == TEMPLATE:
+                replaced.add((board.generation, made))
+            else:
+                cells[board.generation, Kind(dense=True, made=made)] = (XLA, board.why(made))
+    for name, receipt in M_FS_34.items():
+        for made in (Made.FORWARD, Made.INPUT_GRADIENT, Made.KERNEL_GRADIENT):
+            cells[name, Kind(dense=True, made=made)] = (XLA, receipt)
+    cells['sm80', Kind(dense=False, made=Made.FORWARD)] = (CUTLASS, M_EM_2)
+    for receipt in TOGETHER:
+        for matrix in receipt.timed.matrices:
+            cells[receipt.generation, Kind(dense=True, made=receipt.made, together=True, matrix=matrix,
+                                           span=receipt.timed.span)] = (
+                {MOSAIC.name: MOSAIC, APART.name: PRODUCTS_APART}[receipt.winner], receipt.evidence)
+    routes = {TEMPLATE: MOSAIC, REFERENCE: XLA}
+    for timing in timings():
+        kind = XLA if (timing.generation, Kind(dense=True, made=timing.made)) in cells else MOSAIC
+        route = routes[timing.winner]
+        if route is not kind and not (timing.winner == REFERENCE
+                                      and (timing.generation, timing.made) in replaced):
+            cells[timing.generation, Kind(dense=True, made=timing.made, matrix=timing.matrix,
+                                          formed=timing.formed, span=timing.timed.span)] = (
+                route, timing.evidence)
+    return cells
+
+
+DECLARED = _declared()
 """The grouped GEMM's declared cells (`selection.Op.declared`), where a route measured faster than the
 template's default on a generation, each with its receipt (owner, bible da64ae5; "whatever is the
-best/fastest remains the route until our templates catch up", ops 361caffc): (instruction family, kind of
-call) to (that route's kernel, the receipt). A product of a matrix a receipt timed (`MEASURED`) is a cell of
-its own, which that receipt's winner holds: the template's where it won (on Hopper, over its kind's XLA
-cell), XLA's where it lost (on Blackwell, where the template is the kind's default); one timed whose cell is
-undeclared takes the template. A cell leaves the list once the template measures at least as fast on it.
+best/fastest remains the route until our templates catch up", ops 361caffc; bible §6 2026-11-24: "templates
+should replace ref routes on parity"): (device generation, kind of call) to (that route's kernel, the
+receipt). A kind takes the template once every product its receipt timed is at parity, whole
+(`grouped_cells.Scoreboard`: the template matching or beating the best kernel at every shape it serves,
+kernel-templates.md §1), and a generation no receipt timed takes the template; on a kind XLA keeps, a product
+of a matrix a receipt timed (`MEASURED`) at parity over its rows is the template's, a cell of its own, and
+any other its kind's (`GroupedCase.cell`). The list shrinks as the template climbs: no product returns to
+XLA on a kind the template took.
 A cell's route holds no more of a step's memory than the template's: each product's reverse mode returns
 its rows' cotangent only with its kernel gradient formed (`derivatives.with_gradients_formed`, row 6027),
 whichever route forms it (tests/test_declared_cells_memory.py). Nothing is ranked at runtime. A
@@ -2164,13 +2153,20 @@ def grouped_case(launches, arguments, options, *, product: Product, whole: bool)
     # A left operand a prologue forms (a norm's, fused by the algebra's recognition) is a cell of its own
     # where a receipt timed it formed; elsewhere it is its matrix's cell as any call's (train 977 F1: the
     # 4B's normed projections keep the template FOUR_B's receipts measured).
-    family = generation.family(call.target.generation)
+    name = call.target.generation
 
-    def timed(*, formed: bool) -> bool:
-        return matrix is not None and any(timed.holds(matrix, rows)
-                                          for timed in MEASURED.get((family, made, formed), ()))
+    arithmetic = jnp.dtype(arguments[0].dtype).name
+    stored = jnp.dtype(options['out_dtype']).name
 
-    formed = options['hooks'].prologue is not None and timed(formed=True)
+    def timed(*, formed: bool) -> Timed | None:
+        """The receipt timing this product's matrix over its rows in its arithmetic and output dtype, formed
+        or not, None where none did."""
+        return None if matrix is None else next(
+            (timed for timed in MEASURED.get((name, made, formed), ())
+             if timed.holds(matrix, rows, arithmetic, stored)), None)
+
+    formed_by = timed(formed=True) if options['hooks'].prologue is not None else None
+    formed = formed_by is not None
     # Products side by side or chained are one launch's, a cell of their own, keyed by their joined matrix
     # where a receipt timed it (`TOGETHER`), whatever their first matrix's.
     compound = _compound(call)
@@ -2178,14 +2174,15 @@ def grouped_case(launches, arguments, options, *, product: Product, whole: bool)
     if together is not None:
         # Of the arithmetic the receipt timed: its operands' dtype too (base review b68fc2382 F4: an fp16
         # chain inherited the bf16 win).
-        arithmetic = (family, made, jnp.dtype(arguments[0].dtype).name)
-        timed_together = any(receipt.timed.holds(together, rows) for receipt in TOGETHER
-                             if (receipt.family, receipt.made, receipt.dtype) == arithmetic)
-        matrix_of = together if timed_together else None
+        found = next((receipt.timed for receipt in TOGETHER if receipt.timed.holds(together, rows, arithmetic)
+                      and (receipt.generation, receipt.made) == (name, made)), None)
+        matrix_of = together if found is not None else None
     else:
-        matrix_of = matrix if formed or timed(formed=False) else None
+        found = formed_by if formed else timed(formed=False)
+        matrix_of = matrix if found is not None else None
     kind = Kind(bool(options['dense']), made, fp8=fp8, gathered=gathered, scattered=scattered,
-                matrix=matrix_of, formed=formed, together=together is not None)
+                matrix=matrix_of, formed=formed, together=together is not None,
+                span=None if found is None else found.span)
     cuda = generation.capability(call.target.generation)
     floor = cuda is not None and cuda[0] * 10 + cuda[1] >= generation.BF16_GPU
     placed = generation.tpu(call.target) or floor
