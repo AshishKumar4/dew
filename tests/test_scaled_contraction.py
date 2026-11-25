@@ -348,23 +348,33 @@ def test_a_transposed_letter_no_factor_reads_forms_no_product_over_the_others():
     """The masses' cotangent of the attention mean at the sm90 matrix cell's width (1024 queries and keys,
     256 channels, eight heads in four groups): the divisor's term reads `k` through the masses alone, its
     unit operand along `k` held apart from the cotangent's group it is a factor of (`Form.units`), so no
-    array the lowered program forms is larger than the masses, where held with it the group formed
-    `bhgqdk`, 8 GiB, four held at once (row 12979). Lowered, never compiled or run."""
+    array the lowered program forms is larger than a sum's operands or its terms' results, where held with
+    it the group formed `bhgqdk`, 8 GiB, four held at once (row 12979). Lowered, never compiled or run."""
     from jax.extend.mlir import ir
 
     from dew.nn.kernels.lowered import read_operations
 
     masses = jax.ShapeDtypeStruct((1, 4, 2, 1024, 1024), jnp.float32)
     values = jax.ShapeDtypeStruct((1, 1024, 4, 256), jnp.float32)
-    pulled = jax.jit(jax.grad(lambda m, v: jnp.sum(contract(ATTENTION_MEAN, m, v)), argnums=(0, 1)))
+    grad = jax.grad(lambda m, v: jnp.sum(contract(ATTENTION_MEAN, m, v)), argnums=(0, 1))
 
     def size(operation):
         ranked = [ir.RankedTensorType(result.type) for result in operation.results
                   if isinstance(result.type, ir.RankedTensorType)]
         return max((int(np.prod(kind.shape)) for kind in ranked), default=None)
 
-    largest = max(read_operations(pulled.lower(masses, values), size))
-    assert largest <= masses.size, largest
+    # What a sum forms beside its operands: its terms' results, one a term, stacked to join them.
+    from reference_error import equations
+
+    from dew.nn.kernels.templates.scaled_contraction import scaled_contraction_p
+
+    sums = [equation for equation in equations(jax.make_jaxpr(grad)(masses, values))
+            if equation.primitive is scaled_contraction_p]
+    bound = max(max(*(int(np.prod(atom.aval.shape)) for atom in equation.invars),
+                    len(equation.params["form"].terms) * int(np.prod(equation.outvars[0].aval.shape)))
+                for equation in sums)
+    largest = max(read_operations(jax.jit(grad).lower(masses, values), size))
+    assert largest <= bound, (largest, bound)
 
 
 def test_a_transposes_unit_operand_takes_no_band_from_the_groups_beside_it():
