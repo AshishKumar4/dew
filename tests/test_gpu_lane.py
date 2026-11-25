@@ -401,14 +401,15 @@ def test_a_cell_its_prepares_cap_left_is_named_and_counted_but_reds_no_row(ci):
     assert graded([], before=whole, found=found)["exitCode"] == 0
     for masks in ({ci.prepares.identity(capped)}, {ci.prepares.identity(named)}):
         assert graded([lowered], before=masks)["exitCode"] == 1
-    # Parameter ids sharing a start: main skipping test_flow[x] exempts no cell of test_flow[x] @ y],
-    # fresh or reused.
-    sharing = {"test": "tests/test_gpu_vae.py::test_flow[x] @ y]", "where": "a site", "error": "e"}
+    # Parameter ids sharing a start: main skipping test_flow[x] exempts no cell of test_flow[x] @ y] nor of
+    # test_flow[x] @ y [z], fresh or reused.
     skipped_x = {ci.prepares.identity({**skipped, "test": "tests/test_gpu_vae.py::test_flow[x]"})}
-    assert graded([sharing], before=skipped_x)["exitCode"] == 1
-    reused_sharing = {"name": name, "exitCode": 0, "output": "",
-                      "unprepared": [ci.prepares.identity(sharing)]}
-    assert graded([], before=skipped_x, found=reused_sharing)["exitCode"] == 1
+    for param in ("x] @ y", "x] @ y [z"):
+        sharing = {"test": f"tests/test_gpu_vae.py::test_flow[{param}]", "where": "a site", "error": "e"}
+        assert graded([sharing], before=skipped_x)["exitCode"] == 1
+        reused_sharing = {"name": name, "exitCode": 0, "output": "",
+                          "unprepared": [ci.prepares.identity(sharing)]}
+        assert graded([], before=skipped_x, found=reused_sharing)["exitCode"] == 1
 
 
 @pytest.mark.parametrize("capped", [False, True])

@@ -298,14 +298,13 @@ def identity(record: Mapping) -> str:
 def skipped_whole(record: Mapping, untried: set[str]) -> bool:
     """Whether a cell `record` is of a test main's run skipped whole (`untried`, node ids): its structured
     test, exactly; a reused row's identity alone only where it reads one way, a skipped node id, " @ ", then
-    a where holding no " @ " (`identity`), so a parameter id that holds " @ " and shares a skipped one's
-    start is never taken for it."""
+    a remainder holding no " @ " (its where and any label, `identity`), so a parameter id that holds " @ "
+    and shares a skipped one's start is never taken for it."""
     if "test" in record:
         return record["test"] in untried
     for test in untried:
         if record["identity"].startswith(f"{test} @ "):
-            where = record["identity"][len(test) + 3:]
-            if " @ " not in (where.split(" [", 1)[0]):
+            if " @ " not in record["identity"][len(test) + 3:]:
                 return True
     return False
 
