@@ -796,9 +796,9 @@ def test_weighted_central_moments_derive_and_match_float64_at_high_mean(mode):
 
 @pytest.mark.parametrize("mode", ["walk", "merge"])
 def test_masked_central_moments_handle_empty_tiles_and_empty_rows(mode):
-    """Masked unweighted variance (`moments.chunked_masked_moments`) with wholly-masked tiles (first tile
-    empty, middle tile empty) and an all-masked row stays finite and matches the declared function (check 1),
-    with zero `0 / 0` NaNs."""
+    """Masked unweighted variance (`moments.chunked_moments` with boolean mask) with wholly-masked tiles
+    (first tile empty, middle tile empty) and an all-masked row stays finite and matches the declared
+    function (check 1), with zero `0 / 0` NaNs."""
     from dew.algebra import moments
 
     def draw_masked(seed):
@@ -812,11 +812,11 @@ def test_masked_central_moments_handle_empty_tiles_and_empty_rows(mode):
         return x, mask
 
     assert_as_exact(
-        jax.jit(lambda x, m: moments.chunked_masked_moments(x, m, tile=32, mode=mode)),
+        jax.jit(lambda x, m: moments.chunked_moments(x, m, tile=32, mode=mode)),
         jax.jit(moments.masked_moments),
         draw_masked, f"masked central moments ({mode})", seeds=16)
     x0, m0 = draw_masked(0)
-    mean, var = moments.chunked_masked_moments(x0, m0, tile=32, mode=mode)
+    mean, var = moments.chunked_moments(x0, m0, tile=32, mode=mode)
     assert np.all(np.isfinite(mean)) and np.all(np.isfinite(var))
     assert float(mean[0]) == 0.0 and float(var[0]) == 0.0
 

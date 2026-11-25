@@ -20,7 +20,7 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 import numpy as np
-from egglog import DagCostModel, EGraph, Schedule, String, Vec, get_callable_args, i64, set_, union
+from egglog import DagCostModel, EGraph, Schedule, String, Vec, get_callable_args, i64, set_
 from jax._src import api_util, config as jax_config
 from jax._src.interpreters import partial_eval
 from jax.core import ShapedArray, eval_jaxpr
@@ -462,17 +462,7 @@ def _windows(jaxpr: jcore.Jaxpr) -> list[tuple[jcore.Jaxpr, list[jcore.Var]]]:
     heads = [equation for equation in jaxpr.eqns if heads_window(equation)]
     if not heads:
         return []
-    # Index sibling `rsqrt(v)` and unit reciprocal `1 / y` equations by operand so a division head's window
-    # sees reciprocals the program already computes (backward walk alone never reaches sibling consumers).
-    rsqrts: dict[jcore.Var, list[jcore.JaxprEqn]] = {}
-    reciprocals: dict[jcore.Var, list[jcore.JaxprEqn]] = {}
-    if any(head.primitive is jax.lax.div_p for head in heads):
-        for equation in jaxpr.eqns:
-            if equation.primitive is jax.lax.rsqrt_p and isinstance(equation.invars[0], jcore.Var):
-                rsqrts.setdefault(equation.invars[0], []).append(equation)
-            elif (equation.primitive is jax.lax.div_p and isinstance(equation.invars[1], jcore.Var)
-                  and _is_unit_literal(equation.invars[0])):
-                reciprocals.setdefault(equation.invars[1], []).append(equation)
+    rsqrts, reciprocals = _reuse_siblings(jaxpr, heads)
     order = {id(equation): index for index, equation in enumerate(jaxpr.eqns)}
     clusters: list[dict[int, jcore.JaxprEqn]] = []
     for head in heads:
@@ -531,38 +521,70 @@ def _is_unit_literal(atom) -> bool:
     return value.ndim == 0 and jnp.issubdtype(value.dtype, jnp.inexact) and bool(value == 1)
 
 
+def _reuse_siblings(
+    jaxpr: jcore.Jaxpr, heads: Sequence[jcore.JaxprEqn],
+) -> tuple[dict[jcore.Var, list[jcore.JaxprEqn]], dict[jcore.Var, list[jcore.JaxprEqn]]]:
+    """Index sibling `rsqrt(v)` and `1 / y` equations in `jaxpr` when any window head is a division."""
+    rsqrts: dict[jcore.Var, list[jcore.JaxprEqn]] = {}
+    reciprocals: dict[jcore.Var, list[jcore.JaxprEqn]] = {}
+    if any(head.primitive is jax.lax.div_p for head in heads):
+        for equation in jaxpr.eqns:
+            if equation.primitive is jax.lax.rsqrt_p and isinstance(equation.invars[0], jcore.Var):
+                rsqrts.setdefault(equation.invars[0], []).append(equation)
+            elif (equation.primitive is jax.lax.div_p and isinstance(equation.invars[1], jcore.Var)
+                  and _is_unit_literal(equation.invars[0])):
+                reciprocals.setdefault(equation.invars[1], []).append(equation)
+    return rsqrts, reciprocals
+
+
+_REUSE_MAKERS = (jax.lax.max_p, jax.lax.add_p, jax.lax.reduce_sum_p)
+
+
 def _pull_reuse_siblings(head: jcore.JaxprEqn, maker: Callable,
                          rsqrts: Mapping[jcore.Var, Sequence[jcore.JaxprEqn]],
                          reciprocals: Mapping[jcore.Var, Sequence[jcore.JaxprEqn]],
                          window: dict[int, jcore.JaxprEqn]) -> None:
     """Pull sibling `rsqrt(v)` and `1 / y` equations sharing a division head's radicand or divisor (directly
-    or through a `broadcast_in_dim`) into `window`, up to `CLUSTER`."""
+    or through chained `broadcast_in_dim`s), along with the connecting chain equations beyond `WINDOW`, into
+    `window` up to `CLUSTER`."""
     divisor = head.invars[1]
     if not isinstance(divisor, jcore.Var):
         return
-    divisors: list[jcore.Var] = [divisor]
-    radicands: list[jcore.Var] = []
+    chain: list[jcore.JaxprEqn] = []
+    div_chain: list[tuple[jcore.Var, list[jcore.JaxprEqn]]] = [(divisor, [])]
+    rad_chain: list[tuple[jcore.Var, list[jcore.JaxprEqn]]] = []
     eq_d = maker(divisor)
     while (eq_d is not None and eq_d.primitive is jax.lax.broadcast_in_dim_p
            and isinstance(eq_d.invars[0], jcore.Var)):
-        divisors.append(eq_d.invars[0])
+        chain.append(eq_d)
+        div_chain.append((eq_d.invars[0], list(chain)))
         eq_d = maker(eq_d.invars[0])
     if eq_d is not None and eq_d.primitive is jax.lax.sqrt_p and isinstance(eq_d.invars[0], jcore.Var):
+        sqrt_chain = [*chain, eq_d]
         rad = eq_d.invars[0]
-        radicands.append(rad)
+        rad_chain.append((rad, list(sqrt_chain)))
         eq_r = maker(rad)
         while (eq_r is not None and eq_r.primitive is jax.lax.broadcast_in_dim_p
                and isinstance(eq_r.invars[0], jcore.Var)):
-            radicands.append(eq_r.invars[0])
+            sqrt_chain.append(eq_r)
+            rad_chain.append((eq_r.invars[0], list(sqrt_chain)))
             eq_r = maker(eq_r.invars[0])
-    for rad in radicands:
-        for sibling in rsqrts.get(rad, ()):
-            if id(sibling) not in window and len(window) < CLUSTER:
-                window[id(sibling)] = sibling
-    for div_var in divisors:
-        for sibling in reciprocals.get(div_var, ()):
-            if id(sibling) not in window and len(window) < CLUSTER:
-                window[id(sibling)] = sibling
+
+    def _add(eqs: Iterable[jcore.JaxprEqn]) -> None:
+        for eq_item in eqs:
+            if id(eq_item) not in window and len(window) < CLUSTER:
+                window[id(eq_item)] = eq_item
+
+    for rad, needed in rad_chain:
+        siblings = rsqrts.get(rad, ())
+        if siblings:
+            _add((*needed, *siblings))
+    for div_var, needed in div_chain:
+        siblings = reciprocals.get(div_var, ())
+        if siblings:
+            div_maker = maker(div_var)
+            extra = (div_maker,) if div_maker is not None and div_maker.primitive in _REUSE_MAKERS else ()
+            _add((*needed, *extra, *siblings))
 
 
 def _region(closed: jcore.Jaxpr, *, accurate: bool, saturation: Saturation,
@@ -589,8 +611,6 @@ def _region(closed: jcore.Jaxpr, *, accurate: bool, saturation: Saturation,
     priced = cost.model(region, cost.fused(cost.target()))
     graph, bundle, roots = graphed(region)
     graph.push()
-    if any(sets.name == "reuse" for sets in firing):
-        _compose_broadcasts(graph, region)
     saturated = saturate(graph, region, firing, saturation)
     nodes = node_count(graph)
     forms, after = extracted(graph, bundle, priced)
@@ -606,39 +626,6 @@ def _region(closed: jcore.Jaxpr, *, accurate: bool, saturation: Saturation,
     report = AlgebraReport(region.equations, tuple(fired), fired, saturated.limits, saturated.iterations,
                            nodes, saturated.limited, before.value, after.value, time.perf_counter() - began)
     return Rewrite(region, picked, report)
-
-
-def _compose_broadcasts(graph: EGraph, region: terms.Region) -> None:
-    """Union any chain of `broadcast_in_dim` terms in `region` with its single composed `broadcast_in_dim`,
-    so `reuse` matches `keepdims=True` and `[:, None]` broadcasts with its single-broadcast rules."""
-    actions: list = []
-    for term, extent in list(region.shapes):
-        args = get_callable_args(term, terms.Term.shaped)
-        if args is None or terms.text(args[1]) != "broadcast_in_dim":
-            continue
-        outer_idx = terms.integer(args[2])
-        outer_prim, outer_params = region.params[outer_idx]
-        if outer_prim is not jax.lax.broadcast_in_dim_p or outer_params.get("sharding") is not None:
-            continue
-        dims = tuple(int(d) for d in outer_params["broadcast_dimensions"])
-        base = args[0]
-        steps = 0
-        while (inner := get_callable_args(base, terms.Term.shaped)) is not None and (
-                terms.text(inner[1]) == "broadcast_in_dim"):
-            inner_prim, inner_params = region.params[terms.integer(inner[2])]
-            if inner_prim is not jax.lax.broadcast_in_dim_p or inner_params.get("sharding") is not None:
-                break
-            dims = tuple(dims[int(d)] for d in inner_params["broadcast_dimensions"])
-            base = inner[0]
-            steps += 1
-        if steps:
-            region.params.append((jax.lax.broadcast_in_dim_p, {
-                "shape": tuple(outer_params["shape"]), "broadcast_dimensions": dims, "sharding": None}))
-            composed = base.shaped("broadcast_in_dim", i64(len(region.params) - 1))
-            actions.append(union(term).with_(composed))
-            actions.append(set_(rules.shape(composed)).to(Vec[i64](*(i64(size) for size in extent))))
-    if actions:
-        graph.register(*actions)
 
 
 def graphed(region: terms.Region) -> tuple[EGraph, terms.Term, list[terms.Term]]:

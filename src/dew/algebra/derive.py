@@ -82,7 +82,7 @@ class Reduction:
     function: Callable
     operands: Mapping[str, Axes]
     walked: str
-    exponent: Literal[2, "e"]
+    exponent: Literal[2, "e"] = "e"
     ranges: Mapping[str, float] = dataclasses.field(default_factory=dict)
     exact: bool = False
     """Whether its forms are extracted exactly (`extract.cheapest`): a declaration whose greedy extraction the
@@ -391,7 +391,8 @@ def masked_mean_lifted(mu: Term, total: Term, count: Term, value: Term, mask: Te
 
 
 @function
-def centered(diff: Term, value: Term, total: Term, count: Term, weight: Term, axis: i64, sign: i64) -> Unit: ...
+def centered(diff: Term, value: Term, total: Term, count: Term, weight: Term, axis: i64,
+             sign: i64) -> Unit: ...
 """`diff` is `sign * (value - mean)` along `axis` under `weight`."""
 
 
@@ -437,16 +438,13 @@ def masked_central_moment(term: Term, sx: Term, sy: Term, count: Term, x: Term, 
 """`term` is the walked masked central second moment `sum(where(mask, (x - mu_x) * (y - mu_y), z))`."""
 
 
-def _moment_walking() -> list:
-    """The facts' rules recognizing weighted and masked central second moments (variance and covariance)
-    along the walked axis, for Chan-Golub-LeVeque decoupling (`_moment_decoupled`)."""
-    x, y, z, w, mask, ind, t, n, s, sx, sy, d, c, mu, dx, dy, pair, m = vars_(
-        "x y z w mask ind t n s sx sy d c mu dx dy pair m", Term)
+def _moment_counts() -> list:
+    """Rules recognizing indicators, counts, first sums, zero-safe denominators, and keepdims lifts."""
+    x, z, w, mask, ind, t, n, s, d, c = vars_("x z w mask ind t n s d c", Term)
     layout = var("layout", String)
-    p, q, r, a, sign = vars_("p q r a sign", i64)
+    p, q, a = vars_("p q a", i64)
     axes = var("axes", Vec[i64])
-    shape = rules.shape
-    found = [
+    return [
         # Ones and booleans through layouts and casts; 0/1 mask indicators.
         rule(eq(t).to(x.shaped(layout, p)), unit_array(x)).then(unit_array(t)),
         rule(eq(t).to(x.convert(p)), unit_array(x)).then(unit_array(t)),
@@ -490,7 +488,16 @@ def _moment_walking() -> list:
             first_lifted(t, s, x, w, a)),
         rule(eq(t).to(s.shaped(layout, p)), masked_first_sum(s, x, mask, a), inserts_axis(p, a)).then(
             masked_first_lifted(t, s, x, mask, a)),
-        # Weighted and masked means, plus axis-aligned broadcasts back to `x`'s shape.
+    ]
+
+
+def _moment_means() -> list:
+    """Rules recognizing weighted and masked means, zero-guards, and axis-aligned mean broadcasts."""
+    x, z, w, mask, t, n, s, d, c, mu = vars_("x z w mask t n s d c mu", Term)
+    layout = var("layout", String)
+    p, a = vars_("p a", i64)
+    shape = rules.shape
+    found = [
         rule(eq(mu).to(s.binary(String("div"), d, p)), first_sum(s, x, w, a), counts(n, w, a),
              safe_count(d, n), eq(shape(s)).to(shape(n))).then(mean_of(mu, s, n, x, w, a)),
         rule(eq(mu).to(s.binary(String("div"), d, p)), masked_first_sum(s, x, mask, a),
@@ -510,7 +517,29 @@ def _moment_walking() -> list:
              identity_broadcast(p), eq(shape(t)).to(shape(x))).then(mean_lifted(t, s, n, x, w, a)),
         rule(eq(t).to(mu.shaped(String("broadcast_in_dim"), p)), masked_mean_lifted(mu, s, n, x, mask, a),
              identity_broadcast(p), eq(shape(t)).to(shape(x))).then(masked_mean_lifted(t, s, n, x, mask, a)),
-        # Centered differences (both `x - mu` and `mu - x`).
+    ]
+    guards = (
+        n.compare(String("gt"), z, p).select(c, mu),
+        z.compare(String("lt"), n, p).select(c, mu),
+        n.compare(String("ne"), z, p).select(c, mu),
+        n.compare(String("eq"), z, p).select(mu, c),
+        z.compare(String("eq"), n, p).select(mu, c),
+    )
+    for mean_fact, ref in ((mean_of, w), (masked_mean_of, mask)):
+        for guard in guards:
+            found.append(rule(eq(t).to(guard), mean_fact(mu, s, n, x, ref, a), zero(z), zero(c)).then(
+                mean_fact(t, s, n, x, ref, a)))
+    return found
+
+
+def _moment_centered() -> list:
+    """Rules recognizing centered differences, squares/products, weighted terms, and second central sums."""
+    x, y, z, w, mask, t, n, s, sx, sy, mu, dx, dy, pair, m = vars_(
+        "x y z w mask t n s sx sy mu dx dy pair m", Term)
+    p, q, a, sign = vars_("p q a sign", i64)
+    axes = var("axes", Vec[i64])
+    shape = rules.shape
+    found = [
         rule(eq(dx).to(x.binary(String("sub"), mu, p)), mean_lifted(mu, s, n, x, w, a),
              eq(shape(x)).to(shape(mu))).then(centered(dx, x, s, n, w, a, i64(1))),
         rule(eq(dx).to(mu.binary(String("sub"), x, p)), mean_lifted(mu, s, n, x, w, a),
@@ -519,7 +548,6 @@ def _moment_walking() -> list:
              eq(shape(x)).to(shape(mu))).then(masked_centered(dx, x, s, n, mask, a, i64(1))),
         rule(eq(dx).to(mu.binary(String("sub"), x, p)), masked_mean_lifted(mu, s, n, x, mask, a),
              eq(shape(x)).to(shape(mu))).then(masked_centered(dx, x, s, n, mask, a, i64(-1))),
-        # Centered squares (`square(dx)` and `dx ** 2`).
         rule(eq(pair).to(dx.unary(String("square"), p)), centered(dx, x, sx, n, w, a, sign)).then(
             centered_pair(pair, sx, sx, n, x, x, w, a, i64(1))),
         rule(eq(pair).to(dx.unary(String("integer_pow"), p)), is_square(p),
@@ -530,16 +558,6 @@ def _moment_walking() -> list:
              masked_centered(dx, x, sx, n, mask, a, sign)).then(
             masked_centered_pair(pair, sx, sx, n, x, x, mask, a, i64(1))),
     ]
-    # Guarded zero-means (`where(n > 0, mu, 0)` and `where(n == 0, 0, mu)`).
-    for mean_fact, ref in ((mean_of, w), (masked_mean_of, mask)):
-        for guard in (lambda: n.compare(String("gt"), z, p).select(c, mu),
-                      lambda: z.compare(String("lt"), n, p).select(c, mu),
-                      lambda: n.compare(String("ne"), z, p).select(c, mu),
-                      lambda: n.compare(String("eq"), z, p).select(mu, c),
-                      lambda: z.compare(String("eq"), n, p).select(mu, c)):
-            found.append(rule(eq(t).to(guard()), mean_fact(mu, s, n, x, ref, a), zero(z), zero(c)).then(
-                mean_fact(t, s, n, x, ref, a)))
-    # Centered products `dx * dy` and every association of `w * dx * dy`.
     for s1 in (1, -1):
         for s2 in (1, -1):
             prod_sign = i64(s1 * s2)
@@ -582,6 +600,12 @@ def _moment_walking() -> list:
             summed(m), masked_central_moment(m, sx, sy, n, x, y, mask, z, a, sign)),
     ]
     return found
+
+
+def _moment_walking() -> list:
+    """The facts' rules recognizing weighted and masked central second moments (variance and covariance)
+    along the walked axis, for Chan-Golub-LeVeque decoupling (`_moment_decoupled`)."""
+    return [*_moment_counts(), *_moment_means(), *_moment_centered()]
 
 
 def _moment_decoupled() -> list:
@@ -1238,16 +1262,7 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
     graph.run(PLAIN.saturate())
     found = [term for term, _ in region.shapes if _holds(graph, summed(term)) or _holds(graph, peaked(term))]
     reductions = tuple({terms.key(term): term for term in found}.values())
-    for index, reduction in enumerate(reductions):
-        graph.register(set_(slot(reduction)).to(i64(index)))
-        region.params.append((jax.lax.convert_element_type_p, {
-            "new_dtype": region.dtypes[terms.key(reduction)], "weak_type": False, "sharding": None}))
-        graph.register(set_(retype(i64(index))).to(i64(len(region.params) - 1)))
-        for side in (0, 1):
-            graph.register(set_(rules.shape(Term.state(i64(index), i64(side)))).to(
-                Vec[i64](*(i64(size) for size in region.shape(reduction)))))
-    _lift(graph, region, reductions)
-    _moment_layouts(graph, region, reductions)
+    _register_reduction_slots(graph, region, reductions)
     outputs = list(region.outputs)
     along = [term is not None and _walked(graph, term) for term in outputs]
     for term, is_along in zip(outputs, along, strict=True):
@@ -1331,12 +1346,22 @@ def _decoupled_through(graph: EGraph, region: terms.Region, facts: Schedule, dec
     graph.run(facts)
 
 
-def _register(graph: EGraph, region: terms.Region, closed, names, walked_axes) -> None:
-    """The facts the rules read that each parameter's own values state (the engine's, `program.stated`, and
-    the derivation's own), and each input's walked axis."""
-    program.stated(graph, region)
-    _least(graph, region)
-    _dtype_constants(graph, region)
+def _register_reduction_slots(graph: EGraph, region: terms.Region, reductions: tuple[Term, ...]) -> None:
+    """Assign state slots, retypes, state shapes, and broadcast layouts for each walked `reduction`."""
+    for index, reduction in enumerate(reductions):
+        graph.register(set_(slot(reduction)).to(i64(index)))
+        region.params.append((jax.lax.convert_element_type_p, {
+            "new_dtype": region.dtypes[terms.key(reduction)], "weak_type": False, "sharding": None}))
+        graph.register(set_(retype(i64(index))).to(i64(len(region.params) - 1)))
+        for side in (0, 1):
+            graph.register(set_(rules.shape(Term.state(i64(index), i64(side)))).to(
+                Vec[i64](*(i64(size) for size in region.shape(reduction)))))
+    _lift(graph, region, reductions)
+    _moment_layouts(graph, region, reductions)
+
+
+def _register_param_moves(graph: EGraph, region: terms.Region) -> None:
+    """Register how each parameter in `region.params` moves, inserts, reduces, or contracts axes."""
     for index, (primitive, params) in enumerate(list(region.params)):
         declared = terms.OPERATIONS.get(primitive)
         kind = None if declared is None else declared.kind
@@ -1389,6 +1414,15 @@ def _register(graph: EGraph, region: terms.Region, closed, names, walked_axes) -
                 graph.register(contracts_left(i64(index), i64(int(axis))))
             for axis in right_contracted:
                 graph.register(contracts_right(i64(index), i64(int(axis))))
+
+
+def _register(graph: EGraph, region: terms.Region, closed, names, walked_axes) -> None:
+    """The facts the rules read that each parameter's own values state (the engine's, `program.stated`, and
+    the derivation's own), and each input's walked axis."""
+    program.stated(graph, region)
+    _least(graph, region)
+    _dtype_constants(graph, region)
+    _register_param_moves(graph, region)
     # A scalar anchor's axis (`scales`' -1) is none, through every equation.
     for index in range(len(region.params)):
         none = i64(-1)
@@ -1437,7 +1471,7 @@ def _least(graph: EGraph, region: terms.Region) -> None:
 
 
 def _dtype_constants(graph: EGraph, region: terms.Region) -> None:
-    """Each floating value's dtype's 0 and 1 literals (`zero_of`, `one_of`) and each boolean value (`boolean`),
+    """Each floating value's dtype's 0 and 1 literals (`zero_of`, `one_of`) and each boolean (`boolean`),
     registered for Chan-Golub-LeVeque zero-count guards and masked indicators."""
     zeros: dict[np.dtype, int] = {}
     ones: dict[np.dtype, int] = {}

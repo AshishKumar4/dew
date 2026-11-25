@@ -689,18 +689,21 @@ def test_singleton_ratios_emit_no_window_loop_and_hold_degenerate_values():
                                axis=0, reduced=True, units=windows.Units())
     a = np.asarray([[0.0, -0.0, SUBNORMAL, LEAST, 1.5, -2.0 ** 100, LARGEST]], np.float32)
     b = np.asarray([[2.0]], np.float32)
-    for lowered, args in (
-        (lambda x, y: ratios._ratio_value(x, y, form=means._FINISHED), (a, b[:, 0])),
-        (lambda x, y: ratios._ratio_value(x, y, form=means._RESUMED), (a, b[:, 0])),
-        (lambda x, y: ratios._ratio_value(x, y, form=signed_form), (a, b)),
-        (lambda o, w, m: means._merged_state_value(o, w, m, units=windows.Units(), axis=0),
-         (a, b[:, 0], np.asarray([-3.0], np.float32))),
+    for sum_fn, args in (
+        (lambda x, y: ratios._ratio_sums((x, y), means._FINISHED), (a, b[:, 0])),
+        (lambda x, y: ratios._ratio_sums((x, y), means._RESUMED), (a, b[:, 0])),
+        (lambda x, y: ratios._ratio_sums((x, y), signed_form), (a, b)),
     ):
-        traced = jax.make_jaxpr(lowered)(*args)
-        primitives = {eq.primitive for eq in traced.jaxpr.eqns}
+        primitives = {eq.primitive for eq in jax.make_jaxpr(sum_fn)(*args).jaxpr.eqns}
         assert jax.lax.while_p not in primitives
         assert jax.lax.optimization_barrier_p not in primitives
-    expected_signed = np.asarray([_unsigned_land(-float(v) / 2.0) for v in a[0].astype(np.float64)], np.float32)
+    merged_prims = {
+        eq.primitive for eq in jax.make_jaxpr(
+            lambda o, w, m: means._merged_state_value(o, w, m, units=windows.Units(), axis=0))(
+                a, b[:, 0], np.asarray([-3.0], np.float32)).jaxpr.eqns}
+    assert jax.lax.while_p not in merged_prims
+    expected_signed = np.asarray(
+        [_unsigned_land(-float(v) / 2.0) for v in a[0].astype(np.float64)], np.float32)
     got_signed = np.asarray(jax.jit(lambda x, y: ratios.ratio([x, y], signed_form))(a, b))
     assert_bits(got_signed, expected_signed, "signed singleton ratio")
     expected_id = np.asarray([_unsigned_land(float(v)) for v in a[0].astype(np.float64)], np.float32)

@@ -482,6 +482,7 @@ def _streamed(load, chunks: int, sums: list[_Sum], units: Units):
     return [tuple(jnp.squeeze(part, each.axis) if each.axis is not None else part for part in joined)
             for each, joined in zip(sums, made, strict=True)]
 
+
 def _quotients_summed(summed, axes: tuple[int, ...]):
     """A ratio's quotients before they land (`_ratio_sum`'s, `(high, low, exponent)`, each under 2 at its
     power of two) summed over `axes` (`Ratio.across`), one along them, landing none: summed a window at a

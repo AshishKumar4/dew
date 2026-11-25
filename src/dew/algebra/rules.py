@@ -9,9 +9,11 @@ value it makes is constant along `axis`, so a sum along that axis may take it ou
 from __future__ import annotations
 
 import collections
+import contextlib
+import contextvars
 import dataclasses
 import importlib
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Literal
 
 import jax
@@ -585,23 +587,19 @@ def _reuse() -> tuple[RuleFamily, ...]:
     # A divisor's reciprocal is a normal finite float (above least normal and under reach).
     normal = (i64(0) - floor <= reached, lowest <= i64(0) - bound - 1)
     reciprocals = []
-    makers = (
-        (u.binary("max", w, made), (eq(shape(u)).to(shape(w)),)),
-        (u.binary("add", w, made), (eq(shape(u)).to(shape(w)),)),
-        (u.reduce("sum", axes, made), ()),
-    )
+    makers = (u.binary("max", w, made), u.binary("add", w, made), u.reduce("sum", axes, made))
     r_laid = r.shaped("broadcast_in_dim", laid)
-    for y, maker_cond in makers:
+    for y in makers:
         for dividend_guard in ((eq(held).to(log2_bound(a)), held - floor <= reached), (i64(0) <= floor,)):
             reciprocals += [
                 rule(
-                    eq(t).to(a.binary("div", y, divided)), eq(r).to(one.binary("div", y, inverted)), unit(one),
-                    plain(inverted), *maker_cond, eq(shape(r)).to(shape(t)), eq(floor).to(log2_floor(y)),
-                    eq(bound).to(log2_bound(y)), *common, *normal, *dividend_guard).then(
-                    union(t).with_(a.binary("mul", r, multiplied))),
+                    eq(t).to(a.binary("div", y, divided)), eq(r).to(one.binary("div", y, inverted)),
+                    unit(one), plain(inverted), eq(shape(r)).to(shape(t)), eq(floor).to(log2_floor(y)),
+                    eq(bound).to(log2_bound(y)), *common, *normal,
+                    *dividend_guard).then(union(t).with_(a.binary("mul", r, multiplied))),
                 rule(
                     eq(t).to(a.binary("div", y.shaped("broadcast_in_dim", laid), divided)),
-                    eq(r).to(one.binary("div", y, inverted)), unit(one), plain(inverted), *maker_cond,
+                    eq(r).to(one.binary("div", y, inverted)), unit(one), plain(inverted),
                     eq(shape(r)).to(shape(y)), eq(extent).to(shape(t)), eq(floor).to(log2_floor(y)),
                     eq(bound).to(log2_bound(y)), *common, *normal, *dividend_guard).then(
                     union(t).with_(a.binary("mul", r_laid, multiplied)), set_(shape(r_laid)).to(extent)),
@@ -856,7 +854,12 @@ _HEADS: dict[str, set[tuple[str, ...]]] = {}
 operations that make its operands, where the left side states them. The program pass opens a window at an
 equation one of them matches (`heads`, `program.WINDOW` deep), so a rule is reachable from the moment it is
 registered; a set that only aids the others (`Rules.aid`: commutativity leaves every price as it was) or runs
-at dev time alone (`Rules.dev`) opens none."""
+at dev time alone (`Rules.dev`) opens none unless enabled via `enabling_dev`."""
+_DEV_HEADS: dict[str, dict[str, set[tuple[str, ...]]]] = {}
+"""Window heads for each dev-time rule set (`Rules.dev`), active only while named in `_DEV_ENABLED`."""
+_DEV_ENABLED: contextvars.ContextVar[frozenset[str]] = contextvars.ContextVar(
+    "dew_algebra_dev_enabled", default=frozenset())
+"""Dev-time rule sets (`Rules.dev`) temporarily enabled in the current context (`enabling_dev`)."""
 
 
 def _operation(pattern) -> declarations.CallDecl | None:
@@ -925,6 +928,14 @@ def register(rules: Rules) -> None:
     RULES[rules.name] = rules
     for root, made in (head for _, head in found if head is not None):
         _HEADS.setdefault(root, set()).add(made)
+    if rules.dev:
+        dev_heads: dict[str, set[tuple[str, ...]]] = {}
+        for family in rules.families:
+            for written in family.rules:
+                head = _head(written)
+                if head is not None:
+                    dev_heads.setdefault(head[0], set()).add(head[1])
+        _DEV_HEADS[rules.name] = dev_heads
 
 
 _MEASURED = ("measured M-DC-1 (four diffusion training steps, GH200) and M-DC-3 (six GPU flows' training and "
@@ -965,7 +976,13 @@ def heads(primitive: str, operands: Sequence[str | None]) -> bool:
     each of the equation's operands answering one of the left side's at most, in any order (commutativity
     may have swapped them)."""
     made = collections.Counter(operand for operand in operands if operand is not None)
-    return any(not collections.Counter(needed) - made for needed in _HEADS.get(primitive, ()))
+    if any(not collections.Counter(needed) - made for needed in _HEADS.get(primitive, ())):
+        return True
+    enabled = _DEV_ENABLED.get()
+    if not enabled:
+        return False
+    return any(not collections.Counter(needed) - made
+               for name in enabled for needed in _DEV_HEADS.get(name, {}).get(primitive, ()))
 
 
 def reorderable(region: terms.Region) -> bool:
@@ -993,13 +1010,28 @@ def reorderable(region: terms.Region) -> bool:
                for found in extrema)
 
 
+@contextlib.contextmanager
+def enabling_dev(*names: str) -> Iterator[None]:
+    """Enable registered dev-time rule sets `names` (both their rules and their window heads) in the current
+    context without mutating global registries."""
+    unknown = [name for name in names if name not in RULES or not RULES[name].dev]
+    if unknown:
+        raise ValueError(f"not registered dev-time rule sets: {unknown}")
+    token = _DEV_ENABLED.set(_DEV_ENABLED.get() | frozenset(names))
+    try:
+        yield
+    finally:
+        _DEV_ENABLED.reset(token)
+
+
 def admitted(accurate: bool, *, dev: bool = False) -> tuple[Rules, ...]:
     """The rule sets a program's numerics admit: every set under default numerics, the `exact` ones alone
-    under the accurate numerics (`precision="accurate"`); the dev-time sets (`Rules.dev`) only where `dev`,
-    whose choice measures each candidate's error instead; none the pass leaves out (`dew._cache.Passes`'
-    `without`, a receipt's arm)."""
+    under the accurate numerics (`precision="accurate"`); the dev-time sets (`Rules.dev`) only where `dev`
+    or named in `enabling_dev`; none the pass leaves out (`dew._cache.Passes`' `without`, a receipt's arm)."""
+    enabled = _DEV_ENABLED.get()
     return tuple(rules for rules in RULES.values()
-                 if (dev or not rules.dev) and (dev or not accurate or rules.rounding == "exact")
+                 if (dev or not rules.dev or rules.name in enabled)
+                 and (dev or not accurate or rules.rounding == "exact")
                  and admits(rules))
 
 

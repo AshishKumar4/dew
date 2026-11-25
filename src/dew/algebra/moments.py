@@ -1,6 +1,6 @@
 """Central-moment declarations and algebra-level tiled consumer (`dew.algebra.derive`, docs/design/algebra.md
-§1.4, §6.9): weighted and masked mean/variance and bilinear covariance walks derived through Chan-Golub-LeVeque
-parallel moment merges (`derive._moment_decoupled`), ready for sequential stepping or parallel tree merges of
+§1.4, §6.9): weighted and masked mean/variance and bilinear covariance walks derived through
+Chan-Golub-LeVeque merge rules, producing finite variance and covariance across arbitrarily shifted data and
 disjoint partials."""
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ def masked_moments(x: jax.Array, mask: jax.Array) -> tuple[jax.Array, jax.Array]
 
 
 def weighted_covariance(x: jax.Array, y: jax.Array, w: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Weighted `(mean_x, mean_y, covariance)` of `(x, y)` along their last axis under nonnegative weights `w`."""
+    """Weighted `(mean_x, mean_y, covariance)` of `(x, y)` along their last axis under nonnegative `w`."""
     n = jnp.sum(w, axis=-1)
     safe_n = jnp.where(n > 0, n, jnp.ones_like(n))
     mean_x = jnp.sum(w * x, axis=-1) / safe_n
@@ -55,7 +55,7 @@ def weighted_covariance(x: jax.Array, y: jax.Array, w: jax.Array) -> tuple[jax.A
 @functools.cache
 def declaration(kind: Literal["weighted", "masked", "covariance"], rank: int = 2) -> derive.Reduction:
     """`derive.Reduction` for `kind` over `rank`-D arrays walked along their last axis."""
-    axes = tuple(f"d{i}" for i in range(rank - 1)) + ("walked",)
+    axes = (*(f"d{i}" for i in range(rank - 1)), "walked")
     if kind == "weighted":
         return derive.Reduction(weighted_moments, {"x": axes, "w": axes}, walked="walked")
     if kind == "masked":
@@ -105,28 +105,26 @@ def _walked(forms: Derived, tiles: list[dict[str, jax.Array]]):
     return forms.finish(state, tiles[0], shapes=shapes)
 
 
+def _run_chunked(kind: Literal["weighted", "masked", "covariance"], operands: dict[str, jax.Array], *,
+                 tile: int, mode: Literal["walk", "merge"] = "merge"):
+    rank = next(iter(operands.values())).ndim
+    forms = derived(kind, rank)
+    chunks = _tiles(operands, tile)
+    return _tree_merged(forms, chunks) if mode == "merge" else _walked(forms, chunks)
+
+
 def chunked_moments(x: jax.Array, w: jax.Array, *, tile: int,
                     mode: Literal["walk", "merge"] = "merge") -> tuple[jax.Array, jax.Array]:
-    """Compute weighted `(mean, variance)` of `x` along its last axis in `tile`-wide chunks using derived
-    Chan-Golub-LeVeque forms, either sequentially (`mode='walk'`) or via pairwise parallel merge
-    (`mode='merge'`)."""
-    forms = derived("weighted", x.ndim)
-    chunks = _tiles({"x": x, "w": w}, tile)
-    return _tree_merged(forms, chunks) if mode == "merge" else _walked(forms, chunks)
-
-
-def chunked_masked_moments(x: jax.Array, mask: jax.Array, *, tile: int,
-                           mode: Literal["walk", "merge"] = "merge") -> tuple[jax.Array, jax.Array]:
-    """Compute masked unweighted `(mean, variance)` of `x` along its last axis in `tile`-wide chunks."""
-    forms = derived("masked", x.ndim)
-    chunks = _tiles({"x": x, "mask": mask}, tile)
-    return _tree_merged(forms, chunks) if mode == "merge" else _walked(forms, chunks)
+    """Compute weighted or boolean-masked `(mean, variance)` of `x` along its last axis in `tile`-wide chunks
+    using derived Chan-Golub-LeVeque forms (`mode="walk"` for sequential tiles, `mode="merge"` for pairwise
+    tree reduction of independent partial states)."""
+    if w.dtype == jnp.bool_:
+        return _run_chunked("masked", {"x": x, "mask": w}, tile=tile, mode=mode)
+    return _run_chunked("weighted", {"x": x, "w": w}, tile=tile, mode=mode)
 
 
 def chunked_covariance(x: jax.Array, y: jax.Array, w: jax.Array, *, tile: int,
                        mode: Literal["walk", "merge"] = "merge") -> tuple[jax.Array, jax.Array, jax.Array]:
     """Compute weighted `(mean_x, mean_y, covariance)` of `(x, y)` along their last axis in `tile`-wide
-    chunks."""
-    forms = derived("covariance", x.ndim)
-    chunks = _tiles({"x": x, "y": y, "w": w}, tile)
-    return _tree_merged(forms, chunks) if mode == "merge" else _walked(forms, chunks)
+    chunks using derived Chan-Golub-LeVeque forms."""
+    return _run_chunked("covariance", {"x": x, "y": y, "w": w}, tile=tile, mode=mode)
