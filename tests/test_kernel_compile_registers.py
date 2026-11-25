@@ -253,6 +253,7 @@ def test_report_binaries_distinguishes_sm100_tmem_mosaic_cubins_from_non_tmem_tr
 
     import numpy as np
     from jax.experimental import pallas as pl
+    from jax.experimental.pallas import triton as pltriton
     from test_mosaic_toolkit import _persisted_operands, _persisted_products
 
     from dew.nn.kernels import generation
@@ -274,8 +275,8 @@ def test_report_binaries_distinguishes_sm100_tmem_mosaic_cubins_from_non_tmem_tr
 
     row = jax.ShapeDtypeStruct((1024,), jnp.float32)
     with generation.assumed("sm100"):
-        exe_t = kc.lowered_for(pl.pallas_call(doubled, out_shape=row, backend="triton"), (row,),
-                               "sm100").compile()
+        doubling = pl.pallas_call(doubled, out_shape=row, compiler_params=pltriton.CompilerParams())
+        exe_t = kc.lowered_for(doubling, (row,), "sm100").compile()
     triton_decoded = [b for b in assembled.binaries(exe_t, decoded=True) if b.kind == "triton"]
     triton_raw = [b for b in assembled.binaries(exe_t, decoded=False) if b.kind == "triton"]
     assert triton_decoded and all(b.uses_tmem is False for b in triton_decoded), triton_decoded

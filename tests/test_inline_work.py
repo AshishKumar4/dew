@@ -171,7 +171,8 @@ def test_a_warps_tensor_core_product_counts_its_operations_in_its_mode():
 def test_a_store_its_operand_guards_counts_the_lanes_that_take_it():
     """A store guarded by an operand (`inline_ptx`'s predicate: the first lane's) moves that lane's word
     alone; one guarded by a predicate the block sets itself of a constant moves what that predicate's lanes
-    move (none), and one of the data is unpriced, its lanes unknown."""
+    move (none), its setp an ISETP on every lane it issues on (the review of train 1261, F1), and one of the
+    data is unpriced, its lanes unknown."""
     def elected(ctx, ref):
         del ctx, ref
         i32 = ir.IntegerType.get_signless(32)
@@ -189,9 +190,9 @@ def test_a_store_its_operand_guards_counts_the_lanes_that_take_it():
                                   arith.constant(i32, 1), word, has_side_effects=True)
         return body
 
-    # A predicate the block sets of a constant: no lane holds it, so the store moves nothing.
+    # A predicate the block sets of a constant: no lane holds it, so the store moves nothing; the setp issues.
     i32 = ir.IntegerType.get_signless
-    assert _counted(guarded(lambda ref: arith.constant(i32(32), 1))) == Work()
+    assert _counted(guarded(lambda ref: arith.constant(i32(32), 1))) == Work(integer_operations=128)
 
     def loaded(ref):
         # A word of the data: which lanes hold the predicate set of it is unknown.
@@ -214,7 +215,8 @@ def test_a_copy_through_the_launch_context_moves_its_shared_tile_once():
 def test_a_tickets_elected_and_last_lanes_move_their_words_alone():
     """A ticket's PTX (`across.arrived`'s) guards its atomic by the lane it elects itself (`setp` on an
     operand whose lanes are known: the first thread) and its reset by the last arriver among it: the atomic
-    moves one lane's word, the reset at most that lane's, where a block's own predicate once refused it."""
+    moves one lane's word, the reset at most that lane's, where a block's own predicate once refused it; its
+    two setps and its selp issue on the warpgroup's every lane (the review of train 1261, F1)."""
     def ticket(ctx, ref):
         del ctx, ref
         i32 = ir.IntegerType.get_signless(32)
@@ -230,7 +232,7 @@ def test_a_tickets_elected_and_last_lanes_move_their_words_alone():
             selp.u32 $0, 1, 0, last;
             }""", thread, count, count, result_types=i32, has_side_effects=True)
 
-    assert _counted(ticket) == Work(device_bytes=8 + 4)
+    assert _counted(ticket) == Work(device_bytes=8 + 4, integer_operations=3 * 128)
 
 
 def test_a_launch_contexts_copy_counts_under_its_branch_and_loop():
@@ -304,7 +306,8 @@ def test_a_store_a_branch_holds_under_a_guard_of_the_data_is_refused():
 def test_a_comparison_reads_its_sides_at_their_width_and_signedness():
     """A thread's index less one compared unsigned with 32 bits' largest (PTX's octal `037777777777`, and
     arith's `ult` against -1) holds on the first lane alone, its -1 being that largest: a store it guards
-    moves one word, and a branch on it runs one lane's."""
+    moves one word (its setp an ISETP a lane, the review of train 1261, F1), and a branch on it runs one
+    lane's."""
     def octal(ctx, ref):
         del ctx, ref
         i32 = ir.IntegerType.get_signless(32)
@@ -313,7 +316,7 @@ def test_a_comparison_reads_its_sides_at_their_width_and_signedness():
         mgpu_utils.inline_ptx("{ .reg .pred p; setp.eq.u32 p, $1, 037777777777; @p st.shared.u32 [$0], $1; }",
                               arith.constant(i32, 1), below, has_side_effects=True)
 
-    assert _counted(octal) == Work(shared_bytes=4)
+    assert _counted(octal) == Work(shared_bytes=4, integer_operations=128)
 
     def unsigned(ctx, ref):
         del ctx

@@ -465,8 +465,15 @@ def _assembly(text: str, active: np.ndarray, operand: Callable) -> Work:
             return operand(int(word[1:]))[1]
         return predicates.get(word, unknown)
 
-    # The three-way add being formed (`IADD3`): its register, its operands so far, whether it was issued.
-    adding: tuple[str, int, bool] | None = None
+    # The three-way add being formed (`IADD3`): its register, its operands so far, whether an add issued it,
+    # and the lanes its immediate's move issues it on where no add does.
+    adding: tuple[str, int, bool, float] | None = None
+
+    def closed(pending: tuple[str, int, bool, float] | None) -> Work:
+        # A three-way add no add issued: its immediate's move materializes the constant, an issue (an IADD3 of
+        # its immediate alone, `BitOp.issues`).
+        return Work() if pending is None or pending[2] else Work(integer_operations=pending[3])
+
     for line in _statements(text):
         words = line.split()
         running = active
@@ -486,25 +493,24 @@ def _assembly(text: str, active: np.ndarray, operand: Callable) -> Work:
         moving = float(running.sum())
         if words and words[0].startswith("setp."):
             predicates[words[1].strip(",")] = _set(words, lanes_of, bounds_of)
-            adding = None
-            work = work + _instruction(words, issued, moving)
+            work, adding = work + closed(adding) + _instruction(words, issued, moving), None
             continue
         if words and words[0].startswith("mov.") and guard is None and len(words) == 3 and (
                 _ptx_integer(words[2]) is not None):
             # An immediate's move: an add accumulating into its register issues the IADD3 it starts.
-            adding = (words[1].strip(","), 1, False)
+            work, adding = work + closed(adding), (words[1].strip(","), 1, False, issued)
             continue
         if words and words[0].startswith(("add.", "sub.")) and guard is None and len(words) == 4 and not any(
                 kind in words[0] for kind in ("f32", "f16", "bf16", "f64")):
             out, first = words[1].strip(","), words[2].strip(",")
             if adding is not None and out == first == adding[0] and adding[1] < 3:
-                issued_already, adding = adding[2], (out, adding[1] + 1, True)
+                issued_already, adding = adding[2], (out, adding[1] + 1, True, adding[3])
                 if issued_already:
                     continue
             else:
-                adding = (out, 2, True)
+                work, adding = work + closed(adding), (out, 2, True, issued)
         elif words and not words[0].startswith("//"):
-            adding = None
+            work, adding = work + closed(adding), None
         if " ".join(words).startswith(COPIED):
             # A launch context's copy (`_Launch`): its bytes once, where any lane reaches it and takes
             # its issuer's guard.
@@ -518,7 +524,7 @@ def _assembly(text: str, active: np.ndarray, operand: Callable) -> Work:
         if guard is not None and words[0].startswith(("ld.", "st.", "atom.", "red.", "cp.async.")):
             raise Uncounted(f"a memory instruction under a guard of unknown lanes ({guard}): {words[0]}")
         work = work + _instruction(words, issued, moving)
-    return work
+    return work + closed(adding)
 
 
 def _statements(text: str) -> list[str]:

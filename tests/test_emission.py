@@ -731,8 +731,10 @@ def test_a_steps_mask_of_its_tiles_indices_issues_once_and_one_of_its_place_each
         return (role.step(lambda work: work.integer_operations), role.step(_operations),
                 role.fixed.integer_operations)
 
-    (indexed, selected, once), (placed, selected_placed, _) = counted(placed=False), counted(placed=True)
-    assert indexed == 0 and placed >= 3 * 128 and once == placed, (indexed, placed, once)
+    (indexed, selected, once) = counted(placed=False)
+    (placed, selected_placed, placed_once) = counted(placed=True)
+    # The unplaced walk's once is the placed walk's mask a step and its own once together.
+    assert indexed == 0 and placed >= 3 * 128 and once == placed + placed_once, (indexed, placed, once)
     assert selected == selected_placed == 128, (selected, selected_placed)
 
 

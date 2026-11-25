@@ -354,45 +354,46 @@ def test_a_forms_traced_decode_is_its_decode(name):
         np.testing.assert_array_equal(np.asarray(got).astype(np.uint64), expected)
 
 
-def _inline_decode(form: bits.BitForm):
-    """A Triton kernel decoding a block of stored words (uint32) through the form's PTX, every register in
-    one block (`BitForm.ptx_registers`, what a Mosaic kernel inlines), its words int32 inside, as Triton's
-    inline assembly types a 32-bit register (a signless integer)."""
-    from jax.experimental import pallas as pl
-    from jax.experimental.pallas import triton as plgpu
+DECODED = (64, 16)
+"""The stored words a test's kernel decodes."""
 
-    count = len(form.outputs)
+
+def _inlined(form: bits.BitForm, generation: str):
+    """A Mosaic GPU kernel decoding `DECODED` stored words (uint32) through the form's PTX, every register in
+    one inline block (`inline_forms.registers`, `BitForm.ptx_registers`), in `generation`'s family's register
+    layout, as a packed GEMM's mainloop inlines it."""
+    from jax.experimental.pallas import mosaic_gpu as plgpu
+
+    from dew.nn.kernels.templates import bundles, inline_forms
+
+    layout = bundles.of(generation, jnp.bfloat16).layout
 
     def body(words_ref, *out_refs):
-        shape = jax.ShapeDtypeStruct(words_ref.shape, jnp.int32)
-        registers = plgpu.elementwise_inline_asm(form.ptx_registers(), args=(words_ref[...],),
-                                                 constraints="=r," * count + "r", pack=1,
-                                                 result_shape_dtypes=(shape,) * count)
-        for register, ref in zip(registers, out_refs, strict=True):
-            ref[...] = register
+        words = plgpu.layout_cast(words_ref[...], layout)
+        for out_ref, register in zip(out_refs, inline_forms.registers(form, words, layout), strict=True):
+            out_ref[...] = register
 
-    def decode(words):
-        shape = jax.ShapeDtypeStruct(words.shape, jnp.int32)
-        signed = jax.lax.bitcast_convert_type(words, jnp.int32)
-        return tuple(jax.lax.bitcast_convert_type(value, jnp.uint32)
-                     for value in pl.pallas_call(body, out_shape=(shape,) * count)(signed))
-
-    return decode
+    return plgpu.kernel(body, out_type=(jax.ShapeDtypeStruct(DECODED, jnp.uint32),) * len(form.outputs),
+                        num_threads=1, thread_name="wg")
 
 
 @pytest.mark.parametrize("name", FORMS)
 @pytest.mark.parametrize("generation", ["sm80", "sm90"])
 def test_a_forms_ptx_compiles_for_the_gpu(generation, name):
-    """A form's PTX in a Triton kernel's inline assembly, lowered and compiled by XLA for a compile-only GPU
-    of `generation` (`tests/kernel_compile.py`): ptxas takes every instruction PTX writes for a form
-    (`FORMS` take them all). What a form's PTX computes on a GPU is held where a kernel consumes it, never a
-    unit test on a GPU (the owner's rule): the NVFP4 form in the packed GEMM's mainloop, through
-    tests/test_gpu_gemm.py's NVFP4 product cells (every order, sm80 and sm90, its decode's PTX form a cell's
-    fault) and its NVFP4 matrix (a training step with the matrix decoded in the mainloop, check 1)."""
+    """A form's PTX inlined in a Mosaic GPU kernel (`inline_forms.registers`, the product's path), lowered and
+    compiled by XLA for a compile-only GPU of `generation` (`tests/kernel_compile.py`): ptxas takes every
+    instruction PTX writes for a form (`FORMS` take them all). What a form's PTX computes on a GPU is held
+    where a kernel consumes it, never a unit test on a GPU (the owner's rule): the NVFP4 form in the packed
+    GEMM's mainloop, through tests/test_gpu_gemm.py's NVFP4 product cells (every order, sm80 and sm90, its
+    decode's PTX form a cell's fault) and its NVFP4 matrix (a training step with the matrix decoded in the
+    mainloop, check 1)."""
     from kernel_compile import lowered_for
 
-    words = jax.ShapeDtypeStruct((1024,), jnp.uint32)
-    lowered_for(_inline_decode(FORMS[name]()), (words,), generation).compile()
+    from dew.nn.kernels import generation as generations
+
+    with generations.assumed(generation):
+        lowered_for(_inlined(FORMS[name](), generation), (jax.ShapeDtypeStruct(DECODED, jnp.uint32),),
+                    generation).compile()
 
 
 @pytest.mark.parametrize("name", FORMS)
@@ -401,29 +402,18 @@ def test_a_kernel_inlining_a_forms_decode_counts_the_forms_issues_on_each_pipe(n
     counts what the form's PTX issues over its words, the form's own work (`BitForm.work`: its steps' issues
     on the ALU, `Work.integer_operations`, and the FMA pipe, `Work.integer_multiply_adds`), where the count
     refused the body as unpriced (row 5386): a compare's and a select's ISETP and SEL each, a three-way add
-    one IADD3 (the review of train 1261, F1: setp and selp counted free, an add a PTX statement); traced
-    alone, nothing compiled or run."""
-    from jax.experimental.pallas import mosaic_gpu as plgpu
-
+    one IADD3, a constant one (the review of train 1261, F1: setp and selp counted free, an add a PTX
+    statement); traced alone, nothing compiled or run."""
     from dew.nn import programs
-    from dew.nn.kernels.templates import emission, inline_forms
+    from dew.nn.kernels.templates import emission
     from dew.nn.kernels.templates.cost import Stated
 
-    form, shape = FORMS[name](), (64, 16)
-
-    def body(words_ref, *out_refs):
-        words = plgpu.layout_cast(words_ref[...], plgpu.Layout.WGMMA)
-        for out_ref, register in zip(out_refs, inline_forms.registers(form, words, plgpu.Layout.WGMMA),
-                                     strict=True):
-            out_ref[...] = register
-
-    launch = plgpu.kernel(body, out_type=(jax.ShapeDtypeStruct(shape, jnp.uint32),) * len(form.outputs),
-                          num_threads=1, thread_name="wg")
-    traced = jax.make_jaxpr(launch)(jnp.zeros(shape, jnp.uint32)).jaxpr
+    form = FORMS[name]()
+    traced = jax.make_jaxpr(_inlined(form, "sm90"))(jnp.zeros(DECODED, jnp.uint32)).jaxpr
     (kernel,) = [equation for equation in programs.equations(traced)
                  if equation.primitive in programs.NATIVE_KERNELS]
     counted = emission.launch_work(kernel, Stated(steps=0, bytes_accessed=0))
-    stated = form.work(shape[0] * shape[1])
+    stated = form.work(DECODED[0] * DECODED[1])
     assert (counted.integer_operations, counted.integer_multiply_adds) == (
         stated.integer_operations, stated.integer_multiply_adds), (counted, stated)
 
