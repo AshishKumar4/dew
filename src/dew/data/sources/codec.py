@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
+import functools
 import hashlib
 import importlib
 import io
@@ -161,10 +162,16 @@ def _npy_header(value: np.ndarray, *, f_order: bool) -> bytes | None:
     or None when `np.save` is needed."""
     if value.dtype.fields is not None or value.dtype.hasobject or value.dtype.char == "T":
         return None
-    header = npy_format.header_data_from_array_1_0(value)
-    header["fortran_order"] = f_order
+    return _header(value.dtype, value.shape, f_order)
+
+
+@functools.lru_cache(maxsize=256)
+def _header(dtype: np.dtype, shape: tuple[int, ...], f_order: bool) -> bytes:
+    """The NPY 1.0 header of an array of `dtype` and `shape`, which is all it reads of the array, written
+    once for each: a fingerprint of a thousand stores' records wrote it a quarter million times (row 7840)."""
     buffer = io.BytesIO()
-    npy_format.write_array_header_1_0(buffer, header)
+    npy_format.write_array_header_1_0(buffer, {"descr": npy_format.dtype_to_descr(dtype),
+                                               "fortran_order": f_order, "shape": shape})
     return buffer.getvalue()
 
 

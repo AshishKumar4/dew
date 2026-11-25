@@ -488,13 +488,19 @@ def _member_keys(members: Sequence[str]) -> list[str]:
     """Each mixture member's key: the name it goes by (`_members`), as the plan's order records it
     for every read alike, with its place among the members of that name, so two such members are
     apart. A member's draws and its saved position are keyed by it, so adding or removing another
-    member leaves them as they were."""
+    member leaves them as they were. Keyed once for a mixture's members (`_keyed`): each member's read
+    asks its own, so a mixture of a thousand members keyed them a million times (row 7840)."""
+    return list(_keyed(tuple(members)))
+
+
+@functools.lru_cache(maxsize=64)
+def _keyed(members: tuple[str, ...]) -> tuple[str, ...]:
     seen: collections.Counter[str] = collections.Counter()
     keys = []
     for name in members:
         keys.append(f"{seen[name]}:{name}")
         seen[name] += 1
-    return keys
+    return tuple(keys)
 
 
 def same_stage(made: Stage, held: Stage) -> bool:
