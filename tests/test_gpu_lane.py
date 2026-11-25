@@ -435,10 +435,11 @@ def test_a_dry_prepare_task_runs_within_its_wall_whatever_its_deadline(ci, tmp_p
         verdict.write_text(json.dumps({"rows": []}))
         return 0
     monkeypatch.setattr(ci, "tested", tested)
+    # A fixed clock: its process is given the wall's whole budget but its end's.
+    monkeypatch.setattr(time, "monotonic", lambda: 1000.0)
     ci.prepares.run(ci, "3.12", ["prepare:tests/test_gpu_vae.py"], "@prepare-sm90", tmp_path / "v.json",
                     1680.0, "off")
-    [seconds] = seen
-    assert seconds <= ci.prepares.PREPARE_WALL - ci.session.GRACE - ci.SETTLE - 10.0
+    assert seen == [ci.prepares.PREPARE_WALL - ci.session.GRACE - ci.SETTLE - 10.0]
 
 
 def cgroup_tree(root, levels):
