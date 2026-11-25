@@ -399,9 +399,13 @@ def test_a_mixtures_corpora_read_in_workers_by_their_draw_weights():
     """A mixture read in eight loading workers that draws one corpus seven times as often as the other
     reads it in seven of them and the other in one, where an equal share gave each four (the owner's 4B
     mixture: a corpus drawn 2.74% of the time read in 26 of 52 workers, as many as the 97.26% one), as
-    the position it saves records."""
+    the position its streamed read saves records (each worker reading shards of its own)."""
+
+    def corpus(name: str) -> Pipeline:
+        return Pipeline(Memory([{"id": index} for index in range(16)], shard_rows=1), name=name).repeat()
+
     loading = Loading(workers=8, threads=1, read_buffer=1, worker_buffer=1)
-    data = compile(mix([_kept("rare"), _kept("common")], [1.0, 7.0]).batch(1), read="indexed",
+    data = compile(mix([corpus("rare"), corpus("common")], [1.0, 7.0]).batch(1), read="streamed",
                    loading=loading)
     reader = data.train(DataPartition())
     try:
