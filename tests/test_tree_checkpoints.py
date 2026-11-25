@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.sharding import NamedSharding, PartitionSpec as P
+from placement_parity import assert_same_leaf
 
 from dew.checkpoints import Checkpoints, Keep, Ranking
 
@@ -31,12 +32,10 @@ def template(of, sharding=None):
 
 
 def same(left, right):
-    left, right = (jax.tree.map(lambda leaf: np.asarray(jax.random.key_data(leaf) if jnp.issubdtype(
-        leaf.dtype, jax.dtypes.prng_key) else leaf), side) for side in (left, right))
+    """Two trees alike leaf by leaf to the bit, a key's implementation its dtype (`assert_same_leaf`)."""
     assert jax.tree.structure(left) == jax.tree.structure(right)
     for one, other in zip(jax.tree.leaves(left), jax.tree.leaves(right), strict=True):
-        assert one.dtype == other.dtype
-        np.testing.assert_array_equal(one, other)
+        assert_same_leaf(one, other)
 
 
 @jax.jit
@@ -259,3 +258,15 @@ def test_a_steps_rollout_tree_restores_alone_and_a_step_without_one_holds_none(t
         checkpoints.save(3, state.replace(step=jnp.int32(3)), weights_only=True, rollout=held)
     with pytest.raises(ValueError):
         checkpoints.save(3, held, rollout=held)
+
+
+def test_two_keys_of_one_data_and_two_implementations_are_told_apart():
+    """The exact-leaf check (`assert_same_leaf`) reads a typed PRNG key's implementation apart from its words:
+    two keys of one key data, one `rbg` and one `unsafe_rbg`, which a check of their data alone took for
+    one (row 12999), are refused; and the same key is taken."""
+    data = jax.random.key_data(jax.random.key(0, impl="rbg"))
+    rbg, unsafe = (jax.random.wrap_key_data(data, impl=impl) for impl in ("rbg", "unsafe_rbg"))
+    assert_same_leaf(rbg, jax.random.wrap_key_data(data, impl="rbg"))
+    with pytest.raises(AssertionError):
+        assert_same_leaf(rbg, unsafe)
+

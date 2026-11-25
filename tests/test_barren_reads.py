@@ -421,6 +421,51 @@ def test_a_mixtures_corpora_share_its_workers_by_their_draw_weights(workers, wei
     assert {share.buffer for share in dealt} == {3}
 
 
+@pytest.mark.parametrize(("workers", "weights", "capacities", "shares"), [
+    # The heavy corpus is dealt three of four, but holds two whole files: its third worker goes to the light.
+    (4, [0.97, 0.03], [2, 2], [2, 2]),
+    # No corpus with room: the worker past both corpora's files reads nothing, given to none.
+    (4, [0.97, 0.03], [1, 1], [1, 1]),
+    # A corpus of no bound takes what another cannot hold.
+    (8, [0.5, 0.5], [1, None], [1, 7]),
+])
+def test_a_mixtures_corpora_hold_no_more_workers_than_their_shards(workers, weights, capacities, shares):
+    """A corpus streamed from shards its store cannot cut finer (whole compressed files) takes no more of a
+    mixture's workers than it holds shards for (`dew.data.pipeline.allocation`'s capacities), those past it
+    given to the corpora with room, heaviest first (row 12995)."""
+    from dew.data.pipeline import Workers
+
+    pool = Workers(workers, buffer=1)
+    assert [pool.shared(weights, index, capacities).count for index in range(len(weights))] == shares
+
+
+def _kept(row) -> bool:
+    """Every record: a step that may drop one, so a read pools its workers before the mix (`pooled`)."""
+    return row["id"] >= 0
+
+
+def test_a_skewed_mix_of_whole_compressed_files_reads_in_its_workers_and_resumes(tmp_path):
+    """A mix drawn 97:3 from two corpora of two gzip JSON-lines files each, its steps dropping records so its
+    four workers are pooled before the mix: the heavy corpus, dealt three by its weight, holds two whole
+    files, so it reads in two and the light corpus in two (`_Build.capacities`), where the cut refused three
+    workers two files (row 12995); and a position saved resumes where it stopped."""
+    import gzip
+
+    from dew.data.sources.files import Files
+
+    def corpus(name: str) -> Pipeline:
+        for part in range(2):
+            with gzip.open(tmp_path / f"{name}-{part}.jsonl.gz", "wt") as file:
+                file.writelines(json.dumps({"id": part * 100 + index}) + "\n" for index in range(12))
+        return Pipeline(Files(str(tmp_path / f"{name}-*.jsonl.gz"), format="jsonl"), name=name).filter(
+            _kept).repeat()
+
+    loading = Loading(workers=4, threads=1, read_buffer=1, worker_buffer=1)
+    data = compile(mix([corpus("heavy"), corpus("light")], [97.0, 3.0], seed=1).batch(1), read="streamed",
+                   loading=loading)
+    assert_resumes_where_it_stopped(lambda: data.train(DataPartition()), _batches, 4, 4)
+
+
 def test_a_streamed_weighted_mixture_read_in_loading_workers_reads():
     """A weighted mix of two streamed corpora read in eight loading workers, each worker's copy of the mix
     cut to its slice: its corpora take the slice (`dew.data.mixing.sliced`) and the read delivers rows,
@@ -433,3 +478,28 @@ def test_a_streamed_weighted_mixture_read_in_loading_workers_reads():
     data = compile(mix([corpus("rare"), corpus("common")], [1.0, 7.0]).batch(1), read="streamed",
                    loading=loading)
     assert set(_ids(data.train(DataPartition()), 8)) <= set(range(16))
+
+
+def test_a_window_shuffled_stream_holds_the_index_of_its_current_file_alone(tmp_path):
+    """A stream of thirty JSON-lines files read by index through a shuffle window
+    (`dew.data.shards._SequentialIterator.window`) holds the records' places of the file it stands in alone, each it stood past closed as it passed: a
+    window that ended at a file's last record left that file's held, so a read held one table a file for
+    every file it ever read (row 12996)."""
+    import gc
+
+    from dew.data.sources import files
+    from dew.data.sources.files import Files
+
+    for part in range(30):
+        (tmp_path / f"part-{part:02d}.jsonl").write_text(
+            "".join(json.dumps({"id": part * 10 + index}) + "\n" for index in range(5)))
+    chain = Pipeline(Files(str(tmp_path / "part-*.jsonl"), format="jsonl")).shuffle(3, window=5).batch(1)
+    reader = compile(chain, read="streamed", loading=Loading(workers=0)).train(DataPartition())
+    try:
+        read = [int(np.asarray(next(reader)["id"])[0]) for _ in range(140)]
+        gc.collect()
+        held = [found for found in gc.get_objects() if isinstance(found, files._ShardLines)]
+    finally:
+        reader.close()
+    assert len(set(read)) > 100 and len(held) <= 2
+

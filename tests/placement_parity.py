@@ -38,9 +38,15 @@ def floats(state) -> dict[str, np.ndarray]:
             if jnp.issubdtype(leaf.dtype, jnp.floating)}
 
 
-def raw(leaf) -> np.ndarray:
-    """A leaf's values, a key's as its data."""
-    return np.asarray(jax.random.key_data(leaf) if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key) else leaf)
+def assert_same_leaf(mine, theirs, err_msg: str = "") -> None:
+    """Two leaves alike to the bit: their dtypes first, a typed PRNG key's its implementation (two may print
+    one tag, `rbg` and `unsafe_rbg`), then their words, a key's its key data
+    (`dew.algebra.terms.held_bits`), each apart, so neither stands for the other."""
+    from dew.algebra.terms import held_bits
+
+    (mine_dtype, mine_bits), (their_dtype, their_bits) = held_bits(mine), held_bits(theirs)
+    assert mine_dtype == their_dtype, (err_msg, mine_dtype, their_dtype)
+    np.testing.assert_array_equal(mine_bits, their_bits, err_msg=err_msg)
 
 
 def layouts_agree(run, draw, label: str, layout, reference, seeds: int = LAYOUT_SEEDS):
@@ -60,4 +66,4 @@ def layouts_agree(run, draw, label: str, layout, reference, seeds: int = LAYOUT_
     leaves = zip(jax.tree_util.tree_leaves_with_path(ran), jax.tree.leaves(held), strict=True)
     for (path, mine), theirs in leaves:
         if not jnp.issubdtype(mine.dtype, jnp.floating):
-            np.testing.assert_array_equal(raw(mine), raw(theirs), err_msg=jax.tree_util.keystr(path))
+            assert_same_leaf(mine, theirs, err_msg=jax.tree_util.keystr(path))
