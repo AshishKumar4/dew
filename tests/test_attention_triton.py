@@ -1090,6 +1090,8 @@ def test_a_hook_through_a_custom_vjp_lowers_and_compiles_on_tritons_compiler(tar
 
 
 @pytest.mark.gpu(reason="runs a Pallas Triton kernel's arithmetic on this GPU")
+@pytest.mark.compiles_at_run(reason="runs a Pallas Triton kernel's arithmetic, judged bit for bit, "
+                                   "no check-1 site")
 @pytest.mark.generations("sm80", "sm90", "sm100")
 def test_tritons_compiler_rounds_a_product_and_the_sum_it_feeds_apart():
     """A Pallas Triton kernel's product and the sum it feeds, alone (`a * b + c`) and inside a compensated
@@ -1357,6 +1359,8 @@ def test_triton_kernel_dot_keeps_ieee_fp32_range_in_native_launch():
                     "triton kernel_dot keeps IEEE fp32 range above bfloat16.max", seeds=FEWEST_SEEDS)
 
 
+@pytest.mark.compiles_at_run(reason="a template's certification compiles its configs as the call traces, "
+                                   "no check-1 site")
 def test_common_triton_forward_lowering_isolates_scaled_op():
     """Row 11648: certifying the common `TritonForward` (`lowering(ba, config)`) traces only its own
     unscaled kernel(s), never compiling `rare()`'s separate `scaled=True` op inside the common op's
@@ -1391,6 +1395,7 @@ def test_common_triton_forward_lowering_isolates_scaled_op():
         assert any("scaled" in name for name in runtime_names), runtime_names
 
 
+@pytest.mark.compiles_at_run(reason="runs the Triton forward on its GPU, judged bit for bit, no check-1 site")
 def test_triton_forward_settles_interior_and_overflow_midpoints():
     """`attention_triton.forward` retains full single-rounding (`narrowing_settled`) on 16-bit outputs:
     settling both finite interior BF16 midpoints (`denom = 1 + 2^-23`, `acc = 1 + 3/256 + 2^-23` ->
