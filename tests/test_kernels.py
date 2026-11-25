@@ -184,11 +184,13 @@ def a_fused_kernel_takes_forward_mode_through_the_reference(implementation, with
                 return jax.jvp(attend(name), arrays[:3], arrays[3:])[1]
         return run
 
-    # Refused as it traces (`jax.eval_shape`), computing nothing in a GPU tier part's prepare.
+    # Refused as it lowers for the GPU, computing nothing in a GPU tier part's prepare: JAX stages a
+    # custom_vjp's JVP as a linearization whose evaluation and lowering raise, never its abstract evaluation
+    # (`jax.eval_shape` passed it, row 12632).
     operands = (jax.ShapeDtypeStruct(shape, jnp.bfloat16),) * 3
     with pytest.raises(TypeError):
-        jax.eval_shape(lambda *arrays: jax.jvp(attend(implementation), arrays[:3], arrays[3:]),
-                       *operands, *operands)
+        jax.jit(lambda *arrays: jax.jvp(attend(implementation), arrays[:3], arrays[3:])).trace(
+            *operands, *operands).lower(lowering_platforms=("cuda",))
     # The truth the reference path's own float64 run, as `test_cpu_fp32_attention_summed_in_float64_takes_
     # forward_mode` takes it.
     draw = normal_drawn(0xF0E, *[shape] * 6, dtype=jnp.bfloat16)
