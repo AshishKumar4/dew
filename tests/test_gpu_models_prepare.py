@@ -1,7 +1,7 @@
 """A GPU tier part's prepare of `tests/test_gpu_models.py`'s cells, emulated on a CPU: each arm of
 `a_bf16_decoder_trains_and_serves_through_its_gpu_kernels` and `modernbert_states_in_bf16_on_the_gpu_kernels`
 stated alike in the prepare and on another device's run, so the run finds what its prepare compiled (rows
-11967, 5175, 11012, 11013).
+11967, 11013).
 """
 
 import os
@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 WORKER = r"""
+import json
 import os
 import sys
 from pathlib import Path
@@ -26,6 +27,7 @@ from arm_store import _Ahead, _compile_arms, _stored_arm, armed
 from generation_support import node_target, node_topology
 from gpu_flow import Cell, run_cells
 from truths_ahead import (
+    DEFERRED,
     PROGRAMS,
     UNPREPARED,
     CompiledTruths,
@@ -41,6 +43,8 @@ base = Path(sys.argv[1])
 cpus = jax.devices("cpu")
 assert len(cpus) >= 2, f"expected >=2 cpu devices, got {cpus}"
 
+CAUSAL_CELL = "a bf16 decoder trains on a packed batch and serves its cache through the GPU's kernels"
+
 # 1. Real sm90 prepare of both GPU model cells (pattern of test_flow_cells.py).
 sm90_store = base / "sm90_store"
 os.environ[model_flows.TOPOLOGY] = str(node_topology(base / "topology.bin", gpu="sm90"))
@@ -50,8 +54,7 @@ os.environ["PYTEST_CURRENT_TEST"] = (
 )
 with prepared(sm90_store, stamp="a", target=node_target()):
     run_cells([
-        Cell("a bf16 decoder trains on a packed batch and serves its cache through the GPU's kernels",
-             causal.a_bf16_decoder_trains_and_serves_through_its_gpu_kernels),
+        Cell(CAUSAL_CELL, causal.a_bf16_decoder_trains_and_serves_through_its_gpu_kernels),
         Cell("ModernBERT's states in bf16 on its GPU kernels",
              modernbert.modernbert_states_in_bf16_on_the_gpu_kernels),
     ])
@@ -103,10 +106,13 @@ assert m_dew_prep == m_dew_run, f"ModernBERT dew arm_role drifted across devices
 # The causal site's sm90 programs: where its prepare compiled them ahead, both its arms' by the keys the run
 # looks them up by, never one arm's without its twin's; or its site marked compiled at run, each arm compiled
 # on the GPU (`CompiledTruths.at_run`: its cuDNN launch lowering on no deviceless prepare).
-# Or its cell deferred whole to its run (a cell its deviceless prepare could not trace, `run_cells`), whose
-# arms' site its prepare never reached, each arm compiled on the GPU.
+# Or its cell deferred whole to its run, recorded so (`gpu_flow.run_cells`, `DEFERRED`: its cuDNN attention
+# lowering on no deviceless prepare), its arms' site never reached, each arm compiled on the GPU.
 c_sample = drawn_on_the_host(run_causal[2], 0)
-if ro.holds(armed(c_label)) and ro.at_run(armed(c_label)) is None:
+if not ro.holds(armed(c_label)):
+    deferred = json.loads((sm90_store / DEFERRED).read_text())
+    assert any(reason["error"].startswith(CAUSAL_CELL) for reason in deferred["reasons"]), deferred
+elif ro.at_run(armed(c_label)) is None:
     c_programs = AheadPrograms.load(ro.path(armed(c_label)) / PROGRAMS).programs
     for role_name in (c_dew_run, c_ref_run):
         assert named(role_name, c_sample) in c_programs, (named(role_name, c_sample), sorted(c_programs))
