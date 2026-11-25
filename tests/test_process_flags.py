@@ -270,9 +270,6 @@ SLURM_TASK = {"SLURM_JOB_ID": "7", "SLURM_STEP_NODELIST": "node-0", "SLURM_NTASK
 @pytest.mark.parametrize(("env", "counted", "ungraphed"), [
     ({"CUDA_VISIBLE_DEVICES": "0,1"}, None, True),
     ({"CUDA_VISIBLE_DEVICES": "0"}, None, False),
-    # JAX's selection, set as the process starts, is the GPU it opens whatever pool it joins.
-    ({"JAX_CUDA_VISIBLE_DEVICES": "3", "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7"}, None, False),
-    ({"JAX_CUDA_VISIBLE_DEVICES": "2,3"}, None, True),
     # A place a pool would pin the process to narrows nothing (row 12761's review): `dew launch`'s rank and
     # a Slurm task open every GPU they see where they join no pool (`multi_host=False`), and a Slurm step of
     # one task joins none (`joins_pool`).
@@ -290,15 +287,16 @@ def test_a_process_that_may_open_more_than_one_gpu_graphs_no_peer_wait_unless_it
         env, counted, ungraphed):
     """`import dew` keeps XLA's conditionals and one-shot collective kernels out of its CUDA graphs in a
     process that may open more than one GPU, where one GPU's graph waited on its peer while the peer's host
-    held the driver (row 12714): those JAX's selection names as it stands (JAX_CUDA_VISIBLE_DEVICES), else its
-    visible GPUs, else those its CUDA driver counts (`dew._pool.local_gpus`), never a place a pool it may not
-    join would pin it to; one GPU, an uncounted host or a run naming the commands keeps XLA's list. An
-    environment that names its GPUs is read by Dew's own count; one that names none, by the driver's count
-    `counted` (None uncounted)."""
+    held the driver (row 12714): its visible GPUs, else those its CUDA driver counts
+    (`dew._pool.local_gpus`), never a place a pool it may not join would pin it to; one GPU, an uncounted
+    host or a run naming the commands keeps XLA's list. An environment that names its GPUs is read by Dew's
+    own count; one that names none, by the driver's count `counted` (None uncounted).
+    `prepare_process(multi_host=False)` under a Slurm step of eight tasks joins no pool, so its process opens
+    every GPU it sees, as the eight-task row reads it."""
     from dew import _pool
     from dew._devices import peer_waits_ungraphed
 
-    named = "CUDA_VISIBLE_DEVICES" in env or "JAX_CUDA_VISIBLE_DEVICES" in env
+    named = "CUDA_VISIBLE_DEVICES" in env
     uncounted = None if counted is None else tuple(range(counted))
     opens = _pool.local_gpus if named else lambda selected, environ: uncounted
     assert peer_waits_ungraphed(env, opens) is ungraphed
