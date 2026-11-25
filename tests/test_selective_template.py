@@ -833,6 +833,31 @@ def test_a_spill_steps_the_kernel_that_spilled():
 
 
 @pytest.mark.parametrize('target', ['sm80', 'sm90'])
+def test_a_spilled_backward_takes_its_models_next_plan(target):
+    """`Selective.derived` past a backward's spill on an A100's and an H100's facts for Mamba-1 2.8B's bf16
+    scan: the register model's next plan (`backward_plans`), the next again past its spill too. Halving
+    the spilled plan's tokens, an A100's 8 tokens at three programs, which spill 48 bytes, ran 4 at four,
+    the model's third, past 16 at two, its second, which compiles spill-free (row 1300)."""
+    operands = (jax.ShapeDtypeStruct((8, 2048, 5120), jnp.bfloat16),) * 2 + (
+        jax.ShapeDtypeStruct((5120, 16), jnp.float32),
+        *(jax.ShapeDtypeStruct((8, 2048, 16), jnp.bfloat16),) * 2, jax.ShapeDtypeStruct((5120,), jnp.float32))
+    facts = generation.gpu_target(target)
+    plans = selective.backward_plans(facts)
+    with generation.assumed(facts):
+        bound = selective.SELECTIVE.bind(*operands)
+        identity = report._identity(selective.SELECTIVE, bound, facts)
+        derived = selective.SELECTIVE.derived(bound, facts)
+        assert (derived.positions, derived.resident) == plans[0]
+        refused = [derived]
+        for plan in plans[1:3]:
+            with report.refusals():
+                report.refuse([(identity, tiles, {'selective_scan_backward'}) for tiles in refused])
+                stepped = selective.SELECTIVE.derived(bound, facts)
+            assert (stepped.chunk, stepped.positions, stepped.resident) == (derived.chunk, *plan), stepped
+            refused.append(stepped)
+
+
+@pytest.mark.parametrize('target', ['sm80', 'sm90'])
 def test_the_tuners_variants_lead_with_the_derived_config_each_legal(target):
     """`Selective.variants` on an A100's and an H100's facts for Mamba-1 2.8B's bf16 scan: the derived config
     first, then its neighbours (`Selective.neighbours`), distinct and each legal there, so an opt-in tuning
