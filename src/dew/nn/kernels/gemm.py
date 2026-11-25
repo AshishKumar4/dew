@@ -7,15 +7,16 @@ where `group_sizes` is None. `gemm_t(lhs, rhs, group_sizes)` is each group's row
 times its rows of `rhs`, `[groups, depth, width]`: the kernel gradient. Both multiply in `lhs`'s dtype,
 `rhs` rounded to it, sum in fp32 and round once.
 
-The hooks are plain JAX functions the kernels trace into their bodies: `prologue(lhs_tile, *side_tiles)`
-transforms each loaded tile of `lhs` before its product, its result rounded to `lhs`'s dtype;
-`epilogue(acc, *side_tiles)` each fp32 accumulator tile before its one rounding, returning one output
-or a tuple (`out_dtypes`). A side operand is `(array, axes)`, `axes` naming per dimension the launch
-axis it follows ('rows', 'depth' for the prologue's; 'rows', 'columns' for the epilogue's), 'groups' for
-one value a group, or None for a dimension of one the hook broadcasts; the kernels load each side tile at
+The hooks (`templates.hooks.Hook`) are plain JAX functions the kernels trace into their bodies: the
+prologue's `fn(lhs_tile, *side_tiles)` transforms each loaded tile of `lhs` before its product, its result
+rounded to `lhs`'s dtype; the epilogue's `fn(acc, *side_tiles)` each fp32 accumulator tile before its one
+rounding, returning one output or a tuple (`out_dtypes`). A side operand is a `hooks.Side`, its `axes`
+naming per dimension the launch axis it follows ('rows', 'depth' for the prologue's; 'rows', 'columns' for
+the epilogue's), 'groups' for one value a group, or None for a dimension of one the hook broadcasts; the
+kernels load each side tile at
 their own origins, a `groups` axis at the tile's group, handing the hook each row its group's value, and
 the hook broadcasts a vector itself (`ms[:, None]`). The epilogue applies to every row: a row past the
-routed ones sums nothing, so `gemm(..., epilogue=e)` is `e` of the plain product, and a function
+routed ones sums nothing, so `gemm(..., epilogue=Hook(e))` is `e` of the plain product, and a function
 `jax.experimental.pallas.fuser` hands over keeps its value (`fused`).
 
 Each call runs the first of the implementations that takes it, in a fixed order
@@ -62,6 +63,7 @@ from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import epilogue_vjp, rows_permuted, scattered, tiling
 from dew.nn.kernels.templates.gemm.factored import factored
 from dew.nn.kernels.templates.gemm.hooks import NO_HOOKS, ColumnLocal, Formed, Hooks, column_local
+from dew.nn.kernels.templates.hooks import NO_HOOK, Hook, Side
 from dew.nn.kernels.templates.product import SCALE_DEPTH, bf16_part_count, declared, formed, terms
 from dew.nn.precision import accumulated, asks_default_precision, at_least_fp32, exact_products, twice_scaled
 from dew.nn.programs import read_by
@@ -94,8 +96,8 @@ def unbuilt():
 
 def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights,
          group_sizes: jax.Array | None = None, *,
-         transpose_rhs: bool = False, prologue=None, prologue_operands: tuple = (), epilogue=None,
-         epilogue_operands: tuple = (), out_dtype, out_dtypes: tuple | None = None,
+         transpose_rhs: bool = False, prologue: Hook = NO_HOOK, epilogue: Hook = NO_HOOK, out_dtype,
+         out_dtypes: tuple | None = None,
          precision: PrecisionLike = None, interpret_on_cpu: bool = False, prologue_jvp=None, compute=None,
          layer: jax.Array | None = None, paired: jax.Array | None = None, gather: jax.Array | None = None,
          scatter: jax.Array | None = None, applied: jax.Array | None = None, named: tuple = (),
@@ -144,11 +146,13 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights,
     6794, M-EM-59i); with no other part (`_gemm_refused`). `selected`, a caller's route of the forward
     (`side_by_side`'s), runs as found."""
     if isinstance(rhs, (NvFp4, TernaryWeights)):
-        return _packed_gemm(lhs, rhs, group_sizes, epilogue=epilogue, epilogue_operands=epilogue_operands,
-                            out_dtype=out_dtype, layer=layer, gather=gather, scatter=scatter,
-                            interpret_on_cpu=interpret_on_cpu,
-                            refused=(transpose_rhs, prologue, prologue_operands, paired, prologue_jvp,
+        return _packed_gemm(lhs, rhs, group_sizes, epilogue=epilogue, out_dtype=out_dtype, layer=layer,
+                            gather=gather, scatter=scatter, interpret_on_cpu=interpret_on_cpu,
+                            refused=(transpose_rhs, prologue.fn, prologue.sides, paired, prologue_jvp,
                                      out_dtypes, applied, beside, selected))
+    prologue_arrays, prologue_axes = _split(prologue.sides, 'prologue', group_sizes)
+    epilogue_arrays, epilogue_axes = _split(epilogue.sides, 'epilogue', group_sizes)
+    prologue, epilogue = prologue.fn, epilogue.fn
     _gemm_refused(group_sizes, gather=gather, scatter=scatter, compute=compute, applied=applied,
                   prologue=prologue, lhs=lhs,
                   beside=beside and (prologue, epilogue, paired, gather, scatter, applied, compute, layer,
@@ -158,8 +162,6 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights,
     dense = group_sizes is None and layer is None
     prologue = _prologued(prologue, prologue_jvp)
     paired = None if paired is None else _grouped(lhs, paired, group_sizes, layer)[0]
-    prologue_arrays, prologue_axes = _split(prologue_operands, 'prologue', group_sizes)
-    epilogue_arrays, epilogue_axes = _split(epilogue_operands, 'epilogue', group_sizes)
     beside = tuple(_grouped(lhs, matrix, group_sizes, layer)[0] for matrix in beside)
     rhs, group_sizes, first = _grouped(lhs, rhs, group_sizes, layer)
     dtypes = tuple(jnp.dtype(dtype) for dtype in (out_dtypes or (out_dtype,) * (1 + len(beside))))
@@ -332,9 +334,9 @@ def _gemm_refused(group_sizes, *, prologue, gather, scatter, compute, applied, l
         raise ValueError(f"a formed operand is a prologue's, of the rows' shape {lhs.shape} and dtype "
                          f"{expected}, not {applied.shape} {applied.dtype}")
 
-def _packed_gemm(lhs, matrix: NvFp4 | TernaryWeights, group_sizes, *, epilogue,
-                 epilogue_operands: tuple, out_dtype, layer, gather, scatter, interpret_on_cpu: bool,
-                 refused: tuple) -> jax.Array:
+def _packed_gemm(lhs, matrix: NvFp4 | TernaryWeights, group_sizes, *, epilogue: Hook, out_dtype, layer,
+                 gather,
+                 scatter, interpret_on_cpu: bool, refused: tuple) -> jax.Array:
     """`gemm` of a packed weight matrix (`NvFp4`, `TernaryWeights`: its fp32 sums times its
     scale, frozen), its epilogue on them in XLA before the one rounding, its rows scattered as any, one
     output; none of `refused` (a transposed matrix, a prologue, its side operands, a pair, a prologue's JVP,
@@ -350,10 +352,10 @@ def _packed_gemm(lhs, matrix: NvFp4 | TernaryWeights, group_sizes, *, epilogue,
             raise ValueError(f"{type(matrix).__name__} product in gemm does not take gather or layer")
         summed = ternary_weight_product(lhs, matrix, group_sizes, quantize_activations=False,
                                         out_dtype=jnp.float32, interpret_on_cpu=interpret_on_cpu)
-    if epilogue is not None:
-        arrays, axes = _split(epilogue_operands, 'epilogue', group_sizes)
+    if epilogue.fn is not None:
+        arrays, axes = _split(epilogue.sides, 'epilogue', group_sizes)
         sizes = jnp.asarray([summed.shape[0]], jnp.int32) if group_sizes is None else group_sizes
-        [summed] = _tupled(epilogue, summed, *_rows(arrays, axes, sizes, summed.shape[0]))
+        [summed] = _tupled(epilogue.fn, summed, *_rows(arrays, axes, sizes, summed.shape[0]))
     return scattered(summed.astype(out_dtype), scatter)
 
 
@@ -729,9 +731,9 @@ def gemm_quantized(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None
         assert isinstance(minifloat, bits.Minifloat)
         out_dtype = quantized.minifloat_dtype(minifloat)
         ts = jnp.asarray(1.0 if tensor_scale is None else tensor_scale, jnp.float32)
-        sides = (() if tensor_scale is None else ((jnp.broadcast_to(ts, (lhs.shape[0],)), ('rows',)),))
+        sides = (() if tensor_scale is None else (Side(jnp.broadcast_to(ts, (lhs.shape[0],)), ('rows',)),))
         out = gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs,
-                   epilogue=quantized.quantize_epilogue(minifloat), epilogue_operands=sides,
+                   epilogue=Hook(quantized.quantize_epilogue(minifloat), sides),
                    out_dtype=out_dtype, precision=precision, interpret_on_cpu=interpret_on_cpu)
         assert isinstance(out, jax.Array)
         return out, ts
@@ -740,7 +742,7 @@ def gemm_quantized(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None
             raise ValueError(
                 f"gemm_quantized(MxFp8) requires width divisible by {product_of.MXFP8.depth}, got {width}")
         out = gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs,
-                   epilogue=quantized.quantize_mxfp8_epilogue(), out_dtype=jnp.float8_e4m3fn,
+                   epilogue=Hook(quantized.quantize_mxfp8_epilogue()), out_dtype=jnp.float8_e4m3fn,
                    out_dtypes=(jnp.float8_e4m3fn, jnp.float8_e8m0fnu), precision=precision,
                    interpret_on_cpu=interpret_on_cpu)
         assert isinstance(out, tuple)
@@ -753,8 +755,8 @@ def gemm_quantized(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None
                 f"got {width}")
         ts = jnp.asarray(1.0 if tensor_scale is None else tensor_scale, jnp.float32)
         out = gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs,
-                   epilogue=quantized.quantize_nvfp4_epilogue(),
-                   epilogue_operands=((jnp.broadcast_to(ts, (lhs.shape[0],)), ('rows',)),),
+                   epilogue=Hook(quantized.quantize_nvfp4_epilogue(),
+                                 (Side(jnp.broadcast_to(ts, (lhs.shape[0],)), ('rows',)),)),
                    out_dtype=jnp.uint8, out_dtypes=(jnp.uint8, jnp.float8_e4m3fn),
                    precision=precision, interpret_on_cpu=interpret_on_cpu)
         assert isinstance(out, tuple)
@@ -865,9 +867,9 @@ def _interpreted(product: Callable, interpret_on_cpu: bool, *operands) -> jax.Ar
 def ternary_weight_product(lhs: jax.Array, weights, group_sizes: jax.Array | None = None, **kw) -> jax.Array:
     from .templates.gemm import ternary
     return ternary.ternary_weight_product(lhs, weights, group_sizes, **kw)
-def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, prologue=None,
-           prologue_operands: tuple = (), out_dtype, precision: PrecisionLike = None,
-           interpret_on_cpu: bool = False, gather: tuple | None = None) -> jax.Array:
+def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, prologue: Hook = NO_HOOK,
+           out_dtype, precision: PrecisionLike = None, interpret_on_cpu: bool = False,
+           gather: tuple | None = None) -> jax.Array:
     """Each group's rows of `prologue(lhs)` transposed times its rows of `rhs`: `[groups, depth, width]`
     in `out_dtype`, an empty group's zero, summed as `gemm`'s `precision` asks; without `group_sizes`,
     every row one group, a dense product's (`[1, depth, width]`). A value, as `gemm`'s reverse mode
@@ -876,8 +878,8 @@ def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, pro
     `gather`: the reverse pass of gathered tokens and of a scattered product's cotangent, row 1376)."""
     if gather is not None and group_sizes is None:
         raise ValueError("gathered rows are a grouped call's")
-    prologue_arrays, prologue_axes = _split(prologue_operands, 'prologue', group_sizes)
-    return _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, out_dtype=out_dtype,
+    prologue_arrays, prologue_axes = _split(prologue.sides, 'prologue', group_sizes)
+    return _gemm_t(lhs, rhs, group_sizes, prologue.fn, prologue_arrays, prologue_axes, out_dtype=out_dtype,
                    precision=precision, interpret_on_cpu=interpret_on_cpu, gather=gather)
 
 
@@ -1279,8 +1281,8 @@ def blockwise_fp8_product(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Ar
 
 
 def blockwise_fp8_finished(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Array, row_scales: jax.Array,
-                           column_scales: jax.Array, *, epilogue: Callable, out_dtypes: tuple,
-                           epilogue_operands: tuple = (), out_forms: tuple | None = None, dense: bool = False,
+                           column_scales: jax.Array, *, epilogue: Hook, out_dtypes: tuple,
+                           out_forms: tuple | None = None, dense: bool = False,
                            interpret_on_cpu: bool = False) -> tuple[jax.Array, ...]:
     """`blockwise_fp8_product`'s fp32 sums through `epilogue`, its several outputs in `out_dtypes` (the
     template's epilogue, XLA's the same function of its sums: a next product's rows quantized from them,
@@ -1288,12 +1290,22 @@ def blockwise_fp8_finished(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.A
     output broadcast across each block's columns stored one value a row a block, transposed, as a next
     blockwise product reads its rows' scales). `dense`: its one group covers every row (a padded chain's,
     `projections.blockwise_chain`), which a transposed form's stores need (`quantized.forms_refusal`).
-    `epilogue_operands`, its side tiles (`[rows, columns]` each, the call's output's), the epilogue taking
-    them after the sum (a gated MLP's rounded gate product, its up product's SwiGLU taken here, row 12689)."""
+    The epilogue's side operands (`hooks.Side`s on the output's `('rows', 'columns')`, `_tiles`), its side
+    tiles, which it takes after the sum (a gated MLP's rounded gate product, its up product's SwiGLU taken
+    here, row 12689)."""
     return _blockwise_fp8(lhs, kernel, group_sizes, row_scales, column_scales,
-                          dtypes=tuple(jnp.dtype(dtype) for dtype in out_dtypes), epilogue=epilogue,
-                          sides=tuple(epilogue_operands), out_forms=out_forms, dense=dense,
+                          dtypes=tuple(jnp.dtype(dtype) for dtype in out_dtypes), epilogue=epilogue.fn,
+                          sides=_tiles(epilogue), out_forms=out_forms, dense=dense,
                           interpret=interpret_on_cpu)
+
+
+def _tiles(epilogue: Hook) -> tuple[jax.Array, ...]:
+    """A finished product's epilogue's side operands, each a tile of the output's (`[rows, columns]`,
+    `LAUNCH_AXES['epilogue']`), as the launch takes them."""
+    if any(tuple(side.axes) != LAUNCH_AXES['epilogue'] for side in epilogue.sides):
+        raise ValueError(f"a finished product's epilogue takes side tiles on {LAUNCH_AXES['epilogue']}, not "
+                         f"{[side.axes for side in epilogue.sides]}")
+    return tuple(side.value for side in epilogue.sides)
 
 
 def _blockwise_fp8(lhs, kernel, group_sizes, row_scales, column_scales, *, dtypes: tuple,
@@ -1558,29 +1570,29 @@ def nvfp4_block_product(lhs: NvFp4Block, matrices: NvFp4Block, group_blocks: jax
 
 
 def nvfp4_block_finished(lhs: NvFp4Block, matrices: NvFp4Block, group_blocks: jax.Array, *,
-                         epilogue: Callable, out_dtypes: tuple, epilogue_operands: tuple = (),
-                         epilogue_scalars: tuple = (), out_forms: tuple | None = None, dense: bool = False,
+                         epilogue: Hook, out_dtypes: tuple, epilogue_scalars: tuple = (),
+                         out_forms: tuple | None = None, dense: bool = False,
                          interpret_on_cpu: bool = False) -> tuple[jax.Array, ...]:
     """`nvfp4_block_product`'s fp32 sums times both tensor scales (`twice_scaled`) through `epilogue`, its
     several outputs in `out_dtypes`: the template's epilogue on Blackwell's block-scaled tensor cores, its
     sums scaled there before any function of them, XLA's the same function of its sums (a next product's
     rows quantized from them, `quantized.nvfp4_epilogue`, row 12721), each stored as `out_forms` states
     (`Hooks.out_forms`: an output broadcast across each block's columns stored one value a row a block,
-    transposed). `epilogue_operands`, its side tiles (`[rows, columns]` each), the epilogue taking them after
-    the sums; `epilogue_scalars`, fp32 scalars after them (a delayed recipe's next tensor scale, refused
+    transposed). The epilogue's side operands, its side tiles (`[rows, columns]` each, `_tiles`), it takes
+    after the sums; `epilogue_scalars`, fp32 scalars after them (a delayed recipe's next tensor scale, refused
     unless one scalar as every tensor scale is, `bits.nvfp4_given_scale`), each a
     tile of its value there, carried as a vector over the rows (the launch's side of one value a row: a
     register a thread where a thread holds a row, tcgen05's, where a vector over the columns held a chunk's
     64 and spilled 7108 bytes; witness/b1-probe-3). `dense`: its one group covers every row, which a
     transposed form's stores need (`quantized.forms_refusal`)."""
-    tiles = tuple(epilogue_operands)
+    tiles = _tiles(epilogue)
     vectors = tuple(jnp.broadcast_to(bits.nvfp4_given_scale(scalar), lhs.codes.shape[:1])
                     for scalar in (lhs.scale, matrices.scale, *epilogue_scalars))
 
     def scaled(acc, *sides):
         held, wide = sides[:len(tiles)], [jax.lax.broadcast_in_dim(vector, acc.shape, (0,))
                                           for vector in sides[len(tiles):]]
-        return epilogue(twice_scaled(acc, *wide[:2]), *held, *wide[2:])
+        return epilogue.fn(twice_scaled(acc, *wide[:2]), *held, *wide[2:])
 
     side_axes = (LAUNCH_AXES['epilogue'],) * len(tiles) + (('rows',),) * len(vectors)
     return _block_scaled(lhs, matrices, group_blocks, NVFP4_BLOCK_OP, interpret_on_cpu, epilogue=scaled,
@@ -2455,14 +2467,15 @@ def _grouped(lhs, rhs, group_sizes, layer=None):
     return stack.reshape(layers * groups, *stack.shape[2:]), sizes, first
 
 
-def _split(operands: tuple, hook: str, group_sizes: jax.Array | None) -> tuple[tuple, tuple]:
-    """The side operands' arrays and their axes, each checked: one axis per dimension, each a launch
-    axis the hook's operands follow, `groups` beside no rows (one value a group of the call's, a dense
-    product's one group: `axes.GROUPS`) or None for a dimension of one, at least one a launch axis."""
+def _split(sides: tuple[Side, ...], hook: str, group_sizes: jax.Array | None) -> tuple[tuple, tuple]:
+    """A hook's side operands' arrays and their axes (`hooks.Side`), each checked: one axis per dimension,
+    each a launch axis the hook's operands follow, `groups` beside no rows (one value a group of the call's,
+    a dense product's one group: `axes.GROUPS`) or None for a dimension of one, at least one a launch
+    axis."""
     groups = 1 if group_sizes is None else group_sizes.shape[0]
     arrays, axes_of = [], []
-    for array, axes in operands:
-        axes = tuple(axes)
+    for side in sides:
+        array, axes = side.value, tuple(side.axes)
         named = [axis for axis in axes if axis not in (None, GROUPS)]
         if (len(axes) != array.ndim or not named or any(axis not in LAUNCH_AXES[hook] for axis in named)
                 or any(extent != 1 for axis, extent in zip(axes, array.shape, strict=True) if axis is None)):

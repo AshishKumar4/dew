@@ -31,13 +31,13 @@ from dew.nn.kernels.templates.attention import (
     Kept,
     KeySpans,
     Kind,
-    Param,
     Split,
     floating_params,
     prologued,
     shared_sum,
     takes_output_residuals,
 )
+from dew.nn.kernels.templates.hooks import Hook, Side
 
 
 def _plain():
@@ -84,7 +84,7 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     which the Mosaic forward reads from the key's slot, the keys loaded once (`_Config.in_key`).
     """
     hooks = Hooks() if hooks is None else hooks
-    if hooks.output_mod is not None:
+    if hooks.output.fn is not None:
         raise ValueError("the attention route takes score hooks and the initial state; its backward takes "
                          "the output before an output hook, so the caller applies `output_mod` to the result")
     config = _Config(scale, *run_forms(natural, accurate),
@@ -312,15 +312,15 @@ def _attend_backward(config: _Config, saved: tuple, dout: jax.Array) -> tuple:
     # loads them, of the operands as the forward took them (`narrowed`); the prologues' own pullbacks run
     # here, in XLA, beside their neighbours, at those operands.
     narrow_query, narrow_key, _ = config.narrowed(query, key, value)
-    dquery, query_params = _pulled(narrow_query, hooks.query_mod, hooks.query_params, grads.query)
-    dkey, key_params = _pulled(narrow_key, hooks.key_mod, hooks.key_params, grads.key)
+    dquery, query_params = _pulled(narrow_query, hooks.query.fn, hooks.query.sides, grads.query)
+    dkey, key_params = _pulled(narrow_key, hooks.key.fn, hooks.key.sides, grads.key)
     inputs, hooked = with_gradients_formed(
         (dquery.astype(query.dtype), dkey.astype(key.dtype), grads.value.astype(value.dtype)),
         _hooks_cotangent(hooks, grads, query_params, key_params))
     return (*inputs, None, hooked)
 
 
-def _pulled(operand: jax.Array, mod, params: tuple[Param, ...], cotangent: jax.Array
+def _pulled(operand: jax.Array, mod, params: tuple[Side, ...], cotangent: jax.Array
             ) -> tuple[jax.Array, tuple]:
     """`cotangent`, of `operand` `[B, T, H, D]` under its prologue `mod` (`prologued`), taken back to
     `operand` and to the prologue's parameters: each floating one's gradient, zeros of the others (positions,
@@ -333,7 +333,7 @@ def _pulled(operand: jax.Array, mod, params: tuple[Param, ...], cotangent: jax.A
         given = [param.value for param in params]
         for index, value in zip(floating, values, strict=True):
             given[index] = value
-        return prologued(operand, mod, tuple(map(Param, given, (param.kind for param in params))))
+        return prologued(operand, mod, tuple(map(Side, given, (param.axes for param in params))))
 
     _, pull = jax.vjp(applied, operand, *(params[index].value for index in floating))
     found = pull(cotangent.astype(operand.dtype))
@@ -385,9 +385,9 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
 
         grads = attention_triton.backward(query, key, value, spans, _spread(hooks, query), dout,
                                           residuals=residuals, rounded=rounded, interpret=interpret, **form)
-        return dataclasses.replace(grads, score_params=tuple(
-            shared_sum(grad, param) if param.kind in SPREAD else grad
-            for grad, param in zip(grads.score_params, hooks.score_params, strict=True)))
+        return dataclasses.replace(grads, score=dataclasses.replace(grads.score, sides=tuple(
+            shared_sum(grad, param) if param.axes in SPREAD else grad
+            for grad, param in zip(grads.score_params, hooks.score.sides, strict=True))))
     portable, plain = _plain()
     return portable.backward(plain, *call, residuals=residuals, rounded=rounded, **form)
 
@@ -402,22 +402,21 @@ def _spread(hooks: Hooks, query: jax.Array) -> Hooks:
     (`template.shared_place`, `SPREAD`), as the Pallas-Triton mainloop indexes them; the other mainloops read
     them shared."""
     batch, heads = query.shape[0], query.shape[2]
-    return dataclasses.replace(hooks, score_params=tuple(
+    return dataclasses.replace(hooks, score=dataclasses.replace(hooks.score, sides=tuple(
         dataclasses.replace(param, value=jnp.broadcast_to(param.value,
                                                           (batch, heads, *param.value.shape[2:])))
-        if param.kind in SPREAD else param for param in hooks.score_params))
+        if param.axes in SPREAD else param for param in hooks.score.sides)))
 
 
 def _hooks_cotangent(hooks: Hooks, grads: Gradients, query_params: tuple = (), key_params: tuple = ()
                      ) -> Hooks:
     """The cotangent of `hooks` in its own structure: each score and prologue parameter's gradient in its
-    `Param` (`_pulled`'s for the prologues'), and the initial state's where there is one. The callables are
+    `Side` (`_pulled`'s for the prologues'), and the initial state's where there is one. The callables are
     static, and the output hook is refused."""
-    def given(params: tuple[Param, ...], found) -> tuple[Param, ...]:
+    def given(params: tuple[Side, ...], found) -> tuple[Side, ...]:
         return tuple(dataclasses.replace(param, value=grad)
                      for param, grad in zip(params, found, strict=True))
 
-    return Hooks(score_mod=hooks.score_mod, score_params=given(hooks.score_params, grads.score_params),
-                 initial=grads.initial, query_mod=hooks.query_mod,
-                 query_params=given(hooks.query_params, query_params), key_mod=hooks.key_mod,
-                 key_params=given(hooks.key_params, key_params))
+    return Hooks(score=Hook(hooks.score.fn, given(hooks.score.sides, grads.score_params)),
+                 initial=grads.initial, query=Hook(hooks.query.fn, given(hooks.query.sides, query_params)),
+                 key=Hook(hooks.key.fn, given(hooks.key.sides, key_params)))

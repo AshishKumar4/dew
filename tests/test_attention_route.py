@@ -48,6 +48,7 @@ from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.inputs import counted_places
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import attention as template, attention_route
+from dew.nn.kernels.templates.hooks import Hook
 from dew.nn.precision import Numerics
 
 HEADS, KV_HEADS, WIDTH = 4, 2, 32
@@ -1044,11 +1045,11 @@ def test_the_route_takes_score_hooks_and_the_initial_state_and_refuses_an_output
     query, key, value, sinks, _ = drawing(QUERIES, KEYS, jnp.float32, sinks=True)(0)
     assert sinks is not None
     spans = template.spans(QUERIES, KEYS, ROWS, causal=True)
-    hooks = template.Hooks(score_mod=template.Capped(SOFTCAP),
+    hooks = template.Hooks(score=Hook(template.Capped(SOFTCAP)),
                            initial=template.sinks(sinks, ROWS, QUERIES, WIDTH))
     assert attention_route.attend(query, key, value, spans, hooks).shape == (ROWS, QUERIES, HEADS, WIDTH)
     with pytest.raises(ValueError):
-        attention_route.attend(query, key, value, spans, template.Hooks(output_mod=jnp.tanh))
+        attention_route.attend(query, key, value, spans, template.Hooks(output=Hook(jnp.tanh)))
 
 
 @pytest.mark.parametrize("generation_name", ["sm86", "sm120"])

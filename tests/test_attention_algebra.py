@@ -36,6 +36,7 @@ from dew.nn.kernels.templates import (
     attention_portable,
     attention_triton,
 )
+from dew.nn.kernels.templates.hooks import Hook, Side
 
 TILES = (attention_triton.Tiles(32, 32, 4, 2), attention_triton.Tiles(64, 32, 4, 2),
          attention_triton.Tiles(32, 64, 4, 2))
@@ -111,8 +112,8 @@ def test_the_forwards_split_sums_give_the_first_passes_gradients(hooks):
 
     def grads(*, split: bool):
         def run(query, key, value, dout, params, initial):
-            given = tuple(template.Param(value, kind) for value, kind in zip(params, kinds, strict=True))
-            hooked = template.Hooks(score_mod, given, initial)
+            given = tuple(Side(value, kind) for value, kind in zip(params, kinds, strict=True))
+            hooked = template.Hooks(score=Hook(score_mod, given), initial=initial)
             found = attention_portable.backward(attention_portable.Tiles(32, 32, attention_triton.BLOCK),
                                                 query, key, value, spans, hooked, dout, split=split)
             return found.query, found.key, found.value, found.score_params, found.initial
@@ -122,8 +123,9 @@ def test_the_forwards_split_sums_give_the_first_passes_gradients(hooks):
     def truth(query, key, value, dout, params, initial):
         # The reference's own gradients, in the float64 the gate widens to.
         def attend(query, key, value, params, initial):
-            given = tuple(template.Param(value, kind) for value, kind in zip(params, kinds, strict=True))
-            return template.reference(query, key, value, spans, template.Hooks(score_mod, given, initial))
+            given = tuple(Side(value, kind) for value, kind in zip(params, kinds, strict=True))
+            return template.reference(query, key, value, spans,
+                                      template.Hooks(score=Hook(score_mod, given), initial=initial))
 
         pull = jax.vjp(attend, query, key, value, params, initial)[1]
         return pull(dout)
@@ -794,8 +796,8 @@ def test_a_querys_gradient_over_keys_near_fp32s_largest_is_finite_at_any_scale_a
     dout = jnp.zeros((1, 1, 1, 16), jnp.float32).at[..., 0].set(1.0)
     spans = template.spans(1, 2, 1)
     hooks = template.Hooks() if slope is None else template.Hooks(
-        score_mod=lambda s, q_pos, k_pos, slope: slope * s,
-        score_params=(template.Param(jnp.full((1,), slope, jnp.float32), template.Kind.HEAD),))
+        score=Hook(lambda s, q_pos, k_pos, slope: slope * s,
+                   (Side(jnp.full((1,), slope, jnp.float32), template.Kind.HEAD),)))
     found, want = _accurate_dq(query, key, value, spans, hooks, dout, scale, f"keys of {size}")
     np.testing.assert_array_equal(found, 0.0)
     np.testing.assert_array_equal(want, 0.0)

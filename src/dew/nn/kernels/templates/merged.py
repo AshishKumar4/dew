@@ -47,25 +47,26 @@ from dew.nn.kernels.templates import (
     mosaic,
     report,
 )
-from dew.nn.kernels.templates.attention import Initial, Kind, Param, kept_dtype, output_hooked, ungrouped_rows
+from dew.nn.kernels.templates.attention import Initial, Kind, kept_dtype, output_hooked, ungrouped_rows
+from dew.nn.kernels.templates.hooks import Side
 
 _OUTPUT_KINDS = (Kind.HEAD, Kind.QUERY, Kind.OUTPUT)
 
 
-def output_hook_refusal(output_mod: Callable | None, output_params: tuple[Param, ...]) -> str | None:
+def output_hook_refusal(output_mod: Callable | None, output_params: tuple[Side, ...]) -> str | None:
     """Refusal reason when `output_mod`/`output_params` are inadmissible for fused decode/merge output hooks,
     or None when admissible (the single admission rule shared by `attention_decode.packable` and
     `merged_finished`, row 5385)."""
     if output_params and output_mod is None:
         return "output_params require an output_mod"
-    bad = [param.kind for param in output_params if param.kind not in _OUTPUT_KINDS]
+    bad = [param.axes for param in output_params if param.axes not in _OUTPUT_KINDS]
     if bad:
         return (f"merged_finished supports {[k.value for k in _OUTPUT_KINDS]} output_params, "
                 f"got {[k.value for k in bad]}")
     return None
 
 
-def _validate_output_hook(output_mod: Callable | None, output_params: tuple[Param, ...]) -> None:
+def _validate_output_hook(output_mod: Callable | None, output_params: tuple[Side, ...]) -> None:
     """Validate `output_mod`/`output_params` via `output_hook_refusal`."""
     if (reason := output_hook_refusal(output_mod, output_params)) is not None:
         raise ValueError(reason)
@@ -97,7 +98,7 @@ def _value(padded, stacked, *extra, units: windows.Units, queries: int, width: i
     if output_mod is not None:
         # Its parameters in the dtype a launch's epilogue reads them (`kept_dtype`, `padded_call`'s), so a
         # single slice's fused hook and a merge's compute alike (an fp64 gate of 1 + 2^-25: 0 against 2^-25).
-        params = tuple(Param(arg.astype(kept_dtype(arg.dtype)), kind)
+        params = tuple(Side(arg.astype(kept_dtype(arg.dtype)), kind)
                        for arg, kind in zip(out_args, output_kinds, strict=True))
         ungrouped = jnp.swapaxes(output_hooked(jnp.swapaxes(ungrouped, 1, 2), output_mod, params), 1, 2)
     return (ungrouped.astype(out_dtype),)
@@ -205,7 +206,7 @@ def merged_padded(spec: algebra.Forward, padded: jax.Array, stacked: jax.Array, 
 def merged_finished(spec: algebra.Forward, padded: jax.Array, stacked: jax.Array, *, queries: int,
                     width: int, out_dtype, out_heads: int, initial: Initial | None = None,
                     output_mod: Callable | None = None,
-                    output_params: tuple[Param, ...] = ()) -> jax.Array:
+                    output_params: tuple[Side, ...] = ()) -> jax.Array:
     """`merged_padded` finished, ungrouped to `[B, queries // (out_heads // KV), out_heads, width]`, passed
     through optional fused `output_mod`/`output_params` (row 5385), and cast to `out_dtype` inside the same
     launch (row 7926: eliminates post-merge finish/transpose/hook/cast XLA fusions on a split decode step)."""
@@ -214,7 +215,7 @@ def merged_finished(spec: algebra.Forward, padded: jax.Array, stacked: jax.Array
     _validate_output_hook(output_mod, output_params)
     init_extra = () if initial is None else (initial.m, initial.total, initial.acc)
     out_extra = tuple(param.value for param in output_params)
-    out_kinds = tuple(param.kind for param in output_params)
+    out_kinds = tuple(param.axes for param in output_params)
     raw_scale = spec.scale if (initial is not None and spec.raw) else None
     (out,) = _merged(algebra.units_of(spec), queries, width, raw_scale, jnp.dtype(out_dtype), out_heads,
                      output_mod, out_kinds, padded, stacked, *init_extra, *out_extra)

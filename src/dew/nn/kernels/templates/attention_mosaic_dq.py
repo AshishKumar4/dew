@@ -20,7 +20,7 @@ from dew.nn.kernels.templates import (
     stores,
     swizzling,
 )
-from dew.nn.kernels.templates.attention import Dropout, Param
+from dew.nn.kernels.templates.attention import Dropout
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
     TileWalk,
@@ -54,6 +54,7 @@ from dew.nn.kernels.templates.attention_mosaic_scores import (
     _score_params,
     _scores,
 )
+from dew.nn.kernels.templates.hooks import Side
 
 DQ_ROWS = ("residual", "mass", "keyed_mass", "keyed_shift")
 """The row sums a dQ launch writes (`gradient.DqSums`' fields, `[B, H, Qp]` fp32 each, in the order of its
@@ -361,7 +362,7 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
 
     scoped, rings, after = _dq_allocations(family, program.tiles, width, value_width, query.dtype,
                                            program.stages,
-                                           params=param_types(map(Param, score_params, kinds)))
+                                           params=param_types(map(Side, score_params, kinds)))
     products = placed_scratch(family, block_k, query.dtype, (), (share[1],))
     def entry(*refs):
         family.scoped(functools.partial(body, *refs), *scoped, streams=rings, after_walks=tuple(after),

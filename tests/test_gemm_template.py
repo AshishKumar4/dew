@@ -32,6 +32,7 @@ from dew.nn.kernels import (
 from dew.nn.kernels.templates import cost, mosaic_sm90, product, resources, tail
 from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing, tiling
 from dew.nn.kernels.templates.gemm.hooks import Hooks
+from dew.nn.kernels.templates.hooks import Hook, Side
 
 pytestmark = pytest.mark.kernel
 
@@ -149,36 +150,39 @@ def doubled(acc):
 
 @dataclasses.dataclass(frozen=True)
 class Case:
-    """One call of the template: its hooks, their side operands from the drawn inputs, its outputs."""
+    """One call of the template: its hooks' functions, their side operands (`hooks.Side`) from the drawn
+    inputs, its outputs."""
     prologue: object = None
-    prologue_operands: object = lambda x, w, ms, nw, b, u, s: ()
+    prologue_sides: object = lambda x, w, ms, nw, b, u, s: ()
     epilogue: object = None
-    epilogue_operands: object = lambda x, w, ms, nw, b, u, s: ()
+    epilogue_sides: object = lambda x, w, ms, nw, b, u, s: ()
     out_dtypes: tuple = (jnp.bfloat16,)
     dense: bool = False
 
 
 CASES = {
     "plain": Case(),
-    "norm and bias": Case(normed, lambda x, w, ms, nw, b, u, s: ((ms, ("rows",)), (nw, ("depth",))),
-                          biased, lambda x, w, ms, nw, b, u, s: ((b, ("columns",)),)),
-    "gated prologue": Case(gated, lambda x, w, ms, nw, b, u, s: ((u, ("rows", "depth")),)),
-    "cast prologue": Case(casted, lambda x, w, ms, nw, b, u, s: ((s, ("depth",)),)),
+    "norm and bias": Case(normed, lambda x, w, ms, nw, b, u, s: (Side(ms, ("rows",)), Side(nw, ("depth",))),
+                          biased, lambda x, w, ms, nw, b, u, s: (Side(b, ("columns",)),)),
+    "gated prologue": Case(gated, lambda x, w, ms, nw, b, u, s: (Side(u, ("rows", "depth")),)),
+    "cast prologue": Case(casted, lambda x, w, ms, nw, b, u, s: (Side(s, ("depth",)),)),
     "broadcast axes": Case(normed_broadcast,
-                           lambda x, w, ms, nw, b, u, s: ((ms[:, None], ("rows", None)), (nw, ("depth",))),
-                           biased_row, lambda x, w, ms, nw, b, u, s: ((b[None, :], (None, "columns")),)),
-    "scaled": Case(epilogue=scaled, epilogue_operands=lambda x, w, ms, nw, b, u, s: ((s, ("columns",)),),
+                           lambda x, w, ms, nw, b, u, s: (Side(ms[:, None], ("rows", None)),
+                                                          Side(nw, ("depth",))),
+                           biased_row, lambda x, w, ms, nw, b, u, s: (Side(b[None, :], (None, "columns")),)),
+    "scaled": Case(epilogue=scaled, epilogue_sides=lambda x, w, ms, nw, b, u, s: (Side(s, ("columns",)),),
                    out_dtypes=(jnp.float32,)),
     # Each row its own scale (routing weights'): a cooperative consumer reads its half's rows of it.
     "row scaled": Case(epilogue=scaled_rows,
-                       epilogue_operands=lambda x, w, ms, nw, b, u, s: ((ms, ("rows",)),)),
+                       epilogue_sides=lambda x, w, ms, nw, b, u, s: (Side(ms, ("rows",)),)),
     "two outputs": Case(epilogue=doubled, out_dtypes=(jnp.bfloat16, jnp.float32)),
     "wide output": Case(out_dtypes=(jnp.float32,)),
     "dense": Case(out_dtypes=(jnp.float32,), dense=True),
-    "dense norm and bias": Case(normed, lambda x, w, ms, nw, b, u, s: ((ms, ("rows",)), (nw, ("depth",))),
-                                biased, lambda x, w, ms, nw, b, u, s: ((b, ("columns",)),), dense=True),
+    "dense norm and bias": Case(normed,
+                                lambda x, w, ms, nw, b, u, s: (Side(ms, ("rows",)), Side(nw, ("depth",))),
+                                biased, lambda x, w, ms, nw, b, u, s: (Side(b, ("columns",)),), dense=True),
     "dense scaled": Case(epilogue=scaled,
-                         epilogue_operands=lambda x, w, ms, nw, b, u, s: ((s, ("columns",)),),
+                         epilogue_sides=lambda x, w, ms, nw, b, u, s: (Side(s, ("columns",)),),
                          out_dtypes=(jnp.float32,), dense=True),
     "dense two outputs": Case(epilogue=doubled, out_dtypes=(jnp.bfloat16, jnp.float32), dense=True),
 }
@@ -202,8 +206,8 @@ def _dew(case, **kw):
     def run(x, w, ms, nw, b, u, s):
         drawn = (x, w, ms, nw, b, u, s)
         outs = gemm.gemm(x, w[1] if case.dense else w, None if case.dense else jnp.asarray(SIZES),
-                             prologue=case.prologue, prologue_operands=case.prologue_operands(*drawn),
-                             epilogue=case.epilogue, epilogue_operands=case.epilogue_operands(*drawn),
+                             prologue=Hook(case.prologue, case.prologue_sides(*drawn)),
+                             epilogue=Hook(case.epilogue, case.epilogue_sides(*drawn)),
                              out_dtype=case.out_dtypes[0],
                              out_dtypes=case.out_dtypes if len(case.out_dtypes) > 1 else None, **kw)
         return outs if isinstance(outs, tuple) else (outs,)
@@ -226,7 +230,8 @@ def _plain(case, *, truth: bool = False):
     def run(x, w, ms, nw, b, u, s):
         drawn, h = (x, w, ms, nw, b, u, s), x
         if case.prologue is not None:
-            h = operand(case.prologue(x, *(a for a, _ in case.prologue_operands(*drawn))), jnp.bfloat16)
+            h = operand(case.prologue(x, *(side.value for side in case.prologue_sides(*drawn))),
+                        jnp.bfloat16)
         wide = jnp.promote_types(x.dtype, jnp.float32)
         matrix = operand(w, jnp.bfloat16).astype(h.dtype)
         if case.dense:
@@ -234,7 +239,7 @@ def _plain(case, *, truth: bool = False):
         else:
             acc = jax.lax.ragged_dot(h, matrix, jnp.asarray(SIZES), preferred_element_type=wide)
         if case.epilogue is not None:
-            acc = case.epilogue(acc, *(a for a, _ in case.epilogue_operands(*drawn)))
+            acc = case.epilogue(acc, *(side.value for side in case.epilogue_sides(*drawn)))
         outs = acc if isinstance(acc, tuple) else (acc,)
         dtypes = (jnp.float64,) * len(outs) if truth else case.out_dtypes
         return tuple(out.astype(dtype) for out, dtype in zip(outs, dtypes, strict=True))
@@ -500,9 +505,9 @@ def test_an_empty_rows_undefined_derivative_reaches_no_shared_gradient():
     w = jnp.ones((1, DEPTH, WIDTH)) / DEPTH
 
     def through(x, ms, nw, w, *, sizes, interpret):
-        out = gemm.gemm(x, w, jnp.asarray(sizes), prologue=normed,
-                            prologue_operands=((ms, ("rows",)), (nw, ("depth",))), out_dtype=jnp.float32,
-                            interpret_on_cpu=interpret)
+        out = gemm.gemm(x, w, jnp.asarray(sizes),
+                        prologue=Hook(normed, (Side(ms, ("rows",)), Side(nw, ("depth",)))),
+                        out_dtype=jnp.float32, interpret_on_cpu=interpret)
         return jnp.sum(out)
 
     with generation.assumed("sm80"):
@@ -543,8 +548,8 @@ def test_the_prologues_rounding_is_in_its_derivative():
     ct = jnp.zeros((1, WIDTH)).at[0, :2].set(jnp.asarray([1.0, 0.125]))
 
     def loss(scale, *, interpret):
-        out = gemm.gemm(x, w, jnp.asarray([1]), prologue=casted,
-                            prologue_operands=((scale, ("depth",)),), out_dtype=jnp.float32,
+        out = gemm.gemm(x, w, jnp.asarray([1]), prologue=Hook(casted, (Side(scale, ("depth",)),)),
+                        out_dtype=jnp.float32,
                             interpret_on_cpu=interpret)
         return jnp.sum(out * ct)
 
@@ -570,7 +575,7 @@ def test_a_prologue_never_sees_the_depths_padding(generation_name, sizes):
     with (generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic"),
           generation.routes() as routes):
         out = jax.jit(lambda x, w: gemm.gemm(x, w, None if sizes is None else jnp.asarray(sizes),
-                                             prologue=reciprocal, out_dtype=jnp.float32,
+                                             prologue=Hook(reciprocal), out_dtype=jnp.float32,
                                              interpret_on_cpu=True))(x, w)
     assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"mosaic"}
     np.testing.assert_array_equal(np.asarray(out), np.full((3, 16), 17.0))
@@ -592,9 +597,8 @@ def test_a_dense_product_whose_extents_no_tile_divides_holds_check_1(transpose_r
         return x, w, ms, nw, b, jnp.asarray(rng.normal(size=(65, 100)), jnp.bfloat16)
 
     def dew(x, w, ms, nw, b):
-        return gemm.gemm(x, w, None, prologue=normed,
-                             prologue_operands=((ms, ("rows",)), (nw, ("depth",))), epilogue=biased,
-                             epilogue_operands=((b, ("columns",)),), out_dtype=jnp.bfloat16,
+        return gemm.gemm(x, w, None, prologue=Hook(normed, (Side(ms, ("rows",)), Side(nw, ("depth",)))),
+                         epilogue=Hook(biased, (Side(b, ("columns",)),)), out_dtype=jnp.bfloat16,
                              transpose_rhs=transpose_rhs, interpret_on_cpu=True)
 
     def plain(x, w, ms, nw, b, wide=jnp.float32, out=jnp.bfloat16):
@@ -1328,7 +1332,7 @@ def test_a_side_operands_rows_may_be_any_of_its_dimensions(generation_name):
     sizes = jnp.asarray(SIDE_SIZES)
     for hook, layout, transposed in SIDE_LAYOUTS:
         def dew(x, w, dy, side, hook=hook, layout=layout, transposed=transposed):
-            options = {"prologue": hook, "prologue_operands": ((side.T if transposed else side, layout),),
+            options = {"prologue": Hook(hook, (Side(side.T if transposed else side, layout),)),
                        "out_dtype": jnp.float32, "interpret_on_cpu": True}
             return gemm.gemm(x, w, sizes, **options), gemm.gemm_t(x, dy, sizes, **options)
 
@@ -1357,7 +1361,7 @@ def test_a_side_operand_names_one_launch_axis_per_dimension():
     for operand, axes in ((jnp.ones((8,)), ("columns",)), (jnp.ones((8, 2)), ("rows", None)),
                           (jnp.ones((1,)), (None,))):
         with pytest.raises(ValueError):
-            gemm.gemm(x, w, jnp.asarray([8]), prologue=normed, prologue_operands=((operand, axes),),
+            gemm.gemm(x, w, jnp.asarray([8]), prologue=Hook(normed, (Side(operand, axes),)),
                           out_dtype=jnp.float32)
 
 
@@ -1409,7 +1413,7 @@ def test_the_epilogue_applies_to_every_row(generation_name):
     x, w, _, _, b, *_ = _draw(1)
     with generation.assumed(generation_name):
         out = jax.jit(lambda x, w, b: gemm.gemm(
-            x, w, jnp.asarray(SIZES), epilogue=biased, epilogue_operands=((b, ("columns",)),),
+            x, w, jnp.asarray(SIZES), epilogue=Hook(biased, (Side(b, ("columns",)),)),
             out_dtype=jnp.float32, interpret_on_cpu=True))(x, w, b)
     expected = np.broadcast_to(np.asarray(b), (ROWS - ROUTED, WIDTH))
     np.testing.assert_array_equal(np.asarray(out)[ROUTED:], expected)
@@ -2132,7 +2136,7 @@ def test_a_cooperative_tiles_gradients_hold_check_1():
     gradient through the cooperative kernel gradient, each consumer its depth half, against JAX's
     derivative of the plain program (eagerly: `test_the_templates_gradients_hold_check_1`)."""
     case = "bias"
-    spec = Case(epilogue=biased, epilogue_operands=lambda x, w, ms, nw, b, u, s: ((b, ("columns",)),))
+    spec = Case(epilogue=biased, epilogue_sides=lambda x, w, ms, nw, b, u, s: (Side(b, ("columns",)),))
     pinned = {grouped_matmul.MosaicGmm: COOPERATIVE, grouped_matmul.MosaicTgmm: COOPERATIVE}
     with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"), tuning.pinned(pinned):
         assert_as_exact(as_given(_gradients(_dew(spec, interpret_on_cpu=True))), _gradients(_plain(spec)),
@@ -2329,8 +2333,8 @@ def test_an_integer_side_operand_takes_no_gradient():
 
     def gradient(*, interpret):
         def loss(x, w):
-            out = gemm.gemm(x, w, jnp.asarray(SIZES), prologue=selected,
-                                prologue_operands=((mask, ("rows",)),), out_dtype=jnp.float32,
+            out = gemm.gemm(x, w, jnp.asarray(SIZES), prologue=Hook(selected, (Side(mask, ("rows",)),)),
+                            out_dtype=jnp.float32,
                                 interpret_on_cpu=interpret)
             return jnp.sum(out)
         return jax.jit(jax.grad(loss))

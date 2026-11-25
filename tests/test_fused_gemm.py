@@ -20,6 +20,7 @@ from dew.algebra import cost as algebra_cost
 from dew.nn import programs
 from dew.nn.kernels import fused_gemm, gemm, generation, selection
 from dew.nn.kernels.templates import cost
+from dew.nn.kernels.templates.hooks import Hook, Side
 
 
 @INTERPRETS
@@ -194,9 +195,9 @@ def test_an_explicit_epilogue_is_rewritten_by_the_algebra_pass_as_an_inferred_on
 
     def explicit(x, w, a, b):
         # The consumer the pass rewrites (test_algebra_program's score hook), on the product's tile.
-        return gemm.gemm(x, w, sizes, epilogue=lambda acc, a, b: _scaled_twice(acc, None, None, a, b),
-                         epilogue_operands=((a, ("columns",)), (b, ("columns",))), out_dtype=jnp.float32,
-                         interpret_on_cpu=True)
+        return gemm.gemm(x, w, sizes, epilogue=Hook(lambda acc, a, b: _scaled_twice(acc, None, None, a, b),
+                                                    (Side(a, ("columns",)), Side(b, ("columns",)))),
+                         out_dtype=jnp.float32, interpret_on_cpu=True)
 
     rng = np.random.default_rng(0)
     operands = (jnp.asarray(rng.standard_normal((136, 128)) / 8, jnp.float32),

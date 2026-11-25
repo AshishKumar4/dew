@@ -29,6 +29,7 @@ from test_attention_mosaic import FED, WGMMA, _residuals
 
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import attention as template, attention_mosaic, attention_route, report
+from dew.nn.kernels.templates.hooks import Hook, Side
 
 MAINLOOP = "attention_mainloop"
 """The choice of the mainloop the route's passes run on (`attention_route.MAINLOOP`)."""
@@ -82,9 +83,9 @@ def _hooks(case: dict[str, str], params: tuple) -> template.Hooks | None:
     """`case`'s hook over its drawn `params`: one function a hook, so every case's call of it is the one the
     template's analyses of a hook (its legality, traced at each tile shape) are kept for."""
     if case["hook"] == "softcap":
-        return template.Hooks(_softcapped)
+        return template.Hooks(score=Hook(_softcapped))
     if case["hook"] in BIAS:
-        return template.Hooks(_biased, tuple(template.Param(param, BIAS[case["hook"]]) for param in params))
+        return template.Hooks(score=Hook(_biased, tuple(Side(param, BIAS[case["hook"]]) for param in params)))
     return None
 
 

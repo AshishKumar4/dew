@@ -25,6 +25,7 @@ from test_reference_error_written import _cancelling, _combined
 from truths_ahead import UNPREPARED, compiled_truths
 
 from dew.nn.kernels import gemm, generation, tuning
+from dew.nn.kernels.templates.hooks import Hook
 
 
 def noised(scale: float, noise: str, own: float = 0.0):
@@ -281,7 +282,7 @@ def test_an_arm_whose_launch_takes_a_local_hook_runs_from_its_store(tmp_path):
 
     def doubled(x, w):
         return gemm.gemm(x.astype(jnp.bfloat16), w.astype(jnp.bfloat16), jnp.asarray(sizes),
-                         epilogue=lambda acc: acc * 2, out_dtype=jnp.float32, interpret_on_cpu=True)
+                         epilogue=Hook(lambda acc: acc * 2), out_dtype=jnp.float32, interpret_on_cpu=True)
 
     with generation.assumed("sm80"), generation.chosen(grouped_matmul="triton"):
         expected = np.asarray(ahead_arm(doubled, "a doubled product")(x, w))

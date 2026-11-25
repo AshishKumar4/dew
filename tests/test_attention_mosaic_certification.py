@@ -26,6 +26,7 @@ from dew.nn.kernels.templates import (
     report,
     resources,
 )
+from dew.nn.kernels.templates.hooks import Hook, Side
 
 pytestmark = pytest.mark.kernel
 
@@ -47,8 +48,7 @@ def test_a_backward_certification_refuses_every_config_of_takes_another_route():
         return s / temperature
 
     def loss(query, key, value, temperature):
-        hooks = template.Hooks(score_mod=tempered,
-                               score_params=(template.Param(temperature, template.Kind.QUERY),))
+        hooks = template.Hooks(score=Hook(tempered, (Side(temperature, template.Kind.QUERY),)))
         out = attention_route.attend(query, key, value, spans, hooks, accurate=True)
         return jnp.sum(out.astype(jnp.float32))
 
@@ -239,7 +239,9 @@ jax.monitoring.register_event_duration_secs_listener(heard)
 HOOKED_FORWARD = EDITED_FORWARD.replace("import jax\n", "import jax\n\n\ndef capped(s, q_pos, k_pos):\n"
                                         "    return 30.0 * jax.numpy.tanh(s / 30.0)\n", 1).replace(
     "attention_mosaic.forward(q, k, v, spans, None)",
-    "attention_mosaic.forward(q, k, v, spans, template.Hooks(score_mod=capped))", 1)
+    "attention_mosaic.forward(q, k, v, spans, template.Hooks(score=hooks.Hook(capped)))", 1).replace(
+    "from dew.nn.kernels.templates import attention as template, attention_mosaic, report",
+    "from dew.nn.kernels.templates import attention as template, attention_mosaic, hooks, report", 1)
 """`EDITED_FORWARD` of a launch with a score hook (a soft cap)."""
 
 

@@ -33,6 +33,7 @@ from test_recurrence_chunk import chunk_on, token_by_token
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import attention as template, attention_portable, attention_route
+from dew.nn.kernels.templates.hooks import Hook
 
 
 @contextlib.contextmanager
@@ -108,15 +109,15 @@ def _edges(dtype) -> dict:
     pair = (_rows([[0.0], [0.0]], dtype), _rows([[0.0]], dtype), _rows([[big]], dtype),
             _rows([[0.0], [4.0]], dtype))
     return {
-        "a query a hook empties": (*pair, spans_two, template.Hooks(score_mod=_emptied)),
+        "a query a hook empties": (*pair, spans_two, template.Hooks(score=Hook(_emptied))),
         "a query no span reaches": (*pair, empty, None),
         "keys past a whole tile": (_rows(drawn[0][:12], dtype), _rows(drawn[1][:12], dtype),
                                    _rows(drawn[2][:12], dtype), _rows(drawn[3][:12], dtype),
                                    template.spans(12, 12, 1), None),
         "an infinite hook where masked": (*(_rows(x, dtype) for x in drawn), causal,
-                                          template.Hooks(score_mod=_poisoned(jnp.inf))),
+                                          template.Hooks(score=Hook(_poisoned(jnp.inf)))),
         "a NaN hook where masked": (*(_rows(x, dtype) for x in drawn), causal,
-                                    template.Hooks(score_mod=_poisoned(jnp.nan))),
+                                    template.Hooks(score=Hook(_poisoned(jnp.nan)))),
         "values at the largest": (_rows(drawn[0], dtype), _rows(drawn[1], dtype),
                                   _rows([[largest]] * 16, dtype), _rows(drawn[3], dtype), causal, None),
         "values at the least": (_rows(drawn[0], dtype), _rows(drawn[1], dtype),

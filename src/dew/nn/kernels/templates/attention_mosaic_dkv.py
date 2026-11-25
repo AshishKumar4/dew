@@ -28,7 +28,7 @@ from dew.nn.kernels.templates import (
     stores,
     swizzling,
 )
-from dew.nn.kernels.templates.attention import DKV_GRADS, Dropout, Kind, Param, by_power, shared_place
+from dew.nn.kernels.templates.attention import DKV_GRADS, Dropout, Kind, by_power, shared_place
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
     TileWalk,
@@ -69,6 +69,7 @@ from dew.nn.kernels.templates.attention_mosaic_scores import (
     _scores,
     _splits_scores,
 )
+from dew.nn.kernels.templates.hooks import Side
 
 
 def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype, *,
@@ -792,7 +793,7 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
 
     scoped, rings, after = _dkv_allocations(family, program.tiles, width, value_width, query.dtype,
                                             stages=stages, columns=program.tiles.columns, tiled=tiled,
-                                            params=param_types(map(Param, score_params, kinds)))
+                                            params=param_types(map(Side, score_params, kinds)))
     products = placed_scratch(family, block_q, query.dtype, dq_halves(width) if walk.fused else (),
                               tuple(share for _, share in shares))
     def entry(*refs):

@@ -40,6 +40,7 @@ from dew.nn.kernels.templates import (
     attention_route,
     bundles,
 )
+from dew.nn.kernels.templates.hooks import Hook, Side
 
 pytestmark = pytest.mark.kernel
 
@@ -115,9 +116,9 @@ def _gated_hooks(hooks: str, queries: int, width: int):
             jnp.arange(1, dtype=jnp.int32), jnp.arange(4, dtype=jnp.int32), 0.1))
     score_mod, kinds, draw_hooks = score_hooks(SCORE_HOOKS[hooks], queries, queries, width, rows=1, heads=4)
     params, initial = draw_hooks(0)
-    return template.Hooks(score_mod, tuple(template.Param(value, kind) for value, kind in zip(params, kinds,
-                                                                                               strict=True)),
-                          initial)
+    return template.Hooks(score=Hook(score_mod, tuple(Side(value, kind)
+                                                      for value, kind in zip(params, kinds, strict=True))),
+                          initial=initial)
 
 
 def _gated_backward(generation_name: str, width: int, accurate: bool, hooks: str = "none",
@@ -937,9 +938,9 @@ def test_the_launches_lower_for_an_h100(call, accurate):
     score_mod, kinds, draw_hooks = score_hooks(FORWARD_HOOKS["all"][0], tokens, tokens, 128)
     params, initial = draw_hooks(0)
     gate = hooks_for(HOOKS["gate"], tokens, 128, gate_of(tokens, 128))
-    hooks = template.Hooks(score_mod, tuple(template.Param(value, kind)
-                                            for value, kind in zip(params, kinds, strict=True)), initial,
-                           gate.output_mod, gate.output_params)
+    hooks = template.Hooks(score=Hook(score_mod, tuple(Side(value, kind)
+                                                       for value, kind in zip(params, kinds, strict=True))),
+                           initial=initial, output=gate.output)
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
         for forward_hooks in (None, hooks):
             for training in (template.Kept.NONE, template.Kept.SPLIT):
@@ -1052,13 +1053,13 @@ def test_every_approximated_operation_in_a_hook_takes_exact_math(operation):
         del q_pos
         return applied(q.astype(jnp.float32)).astype(q.dtype)
 
-    for hooks in (template.Hooks(score_mod), template.Hooks(output_mod=output_mod)):
+    for hooks in (template.Hooks(score=Hook(score_mod)), template.Hooks(output=Hook(output_mod))):
         for differentiated in (False, True):
             assert not attention_mosaic_program.approximate(hooks, (64, 64), 64,
                                                             differentiated=differentiated)
     # A query prologue a launch takes on its query tile (`attention_mosaic_forward._prologued`).
     assert not attention_mosaic_program.approximate(
-        template.Hooks(query_mod=query_mod), (64, 64), 64, differentiated=False,
+        template.Hooks(query=Hook(query_mod)), (64, 64), 64, differentiated=False,
         query=(64, 64, jnp.bfloat16))
 
 
@@ -1124,9 +1125,8 @@ def test_the_backward_under_every_score_hook_lowers_for_an_h100(hooks, accurate)
     params, initial = draw_hooks(0)
 
     def backward_of(q, k, v, dout, residuals, params, initial):
-        hooked = template.Hooks(score_mod, tuple(template.Param(value, kind)
-                                                 for value, kind in zip(params, kinds, strict=True)),
-                                initial)
+        sides = tuple(Side(value, kind) for value, kind in zip(params, kinds, strict=True))
+        hooked = template.Hooks(score=Hook(score_mod, sides), initial=initial)
         return attention_route.backward(q, k, v, spans, hooked, dout, residuals=residuals, accurate=accurate)
 
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
@@ -1152,9 +1152,8 @@ def test_the_training_forward_under_every_score_hook_lowers_for_an_h100(hooks, n
     params, initial = draw_hooks(0)
 
     def trained(q, k, v, params, initial):
-        hooked = template.Hooks(score_mod, tuple(template.Param(value, kind)
-                                                 for value, kind in zip(params, kinds, strict=True)),
-                                initial)
+        sides = tuple(Side(value, kind) for value, kind in zip(params, kinds, strict=True))
+        hooked = template.Hooks(score=Hook(score_mod, sides), initial=initial)
         return attention_mosaic.forward(q, k, v, spans, hooked, natural=natural,
                                         residuals=template.Kept.SPLIT)
 
@@ -1180,7 +1179,7 @@ def test_a_hook_that_forms_a_unit_axis_compiles_for_an_h100(axis):
     def score_mod(s, q_pos, k_pos):
         return s + 0.01 * (q_pos[:, :1] if axis == 0 else k_pos[:1, :]).astype(s.dtype)
 
-    hooks = template.Hooks(score_mod)
+    hooks = template.Hooks(score=Hook(score_mod))
     query = jax.ShapeDtypeStruct((1, queries, 4, 128), jnp.bfloat16)
     key = jax.ShapeDtypeStruct((1, queries, 2, 128), jnp.bfloat16)
 

@@ -40,6 +40,7 @@ from dew.batch import Variables, leaves_by_path
 from dew.mesh import EXPERT_AXIS, STAGE_AXIS, LayoutRefused, LogicalAxes, batch_axes, logical_spec, mesh_axes
 from dew.nn.dense import Dense, packed_matrix
 from dew.nn.derivatives import KernelGlue, Protected, contracted, declared_tangent, with_tangents_formed_at
+from dew.nn.kernels.templates.hooks import Hook, Side
 from dew.nn.residuals import Residual
 
 from .activations import GatedActivation, gated_product, logistic, relu2, swiglu_clamped
@@ -688,8 +689,7 @@ def _streamed(x: jax.Array | Gathered, compute, *, hooked: bool = True
         return x.tokens, x.rows, {}
     if x.tokens.dtype != compute or not hooked:
         return gathered(x), None, {}
-    return x.tokens, x.rows, {'prologue': _scaled,
-                              'prologue_operands': ((x.scales.astype(x.tokens.dtype), ('rows',)),)}
+    return x.tokens, x.rows, {'prologue': Hook(_scaled, (Side(x.scales.astype(x.tokens.dtype), ('rows',)),))}
 
 
 def _scaled(rows: jax.Array, scales: jax.Array) -> jax.Array:
@@ -768,7 +768,7 @@ def _biased(bias: jax.Array | None, compute) -> dict:
         return {}
     work = jnp.result_type(bias.dtype, compute, jnp.float32)
     held = jnp.asarray(rounded_operand(bias, compute)).astype(work)
-    return {'epilogue': _plus_bias, 'epilogue_operands': ((held, ('groups', 'columns')),)}
+    return {'epilogue': Hook(_plus_bias, (Side(held, ('groups', 'columns')),))}
 
 
 def _plus_bias(acc: jax.Array, bias: jax.Array) -> jax.Array:

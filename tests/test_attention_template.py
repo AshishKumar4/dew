@@ -18,6 +18,7 @@ from dew.nn.attention_masks import alibi_bias, alibi_slopes, chunk_mask, key_spa
 from dew.nn.documents import CrossDocuments, cross_document_mask, document_mask
 from dew.nn.inputs import counted_places
 from dew.nn.kernels.templates import attention as template
+from dew.nn.kernels.templates.hooks import Hook, Side
 from dew.nn.precision import FP32_SUMS
 from dew.nn.visibility import windowed
 
@@ -371,11 +372,11 @@ def hooks_of(hooks: dict, queries: int) -> template.Hooks:
             s = s + params[0].astype(s.dtype) * k_pos.astype(s.dtype)
         return s
 
-    params = (template.Param(slopes, template.Kind.HEAD),) if hooks.get("alibi") else ()
+    params = (Side(slopes, template.Kind.HEAD),) if hooks.get("alibi") else ()
     initial = (template.sinks(jnp.asarray(SINKS, jnp.float32), ROWS, queries, 32)
                if hooks.get("sinks") else None)
     used = cap is not None or hooks.get("alibi")
-    return template.Hooks(score_mod if used else None, params, initial)
+    return template.Hooks(score=Hook(score_mod if used else None, params), initial=initial)
 
 
 ARITHMETIC = ("full", "causal-window", "causal-documents-window", "cross-causal-lengths-starts")
@@ -485,10 +486,10 @@ def test_every_parameter_layout_and_the_output_hook_are_on_par(case, dtype):
     def output_mod(o, g):
         return o * jax.nn.sigmoid(g.astype(o.dtype))
 
-    hooks = template.Hooks(score_mod, (template.Param(temperature, template.Kind.QUERY),
-                                       template.Param(key_bias, template.Kind.KEY),
-                                       template.Param(dense_bias, template.Kind.TILE)),
-                           None, output_mod, (template.Param(gate, template.Kind.OUTPUT),))
+    hooks = template.Hooks(score=Hook(score_mod, (Side(temperature, template.Kind.QUERY),
+                                                  Side(key_bias, template.Kind.KEY),
+                                                  Side(dense_bias, template.Kind.TILE))),
+                           output=Hook(output_mod, (Side(gate, template.Kind.OUTPUT),)))
 
     def ours(query, key, value):
         return template.reference(query, key, value, spans, hooks)
@@ -843,16 +844,16 @@ def test_hooks_are_a_pytree_whose_values_a_compiled_call_takes():
 
     compiled = jax.jit(attend)
     alibi = hooks_of(HOOKS["softcap-sinks-alibi"], queries)
-    steeper = template.Hooks(alibi.score_mod, (template.Param(2 * alibi.score_params[0].value,
-                                                              template.Kind.HEAD),),
-                             dataclasses.replace(alibi.initial, m=alibi.initial.m + 1))
+    steeper = template.Hooks(score=Hook(alibi.score.fn,
+                                        (Side(2 * alibi.score.sides[0].value, template.Kind.HEAD),)),
+                             initial=dataclasses.replace(alibi.initial, m=alibi.initial.m + 1))
     outputs = compiled(alibi), compiled(steeper)
     assert len(traces) == 1
     assert not np.array_equal(np.asarray(outputs[0]), np.asarray(outputs[1]))
     grads = jax.grad(lambda hooks: jnp.sum(attend(hooks)))(alibi)
     assert jax.tree.structure(grads) == jax.tree.structure(alibi)
     assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves(grads))
-    assert np.abs(np.asarray(grads.score_params[0].value)).sum() > 0
+    assert np.abs(np.asarray(grads.score.sides[0].value)).sum() > 0
 
 
 def test_a_call_of_no_keys_reads_its_initial_state_or_zero():
