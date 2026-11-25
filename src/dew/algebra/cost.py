@@ -59,6 +59,12 @@ VALUE = jnp.dtype(jnp.float32)
 """The dtype a term's value is priced at where the e-graph holds none (a leaf's and a product's are their
 own): a vector lane's fp32, as `LANE_BYTES` keeps it."""
 
+UNPROVEN = jnp.dtype(jnp.float64)
+"""The dtype a term's arithmetic is priced at where its region's program holds values of other than fp32
+(`Region.single_float32`): a float no measured form is of, so a division, a special function and an integer
+power's reciprocal price as unmeasured (an operation, an exponential an element) and any other float
+arithmetic on the fp32 lanes, as `VALUE`'s does (`emission.operation_work`)."""
+
 
 def _shapes(graph: EGraph, operands, held: dict | None) -> list[tuple[int, ...]] | None:
     """The shapes of `operands`, e-classes the extractor supplied (`shape_of`, kept in `held`); None where one
@@ -78,24 +84,19 @@ def _operation_work(primitive, inputs, outputs, params, on: generation.GpuTarget
 
 
 def _priced(primitive, params, shapes: list[tuple[int, ...]], made: tuple[int, ...],
-            on: generation.GpuTarget | None = None, dtype=None) -> Work:
+            on: generation.GpuTarget | None = None, dtype=VALUE) -> Work:
     """An equation's arithmetic as the kernels' counter prices its primitive (`_operation_work`) on `on`, its
-    operands of `shapes` and the value it makes of `made` at `VALUE`; a division at `dtype`, its price its
-    dtype's (an fp32 one's its own, `emission.IEEE_DIVISION`), one of no `dtype` (an int32's, a bfloat16
-    program's, `rules._ranged`'s quotient of one) an operation an element, as unproven fp32."""
-    if primitive is jax.lax.div_p:
-        if dtype is None:
-            return Work(operations=float(math.prod(made)))
-        return _operation_work(primitive, [jax.ShapeDtypeStruct(known, dtype) for known in shapes],
-                               [jax.ShapeDtypeStruct(made, dtype)], params, on)
-    return _operation_work(primitive, [jax.ShapeDtypeStruct(known, VALUE) for known in shapes],
-                           [jax.ShapeDtypeStruct(made, VALUE)], params, on)
+    operands of `shapes` and the value it makes of `made` at `dtype`: an fp32 program's at its own forms (a
+    division's `emission.IEEE_DIVISION`, a special function's `emission.XLA_FORMS`), another's `UNPROVEN`
+    (an int32's, a bfloat16 program's, `rules._ranged`'s quotient of one)."""
+    return _operation_work(primitive, [jax.ShapeDtypeStruct(known, dtype) for known in shapes],
+                           [jax.ShapeDtypeStruct(made, dtype)], params, on)
 
 
 def _elementwise(graph: EGraph, primitive, params, operands, held: dict | None,
-                 on: generation.GpuTarget | None = None, dtype=None) -> Work:
-    """An elementwise node's arithmetic (`_priced` on `on`, a division at `dtype`), its result its operands'
-    shapes broadcast; nothing where one is unknown."""
+                 on: generation.GpuTarget | None = None, dtype=VALUE) -> Work:
+    """An elementwise node's arithmetic (`_priced` on `on` at `dtype`), its result its operands' shapes
+    broadcast; nothing where one is unknown."""
     shapes = _shapes(graph, operands, held)
     return (Work() if shapes is None
             else _priced(primitive, params, shapes, np.broadcast_shapes(*shapes), on, dtype))
@@ -183,16 +184,17 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None,
         return Work()
     # Each other elementwise operation by its primitive, its parameters' entry (`Region.params`); a
     # selection's and a clamp's their own. A layout change computes nothing.
+    # Its dtype fp32 where the region's program holds fp32 values alone, unproven otherwise (an e-graph's node
+    # names no dtype; `Region.dtypes` its traced terms'): a division's, a special function's and a power's
+    # price their dtype's.
+    typed = VALUE if region.single_float32 else UNPROVEN
     if (args := get_callable_args(node, Term.unary)) is not None:
-        return _elementwise(graph, *region.params[integer(args[2])], args[:1], held, on)
+        return _elementwise(graph, *region.params[integer(args[2])], args[:1], held, on, typed)
     if (args := get_callable_args(node, Term.convert)) is not None:
         return _elementwise(graph, *region.params[integer(args[1])], args[:1], held, on)
     for constructor in (Term.binary, Term.compare):
         if (args := get_callable_args(node, constructor)) is not None:
             primitive, params = region.params[integer(args[3])]
-            # A division's dtype: fp32 where its program holds fp32 values alone, unproven otherwise (an
-            # e-graph's node names no dtype; `Region.dtypes` its traced terms').
-            typed = VALUE if primitive is jax.lax.div_p and region.single_float32 else None
             return _elementwise(graph, primitive, params, (args[0], args[2]), held, on, typed)
     for constructor, primitive in ((Term.select, jax.lax.select_n_p), (Term.clamp, jax.lax.clamp_p)):
         if (args := get_callable_args(node, constructor)) is not None:
