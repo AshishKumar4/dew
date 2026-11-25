@@ -735,6 +735,72 @@ def test_a_steps_mask_of_its_tiles_indices_issues_nothing_and_one_of_its_place_c
     assert selected == selected_placed == 128, (selected, selected_placed)
 
 
+def _static_multiply(factor: int) -> jax.Array:
+    """`iota * factor` as a row's floats: an integer multiply of iotas and literals alone, 128 of them."""
+    return (lax.iota(jnp.int32, 128) * factor).astype(jnp.float32)
+
+
+def test_static_work_a_loop_reaches_is_hoisted_once_whichever_trips_reach_it():
+    """Static work (iotas and literals) inside a loop is computed once outside it, as the compiler hoists
+    it, whichever of its trips or arms reach it (row 12767): a walk whose parity picks `iota * 3` or
+    `iota * 5` computes both, 256 multiplies; a two-trip scan whose second trip alone takes `iota * 3`
+    computes it, 128; a two-trip scan whose arms its data decides computes both, 256."""
+    def parity(row, trips):
+        def step(index, row):
+            mosaic.step_index(index)
+            return row + lax.cond(index % 2 == 1, lambda: _static_multiply(3), lambda: _static_multiply(5))
+
+        return lax.fori_loop(0, trips, step, row)
+
+    def later(row):
+        def step(index, row):
+            return lax.cond(index == 1, lambda row: row + _static_multiply(3), lambda row: row, row)
+
+        return lax.fori_loop(0, 2, step, row)
+
+    def decided(row):
+        def step(row, _):
+            return lax.cond(row[0] > 0, lambda row: row + _static_multiply(3),
+                            lambda row: row + _static_multiply(5), row), None
+
+        return lax.scan(step, row, None, length=2)[0]
+
+    walked = _emitted(parity, _ROW, _TRIPS).roles[0].fixed
+    assert walked.integer_multiply_adds == 2 * 128, walked
+    assert _emitted(later, _ROW).roles[0].fixed.integer_multiply_adds == 128
+    assert _emitted(decided, _ROW).roles[0].fixed.integer_multiply_adds == 2 * 128
+
+
+def test_static_work_outside_loops_runs_on_its_path_once_a_call():
+    """Static work outside every loop runs where its path does: in a conditional its data decides, its arm's
+    under the arms' envelope with the arm's other work (`iota * 3`'s multiply, conversion and add against
+    one add: 384 issues; against three adds, 384 too, never 640), and once at each call of a cached jitted
+    body (two calls, 256 multiplies) (row 12767)."""
+    def chosen(first, other):
+        def body(row):
+            return lax.cond(row[0] > 0, first, other, row)
+
+        return cost.issued(_emitted(body, _ROW).roles[0].fixed)
+
+    def tripled_row(row):
+        return row + _static_multiply(3)
+
+    # The predicate and its branch index alone, which each conditional below issues beside its arms.
+    baseline = chosen(lambda row: row, lambda row: row)
+    against_one = chosen(tripled_row, lambda row: row + 1.0)
+    against_three = chosen(tripled_row, lambda row: ((row + 1.0) + 2.0) + 3.0)
+    assert against_one - baseline == against_three - baseline == 3 * 128, (baseline, against_one,
+                                                                           against_three)
+
+    tripled = jax.jit(lambda x: x * 3)
+
+    def called(row):
+        indices = lax.iota(jnp.int32, 128)
+        return row + (tripled(indices) + tripled(indices + 1)).astype(jnp.float32)
+
+    assert _emitted(called, _ROW).roles[0].fixed.integer_multiply_adds == 2 * 128
+
+
 @pytest.mark.parametrize("held", ["step", "scope", "branch"])
 def test_a_steps_mask_of_a_runtime_value_counts_its_integer_operations_each_step(held):
     """A walk step's mask of its tile's indices offset by its parity (`index % 2`, a value the count holds
