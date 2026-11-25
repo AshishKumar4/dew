@@ -434,8 +434,7 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
                                 width=v_smem.shape[-1])
             family.loaded(((k_ref.at[k_view], k_smem.at[index], k_loaded.at[index]),
                            (v_ref.at[v_view], v_smem.at[index], v_loaded.at[index])))
-            if walk.scaled:
-                _keys_powered(family, k_smem.at[index], walk.spec.prescale, key_swizzle, walk.interpret)
+            _keys_powered(family, k_smem.at[index], walk.spec.prescale, program.tiles, walk.interpret)
             lo, hi, whole = program.readers(k_first, q_steps, spans_of, row)
             coords_of = functools.partial(_coords, family, spans_of, row, k_first=k_first,
                                           shape=(block_q, block_k),
@@ -468,7 +467,6 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
 
         family.scheduled(consumers, consumer, producer)
 
-    key_swizzle = transposed_swizzles(program.tiles, "keys").get("keys")
     stages = min(program.tiles.stages, q_steps)
     # A score hook's warpgroups' scratch, or fp16's running scale's (`staged_parts`).
     reduced = reducing(family, consumers, walk.reduces, scaled=staged_parts(query.dtype) > 1)
@@ -495,22 +493,23 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
     operands = (query, key, value, dout, peak, total, anchor, delta, key_index, *leaves)
     dq_axes = head_slice(family, batch, heads, queries, jnp.float32)
     dq, dk, dv = _fused_called(launch, operands, (shapes, groups), copies=consumers if walk.interpret else 1,
-                               grouped=grouped, dq_shape=(*dq_axes, width))
-    if walk.scaled:
-        # Its keys took the query's power (`_keys_powered`), so did dQ's every product: taken back, exactly.
-        dq = dq * (1.0 / walk.spec.prescale)
+                               grouped=grouped, dq_shape=(*dq_axes, width), power=walk.spec.prescale)
     return (head_unlayout(family, dq, heads), head_unlayout(family, dk, kv_heads),
             head_unlayout(family, dv, kv_heads))
 
 
-def _keys_powered(family: mosaic.Family, keys, power: float, swizzle: int | None, interpret: bool) -> None:
+def _keys_powered(family: mosaic.Family, keys, power: float, tiles: BackwardTiles, interpret: bool) -> None:
     """A consumer's resident keys `keys` taken by the query's `power` (a power of two, `by_power`'s) once,
     after their load: its logits' products then read each step's query as its slot holds it, where the
     query took the power in registers every step (M-NA-28-gh200: 68M HMUL2 and 17M LDSM of the fused dK/dV's
     2.02B instructions, row 5272), and its dQ, every product's taken by it too, takes it back after the
     launch (`_fused_launch`): exact, a power of two, but where a product's sum falls below fp32's least
-    normal by it, which its adds may flush. An explicitly swizzled block in place (`across.scale_smem`),
-    else through registers (`Family.staged`)."""
+    normal by it, which its adds may flush. A block its `tiles` swizzle explicitly in place
+    (`across.scale_smem`, `transposed_swizzles`),
+    else through registers (`Family.staged`); a power of 1 none."""
+    if power == 1.0:
+        return
+    swizzle = transposed_swizzles(tiles, "keys").get("keys")
     if swizzle is not None and not interpret:
         across.scale_smem(keys, power, swizzle=swizzle)
         family.published()
@@ -564,19 +563,21 @@ def _dq_summed(walk: _Backward, dq_ref, out_smem, place: tuple, summing: dict, q
 
 
 def _fused_called(launch: Callable, operands: tuple, grads: tuple, *, copies: int, grouped: bool,
-                  dq_shape: tuple[int, int, int, int]) -> tuple[jax.Array, jax.Array, jax.Array]:
+                  dq_shape: tuple[int, int, int, int], power: float = 1.0
+                  ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """The fused launch called on its `operands` (`_fused_launch`'s): dQ added into zeros in place, and
     grouped dK and dV in one ref of both (`stacked.zeros`, `[2, B, Kp, KV, D]`, `grads` their shapes
     and grouping: where XLA wraps the launch in a dynamic-slice fusion, a step's stacked forward rows sliced
     for this launch's operands, two refs of equal zeros were one buffer, dK and dV each the sum of both, row
     3180, ET-3180-PLAIN-h100): one copy of dQ, or each consumer's own interpreted (`Family.added`,
-    `copies`), a consumer's keys its own."""
+    `copies`), a consumer's keys its own; dQ taken back by the query's `power` its keys took
+    (`_keys_powered`), as every one of its products did, exactly."""
     dq = jax.new_ref(launches.filled((copies, *dq_shape), jnp.float32, *operands[:4]))
     if not grouped:
         dk, dv = launch(*operands, dq)
-        return stacked.added(dq), dk, dv
+        return stacked.added(dq) * (1.0 / power), dk, dv
     shapes, groups = grads
     dkv = stacked.zeros(shapes, groups, *operands[:4])
     launch(*operands, dq, *dkv)
     dk, dv = stacked.read(dkv, groups)
-    return stacked.added(dq), dk, dv
+    return stacked.added(dq) * (1.0 / power), dk, dv
