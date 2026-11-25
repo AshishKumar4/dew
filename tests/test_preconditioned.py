@@ -7,7 +7,6 @@ ATK's walk on the recurrence template beside it, packed over spans; and the squa
 saturates. A 16-bit call carries fla's own roundings, which no walk runs: it is held to fla's chunked release
 (row 12696's recorded arm)."""
 
-import contextlib
 import dataclasses
 import functools
 
@@ -28,6 +27,7 @@ from dew.nn.kernels.preconditioned import (
 )
 from dew.nn.kernels.recurrence import Hooks
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
+from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop_backward, template
 from dew.nn.kernels.templates.recurrence.mainloop import Tiles
 from dew.nn.precision import l2norm
@@ -223,14 +223,13 @@ def read_erase_operands(seed):
     return tuple(hosted(x) for x in drawn)
 
 
-def templated(*operands, kernel: str | None = "mosaic_gpu", target: str = "sm90"):
-    """`chunked` with the delta rule on `kernel` (the recurrence template's where unnamed; the selector's
-    own choice where None) under the run's fast forms, where an fp32 call's products round as fla's do
-    (`recurrence_chunk.fast_rounding`), at `target`'s facts (an H100's)."""
+def templated(*operands, kernel: str = "mosaic_gpu", target: str = "sm90"):
+    """`chunked` with the delta rule on `kernel` (the recurrence template's where unnamed) under the run's
+    fast forms, where an fp32 call's products round as fla's do (`recurrence_chunk.fast_rounding`), at
+    `target`'s facts (an H100's)."""
     fast = dataclasses.replace(generation.numerics(), forms='fast')
     with (generation.assumed(target if INTERPRETED else None, interpreted=INTERPRETED),
-          generation.run_precision(fast),
-          generation.chosen(gated_delta_rule=kernel) if kernel else contextlib.nullcontext()):
+          generation.run_precision(fast), generation.chosen(gated_delta_rule=kernel)):
         return chunked(*operands)
 
 
@@ -381,22 +380,29 @@ def test_a_read_erase_under_a_decay_a_key_dimension_trains_on_the_template():
         'mosaic_gpu', 'xla'}
 
 
-@pytest.mark.parametrize(('target', 'taken'), [('sm90', {'mosaic_gpu', 'xla'}), ('sm86', {'xla'})])
-def test_a_key_decays_read_erase_trains_where_its_launches_hold(target, taken):
-    """PKDA's 16-bit training call, its kernel the selector's own, traced through the public gradient: on an
-    H100 the template's, on an sm86 (99 KB a block) the portable math's, its key memory launch past the
-    part's registers with its reads (`template.reads_trained`, row 12890), the selector and the rule's
-    gradient one predicate (the selector's alone gave it the template, whose gradient then refused it):
-    the kernels its traced routes name, beside the portable tangent's."""
+@pytest.mark.parametrize('target', ['sm90', 'sm86'])
+def test_a_key_decays_read_erase_trains_on_the_template_where_its_launches_hold(target):
+    """PKDA's 16-bit training call naming the template, traced through the public gradient: on an H100 the
+    template's (the kernels its traced routes name, beside the portable tangent's); on an sm86 (99 KB a
+    block), where its key memory launch is past the part's registers with its reads (row 12890), refused as
+    the selector refuses a kernel that does not take a call (`selection.KernelRefused`), the selector and the
+    rule's gradient one predicate (`template.reads_trained`): the selector's alone took it, its pullback then
+    raising past the selection (head review of 2b18b2979)."""
     drawn = operands(per_key=True, shape=TEMPLATED)(0)[:-1]
     drawn = (*(x.astype(jnp.bfloat16) for x in drawn[:3]), *drawn[3:])
 
     def loss(*given):
-        return templated(*given, kernel=None, target=target)[0].astype(jnp.float32).sum()
+        return templated(*given, target=target)[0].astype(jnp.float32).sum()
 
+    gradient = functools.partial(jax.eval_shape, jax.grad(loss, argnums=(0, 1, 2)), *drawn)
+    if target == 'sm86':
+        with pytest.raises(KernelRefused):
+            gradient()
+        return
     with generation.routes() as found:
-        jax.eval_shape(jax.grad(loss, argnums=(0, 1, 2)), *drawn)
-    assert {route.kernel for route in found if route.choice == generation.Choice.GATED_DELTA_RULE} == taken
+        gradient()
+    assert {route.kernel for route in found if route.choice == generation.Choice.GATED_DELTA_RULE} == {
+        'mosaic_gpu', 'xla'}
 
 
 def test_atks_walk_on_the_template_is_as_exact_over_packed_spans():
