@@ -171,9 +171,9 @@ def _shifted_tangent_div(dtw: jax.Array, numerator: jax.Array, sn: jax.Array,
                          extra_shift: jax.Array | int = 0) -> jax.Array:
     """Linear-in-`dtw` evaluation of `dtw * numerator * 2**extra_shift / sn` using `dew.nn.precision.power2`:
     balances `k_dtw` and `q = power2(numerator, k_num) / u_sn` so both factors move in the same direction
-    (`>= 1` when `|R| >= 1`, `<= 1` when `|R| < 1`), lifting `<= minexp` numerators above `minexp` before
-    dividing by `u_sn in [1, 2)` so normal quotients never flush to subnormal on XLA:CPU, and putting
-    positive shift onto zero `numerator` to avoid `inf * 0`."""
+    (`>= 1` when `|R| >= 1`, `<= 1` when `|R| < 1`), moves `/ u_sn` onto `power2(dtw, k_dtw)` when `e_total
+    <= 0` and `e_num <= minexp` (preventing both subnormal flush on XLA:CPU and upward scaling of numerator
+    tangents), and puts positive shift onto zero `numerator` to avoid `inf * 0`."""
     minexp = int(jnp.finfo(numerator.dtype).minexp)
     e_sn = _primal_exponent(sn)
     u_sn = power2(sn, -e_sn)
@@ -187,12 +187,15 @@ def _shifted_tangent_div(dtw: jax.Array, numerator: jax.Array, sn: jax.Array,
     need = -e_num + jnp.where(q_ge_1, jnp.int32(0), jnp.int32(1))
     drop = -e_num - jnp.where(q_ge_1, jnp.int32(1), jnp.int32(0))
     k_up = jnp.where(need > 0, need, jnp.minimum(e_total, jnp.int32(0)))
-    k_dn_base = jnp.where(drop < 0, drop, jnp.maximum(e_total, jnp.int32(0)))
-    k_dn = jnp.where(e_num + k_dn_base <= minexp,
-                     jnp.minimum(drop, jnp.int32(minexp + 1) - e_num), k_dn_base)
+    k_dn = jnp.where(drop < 0, drop, jnp.maximum(e_total, jnp.int32(0)))
     k_num = jnp.where(zero_num, jnp.maximum(e_total, jnp.int32(0)), jnp.where(e_r >= 0, k_up, k_dn))
     k_dtw = e_total - k_num
-    return power2(dtw, k_dtw) * (power2(numerator, k_num) / u_sn)
+    div_on_dtw = (~zero_num) & (e_r < 0) & (drop >= 0) & (e_total <= 0) & (e_num <= minexp)
+    scaled_dtw = power2(dtw, k_dtw)
+    on_dtw = (jnp.where(div_on_dtw, scaled_dtw, 0.0) / u_sn) * jnp.where(div_on_dtw, numerator, 0.0)
+    on_num = (jnp.where(div_on_dtw, 0.0, scaled_dtw)
+              * (power2(jnp.where(div_on_dtw, 0.0, numerator), k_num) / u_sn))
+    return jnp.where(div_on_dtw, on_dtw, on_num)
 
 
 def _safe_tangent_quad(dtw: jax.Array, big_c: jax.Array, sml_c: jax.Array, sn: jax.Array) -> jax.Array:

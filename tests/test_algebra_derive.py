@@ -1237,7 +1237,7 @@ def test_chunked_moments_preserves_scaled_tangent_under_large_total_weight():
 
 def test_chunked_moments_balanced_quotient_direction_jvp_and_vjp():
     """Balanced quotient factors move monotonically with `|R|` in both JVP and VJP, preventing overshoot
-    overflow near `fmax` and subnormal flush of `minexp` numerators divided by non-power-of-two weights."""
+    overflow near `fmax`, subnormal flush of `minexp` numerators, and mixed-AD tangent overflow."""
     from dew.algebra import moments
 
     x_vjp = jnp.asarray([[np.float32(1.75), 0.0]], jnp.float32)
@@ -1245,10 +1245,12 @@ def test_chunked_moments_balanced_quotient_direction_jvp_and_vjp():
     cot_hi = jnp.asarray([np.float32(1.5 * 2.0 ** 127)], jnp.float32)
     x_jvp = jnp.asarray([[1.0, 0.0]], jnp.float32)
     w_lo = jnp.asarray([[0.0, np.float32(1.5 * 2.0 ** -100)]], jnp.float32)
-    dw_hi = jnp.asarray([[np.float32(1.25 * 2.0 ** 28), 0.0]], jnp.float32)
+    dw_hi = jnp.asarray([[np.float32(2.0 ** 28), 0.0]], jnp.float32)
     x_tiny = jnp.asarray([[np.finfo(np.float32).tiny, 0.0]], jnp.float32)
     w_mid = jnp.asarray([[0.0, np.float32(1.5 * 2.0 ** 10)]], jnp.float32)
+    w_p2 = jnp.asarray([[0.0, np.float32(2.0 ** 10)]], jnp.float32)
     dw_mid = jnp.asarray([[np.float32(2.0 ** 20), 0.0]], jnp.float32)
+    dx_ov = jnp.asarray([[np.float32(1.5 * 2.0 ** 127), 0.0]], jnp.float32)
     for mode in ("walk", "merge"):
         for tile in (1, 2):
             _, pb = jax.vjp(
@@ -1258,13 +1260,18 @@ def test_chunked_moments_balanced_quotient_direction_jvp_and_vjp():
             _, (dm, _) = jax.jvp(
                 lambda w_, t=tile, m=mode: moments.chunked_moments(x_jvp, w_, tile=t, mode=m),
                 (w_lo,), (dw_hi,))
-            np.testing.assert_allclose(
-                float(dm[0]), float(np.float32((5.0 / 6.0) * 2.0 ** 128)), rtol=1e-6, atol=0.0)
+            assert float(dm[0]) == float(np.float32((2.0 / 3.0) * 2.0 ** 128))
             _, (dm_t, _) = jax.jvp(
                 lambda w_, t=tile, m=mode: moments.chunked_moments(x_tiny, w_, tile=t, mode=m),
                 (w_mid,), (dw_mid,))
-            np.testing.assert_allclose(
-                float(dm_t[0]), float(np.float32((2.0 / 3.0) * 2.0 ** -116)), rtol=1e-6, atol=0.0)
+            assert float(dm_t[0]) == float(np.float32((2.0 / 3.0) * 2.0 ** -116))
+            for w_case, expected in ((w_p2, 1.5 * 2.0 ** 117), (w_mid, 2.0 ** 117)):
+                _, d_gw = jax.jvp(
+                    lambda x_, w_=w_case, t=tile, m=mode: jax.grad(
+                        lambda w__: moments.chunked_moments(x_, w__, tile=t, mode=m)[0].sum())(w_),
+                    (x_tiny,), (dx_ov,))
+                np.testing.assert_array_equal(
+                    np.asarray(d_gw), np.asarray([[np.float32(expected), 0.0]], np.float32))
 
 
 def test_chunked_moments_directed_overflow_mixed_zero_weight_and_direct_jvp():
