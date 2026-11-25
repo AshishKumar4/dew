@@ -424,8 +424,12 @@ lm = LMObjective(model, 4)
 configured = Trainer(lm, OptimConfig(optimizer=Adam(), lr=1e-3), key=jax.random.key(0))._settings()
 handed = Trainer(lm, optax.sgd(1e-2), key=jax.random.key(0))._settings()
 criterion = Supervised(model, lambda outputs, batch: outputs.sum(), inputs="text")
-pathed = dataclasses.replace(configured, optimizer_source=OptimConfig(optimizer=Optax(path="mine:factory"),
-                                                                      lr=1e-3))
+def factory(learning_rate) -> optax.GradientTransformation:
+    return optax.sgd(learning_rate)
+
+
+elsewhere = OptimConfig(optimizer=Optax(path="__main__:factory"), lr=1e-3)
+pathed = dataclasses.replace(configured, optimizer_source=elsewhere)
 whole = [whole_digest()]
 launch = op_provenance(TritonForward(score_mod=Capped(30.0)), {})
 print(json.dumps({"lm": _code(configured, lm.program_key(), None),

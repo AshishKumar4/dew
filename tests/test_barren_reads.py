@@ -439,7 +439,7 @@ def test_a_mixtures_corpora_hold_no_more_workers_than_their_shards(workers, weig
     assert [pool.shared(weights, index, capacities).count for index in range(len(weights))] == shares
 
 
-def _kept(row) -> bool:
+def _every_record(row) -> bool:
     """Every record: a step that may drop one, so a read pools its workers before the mix (`pooled`)."""
     return row["id"] >= 0
 
@@ -458,7 +458,7 @@ def test_a_skewed_mix_of_whole_compressed_files_reads_in_its_workers_and_resumes
             with gzip.open(tmp_path / f"{name}-{part}.jsonl.gz", "wt") as file:
                 file.writelines(json.dumps({"id": part * 100 + index}) + "\n" for index in range(12))
         return Pipeline(Files(str(tmp_path / f"{name}-*.jsonl.gz"), format="jsonl"), name=name).filter(
-            _kept).repeat()
+            _every_record).repeat()
 
     loading = Loading(workers=4, threads=1, read_buffer=1, worker_buffer=1)
     data = compile(mix([corpus("heavy"), corpus("light")], [97.0, 3.0], seed=1).batch(1), read="streamed",
