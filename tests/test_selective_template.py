@@ -669,6 +669,30 @@ def _bound(length: int):
     return selective.SELECTIVE.bind(*operands, interpret=True)
 
 
+def test_a_configs_shared_memory_covers_its_backward_launchs():
+    """A config's staged shared memory (`Selective.staged_bytes`, which `legal` holds to a program's share)
+    is the larger of its launches', its backward's scratch too (its block's exchange, its states' rows and,
+    forked, its documents' token rows), as its backward allocates them, where its forward's chunk alone was
+    priced (row 6131: the planner and the emitter read one description). An A100's forked call at 16 tokens
+    a chunk and 16 a thread (a backward block of 2,048) stages 52,224 bytes, its forward 25,600."""
+    from dew.nn.kernels.templates import bundles, resources
+
+    forked = FORKED["shared and chained"]
+    rows, length, channels, states = 2, 4096, 256, 16
+    operands = (jax.ShapeDtypeStruct((rows, length, channels), jnp.bfloat16),) * 2 + (
+        jax.ShapeDtypeStruct((channels, states), jnp.float32),
+        *(jax.ShapeDtypeStruct((rows, length, states), jnp.bfloat16),) * 2,
+        jax.ShapeDtypeStruct((channels,), jnp.float32))
+    facts = generation.gpu_target("sm80")
+    with generation.assumed(facts):
+        bound = selective.SELECTIVE.bind(*operands, forked=forked, interpret=True)
+        staged = selective.SELECTIVE.staged_bytes(bound, selective.Tiles(16, 16, 2), facts)
+    assert staged == 52224, staged
+    scratch = selective.backward_scratch(states, selective.block_positions(length, 16), forked=True)
+    family = bundles.of("sm80", jnp.bfloat16)
+    assert resources.shared_bytes(family, resources.Scope(program=scratch)) == staged
+
+
 @pytest.mark.check1_shards(seeds=8, per_task=4)
 def test_a_spill_steps_the_kernel_that_spilled():
     """`Selective.derived` past a compile's spill (`report.refuse`, a refusals scope): a backward kernel that
