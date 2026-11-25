@@ -119,6 +119,9 @@
 "tests/test_attention_blackwell.py::test_the_blackwell_forward_holds_check_1_interpreted[causal-64-natural]",
 "tests/test_attention_blackwell.py::test_the_blackwell_forward_keeps_finite_a_logit_its_scale_keeps_finite_interpreted"
 ],
+"tests/test_attention_compositions.py": [
+"tests/test_attention_compositions.py::test_forgetting_attention_by_default_runs_the_template_holding_no_written_out_bias[sm90]"
+],
 "tests/test_attention_decode_template.py": [
 "tests/test_attention_decode_template.py::test_a_decode_step_fuses_output_hooks_single_slice_and_split_interpreted[split-head]",
 "tests/test_attention_decode_template.py::test_a_decode_step_given_its_caches_value_bounds_walks_as_one_given_none_interpreted[ordinary-paged]",
@@ -856,9 +859,6 @@
 "tests/test_chunked_cross_entropy.py::test_the_softcap_gradient_survives_saturated_logits",
 "tests/test_chunked_cross_entropy.py::test_the_whole_logits_head_computes_what_the_tiled_one_does[None-float32]"
 ],
-"tests/test_codec_checkpoints.py": [
-"tests/test_codec_checkpoints.py::test_a_quantized_checkpoint_saves_its_own_bytes[modelopt/tiny]"
-],
 "tests/test_compile_ahead.py": [
 "tests/test_compile_ahead.py::test_a_compile_only_gpu_holds_the_accumulator_a_step_builds_once",
 "tests/test_compile_ahead.py::test_a_configured_run_compiles_ahead_for_the_multiprocessors_it_states_and_loads_only_there",
@@ -1499,6 +1499,9 @@
 ],
 "tests/test_dpo.py": [
 "tests/test_dpo.py::test_packed_pairs_train_as_each_pair_a_row[gated delta net hybrid-shared]"
+],
+"tests/test_dream_walk.py": [
+"tests/test_dream_walk.py::test_a_dream_release_walks_its_responses_as_its_own_sampling_does[dream]"
 ],
 "tests/test_dreamer.py": [
 "tests/test_dreamer.py::test_a_dreamer_run_resumed_from_its_checkpoint_owes_its_steps_and_with_its_replay_ends_alike[prefilled-replay]",
@@ -2278,9 +2281,6 @@
 "tests/test_layer_stack.py::test_runs_of_like_layers_scan_and_the_rest_unroll[deepseek_widths]",
 "tests/test_layer_stack.py::test_runs_of_like_layers_scan_and_the_rest_unroll[gemma4]"
 ],
-"tests/test_layout_counts.py": [
-"tests/test_layout_counts.py::test_a_laid_out_corpus_resumed_reads_its_windows_counted_as_the_uninterrupted_read[first-fit-2-indexed]"
-],
 "tests/test_layout_validation.py": [
 "tests/test_layout_validation.py::test_a_gpu_step_runs_the_collectives_its_layout_plans[h100_fsdp2_tensor2]"
 ],
@@ -2302,9 +2302,6 @@
 "tests/test_linear_attention.py::test_the_layer_decodes_as_it_prefills",
 "tests/test_linear_attention.py::test_the_layer_reads_a_holed_row_as_the_row_without_its_holes",
 "tests/test_linear_attention.py::test_the_port_keeps_each_row_to_itself_at_its_rows_tightest_document_bound"
-],
-"tests/test_live_bridge.py": [
-"tests/test_live_bridge.py::test_a_page_s_restarts_are_admitted_as_its_cells_are_and_end_with_it"
 ],
 "tests/test_llama4.py": [
 "tests/test_llama4.py::test_a_paged_cache_draws_what_the_dense_cache_draws[paged]"
