@@ -1006,15 +1006,19 @@ def test_a_replicated_rows_reduction_combines_each_copy(target):
 
     butterfly = Work(operations=128 * (1 + 5), shuffles=128 * 5)
     generation_named = target.split()[0]
-    placed = (jax.sharding.use_abstract_mesh(generation.gpu_mesh(jax.sharding.AbstractMesh((1,), ("data",)),
-                                                                generation_named))
-              if target.endswith("placed") else generation.assumed(generation_named))
+
+    def placed():
+        if target.endswith("placed"):
+            mesh = jax.sharding.AbstractMesh((1,), ("data",))
+            return jax.sharding.use_abstract_mesh(generation.gpu_mesh(mesh, generation_named))
+        return generation.assumed(generation_named)
+
     for reduce, work in ((jnp.sum, butterfly),
                          (jnp.max, Work(operations=64) if generation_named == "sm100" else butterfly)):
         launch = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((1,), jnp.float32), num_threads=1,
                               thread_name="wg", scratch_types=[plgpu.SMEM((1, 64), jnp.float32)])
         traced = jax.make_jaxpr(launch)().jaxpr
-        with placed:
+        with placed():
             fixed = emission.emitted(traced, 1, "wg", forms=emission.ACCURATE_FORMS).roles[0].fixed
         assert (fixed.operations, fixed.shuffles) == (work.operations, work.shuffles), (reduce, fixed)
 
