@@ -453,23 +453,17 @@ def before(ci, python: str, name: str, group: str, until: float) -> set[str] | s
     checkout's `mainline`, ci.py's `baseline_key`, listed under the file's place once; a green run's alone,
     never written over by a red one), whole or a group of any cut: one cut of main's whole, every group of
     it read, so a row this run cut otherwise is held to main's all the same. `BOOTSTRAP` where main has no
-    run of it at all (no baseline, nor a run named), or where this checkout is main's commit itself and
-    reads none whole; `UNREAD` where none is read whole: no token or main, a
-    Worker that failed or answered late, a baseline that is no list, a run named with no baseline, or no cut
-    whole. Every request, each page of the listing among them, is bounded by `until` (a `time.monotonic`
-    instant), and a read past it is none."""
+    run of it at all (no baseline, nor a run named) or none it kept whole (a cut part-written, a run named
+    with no baseline); `UNREAD` where its baselines could not be read: no token or main, a Worker that failed
+    or answered late, a baseline that is no list. Every request, each page of the listing among them, is
+    bounded by `until` (a `time.monotonic` instant), and a read past it is none."""
     found = _before(ci, python, name, group, until)
-    commit = ci.mainline()
-    if found == PARTIAL and commit is not None and commit == ci.run_keys.head_commit():
-        # A run of main's own commit (a train's base, main's CI) that reads no whole baseline of it: what it
-        # leaves unprepared is main's, the baseline it writes once green (`run_keys.baselined`). Said stale,
-        # a cut main's earlier run left part-written (a group red, so unwritten) would never be green to be
-        # written whole: every run of main red on it, every train's base with them (train 1275's
-        # test_gpu_compile_ahead.py users prepare). One that reads a whole baseline is held to it as its
-        # heads are: a base let pass on a cell its heads were red for returned them all (train 1282), and
-        # one that failed to read them (`UNREAD`) is no run that read none whole.
-        return BOOTSTRAP
-    return UNREAD if found == PARTIAL else found
+    # Main keeping no baseline of it whole holds no run to one, a train's base (main's own commit, whose green
+    # run writes it) and its heads alike: graded apart, the base green on BOOTSTRAP and every head stale on
+    # the same main, the heads were returned for the base's grade (train 1291: main 2b1b88c39 kept 2 of its
+    # 5 attention prepare groups, its other 3 stale in its CI, and three heads were returned on 9 groups). A
+    # whole baseline holds both alike (train 1282), and one that could not be read (`UNREAD`) neither.
+    return BOOTSTRAP if found == PARTIAL else found
 
 
 def _before(ci, python: str, name: str, group: str, until: float) -> set[str] | str:
