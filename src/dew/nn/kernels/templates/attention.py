@@ -2092,6 +2092,43 @@ def raised_sum(grad: jax.Array, shift: jax.Array, axes: tuple[int, ...]) -> jax.
     `0 * inf`."""
     if not axes:
         return shifted(grad, shift)
+    shift = jnp.broadcast_to(shift, jnp.broadcast_shapes(shift.shape, (1,) * grad.ndim))
+    # The sum is elementwise over every other axis: taken a slab of them at a time where its digits would
+    # hold more than `RAISED_ELEMENTS` entries at once (row 10694: a tile bias's gradient over 4 rows of
+    # 8 heads' 2048 x 2048 logits asked 5.47 GiB of an A100's 40 at once).
+    kept = [axis for axis in range(grad.ndim) if axis not in axes and grad.shape[axis] > 1]
+    slabs = _slabs(grad.size, grad.shape[kept[-1]]) if kept else 1
+    if slabs == 1:
+        return _raised(grad, shift, axes)
+    axis = kept[-1]
+
+    def split(x):
+        # `x` in `slabs` along `axis`, the slab its leading axis; one of no extent there each slab's whole.
+        if x.shape[axis] == 1:
+            return jnp.broadcast_to(x, (slabs, *x.shape))
+        return jnp.moveaxis(x.reshape(*x.shape[:axis], slabs, x.shape[axis] // slabs, *x.shape[axis + 1:]),
+                            axis, 0)
+
+    # A slab at a time (`lax.map`, a loop), so one slab's digits are live at once.
+    pieces = jax.lax.map(lambda parts: _raised(*parts, axes), (split(grad), split(shift)))
+    merged = jnp.moveaxis(pieces, 0, axis)
+    return merged.reshape(*merged.shape[:axis], -1, *merged.shape[axis + 2:])
+
+
+RAISED_ELEMENTS = 1 << 24
+"""The most entries `raised_sum` sums aligned at once: its digits hold about 44 bytes an entry (`aligned`'s
+levels of int32), so 0.7 GiB a slab."""
+
+
+def _slabs(size: int, extent: int) -> int:
+    """The fewest slabs of an axis of `extent` (a divisor of it) that hold `size` entries `RAISED_ELEMENTS`
+    or fewer a slab, or `extent` where none does."""
+    wanted = -(-size // RAISED_ELEMENTS)
+    return next((count for count in range(wanted, extent + 1) if extent % count == 0), extent)
+
+
+def _raised(grad: jax.Array, shift: jax.Array, axes: tuple[int, ...]) -> jax.Array:
+    """`raised_sum`'s exact sum of `grad`'s parts raised by `2^shift` over `axes` (kept)."""
     one = jnp.ones((), jnp.float32)
     third = shift // 3
     factors = (power2(one, third), power2(one, third), power2(one, shift - 2 * third))
