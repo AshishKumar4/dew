@@ -257,6 +257,20 @@ convert; exp2, sqrt and rsqrt their approximate forms. A sin's and a cos's accur
 reduction for large arguments, which a static count misstates: unpriced, with log1p and pow, which Mosaic
 GPU lowers in neither form. An fp32 division its one form (`MOSAIC_DIVISION`)."""
 
+CONVERSION_FORMS: Mapping = {
+    ("f32", "bf16"): Work(conversions=0.5), ("f32", "f16"): Work(conversions=0.5),
+    ("f32", "f8"): Work(conversions=0.5),
+    ("bf16", "f32"): Work(integer_operations=1), ("f16", "f32"): Work(operations=1),
+    ("f8", "f32"): Work(conversions=0.5, operations=1), ("f32", "int"): Work(conversions=1, operations=2),
+    ("int", "f32"): Work(conversions=1), ("bf16", "f16"): Work(integer_operations=1, conversions=0.5)}
+"""An element type conversion's issue an element in a Mosaic GPU kernel, by its source's and its target's
+kinds (`_kind`: fp32, bf16, a 16-bit float, an 8-bit float, an integer), from sm90's SASS of a kernel of one
+(FS-CONV-SASS1): a narrowing to a 16- or 8-bit float one F2FP a packed pair (`cvt.rn.bf16x2.f32`,
+`cvt.rn.f16x2.f32`, `cvt.rn.satfinite.e4m3x2.f32`); a bf16 widened by its bits, a PRMT and an IMAD.U32 a
+pair; an fp16 by an HADD2.F32 an element; an e4m3 unpacked to fp16 pairs (F2FP.UNPACK_B) and widened alike;
+an fp32 to an int32 an F2I beside its saturating clamp's two FMNMX; an int32 to an fp32 an I2FP; a bf16 to
+an fp16 through fp32. Any other pair a conversion an element, unmeasured."""
+
 TRITON_FORMS: Mapping = {**{function: Work(exponentials=1) for function in APPROXIMATED},
                          precision.correctly_rounded_divide_p: Work(exponentials=1, operations=6)}
 """A Pallas Triton kernel's forms (`forms_of`): each special function one exponential an element, as a
@@ -1032,6 +1046,19 @@ def _expanded(equation) -> tuple[jax_core.Jaxpr, Sequence] | None:
     return traced.jaxpr, traced.consts
 
 
+def _kind(dtype) -> str:
+    """A dtype's kind as a kernel's conversion reads it (`CONVERSION_FORMS`): fp32, bf16, another 16-bit
+    float, an 8-bit float, an integer, or its own name."""
+    dtype = np.dtype(dtype)
+    if dtype == np.float32:
+        return "f32"
+    if dtype == jnp.bfloat16:
+        return "bf16"
+    if jnp.issubdtype(dtype, jnp.floating):
+        return {2: "f16", 1: "f8"}.get(dtype.itemsize, dtype.name)
+    return "int" if jnp.issubdtype(dtype, jnp.integer) and dtype.itemsize == 4 else dtype.name
+
+
 def _divides_on_cuda(outputs: Sequence, target: generation.GpuTarget | None) -> bool:
     """Whether a division of results `outputs` is an fp32 one on a CUDA multiprocessor (`target`, else the
     process's own), whose MUFU and refinement Dew measured; fp64's and narrower floats' unmeasured."""
@@ -1124,7 +1151,12 @@ def operation_work(primitive, inputs: Sequence, outputs: Sequence, params: Mappi
         form = forms.get(primitive)
         return Work(unpriced_operations=elements) if form is None else repeated(form, elements)
     if primitive is lax.convert_element_type_p:
-        return Work(conversions=sum(_elements(aval) for aval in outputs))
+        elements = sum(_elements(aval) for aval in outputs)
+        if forms in (APPROXIMATE_FORMS, ACCURATE_FORMS):
+            form = CONVERSION_FORMS.get((_kind(inputs[0].dtype), _kind(outputs[0].dtype)))
+            if form is not None:
+                return repeated(form, elements)
+        return Work(conversions=elements)
     if primitive is lax.dot_general_p:
         (contracted, _), _ = params["dimension_numbers"]
         lhs, rhs = inputs[:2]
