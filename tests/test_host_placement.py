@@ -339,24 +339,28 @@ def test_a_banked_loop_of_several_runs_decodes_through_its_passes():
 @pytest.mark.usefixtures("scanned_stacks")
 def test_a_gathered_loop_over_banks_serves_on_a_mesh_as_its_loop():
     """A gathered loop (`Loop.gathered`) over a store banked by run, traced as a server on an FSDP mesh
-    traces it (`placing(FORWARD)`, `Server`'s): its scores and its greedy decode are the same loop's not
-    gathered, bit for bit, each pass reading its run's bank where it lies, where the gathered passes' plain
-    layers asked a lone layer for weights its run's bank holds (the row 12722 review)."""
+    traces it (`placing(FORWARD)`, `Server`'s): its scores and its prefill's decode logits are the same
+    loop's not gathered, bit for bit, each pass reading its run's bank where it lies, where the gathered
+    passes' plain layers asked a lone layer for weights its run's bank holds (the row 12722 review)."""
     from dew.nn.backbones.decoder_stack import Loop
     from dew.nn.sharding import FORWARD, placing
     from dew.training import MeshSpec
 
     mesh = MeshSpec(fsdp=8).build(jax.devices()[:8])
-    greedy = Sampling(temperature=0.0)
     found = {}
     for gathered in (False, True):
         _, scanned, variables, tokens = pair(num_layers=6, bank_layers=2,
                                              loop=Loop(2, layers=(2, 4), gathered=gathered))
         resident = HeldBanks(variables).place(scanned, mesh=mesh, layout=DEVICE)
+
+        def prefilled(store, tokens, model=scanned):
+            rows = tokens.shape[0]
+            cache = model.apply(store, rows, method="init_cache", mutable=["cache"])[1]["cache"]
+            return model.apply({**store, "cache": cache}, tokens, decode=True, mutable=["cache"])[0]
+
         with jax.set_mesh(mesh), placing(FORWARD):
-            scores = np.asarray(jax.jit(scanned.apply)(resident, tokens))
-            decoded = generate(scanned, resident, tokens, 4, key=0, sampling=greedy).host().tokens
-        found[gathered] = scores, decoded
+            found[gathered] = (np.asarray(jax.jit(scanned.apply)(resident, tokens)),
+                               np.asarray(jax.jit(prefilled)(resident, tokens)))
     np.testing.assert_array_equal(found[True][0], found[False][0])
     np.testing.assert_array_equal(found[True][1], found[False][1])
 
