@@ -231,7 +231,14 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
                             target=target, table=table, sources=sources, scales=scales, chosen=chosen,
                             in_key=in_key, initial=hooks is not None and hooks.initial is not None)
     if priced is not None:
-        slices = priced
+        slices, tile, sliced_op, sliced_ba = priced
+        if slices == 1:
+            return planned(config, op, ba, 1)
+        # The priced tile certified as its launch runs it, the streaming walk's own offered past a refusal.
+        certified = sliced_op._certified(
+            sliced_ba, tile, offered=lambda: sliced_op.streaming(sliced_ba, tile, target), decided=tile)
+        if isinstance(certified, attention_mosaic.Tiles):
+            return planned(certified, sliced_op, sliced_ba, slices)
     else:
         # The most slices whose programs keep the device's stream in flight at once (`MosaicForward.streamed`,
         # at most those it holds), where the cost model prices no step of them.
@@ -245,36 +252,39 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
 
 def _priced_slices(query, key, value, spans: KeySpans, hooks: Hooks | None, single: tuple, counts: list[int],
                    *, scale: float | None, target: generation.GpuTarget, table, sources, scales,
-                   chosen: Walk, in_key: bool, initial: bool) -> int | None:
-    """The slice count of `counts` (one beside them, `single`'s launch) whose step the cost model prices
-    least: its walk (`MosaicForward.price_config`, its programs' warps hiding each other's issue intervals)
-    and, past one slice, the merge of its slices (`merged.launch_work`, its passes' waited loads). Each
-    count's config is its derivation's at the key tile its walk streams at (`MosaicForward.streaming`),
-    uncertified here; the chosen one is certified as it launches. None where the model prices some step
-    none: a GH200's B8 over 32768 keys at width 128 walked 346.0 us on 2 slices of K128 and 309.3 on 4 of
-    K64 at two programs a multiprocessor (M-NA-21-gh200), which a walk priced at its device bytes alone
-    ranked level (FS-5274-LAT1)."""
+                   chosen: Walk, in_key: bool, initial: bool) -> tuple | None:
+    """The slice count of `counts` (one beside them, `single`'s launch) and key tile whose step the cost
+    model prices least, with the op and bound arguments of its launch: its walk
+    (`MosaicForward.price_config`, its programs' warps hiding each other's issue intervals) and, past one
+    slice, the merge of its slices (`merged.launch_work`, its passes' waited loads). Each count's tiles are
+    those its derived config's walk may stream at (`MosaicForward.streamings`), uncertified here; the chosen
+    one is certified as it launches; None where the model prices some step none. A GH200's B8 over 32768
+    keys at width 128 walked 346.0 us on 2 slices of K128 and 309.3 on 4 of K64 at two programs a
+    multiprocessor (M-NA-21-gh200), which a walk priced at its device bytes alone ranked level and its
+    programs' issue intervals rank right (FS-5274-LAT1)."""
     config, op, ba = single
-    prices = {1: op.price_config(ba, config, target, issued=True)}
+    prices = {(1, config): (op.price_config(ba, config, target, issued=True), op, ba)}
     for count in counts:
         proposed = _proposed(query, key, value, spans, hooks, scale=scale, target=target, table=table,
                              sources=sources, scales=scales, splits=count, chosen=chosen, in_key=in_key)
         if proposed is None:
             continue
         tiles, sliced_op, sliced_ba = proposed
-        walk = sliced_op.price_config(sliced_ba, tiles, target, issued=True)
-        merge = _merge_seconds(query, value, spans, tiles, count, target=target, initial=initial)
-        prices[count] = None if walk is None else walk + merge
-    if any(price is None for price in prices.values()):
+        for tile in tiles:
+            walk = sliced_op.price_config(sliced_ba, tile, target, issued=True)
+            merge = _merge_seconds(query, value, spans, tile, count, target=target, initial=initial)
+            prices[count, tile] = (None if walk is None else walk + merge, sliced_op, sliced_ba)
+    if any(price is None for price, _, _ in prices.values()):
         return None
-    return min(prices, key=lambda count: (prices[count], count))
+    (count, tile), (_, chosen_op, chosen_ba) = min(
+        prices.items(), key=lambda item: (item[1][0], item[0][0], item[0][1].block_k))
+    return count, tile, chosen_op, chosen_ba
 
 
 def _proposed(query, key, value, spans: KeySpans, hooks: Hooks | None, *, scale: float | None,
               target: generation.GpuTarget, table, sources, scales, splits: int, chosen: Walk, in_key: bool):
-    """`_streamed`'s config, op and bound arguments for `splits` slices, as derived (`MosaicForward.derived`
-    at the key tile its walk streams at, `streaming`), certifying none: a price's proposal. None where none
-    derives."""
+    """The key tiles a launch of `splits` slices may stream at (`MosaicForward.streamings` of its derived
+    config), its op and bound arguments, certifying none: a price's proposals. None where none derives."""
     op, args = attention_mosaic._forward_call(query, key, value, spans, hooks, scale=scale, natural=False,
                                               out_dtype=jnp.float32, masked=hooks is None or hooks.output_mod
                                               is None, splits=splits, table=table, sources=sources,
@@ -282,7 +292,7 @@ def _proposed(query, key, value, spans: KeySpans, hooks: Hooks | None, *, scale:
                                               bounded=chosen.bounded, in_key=in_key)
     ba = op.bind(*args, residuals=Kept.OUTPUT, interpret=False)
     derived = op.derived(ba, target)
-    return None if derived is None else (op.streaming(ba, derived, target), op, ba)
+    return None if derived is None else (op.streamings(ba, derived, target), op, ba)
 
 
 def _merge_seconds(query, value, spans: KeySpans, config: attention_mosaic.Tiles, slices: int, *,

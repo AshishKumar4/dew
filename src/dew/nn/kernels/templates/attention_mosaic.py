@@ -903,20 +903,13 @@ class MosaicForward(_Mainloop[Tiles]):
         in_flight = self._in_flight(ba, config, target)
         if in_flight is None:
             return config
-        query = ba.arguments["query"]
-        family = bundle_of(config, query.dtype, target=target)
         # Its key tiles dividing the call's keys alone: a tile past them pads the whole cache, its keys and
         # values copied a step (`padded_call`; a 96-key tile over 32768, 383 us a step on an A100,
         # M-DD-5 W16, as long as its launch). A multiprocessor's bytes in flight are its resident programs'
         # together (`resident`): a larger tile holding fewer of them keeps no more in flight (an A100's
         # 16-row d64 decode at 256-key tiles staged 146 KB, one program a multiprocessor, 1.17x the hand
         # kernel's five resident programs of 20 KB, M-DD-7 W34).
-        dividing = [launched for launched in (
-                        self._launchable(ba, dataclasses.replace(config, block_k=extent), target)
-                        for extent in reversed(walked_extents(family, query.dtype, config.block_k,
-                                                              parts=self.parts))
-                        if self.keys % extent == 0)
-                    if launched is not None]
+        dividing = self._dividing(ba, config, target)
         picked = config
         for candidate in dividing:
             held = self.resident(ba, candidate, target)
@@ -929,9 +922,31 @@ class MosaicForward(_Mainloop[Tiles]):
             # 84.5 of its 134 us a step at width 128 (M-ET-70), where its 128-key walk alone is 49.5.
             if self.keys % config.block_k and dividing:
                 picked = dividing[-1]
-        slice_tiles = math.ceil(math.ceil(_keys(ba) / self.splits) / picked.block_k)
-        want = min(3, slice_tiles // 2)
-        return self._deepened(ba, picked, target, want=want)
+        return self._streamed_ring(ba, picked, target)
+
+    def streamings(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget
+                   ) -> tuple[Tiles, ...]:
+        """Each key tile a memory-bound walk of `config` may stream at (`streaming`'s offers: the launchable
+        tiles dividing the call's keys, least first, else `config`), its ring deepened as `streaming`
+        deepens it: a priced choice's candidates (`attention_decode._priced_slices`)."""
+        return tuple(self._streamed_ring(ba, tile, target)
+                     for tile in (self._dividing(ba, config, target) or [config]))
+
+    def _dividing(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget
+                  ) -> list[Tiles]:
+        """`config`'s launchable key tiles dividing the call's keys (`_launchable`), least first."""
+        family = bundle_of(config, ba.arguments["query"].dtype, target=target)
+        return [launched for launched in (
+            self._launchable(ba, dataclasses.replace(config, block_k=extent), target)
+            for extent in reversed(walked_extents(family, ba.arguments["query"].dtype, config.block_k,
+                                                  parts=self.parts))
+            if self.keys % extent == 0)
+                if launched is not None]
+
+    def _streamed_ring(self, ba: tokamax.BoundArguments, tile: Tiles, target: generation.GpuTarget) -> Tiles:
+        """`tile`'s ring as a streaming walk deepens it: up to three stages, half a slice's key tiles."""
+        slice_tiles = math.ceil(math.ceil(_keys(ba) / self.splits) / tile.block_k)
+        return self._deepened(ba, tile, target, want=min(3, slice_tiles // 2))
 
     def streamed(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
         """The programs a multiprocessor runs at once to keep its share of the device's stream in flight at
