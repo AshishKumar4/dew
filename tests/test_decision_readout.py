@@ -379,7 +379,8 @@ def test_a_decision_models_exit_logits_run_each_later_pass_over_its_rows_still_l
     # Each row's first pass's exit chance (its row gate's logit, one a row), the threshold between the
     # fourth and fifth largest: four rows exit at the first pass, four loop on.
     _, sown = objective.model.observed_logits(variables, batch, opened=(EXITS,))
-    first = np.sort(1 / (1 + np.exp(-np.asarray(sown[EXITS]["logits"][0], np.float64)[:, 0])))
+    logit = np.asarray(sown[EXITS]["logits"][0], np.float64).reshape(len(batch.tokens), -1)[:, 0]
+    first = np.sort(1 / (1 + np.exp(-logit)))
     threshold = float((first[3] + first[4]) / 2)
     assert first[3] < threshold < first[4]
     model = DecisionModel(looped.clone(loop=dataclasses.replace(looped.loop, exit_threshold=threshold)),

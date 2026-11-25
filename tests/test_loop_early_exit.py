@@ -181,8 +181,9 @@ def test_a_pass_runs_over_the_rows_still_looping_alone(opened, shared):
     exit passes alone, as a decision model's scoring does (`DecisionModel.exit_logits`), which are sown
     once over every row after the passes: its logits and each row's exit pass those of a call whose passes
     run over every row (one opening a collection beside them, which a pass may write a row of), whether
-    the call's positions are each row's or one `[S]` every row shares, which no bucket gathers."""
-    looped = _rows_exiting()
+    the call's positions are each row's or one `[S]` every row shares, which no bucket gathers (read by the
+    rotary attention of the block [2, 4) that loop loops)."""
+    looped = _rows_exiting(layers=(2, 4)) if shared else _rows_exiting()
     variables, ids = _gated(model_draw(looped, (8, 12), looped.vocab_size), looped.emb_features, 0xE95)(0)
     fields = {"positions": jnp.arange(ids.shape[1]) + 3} if shared else {}
     scored = functools.partial(looped.apply, mutable=list(opened), **fields) if opened else looped.apply
