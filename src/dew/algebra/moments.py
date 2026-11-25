@@ -20,15 +20,20 @@ SATURATION = program.Saturation(growth=64, depth=4)
 """Derivation limits for central-moment walks."""
 
 
-def weighted_moments(x: jax.Array, w: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """Weighted `(mean, variance)` of `x` along its last axis under nonnegative weights `w`, zero where
-    total weight is zero."""
+def _weighted_moments_with_total(x: jax.Array, w: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Weighted `(mean, variance, total_weight)` of `x` along its last axis under nonnegative `w`."""
     n = jnp.sum(w, axis=-1)
     safe_n = jnp.where(n > 0, n, jnp.ones_like(n))
     mean = jnp.sum(w * x, axis=-1) / safe_n
     diff = x - mean[..., None]
     m2 = jnp.sum(w * diff * diff, axis=-1)
-    return mean, m2 / safe_n
+    return mean, m2 / safe_n, n
+
+
+def weighted_moments(x: jax.Array, w: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Weighted `(mean, variance)` of `x` along its last axis under nonnegative weights `w`, zero where
+    total weight is zero."""
+    return _weighted_moments_with_total(x, w)[:2]
 
 
 def masked_moments(x: jax.Array, mask: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -42,8 +47,10 @@ def masked_moments(x: jax.Array, mask: jax.Array) -> tuple[jax.Array, jax.Array]
     return mean, m2 / safe_n
 
 
-def weighted_covariance(x: jax.Array, y: jax.Array, w: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Weighted `(mean_x, mean_y, covariance)` of `(x, y)` along their last axis under nonnegative `w`."""
+def _weighted_cov_with_total(
+    x: jax.Array, y: jax.Array, w: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Weighted `(mean_x, mean_y, covariance, total_weight)` of `(x, y)` along their last axis."""
     n = jnp.sum(w, axis=-1)
     safe_n = jnp.where(n > 0, n, jnp.ones_like(n))
     mean_x = jnp.sum(w * x, axis=-1) / safe_n
@@ -51,7 +58,12 @@ def weighted_covariance(x: jax.Array, y: jax.Array, w: jax.Array) -> tuple[jax.A
     dx = x - mean_x[..., None]
     dy = y - mean_y[..., None]
     cov = jnp.sum(w * dx * dy, axis=-1) / safe_n
-    return mean_x, mean_y, cov
+    return mean_x, mean_y, cov, n
+
+
+def weighted_covariance(x: jax.Array, y: jax.Array, w: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Weighted `(mean_x, mean_y, covariance)` of `(x, y)` along their last axis under nonnegative `w`."""
+    return _weighted_cov_with_total(x, y, w)[:3]
 
 
 @functools.cache
@@ -76,6 +88,19 @@ def derived(kind: Literal["weighted", "masked", "covariance"], rank: int = 2, *,
     return derive.derive(declaration(kind, rank), accurate=accurate, saturation=SATURATION)
 
 
+@functools.cache
+def _derived_with_total(kind: Literal["weighted", "covariance"], rank: int = 2) -> Derived:
+    """Derived forms exposing total weight `n` as the final declared output (no extra reduction slot)."""
+    axes = (*(f"d{i}" for i in range(rank - 1)), "walked")
+    if kind == "weighted":
+        red = derive.Reduction(_weighted_moments_with_total, {"x": axes, "w": axes}, walked="walked",
+                               ranges={"w": (0.0, math.inf)})
+    else:
+        red = derive.Reduction(_weighted_cov_with_total, {"x": axes, "y": axes, "w": axes}, walked="walked",
+                               ranges={"w": (0.0, math.inf)})
+    return derive.derive(red, accurate=False, saturation=SATURATION)
+
+
 def _tiled(operands: dict[str, jax.Array], tile: int) -> dict[str, jax.Array]:
     """Broadcast `operands` to one rank >= 1 shape and reshape `(..., n_tiles * tile)` to
     `(n_tiles, ..., tile)` so scans and vmapped tree merges trace one tile body."""
@@ -93,16 +118,13 @@ def _tiled(operands: dict[str, jax.Array], tile: int) -> dict[str, jax.Array]:
             for name, value in common.items()}
 
 
-def _eval_derived(kind: Literal["weighted", "masked", "covariance"], tiled: dict[str, jax.Array],
-                  mode: Literal["walk", "merge"]):
+def _eval_derived(forms: Derived, tiled: dict[str, jax.Array], mode: Literal["walk", "merge"]):
     first = {name: tile_stack[0] for name, tile_stack in tiled.items()}
-    rank = next(iter(first.values())).ndim
-    forms = derived(kind, rank)
     shapes = {name: (value.shape, value.dtype) for name, value in first.items()}
     empty = forms.init(shapes)
     if mode == "walk":
         state, _ = jax.lax.scan(lambda carry, chunk: (forms.step(carry, chunk), None), empty, tiled)
-        return state, forms.finish(state, first, shapes=shapes)
+        return forms.finish(state, first, shapes=shapes)
     partials = jax.vmap(lambda chunk: forms.step(empty, chunk))(tiled)
     while partials[0].shape[0] > 1:
         count = partials[0].shape[0]
@@ -115,18 +137,17 @@ def _eval_derived(kind: Literal["weighted", "masked", "covariance"], tiled: dict
             merged = jax.tree.map(lambda a, b: jnp.concatenate([a, b], axis=0), merged, tail)
         partials = merged
     final = jax.tree.map(lambda state: state[0], partials)
-    return final, forms.finish(final, first, shapes=shapes)
+    return forms.finish(final, first, shapes=shapes)
 
 
 def _weighted_term(tw: jax.Array, operand: jax.Array, sn: jax.Array) -> jax.Array:
-    """Range-safe `(tw / sn) * operand`, preserving `tw` derivatives at `tw == 0` and `n == 0`."""
-    safe_operand = jnp.where((tw > 0) | jnp.isfinite(operand), operand, 0.0)
+    """Range-safe `(tw / sn) * operand`, strictly linear in `operand` and preserving `tw` derivatives."""
     small_tw = (tw <= 1.0) & (sn > 1.0)
     tw_mf = jnp.where(small_tw, tw, 0.0)
     sn_mf = jnp.where(small_tw, sn, 1.0)
     tw_df = jnp.where(small_tw, 0.0, tw)
     sn_df = jnp.where(small_tw, 1.0, sn)
-    return jnp.where(small_tw, (tw_mf * safe_operand) / sn_mf, (tw_df / sn_df) * safe_operand)
+    return jnp.where(small_tw, (tw_mf * operand) / sn_mf, (tw_df / sn_df) * operand)
 
 
 def _split_range(mask: jax.Array, sn: jax.Array, *values: jax.Array):
@@ -176,8 +197,8 @@ def _cov_tangent_tile(
     cy = ty - mu_y[..., None]
     d_mx = jnp.sum(_weighted_term(tw, dtx, sn) + _safe_tangent_div(dtw, tx - mu_x_pos, sn), axis=-1)
     d_my = jnp.sum(_weighted_term(tw, dty, sn) + _safe_tangent_div(dtw, ty - mu_y_pos, sn), axis=-1)
-    pw_cy = _weighted_term(tw, cy, sn)
-    pw_cx = _weighted_term(tw, cx, sn)
+    pw_cy = _weighted_term(tw, jnp.where((tw > 0) | jnp.isfinite(cy), cy, 0.0), sn)
+    pw_cx = _weighted_term(tw, jnp.where((tw > 0) | jnp.isfinite(cx), cx, 0.0), sn)
     cov_term = jnp.where(pos, cov[..., None], 0.0)
     half_max = jnp.asarray(0.5 * jnp.finfo(cx.dtype).max, cx.dtype)
     x_ge_y = jnp.abs(cx) >= jnp.abs(cy)
@@ -242,8 +263,8 @@ def _tiled_tangents(
 
 def _chunked_weighted_primal(x: jax.Array, w: jax.Array, tile: int,
                              mode: Literal["walk", "merge"]) -> tuple[jax.Array, jax.Array, jax.Array]:
-    state, (mean, var) = _eval_derived("weighted", _tiled({"x": x, "w": w}, tile), mode)
-    return mean, var, state[0]
+    tiled = _tiled({"x": x, "w": w}, tile)
+    return _eval_derived(_derived_with_total("weighted", tiled["x"].ndim - 1), tiled, mode)
 
 
 def _chunked_weighted_jvp(tile: int, mode: Literal["walk", "merge"], primals, tangents):
@@ -261,8 +282,8 @@ _run_chunked_weighted = contracted("test_chunked_moments_holds_every_order")(
 def _chunked_cov_primal(
     x: jax.Array, y: jax.Array, w: jax.Array, tile: int, mode: Literal["walk", "merge"],
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    state, (mean_x, mean_y, cov) = _eval_derived("covariance", _tiled({"x": x, "y": y, "w": w}, tile), mode)
-    return mean_x, mean_y, cov, state[0]
+    tiled = _tiled({"x": x, "y": y, "w": w}, tile)
+    return _eval_derived(_derived_with_total("covariance", tiled["x"].ndim - 1), tiled, mode)
 
 
 def _chunked_cov_jvp(tile: int, mode: Literal["walk", "merge"], primals, tangents):
@@ -303,7 +324,8 @@ def chunked_moments(x: jax.Array, w: jax.Array, *, tile: int,
     if w_arr.dtype == jnp.bool_:
         out_dtype = _floating_dtype(x_arr)
         work = _working_dtype(out_dtype)
-        _, finished = _eval_derived("masked", _tiled({"x": x_arr.astype(work), "mask": w_arr}, tile), mode)
+        tiled = _tiled({"x": x_arr.astype(work), "mask": w_arr}, tile)
+        finished = _eval_derived(derived("masked", tiled["x"].ndim - 1), tiled, mode)
         return _cast_back(finished, work, out_dtype)
     out_dtype = _floating_dtype(x_arr, w_arr)
     work = _working_dtype(out_dtype)

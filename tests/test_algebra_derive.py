@@ -1170,13 +1170,21 @@ def test_chunked_moments_directed_overflow_mixed_zero_weight_and_direct_jvp():
             got_hv = jax.jvp(lambda w_, fn=ch_dv_dx: fn(x_zm, w_), (w_zm,), (dw_unit,))[1]
             np.testing.assert_array_equal(np.asarray(got_hm), np.asarray(ref_hm))
             np.testing.assert_array_equal(np.asarray(got_hv), np.asarray(ref_hv))
+            # Jitted value VJP with zero individual weights must stay linear in value tangents.
+            got_gx_m = jax.jit(ch_dm_dx)(x_zm, w_zm)
+            got_gx_v = jax.jit(ch_dv_dx)(x_zm, w_zm)
+            np.testing.assert_array_equal(np.asarray(got_gx_m), np.asarray(plain_dm_dx(x_zm, w_zm)))
+            np.testing.assert_array_equal(np.asarray(got_gx_v), np.asarray(plain_dv_dx(x_zm, w_zm)))
 
-    # Direct `derive.derive` forms (without `chunked_moments` custom tangent) preserve zero-weight JVP.
+    # Direct `derive.derive` forms (without `chunked_moments` custom tangent) preserve zero-weight JVP
+    # without `L^2` overflow on `x=[2^70, 2^70]`, `w=[1, 0]` (or `[0, 1]`), both via `step` and `merge`.
     forms_w = derive.derive(moments.declaration("weighted"), accurate=False, saturation=SATURATION)
     shapes_w = dict.fromkeys(("x", "w"), ((1, 1), jnp.float32))
     for x_dir, w_dir, dw_dir, exp_dm, exp_dv in (
         ([[0.0, 2.0]], [[1.0, 0.0]], [[0.0, 1.0]], 2.0, 4.0),
         ([[10.0, 12.0]], [[1.0, 0.0]], [[0.0, 1.0]], 2.0, 4.0),
+        ([[float(scale_ov), float(scale_ov)]], [[1.0, 0.0]], [[0.0, 1.0]], 0.0, 0.0),
+        ([[float(scale_ov), float(scale_ov)]], [[0.0, 1.0]], [[1.0, 0.0]], 0.0, 0.0),
         ([[3.0, 5.0]], [[0.0, 0.0]], [[1.0, 2.0]], 13.0, 59.0),
     ):
         xd, wd, dwd = (jnp.asarray(v, jnp.float32) for v in (x_dir, w_dir, dw_dir))
@@ -1193,6 +1201,9 @@ def test_chunked_moments_directed_overflow_mixed_zero_weight_and_direct_jvp():
 
             _, (dm_dir, dv_dir) = jax.jvp(direct_walk, (wd,), (dwd,))
             assert float(dm_dir[0]) == exp_dm and float(dv_dir[0]) == exp_dv
+            if exp_dv == 0.0:
+                gw_v = jax.grad(lambda w_, fn=direct_walk: fn(w_)[1].sum())(wd)
+                np.testing.assert_array_equal(np.asarray(gw_v), np.zeros((1, 2), np.float32))
 
 
 def test_chunked_moments_balances_unequal_scales_value_gradients_and_explicit_sharding():
