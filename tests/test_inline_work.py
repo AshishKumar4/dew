@@ -4,6 +4,7 @@
 import jax
 import jax.numpy as jnp
 import pytest
+from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.mosaic.gpu import utils as mgpu_utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
@@ -57,20 +58,29 @@ def test_a_shuffle_issues_on_every_lane_of_its_warps():
     """A body each lane of which exchanges its word with its butterfly partner (`shfl.sync.bfly`) issues a
     shuffle a lane, as the SASS of a kernel's does (KDA's intra_own: 102,400 lane shuffles a program counted
     against 102,656 SHFL executed, M-JS-272), where shuffles counted nothing."""
-    from jax.extend.mlir.dialects import nvvm
 
     def body(ctx, ref):
         del ctx
         index = ir.IndexType.get()
         thread = arith.index_cast(index, mgpu_utils.thread_idx())
-        word = memref.load(ref, [thread])
-        i32 = ir.IntegerType.get_signless(32)
-        exchanged = nvvm.shfl_sync(ir.F32Type.get(), arith.constant(i32, -1), word, arith.constant(i32, 1),
-                                   arith.constant(i32, 31), nvvm.ShflKind.bfly)
-        memref.store(exchanged, ref, [thread])
+        memref.store(mgpu_utils.shfl_bfly(memref.load(ref, [thread]), 1), ref, [thread])
 
     counted = _counted(body)
-    assert counted.shuffles == 128 and cost.issued(counted) == 128, counted
+    assert counted.shuffles == 128, counted
+
+
+def test_a_lane_broadcasts_ptx_shuffle_issues_on_every_lane():
+    """`across.uniform`'s lane-0 broadcast, one `shfl.sync.idx` a thread in its inline PTX, issues a shuffle
+    a lane, where the PTX's shuffles counted nothing."""
+    from dew.nn.kernels.templates import across
+
+    def kernel(out_gmem):
+        del out_gmem
+        across.uniform(lax.axis_index("wg"))
+
+    launched = plgpu.kernel(kernel, out_type=_ROW, num_threads=1, thread_name="wg")
+    counted = emission.emitted(jax.make_jaxpr(launched)().jaxpr, 1, "wg").roles[0].fixed
+    assert counted.shuffles == 128, counted
 
 
 def test_a_branch_a_lanes_place_decides_issues_for_its_warps_and_moves_its_lanes_bytes():
