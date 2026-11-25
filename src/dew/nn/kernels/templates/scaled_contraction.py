@@ -498,15 +498,13 @@ def _transpose(cotangent, *arrays, form: Form):
             read = set(form.out).union(*(form.subscripts[index] for group in groups for index, _ in group
                                          if index != linear))
             unread = "".join(letter for letter in subscript if letter not in read)
-            # Its own group, as `_batched` places its unit operand: in `pulled`'s group its disjoint letters
-            # would form their outer product inside `_held` (attention's `bhgqdk`, 8 GiB each, row 12979).
-            extra: tuple[tuple[Factor, ...], ...] = ()
+            extra: tuple[Factor, ...] = ()
             if unread:
                 operands.append(jnp.ones([array.aval.shape[subscript.index(letter)] for letter in unread],
                                          array.aval.dtype))
                 subscripts.append(unread)
-                extra = (((len(operands) - 1, 1),),)
-            pulled_term = (sign, (*(group for group in rest if group), ((pulled, 1), *below), *extra))
+                extra = ((len(operands) - 1, 1),)
+            pulled_term = (sign, (*(group for group in rest if group), ((pulled, 1), *below, *extra)))
             (rounded.setdefault(marks[t], []) if t in marks else terms).append(pulled_term)
         if not terms and not rounded:
             # An operand no term reads (a sum's operand its own transpose carried along): no cotangent.
