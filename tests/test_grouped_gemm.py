@@ -1708,13 +1708,18 @@ def test_hopper_cluster2_balanced_tail_lowers_spill_free():
         ba_dw = tgmm.bind(x_dw, dy_dw, sizes, out_dtype="float32", interpret=False, dense=True)
         tile_c2_split = dataclasses.replace(tile_c2, splits=2)
         assert gmm.legal(ba_fwd, tile_c2, sm90) and gmm.balanced(ba_fwd, tile_c2, sm90)
-        assert gmm.legal(ba_fwd, tile_c2_split, sm90) and not gmm.balanced(ba_fwd, tile_c2_split, sm90)
-        assert gmm._stated(ba_fwd, tile_c2_split, sm90)["balanced"] is False
+        # Split two ways its 2048 rows' fp32 partials (40 MiB) are past the workspace, pinned or derived
+        # (row 12850); 1024 rows' (20 MiB) within it, and a split tile takes no tail.
+        assert not gmm.legal(ba_fwd, tile_c2_split, sm90)
+        ba_half = gmm.bind(jax.ShapeDtypeStruct((1024, 8192), jnp.bfloat16), w_fwd, sizes,
+                           out_dtype="bfloat16", trans_rhs=False, interpret=False, dense=True)
+        assert gmm.legal(ba_half, tile_c2_split, sm90) and not gmm.balanced(ba_half, tile_c2_split, sm90)
+        assert gmm._stated(ba_half, tile_c2_split, sm90)["balanced"] is False
         assert tgmm.legal(ba_dw, tile_c2, sm90) and tgmm.balanced(ba_dw, tile_c2, sm90)
         cases = [
             KernelCase("sm90_cluster2_tail_fwd", lambda: _traced_on(sm90, *gmm.lowering(ba_fwd, tile_c2))),
             KernelCase("sm90_cluster2_split2_fwd",
-                       lambda: _traced_on(sm90, *gmm.lowering(ba_fwd, tile_c2_split))),
+                       lambda: _traced_on(sm90, *gmm.lowering(ba_half, tile_c2_split))),
             KernelCase("sm90_cluster2_tail_dw", lambda: _traced_on(sm90, *tgmm.lowering(ba_dw, tile_c2))),
         ]
         records = compile_mosaic_kernels(cases, "sm90")
@@ -2268,8 +2273,8 @@ def test_explicit_target_b200_gathered_settles_under_ambient_sm80():
 def test_a100_deep_k_dense_dx_derives_l2_drift_split_and_compiles():
     """On `walks_scoped` A100 (`sm80`, L2=40MB), `SplitWalk` prices a deep-K dense wave past the L2 drift
     horizon (`8192x51200->5120`, `M-FS-6`, row 5363) faster split than unsplit while shallower shapes and
-    Hopper `sm90` price unsplit least; derived tiles stay legal and a pinned `splits=2` `sm80` tile compiles
-    spill-free."""
+    Hopper `sm90` price unsplit least; derived tiles stay legal, a split whose partials pass the reference's
+    workspace is none (row 12850), and a pinned `splits=2` `sm80` tile within it compiles spill-free."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels
 
@@ -2300,11 +2305,16 @@ def test_a100_deep_k_dense_dx_derives_l2_drift_split_and_compiles():
             assert tile is not None and launch.legal(ba, tile, target), tile
             walk = walk_of(tile, target, depth_k, width_n)
             assert walk is not None and walk.seconds(1) <= walk.seconds(2), (depth_k, walk)
+        # Its 8192 rows' fp32 partials split two ways (320 MiB) are past the 4 MiB workspace cuBLAS holds
+        # (row 12850), so the drift's split is no tile's, pinned or derived; 64 rows' (2.6 MiB) compile split.
         pinned = dataclasses.replace(deep_tile, splits=2)
-        assert launch.legal(deep_ba, pinned, target), pinned
+        assert not launch.legal(deep_ba, pinned, target) and launch.derived(deep_ba, target).splits == 1
+        few_ba = launch.bind(bf16((64, 51200)), bf16((1, 5120, 51200)), one, out_dtype="bfloat16",
+                             trans_rhs=True, interpret=False, dense=True)
+        assert launch.legal(few_ba, pinned, target), pinned
         if generation.compile_only_gpus("sm80"):
             records = compile_mosaic_kernels(
-                [KernelCase("sm80_deep_k_split_dx", lambda: launch.lowering(deep_ba, pinned))], "sm80")
+                [KernelCase("sm80_deep_k_split_dx", lambda: launch.lowering(few_ba, pinned))], "sm80")
             for rec in records:
                 assert not rec.get("error"), rec
                 assert rec["kernels"], rec

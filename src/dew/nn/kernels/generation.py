@@ -613,12 +613,13 @@ class GpuTarget:
 
     @property
     def reference_workspace(self) -> int | None:
-        """The device memory XLA hands one cuBLAS GEMM as its workspace on this GPU, its library's rule by
+        """The nominal ceiling XLA sets for one cuBLAS GEMM's workspace on this GPU, its library's rule by
         compute capability: 32 MiB from Hopper on, 4 MiB before (xla/service/gpu/matmul_utils.h's
-        `kHopperWorkspace` and `kDefaultWorkspace`, applied by xla/backends/gpu/transforms/gemm_rewriter.cc).
-        A template's launch holds no more beside its operands and outputs (a split's fp32 partials, a
-        balanced tail's), its peak memory on par with the reference's (kernel-templates.md §1); None off a
-        CUDA GPU."""
+        `kHopperWorkspace` and `kDefaultWorkspace`, applied by xla/backends/gpu/transforms/gemm_rewriter.cc,
+        which clamps a legacy GEMM's to its operands' bytes). A template's launch holds no more beside its
+        operands and outputs (a split's fp32 partials, a balanced tail's, `pricing.within_workspace`); its
+        peak-memory parity with the reference (kernel-templates.md §1) is measured apart. None off a CUDA
+        GPU."""
         found = capability(self.generation)
         if found is None:
             return None

@@ -1073,7 +1073,18 @@ class MosaicGmm(_Mosaic):
             # A decode step's partials hold its rows, a TMA descriptor's whole 8s of them.
             held=-(-rows // row_tiles.TMA_ROWS) * row_tiles.TMA_ROWS,
             operands=self._operand_bytes(ba, tile), stored=_stored_bytes(ba, rows, width),
-            multiprocessors=_multiprocessors(target))
+            multiprocessors=_multiprocessors(target), partial_bytes=self._slice_bytes(ba))
+
+    def _slice_bytes(self, ba) -> int:
+        """One depth slice's fp32 partials as a split launch declares them (`mosaic_gpu._declared`): its
+        walked rows (a gathered call's table's, else its rows'; a scattered call's no more than those),
+        padded to a TMA descriptor's whole rows, by its width."""
+        from .templates.gemm import row_tiles
+
+        gather = ba.arguments.get('gather')
+        rows = ba.arguments['tokens'].shape[0] if gather is None else gather.shape[0]
+        width = ba.arguments['kernel'].shape[1 if ba.arguments['trans_rhs'] else 2]
+        return -(-rows // row_tiles.TMA_ROWS) * row_tiles.TMA_ROWS * width * 4
 
     def _operand_bytes(self, ba, tile: tiling.Tiles) -> tuple[tuple[float, float], tuple]:
         """The bytes an element of the products' left and right operands moves from device memory at `tile`
@@ -1200,13 +1211,16 @@ class MosaicGmm(_Mosaic):
         if ba.arguments.get('chained') and not self._takes_chained(ba, config, target):
             return False
         # A split is a decode step's (a dense call's, swapped or not, or a grouped one's), each run some
-        # steps, of no exact sums or pair products (`mosaic_gpu._pair_refused`): their runs sum exactly
-        # (`mosaic_gpu.gmm`), but an A100's exact input gradient split four ways at 64 x 128 x 32 (six stages,
-        # two programs) spilled 24 bytes where its register model held 187 (the GEMM compile gate, EM-G1),
-        # its runs' traced steps beside the running sum.
+        # steps, its partials within the reference's workspace (`pricing.within_workspace`, a pinned or
+        # cached tile's as a derived one's, row 12850), of no exact sums or pair products
+        # (`mosaic_gpu._pair_refused`): their runs sum exactly (`mosaic_gpu.gmm`), but an A100's exact input
+        # gradient split four ways at 64 x 128 x 32 (six stages, two programs) spilled 24 bytes where its
+        # register model held 187 (the GEMM compile gate, EM-G1), its runs' traced steps beside the running
+        # sum.
         depth = ba.arguments['tokens'].shape[1]
         if config.splits > 1 and (
-                ba.arguments['exact_sums'] or self._scaled or ba.arguments.get('paired') is not None
+                not pricing.within_workspace(target, config.splits * self._slice_bytes(ba))
+                or ba.arguments['exact_sums'] or self._scaled or ba.arguments.get('paired') is not None
                 or ba.arguments['hooks'].prologue is not None or ba.arguments['hooks'].epilogue is not None
                 or pricing.family_of(config, ba.arguments['tokens'].dtype, target).pairs_product
                 or not mosaic_gpu.split_runs(-(-depth // config.block_k), config.splits)):
@@ -1675,7 +1689,8 @@ class MosaicTgmm(_Mosaic):
                 'stored': jnp.dtype(ba.arguments['out_dtype']).itemsize,
                 'multiprocessors': _multiprocessors(target),
                 'step_seconds': pricing.step_seconds(tile, target, itemsizes),
-                'bandwidth': target.memory_rate, 'launch_seconds': target.launch_seconds, 'target': target}
+                'bandwidth': target.memory_rate, 'launch_seconds': target.launch_seconds, 'target': target,
+                'partial_bytes': self._slice_bytes(ba, target)}
 
     def _partials(self, ba):
         """The call `ba` writing fp32 partials, as a split's slices do (`mosaic_gpu.tgmm`): each slice a group
@@ -1719,9 +1734,18 @@ class MosaicTgmm(_Mosaic):
 
         if config.splits > 1 and (
                 self.K_MAJOR
-                or pricing.family_of(config, ba.arguments['tokens'].dtype, target).pairs_product):
+                or pricing.family_of(config, ba.arguments['tokens'].dtype, target).pairs_product
+                or not pricing.within_workspace(target, config.splits * self._slice_bytes(ba, target))):
             return False
         return super()._legal(ba, config, target)
+
+    def _slice_bytes(self, ba, target) -> int:
+        """One depth slice's fp32 partials as a split launch declares them (`_partials`: each group's
+        `[depth, width]`, at the call's aligned extents, `_contraction`), the bound a pinned or cached split
+        holds as a derived one does (`pricing.within_workspace`, row 12850)."""
+        aligned = self._aligned(ba, target)
+        depth, _, width = self._generated_extents(aligned)
+        return aligned.arguments['sizes'].shape[0] * depth * width * 4
 
     def candidate(self, ba, config: tiling.Tiles, target) -> bool:
         """`_Mosaic.candidate` on a family whose products read registers loading its transposed stage in whole
