@@ -1275,7 +1275,7 @@ def _mosaic_layout(hooks, roles: tuple[tuple[str, int], ...], operands: Sequence
         bound=hooks.inverse_bound, rounded=rounded, apart=hooks.apart, values_gated=values_gated)
     _, ba = bound_call.bound["mosaic_gpu"]
     tiles = template.MOSAIC.taken(ba)
-    if tiles is None:
+    if not isinstance(tiles, mainloop.Tiles):
         return None
     active_tiles = tiles if keeps else (tiles.forward or tiles)
     family, interpret = mainloop.issued(common_dt)

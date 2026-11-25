@@ -1791,14 +1791,15 @@ def test_recurrence_recognition_guards_later_chunk_carry_lossy_norm_and_reads_ke
     roles = (("query", 1), ("key", 2), ("value", 3), ("log_decay", 4), ("beta", 5))
     delta_hooks = recurrence.Hooks(decay="scalar", delta=True)
     wg_hooks = recurrence.Hooks(decay="scalar", delta=False, write_gate=True)
-    with generation.assumed("sm80"):
-        sm80_delta = recognize._recurrence_kernel_layout(
-            "mosaic_gpu", delta_hooks, roles, vars_f32, jnp.float32, jnp.float32, keeps=False)
-    with generation.assumed("sm90"):
-        sm90_delta = recognize._recurrence_kernel_layout(
-            "mosaic_gpu", delta_hooks, roles, vars_f32, jnp.float32, jnp.float32, keeps=False)
-        sm90_wg = recognize._recurrence_kernel_layout(
-            "mosaic_gpu", wg_hooks, roles, vars_bf16, jnp.bfloat16, jnp.bfloat16, keeps=False)
+    with jax.default_matmul_precision("default"):
+        with generation.assumed("sm80"):
+            sm80_delta = recognize._recurrence_kernel_layout(
+                "mosaic_gpu", delta_hooks, roles, vars_f32, jnp.float32, jnp.float32, keeps=False)
+        with generation.assumed("sm90"):
+            sm90_delta = recognize._recurrence_kernel_layout(
+                "mosaic_gpu", delta_hooks, roles, vars_f32, jnp.float32, jnp.float32, keeps=False)
+            sm90_wg = recognize._recurrence_kernel_layout(
+                "mosaic_gpu", wg_hooks, roles, vars_bf16, jnp.bfloat16, jnp.bfloat16, keeps=False)
     assert sm80_delta is not None and sm80_delta[:2] == (jnp.dtype(jnp.float32), 10)
     assert sm90_delta is not None and sm90_delta[:2] == (jnp.dtype(jnp.float32), 15)
     assert sm90_wg is not None and sm90_wg[:2] == (jnp.dtype(jnp.float32), 23)
