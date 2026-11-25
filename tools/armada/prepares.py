@@ -348,10 +348,16 @@ def entries(ci, python: str, timings: dict, target: float, cache: str, stamped: 
                for index, held in enumerate(ci.kept_tasks(python, found, target), start=1)]
     return entries + [
         {"name": f"{python}-prepare-{index}", "python": python, "tests": TOKEN + name, "split": group,
-         "rows": [ci.row(python, name, group)], **stamped,
+         "rows": [ci.row(python, name, group)], **stamped, "size": SIZE,
          "weight": measured.get(ci.row(python, name, group), PREPARE_SECONDS)
          + (ci.COLD_SECONDS if cache != "on" else 0.0)}
         for index, (name, group) in enumerate(rows_, start=1) if (name, group) not in found]
+
+
+SIZE = "large"
+"""The container a dry prepare runs on: it compiles a GPU group's programs on the CPU, which a medium's 10 GiB
+does not hold (test_gpu_recurrence.py#9/11's prepare peaked at the medium's whole 10 GiB, alone in 1,431 s, and
+was killed beside other tasks in train 1269). Its tests' recorded peaks, their CPU runs', do not size it."""
 
 
 BOOTSTRAP = "bootstrap"
