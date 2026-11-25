@@ -120,7 +120,7 @@ def emitted(body: jax_core.Jaxpr, warpgroups: int, axis: str | None, *, device: 
         for index in range(warpgroups):
             counting = _Counting(axis, index, forms=forms, arrivals=arrivals)
             counting.run(body, values)
-            roles.append(Role(sum(counting.hoisted.values(), counting.fixed), tuple(counting.walks)))
+            roles.append(Role(counting.held(), tuple(counting.walks)))
         return roles
 
     roles = counted()
@@ -882,6 +882,13 @@ class _Counting:
         else:
             self.fixed = self.fixed + found.work
 
+    def held(self) -> Work:
+        """Its work outside its walks and what it hoisted out of its loops (`hoisted`), together."""
+        total = self.fixed
+        for work in self.hoisted.values():
+            total = total + work
+        return total
+
     def expanded(self, equation) -> tuple[jax_core.Jaxpr, Sequence] | None:
         """`equation`'s expansion (`_expanded`), traced once for the count: a loop's trips and trials visit
         one, so its equations' sites (`hoist`) are one across them (the review of lane/toolkit 55ba7911d)."""
@@ -923,8 +930,7 @@ class _Counting:
             if self.loops:
                 self.arrivals.left(trial.landing)
             trials.append(trial)
-        self.fixed = self.fixed + most([trial.fixed if self.loops
-                                        else sum(trial.hoisted.values(), trial.fixed) for trial in trials])
+        self.fixed = self.fixed + most([trial.fixed if self.loops else trial.held() for trial in trials])
         if any(trial.walks for trial in trials):
             self.walks.append(most([_mean(trial.walks) for trial in trials if trial.walks]))
         if self.loops:
@@ -1251,7 +1257,7 @@ def resident_of(kernel) -> int:
     held = params.get("mosaic_gpu") if isinstance(params, Mapping) else params
     if not isinstance(held, gpu_core.CompilerParams):
         return 1
-    return max(1, getattr(held, "min_blocks_per_sm", None) or 1)
+    return max(1, held.min_blocks_per_sm)
 
 
 def launches_seconds(jaxpr: jax_core.Jaxpr, target: generation.GpuTarget, *,
