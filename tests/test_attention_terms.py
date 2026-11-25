@@ -28,7 +28,7 @@ its fourth place, and biasing each query by its distance from a key within five 
 def _layer(dtype=jnp.float32) -> CausalSelfAttention:
     return CausalSelfAttention(MixerContext(
         emb_features=FEATURES, num_heads=HEADS, num_kv_heads=KV_HEADS, head_dim=WIDTH, max_seq_len=16,
-        dtype=dtype), nope=True, **TERMS)
+        qk_norm=False, dtype=dtype), nope=True, **TERMS)
 
 
 def _clip(x, threshold, scale=None):
