@@ -38,14 +38,24 @@ from jax.sharding import PartitionSpec as P
 from dew import quantization
 from dew.batch import Variables, leaves_by_path
 from dew.mesh import EXPERT_AXIS, STAGE_AXIS, LayoutRefused, LogicalAxes, batch_axes, logical_spec, mesh_axes
-from dew.nn.dense import Dense, packed_matrix
+from dew.nn.dense import Dense, amax_history, noted_amax, packed_matrix
 from dew.nn.derivatives import KernelGlue, Protected, contracted, declared_tangent, with_tangents_formed_at
 from dew.nn.residuals import Residual
 
-from .activations import GatedActivation, gated_product, logistic, relu2, swiglu_clamped
+from .activations import (
+    GatedActivation,
+    Situ,
+    gated_hook,
+    gated_product,
+    logistic,
+    relu2,
+    rounded_gated,
+    swiglu_clamped,
+)
 from .blocks import normal_kernel
 from .flops import MissingFlopsCount, counted_flops, projection_flops
 from .kernels import formats, gemm, generation, projections
+from .kernels.templates.gemm.hooks import hook_lowers
 from .precision import (
     at_least_fp32,
     capped_logits,
@@ -700,7 +710,7 @@ def _scaled(rows: jax.Array, scales: jax.Array) -> jax.Array:
 def expert_projection(x: jax.Array | Gathered, kernel: jax.Array | formats.NvFp4 | Layered,
                       group_sizes: jax.Array, dtype: Dtype | None, implementation: str,
                       precision: PrecisionLike, bias: jax.Array | None = None,
-                      scatter: jax.Array | None = None) -> jax.Array:
+                      scatter: jax.Array | None = None, tensor_scale: jax.Array | None = None) -> jax.Array:
     """The grouped matmul of `x`'s expert-sorted rows, `[rows, in]`, through
     each expert's matrix in `kernel`, `[experts, in, out]`, `group_sizes`
     counting each expert's leading rows, under one precision contract for both
@@ -719,7 +729,8 @@ def expert_projection(x: jax.Array | Gathered, kernel: jax.Array | formats.NvFp4
     the bias's own dtype. `Gathered` rows are read where they lie (`gemm.gemm`'s `gather`, at a stack's
     layer too), scaled in the product's prologue (`_streamed`), but by a run's recipe, which takes them
     gathered; with `scatter`, each output row lands at its entry's row (`gemm.gemm`'s `scatter`, a
-    permutation).
+    permutation). `tensor_scale`, the rows' NVFP4 tensor scale under a delayed-scaling recipe that takes the
+    experts (`ExpertLinear.history`, `projections.recipe_projection`'s), which it requires (row 12721).
 
     Every implementation runs the GEMM template
     (`dew.nn.kernels.gemm.gemm`), which selects each of its
@@ -750,7 +761,8 @@ def expert_projection(x: jax.Array | Gathered, kernel: jax.Array | formats.NvFp4
         recipe = (None if recipe_role() is None or packed else projections.recipe_projection(
             jnp.asarray(gathered(x), compute),
             rounded_operand(stack if layer is None else stack[layer], compute), group_sizes,
-            out_dtype=compute, bias=None if bias is None else rounded_operand(bias, compute)))
+            out_dtype=compute, bias=None if bias is None else rounded_operand(bias, compute),
+            tensor_scale=tensor_scale))
     if recipe is not None:
         return recipe if scatter is None else jnp.zeros_like(recipe).at[scatter].set(recipe,
                                                                                     unique_indices=True)
@@ -789,6 +801,115 @@ def paired_projections(x: jax.Array | Gathered, first: jax.Array | Layered, seco
     the same index: `ExpertMLP`'s kernels, `_one_layer`) pair at it, read in place, and stacks read at two
     indices each at its own. `Gathered` rows are read and scaled where they lie, as `expert_projection`
     reads them."""
+    compute, paired = _paired(x, first, second, dtype)
+    first_rows, second_rows = (_apart(x, (first, second), group_sizes, compute, implementation, precision)
+                               if paired is None else
+                               _paired_call(paired, group_sizes, compute, implementation, precision))
+    return first_rows, second_rows
+
+
+def gated_experts(x: jax.Array | Gathered, gate: jax.Array | Layered, up: jax.Array | Layered,
+                  down: jax.Array | Layered, group_sizes: jax.Array, dtype: Dtype | None, implementation: str,
+                  precision: PrecisionLike, activation: GatedActivation, limit: float | None,
+                  scatter: jax.Array | None = None, scales: tuple[jax.Array | None, ...] | None = None,
+                  noted: Callable[[jax.Array], None] | None = None) -> jax.Array:
+    """A gated expert MLP's output (gate, up and down projections of `x`'s expert-sorted rows, the gated
+    product of `activation` between them, clamped by `limit`), as `dew.nn.gated_mlp.fused_products` runs a
+    dense one (row 1376): the gate and up projections one paired product, their roundings and their gated
+    product its epilogue (`activations.gated_hook`: the product's arithmetic on the tile, no launch of its
+    own), the gate's and up's kept under the names a remat policy reads (`Residual.GATE_PROJ`,
+    `Residual.UP_PROJ`); the down projection's prologue that gated product of the kept roundings, the
+    epilogue's output its formed value (`gemm.gemm`'s `applied`). So neither backward recomputes the pair: the
+    paired product's reads its kept roundings, the down projection's its prologue's operands, which a policy
+    saving the two names keeps. The gated product's gradient is `gated_hook`'s portable one (its activation
+    rounded to the compute dtype, as `GatedMLP`'s fused products take it), check 1 against float64 and bitwise
+    the unfused hook's; a dense layer's standalone `norm_swiglu` launch multiplies by the unrounded fp32
+    activation, a bf16 ulp apart where they differ. Where the pair runs apart (`paired_projections`) or the
+    down projection takes
+    no prologue (a packed bank's NVFP4 product, a run's recipe that takes the experts, `expert_projection`)
+    or the gated product's hook lowers on no launch's epilogue (a `Situ`, an exact GELU's erfc), each
+    projection runs on its own and the gated
+    product between them (`gated_product`), as before. Every arm's output the compute dtype's. `scatter`,
+    `expert_projection`'s. `scales`, the gate's, up's and down's delayed-scaling NVFP4 tensor scales
+    (`ExpertLinear.history`, row 12721) where a run's delayed recipe takes the experts, which runs them apart,
+    and `noted`, what takes the down projection's rows (their gated product) as its recipe reads them."""
+    compute, paired = _paired(x, gate, up, dtype)
+    down_stack, down_layer = (down.stack, down.layer) if isinstance(down, Layered) else (down, None)
+    fusable = (paired is not None and down_layer is paired[-1] and not isinstance(down_stack, formats.NvFp4)
+               and not _recipe_takes_experts(down_stack))
+    # The gated product's hook where a launch's epilogue and prologue take its operations (`hook_lowers`, as
+    # `dew.nn.gated_mlp` asks: an exact GELU's erfc lowers on no Mosaic launch), else None; asked of a
+    # compute dtype a launch takes (float32 or narrower), a wider one's products XLA's, whose hook is its own.
+    hook = None if isinstance(activation, Situ) or not fusable else gated_hook(activation, limit)
+    if (hook is not None and jnp.dtype(compute).itemsize <= 4
+            and not hook_lowers(hook, (jax.ShapeDtypeStruct((128, 128), compute),) * 2,
+                                generation.gpu_target())):
+        hook = None
+    if paired is None or hook is None:
+        gate_scale, up_scale, down_scale = scales or (None, None, None)
+        gate_rows, up_rows = (_apart(x, (gate, up), group_sizes, compute, implementation, precision,
+                                     (gate_scale, up_scale))
+                              if paired is None else
+                              _paired_call(paired, group_sizes, compute, implementation, precision))
+        gate_rows, up_rows = (checkpoint_name(gate_rows, Residual.GATE_PROJ),
+                              checkpoint_name(up_rows, Residual.UP_PROJ))
+        hidden = gated_product(activation)(*swiglu_clamped(gate_rows, up_rows, limit))
+        if noted is not None:
+            noted(hidden)
+        return _computed(expert_projection(hidden, down, group_sizes, compute, implementation, precision,
+                                           scatter=scatter, tensor_scale=down_scale), compute)
+    gate_rows, up_rows, hidden = _paired_call(
+        paired, group_sizes, compute, implementation, precision, epilogue=rounded_gated(hook, compute),
+        named=(Residual.GATE_PROJ, Residual.UP_PROJ, None))
+    # Named where a remat policy reads them too, as the down projection's operands (`fused_products`).
+    gate_rows, up_rows = (checkpoint_name(gate_rows, Residual.GATE_PROJ),
+                          checkpoint_name(up_rows, Residual.UP_PROJ))
+    with _named(implementation):
+        out = gemm.gemm(gate_rows, down_stack, group_sizes, compute=compute, out_dtype=compute,
+                        precision=precision, layer=down_layer, scatter=scatter, prologue=hook,
+                        prologue_operands=((up_rows, ('rows', 'depth')),), applied=hidden)
+    return _computed(out, compute)
+
+
+def _apart(x: jax.Array | Gathered, kernels: tuple, group_sizes: jax.Array, compute: Dtype,
+           implementation: str, precision: PrecisionLike,
+           scales: tuple[jax.Array | None, ...] | None = None) -> tuple[jax.Array, ...]:
+    """`expert_projection` of `x` through each of `kernels` on its own, at its delayed-scaling NVFP4 tensor
+    scale of `scales` where given, each output the compute dtype's."""
+    scales = scales or (None,) * len(kernels)
+    return tuple(_computed(expert_projection(x, kernel, group_sizes, compute, implementation, precision,
+                                             tensor_scale=scale), compute)
+                 for kernel, scale in zip(kernels, scales, strict=True))
+
+
+def _paired_call(paired: tuple, group_sizes: jax.Array, compute: Dtype, implementation: str,
+                 precision: PrecisionLike, *, epilogue=None, named: tuple = ()) -> tuple[jax.Array, ...]:
+    """The paired product `_paired` describes (`paired`), its outputs the compute dtype's: the two products,
+    or what `epilogue` makes of their accumulators, `named` naming them (`gemm.gemm`'s)."""
+    tokens, rows, prologue, first_stack, second_stack, layer = paired
+    count = len(named) if named else 2
+    hooks = {} if epilogue is None else {"epilogue": epilogue, "named": named}
+    with _named(implementation):
+        outputs = gemm.gemm(tokens, first_stack, group_sizes, compute=compute, out_dtype=compute,
+                            out_dtypes=(compute,) * count, precision=precision, paired=second_stack,
+                            layer=layer, gather=rows, **prologue, **hooks)
+    return tuple(_computed(output, compute) for output in outputs)
+
+
+def _computed(output: jax.Array, compute: Dtype) -> jax.Array:
+    """A projection's output in the compute dtype, whichever arm made it: paired or apart, its dtype the
+    same (a no-op where it already is)."""
+    return output.astype(compute)
+
+
+def _paired(x: jax.Array | Gathered, first: jax.Array | Layered, second: jax.Array | Layered,
+            dtype: Dtype | None) -> tuple[Dtype, tuple | None]:
+    """The compute dtype of a paired product of `first` and `second` over `x` (`paired_projections`: the
+    rows' and both matrices' however a matrix is held), and what the product takes: the template's tokens,
+    the rows it gathers and its prologue (`_streamed`), both stacks and the layer read; None where the two
+    run apart: matrices of two layer indices (or a stack's layer beside a matrix), a
+    packed bank (its product the NVFP4 one, which pairs with none), or a run's low-precision recipe that
+    takes the experts (`recipe_refusal`); experts the recipe leaves pair as without one."""
     (first_stack, layer), (second_stack, second_layer) = (
         (kernel.stack, kernel.layer) if isinstance(kernel, Layered) else (kernel, None)
         for kernel in (first, second))
@@ -796,18 +917,9 @@ def paired_projections(x: jax.Array | Gathered, first: jax.Array | Layered, seco
                                  _held(second_stack), dtype=dtype)
     if (layer is not second_layer or isinstance(first_stack, formats.NvFp4)
             or isinstance(second_stack, formats.NvFp4) or _recipe_takes_experts(first_stack)):
-        # Matrices of two layer indices (or a stack's layer beside a matrix), a packed bank (its product the
-        # NVFP4 one, which pairs with none), or a run's low-precision recipe that takes the experts
-        # (`recipe_refusal`), take each product apart (`expert_projection`); experts the recipe leaves pair as
-        # without one.
-        return (expert_projection(x, first, group_sizes, compute, implementation, precision),
-                expert_projection(x, second, group_sizes, compute, implementation, precision))
+        return compute, None
     tokens, rows, prologue = _streamed(x, compute)
-    with _named(implementation):
-        gate, up = gemm.gemm(tokens, first_stack, group_sizes, compute=compute, out_dtype=compute,
-                             out_dtypes=(compute, compute), precision=precision, paired=second_stack,
-                             layer=layer, gather=rows, **prologue)
-    return gate, up
+    return compute, (tokens, rows, prologue, first_stack, second_stack, layer)
 
 
 def _one_layer(kernels: tuple) -> tuple:
@@ -868,6 +980,7 @@ class ExpertLinear(nn.Module):
             # A scanned decode over a bank hands the run's stack and the iteration's layer.
             self.kernel = Layered(self.get_variable(BANKED_EXPERTS, 'kernel'),
                                   self.get_variable(BANKED_EXPERTS, 'layer'))
+            self.history = None
             return
         # With the expert dimension as a batch axis, fan_in is per expert and
         # every expert initialises like the matching Dense of a dense MLP. A served checkpoint's packed
@@ -878,6 +991,11 @@ class ExpertLinear(nn.Module):
                 1.0, 'fan_in', 'truncated_normal', in_axis=-2, out_axis=-1,
                 batch_axis=(0,)))['kernel_init'], self.kernel_axes),
             (self.num_experts, self.in_features, self.features), jnp.float32))
+        # Its amax history under a delayed-scaling NVFP4 recipe that takes the experts (`dense.amax_history`,
+        # row 12721), as a Dense holds its own; a packed bank the recipe never takes holds none.
+        with projection_role("experts"):
+            self.history = (None if isinstance(self.kernel, formats.NvFp4)
+                            else amax_history(self, 'amax_history', (self.in_features, self.features)))
 
 
 def capacity_positions(indices: jax.Array, num_experts: int,
@@ -906,22 +1024,45 @@ def capacity_positions(indices: jax.Array, num_experts: int,
     return positions.reshape(indices.shape), capacity
 
 
+type Projected = tuple[jax.Array, tuple[jax.Array, ...]]
+"""What an expert layer's projection hands its dispatch (`expert_dispatch`): a row per slot, and the
+largest magnitude among the rows each of its projections holding a delayed-scaling NVFP4 history quantized
+(`admitted_amax`), in its own order, () where none holds one: the dispatch takes the largest over its
+calls, rounds and devices, and the layer records them (`dense.observed`, row 12721)."""
+
+
+def admitted_amax(x: jax.Array | Gathered, group_sizes: jax.Array, compute: Dtype) -> jax.Array:
+    """The largest magnitude among `x`'s rows a recipe's grouped product quantizes
+    (`projections.recipe_projection`): those `group_sizes` admits, the first `sum(group_sizes)` as
+    computed in `compute` (a slot capacity dropped, past them, it never quantizes), finite
+    (`projections.nvfp4_amax`); its derivative none (row 12721)."""
+    rows = jnp.asarray(gathered(x), compute)
+    admitted = jnp.arange(rows.shape[0]) < jnp.sum(group_sizes)
+    return jax.lax.stop_gradient(projections.nvfp4_amax(jnp.where(admitted[:, None], rows, 0)))
+
+
+def _largest(first: tuple[jax.Array, ...], second: tuple[jax.Array, ...]) -> tuple[jax.Array, ...]:
+    return tuple(jnp.maximum(one, other) for one, other in zip(first, second, strict=True))
+
+
 def expert_dispatch[Parameters](
-        project: Callable[[jax.Array, jax.Array, jax.Array, Parameters], jax.Array],
+        project: Callable[[jax.Array, jax.Array, jax.Array, Parameters], Projected],
         x: jax.Array, indices: jax.Array, parameters: Parameters,
         parameter_axes: Sequence[LogicalAxes], *,
         num_experts: int, dispatch: str, output_dtype: Dtype,
         input_weights: jax.Array | None = None, initializing: bool = False,
         capacity_factor: float | None = None,
-        gathered_project: Callable[[Gathered, jax.Array, jax.Array, Parameters], jax.Array] | None = None
-        ) -> jax.Array:
+        gathered_project: Callable[[Gathered, jax.Array, jax.Array, Parameters], Projected] | None = None
+        ) -> Projected:
     """Run every routed token through its expert, and return the slots in
     token order.
 
     `project` takes rows sorted by expert, the group sizes, the sorted expert
     ids and the expert-major parameters, and returns a row per slot, of its own
     width, which may differ from the tokens' (MoVA's values,
-    `dew.nn.value_experts`); `parameter_axes` names the parameters' dimensions.
+    `dew.nn.value_experts`), with its projections' largest magnitudes (`Projected`),
+    which the dispatch returns beside the slots, each the largest over its calls,
+    rounds and devices; `parameter_axes` names the parameters' dimensions.
     The caller owns the activation, biases and output weights; `input_weights`
     scales each expert's input instead, as Llama 4 does. `x` is
     `[batch, length, width]` or `[tokens, width]`.
@@ -1036,7 +1177,7 @@ def _stored_primal_jvp(run, primals, tangents):
 
     if not live:
         output = forward()
-        return output, SymbolicZero(jax.typeof(output))
+        return output, jax.tree.map(lambda leaf: SymbolicZero(jax.typeof(leaf)), output)
     # Through the rule's dual (`with_tangents_formed_at`, `x` the first, the experts' parameters the rest):
     # reverse mode returns `x`'s cotangent only with the experts' gradients formed.
     directions = with_tangents_formed_at(tuple(directions), range(1, len(directions)))
@@ -1050,13 +1191,13 @@ _stored_primal = contracted("test_a_stored_expert_primal_holds_every_order")(
 
 
 def _dispatched[Parameters](
-        project: Callable[[jax.Array, jax.Array, jax.Array, Parameters], jax.Array],
+        project: Callable[[jax.Array, jax.Array, jax.Array, Parameters], Projected],
         x: jax.Array, indices: jax.Array, parameters: Parameters,
         input_weights: jax.Array | None, *, parameter_axes: Sequence[LogicalAxes],
         num_experts: int, dispatch: str, output_dtype: Dtype, initializing: bool,
         capacity: int | None,
-        gathered_project: Callable[[Gathered, jax.Array, jax.Array, Parameters], jax.Array] | None = None
-        ) -> jax.Array:
+        gathered_project: Callable[[Gathered, jax.Array, jax.Array, Parameters], Projected] | None = None
+        ) -> Projected:
     """`expert_dispatch` past its checks, over the parameters it is given."""
     mesh = jax.sharding.get_abstract_mesh()
     shards = mesh.shape.get(EXPERT_AXIS, 1)
@@ -1138,23 +1279,28 @@ def _dispatched[Parameters](
                 parameter = jax.lax.all_gather(parameter, axes, axis=dimension, tiled=True)
             return parameter
 
-        return inner(x, indices, jax.tree.map(gathered, parameters, held, is_leaf=_layered), input_weights)
+        projected, observed = inner(x, indices, jax.tree.map(gathered, parameters, held, is_leaf=_layered),
+                                    input_weights)
+        # The largest magnitudes over every device's rows, each stage's its own (a pipeline's stages run
+        # other layers).
+        return projected, jax.lax.pmax(observed, tuple(sorted(manual - {STAGE_AXIS})))
 
     # The kernels carry no manual-axis type, so this map does not check them;
     # MaxText hosts its gmm the same way.
-    return jax.shard_map(
+    projected, observed = jax.shard_map(
         body, mesh=mesh, axis_names=manual,
         in_specs=(tokens, routing, held, None if input_weights is None else routing),
-        out_specs=P(*routing, None), check_vma=False)(
-            x, indices, parameters, input_weights)[:rows]
+        out_specs=(P(*routing, None), P()), check_vma=False)(
+            x, indices, parameters, input_weights)
+    return projected[:rows], observed
 
 
 def _sorted_locally[Parameters](
-        project: Callable[[jax.Array, jax.Array, jax.Array, Parameters], jax.Array],
+        project: Callable[[jax.Array, jax.Array, jax.Array, Parameters], Projected],
         x: jax.Array, indices: jax.Array, parameters: Parameters,
         input_weights: jax.Array | None, *, num_experts: int,
-        gathered_project: Callable[[Gathered, jax.Array, jax.Array, Parameters], jax.Array] | None = None
-        ) -> jax.Array:
+        gathered_project: Callable[[Gathered, jax.Array, jax.Array, Parameters], Projected] | None = None
+        ) -> Projected:
     """Project every slot of `x`'s tokens where they are: sort the slots by
     expert, gather their token rows and put the results back in slot order
     (or hand `gathered_project` the tokens, the rows each slot reads, the
@@ -1169,24 +1315,24 @@ def _sorted_locally[Parameters](
     if gathered_project is not None:
         rows = Gathered(tokens, order // top_k, order,
                         None if input_weights is None else input_weights.ravel()[order])
-        projected = gathered_project(rows, sizes, experts[order], parameters)
+        projected, observed = gathered_project(rows, sizes, experts[order], parameters)
         projected = jnp.where((experts < num_experts)[:, None], projected, 0)
-        return projected.reshape(*indices.shape, projected.shape[-1])
+        return projected.reshape(*indices.shape, projected.shape[-1]), observed
     grouped = tokens[order // top_k]
     if input_weights is not None:
         grouped = grouped * input_weights.ravel()[order][:, None].astype(grouped.dtype)
-    projected = project(grouped, sizes, experts[order], parameters)
+    projected, observed = project(grouped, sizes, experts[order], parameters)
     projected = jnp.where((experts[order] < num_experts)[:, None], projected, 0)
-    return projected[jnp.argsort(order)].reshape(*indices.shape, projected.shape[-1])
+    return projected[jnp.argsort(order)].reshape(*indices.shape, projected.shape[-1]), observed
 
 
 def _exchange_shard[Parameters](
-        project: Callable[[jax.Array, jax.Array, jax.Array, Parameters], jax.Array],
+        project: Callable[[jax.Array, jax.Array, jax.Array, Parameters], Projected],
         x: jax.Array, indices: jax.Array, parameters: Parameters,
         input_weights: jax.Array | None, *, num_experts: int, shards: int,
-        output_dtype: Dtype, capacity: int | None) -> jax.Array:
+        output_dtype: Dtype, capacity: int | None) -> Projected:
     """Run one device's share of `expert_dispatch`'s exchange, inside its
-    shard_map.
+    shard_map, its projections' largest magnitudes the largest over its rounds.
 
     The device sorts its slots by expert and sends each shard its run of them
     in one `ragged_all_to_all`, the shard projects what every device sent it,
@@ -1227,7 +1373,7 @@ def _exchange_shard[Parameters](
     rounds = -(-jnp.max(table) // share)
     regions = jnp.arange(shards, dtype=jnp.int32) * share
 
-    def exchanged(start: int | jax.Array, returned: jax.Array | None) -> jax.Array:
+    def exchanged(start: int | jax.Array, returned: jax.Array | None) -> Projected:
         """One round: each sender's next `share` rows of its run to every shard, from `start` into it,
         projected there and sent back into `returned`, or, for the first round, into rows of the projection's
         own width (a value expert's need not be its input's)."""
@@ -1244,27 +1390,32 @@ def _exchange_shard[Parameters](
         received_ids = jnp.where(jnp.arange(share) < receiving[:, None], received_ids, per_shard).ravel()
         permutation = jnp.argsort(received_ids)
         groups = jnp.bincount(received_ids, length=per_shard + 1)[:per_shard]
-        computed = project(received[permutation], groups, received_ids[permutation].astype(experts.dtype),
-                           parameters)[jnp.argsort(permutation)]
-        computed = jnp.where((received_ids < per_shard)[:, None], computed, 0).astype(output_dtype)
+        computed, observed = project(received[permutation], groups,
+                                     received_ids[permutation].astype(experts.dtype), parameters)
+        computed = jnp.where((received_ids < per_shard)[:, None], computed[jnp.argsort(permutation)],
+                             0).astype(output_dtype)
         if returned is None:
             returned = jnp.zeros((slots, computed.shape[-1]), output_dtype)
         # Each sender's rows back where it sent them from.
         return jax.lax.ragged_all_to_all(computed, returned, regions, receiving, sent_from[:, me] + start,
-                                         sending, axis_name=EXPERT_AXIS)
+                                         sending, axis_name=EXPERT_AXIS), observed
 
-    def round_of(index, returned):
-        # Every device takes the same rounds, from the gathered table.
-        return jax.lax.cond(index < rounds, lambda held: exchanged(index * share, held), lambda held: held,
-                            returned)
+    def round_of(index, held):
+        # Every device takes the same rounds, from the gathered table; a round's largest magnitudes kept
+        # beside the earlier rounds'.
+        def taken(held):
+            returned, observed = exchanged(index * share, held[0])
+            return returned, _largest(held[1], observed)
 
-    returned = exchanged(0, None)
+        return jax.lax.cond(index < rounds, taken, lambda held: held, held)
+
+    returned, observed = exchanged(0, None)
     # The most rounds any routing takes, a device's every slot sent to one shard; a capacity's bound past
     # the balanced share alone takes further ones.
     if most > share:
-        returned = jax.lax.fori_loop(1, -(-most // share), round_of, returned)
+        returned, observed = jax.lax.fori_loop(1, -(-most // share), round_of, (returned, observed))
     # The rows in slot order; a dropped slot's, sent nowhere, stays zero.
-    return returned[jnp.argsort(order)].reshape(*indices.shape, returned.shape[-1])
+    return returned[jnp.argsort(order)].reshape(*indices.shape, returned.shape[-1]), observed
 
 
 def _widened[Tree](parameters: Tree) -> Tree:
@@ -1354,13 +1505,39 @@ class ExpertMLP(nn.Module):
                                 init_std=(self.init_std if self.output_init_std is None
                                           else self.output_init_std))
 
-    def _project(self, tokens: jax.Array | Gathered, sizes: jax.Array, _expert_ids: jax.Array,
-                 kernels: tuple[jax.Array, ...], *, dtype: Dtype) -> jax.Array:
-        kernels = _one_layer(kernels)
+    @nn.nowrap
+    def _projections(self) -> tuple[ExpertLinear, ...]:
+        """The layer's projections in the order it runs them."""
+        if self.activation == 'relu2':
+            return self.up_proj, self.down_proj
+        return self.gate_proj, self.up_proj, self.down_proj
 
-        def linear(x: jax.Array | Gathered, kernel: jax.Array, scatter: jax.Array | None = None) -> jax.Array:
+    def _project(self, tokens: jax.Array | Gathered, sizes: jax.Array, _expert_ids: jax.Array,
+                 kernels: tuple[jax.Array, ...], *, dtype: Dtype) -> Projected:
+        kernels = _one_layer(kernels)
+        layers = self._projections()
+        # Each projection's delayed-scaling NVFP4 tensor scale, its history's (`ExpertLinear.history`, row
+        # 12721), and the largest magnitude among the rows it quantizes for each holding one, the dispatch's
+        # to return (`Projected`): the gate and up projections' its rows', the down projection's its hidden
+        # rows'.
+        scales = tuple(None if layer.history is None
+                       else projections.delayed_tensor_scale(layer.history.value) for layer in layers)
+        delayed = any(scale is not None for scale in scales)
+        hidden_rows: list[jax.Array] = []
+
+        def observed() -> tuple[jax.Array, ...]:
+            held = [layer for layer in layers if layer.history is not None]
+            if not held:
+                return ()
+            read = admitted_amax(tokens, sizes, dtype)
+            return tuple(admitted_amax(hidden_rows[0], sizes, dtype) if layer is layers[-1] else read
+                         for layer in held)
+
+        def linear(x: jax.Array | Gathered, kernel: jax.Array, scatter: jax.Array | None = None,
+                   tensor_scale: jax.Array | None = None) -> jax.Array:
             return jnp.asarray(expert_projection(
-                x, kernel, sizes, dtype, self.implementation, self.precision, scatter=scatter))
+                x, kernel, sizes, dtype, self.implementation, self.precision, scatter=scatter,
+                tensor_scale=tensor_scale))
 
         # Gathered rows' slots: the last projection writes each row at its slot (`Gathered`).
         slots = tokens.slots if isinstance(tokens, Gathered) else None
@@ -1368,16 +1545,19 @@ class ExpertMLP(nn.Module):
         # The same residual names as the dense MLP's, so one remat policy
         # covers both (residuals.RESIDUALS).
         if self.activation == 'relu2':
-            up = checkpoint_name(linear(tokens, kernels[0]), Residual.UP_PROJ)
-            hidden = relu2(up)
-            return checkpoint_name(linear(hidden, kernels[1], slots), Residual.DOWN_PROJ)
-        # The gate and up projections read the same rows: one paired product (`paired_projections`).
-        gate, up = paired_projections(tokens, kernels[0], kernels[1], sizes, dtype, self.implementation,
-                                      self.precision)
-        gate, up = checkpoint_name(gate, Residual.GATE_PROJ), checkpoint_name(up, Residual.UP_PROJ)
-        gate, up = swiglu_clamped(gate, up, self.swiglu_limit)
-        hidden = gated_product(self.activation)(gate, up)
-        return checkpoint_name(linear(hidden, kernels[2], slots), Residual.DOWN_PROJ)
+            up_scale, down_scale = scales
+            up = checkpoint_name(linear(tokens, kernels[0], tensor_scale=up_scale), Residual.UP_PROJ)
+            hidden_rows.append(relu2(up))
+            out = checkpoint_name(linear(hidden_rows[0], kernels[1], slots, down_scale), Residual.DOWN_PROJ)
+            return out, observed()
+        # The gate and up projections read the same rows: one paired product, their gated product its
+        # epilogue and the down projection's prologue (`gated_experts`).
+        gate, up, down = kernels
+        out = checkpoint_name(gated_experts(
+            tokens, gate, up, down, sizes, dtype, self.implementation, self.precision, self.activation,
+            self.swiglu_limit, slots, scales=scales if delayed else None,
+            noted=hidden_rows.append if layers[-1].history is not None else None), Residual.DOWN_PROJ)
+        return out, observed()
 
     def _combine(self, slots: jax.Array, weights: jax.Array) -> jax.Array:
         wide = at_least_fp32(slots.dtype)
@@ -1399,11 +1579,16 @@ class ExpertMLP(nn.Module):
         # Each leaf's axes: a packed bank's four its own (`quantization.expert_leaf_axes`).
         axes = tuple(leaf for kernel, name in zip(kernels, names, strict=True)
                      for leaf in quantization.expert_leaf_axes(kernel, EXPERT_AXES[name]))
-        slots = expert_dispatch(
+        slots, observed = expert_dispatch(
             project, x, indices, kernels, axes, num_experts=self.num_experts, dispatch=self.dispatch,
             initializing=self.is_initializing(), output_dtype=compute,
             input_weights=weights if self.scale_inputs else None,
             capacity_factor=self.capacity_factor, gathered_project=project)
+        # What each projection holding a history quantized, the largest over the dispatch's calls, rounds and
+        # devices, recorded here, outside its transformations (row 12721).
+        held = [layer for layer in self._projections() if layer.history is not None]
+        for layer, amax in zip(held, observed, strict=True):
+            noted_amax(layer, 'amax_history', amax)
         return self._combine(slots, weights)
 
 

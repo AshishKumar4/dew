@@ -196,12 +196,8 @@ def fused_products(rows: jax.Array, kernels: tuple[jax.Array, jax.Array, jax.Arr
     `gemm`'s."""
     dtype = rows.dtype
     hook = activations.gated_hook(activation, limit)
-
-    def projected(gate_acc, up_acc):
-        gate, up = gate_acc.astype(dtype), up_acc.astype(dtype)
-        return gate, up, hook(gate, up)
-
-    gate, up, hidden = gemm.gemm(rows, kernels[0], paired=kernels[1], epilogue=projected, out_dtype=dtype,
+    gate, up, hidden = gemm.gemm(rows, kernels[0], paired=kernels[1],
+                                 epilogue=activations.rounded_gated(hook, dtype), out_dtype=dtype,
                                  out_dtypes=(dtype,) * 3, precision=precision,
                                  interpret_on_cpu=interpret_on_cpu)
     if names is not None:

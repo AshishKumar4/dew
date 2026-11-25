@@ -982,6 +982,8 @@ dew.nn.precision.Dtypes
 dew.nn.precision.LowPrecision
   recipe: str = 'blockwise_fp8'
   roles: tuple[str, ...] = ('mixer', 'mlp', 'experts')
+  tensor_scaling: str = 'current'
+  amax_history: int = 16
 dew.nn.precision.Numerics
   dtypes: Dtypes = dew.nn.precision.Dtypes()
   matmul: str | jax.lax.DotAlgorithmPreset = 'default'

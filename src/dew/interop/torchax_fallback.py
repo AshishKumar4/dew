@@ -821,9 +821,10 @@ def _functional_experts() -> type:
                     # The gate's and the up projection's products of the same rows, one paired product.
                     gate, up = paired_projections(tokens, held[0], held[1], sizes, compute, "xla", None)
                     gated = gated_product(self.activation)(gate, up)
-                    return jnp.asarray(expert_projection(gated, held[2], sizes, compute, "xla", None))
+                    # No history: a fallback's experts take no delayed-scaling recipe's state.
+                    return jnp.asarray(expert_projection(gated, held[2], sizes, compute, "xla", None)), ()
 
-                slots = expert_dispatch(project, x, jnp.where(identity, self.routed, index), kernels,
+                slots, _ = expert_dispatch(project, x, jnp.where(identity, self.routed, index), kernels,
                                         tuple(EXPERT_AXES[name] for name in ("gate_proj", "up_proj",
                                                                              "down_proj")),
                                         num_experts=self.routed, dispatch="global", output_dtype=compute)
