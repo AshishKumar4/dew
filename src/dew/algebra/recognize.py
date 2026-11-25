@@ -1273,8 +1273,8 @@ def _mosaic_layout(hooks, roles: tuple[tuple[str, int], ...], operands: Sequence
     bound_call, _ = recurrence_chunk.template_bind(
         q, k, v, g, beta, state, scale=scale, delta=hooks.delta, wide=fused_wide,
         bound=hooks.inverse_bound, rounded=rounded, apart=hooks.apart, values_gated=values_gated)
-    impl, ba = bound_call.bound["mosaic_gpu"]
-    tiles = impl.taken(ba)
+    _, ba = bound_call.bound["mosaic_gpu"]
+    tiles = template.MOSAIC.taken(ba)
     if tiles is None:
         return None
     active_tiles = tiles if keeps else (tiles.forward or tiles)
@@ -1312,9 +1312,9 @@ def _recurrence_kernel_layout(kernel: str, hooks, roles: tuple[tuple[str, int], 
 
     if kernel == "fla":
         common_dt = jnp.dtype(common)
-        info = jnp.finfo(common_dt)
-        nmant = 10 if common_dt == jnp.float32 else int(info.nmant)
-        return common_dt, nmant, int(info.minexp) - int(info.nmant), recurrence_chunk.CHUNK_SIZE
+        limits = jnp.finfo(common_dt)
+        nmant = 10 if common_dt == jnp.float32 else int(limits.nmant)
+        return common_dt, nmant, int(limits.minexp) - int(limits.nmant), recurrence_chunk.CHUNK_SIZE
     if kernel != "mosaic_gpu":
         return None
     key = (kernel, keeps, tuple((aval(var).shape, aval(var).dtype) for var in operands),

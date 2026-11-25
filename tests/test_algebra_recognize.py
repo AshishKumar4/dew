@@ -1634,12 +1634,41 @@ def test_recurrence_recognition_guards_fla_zero_gate_gram_overflow_score_underfl
         assert float(np.asarray(got_out3, np.float32)[0, 0, 0, 0]) == float(jnp.bfloat16(2.0 ** -92))
 
 
+def _scan_bf16_state_init(step):
+    """Return a bounded GDN scan whose fp32 state initializer is losslessly widened from bf16."""
+    def scan_fn(state, q, k, v, g, beta):
+        s_in = _bounded_box(state, 0.125).astype(q.dtype).astype(jnp.float32)
+        return jax.lax.scan(step, s_in, (_bounded_box(q, 0.125), _bounded_box(k, 0.125), _bounded_box(v),
+                                         jnp.minimum(g, 0.0), jax.nn.sigmoid(beta)))
+    return scan_fn
+
+
+def _assert_fla_cancel_preserved(scan_fn, state, q, k, v, g, beta, *, token_idx: int, expected: float):
+    """Assert direct forced FLA flushes `token_idx` to 0 while `dew.jit(scan_fn)` preserves exact cancellation
+    matching `jax.jit(scan_fn)` bit-for-bit."""
+    import dew
+    from dew.nn.kernels import recurrence, recurrence_chunk
+
+    with generation.chosen(gated_delta_rule="fla"):
+        fla_out, _ = recurrence_chunk.chunk(
+            recurrence.Hooks(decay="scalar", delta=True),
+            recurrence_chunk.Chunk(
+                state=state, query=jnp.swapaxes(q, 0, 1), key=jnp.swapaxes(k, 0, 1),
+                value=jnp.swapaxes(v, 0, 1), log_decay=jnp.swapaxes(g, 0, 1),
+                beta=jnp.swapaxes(jax.nn.sigmoid(beta), 0, 1)), dtype=jnp.bfloat16)
+        assert float(np.asarray(fla_out, np.float32)[0, token_idx, 0, 0]) == 0.0
+        ref_fin, ref_out = jax.jit(scan_fn)(state, q, k, v, g, beta)
+        got_fin, got_out = dew.jit(scan_fn)(state, q, k, v, g, beta)
+        np.testing.assert_array_equal(np.asarray(got_fin), np.asarray(ref_fin))
+        np.testing.assert_array_equal(np.asarray(got_out, np.float32), np.asarray(ref_out, np.float32))
+        assert float(np.asarray(got_out, np.float32)[token_idx, 0, 0, 0]) == expected
+
+
 def test_recurrence_recognition_preserves_fp32_entering_state_cancellation():
     """`RECURRENCES` preserves token scans when the selected route (`fla`/`mosaic_gpu`) narrows a live fp32
     entering state to bf16 before the readout dot, isolating region cache keys by entering-state source dtype
     and preserving exact `-2^-19` cancellation where forced FLA flushes to zero."""
     import dew
-    from dew.nn.kernels import recurrence, recurrence_chunk
 
     seq, batch, hv, dk, dv = 64, 1, 2, 64, 64
     qkv_shapes = (
@@ -1651,11 +1680,7 @@ def test_recurrence_recognition_preserves_fp32_entering_state_cancellation():
         jax.ShapeDtypeStruct((seq, batch, hv), jnp.bfloat16),
     )
     step = _gdn_make_step(batch, hv)
-
-    def scan_bf16_state_warm(state, q, k, v, g, beta):
-        s_in = _bounded_box(state, 0.125).astype(q.dtype).astype(jnp.float32)
-        return jax.lax.scan(step, s_in, (_bounded_box(q, 0.125), _bounded_box(k, 0.125), _bounded_box(v),
-                                         jnp.minimum(g, 0.0), jax.nn.sigmoid(beta)))
+    scan_bf16_state_warm = _scan_bf16_state_init(step)
 
     def scan_fp32_state_cancel(state, q, k, v, g, beta):
         return jax.lax.scan(step, _bounded_box(state, 0.125),
@@ -1675,19 +1700,9 @@ def test_recurrence_recognition_preserves_fp32_entering_state_cancellation():
     z_v = jnp.zeros((seq, batch, hv, dv), jnp.bfloat16)
     z_g = jnp.zeros((seq, batch, hv), jnp.float32)
     z_b = jnp.zeros((seq, batch, hv), jnp.bfloat16)
-    with generation.chosen(gated_delta_rule="fla"):
-        fla_out, _ = recurrence_chunk.chunk(
-            recurrence.Hooks(decay="scalar", delta=True),
-            recurrence_chunk.Chunk(
-                state=s_cancel, query=jnp.swapaxes(q_cancel, 0, 1), key=jnp.swapaxes(z_k, 0, 1),
-                value=jnp.swapaxes(z_v, 0, 1), log_decay=jnp.swapaxes(z_g, 0, 1),
-                beta=jnp.swapaxes(jax.nn.sigmoid(z_b), 0, 1)), dtype=jnp.bfloat16)
-        assert float(np.asarray(fla_out, np.float32)[0, 0, 0, 0]) == 0.0
-        ref_fin, ref_out = jax.jit(scan_fp32_state_cancel)(s_cancel, q_cancel, z_k, z_v, z_g, z_b)
-        got_fin, got_out = dew.jit(scan_fp32_state_cancel)(s_cancel, q_cancel, z_k, z_v, z_g, z_b)
-        np.testing.assert_array_equal(np.asarray(got_fin), np.asarray(ref_fin))
-        np.testing.assert_array_equal(np.asarray(got_out, np.float32), np.asarray(ref_out, np.float32))
-        assert float(np.asarray(got_out, np.float32)[0, 0, 0, 0]) == float(jnp.bfloat16(-(2.0 ** -19)))
+    _assert_fla_cancel_preserved(
+        scan_fp32_state_cancel, s_cancel, q_cancel, z_k, z_v, z_g, z_b,
+        token_idx=0, expected=float(jnp.bfloat16(-(2.0 ** -19))))
 
 
 def test_recurrence_recognition_guards_later_chunk_carry_lossy_norm_and_reads_kernel_layout():
@@ -1695,7 +1710,8 @@ def test_recurrence_recognition_guards_later_chunk_carry_lossy_norm_and_reads_ke
     keys normalized through lossy bf16->fp16 denominators, and reads Mosaic intermediate precision directly
     from `chunk_forward.prepared` (`sm80` TF32 vs `sm90` 2-part bf16 vs unrounded 3-part fp32)."""
     import dew
-    from dew.nn.kernels import recurrence, recurrence_chunk
+    from dew.algebra import recognize
+    from dew.nn.kernels import recurrence
 
     batch, hv, dk, dv = 1, 2, 64, 64
     step = _gdn_make_step(batch, hv)
@@ -1710,12 +1726,7 @@ def test_recurrence_recognition_guards_later_chunk_carry_lossy_norm_and_reads_ke
         jax.ShapeDtypeStruct((seq128, batch, hv), jnp.float32),
         jax.ShapeDtypeStruct((seq128, batch, hv), jnp.bfloat16),
     )
-
-    def scan_bf16_init_128(state, q, k, v, g, beta):
-        s_in = _bounded_box(state, 0.125).astype(q.dtype).astype(jnp.float32)
-        return jax.lax.scan(step, s_in, (_bounded_box(q, 0.125), _bounded_box(k, 0.125), _bounded_box(v),
-                                         jnp.minimum(g, 0.0), jax.nn.sigmoid(beta)))
-
+    scan_bf16_init_128 = _scan_bf16_state_init(step)
     with generation.assumed("sm90"), generation.chosen(gated_delta_rule="fla"):
         assert not _routes("gated_delta_rule", lambda: dew.jit(scan_bf16_init_128).trace(*shapes128))
     with generation.assumed("sm90"):
@@ -1728,19 +1739,9 @@ def test_recurrence_recognition_guards_later_chunk_carry_lossy_norm_and_reads_ke
     v128 = jnp.zeros((seq128, batch, hv, dv), jnp.bfloat16).at[0, :, :, 0].set(jnp.bfloat16(-33.0 / 4096.0))
     g128 = jnp.zeros((seq128, batch, hv), jnp.float32)
     b128 = jnp.zeros((seq128, batch, hv), jnp.bfloat16)
-    with generation.chosen(gated_delta_rule="fla"):
-        fla_out, _ = recurrence_chunk.chunk(
-            recurrence.Hooks(decay="scalar", delta=True),
-            recurrence_chunk.Chunk(
-                state=s0, query=jnp.swapaxes(q128, 0, 1), key=jnp.swapaxes(k128, 0, 1),
-                value=jnp.swapaxes(v128, 0, 1), log_decay=jnp.swapaxes(g128, 0, 1),
-                beta=jnp.swapaxes(jax.nn.sigmoid(b128), 0, 1)), dtype=jnp.bfloat16)
-        assert float(np.asarray(fla_out, np.float32)[0, 64, 0, 0]) == 0.0
-        ref_fin, ref_out = jax.jit(scan_bf16_init_128)(s0, q128, k128, v128, g128, b128)
-        got_fin, got_out = dew.jit(scan_bf16_init_128)(s0, q128, k128, v128, g128, b128)
-        np.testing.assert_array_equal(np.asarray(got_fin), np.asarray(ref_fin))
-        np.testing.assert_array_equal(np.asarray(got_out, np.float32), np.asarray(ref_out, np.float32))
-        assert float(np.asarray(got_out, np.float32)[64, 0, 0, 0]) == float(jnp.bfloat16(-(2.0 ** -19)))
+    _assert_fla_cancel_preserved(
+        scan_bf16_init_128, s0, q128, k128, v128, g128, b128,
+        token_idx=64, expected=float(jnp.bfloat16(-(2.0 ** -19))))
 
     # 2. Lossy bf16 -> fp16 -> fp32 norm denominator must not certify unit_norm or admit FLA WY overflow.
     seq64 = 64

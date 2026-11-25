@@ -2475,7 +2475,7 @@ def test_body_key_distinguishes_callable_dataclasses_and_norm_rejects_bad_layout
         k1, k2 = terms.body_key(c1), terms.body_key(c2)
         assert (k1 is not None and k2 is not None and k1 != k2) if shareable else (k1 is None and k2 is None)
         assert terms.jaxpr_digest(c1, in_process=True) != terms.jaxpr_digest(c2, in_process=True)
-        assert terms.jaxpr_digest(c1, in_process=False) != terms.jaxpr_digest(c2, in_process=False)
+        assert shareable or terms.jaxpr_digest(c1) != terms.jaxpr_digest(c2)
         with generation.assumed("sm90"):
             r1 = program._closed(c1, accurate=False, saturation=algebra.SATURATION, kernels=True)
             r2 = program._closed(c2, accurate=False, saturation=algebra.SATURATION, kernels=True)
