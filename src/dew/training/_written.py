@@ -31,8 +31,8 @@ _input_log = logging.getLogger("dew.training.input")
 """Where a run says what its input costs its steps, once (`written`)."""
 
 
-def saved_checkpoint(
-    trainer: Trainer,
+def saved_checkpoint[L, E](
+    trainer: Trainer[L, E],
     checkpoints: Checkpoints,
     step: int,
     state: TrainState,
@@ -69,8 +69,8 @@ def saved_checkpoint(
     return time.perf_counter() - paused
 
 
-def checkpoint_envelope(trainer: Trainer, state: TrainState, position: bytes | None, interval: Interval,
-                        run: FitRun, *, weights_only: bool = False) -> Envelope:
+def checkpoint_envelope[L, E](trainer: Trainer[L, E], state: TrainState, position: bytes | None,
+                              interval: Interval, run: FitRun, *, weights_only: bool = False) -> Envelope:
     """What a checkpoint of `state` holds on every tier, each tier's save adding its own metadata: one
     envelope a persistent and a local save submit (row 4126)."""
     control, share = {**run.stop_control, **interval.token_control}, DataPartition.of(trainer.device_mesh)
@@ -83,8 +83,9 @@ def checkpoint_envelope(trainer: Trainer, state: TrainState, position: bytes | N
             "rollout": None if weights_only else _rollout_saved(trainer.rollout), "_laid": laid}
 
 
-def saved_local_checkpoint(trainer: Trainer, checkpoints: Checkpoints, step: int, state: TrainState,
-                           position: bytes | None, interval: Interval, run: FitRun) -> float:
+def saved_local_checkpoint[L, E](trainer: Trainer[L, E], checkpoints: Checkpoints, step: int,
+                                 state: TrainState, position: bytes | None, interval: Interval,
+                                 run: FitRun) -> float:
     """Write one checkpoint to the local directory with `run`'s stop control, its stream placing
     nothing meanwhile (`FitRun.held`), and report it.
 
@@ -100,7 +101,7 @@ def saved_local_checkpoint(trainer: Trainer, checkpoints: Checkpoints, step: int
     return time.perf_counter() - paused
 
 
-def read_taken(trainer: Trainer, run: FitRun, *, agree: bool = True, wait: bool = True) -> None:
+def read_taken[L, E](trainer: Trainer[L, E], run: FitRun, *, agree: bool = True, wait: bool = True) -> None:
     """Hand the log the loop took (`Taken`) to the run's writer, which reads it on the host and reports
     one logging interval off the step loop (`LogWriter`, `_written`), and raise a write's failure: of
     every write, waiting for each, where `wait`, as before a compile, an evaluation, a save or the end,
@@ -124,14 +125,14 @@ def read_taken(trainer: Trainer, run: FitRun, *, agree: bool = True, wait: bool 
             check()
 
 
-def read_log(trainer: Trainer, run: FitRun, taken: Taken) -> tuple[Reading, float]:
+def read_log[L, E](trainer: Trainer[L, E], run: FitRun, taken: Taken) -> tuple[Reading, float]:
     """`taken` on the host, its losses checked, and its interval's seconds, on the writer's reader
     thread (`LogWriter`), whose clock it moves."""
     read, elapsed, run.writer.since = taken.read(trainer._display, run.writer.since)
     return read, elapsed
 
 
-def written(trainer: Trainer, run: FitRun, taken: Taken, reading: tuple[Reading, float]) -> None:
+def written[L, E](trainer: Trainer[L, E], run: FitRun, taken: Taken, reading: tuple[Reading, float]) -> None:
     """Report `taken`'s interval's scalars (`logged_scalars`) on rank zero, on the writer's reporter
     thread (`_read_taken`); every other rank has nothing to report."""
     if jax.process_index() != 0:
@@ -151,7 +152,8 @@ def written(trainer: Trainer, run: FitRun, taken: Taken, reading: tuple[Reading,
         trainer.tracker.log(scalars, taken.step)
 
 
-def reported_outcome(trainer: Trainer, error: BaseException | None, run: FitRun) -> BaseException | None:
+def reported_outcome[L, E](trainer: Trainer[L, E], error: BaseException | None,
+                           run: FitRun) -> BaseException | None:
     """Agree the run's cleanup, report its goodput and its outcome.
 
     Every rank reaches the cleanup agreement, so a rank that failed alone
