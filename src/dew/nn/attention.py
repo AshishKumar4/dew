@@ -685,9 +685,11 @@ def _weighted(weights: jax.Array, value: jax.Array, *, skipped, sinks, precision
         # Grouped by key head (`_skipped_logits`' keys whole, a mask every head shares).
         *rows, _, length, keys = weights.shape
         grouped = weights.reshape(*rows, kv_heads, heads // kv_heads, length, keys)
+        # The weights in the values' dtype, as `weighted_values` takes them, over the grouped product.
         return _by_query_block(
-            lambda weights_of, visited: weighted_values(
-                '...kgqs,...skd->...qkgd', weights_of, _visited(visited, value), precision=precision),
+            lambda weights_of, visited: float32_einsum(
+                '...kgqs,...skd->...qkgd', weights_of.astype(value.dtype), _visited(visited, value),
+                precision=precision),
             grouped, skipped, query_axis=-2, out_axis=-4).reshape(*rows, length, heads, value.shape[-1])
     if sinks is None:
         return weighted_values('...hqk,...khd->...qhd', weights, value, precision=precision)
