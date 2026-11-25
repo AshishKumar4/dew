@@ -9,6 +9,7 @@ import contextvars
 import dataclasses
 import functools
 import os
+import weakref
 from collections.abc import Callable, Mapping
 
 import jax
@@ -180,9 +181,26 @@ def without_ynn(fn, **jit_options):
         jit_options["compiler_options"] = {**switched_off(), **(own or {})}
     compiled = jax.jit(fn, **jit_options)
     compiled.without_ynn = True
-    if own:
-        compiled.own_compiler_options = dict(own)
-    return compiled
+    return with_own_options(compiled, own)
+
+
+_OWN_OPTIONS: "weakref.WeakKeyDictionary[Callable, dict]" = weakref.WeakKeyDictionary()
+"""Each program's caller's own compiler options (`without_ynn`'s: a cuBLAS reference's), which its twin as
+written keeps (`own_options`), as the program it is compiled from."""
+
+
+def with_own_options[Fn: Callable](fn: Fn, options: Mapping | None) -> Fn:
+    """`fn`, its caller's `options` (none where empty) kept for its twin as written (`own_options`)."""
+    if options:
+        _OWN_OPTIONS[fn] = dict(options)
+    return fn
+
+
+def own_options(fn) -> dict | None:
+    """The compiler options `fn`'s caller gave it (`with_own_options`), which its twin as written compiles
+    with over `as_written`'s; None where it gave none (an attention arm's, whose twin compiles as written
+    alone)."""
+    return _OWN_OPTIONS.get(fn)
 
 
 def as_recorded[Arm: Callable](fn: Arm, pilots: range | None = None) -> Arm:
@@ -375,7 +393,7 @@ def _compiled(fn, compile, pairing=None, *, reference: bool = False, written: bo
     run = unrewritten if reference and not _declared(fn) else _as_is
     if isinstance(fn, _RunToRun):
         return _RunToRun(_compiled(fn.fn, compile, pairing, reference=reference, written=written), fn.why)
-    own = getattr(fn, "own_compiler_options", None) if written else None
+    own = own_options(fn) if written else None
     fn = _own_function(fn) if written else fn
     if _given(fn) or getattr(fn, "without_ynn", False):
         return run(fn)

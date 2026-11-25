@@ -208,74 +208,45 @@ def test_a_compile_only_gpu_prepare_holds_a_reference_of_its_own_compiler_option
     assert not (tmp_path / "store" / UNPREPARED).exists(), (tmp_path / "store" / UNPREPARED).read_text()
 
 
-def test_a_prepared_written_twin_of_a_cublas_reference_keeps_its_compiler_options(tmp_path, monkeypatch):
-    """A library reference compiled with caller `compiler_options` (`generation_support.cublas_compiled`'s
-    `CUBLAS`, turning Triton GEMMs off) keeps those options on its as-written twin too, both live
-    (`arm_forms._written_twin`) and in a compile-only sm90 prepare (`arm_store._compile_arms`, written=True):
-    dropping them let XLA's Triton GEMM hijack the FP8 dot into a split-K fusion instead of cuBLASLt's
-    `__cublas$lt$matmul$f8` (rows 12983, 12984)."""
+def test_a_written_twin_of_a_cublas_reference_keeps_its_compiler_options():
+    """A library reference compiled with its caller's `compiler_options`
+    (`generation_support.cublas_compiled`'s `CUBLAS`, Triton GEMMs off) keeps them on its twin as written,
+    live (`arm_forms._written_twin`) and as a compile-only GPU's prepare compiles a held arm
+    (`arm_store._arm_compile`): an sm90 FP8 dot stays cuBLASLt's `__cublas$lt$matmul$f8`, where dropping them
+    let XLA's Triton GEMM take it as a split-K fusion (rows 12983, 12984). An arm of no options of its own
+    compiles as written alone."""
     import generation_support
-    import model_flows
-    import tier_wire
-    from arm_forms import _written_twin
-    from dew.telemetry.instrumentation import hlo_instructions
-    from dew.training import ahead
-    from truths_ahead import prepared
+    from arm_arithmetic import as_written
+    from arm_forms import _written_twin, own_options, with_own_options
+    from arm_forms import _Paired
+    from arm_store import _arm_compile
+    from jax.sharding import NamedSharding, PartitionSpec
+    from kernel_compile import _device
 
-    monkeypatch.setenv(model_flows.TOPOLOGY, str(generation_support.node_topology(tmp_path / "topology.bin",
-                                                                                   gpu="sm90")))
-    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    from dew.telemetry.instrumentation import hlo_instructions
 
     def fp8_dot(lhs, rhs):
         return jnp.dot(lhs, rhs, precision=jax.lax.Precision.DEFAULT, preferred_element_type=jnp.float32)
 
-    def draw(seed):
-        rng = np.random.default_rng(seed)
-        return (rng.normal(size=(256, 128)).astype(jnp.float8_e4m3fn),
-                rng.normal(size=(128, 256)).astype(jnp.float8_e4m3fn))
-
-    def truth(lhs, rhs):
-        return jnp.dot(lhs.astype(jnp.float64), rhs.astype(jnp.float64), preferred_element_type=jnp.float64)
-
-    reference = generation_support.cublas_compiled(fp8_dot, draw(0), "__cublas$lt$matmul$f8")
-
-    compiled_sites: dict[str, list[tuple[set[str], list]]] = {}
-    current_label = [""]
-    orig_of = ahead.Executable.of
-
-    @staticmethod
-    def spy_of(compiled):
-        instructions = tuple(hlo_instructions(compiled).values())
-        targets = {each.target for each in instructions} - {""}
-        dots = [each for each in instructions if each.op == "dot" or "dot" in each.fused]
-        compiled_sites.setdefault(current_label[0], []).append((targets, dots))
-        return orig_of(compiled)
-
-    from truths_ahead import CompiledTruths
-    orig_site = CompiledTruths.compile_site
-
-    def spy_site(self, label, *args, **kwargs):
-        current_label[0] = label
-        return orig_site(self, label, *args, **kwargs)
-
-    monkeypatch.setattr(ahead.Executable, "of", spy_of)
-    monkeypatch.setattr(CompiledTruths, "compile_site", spy_site)
-
-    with prepared(tmp_path / "store", stamp="cublas-written", target=generation_support.node_target()):
-        assert_as_exact(jax.jit(fp8_dot), reference, draw, "fp8 cublas site", seeds=32, truth_fn=truth)
-
-    assert not (tmp_path / "store" / UNPREPARED).exists(), (tmp_path / "store" / UNPREPARED).read_text()
-    main_key = "fp8 cublas site, its arms"
-    written_key = "fp8 cublas site, its arms as written"
-    assert main_key in compiled_sites and written_key in compiled_sites, sorted(compiled_sites)
-    # Main site holds dew + reference (last is reference); written site holds reference as written alone.
-    ref_targets, ref_dots = compiled_sites[main_key][-1]
-    written_targets, written_dots = compiled_sites[written_key][-1]
-    assert ref_targets == {"__cublas$lt$matmul$f8"} and not ref_dots, (ref_targets, ref_dots)
-    assert written_targets == {"__cublas$lt$matmul$f8"} and not written_dots, (written_targets, written_dots)
+    shapes = (jax.ShapeDtypeStruct((256, 128), jnp.float8_e4m3fn),
+              jax.ShapeDtypeStruct((128, 256), jnp.float8_e4m3fn))
+    reference = without_ynn(fp8_dot, compiler_options=generation_support.CUBLAS)
     twin = _written_twin(jax.jit(fp8_dot), reference)
-    live_written = twin.without.wrapped if hasattr(twin, "without") else twin.wrapped
-    assert getattr(live_written, "own_options", None) == generation_support.CUBLAS
+    live = twin.without.wrapped if isinstance(twin, _Paired) else twin.wrapped
+    assert live.own_options == generation_support.CUBLAS
+    assert own_options(jax.jit(fp8_dot)) is None
+
+    mesh = _device("sm90")
+    placed = tuple(jax.ShapeDtypeStruct(each.shape, each.dtype, sharding=NamedSharding(mesh, PartitionSpec()))
+                   for each in shapes)
+
+    def targets(fn) -> set[str]:
+        with generation.assumed("sm90"), jax.set_mesh(mesh):
+            compiled = _arm_compile(jax.jit, as_written("gpu"))(fn, out_shardings=None)
+            executable = compiled.trace(*placed).lower().compile()
+        return {each.target for each in hlo_instructions(executable).values()} - {""}
+
+    assert targets(with_own_options(fp8_dot, generation_support.CUBLAS)) == {"__cublas$lt$matmul$f8"}
 
 
 def test_an_arm_of_the_cpu_lanes_options_is_built_by_where_its_calls_are_placed():
