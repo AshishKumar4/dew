@@ -100,15 +100,15 @@ m_dew_run = arm_role("dew", run_mb[0], m_label)
 assert m_dew_prep is not None, "ModernBERT dew arm has no statement"
 assert m_dew_prep == m_dew_run, f"ModernBERT dew arm_role drifted across devices: {m_dew_prep} != {m_dew_run}"
 
-# The causal site's sm90 programs: both its arms', by the keys the run looks them up by, or neither (its cell
-# deferred whole, its cuDNN launch lowering on no deviceless prepare), never one arm's without the other's,
-# which the run would read beside an unprepared twin.
+# The causal site's sm90 programs: where its prepare compiled them ahead, both its arms' by the keys the run
+# looks them up by, never one arm's without its twin's; or its site marked compiled at run, each arm compiled
+# on the GPU (`CompiledTruths.at_run`: its cuDNN launch lowering on no deviceless prepare).
 c_sample = drawn_on_the_host(run_causal[2], 0)
-c_programs = (AheadPrograms.load(ro.path(armed(c_label)) / PROGRAMS).programs
-              if ro.holds(armed(c_label)) else {})
-c_held = {role for role, role_name in (("dew", c_dew_run), ("reference", c_ref_run))
-          if named(role_name, c_sample) in c_programs}
-assert c_held in (set(), {"dew", "reference"}), (c_held, sorted(c_programs))
+assert ro.holds(armed(c_label)), "the causal site's arms not prepared"
+if ro.at_run(armed(c_label)) is None:
+    c_programs = AheadPrograms.load(ro.path(armed(c_label)) / PROGRAMS).programs
+    for role_name in (c_dew_run, c_ref_run):
+        assert named(role_name, c_sample) in c_programs, (named(role_name, c_sample), sorted(c_programs))
 
 # Confirm ModernBERT's run-side program name matches what sm90 prepare stored.
 mb_sample = drawn_on_the_host(run_mb[2], 0)
