@@ -66,7 +66,7 @@ from dew.mesh import (
     mesh_axes,
     row_axes,
 )
-from dew.nn.derivatives import formed_together
+from dew.nn.derivatives import formed_together_at
 
 if TYPE_CHECKING:
     from dew.nn.backbones.decoder_stack import DecoderBank, StackView
@@ -575,11 +575,7 @@ def on_shards(local: Callable, spec: jax.sharding.PartitionSpec, operands: Seque
         # `manual_map` (row 12898): a barrier inside `local` (`with_gradients_formed`) sits before the map's
         # `psum` / `psum_scatter`, letting XLA combine every layer's unreduced weight gradients into one
         # collective at the step's end and defer other per-layer reductions past earlier layers.
-        inputs = tuple(operand for index, operand in enumerate(operands) if index not in gathered)
-        weights = tuple(operand for index, operand in enumerate(operands) if index in gathered)
-        inputs, weights = formed_together(inputs, weights)
-        by_input, by_weight = iter(inputs), iter(weights)
-        operands = tuple(next(by_weight if index in gathered else by_input) for index in range(len(operands)))
+        operands = formed_together_at(tuple(operands), gathered)
 
     def held(*operands):
         return local(*(_gathered_whole(operand, gathered[index]) if index in gathered else operand

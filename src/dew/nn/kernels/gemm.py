@@ -974,10 +974,8 @@ def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, 
             product = functools.partial(jax.lax.dot_general, dimension_numbers=(((0,), (0,)), ((), ())),
                                         precision=precision,
                                         out_sharding=xla_products.ragged_placement(((lhs, 1), (rhs, 1))))
-            target = _xla_dot_dtype(compute, out_dtype, precision, wide)
-            out = accumulated(product, lhs.astype(compute), rhs.astype(compute),
-                              preferred_element_type=target)[None]
-            return out if out.dtype == jnp.dtype(out_dtype) else out.astype(out_dtype)
+            return accumulated(product, lhs.astype(compute), rhs.astype(compute),
+                               preferred_element_type=wide)[None].astype(out_dtype)
         # Its operands and precision are XLA's ragged dot's as every one of its products takes them
         # (`xla_products.as_multiplied`): XLA's TPU kernel refuses 16-bit operands at HIGHEST, which a v5e's
         # grouped weight gradient met under a highest default (row 7064, "Bad lhs type").
@@ -2296,30 +2294,15 @@ def xla_mainloop(config: XlaConfig, lhs, rhs, group_sizes, prologue, prologue_ar
         products = tuple(row if prologue is None else prologue(row, *prologue_arrays).astype(lhs.dtype)
                          for row in rows)
         wide = at_least_fp32(lhs.dtype)
-        direct = dense and epilogue is None and not chained
-        targets = (tuple(_xla_dot_dtype(lhs.dtype, dtype, precision, wide) for dtype in dtypes)
-                   if direct else (wide,) * len(products))
         accs = tuple(xla_products.xla_dot(product, each[0].astype(lhs.dtype), precision=precision,
-                                            preferred_element_type=target) if dense
+                                            preferred_element_type=wide) if dense
                      else xla_products.xla_ragged_dot(product, each.astype(lhs.dtype), group_sizes,
                                                         precision=precision, preferred_element_type=wide)
-                     for product, each, target in zip(products, matrices, targets, strict=True))
+                     for product, each in zip(products, matrices, strict=True))
     accs = (functools.reduce(jnp.add, accs),) if chained else accs
     outs = accs if epilogue is None else _as_tuple(epilogue(*accs, *epilogue_arrays))
-    outs = tuple(out if out.dtype == dtype else out.astype(dtype)
-                 for out, dtype in zip(outs, dtypes, strict=True))
+    outs = tuple(out.astype(dtype) for out, dtype in zip(outs, dtypes, strict=True))
     return outs if several else outs[0]
-
-
-def _xla_dot_dtype(operand_dtype, out_dtype, precision: PrecisionLike, wide):
-    """Output dtype for a plain dense XLA dot (`xla_mainloop`, `_gemm_t`): bf16 directly when both operands
-    and output are bf16 with no explicit dot algorithm (accumulated in fp32 and rounded once in cuBLASLt's
-    epilogue, avoiding an fp32 temporary and trailing convert that breaks downstream reduction fusion, row
-    12898); `wide` otherwise."""
-    if (jnp.dtype(operand_dtype) == jnp.bfloat16 and jnp.dtype(out_dtype) == jnp.bfloat16
-            and not isinstance(precision, (jax.lax.DotAlgorithm, jax.lax.DotAlgorithmPreset))):
-        return jnp.bfloat16
-    return wide
 
 
 @dataclasses.dataclass(frozen=True)

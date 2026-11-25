@@ -647,3 +647,10 @@ formed_together = contracted("test_a_module_reading_its_parameters_formed_togeth
 primal. What reads them computes in any way of its own; the layer below, reading `value`'s cotangent, waits
 on the parameters' (row 11713: a loop pass's bank cotangent summed over the layers above in one
 accumulator, `decoder_stack._scanned_runs`)."""
+
+
+def formed_together_at(operands: tuple, parameters: Collection[int]) -> tuple:
+    """`operands`, those at `parameters` its parameters', through `formed_together`: the rest's cotangents
+    leave only with the parameters' formed, every operand back at its position (`_apart`, `_together`)."""
+    inputs, held = formed_together(*_apart(operands, parameters))
+    return _together(inputs, held, parameters)
