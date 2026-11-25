@@ -8,6 +8,7 @@ from typing import NamedTuple, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
+from jax.ad_checkpoint import checkpoint_name
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates.hooks import lowering_rules, lowers
@@ -68,6 +69,38 @@ class Formed(Protocol):
 
     @property
     def out_forms(self) -> tuple: ...
+
+
+@runtime_checkable
+class Residualized(Protocol):
+    """An epilogue whose first `residuals` outputs a reverse pass alone reads (`wide.Gated`'s saved rounded
+    product): `gemm` writes them where a derivative is taken, under their names (its `named`), returns the
+    rest, and runs `unsaved()`, the epilogue without them, where none is (`linear_tangent`'s `primal`), so
+    an inference's launch stores none."""
+
+    @property
+    def residuals(self) -> int: ...
+
+    def unsaved(self) -> Callable: ...
+
+
+def kept_outputs(named: tuple, residuals: int = 0) -> tuple[int, ...]:
+    """The outputs `gemm`'s forward saves, by position: each `named` names (`checkpoint_name`) and the first
+    `residuals` (`Residualized`'s), named or not."""
+    return tuple(at for at in range(max(len(named), residuals))
+                 if at < residuals or named[at] is not None)
+
+
+def held_outputs(out, named: tuple, several: bool, residuals: int = 0) -> tuple:
+    """`gemm`'s forward's outputs `out` (several, or one) and what it saves (`kept_outputs`): each output
+    `named` names a residual under its name, the one array the output and the residual are; the first
+    `residuals` (`Residualized`'s) saved, named or not, and never returned."""
+    outs = list(out if several else (out,))
+    names = tuple(named) + (None,) * (len(outs) - len(named))
+    outs = [checkpoint_name(each, name) if name is not None else each
+            for each, name in zip(outs, names, strict=True)]
+    saved = tuple(outs[at] for at in kept_outputs(named, residuals))
+    return (tuple(outs[residuals:]) if several else outs[0]), saved
 
 
 def _unsqueezing(hook, positions: tuple, tiles: int = 1):

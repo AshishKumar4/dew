@@ -353,12 +353,14 @@ class Written:
     (`arm_forms._written_twin`). Its `lower` and `trace` are the program an uncommitted call runs, for the
     platform the context places a call on."""
 
-    def __init__(self, fn, compile: Callable = jax.jit):
-        self.fn, self.compile, self._made, self._compiled = fn, compile, {}, {}
+    def __init__(self, fn, compile: Callable = jax.jit, *, own_options: dict | None = None):
+        self.fn, self.compile, self.own_options = fn, compile, own_options
+        self._made, self._compiled = {}, {}
 
     def program(self, platform: str):
         if platform not in self._made:
-            self._made[platform] = self.compile(products_held(self.fn), compiler_options=as_written(platform))
+            options = {**as_written(platform), **(self.own_options or {})}
+            self._made[platform] = self.compile(products_held(self.fn), compiler_options=options)
         return self._made[platform]
 
     def ran_on(self, *inputs, **options) -> str:
