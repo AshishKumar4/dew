@@ -1168,11 +1168,9 @@ def test_a_dense_kernel_gradients_balanced_tail_holds_check_1(rows, depth, width
 
 
 def a_dense_kernel_gradients_balanced_tail_holds_check_1(rows: int, depth: int, width: int, out_dtype,
-                                                         generation_name: str = "sm90",
-                                                         tile: tiling.Tiles | None = None) -> None:
+                                                         generation_name: str = "sm90", tile=None) -> None:
     """`test_a_dense_kernel_gradients_balanced_tail_holds_check_1`'s check at one shape and output dtype,
-    interpreted on a CPU and compiled on a Hopper GPU, at `tile` where given (its tail balanced), else at the
-    launch's derived tile."""
+    interpreted on a CPU and compiled on a Hopper GPU, at `tile` (else the derived one), its tail balanced."""
     draw = _dense_draw(rows, depth, width, cotangent=True)
     target = dataclasses.replace(generation.gpu_target(generation_name), multiprocessors=8, measured={})
     spec = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)

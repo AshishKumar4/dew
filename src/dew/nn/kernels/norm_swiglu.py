@@ -1349,7 +1349,7 @@ def _tile_of(rows: int, width: int, block: int, at: int = 0):
 
 
 def _swiglu_forward(gate_ref, up_ref, y_ref, *, block: int, interpret: bool):
-    rows, columns, mask = _tile_of(*gate_ref.shape, block)
+    rows, columns, mask = _tile_of(gate_ref.shape[0], gate_ref.shape[1], block)
     gate = plgpu.load(gate_ref.at[rows, columns], mask=mask, other=0).astype(jnp.float32)
     up = plgpu.load(up_ref.at[rows, columns], mask=mask, other=0).astype(jnp.float32)
     y = _product(gate, up, gate_ref.dtype, interpret)
@@ -1357,7 +1357,7 @@ def _swiglu_forward(gate_ref, up_ref, y_ref, *, block: int, interpret: bool):
 
 
 def _swiglu_backward(gate_ref, up_ref, dy_ref, dg_ref, du_ref, *, block: int, interpret: bool):
-    rows, columns, mask = _tile_of(*gate_ref.shape, block)
+    rows, columns, mask = _tile_of(gate_ref.shape[0], gate_ref.shape[1], block)
     gate = plgpu.load(gate_ref.at[rows, columns], mask=mask, other=0).astype(jnp.float32)
     up = plgpu.load(up_ref.at[rows, columns], mask=mask, other=0).astype(jnp.float32)
     dy = plgpu.load(dy_ref.at[rows, columns], mask=mask, other=0).astype(jnp.float32)
@@ -1431,7 +1431,7 @@ class SwigluForward(_Rows):
     def _fwd(self, gate: jax.Array, up: jax.Array, *, interpret: bool, config: BlockConfig,
              return_residuals: bool = False):
         return _launch(_swiglu_forward, "swiglu_forward", (gate, up), _Out(gate.dtype, ((0, 0), (0, 1))),
-                       _row_grid(*gate.shape, config), config, interpret)
+                       _row_grid(gate.shape[0], gate.shape[1], config), config, interpret)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1444,7 +1444,7 @@ class SwigluBackward(_Rows):
              return_residuals: bool = False):
         outputs = (_Out(gate.dtype, ((0, 0), (0, 1))), _Out(up.dtype, ((1, 0), (1, 1))))
         return _launch(_swiglu_backward, "swiglu_backward", (gate, up, dy), outputs,
-                       _row_grid(*gate.shape, config), config, interpret)
+                       _row_grid(gate.shape[0], gate.shape[1], config), config, interpret)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1469,7 +1469,8 @@ class PackedSwigluBackward(_Rows):
     def _fwd(self, gate_up: jax.Array, dy: jax.Array, *, interpret: bool, config: BlockConfig,
              return_residuals: bool = False):
         return _launch(_packed_backward, "swiglu_backward", (gate_up, dy),
-                       _Out(gate_up.dtype, ((0, 0), (0, 1))), _row_grid(*dy.shape, config), config, interpret)
+                       _Out(gate_up.dtype, ((0, 0), (0, 1))), _row_grid(dy.shape[0], dy.shape[1], config),
+                       config, interpret)
 
 
 _SWIGLU_FORWARD = SwigluForward()
