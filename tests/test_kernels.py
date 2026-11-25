@@ -18,6 +18,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import tier_wire
+from arm_arithmetic import drawn_on_the_host
 from attention_oracle import (
     ATTENTION_SEEDS,
     attention_and_grads,
@@ -370,7 +372,9 @@ def packed_sequences_attend_within_themselves_as_far_from_float64_as_one_at_a_ti
         # one-token document's exactly zero where the reference's is); the sinks' gradient summed whole.
         return (*(leaf[at] for leaf in leaves[:4] for at in documents), *leaves[4:])
 
-    attention_on_par(packed, dense, draw, "packed documents", split=by_document,
+    # A label a cell's own: a part's store of compiled truths holds one site a label.
+    label = f"packed documents {head_dim} {'causal' if causal else 'full'}{' sunk' if sunk else ''}"
+    attention_on_par(packed, dense, draw, label, split=by_document,
                      keep=kept(len(ids[0]), len(ids[0]), causal=causal, window=window, segment_ids=ids),
                      seeds=PACKED_SINK_SEEDS if sunk else ATTENTION_SEEDS)
 
@@ -635,15 +639,20 @@ def packed_rows_on_flash_are_as_exact_as_the_document_mask_from_float64(window, 
     flash_here()
     lengths = [[700, 1, 220, 103], [129, 383, 400, 112]]
     segments = documents(lengths)
-    real = jnp.asarray(segments != 0)[:, :, None, None]
+    # Host constants and a draw made on the host (`drawn_on_the_host`): a GPU tier part's prepare computes
+    # nothing on its compile-only device.
+    real = (segments != 0)[:, :, None, None]
 
-    def draw(seed):
+    def drawn(seed):
         streams = np.random.default_rng([23, seed])
         q, k, v, dy = (jnp.asarray(streams.normal(size=(2, 1024, heads, 64)), jnp.bfloat16)
                        for heads in (8, 2, 2, 8))
         # The padding's rows take no cotangent: its output is no token's.
         sunk = (jnp.asarray(streams.normal(size=(8,)) * 2, jnp.float32),) if sinks else ()
         return q, k, v, *sunk, jnp.where(real, dy, 0)
+
+    def draw(seed):
+        return drawn_on_the_host(drawn, seed)
 
     def kernel(implementation):
         # The padding's rows read as zero: flash attends it among itself, the mask to nothing.
@@ -672,13 +681,16 @@ def queries_reading_another_sequences_documents_on_flash_are_as_exact_as_the_doc
     queries = documents([[20, 1, 40, 35], [9, 0, 30, 57]])
     # Row 0's second document has a query and no key.
     keys = documents([[300, 0, 500, 224], [129, 383, 400, 112]])
-    real = jnp.asarray(queries != 0)[:, :, None, None]
+    real = (queries != 0)[:, :, None, None]
 
-    def draw(seed):
+    def drawn(seed):
         streams = np.random.default_rng([29, seed])
         q, k, v, dy = (jnp.asarray(streams.normal(size=(2, length, 8, 64)), jnp.bfloat16)
                        for length in (96, 1024, 1024, 96))
         return q, k, v, jnp.where(real, dy, 0)
+
+    def draw(seed):
+        return drawn_on_the_host(drawn, seed)
 
     def kernel(implementation):
         return lambda q, k, v: scaled_dot_product_attention(
@@ -687,9 +699,12 @@ def queries_reading_another_sequences_documents_on_flash_are_as_exact_as_the_doc
 
     attention_on_par(kernel('flash'), kernel('xla'), draw, "queries reading another sequence's documents",
                      keep=kept(96, 1024, segment_ids=queries, key_segment_ids=keys))
+    if tier_wire.preparing():
+        # A GPU tier part's prepare runs no kernel: its run checks the zero rows.
+        return
     query, key, value, _ = draw(0)
     found = np.asarray(jax.jit(kernel('flash'))(query, key, value))
-    np.testing.assert_array_equal(found[~np.asarray(real[..., 0, 0])], 0)
+    np.testing.assert_array_equal(found[~real[..., 0, 0]], 0)
     np.testing.assert_array_equal(found[0][queries[0] == 2], 0)
 
 
@@ -818,14 +833,15 @@ def cudnn_takes_key_lengths_and_agrees_with_xla(q_len, kv_len, causal, as_mask):
     The same keys ended by a `[B, 1, 1, K]` mask, the shape CLIP's text tower
     builds, agree the same way: the mask broadcasts over the queries on the
     cudnn path as it does on xla."""
-    lengths = jnp.asarray([kv_len, kv_len - 40], jnp.int32)
-    keep = (np.arange(kv_len)[None, :] < np.asarray(lengths)[:, None])[:, None, None, :]
+    # Host constants (a GPU tier part's prepare computes nothing on its compile-only device).
+    lengths = np.asarray([kv_len, kv_len - 40], np.int32)
+    keep = (np.arange(kv_len)[None, :] < lengths[:, None])[:, None, None, :]
     keep = keep & kept(q_len, kv_len, causal=causal)
     draw = normal_drawn(0xC1D7, (2, q_len, 4, 64), (2, kv_len, 4, 64), (2, kv_len, 4, 64), (2, q_len, 4, 64),
                         dtype=jnp.bfloat16)
 
     def attend(implementation):
-        mask = ({"mask": (jnp.arange(kv_len) < lengths[:, None])[:, None, None, :]} if as_mask
+        mask = ({"mask": (np.arange(kv_len) < lengths[:, None])[:, None, None, :]} if as_mask
                 else {"key_value_seq_lengths": lengths})
         return lambda q, k, v: scaled_dot_product_attention(q, k, v, implementation=implementation,
                                                             causal=causal, **mask)
@@ -837,8 +853,8 @@ def single_query_cudnn_decode_matches_float64_attention_and_gradients():
     """One query a row over grouped key heads and distinct key counts (17, 8 and 1), which cuDNN's backward
     takes padded though its forward takes an odd length: on par with the xla kernel, forward and backward,
     from float64 (check 1); the row of one key's query gradient float64 zero."""
-    lengths = jnp.asarray([17, 8, 1], jnp.int32)
-    keep = (np.arange(17)[None, :] < np.asarray(lengths)[:, None])[:, None, None, :]
+    lengths = np.asarray([17, 8, 1], np.int32)
+    keep = (np.arange(17)[None, :] < lengths[:, None])[:, None, None, :]
     draw = normal_drawn(0xDEC0, (3, 1, 4, 64), (3, 17, 2, 64), (3, 17, 2, 64), (3, 1, 4, 64),
                         dtype=jnp.bfloat16)
 
@@ -1108,6 +1124,7 @@ def eligibility_call(dtype, head_dim, causal, window=None, documents=None, max_s
                                  "sinks": jnp.zeros((4,), jnp.float32) if sinks else None}
 
 
+@pytest.mark.compiles_at_run(reason="runs each kernel forced on this GPU, no check-1 site")
 @pytest.mark.parametrize("kernel", ["flash", "triton", "cudnn", "xla", "template"])
 @pytest.mark.parametrize("call", eligibility_cases(),
                          ids=lambda call: "-".join(f"{name}={value}" for name, value in call.items()))

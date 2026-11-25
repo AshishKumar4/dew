@@ -329,9 +329,12 @@ def cells_of(check, generation: str | None = None, *, native: Callable[..., Mapp
         under = generation
         if under is None and hasattr(check, "covers"):
             under = check.covers(**arguments).get("generation")
+        # A check marked to compile at its run (`compiles_at_run`, no check-1 site) is a cell its prepare
+        # passes by (`Cell.at_run`), as tests/conftest.py passes such a test.
+        at_run = next((mark.kwargs["reason"] for mark in marks if mark.name == "compiles_at_run"), None)
         cells.append(Cell(f"{name}: {label}" if label else name, run, under,
                           native=dict(native(**given)) if native else {},
-                          fault=fault(**given) if fault else None))
+                          fault=fault(**given) if fault else None, at_run=at_run))
     return cells
 
 

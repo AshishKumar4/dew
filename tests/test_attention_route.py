@@ -883,14 +883,18 @@ def _causal_terms(length: int):
     gradient's terms its own, the keys' and values' the root of the blocks' summed squares; a function of a
     draw `(query, key, value, sinks, dout)`, the sinks' gradient none."""
     def terms(query, key, value, sinks, dout):
+        # A program a GPU part's prepare traces (`traced_attention_terms`), its operands traced: no host
+        # array of them (a prepare-sm90 run's TracerArrayConversionError where host terms read them).
         del sinks
         blocks = []
-        for first in range(0, length, TRUTH_ROWS):
-            rows = slice(first, first + TRUTH_ROWS)
-            keep = (np.arange(first, first + TRUTH_ROWS)[:, None] >= np.arange(length)[None, :])[None, None]
-            blocks.append(attention_terms(query[:, rows], key, value, dout[:, rows], keep))
-        out, d_query = (np.concatenate([block[leaf] for block in blocks], axis=1) for leaf in (0, 1))
-        d_key, d_value = (np.sqrt(sum(np.square(block[leaf]) for block in blocks)) for leaf in (2, 3))
+        with jax.enable_x64(new_val=True):
+            for first in range(0, length, TRUTH_ROWS):
+                rows = slice(first, first + TRUTH_ROWS)
+                queries = np.arange(first, first + TRUTH_ROWS)[:, None]
+                keep = (queries >= np.arange(length)[None, :])[None, None]
+                blocks.append(traced_attention_terms(query[:, rows], key, value, dout[:, rows], keep))
+            out, d_query = (jnp.concatenate([block[leaf] for block in blocks], axis=1) for leaf in (0, 1))
+            d_key, d_value = (jnp.sqrt(sum(jnp.square(block[leaf]) for block in blocks)) for leaf in (2, 3))
         return out, d_query, d_key, d_value, None
 
     return terms
