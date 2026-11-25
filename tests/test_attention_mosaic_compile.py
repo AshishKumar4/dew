@@ -1166,6 +1166,28 @@ def test_the_training_forward_under_every_score_hook_lowers_for_an_h100(hooks, n
         jax.jit(trained).trace(q, kv, kv, params, initial).lower(lowering_platforms=("cuda",))
 
 
+@lowers("sm90")
+@pytest.mark.parametrize("axes", [template.Kind.TILE, ("batch", "heads", "queries", "keys")],
+                         ids=["kind", "tuple"])
+def test_a_dense_bias_lowers_for_an_h100_whichever_way_its_axes_are_named(axes):
+    """A dense score bias (a `[B, H, Q, K]` side operand) streamed by an H100's producer lowers in the forward
+    whether its axes are a `Kind` or the plain tuple of them: a launch's kinds read through `kind_of`, where
+    a plain tuple missed its tile's stream and was sliced as a vector's (row 13032, Train 1291's review)."""
+    queries = keys = 256
+    spans = template.spans(queries, keys, 1, causal=True)
+    q = jax.ShapeDtypeStruct((1, queries, 4, 128), jnp.bfloat16)
+    kv = jax.ShapeDtypeStruct((1, keys, 2, 128), jnp.bfloat16)
+    bias = jax.ShapeDtypeStruct((1, 4, queries, keys), jnp.float32)
+
+    def forward(q, k, v, bias):
+        hooked = template.Hooks(score=Hook(lambda s, q_pos, k_pos, b: s + b, (Side(bias, axes),)))
+        return attention_mosaic.forward(q, k, v, spans, hooked)
+
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(forward).trace(q, kv, kv, bias).lower(lowering_platforms=("cuda",))
+
+
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("axis", [0, 1])
 def test_a_hook_that_forms_a_unit_axis_compiles_for_an_h100(axis):
