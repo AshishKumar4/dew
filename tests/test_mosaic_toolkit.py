@@ -2308,7 +2308,7 @@ def test_a_staged_batch_is_fenced_for_asynchronous_product_readers_alone(family)
     family = mosaic_sm90.WGMMA if family == "wgmma" else family
 
     def body(out_ref, source, staging):
-        value = plgpu.load(source, (), layout=family.layout, optimized=False)
+        value = plgpu.load(source, layout=family.layout, optimized=False)
         family.staged_all([(value, staging)])
 
     tile = plgpu.SMEM((64, 64), jnp.bfloat16)
