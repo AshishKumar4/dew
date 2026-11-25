@@ -603,7 +603,7 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
         return jnp.einsum(subscripts, lhs, rhs, precision=algorithm, preferred_element_type=formed)
 
     if skipped is not None:
-        scoring, value, logits = _skipped_logits(logits_of, scaled_query, scoring, value, skipped)
+        value, logits = _skipped_logits(logits_of, scaled_query, scoring, value, skipped)
     elif sinks is None:
         scoring, value = repeat_kv_heads(scoring, heads), repeat_kv_heads(value, heads)
         logits = logits_of('...qhd,...khd->...hqk', scaled_query, scoring)
@@ -685,12 +685,14 @@ def _weighted(weights: jax.Array, value: jax.Array, *, skipped, sinks, precision
         # Grouped by key head (`_skipped_logits`' keys whole, a mask every head shares).
         *rows, _, length, keys = weights.shape
         grouped = weights.reshape(*rows, kv_heads, heads // kv_heads, length, keys)
-        # The weights in the values' dtype, as `weighted_values` takes them, over the grouped product.
-        return _by_query_block(
+        # The weights in the values' dtype, as `weighted_values` takes them, over the grouped product, its
+        # key and group axes flattened in the product's own leading shape (rows broadcast).
+        out = _by_query_block(
             lambda weights_of, visited: float32_einsum(
                 '...kgqs,...skd->...qkgd', weights_of.astype(value.dtype), _visited(visited, value),
                 precision=precision),
-            grouped, skipped, query_axis=-2, out_axis=-4).reshape(*rows, length, heads, value.shape[-1])
+            grouped, skipped, query_axis=-2, out_axis=-4)
+        return out.reshape(*out.shape[:-3], heads, out.shape[-1])
     if sinks is None:
         return weighted_values('...hqk,...khd->...qhd', weights, value, precision=precision)
     *rows, heads, length, keys = weights.shape
@@ -727,16 +729,16 @@ def _visited(visited: jax.Array, operand: jax.Array) -> jax.Array:
 
 
 def _skipped_logits(logits_of: Callable, query: jax.Array, key: jax.Array, value: jax.Array,
-                    skipped: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+                    skipped: jax.Array) -> tuple[jax.Array, jax.Array]:
     """`reference_attention`'s logits `[..., H, Q, K]` where a walk `skipped` keys `[H or 1, Q // b, K]`:
-    each query block's products over the keys it visits alone (`_by_query_block`), and the keys and values
-    its weights then read. A mask every head shares (`H or 1` one) groups the query heads by key head, the
+    each query block's products over the keys it visits alone (`_by_query_block`), and the values its
+    weights then read. A mask every head shares (`H or 1` one) groups the query heads by key head, the
     keys and values whole (row 12848's review: a grouped-query call's keys repeated a query head each);
     a mask each head holds its own repeats them, a head's keys zeroed by its own."""
     heads, kv_heads = query.shape[-2], key.shape[-2]
     if skipped.shape[-3] != 1 or kv_heads == heads:
         key, value = repeat_kv_heads(key, heads), repeat_kv_heads(value, heads)
-        return key, value, _by_query_block(
+        return value, _by_query_block(
             lambda rows_of, visited: logits_of('...qhd,...khd->...hqk', rows_of, _visited(visited, key)),
             query, skipped, query_axis=-3, out_axis=-2)
     *rows, length, _, width = query.shape
@@ -744,7 +746,8 @@ def _skipped_logits(logits_of: Callable, query: jax.Array, key: jax.Array, value
     logits = _by_query_block(
         lambda rows_of, visited: logits_of('...qkgd,...skd->...kgqs', rows_of, _visited(visited, key)),
         grouped, skipped, query_axis=-4, out_axis=-2)
-    return key, value, logits.reshape(*rows, heads, length, key.shape[-3])
+    # The key and group axes flattened in the scan's own leading shape (its rows broadcast the operands').
+    return value, logits.reshape(*logits.shape[:-4], heads, *logits.shape[-2:])
 
 
 def _by_query_block(product: Callable, operand: jax.Array, skipped: jax.Array, *, query_axis: int,
