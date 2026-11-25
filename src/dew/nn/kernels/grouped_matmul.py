@@ -1728,7 +1728,7 @@ class MosaicTgmm(_Mosaic):
                 'width': width, 'itemsizes': itemsizes,
                 'stored': jnp.dtype(ba.arguments['out_dtype']).itemsize,
                 'multiprocessors': _multiprocessors(target),
-                'step_seconds': pricing.step_seconds(tile, target, itemsizes),
+                'step_seconds': pricing.step_seconds(tile, target, itemsizes, issued=tokens.dtype),
                 'bandwidth': target.memory_rate, 'launch_seconds': target.launch_seconds, 'target': target,
                 'partial_bytes': self._slice_bytes(ba, tile, target)}
 

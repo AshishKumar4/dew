@@ -44,16 +44,19 @@ def tile_rows(tiles: "Tiles", family: mosaic.Family) -> int:
 
 
 def step_seconds(tiles: "Tiles", target, itemsizes: tuple[float, float],
-                 decoded: tuple = (None, None)) -> float | None:
+                 decoded: tuple = (None, None), *, issued=None) -> float | None:
     """One step of `tiles` on one multiprocessor, in seconds, the unit the kernel gradient's split
     (`split_count`) and a balanced tail (`handoff_steps`) price their walks in: the longer of its products'
-    FLOPs at the multiprocessor's 16-bit tensor rate and its operands' bytes through its shared memory at
+    FLOPs at the multiprocessor's tensor rate for the dtype its MMA issues (`issued`: an 8-bit float's
+    `Rates.eight`, fp32's TF32, else the 16-bit rate, which packed operands decoded before their products
+    take; where None, fp32 operands' TF32 and every other the 16-bit) and its operands' bytes through its
+    shared memory at
     that memory's rate (`templates.cost.rates`, each the architecture's a clock at the part's clock; their
     units overlapped, `cost.units`), a step's `step_shared_bytes` of operands of `itemsizes` (the left's
     and the right's) in their `decoded` forms; None where the target states no tensor rate. A pair's step is
     a CTA's: its rows by the pair's columns (`tile_columns`)."""
     rates = unit_cost.rates(target, device=False)
-    tensor = (rates.tf32 or rates.tensor) if itemsizes == (4, 4) else rates.tensor
+    tensor = _tensor_rate(rates, itemsizes, issued)
     shared = rates.shared
     if tensor is None:
         return None
@@ -70,6 +73,16 @@ def step_seconds(tiles: "Tiles", target, itemsizes: tuple[float, float],
         vmem = (moved + 2 * tiles.block_m * columns * 4) / shared if shared is not None else 0.0
         return max(products, dma, vmem) + (target.kernel_step_seconds or 0.0)
     return products if shared is None else max(products, moved / shared)
+
+
+def _tensor_rate(rates, itemsizes: tuple[float, float], issued) -> float | None:
+    """The multiprocessor's tensor rate (`cost.Rates`) for the operands its MMA issues (`step_seconds`)."""
+    if issued is None:
+        return (rates.tf32 or rates.tensor) if itemsizes == (4, 4) else rates.tensor
+    dtype = jnp.dtype(issued)
+    if jnp.issubdtype(dtype, jnp.floating) and dtype.itemsize == 1:
+        return rates.eight or rates.tensor
+    return (rates.tf32 or rates.tensor) if dtype == jnp.float32 else rates.tensor
 
 
 def step_shared_bytes(tiles: "Tiles", family: mosaic.Family, itemsizes: tuple[float, float],
@@ -130,7 +143,7 @@ def balanced_tail(tiles: "Tiles", grid: tuple[int, int], steps: int, itemsizes: 
     (`handoff_steps`), its `fixed_up` partials' bytes (each tile's fp32 block) and whether its family's walk
     is scoped to its block, which a balanced tail launches persistent (`mosaic.Family.walks_scoped`), each
     priced by `tail.balanced`; None where the target states no rate or walking beats balancing."""
-    step, rate = step_seconds(tiles, target, itemsizes), target.memory_rate
+    step, rate = step_seconds(tiles, target, itemsizes, issued=dtype), target.memory_rate
     pairs = programs // tiles.cluster
     if step is None or rate is None or pairs <= 0:
         return None
@@ -140,7 +153,8 @@ def balanced_tail(tiles: "Tiles", grid: tuple[int, int], steps: int, itemsizes: 
     traffic = tail_of.Traffic(grid, tiles.grid_block_n, tile_rows(tiles, family) * tiles.block_k * left,
                               tiles.block_n * tiles.block_k * right, step, mp, rate, target.l2_bytes)
     return tail_of.balanced(grid[0] * grid[1], steps, pairs, traffic,
-                            handoff_steps=handoff_steps(tiles, target, itemsizes), scoped=family.walks_scoped,
+                            handoff_steps=handoff_steps(tiles, target, itemsizes, issued=dtype),
+                            scoped=family.walks_scoped,
                             partial_bytes=tile_rows(tiles, family) * tile_columns(tiles, family) * 4)
 
 
@@ -193,11 +207,11 @@ def within_workspace(target: generation.GpuTarget | None, held: float) -> bool:
     return bound is None or held <= bound
 
 
-def handoff_steps(tiles: "Tiles", target, itemsizes: tuple[int, int]) -> float:
+def handoff_steps(tiles: "Tiles", target, itemsizes: tuple[int, int], *, issued=None) -> float:
     """A balanced tail's hand-off of a partial between programs (`GpuTarget.handoff_seconds`) in MMA steps
     of `tiles` (`step_seconds`), as `tail.balanced` prices it; none where the part's hand-off or its rate is
     unmeasured."""
-    step, handoff = step_seconds(tiles, target, itemsizes), target.handoff_seconds
+    step, handoff = step_seconds(tiles, target, itemsizes, issued=issued), target.handoff_seconds
     return 0.0 if step is None or handoff is None else handoff / step
 
 

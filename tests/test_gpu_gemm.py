@@ -563,5 +563,7 @@ def test_an_adapted_products_backward_keeps_a_narrow_presets_fp32_products_wide(
         label = f"an adapted product's rows gradient into {np.dtype(out_dtype)}"
         gradients.append((scale, out_dtype, ahead_arm(jax.jit(rows_gradient), label)(x, kernel, a, b, dy)))
     for scale, out_dtype, d_x in gradients:
-        assert np.all(np.isfinite(np.asarray(d_x, np.float32))), (out_dtype, d_x[0])
-        assert np.asarray(d_x[0, 0], np.float32) == 64.0 * (4.0 if scale > 1 else 1.0), (out_dtype, d_x[0])
+        # Every feature of the cotangent's row 64 (or 256 through the scale), every other row zero: exact.
+        want = np.zeros((8, 16), np.float32)
+        want[0] = 64.0 * (4.0 if scale > 1 else 1.0)
+        np.testing.assert_array_equal(np.asarray(d_x, np.float32), want, err_msg=str(out_dtype))

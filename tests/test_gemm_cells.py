@@ -124,3 +124,19 @@ def test_a_pinned_split_runs_only_where_its_partials_fit_the_workspace():
                             if isinstance(op, grouped_matmul.MosaicGmm)}
             with tuning.pinned({grouped_matmul.MosaicGmm: tile}), pytest.raises(tuning.Unpinnable):
                 jax.jit(run).trace(*shapes(264))
+
+
+@pytest.mark.parametrize(("operands", "rate"), [("float8_e4m3fn", "eight"), ("bfloat16", "tensor")])
+def test_a_steps_products_are_priced_at_the_rate_its_mma_issues(operands, rate):
+    """A step's products are priced at the tensor rate of the dtype its MMA issues (`pricing.step_seconds`'s
+    `issued`): an 8-bit float's on an H100, which doubles the 16-bit rate, so a cooperative 128 x 256 FP8 step
+    within its products' time takes half a bf16 step's; a bf16 one, the 16-bit rate (row 13008)."""
+    from dew.nn.kernels.templates import cost
+    from dew.nn.kernels.templates.gemm import pricing, tiling
+
+    h100 = generation.gpu_target("sm90")
+    tiles = tiling.Tiles(128, 256, 64, 4, 8, warpgroups=2, family="wgmma")
+    size = jnp.dtype(operands).itemsize
+    step = pricing.step_seconds(tiles, h100, (size, size), issued=jnp.dtype(operands))
+    rates = cost.rates(h100, device=False)
+    assert step == 2 * 128 * 256 * 64 / {"eight": rates.eight, "tensor": rates.tensor}[rate]
