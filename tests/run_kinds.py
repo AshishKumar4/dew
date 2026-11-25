@@ -28,7 +28,7 @@ from dew.data import TFDS, Files, Loading, images as image_steps, presets
 from dew.data.pipeline import Rejected
 from dew.data.sources.tokens import TokenFiles
 from dew.decision import decisions
-from dew.decision.config import DecisionRunConfig, Letters, RowBudgets
+from dew.decision.config import CrossContext, DecisionRunConfig, Letters, RowBudgets
 from dew.decision.layout import Labels, QuestionSegment, built_in, per_question
 from dew.diffusion.presets import Flow
 from dew.inputs import TextCondition
@@ -252,9 +252,9 @@ def state_then_question() -> tuple[QuestionSegment, ...]:
     return begin, state, header, separator, lines, end
 
 
-BESIDE = {"layout.framing": {"segments": built_in(None, "question_first"), "max_len": 256},
-          "layout.unit": {"segments": state_then_question(), "max_len": 256},
-          "context_encoder": {"context_layers": (0,), "context_length": 64}}
+BESIDE = {"layout.framing": {"rows": RowBudgets(segments=built_in(None, "question_first"), max_len=256)},
+          "layout.unit": {"rows": RowBudgets(segments=state_then_question(), max_len=256)},
+          "context_encoder": {"context": CrossContext(layers=(0,), length=64)}}
 def lettered(root: Path, drawn: bool) -> RunConfig:
     """A decision run of a fresh letter readout (`--head letters`) over a tiny causal source, its rows
     lettered option lines read at an answer cue, the layout's labels the head's."""

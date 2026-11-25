@@ -260,6 +260,11 @@ def holds(field, option) -> bool:
     return kinds(option) <= kinds(field)
 
 
+CONFIG_MODULES = ("dew.config", "dew.decision.config")
+"""The modules of a run's sections, whose fields reach a saved task's options (`reach`): a decision run's rows
+and context among them (`RowBudgets`, `CrossContext`)."""
+
+
 def reach(run: RunConfig, objective: str, name: str, annotation, argument: bool = True) -> Reach | None:
     """Where `dew train` sets a saved task's option `name` of `annotation`: a field of the run, or of a
     section it holds, declared of that type (a number or a text's of that name) or a builder of it
@@ -271,11 +276,14 @@ def reach(run: RunConfig, objective: str, name: str, annotation, argument: bool 
         hints = annotations_of(type(config), include_extras=True)
         for field in dataclasses.fields(config):
             value, hint = getattr(config, field.name), hints[field.name]
-            if field.name == name if named else holds(bare(hint), bare(annotation)):
+            # A section's field names its option by its path, its dots as underscores (a decision run's
+            # `context.encoder`, the settings' `context_encoder`).
+            if (name in (field.name, f"{prefix}{field.name}".replace(".", "_")) if named
+                    else holds(bare(hint), bare(annotation))):
                 yield Reach(prefix + field.name, hint)
             elif not named and builds(hint, annotation):
                 yield Reach(prefix + field.name, hint, builds=True)
-            elif dataclasses.is_dataclass(value) and type(value).__module__.startswith("dew.config"):
+            elif dataclasses.is_dataclass(value) and type(value).__module__.startswith(CONFIG_MODULES):
                 yield from paths(value, f"{prefix}{field.name}.")
     found = next(paths(run, ""), None)
     if found is None and argument and name in inspect.signature(objectives[objective]).parameters:

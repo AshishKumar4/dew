@@ -20,7 +20,7 @@ from run_kinds import MostlyKept, trained
 from dew.config import ModelConfig
 from dew.data import Files, Loading, Phase, Steps, phases
 from dew.decision import Decide, decisions
-from dew.decision.config import DecisionRunConfig
+from dew.decision.config import DecisionRunConfig, RowBudgets
 from dew.nn.backbones.decoder_stack import Loop
 
 QWEN35 = Path(__file__).parent / "fixtures" / "hf" / "qwen35-native-tiny"
@@ -65,7 +65,8 @@ LOOP = Loop(STEPS[-1], step_norm=False, layers=(1, 3), implicit=True)
 def run(root: Path, steps, data, loop: Loop = LOOP) -> DecisionRunConfig:
     del root
     return DecisionRunConfig(pretrained=str(QWEN35),
-                             model=ModelConfig("causal_transformer", {"dtype": "float32"}), max_len=MAX_LEN,
+                             model=ModelConfig("causal_transformer", {"dtype": "float32"}),
+                             rows=RowBudgets(max_len=MAX_LEN),
                              data=data, validation=None, loop=loop, passes=steps)
 
 

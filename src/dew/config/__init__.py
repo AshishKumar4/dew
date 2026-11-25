@@ -809,10 +809,15 @@ class RunConfig:
         """
         chained = {path: value for path, value in point.items() if path.partition(".")[0] in CHAINS}
         record = self._fields_record()
-        for path, value in point.items():
+        # The shallower paths first: a path under a section no run holds unset that the same point sets
+        # (`context`, then `context.encoder`) is placed in the run as the point sets that section.
+        for path, value in sorted(point.items(), key=lambda item: item[0].count(".")):
             if path in chained:
                 continue
-            keys, unset = _placed(self, path)
+            try:
+                keys, unset = _placed(self, path)
+            except KeyError:
+                keys, unset = _placed(type(self).from_dict(record), path)
             *groups, field = keys
             node = record
             for group in groups:

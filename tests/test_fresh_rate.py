@@ -405,7 +405,10 @@ def test_a_shared_form_run_draws_its_layers_gates_alone_in_its_fresh_group(tmp_p
     gate."""
     from run_kinds import trained
 
-    shared = dataclasses.replace(context_run(tmp_path), context_form="shared", context_layers=(3,))
+    from dew.decision.config import CrossContext
+
+    shared = dataclasses.replace(context_run(tmp_path),
+                                 context=CrossContext(layers=(3,), length=16, form="shared"))
     gated, _ = trained(shared, tmp_path, "shared")
     labels = labelled(groups(tmp_path, "shared"), gated.variables["params"])
     drawn = {path: label for path, label in labels.items() if crossing(path)}
