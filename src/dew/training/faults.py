@@ -21,11 +21,13 @@ import os
 import socket
 import sys
 from pathlib import Path
+from typing import TextIO
 
 _log = logging.getLogger(__name__)
 
-_OWNED: list[bool] = []
-"""Whether this process's fault handler is Dew's, decided once as it is readied (`owned`)."""
+_OWNED: list[TextIO | None] = []
+"""The stream this process's fault handler writes to where it is Dew's, None where another owner's, decided
+once (`owned`)."""
 
 
 def owned() -> None:
@@ -34,12 +36,12 @@ def owned() -> None:
     before NCCL starts. Where another owner enabled the handler, it stays theirs."""
     if _OWNED:
         return
-    if faulthandler.is_enabled() or sys.__stderr__ is None:
-        _OWNED.append(False)
+    if faulthandler.is_enabled() or (stream := sys.__stderr__) is None:
+        _OWNED.append(None)
         return
     os.environ.setdefault("UCX_ERROR_SIGNALS", "")
-    faulthandler.enable(sys.__stderr__, all_threads=True)
-    _OWNED.append(True)
+    faulthandler.enable(stream, all_threads=True)
+    _OWNED.append(stream)
 
 
 def record_path(directory: str) -> Path:
@@ -55,7 +57,7 @@ def recording(directory: str | None):
     on where nothing made it so before (`owned`: no JAX read). None where the handler is another owner's,
     or the run keeps no directory on this host's file system (no checkpoints, or a bucket's)."""
     owned()
-    if not _OWNED[0] or directory is None or "://" in directory:
+    if (stream := _OWNED[0]) is None or directory is None or "://" in directory:
         yield None
         return
     path = record_path(directory)
@@ -65,4 +67,4 @@ def recording(directory: str | None):
         try:
             yield path
         finally:
-            faulthandler.enable(sys.__stderr__, all_threads=True)
+            faulthandler.enable(stream, all_threads=True)
