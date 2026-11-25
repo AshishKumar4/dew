@@ -90,17 +90,18 @@ class GatedCase:
             return False
         gate, down = self.kernels
         hidden = jax.ShapeDtypeStruct((self.rows.shape[0], gate.shape[-1]), self.dtype)
-        tile = jax.ShapeDtypeStruct((128, 128), self.dtype)
-        if not hook_lowers(self.hook, (tile, tile), gpu_target()):
-            return False
         if self.grouped:
             return _grouped_launched(self.rows, gate, down, hidden, self.dtype, self.precision, self.hook,
                                      whole=self.whole)
         try:
-            return all(projections.launches(rows, kernel, self.dtype, self.precision, whole=self.whole)
-                       for rows, kernel in ((self.rows, gate), (hidden, down)))
+            launched = all(projections.launches(rows, kernel, self.dtype, self.precision, whole=self.whole)
+                           for rows, kernel in ((self.rows, gate), (hidden, down)))
         except KernelRefused:
             return False
+        if not launched:
+            return False
+        tile = jax.ShapeDtypeStruct((128, 128), self.dtype)
+        return hook_lowers(self.hook, (tile, tile), gpu_target())
 
 
 def _paired_epilogue(hook: Callable[[jax.Array, jax.Array], jax.Array], dtype: jnp.dtype):

@@ -2267,13 +2267,13 @@ def test_structural_closed_isolates_callbacks_device_consts_and_prng_impls():
     def make_prng(fill: int):
         return jrandom.define_prng_impl(
             key_shape=(2,),
-            seed_fn=lambda seed: jnp.zeros((2,), jnp.uint32),
-            split_fn=lambda key, shape: jnp.broadcast_to(key, (*shape, 2)),
-            random_bits_fn=lambda key, bit_width, shape: jnp.full(shape, fill, jnp.uint32),
-            fold_in_fn=lambda key, word: key,
+            seed=lambda seed: jnp.zeros((2,), jnp.uint32),
+            split=lambda key, shape: jnp.broadcast_to(key, (*shape, 2)),
+            random_bits=lambda key, bit_width, shape: jnp.full(shape, fill, jnp.uint32),
+            fold_in=lambda key, word: key,
+            name="shared_test_name",
             tag="shared_test_tag",
         )
-
     impl_a, impl_b = make_prng(11), make_prng(29)
     key_a, key_b = jax.random.key(0, impl=impl_a), jax.random.key(0, impl=impl_b)
 
