@@ -316,15 +316,16 @@ def _deriving(accurate: bool, saturation: Saturation) -> Hashable:
             rules.admitted_names(accurate))
 
 
-def _held(jaxpr: jcore.Jaxpr) -> terms.Region:
-    """What `jaxpr` proves of each value (`terms.Region.held`, its magnitudes, and `terms.Region.apart`, the
-    rest), its structure's alone (`terms.Skeleton`), its constants taken as inputs: what its windows read
-    of the values they take from outside them."""
-    opened = jaxpr.replace(constvars=[], invars=[*jaxpr.constvars, *jaxpr.invars])
-    return terms.region(opened, forms=terms.Skeleton)
+def _held(jaxpr: jcore.Jaxpr) -> tuple[dict[jcore.Var, terms.Magnitude | None], dict[jcore.Var, terms.Apart]]:
+    """What `jaxpr` proves of each value (`terms.proven`: its magnitudes and `Apart`), its constants taken as
+    inputs: what its windows read of the values they take from outside them."""
+    return terms.proven(jaxpr)
 
 
-def _declared(window: jcore.Jaxpr, proven: terms.Region | None) -> dict[int, terms.Proven]:
+def _declared(
+    window: jcore.Jaxpr,
+    proven: tuple[dict[jcore.Var, terms.Magnitude | None], dict[jcore.Var, terms.Apart]] | None,
+) -> dict[int, terms.Proven]:
     """What `window`'s inputs hold (`terms.Proven`, by input index): each one as the program proves it
     (`_held`), its magnitude's bound as its power of two where the program bounds one and the rest
     (`terms.Apart`), so a bound a window cuts its equations below holds within it (a scale's under a
@@ -334,11 +335,12 @@ def _declared(window: jcore.Jaxpr, proven: terms.Region | None) -> dict[int, ter
     declared: dict[int, terms.Proven] = {}
     if proven is None:
         return declared
+    held, apart = proven
     for index, var in enumerate(window.invars):
-        bound = proven.held.get(var)
+        bound = held.get(var)
         magnitude = (None if bound is None or bound >= 1024
                      else 0.0 if bound == terms.NOTHING else math.ldexp(1.0, bound))
-        declared[index] = terms.Proven(magnitude, proven.apart.get(var, terms.NOWHERE))
+        declared[index] = terms.Proven(magnitude, apart.get(var, terms.NOWHERE))
     return declared
 
 
@@ -372,16 +374,29 @@ def _splices(window: jcore.Jaxpr, yielded: list[jcore.Var], done: Rewrite,
     leaves = [fusion.typed(var.aval, weak=True) for var in window.invars if isinstance(var.aval, ShapedArray)]
     if len(leaves) != len(window.invars):
         return {}
-    chosen = []
+    changed_forms: list[terms.Term] = []
     for out, root in zip(yielded, done.region.outputs, strict=True):
         made_at = id(made_by[out])
         if root is None or made_at in taken:
             continue
         form = done.picked.get(terms.key(root))
-        if form is None or terms.key(form) == terms.key(root):
+        if form is not None and terms.key(form) != terms.key(root):
+            changed_forms.append(form)
+    shared = ({terms.key(sub) for form in changed_forms for sub in terms.subterms(form)}
+              if changed_forms else set())
+    chosen = []
+    seen_at: set[int] = set()
+    for out, root in zip(yielded, done.region.outputs, strict=True):
+        made_at = id(made_by[out])
+        if root is None or made_at in taken or made_at in seen_at:
             continue
-        if made_at not in {at for _, _, at in chosen}:
-            chosen.append((out, form, made_at))
+        form = done.picked.get(terms.key(root))
+        if form is None:
+            continue
+        if terms.key(form) == terms.key(root) and terms.key(root) not in shared:
+            continue
+        seen_at.add(made_at)
+        chosen.append((out, form, made_at))
     while chosen:
         traced = jax.make_jaxpr(lambda *values, forms=tuple(form for _, form, _ in chosen):
                                 terms.forms_value(done.region, list(forms), list(values)))(*leaves)
@@ -462,8 +477,11 @@ def _windows(jaxpr: jcore.Jaxpr) -> list[tuple[jcore.Jaxpr, list[jcore.Var]]]:
     heads = [equation for equation in jaxpr.eqns if heads_window(equation)]
     if not heads:
         return []
+    rsqrts, reciprocals, fma_readers = _reuse_siblings(jaxpr, heads)
     order = {id(equation): index for index, equation in enumerate(jaxpr.eqns)}
-    clusters: list[dict[int, jcore.JaxprEqn]] = []
+    live_clusters: list[dict[int, jcore.JaxprEqn] | None] = []
+    owners: dict[int, set[int]] = {}
+    capped: set[int] = set()
     for head in heads:
         window, frontier = {id(head): head}, [(head, 0)]
         while frontier:
@@ -473,11 +491,10 @@ def _windows(jaxpr: jcore.Jaxpr) -> list[tuple[jcore.Jaxpr, list[jcore.Var]]]:
                 if operand is not None and depth + 1 < WINDOW and id(operand) not in window:
                     window[id(operand)] = operand
                     frontier.append((operand, depth + 1))
-        sharing = [cluster for cluster in clusters if cluster.keys() & window.keys()]
-        if sharing and len(set(window).union(*(cluster.keys() for cluster in sharing))) <= CLUSTER:
-            clusters = [cluster for cluster in clusters if all(cluster is not shared for shared in sharing)]
-            window = {key: member for cluster in [*sharing, window] for key, member in cluster.items()}
-        clusters.append(window)
+        if head.primitive is jax.lax.div_p:
+            _pull_reuse_siblings(head, maker, rsqrts, reciprocals, fma_readers, window)
+        _merge_cluster(live_clusters, owners, capped, window)
+    clusters = [cluster for cluster in live_clusters if cluster is not None]
     read: dict[jcore.Var, set[int]] = {}
     for equation in jaxpr.eqns:
         for atom in equation.invars:
@@ -503,11 +520,157 @@ def _windows(jaxpr: jcore.Jaxpr) -> list[tuple[jcore.Jaxpr, list[jcore.Var]]]:
             equations.append(equation.replace(invars=invars, outvars=outvars))
         for equation in members:
             out = equation.outvars[0]
-            if out in returned or read.get(out, set()) - cluster.keys():
+            readers = read.get(out, ())
+            if out in returned or len(readers) > len(cluster) or any(r not in cluster for r in readers):
                 outputs.append(fresh[out])
                 yielded.append(out)
         windows.append((jcore.Jaxpr([], list(outside), outputs, equations), yielded))
     return windows
+
+
+def _merge_cluster(live_clusters: list[dict[int, jcore.JaxprEqn] | None],
+                   owners: dict[int, set[int]], capped: set[int],
+                   window: dict[int, jcore.JaxprEqn]) -> None:
+    """Join `window` into any live clusters sharing an equation where the union stays within `CLUSTER`,
+    keeping live owner links directly and marking keys whose combined owners already exceed `CLUSTER` in
+    `capped` so high-fanout shared producers stay O(1) per head."""
+    if not any(key in capped for key in window):
+        shared_ids: set[int] = set()
+        union_keys = set(window)
+        overflow = False
+        for key in window:
+            for cid in owners.get(key, ()):
+                if cid in shared_ids:
+                    continue
+                shared = live_clusters[cid]
+                if shared is None:
+                    continue
+                shared_ids.add(cid)
+                union_keys.update(shared)
+                if len(union_keys) > CLUSTER:
+                    overflow = True
+                    break
+            if overflow:
+                break
+        if shared_ids and not overflow:
+            merged: dict[int, jcore.JaxprEqn] = {}
+            for cid in sorted(shared_ids):
+                shared = live_clusters[cid]
+                if shared is not None:
+                    merged.update(shared)
+                    live_clusters[cid] = None
+                    for key in shared:
+                        if (owned := owners.get(key)) is not None:
+                            owned.discard(cid)
+            merged.update(window)
+            window = merged
+    new_id = len(live_clusters)
+    live_clusters.append(window)
+    for key in window:
+        if key in capped:
+            continue
+        owned = owners.setdefault(key, set())
+        owned.add(new_id)
+        if len(owned) > 1:
+            key_union: set[int] = set()
+            for cid in owned:
+                if (member := live_clusters[cid]) is not None:
+                    key_union.update(member)
+                    if len(key_union) > CLUSTER:
+                        capped.add(key)
+                        owners.pop(key, None)
+                        break
+
+
+def _is_unit_literal(atom) -> bool:
+    """Whether `atom` is a scalar floating literal equal to 1."""
+    if not isinstance(atom, jcore.Literal):
+        return False
+    value = np.asarray(atom.val)
+    return value.ndim == 0 and jnp.issubdtype(value.dtype, jnp.inexact) and bool(value == 1)
+
+
+def _reuse_siblings(
+    jaxpr: jcore.Jaxpr, heads: Sequence[jcore.JaxprEqn],
+) -> tuple[dict[jcore.Var, list[jcore.JaxprEqn]], dict[jcore.Var, list[jcore.JaxprEqn]],
+           dict[jcore.Var, list[jcore.JaxprEqn]]]:
+    """Index sibling `rsqrt(v)`, `1 / y`, and immediate FMA-eligible `add`/`sub` consumers in `jaxpr`
+    when any window head is a division."""
+    rsqrts: dict[jcore.Var, list[jcore.JaxprEqn]] = {}
+    reciprocals: dict[jcore.Var, list[jcore.JaxprEqn]] = {}
+    fma_readers: dict[jcore.Var, list[jcore.JaxprEqn]] = {}
+    div_outs = {head.outvars[0] for head in heads if head.primitive is jax.lax.div_p}
+    if div_outs:
+        for equation in jaxpr.eqns:
+            if equation.primitive is jax.lax.rsqrt_p and isinstance(equation.invars[0], jcore.Var):
+                rsqrts.setdefault(equation.invars[0], []).append(equation)
+            elif (equation.primitive is jax.lax.div_p and isinstance(equation.invars[1], jcore.Var)
+                  and _is_unit_literal(equation.invars[0])):
+                reciprocals.setdefault(equation.invars[1], []).append(equation)
+            elif equation.primitive is jax.lax.add_p:
+                for atom in equation.invars:
+                    if isinstance(atom, jcore.Var) and atom in div_outs:
+                        fma_readers.setdefault(atom, []).append(equation)
+            elif (equation.primitive is jax.lax.sub_p and isinstance(equation.invars[0], jcore.Var)
+                  and equation.invars[0] in div_outs):
+                fma_readers.setdefault(equation.invars[0], []).append(equation)
+    return rsqrts, reciprocals, fma_readers
+
+
+_REUSE_MAKERS = (jax.lax.max_p, jax.lax.add_p, jax.lax.reduce_sum_p)
+
+
+def _pull_reuse_siblings(head: jcore.JaxprEqn, maker: Callable,
+                         rsqrts: Mapping[jcore.Var, Sequence[jcore.JaxprEqn]],
+                         reciprocals: Mapping[jcore.Var, Sequence[jcore.JaxprEqn]],
+                         fma_readers: Mapping[jcore.Var, Sequence[jcore.JaxprEqn]],
+                         window: dict[int, jcore.JaxprEqn]) -> None:
+    """Pull sibling `rsqrt(v)` and `1 / y` equations sharing a division head's radicand or divisor (directly
+    or through chained `broadcast_in_dim`s), connecting chain equations beyond `WINDOW`, and any immediate
+    FMA-eligible `add`/`sub` consumer of a matched division head into `window` up to `CLUSTER`."""
+    divisor = head.invars[1]
+    if not isinstance(divisor, jcore.Var):
+        return
+    chain: list[jcore.JaxprEqn] = []
+    div_chain: list[tuple[jcore.Var, list[jcore.JaxprEqn]]] = [(divisor, [])]
+    rad_chain: list[tuple[jcore.Var, list[jcore.JaxprEqn]]] = []
+    eq_d = maker(divisor)
+    while (eq_d is not None and eq_d.primitive is jax.lax.broadcast_in_dim_p
+           and isinstance(eq_d.invars[0], jcore.Var)):
+        chain.append(eq_d)
+        div_chain.append((eq_d.invars[0], list(chain)))
+        eq_d = maker(eq_d.invars[0])
+    if eq_d is not None and eq_d.primitive is jax.lax.sqrt_p and isinstance(eq_d.invars[0], jcore.Var):
+        sqrt_chain = [*chain, eq_d]
+        rad = eq_d.invars[0]
+        rad_chain.append((rad, list(sqrt_chain)))
+        eq_r = maker(rad)
+        while (eq_r is not None and eq_r.primitive is jax.lax.broadcast_in_dim_p
+               and isinstance(eq_r.invars[0], jcore.Var)):
+            sqrt_chain.append(eq_r)
+            rad_chain.append((eq_r.invars[0], list(sqrt_chain)))
+            eq_r = maker(eq_r.invars[0])
+
+    def _add(eqs: Iterable[jcore.JaxprEqn]) -> None:
+        for eq_item in eqs:
+            if id(eq_item) not in window and len(window) < CLUSTER:
+                window[id(eq_item)] = eq_item
+
+    matched = False
+    for rad, needed in rad_chain:
+        siblings = rsqrts.get(rad, ())
+        if siblings:
+            matched = True
+            _add((*needed, *siblings))
+    for div_var, needed in div_chain:
+        siblings = reciprocals.get(div_var, ())
+        if siblings:
+            matched = True
+            div_maker = maker(div_var)
+            extra = (div_maker,) if div_maker is not None and div_maker.primitive in _REUSE_MAKERS else ()
+            _add((*needed, *extra, *siblings))
+    if matched:
+        _add(fma_readers.get(head.outvars[0], ()))
 
 
 def _region(closed: jcore.Jaxpr, *, accurate: bool, saturation: Saturation,
@@ -536,7 +699,9 @@ def _region(closed: jcore.Jaxpr, *, accurate: bool, saturation: Saturation,
     graph.push()
     saturated = saturate(graph, region, firing, saturation)
     nodes = node_count(graph)
-    forms, after = extracted(graph, bundle, priced)
+    # Cross-root sharing (`reuse`: `a / sqrt(v)` sharing a sibling `rsqrt(v)`) ties greedy per-class
+    # extraction (`sqrt` and `rsqrt` price alike per class); exact DAG extraction sees the shared node.
+    forms, after = extracted(graph, bundle, priced, exact=saturated.fired.get("reuse", 0) > 0)
     changed = any(terms.key(form) != terms.key(root) for root, form in zip(roots, forms, strict=True))
     graph.pop()
     before = after
@@ -804,17 +969,20 @@ def _within(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels:
     changed = False
     equations = []
     for equation in jaxpr.eqns:
+        cleaned = equation.primitive in partial_eval.dce_rules
         if _mapped(equation):
             # A manual mesh's body, each device's program, rewritten in its own context (`_manual`), within
             # the context the equation was recorded in (its abstract mesh among it: a map staged on a mesh of
             # its own beside the caller's, JAX's replay of an equation, `JaxprEqn.ctx`).
             with equation.ctx.manager, _manual(equation.params):
-                params = with_bodies(equation.params,
-                                     lambda body: _closed(body, accurate, saturation, kernels))
+                params = with_bodies(
+                    equation.params,
+                    lambda body, c=cleaned: _closed(body, accurate, saturation, kernels, _cleaned=c))
         elif _holds_regions(equation) or _marked(equation, WITHIN) or (
                 _marked(equation, (Algebra,)) and _opening(equation) is None):
-            params = with_bodies(equation.params,
-                                 lambda body: _closed(body, accurate, saturation, kernels))
+            params = with_bodies(
+                equation.params,
+                lambda body, c=cleaned: _closed(body, accurate, saturation, kernels, _cleaned=c))
         elif _opening(equation) is not None:
             # Its body's own bodies rewritten, its math left to the region it opens into (`_opened`).
             params = with_bodies(equation.params,
@@ -893,7 +1061,8 @@ def _opening(equation: jcore.JaxprEqn) -> jcore.Jaxpr | None:
     return body if body is not None and not body.consts else None
 
 
-def _rewritten(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels: bool) -> jcore.Jaxpr:
+def _rewritten(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels: bool,
+               *, _cleaned: bool = False) -> jcore.Jaxpr:
     """`closed`'s bodies rewritten in place (`_within`), then its own math (`_windowed`) with each Algebra
     span's body opened into it (`_opened`), so a window reaches across the span's boundary, where the run's
     numerics admit a rewrite of it (`_saturating`), then, with `kernels`, its products fused with their
@@ -901,8 +1070,9 @@ def _rewritten(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kern
     of Dew's takes them (`fusion.fused_program`), whatever the numerics admit: accurate forms limit
     reassociation alone (row 4730). The program with its spans kept as traced where no window's form lands
     (`closed` itself where nothing changed). The pass reads the program without its unread work (`_read`),
-    so nothing it discards is derived, written as a kernel, certified or built."""
-    read = _read(closed)
+    so nothing it discards is derived, written as a kernel, certified or built; nested bodies visited after
+    an enclosing `_read` (`_cleaned`) skip redundant recursive DCE passes."""
+    read = closed if _cleaned else _read(closed)
     made = _within(read, accurate, saturation, kernels)
     if _saturating(accurate):
         spans: list[_Span] = []
@@ -981,7 +1151,8 @@ nothing changes holds None, not itself, which would keep it alive."""
 
 
 
-def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels: bool) -> jcore.Jaxpr:
+def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels: bool,
+            *, _cleaned: bool = False) -> jcore.Jaxpr:
     """A body's program rewritten, over the same inputs, weak types included, and the same outputs, the same
     object for every call site and retrace of one body (`_REWRITTEN`), the body itself where nothing
     changes; a body whose constants another holds (an open jaxpr), or that reads a value of no shape, as it
@@ -1007,10 +1178,10 @@ def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels
 
     def rewrite() -> _Body:
         with kernel_report.recording() as regions:
-            made, record = fusion.recorded(lambda: _rewritten(closed, accurate, saturation, kernels))
+            made, record = fusion.recorded(
+                lambda: _rewritten(closed, accurate, saturation, kernels, _cleaned=_cleaned))
         fresh.append(_Body(None if made is closed else made, record, tuple(regions.rewritten)))
         return fresh[0]
-
     # Held with the facts its rewrite read while each answers alike (`_cache.holding`).
     body = _cache.holding(rewrites, key, rewrite, fusion.DECISIONS_HELD)
     reused = not fresh

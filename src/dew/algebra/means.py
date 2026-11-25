@@ -304,15 +304,16 @@ def merged_state_chunked(load, chunks: int, units: Units, axis: int):
     def joining(c, carry):
         joined, finite, least, most, held = carry
         outputs, totals, anchors, valid = load(c)
-        holds = valid & _mass(totals)[0]
+        mass_holds = _mass(totals)[0]
+        holds = mass_holds if valid is None else valid & mass_holds
+        finite_anchor = jnp.isfinite(anchors) if valid is None else valid & jnp.isfinite(anchors)
         laid = _laid(holds, outputs)
         return (jnp.maximum(joined, jnp.max(jnp.where(holds, anchors, -jnp.inf), axis=axis, keepdims=True)),
-                jnp.maximum(finite, jnp.max(jnp.where(valid & jnp.isfinite(anchors), anchors, -jnp.inf),
+                jnp.maximum(finite, jnp.max(jnp.where(finite_anchor, anchors, -jnp.inf),
                                             axis=axis, keepdims=True)),
                 jnp.minimum(least, jnp.min(jnp.where(laid, outputs, jnp.inf), axis=axis)),
                 jnp.maximum(most, jnp.max(jnp.where(laid, outputs, -jnp.inf), axis=axis)),
                 held | jnp.any(laid, axis=axis))
-
     kept = tuple(1 if place == axis else size for place, size in enumerate(totals.shape))
     start = (jnp.full(kept, -jnp.inf, dtype), jnp.full(kept, -jnp.inf, dtype),
              jnp.full(channels, jnp.inf, dtype), jnp.full(channels, -jnp.inf, dtype),
@@ -326,8 +327,8 @@ def merged_state_chunked(load, chunks: int, units: Units, axis: int):
     def weighed(c):
         outputs, totals, anchors, valid = load(c)
         _, operands = _laid_mean(outputs, *_weights(totals, anchors, joined))
-        return [_laid_to(operand, rank) for operand in operands], _laid_to(valid, rank)
-
+        laid_valid = None if valid is None else _laid_to(valid, rank)
+        return [_laid_to(operand, rank) for operand in operands], laid_valid
     count = chunks * outputs.shape[axis]
     mean = dataclasses.replace(_MEAN, axis=axis, units=units)
     numerator, masses = _streamed(weighed, chunks, [_Sum(mean.numerator, axis, (), count),

@@ -678,3 +678,60 @@ def test_applied_preserves_single_rounding_under_gradual_underflow():
         assert int(got.view(np.uint32)) == 0x00078001
     else:
         assert int(got.view(np.uint32)) == 0x00000000
+
+
+def _unprotected_primitives(jaxpr):
+    """Primitives reachable from `jaxpr` recursing through all nested bodies except `Protected` spans
+    (preserving precision-transform barriers while checking that no window loop or barrier leaks out)."""
+    from dew.nn.derivatives import Protected, marked_call_p
+    from dew.nn.programs import bodies
+
+    seen = set()
+    stack = [jaxpr]
+    while stack:
+        body = stack.pop()
+        for eq in body.eqns:
+            seen.add(eq.primitive)
+            if eq.primitive is marked_call_p and isinstance(eq.params["kind"], Protected):
+                continue
+            stack.extend(bodies(eq))
+    return seen
+
+
+def test_singleton_ratios_emit_no_window_loop_and_hold_degenerate_values():
+    """Any 1-state ratio (`means.finished`, `means.resumed`, 1-state `merged_output`, 1-state `merged_state`,
+    and an arbitrary signed 1-state `ratios.Ratio`) lowers through `_streamed`'s general singleton path
+    without a `while` loop anywhere or any unprotected window `optimization_barrier`, and matches float64
+    truth at zero, negative zero, subnormals, and extreme magnitudes (rows 12223, 12269, 12331)."""
+    from dew.nn.programs import equations
+
+    signed_form = ratios.Ratio(numerator=((-1.0, (("v", 0),)),), denominator=((1.0, (("v", 1),)),),
+                               axis=0, reduced=True, units=windows.Units())
+    a = np.asarray([[0.0, -0.0, SUBNORMAL, LEAST, 1.5, -2.0 ** 100, LARGEST]], np.float32)
+    b = np.asarray([[2.0]], np.float32)
+    for sum_fn, args in (
+        (lambda x, y: ratios._ratio_sums((x, y), means._FINISHED), (a, b[:, 0])),
+        (lambda x, y: ratios._ratio_sums((x, y), means._RESUMED), (a, b[:, 0])),
+        (lambda x, y: ratios._ratio_sums((x, y), signed_form), (a, b)),
+    ):
+        traced = jax.make_jaxpr(sum_fn)(*args).jaxpr
+        all_prims = {eq.primitive for eq in equations(traced)}
+        assert jax.lax.while_p not in all_prims
+        assert jax.lax.optimization_barrier_p not in _unprotected_primitives(traced)
+    merged_traced = jax.make_jaxpr(
+        lambda o, w, m: means._merged_state_value(o, w, m, units=windows.Units(), axis=0))(
+            a, b[:, 0], np.asarray([-3.0], np.float32)).jaxpr
+    assert jax.lax.while_p not in {eq.primitive for eq in equations(merged_traced)}
+    expected_signed = np.asarray(
+        [_unsigned_land(-float(v) / 2.0) for v in a[0].astype(np.float64)], np.float32)
+    got_signed = np.asarray(jax.jit(lambda x, y: ratios.ratio([x, y], signed_form))(a, b))
+    assert_bits(got_signed, expected_signed, "signed singleton ratio")
+    expected_id = np.asarray([_unsigned_land(float(v)) for v in a[0].astype(np.float64)], np.float32)
+    one_out = jax.jit(means.merged_output, static_argnums=(3, 4))(
+        a, np.asarray([2.0], np.float32), np.asarray([0.0], np.float32), windows.Units(), 0)
+    assert_bits(np.asarray(one_out), expected_id, "1-state merged_output")
+    one_state = jax.jit(means.merged_state, static_argnums=(3, 4))(
+        a, np.asarray([2.0], np.float32), np.asarray([-3.0], np.float32), windows.Units(), 0)
+    assert_bits(np.asarray(one_state[0]), expected_id, "1-state merged_state output")
+    assert_bits(np.asarray(one_state[1]), np.float32(2.0), "1-state merged_state total")
+    assert_bits(np.asarray(one_state[2]), np.float32(-3.0), "1-state merged_state anchor")

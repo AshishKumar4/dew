@@ -134,15 +134,24 @@ def _product(term, value: Callable[[tuple], Scaled], dtype):
     product of significands in [1, 2) stays far within the format, and each step's power of two moves no
     rounding, so it is the term renormalized after every factor, bit for bit. The term is within `u^2` of its
     real value but for its factors' own roundings (an exponential's, `_factors_value`). A subnormal operand
-    is read from its bits (`scaled.scaled`); a zero term's exponent is no other's (`_summed` reads it as
-    none). A term with a zero factor is zero whatever its others: a state of no mass contributes none, its
-    exponential past its reach (NaN) included (the base review's F3: NaN where the merge is 1); a term of
-    its derivative without that factor keeps its own."""
+    is read from its bits (`scaled.scaled`); a zero term's exponent is zero. A term with a zero factor is
+    zero whatever its others: a state of no mass contributes none, its exponential past its reach (NaN)
+    included (the base review's F3: NaN where the merge is 1); a term of its derivative without that factor
+    keeps its own."""
     coefficient, factors = term
+    # A single unit-coefficient factor is already normalized into [1, 2) or +0 at exponent 0 (`value`):
+    # skip `two_product` and `_renormalized`, which would only multiply by +-1 and re-split it.
+    if len(factors) == 1 and coefficient in (1.0, -1.0):
+        factor_value = value(factors[0])
+        if factor_value.significand.dtype == dtype:
+            significand = factor_value.significand
+            high = (significand if coefficient == 1.0
+                    else jnp.where(significand == 0, jnp.zeros_like(significand), -significand))
+            return high, jnp.zeros_like(high), factor_value.exponent
     fraction, power = math.frexp(coefficient)
     high, low = jnp.asarray(2 * fraction, dtype), jnp.zeros((), dtype)
     exponent = jnp.asarray(power - 1, jnp.int32)
-    zero = jnp.zeros((), bool)
+    zero = jnp.asarray(coefficient == 0, bool)
     for count, factor in enumerate(factors, 1):
         factor_value = value(factor)
         zero = zero | (factor_value.significand == 0)
@@ -152,8 +161,7 @@ def _product(term, value: Callable[[tuple], Scaled], dtype):
         if count % _HELD == 0:
             high, low, exponent = _renormalized(high, low, exponent, dtype)
     high, low, exponent = _renormalized(high, low, exponent, dtype)
-    return jnp.where(zero, 0.0, high), jnp.where(zero, 0.0, low), exponent
-
+    return jnp.where(zero, 0.0, high), jnp.where(zero, 0.0, low), jnp.where(zero, 0, exponent)
 
 _HELD = 64
 """The factors a term's product takes before it is renormalized (`_product`): each significand under 2, its
@@ -247,28 +255,44 @@ class _Sum:
     def axes(self) -> tuple[int, ...]:
         return tuple(sorted(({self.axis} if self.axis is not None else set()) | set(self.over)))
 
-    def summands(self, operands, value, valid, dtype):
-        """Each term's product over a chunk's `operands` (`_product`, its factors `value`'s), broadcast to the
-        sum's extent (its read operands', its states' axis whole, its own along `over`), the slots `valid`
-        does not hold read as zero, an exponent none where its product is; each formed once
-        (`lax.optimization_barrier`): an exact product is hundreds of operations an element, which a compiler
-        fusing it into each reduction formed four times (XLA:CPU's loop vectorizer held one such program past
-        240 s, row 7925)."""
+    def _placed_summands(self, operands, value, valid, dtype, *, squeezed_axis: int | None = None,
+                         empty_exponent: int = _NONE):
+        """Each term's product over a chunk's `operands` (`_product`, its factors `value`'s), broadcast to
+        the sum's extent (its read operands', its states' axis whole unless `squeezed_axis` already removed
+        it, its own along `over`), masked by `valid` where given; unbarriered so singleton sums share the
+        exact layout and masking without emitting a barrier."""
         rank = max(operand.ndim for operand in operands)
         read = {operand for _, factors in self.terms for factor in factors for operand in factor[1:]}
         shape = list(np.broadcast_shapes((1,) * rank, *(operands[index].shape for index in read)))
-        if self.axis is not None:
+        if squeezed_axis is None and self.axis is not None:
             shape[self.axis] = max(operand.shape[self.axis] for operand in operands)
+        over = (self.over if squeezed_axis is None
+                else tuple(place - (place > squeezed_axis) for place in self.over))
         made = []
         for term in self.terms:
             parts = _product(term, value, dtype)
             extent = np.broadcast_shapes((1,) * rank, *(np.shape(part) for part in parts))
-            own = tuple(extent[place] if place in self.over else size for place, size in enumerate(shape))
-            high, low, exponent = (jnp.broadcast_to(part, own) for part in parts)
+            own = tuple(extent[place] if place in over else size for place, size in enumerate(shape))
+            high, low, exponent = (part if part.shape == own else jnp.broadcast_to(part, own)
+                                   for part in parts)
+            if low.dtype != dtype:
+                low = low.astype(dtype)
             if valid is not None:
-                high, low = jnp.where(valid, high, 0.0), jnp.where(valid, low, 0.0)
-            made.append((high, low.astype(dtype), jnp.where(high != 0, exponent, _NONE)))
-        return jax.lax.optimization_barrier(tuple(made))
+                high = jnp.where(valid, high, 0.0)
+                low = jnp.where(valid, low, 0.0)
+            if empty_exponent == _NONE:
+                exponent = jnp.where(high != 0, exponent, _NONE)
+            elif valid is not None:
+                exponent = jnp.where(valid, exponent, empty_exponent)
+            made.append((high, low, exponent))
+        return tuple(made)
+
+    def summands(self, operands, value, valid, dtype):
+        """Each term's product over a chunk's `operands` (`_placed_summands`), each formed once
+        (`lax.optimization_barrier`): an exact product is hundreds of operations an element, which a compiler
+        fusing it into each reduction formed four times (XLA:CPU's loop vectorizer held one such program past
+        240 s, row 7925)."""
+        return jax.lax.optimization_barrier(self._placed_summands(operands, value, valid, dtype))
 
     def bits(self, extents) -> int:
         """The bits its summands' count takes (each term's `extents`): their magnitudes' sum, each under 2,
@@ -390,15 +414,69 @@ def _windows(summands_of, chunks: int, axes: list[tuple[int, ...]], bits: list[i
     return totals
 
 
+def _is_singleton(each: _Sum, operands) -> bool:
+    """Whether `each` over a single chunk of `operands` has one summand per output element: one term and
+    extent 1 along every axis it reduces, so windowed summation is the term itself."""
+    if len(each.terms) != 1:
+        return False
+    if each.axis is not None and max(operand.shape[each.axis] for operand in operands) != 1:
+        return False
+    read = {operand for factor in each.terms[0][1] for operand in factor[1:]}
+    return all(operands[index].shape[place] == 1 for place in each.over for index in read)
+
+
+def _singleton_value(each: _Sum, operands, value: Callable[[tuple], Scaled], valid, dtype, *,
+                     squeezed_axis: int | None = None):
+    """A singleton `_Sum`'s single `(high, low, exponent)` without windowed reduction or barriers: delegates
+    layout, broadcasting, masking, and dtype alignment to `_Sum._placed_summands`."""
+    (high, low, exponent), = each._placed_summands(operands, value, valid, dtype,
+                                                  squeezed_axis=squeezed_axis, empty_exponent=0)
+    if squeezed_axis is None and each.axis is not None:
+        return tuple(jnp.squeeze(part, each.axis) for part in (high, low, exponent))
+    return high, low, exponent
+
+
 def _streamed(load, chunks: int, sums: list[_Sum], units: Units):
     """`sums` of states a `load(c)` gives `chunks` at a time (each `(operands, valid)`: a chunk's operands
     laid to one rank, its states along each sum's axis, and the slots it holds), each `(high, low,
     exponent)` without its states' axis: summed a window at a time, each two passes over the chunks
-    (`_windows`). The one value function of the law's sums, XLA's (`_arrays`'s loads) and a kernel's (its
-    own loads of its refs) alike, a chunk's factors formed once for all its sums (`_factor_values`)."""
-    operands, _ = load(0)
+    (`_windows`), or directly without loops or barriers for any singleton sum of one chunk, one term, and
+    unit reduction extents (`_is_singleton`). The one value function of the law's sums, XLA's (`_arrays`'s
+    loads) and a kernel's (its own loads of its refs) alike, a chunk's factors formed once for all its sums
+    (`_factor_values`)."""
+    operands, valid0 = load(0)
     dtype = operands[0].dtype
     rank = max(operand.ndim for operand in operands)
+
+    if chunks == 1:
+        singletons = [_is_singleton(each, operands) for each in sums]
+        if all(singletons):
+            axes_set = {each.axis for each in sums}
+            common_axis = next(iter(axes_set)) if len(axes_set) == 1 else None
+            if common_axis is not None:
+                # Squeeze the unit reduced axis before forming factors so 1-state ratios (such as
+                # `means.finished` inside Mosaic GPU kernels) split values at their unsqueezed rank.
+                squeezed = [jnp.squeeze(operand, common_axis) for operand in operands]
+                squeezed_valid = None if valid0 is None else jnp.squeeze(valid0, common_axis)
+                value = _factor_values(squeezed, units, rank - 1)
+                return [_singleton_value(each, squeezed, value, squeezed_valid, dtype,
+                                         squeezed_axis=common_axis) for each in sums]
+            value = _factor_values(operands, units, rank)
+            return [_singleton_value(each, operands, value, valid0, dtype) for each in sums]
+        if any(singletons):
+            # Share one factor cache across singleton and windowed sums in a mixed single-chunk group.
+            value = _factor_values(operands, units, rank)
+            rest_sums = [each for each, is_one in zip(sums, singletons, strict=True) if not is_one]
+            rest_summands = [each.summands(operands, value, valid0, dtype) for each in rest_sums]
+            rest_bits = [each.bits([high.shape for high, _, _ in summands])
+                         for each, summands in zip(rest_sums, rest_summands, strict=True)]
+            rest_made = _windows(lambda _c: rest_summands, 1, [each.axes() for each in rest_sums],
+                                 rest_bits, dtype)
+            rest_iter = iter([
+                tuple(jnp.squeeze(part, each.axis) if each.axis is not None else part for part in joined)
+                for each, joined in zip(rest_sums, rest_made, strict=True)])
+            return [_singleton_value(each, operands, value, valid0, dtype) if is_one else next(rest_iter)
+                    for each, is_one in zip(sums, singletons, strict=True)]
 
     def summands_of(c):
         operands, valid = load(c)
@@ -456,10 +534,11 @@ def _arrays(operands, axis: int | None):
             start = c * width
             sliced = [jax.lax.dynamic_slice_in_dim(operand, start, width, axis)
                       if operand.shape[axis] == chunks * width else operand for operand in padded]
+        if not extra:
+            return sliced, None
         index = start + jax.lax.broadcasted_iota(jnp.int32, tuple(width if place == axis else 1
                                                                    for place in range(sliced[0].ndim)), axis)
         return sliced, index < states
-
     return load, chunks
 
 
