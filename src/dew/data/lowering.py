@@ -1449,8 +1449,7 @@ class _Build:
         ordered = self.in_order
         if self.global_order or not self.training or not (ordered or pooled):
             return self
-        pool = next((stage for stage in pipeline.stages if isinstance(stage, Workers)),
-                    Workers(count, self.loading.ahead))
+        pool = worker_stage(pipeline, self.loading)
         return dataclasses.replace(self, loading=dataclasses.replace(self.loading, workers=count), pool=pool)
 
     def owning(self, pipeline: Pipeline) -> _Build:
@@ -1466,15 +1465,20 @@ class _Build:
         """The loading workers each corpus reads in, as `pooled` shares them out for `partition`'s share
         (`capacities`), by the corpus's place among the mixtures above it, which a position saved under one
         sharing restores only under the same, a corpus a mixture keeps across an edit included."""
+        return {key: stage.count for key, stage in self.pool_stages(pipeline, partition).items()}
+
+    def pool_stages(self, pipeline: Pipeline, partition: DataPartition) -> dict[str, Workers]:
+        """The worker stage each corpus reads in (`pools`), its count and the buffer its reader is built
+        with: a corpus's own written stage, else its share of its mixture's."""
         build = self.owning(pipeline)
         source = pipeline.source
         if build.pool is None or build.in_order:
             return {}
         if not isinstance(source, Combined):
-            return {"/".join(str(key) for key in build.corpus): build.pool.count}
+            return {"/".join(str(key) for key in build.corpus): build.pool}
         builds = build.member_builds(build.capacities(pipeline, partition))
-        return {key: count for child, member in zip(source.pipelines, builds, strict=True)
-                for key, count in member.pools(child, partition).items()}
+        return {key: stage for child, member in zip(source.pipelines, builds, strict=True)
+                for key, stage in member.pool_stages(child, partition).items()}
 
     def capacities(self, pipeline: Pipeline, partition: DataPartition) -> tuple[int | None, ...]:
         """The most of a shared pool's workers each corpus `pipeline` mixes can take where its read streams
@@ -2449,10 +2453,16 @@ def _split_spans(pipeline: Pipeline, build: _Build) -> Iterator[list[tuple[int, 
             yield spans
 
 
+def worker_stage(pipeline: Pipeline, loading: Loading) -> Workers:
+    """The worker stage a read of `pipeline` runs in, as its reader is built: the one it writes
+    (`.workers(n, buffer=)`), its count and buffer, else `loading`'s count, each worker holding the batches
+    its loading holds ready (`Loading.ahead`)."""
+    return next((stage for stage in pipeline.stages if isinstance(stage, Workers)),
+                Workers(loading.worker_count, loading.ahead))
+
+
 def _workers(pipeline: Pipeline, loading: Loading) -> int:
-    return next(
-        (stage.count for stage in pipeline.stages if isinstance(stage, Workers)), loading.worker_count
-    )
+    return worker_stage(pipeline, loading).count
 
 
 @dataclasses.dataclass(frozen=True)

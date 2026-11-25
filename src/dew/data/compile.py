@@ -104,6 +104,7 @@ from dew.data.lowering import (
     _split_spans,
     _workers,
     cache_prefix,
+    worker_stage,
 )
 from dew.data.materialize import _materialize, _Memory
 from dew.data.mixing import CorpusCounts, Proportions, _weights, mixed_indexed, warn_rejections
@@ -1244,8 +1245,11 @@ def _compiled(
         widths=_bound_widths(original),
         tail=tail(train, build),
         order_records=ordered,
-        reading=TrainingRead(read, chooser, build.loading, _workers(train, build.loading), build.pools(train),
-                        faster=_faster((train,) if validation is None else (train, validation), build)),
+        # As the reader is built: one share's (`DataPartition()`), a whole-file corpus's share bounded by
+        # its shards over one reader (`_Build.capacities`).
+        reading=TrainingRead(read, chooser, build.loading, worker_stage(train, build.loading),
+                             build.pool_stages(train, DataPartition()),
+                             faster=_faster((train,) if validation is None else (train, validation), build)),
     )
 
 

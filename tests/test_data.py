@@ -290,9 +290,9 @@ def test_a_loader_explains_the_read_its_readers_run():
     reading = chosen.reading
     assert (reading.read, reading.chooser, reading.faster) == ("memory", "sources", None)
     made = batches(chosen)
-    assert reading.workers == len({int(pid) for batch in made for pid in batch["pid"]}) == 2
+    assert reading.workers.count == len({int(pid) for batch in made for pid in batch["pid"]}) == 2
     text = chosen.explain()
-    assert all(fact in text for fact in (reading.read, str(reading.workers), *chosen.plan.order))
+    assert all(fact in text for fact in (reading.read, str(reading.workers.count), *chosen.plan.order))
     assert compile(rows.read("memory"), seed=5, loading=auto).reading.chooser == "chain"
     indexed = compile(rows, seed=5, steps=10**6, loading=auto, read="indexed")
     assert (indexed.reading.chooser, indexed.reading.faster) == ("compile", "memory")
@@ -305,6 +305,12 @@ def test_a_loader_explains_the_read_its_readers_run():
                 for batch in made]
 
     assert drawn(batches(faster)) == drawn(batches(indexed))
+    # A worker stage the chain writes is read as its reader is built: its count and its buffer, which the
+    # loading's own does not state (row 13018).
+    from dew.data.pipeline import Workers
+
+    written = compile(rows.workers(2, buffer=4), seed=5, steps=10**6, loading=auto)
+    assert written.reading.workers == Workers(2, 4) and "each holding 4 batches" in written.explain()
     interleaved = Pipeline(Memory(_Indexed(30), shard_rows=8)).interleave(2)
     plain = Pipeline(Memory(_Indexed(30), shard_rows=8)).repeat().batch(4)
     streamed = {"alone": compile(plain, steps=10**6, loading=Loading(workers=0), read="streamed"),
