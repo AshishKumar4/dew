@@ -708,7 +708,9 @@ class _Passes:
         assert threshold is not None, "a loop stops at its threshold (`stops`)"
         _, end = self.span
         real = jnp.ones(x.shape[:2], bool) if self.valid is None else self.valid.astype(bool)
-        caches = [self.block_cache(model)] if self.decode else []
+        # A cached call's block cache as each row's exiting pass left it, chosen as its rows exit
+        # (`_kept_exits`).
+        chosen = self.block_cache(model) if self.decode else None
         selected, output, gated = self.exit_of(model, x, 0, stop=False)
         first = self.sown(model, output, gated)
         assert first is not None, "a loop stopping at its threshold gates its exits"
@@ -723,8 +725,8 @@ class _Passes:
                                            normed=output if normed_output else None, rows=exited[:, 0])
             (x, bank), self.left = _sown_switch((~done).astype(jnp.int32), (self.held_pass, pass_block),
                                                 model, (x, bank))
-            if self.decode:
-                caches.append(self.block_cache(model))
+            if chosen is not None:
+                chosen = self._kept_exits(chosen, self.block_cache(model), exited[:, 0])
             if step == loop.steps - 1:
                 break
             held = (jnp.zeros_like(selected), None if output is None else jnp.zeros_like(output),
@@ -735,8 +737,9 @@ class _Passes:
             self.exited.append((selected, logit))
             logits.append(logit)
             exited = exited | reached(logits, threshold)
-        if self.decode:
-            self._kept_exits(model, caches, logits, threshold)
+        if chosen is not None:
+            for name, entries in chosen.items():
+                model.put_variable('cache', name, entries)
         return x, bank
 
     def held_pass(self, module, carry):
@@ -782,31 +785,30 @@ class _Passes:
         return {name: value for name, value in module.variables.get('cache', {}).items()
                 if (run := group_layers(name)) is not None and first <= run.start and run.stop <= end}
 
-    def _kept_exits(self, module, caches: list[dict], logits, threshold: float) -> None:
-        """Each row's cache entries of the block as its exiting pass left them (`exit_choice`, one pass a
-        row under `exit_by='row'`), of `caches`, each pass's (`block_cache`): a later call's tokens read each
-        earlier row's exiting pass's keys, values and states. An entry holding no row axis (a pool of pages)
-        keeps no row's pass, and is refused."""
-        choice = exit_choice(logits, threshold)[:, 0]
-        batch = choice.shape[0]
+    @staticmethod
+    def _kept_exits(chosen: dict, latest: dict, exited: jax.Array) -> dict:
+        """The block cache each row's exiting pass leaves (`exit_choice`, one pass a row under
+        `exit_by='row'`): `chosen`, the entries as the passes before left them for the rows already
+        `exited`, `latest`'s, this pass's, for the rest; a later call's tokens read each earlier row's
+        exiting pass's keys, values and states. One cache beside the working one, never one a pass (row
+        13059). An entry holding no row axis (a pool of pages) keeps no row's pass, and is refused."""
+        batch = exited.shape[0]
 
-        def kept(axis: int, *passes):
+        def kept(axis: int, held, last):
             # `axis` an entry's rows: after its layers in a banked run's (`row_axis`).
-            last = passes[-1]
-            if last.ndim <= axis or all(each is last for each in passes):
+            if last is held or last.ndim <= axis:
                 return last
             if last.shape[axis] != batch:
                 raise ValueError("a cached call skipping its passes keeps each row's exiting pass's cache, "
                                  f"and an entry of shape {last.shape} holds no row of its {batch}: a pool of "
                                  "pages; serve a looped decoder's early exit over a dense cache")
-            stacked = jnp.stack(passes)
-            index = choice.reshape(1, *(1,) * axis, batch, *(1,) * (last.ndim - axis - 1))
-            return jnp.take_along_axis(stacked, index, axis=0)[0]
-        for name in caches[-1]:
-            module.put_variable('cache', name, jax.tree_util.tree_map_with_path(
-                lambda path, *passes, name=name: kept(row_axis((jax.tree_util.DictKey(name), *path)),
-                                                      *passes),
-                *(cache[name] for cache in caches)))
+            rows = exited.reshape(*(1,) * axis, batch, *(1,) * (last.ndim - axis - 1))
+            return jnp.where(rows, held, last)
+        def entry(name: str, entries):
+            return jax.tree_util.tree_map_with_path(
+                lambda path, held, last: kept(row_axis((jax.tree_util.DictKey(name), *path)), held, last),
+                chosen[name], entries)
+        return {name: entry(name, entries) for name, entries in latest.items()}
 
     def own_view(self, step: int):
         first, end = self.span
