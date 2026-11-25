@@ -82,10 +82,12 @@ class Form:
     divisor: tuple[Term, ...] = ()
     divided: str = ""
     narrowed: tuple[tuple[int, int, str], ...] = ()
-    padded: tuple[int, ...] = ()
+    padded: tuple[tuple[int, int], ...] = ()
     """The operands a transpose added, ones along letters no other factor of a term reads, each a group of its
-    own: contracted apart from the cotangent's group, whose product over their letters it would form, and
-    banded as one factor more of it (`_band`)."""
+    own, by the operand it pads (`(unit, partner)`: the cotangent, or that cotangent's tangent in a
+    derivative of the transpose): contracted apart from the partner's group, whose product over their letters
+    it would form, and banded as one factor more of it where its partner is in the term (`_band`); a unit
+    whose partner a later transpose takes away is a group like any other, as it was beside that partner."""
 
     def letters(self, group: tuple[Factor, ...]) -> str:
         """`group`'s letters, each once, in the order its factors' subscripts name them."""
@@ -149,10 +151,12 @@ def _band(form: Form, groups: tuple) -> int:
     """The binades a group's band spans in a term of `groups` (each `_held`'s group, its factors counted):
     a band tuple's product of significands each within `[2^-(band + n), 2^n]` stays a normal fp32
     (`2^-120`); 0 where the term's groups and factors leave none (its sum taken unbanded, one tuple). A
-    group of a transpose's unit operands alone (`Form.padded`) counts as the factor it is, beside the
-    cotangent, not as a group: the bands are the term's as though it lay in the cotangent's group."""
+    group of a transpose's unit operands alone (`Form.padded`) whose partners are in the term counts as the
+    factors it holds, not as a group: the bands are the term's as though they lay in their partner's group."""
     factors = sum(len(group) for group in groups)
-    counted = sum(1 for group in groups if not all(index in form.padded for index, _ in group))
+    present = {index for group in groups for index, _ in group}
+    joined = {unit for unit, partner in form.padded if partner in present}
+    counted = sum(1 for group in groups if not all(index in joined for index, _ in group))
     return max(0, (120 - factors) // counted)
 
 
@@ -443,8 +447,9 @@ def _jvp(primals, tangents, *, form: Form):
             terms += [(-sign, (*groups, ((len(operands) - 1, 1),))) for (sign, groups), _, _ in below]
     if not terms:
         return out, ad.Zero(jax.typeof(out).to_tangent_aval())
-    tangent = Form(tuple(subscripts), tuple(terms), form.out, form.divisor, form.divided, narrowed,
-                   form.padded)
+    # A unit pads its partner's tangent as it pads the partner (`Form.padded`).
+    padded = (*form.padded, *((unit, at[partner]) for unit, partner in form.padded if partner in at))
+    tangent = Form(tuple(subscripts), tuple(terms), form.out, form.divisor, form.divided, narrowed, padded)
     return out, contract(tangent, *operands)
 
 
@@ -460,7 +465,9 @@ def _transpose(cotangent, *arrays, form: Form):
     below: tuple[Factor, ...] = ()
     shared = [arrays[index] for index in known]
     shared_subscripts = [form.subscripts[index] for index in known]
-    kept_padded = tuple(place[index] for index in form.padded if index in place)
+    # A unit padding a known operand pads it still; one whose partner this transpose takes is a group.
+    kept_padded = tuple((place[unit], place[partner]) for unit, partner in form.padded
+                        if unit in place and partner in place)
     if form.divisor:
         if any(index not in place for _, groups in form.divisor for group in groups for index, _ in group):
             raise NotImplementedError("a scaled contraction is linear in no divisor's operand")
@@ -519,7 +526,7 @@ def _transpose(cotangent, *arrays, form: Form):
                 operands.append(jnp.ones([array.aval.shape[subscript.index(letter)] for letter in unread],
                                          array.aval.dtype))
                 subscripts.append(unread)
-                padded.append(len(operands) - 1)
+                padded.append((len(operands) - 1, pulled))
                 extra = (((len(operands) - 1, 1),),)
             pulled_term = (sign, (*(group for group in rest if group), ((pulled, 1), *below), *extra))
             (rounded.setdefault(marks[t], []) if t in marks else terms).append(pulled_term)

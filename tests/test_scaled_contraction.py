@@ -392,3 +392,16 @@ def test_a_scalar_group_keeps_its_band_beside_a_term_that_cancels():
     a = jnp.asarray([1.0, 2.0 ** -60], jnp.float32)
     one = jnp.float32(1.0)
     np.testing.assert_array_equal(np.asarray(contract(form, a, one, one)), np.float32(2.0 ** -60))
+
+
+def test_a_transposes_transpose_bands_its_unit_as_a_group_once_its_partner_is_taken():
+    """`sum_k x[k] - sum_k w[k] x[k]` at `w = [1, 0]`: its pullback, transposed again against `[1, 2^-60]`,
+    is `2^-60` exactly. The first transpose pads its cotangent with a unit along `k`; the second takes that
+    cotangent away, and the unit, left a group of its own, keeps the band it had as one: banded as a factor
+    beside a partner the term no longer holds, the band held both parts and `1 - 1` rounded away the
+    `2^-60`."""
+    form = Form(("k", "k"), ((1, (((0, 1),),)), (-1, (((1, 1),), ((0, 1),)))), "")
+    w = jnp.asarray([1.0, 0.0], jnp.float32)
+    _, pull = jax.vjp(lambda x: contract(form, x, w), jnp.ones(2, jnp.float32))
+    (back,) = jax.linear_transpose(pull, jnp.float32(1.0))((jnp.asarray([1.0, 2.0 ** -60], jnp.float32),))
+    np.testing.assert_array_equal(np.asarray(back), np.float32(2.0 ** -60))
