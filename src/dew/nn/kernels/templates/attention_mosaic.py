@@ -1952,16 +1952,16 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
     def price_config(self, ba: tokamax.BoundArguments, config: BackwardTiles, target: generation.GpuTarget
                      ) -> tuple[bool, float] | None:
         """Price `config`'s launches on `target`, the fused one's or the two's summed (`cost.launch_seconds`
-        over `emission.work_of`, each kernel at its own launch's residency, `_launch_models`), traced under
-        `report.launching`: whether any of their work lies at a rate the target states none of, a
+        over `emission.launched_kernels`, each kernel at its own launch's residency, `_launch_models`), traced
+        under `report.launching`: whether any of their work lies at a rate the target states none of, a
         multiprocessor's or the whole device's (`cost.units`' unpriced; its memory's bandwidth, which the
         first prices infinite), or a step of no latency (`cost.spanned`'s), or a launch's registers' model
-        passes its cap (spills no rate prices), and the seconds; None where its launches' work is uncounted.
-        Every fact read is `target`'s, whatever GPU is in effect where it is asked. As its hookless call (its
-        hook fields none): a hook a choice prices takes no parameters, its work the same a score in either
-        form, and a launch keyed by its hooks' fingerprints (`KernelOp.keyed`, which traces none) prices as
-        its live call does; one whose hook takes parameters (which holds no fused launch, so no choice)
-        None."""
+        passes its cap (spills no rate prices), and the seconds; None where a launch's work is uncounted, a
+        launch lies under a loop or a branch, or it traces none. Every fact read is `target`'s, whatever GPU
+        is in effect where it is asked. As its hookless call (its hook fields none): a hook a choice prices
+        takes no parameters, its work the same a score in either form, and a launch keyed by its hooks'
+        fingerprints (`KernelOp.keyed`, which traces none) prices as its live call does; one whose hook takes
+        parameters (which holds no fused launch, so no choice) None."""
         if ba.arguments["score_params"]:
             return None
         names = ("query", "key", "value", "dout", "start", "end", "query_ids", "key_ids", "score_params",
