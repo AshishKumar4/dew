@@ -48,6 +48,7 @@ from .attention_masks import (
     with_key_starts,
 )
 from .attention_parallel import (
+    exchanges_heads,
     four_dimensional,
     on_attention_shards,
     pad_rows,
@@ -748,14 +749,14 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
         block_groups = image_groups = None
     if sliding_window is None:
         places = None
+    visibility = None
     if shards > 1:
         spanned = {"block_groups": block_groups, "image_groups": image_groups, "key_valid": key_valid,
                    "key_runs": key_runs, "places": places, "query_slots": query_slots}
-        causal, sliding_window, mask, key_value_seq_lengths, materialized = _sequence_sharded(
-            query.shape[-3], key.shape[-3], causal=causal, sliding_window=sliding_window, mask=mask,
-            segment_ids=segment_ids, lengths=key_value_seq_lengths, starts=key_value_seq_starts,
-            spanned=spanned)
-        if materialized:
+        causal, sliding_window, mask, key_value_seq_lengths, materialized, visibility = _sequence_sharded(
+            query, key, shards, causal=causal, sliding_window=sliding_window, mask=mask, spanned=spanned,
+            segment_ids=segment_ids, lengths=key_value_seq_lengths, starts=key_value_seq_starts)
+        if materialized or (visibility and implementation == 'cudnn'):
             implementation = kernel_for_materialized_mask(
                 implementation, query, key, dtype=dtype, precision=precision,
                 force_fp32_for_softmax=force_fp32_for_softmax, wide_logits=wide_logits)
@@ -764,17 +765,17 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
         attention_kernel, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax, implementation=implementation,
         softcap=softcap, wide_logits=wide_logits, scale_logits=scale_logits, mask_fill=mask_fill,
-        in_key=in_key)
+        in_key=in_key, max_segments=max_segments)
     if shards > 1:
         out = sequence_parallel_attention(
             kernel, query, key, value, shards, causal=causal,
             sliding_window=sliding_window, mask=mask, bias=dense_bias(bias), sinks=sinks,
             key_value_seq_lengths=key_value_seq_lengths,
-            dropout_rate=dropout_rate if dropping else 0.0, dropout_seed=words)
+            dropout_rate=dropout_rate if dropping else 0.0, dropout_seed=words, visibility=visibility)
     else:
         out = kernel(query, key, value, causal=causal, sliding_window=sliding_window,
                      mask=mask, bias=bias, sinks=sinks, segment_ids=segment_ids,
-                     max_segments=max_segments, key_value_seq_lengths=key_value_seq_lengths,
+                     key_value_seq_lengths=key_value_seq_lengths,
                      key_value_seq_starts=key_value_seq_starts, block_groups=block_groups,
                      image_groups=image_groups, key_valid=key_valid, key_runs=key_runs, places=places,
                      query_slots=query_slots, dropout_rate=dropout_rate if dropping else 0.0,
@@ -1397,20 +1398,28 @@ def resolve_implementation(implementation: AttentionImpl, query, key, *, dtype=N
     return select(DECODE, case, {'auto': None, 'cudnn': 'cudnn'}[implementation])
 
 
-def _sequence_sharded(queries: int, keys: int, *, causal, sliding_window, mask, segment_ids, lengths, starts,
+def _sequence_sharded(query, key, shards: int, *, causal, sliding_window, mask, segment_ids, lengths, starts,
                       spanned: dict):
-    """A call's visibility as the sequence exchange takes it (`sequence_parallel_attention`: its causality, a
-    window, a mask and key lengths alone): a single device's template reads block groups, key validity,
-    runs and places, and its kernels documents aligned to their last keys and the keys' starts; across
-    sequence shards each is the mask it means, its causality, window, documents, key lengths and starts
-    among them where `spanned` holds any (`visibility_mask`). The exchanges split an explicit mask along the
-    sequence and have no split for the ids, so the documents travel as the mask they stand for, causality
-    and the window folded in beside them. Returns the causality, window, mask and key lengths it takes, and
-    whether it materialized a mask its kernel must take (`kernel_for_materialized_mask`)."""
+    """A call's visibility as the sequence exchange takes it (`sequence_parallel_attention`). Where the
+    all-to-all takes the call (`exchanges_heads`, the predicate its choice reads), each device holds whole
+    sequences, so the call's per-token ids (documents, key starts, `spanned`'s block and image groups, key
+    validity, runs, places and query slots) travel whole beside them as its `visibility` and its kernel
+    reads them as on one device: no dense `[B, 1, S, S]` mask (row 1495). Elsewhere (the gather, which
+    stripes the queries) the exchange takes causality, a window, a mask and key lengths alone: each id is
+    the mask it means, its causality, window, documents, key lengths and starts among them where `spanned`
+    holds any (`visibility_mask`), and the documents travel as the mask they stand for, causality and the
+    window folded in beside them. Returns the causality, window, mask and key lengths it takes, whether it
+    materialized a mask its kernel must take (`kernel_for_materialized_mask`), and the visibility ids, which
+    a call naming cuDNN takes on that masked kernel too (cuDNN takes no mask; its kernel would build one)."""
+    queries, keys = query.shape[-3], key.shape[-3]
+    ids = {name: x for name, x in {"segment_ids": segment_ids, "key_value_seq_starts": starts,
+                                   **spanned}.items() if x is not None}
+    if ids and exchanges_heads(query, key, shards, masked=True):
+        return causal, sliding_window, mask, lengths, False, ids
     if any(x is not None for x in spanned.values()):
         mask = visibility_mask(queries, keys, causal, sliding_window, mask, segment_ids, lengths, starts,
                                **spanned)
-        return False, None, mask, None, True
+        return False, None, mask, None, True, None
     if isinstance(segment_ids, CrossDocuments) and (causal or sliding_window is not None):
         aligned = cross_document_mask(segment_ids, causal=causal, sliding_window=sliding_window)
         mask = aligned if mask is None else jnp.logical_and(aligned, mask)
@@ -1420,8 +1429,8 @@ def _sequence_sharded(queries: int, keys: int, *, causal, sliding_window, mask, 
     if segment_ids is not None:
         documents = with_documents(mask, segment_ids)
         mask = combined_attention_mask(queries, keys, causal, sliding_window, documents)
-        return False, None, mask, lengths, True
-    return causal, sliding_window, mask, lengths, False
+        return False, None, mask, lengths, True, None
+    return causal, sliding_window, mask, lengths, False, None
 
 
 def kernel_for_materialized_mask(implementation: AttentionImpl, query, key, *, dtype=None, precision=None,
