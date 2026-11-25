@@ -9,7 +9,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.mosaic.gpu import utils as mgpu_utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend.mlir import ir
-from jax.extend.mlir.dialects import arith, math, memref, scf
+from jax.extend.mlir.dialects import arith, math, memref, scf, vector
 
 from dew.nn.kernels.templates import cost, emission
 from dew.nn.kernels.templates.cost import Work
@@ -67,6 +67,26 @@ def test_a_shuffle_issues_on_every_lane_of_its_warps():
 
     counted = _counted(body)
     assert counted.shuffles == 128, counted
+
+
+def test_a_load_or_store_issues_on_every_lane_a_16_bytes_an_instruction():
+    """An inline body's shared memory load and store issue on every lane of its warps, an instruction a 16
+    bytes a lane moves: a scalar's one, four fp32 words' one (LDS.128), eight's two (KDA's intra: 32,768 fp32
+    scalar loads a program its SASS's 32,768 LDS, M-JS-272), where memory instructions issued nothing."""
+    def body(width):
+        def kernel(ctx, ref):
+            del ctx
+            index = ir.IndexType.get()
+            thread = arith.index_cast(index, mgpu_utils.thread_idx())
+            if width == 1:
+                memref.store(memref.load(ref, [thread]), ref, [thread])
+            else:
+                vector_type = ir.VectorType.get((width,), ir.F32Type.get())
+                vector.store(vector.load(vector_type, ref, [thread]), ref, [thread])
+        return kernel
+
+    # Counted, not run: each lane's vector overlaps its neighbour's.
+    assert [_counted(body(width)).accesses for width in (1, 4, 8)] == [2 * 128, 2 * 128, 4 * 128]
 
 
 def test_a_lane_broadcasts_ptx_shuffle_issues_on_every_lane():
