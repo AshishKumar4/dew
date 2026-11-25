@@ -143,11 +143,12 @@ def _lowers(hook, tiles: tuple, sides, rules, *, layout=None) -> bool:
 
 @dataclasses.dataclass(frozen=True)
 class ColumnLocal:
-    """An epilogue `hook` its caller declares column-local: each output column computed from that column of
-    its accumulators and of its side tiles alone, as a prologue's is by the template's contract (applied a
-    depth step's tile at a time, kernel-templates.md §3), so its VJP's (`gemm._prologue_pulled`). A launch
-    reads such a hook's tile out a chunk of columns at a time (`read_out`, `pricing.hook_chunk`); any other
-    hook takes its tile whole."""
+    """An epilogue or prologue `hook` its caller declares column-local: evaluated on any slice of its tile's
+    columns (and its side tiles' same columns) it computes that slice of its result, its extents read
+    nowhere, and so does its pullback where a reverse pass forms it (`gemm._prologue_pulled`, which declares
+    its prologue's VJP only where the prologue is declared; `activations.gated_hook`, entrywise). A launch
+    reads such an epilogue's tile out a chunk of columns at a time (`read_out`, `pricing.hook_chunk`); any
+    other its issuer's own read-out (a register accumulator's whole, tcgen05's 64 columns)."""
 
     hook: Callable
 

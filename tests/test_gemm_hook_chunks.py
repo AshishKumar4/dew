@@ -3,11 +3,13 @@ it column-local (`hooks.ColumnLocal`, `pricing.hook_chunk`): its outputs staged 
 fill whole buffers, and a hook reading every column of its row, undeclared, still sees them all; each
 product, the template named at a pinned 128-column tile, interpreted, as exact as XLA's from float64."""
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, with_gradients
 
 from dew.nn.kernels import gemm, generation, grouped_matmul, tuning
 from dew.nn.kernels.templates.gemm import tiling
@@ -70,19 +72,33 @@ def test_a_hooked_product_over_a_chunked_tile_is_its_programs(hook, out_dtypes):
                     truth_fn=_reference(hook, (jnp.float64,) * len(out_dtypes), wide=jnp.float64))
 
 
-def test_a_hooks_declared_locality_holds_through_the_forms_a_launch_takes_it_in():
-    """A hook's `ColumnLocal` declaration reads through the form every launch holds it in
-    (`tuning.prepared`) and its side tiles' dimensions of one given back (`Hooks.after`), and an
-    undeclared hook, a gated MLP's own (`activations.gated_hook`, declared) aside, reads as none."""
-    from dew.nn import activations
-    from dew.nn.kernels.templates.gemm.hooks import Hooks, column_local
+def _width_scaled(x):
+    """A prologue scaling each entry by its tile's width: entrywise, but reading the extent it is traced at,
+    so no slice of its tile computes as the tile does (undeclared: `hooks.ColumnLocal`)."""
+    return x * x.shape[-1]
 
-    def plain(acc, side):
-        return acc + side
 
-    for declared in (False, True):
-        hook = ColumnLocal(plain) if declared else plain
-        held = Hooks(epilogue=tuning.prepared(hook), epilogue_axes=(('rows', 'columns'),),
-                     epilogue_broadcast=((1,),))
-        assert column_local(held.after()) is declared
-    assert column_local(tuning.prepared(activations.gated_hook("swiglu")))
+def _draw_rows(seed):
+    rng = np.random.default_rng(seed)
+    bf16 = functools.partial(jnp.asarray, dtype=jnp.bfloat16)
+    return (bf16(rng.standard_normal((ROWS, DEPTH)) / 8), bf16(rng.standard_normal((DEPTH, WIDTH)) / 8),
+            bf16(rng.standard_normal((ROWS, WIDTH))))
+
+
+def test_an_undeclared_prologues_pullback_reads_its_tile_whole():
+    """An undeclared prologue's pulled cotangent (`gemm._prologue_pulled`), here one reading its tile's
+    width, through the template at a pinned 128-column tile its depth's width: read out whole, its rows'
+    gradient as exact as XLA's from float64 (read out 64 columns at a time, it would scale by 64)."""
+    def dew(x, w):
+        with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"),
+              tuning.pinned({grouped_matmul.MosaicGmm: TILE})):
+            return gemm.gemm(x, w, None, prologue=_width_scaled, applied=_width_scaled(x),
+                             out_dtype=jnp.bfloat16, interpret_on_cpu=True)
+
+    def plain(x, w, wide=jnp.float32):
+        formed = _width_scaled(x.astype(wide)).astype(x.dtype if wide == jnp.float32 else wide)
+        return jnp.dot(formed.astype(wide), w.astype(wide)).astype(x.dtype if wide == jnp.float32 else wide)
+
+    assert_as_exact(with_gradients(dew), jax.jit(with_gradients(plain)), _draw_rows,
+                    "undeclared width-scaled prologue's pullback", seeds=SEEDS,
+                    truth_fn=with_gradients(functools.partial(plain, wide=jnp.float64)))
