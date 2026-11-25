@@ -168,8 +168,8 @@ def but_state(fn):
     """`with_gradients(fn)` for `fn(query, key, value, log_decay, beta, state, reads)`, its entering memory
     closed over: every input's gradient but its."""
     def run(query, key, value, log_decay, beta, state, reads, cotangent):
-        out, pull = jax.vjp(lambda q, k, v, g, b, r: fn(q, k, v, g, b, state, r), query, key, value, log_decay,
-                            beta, reads)
+        out, pull = jax.vjp(lambda q, k, v, g, b, r: fn(q, k, v, g, b, state, r), query, key, value,
+                            log_decay, beta, reads)
         return out, *pull(cotangent)
     return run
 
@@ -522,13 +522,14 @@ def test_a_key_decays_read_erase_on_the_template_is_as_exact_as_its_reference(ca
     with a reference (check 1): 'head decays', each key's decay the head's, against the same call under that
     decay a head, whose read erase check 1 holds to the recurrence at the accurate forms: a system whose rows
     and columns trade the reads and the keys, weights formed from the keys, or a gradient landing on the
-    other, lands far past it; every leaf but the entering memory's gradient, which a decay a key
-    dimension's reverse walk forms 1.87 times as far from float64 as a decay a head's on Kimi's delta
-    attention itself against the gated delta net (scratch jsf-beta2, no read erase: check 1's leaf `[6]`). 'along its keys', each key its own decay, reading along its keys, against Kimi's delta attention
-    on the template, every leaf, the keys' gradient its reads' and its own summed, which check 1 holds to
-    fla's recorded sites (`test_recurrence_mosaic_gradient`): a read's decay taken from another key's, or a
-    term lost between the reads' gradient and the keys', moves it far past. fla's recorded PKDA sites hold
-    it once M-JS-266b's fixture lands (rows 1459, 12696)."""
+    other, lands far past it; every leaf but the entering memory's gradient, which a decay a key dimension's
+    reverse walk forms 1.87 times as far from float64 as a decay a head's on Kimi's delta attention itself
+    against the gated delta net (scratch jsf-beta2, no read erase: check 1's leaf `[6]`). 'along its keys',
+    each key its own decay, reading along its keys, against Kimi's delta attention on the template, every
+    leaf, the keys' gradient its reads' and its own summed, which check 1 holds to fla's recorded sites
+    (`test_recurrence_mosaic_gradient`): a read's decay taken from another key's, or a term lost between the
+    reads' gradient and the keys', moves it far past. fla's recorded PKDA sites hold it once M-JS-266b's
+    fixture lands (rows 1459, 12696)."""
     dew, reference, truth, draw = KEY_DECAY_CASES[case]
     assert_as_exact(jax.jit(dew), jax.jit(reference), draw,
                     f"a key decay's read erase on the template: {case}", seeds=SEEDS, truth_fn=jax.jit(truth))
