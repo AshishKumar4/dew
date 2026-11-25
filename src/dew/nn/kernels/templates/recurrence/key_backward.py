@@ -522,14 +522,13 @@ def _key_memory_held(call: Call, keys: int, values: int, *, reads: bool = False)
     merging = largest_live_set(
         product_fragments(call, (held, chunk, chunk), (held, chunk, keys)),
         product_fragments(call, (held, chunk, keys), (held, keys, chunk), rhs_transposed=True))
-    # Under `reads`, three fp32 key-block tiles more through both phases, as ptxas holds them: priced in the
-    # weights' phase alone, the memory products' phase stayed the launch's largest, its derived tiles as they
-    # were, and Kimi Linear's PKDA training's launch spilled 32 bytes a thread on an sm86 and 184 on an
-    # sm120 (46 registers; scratch jsf-pkdagate2 to -4), its fast backward held.
-    reading = [f32(chunk, keys)] * 3 * reads
+    # Under `reads`, three fp32 key-block tiles more, as ptxas holds them: priced as their fp32 value alone,
+    # or with their given-dtype tile beside it, Kimi Linear's PKDA training's launch derived the same tiles
+    # and spilled 32 bytes a thread on an sm86 and 184 on an sm120 (46 registers; scratch jsf-pkdagate2 and
+    # -3), its fast backward held.
     return Held(carried=[f32(chunk, chunk), f32(chunk, 1)] + (sums if walked else []), phases=(
-        apart + fresh + memory + reading,
-        [f32(chunk, keys)] * 4 + reading + apart + fresh + held_tile(held, chunk, keys) * 2
+        apart + fresh + memory,
+        [f32(chunk, keys)] * (4 + 3 * reads) + apart + fresh + held_tile(held, chunk, keys) * 2
         + [f32(chunk, chunk)] * merged + merging))
 
 
