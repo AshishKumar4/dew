@@ -938,10 +938,10 @@ def test_a_kernels_conversion_issues_as_its_assembler_lowers_it(source, target, 
                                    generation.gpu_target("sm90")) == unchanged
 
 
-def _row_reduced(laid_out, called: bool = False) -> Work:
-    """A one-warpgroup Mosaic GPU kernel's fixed work: a 64 x 64 fp32 tile it loads from shared memory and
-    lays out as `laid_out` (a `layout_cast`'s, or none), then reduces along its rows, twice (in a jitted
-    helper its tile an argument of, where `called`)."""
+def _row_reduced(laid_out, where: str = "inline", shape: tuple[int, int] = (64, 64)) -> Work:
+    """A one-warpgroup Mosaic GPU kernel's fixed work: an fp32 tile of `shape` it loads from shared memory
+    and lays out as `laid_out` (a `layout_cast`'s, or none), then reduces along its rows, twice: inline, in
+    a jitted helper its tile an argument of, or in a scope (`pl.run_scoped`) its tile a constant of."""
     def rows(tile):
         return jnp.max(tile, axis=1) + jnp.max(tile, axis=1)
 
@@ -949,18 +949,26 @@ def _row_reduced(laid_out, called: bool = False) -> Work:
         tile = smem[...]
         if laid_out is not None:
             tile = plgpu.layout_cast(tile, laid_out)
-        out_ref[...] = jax.jit(rows)(tile) if called else rows(tile)
+        if where == "scoped":
+            def scope(scratch):
+                del scratch
+                out_ref[...] = rows(tile)
 
-    launch = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((64,), jnp.float32), num_threads=1,
-                          thread_name="wg", scratch_types=[plgpu.SMEM((64, 64), jnp.float32)])
+            pl.run_scoped(scope, plgpu.SMEM((8,), jnp.float32))
+        else:
+            out_ref[...] = jax.jit(rows)(tile) if where == "called" else rows(tile)
+
+    launch = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct(shape[:1], jnp.float32), num_threads=1,
+                          thread_name="wg", scratch_types=[plgpu.SMEM(shape, jnp.float32)])
     traced = jax.make_jaxpr(launch)().jaxpr
     return emission.emitted(traced, 1, "wg", forms=emission.ACCURATE_FORMS).roles[0].fixed
 
 
-@pytest.mark.parametrize(("laid_out", "rounds", "called"), [
-    (plgpu.Layout.WGMMA, 2, False), (plgpu.Layout.WGMMA_TRANSPOSED, 3, False), (None, 0, False),
-    (plgpu.Layout.WGMMA, 2, True)], ids=["wgmma", "transposed", "unknown", "wgmma-in-a-call"])
-def test_a_laid_out_row_reduction_issues_its_butterfly_once(laid_out, rounds, called):
+@pytest.mark.parametrize(("laid_out", "rounds", "where"), [
+    (plgpu.Layout.WGMMA, 2, "inline"), (plgpu.Layout.WGMMA_TRANSPOSED, 3, "inline"), (None, 0, "inline"),
+    (plgpu.Layout.WGMMA, 2, "called"), (plgpu.Layout.WGMMA, 2, "scoped")],
+    ids=["wgmma", "transposed", "unknown", "wgmma-in-a-call", "wgmma-in-a-scope"])
+def test_a_laid_out_row_reduction_issues_its_butterfly_once(laid_out, rounds, where):
     """A kernel's reduction along a tile's rows, its tile's layout named by its provenance (here a
     `layout_cast`), issues its butterfly across the lanes that layout spreads a row over, as Mosaic GPU
     lowers it: log2 of them rounds of a shuffle and a combine of each 32-bit word of the result's registers
@@ -968,8 +976,9 @@ def test_a_laid_out_row_reduction_issues_its_butterfly_once(laid_out, rounds, ca
     names the layout (inference's choice). Each thread first combines the values it holds of each of its
     rows, so a reduction combines its elements less the values a thread keeps, then a round's each. The same
     reduction twice issues it once, as the lowering's CSE merges them; a jitted helper's reduction of its
-    laid-out argument alike. Where shuffles went uncounted (row 12889); the two maxima's sum 64 more."""
-    fixed = _row_reduced(laid_out, called)
+    laid-out argument, and a scope's of its captured tile, alike. Where shuffles went uncounted (row 12889);
+    the two maxima's sum 64 more."""
+    fixed = _row_reduced(laid_out, where)
     if laid_out is None:
         assert fixed.shuffles == 0 and fixed.operations == 64 * 64 + 64, fixed
         return
@@ -978,6 +987,24 @@ def test_a_laid_out_row_reduction_issues_its_butterfly_once(laid_out, rounds, ca
     held = math.prod(result.registers_shape((64,))) * result.vector_length * 128
     assert fixed.shuffles == rounds * held, (fixed, held)
     assert fixed.operations == 64 * 64 - held + rounds * held + 64, (fixed, held)
+
+
+def test_a_replicated_rows_reduction_combines_each_copy():
+    """A 1 x 64 fp32 row a row at a time (`swizzling._row_layout`: two values a lane, every warp of the
+    warpgroup a copy) reduced along it: each of the 128 threads combines its two values, then five rounds
+    across the warp's 32 lanes, a shuffle and a combine each, 768 combines where the row's 64 elements
+    alone counted 576 (the review of lane/toolkit ca6da710b, P2)."""
+    from dew.nn.kernels.templates import swizzling
+
+    def body(out_ref, smem):
+        row = plgpu.layout_cast(smem[...], swizzling._row_layout((1, 64), jnp.float32))
+        out_ref[...] = jnp.max(row, axis=1)
+
+    launch = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((1,), jnp.float32), num_threads=1,
+                          thread_name="wg", scratch_types=[plgpu.SMEM((1, 64), jnp.float32)])
+    traced = jax.make_jaxpr(launch)().jaxpr
+    fixed = emission.emitted(traced, 1, "wg", forms=emission.ACCURATE_FORMS).roles[0].fixed
+    assert fixed.operations == 128 * (1 + 5) and fixed.shuffles == 128 * 5, fixed
 
 
 def test_an_attention_forwards_walk_issues_its_row_reductions_butterflies():
