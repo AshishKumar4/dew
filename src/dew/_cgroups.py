@@ -142,13 +142,19 @@ def oom_kills(level: Path) -> int | None:
     return int(counts["oom_kill"]) if "oom_kill" in counts else None
 
 
+CHARGES = {"memory.current": "inactive_file", "memory.usage_in_bytes": "total_inactive_file"}
+"""Where each hierarchy states a group's charge, and the `memory.stat` counter of the inactive page cache that
+charge holds: cgroup v2's (`memory.current`, whose stat counts every descendant's), and v1's memory
+controller's (`memory.usage_in_bytes`, which counts every descendant's as its `total_` counters do)."""
+
+
 def memory_held(level: Path) -> int | None:
-    """The bytes `level` holds that its kernel will not reclaim first: its charge (`memory.current`) less
-    its inactive page cache (`memory.stat`'s `inactive_file`), as the kubelet counts a container's working
-    set; None where it states no charge."""
-    current, stat = level / "memory.current", level / "memory.stat"
-    if not current.is_file():
-        return None
-    stated = [line.split() for line in stat.read_text().splitlines()] if stat.is_file() else []
-    reclaimed = next((int(value) for name, value in stated if name == "inactive_file"), 0)
-    return int(current.read_text()) - reclaimed
+    """The bytes `level` holds that its kernel will not reclaim first: its charge (`CHARGES`: v2's or v1's)
+    less the inactive page cache in it, as the kubelet counts a container's working set; None where it states
+    no charge, or its charge cannot be read (`_read`)."""
+    for charge, inactive in CHARGES.items():
+        if (current := _read(level / charge)) is not None:
+            stated = [line.split() for line in (_read(level / "memory.stat") or "").splitlines()]
+            reclaimed = next((int(value) for name, value in stated if name == inactive), 0)
+            return int(current) - reclaimed
+    return None

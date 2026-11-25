@@ -382,7 +382,7 @@ class Host:
         bound the host's. Under a memory limit the page cache the kernel reclaims first (`inactive_file`) is
         room, as the kubelet counts a container's working set: a run that has read its corpus once holds it
         in cache, charged to its cgroup, and counting that as taken left room for no worker beside it. A
-        level that states no charge (`cgroups.memory_held`: v1's) is bounded by its limit alone."""
+        level whose charge cannot be read (`cgroups.memory_held`) is bounded by its limit alone."""
         import psutil
 
         group = cgroups.own(root, membership)
