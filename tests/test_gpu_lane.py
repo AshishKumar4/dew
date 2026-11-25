@@ -392,6 +392,43 @@ def test_only_a_dry_prepare_runs_under_a_time_cap(ci, tmp_path, monkeypatch, cap
     assert began + seen["seconds"] - ci.prepares.CAP_MARGIN <= cap <= time.monotonic() + seen["seconds"]
 
 
+@pytest.mark.parametrize(("limit", "holds"), [("10737418240\n", str(int(10737418240 * 0.75))),
+                                              ("max\n", ""), (None, "")])
+def test_a_dry_prepare_holds_no_more_than_its_container_allows(ci, tmp_path, monkeypatch, limit, holds):
+    """A dry prepare's process (prepares.py's `process`, `capped`) runs under a memory cap (tests/tier_wire.py's
+    `PREPARE_HOLDS`) of its container's limit (its cgroup's `memory.max`) less its end's share (`HELD_SHARE`),
+    so a group whose programs outgrow its container is capped rather than killed with every report; none where
+    its container states no limit (`max`) or no cgroup is read, and a part's prepare never."""
+    stated = tmp_path / "memory.max"
+    if limit is not None:
+        stated.write_text(limit)
+    contained = ci.prepares.contained_bytes
+    monkeypatch.setattr(ci.prepares, "contained_bytes", lambda: contained(stated))
+    seen = {}
+
+    def tested(python, files, group, verdict, seconds, *args, **kwargs):
+        seen.setdefault("environ", []).append(args[3])
+        return 0
+    monkeypatch.setattr(ci, "tested", tested)
+    for capped in (True, False):
+        ci.prepares.process(ci, "3.12", "tests/test_gpu_vae.py", "", tmp_path / "v.json", 1500.0, unit="u",
+                            threads="1", users=False, variant="@prepare-sm90", capped=capped)
+    wire = ci.tier_wire()
+    dry, part = seen["environ"]
+    assert (dry[wire.PREPARE_HOLDS], part[wire.PREPARE_HOLDS]) == (holds, "")
+
+
+def test_a_process_past_the_memory_it_may_hold_is_past_its_cap():
+    """A dry prepare's process holding more than its memory cap (tests/tier_wire.py's `PREPARE_HOLDS`) is past
+    its cap (`past_cap`), so it starts no further test, cell or draw; one holding less, or under no memory cap,
+    is not."""
+    holds = tier_wire.held()
+    assert holds > 0
+    assert tier_wire.past_cap({tier_wire.PREPARE_HOLDS: str(holds // 2)})
+    assert not tier_wire.past_cap({tier_wire.PREPARE_HOLDS: str(holds * 4)})
+    assert not tier_wire.past_cap({tier_wire.PREPARE_HOLDS: ""})
+
+
 def test_the_plan_prepares_each_gpu_tier_file_dry_for_each_generation(ci, tmp_path):
     """The plan's dry prepares (prepares.py's `entries`): each file holding a `gpu`-marked test (a mark in a
     string is none) for each generation of `PREPARED` (sm90 alone at first), its lane's process and, where it

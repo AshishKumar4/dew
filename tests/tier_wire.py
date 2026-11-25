@@ -43,12 +43,28 @@ unprepared and run unprepared on its GPU as any is, but no red of its row (prepa
 its prepare's time, no fault of the test."""
 
 
+PREPARE_HOLDS = "DEW_TIER_PREPARE_HOLDS"
+"""The bytes a dry prepare's process may hold resident before it starts no further test, cell or site's draw
+(`past_cap`): its container's memory, less what its process's end takes (tools/armada/prepares.py's
+`process`). A process keeps every program it compiled (JAX's and XLA's caches), so a group of heavy families
+grows to its container's whole memory and is killed, every report lost (a recurrence group's prepare at a
+medium's 10 GiB, train 1269). Unset or empty, no cap."""
+
+
+def held() -> int:
+    """The bytes this process holds resident (its `/proc/self/statm` pages)."""
+    with open("/proc/self/statm") as statm:
+        return int(statm.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+
+
 def past_cap(environ: Mapping[str, str] = os.environ) -> bool:
-    """Whether a dry prepare of `environ` (this process's) is past its cap (`PREPARE_BY`): it starts nothing
-    more."""
+    """Whether a dry prepare of `environ` (this process's) is past its cap, its time's (`PREPARE_BY`) or its
+    memory's (`PREPARE_HOLDS`): it starts nothing more."""
     import time
 
-    return bool(environ.get(PREPARE_BY)) and time.monotonic() > float(environ[PREPARE_BY])
+    if environ.get(PREPARE_BY) and time.monotonic() > float(environ[PREPARE_BY]):
+        return True
+    return bool(environ.get(PREPARE_HOLDS)) and held() > int(environ[PREPARE_HOLDS])
 
 
 class PastCap(Exception):
@@ -67,7 +83,8 @@ def stop_past_cap(environ: Mapping[str, str] = os.environ) -> None:
 
 def capped(why: str) -> str:
     """The reason a test or cell left unprepared by its prepare's cap gives (`CAPPED`, its where)."""
-    return f"not prepared: {why} ran past its group's prepare time cap; its run compiles it on its GPU"
+    return (f"not prepared: {why} ran past its group's prepare cap (its time or memory); its run compiles it"
+            " on its GPU")
 
 
 def preparing(environ: Mapping[str, str] = os.environ) -> bool:

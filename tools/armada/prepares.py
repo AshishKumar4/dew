@@ -173,8 +173,8 @@ def process(ci, python: str, file: str, group: str, verdict: Path, left: float, 
     process's flags where `users` (`VARIANTS`), its row named for `variant`, within what is `left` of its
     caller's deadline. What its own end may take past its deadline is kept back (its grace, its group's
     settling, its reader's last ten seconds); with none left, it is not started, its row saying so. A dry
-    prepare's (`capped`) runs under its time cap (tests/tier_wire.py's `PREPARE_BY`); a part's never, whose
-    run reads every program it prepares."""
+    prepare's (`capped`) runs under its time cap and its memory's (tests/tier_wire.py's `PREPARE_BY` and
+    `PREPARE_HOLDS`); a part's never, whose run reads every program it prepares."""
     if (mine := left - ci.session.GRACE - ci.SETTLE - 10.0) <= 0:
         why = "not prepared: its lane's prepare had no time left for it"
         verdict.write_text(json.dumps({"rows": [ci.stale_row(python, file, ci.varied(group, variant), why)]}))
@@ -183,7 +183,10 @@ def process(ci, python: str, file: str, group: str, verdict: Path, left: float, 
     # Past its cap a dry prepare starts no further test or cell (tests/tier_wire.py's `past_cap`), so what it
     # prepared is kept, its end in time to upload it: a cap of the time it has but its end's.
     # A part's clears any cap it inherits (its environment's, its caller's).
-    cap = {wire.PREPARE_BY: repr(time.monotonic() + max(mine - CAP_MARGIN, mine / 2)) if capped else ""}
+    # Of memory, the container's but its end's share (`HELD_SHARE`), where its container states it.
+    held = contained_bytes() if capped else None
+    cap = {wire.PREPARE_BY: repr(time.monotonic() + max(mine - CAP_MARGIN, mine / 2)) if capped else "",
+           wire.PREPARE_HOLDS: str(int(held * HELD_SHARE)) if held else ""}
     return ci.tested(python, [file], group, verdict, mine, cache, ci.session.GRACE, common,
                      {"JAX_PLATFORMS": "cpu", wire.PREPARE: "1", "OMP_NUM_THREADS": threads,
                       **(VARIANTS["users"][1] if users else {}), wire.UNIT: unit, **cap, **(environ or {})},
@@ -193,6 +196,21 @@ def process(ci, python: str, file: str, group: str, verdict: Path, left: float, 
 CAP_MARGIN = 240.0
 """What a dry prepare keeps of its time past its cap (`process`) for its process's end: the test or cell
 running at its cap, its programs' upload to the shared cache, its report."""
+
+
+HELD_SHARE = 0.75
+"""The share of its container's memory a dry prepare's process may hold before it starts nothing more
+(`process`, tests/tier_wire.py's `PREPARE_HOLDS`): the rest is the test, cell or draw running as it passes
+its cap, its process's end, and the task's own processes beside it."""
+
+
+def contained_bytes(limit: Path = Path("/sys/fs/cgroup/memory.max")) -> int | None:
+    """The bytes this container may hold (its cgroup's `memory.max`); None where it states no limit."""
+    try:
+        stated = limit.read_text().strip()
+    except OSError:
+        return None
+    return int(stated) if stated.isdigit() else None
 
 
 def planned(files: list[tuple[str, bool, int]], took: Callable[[str, str], tuple[float, float] | None],
