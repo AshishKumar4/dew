@@ -406,7 +406,7 @@ class RemoteCache:
             self._failed(error)
             return
         # The chunks it held past those it now fills, deleted, so the next fetch ends where this bundle does.
-        for index in range(len(chunks), len(held)):
+        for index in range(len(layout), len(held)):
             self.uploads.put((self._chunk(file, index), None))
 
     def _payloads(self, keys: list[str]) -> list[tuple[str, bytes]]:
