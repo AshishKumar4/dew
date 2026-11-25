@@ -344,7 +344,8 @@ def test_a_saturating_narrowing_compiles_and_counts_a_conversion_a_pair(generati
     from dew.nn.kernels.templates import bundles, inline_forms
     from dew.nn.kernels.templates.cost import Stated
 
-    shape = (64, 16)
+    # Its rows whole 32-byte sectors in bf16, as a register tile's store to device memory takes them.
+    shape = (64, 64)
     layout = bundles.of(generation, jnp.bfloat16).layout
 
     def body(x_ref, out_ref):

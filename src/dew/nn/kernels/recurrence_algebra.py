@@ -28,7 +28,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.nn import derivatives
-from dew.nn.float_bits import TWO_FACTOR_REACH, raised_exactly, whole_power2
+from dew.nn.float_bits import TWO_FACTOR_REACH, exact_power2, raised_exactly
 from dew.nn.kernels.generation import linear_map, unbroadcast
 from dew.nn.kernels.options import program
 from dew.nn.kernels.templates.product import Blocks, Exact, Transposed
@@ -173,8 +173,23 @@ def raised(whole, part: jax.Array | float = 0.0):
     fraction's exp2 lies in [1, 2), so `n` past fp32's exponents gives zero or infinity at any reach, and the
     two factors held an A100's query_key launch spill-free where three spilled it (ledger 2519), each set
     from `n` as a float (`power2`'s `integral`)."""
-    n = jnp.floor(whole)
+    n = _floor(whole)
     return power2(jnp.exp2((whole - n) + part), n, reach=TWO_FACTOR_REACH, integral=True)
+
+
+def _floor(x):
+    """`floor(x)` of fp32 `x` from its truncation toward zero, the same value (a zero's sign aside): every
+    fp32 of magnitude 2^23 or more is an integer, and infinities and NaNs are their own floor, so their
+    truncation, whatever its conversion gives past an int32 or of a NaN, is never taken: the conversion's
+    own clamps (FS-CONV-SASS1) bound it, where a clip to 2^23 before it issued two more an element. Mosaic
+    GPU lowers `jnp.floor` too (one cvt.rmi since post81), but there an H100's write-gated forked training
+    certified a consumer past its first rung and its fp32 turned training step held in no config's compile
+    (theme/jsf-intradiet e04820c37), as the sm100 Kimi delta attention two-role training launch spilled 8
+    bytes at its residency's 248-register share (audit K2-1, jsf-calib-floor): ptxas is not monotone
+    between them."""
+    truncated = x.astype(jnp.int32).astype(x.dtype)
+    floor = jnp.where(truncated > x, truncated - 1.0, truncated)
+    return jnp.where(jnp.abs(x) < 2.0 ** 23, floor, x)
 
 
 def decayed(rows, rows_lo, columns, columns_lo):
@@ -216,16 +231,14 @@ def separated(hi, lo: jax.Array | float = 0.0):
     """A compensated base-2 exponent `(hi, lo)` as its whole part and fraction `(n, f)`: `n` the integer
     `floor(hi)` (`hi` itself past 2^23, where every fp32 is one), `f` what `hi` holds past it and `lo` (zero
     where the exponent is one fp32, a decay a key dimension's rounded prefix), the form whose differences are
-    exact at any size (`between`). Once a call, where its prefix is cumulated. `floor` one instruction on a
-    GPU (cvt.rmi); its truncation through an integer (four clamps, two conversions, two compares and two
-    selects an element) was some 160 of Kimi delta attention's intra walk's 1552 issues a step (M-JS-272)."""
-    whole = jnp.floor(hi)
+    exact at any size (`between`). Once a call, where its prefix is cumulated."""
+    whole = _floor(hi)
     return whole, (hi - whole) + lo
 
 
 def between(later, earlier):
     """`exp2(later - earlier)` of two separated exponents (`separated`, broadcasting), to fp32's resolution:
-    exp2 of the fractions' difference times the wholes' difference's exact power of two (`whole_power2`), zero
+    exp2 of the fractions' difference times the wholes' difference's exact power of two (`exact_power2`), zero
     where the wholes differ by -127 or less (its zero exponent bits; at -126 and -125 the product may lie
     among fp32's subnormals, which a GPU's fast math flushes) and the difference held at `PAIR_CEILING` above.
     A difference of the rounded sums lost the fraction's last bits at the exponent's size, 1e-6 of the decay
@@ -238,7 +251,7 @@ def between(later, earlier):
     the ports' ranges; a decay whose exponent is at most zero is `decay`'s; the template's ranges
     (`range_decay`) and a decay from the prefix's start are `raised`'s."""
     (whole, fraction), (other, its_fraction) = later, earlier
-    return jnp.exp2(fraction - its_fraction) * whole_power2(jnp.clip(whole - other, -127.0, PAIR_CEILING))
+    return jnp.exp2(fraction - its_fraction) * exact_power2(jnp.clip(whole - other, -127.0, PAIR_CEILING))
 
 
 def decay(later, earlier):
@@ -249,7 +262,7 @@ def decay(later, earlier):
     were 5.5k of a compute warp's 28.9k issues in a B200's Kimi Linear intra walk once its prefix was
     separated (modelled at 191cb7975e4)."""
     (whole, fraction), (other, its_fraction) = later, earlier
-    return jnp.exp2(fraction - its_fraction) * whole_power2(jnp.maximum(whole - other, -127.0))
+    return jnp.exp2(fraction - its_fraction) * exact_power2(jnp.maximum(whole - other, -127.0))
 
 
 def first_decays(dg, entered, d_entered, first, memory, takes, live, passed=None):

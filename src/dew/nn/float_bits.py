@@ -51,12 +51,10 @@ def whole_power2(n: jax.Array) -> jax.Array:
     there (+0 at -127, infinity at 128), from no integer conversion: `n + 2^23 + 127` is an integer in
     [2^23, 2^24) and so exact, its significand's low bits `n + 127`, which a left shift sets in the
     exponent field (the leading bits shift out). A float's conversion to an integer lowers in a Mosaic GPU
-    kernel to two clamps and a conversion (FS-CONV-SASS1), and `exact_power2` takes an integer: in Kimi
-    delta attention's intra walk, 112 of a step's 1552 issues and its 56 conversions (M-JS-272); this is an
+    kernel to two clamps and a conversion (FS-CONV-SASS1), and `exact_power2` takes an integer; this is an
     add and a shift. Its domain is the caller's to hold, by a clip or a bound of its own
-    (`precision.power2`'s integral halves, `recurrence_algebra.decay`'s): a non-integral `n` rounds to the
-    nearest power, and one past either end, or a NaN, sets the shifted bits in the sign or the exponent
-    field as they fall, no power."""
+    (`precision.power2`'s integral halves): a non-integral `n` rounds to the nearest power, and one past
+    either end, or a NaN, sets the shifted bits in the sign or the exponent field as they fall, no power."""
     biased = jnp.asarray(n, jnp.float32) + np.float32(2.0 ** 23 - WHOLE_POWERS[0])
     bits = jax.lax.bitcast_convert_type(biased, jnp.int32)
     return jax.lax.bitcast_convert_type(jax.lax.shift_left(bits, jnp.full_like(bits, 23)), jnp.float32)
