@@ -1598,7 +1598,11 @@ def uncontracted(*values):
 
     if interpreting() is not None or not _MARKING.get():
         return jax.lax.optimization_barrier(values)
-    return jax.lax.platform_dependent(values, default=jax.lax.optimization_barrier, **_UNBARRIERED)
+    from dew._cache import unrecorded
+
+    # Its branches dispatch no kernel and route none: one trace under every receipt around it (row 10524).
+    with unrecorded():
+        return jax.lax.platform_dependent(values, default=jax.lax.optimization_barrier, **_UNBARRIERED)
 
 
 def _odd(dtype) -> bool:
