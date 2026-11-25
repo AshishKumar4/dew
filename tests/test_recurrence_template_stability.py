@@ -503,11 +503,11 @@ def faint_read(length: int, width: int) -> tuple:
 def faint_read_call(length: int, width: int):
     """`faint_read`'s read erase, its keys and queries, and its call `(q, k, v, r) -> output` on `kernel` (the
     delta rule's, `chunk_on`) under a decay a key dimension, its reads undeclared (`Hooks.unit_reads`): token
-    0 writes `2^60` along a key on channel 1, token 1 decays channel 0 by `2^-60`, reads `2^100` along it and
-    writes along channel 2, which its query reads."""
+    0 writes `2^60` along a key whose channel 0 is `2^-100`, token 1 decays channel 0 by `2^-60`, reads
+    `2^100` along it and writes along channel 2, which its query reads."""
     unit = np.eye(width, dtype=np.float32)
     keys = np.zeros((1, length, 1, width), np.float32)
-    keys[0, 0, 0], keys[0, 1, 0] = unit[1], unit[2]
+    keys[0, 0, 0], keys[0, 1, 0] = 2.0 ** -100 * unit[0] + unit[1], unit[2]
     queries = np.zeros_like(keys)
     queries[0, 1, 0] = unit[2]
     reads, values, beta, decay = faint_read(length, width)
