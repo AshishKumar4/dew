@@ -347,8 +347,9 @@ the masses' own sum over `k`, which the result does not read."""
 def test_a_transposed_letter_no_factor_reads_forms_no_product_over_the_others():
     """The masses' cotangent of the attention mean at the sm90 matrix cell's width (1024 queries and keys,
     256 channels, eight heads in four groups): the divisor's term reads `k` through the masses alone, its
-    unit operand along `k` a group of its own, so no group's product spans more than an operand does, where
-    one in the cotangent's group formed `bhgqdk`, 8 GiB, four held at once (row 12979). Traced only."""
+    unit operand along `k` held apart from the cotangent's group it is a factor of (`Form.units`), so no
+    part's product spans more than an operand does, where held with it the group formed `bhgqdk`, 8 GiB,
+    four held at once (row 12979). Traced only."""
     from dew.nn.kernels.templates.scaled_contraction import scaled_contraction_p
 
     masses = jax.ShapeDtypeStruct((1, 4, 2, 1024, 1024), jnp.float32)
@@ -364,14 +365,16 @@ def test_a_transposed_letter_no_factor_reads_forms_no_product_over_the_others():
                    for letter, size in zip(subscript, operand.aval.shape, strict=True)}
         for _, groups in (*form.terms, *form.divisor):
             for group in groups:
-                assert int(np.prod([extents[letter] for letter in form.letters(group)])) <= bound, group
+                rest = tuple(factor for factor in group if factor[0] not in form.units)
+                for part in ((rest,) if rest else ()) + tuple((f,) for f in group if f[0] in form.units):
+                    assert int(np.prod([extents[letter] for letter in form.letters(part)])) <= bound, part
 
 
 def test_a_transposes_unit_operand_takes_no_band_from_the_groups_beside_it():
     """`y[d] = w[d] s_0 sum_k x[k]` times 57 scalars, each a group: `x`'s cotangent against `2^127` and
-    `2^-30` at `w = [0, 1]` is `2^-30` at every `k`, exactly. The transpose's unit operand along `k`, a group
-    of its own, counts as the factor beside the cotangent it is (`Form.padded`), so the term keeps its band;
-    counted as a group it left none, and the sum, unbanded, read `2^-30` beneath `2^127` as zero."""
+    `2^-30` at `w = [0, 1]` is `2^-30` at every `k`, exactly. The transpose's unit operand along `k` is a
+    factor of the cotangent's group (`Form.units`), so the term keeps its band; a group of its own left
+    none, and the sum, unbanded, read `2^-30` beneath `2^127` as zero."""
     scalars = 58
     subscripts = ("k", "d", *("",) * scalars)
     weight = ((1, 1), (2, 1))
@@ -396,12 +399,31 @@ def test_a_scalar_group_keeps_its_band_beside_a_term_that_cancels():
 
 def test_a_transposes_transpose_bands_its_unit_as_a_group_once_its_partner_is_taken():
     """`sum_k x[k] - sum_k w[k] x[k]` at `w = [1, 0]`: its pullback, transposed again against `[1, 2^-60]`,
-    is `2^-60` exactly. The first transpose pads its cotangent with a unit along `k`; the second takes that
-    cotangent away, and the unit, left a group of its own, keeps the band it had as one: banded as a factor
-    beside a partner the term no longer holds, the band held both parts and `1 - 1` rounded away the
-    `2^-60`."""
+    is `2^-60` exactly. The first transpose's unit along `k` is a factor of its cotangent's group; the
+    second takes that cotangent away, and the unit, left that group's one factor, keeps the band the group
+    had: banded as no group, the band held both parts and `1 - 1` rounded away the `2^-60`."""
     form = Form(("k", "k"), ((1, (((0, 1),),)), (-1, (((1, 1),), ((0, 1),)))), "")
     w = jnp.asarray([1.0, 0.0], jnp.float32)
     _, pull = jax.vjp(lambda x: contract(form, x, w), jnp.ones(2, jnp.float32))
     (back,) = jax.linear_transpose(pull, jnp.float32(1.0))((jnp.asarray([1.0, 2.0 ** -60], jnp.float32),))
     np.testing.assert_array_equal(np.asarray(back), np.float32(2.0 ** -60))
+
+
+def test_a_quotients_transposes_transpose_keeps_its_unit_beside_the_divisors_factors():
+    """`prod(s) (sum_k x[k] - sum_k w[k] x[k]) / d` over 57 scalar groups at `w = [1, 0]`, `s = d = 1`: its
+    pullback, transposed again against `[2^127, 2^-30]`, is `2^-30` exactly. Once the second transpose takes
+    the first's cotangent away, its unit stays in the group the divisor's reciprocal and exponent hold, as
+    one of its factors; a group of its own left the term no band, and `2^-30` rounded away beneath the
+    cancelling `2^127`."""
+    scalars = 57
+    singles = tuple(((2 + index, 1),) for index in range(scalars))
+    divisor = 2 + scalars
+    form = Form(("k", "k", *("",) * scalars, ""),
+                ((1, (((0, 1),), *singles)), (-1, (((1, 1),), ((0, 1),), *singles))), "",
+                divisor=((1, (((divisor, 1),),)),), divided="")
+    w = jnp.asarray([1.0, 0.0], jnp.float32)
+    ones = [jnp.float32(1.0)] * (scalars + 1)
+    _, pull = jax.vjp(lambda x: contract(form, x, w, *ones), jnp.ones(2, jnp.float32))
+    cotangent = jnp.asarray([2.0 ** 127, 2.0 ** -30], jnp.float32)
+    (back,) = jax.linear_transpose(pull, jnp.float32(1.0))((cotangent,))
+    np.testing.assert_array_equal(np.asarray(back), np.float32(2.0 ** -30))
