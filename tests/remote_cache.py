@@ -389,29 +389,33 @@ class RemoteCache:
         except UNREACHABLE as error:
             self._failed(error)
             return
+        kept = {key for keys in layout for key in keys}
         with self.state:
-            self.queued[file] = wanted
-            kept = {key for keys in layout for key in keys}
             if not kept or kept == self.held.get(file, set()):
+                self.queued[file] = wanted
                 return  # nothing new fits: the Worker's bundle stays as it is
-            self.held[file] = kept
             held = self.chunked.get(file, [])
-            changed = [index for index, keys in enumerate(layout)
-                       if index >= len(held) or keys != held[index]]
-            self.chunked[file] = [list(keys) for keys in layout]
+        changed = [index for index, keys in enumerate(layout) if index >= len(held) or keys != held[index]]
+        # Its changed chunks' payloads read before anything is held sent: a close that cannot read one sends
+        # nothing, and the next sends it.
         try:
-            for index in changed:
-                self.uploads.put((self._chunk(file, index), packed(self._payloads(layout[index]))))
+            bodies = [(index, packed(self._payloads(layout[index]))) for index in changed]
         except UNREACHABLE as error:
             self._failed(error)
             return
+        with self.state:
+            self.queued[file] = wanted
+            self.held[file] = kept
+            self.chunked[file] = [list(keys) for keys in layout]
+        for index, body in bodies:
+            self.uploads.put((self._chunk(file, index), body))
         # The chunks it held past those it now fills, deleted, so the next fetch ends where this bundle does.
         for index in range(len(layout), len(held)):
             self.uploads.put((self._chunk(file, index), None))
 
     def _payloads(self, keys: list[str]) -> list[tuple[str, bytes]]:
         """`keys`' programs as the directory holds them, one gone since its layout (JAX's cache evicts) going
-        without."""
+        without; one that cannot be read (OSError) fails the whole."""
         entries = []
         for key in keys:
             try:
