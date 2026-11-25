@@ -25,8 +25,10 @@
 set -u
 gates=tools/check_gates
 PYTHON=${PYTHON:-python}
+# Whether a base was given, not defaulted: the locks gate resolves again only against a given one.
+BASE_GIVEN=${BASE:+1}
 BASE=${BASE:-origin/main}
-export PYTHON BASE
+export PYTHON BASE BASE_GIVEN
 names() { grep -v '^#' "$gates" | cut -f1; }
 # A gate's command, from the checkout's top, with the lint inputs read; its exit status is the gate's.
 run() {
