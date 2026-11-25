@@ -4,13 +4,15 @@ runs (`recording`), so a fatal signal in it (a segfault in any thread, native co
 thread's Python stack, and on Python 3.14 the faulting thread's C frames by library and offset
 (`faulthandler`'s `c_stack`), where the run's checkpoints are. Nothing runs until a fatal signal.
 
-The handler is enabled once, as the process is readied (`runtime.ready_process`), and never disabled: a
+The handler is enabled once, as the process is prepared, before its pool's join (`runtime.prepare_process`),
+readied (`runtime.ready_process`) or a fit records (`recording`), whichever comes first, and never disabled: a
 handler installed over it (UCX's, as NCCL's transport starts, each saving the one it replaced and, on a
 signal, putting it back and raising again) hands each signal back to it, which writes its stacks and hands
 on to what it found. A fit re-points it at the run's file and back at standard error after, which installs
 nothing. The process's policy asks UCX for no handler of its own where its environment names none
-(`UCX_ERROR_SIGNALS` empty, read once as UCX starts), as Dew's other environment defaults are; a process
-whose fault handler another owner enabled (pytest, `PYTHONFAULTHANDLER`) keeps it, and records nothing."""
+(`UCX_ERROR_SIGNALS` empty, read once as UCX starts: a transport already started keeps the policy it read),
+as Dew's other environment defaults are; a process whose fault handler another owner enabled (pytest,
+`PYTHONFAULTHANDLER`) keeps it, and records nothing."""
 
 import contextlib
 import faulthandler
@@ -49,10 +51,11 @@ def record_path(directory: str) -> Path:
 @contextlib.contextmanager
 def recording(directory: str | None):
     """The process's fault handler writing to its record in the run directory `directory` for the block,
-    to standard error again after it: re-pointed, nothing installed. None where the handler is another
-    owner's (`owned`), or the run keeps no directory on this host's file system (no checkpoints, or a
-    bucket's)."""
-    if not (_OWNED and _OWNED[0]) or directory is None or "://" in directory:
+    to standard error again after it: re-pointed, nothing installed, the handler the process's from here
+    on where nothing made it so before (`owned`: no JAX read). None where the handler is another owner's,
+    or the run keeps no directory on this host's file system (no checkpoints, or a bucket's)."""
+    owned()
+    if not _OWNED[0] or directory is None or "://" in directory:
         yield None
         return
     path = record_path(directory)

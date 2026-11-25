@@ -115,6 +115,8 @@ def prepare_process(wandb: Wandb | None = None,
     joins = cluster is not None or joins_pool(multi_host, environment)
     _set_environment(wandb, xla_flags, compilation_cache_dir, joins)
     _raise_limits()
+    # Before the pool's join, whose collective may start NCCL's UCX transport (`faults.owned`).
+    faults.owned()
     _join_process_pool(environment, joins)
     ready_process()
     _log.info("Number of devices: %s", jax.device_count())
