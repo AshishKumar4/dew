@@ -15,7 +15,17 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-from armada_support import apart, armada_task, cached, cached_checkout, commit, interpreter, loaded, written
+from armada_support import (
+    apart,
+    armada_task,
+    cached,
+    cached_checkout,
+    cached_runs,
+    commit,
+    interpreter,
+    loaded,
+    written,
+)
 from tool_support import git, load
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1036,20 +1046,6 @@ def test_every_row_carries_its_cases_reports_and_a_reused_row_keeps_them(ci, tmp
     assert (tmp_path / "runs").read_text() == "x", "the second task reused the rows"
 
 
-def cached_runs(ci, root: Path, monkeypatch, cache_worker) -> Callable[[], int]:
-    """The checkout's one 3.12 task, run green on one CPU class against the shared test cache as armada
-    starts it (`armada_task`) under the cache's policy (`cached_checkout`): each call, how many times its
-    test has run, which it counts in `runs`."""
-    verdict = cached_checkout(ci, root, monkeypatch, cache_worker)
-
-    def run(policy: str = "on") -> int:
-        rows = armada_task(ci, monkeypatch, verdict, policy)
-        assert [row["exitCode"] for row in rows] == [0]
-        return len((root / "runs").read_text())
-
-    return run
-
-
 @pytest.mark.parametrize(("changed", "policy"), [
     ({"src/pkg/mod.py": "VALUE = 2\n"}, "on"), ({"docs/page.md": "page\n"}, "on"),
     ({"tutorials/notes.ipynb": "{}\n"}, "on"), ({"tools/tool.py": "VALUE = 2\n"}, "on"),
@@ -1295,8 +1291,9 @@ def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cu
     its fixture), its setup's group keeping the place of its first recorded test, where the plan has it,
     though the new test comes first. A test the record lacks, alone or a new setup's, joins the plan's groups
     without moving a recorded test from its planned group (`session.kept`), the new tests cut by the file's
-    mean across them: each test still runs in one group, and its file's groups run, never reused, until the
-    record names it (`record`'s `unkeyed`). A mark written
+    mean across them: each test still runs in one group, and the group holding it runs, never reused, until
+    the record names it (`record`'s `unkeyed`), the file's other groups their plan's whole, reused. A mark
+    written
     elsewhere than a test's own decorator, or of a name not a literal string, refuses the file, naming its
     line, as the plan cannot read it."""
     (tmp_path / ".armada.json").write_text(json.dumps({"target": 300, "environment": {}}))
@@ -1336,7 +1333,7 @@ def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cu
     assert [ci.run_keys.members("tests/test_order.py", f"{group}/3") for group in (1, 2, 3)] == [
         [order["1b"]], [order["2a"]], [order["3c"]]]
     # A new lone test, or a new setup's pair, before recorded a, b, c joins the first group, a, b and c each
-    # staying in its planned group, and the file's groups are not reused.
+    # staying in its planned group: that group is not reused, the others, all recorded, are.
     files = {"lone": ("0x", "1a", "2b", "3c"), "group": ("0y", "0z", "1a", "2b", "3c")}
     for name, tests in files.items():
         (tmp_path / f"tests/test_{name}.py").write_text(
@@ -1358,8 +1355,8 @@ def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cu
         assert [ci.run_keys.members(f"tests/test_{name}.py", f"{group}/3") for group in (1, 2, 3)] == [
             [node[name, test]] for test in ("1a", "2b", "3c")]
         common = ci.shared("3.12")
-        assert [ci.reused("3.12", f"tests/test_{name}.py", f"{group}/3", common) for group in (1, 2, 3)] == [
-            None, None, None]
+        reuse = [ci.reused("3.12", f"tests/test_{name}.py", f"{group}/3", common) for group in (1, 2, 3)]
+        assert reuse[0] is None and all(row is not None for row in reuse[1:])
     for misplaced in ("pytestmark = pytest.mark.shared_setup('plan')\n",
                       "@pytest.mark.shared_setup(NAME)\n"):
         (tmp_path / "tests/test_refused.py").write_text(

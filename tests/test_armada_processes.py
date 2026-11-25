@@ -57,6 +57,77 @@ def test_a_resumed_task_runs_whole_a_file_whose_process_ended_red_after_its_test
     assert rows == {"3.12:tests/test_crashing.py": 0, "3.12:tests/test_other.py": 0}
 
 
+def recycled_row(ci, tmp_path, monkeypatch, source: str, hook: str = "", **kwargs) -> dict:
+    """The row a dry prepare's task gives tests/test_recycled.py of `source` (a conftest `hook` in its
+    continuations, where DEW_CONTINUES_ROW is set), under a recycle bound every process passes."""
+    written(tmp_path, {"test_recycled.py": source})
+    if hook:
+        conftest = tmp_path / "tests" / "conftest.py"
+        conftest.write_text((conftest.read_text() if conftest.is_file() else "")
+                            + "\nimport os\n\n\ndef pytest_collection_modifyitems(items):\n"
+                              f"    if os.environ.get('DEW_CONTINUES_ROW'):\n        {hook}\n")
+    interpreter(tmp_path, "3.12")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ARMADA_ARTIFACTS", str(tmp_path / "artifacts"))
+    out = tmp_path / "verdict.json"
+    ci.tested("3.12", ["tests/test_recycled.py"], "", out, 600.0, "off", 5.0, "", {}, recycle_at=1,
+              **{"recorded": False, **kwargs})
+    [row] = json.loads(out.read_text())["rows"]
+    return row
+
+
+@pytest.mark.parametrize("failing", [False, True])
+def test_a_dry_prepares_tests_past_its_recycle_bound_run_on_in_fresh_processes_as_one_row(
+        ci, tmp_path, monkeypatch, failing):
+    """A dry prepare's pytest that holds more than its bound (`tested`'s `recycle_at`, recycle.py) ends after
+    the test running, and the tests left run in a fresh process, each test once, so what a process compiled
+    is returned at its end: here a bound every process passes, each test its own process. The row is one,
+    every test's case in it, and red where a test of any of its processes failed; recorded as a blind watch's
+    (`run_keys.record`'s `opened` None), keyed by none, as what each process read is no one record's, its red
+    still beginning its next epoch and its green still writing its baseline."""
+    middle = "    assert False\n" if failing else "    pass\n"
+    recorded = []
+    monkeypatch.setattr(ci.run_keys, "record", lambda *args: recorded.append(args) or set())
+    row = recycled_row(ci, tmp_path, monkeypatch,
+                       "import os\ndef ran():\n    with open('pids', 'a') as pids:\n"
+                       "        pids.write(f'{os.getpid()} ')\n"
+                       f"def test_a():\n    ran()\ndef test_b():\n    ran()\n{middle}"
+                       "def test_c():\n    ran()\n",
+                       recorded=True)
+    # Recorded as a blind watch's (no inputs, so no key), its red's epoch and its green's baseline kept.
+    [(_, [recorded_row], *_, opened, _, _, _)] = recorded
+    assert opened is None and recorded_row["name"] == row["name"]
+    assert len(set((tmp_path / "pids").read_text().split())) == 3
+    assert sorted(row["tests"]) == [f"tests/test_recycled.py::test_{name}" for name in "abc"]
+    assert row["exitCode"] == (1 if failing else 0)
+
+
+@pytest.mark.parametrize(("source", "hook"), [
+    # A crash at its exit, after its report: graded as it ended, nothing run past it.
+    ("import atexit, os\ndef test_a():\n    atexit.register(lambda: os._exit(3))\n"
+     "def test_b():\n    pass\n", ""),
+    # Its last process exits 0 with no report of its own (its JUnit file removed as it exits).
+    ("import atexit, os, sys\ndef test_a():\n    pass\ndef test_b():\n"
+     "    report = next(arg.split('=', 1)[1] for arg in sys.argv if arg.startswith('--junitxml='))\n"
+     "    atexit.register(lambda: os.remove(report))\n", ""),
+    # Its last process's collection drops the tests left unreported (a valid report of no test, exit 5).
+    ("def test_a():\n    pass\ndef test_b():\n    pass\n", "items.clear()"),
+    # Its last process's collection drops test_c alone, test_b reported.
+    ("def test_a():\n    pass\ndef test_b():\n    pass\ndef test_c():\n    pass\n",
+     "items[:] = [item for item in items if not item.name.endswith('_c')]"),
+    # A later import no longer defines test_c (test_a wrote the file its definition reads).
+    ("import pathlib\ndef test_a():\n    pathlib.Path('ran-a').touch()\ndef test_b():\n    pass\n"
+     "if not pathlib.Path('ran-a').exists():\n    def test_c():\n        pass\n", ""),
+])
+def test_a_recycled_row_whose_processes_did_not_report_every_test_its_first_selected_is_red(
+        ci, tmp_path, monkeypatch, source, hook):
+    """A dry prepare's row run past a recycle is red unless every test its first process selected was reported
+    by one of its processes, its last by its own report: a process that crashed after its report is never run
+    past, an earlier process's cases are no evidence of its last's, and a later collection that drops or no
+    longer defines a test left never stands for it."""
+    assert recycled_row(ci, tmp_path, monkeypatch, source, hook)["exitCode"] != 0
+
+
 def test_a_report_its_killed_pytest_cut_short_greens_nothing_and_the_tasks_other_files_are_graded(
         ci, tmp_path, monkeypatch):
     """A file whose pytest left its JUnit report and its collection's record cut short (killed as it wrote
