@@ -776,12 +776,12 @@ def _scaled_diff(ops: dict[str, i64], a0, a1, u0, u1, zero_n, half_n, qmax) -> t
     return big.select(raw, halved), big
 
 
-def _extreme_drop_mul(ops: dict[str, i64], extreme, n_min, safe_max, val, zero_n, one_n) -> Term:
-    """Double-where guarded `(n_min / safe_max) * val` for the extreme weight-ratio arm (`n_min / safe_max <
-    rflr`), choosing `(n_min * val) / safe_max` when `n_min <= 1` and `(val / safe_max) * n_min` when
+def _extreme_drop_mul(ops: dict[str, i64], extreme, n_min, safe_max, factor, zero_n, one_n) -> Term:
+    """Double-where guarded `(n_min / safe_max) * factor` for the extreme weight-ratio arm (`n_min / safe_max
+    < rflr`), choosing `(n_min * factor) / safe_max` when `n_min <= 1` and `(factor / safe_max) * n_min` when
     `n_min > 1` (where `safe_max > 1 / rflr`)."""
     ext_n = extreme.select(zero_n, n_min)
-    ext_v = extreme.select(zero_n, val)
+    ext_v = extreme.select(zero_n, factor)
     big_n = ext_n.compare(String("gt"), one_n, ops["gt"])
     max_lo = extreme.select(one_n, big_n.select(safe_max, one_n))
     max_hi = extreme.select(one_n, big_n.select(one_n, safe_max))
@@ -814,15 +814,22 @@ def _extreme_corr(ops: dict[str, i64], extreme, k_min, safe_max, big_d, small_d,
     return extreme.select(zero_n, div_first.select(arm_lo, arm_hi))
 
 
-def _combine_residual(ops: dict[str, i64], n0, ax0, ux0, n1, ax1, ux1) -> Term:
-    """Normalized first-moment residual `ux = sum(w * (x - kept_a)) / (n0 + n1)` of two merged partials,
-    using scale-invariant probabilities in the normal-ratio arm and `_extreme_drop_mul` in the extreme arm."""
+def _moment_merge_ctx(ops: dict[str, i64], n0, n1) -> tuple[Term, ...]:
+    """Broadcast constants and scale-invariant merge probabilities shared by `_combine_residual` and
+    `_moment_combine`."""
     zero_n = Term.literal(ops["z_n"]).shaped(String("broadcast_in_dim"), ops["fill_n"])
     one_n = Term.literal(ops["o_n"]).shaped(String("broadcast_in_dim"), ops["fill_n"])
     half_n = Term.literal(ops["h_n"]).shaped(String("broadcast_in_dim"), ops["fill_n"])
     qmax = Term.literal(ops["q_n"]).shaped(String("broadcast_in_dim"), ops["fill_n"])
     rflr = Term.literal(ops["r_flr"]).shaped(String("broadcast_in_dim"), ops["fill_n"])
-    both, keep0, extreme, n_min, safe_max, p0, p1 = _merge_probs(ops, n0, n1, zero_n, one_n, rflr)
+    return (zero_n, one_n, half_n, qmax, *_merge_probs(ops, n0, n1, zero_n, one_n, rflr))
+
+
+def _combine_residual(ops: dict[str, i64], n0, ax0, ux0, n1, ax1, ux1) -> Term:
+    """Normalized first-moment residual `ux = sum(w * (x - kept_a)) / (n0 + n1)` of two merged partials,
+    using scale-invariant probabilities in the normal-ratio arm and `_extreme_drop_mul` in the extreme arm."""
+    zero_n, one_n, half_n, qmax, both, keep0, extreme, n_min, safe_max, p0, p1 = _moment_merge_ctx(
+        ops, n0, n1)
     kept_a, drop_a = keep0.select(ax1, ax0), keep0.select(ax0, ax1)
     kept_u, drop_u = keep0.select(ux1, ux0), keep0.select(ux0, ux1)
     p_kept, p_drop = keep0.select(p1, p0), keep0.select(p0, p1)
@@ -839,12 +846,8 @@ def _moment_combine(ops: dict[str, i64], c0, n0, ax0, ux0, ay0, uy0,
                     c1, n1, ax1, ux1, ay1, uy1, sign_val: int) -> Term:
     """Normalized Chan-Golub-LeVeque central-moment combine `p0 * c0 + p1 * c1 +/- (p0 * p1) * dx * dy`,
     shared by weighted and masked moments with exact normal-ratio and extreme-ratio scaling."""
-    zero_n = Term.literal(ops["z_n"]).shaped(String("broadcast_in_dim"), ops["fill_n"])
-    one_n = Term.literal(ops["o_n"]).shaped(String("broadcast_in_dim"), ops["fill_n"])
-    half_n = Term.literal(ops["h_n"]).shaped(String("broadcast_in_dim"), ops["fill_n"])
-    qmax = Term.literal(ops["q_n"]).shaped(String("broadcast_in_dim"), ops["fill_n"])
-    rflr = Term.literal(ops["r_flr"]).shaped(String("broadcast_in_dim"), ops["fill_n"])
-    both, keep0, extreme, n_min, safe_max, p0, p1 = _merge_probs(ops, n0, n1, zero_n, one_n, rflr)
+    zero_n, one_n, half_n, qmax, both, keep0, extreme, n_min, safe_max, p0, p1 = _moment_merge_ctx(
+        ops, n0, n1)
     c_kept, c_drop = keep0.select(c1, c0), keep0.select(c0, c1)
     p_kept, p_drop = keep0.select(p1, p0), keep0.select(p0, p1)
     base_norm = p_kept.binary(String("mul"), c_kept, ops["mul"]).binary(
@@ -888,11 +891,10 @@ def _tile_weighted_mean_and_residual(ops: dict[str, i64], n, x, w, axes, p,
     safe_hi = mul_first.select(one_x, safe_x)
     pw = pos_x.select(zero_x, w.binary(String("div"), safe_x, ops["div"]))
 
-    def weighted_avg(val: Term) -> Term:
-        arm_mf = w_lo.binary(String("mul"), val, ops["mul"]).binary(String("div"), safe_hi, ops["div"])
-        arm_df = pw.binary(String("mul"), val, ops["mul"])
+    def weighted_avg(values: Term) -> Term:
+        arm_mf = w_lo.binary(String("mul"), values, ops["mul"]).binary(String("div"), safe_hi, ops["div"])
+        arm_df = pw.binary(String("mul"), values, ops["mul"])
         return pos_x.select(zero_x, mul_first.select(arm_df, arm_mf)).reduce(String("sum"), axes, p)
-
     ax = weighted_avg(x)
     dx = x.binary(String("sub"), ax.shaped(String("broadcast_in_dim"), lift_x), ops["sub"])
     return ax, weighted_avg(dx)
@@ -1909,12 +1911,13 @@ def _register(graph: EGraph, region: terms.Region, closed, names, walked_axes) -
         literal = Term.literal(i64(index))
         facts.extend((local(literal), unwalked(literal)))
         if not terms.typed_key(value):
-            arr = np.asarray(value)
-            if np.all(arr == 0):
+            literal_array = np.asarray(value)
+            if np.all(literal_array == 0):
                 facts.append(zero(literal))
-            elif np.all(arr == 1):
+            elif np.all(literal_array == 1):
                 facts.extend((unit_array(literal), positive_guard(literal)))
-            elif arr.dtype != np.bool_ and np.all(np.isfinite(arr)) and np.all(arr > 0):
+            elif (literal_array.dtype != np.bool_ and np.all(np.isfinite(literal_array))
+                  and np.all(literal_array > 0)):
                 facts.append(positive_guard(literal))
     if facts:
         graph.register(*facts)
@@ -1960,9 +1963,10 @@ def _register_moment_resources(graph: EGraph, region: terms.Region, reductions: 
         dtype = region.dtypes.get(terms.key(reduction))
         if dtype is not None and jnp.issubdtype(dtype, jnp.floating):
             if dtype not in zeros:
-                info = jnp.finfo(dtype)
-                qmax_val = np.asarray(info.max, dtype) * np.asarray(0.25, dtype)
-                rflr_val = np.asarray(min(math.sqrt(float(info.tiny)), 0.25 * float(info.eps)), dtype)
+                float_info = jnp.finfo(dtype)
+                qmax_val = np.asarray(float_info.max, dtype) * np.asarray(0.25, dtype)
+                rflr_val = np.asarray(min(math.sqrt(float(float_info.tiny)),
+                                          0.25 * float(float_info.eps)), dtype)
                 for table, value in ((zeros, 0.0), (ones, 1.0), (halfs, 0.5),
                                      (qmaxs, qmax_val), (rflrs, rflr_val)):
                     region.literals.append(np.asarray(value, dtype))

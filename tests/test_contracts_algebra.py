@@ -6,7 +6,7 @@ import jax.numpy as jnp
 import pytest
 from contract_support import EDGES, ORDER_SETS, assert_contract, normal_draw
 
-from dew.algebra import means, windows
+from dew.algebra import means, moments, windows
 
 
 def _plain(outputs, totals, anchors):
@@ -38,6 +38,32 @@ def test_the_convex_mean_holds_every_order(taken):
         direction = (along[0] * scale, along[1] * scale, along[2])
         assert_contract(_merged, primals, direction, cotangent, f"the convex mean {edge}", plain_fn=_plain,
                         taking=ORDER_SETS[taken])
+
+
+def _chunked_weighted(x, w):
+    return moments.chunked_moments(x, w, tile=4, mode="walk")
+
+
+def _chunked_cov(x, y, w):
+    return moments.chunked_covariance(x, y, w, tile=4, mode="merge")
+
+
+@pytest.mark.parametrize("taken", ORDER_SETS)
+def test_chunked_moments_holds_every_order(taken):
+    """Chunked weighted central moments (`moments.chunked_moments`, walk) and covariance
+    (`moments.chunked_covariance`, merge) hold every derivative order finite against float64 truth and their
+    plain declarations across float32's exponent edges (`EDGES`)."""
+    x, y, w = normal_draw(9045, (2, 8), (2, 8), (2, 8))
+    dx, dy, dw = normal_draw(9046, (2, 8), (2, 8), (2, 8))
+    c_mean, c_my, c_cov = normal_draw(9047, (2,), (2,), (2,))
+    for edge, scale in EDGES.items():
+        w_pos = (jnp.abs(w) + 0.25) * scale
+        assert_contract(_chunked_weighted, (x * scale, w_pos), (dx * scale, dw * scale), (c_mean, c_cov),
+                        f"chunked moments {edge}", plain_fn=moments.weighted_moments,
+                        taking=ORDER_SETS[taken])
+        assert_contract(_chunked_cov, (x * scale, y * scale, w_pos), (dx * scale, dy * scale, dw * scale),
+                        (c_mean, c_my, c_cov), f"chunked covariance {edge}",
+                        plain_fn=moments.weighted_covariance, taking=ORDER_SETS[taken])
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])

@@ -1169,7 +1169,7 @@ def test_chunked_moments_balances_unequal_scales_value_gradients_and_explicit_sh
     y_mn = jnp.asarray([[0.0, 32.0]], jnp.float32)
     w_mn = jnp.asarray([[tiny, tiny]], jnp.float32)
     forms_cov = derive.derive(moments.declaration("covariance"), accurate=False, saturation=SATURATION)
-    shapes_cov = {name: ((1, 1), jnp.float32) for name in ("x", "y", "w")}
+    shapes_cov = dict.fromkeys(("x", "y", "w"), ((1, 1), jnp.float32))
 
     def direct_cov(x_, y_, w_):
         s0 = forms_cov.step(forms_cov.init(shapes_cov), {"x": x_[:, :1], "y": y_[:, :1], "w": w_[:, :1]})

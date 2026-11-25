@@ -14,6 +14,7 @@ import jax.numpy as jnp
 
 from dew.algebra import derive, program
 from dew.algebra.forms import Derived
+from dew.nn.derivatives import Protected, contracted, declared_tangent
 
 SATURATION = program.Saturation(growth=64, depth=4)
 """Derivation limits for central-moment walks."""
@@ -117,26 +118,37 @@ def _eval_derived(kind: Literal["weighted", "masked", "covariance"], tiled: dict
     return final, forms.finish(final, first, shapes=shapes)
 
 
-def _weighted_term(tw: jax.Array, val: jax.Array, sn: jax.Array, pos: jax.Array) -> jax.Array:
-    """Range-safe `(tw / sn) * val`, zeroed where `not pos` or `tw == 0`."""
+def _weighted_term(tw: jax.Array, operand: jax.Array, sn: jax.Array, pos: jax.Array) -> jax.Array:
+    """Range-safe `(tw / sn) * operand`, zeroed where `not pos` or `tw == 0`."""
     nz = pos & (tw > 0)
-    safe_val = jnp.where(nz, val, 0.0)
+    safe_operand = jnp.where(nz, operand, 0.0)
+    safe_tw = jnp.where(nz, tw, 0.0)
     small_tw = (tw <= 1.0) & (sn > 1.0)
-    return jnp.where(nz, jnp.where(small_tw, (tw * safe_val) / sn, (tw / sn) * safe_val), 0.0)
+    tw_mf = jnp.where(small_tw, safe_tw, 0.0)
+    sn_mf = jnp.where(small_tw, sn, 1.0)
+    tw_df = jnp.where(small_tw, 0.0, safe_tw)
+    sn_df = jnp.where(small_tw, 1.0, sn)
+    return jnp.where(small_tw, (tw_mf * safe_operand) / sn_mf, (tw_df / sn_df) * safe_operand)
 
 
-def _safe_tangent_div(dtw: jax.Array, num: jax.Array, sn: jax.Array) -> jax.Array:
-    """Linear-in-`dtw` evaluation of `dtw * num / sn` without `0 * inf` in forward or reverse mode."""
-    qmax = jnp.asarray(0.25 * jnp.finfo(num.dtype).max, num.dtype)
+def _safe_tangent_div(dtw: jax.Array, numerator: jax.Array, sn: jax.Array) -> jax.Array:
+    """Linear-in-`dtw` evaluation of `dtw * numerator / sn` without `0 * inf` in forward or reverse mode."""
+    qmax = jnp.asarray(0.25 * jnp.finfo(numerator.dtype).max, numerator.dtype)
     hi = sn > 1.0
     sn_hi = jnp.where(hi, sn, 1.0)
     sn_lo = jnp.where(hi, 1.0, sn)
-    safe_lo = jnp.abs(num) <= sn_lo * qmax
-    num_safe = jnp.where(safe_lo, num, 0.0)
-    num_big = jnp.where(safe_lo, 0.0, num)
+    num_hi = jnp.where(hi, numerator, 0.0)
+    dtw_hi = jnp.where(hi, dtw, 0.0)
+    num_lo = jnp.where(hi, 0.0, numerator)
+    dtw_lo = jnp.where(hi, 0.0, dtw)
+    safe_lo = jnp.abs(num_lo) <= sn_lo * qmax
+    num_safe = jnp.where(safe_lo, num_lo, 0.0)
+    num_big = jnp.where(safe_lo, 0.0, num_lo)
+    dtw_safe = jnp.where(safe_lo, dtw_lo, 0.0)
+    dtw_big = jnp.where(safe_lo, 0.0, dtw_lo)
     sn_big = jnp.where(safe_lo, 1.0, sn_lo)
-    lo_term = dtw * (num_safe / sn_lo) + (dtw * num_big) / sn_big
-    return jnp.where(hi, dtw * (num / sn_hi), lo_term)
+    lo_term = dtw_safe * (num_safe / sn_lo) + (dtw_big * num_big) / sn_big
+    return jnp.where(hi, dtw_hi * (num_hi / sn_hi), lo_term)
 
 
 def _cov_tangent_tile(tx: jax.Array, ty: jax.Array, tw: jax.Array,
@@ -157,11 +169,13 @@ def _cov_tangent_tile(tx: jax.Array, ty: jax.Array, tw: jax.Array,
     sn_hi = jnp.where(hi, sn, 1.0)
     big_c = jnp.where(jnp.abs(cx) >= jnp.abs(cy), cx, cy)
     sml_c = jnp.where(jnp.abs(cx) >= jnp.abs(cy), cy, cx)
-    c_dw_hi = (big_c / sn_hi) * sml_c - cov[..., None] / sn_hi
+    c_dw_hi = (jnp.where(hi, big_c, 0.0) / sn_hi) * jnp.where(hi, sml_c, 0.0) - (
+        jnp.where(hi, cov[..., None], 0.0) / sn_hi)
     safe_cx = jnp.where(hi, 0.0, cx)
     safe_cy = jnp.where(hi, 0.0, cy)
-    c_dw_lo = safe_cx * safe_cy - cov[..., None]
-    d_cov_w = jnp.where(hi, dtw * c_dw_hi, _safe_tangent_div(dtw, c_dw_lo, jnp.where(hi, 1.0, sn)))
+    c_dw_lo = safe_cx * safe_cy - jnp.where(hi, 0.0, cov[..., None])
+    d_cov_w = jnp.where(hi, jnp.where(hi, dtw, 0.0) * c_dw_hi,
+                        _safe_tangent_div(jnp.where(hi, 0.0, dtw), c_dw_lo, jnp.where(hi, 1.0, sn)))
     d_cov = jnp.sum(pw_cy * dtx + pw_cx * dty + d_cov_w, axis=-1)
     return d_mx, d_my, d_cov
 
@@ -171,57 +185,79 @@ def _tile_array(value: jax.Array, shape: tuple[int, ...], tile: int) -> jax.Arra
     return jnp.moveaxis(jnp.broadcast_to(value, shape).reshape(*shape[:-1], n_tiles, tile), -2, 0)
 
 
+def _total_weight(shape: tuple[int, ...], w: jax.Array, tile: int,
+                  mode: Literal["walk", "merge"]) -> jax.Array:
+    w_stack = _tile_array(w, shape, tile)
+    if mode == "walk":
+        zeros = jnp.zeros(shape[:-1], w.dtype)
+        total, _ = jax.lax.scan(lambda acc, chunk: (acc + jnp.sum(chunk, axis=-1), None), zeros, w_stack)
+        return total
+    return jnp.sum(w_stack, axis=(0, -1))
+
+
 def _tiled_tangents(x: jax.Array, y: jax.Array, w: jax.Array,
                     dx: jax.Array, dy: jax.Array, dw: jax.Array,
                     mu_x: jax.Array, mu_y: jax.Array, cov: jax.Array, n: jax.Array,
                     tile: int, mode: Literal["walk", "merge"]) -> tuple[jax.Array, jax.Array, jax.Array]:
     shape = jnp.broadcast_shapes(x.shape, y.shape, w.shape)
-    stacks = tuple(_tile_array(arr, shape, tile) for arr in (x, y, w, dx, dy, dw))
+    tx_s = _tile_array(x, shape, tile)
+    ty_s = _tile_array(y, shape, tile)
+    tw_s = _tile_array(w, shape, tile)
+    dtx_s = _tile_array(dx, shape, tile)
+    dty_s = _tile_array(dy, shape, tile)
+    dtw_s = _tile_array(dw, shape, tile)
     if mode == "walk":
         zeros = (jnp.zeros_like(mu_x), jnp.zeros_like(mu_y), jnp.zeros_like(cov))
 
         def step(acc, chunk):
-            d_mx, d_my, d_cov = _cov_tangent_tile(*chunk, mu_x, mu_y, cov, n)
+            tx, ty, tw, dtx, dty, dtw = chunk
+            d_mx, d_my, d_cov = _cov_tangent_tile(tx, ty, tw, dtx, dty, dtw, mu_x, mu_y, cov, n)
             return (acc[0] + d_mx, acc[1] + d_my, acc[2] + d_cov), None
 
-        totals, _ = jax.lax.scan(step, zeros, stacks)
+        totals, _ = jax.lax.scan(step, zeros, (tx_s, ty_s, tw_s, dtx_s, dty_s, dtw_s))
         return totals
     d_mx, d_my, d_cov = jax.vmap(
         lambda tx, ty, tw, dtx, dty, dtw: _cov_tangent_tile(tx, ty, tw, dtx, dty, dtw, mu_x, mu_y, cov, n)
-    )(*stacks)
+    )(tx_s, ty_s, tw_s, dtx_s, dty_s, dtw_s)
     return jnp.sum(d_mx, axis=0), jnp.sum(d_my, axis=0), jnp.sum(d_cov, axis=0)
 
 
-@functools.partial(jax.custom_jvp, nondiff_argnums=(2, 3))
-def _run_chunked_weighted(x: jax.Array, w: jax.Array, tile: int,
-                          mode: Literal["walk", "merge"]) -> tuple[jax.Array, jax.Array]:
+def _chunked_weighted_primal(x: jax.Array, w: jax.Array, tile: int,
+                             mode: Literal["walk", "merge"]) -> tuple[jax.Array, jax.Array]:
     _, finished = _eval_derived("weighted", _tiled({"x": x, "w": w}, tile), mode)
     return finished
 
 
-@_run_chunked_weighted.defjvp
-def _run_chunked_weighted_jvp(tile: int, mode: Literal["walk", "merge"], primals, tangents):
+def _chunked_weighted_jvp(tile: int, mode: Literal["walk", "merge"], primals, tangents):
     x, w = primals
     dx, dw = tangents
-    state, (mean, var) = _eval_derived("weighted", _tiled({"x": x, "w": w}, tile), mode)
-    d_mean, _, d_var = _tiled_tangents(x, x, w, dx, dx, dw, mean, mean, var, state[0], tile, mode)
+    mean, var = _run_chunked_weighted(x, w, tile, mode)
+    n = _total_weight(jnp.broadcast_shapes(x.shape, w.shape), w, tile, mode)
+    d_mean, _, d_var = _tiled_tangents(x, x, w, dx, dx, dw, mean, mean, var, n, tile, mode)
     return (mean, var), (d_mean, d_var)
 
 
-@functools.partial(jax.custom_jvp, nondiff_argnums=(3, 4))
-def _run_chunked_cov(x: jax.Array, y: jax.Array, w: jax.Array, tile: int,
-                     mode: Literal["walk", "merge"]) -> tuple[jax.Array, jax.Array, jax.Array]:
+_run_chunked_weighted = contracted("test_chunked_moments_holds_every_order")(
+    declared_tangent(Protected(), _chunked_weighted_primal, _chunked_weighted_jvp, nondiff_argnums=(2, 3)))
+
+
+def _chunked_cov_primal(x: jax.Array, y: jax.Array, w: jax.Array, tile: int,
+                        mode: Literal["walk", "merge"]) -> tuple[jax.Array, jax.Array, jax.Array]:
     _, finished = _eval_derived("covariance", _tiled({"x": x, "y": y, "w": w}, tile), mode)
     return finished
 
 
-@_run_chunked_cov.defjvp
-def _run_chunked_cov_jvp(tile: int, mode: Literal["walk", "merge"], primals, tangents):
+def _chunked_cov_jvp(tile: int, mode: Literal["walk", "merge"], primals, tangents):
     x, y, w = primals
     dx, dy, dw = tangents
-    state, (mean_x, mean_y, cov) = _eval_derived("covariance", _tiled({"x": x, "y": y, "w": w}, tile), mode)
-    d_mx, d_my, d_cov = _tiled_tangents(x, y, w, dx, dy, dw, mean_x, mean_y, cov, state[0], tile, mode)
+    mean_x, mean_y, cov = _run_chunked_cov(x, y, w, tile, mode)
+    n = _total_weight(jnp.broadcast_shapes(x.shape, y.shape, w.shape), w, tile, mode)
+    d_mx, d_my, d_cov = _tiled_tangents(x, y, w, dx, dy, dw, mean_x, mean_y, cov, n, tile, mode)
     return (mean_x, mean_y, cov), (d_mx, d_my, d_cov)
+
+
+_run_chunked_cov = contracted("test_chunked_moments_holds_every_order")(
+    declared_tangent(Protected(), _chunked_cov_primal, _chunked_cov_jvp, nondiff_argnums=(3, 4)))
 
 
 def _floating_dtype(*arrays: jax.Array):
