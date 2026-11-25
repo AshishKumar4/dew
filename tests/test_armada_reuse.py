@@ -835,3 +835,23 @@ def test_a_red_runs_epoch_write_sent_again_after_a_later_one_never_puts_it_back(
     answer.close()
     assert status in (204, 412)
     assert planned() == ["tests/test_a.py", "tests/test_b.py tests/test_c.py"]
+
+
+def test_a_fetched_fixtures_store_is_keyed_by_its_names_whether_a_host_holds_it_or_not(
+        ci, tmp_path, monkeypatch):
+    """A fetched fixture's store (tools/fetched_fixtures.py's LOCAL) holds each file under its sha256, which a
+    task's environment fills and a planner's lacks: a stored file is keyed by its name, there or not, and a
+    listing of the fixtures' directory reads alike with the store in it or not; another listed entry
+    re-keys it."""
+    monkeypatch.chdir(tmp_path)
+    fixtures = tmp_path / "tests/fixtures"
+    fixtures.mkdir(parents=True)
+    (fixtures / "model.json").write_text("{}\n")
+    stored = f"tests/fixtures/fetched/{'a' * 64}.npz"
+    absent = (ci.digests.contents("tests/fixtures"), ci.digests.contents(stored))
+    (tmp_path / stored).parent.mkdir(parents=True)
+    (tmp_path / stored).write_bytes(b"payload")
+    assert (ci.digests.contents("tests/fixtures"), ci.digests.contents(stored)) == absent
+    assert ci.digests.contents(f"tests/fixtures/fetched/{'b' * 64}.npz") != absent[1]
+    (fixtures / "other.json").write_text("{}\n")
+    assert ci.digests.contents("tests/fixtures") != absent[0]

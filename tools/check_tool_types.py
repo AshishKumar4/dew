@@ -181,13 +181,28 @@ def located(name: str, roots: tuple[str, ...]) -> list[Path]:
     return []
 
 
-def closure(path: Path) -> list[Path]:
-    """Tool `path` and every module of the checkout it imports, followed through their own imports."""
+class Reads:
+    """What one run of the gate reads of the checkout, each file parsed, each import looked up and each file
+    read once: hundreds of tools share most of src/dew, and a closure walked afresh for each spent 449 s of a
+    shard's 600 (2026-11-25, its keys alike). Never held past a run, whose files do not change under it."""
+
+    def __init__(self) -> None:
+        self.imported = functools.cache(imported)
+        self.roots_of = functools.cache(roots_of)
+        self.located = functools.cache(located)
+        self.bytes = functools.cache(Path.read_bytes)
+
+
+def closure(path: Path, reads: Reads | None = None) -> list[Path]:
+    """Tool `path` and every module of the checkout it imports, followed through their own imports, read
+    through `reads` (a run's, else afresh)."""
+    reads = reads or Reads()
     seen, frontier = {path}, [path]
     while frontier:
         here = frontier.pop()
-        for name in imported(here):
-            for found in located(name, roots_of(here)):
+        roots = reads.roots_of(here)
+        for name in reads.imported(here):
+            for found in reads.located(name, roots):
                 if found not in seen:
                     seen.add(found)
                     frontier.append(found)
@@ -206,14 +221,15 @@ def common() -> bytes:
     return digest.digest()
 
 
-def key(path: Path, requirements: Iterable[str], shared: bytes) -> str:
+def key(path: Path, requirements: Iterable[str], shared: bytes, reads: Reads | None = None) -> str:
     """Tool `path`'s verdict's key: `shared` (`common`), its environment (its requirements, and Dew's lock,
     whose environment every one reads beneath its own: `beneath`) and the code of its `closure`, each file by
-    its path and bytes."""
+    its path and bytes, read through `reads` (a run's, else afresh)."""
+    reads = reads or Reads()
     digest = hashlib.sha256(shared)
-    digest.update(json.dumps(list(requirements)).encode() + (ROOT / "locks" / "cpu.txt").read_bytes())
-    for each in closure(path):
-        digest.update(each.relative_to(ROOT).as_posix().encode() + each.read_bytes())
+    digest.update(json.dumps(list(requirements)).encode() + reads.bytes(ROOT / "locks" / "cpu.txt"))
+    for each in closure(path, reads):
+        digest.update(each.relative_to(ROOT).as_posix().encode() + reads.bytes(each))
     return digest.hexdigest()
 
 
@@ -373,7 +389,7 @@ def main() -> int:
         # (2026-11-19: a system python3.14 read every Dew tool against its standard library alone).
         parser.error(f"{sys.executable} is no virtual environment: run this with Dew's "
                      "(.venv-3.12/bin/python)")
-    pins, shared, store = releases(), common(), records()
+    pins, shared, store, reads = releases(), common(), records(), Reads()
     groups: dict[tuple[str, tuple[str, ...]], list[Path]] = {}
     red = 0
     named = {(ROOT / path).resolve() for path in args.paths}
@@ -396,7 +412,7 @@ def main() -> int:
     for (name, requirements), paths in sharded(sorted(groups.items()), *args.shard):
         if args.environment and name not in args.environment:
             continue
-        keys = {path: key(path, requirements, shared) for path in paths}
+        keys = {path: key(path, requirements, shared, reads) for path in paths}
         wanted = [path for path in paths
                   if store is None or store.recorded(f"{STORE}/{keys[path]}", token) is None]
         print(f"{name}: {len(paths)} tools, {len(paths) - len(wanted)} green before", flush=True)
