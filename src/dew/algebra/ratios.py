@@ -20,19 +20,19 @@ from jax.sharding import PartitionSpec
 from dew.algebra import scaled
 from dew.algebra.windows import (
     Units,
-    _NONE,
     _arrays,
     _factor_values,
     _laid_to,
     _landed,
+    _NONE,
     _quotient,
     _quotients_summed,
     _raised,
     _streamed,
     _Sum,
     _times,
-    _without_axis,
     _windows,
+    _without_axis,
     chunk_width,
 )
 
