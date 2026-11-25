@@ -214,20 +214,31 @@ def test_a_cuda_targets_verdict_key_names_the_ptxas_jax_gives_xla_and_none_stati
 def test_a_cuda_targets_verdict_key_names_each_nvjitlink_the_loader_could_open(tmp_path):
     """XLA assembles a Pallas-Triton kernel through the libnvJitLink its stub opens by soname, a system one
     where no wheel provides it: a CUDA target's verdict key names each the process's loader could find (its
-    `LD_LIBRARY_PATH`'s here), by its contents' size and age, so one updated in place keys a launch afresh,
-    and the same one keys it alike (row 12166: the key read the nvJitLink wheels' versions alone)."""
+    `LD_LIBRARY_PATH`'s here) by the name it is found by and the file that resolves to, so one updated in
+    place keys a launch afresh, as does its soname pointed at another build beside it, and the same ones
+    key it alike (row 12166: the key read the nvJitLink wheels' versions alone; the review of
+    toolkit/nvjitlink-key 13b1e490b: a soname's retarget kept its key)."""
     from process_support import fresh
 
-    library = tmp_path / "lib" / "libnvJitLink.so.13"
-    library.parent.mkdir()
+    directory = tmp_path / "lib"
+    directory.mkdir()
+    builds = {name: directory / f"libnvJitLink.so.{name}" for name in ("13.0", "13.1")}
+    for name, build in builds.items():
+        build.write_bytes(f"build {name}".encode())
+        os.utime(build, ns=(10**18, 10**18))
+    (directory / "libnvJitLink.so").symlink_to(builds["13.0"].name)
+    soname = directory / "libnvJitLink.so.13"
 
-    def key(contents: bytes, modified: int) -> str | None:
-        library.write_bytes(contents)
-        os.utime(library, ns=(modified, modified))
-        return fresh(VERDICT_KEYS, "sm90", variables={"LD_LIBRARY_PATH": str(library.parent)})["sm90"]
+    def key(target: str) -> str | None:
+        soname.unlink(missing_ok=True)
+        soname.symlink_to(builds[target].name)
+        return fresh(VERDICT_KEYS, "sm90", variables={"LD_LIBRARY_PATH": str(directory)})["sm90"]
 
-    first, again, updated = key(b"build 1", 10**18), key(b"build 1", 10**18), key(b"build 22", 2 * 10**18)
-    assert first is not None and first == again != updated
+    first, again, retargeted = key("13.0"), key("13.0"), key("13.1")
+    builds["13.0"].write_bytes(b"build 13.0, rebuilt")
+    updated = key("13.0")
+    assert first is not None and first == again
+    assert len({first, retargeted, updated}) == 3
 
 
 def test_a_tpu_targets_verdict_key_reads_no_gpu_assembler():
