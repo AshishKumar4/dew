@@ -1,6 +1,8 @@
 """A launch's work counted from its kernel's emission (`templates.emission`, row 5895): a step of its walk
 counted from its body, as each warpgroup runs it."""
 
+import math
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -934,6 +936,71 @@ def test_a_kernels_conversion_issues_as_its_assembler_lowers_it(source, target, 
     unchanged = Work() if source == target else Work(conversions=128)
     assert emission.operation_work(lax.convert_element_type_p, [row_in], [row_out], params,
                                    generation.gpu_target("sm90")) == unchanged
+
+
+def _row_reduced(laid_out) -> Work:
+    """A one-warpgroup Mosaic GPU kernel's fixed work: a 64 x 64 fp32 tile it loads from shared memory and
+    lays out as `laid_out` (a `layout_cast`'s, or none), then reduces along its rows, twice."""
+    def body(out_ref, smem):
+        tile = smem[...]
+        if laid_out is not None:
+            tile = plgpu.layout_cast(tile, laid_out)
+        out_ref[...] = jnp.max(tile, axis=1) + jnp.max(tile, axis=1)
+
+    launch = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((64,), jnp.float32), num_threads=1,
+                          thread_name="wg", scratch_types=[plgpu.SMEM((64, 64), jnp.float32)])
+    traced = jax.make_jaxpr(launch)().jaxpr
+    return emission.emitted(traced, 1, "wg", forms=emission.ACCURATE_FORMS).roles[0].fixed
+
+
+@pytest.mark.parametrize(("laid_out", "rounds"), [(plgpu.Layout.WGMMA, 2), (plgpu.Layout.WGMMA_TRANSPOSED, 3),
+                                                   (None, 0)], ids=["wgmma", "transposed", "unknown"])
+def test_a_laid_out_row_reduction_issues_its_butterfly_once(laid_out, rounds):
+    """A kernel's reduction along a tile's rows, its tile's layout named by its provenance (here a
+    `layout_cast`), issues its butterfly across the lanes that layout spreads a row over, as Mosaic GPU
+    lowers it: log2 of them rounds of a shuffle and a combine of each 32-bit word of the result's registers
+    a thread (WGMMA's four lanes, two rounds; WGMMA_TRANSPOSED's eight, three); none where no provenance
+    names the layout (inference's choice). The same reduction twice issues it once, as the lowering's CSE
+    merges them. Where shuffles went uncounted (row 12889)."""
+    fixed = _row_reduced(laid_out)
+    if laid_out is None:
+        assert fixed.shuffles == 0, fixed
+        return
+    result = laid_out.to_mgpu().reduce((1,))
+    # Each fp32 register one 32-bit word, each shuffled once a round.
+    words = math.prod(result.registers_shape((64,))) * result.vector_length
+    assert fixed.shuffles == rounds * words * 128, (fixed, words)
+
+
+def test_an_attention_forwards_walk_issues_its_row_reductions_butterflies():
+    """The attention forward's walk, traced for an H100 at 64 x 128 tiles with two consumers and for an A100
+    at 64 x 64 (its scaled kernel, the one each compiles), issues 12 shuffles a thread a step, as their SASS
+    does (FS-REDSHFL4): three distinct row reductions of a product's accumulator (WGMMA's or mma.sync's
+    layout, by provenance), two rows a thread, two rounds each, the scaled kernel's repeated max and sum
+    merged as the lowering's CSE merges them."""
+    from dew.nn.attention import scaled_dot_product_attention
+    from dew.nn.kernels import tuning
+    from dew.nn.kernels.templates import attention_mosaic
+
+    for gen, tiles in (("sm90", attention_mosaic.Tiles(64, 128, 2, 2, family="wgmma")),
+                       ("sm80", attention_mosaic.Tiles(64, 64, 2, 1, family="mma.sync"))):
+        operand = jax.ShapeDtypeStruct((1, 2048, 8, 64), jnp.bfloat16)
+
+        def forward(q, k, v, tiles=tiles):
+            with tuning.pinned({attention_mosaic.MosaicForward: tiles}):
+                return scaled_dot_product_attention(q, k, v, causal=False, implementation="template")
+
+        with generation.assumed(gen):
+            traced = jax.make_jaxpr(forward)(operand, operand, operand)
+            (scaled,) = [equation for equation in programs.equations(traced.jaxpr)
+                         if equation.primitive in programs.NATIVE_KERNELS
+                         and str(equation.params.get("name", "")).startswith("attention_forward_scaled")]
+            mesh = scaled.params.get("mesh")
+            forms = emission.forms_of(scaled.params["compiler_params"])
+            counted = (emission.emitted(emission._body(scaled), mesh.num_threads or 1, mesh.thread_name,
+                                        forms=forms) if mesh is not None
+                       else emission.emitted(emission._body(scaled), 1, None, forms=forms))
+        assert counted.roles[0].step(lambda work: work.shuffles) == 12 * 128, gen
 
 
 @pytest.mark.parametrize(("platform", "operations"), [("sm90", 0), ("cpu", 128), ("v5e", 256)])
