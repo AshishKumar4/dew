@@ -91,34 +91,35 @@ class Region(NamedTuple):
         return tuple(sorted({*self.prologue, *self.places}))
 
 
-def fused_program(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
-    """`jaxpr` with each attention region a kernel of Dew's takes written as Dew's attention, each product
-    region the template takes fused (the module's account), and each RMSNorm and SwiGLU region the fused
-    norms take written as Dew's, every call by `recognize`; `jaxpr` itself where none is."""
+def fused_program(jaxpr: jcore.Jaxpr, *, _base: tuple[Hashable, Hashable] | None = None) -> jcore.Jaxpr:
+    """`jaxpr` with each attention and recurrence region a kernel of Dew's takes written as Dew's call,
+    each product region the template takes fused (the module's account), and each RMSNorm and SwiGLU region
+    the fused norms take written as Dew's, every call by `recognize`; `jaxpr` itself where none is."""
     from dew.algebra import recognize
     from dew.nn.kernels import fused_gemm
 
     index = Index(jaxpr)
-    attention = recognize.recognized(jaxpr, index, recognize.ATTENTION)
-    held = {place for region in attention for place in region.places}
+    base = base_context() if _base is None else _base
+    front = recognize.recognized(jaxpr, index, (*recognize.ATTENTION, *recognize.RECURRENCES), _base=base)
+    held = {place for region in front for place in region.places}
     identities = {}
     for found in _regions(index):
         if held & set(found.places):
             continue
         taken = _taken(index, found, lambda region: _decided(
-            _identity(jaxpr, region), lambda: _takes(fused_gemm, jaxpr, region)))
+            _identity(jaxpr, region), lambda: _takes(fused_gemm, jaxpr, region), _base=base))
         if taken is not None:
             identities[taken] = _identity(jaxpr, taken)
     products = list(identities)
     # A norm a product's prologue replays is the product's (`_prologue`), as an epilogue's norm is.
     held |= {place for region in products for place in region.replayed}
-    written = attention + recognize.recognized(jaxpr, index, recognize.NORMS, frozenset(held))
+    written = front + recognize.recognized(jaxpr, index, recognize.NORMS, frozenset(held), _base=base)
     if not products and not written:
         return jaxpr
     written += [Written(region.places, region.inputs, region.outputs, region.at,
                         _fusing(_replayed(jaxpr, region, fused_gemm), fused_gemm),
                         ("product", identities[region])) for region in products]
-    return _spliced(jaxpr, written)
+    return _spliced(jaxpr, written, _base=base)
 
 
 def _taken(index: Index, found: Region, decided: Callable[[Region], RegionDecision]) -> Region | None:
@@ -502,6 +503,25 @@ class RegionDecision(NamedTuple):
 _held: collections.OrderedDict[Hashable, Held[RegionDecision]] = collections.OrderedDict()
 
 
+def base_context() -> tuple[Hashable, Hashable]:
+    """The trace-stable prefix of `choice_context()` (`derive.context()`, `options.trace_context()`),
+    computed once per pass or body while `choice_context_of` appends the live `report.refusal_snapshot()`."""
+    from dew.algebra import derive
+    from dew.nn.kernels.options import trace_context
+
+    return derive.context(), trace_context()
+
+
+def choice_context_of(base: tuple[Hashable, Hashable] | None = None) -> Hashable:
+    """`choice_context()` reusing a precomputed `base_context()` while reading live `refusal_snapshot()`."""
+    if base is None:
+        return choice_context()
+    from dew.nn.kernels.templates import report
+
+    derive_ctx, trace_ctx = base
+    return derive_ctx, (trace_ctx, report.refusal_snapshot())
+
+
 def choice_context() -> Hashable:
     """The context a kernel of Dew's is chosen in, which every held kernel decision of the algebra's keys
     (`_cache.holding`: a region's fusion, its written program, a recognition, an attention call's kernel):
@@ -523,14 +543,15 @@ def _identity(jaxpr: jcore.Jaxpr, region: Region) -> Hashable:
                                          [jaxpr.eqns[place] for place in region.replayed]))
 
 
-def _decided(identity: Hashable, decide: Callable[[], RegionDecision]) -> RegionDecision:
+def _decided(identity: Hashable, decide: Callable[[], RegionDecision], *,
+             _base: tuple[Hashable, Hashable] | None = None) -> RegionDecision:
     """A region's decision (`decide`), weighed once for its structure (`_identity`) in the context a kernel
     is chosen in (`choice_context`), held with the facts its probes read (`_cache.holding`)."""
     def weighed() -> RegionDecision:
         # Its probes' routes are no program's: the routes a block collects are the kernels it runs.
         with generation.routes(alone=True):
             return decide()
-    return _cache.holding(_held, (identity, choice_context()), weighed, DECISIONS_HELD)
+    return _cache.holding(_held, (identity, choice_context_of(_base)), weighed, DECISIONS_HELD)
 
 
 def _takes(fused_gemm, jaxpr: jcore.Jaxpr, region: Region) -> RegionDecision:
@@ -620,7 +641,7 @@ class _Trace(NamedTuple):
 _traces: collections.OrderedDict[Hashable, Held[_Trace]] = collections.OrderedDict()
 
 
-def _traced(region: Written) -> _Trace | None:
+def _traced(region: Written, *, _base: tuple[Hashable, Hashable] | None = None) -> _Trace | None:
     """`region`'s call traced as one nested program over its inputs' types (`nested`), once a process for
     its identity (`Written.key`) in the context a kernel is chosen in (`choice_context`), held with the
     facts its trace read while each answers alike, those read again wherever it is taken
@@ -632,7 +653,7 @@ def _traced(region: Written) -> _Trace | None:
         (equation,) = traced.jaxpr.eqns
         return _Trace(equation, tuple(traced.jaxpr.invars), record)
 
-    held = _cache.holding(_traces, (region.key, choice_context()), traced_once, DECISIONS_HELD)
+    held = _cache.holding(_traces, (region.key, choice_context_of(_base)), traced_once, DECISIONS_HELD)
     # Its outputs the very types the region made (`jax_core.typematch`: shape, dtype, sharding, the manual
     # axes they vary over), else it is not written, a value of another type in its place a program JAX
     # refuses, and its routes reported refused (`_unwritten`).
@@ -666,10 +687,11 @@ def _unwritten(region: Written, trace: _Trace) -> None:
             taken, kernel="xla", preferred=taken.kernel, refusal=refusal))
 
 
-def _spliced(jaxpr: jcore.Jaxpr, regions: Sequence[Written]) -> jcore.Jaxpr:
+def _spliced(jaxpr: jcore.Jaxpr, regions: Sequence[Written], *,
+             _base: tuple[Hashable, Hashable] | None = None) -> jcore.Jaxpr:
     """`jaxpr` with each of `regions`' equations replaced by one nested program of its call over its inputs
     (`_traced`), its outputs the very values the region made, written at its place."""
-    traces = [(region, trace) for region in regions if (trace := _traced(region)) is not None]
+    traces = [(region, trace) for region in regions if (trace := _traced(region, _base=_base)) is not None]
     if not traces:
         # No region written: the program itself, whose identity JAX shares its lowering by.
         return jaxpr

@@ -851,14 +851,15 @@ def _identities() -> tuple[RuleFamily, ...]:
 
 FACTS = _facts()
 RULES: dict[str, Rules] = {}
-_HEADS: dict[str, set[tuple[str, ...]]] = {}
-"""What each registered rule's left side reads at its head (`_head`), by the operation it heads at: the
-operations that make its operands, where the left side states them. The program pass opens a window at an
-equation one of them matches (`heads`, `program.WINDOW` deep), so a rule is reachable from the moment it is
-registered; a set that only aids the others (`Rules.aid`: commutativity leaves every price as it was) or runs
-at dev time alone (`Rules.dev`) opens none unless enabled via `enabling_dev`."""
-_DEV_HEADS: dict[str, dict[str, set[tuple[str, ...]]]] = {}
-"""Window heads for each dev-time rule set (`Rules.dev`), active only while named in `ALGEBRA.value.dev`."""
+_HEAD_PATTERNS: dict[str, set[tuple[tuple[str, int], ...]]] = {}
+"""What each registered rule's left side reads at its head (`_head`), indexed by root operation to required
+operand-producer multisets (as sorted `(symbol, count)` tuples). The program pass opens a window at an
+equation one of them matches (`heads`, `program.WINDOW` deep), and derives active root primitives directly
+from its keys (`head_primitives`); a set that only aids the others (`Rules.aid`) or runs at dev time alone
+(`Rules.dev`) opens none unless enabled via `enabling_dev`."""
+_DEV_PATTERNS: dict[str, dict[str, set[tuple[tuple[str, int], ...]]]] = {}
+"""Window head patterns for each dev-time rule set (`Rules.dev`), active only while named in
+`ALGEBRA.value.dev`."""
 
 
 def _operation(pattern) -> declarations.CallDecl | None:
@@ -926,15 +927,16 @@ def register(rules: Rules) -> None:
                          f"of the language, so no window of a program opens for it")
     RULES[rules.name] = rules
     for root, made in (head for _, head in found if head is not None):
-        _HEADS.setdefault(root, set()).add(made)
+        _HEAD_PATTERNS.setdefault(root, set()).add(tuple(sorted(collections.Counter(made).items())))
     if rules.dev:
-        dev_heads: dict[str, set[tuple[str, ...]]] = {}
+        dev_patterns: dict[str, set[tuple[tuple[str, int], ...]]] = {}
         for family in rules.families:
             for written in family.rules:
                 head = _head(written)
                 if head is not None:
-                    dev_heads.setdefault(head[0], set()).add(head[1])
-        _DEV_HEADS[rules.name] = dev_heads
+                    dev_patterns.setdefault(head[0], set()).add(
+                        tuple(sorted(collections.Counter(head[1]).items())))
+        _DEV_PATTERNS[rules.name] = dev_patterns
 
 
 _MEASURED = ("measured M-DC-1 (four diffusion training steps, GH200) and M-DC-3 (six GPU flows' training and "
@@ -968,20 +970,38 @@ register(Rules.declared("joined", "reorders", _joined(),
                         "passes)"))
 
 
+def head_primitives() -> frozenset[str]:
+    """Operation symbols where any active registered rule's left side heads (`_HEAD_PATTERNS`, enabled dev
+    sets)."""
+    enabled = ALGEBRA.value.dev
+    if not enabled:
+        return frozenset(_HEAD_PATTERNS)
+    return frozenset(_HEAD_PATTERNS).union(*(_DEV_PATTERNS.get(name, ()) for name in enabled))
+
+
+def _matches_head(patterns: set[tuple[tuple[str, int], ...]],
+                  operands: Sequence[str | None]) -> bool:
+    """Whether `operands` satisfies any pre-counted required producer multiset in `patterns`."""
+    for needed in patterns:
+        if not needed or all(operands.count(symbol) >= count for symbol, count in needed):
+            return True
+    return False
+
+
 def heads(primitive: str, operands: Sequence[str | None]) -> bool:
     """Whether an equation binding `primitive` over operands made by `operands` (each producer's primitive, or
     None for a value from outside) is a head a registered rule may lower the price at: some rule's left side
     heads at that operation over operands of those makers (`_HEADS`, each rule's own as it is registered),
     each of the equation's operands answering one of the left side's at most, in any order (commutativity
     may have swapped them)."""
-    made = collections.Counter(operand for operand in operands if operand is not None)
-    if any(not collections.Counter(needed) - made for needed in _HEADS.get(primitive, ())):
+    if (patterns := _HEAD_PATTERNS.get(primitive)) and _matches_head(patterns, operands):
         return True
     enabled = ALGEBRA.value.dev
     if not enabled:
         return False
-    return any(not collections.Counter(needed) - made
-               for name in enabled for needed in _DEV_HEADS.get(name, {}).get(primitive, ()))
+    return any(_matches_head(dev_patterns, operands)
+               for name in enabled
+               if (dev_patterns := _DEV_PATTERNS.get(name, {}).get(primitive)))
 
 
 def reorderable(region: terms.Region) -> bool:
