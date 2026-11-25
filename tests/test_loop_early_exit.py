@@ -4,6 +4,7 @@ cached call keeps each row's exiting pass's cache, and a block's providers publi
 (Gemma 4's shared keys and values)."""
 
 import dataclasses
+import functools
 import json
 from pathlib import Path
 
@@ -31,6 +32,7 @@ from dew.nn.backbones.embeddings import prepared_embeddings
 from dew.nn.backbones.looping import gate_logit
 from dew.nn.cross_attention import CrossAttention
 from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS
+from dew.nn.protocols import EXIT_PASSES
 
 FIXTURES = Path(__file__).with_name("fixtures") / "hf"
 
@@ -170,13 +172,18 @@ def test_a_loop_runs_no_pass_after_every_token_exits():
     assert zeros(30.0) > zeros(-30.0)
 
 
-def test_a_pass_runs_over_the_rows_still_looping_alone():
+@pytest.mark.parametrize("opened", [(), (EXIT_PASSES,)], ids=["closed", "exit passes"])
+def test_a_pass_runs_over_the_rows_still_looping_alone(opened):
     """Scoring whose rows exit whole (`exit_by='row'`) runs each later pass over the batch's halvings, the
     smallest that holds its rows still looping (`compacted`, row 12927): eight rows' pass a program for
-    eight, four, two and one, each branch's products over its own rows."""
+    eight, four, two and one, each branch's products over its own rows. So too where the call opens the
+    exit passes alone, as a decision model's scoring does (`DecisionModel.exit_logits`), which are sown
+    once over every row after the passes: its logits and each row's exit pass those of a call whose passes
+    run over every row (one opening a collection beside them, which a pass may write a row of)."""
     looped = _rows_exiting()
     variables, ids = _gated(model_draw(looped, (8, 12), looped.vocab_size), looped.emb_features, 0xE95)(0)
-    buckets = [eqn for eqn in _conds(jax.make_jaxpr(looped.apply)(variables, ids))
+    scored = functools.partial(looped.apply, mutable=list(opened)) if opened else looped.apply
+    buckets = [eqn for eqn in _conds(jax.make_jaxpr(scored)(variables, ids))
                if len(eqn.params["branches"]) == 4]
     # One a later pass, each branch's products over its bucket's rows (or its rows' tokens, flattened).
     assert len(buckets) == looped.loop.steps - 1
@@ -184,6 +191,13 @@ def test_a_pass_runs_over_the_rows_still_looping_alone():
         for size, branch in zip((8, 4, 2, 1), eqn.params["branches"], strict=True):
             rows = _rows_of_products(branch.jaxpr)
             assert size in rows or size * ids.shape[1] in rows
+    if opened:
+        compact, whole = (jax.jit(functools.partial(looped.apply, mutable=mutable))(variables, ids)
+                          for mutable in ([EXIT_PASSES], [EXIT_PASSES, "intermediates"]))
+        chosen = np.asarray(compact[1][EXIT_PASSES]["chosen"][0])
+        assert len(np.unique(chosen)) > 1
+        np.testing.assert_array_equal(chosen, np.asarray(whole[1][EXIT_PASSES]["chosen"][0]))
+        np.testing.assert_array_equal(np.asarray(compact[0]), np.asarray(whole[0]))
 
 
 def _decoded(model, prompt: int):

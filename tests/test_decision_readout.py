@@ -18,7 +18,7 @@ import numpy as np
 import pytest
 from arm_arithmetic import float64_held
 from model_support import attending
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, equations
 from test_decision_objective import SPECIALS, TOKENIZER
 
 from dew.batch import part, thaw
@@ -356,6 +356,24 @@ def _exit_passes(gates: np.ndarray, threshold: float) -> np.ndarray:
     kept = np.cumprod(np.concatenate([np.ones_like(hazard[:1]), 1 - hazard[:-1]]), axis=0)
     reached = np.cumsum(hazard * kept, axis=0) >= threshold
     return np.where(reached.any(axis=0), reached.argmax(axis=0) + 1, len(gates))
+
+
+@attending("xla")
+def test_a_decision_models_exit_logits_run_each_later_pass_over_its_rows_still_looping():
+    """Scoring a readout of labels over a backbone whose rows exit whole at its threshold (`exit_by='row'`)
+    through the decision model's `exit_logits`, which opens the exit passes alone, runs each later pass
+    over the batch's halvings that hold its rows still looping (`looping.compacted`, row 12927): eight
+    rows' pass a program for eight, four, two and one."""
+    looped = backbone().with_passes(3, (0, 2), exit_gate=True, exit_threshold=0.5)
+    looped = looped.clone(loop=dataclasses.replace(looped.loop, exit_at="block", exit_by="row"))
+    objective = DecisionObjective(looped, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
+                                  head=LabelReadout(32, ids()))
+    variables = objective.init(jax.random.key(0))
+    batch = DecisionInputs.collate(rows_of(0, count=8), SPECIALS.pad)
+    traced = jax.make_jaxpr(lambda values: objective.model.exit_logits(values, batch))(variables)
+    buckets = [eqn for eqn in equations(traced)
+               if eqn.primitive.name == "cond" and len(eqn.params["branches"]) == 4]
+    assert len(buckets) == looped.loop.steps - 1
 
 
 @attending("xla")

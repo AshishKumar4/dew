@@ -568,9 +568,10 @@ class _Passes:
         self.stops = (self.exit_states and not self.train and loop.steps > 1
                       and (not self.decode or (loop.shared_cache and self.gates_block)))
         # Scoring exiting by row runs a pass over its rows still looping alone, where nothing it writes beside
-        # its state (a collection) holds a row of each (`compacted`).
+        # its state (a collection) holds a row of each (`compacted`): a decision model's scoring opens the
+        # exit passes alone (`DecisionModel.exit_logits`), sown once over every row after the passes.
         self.compacts = (self.stops and not self.decode and loop.exit_by == "row"
-                         and model.scope is not None and model.scope.mutable is False)
+                         and model.scope is not None and _writes_exit_passes_alone(model.scope.mutable))
         if loop.exit_gate and loop.exit_by == "row":
             # A row's gate pools its tokens: whole-row scoring's (`Loop.exit_by`).
             coordinates = (None if (metadata := self.inputs.get('attention_metadata')) is None
@@ -947,6 +948,17 @@ class _Passes:
 
         stepping = nn.remat(fixed_remat(branched)) if self.loop.remat else branched
         return stepping(module, carry, step, passes)
+
+
+def _writes_exit_passes_alone(mutable) -> bool:
+    """Whether a call's mutable collections (Flax's filter, as its scope holds it) are none or the exit
+    passes alone (`EXIT_PASSES`), which `_handed_on` sows once over every row after the passes: what no
+    pass over fewer rows writes. Every other filter (all, a deny list, any other collection) may name one a
+    pass writes a row of."""
+    if mutable is False:
+        return True
+    names = (mutable,) if isinstance(mutable, str) else mutable
+    return isinstance(names, list | tuple | set | frozenset) and set(names) <= {EXIT_PASSES}
 
 
 def _token_aligned(passes: _Passes, x: jax.Array) -> bool:
