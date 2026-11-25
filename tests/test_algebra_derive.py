@@ -1278,6 +1278,10 @@ def test_chunked_moments_balanced_quotient_direction_jvp_and_vjp():
     x_unf = jnp.asarray([[0.0, a_lo]], jnp.float32)
     w_unf = jnp.asarray([[0.0, a_lo]], jnp.float32)
     dw_unf = jnp.asarray([[np.float32(2.0 ** 80), 0.0]], jnp.float32)
+    x_jt = jnp.asarray([[-8.0, 8.0]], jnp.float32)
+    w_jt = jnp.asarray([[0.75, 0.25]], jnp.float32)
+    dx_jt = jnp.asarray([[np.float32(-(2.0 ** 125)), np.float32(2.0 ** 125)]], jnp.float32)
+    dw_jt = jnp.asarray([[np.float32(3.0 * 2.0 ** 121), np.float32(-(2.0 ** 121))]], jnp.float32)
     for mode in ("walk", "merge"):
         for tile in (1, 2):
             _, pb = jax.vjp(
@@ -1334,6 +1338,10 @@ def test_chunked_moments_balanced_quotient_direction_jvp_and_vjp():
                 lambda w_, t=tile, m=mode: moments.chunked_moments(x_unf, w_, tile=t, mode=m),
                 (w_unf,), (dw_unf,))
             assert float(dv_unf[0]) == 1.0
+            _, (_, dv_jt) = jax.jvp(
+                lambda x_, w_, t=tile, m=mode: moments.chunked_moments(x_, w_, tile=t, mode=m),
+                (x_jt, w_jt), (dx_jt, dw_jt))
+            assert float(dv_jt[0]) == 0.0
         for tile_c in (1, 3):
             _, d_gc = jax.jvp(
                 lambda x_, t=tile_c, m=mode: jax.grad(

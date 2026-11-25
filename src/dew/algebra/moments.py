@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import functools
 import math
+from collections.abc import Sequence
 from typing import Literal
 
 import jax
 import jax.numpy as jnp
+from jax.custom_derivatives import SymbolicZero
 
 from dew.algebra import derive, program, ratios, windows
 from dew.algebra.forms import Derived
@@ -147,115 +149,111 @@ def _eval_derived(forms: Derived, tiled: dict[str, jax.Array], mode: Literal["wa
     return forms.finish(final, first, shapes=shapes)
 
 
-def _weighted_term(tw: jax.Array, operand: jax.Array, sn: jax.Array) -> jax.Array:
-    """Range-safe `(tw / sn) * operand`, strictly linear in `operand` and preserving `tw` derivatives."""
-    small_tw = (tw <= 1.0) & (sn > 1.0)
-    tw_mf = jnp.where(small_tw, tw, 0.0)
-    sn_mf = jnp.where(small_tw, sn, 1.0)
-    tw_df = jnp.where(small_tw, 0.0, tw)
-    sn_df = jnp.where(small_tw, 1.0, sn)
-    return jnp.where(small_tw, (tw_mf * operand) / sn_mf, (tw_df / sn_df) * operand)
+_MEAN_FORM = ratios.Ratio(
+    ((1.0, (("v", 0), ("v", 1))),), ((1.0, (("v", 1),)),), 0, reduced=True, units=windows.Units())
+"""Streamed weighted mean `sum(w * r) / sum(w)` along axis 0 (`_streamed_tangents`)."""
+
+_COV_FORM = ratios.Ratio(
+    ((1.0, (("v", 0), ("v", 1), ("v", 2))),), ((1.0, (("v", 2),)),), 0, reduced=True, units=windows.Units())
+"""Streamed weighted covariance `sum(w * cx * cy) / sum(w)` along axis 0 (`_streamed_tangents`)."""
+
+_MEAN_ZERO = ratios.Ratio(
+    ((1.0, (("v", 0), ("v", 1))),), (), 0, reduced=True, units=windows.Units())
+"""Streamed `sum(x * dw)` along axis 0 at the all-zero-weight (`n == 0`) boundary."""
+
+_COV_ZERO = ratios.Ratio(
+    ((1.0, (("v", 0), ("v", 1), ("v", 2))),), (), 0, reduced=True, units=windows.Units())
+"""Streamed `sum(x * y * dw)` along axis 0 at the all-zero-weight (`n == 0`) boundary."""
 
 
-_TANGENT_DIV = ratios.Ratio(
-    ((1.0, (("v", 0), ("v", 1))),), ((1.0, (("v", 2),)),), 0, reduced=True, units=windows.Units())
-"""Elementwise `dtw * numerator / sn` along a leading unit axis (`_safe_tangent_div`)."""
+def _ratio_jvp_only(primals: Sequence[jax.Array], tangents: Sequence,
+                    form: ratios.Ratio) -> jax.Array | None:
+    """Exact tangent of `ratios.ratio(primals, form)` along non-`SymbolicZero` `tangents`, or None if none
+    move: every moving value and weight contribution cancels unlanded inside one `Ratio`, and omitting
+    `SymbolicZero` operands keeps partial reverse-mode transposes strictly linear."""
+    moving = [index for index, tangent in enumerate(tangents) if not isinstance(tangent, SymbolicZero)]
+    if not moving:
+        return None
+    active_set = frozenset(moving)
 
-_COV_W_TANGENT = ratios.Ratio(
-    (), ((1.0, (("v", 2),)),), 0, reduced=True, units=windows.Units(), power=2,
-    products=(
-        (1.0, (ratios.Summed(((1.0, (("v", 3), ("v", 0), ("v", 1))),), reduced=True),
-               ratios.Summed(((1.0, (("v", 2),)),), reduced=True))),
-        (-1.0, (ratios.Summed(((1.0, (("v", 2), ("v", 0), ("v", 1))),), reduced=True),
-                ratios.Summed(((1.0, (("v", 3),)),), reduced=True))),
-    ))
-"""Streamed `((sum dw*cx*cy)*(sum w) - (sum w*cx*cy)*(sum dw)) / (sum w)^2` along axis 0: keeps centered
-products and covariance at identical unlanded double-word precision across overflow, underflow, and
-stationary points."""
+    def evaluate(*active: jax.Array) -> jax.Array:
+        iterator = iter(active)
+        full = [next(iterator) if index in active_set else primal for index, primal in enumerate(primals)]
+        return ratios.ratio(full, form)
 
-_COV_W_ZERO = ratios.Ratio(
-    ((1.0, (("v", 2), ("v", 0), ("v", 1))),), (), 0, reduced=True, units=windows.Units())
-"""Streamed `sum dw*cx*cy` along axis 0 at the all-zero-weight (`n == 0`) boundary."""
-
-
-def _safe_tangent_div(dtw: jax.Array, numerator: jax.Array, sn: jax.Array) -> jax.Array:
-    """Range-safe `dtw * numerator / sn` via singleton `ratios.ratio_p`, keeping primal and higher-order
-    mixed derivatives in one scaled-product operation without primal-only normalization."""
-    return ratios.ratio([dtw[None], numerator[None], sn[None]], _TANGENT_DIV)
+    _, tangent = jax.jvp(evaluate, tuple(primals[index] for index in moving),
+                         tuple(tangents[index] for index in moving))
+    return tangent
 
 
-def _cov_tangent_tile(
-    tx: jax.Array, ty: jax.Array, tw: jax.Array,
-    dtx: jax.Array, dty: jax.Array, dtw: jax.Array,
-    mu_x: jax.Array, mu_y: jax.Array, n: jax.Array,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Exact final-center linear tangent `(d_mu_x, d_mu_y, d_cov_xy, sum_pw_cy, sum_pw_cx, d_n)` of one
-    tile for both `n > 0` and `n == 0` boundaries without multi-tile zero-mass exponent overflow."""
-    pos = n[..., None] > 0
-    sn = jnp.where(pos, n[..., None], 1.0)
-    mu_x_pos = jnp.where(pos, mu_x[..., None], 0.0)
-    mu_y_pos = jnp.where(pos, mu_y[..., None], 0.0)
-    cx = tx - mu_x[..., None]
-    cy = ty - mu_y[..., None]
-    d_mx = jnp.sum(_weighted_term(tw, dtx, sn) + _safe_tangent_div(dtw, tx - mu_x_pos, sn), axis=-1)
-    d_my = jnp.sum(_weighted_term(tw, dty, sn) + _safe_tangent_div(dtw, ty - mu_y_pos, sn), axis=-1)
-    pw_cy = _weighted_term(tw, jnp.where((tw > 0) | jnp.isfinite(cy), cy, 0.0), sn)
-    pw_cx = _weighted_term(tw, jnp.where((tw > 0) | jnp.isfinite(cx), cx, 0.0), sn)
-    d_cov_xy = jnp.sum(pw_cy * dtx + pw_cx * dty, axis=-1)
-    return d_mx, d_my, d_cov_xy, jnp.sum(pw_cy, axis=-1), jnp.sum(pw_cx, axis=-1), jnp.sum(dtw, axis=-1)
+def _move_tangent(tangent, shape: tuple[int, ...]):
+    """Broadcast a live tangent to `shape` and move its walked axis to 0, leaving `SymbolicZero` intact."""
+    if isinstance(tangent, SymbolicZero):
+        return tangent
+    return jnp.moveaxis(jnp.broadcast_to(tangent, shape), -1, 0)
 
 
-def _tile_array(value: jax.Array, shape: tuple[int, ...], tile: int) -> jax.Array:
-    n_tiles = shape[-1] // tile
-    return jnp.moveaxis(jnp.broadcast_to(value, shape).reshape(*shape[:-1], n_tiles, tile), -2, 0)
+def _mask_tangent(mask: jax.Array, tangent):
+    """Zero a live tangent outside `mask`, leaving `SymbolicZero` intact."""
+    return tangent if isinstance(tangent, SymbolicZero) else jnp.where(mask, tangent, 0.0)
 
 
-def _tiled_tangents(
+def _centered_tangent(dv, d_mean: jax.Array | None, shape: tuple[int, ...]):
+    """Centered tangent `dv - d_mean[None]` along axis 0, or `SymbolicZero` when neither moves."""
+    if isinstance(dv, SymbolicZero):
+        return dv if d_mean is None else jnp.broadcast_to(-d_mean[None], (shape[-1], *shape[:-1]))
+    return dv if d_mean is None else dv - d_mean[None]
+
+
+def _streamed_tangents(
     x: jax.Array, y: jax.Array, w: jax.Array,
-    dx: jax.Array, dy: jax.Array, dw: jax.Array,
+    dx, dy, dw,
     mu_x: jax.Array, mu_y: jax.Array, cov: jax.Array, n: jax.Array,
-    tile: int, mode: Literal["walk", "merge"],
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+) -> tuple:
+    """Exact streamed tangents `(d_mx, d_my, d_cov, d_n)` sharing one broadcast/centering pass and one
+    unlanded `ratios.Ratio` per output, handling both `n > 0` and `n == 0` boundaries and `SymbolicZero`."""
     shape = tuple(int(size) for size in jnp.broadcast_shapes(x.shape, y.shape, w.shape))
-    tx_s = _tile_array(x, shape, tile)
-    ty_s = _tile_array(y, shape, tile)
-    tw_s = _tile_array(w, shape, tile)
-    dtx_s = _tile_array(dx, shape, tile)
-    dty_s = _tile_array(dy, shape, tile)
-    dtw_s = _tile_array(dw, shape, tile)
-    if mode == "walk":
-        zeros = (jnp.zeros_like(mu_x), jnp.zeros_like(mu_y), jnp.zeros_like(cov),
-                 jnp.zeros_like(mu_y), jnp.zeros_like(mu_x), jnp.zeros_like(n))
-
-        def step(acc, chunk):
-            tx, ty, tw, dtx, dty, dtw = chunk
-            parts = _cov_tangent_tile(tx, ty, tw, dtx, dty, dtw, mu_x, mu_y, n)
-            return tuple(prev + delta for prev, delta in zip(acc, parts, strict=True)), None
-
-        d_mx, d_my, d_cov_xy, sum_pw_cy, sum_pw_cx, d_n = jax.lax.scan(
-            step, zeros, (tx_s, ty_s, tw_s, dtx_s, dty_s, dtw_s))[0]
-    else:
-        d_mx_s, d_my_s, d_cov_s, sum_cy_s, sum_cx_s, d_n_s = jax.vmap(
-            lambda tx, ty, tw, dtx, dty, dtw: _cov_tangent_tile(
-                tx, ty, tw, dtx, dty, dtw, mu_x, mu_y, n)
-        )(tx_s, ty_s, tw_s, dtx_s, dty_s, dtw_s)
-        d_mx, d_my, d_cov_xy = jnp.sum(d_mx_s, axis=0), jnp.sum(d_my_s, axis=0), jnp.sum(d_cov_s, axis=0)
-        sum_pw_cy, sum_pw_cx, d_n = (jnp.sum(sum_cy_s, axis=0), jnp.sum(sum_cx_s, axis=0),
-                                     jnp.sum(d_n_s, axis=0))
-    pos = n > 0
-    cx0 = jnp.moveaxis(jnp.broadcast_to(x, shape) - mu_x[..., None], -1, 0)
-    cy0 = jnp.moveaxis(jnp.broadcast_to(y, shape) - mu_y[..., None], -1, 0)
+    x0 = jnp.moveaxis(jnp.broadcast_to(x, shape), -1, 0)
+    y0 = jnp.moveaxis(jnp.broadcast_to(y, shape), -1, 0)
     w0 = jnp.moveaxis(jnp.broadcast_to(w, shape), -1, 0)
-    dw0 = jnp.moveaxis(jnp.broadcast_to(dw, shape), -1, 0)
+    dx0 = _move_tangent(dx, shape)
+    dy0 = _move_tangent(dy, shape)
+    dw0 = _move_tangent(dw, shape)
+    pos = n > 0
     pos0 = pos[None]
     unit0 = jnp.zeros((shape[-1],) + (1,) * (len(shape) - 1), w0.dtype).at[0].set(1.0)
     w_pos = jnp.where(pos0, w0, unit0)
-    dw_pos = jnp.where(pos0, dw0, 0.0)
-    dw_zero = jnp.where(pos0, 0.0, dw0)
-    d_cov_w = jnp.where(pos, ratios.ratio([cx0, cy0, w_pos, dw_pos], _COV_W_TANGENT),
-                        ratios.ratio([cx0, cy0, dw_zero], _COV_W_ZERO))
-    d_cov = d_cov_xy + d_cov_w - d_mx * sum_pw_cy - d_my * sum_pw_cx
-    return d_mx, d_my, d_cov, d_n
+    dx_pos, dy_pos, dw_pos = (_mask_tangent(pos0, t) for t in (dx0, dy0, dw0))
+    dw_zero = None if isinstance(dw0, SymbolicZero) else jnp.where(pos0, 0.0, dw0)
+
+    def mean_tangent(vals0: jax.Array, d_vals_pos, mu: jax.Array) -> jax.Array | None:
+        # Shift by constant `stop_gradient(mu)` so large-offset inputs do not cancel while preserving exact
+        # higher-order derivatives of `sum(w * vals) / sum(w)`.
+        shifted = vals0 - jax.lax.stop_gradient(mu)[None]
+        d_pos = _ratio_jvp_only((shifted, w_pos), (d_vals_pos, dw_pos), _MEAN_FORM)
+        if d_pos is None and dw_zero is None:
+            return None
+        zero_branch = 0.0 if dw_zero is None else ratios.ratio([vals0, dw_zero], _MEAN_ZERO)
+        return jnp.where(pos, 0.0 if d_pos is None else d_pos, zero_branch)
+
+    d_mx = mean_tangent(x0, dx_pos, mu_x)
+    same_xy = x is y and dx is dy and mu_x is mu_y
+    d_my = d_mx if same_xy else mean_tangent(y0, dy_pos, mu_y)
+    cx0 = x0 - mu_x[None]
+    cy0 = cx0 if same_xy else y0 - mu_y[None]
+    dcx_pos = _mask_tangent(pos0, _centered_tangent(dx0, d_mx, shape))
+    dcy_pos = dcx_pos if same_xy else _mask_tangent(pos0, _centered_tangent(dy0, d_my, shape))
+    d_cov_pos = _ratio_jvp_only((cx0, cy0, w_pos), (dcx_pos, dcy_pos, dw_pos), _COV_FORM)
+    if d_cov_pos is None and dw_zero is None:
+        d_cov = SymbolicZero(jax.typeof(cov).to_tangent_aval())
+    else:
+        cov_zero = 0.0 if dw_zero is None else ratios.ratio([x0, y0, dw_zero], _COV_ZERO)
+        d_cov = jnp.where(pos, 0.0 if d_cov_pos is None else d_cov_pos, cov_zero)
+    d_mx_out = SymbolicZero(jax.typeof(mu_x).to_tangent_aval()) if d_mx is None else d_mx
+    d_my_out = SymbolicZero(jax.typeof(mu_y).to_tangent_aval()) if d_my is None else d_my
+    d_n_out = SymbolicZero(jax.typeof(n).to_tangent_aval()) if isinstance(dw0, SymbolicZero) else jnp.sum(
+        dw0, axis=0)
+    return d_mx_out, d_my_out, d_cov, d_n_out
 
 
 def _chunked_weighted_primal(x: jax.Array, w: jax.Array, tile: int,
@@ -268,12 +266,13 @@ def _chunked_weighted_jvp(tile: int, mode: Literal["walk", "merge"], primals, ta
     x, w = primals
     dx, dw = tangents
     mean, var, n = _run_chunked_weighted(x, w, tile, mode)
-    d_mean, _, d_var, d_n = _tiled_tangents(x, x, w, dx, dx, dw, mean, mean, var, n, tile, mode)
+    d_mean, _, d_var, d_n = _streamed_tangents(x, x, w, dx, dx, dw, mean, mean, var, n)
     return (mean, var, n), (d_mean, d_var, d_n)
 
 
 _run_chunked_weighted = contracted("test_chunked_moments_holds_every_order")(
-    declared_tangent(Protected(), _chunked_weighted_primal, _chunked_weighted_jvp, nondiff_argnums=(2, 3)))
+    declared_tangent(Protected(), _chunked_weighted_primal, _chunked_weighted_jvp,
+                     nondiff_argnums=(2, 3), symbolic_zeros=True))
 
 
 def _chunked_cov_primal(
@@ -287,12 +286,13 @@ def _chunked_cov_jvp(tile: int, mode: Literal["walk", "merge"], primals, tangent
     x, y, w = primals
     dx, dy, dw = tangents
     mean_x, mean_y, cov, n = _run_chunked_cov(x, y, w, tile, mode)
-    d_mx, d_my, d_cov, d_n = _tiled_tangents(x, y, w, dx, dy, dw, mean_x, mean_y, cov, n, tile, mode)
+    d_mx, d_my, d_cov, d_n = _streamed_tangents(x, y, w, dx, dy, dw, mean_x, mean_y, cov, n)
     return (mean_x, mean_y, cov, n), (d_mx, d_my, d_cov, d_n)
 
 
 _run_chunked_cov = contracted("test_chunked_moments_holds_every_order")(
-    declared_tangent(Protected(), _chunked_cov_primal, _chunked_cov_jvp, nondiff_argnums=(3, 4)))
+    declared_tangent(Protected(), _chunked_cov_primal, _chunked_cov_jvp,
+                     nondiff_argnums=(3, 4), symbolic_zeros=True))
 
 
 def _floating_dtype(*arrays: jax.Array):
