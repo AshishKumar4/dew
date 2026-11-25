@@ -40,6 +40,7 @@ _log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from dew.batch import Batch
+    from dew.objectives.base import Objective
     from dew.state import TrainState
     from dew.training.trainer import StepFn
 
@@ -57,7 +58,7 @@ RECORD_VERSION = 3
 
 def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], splits: Sequence[int],
              mesh: Mesh, step: Callable[..., StepFn] | None = None, remat: str = "auto", *,
-             objective: object = None) -> dict[str, JSON] | None:
+             objective: Objective | None = None) -> dict[str, JSON] | None:
     """What a recorded rung was decided for, read before the step traces: the
     configuration of the `modules` its programs run at the rung it starts from
     (`Objective.program_key`) and a custom `step`, as an identity states them
@@ -100,7 +101,8 @@ def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], spl
             'xla_flags': ' '.join(settings)}
 
 
-def _code(objective: object, modules: Sequence[object], step: object) -> list[str]:
+def _code(objective: Objective | None, modules: Sequence[object],
+          step: Callable[..., StepFn] | None) -> list[str]:
     """The digests of the code that builds a step (`provenance_code`): the step's compiler and the modules of
     Dew's defining the `objective` (its class and every base) and what it holds, its program's `modules` and
     a custom `step`, each with every module of Dew's it can import. All of Dew's where any is a function no
@@ -115,7 +117,7 @@ def _code(objective: object, modules: Sequence[object], step: object) -> list[st
 
 def recorded_rung(modules: Sequence[object], arguments: tuple[TrainState, Batch], splits: Sequence[int],
                   mesh: Mesh, step: Callable[..., StepFn] | None = None, remat: str = "auto", *,
-                  objective: object = None) -> tuple[Path | None, dict[str, JSON], JSON]:
+                  objective: Objective | None = None) -> tuple[Path | None, dict[str, JSON], JSON]:
     """Where the rung of the step over `arguments` on `mesh` is recorded, its key
     (`rung_key`), and the rung the record holds (None if there is none). A
     process of a pool keeps no record: its processes agree on the rung; nor does a step its key states

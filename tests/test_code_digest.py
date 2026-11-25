@@ -56,6 +56,15 @@ def loaded(name):
 """A module importing by a computed name, through an alias of `import_module`."""
 
 
+def _edited_run(script: str, tree: Path, tmp_path: Path, edits: tuple[Path, ...]) -> dict:
+    """`script`'s printed JSON, run fresh over the copied package `tree` once each of `edits` has a line
+    appended."""
+    for path in edits:
+        path.write_text(path.read_text() + "\n# edited\n")
+    return fresh(script, source=tree, platforms="cpu", cache_dir=tmp_path / "xla",
+                 variables={"XDG_CACHE_HOME": str(tmp_path)})
+
+
 def test_a_stores_digest_follows_its_code_and_an_unreviewed_import_keys_the_whole_package(tmp_path):
     """An edit of Dew's code outside the certification's and the communicators' (a trainer's), of a module
     only a `TYPE_CHECKING` block imports and of the release's version keeps every digest; an edit of a
@@ -75,10 +84,7 @@ def test_a_stores_digest_follows_its_code_and_an_unreviewed_import_keys_the_whol
         (package / name).write_text("")
 
     def digests(*edits: Path) -> dict:
-        for path in edits:
-            path.write_text(path.read_text() + "\n# edited\n")
-        return fresh(DIGESTS, source=tree, platforms="cpu", cache_dir=tmp_path / "xla",
-                     variables={"XDG_CACHE_HOME": str(tmp_path)})
+        return _edited_run(DIGESTS, tree, tmp_path, edits)
 
     before = digests()
     assert before["computed"] == before["whole"]
@@ -432,10 +438,7 @@ def test_a_rung_records_code_is_its_step_its_objective_and_its_models_and_none_e
     package = tree / "dew"
 
     def codes(*edits: Path) -> dict:
-        for path in edits:
-            path.write_text(path.read_text() + "\n# edited\n")
-        return fresh(RUNG_CODE, source=tree, platforms="cpu", cache_dir=tmp_path / "xla",
-                     variables={"XDG_CACHE_HOME": str(tmp_path)})
+        return _edited_run(RUNG_CODE, tree, tmp_path, edits)
 
     (package / "_spare_rung.py").write_text("")
     before = codes()
