@@ -442,9 +442,9 @@ def wide_products(rows: jax.Array, kernels: tuple[jax.Array, jax.Array, jax.Arra
     saved = not _recomputes_gate_up()
     name = names[0] if names is not None else Residual.GATE_PROJ
     combined = wide.interleaved(kernels[0], kernels[1])
-    result = wide.gated_product(rows, combined, hook, out_dtype=dtype, saved=saved, name=str(name),
-                                precision=precision, interpret_on_cpu=interpret_on_cpu)
-    hidden = result[1] if isinstance(result, tuple) else result
+    gated = wide.gated_product(rows, combined, hook, out_dtype=dtype, saved=saved, name=str(name),
+                               precision=precision, interpret_on_cpu=interpret_on_cpu)
+    hidden = gated[1] if isinstance(gated, tuple) else gated
     out = gemm.gemm(hidden, kernels[2], out_dtype=dtype, precision=precision,
                     interpret_on_cpu=interpret_on_cpu)
     return out if names is None else checkpoint_name(out, names[2])

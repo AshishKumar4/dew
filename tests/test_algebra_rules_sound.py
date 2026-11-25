@@ -437,7 +437,7 @@ def _instantiations(matched, conditions, symbolic: bool, shapes=SHAPES, candidat
     unit_num = {n: np.asarray(1.0, dtype=float) for n in units}
     unit_sym = {n: np.asarray(1, dtype=object) for n in units} if symbolic else {}
     for taken in itertools.product(shapes, repeat=len(term_names)):
-        num_arrays = {n: _operand(n, shape, False, positive=n in positive)
+        num_arrays = {n: _operand(n, shape, symbolic=False, positive=n in positive)
                       for n, shape in zip(term_names, taken, strict=True)}
         num_arrays.update(unit_num)
         sym_arrays = None
@@ -445,7 +445,7 @@ def _instantiations(matched, conditions, symbolic: bool, shapes=SHAPES, candidat
             params = dict(zip(param_names, chosen, strict=True))
             # Pre-filter admissibility in NumPy before constructing/evaluating SymPy arrays (row 12909):
             # every condition and shape check agrees across NumPy and SymPy, rejecting ~95% of combos in us.
-            num_eval = Evaluated(num_arrays, params, False)
+            num_eval = Evaluated(num_arrays, params, symbolic=False)
             try:
                 num_value = num_eval.value(pattern)
                 num_eval.bound[name] = num_value
@@ -457,10 +457,10 @@ def _instantiations(matched, conditions, symbolic: bool, shapes=SHAPES, candidat
                 yield num_eval, num_value
                 continue
             if sym_arrays is None:
-                sym_arrays = {n: _operand(n, shape, True, positive=n in positive)
+                sym_arrays = {n: _operand(n, shape, symbolic=True, positive=n in positive)
                               for n, shape in zip(term_names, taken, strict=True)}
                 sym_arrays.update(unit_sym)
-            evaluated = Evaluated(sym_arrays, params, True)
+            evaluated = Evaluated(sym_arrays, params, symbolic=True)
             try:
                 value = evaluated.value(pattern)
                 evaluated.bound[name] = value

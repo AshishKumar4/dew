@@ -114,6 +114,11 @@ def _log2(value: float) -> int:
     return exponent - 1 if mantissa == 0.5 else exponent
 
 
+def _floor_log2(value: float) -> int:
+    """`floor(log2(value))` of a positive float, exactly, by its exponent."""
+    return math.frexp(value)[1] - 1
+
+
 def _magnitude(value) -> Magnitude | None:
     """A constant's magnitude, its elements' largest (a complex one's modulus); None for one of no number (a
     key's, tracer's, or concrete device array's). A number of any dtype, ml_dtypes' (bfloat16, float8) among
@@ -308,13 +313,13 @@ class _NormTrack:
         return self.origin.get(var, var)
 
     def _propagate_layout(self, equation: jcore.JaxprEqn, src: jcore.Var, out: jcore.Var) -> None:
-        if (entry := self.sq_sum.get(src)) is not None:
-            if (moved := _move_kept(equation, src, out, entry[1])) is not None:
-                self.sq_sum[out] = (entry[0], moved, entry[2], entry[3])
+        if ((entry := self.sq_sum.get(src)) is not None
+                and (moved := _move_kept(equation, src, out, entry[1])) is not None):
+            self.sq_sum[out] = (entry[0], moved, entry[2], entry[3])
         for table in (self.inv_norm, self.pos_norm):
-            if (entry := table.get(src)) is not None:
-                if (moved := _move_kept(equation, src, out, entry[1])) is not None:
-                    table[out] = (entry[0], moved)
+            if ((entry := table.get(src)) is not None
+                    and (moved := _move_kept(equation, src, out, entry[1])) is not None):
+                table[out] = (entry[0], moved)
 
     def _unit_check(self, scaled: jcore.Var | jcore.Literal, divisor: jcore.Var | jcore.Literal,
                     table: Mapping[jcore.Var, tuple[jcore.Var, tuple[int | None, ...]]],
@@ -411,9 +416,9 @@ def _is_neg_inf(atom) -> bool:
     """Whether `atom` is a host floating literal equal to `-inf` everywhere (`jnp.max(..., initial=-inf)`)."""
     if not isinstance(atom, jcore.Literal):
         return False
-    arr = _host_array(atom.val)
-    return (arr is not None and arr.size > 0 and jnp.issubdtype(arr.dtype, jnp.floating)
-            and bool(np.all(arr == -np.inf)))
+    values = _host_array(atom.val)
+    return (values is not None and values.size > 0 and jnp.issubdtype(values.dtype, jnp.floating)
+            and bool(np.all(values == -np.inf)))
 
 
 class _SoftmaxTrack:
@@ -438,9 +443,12 @@ class _SoftmaxTrack:
     def passthrough(self, src: jcore.Var, out: jcore.Var) -> None:
         """Forward softmax provenance across a value-preserving barrier (`stop_gradient_p`)."""
         self.origin[out] = self._canon(src)
-        for table in (self.max_of, self.nonpos_max, self.unit_exp):
-            if src in table:
-                table[out] = table[src]
+        if src in self.max_of:
+            self.max_of[out] = self.max_of[src]
+        if src in self.nonpos_max:
+            self.nonpos_max[out] = self.nonpos_max[src]
+        if src in self.unit_exp:
+            self.unit_exp[out] = self.unit_exp[src]
 
     def step(self, equation: jcore.JaxprEqn, bound: Magnitude | None, proved: Apart,
              apart_of: Callable[..., Apart]) -> tuple[Magnitude | None, Apart]:
@@ -467,9 +475,9 @@ class _SoftmaxTrack:
                     self.max_of[out] = self.max_of[cand]
             return bound, proved
         if prim in (jax.lax.broadcast_in_dim_p, jax.lax.reshape_p) and isinstance(invars[0], jcore.Var):
-            if (entry := self.max_of.get(invars[0])) is not None:
-                if (moved := _move_kept(equation, invars[0], out, entry[1])) is not None:
-                    self.max_of[out] = (entry[0], moved)
+            if ((entry := self.max_of.get(invars[0])) is not None
+                    and (moved := _move_kept(equation, invars[0], out, entry[1])) is not None):
+                self.max_of[out] = (entry[0], moved)
             return bound, proved
         if prim is jax.lax.sub_p and len(invars) == 2:
             left, right = invars
@@ -490,15 +498,15 @@ class _SoftmaxTrack:
                     and jnp.issubdtype(out_aval.dtype, jnp.floating)):
                 self.unit_exp[out] = red
             return bound, proved
-        if prim is jax.lax.reduce_sum_p and isinstance(invars[0], jcore.Var):
-            if ((red := self.unit_exp.get(invars[0])) is not None
-                    and jnp.issubdtype(out_aval.dtype, jnp.floating) and _reduced(equation) >= 1):
-                sum_axes = frozenset(int(ax) for ax in equation.params["axes"])
-                if red.issubset(sum_axes):
-                    floor = max(proved.floor, 0) if proved.floor is not None else 0
-                    refined = _held_apart(
-                        Apart(floor, 1, number=True, finite=proved.finite), out_aval.dtype)
-                    return (bound if refined.finite else None), refined
+        if (prim is jax.lax.reduce_sum_p and isinstance(invars[0], jcore.Var)
+                and (red := self.unit_exp.get(invars[0])) is not None
+                and jnp.issubdtype(out_aval.dtype, jnp.floating) and _reduced(equation) >= 1):
+            sum_axes = frozenset(int(ax) for ax in equation.params["axes"])
+            if red.issubset(sum_axes):
+                floor = max(proved.floor, 0) if proved.floor is not None else 0
+                refined = _held_apart(
+                    Apart(floor, 1, number=True, finite=proved.finite), out_aval.dtype)
+                return (bound if refined.finite else None), refined
         return bound, proved
 
     def child(self, outer_invars: Sequence, inner_invars: Sequence[jcore.Var]) -> _SoftmaxTrack:

@@ -39,22 +39,26 @@ def _apart(activation, limit, *, truth: bool = False):
     return run
 
 
-@pytest.mark.parametrize("generation_name", generations("sm90", "sm100"))
+@pytest.mark.parametrize(("form", "generation_name"), [
+    ("fused", g) for g in generations("sm90", "sm100")
+] + [("wide", g) for g in generations("sm80", "sm90", "sm100")])
 @pytest.mark.parametrize(("activation", "limit"), ACTIVATIONS, ids=lambda value: str(value))
-def test_the_fused_mlp_holds_check_1_with_its_gradients(generation_name, activation, limit):
-    """The fused gated MLP (`fused_products`) on the template's launches, interpreted as `generation_name`:
-    its output, and the gradients of its rows and its three kernels through the template's own reverse
-    modes (the paired product's, and the down projection's with the gated product's VJP in its input
-    gradient's epilogue), each as exact as the three products apart from float64 truth (check 1). The routes
-    it records run every product on the template."""
-    def fused(x, gate, up, down):
-        return fused_products(x, (gate, up, down), activation, limit=limit, interpret_on_cpu=True)
+def test_the_fused_mlp_holds_check_1_with_its_gradients(form, generation_name, activation, limit):
+    """Both fused gated MLP forms (`fused_products` paired and Formulation (C) `wide_products`) on the
+    template's launches, interpreted as `generation_name`: output and all four gradients (rows, gate, up,
+    down) hold check 1 against the three products apart from float64 truth, recording mosaic routes."""
+    from dew.nn.gated_mlp import wide_products
 
-    label = f"fused {activation} MLP, limit {limit}, on {generation_name}"
+    runner = wide_products if form == "wide" else fused_products
+
+    def run_form(x, gate, up, down):
+        return runner(x, (gate, up, down), activation, limit=limit, interpret_on_cpu=True)
+
+    label = f"{form} {activation} MLP, limit {limit}, on {generation_name}"
     apart, truth = (with_gradients(_apart(activation, limit, truth=truth)) for truth in (False, True))
     with (generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic"),
           generation.routes() as routes):
-        assert_as_exact(with_gradients(fused), jax.jit(apart), _draw, label, seeds=SEEDS, truth_fn=truth)
+        assert_as_exact(with_gradients(run_form), jax.jit(apart), _draw, label, seeds=SEEDS, truth_fn=truth)
     assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"mosaic"}
 
 
@@ -472,25 +476,6 @@ def test_grouped_gated_experts_hands_off_default_a100_cutlass_down():
 
 
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90", "sm100"))
-@pytest.mark.parametrize(("activation", "limit"), ACTIVATIONS, ids=lambda value: str(value))
-def test_the_wide_mlp_holds_check_1_with_its_gradients(generation_name, activation, limit):
-    """Formulation (C) (`wide_products`: interleaved wide gate+up split-epilogue + plain down) on the GEMM
-    template interpreted as `generation_name` holds check 1 for forward output and all four gradients
-    (rows, gate, up, down) against the apart products from float64 truth (row 1958)."""
-    from dew.nn.gated_mlp import wide_products
-
-    def wide_fn(x, gate, up, down):
-        return wide_products(x, (gate, up, down), activation, limit=limit, interpret_on_cpu=True)
-
-    label = f"wide {activation} MLP, limit {limit}, on {generation_name}"
-    apart, truth = (with_gradients(_apart(activation, limit, truth=truth)) for truth in (False, True))
-    with (generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic"),
-          generation.routes() as routes):
-        assert_as_exact(with_gradients(wide_fn), jax.jit(apart), _draw, label, seeds=SEEDS, truth_fn=truth)
-    assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"mosaic"}
-
-
-@pytest.mark.parametrize("generation_name", generations("sm80", "sm90", "sm100"))
 def test_wide_gated_mlp_selector_handoffs_and_remat_recompute(generation_name):
     """`GATED_MLP` selects `'wide'` when named via `dew.kernels.use(Kernels(gated_mlp='wide'))`, hands off
     biased, unaligned-hidden, and grouped cases to `'apart'`, and drops the saved wide residual when an
@@ -503,9 +488,9 @@ def test_wide_gated_mlp_selector_handoffs_and_remat_recompute(generation_name):
 
     def kernels(layer, **choose):
         params = jax.eval_shape(layer.init, jax.random.key(0), x)
-        with generation.assumed(generation_name), dew.kernels.use(dew.kernels.Kernels(**choose)):
-            with generation.routes() as routes:
-                jax.eval_shape(layer.apply, params, x)
+        with (generation.assumed(generation_name), dew.kernels.use(dew.kernels.Kernels(**choose)),
+              generation.routes() as routes):
+            jax.eval_shape(layer.apply, params, x)
         return [route.kernel for route in routes if route.choice == "gated_mlp"]
 
     plain = GatedMLP(hidden_features=HIDDEN, out_features=FEATURES, dtype=jnp.bfloat16)

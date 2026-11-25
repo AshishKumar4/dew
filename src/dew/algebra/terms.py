@@ -77,7 +77,7 @@ from dew.algebra._proofs import (
     _side_matches,
     _SoftmaxTrack,
     _within,
-    dtype_lossless_in,
+    dtype_lossless_in as dtype_lossless_in,
     typed_key,
 )
 from dew.nn import programs
@@ -918,7 +918,7 @@ def _walk_sub_provenance(value, out: list[str], seen: set[int]) -> None:
             _walk_sub_provenance(part, out, seen)
         return
     if isinstance(value, Mapping):
-        for _, part in sorted(value.items(), key=lambda item: repr(item[0])):
+        for _, part in sorted(value.items(), key=lambda entry: repr(entry[0])):
             _walk_sub_provenance(part, out, seen)
         return
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
@@ -950,8 +950,9 @@ def provenance_key(closed: jcore.Jaxpr) -> str:
     if di is None:
         feed(("debug_info", None))
     else:
-        res = di.result_paths if isinstance(di.result_paths, (type(None), tuple)) else repr(di.result_paths)
-        feed(("debug_info", di.traced_for, di.func_src_info, di.arg_names, res))
+        result_paths = (di.result_paths if isinstance(di.result_paths, (type(None), tuple))
+                        else repr(di.result_paths))
+        feed(("debug_info", di.traced_for, di.func_src_info, di.arg_names, result_paths))
     for equation in inner.eqns:
         si = equation.source_info
         tb = si.traceback
@@ -1134,6 +1135,7 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
                                         for atom in equation.invars],
                              [atom.val if isinstance(atom, jcore.Literal) else None
                               for atom in equation.invars], outputs))
+    outputs = [None if isinstance(atom, jcore.Literal) else env[atom] for atom in jaxpr.outvars]
     literal_outputs = [atom.val if isinstance(atom, jcore.Literal) else None for atom in jaxpr.outvars]
     stock = {name: param(primitive, values) for name, (primitive, values) in stocked().items()}
     return Region(leaves, opaque, outputs, literal_outputs, params, literals, shapes,

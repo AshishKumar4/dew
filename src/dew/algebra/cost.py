@@ -116,11 +116,11 @@ def _priced(primitive, params, shapes: list[tuple[int, ...]], made: tuple[int, .
 
 
 def _result_dtype(primitive, params, in_dtypes: list[np.dtype | None],
-                  constructor: object = None) -> np.dtype | None:
+                  *, compared: bool = False) -> np.dtype | None:
     """The output dtype of an elementwise node from its children's e-graph dtypes and `params`."""
     if primitive is jax.lax.convert_element_type_p and "new_dtype" in params:
         return jnp.dtype(params["new_dtype"])
-    if constructor is Term.compare or primitive is jax.lax.is_finite_p:
+    if compared or primitive is jax.lax.is_finite_p:
         return jnp.dtype(jnp.bool_)
     if (out_dt := params.get("out_dtype")) is not None:
         return jnp.dtype(out_dt)
@@ -138,14 +138,14 @@ def _result_dtype(primitive, params, in_dtypes: list[np.dtype | None],
 
 
 def _elementwise(graph: EGraph, primitive, params, operands, held: dict | None,
-                 on: generation.GpuTarget | None = None, *, constructor: object = None) -> Work:
+                 on: generation.GpuTarget | None = None, *, compared: bool = False) -> Work:
     """An elementwise node's arithmetic (`_priced` on `on`), reading real operand dtypes from the e-graph
     (`dtype_of`), its result its operands' shapes broadcast; nothing where one shape is unknown."""
     shapes = _shapes(graph, operands, held)
     if shapes is None:
         return Work()
     in_dtypes = [dtype_of(graph, operand, held) for operand in operands]
-    out_dt = _result_dtype(primitive, params, in_dtypes, constructor)
+    out_dt = _result_dtype(primitive, params, in_dtypes, compared=compared)
     return _priced(primitive, params, shapes, np.broadcast_shapes(*shapes), on, out_dt, in_dtypes=in_dtypes)
 
 
@@ -240,7 +240,7 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None,
         if (args := get_callable_args(node, constructor)) is not None:
             primitive, params = region.params[integer(args[3])]
             return _elementwise(graph, primitive, params, (args[0], args[2]), held, on,
-                                constructor=constructor)
+                                compared=constructor is Term.compare)
     for constructor, primitive in ((Term.select, jax.lax.select_n_p), (Term.clamp, jax.lax.clamp_p)):
         if (args := get_callable_args(node, constructor)) is not None:
             return _elementwise(graph, primitive, {}, args[:3], held, on)

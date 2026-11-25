@@ -354,7 +354,7 @@ def test_a_per_key_paired_faint_product_keeps_value_and_gradient_within_and_acro
             between[ref, 0, 0] = np.float32(2.0 ** -60)
             between[later, ref, 0] = np.float32(1.0)
         between_arr = jnp.asarray(between)
-        out, pullback = jax.vjp(lambda l_, r_: scan._paired(l_, r_, between_arr), left, right)
+        out, pullback = jax.vjp(lambda l_, r_, b_=between_arr: scan._paired(l_, r_, b_), left, right)
         assert float(out[later, 0]) == float(np.float32(2.0 ** -60))
         cot = jnp.zeros_like(out).at[later, 0].set(np.float32(-(2.0 ** 60)))
         d_left, d_right = pullback(cot)

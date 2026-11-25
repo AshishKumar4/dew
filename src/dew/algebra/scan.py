@@ -1171,8 +1171,8 @@ def _channel_shift(left_blk: jax.Array, right_blk: jax.Array) -> jax.Array:
     minexp, maxexp = int(limits.minexp), int(limits.maxexp - 1)
     cap = min(-minexp, maxexp)
 
-    def bounds(arr: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
-        plain = jax.lax.stop_gradient(arr)
+    def bounds(block: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+        plain = jax.lax.stop_gradient(block)
         _, biased, fraction, _, exp = float_bits.float_bits(plain)
         exp32 = exp.astype(jnp.int32)
         finite_nz = jnp.isfinite(plain) & ((biased != 0) | (fraction != 0))
