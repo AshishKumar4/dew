@@ -138,7 +138,7 @@ def test_dew_launch_shows_each_process_its_own_gpus_alone():
         ("4,5", "0,1"), ("6,7", "0,1")]
     # A host no one counted the GPUs of (a remote one whose nvidia-smi does not answer) and whose pool lists
     # none: each process its host's own ordinals from its first, as JAX_LOCAL_DEVICE_IDS named them.
-    uncounted = Launch(command=("python", "train.py"), processes_per_host=2, devices_per_process=1,
+    uncounted = Launch(command=("python", "train.py"), processes_per_host=2, devices_per_process=1, port=8476,
                        env=("JAX_PLATFORMS=cuda",)).pool(["gpu-host.invalid"])
     assert [(process.env["CUDA_VISIBLE_DEVICES"], process.env[LOCAL_DEVICES]) for process in uncounted] == [
         ("0", "0"), ("1", "0")]
