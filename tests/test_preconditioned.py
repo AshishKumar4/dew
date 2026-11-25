@@ -147,31 +147,35 @@ def on_the_mainloop(query, key, value, log_decay, beta, state, reads, d_out, d_f
     return (out, final), (dq, dk, dv, dg, dbeta, dh0, d_reads)
 
 
-def on_the_mainloops_forward(query, key, value, log_decay, beta, state, reads):
-    """`read_erased`'s output and final memory on the template's mainloop forward (`chunk_forward.forward`'s
-    `reads`), its accurate fp32 forms, interpreted on an A100's bundle."""
-    target = generation.gpu_target('sm80')
-    with generation.assumed(target, interpreted=True):
-        return chunk_forward.forward(query, key, value, log_decay, beta, state, reads=reads, tiles=NARROW,
-                                     family=template.bundle(target, jnp.float32), interpret=True)
+def read_erased_forward(query, key, value, log_decay, beta, state, reads):
+    """`read_erased_on_the_template`'s output and final memory, its forward alone, under a decay a head
+    (`log_decay` `[B, S, HV]`) or a key dimension (`[B, S, HV, Dk]`, its decay the head's at every key)."""
+    return read_erased_on_the_template(query, key, value, log_decay, beta, state, reads)
 
 
-def key_decayed(seed):
-    """`read_erase_operands`' draw of a seed under a decay a key dimension (PKDA's), its cotangents gone."""
-    q, k, v, g, beta, state, reads, *_ = read_erase_operands(seed)
-    normal = np.random.default_rng([1459, 2, seed]).standard_normal
-    keyed = -softplus(-(normal((*g.shape, k.shape[-1])) + 3.0))
-    return q, k, v, hosted(keyed), beta, state, reads
+def with_key_decays(query, key, value, log_decay, beta, state, reads):
+    """`read_erased_forward` under a decay a key dimension, each key's the head's (`log_decay` `[B, S, HV]`
+    spread over the keys)."""
+    keyed = jnp.broadcast_to(log_decay[..., None], (*log_decay.shape, key.shape[-1]))
+    return read_erased_forward(query, key, value, keyed, beta, state, reads)
 
 
-def test_a_read_erase_under_a_decay_a_key_dimension_on_the_mainloop_is_as_exact_as_its_recurrence():
-    """The delta rule erasing along reads of its own under a decay a key dimension (PKDA's) on the
-    template's mainloop forward, its accurate fp32 forms: the system's rows the reads' in its own pairs and
-    the intra walk, its weights the reads' and its decayed keys the keys' apart (`chunk_forward._paired`,
-    `_key_weighted`): the output and final memory on par with its recurrence a token at a time in fp32 from
-    float64 (check 1). Its training is the portable math's (`mainloop_backward.fast_backward_form`)."""
-    assert_as_exact(jax.jit(on_the_mainloops_forward), jax.jit(read_erased), key_decayed,
-                    "a key decay's read erase on the mainloop", seeds=SEEDS)
+def sixteen_bit_forward(seed):
+    """`sixteen_bit_read_erase`'s draw of a seed, its cotangents gone."""
+    return sixteen_bit_read_erase(seed)[:-1]
+
+
+def test_a_read_erase_under_a_decay_a_key_dimension_on_the_template_is_its_head_decays():
+    """The delta rule erasing along reads of its own under a decay a key dimension (PKDA's) on the template,
+    its 16-bit forward (the system's rows the reads' in its own pairs and the intra walk, its weights the
+    reads' and its decayed keys the keys' apart: `chunk_forward._paired`, `_key_weighted`), each key's decay
+    the head's, on par from float64 with the same call under that decay a head (check 1, the truth its
+    recurrence a token at a time), whose read erase check 1 holds to the recurrence at the accurate forms: a
+    system whose rows and columns trade the reads and the keys, or weights formed from the keys, lands far
+    past it. Its training is the portable math's (`mainloop_backward.fast_backward_form`); fla's recorded
+    PKDA sites hold it once M-JS-266b's fixture lands (row 12696)."""
+    assert_as_exact(jax.jit(with_key_decays), jax.jit(read_erased_forward), sixteen_bit_forward,
+                    "a key decay's read erase on the template", seeds=SEEDS, truth_fn=jax.jit(read_erased))
 
 
 def read_erase_operands(seed):

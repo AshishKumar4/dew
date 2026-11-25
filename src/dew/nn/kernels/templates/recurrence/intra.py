@@ -449,7 +449,7 @@ def _sub_chunk_walk(q, k, prefix, beta, taken, own: tuple, call: Call, *, scale:
     inputs = (q, k, *((reads,) if reading else ()), *prefix, beta, taken, *own)
     return launch_kernel(program, call, out_type=tuple(form.shape(call.heads * chunk) for form in out_forms),
                          grid=(call.chunks, call.heads), grid_names=("chunks", "heads"), blocks=blocks,
-                         stages=(1, 2), live=chunk_liveness(len(prefix) + 3), steps=steps,
+                         stages=(1, 2), live=chunk_liveness(len(prefix) + 3 + reading), steps=steps,
                          model=_sub_chunk_flops(call, keys, outputs),
                          held=_sub_chunk_held(call, keys, outputs), staging=staging, landing=landing,
                          name=_named("recurrence_intra", products), sums=(chunk,) * (outputs * later),
