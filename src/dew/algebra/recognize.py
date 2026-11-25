@@ -1284,9 +1284,9 @@ def _recurrence_bounded(
     state_dtype, state_source_dtype, out_dtype, scale: float | None, delta: bool, has_beta: bool,
     decay: str,
 ) -> bool:
-    """Whether the selected chunked kernel's operand layout (`_recurrence_kernel_layout`) preserves lossless
-    entering-state and inter-chunk carries, upper-range finiteness (ungated `K @ K^T`, `Q @ K^T`, contractive
-    WY inverse, peak state/readout), and lower-range non-underflow into `out_dtype` (row 3450)."""
+    """Whether the selected chunked kernel's captured operand layout (`_recurrence_kernels`) preserves
+    lossless entering-state and inter-chunk carries, upper-range finiteness (ungated `K @ K^T`, `Q @ K^T`,
+    contractive WY inverse, peak state/readout), and lower-range non-underflow into `out_dtype` (row 3450)."""
     if (state_bound is None or q_bound is None or k_bound is None or v_bound is None
             or not (state_apart.finite and q_apart.finite and k_apart.finite and v_apart.finite)
             or (scale is not None and (not math.isfinite(scale) or scale <= 0.0 or scale > 1.0))
@@ -1460,8 +1460,7 @@ def _recurrence_kernels(call: Callable, operands: Sequence[jcore.Var], options: 
 
 
 def _recurrence_route_admits(
-    call: Callable, operands: Sequence[jcore.Var], options: Hashable, hooks,
-    roles: tuple[tuple[str, int], ...], *,
+    call: Callable, operands: Sequence[jcore.Var], options: Hashable, hooks, *,
     state_bound: terms.Magnitude | None, state_apart: terms.Apart, state_source_dtype,
     q_bound: terms.Magnitude | None, q_apart: terms.Apart,
     k_bound: terms.Magnitude | None, k_apart: terms.Apart,
@@ -1473,10 +1472,11 @@ def _recurrence_route_admits(
     training kernel's captured operand layout (`_recurrence_kernels`), checked only after token equivalence
     is proven. Under `forms="accurate"` (`docs/design/algebra.md §3`, `docs/design/testing.md`) leaves plain
     token scans intact so exact fp32 intra-chunk cancellation is preserved; under default `forms="fast"`
-    admits `bf16` delta-rule scans under the fast-forms contract (Check-1 on drawn inputs, finite where
-    reference is finite, exact zero where reference is zero) while holding entering-state, chunk-boundary,
-    WY-inverse, and overflow/subnormal guards."""
-    del roles
+    admits `bf16` delta-rule scans under the default-form contract (Check-1 on drawn inputs, finite where
+    the reference is finite, and exact zero for structural zeros—zero/empty operands—per
+    `docs/design/testing.md` and Check-1's term-sized cancelling-row rule, not accidental cancellation of
+    nonzero `bf16` scores) while holding entering-state, chunk-boundary, WY-inverse, and overflow/subnormal
+    guards."""
     if generation.numerics().forms == "accurate":
         return False
     fwd_ok, fwd_kernels, fwd_mosaic = _recurrence_kernels(call, operands, options, vjp=False)
@@ -1562,7 +1562,7 @@ def _recurrence_candidates(
                                                  out_dtype=ys_aval.dtype)
                         opts = (hooks, roles, ys_aval.dtype)
                         admit = functools.partial(
-                            _recurrence_route_admits, call, operands, opts, hooks, roles,
+                            _recurrence_route_admits, call, operands, opts, hooks,
                             state_bound=state_bound, state_apart=state_apart,
                             state_source_dtype=state_source_dtype,
                             q_bound=q_bound, q_apart=q_apart, k_bound=k_bound, k_apart=k_apart,

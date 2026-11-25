@@ -1643,9 +1643,10 @@ def _scan_bf16_state_init(step):
     return scan_fn
 
 
-def _assert_fla_cancel_preserved(scan_fn, state, q, k, v, g, beta, *, token_idx: int, expected: float):
-    """Assert direct forced FLA flushes `token_idx` to 0 while `dew.jit(scan_fn)` preserves exact cancellation
-    matching `jax.jit(scan_fn)` bit-for-bit."""
+def _assert_fla_cancel_preserved(scan_fn, state, q, k, v, g, beta, *, token_idx: int, expected: float,
+                                 fla_expected: float = 0.0):
+    """Assert direct forced FLA rounds `token_idx` to `fla_expected` while `dew.jit(scan_fn)` preserves
+    exact cancellation matching `jax.jit(scan_fn)` bit-for-bit."""
     import dew
     from dew.nn.kernels import recurrence, recurrence_chunk
 
@@ -1656,7 +1657,7 @@ def _assert_fla_cancel_preserved(scan_fn, state, q, k, v, g, beta, *, token_idx:
                 state=state, query=jnp.swapaxes(q, 0, 1), key=jnp.swapaxes(k, 0, 1),
                 value=jnp.swapaxes(v, 0, 1), log_decay=jnp.swapaxes(g, 0, 1),
                 beta=jnp.swapaxes(jax.nn.sigmoid(beta), 0, 1)), dtype=jnp.bfloat16)
-        assert float(np.asarray(fla_out, np.float32)[0, token_idx, 0, 0]) == 0.0
+        assert float(np.asarray(fla_out, np.float32)[0, token_idx, 0, 0]) == fla_expected
         ref_fin, ref_out = jax.jit(scan_fn)(state, q, k, v, g, beta)
         got_fin, got_out = dew.jit(scan_fn)(state, q, k, v, g, beta)
         np.testing.assert_array_equal(np.asarray(got_fin), np.asarray(ref_fin))
@@ -1788,9 +1789,9 @@ def test_recurrence_recognition_guards_later_chunk_carry_and_unsound_norms():
 
 
 def test_recurrence_recognition_accurate_intra_chunk_and_observed_layout():
-    """Intra-chunk 2-token witness preserves exact `-2^-23` under `forms="accurate"` while holding fast-form
-    finiteness/zeros (`docs/design/algebra.md §3`), and `chunk_forward.observed()` + `_recurrence_kernels`
-    capture Mosaic `Call.held` & `Call.chunk` directly from forward/training dispatch."""
+    """Intra-chunk 2-token and orthogonal score-cancellation witnesses are preserved under `forms="accurate"`
+    while default `forms="fast"` holds finiteness and structural zeros under forced `mosaic_gpu` and `fla`
+    routes; `chunk_forward.observed()` + `_recurrence_kernels` capture Mosaic `Call.held` & `Call.chunk`."""
     import dew
     from dew.algebra import recognize
     from dew.nn.kernels import recurrence
@@ -1816,6 +1817,12 @@ def test_recurrence_recognition_accurate_intra_chunk_and_observed_layout():
     k_intra = jnp.zeros((seq64, batch, hv, dk), jnp.bfloat16).at[:2, :, :, 0].set(jnp.bfloat16(1.0 / 64.0))
     v_intra = jnp.zeros((seq64, batch, hv, dv), jnp.bfloat16).at[0, :, :, 0].set(
         jnp.bfloat16(1.0)).at[1, :, :, 0].set(jnp.bfloat16(-1.0))
+    q_orth = jnp.zeros((seq64, batch, hv, dk), jnp.bfloat16).at[1, :, :, 0].set(
+        jnp.bfloat16(0.125)).at[1, :, :, 1].set(jnp.bfloat16(3.0 / 32.0))
+    k_orth = jnp.zeros((seq64, batch, hv, dk), jnp.bfloat16).at[0, :, :, 0].set(
+        jnp.bfloat16(129.0 / 2048.0)).at[1, :, :, 1].set(jnp.bfloat16(129.0 / 2048.0))
+    v_orth = jnp.zeros((seq64, batch, hv, dv), jnp.bfloat16).at[0, :, :, 0].set(
+        jnp.bfloat16(3.0 / 32.0)).at[1, :, :, 0].set(jnp.bfloat16(-0.125))
     with generation.run_precision(Numerics(forms="accurate")):
         with generation.assumed("sm90"):
             assert not _routes("gated_delta_rule", lambda: dew.jit(scan_64).trace(*shapes64))
@@ -1824,11 +1831,19 @@ def test_recurrence_recognition_accurate_intra_chunk_and_observed_layout():
         _assert_fla_cancel_preserved(
             scan_64, z_s, q_intra, k_intra, v_intra, z_g, z_b,
             token_idx=1, expected=float(jnp.bfloat16(-(2.0 ** -23))))
-    fast_f, fast_o = dew.jit(scan_64)(z_s, q_intra, k_intra, v_intra, z_g, z_b)
-    assert np.isfinite(np.asarray(fast_f)).all() and np.isfinite(np.asarray(fast_o, np.float32)).all()
-    zero_f, zero_o = dew.jit(scan_64)(z_s, z_q, k_intra, z_v, z_g, z_b)
-    assert not np.asarray(zero_f).any() and not np.asarray(zero_o, np.float32).any()
-
+        _assert_fla_cancel_preserved(
+            scan_64, z_s, q_orth, k_orth, v_orth, z_g, z_b,
+            token_idx=1, expected=0.0, fla_expected=float(jnp.bfloat16(-(2.0 ** -20))))
+    for route in ("mosaic_gpu", "fla"):
+        with generation.chosen(gated_delta_rule=route):
+            assert set(_routes("gated_delta_rule", lambda: dew.jit(scan_64).trace(*shapes64))) == {route}
+            for qq, kk, vv, zero in ((q_intra, k_intra, v_intra, False), (q_orth, k_orth, v_orth, False),
+                                     (z_q, k_intra, z_v, True), (q_orth, k_orth, z_v, True)):
+                got_f, got_o = dew.jit(scan_64)(z_s, qq, kk, vv, z_g, z_b)
+                assert np.isfinite(np.asarray(got_f)).all()
+                assert np.isfinite(np.asarray(got_o, np.float32)).all()
+                if zero:
+                    assert not np.asarray(got_f).any() and not np.asarray(got_o, np.float32).any()
     # `chunk_forward.observed()` and `_recurrence_kernels` capture Mosaic `Call.held` & `Call.chunk` live
     # (`sm80` TF32 10b, `sm90` 2-part bf16 15b, `sm90` unrounded 3-part 23b, and nothing outside `observed`).
     f32_shapes = (
