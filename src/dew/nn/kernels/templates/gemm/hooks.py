@@ -57,13 +57,8 @@ class Hooks:
         return _unsqueezing(self.prologue, self.prologue_broadcast)
 
     def after(self):
-        """The epilogue as a kernel traces it: on the squeezed side tiles, column-local as declared
-        (`ColumnLocal`: a side's dimension of one given back across a chunk's columns as across its
-        tile's)."""
-        after = _unsqueezing(self.epilogue, self.epilogue_broadcast, self.accumulators)
-        if isinstance(self.epilogue, ColumnLocal) and after is not self.epilogue:
-            return ColumnLocal(after)
-        return after
+        """The epilogue as a kernel traces it: on the squeezed side tiles."""
+        return _unsqueezing(self.epilogue, self.epilogue_broadcast, self.accumulators)
 
     def kernel_options(self) -> dict:
         return {'prologue': self.before(), 'prologue_axes': self.prologue_axes, 'epilogue': self.after(),
@@ -160,6 +155,22 @@ class ColumnLocal:
         return self.hook(*tiles)
 
 
+def column_local(hook) -> bool:
+    """Whether `hook` is declared column-local (`ColumnLocal`) as a launch holds it: through the form every
+    launch takes it in (`tuning.Prepared`'s source; the algebra's rewrite computes its function) and its side
+    tiles' dimensions of one given back (`_unsqueezed`, across whatever columns its tile has)."""
+    from dew.nn.kernels import tuning
+
+    while not isinstance(hook, ColumnLocal):
+        if isinstance(hook, tuning.Prepared):
+            hook = hook.source
+        elif isinstance(hook, functools.partial) and hook.func is _unsqueezed:
+            hook = hook.args[0]
+        else:
+            return False
+    return True
+
+
 class ReadOut(NamedTuple):
     """How a launch's epilogue reads its tile out (`read_out`): each output's divisor where its form narrows
     it, 1 elsewhere (`narrowed`; a tile's own columns by `mosaic_gpu._gmm_finished`), and the columns its
@@ -185,7 +196,7 @@ def read_out(family, part: tuple[int, int], dtypes: tuple, forms: tuple, staging
     if epilogue is None:
         return ReadOut(narrowed)
     return ReadOut(narrowed, pricing.hook_chunk(family, part[0], part[1], dtypes, forms, staging,
-                                                local=isinstance(epilogue, ColumnLocal)))
+                                                local=column_local(epilogue)))
 
 
 def lowering_rules(target) -> dict:

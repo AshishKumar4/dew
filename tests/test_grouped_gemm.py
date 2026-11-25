@@ -35,6 +35,7 @@ from dew.nn.kernels import (
     tuning,
 )
 from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing, row_tiles, tiling
+from dew.nn.kernels.templates.gemm.hooks import ColumnLocal
 from dew.nn.moe import expert_projection
 
 pytestmark = pytest.mark.kernel
@@ -1337,9 +1338,10 @@ def test_mosaic_planning_uses_explicit_target_not_ambient_gpu():
 
 @lowers("sm90")
 def test_gemm_register_model_fits_sm90_epilogue_and_tgmm_census():
-    """The GEMM register model admits multi-output epilogue tiles that compile spill-free under sm90 ptxas
-    (a column-local hook read out 64 columns at a time, so the 64 x 256 mixed-output tile too), and `dew_tgmm`
-    likewise, and scopes wgmma `tgmm` scalar addressing away from tcgen05 (rows 8723, 11946, 11947, 1958)."""
+    """The GEMM register model holds legal multi-output epilogues and `dew_tgmm` spill-free under sm90 ptxas
+    while refusing wide multi-output tiles past the single-warpgroup budget, but where their hook is declared
+    column-local (read out 64 columns at a time), and scopes wgmma `tgmm` scalar addressing away from
+    tcgen05 (rows 8723, 11946, 11947, 1958)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels
 
@@ -1355,24 +1357,29 @@ def test_gemm_register_model_fits_sm90_epilogue_and_tgmm_census():
             out_dtypes=("bfloat16", "bfloat16"))
         ba_two = gmm.bind(x, w, sizes, out_dtype="bfloat16", trans_rhs=False, interpret=False,
                           hooks=two_out_hooks)
-        wide_last = grouped_matmul.Hooks(
-            epilogue=lambda acc: (acc.astype(jnp.bfloat16), acc + 1.0),
-            out_dtypes=("bfloat16", "float32"))
+        def mixed(acc):
+            return acc.astype(jnp.bfloat16), acc + 1.0
+
+        wide_last = grouped_matmul.Hooks(epilogue=mixed, out_dtypes=("bfloat16", "float32"))
         ba_wide_last = gmm.bind(x, w, sizes, out_dtype="bfloat16", trans_rhs=False, interpret=False,
                                 hooks=wide_last)
+        # Declared column-local (`hooks.ColumnLocal`), its tile read out 64 columns at a time.
+        ba_local = gmm.bind(x, w, sizes, out_dtype="bfloat16", trans_rhs=False, interpret=False,
+                            hooks=dataclasses.replace(wide_last, epilogue=ColumnLocal(mixed)))
         ba_dw = tgmm.bind(x, dy, sizes, out_dtype="float32", interpret=False, dense=False)
         t256 = tiling.Tiles(64, 256, 64, 3, 56, warpgroups=1, family="wgmma")
         # 128-col mixed (bf16, fp32) exercises per-output staging widths: 64-col bf16 and 32-col fp32.
         t128 = tiling.Tiles(64, 128, 64, 3, 56, warpgroups=1, family="wgmma")
         assert gmm.legal(ba_two, t256, sm90)
-        # A hook takes 64 columns at a time (`pricing.hook_chunk`): the wide mixed tile its model holds
-        # compiles spill-free, which its whole-tile hook's model refused (row 1958).
-        assert gmm.legal(ba_wide_last, t256, sm90)
+        # Read out whole, the wide mixed tile is past one warpgroup's registers; a column-local hook's, 64
+        # columns at a time, is within them and compiles spill-free (row 1958).
+        assert not gmm.legal(ba_wide_last, t256, sm90)
+        assert gmm.legal(ba_local, t256, sm90)
         assert gmm.legal(ba_wide_last, t128, sm90)
         assert tgmm.legal(ba_dw, t256, sm90)
         cases = [
             KernelCase("two_out_64x256", lambda: gmm.lowering(ba_two, t256)),
-            KernelCase("mixed_64x256", lambda: gmm.lowering(ba_wide_last, t256)),
+            KernelCase("mixed_local_64x256", lambda: gmm.lowering(ba_local, t256)),
             KernelCase("mixed_64x128", lambda: gmm.lowering(ba_wide_last, t128)),
             KernelCase("tgmm_64x256", lambda: tgmm.lowering(ba_dw, t256)),
         ]
