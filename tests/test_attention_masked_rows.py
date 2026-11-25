@@ -22,7 +22,7 @@ import numpy as np
 import pytest
 import tier_wire
 from arm_arithmetic import drawn_on_the_host
-from attention_oracle import attention_on_par, exact_value_and_grads, kept, qkv, value_and_grads
+from attention_oracle import attention_on_par, exact_value_and_grads, kept, packed_ids, qkv, value_and_grads
 from reference_error import FEWEST_SEEDS
 
 from dew.nn.attention import scaled_dot_product_attention
@@ -39,12 +39,8 @@ def masked():
 
 
 def padded():
-    """Two packed rows of 256 that end in padding, host ids (a GPU tier part's prepare computes nothing on
-    its compile-only device)."""
-    rows = [np.pad(np.repeat(np.arange(1, len(lengths) + 1), lengths), (0, 256 - sum(lengths)))
-            for lengths in ((100, 84, 50), (30, 190, 10))]
-    segment_ids = np.stack(rows).astype(np.int32)
-    return {"causal": True, "segment_ids": segment_ids}, None
+    """Two packed rows of 256 that end in padding."""
+    return {"causal": True, "segment_ids": packed_ids((100, 84, 50), (30, 190, 10))}, None
 
 
 CASES = {"mask": masked, "padding": padded}
