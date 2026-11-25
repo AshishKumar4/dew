@@ -15,11 +15,19 @@ import numpy as np
 
 from dew import _position
 from dew._coordination import from_every_process
-from dew._records import JSON
+from dew._records import JSON, json_value
 from dew.mesh import LogicalAxes
 
 if TYPE_CHECKING:
+    from dew.checkpoints import Checkpoints
     from dew.data.dataset import DataPartition
+
+
+def saved_under(checkpoints: Checkpoints, step: int, key: str) -> JSON:
+    """What `step` of `checkpoints` was saved with under `key` among its custom metadata, None where it
+    holds none: the local step's as its process holds it, a committed one's from the persistent directory.
+    Read by a resume of an earlier run's marks (`dew.config.earlier.TYPED_OPTIMIZER`), no public API's."""
+    return json_value(checkpoints._custom_of(step).get(key), key)
 
 
 def step_record(deltas: Mapping[str, list[str]], control: dict | None, rung: JSON, artifact: JSON,

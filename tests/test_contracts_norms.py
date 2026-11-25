@@ -324,13 +324,22 @@ def test_the_fused_norms_and_products_hold_every_order(edge):
         assert_contract(fn, primals, direction, pulled_back, f"{name} {edge}", truth_fn=plain, plain_fn=plain)
 
 
+def plain_l2norm(x):
+    """A unit norm as its formula reads (`precision.l2norm` before its own derivative, row 12771): the rows
+    in at least fp32 over the root of their sums of squares and the eps, rounded once to their dtype, every
+    derivative JAX's of it."""
+    wide = x.astype(precision.at_least_fp32(x.dtype))
+    return (wide * jax.lax.rsqrt(jnp.sum(jnp.square(wide), axis=-1, keepdims=True) + precision.L2NORM_EPS)
+            ).astype(x.dtype)
+
+
 def plain_stepped(residual, branch, alpha):
-    """nGPT's join as its formula reads, each unit norm `precision.l2norm`'s: the reference its two-pass
+    """nGPT's join as its formula reads, each unit norm `plain_l2norm`'s: the reference its two-pass
     reverse (`ngpt.stepped`) is held to."""
     wide = precision.at_least_fp32(jnp.result_type(residual, branch, alpha))
-    start, end = (precision.l2norm(x).astype(wide) for x in (residual, branch))
+    start, end = (plain_l2norm(x).astype(wide) for x in (residual, branch))
     rate = jnp.abs(alpha.astype(wide) * STEP)
-    return precision.l2norm(start + rate * (end - start)).astype(residual.dtype)
+    return plain_l2norm(start + rate * (end - start)).astype(residual.dtype)
 
 
 def plain_hidden(gate, up, gate_gain, up_gain):
@@ -340,7 +349,7 @@ def plain_hidden(gate, up, gate_gain, up_gain):
     gated = (gate.astype(wide) * ngpt.gain(gate_gain, HIDDEN, wide)).astype(gate.dtype)
     upped = (up.astype(wide) * ngpt.gain(up_gain, HIDDEN, wide)).astype(up.dtype)
     product = gated_product("swiglu", implementation="xla")
-    return precision.l2norm(product(gated.astype(wide), upped.astype(wide)).astype(gate.dtype))
+    return plain_l2norm(product(gated.astype(wide), upped.astype(wide)).astype(gate.dtype))
 
 
 STEP, HIDDEN = 0.05, 4.0
@@ -388,9 +397,11 @@ def test_ngpts_join_leaves_a_long_residuals_radial_cotangent_nothing(wide):
                 <= 1 + rounding)
 
 
+@pytest.mark.parametrize("norm", ["l2_normed", "l2norm"])
 @pytest.mark.parametrize("direction", ["forward", "reverse"])
-def test_a_unit_norm_carries_a_short_rows_huge_radial_derivative_finite(direction):
-    """nGPT's unit norm (`precision.l2_normed`) of a row of length 1/2, its tangent (forward) or cotangent
+def test_a_unit_norm_carries_a_short_rows_huge_radial_derivative_finite(direction, norm):
+    """nGPT's unit norm (`precision.l2_normed`, and `precision.l2norm`, the one its queries, keys and stream
+    and cross-attention's join read, row 12771) of a row of length 1/2, its tangent (forward) or cotangent
     (reverse) along the row and as large as float32 holds (3 * 2^126): the row's derivative is the part the
     norm's eps leaves, `c eps / (1/4 + eps)^(3/2)`, about 2^110.7, finite, positive and off the row's other
     axis, projected off the row before it meets the row's inverse length, 2, in both directions, where scaling
@@ -398,10 +409,11 @@ def test_a_unit_norm_carries_a_short_rows_huge_radial_derivative_finite(directio
     fix had moved the overflow to the forward)."""
     row = jnp.asarray([[0.5, 0.0]], jnp.float32)
     huge = jnp.asarray([[3.0 * 2.0 ** 126, 0.0]], jnp.float32)
+    unit = precision.l2norm if norm == "l2norm" else functools.partial(precision.l2_normed, dtype=jnp.float32)
     if direction == "forward":
-        derivative = jax.jvp(lambda x: precision.l2_normed(x, jnp.float32), (row,), (huge,))[1]
+        derivative = jax.jvp(unit, (row,), (huge,))[1]
     else:
-        _, pulled = jax.vjp(lambda x: precision.l2_normed(x, jnp.float32), row)
+        _, pulled = jax.vjp(unit, row)
         (derivative,) = pulled(huge)
     assert float(derivative[0, 1]) == 0.0
     assert np.isfinite(float(derivative[0, 0])) and float(derivative[0, 0]) > 0
@@ -409,9 +421,10 @@ def test_a_unit_norm_carries_a_short_rows_huge_radial_derivative_finite(directio
 
 @pytest.mark.parametrize("edge", EDGES)
 def test_ngpts_join_and_normed_hidden_hold_every_order(edge):
-    """nGPT's join (`ngpt.stepped`) and normed hidden (`ngpt.normed_hidden`), each JAX's derivatives of its
-    formula, no rule of its own (row 11940): every order finite wherever float64 is a normal float32 and the
-    plain formula, the norms, the step, the gains and the product as written, is."""
+    """nGPT's join (`ngpt.stepped`), normed hidden (`ngpt.normed_hidden`) and unit norm (`precision.l2norm`,
+    its queries', keys', stream's and cross-attention join's, row 12771), each JAX's derivatives of its
+    formula but for the unit norm's own (row 11940): every order finite wherever float64 is a normal float32
+    and the plain formula, the norms, the step, the gains and the product as written, is."""
     residual, branch, gate, up = normal_draw(2671, (3, 16), (3, 16), (3, 16), (3, 16), scale=EDGES[edge])
     alpha, gate_gain, up_gain = normal_draw(2672, (16,), (16,), (16,))
     directions = normal_draw(2673, (3, 16), (3, 16), (16,), (3, 16), (3, 16), (16,), (16,),
@@ -424,6 +437,7 @@ def test_ngpts_join_and_normed_hidden_hold_every_order(edge):
         "nGPT's normed hidden": (lambda gate, up, gate_gain, up_gain: ngpt.normed_hidden(
                                      gate, up, gate_gain, up_gain, HIDDEN, product),
                                  plain_hidden, (gate, up, gate_gain, up_gain), directions[3:]),
+        "nGPT's unit norm": (precision.l2norm, plain_l2norm, (residual,), directions[:1]),
     }
     for name, (fn, plain, primals, direction) in sites.items():
         assert_contract(fn, primals, direction, cotangent, f"{name} {edge}", truth_fn=plain, plain_fn=plain)

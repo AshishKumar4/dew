@@ -12,6 +12,7 @@ from flax import linen as nn
 
 from dew.mesh import LayoutRefused
 
+from ..dense import captures_any_method
 from ..host_memory import on_host
 from ..hyper_connections import Carried
 from ..precision import at_least_fp32
@@ -35,14 +36,13 @@ if TYPE_CHECKING:
 
 
 def scanned() -> bool:
-    """Whether a decoder's stack runs its like and periodic runs under the scan
-    (`generation.chosen(layer_scan="scanned")`, `Choice.LAYER_SCAN`) or every layer unrolled, the default
-    until the scanned path's open rows close (12076 to 12080; row 4074 then makes the scan the default:
-    Qwen3.5-4B's periodic stack lowers unrolled to 112k operations): how it compiles, by its structure alone,
-    never a model's field."""
+    """Whether a decoder's stack runs its like and periodic runs under the scan, the default, or every layer
+    unrolled (`generation.chosen(layer_scan="plain")`, `Choice.LAYER_SCAN`): Qwen3.5-4B's periodic stack
+    lowers unrolled to 112k operations, scanned to its period's (row 4074). How it compiles, by its
+    structure alone, never a model's field."""
     from dew.nn.kernels.generation import Choice, chosen_kernel
 
-    return chosen_kernel(Choice.LAYER_SCAN, "plain") == "scanned"
+    return chosen_kernel(Choice.LAYER_SCAN, "scanned") == "scanned"
 
 
 def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer_input,
@@ -77,6 +77,15 @@ def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer
         x = x.astype(at_least_fp32(x.dtype))
     stages = pipeline_stages()
     first, end = (0, decoder.num_layers) if span is None else span
+
+    def unrolled():
+        # Each layer run directly, in the stream's own dtype: no scan carries it.
+        return run_stack(
+            decoder.layers, decoder.block, decoder.specs,
+            tuple((index, 1) for index in range(first, end)), x,
+            train=train, decode=decode, kv_store={} if decoder.provides else None,
+            per_layer_input=per_layer_input, attention_metadata=attention_metadata, prior_bank=prior_bank)
+
     # A seeded initialization (PTQ's abstract annotation pass) reads the
     # supplied layout; the scan's init=True pass would draw over it first.
     if (decoder.is_initializing() and stages == 1 and not decode
@@ -93,13 +102,9 @@ def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer
                                    trans_out_fn=view.unstack, init=True, mutable=True)
             return run(decoder, view, x, train, decode, per_layer_input, attention_metadata, prior_bank)
     if decoder.is_initializing() or (stages == 1 and not scanned()):
-        return run_stack(
-            decoder.layers, decoder.block, decoder.specs,
-            tuple((index, 1) for index in range(first, end)), x,
-            train=train, decode=decode, kv_store={} if decoder.provides else None,
-            per_layer_input=per_layer_input, attention_metadata=attention_metadata, prior_bank=prior_bank)
+        return unrolled()
     staged = stored_by_stage(decoder.variables)
-    banked = () if staged else decoder.banked_collections()
+    banked = () if staged else decoder.banked_collections(span)
     held = decoder.variables.get('cache', {})
     if decode and 'params' in banked and not any(group_layers(name) for name in held):
         # A decode over a store banked by run that opens its cache opens it banked as `init_cache` does
@@ -114,10 +119,16 @@ def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer
         view, split = (dataclasses.replace(stage_view(decoder, 1), staged=staged),
                        StageSplit(0, decoder.num_layers, 0))
     elif stages == 1:
-        if span is not None and banked:
+        groups, periods = one_stage_runs(decoder, first, end, banked=bool(banked))
+        if span is not None and banked and not set(groups).issubset(decoder.groups):
             raise LayoutRefused(f"a loop over layers {span} runs part of the stack, and a store banked "
                                 f"by run holds whole runs; {list(banked)} arrived banked")
-        groups, periods = one_stage_runs(decoder, first, end, banked=bool(banked))
+        if not any(count > 1 for _, count in groups) or (
+                not banked and 'streaming' not in decoder.variables and captures_any_method(decoder)):
+            # No run scans, or a caller's capture of any method may keep what no scan stacks (a method's
+            # non-array return, wherever its filter selects it): each layer runs as the plain stack runs it,
+            # as a loop's passes do under such a capture (`looping`).
+            return unrolled()
         view, split = (StackView(groups, banked=banked, periods=periods),
                        StageSplit(0, decoder.num_layers, 0))
     else:
@@ -127,7 +138,7 @@ def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer
         view, split = pipelined(decoder, x, stages, decode=decode, banked=banked, span=span)
     dtype = decoder.residual_dtype(
         x, train=train, decode=decode, per_layer_input=per_layer_input,
-        attention_metadata=attention_metadata)
+        attention_metadata=attention_metadata, first=first)
     # A carried collapse stays fp32, as the reference keeps it.
     x = x._replace(streams=x.streams.astype(dtype)) if isinstance(x, Carried) else x.astype(dtype)
     run = nn.map_variables(stacked, mapped_collections=True, trans_in_fn=view.stack,

@@ -324,8 +324,12 @@ class GatedMLP(nn.Module):
     def _chained(self, x, projections_: tuple[nn.Module, ...], activation: Callable, train: bool):
         """The MLP's output as one chain of its projections where the run's recipe takes them
         (`projections.recipe_chain`: blockwise FP8, the down projection's rows quantized in the up
-        projection's epilogue, bitwise the projections apart): an ungated MLP's up and down (row 8547), or a
-        gated one's gate, up and down, `activation` its gated product of the two (row 12689). Else None, each
+        projection's epilogue; its gradients bitwise the projections apart, its value too where the
+        activation computes alike in the kernel and in XLA, else within check 1 of theirs, docs/design/
+        testing.md's kernel against the composition it replaces, M-NG-21b): an ungated MLP's up and down (row
+        8547), or a gated one's gate, up and down, `activation` its gated product of the two (row 12689), its
+        gate's and up's products named as the projections apart name them, which a remat policy saves (row
+        12758). Else None, each
         projection then its own: a bias, hidden units dropped between them, a tensor axis splitting the
         hidden width (the chain reads its matrices whole), the parameters' creation, or projections not plain
         `Dense` whose kernels they hold, their products owned by no wrapper or interceptor (a LoRA's, a
@@ -360,7 +364,7 @@ class GatedMLP(nn.Module):
             return None
         gate = promoted[0][1] if len(promoted) == 2 else None
         out = recipe_chain(rows.reshape(-1, rows.shape[-1]), promoted[-1][1], down, activation,
-                           out_dtype=rows.dtype, gate=gate)
+                           out_dtype=rows.dtype, gate=gate, names=(Residual.GATE_PROJ, Residual.UP_PROJ))
         if out is None:
             return None
         return checkpoint_name(out.reshape(*x.shape[:-1], out.shape[-1]), Residual.DOWN_PROJ)

@@ -18,12 +18,14 @@ from typing import Literal, NamedTuple, get_args
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import tokamax
 from flax.linen.dtypes import promote_dtype
 from jax.ad_checkpoint import checkpoint_name
+from jax.typing import DTypeLike
 
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent, with_tangents_formed_at
-from dew.nn.programs import own_preset
+from dew.nn.programs import holes, own_preset
 from dew.nn.residuals import Residual
 
 from .attention_kernels import (
@@ -48,6 +50,7 @@ from .attention_masks import (
     with_key_starts,
 )
 from .attention_parallel import (
+    check_rows,
     four_dimensional,
     on_attention_shards,
     pad_rows,
@@ -55,6 +58,7 @@ from .attention_parallel import (
     shard_heads,
     split_with_queries,
     tensor_shards,
+    visibility_refused,
 )
 from .attention_sinks import sink_softmax
 from .attention_tpu import splash_mask_descriptor, tpu_attention
@@ -502,9 +506,23 @@ def weighted_values(equation, weights, value, *, precision=None) -> jax.Array:
     return float32_einsum(equation, weights.astype(value.dtype), value, precision=precision)
 
 
+class Products(NamedTuple):
+    """`reference_attention`'s two products apart, as a kernel's portable rule states each (Splash's,
+    `_splash_portable`): the logits' precision (`scores`), their sums' dtype where it names one (`logits`:
+    the query's and key's own operands, fp32 sums), the value product's precision (`values`), and its dtype
+    where it names one (`weighted`: the weights unrounded and the values widened to it, the query and key
+    left in theirs)."""
+
+    scores: jax.lax.PrecisionLike
+    values: jax.lax.PrecisionLike
+    logits: DTypeLike | None = None
+    weighted: DTypeLike | None = None
+
+
 def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, softcap=None, dtype=None,
                         precision=None, force_fp32_for_softmax=True, dropout_rate=0.0, dropout_seed=None,
-                        dropout_places=None, wide_logits=False, scale_logits=False, mask_fill=None):
+                        dropout_places=None, wide_logits=False, scale_logits=False, mask_fill=None,
+                        query_scale=None, logit_floor=None, skipped=None):
     """Attend over [B, S, H, D] in plain XLA ops, every score policy on one pipeline.
 
     It is flax's reference attention, op for op: the query scaled by
@@ -539,13 +557,28 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
     -0.7 times fp32's largest) and a written-out program its own (-inf, its
     dtype's least); None fills as flax does, its dtype's least, and -inf beside
     sinks.
+
+    A kernel's portable rule states its own walk (Splash's, `splash._splash_portable`, row 12848):
+    `query_scale`, the scale its query takes in place of `D ** -0.5` (1 where the query comes scaled);
+    `logit_floor`, its softmax's starting maximum (`m = max(m, floor)`, a walk's start, beneath which a
+    logit's weight underflows: a mask fill of 0 over logits of -200 weighs zero, not their mean), the sinks'
+    own where it has them; `skipped` `[H or 1, Q // b, K]`, the keys a query block of `b` rows never visits
+    (a tile a block-sparse walk skips), -inf after the mask fill and zeroed out of the keys and values each
+    block's products read, so a skipped key's non-finite value or tangent never forms `0 * NaN` (row
+    2654), a row of no weight left 0; and `precision` its two products' apart (`Products`).
     """
-    query, key, value = promote_dtype(query, key, value, dtype=dtype)
+    products = precision if isinstance(precision, Products) else Products(precision, precision)
+    scores_precision, values_precision = products.scores, products.values
+    if products.weighted is None:
+        query, key, value = promote_dtype(query, key, value, dtype=dtype)
+    else:
+        (query, key), value = promote_dtype(query, key, dtype=dtype), value.astype(products.weighted)
     dtype = query.dtype
     *rows, length, heads, width = query.shape
     kv_heads, keys = key.shape[-2], key.shape[-3]
     grouped = kv_heads != heads and value.shape[-2] == kv_heads
-    if scale_logits and sinks is None and not dropout_rate and grouped:
+    if (scale_logits and sinks is None and not dropout_rate and grouped and skipped is None
+            and query_scale is None and logit_floor is None and products.weighted is None):
         attend = functools.partial(reference_attention, softcap=softcap, precision=precision,
                                    force_fp32_for_softmax=force_fp32_for_softmax, wide_logits=wide_logits,
                                    scale_logits=True, mask_fill=mask_fill)
@@ -554,19 +587,29 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
         scaled_query, scoring = query.astype(at_least_fp32(dtype)), key.astype(at_least_fp32(dtype))
     elif scale_logits:
         scaled_query, scoring = query, key
-    else:
+    elif query_scale is None:
         scaled_query, scoring = query / jnp.sqrt(width).astype(dtype), key
+    else:
+        scaled_query, scoring = query * jnp.asarray(query_scale, dtype), key
     # jax.nn's logits are its product's fp32 sums, never rounded to the operands' dtype, at the dot algorithm
     # it names (`_jax_nn_algorithm`).
-    formed = at_least_fp32(dtype) if scale_logits else None
-    algorithm = _jax_nn_algorithm(dtype, precision) if scale_logits else None
+    formed = at_least_fp32(dtype) if scale_logits else products.logits
+    algorithm = _jax_nn_algorithm(dtype, scores_precision) if scale_logits else None
 
     def logits_of(subscripts: str, lhs: jax.Array, rhs: jax.Array) -> jax.Array:
         if algorithm is None:
-            return float32_einsum(subscripts, lhs, rhs, precision=precision, preferred_element_type=formed)
+            return float32_einsum(subscripts, lhs, rhs, precision=scores_precision,
+                                  preferred_element_type=formed)
         return jnp.einsum(subscripts, lhs, rhs, precision=algorithm, preferred_element_type=formed)
 
-    if sinks is None:
+    if skipped is not None:
+        # Each query block's products over the keys and values it visits alone (`_by_query_block`).
+        scoring, value = repeat_kv_heads(scoring, heads), repeat_kv_heads(value, heads)
+        logits = _by_query_block(
+            lambda rows_of, visited: logits_of('...qhd,...khd->...hqk', rows_of,
+                                               jnp.where(visited, scoring, jnp.zeros((), scoring.dtype))),
+            scaled_query, skipped, query_axis=-3, out_axis=-2)
+    elif sinks is None:
         scoring, value = repeat_kv_heads(scoring, heads), repeat_kv_heads(value, heads)
         logits = logits_of('...qhd,...khd->...hqk', scaled_query, scoring)
     elif kv_heads == 1:
@@ -578,28 +621,13 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
         grouped = scaled_query.reshape(*rows, length, kv_heads, heads // kv_heads, width)
         logits = logits_of('...tkgd,...skd->...kgts', grouped, scoring).reshape(*rows, heads, length, keys)
     if wide_logits or scale_logits:
-        logits = logits * width ** -0.5
+        logits = logits * (width ** -0.5 if query_scale is None else query_scale)
     if softcap is not None:
         logits = capped_logits(logits, softcap)
     if bias is not None:
         logits = logits + bias
-    if mask is not None:
-        # Beside a sink a masked key is -inf, so it weighs nothing whatever the sink's logit: the sink
-        # keeps every row's denominator finite. Without one the finite floor keeps a row every key
-        # masks a number, as flax's does.
-        if mask_fill is None:
-            mask_fill = -jnp.inf if sinks is not None else jnp.finfo(dtype).min
-        logits = jnp.where(mask, logits, mask_fill)
-    if sinks is not None:
-        if sinks.shape != (heads,):
-            raise ValueError(f"sinks must have one logit per query head, got {sinks.shape}")
-        wide = jnp.promote_types(logits.dtype, sinks.dtype)
-        weights = sink_softmax(logits, sinks, at_least_fp32(wide) if force_fp32_for_softmax else None)
-    elif force_fp32_for_softmax and dtype != jnp.float32:
-        weights = jax.nn.softmax(logits.astype(at_least_fp32(dtype)))
-    else:
-        # A bias wider than the logits widens them; the softmax runs there and its weights round after.
-        weights = jax.nn.softmax(logits).astype(dtype)
+    weights = _weights(logits, mask=mask, mask_fill=mask_fill, skipped=skipped, sinks=sinks,
+                       logit_floor=logit_floor, wide=force_fp32_for_softmax, dtype=dtype)
     if dropout_rate:
         if dropout_seed is None:
             raise ValueError("training attention dropout requires dropout_seed")
@@ -610,14 +638,103 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
         keep = template.dropout_keep(dropout_seed, dropout_rate, weights.shape, dropout_places)
         scale = jnp.asarray(1.0 / (1.0 - dropout_rate), wide)
         weights = (weights.astype(wide) * jnp.where(keep, scale, 0)).astype(dtype)
+    return _weighted(weights, value, skipped=skipped, sinks=sinks, precision=values_precision)
+
+
+def _weights(logits: jax.Array, *, mask, mask_fill, skipped, sinks, logit_floor, wide: bool, dtype
+             ) -> jax.Array:
+    """`reference_attention`'s weights of its `logits` `[..., H, Q, K]`: masked (`mask_fill`, -inf beside
+    `sinks`), a walk's `skipped` keys -inf after, then softmaxed beside the sinks, from `logit_floor`, or
+    from the row's own maximum, in fp32 at least where `wide` (`force_fp32_for_softmax`)."""
+    heads, length = logits.shape[-3], logits.shape[-2]
+    if mask is not None:
+        # Beside a sink a masked key is -inf, so it weighs nothing whatever the sink's logit: the sink
+        # keeps every row's denominator finite. Without one the finite floor keeps a row every key
+        # masks a number, as flax's does.
+        if mask_fill is None:
+            mask_fill = -jnp.inf if sinks is not None else jnp.finfo(dtype).min
+        logits = jnp.where(mask, logits, mask_fill)
+    if skipped is not None:
+        rows_per_block = length // skipped.shape[-2]
+        logits = jnp.where(jnp.repeat(skipped, rows_per_block, axis=-2), -jnp.inf, logits)
+    walked = logit_floor is not None or skipped is not None
+    if sinks is not None and sinks.shape != (heads,):
+        raise ValueError(f"sinks must have one logit per query head, got {sinks.shape}")
+    if sinks is not None and not walked:
+        widest = jnp.promote_types(logits.dtype, sinks.dtype)
+        return sink_softmax(logits, sinks, at_least_fp32(widest) if wide else None)
+    if walked:
+        # A walk's softmax: from its starting maximum (the floor, the sink beside it), a row of no weight
+        # none, never NaN, its sink's -inf and every key's (row 12848's review).
+        widest = jnp.promote_types(logits.dtype, sinks.dtype) if sinks is not None else logits.dtype
+        weights = _floored_softmax(logits.astype(at_least_fp32(widest)) if wide else logits,
+                                   -jnp.inf if logit_floor is None else logit_floor, sinks)
+        return weights if wide else weights.astype(dtype)
+    if wide and dtype != jnp.float32:
+        return jax.nn.softmax(logits.astype(at_least_fp32(dtype)))
+    # A bias wider than the logits widens them; the softmax runs there and its weights round after.
+    return jax.nn.softmax(logits).astype(dtype)
+
+
+def _weighted(weights: jax.Array, value: jax.Array, *, skipped, sinks, precision) -> jax.Array:
+    """`reference_attention`'s output: its `weights` `[..., H, Q, K]` times `value` (`[..., K, KV, Dv]`, its
+    heads repeated where it went through `repeat_kv_heads`), each query block's over the keys it visits where
+    a walk `skipped` some, grouped by key head beside `sinks` (`[..., Q, H, Dv]`)."""
+    if skipped is not None:
+        return _by_query_block(
+            lambda weights_of, visited: weighted_values(
+                '...hqk,...khd->...qhd', weights_of,
+                jnp.where(visited, value, jnp.zeros((), value.dtype)), precision=precision),
+            weights, skipped, query_axis=-2, out_axis=-3)
     if sinks is None:
         return weighted_values('...hqk,...khd->...qhd', weights, value, precision=precision)
+    *rows, heads, length, keys = weights.shape
+    kv_heads = value.shape[-2]
     if kv_heads == 1:
         return float32_einsum('...gts,...sd->...tgd', weights.astype(value.dtype), value[..., 0, :],
                               precision=precision)
     groups = weights.astype(value.dtype).reshape(*rows, kv_heads, heads // kv_heads, length, keys)
     return float32_einsum('...kgts,...skd->...tkgd', groups, value, precision=precision).reshape(
         *rows, length, heads, value.shape[-1])
+
+
+def _floored_softmax(logits: jax.Array, floor, sinks: jax.Array | None = None) -> jax.Array:
+    """The softmax of `logits` `[..., H, Q, K]` over the keys from a starting maximum `floor`
+    (`reference_attention`'s `logit_floor`) and each head's sink `[H]` beside them where given: `m = max(m,
+    floor, sink)`, each weight `exp(logit - m)` over their sum and the sink's `exp(sink - m)`, a row of no
+    weight 0, its maximum -inf shifting by none."""
+    most = jnp.maximum(jnp.max(logits, axis=-1, initial=-jnp.inf), jnp.asarray(floor, logits.dtype))
+    sink = None if sinks is None else sinks.astype(logits.dtype)[:, None]
+    if sink is not None:
+        most = jnp.maximum(most, sink)
+    shift = jnp.where(jnp.isfinite(most), most, 0.0)
+    exponentials = jnp.exp(logits - shift[..., None])
+    total = jnp.sum(exponentials, axis=-1)
+    if sink is not None:
+        total = total + jnp.where(jnp.isfinite(most), jnp.exp(sink - shift), 0.0)
+    return jnp.where(total[..., None] > 0, exponentials / jnp.where(total > 0, total, 1.0)[..., None], 0.0)
+
+
+def _by_query_block(product: Callable, operand: jax.Array, skipped: jax.Array, *, query_axis: int,
+                    out_axis: int) -> jax.Array:
+    """`product(block, visited)` over each query block of `operand` (its queries along `query_axis`, in
+    blocks of `Q // skipped.shape[-2]`), `visited` `[K, H or 1, 1]` the keys `skipped` `[H or 1, Q // b, K]`
+    leaves that block, in one scan, its blocks' outputs joined along `out_axis` (`reference_attention`'s
+    `skipped`: the keys and values zeroed a block at a time, no `[Q, K, D]` formed)."""
+    blocks = skipped.shape[-2]
+    axis = operand.ndim + query_axis
+    split = operand.reshape(*operand.shape[:axis], blocks, operand.shape[axis] // blocks,
+                            *operand.shape[axis + 1:])
+    visited = jnp.moveaxis(jnp.logical_not(skipped), -2, 0)
+
+    def step(_, pair):
+        block, seen = pair
+        return None, product(block, jnp.swapaxes(seen, 0, 1)[..., None])
+
+    _, outs = jax.lax.scan(step, None, (jnp.moveaxis(split, axis, 0), visited))
+    joined = jnp.moveaxis(outs, 0, out_axis - 1)
+    at = joined.ndim + out_axis - 1
+    return joined.reshape(*joined.shape[:at], joined.shape[at] * joined.shape[at + 1], *joined.shape[at + 2:])
 
 
 def _grouped_as_jax_nn(attend: Callable, query, key, value, mask, bias) -> jax.Array:
@@ -748,14 +865,14 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
         block_groups = image_groups = None
     if sliding_window is None:
         places = None
+    visibility = None
     if shards > 1:
         spanned = {"block_groups": block_groups, "image_groups": image_groups, "key_valid": key_valid,
                    "key_runs": key_runs, "places": places, "query_slots": query_slots}
-        causal, sliding_window, mask, key_value_seq_lengths, materialized = _sequence_sharded(
-            query.shape[-3], key.shape[-3], causal=causal, sliding_window=sliding_window, mask=mask,
-            segment_ids=segment_ids, lengths=key_value_seq_lengths, starts=key_value_seq_starts,
-            spanned=spanned)
-        if materialized:
+        causal, sliding_window, mask, key_value_seq_lengths, materialized, visibility = _sequence_sharded(
+            query, key, shards, causal=causal, sliding_window=sliding_window, mask=mask, spanned=spanned,
+            segment_ids=segment_ids, lengths=key_value_seq_lengths, starts=key_value_seq_starts)
+        if materialized or (visibility and implementation == 'cudnn'):
             implementation = kernel_for_materialized_mask(
                 implementation, query, key, dtype=dtype, precision=precision,
                 force_fp32_for_softmax=force_fp32_for_softmax, wide_logits=wide_logits)
@@ -764,17 +881,17 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
         attention_kernel, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax, implementation=implementation,
         softcap=softcap, wide_logits=wide_logits, scale_logits=scale_logits, mask_fill=mask_fill,
-        in_key=in_key)
+        in_key=in_key, max_segments=max_segments)
     if shards > 1:
         out = sequence_parallel_attention(
             kernel, query, key, value, shards, causal=causal,
             sliding_window=sliding_window, mask=mask, bias=dense_bias(bias), sinks=sinks,
             key_value_seq_lengths=key_value_seq_lengths,
-            dropout_rate=dropout_rate if dropping else 0.0, dropout_seed=words)
+            dropout_rate=dropout_rate if dropping else 0.0, dropout_seed=words, visibility=visibility)
     else:
         out = kernel(query, key, value, causal=causal, sliding_window=sliding_window,
                      mask=mask, bias=bias, sinks=sinks, segment_ids=segment_ids,
-                     max_segments=max_segments, key_value_seq_lengths=key_value_seq_lengths,
+                     key_value_seq_lengths=key_value_seq_lengths,
                      key_value_seq_starts=key_value_seq_starts, block_groups=block_groups,
                      image_groups=image_groups, key_valid=key_valid, key_runs=key_runs, places=places,
                      query_slots=query_slots, dropout_rate=dropout_rate if dropping else 0.0,
@@ -1065,11 +1182,17 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         bias = dense_bias(bias)
     call = functools.partial(
         _attention_kernel, dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
-        causal=causal, sliding_window=sliding_window, mask=mask, masked=masked, softcap=softcap,
-        segment_ids=segment_ids, max_segments=max_segments, lengths=lengths, starts=starts,
-        block_groups=block_groups, image_groups=image_groups, key_valid=key_valid, key_runs=key_runs,
-        places=places, query_slots=query_slots, dropout_rate=dropout_rate, dropout_seed=dropout_seed,
-        dropout_places=dropout_places, wide_logits=wide_logits, scale_logits=scale_logits, in_key=in_key)
+        causal=causal, sliding_window=sliding_window, softcap=softcap, max_segments=max_segments,
+        dropout_rate=dropout_rate, wide_logits=wide_logits, scale_logits=scale_logits, in_key=in_key)
+    # Every array operand (masks, segment ids, lengths, spans, dropout) passes into `forward_differentiable`
+    # as an argument, as the decode kernel passes its lengths and starts above: a closed-over integer or bool
+    # tracer stays in a nested derivative's `custom_jvp` call as a constant (M-DD-13b, and a scanned
+    # in-backward step over packed decision rows).
+    operands, operands_of = holes(
+        {"mask": mask, "masked": masked, "segment_ids": segment_ids, "lengths": lengths, "starts": starts,
+         "block_groups": block_groups, "image_groups": image_groups, "key_valid": key_valid,
+         "key_runs": key_runs, "places": places, "query_slots": query_slots, "dropout_seed": dropout_seed,
+         "dropout_places": dropout_places}, lambda leaf: isinstance(leaf, jax.Array | np.ndarray))
     live = visible_rows(query.shape[-3], key.shape[-3], causal, sliding_window, mask, segment_ids, lengths,
                         starts, block_groups=block_groups, image_groups=image_groups, key_valid=key_valid,
                         key_runs=key_runs, places=places, query_slots=query_slots)
@@ -1081,24 +1204,28 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
             # A call no derivative is taken of on the template where it measured faster, a differentiated
             # one's forward and derivatives xla's (`attention_kernels.template_infers`).
             def on(implementation):
-                def run(query, key, value, bias, sinks):
-                    return call(query, key, value, bias=bias, sinks=sinks, implementation=implementation)
+                def run(query, key, value, bias, sinks, *extra):
+                    return call(query, key, value, bias=bias, sinks=sinks, implementation=implementation,
+                                **operands_of(extra))
                 return run
 
             primal = 'template' if template_infers(query.dtype, query.shape[-1], causal) else 'xla'
-            return forward_differentiable(on(primal), on('xla'), query, key, value, bias, sinks,
+            return forward_differentiable(on(primal), on('xla'), query, key, value, bias, sinks, *operands,
                                           primal_alone=True, parameters=(3, 4))
 
-        def fused(query, key, value, bias, sinks):
-            return call(query, key, value, bias=bias, sinks=sinks, implementation=kernel, mask_fill=fill)
+        def fused(query, key, value, bias, sinks, *extra):
+            return call(query, key, value, bias=bias, sinks=sinks, implementation=kernel, mask_fill=fill,
+                        **operands_of(extra))
 
         if not FORWARD_MODE.get() or not reverse_only(kernel):
-            return fused(query, key, value, bias, sinks)
+            return fused(query, key, value, bias, sinks, *operands)
 
-        def reference(query, key, value, bias, sinks):
-            return call(query, key, value, bias=bias, sinks=sinks, implementation='reference', mask_fill=fill)
+        def reference(query, key, value, bias, sinks, *extra):
+            return call(query, key, value, bias=bias, sinks=sinks, implementation='reference',
+                        mask_fill=fill, **operands_of(extra))
 
-        return forward_differentiable(fused, reference, query, key, value, bias, sinks, parameters=(3, 4))
+        return forward_differentiable(fused, reference, query, key, value, bias, sinks, *operands,
+                                      parameters=(3, 4))
 
     if mask_fill is None:
         return _read_nothing(ran(), live)
@@ -1265,7 +1392,7 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
     # and JAX's own products by the forward's scope alone, which their tangents and transposes keep, so
     # forward mode differentiates them as written. A stated default is a floor the run's configured
     # precision meets, and a kernel that states its own keeps it.
-    if reverse_only(implementation) and not asks_default_precision(precision):
+    if reverse_only(implementation) and implementation != 'tpu' and not asks_default_precision(precision):
         return at_precision(precision, parameters=(3, 4))(fused)(query, key, value, bias, sinks)
     with configured_precision(precision):
         return fused(query, key, value, bias, sinks)
@@ -1397,31 +1524,41 @@ def resolve_implementation(implementation: AttentionImpl, query, key, *, dtype=N
     return select(DECODE, case, {'auto': None, 'cudnn': 'cudnn'}[implementation])
 
 
-def _sequence_sharded(queries: int, keys: int, *, causal, sliding_window, mask, segment_ids, lengths, starts,
+def _sequence_sharded(query, key, shards: int, *, causal, sliding_window, mask, segment_ids, lengths, starts,
                       spanned: dict):
-    """A call's visibility as the sequence exchange takes it (`sequence_parallel_attention`: its causality, a
-    window, a mask and key lengths alone): a single device's template reads block groups, key validity,
-    runs and places, and its kernels documents aligned to their last keys and the keys' starts; across
-    sequence shards each is the mask it means, its causality, window, documents, key lengths and starts
-    among them where `spanned` holds any (`visibility_mask`). The exchanges split an explicit mask along the
-    sequence and have no split for the ids, so the documents travel as the mask they stand for, causality
-    and the window folded in beside them. Returns the causality, window, mask and key lengths it takes, and
-    whether it materialized a mask its kernel must take (`kernel_for_materialized_mask`)."""
+    """A call's visibility as the sequence exchange takes it (`sequence_parallel_attention`). Where the
+    exchange passes them (`visibility_refused`, the predicate it reads too), the call's per-token ids
+    (documents, key starts, `spanned`'s block and image groups, key validity, runs, places and query slots)
+    travel as its `visibility`: whole beside the all-to-all's whole sequences, or beside the gather's whole
+    keys, each striped query reading them at its slot; no dense `[B, 1, S, S]` mask (row 1495). Elsewhere
+    (a cross call the gather takes) each id is the mask it means, its causality, window, documents, key
+    lengths and starts among them where `spanned` holds any (`visibility_mask`), and the documents travel
+    as the mask they stand for, causality and the window folded in beside them. Returns the causality,
+    window, mask and key lengths it takes, whether it materialized a mask its kernel must take
+    (`kernel_for_materialized_mask`), and the visibility ids, which a call naming cuDNN takes on that masked
+    kernel too (cuDNN takes no mask; its kernel would build one)."""
+    queries, keys = query.shape[-3], key.shape[-3]
+    ids = {name: x for name, x in {"segment_ids": segment_ids, "key_value_seq_starts": starts,
+                                   **spanned}.items() if x is not None}
+    check_rows(query.shape[0], {**ids, "key_value_seq_lengths": lengths})
+    if ids and visibility_refused(query, key, shards, ids) is None:
+        return causal, sliding_window, mask, lengths, False, ids
     if any(x is not None for x in spanned.values()):
         mask = visibility_mask(queries, keys, causal, sliding_window, mask, segment_ids, lengths, starts,
                                **spanned)
-        return False, None, mask, None, True
+        return False, None, mask, None, True, None
+    built = False
     if isinstance(segment_ids, CrossDocuments) and (causal or sliding_window is not None):
         aligned = cross_document_mask(segment_ids, causal=causal, sliding_window=sliding_window)
         mask = aligned if mask is None else jnp.logical_and(aligned, mask)
-        causal, sliding_window, segment_ids = False, None, None
+        causal, sliding_window, segment_ids, built = False, None, None, True
     if starts is not None:
-        mask = with_key_starts(mask, starts, keys)
+        mask, built = with_key_starts(mask, starts, keys), True
     if segment_ids is not None:
         documents = with_documents(mask, segment_ids)
         mask = combined_attention_mask(queries, keys, causal, sliding_window, documents)
-        return False, None, mask, lengths, True
-    return causal, sliding_window, mask, lengths, False
+        return False, None, mask, lengths, True, None
+    return causal, sliding_window, mask, lengths, built, None
 
 
 def kernel_for_materialized_mask(implementation: AttentionImpl, query, key, *, dtype=None, precision=None,

@@ -109,15 +109,6 @@ class GatedCase:
         return hook_lowers(self.hook, (tile, tile), gpu_target())
 
 
-def _paired_epilogue(hook: Callable[[jax.Array, jax.Array], jax.Array], dtype: jnp.dtype):
-    """Paired gate+up epilogue returning cast `(gate, up, hook(gate, up))`."""
-    def projected(gate_acc, up_acc):
-        gate_out, up_out = gate_acc.astype(dtype), up_acc.astype(dtype)
-        return gate_out, up_out, hook(gate_out, up_out)
-
-    return projected
-
-
 def _grouped_stack(matrix: jax.ShapeDtypeStruct, dtype: jnp.dtype,
                    layered: bool) -> jax.ShapeDtypeStruct | None:
     """Flatten a 4D stacked expert bank `[layers, experts, in, out]` to 3D when `layered`, or keep 3D."""
@@ -159,7 +150,7 @@ def _grouped_launched(rows: jax.ShapeDtypeStruct, gate: jax.ShapeDtypeStruct, do
 
     def pair_name(lhs: jax.ShapeDtypeStruct, table: jax.ShapeDtypeStruct | None) -> str:
         call, product = gemm._gemm_call(
-            lhs, gate_3d, sizes, None, (), (), _paired_epilogue(hook, dtype), (), (), (dtype,) * 3,
+            lhs, gate_3d, sizes, None, (), (), activations.rounded_gated(hook, dtype), (), (), (dtype,) * 3,
             several=True, transpose_rhs=False, interpret=False, precision=precision, dense=False,
             paired=gate_3d, first=first, gather=table, scatter=None, summed_as=())
         return selected_name(call, product)
@@ -380,7 +371,7 @@ def fused_products(rows: jax.Array, kernels: tuple[jax.Array, jax.Array, jax.Arr
     dtype = rows.dtype
     hook = activations.gated_hook(activation, limit)
     gate, up, hidden = gemm.gemm(rows, kernels[0], paired=kernels[1],
-                                 epilogue=_paired_epilogue(hook, dtype), out_dtype=dtype,
+                                 epilogue=activations.rounded_gated(hook, dtype), out_dtype=dtype,
                                  out_dtypes=(dtype,) * 3, precision=precision,
                                  interpret_on_cpu=interpret_on_cpu)
     if names is not None:

@@ -156,7 +156,7 @@ def _deferred(label: str, error: BaseException, frames: list[tuple[str, int]],
     (`tried_before`, its store's sites tried before the cell, `_tried`), where nothing computes. A cell that
     tried no site before it raised, or one its check's prepare did not finish whole (a trace or a compile that
     raised, an arm's after its site's truths were written: `truths_ahead.CompiledTruths.preparing`), computed
-    past or failed within the programs its prepare holds, and is recorded deferred (`truths_ahead.DEFERRED`,
+    past or failed within the programs its prepare holds, and is recorded deferred (`tier_wire.DEFERRED`,
     where it raised and why), its run computing and judging it with the flow's other cells served by the store
     and naming the test unprepared (tests/conftest.py); one whose every site it began its prepare finished,
     and then raised, checked what its prepare gives in their place (`CompiledTruths.judged_its_zeros`, a
@@ -167,15 +167,31 @@ def _deferred(label: str, error: BaseException, frames: list[tuple[str, int]],
     import os
 
     import store_wire
+    import tier_wire
     import truths_ahead
 
     store = store_wire.COMPILED.get()
     if not store.judged_its_zeros(error, tried_before):
         test = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0]
         truths_ahead.unprepared(store.directory, test, frames[::-1], f"{label}: {_raised(error)[:400]}",
-                                truths_ahead.DEFERRED)
+                                tier_wire.DEFERRED, cell=label)
         print(f"cell deferred to its run: {label}", flush=True)
     return True
+
+
+def _capped(label: str) -> None:
+    """A flow's cell its prepare's cap left (`tier_wire.past_cap`): recorded deferred to its run
+    (`tier_wire.DEFERRED`), where `tier_wire.CAPPED`, so its row names it unprepared and is no red for it."""
+    import os
+
+    import store_wire
+    import tier_wire
+    import truths_ahead
+
+    test = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0]
+    truths_ahead.reasoned(store_wire.COMPILED.get().directory / tier_wire.DEFERRED, test, tier_wire.CAPPED,
+                          f"{label}: {tier_wire.capped('the cell')}", label)
+    print(f"cell deferred to its run by its prepare's cap: {label}", flush=True)
 
 
 def run_cells(cells: Iterable[Cell]) -> list[str]:
@@ -203,6 +219,12 @@ def run_cells(cells: Iterable[Cell]) -> list[str]:
             if preparing and cell.at_run is not None:
                 # Nothing of it to compile ahead (`Cell.at_run`): its run runs it, as a deferred cell's.
                 print(f"cell compiles at its run: {cell.label}: {cell.at_run}", flush=True)
+                deferred += 1
+                continue
+            if preparing and tier_wire.past_cap():
+                # Past its prepare's cap (`tier_wire.PREPARE_BY`): deferred to its run, named unprepared, as a
+                # cell its prepare could not prepare; the cells prepared before it kept.
+                _capped(cell.label)
                 deferred += 1
                 continue
             print(f"cell: {cell.label}", flush=True)
@@ -307,9 +329,12 @@ def cells_of(check, generation: str | None = None, *, native: Callable[..., Mapp
         under = generation
         if under is None and hasattr(check, "covers"):
             under = check.covers(**arguments).get("generation")
+        # A check marked to compile at its run (`compiles_at_run`, no check-1 site) is a cell its prepare
+        # passes by (`Cell.at_run`), as tests/conftest.py passes such a test.
+        at_run = next((mark.kwargs["reason"] for mark in marks if mark.name == "compiles_at_run"), None)
         cells.append(Cell(f"{name}: {label}" if label else name, run, under,
                           native=dict(native(**given)) if native else {},
-                          fault=fault(**given) if fault else None))
+                          fault=fault(**given) if fault else None, at_run=at_run))
     return cells
 
 
@@ -357,6 +382,13 @@ def when(holds: bool, reason: str, check: Callable[[], None]) -> Callable[[], No
             pytest.skip(reason)
         check()
     return run
+
+
+def on_two_gpus(check: Callable[[], None]) -> Callable[[], None]:
+    """`check` where this process sees two GPUs, else skipped (`when`): a two-GPU flow's cell."""
+    import jax
+
+    return when(jax.default_backend() == "gpu" and jax.device_count() >= 2, "needs two GPUs", check)
 
 
 def isolated(tmp_path_factory) -> Callable[..., Callable[[], None]]:

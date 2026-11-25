@@ -14,8 +14,9 @@ Reference: gemma bf0b49901a428d13e9c2b2629f0eb9c153d3cbd3,
 
 from __future__ import annotations
 
+import functools
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Literal
 
 import jax
@@ -43,6 +44,7 @@ from dew.batch import (
 )
 from dew.inference.tasks import BlockGeneration, BlockSettings, processor_settings
 from dew.inputs import Field, InputSpec
+from dew.nn.dense import NVFP4_AMAX
 from dew.nn.inputs import ModelInputs
 from dew.nn.inspection import INSPECTED, QK
 from dew.nn.precision import at_least_fp32, weighted_total
@@ -70,6 +72,11 @@ if TYPE_CHECKING:
     from dew.inference.tasks import Processor
     from dew.nn.backbones.decoder_stack import DecoderBank
     from dew.nn.diffusion_gemma import DiffusionGemma
+
+
+type Observed = tuple[Variables | None, Variables | None, Variables | None]
+"""What a step's scoring observed (`Step.observed`'s): the attention logit maxima, the watched activations
+and the projections' recorded largest magnitudes, each None where the step asked for none."""
 
 
 @struct.dataclass
@@ -309,9 +316,9 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
         return self.model.init(key, jnp.zeros((1, self.canvas_size), jnp.int32))
 
     def loss(self, variables: Variables, batch: Batch, step: Step):
-        stats, _, (qk, inspected) = self._scored(variables, batch, step, train=step.training)
+        stats, _, (qk, inspected, amax) = self._scored(variables, batch, step, train=step.training)
         return stats, Aux(metrics={"canvas_ce": stats.canvas, "encoder_ce": stats.encoder}, qk_stats=qk,
-                          inspected=inspected)
+                          inspected=inspected, amax=amax)
 
     def _evaluation_scores(self, params: Variables, batch: Batch, step: Step) -> TokenScores:
         """Return the denoiser's cross entropy on every canvas target of the batch.
@@ -330,10 +337,10 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
         return stats, scores
 
     def _scored(self, params: Variables, batch: Batch, step: Step, *, train: bool
-                ) -> tuple[BlockSFTStatistics, TokenScores | None, tuple[Variables | None, Variables | None]]:
-        """The SFT statistics, out of training the canvas targets' scores, and the attention logit maxima
-        and watched activations the step asks for (`Step.qk_stats`, `Step.watched`, else None), from one
-        scoring of the batch."""
+                ) -> tuple[BlockSFTStatistics, TokenScores | None, Observed]:
+        """The SFT statistics, out of training the canvas targets' scores, and the attention logit maxima,
+        watched activations and recorded largest magnitudes the step asks for (`Step.qk_stats`,
+        `Step.watched`, `Step.amax`, else None), from one scoring of the batch."""
         canvas_losses, target_mask, encoder_losses, encoder_target_mask, correct, sown = self._token_losses(
             params, batch, step, train=train)
         support = (
@@ -444,7 +451,7 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
 
     def _token_losses(self, params: Variables, batch: Batch, step: Step, *, train: bool
                       ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array | None,
-                                 tuple[Variables | None, Variables | None]]:
+                                 Observed]:
         """Score both SFT passes over one batch.
 
         Returns the denoiser's per-token cross entropies over the response
@@ -509,6 +516,10 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
         qk = None
         if step.qk_stats:
             qk = sows_appended(sows_appended(mutated[QK], first_sown[QK]), second_sown[QK])
+        # The projections' largest magnitudes over every pass that ran them, the conditioning pass's among
+        # them, as the maxima are (row 12721).
+        records: list[Mapping] = [held.get(NVFP4_AMAX) or {} for held in (mutated, first_sown, second_sown)]
+        amax = functools.reduce(sows_appended, records, {}) if step.amax else None
         # The encoder's pass and the denoiser's that carries the gradient, as the step watches them.
         inspected = None if step.watched is None else {
             "encoder": mutated.get(INSPECTED, {}), "denoiser": second_sown.get(INSPECTED, {})}
@@ -522,7 +533,7 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
                                                              at_least_fp32(encoder_states.dtype))
         encoder_losses, _, _ = self.head_terms(model, params, encoder_states, shifted, predict=False)
         correct = None if predicted is None else predicted == response
-        return canvas_losses, target_mask, encoder_losses, encoder_target_mask, correct, (qk, inspected)
+        return canvas_losses, target_mask, encoder_losses, encoder_target_mask, correct, (qk, inspected, amax)
 
     def reduce_loss(self, stats: BlockSFTStatistics):
         canvas, _ = stats.canvas.mean()

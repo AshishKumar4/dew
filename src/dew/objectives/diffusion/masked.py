@@ -257,8 +257,8 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
             statistics, effects, metrics = self.balance.compose(
                 params, prediction, routing, batch, queries, fields)
             reported.update(metrics)
-        qk, inspected = step.observed(sown)
-        aux = Aux(metrics=reported, qk_stats=qk, effects=effects, inspected=inspected)
+        qk, inspected, amax = step.observed(sown)
+        aux = Aux(metrics=reported, qk_stats=qk, effects=effects, inspected=inspected, amax=amax)
         return statistics, aux, TokenScores(losses * weights, real.astype(losses.dtype), correct)
 
     def _token_losses(self, params, batch, step: Step, *, train: bool):

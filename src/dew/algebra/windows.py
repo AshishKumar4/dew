@@ -354,7 +354,7 @@ def _windows(summands_of, chunks: int, axes: list[tuple[int, ...]], bits: list[i
     its summands' largest exponent beneath the windows before it, and their magnitudes' sum there, the power
     of two that puts that sum a binade beneath the format's largest, so no partial sum passes the format),
     the second summing those it keeps normal there (`_summing`), the window joined to those before
-    (`_joined`). Another window follows wherever summands lie beneath it within a double float's reach of
+    (`joined`). Another window follows wherever summands lie beneath it within a double float's reach of
     the sum so far (`bits`: their count's headroom), or the sum so far is zero, so a band that cancels never
     drops the bands beneath it, however far (`[1, -1, 1, -1, 1]` at anchors `[1000, 1000, 200, 200, 0]` sums
     to `1`, the merge P0's base review 13, F2: two bands, it was 0). A row the windows have resolved takes
@@ -389,7 +389,7 @@ def _windows(summands_of, chunks: int, axes: list[tuple[int, ...]], bits: list[i
         made, below = [], []
         for total, top, (held, error, low, under) in zip(totals, tops, summed, strict=True):
             high, rest = two_sum(held, low + error)
-            made.append(_joined(total, (high, rest, top - placement)))
+            made.append(joined(total, (high, rest, top - placement)))
             below.append(under)
         # A sum's ceiling only falls: one whose window found no summand beneath it keeps its own, where its
         # empty window's top raised it and a window after read the summands it had summed again (`2^-120`
@@ -551,18 +551,20 @@ def _folded(operation: Callable, values: list):
     return values[0]
 
 
-def _joined(a, b):
+def joined(a, b):
     """Two double floats at powers of two (`_streamed`'s bands) summed, `(high, low, exponent)`: each moved to
     the larger's power (exact, or beneath the larger's `u^2`), one compensated step of the two
     (`scaled.compensated_pair`: their high parts' sum exact, its error carried with their low parts), then
-    renormalized (`two_sum`); a zero sum where both are."""
+    renormalized (`two_sum`); a zero sum where both are. Which is live its high part's presence says, no
+    exponent a sentinel: a live one at any int32 exponent is joined as itself."""
     a, b = _normal(*a), _normal(*b)
-    exponents = [jnp.where(high != 0, exponent, _NONE) for high, _, exponent in (a, b)]
-    top = jnp.maximum(*exponents)
-    moved = [(power2(high, exponent - top, reach=_REACH), power2(low, exponent - top, reach=_REACH))
-             for (high, low, _), exponent in zip((a, b), exponents, strict=True)]
+    live = [high != 0 for high, _, _ in (a, b)]
+    top = jnp.where(live[0] & live[1], jnp.maximum(a[2], b[2]), jnp.where(live[0], a[2], b[2]))
+    moved = [tuple(jnp.where(alive, power2(part, jnp.where(alive, exponent - top, 0), reach=_REACH),
+                             jnp.where(live[0] | live[1], 0, part)) for part in (high, low))
+             for (high, low, exponent), alive in zip((a, b), live, strict=True)]
     high, low = two_sum(*scaled.compensated_pair(*moved[0], *moved[1]))
-    return high, low, jnp.where(top == _NONE, 0, top)
+    return high, low, jnp.where(live[0] | live[1], top, 0)
 
 
 def _normal(high, low, exponent):

@@ -487,7 +487,9 @@ def _static_equation(equation, picked: frozenset = frozenset()) -> bool:
     steps alone: 1,083 s on a GH200 at 21% busy, row 7096), nor every step unrolled into the program (a
     token scan's 64 steps and their adjoint's took 128 s of XLA's CPU compile, row 6004)."""
     primitive = equation.primitive
-    if primitive is jax.lax.while_p or (primitive is jax.lax.cond_p and equation.invars[0] not in picked):
+    if primitive is jax.lax.while_p or (
+            primitive is jax.lax.cond_p and equation.params.get("branches_platforms") is None
+            and equation.invars[0] not in picked):
         return False
     return all(static(body) for body in programs.bodies(equation))
 
@@ -656,9 +658,11 @@ def _applied(equation, inputs, given, wanted: bool, compiling: bool = False, rul
     walked = wanted or rule is not None
     if walked and body is not None:
         return evaluated(*body, inputs, given, compiling, rule, used)
-    # A branch picks by its selector alone: one known (a platform's, `_platform`) walks its branch beside
-    # traced operands, never every dead one (a platform's other branches, primitives no rule evaluates).
-    picking = inputs[:1] if primitive is jax.lax.cond_p else inputs
+    # A branch picks by its selector alone: one known (a platform's, `_platform` or `branches_platforms`)
+    # walks its branch beside traced operands, never every dead one (a platform's other branches, primitives
+    # no rule evaluates).
+    platforms = params.get("branches_platforms") if primitive is jax.lax.cond_p else None
+    picking = () if platforms is not None else inputs[:1] if primitive is jax.lax.cond_p else inputs
     if rule is not None and programs.control_flow(primitive) and _traced_values(picking):
         # Traced, its values pick no branch and bound no Python loop: the primitive itself over walked bodies.
         outputs = _bound_walk(equation, inputs, rule, used)
@@ -675,7 +679,9 @@ def _applied(equation, inputs, given, wanted: bool, compiling: bool = False, rul
     if walked and primitive is primitives.shard_map_p:
         return _mapped(equation, inputs, given, rule)
     if walked and primitive is jax.lax.cond_p:
-        branch = programs.branches(equation)[int(inputs[0])]
+        chosen = (programs.platform_branch(platforms, programs.lowering_platform(_placed()))
+                  if platforms is not None else int(inputs[0]))
+        branch = programs.branches(equation)[chosen]
         return evaluated(branch.jaxpr, branch.consts, inputs[1:], given[1:], compiling, rule, used)
     if rule is not None:
         outputs = rule.primitive(equation, inputs)

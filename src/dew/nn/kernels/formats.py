@@ -341,16 +341,34 @@ class NvFp4Block:
     scale: jax.Array
 
     @classmethod
-    def quantized(cls, x: jax.Array) -> "NvFp4Block":
+    def quantized(cls, x: jax.Array, tensor_scale: jax.Array | None = None) -> "NvFp4Block":
         """`x` (`[..., depth]`) as NVFP4 along its depth, `bits.nvfp4_quantized`'s rule (one tensor scale,
         its largest magnitude over 6 x 448; each block's the least E4M3 at or above its largest magnitude
         over 6 times it; each value rounded to E2M1, ties to even), at the operand's width (`at_least_fp32`:
-        a float64 truth's float32 values quantize to the same operand)."""
+        a float64 truth's float32 values quantize to the same operand). `tensor_scale`, the tensor scale in
+        place of `x`'s own (a delayed-scaling recipe's, `bits.nvfp4_coded`'s `tensor`, row 12721)."""
         x = jnp.asarray(x)
         x = x.astype(at_least_fp32(x.dtype))
-        codes, scales, scale = bits.nvfp4_coded(x.reshape(-1, x.shape[-1]).T)
+        codes, scales, scale = bits.nvfp4_coded(x.reshape(-1, x.shape[-1]).T, tensor_scale)
         values = _e2m1_values(codes.T).reshape(x.shape).astype(jnp.float4_e2m1fn)
         return cls(values, scales.T.reshape(*x.shape[:-1], -1), scale)
+
+    @classmethod
+    def encoded(cls, codes: jax.Array, scales: jax.Array, scale: jax.Array) -> "NvFp4Block":
+        """An operand of E2M1 `codes` one a byte (uint8 codes of `bits.nvfp4_coded`'s rule, as a GEMM
+        epilogue stores them: `quantized.nvfp4_epilogue`), its block `scales` and tensor `scale`: each code's
+        value as float4, which XLA packs two a byte (row 12721; packed 4-bit stores of its own, row 12743);
+        its tensor scale one scalar (`bits.nvfp4_given_scale`)."""
+        return cls(_e2m1_values(codes).astype(jnp.float4_e2m1fn), scales, bits.nvfp4_given_scale(scale))
+
+    @classmethod
+    def packed(cls, codes: jax.Array, scales: jax.Array, scale: jax.Array) -> "NvFp4Block":
+        """An operand of E2M1 `codes` two a byte (`[..., depth / 2]` uint8, the even depth's in its low
+        nibble, as a GEMM epilogue stores them packed: `quantized.Form`'s `packed`, row 12743), its block
+        `scales` and tensor `scale` (one scalar, `bits.nvfp4_given_scale`): the bytes read as the float4
+        codes they hold, no pass over them."""
+        values = jax.lax.bitcast_convert_type(codes, jnp.float4_e2m1fn)
+        return cls(values.reshape(*codes.shape[:-1], -1), scales, bits.nvfp4_given_scale(scale))
 
     @classmethod
     def of(cls, matrix: NvFp4) -> "NvFp4Block":

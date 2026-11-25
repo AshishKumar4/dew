@@ -225,9 +225,9 @@ def reported_window(report: Callable[[Record, int], None], note: Callable[[str],
                     error: BaseException | None) -> BaseException | None:
     """Report a fit's window that stopped, `profiled` its steps traced, the step it stopped at and the
     directory its capture is in, once every rank's export is written and the pool agreed the run's
-    outcome (`Trainer._reported_outcome`), whatever that outcome: its record (`report`) and its note on
-    process zero (`note`). Returns the run's `error`, or a failed report as the error of a run that had
-    none, noted on one that had."""
+    outcome (`dew.training._written.reported_outcome`), whatever that outcome: its record (`report`) and
+    its note on process zero (`note`). Returns the run's `error`, or a failed report as the error of a run
+    that had none, noted on one that had."""
     if profiled is None:
         return error
     traced, step, directory, program = profiled

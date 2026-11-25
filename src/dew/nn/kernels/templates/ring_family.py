@@ -69,6 +69,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     selects_sources = True
     takes_pingpong = True
     walks_once = True
+    stores_narrowed = True
     # Mosaic GPU's default for a warpgroup (its CompilerParams' 128 x 4 x 4 bytes).
     warpgroup_reduction_scratch = 2048
     stores_through_registers = False
@@ -252,7 +253,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                 raise ValueError("a scattered output's rows land a row at a time as computed, no write of "
                                  "its own")
             staged_chunks(smems[output].at[index], value, ref, place, write=form.write or self.written,
-                          divisor=form.divisor, transposed=form.transposed)
+                          divisor=form.divisor, transposed=form.transposed, narrowed=form.narrowed)
 
         return store
 

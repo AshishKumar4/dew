@@ -31,6 +31,8 @@ def task_arguments(running: argparse.ArgumentParser, pythons: Sequence[str], dea
         help="the plan's DEW_TEST_CACHE (`policy`): on, cold (looked up, run cold), or off")
     running.add_argument("--census", choices=("0", "1"), default="0",
                          help="the plan's census: 1 runs the tests under check 1's CENSUS, recording no row")
+    running.add_argument("--main", default=None,
+                         help="the plan's main commit (ci.py's `mainline`), which a task's checkout lacks")
     running.add_argument("--deadline", type=float, default=deadline,
                          help="seconds before armada's own task timeout (.armada.json) to interrupt at")
     running.add_argument("--coverage", type=Path, default=None,

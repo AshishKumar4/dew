@@ -122,8 +122,15 @@ class Tiles:
             family.output_staging((), self.warpgroups, staging)
         except ValueError as refused:
             return str(refused)
+        columns, piece = self.issued(family)
+        return stores.staging_refusal(columns, (), staging, piece=piece)
+
+    def issued(self, family) -> tuple[int, int]:
+        """This tile's output columns on `family` (a pair's both where its products span it) and those its
+        issuer reads out of its accumulators at once (`mosaic.Issuer.chunk_columns`: tcgen05's 64 of tensor
+        memory, a register accumulator's all): what a staged chunk divides."""
         columns = self.block_n * (self.cluster if family.pairs_product else 1)
-        return stores.staging_refusal(columns, (), staging, piece=family.chunk_columns(columns))
+        return columns, family.chunk_columns(columns)
 
     def stated(self, outputs, family) -> tuple[int, int] | None:
         """The output staging this tile states for a kernel storing `outputs` (`(shape, dtype)` each, or
@@ -147,8 +154,7 @@ class Tiles:
         unit = math.lcm(ACCUMULATOR_COLUMNS, family.atom_columns)
         if self.staging[0] % unit:
             return f"a stated chunk of {self.staging[0]} columns slices the accumulator's {unit}-column atoms"
-        columns = self.block_n * (self.cluster if family.pairs_product else 1)
-        piece = family.chunk_columns(columns)
+        columns, piece = self.issued(family)
         forms = [each for each in dtypes if isinstance(each, (stores.Output, tuple))]
         if not forms:
             return stores.staging_refusal(columns, dtypes, self.staging, piece=piece)

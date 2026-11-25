@@ -126,7 +126,7 @@ from dew.checkpoints._state_trees import (
     _variable_trees,
     _with,
     _with_ema_deltas,
-    decodes_done,
+    ahead_done,
 )
 from dew.checkpoints._step_records import counted_processes, gather_positions, read_position, step_record
 from dew.checkpoints.averaging import (
@@ -1161,11 +1161,6 @@ class Checkpoints:
         the run to (`dew.training.startup.computation_differs`); None for a step saved outside `fit` or before
         Dew recorded it."""
         return json_value(self._custom_of(step).get('training'), 'training')
-
-    def saved_with(self, step: int, key: str) -> JSON:
-        """What `step` was saved with under `key` among its custom metadata, None where it holds none: the
-        local step's as its process holds it, a committed one's from the persistent directory."""
-        return json_value(self._custom_of(step).get(key), key)
 
     def control(self, step: int) -> dict:
         if step != self._local_latest():
@@ -2476,7 +2471,7 @@ class Checkpoints:
         cut = ([] if self._manager is None else [("Checkpoint projection", self._project)])
         cut.append(("Checkpoint deletion", self._deleted))
         return [*(("Checkpoint wait", writer.wait_until_finished) for writer in opened),
-                ("Checkpoint restore decodes", decodes_done), *cut,
+                ("Checkpoint compiles ahead", ahead_done), *cut,
                 ("Checkpoint detach", detached), *(("Checkpoint close", writer.close) for writer in opened)]
 
     def wait(self) -> None:
@@ -2488,6 +2483,6 @@ class Checkpoints:
         with region("checkpoint.wait"):
             attempted([*(("Checkpoint wait", writer.wait_until_finished)
                          for writer in (self._manager, self._local_manager) if writer is not None),
-                       ("Checkpoint restore decodes", decodes_done)])
+                       ("Checkpoint compiles ahead", ahead_done)])
             self._pending = None
             self._project()

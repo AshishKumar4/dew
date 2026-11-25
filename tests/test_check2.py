@@ -1415,13 +1415,18 @@ def test_the_recurrence_step_witness_holds_a_decay_a_key_dimension_and_refuses_o
 
 
 @INTERPRETS
-@pytest.mark.parametrize("dtype", [None, jnp.float32], ids=["bf16 clamped", "fp32 compensated"])
-def test_the_recurrence_step_witness_holds_an_unbounded_steep_column(dtype):
+@pytest.mark.parametrize(("dtype", "part"), [
+    pytest.param(None, "forward", id="bf16 clamped"),
+    pytest.param(None, "backward", id="bf16 clamped backward"),
+    pytest.param(jnp.float32, "forward", id="fp32 compensated"),
+])
+def test_the_recurrence_step_witness_holds_an_unbounded_steep_column(dtype, part):
     """The step witness (row 2084 (e)) under a decay a key dimension no bound declares, one key dimension of
     one token a chunk at -2^26 beside mild ones (`rw.assert_clamped_key_decays_witnessed`): every record of a
     call of three chunks inside its step's enclosure, a bf16 call's fast backward's too, its decays clamped
-    before its rounded prefix; an fp32 call's forward, its prefix the compensated pair (row 12067)."""
-    rw.assert_clamped_key_decays_witnessed(rw.interpreted_lane(), dtype=dtype)
+    before its rounded prefix; an fp32 call's forward, its prefix the compensated pair (row 12067). The bf16
+    call's forward and backward a case each (together 133 s, row 12636)."""
+    rw.assert_clamped_key_decays_witnessed(rw.interpreted_lane(), dtype=dtype, part=part)
 
 
 @INTERPRETS

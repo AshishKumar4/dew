@@ -47,7 +47,7 @@ from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, sequence_blocks
-from dew.nn.kernels import chunked_launch, recurrence_algebra, recurrence_chunk
+from dew.nn.kernels import chunked_launch, recurrence_algebra, recurrence_chunk, recurrence_forked
 from dew.nn.kv_cache import Opened, compute_dtype
 from dew.nn.linear import (
     DepthwiseConv1d,
@@ -177,9 +177,9 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
         h, table = carried
         step, load, store = step
         # A chunk that takes a document up enters its table slot's state; each row's documents in turn.
-        taken = jax.vmap(recurrence_chunk.table_read)(given, table, load)
+        taken = jax.vmap(recurrence_forked.table_read)(given, table, load)
         after, read = scanned(jnp.where((load >= 0)[:, None, None], taken, h), step)
-        return (after, jax.vmap(recurrence_chunk.table_stored)(table, store, after)), read
+        return (after, jax.vmap(recurrence_forked.table_stored)(table, store, after)), read
 
     table = jnp.zeros((batch, forked.held, *given.shape[2:]), work)
     (last, _), out = jax.lax.scan(loading, (jnp.zeros_like(given[:, 0]), table),

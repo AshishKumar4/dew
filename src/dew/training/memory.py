@@ -750,12 +750,15 @@ def step_room(device, resident: int = 0) -> int | None:
 
 
 def resident_on(*trees: TrainState | Batch) -> dict[Hashable, int]:
-    """The bytes the arrays of `trees` hold on each device of this process now, by device: a placed state's
-    and batch's shards, read before they are abstracted to the shapes a step is lowered over
-    (`dew.training._candidates`); an abstract, host or donated leaf holds none."""
+    """The bytes the arrays of `trees` hold in each device of this process's own memory now, by device: a
+    placed state's and batch's shards, read before they are abstracted to the shapes a step is lowered over
+    (`dew.training._candidates`); an abstract, host or donated leaf holds none, nor one placed in its host's
+    memory (`Layout(host=...)`'s pinned banks), which no allocator of the device holds (row 12883: counted,
+    a host-offloaded run's limit gave back bytes its device never held)."""
     held: dict[Hashable, int] = {}
     for leaf in jax.tree.leaves(trees):
-        if isinstance(leaf, jax.Array) and not leaf.is_deleted():
+        if (isinstance(leaf, jax.Array) and not leaf.is_deleted()
+                and (leaf.sharding.memory_kind or "device") == "device"):
             for shard in leaf.addressable_shards:
                 held[shard.device] = held.get(shard.device, 0) + shard.data.nbytes
     return held
@@ -897,12 +900,26 @@ class LiveSet:
         return LiveSet(scaled, unknown, tuple(made))
 
     def forward_bytes(self, dropped: Callable[[str, tuple[str, ...]], bool]) -> int:
-        """The bytes of the values its step's forward made (its op name's first scope under the step a
-        `jvp(`) that `dropped` (an op name and the names its value carries) says a rung would not keep: those
-        a backward reads, never the backward's own temporaries, which recomputation does not free."""
+        """The bytes of the values its step's forward made (its op name's first scope under the step and the
+        control flow it runs in a `jvp(`: a replayed window's forward inside its conditional and loop
+        among them, row 12884) that `dropped` (an op name and the names its value carries) says a rung would
+        not keep: those a backward reads, never the backward's own temporaries, which recomputation does not
+        free."""
         return sum(size for size, op_name, names in self.made
-                   if op_name.split("/")[1:2] and op_name.split("/")[1].startswith("jvp(")
-                   and dropped(op_name, names))
+                   if forward_made(op_name) and dropped(op_name, names))
+
+
+CONTROL_SCOPES = re.compile(r"cond|while|body|body_fun|cond_fun|branch_\d+_fun")
+"""The scopes JAX names a step's control flow by in an op's name (`jax.lax.cond`'s branches, a loop's body
+and condition), under which a replayed window's forward stands (`Transaction.step`'s replay)."""
+
+
+def forward_made(op_name: str) -> bool:
+    """Whether the op `op_name` names was made by a step's forward: its first scope under the step's own and
+    the control flow it runs in (`CONTROL_SCOPES`) a `jvp(`, where a backward's is a `transpose(`."""
+    scopes = op_name.split("/")[1:]
+    first = next((scope for scope in scopes if not CONTROL_SCOPES.fullmatch(scope)), "")
+    return first.startswith("jvp(")
 
 
 def fits_everywhere(read: Callable[[], int | None]) -> tuple[bool, int | None]:

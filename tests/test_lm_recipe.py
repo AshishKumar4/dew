@@ -261,9 +261,12 @@ def recipe_run(kind, tokens, *args, model_config="{}", objective=None, objective
                     default=tiny(default, model_config, objective, objective_fields))
 
 
-def pretrained_config(tokens, pretrained, *args, model_config="{}"):
+def pretrained_config(tokens, pretrained, *args, model_config="{}", **fields):
+    """An LM run over the `pretrained` checkpoint from the recipe's command line, `fields` its stated
+    choices beside its data (a run's `loop`, which no flag states)."""
     return recipe_run(LMRunConfig, tokens, "--pretrained", str(pretrained), *args, model_config=model_config,
-                      default=LMRunConfig(data=windows(tokens), validation=windows(tokens, held=True)))
+                      default=LMRunConfig(data=windows(tokens), validation=windows(tokens, held=True),
+                                          pretrained=str(pretrained), **fields))
 
 
 @attending("reference")
@@ -888,44 +891,47 @@ def test_a_trained_block_diffusion_tree_saves_back_over_its_source(tmp_path):
 
 
 def test_a_pretrained_run_loops_its_decoder_as_a_decision_run_does(tmp_path):
-    """`--loop-steps 2 --loop-layers 0 1` give a --pretrained decoder with no loop one over its own
-    block, as they do a decision run's (`DecoderRunConfig`): the objective trains the looped decoder
-    over the checkpoint's weights as they were, and the run's record holds the loop, which a resume
-    takes again. A fresh decoder's run refuses them: its model states its own loop."""
+    """A run's loop (`DecoderRunConfig.loop`) gives a --pretrained decoder with no loop one over its own
+    block, as it does a decision run's: the objective trains the looped decoder over the checkpoint's
+    weights as they were, and the run's record holds the loop, which a resume takes again. A fresh decoder's
+    run refuses it: its model states its own loop."""
     from dew.interop import Pretrained
     from dew.nn.backbones.decoder_stack import Loop
 
+    loop = Loop(2, step_norm=False, layers=(0, 1))
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
     checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
     config = recipe_run(Started, tokens, "--pretrained", str(checkpoint), "--trainer.steps", "1",
-                        "--max-new-tokens", "0", "--loop-steps", "2", "--loop-layers", "0", "1",
-                        default=Started(data=windows(tokens), validation=windows(tokens, held=True)))
+                        "--max-new-tokens", "0",
+                        default=Started(data=windows(tokens), validation=windows(tokens, held=True),
+                                        pretrained=str(checkpoint), loop=loop))
     objective = config.prepare().train("looped")
-    assert objective.model.loop == Loop(2, step_norm=False, layers=(0, 1))
+    assert objective.model.loop == loop
     loaded = Pretrained.load(checkpoint, dtype="float32")
     for mine, theirs in zip(jax.tree.leaves(objective.held_variables()["params"]),
                             jax.tree.leaves(loaded.variables["params"]), strict=True):
         np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
-    recorded = LMRunConfig.from_dict(config.to_dict())
-    assert (recorded.loop_steps, recorded.loop_layers) == (2, (0, 1))
+    assert LMRunConfig.from_dict(config.to_dict()).loop == loop
     with pytest.raises(ValueError):
-        LMRunConfig(loop_steps=2)
+        LMRunConfig(loop=loop)
 
 
 def test_a_pretrained_run_trains_the_exit_gate_its_loop_draws_in_its_fresh_group(tmp_path):
-    """`--loop-exit-gate` gives a --pretrained decoder a gate its checkpoint holds none of, drawn fresh
-    (`Pretrained.with_model`): the LM objective names it among what it trains fresh (`fresh_modules`, the
-    source's `Pretrained.fresh`), so the run records a fresh group that claims the gate alone, ahead of
-    the base that holds the checkpoint's weights (the train review of trains 707-732: an LM run trained
-    its fresh parameters at the base rate)."""
+    """A run's loop with an exit gate (`DecoderRunConfig.loop`, `Loop.exit_gate`) gives a --pretrained
+    decoder a gate its checkpoint holds none of, drawn fresh (`Pretrained.with_model`): the LM objective
+    names it among what it trains fresh (`fresh_modules`, the source's `Pretrained.fresh`), so the run
+    records a fresh group that claims the gate alone, ahead of the base that holds the checkpoint's weights
+    (the train review of trains 707-732: an LM run trained its fresh parameters at the base rate)."""
+    from dew.nn.backbones.decoder_stack import Loop
     from dew.optim import param_labels, parameter_name
 
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
     checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
     config = recipe_run(Started, tokens, "--pretrained", str(checkpoint), "--trainer.steps", "1",
-                        "--max-new-tokens", "0", "--loop-steps", "2", "--loop-layers", "0", "1",
-                        "--loop-exit-gate",
-                        default=Started(data=windows(tokens), validation=windows(tokens, held=True)))
+                        "--max-new-tokens", "0",
+                        default=Started(data=windows(tokens), validation=windows(tokens, held=True),
+                                        pretrained=str(checkpoint),
+                                        loop=Loop(2, step_norm=False, layers=(0, 1), exit_gate=True)))
     objective = config.prepare().train("gated")
     gate = ("early_exit_gate/bias", "early_exit_gate/kernel")
     assert objective.fresh_modules() == gate
@@ -947,26 +953,28 @@ def test_a_pretrained_run_trains_the_exit_gate_its_loop_draws_in_its_fresh_group
 
 
 def test_a_pretrained_run_passes_messages_it_trains_fresh_and_keeps_a_checkpoints_own(tmp_path):
-    """`--loop-messages` gives a --pretrained decoder's loop the messages its flags shape (`Loop.messages`):
-    the run trains each merge fresh beside the checkpoint's weights, its steps move their gains off the
-    zero they are drawn at, the bank reaching them, and resumed from its record it trains them on (row
-    10854). A run that states no shape over a loop
-    holding messages already keeps that loop's own, not the defaults (row 10855)."""
+    """A run's loop with messages (`DecoderRunConfig.loop`, `Loop.messages`) gives a --pretrained decoder's
+    loop the messages it shapes: the run trains each merge fresh beside the checkpoint's weights, its steps
+    move their gains off the zero they are drawn at, the bank reaching them, and resumed from its record it
+    trains them on (row 10854). A run that states no loop over a checkpoint whose loop holds messages keeps
+    that loop's own, at the passes it states (row 10855); one that states its loop runs it whole, additive
+    messages over a checkpoint's that dropped them (row 11742)."""
+    from dew.config import DecoderRunConfig
     from dew.interop import Pretrained
+    from dew.nn.backbones.decoder_stack import Loop
     from dew.nn.cross_pass import CrossPass
 
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
     checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
-    looping = ("--loop-steps", "2", "--loop-layers", "0", "1", "--loop-messages")
-    shaped = ("--max-new-tokens", "0", *looping, "--loop-message-block-size", "1", "--loop-message-rank", "2",
-              "--loop-message-additive", "False")
-    config = recipe_run(Started, tokens, "--pretrained", str(checkpoint), *shaped,
-                        default=Started(data=windows(tokens), validation=windows(tokens, held=True)))
+    shaped = Loop(2, step_norm=False, layers=(0, 1), messages=CrossPass(block_size=1, rank=2, additive=False))
+    config = recipe_run(Started, tokens, "--pretrained", str(checkpoint), "--max-new-tokens", "0",
+                        default=Started(data=windows(tokens), validation=windows(tokens, held=True),
+                                        pretrained=str(checkpoint), loop=shaped))
     objective = config.prepare().train("messaged")
     assert objective.model.loop.messages == CrossPass(block_size=1, rank=2, additive=False)
     assert objective.fresh_modules() and all("cross_pass_" in path for path in objective.fresh_modules())
-    trained = pretrained_config(tokens, checkpoint, "--trainer.steps", "2", *shaped,
-                                "--trainer.name", "messaged").run()
+    trained = pretrained_config(tokens, checkpoint, "--trainer.steps", "2", "--max-new-tokens", "0",
+                                "--trainer.name", "messaged", loop=shaped).run()
     named = {jax.tree_util.keystr(path): leaf
              for path, leaf in jax.tree_util.tree_leaves_with_path(trained.variables["params"])}
     gains = [leaf for name, leaf in named.items() if "cross_pass_" in name and name.endswith("['gain']")]
@@ -983,8 +991,8 @@ def test_a_pretrained_run_passes_messages_it_trains_fresh_and_keeps_a_checkpoint
              for path, leaf in jax.tree_util.tree_leaves_with_path(resumed.variables(step=3)["params"])}
     # It trains on from what it saved, its merges not drawn again: its third step is a run's that never
     # stopped.
-    straight = pretrained_config(tokens, checkpoint, "--trainer.steps", "3", *shaped,
-                                 "--trainer.name", "straight").run()
+    straight = pretrained_config(tokens, checkpoint, "--trainer.steps", "3", "--max-new-tokens", "0",
+                                 "--trainer.name", "straight", loop=shaped).run()
     unbroken = {jax.tree_util.keystr(path): leaf
                 for path, leaf in jax.tree_util.tree_leaves_with_path(straight.variables["params"])}
     assert again.keys() == unbroken.keys() == named.keys()
@@ -994,18 +1002,12 @@ def test_a_pretrained_run_passes_messages_it_trains_fresh_and_keeps_a_checkpoint
     held = CrossPass(block_size=1, rank=2, normalize_values=False, scale_by_input_rms=False)
     loaded = Pretrained.load(checkpoint, dtype="float32")
     start = loaded.with_model(loaded.model.with_passes(2, (0, 1), messages=held), key=0)
-    kept = recipe_run(Started, tokens, "--pretrained", str(checkpoint), "--max-new-tokens", "0", *looping,
-                      default=Started(data=windows(tokens), validation=windows(tokens, held=True)))
-    assert kept.looped(start).model.loop.messages == held
-    # A run stating additive messages takes them over a checkpoint's that dropped them, and one stating
-    # nothing keeps the checkpoint's (row 11742: stating them on was read as stating nothing).
+    kept = DecoderRunConfig(passes=3).looped(start).model.loop
+    assert kept.messages == held and kept.steps == 3
     dropped = loaded.with_model(loaded.model.with_passes(2, (0, 1), messages=dataclasses.replace(
         held, additive=False)), key=0)
-    for stated, additive in ((("--loop-message-additive", "True"), True), ((), False)):
-        restated = recipe_run(Started, tokens, "--pretrained", str(checkpoint), "--max-new-tokens", "0",
-                              *looping, *stated,
-                              default=Started(data=windows(tokens), validation=windows(tokens, held=True)))
-        assert restated.looped(dropped).model.loop.messages.additive is additive, stated
+    stated = Loop(2, step_norm=False, layers=(0, 1), messages=dataclasses.replace(held, additive=True))
+    assert DecoderRunConfig(loop=stated).looped(dropped).model.loop.messages.additive
 
 
 def test_a_run_that_names_no_metrics_and_validates_nothing_trains(tmp_path):

@@ -152,14 +152,14 @@ def run(directory: Path, mode: str) -> None:
     stats, _, _ = objective.predict(before.variables, probe, step, train=False)
     initial_loss = float(objective.reduce_loss(stats)[0])
     if mode == "baseline":
-        write_reference(out / "reference.npz", source, before.variables, probe, step)
+        write_reference(out / "reference.npz", source, trainer.stored(before).variables, probe, step)
     state = trainer.fit(data, steps=STEPS, log_every=1, checkpoint_every=CHECKPOINT_STEP)
     cache = compilation_cache_counts()
     stats, _, _ = objective.predict(state.variables, probe, step, train=False)
     final_loss = float(objective.reduce_loss(stats)[0])
     restored, _, position = trainer.place()
     assert position, "the final checkpoint has no data position"
-    np.savez(out / "state.npz", **state_arrays(state, restored))
+    np.savez(out / "state.npz", **state_arrays(state, trainer.stored(restored)))
     export(out, source, state.variables, probe)
     (out / "result.json").write_text(json.dumps({
         "initial_loss": initial_loss, "final_loss": final_loss,

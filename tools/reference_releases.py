@@ -51,6 +51,9 @@ RELEASES: Mapping[str, Mapping[str, str]] = {
     # fleet's DEW_FLA_PYTHON (torch 2.14.1, past fla #640's Hopper miscompile), whose
     # 2.8.0 pin no node could record against (M-JS-92's refusal, 11-12).
     "fla": {"torch": "2.14.1", "transformers": "5.22.2", "fla-core": "0.5.2"},
+    # fla-core 0.6.0's momentum_delta_rule, which 0.5.2 has none of: row 1454's recorded momentum arm
+    # (tools/fla_momentum_reference.py), apart from "fla" so its recordings' provenance stays as it is.
+    "fla-0.6": {"torch": "2.14.1", "transformers": "5.22.2", "fla-core": "0.6.0"},
     "diffusers": {"diffusers": tested("diffusers")},
     # The pipelines diffusers 0.34.0 builds read transformers 4's text towers.
     "diffusers-pipelines": {"diffusers": tested("diffusers"), "transformers": "4.49.0"},

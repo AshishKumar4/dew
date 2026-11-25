@@ -925,6 +925,33 @@ def test_a_walk_its_compile_refused_plans_a_config_its_launch_pins(dtype):
     assert chosen != refused
 
 
+@pytest.mark.parametrize("lengths", [False, True], ids=["full", "lengths"])
+def test_a_split_walk_its_compile_refused_plans_and_traces_another_config(lengths):
+    """A split decode step whose priced walk a compile refused (its kernel spilled, `report.refuse_launch`)
+    plans another config of its slices and its step traces, a cache's lengths or none: the priced tile is
+    completed and legal at the call's own spans before it is certified, a refused one falling to its
+    streaming walk's own config at those slices, never pinned as refused (the reviews of b11a701f4f0 and
+    97072e2e343: a refused priced tile, priced over a cache's whole extent, raised `Unpinnable`)."""
+    keys = 4096
+    query = jnp.zeros((1, 1, 32, 64), jnp.bfloat16)
+    key = value = jnp.zeros((1, keys, 8, 64), jnp.bfloat16)
+    spans = template.spans(1, keys, 1, lengths=jnp.full((1,), keys, jnp.int32) if lengths else None)
+    with generation.assumed("sm90"):
+        work, rows, row_spans, _ = attention_decode.planned(query, key, value, spans, template.Hooks())
+        plan = work["plain"]
+        assert plan.slices > 1, plan
+        op, args = attention_mosaic._forward_call(rows, key, value, row_spans, template.Hooks(), scale=None,
+                                                  natural=False, out_dtype=jnp.float32, masked=True,
+                                                  splits=plan.slices, subtracted=True)
+        launch = op.bind(*args, residuals=template.Kept.OUTPUT, interpret=False)
+        refused = op.completed(launch, plan.config)
+        with report.refusals():
+            report.refuse_launch(op, launch, refused, {"attention_forward_split"})
+            again = attention_decode.planned(query, key, value, spans, template.Hooks())[0]["plain"]
+            jax.make_jaxpr(lambda q, k, v: attention_decode.attend(q, k, v, spans))(query, key, value)
+    assert op.completed(launch, again.config) != refused or again.slices != plan.slices, (plan, again)
+
+
 @COMPILES_ON_CPU
 def test_a_decode_steps_price_reads_its_keys_and_a_paged_pool_walks_no_fewer_steps():
     """A decode step's price (`attention_decode.priced_step`: its launches' work as their emission counts it,

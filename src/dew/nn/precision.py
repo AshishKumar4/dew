@@ -118,7 +118,6 @@ __all__ = [
     "head_product",
     "iteration_dtype",
     "l2_squares",
-    "l2_unit",
     "l2norm",
     "numerics_of",
     "operand_precision",
@@ -994,25 +993,24 @@ def l2norm(x: jax.Array, eps: float = L2NORM_EPS) -> jax.Array:
     """`x` over its L2 length along the last axis, `x * rsqrt(sum(x**2) + eps)` with `eps` added under
     the root, computed in at least fp32 (`at_least_fp32`, a float64 input's in float64) and rounded
     once to `x`'s dtype: the normalization of FLA's `l2norm` (the linear attentions' queries and
-    keys, modeling_qwen3_next.py:368-371) and of nGPT's `justnorm` (its residual stream and
-    weights)."""
-    return l2_unit(*l2_squares(x), x.dtype, eps)
+    keys, modeling_qwen3_next.py:368-371) and of nGPT's `justnorm` (its residual stream, queries, keys
+    and weights), its derivative the unit norm's own (`l2_normed`, row 12771)."""
+    return l2_normed(x, x.dtype, eps)
 
 
 def l2_squares(x: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """`x` in at least fp32 and its rows' sums of squares: `l2norm`'s reduction, which a reverse that keeps
-    them reads (nGPT's join, `dew.nn.ngpt`)."""
+    """`x` in at least fp32 and its rows' sums of squares: `l2_normed`'s reduction."""
     wide = x.astype(at_least_fp32(x.dtype))
     return wide, jnp.sum(jnp.square(wide), axis=-1, keepdims=True)
 
 
 def l2_normed(x: jax.Array, dtype, eps: float = L2NORM_EPS) -> jax.Array:
-    """`l2norm` of `x`'s rows rounded once to `dtype`, as `l2_unit(*l2_squares(x), dtype, eps)` computes it,
-    its derivative the unit norm's own, `r (t - y <y, t>)` for the unit row `y = x r` and its transpose
-    `r (c - y <y, c>)`: every term at the row's own scale, where JAX's derivative of `rsqrt` reads
-    `rsqrt(s) / s`, which flushes to zero at a row of length 2^55 and leaves a radial cotangent its
-    `r c` term alone, 2^-55 where the exact gradient is 0 (nGPT's join and hidden norm, row 11940's
-    review: their written transposes cancelled it)."""
+    """`x`'s rows over their L2 lengths, `wide * rsqrt(squares + eps)` of their wide copy and sums of
+    squares (`l2_squares`), rounded once to `dtype`: `l2norm`, its derivative the unit norm's own, `r (t -
+    y <y, t>)` for the unit row `y = x r` and its transpose `r (c - y <y, c>)`: every term at the row's
+    own scale, where JAX's derivative of `rsqrt` reads `rsqrt(s) / s`, which flushes to zero at a row of
+    length 2^55 and leaves a radial cotangent its `r c` term alone, 2^-55 where the exact gradient is 0
+    (nGPT's join and hidden norm, row 11940's review: their written transposes cancelled it)."""
     return _unit_rows(eps, *l2_squares(x)).astype(dtype)
 
 
@@ -1065,11 +1063,6 @@ derivative the rows' own (`_unit_rows`')."""
 _unit_rows = contracted("test_ngpts_join_and_normed_hidden_hold_every_order")(
     declared_tangent(Protected(), _unit_rows_value, _unit_rows_tangent, nondiff_argnums=(0,)))
 """`_unit_rows_value` with the unit norm's own tangent, every term at the row's scale (`l2_normed`)."""
-
-
-def l2_unit(wide: jax.Array, squares: jax.Array, dtype, eps: float = L2NORM_EPS) -> jax.Array:
-    """`l2norm` of the rows `wide` from their sums of squares (`l2_squares`), rounded once to `dtype`."""
-    return (wide * jax.lax.rsqrt(squares + eps)).astype(dtype)
 
 
 def float32_dot_general(lhs, rhs, dimension_numbers, precision: jax.lax.PrecisionLike = None,
@@ -1178,16 +1171,30 @@ class LowPrecision:
     routes), which a run's numerics check where they take effect (`generation.run_precision`), multiplies
     the projections whose role is among `roles` (`PROJECTION_ROLES`), each where its widths take the
     recipe's blocks; every other product keeps the run's dtypes, the routers, norms, embeddings and heads
-    among them, as every published low-precision recipe keeps them."""
+    among them, as every published low-precision recipe keeps them. `tensor_scaling`, NVFP4's activations'
+    tensor scale: "current" (the default), each tensor's own largest magnitude, exactly; "delayed" (opt-in,
+    NVFP4 alone), the largest of the last `amax_history` steps' (Transformer Engine's delayed scaling), which
+    the run's state holds and hands each projection (`recipe_projection`'s `tensor_scale`): a scale known
+    before the tensor is, so the product forming it may quantize it in its epilogue (row 12721)."""
 
     recipe: str = "blockwise_fp8"
     roles: tuple[str, ...] = ("mixer", "mlp", "experts")
+    tensor_scaling: str = "current"
+    amax_history: int = 16
 
     def __post_init__(self):
         object.__setattr__(self, "roles", tuple(self.roles))
         unknown = sorted(set(self.roles) - set(PROJECTION_ROLES))
         if unknown:
             raise ValueError(f"a recipe's roles are among {PROJECTION_ROLES}, not {unknown}")
+        if self.tensor_scaling not in ("current", "delayed"):
+            raise ValueError(f"tensor_scaling is 'current' or 'delayed', not {self.tensor_scaling!r}")
+        if self.tensor_scaling == "delayed" and self.recipe != "nvfp4":
+            raise ValueError(f"delayed tensor scaling is NVFP4's alone, not {self.recipe!r}'s")
+        if (not isinstance(self.amax_history, int) or isinstance(self.amax_history, bool)
+                or self.amax_history < 1):
+            raise ValueError(f"an amax history holds a whole number of steps, at least one, not "
+                             f"{self.amax_history!r}")
 
 
 @contextlib.contextmanager
@@ -1355,13 +1362,14 @@ def _configured_name(precision: jax.lax.PrecisionLike) -> str | None:
     return name.lower() if name in jax.lax.Precision.__members__ else name
 
 
-def configured_precision(precision: jax.lax.PrecisionLike):
+def configured_precision(precision: jax.lax.PrecisionLike, *, exact: bool = False):
     """A context in which a product that takes no precision of its own (jax.nn's xla attention)
-    multiplies at `precision`, through `jax.default_matmul_precision`; an unset or default
-    precision changes nothing, a floor the configured one meets. A precision no config names
-    (`configurable_precision`) is refused."""
+    multiplies at `precision`, through `jax.default_matmul_precision`; an unset precision changes nothing,
+    and a default one nothing unless `exact`, where it overrides an outer higher one (splash's arms, each
+    at exactly its own). A precision no config names (`configurable_precision`) is refused."""
     name = _configured_name(precision)
-    return contextlib.nullcontext() if name in (None, 'default') else jax.default_matmul_precision(name)
+    kept = name is None or (name == 'default' and not exact)
+    return contextlib.nullcontext() if kept else jax.default_matmul_precision(name)
 
 
 def operand_precision(dtype: Dtype | None, precision: jax.lax.PrecisionLike = None) -> jax.lax.PrecisionLike:
@@ -1875,10 +1883,14 @@ def twice_scaled(product: jax.Array, first: jax.Array, second: jax.Array) -> jax
     input's block scale near float32's largest (2**113 for inputs near 2**122) overflows the codes' product
     the kernel's scale (2**-9) brings back in range, and one near the least normal underflows it the other
     way (ledger 2715), as two tensor scales near 2**-76 do multiplied first (an NVFP4 product of operands
-    near 2**-65), so no one order holds both ends; the result overflows only where the product does."""
+    near 2**-65), so no one order holds both ends; the result overflows only where the product does. Its
+    tests are comparisons alone (finite: a magnitude below infinity), so a kernel's epilogue runs it as XLA
+    does: Mosaic GPU lowers no `is_finite` (`gemm.nvfp4_block_finished`, row 12721)."""
     tiny = jnp.finfo(product.dtype).tiny
     once = product * first
-    kept = jnp.isfinite(once) & ((jnp.abs(once) >= tiny) | (product == 0))
+    magnitude = jnp.abs(once)
+    # Not `jnp.isfinite`: Mosaic GPU lowers no is_finite, and the fused NVFP4 epilogue runs this in a kernel.
+    kept = (magnitude < np.inf) & ((magnitude >= tiny) | (product == 0))
     return jnp.where(kept, once, product * second) * jnp.where(kept, second, first)  # no cotangent unchosen
 
 

@@ -8,7 +8,8 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import functools
-from typing import Any
+import math
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -39,6 +40,12 @@ def epilogue_layout(layout):
         _EPILOGUE_LAYOUT.reset(token)
 
 
+def epilogue_register_layout():
+    """The accumulator register layout a compiled GEMM epilogue is being traced in (`epilogue_layout`), None
+    outside one."""
+    return _EPILOGUE_LAYOUT.get()
+
+
 def encode_tile(x: jax.Array, minifloat: bits.Minifloat) -> jax.Array:
     """Encode fp32 tile `x` into `minifloat` codes via `bits.encode_form`: inline PTX
     (`inline_forms.registers`) inside a compiled GPU epilogue, or `BitForm.traced` when interpreted or
@@ -53,25 +60,57 @@ def encode_tile(x: jax.Array, minifloat: bits.Minifloat) -> jax.Array:
 
 
 def _block_max(acc: jax.Array, block: int) -> jax.Array:
-    """Per-row maximum of `|acc|` over each `block`-column group, broadcast back to `acc.shape`."""
-    shift = block.bit_length() - 1
-    block_id = jax.lax.broadcasted_iota(jnp.int32, acc.shape, 1) >> jnp.int32(shift)
-    abs_acc = jnp.abs(acc)
+    """Per-row maximum of `|acc|` over each `block`-column group, broadcast back to `acc.shape`: within a
+    kernel (or for a tile of no whole blocks, a launch identity's probe of a narrower one) one row reduction
+    a block (`_blocks_reduced`), elsewhere one reduction of the blocks' view."""
+    rows, columns = acc.shape
+    magnitude = jnp.abs(acc)
+    if _EPILOGUE_LAYOUT.get() is None and columns % block == 0:
+        return jnp.repeat(jnp.max(magnitude.reshape(rows, columns // block, block), axis=-1), block, axis=1)
+    block_id = _block_ids(acc.shape, block)
     peaks = jnp.zeros_like(acc)
-    for group in range(acc.shape[1] // block):
-        bmax = jnp.max(jnp.where(block_id == group, abs_acc, jnp.float32(0.0)), axis=1)
-        peaks = jnp.where(block_id == group, jax.lax.broadcast_in_dim(bmax, acc.shape, (0,)), peaks)
+    for group, peak in enumerate(_blocks_reduced(magnitude, block, jnp.float32(0.0))):
+        peaks = jnp.where(block_id == group, jax.lax.broadcast_in_dim(peak, acc.shape, (0,)), peaks)
     return peaks
+
+
+def _block_ids(shape: tuple[int, ...], block: int) -> jax.Array:
+    """Each column's `block`-column group (`block` a power of two) of a tile of `shape`: its column's iota
+    shifted, as a warpgroup's accumulator layouts lower it."""
+    return jax.lax.broadcasted_iota(jnp.int32, shape, 1) >> jnp.int32(block.bit_length() - 1)
+
+
+def _blocks_reduced(values: jax.Array, block: int, fill: jax.Array) -> list[jax.Array]:
+    """Each `block`-column group's row maxima of `values` (`[rows, columns]`): one row reduction a group, its
+    columns selected by their group (`_block_ids`), the others `fill`, the form Mosaic GPU lowers in a
+    warpgroup's accumulator layouts (tcgen05's and WGMMA's), where a reshape to the blocks and its transpose
+    has no lowering (witness/b2-blockmax-1, row 12721); one group's, its row reduction alone."""
+    groups = values.shape[1] // block
+    if groups == 1:
+        return [jnp.max(values, axis=1)]
+    block_id = _block_ids(values.shape, block)
+    return [jnp.max(jnp.where(block_id == group, values, fill), axis=1) for group in range(groups)]
+
+
+def _divided(numerator: jax.Array, denominator: jax.Array | float) -> jax.Array:
+    """The IEEE fp32 quotient of a tile by one of its shape or by a constant: PTX's `div.rn.f32` inline in a
+    compiled GPU epilogue (`inline_forms.quotients`, one instruction where the software rule issued dozens an
+    element), the software rule elsewhere (`precision.lowered_divide`: XLA's arms, interpreted or not, whose
+    own division a CPU flushes and a GPU approximates; row 4023), the same quotient."""
+    from dew.nn.precision import lowered_divide
+
+    layout = _EPILOGUE_LAYOUT.get() if launches.interpreting() is False else None
+    if layout is None:
+        return lowered_divide(numerator, jnp.asarray(denominator, jnp.float32), jnp.int32(0))
+    return inline_forms.quotients(numerator, denominator, layout)
 
 
 def _quantized_epilogue(minifloat: bits.Minifloat, acc: jax.Array,
                         scale: jax.Array | None = None) -> jax.Array:
     if scale is None:
         return encode_tile(acc, minifloat)
-    from dew.nn.precision import lowered_divide
-
     s = jax.lax.broadcast_in_dim(scale, acc.shape, (0,)) if scale.ndim == 1 else scale
-    return encode_tile(lowered_divide(acc, s, jnp.int32(0)), minifloat)
+    return encode_tile(_divided(acc, s), minifloat)
 
 
 def quantize_epilogue(minifloat: bits.Minifloat):
@@ -82,18 +121,15 @@ def quantize_epilogue(minifloat: bits.Minifloat):
 def _nvfp4_quantize_epilogue(acc: jax.Array, tensor_scale: jax.Array) -> tuple[jax.Array, jax.Array]:
     """GEMM epilogue quantizing each 16-column block of fp32 `acc` (`[rows, cols]`, `cols % 16 == 0`) to
     E2M1 nibbles (`uint8`) and E4M3 block scales (`float8_e4m3fn`, broadcast over each 16-column block) via
-    `bits.encode_form` inline PTX and `precision.lowered_divide`, bitwise matching
+    `bits.encode_form` inline PTX and IEEE division (`_divided`), bitwise matching
     `formats.NvFp4Block.quantized` at `tensor_scale` (rows 8547, 12037)."""
     from dew.nn.fake_quant import E2M1_MAX
-    from dew.nn.precision import lowered_divide
 
     block_max = _block_max(acc, product_formats.NVFP4.depth)
-    zero = jnp.int32(0)
     ts_in = tensor_scale.astype(jnp.float32)
     ts = (jax.lax.broadcast_in_dim(ts_in, acc.shape, (0,)) if ts_in.ndim == 1
           else jnp.broadcast_to(ts_in, acc.shape))
-    e2m1_max = jnp.full(acc.shape, E2M1_MAX, jnp.float32)
-    ratio = lowered_divide(lowered_divide(block_max, ts, zero), e2m1_max, zero)
+    ratio = _divided(_divided(block_max, ts), float(E2M1_MAX))
     nearest_f8 = encode_tile(ratio, bits.E4M3)
     nearest = jax.lax.bitcast_convert_type(nearest_f8, jnp.uint8).astype(jnp.uint32)
     scale_u32 = jnp.where(bits.scales_decoded(nearest) < ratio,
@@ -101,7 +137,7 @@ def _nvfp4_quantize_epilogue(acc: jax.Array, tensor_scale: jax.Array) -> tuple[j
     each = bits.scales_decoded(scale_u32)
     pos = each > jnp.float32(0.0)
     safe_each = jnp.where(pos, each, jnp.float32(1.0))
-    scaled = jnp.where(pos, lowered_divide(lowered_divide(acc, ts, zero), safe_each, zero), jnp.float32(0.0))
+    scaled = jnp.where(pos, _divided(_divided(acc, ts), safe_each), jnp.float32(0.0))
     e2m1_codes = encode_tile(scaled, bits.E2M1)
     scale_f8 = jax.lax.bitcast_convert_type(scale_u32.astype(jnp.uint8), jnp.float8_e4m3fn)
     return e2m1_codes, scale_f8
@@ -142,20 +178,10 @@ def _blockwise_fp8_quantized(values: jax.Array) -> tuple[jax.Array, jax.Array]:
     its tile's columns), bitwise `projections.rows_quantized`'s: its scale `fake_quant.fp8_block_scale` of the
     tile's amax, its codes E4M3 of the values over it, the IEEE quotient a product by its exact reciprocal
     (`_reciprocal`, an infinite or NaN block's as the recipe's), by `bits.encode_form` (ties to even,
-    saturated). Within a kernel the tile's
-    amax a row reduction of each tile's columns of the accumulator's layout (`_block_max`), elsewhere one
-    reduction of the tiles' view (DeepSeek-V3's blockwise FP8 recipe, row 8547)."""
+    saturated), the tile's amax `_block_max`'s (DeepSeek-V3's blockwise FP8 recipe, row 8547)."""
     from dew.nn.fake_quant import fp8_block_scale
 
-    block = product_formats.SCALE_DEPTH
-    rows, cols = values.shape
-    if _EPILOGUE_LAYOUT.get() is None and cols % block == 0:
-        tiles = jnp.max(jnp.abs(values.reshape(rows, cols // block, block)), axis=-1)
-        amax = jnp.repeat(tiles, block, axis=1)
-    else:
-        # A kernel's accumulator layout, or a launch identity's probe of a narrower tile (`traced`).
-        amax = _block_max(values, block)
-    scale = fp8_block_scale(amax)
+    scale = fp8_block_scale(_block_max(values, product_formats.SCALE_DEPTH))
     return encode_tile(values * _reciprocal(scale), bits.E4M3), scale
 
 
@@ -177,131 +203,285 @@ def blockwise_fp8_epilogue(activation=None, out_dtype=jnp.bfloat16):
     product itself where none), rounded to `out_dtype`, as E4M3 codes and 1 x 128 power-of-two scales
     (`_blockwise_fp8_quantized`), bitwise the recipe's `projections.rows_quantized` of that activation, which
     a separate pass formed from the stored products (row 8547)."""
-    if jnp.dtype(out_dtype).itemsize > 4:  # its quantizer reads fp32 (`_blockwise_fp8_quantized`)
-        raise ValueError(f"a quantizing epilogue reads fp32 at most, not {jnp.dtype(out_dtype)}")
+    _read_in_fp32(out_dtype)
 
     def quantized(acc, *sides):
-        rounded = acc.astype(out_dtype)
-        next_rows = rounded if activation is None else activation(*sides, rounded).astype(out_dtype)
-        codes, scales = _blockwise_fp8_quantized(next_rows.astype(jnp.float32))
-        return rounded, codes, scales
+        rounded, next_rows = _activated(acc, sides, activation, out_dtype)
+        return rounded, *_blockwise_fp8_quantized(next_rows)
 
     return quantized
 
 
-def forms_of(out_forms: tuple | None, count: int) -> tuple:
-    """Each of a call's `count` outputs' form (`Hooks.out_forms`): None for a tile of its own, else
-    `(divisor, transposed)`; none stated, every output a tile."""
+def nvfp4_epilogue(activation=None, out_dtype=jnp.bfloat16):
+    """A GEMM epilogue returning its product rounded to `out_dtype` beside its next product's rows quantized
+    as NVFP4 at a given tensor scale, its last side (a delayed-scaling recipe's, each row's the one scale;
+    row 12721): `activation` of its other side tiles and the rounded product, rounded to `out_dtype`, as
+    E2M1 codes one a byte (uint8) and E4M3 block scales broadcast over each block's 16 columns
+    (`_nvfp4_quantize_epilogue`), bitwise `formats.NvFp4Block.quantized` of that activation at the scale,
+    which a separate pass formed from the stored products. Its product the fp32 sums a caller has scaled
+    (`gemm.nvfp4_block_finished`: its operands' two tensor scales)."""
+    _read_in_fp32(out_dtype)
+
+    def quantized(acc, *sides):
+        *tiles, tensor_scale = sides
+        rounded, next_rows = _activated(acc, tuple(tiles), activation, out_dtype)
+        return rounded, *_nvfp4_quantize_epilogue(next_rows, tensor_scale)
+
+    return quantized
+
+
+def _read_in_fp32(out_dtype) -> None:
+    """Refuse a quantizing epilogue's `out_dtype` wider than fp32, which its quantizer reads values in."""
+    if jnp.dtype(out_dtype).itemsize > 4:
+        raise ValueError(f"a quantizing epilogue reads fp32 at most, not {jnp.dtype(out_dtype)}")
+
+
+def _activated(acc: jax.Array, sides: tuple, activation, out_dtype) -> tuple[jax.Array, jax.Array]:
+    """A quantizing epilogue's product rounded to `out_dtype`, and its next product's rows in fp32:
+    `activation` of the side tiles and the rounded product, rounded to `out_dtype` again (the rounded product
+    itself where none), as a separate pass forms them from the stored products."""
+    rounded = acc.astype(out_dtype)
+    next_rows = rounded if activation is None else activation(*sides, rounded).astype(out_dtype)
+    return rounded, next_rows.astype(jnp.float32)
+
+
+class Form(NamedTuple):
+    """How a several-output call stores one of its outputs (`Hooks.out_forms`; a tile of its own where None):
+    `divisor` of its tile's columns a stored value. Reduced (the default): the value its epilogue broadcast
+    across each `divisor`-column block, one a row a block (a next product's block scales, `reduced`),
+    `transposed` its rows contiguous (`[columns // divisor, rows]`, as a block-scaled product reads them).
+    `packed`: two 4-bit codes a byte (`divisor` 2, row-major), the even column's in its low nibble, as a
+    sub-byte array packs them (NVFP4's E2M1 codes, `paired`; row 12743). `narrowed`, where nonzero: its
+    epilogue computes it a `divisor`-th as wide as the tile (`[rows, columns // divisor]`, row-major) from
+    whole runs of `narrowed` columns, `divisor` of them a stored run (a wide gated product's hidden
+    activation, one of each gate and up run, `templates.gemm.wide.GROUP`), stored as computed; a tile, and
+    every piece its issuer reads out at once, holds whole `unit`s."""
+
+    divisor: int
+    transposed: bool = False
+    packed: bool = False
+    narrowed: int = 0
+
+    @property
+    def unit(self) -> int:
+        """The tile columns its epilogue narrows whole (`divisor` runs of `narrowed`), else its `divisor`."""
+        return self.divisor * self.narrowed if self.narrowed else self.divisor
+
+    def __repr__(self) -> str:
+        # A launch's pick key reads its forms' repr (`grouped_launch._GroupedLaunch.traced`): a form that
+        # narrows nothing keys as it did before `narrowed` was a field.
+        if not self.narrowed:
+            return f"Form(divisor={self.divisor!r}, transposed={self.transposed!r}, packed={self.packed!r})"
+        return (f"Form(divisor={self.divisor!r}, transposed={self.transposed!r}, packed={self.packed!r}, "
+                f"narrowed={self.narrowed!r})")
+
+
+def forms_of(out_forms: tuple | None, dtypes: tuple) -> tuple:
+    """Each of a call's outputs' form (`Hooks.out_forms`, each a `Form` or its fields' tuple), the outputs'
+    `dtypes` its several outputs' (`out_dtypes`): None for a tile of its own; none stated, every output a
+    tile. A packed form is two codes a byte, row-major, stored uint8 (its every route's: `_pairs`), the one
+    boundary each route's selection reads."""
     if not out_forms:
         return ()
-    if count < 2:
-        raise ValueError("output forms are a several-output call's (`out_dtypes`)")
-    if len(out_forms) != count:
-        raise ValueError(f"{len(out_forms)} output forms for {count} outputs")
-    return tuple(out_forms)
+    if len(out_forms) != len(dtypes):
+        raise ValueError(f"{len(out_forms)} output forms for {len(dtypes)} outputs")
+    forms = _formed(out_forms)
+    for form, dtype in zip(forms, dtypes, strict=True):
+        if form is not None and form.packed and (form.divisor != 2 or form.transposed
+                                                 or jnp.dtype(dtype) != jnp.dtype(jnp.uint8)):
+            raise ValueError(f"a packed output is two 4-bit codes a byte, row-major, uint8, not {form} in "
+                             f"{jnp.dtype(dtype)}")
+        if form is not None and form.narrowed and (form.divisor < 2 or form.transposed or form.packed):
+            raise ValueError(f"a narrowed output is a divisor-th of the tile's columns, row-major, not "
+                             f"{form}")
+    return forms
+
+
+def _formed(out_forms) -> tuple:
+    """Each of `out_forms` as a `Form` (`_form`), None as it is."""
+    return tuple(None if form is None else _form(form) for form in out_forms or ())
+
+
+def _form(form: Form | tuple) -> Form:
+    """`form` as a `Form`, its fields' tuple read in their order."""
+    return form if isinstance(form, Form) else Form(*form)
 
 
 def reduced(buffer, piece: jax.Array) -> None:
-    """A reduced output's chunk written (`stores.Output.write`): `piece`, a consumer's rows by one block's
-    columns (the chunk its staging states, one block), its value broadcast across them by its epilogue, as
-    each row's maximum, `[1, rows]` where transposed: a row reduction of the accumulator's layout, which
-    Mosaic GPU lowers where a strided read of every `divisor`-th column does not (witness/packing-1, sm90)."""
-    buffer[0, :] = jnp.max(piece.astype(jnp.float32), axis=1).astype(buffer.dtype)
+    """A reduced output's chunk written (`stores.Output.write`): `piece`, a consumer's rows by the chunk's
+    columns (its staging's, whole blocks: `formed`), each block's value broadcast across its columns by its
+    epilogue, into `buffer` (`[blocks, rows]`, transposed: `forms_refusal`) as each row's maximum over each
+    block, a buffer row a block: one row reduction a block of the accumulator's layout (`_blocks_reduced`),
+    which Mosaic GPU lowers where a strided read of every `divisor`-th column, or a reshape to the blocks and
+    its transpose, does not (witness/packing-1, sm90; witness/b2-blockmax-1, sm90 and sm100). A chunk of
+    tcgen05's 64 columns holds four NVFP4 blocks (row 12721), a Hopper one a block."""
+    blocks = buffer.shape[0]
+    maxima = _blocks_reduced(piece.astype(jnp.float32), piece.shape[1] // blocks, jnp.float32(-jnp.inf))
+    for block, peak in enumerate(maxima):
+        buffer[block, :] = peak.astype(buffer.dtype)
+
+
+def paired(buffer, piece: jax.Array) -> None:
+    """A packed output's chunk written (`stores.Output.write`): `piece`, a consumer's rows by the chunk's
+    columns of 4-bit codes, into `buffer` (`[rows, columns / 2]` uint8) two a byte (`_pairs`)."""
+    buffer[...] = _pairs(piece)
+
+
+def _pairs(codes: jax.Array) -> jax.Array:
+    """`codes` (`[rows, columns]`, 4-bit codes) two a byte, the even column's in its low nibble, as a
+    sub-byte array packs them: in a compiled GPU epilogue's register layout each pair in the thread that
+    holds it (`inline_forms.paired`), elsewhere its columns' view as pairs (interpreted, and XLA's form of a
+    packed output's store, `stored`), the same bytes."""
+    layout = _EPILOGUE_LAYOUT.get() if launches.interpreting() is False else None
+    if layout is not None:
+        return inline_forms.paired(codes.astype(jnp.uint8), layout)
+    rows, columns = codes.shape
+    both = codes.astype(jnp.uint8).reshape(rows, columns // 2, 2)
+    return both[..., 0] | (both[..., 1] << jnp.uint8(4))
 
 
 def outputs(part: tuple[int, int], dtypes: tuple, forms: tuple) -> tuple:
     """A consumer's share `part` of each output as its family stages it: `(shape, dtype)` for a tile,
-    `stores.Output` for one a form reduces (`forms_of`), written by `reduced`."""
+    `stores.Output` for one a form stores (`forms_of`), written by `paired` where packed, else `reduced`."""
     from dew.nn.kernels.templates import stores
 
     if not forms:
         return tuple((part, jnp.dtype(dtype)) for dtype in dtypes)
-    return tuple((part, jnp.dtype(dtype)) if form is None
-                 else stores.Output(part, jnp.dtype(dtype), divisor=form[0], write=reduced,
-                                    transposed=form[1])
-                 for dtype, form in zip(dtypes, forms, strict=True))
+
+    def output(dtype, form):
+        if form is None:
+            return part, jnp.dtype(dtype)
+        if form.narrowed:
+            return stores.Output(part, jnp.dtype(dtype), divisor=form.divisor, narrowed=True)
+        return stores.Output(part, jnp.dtype(dtype), divisor=form.divisor,
+                             write=paired if form.packed else reduced, transposed=form.transposed)
+
+    return tuple(output(dtype, form) for dtype, form in zip(dtypes, _formed(forms), strict=True))
 
 
-def declared(dtype, form: tuple[int, bool], rows: int, columns: int) -> jax.ShapeDtypeStruct:
-    """An output a form reduces (`forms_of`) as its call declares it: one value a row each `divisor` of
+def declared(dtype, form: Form | tuple, rows: int, columns: int) -> jax.ShapeDtypeStruct:
+    """An output a form stores (`forms_of`) as its call declares it: one value a row each `divisor` of
     `columns`, `[columns // divisor, rows]` where transposed, `[rows, columns // divisor]` otherwise."""
-    divisor, transposed = form
-    if columns % divisor:
-        raise ValueError(f"{columns} columns hold no whole {divisor}-column blocks")
-    shape = (columns // divisor, rows) if transposed else (rows, columns // divisor)
-    return jax.ShapeDtypeStruct(shape, jnp.dtype(dtype))
+    form = _form(form)
+    if columns % form.divisor:
+        raise ValueError(f"{columns} columns hold no whole {form.divisor}-column blocks")
+    stored_columns = columns // form.divisor
+    return jax.ShapeDtypeStruct((stored_columns, rows) if form.transposed else (rows, stored_columns),
+                                jnp.dtype(dtype))
 
 
-def _reduced_divisor(out_forms: tuple | None) -> int | None:
-    """The one block width a call's outputs a form reduces state (`Hooks.out_forms`), None for none."""
-    divisors = {form[0] for form in out_forms or () if form is not None}
-    if len(divisors) > 1:
-        raise ValueError(f"a call's reduced outputs state one block width, not {sorted(divisors)}")
-    return next(iter(divisors), None)
+def _chunk_unit(out_forms: tuple | None) -> int | None:
+    """The columns each staged chunk is whole numbers of where a call's outputs state forms its stores write
+    (every such form's `divisor`: a reduced output's blocks, a packed one's pairs), None for none: a narrowed
+    one is stored as computed (`forms_refusal` holds its divisor)."""
+    divisors = [form.divisor for form in _formed(out_forms) if form is not None and not form.narrowed]
+    return math.lcm(*divisors) if divisors else None
 
 
 def formed(config, out_forms: tuple | None):
-    """`config` (a GEMM tile) staging its outputs a block of a reduced output's columns at a time where the
-    call stores one (`Hooks.out_forms`; two buffers), so each chunk a reduced output's `write` takes is one
-    block (`reduced`); `config` as it is elsewhere, or where it states its staging."""
+    """`config` (a GEMM tile) staging its outputs whole units of its forms' columns at a time where the call
+    stores outputs in forms (`Hooks.out_forms`; two buffers, `_block_chunk`'s columns), so each chunk a form's
+    `write` takes is whole blocks and pairs (`reduced`, `paired`); `config` as it is elsewhere, where it
+    states its staging, or where it stages no such chunk (a tcgen05 tile's 128-column FP8 blocks, wider than
+    the 64 columns its issuer reads out at once: `Tiles.chunked_refusal`), which `forms_refusal` refuses, so
+    its family declines."""
     import dataclasses
 
-    from dew.nn.kernels.templates import stores
+    from dew.nn.kernels.templates import bundles, stores
 
-    divisor = _reduced_divisor(out_forms)
-    staging = None if divisor is None else (divisor, stores.OUTPUT_BUFFERS)
-    # A tile whose issuer emits narrower pieces than a block (tcgen05's 64 columns) stages no block a chunk
-    # (`Tiles.chunked_refusal`): left unstated, which `forms_refusal` refuses, so its family declines.
-    if staging is None or config.staging is not None or config.chunked_refusal(staging) is not None:
+    unit = _chunk_unit(out_forms)
+    if unit is None or config.staging is not None:
+        return config
+    staging = (_block_chunk(config.issued(bundles.named(config.family, jnp.bfloat16, None)), unit),
+               stores.OUTPUT_BUFFERS)
+    if config.chunked_refusal(staging) is not None:
         return config
     return dataclasses.replace(config, staging=staging)
 
 
+def _block_chunk(issued: tuple[int, int], unit: int) -> int:
+    """The columns a chunk of outputs in forms stages, its tile's `issued` columns and pieces
+    (`Tiles.issued`): a piece its issuer reads out narrower than the tile, where whole `unit`s (tcgen05's 64
+    columns of tensor memory, four NVFP4 blocks), so no piece is sliced in registers; else one unit, a slice
+    of a register accumulator's (row 12721)."""
+    columns, piece = issued
+    return piece if piece < columns and piece % unit == 0 else unit
+
+
 def forms_refusal(out_forms: tuple | None, config, *, dense: bool) -> str | None:
-    """Why a GEMM launch at `config` stores no output a form reduces (`Hooks.out_forms`), None where it does
-    or the call stores none: its staging a block of the form's columns a chunk (`formed`, which `reduced`
-    writes), and a transposed one's call dense (its stores take a share's whole rows,
-    `stores.transposed_rows`: a grouped tile's share starts mid-tile)."""
-    divisor = _reduced_divisor(out_forms)
-    if divisor is None:
+    """Why a GEMM launch at `config` stores no output in its form (`Hooks.out_forms`), None where it does or
+    the call states none: its staging whole units of the forms' columns a chunk (`formed`, which `reduced`
+    and `paired` write), each reduced output transposed (`reduced` writes a block's maxima as its buffer's
+    row, no strided column), and its call dense (a transposed store takes a share's whole rows,
+    `stores.transposed_rows`, and a packed row's store a share's from its first, `stores._aligned_ladder`: a
+    grouped tile's share starts mid-tile); a narrowed output (`Form.narrowed`) where the tile's family stores
+    one (`mosaic.Transport.stores_narrowed`), its stated chunk whole multiples of its divisor."""
+    from dew.nn.kernels.templates import bundles
+
+    narrowed = [form for form in _formed(out_forms) if form is not None and form.narrowed]
+    if narrowed:
+        family = bundles.named(config.family, jnp.bfloat16, None)
+        if not family.stores_narrowed:
+            return f"a {config.family} launch stores no output narrower than its tile"
+        if not dense:
+            return ("a narrowed output is a dense call's (a scattered one's rows land a row at a time, none "
+                    "narrowed)")
+        # Its epilogue narrows whole runs (`Form.unit`): every tile's and every piece its issuer reads out at
+        # once (tcgen05's 64 columns), and its stated chunk whole stored columns.
+        unit = math.lcm(*(form.unit for form in narrowed))
+        if any(each % unit for each in config.issued(family)):
+            return (f"a {config.issued(family)} tile's columns and pieces hold no whole {unit}-column runs "
+                    "of a narrowed output")
+        if config.staging is not None and any(config.staging[0] % form.divisor for form in narrowed):
+            return f"a chunk of {config.staging[0]} columns holds no whole column groups of a narrowed output"
+    unit = _chunk_unit(out_forms)
+    if unit is None:
         return None
-    if config.staging is None or config.staging[0] != divisor:
-        return f"a reduced output's chunk is one {divisor}-column block, not {config.staging}"
-    if not dense and any(form is not None and form[1] for form in out_forms or ()):
-        return "a transposed output is a dense call's"
+    if config.staging is None or config.staging[0] % unit:
+        return f"a chunk of outputs in forms is whole {unit}-column units, not {config.staging}"
+    if any(form is not None and not (form.packed or form.transposed or form.narrowed)
+           for form in _formed(out_forms)):
+        return "a launch stores a reduced output transposed, a buffer row a block"
+    if not dense:
+        return "an output in a form is a dense call's"
     return None
 
 
-def stored(value: jax.Array, form: tuple[int, bool] | None) -> jax.Array:
-    """`value` (`[rows, columns]`, an epilogue's output broadcast across each block's columns where `form`
-    reduces it) as its call stores it (`declared`): itself for a tile; a block's first column each block,
-    `[columns // divisor, rows]` where transposed: XLA's form of `reduced`'s store."""
+def stored(value: jax.Array, form: Form | tuple | None) -> jax.Array:
+    """`value` (`[rows, columns]`, an epilogue's output) as its call stores it (`declared`): itself for a
+    tile; two codes a byte where `form` packs it (`_pairs`); else a block's first column each block (its
+    value broadcast across its block), `[columns // divisor, rows]` where transposed: XLA's form of a form's
+    store."""
     if form is None:
         return value
-    divisor, transposed = form
-    blocks = value[:, ::divisor]
-    return blocks.T if transposed else blocks
+    form = _form(form)
+    if form.narrowed:
+        return value
+    if form.packed:
+        return _pairs(value)
+    blocks = value[:, ::form.divisor]
+    return blocks.T if form.transposed else blocks
 
 
 def trimmed(outs: tuple, forms: tuple, rows: int | None, columns: int | None = None) -> tuple:
     """A call's outputs (`declared`'s) to their first `rows` rows and `columns` columns where given, along
-    each output's own axes: a transposed reduced output's rows its second axis, its columns its first, a
-    `divisor`th of them."""
+    each output's own axes: a transposed output's rows its second axis, its columns its first, a `divisor`th
+    of them."""
     def one(out, form):
         if form is None:
             return out[:rows] if columns is None else out[:rows, :columns]
-        divisor, transposed = form
-        blocks = None if columns is None else -(-columns // divisor)
-        return out[:blocks, :rows] if transposed else out[:rows, :blocks]
+        kept = None if columns is None else -(-columns // form.divisor)
+        return out[:kept, :rows] if form.transposed else out[:rows, :kept]
 
-    return tuple(one(out, form) for out, form in zip(outs, forms or (None,) * len(outs), strict=True))
+    held = _formed(forms) or (None,) * len(outs)
+    return tuple(one(out, form) for out, form in zip(outs, held, strict=True))
 
 
 def typed_outputs(dtypes: tuple, out_forms: tuple | None, config, *, dense: bool) -> tuple[tuple, tuple]:
     """A `gmm` call's outputs' dtypes and forms (`forms_of`), refused where its tile stores none of them
     (`forms_refusal`): a direct call's as a launch's planning refuses it."""
     typed = tuple(jnp.dtype(dtype) for dtype in dtypes)
-    forms = forms_of(out_forms, len(typed))
+    forms = forms_of(out_forms, typed)
     if (refusal := forms_refusal(forms, config, dense=dense)) is not None:
         raise ValueError(f"{config}: {refusal}")
     return typed, forms

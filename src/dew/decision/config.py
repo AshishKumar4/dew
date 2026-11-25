@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Annotated, ClassVar, Literal
 import jax
 import jax.numpy as jnp
 
-from dew._records import ADDED, integer, number, record
+from dew._records import integer, number, record
 from dew.config import DecoderRunConfig, MetricConfig, ObjectiveConfig, Prepared
 from dew.data.pipeline import Dataset, cut_unit
 from dew.decision.data import SCHEDULE_MIXTURE, made_by
@@ -37,11 +37,12 @@ from dew.decision.layout import (
     Instructions,
     Labels,
     Layout,
+    OptionText,
     Reads,
     RowOrder,
     RowSegment,
     Schema,
-    SegmentLayout,
+    SplitAt,
     default_layout,
     layout_writing,
     per_question,
@@ -138,6 +139,118 @@ class Letters:
 
 
 @dataclasses.dataclass(frozen=True)
+class RowBudgets:
+    """How a decision run lays its rows out over the layout its release or fresh head reads
+    (`SegmentLayout`): each field one of the layout's own, by its name, which the run sets on that layout
+    where it states it, and None keeps the layout's own (`_budgeted`). The layout's fields its head and
+    backbone derive (its form, labels and blocks) are no run's to state."""
+
+    max_len: int | None = None
+    """The row's length in tokens; None keeps the checkpoint's (Laya's 512) or the layout's own."""
+    head_max_len: int | None = None
+    """The tokens the question and its options may share, a declared cut; None
+    keeps the checkpoint's (Laya's release declares 192) or a fresh head's,
+    which keeps every question whole. Each row it cuts is counted in the run's
+    data counters, and a row whose cut leaves two options alike is refused."""
+    option_tokens: int | None = None
+    """The most tokens one option keeps, in a layout of one row per question, a
+    declared cut counted as `head_max_len`'s is; None keeps the checkpoint's
+    (Laya's 48) or a fresh head's, each option whole."""
+    max_state_tokens: int | None = None
+    """The most tokens a joint row's state keeps, whatever room `max_len` leaves
+    it: a row is its state, cut to this, and its schema, so a large schema
+    (a hundred options, or a document's many hypotheses) fits under a `max_len`
+    set for it without lengthening every other row's state. None lets the
+    state fill the row."""
+    segments: Annotated[tuple[RowSegment, ...], record_argument(tuple[RowSegment, ...])] | None = None
+    """The row's parts in order, as its layout reads them. A joint row's user turn
+    (`SegmentLayout.segments`): the schema first, or read as the row's context through the run's context
+    layers (`DecisionRunConfig.context`, `Schema(stream="context")`), its `CrossContext.length` holding
+    the whole schema. A question row's text (`SegmentLayout.segments`): its instructions, option lines
+    and answer cue beside the state, the question first or the state first, its blocks following that order
+    (`SegmentLayout.blocks`). None keeps the layout's own, the release's turn."""
+    reads: Annotated[Reads, record_argument(Reads)] | None = None
+    """Which of the row's streams each reads (`Reads`), where its `segments` name a stream of the row's
+    own (`Schema(stream=...)`, `Instructions(stream=...)`): two streams in one pass, the state reading
+    the schema and the schema itself alone, are its table. None reads the row in order."""
+    parallel: bool | None = None
+    """Whether a question row reads its options in parallel, each at positions of its own after the
+    question (`SegmentLayout.parallel`), which a head that reads option slots needs. None keeps the
+    layout's own."""
+    shared_state: int | None = None
+    """The most questions a row asks over one copy of their request's state, each read as its own row reads
+    it (`SegmentLayout.shared_state`), 1 a row a question. None keeps the layout's own: as many as a row
+    holds, where the backbone and head read each question as its own row."""
+    siblings: bool | None = None
+    """Whether a question of a row over one state also reads the questions before it in the row, whole
+    (`SegmentLayout.siblings`). None keeps the layout's own, each reading the state and itself."""
+    unit: Unit | None = None
+    """How a question row's `segments` encode their text, piece by piece or whole
+    (`SegmentLayout.unit`). None keeps the layout's own, piece by piece."""
+    order: RowOrder | None = None
+    """The order a question row's own text writes its parts in (`SegmentLayout.order`): the state
+    first, the question first, or the state, the question and the state again (`re_read`), each part as
+    the built-in row writes it. None keeps the layout's own, a causal backbone's state first."""
+    split: SplitAt | None = None
+    """Where a question row splits into its blocks, where its backbone reads blocks (a
+    block_bidirectional `--source.attention`, `SegmentLayout.split`): at its second part, a
+    question-first row's state; at its question; or nowhere, the whole row one block its backbone
+    reads both ways (`whole`). None keeps the layout's own law."""
+    framing: Framing | None = None
+    """How a joint row frames itself as a conversation (`Framing`): its system message, the
+    assistant's prefill, the reasoning switch, a Jinja chat template in place of the tokenizer's
+    own, and the template's other variables; recorded with the run's layout, so the run reloads it.
+    None keeps the layout's own, the tokenizer's template with thinking off."""
+
+
+@dataclasses.dataclass(frozen=True)
+class CrossContext:
+    """The layers of a decision run's backbone that read each example's context (`Example.context`)
+    through gated cross-attention, and how: the context encoded as `encoder` says or by a configured
+    `text` encoder, the blocks training from zero gates beside the head, the loaded backbone frozen
+    (`Pretrained.with_cross_attention`) unless `frozen` is off, with the run's `lora` its adapter beside
+    them."""
+
+    layers: tuple[int, ...]
+    """The backbone layers that read the context."""
+    frozen: bool = True
+    """Whether the context layers freeze the backbone beside their blocks, which then train alone with
+    the head; off, they freeze nothing more, so the backbone trains as the run trains it: whole, a full
+    fine-tune, or through its `lora` adapter over the frozen base."""
+    length: int = 256
+    """The most tokens of an example's context the cross-attention reads; a longer context keeps its
+    first tokens, the cut counted in the run's data report (`data/cut/<corpus>/context`), as a served
+    request's is stated in its answer (`usage.context_kept`)."""
+    encoder: ContextEncoder = "table"
+    """How a context becomes the states its cross-attention reads (`DecisionModel.context_encoder`): the
+    backbone's token table, or the backbone's own pass over it."""
+    text: TextCondition | None = None
+    """A configured encoder of the context in place of the backbone's own (`DecisionModel.context`): a
+    registered encoder of text into states (`char_table`, `clip_text`, `t5`) and its checkpoint, as a
+    diffusion run's text condition names one, computing in the run's dtype, its tokenization the
+    context's, each row's context encoded alone, its states read by the cross-attention at its own width,
+    its weights frozen unless the run trains them (`DecisionRunConfig.context_text_trained`)."""
+    form: Literal["idefics", "shared"] = "idefics"
+    """The block each context layer runs: IDEFICS's gated block, an attention and a feed-forward of its
+    own drawn beside the layer (`CrossAttention`), or the layer's own attention reading the context
+    behind a gate it adds, the only weights the form draws (`SharedCrossAttention`)."""
+
+    def __post_init__(self) -> None:
+        text = self.text
+        if text is not None and (text.field, text.unconditional) != (TextCondition.field,
+                                                                     TextCondition.unconditional):
+            raise ValueError("a decision's context encoder reads the row's context field and has no "
+                             "unconditional branch; its text's field and unconditional are a diffusion run's")
+        if text is not None:
+            # The states context layers read are a text's (`TextContext`, keyword `textcontext`): an encoder
+            # of another input, or a denoiser's conditioner, is refused by its declarations, before any build.
+            kind = encoders[text.encoder]
+            if not kind.reads_captions or kind.keyword != ConditionEncoder.keyword:
+                raise ValueError(f"the context's text encoder {text.encoder} encodes no text into the states "
+                                 "context layers read; name one that does (char_table, clip_text, t5)")
+
+
+@dataclasses.dataclass(frozen=True)
 class DecisionRunConfig(DecoderRunConfig):
     """A run, plus the decision objective's own knobs."""
 
@@ -168,24 +281,10 @@ class DecisionRunConfig(DecoderRunConfig):
     (`PretrainedDecision.backbone`), the release's head, layout and calibration set aside."""
     calibrate: bool = True
     """Fit the task's temperatures on the held-out rows after training."""
-    max_len: int | None = None
-    """The row's length in tokens; None keeps the checkpoint's (Laya's 512) or the layout's own."""
-    head_max_len: int | None = None
-    """The tokens the question and its options may share, a declared cut; None
-    keeps the checkpoint's (Laya's release declares 192) or a fresh head's,
-    which keeps every question whole. Each row it cuts is counted in the run's
-    data counters, and a row whose cut leaves two options alike is refused."""
-    option_tokens: int | None = None
-    """The most tokens one option keeps, in a layout of one row per question, a
-    declared cut counted as `head_max_len`'s is; None keeps the checkpoint's
-    (Laya's 48) or a fresh head's, each option whole."""
-    max_state_tokens: int | None = None
-    """The most tokens a joint row's state keeps, whatever room `max_len` leaves
-    it: a row is its state, cut to this, and its schema, so a large schema
-    (a hundred options, or a document's many hypotheses) fits under a `max_len`
-    set for it without lengthening every other row's state. None lets the
-    state fill the row."""
-    option_text: Literal["named", "described"] | None = None
+    rows: RowBudgets = dataclasses.field(default_factory=RowBudgets)
+    """How the run lays its rows out over its layout (`RowBudgets`), each budget it leaves None the
+    layout's own."""
+    option_text: OptionText | None = None
     """How a question row writes a choice's option (`SegmentLayout.option_text`): its key and
     description (`named`, as Laya's release reads its rows), or its description alone (`described`).
     None keeps the layout's own, a release's named and a fresh head's described, which its record holds
@@ -195,80 +294,14 @@ class DecisionRunConfig(DecoderRunConfig):
     (`dew.config.earlier.earlier_option_text`, `earlier_checkpointed`). A joint row
     names each option by its key beside its description in its schema, the named writing, and has no
     other."""
-    segments: Annotated[tuple[RowSegment, ...], record_argument(tuple[RowSegment, ...])] | None = None
-    """The row's parts in order, as its layout reads them. A joint row's user turn
-    (`SegmentLayout.segments`): the schema first, or read as the row's context through
-    `context_layers` (`Schema(stream="context")`), its `context_length` holding the whole schema. A
-    question row's text (`SegmentLayout.segments`): its instructions, option lines and answer cue
-    beside the state, the question first or the state first, its blocks following that order
-    (`SegmentLayout.blocks`). None keeps the layout's own, the release's turn."""
-    reads: Annotated[Reads, record_argument(Reads)] | None = None
-    """Which of the row's streams each reads (`Reads`), where its `segments` name a stream of the row's
-    own (`Schema(stream=...)`, `Instructions(stream=...)`): two streams in one pass, the state reading
-    the schema and the schema itself alone, are its table. None reads the row in order."""
-    parallel: bool | None = None
-    """Whether a question row reads its options in parallel, each at positions of its own after the
-    question (`SegmentLayout.parallel`), which a head that reads option slots needs. None keeps the
-    layout's own."""
-    shared_state: int | None = None
-    """The most questions a row asks over one copy of their request's state, each read as its own row reads
-    it (`SegmentLayout.shared_state`), 1 a row a question. None keeps the layout's own: as many as a row
-    holds, where the backbone and head read each question as its own row."""
-    siblings: bool | None = None
-    """Whether a question of a row over one state also reads the questions before it in the row, whole
-    (`SegmentLayout.siblings`). None keeps the layout's own, each reading the state and itself."""
-    unit: Unit | None = None
-    """How a question row's `segments` encode their text, piece by piece or whole
-    (`SegmentLayout.unit`). None keeps the layout's own, piece by piece."""
-    order: RowOrder | None = None
-    """The order a question row's own text writes its parts in (`SegmentLayout.order`): the state
-    first, the question first, or the state, the question and the state again (`re_read`), each part as
-    the built-in row writes it. None keeps the layout's own, a causal backbone's state first."""
-    split: Literal["part", "question", "whole"] | None = None
-    """Where a question row splits into its blocks, where its backbone reads blocks (a
-    block_bidirectional `--source.attention`, `SegmentLayout.split`): at its second part, a
-    question-first row's state; at its question; or nowhere, the whole row one block its backbone
-    reads both ways (`whole`). None keeps the layout's own law."""
-    framing: Framing | None = None
-    """How a joint row frames itself as a conversation (`Framing`): its system message, the
-    assistant's prefill, the reasoning switch, a Jinja chat template in place of the tokenizer's
-    own, and the template's other variables; recorded with the run's layout, so the run reloads it.
-    None keeps the layout's own, the tokenizer's template with thinking off."""
-    context_layers: tuple[int, ...] | None = None
-    """The backbone layers that read each example's context (`Example.context`)
-    through gated cross-attention, the context encoded as `context_encoder` says;
-    the blocks train from zero gates beside the head, the loaded backbone frozen
-    (`Pretrained.with_cross_attention`) unless `context_frozen` is off, with
-    `lora` its adapter beside them. None reads no context."""
-    context_frozen: bool = True
-    """Whether the context layers freeze the backbone beside their blocks, which
-    then train alone with the head; off, they freeze nothing more, so the
-    backbone trains as the run trains it: whole, a full fine-tune, or through
-    its `lora` adapter over the frozen base (`--no-context-frozen`). With
-    `context_layers` alone."""
-    context_length: int = 256
-    """The most tokens of an example's context the cross-attention reads; a
-    longer context keeps its first tokens, the cut counted in the run's data
-    report (`data/cut/<corpus>/context`), as a served request's is stated in
-    its answer (`usage.context_kept`). With `context_layers` alone."""
-    context_encoder: ContextEncoder = "table"
-    """How a context becomes the states its cross-attention reads
-    (`DecisionModel.context_encoder`): the backbone's token table, or the
-    backbone's own pass over it. With `context_layers` alone."""
-    context_text: TextCondition | None = dataclasses.field(default=None, metadata={ADDED: True})
-    """A configured encoder of the context in place of the backbone's own (`DecisionModel.context`): a
-    registered encoder of text into states (`char_table`, `clip_text`, `t5`) and its checkpoint, as a
-    diffusion run's text condition names one, computing in the run's dtype, its tokenization the
-    context's, each row's context encoded alone, its states read by the cross-attention at its own width,
-    its weights frozen unless `context_text_trained`. With `context_layers` alone."""
-    context_text_trained: bool = dataclasses.field(default=False, metadata={ADDED: True})
+    context: CrossContext | None = None
+    """The backbone layers that read each example's context and how (`CrossContext`); None reads no
+    context but the one a saved run or release it starts from carries."""
+    context_text_trained: bool = False
     """Whether a configured context encoder's weights train with the run, else held frozen and run
-    forward alone, as a diffusion run's text encoders are."""
-    context_form: Literal["idefics", "shared"] = "idefics"
-    """The block each context layer runs: IDEFICS's gated block, an attention and a
-    feed-forward of its own drawn beside the layer (`CrossAttention`), or the
-    layer's own attention reading the context behind a gate it adds, the only
-    weights the form draws (`SharedCrossAttention`). With `context_layers` alone."""
+    forward alone, as a diffusion run's text encoders are: the run's own (`CrossContext.text`), or the one a
+    saved run or release it starts from carries (`PretrainedDecision.context`), whose context layers it
+    states none of."""
     @classmethod
     def earlier_checkpointed(cls, record: Mapping[str, object], checkpoints: Checkpoints
                              ) -> Mapping[str, object]:
@@ -302,58 +335,35 @@ class DecisionRunConfig(DecoderRunConfig):
 
     def _context_derived(self, dtype: str) -> Mapping[str, object]:
         """The objective's context arguments: how its backbone encodes a row's context, or the encoder a
-        run configures (`context_text`, built in the run's compute `dtype`, one that encodes text as
-        `_refuse_unread_context` holds it) and whether its weights train (`context_text_trained`, which
-        `build_run` reads as well for an encoder its start carries)."""
-        if self.context_layers is None:
+        run configures (`CrossContext.text`, built in the run's compute `dtype`) and whether its weights
+        train (`context_text_trained`, which `build_run` reads as well for an encoder its start carries)."""
+        if self.context is None:
             return {}
-        if self.context_text is None:
-            return {"context_encoder": self.context_encoder}
-        built = self.context_text.build(dtype=dtype_name(jnp.dtype(dtype)))
+        if self.context.text is None:
+            return {"context_encoder": self.context.encoder}
+        built = self.context.text.build(dtype=dtype_name(jnp.dtype(dtype)))
         return {"context_encoder": built.encoder, "context_trained": self.context_text_trained}
 
     def _refuse_unread_context(self) -> None:
-        """Refuse each context option a run without context layers would read nothing of: a schema read
-        as the row's context, its encoder, its frozen backbone and its block's form."""
-        # A schema, or a question's instructions and options, read as the row's context.
+        """Refuse a row whose questions are read as its context (`Schema(stream="context")`,
+        `Instructions(stream="context")`) in a run that reads no context."""
         in_context = any(isinstance(segment, (Schema, Instructions)) and segment.stream == "context"
-                         for segment in self.segments or ())
-        if in_context and self.context_layers is None:
-            raise ValueError("a row whose questions are read as its context is read by context layers; set "
-                             "--context-layers")
-        if self.context_encoder != "table" and self.context_layers is None:
-            raise ValueError("--context-encoder says how context layers read a context; set --context-layers")
-        if self.context_text is not None and self.context_layers is None:
-            raise ValueError("--context-text encodes the context context layers read; set --context-layers")
-        text = self.context_text
-        if text is not None and (text.field, text.unconditional) != (TextCondition.field,
-                                                                     TextCondition.unconditional):
-            raise ValueError("a decision's context encoder reads the row's context field and has no "
-                             "unconditional branch; --context-text.field and --context-text.unconditional "
-                             "are a diffusion run's")
-        if text is not None:
-            # The states context layers read are a text's (`TextContext`, keyword `textcontext`): an encoder
-            # of another input, or a denoiser's conditioner, is refused by its declarations, before any build.
-            kind = encoders[text.encoder]
-            if not kind.reads_captions or kind.keyword != ConditionEncoder.keyword:
-                raise ValueError(f"--context-text.encoder {text.encoder} encodes no text into the states "
-                                 "context layers read; name one that does (char_table, clip_text, t5)")
-        if not self.context_frozen and self.context_layers is None:
-            raise ValueError("--no-context-frozen says how context layers hold the backbone; set "
-                             "--context-layers")
-        if self.context_form != "idefics" and self.context_layers is None:
-            raise ValueError("--context-form says which block context layers run; set --context-layers")
+                         for segment in self.rows.segments or ())
+        if in_context and self.context is None:
+            raise ValueError("a row whose questions are read as its context is read by context layers; state "
+                             "the run's context (CrossContext)")
 
-    def _context_blocks(self, configured: ConditionEncoder | None) -> CrossAttention | SharedCrossAttention:
-        """The context layers the run draws (`context_form`), reading a configured encoder's states at its own
-        width (`ConditionWork.features`), else the backbone's; a shared layer reads them at the backbone's."""
-        assert self.context_layers is not None
-        if self.context_form == "shared":
+    def _context_blocks(self, context: CrossContext, configured: ConditionEncoder | None
+                        ) -> CrossAttention | SharedCrossAttention:
+        """The context layers the run draws (`CrossContext.form`), reading a configured encoder's states at
+        its own width (`ConditionWork.features`), else the backbone's; a shared layer reads them at the
+        backbone's."""
+        if context.form == "shared":
             # The layer's own attention reads the context at the backbone's width, a configured encoder's
             # states among them where they are that wide; the layer refuses any other width.
-            return SharedCrossAttention(self.context_layers, self.context_length)
+            return SharedCrossAttention(context.layers, context.length)
         features = None if configured is None else state_width(configured)
-        return CrossAttention(self.context_layers, self.context_length, context_features=features)
+        return CrossAttention(context.layers, context.length, context_features=features)
 
     def build_run(self) -> Prepared:
         """The objective over the backbone `pretrained` names, on the table's
@@ -377,7 +387,7 @@ class DecisionRunConfig(DecoderRunConfig):
         from dew.decision.slot_source import reads_blocks
         from dew.decision.sources import PretrainedDecision
 
-        frozen = self.lora is not None or (self.context_layers is not None and self.context_frozen)
+        frozen = self.lora is not None or (self.context is not None and self.context.frozen)
         start = Pretrained.load(self.pretrained, subfolder=self.subfolder, revision=self.revision,
                                 dtype=dtype,
                                 **self.source_keywords(frozen=frozen))
@@ -391,9 +401,9 @@ class DecisionRunConfig(DecoderRunConfig):
         # saved run or release it starts from carries (`PretrainedDecision.context`).
         if isinstance(start, PretrainedDecision) and start.context is not None:
             derived["context_trained"] = self.context_text_trained
-        elif self.context_text_trained and self.context_text is None:
+        elif self.context_text_trained and (self.context is None or self.context.text is None):
             raise ValueError("--context-text-trained trains a configured context encoder, which neither the "
-                             "run (--context-text) nor its start carries")
+                             "run (its context's text) nor its start carries")
         # Whether a fresh head's rows lie in blocks, as the loaded checkpoint and the run declare it.
         blocked = not release and reads_blocks(start.config, self.source.overrides())
         # The backbone's own transformations, a release's as a fresh backbone's: its head and layout
@@ -404,12 +414,13 @@ class DecisionRunConfig(DecoderRunConfig):
                                  f"{type(start.model).__name__} does not support")
             start = dataclasses.replace(start, model=start.model.with_remat(remat_policy(self.remat)))
         start = self.looped(start)
-        if self.context_layers is not None:
+        if self.context is not None:
             # Drawn from a key of their own, apart from the adapter's and the head's.
             encoder = derived["context_encoder"]
             configured = encoder if isinstance(encoder, ConditionEncoder) else None
-            start = start.with_cross_attention(self._context_blocks(configured), key=jax.random.fold_in(
-                jax.random.key(self.trainer.key), 1), frozen=self.context_frozen)
+            start = start.with_cross_attention(self._context_blocks(self.context, configured),
+                                               key=jax.random.fold_in(jax.random.key(self.trainer.key), 1),
+                                               frozen=self.context.frozen)
         start = start if self.lora is None else start.adapt(self.lora, key=self.trainer.key)
         assumed = start.assumed if isinstance(start, PretrainedDecision) else frozenset()
         if isinstance(start, PretrainedDecision):
@@ -458,9 +469,10 @@ class DecisionRunConfig(DecoderRunConfig):
                         validation=held)
 
     def _row_fields(self) -> Budgets:
-        """The run's fields that lay its rows out, by the layouts' field names (`ROW_FIELDS`), which
+        """The run's budgets of its rows (`rows`) and its option text, by the layout's field names, which
         `_budgeted` sets on the layout the run reads."""
-        return {name: getattr(self, name) for name in ROW_FIELDS}
+        return {**{field.name: getattr(self.rows, field.name) for field in dataclasses.fields(RowBudgets)},
+                "option_text": self.option_text}
 
     def _fresh_head(self, start, blocked: bool, budgets: Budgets) -> Mapping[str, object]:
         """The head a fresh backbone `start` reads and its rows' layout: the joint schema head, the
@@ -493,16 +505,16 @@ class DecisionRunConfig(DecoderRunConfig):
         layout = objective.layout
         found: dict[str, dict[str, object]] = {"window": {
             "tokens": layout.max_len,
-            "from": "stated" if self.max_len is not None else "release" if release else "default"}}
+            "from": "stated" if self.rows.max_len is not None else "release" if release else "default"}}
         if per_question(layout):
             for capacity, name in (("question", "head_max_len"), ("option", "option_tokens")):
                 held = getattr(layout, name)
-                origin = ("stated" if getattr(self, name) is not None else "whole" if held is None
+                origin = ("stated" if getattr(self.rows, name) is not None else "whole" if held is None
                           else "laya" if name in assumed else "release")
                 found[capacity] = {"tokens": held, "from": origin}
-        if self.context_layers is not None:
-            stated = self.context_length != type(self).context_length
-            found["context"] = {"tokens": self.context_length, "from": "stated" if stated else "default"}
+        if self.context is not None:
+            stated = self.context.length != CrossContext.length
+            found["context"] = {"tokens": self.context.length, "from": "stated" if stated else "default"}
         # A lettered layout's labels are named by now, as its head reads them (`Head.labelled`).
         labels = layout.labels if per_question(layout) else None
         named = None if labels is None else labels.names
@@ -541,14 +553,6 @@ class DecisionRunConfig(DecoderRunConfig):
 type Budgets = dict[str, int | bool | str | Framing | Labels | tuple[RowSegment, ...] | None]
 """A run's fields of a row's layout, by the layout's field names (`_budgeted`)."""
 
-ROW_FIELDS = tuple(sorted(
-    {entry.name for entry in dataclasses.fields(SegmentLayout)}
-    & {entry.name for entry in dataclasses.fields(DecisionRunConfig)}))
-"""The run's fields that lay out its rows: each a field of the decision layout (`SegmentLayout`) the run
-declares by the same name, so a layout field the run states reaches its layout (`_budgeted`) without a list
-of its own to keep."""
-
-
 def _fresh_layout(causal: bool, one_question: bool, budgets: Budgets, blocked: bool = False,
                   labels: Labels | None = None) -> Layout:
     """The layout a fresh head reads (`default_layout`), with the run's `budgets`, its rows in blocks
@@ -578,13 +582,13 @@ def _budgeted(layout: Layout, budgets: Budgets) -> Layout:
         del stated["option_text"]
     if per_question(layout) and "framing" in stated and (
             stated.get("segments", layout.segments) is None):
-        raise ValueError("--framing frames a joint row or a question row of --segments; a question layout's "
-                         "own row is written as its release writes it, unframed")
+        raise ValueError("--rows.framing frames a joint row or a question row of --rows.segments; a question "
+                         "layout's own row is written as its release writes it, unframed")
     fields = {field.name for field in dataclasses.fields(layout)}
-    unknown = sorted(f"--{name.replace('_', '-')}" for name in stated if name not in fields)
+    unknown = sorted(f"--rows.{name.replace('_', '-')}" for name in stated if name not in fields)
     if unknown:
         raise ValueError(f"{', '.join(unknown)} budget a row that {type(layout).__name__} does not lay out")
     return dataclasses.replace(layout, **stated)
 
 
-__all__ = ["DecisionRunConfig", "JointShape", "Letters"]
+__all__ = ["CrossContext", "DecisionRunConfig", "JointShape", "Letters", "RowBudgets"]

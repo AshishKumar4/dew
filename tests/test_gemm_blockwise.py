@@ -9,7 +9,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, with_gradients
+from blockwise_matrix import CUBLASLT_PRECISION
+from reference_error import assert_as_exact, equations, with_gradients
 
 from dew.nn.kernels import gemm, generation, grouped_matmul, projections, tuning
 from dew.nn.kernels.templates.gemm import tiling
@@ -111,8 +112,11 @@ def _gradient_truth(lhs_t, rhs_t, *scales):
 
 def _gradient_cublaslt(*operands):
     """cuBLASLt's FP8 GEMM on the kernel gradient's codes a block at a time (`blockwise_matrix.cublaslt_arm`:
-    its blocks' dots of the FP8 codes into fp32), each partial scaled and added in order."""
-    return _blocked(*operands, jnp.float32)
+    its blocks' dots of the FP8 codes into fp32 at `CUBLASLT_PRECISION`, cuBLASLt's fast accumulation), each
+    partial scaled and added in order. The precision read as a name of this module's: a test module an arm
+    reads through is no value its prepare's statement holds (`truths_ahead.arm_role`), and the arm would run
+    unprepared."""
+    return _blocked(*operands, jnp.float32, precision=CUBLASLT_PRECISION)
 
 
 def a_blockwise_kernel_gradient_is_on_par(interpret: bool = False):
@@ -233,7 +237,8 @@ def test_restored_blockwise_cublaslt_references_prepare_on_sm90(tmp_path, monkey
     import generation_support
     import model_flows
     import tier_wire
-    from truths_ahead import AT_RUN, DEFERRED, HELD, SITE, UNPREPARED, prepared
+    from tier_wire import DEFERRED
+    from truths_ahead import AT_RUN, HELD, SITE, UNPREPARED, prepared
 
     monkeypatch.setenv(model_flows.TOPOLOGY, str(generation_support.node_topology(tmp_path / "topology.bin",
                                                                                    gpu="sm90")))
@@ -280,10 +285,7 @@ def test_a_blockwise_chain_through_the_template_is_its_two_projections_apart(row
     with generation.assumed("sm90"), generation.chosen(blockwise_fp8="mosaic"), generation.routes() as routes:
         fused = jax.jit(with_gradients(chained))(x, up, down, cotangent)
         separate = jax.jit(with_gradients(apart))(x, up, down, cotangent)
-    for name, got, want in zip(("value", "d_x", "d_up", "d_down"), fused, separate, strict=True):
-        assert got.dtype == want.dtype, (name, got.dtype, want.dtype)
-        bits = np.dtype(f"uint{8 * got.dtype.itemsize}")
-        np.testing.assert_array_equal(np.asarray(got).view(bits), np.asarray(want).view(bits), err_msg=name)
+    blockwise_matrix.assert_bitwise_leaves(("value", "d_x", "d_up", "d_down"), fused, separate)
     assert ("blockwise_fp8", "mosaic") in {(route.choice, route.kernel) for route in routes}
 
 
@@ -339,10 +341,7 @@ def test_an_ungated_mlps_recipe_chain_is_its_two_recipe_projections_apart(rows):
     with generation.run_precision(FP8), projection_role("mlp"):
         fused = jax.jit(with_gradients(chained))(x, up, down, cotangent)
         separate = jax.jit(with_gradients(apart))(x, up, down, cotangent)
-    for name, got, want in zip(("value", "d_x", "d_up", "d_down"), fused, separate, strict=True):
-        assert got.dtype == want.dtype, (name, got.dtype, want.dtype)
-        bits = np.dtype(f"uint{8 * got.dtype.itemsize}")
-        np.testing.assert_array_equal(np.asarray(got).view(bits), np.asarray(want).view(bits), err_msg=name)
+    blockwise_matrix.assert_bitwise_leaves(("value", "d_x", "d_up", "d_down"), fused, separate)
 
 
 def _swiglu(gate, up):
@@ -378,10 +377,7 @@ def test_a_gated_blockwise_chain_through_the_template_is_its_three_projections_a
     with generation.assumed("sm90"), generation.chosen(blockwise_fp8="mosaic"), generation.routes() as routes:
         fused = jax.jit(with_gradients(chained))(x, gate, up, down, cotangent)
         separate = jax.jit(with_gradients(apart))(x, gate, up, down, cotangent)
-    for name, got, want in zip(("value", "d_x", "d_gate", "d_up", "d_down"), fused, separate, strict=True):
-        assert got.dtype == want.dtype, (name, got.dtype, want.dtype)
-        bits = np.dtype(f"uint{8 * got.dtype.itemsize}")
-        np.testing.assert_array_equal(np.asarray(got).view(bits), np.asarray(want).view(bits), err_msg=name)
+    blockwise_matrix.assert_bitwise_leaves(("value", "d_x", "d_gate", "d_up", "d_down"), fused, separate)
     assert ("blockwise_fp8", "mosaic") in {(route.choice, route.kernel) for route in routes}
 
 
@@ -438,10 +434,8 @@ def _assert_gated_chain_is_apart(activation, x, gate, up, down, cotangent) -> No
     with generation.run_precision(FP8), projection_role("mlp"):
         fused = jax.jit(with_gradients(chained))(x, gate, up, down, cotangent)
         separate = jax.jit(with_gradients(apart))(x, gate, up, down, cotangent)
-    for name, got, want in zip(("value", "d_x", "d_gate", "d_up", "d_down"), fused, separate, strict=True):
-        assert np.all(np.isfinite(np.asarray(got, np.float32))), name
-        bits = np.dtype(f"uint{8 * got.dtype.itemsize}")
-        np.testing.assert_array_equal(np.asarray(got).view(bits), np.asarray(want).view(bits), err_msg=name)
+    blockwise_matrix.assert_bitwise_leaves(("value", "d_x", "d_gate", "d_up", "d_down"), fused, separate,
+                                           finite=True)
 
 
 @pytest.mark.parametrize("activation", ["nonzero at zero", "nonfinite derivative at zero"])
@@ -471,7 +465,44 @@ def test_a_padded_recipe_chain_keeps_its_padding_out_of_every_gradient(activatio
     with generation.run_precision(FP8), projection_role("mlp"):
         fused = jax.jit(with_gradients(chained))(x, up, down, cotangent)
         separate = jax.jit(with_gradients(apart))(x, up, down, cotangent)
-    for name, got, want in zip(("value", "d_x", "d_up", "d_down"), fused, separate, strict=True):
-        assert np.all(np.isfinite(np.asarray(got, np.float32))), name
-        bits = np.dtype(f"uint{8 * got.dtype.itemsize}")
-        np.testing.assert_array_equal(np.asarray(got).view(bits), np.asarray(want).view(bits), err_msg=name)
+    blockwise_matrix.assert_bitwise_leaves(("value", "d_x", "d_up", "d_down"), fused, separate, finite=True)
+
+
+@pytest.mark.parametrize("recipe", ["blockwise_fp8", "nvfp4"])
+@pytest.mark.parametrize("gated", [False, True], ids=["ungated", "gated"])
+def test_a_recipe_chains_products_carry_the_names_a_remat_policy_saves(recipe, gated):
+    """A recipe chain given `names` (`blockwise_chain`, `nvfp4_chain`; `recipe_chain`'s, which `GatedMLP`
+    passes) names its first projections' rounded products, the residuals its backward reads, as the
+    projections apart name their outputs: differentiated under a remat policy saving those names, its
+    program runs no more products than without remat, its backward recomputing neither first projection nor
+    its quantizing epilogue; unnamed, the same policy recomputes them (row 12758)."""
+    rng = np.random.default_rng(12758)
+    x = jnp.asarray(rng.normal(size=(128, 128)), jnp.bfloat16)
+    firsts = [jnp.asarray(rng.normal(size=(1, 128, 256)) / 16, jnp.bfloat16) for _ in range(1 + gated)]
+    down = jnp.asarray(rng.normal(size=(1, 256, 128)) / 16, jnp.bfloat16)
+
+    def activation(*values):
+        return jax.nn.silu(values[0]) * values[-1] if gated else jax.nn.relu(values[0])
+
+    def total(names):
+        def run(x, *matrices):
+            *gate, up, down = matrices
+            options = {"gate": gate[0] if gate else None, "names": names, "out_dtype": jnp.bfloat16}
+            if recipe == "nvfp4":
+                scales = (jnp.float32(2.0 ** -6), jnp.float32(2.0 ** -8))
+                out = projections.nvfp4_chain(x, up, down, activation, tensor_scales=scales, **options)
+            else:
+                out = projections.blockwise_chain(x, up, down, activation, **options)
+            return jnp.sum(out.astype(jnp.float32))
+        return run
+
+    def products(fn) -> int:
+        # The products the differentiated program runs, its sub-programs' too.
+        graph = jax.make_jaxpr(jax.grad(fn, argnums=tuple(range(3 + gated))))(x, *firsts, down)
+        return sum(equation.primitive.name in ("dot_general", "ragged_dot_general")
+                   for equation in equations(graph, platform="cpu"))
+
+    policy = jax.checkpoint_policies.save_only_these_names("gate", "up")
+    plain = products(total(("gate", "up")))
+    assert products(jax.checkpoint(total(("gate", "up")), policy=policy)) == plain
+    assert products(jax.checkpoint(total(None), policy=policy)) > plain

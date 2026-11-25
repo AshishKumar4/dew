@@ -56,6 +56,10 @@ class Unavailable(R2Error):
     """A Worker that is busy or down (429, 5xx), or a request that did not complete."""
 
 
+class Malformed(R2Error):
+    """An answer that is not what the Worker's contract says it gives (a listing that is no page of keys)."""
+
+
 def valid(key: str) -> bool:
     """Whether the Worker takes `key` (r2.json): at most max_key_length characters of letters, digits and
     `._=-` in /-separated parts, none of them `..`."""
@@ -74,43 +78,157 @@ class Stream(Protocol):
     def close(self) -> None: ...
 
 
-Sender = Callable[[str, str, Mapping[str, str], "bytes | None", float], tuple[int, Mapping[str, str], Stream]]
-"""What sends a request, `(method, url, headers, body, timeout)`, and gives its answer whatever its status, as
-`(status, headers, body)`, following no redirect. A request that does not complete, and a body cut short
-while it is read, raise an OSError (or http.client's HTTPException); everything else is the `Store`'s."""
+Sender = Callable[[str, str, Mapping[str, str], "bytes | None", float, "float | None"],
+                  tuple[int, Mapping[str, str], Stream]]
+"""What sends a request, `(method, url, headers, body, timeout, until)`, and gives its answer whatever its
+status, as `(status, headers, body)`, following no redirect: each wait at most `timeout` seconds and, where a
+caller gives `until` (a `time.monotonic` instant), the whole of it, connecting, sending and every receive of
+its answer's headers, ended by then. A request that does not complete, and a body cut short while it is read,
+raise an OSError (or http.client's HTTPException); everything else is the `Store`'s."""
+
+
+class _Guard:
+    """A request's sockets shut at `until`, which ends whatever receive or send waits on one then: its every
+    wait, however many, within its caller's end. It watches each socket the request comes to use (`watch`):
+    the one connected, TLS's wrapping of it, and the one its answer reads, even once a `Connection: close`
+    answer detaches it from its connection. Disarmed (`disarm`) under the same lock it fires under, so once
+    disarmed no shutdown follows, and whether it fired first says whether its connection may be kept. None
+    (`until` None) guards nothing."""
+
+    def __init__(self, until: float | None):
+        self.lock = threading.Lock()
+        self.fired = self.disarmed = False
+        self.sockets: list[socket.socket] = []
+        self.timer = None
+        if until is not None:
+            self.timer = threading.Timer(max(until - time.monotonic(), 0.0), self.fire)
+            self.timer.daemon = True
+            self.timer.start()
+
+    @staticmethod
+    def shut(sock: socket.socket) -> None:
+        with contextlib.suppress(OSError):
+            sock.shutdown(socket.SHUT_RDWR)
+
+    def watch(self, sock: socket.socket | None) -> None:
+        """`sock` shut at `until` too, at once where it has passed."""
+        if sock is None:
+            return
+        with self.lock:
+            if self.fired and not self.disarmed:
+                self.shut(sock)
+            elif sock not in self.sockets:
+                self.sockets.append(sock)
+
+    def fire(self) -> None:
+        with self.lock:
+            if self.disarmed:
+                return
+            self.fired = True
+            for sock in self.sockets:
+                self.shut(sock)
+
+    def disarm(self) -> bool:
+        """The guard stopped: True where it had not fired, its sockets untouched."""
+        with self.lock:
+            self.disarmed = True
+            if self.timer is not None:
+                self.timer.cancel()
+            return not self.fired
+
+
+def _connect(connection: http.client.HTTPConnection, guard: _Guard, until: float | None) -> None:
+    """`connection` connected (its name resolved, its TCP and TLS handshakes) within `until` where one is
+    given, its socket then watched by `guard`. A connect still going at `until` is left to finish on its own
+    thread, which closes what it made; the caller is given a TimeoutError then."""
+    if until is None:
+        connection.connect()
+        guard.watch(connection.sock)
+        return
+    outcome: dict[str, BaseException | bool] = {}
+    abandoned = threading.Event()
+
+    def connect() -> None:
+        try:
+            connection.connect()
+            outcome["done"] = True
+        except BaseException as error:  # handed to the caller below
+            outcome["error"] = error
+        if abandoned.is_set():
+            connection.close()
+
+    thread = threading.Thread(target=connect, daemon=True)
+    thread.start()
+    thread.join(max(until - time.monotonic(), 0.0))
+    if thread.is_alive():
+        abandoned.set()
+        raise TimeoutError("the connection was not made in time")
+    if isinstance(error := outcome.get("error"), BaseException):
+        raise error
+    guard.watch(connection.sock)
+
+
+def _wait(timeout: float, until: float | None, what: str) -> float:
+    """A wait of at most `timeout` seconds and what is left until `until` (none, None); a TimeoutError where
+    nothing is left."""
+    if until is None:
+        return timeout
+    left = until - time.monotonic()
+    if left <= 0:
+        raise TimeoutError(f"{what}: no time left")
+    return min(timeout, left)
 
 
 class _Answer:
     """An http.client answer as a `Stream`: each read one receive of its socket, bounded as asked."""
 
     def __init__(self, connection: http.client.HTTPConnection, sock: socket.socket,
-                 response: http.client.HTTPResponse):
+                 response: http.client.HTTPResponse, guard: _Guard, until: float | None):
         self.connection, self.sock, self.response = connection, sock, response
+        self.guard, self.until = guard, until
+        # The socket its answer reads, its connection's or one a `Connection: close` answer detached.
+        guard.watch(sock)
 
     def read1(self, size: int, seconds: float) -> bytes:
-        self.sock.settimeout(seconds)
-        return self.response.read1(size)
+        self.sock.settimeout(_wait(seconds, self.until, "a body's read"))
+        data = self.response.read1(size)
+        # Read on a socket its guard shut: an end of the stream that is no end of the body (a chunk's size
+        # line cut short reads as the last chunk), never data.
+        if self.guard.fired:
+            raise TimeoutError("the answer's body was read past its caller's end")
+        return data
 
     def close(self) -> None:
+        self.guard.disarm()
         self.response.close()
         self.connection.close()
 
 
-def urllib_send(method: str, url: str, headers: Mapping[str, str], body: bytes | None,
-                timeout: float) -> tuple[int, Mapping[str, str], Stream]:
+def urllib_send(method: str, url: str, headers: Mapping[str, str], body: bytes | None, timeout: float,
+                until: float | None = None) -> tuple[int, Mapping[str, str], Stream]:
     """The standard library's sender: a connection a request, following no redirect, which a caller that
     runs before any environment exists (ci.py, remote_cache) can use. Its socket is held from the request
-    on, so each read of the answer's body waits as long as the `Body` reading it allows."""
+    on, so each read of the answer's body waits as long as the `Body` reading it allows; the request whole
+    ends by `until` (`_Guard`)."""
     parts = urllib.parse.urlsplit(url)
     if parts.hostname is None:
         raise ValueError(f"{url} names no host")
     opened = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
-    connection = opened(parts.hostname, parts.port, timeout=timeout)
-    connection.request(method, f"{parts.path or '/'}{f'?{parts.query}' if parts.query else ''}", body=body,
-                       headers=dict(headers))
-    sock = connection.sock
-    response = connection.getresponse()
-    return response.status, dict(response.headers), _Answer(connection, sock, response)
+    connection = opened(parts.hostname, parts.port, timeout=_wait(timeout, until, url))
+    guard = _Guard(until)
+    try:
+        _connect(connection, guard, until)
+        connection.request(method, f"{parts.path or '/'}{f'?{parts.query}' if parts.query else ''}",
+                           body=body, headers=dict(headers))
+        sock = connection.sock
+        response = connection.getresponse()
+        if guard.fired:
+            raise TimeoutError("the answer's headers came past its caller's end")
+    except BaseException:
+        guard.disarm()
+        connection.close()
+        raise
+    return response.status, dict(response.headers), _Answer(connection, sock, response, guard, until)
 
 
 DRAINED = 2 ** 16
@@ -134,8 +252,8 @@ class KeptSend:
     def __init__(self):
         self.local = threading.local()
 
-    def __call__(self, method: str, url: str, headers: Mapping[str, str], body: bytes | None,
-                 timeout: float) -> tuple[int, Mapping[str, str], Stream]:
+    def __call__(self, method: str, url: str, headers: Mapping[str, str], body: bytes | None, timeout: float,
+                 until: float | None = None) -> tuple[int, Mapping[str, str], Stream]:
         parts = urllib.parse.urlsplit(url)
         host = parts.hostname
         if host is None:
@@ -148,31 +266,46 @@ class KeptSend:
         opened = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
         held = kept.pop(place, None)
         while True:
-            connection = held or opened(host, parts.port, timeout=timeout)
-            connection.timeout = timeout
-            if connection.sock is not None:
-                connection.sock.settimeout(timeout)
+            # What is left of `until`, read afresh for each attempt: a retry on a new connection waits no
+            # longer than the first left it.
+            wait = _wait(timeout, until, url)
+            connection = held or opened(host, parts.port, timeout=wait)
+            connection.timeout = wait
+            guard = _Guard(until)
             try:
+                if connection.sock is None:
+                    _connect(connection, guard, until)
+                else:
+                    connection.sock.settimeout(wait)
+                    guard.watch(connection.sock)
                 connection.request(method, target, body=body, headers=dict(headers))
                 # Held before the answer, which detaches it from a connection the Worker closes after it, as
                 # `urllib_send` holds it.
                 sock = connection.sock
                 response = connection.getresponse()
+                if guard.fired:
+                    raise TimeoutError("the answer's headers came past its caller's end")
             except (http.client.RemoteDisconnected, ConnectionResetError, BrokenPipeError):
+                in_time = guard.disarm()
                 connection.close()
-                if held is None:
+                if held is None or not in_time:
                     raise
                 held = None
                 continue
-            return response.status, dict(response.headers), _Kept(kept, place, connection, sock, response)
+            except BaseException:
+                guard.disarm()
+                connection.close()
+                raise
+            return (response.status, dict(response.headers),
+                    _Kept(kept, place, connection, sock, response, guard, until))
 
 
 class _Kept(_Answer):
     """A `KeptSend` answer: closed, its connection goes back to its thread's where it can carry another."""
 
     def __init__(self, kept: dict, place: tuple, connection: http.client.HTTPConnection, sock: socket.socket,
-                 response: http.client.HTTPResponse):
-        super().__init__(connection, sock, response)
+                 response: http.client.HTTPResponse, guard: _Guard, until: float | None):
+        super().__init__(connection, sock, response, guard, until)
         self.kept, self.place = kept, place
 
     def close(self) -> None:
@@ -185,7 +318,11 @@ class _Kept(_Answer):
         elif (not response.isclosed() and not 200 <= response.status < 300 and response.length is not None
                 and response.length <= DRAINED):
             self.drained()
-        if response.isclosed() and not response.will_close and self.place not in self.kept:
+        # Disarmed before it is kept: a guard that fired first, or fires no more once disarmed, leaves no
+        # shutdown pending on a connection the next request takes.
+        in_time = self.guard.disarm()
+        if (in_time and response.isclosed() and not response.will_close
+                and self.place not in self.kept):
             self.kept[self.place] = self.connection
         else:
             super().close()
@@ -195,6 +332,7 @@ class _Kept(_Answer):
         most what is left of them; a body that does not come whole in time leaves the answer open, and its
         connection is closed."""
         ends = time.monotonic() + DRAIN_SECONDS
+        ends = ends if self.until is None else min(ends, self.until)
         # A body cut short or refused leaves the answer open, which `close` reads as a connection to close.
         with contextlib.suppress(OSError, http.client.HTTPException):
             while not self.response.isclosed() and (left := ends - time.monotonic()) > 0:
@@ -207,11 +345,15 @@ class Body:
     before the length the Worker announced, a connection cut while reading, or a body arriving slower than
     `MIN_RATE` past `timeout` seconds, `Unavailable`."""
 
-    def __init__(self, stream: Stream, headers: Mapping[str, str], limit: int, what: str, timeout: float):
+    def __init__(self, stream: Stream, headers: Mapping[str, str], limit: int, what: str, timeout: float,
+                 until: float | None = None):
         self.stream, self.left, self.what, self.timeout = stream, limit, what, timeout
         announced = {name.lower(): value for name, value in headers.items()}.get("content-length")
         self.owed = None if announced is None else int(announced)
         self.ends = time.monotonic() + timeout + (limit if self.owed is None else self.owed) / MIN_RATE
+        # A caller's own end (`until`, a `time.monotonic` instant) bounds it whole, no allowance past it.
+        if until is not None:
+            self.ends = min(self.ends, until)
 
     def read(self, size: int = -1) -> bytes:
         """At most `size` bytes more, what one receive gives (all the rest, under -1); b"" at the body's end.
@@ -272,11 +414,12 @@ class Store:
     @contextlib.contextmanager
     def request(self, method: str, key: str = "", *, query: Mapping[str, str] | None = None,
                 headers: Mapping[str, str] | None = None, body: bytes | None = None,
-                limit: int = MAX_BYTES) -> Iterator[Reply]:
+                limit: int = MAX_BYTES, until: float | None = None) -> Iterator[Reply]:
         """The Worker's answer to `method` on `key` (the bucket's root, for a listing, when empty), held
-        open while the caller reads its body (at most `limit` bytes; none for a 304 or 404). A key or a body
-        the Worker would refuse is a ValueError, raised before anything is sent; any other failure an
-        `R2Error`."""
+        open while the caller reads its body (at most `limit` bytes; none for a 304 or 404), the whole of it
+        within `until` (a `time.monotonic` instant) where one is given: its every wait no longer than what is
+        left, no allowance past it. A key or a body the Worker would refuse is a ValueError, raised before
+        anything is sent; any other failure, its time out among them, an `R2Error`."""
         if key and not valid(key):
             raise ValueError(f"the R2 Worker takes no key {key!r}")
         if body is not None and not CONTRACT["min_bytes"] <= len(body) <= MAX_BYTES:
@@ -286,10 +429,13 @@ class Store:
         if query:
             url += "?" + urllib.parse.urlencode(query)
         what = f"{method} {key or url}"
+        timeout = self.timeout if until is None else min(self.timeout, until - time.monotonic())
+        if timeout <= 0:
+            raise Unavailable(f"{what}: no time left to ask")
         try:
             status, given, stream = self.send(method, url, {
                 "Authorization": f"Bearer {self.token}", "User-Agent": self.user_agent, **(headers or {})},
-                body, self.timeout)
+                body, timeout, until)
         except (OSError, http.client.HTTPException) as error:  # a request that did not complete
             raise Unavailable(f"{what} did not complete: {error}") from error
         with contextlib.closing(stream):
@@ -298,12 +444,12 @@ class Store:
                           Unavailable if status == 429 or status >= 500 else Refused)
                 raise raised(f"the R2 Worker answered {status} to {what}")
             answer = (None if method == "HEAD" or status in (304, 404) else
-                      Body(stream, given, limit, f"the answer to {what}", self.timeout))
+                      Body(stream, given, limit, f"the answer to {what}", timeout, until))
             yield Reply(status, dict(given), answer)
 
-    def get(self, key: str, limit: int = MAX_BYTES) -> bytes | None:
-        """The object at `key`, or None where there is none."""
-        with self.request("GET", key, limit=limit) as reply:
+    def get(self, key: str, limit: int = MAX_BYTES, until: float | None = None) -> bytes | None:
+        """The object at `key`, or None where there is none, within `until` where one is given (`request`)."""
+        with self.request("GET", key, limit=limit, until=until) as reply:
             return None if reply.body is None else reply.body.whole()
 
     def put(self, key: str, body: bytes) -> None:
@@ -316,13 +462,24 @@ class Store:
         with self.request("DELETE", key):
             pass
 
-    def keys(self, prefix: str) -> Iterator[str]:
-        """The keys under `prefix`, without it, a page at a time."""
+    def keys(self, prefix: str, until: float | None = None) -> Iterator[str]:
+        """The keys under `prefix`, without it, a page at a time, each page within `until` where one is given
+        (`request`). A page that is no object of a list of keys and a cursor (a string, or none at the
+        listing's end) is `Malformed`."""
         cursor = None
         while True:
             query = {"list": prefix} | ({"cursor": cursor} if cursor else {})
-            with self.request("GET", query=query) as reply:
-                page = json.loads(reply.body.whole())
+            with self.request("GET", query=query, until=until) as reply:
+                if reply.body is None:
+                    raise Malformed(f"a listing of {prefix} has no body")
+                try:
+                    page = json.loads(reply.body.whole())
+                except ValueError as error:
+                    raise Malformed(f"a listing of {prefix} is no JSON: {error}") from error
+            if not (isinstance(page, dict) and isinstance(page.get("keys"), list)
+                    and all(isinstance(key, str) for key in page["keys"]) and "cursor" in page
+                    and (page["cursor"] is None or isinstance(page["cursor"], str))):
+                raise Malformed(f"a listing of {prefix} is no page of keys and a cursor")
             yield from page["keys"]
             cursor = page["cursor"]
             if not cursor:

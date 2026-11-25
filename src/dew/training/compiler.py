@@ -61,14 +61,15 @@ from dew.training.distributed import (
     resumed_link_figures,
 )
 from dew.training.memory import (
+    admission,
     ceiling_headroom,
     climb_to,
     code_bytes,
     layer_gathers,
     local_devices,
     memory_record,
-    placed_beside,
     remat_admits,
+    remat_stated,
     remat_topmost,
     rung_record,
     step_fits,
@@ -999,11 +1000,13 @@ class StepCompiler[L, E]:
             # charge of a state the devices held none of (row 8962: a headroom and a charge of two
             # judgements in one record); and the placed judgement whole (`placed`): that headroom with its
             # copies built, and the bytes it held beside the step that the allocators did not.
-            held_out = judging.charged[0]
+            held_out, built = judging.charged
             stats = compiled_memory(planned.judged)
-            beside = None if stats is None else placed_beside(stats, held_out)
-            probes = [*probes[:own], {**probes[own], "headroom": headroom, "beside": beside},
-                      *probes[own + 1:]]
+            # Its admitted terms the placed judgement's too (`memory.admission`), beside them as it placed.
+            admitted = None if stats is None else list(admission(stats, held_out, built))
+            beside = None if admitted is None else admitted[1]
+            probes = [*probes[:own], {**probes[own], "headroom": headroom, "beside": beside,
+                                      "admitted": admitted}, *probes[own + 1:]]
             memory = memory_record(planned.executable, local_devices(mesh), held_out, fits=True)
             compiled = dataclasses.replace(
                 compiled, plan={**plan, "probes": probes, "placed": {"headroom": headroom, "held": held_out}},
@@ -1102,8 +1105,9 @@ class StepCompiler[L, E]:
         start copies let go (`freed`, `Start.freed`), and a placed plan is judged on no more than its
         devices' free bytes (their largest block), so a candidate the search saw miss by more than that misses
         there. Refused only where the search measured every candidate a search on the placed devices could
-        reach: each rung it asked at every split (`PlanRefused.candidates`), none passed over, its rungs'
-        variants chosen from no miss (`PlanRefused.variants`), its search begun at the base rung (no record
+        reach: each rung it asked at every split (`PlanRefused.candidates`), none passed over, each lighter
+        form of them measured or measured to free nothing (`PlanRefused.variants`,
+        `FitSearch.unmeasured_lighter`), its search begun at the base rung (no record
         or checkpoint naming one, which a placed search of other shardings may not read,
         `PlanRefused.recorded_start`), what the start frees known (none where an aliased held array leaves it
         unknown, `Start.freed`), every miss measured and each beyond that room on some process (a
@@ -1192,33 +1196,15 @@ class StepCompiler[L, E]:
     def sampled_step(self, cap: Compiled, key: jax.Array) -> DrawingStep:
         """The step of a run that draws its pass count per microbatch (`PhasePasses.sampled`): `cap`, the one
         program at its cap (`compile`, which plans it with a count a microbatch, `_plan`), drawing under the
-        run's `key`. Its window pools each microbatch's statistics by their mean: one that replays them
-        (`pooled_by_mean`) would replay each at the count closing its window, and is refused where it holds
-        several (row 7884)."""
+        run's `key`. A window that replays its microbatches replays each at the count it drew, which its
+        held batch carries (`dew.batch.LOOP_PASSES`), as one that pools them by their mean; statistics of a
+        step's whole batch read each part at its own count, cut from the whole batch that carries them
+        (`Transaction._step_attempt`'s `part_at`; row 12867, where both were refused, rows 7884 and
+        10770)."""
         sampled, planned = self.phase_passes.sampled, cap.planned
         assert sampled is not None and planned is not None and cap.step is not None
-        self._refuse_sampled_window(planned)
         words = tuple(int(word) for word in np.asarray(jax.random.key_data(key)).ravel())
         return DrawingStep(planned.split, sampled, words, cap.step_flops, run=cap.step)
-
-    def _refuse_sampled_window(self, cap: Planned) -> None:
-        """Refused where a run and a build ahead (`compile_ahead`) both build a sampled run's step: a window
-        that pools its microbatches by their mean holds their gradient's sum and its mass
-        (`dew.training._windows.empty_window`), DiLoCo's its groups' (`TrainState.window`); one that replays
-        them holds their batches instead."""
-        sampled = self.phase_passes.sampled
-        assert sampled is not None, "a run that draws its pass count per microbatch"
-        window = cap.candidate.prepared.window
-        if window is not None and window.mass is None:
-            raise ValueError(f"{type(self.objective).__name__}'s statistics are no mean its window pools, so "
-                             "its update replays each microbatch at the count that closes it: a pass count "
-                             "drawn per microbatch takes them one microbatch an update (split and "
-                             "accumulation 1), until replays run each at its own (row 7884)")
-        if window is not None and window.batch_statistics is not None and cap.split > 1 and sampled.cap > 1:
-            raise ValueError(f"{type(self.objective).__name__}'s statistics of a step's whole batch "
-                             "(`batch_statistics`) are computed at its first part, by that part's count, and "
-                             "read by every part: a pass count drawn per microbatch reads them one part a "
-                             "step (split 1), until each part's count computes its own (row 10770's audit)")
 
     def whole_program(self) -> OuterProgram:
         """The program a split step's whole runs on its microbatches' outputs (`whole_step_program`), each
@@ -1388,8 +1374,10 @@ class StepCompiler[L, E]:
             recorded = {**record(searched.rung, 'plan'), 'split': searched.split}
             source = "this process's search of the step"
         before = self.rung()
-        # Where the run was configured, before a record moves it: the ladder a frontier reads below its plan.
+        # Where the run was configured, before a record moves it: the ladder a frontier reads below its plan,
+        # and whether the run itself stated a remat policy (not one a saved plan climbed to).
         origin = Rung.of(self.objective, self._xla_defaults, self._narrow, self._ns_group)
+        stated = remat_stated(self.objective)
         if recorded is not None and not remat_admits(self.objective, record(recorded, 'plan'), self.remat):
             # A plan saved by a run of another policy (an ahead step's, a checkpoint's), which this one's
             # recomputation contradicts: searched afresh from where the run was configured.
@@ -1412,7 +1400,7 @@ class StepCompiler[L, E]:
             self.objective, mesh, self._xla_defaults, self._narrow, self._ns_group,
             None if self._base_rung is None
             else self._base_rung[1], resumed, remat=self.remat, ahead=self.ahead,
-            provisional=provisional, unplaced=unplaced, executables=self._executables)
+            provisional=provisional, stated_remat=stated, unplaced=unplaced, executables=self._executables)
         if search.provisional:
             # Its programs held until a plan is taken in its place, or its run abandons it, even where it
             # refuses (`Unplaced.release`, `dew.training.ahead.LaterPlans`).

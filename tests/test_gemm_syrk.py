@@ -175,9 +175,28 @@ def test_unforced_syrk_skips_mosaic_certification_while_forced_certifies():
                for c in report.certifications())
 
 
-def test_syrk_measured_gate_admits_whole_tile_ampere_and_hopper_gram_only():
-    """`M-NG-45-a100` & `M-NG-45b-gh200` admit whole-tile `mma.sync`/`wgmma` symmetric Gram (1.52-1.91x XLA)
-    while keeping ragged shapes, polynomials (pending native Check 1), and unmeasured `sm100` on XLA."""
+@pytest.mark.parametrize("other", ["mosaic", "cutlass", "triton"])
+def test_naming_the_grouped_products_kernel_leaves_muons_symmetric_products_their_own(other):
+    """Muon's symmetric Gram and Newton-Schulz polynomial (`gemm.SYRK`) select under their own choice
+    (`syrk`): naming the grouped products' kernel (`grouped_matmul`) routes no SYRK call to it nor refuses
+    one, each symmetric product on an sm90's routes the default's, as `syrk` unnamed takes it (row 12485)."""
+    x = jax.ShapeDtypeStruct((4, 128, 256), jnp.bfloat16)
+
+    def routes_of(**named):
+        with generation.assumed("sm90"), generation.chosen(**named), generation.routes() as found:
+            jax.eval_shape(gemm.symmetric_gram, x)
+            jax.eval_shape(lambda a: gemm.symmetric_polynomial(a, (3.4445, -4.7750, 2.0315)),
+                           jax.ShapeDtypeStruct((4, 128, 128), jnp.bfloat16))
+        return [(route.choice, route.kernel) for route in found if route.choice == "syrk"]
+
+    default = routes_of()
+    assert default and routes_of(grouped_matmul=other) == default
+
+
+def test_syrk_measured_gate_admits_whole_tile_ampere_and_hopper_grams_and_polynomials():
+    """`M-NG-45-a100`, `M-NG-45b-gh200` and `M-NG-5` admit whole-tile `mma.sync`/`wgmma` symmetric Grams
+    (1.52-1.98x XLA) and polynomials (1.17-1.96x) while keeping ragged shapes and unmeasured `sm100` on
+    XLA."""
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     for gpu in ("sm80", "sm90"):
         with generation.assumed(gpu):
@@ -185,7 +204,9 @@ def test_syrk_measured_gate_admits_whole_tile_ampere_and_hopper_gram_only():
                                      precision=None, out_dtype=jnp.bfloat16, interpret_on_cpu=False)
             assert not gemm._syrk_select(bf16((4, 150, 200)), has_poly=False, transpose=False,
                                          precision=None, out_dtype=jnp.bfloat16, interpret_on_cpu=False)
-            assert not gemm._syrk_select(bf16((28, 2560, 2560)), has_poly=True, transpose=False,
+            assert gemm._syrk_select(bf16((28, 2560, 2560)), has_poly=True, transpose=False,
+                                     precision=None, out_dtype=jnp.bfloat16, interpret_on_cpu=False)
+            assert not gemm._syrk_select(bf16((4, 150, 150)), has_poly=True, transpose=False,
                                          precision=None, out_dtype=jnp.bfloat16, interpret_on_cpu=False)
     with generation.assumed("sm100"):
         assert not gemm._syrk_select(bf16((28, 2560, 4096)), has_poly=False, transpose=False,
@@ -516,30 +537,30 @@ def test_newton_schulz_reaches_mosaic_syrk_and_honors_dot_algorithm():
 
 
 @lowers("sm90")
-def test_syrk_measured_gram_gates_to_measured_bf16_cells():
-    """`syrk.measured_gram` admits whole-tile bf16 Gram shapes filling at least one SM wave on measured
-    generations (`sm80`, `sm90`) with no hardcoded shape table, refusing non-whole-tile, underfilled, fp32
-    output, fp16 input, and unmeasured generations (rows 11941, 12163)."""
+def test_syrk_measured_gates_grams_and_polynomials_to_measured_bf16_cells():
+    """`syrk.measured` admits whole-tile bf16 Gram and polynomial shapes filling at least one SM wave on
+    measured generations (`sm80`, `sm90`) with no hardcoded shape table, refusing non-whole-tile,
+    underfilled, fp32 output, fp16 input, and unmeasured generations (rows 11941, 12163, 5972)."""
     from kernel_compile import lowered_for
 
     sm80, sm90 = generation.gpu_target("sm80"), generation.gpu_target("sm90")
-    assert syrk.measured_gram(sm80, (28, 2560, 4096), jnp.bfloat16, transpose=False, out_dtype=jnp.bfloat16)
-    assert syrk.measured_gram(sm90, (36, 4096, 14336), jnp.bfloat16, transpose=True, out_dtype=jnp.bfloat16)
+    assert syrk.measured(sm80, (28, 2560, 4096), jnp.bfloat16, transpose=False, out_dtype=jnp.bfloat16)
+    assert syrk.measured(sm90, (36, 4096, 14336), jnp.bfloat16, transpose=True, out_dtype=jnp.bfloat16)
     # Derived shape-class rule admits arbitrary model layer counts and single large matrices >= 1 wave.
-    assert syrk.measured_gram(sm80, (29, 2560, 4096), jnp.bfloat16, transpose=False, out_dtype=jnp.bfloat16)
-    assert syrk.measured_gram(sm90, (1, 4096, 4096), jnp.bfloat16, transpose=False, out_dtype=jnp.bfloat16)
+    assert syrk.measured(sm80, (29, 2560, 4096), jnp.bfloat16, transpose=False, out_dtype=jnp.bfloat16)
+    assert syrk.measured(sm90, (1, 4096, 4096), jnp.bfloat16, transpose=False, out_dtype=jnp.bfloat16)
     # Refuses non-whole-tile shapes, underfilled grids, non-bf16 dtypes, and unmeasured generations.
-    assert not syrk.measured_gram(sm90, (28, 130, 130), jnp.bfloat16, transpose=False,
+    assert not syrk.measured(sm90, (28, 130, 130), jnp.bfloat16, transpose=False,
                                   out_dtype=jnp.bfloat16)
-    assert not syrk.measured_gram(sm90, (1, 512, 512), jnp.bfloat16, transpose=False,
+    assert not syrk.measured(sm90, (1, 512, 512), jnp.bfloat16, transpose=False,
                                   out_dtype=jnp.bfloat16)
-    assert not syrk.measured_gram(sm90, (28, 2560, 4096), jnp.bfloat16, transpose=False,
+    assert not syrk.measured(sm90, (28, 2560, 4096), jnp.bfloat16, transpose=False,
                                   out_dtype=jnp.float32)
-    assert not syrk.measured_gram(sm80, (28, 2560, 4096), jnp.float16, transpose=False,
+    assert not syrk.measured(sm80, (28, 2560, 4096), jnp.float16, transpose=False,
                                   out_dtype=jnp.float16)
     for gen in ("sm86", "sm89", "sm120"):
-        assert not syrk.measured_gram(generation.gpu_target(gen), (28, 2560, 4096), jnp.bfloat16,
-                                      transpose=False, out_dtype=jnp.bfloat16)
+        assert not syrk.measured(generation.gpu_target(gen), (28, 2560, 4096), jnp.bfloat16,
+                                 transpose=False, out_dtype=jnp.bfloat16)
 
     # End-to-end auto selection admits whole-tile bf16->bf16 across layer counts and keeps fp32 / underfilled
     # on XLA.
@@ -548,6 +569,15 @@ def test_syrk_measured_gram_gates_to_measured_bf16_cells():
             lowered_for(lambda a: gemm.symmetric_gram(a),
                         (jax.ShapeDtypeStruct(shape, jnp.bfloat16),), "sm90")
         assert any(r.kernel == "mosaic" for r in measured_seen), (shape, measured_seen)
+    # A polynomial its caller states symmetric (a Gram's, Newton-Schulz's) takes the launch; a square operand
+    # of any values keeps XLA's program, whose `a @ a` the launch's mirrored upper triangle is not.
+    for symmetric, kernel in ((True, "mosaic"), (False, "xla")):
+        with generation.routes() as polynomial_seen:
+            lowered_for(lambda a, symmetric=symmetric: gemm.symmetric_polynomial(
+                a, jnp.asarray([3.4445, -4.7750, 2.0315]), symmetric=symmetric),
+                (jax.ShapeDtypeStruct((28, 2560, 2560), jnp.bfloat16),), "sm90")
+        assert {r.kernel for r in polynomial_seen if r.choice == "syrk"} == {kernel}, (symmetric,
+                                                                                    polynomial_seen)
     for shape, out_dtype in (((1, 512, 512), jnp.bfloat16), ((28, 2560, 4096), jnp.float32)):
         with generation.routes() as unmeasured_seen:
             lowered_for(lambda a, dt=out_dtype: gemm.symmetric_gram(a, out_dtype=dt),

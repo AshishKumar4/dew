@@ -249,19 +249,21 @@ owner's "tf32 default") and its exponentials are ex2.approx's, which the interpr
 recurrence lane, 11-11): a cell each GPU kind runs, its family's own."""
 
 
-def template_stability_cells() -> list[Cell]:
-    """The template finite and on par where chunked forms break, every form, regime and product, plus KDA's
-    512-seed `FLOOR_GATES` gradient check."""
+def template_stability_cells(site: str) -> list[Cell]:
+    """The template finite and on par where chunked forms break, one form's (`site`) every regime and
+    product."""
     finite = template_stability.the_template_stays_finite_and_on_par_where_chunked_forms_break
-    return [
-        *(Cell(f"the template stays finite and on par where chunked forms break: {name} {regime} {product}"
-               f"{'' if forms is None else f' ({forms} forms)'}",
-               functools.partial(finite, name, regime, product, forms), fault=STRESS)
-          for name, regime, product, forms in template_stability.CASES),
-        Cell("Kimi delta attention under tiny gates at the floor is as exact as fla",
-             template_stability.kimis_unit_keys_under_tiny_gates_at_the_floor_are_as_exact_as_fla,
-             fault=STRESS),
-    ]
+    return [Cell(f"the template stays finite and on par where chunked forms break: {name} {regime} {product}"
+                 f"{'' if forms is None else f' ({forms} forms)'}",
+                 functools.partial(finite, name, regime, product, forms), fault=STRESS)
+            for name, regime, product, forms in template_stability.CASES if name == site]
+
+
+def kimi_floor_cells() -> list[Cell]:
+    """KDA's 512-seed `FLOOR_GATES` gradient check on the template."""
+    return [Cell("Kimi delta attention under tiny gates at the floor is as exact as fla",
+                 template_stability.kimis_unit_keys_under_tiny_gates_at_the_floor_are_as_exact_as_fla,
+                 fault=STRESS)]
 
 
 def portable_cells() -> list[Cell]:
@@ -408,13 +410,17 @@ def lightning_cells() -> list[Cell]:
                  native={"launch": "lightning template"})]
 
 
-FAMILIES = {"two-role walk": walk_cells, "template stability": template_stability_cells,
-            "lightning": lightning_cells,
+FAMILIES = {"two-role walk": walk_cells,
+            **{f"template stability: {site}": functools.partial(template_stability_cells, site)
+               for site in dict.fromkeys(name for name, *_ in template_stability.CASES)},
+            "template stability: Kimi at the floor": kimi_floor_cells, "lightning": lightning_cells,
             "portable": portable_cells, "SSD port": ssd_port_cells, "selective scan": selective_cells,
             "forked template": forked_cells, "fp32 template": fp32_template_cells,
             "port training and decode": lambda: [*port_training_cells(), *decode_cells()]}
 """The recurrence cells by family, each family a test of its own: the planner times and packs each, and one
-family's failure hides no other's (a single flow of every family ran past a GPU job's 50 minutes). A
+family's failure hides no other's (a single flow of every family ran past a GPU job's 50 minutes). The
+template's stability a family a form: every form's in one held 10 GiB and 1431 s of an sm90 tier's dry
+prepare, past its container's memory (train 1269). A
 layer's port training and its decode run as one flow. The Mosaic mainloop's forward and gradient on a GPU are
 the model flows' (tests/test_gpu_flows.py: Kimi's delta attention, Qwen3-Next's gated delta net, MiniMax's
 lightning attention), its cases the CPU's, interpreted and through the compile gate (row 5461)."""
@@ -432,8 +438,18 @@ recurrence's distance from float64 (M-JS-96), which no cell saw (the recurrence 
 def test_the_recurrences_run_on_this_gpu(family):
     """A family's recurrence cells on this GPU (`gpu_flow.run_cells`) a GPU runs (`gpu_flow.covering`: each
     kept for a GPU-only fault by name, the fewest others covering its native axes, every other the CPU's,
-    interpreted and through the compile gate), each one's failure kept and all raised together."""
-    run_cells(covering(FAMILIES[family]()))
+    interpreted and through the compile gate), each one's failure kept and all raised together. Every
+    compiled program and held trace released after each family (`conftest.release`: JAX's, the float64
+    terms walk's and Dew's own programs'): a dry prepare runs a group's families in one process, which kept
+    every one's (a process of four template stability families killed for memory in its fifth, scratch
+    jsf-rss-split3; clearing JAX's caches after each, none, jsf-rss-clear3; train 1274's prepare-sm90, 10
+    GiB; row 12881)."""
+    import conftest
+
+    try:
+        run_cells(covering(FAMILIES[family]()))
+    finally:
+        conftest.release()
 
 
 def test_the_recurrence_matrix_holds_on_this_gpu():

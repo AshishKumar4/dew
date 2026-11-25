@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from armada_support import commit, interpreter, loaded
+from armada_support import cached, commit, interpreter, loaded
 
 
 @pytest.fixture
@@ -121,7 +121,7 @@ def test_a_recorded_test_the_file_no_longer_defines_cuts_it_into_no_group(ci, tm
                and entry["tests"] == "tests/test_cut.py"]
     assert [entry["weight"] for entry in planned] == [100.0] * 6
     count = len(planned)
-    members = [ci.members("tests/test_cut.py", f"{group}/{count}") for group in range(1, count + 1)]
+    members = [ci.run_keys.members("tests/test_cut.py", f"{group}/{count}") for group in range(1, count + 1)]
     assert sorted(node.partition("::")[2] for group in members for node in group) == [
         "TestHeld::test_inherited", "test_kept[0]", "test_kept[1]", "test_kept[2]", "test_kept[3]",
         "test_made"]
@@ -362,7 +362,7 @@ def test_a_cold_run_is_kept_as_its_tests_cold_times_and_every_cut_weighs_them(ci
     folded = json.loads((tmp_path / "tests/test_durations.json").read_text())
     a, b, c = (f"tests/test_cells.py::test_{name}" for name in "abc")
     assert folded == {a: [1.0, 30.0], b: [2.0, 40.0], c: [20.0, 20.0]}
-    assert ci.durations_record() == {a: 30.0, b: 40.0, c: 20.0}
+    assert ci.run_keys.durations_record() == {a: 30.0, b: 40.0, c: 20.0}
     # A red run past a cold time raises it; a green warm run moves only the warm time.
     rows = [{"name": "3.12:tests/test_cells.py", "exitCode": 1, "seconds": 60.0,
              "tests": {"tests/test_cells.py::test_a": 60.0}, "cold": ["tests/test_cells.py::test_a"]}]
@@ -507,7 +507,7 @@ def test_a_tasks_peak_bounds_its_tests_and_a_heavy_files_tasks_run_large(ci, tmp
     assert folded == {"tests/test_ranks.py::test_a": [10.0, None, ranks],
                       "tests/test_ranks.py::test_b": [5.0, 30.0, ranks],
                       "tests/test_light.py::test_a": [1.0, None, light]}
-    assert ci.durations_record()["tests/test_ranks.py::test_b"] == 30.0
+    assert ci.run_keys.durations_record()["tests/test_ranks.py::test_b"] == 30.0
     assert ci.session.heavy_files() == {"tests/test_ranks.py"}
     entries = [entry for entry in ci.plan(240.0, {"files": {}}) if entry["python"] == "3.12"]
     # The task that runs the heavy file, light files packed beside it or not, is large.
@@ -520,6 +520,51 @@ def test_a_tasks_peak_bounds_its_tests_and_a_heavy_files_tasks_run_large(ci, tmp
     assert lowered["tests/test_ranks.py::test_a"][2] == light
     assert ci.session.heavy_files() == set()
     assert all("size" not in entry for entry in ci.plan(240.0, {"files": {}}))
+
+
+def test_every_dry_prepare_task_runs_large_whatever_its_tests_cpu_peaks(ci, tmp_path, monkeypatch,
+                                                                        cache_worker):
+    """A GPU tier file's dry prepare (prepares.py's `entries`) compiles its programs on the CPU, so its every
+    task, a kept one's that compiles a row its lookup misses among them, is planned on a large container
+    (ci.py's `PREPARE_SIZE`), though its tests' recorded peaks, their CPU runs', are light: one prepare
+    peaked at a medium's whole 10 GiB and was killed beside other tasks (train 1269). The file's own CPU
+    rows keep armada's own sizing."""
+    (tmp_path / ".armada.json").write_text(json.dumps({"target": 240, "environment": {}}))
+    # The prepare's recipe (prepares.py's `RECIPE`), which keys its rows, beside a GPU tier file.
+    for name in ci.prepares.RECIPE:
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text("")
+    (tmp_path / "tests" / "test_gpu_flow.py").write_text(
+        "import pytest\n\n@pytest.mark.gpu\ndef test_a(): pass\n")
+    # Its test's recorded peak a light CPU run's, as a GPU test's skipped run on armada records.
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+        {"tests/test_gpu_flow.py::test_a": [1.0, None, 900_000_000]}))
+    commit(tmp_path, "main")
+    entries = [entry for entry in ci.plan(240.0, {"files": {}}) if entry["python"] == ci.PYTHONS[0]]
+    prepares = [entry for entry in entries if entry["tests"].startswith(ci.prepares.TOKEN)]
+    assert prepares and [entry.get("size") for entry in prepares] == ["large"] * len(prepares)
+    assert all("size" not in entry for entry in entries if entry not in prepares)
+    # A kept prepare, its row green in the shared cache on these inputs, looks its row up, and compiles it
+    # where the lookup misses as its task runs (ci.py's `unrun`): large too.
+    url, stored, _ = cache_worker
+    cpu = "GenuineIntel-6-143"
+    config = json.loads((tmp_path / ".armada.json").read_text())
+    (tmp_path / ".armada.json").write_text(json.dumps(
+        {**config, "task": {"cpu": {"vendor": "GenuineIntel", "family": 6, "model": 143}}}))
+    cached(monkeypatch, url)
+    monkeypatch.setenv(ci.READ_TOKEN, "token")
+    python, name, group = prepares[0]["python"], prepares[0]["tests"].removeprefix(ci.prepares.TOKEN), \
+        prepares[0]["split"]
+    common, place = ci.prepare_shared(python), ci.row(python, name, group)
+    key = ci.run_keys.cache_key(common, name, group, [])
+    green = {"key": key, "depends": [], "epoch": "green",
+             "row": {"name": place, "exitCode": 0, "unprepared": []}}
+    stored["/" + ci.epoch_key(python, place, cpu, common)] = json.dumps({"epoch": "green"}).encode()
+    for at in (ci.record_key(python, place, cpu, common), ci.green_key(python, place, cpu, key)):
+        stored["/" + at] = json.dumps(green).encode()
+    kept = [entry for entry in ci.plan(240.0, {"files": {}})
+            if entry["python"] == python and place in entry.get("rows", [])]
+    assert [(ci.session.KEPT_AT in entry["tests"], entry.get("size")) for entry in kept] == [(True, "large")]
 
 
 def test_a_killed_tasks_peak_raises_its_files_tests_and_heavy_tasks_run_large(ci, tmp_path, monkeypatch):
@@ -561,7 +606,9 @@ def test_a_resumed_attempts_rows_carry_the_earlier_attempts_peak(tmp_path, monke
         + json.dumps({"node": "tests/test_x.py::light", "seconds": 1.0, "peak": 2_000}) + "\n")
     monkeypatch.setenv("ARMADA_RESUME", str(tmp_path / "resume"))
     monkeypatch.setenv("ARMADA_ARTIFACTS", str(tmp_path / "now"))
-    passed, cold, peak = progress.resumed(["tests/test_x.py"], lambda node: node.split("::")[0])
+    # A split group's attempt, whose passes count whether or not its process ended (`resumed`'s `sealed`).
+    passed, cold, peak = progress.resumed(["tests/test_x.py"], lambda node: node.split("::")[0],
+                                          sealed=False)
     assert sorted(passed) == ["tests/test_x.py::heavy", "tests/test_x.py::light"]
     assert (cold, peak) == (set(), 7_000)
     carried = [json.loads(line) for line in (tmp_path / "now" / progress.PROGRESS).read_text().splitlines()]

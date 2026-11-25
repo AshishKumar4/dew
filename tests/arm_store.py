@@ -30,6 +30,7 @@ from check1_wire import QUALIFY
 from float64_terms import POWER, evaluated, evaluated_on, static, traced
 from reference_error import _of_float64, _site, _SiteTerms, _sizing_seeds, _truth_program
 from store_wire import COMPILED
+from tier_wire import stop_past_cap
 from truths_ahead import AT_RUN, CompiledTruths, arm_role, named
 
 from dew.parity_stages import staged_units
@@ -78,6 +79,8 @@ def _first_draws(draw, seeds: Iterable[int], label: str) -> list:
     program). The seeds drawn in full to learn their shapes are counted, a `ConcreteDraws` warning."""
     firsts, concrete, seen = [], 0, set()
     for seed in seeds:
+        # A dry prepare past its cap stops before a draw (`tier_wire.stop_past_cap`).
+        stop_past_cap()
         try:
             shapes = jax.eval_shape(functools.partial(drawn_on_the_host, draw, seed))
         except _CONCRETE:

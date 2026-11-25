@@ -87,10 +87,11 @@ def graded(name: str, own: list[ET.Element], cases: list[ET.Element], counted: M
     where it ran out of time, `running` the file its time was spent in (its executed log's last visit).
     `started` whether pytest began (executed.py wrote its pid as pytest loaded it): a task whose pytest never
     began failed in its runner (its environment, its launch, an install before pytest), with no verdict of any
-    test, so its row is said stale and run again (`STALE`), never a red of its tests; one that began and ended
-    with no report is a red of its file whole, the file it `reached` last and its exit, a signal's named,
-    kept for whoever it routes to (Main, 2026-11-09: a write the runner could not make filed 43 GPU tier
-    parts' files as reds)."""
+    test, so its row is said stale and run again (`STALE`), never a red of its tests, as is one whose task's
+    time ran out in another file's test before every test its collection selected reported; one that began
+    and ended with no report is a red of its file whole, the file it `reached` last and its exit, a signal's
+    named, kept for whoever it routes to (Main, 2026-11-09: a write the runner could not make filed 43 GPU
+    tier parts' files as reds)."""
     failed = [(case, kind, node) for case in own for kind in ("failure", "error")
               if (node := case.find(kind)) is not None]
     red = [f"{kind.upper()} {case.get('classname')}::{case.get('name')}: {node.get('message')}"
@@ -102,6 +103,15 @@ def graded(name: str, own: list[ET.Element], cases: list[ET.Element], counted: M
     # The executed log's visits name files: a test node's row is spent where its file's test was running.
     spent = expired is not None and (owning(name) == running or running is None)
     unreached = expired is not None and not spent and not own and not deselected
+    # A file whose tests interleave with another's (A[0], B[0], A[1]) has cases however the deadline fell;
+    # where it fell in another file's test, its own count of reported tests must reach the tests its
+    # collection selected (the selection's set-aside ones among the deselected), or it ran in part
+    # (row 12179).
+    reported_tests = len({node_of(case) for case in own if case.get("classname")})
+    selected = counted["collected"] - counted["deselected"] if counted else None
+    # A file whose cases say it is red whole already (a failed case, a skip on a missing import) keeps it.
+    partial = (expired is not None and not spent and bool(own) and not failed and not skipped
+               and (selected is None or reported_tests < selected))
     unstarted = expired is None and not started and not reported and returncode != 0
     exited = [] if (expired is not None and not spent) or unstarted else \
         exit_red(returncode, cases, own, deselected, name, reached)
@@ -115,6 +125,10 @@ def graded(name: str, own: list[ET.Element], cases: list[ET.Element], counted: M
     if unreached:
         red.append(f"not graded: its task's {expired:.0f} s were spent in {running}, before pytest reported "
                    "any test of it; it runs again")
+    if partial:
+        red.append(f"not graded: its task's {expired:.0f} s were spent in {running}, after pytest reported "
+                   f"{reported_tests} of its {selected if selected is not None else 'uncounted'} selected "
+                   "tests; it runs again")
     if unstarted:
         red.append(f"not graded: pytest never began (its runner exited {returncode} before pytest loaded its "
                    "plugins: the environment, the launch or an install before it); it runs again")
@@ -122,7 +136,7 @@ def graded(name: str, own: list[ET.Element], cases: list[ET.Element], counted: M
     nodes = sorted({node_of(case) for case, _, _ in failed if case.get("classname")})
     whole = skipped or exited or unaccounted or not nodes or any(not case.get("classname")
                                                                   for case, _, _ in failed)
-    cause = ({} if not red else red_as(STALE, []) if unreached or unstarted
+    cause = ({} if not red else red_as(STALE, []) if unreached or unstarted or partial
              else red_as("deadline", []) if spent
              else red_as("whole", []) if whole else red_as("nodes", nodes))
     return red, failed, cause

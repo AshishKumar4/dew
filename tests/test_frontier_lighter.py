@@ -3,7 +3,7 @@ that fit (`FitSearch.below`, the plan's `lighter`; row 10817), on compile-only G
 
 import pytest
 from model_support import attending
-from test_compile_ahead import BATCH, SEQ_LEN, VOCAB, fine_tune, gpus, need_ahead
+from test_compile_ahead import SEQ_LEN, TILED_BATCH, TILED_VOCAB, fine_tune, gpus, need_ahead
 from token_support import token_rows
 
 from dew._records import listed, record
@@ -27,11 +27,13 @@ def test_a_frontier_lists_each_lighter_rung_the_search_passed_over_that_fits(tmp
     assert need_ahead("sm90", split=1, remat=None) > room
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "rungs"))
     rung = ("split", "remat", "head_tile", "head_fused", "xla_defaults", "narrow")
-    alone = record(compile_ahead(fine_tune(MeshSpec().build(gpus("sm90", limit=room)), split=1),
-                                 token_rows(VOCAB, BATCH, SEQ_LEN + 1)).plan, "plan")
+    alone = record(compile_ahead(fine_tune(MeshSpec().build(gpus("sm90", limit=room)), split=1,
+                                           vocab=TILED_VOCAB),
+                                 token_rows(TILED_VOCAB, TILED_BATCH, SEQ_LEN + 1)).plan, "plan")
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "again"))
-    trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=room)), split=1)
-    plan = record(compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), frontier=True).plan, "plan")
+    trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=room)), split=1, vocab=TILED_VOCAB)
+    plan = record(compile_ahead(trainer, token_rows(TILED_VOCAB, TILED_BATCH, SEQ_LEN + 1),
+                                frontier=True).plan, "plan")
     assert {name: plan[name] for name in rung} == {name: alone[name] for name in rung}
     assert plan["remat"] is not None and plan["head_tile"] is None, plan["probes"]
     assert recompute_record(trainer.objective) == plan["remat"] and trainer.objective.head_tile is None
@@ -40,8 +42,10 @@ def test_a_frontier_lists_each_lighter_rung_the_search_passed_over_that_fits(tmp
     assert any(entry["remat"] is None and entry["head_tile"] is not None for entry in lighter), lighter
     # A plan taken from the record the first plan left lists the same lighter rungs, its search asking none.
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "rungs"))
-    warm = record(compile_ahead(fine_tune(MeshSpec().build(gpus("sm90", limit=room)), split=1),
-                                token_rows(VOCAB, BATCH, SEQ_LEN + 1), frontier=True).plan, "plan")
+    warm = record(compile_ahead(fine_tune(MeshSpec().build(gpus("sm90", limit=room)), split=1,
+                                          vocab=TILED_VOCAB),
+                                token_rows(TILED_VOCAB, TILED_BATCH, SEQ_LEN + 1), frontier=True).plan,
+                  "plan")
     # Its first compile the recorded rung, which fits.
     first = record(listed(warm["probes"], "probes", read=record, what="probes")[0], "probe")
     assert first["fits"] is True

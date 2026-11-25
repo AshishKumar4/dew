@@ -3,6 +3,7 @@ its side tiles, as `grouped_matmul`'s launches bind them and their kernels trace
 
 import dataclasses
 import functools
+from typing import Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -62,6 +63,16 @@ class Hooks:
         return {'prologue': self.before(), 'prologue_axes': self.prologue_axes, 'epilogue': self.after(),
                 'epilogue_axes': self.epilogue_axes, 'out_dtypes': self.out_dtypes,
                 **({'out_forms': self.out_forms} if self.out_forms else {})}
+
+
+@runtime_checkable
+class Formed(Protocol):
+    """An epilogue that states how each of its outputs stores (`Hooks.out_forms`, `quantized.Form`): one
+    whose outputs are narrower than its tile (`wide.Gated`'s gated product), which a launch's declared
+    outputs and stores read before it is traced."""
+
+    @property
+    def out_forms(self) -> tuple: ...
 
 
 def _unsqueezing(hook, positions: tuple, tiles: int = 1):

@@ -92,6 +92,14 @@ def _product(groups: int, out_dtype: str, kernel: str):
     return product
 
 
+CUBLASLT_PRECISION = jax.lax.Precision.DEFAULT
+"""The precision a cuBLASLt FP8 arm's dots state (`cublaslt`, test_gemm_blockwise's kernel gradient): XLA
+enables cuBLASLt's FP8 fast accumulation, the form the owner's parity holds (docs/design/testing.md, "FP8
+products"), only at a dot's DEFAULT compute precision (`IsFastAccumEnabled`,
+xla/stream_executor/cuda/cuda_blas_lt.cc), and a dot stating none takes the lane's
+JAX_DEFAULT_MATMUL_PRECISION=highest (tests/lane_environment.py), under which the arm summed in fp32."""
+
+
 def cublaslt_arm(fn, inputs):
     """`fn`, a program whose dots multiply FP8 codes into fp32, compiled as cuBLASLt's FP8 GEMM runs each
     (`generation_support.cublas_compiled`), the reference arm of a block-scaled FP8 form on Hopper
@@ -102,7 +110,9 @@ def cublaslt_arm(fn, inputs):
 
 def cublaslt(sizes, out_dtype: str) -> callable:
     """cuBLASLt's FP8 GEMM on a product's codes a 128-deep block at a time (XLA's dot of two FP8 operands
-    into fp32, `cublaslt_arm`), every row by each group's matrix and a group's rows kept, each block's
+    into fp32 at DEFAULT precision, `cublaslt_arm`: cuBLASLt's fast accumulation, each block summed in the
+    tensor cores' narrow accumulator, which XLA turns off at any other precision, the lane's `highest`
+    among them; rows 12753, 12754), every row by each group's matrix and a group's rows kept, each block's
     partial scaled by its rows' and columns' scales and the blocks added in fp32, as the product's
     definition (`truth`) orders them: `run(rows, matrices, row_scales, column_scales)`."""
     owners = np.repeat(np.arange(len(sizes)), np.asarray(sizes))
@@ -114,7 +124,7 @@ def cublaslt(sizes, out_dtype: str) -> callable:
             mine = jnp.asarray(np.pad(owners == group, (0, rows.shape[0] - owners.size)))[:, None]
             for block in range(row_scales.shape[0]):
                 depth = slice(128 * block, 128 * (block + 1))
-                partial = jnp.dot(rows[:, depth], matrices[group, :, depth].T,
+                partial = jnp.dot(rows[:, depth], matrices[group, :, depth].T, precision=CUBLASLT_PRECISION,
                                   preferred_element_type=jnp.float32)
                 columns = jnp.repeat(column_scales[group, block], per)
                 out = out + jnp.where(mine, partial * row_scales[block, :, None] * columns[None, :], 0)
@@ -161,6 +171,19 @@ def a_blockwise_fp8_product_is_on_par(case: tuple[str, ...]) -> None:
     recorded = {(found.choice, found.kernel) for found in routes}
     unnamed = sorted(pair for pair in recorded if pair[0] not in CHOICES and pair[1] != "xla")
     assert ("blockwise_fp8", "mosaic") in recorded and not unnamed, (sorted(recorded), unnamed)
+
+def assert_bitwise_leaves(names, fused, separate, *, finite: bool = False) -> None:
+    """A recipe chain's outputs (`with_gradients`' value and gradients, `names` each) bit for bit its
+    projections apart, of one dtype each, and every one finite where `finite` (a padded chain's: no
+    activation of its padding enters a gradient)."""
+    for name, got, want in zip(names, fused, separate, strict=True):
+        assert got.dtype == want.dtype, (name, got.dtype, want.dtype)
+        if finite:
+            assert np.all(np.isfinite(np.asarray(got, np.float32))), name
+        unsigned = np.dtype(f"uint{8 * got.dtype.itemsize}")
+        np.testing.assert_array_equal(np.asarray(got).view(unsigned), np.asarray(want).view(unsigned),
+                                      err_msg=name)
+
 
 def grouped(group_blocks, lhs, matrices):
     """Each group's rows of `lhs` (`group_blocks` 128-row blocks a group) times its matrix of `matrices`, in

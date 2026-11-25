@@ -4,9 +4,11 @@ unrolls to as that stack does, to the bit; decoding, scanned runs and
 checkpointed passes, which compute it another way, are on par with it from
 float64 over drawn models and tokens (check 1)."""
 
+import collections
 import dataclasses
 import functools
 import json
+import re
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -26,7 +28,7 @@ from model_support import (
     unrolled as layer_at_a_time,
     with_logit_cotangent,
 )
-from reference_error import assert_as_exact, dew_path, with_gradients
+from reference_error import as_given, assert_as_exact, dew_path, with_gradients
 
 from dew.batch import leaves_by_path
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -51,7 +53,7 @@ def tokens(rng, length=12, rows=2):
     return jax.random.randint(rng, (rows, length), 0, VOCAB)
 
 
-SEEDS = {'decode': 64, 'scanned': 64, 'block decode': 32}
+SEEDS = {'decode': 64, 'scanned': 64, 'block decode': 32, 'gathered': 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada):
 the most any of a site's cases took; a site that `check1_shards` shards, its mark states them
 (`marked_seeds`)."""
@@ -179,11 +181,7 @@ def test_checkpointed_passes_preserve_logits_and_gradients(backprop_steps, stack
     checkpointed = plain.clone(loop=dataclasses.replace(loop, remat=True))
 
     def result(model):
-        def run(tree, ids, cotangent):
-            pulled = with_gradients(lambda tree: model.apply(tree, ids, train=True))
-            logits, gradients = pulled(tree, cotangent)
-            return {'logits': logits, 'gradients': gradients}
-        return jax.jit(run)
+        return jax.jit(_logits_and_gradients(model))
 
     # Eight rows of sixteen tokens: a norm's scale sums its gradient over enough of them to resolve.
     draw = with_logit_cotangent(drawn(plain, 16, 8), VOCAB, 0x100)
@@ -584,13 +582,13 @@ def test_an_implicit_loop_whose_rows_are_one_theta_computes_the_shared_theta():
 @attending("reference")
 def test_a_loaded_decoder_gains_an_implicit_loop_at_zero_theta():
     """A loaded Qwen 3.5 given an implicit loop over its own block, as a run asks for one
-    (`dew.config.looping`), draws the loop's θ at zero beside the parameters it loaded, among what it drew
+    (`DecoderRunConfig.loop`), draws the loop's θ at zero beside the parameters it loaded, among what it drew
     fresh (`Pretrained.with_model`), so it runs and starts as the decoder it loaded."""
-    from dew.config import looping
+    from dew.config import DecoderRunConfig
     from dew.interop.pretrained import Pretrained
 
     loaded = Pretrained.load(str(QWEN35), dtype="float32")
-    looped = looping(loaded, 3, (1, 4), implicit=True)
+    looped = DecoderRunConfig(loop=Loop(3, step_norm=False, layers=(1, 4), implicit=True)).looped(loaded)
     theta = looped.variables["params"]["loop_theta"]
     assert looped.model.loop == Loop(3, step_norm=False, layers=(1, 4), implicit=True)
     assert np.shape(theta) == (loaded.model.emb_features,) and not np.any(np.asarray(theta))
@@ -1105,3 +1103,254 @@ def test_a_count_of_passes_given_per_call_weighs_the_passes_that_ran():
     assert float(jax.jit(lambda ran: weighed(weights.ran(ran), terms))(ran)) == float(two)
     with pytest.raises(ValueError):
         PassWeights.of((0.25, 0.25, 0.25, 0.25)).ran(ran)
+
+
+@attending("xla")
+def test_a_scanned_block_loop_serves_with_a_per_pass_cache(rng):
+    """A looped decoder whose looped block scans (`layers=(1, 3)`, two equal layers under the default
+    layer scan) serves prompts under a per-pass cache (`PassView` hiding `layers_0` in later passes):
+    probing the residual dtype reads the span's first layer's cache, never `layers_0`'s."""
+    from dew.inference import TextGeneration
+    from dew.inference.serving import Server
+    from dew.sampling import Sampling
+
+    model = tiny(num_layers=4, max_seq_len=32, loop=Loop(2, layers=(1, 3)), dtype="float32")
+    prompts = [[1, 2, 3, 4], [5, 6, 7, 8, 9, 10]]
+    variables = nn.unbox(model.init(rng, jnp.asarray([prompts[0]], jnp.int32)))
+    task = TextGeneration(model, variables, sampling=Sampling(temperature=0.0))
+    server = Server.from_task(task, slots=2, capacity=32)
+    tickets = [server.submit(prompt, 4, key=index) for index, prompt in enumerate(prompts)]
+    server.run()
+    for ticket, prompt in zip(tickets, prompts, strict=True):
+        served, alone = ticket.result().host(), task([prompt], 4, key=0).host()
+        np.testing.assert_array_equal(served.tokens[0, served.prompt_width:],
+                                      alone.tokens[0, alone.prompt_width:])
+
+
+def _logits_and_gradients(model):
+    """`model`'s training logits and the gradient of a cotangent on them, a function of its variables, its
+    tokens and that cotangent: what a site comparing two ways of running a loop holds on par."""
+    def run(tree, ids, cotangent):
+        pulled = with_gradients(lambda tree: model.apply(tree, ids, train=True))
+        logits, gradients = pulled(tree, cotangent)
+        return {'logits': logits, 'gradients': gradients}
+    return run
+
+
+def _collectives_in_loops(text: str) -> collections.Counter:
+    """The collectives (`all-gather`, `reduce-scatter`, `all-reduce`, their async starts) in a compiled
+    program's `while` loops, their bodies and every computation they call, from its HLO `text`, each by its
+    name and the rank of the arrays it moves (a matrix's 2)."""
+    computations, current = {}, None
+    for line in text.splitlines():
+        header = re.match(r"^(?:ENTRY )?%?([\w.\-]+) .*\{$", line)
+        if header and not line.startswith(" "):
+            current = computations.setdefault(header.group(1), [])
+        elif current is not None:
+            current.append(line)
+    bodies = [match.group(1) for lines in computations.values() for line in lines
+              if " while(" in line
+              for match in [re.search(r"body=%?([\w.\-]+)", line)] if match]
+    # Every computation a body calls, at any depth: each name on its lines that names a computation.
+    seen, pending = set(), list(bodies)
+    while pending:
+        name = pending.pop()
+        if name not in seen:
+            seen.add(name)
+            pending.extend(called for line in computations[name]
+                           for called in re.findall(r"%([\w.\-]+)", line) if called in computations)
+    def rank(line: str, op: str) -> int:
+        # Its result's shapes' (`f32[64,32]{1,0}`, a tuple's widest), written between `=` and its name.
+        result = line.split("=", 1)[1].split(op, 1)[0]
+        return max((len(dims.split(",")) if dims else 0) for dims in re.findall(r"\w+\[([\d,]*)\]", result))
+
+    return collections.Counter((op, rank(line, op)) for name in seen for line in computations[name]
+                               for op in re.findall(r"\b(all-gather|reduce-scatter|all-reduce)(?:-start)?\(",
+                                                    line))
+
+
+def _gathered_case(*, gathered: bool, remat: bool, exiting: bool = False, counted: bool = False):
+    """A four-layer decoder looping its layers [1, 3) four times (`Loop.gathered`), recomputing each pass and
+    each layer where `remat`, every pass exiting through the coda where `exiting` (`Loop.exit_gate`, its
+    exits weighed into the output, each pass's step normed), running a count of passes the call computes
+    where `counted` (`loop_passes`, three), and its gradient of a cotangent on its logits as a function of
+    its variables, its tokens and the cotangent."""
+    from dew.nn.backbones.decoder_block import REMAT_POLICIES
+
+    loop = Loop(4, layers=(1, 3), remat=remat, gathered=gathered, step_norm=exiting, exit_gate=exiting)
+    model = tiny(num_layers=4, loop=loop, **({"remat": REMAT_POLICIES["full"]} if remat else {}))
+
+    def forward(variables, ids):
+        count = jnp.full((), 3, jnp.int32) if counted else None
+        return model.apply(variables, ids, loop_passes=count)
+    return model, with_gradients(forward)
+
+
+GATHERED_MESHES = {"fsdp": {"fsdp": 8}, "hybrid": {"fsdp": 4}, "tensor": {"fsdp": 4, "tensor": 2},
+                   "sequence": {"fsdp": 4, "sequence": 2}}
+"""The meshes of eight devices a gathered loop runs on: fully sharded alone, hybrid (two data replicas of
+four), beside a tensor split and beside a sequence split."""
+
+
+@pytest.mark.mesh(devices=8)
+@pytest.mark.parametrize(("mesh_shape", "remat", "boxed", "case"), [
+    pytest.param("fsdp", False, False, {}, id="fsdp-plain-arrays"),
+    pytest.param("fsdp", False, True, {}, id="fsdp-plain-boxed"),
+    pytest.param("fsdp", True, False, {}, id="fsdp-recomputed-arrays"),
+    pytest.param("fsdp", True, True, {}, id="fsdp-recomputed-boxed"),
+    pytest.param("fsdp", False, False, {"exiting": True}, id="fsdp-exiting"),
+    pytest.param("fsdp", True, False, {"exiting": True}, id="fsdp-recomputed-exiting"),
+    pytest.param("fsdp", False, False, {"counted": True}, id="fsdp-counted"),
+    pytest.param("hybrid", False, False, {}, id="hybrid"),
+    pytest.param("tensor", False, True, {}, id="tensor-boxed"),
+    pytest.param("sequence", False, False, {}, id="sequence"),
+])
+def test_a_gathered_loop_reads_its_block_gathered_once(mesh_shape, remat, boxed, case):
+    """A looped block whose parameters fully sharded data parallelism splits, with `Loop.gathered`, reads
+    them gathered once before its passes, and reduces its matrices' gradients once after them: its training
+    step's pass loop (the `while` of its three later passes), its body and all it calls, gathers no matrix
+    and reduces none (all-reduce or reduce-scatter), where the same step without it gathers and reduces its
+    matrices there each pass; each pass and layer recomputed or not (row 12722: the gather is not sunk back
+    into a checkpointed body), its variables arrays or as its init boxes them (`flax.core.meta`'s logical
+    axes), each pass exiting through the coda or not, its passes counted per call or not
+    (`_gathered_case`), on each of `GATHERED_MESHES`. A tensor split's
+    reductions of activations stay in the loop, as without it. Every leaf split (`Layout(min_shard=1)`)."""
+    from dew.distributed.placement import Layout
+    from dew.mesh import DEFAULT_RULES
+    from dew.nn.sharding import placing
+    from dew.training import MeshSpec
+
+    mesh = MeshSpec(**GATHERED_MESHES[mesh_shape]).build(jax.devices()[:8])
+    layout = Layout(min_shard=1)
+    found = {}
+    for gathered in (False, True):
+        model, gradient = _gathered_case(gathered=gathered, remat=remat, **case)
+        variables, ids = model_draw(model, (8, 12), VOCAB)(0)
+        if boxed:
+            variables = model.init(jax.random.key(0), ids)
+        variables = jax.device_put(variables, layout.shardings(mesh, nn.unbox(variables)))
+        cotangent = jnp.ones((8, 12, VOCAB), jnp.float32)
+        with jax.set_mesh(mesh), nn.logical_axis_rules(DEFAULT_RULES), placing(layout):
+            text = jax.jit(gradient).lower(variables, ids, cotangent).compile().as_text()
+        found[gathered] = _collectives_in_loops(text)
+    # The matrices' gathers out of the loop, and their gradients summed unreduced, reduced once after it
+    # (`Loop.gathered`); a vector's (a norm's scale) still reduced each pass.
+    def matrices(moved: collections.Counter, ops: set[str]) -> int:
+        return sum(count for (op, rank), count in moved.items() if rank == 2 and op in ops)
+
+    gathers, reductions = {"all-gather"}, {"all-reduce", "reduce-scatter"}
+    assert matrices(found[False], gathers) and matrices(found[False], reductions), found
+    assert not matrices(found[True], gathers) and not matrices(found[True], reductions), found
+
+
+@pytest.mark.mesh(devices=8)
+@pytest.mark.parametrize(("mesh_shape", "loop"), [
+    pytest.param("fsdp", Loop(4, layers=(1, 3)), id="fsdp"),
+    pytest.param("hybrid", Loop(4, layers=(1, 3)), id="hybrid"),
+    pytest.param("tensor", Loop(4, layers=(1, 3)), id="tensor"),
+    pytest.param("sequence", Loop(4, layers=(1, 3)), id="sequence"),
+    pytest.param("fsdp", Loop(2, layers=(1, 3), exit_gate=True), id="fsdp-two-passes-exiting"),
+])
+def test_a_gathered_loop_trains_the_same_model(mesh_shape, loop):
+    """A gathered loop's logits and every gradient, its block's parameters' summed unreduced across
+    passes before their one reduction, are on par with the same loop's reading them where they lie
+    (check 1, both from the loop's float64 twin): the same sums in another order (row 12722), on each of
+    `GATHERED_MESHES`, and where each of two passes, unrolled, exits through the coda its gate weighs into the
+    output. Every leaf split (`Layout(min_shard=1)`)."""
+    from dew.distributed.placement import Layout
+    from dew.mesh import DEFAULT_RULES
+    from dew.nn.sharding import placing
+    from dew.training import MeshSpec
+
+    mesh = MeshSpec(**GATHERED_MESHES[mesh_shape]).build(jax.devices()[:8])
+    layout = Layout(min_shard=1)
+    apart = tiny(num_layers=4, loop=loop, dtype="float32")
+    gathered = apart.clone(loop=dataclasses.replace(loop, gathered=True))
+
+    def result(model, *, placed: bool = True):
+        run = _logits_and_gradients(model)
+
+        @as_given
+        def ran(tree, ids, cotangent):
+            # Run as given (`as_given`): placed on the mesh and traced under its layout outside any jit.
+            if not placed:
+                return jax.jit(run)(tree, ids, cotangent)
+            tree = jax.device_put(tree, layout.shardings(mesh, tree))
+            with jax.set_mesh(mesh), nn.logical_axis_rules(DEFAULT_RULES), placing(layout):
+                return jax.jit(run)(tree, ids, cotangent)
+        return ran
+
+    draw = with_logit_cotangent(drawn(apart, 16, 8), VOCAB, 12722)
+    assert_as_exact(result(gathered), result(apart), draw, "a gathered loop's logits and gradients",
+                    seeds=SEEDS['gathered'], truth_fn=result(apart.clone(dtype=jnp.float64), placed=False))
+
+
+@pytest.mark.mesh(devices=8)
+@pytest.mark.parametrize("placed", ["within", "returned"])
+@pytest.mark.parametrize("sum_", ["reduced", "unreduced"])
+def test_a_sum_a_gathered_region_writes_out_is_placed_back_taken(sum_, placed):
+    """A value a gathered loop's Explicit region (`sharding.explicit_over`) writes out as a pass's sown value
+    is (`sharding.typed_on`), whose placement carries a sum over the FSDP axis the step's mesh leaves Auto, is
+    placed back on that mesh with the sum taken: a matrix gathered reduced (`gathered_over`), the copy it
+    is; a product's partial sums over the axis (`unreduced`), their total. Its sum over an Auto axis is no
+    placement there, which JAX refused, with its kind too where no axis was left (the row 12849 review):
+    placed back within the region, as a pass's sown value is, or returned from it, `explicit_over` placing
+    it back outside the region's mesh."""
+    from dew.nn.sharding import explicit_over, gathered_over, typed_on
+    from dew.training import MeshSpec
+
+    mesh = MeshSpec(fsdp=8).build(jax.devices()[:8])
+    weight = np.arange(64, dtype=np.float32).reshape(16, 4)
+    # Whole numbers, whose products and sums float32 holds exactly in any order.
+    columns = np.arange(32, dtype=np.float32).reshape(8, 4)
+    with jax.set_mesh(mesh):
+        held = jax.device_put(weight, jax.sharding.PartitionSpec("fsdp"))
+        rows = jax.device_put(columns, jax.sharding.PartitionSpec("fsdp"))
+        outer = jax.sharding.get_abstract_mesh()
+
+        def inside(rows):
+            if sum_ == "reduced":
+                return gathered_over(held, jax.sharding.PartitionSpec("fsdp"), {"fsdp"})
+            # Each device's rows' product, unreduced over the axis that splits them.
+            return jnp.einsum("bd,be->de", rows, rows,
+                              out_sharding=jax.sharding.PartitionSpec(unreduced={"fsdp"}))
+
+        def region(rows):
+            return explicit_over(lambda rows: typed_on(inside(rows), outer) if placed == "within"
+                                 else inside(rows), rows)
+        out = jax.jit(region)(rows)
+    expected = weight if sum_ == "reduced" else columns.T @ columns
+    np.testing.assert_array_equal(np.asarray(out), expected)
+
+
+def test_a_gathered_loop_traced_under_no_layout_is_the_loop():
+    """Under no traced layout (an initialization, a server's forward), a gathered loop reads its block where
+    it lies: its program is the plain loop's, equation for equation (`Loop.gathered`)."""
+    programs = []
+    for gathered in (False, True):
+        model, gradient = _gathered_case(gathered=gathered, remat=False)
+        variables, ids = model_draw(model, (2, 12), VOCAB)(0)
+        programs.append(str(jax.make_jaxpr(gradient)(variables, ids, jnp.ones((2, 12, VOCAB)))))
+    assert programs[0] == programs[1]
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_gathered_loop_on_one_fsdp_device_is_the_loop():
+    """On a mesh whose FSDP axis holds one device (data parallel alone), a gathered loop lowers to the
+    plain loop's program, operation for operation (`Loop.gathered`: nothing to gather, no scope lifted for
+    it)."""
+    from dew.distributed.placement import Layout
+    from dew.mesh import DEFAULT_RULES
+    from dew.nn.sharding import placing
+    from dew.training import MeshSpec
+
+    mesh = MeshSpec().build(jax.devices()[:8])
+    layout = Layout(min_shard=1)
+    programs = []
+    for gathered in (False, True):
+        model, gradient = _gathered_case(gathered=gathered, remat=False)
+        variables, ids = model_draw(model, (8, 12), VOCAB)(0)
+        variables = jax.device_put(variables, layout.shardings(mesh, variables))
+        with jax.set_mesh(mesh), nn.logical_axis_rules(DEFAULT_RULES), placing(layout):
+            programs.append(jax.jit(gradient).lower(variables, ids, jnp.ones((8, 12, VOCAB))).as_text())
+    assert programs[0] == programs[1]

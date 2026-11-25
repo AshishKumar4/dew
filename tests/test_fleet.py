@@ -19,6 +19,7 @@ import time
 
 import pytest
 from process_support import running
+from test_cleanup import lifelines
 from tool_support import load
 
 from dew.data.prompts import PromptRecord
@@ -201,6 +202,17 @@ def test_a_runtime_that_cannot_start_the_container_raises():
         pytest.raises(InfrastructureError),
     ):
         fleet.run([Program({"main.py": "print(5)"}, ("python", "main.py"))])
+
+
+def test_a_container_client_that_ended_leaves_no_lifeline():
+    """A runtime's client that ended by itself (`false`, which creates nothing) ends its group's ownership
+    with the run: its lifeline (`dew._cleanup.start`'s) is let go and ends before the runner returns, where it
+    waited on a later start to be let go (row 12772's review)."""
+    before = lifelines()
+    with pytest.raises(InfrastructureError):
+        ContainerRunner(IMAGE, runtime="false")(Program({"main.py": "print(5)"}, ("python", "main.py")),
+                                                SandboxLimits())
+    assert lifelines() == before
 
 
 def test_a_runtime_that_stalls_removing_the_container_is_an_infrastructure_failure(tmp_path):

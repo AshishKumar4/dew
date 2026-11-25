@@ -34,7 +34,9 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     `dynamic_scale` as it trained under it; a Muon run's Newton-Schulz precision as a dot algorithm
     (`earlier_newton_schulz`); a profile window's capture options as its capture's (`earlier_profile`); a
     decision run's option text as its rows wrote it (`earlier_option_text`), and the fewest options its
-    rows drew "none of the above" on as they drew it (`earlier_none_of_the_above`); a world model's
+    rows drew "none of the above" on as they drew it (`earlier_none_of_the_above`), and its rows' budgets
+    and context layers as the records that hold them (`earlier_decision_rows`, row 11937); an LM run's
+    rollout's reward named by its import path as that path's record (`earlier_reward`); a world model's
     tokenizer's and its dynamics model's positions as they learned them (`earlier_tokenizer_positions`,
     `earlier_dynamics_positions`); a trainer layout recorded at `Layout()`'s defaults as unset
     (`earlier_trainer_layout`); its data plan version
@@ -61,6 +63,9 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     earlier = earlier_none_of_the_above(earlier_profile(earlier_trainer(
         moved if unsettable else earlier_trainer_layout(moved))))
     earlier = earlier_option_text(earlier_dynamics_positions(earlier_tokenizer_positions(earlier)))
+    # A decision run's budgets and context layers by the records they are held in now, and an LM run's
+    # reward by the record of what its import path names (row 11937).
+    earlier = earlier_reward(earlier_decision_rows(earlier))
     earlier = earlier_newton_schulz(earlier_retired(earlier_packed_experts(earlier), additive_unset=additive))
     # Its optimizer's and trainer's settings by the names a run's surface gives them now (`earlier_surface`).
     earlier = earlier_surface(earlier)
@@ -265,7 +270,11 @@ def _retired(name: str, fields: Mapping[str, _records.JSON], root: bool,
     flat_batched = (issubclass(kind, RunConfig) and isinstance(trainer, Mapping)
                     and _records.class_record(trainer) is None
                     and any(key in trainer for key in EARLIER_TRAINER_FIELDS))
-    if not (exported or flat or unset or spec is not None or batched or flat_batched or pinned or validated):
+    # A decoder run's flat loop fields, which a run states as its loop and passes since row 11937.
+    flat_loop = issubclass(kind, DecoderRunConfig) and any(
+        key in fields for key in (*EARLIER_LOOP_FIELDS, *EARLIER_PASS_FIELDS))
+    if not (exported or flat or unset or spec is not None or batched or flat_batched or pinned or validated
+            or flat_loop):
         return None
     migrated = {key: value for key, value in fields.items() if not (exported and key == "export_model")}
     if batched:
@@ -298,6 +307,8 @@ def _retired(name: str, fields: Mapping[str, _records.JSON], root: bool,
         migrated = _suites(migrated)
     if unset:
         migrated["loop_message_additive"] = None
+    if flat_loop:
+        migrated = _earlier_loop(migrated)
     return {"class": name, "fields": migrated}
 
 
@@ -579,6 +590,11 @@ def mask_readers(config: Mapping[str, JSON]) -> tuple[list[JSON], Sequence[Mappi
                                       if isinstance(group, Mapping) and not group.get("spared", False)]
     return groups, held if groups else ([] if config.get("spared", True) else [config])
 
+
+TYPED_OPTIMIZER = "typed_optimizer"
+"""The custom-metadata key an intermediate Dew saved each step under as its optimizer's spec built it
+(main f124c76b5 until row 12338): a step saved so holds its decay as its record states it, whatever mark
+lies beside its run (`MASKED_DECAY_MARK`). No Dew writes it now; deleted at 1.0 with the mark."""
 
 MASKED_DECAY_MARK = "earlier-masked-decay.json"
 """The file an intermediate Dew (main f124c76b5 until row 12338's deletion of its restore translation) kept
@@ -912,3 +928,159 @@ def earlier_compute(record: Mapping[str, object]) -> str:
     loads = fields.get("pretrained") is not None and isinstance(kind, type) and issubclass(
         kind, LMRunConfig | DiffusionRunConfig)
     return "bfloat16" if loads else "float32"
+
+
+EARLIER_LOOP_FIELDS = ("loop_layers", "loop_backprop_steps", "loop_remat", "loop_implicit",
+                       "loop_theta_per_pass", "loop_exit_gate", "loop_exit_threshold", "loop_messages",
+                       "loop_message_block_size", "loop_message_rank", "loop_message_additive")
+"""A decoder run's flat fields that changed its checkpoint's loop one choice at a time, which an earlier Dew
+recorded (`DecoderRunConfig` before row 11937), read as their `_LoopChange`."""
+
+EARLIER_PASS_FIELDS = ("loop_steps", "loop_steps_sample", "loop_steps_mean", "loop_steps_dispersion",
+                       "loop_steps_max")
+"""A decoder run's flat pass-count fields an earlier Dew recorded, read as its `passes` (row 11937)."""
+
+
+@dataclasses.dataclass(frozen=True)
+class _LoopChange:
+    """The changes a decoder run saved by an earlier Dew made to its checkpoint's loop, one choice at a
+    time (`EARLIER_LOOP_FIELDS`), each None or false keeping the checkpoint's own, which its run's `loop`
+    holds where its record is read (`earlier_run`): a run states its loop whole since row 11937
+    (`DecoderRunConfig.loop`). Read only from a saved record (`DecoderRunConfig._earlier_loop`); carried to
+    1.0 (ledger 1552)."""
+
+    layers: tuple[int, int] | None = None
+    backprop_steps: int | None = None
+    remat: bool = False
+    implicit: bool = False
+    theta_per_pass: bool = False
+    exit_gate: bool = False
+    exit_threshold: float | None = None
+    messages: bool = False
+    message_block_size: int | None = None
+    message_rank: int | None = None
+    message_additive: bool | None = None
+
+    def applied(self, start, passes, key):
+        """`start` (a loaded `Pretrained`) with its loop changed as the earlier run changed it, run at the
+        count it held and handed on (`passes`, a `PassPolicy`): a looped checkpoint's own block, or
+        `layers`, which gives a decoder with no loop one; its θ a row a later pass where it asked one
+        (`theta_per_pass`), for its largest count, each row the checkpoint's one θ; its messages the
+        checkpoint's own with what it stated in their place."""
+        from dew.config import _theta_rows
+        from dew.nn.cross_pass import CrossPass
+        from dew.nn.protocols import Looped, Looping
+        from dew.training.phase_passes import SampledPasses
+
+        counts = (passes if isinstance(passes, tuple) else
+                  (passes.cap,) if isinstance(passes, SampledPasses) else (passes,))
+        handed = counts[-1]
+        rows = max((count for count in counts if count is not None), default=None)
+        own = start.model.loop if isinstance(start.model, Looped) else None
+        if own is not None and own.theta_passes is not None:
+            rows = own.theta_passes
+        elif rows is None and own is not None:
+            rows = own.steps
+        messages = None
+        if self.messages:
+            stated = {"block_size": self.message_block_size, "rank": self.message_rank,
+                      "additive": self.message_additive}
+            held = None if own is None else own.messages
+            given = {name: value for name, value in stated.items() if value is not None}
+            messages = dataclasses.replace(CrossPass() if held is None else held, **given)
+        theta_passes = rows if self.theta_per_pass else None
+        looped = (start.model.with_passes(handed, self.layers, backprop_steps=self.backprop_steps,
+                                          remat=self.remat or None, implicit=self.implicit or None,
+                                          exit_gate=self.exit_gate or None,
+                                          exit_threshold=self.exit_threshold,
+                                          theta_passes=theta_passes, messages=messages)
+                  if isinstance(start.model, Looping) else None)
+        if looped is None:
+            raise ValueError(f"this {type(start.model).__name__} has no loop: the saved run's loop names no "
+                             "block of its layers to repeat")
+        if theta_passes is not None:
+            start = dataclasses.replace(start, variables=_theta_rows(start.variables, theta_passes))
+        return start.with_model(looped, key=key)
+
+
+def _earlier_loop(fields: Mapping[str, JSON]) -> dict[str, JSON]:
+    """A decoder run's fields with its earlier flat loop fields (`EARLIER_LOOP_FIELDS`,
+    `EARLIER_PASS_FIELDS`) read as its `_earlier_loop`, their `_LoopChange`, and its `passes`."""
+    kept = {key: value for key, value in fields.items()
+            if key not in EARLIER_LOOP_FIELDS and key not in EARLIER_PASS_FIELDS}
+    # A choice stated: a value, or a flag set; the messages' additive term's false its own choice.
+    changed = {key.removeprefix("loop_"): fields[key] for key in EARLIER_LOOP_FIELDS
+               if fields.get(key) is not None
+               and (fields[key] is not False or key == "loop_message_additive")}
+    if changed:
+        kept["_earlier_loop"] = {"class": registry.import_path(_LoopChange), "fields": changed}
+    if fields.get("loop_steps_sample") is not None:
+        kept["passes"] = {"class": "dew.training.phase_passes:SampledPasses", "fields": {
+            "mean": fields.get("loop_steps_mean"), "dispersion": fields.get("loop_steps_dispersion"),
+            "cap": fields.get("loop_steps_max"), "law": fields["loop_steps_sample"]}}
+    elif fields.get("loop_steps") is not None:
+        kept["passes"] = fields["loop_steps"]
+    return kept
+
+
+EARLIER_ROW_FIELDS = ("max_len", "head_max_len", "option_tokens", "max_state_tokens", "segments", "reads",
+                      "parallel", "shared_state", "siblings", "unit", "order", "split", "framing")
+"""A decision run's flat budgets of its rows' layout an earlier Dew recorded, read as its `rows`
+(`dew.decision.config.RowBudgets`, row 11937)."""
+
+EARLIER_CONTEXT_FIELDS = {"context_layers": "layers", "context_frozen": "frozen", "context_length": "length",
+                          "context_encoder": "encoder", "context_text": "text", "context_form": "form"}
+"""A decision run's flat fields of the layers that read its context an earlier Dew recorded, by the name
+each has in its `context` (`dew.decision.config.CrossContext`, row 11937)."""
+
+
+def earlier_decision_rows(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A saved decision run's record that states its rows' budgets and its context layers flat
+    (`EARLIER_ROW_FIELDS`, `EARLIER_CONTEXT_FIELDS`): its budgets as its `rows`, and its context layers'
+    fields as its `context`, none where it read no context (`context_layers` None, its other context
+    fields then its defaults, which it refused stated). Carried to 1.0 (ledger 1552)."""
+    named = registry.class_record(record)
+    if named is None or named[0] not in registry.runs or not any(
+            key in named[1] for key in (*EARLIER_ROW_FIELDS, *EARLIER_CONTEXT_FIELDS)):
+        return record
+    # A run of a class that holds its budgets and context layers so (a decision run), no other run's
+    # fields of those names.
+    run_class = registry.runs[named[0]]
+    held = ({field.name for field in dataclasses.fields(run_class)}
+            if isinstance(run_class, type) and dataclasses.is_dataclass(run_class) else set())
+    if not {"rows", "context"} <= held:
+        return record
+    fields = {key: value for key, value in named[1].items()
+              if key not in EARLIER_ROW_FIELDS and key not in EARLIER_CONTEXT_FIELDS}
+    rows = {key: named[1][key] for key in EARLIER_ROW_FIELDS if key in named[1]}
+    if rows:
+        fields["rows"] = rows
+    if named[1].get("context_layers") is not None:
+        fields["context"] = {renamed: named[1][key] for key, renamed in EARLIER_CONTEXT_FIELDS.items()
+                             if key in named[1]}
+    return {**record, "fields": fields}
+
+
+def earlier_reward(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A saved LM run's record whose GRPO rollout named its reward by its import path, a string
+    (`PromptRollout.reward` before row 11937): the record of what the path names, `{"function": path}`,
+    which reads as the function it names, or as the class, whose instance at its defaults the rollout
+    calls, as the path read before, recorded by its path again. Carried to 1.0 (ledger 1552)."""
+    named = registry.class_record(record)
+    rollout = None if named is None else named[1].get("rollout")
+    if named is None or named[0] not in registry.runs or not isinstance(rollout, Mapping):
+        return record
+    classed = "class" in rollout and isinstance(rollout.get("fields"), Mapping)
+    held = rollout["fields"] if classed else rollout
+    if not (isinstance(held, Mapping) and isinstance(held.get("reward"), str)):
+        return record
+    # A reward named by a string: an LM run's rollout's, no other run's (a diffusion rollout names its
+    # reward by an alias).
+    from dew.config.lm import LMRunConfig
+
+    run_class = registry.runs[named[0]]
+    if not (isinstance(run_class, type) and issubclass(run_class, LMRunConfig)):
+        return record
+    restated = {**held, "reward": {"function": held["reward"]}}
+    rollout = {**rollout, "fields": restated} if classed else restated
+    return {**record, "fields": {**named[1], "rollout": rollout}}

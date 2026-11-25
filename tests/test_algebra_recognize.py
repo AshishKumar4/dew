@@ -1372,8 +1372,8 @@ def test_recurrence_recognition_guards_range_tracers_tokens_and_training_vjp():
     unbounded_scan = _gdn_make_scan(_gdn_make_step(batch, hv), bound_inputs=False)
     with generation.assumed("sm90"), generation.chosen(gated_delta_rule="fla"):
         assert not _routes("gated_delta_rule", lambda: dew.jit(unbounded_scan).trace(*std_shapes))
-    q_big = jnp.zeros((seq, batch, hv, dk), jnp.bfloat16).at[:, :, :, 0].set(jnp.bfloat16(2.0 ** 80))
-    k_big = jnp.zeros((seq, batch, hv, dk), jnp.bfloat16).at[:, :, :, 0].set(jnp.bfloat16(2.0 ** 80))
+    q_big = jnp.zeros((seq, batch, hv, dk), jnp.bfloat16).at[0, :, :, 0].set(jnp.bfloat16(2.0 ** 80))
+    k_big = jnp.zeros((seq, batch, hv, dk), jnp.bfloat16).at[0, :, :, 0].set(jnp.bfloat16(2.0 ** 80))
     v_one = jnp.ones((seq, batch, hv, dv), jnp.bfloat16)
     g_zero = jnp.zeros((seq, batch, hv), jnp.float32)
     b_tiny = jnp.full((seq, batch, hv), jnp.bfloat16(2.0 ** -80))

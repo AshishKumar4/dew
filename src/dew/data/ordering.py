@@ -9,7 +9,6 @@ import threading
 from collections.abc import Mapping, Sequence
 from typing import overload
 
-import grain.experimental as gx
 import grain.python as grain
 import numpy as np
 from grain._src.python.dataset.transformations.shuffle import _reshuffle_window, _WindowShuffleDatasetIterator
@@ -17,6 +16,7 @@ from grain._src.python.dataset.transformations.shuffle import _reshuffle_window,
 from dew.batch import Batch
 from dew.data.dataset import Ranges
 from dew.data.pipeline import Pipeline, Repeat
+from dew.data.shards import Window, passed, served, shuffled
 
 
 class BlockShuffle(grain.MapDataset[Batch]):
@@ -67,7 +67,7 @@ class BlockShuffle(grain.MapDataset[Batch]):
         seed = int(np.random.SeedSequence([self._seed, epoch, block]).generate_state(1)[0])
         # Grain's shuffle of an integer range, `MapDataset.range(size).shuffle(seed)`, at one index
         # of its first epoch (`ShuffleMapDataset._shuffled_index`).
-        offset = gx.index_shuffle(place, max_index=blocks.counts[block] - 1, seed=seed, rounds=4)
+        offset = shuffled(place, blocks.counts[block] - 1, seed)
         for member in members:
             if offset < self._sizes[member]:
                 return epoch * self._total + self._shards.start(member) + offset
@@ -86,10 +86,13 @@ class WindowShuffle(grain.IterDataset[Batch]):
     """A streamed read's records shuffled within each `window` of them, in the order Grain's window shuffle
     gives (`grain.experimental.WindowShuffleIterDataset`: window k of the parent's records drawn by
     `index_shuffle(position, window - 1, seed + k, rounds=4)` and given from the last), its position the
-    one Grain saves, so a saved run reads and resumes as it did. Each window after the first is read as
-    the one before is given, a record of it for each record given, where Grain read each whole as its first
-    record was asked: a 16k-record window's read stalled the step that asked it 10 s and held the GIL
-    against the steps' dispatch (row 4740)."""
+    one Grain saves, so a saved run reads and resumes as it did. Where its parent serves its next records by
+    index (`dew.data.shards.Window`: line files read in order, through maps alone), a window reads only the
+    records it gives, as it gives them, its parent then placed past the window, none read (row 12475: a
+    stream read a whole window before its first record, a source smaller than its window several times
+    over); else each window after the first is read as the one before is given, a record of it for each
+    record given, where Grain read each whole as its first record was asked (row 4740: a 16k-record
+    window's read stalled the step that asked it 10 s)."""
 
     def __init__(self, parent: grain.IterDataset[Batch], *, window: int, seed: int):
         super().__init__(parent)
@@ -111,6 +114,16 @@ class _WindowShuffled(_WindowShuffleDatasetIterator[Batch]):
         self._next: Mapping[str, object] | None = None
         self._ahead: list[Batch] = []
         self._ended = False
+        # The current window's records by index where its parent served them so (`Window`); None for a
+        # window read as a stream.
+        self._served: Window | None = None
+
+    def _indexed(self) -> Window | None:
+        """The next window's records by index (`served`), where the parent stands at its start, no record of
+        it read ahead; None where it serves none so."""
+        if self._next is not None or self._ahead:
+            return None
+        return served(self._parent, self._window_size)
 
     def _read_ahead(self, count: int) -> None:
         while count > 0 and not self._ended:
@@ -121,6 +134,12 @@ class _WindowShuffled(_WindowShuffleDatasetIterator[Batch]):
             count -= 1
 
     def _fill_and_shuffle_window(self) -> None:
+        self._served = self._indexed()
+        if self._served is not None:
+            # Its records read as they are given, in Grain's order (`_place`), none held.
+            self._parent_exhausted = self._served.held < self._window_size
+            self._window = []
+            return
         # A window read ahead starts where the one before it ended, not where the parent stands now.
         if self._next is not None:
             self._parent_window_start_iter_state = self._next
@@ -131,14 +150,44 @@ class _WindowShuffled(_WindowShuffleDatasetIterator[Batch]):
         self._window = _reshuffle_window(window=records, seed=self._global_seed + self._window_index)
         self._next = None if self._ended else self._parent.get_state()
 
+    def _place(self, given: int) -> int:
+        """The place in the served window of the record it gives `given`th: Grain's (`_reshuffle_window`'s
+        list of the window's places by `index_shuffle`, given from its last), drawn alone."""
+        held = self._served.held if self._served is not None else 0
+        return shuffled(held - 1 - given, held - 1, self._global_seed + self._window_index)
+
     def __next__(self) -> Batch:
-        given = super().__next__()
-        if self._next is not None:
-            self._read_ahead(1)
-        return given
+        while True:
+            if self._served is not None:
+                if self._pos_in_window < self._served.held:
+                    # Grain's own step through a window (`_WindowShuffleDatasetIterator.__next__`), its
+                    # record read by index first: its position moves on once it is read.
+                    record = self._served[self._place(self._pos_in_window)]
+                    self._pos_in_window += 1
+                    if self._pos_in_window == self._served.held:
+                        self._window_index += 1
+                    return record
+                # A window served by index given whole: its parent stands past its records, none read.
+                passed(self._parent, self._served)
+                self._served = None
+            elif self._window:
+                given = super().__next__()
+                if self._next is not None:
+                    self._read_ahead(1)
+                return given
+            if self._parent_exhausted:
+                raise StopIteration
+            # The next window, started where the parent stands, as Grain starts one.
+            self._parent_window_start_iter_state = self._parent.get_state()
+            self._fill_and_shuffle_window()
+            self._pos_in_window = 0
+            if not (self._served.held if self._served is not None else self._window):
+                raise StopIteration
 
     def set_state(self, state: Mapping[str, object]) -> None:
         self._ended, self._ahead, self._next = False, [], None
+        # Grain's own restore: its window filled again from its start (`_fill_and_shuffle_window`), the
+        # records it gave dropped; a served one gives on from its position (`_place`).
         super().set_state(state)
 
 

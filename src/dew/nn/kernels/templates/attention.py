@@ -38,15 +38,18 @@ import numpy as np
 from jax.typing import DTypeLike
 
 from dew._hashing import fmix32
+from dew.nn.aligned import aligned_sum
 from dew.nn.derivatives import Protected, contracted, surrogate
 from dew.nn.float_bits import binade_of, lowered_rounded, raised_exactly
 from dew.nn.kernels import generation, tuning
+from dew.nn.kernels.templates import scaled_contraction
 from dew.nn.precision import (
     at_least_fp32,
     compensated_sum,
     exact_float32,
     float32_einsum,
     lowered_divide,
+    power2,
     split_bits,
     two_sum,
     uncontracted,
@@ -1147,14 +1150,6 @@ def shared_place(shape: tuple[int, ...], row, head) -> tuple:
     return (row if shape[0] > 1 else 0), (head if shape[1] > 1 else 0)
 
 
-def shared_sum(grad: jax.Array, param: Param) -> jax.Array:
-    """A parameter's gradient `[B, H, ...]` (a mainloop's, a program a batch row and head) summed over the
-    batch rows and heads it shares (`shared_place`), its own shape; a mainloop that adds them in its
-    programs hands it back that shape already."""
-    shared = tuple(axis for axis in (0, 1) if param.value.shape[axis] == 1 and grad.shape[axis] > 1)
-    return grad.sum(axis=shared, keepdims=True) if shared else grad
-
-
 def _per_head(param: Param, row: jax.Array, head: jax.Array) -> jax.Array:
     """`param` as the reference reads it for one batch row and query head, over every query and key."""
     value = param.value
@@ -1344,7 +1339,8 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
         acc = acc0 * carried[..., None] + valued(p)
         normalized = jnp.where(total[..., None] > 0, acc / jnp.where(total > 0, total, 1)[..., None], 0)
         if hooks.initial is None or hooks.initial.valueless:
-            normalized = held_mean(normalized, acc, value.dtype)
+            normalized = held_mean(acc, total, value.dtype, functools.partial(
+                _scaled_mean, logits, value, m0, total0, acc0))
         if hooks.output_mod is None and jnp.dtype(query.dtype).itemsize == 2:
             # Rounded to odd for its narrowing, as the kernels' quotients outside a register epilogue are.
             normalized = narrowing_settled(normalized, acc, total, query.dtype)
@@ -1477,10 +1473,49 @@ def _between(bits: jax.Array, dtype: DTypeLike) -> jax.Array:
     return (significand & (2 * half - 1)) == half
 
 
-def held_mean(out: jax.Array, sums: jax.Array, dtype) -> jax.Array:
-    """The reference's mean saturation (`saturated`): its value, its derivative the mean's, `out`'s
-    (`derivative_of`)."""
-    return saturated(jax.lax.stop_gradient(out), jnp.abs(sums) < jnp.inf, dtype) + derivative_of(out)
+def held_mean(acc: jax.Array, total: jax.Array, dtype, law) -> jax.Array:
+    """The reference's mean `acc / total` (zero where `total` is) saturated (`saturated`): its value, and its
+    derivative at every order `law`'s (`_scaled_mean`), one quotient formed apart from its binades
+    (`scaled_contraction`) whose every order is that quotient again: its sums and total at any magnitude, and
+    any tangent's, take no `total^-2` and no sum past the format (a value of 2^62 over a mass of 2^62 moved by
+    2^100: -2^38, where the quotient's own derivative formed -inf)."""
+    finite = jnp.abs(jax.lax.stop_gradient(acc)) < jnp.inf
+    held = jax.lax.stop_gradient(total)[..., None]
+    seen = held > 0
+    out = jnp.where(seen, jax.lax.stop_gradient(acc) / jnp.where(seen, held, 1), 0)
+    return saturated(out, finite, dtype) + derivative_of(law())
+
+
+def _scaled_mean(logits: jax.Array, value: jax.Array, m0: jax.Array, total0: jax.Array,
+                 acc0: jax.Array) -> jax.Array:
+    """The mean of the values `[B, K, Hk, Dv]` at the logits `[B, H, Q, K]` beside a state (its maximum `m0`
+    and mass `total0`, `[B, H, Q]`, and its sums `acc0`, `[B, H, Q, Dv]`, a valueless state's zero), `[B, H,
+    Q, Dv]`, as the reference forms it (`valued`): each key's mass at the row's maximum, held out of the graph
+    (`m`'s, any shift's derivative cancels), weighing the values narrowed to their dtype, the narrowing a
+    stop-gradient operand of its own and the weights' cotangent from them rounded there (`Form. narrowed`, as
+    JAX's transpose of the narrowing rounds it); their total unnarrowed beside the state's mass. One quotient
+    formed apart from its binades (`scaled_contraction`, its divisor its own sum of its operands): every order
+    is that quotient again, so a cotangent's part through the values and through the total (each 2^130 at
+    values near the format's largest) cancel within one sum; zero over a total of none."""
+    batch, heads, queries, keys = logits.shape
+    kv_heads, width = value.shape[2], value.shape[3]
+    wide = at_least_fp32(value.dtype)
+    grouped = (batch, kv_heads, heads // kv_heads, queries)
+    reached = jnp.maximum(m0, jnp.max(logits, axis=-1, initial=-jnp.inf))
+    shift = jax.lax.stop_gradient(jnp.where(jnp.isfinite(reached), reached, 0))
+    masses = jnp.where(jnp.isfinite(logits), jnp.exp(logits - shift[..., None]), 0)
+    narrowing = jax.lax.stop_gradient(masses.astype(value.dtype).astype(masses.dtype) - masses)
+    carried = jnp.where(jnp.isfinite(m0), jnp.exp(m0 - shift), 0)
+    seen = jax.lax.stop_gradient(jnp.sum(masses, axis=-1) + total0 * carried) > 0
+    form = scaled_contraction.Form(
+        ("bhgqk", "bhgqk", "bkhd", "bhgqd", "bhgq", "bhgq"),
+        ((1, (((0, 1),), ((2, 1),))), (1, (((1, 1),), ((2, 1),))), (1, (((3, 1), (4, 1)),))), "bhgqd",
+        divisor=((1, (((0, 1),),)), (1, (((4, 1), (5, 1)),))), divided="bhgq",
+        narrowed=((0, 0, jnp.dtype(value.dtype).name),) if jnp.dtype(value.dtype) != jnp.dtype(wide) else ())
+    mean = scaled_contraction.contract(
+        form, masses.reshape(*grouped, keys), narrowing.reshape(*grouped, keys), value.astype(wide),
+        acc0.reshape(*grouped, width), carried.reshape(grouped), total0.reshape(grouped))
+    return jnp.where(seen[..., None], mean.reshape(batch, heads, queries, width), 0)
 
 
 def derivative_of(out: jax.Array) -> jax.Array:
@@ -1944,25 +1979,31 @@ class Gradients:
 
 
 
+def launch_cotangent(dout: jax.Array, dtype: DTypeLike, hooks: Hooks, totals: jax.Array) -> jax.Array:
+    """The one cotangent every part of the backward takes, its shift's (`value_shift`) and its launch's
+    (`launch_arguments`): the output's `dout` `[B, Q, H, Dv]` in the operands' `dtype`, as the reference
+    takes it, none at a query a score hook leaves seeing no key (its denominator `totals` `[B, H, Q]` 0, its
+    output the reference's zero), whose weights are 0 while its `dO Vᵀ` may overflow (`0 * inf`), and whose
+    `dO` of `inf` would take its row's values beneath a shift no visited query asks for."""
+    dout = dout.astype(dtype)
+    if hooks.score_mod is None:
+        return dout
+    return jnp.where(jnp.swapaxes(totals, 1, 2)[..., None] > 0, dout, jnp.zeros((), dout.dtype))
+
+
 def launch_arguments(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,
                      dout: jax.Array, residuals: tuple[jax.Array, jax.Array, jax.Array, Split], *, block: int,
                      scale: float | None) -> tuple[tuple, dict, tuple]:
     """The arrays and parameters `gradients` hands a mainloop's backward launch for this call (padded to
-    whole `block`s), and what it finishes the gradients from (the padded call, the initial state's terms
-    and the cotangent `[B, H, Q, Dv]` fp32): a launch's own fitting reads them before any launch runs
-    (`attention_triton.backward_unfitted`)."""
+    whole `block`s), `dout` the launch's cotangent (`launch_cotangent`), and what it finishes the gradients
+    from (the padded call, the initial state's terms and the cotangent `[B, H, Q, Dv]` fp32): a launch's own
+    fitting reads them before any launch runs (`attention_triton.backward_unfitted`)."""
     batch, queries, heads, width = query.shape
     group, value_width = heads // key.shape[2], value.shape[-1]
     # The logits taken as the forward took them (`prescale`): every launch recomputes them from the query
     # taken by the power, at the scale left, and takes the gradients' cotangents at the call's whole scale
     # against the call's own keys and queries, so no factor of the power is taken back from a product.
     power, scale = prescale(query.dtype, width, scale)
-    # One cotangent for every part: the output's, in the operands' dtype as the reference takes it, none at
-    # a query a score hook leaves seeing no key (its denominator 0, its output the reference's zero), whose
-    # weights are 0 while its `dO Vᵀ` may overflow (`0 * inf`).
-    dout = dout.astype(query.dtype)
-    if hooks.score_mod is not None:
-        dout = jnp.where(jnp.swapaxes(residuals[1], 1, 2)[..., None] > 0, dout, jnp.zeros((), dout.dtype))
     cotangent = jnp.swapaxes(dout.astype(jnp.float32), 1, 2)
     state = hooks.initial
     if state is None:
@@ -2002,6 +2043,147 @@ def launch_arguments(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
     return arrays, params, (call, starts, cotangent)
 
 
+def value_shift(dout: jax.Array, value: jax.Array, hooks: Hooks) -> jax.Array:
+    """The power of two `gradients` takes each batch row's and key head's values beneath, int32 `[B, Hk]`: 0
+    wherever `sum_d max|dO_d| max|V_d|` over that row and head (the largest `|dP|` and `|D|` it can form, its
+    channels' maxima paired, an initial state's mean among the values) stays under fp32's `2^127`, else the
+    binades it passes by, so `dP = dO V^T`, `D = dO . O` and their difference form finite; a row's own, so
+    one past the format takes no other's small values beneath it, whatever hook parameters the rows share
+    (`gradients` sums a shared one's parts across rows at their own scales, `raised_sum`). `dout` the
+    launch's own cotangent (`launch_cotangent`): a query no key reaches asks for no shift. Within a row and
+    head the shift is its keys' and queries' together: a query of small values beside a key at the format's
+    edge is taken beneath it too (row 12452), and a key head's for each of its query heads. Its sum taken at
+    each factor's own largest binade, finite whatever their product."""
+    batch, queries, heads, width = dout.shape
+    kv_heads = value.shape[2]
+    group = heads // kv_heads
+
+    def channels(x: jax.Array, axes: tuple[int, ...]) -> jax.Array:
+        return jnp.max(jnp.abs(x.astype(jnp.float32)), axis=axes, initial=0.0)
+
+    cotangents = channels(dout.reshape(batch, queries, kv_heads, group, width), (1, 3))
+    values = channels(value, (1,))
+    initial = hooks.initial
+    if initial is not None and not initial.valueless:
+        total = initial.total.astype(jnp.float32)[..., None]
+        mean = initial.acc.astype(jnp.float32) / jnp.where(total > 0, total, 1)
+        values = jnp.maximum(values, channels(mean.reshape(batch, kv_heads, group, queries, width), (2, 3)))
+    lead_o, lead_v = binade_of(jnp.max(cotangents, axis=-1)), binade_of(jnp.max(values, axis=-1))
+    held = jnp.sum(power2(cotangents, -lead_o[..., None]) * power2(values, -lead_v[..., None]), axis=-1)
+    shift = jnp.maximum(binade_of(held) + lead_o + lead_v - 126, 0)
+    return jax.lax.stop_gradient(shift).astype(jnp.int32)
+
+
+def shifted(x: jax.Array, shift: jax.Array) -> jax.Array:
+    """`x * 2^shift` in `x`'s dtype, `x` itself bit for bit where the shift is 0 (a subnormal on a process
+    that flushes them included)."""
+    return jnp.where(shift == 0, x, power2(x, shift).astype(x.dtype))
+
+
+def raised_sum(grad: jax.Array, shift: jax.Array, axes: tuple[int, ...]) -> jax.Array:
+    """`grad` fp32, each part `2^shift` beneath its truth (`shift` int32, at least 0, broadcast against it),
+    raised and summed over `axes` (kept): a part apiece exactly (`shifted`) where it sums none; else the
+    exact sum of the raised parts rounded once (`aligned.aligned_sum`), so parts past fp32's largest that
+    cancel give what they cancel to (two rows' `±2^252` under a shared bias 0, where each raised first was
+    `±inf` and their sum NaN), a part at its own scale keeps its bits beside a larger one's, and normal parts
+    that cancel to a subnormal keep it where fp32's sum flushes it (XLA's CPU, `bodies.subnormals`). Its
+    factor `2^shift` three powers of two each within fp32's normals (at most `2^87`: a shift of 258 at most,
+    both a row's values and its cotangent infinite, 257 one of them), so a part of 0 raised is 0, never
+    `0 * inf`."""
+    if not axes:
+        return shifted(grad, shift)
+    one = jnp.ones((), jnp.float32)
+    third = shift // 3
+    factors = (power2(one, third), power2(one, third), power2(one, shift - 2 * third))
+    return aligned_sum([(grad, *factors)], axis=axes)
+
+
+def hook_gradient(grad: jax.Array, shift: jax.Array, param: Param) -> jax.Array:
+    """A score hook parameter's gradient from a launch's fp32 parts, a batch row's and query head's each
+    (`[B, H, ...]`; a head's partial sums `[., B, H, 1]`) beneath their shift `[B, H]` (`beneath_shift`):
+    raised and summed over the rows and heads `param` shares (`shared_place`; a head's over every row and
+    partial sum) at once (`raised_sum`), in its own shape. Every launch writes a row's and head's apiece, so
+    no sum across rows precedes the one that takes each at its own scale."""
+    if param.kind == Kind.HEAD:
+        return raised_sum(grad, shift[None, :, :, None], (0, 1))[0, 0, :param.value.shape[0], 0]
+    laid = shift.reshape(*shift.shape, *(1,) * (grad.ndim - 2))
+    shared = tuple(axis for axis in (0, 1) if param.value.shape[axis] == 1 and grad.shape[axis] > 1)
+    return raised_sum(grad, laid, shared)
+
+
+def beneath_shift(dout: jax.Array, value: jax.Array, residuals: tuple[jax.Array, jax.Array, jax.Array, Split],
+                  hooks: Hooks) -> tuple[jax.Array, jax.Array, tuple, Hooks]:
+    """The values at an exact power of two beneath them (`value_shift`), each batch row's and key head's,
+    with the split sums and the initial state's sums they weigh: a call whose `dO V` stays within fp32
+    shifts by 0 and rounds as it did; one past it forms `dP`, D and their difference finite (values at fp32's
+    largest: each 2^130, `inf - inf` where its truth is 0). `(shift [B, H], value, residuals, hooks)`, each
+    taken beneath it."""
+    shift = value_shift(dout, value, hooks)
+    heads = dout.shape[2]
+    by_head = jnp.repeat(shift, heads // shift.shape[1], axis=1)
+    maxima, totals, anchors, split = residuals
+    residuals = (maxima, totals, anchors,
+                 split._replace(others=shifted(split.others, -by_head[:, :, None, None])))
+    if hooks.initial is not None:
+        hooks = dataclasses.replace(hooks, initial=dataclasses.replace(
+            hooks.initial, acc=shifted(hooks.initial.acc, -by_head[:, :, None, None])))
+    return by_head, shifted(value, -shift[:, None, :, None]), residuals, hooks
+
+
+def _initial_gradients(state: Initial, starts: tuple[jax.Array, jax.Array, jax.Array], peak: jax.Array,
+                       total: jax.Array, mass: jax.Array, delta: jax.Array, low: jax.Array, lost: jax.Array,
+                       cotangent: jax.Array, restored: Callable[[jax.Array], jax.Array]) -> Initial:
+    """`gradients`' initial state's gradients from the launch's softmax rows (its maximum `peak`, total,
+    the keys' `mass`, D and what its roundings lost) and the state's terms `starts`, those the values read
+    raised by `restored` (`beneath_shift`)."""
+    # The initial state as one more softmax term, its weight exp(m0 - m) / T and value acc0 / total0:
+    # each gradient divides by T first and takes the factor exp(m0 - m) last, so a state that weighs
+    # little beside the keys (a subnormal factor) is rounded once there, as the reference rounds it.
+    # Bounded as the launch's own carried factor is (`attention_gradient.below`): the forward's
+    # maximum is the state's too, whatever its rounding.
+    carried = jnp.exp(jnp.minimum(starts[0] - peak, 0.0))
+    factor = jnp.where((total > 0) & jnp.isfinite(starts[0]), carried, 0.0)
+    inverse = jnp.where(total > 0, 1.0 / jnp.where(total > 0, total, 1.0), 0.0)
+    # Its maximum's cotangent, that term's score cotangent, taken whole as the reference's derivative
+    # takes it; exactly 0 for a query that read only its state, whose output its maximum leaves unmoved.
+    # Its weight before any product, as the launch takes it (`attention_gradient.refinement`).
+    # Less D's rounded parts: a state that holds nearly all the weight has `starts[2]` and D equal in fp32
+    # where they differ by D's refinement alone (an fp16 call beside a state near fp32's largest, 4,094 of
+    # its maxima's gradients 0 in place of 1e-34, row 6302).
+    moved = (((starts[2] - delta) - low) - lost) * ((starts[1] * factor) * inverse)
+    # Its denominator's: D over T in one division, as the reference's derivative of its own division
+    # rounds it, not D times T's rounded inverse (row 2466: 1.5 to 1.66 times the reference's error from
+    # float64 at fp32 sums).
+    share = jnp.where(total > 0, delta / jnp.where(total > 0, total, 1.0), 0.0)
+    # Its product with the state's factor, below fp32's least normal where the state's denominator is
+    # large or its maximum lies far under the walk's, kept on a CPU, which flushes the share, the factor
+    # and their product: the factor as two normal halves `exp(d / 2)` (row 6302, 161 of a resumed
+    # state's denominators' gradients 0).
+    held = (total > 0) & jnp.isfinite(starts[0])
+    half = jnp.where(held, jnp.exp(jnp.minimum(starts[0] - peak, 0.0) * 0.5), 0.0)
+
+    def weighed_by(*, flushing: bool) -> jax.Array:
+        if not flushing:
+            return share * factor
+        # `delta * half * half / total` with D raised from its bits until its products stay normal,
+        # divided and lowered in one rounding (`lowered_divide`).
+        nonzero = (binade_of(delta) > -1024) & (binade_of(half) > -1024) & (total > 0)
+        binades = binade_of(delta) + 2 * binade_of(half)
+        ceiling = jnp.maximum(126 - binade_of(delta), 0)
+        raised = jnp.where(nonzero, jnp.clip(-124 - binades, 0, ceiling), 0)
+        numerator = raised_exactly(delta, raised) * half * half
+        divisor = jnp.where(total > 0, total, 1.0)
+        return jnp.where(nonzero, lowered_divide(numerator, divisor, raised), 0.0)
+    from dew.nn.kernels.templates import bodies
+
+    weighed = bodies.subnormals(weighed_by, delta.dtype)
+    # In the state's own structure, its static marks with it (`Initial.valueless`).
+    return dataclasses.replace(
+        state, m=restored(jnp.where(mass > 0, moved, 0.0)).astype(state.m.dtype),
+        total=restored(-weighed).astype(state.total.dtype),
+        acc=((cotangent * inverse[..., None]) * factor[..., None]).astype(state.acc.dtype))
+
+
 def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
               hooks: Hooks | None, dout: jax.Array,
               residuals: tuple[jax.Array, jax.Array, jax.Array, Split], *, block: int,
@@ -2029,6 +2211,17 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     hooks = Hooks() if hooks is None else hooks
     if hooks.output_mod is not None:
         raise ValueError("the backward takes the output before the output hook (`backward`'s docstring)")
+    # Each gradient linear in the values (dQ, dK, the hooks' and the state's maximum and denominator)
+    # restored last by the power of two they were taken beneath (`beneath_shift`), from the launch's own
+    # cotangent (`launch_cotangent`); dV and the state's sums' read none.
+    dout = launch_cotangent(dout, query.dtype, hooks, residuals[1])
+    shift, value, residuals, hooks = beneath_shift(dout, value, residuals, hooks)
+
+    def restored(grad: jax.Array) -> jax.Array:
+        # dQ's or dK's, its batch rows on axis 0 and its query or key heads on axis 2.
+        heads = shift if grad.shape[2] == shift.shape[1] else shift[:, ::shift.shape[1] // grad.shape[2]]
+        return shifted(grad, heads[:, None, :, None])
+
     batch, queries, heads, width = query.shape
     keys, kv_heads, value_width = key.shape[1], key.shape[2], value.shape[-1]
     group = heads // kv_heads
@@ -2037,7 +2230,7 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     state = hooks.initial
     kinds = params["score_kinds"]
     outputs = launch(*arrays, **params)
-    dq, softmax = outputs[0], outputs[1:7]
+    dq, softmax = restored(outputs[0]), outputs[1:7]
     grads_out = list(outputs[8:])
     dq_grads = [grads_out.pop(0) for kind in kinds if kind in DQ_GRADS]
     dk, dv, *key_grads = grads_out
@@ -2046,71 +2239,28 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     delta, low = two_sum(anchor, delta)
     padded_k, padded_d, padded_dv = call.key.shape[1], call.key.shape[-1], call.value.shape[-1]
     if dk.shape[2] != kv_heads:
-        # A launch's gradients a query head's each, a key head's summed here (in a fixed order); a launch
-        # that adds them into the key head's own returns them summed.
+        # A launch's gradients a query head's each, a key head's summed here (in a fixed order), beneath the
+        # shift its query heads share, then raised once; a launch that adds them into the key head's own
+        # returns them summed.
         dk = dk.reshape(batch, padded_k, kv_heads, group, padded_d).sum(axis=3)
         dv = dv.reshape(batch, padded_k, kv_heads, group, padded_dv).sum(axis=3)
+    dk = restored(dk)
     grads = []
     for param in hooks.score_params:
         match param.kind:
             case Kind.HEAD:
-                grads.append(dq_grads.pop(0).sum(axis=(0, 1))[:param.value.shape[0], 0])
+                grads.append(hook_gradient(dq_grads.pop(0), shift, param))
             case Kind.QUERY:
-                grads.append(shared_sum(dq_grads.pop(0)[:, :, :queries], param))
+                grads.append(hook_gradient(dq_grads.pop(0)[:, :, :queries], shift, param))
             case Kind.TILE:
-                grads.append(shared_sum(key_grads.pop(0)[:, :, :queries, :keys], param))
+                grads.append(hook_gradient(key_grads.pop(0)[:, :, :queries, :keys], shift, param))
             case Kind.KEY:
-                grads.append(shared_sum(key_grads.pop(0)[:, :, :keys], param))
+                grads.append(hook_gradient(key_grads.pop(0)[:, :, :keys], shift, param))
             case Kind.OUTPUT:
                 raise ValueError("a score hook takes no output parameter")
-    initial = None
-    if state is not None:
-        # The initial state as one more softmax term, its weight exp(m0 - m) / T and value acc0 / total0:
-        # each gradient divides by T first and takes the factor exp(m0 - m) last, so a state that weighs
-        # little beside the keys (a subnormal factor) is rounded once there, as the reference rounds it.
-        # Bounded as the launch's own carried factor is (`attention_gradient.below`): the forward's
-        # maximum is the state's too, whatever its rounding.
-        carried = jnp.exp(jnp.minimum(starts[0] - peak, 0.0))
-        factor = jnp.where((total > 0) & jnp.isfinite(starts[0]), carried, 0.0)
-        inverse = jnp.where(total > 0, 1.0 / jnp.where(total > 0, total, 1.0), 0.0)
-        # Its maximum's cotangent, that term's score cotangent, taken whole as the reference's derivative
-        # takes it; exactly 0 for a query that read only its state, whose output its maximum leaves unmoved.
-        # Its weight before any product, as the launch takes it (`attention_gradient.refinement`).
-        # Less D's rounded parts: a state that holds nearly all the weight has `starts[2]` and D equal in fp32
-        # where they differ by D's refinement alone (an fp16 call beside a state near fp32's largest, 4,094 of
-        # its maxima's gradients 0 in place of 1e-34, row 6302).
-        moved = (((starts[2] - delta) - low) - lost) * ((starts[1] * factor) * inverse)
-        # Its denominator's: D over T in one division, as the reference's derivative of its own division
-        # rounds it, not D times T's rounded inverse (row 2466: 1.5 to 1.66 times the reference's error from
-        # float64 at fp32 sums).
-        share = jnp.where(total > 0, delta / jnp.where(total > 0, total, 1.0), 0.0)
-        # Its product with the state's factor, below fp32's least normal where the state's denominator is
-        # large or its maximum lies far under the walk's, kept on a CPU, which flushes the share, the factor
-        # and their product: the factor as two normal halves `exp(d / 2)` (row 6302, 161 of a resumed
-        # state's denominators' gradients 0).
-        held = (total > 0) & jnp.isfinite(starts[0])
-        half = jnp.where(held, jnp.exp(jnp.minimum(starts[0] - peak, 0.0) * 0.5), 0.0)
-
-        def weighed_by(*, flushing: bool) -> jax.Array:
-            if not flushing:
-                return share * factor
-            # `delta * half * half / total` with D raised from its bits until its products stay normal,
-            # divided and lowered in one rounding (`lowered_divide`).
-            nonzero = (binade_of(delta) > -1024) & (binade_of(half) > -1024) & (total > 0)
-            binades = binade_of(delta) + 2 * binade_of(half)
-            ceiling = jnp.maximum(126 - binade_of(delta), 0)
-            raised = jnp.where(nonzero, jnp.clip(-124 - binades, 0, ceiling), 0)
-            numerator = raised_exactly(delta, raised) * half * half
-            divisor = jnp.where(total > 0, total, 1.0)
-            return jnp.where(nonzero, lowered_divide(numerator, divisor, raised), 0.0)
-        from dew.nn.kernels.templates import bodies
-
-        weighed = bodies.subnormals(weighed_by, delta.dtype)
-        # In the state's own structure, its static marks with it (`Initial.valueless`).
-        initial = dataclasses.replace(
-            state, m=jnp.where(mass > 0, moved, 0.0).astype(state.m.dtype),
-            total=(-weighed).astype(state.total.dtype),
-            acc=((cotangent * inverse[..., None]) * factor[..., None]).astype(state.acc.dtype))
+    initial = None if state is None else _initial_gradients(
+        state, starts, peak, total, mass, delta, low, lost, cotangent,
+        functools.partial(shifted, shift=shift[:, :, None]))
     # Unrounded (`rounded` False), dK and dV stay in at least fp32 for a caller that sums them across
     # shards first and rounds once (`attention_route.attend`'s `operand_dtype`).
     key_dtype, value_dtype = ((key.dtype, value.dtype) if rounded

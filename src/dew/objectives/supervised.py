@@ -124,7 +124,7 @@ class Supervised(Objective[Ratio]):
                                             rngs=model_rngs(step.key, training=step.training),
                                             mutable=step.sown(*held), method="__call__", **mode,
                                             **progressed(self.model, self.progress(step)))
-        qk, sown = step.observed(dict(updates))
+        qk, sown, amax = step.observed(dict(updates))
         updates = {name: value for name, value in updates.items() if name in held}
         losses = self.criterion(outputs, batch)
         if jnp.ndim(losses) == 0:
@@ -132,7 +132,7 @@ class Supervised(Objective[Ratio]):
                              "takes the mean over the batch's rows itself")
         metrics: dict[str, jax.Array | Ratio] = {
             name: self.row_mean(metric(outputs, batch), batch) for name, metric in self.metrics.items()}
-        aux = Aux(metrics, variables=dict(updates) if held else None, qk_stats=qk, inspected=sown)
+        aux = Aux(metrics, variables=dict(updates) if held else None, qk_stats=qk, inspected=sown, amax=amax)
         return self.row_mean(losses, batch), aux, losses
 
 

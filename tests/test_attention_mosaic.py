@@ -1489,18 +1489,18 @@ def test_a_pinned_rewalk_runs_whichever_of_its_tiles_the_pin_names(named):
         assert op.completed(ba, pinned) == pinned
 
 
-def _backward_call(shape, width: int, accurate: bool):
-    """A causal backward's op and bound arguments over `shape`'s operands, its heads `width` wide, with a
-    training forward's residuals."""
+def _backward_call(shape, width: int, accurate: bool, causal: bool = True):
+    """A causal backward's (a full one's, not `causal`) op and bound arguments over `shape`'s operands, its
+    heads `width` wide, with a training forward's residuals."""
     rows, tokens, heads, kv_heads = shape
-    spans = template.spans(tokens, tokens, rows, causal=True)
+    spans = template.spans(tokens, tokens, rows, causal=causal)
     query = jax.ShapeDtypeStruct((rows, tokens, heads, width), jnp.bfloat16)
     key = jax.ShapeDtypeStruct((rows, tokens, kv_heads, width), jnp.bfloat16)
     stats = jax.ShapeDtypeStruct((rows, heads, tokens), jnp.float32)
     residuals = (stats, stats, jax.ShapeDtypeStruct((rows, heads, tokens), jnp.int32),
                  template.Split(jax.ShapeDtypeStruct((rows, heads, tokens, width), jnp.float32), stats, stats,
                                 stats))
-    op = attention_mosaic.MosaicBackward(form="causal", keys=tokens, scale=width ** -0.5, accurate=accurate)
+    op = attention_mosaic.MosaicBackward(form=spans.form, keys=tokens, scale=width ** -0.5, accurate=accurate)
     return op, _bound(op, query, key, key, query, spans.start, spans.end, None, None, (), None, residuals)
 
 
@@ -2119,14 +2119,12 @@ def test_a_training_forward_256_wide_past_the_folds_reach_is_on_par_interpreted(
 
 @ON_EACH_FAMILY
 @INTERPRETS
-@pytest.mark.parametrize(("hooks", "deterministic"), [("key-bias", False), ("tile-bias", False),
-                                                      ("tile-bias", True)])
-def test_a_parameter_every_row_shares_takes_each_rows_gradient_interpreted(hooks, deterministic, request):
+@pytest.mark.parametrize("hooks", ["key-bias", "tile-bias"])
+def test_a_parameter_every_row_shares_takes_each_rows_gradient_interpreted(hooks):
     """A key's or a tile's parameter one for every batch row (`[1, H, ...]`, T5's shared bias): the dK/dV
-    programs read it at its shared place and add each row's gradient into its own shape in the program
-    (`shared_place`, `Family.added`, row 2577), or under --xla_gpu_deterministic_ops each program writes its
-    own place, summed after (row 2645), every gradient the reference's, under the interpreter."""
-    request.getfixturevalue("with_deterministic_ops" if deterministic else "without_deterministic_ops")
+    programs read it at its shared place (`shared_place`) and write each row's gradient at its own, summed
+    across the rows after (`template.hook_gradient`), every gradient the reference's, under the
+    interpreter."""
     _check_hooked_backward(hooks, form="default", interpret=True, shared=True)
 
 

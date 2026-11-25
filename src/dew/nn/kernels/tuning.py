@@ -517,6 +517,12 @@ _READING = contextvars.ContextVar("dew_reading_picks", default=False)
 """Whether launches traced here read stored picks: within an opt-in tuning run alone (`reading`)."""
 
 
+def reads_picks() -> bool:
+    """Whether launches traced here read stored picks (`reading`): an opt-in tuning run's, whose picks a
+    priced choice leaves to them (`attention_decode.plan`)."""
+    return _READING.get()
+
+
 @contextlib.contextmanager
 def reading() -> Iterator[None]:
     """Launches traced within take the picks stored for their keys, as an opt-in tuning run's do (`tune`,

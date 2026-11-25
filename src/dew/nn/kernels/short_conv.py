@@ -27,7 +27,7 @@ import numpy as np
 
 from dew.nn.activations import silu
 from dew.nn.derivatives import KernelGlue, Protected, contracted, with_gradients_formed
-from dew.nn.precision import at_least_fp32, compensated_sum, l2norm
+from dew.nn.precision import at_least_fp32, compensated_sum, l2_normed
 
 from . import generation
 from .generation import INHERENT, Choice
@@ -228,7 +228,8 @@ def xla_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, seg
 
 def conv_pieces(convolved, parts, dtype):
     """`convolved` `[B, S, D]` as `causal_conv1d` returns it for `parts` (the whole, where None), in `dtype`:
-    each piece split off in order and the `head`-wide groups of a normalised one l2-normalised."""
+    each piece split off in order and the `head`-wide groups of a normalised one l2-normalised
+    (`l2_normed`)."""
     if parts is None:
         return convolved.astype(dtype)
     pieces, first = [], 0
@@ -236,6 +237,8 @@ def conv_pieces(convolved, parts, dtype):
         piece = convolved[..., first:first + width]
         first += width
         if head is not None:
-            piece = l2norm(piece.reshape(*piece.shape[:-1], -1, head)).reshape(piece.shape)
-        pieces.append(piece.astype(dtype))
+            piece = l2_normed(piece.reshape(*piece.shape[:-1], -1, head), dtype).reshape(piece.shape)
+        else:
+            piece = piece.astype(dtype)
+        pieces.append(piece)
     return tuple(pieces)
