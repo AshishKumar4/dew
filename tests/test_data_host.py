@@ -65,17 +65,24 @@ def test_a_cgroups_reclaimable_page_cache_is_room_for_automatic_loading(tmp_path
     assert host.memory == 2 * 2**30 - int(1.9 * 2**30) + int(1.5 * 2**30)
 
 
-def test_a_v1_memory_controllers_limit_bounds_automatic_loading(tmp_path):
+def test_a_v1_memory_controllers_limit_bounds_automatic_loading_by_what_its_working_set_leaves(tmp_path):
     """Under cgroup v1 a group's memory limit is its memory controller's (`memory.limit_in_bytes`, at that
-    controller's own mount), which bounds automatic loading as a v2 limit does, where the host read v2's
-    alone and sized a v1 container's loading by the machine's memory (row 13035)."""
+    controller's own mount), and its charge `memory.usage_in_bytes`, less the inactive page cache under it
+    (`memory.stat`'s hierarchical `total_inactive_file`, as its usage counts every descendant's): a group of
+    1 GiB with 0.9 GiB charged, 0.25 GiB of it cache, leaves 0.35 GiB, where the host read v2's limit alone
+    and sized a v1 container's loading by the machine's memory, then its limit without its charge left the
+    whole GiB (row 13035)."""
     from dew.data.dataset import Host
 
     membership = tmp_path / "cgroup"
     membership.write_text("4:cpu,cpuacct:/job\n5:memory:/job\n")
-    (tmp_path / "memory/job").mkdir(parents=True)
-    (tmp_path / "memory/job/memory.limit_in_bytes").write_text(f"{2**20}\n")
-    assert Host.current(tmp_path, membership).memory == 2**20
+    job = tmp_path / "memory/job"
+    job.mkdir(parents=True)
+    (job / "memory.limit_in_bytes").write_text(f"{2**30}\n")
+    (job / "memory.usage_in_bytes").write_text(f"{int(0.9 * 2**30)}\n")
+    # The group's own inactive cache, which its usage of every descendant's does not stop at.
+    (job / "memory.stat").write_text(f"inactive_file {int(0.5 * 2**30)}\ntotal_inactive_file {2**28}\n")
+    assert Host.current(tmp_path, membership).memory == 2**30 - int(0.9 * 2**30) + 2**28
 
 
 def test_a_process_reads_its_cgroups_limits_through_the_reader_a_tool_loads_before_dew(tmp_path):
