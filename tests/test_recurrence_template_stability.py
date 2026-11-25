@@ -50,7 +50,6 @@ from test_recurrence_stability import (
 
 from dew.nn.kernels import generation, recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk
-from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates.recurrence import template
 
 pytestmark = pytest.mark.kernel
@@ -524,7 +523,7 @@ def faint_read_call(length: int, width: int):
 
 def test_a_read_past_its_keys_range_takes_the_portable_math_which_keeps_its_faint_pair():
     """A read erase whose reads no hook declares at most one in size (`Hooks.unit_reads`) takes the portable
-    math, the template refusing it where a call names it (its own pairs' factors at most one, which an
+    math, the template handing it over where a call names it (its own pairs' factors at most one, which an
     unbounded read breaks: a read of `2^100` against a pair's decay `2^-60` and its pairs' gradient of
     `-2^60` was `-2^160` in their transpose, a nonfinite gradient; folded into the key before the read,
     `2^-160` rounded to zero, its output zero; heads review of 675cd1ecc and 5b2aba881). On the portable
@@ -533,11 +532,10 @@ def test_a_read_past_its_keys_range_takes_the_portable_math_which_keeps_its_fain
     length, width = 64, 32
     operands, run = faint_read_call(length, width)
     d_out = jnp.zeros((1, length, 1, width), jnp.bfloat16).at[0, 1, 0, 0].set(1.0)
-    with generation.assumed("sm90", interpreted=True):
-        with pytest.raises(KernelRefused):
-            run('mosaic_gpu', *operands)
-        out, pull = jax.vjp(functools.partial(run, 'xla'), *operands)
+    with generation.assumed("sm90", interpreted=True), generation.routes() as found:
+        out, pull = jax.vjp(functools.partial(run, 'mosaic_gpu'), *operands)
         grads = pull(d_out)
+    assert {route.kernel for route in found if route.choice == generation.Choice.GATED_DELTA_RULE} == {'xla'}
     expected = np.zeros((1, length, 1, width), np.float32)
     expected[0, 1, 0, 0] = -1.0
     np.testing.assert_array_equal(np.asarray(out, np.float32), expected)
