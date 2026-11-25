@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import datetime
+import faulthandler
 import functools
 import hashlib
 import logging
@@ -100,7 +101,7 @@ from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import StepFlops
 from dew.telemetry.profile import region
 from dew.telemetry.records import AxisLink, DataRestarted, FitStarted, Record, StepCompiled
-from dew.training import streaming
+from dew.training import faults, streaming
 from dew.training._candidates import RunShape, Stepping, StepSettings, as_placed, prepared_for
 from dew.training._fit import (
     Emptied,
@@ -774,6 +775,19 @@ class Trainer(Generic[Loss, Effects]):
         ahead runs the programs compiled with it as compiled (`AheadOfTime.taking`), compiling none."""
         return contextlib.nullcontext() if self._compiler.ahead is None else self._compiler.ahead.taking()
 
+    def _first_stepped(self, run: FitRun, loss: jax.Array) -> None:
+        """The run's first step done (`loss` ready): its startup's record of it (`Startup.first_step`), and
+        the fault record armed again past the handlers the step's collectives installed (UCX's), which then
+        chain to it (`faults`)."""
+        loss.block_until_ready()
+        run.first_step = run.startup.first_step(run.started)
+        faults.armed(self._run_directory())
+
+    def _run_directory(self) -> str | None:
+        """The run's directory, where its checkpoints are and its fault record goes (`faults`); None for a run
+        that keeps none."""
+        return None if self.checkpoints is None else self.checkpoints.directory
+
     def _handed_ahead(self) -> None:
         """Take the step compiled ahead this trainer was handed, once the process is readied
         (`ready_process`, the backend opened at the run's share): the compiler runs it where it is tuned or
@@ -1217,6 +1231,10 @@ class Trainer(Generic[Loss, Effects]):
             self._handed_ahead()
             plan = self._fit_plan(dataset, **asked)
             run = FitRun(time.perf_counter(), plan.startup)
+            # A fatal signal's stacks to the run's directory, armed again once its first step has run
+            # (`faults`), and the process's handler as the fit found it after.
+            handling, directory = faulthandler.is_enabled(), self._run_directory()
+            faults.armed(directory)
             # Each fit plans its step as the trainer's first did, at the split it was given, so a refit's
             # first step is keyed as that fit's was and reads the step it traced (row 6022); a state that
             # pools a window binds its own split as it compiles (`StepCompiler.compile`).
@@ -1240,6 +1258,7 @@ class Trainer(Generic[Loss, Effects]):
                 if plan.restore_best and run.preempted is None:
                     trained = self._best_model(trained, run)
             finally:
+                faults.restored(handling)
                 primary = sys.exception()
                 error = self._closed(run, primary, profiler)
                 # After the run's log, tracker and outcome closed: a plan still running off the loop is
@@ -1432,8 +1451,7 @@ class Trainer(Generic[Loss, Effects]):
                 # The step's batch is no cooldown branch's to hold beside its own (`_cooled`).
                 batch = device = None
                 if run.first_step is None:
-                    loss.block_until_ready()
-                    run.first_step = run.startup.first_step(run.started)
+                    self._first_stepped(run, loss)
             # The step row is complete once its scope exits; the window's last step closes it before the work
             # after it, whose evaluations, saves and cooldowns run outside it (`FitRun.outside_window`).
             if run.tracing and profile is not None:
