@@ -881,6 +881,37 @@ def test_a_walks_issue_latency_follows_the_warps_its_steps_spread_over():
     assert halved < twice and halved < alone, (alone, twice, halved)
 
 
+def test_a_launch_states_the_residency_its_plan_compiled_it_for():
+    """A Mosaic GPU launch compiled for two programs a multiprocessor (`mosaic.compiler_params(resident=2)`,
+    its `min_blocks_per_sm`) states it (`emission.resident_of`), and a program's launches price at it by
+    default (`emission.launches_seconds`); one compiled for none states one (row 4123: the KDA recurrence's
+    launches priced at one resident where their plans ran two, M-FS-73b's join median 0.65 against 0.98)."""
+    from dew.nn.kernels.templates import mosaic as mosaic_templates
+
+    target = generation.gpu_target("NVIDIA GH200 480GB")
+    row = jax.ShapeDtypeStruct((128,), jnp.float32)
+
+    def doubled(x_ref, o_ref):
+        o_ref[...] = x_ref[...] * 2.0
+
+    def launched(params):
+        launch = plgpu.kernel(doubled, out_type=row, num_threads=1, thread_name="wg",
+                              compiler_params=params)
+        counted = emission.costed(launch, Stated(steps=0, bytes_accessed=1024))
+        traced = jax.make_jaxpr(counted)(row).jaxpr
+        (kernel,) = [equation for equation in programs.equations(traced)
+                     if "cost_estimate" in equation.params]
+        return traced, kernel
+
+    traced, kernel = launched(mosaic_templates.compiler_params(resident=2))
+    assert emission.resident_of(kernel) == 2
+    work = emission.work_of(kernel)
+    assert work is not None
+    assert emission.launches_seconds(traced, target) == cost.launch_seconds(
+        work, emission.launch_programs(kernel), target, resident=2, warps=emission.warps_of(kernel) or 0.0)
+    assert emission.resident_of(launched(None)[1]) == 1
+
+
 def test_a_programs_launches_price_in_sequence_and_an_uncounted_one_leaves_it_unknown():
     """A program of two costed launches (`emission.launches_seconds`) prices each at its own launch's seconds
     (`cost.launch_seconds` of its work, programs and warps), their sum, through a call alike; one launch its
