@@ -520,9 +520,13 @@ def power2(x: jax.typing.ArrayLike, k: jax.typing.ArrayLike, reach: float | None
     # A Python integer held before it converts: one past float32's range raised in its host conversion.
     if isinstance(k, int):
         k = min(max(k, -held), held)
-    # Held as float32, which holds every exponent within the bound exactly: no narrow integer `k` wraps.
-    k = jnp.clip(jnp.asarray(k, jnp.float32), -held, held)
-    if held <= two_factor_reach(dtype) and integral and dtype == jnp.float32:
+    halves = held <= two_factor_reach(dtype) and integral and dtype == jnp.float32
+    # Held as float32, which holds every exponent within the bound exactly: no narrow integer `k` wraps. An
+    # integral `k`'s float halves held within the bound's floor, which the integer halves' truncation of a
+    # fractional bound reaches: an integral `k` stays one.
+    bound = math.floor(held) if halves else held
+    k = jnp.clip(jnp.asarray(k, jnp.float32), -bound, bound)
+    if halves:
         half = jnp.floor(k * np.float32(0.5))
         return x * whole_power2(k - half) * whole_power2(half)
     if held <= two_factor_reach(dtype):
