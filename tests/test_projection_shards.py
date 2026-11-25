@@ -6,6 +6,7 @@ entering apart, each one's gradient summed at its own shape. A mesh that splits 
 Explicit axis, no layout traced under, or a product no launch takes leaves the product to the partitioner."""
 import contextlib
 import math
+import re
 
 import jax
 import jax.numpy as jnp
@@ -392,6 +393,11 @@ def test_a_mapped_stacks_weight_reductions_complete_per_layer(axis):
     for name, instruction in instructions.items():
         for operand in instruction.operands:
             users.setdefault(operand, []).append(name)
+    # The tie's barrier is a control dependency once XLA expands it (`OptimizationBarrierExpander`).
+    for line in step.as_text().splitlines():
+        if (ordered := re.match(r"\s*(?:ROOT )?%?(\S+) = .*control-predecessors=\{([^}]*)\}", line)):
+            for operand in ordered[2].split(","):
+                users.setdefault(operand.strip().lstrip("%"), []).append(ordered[1])
 
     def read_by_a_product(name: str) -> bool:
         seen, frontier = set(), list(users.get(name, ()))
