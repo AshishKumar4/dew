@@ -417,12 +417,20 @@ def before(ci, python: str, name: str, group: str, until: float) -> set[str] | s
     checkout's `mainline`, ci.py's `baseline_key`, listed under the file's place once; a green run's alone,
     never written over by a red one), whole or a group of any cut: one cut of main's whole, every group of
     it read, so a row this run cut otherwise is held to main's all the same. `BOOTSTRAP` where main has no
-    run of it at all (no baseline, nor a run named); `UNREAD` where none is read whole: no token or main, a
+    run of it at all (no baseline, nor a run named), or where this checkout is main's commit itself;
+    `UNREAD` where none is read whole: no token or main, a
     Worker that failed or answered late, a baseline that is no list, a run named with no baseline, or no cut
     whole. Every request, each page of the listing among them, is bounded by `until` (a `time.monotonic`
     instant), and a read past it is none."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN") or os.environ.get(ci.READ_TOKEN)
     commit = ci.mainline()
+    if commit is not None and commit == ci.run_keys.head_commit():
+        # A run of main's own commit (a train's base, main's CI): what it leaves unprepared is main's, the
+        # baseline it writes once green (`run_keys.baselined`), never new against itself. Held to a baseline
+        # of its own commit, a cut main's earlier run left part-written (a group red, so unwritten) read
+        # `UNREAD`, said the row stale, and so never green to write it whole: every run of main red on it,
+        # every train's base with them (train 1275's test_gpu_compile_ahead.py users prepare).
+        return BOOTSTRAP
     if not token or commit is None or "DEW_XLA_CACHE_URL" not in os.environ or time.monotonic() >= until:
         return UNREAD
     held, row_variant = ci.run_keys.device_class(), group.partition(ci.VARIED)[2]
