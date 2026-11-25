@@ -219,12 +219,8 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None,
         return Work()
     # Each other elementwise operation by its primitive, its parameters' entry (`Region.params`); a
     # selection's and a clamp's their own. A layout change computes nothing.
-    # Proven fp32 where the region's program holds fp32 values alone, unproven otherwise (an e-graph's node
-    # names no dtype; `Region.dtypes` its traced terms'): a division, a special function and a power priced
-    # at their measured forms only where proven.
-    fp32 = region.single_float32
     if (args := get_callable_args(node, Term.unary)) is not None:
-        return _elementwise(graph, *region.params[integer(args[2])], args[:1], held, on, fp32)
+        return _elementwise(graph, *region.params[integer(args[2])], args[:1], held, on)
     if (args := get_callable_args(node, Term.convert)) is not None:
         return _elementwise(graph, *region.params[integer(args[1])], args[:1], held, on)
     for constructor in (Term.binary, Term.compare):
