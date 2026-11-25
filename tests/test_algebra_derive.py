@@ -1135,6 +1135,66 @@ def test_chunked_moments_preserves_zero_weight_derivatives_and_extreme_anchors()
         assert float(dv_e0[0, 1]) == 0.0
 
 
+def test_chunked_moments_directed_overflow_mixed_zero_weight_and_direct_jvp():
+    """Weight tangents stay finite when `cx * cy` overflows, mixed 2nd derivatives at zero individual and
+    all-zero weights match the plain declaration, and direct `derive` forms preserve zero-weight JVP."""
+    from dew.algebra import moments
+
+    # Overflowing centered product (`cx * cy = 2^140`) with finite directed weight tangent (`dw = 2^-70`):
+    # multiplying `dtw` before `cx * cy` stays finite and equals `2^70` (matches plain covariance JVP).
+    scale_ov = np.float32(2.0 ** 70)
+    x_ov = jnp.asarray([[scale_ov, 0.0]], jnp.float32)
+    w_ov = jnp.asarray([[0.0, 1.0]], jnp.float32)
+    dw_ov = jnp.asarray([[np.float32(2.0 ** -70), 0.0]], jnp.float32)
+    for mode in ("walk", "merge"):
+        _, (_, _, dc_ov) = jax.jvp(
+            lambda w_, m=mode: moments.chunked_covariance(x_ov, x_ov, w_, tile=1, mode=m),
+            (w_ov,), (dw_ov,))
+        assert float(dc_ov[0]) == float(scale_ov)
+
+    # Mixed 2nd-order derivatives at zero individual weights and all-zero weights match plain declaration.
+    x_zm = jnp.asarray([[0.0, 2.0]], jnp.float32)
+    dw_unit = jnp.asarray([[0.0, 1.0]], jnp.float32)
+    for w_list in ([[1.0, 0.0]], [[0.0, 0.0]]):
+        w_zm = jnp.asarray(w_list, jnp.float32)
+        plain_dm_dx = jax.grad(lambda x_, w_: moments.weighted_moments(x_, w_)[0].sum(), argnums=0)
+        plain_dv_dx = jax.grad(lambda x_, w_: moments.weighted_moments(x_, w_)[1].sum(), argnums=0)
+        ref_hm = jax.jvp(lambda w_, fn=plain_dm_dx: fn(x_zm, w_), (w_zm,), (dw_unit,))[1]
+        ref_hv = jax.jvp(lambda w_, fn=plain_dv_dx: fn(x_zm, w_), (w_zm,), (dw_unit,))[1]
+        for mode in ("walk", "merge"):
+            ch_dm_dx = jax.grad(
+                lambda x_, w_, m=mode: moments.chunked_moments(x_, w_, tile=1, mode=m)[0].sum(), argnums=0)
+            ch_dv_dx = jax.grad(
+                lambda x_, w_, m=mode: moments.chunked_moments(x_, w_, tile=1, mode=m)[1].sum(), argnums=0)
+            got_hm = jax.jvp(lambda w_, fn=ch_dm_dx: fn(x_zm, w_), (w_zm,), (dw_unit,))[1]
+            got_hv = jax.jvp(lambda w_, fn=ch_dv_dx: fn(x_zm, w_), (w_zm,), (dw_unit,))[1]
+            np.testing.assert_array_equal(np.asarray(got_hm), np.asarray(ref_hm))
+            np.testing.assert_array_equal(np.asarray(got_hv), np.asarray(ref_hv))
+
+    # Direct `derive.derive` forms (without `chunked_moments` custom tangent) preserve zero-weight JVP.
+    forms_w = derive.derive(moments.declaration("weighted"), accurate=False, saturation=SATURATION)
+    shapes_w = dict.fromkeys(("x", "w"), ((1, 1), jnp.float32))
+    for x_dir, w_dir, dw_dir, exp_dm, exp_dv in (
+        ([[0.0, 2.0]], [[1.0, 0.0]], [[0.0, 1.0]], 2.0, 4.0),
+        ([[10.0, 12.0]], [[1.0, 0.0]], [[0.0, 1.0]], 2.0, 4.0),
+        ([[3.0, 5.0]], [[0.0, 0.0]], [[1.0, 2.0]], 13.0, 59.0),
+    ):
+        xd, wd, dwd = (jnp.asarray(v, jnp.float32) for v in (x_dir, w_dir, dw_dir))
+        for use_merge in (False, True):
+            def direct_walk(w_, merge=use_merge, xv=xd):
+                empty = forms_w.init(shapes_w)
+                s0 = forms_w.step(empty, {"x": xv[:, :1], "w": w_[:, :1]})
+                if merge:
+                    s1 = forms_w.step(empty, {"x": xv[:, 1:], "w": w_[:, 1:]})
+                    fin = forms_w.merge(s0, s1, shapes=shapes_w)
+                else:
+                    fin = forms_w.step(s0, {"x": xv[:, 1:], "w": w_[:, 1:]})
+                return forms_w.finish(fin, {"x": xv[:, :1], "w": w_[:, :1]}, shapes=shapes_w)
+
+            _, (dm_dir, dv_dir) = jax.jvp(direct_walk, (wd,), (dwd,))
+            assert float(dm_dir[0]) == exp_dm and float(dv_dir[0]) == exp_dv
+
+
 def test_chunked_moments_balances_unequal_scales_value_gradients_and_explicit_sharding():
     """Positive-mass combines and tile products balance unequal covariance scales and minimum-normal weights
     without underflow; value gradients hold Check 1 (`assert_as_exact`) and explicit sharding lowers."""

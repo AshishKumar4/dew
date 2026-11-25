@@ -57,7 +57,7 @@ def test_chunked_moments_holds_every_order(taken):
     dx, dy, dw = normal_draw(9046, (2, 8), (2, 8), (2, 8))
     c_mean, c_my, c_cov = normal_draw(9047, (2,), (2,), (2,))
     for edge, scale in EDGES.items():
-        w_pos = (jnp.abs(w) + 0.25) * scale
+        w_pos = ((jnp.abs(w) + 0.25) * scale).at[:, 0].set(0.0)
         assert_contract(_chunked_weighted, (x * scale, w_pos), (dx * scale, dw * scale), (c_mean, c_cov),
                         f"chunked moments {edge}", plain_fn=moments.weighted_moments,
                         taking=ORDER_SETS[taken])
