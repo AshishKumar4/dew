@@ -690,24 +690,27 @@ def explicit_over[T](fn: Callable[[jax.Array], T], x: jax.Array) -> T:
 def typed_on[T](tree: T, mesh: jax.sharding.AbstractMesh) -> T:
     """`tree` with each array typed on another mesh than `mesh` (one `explicit_over` traced) placed back on
     `mesh` as its type places it over `mesh`'s Explicit axes, its sums still to take (`reduced`,
-    `unreduced`) over those alone, as JAX's own conversion between meshes keeps them: a sum over an axis
-    `mesh` leaves Auto is taken on the way (an unreduced one reduced, a reduced copy kept whole); every other
-    leaf as it is."""
+    `unreduced`) over those alone: a sum over an axis `mesh` leaves Auto is taken first, on the mesh it was
+    typed on (an unreduced one reduced, a reduced copy kept whole), which no conversion between the meshes
+    takes; every other leaf as it is."""
     explicit = frozenset(mesh.explicit_axes)
+
+    def taken(spec: jax.sharding.PartitionSpec) -> jax.sharding.PartitionSpec:
+        # Its sums over `mesh`'s Explicit axes alone, a sum's kind with its axes: none left, none stated.
+        unreduced = spec.unreduced & explicit
+        return spec.update(reduced=spec.reduced & explicit, unreduced=unreduced,
+                           unreduced_kind=spec.unreduced_kind if unreduced else None)
 
     def back(value):
         if not isinstance(value, jax.Array) or jax.typeof(value).sharding.mesh == mesh:
             return value
+        spec = jax.typeof(value).sharding.spec
+        if (spec.reduced | spec.unreduced) - explicit:
+            value = jax.sharding.reshard(value, taken(spec))
         with jax.sharding.use_abstract_mesh(mesh):
-            spec = kept_axes(jax.typeof(value).sharding.spec, explicit.__contains__)
-            unreduced = spec.unreduced & explicit
-            # A sum's kind goes with its axes: none left, none stated, as JAX's own conversion does it.
-            return jax.sharding.reshard(value, spec.update(
-                reduced=spec.reduced & explicit, unreduced=unreduced,
-                unreduced_kind=spec.unreduced_kind if unreduced else None))
+            return jax.sharding.reshard(value, taken(kept_axes(jax.typeof(value).sharding.spec,
+                                                               explicit.__contains__)))
     return jax.tree.map(back, tree)
-
-
 def placed_axes(mesh: jax.sharding.AbstractMesh) -> list[str]:
     """The axes of `mesh` a constraint traced here places (`automatic_axes`, those above one device no
     `shard_map` holds): not an Explicit axis, which an array's type places, nor, inside a pipeline's stage
