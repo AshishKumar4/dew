@@ -153,9 +153,18 @@ _MEAN_FORM = ratios.Ratio(
     ((1.0, (("v", 0), ("v", 1))),), ((1.0, (("v", 1),)),), 0, reduced=True, units=windows.Units())
 """Streamed weighted mean `sum(w * r) / sum(w)` along axis 0 (`_streamed_tangents`)."""
 
+_WEIGHT = ((1.0, (("v", 2),)),)
 _COV_FORM = ratios.Ratio(
-    ((1.0, (("v", 0), ("v", 1), ("v", 2))),), ((1.0, (("v", 2),)),), 0, reduced=True, units=windows.Units())
-"""Streamed weighted covariance `sum(w * cx * cy) / sum(w)` along axis 0 (`_streamed_tangents`)."""
+    (), _WEIGHT, 0, reduced=True, units=windows.Units(), power=2,
+    products=(
+        (1.0, (ratios.Summed(((1.0, (("v", 0), ("v", 1), ("v", 2))),), reduced=True),
+               ratios.Summed(_WEIGHT, reduced=True))),
+        (-1.0, (ratios.Summed(((1.0, (("v", 0), ("v", 2))),), reduced=True),
+                ratios.Summed(((1.0, (("v", 1), ("v", 2))),), reduced=True))),
+    ),
+)
+"""Anchored covariance (sum(w cx cy) * sum(w) - sum(w cx) * sum(w cy)) / sum(w)**2.
+Differentiating the form keeps both residual means and their tangents unlanded until cancellation."""
 
 _MEAN_ZERO = ratios.Ratio(
     ((1.0, (("v", 0), ("v", 1))),), (), 0, reduced=True, units=windows.Units())
@@ -198,13 +207,6 @@ def _mask_tangent(mask: jax.Array, tangent):
     return tangent if isinstance(tangent, SymbolicZero) else jnp.where(mask, tangent, 0.0)
 
 
-def _centered_tangent(dv, d_mean: jax.Array | None, shape: tuple[int, ...]):
-    """Centered tangent `dv - d_mean[None]` along axis 0, or `SymbolicZero` when neither moves."""
-    if isinstance(dv, SymbolicZero):
-        return dv if d_mean is None else jnp.broadcast_to(-d_mean[None], (shape[-1], *shape[:-1]))
-    return dv if d_mean is None else dv - d_mean[None]
-
-
 def _streamed_tangents(
     x: jax.Array, y: jax.Array, w: jax.Array,
     dx, dy, dw,
@@ -214,10 +216,11 @@ def _streamed_tangents(
     unlanded `ratios.Ratio` per output, handling both `n > 0` and `n == 0` boundaries and `SymbolicZero`."""
     shape = tuple(int(size) for size in jnp.broadcast_shapes(x.shape, y.shape, w.shape))
     x0 = jnp.moveaxis(jnp.broadcast_to(x, shape), -1, 0)
-    y0 = jnp.moveaxis(jnp.broadcast_to(y, shape), -1, 0)
+    same_xy = x is y and dx is dy and mu_x is mu_y
+    y0 = x0 if same_xy else jnp.moveaxis(jnp.broadcast_to(y, shape), -1, 0)
     w0 = jnp.moveaxis(jnp.broadcast_to(w, shape), -1, 0)
     dx0 = _move_tangent(dx, shape)
-    dy0 = _move_tangent(dy, shape)
+    dy0 = dx0 if same_xy else _move_tangent(dy, shape)
     dw0 = _move_tangent(dw, shape)
     pos = n > 0
     pos0 = pos[None]
@@ -226,24 +229,25 @@ def _streamed_tangents(
     dx_pos, dy_pos, dw_pos = (_mask_tangent(pos0, t) for t in (dx0, dy0, dw0))
     dw_zero = None if isinstance(dw0, SymbolicZero) else jnp.where(pos0, 0.0, dw0)
 
-    def mean_tangent(vals0: jax.Array, d_vals_pos, mu: jax.Array) -> jax.Array | None:
-        # Shift by constant `stop_gradient(mu)` so large-offset inputs do not cancel while preserving exact
-        # higher-order derivatives of `sum(w * vals) / sum(w)`.
-        shifted = vals0 - jax.lax.stop_gradient(mu)[None]
+    # A fixed anchor preserves translation invariance at every derivative order, without subtracting a
+    # rounded mean tangent from each sample. A row that would overflow with this anchor uses zero instead.
+    def centered(vals0: jax.Array, mu: jax.Array) -> jax.Array:
+        anchor = jax.lax.stop_gradient(mu)[None]
+        shifted = vals0 - anchor
+        return jnp.where(jnp.any(jnp.isinf(shifted), axis=0, keepdims=True), vals0, shifted)
+
+    def mean_tangent(vals0: jax.Array, shifted: jax.Array, d_vals_pos) -> jax.Array | None:
         d_pos = _ratio_jvp_only((shifted, w_pos), (d_vals_pos, dw_pos), _MEAN_FORM)
         if d_pos is None and dw_zero is None:
             return None
         zero_branch = 0.0 if dw_zero is None else ratios.ratio([vals0, dw_zero], _MEAN_ZERO)
         return jnp.where(pos, 0.0 if d_pos is None else d_pos, zero_branch)
 
-    d_mx = mean_tangent(x0, dx_pos, mu_x)
-    same_xy = x is y and dx is dy and mu_x is mu_y
-    d_my = d_mx if same_xy else mean_tangent(y0, dy_pos, mu_y)
-    cx0 = x0 - mu_x[None]
-    cy0 = cx0 if same_xy else y0 - mu_y[None]
-    dcx_pos = _mask_tangent(pos0, _centered_tangent(dx0, d_mx, shape))
-    dcy_pos = dcx_pos if same_xy else _mask_tangent(pos0, _centered_tangent(dy0, d_my, shape))
-    d_cov_pos = _ratio_jvp_only((cx0, cy0, w_pos), (dcx_pos, dcy_pos, dw_pos), _COV_FORM)
+    cx0 = centered(x0, mu_x)
+    cy0 = cx0 if same_xy else centered(y0, mu_y)
+    d_mx = mean_tangent(x0, cx0, dx_pos)
+    d_my = d_mx if same_xy else mean_tangent(y0, cy0, dy_pos)
+    d_cov_pos = _ratio_jvp_only((cx0, cy0, w_pos), (dx_pos, dy_pos, dw_pos), _COV_FORM)
     if d_cov_pos is None and dw_zero is None:
         d_cov = SymbolicZero(jax.typeof(cov).to_tangent_aval())
     else:
