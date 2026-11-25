@@ -1982,7 +1982,8 @@ from test_plan import BATCH, lm
 from dew.training.rungs import rung_key
 trainer = lm()
 state, _, _ = trainer.place()
-print(json.dumps(rung_key(trainer.objective.program_key(), (state, BATCH), [1, 2], trainer.device_mesh)))
+print(json.dumps(rung_key(trainer.objective.program_key(), (state, BATCH), [1, 2], trainer.device_mesh,
+                          settings=trainer._settings())))
 """
 
 
@@ -2025,7 +2026,7 @@ def test_a_rung_key_states_its_modules_configuration_not_their_display():
     state, _, _ = trainer.place()
 
     def key(module):
-        return rung_key([module], (state, BATCH), [1, 2], trainer.device_mesh)
+        return rung_key([module], (state, BATCH), [1, 2], trainer.device_mesh, settings=trainer._settings())
 
     assert key(Displayed(4)) == key(Displayed(4)) != key(Displayed(8))
     zeros, ones = (key(Displayed(4, held=values)) for values in (jnp.zeros(2), jnp.ones(2)))
@@ -2049,7 +2050,8 @@ def test_a_rung_key_holds_a_flag_given_twice_by_its_order(monkeypatch):
 
     def key(*settings):
         monkeypatch.setenv("XLA_FLAGS", " ".join((flags, *settings)))
-        return rung_key(trainer.objective.program_key(), (state, BATCH), [1, 2], trainer.device_mesh)
+        return rung_key(trainer.objective.program_key(), (state, BATCH), [1, 2], trainer.device_mesh,
+                          settings=trainer._settings())
 
     autotune_on, autotune_off = "--xla_gpu_autotune_level=4", "--xla_gpu_autotune_level=0"
     first = key(autotune_on, autotune_off)
