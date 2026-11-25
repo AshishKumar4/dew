@@ -544,7 +544,7 @@ def syrk_registers(tiles: Tiles, dtype, out_dtype, *, transpose: bool, polynomia
     plain = resources.tile_registers(family, tiles.sharing, (tiles.block_m, columns, tiles.block_k), dtype,
                                      stored=(out_dtype,), rhs_transposed=not transpose)
     epilogue = epilogue_registers(family, tiles.share, columns, (out_dtype,),
-                                  tile_count=1 if polynomial else 0, has_hook=polynomial)
+                                  tiles=(jnp.float32,) if polynomial else (), has_hook=polynomial)
     return plain + epilogue
 
 

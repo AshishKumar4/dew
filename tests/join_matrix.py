@@ -168,7 +168,11 @@ def a_joined_layers_training_step_is_on_par(case: tuple[str, ...]) -> None:
     def draw(seed):
         # The layer's parameters drawn with each seed's inputs, the same each draw: a GPU tier's prepare,
         # whose device computes nothing, reaches the site with nothing computed (row 10990).
-        params = layer.init(jax.random.key(4), jnp.zeros((*ROWS, FEATURES), dtype))
+        # Initialized by XLA's products: a draw runs on the host's CPU and its own kernels
+        # (`arm_arithmetic.ahead_on_the_host`), where the template the cell names refuses the call
+        # (row 12378).
+        with generation.chosen(grouped_matmul="xla"):
+            params = layer.init(jax.random.key(4), jnp.zeros((*ROWS, FEATURES), dtype))
         if combination["join"] in ("gate_up", "qkv"):
             params = jax.tree.map(lambda leaf: leaf + 0.1 * jax.random.normal(jax.random.key(6), leaf.shape),
                                   params)

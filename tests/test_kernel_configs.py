@@ -756,14 +756,36 @@ def _gate_forms(generation_name: str) -> set[str]:
 def _gate_cases(generation_name: str, form: str) -> list:
     """A form's cases at the projections whose calls differ in what their kernels are built from, each at
     the tile its launch settles on as a call (`_gemm_mainloop_cases`' `settled`): one projection of each
-    derived tile and boundary (`_boundary`), a call the gate traces whole (certification settles a tile by
-    its whole call), not every projection that derives the same tile over the same boundaries again. Derived
-    where they compile, in the gate's refusals (`report.refusals`)."""
+    derived tile, boundary and walk (`_gate_key`), a call the gate traces whole (certification settles a tile
+    by its whole call), not every projection that derives the same kernel structure again. Derived where they
+    compile, in the gate's refusals (`report.refusals`)."""
     kept: dict = {}
     for shape in GEMM_SHAPES:
         for case in _gemm_mainloop_cases(generation_name, shape, form=form, settled=True):
-            kept.setdefault((repr(case.tile), _boundary(GEMM_SHAPES[shape], case.tile)), case)
+            kept.setdefault(_gate_key(GEMM_SHAPES[shape], case.tile), case)
     return list(kept.values())
+
+
+def _gate_key(extents: tuple[int, int, int, int], tile) -> tuple:
+    """What a projection's kernel is built from beyond its extents' constants, by which the compile gate
+    keeps one projection of each (`_gate_cases`, row 12629): its tile, its boundaries (`_boundary`), and its
+    walk's depth in steps up to one past its stages, `min(steps, stages + 1)`: the IR bakes its extents in,
+    but only its static trip count changes its structure (the pipeline unrolls its drain per static step
+    count, a walk of fewer steps than stages its own prologue and drain, and ptxas unrolls small static
+    loops), each a register and spill profile of its own; its strides and other extents are constants."""
+    steps = -(-extents[1] // tile.block_k)
+    return repr(tile), _boundary(extents, tile), min(steps, tile.stages + 1)
+
+
+def test_the_compile_gate_keeps_a_walk_of_fewer_steps_than_stages_apart():
+    """Two projections of one tile and boundaries, one walking fewer depth steps than the tile's stages and
+    one as many or more, are kept apart by the compile gate (`_gate_key`): the short walk's prologue and
+    drain unroll to another kernel (row 12629). Two that both walk past one more than the stages share
+    one."""
+    tile = tiling.Tiles(128, 128, 64, 4, 1, warpgroups=2, family="wgmma")
+    short, deep, deeper = ((4096, depth, 4096, 1) for depth in (128, 4096, 8192))
+    assert _gate_key(short, tile) != _gate_key(deep, tile)
+    assert _gate_key(deep, tile) == _gate_key(deeper, tile)
 
 
 def _boundary(extents: tuple[int, int, int, int], tile) -> tuple:

@@ -4,6 +4,7 @@ dtypes."""
 
 import contextlib
 import dataclasses
+import functools
 
 import flax.linen as nn
 import jax
@@ -795,3 +796,354 @@ def test_the_blockwise_recipes_scales_meet_its_products_in_range():
     with generation.run_precision(RECIPE_NUMERICS["blockwise_fp8"]), projection_role("mlp"):
         out = np.asarray(jax.jit(layer.apply)(params, x), np.float32)
     np.testing.assert_array_equal(out, np.full((4, 128), 2.0 ** 117, np.float32))
+
+
+def _delayed_nvfp4():
+    from dew.nn.precision import DTYPE_PRESETS, LowPrecision, Numerics
+
+    return Numerics(DTYPE_PRESETS["bf16-mixed"], low_precision=LowPrecision(recipe="nvfp4",
+                                                                             tensor_scaling="delayed"))
+
+
+@pytest.mark.parametrize("general", [False, True], ids=["dense", "dense-general"])
+def test_a_delayed_nvfp4_dense_reads_its_history_and_records_its_rows(general):
+    """A Dense under a delayed-scaling NVFP4 recipe that takes it (row 12721) holds its amax history
+    (`dense.NVFP4_HISTORY`, zeros of the recipe's length where initialized), quantizes its rows at the tensor
+    scale of the history's largest, its output bitwise the recipe projection's at that scale, and records its
+    rows' largest magnitude under its history's name (`dense.NVFP4_AMAX`); it refuses to run without a
+    history, and a current-scaling recipe holds none. A DenseGeneral too (an attention's projection's
+    module), its product's extents as matrices its history's."""
+    from dew.nn.dense import NVFP4_AMAX, NVFP4_HISTORY, Dense, DenseGeneral
+    from dew.nn.kernels import projections
+    from dew.nn.precision import NVFP4, projection_role
+
+    rng = np.random.default_rng(12721)
+    x = jnp.asarray(rng.normal(size=(100, 128)), jnp.bfloat16)
+    layer = (DenseGeneral((4, 16), use_bias=False, dtype=jnp.bfloat16) if general
+             else Dense(64, use_bias=False, dtype=jnp.bfloat16))
+    with generation.run_precision(_delayed_nvfp4()), projection_role("mlp"):
+        variables = layer.init(jax.random.key(0), x)
+        assert np.asarray(variables[NVFP4_HISTORY]["amax_history"]).tolist() == [0.0] * 16
+        history = jnp.asarray([3.0, 7.5] + [0.0] * 14, jnp.float32)
+        # The state a step holds: its parameters and histories, no sown collection (an init sows too).
+        held = {"params": variables["params"], NVFP4_HISTORY: {"amax_history": history}}
+        out, sown = layer.apply(held, x, mutable=[NVFP4_AMAX])
+        # The layer's kernel as it multiplies it, promoted to its dtype.
+        kernel = jnp.asarray(variables["params"]["kernel"], jnp.bfloat16).reshape(128, 64)
+        want = projections.recipe_projection(x, kernel, out_dtype=jnp.bfloat16,
+                                             tensor_scale=projections.delayed_tensor_scale(history))
+        want = want.reshape(out.shape)
+        with pytest.raises(ValueError):
+            layer.apply({"params": variables["params"]}, x)
+    np.testing.assert_array_equal(np.asarray(out).view(np.uint16), np.asarray(want).view(np.uint16))
+    assert np.asarray(sown[NVFP4_AMAX]["amax_history"]).tolist() == [
+        float(projections.nvfp4_amax(x))]
+    with generation.run_precision(NVFP4), projection_role("mlp"):
+        assert NVFP4_HISTORY not in layer.init(jax.random.key(0), x)
+
+
+def _summed_recording(module, held, *args):
+    """`module`'s outputs summed in fp32 over `held` with its params given, the largest magnitudes its
+    delayed-scaling NVFP4 projections record beside it (`dense.NVFP4_AMAX`): a loss its gradient reads."""
+    from dew.nn.dense import NVFP4_AMAX
+
+    def loss(params, *args):
+        out, sown = module.apply({**held, "params": params}, *args, mutable=[NVFP4_AMAX])
+        return jnp.sum(out.astype(jnp.float32)), sown
+
+    return loss
+
+
+def test_a_delayed_nvfp4_models_every_taken_projection_reads_its_own_history():
+    """Under a delayed-scaling NVFP4 recipe (row 12721), a model's every projection the recipe takes holds an
+    amax history, one a route taken (`generation.routes`): its attention's projections (joined or not: a
+    join the recipe would take is refused, `joined._recipe_differs`), its dense and shared experts' MLPs (the
+    recipe chain declines a delayed recipe, each projection then its own), its experts' three; its gradient
+    runs, no projection refused for a scale it lacks, and the largest magnitudes it records mirror its
+    histories path for path (`dense.NVFP4_AMAX` against `dense.NVFP4_HISTORY`), what a step rolls in."""
+    from dew.nn.dense import NVFP4_AMAX, NVFP4_HISTORY
+
+    model = mixed()
+    tokens = jnp.asarray(np.random.default_rng(0).integers(0, VOCAB, (2, 64)), jnp.int32)
+    with generation.run_precision(_delayed_nvfp4()):
+        variables = model.init(jax.random.key(0), tokens)
+        held = {name: tree for name, tree in variables.items() if name != NVFP4_AMAX}
+
+        _, sown = jax.grad(_summed_recording(model, held), has_aux=True)(held["params"], tokens)
+        # The forward's routes, one a projection the recipe considers.
+        with generation.routes() as found:
+            jax.eval_shape(lambda params: model.apply({**held, "params": params}, tokens), held["params"])
+    choice = projections.RECIPES["nvfp4"].choice
+    taken = [route for route in found if route.choice == choice and route.kernel != "unquantized"]
+    histories = jax.tree_util.tree_flatten_with_path(held[NVFP4_HISTORY])[0]
+    recorded = jax.tree_util.tree_flatten_with_path(sown[NVFP4_AMAX],
+                                                    is_leaf=lambda leaf: isinstance(leaf, tuple))[0]
+    assert histories and len(histories) == len(taken), (len(histories), len(taken))
+    assert [path for path, _ in histories] == [path for path, _ in recorded]
+
+
+def _expert_layers():
+    """Each expert module a delayed-scaling NVFP4 recipe's experts role reaches (row 12721), its inputs: its
+    layer built, a routing's weights and indices, and the routing a capacity drops slots of."""
+    from dew.nn import gpt_oss, moe
+
+    rng = np.random.default_rng(12721)
+    x = jnp.asarray(rng.normal(size=(64, 128)), jnp.bfloat16)
+    # The last token's row the largest by far, both its slots routed to expert 0, which every token's first
+    # slot fills past its capacity (`capacity_positions`: 32 of a sequence's 128 slots): dropped twice, a
+    # row no product quantizes; every other token reaches an expert by its second slot.
+    x = x.at[-1].set(1e4)
+    second = rng.integers(1, 4, 64)
+    second[-1] = 0
+    indices = jnp.asarray(np.stack([np.zeros(64, np.int64), second], axis=-1), jnp.int32)
+    weights = jnp.full(indices.shape, 0.5, jnp.bfloat16)
+    return {
+        "experts": (moe.ExpertMLP(num_experts=4, hidden_features=128, out_features=128,
+                                  capacity_factor=1.0, dispatch="global"), (x, weights, indices)),
+        "gpt-oss": (gpt_oss.GptOssExperts(128, 128, 4, capacity_factor=1.0, dispatch="global"),
+                    (x, weights, indices)),
+    }
+
+
+@pytest.mark.parametrize("name", ["experts", "gpt-oss"])
+def test_a_delayed_nvfp4_expert_layer_records_its_admitted_rows_alone(name):
+    """Every expert module under a delayed-scaling NVFP4 recipe that takes the experts (row 12721), a
+    gpt-oss bank too, holds a history for each projection it quantizes and runs under it; what it records
+    for the projection reading its tokens is the largest magnitude among the rows a capacity admits, a
+    dropped slot's row (its largest by far) never among them (`moe.admitted_amax`), sown outside the
+    dispatch's transformations (`dense.noted_amax`) path for path with its histories."""
+    from dew.nn.dense import NVFP4_AMAX, NVFP4_HISTORY
+
+    layer, (x, weights, indices) = _expert_layers()[name]
+    with generation.run_precision(_delayed_nvfp4()):
+        variables = layer.init(jax.random.key(0), x, weights, indices)
+        held = {key: tree for key, tree in variables.items() if key != NVFP4_AMAX}
+        _, sown = layer.apply(held, x, weights, indices, mutable=[NVFP4_AMAX])
+    histories = jax.tree_util.tree_flatten_with_path(held[NVFP4_HISTORY])[0]
+    recorded = dict(jax.tree_util.tree_flatten_with_path(sown[NVFP4_AMAX],
+                                                         is_leaf=lambda leaf: isinstance(leaf, tuple))[0])
+    assert histories and [path for path, _ in histories] == list(recorded)
+    # The projection reading the layer's rows (the gate's, gpt-oss's interleaved gate and up).
+    (read,) = [amax for path, (amax,) in recorded.items() if path[0].key in ("gate_proj", "gate_up_proj")]
+    admitted = np.asarray(x[:-1], np.float32)
+    assert float(read) == float(np.max(np.abs(admitted))), (float(read), np.max(np.abs(admitted)))
+
+
+@pytest.mark.mesh(devices=4)
+def test_a_meshed_delayed_nvfp4_expert_layer_records_what_one_device_does():
+    """An expert layer under a delayed-scaling NVFP4 recipe exchanging its slots over a 4-way expert axis
+    (`moe._exchange_shard`), a skewed routing taking it further rounds (a `fori_loop`) and its largest row
+    the last device's last round's, records what its gate and up projections read, the largest over every
+    device's and round's rows, bitwise what it records on one device (row 12721): returned by its dispatch
+    and reduced over the mesh (`jax.lax.pmax`), no tracer of the map's leaking. Its down projection's, of
+    rows each layout's products round alike only to their recipe's accuracy, is recorded and finite."""
+    from dew.mesh import DEFAULT_RULES
+    from dew.nn import moe
+    from dew.nn.dense import NVFP4_AMAX
+    from dew.training import MeshSpec
+
+    rng = np.random.default_rng(4)
+    x = jnp.asarray(rng.normal(size=(64, 128)), jnp.bfloat16).at[-1].set(64.0)
+    # Every token's first slot to expert 0: each device sends its shard more than one round's share.
+    indices = jnp.asarray(np.stack([np.zeros(64, np.int64), rng.integers(1, 4, 64)], axis=-1), jnp.int32)
+    weights = jnp.full(indices.shape, 0.5, jnp.bfloat16)
+    found = {}
+    for dispatch, devices in (("global", 1), ("exchange", 4)):
+        layer = moe.ExpertMLP(num_experts=4, hidden_features=128, out_features=128, dispatch=dispatch)
+        mesh = MeshSpec(expert=devices).build(jax.devices()[:devices])
+        with (jax.set_mesh(mesh), nn.logical_axis_rules(DEFAULT_RULES),
+              generation.run_precision(_delayed_nvfp4())):
+            variables = layer.init(jax.random.key(0), x, weights, indices)
+            held = {key: tree for key, tree in variables.items() if key != NVFP4_AMAX}
+            _, sown = jax.jit(functools.partial(layer.apply, mutable=[NVFP4_AMAX]))(held, x, weights, indices)
+        found[dispatch] = jax.tree.map(np.asarray, sown[NVFP4_AMAX])
+    assert jax.tree.structure(found["global"]) == jax.tree.structure(found["exchange"])
+    for name in ("gate_proj", "up_proj"):
+        np.testing.assert_array_equal(found["exchange"][name]["amax_history"],
+                                      found["global"][name]["amax_history"])
+        assert float(found["exchange"][name]["amax_history"][0]) == 64.0
+    assert np.isfinite(float(found["exchange"]["down_proj"]["amax_history"][0]))
+
+
+def test_a_delayed_nvfp4_gated_mlp_trains_each_projection_on_its_own_history():
+    """A GatedMLP at widths the recipe takes, under a delayed-scaling NVFP4 recipe (row 12721), initializes
+    a history for each of its gate, up and down projections, and its value and every gradient run: its
+    projections apart, each at its own history's tensor scale (`mlp._chained` declines a delayed recipe,
+    and `projections.recipe_chain` given no scales declines it too), the largest magnitude each quantized
+    recorded under its history's path, finite."""
+    from dew.nn.dense import NVFP4_AMAX, NVFP4_HISTORY
+    from dew.nn.mlp import GatedMLP
+    from dew.nn.precision import projection_role
+
+    layer = GatedMLP(hidden_features=2 * WIDTH, out_features=WIDTH, dtype=jnp.bfloat16)
+    x = jnp.asarray(np.random.default_rng(12721).normal(size=(64, WIDTH)), jnp.bfloat16)
+    # In the role a decoder block runs its MLP in (`projection_role`), which the recipe takes.
+    with generation.run_precision(_delayed_nvfp4()), projection_role("mlp"):
+        variables = layer.init(jax.random.key(0), x)
+        held = {key: tree for key, tree in variables.items() if key != NVFP4_AMAX}
+
+        (value, sown), grads = jax.value_and_grad(_summed_recording(layer, held), argnums=(0, 1),
+                                                  has_aux=True)(held["params"], x)
+    histories = jax.tree_util.tree_flatten_with_path(held[NVFP4_HISTORY])[0]
+    recorded = jax.tree_util.tree_flatten_with_path(sown[NVFP4_AMAX],
+                                                    is_leaf=lambda leaf: isinstance(leaf, tuple))[0]
+    assert len(histories) == 3 and [path for path, _ in histories] == [path for path, _ in recorded]
+    assert np.isfinite(float(value))
+    assert all(np.all(np.isfinite(np.asarray(leaf, np.float32))) for leaf in jax.tree.leaves(grads))
+    assert all(np.isfinite(float(amax)) and float(amax) > 0 for _, (amax,) in recorded)
+
+
+def test_a_rolled_history_takes_its_steps_largest_newest():
+    """A training step's update of a delayed-scaling NVFP4 run's histories (`dense.rolled`, row 12721):
+    each history a step recorded shifted by one along its steps, the step's largest newest and its oldest
+    dropped, a scanned stack's `[layers, steps]` each layer's own; a history no call recorded as it was."""
+    from dew.nn.dense import rolled
+
+    histories = {"a": {"amax_history": jnp.asarray([1.0, 2.0, 3.0])},
+                 "b": {"amax_history": jnp.asarray([4.0, 5.0, 6.0])},
+                 "stack": {"up_proj": jnp.asarray([[1.0, 2.0], [3.0, 4.0]])}}
+    out = rolled(histories, {"a": {"amax_history": jnp.float32(9.0)},
+                             "stack": {"up_proj": jnp.asarray([7.0, 8.0])}})
+    assert out["a"]["amax_history"].tolist() == [9.0, 1.0, 2.0]
+    assert out["b"]["amax_history"].tolist() == [4.0, 5.0, 6.0]
+    assert out["stack"]["up_proj"].tolist() == [[7.0, 1.0], [8.0, 3.0]]
+
+
+def test_a_delayed_nvfp4_expert_layer_quantizes_each_projection_at_its_own_scale():
+    """An expert layer under a delayed-scaling NVFP4 recipe that takes its experts (row 12721) runs its
+    gate, up and down projections apart, each quantized at its own history's tensor scale
+    (`moe.gated_experts`'s `scales`), and records its down projection's rows, their gated product: its
+    output bitwise each projection by `moe.expert_projection` at that scale."""
+    from dew.nn import moe
+    from dew.nn.kernels import projections
+
+    rng = np.random.default_rng(12722)
+    tokens, depth, width = 136, 128, 256
+    rows = jnp.asarray(rng.normal(size=(tokens, depth)), jnp.bfloat16)
+    gate, up = (jnp.asarray(rng.normal(size=(2, depth, width)) / 8, jnp.bfloat16) for _ in range(2))
+    down = jnp.asarray(rng.normal(size=(2, width, depth)) / 8, jnp.bfloat16)
+    sizes = jnp.asarray([70, 66], jnp.int32)
+    scales = tuple(projections.delayed_tensor_scale(jnp.asarray([value], jnp.float32))
+                   for value in (3.0, 5.0, 7.0))
+    noted = []
+    with generation.run_precision(_delayed_nvfp4()):
+        out = moe.gated_experts(rows, gate, up, down, sizes, jnp.bfloat16, "auto", None, "swiglu", None,
+                                scales=scales, noted=noted.append)
+        gate_rows, up_rows = (moe.expert_projection(rows, kernel, sizes, jnp.bfloat16, "auto", None,
+                                                    tensor_scale=scale)
+                              for kernel, scale in zip((gate, up), scales[:2], strict=True))
+        hidden = moe.gated_product("swiglu")(*moe.swiglu_clamped(gate_rows, up_rows, None))
+        want = moe.expert_projection(hidden, down, sizes, jnp.bfloat16, "auto", None, tensor_scale=scales[2])
+    np.testing.assert_array_equal(np.asarray(out).view(np.uint16), np.asarray(want).view(np.uint16))
+    np.testing.assert_array_equal(np.asarray(noted[0]).view(np.uint16), np.asarray(hidden).view(np.uint16))
+
+
+@pytest.mark.parametrize("activation", ["gelu", "swiglu"])
+def test_an_mlps_projections_run_as_one_recipe_chain_bitwise_their_projections_apart(activation):
+    """An MLP whose projections DeepSeek-V3's blockwise FP8 recipe takes in its role runs them as one chain
+    (`projections.recipe_chain`): an ungated one's up and down (row 8547), a gated one's gate, up and down,
+    its gated product in the up projection's epilogue (row 12689). One recipe region of the recipe's
+    derivative where the projections apart held one each (`dew.nn.derivatives.Surrogate`), its rows any
+    count (laid in whole blocks), and its output and every gradient, the rows' and every kernel's, bitwise
+    the projections apart with its activation between them (`projections.recipe_projection`)."""
+    from reference_error import equations
+
+    from dew.nn.activations import gated_product, ungated_activation
+    from dew.nn.derivatives import Surrogate
+    from dew.nn.mlp import GatedMLP
+    from dew.nn.precision import projection_role
+
+    fp8 = RECIPE_NUMERICS["blockwise_fp8"]
+    mlp = GatedMLP(hidden_features=256, out_features=128, activation=activation, dtype=jnp.bfloat16)
+    x = jax.random.normal(jax.random.key(0), (2, 100, 128), jnp.bfloat16)
+    variables = nn.unbox(mlp.init(jax.random.key(1), x))
+    gated = activation == "swiglu"
+
+    def chained(variables, x):
+        return mlp.apply(variables, x)
+
+    def apart(variables, x):
+        rows = x.reshape(-1, x.shape[-1])
+
+        def projected(rows, name):
+            kernel = variables["params"][name]["kernel"].astype(x.dtype)
+            return projections.recipe_projection(rows, kernel, out_dtype=x.dtype)
+
+        up = projected(rows, "up_proj")
+        hidden = (gated_product(activation)(projected(rows, "gate_proj"), up) if gated
+                  else ungated_activation(activation, up))
+        out = projected(hidden, "down_proj")
+        return out.reshape(*x.shape[:-1], out.shape[-1])
+
+    with generation.run_precision(fp8), projection_role("mlp"):
+        graph = jax.make_jaxpr(chained)(variables, x)
+        regions = [equation for equation in equations(graph) if equation.primitive.name == "marked_call"
+                   and isinstance(equation.params.get("kind"), Surrogate)]
+        assert len(regions) == 1, len(regions)
+        cotangent = jax.random.normal(jax.random.key(2), (2, 100, 128), jnp.bfloat16)
+        ran = [jax.jit(with_gradients(form))(variables, x, cotangent) for form in (chained, apart)]
+    for mine, theirs in zip(*(jax.tree.leaves(each) for each in ran), strict=True):
+        np.testing.assert_array_equal(_bits(mine), _bits(theirs))
+
+
+def _bits(leaf) -> np.ndarray:
+    """`leaf`'s raw bit patterns, so a bitwise comparison tells -0.0 from +0.0."""
+    held = np.asarray(leaf)
+    return held.view(np.dtype(f"u{held.dtype.itemsize}"))
+
+
+@pytest.mark.parametrize(("kind", "activation"), [
+    pytest.param("a function of its own", "relu", id="a function of its own"),
+    *(pytest.param(kind, activation, id=f"{kind}-{activation}")
+      for kind in ("mixed dtypes", "a sequence axis", "float64", "a promotion of its own")
+      for activation in ("gelu", "swiglu")),
+])
+def test_an_mlp_the_chain_cannot_read_runs_its_projections_apart(kind, activation):
+    """An MLP the recipe's chain cannot run as its projections apart, ungated or gated, runs them apart, one
+    recipe region each (`dew.nn.derivatives.Surrogate`): an activation given as a function of its own, which
+    the chain would call on its rows flattened and padded (a function of one placement or mixing positions
+    reads them otherwise); kernels of two dtypes, whose products promote apart (a bf16 up projection's into a
+    float32 down projection's, its output float32); rows a sequence axis splits, which the chain would
+    flatten past the hidden activation's placement; float64, which its quantizing epilogue does not write;
+    and a projection promoting its operands by a function of its own, which the chain would skip."""
+    from flax.linen.dtypes import promote_dtype as flax_promote_dtype
+    from jax.sharding import AbstractMesh, AxisType
+    from reference_error import equations
+
+    from dew.nn.dense import Dense
+    from dew.nn.derivatives import Surrogate
+    from dew.nn.mlp import GatedMLP
+    from dew.nn.precision import projection_role
+
+    fp8 = RECIPE_NUMERICS["blockwise_fp8"]
+    mixed, wide = kind == "mixed dtypes", kind == "float64"
+
+    def promoted(*operands, dtype=None):
+        # Flax's promotion, then the inputs doubled: a promotion of the layer's own.
+        inputs, *rest = flax_promote_dtype(*operands, dtype=dtype)
+        return (inputs * 2, *rest)
+
+    linear = (functools.partial(Dense, promote_dtype=promoted) if kind == "a promotion of its own"
+              else None)
+    mlp = GatedMLP(hidden_features=256, out_features=128,
+                   activation=jax.nn.relu if kind == "a function of its own" else activation,
+                   dtype=None if mixed else jnp.float64 if wide else jnp.bfloat16,
+                   **({} if linear is None else {"linear": linear}))
+    # A float64 run's whole: its rows drawn, its parameters made and its graph traced under x64.
+    widened = jax.enable_x64(new_val=True) if wide else contextlib.nullcontext()
+    with widened:
+        x = jax.random.normal(jax.random.key(0), (2, 100, 128), jnp.float64 if wide else jnp.bfloat16)
+        variables = nn.unbox(mlp.init(jax.random.key(1), x))
+    if mixed:
+        params = variables["params"]
+        variables = {"params": {name: {"kernel": params[name]["kernel"].astype(
+            jnp.float32 if name == "down_proj" else jnp.bfloat16)} for name in params}}
+    placed = (jax.sharding.use_abstract_mesh(AbstractMesh((2,), ("sequence",), axis_types=(AxisType.Auto,)))
+              if kind == "a sequence axis" else contextlib.nullcontext())
+    with generation.run_precision(fp8), projection_role("mlp"), placed, widened:
+        graph = jax.make_jaxpr(lambda variables, x: mlp.apply(variables, x))(variables, x)
+        out = jax.eval_shape(lambda variables, x: mlp.apply(variables, x), variables, x)
+    regions = [equation for equation in equations(graph) if equation.primitive.name == "marked_call"
+               and isinstance(equation.params.get("kind"), Surrogate)]
+    assert len(regions) == (3 if activation == "swiglu" else 2), len(regions)
+    assert out.dtype == (jnp.float32 if mixed else jnp.float64 if wide else jnp.bfloat16)

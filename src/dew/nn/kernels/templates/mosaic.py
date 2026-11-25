@@ -54,7 +54,7 @@ from dew.nn.kernels.templates import (
 )
 from dew.nn.kernels.templates.cost import Stated
 from dew.nn.kernels.templates.rings import CLUSTER, Ref, Turn, besides, drain, loaded_once
-from dew.nn.kernels.templates.stores import column_chunks, column_spans, written
+from dew.nn.kernels.templates.stores import Output, column_chunks, column_spans, written
 from dew.telemetry.instrumentation import MODEL_FLOPS
 
 Operand = Ref | jax.Array
@@ -393,10 +393,16 @@ _ONCE_PREDICATED = _cache.untraced(contextvars.ContextVar("once_predicated", def
 own)."""
 
 
-def refuse_staging(family, chunks: tuple[int, int] | None) -> None:
-    """Refuses `chunks` (`Family.output_staging`'s) where `family` stages each output tile whole."""
+def refuse_staging(family, chunks: tuple[int, int] | None, outputs: tuple = ()) -> tuple[tuple, ...]:
+    """Refuses `chunks` (`Family.output_staging`'s) where `family` stages each output tile whole, and any of
+    `outputs` stored packed or written by its own write (`stores.Output`'s divisor, transposed form or write,
+    which chunked staging alone takes); `outputs` as `(shape, dtype)` pairs."""
     if chunks is not None:
         raise ValueError(f"{family.name} stages each output tile whole, in no chunks: {chunks}")
+    plain = tuple(map(Output.of, outputs))
+    if any(output.divisor > 1 or output.transposed or output.write is not None for output in plain):
+        raise ValueError(f"{family.name} stages each output tile whole as its issuer writes it, none packed")
+    return tuple((output.shape, output.dtype) for output in plain)
 
 
 def then_read(read: Callable, after: Callable | None) -> Callable:
@@ -1262,6 +1268,17 @@ class Issuer[Accumulator](abc.ABC):
         write states its own (`WgmmaIssuer`). The walk's ring waits and releases are its own, outside it."""
         return self.issued_when(~idle, acc, issue)
 
+    bound_registers: int = 0
+    """The registers a consumer thread holds beside its tile where its products take a row bound (`bounded`):
+    none where its instructions take none."""
+
+    def side_bytes(self, dtype) -> int:
+        """The bytes a register holds a value of an epilogue's `[rows, columns]` side tile of `dtype` in, as
+        `side_tile` loads it: its own width in Mosaic GPU's fragmented arrays (a bf16 tile two values a
+        register: an H100's gated blockwise chain, its gate a bf16 side, compiled at 168 registers, row
+        12689)."""
+        return jnp.dtype(dtype).itemsize
+
     def bounded(self, rows: jax.Array) -> Self:
         """This issuer, its products issued for a tile's rows before `rows` alone (an int32, one value across
         the issuing warpgroup: a ragged group's rows in its last tile), the accumulator's rows kept past it,
@@ -1617,6 +1634,12 @@ class Transport[Allocated, Opened](abc.ABC):
     walks_scoped: bool = False
     """Whether its walks scope their streams apart, each in its own scope (`emit_pipeline`'s slots): a tile
     scoped after a walk then takes the larger of the two (`resources.shared_bytes`)."""
+
+    walks_streamed: bool = False
+    """Whether consumers holding their own blocks walk every streamed step together (`walk_own`'s), each
+    masking the steps outside its own: their per-step meets pair, so a sum across them after the walk
+    (`across.summed_across`) meets paired too. Where not, a consumer passes the steps outside its own
+    range (`passed`) and walks its own alone."""
 
     prefetches_fragments: bool = False
     """Whether its walk takes a step's `prefetch` (`walk`'s): the first fragments of a step's products read
@@ -1999,8 +2022,7 @@ class Transport[Allocated, Opened](abc.ABC):
         template's allocations count as its own (`resources.Scope`): the whole tile, where a family stages
         it whole, which takes no `chunks` (chunk columns and buffers, `stores.output_staging`'s `staging`)."""
         del consumers
-        refuse_staging(self, chunks)
-        return [plgpu.SMEM(shape, dtype) for shape, dtype in outputs]
+        return [plgpu.SMEM(shape, dtype) for shape, dtype in refuse_staging(self, chunks, outputs)]
 
     def persist_scratch(self, consumers: int, rewrites: tuple[int, ...] = (), *,
                         pingpong: bool = False) -> tuple[tuple, int]:
@@ -2096,6 +2118,12 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
 
     consumers: int
     """The compute roles a program may take (sm90 two warpgroups, sm80 one)."""
+
+    @property
+    def shared_consumers(self) -> int:
+        """The most compute roles a launch may name (`consumers` where its derivation picks its own): a
+        cp.async family's two over one collective pipeline (`mosaic_sm80.CpAsync`), more than it derives."""
+        return self.consumers
 
     def for_generation(self, generation_name: str) -> "Family":
         """The bundle as a device of `generation_name` runs it (`bundles.groups`, its composition for that

@@ -40,6 +40,12 @@ class Hooks:
     """The accumulator tiles the epilogue takes before its side tiles: a launch's binding states them from
     its bound operands (two where a second matrix is bound, `gmm_call`'s `paired`; `_GroupedLaunch.bind`),
     never a caller."""
+    out_forms: tuple | None = None
+    """How each output stores, where the epilogue returns several (`out_dtypes`): None for a tile of its own,
+    else `(divisor, transposed)`: one value a row each `divisor` columns, stored `[columns // divisor, rows]`
+    where transposed (`stores.Output`; a next product's 1 x `divisor` scales, its rows contiguous, as a
+    blockwise FP8 product reads them; row 8547). Its epilogue returns such an output broadcast across each
+    of its blocks' columns, so a block's row maximum is its value (`quantized.reduced`)."""
     depth_masked: bool = False
     """Whether the prologue's result is zeroed past the call's depth by its last side vector
     (`mosaic_gpu.depth_masked`), which a launch's alignment binds once (`MosaicGmm._aligned`)."""
@@ -54,7 +60,8 @@ class Hooks:
 
     def kernel_options(self) -> dict:
         return {'prologue': self.before(), 'prologue_axes': self.prologue_axes, 'epilogue': self.after(),
-                'epilogue_axes': self.epilogue_axes, 'out_dtypes': self.out_dtypes}
+                'epilogue_axes': self.epilogue_axes, 'out_dtypes': self.out_dtypes,
+                **({'out_forms': self.out_forms} if self.out_forms else {})}
 
 
 def _unsqueezing(hook, positions: tuple, tiles: int = 1):

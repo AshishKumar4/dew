@@ -6,14 +6,18 @@ import functools
 import math
 from collections.abc import Callable
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import scipy.special
 from flax import linen as nn
+from flax.core import meta
+from flax.linen.dtypes import promote_dtype
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
-from dew.nn.dense import Dense
+from dew.mesh import SEQUENCE_AXIS, TENSOR_AXIS
+from dew.nn.dense import Dense, _promoted
 from dew.nn.dropout import Dropout
 from dew.nn.residuals import Residual
 
@@ -32,8 +36,9 @@ from .activations import (
 from .blocks import normal_kernel
 from .flops import projection_flops
 from .gated_mlp import fuses, gated_mlp
-from .joined import joined_dense, joins
+from .joined import joined_dense, joins, plain_denses, projections_of
 from .kernels.generation import Choice
+from .kernels.projections import recipe_chain
 from .ngpt import NGPT, normed_hidden
 from .precision import at_least_fp32, compensated_sum, float32_dot_general, scaled, sqrt_or_zero
 from .protocols import ProjectionGroup
@@ -242,9 +247,16 @@ class GatedMLP(nn.Module):
         activation = self._activation()
         axes = self._axes(x)
         if not isinstance(activation, (str, Situ)):
-            up = checkpoint_name(self._placed(self.up_proj(x)), Residual.UP_PROJ)
-            out = self._down(activation(up), train)
+            out = self._chained(x, (self.up_proj, self.down_proj), activation, train)
+            if out is None:
+                up = checkpoint_name(self._placed(self.up_proj(x)), Residual.UP_PROJ)
+                out = self._down(activation(up), train)
             return activation(out) if self.activation_after else out
+        if isinstance(activation, str) and self._fusable() and self.swiglu_limit is None:
+            chained = self._chained(x, (self.gate_proj, self.up_proj, self.down_proj),
+                                    gated_product(activation), train)
+            if chained is not None:
+                return scaled(chained, self.down_multiplier)
         # A packed MLP holds no gate_proj apart (`_fusable`): its projections are read past that.
         if (isinstance(activation, str) and self._fusable()
                 and fuses(projections := (self.gate_proj, self.up_proj, self.down_proj), x, activation,
@@ -308,6 +320,50 @@ class GatedMLP(nn.Module):
         dtype (dory.py:188-194)."""
         return normed_hidden(gate, up, self.suv_gate, self.suv_up, ngpt.hidden(self.out_features),
                              gated_product(activation, axes=self._axes(gate)))
+
+    def _chained(self, x, projections_: tuple[nn.Module, ...], activation: Callable, train: bool):
+        """The MLP's output as one chain of its projections where the run's recipe takes them
+        (`projections.recipe_chain`: blockwise FP8, the down projection's rows quantized in the up
+        projection's epilogue, bitwise the projections apart): an ungated MLP's up and down (row 8547), or a
+        gated one's gate, up and down, `activation` its gated product of the two (row 12689). Else None, each
+        projection then its own: a bias, hidden units dropped between them, a tensor axis splitting the
+        hidden width (the chain reads its matrices whole), the parameters' creation, or projections not plain
+        `Dense` whose kernels they hold, their products owned by no wrapper or interceptor (a LoRA's, a
+        served quantized kernel's) and observed by no inspection (`joined.projections_of`), take them apart;
+        so do an activation not named (an ungated MLP's one of `UNGATED`'s, a gated one's its gated
+        product's: the chain calls it on its rows flattened and padded, which only an elementwise function
+        keeping its dtype reads as the projections apart do), projections whose promoted operands are not of
+        one dtype (the chain rounds once, in the rows'), nor float32 or narrower (its quantizing epilogue
+        writes no float64), projections promoting their operands otherwise than flax's `promote_dtype` (the
+        chain promotes nothing), and a sequence axis splitting the rows (the chain flattens them, past the
+        hidden activation's placement)."""
+        named = isinstance(self.activation, str) and (len(projections_) == 3 or self.activation in UNGATED)
+        if not (named and plain_denses(projections_)
+                and all(projection.promote_dtype is promote_dtype for projection in projections_)):
+            return None
+        found = projections_of(projections_)
+        mesh = jax.sharding.get_abstract_mesh().shape
+        if (self.use_bias or (self.dropout_rate and train) or not found.held
+                or found.intercepted or found.observed or not found.dot_general
+                or mesh.get(TENSOR_AXIS, 1) > 1 or mesh.get(SEQUENCE_AXIS, 1) > 1):
+            return None
+        *first, down_proj = projections_
+        # Each kernel read and cast as its projection's call casts it (`dense._promoted`).
+        promoted = [_promoted(projection, x, meta.unbox(projection.get_variable('params', 'kernel')), None)
+                    for projection in first]
+        rows = promoted[-1][0]
+        hidden, down = _promoted(down_proj, rows, meta.unbox(down_proj.get_variable('params', 'kernel')),
+                                 None)[:2]
+        if (len({array.dtype for inputs, kernel, _ in promoted for array in (inputs, kernel)}
+                | {hidden.dtype, down.dtype}) != 1
+                or not jnp.issubdtype(rows.dtype, jnp.floating) or rows.dtype.itemsize > 4):
+            return None
+        gate = promoted[0][1] if len(promoted) == 2 else None
+        out = recipe_chain(rows.reshape(-1, rows.shape[-1]), promoted[-1][1], down, activation,
+                           out_dtype=rows.dtype, gate=gate)
+        if out is None:
+            return None
+        return checkpoint_name(out.reshape(*x.shape[:-1], out.shape[-1]), Residual.DOWN_PROJ)
 
     def _down(self, hidden, train: bool):
         if self.dropout_rate:

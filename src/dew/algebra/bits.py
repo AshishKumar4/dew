@@ -990,7 +990,18 @@ def nvfp4_quantized(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     return packed(codes.T, E2M1).T, scales, tensor
 
 
-def nvfp4_coded(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+def nvfp4_tensor_scale(largest: jax.Array, quotient=None) -> jax.Array:
+    """NVFP4's tensor scale of a tensor whose largest magnitude is `largest` (`nvfp4_coded`'s rule): it over
+    6 * 448, at least fp32's least normal, 1 where it is zero, each quotient IEEE fp32 division's
+    (`correctly_rounded_divide`) or `quotient`'s. A delayed-scaling recipe's scale of the largest magnitude
+    its amax history holds (`dew.nn.kernels.projections.delayed_tensor_scale`, row 12721)."""
+    quotient = correctly_rounded_divide if quotient is None else quotient
+    least_normal = np.float32(np.finfo(np.float32).tiny)
+    over = quotient(largest, np.float32(E2M1_MAX * E4M3_MAX))
+    return jnp.where(largest > 0, jnp.maximum(over, least_normal), np.float32(1))
+
+
+def nvfp4_coded(x: jax.Array, tensor: jax.Array | None = None) -> tuple[jax.Array, jax.Array, jax.Array]:
     """A tile `x` `[depth, columns]` of float32 values as NVFP4: its E2M1 codes (`[depth, columns]` uint32,
     a code each), its block scales (`[depth / 16, columns]` float8_e4m3fn,
     one for each sixteen along the depth) and its tensor scale (fp32): the tensor scale its largest magnitude
@@ -1003,7 +1014,9 @@ def nvfp4_coded(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     tensor scale is each value's rounding, as the GEMM epilogue's NVFP4 output stores it (row 4050). Each
     quotient is IEEE fp32 division's on every backend (`quotient`), so a tile's codes and scales are the
     rule's wherever it is quantized (row 5456: XLA's own division, a CPU's product by the reciprocal and a
-    GPU's approximate quotient, moved codes across an e2m1 midpoint and scales a step)."""
+    GPU's approximate quotient, moved codes across an e2m1 midpoint and scales a step). `tensor`, a tensor
+    scale given in place of the tile's own (a delayed-scaling recipe's, row 12721), the rule otherwise the
+    same: a block past it saturates its scale at 448 and its codes at 6, as delayed scaling clips."""
     def quotient(numerator, denominator):
         # IEEE fp32 division (`correctly_rounded_divide`); at a float64 truth's width, the float32 values'
         # float64 quotient rounded once to fp32, the same value (a quotient of 24-bit operands rounded to 53
@@ -1012,12 +1025,11 @@ def nvfp4_coded(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
             return correctly_rounded_divide(numerator, denominator)
         return (jnp.asarray(numerator, x.dtype) / jnp.asarray(denominator, x.dtype)).astype(jnp.float32)
 
+    if tensor is not None and jnp.ndim(tensor) != 0:
+        raise ValueError(f"an NVFP4 tensor scale is one scalar, not a {jnp.shape(tensor)} array")
     magnitude = jnp.abs(x)
-    largest = jnp.max(magnitude)
-    least_normal = np.float32(np.finfo(np.float32).tiny)
-    tensor = jnp.where(largest > 0,
-                       jnp.maximum(quotient(largest, np.float32(E2M1_MAX * E4M3_MAX)), least_normal),
-                       np.float32(1))
+    tensor = (nvfp4_tensor_scale(jnp.max(magnitude), quotient) if tensor is None
+              else jnp.asarray(tensor, jnp.float32))
     blocks = jnp.max(magnitude.reshape(-1, NVFP4.depth, x.shape[-1]), axis=1)
     ratio = quotient(quotient(blocks, tensor), np.float32(E2M1_MAX))
     nearest = encoded(jax.lax.bitcast_convert_type(ratio, jnp.uint32), E4M3)
