@@ -842,11 +842,14 @@ class Parting:
         return parted
 
     def measured(self, joined: int | None, parted: int | None) -> None:
-        """A rung's parted variant missed by `parted` where the rung joined missed by `joined` (None where a
-        miss measured nothing): what parting freed, the least any process measured, stands in for the
-        count; none freed, or none measured, makes parting futile."""
+        """A rung's parted variant missed by `parted` where the rung joined missed by `joined` at the same
+        split (None where either measured nothing there): what parting freed, the least any process
+        measured, stands in for the count; none freed on some process makes parting futile; a process that
+        measured nothing leaves both as they were, every process alike."""
         freed = self.gather(None if joined is None or parted is None else joined - parted)
-        if any(value is None or value <= 0 for value in freed):
+        if any(value is None for value in freed):
+            return
+        if any(value <= 0 for value in freed):
             self.futile = True
         else:
             self.estimate = min(freed)
@@ -1410,16 +1413,17 @@ class FitSearch[LossT, EffectsT]:
         parting = self.parting = Parting(self.stacks_count() if group is None else 0, self.gather)
 
         def parted(rung: Rung) -> int | None:
-            # `rung`, just asked joined and missed, asked parted at once where its miss leaves it so; a miss
-            # of it measures what parting freed (`Parting.measured`).
-            joined = self.shortfall(named[-1])
-            variant = parting.after(rung, joined)
+            # `rung`, just asked joined and missed, asked parted at once where its last attempt's miss
+            # leaves it so; a miss of it measures what parting freed against the joined rung's at the same
+            # split (`Parting.measured`), none where either measured nothing there.
+            at, joined = named[-1], self.last_shortfall(named[-1])
+            variant = parting.after(rung, None if joined is None else joined[1])
             if variant is None or variant in self.asked:
                 return None
             split = ask(variant, "the step does not fit the devices with its Newton-Schulz stacks joined; "
                         "compiling it again joining one at a time (%s)")
-            if split is None:
-                parting.measured(joined, self.shortfall(named[-1]))
+            if split is None and (last := self.last_shortfall(named[-1])) is not None:
+                parting.measured(self.shortfall_at(at, last[0]), last[1])
             return split
 
         if (split := parted(start)) is not None:
@@ -1556,11 +1560,18 @@ class FitSearch[LossT, EffectsT]:
         and whether a rung's parted step is asked is one (`Parting`, `below`)."""
         return max(self.gather(self.stacks_held()))
 
-    def shortfall(self, rung: str) -> int | None:
-        """What the search fell short by at `rung` at the split it last missed at there, its walk's finest
-        (`MemoryMiss.shortfall`, in bytes), as `freed` reads it; None where it measured no miss there."""
-        latest = next((miss for (at, _), miss in reversed(self.misses.items()) if at == rung), None)
-        return None if latest is None else latest.shortfall // self.factor
+    def last_shortfall(self, rung: str) -> tuple[int, int | None] | None:
+        """The split of the last attempt the search made at `rung` and what it fell short by there
+        (`MemoryMiss.shortfall`, in bytes), None for a miss that measured nothing (an allocation refusal
+        with no figure); None where it attempted none there."""
+        split = next((probe.split for probe in reversed(self.probes)
+                      if json.dumps(probe.rung, sort_keys=True) == rung), None)
+        return None if split is None else (split, self.shortfall_at(rung, split))
+
+    def shortfall_at(self, rung: str, split: int) -> int | None:
+        """What the search fell short by at `rung` at `split`, None where it measured no miss there."""
+        miss = self.misses.get((rung, split))
+        return None if miss is None else miss.shortfall // self.factor
 
     def short(self, rung: str) -> tuple[int, LiveSet] | None:
         """The least the search fell short by at `rung` (`MemoryMiss.shortfall`, in bytes) among its misses

@@ -90,10 +90,10 @@ class Scripted(FitSearch):
     """A search over a small LM's ladder whose compiles are a table (`need`: the bytes a rung needs, by its
     place among the remat rungs a climb visits and whether it parts its stacks), judged against `room`, a
     miss short by the difference, a need of None a miss that measured nothing (an allocation failure XLA
-    reports no figure for); its stacks holding `count` bytes by count. Every rung it compiled, in order
-    (`compiled`), as `(place, ns_group)`."""
+    reports no figure for); its stacks holding `count` bytes by count; where `by_split`, `need` takes the
+    split too. Every rung it compiled, in order (`compiled`), as `(place, ns_group)`."""
 
-    def __init__(self, need: Callable[[int, int | None], int | None], room: int, count: int):
+    def __init__(self, need: Callable[..., int | None], room: int, count: int, *, by_split: bool = False):
         model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=2, num_heads=2, mlp_features=64,
                                   max_seq_len=16)
         climber = LMObjective(model, seq_len=16)
@@ -103,7 +103,7 @@ class Scripted(FitSearch):
         super().__init__(lower=None, options=lambda candidate: None, objective=LMObjective(model, seq_len=16),
                          mesh=MeshSpec().build(jax.devices()[:1]), xla_defaults=False, narrow=False,
                          ns_group=None, base=None, resumed=None)
-        self.need, self.room, self.count = need, room, count
+        self.need, self.room, self.count, self.by_split = need, room, count, by_split
         self.compiled: list[tuple[int, int | None]] = []
 
     def stacks_held(self) -> int:
@@ -117,14 +117,16 @@ class Scripted(FitSearch):
     def fits_here(self, split: int) -> bool:
         place = self.place()
         self.compiled.append(place)
-        need = self.need(*place)
+        need = self.need(*place, split) if self.by_split else self.need(*place)
         if need is None:
             self.probes.append(Probe(split, 1, self.current(), fits=False, headroom=None, temp=0, argument=0))
             return False
         short = need - self.room
         self.probes.append(Probe(split, 1, self.current(), short <= 0, -short, 0, 0))
         if short > 0:
-            self.misses[(self.rung(), split)] = MemoryMiss(split, 0, short * self.factor, self.factor)
+            # Its temporaries all a microbatch's, so a split it doubles may fit (`FitSearch.after`).
+            self.misses[(self.rung(), split)] = MemoryMiss(split, need * self.factor, short * self.factor,
+                                                           self.factor)
         return short <= 0
 
 
@@ -245,3 +247,22 @@ def test_a_refused_search_that_measured_every_lighter_form_of_its_rungs_says_so(
     walked.probes.append(Probe(1, 1, {**walked.current(), "head_tile": 4}, fits=False, headroom=-10, temp=0,
                                argument=0))
     assert walked.searched([1], 0) is None and walked.unmeasured_lighter(), walked.compiled
+
+
+def test_a_last_attempt_that_measured_nothing_parts_no_stacks_at_once_whatever_an_earlier_split_measured():
+    """A start that missed by a measured 10 at one split and then by no figure at the split after (an
+    allocation refusal), its last attempt: it asks the next rung joined, not its own parted at once, the
+    earlier split's measure no reading of its last (review of row 12463's P0: the stale 10 parted it);
+    and a parted step's miss is weighed against the joined rung's at its own split, never another's."""
+    search = Scripted(lambda place, group, split: (100 if split == 1 else None) if place == 0 else 90,
+                      room=90, count=20, by_split=True)
+    assert search.searched([1, 2], 0) is not None
+    assert search.compiled[:2] == [(0, None), (0, None)], search.compiled
+    assert all(group is None for _, group in search.compiled), search.compiled
+    # Parted, the start measures 100 at the first split and nothing at the second: no measure at one split
+    # of both, so parting is neither futile nor measured, and the next rung is parted at once as before.
+    weighed = Scripted(lambda place, group, split: (100 if group is None or split == 1 else None)
+                       if place == 0 else (92 if group is None else 90), room=90, count=20, by_split=True)
+    assert weighed.searched([1, 2], 0) is not None
+    assert weighed.compiled[:4] == [(0, None), (0, None), (0, 1), (0, 1)], weighed.compiled
+    assert weighed.parting is not None and not weighed.parting.futile, weighed.compiled
