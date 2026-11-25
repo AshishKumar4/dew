@@ -1370,8 +1370,13 @@ def test_a_stationary_weight_direction_cannot_erase_another_samples_tangent(mode
     x = jnp.asarray([[-1.0, 1.0, 0.0]], jnp.float32)
     w = jnp.asarray([[0.5, 0.5, 0.0]], jnp.float32)
     dw = jnp.asarray([[2.0 ** 125, 0.0, 2.0 ** -40]], jnp.float32)
-    _, tangent = jax.jvp(lambda q: moments.chunked_moments(x, q, tile=1, mode=mode)[1], (w,), (dw,))
-    np.testing.assert_array_equal(tangent, [-2.0 ** -40])
+
+    def directed(x):
+        return jax.jvp(lambda q: moments.chunked_moments(x, q, tile=1, mode=mode)[1], (w,), (dw,))[1]
+
+    first, second = jax.jvp(directed, (x,), (x,))
+    np.testing.assert_array_equal(first, [-2.0 ** -40])
+    np.testing.assert_array_equal(second, [-2.0 ** -39])
 
 
 def test_chunked_moments_directed_overflow_mixed_zero_weight_and_direct_jvp():

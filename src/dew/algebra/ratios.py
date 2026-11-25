@@ -70,7 +70,7 @@ class Ratio:
     power: int = 1
     products: tuple = ()
     join_directions: bool = False
-    directions: tuple[int, ...] = ()
+    directions: tuple[tuple[int, ...], ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -162,14 +162,18 @@ def _directional_products(form: Ratio):
     """Products split into one affine factor over states and the sums constant over that factor."""
     if not form.reduced or not form.directions:
         return ()
-    direction_indices = frozenset(form.directions)
+    groups = tuple(frozenset(indices) for indices in form.directions)
     split = []
     for coefficient, sums in form.products:
-        moving = [at for at, each in enumerate(sums) if any(
-            direction_indices.intersection(factor[1:]) for _, factors in each.terms for factor in factors)]
-        if len(moving) != 1:
+        operands = [{index for _, factors in each.terms for factor in factors for index in factor[1:]}
+                    for each in sums]
+        for indices in groups:
+            moving = [at for at, read in enumerate(operands) if indices & read]
+            if len(moving) == 1:
+                (at,) = moving
+                break
+        else:
             return ()
-        (at,) = moving
         direction = sums[at]
         if not direction.reduced or direction.over:
             return ()
@@ -374,7 +378,8 @@ def _compacted(operands: list, form: Ratio):
     return ([operands[index] for index in sorted(read)],
             dataclasses.replace(form, numerator=_remapped(form.numerator, to),
                                 denominator=_remapped(form.denominator, to),
-                                directions=tuple(to(index) for index in form.directions if index in read),
+                                directions=tuple(tuple(to(i) for i in group if i in read)
+                                                 for group in form.directions),
                                 products=tuple((coefficient, tuple(dataclasses.replace(
                                     each, terms=_remapped(each.terms, to)) for each in sums))
                                     for coefficient, sums in form.products)))
@@ -426,9 +431,14 @@ def _ratio_jvp(primals, tangents, *, form: Ratio):
     products = _canonical(products)
     if not products:
         return value, ad.Zero(jax.typeof(value).to_tangent_aval())
-    derived_form = _classic(dataclasses.replace(
-        form, numerator=(), products=products, power=form.power + bool(moved),
-        directions=tuple(tangent_of.values()) if form.join_directions else ()))
+    directions = ()
+    if form.join_directions:
+        # Earlier directions can still have the largest coefficients when this direction is taken.
+        # Their replacements belong to the same group, considered first in each product.
+        directions = (*[(*group, *(tangent_of[i] for i in group if i in tangent_of))
+                        for group in form.directions], tuple(tangent_of.values()))
+    derived_form = _classic(dataclasses.replace(form, numerator=(), products=products,
+                                                power=form.power + bool(moved), directions=directions))
     return value, ratio(operands, derived_form)
 
 
