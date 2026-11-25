@@ -63,7 +63,7 @@ from dew.nn.precision import compensated_sum
 
 
 def fast_backward_form(delta: bool, rounded: bool, dtype, *, per_key: bool = False,
-                       wide: bool = False) -> bool:
+                       wide: bool = False, reads: bool = False) -> bool:
     """Whether the fast backward takes a call's form: the delta rule, fla's DAG at fla's rounding, a decay a
     head's or a key dimension's (fla_kda's, `key_backward`); or a bf16 call without it and a decay a head or
     none, the same DAG without the delta rule's: `rounded` (the SSD's under the run's fast forms, its route's)
@@ -76,9 +76,11 @@ def fast_backward_form(delta: bool, rounded: bool, dtype, *, per_key: bool = Fal
     call's held in three parts whose output is fp32 (`wide`: an epilogue reads it, Mamba2's gated norm), its
     gradient fp32 where the launches read it in bf16 (rounded so, Mamba2's step's gradient under its norm was
     2.2e-3 from float64 against the portable math's 3.1e-7), take none. A decay a key dimension's form takes
-    each sub-chunk's own pairs each their own decay (`algebra.key_diagonal_pairs_back`)."""
+    each sub-chunk's own pairs each their own decay (`algebra.key_diagonal_pairs_back`). Keys erasing along
+    reads of their own (`reads`, `chunk_forward.forward`'s) it takes under a decay a head alone: a decay a
+    key dimension's launches split no gradient between the keys and the reads (`key_backward`)."""
     dtype = jnp.dtype(dtype)
-    if per_key and dtype == jnp.float32 and not rounded:
+    if per_key and (reads or (dtype == jnp.float32 and not rounded)):
         return False
     if delta:
         return True
@@ -158,11 +160,11 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
     skip). Returns them with each launch's outputs as stored (`Kept`; a decay a key dimension's,
     `key_backward.KeyKept`), the forward's `kept_forward` beside it. A `forked` call's
     (`chunk_forward.ForkedTable`) `dh0` is its given memories' and `dentries` its entry write's
-    (`_tabled_gradients`, `_entered_gradient`), None for another. Under an erase along reads of their own
-    (`reads` `[B, T, H, Dk]`, `recurrence.Hooks.erase` 'read', `chunk_forward.forward`'s), the system's rows
-    and the weights the reads' (`_system_back`, `_keys_back`), `dreads` their gradient, None without them."""
+    (`_tabled_gradients`, `_entered_gradient`), None for another. Under reads of their own (`reads`,
+    `chunk_forward.forward`'s) the system's rows and weights are theirs, `dreads` their gradient."""
     dtype = jnp.result_type(q, k, v)
-    if not fast_backward_form(delta, rounded, dtype, per_key=g.ndim == 4, wide=jnp.dtype(do.dtype) != dtype):
+    if not fast_backward_form(delta, rounded, dtype, per_key=g.ndim == 4, wide=jnp.dtype(do.dtype) != dtype,
+                              reads=reads is not None):
         raise NotImplementedError("the fast backward takes the delta rule (under a decay a key dimension "
                                   "not in fp32 three-part form), or a bf16 or fp32 call without it and a "
                                   "decay a head (a bf16 call's output gradient bf16 where not rounded)")

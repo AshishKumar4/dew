@@ -27,6 +27,7 @@ from dew.nn.kernels.preconditioned import (
 )
 from dew.nn.kernels.recurrence import Hooks
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
+from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop_backward, template
 from dew.nn.kernels.templates.recurrence.mainloop import Tiles
 from dew.nn.precision import l2norm
@@ -104,14 +105,15 @@ def walked(*operands, starts=None):
 
 def read_erased(query, key, value, log_decay, beta, state, reads):
     """The delta rule erasing along reads of its own (`recurrence.Hooks.erase` 'read') a token at a time in
-    the operands' dtype, `S' = (I - beta k b^T) exp(g) S + beta k v^T`, read `q^T S' Dk^-1/2`, each key head's
-    queries, keys and reads its value heads': `(output, final memory)`."""
+    the operands' dtype, `S' = (I - beta k b^T) exp(g) S + beta k v^T`, read `q^T S' Dk^-1/2`, its decay a
+    head's or a key dimension's (`log_decay` `[B, S, HV]` or `[B, S, HV, Dk]`), each key head's queries, keys
+    and reads its value heads': `(output, final memory)`."""
     group = value.shape[2] // key.shape[2]
     query, key, reads = (jnp.repeat(x, group, axis=2) for x in (query, key, reads))
 
     def one(memory, token):
         q, k, v, g, b, r = token
-        memory = memory * jnp.exp(g)[..., None, None]
+        memory = memory * (jnp.exp(g)[..., None] if g.ndim == 3 else jnp.exp(g)[..., None, None])
         corrected = v - jnp.einsum('bhk,bhkv->bhv', r, memory)
         memory = memory + jnp.einsum('bhk,bhv->bhkv', b[..., None] * k, corrected)
         return memory, jnp.einsum('bhk,bhkv->bhv', q * q.shape[-1] ** -0.5, memory)
@@ -143,6 +145,33 @@ def on_the_mainloop(query, key, value, log_decay, beta, state, reads, d_out, d_f
                                                    inverse=inverse, kept=kept, reads=reads, **common)
     dq, dk, dv, dg, dbeta, dh0, *_, d_reads = grads
     return (out, final), (dq, dk, dv, dg, dbeta, dh0, d_reads)
+
+
+def on_the_mainloops_forward(query, key, value, log_decay, beta, state, reads):
+    """`read_erased`'s output and final memory on the template's mainloop forward (`chunk_forward.forward`'s
+    `reads`), its accurate fp32 forms, interpreted on an A100's bundle."""
+    target = generation.gpu_target('sm80')
+    with generation.assumed(target, interpreted=True):
+        return chunk_forward.forward(query, key, value, log_decay, beta, state, reads=reads, tiles=NARROW,
+                                     family=template.bundle(target, jnp.float32), interpret=True)
+
+
+def key_decayed(seed):
+    """`read_erase_operands`' draw of a seed under a decay a key dimension (PKDA's), its cotangents gone."""
+    q, k, v, g, beta, state, reads, *_ = read_erase_operands(seed)
+    normal = np.random.default_rng([1459, 2, seed]).standard_normal
+    keyed = -softplus(-(normal((*g.shape, k.shape[-1])) + 3.0))
+    return q, k, v, hosted(keyed), beta, state, reads
+
+
+def test_a_read_erase_under_a_decay_a_key_dimension_on_the_mainloop_is_as_exact_as_its_recurrence():
+    """The delta rule erasing along reads of its own under a decay a key dimension (PKDA's) on the
+    template's mainloop forward, its accurate fp32 forms: the system's rows the reads' in its own pairs and
+    the intra walk, its weights the reads' and its decayed keys the keys' apart (`chunk_forward._paired`,
+    `_key_weighted`): the output and final memory on par with its recurrence a token at a time in fp32 from
+    float64 (check 1). Its training is the portable math's (`mainloop_backward.fast_backward_form`)."""
+    assert_as_exact(jax.jit(on_the_mainloops_forward), jax.jit(read_erased), key_decayed,
+                    "a key decay's read erase on the mainloop", seeds=SEEDS)
 
 
 def read_erase_operands(seed):
@@ -256,15 +285,13 @@ def test_a_grouped_read_erase_on_the_template_is_as_exact_as_its_heads_apart():
                     truth_fn=jax.jit(with_gradients(read_erased)))
 
 
-@pytest.mark.parametrize(('per_key', 'kernel', 'taken'), [(False, 'mosaic_gpu', 'mosaic_gpu'),
-                                                         (False, 'fla', 'xla'), (True, 'mosaic_gpu', 'xla')],
-                         ids=['pgdn template', 'pgdn port', 'pkda template'])
-def test_a_read_erase_takes_the_template_under_a_decay_a_head_alone(per_key, kernel, taken):
+@pytest.mark.parametrize(('kernel', 'taken'), [('mosaic_gpu', 'mosaic_gpu'), ('fla', 'xla')],
+                         ids=['template', 'port'])
+def test_a_read_erase_under_a_decay_a_head_trains_on_the_template(kernel, taken):
     """The delta rule's selector gives PGDN's 16-bit training call the template it names (its keys' erase
     along reads of their own, `chunk_forward.forward`'s `reads`), where fla's port, which takes no reads,
-    and PKDA's decay a key dimension, which the template's read erase does not take yet, hand over to the
-    portable math: the kernels its traced routes name, beside the portable tangent's."""
-    drawn = operands(per_key, TEMPLATED)(0)[:-1]
+    hands over to the portable math: the kernels its traced routes name, beside the portable tangent's."""
+    drawn = operands(per_key=False, shape=TEMPLATED)(0)[:-1]
     # A 16-bit call's queries, keys and values, as a layer's projections give them.
     drawn = (*(x.astype(jnp.bfloat16) for x in drawn[:3]), *drawn[3:])
 
@@ -276,6 +303,25 @@ def test_a_read_erase_takes_the_template_under_a_decay_a_head_alone(per_key, ker
     # Beside a kernel's routes, its derivative's portable tangent's (`_per_product`).
     kernels = {route.kernel for route in found if route.choice == generation.Choice.GATED_DELTA_RULE}
     assert kernels == {taken, 'xla'}, kernels
+
+
+def test_a_read_erase_under_a_decay_a_key_dimension_runs_its_forward_alone_on_the_template():
+    """PKDA's 16-bit call naming the template runs its forward there (its keys' erase along reads of their
+    own under a decay a key dimension, `chunk_forward._paired`), and its gradient, which the template's fast
+    backward does not take (`mainloop_backward.fast_backward_form`), is refused where it is traced: a kernel
+    a call names insists on it (`selection.KernelRefused`)."""
+    drawn = operands(per_key=True, shape=TEMPLATED)(0)[:-1]
+    drawn = (*(x.astype(jnp.bfloat16) for x in drawn[:3]), *drawn[3:])
+
+    def loss(*given):
+        return templated(*given)[0].astype(jnp.float32).sum()
+
+    with generation.routes() as found:
+        jax.eval_shape(loss, *drawn)
+    assert {route.kernel for route in found if route.choice == generation.Choice.GATED_DELTA_RULE} == {
+        'mosaic_gpu'}
+    with pytest.raises(KernelRefused):
+        jax.eval_shape(jax.grad(loss, argnums=(0, 1, 2)), *drawn)
 
 
 def test_atks_walk_on_the_template_is_as_exact_over_packed_spans():

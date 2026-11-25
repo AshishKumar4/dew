@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -129,7 +130,8 @@ def by_thread(call: Call) -> bool:
     return not call.interpret and call.chunk % SPAN == 0
 
 
-def own_bands(queries, staged: tuple, betas, bands, *, products: tuple[str, ...], unit_pairs: bool) -> None:
+def own_bands(queries, staged: tuple, betas, bands, *, products: tuple[str, ...], unit_pairs: bool,
+              reads=None) -> None:
     """Each output's sub-chunks' own pairs of one key block added into `bands`, a plain fp32 shared tile
     `[outputs, C, SUB]` (`algebra.key_diagonal_bands`' form, a row's column its earlier token's place in its
     sub-chunk's diagonal block, an entry no thread writes zero), from the outputs' rows (`products`': the
@@ -145,14 +147,16 @@ def own_bands(queries, staged: tuple, betas, bands, *, products: tuple[str, ...]
     the quad's (`utils.shfl_bfly`), the warpgroup met once when done. fla_kda's token-parallel diagonal
     (chunk_kda_fwd_intra_token_parallel) walks the pairs at or before a token alone; the bands a tile in the
     accumulator's layout took every offset of every row, its shifted reads whole tiles and its sums over a key
-    block's columns a warp's shuffles, 70% of an emulated GH200's intra_own issues (M-JS-145h)."""
+    block's columns a warp's shuffles, 70% of an emulated GH200's intra_own issues (M-JS-145h). The system's
+    rows are `reads`' (staged as the keys) where given, each scaled by its write strength."""
     keyed, decayed = staged
-    refs = tuple(ref for ref in (queries, keyed, decayed, betas, bands) if ref is not None)
+    refs = tuple(ref for ref in (queries, keyed, decayed, betas, reads, bands) if ref is not None)
     plgpu.inline_mgpu(arg_types=(plgpu.RefType(),) * len(refs), return_type=())(
-        lambda ctx, *refs: _own_bands(*refs, products=products, unit_pairs=unit_pairs))(*refs)
+        lambda ctx, *refs: _own_bands(*refs, products=products, unit_pairs=unit_pairs,
+                                      reads=reads is not None))(*refs)
 
 
-def _own_bands(*refs, products: tuple[str, ...], unit_pairs: bool) -> None:
+def _own_bands(*refs, products: tuple[str, ...], unit_pairs: bool, reads: bool = False) -> None:
     """`own_bands` in Mosaic GPU's terms, a `SPAN` of rows at a time: `refs` its queries (where it forms the
     scores), the staged keys and decays (two tiles), the write strengths (where it forms the system) and the
     bands."""
@@ -161,6 +165,8 @@ def _own_bands(*refs, products: tuple[str, ...], unit_pairs: bool) -> None:
     queries_ref = refs[0] if scored else None
     keyed_ref, decayed_ref = refs[scored], refs[scored + 1]
     betas_ref, bands_ref = refs[scored + 2] if system else None, refs[-1]
+    # The system's rows the reads' where given (`own_bands`' `reads`), else the keys'.
+    rows_ref = refs[scored + 3] if reads else keyed_ref
     chunk, keys = ir.MemRefType(keyed_ref.type).shape
     pad = 0
     sub, run = algebra.SUB, keys // QUARTERS
@@ -179,7 +185,7 @@ def _own_bands(*refs, products: tuple[str, ...], unit_pairs: bool) -> None:
         if name == "scores":
             return [_widened(memref.load(queries_ref, at(row, column))) for column in columns]
         strength = native.Word(memref.load(betas_ref, at(row)))
-        keys = (native.Word(_widened(memref.load(keyed_ref, at(arith.addi(row, const(pad)), column))))
+        keys = (native.Word(_widened(memref.load(rows_ref, at(arith.addi(row, const(pad)), column))))
                 for column in columns)
         return [algebra.gated(key, strength).value for key in keys]
 
@@ -276,7 +282,8 @@ def shifted_up(call: Call, e, value: jax.Array) -> jax.Array:
     return call.family.row_shifted(value, -e, period=algebra.SUB, interpret=call.interpret)
 
 
-def intra_own(q, k, prefix, beta, taken, call: Call, *, scale: float, products: tuple[str, ...]) -> tuple:
+def intra_own(q, k, prefix, beta, taken, call: Call, *, scale: float, products: tuple[str, ...],
+              reads=None) -> tuple:
     """Each output of the intra walk's (`products`) sub-chunks' own pairs, each its own decay, a compact
     block a sub-chunk `[R, HV * SUB]` each (a row's columns its sub-chunk's diagonal block's): the scores'
     blocks masked and scaled as the output takes them (`algebra.block_masked`) in their form, each entry
@@ -301,12 +308,15 @@ def intra_own(q, k, prefix, beta, taken, call: Call, *, scale: float, products: 
         raise NotImplementedError("the own pairs invert their system's blocks a thread a column, natively a "
                                   f"chunk a whole number of {SPAN} tokens, not {chunk}")
     scored = "scores" in products
+    # The system's rows the reads where the call erases along them (`intra.intra_rows`), its columns the keys.
+    reading = reads is not None and "system" in products
     keys = key_block(call, functools.partial(_own_held, call, outputs=len(products)),
-                     functools.partial(_own_staged, call, products=products),
-                     functools.partial(pair_streams, call, queries=scored), contracted=True)
+                     functools.partial(_own_staged, call, products=products, reads=reading),
+                     functools.partial(pair_streams, call, queries=scored, reads=reading), contracted=True)
     steps = width // keys
 
     def program(at, q_ref, k_ref, *refs, streams, staging, landing):
+        reads_ref, refs = (refs[0], refs[1:]) if reading else (None, refs)
         prefix_refs, (beta_ref, _taken_ref, *outs) = refs[:len(prefix)], refs[len(prefix):]
         n, h = at["chunks"], at["heads"]
         row, span = n * chunk, pl.ds(n * chunk, chunk)
@@ -314,7 +324,9 @@ def intra_own(q, k, prefix, beta, taken, call: Call, *, scale: float, products: 
         views = stream_views(lambda i: (0, i), keys=call.given.views(k_ref, row, chunk, keyed, width),
                              **limb_views(call, prefix_refs, row, chunk, h * width, width),
                              **({"queries": call.given.views(q_ref, row, chunk, keyed, width)}
-                                if scored else {}))
+                                if scored else {}),
+                             **({"reads": call.given.views(reads_ref, row, chunk, keyed, width)}
+                                if reading else {}))
         shifts, *threaded = staging if not by_thread(call) else ((), *staging)
 
         def step(index, slots, bands, accumulators):
@@ -327,23 +339,12 @@ def intra_own(q, k, prefix, beta, taken, call: Call, *, scale: float, products: 
             if not by_thread(call):
                 shifted = shifted_keys(call, shifts, operand("keys"), limbs)
                 found = algebra.key_diagonal_bands(
-                    [intra_rows(call, name, operand, beta_ref.at[h, span]) for name in products], shifted,
-                    unit_pairs=call.unit_pairs)
+                    [intra_rows(call, name, operand, beta_ref.at[h, span], reads=reading)
+                     for name in products], shifted, unit_pairs=call.unit_pairs)
                 bands = tuple(band + more for band, more in zip(bands, found, strict=True))
             else:
-                # By thread: the scores' queries and the system's write strengths staged after the keys' and
-                # decays' (the system's rows the staged keys scaled in the walk), then each thread its own
-                # pairs' words (`own_bands`), the bands summed in shared memory.
-                keyed, decayed, *rest = threaded
-                queries, betas, summed = _threaded(rest, products)
-                _own_rows(call, keyed, decayed, operand("keys"), limbs)
-                if queries is not None:
-                    plgpu.store(queries, operand("queries").astype(queries.dtype), optimized=False)
-                if betas is not None:
-                    plgpu.store(betas, family.rows_of(beta_ref.at[h, span]), optimized=False)
-                mosaic.synced(call.interpret)
-                own_bands(queries, (keyed, decayed), betas, summed, products=products,
-                          unit_pairs=call.unit_pairs)
+                _threaded_bands(call, threaded, operand, limbs, beta_ref.at[h, span], products=products,
+                                reads=reading)
 
             return bands, accumulators
 
@@ -382,11 +383,11 @@ def intra_own(q, k, prefix, beta, taken, call: Call, *, scale: float, products: 
                  else tuple(family.as_tile(family.zeros((chunk, algebra.SUB))) for _ in products))
         return mosaic.Walk(views, step, steps=steps, carry=carry, prologue=prologue, read=read)
 
-    blocks = pair_streams(call, keys, queries=scored)
+    blocks = pair_streams(call, keys, queries=scored, reads=reading)
     # Each output's pairs a key a term, a sub-chunk's offsets: the model's.
     model = len(products) * 3 * chunk * algebra.SUB * width
-    staging, landing = _own_staged(call, keys, products=products)
-    inputs = (q, k, *prefix, beta, taken)
+    staging, landing = _own_staged(call, keys, products=products, reads=reading)
+    inputs = (q, k, *((reads,) if reading else ()), *prefix, beta, taken)
     out_type = tuple(forms[name].shape(call.heads * algebra.SUB) for name in products)
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                          grid_names=("chunks", "heads"), blocks=blocks, stages=(1, 2),
@@ -497,13 +498,13 @@ def own_form(call: Call, name: str) -> Operand:
     return placed_form(call) if name == "scores" else inverse_form(call)
 
 
-def _own_staged(call: Call, keys: int, *, products: tuple[str, ...]) -> tuple:
+def _own_staged(call: Call, keys: int, *, products: tuple[str, ...], reads: bool = False) -> tuple:
     """`intra_own`'s staging at key block `keys`: its shifted reads' tile (`own_staging`); or where a thread
     forms its own pairs (`by_thread`) the keys and the tokens' own decays (`_own_rows`), the scores' queries,
     the system's write strengths and the outputs' blocks summed (`own_bands`'), plain, the keys and queries in
-    the operands' dtype, the rest fp32; and each output's blocks' landing. The system's rows
-    staged too held an A100's intra_own at two programs a multiprocessor (541 us against 481 at three,
-    M-JS-160-a100)."""
+    the operands' dtype, the rest fp32, and the system's reads where they are its rows (`reads`, staged as
+    the keys); and each output's blocks' landing. The system's rows staged too held an A100's intra_own at
+    two programs a multiprocessor (541 us against 481 at three, M-JS-160-a100)."""
     outputs, chunk, given = len(products), call.chunk, call.given.dtype
     if not by_thread(call):
         staging = own_staging(call, keys)
@@ -513,6 +514,7 @@ def _own_staged(call: Call, keys: int, *, products: tuple[str, ...]) -> tuple:
         staging = (swizzling.plain((chunk, keys), given), swizzling.plain((chunk, keys), jnp.float32),
                    *((swizzling.plain((chunk, keys), given),) if "scores" in products else ()),
                    *((swizzling.plain((chunk,), jnp.float32),) if "system" in products else ()),
+                   *((swizzling.plain((chunk, keys), given),) if reads else ()),
                    swizzling.plain((outputs, chunk, algebra.SUB), jnp.float32))
     # A landing where the scores' form of parts takes their blocks through registers (`_blocks_written`); a
     # one-part form's blocks copied from their sums straight (`intra.copied_by_thread`), the system's inverses
@@ -522,12 +524,32 @@ def _own_staged(call: Call, keys: int, *, products: tuple[str, ...]) -> tuple:
     return staging, {name: own_form(call, name).landing(chunk, algebra.SUB) for name in landed}
 
 
-def _threaded(threaded: list, products: tuple[str, ...]) -> tuple:
-    """`_own_staged`'s by-thread scratch `(queries, betas, bands)`, None where not taken."""
+def _threaded_bands(call: Call, threaded: list, operand: Callable[[str], jax.Array], limbs: tuple, beta, *,
+                    products: tuple[str, ...], reads: bool) -> None:
+    """`intra_own`'s step by thread (`by_thread`): the scores' queries, the system's reads where they are its
+    rows and its write strengths `beta` staged after the keys' and decays' (`_own_rows`; the system's rows
+    the staged keys or reads scaled in the walk), then each thread its own pairs' words (`own_bands`), the
+    bands summed in shared memory (`threaded`'s last)."""
+    keyed, decayed, *rest = threaded
+    queries, betas, read, summed = _threaded(rest, products, reads=reads)
+    _own_rows(call, keyed, decayed, operand("keys"), limbs)
+    for tile, name in ((queries, "queries"), (read, "reads")):
+        if tile is not None:
+            plgpu.store(tile, operand(name).astype(tile.dtype), optimized=False)
+    if betas is not None:
+        plgpu.store(betas, call.family.rows_of(beta), optimized=False)
+    mosaic.synced(call.interpret)
+    own_bands(queries, (keyed, decayed), betas, summed, products=products, unit_pairs=call.unit_pairs,
+              reads=read)
+
+
+def _threaded(threaded: list, products: tuple[str, ...], *, reads: bool = False) -> tuple:
+    """`_own_staged`'s by-thread scratch `(queries, betas, reads, bands)`, None where not taken."""
     found = iter(threaded)
     queries = next(found) if "scores" in products else None
     betas = next(found) if "system" in products else None
-    return queries, betas, next(found)
+    read = next(found) if reads else None
+    return queries, betas, read, next(found)
 
 
 def _own_held(call: Call, block: int, outputs: int = 1) -> Held:
