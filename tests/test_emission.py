@@ -906,27 +906,45 @@ def _read_twice(product, z):
     return (product + z) * product
 
 
-@pytest.mark.parametrize("primitive", [lax.div_p, precision.correctly_rounded_divide_p])
-def test_an_fp32_division_issues_a_reciprocal_and_its_refinement(primitive):
-    """An fp32 division on a CUDA target issues a MUFU.RCP beside its refinement, never one instruction as a
-    multiply does: a Mosaic GPU kernel's (`div.full.f32`, with or without `approx_math`) one MUFU, five FMULs
-    and two FSETPs an element; XLA's and a correctly rounded one's (`div.rn.f32`) one MUFU, five FFMAs and an
-    FCHK on its common path (ptxas 13.0's sm90 SASS, FS-DIV-SASS1 and FS-DIV-SASS5); so `a / y` prices above
-    `a * r`, which a reciprocal held already makes of it. An integer division, and a TPU's, unmeasured, stay
-    an operation an element."""
-    row = jax.ShapeDtypeStruct((128,), jnp.float32)
+def test_an_fp32_division_in_a_kernel_issues_a_reciprocal_and_its_refinement():
+    """An fp32 division in a Mosaic GPU kernel issues a MUFU.RCP beside its refinement, never one instruction
+    as a multiply does: `div.full.f32`, with `approx_math` or without, one MUFU, five FMULs and two FSETPs an
+    element (ptxas 13.0's sm90 SASS, FS-DIV-SASS1 and FS-DIV-SASS5), so `a / y` prices above `a * r`, which a
+    reciprocal held already makes of it. XLA's own fp32 division, another width's (fp64's, bf16's) and a
+    TPU's, unmeasured, stay an operation an element, as an integer division does."""
+    hopper, tpu = generation.gpu_target("sm90"), generation.TARGETS["v5e"]
+
+    def priced(dtype, target, forms) -> Work:
+        row = jax.ShapeDtypeStruct((128,), dtype)
+        return emission.operation_work(lax.div_p, [row, row], [row], {}, target, forms=forms)
+
+    for forms in (emission.ACCURATE_FORMS, emission.APPROXIMATE_FORMS):
+        assert priced(jnp.float32, hopper, forms) == Work(exponentials=128, operations=7 * 128)
+        assert priced(jnp.float64, hopper, forms) == priced(jnp.bfloat16, hopper, forms) == Work(
+            operations=128)
+        assert priced(jnp.float32, tpu, forms) == Work(operations=128)
+    assert priced(jnp.float32, hopper, None) == Work(operations=128)
+    assert priced(jnp.int32, hopper, emission.ACCURATE_FORMS) == Work(integer_operations=128)
+
+
+def test_a_correctly_rounded_division_prices_as_it_lowers():
+    """A correctly rounded fp32 division (`precision.correctly_rounded_divide`) prices as each backend lowers
+    it: a Pallas Triton kernel's native `div.rn.f32` (`emission.TRITON_FORMS`), one MUFU beside five FFMAs and
+    an FCHK an element on its common path (FS-DIV-SASS5); XLA's and a Mosaic GPU kernel's its software
+    division (`precision._correctly_rounded_divide`), its significands' and residual's divisions among its
+    bit arithmetic, above a plain division's MUFU and refinement, never one operation an element."""
     hopper = generation.gpu_target("sm90")
-    kernel = Work(exponentials=128, operations=7 * 128)
-    xla = Work(exponentials=128, operations=6 * 128)
-    for forms, expected in ((emission.ACCURATE_FORMS, kernel), (emission.APPROXIMATE_FORMS, kernel),
-                            (None, xla)):
-        if primitive is precision.correctly_rounded_divide_p:
-            expected = xla
-        found = emission.operation_work(primitive, [row, row], [row], {}, hopper, forms=forms)
-        assert found == expected, (forms is None, found)
-    integers = jax.ShapeDtypeStruct((128,), jnp.int32)
-    assert emission.operation_work(lax.div_p, [integers, integers], [integers], {}, hopper) == Work(
-        integer_operations=128)
+    row = jax.ShapeDtypeStruct((128,), jnp.float32)
+
+    def priced(forms) -> Work:
+        return emission.operation_work(precision.correctly_rounded_divide_p, [row, row], [row], {}, hopper,
+                                       forms=forms)
+
+    assert priced(emission.TRITON_FORMS) == Work(exponentials=128, operations=6 * 128)
+    software = priced(emission.ACCURATE_FORMS)
+    plain = emission.operation_work(lax.div_p, [row, row], [row], {}, hopper, forms=emission.ACCURATE_FORMS)
+    assert software.exponentials >= 128 and cost.issued(software) > cost.issued(plain), (software, plain)
+    assert cost.issued(priced(None)) > 128
 
 
 @pytest.mark.parametrize(("body", "fused"), [
