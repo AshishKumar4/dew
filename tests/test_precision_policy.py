@@ -1583,7 +1583,8 @@ def test_an_integral_exponents_float_halves_scale_as_its_integer_halves_bit_for_
     from -300 to 300 and at both infinities, on operands whose half-scaled products round below the least
     normal (a significand of 24 bits at 2^-125) and past the largest, a zero's, an infinity's and a NaN's;
     a NaN `k` (no integer) on a NaN operand, `recurrence_algebra.raised`'s, a NaN; and at a fractional
-    reach, which clipped an integral `k` to a fraction the float halves rounded up (head review e25adf11a)."""
+    reach and one float32 rounds to an integer, the first of which clipped an integral `k` to a fraction the
+    float halves rounded up and the second a floor of took below float32's clip (head review e25adf11a)."""
     from dew.nn.precision import power2
 
     exponents = np.asarray([*range(-300, 301), np.inf, -np.inf], np.float32)
@@ -1601,10 +1602,11 @@ def test_an_integral_exponents_float_halves_scale_as_its_integer_halves_bit_for_
     np.testing.assert_array_equal(found.view(np.uint32)[numbers], expected.view(np.uint32)[numbers])
     nan = np.float32(np.nan)
     assert np.isnan(np.asarray(power2(nan, nan, TWO_FACTOR_REACH, integral=True)))
-    # A fractional reach clips an integral `k` to an integer still: the integer halves' truncation of it.
-    fractional = np.asarray([-3, -2, 2, 3], np.float32)
-    np.testing.assert_array_equal(np.asarray(power2(np.float32(1), fractional, 1.75, integral=True)),
-                                  np.asarray(power2(np.float32(1), fractional, 1.75)))
+    # A fractional reach, and one float32 rounds to an integer, as the integer halves take them.
+    clipped = np.asarray([-3, -2, 2, 3], np.float32)
+    for reach in (1.75, 1.999999999):
+        np.testing.assert_array_equal(np.asarray(power2(np.float32(1), clipped, reach, integral=True)),
+                                      np.asarray(power2(np.float32(1), clipped, reach)), err_msg=str(reach))
 
 
 def test_a_stated_reach_past_two_normal_halves_scales_a_large_operand_exactly():
