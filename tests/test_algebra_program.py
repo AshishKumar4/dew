@@ -1374,20 +1374,32 @@ def test_a_template_walks_span_is_priced_at_its_gpus_kernel_step(generation_name
     assert kernel_cost.walked(kernel_cost.Work(flops=1.0, span=10_000), target) == 10_000 * step > 0
 
 
-def test_a_template_walks_chain_is_priced_at_its_parts_latencies():
-    """A tile walk's dependent path (`Chain`) waits on its products and its warpgroups' barriers, each at the
-    part's measured latency (a GH200's: a waited 64 x N product's fixed seconds and seconds a column, a
-    barrier round trip, M-FS-19): a recurrence chunk step waiting on four products of 128 columns and two
-    round trips costs their sum, where its span alone priced one reduction (row 4123: a states launch's chunk
-    step measured 13 times one)."""
+GH200_LATENCIES = {"product": (20.6e-9, 1.156e-9), "barrier": 85.0e-9, "copy": (464.5e-9, 5.17e-12)}
+"""A GH200's step latencies as M-FS-19 measured them (FS-4123-LATENCIES2-gh200, clock locked at 1.98 GHz,
+two rounds within 0.5%): a waited 64 x N product's fixed seconds and seconds a column, a two-warpgroup
+barrier's round trip, a tile copy's from device memory past an L2 eviction, fixed and a byte."""
+
+
+def test_a_template_walks_chain_is_priced_at_its_parts_measured_latencies():
+    """A tile walk's dependent path (`Chain`) waits on its products, its warpgroups' barriers and its cold
+    tile copies, each at the part's measured latency (M-FS-19's receipt, `GH200_LATENCIES`, independent of
+    the part's own record): a recurrence chunk step waiting on four products of 128 columns and two round
+    trips costs their sum, where its span alone priced one reduction (row 4123: a states launch's chunk step
+    measured 13 times one), and one waiting on a 32 KiB tile copied cold through a ring of one stage the
+    copy's fixed seconds and its slope's (the review of pricing-5 146aadb571f, row 12371)."""
     target = generation.gpu_target("NVIDIA GH200 480GB")
+    (fixed, per_column), barrier = GH200_LATENCIES["product"], GH200_LATENCIES["barrier"]
     chain = kernel_cost.Chain(span=1, products=4, columns=4 * 128, barriers=2)
     chained = kernel_cost.walked(kernel_cost.Work(flops=1.0, chains=(chain,)), target)
     spanned = kernel_cost.walked(kernel_cost.Work(flops=1.0, span=1), target)
-    (fixed, per_column), barrier = target.product_latency, target.barrier_seconds
     expected = target.kernel_step_seconds + 4 * fixed + 512 * per_column + 2 * barrier
     assert_computes_the_oracle(np.float64(chained), np.float64(expected), "the chain's seconds", roundings=8)
     assert chained > 4 * spanned
+    copied, per_byte = GH200_LATENCIES["copy"]
+    cold = kernel_cost.Chain(span=1, products=4, columns=4 * 128, barriers=2, copies=1, copy_bytes=32768)
+    waited = kernel_cost.walked(kernel_cost.Work(flops=1.0, chains=(cold,)), target)
+    assert_computes_the_oracle(np.float64(waited), np.float64(expected + copied + 32768 * per_byte),
+                               "the cold copy's seconds", roundings=8)
 
 
 def test_a_rings_stages_hide_a_tile_copy_its_steps_outlast():

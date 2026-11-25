@@ -1205,18 +1205,48 @@ def test_a_b200s_packed_documents_take_cudnn_only_where_its_receipt_timed_them(t
      {"sys/fs/cgroup/memory/memory.limit_in_bytes": "9223372036854771712",
       "sys/fs/cgroup/memory/outer/inner/memory.limit_in_bytes": "1073741824"}, 1073741824),
     ("0::/system.slice/run.service\n", {"sys/fs/cgroup/memory.max": "3221225472"}, 3221225472),
-], ids=["v2-limiting-parent", "v1-nested", "v2-container"])
+    ("0::/workers/batch \n", {"sys/fs/cgroup/memory.max": "max",
+                               "sys/fs/cgroup/workers/batch /memory.max": "1073741824",
+                               "sys/fs/cgroup/workers/batch/memory.max": "4294967296"}, 1073741824),
+], ids=["v2-limiting-parent", "v1-nested", "v2-container", "v2-name-ending-in-a-space"])
 def test_a_process_is_held_to_its_control_groups_least_memory_limit(tmp_path, groups, limits, least):
     """A CPU call's memory share reads the limits on this process's control groups (`/proc/self/cgroup`),
-    its own group's and every ancestor's (`generation.cgroup_memory_limits`): a parent's tighter limit
-    under cgroup v2, a nested group's under v1's memory controller, and a container's own group, its mount's
-    root, where the group its process names is not mounted."""
+    its own group's and every ancestor's (`_cgroups.memory_limits`): a parent's tighter limit
+    under cgroup v2, a nested group's under v1's memory controller, a container's own group, its mount's
+    root, where the group its process names is not mounted, and a group whose name ends in a space, read as
+    named (the review of toolkit/audit-1800 1ecba10d3)."""
     (tmp_path / "proc/self").mkdir(parents=True)
     (tmp_path / "proc/self/cgroup").write_text(groups)
     for path, limit in limits.items():
         (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / path).write_text(limit + "\n")
-    assert min(generation.cgroup_memory_limits(str(tmp_path))) == least
+    from dew import _cgroups
+
+    assert min(_cgroups.memory_limits(tmp_path / "sys/fs/cgroup", tmp_path / "proc/self/cgroup")) == least
+
+
+def test_a_cgroup_limit_unreadable_as_it_is_read_leaves_the_others(tmp_path):
+    """A process's group's limit that cannot be read (a group removed or made unreadable as the process
+    moves out of it; a file no one may read here) leaves its ancestors' limits read, as the membership file
+    unreadable leaves none, where a CPU call's memory share failed outright (the review of
+    toolkit/audit-1800 1ecba10d3)."""
+    import os
+
+    from dew import _cgroups
+
+    if os.geteuid() == 0:
+        pytest.skip("root reads a file no one may read")
+    membership = tmp_path / "proc/self/cgroup"
+    membership.parent.mkdir(parents=True)
+    membership.write_text("0::/outer/inner\n")
+    (tmp_path / "sys/fs/cgroup/outer/inner").mkdir(parents=True)
+    (tmp_path / "sys/fs/cgroup/outer/memory.max").write_text("2147483648\n")
+    hidden = tmp_path / "sys/fs/cgroup/outer/inner/memory.max"
+    hidden.write_text("1073741824\n")
+    hidden.chmod(0)
+    assert _cgroups.memory_limits(tmp_path / "sys/fs/cgroup", membership) == [2147483648]
+    membership.chmod(0)
+    assert _cgroups.memory_limits(tmp_path / "sys/fs/cgroup", membership) == []
 
 
 @pytest.mark.parametrize("filled", [False, True], ids=["blocks", "filled"])

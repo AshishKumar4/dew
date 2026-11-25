@@ -1627,33 +1627,40 @@ def resident_of(kernel) -> int:
     return max(1, held.min_blocks_per_sm)
 
 
-def launches_seconds(jaxpr: jax_core.Jaxpr, target: generation.GpuTarget, *,
-                     resident: Callable[[jax_core.JaxprEqn], int] = resident_of) -> float | None:
-    """A traced program's native launches priced on `target`, in sequence: each kernel's work as its costed
-    launch counted it (`work_of`), over its programs (`launch_programs`) at the residency its plan gives it
-    (`resident`; its compiled plan's by default, `resident_of`) and the warps it issues over (`warps_of`),
-    through `cost.launch_seconds`,
-    through the calls it makes (`_expanded`); None where any launch's work its emission does not count, or a
-    launch lies under a loop or a branch, whose trips or taken arm no sequence states (the review of
-    lane/toolkit 61dd3c7d2): its price unknown, never 0. What XLA runs beside them is the algebra's to price
-    (`dew.algebra.program.priced`)."""
-    total = 0.0
+def launched_kernels(jaxpr: jax_core.Jaxpr) -> list[tuple[jax_core.JaxprEqn, Launched]] | None:
+    """A traced program's native launches in sequence, through the calls it makes (`_expanded`), each with
+    its costed launch (`Launched`: its work and warps as its emission counted them): the one discovery a
+    planner prices a program's launches by (`launches_seconds`, attention's `price_config`s). None where any
+    launch's work its emission does not count, or a launch lies under a loop or a branch, whose trips or
+    taken arm no sequence states (the review of lane/toolkit 61dd3c7d2): its price unknown, never 0."""
+    found = []
     for equation in jaxpr.eqns:
         if equation.primitive in programs.NATIVE_KERNELS:
-            launched = _LAUNCHED.get(_body(equation))
-            if launched is None:
+            if (launched := _LAUNCHED.get(_body(equation))) is None:
                 return None
-            total += launch_seconds(launched.work, launch_programs(equation), target,
-                                    resident=resident(equation), warps=launched.warps)
+            found.append((equation, launched))
         elif (expanded := _expanded(equation)) is not None:
-            called = launches_seconds(expanded[0], target, resident=resident)
-            if called is None:
+            if (called := launched_kernels(expanded[0])) is None:
                 return None
-            total += called
+            found += called
         elif any(inner.primitive in programs.NATIVE_KERNELS for inner in programs.equations(jaxpr.replace(
                 eqns=[equation]))):
             return None
-    return total
+    return found
+
+
+def launches_seconds(jaxpr: jax_core.Jaxpr, target: generation.GpuTarget, *,
+                     resident: Callable[[jax_core.JaxprEqn], int] = resident_of) -> float | None:
+    """A traced program's native launches (`launched_kernels`) priced on `target`, in sequence: each
+    kernel's work as its costed launch counted it, over its programs (`launch_programs`) at the residency its
+    plan gives it (`resident`; its compiled plan's by default, `resident_of`) and the warps it issues over,
+    through `cost.launch_seconds`; None where `launched_kernels` is. What XLA runs beside them is the
+    algebra's to price (`dew.algebra.program.priced`)."""
+    if (found := launched_kernels(jaxpr)) is None:
+        return None
+    return sum(launch_seconds(launched.work, launch_programs(equation), target, resident=resident(equation),
+                              warps=launched.warps) for equation, launched in found)
+
 
 def work_of(kernel) -> Work | None:
     """A kernel equation's work as its costed launch counted it (`launch_work`), None where no costed launch
