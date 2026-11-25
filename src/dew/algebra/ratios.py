@@ -208,7 +208,8 @@ def _banded_sum(each: Summed, arrays, count: int, rank: int, form: Ratio, dtype)
     """An independent direction's exact dyadic bins, computed once before multiplying other sums."""
     load, chunks = arrays
     info = scaled.format_of(dtype)
-    width = max(1, min(16, info.mantissa - (2 * count * len(each.terms)).bit_length()))
+    capacity = min(jnp.iinfo(jnp.int32).bits - 1, info.mantissa + 1)
+    width = max(1, min(16, capacity - (2 * count * len(each.terms)).bit_length()))
     powers = [(math.frexp(coefficient)[1], len(factors)) for coefficient, factors in each.terms]
     lower = min(exponent - (degree + 2) * info.reach - info.mantissa for exponent, degree in powers)
     upper = max(exponent + (degree + 1) * (info.largest + 2) for exponent, degree in powers)
@@ -225,33 +226,35 @@ def _banded_sum(each: Summed, arrays, count: int, rank: int, form: Ratio, dtype)
 
 def _band_products(products, values, expanded, dtype):
     """Multiply independent sums over their bin combinations, without materializing a sample grid."""
-    plans = [(coefficient, sums, math.prod(expanded[each][0].shape[-1] for each in sums if each in expanded))
+    plans = [(coefficient, sums, math.prod(expanded[each][1] for each in sums if each in expanded),
+              math.prod(expanded[each][0][0].shape[-1] for each in sums if each in expanded))
              for coefficient, sums in products]
-    length = max(steps for _, _, steps in plans)
+    length = max(bound for _, _, _, bound in plans)
     width = chunk_width(length)
+    live_length = functools.reduce(jnp.maximum, [jnp.max(jnp.asarray(steps), initial=0) for _, _, steps, _ in plans])
 
     def block(chunk):
         term = chunk * width + jnp.arange(width, dtype=jnp.int32)
         found = []
-        for coefficient, sums, steps in plans:
+        for coefficient, sums, steps, _ in plans:
             taken = {}
             index = term
             for place, each in enumerate(sums):
                 if each in expanded:
-                    size = expanded[each][0].shape[-1]
-                    index, pos = jnp.divmod(index, size)
-                    taken[place] = tuple(jnp.take(part, pos, axis=-1) for part in expanded[each])
+                    parts, count = expanded[each]
+                    index, pos = jnp.divmod(index, jnp.maximum(count[..., None], 1))
+                    taken[place] = tuple(jnp.take_along_axis(part, pos, axis=-1) for part in parts)
                 else:
                     taken[place] = tuple(part[..., None] for part in values[each])
             hi, lo, exponent = _product_of(coefficient, tuple(taken), taken, dtype)
-            live = (term < steps) & (hi != 0)
+            live = (term < jnp.asarray(steps)[..., None]) & (hi != 0)
             found.append((jnp.where(live, hi, 0), jnp.where(live, lo, 0),
                           jnp.where(live, exponent, windows._NONE)))
         return [jax.lax.optimization_barrier(tuple(found))]
 
-    rank = next(iter(expanded.values()))[0].ndim - 1
-    bits = sum(steps for _, _, steps in plans).bit_length()
-    (value,) = windows._windows(block, -(-length // width), [(rank,)], [bits], dtype)
+    rank = next(iter(expanded.values()))[0][0].ndim - 1
+    bits = sum(bound for _, _, _, bound in plans).bit_length()
+    (value,) = windows._windows(block, (live_length + width - 1) // width, [(rank,)], [bits], dtype)
     return tuple(jnp.squeeze(part, rank) for part in value)
 
 

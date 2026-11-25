@@ -1408,6 +1408,26 @@ def test_chunked_covariance_keeps_both_independent_value_directions(mode):
     np.testing.assert_array_equal(checked(dy, dx), expected)
 
 
+@pytest.mark.parametrize(("rows", "states"), [(0, 4), (1, 65536)])
+def test_mixed_covariance_in_a_constant_direction_is_zero(rows, states):
+    from dew.algebra import moments
+
+    w = jnp.ones((rows, states), jnp.float64)
+    x = jnp.zeros_like(w)
+    dy = x.at[:, 0].set(1.0)
+
+    def mixed(x, dx, dy):
+        def first(y):
+            def covariance(v):
+                return moments.chunked_covariance(v, y, w, tile=16, mode="merge")[2]
+
+            return jax.jvp(covariance, (x,), (dx,))[1]
+
+        return jax.jvp(first, (x,), (dy,))[1]
+
+    np.testing.assert_array_equal(jax.jit(mixed)(x, w, dy), np.zeros((rows,), np.float64))
+
+
 def test_chunked_moments_directed_overflow_mixed_zero_weight_and_direct_jvp():
     """Weight tangents stay finite when `cx * cy` overflows, mixed 2nd derivatives at zero individual and
     all-zero weights match the plain declaration, and direct `derive` forms preserve zero-weight JVP."""

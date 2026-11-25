@@ -47,8 +47,9 @@ def summed(load, chunks: int, *, axis: int, width: int, lower: int, bins: int, d
                 for places, parts in digits(value, exponent):
                     slots, values = (jnp.moveaxis(part, axis, -1) for part in (places, parts))
                     shape = jnp.broadcast_shapes(carry.shape[:-1], slots.shape[:-1])
-                    slots = jnp.broadcast_to(slots, (*shape, slots.shape[-1])).reshape(math.prod(shape), -1)
-                    values = jnp.broadcast_to(values, (*shape, values.shape[-1])).reshape(math.prod(shape), -1)
+                    slots = jnp.broadcast_to(slots, (*shape, slots.shape[-1])).reshape(math.prod(shape), slots.shape[-1])
+                    values = jnp.broadcast_to(values, (*shape, values.shape[-1])).reshape(math.prod(shape),
+                                                                                         values.shape[-1])
                     taken = jnp.broadcast_to(carry, (*shape, bins)).reshape(math.prod(shape), bins)
                     carry = jax.vmap(lambda row, at, digit: row.at[at].add(digit, mode="drop",
                                                                             wrap_negative_indices=False))(
@@ -59,6 +60,17 @@ def summed(load, chunks: int, *, axis: int, width: int, lower: int, bins: int, d
     rows = tuple(size for at, size in enumerate(shape) if at != axis)
     initial = jnp.zeros((*rows, bins), jnp.int32)
     digits = of_chunk(0, initial) if chunks == 1 else jax.lax.fori_loop(0, chunks, of_chunk, initial)
-    held = scaled.scaled(digits.astype(dtype))
-    exponent = held.exponent + jnp.arange(bins, dtype=jnp.int32) * width + lower
-    return held.significand, jnp.zeros_like(held.significand), exponent
+    live = digits != 0
+    positions = jnp.cumsum(live, axis=-1, dtype=jnp.int32)
+    count = positions[..., -1]
+    indices = jnp.where(live, positions - 1, bins)
+    powers = jnp.arange(bins, dtype=jnp.int32) * width + lower
+
+    def compressed(row, index):
+        values = jnp.zeros_like(row).at[index].set(row, mode="drop")
+        exponents = jnp.zeros_like(powers).at[index].set(powers, mode="drop")
+        return values, exponents
+
+    values, exponent = jax.vmap(compressed)(digits.reshape(-1, bins), indices.reshape(-1, bins))
+    held = scaled.scaled(values.reshape(digits.shape).astype(dtype))
+    return (held.significand, jnp.zeros_like(held.significand), held.exponent + exponent.reshape(digits.shape)), count
