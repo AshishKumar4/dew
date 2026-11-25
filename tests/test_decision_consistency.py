@@ -602,9 +602,10 @@ def test_an_input_lm_term_is_the_backbones_own_next_token_loss_over_the_rows_bes
 def test_a_consistency_term_divides_the_groups_answers_at_the_passes_the_loss_weighs():
     """A consistency term over a looped backbone's passes traces the groups' divergence at each pass its loss
     weighs (`DecisionObjective._weighed`): under an exit gate's objective (`exit_entropy`, which weighs no
-    pass's divergence) the last alone, so the term adds to a three-pass loss's program what it adds to a
-    one-pass loss's; under `pass_weights` each of the three. Every pass's was traced under `exit_entropy`
-    and two of them dropped unread (row 12866)."""
+    pass's divergence) the last alone, so the term adds to a three-pass loss's program the group sums
+    (`categorical.group_divergence`'s segment sums, a scatter-add each) it adds to a one-pass loss's; under
+    `pass_weights` three times those. Every pass's was traced under `exit_entropy` and two of them dropped
+    unread (row 12866)."""
     from reference_error import equations
 
     from dew.nn.backbones.decoder_stack import Loop
@@ -613,7 +614,7 @@ def test_a_consistency_term_divides_the_groups_answers_at_the_passes_the_loss_we
     step = Step(jnp.asarray(0), jax.random.key(1), None)
 
     def added(steps: int, **weighing) -> int:
-        """The operations the consistency term adds to a loss over a loop of `steps` passes."""
+        """The group sums the consistency term adds to a loss over a loop of `steps` passes."""
         backbone = tiny_backbone().clone(max_seq_len=LAYOUT.max_len,
                                          loop=Loop(steps=steps, exit_gate="exit_entropy" in weighing))
         counted = []
@@ -627,12 +628,13 @@ def test_a_consistency_term_divides_the_groups_answers_at_the_passes_the_loss_we
             def loss(variables, objective=objective, batch=batch):
                 return objective.loss(variables, batch, step)
             graph = jax.make_jaxpr(loss)(objective.init(jax.random.key(0)))
-            counted.append(sum(1 for _ in equations(graph)))
+            counted.append(sum(1 for equation in equations(graph)
+                               if equation.primitive.name == "scatter-add"))
         return counted[1] - counted[0]
 
     once = added(1, exit_entropy=0.1)
-    assert added(3, exit_entropy=0.1) == once
-    assert added(3, pass_weights=(0.2, 0.3, 0.5)) > once
+    assert once and added(3, exit_entropy=0.1) == once
+    assert added(3, pass_weights=(0.2, 0.3, 0.5)) == 3 * once
 
 
 @attending("xla")
