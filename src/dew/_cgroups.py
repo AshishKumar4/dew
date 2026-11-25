@@ -150,11 +150,12 @@ controller's (`memory.usage_in_bytes`, which counts every descendant's as its `t
 
 def memory_held(level: Path) -> int | None:
     """The bytes `level` holds that its kernel will not reclaim first: its charge (`CHARGES`: v2's or v1's)
-    less the inactive page cache in it, as the kubelet counts a container's working set; None where it states
-    no charge, or its charge cannot be read (`_read`)."""
+    less the inactive page cache in it, as the kubelet counts a container's working set, none where the cache
+    read after the charge is past it (v1's charge is approximate; cAdvisor's floor); None where it states no
+    charge, or its charge cannot be read (`_read`)."""
     for charge, inactive in CHARGES.items():
         if (current := _read(level / charge)) is not None:
             stated = [line.split() for line in (_read(level / "memory.stat") or "").splitlines()]
             reclaimed = next((int(value) for name, value in stated if name == inactive), 0)
-            return int(current) - reclaimed
+            return max(0, int(current) - reclaimed)
     return None
