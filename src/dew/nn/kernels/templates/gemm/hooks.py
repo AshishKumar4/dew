@@ -262,3 +262,35 @@ def read_out(family, part: tuple[int, int], dtypes: tuple, forms: tuple, staging
     local = functools.partial(column_local, epilogue, accumulators, sides, *part)
     return ReadOut(narrowed, pricing.hook_chunk(family, part[0], part[1], dtypes, forms, staging,
                                                 local=local))
+
+
+def lowering_rules(target) -> dict:
+    """The rules a hook's operations need on `target`'s Mosaic launches: a TPU core's TensorCore rules; a
+    GPU's at warpgroup semantics."""
+    if generation.tpu(target):
+        return mosaic_tpu_lowering.lowering_rules[tpu_core.CoreType.TC]
+    return mosaic_gpu_lowering.mosaic_lowering_rules[plgpu_core.WGxWG_SEMANTICS]
+
+
+def hook_lowers(hook, tiles: tuple, target) -> bool:
+    """Whether `target`'s Mosaic launches take `hook` on `tiles` (`_lowers`, `lowering_rules`): a caller's
+    hook asked before it is bound to a launch (`dew.nn.gated_mlp`'s gated product)."""
+    dtype = tiles[0].dtype if tiles else jnp.bfloat16
+    return _lowers(hook, tiles, (), lowering_rules(target), layout=_epilogue_layout(dtype, target))
+
+
+def hooks_lower(ba, dtype, target) -> bool:
+    """Whether `target`'s Mosaic launches take a bound launch's hooks (`_lowers`, `lowering_rules`), traced on
+    128-wide tiles: the primitives a hook makes do not depend on its tile's extents."""
+    rules = lowering_rules(target)
+    hooks = ba.arguments['hooks']
+
+    def tiles(name, axes_of):
+        return [jax.ShapeDtypeStruct((128,) * len(axes), side.dtype)
+                for side, axes in zip(ba.arguments.get(name, ()), axes_of, strict=True)]
+
+    return (_lowers(hooks.before(), (jax.ShapeDtypeStruct((128, 128), dtype),),
+                    tiles('prologue_operands', hooks.prologue_axes), rules, layout=None)
+            and _lowers(hooks.after(), (jax.ShapeDtypeStruct((128, 128), jnp.float32),) * hooks.accumulators,
+                        tiles('epilogue_operands', hooks.epilogue_axes), rules,
+                        layout=_epilogue_layout(dtype, target)))
