@@ -229,6 +229,32 @@ def test_the_gradients_are_transformers(source, loaded, tokens):
         assert np.abs(np.asarray(grads[name]) - expected).max() <= GRADIENT * np.abs(expected).max(), name
 
 
+def test_a_recomputed_step_recomputes_each_layer_and_its_gradients_are_transformers(source, loaded, tokens):
+    """With `remat`, a step's backward recomputes each of the source's decoder layers from its inputs
+    (one `jax.checkpoint` a layer in the step's program), and its gradients are torch autograd's of
+    transformers' own loss as the step without it are; its record names its rung, and the ladder climbs no
+    further."""
+    _, model = source
+    recomputed = dataclasses.replace(loaded, model=loaded.model.clone(remat=True))
+    assert loaded.model.recompute_more() == recomputed.model and recomputed.model.recompute_more() is None
+    assert loaded.model.restore_recompute(recomputed.model.recompute_record()) == recomputed.model
+    objective = LMObjective(recomputed, seq_len=SEQ, ema_decay=None)
+    params = {name: jnp.asarray(leaf) for name, leaf in loaded.variables["params"].items()}
+
+    def loss(params):
+        return objective_loss(objective, {**loaded.variables, "params": params}, tokens, scalar=True)
+    program = jax.make_jaxpr(jax.grad(loss))(params)
+    checkpoints = [eqn for eqn in equations(program) if eqn.primitive.name == "checkpoint"]
+    assert len(checkpoints) == TINY["num_hidden_layers"], len(checkpoints)
+    ids = torch.from_numpy(tokens.astype(np.int64))
+    model.zero_grad()
+    model(ids, labels=ids).loss.backward()
+    grads = jax.grad(loss)(params)
+    for name, parameter in model.named_parameters():
+        expected = parameter.grad.numpy()
+        assert np.abs(np.asarray(grads[name]) - expected).max() <= GRADIENT * np.abs(expected).max(), name
+
+
 @pytest.mark.mesh
 def test_trainer_steps_move_the_params_and_place_them_by_name(loaded, tokens):
     """AdamW through the Trainer on a fsdp x tensor mesh: the loss falls,

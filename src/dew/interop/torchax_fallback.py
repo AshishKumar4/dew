@@ -36,7 +36,7 @@ import inspect
 import json
 import math
 import warnings
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from types import FunctionType
@@ -51,6 +51,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.extend.core import Literal, primitives
 
 from dew import _records
+from dew._records import JSON
 from dew.batch import COORDINATES_FIELD, Coordinates, Variables, real_slots, token_coordinates
 from dew.distributed.placement import Layout
 from dew.interop import sources, verify
@@ -817,17 +818,20 @@ def _dew_experts(module, hidden_states, top_k_index, top_k_weights):
     (`gate_up_proj` `[E, 2I, D]`, or `[E, D, 2I]` transposed) and down projection read as Dew's `[E, in,
     out]` kernels; an index past its experts (an expert-parallel sentinel, whose weight transformers zeroes)
     no slot. A module whose experts Dew's gated product does not compute (biased, ungated, interleaved, a
-    gate of its own, an activation Dew gates by none) runs transformers' batched products. A program of its
+    gate of its own, an activation Dew gates by none), or one run in torch outside the trace, runs
+    transformers' batched products. A program of its
     own, attested token by token (`sequence_causality.TOKENWISE`): its dispatch sorts the tokens by expert,
     and each token's output reads its own input alone."""
+    import torchax
     from torchax.interop import jax_view, torch_view
     from transformers.integrations.moe import _default_apply_gate, batched_mm_experts_forward
 
     from dew.interop.parts import Ambiguous, gated_activation
 
     gate = inspect.getattr_static(type(module), "_apply_gate", None)
-    plain = (module.has_gate and not module.has_bias and module.is_concatenated
-             and gate is _default_apply_gate)
+    # Torch's own tensors (a load's probe runs the model in torch) take transformers' products.
+    plain = (isinstance(hidden_states, torchax.tensor.Tensor) and module.has_gate and not module.has_bias
+             and module.is_concatenated and gate is _default_apply_gate)
     try:
         activation = gated_activation(module.act_fn) if plain else None
     except Ambiguous:
@@ -1036,7 +1040,8 @@ class TorchGraph:
                  tokens: jax.Array, *, train: bool, key: jax.Array | None = None,
                  precision: jax.lax.PrecisionLike = None, laid: Coordinates | None = None,
                  visible: jax.Array | None = None, key_places: jax.Array | None = None,
-                 head_input: jax.Array | None = None) -> tuple[jax.Array, jax.Array]:
+                 head_input: jax.Array | None = None,
+                 recomputed: bool = False) -> tuple[jax.Array, jax.Array]:
         """The logits and the output head's input states for `tokens`, in Dew's torchax
         environment (`_environment`), every product at `precision` (`configured_precision`):
         torch's operators state none. Each broadcast of a value narrower than fp32 sums
@@ -1046,14 +1051,15 @@ class TorchGraph:
         given, is what each token sees in their place, and `key_places` `[B, S]` the keys' positions a
         window counts (`_Attending`). `head_input`, where
         given, is the output head's input in place of the states the forward computes, so the
-        logits are the head's over it, every step the forward takes after the head included."""
+        logits are the head's over it, every step the forward takes after the head included. `recomputed`
+        recomputes each decoder layer in the backward (`TorchCausalLM.remat`)."""
         documents, max_segments = _documents(laid)
         positions = None if laid is None else laid.places()
         valid = None if laid is None or laid.valid is None else jnp.asarray(laid.valid, bool)
         arguments = (dict(params), dict(buffers), tokens, key, positions, documents, valid, visible,
                      key_places, head_input, None, None)
         (logits, hidden), _ = self._run(arguments, train=train, precision=precision,
-                                        max_segments=max_segments)
+                                        max_segments=max_segments, recomputed=recomputed)
         return logits, hidden
 
     def step(self, params: Mapping[str, jax.Array], buffers: Mapping[str, jax.Array], tokens: jax.Array, *,
@@ -1069,12 +1075,14 @@ class TorchGraph:
              (dict(cache), slots, filled), reach), train=False, precision=precision, max_segments=1)
         return logits, written
 
-    def _run(self, arguments: tuple, *, train: bool, precision: jax.lax.PrecisionLike, max_segments: int):
+    def _run(self, arguments: tuple, *, train: bool, precision: jax.lax.PrecisionLike, max_segments: int,
+             recomputed: bool = False):
+        layers: list = []
         traced, shapes, draws = self.traced(*arguments, train=train, precision=precision,
-                                            max_segments=max_segments)
+                                            max_segments=max_segments, layers=layers if recomputed else None)
         self.certify(traced, arguments, train=train, max_segments=max_segments)
         outputs = jax.tree.unflatten(jax.tree.structure(shapes),
-                                     _accumulating(traced, *jax.tree.leaves(arguments)))
+                                     _accumulating(traced, *jax.tree.leaves(arguments), recomputed=layers))
         key = arguments[3]
         if draws.host:
             raise ValueError(
@@ -1110,11 +1118,12 @@ class TorchGraph:
                valid: jax.typing.ArrayLike | None = None, visible: jax.typing.ArrayLike | None = None,
                key_places: jax.typing.ArrayLike | None = None, head_input: jax.typing.ArrayLike | None = None,
                cache: tuple | None = None, reach: jax.typing.ArrayLike | None = None, *, train: bool,
-               precision: jax.lax.PrecisionLike = None, max_segments: int = 1):
+               precision: jax.lax.PrecisionLike = None, max_segments: int = 1, layers: list | None = None):
         """The forward over these arguments traced once (`jax.make_jaxpr`), its output shapes, and the
         draws it made (`_Draws`): on torchax's device, a key's, or on the host, fixed by the trace. Its
         outputs are the forward's and, for a decoding call (`cache`, the held caches, slots and filled
-        slots of `_Cached`), every layer's cache after it."""
+        slots of `_Cached`), every layer's cache after it. Where `layers` is given, each decoder layer
+        traces as a program of its own, which `layers` takes (`_layers_apart`)."""
         env = _environment()
         draws = _Draws()
 
@@ -1128,9 +1137,11 @@ class TorchGraph:
                 _Attending(chosen_attention(), documents, valid, max_segments, train, key, visible,
                            positions, key_places, cached)))
             self.module.train(train)
+            apart = (contextlib.nullcontext() if layers is None
+                     else _layers_apart(self.module._model, env, draws, layers))
             try:
                 with (env, env.override_property(prng=key) if key is not None else contextlib.nullcontext(),
-                      draws, attending, _reaching(reach)):
+                      draws, attending, _reaching(reach), apart):
                     outputs = env.t2j_iso(self.module.functional_call(_forward, *arguments))
             finally:
                 self.module.eval()
@@ -1249,7 +1260,7 @@ def _at_opmath(env, lowering, keeps_fp32: tuple[int, str] | None):
     return computed
 
 
-def _accumulating(closed: Jaxpr, *arguments: jax.Array) -> list[jax.Array]:
+def _accumulating(closed: Jaxpr, *arguments: jax.Array, recomputed: Sequence[Jaxpr] = ()) -> list[jax.Array]:
     """`closed` evaluated on `arguments` with each broadcast of a floating value
     narrower than fp32 summing its gradient in fp32 (`dew.nn.precision.broadcast_summed`): an explicit
     `broadcast_in_dim`, and the size-1 dimensions an elementwise operation
@@ -1275,7 +1286,10 @@ def _accumulating(closed: Jaxpr, *arguments: jax.Array) -> list[jax.Array]:
             for var in equation.invars:
                 if not isinstance(var, Literal) and last[var] == index and var not in kept:
                     held.pop(var, None)
-            if (inner := purely_called(equation)) is not None:
+            if (inner := purely_called(equation)) is not None and any(inner is layer for layer in recomputed):
+                # A decoder layer a step recomputes in its backward (`TorchCausalLM.remat`).
+                outputs = jax.checkpoint(functools.partial(_evaluated, evaluate, inner))(*inputs)
+            elif inner is not None:
                 outputs = evaluate(inner.jaxpr, inner.consts, inputs)
             elif equation.primitive is primitives.broadcast_in_dim_p and _narrow_float(inputs[0]):
                 outputs = [broadcast_summed(inputs[0], tuple(equation.params["shape"]),
@@ -1297,6 +1311,56 @@ def _accumulating(closed: Jaxpr, *arguments: jax.Array) -> list[jax.Array]:
         return [read(var) for var in jaxpr.outvars]
 
     return evaluate(closed.jaxpr, closed.consts, arguments)
+
+
+def _evaluated(evaluate, inner: Jaxpr, *inputs: jax.Array) -> list[jax.Array]:
+    """`inner` evaluated over `inputs` by `evaluate` (`_accumulating`'s), as a function `jax.checkpoint`
+    recomputes."""
+    return evaluate(inner.jaxpr, inner.consts, inputs)
+
+
+@contextlib.contextmanager
+def _layers_apart(model, env, draws, layers: list) -> Iterator[None]:
+    """Each of `model`'s decoder layers (its decoder's `layers`), while it traces, as a program of its own
+    over its tensor arguments (`dew.nn.nested.nested`), each program `layers` takes: what `_accumulating`
+    recomputes in a step's backward (`TorchCausalLM.remat`). A layer that draws (its dropout) is refused:
+    its program would hold the draw's key, which torchax carries past it."""
+    import torch
+    from torch.utils import _pytree
+
+    from dew.nn.nested import nested
+
+    held = model.get_decoder()
+    if not isinstance(stack := getattr(held, 'layers', None), torch.nn.ModuleList):
+        raise ValueError(f"tier 3 recomputes a source's decoder layers, and {type(held).__name__} holds no "
+                         "`layers` list")
+
+    def apart(forward):
+        def call(*args, **kwargs):
+            leaves, structure = _pytree.tree_flatten((args, kwargs))
+            tensors = [index for index, leaf in enumerate(leaves) if isinstance(leaf, torch.Tensor)]
+
+            def run(*values):
+                given = list(leaves)
+                for index, value in zip(tensors, values, strict=True):
+                    given[index] = env.j2t_iso(value)
+                args, kwargs = _pytree.tree_unflatten(given, structure)
+                return env.t2j_iso(forward(*args, **kwargs))
+            drawn = draws.device
+            out = nested(run, traced=layers.append)(*(env.t2j_iso(leaves[index]) for index in tensors))
+            if draws.device != drawn:
+                raise ValueError("tier 3 recomputes each decoder layer from its inputs, and this source's "
+                                 "layers draw (dropout): set its rates to 0, or train it unrecomputed")
+            return env.j2t_iso(out)
+        return call
+
+    for layer in stack:
+        layer.forward = apart(layer.forward)
+    try:
+        yield
+    finally:
+        for layer in stack:
+            del layer.forward
 
 
 _BROADCASTING = frozenset((primitives.add_p, primitives.sub_p, primitives.mul_p, primitives.div_p,
@@ -1383,6 +1447,26 @@ class TorchCausalLM(nn.Module):
     rebuild: int | None = None
     """The position past which cached keys go stale, LongRoPE's original context, where the source's
     rotary switches tables there (`functional_rotaries`), or None (`Serving.cache_rebuild_position`)."""
+    remat: bool = False
+    """Each of the source's decoder layers (its decoder's `layers`) recomputed in a training step's
+    backward from its inputs alone (`jax.checkpoint` over the layer's own program, `_layers_apart`),
+    keeping nothing inside it: `REMAT_POLICIES['full']`. torch's code marks none of the residuals a
+    named policy keeps, so this is the one rung a tier-3 model climbs (`recompute_more`)."""
+
+    @nn.nowrap
+    def recompute_record(self) -> JSON:
+        return {'remat': self.remat}
+
+    @nn.nowrap
+    def recompute_more(self) -> Self | None:
+        """Its layers recomputed (`remat`) where they are not, else None: the ladder's one rung."""
+        return None if self.remat else self.clone(remat=True)
+
+    @nn.nowrap
+    def restore_recompute(self, record: JSON) -> Self:
+        """Its layers recomputed where `record` (`recompute_record`'s) says the run's were."""
+        held = _records.record(record, 'recompute')
+        return self.clone(remat=True) if bool(held.get('remat')) and not self.remat else self
 
     def bank_sites(self, store: Variables) -> tuple[DecoderBank, ...]:
         return ()
@@ -1593,7 +1677,7 @@ class TorchCausalLM(nn.Module):
         key = self.make_rng("dropout") if train and self.has_rng("dropout") else None
         return self.graph(params, buffers, jnp.asarray(tokens), train=train, key=key,
                           precision=self._products(compute), laid=laid, visible=visible,
-                          key_places=key_places, head_input=head_input)
+                          key_places=key_places, head_input=head_input, recomputed=self.remat and train)
 
     def _operands(self, held) -> tuple[dict[str, jax.Array], dict[str, jax.Array], Dtype]:
         """The forward's parameters at `dtype`, its buffers, and the dtype its products take: `dtype`, or
