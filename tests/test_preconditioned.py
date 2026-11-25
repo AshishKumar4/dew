@@ -8,6 +8,7 @@ saturates. A 16-bit call carries fla's own roundings, which no walk runs: it is 
 (row 12696's recorded arm)."""
 
 import dataclasses
+import functools
 
 import jax
 import jax.numpy as jnp
@@ -24,6 +25,8 @@ from dew.nn.kernels.preconditioned import (
     preconditioned_keys,
     preconditioned_step,
 )
+from dew.nn.kernels.recurrence import Hooks
+from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop_backward, template
 from dew.nn.kernels.templates.recurrence.mainloop import Tiles
 from dew.nn.precision import l2norm
@@ -215,6 +218,42 @@ def test_a_read_erase_on_the_mainloop_is_as_exact_as_its_recurrence_a_token_at_a
     in fp32 from float64 (check 1)."""
     assert_as_exact(jax.jit(on_the_mainloop), jax.jit(read_erased_with_gradients), read_erase_operands,
                     "a read erase on the mainloop", seeds=SEEDS)
+
+
+def read_erased_on_the_template(query, key, value, log_decay, beta, state, reads, *, group: int = 1):
+    """The chunked op's delta rule erasing along `reads` (`recurrence.Hooks.erase` 'read') on the recurrence
+    template under the run's fast forms at an H100's facts, its queries, keys and reads repeated `group`
+    times over their heads first (each value head a key head of its own where `group` is the call's)."""
+    query, key, reads = (jnp.repeat(x, group, axis=2) for x in (query, key, reads))
+    hooks = Hooks(decay='scalar', erase='read', scale=query.shape[-1] ** -0.5)
+    fast = dataclasses.replace(generation.numerics(), forms='fast')
+    with (generation.assumed("sm90" if INTERPRETED else None, interpreted=INTERPRETED),
+          generation.run_precision(fast), generation.chosen(gated_delta_rule="mosaic_gpu")):
+        return chunk(hooks, Chunk(query, key, value, log_decay=log_decay, beta=beta, erase_read=reads,
+                                  state=state))
+
+
+def sixteen_bit_read_erase(seed):
+    """`read_erase_operands`' draw of a seed as a 16-bit call takes it: its queries, keys, values, reads and
+    the output's cotangent bf16."""
+    q, k, v, g, beta, state, reads, d_out, d_final = read_erase_operands(seed)
+    q, k, v, reads, d_out = (x.astype(jnp.bfloat16) for x in (q, k, v, reads, d_out))
+    return q, k, v, g, beta, state, reads, (d_out, d_final)
+
+
+def test_a_grouped_read_erase_on_the_template_is_as_exact_as_its_heads_apart():
+    """A 16-bit delta rule erasing along reads of its own through the chunked op on the template, its keys
+    and reads a key head's over two value heads each (`TEMPLATED`), on par from float64 with the same call
+    whose keys and reads are repeated a value head's each before it (check 1, the truth its recurrence a
+    token at a time): its output, final memory and every operand's gradient, the key heads' summed over
+    their value heads by the repeat's own derivative. A value head reading another key head's keys or
+    reads, or a gradient summed onto the wrong key head, moves its leaves far past the repeated call's,
+    whose arithmetic is the grouped call's (head review of 410aee86f)."""
+    group = TEMPLATED[3] // TEMPLATED[2]
+    assert_as_exact(jax.jit(with_gradients(read_erased_on_the_template)),
+                    jax.jit(with_gradients(functools.partial(read_erased_on_the_template, group=group))),
+                    sixteen_bit_read_erase, "a grouped read erase on the template", seeds=SEEDS,
+                    truth_fn=jax.jit(with_gradients(read_erased)))
 
 
 @pytest.mark.parametrize(('per_key', 'kernel', 'taken'), [(False, 'mosaic_gpu', 'mosaic_gpu'),
