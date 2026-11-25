@@ -20,11 +20,11 @@ from jax.sharding import PartitionSpec
 from dew.algebra import scaled
 from dew.algebra.windows import (
     Units,
+    _NONE,
     _arrays,
     _factor_values,
     _laid_to,
     _landed,
-    _NONE,
     _quotient,
     _quotients_summed,
     _raised,
@@ -56,6 +56,8 @@ class Ratio:
     `Summed`), its `numerator` then none: a derivative's whose denominator moves, `(dP D - q P dD) / D^(q+1)`
     (`_ratio_jvp`), each sum formed once, unlanded, so no quotient is landed apart from the terms it cancels
     against (the merge P0's base review 9, F2: a landed quotient of 2^-156 lost the derivative's -2^-66).
+    Where join_directions is set, the derivative sums terms carrying a direction before reducing over
+    states, so cancellation within a stationary coefficient cannot erase another state's direction.
     A zero lands as +0. A value (`scaled._valued`)."""
 
     numerator: tuple

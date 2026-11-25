@@ -1363,6 +1363,17 @@ def test_chunked_covariance_retains_small_value_tangent(mode):
     np.testing.assert_array_equal(tangent, [0.25])
 
 
+@pytest.mark.parametrize("mode", ["walk", "merge"])
+def test_a_stationary_weight_direction_cannot_erase_another_samples_tangent(mode):
+    from dew.algebra import moments
+
+    x = jnp.asarray([[-1.0, 1.0, 0.0]], jnp.float32)
+    w = jnp.asarray([[0.5, 0.5, 0.0]], jnp.float32)
+    dw = jnp.asarray([[2.0 ** 125, 0.0, 2.0 ** -40]], jnp.float32)
+    _, tangent = jax.jvp(lambda q: moments.chunked_moments(x, q, tile=1, mode=mode)[1], (w,), (dw,))
+    np.testing.assert_array_equal(tangent, [-2.0 ** -40])
+
+
 def test_chunked_moments_directed_overflow_mixed_zero_weight_and_direct_jvp():
     """Weight tangents stay finite when `cx * cy` overflows, mixed 2nd derivatives at zero individual and
     all-zero weights match the plain declaration, and direct `derive` forms preserve zero-weight JVP."""
