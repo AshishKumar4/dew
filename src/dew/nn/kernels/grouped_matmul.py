@@ -1092,7 +1092,8 @@ class MosaicGmm(_Mosaic):
             # A decode step's partials hold its rows, a TMA descriptor's whole 8s of them.
             held=-(-rows // row_tiles.TMA_ROWS) * row_tiles.TMA_ROWS,
             operands=self._operand_bytes(ba, tile), stored=_stored_bytes(ba, rows, width),
-            multiprocessors=_multiprocessors(target), partial_bytes=self._slice_bytes(ba, tile, target))
+            multiprocessors=_multiprocessors(target), issued=ba.arguments['tokens'].dtype,
+            partial_bytes=self._slice_bytes(ba, tile, target))
 
     def _slice_bytes(self, ba, config: tiling.Tiles, target) -> int:
         """One depth slice's fp32 partials as a split launch at `config` declares them

@@ -1079,12 +1079,12 @@ def test_a_step_is_priced_at_the_longer_of_its_products_and_its_shared_traffic()
     def per_flop(tiles, target):
         family = pricing.family_of(tiles, jnp.bfloat16)
         flops = 2 * tiles.block_m * pricing.tile_columns(tiles, family) * tiles.block_k
-        return pricing.step_seconds(tiles, target, (2, 2)) / flops
+        return pricing.step_seconds(tiles, target, (2, 2), issued=jnp.bfloat16) / flops
 
     assert per_flop(pair, b200) < per_flop(one_cta, b200)
     cooperative = tiling.Tiles(128, 256, 64, 4, 8, warpgroups=2, family="wgmma")
     tensor = cost.rates(h100, device=False).tensor
-    assert pricing.step_seconds(cooperative, h100, (2, 2)) == 2 * 128 * 256 * 64 / tensor
+    assert pricing.step_seconds(cooperative, h100, (2, 2), issued=jnp.bfloat16) == 2 * 128 * 256 * 64 / tensor
     walk = pricing.split_walk(pair, groups=1, rows=24576, depth=9216, width=2560, itemsizes=(2, 2), stored=2,
                                  multiprocessors=148, step_seconds=1.0, bandwidth=1.0, launch_seconds=None)
     assert walk.output * pair.block_m * 2 * pair.block_n == 9216 * 2560
@@ -1137,10 +1137,10 @@ def test_a_kernel_gradients_tail_is_priced_in_its_parts_steps_whatever_multiproc
     times too short)."""
     h100 = generation.gpu_target("sm90")
     few, more = (dataclasses.replace(h100, multiprocessors=count) for count in (8, 64))
-    assert (pricing.step_seconds(COOPERATIVE, few, (2, 2))
-            == pricing.step_seconds(COOPERATIVE, more, (2, 2)))
-    assert (pricing.handoff_steps(COOPERATIVE, few, (2, 2))
-            == pricing.handoff_steps(COOPERATIVE, more, (2, 2)))
+    assert (pricing.step_seconds(COOPERATIVE, few, (2, 2), issued=jnp.bfloat16)
+            == pricing.step_seconds(COOPERATIVE, more, (2, 2), issued=jnp.bfloat16))
+    assert (pricing.handoff_steps(COOPERATIVE, few, (2, 2), issued=jnp.bfloat16)
+            == pricing.handoff_steps(COOPERATIVE, more, (2, 2), issued=jnp.bfloat16))
     for steps in (2, 4, 16, 64):
         decided = {pricing.balanced_tail(COOPERATIVE, (1, 11), steps, (2, 2), target, 8) is not None
                    for target in (few, more)}

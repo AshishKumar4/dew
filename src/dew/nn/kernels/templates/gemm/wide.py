@@ -98,7 +98,7 @@ class Gated:
 
 
 def gated_product(rows: jax.Array, wide: jax.Array, hook: Callable, *, out_dtype, saved: bool = False,
-                  name: str = "gate_up", precision=None, interpret_on_cpu: bool = False) -> jax.Array:
+                  name: str | None = "gate_up", precision=None, interpret_on_cpu: bool = False) -> jax.Array:
     """`rows` (`[tokens, in]`) through a gated MLP's gate and up projections held as one wide matrix (`[in, 2
     * hidden]`, their columns interleaved a `GROUP` at a time, `interleaved`): one product, one accumulator,
     whose epilogue writes their gated product `hook(gate, up)` alone (`[tokens, hidden]` in `out_dtype`, each
@@ -106,7 +106,8 @@ def gated_product(rows: jax.Array, wide: jax.Array, hook: Callable, *, out_dtype
     `activations.gated_hook`), half its tile's width (`Gated`; formulation (C),
     docs/design/kernel-templates.md §3). `saved`: the rounded wide product (`[tokens, 2 * hidden]`, gate and
     up interleaved) stored too where a derivative is taken, never returned (`Gated.residuals`), the reverse
-    pass's residual under `name` (`gemm.gemm`'s `named`, a remat policy's label), from which it forms the
+    pass's residual under `name` (`gemm.gemm`'s `named`, a remat policy's label; None, unlabelled), from which
+    it forms the
     gate's and up's cotangents (the hook's VJP) for one input gradient and one kernel gradient of the wide
     matrix; an inference's launch stores the gated product alone. Unsaved, the reverse pass forms the
     product again.

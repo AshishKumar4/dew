@@ -51,13 +51,14 @@ def _local_contraction(lhs, lhs_axis: int, rhs, rhs_axis: int) -> bool:
 
 def direct_dtype(lhs, lhs_axis: int, rhs, rhs_axis: int, out_dtype, precision: PrecisionLike, wide):
     """Output dtype for a primal-only CUDA dense XLA dot (`xla_mainloop`, `_gemm_t`, row 12898): bfloat16
-    directly when both operands and output are bfloat16, neither the call nor `jax_default_matmul_precision`
-    asks for an explicit dot algorithm (`_PLAIN_PRECISIONS`), and the contraction is local to each device
-    (`_local_contraction`, so no SPMD partials are rounded before their reduction). cuBLASLt accumulates bf16
-    products in fp32 and rounds once in its epilogue without writing an fp32 temporary or trailing convert
-    that breaks downstream reduction fusion: XLA's own dense bf16 dot (Dense's), the reference's arithmetic.
-    A product of one row or column stays `wide`: XLA reduces it as a vector, its products rounded to the
-    dot's dtype before their sum (`DotStrengthReduction`). `wide` otherwise."""
+    directly, XLA's own dense bf16 dot (Dense's, the reference's arithmetic, owner 11-25), where both operands
+    and the output are bfloat16, neither the call nor `jax_default_matmul_precision` asks for an explicit dot
+    algorithm (`_PLAIN_PRECISIONS`), and no partitioning the trace sees splits the contraction
+    (`_local_contraction`): cuBLASLt then accumulates in fp32 and stores bf16, no fp32 temporary or trailing
+    convert breaking a downstream reduction's fusion, with whatever the reference's own dot does past that (a
+    split only lowering applies, cuBLASLt's split-K reduction). A product of one row or column stays `wide`:
+    XLA reduces it as a vector, its products rounded to the dot's dtype before their sum. Every derivative's
+    tangent (`portable`) keeps the fp32 product and its one rounding; `wide` otherwise."""
     if (jnp.dtype(lhs.dtype) == jnp.bfloat16 and jnp.dtype(rhs.dtype) == jnp.bfloat16
             and jnp.dtype(out_dtype) == jnp.bfloat16
             and math.prod(lhs.shape[:lhs_axis] + lhs.shape[lhs_axis + 1:]) > 1

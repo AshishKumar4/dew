@@ -98,9 +98,9 @@ def kept_outputs(named: tuple, residuals: int = 0) -> tuple[int, ...]:
 
 
 def held_outputs(out, named: tuple, several: bool, residuals: int = 0) -> tuple:
-    """`gemm`'s forward's outputs `out` (several, or one) and what it saves (`kept_outputs`): each output `named`
-    names a residual under its name, the one array the output and the residual are; the first `residuals`
-    (`Residualized`'s) saved, named or not, and never returned."""
+    """`gemm`'s forward's outputs `out` (several, or one) and what it saves (`kept_outputs`): each output
+    `named` names a residual under its name, the one array the output and the residual are; the first
+    `residuals` (`Residualized`'s) saved, named or not, and never returned."""
     outs = list(out if several else (out,))
     names = tuple(named) + (None,) * (len(outs) - len(named))
     outs = [checkpoint_name(each, name) if name is not None else each

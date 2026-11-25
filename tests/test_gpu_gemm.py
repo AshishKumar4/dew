@@ -55,6 +55,7 @@ import numpy as np
 import pytest
 import syrk_matrix
 import test_contracts_gemm as contracts_gemm
+import test_declared_cells_memory as declared_cells_memory
 import test_fed_walks as fed_walks
 import test_gemm_blockwise as gemm_blockwise
 import test_gemm_gather as gemm_gather
@@ -229,6 +230,12 @@ def _syrk_and_tail_cells():
         Cell("an XLA fallback's dense bf16 product holds check 1 against XLA's own dot",
              an_xla_fallbacks_dense_bf16_product_holds_check_1_against_xlas_own_dot, "sm90",
              fault=CUBLAS_BF16, native={"launch": "xla fallback", "pass": "forward"}),
+        *(Cell(f"an XLA fallback's {product} tangent sums its terms before rounding",
+               functools.partial(
+                   declared_cells_memory.a_dense_bf16_products_tangent_sums_its_terms_before_rounding, product),
+               "sm90", fault=CUBLAS_BF16,
+               native={"launch": "xla fallback", "pass": f"{product} tangent"})
+          for product in ("gemm", "gemm_t")),
         Cell("native Hopper cluster=2 balanced tail holds check 1",
              native_hopper_cluster2_balanced_tail_holds_check_1, "sm90", fault=BALANCED_TAIL,
              native={"launch": "cluster2 tail", "pass": "forward"}),

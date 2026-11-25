@@ -7,6 +7,7 @@ import functools
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from flax import linen as nn
 from kernel_compile import lowered_for
@@ -206,20 +207,36 @@ def test_a_primal_dense_bf16_xla_fallback_stores_bf16_as_xlas_own_dot_does():
     assert set(_cublas_dtypes(compiled)) == {"f32"}
 
 
-@pytest.mark.parametrize("product", ["gemm", "gemm_t"])
-def test_a_dense_bf16_products_tangent_sums_its_terms_before_rounding(product):
-    """`jax.jvp` of a dense bf16 product whose two tangent terms cancel to below a bf16 ulp of either
-    (x = 129/128, w = 1, dx = 1, dw = -255/256: -127/32768): the tangent sums both terms in fp32 and rounds
-    once (`gemm`'s portable program, every derivative's), never a bf16 rounding a term."""
+def a_dense_bf16_products_tangent_sums_its_terms_before_rounding(product: str) -> None:
+    """`jax.jvp` of a dense bf16 product (`gemm` or `gemm_t`, 4 x 2 by 2 x 4, no extent of one: a shape the
+    XLA fallback stores bf16 directly where no derivative is taken) whose two tangent terms cancel to below a
+    bf16 ulp of either (x = 129/128, w = 1, dx = 1, dw = -255/256 in each entry's one live term): every entry
+    of the tangent is -127/32768, both terms summed in fp32 and rounded once (`gemm`'s portable program,
+    every derivative's), never a bf16 rounding a term."""
     bf16 = jnp.bfloat16
-    x, w = jnp.full((1, 1), 129 / 128, bf16), jnp.ones((1, 1), bf16)
-    dx, dw = jnp.ones((1, 1), bf16), jnp.full((1, 1), -255 / 256, bf16)
+    left, right = np.zeros((4, 2), np.float32), np.zeros((2, 4), np.float32)
+    left[:, 0], right[0] = 129 / 128, 1.0
+    d_left, d_right = np.zeros((4, 2), np.float32), np.zeros((2, 4), np.float32)
+    d_left[:, 0], d_right[0] = 1.0, -255 / 256
     if product == "gemm":
         def fn(x, w):
             return gemm.gemm(x, w, None, out_dtype=bf16)
+        operands, tangents = (left, right), (d_left, d_right)
     else:
         def fn(x, w):
             return gemm.gemm_t(x, w, None, out_dtype=bf16)[0]
-    with generation.chosen(grouped_matmul="xla"):
-        _, tangent = jax.jvp(fn, (x, w), (dx, dw))
-    assert float(tangent.reshape(())) == float(jnp.asarray(-127 / 32768, bf16)), tangent
+        operands, tangents = (left.T, right), (d_left.T, d_right)
+
+    def tangent(*arrays):
+        with generation.chosen(grouped_matmul="xla"):
+            return jax.jvp(fn, arrays[:2], arrays[2:])[1]
+
+    found = jax.jit(tangent)(*(jnp.asarray(each, bf16) for each in (*operands, *tangents)))
+    np.testing.assert_array_equal(np.asarray(found, np.float32), np.full((4, 4), -127 / 32768, np.float32))
+
+
+@pytest.mark.parametrize("product", ["gemm", "gemm_t"])
+def test_a_dense_bf16_products_tangent_sums_its_terms_before_rounding(product):
+    """`a_dense_bf16_products_tangent_sums_its_terms_before_rounding` on this process's device (a GPU's
+    native cell runs it on CUDA's fallback, tests/test_gpu_gemm.py)."""
+    a_dense_bf16_products_tangent_sums_its_terms_before_rounding(product)

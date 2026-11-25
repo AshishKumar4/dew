@@ -2056,7 +2056,7 @@ def test_a_walk_ranks_the_qkv_input_gradients_as_a_gh200_ran_them():
     joined: its chain's fp32 hand-offs, written and read back, were no part of it."""
     target = generation.gpu_target("NVIDIA GH200 480GB")
     tile = tiling.Tiles(128, 256, 64, 4, 8, warpgroups=2, cluster=2, family="wgmma")
-    step = pricing.step_seconds(tile, target, (2, 2))
+    step = pricing.step_seconds(tile, target, (2, 2), issued=jnp.bfloat16)
 
     def launch(contraction: int, depth: int, width: int, stored: float) -> float:
         walk = pricing.split_walk(tile, groups=1, rows=contraction, depth=depth, width=width,

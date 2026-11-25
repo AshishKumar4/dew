@@ -14,7 +14,13 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import bundles, cost as unit_cost, mosaic, tail as tail_of
+from dew.nn.kernels.templates import (
+    bundles,
+    cost as unit_cost,
+    mosaic,
+    product as product_of,
+    tail as tail_of,
+)
 from dew.nn.kernels.templates.gemm.tiling import TilesTemplate as TilesTemplate
 
 if TYPE_CHECKING:
@@ -44,19 +50,18 @@ def tile_rows(tiles: "Tiles", family: mosaic.Family) -> int:
 
 
 def step_seconds(tiles: "Tiles", target, itemsizes: tuple[float, float],
-                 decoded: tuple = (None, None), *, issued=None) -> float | None:
+                 decoded: tuple = (None, None), *, issued) -> float | None:
     """One step of `tiles` on one multiprocessor, in seconds, the unit the kernel gradient's split
     (`split_count`) and a balanced tail (`handoff_steps`) price their walks in: the longer of its products'
-    FLOPs at the multiprocessor's tensor rate for the dtype its MMA issues (`issued`: an 8-bit float's
-    `Rates.eight`, fp32's TF32, else the 16-bit rate, which packed operands decoded before their products
-    take; where None, fp32 operands' TF32 and every other the 16-bit) and its operands' bytes through its
-    shared memory at
+    FLOPs at the multiprocessor's tensor rate for the dtype its MMA issues (`issued`, its caller's: an FP8
+    operand's `Rates.eight` (`product.eight`), fp32's TF32, every other the 16-bit rate, which packed operands
+    decoded before their products take) and its operands' bytes through its shared memory at
     that memory's rate (`templates.cost.rates`, each the architecture's a clock at the part's clock; their
     units overlapped, `cost.units`), a step's `step_shared_bytes` of operands of `itemsizes` (the left's
     and the right's) in their `decoded` forms; None where the target states no tensor rate. A pair's step is
     a CTA's: its rows by the pair's columns (`tile_columns`)."""
     rates = unit_cost.rates(target, device=False)
-    tensor = _tensor_rate(rates, itemsizes, issued)
+    tensor = _tensor_rate(rates, issued)
     shared = rates.shared
     if tensor is None:
         return None
@@ -75,14 +80,12 @@ def step_seconds(tiles: "Tiles", target, itemsizes: tuple[float, float],
     return products if shared is None else max(products, moved / shared)
 
 
-def _tensor_rate(rates, itemsizes: tuple[float, float], issued) -> float | None:
-    """The multiprocessor's tensor rate (`cost.Rates`) for the operands its MMA issues (`step_seconds`)."""
-    if issued is None:
-        return (rates.tf32 or rates.tensor) if itemsizes == (4, 4) else rates.tensor
-    dtype = jnp.dtype(issued)
-    if jnp.issubdtype(dtype, jnp.floating) and dtype.itemsize == 1:
+def _tensor_rate(rates, issued) -> float | None:
+    """The multiprocessor's tensor rate (`cost.Rates`) for the operands its MMA issues (`step_seconds`): an
+    FP8 operand's (`product.eight`; a 4-bit float, one byte stored, no rate of its own, the 16-bit's)."""
+    if product_of.eight(issued):
         return rates.eight or rates.tensor
-    return (rates.tf32 or rates.tensor) if dtype == jnp.float32 else rates.tensor
+    return (rates.tf32 or rates.tensor) if jnp.dtype(issued) == jnp.float32 else rates.tensor
 
 
 def step_shared_bytes(tiles: "Tiles", family: mosaic.Family, itemsizes: tuple[float, float],
@@ -207,7 +210,7 @@ def within_workspace(target: generation.GpuTarget | None, held: float) -> bool:
     return bound is None or held <= bound
 
 
-def handoff_steps(tiles: "Tiles", target, itemsizes: tuple[int, int], *, issued=None) -> float:
+def handoff_steps(tiles: "Tiles", target, itemsizes: tuple[int, int], *, issued) -> float:
     """A balanced tail's hand-off of a partial between programs (`GpuTarget.handoff_seconds`) in MMA steps
     of `tiles` (`step_seconds`), as `tail.balanced` prices it; none where the part's hand-off or its rate is
     unmeasured."""
@@ -480,7 +483,7 @@ def split_walk(tiles: "Tiles", *, groups: int, rows: int, depth: int, width: int
 
 def decode_contraction(tiles: "Tiles", target, *, rows: int, groups: int, depth: int, width: int,
                        columns: int | None, held: int, operands: tuple, stored: float,
-                       multiprocessors: int, partial_bytes: float | None = None) -> dict:
+                       multiprocessors: int, issued, partial_bytes: float | None = None) -> dict:
     """A product's walk at `tiles` as `split_walk` and `split_count` price it (their keywords): swapped
     (`Tiles.swapped`), its matrix the rows (`width`) over its `depth`, the call's `rows` its padded `columns`;
     multi-row-tile calls (`rows > groups * block_m`), all `rows` over `depth` (row 10151); else each
@@ -498,7 +501,7 @@ def decode_contraction(tiles: "Tiles", target, *, rows: int, groups: int, depth:
                  'partial_rows': held}
     unswapped = dataclasses.replace(tiles, swapped=False)
     return {**shape, 'itemsizes': itemsizes, 'stored': stored, 'multiprocessors': multiprocessors,
-            'step_seconds': step_seconds(unswapped, target, itemsizes, decoded),
+            'step_seconds': step_seconds(unswapped, target, itemsizes, decoded, issued=issued),
             'bandwidth': target.memory_rate, 'launch_seconds': target.launch_seconds, 'target': target,
             'partial_bytes': partial_bytes}
 
