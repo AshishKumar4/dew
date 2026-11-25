@@ -1199,17 +1199,15 @@ def _equation_layouts(equation, given: list, found: dict) -> list:
             carried = kept
         return carried
     if primitive is lax.scan_p:
-        consts, carries = params["num_consts"], params["num_carry"]
-        carried = list(given[consts:consts + carries])
-        rest = len(equation.invars) - consts - carries
+        consts, carried, xs = map(list, params["ft_in"].update(given).unpack())
         for _ in range(2):
-            out = _laid_out(params["jaxpr"].jaxpr, [*given[:consts], *carried, *([None] * rest)], found)
+            out = _laid_out(params["jaxpr"].jaxpr, [*consts, *carried, *([None] * len(xs))], found)
             kept = [before if before == after else None
-                    for before, after in zip(carried, out[:carries], strict=True)]
+                    for before, after in zip(carried, out[:len(carried)], strict=True)]
             if kept == carried:
                 break
             carried = kept
-        return carried + [None] * (len(outs) - carries)
+        return carried + [None] * (len(outs) - len(carried))
     return unknown
 
 
