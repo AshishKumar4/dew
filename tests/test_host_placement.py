@@ -335,6 +335,34 @@ def test_a_banked_loop_of_several_runs_decodes_through_its_passes():
     np.testing.assert_array_equal(fetched.tokens[decided], held.tokens[decided])
 
 
+def test_a_banked_block_decodes_each_row_at_its_exiting_pass():
+    """A six-layer decoder banked two layers a run, its middle run looped three times under a cache its
+    passes share, its gate on the block's output exiting each token apart, its rows exiting at different
+    passes: greedy steps through the banked store take the plain store's continuation on each decided row,
+    each row's cache its exiting pass's, read on the bank's row axis after its layers'
+    (`looping._Passes._kept_exits`)."""
+    from dew.nn.backbones.decoder_stack import Loop
+    from dew.nn.protocols import EXIT_PASSES
+
+    loop = Loop(3, layers=(2, 4), exit_gate=True, exit_threshold=0.6, exit_at="block", shared_cache=True)
+    plain, scanned, variables, tokens = pair(num_layers=6, bank_layers=2, loop=loop)
+    gate = np.random.default_rng(0xE9F).normal(0, 1.0, (SHAPE["emb_features"] + 1,))
+    variables = {**variables, "params": {**variables["params"], "early_exit_gate": {
+        "kernel": jnp.asarray(gate[:-1, None], jnp.float32), "bias": jnp.asarray(gate[-1:], jnp.float32)}}}
+    resident, _ = stores(scanned, variables)
+    greedy = Sampling(temperature=0.0)
+    banked = generate(scanned, resident, tokens, 4, key=0, sampling=greedy).host()
+    held = generate(plain, variables, tokens, 4, key=0, sampling=greedy).host()
+    continued = jnp.asarray(held.tokens[:, :-1])
+    _, sown = plain.apply(variables, continued, mutable=[EXIT_PASSES])
+    chosen = np.asarray(sown[EXIT_PASSES]["chosen"][0])[:, held.prompt_width - 1:]
+    assert np.any(chosen[0] != chosen[1]), "the draw's rows exit at the same passes"
+    decisions = np.asarray(plain.apply(variables, continued), np.float64)[:, held.prompt_width - 1:]
+    decided = np.all(top_margin(decisions, 1) > MARGIN, axis=-1)
+    assert decided.any(), "no row's continuation is decided at every step"
+    np.testing.assert_array_equal(banked.tokens[decided], held.tokens[decided])
+
+
 @pytest.mark.mesh(devices=8)
 @pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize(("num_layers", "loop"), [

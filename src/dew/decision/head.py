@@ -40,6 +40,7 @@ from dew.nn.mixers import AttentionMixer
 from dew.nn.mlp import GatedMLP
 from dew.nn.norms import cosine
 from dew.nn.precision import (
+    EXACT_FLOAT32,
     accumulated,
     at_least_fp32,
     capped_logits,
@@ -611,9 +612,10 @@ class LabelReadout(Head):
             jnp.zeros(ids.shape, _wide(table.matrix.dtype, self.dtype)) if table.bias is None
             else drawn(jnp.take(table.bias, ids.reshape(-1)).reshape(ids.shape))))
         answers = table.states(answer_states(states, inputs))
-        # In the readout's compute dtype under the run's precision, summed in at least fp32 (row 12919).
-        compute = _compute(answers.dtype, self.dtype)
-        logits = computed_einsum("bqd,kvd->bqkv", answers, rows[:width], dtype=compute)
+        # Exact in at least fp32, as the tied table's reader takes its columns (`OutputTable.columns`'
+        # `exact`): an untied readout drawn from a tied one scores its labels alike.
+        answers = answers.astype(_wide(jnp.result_type(answers, rows), self.dtype))
+        logits = jnp.einsum("bqd,kvd->bqkv", answers, rows[:width], precision=EXACT_FLOAT32)
         capped = capped_logits(scaled_logits(logits, None, bias[:width]), table.softcap)
         return _past_labels(jax.nn.logsumexp(capped, axis=-1), width)
 

@@ -32,6 +32,7 @@ derivatives; other backends use lax, as does a convolution a Qwix rule
 quantizes (`dew.quantization`).
 """
 
+import functools
 import math
 from collections.abc import Callable, Sequence
 
@@ -121,7 +122,7 @@ def _unreplicated(x: jax.Array, spatial: int) -> jax.Array:
     return constrained(x, P(*(tuple(entry) if entry else None for entry in entries)))
 
 
-def _polyphase_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> jax.Array:
+def _polyphase_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int, precision=None) -> jax.Array:
     """The dilated depthwise convolution as an undilated one over its
     `dilation ** 2` interleaved grids.
 
@@ -131,15 +132,16 @@ def _polyphase_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> j
     convolution with its own zero border, and the grids interleave back.
     The image is padded with zeros to a multiple of `dilation` first, which
     are the zeros 'SAME' padding reads there anyway. The convolution sums in
-    at least fp32 at the run's precision (`Numerics.matmul`: `ACCURATE`'s
-    exact float32), so bf16 rounds once, from fp32 (row 12920)."""
+    at least fp32 at the layer's `precision`, or the run's where it states
+    none (`Numerics.matmul`: `ACCURATE`'s exact float32), so bf16 rounds once,
+    from fp32 (row 12920)."""
     batch, height, width, features = lhs.shape
     rows, columns = -(-height // dilation), -(-width // dilation)
     padded = jnp.pad(lhs, ((0, 0), (0, rows * dilation - height), (0, columns * dilation - width), (0, 0)))
     grids = padded.reshape(batch, rows, dilation, columns, dilation, features).transpose(0, 2, 4, 1, 3, 5)
     output = jax.lax.conv_general_dilated(
         grids.reshape(batch * dilation * dilation, rows, columns, features), rhs, (1, 1), 'SAME',
-        dimension_numbers=('NHWC', 'HWIO', 'NHWC'), feature_group_count=features,
+        dimension_numbers=('NHWC', 'HWIO', 'NHWC'), feature_group_count=features, precision=precision,
         preferred_element_type=at_least_fp32(lhs.dtype)).astype(lhs.dtype)
     output = output.reshape(batch, dilation, dilation, rows, columns, features).transpose(0, 3, 1, 4, 2, 5)
     return output.reshape(batch, rows * dilation, columns * dilation, features)[:, :height, :width]
@@ -225,7 +227,9 @@ def _conv_general_dilated(
             == jax.lax.ConvDimensionNumbers((0, 3, 1, 2), (3, 2, 0, 1), (0, 3, 1, 2))):
         # bf16 is faster polyphase, fp32 materialized (`_materialized_depthwise_3x3`).
         if dilated is None:
-            dilated = _polyphase_depthwise_3x3 if lhs.dtype == jnp.bfloat16 else _materialized_depthwise_3x3
+            # The layer's own precision rides with the polyphase form; the materialized one is exact.
+            dilated = (functools.partial(_polyphase_depthwise_3x3, precision=precision)
+                       if lhs.dtype == jnp.bfloat16 else _materialized_depthwise_3x3)
         return jax.lax.platform_dependent(
             lhs, rhs, cuda=convolve if dilation[0] == 1 else lambda x, w: dilated(x, w, dilation[0]),
             default=convolve)

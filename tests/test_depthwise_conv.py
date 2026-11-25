@@ -10,6 +10,7 @@ from flax import linen as nn
 from reference_error import assert_fp32_reduction_bound
 
 from dew.nn.conv import Conv, _materialized_depthwise_3x3, _polyphase_depthwise_3x3
+from dew.nn.precision import EXACT_FLOAT32
 from dew.nn.ssm import SpatialFusionConv
 
 
@@ -180,3 +181,16 @@ def test_depthwise_quantization_keeps_the_original_provider_output(training):
     np.testing.assert_array_equal(before, after)
 
 
+
+
+def test_the_polyphase_form_convolves_at_its_layers_precision():
+    """The bf16 polyphase form convolves at the precision its layer states, an exact float32 inside a run
+    whose default is bf16's, and at the run's where it states none (row 12920)."""
+    x, w = jnp.ones((1, 8, 8, 4), jnp.bfloat16), jnp.ones((3, 3, 1, 4), jnp.bfloat16)
+
+    def lowered(precision):
+        form = partial(_polyphase_depthwise_3x3, dilation=2, precision=precision)
+        return jax.jit(form).lower(x, w).as_text()
+    with jax.default_matmul_precision("bfloat16"):
+        stated, unstated = lowered(EXACT_FLOAT32), lowered(None)
+    assert "HIGHEST" in stated and "HIGHEST" not in unstated

@@ -11,8 +11,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from jax.extend import core as jex_core
-from model_support import attending, decode_steps, model_draw, with_logit_cotangent
+from model_support import TINY_DECODER, attending, decode_steps, model_draw, with_logit_cotangent
 from reference_error import assert_as_exact, with_gradients
 
 from dew.interop.hf_decoders import translate_config
@@ -20,11 +21,14 @@ from dew.nn.backbones.call_metadata import call_metadata
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_stack import Loop
 from dew.nn.backbones.embeddings import prepared_embeddings
+from dew.nn.backbones.looping import gate_logit
+from dew.nn.cross_attention import CrossAttention
+from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS
 
 FIXTURES = Path(__file__).with_name("fixtures") / "hf"
 
 SEEDS = {"rows": 8, "first pass": 8, "last pass": 8, "sharing": 8, "sharing backward": 8,
-         "sharing decode": 8}
+         "sharing decode": 8, "sharing parts": 8, "counted sharing": 8, "cross rows": 8}
 """Check 1's declared seeds for each site of the file."""
 
 
@@ -32,6 +36,12 @@ def _decoder(name: str) -> CausalTransformer:
     """A tiny release fixture as Dew builds it (`translate_config`), in float32."""
     config = json.loads((FIXTURES / name / "config.json").read_text())
     return CausalTransformer(**{**translate_config(config), "dtype": "float32"})
+
+
+def _from(name: str, **config) -> CausalTransformer:
+    """A tiny release fixture as Dew builds it with `config`'s fields over its own, in float32."""
+    source = json.loads((FIXTURES / name / "config.json").read_text())
+    return CausalTransformer(**{**translate_config({**source, **config}), "dtype": "float32"})
 
 
 def _rows_exiting(**loop) -> CausalTransformer:
@@ -313,3 +323,136 @@ def test_a_loop_over_shared_keys_and_values_decodes_as_it_prefills():
     draw = model_draw(twice, (2, 12), twice.vocab_size)
     assert_as_exact(_decoded(twice, 8), jax.jit(twice.apply), draw, "a sharing loop's decode",
                     seeds=SEEDS["sharing decode"], truth_fn=jax.jit(twice.clone(dtype=jnp.float64).apply))
+
+
+def test_every_passes_gate_reads_its_placement_and_pooling():
+    """A row's gate pools the row's tokens at every pass, the last pass's among them, so each logit is one
+    a row; a gate on the block's output reads the block's at every pass, the last's among them, not the
+    coda's a gate after the coda reads."""
+    rows = _rows_exiting()
+    variables, ids = _gated(model_draw(rows, (2, 12), rows.vocab_size), rows.emb_features, 0xE98)(0)
+    _, exits = jax.jit(lambda v, tokens: rows.apply(v, tokens, mutable=["exits"]))(variables, ids)
+    for logit in exits["exits"]["logits"]:
+        held = np.asarray(logit)
+        np.testing.assert_array_equal(held, np.broadcast_to(held[:, :1], held.shape))
+    block = _tokens_exiting()
+    coda = block.clone(loop=dataclasses.replace(block.loop, exit_at="coda"))
+    variables, ids = _gated(model_draw(block, (2, 12), block.vocab_size), block.emb_features, 0xE99)(0)
+
+    def last(model):
+        _, sown = jax.jit(lambda v, tokens: model.apply(v, tokens, mutable=["exits"]))(variables, ids)
+        return np.asarray(sown["exits"]["logits"][-1])
+    assert not np.array_equal(last(block), last(coda))
+
+
+def test_a_rows_gate_pools_its_real_tokens_alone():
+    """A row's gate reads the mean of its real tokens' states (`gate_logit`): a padding token's state,
+    unspecified, a NaN among them, leaves the row's logit as it is, bit for bit."""
+    rows = _rows_exiting()
+    variables, _ = _gated(model_draw(rows, (2, 12), rows.vocab_size), rows.emb_features, 0xE9B)(0)
+    states = jax.random.normal(jax.random.key(1), (2, 12, rows.emb_features))
+    valid = jnp.arange(12)[None] < jnp.asarray([[9], [12]])
+    poisoned = jnp.where(valid[..., None], states, jnp.nan)
+
+    def gate(module, states, valid):
+        return gate_logit(module, states, valid)
+    run = jax.jit(lambda v, s, real: rows.apply(v, s, real, method=gate))
+    np.testing.assert_array_equal(np.asarray(run(variables, poisoned, valid)),
+                                  np.asarray(run(variables, states, valid)))
+
+
+def test_a_block_gate_refuses_what_its_one_coda_cannot_read():
+    """A gate on the block's output runs the coda once over its tokens' exiting states: a coda reading the
+    block's published keys and values (Gemma 4's sharing layer after the block) would read the last pass's
+    for every token, and a cached call collecting every pass's exit would run codas it keeps no cache for,
+    each refused."""
+    sharing = _sharing(2)
+    gated = sharing.clone(loop=dataclasses.replace(sharing.loop, exit_gate=True, exit_threshold=0.6,
+                                                   exit_at="block"))
+    with pytest.raises(ValueError):
+        model_draw(gated, (2, 12), gated.vocab_size)(0)
+    block = _tokens_exiting(shared_cache=True)
+    variables, ids = model_draw(block, (2, 12), block.vocab_size)(0)
+    made, _ = decode_steps(block)
+    with pytest.raises(ValueError):
+        block.apply({**variables, "cache": made(variables, 2)}, ids[:, :1], decode=True,
+                    mutable=["cache", "exits"])
+
+
+def test_a_stopping_loop_runs_under_a_capture_of_every_method():
+    """A loop under a threshold, which stops its passes where every token has exited, under a capture that
+    keeps every method's output, whose helpers return no array: its passes run one by one, keeping each
+    capture as Flax keeps it, no switch returning a non-array."""
+    rows = _rows_exiting()
+    variables, ids = _gated(model_draw(rows, (2, 12), rows.vocab_size), rows.emb_features, 0xE9C)(0)
+    _, captured = rows.apply(variables, ids, capture_intermediates=lambda module, method: True,
+                             mutable=["intermediates"])
+    assert "looped" in captured["intermediates"], sorted(captured["intermediates"])
+
+
+@attending("reference")
+def test_a_row_exit_over_cross_attention_stops_its_passes_over_every_row():
+    """A loop exiting by row over cross-attending layers, its call's context `[B, C, D]` and lengths `[B]`
+    holding its rows but not its tokens: scoring under its threshold stops its passes over every row,
+    compacting none (`looping._token_aligned`), its logits on par with its passes unrolled under a capture of
+    every method, which stops none (check 1 against them in float64)."""
+    model = CausalTransformer(**{**TINY_DECODER, "vocab_size": 64, "num_layers": 4, "dtype": "float32",
+                                 "cross_attention": CrossAttention(layer_ids=(1, 2), context_length=6,
+                                                                   context_features=24),
+                                 "loop": Loop(3, layers=(1, 3), exit_gate=True, exit_threshold=0.6,
+                                              exit_at="block", exit_by="row")})
+
+    def plain(seed):
+        rng = np.random.default_rng([0xE9D, seed])
+        ids = jnp.asarray(rng.integers(1, 64, (2, 10)), jnp.int32)
+        context = jnp.asarray(rng.normal(size=(2, 6, 24)), jnp.float32)
+        lengths = jnp.asarray([4, 6], jnp.int32)
+        conditioning = {CONTEXT: context, CONTEXT_LENGTHS: lengths}
+        variables = nn.unbox(model.init(jax.random.key(seed), ids, conditioning=conditioning))
+        return variables, ids, context, lengths
+
+    def scored(module, *, captured: bool):
+        def run(variables, ids, context, lengths):
+            conditioning = {CONTEXT: context, CONTEXT_LENGTHS: lengths}
+            if not captured:
+                return module.apply(variables, ids, conditioning=conditioning)
+            return module.apply(variables, ids, conditioning=conditioning, mutable=["intermediates"],
+                                capture_intermediates=lambda each, method: True)[0]
+        return jax.jit(run)
+    assert_as_exact(scored(model, captured=False), scored(model, captured=True),
+                    _gated(plain, model.emb_features, 0xE9E),
+                    "a row exit over cross-attention", seeds=SEEDS["cross rows"],
+                    truth_fn=scored(model.clone(dtype=jnp.float64), captured=True))
+
+
+@attending("reference")
+@pytest.mark.parametrize("looped", [
+    pytest.param(lambda: _decoder("gemma4-kvshare").with_passes(2, (2, 4)), id="a block opening on a reader"),
+    pytest.param(lambda: _from("gemma-tiny", num_hidden_layers=6).clone(kv_shared_layers=(5,))
+                 .with_passes(2, (5, 6)), id="a provider closing a scanned prelude"),
+])
+def test_a_loops_parts_carry_their_providers_publications(looped):
+    """A loop whose block opens on a layer reading a provider before it (its first layer's dtype read with
+    that provider's publications), or whose prelude scans a run of layers before the provider its block
+    reads (the scanned run's initialization writing the publications the block reads): its logits on par
+    with its parts unrolled here (`_sharing_by_hand`), check 1 against them in float64."""
+    model = looped()
+    draw = model_draw(model, (2, 12), model.vocab_size)
+
+    def unrolled(module):
+        return jax.jit(lambda variables, ids: module.apply(variables, ids, method=_sharing_by_hand))
+    assert_as_exact(jax.jit(model.apply), unrolled(model), draw, "a loop's parts' publications",
+                    seeds=SEEDS["sharing parts"], truth_fn=unrolled(model.clone(dtype=jnp.float64)))
+
+
+@attending("reference")
+def test_a_counted_loop_runs_where_its_coda_reads_none_of_its_blocks_publications():
+    """A loop whose block holds a provider and the layer reading it, its coda reading neither: given a
+    count of its passes per call, it runs every pass under one scan, the block's publications dropped
+    across it, and computes the loop of that many passes (check 1 against it in float64)."""
+    counted = _from("gemma-tiny", num_hidden_layers=6).clone(kv_shared_layers=(2,)).with_passes(3, (1, 3))
+    fixed = counted.clone(loop=dataclasses.replace(counted.loop, steps=2))
+    draw = model_draw(counted, (2, 12), counted.vocab_size)
+    run = jax.jit(lambda variables, ids: counted.apply(variables, ids, loop_passes=jnp.int32(2)))
+    assert_as_exact(run, jax.jit(fixed.apply), draw, "a counted loop over a block's own sharing",
+                    seeds=SEEDS["counted sharing"], truth_fn=jax.jit(fixed.clone(dtype=jnp.float64).apply))

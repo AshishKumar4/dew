@@ -106,7 +106,9 @@ def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer
             view = StackView(groups)
             run = nn.map_variables(stacked, mapped_collections=True, trans_in_fn=view.stack,
                                    trans_out_fn=view.unstack, init=True, mutable=True)
-            return run(decoder, view, x, train, decode, per_layer_input, attention_metadata, prior_bank)
+            # Its providers write the store the layers after the span read (a loop's next part).
+            return run(decoder, view, x, train, decode, per_layer_input, attention_metadata, prior_bank,
+                       store)
     if decoder.is_initializing() or (stages == 1 and not scanned()):
         return unrolled()
     staged = stored_by_stage(decoder.variables)
@@ -144,7 +146,7 @@ def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer
         view, split = pipelined(decoder, x, stages, decode=decode, banked=banked, span=span)
     dtype = decoder.residual_dtype(
         x, train=train, decode=decode, per_layer_input=per_layer_input,
-        attention_metadata=attention_metadata, first=first)
+        attention_metadata=attention_metadata, first=first, kv_store=store)
     # A carried collapse stays fp32, as the reference keeps it.
     x = x._replace(streams=x.streams.astype(dtype)) if isinstance(x, Carried) else x.astype(dtype)
     run = nn.map_variables(stacked, mapped_collections=True, trans_in_fn=view.stack,
@@ -161,8 +163,9 @@ def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer
             attention_metadata=attention_metadata)
 
     x = outside(x, 0, split.prefix)
-    # A loop's part's store passes in; else the run makes its own, inside the transform that maps its view.
-    x = run(decoder, view, x, train, decode, per_layer_input, attention_metadata, prior_bank, kv_store)
+    # One store across the layers around the run and the run's own: a loop's part's, passed in, or the
+    # stack's own.
+    x = run(decoder, view, x, train, decode, per_layer_input, attention_metadata, prior_bank, store)
     return outside(x, decoder.num_layers - split.suffix, decoder.num_layers)
 
 
