@@ -693,14 +693,17 @@ def test_a_launch_whose_trace_reads_a_value_of_the_trace_around_it_runs_itself()
     def launch(x):
         return x + around[-1]
 
-    @jax.jit
-    def step(x, y):
-        around.append(y)
-        return launch(x)
+    def stepped(scale: float):
+        @jax.jit
+        def step(x, y):
+            around.append(y * scale)
+            return launch(x)
+        return step
 
+    # Two steps traced apart over the same operands: the second takes the verdict the first held.
     x = jnp.arange(4.0)
-    for y in (1.0, 2.0):
-        assert jnp.array_equal(step(x, jnp.float32(y)), x + y)
+    for scale in (1.0, 2.0):
+        assert jnp.array_equal(stepped(scale)(x, jnp.float32(1.0)), x + scale)
 
 
 def _halved_score(scores):
