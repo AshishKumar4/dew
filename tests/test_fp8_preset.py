@@ -865,7 +865,7 @@ def test_an_mlps_recipe_chain_keeps_its_products_under_a_remat_policy_saving_its
     variables = nn.unbox(mlp.init(jax.random.key(1), x))
 
     def loss(variables, x):
-        return jnp.sum(mlp.apply(variables, x).astype(jnp.float32))
+        return jnp.sum(jnp.asarray(mlp.apply(variables, x), jnp.float32))
 
     def products(fn) -> int:
         graph = jax.make_jaxpr(jax.grad(fn, argnums=(0, 1)))(variables, x)
