@@ -659,6 +659,28 @@ def test_a_later_process_of_one_rows_task_keeps_its_bundles_earlier_programs(
     assert closed_and_kept(cache, stored, "tests/a.py") == {"jit_x-1", "jit_b-1"}
 
 
+def test_a_process_recycle_stopped_keeps_its_bundles_programs_for_the_processes_after_it(
+        cache_worker, tmp_path, monkeypatch):
+    """A row's process that recycle.py stopped past its bound (its `RECYCLED` marker written) keeps in its
+    bundle every program it fetched, those it did not load among them: its row's later processes load them,
+    and a bundle pruned to what the stopped process loaded would have them compile again (row 13004). The
+    same run unstopped prunes them."""
+    url, stored, _ = cache_worker
+    marker = tmp_path / "recycled"
+    monkeypatch.setenv(remote_cache.RECYCLE.RECYCLED, str(marker))
+    kept = {}
+    for stopped in (True, False):
+        stored["/jax/cpu/bundles/tests/a.py"] = remote_cache.packed([("jit_x-1", b"x"), ("jit_y-1", b"y")])
+        marker.unlink(missing_ok=True)
+        cache = remote_cache.RemoteCache(tmp_path / str(stopped), url, "token", "jax/cpu")
+        cache.opened("tests/a.py")
+        loaded(tmp_path / str(stopped), "jit_x-1")
+        if stopped:
+            marker.write_text("tests/a.py::test_a")
+        kept[stopped] = closed_and_kept(cache, stored, "tests/a.py")
+    assert kept == {True: {"jit_x-1", "jit_y-1"}, False: {"jit_x-1"}}
+
+
 def test_a_url_that_is_no_address_leaves_the_local_cache_as_it_is(tmp_path):
     """A URL that does not parse (an unclosed IPv6 bracket) or names no port is refused with a warning
     when the cache is installed, as one that is no http(s) address is: the run compiles with JAX's own

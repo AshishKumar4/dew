@@ -102,6 +102,29 @@ def test_a_dry_prepares_tests_past_its_recycle_bound_run_on_in_fresh_processes_a
     assert row["exitCode"] == (1 if failing else 0)
 
 
+def test_a_recycled_rows_later_process_runs_on_the_commits_checkout(ci, tmp_path, monkeypatch):
+    """A dry prepare's later process of one row (past its recycle bound) runs on the commit's checkout, not on
+    what the process before it left: a tracked file it changed checked out again and a file it made removed
+    (`restored`), so the row's green, which publishes its baseline, never ran on a checkout the commit does
+    not hold (row 13000)."""
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data/state.txt").write_text("good")
+    written(tmp_path, {"test_recycled.py": (
+        "from pathlib import Path\ndef test_a():\n    Path('data/state.txt').write_text('bad')\n"
+        "    Path('left.txt').write_text('x')\ndef test_b():\n"
+        "    assert Path('data/state.txt').read_text() == 'good'\n"
+        "    assert not Path('left.txt').exists()\n")})
+    commit(tmp_path, "the commit")
+    interpreter(tmp_path, "3.12")
+    monkeypatch.setattr(ci.run_keys, "record", lambda *args: set())
+    monkeypatch.setenv("ARMADA_ARTIFACTS", str(tmp_path / "artifacts"))
+    out = tmp_path / "verdict.json"
+    ci.tested("3.12", ["tests/test_recycled.py"], "", out, 600.0, "off", 5.0, "", {}, recycle_at=1,
+              recorded=True)
+    [row] = json.loads(out.read_text())["rows"]
+    assert row["exitCode"] == 0, row["output"]
+
+
 @pytest.mark.parametrize(("source", "hook"), [
     # A crash at its exit, after its report: graded as it ended, nothing run past it.
     ("import atexit, os\ndef test_a():\n    atexit.register(lambda: os._exit(3))\n"

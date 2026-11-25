@@ -170,7 +170,8 @@ def groups_of(seconds: float | None, target: float, bound: float) -> int:
 def process(ci, python: str, file: str, group: str, verdict: Path, left: float, *, unit: str, threads: str,
             users: bool, variant: str, cache: str = "off", common: str = "", recorded: bool = False,
             environ: Mapping[str, str] | None = None, kept: Mapping[str, tuple[str, str]] | None = None,
-            judged: Callable[[list[dict]], list[dict]] | None = None, capped: bool = False) -> int:
+            judged: Callable[[list[dict]], list[dict]] | None = None, capped: bool = False,
+            written: list[set[str]] | None = None) -> int:
     """One process of a GPU tier part's prepare (ci.py's `gpu_prepared`) or a dry prepare (`run`): test file
     `file`'s `group` run on the CPU alone under the prepare's word and its unit's name (`unit`), a user's
     process's flags where `users` (`VARIANTS`), its row named for `variant`, within what is `left` of its
@@ -196,7 +197,7 @@ def process(ci, python: str, file: str, group: str, verdict: Path, left: float, 
                      {"JAX_PLATFORMS": "cpu", wire.PREPARE: "1", "OMP_NUM_THREADS": threads,
                       **(VARIANTS["users"][1] if users else {}), wire.UNIT: unit, **cap, **(environ or {})},
                      recorded=recorded, variant=variant, kept=kept, judged=judged,
-                     recycle_at=RECYCLE_AT if capped else None)
+                     recycle_at=RECYCLE_AT if capped else None, written=written)
 
 
 CAP_MARGIN = 240.0
@@ -560,6 +561,8 @@ def run(ci, python: str, tests: list[str], split: str, out: Path, deadline: floa
         """Each of `rest` not prepared, said stale (`ci.stale_row`): the plan's next run of it its grade."""
         return [ci.stale_row(python, name, group, f"not prepared: {why}") for name, group in rest]
 
+    # Each row's checkout writes (`ci.tested`'s), so the next row runs on the commit's checkout (row 13000).
+    written: list[set[str]] = []
     with tempfile.TemporaryDirectory(prefix="dry-prepare-", dir=Path.cwd().parent) as scratch:
         for index, (name, group) in enumerate(units):
             left = deadline - (time.monotonic() - began)
@@ -580,18 +583,21 @@ def run(ci, python: str, tests: list[str], split: str, out: Path, deadline: floa
                     break
             before_ = before(ci, python, name, group, time.monotonic() + min(looked, room / 4))
             verdict = out.with_name(f"{out.name}.{index}")
+            untouched = ci.untracked() if index < len(units) - 1 else set()
             process(
                 ci, python, name, ci.cut_of(group), verdict, deadline - (time.monotonic() - began),
                 unit=ci.row(python, name, group), threads=str(max(1, len(os.sched_getaffinity(0)))),
                 users=users, variant=row_variant, cache=cache, common=common(), recorded=True, capped=True,
                 # The node's one GPU, counted as a node's prepare counts its own (tests/lane_environment.py).
                 environ={wire.TRUTHS: str(truths), wire.TOPOLOGY: str(topology), "CUDA_VISIBLE_DEVICES": "0"},
-                kept={name: kept[(name, group)]} if (name, group) in kept else None,
+                kept={name: kept[(name, group)]} if (name, group) in kept else None, written=written,
                 judged=lambda found, truths=truths, before_=before_, generation=generation: graded(
                     found, unprepared_in(truths, (wire.UNPREPARED, wire.DEFERRED), ci.grading.owning),
                     before_, generation, lambda named: ci.grading.owning(ci.parsed_row(named)[1]),
                     ci.grading.STALE, wire.CAPPED))
             rows_ += [nothing_timed(found) for found in json.loads(verdict.read_text())["rows"]]
+            if index < len(units) - 1:
+                ci.restored(written[-1] if written else set(), untouched, out)
     out.write_text(json.dumps({"rows": rows_}))
     # Its rows its verdict: a red one the suite's red exit, as every task's (.armada.json's task.redExit).
     return ci.told(out, 0)

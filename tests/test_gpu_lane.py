@@ -15,7 +15,7 @@ import jax
 import pytest
 import tier_wire
 import truths_ahead
-from armada_support import LANE_TEST, cached, fetcher, gpu_driver, gpu_lane_at, interpreter, loaded
+from armada_support import LANE_TEST, cached, commit, fetcher, gpu_driver, gpu_lane_at, interpreter, loaded
 from tool_support import load
 
 
@@ -265,6 +265,31 @@ def test_a_dry_prepare_runs_the_tiers_processes_for_one_compile_only_gpu_and_kee
         assert [(row["name"], row["exitCode"], row["unprepared"])
                 for row in json.loads(out.read_text())["rows"]] == rows
     assert not log.exists(), "each row was reused from its record"
+
+
+def test_a_dry_prepare_tasks_rows_each_run_on_the_commits_checkout(ci, tmp_path, monkeypatch, cache_worker):
+    """A dry prepare task's rows (prepares.py's `run`) each run on the commit's checkout, not on what the row
+    before it left: a tracked file it changed is checked out again and a file it made removed
+    (`ci.restored`), so no later row's green, which publishes a prepare's baseline, ran on a checkout the
+    commit does not hold (row 13000)."""
+    url, _, _ = cache_worker
+    cached(monkeypatch, url)
+    monkeypatch.setattr(ci, "mainline", lambda: "f" * 40)
+    dry_checkout(tmp_path)
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data/state.txt").write_text("good")
+    gpu = "import pytest\nfrom pathlib import Path\npytestmark = pytest.mark.gpu\ndef test_it():\n{}"
+    (tmp_path / "tests/test_gpu_writes.py").write_text(gpu.format(
+        "    Path('data/state.txt').write_text('bad')\n    Path('left.txt').write_text('x')\n"))
+    (tmp_path / "tests/test_gpu_reads.py").write_text(gpu.format(
+        "    assert Path('data/state.txt').read_text() == 'good' and not Path('left.txt').exists()\n"))
+    commit(tmp_path, "the commit")
+    interpreter(tmp_path, "3.12")
+    out = tmp_path / "verdict.json"
+    ci.prepares.run(ci, "3.12", ["prepare:tests/test_gpu_writes.py", "prepare:tests/test_gpu_reads.py"],
+                    "@prepare-sm90", out, 600.0, "off")
+    rows = {row["name"]: row["exitCode"] for row in json.loads(out.read_text())["rows"]}
+    assert rows == {f"3.12:tests/test_gpu_{name}.py#@prepare-sm90": 0 for name in ("writes", "reads")}
 
 
 def test_a_flows_deferred_cell_is_read_unprepared_and_a_row_left_no_time_is_stale(ci, tmp_path):
