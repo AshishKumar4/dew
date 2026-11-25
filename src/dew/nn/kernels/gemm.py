@@ -61,7 +61,7 @@ from dew.nn.kernels.templates import axes as side_axes_of, product as product_of
 from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import epilogue_vjp, rows_permuted, scattered, tiling
 from dew.nn.kernels.templates.gemm.factored import factored
-from dew.nn.kernels.templates.gemm.hooks import NO_HOOKS, Hooks
+from dew.nn.kernels.templates.gemm.hooks import NO_HOOKS, Formed, Hooks
 from dew.nn.kernels.templates.product import SCALE_DEPTH, bf16_part_count, declared, formed, terms
 from dew.nn.precision import accumulated, asks_default_precision, at_least_fp32, exact_products, twice_scaled
 from dew.nn.programs import read_by
@@ -204,29 +204,6 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights,
                                    kind=KernelGlue(), nested=not any(named)))
     return differentiable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather,
                           scatter, None if applied is None else jax.lax.stop_gradient(applied), beside)
-
-
-def wide_gated(rows: jax.Array, wide: jax.Array, hook: Callable, *, out_dtype, saved: bool = False,
-               name: str | None = None, precision: PrecisionLike = None,
-               interpret_on_cpu: bool = False) -> jax.Array | tuple[jax.Array, jax.Array]:
-    """`rows` (`[tokens, in]`) through a gated MLP's gate and up projections held as one wide matrix
-    (`[in, 2 * hidden]`, their columns interleaved a `wide.GROUP` at a time, `wide.interleaved`): one product,
-    one accumulator, whose epilogue writes their gated product `hook(gate, up)` alone (`[tokens, hidden]` in
-    `out_dtype`, each projection rounded to it first, as the paired form rounds them,
-    `gated_mlp.fused_products`; `activations.gated_hook`), half its tile's width (`wide.Gated`; formulation
-    (C), docs/design/kernel-templates.md Appendix C row 18). `saved`: the rounded wide product too, first
-    (`[tokens, 2 * hidden]`, gate and up interleaved), the reverse pass's residual under `name` where given
-    (`gemm`'s `named`), from which it forms the gate's and up's cotangents (the hook's VJP) for one input
-    gradient and one kernel gradient of the wide matrix; unsaved, the reverse pass forms the product again.
-    Its route is the dense product's (`grouped_matmul.GROUPED`): the template's launch where it takes the
-    narrowed output (`quantized.forms_refusal`), XLA's otherwise, the same function of the product."""
-    from .templates.gemm import wide as wide_form
-
-    dtype = jnp.dtype(out_dtype)
-    outs = gemm(rows, wide, None, epilogue=wide_form.Gated(hook, dtype, saved), out_dtype=dtype,
-                out_dtypes=(dtype,) * (1 + saved), precision=precision, interpret_on_cpu=interpret_on_cpu,
-                named=(name, None) if saved and name is not None else ())
-    return tuple(outs) if saved else outs[0]
 
 
 def _named_residuals(out, named: tuple, several: bool) -> tuple:
@@ -494,9 +471,9 @@ SYRK: selection.Op[SyrkCase] = selection.Op(generation.Choice.SYRK, (
             'sharding', lambda case: case.no_auto,
             "automatic mesh axes keep XLA's dot outside per-shard launch", SYRK_ROW),
         selection.Requirement(
-            'measured', lambda case: case.measured, "no receipt has Mosaic SYRK beat XLA's batched dot at this "
-            "product's generation, dtype and shape class (`syrk.measured`: M-NG-45 and M-NG-5 admit whole-tile "
-            "bf16 Grams and polynomials on sm80 and sm90)", SYRK_ROW, kind='measured'),
+            'measured', lambda case: case.measured, "no receipt has Mosaic SYRK beat XLA's batched dot at "
+            "this product's generation, dtype and shape class (`syrk.measured`: M-NG-45 and M-NG-5 admit "
+            "whole-tile bf16 Grams and polynomials on sm80 and sm90)", SYRK_ROW, kind='measured'),
         selection.Requirement(
             'launch', lambda case: case.call.eligible('mosaic'),
             "no legal square super-tile holds this symmetric product on the target", SYRK_ROW))),
@@ -1733,11 +1710,11 @@ def _gemm_call(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, 
     before_sides, before_axes, before_broadcast = _launchable(prologue_arrays, prologue_axes)
     after_sides, after_axes, after_broadcast = _launchable(epilogue_arrays, epilogue_axes)
     # Matrices side by side state one dtype, each one's output's (`gmm_call`'s `beside`); an epilogue stating
-    # its outputs' forms (a wide product's narrowed gated product, `wide.Gated.out_forms`), each stored so.
+    # its outputs' forms (`hooks.Formed`: a wide product's narrowed gated product), each stored so.
     stated = tuple(dtype.name for dtype in dtypes) if several and not beside else None
     hooks = Hooks(prologue, before_axes, epilogue, after_axes, stated,
                   prologue_broadcast=before_broadcast, epilogue_broadcast=after_broadcast,
-                  out_forms=getattr(epilogue, 'out_forms', None) if stated else None)
+                  out_forms=epilogue.out_forms if stated and isinstance(epilogue, Formed) else None)
     product = declared(lhs.dtype, precision, outputs=summed_as or dtypes, operands=(lhs.dtype, rhs.dtype))
     def cast(matrix):
         # A matrix in the rows' dtype, as the product multiplies it; an abstract one's statement.

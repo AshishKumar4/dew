@@ -1,6 +1,7 @@
-"""A gated MLP's gate and up projections as one product over one wide matrix (`gemm.wide_gated`,
-`templates.gemm.wide`, formulation (C)): their columns interleaved a run at a time, one accumulator, the
-epilogue writing their gated product alone at half its tile's width (`quantized.Form.narrowed`)."""
+"""A gated MLP's gate and up projections as one product over one wide matrix
+(`templates.gemm.wide.gated_product`, formulation (C)): their columns interleaved a run at a time, one
+accumulator, the epilogue writing their gated product alone at half its tile's width
+(`quantized.Form.narrowed`)."""
 
 import functools
 
@@ -12,7 +13,7 @@ from generation_support import COMPILES_ON_CPU, INTERPRETS
 from reference_error import assert_as_exact, with_gradients
 
 from dew.nn import activations
-from dew.nn.kernels import gemm, generation
+from dew.nn.kernels import generation
 from dew.nn.kernels.templates.gemm import quantized, tiling, wide
 
 SEEDS = 8
@@ -67,8 +68,8 @@ def test_a_wide_gated_product_holds_check_1_against_its_projections_apart(genera
     product (and, saved, its rounded wide product) and the rows', gate's and up's gradients hold check 1
     against the two projections apart and their SwiGLU in XLA, from float64; the launch the template's."""
     def dew(x, gate, up):
-        out = gemm.wide_gated(x, wide.interleaved(gate, up), _swiglu, out_dtype=jnp.bfloat16, saved=saved,
-                              name="gate_up" if saved else None, interpret_on_cpu=True)
+        out = wide.gated_product(x, wide.interleaved(gate, up), _swiglu, out_dtype=jnp.bfloat16,
+                                 saved=saved, name="gate_up" if saved else None, interpret_on_cpu=True)
         return out[1] if saved else out
 
     plain = _apart
@@ -83,12 +84,12 @@ def test_a_wide_gated_product_holds_check_1_against_its_projections_apart(genera
 
 
 def test_a_saved_wide_product_is_its_gate_and_up_interleaved():
-    """A saved wide product's first output (`gemm.wide_gated`'s `saved`) is the product of the rows and the
-    wide matrix rounded, its gate's and up's columns interleaved as the matrix's are, and its second their
+    """A saved wide product's first output (`wide.gated_product`'s `saved`) is the product of the rows and
+    the wide matrix rounded, its gate's and up's columns interleaved as the matrix's are, and its second their
     SwiGLU, so the reverse pass reads the hook's operands from the first."""
     x, gate, up, _ = _draw(1)
     joined = wide.interleaved(gate, up)
-    kept, hidden = gemm.wide_gated(x, joined, _swiglu, out_dtype=jnp.bfloat16, saved=True)
+    kept, hidden = wide.gated_product(x, joined, _swiglu, out_dtype=jnp.bfloat16, saved=True)
     np.testing.assert_array_equal(kept, jnp.dot(x, joined, preferred_element_type=jnp.float32).astype(
         jnp.bfloat16))
     np.testing.assert_array_equal(hidden, _swiglu(*wide.deinterleaved(kept)).astype(jnp.bfloat16))
@@ -119,7 +120,7 @@ def _wide_gated_4b(saved):
     named, its rounded product stored beside the gated one where `saved` (a training forward's)."""
     def product(x, joined):
         with generation.chosen(grouped_matmul="mosaic"):
-            return gemm.wide_gated(x, joined, _swiglu, out_dtype=jnp.bfloat16, saved=saved)
+            return wide.gated_product(x, joined, _swiglu, out_dtype=jnp.bfloat16, saved=saved)
 
     return product, (jax.ShapeDtypeStruct((8192, 2560), jnp.bfloat16),
                      jax.ShapeDtypeStruct((2560, 2 * 9216), jnp.bfloat16))

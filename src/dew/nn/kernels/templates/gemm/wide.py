@@ -46,7 +46,8 @@ def deinterleaved(wide: jax.Array) -> tuple[jax.Array, jax.Array]:
     if width % UNIT:
         raise ValueError(f"a wide matrix's {width} columns are no whole pairs of {GROUP}-column runs")
     runs = wide.reshape(*lead, depth, width // UNIT, 2, GROUP)
-    return tuple(runs[..., half, :].reshape(*lead, depth, width // 2) for half in (0, 1))
+    halves = (*lead, depth, width // 2)
+    return runs[..., 0, :].reshape(halves), runs[..., 1, :].reshape(halves)
 
 
 def split(acc: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -64,7 +65,7 @@ def split(acc: jax.Array) -> tuple[jax.Array, jax.Array]:
 
 @dataclasses.dataclass(frozen=True)
 class Gated:
-    """The epilogue of a wide product (`gemm.wide_gated`): its accumulator rounded to `dtype`, as the paired
+    """The epilogue of a wide product (`gated_product`): its accumulator rounded to `dtype`, as the paired
     form rounds the gate's and up's products (`gated_mlp.fused_products`), and their gated product
     `hook(gate, up)` (`activations.gated_hook`) its one output, half its tile's width; `saved`, the rounded
     product first, whole, a reverse pass's residual. It states its outputs' forms (`out_forms`), which a
@@ -84,3 +85,27 @@ class Gated:
         """Each output's form (`Hooks.out_forms`): the rounded product a tile of its own, the gated product
         narrowed to half its tile (`quantized.Form.narrowed`)."""
         return (*((None,) if self.saved else ()), quantized.Form(2, narrowed=True))
+
+
+def gated_product(rows: jax.Array, wide: jax.Array, hook: Callable, *, out_dtype, saved: bool = False,
+                  name: str | None = None, precision=None,
+                  interpret_on_cpu: bool = False) -> jax.Array | tuple[jax.Array, jax.Array]:
+    """`rows` (`[tokens, in]`) through a gated MLP's gate and up projections held as one wide matrix
+    (`[in, 2 * hidden]`, their columns interleaved a `GROUP` at a time, `interleaved`): one product, one
+    accumulator, whose epilogue writes their gated product `hook(gate, up)` alone (`[tokens, hidden]` in
+    `out_dtype`, each projection rounded to it first, as the paired form rounds them,
+    `gated_mlp.fused_products`; `activations.gated_hook`), half its tile's width (`Gated`; formulation (C),
+    docs/design/kernel-templates.md §3). `saved`: the rounded wide product too, first (`[tokens, 2 * hidden]`,
+    gate and up interleaved), the reverse pass's residual under `name` where given (`gemm.gemm`'s `named`),
+    from which it forms the gate's and up's cotangents (the hook's VJP) for one input gradient and one kernel
+    gradient of the wide matrix; unsaved, the reverse pass forms the product again. Its route is the dense
+    product's (`grouped_matmul.GROUPED`): the template's launch where it stores the narrowed output
+    (`quantized.forms_refusal`), XLA's otherwise, the same function of the product."""
+    from dew.nn.kernels import gemm
+
+    dtype = jnp.dtype(out_dtype)
+    named = (name, None) if saved and name is not None else ()
+    outs = gemm.gemm(rows, wide, None, epilogue=Gated(hook, dtype, saved), out_dtype=dtype,
+                     out_dtypes=(dtype,) * (1 + saved), precision=precision,
+                     interpret_on_cpu=interpret_on_cpu, named=named)
+    return (outs[0], outs[1]) if saved else outs[0]

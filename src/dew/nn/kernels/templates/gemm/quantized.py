@@ -402,7 +402,6 @@ def forms_refusal(out_forms: tuple | None, config, *, dense: bool) -> str | None
     grouped tile's share starts mid-tile); a narrowed output (`Form.narrowed`) where the tile's family stores
     one (`mosaic.Transport.stores_narrowed`), its stated chunk whole multiples of its divisor."""
     from dew.nn.kernels.templates import bundles
-
     from dew.nn.kernels.templates.gemm import wide
 
     narrowed = [form for form in _formed(out_forms) if form is not None and form.narrowed]
