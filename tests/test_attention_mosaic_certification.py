@@ -237,8 +237,34 @@ def test_a_cuda_targets_verdict_key_names_each_nvjitlink_the_loader_could_open(t
     first, again, retargeted = key("13.0"), key("13.0"), key("13.1")
     builds["13.0"].write_bytes(b"build 13.0, rebuilt")
     updated = key("13.0")
-    assert first is not None and first == again
+    assert None not in (first, again, retargeted, updated) and first == again
     assert len({first, retargeted, updated}) == 3
+
+
+@COMPILES_ON_CPU
+def test_a_cuda_targets_verdict_key_reads_ld_library_path_as_the_loader_splits_it(tmp_path):
+    """`LD_LIBRARY_PATH` joined by ';' as the loader also splits it: a libnvJitLink in its second directory
+    keys a Triton launch, retargeted afresh; an entry the loader expands (`$ORIGIN`) leaves the inventory
+    unknown and the verdict unstored (the review of toolkit/nvjitlink-key 47d704873)."""
+    from process_support import fresh
+
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    builds = {name: second / f"libnvJitLink.so.{name}" for name in ("13.0", "13.1")}
+    for name, build in builds.items():
+        build.write_bytes(f"build {name}".encode())
+    soname = second / "libnvJitLink.so.13"
+
+    def key(target: str, path: str) -> str | None:
+        soname.unlink(missing_ok=True)
+        soname.symlink_to(builds[target].name)
+        return fresh(VERDICT_KEYS, "sm90", variables={"LD_LIBRARY_PATH": path})["sm90"]
+
+    joined = f"{first};{second}"
+    older, newer = key("13.0", joined), key("13.1", joined)
+    assert None not in (older, newer) and older != newer
+    assert key("13.0", f"{first};$ORIGIN/lib") is None
 
 
 def test_a_tpu_targets_verdict_key_reads_no_gpu_assembler():
