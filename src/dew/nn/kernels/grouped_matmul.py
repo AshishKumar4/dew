@@ -263,7 +263,7 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
         and holds none past it."""
         from .templates import resources
         from .templates.axes import held as held_axes
-        from .templates.gemm import pricing, quantized
+        from .templates.gemm import pricing
 
         hooks = ba.arguments['hooks']
         if hooks.prologue is None:
@@ -285,7 +285,7 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
         """The epilogue's values beyond the mainloop's held set, delegated to `pricing.epilogue_registers`
         (row 11982)."""
         from .templates.axes import held as held_axes
-        from .templates.gemm import pricing
+        from .templates.gemm import pricing, quantized
 
         hooks = ba.arguments['hooks']
         family = pricing.family_of(config, ba.arguments['tokens'].dtype, target)
