@@ -1450,7 +1450,7 @@ class _Build:
         if self.global_order or not self.training or not (ordered or pooled):
             return self
         pool = next((stage for stage in pipeline.stages if isinstance(stage, Workers)),
-                    Workers(count, self.loading.worker_buffer))
+                    Workers(count, self.loading.ahead))
         return dataclasses.replace(self, loading=dataclasses.replace(self.loading, workers=count), pool=pool)
 
     def owning(self, pipeline: Pipeline) -> _Build:
@@ -2405,7 +2405,7 @@ class _Build:
         reader that wraps this stream."""
         stages = [(at, pipeline.stages[at]) for at in after]
         if self.loading.workers and self.pool is None and _at(pipeline.stages, Workers) is None:
-            workers = Workers(self.loading.worker_count, self.loading.worker_buffer)
+            workers = Workers(self.loading.worker_count, self.loading.ahead)
             stages.append((len(pipeline.stages), workers))
         for at, stage in stages:
             # A pooled read's workers read before its batch (`pooled`).

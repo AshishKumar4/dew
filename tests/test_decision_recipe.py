@@ -1060,7 +1060,7 @@ def test_every_head_that_reads_the_base_resumes_a_decision_run_held_as_shapes_to
     `jax.ShapeDtypeStruct`). A case a head: the three in one took 144 to 166 s (row 7413)."""
     from run_kinds import lettered
 
-    from dew.decision.config import JointShape
+    from dew.decision.config import JointShape, RowBudgets
     from dew.training import Pause
 
     # A tiny causal decoder's run (`run_kinds.lettered`), its letters each one token of its tokenizer bare.
@@ -1069,6 +1069,10 @@ def test_every_head_that_reads_the_base_resumes_a_decision_run_held_as_shapes_to
     head = {"joint": JointShape(width=16, routing_layers=1, layers=1, heads=2, feedforward=32),
             "letters": base.head, "untied": dataclasses.replace(base.head, untied=True)}[name]
     run = dataclasses.replace(base, head=head, calibrate=False)
+    if name == "joint":
+        # A joint row's layout is 16,384 tokens long unless the run states one: its step over 8 such rows
+        # compiled in 34 s of the case's 165 s on armada (row 8770).
+        run = dataclasses.replace(run, rows=RowBudgets(max_len=512))
     trainer = dataclasses.replace(run.trainer, name=name, checkpoint_dir=str(tmp_path / "runs"),
                                   steps=4, checkpoint_every=1, eval_every=None, log_every=1,
                                   multi_host=False, compilation_cache_dir=None, stop=Pause(0.5))

@@ -554,10 +554,11 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
     def __next__(self) -> Batch:
         total = sum(self._delivered)
         scale = sum(self._weights)
-        chosen = max(
-            range(len(self._reads)),
-            key=lambda index: self._weights[index] * total - self._delivered[index] * scale,
-        )
+        # The first corpus furthest behind its share, scored in one pass: a key function called for each
+        # of a thousand corpora took a tenth of such a mix's read (row 7840).
+        deficits = [weight * total - delivered * scale
+                    for weight, delivered in zip(self._weights, self._delivered, strict=True)]
+        chosen = deficits.index(max(deficits))
         self._positions.moved(self._keys[chosen])
         value = next(self._reads[chosen])
         tokens = self._tokens(value)
