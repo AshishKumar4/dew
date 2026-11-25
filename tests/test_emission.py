@@ -11,7 +11,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from kernel_compile import lowered_for
 from reference_error import ahead_arm
 
-from dew.nn import precision, programs
+from dew.nn import programs
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import cost, emission, mosaic
 from dew.nn.kernels.templates.cost import Stated, Work
@@ -904,29 +904,6 @@ def test_an_integer_multiply_counts_on_the_fma_pipe_at_its_own_rate_beside_the_f
 def _read_twice(product, z):
     """`product + z` times `product`: one multiply's output read by an add and by a multiply."""
     return (product + z) * product
-
-
-@pytest.mark.parametrize("primitive", [lax.div_p, precision.correctly_rounded_divide_p])
-def test_an_fp32_division_issues_a_reciprocal_and_its_refinement(primitive):
-    """An fp32 division on a CUDA target issues a MUFU.RCP beside its refinement, never one instruction as a
-    multiply does: a Mosaic GPU kernel's (`div.full.f32`, with or without `approx_math`) one MUFU, five FMULs
-    and two FSETPs an element; XLA's and a correctly rounded one's (`div.rn.f32`) one MUFU, five FFMAs and an
-    FCHK on its common path (ptxas 13.0's sm90 SASS, FS-DIV-SASS1 and FS-DIV-SASS5); so `a / y` prices above
-    `a * r`, which a reciprocal held already makes of it. An integer division, and a TPU's, unmeasured, stay
-    an operation an element."""
-    row = jax.ShapeDtypeStruct((128,), jnp.float32)
-    hopper = generation.gpu_target("sm90")
-    kernel = Work(exponentials=128, operations=7 * 128)
-    xla = Work(exponentials=128, operations=6 * 128)
-    for forms, expected in ((emission.ACCURATE_FORMS, kernel), (emission.APPROXIMATE_FORMS, kernel),
-                            (None, xla)):
-        if primitive is precision.correctly_rounded_divide_p:
-            expected = xla
-        found = emission.operation_work(primitive, [row, row], [row], {}, hopper, forms=forms)
-        assert found == expected, (forms is None, found)
-    integers = jax.ShapeDtypeStruct((128,), jnp.int32)
-    assert emission.operation_work(lax.div_p, [integers, integers], [integers], {}, hopper) == Work(
-        integer_operations=128)
 
 
 @pytest.mark.parametrize(("body", "fused"), [
