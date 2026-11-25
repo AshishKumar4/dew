@@ -395,24 +395,25 @@ def test_a_shuffled_limit_rejected_for_passes_reads_on_to_the_pass_that_keeps_on
             stream.close()
 
 
-def test_a_mixtures_corpora_read_in_workers_by_their_draw_weights():
-    """A mixture read in eight loading workers that draws one corpus seven times as often as the other
-    reads it in seven of them and the other in one, where an equal share gave each four (the owner's 4B
-    mixture: a corpus drawn 2.74% of the time read in 26 of 52 workers, as many as the 97.26% one), as
-    the position its streamed read saves records (each worker reading shards of its own)."""
 
-    def corpus(name: str) -> Pipeline:
-        return Pipeline(Memory([{"id": index} for index in range(16)], shard_rows=1), name=name).repeat()
+@pytest.mark.parametrize(("workers", "weights", "shares"), [
+    # The owner's 4B mixture on 52 workers: an equal share gave the 2.74% corpus 26, as many as the other.
+    (52, [0.0274, 0.9726], [1, 51]),
+    (8, [1.0, 7.0], [1, 7]),
+    # Every corpus drawn from reads in one at least, taken from the one holding the most.
+    (5, [0.001, 0.001, 1.0], [1, 1, 3]),
+    # Fewer workers than drawn corpora: one each the heaviest, the earlier first among equals.
+    (3, [1.0, 1.0, 1.0, 1.0], [1, 1, 1, 0]),
+    (4, [0.0, 1.0, 1.0], [0, 2, 2]),
+    (7, [1.0, 1.0, 1.0], [3, 2, 2]),
+])
+def test_a_mixtures_corpora_share_its_workers_by_their_draw_weights(workers, weights, shares):
+    """A mixture's loading workers dealt to its corpora by their draw weights (`Workers.shared`, which a
+    mixture's build reads each corpus's pool from): in proportion, by largest remainders, every drawn
+    corpus one at least, each at the mixture's buffer."""
+    from dew.data.pipeline import Workers
 
-    loading = Loading(workers=8, threads=1, read_buffer=1, worker_buffer=1)
-    data = compile(mix([corpus("rare"), corpus("common")], [1.0, 7.0]).batch(1), read="streamed",
-                   loading=loading)
-    reader = data.train(DataPartition())
-    try:
-        next(reader)
-        plan = record(json.loads(reader.get_state())["dew_data_plan"], "saved plan")
-    finally:
-        reader.close()
-    pools = record(record(plan["topology"], "topology")["pools"], "pools")
-    assert sorted(pools.values()) == [1, 7], pools
-    assert next(count for name, count in pools.items() if "common" in name) == 7, pools
+    pool = Workers(workers, buffer=3)
+    dealt = [pool.shared(weights, index) for index in range(len(weights))]
+    assert [share.count for share in dealt] == shares
+    assert {share.buffer for share in dealt} == {3}
