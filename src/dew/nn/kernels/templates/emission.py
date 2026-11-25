@@ -1090,7 +1090,8 @@ def _filled(jaxpr: jax_core.Jaxpr, stated: Stated) -> jax_core.Jaxpr:
     rule's, `plgpu.kernel`'s) rewritten around it."""
     def rewritten(equation):
         if equation.primitive in (mpmd.mpmd_map_p, pallas_call.pallas_call_p):
-            work = _WORKS[_body(equation)] = launch_work(equation, stated)
+            work, _WARPS[_body(equation)] = _launched(equation, stated)
+            _WORKS[_body(equation)] = work
             return equation.replace(params={**equation.params, "cost_estimate": _estimate(work)})
         return equation.replace(params={name: _filled(value, stated) if isinstance(value, jax_core.Jaxpr)
                                         else value for name, value in equation.params.items()})
@@ -1111,6 +1112,11 @@ def launch_work(kernel, stated: Stated) -> Work:
     times and the rest each program's (`Emitted.issued`), the bytes it states its device's, its span the
     steps its longest program walks (`Stated.longest`, else their mean), and one kernel. Its cost
     estimate's (`_estimate`) and a step's price (`work_of`, `attention_decode.priced_step`) alike."""
+    return _launched(kernel, stated)[0]
+
+
+def _launched(kernel, stated: Stated) -> tuple[Work, float]:
+    """`launch_work`'s work, and the warps a program's issue spreads over (`warps_of`)."""
     forms = forms_of(kernel.params["compiler_params"])
     programs = launch_programs(kernel)
     if kernel.primitive is mpmd.mpmd_map_p:
@@ -1129,7 +1135,19 @@ def launch_work(kernel, stated: Stated) -> Work:
                 device_bytes=stated.bytes_accessed, span=walked, kernels=1, chains=counted.paths(walked))
     # Its walking roles' issue slots, the most one of them issues a step (`Work.issue_excess`).
     issuing = counted.issued(issue_slots, stated.steps, programs)
-    return dataclasses.replace(work, issue_excess=max(0.0, issue_slots(work) - issuing))
+    return (dataclasses.replace(work, issue_excess=max(0.0, issue_slots(work) - issuing)),
+            _warps(counted) if forms is not None else 0.0)
+
+
+def _warps(counted: Emitted) -> float:
+    """The warps a Mosaic GPU program's issue spreads over: each warpgroup's four, weighted by its issue
+    slots against its busiest's, a step of its walk's where any walks (its walking roles alone), else
+    outside it."""
+    walking = [role for role in counted.roles if role.walks]
+    slots = ([issue_slots(_mean(role.walks)) for role in walking] if walking
+             else [issue_slots(role.fixed) for role in counted.roles])
+    busiest = max(slots, default=0.0)
+    return 4 * sum(slots) / busiest if busiest > 0 else 0.0
 
 
 def _estimate(work: Work) -> pl.CostEstimate:
@@ -1142,6 +1160,8 @@ def _estimate(work: Work) -> pl.CostEstimate:
 _WORKS: "weakref.WeakKeyDictionary[jax_core.Jaxpr, Work]" = weakref.WeakKeyDictionary()
 """Each costed launch's work (`launch_work`) by its kernel's body, as `_filled` counted it: a program a
 launch's lowering cache holds (`tuning.lowered_once`) answers with the body it traced once."""
+_WARPS: "weakref.WeakKeyDictionary[jax_core.Jaxpr, float]" = weakref.WeakKeyDictionary()
+"""Each costed launch's issuing warps (`_warps`) by its kernel's body, counted beside its work."""
 
 
 def forms_of(compiler_params) -> Mapping | None:
@@ -1158,6 +1178,12 @@ def forms_of(compiler_params) -> Mapping | None:
 def _body(kernel) -> jax_core.Jaxpr:
     """A kernel equation's body: its `mpmd_map`'s one jaxpr or its `pallas_call`'s."""
     return kernel.params["jaxprs"][0] if kernel.primitive is mpmd.mpmd_map_p else kernel.params["jaxpr"]
+
+
+def warps_of(kernel) -> float | None:
+    """The warps a kernel equation's programs issue over as its costed launch counted them (`_warps`: a
+    Mosaic GPU program's; 0 for another backend's), None where no costed launch counted it."""
+    return _WARPS.get(_body(kernel))
 
 
 def work_of(kernel) -> Work | None:

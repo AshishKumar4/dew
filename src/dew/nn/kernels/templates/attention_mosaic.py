@@ -939,7 +939,8 @@ class MosaicForward(_Mainloop[Tiles]):
             work = emission.work_of(kernel)
             if work is None:
                 return None
-            total += cost.launch_seconds(work, emission.launch_programs(kernel), target, resident=resident)
+            total += cost.launch_seconds(work, emission.launch_programs(kernel), target, resident=resident,
+                                         warps=emission.warps_of(kernel) or 0.0)
         return total
     def _choose_consumers(self, ba: tokamax.BoundArguments, candidates: list[Tiles], *,
                           target: generation.GpuTarget) -> Tiles:

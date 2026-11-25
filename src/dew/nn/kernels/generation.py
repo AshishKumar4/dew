@@ -263,7 +263,9 @@ class Multiprocessor:
     (`shared_bytes_per_clock`), the threads' instructions its warp schedulers issue a clock
     (`issue_per_clock`: four schedulers, each one warp's instruction a clock, CUDA C++ Programming Guide 12.6
     §16.6.1 to §16.8.1 for compute capabilities 7.x to 9.0; 10.x and 12.x, which no edition of it describes,
-    taken alike), and the range its warpgroups' `setmaxnreg` moves a thread's registers in
+    taken alike), the clocks between one warp's issues in a walk (`issue_interval`: its instructions'
+    dependent latency over a walk's mix, so `issue_interval` warps a scheduler keep it issuing; measured, None
+    where not), and the range its warpgroups' `setmaxnreg` moves a thread's registers in
     (`register_raises`, None before Hopper). The defaults are the facts every CUDA compute capability from 7.5
     to 12.x shares (CUDA C++ Programming Guide §5.1, Tables 33 and 34; 128 bytes a clock measured 126 to 128
     on an A100 and an H800, Luo et al. 2025, "Dissecting the NVIDIA Hopper Architecture through
@@ -282,6 +284,7 @@ class Multiprocessor:
     reserved_shared: int = 1024
     shared_bytes_per_clock: int = 128
     issue_per_clock: int = 4 * 32
+    issue_interval: float | None = None
     register_raises: RegisterRaises | None = SETMAXNREG
 
     def raises(self) -> RegisterRaises:
@@ -424,7 +427,11 @@ _TURING = Architecture((), {'16bit': 1024}, Multiprocessor(resident_threads=1024
 # Hopper issues wgmma (sm_90a) and mma.sync, its TMA multicast to a pair of multiprocessors a cluster (the
 # pair CUTLASS's grouped GEMM and cuBLASLt take on an H100).
 _HOPPER = Architecture(('wgmma', 'mma.sync'), {'16bit': 4096, 'tf32': 2048, '8bit': 8192},
-                       Multiprocessor(resident_threads=2048, resident_blocks=32),
+                       # A warp's issue interval in a walk, 4.6 clocks on a GH200: M-NA-21's decode walk
+                       # (Q16/K128, three stages, one warpgroup a program and one resident, one warp a
+                       # scheduler) 345.1 us over its 75.66 us of issue slots, 4.56; M-FS-70's KDA intra
+                       # launch at two warps a scheduler 57% not issued, 2 / 0.43 = 4.65.
+                       Multiprocessor(resident_threads=2048, resident_blocks=32, issue_interval=4.6),
                        vector_per_clock=256, exponentials_per_clock=CUDA_EXPONENTIALS,
                        integer_per_clock=INTEGER_PER_CLOCK, integer_multiply_adds_per_clock=INTEGER_PER_CLOCK,
                        tma=True, dependent_launch=True, cluster=2)

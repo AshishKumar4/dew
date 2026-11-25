@@ -328,6 +328,21 @@ def most(works: Sequence[Work]) -> Work:
                  chains=sum(works, Work()).chains)
     return dataclasses.replace(taken, issue_excess=max(0.0, issued(taken) - max(map(issued, works))))
 
+def latency_bound(work: Work, at: Rates, target: generation.GpuTarget, *, held: float) -> float:
+    """`work`'s issue slots (`issued`) at the rate `at` takes them, when a multiprocessor's schedulers hold
+    `held` warps issuing it: a warp issues once a `Multiprocessor.issue_interval` clocks, so a scheduler of
+    fewer warps than that interval issues that share of its clocks (`issue_interval / warps` the issue
+    slots' seconds over, M-NA-21's one warp a scheduler 4.56); 0 where the target states no interval or no
+    warps are held."""
+    multiprocessor = target.architecture.multiprocessor
+    interval = None if multiprocessor is None else multiprocessor.issue_interval
+    if interval is None or held <= 0 or at.issue in (None, math.inf):
+        return 0.0
+    # Each scheduler issues one warp's instruction a clock, 32 threads' (`Multiprocessor.issue_per_clock`).
+    schedulers = multiprocessor.issue_per_clock / 32
+    return issued(work) / at.issue * max(1.0, interval / (held / schedulers))
+
+
 def multiplied(field: str, flops: float) -> Work:
     """A product's `flops` in the unit its mode takes (`product.product_mode`'s field): on the CUDA cores
     (`operations`, `Precision.HIGHEST`'s fp32), each multiply an operation and its add fused into it, an FFMA
@@ -445,18 +460,23 @@ def streamed(per_program_bytes: float, busiest: int, bandwidth: float, multiproc
 
 
 def launch_seconds(work: Work, programs: int, target: generation.GpuTarget, *,
-                   resident: int = 1) -> float:
+                   resident: int = 1, warps: float = 0.0) -> float:
     """One kernel launch's seconds on `target` for `programs` programs at `resident` programs per
-    multiprocessor: the longer of the busiest multiprocessor's throughput work (`ceil(n / SMs)` programs
-    sharing one multiprocessor's units), its overlapped latency waves (`ceil(n / wave)` waves of `path`),
-    plus launch latency, against the whole launch's device bound (`seconds`). Co-resident programs share one
-    multiprocessor's throughput units rather than multiplying its peak by `resident`, while overlapping
-    their dependent paths (rows 6216, 10809, 10810)."""
+    multiprocessor, each issuing over `warps` warps (`emission.warps_of`; 0 where unknown): the longer of
+    the busiest multiprocessor's throughput work (`ceil(n / SMs)` programs sharing one multiprocessor's
+    units), its overlapped latency waves (`ceil(n / wave)` waves of `path`), plus launch latency, against
+    the whole launch's device bound (`seconds`). Co-resident programs share one multiprocessor's throughput
+    units rather than multiplying its peak by `resident`, while overlapping their dependent paths (rows
+    6216, 10809, 10810). Its issue slots take a warp's issue interval (`Multiprocessor.issue_interval`) over
+    the warps each scheduler holds, where fewer warps than that interval leave it idle between a warp's
+    instructions (`latency_bound`: rows 5274, 4123)."""
     count = max(programs, 1)
     shared = {unit: getattr(work, unit) / count for unit in (*ISSUED_UNITS, "device_bytes")}
     per_program = dataclasses.replace(work, **shared, kernels=0)
     per_sm = spread(count, target.multiprocessors or 1)
     waves = spread(count, wave(target.multiprocessors, resident))
-    unit_seconds = max(units(per_program, rates(target, device=False))[0])
+    at = rates(target, device=False)
+    unit_seconds = max(*units(per_program, at)[0],
+                       latency_bound(per_program, at, target, held=min(resident, per_sm) * warps))
     wave_seconds = max(per_sm * unit_seconds, waves * path(per_program, target))
     return max(wave_seconds + (target.launch_seconds or 0.0), seconds(work, target))
