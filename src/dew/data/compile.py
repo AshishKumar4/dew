@@ -57,6 +57,7 @@ from dew.data.analysis import (
     _promoted,
     _stated,
     _steps,
+    _store,
     _until,
     _volatile,
     _written,
@@ -88,6 +89,7 @@ from dew.data.dataset import (
     phase_stages,
 )
 from dew.data.epochs import epoch_records, order_records, tail
+from dew.data.explained import Chooser, Reading
 from dew.data.facts import laid_out, merge_facts, row_lengths
 from dew.data.handed import Handed, native_loader
 from dew.data.handoff import record_stage_of
@@ -800,6 +802,7 @@ def compile(
     # A dataset a stage returned as a dataset (`Dataset.pipe`) is read as its chain.
     train, validation = train._chain(), None if validation is None else validation._chain()
     branches = (train,) if validation is None else (train, validation)
+    chooser: Chooser = "compile" if read else "chain" if train.mode else "sources"
     read = read or train.mode or _preferred_read(branches, provision=provision)
     loading = loading or train._loading or _TRAINING_LOADING
     if isinstance(train.source, Phases) and examples is None:
@@ -809,6 +812,7 @@ def compile(
             host=host,
             objective=objective,
             read=read,
+            chooser=chooser,
             provision=provision,
             loading=loading,
             seed=seed,
@@ -827,7 +831,8 @@ def compile(
                      seed=seed, rejections=rejections, examples=examples, widths=widths, measured=measured,
                      epochs=epochs, counting=counting)
     batches = _run_batches(staged, steps=steps, examples=examples, epochs=epochs, tokens=tokens)
-    compiled = _compiled(staged, _coordinated(staged.train), host=host, resume=resume, batches=batches)
+    compiled = _compiled(staged, _coordinated(staged.train), host=host, resume=resume, batches=batches,
+                         chooser=chooser)
     loader = dataclasses.replace(compiled, resume=resume)
     if staged.passes is not None and epochs is not None:
         return dataclasses.replace(loader, examples=epochs * staged.passes, epochs=epochs,
@@ -1141,11 +1146,12 @@ def _compiled(
     *,
     host: tuple[HostStep, ...],
     resume: DataResume,
+    chooser: Chooser,
     batches: int | None = None,
 ) -> Loader:
     """The readers of `staged`, each training batch's packed windows laid out
     as `packed` declares them and each validation batch's as its own packs do
-    (`_held_coordinated`)."""
+    (`_held_coordinated`), and how its training read reads, its read chosen by `chooser` (`Reading`)."""
     train, validation, original, build = staged.train, staged.validation, staged.original, staged.build
     counts, validation_counts = staged.counts, staged.validation_counts
     read, seed, batch, global_order = (
@@ -1237,7 +1243,21 @@ def _compiled(
         widths=_bound_widths(original),
         tail=tail(train, build),
         order_records=ordered,
+        reading=Reading(read, chooser, build.loading, _workers(train, build.loading), build.pools(train),
+                        faster=_faster(original, build, records)),
     )
+
+
+def _faster(original: Pipeline, build: _Build, records: int | None) -> Read | None:
+    """`memory`, where `original` is read otherwise, every source it reads can be read into memory, and its
+    `records`, at the bytes its sampled batches' rows hold (`Sized`), fit in what the read may hold
+    (`Reading.faster`); None otherwise, or where nothing measured its rows or counts its records."""
+    sized = build.loading.sized
+    if build.read == "memory" or sized is None or records is None:
+        return None
+    if not all(_store(source).supports("memory") for _, source in _leaves(original)):
+        return None
+    return "memory" if records * sized.batch_bytes <= sized.budget * build.batch else None
 
 
 def _fixed_fields(pipeline: Pipeline, host: Sequence[HostStep]) -> Mapping[str, tuple[int | None, ...]]:
@@ -1539,14 +1559,14 @@ def _reorders(pipeline: Pipeline) -> bool:
 
 def _built_phases(source: Phases, staged: Sequence[tuple[_Staged, int | None]],
                   packed: tuple[Coordinated, ...], *,
-                  host: tuple[HostStep, ...], resume: DataResume, steps: int | None,
+                  host: tuple[HostStep, ...], resume: DataResume, chooser: Chooser, steps: int | None,
                   budget: int | None, tokens: bool) -> list[tuple[Loader, int | None]]:
     """Each staged phase compiled (`_compiled`) at the batches it reads (`_phase_batches`), beside its end:
     every phase of a run runs the first's device steps, so a phase whose own differ is refused."""
     built: list[tuple[Loader, int | None]] = []
     for index, (phase, end) in enumerate(staged):
         batches = _phase_batches(source, index, phase, steps=steps, budget=budget, tokens=tokens)
-        loaded = _compiled(phase, packed, host=host, resume=resume, batches=batches)
+        loaded = _compiled(phase, packed, host=host, resume=resume, chooser=chooser, batches=batches)
         if built and loaded.device != built[0][0].device:
             # The run applies one set of device steps to every batch (`Loader.device`), so a phase
             # whose own differ would run the first phase's.
@@ -1573,6 +1593,7 @@ def _compile_phases(
     host: tuple[HostStep, ...],
     objective: ObjectiveData | None,
     read: Read,
+    chooser: Chooser,
     provision: bool,
     loading: Loading,
     seed: int,
@@ -1614,8 +1635,8 @@ def _compile_phases(
               else _in_one_order(source, first, staged_at))
     # Every phase declares the most documents a window of any phase holds, so the run steps one program.
     packed = _coordinated(*(phase.train for phase, _ in staged))
-    built = _built_phases(source, staged, packed, host=host, resume=resume, steps=steps, budget=budget,
-                          tokens=tokens)
+    built = _built_phases(source, staged, packed, host=host, resume=resume, chooser=chooser, steps=steps,
+                          budget=budget, tokens=tokens)
 
     # The loaders the run's reads opened, in the order they opened them, whose counts its statistics are
     # (`statistics_of`): the first phase's from the start, each later one's as the run reaches it.
@@ -1637,7 +1658,7 @@ def _compile_phases(
         if phase is staged[index][0]:
             return counted(built[index][0])
         batches = _phase_batches(source, index, phase, steps=steps, budget=budget, tokens=tokens)
-        return counted(_compiled(phase, packed, host=host, resume=resume, batches=batches))
+        return counted(_compiled(phase, packed, host=host, resume=resume, chooser=chooser, batches=batches))
 
     @functools.cache
     def resolved(index: int, ends: tuple[int, ...]) -> _Staged:
