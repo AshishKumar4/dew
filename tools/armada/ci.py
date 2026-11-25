@@ -1475,9 +1475,10 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # This attempt's peak, and an earlier attempt's where it ran tests this row carries (`progress.resumed`).
     peaks = [found for found in (progress.task_peak(host), peak_before) if found is not None]
     peak = max(peaks, default=None)
-    cases, reported = reported_cases(report)
-    # Its last process's report is what says it reported: an earlier one's cases are no evidence of it.
-    cases = earlier + cases
+    # Its last process's report is graded as a run of the tests left, by its own cases alone (`terminal`): an
+    # earlier process's cases are no evidence it ran them. Each earlier process's failures are added after.
+    terminal, reported = reported_cases(report)
+    cases = earlier + terminal
     # How collection found each file: a file with no row is green only where every test it holds was set aside
     # by the selection, as pytest reported it (executed.py); a run that wrote no report greens nothing.
     counts = read_json(collection) or {}
@@ -1496,10 +1497,14 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # A row named by a test node (`file::test`) is graded by its own cases (`grading.of`), its file's
     # collection and visits its own: a GPU lane runs each such row in a task of its own (`lane_units`).
     for name in tests:
-        own = [case for case in cases if grading.of(case, name)]
-        red, failed, cause = grading.graded(name, own, cases, counts.get(grading.owning(name), {}),
+        own = [case for case in terminal if grading.of(case, name)]
+        red, failed, cause = grading.graded(name, own, terminal, counts.get(grading.owning(name), {}),
                                             reported, returncode, deadline if expired else None,
                                             running, pid.is_file(), running)
+        if before := [case for case in earlier if grading.of(case, name)]:
+            # Its earlier processes each reported, recycled (`tested`'s loop): their failures are its too.
+            red_before, failed_before, _ = grading.graded(name, before, earlier, {}, True, 0, None, None)
+            red, failed = red_before + red, failed_before + failed
         # A file that never started in a task that ran out of time has no seconds (`deadline_shares`): its
         # row is `unobserved`, and armada weighs no plan by it.
         unobserved = name not in shares

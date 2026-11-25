@@ -128,6 +128,26 @@ def test_a_recycled_rows_last_process_that_leaves_no_report_is_red(ci, tmp_path,
     assert row["exitCode"] != 0
 
 
+def test_a_recycled_rows_last_process_that_reports_none_of_the_tests_left_is_red(
+        ci, tmp_path, monkeypatch):
+    """A dry prepare's row whose first process recycled after reporting, its last writing a valid report of no
+    test (its collection's hook dropping the tests left without deselecting them, pytest's exit 5), is red: the
+    last report is graded by its own cases alone, an earlier process's no evidence of the tests left."""
+    written(tmp_path, {"test_dropped.py": "def test_a():\n    pass\ndef test_b():\n    pass\n"})
+    conftest = tmp_path / "tests" / "conftest.py"
+    conftest.write_text((conftest.read_text() if conftest.is_file() else "")
+                        + "\nimport os\n\n\ndef pytest_collection_modifyitems(items):\n"
+                          "    if os.environ.get('DEW_CONTINUES_ROW'):\n        items.clear()\n")
+    interpreter(tmp_path, "3.12")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ARMADA_ARTIFACTS", str(tmp_path / "artifacts"))
+    out = tmp_path / "verdict.json"
+    ci.tested("3.12", ["tests/test_dropped.py"], "", out, 600.0, "off", 5.0, "", {}, recorded=False,
+              recycle_at=1)
+    [row] = json.loads(out.read_text())["rows"]
+    assert row["exitCode"] != 0
+
+
 def test_a_report_its_killed_pytest_cut_short_greens_nothing_and_the_tasks_other_files_are_graded(
         ci, tmp_path, monkeypatch):
     """A file whose pytest left its JUnit report and its collection's record cut short (killed as it wrote
