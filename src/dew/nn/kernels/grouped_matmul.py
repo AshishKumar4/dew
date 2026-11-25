@@ -29,6 +29,7 @@ import contextlib
 import contextvars
 import dataclasses
 import functools
+import itertools
 import math
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, ClassVar, Protocol
@@ -36,22 +37,25 @@ from typing import TYPE_CHECKING, ClassVar, Protocol
 import jax
 import jax.numpy as jnp
 
-from . import generation, selection
+from . import generation, grouped_cells, selection
 from .formats import TernaryWeights
 from .generation import INHERENT
 from .grouped_cells import (
-    B200_GRID,
-    EM35D,
-    M_EM_36,
-    M_EM_52,
+    FOUR_B_CELLS,
+    M_EM_2,
     M_EM_65,
     M_EM_67,
+    M_FS_34,
     MEASURED,
     NORMED_08B,
     NORMED_4B_8B,
+    REFERENCE,
+    SCOREBOARDS,
+    TEMPLATE,
     TOGETHER,
     Kind,
     Made,
+    Timed,
 )
 from .grouped_cutlass import CutlassGmm, CutlassTgmm
 from .grouped_launch import INTERPRETED, _GroupedLaunch
@@ -1936,7 +1940,7 @@ class GroupedCase:
     whether they see its operands whole (`whole`: no automatic mesh axis splits them,
     `dew.nn.sharding.automatic_axes`), the `product` it declares, its `extents`, its launches bound to it
     (`call`) and the `kind` of call it is (`Kind`, as `gmm_call` and `tgmm_call` state it), which with the
-    device's instruction family is its cell (`DECLARED`)."""
+    device's generation is its cell (`DECLARED`)."""
 
     placed: bool
     whole: bool
@@ -1962,7 +1966,14 @@ class GroupedCase:
 
     @property
     def cell(self) -> tuple[str | None, Kind]:
-        return generation.family(self.call.target.generation), self.kind
+        """Its cell among `DECLARED`: its target's generation, whose receipts alone time it (one instruction
+        family's generations part in speed against their references, `grouped_cells`), and its kind; a
+        product a receipt timed whose matrix holds no cell of its own (its winner its kind's route) its
+        kind's."""
+        name = self.call.target.generation
+        if self.kind.matrix is None or (name, self.kind) in DECLARED:
+            return name, self.kind
+        return name, self.kind._replace(matrix=None, span=None, formed=False)
 
 
 _Need = selection.Requirement[GroupedCase]
@@ -2054,77 +2065,62 @@ PRODUCTS_APART = selection.Kernel[GroupedCase](
 each its own."""
 
 
-DECLARED: dict[tuple[str | None, Kind], tuple[selection.Kernel[GroupedCase], str]] = {
-    **{(receipt.family, Kind(dense=True, made=receipt.made, together=True, matrix=matrix)): (
-        {MOSAIC.name: MOSAIC, APART.name: PRODUCTS_APART}[receipt.winner], receipt.evidence)
-       for receipt in TOGETHER for matrix in receipt.timed.matrices},
-    **{(family, Kind(dense=True, made=made, matrix=matrix, formed=True)): (MOSAIC, M_EM_65)
-       for family in ('mma.sync', 'wgmma') for made in (Made.FORWARD, Made.KERNEL_GRADIENT)
-       for matrix in NORMED_08B},
-    **{('wgmma', Kind(dense=True, made=made, matrix=matrix, formed=True)): (MOSAIC, M_EM_67)
-       for made in (Made.FORWARD, Made.KERNEL_GRADIENT) for matrix in NORMED_4B_8B},
-    ('mma.sync', Kind(dense=True, made=Made.FORWARD)):
-        (XLA, "DENSE1 (A100, a55c8ffb2, one program a multiprocessor): Mosaic 1.923x and Triton 1.947x "
-             "XLA's dot (cuBLAS), geomean of 10 projections at 8192 tokens; M-FS-9 (RTX PRO 6000, "
-             "d7014761a, mma.sync.fed at two 64 x 64 programs a multiprocessor): Mosaic 1.99x, Triton "
-             "1.09x, geomean of 13"),
-    ('mma.sync', Kind(dense=True, made=Made.INPUT_GRADIENT)):
-        (XLA, "DENSE1 (A100, one program a multiprocessor): Mosaic 2.881x, Triton 1.839x XLA's dot; "
-             "M-FS-9 (RTX PRO 6000): Mosaic 3.00x, Triton 1.10x"),
-    ('mma.sync', Kind(dense=True, made=Made.KERNEL_GRADIENT)):
-        (XLA, "DENSE1 (A100, one program a multiprocessor): Mosaic 1.964x, Triton 1.735x XLA's dot; "
-             "M-FS-9 (RTX PRO 6000): Mosaic 1.72x, Triton 1.28x"),
-    ('mma.sync', Kind(dense=False, made=Made.FORWARD)):
-        (CUTLASS, "M-EM-2 (A100-SXM4-40GB at 1095 MHz, base/kernels 59b96a9b4c2, 400 role-swapped pairs, A/A "
-                 "within 0.993-1.008): the template 1.07x CUTLASS's time, geomean of 5 grouped MoE rows "
-                 "(Qwen3-30B-A3B up 1.193, down 1.090; Mixtral up 0.795, down 1.090; GPT-OSS-20B up 1.244)"),
-    ('wgmma', Kind(dense=True, made=Made.FORWARD)):
-        (XLA, "DENSE1 (H100, a55c8ffb2): Mosaic 1.067x and Triton 1.616x XLA's dot (cuBLAS), geomean of "
-             "10 projections at 8192 tokens"),
-    ('wgmma', Kind(dense=True, made=Made.INPUT_GRADIENT)):
-        (XLA, "DENSE1 (H100): Mosaic 1.048x, Triton 1.738x XLA's dot"),
-    ('wgmma', Kind(dense=True, made=Made.KERNEL_GRADIENT)):
-        (XLA, "DENSE1 (H100): Mosaic 1.049x, Triton 1.149x XLA's dot"),
-    ('wgmma', Kind(dense=True, made=Made.FORWARD, matrix=(2560, 9216))): (
-        MOSAIC, f"{M_EM_36}: the template 0.866x XLA's dot"),
-    ('wgmma', Kind(dense=True, made=Made.FORWARD, matrix=(9216, 2560))): (
-        XLA, f"{M_EM_36}: the template 1.01x XLA's dot"),
-    ('wgmma', Kind(dense=True, made=Made.FORWARD, matrix=(2560, 1024))): (
-        MOSAIC, f"{M_EM_36}: the template 0.96x XLA's dot"),
-    ('wgmma', Kind(dense=True, made=Made.FORWARD, matrix=(2560, 64))): (
-        XLA, f"{M_EM_36}: the template 1.294x XLA's dot"),
-    ('wgmma', Kind(dense=True, made=Made.INPUT_GRADIENT, matrix=(2560, 9216))): (
-        MOSAIC, f"{M_EM_36}: the template 0.943x XLA's dot"),
-    ('wgmma', Kind(dense=True, made=Made.INPUT_GRADIENT, matrix=(9216, 2560))): (
-        MOSAIC, f"{M_EM_36}: the template 0.912x XLA's dot"),
-    ('wgmma', Kind(dense=True, made=Made.INPUT_GRADIENT, matrix=(2560, 1024))): (
-        MOSAIC, f"{M_EM_36}: the template 0.949x XLA's dot"),
-    ('wgmma', Kind(dense=True, made=Made.INPUT_GRADIENT, matrix=(2560, 64))): (
-        MOSAIC, f"{M_EM_36}: the template 0.93x XLA's dot"),
-    ('wgmma', Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 9216))): (
-        XLA, f"{M_EM_52}: the template 1.042x XLA's dot (1.559 against 1.496 ms)"),
-    ('wgmma', Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(9216, 2560))): (
-        MOSAIC, f"{M_EM_52}: the template 0.755x XLA's dot (1.493 against 1.977 ms)"),
-    ('wgmma', Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 1024))): (
-        MOSAIC, f"{M_EM_52}: the template 0.784x XLA's dot (0.189 against 0.241 ms)"),
-    ('wgmma', Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 64))): (
-        MOSAIC, f"{M_EM_52}: the template 0.39x XLA's dot (0.053 against 0.136 ms)"),
-    ('tcgen05', Kind(dense=True, made=Made.FORWARD, matrix=(2560, 64))): (
-        XLA, f"{B200_GRID}: the template 1.216x XLA's dot (em35d 1.225x)"),
-    ('tcgen05', Kind(dense=True, made=Made.INPUT_GRADIENT, matrix=(2560, 9216))): (
-        XLA, f"{EM35D}: the template 1.009x XLA's dot"),
-    ('tcgen05', Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 9216))): (
-        XLA, f"{B200_GRID}: the template 1.355x XLA's dot (em35d 1.303x)"),
-    ('tcgen05', Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 1024))): (
-        XLA, f"{B200_GRID}: the template 1.148x XLA's dot (em35d 1.326x)"),
-}
+def _declared() -> dict[tuple[str | None, Kind], tuple[selection.Kernel[GroupedCase], str]]:
+    """`DECLARED`, from the receipts that hold its cells (`grouped_cells`): each scoreboard's kinds and the
+    products the template clearly won on a kind XLA keeps (`SCOREBOARDS`), the A10's and L4's kinds
+    (`M_FS_34`), the A100's grouped forward (`M_EM_2`), products in one launch timed apart (`TOGETHER`), and
+    the products other receipts timed (normed projections formed, M-EM-65 and M-EM-67; the 4B's,
+    `FOUR_B_CELLS`) where their winner is not their kind's route, none returning to XLA on a kind a
+    scoreboard put on the template."""
+    cells: dict[tuple[str | None, Kind], tuple[selection.Kernel[GroupedCase], str]] = {}
+    replaced = set()
+    for board in SCOREBOARDS:
+        for made, projections in board.times.items():
+            if board.winner(made) == TEMPLATE:
+                replaced.add((board.generation, made))
+                continue
+            cells[board.generation, Kind(dense=True, made=made)] = (XLA, board.why(made))
+            for projection in projections:
+                if board.ahead(made, projection):
+                    cells[board.generation, Kind(dense=True, made=made,
+                                                 matrix=grouped_cells.PROJECTIONS[projection],
+                                                 span=(board.rows, board.rows))] = (
+                        MOSAIC, board.why(made, projection))
+    for name, receipt in M_FS_34.items():
+        for made in (Made.FORWARD, Made.INPUT_GRADIENT, Made.KERNEL_GRADIENT):
+            cells[name, Kind(dense=True, made=made)] = (XLA, receipt)
+    cells['sm80', Kind(dense=False, made=Made.FORWARD)] = (CUTLASS, M_EM_2)
+    for receipt in TOGETHER:
+        for matrix in receipt.timed.matrices:
+            cells[receipt.generation, Kind(dense=True, made=receipt.made, together=True, matrix=matrix,
+                                           span=receipt.timed.span)] = (
+                {MOSAIC.name: MOSAIC, APART.name: PRODUCTS_APART}[receipt.winner], receipt.evidence)
+    routes = {TEMPLATE: MOSAIC, REFERENCE: XLA}
+    timed = [((name, made, matrix, False, (24576, 49152)), (winner, receipt))
+             for (name, made, matrix), (winner, receipt) in FOUR_B_CELLS.items()]
+    for normed, receipt, generations in (
+            (Timed(frozenset(NORMED_08B), 12288, 12288), M_EM_65, ('sm80', 'sm90')),
+            (Timed(frozenset(NORMED_4B_8B), 4096, 12288), M_EM_67, ('sm90',))):
+        timed += [((name, made, matrix, True, normed.span), (TEMPLATE, receipt)) for name, made, matrix in
+                  itertools.product(generations, (Made.FORWARD, Made.KERNEL_GRADIENT), normed.matrices)]
+    for (name, made, matrix, formed, span), (winner, receipt) in timed:
+        kind = XLA if (name, Kind(dense=True, made=made)) in cells else MOSAIC
+        if routes[winner] is not kind and not (winner == REFERENCE and (name, made) in replaced):
+            cells[name, Kind(dense=True, made=made, matrix=matrix, formed=formed, span=span)] = (
+                routes[winner], receipt)
+    return cells
+
+
+DECLARED = _declared()
 """The grouped GEMM's declared cells (`selection.Op.declared`), where a route measured faster than the
 template's default on a generation, each with its receipt (owner, bible da64ae5; "whatever is the
-best/fastest remains the route until our templates catch up", ops 361caffc): (instruction family, kind of
-call) to (that route's kernel, the receipt). A product of a matrix a receipt timed (`MEASURED`) is a cell of
-its own, which that receipt's winner holds: the template's where it won (on Hopper, over its kind's XLA
-cell), XLA's where it lost (on Blackwell, where the template is the kind's default); one timed whose cell is
-undeclared takes the template. A cell leaves the list once the template measures at least as fast on it.
+best/fastest remains the route until our templates catch up", ops 361caffc; bible §6 2026-11-24: "templates
+should replace ref routes on parity"): (device generation, kind of call) to (that route's kernel, the
+receipt). A kind takes the template once its receipt's geomean is at or under XLA's, whole
+(`grouped_cells.Scoreboard`), and a generation no receipt timed takes the template; a product of a matrix a
+receipt timed (`MEASURED`) over its rows is a cell of its own where its winner is not its kind's route, its
+kind's otherwise (`GroupedCase.cell`). The list shrinks as the template climbs: no product returns to XLA on
+a kind the template took.
 A cell's route holds no more of a step's memory than the template's: each product's reverse mode returns
 its rows' cotangent only with its kernel gradient formed (`derivatives.with_gradients_formed`, row 6027),
 whichever route forms it (tests/test_declared_cells_memory.py). Nothing is ranked at runtime. A
@@ -2166,13 +2162,15 @@ def grouped_case(launches, arguments, options, *, product: Product, whole: bool)
     # A left operand a prologue forms (a norm's, fused by the algebra's recognition) is a cell of its own
     # where a receipt timed it formed; elsewhere it is its matrix's cell as any call's (train 977 F1: the
     # 4B's normed projections keep the template FOUR_B's receipts measured).
-    family = generation.family(call.target.generation)
+    name = call.target.generation
 
-    def timed(*, formed: bool) -> bool:
-        return matrix is not None and any(timed.holds(matrix, rows)
-                                          for timed in MEASURED.get((family, made, formed), ()))
+    def timed(*, formed: bool) -> Timed | None:
+        """The receipt timing this product's matrix over its rows, formed or not, None where none did."""
+        return None if matrix is None else next(
+            (timed for timed in MEASURED.get((name, made, formed), ()) if timed.holds(matrix, rows)), None)
 
-    formed = options['hooks'].prologue is not None and timed(formed=True)
+    formed_by = timed(formed=True) if options['hooks'].prologue is not None else None
+    formed = formed_by is not None
     # Products side by side or chained are one launch's, a cell of their own, keyed by their joined matrix
     # where a receipt timed it (`TOGETHER`), whatever their first matrix's.
     compound = _compound(call)
@@ -2180,14 +2178,16 @@ def grouped_case(launches, arguments, options, *, product: Product, whole: bool)
     if together is not None:
         # Of the arithmetic the receipt timed: its operands' dtype too (base review b68fc2382 F4: an fp16
         # chain inherited the bf16 win).
-        arithmetic = (family, made, jnp.dtype(arguments[0].dtype).name)
-        timed_together = any(receipt.timed.holds(together, rows) for receipt in TOGETHER
-                             if (receipt.family, receipt.made, receipt.dtype) == arithmetic)
-        matrix_of = together if timed_together else None
+        arithmetic = (name, made, jnp.dtype(arguments[0].dtype).name)
+        found = next((receipt.timed for receipt in TOGETHER if receipt.timed.holds(together, rows)
+                      and (receipt.generation, receipt.made, receipt.dtype) == arithmetic), None)
+        matrix_of = together if found is not None else None
     else:
-        matrix_of = matrix if formed or timed(formed=False) else None
+        found = formed_by if formed else timed(formed=False)
+        matrix_of = matrix if found is not None else None
     kind = Kind(bool(options['dense']), made, fp8=fp8, gathered=gathered, scattered=scattered,
-                matrix=matrix_of, formed=formed, together=together is not None)
+                matrix=matrix_of, formed=formed, together=together is not None,
+                span=None if found is None else found.span)
     cuda = generation.capability(call.target.generation)
     floor = cuda is not None and cuda[0] * 10 + cuda[1] >= generation.BF16_GPU
     placed = generation.tpu(call.target) or floor

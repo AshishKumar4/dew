@@ -63,13 +63,17 @@ class Output(NamedTuple):
     product's scales as its consumer reads them: a 128-row share's 128 bytes of E8M0 or 512 of fp32 a
     stored row, whatever the tile's width): its chunk's buffer `[chunk // divisor, rows]`, stored whole at
     its share's first row, the tensor's bound clipping the rows past its last (`staged_rows`), so a call
-    whose shares store whole rows (a dense one's) alone takes one."""
+    whose shares store whole rows (a dense one's) alone takes one. `narrowed`, its value already a
+    `divisor`-th of the tile's columns as its epilogue computes it (a wide gated product's hidden activation,
+    one of each gate and up column pair, `templates.gemm.wide`), stored as computed, a chunk's `chunk //
+    divisor` columns at its tile column over `divisor`, as a packed one's are."""
 
     shape: tuple[int, int]
     dtype: jax.typing.DTypeLike
     divisor: int = 1
     write: Callable | None = None
     transposed: bool = False
+    narrowed: bool = False
 
     @classmethod
     def of(cls, output: "Output | tuple[tuple[int, int], jax.typing.DTypeLike]") -> "Output":
@@ -214,7 +218,8 @@ def column_chunks(value: jax.Array, width: int) -> list[tuple[int, jax.Array]]:
 
 
 def staged_chunks(smem, value: jax.Array, ref, place: tuple, *, write: Callable = written,
-                  waits: tuple[int, ...] | None = None, divisor: int = 1, transposed: bool = False) -> None:
+                  waits: tuple[int, ...] | None = None, divisor: int = 1, transposed: bool = False,
+                  narrowed: bool = False) -> None:
     """A consumer's share `value` of an output tile staged through its chunk buffers (`smem`, `[buffers,
     rows, columns]`) a buffer's columns at a time (`column_chunks`) and stored to `ref` at `place`
     (`(row_start, first, stored, column, *ladder)`, `staged_rows`), each chunk's buffer written once the
@@ -223,13 +228,15 @@ def staged_chunks(smem, value: jax.Array, ref, place: tuple, *, write: Callable 
     rows (a ragged last tile's second consumer's) stages nothing: no buffer written, no group issued, so
     every chunk staged commits at least one (`buffer_waits`). An output stored packed (`divisor`,
     `Output.divisor`) stages a buffer's columns times it of the tile a chunk, stored at its tile column over
-    it; `transposed` (`Output.transposed`), its buffer `[columns, rows]`, stored whole (`transposed_rows`)."""
+    it; `transposed` (`Output.transposed`), its buffer `[columns, rows]`, stored whole (`transposed_rows`);
+    `narrowed` (`Output.narrowed`), its value already its stored columns, a buffer's at a time."""
     pl.when(place[2] > 0)(functools.partial(staged, smem, value, ref, place, write=write, waits=waits,
-                                            divisor=divisor, transposed=transposed))
+                                            divisor=divisor, transposed=transposed, narrowed=narrowed))
 
 
 def staged(smem, value: jax.Array, ref, place: tuple, *, write: Callable = written,
-           waits: tuple[int, ...] | None = None, divisor: int = 1, transposed: bool = False) -> None:
+           waits: tuple[int, ...] | None = None, divisor: int = 1, transposed: bool = False,
+           narrowed: bool = False) -> None:
     """`staged_chunks`' chunks staged whatever rows `place` stores: each its buffer's wait, its write and
     its stores."""
     buffers, width = smem.shape[0], smem.shape[-2 if transposed else -1]
@@ -239,7 +246,7 @@ def staged(smem, value: jax.Array, ref, place: tuple, *, write: Callable = writt
             raise ValueError("a scattered output's rows land a row at a time as computed, none packed")
     elif transposed:
         _whole_shares(smem.shape[-1], width, ref.shape[-1], first, stored)
-    elif divisor > 1:
+    elif divisor > 1 and not narrowed:
         _aligned_ladder(width * jax.dtypes.itemsize_bits(smem.dtype) // 8, first, ladder)
         if (ladder[1] if len(ladder) > 1 else 1) == 1 and ref.shape[-1] % width:
             # A rung of one row is one contiguous run, which Mosaic GPU copies by a linear bulk copy clamped
@@ -247,16 +254,17 @@ def staged(smem, value: jax.Array, ref, place: tuple, *, write: Callable = writt
             # row's end would write into the next row.
             raise ValueError(f"a packed chunk of {width} columns copied a row at a time over "
                              f"{ref.shape[-1]} columns runs its last chunk into the next row")
-    chunks = column_chunks(value, width * divisor)
+    # One placement for every form: a chunk's first stored column is its tile column over `divisor`, a
+    # narrowed value's chunks already in stored columns.
+    chunks = column_chunks(value, width if narrowed else width * divisor)
     waits = buffer_waits(len(chunks), buffers) if waits is None else waits
     for chunk, (start, piece) in enumerate(chunks):
         plgpu.wait_smem_to_gmem(waits[chunk], wait_read_only=True)
+        at = (column + start * (divisor if narrowed else 1)) // divisor
         if transposed:
-            transposed_rows(smem.at[chunk % buffers], piece, ref, row_start, (column + start) // divisor,
-                            write=write)
+            transposed_rows(smem.at[chunk % buffers], piece, ref, row_start, at, write=write)
             continue
-        staged_rows(smem.at[chunk % buffers], piece, ref, row_start, first, stored,
-                    (column + start) // divisor, *ladder, write=write)
+        staged_rows(smem.at[chunk % buffers], piece, ref, row_start, first, stored, at, *ladder, write=write)
 
 
 def _whole_shares(rows: int, columns: int, extent: int, first, stored) -> None:

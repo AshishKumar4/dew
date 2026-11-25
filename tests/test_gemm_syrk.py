@@ -534,30 +534,37 @@ def test_newton_schulz_reaches_mosaic_syrk_and_honors_dot_algorithm():
 
 
 @lowers("sm90")
-def test_syrk_measured_gram_gates_to_measured_bf16_cells():
-    """`syrk.measured_gram` admits whole-tile bf16 Gram shapes filling at least one SM wave on measured
-    generations (`sm80`, `sm90`) with no hardcoded shape table, refusing non-whole-tile, underfilled, fp32
-    output, fp16 input, and unmeasured generations (rows 11941, 12163)."""
+def test_syrk_measured_gates_grams_and_polynomials_to_measured_bf16_cells():
+    """`syrk.measured` admits whole-tile bf16 Gram and polynomial shapes filling at least one SM wave on
+    measured generations (`sm80`, `sm90`) with no hardcoded shape table, refusing non-whole-tile,
+    underfilled, fp32 output, fp16 input, and unmeasured generations (rows 11941, 12163, 5972)."""
     from kernel_compile import lowered_for
 
     sm80, sm90 = generation.gpu_target("sm80"), generation.gpu_target("sm90")
-    assert syrk.measured_gram(sm80, (28, 2560, 4096), jnp.bfloat16, transpose=False, out_dtype=jnp.bfloat16)
-    assert syrk.measured_gram(sm90, (36, 4096, 14336), jnp.bfloat16, transpose=True, out_dtype=jnp.bfloat16)
+    assert syrk.measured(sm80, (28, 2560, 4096), jnp.bfloat16, transpose=False, out_dtype=jnp.bfloat16)
+    assert syrk.measured(sm90, (36, 4096, 14336), jnp.bfloat16, transpose=True, out_dtype=jnp.bfloat16)
     # Derived shape-class rule admits arbitrary model layer counts and single large matrices >= 1 wave.
-    assert syrk.measured_gram(sm80, (29, 2560, 4096), jnp.bfloat16, transpose=False, out_dtype=jnp.bfloat16)
-    assert syrk.measured_gram(sm90, (1, 4096, 4096), jnp.bfloat16, transpose=False, out_dtype=jnp.bfloat16)
+    assert syrk.measured(sm80, (29, 2560, 4096), jnp.bfloat16, transpose=False, out_dtype=jnp.bfloat16)
+    assert syrk.measured(sm90, (1, 4096, 4096), jnp.bfloat16, transpose=False, out_dtype=jnp.bfloat16)
     # Refuses non-whole-tile shapes, underfilled grids, non-bf16 dtypes, and unmeasured generations.
-    assert not syrk.measured_gram(sm90, (28, 130, 130), jnp.bfloat16, transpose=False,
+    assert not syrk.measured(sm90, (28, 130, 130), jnp.bfloat16, transpose=False,
                                   out_dtype=jnp.bfloat16)
-    assert not syrk.measured_gram(sm90, (1, 512, 512), jnp.bfloat16, transpose=False,
+    assert not syrk.measured(sm90, (1, 512, 512), jnp.bfloat16, transpose=False,
                                   out_dtype=jnp.bfloat16)
-    assert not syrk.measured_gram(sm90, (28, 2560, 4096), jnp.bfloat16, transpose=False,
+    assert not syrk.measured(sm90, (28, 2560, 4096), jnp.bfloat16, transpose=False,
                                   out_dtype=jnp.float32)
-    assert not syrk.measured_gram(sm80, (28, 2560, 4096), jnp.float16, transpose=False,
+    assert not syrk.measured(sm80, (28, 2560, 4096), jnp.float16, transpose=False,
                                   out_dtype=jnp.float16)
+    # The polynomial (M-NG-5: stacked 1.17-1.21x on an A100, 1.86-1.96x on a GH200) by the same rule.
+    assert syrk.measured(sm80, (28, 2560, 2560), jnp.bfloat16, transpose=False, out_dtype=jnp.bfloat16,
+                         polynomial=True)
+    assert syrk.measured(sm90, (36, 4096, 4096), jnp.bfloat16, transpose=False, out_dtype=jnp.bfloat16,
+                         polynomial=True)
+    assert not syrk.measured(sm80, (4, 150, 150), jnp.bfloat16, transpose=False, out_dtype=jnp.bfloat16,
+                             polynomial=True)
     for gen in ("sm86", "sm89", "sm120"):
-        assert not syrk.measured_gram(generation.gpu_target(gen), (28, 2560, 4096), jnp.bfloat16,
-                                      transpose=False, out_dtype=jnp.bfloat16)
+        assert not syrk.measured(generation.gpu_target(gen), (28, 2560, 4096), jnp.bfloat16,
+                                 transpose=False, out_dtype=jnp.bfloat16)
 
     # End-to-end auto selection admits whole-tile bf16->bf16 across layer counts and keeps fp32 / underfilled
     # on XLA.
@@ -566,6 +573,10 @@ def test_syrk_measured_gram_gates_to_measured_bf16_cells():
             lowered_for(lambda a: gemm.symmetric_gram(a),
                         (jax.ShapeDtypeStruct(shape, jnp.bfloat16),), "sm90")
         assert any(r.kernel == "mosaic" for r in measured_seen), (shape, measured_seen)
+    with generation.routes() as polynomial_seen:
+        lowered_for(lambda a: gemm.symmetric_polynomial(a, jnp.asarray([3.4445, -4.7750, 2.0315])),
+                    (jax.ShapeDtypeStruct((28, 2560, 2560), jnp.bfloat16),), "sm90")
+    assert any(r.kernel == "mosaic" for r in polynomial_seen), polynomial_seen
     for shape, out_dtype in (((1, 512, 512), jnp.bfloat16), ((28, 2560, 4096), jnp.float32)):
         with generation.routes() as unmeasured_seen:
             lowered_for(lambda a, dt=out_dtype: gemm.symmetric_gram(a, out_dtype=dt),

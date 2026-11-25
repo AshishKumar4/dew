@@ -694,24 +694,27 @@ MOSAIC_SYRK = MosaicSyrk()
 """The singleton Mosaic SYRK launch on the shared `Template`/`KernelOp` certification path."""
 
 
-MEASURED_GRAM_GENERATIONS: frozenset[str] = frozenset({"sm80", "sm90"})
-"""GPU generations where real receipts (`M-NG-45-a100`, `M-NG-45b-gh200`, row 11941) proved whole-tile
-bf16 symmetric Gram beats XLA (1.52-1.98x across all measured square and rectangular stacked cells)."""
+MEASURED_GENERATIONS: frozenset[str] = frozenset({"sm80", "sm90"})
+"""GPU generations where receipts (M-NG-45-a100, M-NG-45b-gh200, M-NG-5; rows 11941, 5972) timed whole-tile
+bf16 symmetric products ahead of XLA's batched dot: the Gram 1.66-1.80x faster on an A100 and 1.52-1.98x on
+a GH200, the polynomial 1.17-1.21x and 1.86-1.96x, across every stacked square and rectangular cell timed
+(the ragged 4 x 150 cells, no whole tile, 1.39-2.53x slower)."""
 
 
-def measured_gram(target: generation.GpuTarget, shape: tuple[int, int, int], dtype, *,
-                  transpose: bool, out_dtype=None) -> bool:
-    """Whether symmetric Gram `(target, shape, transpose, dtype, out_dtype)` is admitted by the derived
-    whole-tile bf16 shape-class rule on measured generations (`MEASURED_GRAM_GENERATIONS`, rows 11941,
-    12163): whole square super-tile `m` and step `k`, filling at least one SM wave of upper-triangle CTAs."""
-    if generation.tpu(target) or target.generation not in MEASURED_GRAM_GENERATIONS:
+def measured(target: generation.GpuTarget, shape: tuple[int, int, int], dtype, *, transpose: bool,
+             out_dtype=None, polynomial: bool = False) -> bool:
+    """Whether a symmetric product `(target, shape, transpose, dtype, out_dtype)`, a Gram or its polynomial
+    (`polynomial`: `shape` the square `[g, m, m]`), is admitted by the derived whole-tile bf16 shape-class
+    rule on measured generations (`MEASURED_GENERATIONS`, rows 11941, 12163, 5972): whole square super-tile
+    `m` and step `k`, filling at least one SM wave of upper-triangle CTAs."""
+    if generation.tpu(target) or target.generation not in MEASURED_GENERATIONS:
         return False
     in_dtype = jnp.dtype(dtype)
     resolved_out = in_dtype if out_dtype is None else jnp.dtype(out_dtype)
     if in_dtype != jnp.bfloat16 or resolved_out != jnp.bfloat16:
         return False
     g, m, k = (shape[0], shape[2], shape[1]) if transpose else shape
-    tile = derive_syrk((g, m, k), in_dtype, resolved_out, target, transpose=transpose)
+    tile = derive_syrk((g, m, k), in_dtype, resolved_out, target, transpose=transpose, polynomial=polynomial)
     if tile is None:
         return False
     side = tile_rows(tile, family_of(tile, in_dtype, target))

@@ -1236,9 +1236,10 @@ def test_a_blackwells_projection_and_its_gradients_hold_check_1(sizes, out):
                         seeds=SEEDS, truth_fn=with_gradients(on_xla(jnp.float64)))
 
 
-def _dense_cell(generation_name: str, made: str, matrix: tuple[int, int], rows: int) -> grouped_cells.Kind:
-    """The cell (`GroupedCase.cell`'s kind) of a 16-bit dense product on `generation_name` making `made` of
-    `matrix` `[in, out]` over `rows` tokens."""
+def _dense_case(generation_name: str, made: str, matrix: tuple[int, int],
+                rows: int) -> grouped_matmul.GroupedCase:
+    """The `GroupedCase` of a 16-bit dense product on `generation_name` making `made` of `matrix` `[in, out]`
+    over `rows` tokens."""
     from dew.nn.kernels.templates.product import declared
 
     width_in, width_out = matrix
@@ -1255,22 +1256,74 @@ def _dense_cell(generation_name: str, made: str, matrix: tuple[int, int], rows: 
             call = grouped_matmul.gmm_call(tokens, bf16((1, width_in, width_out)), sizes,
                                            out_dtype=jnp.bfloat16, trans_rhs=transposed, interpret=False,
                                            dense=True)
-        return grouped_matmul.grouped_case(*call, product=product, whole=True).cell[1]
+        return grouped_matmul.grouped_case(*call, product=product, whole=True)
 
 
 @pytest.mark.parametrize("made", ("forward", "input_gradient", "kernel_gradient"))
 def test_a_receipts_matrix_is_a_cell_of_its_own_over_the_rows_it_timed_alone(made):
     """A receipt is evidence for the products it timed alone (`grouped_cells.Timed`, row 6794): each matrix
-    Hopper's receipts timed is a cell of its own (`Kind.matrix`) over the receipt's fewest to most rows and
-    no further (a fine-tune's 2,048 took the 4B key's cell and its launches made the step's products 1.75
-    ms slower), and a matrix no receipt timed never is."""
-    (timed,) = grouped_cells.MEASURED[("wgmma", grouped_cells.Made(made), False)]
-    for matrix in timed.matrices:
-        for rows, held in ((timed.fewest, True), (timed.most, True), (timed.fewest - 1, False),
-                           (timed.most + 1, False)):
-            assert (_dense_cell("sm90", made, matrix, rows).matrix == matrix) is held, (matrix, rows)
-    untimed = (timed.fewest + 1, timed.fewest + 3)
-    assert _dense_cell("sm90", made, untimed, timed.fewest).matrix is None
+    Hopper's receipts timed is a cell of its own (`Kind.matrix`) over that receipt's fewest to most rows
+    (`Kind.span`) and no further (a fine-tune's 2,048 took the 4B key's cell and its launches made the
+    step's products 1.75 ms slower), one matrix two receipts timed over two spans two cells, and a matrix no
+    receipt timed never is."""
+    receipts = grouped_cells.MEASURED[("sm90", grouped_cells.Made(made), False)]
+    assert len({timed.span for timed in receipts}) > 1, receipts
+    for timed in receipts:
+        for matrix in timed.matrices:
+            for rows in (timed.fewest, timed.most):
+                assert _dense_case("sm90", made, matrix, rows).kind.span == timed.span, (matrix, rows)
+            for rows in (timed.fewest - 1, timed.most + 1):
+                if not any(other.holds(matrix, rows) for other in receipts):
+                    assert _dense_case("sm90", made, matrix, rows).kind.matrix is None, (matrix, rows)
+    assert _dense_case("sm90", made, (2560 + 1, 2560 + 3), 8192).kind.matrix is None
+
+
+def _route(generation_name: str, made: str, matrix: tuple[int, int], rows: int) -> str:
+    """The kernel `DECLARED` holds a 16-bit dense product's cell with (`GroupedCase.cell`), the template's
+    where it holds none."""
+    found = grouped_matmul.DECLARED.get(_dense_case(generation_name, made, matrix, rows).cell)
+    return "mosaic" if found is None else found[0].name
+
+
+@pytest.mark.parametrize(("generation_name", "made", "matrix", "rows", "kernel"), [
+    # The A100's forward is at parity (geomean 0.9999): the template's whole, the 4B down it timed 1.05x
+    # XLA's too (its derivation's to climb).
+    ("sm80", "forward", (3072, 8192), 8192, "mosaic"),
+    ("sm80", "forward", (9216, 2560), 8192, "mosaic"),
+    # Its input gradient is behind (1.074): XLA's, but where every round of the template's ran faster.
+    ("sm80", "input_gradient", (3072, 8192), 8192, "xla"),
+    ("sm80", "input_gradient", (25600, 5120), 8192, "mosaic"),
+    ("sm80", "input_gradient", (25600, 5120), 4096, "xla"),
+    # The GH200's kernel gradient is at parity (0.997): the template's whole, the 4B up's 24,576-token cell
+    # (M-EM-52, 1.042x) with it; its forward behind (1.006), XLA's but where the template clearly won.
+    ("sm90", "kernel_gradient", (3072, 8192), 8192, "mosaic"),
+    ("sm90", "kernel_gradient", (4096, 28672), 8192, "mosaic"),
+    ("sm90", "kernel_gradient", (2560, 9216), 24576, "mosaic"),
+    ("sm90", "forward", (3072, 8192), 8192, "xla"),
+    ("sm90", "forward", (4096, 24576), 8192, "mosaic"),
+    ("sm90", "forward", (4096, 4096), 8192, "xla"),
+    # The 4B's up input gradient: the template's at 24,576 tokens (M-EM-36), its kind's XLA at 8,192 where
+    # M-NG-45b timed it behind.
+    ("sm90", "input_gradient", (2560, 9216), 24576, "mosaic"),
+    ("sm90", "input_gradient", (2560, 9216), 8192, "xla"),
+    # A B200's cells its receipts timed losing hold XLA on a generation whose kinds are the template's.
+    ("sm100", "kernel_gradient", (2560, 9216), 24576, "xla"),
+    ("sm100", "kernel_gradient", (9216, 2560), 24576, "mosaic"),
+    # The RTX PRO 6000's forward at parity (0.978), its input gradient behind (1.091).
+    ("sm120", "forward", (3072, 8192), 8192, "mosaic"),
+    ("sm120", "input_gradient", (3072, 8192), 8192, "xla"),
+    # An A10 and an L4 behind at every kind; a B300 no receipt timed, the template's.
+    ("sm86", "forward", (3072, 8192), 8192, "xla"),
+    ("sm89", "kernel_gradient", (3072, 8192), 8192, "xla"),
+    ("sm103", "kernel_gradient", (2560, 9216), 24576, "mosaic"),
+])
+def test_a_generations_receipts_hold_its_dense_cells(generation_name, made, matrix, rows, kernel):
+    """A dense product's route is its generation's receipts' (`grouped_cells.SCOREBOARDS`): a kind the
+    template's, whole, where its receipt's geomean is at or under XLA's dot (bible §6, 2026-11-24: templates
+    replace reference routes on parity), a kind XLA keeps the products the template clearly won over the
+    rows they were timed at, and a generation no receipt timed the template's, whatever its instruction
+    family's other generations measured."""
+    assert _route(generation_name, made, matrix, rows) == kernel
 
 
 @pytest.mark.parametrize("gpu", [pytest.param(name, marks=runs(name)) for name in ("sm80", "sm90")])

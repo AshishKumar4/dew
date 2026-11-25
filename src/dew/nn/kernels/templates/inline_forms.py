@@ -4,7 +4,8 @@ assembly (`plgpu.inline_mgpu`, LLVM's `inline_asm` on each 32-bit word of each r
 the form's own instructions on the pipes its steps name rather than XLA's lowering of their `jax.numpy`
 reading (`BitForm.traced`, which an interpreter runs, where no inline assembly does); and a register tile's
 IEEE fp32 quotients the same way (`quotients`: PTX's `div.rn.f32`), and its 4-bit codes two a byte
-(`paired`: PTX's `bfi.b32`)."""
+(`paired`: PTX's `bfi.b32`); and a register tile's alternate column groups apart (`split_groups`), its
+registers read where they lie, no instruction."""
 
 
 import numpy as np
@@ -77,6 +78,31 @@ def paired(codes, layout):
         return (mgpu_fragments.FragmentedArray(_registers=out, _layout=packed.to_mgpu(), _is_signed=False),)
 
     return plgpu.inline_mgpu(arg_types=(layout,), return_type=(typed,))(pairs)(codes)[0]
+
+
+def split_groups(tile, group: int, layout) -> tuple:
+    """`tile` (`[rows, columns]` in `layout`) as its even and odd runs of `group` columns, each `[rows,
+    columns / 2]` in `layout`: the registers holding each run selected where they lie, no instruction (a wide
+    gated product's gate and up columns, `templates.gemm.wide`). A run is whole tiles of the layout's
+    outermost column tile (WGMMA's and TCGEN05's 8, mma.sync's 8 a warp along the columns), each thread
+    holding the same columns of either run, so the two tiles share the layout."""
+    tiled = layout.to_mgpu()
+    atom = tiled.tiling.tiles[0][-1]
+    rows, columns = tile.shape
+    if group % atom or columns % (2 * group):
+        raise ValueError(f"{columns} columns in {layout}'s {atom}-column tiles hold no whole pairs of "
+                         f"{group}-column runs")
+    per = group // atom
+    typed = plgpu.ShapeDtypeStruct((rows, columns // 2), jnp.dtype(tile.dtype), layout=layout)
+
+    def split(ctx, tile):
+        del ctx
+        runs = np.arange(tile.registers.shape[1]).reshape(-1, 2, per)
+        return tuple(mgpu_fragments.FragmentedArray(_registers=tile.registers[:, runs[:, half].ravel()],
+                                                    _layout=tile.layout, _is_signed=tile.is_signed)
+                     for half in (0, 1))
+
+    return tuple(plgpu.inline_mgpu(arg_types=(layout,), return_type=(typed, typed))(split)(tile))
 
 
 def halved(layout):

@@ -40,6 +40,12 @@ def epilogue_layout(layout):
         _EPILOGUE_LAYOUT.reset(token)
 
 
+def epilogue_register_layout():
+    """The accumulator register layout a compiled GEMM epilogue is being traced in (`epilogue_layout`), None
+    outside one."""
+    return _EPILOGUE_LAYOUT.get()
+
+
 def encode_tile(x: jax.Array, minifloat: bits.Minifloat) -> jax.Array:
     """Encode fp32 tile `x` into `minifloat` codes via `bits.encode_form`: inline PTX
     (`inline_forms.registers`) inside a compiled GPU epilogue, or `BitForm.traced` when interpreted or
@@ -245,11 +251,14 @@ class Form(NamedTuple):
     across each `divisor`-column block, one a row a block (a next product's block scales, `reduced`),
     `transposed` its rows contiguous (`[columns // divisor, rows]`, as a block-scaled product reads them).
     `packed`: two 4-bit codes a byte (`divisor` 2, row-major), the even column's in its low nibble, as a
-    sub-byte array packs them (NVFP4's E2M1 codes, `paired`; row 12743)."""
+    sub-byte array packs them (NVFP4's E2M1 codes, `paired`; row 12743). `narrowed`: its epilogue computes
+    it a `divisor`-th as wide as the tile (`[rows, columns // divisor]`, row-major), stored as computed (a
+    wide gated product's hidden activation, one of each gate and up pair, `templates.gemm.wide`)."""
 
     divisor: int
     transposed: bool = False
     packed: bool = False
+    narrowed: bool = False
 
 
 def forms_of(out_forms: tuple | None, dtypes: tuple) -> tuple:
@@ -259,8 +268,6 @@ def forms_of(out_forms: tuple | None, dtypes: tuple) -> tuple:
     boundary each route's selection reads."""
     if not out_forms:
         return ()
-    if len(dtypes) < 2:
-        raise ValueError("output forms are a several-output call's (`out_dtypes`)")
     if len(out_forms) != len(dtypes):
         raise ValueError(f"{len(out_forms)} output forms for {len(dtypes)} outputs")
     forms = _formed(out_forms)
@@ -269,6 +276,9 @@ def forms_of(out_forms: tuple | None, dtypes: tuple) -> tuple:
                                                  or jnp.dtype(dtype) != jnp.dtype(jnp.uint8)):
             raise ValueError(f"a packed output is two 4-bit codes a byte, row-major, uint8, not {form} in "
                              f"{jnp.dtype(dtype)}")
+        if form is not None and form.narrowed and (form.divisor < 2 or form.transposed or form.packed):
+            raise ValueError(f"a narrowed output is a divisor-th of the tile's columns, row-major, not "
+                             f"{form}")
     return forms
 
 
@@ -322,10 +332,16 @@ def outputs(part: tuple[int, int], dtypes: tuple, forms: tuple) -> tuple:
 
     if not forms:
         return tuple((part, jnp.dtype(dtype)) for dtype in dtypes)
-    return tuple((part, jnp.dtype(dtype)) if form is None
-                 else stores.Output(part, jnp.dtype(dtype), divisor=form.divisor,
-                                    write=paired if form.packed else reduced, transposed=form.transposed)
-                 for dtype, form in zip(dtypes, _formed(forms), strict=True))
+
+    def output(dtype, form):
+        if form is None:
+            return part, jnp.dtype(dtype)
+        if form.narrowed:
+            return stores.Output(part, jnp.dtype(dtype), divisor=form.divisor, narrowed=True)
+        return stores.Output(part, jnp.dtype(dtype), divisor=form.divisor,
+                             write=paired if form.packed else reduced, transposed=form.transposed)
+
+    return tuple(output(dtype, form) for dtype, form in zip(dtypes, _formed(forms), strict=True))
 
 
 def declared(dtype, form: Form | tuple, rows: int, columns: int) -> jax.ShapeDtypeStruct:
@@ -340,9 +356,10 @@ def declared(dtype, form: Form | tuple, rows: int, columns: int) -> jax.ShapeDty
 
 
 def _chunk_unit(out_forms: tuple | None) -> int | None:
-    """The columns each staged chunk is whole numbers of where a call's outputs state forms (every form's
-    `divisor`: a reduced output's blocks, a packed one's pairs), None for none."""
-    divisors = [form.divisor for form in _formed(out_forms) if form is not None]
+    """The columns each staged chunk is whole numbers of where a call's outputs state forms its stores write
+    (every such form's `divisor`: a reduced output's blocks, a packed one's pairs), None for none: a narrowed
+    one is stored as computed (`forms_refusal` holds its divisor)."""
+    divisors = [form.divisor for form in _formed(out_forms) if form is not None and not form.narrowed]
     return math.lcm(*divisors) if divisors else None
 
 
@@ -382,13 +399,31 @@ def forms_refusal(out_forms: tuple | None, config, *, dense: bool) -> str | None
     and `paired` write), each reduced output transposed (`reduced` writes a block's maxima as its buffer's
     row, no strided column), and its call dense (a transposed store takes a share's whole rows,
     `stores.transposed_rows`, and a packed row's store a share's from its first, `stores._aligned_ladder`: a
-    grouped tile's share starts mid-tile)."""
+    grouped tile's share starts mid-tile); a narrowed output (`Form.narrowed`) where the tile's family stores
+    one (`mosaic.Transport.stores_narrowed`), its stated chunk whole multiples of its divisor."""
+    from dew.nn.kernels.templates import bundles
+
+    from dew.nn.kernels.templates.gemm import wide
+
+    narrowed = [form for form in _formed(out_forms) if form is not None and form.narrowed]
+    if narrowed:
+        family = bundles.named(config.family, jnp.bfloat16, None)
+        if not family.stores_narrowed:
+            return f"a {config.family} launch stores no output narrower than its tile"
+        # Its epilogue narrows whole pairs of runs (`wide.split`): every tile's and every piece its issuer
+        # reads out at once (tcgen05's 64 columns), and its stated chunk whole stored columns.
+        if any(each % wide.UNIT for each in config.issued(family)):
+            return (f"a {config.issued(family)} tile's columns and pieces hold no whole {wide.UNIT}-column "
+                    "pairs of a narrowed output's runs")
+        if config.staging is not None and any(config.staging[0] % form.divisor for form in narrowed):
+            return f"a chunk of {config.staging[0]} columns holds no whole column groups of a narrowed output"
     unit = _chunk_unit(out_forms)
     if unit is None:
         return None
     if config.staging is None or config.staging[0] % unit:
         return f"a chunk of outputs in forms is whole {unit}-column units, not {config.staging}"
-    if any(form is not None and not (form.packed or form.transposed) for form in _formed(out_forms)):
+    if any(form is not None and not (form.packed or form.transposed or form.narrowed)
+           for form in _formed(out_forms)):
         return "a launch stores a reduced output transposed, a buffer row a block"
     if not dense:
         return "an output in a form is a dense call's"
@@ -403,6 +438,8 @@ def stored(value: jax.Array, form: Form | tuple | None) -> jax.Array:
     if form is None:
         return value
     form = _form(form)
+    if form.narrowed:
+        return value
     if form.packed:
         return _pairs(value)
     blocks = value[:, ::form.divisor]
