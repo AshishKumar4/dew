@@ -209,7 +209,11 @@ def write_recording(directory: Path) -> None:
     config = configuration.Inkling2LoopTextConfig(**TEXT)
     model = modeling.Inkling2LoopForCausalLM.from_pretrained(
         directory, config=config, dtype=torch.float32, attn_implementation='eager').eval()
+    # The experts' own loop (`Inkling2LoopExperts.forward`), which runs in float64 as torch's grouped
+    # products do not; its modules read the choice off the config at each call (integrations/moe.py:633).
+    model.config._experts_implementation = 'eager'
     truth = float64_twin(model, lambda: modeling.Inkling2LoopForCausalLM(model.config))
+    truth.config._experts_implementation = 'eager'
     flag = ' --quantized' if directory == QUANTIZED else ''
     command = ('PYTHONPATH=src:tools:tests .venv-inkling2/bin/python tools/inkling2_fixture.py'
                f'{flag} --recording')
