@@ -409,7 +409,8 @@ class Probe:
                 "headroom": self.headroom, "temp": self.temp, "argument": self.argument,
                 "ahead": self.ahead,
                 "compile_seconds": self.compile_seconds,
-                "beside": self.beside, "spent": dict(self.spent)}
+                "beside": self.beside, "admitted": None if self.admitted is None else list(self.admitted),
+                "spent": dict(self.spent)}
 
     def named(self) -> str:
         tile = ("" if self.rung["head_tile"] is None else ", the head tiled" if self.rung["head_fused"]
