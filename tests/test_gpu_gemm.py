@@ -294,9 +294,11 @@ def _toolkit_cells() -> list[Cell]:
     ]
 
 
-KERNEL_PARTS = 4
+KERNEL_PARTS = 6
 """The kernels flow's parts (`in_parts`): its prepare alone 164 s warm on a GH200's host (MAINGPU-63d4814e1),
-and with the join matrix's 665 s cold in a train's prepare group (row 12759), past the train's bound."""
+and with the join matrix's 665 s cold in a train's prepare group (row 12759), past the train's bound; six
+since its native tail and fallback cells, whose sm90 prepare group took 647 s against a 606 s bound
+(row 13037), so a group packs smaller parts under it."""
 
 JOIN_PARTS = 2
 """The join matrix's parts (`in_parts`): its prepare 153 s warm on a GH200's host (MAINGPU-63d4814e1)."""
