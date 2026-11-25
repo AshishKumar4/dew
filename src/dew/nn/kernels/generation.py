@@ -1275,13 +1275,6 @@ def _compile_only_gpus(generation: str, count: int, memory: int | None,
     return tuple(topology.devices[:count])
 
 
-def _compute_capability(device) -> str | None:
-    """`device`'s compute capability, '8.9' for an sm89 card. jax's Device
-    declares no such field, and a CUDA device carries it, so it is read at
-    this boundary; a device without one gives None."""
-    return getattr(device, 'compute_capability', None)
-
-
 def _multiprocessors(device) -> int | None:
     """`device`'s streaming multiprocessors. jax's Device declares no such
     field, and a CUDA device reports them as its cores, so it is read at this
@@ -1393,7 +1386,9 @@ def device_generation() -> str:
 def _generation(device) -> str:
     """`device`'s own generation: a CUDA device's by its compute capability, a TPU's by its kind, another
     platform's its name."""
-    capability = _compute_capability(device) if device.platform == 'gpu' else None
+    from dew._devices import compute_capability
+
+    capability = compute_capability(device) if device.platform == 'gpu' else None
     if capability:
         return 'sm' + capability.replace('.', '')
     if device.platform == 'tpu':

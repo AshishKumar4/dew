@@ -27,6 +27,8 @@ from jax.core import ShapedArray
 from jax.experimental.pallas import pallas_call_p
 from jax.extend.backend import backends
 
+from dew._devices import compute_capability
+
 
 def holes[Tree, Leaf](tree: Tree, selected: Callable[[Leaf], bool] | Sequence[bool],
                       is_leaf: Callable[[Leaf], bool] | None = None
@@ -79,7 +81,7 @@ def lowering_platform(device) -> str | None:
     for platform, names in (("rocm", ("rocm",)), ("oneapi", ("oneapi", "sycl")), ("cuda", ("cuda",))):
         if any(name in version for name in names):
             return platform
-    capability = _compute_capability(device)
+    capability = compute_capability(device)
     return "cuda" if capability and re.fullmatch(r"\d+\.\d+", str(capability)) else None
 
 
@@ -88,12 +90,6 @@ def _platform_version(device) -> str:
     boundary: jax's devices declare no client, a concrete one holds it and an abstract one (a compile-only
     mesh's) none, which gives ''."""
     return str(getattr(getattr(device, "client", None), "platform_version", "")).lower()
-
-
-def _compute_capability(device) -> str | None:
-    """`device`'s compute capability, '9.0' for an H100's, read at this boundary: jax's Device declares no
-    such field, a CUDA device and an abstract one (a compile-only mesh's) carry it; None without one."""
-    return getattr(device, "compute_capability", None)
 
 def opaque(equation: jcore.JaxprEqn) -> bool:
     """Whether XLA sees nothing of `equation`'s body: a native Pallas kernel's (`NATIVE_KERNELS`), one
