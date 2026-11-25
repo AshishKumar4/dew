@@ -535,7 +535,9 @@ def test_every_dry_prepare_task_runs_large_whatever_its_tests_cpu_peaks(ci, tmp_
         (tmp_path / name).write_text("")
     (tmp_path / "tests" / "test_gpu_flow.py").write_text(
         "import pytest\n\n@pytest.mark.gpu\ndef test_a(): pass\n")
-    (tmp_path / "tests/test_durations.json").write_text(json.dumps({"tests/test_gpu_flow.py::test_a": 1.0}))
+    # Its test's recorded peak a light CPU run's, as a GPU test's skipped run on armada records.
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+        {"tests/test_gpu_flow.py::test_a": [1.0, None, 900_000_000]}))
     commit(tmp_path, "main")
     entries = [entry for entry in ci.plan(240.0, {"files": {}}) if entry["python"] == ci.PYTHONS[0]]
     prepares = [entry for entry in entries if entry["tests"].startswith(ci.prepares.TOKEN)]
