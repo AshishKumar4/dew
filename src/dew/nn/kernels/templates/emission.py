@@ -275,6 +275,10 @@ an fp32 to an int32 an F2I beside its saturating clamp's two FMNMX; an int32 to 
 an fp16 through fp32. One to its own dtype nothing, anywhere (FS-CONV-SASS2); any other pair a
 conversion an element, unmeasured."""
 
+_KERNEL_FORMS: Mapping = {"approximate": APPROXIMATE_FORMS, "accurate": ACCURATE_FORMS}
+"""A Mosaic GPU kernel's two forms tables by name, which a kernel's forms are by equality (a copy of one
+alike), so a price cached by name (`_software_division`) reads the same table."""
+
 TRITON_FORMS: Mapping = {**{function: Work(exponentials=1) for function in APPROXIMATED},
                          precision.correctly_rounded_divide_p: Work(exponentials=1, operations=6)}
 """A Pallas Triton kernel's forms (`forms_of`): each special function one exponential an element, as a
@@ -295,10 +299,9 @@ _FREE = frozenset({
     pallas.program_id_p, tpu.dma_wait_p, gpu.wait_gmem_to_smem_p, pjit.reshard_p, lax.gather_p,
     lax.dynamic_slice_p, lax.dynamic_update_slice_p, lax.concatenate_p, lax.pad_p, lax.rev_p, lax.split_p,
     lax.stack_p, lax.tile_p, lax.unstack_p, gpu.commit_group_p, ad_util.stop_gradient_p, jax_core.pvary_p,
-    jax_core.reduced_vary_cast_p, control_flow.platform_index_p})
+    jax_core.reduced_vary_cast_p})
 """What moves no data between memories and computes nothing a unit's rate prices: synchronization, layouts,
-a value's type cast along manual mesh axes (to vary, or from reduced: no value changes), the platform a
-program lowers for (`platform_index`, which its compile resolves),
+a value's type cast along manual mesh axes (to vary, or from reduced: no value changes),
 indices, a value's elements rearranged among a role's registers (a gather's, a slice's, a concatenation's;
 every layout move the Pallas fuser tiles: a dynamic slice and its update, whose index arithmetic is scalar,
 which nothing counts, a split, a stack, a tile and an unstack, so a fused prologue's stage holds no
@@ -727,6 +730,10 @@ class _Counting:
             return _folded(equation, operands)
         if (placed := _placed(primitive, values)) is not None:
             return [placed]
+        if primitive is control_flow.platform_index_p:
+            # The platform a program lowers for, its compile's choice: the priced target's, so a platform's
+            # branch (`lax.platform_dependent`) counts as its own runs.
+            return [_platform_branch(params["platforms"])]
         if primitive is pallas.multiple_of_p:
             # A divisibility hint: its operand's value, nothing computed.
             return [values[0]]
@@ -1052,6 +1059,17 @@ def _expanded(equation) -> tuple[jax_core.Jaxpr, Sequence] | None:
     return traced.jaxpr, traced.consts
 
 
+def _platform_branch(platforms) -> int:
+    """The branch of a `lax.platform_dependent` whose platforms (`platform_index`'s `platforms`, a branch's
+    names, or None for its default) hold the priced target's: a CUDA multiprocessor's `cuda`, else a TPU's."""
+    name = "cuda" if generation.gpu_target().architecture.multiprocessor is not None else "tpu"
+    named = [index for index, names in enumerate(platforms) if names is not None and name in names]
+    defaults = [index for index, names in enumerate(platforms) if names is None]
+    if not named and not defaults:
+        raise Unpriced(f"no branch of a platform choice among {platforms} runs on {name}")
+    return (named or defaults)[0]
+
+
 @functools.lru_cache(maxsize=64)
 def _software_division(operands: tuple, target: generation.GpuTarget, forms: str | None) -> Work:
     """A correctly rounded division's software form (`precision._correctly_rounded_divide`, XLA's and Mosaic
@@ -1061,8 +1079,7 @@ def _software_division(operands: tuple, target: generation.GpuTarget, forms: str
     with generation.assumed(target):
         traced = jax.make_jaxpr(precision._correctly_rounded_divide)(
             *(jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in operands))
-        held = {"approximate": APPROXIMATE_FORMS, "accurate": ACCURATE_FORMS}.get(forms or "")
-        counted = emitted(traced.jaxpr, 1, None, forms=held).roles[0]
+        counted = emitted(traced.jaxpr, 1, None, forms=_KERNEL_FORMS.get(forms or "")).roles[0]
     return counted.fixed + sum(counted.walks, Work())
 
 
@@ -1139,9 +1156,9 @@ def operation_work(primitive, inputs: Sequence, outputs: Sequence, params: Mappi
     if primitive is precision.correctly_rounded_divide_p:
         if (native := (forms or {}).get(primitive)) is not None:
             return repeated(native, sum(_elements(aval) for aval in outputs))
-        kinds = {id(APPROXIMATE_FORMS): "approximate", id(ACCURATE_FORMS): "accurate"}
+        kind = next((name for name, table in _KERNEL_FORMS.items() if forms == table), None)
         return _software_division(tuple((tuple(aval.shape), np.dtype(aval.dtype)) for aval in inputs),
-                                  target or generation.gpu_target(), kinds.get(id(forms)))
+                                  target or generation.gpu_target(), kind)
     if primitive is lax.div_p and forms is not None and _divides_on_cuda(outputs, target) and (
             (form := forms.get(primitive)) is not None):
         return repeated(form, sum(_elements(aval) for aval in outputs))
@@ -1160,7 +1177,7 @@ def operation_work(primitive, inputs: Sequence, outputs: Sequence, params: Mappi
         if inputs[0].dtype == outputs[0].dtype:
             # Its own dtype (a weak type made strong): no instruction (FS-CONV-SASS2's fp32 to fp32).
             return Work()
-        if forms in (APPROXIMATE_FORMS, ACCURATE_FORMS):
+        if forms in _KERNEL_FORMS.values():
             form = CONVERSION_FORMS.get((np.dtype(inputs[0].dtype), np.dtype(outputs[0].dtype)))
             if form is not None:
                 return repeated(form, elements)
@@ -1266,7 +1283,7 @@ def _launched(kernel, stated: Stated) -> "Launched":
     issuing = counted.issued(issue_slots, stated.steps, programs)
     # A Mosaic GPU program's warps: a core map's (`plgpu.kernel`) or a call compiled with Mosaic GPU's
     # parameters (`forms_of`); another backend's unknown.
-    mosaic = kernel.primitive is mpmd.mpmd_map_p or forms in (APPROXIMATE_FORMS, ACCURATE_FORMS)
+    mosaic = kernel.primitive is mpmd.mpmd_map_p or forms in _KERNEL_FORMS.values()
     return Launched(dataclasses.replace(work, issue_excess=max(0.0, issue_slots(work) - issuing)),
                     _warps(counted) if mosaic else 0.0)
 
