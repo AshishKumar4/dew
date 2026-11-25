@@ -1097,9 +1097,11 @@ class MosaicGmm(_Mosaic):
         dtype = ba.arguments['tokens'].dtype
         gather = ba.arguments.get('gather')
         rows = ba.arguments['tokens'].shape[0] if gather is None else gather.shape[0]
-        width = ba.arguments['kernel'].shape[1 if ba.arguments['trans_rhs'] else 2]
+        width = _matrix_extents(ba)[1]
         if layouts := self._families(ba, target):
-            width = self._aligned_extents(ba, layouts[0], target)[1].get('width', width)
+            launched = self._aligned_extents(ba, layouts[0], target)[1]
+            if 'width' in launched:
+                width = launched['width']
         if ba.arguments.get('scatter') is not None and not config.swapped:
             # A scattered launch declares its partials at the product's rows, unwalked
             # (`mosaic_gpu._declared`'s `stored`).
