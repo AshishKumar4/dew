@@ -798,7 +798,7 @@ def _tripled_row():
 
         _TRIPLED_ROW.append(scaled.primitive(
             "tripled_row", lambda row: row + (lax.iota(jnp.int32, row.shape[0]) * 3).astype(row.dtype),
-            lambda row: jax.core.ShapedArray(row.shape, row.dtype)))
+            lambda row: row))
     return _TRIPLED_ROW[0]
 
 
