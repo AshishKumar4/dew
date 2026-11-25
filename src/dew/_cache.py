@@ -372,14 +372,15 @@ class Passes:
     """Whether the algebra pass rewrites the programs Dew compiles (`dew.algebra.passes`), the GPU whose
     facts it prices them for (a `GpuTarget` name; None for the process's own), whether each template
     derivation's greedy extraction is held to the exact optimum (`checked`, the test suite's oracle,
-    `dew.algebra.extract.cheapest`), and the rule sets it leaves out (`without`, by name, each of
-    `dew.algebra.rules.nameable`: a receipt's arm, docs/design/algebra.md §1.6 and §6.4)."""
+    `dew.algebra.extract.cheapest`), the rule sets it leaves out (`without`, by name, each of
+    `dew.algebra.rules.nameable`: a receipt's arm, docs/design/algebra.md §1.6 and §6.4), and any
+    cost-qualified dev-time rule sets enabled in scope (`dev`, `dew.algebra.rules.enabling_dev`)."""
 
     on: bool = True
     target: str | None = None
     checked: bool = False
     without: frozenset[str] = frozenset()
-
+    dev: frozenset[str] = frozenset()
 
 ALGEBRA = _context(Passes())
 """The algebra pass's switch (`Passes`), keyed on as `KERNEL_TUNES` is: a program a switch traced is never run

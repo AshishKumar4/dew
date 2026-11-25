@@ -177,15 +177,16 @@ glue is (§6.2), reorderings over its values held by the dominance rule alone (�
     every program the pass saw, bodies included) the only pattern of note was a divisor shared by several
     quotients (42 to 452 of 423 to 794 divisions a suite). A shared reciprocal unguarded overflows where `a /
     y` is finite (a subnormal `y`), makes a NaN of a zero `a`, and flushes to zero where a large `y`'s quotient
-    keeps its value, so each rule reads a divisor an epsilon floors (a maximum's or a sum's, so a window
-    opens at a division by one alone) and fires only where its divisor is held away from zero (its floor,
-    `rules.log2_floor`) and bounded (`log2_bound`: the reciprocal a normal float above the narrowest float's
-    least normal power, `rules.least`) and its dividend bounded, the product under the reach (§6.3). A
-    training step's values are mostly unbounded, so it fires on bounded ones alone (an epsilon's floor over a
-    bounded operand);
-  - **decoupled reductions** (dev time): dependent nonlinear reductions broken with correction terms (the running-max
-    rescale of online softmax, log-sum-exp merges and folds, moment merges; the moment merges are not built:
-    no rule, declaration or consumer of one exists);
+    keeps its value, so each rule reads a divisor an epsilon floors (a maximum's, a sum's, or a `reduce_sum`'s,
+    directly or broadcast along trailing axes) and fires only where its divisor is held away from zero (its
+    floor, `rules.log2_floor`) and bounded (`log2_bound`: the reciprocal a normal float above the narrowest
+    float's least normal power, `rules.least`) and either `|y| >= 1` (`floor >= 0`, so `0 < |1/y| <= 1` can
+    never overflow any finite dividend, with positivity required for reciprocal-root reuse) or the dividend
+    is bounded with the product under the reach (§6.3). Window formation (`program._windows`) pulls sibling
+    `rsqrt` and unit reciprocal equations sharing a division head's radicand or divisor into the window;
+  - **decoupled reductions** (dev time): dependent nonlinear reductions broken with correction terms (the
+    running-max rescale of online softmax, log-sum-exp merges and folds, and Chan-Golub-LeVeque central-moment
+    merges for weighted and masked variance and bilinear covariance in `derive.py` / `moments.py`, row 9036);
   - **stable forms** (`stable`, dev time; §1.5; row 9037): `log1p` and `expm1`, a sum's logarithm taken out
     of its exponent (the log-sum-exp fold), logarithms of exponentials in log space (`log(exp(a) / exp(b))`
     as `a - b`, a KL's divergence of two softmaxes; `log(exp(a) exp(b))`, `log(exp(a))`), differences of
@@ -333,14 +334,15 @@ fitted to them, and a rule set ships only with measured receipts.
   out costs a trace, never a stale program; and the compiles' refused launches), and written into each later lowering holding the region, reporting the
   kernels' routes and launches its trace reported: a step's relowerings and its planner's candidates traced
   every region again, 1,724 traces and 144 seconds of a Qwen3.5-4B decision step's start on a GH200.
-- **Recognition (compile time, row 4783):** a region of a program is written as one of Dew's calls (its
-  attention, RMSNorm, stream and gated norms, SwiGLU) only where the region is proven to compute that call, by
-  its normal form's identity or in the e-graph (`dew.algebra.recognize`). Each call's math is declared once, as the call itself on its portable path
-  (`implementation='xla'`, attention's `'reference'`), the arithmetic its kernels are held to; no account
-  of a spelling is written anywhere. Around an equation of the primitive every declaration of a family holds
-  (`exp`, `rsqrt`, `logistic`), the family names its candidates: the values the call would read and make,
-  its static arguments read from the region's own constants (an epsilon, a softcap, a mask's fill, which the
-  kernels take as the program holds it), each choice the call takes tried, within the search's bounds
+- **Recognition (compile time, rows 3450, 4783):** a region of a program is written as one of Dew's calls (its
+  attention, chunked linear recurrence, RMSNorm, stream and gated norms, SwiGLU) only where the region is
+  proven to compute that call, by its normal form's identity or in the e-graph (`dew.algebra.recognize`). Each
+  call's math is declared once, as the call itself on its portable path (`implementation='xla'`, attention's
+  `'reference'`, a recurrence's `step_reference`), the arithmetic its kernels are held to; no account of a
+  spelling is written anywhere. Around an equation of the primitive every declaration of a family holds
+  (`exp`, `scan`, `rsqrt`, `logistic`), the family names its candidates: the values the call would read and
+  make, its static arguments read from the region's own constants (an epsilon, a softcap, a mask's fill,
+  which the kernels take as the program holds it), each choice the call takes tried, within the search's bounds
   (`REACH` equations from an anchor, `SPAN` a region, no barrier crossed, the first region one of whose
   candidates is proven equal taken). A body that binds no anchor of the families asked, at any depth of the programs it nests, is
   answered at once, before any key of it is built (row 5556). The region's equations and each

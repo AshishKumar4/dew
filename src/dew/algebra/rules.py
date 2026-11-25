@@ -9,9 +9,10 @@ value it makes is constant along `axis`, so a sum along that axis may take it ou
 from __future__ import annotations
 
 import collections
+import contextlib
 import dataclasses
 import importlib
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Literal
 
 import jax
@@ -565,43 +566,74 @@ _FLOORED = Drawn(((64, 1024), (64, 1024)), scale=lambda rng, shape, drawn: (
 def _reuse() -> tuple[RuleFamily, ...]:
     """A value the program already computed read in a new one's place (§1.4's reuse): a quotient by a value
     whose reciprocal the program holds, `a / y` as `a (1 / y)`, and by a root whose reciprocal root it holds,
-    `a / sqrt(v)` as `a rsqrt(v)` (a normalization's `x / max(|y|, eps)` beside its reciprocal, a norm's
-    `rsqrt(mean(x^2) + eps)`), a reciprocal's divisor made by a maximum or a sum (an epsilon's floor, so a
-    window opens at a division by one alone, not at every division a program holds). Each reorders a
-    rounding, and each fires only where the reciprocal is a normal finite float and the product finite
-    (§6.3's dominance rule): the divisor held away from zero
-    (`log2_floor`: its reciprocal at most `2**-floor`, under the program's reach), and bounded (`log2_bound`:
-    its reciprocal at least `2**-bound`, above the narrowest float's least normal power, so no flushing lane
-    reads it as zero), and the dividend's bound with the reciprocal's under the reach. A reciprocal of an
-    unguarded divisor overflows where the quotient is finite (a subnormal one) and makes a NaN of a zero
-    dividend, so it is never shared (the reuse probe, 2026-11-05)."""
+    `a / sqrt(v)` as `a rsqrt(v)` (directly or broadcast along trailing axes: a norm's `x / sqrt(v)[:, None]`
+    beside `rsqrt(v)`, a normalization's `x / max(|y|, eps)` or `x / sum(...)` beside its reciprocal). Each
+    reorders a rounding, and each fires only where the reciprocal is a normal finite float and the product
+    finite (§6.3's dominance rule): the divisor held away from zero (`log2_floor`: its reciprocal at most
+    `2**-floor`, under the program's reach) and bounded (`log2_bound`: its reciprocal at least `2**-bound`,
+    above the narrowest float's least normal power, so no flushing lane reads it as zero), and either the
+    divisor is at least 1 (`floor >= 0`, so `0 < |1/y| <= 1` can never overflow any finite dividend `a`) or
+    the dividend's bound with the reciprocal's stays under the reach. A reciprocal of an unguarded divisor
+    overflows where the quotient is finite (a subnormal one) and makes a NaN of a zero dividend, so it is
+    never shared (the reuse probe, 2026-11-05)."""
     a, u, w, v, one, t, r = vars_("a u w v one t r", Term)
-    divided, inverted, rooted, reciprocal, multiplied, made = vars_(
-        "divided inverted rooted reciprocal multiplied made", i64)
+    axes, extent = vars_("axes extent", Vec[i64])
+    divided, inverted, rooted, reciprocal, multiplied, made, laid = vars_(
+        "divided inverted rooted reciprocal multiplied made laid", i64)
     floor, bound, held, reached, lowest = vars_("floor bound held reached lowest", i64)
-    guarded = (eq(reached).to(reach()), eq(lowest).to(least()), eq(held).to(log2_bound(a)),
-               eq(multiplied).to(stock("mul")), plain(divided), eq(shape(a)).to(shape(t)))
-    # A divisor's reciprocal is a normal finite float, the product finite (the docstring's guards).
+    common = (eq(reached).to(reach()), eq(lowest).to(least()), eq(multiplied).to(stock("mul")),
+              plain(divided), eq(shape(a)).to(shape(t)))
+    # A divisor's reciprocal is a normal finite float (above least normal and under reach).
     normal = (i64(0) - floor <= reached, lowest <= i64(0) - bound - 1)
     reciprocals = []
-    for maker in ("max", "add"):
-        y = u.binary(maker, w, made)
-        reciprocals.append(rule(
-            eq(t).to(a.binary("div", y, divided)), eq(r).to(one.binary("div", y, inverted)), unit(one),
-            plain(inverted), eq(shape(r)).to(shape(t)), eq(floor).to(log2_floor(y)),
-            eq(bound).to(log2_bound(y)), *guarded, *normal, held - floor <= reached).then(
-            union(t).with_(a.binary("mul", r, multiplied))))
+    makers = (u.binary("max", w, made), u.binary("add", w, made), u.reduce("sum", axes, made))
+    r_laid = r.shaped("broadcast_in_dim", laid)
+    for y in makers:
+        for dividend_guard in ((eq(held).to(log2_bound(a)), held - floor <= reached), (i64(0) <= floor,)):
+            reciprocals += [
+                rule(
+                    eq(t).to(a.binary("div", y, divided)), eq(r).to(one.binary("div", y, inverted)),
+                    unit(one), plain(inverted), eq(shape(r)).to(shape(t)), eq(floor).to(log2_floor(y)),
+                    eq(bound).to(log2_bound(y)), *common, *normal,
+                    *dividend_guard).then(union(t).with_(a.binary("mul", r, multiplied))),
+                rule(
+                    eq(t).to(a.binary("div", y.shaped("broadcast_in_dim", laid), divided)),
+                    eq(r).to(one.binary("div", y, inverted)), unit(one), plain(inverted),
+                    eq(shape(r)).to(shape(y)), eq(extent).to(shape(y.shaped("broadcast_in_dim", laid))),
+                    eq(floor).to(log2_floor(y)), eq(bound).to(log2_bound(y)), *common, *normal,
+                    *dividend_guard).then(
+                    union(t).with_(a.binary("mul", r_laid, multiplied)), set_(shape(r_laid)).to(extent)),
+            ]
+    roots = []
+    for dividend_guard in ((eq(held).to(log2_bound(a)), held + (i64(0) - floor).max(i64(0)) <= reached),
+                           (i64(0) <= floor,)):
+        roots += [
+            rule(
+                eq(t).to(a.binary("div", v.unary("sqrt", rooted), divided)),
+                eq(r).to(v.unary("rsqrt", reciprocal)), positive(v), eq(shape(r)).to(shape(t)),
+                eq(floor).to(log2_floor(v)), eq(bound).to(log2_bound(v)), *common, *normal,
+                *dividend_guard).then(union(t).with_(a.binary("mul", r, multiplied))),
+            rule(
+                eq(t).to(a.binary("div", v.unary("sqrt", rooted).shaped("broadcast_in_dim", laid), divided)),
+                eq(r).to(v.unary("rsqrt", reciprocal)), positive(v), eq(shape(r)).to(shape(v)),
+                eq(extent).to(shape(v.unary("sqrt", rooted).shaped("broadcast_in_dim", laid))),
+                eq(floor).to(log2_floor(v)), eq(bound).to(log2_bound(v)), *common, *normal,
+                *dividend_guard).then(
+                union(t).with_(a.binary("mul", r_laid, multiplied)), set_(shape(r_laid)).to(extent)),
+            rule(
+                eq(t).to(a.binary("div", v.shaped("broadcast_in_dim", laid).unary("sqrt", rooted), divided)),
+                eq(r).to(v.unary("rsqrt", reciprocal)), positive(v), eq(shape(r)).to(shape(v)),
+                eq(extent).to(shape(v.shaped("broadcast_in_dim", laid))),
+                eq(floor).to(log2_floor(v)), eq(bound).to(log2_bound(v)), *common, *normal,
+                *dividend_guard).then(
+                union(t).with_(a.binary("mul", r_laid, multiplied)), set_(shape(r_laid)).to(extent)),
+        ]
     return (
         RuleFamily("a quotient by a value whose reciprocal the program holds", tuple(reciprocals),
                    (lambda a, y: a / jnp.maximum(y, 1e-3), lambda a, y: a * (1 / jnp.maximum(y, 1e-3)),
                     _FLOORED)),
-        RuleFamily("a quotient by a root whose reciprocal the program holds", (rule(
-            eq(t).to(a.binary("div", v.unary("sqrt", rooted), divided)),
-            eq(r).to(v.unary("rsqrt", reciprocal)), positive(v), eq(shape(r)).to(shape(t)),
-            eq(floor).to(log2_floor(v)), eq(bound).to(log2_bound(v)), *guarded, *normal,
-            held + (i64(0) - floor).max(i64(0)) <= reached).then(
-            union(t).with_(a.binary("mul", r, multiplied))),),
-            (lambda a, v: a / jnp.sqrt(v), lambda a, v: a * jax.lax.rsqrt(v), _FLOORED)))
+        RuleFamily("a quotient by a root whose reciprocal the program holds", tuple(roots),
+                   (lambda a, v: a / jnp.sqrt(v), lambda a, v: a * jax.lax.rsqrt(v), _FLOORED)))
 
 
 def _linear() -> tuple[RuleFamily, ...]:
@@ -824,7 +856,11 @@ _HEADS: dict[str, set[tuple[str, ...]]] = {}
 operations that make its operands, where the left side states them. The program pass opens a window at an
 equation one of them matches (`heads`, `program.WINDOW` deep), so a rule is reachable from the moment it is
 registered; a set that only aids the others (`Rules.aid`: commutativity leaves every price as it was) or runs
-at dev time alone (`Rules.dev`) opens none."""
+at dev time alone (`Rules.dev`) opens none unless enabled via `enabling_dev`."""
+_DEV_HEADS: dict[str, dict[str, set[tuple[str, ...]]]] = {}
+"""Window heads for each dev-time rule set (`Rules.dev`), active only while named in `ALGEBRA.value.dev`."""
+_HEAD_PATTERNS: dict[str, list[tuple[tuple[str, int], ...]]] = {}
+_DEV_PATTERNS: dict[str, dict[str, list[tuple[tuple[str, int], ...]]]] = {}
 
 
 def _operation(pattern) -> declarations.CallDecl | None:
@@ -892,8 +928,24 @@ def register(rules: Rules) -> None:
                          f"of the language, so no window of a program opens for it")
     RULES[rules.name] = rules
     for root, made in (head for _, head in found if head is not None):
-        _HEADS.setdefault(root, set()).add(made)
-
+        bucket = _HEADS.setdefault(root, set())
+        if made not in bucket:
+            bucket.add(made)
+            _HEAD_PATTERNS.setdefault(root, []).append(tuple(collections.Counter(made).items()))
+    if rules.dev:
+        dev_heads: dict[str, set[tuple[str, ...]]] = {}
+        dev_patterns: dict[str, list[tuple[tuple[str, int], ...]]] = {}
+        for family in rules.families:
+            for written in family.rules:
+                head = _head(written)
+                if head is not None:
+                    bucket = dev_heads.setdefault(head[0], set())
+                    if head[1] not in bucket:
+                        bucket.add(head[1])
+                        dev_patterns.setdefault(head[0], []).append(
+                            tuple(collections.Counter(head[1]).items()))
+        _DEV_HEADS[rules.name] = dev_heads
+        _DEV_PATTERNS[rules.name] = dev_patterns
 
 _MEASURED = ("measured M-DC-1 (four diffusion training steps, GH200) and M-DC-3 (six GPU flows' training and "
              "decode programs, a DPO step, GH200 and A100): within each cell's A/A")
@@ -926,14 +978,37 @@ register(Rules.declared("joined", "reorders", _joined(),
                         "passes)"))
 
 
+def head_primitives() -> frozenset[str]:
+    """Operation symbols where any active registered rule's left side heads (`_HEADS`, enabled dev sets)."""
+    enabled = ALGEBRA.value.dev
+    if not enabled:
+        return frozenset(_HEADS)
+    return frozenset(_HEADS).union(*(_DEV_HEADS.get(name, ()) for name in enabled))
+
+
+def _matches_head(patterns: Sequence[tuple[tuple[str, int], ...]],
+                  operands: Sequence[str | None]) -> bool:
+    """Whether `operands` satisfies any pre-counted required producer multiset in `patterns`."""
+    for needed in patterns:
+        if not needed or all(operands.count(symbol) >= count for symbol, count in needed):
+            return True
+    return False
+
+
 def heads(primitive: str, operands: Sequence[str | None]) -> bool:
     """Whether an equation binding `primitive` over operands made by `operands` (each producer's primitive, or
     None for a value from outside) is a head a registered rule may lower the price at: some rule's left side
     heads at that operation over operands of those makers (`_HEADS`, each rule's own as it is registered),
     each of the equation's operands answering one of the left side's at most, in any order (commutativity
     may have swapped them)."""
-    made = collections.Counter(operand for operand in operands if operand is not None)
-    return any(not collections.Counter(needed) - made for needed in _HEADS.get(primitive, ()))
+    if (patterns := _HEAD_PATTERNS.get(primitive)) and _matches_head(patterns, operands):
+        return True
+    enabled = ALGEBRA.value.dev
+    if not enabled:
+        return False
+    return any(_matches_head(dev_patterns, operands)
+               for name in enabled
+               if (dev_patterns := _DEV_PATTERNS.get(name, {}).get(primitive)))
 
 
 def reorderable(region: terms.Region) -> bool:
@@ -961,13 +1036,28 @@ def reorderable(region: terms.Region) -> bool:
                for found in extrema)
 
 
+@contextlib.contextmanager
+def enabling_dev(*names: str) -> Iterator[None]:
+    """Enable registered cost-qualified dev-time rule sets `names` (both their rules and their window heads)
+    in JAX's trace context (`ALGEBRA.value.dev`) without mutating global registries; `bounded` sets such as
+    `stable`, which require measured candidate selection (`dew.algebra.error.choose`), are refused."""
+    invalid = [name for name in names
+               if name not in RULES or not RULES[name].dev or RULES[name].rounding == "bounded"]
+    if invalid:
+        raise ValueError(f"not cost-qualified dev-time rule sets: {invalid}")
+    with ALGEBRA(dataclasses.replace(ALGEBRA.value, dev=ALGEBRA.value.dev | frozenset(names))):
+        yield
+
+
 def admitted(accurate: bool, *, dev: bool = False) -> tuple[Rules, ...]:
     """The rule sets a program's numerics admit: every set under default numerics, the `exact` ones alone
-    under the accurate numerics (`precision="accurate"`); the dev-time sets (`Rules.dev`) only where `dev`,
-    whose choice measures each candidate's error instead; none the pass leaves out (`dew._cache.Passes`'
+    under the accurate numerics (`precision="accurate"`); the dev-time sets (`Rules.dev`) only where `dev`
+    or named in `enabling_dev` (`ALGEBRA.value.dev`); none the pass leaves out (`dew._cache.Passes`'
     `without`, a receipt's arm)."""
+    enabled = ALGEBRA.value.dev
     return tuple(rules for rules in RULES.values()
-                 if (dev or not rules.dev) and (dev or not accurate or rules.rounding == "exact")
+                 if (dev or not rules.dev or rules.name in enabled)
+                 and (dev or not accurate or rules.rounding == "exact")
                  and admits(rules))
 
 

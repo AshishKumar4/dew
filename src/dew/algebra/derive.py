@@ -60,8 +60,29 @@ from egglog.bindings import EggSmolError
 
 from dew import _cache
 from dew._cache import ALGEBRA, unintercepted
-from dew.algebra import cost, extract, program, rules, terms
+from dew.algebra import cost, derive_moments, extract, program, rules, terms
 from dew.algebra.cost import Work
+from dew.algebra.derive_moments import (
+    MOMENT_SSA,
+    anchor_slot,
+    anchored_first,
+    boolean,
+    filled,
+    hi_slot,
+    identity_broadcast,
+    inserts_axis,
+    is_square,
+    moment_anchor,
+    moment_hi,
+    moment_scale,
+    nonnegative,
+    plain_local,
+    positive_guard,
+    scale_slot,
+    scaled_second,
+    unit_array,
+    unreduced,
+)
 from dew.algebra.forms import Accumulated, Added, Derived, Merged, Refused, evaluated, evaluator, inlined
 from dew.algebra.terms import Term
 from dew.nn.kernels import generation
@@ -82,8 +103,8 @@ class Reduction:
     function: Callable
     operands: Mapping[str, Axes]
     walked: str
-    exponent: Literal[2, "e"]
-    ranges: Mapping[str, float] = dataclasses.field(default_factory=dict)
+    exponent: Literal[2, "e"] = "e"
+    ranges: Mapping[str, float | tuple[float, float]] = dataclasses.field(default_factory=dict)
     exact: bool = False
     """Whether its forms are extracted exactly (`extract.cheapest`): a declaration whose greedy extraction the
     test suite's oracle finds dearer than the optimum (`dew._cache.Passes.checked`)."""
@@ -413,16 +434,18 @@ def _walking(scaled: bool = False):
              local(y), left_of(p, c, d)).then(summed(t), set_(anchored(t)).to(d)),
         rule(eq(t).to(x.dot(y, p)), eq(walked(y)).to(a), contracts_right(p, a), scales(y, k, name, e, s, c),
              local(x), right_of(p, c, d)).then(summed(t), set_(anchored(t)).to(d)),
+        *derive_moments.moment_walking(local, summed, walked, zero),
     ]
     return ruleset(*walking, name="walking scaled" if scaled else "walking")
 
 
 def _shapes():
     """The shapes of the values the derivation's rules make: a carried state its reduction's, a value a step,
-    merge, finish or carried state reads its own, a select its operands', a clamp its operand's, a lifted
-    correction its broadcast's target."""
+    merge, finish or carried state reads its own, a comparison its operands', a select its operands', a clamp
+    its operand's, a lifted correction or broadcast its target."""
     x, y, z, w = vars_("x y z w", Term)
-    side, at = vars_("side at", i64)
+    name = var("name", String)
+    side, at, p = vars_("side at p", i64)
     extent = var("extent", Vec[i64])
     given, to = vars_("given to", Vec[i64])
     shape = rules.shape
@@ -431,9 +454,18 @@ def _shapes():
         rule(eq(extent).to(shape(x)), eq(y).to(x.stepped())).then(set_(shape(y)).to(extent)),
         rule(eq(extent).to(shape(x)), eq(y).to(x.merged())).then(set_(shape(y)).to(extent)),
         rule(eq(extent).to(shape(x)), eq(y).to(x.finished())).then(set_(shape(y)).to(extent)),
-        rule(eq(extent).to(shape(y)), eq(z).to(x.select(y, z))).then(set_(shape(x.select(y, z))).to(extent)),
+        rule(eq(extent).to(shape(x)), eq(y).to(moment_anchor(x))).then(set_(shape(y)).to(extent)),
+        rule(eq(extent).to(shape(x)), eq(y).to(moment_hi(x))).then(set_(shape(y)).to(extent)),
+        rule(eq(extent).to(shape(x)), eq(y).to(moment_scale(x))).then(set_(shape(y)).to(extent)),
+        rule(eq(w).to(x.compare(name, y, p)), eq(extent).to(shape(x)), eq(shape(y)).to(extent)).then(
+            set_(shape(w)).to(extent)),
+        rule(eq(extent).to(shape(y)), eq(w).to(x.select(y, z))).then(set_(shape(w)).to(extent)),
         rule(eq(extent).to(shape(y)), eq(w).to(x.clamp(y, z))).then(set_(shape(w)).to(extent)),
         rule(eq(y).to(x.shaped(String("broadcast_in_dim"), lifts(given, to, at)))).then(
+            set_(shape(y)).to(to)),
+        rule(eq(y).to(x.shaped(String("broadcast_in_dim"), filled(to)))).then(
+            set_(shape(y)).to(to)),
+        rule(eq(y).to(x.shaped(String("broadcast_in_dim"), unreduced(to, at)))).then(
             set_(shape(y)).to(to)),
         name="derived shapes")
 
@@ -519,19 +551,24 @@ def _decoupled(rescaling: bool = False):
     # A walked sum of local products states its weights and values as it writes them (no factor: it takes no
     # rescale), which a mainloop's own accumulator takes (`Accumulated`).
     stepped, merged = vars_("stepped merged", Term)
-    derived.append(rule(eq(stepped).to(t.stepped()), eq(t).to(x.dot(y, p)), summed(t), local_of(t),
+    derived.append(rule(eq(stepped).to(t.stepped()), eq(t).to(x.dot(y, p)), summed(t), plain_local(t),
                         slotted).then(set_(weighed(stepped)).to(x.stepped()),
                                       set_(weighted(stepped)).to(y.stepped())))
     for combined, which, index in (("max", peaked, largest), ("add", summed, added)):
         stocked = eq(index).to(stock(combined))
         derived += [
-            rewrite(t.stepped()).to(Term.state(i, 0).binary(combined, t, index), which(t), local_of(t),
+            rewrite(t.stepped()).to(Term.state(i, 0).binary(combined, t, index), which(t), plain_local(t),
                                     stocked, slotted),
             rewrite(t.merged()).to(Term.state(i, 0).binary(combined, Term.state(i, 1), index), which(t),
-                                   local_of(t), stocked, slotted),
-            rewrite(t.finished()).to(Term.state(i, 0), which(t), slotted),
+                                   plain_local(t), stocked, slotted),
         ]
-    derived.append(rewrite(t.held(side)).to(Term.state(i, side), peaked(t), slotted))
+    derived += [
+        rewrite(t.finished()).to(Term.state(i, 0), peaked(t), slotted),
+        rewrite(t.finished()).to(Term.state(i, 0), summed(t), plain_local(t), slotted),
+        rewrite(t.held(side)).to(Term.state(i, side), peaked(t), slotted),
+        rewrite(t.held(side)).to(Term.state(i, side), summed(t), plain_local(t), slotted),
+    ]
+    derived += derive_moments.moment_decoupled(slot)
 
     # A sum along the walked axis of values that scale with an anchor `k`: its carried value rescaled by
     # exp(k carried - k now), lifted to its shape, beside the tile's sum at the anchor now; the anchor now
@@ -610,7 +647,8 @@ DECOUPLED_RESCALED = rules.Rules("decoupled rescaled", "reorders", _decoupled(re
 PLAIN = _plain()
 
 
-_READINGS = (Term.stepped, Term.merged, Term.finished, Term.held)
+_READINGS = (Term.stepped, Term.merged, Term.finished, Term.held, moment_anchor, moment_hi, moment_scale,
+             *MOMENT_SSA)
 
 
 def _priced(region: terms.Region, schedule) -> DagCostModel[cost.Seconds]:
@@ -658,6 +696,10 @@ class _Forms:
     floors: tuple[float | None, ...] = ()
     """Each reduction's floor, the identity it is carried from where the declaration reads it only floored
     (`_floors`); None for every other."""
+    anchors: tuple[Term, ...] = ()
+    """First-moment reductions carrying a companion base-mean anchor slot (`moment_anchor`)."""
+    scales: tuple[Term, ...] = ()
+    """Central second-moment reductions carrying a companion zero-mass scale slot (`moment_scale`)."""
 
 
 def context() -> tuple:
@@ -671,8 +713,8 @@ def context() -> tuple:
     the whole trace context, whose identity-keyed collections (`dew._cache.KERNEL_ROUTES`, `KERNEL_SEEN`) are
     new in each lowering: every lowering derived again and the cache grew without end."""
     return (jax.sharding.get_abstract_mesh(), cost.target(), generation.numerics(),
-            jax.config.jax_default_matmul_precision, ALGEBRA.value.checked, ALGEBRA.value.without)
-
+            jax.config.jax_default_matmul_precision, ALGEBRA.value.checked, ALGEBRA.value.without,
+            ALGEBRA.value.dev)
 
 FORMS_HELD = 64
 """The derived forms one declaration keeps, its least recently traced dropped past them: a process's distinct
@@ -712,17 +754,20 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
     def init(shapes):
         made = forms(shapes)
         avals = [jax.ShapeDtypeStruct(*shapes[name]) for name in names]
+        slot_terms = (*made.reductions, *made.anchors, *made.scales, *made.scales)
+        slot_floors = (*made.floors, *(math.inf,) * len(made.anchors), *(0.0,) * len(made.scales),
+                       *(1.0,) * len(made.scales))
         typed = jax.eval_shape(lambda *values: tuple(evaluated(made.region, reduction,
                                                                [*made.consts, *values], {})
-                                                     for reduction in made.reductions), *avals)
+                                                     for reduction in slot_terms), *avals)
         return tuple(jnp.full(aval.shape, _identity(reduction, aval.dtype) if floor is None else floor,
                               aval.dtype)
-                     for reduction, aval, floor in zip(made.reductions, typed, made.floors, strict=True))
+                     for reduction, aval, floor in zip(slot_terms, typed, slot_floors, strict=True))
 
     def carried(made: _Forms, *states) -> dict:
         return {terms.key(Term.state(i64(index), i64(side))): state[index]
                 for side, state in enumerate(states)
-                for index in range(len(made.reductions))}
+                for index in range(len(made.steps))}
 
     def step(state, tiles, *, product=None, stepped=None, outputs: Sequence[int] = ()):
         made = forms(shaped(tiles))
@@ -783,7 +828,10 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
 
     def slots(shapes) -> tuple[tuple[str, tuple[int, ...]], ...]:
         made = forms(shapes)
-        return tuple((_role(reduction), made.region.shape(reduction)) for reduction in made.reductions)
+        return (*((_role(reduction), made.region.shape(reduction)) for reduction in made.reductions),
+                *(("anchor", made.region.shape(term)) for term in made.anchors),
+                *(("hi", made.region.shape(term)) for term in made.scales),
+                *(("scale", made.region.shape(term)) for term in made.scales))
 
     return Derived(init, step, merge, finish, mapped,
                    {"rounding": "reorders", "walked": declaration.walked, "exponent": declaration.exponent,
@@ -827,22 +875,22 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
     graph.run(PLAIN.saturate())
     found = [term for term, _ in region.shapes if _holds(graph, summed(term)) or _holds(graph, peaked(term))]
     reductions = tuple({terms.key(term): term for term in found}.values())
-    for index, reduction in enumerate(reductions):
-        graph.register(set_(slot(reduction)).to(i64(index)))
-        region.params.append((jax.lax.convert_element_type_p, {
-            "new_dtype": region.dtypes[terms.key(reduction)], "weak_type": False, "sharding": None}))
-        graph.register(set_(retype(i64(index))).to(i64(len(region.params) - 1)))
-        for side in (0, 1):
-            graph.register(set_(rules.shape(Term.state(i64(index), i64(side)))).to(
-                Vec[i64](*(i64(size) for size in region.shape(reduction)))))
-    _lift(graph, region, reductions)
+    anchors = tuple(term for term in reductions if _holds(graph, anchored_first(term)))
+    scales = tuple(term for term in reductions if _holds(graph, scaled_second(term)))
+    _register_reduction_slots(graph, region, reductions, anchors, scales)
     outputs = list(region.outputs)
     along = [term is not None and _walked(graph, term) for term in outputs]
     for term, is_along in zip(outputs, along, strict=True):
         if is_along and term is not None and not _holds(graph, local(term)):
             raise Refused("an output along the walked axis reads a walked reduction: no tile holds it")
     roots = ([reduction.stepped() for reduction in reductions]
+             + [moment_anchor(term).stepped() for term in anchors]
+             + [moment_hi(term).stepped() for term in scales]
+             + [moment_scale(term).stepped() for term in scales]
              + [reduction.merged() for reduction in reductions]
+             + [moment_anchor(term).merged() for term in anchors]
+             + [moment_hi(term).merged() for term in scales]
+             + [moment_scale(term).merged() for term in scales]
              + [term.finished() for term, is_along in zip(outputs, along, strict=True)
                 if term is not None and not is_along])
     declared = Term.bundle(Vec[Term](*region.roots()))
@@ -891,7 +939,8 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
     report = program.AlgebraReport(region.equations, tuple(saturated.fired), saturated.fired,
                                    saturated.limits, saturated.iterations, program.node_count(graph),
                                    saturated.limited, before.value, after.value, time.perf_counter() - began)
-    count = len(reductions)
+    extra_pad = (None,) * (len(anchors) + 2 * len(scales))
+    count = len(reductions) + len(anchors) + 2 * len(scales)
     steps, merges, finished = chosen[:count], chosen[count:2 * count], iter(chosen[2 * count:])
     finishes = tuple(None if term is None or is_along else next(finished)
                      for term, is_along in zip(outputs, along, strict=True))
@@ -904,8 +953,8 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
         if _reads_leaves(form) & walked_leaves:
             raise Refused("a merge reads a walked operand: no tile is there to read")
     return _Forms(region, reductions, tuple(steps), tuple(merges), finishes, tuple(along), tuple(outputs),
-                  walked_leaves, tuple(closed.consts), report, tuple(accumulated), tuple(added),
-                  tuple(merged), floors)
+                  walked_leaves, tuple(closed.consts), report, (*accumulated, *extra_pad),
+                  (*added, *extra_pad), (*merged, *extra_pad), floors, anchors, scales)
 
 
 def _decoupled_through(graph: EGraph, region: terms.Region, facts: Schedule, decoupled: rules.Rules) -> None:
@@ -919,19 +968,61 @@ def _decoupled_through(graph: EGraph, region: terms.Region, facts: Schedule, dec
     graph.run(facts)
 
 
-def _register(graph: EGraph, region: terms.Region, closed, names, walked_axes) -> None:
-    """The facts the rules read that each parameter's own values state (the engine's, `program.stated`, and
-    the derivation's own), and each input's walked axis."""
-    program.stated(graph, region)
-    _least(graph, region)
-    for index, (primitive, params) in enumerate(region.params):
+def _register_reduction_slots(graph: EGraph, region: terms.Region, reductions: tuple[Term, ...],
+                              anchors: tuple[Term, ...], scales: tuple[Term, ...]) -> None:
+    """Assign state slots, companion anchor/scale slots, retypes, state shapes, and broadcast layouts."""
+    anchored_keys = {terms.key(term) for term in anchors}
+    for index, reduction in enumerate(reductions):
+        graph.register(set_(slot(reduction)).to(i64(index)))
+        if _holds(graph, local_of(reduction)) and terms.key(reduction) not in anchored_keys:
+            graph.register(plain_local(reduction))
+        region.params.append((jax.lax.convert_element_type_p, {
+            "new_dtype": region.dtypes[terms.key(reduction)], "weak_type": False, "sharding": None}))
+        graph.register(set_(retype(i64(index))).to(i64(len(region.params) - 1)))
+        for side in (0, 1):
+            graph.register(set_(rules.shape(Term.state(i64(index), i64(side)))).to(
+                Vec[i64](*(i64(size) for size in region.shape(reduction)))))
+    for offset, term in enumerate(anchors):
+        a_index = len(reductions) + offset
+        graph.register(set_(anchor_slot(term)).to(i64(a_index)))
+        for side in (0, 1):
+            graph.register(set_(rules.shape(Term.state(i64(a_index), i64(side)))).to(
+                Vec[i64](*(i64(size) for size in region.shape(term)))))
+    for offset, term in enumerate(scales):
+        h_index = len(reductions) + len(anchors) + offset
+        s_index = h_index + len(scales)
+        graph.register(set_(hi_slot(term)).to(i64(h_index)), set_(scale_slot(term)).to(i64(s_index)))
+        for slot_index in (h_index, s_index):
+            for side in (0, 1):
+                graph.register(set_(rules.shape(Term.state(i64(slot_index), i64(side)))).to(
+                    Vec[i64](*(i64(size) for size in region.shape(term)))))
+    _lift(graph, region, reductions)
+    if anchors or scales or any(_holds(graph, summed(reduction)) and not _holds(graph, local_of(reduction))
+                                and graph.lookup_function_value(anchored(reduction)) is None
+                                for reduction in reductions):
+        derive_moments.register_moment_resources(graph, region, reductions, walked)
+
+
+def _register_param_moves(graph: EGraph, region: terms.Region) -> None:
+    """Register how each parameter in `region.params` moves, inserts, reduces, or contracts axes."""
+    for index, (primitive, params) in enumerate(list(region.params)):
         declared = terms.OPERATIONS.get(primitive)
         kind = None if declared is None else declared.kind
         if kind in ("binary", "unary", "comparison", "cast"):
             graph.register(keeps(i64(index)))
+            if primitive is jax.lax.integer_pow_p and params.get("y") == 2:
+                graph.register(is_square(i64(index)))
         elif primitive is jax.lax.broadcast_in_dim_p:
-            for axis, to in enumerate(params["broadcast_dimensions"]):
-                graph.register(lays(i64(index), i64(axis), i64(int(to))))
+            dims = tuple(int(d) for d in params["broadcast_dimensions"])
+            after = tuple(int(s) for s in params["shape"])
+            for axis, to in enumerate(dims):
+                graph.register(lays(i64(index), i64(axis), i64(to)))
+            if dims == tuple(range(len(after))):
+                graph.register(identity_broadcast(i64(index)))
+            elif len(dims) == len(after) - 1:
+                missing = [axis for axis in range(len(after)) if axis not in dims]
+                if len(missing) == 1 and dims == tuple(p for p in range(len(after)) if p != missing[0]):
+                    graph.register(inserts_axis(i64(index), i64(missing[0])))
         elif primitive is jax.lax.transpose_p:
             permutation = list(params["permutation"])
             for axis in range(len(permutation)):
@@ -939,6 +1030,9 @@ def _register(graph: EGraph, region: terms.Region, closed, names, walked_axes) -
         elif primitive in (jax.lax.squeeze_p, jax.lax.reshape_p):
             for axis, to in _moved(primitive, params, region, index):
                 graph.register(lays(i64(index), i64(axis), i64(to)))
+            if primitive is jax.lax.reshape_p and params.get("dimensions") is None:
+                for axis in _inserted_reshape_axes(region, index):
+                    graph.register(inserts_axis(i64(index), i64(axis)))
         elif kind == "reduction":
             reduced = {int(axis) for axis in params["axes"]}
             for axis in range(_rank_before(region, index, reduced)):
@@ -963,26 +1057,51 @@ def _register(graph: EGraph, region: terms.Region, closed, names, walked_axes) -
                 graph.register(contracts_left(i64(index), i64(int(axis))))
             for axis in right_contracted:
                 graph.register(contracts_right(i64(index), i64(int(axis))))
+
+
+def _register(graph: EGraph, region: terms.Region, closed, names, walked_axes) -> None:
+    """The facts the rules read that each parameter's own values state (the engine's, `program.stated`, and
+    the derivation's own), and each input's walked axis."""
+    program.stated(graph, region)
+    _least(graph, region)
+    _register_param_moves(graph, region)
+    facts: list = []
     # A scalar anchor's axis (`scales`' -1) is none, through every equation.
+    none = i64(-1)
     for index in range(len(region.params)):
-        none = i64(-1)
-        graph.register(lays(i64(index), none, none), reduces(i64(index), none, none),
-                       left_of(i64(index), none, none), right_of(i64(index), none, none))
+        facts.extend((lays(i64(index), none, none), reduces(i64(index), none, none),
+                      left_of(i64(index), none, none), right_of(i64(index), none, none)))
     for index in range(len(closed.jaxpr.constvars)):
-        graph.register(local(Term.leaf(i64(index))), unwalked(Term.leaf(i64(index))))
+        leaf = Term.leaf(i64(index))
+        facts.extend((local(leaf), unwalked(leaf)))
     first = len(closed.jaxpr.constvars)
     for index, input_name in enumerate(names):
         leaf = Term.leaf(i64(first + index))
-        graph.register(local(leaf))
+        facts.append(local(leaf))
         if input_name in walked_axes:
-            graph.register(set_(walked(leaf)).to(i64(walked_axes[input_name])))
+            facts.append(set_(walked(leaf)).to(i64(walked_axes[input_name])))
         else:
-            graph.register(unwalked(leaf))
+            facts.append(unwalked(leaf))
+    for term, _ in region.shapes:
+        named = terms.key(term)
+        if region.dtypes.get(named) == np.bool_:
+            facts.append(boolean(term))
+        if named in region.nonnegative:
+            facts.append(nonnegative(term))
     for index, value in enumerate(region.literals):
         literal = Term.literal(i64(index))
-        graph.register(local(literal), unwalked(literal))
-        if np.all(np.asarray(value) == 0):
-            graph.register(zero(literal))
+        facts.extend((local(literal), unwalked(literal)))
+        if not terms.typed_key(value):
+            literal_array = np.asarray(value)
+            if np.all(literal_array == 0):
+                facts.append(zero(literal))
+            elif np.all(literal_array == 1):
+                facts.extend((unit_array(literal), positive_guard(literal)))
+            elif (literal_array.dtype != np.bool_ and np.all(np.isfinite(literal_array))
+                  and np.all(literal_array > 0)):
+                facts.append(positive_guard(literal))
+    if facts:
+        graph.register(*facts)
 
 
 def _least(graph: EGraph, region: terms.Region) -> None:
@@ -1001,6 +1120,22 @@ def _least(graph: EGraph, region: terms.Region) -> None:
             region.shaped(literal, ())
             graph.register(set_(rules.shape(literal)).to(Vec[i64]()))
         graph.register(set_(least(term)).to(i64(floors[dtype])))
+
+
+def _inserted_reshape_axes(region: terms.Region, index: int) -> list[int]:
+    """Every axis `a` that a `reshape` of parameters `index` inserts as size 1 across all terms using `index`,
+    keeping every other axis in order."""
+    pairs = []
+    for term, after in region.shapes:
+        if (args := get_callable_args(term, Term.shaped)) is not None and terms.integer(args[2]) == index:
+            pairs.append((region.shape(args[0]), tuple(after)))
+    if not pairs:
+        return []
+    after = pairs[0][1]
+    if any(len(after) != len(before) + 1 or end != after for before, end in pairs):
+        return []
+    return [axis for axis in range(len(after))
+            if after[axis] == 1 and all(before == (*after[:axis], *after[axis + 1:]) for before, _ in pairs)]
 
 
 def _moved(primitive, params, region: terms.Region, index: int) -> list[tuple[int, int]]:
