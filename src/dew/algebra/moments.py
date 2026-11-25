@@ -157,13 +157,15 @@ def _weighted_term(tw: jax.Array, operand: jax.Array, sn: jax.Array) -> jax.Arra
     return jnp.where(small_tw, (tw_mf * operand) / sn_mf, (tw_df / sn_df) * operand)
 
 
-_WEIGHT_DIV = ratios.Ratio(((1.0, (("v", 0), ("v", 1))),), ((1.0, (("v", 2),)),), 0,
-                           reduced=True, units=windows.Units())
 def _split_range(mask: jax.Array, sn: jax.Array, *values: jax.Array):
     """Double-where partition of `(sn, *values)` across `mask`: `(sn_t, sn_f, vals_t, vals_f)`."""
     return (jnp.where(mask, sn, 1.0), jnp.where(mask, 1.0, sn),
             tuple(jnp.where(mask, value, 0.0) for value in values),
             tuple(jnp.where(mask, 0.0, value) for value in values))
+
+
+_WEIGHT_DIV = ratios.Ratio(((1.0, (("v", 0), ("v", 1))),), ((1.0, (("v", 2),)),), 0,
+                           reduced=True, units=windows.Units())
 
 
 def _safe_tangent_div(dtw: jax.Array, numerator: jax.Array, sn: jax.Array) -> jax.Array:
