@@ -954,6 +954,47 @@ def test_producers_rungs_keeps_top_after_stated_cap_start():
         assert start_cap not in ladder, (start_cap, ladder)
 
 
+@pytest.mark.parametrize("depth", [512, 511], ids=["whole", "padded"])
+def test_a_refused_gathered_tile_leaves_its_launch_a_config_it_takes(depth):
+    """A gathered paired product on an H100 (an MoE gate/up, 512 tokens gathered to 1024 rows over two
+    experts, its gated epilogue's three outputs) whose tile a compile refused spilling, and the first rungs of
+    its producer's ladder too (`producers.rungs`), each modelled past its consumers' budget: the launch still
+    offers a config no compile refused and its launch takes, the tile refused where its ladder settles on a
+    rung it does not take, at a depth its tiles divide and at one they pad (train 1286, row 12972: the
+    refused tile offered again, its offer refused, the call Exhausted)."""
+    from dew.nn.activations import gated_hook, rounded_gated
+    from dew.nn.kernels.templates import report
+    from dew.nn.kernels.templates.gemm import producers
+
+    bf16 = jnp.bfloat16
+    sizes = jnp.asarray([512, 512], jnp.int32)
+    table = jnp.arange(1024, dtype=jnp.int32) % 512
+
+    def paired(tokens, first, second):
+        return gemm.gemm(tokens, first, sizes, compute=bf16, out_dtype=bf16, out_dtypes=(bf16,) * 3,
+                         paired=second, gather=table, epilogue=rounded_gated(gated_hook("swiglu"), bf16))
+
+    shapes = (jax.ShapeDtypeStruct((512, depth), bf16), jax.ShapeDtypeStruct((2, depth, 512), bf16),
+              jax.ShapeDtypeStruct((2, depth, 512), bf16))
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"), tuning.seen() as launches:
+        jax.make_jaxpr(paired)(*shapes)
+    [ba] = [bound for _, bound in launches.taken if bound.arguments.get("paired") is not None
+            and not bound.arguments.get("trans_rhs")]
+    op = ba.op
+    assert isinstance(op, grouped_matmul.MosaicGmm), op
+    with generation.assumed("sm90"), report.refusals():
+        target = generation.gpu_target()
+        tile = op.derived(ba, target)
+        identity = report._identity(op, ba, target)
+        report.refuse([(identity, tile, frozenset({op.KERNEL}))])
+        rungs = list(producers.rungs(op, ba, tile, target))[:3]
+        assert rungs, "a gathered tile's producer steps"
+        report.refuse([(identity, rung, frozenset({op.KERNEL})) for rung in rungs])
+        refused = [tile, *rungs]
+        offered = op.remaining(ba)
+        assert offered is not None and offered not in refused and op.legal(ba, offered, target), offered
+
+
 @pytest.mark.parametrize("in_dtype", [jnp.bfloat16, jnp.float32], ids=["bf16", "fp32"])
 def test_gathered_prologued_paired_layered_with_compute_holds_check_1_and_compiles(in_dtype):
     """MoE call shape (`compute=bf16` + `prologue` + `gather` + `paired` + `layer`, rows 5391, 12306):

@@ -7,6 +7,7 @@ import functools
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from flax import linen as nn
 from kernel_compile import lowered_for
@@ -149,3 +150,99 @@ def _placed(mesh, leaf, spec=None):
 
     spec = PartitionSpec() if spec is None else spec
     return jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=NamedSharding(mesh, spec))
+
+
+def _cublas_dtypes(compiled) -> list[str]:
+    """The output element type of each cuBLAS product of `compiled`, read from its module's schema
+    (`hlo_instructions`)."""
+    from dew.telemetry.instrumentation import hlo_instructions
+
+    return [instruction.arrays[0] for instruction in hlo_instructions(compiled).values()
+            if "cublas" in instruction.target]
+
+
+def _dot_dtypes(lowered) -> list[str]:
+    """The result element type of each dot of `lowered`'s program, read from its operations."""
+    from jax.extend.mlir import ir
+
+    from dew.nn.kernels.lowered import read_operations
+
+    return read_operations(lowered, lambda operation: str(ir.RankedTensorType(
+        operation.results[0].type).element_type) if operation.name == "stablehlo.dot_general" else None)
+
+
+def test_a_primal_dense_bf16_xla_fallback_stores_bf16_as_xlas_own_dot_does():
+    """A dense bf16 product the template leaves to XLA, lowered for an H100 with no derivative taken
+    (`gemm_xla.direct_dtype`, row 12898): its cuBLAS product stores bfloat16, as XLA's own dense dot (Dense's)
+    does, no fp32 temporary beside it; a product of one row, an explicit dot algorithm, and a contraction a
+    mesh axis splits keep the fp32 product and its one rounding."""
+    from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec
+
+    options = {"xla_gpu_enable_triton_gemm": False}
+    x, w = jax.ShapeDtypeStruct((2048, 512), jnp.bfloat16), jax.ShapeDtypeStruct((512, 2048), jnp.bfloat16)
+    one_row = jax.ShapeDtypeStruct((1, 512), jnp.bfloat16)
+
+    def product(x, w):
+        return gemm.gemm(x, w, None, out_dtype=jnp.bfloat16)
+
+    def gradient(a, b):
+        return gemm.gemm_t(a, b, None, out_dtype=jnp.bfloat16)
+
+    def stored(fn, *shapes) -> list[str]:
+        return _cublas_dtypes(lowered_for(fn, shapes, "sm90").compile(compiler_options=options))
+
+    with generation.chosen(grouped_matmul="xla"):
+        assert set(stored(product, x, w)) == {"bf16"}
+        assert set(stored(gradient, x, x)) == {"bf16"}
+        # A one-row product XLA reduces as a vector: its dot's own dtype, not cuBLAS's store.
+        assert set(_dot_dtypes(lowered_for(product, (one_row, w), "sm90"))) == {"f32"}
+        with jax.default_matmul_precision("F32_F32_F32"):
+            assert set(stored(gradient, x, x)) == {"f32"}
+    devices = generation.compile_only_gpus("sm90", 2, 2**36)
+    mesh = Mesh(devices, ("tp",))
+    split = (jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=NamedSharding(mesh, PartitionSpec(None, "tp"))),
+             jax.ShapeDtypeStruct(w.shape, w.dtype, sharding=NamedSharding(mesh, PartitionSpec("tp", None))))
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="xla"), jax.set_mesh(mesh):
+        compiled = jax.jit(product).lower(*split).compile(compiler_options=options)
+    assert set(_cublas_dtypes(compiled)) == {"f32"}
+    # Two rows an explicit data axis splits: each device's product is one row's, a vector's, kept wide.
+    rows = Mesh(devices, ("data",), axis_types=(AxisType.Explicit,))
+    pair = (jax.ShapeDtypeStruct((2, 512), jnp.bfloat16, sharding=NamedSharding(rows, PartitionSpec("data"))),
+            jax.ShapeDtypeStruct(w.shape, w.dtype, sharding=NamedSharding(rows, PartitionSpec())))
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="xla"), jax.set_mesh(rows):
+        assert set(_dot_dtypes(jax.jit(product).trace(*pair).lower())) == {"f32"}
+
+
+def a_dense_bf16_products_tangent_sums_its_terms_before_rounding(product: str) -> None:
+    """`jax.jvp` of a dense bf16 product (`gemm` or `gemm_t`, 4 x 2 by 2 x 4, no extent of one: a shape the
+    XLA fallback stores bf16 directly where no derivative is taken) whose two tangent terms cancel to below a
+    bf16 ulp of either (x = 129/128, w = 1, dx = 1, dw = -255/256 in each entry's one live term): every entry
+    of the tangent is -127/32768, both terms summed in fp32 and rounded once (`gemm`'s portable program,
+    every derivative's), never a bf16 rounding a term."""
+    bf16 = jnp.bfloat16
+    left, right = np.zeros((4, 2), np.float32), np.zeros((2, 4), np.float32)
+    left[:, 0], right[0] = 129 / 128, 1.0
+    d_left, d_right = np.zeros((4, 2), np.float32), np.zeros((2, 4), np.float32)
+    d_left[:, 0], d_right[0] = 1.0, -255 / 256
+    if product == "gemm":
+        def fn(x, w):
+            return gemm.gemm(x, w, None, out_dtype=bf16)
+        operands, tangents = (left, right), (d_left, d_right)
+    else:
+        def fn(x, w):
+            return gemm.gemm_t(x, w, None, out_dtype=bf16)[0]
+        operands, tangents = (left.T, right), (d_left.T, d_right)
+
+    def tangent(*arrays):
+        with generation.chosen(grouped_matmul="xla"):
+            return jax.jvp(fn, arrays[:2], arrays[2:])[1]
+
+    found = jax.jit(tangent)(*(jnp.asarray(each, bf16) for each in (*operands, *tangents)))
+    np.testing.assert_array_equal(np.asarray(found, np.float32), np.full((4, 4), -127 / 32768, np.float32))
+
+
+@pytest.mark.parametrize("product", ["gemm", "gemm_t"])
+def test_a_dense_bf16_products_tangent_sums_its_terms_before_rounding(product):
+    """`a_dense_bf16_products_tangent_sums_its_terms_before_rounding` on this process's device (a GPU's
+    native cell runs it on CUDA's fallback, tests/test_gpu_gemm.py)."""
+    a_dense_bf16_products_tangent_sums_its_terms_before_rounding(product)
