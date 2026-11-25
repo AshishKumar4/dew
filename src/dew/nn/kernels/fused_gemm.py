@@ -642,11 +642,14 @@ def _split(producer, values):
     # XLA's program of the sides: the producer's, read back from them (its extraction prices what they read
     # alone); none where every side is an input the stage reads as given.
     computed = any(not isinstance(var, jax_core.Literal) and var not in jaxpr.invars for var in sides)
-    whole_jvp = functools.partial(_whole_jvp, flat, tuple(leaves), places, tuple(array.shape for array in arrays))
+    whole_jvp = functools.partial(_whole_jvp, flat, tuple(leaves), places,
+                                  tuple(array.shape for array in arrays))
     if computed or any(not jnp.issubdtype(array.dtype, jnp.inexact) for array in arrays):
         jvp = whole_jvp
     elif any(programs.own_derivative(eq.primitive) for eq in programs.equations(source.jaxpr)):
         jvp = _tile_jvp(whole_jvp, arrays, types, axes)
+        if isinstance(jvp, Refusal):
+            return jvp
     else:
         jvp = None
     formed = Formed(staged, closed.replace(jaxpr=jaxpr.replace(outvars=list(sides))) if computed else None,
@@ -655,19 +658,26 @@ def _split(producer, values):
 
 
 def _tile_jvp(whole_jvp, arrays: list, types: tuple, axes: tuple):
-    """Trace the producer's own derivative before tiling it, with primal and tangent sides on the
-    same axes. There are no computed sides, so no derivative reads a whole-row statistic."""
+    """Prove the producer's own JVP uses the offered primal and tangent tiles. Keep the original
+    derivative on whole arrays, where higher orders must read its nested custom rules."""
     count = len(arrays)
 
     def push(*values):
         return whole_jvp(*values[:count])(*values[count:])
 
-    derivative = jax.make_jaxpr(push)(*arrays, *arrays)
-    return functools.partial(_jvp_on_tile, functools.partial(_inlined, derivative), (*types, *types),
-                             (*axes, PROLOGUE_AXES, *axes))
+    tangent = functools.partial(_inlined, jax.make_jaxpr(push)(*arrays, *arrays))
+    offered = (*axes, PROLOGUE_AXES, *axes)
+    taken = _prologue_axes(tangent, [*arrays, *arrays], arrays[0].shape)
+    if isinstance(taken, Refusal):
+        return taken
+    if offered != taken:
+        return Refusal("derivative_tiles", "the producer's derivative needs different tiles than its value")
+    return functools.partial(_jvp_on_tile, whole_jvp, tangent, (*types, *types), offered)
 
 
-def _jvp_on_tile(derivative, types, axes, base, *sides):
+def _jvp_on_tile(whole_jvp, derivative, types, axes, base, *sides):
+    if not _on_tiles():
+        return whole_jvp(base, *sides)
     return functools.partial(_prologue_tile, derivative, types, axes, base, *sides)
 
 

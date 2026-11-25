@@ -23,6 +23,28 @@ from dew.nn.kernels.templates import cost
 from dew.nn.kernels.templates.hooks import Hook, Side
 
 
+def test_a_whole_depth_producer_derivative_is_not_spliced_into_a_partial_tile():
+    """A pointwise primal can have a custom tangent whose depth cannot be tiled."""
+    @jax.custom_jvp
+    def producer(rows):
+        return 2 * rows
+
+    @producer.defjvp
+    def derivative(primals, tangents):
+        (rows,), (direction,) = primals, tangents
+        summed = jnp.sum(direction, axis=-1, keepdims=True)
+        return producer(rows), jnp.broadcast_to(summed, rows.shape)
+
+    def region(rows, kernel):
+        return fused_gemm.product(producer(rows), kernel, out_dtype=rows.dtype)
+
+    rows = jax.ShapeDtypeStruct((256, 512), jnp.bfloat16)
+    kernel = jax.ShapeDtypeStruct((512, 256), jnp.bfloat16)
+    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic", gemm_prologue="fused"),
+          pytest.raises(selection.KernelRefused)):
+        fused_gemm.analysis(region, rows, kernel)
+
+
 @INTERPRETS
 @pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
 def test_a_fused_regions_consumer_reads_its_product_as_the_dot_rounds_it(generation_name):

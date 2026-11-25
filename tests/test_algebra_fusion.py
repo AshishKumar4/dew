@@ -547,12 +547,18 @@ def test_a_gated_activation_can_feed_the_next_products_prologue():
 
     with (generation.assumed("sm90", interpreted=True),
           generation.chosen(grouped_matmul="mosaic", gemm_prologue="fused")):
-        assert_as_exact(jax.jit(with_gradients(functools.partial(_passed, gated_projection))),
-                        jax.jit(with_gradients(gated_projection)), operands, "gated product before a projection",
-                        seeds=8, truth_fn=with_gradients(truth))
-        assert_as_exact(directional(functools.partial(_passed, gated_projection)), directional(gated_projection),
+        fused = functools.partial(_passed, gated_projection)
+        assert_as_exact(jax.jit(with_gradients(fused)), jax.jit(with_gradients(gated_projection)), operands,
+                        "gated product before a projection", seeds=8, truth_fn=with_gradients(truth))
+        assert_as_exact(directional(fused), directional(gated_projection),
                         normal_drawn(3423, *dims, *dims, dtype=jnp.bfloat16), "gated projection tile JVP",
                         seeds=8, truth_fn=directional(truth))
+        gate, up, down = (jnp.ones(shape, jnp.bfloat16) for shape in dims)
+
+        def loss(value):
+            return fused(gate.at[0, 0].set(value), up, down)[0, 0].astype(jnp.float32)
+
+        assert jnp.isfinite(jax.jit(jax.grad(jax.grad(loss)))(jnp.bfloat16(-100)))
 
 
 def test_a_gated_product_of_no_product_stays_its_region():
