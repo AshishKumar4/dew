@@ -22,7 +22,6 @@ from model_support import (
     with_logit_cotangent,
 )
 from reference_error import assert_as_exact, equations, with_gradients
-from test_loop import _exiting, _passes_exiting
 
 from dew.interop.hf_decoders import translate_config
 from dew.nn.backbones.call_metadata import call_metadata
@@ -52,10 +51,17 @@ def _from(name: str, **config) -> CausalTransformer:
     return CausalTransformer(**{**translate_config({**source, **config}), "dtype": "float32"})
 
 
+def _coda_exiting() -> CausalTransformer:
+    """Qwen 3.5's tiny decoder looping its block [1, 3) three times before its coda, a gate weighing each
+    pass's exit through its own coda, each token leaving at the first pass whose cumulative exit
+    probability reaches 0.6."""
+    return _decoder("qwen35-tiny").with_passes(3, (1, 3), exit_gate=True, exit_threshold=0.6)
+
+
 def _rows_exiting(**loop) -> CausalTransformer:
-    """Qwen 3.5's tiny decoder looping its block [1, 3) three times before its coda, its gate on the
-    block's output exiting each row whole at its threshold, the loop's other fields as `loop` states."""
-    looped = _decoder("qwen35-tiny").with_passes(3, (1, 3), exit_gate=True, exit_threshold=0.6)
+    """The decoder `_coda_exiting` loops with its gate on the block's output, exiting each row whole at
+    its threshold, the loop's other fields as `loop` states."""
+    looped = _coda_exiting()
     return looped.clone(loop=dataclasses.replace(looped.loop, exit_at="block", exit_by="row", **loop))
 
 
@@ -76,6 +82,28 @@ def _gated(draw, width: int, salt: int, bias: float | None = None):
 def _inputs(module, ids) -> dict:
     return {"train": False, "decode": False, "per_layer_input": None,
             "attention_metadata": call_metadata(module, ids, *(False, *(None,) * 9))}
+
+
+def _tokens_by_hand(module, ids):
+    """`module`'s logits with its block's passes and each pass's coda unrolled here from the stack's own
+    spans, each token's state its exiting pass's: the first whose cumulative exit probability, each
+    pass's hazard `sigmoid(gate(norm(coda(h))))` times the chance no pass before it exited, reaches the
+    threshold, the last pass's where none does."""
+    loop, inputs = module.loop, _inputs(module, ids)
+    first, end = loop.layers
+    x = prepared_embeddings(module.scaled_embeddings(module.token_embeddings(ids)), None)
+    h = module.stack(module.stack(x, span=(0, first), **inputs), span=(first, end), **inputs)
+    leaving, kept = [], 1.0
+    for _ in range(loop.steps - 1):
+        y = module.stack(h, span=(end, module.num_layers), **inputs)
+        hazard = jax.nn.sigmoid(module.early_exit_gate(module.norm(y))[..., 0])
+        leaving.append((y, 1 - kept * (1 - hazard) >= loop.exit_threshold))
+        kept = kept * (1 - hazard)
+        h = module.stack(h, span=(first, end), **inputs)
+    out = module.stack(h, span=(end, module.num_layers), **inputs)
+    for y, reached in reversed(leaving):
+        out = jnp.where(reached[..., None], y, out)
+    return module.logits_from_hidden(module.norm(out))
 
 
 def _rows_by_hand(module, ids):
@@ -106,10 +134,10 @@ def _rows_by_hand(module, ids):
 def test_a_loop_exits_at_its_threshold_as_its_passes_unrolled_do(exit_at):
     """Qwen 3.5 looping a block before its coda under an exit gate, on par with its passes unrolled here from
     the stack's own spans (check 1 against them in float64): each token at the pass its threshold exits at,
-    each pass weighed through its own coda (`exit_at='coda'`, `test_loop._passes_exiting`), or each row
+    each pass weighed through its own coda (`exit_at='coda'`, `_tokens_by_hand`), or each row
     whole at its block's output, read through one coda (`exit_at='block'`, `exit_by='row'`, `_rows_by_hand`,
     rows of a batch exiting at different passes and those still looping run apart, row 12927)."""
-    looped, by_hand, shape, salt = ((_exiting(), _passes_exiting, (8, 16), 0xE81) if exit_at == "coda"
+    looped, by_hand, shape, salt = ((_coda_exiting(), _tokens_by_hand, (8, 16), 0xE81) if exit_at == "coda"
                                     else (_rows_exiting(), _rows_by_hand, (8, 12), 0xE91))
     draw = _gated(model_draw(looped, shape, looped.vocab_size), looped.emb_features, salt)
     assert_as_exact(jax.jit(looped.apply), method_run(looped, by_hand), draw,

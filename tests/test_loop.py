@@ -725,34 +725,6 @@ def _with_gate(draw, width: int, seed_salt: int):
     return drawn
 
 
-def _passes_exiting(module, ids):
-    """`module`'s logits with its block's passes and each pass's coda unrolled here from the stack's own
-    spans, each token's state its exiting pass's: the first whose cumulative exit probability, each
-    pass's hazard `sigmoid(gate(norm(coda(h))))` times the chance no pass before it exited, reaches the
-    threshold, the last pass's where none does."""
-    from dew.nn.backbones.call_metadata import call_metadata
-
-    loop = module.loop
-    first, end = loop.layers
-    inputs = {"train": False, "decode": False, "per_layer_input": None,
-              "attention_metadata": call_metadata(module, ids, *(False, *(None,) * 9))}
-    x = prepared_embeddings(module.scaled_embeddings(module.token_embeddings(ids)), None)
-    h = module.stack(module.stack(x, span=(0, first), **inputs), span=(first, end), **inputs)
-    leaving, kept, chosen = [], 1.0, None
-    for _ in range(loop.steps - 1):
-        y = module.stack(h, span=(end, module.num_layers), **inputs)
-        hazard = jax.nn.sigmoid(module.early_exit_gate(module.norm(y))[..., 0])
-        reached = 1 - kept * (1 - hazard) >= loop.exit_threshold
-        chosen = reached if chosen is None else chosen | reached
-        leaving.append((y, reached))
-        kept = kept * (1 - hazard)
-        h = module.stack(h, span=(first, end), **inputs)
-    out = module.stack(h, span=(end, module.num_layers), **inputs)
-    for y, reached in reversed(leaving):
-        out = jnp.where(reached[..., None], y, out)
-    return module.logits_from_hidden(module.norm(out))
-
-
 @attending("reference")
 def test_decoding_a_loop_that_exits_through_each_passs_coda_matches_its_prefill():
     """The loop exiting at its threshold through each pass's coda, decoded a token at a time, is on par
