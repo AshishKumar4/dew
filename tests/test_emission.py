@@ -988,24 +988,28 @@ def test_a_laid_out_row_reduction_issues_its_butterfly_once(laid_out, rounds, wh
     assert fixed.operations == 64 * 64 - held + rounds * held + 64, (fixed, held)
 
 
-def test_a_replicated_rows_reduction_combines_each_copy():
+@pytest.mark.parametrize("target", ["sm90", "sm100"])
+def test_a_replicated_rows_reduction_combines_each_copy(target):
     """A 1 x 64 fp32 row a row at a time (`swizzling._row_layout`: two values a lane, every warp of the
     warpgroup a copy) summed along it: each of the 128 threads combines its two values, then five rounds
     across the warp's 32 lanes, a shuffle and a combine each, 768 combines where the row's 64 elements
-    alone counted 576 (the review of lane/toolkit ca6da710b, P2). Its maximum, which a Blackwell may take
-    by one `redux.sync` across the warp, keeps the elements' price (the review of 8d026cf4a, P2)."""
+    alone counted 576 (the review of lane/toolkit ca6da710b, P2). Its maximum alike on a Hopper, and on a
+    datacenter Blackwell by one `redux.sync` across the warp, the elements' price (the review of 8d026cf4a,
+    P2; Mosaic GPU's float `redux` is compute capability 10.x's alone, train 1286's review)."""
     from dew.nn.kernels.templates import swizzling
 
     def body(out_ref, smem):
         row = plgpu.layout_cast(smem[...], swizzling._row_layout((1, 64), jnp.float32))
         out_ref[...] = reduce(row, axis=1)
 
-    for reduce, work in ((jnp.sum, Work(operations=128 * (1 + 5), shuffles=128 * 5)),
-                         (jnp.max, Work(operations=64))):
+    butterfly = Work(operations=128 * (1 + 5), shuffles=128 * 5)
+    for reduce, work in ((jnp.sum, butterfly),
+                         (jnp.max, Work(operations=64) if target == "sm100" else butterfly)):
         launch = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((1,), jnp.float32), num_threads=1,
                               thread_name="wg", scratch_types=[plgpu.SMEM((1, 64), jnp.float32)])
         traced = jax.make_jaxpr(launch)().jaxpr
-        fixed = emission.emitted(traced, 1, "wg", forms=emission.ACCURATE_FORMS).roles[0].fixed
+        with generation.assumed(target):
+            fixed = emission.emitted(traced, 1, "wg", forms=emission.ACCURATE_FORMS).roles[0].fixed
         assert (fixed.operations, fixed.shuffles) == (work.operations, work.shuffles), (reduce, fixed)
 
 
