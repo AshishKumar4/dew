@@ -200,10 +200,13 @@ def test_a_process_whose_trace_noted_no_stacks_reads_the_frontier_its_peers_read
 
 def test_parting_measured_to_free_nothing_is_asked_at_no_later_rung_but_the_last():
     """A start whose parted step frees nothing of its miss, though the miss is within the stacks' count,
-    measures parting futile: every later rung is asked joined alone, and before the search gives up only
-    the last rung's parted step, where it fits (owner, 2026-11-25: a 4B cold start on two H100s parted
-    every rung of its climb, 83.29 GiB both ways against 72.31 GiB, six 6-11 minute compiles where three
-    were its climb's)."""
+    measures parting futile: every later rung is asked joined first, so a climb that fits joined higher up
+    asks no parted step past its start, and one that fits only parted asks the parted steps once every
+    joined rung missed, each rung's own before the search gives up (owner, 2026-11-25: a 4B cold start on
+    two H100s parted every rung of its climb as it went, 83.29 GiB both ways against 72.31 GiB)."""
+    joined = Scripted(lambda place, group: 100 if place in (0, 1) else 90, room=90, count=20)
+    assert joined.searched([1], 0) == 1
+    assert [group for _, group in joined.compiled].count(1) == 1, joined.compiled
     search = Scripted(lambda place, group: 100 if place == 0 or group is None else 90, room=90, count=20)
     assert search.searched([1], 0) == 1
     asked = search.compiled
@@ -211,7 +214,8 @@ def test_parting_measured_to_free_nothing_is_asked_at_no_later_rung_but_the_last
     assert parted == [1, len(asked) - 1] and len(asked) > 4, asked
     refused = Scripted(lambda place, group: 100, room=90, count=20)
     assert refused.searched([1], 0) is None
-    assert sum(group == 1 for _, group in refused.compiled) == 2, refused.compiled
+    joined_places = {place for place, group in refused.compiled if group is None}
+    assert {place for place, group in refused.compiled if group == 1} == joined_places, refused.compiled
 
 
 def test_a_miss_that_measured_nothing_parts_no_stacks_at_once():
@@ -224,12 +228,12 @@ def test_a_miss_that_measured_nothing_parts_no_stacks_at_once():
 
 
 def test_a_refused_search_that_measured_every_lighter_form_of_its_rungs_says_so():
-    """A search refused with every rung's parted form measured, or parting measured to free nothing, says
-    a search on more room could reach no form it did not measure (`FitSearch.unmeasured_lighter`), which
-    lets a start refuse before it places its state rather than search the placed devices again (owner,
-    2026-11-25: a 4B start on two H100s measured every form of its rungs, each 10.98 GiB short, and its
-    placed search asked them all again, 49 minutes); one that left a rung's parted form unmeasured, parting
-    not measured futile, says it could."""
+    """A search refused with every rung's parted form measured, parting futile or not, says a search on
+    more room could reach no form it did not measure (`FitSearch.unmeasured_lighter`), which lets a start
+    refuse before it places its state rather than search the placed devices again (owner, 2026-11-25: a 4B
+    start on two H100s measured every form of its rungs, each 10.98 GiB short, and its placed search asked
+    them all again, 49 minutes); one that left a rung's parted form unmeasured says it could, whatever
+    another rung's parting measured."""
     futile = Scripted(lambda place, group: 100, room=90, count=20)
     assert futile.searched([1], 0) is None
     assert not futile.unmeasured_lighter(), futile.compiled
@@ -237,7 +241,7 @@ def test_a_refused_search_that_measured_every_lighter_form_of_its_rungs_says_so(
     assert deferred.searched([1], 0) is None
     assert any(group == 1 for _, group in deferred.compiled) and not deferred.unmeasured_lighter(), (
         deferred.compiled)
-    walked = Scripted(lambda place, group: 100 if group is None else 95, room=90, count=20)
+    walked = Scripted(lambda place, group: 100, room=90, count=20)
     walked.probes.append(Probe(1, 1, {**walked.current(), "head_tile": 4}, fits=False, headroom=-10, temp=0,
                                argument=0))
     assert walked.searched([1], 0) is None and walked.unmeasured_lighter(), walked.compiled

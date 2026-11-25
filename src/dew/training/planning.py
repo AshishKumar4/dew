@@ -815,9 +815,9 @@ class Parting:
     rung's to its own miss (owner, 2026-11-23, row 12463: a 4B cold start parted its stacks before the remat
     rung its miss needed, three compiles where two were its contract). A parted rung's miss measures what
     parting freed (`measured`), which then stands in for the count: parting that freed nothing is asked at
-    no later rung at once, and of the deferred variants only the last rung's is asked (owner, 2026-11-25:
-    a 4B cold start on two H100s parted every rung of its climb, freeing 0 bytes of its 10.98 GiB miss, six
-    6-11 minute compiles where three were the climb's)."""
+    no later rung at once, every joined rung asked first, so a climb that fits joined higher up asks no
+    parted step past its start (owner, 2026-11-25: a 4B cold start on two H100s parted every rung of its
+    climb as it went, freeing 0 bytes of its 10.98 GiB miss)."""
     estimate: int
     """What the step's joined stacks free where parted: their count (`joined_bytes`), every process's the
     same, until a parted rung measures it (`measured`); 0 where it joins none."""
@@ -850,12 +850,6 @@ class Parting:
             self.futile = True
         else:
             self.estimate = min(freed)
-
-    def tail(self) -> list[Rung]:
-        """The deferred variants the climb asks before it gives up, in its order: every one, or where
-        parting was measured to free nothing, the last rung's alone, whose recomputation leaves the stacks
-        the most of its peak."""
-        return self.deferred[-1:] if self.futile else list(self.deferred)
 
 
 class Lower(Protocol):
@@ -985,8 +979,6 @@ class FitSearch[LossT, EffectsT]:
     placed state serves an unplaced one."""
     parting: Parting | None = None
     """How its search parted its joined Newton-Schulz stacks (`searched`), None before it climbed."""
-    copies_futile: bool = False
-    """Whether its search measured dropping its narrow copies to free nothing (`searched`)."""
     asked: list[Rung] = dataclasses.field(default_factory=list)
     """The rungs its search asked past the one it stood on first (`searched`), which a plan made offline
     asks none of again (`below`)."""
@@ -1455,8 +1447,6 @@ class FitSearch[LossT, EffectsT]:
                         "again without them (%s)")
             if split is None:
                 narrow = not self.freed(kept, self.rung())
-                # Measured to free nothing, the copies' drop is a lighter form no later rung needs asked.
-                self.copies_futile = narrow
                 if narrow:
                     # Dropped, the step fell no less short at the split both missed at: on a GPU the step
                     # casts its weights whole either way (a GH200: 68.352 MB without its copies, 68.344 MB
@@ -1479,10 +1469,11 @@ class FitSearch[LossT, EffectsT]:
             if split is not None:
                 self.said(named)
                 return split
-        # Every rung asked joined missed: each parted variant a miss past the stacks' count deferred, in the
-        # climb's order, before the search gives up (the count orders, and rules none out), or the last
-        # rung's alone where parting was measured to free nothing (`Parting.tail`).
-        for variant in parting.tail():
+        # Every rung asked joined missed: each parted variant a miss past the stacks' count, or parting
+        # measured futile, deferred, in the climb's order, before the search gives up (the count and the
+        # measure order, and rule none out: a refusal before the state is placed needs each measured,
+        # `unmeasured_lighter`).
+        for variant in parting.deferred:
             if variant in self.asked:
                 continue
             split = ask(variant, "no rung fits the devices with its Newton-Schulz stacks joined; compiling "
@@ -1540,13 +1531,12 @@ class FitSearch[LossT, EffectsT]:
     def unmeasured_lighter(self) -> bool:
         """Whether a rung the search measured has a lighter form a search on more room may reach that it
         did not measure, at any split it asked (`PlanRefused.variants`): the rung without its narrow copies
-        where the step reads them, or with its joined Newton-Schulz stacks parted, unless the search
-        measured that change to free nothing (`copies_futile`, `Parting.futile`), which a search on other
-        room measures alike (owner, 2026-11-25: a 4B start on two H100s measured every form of its rungs and
-        missed each by 10.98 GiB, and its placed search asked them all again)."""
+        where the step reads them, or with its joined Newton-Schulz stacks parted, each rung's own whatever
+        another rung measured (owner, 2026-11-25: a 4B start on two H100s measured every form of its rungs
+        and missed each by 10.98 GiB, and its placed search asked them all again)."""
         measured = {json.dumps(probe.rung, sort_keys=True) for probe in self.probes}
-        copies = not self.copies_futile and any(candidate.copies for candidate in self.lowered.values())
-        parts = self.parting is not None and self.parting.estimate > 0 and not self.parting.futile
+        copies = any(candidate.copies for candidate in self.lowered.values())
+        parts = self.parting is not None and (self.parting.estimate > 0 or self.parting.futile)
         for probe in self.probes:
             lighter = [*([{**probe.rung, "narrow": False}] if copies and probe.rung.get("narrow") else []),
                        *([{**probe.rung, "ns_group": 1}] if parts and probe.rung.get("ns_group") is None
