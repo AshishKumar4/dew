@@ -62,6 +62,8 @@ class CrossPass:
     normalize_values: bool = True
     scaled: bool = False
     """Each message score over the root of the width (Inkling 2's, `AttentionResiduals.scaled`)."""
+    gained: bool = True
+    """Whether each site's message query holds a gain (`AttentionResiduals.gained`; Inkling 2's none)."""
     scale_by_input_rms: bool = True
     normalize_message: bool = True
     norm_eps: float | None = None
@@ -101,7 +103,7 @@ class CrossPassMerge(nn.Module):
         width, rank = self.emb_features, self.spec.rank
         self.depth = DepthAttention(width, norm_eps=self.norm_eps,
                                     normalize_values=self.spec.normalize_values, scaled=self.spec.scaled,
-                                    name='depth')
+                                    gained=self.spec.gained, name='depth')
         down = declared(nn.initializers.normal(1 / math.sqrt(2 * width)), ('embed', None))
         up = declared(nn.initializers.zeros, (None, 'embed'))
         self.input_down = self.param('input_down', down, (width, rank), jnp.float32)

@@ -48,6 +48,9 @@ class AttentionResiduals:
     block_size: int
     normalize_values: bool = False
     scaled: bool = False
+    gained: bool = True
+    """Whether each query is a learned gain times its own vector (`DepthAttention.scale`, Kimi K3's
+    norm weight) or its vector alone (Inkling 2's)."""
 
     def blocks(self, num_layers: int) -> int:
         """The finished blocks after `num_layers` layers: every layer opening one counts."""
@@ -56,7 +59,8 @@ class AttentionResiduals:
     def site(self, index: int) -> ResidualSite:
         """Layer `index`'s place in the blocks."""
         return ResidualSite(finished=-(-index // self.block_size), opens=index % self.block_size == 0,
-                            normalize_values=self.normalize_values, scaled=self.scaled)
+                            normalize_values=self.normalize_values, scaled=self.scaled,
+                            gained=self.gained)
 
 
 NORMALIZED_UNWRITTEN = ("the source's format mixes its attention residuals' values as they are, and this "
@@ -79,6 +83,7 @@ class ResidualSite:
     opens: bool
     normalize_values: bool = False
     scaled: bool = False
+    gained: bool = True
 
 
 def sources(state, finished: int, partial):
@@ -101,9 +106,12 @@ class DepthAttention(nn.Module):
     norm_eps: float = 1e-5
     normalize_values: bool = False
     scaled: bool = False
+    gained: bool = True
 
     def setup(self):
-        self.scale = self.param('scale', nn.initializers.ones, (self.emb_features,), jnp.float32)
+        # An ungained query (`gained=False`) is its kernel alone, its gain none rather than a held one.
+        self.scale = (self.param('scale', nn.initializers.ones, (self.emb_features,), jnp.float32)
+                      if self.gained else jnp.ones((self.emb_features,), jnp.float32))
         self.kernel = self.param('kernel', nn.initializers.zeros, (self.emb_features, 1), jnp.float32)
 
     @nn.nowrap

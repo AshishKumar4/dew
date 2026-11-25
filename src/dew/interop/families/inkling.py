@@ -115,7 +115,7 @@ def _loop(text: Mapping[str, object], layers: int) -> dict[str, object] | None:
     messages = native_fields(CrossPass)(
         block_size=record_int(text, 'n_layers_per_attn_res_block'), rank=record_int(loop, 'gate_rank'),
         additive=False, normalize_values=bool(text.get('attn_res_normalize_values', True)), scaled=True,
-        scale_by_input_rms=False, normalize_message=False)
+        gained=False, scale_by_input_rms=False, normalize_message=False)
     return {'steps': record_int(loop, 'num_passes'), 'layers': (start, end), 'step_norm': False,
             'messages': messages}
 
@@ -151,7 +151,8 @@ def inkling2_text_config(text: Mapping[str, object]) -> DecoderFields:
                                 linear_beta=record_float(text, 'mlp_up_softcap')),
         attention_residuals=native_fields(AttentionResiduals)(
             block_size=record_int(text, 'n_layers_per_attn_res_block'),
-            normalize_values=bool(text.get('attn_res_normalize_values', True)), scaled=True))
+            normalize_values=bool(text.get('attn_res_normalize_values', True)), scaled=True,
+            gained=False))
     loop = _loop(text, layers)
     if loop is not None:
         config['loop'] = loop

@@ -1043,7 +1043,7 @@ class DecoderBlock(nn.Module):
         site = functools.partial(DepthAttention, emb_features=self.emb_features,
                                  norm_eps=self._stated_eps('attention residuals'),
                                  normalize_values=residual_site.normalize_values,
-                                 scaled=residual_site.scaled)
+                                 scaled=residual_site.scaled, gained=residual_site.gained)
         self.attention_res = site(name='attention_res')
         if self.depth_sites:
             # The first site's query and norm the layer's own (`attention_res`, `input_layernorm`).
