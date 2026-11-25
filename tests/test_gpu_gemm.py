@@ -227,8 +227,8 @@ def _syrk_and_tail_cells():
                   fault=lambda case: ("native SYRK upper-triangle mirror store (row 11941)"
                                       if case[1] == "gram" else None)),
         Cell("an XLA fallback's dense bf16 product holds check 1 against XLA's own dot",
-             an_xla_fallbacks_dense_bf16_product_holds_check_1_against_xlas_own_dot, "sm90", fault=CUBLAS_BF16,
-             native={"launch": "xla fallback", "pass": "forward"}),
+             an_xla_fallbacks_dense_bf16_product_holds_check_1_against_xlas_own_dot, "sm90",
+             fault=CUBLAS_BF16, native={"launch": "xla fallback", "pass": "forward"}),
         Cell("native Hopper cluster=2 balanced tail holds check 1",
              native_hopper_cluster2_balanced_tail_holds_check_1, "sm90", fault=BALANCED_TAIL,
              native={"launch": "cluster2 tail", "pass": "forward"}),
