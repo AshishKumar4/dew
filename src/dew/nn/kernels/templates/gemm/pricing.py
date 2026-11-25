@@ -221,13 +221,24 @@ def best_splits(walk: "SplitWalk | None", stages: int) -> int:
     return min([1, *filter(walk.holds, counts)], key=walk.seconds)
 
 
+def hook_chunk(family: mosaic.Family, columns: int, units: tuple[int, ...] = ()) -> int:
+    """The columns an epilogue's hook takes at a time on `family` (`Issuer.hook_columns`), the kernel's
+    (`mosaic_gpu._finished`) and its register model's (`epilogue_registers`): whole where a chunk would hold
+    no whole unit of an output's form (`units`, `quantized.Form.unit`: a reduced output's block, a narrowed
+    one's runs)."""
+    chunk = family.hook_columns(columns)
+    return columns if any(chunk % unit for unit in units) else chunk
+
+
 def epilogue_registers(family: mosaic.Family, share: int, columns: int, stored: tuple, *,
                        vectors: int = 0, tiles: tuple = (), has_hook: bool = False,
-                       staging: tuple[int, int] | None = None) -> int:
+                       staging: tuple[int, int] | None = None, hooked: int | None = None) -> int:
     """Extra consumer-thread registers held across epilogue hook evaluation and staged stores:
     the single owner shared by `_Mosaic._epilogue_registers` and `syrk_registers` (row 11982). `tiles`,
     the dtypes of the `[rows, columns]` tiles beside the accumulator's chunk while its hook runs, each at the
-    width its issuer loads it in (`Issuer.side_bytes`, row 12689)."""
+    width its issuer loads it in (`Issuer.side_bytes`, row 12689). A hook's temporaries are a chunk's:
+    `hooked` columns where its kernel takes them so (`hook_chunk`), its issuer's read-out (`chunk_columns`)
+    elsewhere, beside the accumulator the mainloop's model holds whole."""
     from dew.nn.kernels.templates import resources, stores
 
     scalar = family.scalar_registers()
@@ -240,7 +251,8 @@ def epilogue_registers(family: mosaic.Family, share: int, columns: int, stored: 
 
     if not has_hook:
         return max(0, max((_staging(dtype) for dtype in stored), default=0) - scalar)
-    accumulator = -(-share * family.chunk_columns(columns) // resources.THREADS)
+    chunk = family.chunk_columns(columns) if hooked is None else hooked
+    accumulator = -(-share * chunk // resources.THREADS)
     held = sum(-(-accumulator * family.side_bytes(dtype) // 4) for dtype in tiles)
     live = [-(-accumulator * jnp.dtype(dtype).itemsize // 4) for dtype in stored]
     hook = max(0, resources.CONTROL_REGISTERS + vectors + held - scalar) + sum(live[1:])

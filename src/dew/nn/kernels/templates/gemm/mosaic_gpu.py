@@ -83,6 +83,7 @@ from dew.nn.kernels.templates.gemm.chained import Chained, Partition, flag_row, 
 from dew.nn.kernels.templates.gemm.pricing import (
     dense_tail,
     family_of,
+    hook_chunk,
     tail_workspace,
     tile_columns,
     tile_rows,
@@ -578,6 +579,8 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                     whole=any(form is not None and form.transposed for form in forms),
                     narrowed=tuple(form.divisor if form is not None and form.narrowed else 1
                                    for form in forms),
+                    hook_columns=None if epilogue is None else hook_chunk(
+                        family, part[1], tuple(form.unit for form in forms if form is not None)),
                     epilogue=epilogue, flags=(flags_gmem, pair, tiles.sharing),
                     sides=tuple(zip(side_gmems, epilogue_axes, side_smems, side_barriers, strict=True)),
                     partials=None if tail is None else (workspace, ready))
@@ -769,7 +772,8 @@ def _declared(lhs, rhs, gather, shape: tuple[int, int, int | None], splits: int,
 
 def _gmm_finished(accs: tuple, tile: tuple, wg, store, *, family: mosaic.Family, part: tuple, share_row,
                   m: int, g: int, dense: bool, row_tile: int, epilogue, o_gmems: tuple, sides: tuple,
-                  partials, flags: tuple = (None, 1, 1), whole: bool = False, narrowed: tuple = ()) -> None:
+                  partials, flags: tuple = (None, 1, 1), whole: bool = False, narrowed: tuple = (),
+                  hook_columns: int | None = None) -> None:
     """Dew: a consumer's share of a `gmm` tile stored (`_finished`) from its accumulators: at once, or,
     a balanced tail's tile (`partials`: its workspace and readiness flags), once its program's partial and
     the other programs' are added (`mosaic.Family.fixed_up`); with `flags` (`chained.flags_declared`'s, the
@@ -798,7 +802,7 @@ def _gmm_finished(accs: tuple, tile: tuple, wg, store, *, family: mosaic.Family,
         group=_side_group(group, g), nonfinite=nonfinite,
         place=(part_row, first, stored, column, min(part[0], m), TMA_ROWS if dense else 1),
         narrowed=tuple(None if divisor == 1 else (divisor, ni * (part[1] // divisor))
-                       for divisor in narrowed))
+                       for divisor in narrowed), hook_columns=hook_columns)
     if partials is None or partials[0] is None:
         finished(*accs)
         return
@@ -873,7 +877,8 @@ def _fixed_loaded(family: mosaic.Family, prologue_gmems, prologue_axes: tuple, f
 
 
 def _finished(*accs, family: mosaic.Family, wg, epilogue, o_gmems: tuple, store, sides: tuple, origins: dict,
-              group, place: tuple, nonfinite=None, narrowed: tuple = ()) -> None:
+              group, place: tuple, nonfinite=None, narrowed: tuple = (),
+              hook_columns: int | None = None) -> None:
     """Dew: a consumer's share of a `gmm` tile from its accumulators (`accs`), read out a chunk of columns
     at a time (`mosaic.Issuer.chunks`: all of them at once where its registers hold them): its epilogue on
     its side tiles' same columns (`sides`, each its global ref, axes, staging and barrier, loaded at
@@ -885,7 +890,8 @@ def _finished(*accs, family: mosaic.Family, wg, epilogue, o_gmems: tuple, store,
     (base review b1ab251ac F1: 65536, the joined sum where the products' was 65504, an fp16 infinity), of its
     stored rows alone: another group's, by this entry's matrix, may overflow (base review d0bc7dee6 F3). An
     output `narrowed` names (its divisor and first column, `_gmm_finished`'s) is stored at its own column, a
-    chunk's a `divisor`-th of its tile column."""
+    chunk's a `divisor`-th of its tile column. A hook takes `hook_columns` at a time (`pricing.hook_chunk`, as
+    the register model counts its temporaries), all where None."""
     family.loaded([(gmem.at[axes.named(side_axes, origins | axes.at_group(side_axes, gmem.shape, group))],
                     smem.at[wg], barrier.at[wg])
                    for gmem, side_axes, smem, barrier in sides],
@@ -894,7 +900,7 @@ def _finished(*accs, family: mosaic.Family, wg, epilogue, o_gmems: tuple, store,
     row_start, first, stored, column, *ladder = place
     seen = jnp.zeros((), jnp.bool_)
     layout = family.layout if family.budgets_registers else None
-    for start, chunk in family.chunks(accs):
+    for start, chunk in family.chunks(accs, hook_columns):
         columns = {'columns': slice(start, start + chunk[0].shape[-1])}
         # The epilogue and each output's store in the accumulator's layout: a form's write reads it (a
         # packed output's pairs, `quantized.paired`).

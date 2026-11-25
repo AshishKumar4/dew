@@ -457,12 +457,16 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
     def lhs(self):
         return plgpu.Layout.MMA_LHS(self.dtype, m_warps=self.m_warps)
 
-    def chunks(self, accumulators: tuple) -> Iterator[tuple[int, tuple]]:
+    def hook_columns(self, columns: int) -> int:
+        # Its accumulator in registers: a hook takes `HOOK_COLUMNS` of it at a time (`WgmmaIssuer`'s).
+        return min(columns, mosaic.HOOK_COLUMNS)
+
+    def chunks(self, accumulators: tuple, columns: int | None = None) -> Iterator[tuple[int, tuple]]:
         # The accumulators in their own layout, stated: an epilogue's broadcast of a side vector across one
         # takes the accumulator's layout as its result's (`side_tile`'s vectors its reductions), where left to
         # inference it took the vector's ("Tiling rank different than broadcast result rank, (16,) vs
         # (64, 128)", a scaled forward on sm80, EM-hooks6).
-        yield 0, tuple(plgpu.layout_cast(acc, self.layout) for acc in accumulators)
+        yield from super().chunks(tuple(plgpu.layout_cast(acc, self.layout) for acc in accumulators), columns)
 
     def side_tile(self, ref, held_axes: tuple):
         # In the accumulator's layout, or the accumulator's vector layout of

@@ -94,6 +94,12 @@ def _matrix_extents(ba) -> tuple[int, int]:
     depth, width = (kernel.shape[2], kernel.shape[1]) if transposed else kernel.shape[1:]
     return depth, width + sum(each.shape[1 if transposed else 2] for each in ba.arguments.get('beside') or ())
 
+def _form_units(hooks: Hooks, dtypes: tuple) -> tuple[int, ...]:
+    """The tile columns each output a form stores takes whole (`quantized.Form.unit`), none unformed."""
+    from .templates.gemm import quantized
+
+    return tuple(form.unit for form in quantized.forms_of(hooks.out_forms, dtypes) if form is not None)
+
 _PaddedArgument = tuple[str, "jax.Array | jax.ShapeDtypeStruct | tuple", "dict | tuple"]
 """An argument `_Mosaic._aligned` pads: its name, its value (or tuple of them) and its dims (`_grown`'s)."""
 
@@ -301,7 +307,9 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
                       if len(held_axes(axes)) > 1)
         out_dtypes = hooks.out_dtypes or stored
         return pricing.epilogue_registers(family, config.share, columns, out_dtypes, vectors=vectors,
-                                          tiles=tiles, has_hook=True, staging=config.staging)
+                                          tiles=tiles, has_hook=True, staging=config.staging,
+                                          hooked=pricing.hook_chunk(family, columns,
+                                                                    _form_units(hooks, out_dtypes)))
 
     def _step_sizes(self, ba) -> tuple[int, ...] | None:
         del ba

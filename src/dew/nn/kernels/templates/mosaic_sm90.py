@@ -67,6 +67,12 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
     programs, at 34 (jsf-vback-root, M-JS-63). The CPU gate assembles it at the floor
     (tests/test_kernel_compile_registers.py), so a ptxas that moves it fails there."""
 
+    def hook_columns(self, columns: int) -> int:
+        # Its accumulator in registers, a hook takes a whole `HOOK_COLUMNS` of it at a time: its temporaries
+        # (its side tiles, its outputs) a chunk's, so a hooked epilogue bounds no tile by them (row 1958's
+        # pulled backward at 128 x 64 where 128 x 256's whole-tile hook modelled 400 registers, M-NG-23).
+        return min(columns, mosaic.HOOK_COLUMNS)
+
     def entry_floor(self, tiles) -> int:
         widest = max((columns for _, columns, dtype in tiles if jnp.dtype(dtype) == jnp.float32), default=0)
         accumulator = min(widest, self.widest_product or widest) * self.rows // resources.THREADS

@@ -335,6 +335,12 @@ def taken(active, step: Callable, *state):
     return rebuilt(lax.cond(active, stepped, lambda *values: list(values), *carried))
 
 
+HOOK_COLUMNS = 64
+"""The columns of a register accumulator an epilogue's hook takes at a time (`Issuer.hook_columns`): whole
+tiles of every family's accumulator layout (WGMMA's 8 columns, mma.sync's 8 a warp along them) and a wide
+gated product's gate and up runs a pair (`templates.gemm.wide.UNIT`)."""
+
+
 def loaded(copies, issued: jax.Array | bool = True) -> None:
     """Each `(view, ref, barrier)` copied whole into shared memory, every copy issued before any is
     awaited: issued where `issued` (a role loading `ref` for every role that shares it), awaited by every
@@ -1183,13 +1189,25 @@ class Issuer[Accumulator](abc.ABC):
         where the issuer accumulates in registers or in a ref its walk reads out whole."""
         return columns
 
-    def chunks(self, accumulators: tuple) -> Iterator[tuple[int, tuple]]:
+    def hook_columns(self, columns: int) -> int:
+        """The columns of a tile's accumulator an epilogue's hook takes at once (`chunks`' `columns`, the
+        hook's temporaries one chunk's, as `pricing.epilogue_registers` counts them): its read-out chunk
+        (`chunk_columns`) where the issuer reads out no fewer."""
+        return self.chunk_columns(columns)
+
+    def chunks(self, accumulators: tuple, columns: int | None = None) -> Iterator[tuple[int, tuple]]:
         """A tile's accumulators (its walk's) as its consumer reads them out: `(first_column, values)` a
         chunk of `chunk_columns` columns each, `values` each accumulator's, each chunk's load issued as it
         is taken, after the consumer is done with the chunk before (the live set one chunk's, as the
         register model counts it): the accumulators themselves, one chunk, where the walk returns their
-        values."""
-        yield 0, accumulators
+        values; `columns` of them a chunk where given (`hook_columns`), each a selection of the registers
+        holding them in their own layout (Mosaic GPU's tiled slices), the accumulators live whole."""
+        width = accumulators[0].shape[1]
+        if columns is None or columns >= width:
+            yield 0, accumulators
+            return
+        for first in range(0, width, columns):
+            yield first, tuple(acc[:, first:first + columns] for acc in accumulators)
 
     def started(self, shapes: tuple, initial: tuple | None = None) -> tuple[jax.Array, ...]:
         """Register accumulators of `shapes` as a walk starts: their `initial` values, zero where None."""
