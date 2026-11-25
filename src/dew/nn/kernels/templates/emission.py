@@ -507,12 +507,8 @@ class _Counting:
     of its warpgroup's warps where it is one's (`warps`)."""
 
     def __init__(self, axis: str | None, index: int, loops: int = 0, warp: tuple | None = None,
-                 forms: Mapping | None = None, arrivals: _Arrivals | None = None, lanes: int | None = None,
-                 repeating: bool = False):
+                 forms: Mapping | None = None, arrivals: _Arrivals | None = None, lanes: int | None = None):
         self.axis, self.index, self.warp, self.forms = axis, index, warp, forms
-        # Whether it counts a scan's later trip (`scanned`), its static work charged at the first (the reviews
-        # of lane/toolkit a1b861d7f2d to f7b349470).
-        self.repeating = repeating
         # The warp of its warpgroup whose 32 lanes run its body where a warp mesh's role runs it
         # (`plgpu.warp_map`), None where its warpgroup's 128 do.
         self.lanes = lanes
@@ -687,16 +683,8 @@ class _Counting:
                 and all(value is not None for value in values[1:])):
             return [values[1 + int(values[0])]]
         if _static(equation, given):
-            # Of the program's constants alone: computed once outside every loop (or folded by its compile),
-            # its work charged where it stands, never a step's (the review of train 1261, F6): beside a
-            # trip's or an arm's other work, under the envelope a loop's trips or a conditional's arms take,
-            # once for a scan's trips (`repeating`); a scan whose later trip takes another arm of a
-            # conditional its data decides charges that arm's static work nowhere. A call of them runs on,
-            # its body's folds the values a later guard reads.
-            if primitive in _ARITHMETIC and not self.repeating:
-                self.fixed = _then(self.fixed, operation_work(
-                    primitive, [variable.aval for variable in equation.invars],
-                    [variable.aval for variable in equation.outvars], params, forms=self.forms))
+            # Of the program's constants alone: folded by its compile or computed once outside every loop. A
+            # call of them runs on, its body's folds the values a later guard reads.
             return unknown
         if primitive in _ARITHMETIC:
             self.add(operation_work(primitive, [variable.aval for variable in equation.invars],
@@ -797,27 +785,21 @@ class _Counting:
                 inputs[len(consts) + counter] = _Place(at, start, stop, parity)
                 inputs[len(consts) + bound] = stop
             trial = _Counting(self.axis, self.index, loops=len(self.loops) + 1, warp=self.warp,
-                              forms=self.forms, arrivals=self.arrivals, lanes=self.lanes,
-                              repeating=self.repeating)
+                              forms=self.forms, arrivals=self.arrivals, lanes=self.lanes)
             trial.run(body, inputs, static=static)
             self.arrivals.left(trial.landing)
             return trial
 
         steady, odd = trip("steady", 0), trip("steady", 1)
-        trials = [steady, odd]
+        self.fixed = self.fixed + steady.fixed
         self.walks.extend(steady.walks)
         found = _Loop(_mean([steady.loops[-1].work, odd.loops[-1].work]), steady.loops[-1].marks)
         self.ended(found, walks=True)
         if ranged is not None and found.marks and not self.loops:
             # The first and last trips each take their own work in place of a steady one's.
             for at in _PLACES[1:]:
-                edges = [trip(at, parity) for parity in (0, 1)]
-                trials += edges
-                taken = _mean([edge.loops[-1].work for edge in edges])
+                taken = _mean([trip(at, parity).loops[-1].work for parity in (0, 1)])
                 self.fixed = self.fixed + taken + repeated(found.work, -1)
-        # What its trips do outside their steps, its static work among it (computed once, outside the
-        # loop), whichever trips reach it: the most any trip does.
-        self.fixed = self.fixed + most([trial.fixed for trial in trials])
 
     def warps(self, equation, values: list, given: list[bool]) -> None:
         """A warpgroup's warps each running its role (`plgpu.warp_map`'s `mpmd_map`: tcgen05's load and
@@ -833,8 +815,7 @@ class _Counting:
         for warp in range(count):
             counted = _Counting(self.axis, self.index, loops=len(self.loops), warp=(name, warp),
                                 forms=self.forms, arrivals=self.arrivals,
-                                lanes=warp if isinstance(mesh, gpu_core.WarpMesh) else self.lanes,
-                                repeating=self.repeating)
+                                lanes=warp if isinstance(mesh, gpu_core.WarpMesh) else self.lanes)
             counted.run(inner, barriers)
             if self.loops:
                 self.arrivals.left(counted.landing)
@@ -860,12 +841,8 @@ class _Counting:
         # none.
         static = [*given[:len(consts)], *([False] * (len(carried) + len(xs)))]
         self.loops.append(_Loop())
-        # Its static work computed once, before its first trip: its later trips charge none (`repeating`).
-        was = self.repeating
-        for trip in range(length):
-            self.repeating = was or trip > 0
+        for _ in range(length):
             carried = self.run(body, [*consts, *carried, *([None] * len(xs))], static=static)[:len(carried)]
-        self.repeating = was
         self.ended(self.loops.pop(), walks=False)
         return [*carried, *([None] * (len(body.outvars) - len(carried)))]
 
@@ -895,8 +872,7 @@ class _Counting:
         trials = []
         for branch in branches:
             trial = _Counting(self.axis, self.index, loops=len(self.loops), warp=self.warp,
-                              forms=self.forms, arrivals=self.arrivals, lanes=self.lanes,
-                              repeating=self.repeating)
+                              forms=self.forms, arrivals=self.arrivals, lanes=self.lanes)
             trial.run(branch, operands, static=given[1:])
             if self.loops:
                 self.arrivals.left(trial.landing)
