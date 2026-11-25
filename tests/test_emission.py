@@ -1009,6 +1009,26 @@ def test_a_replicated_rows_reduction_combines_each_copy():
         assert (fixed.operations, fixed.shuffles) == (work.operations, work.shuffles), (reduce, fixed)
 
 
+def test_a_half_warp_rows_integer_maximum_shuffles_across_its_lanes():
+    """A 1 x 16 int32 row over 16 lanes, the warp's two halves each a copy (lane dimensions a replica and
+    the row's): its maximum reduces across 16 of the warp's lanes, not all, so Mosaic GPU exchanges by
+    shuffles, four rounds, no `redux.sync` (the review of lane/toolkit b4abd20a1, P2)."""
+    from jax.experimental.mosaic.gpu import fragmented_array as mgpu_fragments
+
+    halves = plgpu.Layout.TILED(mgpu_fragments.Tiling(((1, 16), (1,))),
+                                warp_dims=(mgpu_fragments.Replicated(mgpu_fragments.WARPS_IN_WARPGROUP),),
+                                lane_dims=(mgpu_fragments.Replicated(2), -2), vector_dim=-1)
+
+    def body(out_ref, smem):
+        out_ref[...] = jnp.max(plgpu.layout_cast(smem[...], halves), axis=1)
+
+    launch = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((1,), jnp.int32), num_threads=1,
+                          thread_name="wg", scratch_types=[plgpu.SMEM((1, 16), jnp.int32)])
+    traced = jax.make_jaxpr(launch)().jaxpr
+    fixed = emission.emitted(traced, 1, "wg", forms=emission.ACCURATE_FORMS).roles[0].fixed
+    assert fixed.shuffles == 4 * 128, fixed
+
+
 def test_an_attention_forwards_walk_issues_its_row_reductions_butterflies():
     """The attention forward's walk, traced for an H100 at 64 x 128 tiles with two consumers and for an A100
     at 64 x 64 (its scaled kernel, the one each compiles), issues 12 shuffles a thread a step, as their SASS
