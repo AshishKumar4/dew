@@ -1121,7 +1121,7 @@ def layouts(jaxpr) -> dict:
     accumulator (WGMMA's, `wgmma_accumulator_deref`; mma.sync's, `mma`'s by its split), a stated layout
     (`layout_cast`), an elementwise op's operands' one layout, a reduction's its operand's reduced
     (`TiledLayout.reduce`), through scoped bodies, calls, a conditional's agreeing arms, a loop's carries
-    its trips keep and any other equation's bodies (a custom rule's call). A value of any other provenance
+    its trips keep and any call's program (`programs.called`). A value of any other provenance
     is not among them: its layout is inference's choice from its uses, which no rule here reads."""
     found: dict = {}
     _laid_out(jaxpr, [None] * len(jaxpr.invars), found)
@@ -1196,9 +1196,6 @@ def _equation_layouts(equation, given: list, found: dict) -> list:
         for region in params["jaxprs"]:
             _laid_out(region, [None] * len(region.invars), found)
         return unknown
-    if primitive in (pjit.jit_p, jax_core.closed_call_p):
-        body = params["jaxpr"]
-        return _laid_out(body.jaxpr, given, found)
     if primitive is lax.cond_p:
         arms = [_laid_out(branch.jaxpr, given[1:], found) for branch in params["branches"]]
         return [first if all(arm[index] == first for arm in arms) else None
@@ -1224,14 +1221,9 @@ def _equation_layouts(equation, given: list, found: dict) -> list:
             if kept == carried:
                 return carried + [None] * (len(outs) - len(carried))
             carried = kept
-    # Any other equation's bodies (a custom rule's call, a custom batching's), their inputs its operands'
-    # where they bind them one for one, its outputs unknown.
-    for value in params.values():
-        for nested in value if isinstance(value, (list, tuple)) else (value,):
-            inner = nested.jaxpr if isinstance(nested, jax_core.ClosedJaxpr) else nested
-            if isinstance(inner, jax_core.Jaxpr):
-                bound = given if len(inner.invars) == len(given) else [None] * len(inner.invars)
-                _laid_out(inner, bound, found)
+    if (inner := programs.called(equation)) is not None:
+        # A call (a jit's, a custom rule's, a custom batching's): its program on its operands one for one.
+        return _laid_out(inner, given, found)
     return unknown
 
 
