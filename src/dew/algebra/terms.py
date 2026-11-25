@@ -609,7 +609,7 @@ def _nested_const_key(const) -> Hashable:
 
 def _extended_dtype(dtype) -> Hashable | None:
     """Return an opaque entry for extended JAX dtypes (such as typed PRNG specs) that share a tag."""
-    return ("object", "extended_dtype", dtype) if isinstance(dtype, jax.dtypes.extended) else None
+    return ("object", "extended_dtype", dtype) if jnp.issubdtype(dtype, jax.dtypes.extended) else None
 
 
 def _in_process_param_key(value, *, reject_device: bool) -> Hashable:
