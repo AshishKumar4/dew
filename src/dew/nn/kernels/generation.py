@@ -2159,20 +2159,30 @@ def backend() -> str:
     return generation
 
 
+def lowering_capability() -> tuple[int, int] | None:
+    """The CUDA compute capability a call's kernels lower for, as Mosaic GPU infers its architecture:
+    within a non-interpreted `assumed`, its generation's; else the placed device's (`placed_device`,
+    concrete or a compile-only mesh's abstract one), whichever backend the process opened. None off a CUDA
+    GPU, or interpreted."""
+    if (found := assumption()) is not None:
+        return None if found.interpreted else capability(found.generation)
+    device = placed_device()
+    return capability(_generation(device)) if device.platform == 'gpu' else None
+
+
 def lowering_platform() -> str | None:
     """The platform JAX lowers a call's code for, as `lax.platform_dependent` names it: within a
     non-interpreted `assumed`, its generation's (`cuda` for an `smXY`, `tpu` for a TPU's); else the placed
-    platform's (`placed_platform`), a GPU's `cuda` where its device (`placed_device`, concrete or a
-    compile-only mesh's abstract one) states an NVIDIA compute capability. None where those facts do not name
-    it (a GPU device stating none)."""
-    import re
+    platform's (`placed_platform`), a GPU's its device's (`placed_device`, concrete or a compile-only mesh's
+    abstract one: `programs.lowering_platform`). None where those facts do not name it (an abstract GPU
+    device stating no compute capability)."""
+    from dew.nn import programs
 
     if (platform := backend()) != 'gpu':
         return platform
     if (found := assumption()) is not None and not found.interpreted:
         return 'cuda'
-    stated = _compute_capability(placed_device())
-    return 'cuda' if stated and re.fullmatch(r'\d+\.\d+', stated) else None
+    return programs.lowering_platform(placed_device())
 
 
 def triton_runs() -> bool:

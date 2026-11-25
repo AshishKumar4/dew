@@ -1175,6 +1175,31 @@ def test_an_xla_programs_division_prices_on_its_target_at_its_dtype():
     assert cost._priced(jax.lax.div_p, {}, [(64,), (64,)], (64,), hopper) == cost.Work(operations=64)
 
 
+def test_an_xla_programs_special_function_and_power_price_their_forms_at_fp32_alone():
+    """An XLA program's fp32 log priced for an H100 issues libdevice's polynomial (`emission.XLA_FORMS`,
+    M-FS-78) and its `x ** -2` a multiply beside `div.rn.f32`'s MUFU and refinement; a float64 program's
+    log and power, whose forms Dew measured none of, an exponential an element and a multiply and an
+    operation (the review of lane/toolkit e59a86a32: the algebra priced every unary term at fp32)."""
+    from dew.nn.kernels.templates import emission
+
+    hopper = generation.TARGETS["sm90"]
+    elements = 64 * 128
+
+    def priced(function, dtype):
+        rows = jax.ShapeDtypeStruct((64, 128), dtype)
+        return program.priced(jax.make_jaxpr(function)(rows).jaxpr, hopper).work
+
+    log = emission.XLA_FORMS[jax.lax.log_p]
+    assert (priced(jnp.log, jnp.float32).operations, priced(jnp.log, jnp.float32).exponentials) == (
+        log.operations * elements, 0)
+    assert priced(lambda x: x ** -2, jnp.float32).exponentials == elements
+    with jax.enable_x64(new_val=True):
+        assert (priced(jnp.log, jnp.float64).exponentials, priced(jnp.log, jnp.float64).operations) == (
+            elements, 0)
+        power = priced(lambda x: x ** -2, jnp.float64)
+        assert (power.exponentials, power.operations) == (0, 2 * elements)
+
+
 def test_an_operation_no_rule_prices_makes_no_form_cheaper_for_taking_more_of_it():
     """An operation no rule prices (an atan2: no kernel's body holds one and no probe has measured it) is
     work at no rate (`Work.unpriced_operations`), so a form taking more of it is never cheaper
