@@ -1220,8 +1220,8 @@ class _NormTrack:
     def __init__(self, sq_sum: dict | None = None, inv_norm: dict | None = None,
                  pos_norm: dict | None = None) -> None:
         self.origin: dict[jcore.Var, jcore.Var] = {}
-        self.squared: dict[jcore.Var, jcore.Var] = {}
-        self.sq_sum: dict[jcore.Var, tuple[jcore.Var, tuple[int | None, ...], bool]] = dict(sq_sum or {})
+        self.squared: dict[jcore.Var, tuple[jcore.Var, int]] = {}
+        self.sq_sum: dict[jcore.Var, tuple[jcore.Var, tuple[int | None, ...], bool, int]] = dict(sq_sum or {})
         self.inv_norm: dict[jcore.Var, tuple[jcore.Var, tuple[int | None, ...]]] = dict(inv_norm or {})
         self.pos_norm: dict[jcore.Var, tuple[jcore.Var, tuple[int | None, ...]]] = dict(pos_norm or {})
 
@@ -1240,7 +1240,7 @@ class _NormTrack:
             return _reshape_kept(kept, in_shape, out_shape)
 
         if (entry := self.sq_sum.get(src)) is not None and (moved := move(entry[1])) is not None:
-            self.sq_sum[out] = (entry[0], moved, entry[2])
+            self.sq_sum[out] = (entry[0], moved, entry[2], entry[3])
         for table in (self.inv_norm, self.pos_norm):
             if (entry := table.get(src)) is not None and (moved := move(entry[1])) is not None:
                 table[out] = (entry[0], moved)
@@ -1273,7 +1273,8 @@ class _NormTrack:
             if not isinstance(cand, jcore.Var):
                 continue
             if (entry := self.sq_sum.get(cand)) is not None and (oa := apart_of(other)).sign > 0:
-                self.sq_sum[out] = (entry[0], entry[1], entry[2] or oa.positive)
+                floored = entry[2] or (oa.above is not None and oa.above >= entry[3])
+                self.sq_sum[out] = (entry[0], entry[1], floored, entry[3])
             if (prim is jax.lax.max_p and (pos := self.pos_norm.get(cand)) is not None
                     and apart_of(other).sign > 0):
                 self.pos_norm[out] = pos
@@ -1291,14 +1292,15 @@ class _NormTrack:
         if (prim is jax.lax.square_p
                 or (prim is jax.lax.integer_pow_p and equation.params.get("y") == 2)
                 or (prim is jax.lax.mul_p and len(invars) == 2 and invars[0] is invars[1])):
-            if isinstance(invars[0], jcore.Var):
-                self.squared[out] = self._canon(invars[0])
+            if isinstance(invars[0], jcore.Var) and jnp.issubdtype(out_aval.dtype, jnp.floating):
+                self.squared[out] = (self._canon(invars[0]), int(jnp.finfo(out_aval.dtype).minexp))
             return None
         if prim is jax.lax.reduce_sum_p and isinstance(invars[0], jcore.Var):
-            if (src := self.squared.get(invars[0])) is not None:
+            if ((sq := self.squared.get(invars[0])) is not None
+                    and jnp.issubdtype(out_aval.dtype, jnp.floating)):
                 red = frozenset(int(ax) for ax in equation.params["axes"])
                 kept = tuple(ax for ax in range(len(_shape(invars[0]))) if ax not in red)
-                self.sq_sum[out] = (src, kept, False)
+                self.sq_sum[out] = (sq[0], kept, False, max(sq[1], int(jnp.finfo(out_aval.dtype).minexp)))
             return None
         if prim in (jax.lax.broadcast_in_dim_p, jax.lax.reshape_p) and isinstance(invars[0], jcore.Var):
             self._propagate_layout(equation, invars[0], out)

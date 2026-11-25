@@ -1705,13 +1705,10 @@ def test_recurrence_recognition_preserves_fp32_entering_state_cancellation():
         token_idx=0, expected=float(jnp.bfloat16(-(2.0 ** -19))))
 
 
-def test_recurrence_recognition_guards_later_chunk_carry_lossy_norm_and_reads_kernel_layout():
-    """`RECURRENCES` preserves multi-chunk scans whose carried fp32 state would narrow at chunk 1+, rejects
-    keys normalized through lossy bf16->fp16 denominators, and reads Mosaic intermediate precision directly
-    from `chunk_forward.prepared` (`sm80` TF32 vs `sm90` 2-part bf16 vs unrounded 3-part fp32)."""
+def test_recurrence_recognition_guards_later_chunk_carry_and_unsound_norms():
+    """`RECURRENCES` preserves multi-chunk scans whose carried fp32 state would narrow at chunk 1+, and
+    rejects keys normalized through lossy `bf16->fp16` casts or underflowing `fp16` squares."""
     import dew
-    from dew.algebra import recognize
-    from dew.nn.kernels import recurrence
 
     batch, hv, dk, dv = 1, 2, 64, 64
     step = _gdn_make_step(batch, hv)
@@ -1753,7 +1750,6 @@ def test_recurrence_recognition_guards_later_chunk_carry_lossy_norm_and_reads_ke
         jax.ShapeDtypeStruct((seq64, batch, hv), jnp.float32),
         jax.ShapeDtypeStruct((seq64, batch, hv), jnp.bfloat16),
     )
-
     def scan_lossy_norm_key(state, q, k, v, g, beta):
         k_f16 = k.astype(jnp.float16).astype(jnp.float32)
         inv = jax.lax.rsqrt(jnp.sum(jnp.square(k_f16), axis=-1, keepdims=True) + jnp.float32(2.0 ** -100))
@@ -1761,23 +1757,80 @@ def test_recurrence_recognition_guards_later_chunk_carry_lossy_norm_and_reads_ke
         return jax.lax.scan(step, jnp.zeros_like(state), (
             jnp.zeros_like(q), k_bad, jnp.zeros_like(v), jnp.minimum(g, 0.0), jax.nn.sigmoid(beta)))
 
-    with generation.assumed("sm90"), generation.chosen(gated_delta_rule="fla"):
-        assert not _routes("gated_delta_rule", lambda: dew.jit(scan_lossy_norm_key).trace(*shapes64))
-    with generation.assumed("sm90"):
-        assert not _routes("gated_delta_rule", lambda: dew.jit(scan_lossy_norm_key).trace(*shapes64))
+    def scan_fp16_sq_underflow_key(state, q, k, v, g, beta):
+        inv = jax.lax.rsqrt(
+            jnp.sum(jnp.square(k), axis=-1, keepdims=True).astype(jnp.float32) + jnp.float32(2.0 ** -100))
+        k_bad = (k.astype(jnp.float32) * inv).astype(jnp.bfloat16)
+        return jax.lax.scan(step, jnp.zeros_like(state), (
+            jnp.zeros_like(q), k_bad, jnp.zeros_like(v), jnp.minimum(g, 0.0), jax.nn.sigmoid(beta)))
+
+    shapes64_f16k = (*shapes64[:2], jax.ShapeDtypeStruct((seq64, batch, hv, dk), jnp.float16), *shapes64[3:])
     z_s = jnp.zeros((batch, hv, dk, dv), jnp.float32)
     z_q = jnp.zeros((seq64, batch, hv, dk), jnp.bfloat16)
-    k_sub = jnp.zeros((seq64, batch, hv, dk), jnp.bfloat16).at[:, :, :, 0].set(jnp.bfloat16(2.0 ** -26))
     z_v = jnp.zeros((seq64, batch, hv, dv), jnp.bfloat16)
     z_g = jnp.zeros((seq64, batch, hv), jnp.float32)
     z_b = jnp.zeros((seq64, batch, hv), jnp.bfloat16)
-    with generation.chosen(gated_delta_rule="fla"):
-        ref_f, ref_o = jax.jit(scan_lossy_norm_key)(z_s, z_q, k_sub, z_v, z_g, z_b)
-        got_f, got_o = dew.jit(scan_lossy_norm_key)(z_s, z_q, k_sub, z_v, z_g, z_b)
-        np.testing.assert_array_equal(np.asarray(got_f), np.asarray(ref_f))
-        np.testing.assert_array_equal(np.asarray(got_o, np.float32), np.asarray(ref_o, np.float32))
+    for bad_scan, bad_shapes, k_val in (
+        (scan_lossy_norm_key, shapes64,
+         jnp.zeros((seq64, batch, hv, dk), jnp.bfloat16).at[:, :, :, 0].set(jnp.bfloat16(2.0 ** -26))),
+        (scan_fp16_sq_underflow_key, shapes64_f16k,
+         jnp.zeros((seq64, batch, hv, dk), jnp.float16).at[:, :, :, 0].set(jnp.float16(2.0 ** -14))),
+    ):
+        with generation.assumed("sm90"), generation.chosen(gated_delta_rule="fla"):
+            assert not _routes("gated_delta_rule", lambda f=bad_scan, s=bad_shapes: dew.jit(f).trace(*s))
+        with generation.assumed("sm90"):
+            assert not _routes("gated_delta_rule", lambda f=bad_scan, s=bad_shapes: dew.jit(f).trace(*s))
+        with generation.chosen(gated_delta_rule="fla"):
+            ref_f, ref_o = jax.jit(bad_scan)(z_s, z_q, k_val, z_v, z_g, z_b)
+            got_f, got_o = dew.jit(bad_scan)(z_s, z_q, k_val, z_v, z_g, z_b)
+            np.testing.assert_array_equal(np.asarray(got_f), np.asarray(ref_f))
+            np.testing.assert_array_equal(np.asarray(got_o, np.float32), np.asarray(ref_o, np.float32))
 
-    # 3. Mosaic layout reader derives TF32 (sm80), 2-part bf16 (sm90), and 3-part unrounded precision live.
+
+def test_recurrence_recognition_accurate_intra_chunk_and_observed_layout():
+    """Intra-chunk 2-token witness preserves exact `-2^-23` under `forms="accurate"` while holding fast-form
+    finiteness/zeros (`docs/design/algebra.md §3`), and `chunk_forward.observed()` + `_recurrence_kernels`
+    capture Mosaic `Call.held` & `Call.chunk` directly from forward/training dispatch."""
+    import dew
+    from dew.algebra import recognize
+    from dew.nn.kernels import recurrence
+    from dew.nn.kernels.templates.recurrence import chunk_forward
+    from dew.nn.precision import Numerics
+
+    seq64, batch, hv, dk, dv = 64, 1, 2, 64, 64
+    shapes64 = (
+        jax.ShapeDtypeStruct((batch, hv, dk, dv), jnp.float32),
+        jax.ShapeDtypeStruct((seq64, batch, hv, dk), jnp.bfloat16),
+        jax.ShapeDtypeStruct((seq64, batch, hv, dk), jnp.bfloat16),
+        jax.ShapeDtypeStruct((seq64, batch, hv, dv), jnp.bfloat16),
+        jax.ShapeDtypeStruct((seq64, batch, hv), jnp.float32),
+        jax.ShapeDtypeStruct((seq64, batch, hv), jnp.bfloat16),
+    )
+    z_s = jnp.zeros((batch, hv, dk, dv), jnp.float32)
+    z_q = jnp.zeros((seq64, batch, hv, dk), jnp.bfloat16)
+    z_v = jnp.zeros((seq64, batch, hv, dv), jnp.bfloat16)
+    z_g = jnp.zeros((seq64, batch, hv), jnp.float32)
+    z_b = jnp.zeros((seq64, batch, hv), jnp.bfloat16)
+    scan_64 = _scan_bf16_state_init(_gdn_make_step(batch, hv))
+    q_intra = jnp.zeros((seq64, batch, hv, dk), jnp.bfloat16).at[1, :, :, 0].set(jnp.bfloat16(0.125))
+    k_intra = jnp.zeros((seq64, batch, hv, dk), jnp.bfloat16).at[:2, :, :, 0].set(jnp.bfloat16(1.0 / 64.0))
+    v_intra = jnp.zeros((seq64, batch, hv, dv), jnp.bfloat16).at[0, :, :, 0].set(
+        jnp.bfloat16(1.0)).at[1, :, :, 0].set(jnp.bfloat16(-1.0))
+    with generation.run_precision(Numerics(forms="accurate")):
+        with generation.assumed("sm90"):
+            assert not _routes("gated_delta_rule", lambda: dew.jit(scan_64).trace(*shapes64))
+        with generation.assumed("sm90"), generation.chosen(gated_delta_rule="fla"):
+            assert not _routes("gated_delta_rule", lambda: dew.jit(scan_64).trace(*shapes64))
+        _assert_fla_cancel_preserved(
+            scan_64, z_s, q_intra, k_intra, v_intra, z_g, z_b,
+            token_idx=1, expected=float(jnp.bfloat16(-(2.0 ** -23))))
+    fast_f, fast_o = dew.jit(scan_64)(z_s, q_intra, k_intra, v_intra, z_g, z_b)
+    assert np.isfinite(np.asarray(fast_f)).all() and np.isfinite(np.asarray(fast_o, np.float32)).all()
+    zero_f, zero_o = dew.jit(scan_64)(z_s, z_q, k_intra, z_v, z_g, z_b)
+    assert not np.asarray(zero_f).any() and not np.asarray(zero_o, np.float32).any()
+
+    # `chunk_forward.observed()` and `_recurrence_kernels` capture Mosaic `Call.held` & `Call.chunk` live
+    # (`sm80` TF32 10b, `sm90` 2-part bf16 15b, `sm90` unrounded 3-part 23b, and nothing outside `observed`).
     f32_shapes = (
         jax.ShapeDtypeStruct((batch, hv, dk, dv), jnp.float32),
         jax.ShapeDtypeStruct((seq64, batch, hv, dk), jnp.float32),
@@ -1791,15 +1844,30 @@ def test_recurrence_recognition_guards_later_chunk_carry_lossy_norm_and_reads_ke
     roles = (("query", 1), ("key", 2), ("value", 3), ("log_decay", 4), ("beta", 5))
     delta_hooks = recurrence.Hooks(decay="scalar", delta=True)
     wg_hooks = recurrence.Hooks(decay="scalar", delta=False, write_gate=True)
-    with jax.default_matmul_precision("default"):
+    call_f32 = functools.partial(
+        recognize._recurrence_chunk_call, hooks=delta_hooks, roles=roles, out_dtype=jnp.float32)
+    call_wg = functools.partial(
+        recognize._recurrence_chunk_call, hooks=wg_hooks, roles=roles, out_dtype=jnp.bfloat16)
+    assert chunk_forward._OBSERVED.get() is None
+    with jax.default_matmul_precision("default"), generation.chosen(gated_delta_rule="mosaic_gpu"):
         with generation.assumed("sm80"):
-            sm80_delta = recognize._recurrence_kernel_layout(
-                "mosaic_gpu", delta_hooks, roles, vars_f32, jnp.float32, jnp.float32, keeps=False)
+            _, k80, lay80 = recognize._recurrence_kernels(
+                call_f32, vars_f32, (delta_hooks, roles, jnp.float32), vjp=False)
         with generation.assumed("sm90"):
-            sm90_delta = recognize._recurrence_kernel_layout(
-                "mosaic_gpu", delta_hooks, roles, vars_f32, jnp.float32, jnp.float32, keeps=False)
-            sm90_wg = recognize._recurrence_kernel_layout(
-                "mosaic_gpu", wg_hooks, roles, vars_bf16, jnp.bfloat16, jnp.bfloat16, keeps=False)
-    assert sm80_delta is not None and sm80_delta[:2] == (jnp.dtype(jnp.float32), 10)
-    assert sm90_delta is not None and sm90_delta[:2] == (jnp.dtype(jnp.float32), 15)
-    assert sm90_wg is not None and sm90_wg[:2] == (jnp.dtype(jnp.float32), 23)
+            _, k90, lay90 = recognize._recurrence_kernels(
+                call_f32, vars_f32, (delta_hooks, roles, jnp.float32), vjp=False)
+            _, k90_bwd, lay90_bwd = recognize._recurrence_kernels(
+                call_f32, vars_f32, (delta_hooks, roles, jnp.float32), vjp=True)
+            _, kwg, laywg = recognize._recurrence_kernels(
+                call_wg, vars_bf16, (wg_hooks, roles, jnp.bfloat16), vjp=False)
+            with chunk_forward.observed() as direct_calls:
+                jax.eval_shape(call_wg, *shapes64)
+            jax.eval_shape(call_wg, *shapes64)
+    assert chunk_forward._OBSERVED.get() is None
+    assert k80 == {"mosaic_gpu"} and lay80 is not None and lay80[:2] == (jnp.dtype(jnp.float32), 10)
+    assert k90 == {"mosaic_gpu"} and lay90 is not None and lay90[:2] == (jnp.dtype(jnp.float32), 15)
+    assert k90_bwd == {"mosaic_gpu"} and lay90_bwd is not None
+    assert lay90_bwd[:2] == (jnp.dtype(jnp.float32), 15)
+    assert kwg == {"mosaic_gpu"} and laywg is not None and laywg[:2] == (jnp.dtype(jnp.float32), 23)
+    assert len(direct_calls) == 1 and int(direct_calls[0].chunk) == laywg[3]
+    assert recognize._operand_precision(direct_calls[0].held) == laywg[:3]

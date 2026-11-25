@@ -2461,16 +2461,14 @@ def test_body_key_distinguishes_callable_dataclasses_and_norm_rejects_bad_layout
     exp2, exp3 = np.full((256, 256), 2.0, np.float32), np.full((256, 256), 3.0, np.float32)
     def make_body(cb, *, nested: bool = False, bare: bool = False):
         inner = jax.jit(lambda y: jax.pure_callback(cb, jax.ShapeDtypeStruct(y.shape, y.dtype), y))
-        def fn(x, w):
-            y = x.astype(jnp.float32) if bare else _bf16_rms(x, w).astype(jnp.float32)
-            return inner(y) if nested else jax.pure_callback(cb, jax.ShapeDtypeStruct(y.shape, y.dtype), y)
-        return fn
+        return lambda x, w: (lambda y: inner(y) if nested else jax.pure_callback(
+            cb, jax.ShapeDtypeStruct(y.shape, y.dtype), y))(
+            x.astype(jnp.float32) if bare else _bf16_rms(x, w).astype(jnp.float32))
     cases = ((make_factory_callback(1.0), make_factory_callback(2.0), True, False, False),
              (id_first, id_second, False, False, False), (cyc1, cyc2, False, True, False),
              (fc1, fc2, False, True, True))
     for cb1, cb2, shareable, is_nested, is_bare in cases:
-        f1 = make_body(cb1, nested=is_nested, bare=is_bare)
-        f2 = make_body(cb2, nested=is_nested, bare=is_bare)
+        f1, f2 = (make_body(cb, nested=is_nested, bare=is_bare) for cb in (cb1, cb2))
         c1, c2 = jax.make_jaxpr(f1)(*rms_shapes), jax.make_jaxpr(f2)(*rms_shapes)
         k1, k2 = terms.body_key(c1), terms.body_key(c2)
         assert (k1 is not None and k2 is not None and k1 != k2) if shareable else (k1 is None and k2 is None)
@@ -2482,19 +2480,21 @@ def test_body_key_distinguishes_callable_dataclasses_and_norm_rejects_bad_layout
         assert r1.jaxpr != r2.jaxpr
         np.testing.assert_array_equal(np.asarray(dew.jit(f1)(x_in, w_in)), exp2)
         np.testing.assert_array_equal(np.asarray(dew.jit(f2)(x_in, w_in)), exp3)
-    def swapped_norm(x):
-        d = jnp.sum(jnp.square(x), axis=-1, keepdims=True) + jnp.float32(1e-6)
-        return x * jax.lax.rsqrt(jax.lax.reshape(d, (4, 2, 2, 1), dimensions=(0, 2, 1, 3)))
-    def expanded_norm(x):
-        d = jnp.sum(jnp.square(x), axis=-1, keepdims=True) + jnp.float32(1e-6)
-        return x * jax.lax.broadcast_in_dim(jax.lax.rsqrt(d), (4, 2, 2, 64), (0, 1, 2, 3))
-    def lossy_cast_norm(x):
-        d = jnp.sum(jnp.square(x.astype(jnp.float16).astype(jnp.float32)), axis=-1, keepdims=True)
-        return x.astype(jnp.float32) * jax.lax.rsqrt(d + jnp.float32(2.0 ** -100))
-    for bad_fn, shape, dt in ((swapped_norm, (4, 2, 2, 8), jnp.float32),
-                              (expanded_norm, (4, 2, 2, 1), jnp.float32),
-                              (lossy_cast_norm, (4, 2, 2, 64), jnp.bfloat16)):
+    bad_norms = (
+        (lambda x: x * jax.lax.rsqrt(jax.lax.reshape(
+            jnp.sum(jnp.square(x), axis=-1, keepdims=True) + jnp.float32(1e-6),
+            (4, 2, 2, 1), dimensions=(0, 2, 1, 3))), (4, 2, 2, 8), jnp.float32),
+        (lambda x: x * jax.lax.broadcast_in_dim(jax.lax.rsqrt(
+            jnp.sum(jnp.square(x), axis=-1, keepdims=True) + jnp.float32(1e-6)),
+            (4, 2, 2, 64), (0, 1, 2, 3)), (4, 2, 2, 1), jnp.float32),
+        (lambda x: x.astype(jnp.float32) * jax.lax.rsqrt(
+            jnp.sum(jnp.square(x.astype(jnp.float16).astype(jnp.float32)), axis=-1, keepdims=True)
+            + jnp.float32(2.0 ** -100)), (4, 2, 2, 64), jnp.bfloat16),
+        (lambda x: x.astype(jnp.float32) * jax.lax.rsqrt(
+            jnp.sum(jnp.square(x), axis=-1, keepdims=True).astype(jnp.float32)
+            + jnp.float32(2.0 ** -100)), (4, 2, 2, 64), jnp.float16),
+    )
+    for bad_fn, shape, dt in bad_norms:
         closed = jax.make_jaxpr(bad_fn)(jax.ShapeDtypeStruct(shape, dt))
-        out = closed.jaxpr.outvars[0]
-        held, apart = terms.proven(closed.jaxpr, targets=(out,), deep=True)
-        assert held[out] is None and not apart[out].unit_norm
+        held, apart = terms.proven(closed.jaxpr, targets=(closed.jaxpr.outvars[0],), deep=True)
+        assert held[closed.jaxpr.outvars[0]] is None and not apart[closed.jaxpr.outvars[0]].unit_norm
