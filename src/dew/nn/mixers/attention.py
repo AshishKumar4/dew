@@ -416,6 +416,11 @@ class CausalSelfAttention(nn.Module):
     """Each query and key head's length clipped (`QKClip`), where a head norm (`MixerContext.qk_norm`)
     would sit: after the projections, before any rotation and the temperature; a layer takes one or the
     other."""
+    projected_sinks: bool = False
+    """Each query's own value-free sink logit a head, a bias-free projection of its input (`sink_proj`,
+    `[B, Q, H]` in fp32; Inkling 2's), in place of a head's static ones (`MixerContext.attention_sinks`):
+    the template's initial state or the portable softmax's column, the kernels taking a head's sinks alone
+    declining it (`scaled_dot_product_attention`); a cached step attends it on the masked route."""
     relative_bias: RelativeBias | None = None
     """An input-conditioned relative-position bias (`RelativeBias`): an fp32 `[B, H, Q, K]` dense bias,
     O(Q K) memory at a prefill, added to the call's own before the softmax."""
@@ -552,20 +557,7 @@ class CausalSelfAttention(nn.Module):
             self.q_norm = norm(name='q_norm')
             if not self.ctx.kv_shared:
                 self.k_norm = norm(name='k_norm')
-        if self.qk_clip is not None:
-            if self.ctx.qk_norm:
-                raise ValueError("qk_clip and qk_norm each bound a head's queries and keys: take one")
-            if self.qk_clip.query_scale:
-                self.q_clip_scale = self.param('q_clip_scale', nn.initializers.ones,
-                                               (self.ctx.num_heads, self.ctx.head_dim), jnp.float32)
-        if self.relative_bias is not None:
-            bias = self.relative_bias
-            self.relative = dense(self.ctx.num_heads * bias.rank, name='relative', use_bias=False,
-                                  kernel_axes=ATTENTION_AXES['gate_proj'])
-            self.relative_scale = self.param('relative_scale', nn.initializers.ones,
-                                             (self.ctx.num_heads, bias.rank), jnp.float32)
-            self.relative_bank = self.param('relative_bank', nn.initializers.zeros, (bias.rank, bias.extent),
-                                            jnp.float32)
+        self._input_terms(dense)
         if self.ctx.ngpt is not None:
             self._ngpt_gains(self.ctx.ngpt)
         if self.ctx.dex is not None:
@@ -581,6 +573,30 @@ class CausalSelfAttention(nn.Module):
             # parameters either way.
             self.values_norm = RMSNorm(epsilon=self.ctx.norm_eps, with_scale=False,
                                        dtype=self.ctx.dtype, name='v_norm')
+
+    def _input_terms(self, dense: Callable[..., nn.Module]):
+        """The parameters of the terms the layer computes from its input beside its projections (`setup`'s
+        `dense` its projections): its head clip's query scale, its projected sinks and its relative bias
+        (`dew.nn.attention_terms`)."""
+        if self.qk_clip is not None:
+            if self.ctx.qk_norm:
+                raise ValueError("qk_clip and qk_norm each bound a head's queries and keys: take one")
+            if self.qk_clip.query_scale:
+                self.q_clip_scale = self.param('q_clip_scale', nn.initializers.ones,
+                                               (self.ctx.num_heads, self.ctx.head_dim), jnp.float32)
+        if self.projected_sinks:
+            if self.ctx.attention_sinks:
+                raise ValueError("a layer's sinks are a head's or each query's own: take one")
+            self.sink_proj = dense(self.ctx.num_heads, name='sink_proj', use_bias=False,
+                                   kernel_axes=ATTENTION_AXES['gate_proj'])
+        if self.relative_bias is not None:
+            bias = self.relative_bias
+            self.relative = dense(self.ctx.num_heads * bias.rank, name='relative', use_bias=False,
+                                  kernel_axes=ATTENTION_AXES['gate_proj'])
+            self.relative_scale = self.param('relative_scale', nn.initializers.ones,
+                                             (self.ctx.num_heads, bias.rank), jnp.float32)
+            self.relative_bank = self.param('relative_bank', nn.initializers.zeros, (bias.rank, bias.extent),
+                                            jnp.float32)
 
     def _ngpt_gains(self, ngpt: NGPT):
         """nGPT's query gain and, under an output gate, the gate's logit gain, one a feature of the
@@ -1084,12 +1100,13 @@ class CausalSelfAttention(nn.Module):
                 kv_store[self.ctx.kv_store_key] = (key, value, positions, places, {})
         query = self._tuned(query, places)
         if decode and attention_metadata is not None and attention_metadata.admitted is not None:
-            if self.relative_bias is not None:
+            if self.relative_bias is not None or self.projected_sinks:
                 raise ValueError(f"{self.name}: a server's mixed step attends its rows' caches by pages, "
-                                 "which take no dense bias: serve a relative bias's layer by the dense cache")
+                                 "which take no dense bias and a head's sinks alone: serve this layer by the "
+                                 "dense cache")
             attention = self._mixed_attended(query, key, value, positions, attention_metadata)
             return self._output(attention, gate, B, S, own_value, progress)
-        sinks = self.sinks
+        sinks = self.sink_proj(x).astype(jnp.float32) if self.projected_sinks else self.sinks
         if self._runs_local(attention_metadata, decode) and not (self.ctx.attention_dropout_rate and train):
             attention = checkpoint_name(local_attention(
                 query, key, value, window=self.ctx.sliding_window, chunk=self.ctx.attention_chunk,
@@ -1333,7 +1350,8 @@ class CausalSelfAttention(nn.Module):
         return mask_kernel(chosen_attention(), query, key, as_bias=decode and query.shape[1] > 1,
                            dtype=self.ctx.dtype, precision=self.ctx.precision,
                            force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
-                           softcap=self.ctx.attn_logit_softcap, sinks=bool(self.ctx.attention_sinks),
+                           softcap=self.ctx.attn_logit_softcap,
+                           sinks=bool(self.ctx.attention_sinks) or self.projected_sinks,
                            wide_logits=self.ctx.wide_logits)
 
     def _prefixed(self, query, key, value, places, prefix, attention_metadata: AttentionMetadata | None):
@@ -1650,7 +1668,8 @@ class CausalSelfAttention(nn.Module):
                 deterministic=False), Residual.CONTEXT)
         # A chunk or metadata mask replaces `cursor` and keeps the gather; a window the kernels read
         # as each row's first key (`starts`).
-        plain_step = append is not None and mask is cursor and S == 1 and bias is None and not sowing
+        plain_step = (append is not None and mask is cursor and S == 1 and bias is None and not sowing
+                      and not self.projected_sinks)
         if plain_step:
             step = functools.partial(self._plain_step, append, query, key, value,
                                      jnp.asarray(positions).reshape(B, S)[:, 0], sinks=sinks)
@@ -1947,7 +1966,7 @@ class CausalSelfAttention(nn.Module):
             return False
         # A bias over the logits (ALiBi's, a relative bias's) is the general kernel's, which local
         # attention takes none of.
-        if (self.alibi or self.relative_bias is not None or decode
+        if (self.alibi or self.relative_bias is not None or self.projected_sinks or decode
                 or (not self.is_initializing() and self.is_mutable_collection(QK))):
             return False
         return metadata is None or (not self._unhonoured(metadata, "local") and all(
