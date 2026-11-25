@@ -498,17 +498,18 @@ def _norms_rewritten(fn, *operands):
     return written(*operands)[0]
 
 
-def _norms_written(fn, *shapes):
-    """`fn` with each RMSNorm and SwiGLU the compile point takes on an H100 written as Dew's norm
-    (`recognize.recognized`), decided under the H100 and written on this host, whose norms run their portable
-    arithmetic: what the compile point's rewrite computes, run here."""
+def _norms_written(fn, *shapes, families=None):
+    """`fn` with each region the compile point takes on an H100 under `families` (`recognize.NORMS` by
+    default) written as Dew's call (`recognize.recognized`), decided under the H100 and written on this
+    host, whose calls run their portable arithmetic: what the compile point's rewrite computes, run here."""
     from jax.extend.core import jaxpr_as_fun
 
     from dew.algebra import fusion, recognize
 
     closed = jax.make_jaxpr(fn)(*shapes)
     with generation.assumed("sm90"):
-        written = recognize.recognized(closed, fusion.Index(closed), recognize.NORMS)
+        written = recognize.recognized(closed, fusion.Index(closed),
+                                       recognize.NORMS if families is None else families)
     return jaxpr_as_fun(closed.replace(jaxpr=fusion._spliced(closed.jaxpr, written))), len(written)
 
 
@@ -1137,11 +1138,23 @@ def _gdn_scan_f64_truth(state, q, k, v, g, beta, *, scale: float | None = None):
     return jax.lax.scan(step, state, (q, k, v, g, beta))
 
 
+def _recurrence_rewritten(fn, *operands):
+    """`fn` with its recognized recurrence scans lowered as on an H100 (`recognize.RECURRENCES`) and run on
+    this host's portable math (same pattern as `_norms_rewritten`)."""
+    from dew.algebra import recognize
+
+    shapes = [jax.ShapeDtypeStruct(jnp.shape(x), jnp.result_type(x)) for x in operands]
+    built, found = _norms_written(fn, *shapes, families=recognize.RECURRENCES)
+    assert found == 1
+    return tuple(built(*operands))
+
+
 @pytest.mark.parametrize("case", ["natural", "grouped_scaled"])
 def test_a_plain_gated_delta_net_scan_runs_dews_recurrence_kernel_through_dew_jit(case):
     """A plain-JAX `jax.lax.scan` gated delta rule compiled through `dew.jit` on an assumed H100 lowers to
     Dew's chunked recurrence kernel (`RECURRENCES`, row 3450) across operand orders, grouped heads, query
-    scales, and natural non-`swapaxes` outer products, and holds check 1 under the interpreted template."""
+    scales, and natural non-`swapaxes` outer products; under the interpreted template it matches Dew's own
+    chunked call bit-for-bit, and its rewritten portable math holds check 1 against the plain scan."""
     from reference_error import assert_as_exact
 
     import dew
@@ -1187,15 +1200,23 @@ def test_a_plain_gated_delta_net_scan_runs_dews_recurrence_kernel_through_dew_ji
         beta = jnp.asarray(rng.uniform(0.05, 0.5, (seq, batch, hv)).astype(np.float32))
         return (state, q, k, v, g, beta) if case == "natural" else (state, g, v, q, beta, k)
 
+    sample = draw(0)
+    own_sample = sample if case == "natural" else (sample[0], sample[3], sample[5], sample[2], sample[1],
+                                                   sample[4])
+    with generation.chosen(gated_delta_rule="mosaic_gpu"):
+        got_final, got_out = dew.jit(fn)(*sample)
+        ref_final, ref_out = jax.jit(own)(*own_sample)
+    np.testing.assert_array_equal(np.asarray(got_final), np.asarray(ref_final))
+    np.testing.assert_array_equal(np.asarray(got_out), np.asarray(ref_out))
+
     def truth(*args):
         if case == "natural":
             return _gdn_scan_f64_truth(*args, scale=scale)
         state, g, v, q, beta, k = args
         return _gdn_scan_f64_truth(state, q, k, v, g, beta, scale=scale)
 
-    with generation.chosen(gated_delta_rule="mosaic_gpu"):
-        assert_as_exact(dew.jit(fn), jax.jit(fn), draw, f"dew.jit gated delta scan ({case})",
-                        seeds=8, truth_fn=truth)
+    assert_as_exact(jax.jit(functools.partial(_recurrence_rewritten, fn)), jax.jit(fn), draw,
+                    f"dew.jit gated delta scan ({case})", seeds=8, truth_fn=truth)
 
 
 def test_non_matching_or_barred_recurrence_scans_stay_as_written():

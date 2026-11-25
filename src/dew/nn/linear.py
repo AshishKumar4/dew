@@ -66,13 +66,7 @@ from .kernels.recurrence_chunk import (
 )
 from .kernels.selection import Kernel, Op, Requirement, select
 from .norms import gated_rms_normalized
-from .precision import (
-    L2NORM_EPS,
-    asks_default_precision,
-    at_least_fp32,
-    compensated_sum,
-    float32_dot_general,
-)
+from .precision import L2NORM_EPS, asks_default_precision, at_least_fp32, compensated_sum, float32_dot_general
 from .sharding import (
     HEADS,
     MLP_HIDDEN,
