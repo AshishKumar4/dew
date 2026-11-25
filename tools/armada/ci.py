@@ -292,6 +292,13 @@ code (this file) runs outside the tests, so a change to it reruns none of them; 
 (`session.DURATIONS`), which only a split file's groups are cut from, so a group's key covers its own file's
 entries alone (`cache_key`); nor does a fixture or a package's data, which is the input of the files whose
 runs opened it, however they opened it (executed.py's `Opens`)."""
+PREPARE_SIZE = "large"
+"""The container every dry prepare task runs on, a kept one's among them (`prepares.entries`), which
+compiles a kept row its lookup misses (`unrun`): a prepare compiles a GPU group's programs on the CPU,
+which a medium's 10 GiB does not hold (test_gpu_recurrence.py#9/11's peaked at the whole 10 GiB, alone in
+1,431 s, and was killed beside other tasks in train 1269). Its tests' recorded peaks are their CPU runs'
+and size none of it (`session.sized`). Here, in the plan's code, not in the prepare's recipe
+(`prepares.RECIPE`), so placing it keys no prepare's row."""
 WHOLE_GPU = "0.75"
 """The share of a GPU a lane given the whole of it hands its files (`gpu_lane`): what JAX's client
 preallocates where no XLA_PYTHON_CLIENT_MEM_FRACTION is set."""
@@ -935,9 +942,11 @@ def plan(target: float, timings: dict, census: bool = False, reach: dict | None 
                      **stamped}
                     for entry in site_entries(python, marked, found, timings, target, eager)]
         # The GPU tier's files prepared dry on the floor Python's CPU (`prepare_entries`), beside its rows,
-        # apart from what reach and the census read.
+        # apart from what reach and the census read, each task on a `PREPARE_SIZE` container.
         if python == PYTHONS[0] and not census:
-            entries += prepares.entries(sys.modules[__name__], python, timings, target, cache, stamped)
+            entries += [{**entry, "size": PREPARE_SIZE}
+                        for entry in prepares.entries(sys.modules[__name__], python, timings, target, cache,
+                                                      stamped)]
     # What the newest Python runs no test of, it imports (`COLLECT`): on a pushed run, every file but its own.
     rest = [] if census else [name for name in every if name not in NEWEST_FILES]
     collecting = collect_entries(rest, timings, target)
