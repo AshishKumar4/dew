@@ -83,6 +83,7 @@ r2 = _armada("r2")  # the Worker's one client and its contract (tools/armada/r2.
 HOST = _armada("host")  # the host's CPU class, which keys a bundle (tools/armada/host.py)
 WATCHED = _armada("watched")  # inotify's one reader (tools/armada/watched.py's `Writes`)
 GRADING = _armada("grading")  # which test file a node is of (tools/armada/grading.py's `owning`)
+RECYCLE = _armada("recycle")  # a later process of one row's task (tools/armada/recycle.py's `CONTINUES`)
 
 MAX_BYTES = r2.MAX_BYTES
 """The largest bundle sent or read: the Worker's bound (tools/armada/r2.json)."""
@@ -354,7 +355,12 @@ class RemoteCache:
                     self._moved_on()
                 written = list(self.written.get(file, []))
                 used = self.used.get(file, set())
-                fetched = [key for key in self.fetched.get(file, []) if file in self.blind or key in used]
+                # A later process of a dry prepare's task (`RECYCLE.CONTINUES`) keeps what it fetched whole:
+                # an earlier process of its row compiled and wrote them, and its own run, which those tests
+                # set aside, used none of them.
+                continues = bool(os.environ.get(RECYCLE.CONTINUES))
+                fetched = [key for key in self.fetched.get(file, [])
+                           if file in self.blind or key in used or continues]
                 self.sealed.add(file)
                 # What it keeps: the fetched programs its run loaded (a recut group's, borrowed from its
                 # file's other cuts, `_siblings`, written under its own cut once), and those it compiled.

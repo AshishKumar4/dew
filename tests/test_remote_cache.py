@@ -547,6 +547,24 @@ def test_a_bundle_that_runs_again_after_another_keeps_what_it_loaded_in_each_sti
     assert kept == {"jit_x-1", "jit_y-1"}
 
 
+def test_a_later_process_of_one_rows_task_keeps_its_bundles_earlier_programs(
+        cache_worker, tmp_path, monkeypatch):
+    """A later process of one row's task (tools/armada/recycle.py's `CONTINUES`), whose tests an earlier
+    process ran and set aside, keeps in its bundle every program it fetched, the earlier process's among them,
+    beside those it compiled: written back as a separate run's would be, it would hold its own alone, and the
+    row's next run compile the earlier tests' again."""
+    url, stored, _ = cache_worker
+    stored["/jax/cpu/bundles/tests/a.py"] = remote_cache.packed([("jit_x-1", b"x")])
+    monkeypatch.setenv(remote_cache.RECYCLE.CONTINUES, "1")
+    cache = remote_cache.RemoteCache(tmp_path, url, "token", "jax/cpu")
+    cache.opened("tests/a.py")
+    compiled(tmp_path, "jit_b-1")
+    cache.closed("tests/a.py")
+    cache.drain()
+    kept = {key for key, _ in remote_cache.unpacked(stored["/jax/cpu/bundles/tests/a.py"])[0]}
+    assert kept == {"jit_x-1", "jit_b-1"}
+
+
 def test_a_url_that_is_no_address_leaves_the_local_cache_as_it_is(tmp_path):
     """A URL that does not parse (an unclosed IPv6 bracket) or names no port is refused with a warning
     when the cache is installed, as one that is no http(s) address is: the run compiles with JAX's own

@@ -1439,6 +1439,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                *(["-p", "recycle"] if recycle_at is not None else [])]
     earlier: list[ET.Element] = []
     outputs: list[str] = []
+    segments = 1
     with temp_roots.temp_root() as root:
         environment = task_environment(environ, site, root, (log, collection, unrecorded, pid),
                                        aside if sets_aside else None, group, network)
@@ -1446,24 +1447,30 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
             environment = {**environment, recycle.RECYCLE_AT: str(recycle_at),
                            recycle.RECYCLED: str(recycled)}
         while True:
-            recycled.unlink(missing_ok=True)
+            # Each process's own sidecars: none an earlier one left reads as this one's.
+            for sidecar in (recycled, report, pid, collection):
+                sidecar.unlink(missing_ok=True)
             # What is left of the task's end, read once as its pytest starts (`unstarted` where none is).
             if (left := ends - time.monotonic()) <= 0:
                 if not earlier:
                     return unstarted(out, rows, python, tests, group)
-                # Its time spent before the tests left could start: they are the deadline's, its last
-                # process's report already among `earlier`.
-                report.unlink(missing_ok=True)
+                # Its time spent before the tests left could start: they are the deadline's.
                 expired = True
                 break
             returncode, output, expired, dump, opened, wrote, evidence = watched_pytest(
                 command, environment, left, grace, pid, python, evidence_name(python, tests, group), began)
-            if not recycled.is_file() or expired:
-                break
             done, _ = reported_cases(report)
+            # Ended by recycle.py alone: pytest's interrupted exit, its report holding the test it ended
+            # after. Any other end (a crash after its report, a kill) is graded as it is, never run past.
+            stopped = recycled.read_text() if recycled.is_file() else None
+            if (expired or stopped is None or returncode != INTERRUPTED
+                    or stopped not in {grading.node_of(case) for case in done}):
+                break
             earlier += done
             outputs.append(output)
+            segments += 1
             aside.write_text(json.dumps(sorted({*done_before, *(grading.node_of(case) for case in earlier)})))
+            environment = {**environment, recycle.CONTINUES: "1"}
     output = "\n".join([*outputs, output])
     # This attempt's peak, and an earlier attempt's where it ran tests this row carries (`progress.resumed`).
     peaks = [found for found in (progress.task_peak(host), peak_before) if found is not None]
@@ -1536,10 +1543,15 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     carried = set(wrote).union(*(written or []))
     if written is not None:
         written.append(set(wrote))
-    if recording and (unnamed := run_keys.record(python, ran, log, common, network, opened, unlisted, carried,
-                                                 began_in)):
+    # A row run in more than one process is recorded by none: what each read is no one record's.
+    if recording and segments == 1 and (unnamed := run_keys.record(python, ran, log, common, network, opened,
+                                                                   unlisted, carried, began_in)):
         out.write_text(json.dumps({"rows": rows + unbaselined(python, ran, unnamed)}))
     return 0
+
+
+INTERRUPTED = 2
+"""pytest's exit where a plugin stopped its session (`session.shouldstop`, pytest's ExitCode.INTERRUPTED)."""
 
 
 def task_environment(environ: Mapping[str, str], site: re.Match[str] | None, root: str,

@@ -12,6 +12,9 @@ RECYCLE_AT = "DEW_RECYCLE_AT"
 """What names the resident bytes past which a dry prepare's pytest ends after the test running."""
 RECYCLED = "DEW_RECYCLED"
 """What names the file a pytest that ended so writes the node id of its last test to."""
+CONTINUES = "DEW_CONTINUES_ROW"
+"""Set in each later process of one row's task (ci.py's `tested`): the shared XLA cache's bundles it writes
+keep every program it fetched, its row's earlier processes' among them (tests/remote_cache.py)."""
 
 _session: dict[str, object] = {}
 
