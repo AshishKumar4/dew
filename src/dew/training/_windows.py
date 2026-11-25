@@ -17,7 +17,7 @@ from dew.nn.precision import at_least_fp32
 from dew.state import Accumulation, TrainState, kept_window, paired, taken
 from dew.training.model_flops import TOKENS
 from dew.training.planning import released
-from dew.training.transaction import batch_statistics_shapes, compact_qk, pooled_by_mean
+from dew.training.transaction import batch_statistics_shapes, compact_qk, largest_recorded, pooled_by_mean
 
 if TYPE_CHECKING:
     from dew.distributed.placement import Placement
@@ -85,6 +85,8 @@ def empty_window[LossT, EffectsT](windowing: Windowing, state: TrainState, batch
                 lambda x: jnp.full(x.shape, -jnp.inf, at_least_fp32(x.dtype))
                 if jnp.issubdtype(x.dtype, jnp.inexact) else zeros(x),
                 compact_qk(jax.tree.map(zeros, aux.qk_stats), windowing.sampled)),
+            # Zeros, the identity of a largest magnitude, until a microbatch records one.
+            amax=largest_recorded(jax.tree.map(zeros, aux.amax)),
             batches=None if shared else buffer(records),
             variables=None if mutable is None else buffer(mutable),
             attempts=None if shared else jnp.zeros((slots,), jnp.int32),

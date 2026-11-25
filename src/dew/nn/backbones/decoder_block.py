@@ -4,10 +4,12 @@ The parts are the gated MLP, the mixture of experts, the block's wiring and
 remat policies, and the multi-token prediction depth.
 """
 
+import contextlib
+import contextvars
 import dataclasses
 import functools
 import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Literal, NamedTuple, Protocol, overload, runtime_checkable
 
 import jax
@@ -545,6 +547,21 @@ class RematPolicy:
         if self.save:
             return jax.checkpoint_policies.save_only_these_names(*self.save)
         return None
+
+
+_SCANNED_REMAT: contextvars.ContextVar[bool] = contextvars.ContextVar("dew_scanned_remat", default=False)
+"""Whether a block traces inside a scanned run whose forward and backward are separate loops
+(`scanned_remat`), so `nn.remat` may set `prevent_cse=False`."""
+
+
+@contextlib.contextmanager
+def scanned_remat() -> Iterator[None]:
+    """Trace a scanned run's block with `prevent_cse=False` on its `nn.remat` boundary (`_SCANNED_REMAT`)."""
+    token = _SCANNED_REMAT.set(True)
+    try:
+        yield
+    finally:
+        _SCANNED_REMAT.reset(token)
 
 
 REMAT_POLICIES: Mapping[str, RematPolicy] = {
@@ -1088,8 +1105,12 @@ class DecoderBlock(nn.Module):
         # Unlike DiT remat_block, this boundary returns the sharing store.
         # The policy decides which named residuals the backward pass reads
         # back instead of recomputing; train stays a static closure value and
-        # Linen lifts variables and RNGs with the call.
-        out, store = nn.remat(run, policy=remat.checkpoint_policy())(
+        # Linen lifts variables and RNGs with the call. Inside a scanned run's
+        # separate forward and backward scans (`scanned_remat`), XLA cannot CSE
+        # across the two loops, so `prevent_cse=False` drops the barriers that
+        # otherwise hold extra temporaries in the scan body.
+        out, store = nn.remat(run, policy=remat.checkpoint_policy(),
+                              prevent_cse=not _SCANNED_REMAT.get())(
             self, x, kv_store, per_layer_input, attention_metadata, prior_bank)
         if kv_store is not None:
             kv_store.update(store)

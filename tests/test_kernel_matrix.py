@@ -100,3 +100,24 @@ def test_a_gpu_runs_each_seeded_case_of_a_family_and_no_other(family):
     cells = dict(kernel_matrix.covered(family))
     kept = [tuple(cells[cell.label].values()) for cell in kernel_matrix.seeded_cells(family)]
     assert sorted(kept) == sorted({case for _, case in kernel_matrix.SEEDED[family]})
+
+
+def test_an_adapted_steps_cell_names_its_kernels_over_its_whole_step():
+    """The low-rank family's training step (`low_rank_matrix._step`) names its kernels over the whole step,
+    its pullback too (`with_gradients` runs it outside the forward's call): traced abstractly as an sm90 cell,
+    its routes run `low_rank` `fused` and every other choice at XLA, as its GPU cell asserts (row 12755: named
+    in the forward alone, the fused form's backward took the grouped template on a GH200)."""
+    import jax
+    import low_rank_matrix as matrix
+    import numpy as np
+    from jax.sharding import Mesh
+
+    case = dict(zip(kernel_matrix.AXES["low_rank"], ("sm90", "8", "none", "bfloat16"), strict=True))
+    model, variables = matrix._adapted(case)
+    factors, x, cotangent = jax.eval_shape(matrix._drawn(case, variables), 0)
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+    with (generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh), generation.routes() as routes):
+        jax.eval_shape(matrix._step(model, variables, "fused"), factors, x, cotangent)
+    recorded = {(route.choice, route.kernel) for route in routes}
+    unnamed = sorted(pair for pair in recorded if pair[0] not in matrix.CHOICES and pair[1] != "xla")
+    assert ("low_rank", "fused") in recorded and not unnamed, (sorted(recorded), unnamed)

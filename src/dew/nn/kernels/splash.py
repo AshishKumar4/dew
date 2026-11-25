@@ -50,6 +50,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import lax, tree_util
+from jax.custom_derivatives import zero_from_primal
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas.ops.tpu.splash_attention import (
@@ -59,11 +60,11 @@ from jax.experimental.pallas.ops.tpu.splash_attention import (
 
 from dew.nn import programs
 from dew.nn.attention_kernels import SPLASH_BLOCK, SPLASH_LANES
-from dew.nn.derivatives import KernelGlue, contracted, declared_derivative, with_gradients_formed
-from dew.nn.kernels import generation, launches
+from dew.nn.derivatives import KernelGlue, contracted, with_gradients_formed
+from dew.nn.kernels import generation, launches, tuning
 from dew.nn.kernels.options import program
 from dew.nn.kernels.templates import attention_algebra, product
-from dew.nn.precision import compensated_sum, products_dtype
+from dew.nn.precision import compensated_sum, configured_precision, products_dtype
 
 # Dew: a hidden key's logit -inf, not upstream's finite -0.7 * float32's largest, which outweighed a row's
 # own keys below it (a causal first query's one key at -3e38 read the hidden keys' values); a row's state
@@ -1173,6 +1174,7 @@ def _attending(
     v: jax.Array,
     segment_ids: SegmentIds | None,
     sinks: jax.Array | None,
+    *,
     blocks: BlockSizes,
     call: _Call,
 ) -> jax.Array:
@@ -1183,18 +1185,21 @@ def _attending(
 
 
 def _attention_fwd(
-    fwd_mask_info, dq_mask_info, dkv_mask_info, q, k, v, segment_ids, sinks, blocks: BlockSizes, call: _Call
+    fwd_mask_info, dq_mask_info, dkv_mask_info, q, k, v, segment_ids, sinks, *,
+    blocks: BlockSizes, call: _Call,
 ):
+    del dq_mask_info, dkv_mask_info
     out, peak, total = _forward(
         fwd_mask_info, q, k, v, segment_ids, sinks, blocks=blocks, call=call, residuals=True
     )
     # Dew: no output among the residuals; the backward's D is its own (`_attention_bwd`).
-    return out, (q, k, v, segment_ids, sinks, peak, total, dq_mask_info, dkv_mask_info)
+    return out, (peak, total)
 
 
-def _attention_bwd(blocks: BlockSizes, call: _Call, residuals: tuple, do: jax.Array):
+def _attention_bwd(blocks: BlockSizes, call: _Call, saved: tuple, operands: tuple, do: jax.Array):
     """dQ, dK and dV from the delta pass, the dK/dV kernel and the dQ kernel; the sinks' gradient."""
-    q, k, v, segment_ids, sinks, peak, total, dq_mask_info, dkv_mask_info = residuals
+    fwd_mask_info, dq_mask_info, dkv_mask_info, q, k, v, segment_ids, sinks = operands
+    peak, total = saved
     inverse = attention_algebra.inverse(total)
     # Dew: di is each query's sum_k p * dp from the dQ kernel's own pass, not rowsum(o * do).
     di = _dq(
@@ -1215,13 +1220,160 @@ def _attention_bwd(blocks: BlockSizes, call: _Call, residuals: tuple, do: jax.Ar
         sinks_exp = -_weights(sinks[..., None].astype(jnp.float32), peak, inverse)
         dsinks = compensated_sum(sinks_exp * di, (sinks_exp.ndim - 1,)).astype(sinks.dtype)
     (dq, dk, dv), dsinks = with_gradients_formed((dq, dk, dv), dsinks)
-    return None, None, None, dq, dk, dv, None, dsinks
+    return (
+        zero_from_primal(fwd_mask_info),
+        zero_from_primal(dq_mask_info),
+        zero_from_primal(dkv_mask_info),
+        dq,
+        dk,
+        dv,
+        zero_from_primal(segment_ids),
+        dsinks,
+    )
 
 
-# Dew: one declared derivative of a kernel's glue (`dew.nn.derivatives`), its `blocks` and `call` static.
-_attention = contracted("test_a_fused_attention_kernel_holds_its_reverse_orders")(
-    declared_derivative(KernelGlue(), _attending, _attention_fwd, _attention_bwd,
-                        nondiff_argnums=(8, 9)))
+def _splash_mask(
+    fwd_mask_info: mask_info_lib.MaskInfo,
+    segment_ids: SegmentIds | None,
+    *,
+    q_seq_len: int,
+    kv_seq_len: int,
+    blocks: BlockSizes,
+    call: _Call,
+) -> tuple[jax.Array | None, jax.Array | None]:
+    """Tile participation (`visited`, False for `block_mask == 0` tiles skipped by `_forward_kernel`) and
+    per-entry visibility (`entry`, masked to `call.mask_value` inside visited tiles) as `[H_m or 1, Q, K]`
+    booleans, handling both dense and shrunken grids (`data_next`)."""
+    visited = None
+    entry = None
+    bm = fwd_mask_info.block_mask
+    if bm is not None:
+        bq, bkv = blocks.block_q, blocks.block_kv
+        kv_blocks = kv_seq_len // bkv
+        vis_blks = jnp.broadcast_to((bm > 0)[..., None, None], (*bm.shape, bq, bkv))
+        if fwd_mask_info.partial_mask_blocks is not None and fwd_mask_info.mask_next is not None:
+            partial = fwd_mask_info.partial_mask_blocks[fwd_mask_info.mask_next.astype(jnp.int32)]
+            blk_vals = (bm == 2)[..., None, None] | ((bm == 1)[..., None, None] & partial)
+        else:
+            blk_vals = vis_blks
+        if fwd_mask_info.data_next is None:
+            dense_vis, dense_entry = vis_blks, blk_vals
+        else:
+            h_idx = jnp.arange(bm.shape[0])[:, None, None]
+            q_idx = jnp.arange(bm.shape[1])[None, :, None]
+            k_idx = fwd_mask_info.data_next.astype(jnp.int32)
+            empty = jnp.zeros((bm.shape[0], bm.shape[1], kv_blocks, bq, bkv), jnp.bool_)
+            dense_vis = empty.at[h_idx, q_idx, k_idx].max(vis_blks)
+            dense_entry = empty.at[h_idx, q_idx, k_idx].max(blk_vals)
+        visited = jnp.swapaxes(dense_vis, 2, 3).reshape(bm.shape[0], q_seq_len, kv_seq_len)
+        entry = jnp.swapaxes(dense_entry, 2, 3).reshape(bm.shape[0], q_seq_len, kv_seq_len)
+    if call.mask_function is not None and fwd_mask_info.q_sequence is not None:
+        computed = call.mask_function(
+            fwd_mask_info.q_sequence[:, None], jnp.arange(kv_seq_len, dtype=jnp.int32)[None, :]
+        )
+        entry = computed[None] if entry is None else (entry & computed[None])
+    if segment_ids is not None:
+        seg = segment_ids.q[:, None] == segment_ids.kv[None, :]
+        entry = seg[None] if entry is None else (entry & seg[None])
+    return visited, entry
+
+
+def _splash_portable(
+    fwd_mask_info: mask_info_lib.MaskInfo,
+    dq_mask_info: mask_info_lib.MaskInfo,
+    dkv_mask_info: mask_info_lib.MaskInfo,
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    segment_ids: SegmentIds | None,
+    sinks: jax.Array | None,
+    *,
+    blocks: BlockSizes,
+    call: _Call,
+) -> jax.Array:
+    """Portable XLA equivalent of `_forward` for forward-mode and higher-order differentiation (row 2654):
+    the reference attention (`dew.nn.attention.reference_attention`, row 12848) over the call's dense mask
+    (`_splash_mask`) as `_forward` walks it: its query scaled already, its masked logits `call.mask_value`
+    and its walk's starting maximum that value (the sinks where it has them), the tiles it skips never
+    visited, its values' product in fp32, and each product at the precision the kernel's own takes it
+    (`_dot`), never the caller's ambient one, which rounds fp32 operands to bf16 on a TPU (a key 2^-9 from
+    another kept its own score's tangent)."""
+    from dew.nn.attention import Products, reference_attention
+
+    del dq_mask_info, dkv_mask_info
+    wide = jnp.promote_types(q.dtype, jnp.float32)
+    # The scores' product on the operands' own dtype into fp32 sums, the value product's in fp32.
+    products = Products(
+        programs.mosaic_tpu_dot_precision(q.dtype, k.dtype, blocks.block_q, q.shape[-1],
+                                          blocks.block_kv_compute),
+        programs.mosaic_tpu_dot_precision(jnp.float32, jnp.float32, blocks.block_q, blocks.block_kv_compute,
+                                          v.shape[-1]),
+        logits=wide, weighted=wide)
+    visited, entry = _splash_mask(fwd_mask_info, segment_ids, q_seq_len=q.shape[1], kv_seq_len=k.shape[1],
+                                  blocks=blocks, call=call)
+    out = reference_attention(
+        jnp.swapaxes(q, 0, 1)[None], jnp.swapaxes(k, 0, 1)[None], jnp.swapaxes(v, 0, 1)[None],
+        mask=entry, sinks=None if sinks is None else sinks.astype(wide), softcap=call.attn_logits_soft_cap,
+        precision=products, mask_fill=call.mask_value, query_scale=1.0,
+        logit_floor=call.mask_value if sinks is None else -jnp.inf,
+        skipped=None if visited is None else jnp.logical_not(visited[:, ::blocks.block_q, :]))
+    return jnp.swapaxes(out[0], 0, 1).astype(q.dtype)
+
+
+def _build_splash_op(blocks: BlockSizes, call: _Call, precision: str | None) -> Callable:
+    """One Splash call differentiated at every order through `_splash_portable` while primal and first-order
+    reverse mode run the TPU Pallas kernels (`generation.linear_tangent`, row 2654)."""
+    def primal(*operands):
+        with configured_precision(precision, exact=True):
+            return _attending(*operands, blocks=blocks, call=call)
+
+    def forward(*operands):
+        with configured_precision(precision, exact=True):
+            return _attention_fwd(*operands, blocks=blocks, call=call)
+
+    def backward_rule(saved, operands, do):
+        with configured_precision(precision, exact=True):
+            return _attention_bwd(blocks, call, saved, operands, do)
+
+    def portable(*operands):
+        with configured_precision(precision, exact=True):
+            return _splash_portable(*operands, blocks=blocks, call=call)
+
+    return contracted("test_a_fused_attention_kernel_holds_every_order")(
+        generation.linear_tangent(forward, backward_rule, portable, kind=KernelGlue(), primal=primal)
+    )
+
+
+@functools.lru_cache(maxsize=64)
+def _cached_splash_op(blocks: BlockSizes, call: _Call, precision: str | None) -> Callable:
+    return _build_splash_op(blocks, call, precision)
+
+
+def _attention(
+    fwd_mask_info,
+    dq_mask_info,
+    dkv_mask_info,
+    q,
+    k,
+    v,
+    segment_ids,
+    sinks,
+    blocks: BlockSizes,
+    call: _Call,
+) -> jax.Array:
+    # Mosaic multiplies 16-bit operands at the default precision only (`attention_tpu`); hold `'default'`
+    # on every native 16-bit Splash rule, else keep the caller's configured precision across backward/tangent.
+    precision = (
+        "default"
+        if jnp.finfo(q.dtype).bits == 16 and not call.interpret
+        else jax.config.jax_default_matmul_precision
+    )
+    op = (
+        _cached_splash_op(blocks, call, precision)
+        if call.mask_function is None or tuning.holdable(call.mask_function)
+        else _build_splash_op(blocks, call, precision)
+    )
+    return op(fwd_mask_info, dq_mask_info, dkv_mask_info, q, k, v, segment_ids, sinks)
 
 
 def _collapsed(mask_info: mask_info_lib.MaskInfo) -> mask_info_lib.MaskInfo:

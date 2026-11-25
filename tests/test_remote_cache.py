@@ -532,6 +532,94 @@ def closed_and_kept(cache, stored: dict, file: str) -> set[str]:
     return {key for key, _ in remote_cache.unpacked(stored[f"/jax/cpu/bundles/{file}"])[0]}
 
 
+def test_a_run_of_part_of_a_files_tests_keeps_its_bundle_whole_and_writes_nothing_it_did_not_compile(
+        cache_worker, tmp_path):
+    """A run that loads under half of what its file's bundle holds (a part of the file's tests: a test node's
+    row, a `-k`) keeps the bundle whole and, compiling nothing, writes nothing: pruned to its part, the next
+    part's run compiled the rest again and rewrote it, each part's in turn (2026-11-24: one bundle written
+    7,459 times in a day). One that compiles a program keeps every fetched one beside it; one that loaded none
+    and compiled as many as the bundle held found it stale, and prunes it."""
+    url, stored, _ = cache_worker
+    bundle = "/jax/cpu/bundles/tests/part.py"
+    stored[bundle] = remote_cache.packed([(f"jit_{name}-1", name.encode()) for name in "abcd"])
+    part = remote_cache.RemoteCache(tmp_path / "part", url, "token", "jax/cpu")
+    part.opened("tests/part.py")
+    loaded(tmp_path / "part", "jit_a-1")
+    held = stored[bundle]
+    part.closed("tests/part.py")
+    part.drain()
+    assert stored[bundle] is held  # never written: a write replaces the stored body with its own
+    grown = remote_cache.RemoteCache(tmp_path / "grown", url, "token", "jax/cpu")
+    grown.opened("tests/part.py")
+    loaded(tmp_path / "grown", "jit_b-1")
+    compiled(tmp_path / "grown", "jit_e-1")
+    grown.closed("tests/part.py")
+    grown.drain()
+    kept = {key for key, _ in remote_cache.unpacked(stored[bundle])[0]}
+    assert kept == {f"jit_{name}-1" for name in "abcde"}
+    stale = remote_cache.RemoteCache(tmp_path / "stale", url, "token", "jax/cpu")
+    stale.opened("tests/part.py")
+    for name in "vwxyz":
+        compiled(tmp_path / "stale", f"jit_{name}-2")
+    stale.closed("tests/part.py")
+    stale.drain()
+    kept = {key for key, _ in remote_cache.unpacked(stored[bundle])[0]}
+    assert kept == {f"jit_{name}-2" for name in "vwxyz"}
+
+
+def test_a_kept_bundle_full_makes_room_for_what_its_part_compiled_and_never_for_an_unsendable_program(
+        cache_worker, tmp_path, monkeypatch):
+    """A part's run whose kept bundle leaves no room for a program it compiled drops what it did not load to
+    make room for it; a program too large for any chunk drops nothing; a program evicted between its layout
+    and its read sends and holds nothing, the next close sending it; and a run that loaded none and
+    compiled none writes nothing, whatever it fetched."""
+    url, stored, _ = cache_worker
+    value = b"v" * 60
+    monkeypatch.setattr(remote_cache, "CHUNKS", 1)
+    each_cost = remote_cache.HEADER.size + len("jit_a-1") + len(value)
+    monkeypatch.setattr(remote_cache, "MAX_BYTES", 4 * each_cost)
+    bundle = "/jax/cpu/bundles/tests/full.py"
+
+    def ran(name: str, load: str, compile_: tuple[str, bytes] | None) -> set[str]:
+        stored[bundle] = remote_cache.packed([(f"jit_{each}-1", value) for each in "abcd"])
+        cache = remote_cache.RemoteCache(tmp_path / name, url, "token", "jax/cpu")
+        cache.opened("tests/full.py")
+        if load:
+            loaded(tmp_path / name, load)
+        if compile_:
+            compiled(tmp_path / name, *compile_)
+        cache.closed("tests/full.py")
+        cache.drain()
+        return {key for key, _ in remote_cache.unpacked(stored[bundle])[0]}
+
+    assert ran("room", "jit_a-1", ("jit_e-1", value)) == {"jit_a-1", "jit_e-1"}
+    whole = {f"jit_{each}-1" for each in "abcd"}
+    assert ran("huge", "jit_a-1", ("jit_x-1", b"x" * remote_cache.MAX_BYTES)) == whole
+    held = stored[bundle]
+    # A program gone between its layout and its read: nothing sent, nothing held, so the next close sends.
+    evicted = remote_cache.RemoteCache(tmp_path / "evicted", url, "token", "jax/cpu")
+    evicted.opened("tests/full.py")
+    compiled(tmp_path / "evicted", "jit_f-1", value)
+    real_payloads = evicted._payloads
+    monkeypatch.setattr(evicted, "_payloads", lambda keys: (
+        (tmp_path / "evicted" / f"jit_f-1{remote_cache.SUFFIX}").unlink(), real_payloads(keys))[1])
+    evicted.closed("tests/full.py")
+    assert evicted.failures == 1 and stored[bundle] is held
+    monkeypatch.undo()
+    monkeypatch.setattr(remote_cache, "CHUNKS", 1)
+    monkeypatch.setattr(remote_cache, "MAX_BYTES", 4 * each_cost)
+    compiled(tmp_path / "evicted", "jit_f-1", value)
+    evicted.closed("tests/full.py")
+    evicted.drain()
+    assert "jit_f-1" in {key for key, _ in remote_cache.unpacked(stored[bundle])[0]}
+    held = stored[bundle]
+    idle = remote_cache.RemoteCache(tmp_path / "idle", url, "token", "jax/cpu")
+    idle.opened("tests/full.py")
+    idle.closed("tests/full.py")
+    idle.drain()
+    assert stored[bundle] is held
+
+
 def test_a_bundle_that_runs_again_after_another_keeps_what_it_loaded_in_each_stint(cache_worker, tmp_path):
     """A file's bundle closed, another's run, then the first's again (A, B, A): a fetched program the first
     loads only in its second stint stays in its bundle with the one it loaded in its first (review,

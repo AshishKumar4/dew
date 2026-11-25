@@ -1133,20 +1133,24 @@ def assert_key_decays_witnessed(lane: Lane, heads: int = 1, width: int = 64) -> 
     assert_refusals(shared, KEY_DECAY_SHARES)
 
 
-def assert_clamped_key_decays_witnessed(lane: Lane, dtype=None) -> None:
+def assert_clamped_key_decays_witnessed(lane: Lane, dtype=None, part: str = "both") -> None:
     """The step witness under a decay a key dimension no bound declares (`declared_bound`), a call of three
     chunks with a steep column (`draw`'s `steep`: one key dimension of one token a chunk at -2^26, mild ones
     beside and after it): every record of its forward inside its step's enclosure, and of a 16-bit call's
     fast backward, which the template trains (`recorded_key_backward`'s), its log decays' gradient judged
     apart: zero at each steep entry, past the clamp, and finite everywhere. A 16-bit call's (`dtype` None,
     bf16) prefix its rounded sum of its decays clamped (`Lane.clamped`); an fp32 call's the compensated pair
-    (row 12067)."""
+    (row 12067). `part` holds the forward's records, the 16-bit call's backward, or both (a case each:
+    together a 16-bit call took 133 s, row 12636)."""
+    if part not in ("forward", "backward", "both"):
+        raise ValueError(f"part is 'forward', 'backward' or 'both', not {part!r}")
     operands = draw(0, "mild", per_key=True, dtype=dtype, steep=True)
     run = recorded(*operands)
-    held = witness(run, lane)
-    for name in RECORDS:
-        assert np.all(held[name]), (name, np.mean(held[name]))
-    if dtype is not None:
+    if part != "backward":
+        held = witness(run, lane)
+        for name in RECORDS:
+            assert np.all(held[name]), (name, np.mean(held[name]))
+    if dtype is not None or part == "forward":
         return
     assert run.trained, "the template trains a 16-bit call with a steep column"
     back = recorded_key_backward(operands, run=run)

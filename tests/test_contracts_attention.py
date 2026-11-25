@@ -48,8 +48,10 @@ def test_a_fused_attention_call_in_forward_mode_holds_every_order(edge):
     float32 and the plain attention formula is, at queries, keys and values whose products near float32's
     ends."""
     def fused(query, key, value):
-        with attention.forward_mode_attention():
-            return attention.scaled_dot_product_attention(query, key, value, implementation="template")
+        return attention.forward_differentiable(
+            lambda q, k, v: attention.scaled_dot_product_attention(q, k, v, implementation="template"),
+            lambda q, k, v: attention.scaled_dot_product_attention(q, k, v, implementation="reference"),
+            query, key, value)
 
     assert_drawn_contract(fused, attention_inputs(2654, (1, 16, 2, 16)), EDGES[edge],
                           f"a fused call in forward mode {edge}", truth_fn=plain_attention,
@@ -74,17 +76,26 @@ def test_a_heads_sinks_hold_every_order(edge):
 
 
 @pytest.mark.parametrize(("implementation", "edge"), list(itertools.product(("template", "tpu"), EDGES)))
-def test_a_fused_attention_kernel_holds_its_reverse_orders(implementation, edge):
+def test_a_fused_attention_kernel_holds_every_order(implementation, edge):
     """The template's route (`attention_route._attend`) and splash (`splash._attention`, interpreted off a
-    TPU), each a reverse-only custom derivative: its primal and its reverse derivative run, finite wherever
-    float64 is a normal float32 and the plain attention formula is, at queries, keys and values whose
-    products near float32's ends. Its other orders do not run (`REVERSE_ONLY`, ledger 2654)."""
+    TPU), each differentiated at every order (`generation.linear_tangent`, row 2654): every order runs
+    (forward mode, reverse mode, higher orders, remat, nested jit, scanned), finite wherever float64 is a
+    normal float32 and the plain attention formula is, at queries, keys and values whose products near
+    float32's ends."""
     def fused(query, key, value):
         return attention.scaled_dot_product_attention(query, key, value, implementation=implementation)
 
     assert_drawn_contract(fused, attention_inputs(2657, (1, 128, 2, 64)), EDGES[edge],
                           f"{implementation} attention {edge}", truth_fn=plain_attention,
-                          plain_fn=plain_attention, without=REVERSE_ONLY)
+                          plain_fn=plain_attention)
+    if implementation == "template" and edge == "near the largest":
+        # Prescaling Q by scale's power of two before the fp32 dot keeps value-only JVP finite at 2^64.
+        big = jnp.zeros((1, 2, 1, 64), jnp.float32).at[:, :, :, 0].set(jnp.float32(2.0 ** 64))
+        vals = jnp.zeros((1, 2, 1, 64), jnp.float32)
+        dvals = jnp.stack([jnp.ones((1, 1, 64), jnp.float32), jnp.full((1, 1, 64), 3.0, jnp.float32)], axis=1)
+        out, dout = jax.jvp(lambda v_in: fused(big, big, v_in), (vals,), (dvals,))
+        assert jnp.all(jnp.isfinite(out)) and jnp.all(jnp.isfinite(dout))
+        assert bool(jnp.array_equal(dout, jnp.full((1, 2, 1, 64), 2.0, jnp.float32)))
 
 
 @pytest.mark.parametrize("edge", EDGES)

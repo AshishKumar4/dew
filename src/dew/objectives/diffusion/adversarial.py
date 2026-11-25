@@ -36,7 +36,6 @@ from dew.nn.activations import logistic
 from dew.nn.blocks import sinusoidal_time
 from dew.nn.conv import convolution
 from dew.nn.dit import TextContext, masked_mean
-from dew.nn.inspection import INSPECTED
 from dew.nn.norms import l2_normalized
 from dew.nn.precision import accumulated, at_least_fp32, divided
 from dew.nn.protocols import Lacks
@@ -355,8 +354,10 @@ class AdversarialDistillationObjective(FlowDistillationObjective):
             metrics["distillation"] = jnp.mean(distillation)
             total = total + distillation
         updates = {SPECTRAL: jax.lax.stop_gradient(spectral)} if step.training else None
-        inspected = None if step.watched is None or sown is None else sown.get(INSPECTED, {})
-        return self.row_mean(total, batch), Aux(metrics=metrics, variables=updates, inspected=inspected)
+        # The student's own call's records: the teacher and the discriminator's heads open none.
+        _, inspected, amax = (None, None, None) if sown is None else step.observed(sown)
+        return self.row_mean(total, batch), Aux(metrics=metrics, variables=updates, inspected=inspected,
+                                                amax=amax)
 
 
 __all__ = ["AdversarialDistillationObjective"]

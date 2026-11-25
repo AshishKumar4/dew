@@ -32,7 +32,7 @@ Built: the three classes are three configurations of one segment layout, rendere
 
 Each segment names its stream (`Schema.stream`, `Instructions.stream`): `"row"`, the row the backbone reads; `"context"`, the row's context, which the backbone reads in a pass of its own and its cross-attention layers read beside the row; or a stream of the row of its own name, in the row's own pass under the layout's `Reads` (§2a). A conditioning stream is an ordinary `dew.inputs.Condition`: an encoder over a batch field. The decision's data writes that field from the segments routed to the stream. The backbone itself is one such encoder: it embeds the stream's tokens with its own table, as the context does today, or runs its own forward over them (a second pass). The model's cross-attention layers read the stream's encoded sequence as their context (`CONTEXT`, `CONTEXT_LENGTHS`).
 
-Built: a decision's context is an ordinary `Condition` of its objective's `InputSpec` (`DecisionObjective.inputs`, `DecisionModel.context_condition`), its encoder the backbone's own (`context_encoder`: its token table, or its own pass, as a schema in context always is) or any `ConditionEncoder` a run configures (`--context-text`, as a diffusion run's text condition; its tokenization the context's, its states read at its width, its weights the model's `context` module, each packed row's context encoded alone), each encoded through the one dispatch (`encode_conditions`) and counted by its work (`conditioning_flops`). A row whose schema is its context reads its example's or request's own context after the schema, in the schema's stream: the schema whole, its spans where it laid them, and the context's first tokens in the room the schema leaves under `context_length`; a context cut there is reported, the rows cut and the tokens dropped, in the run's data report (`data/cut/<corpus>/context`, `data/cut_removed/<corpus>/context`) and a server's usage, as every other cut is.
+Built: a decision's context is an ordinary `Condition` of its objective's `InputSpec` (`DecisionObjective.inputs`, `DecisionModel.context_condition`), its encoder the backbone's own (`context_encoder`: its token table, or its own pass, as a schema in context always is) or any `ConditionEncoder` a run configures (`--context.text`, as a diffusion run's text condition; its tokenization the context's, its states read at its width, its weights the model's `context` module, each packed row's context encoded alone), each encoded through the one dispatch (`encode_conditions`) and counted by its work (`conditioning_flops`). A row whose schema is its context reads its example's or request's own context after the schema, in the schema's stream: the schema whole, its spans where it laid them, and the context's first tokens in the room the schema leaves under `context_length`; a context cut there is reported, the rows cut and the tokens dropped, in the run's data report (`data/cut/<corpus>/context`, `data/cut_removed/<corpus>/context`) and a server's usage, as every other cut is.
 
 So today's `Example.context` is one segment, `State`-like over the example's context, routed to a stream the token table encodes. "The schema on a separate path" is a `Schema` segment routed to a stream the backbone encodes. Neither needs code of its own. Packing places every stream of a row together: a window holds rows while both its tokens (`max_len`) and its contexts (the objective's `context_window`, `max_len` or one row's `context_length` where that is longer) hold them, each row's context end to end after the rows before it (`context_segments`), each question carrying the row the packer placed it in (`question_rows`), and each span moved by its row's start along the stream it indexes: its tokens, or its context where the schema is the context. A row's tokens attend to its own context alone, and the backbone's pass over the contexts reads each as a document of its own.
 
@@ -63,8 +63,8 @@ no stream segments stands in the row's one stream, which a one-entry table reads
 - **Refusals.** A row's reads take the place of blocks and parallel options, which set what a token reads
   otherwise, and of images, whose tokens read each other whole; a layout naming a stream with no reads, or
   reads naming a stream its segments do not lay, is refused when it is built.
-- **Runs.** A run states its reads on the command line (`--reads`, a `Reads` record) beside its
-  `--segments`, and its saved task records them with its layout, so the task loaded from the run reads
+- **Runs.** A run states its reads on the command line (`--rows.reads`, a `Reads` record) beside its
+  `--rows.segments` (`RowBudgets`), and its saved task records them with its layout, so the task loaded from the run reads
   its rows as it trained; a layout field added after runs were saved keeps their data identity until a run
   sets it (`dew._records.ADDED`).
 
@@ -118,7 +118,7 @@ layout = SegmentLayout.joint_row(max_len=4096, segments=(
 # the schema a stream of the row's own, read whole by the state in one pass (§2a)
 ```
 
-On the command line it is the same record: a decision run's `--segments ...` and `--reads ...` (`DecisionRunConfig`). The decision guide shows both variants on one table, trained and served with no Dew change.
+On the command line it is the same record: a decision run's `--rows.segments ...` and `--rows.reads ...` (`DecisionRunConfig.rows`). The decision guide shows both variants on one table, trained and served with no Dew change.
 
 ## Seams, invariants, rejected alternatives
 

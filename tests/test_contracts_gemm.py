@@ -280,52 +280,46 @@ def test_a_blockwise_fp8_projection_holds_every_reverse_order(edge):
                     truth_fn=plain, plain_fn=plain, without=FORWARD_ORDERS)
 
 
+def _swiglu(gate, up):
+    return jax.nn.silu(gate) * up
+
+
+@pytest.mark.parametrize("chain", ["blockwise fp8", "gated blockwise fp8", "gated delayed nvfp4"])
 @pytest.mark.parametrize("edge", EDGES)
-def test_a_blockwise_fp8_chain_holds_every_reverse_order(edge):
-    """`projections.blockwise_chain` (an ungated MLP's two blockwise FP8 projections, the down projection's
-    rows quantized in the up projection's epilogue; its custom VJP each projection's own surrogate): every
-    reverse order, under a nested jit and a scan, in the rows and both matrices, finite wherever float64 is a
-    normal float32 and wherever the plain product of the two through the activation is, at values whose
-    products near float32's ends (row 8547). It takes no forward order: a custom VJP has none."""
-    primals = normal_draw(8547, (256, 128), (1, 128, 256), (1, 256, 128), scale=EDGES[edge])
-    direction = normal_draw(8548, (256, 128), (1, 128, 256), (1, 256, 128), scale=EDGES[edge])
+def test_a_recipe_chain_holds_every_reverse_order(edge, chain):
+    """A recipe chain (an MLP's projections, the down projection's rows quantized in the up projection's
+    epilogue; its custom VJP each projection's own surrogate): `projections.blockwise_chain` ungated through
+    ReLU and gated through SwiGLU (the gate's product read by the up projection's epilogue; rows 8547,
+    12689), and `projections.nvfp4_chain` gated at a delayed recipe's tensor scales, the draw's own largest
+    magnitudes' as a history of this step holds them (row 12721): every reverse order, under a nested jit
+    and a scan, in the rows and every matrix, finite wherever float64 is a normal float32 and wherever the
+    plain product through the activation is, at values whose products near float32's ends. It takes no
+    forward order: a custom VJP has none."""
+    gated = chain.startswith("gated")
+    shapes = ((256, 128), *((1, 128, 256),) * (1 + gated), (1, 256, 128))
+    primals = normal_draw(8547, *shapes, scale=EDGES[edge])
+    direction = normal_draw(8548, *shapes, scale=EDGES[edge])
     (cotangent,) = normal_draw(8549, (256, 128))
+    activation = _swiglu if gated else jax.nn.relu
 
-    def recipe(rows, up, down):
-        return projections.blockwise_chain(rows, up, down, jax.nn.relu, out_dtype=rows.dtype)
+    def plain(rows, *matrices):
+        *firsts, down = matrices
+        return activation(*(rows @ matrix[0] for matrix in firsts)) @ down[0]
 
-    def plain(rows, up, down):
-        return jax.nn.relu(rows @ up[0]) @ down[0]
+    rows, *firsts, _ = primals
+    hidden = activation(*(rows @ matrix[0] for matrix in firsts))
+    scales = tuple(projections.delayed_tensor_scale(projections.nvfp4_amax(each)[None])
+                   for each in (rows, hidden))
 
-    assert_contract(recipe, primals, direction, cotangent, f"a blockwise fp8 chain {edge}", truth_fn=plain,
+    def recipe(rows, *matrices):
+        *gate, up, down = matrices
+        options = {"gate": gate[0] if gate else None, "out_dtype": rows.dtype}
+        if chain.endswith("nvfp4"):
+            return projections.nvfp4_chain(rows, up, down, activation, tensor_scales=scales, **options)
+        return projections.blockwise_chain(rows, up, down, activation, **options)
+
+    assert_contract(recipe, primals, direction, cotangent, f"a {chain} chain {edge}", truth_fn=plain,
                     plain_fn=plain, without=FORWARD_ORDERS)
-
-
-@pytest.mark.parametrize("edge", EDGES)
-def test_a_gated_blockwise_fp8_chain_holds_every_reverse_order(edge):
-    """`projections.blockwise_chain` with its `gate` (a gated MLP's three blockwise FP8 projections, the
-    gate's product read by the up projection's epilogue and their SwiGLU quantized there; its custom VJP
-    each projection's own surrogate): every reverse order, under a nested jit and a scan, in the rows and
-    the three matrices, finite wherever float64 is a normal float32 and wherever the plain product of the
-    three through SwiGLU is, at values whose products near float32's ends (row 12689). It takes no forward
-    order."""
-    primals = normal_draw(12689, (256, 128), (1, 128, 256), (1, 128, 256), (1, 256, 128),
-                          scale=EDGES[edge])
-    direction = normal_draw(12690, (256, 128), (1, 128, 256), (1, 128, 256), (1, 256, 128),
-                            scale=EDGES[edge])
-    (cotangent,) = normal_draw(12691, (256, 128))
-
-    def swiglu(gate, up):
-        return jax.nn.silu(gate) * up
-
-    def recipe(rows, gate, up, down):
-        return projections.blockwise_chain(rows, up, down, swiglu, out_dtype=rows.dtype, gate=gate)
-
-    def plain(rows, gate, up, down):
-        return swiglu(rows @ gate[0], rows @ up[0]) @ down[0]
-
-    assert_contract(recipe, primals, direction, cotangent, f"a gated blockwise fp8 chain {edge}",
-                    truth_fn=plain, plain_fn=plain, without=FORWARD_ORDERS)
 
 
 @pytest.mark.parametrize("edge", EDGES)

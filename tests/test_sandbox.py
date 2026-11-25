@@ -129,6 +129,29 @@ def test_parent_death_kills_what_the_worker_forked(tmp_path):
     assert killing_its_parent_ends(script) == []
 
 
+def test_parent_death_kills_the_container_client(tmp_path):
+    """A SIGKILLed parent takes the container runtime's client it ran a program through with it
+    (`ContainerRunner`): the client's group outlives no owner (`dew._cleanup.start`'s lifeline), where a
+    session of its own alone left it running, and the container it would make with it (row 12772). The
+    client here a runtime that records its id and waits."""
+    pidfile, runtime, script = tmp_path / "client", tmp_path / "runtime", tmp_path / "parent.py"
+    runtime.write_text(f"#!/bin/sh\necho $$ > {pidfile}\nexec sleep 3600\n")
+    runtime.chmod(0o755)
+    script.write_text(
+        "import pathlib, threading, time\n"
+        "from dew.rl.sandbox import ContainerRunner, Program, SandboxLimits\n"
+        f"runner = ContainerRunner('image', runtime={str(runtime)!r})\n"
+        "program = Program({'main.py': 'print(5)'}, ('python', 'main.py'))\n"
+        "limits = SandboxLimits(wall_seconds=3600)\n"
+        "threading.Thread(target=runner, args=(program, limits), daemon=True).start()\n"
+        f"path = pathlib.Path({str(pidfile)!r})\n"
+        "while not (path.exists() and path.read_text().strip()):\n"
+        "    time.sleep(0.05)\n"
+        "print(path.read_text().strip(), flush=True)\n"
+        "time.sleep(3600)\n")
+    assert killing_its_parent_ends(script) == []
+
+
 def test_episodes_collect_through_subprocess_workers():
     """The rollout collects a cohort from real workers and scores it."""
     harness = environment()

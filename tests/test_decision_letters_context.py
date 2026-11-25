@@ -18,7 +18,7 @@ from dew.data import Memory
 from dew.data.pipeline import Rejected
 from dew.data.text import ByteTokenizer
 from dew.decision import Choice, Decide, Example, decisions
-from dew.decision.config import DecisionRunConfig, Letters
+from dew.decision.config import CrossContext, DecisionRunConfig, Letters, RowBudgets
 from dew.decision.head import LabelReadout, SlotReadout
 from dew.decision.layout import (
     AnswerCue,
@@ -209,26 +209,27 @@ def test_a_run_names_its_lettered_question_read_in_context_on_the_command_line(t
     # A batch of as many rows as the test mesh has shards, one an example.
     rows = Memory([{"example": example} for example in examples()]).read("memory").pipe(decisions).batch(8)
     # A backbone with a tokenizer of its own, which the run lays its rows out with and names its letters by.
-    config = DecisionRunConfig.cli(["--pretrained", str(LLAMA.parent / "qwen38-dense-tiny"), "--segments",
-                                    json.dumps(to_record(SEGMENTS, tuple[Segment, ...])), "--context-layers",
-                                    "0", "head:letters", "--head.count", "4", "--head.labels.names",
+    config = DecisionRunConfig.cli(["--pretrained", str(LLAMA.parent / "qwen38-dense-tiny"),
+                                    "--rows.segments", json.dumps(to_record(SEGMENTS, tuple[Segment, ...])),
+                                    "head:letters", "--head.count", "4", "--head.labels.names",
                                     *(LABELS.names or ()), "--head.labels.variants", *LABELS.variants,
                                     "--head.labels.cue", LABELS.cue, "--trainer.name", "letters",
                                     "--trainer.checkpoint-dir", str(tmp_path / "runs"),
                                     "--trainer.steps",
                                     "1", "--trainer.checkpoint-every", "1", "--trainer.eval-every", "None",
                                     "--trainer.multi-host", "False", "--trainer.compilation-cache-dir",
-                                    "None"],
+                                    "None", "context:cross-context", "--context.layers", "0"],
                                    default=stated(DecisionRunConfig(data=rows),
                                                   model_fields={"dtype": "float32"}))
     # The run's own labels, each a single token of the backbone's byte-level vocabulary.
-    assert config.segments == SEGMENTS and isinstance(config.head, Letters) and config.head.labels == LABELS
+    assert config.rows.segments == SEGMENTS and isinstance(config.head, Letters)
+    assert config.head.labels == LABELS and config.context == CrossContext(layers=(0,))
     with pytest.raises(ValueError):
-        dataclasses.replace(config, context_layers=None).prepare()
+        dataclasses.replace(config, context=None).prepare()
     # The same question read in the row, its option lines with it, needs no context layers.
     in_row = tuple(dataclasses.replace(segment, stream="row") if isinstance(segment, Instructions)
                    else segment for segment in SEGMENTS)
-    assert dataclasses.replace(config, segments=in_row, context_layers=None).prepare() is not None
+    assert dataclasses.replace(config, rows=RowBudgets(segments=in_row), context=None).prepare() is not None
     config.run()
     decide = Decide.from_run(str(tmp_path / "runs" / "letters"))
     asked = QUESTIONS[0]

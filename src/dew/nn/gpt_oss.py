@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Mapping
-from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -18,10 +17,14 @@ from jax.ad_checkpoint import checkpoint_name
 from dew import quantization
 from dew.mesh import LogicalAxes
 from dew.nn.activations import quick_gelu, swiglu_clamped
-from dew.nn.dense import Dense, packed_matrix
+from dew.nn.dense import Dense, amax_history, noted_amax, packed_matrix
 from dew.nn.flops import MissingFlopsCount, projection_flops
+from dew.nn.kernels import projections
+from dew.nn.kernels.formats import NvFp4
 from dew.nn.moe import (
+    Projected,
     Routes,
+    admitted_amax,
     chosen_experts,
     expert_compute_dtype,
     expert_dispatch,
@@ -33,9 +36,6 @@ from dew.nn.moe import (
 from dew.nn.precision import float32_dot_general, projection_role
 from dew.nn.residuals import Residual
 from dew.nn.sharding import declared
-
-if TYPE_CHECKING:
-    from dew.nn.kernels.formats import NvFp4
 
 FUSED_EXPERT_AXES: Mapping[str, LogicalAxes] = {
     "gate_up_proj": ("exp", "embed", "mlp"),
@@ -93,33 +93,54 @@ class GptOssExperts(nn.Module):
         if weights.shape != indices.shape:
             raise ValueError(f"routing {indices.shape} does not describe weights {weights.shape}")
         parameters = (gate_up, gate_bias, down, down_bias)
+        # Each unpacked bank's amax history under a delayed-scaling NVFP4 recipe that takes the experts
+        # (`dense.amax_history`, row 12721), declared here, where the module's variables are; a packed bank,
+        # its checkpoint's own codes, none.
+        with projection_role("experts"):
+            histories = tuple(None if isinstance(bank, NvFp4) else amax_history(self, name, shape)
+                              for name, bank, shape in (
+                                  ("gate_up_proj", gate_up, (self.hidden_size, 2 * self.intermediate_size)),
+                                  ("down_proj", down, (self.intermediate_size, self.hidden_size))))
         # Each leaf's axes: a packed bank's four its own (`quantization.expert_leaf_axes`).
         axes = tuple(leaf for parameter, named in zip(parameters, FUSED_EXPERT_AXES.values(), strict=True)
                      for leaf in quantization.expert_leaf_axes(parameter, named))
-        slots = expert_dispatch(
-            functools.partial(self._project, dtype=compute_dtype), x.astype(compute_dtype), indices,
-            parameters, axes,
+        slots, observed = expert_dispatch(
+            functools.partial(self._project, dtype=compute_dtype, histories=histories),
+            x.astype(compute_dtype), indices, parameters, axes,
             num_experts=self.num_local_experts,
             dispatch=self.dispatch, output_dtype=compute_dtype, initializing=self.is_initializing(),
             capacity_factor=self.capacity_factor)
+        # What each bank holding a history quantized, recorded here, outside the dispatch's transformations.
+        held = [name for name, history in zip(("gate_up_proj", "down_proj"), histories, strict=True)
+                if history is not None]
+        for name, amax in zip(held, observed, strict=True):
+            noted_amax(self, name, amax)
         return jnp.sum(slots * weights[..., None], axis=-2)
 
     def _project(self, tokens: jax.Array, sizes: jax.Array, _expert_ids: jax.Array,
                  parameters: tuple[jax.Array | NvFp4, jax.Array, jax.Array | NvFp4, jax.Array], *,
-                 dtype: Dtype) -> jax.Array:
+                 dtype: Dtype, histories: tuple) -> Projected:
         # Each bias is added to its expert's rows' sums before their one rounding (`expert_projection`);
-        # a slot of no expert, past the routed rows, comes back zero from the dispatch.
+        # a slot of no expert, past the routed rows, comes back zero from the dispatch. Each bank holding a
+        # delayed-scaling NVFP4 history quantizes at its scale (row 12721).
         gate_up, gate_bias, down, down_bias = parameters
+        gate_scale, down_scale = (None if history is None else projections.delayed_tensor_scale(history.value)
+                                  for history in histories)
         projected = jnp.asarray(expert_projection(
-            tokens, gate_up, sizes, dtype, self.implementation, self.precision, bias=gate_bias))
+            tokens, gate_up, sizes, dtype, self.implementation, self.precision, bias=gate_bias,
+            tensor_scale=gate_scale))
         # The dense MLP's residual names, the interleaved gate and up one product as a packed MLP's
         # (mlp.py), so one remat policy covers every MLP (residuals.RESIDUALS).
         projected = checkpoint_name(checkpoint_name(projected, Residual.GATE_PROJ), Residual.UP_PROJ)
         gate, up = swiglu_clamped(projected[..., ::2], projected[..., 1::2], 7.0)
         activated = (up + 1) * quick_gelu(gate)
         output = jnp.asarray(expert_projection(
-            activated, down, sizes, dtype, self.implementation, self.precision, bias=down_bias))
-        return checkpoint_name(output, Residual.DOWN_PROJ)
+            activated, down, sizes, dtype, self.implementation, self.precision, bias=down_bias,
+            tensor_scale=down_scale))
+        observed = tuple(admitted_amax(rows, sizes, dtype)
+                         for rows, history in ((tokens, histories[0]), (activated, histories[1]))
+                         if history is not None)
+        return checkpoint_name(output, Residual.DOWN_PROJ), observed
 
 
 class GptOssMLP(nn.Module):

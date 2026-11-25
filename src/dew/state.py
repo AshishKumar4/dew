@@ -63,6 +63,11 @@ class Accumulation:
     fill: jax.Array | None = None
     """None only as a window the previous checkpoint format saved part filled is restored, whose
     occupancy its clock states (`dew.checkpoints._held_occupancy` derives it)."""
+    amax: Variables | None = None
+    """The largest magnitude each delayed-scaling NVFP4 projection recorded over the window's microbatches
+    so far (`dew.objectives.base.Aux.amax`, `largest_recorded`), zeros while it holds none (the identity
+    of a largest magnitude), which its commit rolls into the projections' histories; None in a run that
+    keeps none."""
 
     def replays(self, other: Accumulation | None) -> bool:
         """Whether this window's replay slots hold batches of the shapes `other`'s do, so a step

@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 from jax.core import eval_jaxpr
 from reference_error import assert_as_exact
+from test_contracts_norms import plain_l2norm
 
 from dew import algebra
 from dew.nn import precision
@@ -32,7 +33,7 @@ def rows(seed: int, *shapes) -> tuple[jax.Array, ...]:
 def unit_backward(x, dy):
     """A unit norm's backward written as autodiff writes it: the norm's inverse, then the inner product of the
     unit rows with the cotangent, each waiting on the one before."""
-    _, pull = jax.vjp(precision.l2norm, x)
+    _, pull = jax.vjp(plain_l2norm, x)
     return pull(dy)[0]
 
 

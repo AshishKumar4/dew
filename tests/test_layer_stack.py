@@ -416,13 +416,14 @@ def test_runs_of_like_layers_scan_and_the_rest_unroll(shape):
 
 
 @attending("reference")
-@pytest.mark.check1_shards(seeds=128, per_task=24, conditioning=32, conditioning_per_task=2)
+@pytest.mark.check1_shards(seeds=128, per_task=24, conditioning=32, conditioning_per_task=1)
 def test_gemma3ns_runs_of_like_layers_scan_as_its_loop():
     """`scans_as_the_loop` over Gemma 3n's shape, its 128 seeds and their redraws drawn by CI's map tasks
     (`check1_shards`), 24 a task: tasks of 32 took 79 to 115 s on armada's 25/17 workers (f1c0868b8),
-    each seed's rows redrawn until their selections clear the margin; its 32 weighed draws 2 a task (8 a
+    each seed's rows redrawn until their selections clear the margin; its 32 weighed draws 1 a task (8 a
     task took 657 s in train 1180's CI, past its 633 s bound, row 11794; 4 a task took 651 to 724 s in
-    train 1189's and later CIs, past their 652 s bound, row 11903)."""
+    train 1189's and later CIs, past their 652 s bound, row 11903; 2 a task took 321 to 601 s in train
+    1261's, past its 615 s bound with its judge, row 12744)."""
     scans_as_the_loop("gemma3n")
 
 
@@ -729,30 +730,39 @@ def test_a_banked_moe_decode_pairs_each_layers_gate_and_up_at_the_layer():
                for arguments in bound), [(tuple(arguments["kernel"].shape), arguments["paired"] is not None)
                                          for arguments in bound]
 
+
 @pytest.mark.usefixtures("scanned_stacks")
-def test_a_banked_moe_decode_reads_each_layers_experts_in_place_and_decodes_as_the_loop():
-    """A scanned MoE stack decoding over a bank in device memory (`HeldBanks.place`, every run's leaves one
-    array) hands each layer it reads a layer at a time the run's expert kernels whole and the layer's
-    index, which the grouped matmul reads in place (`dew.nn.moe.Layered`): the step's loop takes every
-    expert stack as a constant, whole, and copies none of them a layer at a time (no slice of a stack's
-    shape is taken in it); every other leaf of the bank it reads in the iteration that reads it, none
-    staged a layer ahead in the loop's carry, which a bank in host memory alone needs. Its steps decode as
-    exactly as the plain loop's, both from the loop's own float64 steps (check 1). A call keeping every
-    collection open writes none of the kernels back."""
+@pytest.mark.parametrize("held", ["resident", "banked"])
+def test_a_moe_decode_reads_each_layers_experts_in_place_and_decodes_as_the_loop(held):
+    """A scanned MoE stack decoding over its own variables, in device memory as a model holds them (resident),
+    or over a bank in device memory (`HeldBanks.place`, every run's leaves one array), hands each layer the
+    run's expert kernels whole and the layer's index, which the grouped matmul reads in place
+    (`dew.nn.moe.Layered`): the step's loop takes every expert stack as a constant, whole, slicing none of
+    them, and the grouped calls of its experts' projections take the whole stack, its layers' experts one
+    axis, and the layer's offset into it (`grouped_matmul.weighed`: the launch boundary, past which a launch
+    reads the layer where it lies; row 1346: sliced, each layer's experts were copied out every step, 45% of a
+    Qwen3-30B-A3B decode step on an H100). A bank's every other leaf is read in the iteration that reads it,
+    none staged a layer ahead in the loop's carry, which a bank in host memory alone needs, and a call keeping
+    every collection open writes none of its kernels back. Its steps decode as exactly as the plain loop's,
+    both from the loop's own float64 steps (check 1)."""
+    from dew.nn.kernels import grouped_matmul
+
     ids = jax.random.randint(jax.random.key(2), (2, 8), 0, VOCAB)
     routed = {"experts": 4, "top_k": 2, "expert_features": 16, "layers": tuple(range(4))}
     scanned = tiny(num_layers=4, max_seq_len=16, mixture=routed)
     plain = tiny(num_layers=4, max_seq_len=16, mixture=routed)
     variables = plain.init(jax.random.key(0), ids)
-    banked = HeldBanks(variables).place(scanned)
-    stacks = {tuple(leaf.shape) for leaf in jax.tree.leaves(experts_apart(banked)[BANKED_EXPERTS])}
-    assert stacks
-    # A call that keeps every collection open hands back none of the expert kernels it read in place.
-    assert BANKED_EXPERTS not in scanned.apply(banked, ids[:, :4], mutable=True)[1]
+    store = variables if held == "resident" else HeldBanks(variables).place(scanned)
+    # The model holds each layer under its own name, a bank its run's layers stacked: the run's scan reads
+    # its four layers' kernels stacked either way.
+    stacks = {(4, *leaf.shape) if held == "resident" else tuple(leaf.shape)
+              for leaf in jax.tree.leaves(experts_apart(store)[BANKED_EXPERTS])}
+    assert stacks and all(len(stack) == 4 for stack in stacks)
 
     cache = scanned.init(jax.random.key(0), ids[:, :1], decode=True)["cache"]
-    graph = jax.make_jaxpr(lambda variables, cache: scanned.apply(
-        {**variables, "cache": cache}, ids[:, :1], decode=True, mutable=["cache"]))(banked, cache)
+    with grouped_matmul.weighed() as calls:
+        graph = jax.make_jaxpr(lambda variables, cache: scanned.apply(
+            {**variables, "cache": cache}, ids[:, :1], decode=True, mutable=["cache"]))(store, cache)
     loops = [equation for equation in equations(graph) if equation.primitive.name == "scan"]
     handed = [{tuple(operand.aval.shape) for operand in scan.params["ft_in"].update(scan.invars).unpack()[0]}
               for scan in loops]
@@ -760,15 +770,23 @@ def test_a_banked_moe_decode_reads_each_layers_experts_in_place_and_decodes_as_t
               for equation in equations(scan.params["jaxpr"])
               if equation.primitive.name in ("dynamic_slice", "slice", "gather")}
     assert any(stacks <= whole for whole in handed) and not stacks & slices
-    carried = {tuple(operand.aval.shape) for scan in loops
-               for operand in scan.params["ft_in"].update(scan.invars).unpack()[1]}
-    layer = {tuple(leaf.shape[1:]) for leaf in jax.tree.leaves(banked["params"]["layers_0_3"])}
-    assert not layer & carried, layer & carried
+    # The calls the experts' projections make take the whole stack, its layers' experts one axis, at the
+    # layer's offset: a launch reads the layer there in place. (A target's portable product, XLA's on this
+    # CPU, slices the layer from the stack past that boundary and weighs its call again, the layer's.)
+    bound = [next(iter(call.bound.values()))[1].arguments for call, _ in calls]
+    whole = {(layers * experts, *matrix) for layers, experts, *matrix in stacks}
+    experts = [arguments for arguments in bound if tuple(arguments["kernel"].shape) in whole]
+    assert experts and all(arguments["first"] is not None for arguments in experts), bound
+    if held == "banked":
+        # A call that keeps every collection open hands back none of the expert kernels it read in place.
+        assert BANKED_EXPERTS not in scanned.apply(store, ids[:, :4], mutable=True)[1]
+        carried = {tuple(operand.aval.shape) for scan in loops
+                   for operand in scan.params["ft_in"].update(scan.invars).unpack()[1]}
+        layer = {tuple(leaf.shape[1:]) for leaf in jax.tree.leaves(store["params"]["layers_0_3"])}
+        assert not layer & carried, layer & carried
 
-    draw = drawn_ids(0x1342, 8)
-
-    # The plain loop's float64 twin over its variables widened once, which the gate compiles for every
-    # draw.
+    draw = drawn_ids(0x1346 if held == "resident" else 0x1342, 8)
+    # The plain loop's float64 twin over its variables widened once, which the gate compiles for every draw.
     with jax.enable_x64(new_val=True):
         wide, wide_variables = (tiny(num_layers=4, max_seq_len=16, mixture=routed, dtype=jnp.float64),
                                 float64_held(variables))
@@ -780,8 +798,8 @@ def test_a_banked_moe_decode_reads_each_layers_experts_in_place_and_decodes_as_t
     def steps(model, store):
         return lambda ids: decoded(model, store, ids)[0]
 
-    assert_as_exact(steps(scanned, banked), unrolled(steps(plain, variables)), draw,
-                    "banked MoE decode steps", seeds=BANKED_EXPERT_SEEDS, truth_fn=truth)
+    assert_as_exact(steps(scanned, store), unrolled(steps(plain, variables)), draw,
+                    f"{held} MoE decode steps", seeds=BANKED_EXPERT_SEEDS, truth_fn=truth)
 
 
 BANKED_DECODE_SEEDS = 8
@@ -1477,3 +1495,26 @@ def test_a_scanned_stack_in_host_memory_reads_and_writes_its_callers_state_as_a_
 
     assert_as_exact(dew_fn, reference_fn, draw, "host-resident scanned stack", seeds=HOST_STACK_SEEDS,
                     truth_fn=truth_fn)
+
+
+def test_a_scanned_stack_under_a_scoped_capture_of_a_method_keeps_its_non_array_returns():
+    """A stack of equal layers, which the default scans, under a caller's filter of a method by its layers'
+    path (`_activation`, which returns the MLP's activation, no array, wherever the decoder scopes it): runs
+    unrolled (`decoder_stages.stack`: a capture of any method may keep what no scan stacks), each layer's
+    return kept under its own name as Flax keeps it, none refused by a scan stacking a non-array."""
+    from dew.registry import models
+
+    model = models.build("causal_transformer", vocab_size=64, emb_features=16, num_heads=2, num_kv_heads=2,
+                         mlp_features=32, max_seq_len=16, num_layers=4)
+    ids = jnp.zeros((2, 8), jnp.int32)
+    variables = model.init(jax.random.key(0), ids)
+
+    def scoped(module, method):
+        return method == "_activation" and bool(module.path) and module.path[0].startswith("layers_")
+
+    _, captured = model.apply(variables, ids, capture_intermediates=scoped, mutable=["intermediates"])
+    kept = captured["intermediates"]
+    layers = sorted(name for name in kept if name.startswith("layers_"))
+    assert layers == [f"layers_{index}" for index in range(4)], layers
+    for index in range(4):
+        assert not isinstance(kept[f"layers_{index}"]["mlp"]["_activation"][0], jax.Array)

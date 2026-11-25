@@ -325,7 +325,7 @@ class BitForm:
         (`templates.cost.Work`, row 5386): each step's issues on its unit (`issues`), the ALU's as integer
         operations (`Work.integer_operations`) and the FMA pipe's as integer multiply-adds (IMAD, beside the
         fp32 lanes' FFMA at its own rate, `Work.integer_multiply_adds`); a step two output registers read
-        counted once, as ptxas computes it once in the kernel's whole PTX (`ptx`)."""
+        counted once, as its PTX writes it once (`ptx_registers`)."""
         issues = self.issues
         return Work(integer_operations=issues[Unit.ALU] * words,
                     integer_multiply_adds=issues[Unit.FMA] * words)
@@ -366,20 +366,11 @@ class BitForm:
         registers = jnp.stack(self.traced(words), axis=-1)
         return jax.lax.bitcast_convert_type(registers, dtype).reshape(*words.shape[:-1], -1)
 
-    def ptx(self, output: int) -> str:
-        """Output register `output` of the form as one PTX block over its stored word `$1` into `$0`, the
-        steps it reads each on the pipe its step names (`_PTX`), for a kernel's inline assembly (Pallas's
-        `elementwise_inline_asm`, constraints `=r,r`, which takes one result a block): a register's block
-        apiece, each holding the steps it reads, so a step two registers share is written twice and ptxas,
-        which optimizes the kernel's PTX whole, may compute it once (the consumer's compile report shows
-        whether it does)."""
-        return self._block((self.outputs[output],))
-
     def ptx_registers(self) -> str:
         """Every output register of the form as one PTX block over its stored word (`$N`, N its outputs'
-        count) into `$0` to `$N-1`, each step it reads written once (`ptx`'s steps, which a block apiece
-        writes again where two registers share them): a kernel's inline assembly of several results
-        (`inline_forms.registers`), so what it emits is the form's work (`work`)."""
+        count) into `$0` to `$N-1`, each step it reads written once on the pipe its step names (`_PTX`): a
+        kernel's inline assembly of several results (`inline_forms.registers`), so what it emits is the
+        form's work (`work`)."""
         return self._block(self.outputs)
 
     def _block(self, outputs: Sequence[int]) -> str:
@@ -759,9 +750,10 @@ E4M3_SCALE_OWED = 2.0 ** 120
 
 def scales_decoded(codes: jax.Array) -> jax.Array:
     """Block scales' E4M3 codes (uint8 or uint32, a code each) as float32, exactly, by the declared
-    transform (`E4M3_SCALE_FORM`, `traced`: a kernel's portable path; its PTX, `BitForm.ptx`, where inline
-    assembly runs) and the one restore rule (`float_bits.raised_exactly`, the register's owed 2^120 from its
-    bits: a subnormal scale as its mantissa's integer times 2^-9, never through a flushing lane); E4M3's two
+    transform (`E4M3_SCALE_FORM`, `traced`: a kernel's portable path; its PTX, `BitForm.ptx_registers`,
+    where inline assembly runs) and the one restore rule (`float_bits.raised_exactly`, the register's owed
+    2^120 from its bits: a subnormal scale as its mantissa's integer times 2^-9, never through a flushing
+    lane); E4M3's two
     NaN codes, 0x7F and 0xFF, NaN, as a cast of them is, so a block of a NaN scale is NaN wherever it is
     decoded, where the form's fields read them as 480 and -480 (the review of 3580, F1)."""
     held = codes.astype(jnp.uint32)
@@ -930,8 +922,9 @@ def encode_form(minifloat: Minifloat) -> BitForm:
     by a cheaper program of one or two that Z3 proves equal on every input), from 41 issues to 37 for each
     of e4m3, e5m2 and e2m1, the same program but for the minifloat's constants (its largest finite value,
     its bias, its mantissa's width, its NaN code and its sign's place). Proven against `encoded` on every
-    fp32 word by its test; its PTX (`BitForm.ptx`) a kernel's inline encode on a family with no satfinite
-    cvt (sm80, sm86), where its consumer's timing decides it against the compiler's lowering of `encoded`."""
+    fp32 word by its test; its PTX (`BitForm.ptx_registers`) a kernel's inline encode on a family with no
+    satfinite cvt (sm80, sm86), where its consumer's timing decides it against the compiler's lowering of
+    `encoded`."""
     m = minifloat.mantissa
     nan = minifloat.largest if minifloat.nan is None else minifloat.nan
     alu = Unit.ALU
@@ -990,7 +983,28 @@ def nvfp4_quantized(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     return packed(codes.T, E2M1).T, scales, tensor
 
 
-def nvfp4_coded(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+def nvfp4_tensor_scale(largest: jax.Array, quotient=None) -> jax.Array:
+    """NVFP4's tensor scale of a tensor whose largest magnitude is `largest` (`nvfp4_coded`'s rule): it over
+    6 * 448, at least fp32's least normal, 1 where it is zero, each quotient IEEE fp32 division's
+    (`correctly_rounded_divide`) or `quotient`'s. A delayed-scaling recipe's scale of the largest magnitude
+    its amax history holds (`dew.nn.kernels.projections.delayed_tensor_scale`, row 12721)."""
+    quotient = correctly_rounded_divide if quotient is None else quotient
+    least_normal = np.float32(np.finfo(np.float32).tiny)
+    over = quotient(largest, np.float32(E2M1_MAX * E4M3_MAX))
+    return jnp.where(largest > 0, jnp.maximum(over, least_normal), np.float32(1))
+
+
+def nvfp4_given_scale(tensor) -> jax.Array:
+    """A tensor scale given in place of a tensor's own (a delayed-scaling recipe's, row 12721) as fp32: the
+    one boundary every given scale passes (`nvfp4_coded`'s, an operand's stored one, a product epilogue's),
+    refused unless one scalar, so no array of them quantizes each row at its own and scales each column by
+    another's."""
+    if jnp.ndim(tensor) != 0:
+        raise ValueError(f"an NVFP4 tensor scale is one scalar, not a {jnp.shape(tensor)} array")
+    return jnp.asarray(tensor, jnp.float32)
+
+
+def nvfp4_coded(x: jax.Array, tensor: jax.Array | None = None) -> tuple[jax.Array, jax.Array, jax.Array]:
     """A tile `x` `[depth, columns]` of float32 values as NVFP4: its E2M1 codes (`[depth, columns]` uint32,
     a code each), its block scales (`[depth / 16, columns]` float8_e4m3fn,
     one for each sixteen along the depth) and its tensor scale (fp32): the tensor scale its largest magnitude
@@ -1003,7 +1017,9 @@ def nvfp4_coded(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     tensor scale is each value's rounding, as the GEMM epilogue's NVFP4 output stores it (row 4050). Each
     quotient is IEEE fp32 division's on every backend (`quotient`), so a tile's codes and scales are the
     rule's wherever it is quantized (row 5456: XLA's own division, a CPU's product by the reciprocal and a
-    GPU's approximate quotient, moved codes across an e2m1 midpoint and scales a step)."""
+    GPU's approximate quotient, moved codes across an e2m1 midpoint and scales a step). `tensor`, a tensor
+    scale given in place of the tile's own (a delayed-scaling recipe's, row 12721), the rule otherwise the
+    same: a block past it saturates its scale at 448 and its codes at 6, as delayed scaling clips."""
     def quotient(numerator, denominator):
         # IEEE fp32 division (`correctly_rounded_divide`); at a float64 truth's width, the float32 values'
         # float64 quotient rounded once to fp32, the same value (a quotient of 24-bit operands rounded to 53
@@ -1013,11 +1029,8 @@ def nvfp4_coded(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
         return (jnp.asarray(numerator, x.dtype) / jnp.asarray(denominator, x.dtype)).astype(jnp.float32)
 
     magnitude = jnp.abs(x)
-    largest = jnp.max(magnitude)
-    least_normal = np.float32(np.finfo(np.float32).tiny)
-    tensor = jnp.where(largest > 0,
-                       jnp.maximum(quotient(largest, np.float32(E2M1_MAX * E4M3_MAX)), least_normal),
-                       np.float32(1))
+    tensor = (nvfp4_tensor_scale(jnp.max(magnitude), quotient) if tensor is None
+              else nvfp4_given_scale(tensor))
     blocks = jnp.max(magnitude.reshape(-1, NVFP4.depth, x.shape[-1]), axis=1)
     ratio = quotient(quotient(blocks, tensor), np.float32(E2M1_MAX))
     nearest = encoded(jax.lax.bitcast_convert_type(ratio, jnp.uint32), E4M3)

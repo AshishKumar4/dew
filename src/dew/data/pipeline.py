@@ -61,6 +61,25 @@ class Rejected:
     `consumed`."""
 
 
+@dataclasses.dataclass(frozen=True)
+class CachedOutputs:
+    """What a cache holds for one input, as rows: its outputs, a missing one
+    and an empty expansion each rejected, which every read of a cache uses."""
+
+    def flat_map(self, outputs: Sequence[Record]) -> tuple[Record, ...]:
+        held = tuple(Rejected("missing") if value is None else value for value in outputs)
+        return held if held else (Rejected("empty_expansion"),)
+
+
+class CachedOne:
+    """What a cache of steps that keep or reject each input holds for one, as the uncached steps make
+    it: its record, or the marker of its rejection; a missing one rejected (`CachedOutputs`)."""
+
+    def __call__(self, outputs: Record | tuple[Record, ...]) -> Record:
+        (value,) = outputs if isinstance(outputs, tuple) else (outputs,)
+        return Rejected("missing") if value is None else value
+
+
 CONSUMED = "_dew_consumed"
 """A row's count of the source examples it is the last row of, set on each source example a run bounded in
 examples reads (`MarkConsumed`) and carried through every step to the batch: each example's count goes to the
@@ -1001,6 +1020,32 @@ class Prefetch:
 class Workers:
     count: int
     buffer: int = WORKER_BUFFER
+
+    def shared(self, weights: Sequence[float], index: int) -> Workers:
+        """The workers the `index`th corpus reads in, of these shared by corpora read at `weights` (a
+        mixture's draw weights; equal for phases or a concatenation), each at this buffer: in proportion to
+        the weights by their largest remainders (the earlier corpus first among equal ones), then one each a
+        drawn corpus given none, taken from the corpus holding the most, so a corpus drawn from 97% of the
+        time reads in nearly every worker where an equal share gave a 3% corpus as many; where there are
+        fewer workers than drawn corpora (a weight above zero), one each the heaviest. A corpus given none
+        reads in the reading process."""
+        drawn = [at for at, weight in enumerate(weights) if weight > 0]
+        if self.count < len(drawn):
+            heaviest = sorted(drawn, key=lambda at: (-weights[at], at))[:self.count]
+            return Workers(int(index in heaviest), self.buffer)
+        # Each weight a share of the largest first, so no product or sum of weights a mix may state
+        # overflows (Grain's mix scales them down by its least).
+        largest = max(weights[at] for at in drawn)
+        scaled = {at: weights[at] / largest for at in drawn}
+        total = sum(scaled.values())
+        exact = {at: self.count * scaled[at] / total for at in drawn}
+        held = {at: math.floor(share) for at, share in exact.items()}
+        for at in sorted(drawn, key=lambda at: (held[at] - exact[at], at))[:self.count - sum(held.values())]:
+            held[at] += 1
+        for at in (at for at in drawn if not held[at]):
+            held[max(drawn, key=lambda most: (held[most], -most))] -= 1
+            held[at] = 1
+        return Workers(held.get(index, 0), self.buffer)
 
 
 @dataclasses.dataclass(frozen=True)

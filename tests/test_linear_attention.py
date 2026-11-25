@@ -37,9 +37,9 @@ from dew.nn.linear import (
     _masked_conv1d,
     causal_conv1d,
     held_conv1d,
-    l2norm,
     recurrent_gated_delta_rule,
 )
+from dew.nn.precision import l2norm
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "linear_attention"
 

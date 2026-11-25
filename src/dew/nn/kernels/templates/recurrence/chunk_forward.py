@@ -12,9 +12,9 @@ import numpy as np
 
 from dew.nn.kernels import chunked_launch, generation, recurrence, recurrence_algebra as algebra, tables
 from dew.nn.kernels.chunked_launch import zero_padded
-from dew.nn.kernels.templates import mosaic, product, stacked
+from dew.nn.kernels.templates import mosaic, product
 from dew.nn.kernels.templates.recurrence import own_pairs
-from dew.nn.kernels.templates.recurrence.intra import _intra, _intra_solve
+from dew.nn.kernels.templates.recurrence.intra import _intra, _prefix
 from dew.nn.kernels.templates.recurrence.mainloop import (
     Call,
     Operand,
@@ -140,7 +140,7 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None
             rounded: bool = False, apart: int = 0, values_gated: bool = False, unit_pairs: bool = False,
             decay_bound: float | None = None,
                 ranged: bool = False, skip=None,
-            forked: ForkedTable | None = None):
+            forked: ForkedTable | None = None, reads=None):
     """The chunked rule's forward on this mainloop: `(o [B, T, HV, Dv], final [B, HV, Dk, Dv])` for `q`, `k`
     `[B, T, H, Dk]`, `v` `[B, T, HV, Dv]`, the natural log decay `g`, a head's `[B, T, HV]` (the gated delta
     rule) or a key dimension's `[B, T, HV, Dk]` (Kimi delta attention), the write gate `beta` `[B, T, HV]` and
@@ -165,13 +165,18 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None
     write gate takes the keys' side (`Call.gated_keys`, Mamba2's SSD), as mamba_ssm's output kernel adds it,
     else to the output after it, landed fp32 and rounded once, the launches holding the values gated. A
     `forked` call's documents, laid from chunks' edges, take their memories up from its table
-    (`ForkedTable`)."""
+    (`ForkedTable`). The delta rule's keys erase along reads of their own where `reads` `[B, T, H, Dk]` is
+    given (`recurrence.Hooks.erase` 'read', the preconditioned delta rules'): `S' = (I - beta k b^T) D S +
+    beta k v^T`, the system's rows and the weights the reads' (`beta b k^T`, `w = X (b beta exp g)`), the
+    memory's writes and the scores the keys' (`_solved`; under a decay a key dimension `_paired` and
+    `_key_weighted`)."""
     out, final, _ = kept_forward(q, k, v, g, beta, h0, starts=starts, firsts=firsts,
                                  max_segments=max_segments, scale=scale, delta=delta, tiles=tiles, wide=wide,
                                  family=family, interpret=interpret, keeps=False,
                                  rounded=rounded, apart=apart, values_gated=values_gated,
                                  unit_pairs=unit_pairs,
-                                 decay_bound=decay_bound, ranged=ranged, skip=skip, forked=forked)
+                                 decay_bound=decay_bound, ranged=ranged, skip=skip, forked=forked,
+                                 reads=reads)
     return out, final
 
 
@@ -183,7 +188,8 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
                  rounded: bool = False, apart: int = 0, values_gated: bool = False, unit_pairs: bool = False,
                  decay_bound: float | None = None,
                      ranged: bool = False,
-                 skip=None, forked: ForkedTable | None = None) -> tuple[jax.Array, jax.Array, tuple]:
+                 skip=None, forked: ForkedTable | None = None,
+                 reads=None) -> tuple[jax.Array, jax.Array, tuple]:
     """`forward`'s `(o, final)` and what the fast backward takes rather than compute again
     (`mainloop_backward.gradients`' `inverse` and `kept`): each chunk's inverse under a decay a head
     (`_solved`'s, None otherwise or where the call `keeps` none, `forward`'s), as fla's backward keeps its
@@ -197,7 +203,7 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
                    rounded=rounded, apart=apart, values_gated=values_gated, unit_pairs=unit_pairs,
                    decay_bound=decay_bound,
                        ranged=ranged, forked=forked,
-                   out_dtype=jnp.float32 if wide else None, skipped=skip is not None)
+                   out_dtype=jnp.float32 if wide else None, skipped=skip is not None, reads=reads)
     call, tiles, out_dtype = run.call, run.tiles, run.landed
     # The skip in the launch that holds the values as given (`Call.gated_keys`); where they hold them gated,
     # added to the output after it, landed fp32 (the output rounded once).
@@ -257,6 +263,9 @@ class _Run:
     stored: jax.Array | None = None
     """A forked call's stored slots, the finals its storing documents left `[B * held * HV * Dk, Dv]` fp32
     (`mainloop._states`'), where its table holds any."""
+    reads: jax.Array | None = None
+    """The reads the delta rule's keys erase along, laid as the keys are (`forward`'s `reads`), where the
+    call takes them."""
 
     def shaped(self, memory: jax.Array) -> jax.Array:
         """Memories `[B * HV * Dk, Dv]` as the call's `[B, HV, Dk, Dv]`."""
@@ -265,23 +274,16 @@ class _Run:
                                                                             :self.value_width]
 
 
-def _paired(q, k, decays, beta, taken, call, *, scale: float, solves: bool, prefix=None) -> tuple:
-    """`intra._intra`'s scores, system where it `solves`, and prefix (`prefix` where given, the forward's
-    kept), each sub-chunk's own pairs written in place on their diagonal blocks by a launch of their own
-    (`own_pairs.intra_own`), the entries the walk leaves zero, each rounded once."""
-    *walked, prefix = _intra(q, k, decays, beta, taken, call, scale=scale, solves=solves, prefix=prefix)
-    # Sums of one shape and dtype (a fast fp32 call's on an A100, its scores' one part fp32 as its system)
-    # stacked into one ref, which `mosaic.checked` asks of refs a launch writes in place (row 3180).
-    groups = stacked.groups([(found.shape, found.dtype) for found in walked])
-    into = [jax.new_ref(walked[group[0]] if len(group) == 1 else jnp.stack([walked[i] for i in group]))
-            for group in groups]
-    own_pairs.intra_own(q, k, prefix, beta, taken, call, scale=scale,
-                        products=("scores", "system") if solves else ("scores",), into=(into, groups))
-    found = [None] * len(walked)
-    for ref, group in zip(into, groups, strict=True):
-        for place, index in enumerate(group):
-            found[index] = ref[...] if len(group) == 1 else ref[place]
-    return (*found, prefix)
+def _paired(q, k, decays, beta, taken, call, *, scale: float, solves: bool, prefix=None, reads=None) -> tuple:
+    """The scores, the system's inverse less its unit diagonal where the call `solves` (`intra._intra`'s),
+    and the decay's prefix (`intra._prefix`'s, or `prefix` where given, the forward's kept): the prefix's
+    launch, then each sub-chunk's own pairs and their system's inverses a launch of their own
+    (`own_pairs.intra_own`), then the walk placing the own scores and merging the inverse; the system's rows
+    the `reads`' where given."""
+    prefix = _prefix(decays, taken, call) if prefix is None else prefix
+    products = ("scores", "system") if solves else ("scores",)
+    own = own_pairs.intra_own(q, k, prefix, beta, taken, call, scale=scale, products=products, reads=reads)
+    return (*_intra(q, k, prefix, beta, taken, own, call, scale=scale, solves=solves, reads=reads), prefix)
 
 
 def _taken(dtype, family: mosaic.Family | None, *, per_key: bool, rounded: bool, delta: bool,
@@ -305,11 +307,30 @@ def _taken(dtype, family: mosaic.Family | None, *, per_key: bool, rounded: bool,
     return family
 
 
+def _key_weighted(k, v, a, prefix: tuple, beta, taken, call, reads) -> tuple:
+    """Under a decay a key dimension `(w, u, the keys decayed to their chunk's end)` (`mainloop._weighted`'s),
+    the weights the `reads`' where given (`recurrence.Hooks.erase` 'read', `w = X (b beta exp g)`) and the
+    decayed keys the keys' apart (the weighted launch without the delta rule's system)."""
+    if reads is None:
+        return _weighted(k, v, a, prefix, beta, taken, call)
+    w, u, _ = _weighted(reads, v, a, prefix, beta, taken, call)
+    (keys,) = _weighted(k, v, None, prefix, beta, taken, dataclasses.replace(call, delta=False))
+    return w, u, keys
+
+
+def _reads_taken(reads, k, *, delta: bool) -> None:
+    """Refuses `reads` (`forward`'s) the mainloop takes none of: but of the keys' shape, under the delta
+    rule."""
+    if reads is not None and (not delta or reads.shape != k.shape):
+        raise NotImplementedError("the mainloop's keys erase along reads of their own, of the keys' shape, "
+                                  "under the delta rule alone: the portable math takes the rest")
+
+
 def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles, family, interpret,
              firsts=None, inverse=None, kept=None, keeps: bool = True, rounded: bool = False, apart: int = 0,
              values_gated: bool = False, unit_pairs: bool = False,
              decay_bound: float | None = None, ranged: bool = False, forked=None,
-             out_dtype=None, skipped: bool = False) -> _Run:
+             out_dtype=None, skipped: bool = False, reads=None) -> _Run:
     """`forward`'s operands checked, padded and laid, and its launches before the output run: under a decay a
     head the solve's but where its `inverse` is given, and the weighted and states launches' but where their
     `kept` values, `(w, h, corrected, stored, prefix)`, are (`kept_forward`'s; its final memory then None;
@@ -319,14 +340,17 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
     skip is a call's without the delta rule alone (`skipped` with `delta` refused). The solve stores its
     inverse where the call `keeps` it (`_solved`). A forked call's documents, laid as a packed call's are (its
     `starts`, `firsts` and `max_segments`), give `forked` (`tabled`): each row's walk takes up each document's
-    memory from its table (`table.Table`)."""
+    memory from its table (`table.Table`). Where `reads` is given (`forward`'s), the solve and weighted
+    launches form the system's rows and the weights from them (`_reads_taken`)."""
     dtype, per_key = jnp.result_type(q, k, v), g.ndim == 4
+    _reads_taken(reads, k, delta=delta)
     family = _taken(dtype, family, per_key=per_key, rounded=rounded, delta=delta, skipped=skipped)
     batch, length, _, key_width = k.shape
     heads, value_width = v.shape[2:]
     scale = key_width ** -0.5 if scale is None else scale
     width, columns = padded_widths(family, key_width, value_width, kept=keeps, per_key=per_key, tiles=tiles)
-    q, k = (zero_padded(x.astype(dtype), 3, width) for x in (q, k))
+    given_reads = () if reads is None else (reads,)
+    q, k, *reads = (zero_padded(x.astype(dtype), 3, width) for x in (q, k, *given_reads))
     v = zero_padded(v.astype(dtype), 3, columns)
     g = zero_padded(g.astype(jnp.float32), 3, width) if per_key else g.astype(jnp.float32)
     # The delta rule's write gate in the operands' dtype, as fla's layer holds it; without the delta rule the
@@ -368,15 +392,17 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
     # A skip reads the values a launch holds as given (`Call.gated_keys`); else it is added after them.
     landed = jnp.dtype(jnp.float32 if skipped and not call.gated_keys else out_dtype or dtype)
     beta = laid(beta).reshape(rows, heads).T
-    q, k, v = (given.split(laid(x).reshape(rows, -1)) for x in (q, k, v))
+    q, k, v, *reads = (given.split(laid(x).reshape(rows, -1)) for x in (q, k, v, *reads))
+    # The system's rows and the weights the reads' where the call takes them, else the keys'.
+    reads, rows_of = (reads[0], reads[0]) if reads else (None, k)
     a, w, u, keys, scores, system = None, None, v, k, None, []
     decays = laid(g).reshape(rows, -1)
     if per_key:
-        # A decay a key dimension's prefix's limbs `[R, HV * Dk]` and its scores, and its system where the
-        # call solves it (no inverse given), one launch's (`_intra`).
+        # A decay a key dimension's prefix's limbs `[R, HV * Dk]` and its scores, and its system's inverse
+        # where the call solves it (no inverse given), merged after the walk's pairs (`_paired`).
         solves = delta and kept is None and inverse is None
         scores, *system, prefix = _paired(q, k, decays, beta, taken, call, scale=scale, solves=solves,
-                                          prefix=None if kept is None else kept[4])
+                                          prefix=None if kept is None else kept[4], reads=reads)
     else:
         # A decay a head's halves, a head's row of vectors `[HV, R]` each.
         halves = algebra.prefix(decays.reshape(chunks, call.chunk, -1))
@@ -390,28 +416,29 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
         # The forward's inverse given without its states (a recomputed forward, `delta_memory`): its weights
         # from the inverse, the system's launch and the solve not repeated.
         a = inverse
-        w, u, keys = _weighted(k, v, a, prefix, beta, taken, call)
+        w, u, keys = _key_weighted(k, v, a, prefix, beta, taken, call, reads)
     elif per_key and delta:
-        a = _intra_solve(system[0], taken, call)
-        w, u, keys = _weighted(k, v, a, prefix, beta, taken, call)
+        # The walk's inverse (`_paired`'s, merged from the own blocks' after the pairs).
+        a = system[0]
+        w, u, keys = _key_weighted(k, v, a, prefix, beta, taken, call, reads)
     elif per_key:
         (keys,) = _weighted(k, v, None, prefix, beta, taken, call)
     elif delta and inverse is None:
         # The forward's residuals come in pairs: a recomputed forward has neither.
         assert kept is None, "a kept forward keeps its inverse"
         if _solves_apart(call):
-            (a,) = _solved(k, v, *prefix, beta, taken, call, applies=False)
-            w, u = _weighted(k, v, a, prefix, beta, taken, call)
+            (a,) = _solved(k, v, *prefix, beta, taken, call, applies=False, reads=reads)
+            w, u = _weighted(rows_of, v, a, prefix, beta, taken, call)
         else:
-            a, w, u = _solved(k, v, *prefix, beta, taken, call, keeps=keeps)
+            a, w, u = _solved(k, v, *prefix, beta, taken, call, keeps=keeps, reads=reads)
     elif delta:
         a = inverse
         if kept is None:
-            w, u = _weighted(k, v, a, prefix, beta, taken, call)
+            w, u = _weighted(rows_of, v, a, prefix, beta, taken, call)
     h0 = h0.reshape(-1, columns)
     run = _Run(call, tiles, dtype, scale, key_width, value_width, batch, q, k, v, prefix, beta, a,
                w, keys, scores, None, None, None, taken, sequences, laid, unlaid, u=u, h0=h0,
-               table=table, landed=landed)
+               table=table, landed=landed, reads=reads)
     if kept is not None:
         # The forward's saved states, with the delta rule's weights or without them (`w` None).
         (w, h, corrected, stored, _) = kept

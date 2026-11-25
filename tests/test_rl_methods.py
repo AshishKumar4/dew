@@ -15,7 +15,7 @@ import numpy as np
 import optax
 import pytest
 from reference_error import assert_as_exact, assert_computes_the_oracle, chain_roundings
-from rl_support import TinyHead
+from rl_support import TinyHead, completion_length
 
 from dew.config import ObjectiveConfig
 from dew.config.lm import PromptRollout
@@ -85,7 +85,7 @@ def composed(name, model, seq_len, *, max_new_tokens=8, overlong_cache=None, **f
     naming it (`PromptRollout.method`), whose settings the run derives into the objective's
     (`ObjectiveConfig.build`, refusing `fields` the method fixes) and its scheduler's
     (`PromptRollout.scheduler_settings`)."""
-    rollout = PromptRollout(reward="rl_support:completion_length", method=name, max_new_tokens=max_new_tokens,
+    rollout = PromptRollout(reward=completion_length, method=name, max_new_tokens=max_new_tokens,
                             overlong_cache=overlong_cache)
     objective = ObjectiveConfig("grpo", fields).build(model=model, seq_len=seq_len,
                                                        **rollout.objective_settings())
@@ -508,3 +508,33 @@ def test_rloo_pays_its_reference_penalty_in_the_reward_before_the_baseline():
         found = np.asarray(rloo_advantage(jnp.asarray(returns, jnp.float32), 3))
         expected.update({token(task, sample): float(value) for sample, value in enumerate(found)})
     np.testing.assert_array_equal(np.asarray(packed[ADVANTAGES_KEY]) * mask, per_session(packed, expected))
+
+
+@pytest.mark.parametrize("path", ["rl_support:completion_length", "rl_support:LengthReward",
+                                  "dew.rl.sandbox:MathReward"])
+def test_a_rollouts_reward_is_the_callable_its_command_line_names_by_its_path(tmp_path, path):
+    """A GRPO run's reward (`PromptRollout.reward`) is a callable the command line names by its import path,
+    a function or a class, whose instance at its defaults the rollout calls; the run's record names it by
+    that path, so it loads holding the function or the class again, a plain class's (`LengthReward`) whose
+    constructor's arguments its instance holds under other names among them; and a run saved naming it by
+    a string, as before row 11937, loads as one naming it so."""
+    import json
+
+    import rl_support
+
+    from dew.config import earlier_run
+    from dew.config.lm import LMRunConfig
+    from dew.registry import imported
+
+    named = imported(path)
+    run = rl_support.recorded_grpo_config(tmp_path, "--rollout.reward", path)
+    assert run.rollout is not None and run.rollout.reward is named
+    record = json.loads(json.dumps(run.record()))
+    loaded = LMRunConfig.read(record).rollout
+    assert loaded is not None and loaded.reward is named
+    rollout = record["fields"]["rollout"]
+    # Its rollout's record, its fields or a class record of them, with the reward named by its path.
+    fields = {**rollout.get("fields", rollout), "reward": path}
+    rollout = {**rollout, "fields": fields} if "class" in rollout else fields
+    earlier = LMRunConfig.read(earlier_run({**record, "fields": {**record["fields"], "rollout": rollout}}))
+    assert earlier.rollout is not None and earlier.rollout.reward is named

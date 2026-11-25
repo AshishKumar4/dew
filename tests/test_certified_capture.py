@@ -232,3 +232,63 @@ def test_a_programs_kernels_certified_aside_are_lowered_once(tmp_path):
     found = fresh(PROGRAM_LOWERING, platforms="cpu", cache_dir=tmp_path / "cache", flags=keeping_picks())
     assert found["replayed"]["miss"], found
     assert found["lowered"]["miss"] == 0 and found["lowered"]["hit"], found
+
+
+SHARDED_IN_TURN = """
+import json
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+from dew.nn.kernels import grouped_matmul
+from dew.nn.kernels.generation import assumed, compile_only_gpus
+from dew.nn.kernels.templates import report
+from dew.training.runtime import ready_process
+
+events = {"hit": 0, "miss": 0}
+
+
+def heard(event, *args, **kwargs):
+    kind = event.rsplit("/", 1)[-1]
+    if "/pallas/mosaic_gpu/lowering_cache/" in event and kind in events:
+        events[kind] += 1
+
+
+jax.monitoring.register_event_listener(heard)
+ready_process()
+devices = compile_only_gpus("sm90", count=2)
+mesh = Mesh(np.array(devices), ("data",))
+launch = grouped_matmul.MosaicGmm()
+
+
+def shard(x, w):
+    return launch(x, w, jnp.array([x.shape[0]], jnp.int32), out_dtype="bfloat16", trans_rhs=False,
+                  interpret=False)
+
+
+step = jax.jit(jax.shard_map(shard, mesh=mesh, in_specs=(PartitionSpec("data"), PartitionSpec()),
+                             out_specs=PartitionSpec("data"), check_vma=False))
+x = jax.ShapeDtypeStruct((1024, 512), jnp.bfloat16, sharding=NamedSharding(mesh, PartitionSpec("data")))
+w = jax.ShapeDtypeStruct((1, 512, 512), jnp.bfloat16, sharding=NamedSharding(mesh, PartitionSpec()))
+with assumed("sm90"), jax.set_mesh(mesh), report.certifying(devices[0]):
+    step.trace(x, w).lower()
+print(json.dumps({"events": events, "certified": len(report.certifications()),
+                  "uncertified": [str(why) for why in report.uncertified().values()]}))
+"""
+"""A grouped GEMM launch inside a shard_map over two compile-only H100s, its program traced and lowered on
+their mesh (`jax.set_mesh`, as a run's) with its launch certified in turn on the first (`report.certifying`,
+no aside block: a launch past a refusal certifies so): the Mosaic GPU lowering cache's hits and misses, and
+what was certified."""
+
+
+def test_a_launch_certified_in_turn_on_a_mesh_of_two_gpus_is_lowered_once(tmp_path):
+    """A launch in a shard_map on two GPUs certified in turn is lowered once in Python: its certification
+    lowers it on the program's mesh, its axes manual (`report._certifying_placement`), and the program reads
+    it back from the lowering cache. On a mesh of its own on the first GPU, its lowering was keyed apart from
+    the program's by its jaxpr and abstract values, its meshes and its axis environment, and the program
+    lowered it again (rows 6327, 12462)."""
+    found = fresh(SHARDED_IN_TURN, platforms="cpu", cache_dir=tmp_path / "cache", flags=keeping_picks())
+    assert found["certified"] == 1 and not found["uncertified"], found
+    assert found["events"] == {"hit": 1, "miss": 1}, found

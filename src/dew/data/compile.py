@@ -1987,7 +1987,7 @@ def _diagnostic(pipeline: Pipeline, *, records: int | None = None) -> _Host:
     A bounded record pass runs lazily without loader read-ahead or
     eager memory transforms, and leaves its counters in the Grain state.
     """
-    read = pipeline.mode or _preferred_read((pipeline,), provision=True)
+    read = held_read(pipeline)
     loading = (pipeline._loading or _DEFAULT_LOADING).unsized()
     if records is not None:
         pipeline = pipeline._then(Limit(records))
@@ -2140,7 +2140,7 @@ def fitted[Entry](
         counting = (count_passes and examples is None and epochs is None
                     and not isinstance(chain.source, Phases))
         trained = chain if examples is not None or epochs is not None else _endless(chain)
-        read = trained.mode or _preferred_read((trained,), provision=True)
+        read = held_read(trained)
         # A run of phases compiles each phase on its own (`_compile_phases`), each binding the widths
         # measured over every phase and held chain (data.md §10, `run_widths`).
         phased = isinstance(trained.source, Phases) and examples is None

@@ -71,12 +71,13 @@ def _prefetched_walk(x, segments: tuple[tuple[int, int], ...], interpret=INTERPR
 @INTERPRETS
 def test_a_traced_empty_common_segment_prefetches_nothing():
     """Interpreted: two consumers' common segments, their bounds traced, of no step, one step and three steps
-    each prefetch once as they start and once at each step's boundary, so the one-step and three-step
-    segments prefetch 2 and 4 times; the empty one, its pipeline not run, none (where it prefetched its
-    first slot, which no copy filled). Each consumer's sum is every walked step's tile."""
+    each prefetch once a step: the first step's as they start, each later one's at the step before's
+    boundary, none past the last step (whose slot no copy fills), so the one-step and three-step segments
+    prefetch 1 and 3 times; the empty one, its pipeline not run, none (where it prefetched its first slot,
+    which no copy filled). Each consumer's sum is every walked step's tile."""
     x = jnp.asarray(np.arange(STEPS * ROWS * WIDTH).reshape(STEPS * ROWS, WIDTH) % 7, jnp.bfloat16)
     sums, counts = _prefetched_walk(x, ((0, 0), (0, 1), (1, STEPS)))
-    np.testing.assert_array_equal(np.asarray(counts), [2 + 4] * CONSUMERS)
+    np.testing.assert_array_equal(np.asarray(counts), [1 + 3] * CONSUMERS)
     expected = np.asarray(x, np.float32).reshape(STEPS, ROWS, WIDTH).sum(axis=0)
     for summed in np.asarray(sums):
         np.testing.assert_array_equal(summed, expected)

@@ -260,6 +260,11 @@ def holds(field, option) -> bool:
     return kinds(option) <= kinds(field)
 
 
+CONFIG_MODULES = ("dew.config", "dew.decision.config")
+"""The modules of a run's sections, whose fields reach a saved task's options (`reach`): a decision run's rows
+and context among them (`RowBudgets`, `CrossContext`)."""
+
+
 def reach(run: RunConfig, objective: str, name: str, annotation, argument: bool = True) -> Reach | None:
     """Where `dew train` sets a saved task's option `name` of `annotation`: a field of the run, or of a
     section it holds, declared of that type (a number or a text's of that name) or a builder of it
@@ -267,17 +272,22 @@ def reach(run: RunConfig, objective: str, name: str, annotation, argument: bool 
     # A number's or a text's field is the option's by its name; any other type's, by its type.
     named = bare(annotation) in (int, float, str, bool)
 
-    def paths(config, prefix: str):
-        hints = annotations_of(type(config), include_extras=True)
-        for field in dataclasses.fields(config):
-            value, hint = getattr(config, field.name), hints[field.name]
-            if field.name == name if named else holds(bare(hint), bare(annotation)):
+    def paths(kind: type, prefix: str):
+        hints = annotations_of(kind, include_extras=True)
+        for field in dataclasses.fields(kind):
+            hint = hints[field.name]
+            # A section's field names its option by its path, its dots as underscores (a decision run's
+            # `context.encoder`, the settings' `context_encoder`).
+            if (name in (field.name, f"{prefix}{field.name}".replace(".", "_")) if named
+                    else holds(bare(hint), bare(annotation))):
                 yield Reach(prefix + field.name, hint)
             elif not named and builds(hint, annotation):
                 yield Reach(prefix + field.name, hint, builds=True)
-            elif dataclasses.is_dataclass(value) and type(value).__module__.startswith("dew.config"):
-                yield from paths(value, f"{prefix}{field.name}.")
-    found = next(paths(run, ""), None)
+            # A section by its declared class, one a run holds unset among them (a decision run's context).
+            elif (isinstance(section := bare(hint), type) and dataclasses.is_dataclass(section)
+                  and section.__module__.startswith(CONFIG_MODULES)):
+                yield from paths(section, f"{prefix}{field.name}.")
+    found = next(paths(type(run), ""), None)
     if found is None and argument and name in inspect.signature(objectives[objective]).parameters:
         return Reach(f"objective.{name}", annotation)
     return found

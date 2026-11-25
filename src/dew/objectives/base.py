@@ -63,6 +63,7 @@ from dew.batch import (
     unboxed,
 )
 from dew.distributed.placement import Layout, RefinesLayout
+from dew.nn.dense import NVFP4_AMAX
 from dew.nn.derivatives import contracted, surrogate
 from dew.nn.inspection import INSPECTED, QK, Watched, watching
 from dew.nn.kernels.generation import drawing
@@ -404,9 +405,10 @@ def stream(name: str) -> int:
     return fold
 
 
-OBSERVED = (QK, INSPECTED)
-"""The collections a model call sows what a step observes in (`Step.observed`): its attention logit maxima
-and its watched activations, each a pass's own, which no state holds (`Objective.init`)."""
+OBSERVED = (QK, INSPECTED, NVFP4_AMAX)
+"""The collections a model call sows what a step observes in (`Step.observed`): its attention logit maxima,
+its watched activations and its delayed-scaling NVFP4 projections' rows' largest magnitudes, each a pass's
+own, which no state holds (`Objective.init`)."""
 
 
 @struct.dataclass
@@ -473,24 +475,31 @@ class Step:
     """Detached statistics over the step's logical minibatch (`Objective.batch_statistics`), computed
     once at a split step's first microbatch and held across its parts; None where the step is read whole
     or the objective states none."""
+    amax: bool = struct.field(pytree_node=False, default=False)
+    """Whether the run's variables hold the amax histories of a delayed-scaling NVFP4 recipe's projections
+    (`dew.nn.dense.NVFP4_HISTORY`, row 12721): the objective opens the `NVFP4_AMAX` collection in the model
+    calls it trains through and returns what they recorded (`Aux.amax`), which the trainer rolls into the
+    histories once per committed update. Static, as `qk_stats` is."""
 
     def sown(self, *collections: str) -> list[str]:
         """The collections a model call the objective trains through opens: `collections`, the ones its
-        objective reads, and those the step asks for, `qk` where the optimizer clips by it and
-        `inspected` where the step watches activations. A call opening none returns an empty mapping
-        beside its output."""
+        objective reads, and those the step asks for, `qk` where the optimizer clips by it,
+        `inspected` where the step watches activations and `nvfp4_amax` where the run's projections keep
+        amax histories (`amax`). A call opening none returns an empty mapping beside its output."""
         return [*collections, *([QK] if self.qk_stats else []),
-                *([INSPECTED] if self.watched is not None else [])]
+                *([INSPECTED] if self.watched is not None else []), *([NVFP4_AMAX] if self.amax else [])]
 
-    def observed(self, sown: Variables) -> tuple[Variables | None, Variables | None]:
+    def observed(self, sown: Variables) -> tuple[Variables | None, Variables | None, Variables | None]:
         """What a model call that opened `sown()` sowed for the step: the attention logit maxima where
-        the optimizer clips by them (`Aux.qk_stats`), each layer's at its weights' path, and the watched
-        activations (`Aux.inspected`). Each is None where the step asked for none: every objective that
+        the optimizer clips by them (`Aux.qk_stats`), each layer's at its weights' path, the watched
+        activations (`Aux.inspected`), and the rows' largest magnitudes its delayed-scaling NVFP4
+        projections recorded (`Aux.amax`). Each is None where the step asked for none: every objective that
         opens them returns them, as a run whose optimizer clips by the maxima refuses a step returning
         none (row 1608: a decision, supervised or continuous diffusion run under 'muonclip' took no
-        update)."""
+        update), and a run that keeps amax histories one returning none of its largest magnitudes."""
         return (sown.get(QK, {}) if self.qk_stats else None,
-                sown.get(INSPECTED, {}) if self.watched is not None else None)
+                sown.get(INSPECTED, {}) if self.watched is not None else None,
+                sown.get(NVFP4_AMAX, {}) if self.amax else None)
 
     def places(self, rows: int) -> tuple[jax.Array, int]:
         """The places among the update's examples of a batch's `rows` rows (`examples`) and how many
@@ -645,6 +654,12 @@ class Aux(Generic[Effects]):
     pooled: Mapping[str, Pooled] = struct.field(default_factory=dict)
     """The statistics behind the metrics stated as `Pooled`, by name, which the trainer pools across a
     step's microbatches (`dew.training.planning.whole_step`); set from `metrics` as an Aux is made."""
+    amax: Variables | None = None
+    """The `nvfp4_amax` collection a delayed-scaling NVFP4 recipe's projections sowed (`Step.amax`,
+    `dew.nn.dense.NVFP4_AMAX`), named and nested as their histories (`dew.nn.dense.NVFP4_HISTORY`), each a
+    tuple of its calls' largest magnitudes, which the trainer takes the largest of across the calls and a
+    window's microbatches and rolls into the histories once per committed update (`dew.nn.dense.rolled`).
+    None where the step asked for none (`Step.amax`)."""
 
     def __post_init__(self):
         # A metric stated as a statistic reads as its value; the statistic is kept for the trainer's pooling.
@@ -757,7 +772,9 @@ def with_projected(variables: Variables, project: Callable[[Variables], Variable
 
 def projected_draw(owner: nn.Module, variables: Variables) -> Variables:
     """A module's freshly drawn tree as training stores it: its parameters projected
-    once by `owner`'s constraint (`updated=True`), as is where it declares none."""
+    once by `owner`'s constraint (`updated=True`), as is where it declares none, and none of what its draw's
+    pass observed (`OBSERVED`), as `Objective.init` keeps none: a step's records are its own pass's."""
+    variables = {name: tree for name, tree in variables.items() if name not in OBSERVED}
     if not isinstance(owner, ProjectsParameters):
         return variables
     return with_projected(variables, functools.partial(owner.projected, updated=True))
@@ -1009,8 +1026,8 @@ class Objective(ABC, Generic[Loss, Effects]):
     own, beside its bases' (`resumed_freely`)."""
     executed: ClassVar[tuple[str, ...]] = ()
     """The settings that say how its programs execute and not what they compute (a head's tiling, which a
-    fit's ladder sets), which a resume may change, as a model's `RunConfig.EXECUTED` fields; a class's own,
-    beside its bases' (`resumed_freely`)."""
+    fit's ladder sets), which a resume may change, as a model's own run fields (`dew._records.RUNS`); a
+    class's own, beside its bases' (`resumed_freely`)."""
     ema_is_reference: ClassVar[bool] = False
     """Whether the objective's average is the frozen reference its loss compares against (an RL
     policy's), which validation, `pipeline` and a saved run's loader never read as the trained weights."""
@@ -1306,11 +1323,6 @@ class Objective(ABC, Generic[Loss, Effects]):
         trainer keeps never take them on.
         """
         return ()
-
-    def _updates_in_backward(self) -> bool:
-        """Whether each stacked layer run this objective's loss differentiates is differentiated once,
-        so its backward may update it in place (`dew.nn.in_backward`)."""
-        return True
 
     def stage_sites(self, store: Variables, stages: int) -> tuple[DecoderBank, ...]:
         """Where the runs a pipeline over `stages` stages stacks lie in `store`, the variables a
