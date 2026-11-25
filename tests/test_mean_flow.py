@@ -6,6 +6,7 @@ built around it."""
 import jax
 import jax.numpy as jnp
 import numpy as np
+from arm_arithmetic import ahead_on_the_host
 from float64_replay import float64_replay
 from model_support import attending
 from reference_error import as_given, assert_as_exact, widened
@@ -142,7 +143,8 @@ def meanflow_case(kernel: str):
     # Each a program of its own (row 6857): run op by op, the model's initializer, and check 1's one call
     # of each arm on a draw holding NumPy arrays (`reference_error._refuse_numpy_arms`), compiled over a
     # thousand small programs on the GPU a cell holds.
-    template = attending("xla")(jax.jit(xla.init))(jax.random.PRNGKey(0))
+    with ahead_on_the_host():  # on the host, before its site, as a GPU tier part's prepare runs it (row 8028)
+        template = attending("xla")(jax.jit(xla.init))(jax.random.PRNGKey(0))
     tokens = xla.inputs.tokenize(["a", "b", "c", "d"] * 4)
 
     @attending("xla")

@@ -25,6 +25,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from arm_arithmetic import ahead_on_the_host
 from interop_support import extract_fixture
 from model_support import attending
 from qwen_image_draws import case_draw, pipeline_draw, prompts_of
@@ -173,12 +174,14 @@ def cudnn_case():
     the float64 twin's on xla, over latents, contexts and probes drawn by seed."""
     model = QwenImageTransformer(in_channels=4, out_channels=4, num_layers=2, heads=2, head_dim=64,
                                  context_in_dim=16, axes_dims_rope=(16, 24, 24), dtype=jnp.bfloat16)
-    mask = jnp.arange(25)[None] < jnp.asarray([[25], [13]])
-    times = jnp.asarray([731.0, 42.0])
-    # One program (row 6857): run op by op, the initializer compiled hundreds of small programs on the GPU the
-    # cell holds.
-    params = attending("cudnn")(jax.jit(model.init))(jax.random.PRNGKey(0), jnp.zeros((2, 4, 6, 4)), times,
-                                 DenoisingCondition(jnp.zeros((2, 25, 16)), mask=mask))["params"]
+    # On the host, before its site, as a GPU tier part's prepare runs it (row 8028); one program (row 6857):
+    # run op by op, the initializer compiled hundreds of small programs on the GPU the cell holds.
+    with ahead_on_the_host():
+        mask = jnp.arange(25)[None] < jnp.asarray([[25], [13]])
+        times = jnp.asarray([731.0, 42.0])
+        condition = DenoisingCondition(jnp.zeros((2, 25, 16)), mask=mask)
+        initialized = attending("cudnn")(jax.jit(model.init))
+        params = initialized(jax.random.PRNGKey(0), jnp.zeros((2, 4, 6, 4)), times, condition)["params"]
 
     @jax.jit
     def draw(seed):
