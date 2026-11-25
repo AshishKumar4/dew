@@ -40,7 +40,7 @@ from flax.core.scope import DenyList
 from flax.linen.transforms import lift_direct_transform
 from jax.sharding import NamedSharding
 
-from dew.batch import sows_appended, unboxed
+from dew.batch import Coordinates, sows_appended, unboxed
 from dew.mesh import FSDP_AXIS, mesh_axes
 from dew.nn.dense import captures_any_method
 
@@ -968,9 +968,17 @@ def _token_aligned(passes: _Passes, x: jax.Array) -> bool:
     `[B, H, S, S]` or a CSA2 layer's compressed entries `[B, S // rate, D]` holds the rows alone, and a pass
     reading or leaving one runs over every row."""
     batch, length = x.shape[:2]
-    return all(not isinstance(leaf, jax.Array | np.ndarray) or leaf.ndim == 0 or leaf.shape[0] != batch
-               or leaf.shape[:2] == (batch, length)
-               for leaf in jax.tree.leaves((passes.inputs, passes.prelude, passes.left)))
+    return all(_coordinates(leaf) or not isinstance(leaf, jax.Array | np.ndarray) or leaf.ndim == 0
+               or leaf.shape[0] != batch or leaf.shape[:2] == (batch, length)
+               for leaf in jax.tree.leaves((passes.inputs, passes.prelude, passes.left),
+                                           is_leaf=_coordinates))
+
+
+def _coordinates(node) -> bool:
+    """Whether `node` is a call's token coordinates (`dew.batch.Coordinates`), every array of which is a
+    row's own (its tokens' fields `[B, S]`, its documents' `firsts` and forks' parents `[B, D]`, each
+    numbered within its row): `compacted` gathers them by row whole."""
+    return isinstance(node, Coordinates)
 
 
 def compacted(ran: Callable, module, carry, normed, rows: jax.Array, passes: _Passes):
@@ -979,8 +987,9 @@ def compacted(ran: Callable, module, carry, normed, rows: jax.Array, passes: _Pa
     B // 2, ..., 1]`, one program a size under `lax.switch`), with every array of the call's inputs, the
     prelude's publications, the block's input and the step norm's `normed` whose leading axes are the
     call's rows and tokens, and scattered back: a pass over fewer rows computes fewer, a row that exited
-    none (row 12927). A row in the bucket beside them runs the pass too, its state no output reads. A call
-    holding a row-holding array beside them (`_token_aligned`) runs its passes over every row."""
+    none (row 12927). The call's coordinates gather by row whole (`_coordinates`). A row in the bucket beside
+    them runs the pass too, its state no output reads. A call holding a row-holding array beside them
+    (`_token_aligned`) runs its passes over every row."""
     x, _ = carry
     batch, length = x.shape[:2]
     sizes = [batch]
@@ -997,7 +1006,11 @@ def compacted(ran: Callable, module, carry, normed, rows: jax.Array, passes: _Pa
         return isinstance(leaf, jax.Array | np.ndarray) and leaf.shape[:2] == (batch, length)
 
     def taken(tree, picked):
-        return jax.tree.map(lambda leaf: jnp.asarray(leaf)[picked] if rowed(leaf) else leaf, tree)
+        def row_of(leaf):
+            if _coordinates(leaf):
+                return jax.tree.map(lambda array: jnp.asarray(array)[picked], leaf)
+            return jnp.asarray(leaf)[picked] if rowed(leaf) else leaf
+        return jax.tree.map(row_of, tree, is_leaf=_coordinates)
 
     def put(whole, part, picked):
         return jax.tree.map(lambda full, each: full.at[picked].set(each) if rowed(full) else each,

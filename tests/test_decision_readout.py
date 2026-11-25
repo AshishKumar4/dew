@@ -23,7 +23,7 @@ from test_decision_objective import SPECIALS, TOKENIZER
 
 from dew.batch import part, thaw
 from dew.decision import Choice
-from dew.decision.head import LabelReadout, SlotReadout
+from dew.decision.head import LabelReadout, SlotReadout, answer_states
 from dew.decision.inputs import DecisionInputs
 from dew.decision.layout import Labels, SegmentLayout
 from dew.decision.model import DecisionModel
@@ -31,7 +31,7 @@ from dew.decision.objective import DecisionObjective
 from dew.interop import Pretrained
 from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.protocols import OutputTable
+from dew.nn.protocols import EXIT_PASSES, OutputTable
 from dew.quantization import InputQuantizer
 
 LLAMA = Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny"
@@ -363,7 +363,8 @@ def test_a_decision_models_exit_logits_run_each_later_pass_over_its_rows_still_l
     """Scoring a readout of labels over a backbone whose rows exit whole at its threshold (`exit_by='row'`)
     through the decision model's `exit_logits`, which opens the exit passes alone, runs each later pass
     over the batch's halvings that hold its rows still looping (`looping.compacted`, row 12927): eight
-    rows' pass a program for eight, four, two and one."""
+    rows' pass a program for eight, four, two and one: its logits and each answer's exit pass those of a
+    forward whose passes run over every row (one opening a collection beside the exit passes)."""
     looped = backbone().with_passes(3, (0, 2), exit_gate=True, exit_threshold=0.5)
     looped = looped.clone(loop=dataclasses.replace(looped.loop, exit_at="block", exit_by="row"))
     objective = DecisionObjective(looped, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
@@ -374,6 +375,13 @@ def test_a_decision_models_exit_logits_run_each_later_pass_over_its_rows_still_l
     buckets = [eqn for eqn in equations(traced)
                if eqn.primitive.name == "cond" and len(eqn.params["branches"]) == 4]
     assert len(buckets) == looped.loop.steps - 1
+    logits, passes = jax.jit(lambda values: objective.model.exit_logits(values, batch))(variables)
+    whole, sown = jax.jit(lambda values: objective.model.observed_logits(
+        values, batch, opened=(EXIT_PASSES, "intermediates")))(variables)
+    (chosen,) = jax.tree.leaves(sown[EXIT_PASSES])
+    np.testing.assert_array_equal(np.asarray(logits), np.asarray(whole))
+    np.testing.assert_array_equal(np.asarray(passes),
+                                  np.asarray(answer_states(chosen[..., None], batch)[..., 0]))
 
 
 @attending("xla")
