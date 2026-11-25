@@ -1245,18 +1245,19 @@ def test_a_kernels_erf_and_atan2_issue_their_polynomials(approx):
                               compiler_params=plgpu.CompilerParams(approx_math=approx))
         traced = jax.make_jaxpr(launch)(row).jaxpr
         (kernel,) = [equation for equation in programs.equations(traced)
-                     if equation.primitive.name in ("mpmd_map", "pallas_call")]
+                     if equation.primitive in programs.NATIVE_KERNELS]
         return emission.launch_work(kernel, Stated(steps=0, bytes_accessed=0))
 
     with generation.assumed("sm90"):
         copied = work(lambda rows: rows, jnp.float32)
         erf = work(lax.erf, jnp.float32)
-        atan2 = work(lambda rows: lax.atan2(rows, rows), jnp.float32)
+        atan2 = work(lambda rows: lax.atan2(rows, rows + 1), jnp.float32)
         narrow = {name: work(operation, jnp.bfloat16) for name, operation in (
             ("copied", lambda rows: rows), ("erf", lax.erf), ("atan2", lambda rows: lax.atan2(rows, rows)))}
     added = {unit: (getattr(erf, unit) - getattr(copied, unit), getattr(atan2, unit) - getattr(copied, unit))
              for unit in ("exponentials", "operations", "integer_operations", "unpriced_operations")}
-    assert added == {"exponentials": (128, 2 * 128), "operations": (21 * 128, (30 + 7) * 128),
+    # atan2's divisor, `rows + 1`, an fp32 add an element beside its form.
+    assert added == {"exponentials": (128, 2 * 128), "operations": (21 * 128, (30 + 7 + 1) * 128),
                      "integer_operations": (2 * 128, 3 * 128), "unpriced_operations": (0, 0)}, added
     assert narrow["erf"].operations - narrow["copied"].operations == 128, narrow
     assert narrow["atan2"].unpriced_operations - narrow["copied"].unpriced_operations == 128, narrow
