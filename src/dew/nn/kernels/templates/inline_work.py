@@ -439,10 +439,11 @@ def _assembly(text: str, active: np.ndarray, operand: Callable) -> Work:
     """Inline PTX's work, an instruction at a time: float arithmetic on the fp32 lanes (a packed pair's, `x2`,
     two an instruction), special functions on their units, integer arithmetic and bit manipulation on the
     integer units (a multiply on the FMA pipe; a compare's setp and a select's selp each an issue, ISETP and
-    SEL, as `BitOp.issues` prices them; adds accumulating into one register, after an immediate's move, one
-    IADD3 of up to three operands, as ptxas fuses them), a conversion at the conversions' rate, a load or
-    store its active lanes' bytes; a shuffle, a move and synchronization free (scalar, a lane's exchange); a
-    global atomic its word read and written by each lane that runs it. An instruction guarded
+    SEL, as `BitOp.issues` prices them; unpredicated 32-bit adds accumulating into one register, after an
+    immediate's move or an add into it, one IADD3 of up to three operands, as ptxas fuses them), a
+    conversion at the conversions' rate, a load or store its active lanes' bytes; a shuffle, a move and
+    synchronization free (scalar, a lane's exchange); a global atomic its word read and written by each lane
+    that runs it. An instruction guarded
     (`@p`, `@!p`) runs on the `active` lanes that may take its guard: an operand's (`$N`, `operand`), or a
     predicate the block sets itself from operands and immediates whose lanes are known (`setp`, and-ed or
     or-ed with another predicate: an elected lane's, a last arriver's among it); a memory instruction whose

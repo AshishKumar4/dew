@@ -477,7 +477,16 @@ def launch_seconds(work: Work, programs: int, target: generation.GpuTarget, *,
     per_sm = spread(count, target.multiprocessors or 1)
     waves = spread(count, wave(target.multiprocessors, resident))
     at = rates(target, device=False)
-    unit_seconds = max(*units(per_program, at)[0],
-                       latency_bound(per_program, at, target, held=min(resident, per_sm) * warps))
-    wave_seconds = max(per_sm * unit_seconds, waves * path(per_program, target))
+    throughput = max(units(per_program, at)[0])
+
+    def resident_wave(held: int) -> float:
+        # `held` programs at once on a multiprocessor: their units shared, their warps hiding each other's
+        # issue intervals.
+        return held * max(throughput, latency_bound(per_program, at, target, held=held * warps))
+
+    # Its full waves at the residency it holds, then its last at the programs left (the review of
+    # lane/toolkit 61dd3c7d2: three programs at two resident are a wave of two and one of one).
+    full, left = divmod(per_sm, max(1, min(resident, per_sm)))
+    busiest = full * resident_wave(min(resident, per_sm)) + (resident_wave(left) if left else 0.0)
+    wave_seconds = max(busiest, waves * path(per_program, target))
     return max(wave_seconds + (target.launch_seconds or 0.0), seconds(work, target))
