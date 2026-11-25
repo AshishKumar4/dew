@@ -26,7 +26,7 @@ from dew.nn.kernels.templates import (
     merged,
     merged_mosaic,
 )
-from dew.nn.kernels.templates.hooks import Side
+from dew.nn.kernels.templates.hooks import Hook, Side
 
 SPECS = {"natural": algebra.finished_form(algebra.Forward("full", 3, ids=False, scale=1.0, natural=True)),
          "fold": algebra.finished_form(algebra.Forward("full", 3, ids=False, scale=0.125, natural=False,
@@ -433,7 +433,7 @@ def test_a_padded_merge_lowers_on_triton_where_mosaic_measured_slower():
 
     def hooked(p, s):
         return merged.merged_finished(spec, p, s, queries=2, width=16, out_dtype=jnp.bfloat16, out_heads=2,
-                                      output_mod=jax.nn.sigmoid)
+                                      output=Hook(jax.nn.sigmoid))
 
     launches._register_mosaic_gpu_lowerings()
     assert jcore.primitives.platform_index_p not in mosaic_lowering.mosaic_lowering_rules[
@@ -946,7 +946,7 @@ def test_a_finished_split_merge_fuses_output_hooks_across_kinds_vmap_and_jvp():
         for init in (None, initial):
             got = merged.merged_finished(spec, padded, stacked, queries=queries, width=width,
                                          out_dtype=jnp.bfloat16, out_heads=out_heads, initial=init,
-                                         output_mod=mod, output_params=params)
+                                         output=Hook(mod, params))
             state = merged.merged_split(spec, padded, stacked, queries=queries, width=width, initial=init)
             base = template.ungrouped_rows(
                 algebra.finish(spec, state, initial=True, normalized=True)[0], out_heads)
@@ -963,21 +963,18 @@ def test_a_finished_split_merge_fuses_output_hooks_across_kinds_vmap_and_jvp():
 
     ref_both = merged.merged_finished(
         spec, padded, stacked, queries=queries, width=width, out_dtype=jnp.bfloat16, out_heads=out_heads,
-        output_mod=gated_mod,
-        output_params=(Side(gate, template.Kind.OUTPUT),
-                       Side(head_scale, template.Kind.HEAD)))
+        output=Hook(gated_mod, (Side(gate, template.Kind.OUTPUT),
+                                Side(head_scale, template.Kind.HEAD))))
     vmapped = jax.vmap(lambda p, s, g: merged.merged_finished(
         spec, p, s, queries=queries, width=width, out_dtype=jnp.bfloat16, out_heads=out_heads,
-        output_mod=gated_mod,
-        output_params=(Side(g, template.Kind.OUTPUT),
-                       Side(head_scale, template.Kind.HEAD))))(
+        output=Hook(gated_mod, (Side(g, template.Kind.OUTPUT),
+                                Side(head_scale, template.Kind.HEAD)))))(
         padded[None], stacked[None], gate[None])
     np.testing.assert_array_equal(np.asarray(vmapped[0]), np.asarray(ref_both))
     vmapped_head = jax.vmap(lambda p, s, g, h: merged.merged_finished(
         spec, p, s, queries=queries, width=width, out_dtype=jnp.bfloat16, out_heads=out_heads,
-        output_mod=gated_mod,
-        output_params=(Side(g, template.Kind.OUTPUT),
-                       Side(h, template.Kind.HEAD))))(
+        output=Hook(gated_mod, (Side(g, template.Kind.OUTPUT),
+                                Side(h, template.Kind.HEAD)))))(
         padded[None], stacked[None], gate[None], head_scale[None])
     np.testing.assert_array_equal(np.asarray(vmapped_head[0]), np.asarray(ref_both))
 
@@ -987,8 +984,7 @@ def test_a_finished_split_merge_fuses_output_hooks_across_kinds_vmap_and_jvp():
     def fn(p, g):
         return merged.merged_finished(
             spec, p, stacked, queries=queries, width=width, out_dtype=jnp.float32, out_heads=out_heads,
-            output_mod=lambda o, x: o * jax.nn.sigmoid(x),
-            output_params=(Side(g, template.Kind.OUTPUT),))
+            output=Hook(lambda o, x: o * jax.nn.sigmoid(x), (Side(g, template.Kind.OUTPUT),)))
 
     def law(p, g):
         st = algebra.merged_state(spec, *merged._trimmed(p, stacked, queries=queries, width=width))
@@ -1005,12 +1001,8 @@ def test_a_finished_split_merge_fuses_output_hooks_across_kinds_vmap_and_jvp():
     with pytest.raises(ValueError):
         merged.merged_finished(spec, padded, stacked, queries=queries, width=width, out_dtype=jnp.bfloat16,
                                out_heads=out_heads,
-                               output_params=(Side(gate, template.Kind.OUTPUT),))
-    with pytest.raises(ValueError):
-        merged.merged_finished(spec, padded, stacked, queries=queries, width=width, out_dtype=jnp.bfloat16,
-                               out_heads=out_heads, output_mod=lambda o, k: o + k,
-                               output_params=(Side(jnp.zeros((batch, out_heads, 8)),
-                                                             template.Kind.KEY),))
+                               output=Hook(lambda o, k: o + k,
+                                           (Side(jnp.zeros((batch, out_heads, 8)), template.Kind.KEY),)))
 
 
 def test_a_finished_split_merge_vmaps_query_params_and_keys_hooks_by_dtype_and_context():
@@ -1032,21 +1024,21 @@ def test_a_finished_split_merge_vmaps_query_params_and_keys_hooks_by_dtype_and_c
     p2, s2 = jnp.stack([padded, padded * 0.5], axis=0), jnp.stack([stacked, stacked], axis=0)
     got_sh = jax.vmap(lambda p, s, q: merged.merged_finished(
         spec, p, s, queries=queries, width=width, out_dtype=jnp.bfloat16, out_heads=out_heads,
-        output_mod=lambda o, x: o + x, output_params=(Side(q, template.Kind.QUERY),)))(
+        output=Hook(lambda o, x: o + x, (Side(q, template.Kind.QUERY),))))(
         p2, s2, q_shared_v)
     for idx in range(2):
         ref_i = merged.merged_finished(
             spec, p2[idx], s2[idx], queries=queries, width=width, out_dtype=jnp.bfloat16,
-            out_heads=out_heads, output_mod=lambda o, x: o + x,
-            output_params=(Side(q_shared_v[idx], template.Kind.QUERY),))
+            out_heads=out_heads,
+            output=Hook(lambda o, x: o + x, (Side(q_shared_v[idx], template.Kind.QUERY),)))
         np.testing.assert_array_equal(np.asarray(got_sh[idx]), np.asarray(ref_i))
     got_unsh = jax.vmap(lambda p, s, q: merged.merged_finished(
         spec, p, s, queries=queries, width=width, out_dtype=jnp.bfloat16, out_heads=out_heads,
-        output_mod=lambda o, x: o * x, output_params=(Side(q, template.Kind.QUERY),)))(
+        output=Hook(lambda o, x: o * x, (Side(q, template.Kind.QUERY),))))(
         padded[None], stacked[None], query_scale[None])
     ref_unsh = merged.merged_finished(
         spec, padded, stacked, queries=queries, width=width, out_dtype=jnp.bfloat16, out_heads=out_heads,
-        output_mod=lambda o, x: o * x, output_params=(Side(query_scale, template.Kind.QUERY),))
+        output=Hook(lambda o, x: o * x, (Side(query_scale, template.Kind.QUERY),)))
     np.testing.assert_array_equal(np.asarray(got_unsh[0]), np.asarray(ref_unsh))
     # A gate shared across the batch (`Kind.OUTPUT`, `[1, T, H, Dv]` a mapped element) reads as each row's.
     shared_gate = jax.random.normal(k4, (1, tokens, out_heads, width), jnp.bfloat16)
@@ -1055,7 +1047,7 @@ def test_a_finished_split_merge_vmaps_query_params_and_keys_hooks_by_dtype_and_c
     def gated(p, s, g):
         return merged.merged_finished(
             spec, p, s, queries=queries, width=width, out_dtype=jnp.bfloat16, out_heads=out_heads,
-            output_mod=lambda o, x: o * x, output_params=(Side(g, template.Kind.OUTPUT),))
+            output=Hook(lambda o, x: o * x, (Side(g, template.Kind.OUTPUT),)))
 
     got_gated = jax.vmap(gated)(p2, s2, gates)
     for idx in range(2):
@@ -1149,8 +1141,8 @@ def test_a_finished_split_merge_with_output_hooks_compiles_spill_free_and_matche
     def call(p, s, *extra_p, fn=mod, param_kinds=kinds):
         return merged.merged_finished(
             spec, p, s, queries=queries, width=width, out_dtype=jnp.bfloat16, out_heads=out_heads,
-            output_mod=fn, output_params=tuple(
-                Side(val, k) for val, k in zip(extra_p, param_kinds, strict=True)))
+            output=Hook(fn, tuple(
+                Side(val, k) for val, k in zip(extra_p, param_kinds, strict=True))))
 
     bool_gate = jax.ShapeDtypeStruct((batch, tokens, out_heads, width), jnp.bool_)
     int_head = jax.ShapeDtypeStruct((out_heads,), jnp.int32)
@@ -1222,6 +1214,6 @@ def test_a_finished_merge_reads_its_output_parameters_as_a_launch_keeps_them():
         gate = jnp.full((batch, tokens, kv_heads * group, width), 1 + 2.0 ** -25, jnp.float64)
         out = merged.merged_finished(
             spec, padded, stacked, queries=tokens * group, width=width, out_dtype=jnp.float32,
-            out_heads=kv_heads * group, output_mod=lambda o, g: o * (g - 1),
-            output_params=(Side(gate, template.Kind.OUTPUT),))
+            out_heads=kv_heads * group,
+            output=Hook(lambda o, g: o * (g - 1), (Side(gate, template.Kind.OUTPUT),)))
     np.testing.assert_array_equal(np.asarray(out), 0.0)

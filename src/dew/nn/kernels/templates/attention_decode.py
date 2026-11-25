@@ -62,7 +62,7 @@ def packable(hooks: Hooks | None) -> bool:
         return True
     if hooks.score.sides or hooks.drop is not None:
         return False
-    if merged.output_hook_refusal(hooks.output.fn, hooks.output.sides) is not None:
+    if merged.output_hook_refusal(hooks.output) is not None:
         return False
     return hooks.score.fn is None or not _reads_places(hooks.score.fn)
 
@@ -383,7 +383,7 @@ def _planned_step(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                 return merged.merged_finished(
                     spec, out, jnp.stack([maximum, total]), queries=queries, width=width,
                     out_dtype=query.dtype, out_heads=heads, initial=initial,
-                    output_mod=hooks.output.fn, output_params=hooks.output.sides)
+                    output=hooks.output)
             state = algebra.merged_state(spec, out, maximum, total, initial)
         else:
             # The slices merged where the launch wrote them (`merged_finished` / `merged_split`), fusing any
@@ -392,8 +392,7 @@ def _planned_step(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
             if finished:
                 return merged.merged_finished(spec, walked_out.padded, walked_out.stacked, queries=queries,
                                               width=width, out_dtype=query.dtype, out_heads=heads,
-                                              initial=initial, output_mod=hooks.output.fn,
-                                              output_params=hooks.output.sides)
+                                              initial=initial, output=hooks.output)
             state = merged.merged_split(spec, walked_out.padded, walked_out.stacked, queries=queries,
                                         width=width, initial=initial)
         if finished:

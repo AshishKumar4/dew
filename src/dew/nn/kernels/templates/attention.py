@@ -697,6 +697,10 @@ class Kind(tuple, enum.Enum):
     """`[H, D]`: one value a head's width entry, a prologue's row's `[D]` (QK-norm's weight); a head extent
     of 1 every head shares."""
 
+    def __repr__(self) -> str:
+        # A launch's identity reads its op's repr (`report._identity`), so a kind's names it, never its axes.
+        return f"<{type(self).__name__}.{self.name}: {self.name.lower()!r}>"
+
 
 def kind_of(side: Side) -> Kind:
     """A hook's side operand's kind: its axes, as `Kind` names them."""
