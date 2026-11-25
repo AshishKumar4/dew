@@ -29,7 +29,6 @@ import contextlib
 import contextvars
 import dataclasses
 import functools
-import itertools
 import math
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, ClassVar, Protocol
@@ -37,7 +36,7 @@ from typing import TYPE_CHECKING, ClassVar, Protocol
 import jax
 import jax.numpy as jnp
 
-from . import generation, grouped_cells, selection
+from . import generation, selection
 from .formats import TernaryWeights
 from .generation import INHERENT
 from .grouped_cells import (
