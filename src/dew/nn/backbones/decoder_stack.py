@@ -31,6 +31,7 @@ from jax.sharding import PartitionSpec as P
 from dew._cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.batch import Variables, merge, part, sows_appended
 from dew.mesh import STAGE_AXIS, LayoutRefused, row_axes
+from dew.nn.dense import NVFP4_AMAX
 from dew.nn.inspection import INDEXER_COLLECTION, QK
 from dew.nn.protocols import StagedStacks, fixed_remat
 from dew.quantization import held_scales, holds_quantized
@@ -624,9 +625,10 @@ def _updates_in_backward(run: nn.Module, specs: Sequence[LayerSpec], *, train: b
                          fetching: bool, store, inputs) -> bool:
     """Whether a scanned run updates in its backward (`dew.nn.in_backward`): inside a step's plan, a
     training forward of a run of like layers, or of a period's layers repeated, that holds its parameters
-    as the plan's state does, writes nothing but its output (no cache, routing statistics or probes:
-    `WRITTEN`), reads no store, per-layer input or host bank, routes no layer (`specs`), and runs under no
-    interceptor (an adapter's, a quantizer's), whose scope a layer applied on its own would leave."""
+    as the plan's state does, writes nothing but its output (no cache, routing statistics, probes or
+    delayed-scaling NVFP4 amaxes: `WRITTEN`, `NVFP4_AMAX`, which a layer applied on its own would sow into
+    nothing, row 12721), reads no store, per-layer input or host bank, routes no layer (`specs`), and runs
+    under no interceptor (an adapter's, a quantizer's), whose scope a layer applied on its own would leave."""
     current = in_backward.plan()
     if current is None or not train or decode or fetching or store is not None:
         return False
@@ -637,7 +639,7 @@ def _updates_in_backward(run: nn.Module, specs: Sequence[LayerSpec], *, train: b
     held = run.variables
     if LAYER_ROWS in held or any(name not in held for name in (*current.moments, in_backward.NORMS)):
         return False
-    return not any(run.is_mutable_collection(name) for name in (*WRITTEN, "intermediates"))
+    return not any(run.is_mutable_collection(name) for name in (*WRITTEN, "intermediates", NVFP4_AMAX))
 
 
 def _kept_without_a_rung(remat: RematPolicy | None) -> tuple[str, ...]:

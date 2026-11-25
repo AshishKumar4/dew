@@ -316,7 +316,7 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         mask = jnp.where(real, raw_mask, 0)
         values, critic_sown = self._critic_scores(variables, batch, opened=step.sown(),
                                                   progress=self.progress(step))
-        critic_qk, critic_inspected = step.observed(critic_sown)
+        critic_qk, critic_inspected, critic_amax = step.observed(critic_sown)
         returns = jnp.where(real, jnp.asarray(batch[RETURNS_KEY], values.dtype), 0)
         old_values = jnp.where(real, jnp.asarray(batch[OLD_VALUES_KEY], values.dtype), 0)
         terms = clipped_value_loss_terms(values, returns, old_values, self.value_clip)
@@ -329,7 +329,11 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         # (`dew.nn.inspection.in_parts`), which the log names them by (`policy/...`, `critic/...`).
         inspected = None if critic_inspected is None else in_parts({"policy": aux.inspected or {},
                                                                     "critic": critic_inspected})
-        return PPOStatistics(pg, critic), Aux(metrics, qk_stats=qk, effects=aux.effects, inspected=inspected)
+        # The actor's and the critic's recorded largest magnitudes each under its part, as their histories
+        # lie (`part`).
+        amax = None if critic_amax is None else {"policy": aux.amax or {}, "critic": critic_amax}
+        return PPOStatistics(pg, critic), Aux(metrics, qk_stats=qk, effects=aux.effects, inspected=inspected,
+                                              amax=amax)
 
     def reduce_loss(self, stats: PPOStatistics | Ratio) -> tuple[jax.Array, jax.Array]:
         """Combine the independently normalized actor and weighted critic losses, or the validation NLL."""

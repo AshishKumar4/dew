@@ -71,9 +71,10 @@ _RELEASED: contextvars.ContextVar[int | None] = contextvars.ContextVar("dew_newt
 them all. A context every trace reads, so a trace kept outside the compile point keys on it
 (`dew.nn.kernels.options.trace_context`)."""
 
-_JOINED: contextvars.ContextVar[list[bool] | None] = _cache.untraced(
+_JOINED: contextvars.ContextVar[list[int] | None] = _cache.untraced(
     contextvars.ContextVar("dew_newton_schulz_joined", default=None))
-"""Where a trace within `joining` notes that it joined stacks a release could part (`joining`)."""
+"""Where a trace within `joining` notes the bytes a device's share of the stacks it joined, which a release
+could part, holds at most at once (`joining`)."""
 
 
 @contextlib.contextmanager
@@ -89,16 +90,27 @@ def released(group: int | None) -> Iterator[None]:
 
 
 @contextlib.contextmanager
-def joining() -> Iterator[list[bool]]:
-    """Within the block, a list holding True once a trace joined two or more stacks of one shape where its
-    run states no group (`spread_stacks`): what a plan's release of them would part (`released(1)`), read
-    off the program the step traced, so a step whose updates join none asks no release."""
-    joined: list[bool] = []
+def joining() -> Iterator[list[int]]:
+    """Within the block, a list holding, for each iteration traced that joined two or more stacks of one
+    shape where its run states no group (`spread_stacks`), what a device's share of its joined sets holds
+    at once by count (`joined_bytes`), read off the program the step traced: a step whose updates join none
+    asks no release (`released(1)`), and the count orders where one asks it
+    (`dew.training.planning.Parting`)."""
+    joined: list[int] = []
     token = _JOINED.set(joined)
     try:
         yield joined
     finally:
         _JOINED.reset(token)
+
+
+def joined_held[T](trace: Callable[[], T]) -> tuple[T, int]:
+    """`trace()`'s result, and what the Newton-Schulz stacks it joined hold at once by count, summed over
+    every iteration it traced (each of a run's Muon transforms, a param group's its own; `joined_bytes`):
+    0 where it joined none, or traced nothing anew (JAX's trace cache)."""
+    with joining() as joined:
+        traced = trace()
+    return traced, sum(joined)
 
 
 def muon_leaf(node) -> bool:
@@ -200,7 +212,9 @@ def _spread_orthogonalized(updates, *, numbers, coeffs, steps: int, eps: float,
     done: list[jax.Array | None] = [None] * len(leaves)
     sets = spread_stacks([stack for stack, _ in stacks], group)
     if not stated and (joined := _JOINED.get()) is not None and any(len(members) > 1 for members in sets):
-        joined.append(True)
+        joined.append(sum(joined_bytes([stacks[index][0] for index in members], devices,
+                                       ns_operands(stacks[members[0]][0].dtype, preconditioning, algorithm))
+                          for members in sets if len(members) > 1))
     for members in sets:
         if len(members) == 1 and not stacks[members[0]][0].shape[0] % devices:
             (index,) = members
@@ -227,6 +241,23 @@ def spread_stacks(stacks: Sequence[jax.Array | jax.ShapeDtypeStruct], group: int
         alike.setdefault((tuple(stack.shape[1:]), str(stack.dtype)), []).append(index)
     return [members[start:start + (group or len(members))] for members in alike.values()
             for start in range(0, len(members), group or len(members))]
+
+
+def joined_bytes(stacks: Sequence[jax.Array | jax.ShapeDtypeStruct], devices: int, work) -> int:
+    """The most bytes one of `devices` holds at once of the iteration of `stacks`, of one matrix shape and
+    dtype, joined into one (`spread_stacks`) and iterated in `work` (`ns_operands`): its share of the
+    padded joined stack's matrices, each held as the joined copy, its padding and its result in the stacks'
+    dtype, as the operand, the iterate and its product in `work`, and as three Gram-side squares (the Gram
+    product, its square and the polynomial) of its shorter side in `work`. Each value counted once, by its
+    logical size: an estimate, which orders a plan's release (`dew.training.planning.Parting`) and rules
+    none out, as XLA's buffers can hold more (a spectral preconditioning's SVD writes its whole U and V
+    under NVIDIA's Jacobi lowering, eighty times this count on two 2 x 1024 float32 stacks; layout copies;
+    a portable SYRK's wider intermediates)."""
+    matrices = sum(stack.shape[0] for stack in stacks)
+    rows, columns = stacks[0].shape[1:]
+    side, wide = min(rows, columns), jnp.dtype(work).itemsize
+    each = rows * columns * (3 * jnp.dtype(stacks[0].dtype).itemsize + 3 * wide) + 3 * side * side * wide
+    return -(-(matrices + -matrices % devices) // devices) * each
 
 
 def newton_schulz_flops(matrices: int, rows: int, columns: int, steps: int) -> float:
@@ -333,5 +364,5 @@ def ns_operands(dtype, preconditioning: Preconditioning = "frobenius",
     return iteration_dtype()
 
 
-__all__ = ["NEWTON_SCHULZ", "POLAR_EXPRESS_TABLE", "Preconditioning", "newton_schulz", "newton_schulz_flops",
-           "ns_operands", "orthogonalized", "polar_express", "spread_stacks"]
+__all__ = ["NEWTON_SCHULZ", "POLAR_EXPRESS_TABLE", "Preconditioning", "joined_bytes", "newton_schulz",
+           "newton_schulz_flops", "ns_operands", "orthogonalized", "polar_express", "spread_stacks"]

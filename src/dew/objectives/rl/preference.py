@@ -247,7 +247,7 @@ class DPOObjective(TokenScorer):
             policy = self.token_scores(variables, ids, coordinates=laid, qk_stats=step.qk_stats,
                                        predict=predict, progress=self.progress(step),
                                        routing=self.balance is not None, watched=step.watched is not None,
-                                       loop_passes=passes)
+                                       loop_passes=passes, amax=step.amax)
         reference = self.token_scores(step.ema, ids, coordinates=laid, progress=self.progress(step),
                                       loop_passes=passes)
         policy_chosen, policy_rejected, weights = _halves(-policy.losses, batch, policy.weights, self.halved)
@@ -272,7 +272,7 @@ class DPOObjective(TokenScorer):
                 {} if laid is None else {COORDINATES_FIELD: laid})
             reported.update(metrics)
         return statistics, Aux[Variables](reported, qk_stats=policy.qk, effects=effects,
-                                          inspected=policy.inspected), policy
+                                          inspected=policy.inspected, amax=policy.amax), policy
 
     def _routed_queries(self, batch) -> jax.Array:
         """The router positions that count, `[B, W - finals]`: each half's completion tokens among the

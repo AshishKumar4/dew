@@ -106,9 +106,9 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
         raise NotImplementedError(f"{self.name}'s consumers each walk every step of their rings (`fed`)")
 
     def walk_own[R](self, streams, views: dict, own: tuple, streamed: tuple, wg,
-                    walk: Callable[..., R], *, between=None, counted=0) -> R:
+                    walk: Callable[..., R], *, between=None, counted=0, common: bool = False) -> R:
         # Every consumer walks each streamed step over its own feed: no partner reads a step it skips.
-        del own, between
+        del own, between, common
         lo, hi = streamed
         return walk(self.fed(streams, views, lo, hi, wg, counted=counted), lo, hi, lo - counted)
 

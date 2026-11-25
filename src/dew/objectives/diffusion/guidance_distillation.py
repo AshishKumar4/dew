@@ -27,7 +27,6 @@ from dew.diffusion.transforms import PredictionTransform, broadcast_rates
 from dew.inputs import InputSpec
 from dew.lora import unadapted
 from dew.nn.inputs import DenoisingCondition
-from dew.nn.inspection import INSPECTED
 from dew.nn.protocols import Lacks
 from dew.objectives.base import TEACHER, Aux, ProgramModule, Step, model_rngs
 from dew.registry import to_record
@@ -139,8 +138,8 @@ class GuidanceDistillationObjective(DiffusionObjective):
         assert isinstance(output, jax.Array)
         losses = optax.l2_loss(output, target)
         weighted = losses * expand(self.process.weight(t), losses)
-        inspected = sown.get(INSPECTED, {}) if step.watched is not None else None
-        return self.row_mean(weighted, batch), Aux(metrics={}, inspected=inspected)
+        _, inspected, amax = step.observed(sown)
+        return self.row_mean(weighted, batch), Aux(metrics={}, inspected=inspected, amax=amax)
 
 
 __all__ = ["GuidanceDistillationObjective", "with_guidance"]

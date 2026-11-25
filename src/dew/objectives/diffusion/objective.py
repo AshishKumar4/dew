@@ -864,8 +864,8 @@ class DiffusionObjective(Objective[Ratio]):
         # The representation's features of the clean images, which both alignments read.
         targets = (None if self.alignment is None
                    else self.alignment.targets(variables[REPRESENTATION], images))
-        losses, aligned, (qk, inspected) = self._denoised(variables, self.model_variables(variables), samples,
-                                                          t, noise, call, targets, batch, step)
+        losses, aligned, (qk, inspected, amax) = self._denoised(
+            variables, self.model_variables(variables), samples, t, noise, call, targets, batch, step)
         weighted = losses * expand(step.boundary("loss weights", self.process.weight(t)), losses)
         if self.uncertainty is not None:
             head = {collection: variables[collection][UNCERTAINTY] for collection in ("params", "constants")}
@@ -880,7 +880,7 @@ class DiffusionObjective(Objective[Ratio]):
             metrics["alignment"] = aligned
             total = total + self.alignment.weight / 2 * aligned.mean()[0] * mass
         if self.end_to_end is None or end_to_end is None:
-            return Ratio(total, mass), Aux(metrics=metrics, qk_stats=qk, inspected=inspected)
+            return Ratio(total, mass), Aux(metrics=metrics, qk_stats=qk, inspected=inspected, amax=amax)
         # The autoencoder's update: its regularizer and the alignment of its
         # latent, read through the frozen model and projector in evaluation
         # mode (the batch norm on its running statistics, no condition
@@ -897,7 +897,8 @@ class DiffusionObjective(Objective[Ratio]):
         autoencoder = end_to_end.regularizer + self.end_to_end.align_weight * through.mean()[0]
         total = total + (autoencoder + end_to_end.hinge) * mass
         updates = {LATENT_STATS: end_to_end.statistics} if step.training else None
-        return Ratio(total, mass), Aux(metrics=metrics, variables=updates, qk_stats=qk, inspected=inspected)
+        return Ratio(total, mass), Aux(metrics=metrics, variables=updates, qk_stats=qk, inspected=inspected,
+                                       amax=amax)
 
     def _denoised(self, params, variables, samples, t, noise, call, targets, batch: Batch, step: Step):
         """The per-element denoising loss at `(t, noise)`; under `alignment`, the REPA loss of the

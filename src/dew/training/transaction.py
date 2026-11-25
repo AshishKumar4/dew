@@ -36,6 +36,7 @@ from dew.data.dataset import rows_of
 from dew.gauss_newton import solves_equations
 from dew.held_updates import holds_back, input_taken, refuse_untold, update_applied
 from dew.nn import in_backward
+from dew.nn.dense import NVFP4_HISTORY, rolled
 from dew.nn.finite import all_finite, leaf_finite, zeroed_unless
 from dew.nn.inspection import (
     PROBES,
@@ -768,6 +769,17 @@ def _held_flag(finite: jax.Array) -> bool:
     return bool(jax.device_get(finite.addressable_data(0)))
 
 
+def largest_recorded(sown: Variables | None) -> Variables | None:
+    """The `nvfp4_amax` collection a step's projections sowed (`Aux.amax`) with each projection's calls'
+    records, a tuple, taken to their elementwise largest, its own shape (`[layers]` in a scanned stack):
+    what a window pools by its largest and its commit rolls into the projections' histories
+    (`dew.nn.dense.rolled`, row 12721). None where the step recorded none."""
+    if sown is None:
+        return None
+    return jax.tree.map(lambda calls: functools.reduce(jnp.maximum, calls), sown,
+                        is_leaf=lambda node: isinstance(node, tuple))
+
+
 def compact_qk(tree, calls: bool = False):
     """Reduce every sowed `max_logits` leaf over its rows, keeping the heads, and a layer's geometry
     (`kv_heads`, `head_dim`, `qk_nope`) to the one count it is; and with `calls`, a layer's calls to one,
@@ -858,6 +870,9 @@ class PendingAttempt(Generic[Loss]):
     own: Loss | None = None
     """This microbatch's own statistics, which a step read in several pools into its batch's loss
     (`dew.training.planning.whole_step`)."""
+    amax: Variables | None = None
+    """The window's largest recorded magnitudes with this microbatch's (`Accumulation.amax`), which the
+    commit rolls into the delayed-scaling NVFP4 projections' histories; None in a run that keeps none."""
 
 
 _GROUPS: contextvars.ContextVar[tuple[int, int | jax.Array] | None] = contextvars.ContextVar(
@@ -939,6 +954,7 @@ def attempt_step(state, variables, ema, batch, *, split: int, slots: int, attemp
     return Step(accepted // split, jax.random.fold_in(state.key, attempt), with_ema(variables, ema),
                 committed=state.updates, record=record, qk_stats=clips_qk(state.opt_state),
                 equations=solves_equations(state.opt_state), watched=watched,
+                amax=NVFP4_HISTORY in state.variables,
                 batch_statistics=batch_statistics,
                 **example_fields(state, slot, split, batch, slots, part, attempt - accepted, microstep))
 
@@ -1124,7 +1140,13 @@ class Transaction:
         everything = (loss, stats, aux.variables, aux.effects, *(() if unscaled else (gradient,)))
         local_finite = all_finite(loss) if unscaled and not self.skip else all_finite(everything)
         local_ok = jnp.asarray(a=True) if state.scale is None else local_finite
+        if aux.amax is None and NVFP4_HISTORY in state.variables:
+            raise ValueError(
+                f"{type(self.objective).__name__} returns none of its projections' recorded largest "
+                "magnitudes (Aux.amax) though its step asks for them (Step.amax), and the run's "
+                "delayed-scaling NVFP4 projections read their amax histories: they would never move")
         qk = compact_qk(aux.qk_stats, self.calls)
+        amax = largest_recorded(aux.amax)
         effects = tuple(jax.tree.leaves(aux.effects))
         candidate, pooled = previous, stats
         replay_required = jnp.asarray(a=False)
@@ -1133,6 +1155,9 @@ class Transaction:
         else:
             effects = tuple(a + b for a, b in zip(previous.effects, effects, strict=True))
             qk = jax.tree.map(jnp.maximum, previous.qk_stats, qk)
+            # A window's largest magnitudes the largest of its microbatches', so the history a split step
+            # rolls in is the one the step read whole would.
+            amax = jax.tree.map(jnp.maximum, previous.amax, amax)
             if self.shared:
                 prior_mass, prior_gradient, mass, total, total_mass, denominator = _pooling_weights(
                     previous, stats)
@@ -1153,17 +1178,19 @@ class Transaction:
                 pooled = Ratio(numerator, total_mass)
                 value, active = pooled.mean()
                 candidate = dataclasses.replace(previous, gradient=gradient, mass=total_mass,
-                                                statistics=(numerator,), effects=effects, qk_stats=qk)
+                                                statistics=(numerator,), effects=effects, qk_stats=qk,
+                                                amax=amax)
             else:
                 leaves = tuple(a + b for a, b in zip(
                     previous.statistics, jax.tree.leaves(stats), strict=True))
                 pooled = self.stats_tree.unflatten(leaves)
                 value, active = self.objective.reduce_loss(pooled)
-                candidate = dataclasses.replace(previous, statistics=leaves, effects=effects, qk_stats=qk)
+                candidate = dataclasses.replace(previous, statistics=leaves, effects=effects, qk_stats=qk,
+                                                amax=amax)
                 replay_required = due & local_ok
             loss = jnp.where(due, value, loss)
         return PendingAttempt(fill, due, active, loss, local_finite, replay_required,
-                              pooled, effects, qk, candidate, gradient, own=stats)
+                              pooled, effects, qk, candidate, gradient, own=stats, amax=amax)
 
     def pooled_cotangent(self, pooled, current_stats, factor):
         """Seed the pooled statistics' cotangent, in the live leaves' dtypes.
@@ -1332,10 +1359,12 @@ class Transaction:
                              "through the trainer, which gives one written before them none waiting")
 
     def commit(self, current, gradient, effects, qk, statistics, applied: Applied | None = None,
-               attempted: jax.Array | None = None):
+               attempted: jax.Array | None = None, amax: Variables | None = None):
         """Apply the pooled native gradient and return its finiteness and global norm. An optimizer that
         reads more than the gradient is handed the update's pooled loss `statistics` (a Gauss-Newton
-        update's system, `dew.gauss_newton`) and attention logit maxima (`qk`).
+        update's system, `dew.gauss_newton`) and attention logit maxima (`qk`). The window's largest
+        recorded magnitudes (`amax`) roll into the delayed-scaling NVFP4 projections' histories as the
+        update commits, as its effects apply, no optimizer reading them (row 12721).
 
         The norm is reduced beside optimizer.update, in the same compiled
         transaction, and leaves it with the loss and auxiliary report. No
@@ -1370,12 +1399,12 @@ class Transaction:
         # keeps the inputs it holds.
         gated = self.skip and current.scale is None and not holds_back(current.opt_state)
         if gated:
-            native_finite = native_finite & all_finite((qk, statistics, effects))
+            native_finite = native_finite & all_finite((qk, statistics, effects, amax))
             # The attempt's own finiteness (its loss, its collections, its microbatch), as its acceptance
             # reads it (`finish_attempt`): one gate for every write.
             native_finite = native_finite if attempted is None else native_finite & attempted
-            native, qk, statistics, effects = (zeroed_unless(native_finite, value)
-                                               for value in (native, qk, statistics, effects))
+            native, qk, statistics, effects, amax = (zeroed_unless(native_finite, value)
+                                                     for value in (native, qk, statistics, effects, amax))
 
         def apply(current):
             # The update applies to the parameters the model's constraint projects
@@ -1409,6 +1438,12 @@ class Transaction:
                 params = written if not gated else {
                     **written, **{name: _chosen(native_finite, value, params[name])
                                   for name, value in written.items()}}
+            if amax is not None:
+                # Each history the window recorded a largest for rolls it in, newest, where the update
+                # applies (`done`): a gated step's rejection, or an update an optimizer holds back, keeps
+                # them as they were.
+                params = {**params, NVFP4_HISTORY: _chosen(done, rolled(params[NVFP4_HISTORY], amax),
+                                                           params[NVFP4_HISTORY])}
             averaged = current.ema
             if self.objective.ema is not None:
                 if averaged is None:
@@ -1494,7 +1529,7 @@ class Transaction:
         scaled one, or one an optimizer holds back, its gradient besides."""
         unscaled = scale is None and not holding
         gated, taken_as_formed = unscaled and self.skip, unscaled and not self.skip
-        trees = (pending.effects, pending.qk, aux.variables, *(() if unscaled else (gradient,)))
+        trees = (pending.effects, pending.qk, pending.amax, aux.variables, *(() if unscaled else (gradient,)))
         read = (pending.loss,) if taken_as_formed else (pending.loss, *trees)
         return gated, taken_as_formed, pending.local_finite & all_finite(read)
 
@@ -1538,7 +1573,8 @@ class Transaction:
         attempted = all_finite((loss, aux.variables)) if gated else None
 
         def commit(current):
-            return self.commit(current, gradient, effects, qk, pending.pooled, pending.applied, attempted)
+            return self.commit(current, gradient, effects, qk, pending.pooled, pending.applied, attempted,
+                               pending.amax)
 
         def recopied(current):
             # A window of several microbatches reads one set of copies
@@ -1787,6 +1823,16 @@ class Transaction:
             realized = self._realized(self.realize_planned(planned), read, batch, step_info, factor)
         return realized, planned
 
+    def _lean(self, state: TrainState, planned: _Planned | None, probing, *, host: bool) -> bool:
+        """Whether the window the step replays, its loss unscaled and its update taken whole, reads no
+        gradient of a microbatch's own (`_pulled`): the commit replays the window's every microbatch, this
+        one realized afresh, under the pooled loss's cotangent, so its forward's residuals live through no
+        backward and no replay (a decision step whose loss weighs its consistency term, 8 layers of a 4B
+        model at split 2: 28.4 GiB a step and 82 s to compile against 18.5 GiB and 43 s). A host step, one
+        that updates its runs in their backward or summarizes its cotangents takes its own."""
+        return (not host and state.accumulation is not None and not self.shared and state.scale is None
+                and not holds_back(state.opt_state) and planned is None and probing is None)
+
     def _read_once(self, planned: _Planned, read: Variables, batch: Batch, step_info, factor) -> bool:
         """Whether every run the state stacks (`_Planned.runs`) is read by the loss once, in a call of its
         own rule at the loss's own level that nothing else of the loss reads its variables beside
@@ -1855,11 +1901,15 @@ class Transaction:
         return set(reached) == set(handled)
 
     def _pulled(self, state: TrainState, realized: Realization, cotangent, planned: _Planned | None,
-                factor, *, whole: bool, masters: bool
+                factor, *, whole: bool, masters: bool, lean: bool = False
                 ) -> tuple[Variables, Variables | None, Applied | None, tuple[tuple[str, ...], ...]]:
         """The microbatch's gradient, its probes' where it summarizes them from the same backward (`whole`),
         what its runs that updated in their backward left (`split_planned`), and the run paths already
-        unscaled and pooled into `state.accumulation.gradient` in the backward (`_planned_accumulation`)."""
+        unscaled and pooled into `state.accumulation.gradient` in the backward (`_planned_accumulation`);
+        zeros of its shape, no backward run, for a lean window, whose commit replays it (`_lean`)."""
+        if lean:
+            shapes = jax.eval_shape(realized.pullback, cotangent)
+            return jax.tree.map(lambda leaf: jnp.zeros(leaf.shape, leaf.dtype), shapes), None, None, ()
         if planned is not None:
             if planned.pooling is not None:
                 previous = state.accumulation
@@ -1974,19 +2024,18 @@ class Transaction:
             # reads each gradient alone (`planned`); a host step, or one realized otherwise, as before.
             realized, planned = self._realized_in(state, realize, read, batch, step_info, factor, host=host)
             loss, cotangent = reduce(realized.stats, factor)
-            # A step that summarizes its cotangents takes its probes' gradient from the same backward where
-            # the microbatch is its update's whole window; otherwise from the pooled loss's, below.
+            # Probes' gradient from this backward where the microbatch is its whole window, else the pooled.
             probing = realized.probed
             whole = probing is not None and self.size == 1
             gradient, probed, applied, pooled_paths = self._pulled(
-                state, realized, cotangent, planned, factor, whole=whole, masters=state.compute is not None)
+                state, realized, cotangent, planned, factor, whole=whole, masters=state.compute is not None,
+                lean=(lean := self._lean(state, planned, probing, host=host)))
             if state.compute is None or self.size > 1:
                 gradient = _unscaled_beside(gradient, factor, pooled_paths) if pooled_paths else unscale(
                     gradient, factor)
-            # Otherwise no loss scale divides it (`dew.training._candidates.prepared_for`),
-            # and a copied parameter's gradient stays bf16 until the update
-            # widens it as it reads it. A window of several microbatches
-            # widens it as it pools it, so the window sums in fp32.
+            # Otherwise no loss scale divides it (`dew.training._candidates.prepared_for`), and a copied
+            # parameter's gradient stays bf16 until the update widens it as it reads it. A window of several
+            # microbatches widens it as it pools it, so the window sums in fp32.
             pending = prepare(state, realized.stats, realized.aux, loss, gradient, closing,
                               *((pooled_paths,) if pooled_paths else ())).replace(applied=applied)
             if probing is not None and not whole:
@@ -2004,7 +2053,8 @@ class Transaction:
 
             def replay(_):
                 cot = pooled(pending.pooled, realized.stats, factor)
-                combined = unscale(realized.pullback(cot), factor)
+                current = self._realized(realize, read, batch, step_info, factor) if lean else realized
+                combined = unscale(current.pullback(cot), factor)
                 def one(index, carried):
                     accumulated, kept = carried
                     replayed, records, step_info = self.replay_input(state, pending.fill, index,
