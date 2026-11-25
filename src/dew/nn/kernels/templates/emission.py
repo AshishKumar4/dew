@@ -288,6 +288,21 @@ five FFMAs and an FCHK, its slow path, a subnormal's or an extreme's, a call a c
 SASS of a hand-written kernel of one, FS-DIV-SASS5). XLA's own fp32 division is it (M-FS-77: plain LLVM
 `fdiv`, PTX `div.rn.f32`)."""
 
+XLA_FORMS: Mapping = {
+    lax.exp_p: Work(exponentials=1, operations=6, integer_operations=1),
+    lax.exp2_p: Work(exponentials=1, operations=7, integer_operations=1),
+    lax.log_p: Work(operations=19, conversions=1, integer_operations=4),
+    lax.log2_p: Work(operations=20, conversions=1, integer_operations=4),
+    lax.log1p_p: Work(operations=19, conversions=1, integer_operations=6),
+    lax.sqrt_p: Work(exponentials=1, operations=3), lax.rsqrt_p: Work(exponentials=1, operations=3)}
+"""Each fp32 special function's issue an element in XLA's own fusions (a program's, `forms` None), from their
+SASS for an H100 and an A100 alike (ptxas 13.0 of the PTX a compile-only client dumps, M-FS-78): an exp and
+an exp2 libdevice's MUFU.EX2 beside its range reduction's six or seven fp32 instructions and a shift; a log,
+a log2 and a log1p no MUFU at all, a polynomial of 19 or 20 fp32 instructions (its FFMAs, multiplies, selects
+and compares) beside an I2F and four or six integer ones; a sqrt and an rsqrt a MUFU.RSQ beside two FMULs
+and an FSETP. A tanh, a logistic, a sin, a cos and a pow branch to slow paths or call a division's, which a
+static count misstates: one exponential an element, as before any was measured."""
+
 TRITON_FORMS: Mapping = {**{function: Work(exponentials=1) for function in APPROXIMATED},
                          precision.correctly_rounded_divide_p: IEEE_DIVISION}
 """A Pallas Triton kernel's forms (`forms_of`): each special function one exponential an element, as a
@@ -1294,9 +1309,10 @@ def _laid_reduction(layout: fragments.TiledLayout, value, axes: Sequence[int], t
                 shuffles=rounds * words * threads)
 
 
-def _divides_on_cuda(outputs: Sequence, target: generation.GpuTarget | None) -> bool:
-    """Whether a division of results `outputs` is an fp32 one on a CUDA multiprocessor (`target`, else the
-    process's own), whose MUFU and refinement Dew measured; fp64's and narrower floats' unmeasured."""
+def _fp32_on_cuda(outputs: Sequence, target: generation.GpuTarget | None) -> bool:
+    """Whether an operation of results `outputs` is an fp32 one on a CUDA multiprocessor (`target`, else the
+    process's own), whose forms Dew measured (a division's, XLA's special functions'); fp64's and narrower
+    floats' unmeasured."""
     held = target or generation.gpu_target()
     return (held.architecture.multiprocessor is not None
             and all(aval.dtype == jnp.float32 for aval in outputs))
@@ -1360,8 +1376,10 @@ def operation_work(primitive, inputs: Sequence, outputs: Sequence, params: Mappi
     (`product.product_mode`: on a TPU, an fp32 product's bfloat16 passes); what moves and computes nothing
     nothing (`_FREE`: a layout change, a barrier); any other primitive's output elements unpriced
     (`Work.unpriced_operations`). With `forms` (a kernel's: `APPROXIMATE_FORMS`, `ACCURATE_FORMS`), a special
-    function issues its form an output element, one with none unpriced. An fp32 division on a CUDA target
-    issues its kernel's form (`MOSAIC_DIVISION`), XLA's own `div.rn.f32`'s (`IEEE_DIVISION`, M-FS-77);
+    function issues its form an output element, one with none unpriced; without, an fp32 one on a CUDA
+    target XLA's own (`XLA_FORMS`, M-FS-78), any other one exponential an element. An fp32 division on a
+    CUDA target issues its kernel's form (`MOSAIC_DIVISION`), XLA's own `div.rn.f32`'s (`IEEE_DIVISION`,
+    M-FS-77);
     other widths' and a TPU's, unmeasured, an operation an element. A correctly rounded one issues its
     native form where a kernel's forms state one (a Triton kernel's, `TRITON_FORMS`), else the software
     division it lowers to (XLA's and Mosaic GPU's, `precision._correctly_rounded_divide`), counted as a
@@ -1372,7 +1390,7 @@ def operation_work(primitive, inputs: Sequence, outputs: Sequence, params: Mappi
         kind = next((name for name, table in _KERNEL_FORMS.items() if forms == table), None)
         return _software_division(tuple((tuple(aval.shape), np.dtype(aval.dtype)) for aval in inputs),
                                   target or generation.gpu_target(), kind)
-    if primitive is lax.div_p and _divides_on_cuda(outputs, target) and (
+    if primitive is lax.div_p and _fp32_on_cuda(outputs, target) and (
             (form := IEEE_DIVISION if forms is None else forms.get(primitive)) is not None):
         return repeated(form, sum(_elements(aval) for aval in outputs))
     if primitive in _OPERATIONS:
@@ -1382,7 +1400,8 @@ def operation_work(primitive, inputs: Sequence, outputs: Sequence, params: Mappi
     if primitive in SPECIAL_FUNCTIONS:
         elements = sum(_elements(aval) for aval in outputs)
         if forms is None:
-            return Work(exponentials=elements)
+            measured = XLA_FORMS.get(primitive) if _fp32_on_cuda(outputs, target) else None
+            return Work(exponentials=elements) if measured is None else repeated(measured, elements)
         form = forms.get(primitive)
         return Work(unpriced_operations=elements) if form is None else repeated(form, elements)
     if primitive is lax.convert_element_type_p:
