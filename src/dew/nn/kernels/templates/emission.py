@@ -1177,11 +1177,14 @@ def operation_work(primitive, inputs: Sequence, outputs: Sequence, params: Mappi
         return Work(unpriced_operations=elements) if form is None else repeated(form, elements)
     if primitive is lax.convert_element_type_p:
         elements = sum(_elements(aval) for aval in outputs)
-        if inputs[0].dtype == outputs[0].dtype:
+        # Its target the dtype it names (`new_dtype`), which the algebra's terms, every value priced at fp32
+        # (`cost.VALUE`), state where their avals do not.
+        source, made = np.dtype(inputs[0].dtype), np.dtype(params.get("new_dtype") or outputs[0].dtype)
+        if source == made:
             # Its own dtype (a weak type made strong): no instruction (FS-CONV-SASS2's fp32 to fp32).
             return Work()
         if forms in _KERNEL_FORMS.values():
-            form = CONVERSION_FORMS.get((np.dtype(inputs[0].dtype), np.dtype(outputs[0].dtype)))
+            form = CONVERSION_FORMS.get((source, made))
             if form is not None:
                 return repeated(form, elements)
         return Work(conversions=elements)
