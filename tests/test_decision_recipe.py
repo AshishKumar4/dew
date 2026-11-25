@@ -685,42 +685,41 @@ def test_a_tables_own_integer_labels_name_their_options_by_value():
 
 
 def test_a_checkpoint_loops_at_the_passes_and_over_the_block_asked():
-    """--loop-steps sets the passes of Ouro's tiny looped decoder, leaving its
-    weights as they were; --loop-layers gives the tiny Qwen 3.5, which does not
-    loop, a loop over a block of its own layers; a block with no passes, or
-    passes with no block, on a decoder that does not loop is refused."""
-    from dew.config import looping
+    """A run's passes (`DecoderRunConfig.passes`) set the passes of Ouro's tiny looped decoder, leaving its
+    loop's other choices and its weights as they were; a run's loop (`DecoderRunConfig.loop`) gives the tiny
+    Qwen 3.5, which does not loop, a loop over a block of its own layers; passes with no loop, on a decoder
+    that does not loop, are refused."""
+    from dew.config import DecoderRunConfig
     from dew.interop import Pretrained
     from dew.nn.backbones.decoder_stack import Loop
 
     ouro = Pretrained.load(Path(__file__).parent / "fixtures" / "hf" / "ouro-tiny", dtype="float32")
-    once = looping(ouro, 1, None)
+    once = DecoderRunConfig(passes=1).looped(ouro)
     assert once.model.loop == Loop(1, exit_gate=True) and ouro.model.loop == Loop(3, exit_gate=True)
     assert once.variables is ouro.variables
     qwen = Pretrained.load(QWEN, dtype="float32")
-    retrofit = looping(qwen, 2, (1, 2))
+    retrofit = DecoderRunConfig(loop=Loop(2, step_norm=False, layers=(1, 2))).looped(qwen)
     assert retrofit.model.language_model.loop == Loop(2, step_norm=False, layers=(1, 2))
     assert qwen.model.language_model.loop is None
     assert retrofit.variables is qwen.variables
-    for steps, layers in ((2, None), (None, (1, 2))):
-        with pytest.raises(ValueError):
-            looping(qwen, steps, layers)
+    with pytest.raises(ValueError):
+        DecoderRunConfig(passes=2).looped(qwen)
 
 
 def test_a_checkpoint_gains_a_loop_whose_exit_gate_starts_at_zeros():
-    """--loop-exit-gate and --loop-exit-threshold give the tiny Qwen, which does not loop, a loop over a
-    block of its own layers whose exit gate is drawn at zeros beside its loaded weights, each pass's exit
-    weighed alike until training moves it, its tokens exiting at the threshold asked."""
+    """A run's loop with an exit gate and an exit threshold gives the tiny Qwen, which does not loop, a loop
+    over a block of its own layers whose exit gate is drawn at zeros beside its loaded weights, each pass's
+    exit weighed alike until training moves it, its tokens exiting at the threshold asked."""
     from flax.traverse_util import flatten_dict
 
-    from dew.config import looping
+    from dew.config import DecoderRunConfig
     from dew.interop import Pretrained
     from dew.nn.backbones.decoder_stack import Loop
 
     qwen = Pretrained.load(QWEN, dtype="float32")
-    gated = looping(qwen, 2, (1, 2), exit_gate=True, exit_threshold=0.9)
-    assert gated.model.language_model.loop == Loop(2, step_norm=False, layers=(1, 2), exit_gate=True,
-                                                   exit_threshold=0.9)
+    loop = Loop(2, step_norm=False, layers=(1, 2), exit_gate=True, exit_threshold=0.9)
+    gated = DecoderRunConfig(loop=loop).looped(qwen)
+    assert gated.model.language_model.loop == loop
     loaded, drawn = flatten_dict(qwen.variables["params"]), flatten_dict(gated.variables["params"])
     gate = {path: value for path, value in drawn.items() if path not in loaded}
     assert sorted(gate) == [("language_model", "early_exit_gate", name) for name in ("bias", "kernel")]
@@ -737,12 +736,14 @@ def test_a_wrapped_decoders_gated_loop_trains_under_the_exit_objective():
     import jax.numpy as jnp
 
     from dew.batch import TEXT_KEY
-    from dew.config import looping
+    from dew.config import DecoderRunConfig
     from dew.interop import Pretrained
+    from dew.nn.backbones.decoder_stack import Loop
     from dew.objectives.base import Step
     from dew.objectives.lm import LMObjective
 
-    gated = looping(Pretrained.load(QWEN, dtype="float32"), 2, (1, 2), exit_gate=True)
+    gated = DecoderRunConfig(loop=Loop(2, step_norm=False, layers=(1, 2), exit_gate=True)).looped(
+        Pretrained.load(QWEN, dtype="float32"))
     objective = LMObjective(gated.model, 8, exit_entropy=0.1, token_accuracy=False)
     assert gated.model.loop == gated.model.language_model.loop
     ids = np.random.default_rng(0).integers(0, gated.model.language_model.vocab_size, (2, 9)).astype(np.int32)
@@ -753,10 +754,8 @@ def test_a_wrapped_decoders_gated_loop_trains_under_the_exit_objective():
 
 
 @pytest.mark.parametrize("fields,checkpoint,message", [
-    ({"loop_backprop_steps": 1}, QWEN, "has no loop"),
-    ({"loop_remat": True}, QWEN, "has no loop"),
-    ({"loop_backprop_steps": 1}, TINY, "has no loop"),
-    ({"loop_remat": True}, TINY, "has no loop"),
+    ({"passes": 2}, QWEN, "has no loop"),
+    ({"passes": 2}, TINY, "has no loop"),
     ({"remat": "unknown"}, QWEN, "remat names one of"),
 ])
 def test_a_decision_run_refuses_memory_options_without_their_backbone(fields, checkpoint, message):

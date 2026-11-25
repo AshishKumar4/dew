@@ -865,11 +865,12 @@ def test_a_multimodal_run_passing_messages_reloads_from_its_native_release_as_it
     from saved_run_kinds import MULTIMODAL, multimodal
 
     from dew.interop import Pretrained
+    from dew.nn.backbones.decoder_stack import Loop
     from dew.nn.cross_pass import CrossPass
     from dew.nn.multimodal import MultimodalTransformer
 
-    looped = dataclasses.replace(multimodal(tmp_path, drawn=False), loop_steps=2, loop_layers=(0, 2),
-                                 loop_messages=True, loop_message_block_size=1)
+    looped = dataclasses.replace(multimodal(tmp_path, drawn=False), loop=Loop(
+        2, step_norm=False, layers=(0, 2), messages=CrossPass(block_size=1)))
     state, _ = trained(looped, tmp_path, "messaged", trainer={"checkpoint_final": True})
     loaded = Pretrained.load(str(released_run(tmp_path / "runs" / "messaged")), dtype="float32")
     assert isinstance(loaded.model, MultimodalTransformer)

@@ -582,13 +582,13 @@ def test_an_implicit_loop_whose_rows_are_one_theta_computes_the_shared_theta():
 @attending("reference")
 def test_a_loaded_decoder_gains_an_implicit_loop_at_zero_theta():
     """A loaded Qwen 3.5 given an implicit loop over its own block, as a run asks for one
-    (`dew.config.looping`), draws the loop's θ at zero beside the parameters it loaded, among what it drew
+    (`DecoderRunConfig.loop`), draws the loop's θ at zero beside the parameters it loaded, among what it drew
     fresh (`Pretrained.with_model`), so it runs and starts as the decoder it loaded."""
-    from dew.config import looping
+    from dew.config import DecoderRunConfig
     from dew.interop.pretrained import Pretrained
 
     loaded = Pretrained.load(str(QWEN35), dtype="float32")
-    looped = looping(loaded, 3, (1, 4), implicit=True)
+    looped = DecoderRunConfig(loop=Loop(3, step_norm=False, layers=(1, 4), implicit=True)).looped(loaded)
     theta = looped.variables["params"]["loop_theta"]
     assert looped.model.loop == Loop(3, step_norm=False, layers=(1, 4), implicit=True)
     assert np.shape(theta) == (loaded.model.emb_features,) and not np.any(np.asarray(theta))

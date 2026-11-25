@@ -888,28 +888,29 @@ def test_a_trained_block_diffusion_tree_saves_back_over_its_source(tmp_path):
 
 
 def test_a_pretrained_run_loops_its_decoder_as_a_decision_run_does(tmp_path):
-    """`--loop-steps 2 --loop-layers 0 1` give a --pretrained decoder with no loop one over its own
-    block, as they do a decision run's (`DecoderRunConfig`): the objective trains the looped decoder
-    over the checkpoint's weights as they were, and the run's record holds the loop, which a resume
-    takes again. A fresh decoder's run refuses them: its model states its own loop."""
+    """A run's loop (`DecoderRunConfig.loop`) gives a --pretrained decoder with no loop one over its own
+    block, as it does a decision run's: the objective trains the looped decoder over the checkpoint's
+    weights as they were, and the run's record holds the loop, which a resume takes again. A fresh decoder's
+    run refuses it: its model states its own loop."""
     from dew.interop import Pretrained
     from dew.nn.backbones.decoder_stack import Loop
 
+    loop = Loop(2, step_norm=False, layers=(0, 1))
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
     checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
     config = recipe_run(Started, tokens, "--pretrained", str(checkpoint), "--trainer.steps", "1",
-                        "--max-new-tokens", "0", "--loop-steps", "2", "--loop-layers", "0", "1",
-                        default=Started(data=windows(tokens), validation=windows(tokens, held=True)))
+                        "--max-new-tokens", "0",
+                        default=Started(data=windows(tokens), validation=windows(tokens, held=True),
+                                        loop=loop))
     objective = config.prepare().train("looped")
-    assert objective.model.loop == Loop(2, step_norm=False, layers=(0, 1))
+    assert objective.model.loop == loop
     loaded = Pretrained.load(checkpoint, dtype="float32")
     for mine, theirs in zip(jax.tree.leaves(objective.held_variables()["params"]),
                             jax.tree.leaves(loaded.variables["params"]), strict=True):
         np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
-    recorded = LMRunConfig.from_dict(config.to_dict())
-    assert (recorded.loop_steps, recorded.loop_layers) == (2, (0, 1))
+    assert LMRunConfig.from_dict(config.to_dict()).loop == loop
     with pytest.raises(ValueError):
-        LMRunConfig(loop_steps=2)
+        LMRunConfig(loop=loop)
 
 
 def test_a_pretrained_run_trains_the_exit_gate_its_loop_draws_in_its_fresh_group(tmp_path):

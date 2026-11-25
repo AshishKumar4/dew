@@ -671,6 +671,11 @@ class MultimodalTransformer(DecoderWrapper):
         return None if language_model is None else self._over(language_model)
 
     @nn.nowrap
+    def with_loop(self, loop: Loop) -> Self:
+        """The language model's (`CausalTransformer.with_loop`)."""
+        return self._over(self.language_model.with_loop(loop))
+
+    @nn.nowrap
     def inference_projection_groups(self, variables: Mapping[str, Mapping]) -> tuple[ProjectionGroup, ...]:
         """The language model's (`held_groups`); the towers run once per prefill and keep their layout."""
         return held_groups(self.language_model, "language_model", variables)

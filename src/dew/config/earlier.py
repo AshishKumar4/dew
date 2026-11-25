@@ -265,7 +265,11 @@ def _retired(name: str, fields: Mapping[str, _records.JSON], root: bool,
     flat_batched = (issubclass(kind, RunConfig) and isinstance(trainer, Mapping)
                     and _records.class_record(trainer) is None
                     and any(key in trainer for key in EARLIER_TRAINER_FIELDS))
-    if not (exported or flat or unset or spec is not None or batched or flat_batched or pinned or validated):
+    # A decoder run's flat loop fields, which a run states as its loop and passes since row 11937.
+    flat_loop = issubclass(kind, DecoderRunConfig) and any(
+        key in fields for key in (*EARLIER_LOOP_FIELDS, *EARLIER_PASS_FIELDS))
+    if not (exported or flat or unset or spec is not None or batched or flat_batched or pinned or validated
+            or flat_loop):
         return None
     migrated = {key: value for key, value in fields.items() if not (exported and key == "export_model")}
     if batched:
@@ -298,6 +302,8 @@ def _retired(name: str, fields: Mapping[str, _records.JSON], root: bool,
         migrated = _suites(migrated)
     if unset:
         migrated["loop_message_additive"] = None
+    if flat_loop:
+        migrated = _earlier_loop(migrated)
     return {"class": name, "fields": migrated}
 
 
@@ -912,3 +918,95 @@ def earlier_compute(record: Mapping[str, object]) -> str:
     loads = fields.get("pretrained") is not None and isinstance(kind, type) and issubclass(
         kind, LMRunConfig | DiffusionRunConfig)
     return "bfloat16" if loads else "float32"
+
+
+EARLIER_LOOP_FIELDS = ("loop_layers", "loop_backprop_steps", "loop_remat", "loop_implicit",
+                       "loop_theta_per_pass", "loop_exit_gate", "loop_exit_threshold", "loop_messages",
+                       "loop_message_block_size", "loop_message_rank", "loop_message_additive")
+"""A decoder run's flat fields that changed its checkpoint's loop one choice at a time, which an earlier Dew
+recorded (`DecoderRunConfig` before row 11937), read as their `LoopChange`."""
+
+EARLIER_PASS_FIELDS = ("loop_steps", "loop_steps_sample", "loop_steps_mean", "loop_steps_dispersion",
+                       "loop_steps_max")
+"""A decoder run's flat pass-count fields an earlier Dew recorded, read as its `passes` (row 11937)."""
+
+
+@dataclasses.dataclass(frozen=True)
+class LoopChange:
+    """The changes a decoder run saved by an earlier Dew made to its checkpoint's loop, one choice at a
+    time (`EARLIER_LOOP_FIELDS`), each None or false keeping the checkpoint's own, which its run's `loop`
+    holds where its record is read (`earlier_run`): a run states its loop whole since row 11937
+    (`DecoderRunConfig.loop`). Read only from a saved record; carried to 1.0 (ledger 1552)."""
+
+    layers: tuple[int, int] | None = None
+    backprop_steps: int | None = None
+    remat: bool = False
+    implicit: bool = False
+    theta_per_pass: bool = False
+    exit_gate: bool = False
+    exit_threshold: float | None = None
+    messages: bool = False
+    message_block_size: int | None = None
+    message_rank: int | None = None
+    message_additive: bool | None = None
+
+    def applied(self, start, passes, key):
+        """`start` (a loaded `Pretrained`) with its loop changed as the earlier run changed it, run at the
+        count it held and handed on (`passes`, a `PassPolicy`): a looped checkpoint's own block, or
+        `layers`, which gives a decoder with no loop one; its θ a row a later pass where it asked one
+        (`theta_per_pass`), for its largest count, each row the checkpoint's one θ; its messages the
+        checkpoint's own with what it stated in their place."""
+        from dew.config import _theta_rows
+        from dew.nn.cross_pass import CrossPass
+        from dew.nn.protocols import Looped, Looping
+        from dew.training.phase_passes import SampledPasses
+
+        counts = (passes if isinstance(passes, tuple) else
+                  (passes.cap,) if isinstance(passes, SampledPasses) else (passes,))
+        handed = counts[-1]
+        rows = max((count for count in counts if count is not None), default=None)
+        own = start.model.loop if isinstance(start.model, Looped) else None
+        if own is not None and own.theta_passes is not None:
+            rows = own.theta_passes
+        elif rows is None and own is not None:
+            rows = own.steps
+        messages = None
+        if self.messages:
+            stated = {"block_size": self.message_block_size, "rank": self.message_rank,
+                      "additive": self.message_additive}
+            held = None if own is None else own.messages
+            given = {name: value for name, value in stated.items() if value is not None}
+            messages = dataclasses.replace(CrossPass() if held is None else held, **given)
+        theta_passes = rows if self.theta_per_pass else None
+        looped = (start.model.with_passes(handed, self.layers, backprop_steps=self.backprop_steps,
+                                          remat=self.remat or None, implicit=self.implicit or None,
+                                          exit_gate=self.exit_gate or None,
+                                          exit_threshold=self.exit_threshold,
+                                          theta_passes=theta_passes, messages=messages)
+                  if isinstance(start.model, Looping) else None)
+        if looped is None:
+            raise ValueError(f"this {type(start.model).__name__} has no loop: the saved run's loop names no "
+                             "block of its layers to repeat")
+        if theta_passes is not None:
+            start = dataclasses.replace(start, variables=_theta_rows(start.variables, theta_passes))
+        return start.with_model(looped, key=key)
+
+
+def _earlier_loop(fields: Mapping[str, JSON]) -> dict[str, JSON]:
+    """A decoder run's fields with its earlier flat loop fields (`EARLIER_LOOP_FIELDS`,
+    `EARLIER_PASS_FIELDS`) read as its `loop`, their `LoopChange`, and its `passes`."""
+    kept = {key: value for key, value in fields.items()
+            if key not in EARLIER_LOOP_FIELDS and key not in EARLIER_PASS_FIELDS}
+    # A choice stated: a value, or a flag set; the messages' additive term's false its own choice.
+    changed = {key.removeprefix("loop_"): fields[key] for key in EARLIER_LOOP_FIELDS
+               if fields.get(key) is not None
+               and (fields[key] is not False or key == "loop_message_additive")}
+    if changed:
+        kept["loop"] = {"class": registry.import_path(LoopChange), "fields": changed}
+    if fields.get("loop_steps_sample") is not None:
+        kept["passes"] = {"class": "dew.training.phase_passes:SampledPasses", "fields": {
+            "mean": fields.get("loop_steps_mean"), "dispersion": fields.get("loop_steps_dispersion"),
+            "cap": fields.get("loop_steps_max"), "law": fields["loop_steps_sample"]}}
+    elif fields.get("loop_steps") is not None:
+        kept["passes"] = fields["loop_steps"]
+    return kept

@@ -690,26 +690,21 @@ def test_a_sampled_run_whose_window_replays_its_microbatches_is_refused(grouped)
     assert isinstance(whole.compile(state, batch), DrawingStep)
 
 
-@pytest.mark.parametrize("fields", [{"loop_steps_mean": 2.0},
-                                    {"loop_steps_sample": "lognormal-poisson", "loop_steps_mean": 2.0,
-                                     "loop_steps_max": 4},
-                                    {"loop_steps_sample": "lognormal-poisson", "loop_steps_mean": 2.0,
-                                     "loop_steps_dispersion": 0.5, "loop_steps_max": 4, "loop_steps": 4},
-                                    {"loop_steps_sample": "lognormal-poisson", "loop_steps_mean": 1.0,
-                                     "loop_steps_dispersion": 0.5, "loop_steps_max": 4}],
-                         ids=["a law unnamed", "a law half stated", "beside a stated count",
-                              "outside its law"])
-def test_a_decoder_run_states_a_sampled_pass_count_whole_and_once(fields):
-    """A run's sampled pass count (`--loop-steps-sample`) is stated whole, its law's mean, dispersion and cap
-    with its name, beside no stated count (the cap the model holds), and within its law; stated so, the run
-    hands its trainer the law and its model the cap."""
+@pytest.mark.parametrize("fields", [{"mean": 2.0, "dispersion": 0.5, "cap": 4, "law": "lognormal"},
+                                    {"mean": 1.0, "dispersion": 0.5, "cap": 4},
+                                    {"mean": 2.0, "dispersion": -0.5, "cap": 4},
+                                    {"mean": 2.0, "dispersion": 0.5, "cap": 0}],
+                         ids=["a law unknown", "outside its law", "a negative dispersion", "no pass"])
+def test_a_decoder_run_states_a_sampled_pass_count_within_its_law(fields):
+    """A run's sampled pass count (`DecoderRunConfig.passes`, a `SampledPasses`) is a known law's, its mean
+    within it, its dispersion at least 0 and its cap at least one pass; stated so, the run hands its trainer
+    the law and its model the cap."""
     from dew.config import DecoderRunConfig
 
     with pytest.raises(ValueError):
-        DecoderRunConfig(**fields)
-    stated = DecoderRunConfig(loop_steps_sample="lognormal-poisson", loop_steps_mean=2.0,
-                              loop_steps_dispersion=0.5, loop_steps_max=4)
-    assert stated.sampled_passes() == SampledPasses(2.0, 0.5, 4) and stated.handed_passes == 4
+        SampledPasses(**fields)
+    law = SampledPasses(2.0, 0.5, 4)
+    assert DecoderRunConfig(passes=law).handed_passes == 4
 
 
 class _Drawing:
