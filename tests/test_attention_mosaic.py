@@ -302,7 +302,7 @@ def _check_spans(label: str, spans: template.KeySpans | Callable[[], template.Ke
                  gate: bool = False, dtype=jnp.bfloat16, natural: bool = False, seeds: int | None = None,
                  width: int = 64, param_rows: int | None = None, pins: tuple | None = None,
                  target: generation.GpuTarget | None = None, routed: bool = True,
-                 keys: int | None = None):
+                 keys: int | None = None, plain_axes: bool = False):
     """The forward, or the backward in the form `form` names (`_backward_form`), over `spans` at `_form_tiles`
     (64 wide) under the score hooks `score` (`test_attention_triton.score_hooks`, their parameters and
     initial state drawn with the operands) and with `gate` an output gate (`hooks_for`), draws of `shape`
@@ -311,7 +311,9 @@ def _check_spans(label: str, spans: template.KeySpans | Callable[[], template.Ke
     values, the hook's parameters and the initial state, over `seeds` draws where given (the site's own,
     else the template site's); its launches at the forward's and backward's configs `pins` where given
     (`_pinned`), interpreted for `target` where given (`_device`), the backward the one the route takes
-    where `routed`, else this mainloop's (a TPU core's, which the route's CUDA facts do not read)."""
+    where `routed`, else this mainloop's (a TPU core's, which the route's CUDA facts do not read). With
+    `plain_axes`, the call names its hook's side operands' axes by the plain tuples of their kinds, the
+    reference by the kinds."""
     rows, queries, heads, _ = shape
     make_spans = spans if callable(spans) else (lambda: spans)
     if keys is not None:
@@ -326,16 +328,17 @@ def _check_spans(label: str, spans: template.KeySpans | Callable[[], template.Ke
     def draw(seed):
         return *draw_operands(seed), *draw_hooks(seed)
 
-    def hooked(params, initial):
+    def hooked(params, initial, plain: bool = False):
         output = hooks_for(HOOKS["gate" if gate else "none"], queries, width, gate_of(queries, width))
-        sides = tuple(Side(value, kind) for value, kind in zip(params, kinds, strict=True))
+        sides = tuple(Side(value, tuple(kind) if plain else kind)
+                      for value, kind in zip(params, kinds, strict=True))
         return template.Hooks(score=Hook(score_mod, sides), initial=initial, output=output.output)
 
     accurate, config = _backward_form(form)
 
     def ours(query, key, value, dout, params, initial):
         built_spans = make_spans()
-        hooks = hooked(params, initial)
+        hooks = hooked(params, initial, plain_axes)
         # The forward at the call forms' tiles 64 wide, else at its derivation's (two consumers' hooked sums
         # 128 wide pass their registers, and a hooked training forward's natural walk theirs 64 wide).
         pinned = pins or (_form_tiles() if width == 64 and not (backward and score) else None, config)
@@ -416,6 +419,17 @@ def test_a_hooks_streamed_parameters_hold_check_1_through_the_rings_rotations_in
             attention_mosaic.BackwardTiles(64, 64, 2, 1, family=WGMMA, dkv_family=WGMMA))
     _check_spans("causal", spans, (1, 256, 2, 1), interpret=True, backward=True, score=STREAMED_HOOKS[hooks],
                  pins=pins)
+
+
+@INTERPRETS
+def test_a_streamed_tile_bias_named_by_its_plain_axes_holds_check_1_interpreted():
+    """A dense bias whose axes are the plain tuple ('batch', 'heads', 'queries', 'keys') rather than
+    `Kind.TILE`, streamed by an H100's producer on the keys' rings over 256 causal tokens: on par with the
+    reference (check 1), where its launch had taken it as a vector's stream, its block one row (row 13032,
+    Train 1291's review)."""
+    spans = template.spans(256, 256, 1, causal=True)
+    _check_spans("causal", spans, (1, 256, 2, 1), interpret=True, score=STREAMED_HOOKS["tile-bias"],
+                 pins=(attention_mosaic.Tiles(64, 64, 2, 2, family=WGMMA), None), plain_axes=True)
 
 
 @INTERPRETS
