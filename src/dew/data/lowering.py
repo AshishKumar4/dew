@@ -1397,14 +1397,15 @@ class _Build:
         streams = self.read == "streamed" or cached
         return self.elastic or (self.training and not self.global_order and not streams)
 
-    def child(self, index: int) -> _Build:
+    def child(self, index: int, capacities: Sequence[int | None] = ()) -> _Build:
         """The build of the `index`th corpus a mixture, phases or a concatenation reads, by its own
-        analysis, keyed by the name it goes by there (`_member_key`)."""
+        analysis, keyed by the name it goes by there (`_member_key`), its share of the pool within each
+        member's `capacities` (`dew.data.pipeline.allocation`, `capacities`)."""
         members = strings(self.lowering.order["members"], "mixture members")
         # A mixture's members share its workers by their draw weights (`_Lowering.draws`); phases' and a
         # concatenation's, each read in turn, equally.
         weights = list(self.lowering.draws) or [1.0] * len(members)
-        pool = None if self.pool is None else self.pool.shared(weights, index)
+        pool = None if self.pool is None else self.pool.shared(weights, index, capacities)
         loading = self.loading if pool is None else dataclasses.replace(self.loading, workers=pool.count)
         # A member's own mixes stamp nothing: only the phase's mix draws what other phases read on.
         return dataclasses.replace(self, lowering=self.lowering.children[index], loading=loading, pool=pool,
@@ -1441,18 +1442,36 @@ class _Build:
         loading = dataclasses.replace(self.loading, workers=written.count)
         return dataclasses.replace(self, pool=written, loading=loading)
 
-    def pools(self, pipeline: Pipeline) -> dict[str, int]:
-        """The loading workers each corpus reads in, as `pooled` shares them out, by the corpus's
-        place among the mixtures above it, which a position saved under one sharing restores only
-        under the same, a corpus a mixture keeps across an edit included."""
+    def pools(self, pipeline: Pipeline, partition: DataPartition) -> dict[str, int]:
+        """The loading workers each corpus reads in, as `pooled` shares them out for `partition`'s share
+        (`capacities`), by the corpus's place among the mixtures above it, which a position saved under one
+        sharing restores only under the same, a corpus a mixture keeps across an edit included."""
         build = self.owning(pipeline)
         source = pipeline.source
         if build.pool is None or build.in_order:
             return {}
         if not isinstance(source, Combined):
             return {"/".join(str(key) for key in build.corpus): build.pool.count}
+        capacities = build.capacities(pipeline, partition)
         return {key: count for index, child in enumerate(source.pipelines)
-                for key, count in build.child(index).pools(child).items()}
+                for key, count in build.child(index, capacities).pools(child, partition).items()}
+
+    def capacities(self, pipeline: Pipeline, partition: DataPartition) -> tuple[int | None, ...]:
+        """The most of a shared pool's workers each corpus `pipeline` mixes can take where its read streams
+        (`allocation`): its shards over `partition`'s shares where its store cannot cut them finer (whole
+        compressed files, each a worker's own), so no corpus is dealt more workers than it holds shards for
+        each, which the cut refuses (`dew.data.shards._shards`); None, no bound, for a corpus of mixtures or
+        one whose shards subdivide."""
+        if self.pool is None or self.read != "streamed" or not isinstance(pipeline.source, Combined):
+            return ()
+        found: list[int | None] = []
+        for child in pipeline.source.pipelines:
+            if isinstance(child.source, Combined):
+                found.append(None)
+                continue
+            manifest = base.stream_manifest(child.source, positioned=False)
+            found.append(None if manifest.subdivide is not None else len(manifest.shards) // partition.count)
+        return tuple(found)
 
     def stage_seed(self, pipeline: Pipeline, at: int, partition: DataPartition) -> int:
         """The seed of the random stage written at `at` in `pipeline`: the run's seed, the corpus's
@@ -1477,7 +1496,8 @@ class _Build:
         read-ahead: a mix of hundreds of corpora holds what a read of one does, and a corpus whose share
         is no thread reads on the thread that draws from it."""
         nested = children(pipeline)
-        builds = [self.child(index) for index in range(len(nested))]
+        capacities = self.capacities(pipeline, partition)
+        builds = [self.child(index, capacities) for index in range(len(nested))]
         builds = [dataclasses.replace(build, loading=dataclasses.replace(
             build.loading, threads=build.loading.threads // len(nested),
             read_buffer=build.loading.read_buffer // len(nested))) for build in builds]

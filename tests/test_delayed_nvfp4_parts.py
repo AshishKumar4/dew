@@ -26,6 +26,46 @@ def test_an_averaged_forward_reads_the_committed_histories():
         np.testing.assert_array_equal(np.asarray(read), one)
 
 
+def test_a_reference_keeps_the_histories_it_started_with():
+    """A run whose average is a frozen reference (unit decay: DPO's, GRPO's) holds its start's amax histories
+    with its start's weights: a forward over the reference (`TrainState.averaged`) reads the histories the
+    run began with, bit for bit, while the run's own roll on (row 12993: the reference read the live
+    histories beside its frozen weights)."""
+    with generation.run_precision(DELAYED):
+        trainer = delayed_lm(1, ema_decay=1.0)
+        started = histories(trainer.place()[0])
+        trained = trainer.fit(data(), steps=2)
+    rolled_on = histories(trained)
+    for start, read, now in zip(started, jax.tree.leaves(trained.averaged[NVFP4_HISTORY]), rolled_on,
+                                strict=True):
+        np.testing.assert_array_equal(np.asarray(read), start)
+        assert now[..., 0].min() > 0, now
+
+
+def test_an_optimizer_holding_updates_back_rolls_the_largest_of_every_call_it_held():
+    """Under an optimizer that applies an update every second call (`optax.MultiSteps`), the call that
+    applies it rolls the largest magnitude of both calls into each history, once: the first call's records
+    wait (`NVFP4_PENDING`) where it applies nothing, so the history after two calls is the history a run
+    reading both calls' rows as one step's two microbatches rolls (row 12994: the second rolled its own
+    alone)."""
+    from delayed_nvfp4 import SEQ
+
+    from dew.objectives.lm import LMObjective
+
+    def trainer(optimizer, split: int) -> Trainer:
+        model = CausalTransformer(vocab_size=64, emb_features=128, num_layers=2, num_heads=2,
+                                  mlp_features=256, max_seq_len=SEQ)
+        return Trainer(LMObjective(model, seq_len=SEQ), optimizer, key=0, split=split)
+
+    with generation.run_precision(DELAYED):
+        every_second = optax.MultiSteps(optax.adamw(1e-3), 2).gradient_transformation()
+        held = trainer(every_second, 1).fit(data(), steps=2)
+        joined = trainer(optax.adamw(1e-3), 2).fit(data(32), steps=1)
+    for one, other in zip(histories(held), histories(joined), strict=True):
+        np.testing.assert_array_equal(one, other)
+        assert one[..., 0].min() > 0 and not one[..., 1:].any(), one
+
+
 def test_a_ppo_steps_records_are_its_own_passes_its_critics_among_them():
     """A PPO objective draws its critic apart from its actor (`PPOObjective.init`), and the critic's draw
     keeps nothing its initializing pass recorded: a step's records are each part's own call's alone, one

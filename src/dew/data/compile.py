@@ -1858,7 +1858,8 @@ def _training_reader(
                 ],
                 # Where a read that drops records reads in workers of each corpus's own (`pooled`),
                 # each worker's position is that corpus's, saved in that many.
-                **({} if build.pool is None or build.in_order else {"pools": build.pools(pipeline)}),
+                **({} if build.pool is None or build.in_order
+                   else {"pools": build.pools(pipeline, partition)}),
             })
         opened = _PerShare(
             functools.partial(build.batches, pipeline, partition),
