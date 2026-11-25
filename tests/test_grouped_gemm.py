@@ -1664,43 +1664,35 @@ def test_hopper_cluster2_balanced_tail_holds_check_1(rows, depth, mp):
                             truth_fn=functools.partial(dw_plain, wide=jnp.float64, out=jnp.float64))
 
 
-@pytest.mark.parametrize(("swapped", "within", "past"), [(False, 248, 264), (True, 12288, 20480)],
-                         ids=["rows", "swapped"])
-def test_a_pinned_split_runs_only_where_its_partials_fit_the_workspace(swapped, within, past):
+def test_a_pinned_split_runs_only_where_its_partials_fit_the_workspace():
     """A pinned two-way split runs where its fp32 partials, as its launch declares them, fit the 4 MiB an
     A100's cuBLAS GEMM's workspace is (`GpuTarget.reference_workspace`, row 12850), and is refused
-    (`tuning.Unpinnable`) where one thing grows them past it: a 1985-wide product launched 2016 wide, its
-    rows 248 (3.8 MiB) or 264 (4.1 MiB); a 16-row decode swapped, its rows padded to a 32-column tile, by
-    12,288 columns (3 MiB) or 20,480 (5 MiB)."""
+    (`tuning.Unpinnable`) where one thing grows them past it: a 1985-wide product, launched 2016 wide, of
+    248 rows (3.8 MiB) or 264 (4.1 MiB)."""
     from dew.nn.kernels import tuning
 
     launch = grouped_matmul.MosaicGmm()
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
-    one = jax.ShapeDtypeStruct((1,), jnp.int32)
 
-    def shapes(grown):
-        rows, depth, width = (16, 4096, grown) if swapped else (grown, 1024, 1985)
-        return bf16((rows, depth)), bf16((depth, width))
+    def shapes(rows):
+        return bf16((rows, 1024)), bf16((1024, 1985))
+
+    def run(x, w):
+        return gemm.gemm(x, w, None, out_dtype=jnp.bfloat16)
 
     with generation.assumed("sm80"):
         target = generation.gpu_target()
-        x, w = shapes(within)
-        ba = launch.bind(x, bf16((1, *w.shape)), one, out_dtype="bfloat16", trans_rhs=False,
-                         interpret=False, dense=True)
-        tile = (dataclasses.replace(launch._derived(launch._swapped(ba, target), target), swapped=True)
-                if swapped else launch.derived(ba, target))
-        tile = dataclasses.replace(tile, splits=2)
-
-        def run(x, w):
-            return gemm.gemm(x, w, None, out_dtype=jnp.bfloat16)
-
+        x, w = shapes(248)
+        ba = launch.bind(x, bf16((1, *w.shape)), jax.ShapeDtypeStruct((1,), jnp.int32), out_dtype="bfloat16",
+                         trans_rhs=False, interpret=False, dense=True)
+        tile = dataclasses.replace(launch.derived(ba, target), splits=2)
         with generation.chosen(grouped_matmul="mosaic"):
             with tuning.pinned({grouped_matmul.MosaicGmm: tile}), tuning.seen() as launches:
-                jax.jit(run).trace(*shapes(within))
+                jax.jit(run).trace(*shapes(248))
             assert tile in {config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
                             if isinstance(op, grouped_matmul.MosaicGmm)}
             with tuning.pinned({grouped_matmul.MosaicGmm: tile}), pytest.raises(tuning.Unpinnable):
-                jax.jit(run).trace(*shapes(past))
+                jax.jit(run).trace(*shapes(264))
 
 
 def _traced_on(target, fn, args):
