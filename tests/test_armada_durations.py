@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from armada_support import commit, interpreter, loaded
+from armada_support import cached, commit, interpreter, loaded
 
 
 @pytest.fixture
@@ -522,7 +522,8 @@ def test_a_tasks_peak_bounds_its_tests_and_a_heavy_files_tasks_run_large(ci, tmp
     assert all("size" not in entry for entry in ci.plan(240.0, {"files": {}}))
 
 
-def test_every_dry_prepare_task_runs_large_whatever_its_tests_cpu_peaks(ci, tmp_path, monkeypatch):
+def test_every_dry_prepare_task_runs_large_whatever_its_tests_cpu_peaks(ci, tmp_path, monkeypatch,
+                                                                        cache_worker):
     """A GPU tier file's dry prepare (prepares.py's `entries`) compiles its programs on the CPU, so its every
     task, a kept one's that compiles a row its lookup misses among them, is planned on a large container
     (ci.py's `PREPARE_SIZE`), though its tests' recorded peaks, their CPU runs', are light: one prepare
@@ -543,6 +544,27 @@ def test_every_dry_prepare_task_runs_large_whatever_its_tests_cpu_peaks(ci, tmp_
     prepares = [entry for entry in entries if entry["tests"].startswith(ci.prepares.TOKEN)]
     assert prepares and [entry.get("size") for entry in prepares] == ["large"] * len(prepares)
     assert all("size" not in entry for entry in entries if entry not in prepares)
+    # A kept prepare, its row green in the shared cache on these inputs, looks its row up, and compiles it
+    # where the lookup misses as its task runs (ci.py's `unrun`): large too.
+    url, stored, _ = cache_worker
+    cpu = "GenuineIntel-6-143"
+    config = json.loads((tmp_path / ".armada.json").read_text())
+    (tmp_path / ".armada.json").write_text(json.dumps(
+        {**config, "task": {"cpu": {"vendor": "GenuineIntel", "family": 6, "model": 143}}}))
+    cached(monkeypatch, url)
+    monkeypatch.setenv(ci.READ_TOKEN, "token")
+    python, name, group = prepares[0]["python"], prepares[0]["tests"].removeprefix(ci.prepares.TOKEN), \
+        prepares[0]["split"]
+    common, place = ci.prepare_shared(python), ci.row(python, name, group)
+    key = ci.run_keys.cache_key(common, name, group, [])
+    green = {"key": key, "depends": [], "epoch": "green",
+             "row": {"name": place, "exitCode": 0, "unprepared": []}}
+    stored["/" + ci.epoch_key(python, place, cpu, common)] = json.dumps({"epoch": "green"}).encode()
+    for at in (ci.record_key(python, place, cpu, common), ci.green_key(python, place, cpu, key)):
+        stored["/" + at] = json.dumps(green).encode()
+    kept = [entry for entry in ci.plan(240.0, {"files": {}})
+            if entry["python"] == python and place in entry.get("rows", [])]
+    assert [(ci.session.KEPT_AT in entry["tests"], entry.get("size")) for entry in kept] == [(True, "large")]
 
 
 def test_a_killed_tasks_peak_raises_its_files_tests_and_heavy_tasks_run_large(ci, tmp_path, monkeypatch):
