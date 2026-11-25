@@ -711,8 +711,8 @@ def _body_key_of(jaxpr: jcore.Jaxpr) -> _SubKey | None:
 
 
 def _dataclass_param_key(value, kind: type, *, reject_device: bool) -> Hashable:
-    """In-process structural key for a dataclass instance preserving exact class identity and guarding
-    non-field attributes (so factory-made callable dataclasses with identical qualnames never collide)."""
+    """In-process structural key for a dataclass instance preserving exact class identity, identity-equality
+    (`eq=False` / `object.__eq__`), and non-field attributes while guarding nested `jax.Array` fields."""
     fields = dataclasses.fields(value)
     field_names = {field.name for field in fields}
     inst_dict = value.__dict__ if any("__dict__" in cls.__dict__ for cls in kind.__mro__) else None
@@ -725,30 +725,30 @@ def _dataclass_param_key(value, kind: type, *, reject_device: bool) -> Hashable:
         if reject_device:
             raise _Unshareable
         return "object", _named(kind), _Identity(value)
-    return "record", ("object", "class", kind), tuple(
+    field_keys = tuple(
         (field.name, _in_process_param_key(getattr(value, field.name), reject_device=reject_device))
         for field in fields)
+    if kind.__eq__ is object.__eq__:
+        return "object", _named(kind), _Identity(value)
+    return "record", ("object", "class", kind), field_keys
 
 
 def _in_process_param_key(value, *, reject_device: bool) -> Hashable:
     """In-process structural key for an equation parameter preserving executable callable, primitive, and
     extended-dtype identities while never copying `jax.Array` device buffers to host."""
     kind = type(value)
-    if value is None or kind is bool or kind is str:
+    if value is None or kind in (bool, str, int):
         return kind.__name__, value
-    if kind is int:
-        return "int", value
     if kind is float:
         return "float", value.hex()
-    if kind is tuple or kind is list:
+    if kind in (tuple, list):
         return "sequence", f"builtins.{kind.__name__}", tuple(
             _in_process_param_key(part, reject_device=reject_device) for part in value)
     if isinstance(value, ShapedArray):
         return _abstract_key(value), _extended_dtype(value.dtype)
     if isinstance(value, jcore.Jaxpr):
         if reject_device:
-            child = _body_key_of(value)
-            if child is None:
+            if (child := _body_key_of(value)) is None:
                 raise _Unshareable
             return "jaxpr", child.digest, ("object", "subkey", child), ()
         child = _in_process_digest(value)
@@ -764,10 +764,6 @@ def _in_process_param_key(value, *, reject_device: bool) -> Hashable:
                 _in_process_param_key(value.keywords, reject_device=reject_device))
     if isinstance(value, (types.FunctionType, types.BuiltinFunctionType)):
         return "object", _named(kind), value
-    if callable(value) and not isinstance(value, (type, np.dtype)):
-        if reject_device:
-            raise _Unshareable
-        return "object", _named(kind), _Identity(value)
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return _dataclass_param_key(value, kind, reject_device=reject_device)
     if isinstance(value, (tuple, list)):
@@ -777,10 +773,17 @@ def _in_process_param_key(value, *, reject_device: bool) -> Hashable:
         return "set", tuple(sorted(
             (_in_process_param_key(part, reject_device=reject_device) for part in value), key=repr))
     if isinstance(value, Mapping):
-        return "mapping", tuple(sorted((
-            (_in_process_param_key(name, reject_device=reject_device),
-             _in_process_param_key(part, reject_device=reject_device))
-            for name, part in value.items()), key=repr))
+        return "mapping", tuple(sorted(((_in_process_param_key(k, reject_device=reject_device),
+                                         _in_process_param_key(v, reject_device=reject_device))
+                                        for k, v in value.items()), key=repr))
+    if callable(value) and not isinstance(value, (type, np.dtype)):
+        if kind.__eq__ is object.__eq__:
+            return "object", _named(kind), _Identity(value)
+        try:
+            hash(value)
+        except TypeError:
+            return "object", _named(kind), _Identity(value)
+        return "object", _named(kind), value
     return _parameter_key_other(value, kind)
 
 
@@ -1264,7 +1267,9 @@ class _NormTrack:
         if not _lossless_float_cast(src, out):
             return
         self.origin[out] = self._canon(src)
-        for table in (self.sq_sum, self.inv_norm, self.pos_norm):
+        if src in self.sq_sum:
+            self.sq_sum[out] = self.sq_sum[src]
+        for table in (self.inv_norm, self.pos_norm):
             if src in table:
                 table[out] = table[src]
 

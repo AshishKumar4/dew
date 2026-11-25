@@ -1244,11 +1244,13 @@ def _recurrence_bounded(
     seq_bits = math.ceil(math.log2(max(seq_len, 1)))
     beta_bits = 0 if not has_beta else (beta_bound or 0)
     beta_lift = max(0, beta_bits) if (has_beta and beta_bound != terms.NOTHING) else 0
+    v_elem = terms.NOTHING if v_bound == terms.NOTHING else (0 if v_apart.unit_norm else v_bound)
     h0_norm = terms.NOTHING if state_bound == terms.NOTHING else state_bound + half_key_bits
     k_norm = _norm_bits(k_bound, k_apart, half_key_bits)
     q_norm = _norm_bits(q_bound, q_apart, half_key_bits)
     # Ungated `K @ K^T` and `Q @ K^T` stay finite even at zero `beta`/`Q`; operands stay within `v_cap`.
-    if ((v_bound != terms.NOTHING and v_bound + beta_lift > v_cap)
+    # Allow 1 bit on `v_elem + beta_lift` for `terms._bounded`'s `UNIT + 1` headroom on `sigmoid(beta)`.
+    if ((v_elem != terms.NOTHING and v_elem + beta_lift > v_cap + 1)
             or (h0_norm != terms.NOTHING and h0_norm > v_cap)
             or (k_norm != terms.NOTHING and (2 * k_norm > work_cap or k_norm > max(0, v_cap)))
             or (q_norm != terms.NOTHING and (

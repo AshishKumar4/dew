@@ -2465,7 +2465,8 @@ def test_body_key_distinguishes_callable_dataclasses_and_norm_rejects_bad_layout
     for cb1, cb2 in ((make_factory_callback(1.0), make_factory_callback(2.0)), (id_first, id_second)):
         f1, f2 = make_body(cb1), make_body(cb2)
         c1, c2 = jax.make_jaxpr(f1)(*rms_shapes), jax.make_jaxpr(f2)(*rms_shapes)
-        assert terms.body_key(c1) is None and terms.body_key(c2) is None
+        k1, k2 = terms.body_key(c1), terms.body_key(c2)
+        assert k1 is not None and k2 is not None and k1 != k2
         assert terms.jaxpr_digest(c1, in_process=True) != terms.jaxpr_digest(c2, in_process=True)
         with generation.assumed("sm90"):
             r1 = program._closed(c1, accurate=False, saturation=algebra.SATURATION, kernels=True)
