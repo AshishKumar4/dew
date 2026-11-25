@@ -89,7 +89,7 @@ def test_a_saved_wide_products_residual_is_stored_where_a_derivative_is_taken_al
     from jax.extend import custom_call_targets
     from kernel_compile import stated_outputs
 
-    product, shapes = _wide_4b(True)
+    product, shapes = _wide_4b(saved=True)
     with generation.assumed("sm90"):
         stored = {name: sorted(count for count, _ in stated_outputs(
                       jax.jit(fn).trace(*shapes).lower(lowering_platforms=("cuda",)),
@@ -97,6 +97,27 @@ def test_a_saved_wide_products_residual_is_stored_where_a_derivative_is_taken_al
                   for name, fn in (("inference", product), ("gradient", _gradient_of(product)))}
     assert stored["inference"] == [1], stored
     assert 2 in stored["gradient"], stored
+
+
+@INTERPRETS
+def test_an_unnamed_saved_residual_takes_the_gradient_a_recomputed_one_does():
+    """A saved wide product whose residual no remat name labels (`name=None`): staged under `jit` and a
+    checkpoint, its gradient is the recomputed product's, its residual held apart from its output
+    (`hooks.held_outputs`) whether named or not."""
+    x, gate, up, dy = _draw(2)
+    joined = wide.interleaved(gate, up)
+
+    def loss(saved, name):
+        def product(x, joined):
+            out = wide.gated_product(x, joined, _swiglu, out_dtype=jnp.bfloat16, saved=saved, name=name,
+                                     interpret_on_cpu=True)
+            return jnp.sum(out.astype(jnp.float32) * dy.astype(jnp.float32))
+        return jax.jit(jax.grad(jax.checkpoint(product), argnums=(0, 1)))
+
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+        unnamed, recomputed = loss(True, None)(x, joined), loss(False, None)(x, joined)
+    for got, want in zip(unnamed, recomputed, strict=True):
+        np.testing.assert_array_equal(got, want)
 
 
 @pytest.mark.parametrize(("family", "block_n", "refused"), [

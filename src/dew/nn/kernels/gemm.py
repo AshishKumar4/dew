@@ -62,7 +62,7 @@ from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import epilogue_vjp, rows_permuted, scattered, tiling
 from dew.nn.kernels.templates.gemm.factored import factored
 from dew.nn.kernels.templates.gemm.hooks import (NO_HOOKS, ColumnLocal, Formed, Hooks, Residualized,
-                                                  column_local, held_outputs)
+                                                  column_local, held_outputs, kept as hooks_kept)
 from dew.nn.kernels.templates.product import SCALE_DEPTH, bf16_part_count, declared, formed, terms
 from dew.nn.precision import accumulated, asks_default_precision, at_least_fp32, exact_products, twice_scaled
 from dew.nn.programs import read_by
@@ -196,7 +196,7 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights,
         return held_outputs(value(*operands), named, several, residuals)
 
     call = _Call(prologue, prologue_axes, epilogue, epilogue_axes, dtypes, several, compute, plain,
-                 tuple(at for at, name in enumerate(named) if name is not None))
+                 hooks_kept(named, residuals))
 
     def backward(saved, operands, cotangent, live):
         # A residual output takes no cotangent: no caller reads it.
@@ -204,7 +204,7 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights,
         return _pulled(call, operands, cotangent, live, saved)
 
     primal = (functools.partial(value, epilogue=epilogue.unsaved(), dtypes=dtypes[residuals:])
-              if residuals else None)
+              if isinstance(epilogue, Residualized) and residuals else None)
     # A named residual is the forward's as it ran, a remat policy's to keep (`linear_tangent`'s `nested`).
     differentiable = contracted("test_a_grouped_gemm_holds_every_order")(
         generation.linear_tangent(forward, grouped_matmul.GROUPED.bound(backward), portable,
