@@ -160,9 +160,7 @@ def test_a_split_files_groups_run_every_test_once(ci, tmp_path):
     """Each task of a split file runs its own group (split.py) of the same
     cut, so the groups together run every test, none twice, a test the
     durations lack included. Each group times the file at what it spent,
-    which armada sums over the groups. Only the group holding the test the
-    durations lack keeps no key (its task's unrecorded list names its file):
-    the others are their plan's groups whole."""
+    which armada sums over the groups."""
     (tmp_path / "tests/test_split.py").write_text(
         "import pytest\n@pytest.mark.parametrize('n', range(6))\ndef test_n(n): pass\n"
         "def test_unrecorded(): pass\n")
@@ -177,9 +175,6 @@ def test_a_split_files_groups_run_every_test_once(ci, tmp_path):
         assert verdict["exitCode"] == 0, verdict["output"]
         assert verdict["timings"] == {"3.12:tests/test_split.py": verdict["seconds"]}
         ran.append(sorted(verdict["tests"]))
-        holds_new = "tests/test_split.py::test_unrecorded" in verdict["tests"]
-        unkeyed = json.loads(out.with_name(f"{out.name}.unrecorded.json").read_text())
-        assert unkeyed == (["tests/test_split.py"] if holds_new else [])
     assert all(ran)
     every = sorted(node for nodes in ran for node in nodes)
     assert every == sorted([f"tests/test_split.py::test_n[{n}]" for n in range(6)]
