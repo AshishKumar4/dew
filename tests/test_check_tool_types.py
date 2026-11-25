@@ -2,7 +2,10 @@
 cohorts conflict refused, and a verdict's key covering every module of the checkout the tool imports, through
 their own imports, so a change to a module a tool imports, the tool untouched, checks it again (row 7933)."""
 
+import ast
 import importlib.util
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -131,3 +134,30 @@ def test_a_tools_key_moves_with_the_neighbour_its_execution_environment_imports(
     before = gate.key(script, [], b"shared")
     (tmp_path / "tools" / "runs" / "b.py").write_text("Y = 3\n")
     assert gate.key(script, [], b"shared") != before
+
+
+def test_a_run_parses_each_shared_dependency_once(gate, tmp_path, monkeypatch) -> None:
+    """One run of the gate (`main`) keys many tools sharing a dependency, parsing that dependency once, not
+    once per tool (`Reads`)."""
+    (tmp_path / "stubs").mkdir()
+    for index in range(5):
+        (tmp_path / "tools" / f"user_{index}.py").write_text("from lib.shared import deep\n")
+    deep = str(tmp_path / "src" / "lib" / "deep.py")
+    parses = 0
+    real_parse = ast.parse
+
+    def counted(source, filename="<unknown>", *args, **kwargs):
+        nonlocal parses
+        if str(filename) == deep:
+            parses += 1
+        return real_parse(source, filename, *args, **kwargs)
+
+    store = types.SimpleNamespace(recorded=lambda key, token: {}, written=lambda *a: True)
+    monkeypatch.setattr(ast, "parse", counted)
+    monkeypatch.setattr(gate, "releases", lambda: {})
+    monkeypatch.setattr(gate, "records", lambda: store)
+    monkeypatch.setattr(sys, "argv", ["check_tool_types"])
+    monkeypatch.setattr(sys, "prefix", "/tmp/fake-venv")
+    monkeypatch.setattr(sys, "base_prefix", "/usr")
+    assert gate.main() == 0
+    assert parses == 1
