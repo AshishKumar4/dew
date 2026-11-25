@@ -8,15 +8,15 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Kernels and performance
 
-- GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 12850]
+- GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 12898]
 - One recurrence algebra, the template for every form and product, and port retirement. [2076, 3426, 3427]
 - Family toolkit: resources derived and checked against ptxas, one planner, one traversal. [2987, 6008, 6010, 12416, 12423, 12424, 12426]
 - The kernel challenge's lessons in the templates. [5271]
-- 4B Real-Token MFU Breakthrough from Existing Profiles. [11941, 11942, 12866]
-- Cached and block visibility on the template's spans. [1495, 245]
+- 4B Real-Token MFU Breakthrough from Existing Profiles. [11941, 11942]
+- Cached and block visibility on the template's spans. [245]
 - Performance measurements. [569, 1378]
 - One attention algebra: state, visibility, hooks. [1293]
-- The template beats FA2 and FA3, its resources the model's. [1299, 12645, 12752, 5284, 5285, 5293]
+- The template beats FA2 and FA3, its resources the model's. [1299, 12752, 5284, 5285, 5293]
 - Inference through the templates. [3424, 3602]
 - Carried JAX fixes upstream. [4689, 4690, 4693, 4698, 5403, 5808, 5809, 5810, 5811, 5813, 5814, 5815, 5816, 5817, 5820, 5822, 5823, 5825, 5827, 5829, 5831, 5832, 5833, 5834, 5835, 5836, 5837, 5839, 5841, 5842, 5843, 5845, 5846, 5847, 5848, 10742]
 - Convolution repairs above their owner. [5665]
@@ -36,7 +36,9 @@ This page is generated from the maintainers' findings ledger as each change land
 - The GEMM compile gate certifies each launch with one CUDA build's compile-only client (the kernel-compile extra's), then checks the settled kernel under each…. [10766]
 - test_plan's second-trainer witness asserts no backend compile of jit(step). [12386]
 - Certification admits a spill only where every STL/LDL of its SASS sits at loop depth 0 (prologue/epilogue) or in call slow-path code. [12387]
-- Memory Planner Miss-Driven ≤2-Step Search, Fast XLA Sizing & Cold-Compile Elimination. [12462, 12867]
+- Memory Planner Miss-Driven ≤2-Step Search, Fast XLA Sizing & Cold-Compile Elimination. [12462]
+- The chunked op's portable math (recurrence_chunk's xla mainloop) loses a faint pair under a decay a key dimension that the token recurrence keeps. [12888]
+- The key memory backward launch's register model under-counts a read erase's reads. [12890]
 - The fork takes no static register cap for a Mosaic GPU kernel. [12686]
 - Sm120's scaled GEMM forwards are derived at a tile their compile spills. [12687]
 - Mosaic GPU async_copy's 1D bulk shortcut (jax fork, launch_context.py is_simple_contiguous_copy) clips a contiguous slice at the whole buffer's end, linearly. [12692]
@@ -48,16 +50,11 @@ This page is generated from the maintainers' findings ledger as each change land
 - resources.operand_fragments counts every part of a multi-part shared operand live at once. [6494]
 - A 4B decision start's cold fit spends 152.8 s (template) and 162.2 s (vendor) in 12 traces of templates/report.py's certification program pulled_back…. [6593]
 - Pallas's interpreter compiles a thread map's body once per leased CPU client. [7087]
-- A turned training step's kept certified configs (report.certifications, pulled, not refused) compile one Mosaic kernel its lowered program does not run. [12646]
-- Attention (shared key runs broadcast against the batch). [12701]
-- The chunked op's portable math (recurrence_chunk's xla mainloop) loses a faint pair under a decay a key dimension that the token recurrence keeps. [12888]
-- The key memory backward launch's register model under-counts a read erase's reads. [12890]
 
 ## Models and interop
 
-- Every recurrence transition and state family. [1300, 1448, 1450, 1451, 1452, 1454, 1455, 1457, 1458, 1459, 1460, 1646]
-- The suite's wall. [5478, 12431, 12433, 12644, 12744]
-- Owner-approved Audit 4 API cleanup. [11937]
+- Every recurrence transition and state family. [1300, 1448, 1450, 1451, 1452, 1454, 1457, 1458, 1459, 1460, 1646]
+- The suite's wall. [5478, 12431, 12433, 12644]
 - Owner ruling 2026-11-24: general opt-in looped-model optimization in dew.nn.backbones.looping + sharding to gather a looped block's FSDP-sharded weights once…. [12722]
 - The remaining releases' media towers. [851, 879]
 - Formats read and written. [871, 2548]
@@ -74,7 +71,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Distributed and memory training modes. [156, 873, 1306, 617]
 - A fact and a question for the step's owner. [6646]
 - Gradients held to an update placed after the backward are parameter-sized temporaries. [6698]
-- LiveSet.forward_bytes counts only buffers whose op name's second scope starts 'jvp(' (memory.py:898-905): a forward realized inside a replay's cond/while…. [12884]
 - Narrow copies at the Qwen3.5-4B decision step. [6638]
 - A program compiled ahead without its GPU that holds a convolution is refused and compiled on its GPU. [8527]
 - sampled_passes over a loop that chooses its passes itself. [12300]
@@ -85,7 +81,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Training and serving efficiency. [5292]
 - The shared-prefix fork as the GPU default, priced where it enters a recurrence. [5476, 5353]
 - A device-plan search whose devices hold no plan walks the whole remat/head ladder before refusing. [8541]
-- memory.resident_on counts host-pinned leaves (Layout(host=...), memory_kind pinned_host) as device bytes, where _fit._device_bytes filters memory_kind 'device'. [12883]
 - The BFC bound places a step's non-aliased outputs beside its temporaries at XLA's raw sizes (memory.placed_beside: stats.output - stats.alias), where each…. [8792]
 
 ## RL and serving
