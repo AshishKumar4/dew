@@ -570,6 +570,8 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                     _gmm_finished, accs, wg=wg, store=store, family=family, part=part,
                     share_row=tiles.share_row(wg), m=m, g=g, dense=dense, row_tile=block_m * pair,
                     whole=any(form is not None and form.transposed for form in forms),
+                    narrowed=tuple(form.divisor if form is not None and form.narrowed else 1
+                                   for form in forms),
                     epilogue=epilogue, flags=(flags_gmem, pair, tiles.sharing),
                     sides=tuple(zip(side_gmems, epilogue_axes, side_smems, side_barriers, strict=True)),
                     partials=None if tail is None else (workspace, ready))
@@ -761,14 +763,17 @@ def _declared(lhs, rhs, gather, shape: tuple[int, int, int | None], splits: int,
 
 def _gmm_finished(accs: tuple, tile: tuple, wg, store, *, family: mosaic.Family, part: tuple, share_row,
                   m: int, g: int, dense: bool, row_tile: int, epilogue, o_gmems: tuple, sides: tuple,
-                  partials, flags: tuple = (None, 1, 1), whole: bool = False) -> None:
+                  partials, flags: tuple = (None, 1, 1), whole: bool = False, narrowed: tuple = ()) -> None:
     """Dew: a consumer's share of a `gmm` tile stored (`_finished`) from its accumulators: at once, or,
     a balanced tail's tile (`partials`: its workspace and readiness flags), once its program's partial and
     the other programs' are added (`mosaic.Family.fixed_up`); with `flags` (`chained.flags_declared`'s, the
     pair and the consumers sharing a tile's rows, `Tiles.sharing`), its row share's written at its table
     entry (`chained.flag_row`): a ping-pong consumer's whole tile's the one slot, as it alone finishes the
     tile (`persistent`'s ping-pong walk; 3b97e20f F5); with `whole`, each share's whole rows (a transposed
-    output's, `stores.transposed_rows`, the tensor's bound clipping those past its last)."""
+    output's, `stores.transposed_rows`, the tensor's bound clipping those past its last); `narrowed`, each
+    output's divisor where its epilogue computes it narrower than the tile (`quantized.Form.narrowed`), its
+    first column its own: the column tile's index times its own width, a multiple of the stores' tiling the
+    lowering sees, where a tile's column over the divisor is no multiple it can prove."""
     group, row_start, ni, _, gathered, program, split, entry = tile
     flags_gmem, pair, sharing = flags
     nonfinite = None if flags_gmem is None else flags_gmem.at[
@@ -785,7 +790,9 @@ def _gmm_finished(accs: tuple, tile: tuple, wg, store, *, family: mosaic.Family,
         _finished, family=family, wg=wg, epilogue=epilogue, o_gmems=o_gmems, store=store, sides=sides,
         origins={'rows': pl.ds(part_row, part[0]), 'columns': pl.ds(column, part[1])},
         group=_side_group(group, g), nonfinite=nonfinite,
-        place=(part_row, first, stored, column, min(part[0], m), TMA_ROWS if dense else 1))
+        place=(part_row, first, stored, column, min(part[0], m), TMA_ROWS if dense else 1),
+        narrowed=tuple(None if divisor == 1 else (divisor, ni * (part[1] // divisor))
+                       for divisor in narrowed))
     if partials is None or partials[0] is None:
         finished(*accs)
         return
@@ -860,7 +867,7 @@ def _fixed_loaded(family: mosaic.Family, prologue_gmems, prologue_axes: tuple, f
 
 
 def _finished(*accs, family: mosaic.Family, wg, epilogue, o_gmems: tuple, store, sides: tuple, origins: dict,
-              group, place: tuple, nonfinite=None) -> None:
+              group, place: tuple, nonfinite=None, narrowed: tuple = ()) -> None:
     """Dew: a consumer's share of a `gmm` tile from its accumulators (`accs`), read out a chunk of columns
     at a time (`mosaic.Issuer.chunks`: all of them at once where its registers hold them): its epilogue on
     its side tiles' same columns (`sides`, each its global ref, axes, staging and barrier, loaded at
@@ -870,7 +877,9 @@ def _finished(*accs, family: mosaic.Family, wg, epilogue, o_gmems: tuple, store,
     `nonfinite` (a one-entry int32 ref, `flags_declared`), whether any value the share stores is non-finite
     written there: the stored value's, converted once, as a finite fp32 sum can overflow its output's dtype
     (base review b1ab251ac F1: 65536, the joined sum where the products' was 65504, an fp16 infinity), of its
-    stored rows alone: another group's, by this entry's matrix, may overflow (base review d0bc7dee6 F3)."""
+    stored rows alone: another group's, by this entry's matrix, may overflow (base review d0bc7dee6 F3). An
+    output `narrowed` names (its divisor and first column, `_gmm_finished`'s) is stored at its own column, a
+    chunk's a `divisor`-th of its tile column."""
     family.loaded([(gmem.at[axes.named(side_axes, origins | axes.at_group(side_axes, gmem.shape, group))],
                     smem.at[wg], barrier.at[wg])
                    for gmem, side_axes, smem, barrier in sides],
@@ -897,7 +906,9 @@ def _finished(*accs, family: mosaic.Family, wg, epilogue, o_gmems: tuple, store,
                     kept = family.iota(value.shape, 0) - first
                     stored_rows = (kept >= 0) & (kept < stored)
                     seen = seen | jnp.any(stored_rows & jnp.isnan(value * 0))
-                store(output, value, o_gmem, (row_start, first, stored, column + start, *ladder))
+                own = narrowed[output] if narrowed else None
+                at = column + start if own is None else own[1] + start // own[0]
+                store(output, value, o_gmem, (row_start, first, stored, at, *ladder))
     if nonfinite is not None:
         nonfinite[...] = jnp.broadcast_to(seen.astype(jnp.int32), (1,))
 

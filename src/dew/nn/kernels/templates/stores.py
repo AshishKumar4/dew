@@ -66,7 +66,7 @@ class Output(NamedTuple):
     whose shares store whole rows (a dense one's) alone takes one. `narrowed`, its value already a
     `divisor`-th of the tile's columns as its epilogue computes it (a wide gated product's hidden activation,
     one of each gate and up column pair, `templates.gemm.wide`), stored as computed, a chunk's `chunk //
-    divisor` columns at its tile column over `divisor`, as a packed one's are."""
+    divisor` columns, placed in its own columns (its caller's `place`)."""
 
     shape: tuple[int, int]
     dtype: jax.typing.DTypeLike
@@ -93,7 +93,10 @@ def staged_columns(columns: int, dtypes, *, swizzle: int = STAGED_BYTES,
     if not packed:
         return math.gcd(columns, swizzle // max(jnp.dtype(dtype).itemsize for dtype in dtypes))
     within = columns if piece is None else math.gcd(columns, piece)
-    chunk = math.gcd(within, swizzle // max(jnp.dtype(dtype).itemsize for dtype in dtypes))
+    # A narrowed output stores a swizzle's row of its own columns a chunk where the tile holds one, its
+    # tile columns that many times its divisor.
+    narrowing = max((output.divisor for output in packed if output.narrowed), default=1)
+    chunk = math.gcd(within, narrowing * swizzle // max(jnp.dtype(dtype).itemsize for dtype in dtypes))
     return next((wider for wider in range(chunk, within + 1, chunk)
                  if not within % wider and _packed_refusal(wider, packed) is None), columns)
 
@@ -229,7 +232,7 @@ def staged_chunks(smem, value: jax.Array, ref, place: tuple, *, write: Callable 
     every chunk staged commits at least one (`buffer_waits`). An output stored packed (`divisor`,
     `Output.divisor`) stages a buffer's columns times it of the tile a chunk, stored at its tile column over
     it; `transposed` (`Output.transposed`), its buffer `[columns, rows]`, stored whole (`transposed_rows`);
-    `narrowed` (`Output.narrowed`), its value already its stored columns, a buffer's at a time."""
+    `narrowed` (`Output.narrowed`), its value and `place` already its stored columns, a buffer's at a time."""
     pl.when(place[2] > 0)(functools.partial(staged, smem, value, ref, place, write=write, waits=waits,
                                             divisor=divisor, transposed=transposed, narrowed=narrowed))
 
@@ -254,13 +257,13 @@ def staged(smem, value: jax.Array, ref, place: tuple, *, write: Callable = writt
             # row's end would write into the next row.
             raise ValueError(f"a packed chunk of {width} columns copied a row at a time over "
                              f"{ref.shape[-1]} columns runs its last chunk into the next row")
-    # One placement for every form: a chunk's first stored column is its tile column over `divisor`, a
-    # narrowed value's chunks already in stored columns.
+    # A narrowed value and its place are its stored columns already (its caller's: a tile's column over the
+    # divisor is no multiple of the stores' tiling the lowering can prove); a packed one's its tile's.
     chunks = column_chunks(value, width if narrowed else width * divisor)
     waits = buffer_waits(len(chunks), buffers) if waits is None else waits
     for chunk, (start, piece) in enumerate(chunks):
         plgpu.wait_smem_to_gmem(waits[chunk], wait_read_only=True)
-        at = (column + start * (divisor if narrowed else 1)) // divisor
+        at = column + start if narrowed else (column + start) // divisor
         if transposed:
             transposed_rows(smem.at[chunk % buffers], piece, ref, row_start, at, write=write)
             continue

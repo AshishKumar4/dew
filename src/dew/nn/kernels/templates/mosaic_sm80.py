@@ -745,7 +745,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     walks_scoped = True  # `emit_pipeline` allocates each walk's slots in its own scope
 
-    stores_narrowed = True  # a narrowed output staged whole at its stored shape, placed by `persist`'s store
+    stores_narrowed = True  # a narrowed output staged whole at its stored shape, at its caller's place
 
     walks_streamed = True  # consumers of one collective pipeline walk every streamed step (`walk_own`)
 
@@ -907,15 +907,11 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         del in_flight, unrolled, accumulators  # its walk carries its accumulators
         index = 0 if consumers == 1 else lax.axis_index("wg")
         staging = self.output_staging(outputs, consumers, chunks)
-        # A narrowed output (`stores.Output.narrowed`) is staged whole at its stored shape and stored at its
-        # tile's column over its divisor, as a chunk-staging family's stores place it (`stores.staged`).
-        divisors = [output.divisor if output.narrowed else 1 for output in map(stores.Output.of, outputs)]
         opened: list = []
 
         def store(output, value, ref, place):
-            if divisors[output] > 1:
-                row_start, first, stored, column, *ladder = place
-                place = (row_start, first, stored, column // divisors[output], *ladder)
+            # A narrowed output (`stores.Output.narrowed`) is staged whole at its stored shape, its `place`
+            # its own columns (its caller's), as a chunk-staging family's stores take it (`stores.staged`).
             # Interpreted pipelines use barrier-tracked copies, not cp.async groups.
             if not interpret:
                 plgpu.wait_gmem_to_smem(0)
