@@ -88,5 +88,6 @@ def summed(load, chunks: int, *, axis: int, width: int, lower: int, bins: int, d
         return values, exponents
 
     values, exponent = jax.vmap(compressed)(sums.reshape(-1, bins), indices.reshape(-1, bins))
-    totals = placed_totals(values.reshape(sums.shape), exponent.reshape(sums.shape), dtype, may_round=may_round)
+    totals = placed_totals(values.reshape(sums.shape), exponent.reshape(sums.shape), dtype,
+                           may_round=may_round)
     return totals, count
