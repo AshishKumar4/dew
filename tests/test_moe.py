@@ -618,9 +618,11 @@ def test_a_layers_paired_and_scaled_expert_products_are_one_launch_as_exact_as_a
 
 @contextlib.contextmanager
 def _chained():
-    """Where a gated expert layer runs its chain on a CPU: an H100's Mosaic GPU launches interpreted, its
-    grouped matmul Mosaic GPU's and its gated MLP named fused (`gated_mlp.GATED_MLP`, whose grouped cell no
-    receipt declares yet, row 12847)."""
+    """Where a gated expert layer traces its chain on a CPU: as on an H100, its grouped matmul Mosaic GPU's
+    and its gated MLP named fused (`gated_mlp.GATED_MLP`, whose grouped cell no receipt declares yet, row
+    12847), the program's launches the H100's (`grouped_matmul.weighed` sees them) and its arithmetic the
+    template's portable XLA on the CPU, which interprets no launch here (`gemm.gemm`'s `interpret_on_cpu`
+    unset): a portable check of the chain's arithmetic, its launches' own the GPU tier's."""
     from dew.nn.kernels import generation
 
     with generation.assumed("sm90", interpreted=True), generation.chosen(grouped_matmul="mosaic",

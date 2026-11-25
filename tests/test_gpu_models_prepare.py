@@ -100,6 +100,16 @@ m_dew_run = arm_role("dew", run_mb[0], m_label)
 assert m_dew_prep is not None, "ModernBERT dew arm has no statement"
 assert m_dew_prep == m_dew_run, f"ModernBERT dew arm_role drifted across devices: {m_dew_prep} != {m_dew_run}"
 
+# The causal site's sm90 programs: both its arms', by the keys the run looks them up by, or neither (its cell
+# deferred whole, its cuDNN launch lowering on no deviceless prepare), never one arm's without the other's,
+# which the run would read beside an unprepared twin.
+c_sample = drawn_on_the_host(run_causal[2], 0)
+c_programs = (AheadPrograms.load(ro.path(armed(c_label)) / PROGRAMS).programs
+              if ro.holds(armed(c_label)) else {})
+c_held = {role for role, role_name in (("dew", c_dew_run), ("reference", c_ref_run))
+          if named(role_name, c_sample) in c_programs}
+assert c_held in (set(), {"dew", "reference"}), (c_held, sorted(c_programs))
+
 # Confirm ModernBERT's run-side program name matches what sm90 prepare stored.
 mb_sample = drawn_on_the_host(run_mb[2], 0)
 mb_programs = AheadPrograms.load(ro.path(armed(m_label)) / PROGRAMS).programs
@@ -121,7 +131,6 @@ os.environ.pop(tier_wire.PREPARE, None)
 with jax.default_device(cpus[1]), compiled_truths(cpu_store, prepare=False, stamp="cpu") as store:
     stored_ref = _stored_arm(store, c_label, run_causal[1], run_causal[1], "reference")
     assert isinstance(stored_ref, _Ahead), "causal reference arm ran unprepared"
-    c_sample = drawn_on_the_host(run_causal[2], 0)
     ref_out = stored_ref(*c_sample)
     assert all(np.all(np.isfinite(np.asarray(leaf))) for leaf in jax.tree.leaves(ref_out))
 

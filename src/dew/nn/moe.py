@@ -853,17 +853,20 @@ def gated_experts(x: jax.Array | Gathered, gate: jax.Array | Layered, up: jax.Ar
     # Fused where the gated MLP's selector chooses it (`gated_mlp.GATED_MLP`, its grouped cell, row 12847):
     # the pair one product of a layer the down projection's, which takes the gated product as its prologue
     # (no NVFP4 bank's, no recipe's that takes the experts), the hook lowering on the template's launches.
-    packed = isinstance(down_stack, formats.NvFp4)
+    packed = isinstance(gate_stack, formats.NvFp4) or isinstance(down_stack, formats.NvFp4)
     with _named(implementation):
-        # A packed bank's matrices are its codes, of no product's shape a launch reads (`None`).
-        fused = paired is not None and fuses_grouped(
-            jax.ShapeDtypeStruct((_sorted_rows(x), gate_stack.shape[-2]), compute),
+        # Asked of every call, one whose pair runs apart among them, so the selector reports each grouped
+        # MLP's route. A packed bank's matrices are its codes, of no product's shape a launch reads (`None`).
+        fused = fuses_grouped(
+            jax.ShapeDtypeStruct((_sorted_rows(x), x.tokens.shape[-1] if isinstance(x, Gathered)
+                                  else x.shape[-1]), compute),
             # One layer's experts' matrices, `[experts, in, out]`, of a stack of layers' too.
             None if packed else (jax.ShapeDtypeStruct(gate_stack.shape[-3:], compute),
                                  jax.ShapeDtypeStruct(down_stack.shape[-3:], compute)),
-            precision, hook, paired=down_layer is paired[-1],
-            down_prologue=not packed and not _recipe_takes_experts(down_stack))
-    if not fused:
+            precision, hook, paired=paired is not None and down_layer is paired[-1],
+            down_prologue=not isinstance(down_stack, formats.NvFp4) and not _recipe_takes_experts(down_stack))
+    # The selector fuses a pair alone (its `paired` requirement).
+    if paired is None or not fused:
         gate_scale, up_scale, down_scale = scales or (None, None, None)
         gate_rows, up_rows = (_apart(x, (gate, up), group_sizes, compute, implementation, precision,
                                      (gate_scale, up_scale))
