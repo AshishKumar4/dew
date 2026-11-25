@@ -198,23 +198,20 @@ def _cov_tangent_tile(
     pw_cy = _weighted_term(tw, jnp.where((tw > 0) | jnp.isfinite(cy), cy, 0.0), sn)
     pw_cx = _weighted_term(tw, jnp.where((tw > 0) | jnp.isfinite(cx), cx, 0.0), sn)
     cov_term = jnp.where(pos, cov[..., None], 0.0)
-    tiny = jnp.asarray(jnp.finfo(cx.dtype).tiny, cx.dtype)
     cx_sg, cy_sg = jax.lax.stop_gradient(cx), jax.lax.stop_gradient(cy)
     cov_sg = jax.lax.stop_gradient(cov_term)
     prod_sg = cx_sg * cy_sg
     prod_ovf = (jnp.isfinite(cx_sg) & jnp.isfinite(cy_sg) & jnp.isfinite(cov_sg)
                 & (~jnp.isfinite(prod_sg) | ~jnp.isfinite(prod_sg - cov_sg)))
-    prod_unf = (cx_sg != 0) & (cy_sg != 0) & (jnp.abs(prod_sg) < tiny)
-    prod_split = prod_ovf | prod_unf
-    cx_safe = jnp.where(prod_split, 0.0, cx)
-    cy_safe = jnp.where(prod_split, 0.0, cy)
-    d_cov_no = _safe_tangent_div(jnp.where(prod_split, 0.0, dtw),
-                                 cx_safe * cy_safe - jnp.where(prod_split, 0.0, cov_term),
-                                 jnp.where(prod_split, 1.0, sn))
-    d_cov_sp = _safe_tangent_cov(jnp.where(prod_split, dtw, 0.0), jnp.where(prod_split, cx, 0.0),
-                                 jnp.where(prod_split, cy, 0.0), jnp.where(prod_split, cov_term, 0.0),
-                                 jnp.where(prod_split, sn, 1.0))
-    d_cov_w = jnp.where(prod_split, d_cov_sp, d_cov_no)
+    cx_safe = jnp.where(prod_ovf, 0.0, cx)
+    cy_safe = jnp.where(prod_ovf, 0.0, cy)
+    d_cov_no = _safe_tangent_div(jnp.where(prod_ovf, 0.0, dtw),
+                                 cx_safe * cy_safe - jnp.where(prod_ovf, 0.0, cov_term),
+                                 jnp.where(prod_ovf, 1.0, sn))
+    d_cov_ov = _safe_tangent_cov(jnp.where(prod_ovf, dtw, 0.0), jnp.where(prod_ovf, cx, 0.0),
+                                 jnp.where(prod_ovf, cy, 0.0), jnp.where(prod_ovf, cov_term, 0.0),
+                                 jnp.where(prod_ovf, sn, 1.0))
+    d_cov_w = jnp.where(prod_ovf, d_cov_ov, d_cov_no)
     d_cov_raw = jnp.sum(pw_cy * dtx + pw_cx * dty + d_cov_w, axis=-1)
     return d_mx, d_my, d_cov_raw, jnp.sum(pw_cy, axis=-1), jnp.sum(pw_cx, axis=-1), jnp.sum(dtw, axis=-1)
 
