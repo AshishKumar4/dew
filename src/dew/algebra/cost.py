@@ -80,12 +80,17 @@ def _operation_work(primitive, inputs, outputs, params, on: generation.GpuTarget
 def _priced(primitive, params, shapes: list[tuple[int, ...]], made: tuple[int, ...],
             on: generation.GpuTarget | None = None, dtype=None) -> Work:
     """An equation's arithmetic as the kernels' counter prices its primitive (`_operation_work`) on `on`, its
-    operands of `shapes` and the value it makes of `made` at `VALUE`; a division at its term's `dtype` where
-    traced (an fp32 one's price is its own, `emission.IEEE_DIVISION`; another width's and an integer's not),
-    a rewrite's, which no trace typed, at `VALUE` as every other term."""
-    held = dtype if primitive is jax.lax.div_p and dtype is not None else VALUE
-    return _operation_work(primitive, [jax.ShapeDtypeStruct(known, held) for known in shapes],
-                           [jax.ShapeDtypeStruct(made, held)], params, on)
+    operands of `shapes` and the value it makes of `made` at `VALUE`; a division at its term's `dtype`, its
+    price its dtype's (an fp32 one's its own, `emission.IEEE_DIVISION`), one a rewrite made, which no trace
+    typed (`rules._ranged`'s quotient of a bfloat16 program's operands), an operation an element, as
+    unproven fp32."""
+    if primitive is jax.lax.div_p:
+        if dtype is None:
+            return Work(operations=float(math.prod(made)))
+        return _operation_work(primitive, [jax.ShapeDtypeStruct(known, dtype) for known in shapes],
+                               [jax.ShapeDtypeStruct(made, dtype)], params, on)
+    return _operation_work(primitive, [jax.ShapeDtypeStruct(known, VALUE) for known in shapes],
+                           [jax.ShapeDtypeStruct(made, VALUE)], params, on)
 
 
 def _elementwise(graph: EGraph, primitive, params, operands, held: dict | None,
@@ -97,9 +102,10 @@ def _elementwise(graph: EGraph, primitive, params, operands, held: dict | None,
             else _priced(primitive, params, shapes, np.broadcast_shapes(*shapes), on, dtype))
 
 
-def _product(left: tuple[int, ...], right: tuple[int, ...], params, product) -> tuple[Work, int]:
-    """A product's arithmetic as the kernels' counter prices it (`_operation_work`: its FLOPs in
-    the mode and passes it multiplies in on the price's target, `target`), and its result's elements: the
+def _product(left: tuple[int, ...], right: tuple[int, ...], params, product,
+             on: generation.GpuTarget | None = None) -> tuple[Work, int]:
+    """A product's arithmetic as the kernels' counter prices it (`_operation_work`: its FLOPs in the mode
+    and passes it multiplies in on `on`, else the price's target, `target`), and its result's elements: the
     batch, the left's free axes, the right's free axes, its operands at their dtypes and its result at the
     one it makes (`terms.Product.made`, JAX's own rule: a bfloat16 by a float16 product is bfloat16, which
     NumPy's promotion refused, base review 0b8b7ed98 F1)."""
@@ -110,7 +116,7 @@ def _product(left: tuple[int, ...], right: tuple[int, ...], params, product) -> 
     inputs = [jax.ShapeDtypeStruct(extent, jnp.dtype(dtype))
               for extent, dtype in zip((left, right), product.operands, strict=True)]
     outputs = [jax.ShapeDtypeStruct(extents, product.made)]
-    done = _operation_work(jax.lax.dot_general_p, inputs, outputs, params, target())
+    done = _operation_work(jax.lax.dot_general_p, inputs, outputs, params, on or target())
     return done, math.prod(extents)
 
 
@@ -167,7 +173,7 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None,
         product = region.products[index]
         read = sum(math.prod(extent) * np.dtype(dtype).itemsize
                    for extent, dtype in zip((left, right), product.operands, strict=True))
-        done, elements = _product(left, right, params, product)
+        done, elements = _product(left, right, params, product, on)
         return done + Work(shared_bytes=read, kernels=1.0, kept_bytes=kept(elements, product.made.itemsize))
     if (args := get_callable_args(node, Term.binary)) is not None and text(args[1]) == RESCALE:
         # A declaration's own rescale of two anchors (`derive.Reduction.rescale`): an exponential an element.
