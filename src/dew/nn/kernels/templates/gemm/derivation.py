@@ -223,10 +223,12 @@ def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], sha
             if not candidate(tile):
                 # A tile a compile of this process found spilling (`report.refused`) gives way to the next.
                 continue
-            if outputs and (tile.stages < busy or (tile.stages == busy and layout.feeds_itself)):
-                # A ring short of busy (a hooked epilogue's outputs and side tiles beside it: the paired
-                # backward's pulled launch, three outputs and two sides, row 1958), or one its consumers
-                # feed at its least busy depth, deepened by a smaller staging of its outputs.
+            if outputs and ((tile.stages < busy and layout.stores_chunks)
+                            or (tile.stages == busy and layout.feeds_itself)):
+                # A ring short of busy where its outputs stage in chunks (a hooked epilogue's outputs and side
+                # tiles beside it: the paired backward's pulled launch, three outputs and two sides, row
+                # 1958), or one its consumers feed at its least busy depth, deepened by a smaller staging of
+                # its outputs.
                 tile = _ring_staged(tile, layout, outputs, candidate=candidate, launch_of=launch_of,
                                     target=target, programs=programs)
             if tile.stages >= busy:
