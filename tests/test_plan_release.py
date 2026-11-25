@@ -1,6 +1,7 @@
 """A plan's release of a Muon step's joined Newton-Schulz stacks (`ns_group` 1) as its search orders it
 against each rung's miss (`dew.training.planning.FitSearch.searched`, `Parting`, row 12463)."""
 
+import functools
 import json
 from collections.abc import Callable
 
@@ -8,7 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from test_plan import free_until_placed, needs, one_device
+from test_plan import LONG_BATCH, free_until_placed, needs, one_device
 
 from dew import newton_schulz
 from dew._records import JSON
@@ -84,6 +85,88 @@ def test_a_runs_param_groups_count_every_muon_transforms_joined_stacks():
         return newton_schulz.joined_held(lambda: jax.eval_shape(solver.update, params, state, params))[1]
 
     assert held(grouped) == held(OptimConfig(optimizer=Muon(), lr=1e-2)) > 0
+
+
+MUON_SEQ = 32
+"""Row length of `muon_lm`: two scanned runs of two layers over 32 tokens give eight square projection
+stacks so `ns_group=4` joins half of them and recomputing saves beside the update's peak."""
+
+
+def muon_lm(remat: str | None = None, **opts) -> Trainer:
+    """A four-layer hybrid LM (two scanned runs of two layers) trained by Muon over one microbatch a step
+    of two rows: its runs' matrices of one shape are eight stacks its Newton-Schulz joins where `opts` states
+    no group, wide enough beside the rows' activations that the update's iteration holds the step's peak;
+    recomputing as `remat` names where given."""
+    model = CausalTransformer(
+        vocab_size=64, emb_features=128, num_layers=4, num_heads=2, mlp_features=256,
+        max_seq_len=MUON_SEQ,
+        layer_types=("sliding_attention", "sliding_attention", "full_attention", "full_attention"),
+        kinds={"sliding_attention": {"window": 4}},
+        **({} if remat is None else {"remat": REMAT_POLICIES[remat]}))
+    config = OptimConfig(optimizer=Muon(**opts), lr=1e-2)
+    return one_device(Trainer(LMObjective(model, seq_len=MUON_SEQ), config, key=jax.random.key(0),
+                              split=1))
+
+
+def fitted_once(trainer: Trainer) -> None:
+    """`trainer` fit one step of two of LONG_BATCH's rows cut to `MUON_SEQ`, its plan made as a fit makes
+    it."""
+    rows = np.asarray(LONG_BATCH["text"][:2, :MUON_SEQ + 1])
+    trainer.fit(Pipeline(Memory({"text": rows})).repeat().batch(2), steps=1)
+
+
+@functools.cache
+def muon_needs() -> tuple[int, int, JSON]:
+    """The rooms the cells below free for the Muon step (`muon_lm`) before its state is placed
+    (`free_until_placed`), and the parted step's remat. Each holds the bytes of the arguments the devices
+    hold none of yet, which a fit plans its step beside before placing them, and lies past what the step
+    needs beside what a device holds with its Newton-Schulz stacks parted (`ns_group` 1): the first half way
+    from there to what it needs with them joined, the second half way from the most of that and of what it
+    needs with them grouped by four recomputing 'minimal', the first rung of that group's climb that frees
+    anything, to what it needs grouped by four. Freed as `free` frees, without the arguments and never taken
+    by them, no rung of that plan fitted and the placed devices' room passed the joined step: the fit
+    searched its ladder again once placed (row 8606: 129 s a cell). Measured once."""
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        joined = needs(monkeypatch, trainer := muon_lm(), lambda: fitted_once(trainer))
+        grouped = needs(monkeypatch, trainer := muon_lm(ns_group=4), lambda: fitted_once(trainer))
+        recomputing = needs(monkeypatch, trainer := muon_lm("minimal", ns_group=4),
+                            lambda: fitted_once(trainer))
+        parted = needs(monkeypatch, trainer := muon_lm(ns_group=1), lambda: fitted_once(trainer))
+    assert parted < joined and max(parted, recomputing) < grouped, (parted, recomputing, grouped, joined)
+    arguments = trainer.plan["probes"][0]["argument"]
+    return ((joined + parted) // 2 + arguments, (grouped + max(parted, recomputing)) // 2 + arguments,
+            trainer.plan["remat"])
+
+
+@pytest.mark.shared_setup("muon_needs")
+def test_a_muon_step_that_fits_only_with_its_stacks_parted_parts_them_before_recomputing(monkeypatch):
+    """A Muon step whose joined Newton-Schulz stacks' copies leave it short of the devices' room, and which
+    fits with them parted, its split fixed: its plan parts them, joining one at a time (`ns_group` 1, the
+    climb's release after the narrow copies, `FitSearch.searched`), and recomputes nothing more, where it
+    climbed the remat rungs (row 5889: the joined copies held 11.3 GB of a 4B step's peak for 82 ms a
+    step)."""
+    room, _, remat = muon_needs()
+    free_until_placed(monkeypatch, room)
+    planned = muon_lm()
+    fitted_once(planned)
+    assert planned.plan["ns_group"] == 1, planned.plan
+    assert planned.plan["remat"] == remat, planned.plan
+
+
+@pytest.mark.shared_setup("muon_needs")
+def test_a_muon_run_that_states_its_stacks_group_keeps_it(monkeypatch):
+    """A Muon run that states its Newton-Schulz group keeps it, in the room where an unstated run's plan
+    parts its stacks, and its own step fits recomputing: its group joins every stack, as the joined step
+    does, and the planner asks no step of it to join them one at a time (`FitSearch.searched`), recomputing
+    instead (row 8696: in all of the room no release was ever asked, so a stated group overridden failed
+    nothing)."""
+    _, room, _ = muon_needs()
+    free_until_placed(monkeypatch, room)
+    stated = muon_lm(ns_group=4)
+    fitted_once(stated)
+    groups = [probe["ns_group"] for probe in stated.plan["probes"]]
+    assert stated.plan["ns_group"] is None and stated.plan["remat"] is not None, stated.plan
+    assert groups and 1 not in groups, groups
 
 
 class Scripted(FitSearch):
