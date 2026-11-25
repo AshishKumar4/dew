@@ -361,11 +361,6 @@ def min_op() -> i64: ...
 
 
 @function(merge=lambda old, new: old)
-def sqrt_op() -> i64: ...
-"""The parameters index of `lax.sqrt_p`."""
-
-
-@function(merge=lambda old, new: old)
 def abs_op() -> i64: ...
 """The parameters index of `lax.abs_p`."""
 
@@ -510,14 +505,14 @@ def anchor_slot(term: Term) -> i64: ...
 
 
 @function
-def moment_scale(term: Term) -> Term: ...
-"""The carried zero-mass scale factor `s in [1, s_cap]` of a weighted central moment (`central_moment`),
-holding `m_stored = m_true / s^2` while `n == 0` and `1.0` whenever `n > 0`."""
+def moment_scale(term: Term, axis_side: i64) -> Term: ...
+"""The carried per-axis (`0` for `x`, `1` for `y`) zero-mass scale `s in [1, s_cap]` of a weighted central
+moment (`central_moment`), holding `m_stored = m_true / (s_x * s_y)` while `n == 0` and `1.0` when `n > 0`."""
 
 
 @function(merge=lambda old, new: old)
-def scale_slot(term: Term) -> i64: ...
-"""The state slot holding `term`'s zero-mass scale (`moment_scale`)."""
+def scale_slot(term: Term, axis_side: i64) -> i64: ...
+"""The state slot holding `term`'s per-axis zero-mass scale (`moment_scale`)."""
 
 
 @function
@@ -802,20 +797,63 @@ def _scaled_diff(ops: dict[str, i64], a0, a1, r0, r1, zero_n, half_n, qmax) -> t
 
 def _scale_for_peak(ops: dict[str, i64], base_scale, peak, one_n, s_thr, s_cap) -> Term:
     """Zero-mass scale factor `s in [1, s_cap]` keeping `peak / s <= s_thr` (so squared products stay
-    finite while `s^2 <= 0.5 * finfo.max` stays finite in VJP), equal to `1.0` when `peak <= s_thr`."""
+    finite while `s_x * s_y <= 0.5 * finfo.max` stays finite in VJP), equal to `1.0` when `peak <= s_thr`."""
     need = peak.binary(String("div"), s_thr, ops["div"]).binary(String("max"), one_n, ops["max"])
     return base_scale.binary(String("max"), need, ops["max"]).binary(String("min"), s_cap, ops["min"])
 
 
+def _balanced_tile_prod(ops: dict[str, i64], w, a, b, one_w) -> Term:
+    """Range-safe elementwise `w * a * b` for `w >= 0`: multiplies `w` by the larger factor when `w <= 1`
+    and by the smaller factor when `w > 1`, avoiding overflow, premature underflow, and `sqrt(0)`."""
+    a_ge_b = a.unary(String("abs"), ops["abs"]).compare(
+        String("ge"), b.unary(String("abs"), ops["abs"]), ops["ge"])
+    big_d, small_d = a_ge_b.select(b, a), a_ge_b.select(a, b)
+    grow = w.compare(String("gt"), one_w, ops["gt"])
+    first, second = grow.select(big_d, small_d), grow.select(small_d, big_d)
+    return w.binary(String("mul"), first, ops["mul"]).binary(String("mul"), second, ops["mul"])
+
+
+def _balanced_quot_prod(ops: dict[str, i64], rx, ry, denom, one_n) -> Term:
+    """Range-safe `(rx * ry) / denom` for `denom > 0`: divides the larger factor by `denom` when `denom > 1`
+    and the smaller factor when `denom <= 1`, preventing premature underflow or overflow."""
+    x_ge_y = rx.unary(String("abs"), ops["abs"]).compare(
+        String("ge"), ry.unary(String("abs"), ops["abs"]), ops["ge"])
+    big_r, small_r = x_ge_y.select(ry, rx), x_ge_y.select(rx, ry)
+    shrink = denom.compare(String("gt"), one_n, ops["gt"])
+    first, second = shrink.select(small_r, big_r), shrink.select(big_r, small_r)
+    return first.binary(String("div"), denom, ops["div"]).binary(String("mul"), second, ops["mul"])
+
+
+def _balanced_triple(ops: dict[str, i64], n_min, denom, a, b, one_n, zero_n) -> Term:
+    """Range-safe `(n_min / denom) * a * b` for `n_min >= 0`, `denom in [1, 2]`: associates the scaling
+    factor with whichever of `(a, b)` pulls the intermediate toward 1, avoiding overflow and premature
+    underflow across arbitrary exponent ratios and minimum-normal weights."""
+    a_ge_b = a.unary(String("abs"), ops["abs"]).compare(
+        String("ge"), b.unary(String("abs"), ops["abs"]), ops["ge"])
+    big_d, small_d = a_ge_b.select(b, a), a_ge_b.select(a, b)
+    grow = n_min.compare(String("gt"), denom, ops["gt"])
+    first, second = grow.select(big_d, small_d), grow.select(small_d, big_d)
+    div_first = n_min.compare(String("gt"), one_n, ops["gt"])
+    safe_eff = div_first.select(zero_n, n_min.binary(String("div"), denom, ops["div"]))
+    safe_n = div_first.select(n_min, zero_n)
+    hi_arm = safe_eff.binary(String("mul"), first, ops["mul"]).binary(String("mul"), second, ops["mul"])
+    t1 = safe_n.binary(String("mul"), first, ops["mul"])
+    big_t1 = t1.unary(String("abs"), ops["abs"]).compare(String("gt"), one_n, ops["gt"])
+    lo_hi = t1.binary(String("div"), denom, ops["div"]).binary(String("mul"), second, ops["mul"])
+    lo_lo = big_t1.select(t1, zero_n).binary(String("mul"), second, ops["mul"]).binary(
+        String("div"), denom, ops["div"])
+    return div_first.select(big_t1.select(lo_lo, lo_hi), hi_arm)
+
+
 def _zero_mass_shift_scaled(ops: dict[str, i64], z_n, z_rx, z_ry, dx_eff, big_x, dy_eff, big_y,
-                            s_work, zero_n, sign_val: int) -> Term:
-    """First-order re-anchoring correction for a zero-mass partial at scale `s_work` (representing
-    `shift_true / s_work^2`): primal 0, exact scaled weight derivative, parenthesized as `n * (dx_s * dy_s)`
-    so unselected VJP cotangents never multiply `inf * 0`."""
-    dx_s = dx_eff.binary(String("div"), s_work, ops["div"])
-    dy_s = dy_eff.binary(String("div"), s_work, ops["div"])
-    rx_s = z_rx.binary(String("div"), s_work, ops["div"])
-    ry_s = z_ry.binary(String("div"), s_work, ops["div"])
+                            sx_work, sy_work, zero_n, sign_val: int) -> Term:
+    """First-order re-anchoring correction for a zero-mass partial at per-axis scales `(sx_work, sy_work)`
+    (representing `shift_true / (sx_work * sy_work)`): primal 0, exact scaled weight derivative,
+    parenthesized as `n * (dx_s * dy_s)` so unselected VJP cotangents never multiply `inf * 0`."""
+    dx_s = dx_eff.binary(String("div"), sx_work, ops["div"])
+    dy_s = dy_eff.binary(String("div"), sy_work, ops["div"])
+    rx_s = z_rx.binary(String("div"), sx_work, ops["div"])
+    ry_s = z_ry.binary(String("div"), sy_work, ops["div"])
     n_x = big_x.select(z_n, z_n.binary(String("add"), z_n, ops["add"]))
     n_xy = big_y.select(n_x, n_x.binary(String("add"), n_x, ops["add"]))
     ry_x = big_x.select(ry_s, ry_s.binary(String("add"), ry_s, ops["add"]))
@@ -829,9 +867,9 @@ def _zero_mass_shift_scaled(ops: dict[str, i64], z_n, z_rx, z_ry, dx_eff, big_x,
 
 def _corr_both(ops: dict[str, i64], n0, ax0, rx0, ay0, ry0, n1, ax1, rx1, ay1, ry1,
                sign_val: int) -> tuple[Term, Term, Term, Term, Term, Term, Term, Term]:
-    """Positive-mass Chan-Golub-LeVeque merge correction and shared guarded residual means: takes
-    `sqrt(n_min) / sqrt(1 + n_min / n_max)` so minimum-normal weights stay normal through `sqrt`, and
-    adaptively halves anchor differences only past `0.25 * finfo.max`."""
+    """Positive-mass Chan-Golub-LeVeque merge correction and shared guarded residual means: balances
+    `(n_min / (1 + n_min / n_max)) * dx * dy` by factor magnitudes (`_balanced_triple`) and adaptively halves
+    anchor differences only past `0.25 * finfo.max`."""
     zero_n = Term.literal(ops["z_n"]).shaped(String("broadcast_in_dim"), ops["fill_n"])
     one_n = Term.literal(ops["o_n"]).shaped(String("broadcast_in_dim"), ops["fill_n"])
     half_n = Term.literal(ops["h_n"]).shaped(String("broadcast_in_dim"), ops["fill_n"])
@@ -844,19 +882,14 @@ def _corr_both(ops: dict[str, i64], n0, ax0, rx0, ay0, ry0, n1, ax1, rx1, ay1, r
     n_max = n0.binary(String("max"), n1, ops["max"])
     n_min = n0.binary(String("min"), n1, ops["min"])
     safe_max = both.select(one_n, n_max)
-    safe_min = both.select(one_n, n_min)
     denom = one_n.binary(String("add"), n_min.binary(String("div"), safe_max, ops["div"]), ops["add"])
-    root_w = both.select(
-        zero_n,
-        safe_min.unary(String("sqrt"), ops["sqrt"]).binary(
-            String("div"), denom.unary(String("sqrt"), ops["sqrt"]), ops["div"]))
     r0x, r1x = rx0.binary(String("div"), safe0, ops["div"]), rx1.binary(String("div"), safe1, ops["div"])
     r0y, r1y = ry0.binary(String("div"), safe0, ops["div"]), ry1.binary(String("div"), safe1, ops["div"])
     dx_eff, big_x = _scaled_diff(ops, ax0, ax1, r0x, r1x, zero_n, half_n, qmax_n)
     dy_raw, big_y = _scaled_diff(ops, ay0, ay1, r0y, r1y, zero_n, half_n, qmax_n)
     dy_eff = dy_raw if sign_val == 1 else zero_n.binary(String("sub"), dy_raw, ops["sub"])
-    base_corr = root_w.binary(String("mul"), both.select(zero_n, dx_eff), ops["mul"]).binary(
-        String("mul"), root_w.binary(String("mul"), both.select(zero_n, dy_eff), ops["mul"]), ops["mul"])
+    base_corr = _balanced_triple(ops, both.select(zero_n, n_min), denom,
+                                 both.select(zero_n, dx_eff), both.select(zero_n, dy_eff), one_n, zero_n)
     after_x = big_x.select(base_corr, base_corr.binary(String("add"), base_corr, ops["add"]))
     corr_both = big_y.select(after_x, after_x.binary(String("add"), after_x, ops["add"]))
     return pos0, pos1, both, corr_both, r0x, r1x, r0y, r1y
@@ -871,12 +904,13 @@ def _moment_combine_masked(ops: dict[str, i64], m0, n0, ax0, rx0, ay0, ry0,
         String("add"), both.select(zero_n, corr_both), ops["add"])
 
 
-def _moment_combine_weighted(ops: dict[str, i64], m0, s0, n0, ax0, rx0, ay0, ry0,
-                             m1, s1, n1, ax1, rx1, ay1, ry1, sign_val: int) -> tuple[Term, Term]:
+def _moment_combine_weighted(ops: dict[str, i64], m0, sx0, sy0, n0, ax0, rx0, ay0, ry0,
+                             m1, sx1, sy1, n1, ax1, rx1, ay1, ry1,
+                             sign_val: int) -> tuple[Term, Term, Term]:
     """Range-safe, zero-weight-differentiable anchored Chan-Golub-LeVeque combine returning
-    `(m_merged, s_merged)`: positive-mass merges stay unscaled (`s=1`), zero-mass merges carry
-    `m_true / s^2` with `s in [1, s_cap]`, and zero-into-positive merges cancel at `s_work` before unscaling
-    so large-offset zero-weight covariance derivatives never hit `inf - inf`."""
+    `(m_merged, sx_merged, sy_merged)`: positive-mass merges stay unscaled (`s_x=s_y=1`), zero-mass merges
+    carry `m_true / (s_x * s_y)` with independent per-axis scales in `[1, s_cap]`, and zero-into-positive
+    merges cancel at `(sx_work, sy_work)` before unscaling."""
     zero_n = Term.literal(ops["z_n"]).shaped(String("broadcast_in_dim"), ops["fill_n"])
     one_n = Term.literal(ops["o_n"]).shaped(String("broadcast_in_dim"), ops["fill_n"])
     half_n = Term.literal(ops["h_n"]).shaped(String("broadcast_in_dim"), ops["fill_n"])
@@ -893,36 +927,64 @@ def _moment_combine_weighted(ops: dict[str, i64], m0, s0, n0, ax0, rx0, ay0, ry0
     z_rx0, z_ry0 = pos0.select(rx0, zero_n), pos0.select(ry0, zero_n)
     dx0_eff, big_x0 = _scaled_diff(ops, ax0, ax1, r0x, zero_n, zero_n, half_n, qmax_n)
     dy0_eff, big_y0 = _scaled_diff(ops, ay0, ay1, r0y, zero_n, zero_n, half_n, qmax_n)
-    peak0 = dx0_eff.unary(String("abs"), ops["abs"]).binary(
-        String("max"), dy0_eff.unary(String("abs"), ops["abs"]), ops["max"])
-    s_work0 = _scale_for_peak(ops, s1, peak0, one_n, s_thr_n, s_cap_n)
-    r1_0 = s1.binary(String("div"), s_work0, ops["div"])
-    m1_s0 = z_m1.binary(String("mul"), r1_0, ops["mul"]).binary(String("mul"), r1_0, ops["mul"])
+    sx_w0 = _scale_for_peak(ops, sx1, dx0_eff.unary(String("abs"), ops["abs"]), one_n, s_thr_n, s_cap_n)
+    sy_w0 = _scale_for_peak(ops, sy1, dy0_eff.unary(String("abs"), ops["abs"]), one_n, s_thr_n, s_cap_n)
+    m1_s0 = z_m1.binary(String("mul"), sx1.binary(String("div"), sx_w0, ops["div"]), ops["mul"]).binary(
+        String("mul"), sy1.binary(String("div"), sy_w0, ops["div"]), ops["mul"])
     shift0_s = _zero_mass_shift_scaled(ops, z_n1, z_rx1, z_ry1, dx0_eff, big_x0, dy0_eff, big_y0,
-                                       s_work0, zero_n, sign_val)
+                                       sx_w0, sy_w0, zero_n, sign_val)
     sum1_s = m1_s0.binary(String("add"), shift0_s, ops["add"])
     m_only0 = m0.binary(String("add"),
-                        sum1_s.binary(String("mul"), s_work0, ops["mul"]).binary(
-                            String("mul"), s_work0, ops["mul"]), ops["add"])
+                        sum1_s.binary(String("mul"), sx_w0, ops["mul"]).binary(
+                            String("mul"), sy_w0, ops["mul"]), ops["add"])
     dx1_eff, big_x1 = _scaled_diff(ops, ax1, ax0, r1x, zero_n, zero_n, half_n, qmax_n)
     dy1_eff, big_y1 = _scaled_diff(ops, ay1, ay0, r1y, zero_n, zero_n, half_n, qmax_n)
-    peak1 = dx1_eff.unary(String("abs"), ops["abs"]).binary(
-        String("max"), dy1_eff.unary(String("abs"), ops["abs"]), ops["max"])
-    s_work1 = _scale_for_peak(ops, s0.binary(String("max"), s1, ops["max"]), peak1,
-                              one_n, s_thr_n, s_cap_n)
-    r0_1 = s0.binary(String("div"), s_work1, ops["div"])
-    r1_1 = s1.binary(String("div"), s_work1, ops["div"])
-    m0_s1 = z_m0.binary(String("mul"), r0_1, ops["mul"]).binary(String("mul"), r0_1, ops["mul"])
-    m1_s1 = z_m1.binary(String("mul"), r1_1, ops["mul"]).binary(String("mul"), r1_1, ops["mul"])
+    sx_w1 = _scale_for_peak(ops, sx0.binary(String("max"), sx1, ops["max"]),
+                            dx1_eff.unary(String("abs"), ops["abs"]), one_n, s_thr_n, s_cap_n)
+    sy_w1 = _scale_for_peak(ops, sy0.binary(String("max"), sy1, ops["max"]),
+                            dy1_eff.unary(String("abs"), ops["abs"]), one_n, s_thr_n, s_cap_n)
+    m0_s1 = z_m0.binary(String("mul"), sx0.binary(String("div"), sx_w1, ops["div"]), ops["mul"]).binary(
+        String("mul"), sy0.binary(String("div"), sy_w1, ops["div"]), ops["mul"])
+    m1_s1 = z_m1.binary(String("mul"), sx1.binary(String("div"), sx_w1, ops["div"]), ops["mul"]).binary(
+        String("mul"), sy1.binary(String("div"), sy_w1, ops["div"]), ops["mul"])
     shift1_s = _zero_mass_shift_scaled(ops, z_n0, z_rx0, z_ry0, dx1_eff, big_x1, dy1_eff, big_y1,
-                                       s_work1, zero_n, sign_val)
+                                       sx_w1, sy_w1, zero_n, sign_val)
     sum0_s = m0_s1.binary(String("add"), shift1_s, ops["add"])
     m_only1 = m1.binary(String("add"),
-                        sum0_s.binary(String("mul"), s_work1, ops["mul"]).binary(
-                            String("mul"), s_work1, ops["mul"]), ops["add"])
-    m_both_zero = m1_s1.binary(String("add"), sum0_s, ops["add"])
-    m_zero_side = pos0.select(pos1.select(m_both_zero, m_only1), m_only0)
-    return both.select(m_zero_side, m_both), either.select(s_work1, one_n)
+                        sum0_s.binary(String("mul"), sx_w1, ops["mul"]).binary(
+                            String("mul"), sy_w1, ops["mul"]), ops["add"])
+    m_zero_side = pos0.select(pos1.select(m1_s1.binary(String("add"), sum0_s, ops["add"]), m_only1), m_only0)
+    return both.select(m_zero_side, m_both), either.select(sx_w1, one_n), either.select(sy_w1, one_n)
+
+
+def _moment_finish_weighted(ops: dict[str, i64], i, i_sx_s, i_sy_s, i_n, i_ax, i_sx, i_ay, i_sy,
+                            sign_val: int) -> Term:
+    """Finish form for a weighted central moment: returns `m` directly when `n > 0`, and re-anchors from
+    `(ax, ay)` to `(0, 0)` at per-axis scales `(sx_work, sy_work)` before unscaling when `n == 0`."""
+    zero_n = Term.literal(ops["z_n"]).shaped(String("broadcast_in_dim"), ops["fill_n"])
+    one_n = Term.literal(ops["o_n"]).shaped(String("broadcast_in_dim"), ops["fill_n"])
+    s_thr_n = Term.literal(ops["s_thr"]).shaped(String("broadcast_in_dim"), ops["fill_n"])
+    s_cap_n = Term.literal(ops["s_cap"]).shaped(String("broadcast_in_dim"), ops["fill_n"])
+    n_f, m_f = Term.state(i_n, 0), Term.state(i, 0)
+    sx_f, sy_f = Term.state(i_sx_s, 0), Term.state(i_sy_s, 0)
+    ax_f, rx_f = Term.state(i_ax, 0), Term.state(i_sx, 0)
+    ay_f, ry_f = Term.state(i_ay, 0), Term.state(i_sy, 0)
+    pos_f = n_f.compare(String("gt"), zero_n, ops["gt"])
+    z_mf, z_nf = pos_f.select(m_f, zero_n), pos_f.select(n_f, zero_n)
+    z_rxf, z_ryf = pos_f.select(rx_f, zero_n), pos_f.select(ry_f, zero_n)
+    sx_w = _scale_for_peak(ops, sx_f, ax_f.unary(String("abs"), ops["abs"]), one_n, s_thr_n, s_cap_n)
+    sy_w = _scale_for_peak(ops, sy_f, ay_f.unary(String("abs"), ops["abs"]), one_n, s_thr_n, s_cap_n)
+    m_f_s = z_mf.binary(String("mul"), sx_f.binary(String("div"), sx_w, ops["div"]), ops["mul"]).binary(
+        String("mul"), sy_f.binary(String("div"), sy_w, ops["div"]), ops["mul"])
+    ax_fs, rxf_s = ax_f.binary(String("div"), sx_w, ops["div"]), z_rxf.binary(String("div"), sx_w, ops["div"])
+    ay_fs, ryf_s = ay_f.binary(String("div"), sy_w, ops["div"]), z_ryf.binary(String("div"), sy_w, ops["div"])
+    z_raw = z_nf.binary(String("mul"), ax_fs.binary(String("mul"), ay_fs, ops["mul"]), ops["mul"]).binary(
+        String("add"), ax_fs.binary(String("mul"), ryf_s, ops["mul"]), ops["add"]).binary(
+        String("add"), ay_fs.binary(String("mul"), rxf_s, ops["mul"]), ops["add"])
+    z_s = z_raw if sign_val == 1 else zero_n.binary(String("sub"), z_raw, ops["sub"])
+    sum_s = m_f_s.binary(String("add"), z_s, ops["add"])
+    return pos_f.select(sum_s.binary(String("mul"), sx_w, ops["mul"]).binary(String("mul"), sy_w, ops["mul"]),
+                        m_f)
 
 
 def _moment_first_decoupled(ops: dict[str, i64], common_ops: tuple) -> list:
@@ -997,32 +1059,134 @@ def _moment_first_decoupled(ops: dict[str, i64], common_ops: tuple) -> list:
     return made
 
 
+def _moment_weighted_rules(ops: dict[str, i64], common: tuple, syms: dict) -> list:
+    """Step, merge, scale, and finish rules for weighted central second moments (`central_moment`)."""
+    t, sx, sy, n, x, y, w = syms["t"], syms["sx"], syms["sy"], syms["n"], syms["x"], syms["y"], syms["w"]
+    axes, p, a, i, i_n = syms["axes"], syms["p"], syms["a"], syms["i"], syms["i_n"]
+    i_sx, i_sy, i_ax, i_ay = syms["i_sx"], syms["i_sy"], syms["i_ax"], syms["i_ay"]
+    i_sx_s, i_sy_s = vars_("i_sx_s i_sy_s", i64)
+    to_w = var("to_w", Vec[i64])
+    fill_w = var("fill_w", i64)
+    zero_n = Term.literal(ops["z_n"]).shaped(String("broadcast_in_dim"), ops["fill_n"])
+    one_n = Term.literal(ops["o_n"]).shaped(String("broadcast_in_dim"), ops["fill_n"])
+    one_w = Term.literal(ops["o_n"]).shaped(String("broadcast_in_dim"), fill_w)
+    s_thr_n = Term.literal(ops["s_thr"]).shaped(String("broadcast_in_dim"), ops["fill_n"])
+    s_cap_n = Term.literal(ops["s_cap"]).shaped(String("broadcast_in_dim"), ops["fill_n"])
+    ax_empty, span_x = _tile_midpoint_span(ops, x, axes)
+    ay_empty, span_y = _tile_midpoint_span(ops, y, axes)
+    safe_tile, ax_tile = _moment_tile_anchor(ops, n, sx, ax_empty)
+    _, ay_tile = _moment_tile_anchor(ops, n, sy, ay_empty)
+    pos_tile = n.compare(String("gt"), zero_n, ops["gt"])
+    sc_x = pos_tile.select(_scale_for_peak(ops, one_n, span_x, one_n, s_thr_n, s_cap_n), one_n)
+    sc_y = pos_tile.select(_scale_for_peak(ops, one_n, span_y, one_n, s_thr_n, s_cap_n), one_n)
+    ax_lifted = ax_tile.shaped(String("broadcast_in_dim"), ops["lift_x"])
+    ay_lifted = ay_tile.shaped(String("broadcast_in_dim"), ops["lift_y"])
+    dx = x.binary(String("sub"), ax_lifted, ops["sub"])
+    dy = y.binary(String("sub"), ay_lifted, ops["sub"])
+    dx_s = dx.binary(String("div"), sc_x.shaped(String("broadcast_in_dim"), ops["lift_x"]), ops["div"])
+    rx = w.binary(String("mul"), dx, ops["mul"]).reduce(String("sum"), axes, p)
+    ry = w.binary(String("mul"), dy, ops["mul"]).reduce(String("sum"), axes, p)
+    corr = _balanced_quot_prod(ops, rx, ry, safe_tile, one_n)
+    made = []
+    for sign_val in (1, -1):
+        dy_signed = dy if sign_val == 1 else ay_lifted.binary(String("sub"), y, ops["sub"])
+        dy_s = dy_signed.binary(String("div"), sc_y.shaped(String("broadcast_in_dim"), ops["lift_y"]),
+                                ops["div"])
+        w_raw = _balanced_tile_prod(ops, w, dx_s, dy_s, one_w).reduce(String("sum"), axes, p)
+        w_tile = (w_raw.binary(String("sub"), corr, ops["sub"]) if sign_val == 1
+                  else w_raw.binary(String("add"), corr, ops["add"]))
+        w_cond = (central_moment(t, sx, sy, n, x, y, w, a, i64(sign_val)),
+                  eq(i_sx_s).to(scale_slot(t, i64(0))), eq(i_sy_s).to(scale_slot(t, i64(1))),
+                  eq(ops["s_thr"]).to(scale_threshold_of(n)), eq(ops["s_cap"]).to(scale_cap_of(n)),
+                  eq(ops["rmin"]).to(reduce_min_of(a)), eq(ops["rmax"]).to(reduce_max_of(a)),
+                  eq(to_w).to(rules.shape(w)), eq(fill_w).to(filled(to_w)), *common)
+        m_step, sx_step, sy_step = _moment_combine_weighted(
+            ops, Term.state(i, 0), Term.state(i_sx_s, 0), Term.state(i_sy_s, 0), Term.state(i_n, 0),
+            Term.state(i_ax, 0), Term.state(i_sx, 0), Term.state(i_ay, 0), Term.state(i_sy, 0),
+            w_tile, sc_x, sc_y, n, ax_tile, rx, ay_tile, ry, sign_val)
+        m_merge, sx_merge, sy_merge = _moment_combine_weighted(
+            ops, Term.state(i, 0), Term.state(i_sx_s, 0), Term.state(i_sy_s, 0), Term.state(i_n, 0),
+            Term.state(i_ax, 0), Term.state(i_sx, 0), Term.state(i_ay, 0), Term.state(i_sy, 0),
+            Term.state(i, 1), Term.state(i_sx_s, 1), Term.state(i_sy_s, 1), Term.state(i_n, 1),
+            Term.state(i_ax, 1), Term.state(i_sx, 1), Term.state(i_ay, 1), Term.state(i_sy, 1), sign_val)
+        w_done = _moment_finish_weighted(ops, i, i_sx_s, i_sy_s, i_n, i_ax, i_sx, i_ay, i_sy, sign_val)
+        made += [
+            rewrite(t.stepped()).to(m_step, *w_cond),
+            rewrite(t.merged()).to(m_merge, *w_cond),
+            rewrite(moment_scale(t, i64(0)).stepped()).to(sx_step, *w_cond),
+            rewrite(moment_scale(t, i64(1)).stepped()).to(sy_step, *w_cond),
+            rewrite(moment_scale(t, i64(0)).merged()).to(sx_merge, *w_cond),
+            rewrite(moment_scale(t, i64(1)).merged()).to(sy_merge, *w_cond),
+            rewrite(t.finished()).to(w_done, *w_cond),
+        ]
+    return made
+
+
+def _moment_masked_rules(ops: dict[str, i64], common: tuple, syms: dict) -> list:
+    """Step, merge, and finish rules for boolean-masked central second moments (`masked_central_moment`)."""
+    t, sx, sy, n, x, y = syms["t"], syms["sx"], syms["sy"], syms["n"], syms["x"], syms["y"]
+    mask, z, axes, p, a = syms["mask"], syms["z"], syms["axes"], syms["p"], syms["a"]
+    i, i_n, i_sx = syms["i"], syms["i_n"], syms["i_sx"]
+    i_sy, i_ax, i_ay = syms["i_sy"], syms["i_ax"], syms["i_ay"]
+    zero_n = Term.literal(ops["z_n"]).shaped(String("broadcast_in_dim"), ops["fill_n"])
+    one_n = Term.literal(ops["o_n"]).shaped(String("broadcast_in_dim"), ops["fill_n"])
+    safe_tile, ax_tile = _moment_tile_anchor(ops, n, sx, zero_n)
+    _, ay_tile = _moment_tile_anchor(ops, n, sy, zero_n)
+    ax_lifted = ax_tile.shaped(String("broadcast_in_dim"), ops["lift_x"])
+    ay_lifted = ay_tile.shaped(String("broadcast_in_dim"), ops["lift_y"])
+    dx = x.binary(String("sub"), ax_lifted, ops["sub"])
+    dy = y.binary(String("sub"), ay_lifted, ops["sub"])
+    rx = mask.select(z, dx).reduce(String("sum"), axes, p)
+    ry = mask.select(z, dy).reduce(String("sum"), axes, p)
+    corr = _balanced_quot_prod(ops, rx, ry, safe_tile, one_n)
+    made = []
+    for sign_val in (1, -1):
+        dy_signed = dy if sign_val == 1 else ay_lifted.binary(String("sub"), y, ops["sub"])
+        m_raw = mask.select(z, dx).binary(
+            String("mul"), mask.select(z, dy_signed), ops["mul"]).reduce(String("sum"), axes, p)
+        m_tile = (m_raw.binary(String("sub"), corr, ops["sub"]) if sign_val == 1
+                  else m_raw.binary(String("add"), corr, ops["add"]))
+        m_cond = (masked_central_moment(t, sx, sy, n, x, y, mask, z, a, i64(sign_val)), *common)
+        made += [
+            rewrite(t.stepped()).to(
+                _moment_combine_masked(ops, Term.state(i, 0), Term.state(i_n, 0), Term.state(i_ax, 0),
+                                       Term.state(i_sx, 0), Term.state(i_ay, 0), Term.state(i_sy, 0),
+                                       m_tile, n, ax_tile, rx, ay_tile, ry, sign_val), *m_cond),
+            rewrite(t.merged()).to(
+                _moment_combine_masked(ops, Term.state(i, 0), Term.state(i_n, 0), Term.state(i_ax, 0),
+                                       Term.state(i_sx, 0), Term.state(i_ay, 0), Term.state(i_sy, 0),
+                                       Term.state(i, 1), Term.state(i_n, 1), Term.state(i_ax, 1),
+                                       Term.state(i_sx, 1), Term.state(i_ay, 1), Term.state(i_sy, 1),
+                                       sign_val), *m_cond),
+            rewrite(t.finished()).to(Term.state(i, 0), *m_cond),
+        ]
+    return made
+
+
 def _moment_decoupled() -> list:
     """Anchored Chan-Golub-LeVeque step, merge, and finish rules for weighted and masked central second
     moments (`central_moment`, `masked_central_moment`), carrying each first moment as `(anchor, residual)`
-    and each weighted central moment with a zero-mass scale slot (`moment_scale`) so high-mean shifted data,
-    extreme weight ratios, and large-offset zero-weight derivatives all stay accurate and finite."""
+    and each weighted central moment with independent per-axis zero-mass scale slots (`moment_scale`)."""
     t, u, sx, sy, n, x, y, w, mask, z = vars_("t u sx sy n x y w mask z", Term)
     axes = var("axes", Vec[i64])
-    to_x, to_y, to_n, to_w = vars_("to_x to_y to_n to_w", Vec[i64])
-    p, a, i, i_s, i_n, i_sx, i_sy, i_ax, i_ay = vars_("p a i i_s i_n i_sx i_sy i_ax i_ay", i64)
+    to_x, to_y, to_n = vars_("to_x to_y to_n", Vec[i64])
+    p, a, i, i_n, i_sx, i_sy, i_ax, i_ay = vars_("p a i i_n i_sx i_sy i_ax i_ay", i64)
     added, subtracted, multiplied, divided = vars_("added subtracted multiplied divided", i64)
-    max_idx, gt_idx, ge_idx, and_idx, or_idx, min_idx, sqrt_idx, abs_idx = vars_(
-        "max_idx gt_idx ge_idx and_idx or_idx min_idx sqrt_idx abs_idx", i64)
+    max_idx, gt_idx, ge_idx, and_idx, or_idx, min_idx, abs_idx = vars_(
+        "max_idx gt_idx ge_idx and_idx or_idx min_idx abs_idx", i64)
     rmin_idx, rmax_idx = vars_("rmin_idx rmax_idx", i64)
-    z_n, o_n, h_n, q_n, s_thr, s_cap, fill_n, fill_w, lift_x, lift_y = vars_(
-        "z_n o_n h_n q_n s_thr s_cap fill_n fill_w lift_x lift_y", i64)
+    z_n, o_n, h_n, q_n, s_thr, s_cap, fill_n, lift_x, lift_y = vars_(
+        "z_n o_n h_n q_n s_thr s_cap fill_n lift_x lift_y", i64)
     stock, shape = rules.stock, rules.shape
     ops = {"add": added, "sub": subtracted, "mul": multiplied, "div": divided, "max": max_idx,
-           "min": min_idx, "sqrt": sqrt_idx, "abs": abs_idx, "gt": gt_idx, "ge": ge_idx, "and": and_idx,
-           "or": or_idx, "rmin": rmin_idx, "rmax": rmax_idx, "z_n": z_n, "o_n": o_n, "h_n": h_n, "q_n": q_n,
+           "min": min_idx, "abs": abs_idx, "gt": gt_idx, "ge": ge_idx, "and": and_idx, "or": or_idx,
+           "rmin": rmin_idx, "rmax": rmax_idx, "z_n": z_n, "o_n": o_n, "h_n": h_n, "q_n": q_n,
            "s_thr": s_thr, "s_cap": s_cap, "fill_n": fill_n, "lift_x": lift_x, "lift_y": lift_y}
     common_ops = (
         eq(added).to(stock("add")), eq(subtracted).to(stock("sub")),
         eq(multiplied).to(stock("mul")), eq(divided).to(stock("div")), eq(max_idx).to(stock("max")),
         eq(gt_idx).to(comp_gt()), eq(ge_idx).to(comp_ge()), eq(and_idx).to(logic_and()),
-        eq(or_idx).to(logic_or()), eq(min_idx).to(min_op()), eq(sqrt_idx).to(sqrt_op()),
-        eq(abs_idx).to(abs_op()),
+        eq(or_idx).to(logic_or()), eq(min_idx).to(min_op()), eq(abs_idx).to(abs_op()),
     )
     common = (
         eq(t).to(u.reduce(String("sum"), axes, p)),
@@ -1035,119 +1199,12 @@ def _moment_decoupled() -> list:
         eq(to_x).to(shape(x)), eq(to_y).to(shape(y)),
         eq(lift_x).to(unreduced(to_x, a)), eq(lift_y).to(unreduced(to_y, a)),
     )
-    zero_n = Term.literal(z_n).shaped(String("broadcast_in_dim"), fill_n)
-    one_n = Term.literal(o_n).shaped(String("broadcast_in_dim"), fill_n)
-    s_thr_n = Term.literal(s_thr).shaped(String("broadcast_in_dim"), fill_n)
-    s_cap_n = Term.literal(s_cap).shaped(String("broadcast_in_dim"), fill_n)
-    ax_empty, span_x = _tile_midpoint_span(ops, x, axes)
-    ay_empty, span_y = _tile_midpoint_span(ops, y, axes)
-    safe_tile, ax_tile_w = _moment_tile_anchor(ops, n, sx, ax_empty)
-    _, ay_tile_w = _moment_tile_anchor(ops, n, sy, ay_empty)
-    _, ax_tile_m = _moment_tile_anchor(ops, n, sx, zero_n)
-    _, ay_tile_m = _moment_tile_anchor(ops, n, sy, zero_n)
-    pos_tile = n.compare(String("gt"), zero_n, gt_idx)
-    sc_tile = pos_tile.select(
-        _scale_for_peak(ops, one_n, span_x.binary(String("max"), span_y, max_idx), one_n, s_thr_n, s_cap_n),
-        one_n)
-    ax_w_lifted = ax_tile_w.shaped(String("broadcast_in_dim"), lift_x)
-    ay_w_lifted = ay_tile_w.shaped(String("broadcast_in_dim"), lift_y)
-    sc_x_lifted = sc_tile.shaped(String("broadcast_in_dim"), lift_x)
-    sc_y_lifted = sc_tile.shaped(String("broadcast_in_dim"), lift_y)
-    ax_m_lifted = ax_tile_m.shaped(String("broadcast_in_dim"), lift_x)
-    ay_m_lifted = ay_tile_m.shaped(String("broadcast_in_dim"), lift_y)
-    dx_w = x.binary(String("sub"), ax_w_lifted, subtracted)
-    dy_w = y.binary(String("sub"), ay_w_lifted, subtracted)
-    dx_w_s = dx_w.binary(String("div"), sc_x_lifted, divided)
-    dx_m = x.binary(String("sub"), ax_m_lifted, subtracted)
-    dy_m = y.binary(String("sub"), ay_m_lifted, subtracted)
-    rx_w = w.binary(String("mul"), dx_w, multiplied).reduce(String("sum"), axes, p)
-    ry_w = w.binary(String("mul"), dy_w, multiplied).reduce(String("sum"), axes, p)
-    rx_m = mask.select(z, dx_m).reduce(String("sum"), axes, p)
-    ry_m = mask.select(z, dy_m).reduce(String("sum"), axes, p)
-    root_safe = safe_tile.unary(String("sqrt"), sqrt_idx)
-    zero_w = Term.literal(z_n).shaped(String("broadcast_in_dim"), fill_w)
-    one_w = Term.literal(o_n).shaped(String("broadcast_in_dim"), fill_w)
-    pos_w = w.compare(String("gt"), zero_w, gt_idx)
-    safe_w = pos_w.select(one_w, w)
-    scale_w = pos_w.select(one_w, safe_w.unary(String("sqrt"), sqrt_idx))
-    left_w = w.binary(String("div"), scale_w, divided)
-    n_f, m_f, s_f = Term.state(i_n, 0), Term.state(i, 0), Term.state(i_s, 0)
-    ax_f, rx_f = Term.state(i_ax, 0), Term.state(i_sx, 0)
-    ay_f, ry_f = Term.state(i_ay, 0), Term.state(i_sy, 0)
-    pos_f = n_f.compare(String("gt"), zero_n, gt_idx)
-    z_mf, z_nf = pos_f.select(m_f, zero_n), pos_f.select(n_f, zero_n)
-    z_rxf, z_ryf = pos_f.select(rx_f, zero_n), pos_f.select(ry_f, zero_n)
-    peak_f = ax_f.unary(String("abs"), abs_idx).binary(
-        String("max"), ay_f.unary(String("abs"), abs_idx), max_idx)
-    s_work_f = _scale_for_peak(ops, s_f, peak_f, one_n, s_thr_n, s_cap_n)
-    r_f = s_f.binary(String("div"), s_work_f, divided)
-    m_f_s = z_mf.binary(String("mul"), r_f, multiplied).binary(String("mul"), r_f, multiplied)
-    ax_fs = ax_f.binary(String("div"), s_work_f, divided)
-    ay_fs = ay_f.binary(String("div"), s_work_f, divided)
-    rxf_s = z_rxf.binary(String("div"), s_work_f, divided)
-    ryf_s = z_ryf.binary(String("div"), s_work_f, divided)
-    z_shift_raw = z_nf.binary(String("mul"), ax_fs.binary(String("mul"), ay_fs, multiplied),
-                              multiplied).binary(
-        String("add"), ax_fs.binary(String("mul"), ryf_s, multiplied), added).binary(
-        String("add"), ay_fs.binary(String("mul"), rxf_s, multiplied), added)
-    made = _moment_first_decoupled(ops, common_ops)
-    for sign_val in (1, -1):
-        dy_w_signed = dy_w if sign_val == 1 else ay_w_lifted.binary(String("sub"), y, subtracted)
-        dy_w_s = dy_w_signed.binary(String("div"), sc_y_lifted, divided)
-        w_raw = left_w.binary(String("mul"), dx_w_s, multiplied).binary(
-            String("mul"), scale_w.binary(String("mul"), dy_w_s, multiplied), multiplied).reduce(
-            String("sum"), axes, p)
-        w_corr = rx_w.binary(String("div"), root_safe, divided).binary(
-            String("mul"), ry_w.binary(String("div"), root_safe, divided), multiplied)
-        w_tile = (w_raw.binary(String("sub"), w_corr, subtracted) if sign_val == 1
-                  else w_raw.binary(String("add"), w_corr, added))
-        dy_m_signed = dy_m if sign_val == 1 else ay_m_lifted.binary(String("sub"), y, subtracted)
-        m_raw = mask.select(z, dx_m).binary(
-            String("mul"), mask.select(z, dy_m_signed), multiplied).reduce(String("sum"), axes, p)
-        m_corr = rx_m.binary(String("div"), root_safe, divided).binary(
-            String("mul"), ry_m.binary(String("div"), root_safe, divided), multiplied)
-        m_tile = (m_raw.binary(String("sub"), m_corr, subtracted) if sign_val == 1
-                  else m_raw.binary(String("add"), m_corr, added))
-        z_shift_s = z_shift_raw if sign_val == 1 else zero_n.binary(String("sub"), z_shift_raw, subtracted)
-        sum_f_s = m_f_s.binary(String("add"), z_shift_s, added)
-        w_done = pos_f.select(
-            sum_f_s.binary(String("mul"), s_work_f, multiplied).binary(String("mul"), s_work_f, multiplied),
-            m_f)
-        w_cond = (central_moment(t, sx, sy, n, x, y, w, a, i64(sign_val)),
-                  eq(i_s).to(scale_slot(t)),
-                  eq(s_thr).to(scale_threshold_of(n)), eq(s_cap).to(scale_cap_of(n)),
-                  eq(rmin_idx).to(reduce_min_of(a)), eq(rmax_idx).to(reduce_max_of(a)),
-                  eq(to_w).to(shape(w)), eq(fill_w).to(filled(to_w)), *common)
-        m_cond = (masked_central_moment(t, sx, sy, n, x, y, mask, z, a, i64(sign_val)), *common)
-        m_step_w, s_step_w = _moment_combine_weighted(
-            ops, Term.state(i, 0), Term.state(i_s, 0), Term.state(i_n, 0),
-            Term.state(i_ax, 0), Term.state(i_sx, 0), Term.state(i_ay, 0), Term.state(i_sy, 0),
-            w_tile, sc_tile, n, ax_tile_w, rx_w, ay_tile_w, ry_w, sign_val)
-        m_merge_w, s_merge_w = _moment_combine_weighted(
-            ops, Term.state(i, 0), Term.state(i_s, 0), Term.state(i_n, 0),
-            Term.state(i_ax, 0), Term.state(i_sx, 0), Term.state(i_ay, 0), Term.state(i_sy, 0),
-            Term.state(i, 1), Term.state(i_s, 1), Term.state(i_n, 1),
-            Term.state(i_ax, 1), Term.state(i_sx, 1), Term.state(i_ay, 1), Term.state(i_sy, 1), sign_val)
-        made += [
-            rewrite(t.stepped()).to(m_step_w, *w_cond),
-            rewrite(t.merged()).to(m_merge_w, *w_cond),
-            rewrite(moment_scale(t).stepped()).to(s_step_w, *w_cond),
-            rewrite(moment_scale(t).merged()).to(s_merge_w, *w_cond),
-            rewrite(t.finished()).to(w_done, *w_cond),
-            rewrite(t.stepped()).to(
-                _moment_combine_masked(ops, Term.state(i, 0), Term.state(i_n, 0), Term.state(i_ax, 0),
-                                       Term.state(i_sx, 0), Term.state(i_ay, 0), Term.state(i_sy, 0),
-                                       m_tile, n, ax_tile_m, rx_m, ay_tile_m, ry_m, sign_val), *m_cond),
-            rewrite(t.merged()).to(
-                _moment_combine_masked(ops, Term.state(i, 0), Term.state(i_n, 0), Term.state(i_ax, 0),
-                                       Term.state(i_sx, 0), Term.state(i_ay, 0), Term.state(i_sy, 0),
-                                       Term.state(i, 1), Term.state(i_n, 1), Term.state(i_ax, 1),
-                                       Term.state(i_sx, 1), Term.state(i_ay, 1), Term.state(i_sy, 1),
-                                       sign_val), *m_cond),
-            rewrite(t.finished()).to(m_f, *m_cond),
-        ]
-    return made
-
+    syms = {"t": t, "sx": sx, "sy": sy, "n": n, "x": x, "y": y, "w": w, "mask": mask, "z": z,
+            "axes": axes, "p": p, "a": a, "i": i, "i_n": i_n, "i_sx": i_sx, "i_sy": i_sy,
+            "i_ax": i_ax, "i_ay": i_ay}
+    return [*_moment_first_decoupled(ops, common_ops),
+            *_moment_weighted_rules(ops, common, syms),
+            *_moment_masked_rules(ops, common, syms)]
 
 def _exponentials(scaled: bool = False) -> list:
     """The rules that find what scales as `exp(-k)` of an anchor `k` (`scales`), from its exponential; and
@@ -1318,7 +1375,7 @@ def _shapes():
         rule(eq(extent).to(shape(x)), eq(y).to(x.merged())).then(set_(shape(y)).to(extent)),
         rule(eq(extent).to(shape(x)), eq(y).to(x.finished())).then(set_(shape(y)).to(extent)),
         rule(eq(extent).to(shape(x)), eq(y).to(moment_anchor(x))).then(set_(shape(y)).to(extent)),
-        rule(eq(extent).to(shape(x)), eq(y).to(moment_scale(x))).then(set_(shape(y)).to(extent)),
+        rule(eq(extent).to(shape(x)), eq(y).to(moment_scale(x, side))).then(set_(shape(y)).to(extent)),
         rule(eq(w).to(x.compare(name, y, p)), eq(extent).to(shape(x)), eq(shape(y)).to(extent)).then(
             set_(shape(w)).to(extent)),
         rule(eq(extent).to(shape(y)), eq(w).to(x.select(y, z))).then(set_(shape(w)).to(extent)),
@@ -1615,8 +1672,9 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
     def init(shapes):
         made = forms(shapes)
         avals = [jax.ShapeDtypeStruct(*shapes[name]) for name in names]
-        slot_terms = (*made.reductions, *made.anchors, *made.scales)
-        slot_floors = (*made.floors, *(None,) * len(made.anchors), *(1.0,) * len(made.scales))
+        scale_terms = tuple(term for term in made.scales for _ in (0, 1))
+        slot_terms = (*made.reductions, *made.anchors, *scale_terms)
+        slot_floors = (*made.floors, *(None,) * len(made.anchors), *(1.0,) * len(scale_terms))
         typed = jax.eval_shape(lambda *values: tuple(evaluated(made.region, reduction,
                                                                [*made.consts, *values], {})
                                                      for reduction in slot_terms), *avals)
@@ -1690,7 +1748,7 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
         made = forms(shapes)
         return (*((_role(reduction), made.region.shape(reduction)) for reduction in made.reductions),
                 *(("anchor", made.region.shape(term)) for term in made.anchors),
-                *(("scale", made.region.shape(term)) for term in made.scales))
+                *(("scale", made.region.shape(term)) for term in made.scales for _ in (0, 1)))
 
     return Derived(init, step, merge, finish, mapped,
                    {"rounding": "reorders", "walked": declaration.walked, "exponent": declaration.exponent,
@@ -1742,12 +1800,13 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
     for term, is_along in zip(outputs, along, strict=True):
         if is_along and term is not None and not _holds(graph, local(term)):
             raise Refused("an output along the walked axis reads a walked reduction: no tile holds it")
+    scale_slots = [(term, i64(axis_side)) for term in scales for axis_side in (0, 1)]
     roots = ([reduction.stepped() for reduction in reductions]
              + [moment_anchor(term).stepped() for term in anchors]
-             + [moment_scale(term).stepped() for term in scales]
+             + [moment_scale(term, axis_side).stepped() for term, axis_side in scale_slots]
              + [reduction.merged() for reduction in reductions]
              + [moment_anchor(term).merged() for term in anchors]
-             + [moment_scale(term).merged() for term in scales]
+             + [moment_scale(term, axis_side).merged() for term, axis_side in scale_slots]
              + [term.finished() for term, is_along in zip(outputs, along, strict=True)
                 if term is not None and not is_along])
     declared = Term.bundle(Vec[Term](*region.roots()))
@@ -1796,11 +1855,9 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
     report = program.AlgebraReport(region.equations, tuple(saturated.fired), saturated.fired,
                                    saturated.limits, saturated.iterations, program.node_count(graph),
                                    saturated.limited, before.value, after.value, time.perf_counter() - began)
-    extra_pad = (None,) * (len(anchors) + len(scales))
-    accumulated.extend(extra_pad)
-    added.extend(extra_pad)
-    merged.extend(extra_pad)
-    count = len(reductions) + len(anchors) + len(scales)
+    extra_pad = (None,) * (len(anchors) + len(scale_slots))
+    accumulated, added, merged = ((*group, *extra_pad) for group in (accumulated, added, merged))
+    count = len(reductions) + len(anchors) + len(scale_slots)
     steps, merges, finished = chosen[:count], chosen[count:2 * count], iter(chosen[2 * count:])
     finishes = tuple(None if term is None or is_along else next(finished)
                      for term, is_along in zip(outputs, along, strict=True))
@@ -1848,9 +1905,9 @@ def _register_reduction_slots(graph: EGraph, region: terms.Region, reductions: t
         for side in (0, 1):
             graph.register(set_(rules.shape(Term.state(i64(a_index), i64(side)))).to(
                 Vec[i64](*(i64(size) for size in region.shape(term)))))
-    for offset, term in enumerate(scales):
+    for offset, (term, axis_side) in enumerate((t, i64(s)) for t in scales for s in (0, 1)):
         s_index = len(reductions) + len(anchors) + offset
-        graph.register(set_(scale_slot(term)).to(i64(s_index)))
+        graph.register(set_(scale_slot(term, axis_side)).to(i64(s_index)))
         for side in (0, 1):
             graph.register(set_(rules.shape(Term.state(i64(s_index), i64(side)))).to(
                 Vec[i64](*(i64(size) for size in region.shape(term)))))
@@ -1976,7 +2033,7 @@ def _least(graph: EGraph, region: terms.Region) -> None:
 
 
 def _register_moment_resources(graph: EGraph, region: terms.Region, reductions: tuple[Term, ...]) -> None:
-    """Register synthetic ops (`comp_gt`, `comp_ge`, `logic_and`, `logic_or`, `min_op`, `sqrt_op`, `abs_op`,
+    """Register synthetic ops (`comp_gt`, `comp_ge`, `logic_and`, `logic_or`, `min_op`, `abs_op`,
     `reduce_min_of`, `reduce_max_of`), per-reduction literals (`zero_of`, `one_of`, `half_of`,
     `quarter_max_of`, `scale_threshold_of`, `scale_cap_of`), and broadcast layouts (`filled`, `unreduced`)
     in one batch, only when the walk holds a recognized central-moment reduction."""
@@ -1984,8 +2041,7 @@ def _register_moment_resources(graph: EGraph, region: terms.Region, reductions: 
     for primitive, params, setter in (
         (jax.lax.gt_p, {}, comp_gt), (jax.lax.ge_p, {}, comp_ge),
         (jax.lax.and_p, {}, logic_and), (jax.lax.or_p, {}, logic_or),
-        (jax.lax.min_p, {}, min_op), (jax.lax.sqrt_p, {"accuracy": None}, sqrt_op),
-        (jax.lax.abs_p, {}, abs_op),
+        (jax.lax.min_p, {}, min_op), (jax.lax.abs_p, {}, abs_op),
     ):
         region.params.append((primitive, params))
         facts.append(set_(setter()).to(i64(len(region.params) - 1)))
