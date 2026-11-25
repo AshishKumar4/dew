@@ -16,6 +16,7 @@ the comparisons sort each token's slots by expert id first.
 """
 
 import collections
+import contextlib
 import functools
 import json
 from pathlib import Path
@@ -615,6 +616,18 @@ def test_a_layers_paired_and_scaled_expert_products_are_one_launch_as_exact_as_a
     np.testing.assert_array_equal(np.asarray(apart), np.asarray(plain(x, gate, up, scales)[1]))
 
 
+@contextlib.contextmanager
+def _chained():
+    """Where a gated expert layer runs its chain on a CPU: an H100's Mosaic GPU launches interpreted, its
+    grouped matmul Mosaic GPU's and its gated MLP named fused (`gated_mlp.GATED_MLP`, whose grouped cell no
+    receipt declares yet, row 12847)."""
+    from dew.nn.kernels import generation
+
+    with generation.assumed("sm90", interpreted=True), generation.chosen(grouped_matmul="mosaic",
+                                                                         gated_mlp="fused"):
+        yield
+
+
 def _gated_case():
     """A gated expert layer's rows, routing and three kernel stacks (two layers of two experts each) for
     `moe.gated_experts`, the layer index each projection reads: [slots, depth] rows of 68 tokens at top 2,
@@ -659,11 +672,17 @@ def test_a_gated_expert_layer_is_bitwise_its_projections_apart(limit):
     clamped or not (GPT-OSS's limit), and the rows' gradient as exactly (check 1)."""
     from reference_error import assert_as_exact, with_gradients
 
+    from dew.nn.kernels import grouped_matmul
+
     draw, gated, apart, _ = _gated_case()
     x, gate, up, down = draw(0)
     cotangent = jax.random.normal(jax.random.key(3), (x.shape[0] * 2, x.shape[1]), jnp.bfloat16)
-    ran = [jax.jit(with_gradients(functools.partial(form, limit=limit)))(x, gate, up, down, cotangent)
-           for form in (gated, apart)]
+    with _chained(), grouped_matmul.weighed() as calls:
+        ran = [jax.jit(with_gradients(functools.partial(form, limit=limit)))(x, gate, up, down, cotangent)
+               for form in (gated, apart)]
+    # The chain ran: its paired call carries the epilogue.
+    assert any(next(iter(call.bound.values()))[1].arguments["hooks"].epilogue is not None
+               for call, _ in calls), calls
     # The output and each kernel's gradient bitwise (the leaves: output, rows', gate's, up's, down's); the
     # rows' gradient below.
     fused, separate = (jax.tree.leaves(each) for each in ran)
@@ -686,12 +705,31 @@ def test_a_gated_expert_layer_is_bitwise_its_projections_apart(limit):
         operands = draw(seed)
         return (*operands, jax.random.normal(jax.random.key(seed), cotangent.shape, jnp.bfloat16))
 
-    with jax.enable_x64(new_val=True):
+    with jax.enable_x64(new_val=True), _chained():
         def truth(x, gate, up, down, cotangent):
             wide = [jnp.asarray(each, jnp.float64) for each in (x, gate, up, down, cotangent)]
             return rows_gradient(apart)(*wide)
         assert_as_exact(jax.jit(rows_gradient(gated)), jax.jit(rows_gradient(apart)), drawn,
                         "a gated expert layer's rows' gradient", seeds=8, truth_fn=truth)
+
+
+@pytest.mark.parametrize("named", [False, True], ids=["unnamed", "named fused"])
+def test_a_gated_expert_layer_runs_its_chain_where_the_gated_mlps_selector_chooses_it(named):
+    """On an H100 whose grouped matmul is Mosaic GPU's, a gated expert layer runs its chain (the pair's one
+    paired call carrying the gated product's epilogue) where the gated MLP's selector chooses it
+    (`gated_mlp.GATED_MLP`'s grouped cell, row 12847): named fused it does; unnamed, no receipt declaring the
+    grouped cell, its projections run apart, as a dense gated MLP's do. It chose by a check of its own."""
+    from dew.nn.kernels import generation, grouped_matmul
+
+    draw, gated, _, _ = _gated_case()
+    chosen = {"gated_mlp": "fused"} if named else {}
+    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic", **chosen),
+          grouped_matmul.weighed() as calls):
+        jax.eval_shape(gated, *draw(0))
+    chained = [arguments for call, _ in calls
+               if (arguments := next(iter(call.bound.values()))[1].arguments).get("paired") is not None
+               and arguments["hooks"].epilogue is not None]
+    assert bool(chained) == named, calls
 
 
 def test_a_gated_expert_layer_runs_its_chain_on_mosaic_gpu_under_a_declared_swiglu():
@@ -704,7 +742,8 @@ def test_a_gated_expert_layer_runs_its_chain_on_mosaic_gpu_under_a_declared_swig
 
     draw, gated, _, _ = _gated_case()
     operands = draw(0)
-    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic", swiglu="pallas"),
+    with (generation.assumed("sm90"),
+          generation.chosen(grouped_matmul="mosaic", swiglu="pallas", gated_mlp="fused"),
           generation.routes() as routes, grouped_matmul.weighed() as calls):
         loss = jax.grad(lambda *operands: gated(*operands).astype(jnp.float32).sum(), argnums=(0, 1, 2, 3))
         jax.eval_shape(loss, *operands)
@@ -750,7 +789,7 @@ def test_a_gated_expert_layers_checkpointed_gradient_runs_its_pair_once(dtype):
         # outputs are the gate's and up's `[slots, width]` (two, a hookless replay of the pair) or those and
         # their gated product (three, the forward's epilogue), the primal and every gradient live.
         chosen = {"grouped_matmul": "mosaic"} if dtype == jnp.bfloat16 else {}
-        with generation.assumed("sm90"), generation.chosen(**chosen):
+        with generation.assumed("sm90"), generation.chosen(gated_mlp="fused", **chosen):
             graph = jax.make_jaxpr(jax.value_and_grad(f, argnums=(0, 1, 2, 3)))(*operands)
         return collections.Counter(
             (equation.primitive.name, len(equation.outvars)) for equation in equations(graph)
@@ -772,7 +811,7 @@ def test_a_gated_expert_layer_whose_hook_no_epilogue_lowers_runs_its_projections
 
     draw, gated, _, _ = _gated_case()
     operands = draw(0)
-    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"),
+    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic", gated_mlp="fused"),
           generation.routes() as routes, grouped_matmul.weighed() as calls):
         def exact(*operands):
             return gated(*operands, activation="geglu_exact").astype(jnp.float32).sum()
