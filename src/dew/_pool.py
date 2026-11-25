@@ -76,8 +76,20 @@ def listed_gpus(argv: Sequence[str], timeout: float = 60) -> int | None:
 
 
 def visible_gpus(visible: str) -> int:
-    """GPUs a CUDA_VISIBLE_DEVICES value lists."""
-    return sum(1 for device in visible.split(",") if device.strip())
+    """GPUs a CUDA_VISIBLE_DEVICES value lists (`visible_list`)."""
+    return len(visible_list(visible))
+
+
+def visible_list(visible: str) -> list[str]:
+    """The GPUs a CUDA_VISIBLE_DEVICES value makes visible, in order: its entries up to the first that names
+    no GPU (a negative index, `-1` among them), past which CUDA enumerates none, so `0,2,-1,1` shows `0` and
+    `2` alone (row 13104)."""
+    shown = []
+    for entry in (part.strip() for part in visible.split(",")):
+        if not entry or (entry.lstrip("-").isdigit() and int(entry) < 0):
+            break
+        shown.append(entry)
+    return shown
 
 
 def cuda_driver() -> ctypes.CDLL | None:

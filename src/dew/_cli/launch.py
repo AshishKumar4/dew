@@ -49,6 +49,7 @@ from dew._pool import (
     runs_on_gpu,
     slurm_tasks_here,
     visible_gpus,
+    visible_list,
 )
 from dew.clusters import SCHEDULERS, Launched, Scheduler, detected_environment
 
@@ -371,7 +372,7 @@ class Launch:
         visible = self.host_env(host).get("CUDA_VISIBLE_DEVICES")
         if visible is None:
             return [str(device) for device in range(first, first + devices)]
-        listed = [device.strip() for device in visible.split(",") if device.strip()]
+        listed = visible_list(visible)
         if first + devices > len(listed):
             raise ValueError(f"{host}'s CUDA_VISIBLE_DEVICES lists {len(listed)} GPUs, too few for a process "
                              f"taking {devices} from its {first}th; ask for fewer with --processes-per-host "

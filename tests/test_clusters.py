@@ -142,6 +142,11 @@ def test_dew_launch_shows_each_process_its_own_gpus_alone():
                        env=("JAX_PLATFORMS=cuda",)).pool(["gpu-host.invalid"])
     assert [(process.env["CUDA_VISIBLE_DEVICES"], process.env[LOCAL_DEVICES]) for process in uncounted] == [
         ("0", "0"), ("1", "0")]
+    # A pool's list that ends at an index naming no GPU shows those before it alone, as CUDA enumerates them:
+    # its processes split those, never one listed past the end (row 13104: rank 1 took the `1` CUDA hid).
+    ended = Launch(command=("python", "train.py"), processes_per_host=2,
+                   env=("CUDA_VISIBLE_DEVICES=0,2,-1,1", "JAX_PLATFORMS=cuda")).pool(["localhost"])
+    assert [process.env["CUDA_VISIBLE_DEVICES"] for process in ended] == ["0", "2"]
     # A pool kept off its GPUs takes its devices by their places, its GPUs left as it hid them.
     on_cpu = Launch(command=("python", "train.py"), processes_per_host=2, devices_per_process=1,
                     env=("JAX_PLATFORMS=cpu", "CUDA_VISIBLE_DEVICES=")).pool(["localhost"])
