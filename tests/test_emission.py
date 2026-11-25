@@ -752,7 +752,22 @@ def test_a_cached_body_called_twice_counts_each_calls_invariant():
     tripled = jax.jit(lambda x: x * 3)
     shared = _emitted(body(tripled, tripled), _ROW).roles[0].fixed
     apart = _emitted(body(tripled, jax.jit(lambda x: x * 3)), _ROW).roles[0].fixed
-    assert shared.integer_operations == apart.integer_operations > 0, (shared, apart)
+    # Each call's 128 multiplies on the FMA pipe (the review of lane/toolkit 1d6a2c24b: its adds hid a lost
+    # multiply from the integer count).
+    assert shared.integer_multiply_adds == apart.integer_multiply_adds == 2 * 128, (shared, apart)
+
+
+def test_a_conditionals_arms_invariants_count_as_one_arm_runs():
+    """A conditional its data decides, its arms adding `iota * 3` or `iota * 5` (iotas and literals): one
+    arm runs, its invariant multiply's work under the arms' envelope, 128 multiplies, never both arms' (the
+    review of lane/toolkit 1d6a2c24b, P1)."""
+    def body(row):
+        indices = lax.iota(jnp.int32, 128)
+        return lax.cond(row[0] > 0, lambda row: row + (indices * 3).astype(jnp.float32),
+                        lambda row: row + (indices * 5).astype(jnp.float32), row)
+
+    fixed = _emitted(body, _ROW).roles[0].fixed
+    assert fixed.integer_multiply_adds == 128, fixed
 
 
 def test_an_invariant_only_odd_steps_reach_counts_once():
@@ -898,8 +913,12 @@ def test_a_mosaic_launch_states_the_warps_its_issue_spreads_over():
     does not 4, the other's sliver of issues (its guard's) hiding no interval."""
     def walked(both: bool):
         def body(x_ref, o_ref):
+            def step(index, row):
+                mosaic.step_index(index)
+                return row * 2.0
+
             def walk():
-                o_ref[...] = lax.fori_loop(0, 8, lambda index, row: row * 2.0, x_ref[...])
+                o_ref[...] = lax.fori_loop(0, 8, step, x_ref[...])
 
             if both:
                 walk()
