@@ -1166,6 +1166,10 @@ def test_an_xla_programs_division_prices_on_its_target_at_its_dtype():
         elements, 6 * elements)
     for dtype, target in ((jnp.float32, tpu), (jnp.int32, hopper), (jnp.bfloat16, hopper)):
         assert priced(dtype, target).exponentials == 0, (dtype, target)
+    # A masked fp32 division (its mask's bools beside its fp32 values) is fp32's.
+    rows = jax.ShapeDtypeStruct((64, 128), jnp.float32)
+    masked = jax.make_jaxpr(lambda x, y: jnp.where(y > 0, x / y, 0.0))(rows, rows).jaxpr
+    assert program.priced(masked, hopper).work.exponentials == elements
     # A quotient a rewrite made, which no trace typed (`rules._ranged`'s of a bfloat16 program), its dtype
     # unproven: an operation an element, as a bfloat16 one (the review of lane/toolkit f8963150b).
     assert cost._priced(jax.lax.div_p, {}, [(64,), (64,)], (64,), hopper) == cost.Work(operations=64)

@@ -382,10 +382,11 @@ class Region[Node: (Term, Skeleton)]:
 
     @functools.cached_property
     def single_float32(self) -> bool:
-        """Whether every value the region's program traced is fp32 (`dtypes`, an extended dtype aside): a
-        division of it, traced or a rewrite's, fp32 too (`cost.work`)."""
+        """Whether every value the region's program traced is fp32 (`dtypes`; an extended dtype and a mask's
+        bool aside, `where(y > 0, a / y, 0)`'s): a division of it, traced or a rewrite's, fp32 too
+        (`cost.work`); an integer's or another float's program none."""
         return all(np.dtype(dtype) == np.float32 for dtype in self.dtypes.values()
-                   if not jnp.issubdtype(dtype, jax.dtypes.extended))
+                   if not jnp.issubdtype(dtype, jax.dtypes.extended) and np.dtype(dtype) != np.bool_)
 
     @functools.cached_property
     def made_by(self) -> dict[int, Opaque[Node]]:
