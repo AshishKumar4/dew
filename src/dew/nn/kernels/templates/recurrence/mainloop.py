@@ -1590,6 +1590,11 @@ def _weighted(k, v, a, prefix: tuple, beta, taken, call: Call):
         def step(index, slots, carry, accumulators, loaded=None, *, keys: bool = True, values: bool = True):
             """A step: under a decay a key dimension its value block (where `values`) and its key block
             (where `keys`), else every block of both."""
+            # Under a decay a key dimension the key block's last token's prefix, read from global memory
+            # ahead of the slots' wait, its latency the wait's: read after the values' weights, the next
+            # instruction waited on it, 3% of a GH200's Kimi Linear weighted launch's samples (M-JS-272).
+            last = (tuple(family.columns_of(ref.at[row + chunk - 1, pl.ds(h * width + index * keyed, keyed)])
+                          for ref in prefix_refs) if call.per_key and keys else None)
             # Every slot waited for each step, the values' too, which the first step alone reads: a load no
             # step waits for leaves its barrier's phases unobserved (the interpreter refuses it).
             slots.acquire_all()
@@ -1620,8 +1625,6 @@ def _weighted(k, v, a, prefix: tuple, beta, taken, call: Call):
                 if call.per_key:
                     limbs = tuple(tile.value() for tile in limb_tiles(call, slots))
                     decay = algebra.raised(*limbs)
-                    ends = pl.ds(h * width + c * keyed, keyed)
-                    last = tuple(family.columns_of(ref.at[row + chunk - 1, ends]) for ref in prefix_refs)
                     written = algebra.key_decayed_write(tile, limbs, last)
                     held.store(outs[-1], written, row, chunk, h * width + c * keyed, keyed,
                                family=family, smem=landing["keyed"])
