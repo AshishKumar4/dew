@@ -37,7 +37,17 @@ from jax.sharding import PartitionSpec as P
 
 from dew import quantization
 from dew.batch import Variables, leaves_by_path
-from dew.mesh import EXPERT_AXIS, STAGE_AXIS, LayoutRefused, LogicalAxes, batch_axes, logical_spec, mesh_axes
+from dew.mesh import (
+    EXPERT_AXIS,
+    STAGE_AXIS,
+    LayoutRefused,
+    LogicalAxes,
+    batch_axes,
+    kept_axes,
+    logical_spec,
+    mesh_axes,
+    spec_axes,
+)
 from dew.nn.dense import Dense, packed_matrix
 from dew.nn.derivatives import KernelGlue, Protected, contracted, declared_tangent, with_tangents_formed_at
 from dew.nn.residuals import Residual
@@ -1079,7 +1089,7 @@ def _dispatched[Parameters](
     positions_axes = ('activation_batch', 'activation_length')[:x.ndim - 1]
     tokens = logical_spec((*positions_axes, 'activation_embed'), x.shape)
     routing = logical_spec((*positions_axes, None), indices.shape)
-    manual = {axis for entry in tokens for axis in mesh_axes(entry)}
+    manual = spec_axes(tokens)
     # A pipeline vmaps its stages with spmd_axis_name=stage, and a vmapped
     # shard_map can split the new dimension only over an axis it holds
     # manual; the operands, which name no stage, are replicated over it.
@@ -1091,9 +1101,7 @@ def _dispatched[Parameters](
     if mesh.shape.get(STAGE_AXIS, 1) > 1 and STAGE_AXIS not in mesh.manual_axes:
         manual.add(STAGE_AXIS)
     def spec(leaf: jax.Array, axes: LogicalAxes) -> P:
-        kept = [tuple(axis for axis in mesh_axes(entry) if axis in manual)
-                for entry in logical_spec(axes, leaf.shape)]
-        return P(*(entry if entry else None for entry in kept))
+        return kept_axes(logical_spec(axes, leaf.shape), manual.__contains__)
 
     # A kernel read in place from a bank (`Layered`) holds its experts on its stack's second dimension.
     stored, experts = [], []

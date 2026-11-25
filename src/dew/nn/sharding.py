@@ -62,9 +62,11 @@ from dew.mesh import (
     LogicalAxisRules,
     MeshAxes,
     axis_rules,
+    kept_axes,
     logical_spec,
     mesh_axes,
     row_axes,
+    spec_axes,
 )
 
 if TYPE_CHECKING:
@@ -656,8 +658,8 @@ def gathered_over(x: jax.Array, spec: jax.sharding.PartitionSpec, axes: str | Co
     mesh = jax.sharding.get_abstract_mesh()
     explicit = set(mesh.explicit_axes)
     dropped = {axes} if isinstance(axes, str) else set(axes)
-    placed = jax.sharding.reshard(x, _only(spec, explicit))
-    kept = _only(spec, explicit - dropped)
+    placed = jax.sharding.reshard(x, kept_axes(spec, explicit.__contains__))
+    kept = kept_axes(spec, (explicit - dropped).__contains__)
     if x.ndim < 2:
         return jax.sharding.reshard(placed, kept)
     reduced = {name for name in dropped & explicit if mesh.shape[name] > 1}
@@ -678,7 +680,7 @@ def explicit_over[T](fn: Callable[[jax.Array], T], x: jax.Array) -> T:
         return fn(x)
     explicit = set(mesh.explicit_axes) | set(axes)
     lead = min(x.ndim, len(RESIDUAL))
-    rows = _only(logical_spec(RESIDUAL[:lead], x.shape[:lead]), explicit)
+    rows = kept_axes(logical_spec(RESIDUAL[:lead], x.shape[:lead]), explicit.__contains__)
     region = mesh.update_axis_types(dict.fromkeys(axes, jax.sharding.AxisType.Explicit))
     with jax.sharding.use_abstract_mesh(region):
         out = fn(jax.sharding.reshard(x, rows))
@@ -693,16 +695,8 @@ def typed_on[T](tree: T, mesh: jax.sharding.AbstractMesh) -> T:
             return value
         with jax.sharding.use_abstract_mesh(mesh):
             spec = jax.typeof(value).sharding.spec
-            return jax.sharding.reshard(value, _only(spec, set(mesh.explicit_axes)))
+            return jax.sharding.reshard(value, kept_axes(spec, set(mesh.explicit_axes).__contains__))
     return jax.tree.map(back, tree)
-
-
-def _only(spec: jax.sharding.PartitionSpec, axes: Collection[str]) -> jax.sharding.PartitionSpec:
-    """`spec` with only `axes` kept in each dimension that names any."""
-    def kept(entry):
-        names = tuple(name for name in mesh_axes(entry) if name in axes)
-        return None if not names else names[0] if len(names) == 1 else names
-    return jax.sharding.PartitionSpec(*map(kept, spec.partitions))
 
 
 def placed_axes(mesh: jax.sharding.AbstractMesh) -> list[str]:
@@ -723,10 +717,7 @@ def auto_part(spec: jax.sharding.PartitionSpec,
     auto = set(mesh.auto_axes)
     if auto == set(mesh.axis_names):
         return spec
-    kept = [entry if entry is jax.sharding.PartitionSpec.UNCONSTRAINED
-            else tuple(axis for axis in mesh_axes(entry) if axis in auto) for entry in spec]
-    return jax.sharding.PartitionSpec(*(axes if axes is jax.sharding.PartitionSpec.UNCONSTRAINED
-                                        else axes[0] if len(axes) == 1 else axes or None for axes in kept))
+    return kept_axes(spec, auto.__contains__)
 
 
 def explicit_placement(aval: ShapedArray) -> jax.sharding.NamedSharding | None:
@@ -751,7 +742,7 @@ def explicit_spec(x: jax.Array, trailing: int = 0) -> jax.sharding.NamedSharding
         return None
     explicit = set(sharding.mesh.explicit_axes)
     spec = tuple(sharding.spec.partitions)
-    if not any(axis in explicit for entry in spec for axis in mesh_axes(entry)):
+    if not spec_axes(sharding.spec) & explicit:
         return None
     padded = (*spec, *(None,) * (x.ndim - len(spec) + trailing))
     return jax.sharding.NamedSharding(sharding.mesh, jax.sharding.PartitionSpec(*padded))

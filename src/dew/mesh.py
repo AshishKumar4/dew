@@ -9,6 +9,7 @@ models' layout (`dew.nn.sharding`) constrains and maps their arrays by these, an
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 
 import jax
 from flax import linen as nn
@@ -150,6 +151,25 @@ def mesh_axes(assignment: MeshAxes) -> tuple[str, ...]:
     if assignment is None:
         return ()
     return (assignment,) if isinstance(assignment, str) else tuple(assignment)
+
+
+def spec_axes(spec: jax.sharding.PartitionSpec) -> set[str]:
+    """Every mesh axis `spec` places a dimension on (its `partitions`, so a spec carrying a sum still to take,
+    `reduced` or `unreduced`, reads as its placement alone)."""
+    return {axis for entry in spec.partitions for axis in mesh_axes(entry)}
+
+
+def kept_axes(spec: jax.sharding.PartitionSpec, keep: Callable[[str], bool]) -> jax.sharding.PartitionSpec:
+    """`spec` with each dimension placed on the mesh axes `keep` admits of its own, in their order, as a
+    tuple, None where it keeps none; an entry left to the partitioner (`UNCONSTRAINED`) as it is, and the
+    sums `spec` still carries (`reduced`, `unreduced`) kept. The one filter of a spec's axes: a constraint's
+    Auto axes (`dew.nn.sharding.auto_part`), a leaf's placement without the state axes
+    (`dew.distributed.placement`), an Explicit region's own (`dew.nn.sharding.gathered_over`)."""
+    def kept(entry):
+        if entry is jax.sharding.PartitionSpec.UNCONSTRAINED:
+            return entry
+        return tuple(axis for axis in mesh_axes(entry) if keep(axis)) or None
+    return spec.update(partitions=tuple(map(kept, spec.partitions)))
 
 
 def axis_rules() -> LogicalAxisRules:

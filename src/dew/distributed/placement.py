@@ -36,8 +36,10 @@ from dew.mesh import (
     LogicalAxisRules,
     MeshAxes,
     batch_axes,
+    kept_axes,
     logical_spec,
     mesh_axes,
+    spec_axes,
 )
 from dew.nn.sharding import boxed, boxed_axes, current_boxes, declared_axes, ruled_boxes
 from dew.state import VARIABLE_FIELDS
@@ -84,7 +86,7 @@ def state_spec(spec_on: Callable[[Mesh | AbstractMesh], P], mesh: Mesh | Abstrac
     `spec_on`'s on `mesh`."""
     plain = spec_on(mesh)
     sequence = mesh.shape.get(SEQUENCE_AXIS, 1)
-    if (sequence == 1 or SEQUENCE_AXIS in _spec_axes(plain)
+    if (sequence == 1 or SEQUENCE_AXIS in spec_axes(plain)
             or SEQUENCE_AXIS in explicit_axes(mesh)):
         return plain
     fsdp = mesh.shape.get(FSDP_AXIS, 1)
@@ -95,10 +97,10 @@ def state_spec(spec_on: Callable[[Mesh | AbstractMesh], P], mesh: Mesh | Abstrac
     grouped = spec_on(abstract.update(axis_sizes=tuple(sizes[name] for name in names), axis_names=names,
                                       axis_types=(*mesh.axis_types, *(AxisType.Auto for _ in added))))
     def others(spec: P) -> list[MeshAxes]:
-        entries = [_without_state_axes(entry) for entry in spec]
+        entries = list(kept_axes(spec, lambda axis: axis not in STATE_AXES))
         return entries + [None] * (len(grouped) + len(plain) - len(entries))
 
-    if FSDP_AXIS not in _spec_axes(grouped) or others(grouped) != others(plain):
+    if FSDP_AXIS not in spec_axes(grouped) or others(grouped) != others(plain):
         return plain
     group = (FSDP_AXIS,) * (fsdp > 1) + (SEQUENCE_AXIS,)
 
@@ -107,11 +109,6 @@ def state_spec(spec_on: Callable[[Mesh | AbstractMesh], P], mesh: Mesh | Abstrac
         return None if not axes else axes[0] if len(axes) == 1 else axes
 
     return P(*map(held, grouped))
-
-
-def _spec_axes(spec: P) -> set[str]:
-    """Every mesh axis `spec` names."""
-    return {axis for entry in spec for axis in mesh_axes(entry)}
 
 
 def device_mesh(mesh: MeshSpec | Mesh) -> Mesh:
@@ -561,8 +558,8 @@ class Layout:
             spec = state_spec(lambda placed: logical_spec(axes, value.shape, rules=self.axis_rules,
                                                           mesh=placed), mesh)
         if self._kept_whole(path):
-            spec = P(*map(_without_state_axes, spec))
-        placed = _spec_axes(spec)
+            spec = kept_axes(spec, lambda axis: axis not in STATE_AXES)
+        placed = spec_axes(spec)
         if outside := sorted(placed & set(UNSPLIT_AXES)):
             raise ValueError(
                 f"the rules place {_variable_path(path)} on {outside}; the data axis "
@@ -747,7 +744,7 @@ class Layout:
         for path, leaf in jax.tree_util.tree_flatten_with_path(state)[0]:
             sharding = leaf.sharding
             if sharding.mesh == mesh and _within_variables(path) is not None:
-                split |= _spec_axes(sharding.spec)
+                split |= spec_axes(sharding.spec)
             # A sharding that names no memory places in its devices' default, their own.
             kind = sharding.memory_kind or "device"
             shard = sharding.shard_shape(leaf.shape)
@@ -863,12 +860,6 @@ def placeable(field) -> bool:
     return all(isinstance(leaf, (jax.Array, jax.ShapeDtypeStruct)) or (
         not isinstance(leaf, (str, bytes)) and np.asarray(leaf).dtype.kind not in "OSUV")
         for leaf in jax.tree.leaves(field))
-
-
-def _without_state_axes(entry: MeshAxes) -> MeshAxes:
-    """A spec entry with the state axes (`STATE_AXES`) dropped from it."""
-    kept = tuple(axis for axis in mesh_axes(entry) if axis not in STATE_AXES)
-    return kept if kept else None
 
 
 def placed_bytes(tree, placement: Placement | None = None, *, device: Hashable | None = None,
