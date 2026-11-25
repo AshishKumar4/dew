@@ -274,6 +274,18 @@ class Loop:
     the loop takes no step norm, reinjection or implicit step; under `backprop_steps` the cut stops the
     bank, so the prelude still trains through every pass after it. Its merges are parameters, so a resume
     compares it (not `PASSED`).
+
+    With `gathered`, a block whose parameters fully sharded data parallelism splits (the run's FSDP axis,
+    `dew.mesh.FSDP_AXIS`) reads them gathered whole over that axis once, before its first pass, and every
+    pass reads that one copy (`looping.run_loop`): no all-gather inside the passes' loop, forward or
+    recomputed, where each pass gathered its own (`steps` times the block's gathers). The passes' weight
+    gradients are still reduced over the data each pass, as without it: on an Auto mesh the loop's carried
+    gradient of the copy is placed whole, so each pass's partial sum is reduced into it. The copy held whole
+    over that axis throughout the loop, which the block's memory must allow (an opt-in for a block that
+    fits). The gradient is the same sum, summed in another order. It gathers the parameters as
+    the step reads them: a run's narrow copies (`dew.training.narrow`), the compute dtype's, where it holds
+    them, else the stored dtype. The prelude, the coda (each pass's too, under `exiting`) and the embedding
+    and head keep their placement, as does a quantized stored kernel.
     """
     steps: int
     step_norm: bool = True
@@ -288,13 +300,15 @@ class Loop:
     exits: bool = False
     theta_passes: int | None = None
     messages: CrossPass | None = None
+    gathered: bool = False
 
     PASSED: ClassVar[tuple[str, ...]] = ("steps", "backprop_steps", "remat", "implicit", "exit_threshold",
-                                         "exits")
+                                         "exits", "gathered")
     """The fields a run sets as it runs the loop's passes over the same parameters, a phase of its data its
     own (`dew.nn.protocols.Looping.with_passes`, `dew.training.phase_passes`): how many passes run, train,
-    recompute, are taken implicitly and exit, none of which makes the parameters mean another thing, so a
-    resume compares none of them (`dew.training.startup.computation_differs`)."""
+    recompute, are taken implicitly, exit and read their parameters gathered, none of which makes the
+    parameters mean another thing, so a resume compares none of them
+    (`dew.training.startup.computation_differs`)."""
 
     @property
     def exiting(self) -> bool:
