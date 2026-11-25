@@ -409,7 +409,8 @@ class Probe:
                 "headroom": self.headroom, "temp": self.temp, "argument": self.argument,
                 "ahead": self.ahead,
                 "compile_seconds": self.compile_seconds,
-                "beside": self.beside, "spent": dict(self.spent)}
+                "beside": self.beside, "admitted": None if self.admitted is None else list(self.admitted),
+                "spent": dict(self.spent)}
 
     def named(self) -> str:
         tile = ("" if self.rung["head_tile"] is None else ", the head tiled" if self.rung["head_fused"]
@@ -451,9 +452,9 @@ class PlanRefused(RuntimeError):
         self.probes, self.allocators = tuple(probes), tuple(allocators)
         # Each rung the search asked past its start, in order, with what it found there (`FitSearch.said`).
         self.asked = tuple(asked)
-        # The splits the search asked of each rung, and whether it chose a variant of its rungs from what
-        # its misses read (its Newton-Schulz stacks parted, its narrow copies dropped), which a search on
-        # more room may choose otherwise (`dew.training.compiler.StepCompiler.refuse_unplaced`).
+        # The splits the search asked of each rung, and whether a rung it measured has a lighter form it did
+        # not (its Newton-Schulz stacks parted, its narrow copies dropped), which a search on more room may
+        # reach (`FitSearch.unmeasured_lighter`, `dew.training.compiler.StepCompiler.refuse_unplaced`).
         self.candidates, self.variants = tuple(candidates), variants
         # Whether the search began at a rung a record or a resumed checkpoint named (`StepCompiler._planned`).
         self.recorded_start = False
@@ -813,25 +814,46 @@ class Parting:
     hold more than it counts: a spectral preconditioning's SVD). Each rung's own: one parted leaves the next
     rung asked joined first, which may fit as it is, and one whose parting freed nothing leaves the next
     rung's to its own miss (owner, 2026-11-23, row 12463: a 4B cold start parted its stacks before the remat
-    rung its miss needed, three compiles where two were its contract)."""
+    rung its miss needed, three compiles where two were its contract). A parted rung's miss measures what
+    parting freed (`measured`), which then stands in for the count: parting that freed nothing is asked at
+    no later rung at once, every joined rung asked first, so a climb that fits joined higher up asks no
+    parted step past its start (owner, 2026-11-25: a 4B cold start on two H100s parted every rung of its
+    climb as it went, freeing 0 bytes of its 10.98 GiB miss)."""
     estimate: int
-    """What the step's joined stacks hold by count, every process's the same; 0 where it joins none."""
+    """What the step's joined stacks free where parted: their count (`joined_bytes`), every process's the
+    same, until a parted rung measures it (`measured`); 0 where it joins none."""
     gather: Callable[[object], list]
     """How every process's verdict is read (`FitSearch.gather`), so each asks the same rungs."""
     deferred: list[Rung] = dataclasses.field(default_factory=list)
     """The parted variants a miss past the count left for the climb's end, in the order it reached them."""
+    futile: bool = False
+    """Whether a parted rung's miss measured parting to free nothing on some process (`measured`)."""
 
     def after(self, rung: Rung, shortfall: int | None) -> Rung | None:
         """`rung`, asked joined and missed by `shortfall` (None where it measured no miss), parted, where it
-        is asked at once; None where its parted variant is deferred, or where the step joins no stacks or
-        its rung parts them already."""
+        is asked at once: every process's miss measured and within what parting frees, which no parted rung
+        measured to free nothing; None where its parted variant is deferred, or where the step joins no
+        stacks or its rung parts them already."""
         if not self.estimate or rung.ns_group is not None:
             return None
         parted = dataclasses.replace(rung, ns_group=1)
-        if any(self.gather(shortfall is not None and shortfall > self.estimate)):
+        if self.futile or any(self.gather(shortfall is None or shortfall > self.estimate)):
             self.deferred.append(parted)
             return None
         return parted
+
+    def measured(self, joined: int | None, parted: int | None) -> None:
+        """A rung's parted variant missed by `parted` where the rung joined missed by `joined` at the same
+        split (None where either measured nothing there): what parting freed, the least any process
+        measured, stands in for the count; none freed on some process makes parting futile; a process that
+        measured nothing leaves both as they were, every process alike."""
+        freed = self.gather(None if joined is None or parted is None else joined - parted)
+        if any(value is None for value in freed):
+            return
+        if any(value <= 0 for value in freed):
+            self.futile = True
+        else:
+            self.estimate = min(freed)
 
 
 class Lower(Protocol):
@@ -950,6 +972,9 @@ class FitSearch[LossT, EffectsT]:
     one that missed among them, for the plan made on the devices as they stand to judge again in place of
     compiling it; a search that is not holds those that fit alone, and drops a held one that misses on its
     devices, which no plan after it asks for."""
+    stated_remat: bool | None = None
+    """Whether any module the run trains stated its own remat before a saved plan moved it (`remat_stated`),
+    read from `objective` as it stands where None."""
     unplaced: int | None = None
     """The bytes a device holds of the state the search plans over that the devices hold none of yet, None
     where they hold it (`dew.training.compiler.StepCompiler.planned_unplaced`): each candidate is judged with
@@ -959,8 +984,8 @@ class FitSearch[LossT, EffectsT]:
     one 38.88 GiB block its pool could give of 70.88 GiB free, 22.41 GiB short, fits). A candidate holds
     none of them (`Candidate.held`), so one cached for a
     placed state serves an unplaced one."""
-    variants: bool = False
-    """Whether its search chose a variant of its rungs from what its misses read (`searched`)."""
+    parting: Parting | None = None
+    """How its search parted its joined Newton-Schulz stacks (`searched`), None before it climbed."""
     asked: list[Rung] = dataclasses.field(default_factory=list)
     """The rungs its search asked past the one it stood on first (`searched`), which a plan made offline
     asks none of again (`below`)."""
@@ -986,7 +1011,8 @@ class FitSearch[LossT, EffectsT]:
             remat_topmost(self.objective)
         self.started = self.remat_rung()
         # Whether the run sets its remat, which it compiles at alone: a module's own, or "none" or "full".
-        self.remat_set = self.remat in ("none", "full") or remat_stated(self.objective)
+        explicit = remat_stated(self.objective) if self.stated_remat is None else self.stated_remat
+        self.remat_set = self.remat in ("none", "full") or explicit
         # The modules at their ladders' tops as the search starts, past which a "selective" one climbs none.
         self.topped = remat_topped(self.objective)
         # Every rung keeps, XLA's defaults' included, the options the modules need to compute right, as the
@@ -1048,8 +1074,8 @@ class FitSearch[LossT, EffectsT]:
         self.kernels = {"spills": spills, "refused": refused, "rewrites": rewrites, "passes": passes}
         if split is None:
             allocators = [device_memory(device) for device in local_devices(self.mesh)]
-            raise PlanRefused(self.probes, allocators, candidates, self.variants, self.outcomes) from (
-                self.refusals[-1] if self.refusals else None)
+            raise PlanRefused(self.probes, allocators, candidates, self.unmeasured_lighter(),
+                              self.outcomes) from (self.refusals[-1] if self.refusals else None)
         return self.found(split), tuple(self.probes)
 
     def above(self, candidates: Sequence[int], split: int) -> tuple[Probe, ...]:
@@ -1175,8 +1201,9 @@ class FitSearch[LossT, EffectsT]:
         (`ahead`); the candidate its executable compiled from, lowered afresh where a kernel spilled
         (`compiled_if_it_fits`, `Relowered`); and the measure of its fit (`Probe`), the search's state
         else untouched. A run that inspects compiles the candidate's sampled step too
-        (`Candidate.sampled`), at once with the step (`report.attempts`), or takes the one compiled ahead
-        with the step (`AheadOfTime.sampled`), which
+        (`Candidate.sampled`): at once with the step (`report.attempts`) until the search has missed, after
+        which only once the step fits; or takes the one compiled ahead with the step
+        (`AheadOfTime.sampled`), which
         must fit as the step must, so a rung fits only where both do; it is `sampled` until the next
         measure."""
         options = self.compiled_options(candidate)
@@ -1196,8 +1223,12 @@ class FitSearch[LossT, EffectsT]:
                 executable, taken = kept, True
             else:
                 # A run that inspects compiles its sampled step beside the step, at once (`report.attempts`),
-                # its compile kept only where the step fits, as the step's own is kept first.
-                early = None if candidate.sampled is None else candidate.sampled()
+                # its compile kept only where the step fits, as the step's own is kept first: until the
+                # search has missed once, past which most of its compiles miss and the sampled step is
+                # lowered and compiled for a step that fits alone (below), where each missed rung lowered,
+                # traced and compiled it for nothing (rows 8411, 10960: half an inspecting climb's time).
+                missed = any(not probe.fits for probe in self.probes)
+                early = None if candidate.sampled is None or missed else candidate.sampled()
                 firsts = report.attempts([(candidate.lowered, options)]
                                          + ([] if early is None else [(early, options)]))
                 relowered = Relowered(lambda: self.relowering(split))
@@ -1389,16 +1420,21 @@ class FitSearch[LossT, EffectsT]:
         missed = self.short(named[0])
         # What its joined Newton-Schulz stacks hold by count, every process's the same (0: it joins none, or
         # its run states their group): what orders each rung's parted variant (`Parting`).
-        parting = Parting(self.stacks_count() if group is None else 0, self.gather)
+        parting = self.parting = Parting(self.stacks_count() if group is None else 0, self.gather)
 
         def parted(rung: Rung) -> int | None:
-            # `rung`, just asked joined and missed, asked parted at once where its miss leaves it so.
-            variant = parting.after(rung, self.shortfall(named[-1]))
+            # `rung`, just asked joined and missed, asked parted at once where its last attempt's miss
+            # leaves it so; a miss of it measures what parting freed against the joined rung's at the same
+            # split (`Parting.measured`), none where either measured nothing there.
+            at, joined = named[-1], self.last_shortfall(named[-1])
+            variant = parting.after(rung, None if joined is None else joined[1])
             if variant is None or variant in self.asked:
                 return None
-            self.variants = True
-            return ask(variant, "the step does not fit the devices with its Newton-Schulz stacks joined; "
-                       "compiling it again joining one at a time (%s)")
+            split = ask(variant, "the step does not fit the devices with its Newton-Schulz stacks joined; "
+                        "compiling it again joining one at a time (%s)")
+            if split is None and (last := self.last_shortfall(named[-1])) is not None:
+                parting.measured(self.shortfall_at(at, last[0]), last[1])
+            return split
 
         if (split := parted(start)) is not None:
             self.said(named)
@@ -1425,7 +1461,6 @@ class FitSearch[LossT, EffectsT]:
                         "again without them (%s)")
             if split is None:
                 narrow = not self.freed(kept, self.rung())
-                self.variants = True
                 if narrow:
                     # Dropped, the step fell no less short at the split both missed at: on a GPU the step
                     # casts its weights whole either way (a GH200: 68.352 MB without its copies, 68.344 MB
@@ -1448,12 +1483,13 @@ class FitSearch[LossT, EffectsT]:
             if split is not None:
                 self.said(named)
                 return split
-        # Every rung asked joined missed: each parted variant a miss past the stacks' count deferred, in the
-        # climb's order, before the search gives up (the count orders, and rules none out).
+        # Every rung asked joined missed: each parted variant a miss past the stacks' count, or parting
+        # measured futile, deferred, in the climb's order, before the search gives up (the count and the
+        # measure order, and rule none out: a refusal before the state is placed needs each measured,
+        # `unmeasured_lighter`).
         for variant in parting.deferred:
             if variant in self.asked:
                 continue
-            self.variants = True
             split = ask(variant, "no rung fits the devices with its Newton-Schulz stacks joined; compiling "
                         "one again joining them one at a time (%s)")
             if split is not None:
@@ -1506,6 +1542,23 @@ class FitSearch[LossT, EffectsT]:
                 found.append(self.probes[-1])
         return tuple(found)
 
+    def unmeasured_lighter(self) -> bool:
+        """Whether a rung the search measured has a lighter form a search on more room may reach that it
+        did not measure, at any split it asked (`PlanRefused.variants`): the rung without its narrow copies
+        where the step reads them, or with its joined Newton-Schulz stacks parted, each rung's own whatever
+        another rung measured (owner, 2026-11-25: a 4B start on two H100s measured every form of its rungs
+        and missed each by 10.98 GiB, and its placed search asked them all again)."""
+        measured = {json.dumps(probe.rung, sort_keys=True) for probe in self.probes}
+        copies = any(candidate.copies for candidate in self.lowered.values())
+        parts = self.parting is not None and (self.parting.estimate > 0 or self.parting.futile)
+        for probe in self.probes:
+            lighter = [*([{**probe.rung, "narrow": False}] if copies and probe.rung.get("narrow") else []),
+                       *([{**probe.rung, "ns_group": 1}] if parts and probe.rung.get("ns_group") is None
+                         else [])]
+            if any(json.dumps(rung, sort_keys=True) not in measured for rung in lighter):
+                return True
+        return False
+
     def stacks_held(self) -> int:
         """What the Newton-Schulz stacks the step's updates join hold by count (`Candidate.joined`), the most
         of any step this search lowered; 0 where they join none."""
@@ -1517,11 +1570,18 @@ class FitSearch[LossT, EffectsT]:
         and whether a rung's parted step is asked is one (`Parting`, `below`)."""
         return max(self.gather(self.stacks_held()))
 
-    def shortfall(self, rung: str) -> int | None:
-        """What the search fell short by at `rung` at the split it last missed at there, its walk's finest
-        (`MemoryMiss.shortfall`, in bytes), as `freed` reads it; None where it measured no miss there."""
-        latest = next((miss for (at, _), miss in reversed(self.misses.items()) if at == rung), None)
-        return None if latest is None else latest.shortfall // self.factor
+    def last_shortfall(self, rung: str) -> tuple[int, int | None] | None:
+        """The split of the last attempt the search made at `rung` and what it fell short by there
+        (`MemoryMiss.shortfall`, in bytes), None for a miss that measured nothing (an allocation refusal
+        with no figure); None where it attempted none there."""
+        split = next((probe.split for probe in reversed(self.probes)
+                      if json.dumps(probe.rung, sort_keys=True) == rung), None)
+        return None if split is None else (split, self.shortfall_at(rung, split))
+
+    def shortfall_at(self, rung: str, split: int) -> int | None:
+        """What the search fell short by at `rung` at `split`, None where it measured no miss there."""
+        miss = self.misses.get((rung, split))
+        return None if miss is None else miss.shortfall // self.factor
 
     def short(self, rung: str) -> tuple[int, LiveSet] | None:
         """The least the search fell short by at `rung` (`MemoryMiss.shortfall`, in bytes) among its misses

@@ -1,6 +1,8 @@
 """The attention template's Pallas-Triton mainloop (`attention_triton`): its forward and backward on par with
 `attention.reference` from float64 across every call form, head width and hook, here interpreted and on a GPU
-(tests/test_gpu_attention.py)."""
+(tests/test_gpu_attention.py). The backward's sweeps over call forms and score hooks are modules of their
+own (tests/test_attention_triton_backward.py, tests/test_attention_triton_hooks.py): a GPU tier prepares a
+file a unit, and this one whole passed its unit's deadline (row 12671)."""
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -28,6 +30,7 @@ from dew.nn.kernels.templates import (
     attention_triton,
 )
 from dew.nn.kernels.templates.hooks import Hook, Side
+from dew.parity import FEWEST_SEEDS
 
 ON_GPU = not interprets()
 SEEDS = 8
@@ -47,15 +50,7 @@ config, 128-key tiles among them, with the real dot. (Interpreted, XLA:CPU's fp3
 257-by-385 product does, over 10 draws; recorded 2026-10-21, ledger 882.)"""
 
 
-@pytest.fixture(autouse=True)
-def _interpreted_as_an_a100():
-    """An interpreted call in a CPU process states the GPU it emulates (`generation.assumed`): the
-    Pallas-Triton mainloop's tiles and their costs are an A100's, its target's facts, where a CPU has none."""
-    if ON_GPU:
-        yield
-        return
-    with generation.assumed("sm80"):
-        yield
+pytestmark = pytest.mark.usefixtures("interpreted_as_an_a100")
 
 
 def geometry(case: dict) -> tuple[int, int]:
@@ -465,38 +460,6 @@ BACKWARD_FORMS = ("full", "causal-window", "documents", "cross-causal-lengths-st
 TEMPLATE_FORMS = {"default": {}, "accurate": {"natural": True, "accurate": True}}
 """The template's two forms an ordinary draw holds to check 1: the default (the base-2 fold and the
 backward's fast form) and the accurate one (natural logits and the backward's accurate form)."""
-
-
-@pytest.mark.parametrize("options", TEMPLATE_FORMS.values(), ids=TEMPLATE_FORMS)
-@pytest.mark.parametrize("config", PINNED[:3], ids=str)
-@pytest.mark.parametrize("form", BACKWARD_FORMS)
-def test_the_backward_is_on_par_over_every_call_form(form, config, options):
-    """Each call form's keys, fp32, no hooks, at pinned dQ and dK/dV configs, in both forms."""
-    check_backward(CASES[form], (), jnp.float32, config, **options)
-
-
-@pytest.mark.parametrize("options", TEMPLATE_FORMS.values(), ids=TEMPLATE_FORMS)
-@pytest.mark.parametrize("config", PINNED[:2], ids=str)
-@pytest.mark.parametrize("form", RUN_CASES)
-def test_the_plain_backward_is_on_par_over_runs(form, config, options):
-    """Each query's runs on the plain-JAX mainloop: its query walk takes its ranges as the forward does, and
-    its key walk reads the query blocks some range of which holds its keys, in both forms."""
-    check_backward(RUN_CASES[form], (), jnp.float32, config, mainloop="portable", **options)
-
-
-@pytest.mark.parametrize("form", [form for form in CASES if form not in BACKWARD_FORMS])
-def test_the_backward_is_on_par_over_the_core_s_other_call_forms(form):
-    """The rest of the template core's call forms, the dK/dV launch at warps and stages of its own."""
-    check_backward(CASES[form], (), jnp.float32, PINNED[0], attention_triton.Tiles(32, 32, 8, 3))
-
-
-@pytest.mark.parametrize("options", TEMPLATE_FORMS.values(), ids=TEMPLATE_FORMS)
-@pytest.mark.parametrize("dtype", attention_triton.DTYPES, ids=DTYPE_IDS)
-@pytest.mark.parametrize("hooks", SCORE_HOOKS.values(), ids=SCORE_HOOKS)
-def test_the_backward_is_on_par_under_every_score_hook(hooks, dtype, options):
-    """Each score hook over causal packed documents under a window: the gradients of its parameters and
-    of the initial state too, in both forms."""
-    check_backward(CASES["causal-documents-window"], hooks, dtype, PINNED[0], **options)
 
 
 def test_a_wide_parameter_computes_as_its_fp32_value_and_its_gradient_returns_wide():
@@ -1128,6 +1091,8 @@ def test_a_hook_through_a_custom_vjp_lowers_and_compiles_on_tritons_compiler(tar
 
 
 @pytest.mark.gpu(reason="runs a Pallas Triton kernel's arithmetic on this GPU")
+@pytest.mark.compiles_at_run(reason="runs a Pallas Triton kernel's arithmetic, judged bit for bit, "
+                                   "no check-1 site")
 @pytest.mark.generations("sm80", "sm90", "sm100")
 def test_tritons_compiler_rounds_a_product_and_the_sum_it_feeds_apart():
     """A Pallas Triton kernel's product and the sum it feeds, alone (`a * b + c`) and inside a compensated
@@ -1390,10 +1355,14 @@ def test_triton_kernel_dot_keeps_ieee_fp32_range_in_native_launch():
         return (jnp.full((16, 16), np.float32(3.40e38), dtype=jnp.float32),
                 jnp.eye(16, dtype=jnp.float32) * np.float32(0.5))
 
+    # The one draw at check 1's fewest seeds: a draw that reads no seed is judged at them alike, where one
+    # seed was refused as inconclusive (row 12670).
     assert_as_exact(jax.jit(ours), jax.jit(jnp.matmul), draw,
-                    "triton kernel_dot keeps IEEE fp32 range above bfloat16.max", seeds=1)
+                    "triton kernel_dot keeps IEEE fp32 range above bfloat16.max", seeds=FEWEST_SEEDS)
 
 
+@pytest.mark.compiles_at_run(reason="a template's certification compiles its configs as the call traces, "
+                                   "no check-1 site")
 def test_common_triton_forward_lowering_isolates_scaled_op():
     """Row 11648: certifying the common `TritonForward` (`lowering(ba, config)`) traces only its own
     unscaled kernel(s), never compiling `rare()`'s separate `scaled=True` op inside the common op's
@@ -1428,6 +1397,7 @@ def test_common_triton_forward_lowering_isolates_scaled_op():
         assert any("scaled" in name for name in runtime_names), runtime_names
 
 
+@pytest.mark.compiles_at_run(reason="runs the Triton forward on its GPU, judged bit for bit, no check-1 site")
 def test_triton_forward_settles_interior_and_overflow_midpoints():
     """`attention_triton.forward` retains full single-rounding (`narrowing_settled`) on 16-bit outputs:
     settling both finite interior BF16 midpoints (`denom = 1 + 2^-23`, `acc = 1 + 3/256 + 2^-23` ->

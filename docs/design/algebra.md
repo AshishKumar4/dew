@@ -177,15 +177,16 @@ glue is (§6.2), reorderings over its values held by the dominance rule alone (�
     every program the pass saw, bodies included) the only pattern of note was a divisor shared by several
     quotients (42 to 452 of 423 to 794 divisions a suite). A shared reciprocal unguarded overflows where `a /
     y` is finite (a subnormal `y`), makes a NaN of a zero `a`, and flushes to zero where a large `y`'s quotient
-    keeps its value, so each rule reads a divisor an epsilon floors (a maximum's or a sum's, so a window
-    opens at a division by one alone) and fires only where its divisor is held away from zero (its floor,
-    `rules.log2_floor`) and bounded (`log2_bound`: the reciprocal a normal float above the narrowest float's
-    least normal power, `rules.least`) and its dividend bounded, the product under the reach (§6.3). A
-    training step's values are mostly unbounded, so it fires on bounded ones alone (an epsilon's floor over a
-    bounded operand);
-  - **decoupled reductions** (dev time): dependent nonlinear reductions broken with correction terms (the running-max
-    rescale of online softmax, log-sum-exp merges and folds, moment merges; the moment merges are not built:
-    no rule, declaration or consumer of one exists);
+    keeps its value, so each rule reads a divisor an epsilon floors (a maximum's, a sum's, or a `reduce_sum`'s,
+    directly or broadcast along trailing axes) and fires only where its divisor is held away from zero (its
+    floor, `rules.log2_floor`) and bounded (`log2_bound`: the reciprocal a normal float above the narrowest
+    float's least normal power, `rules.least`) and either `|y| >= 1` (`floor >= 0`, so `0 < |1/y| <= 1` can
+    never overflow any finite dividend, with positivity required for reciprocal-root reuse) or the dividend
+    is bounded with the product under the reach (§6.3). Window formation (`program._windows`) pulls sibling
+    `rsqrt` and unit reciprocal equations sharing a division head's radicand or divisor into the window;
+  - **decoupled reductions** (dev time): dependent nonlinear reductions broken with correction terms (the
+    running-max rescale of online softmax, log-sum-exp merges and folds, and Chan-Golub-LeVeque central-moment
+    merges for weighted and masked variance and bilinear covariance in `derive.py` / `moments.py`, row 9036);
   - **stable forms** (`stable`, dev time; §1.5; row 9037): `log1p` and `expm1`, a sum's logarithm taken out
     of its exponent (the log-sum-exp fold), logarithms of exponentials in log space (`log(exp(a) / exp(b))`
     as `a - b`, a KL's divergence of two softmaxes; `log(exp(a) exp(b))`, `log(exp(a))`), differences of
@@ -469,6 +470,7 @@ because its Python API is still marked as subject to change.
 | `dew.algebra.terms` | The term language and its conversion to and from jaxprs |
 | `dew.algebra.rules` | The shape of each value a rule makes (`FACTS`, an e-class analysis; the magnitude bound is the region's, `terms.Region.magnitudes`, §6.3), `Rules` and `RuleFamily`, the registry and the sets registered: `identities`, `contracted`, `stable`, `reuse`, `linear`, `joined`, each declared as its rewrites with their instances (the error-free transforms are `error`'s derivation, no set, §1.4; `decoupled` and `carried` are the derivations' own sets, never registered) |
 | `dew.algebra.linear_scan` | A recurrence's token update read as an affine map by rules, and its chunk form derived by identities and extracted under the work-span model (§6.9) |
+| `dew.algebra.coupled_scan` | A coupled pair's chunk forms (`Scan.state` a pair: Momentum DeltaNet's memory and momentum), its 2x2 triangular transition read from the update by `linear_scan.coupled_parts`, its decayed sums and the terms they weigh in scaled arithmetic past float32's range (§6.9) |
 | `dew.algebra.cost` | A node's work in the cost vocabulary (`work`, `templates.cost.Work`), the two schedules (`fused`, `walk`) that turn it into seconds, and the DAG cost models extraction reads (`model`, `stable`) |
 | `dew.algebra.extract` | Extraction: egglog's greedy DAG (`cheapest`) and the exact one, its oracle (§6.5) |
 | `dew.algebra.error` | Dev time: a function's candidate forms in order of price, each one's sums compensated after them (`compensated`, the error-free derivation), and the first its caller's admission takes (`choose`, §6.5) |
@@ -1203,11 +1205,13 @@ class Reduction:                     # attention, and any walk whose state is a 
 
 @dataclass(frozen=True)
 class Scan:                          # a recurrence
-    update: Callable                 # (h, **token) -> h, read as h <- A_t h + B_t U_t^T by rules
-    readout: Callable                # (h, **token) -> o_t, the token's operands by name
+    update: Callable                 # (h, **token) -> h, read as h <- A_t h + B_t U_t^T by rules; a pair's
+                                     # ((h, m), **token) -> (h, m), read as the coupled map (§6.9)
+    readout: Callable                # (h, **token) -> o_t, the token's operands by name; a pair's of (h, m)
     operands: Mapping[str, Axes]
     walked: str                      # "time"
-    state: tuple[tuple[int, ...], jnp.dtype]   # the state's shape (keys by values) and dtype
+    state: State | tuple[State, State]   # the state's shape (keys by values) and dtype, or a coupled
+                                     # pair's two of one shape and dtype (`coupled_scan`)
     reset: str | None = None         # an operand whose tokens start a document: each takes the finite
                                      # exponent `scan.RESET_DECAY` for its own (the state entering it
                                      # decays to exactly 0 in fp32), the replaced exponent given no gradient
@@ -1222,10 +1226,11 @@ class Scan:                          # a recurrence
 
 class Derived(NamedTuple):           # dew.algebra.forms
     init: Callable                   # shapes -> the empty state
-    step: Callable                   # (state, tiles) -> state; a scan's (state, prepared)
+    step: Callable                   # (state, tiles) -> state; a scan's (state, prepared) -> (state, kept),
+                                     # kept what its chunk solved for its outputs (a pair's inputs, else None)
     merge: Callable                  # two states of disjoint walks joined: split walks, the work scheduler's fix-up
     finish: Callable                 # (state, operands) -> the outputs the walk reduces
-    mapped: Callable                 # a tile's outputs along the walked axis; a scan's (prepared, state)
+    mapped: Callable                 # a tile's outputs along the walked axis; a scan's (prepared, state, kept)
     report: Mapping                  # what the derivation decoupled and its rounding class
     backward: Callable | None = None # a scan's chunk adjoint, its replay's derivative; a reduction's backward is a declaration of its own
     prepare: Callable = ...          # a tile's values that read no state, for every tile at once

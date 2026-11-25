@@ -1401,7 +1401,7 @@ EXTERNAL = ("subprocess.", "socket.", "ssl.", "select.", "urllib.", "http.", "re
             "filelock.", "multiprocessing.", "concurrent.futures.ProcessPoolExecutor.", "os.kill.",
             "os.killpg.", "os.waitpid.", "os.waitid.", "os.fork.", "os.posix_spawn.", "jax.distributed.",
             "dew._cleanup.signal_group.", "dew._cleanup.exit_code.", "dew._cleanup.groups_ended.",
-            "dew._cleanup.end_group.", "dew._cleanup.process_group.",
+            "dew._cleanup.end_group.",
             "IPython.display.display.", "IPython.display.update_display.", "IPython.display.clear_output.")
 """What leaves the process: a subprocess, the network, a remote service, another process (a
 notebook's frontend, which IPython's display functions publish to over the kernel's socket; its

@@ -196,8 +196,6 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
 
     copies_vectors = True
 
-    adds_vectors = False
-
     walks_scoped = False
 
     budgets_registers = False

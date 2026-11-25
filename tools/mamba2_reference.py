@@ -364,12 +364,10 @@ def write_seeded(only: str | None = None) -> None:
                     and value.tobytes() == other.tobytes()), f"transformers seed {seed}: {name} differs"
         return inputs
 
-    from reference_error import recording
+    from reference_worker import kept_sites, pinned_base
 
     destination = SSD / "ssd_seeded.npz"
-    stored = ({} if only is None else
-              {name: value for name, value in recording(destination).items()
-               if not name.startswith(f"{only}.") and name != "provenance"})
+    stored = {}
     references = {**dict.fromkeys(support.SCAN_SITES, scan_reference),
                   **dict.fromkeys(support.LAYER_SITES, layer_reference),
                   **dict.fromkeys(support.MODEL_SITES, model_reference)}
@@ -383,6 +381,19 @@ def write_seeded(only: str | None = None) -> None:
         f"transformers {transformers.__version__}", transformers_record()["revision"], "cpu",
         "PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu python tools/mamba2_reference.py seeded",
         truth="transformers reference in torch float64 through src/_dew_torch/precision.py")
+    if only is not None:
+        # Every other site as the pinned recording holds it, refused where that was recorded under another
+        # transformers than this site, or on another device (tools/reference_worker.py's `kept_sites`).
+        common = json.loads(str(stored["provenance"]))
+        device = common.pop("device")
+        base = pinned_base(destination)
+        if base is None:
+            raise ValueError(f"{destination.name} is pinned nowhere: record every site of it")
+        kept, placed_on = kept_sites(base, {only}, common)
+        if any(each != device for each in placed_on.values()):
+            raise ValueError(f"{destination.name} holds sites recorded on {set(placed_on.values())}, {only} "
+                             f"on {device}: record every site of it again")
+        stored.update(kept)
     written = save(destination, stored, reference=f"transformers {transformers.__version__}",
                    license="Apache-2.0")
     print(f"wrote {destination.name}: {written} ({written.stat().st_size:,} bytes)", flush=True)

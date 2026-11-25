@@ -303,6 +303,16 @@ def gated_hook(activation: str, limit: float | None = None) -> Callable[[jax.Arr
     return ColumnLocal(hook)
 
 
+def rounded_gated(hook: Callable, dtype) -> Callable:
+    """A paired product's epilogue (`gemm.gemm`'s): its two accumulators rounded to `dtype` and `hook`'s
+    gated product of the rounded pair (`gated_hook`), the three a fused gated MLP keeps
+    (`dew.nn.gated_mlp.fused_products`, `dew.nn.moe.gated_experts`)."""
+    def epilogue(first, second):
+        first, second = first.astype(dtype), second.astype(dtype)
+        return first, second, hook(first, second)
+    return epilogue
+
+
 def _gated(activate: Callable[[jax.Array], jax.Array], rounding: Callable = rounded_to
            ) -> Callable[[jax.Array, jax.Array], jax.Array]:
     """`gated_product`'s arithmetic of a gate and an up projection: `activate(gate) * up` at fp32 and wider,

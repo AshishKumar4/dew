@@ -146,10 +146,13 @@ def parsed(path: str) -> ast.Module:
 
 
 def fields(cls) -> list[str]:
-    """A dataclass's fields: `name: type = default`, marked where its constructor takes it by keyword alone
-    or not at all; a dataclass it builds is listed on its own."""
+    """A dataclass's public fields: `name: type = default`, marked where its constructor takes it by keyword
+    alone or not at all; a dataclass it builds is listed on its own. A private field (`_name`, a saved
+    record's translation that no caller states) is no contract."""
     lines = []
     for field in dataclasses.fields(cls):
+        if field.name.startswith("_"):
+            continue
         line = f"{field.name}: {annotation(field.type)}{default(field)}"
         if not field.init:
             line += "  [no constructor argument]"
@@ -234,7 +237,8 @@ def reaches(hint, expanded: frozenset[typing.TypeAliasType] = frozenset()) -> It
 def config() -> list[str]:
     """Every record dataclass a run's `run.json` holds: those of `dew.config` and its modules, and of the
     module of each run kind the registry names (`dew.registry.runs`), wherever it lives, and every dataclass
-    of Dew a run kind's fields reach (`reaches`), each once under its qualified name."""
+    of Dew a run kind's public fields reach (`reaches`), each once under its qualified name; a private one
+    (`_Name`, a saved record's translation) aside."""
     import dew.config
     from dew._records import annotations_of
     from dew.registry import runs
@@ -246,7 +250,8 @@ def config() -> list[str]:
                *(importlib.import_module(module) for module in kinds),
                importlib.import_module("dew.interop.release_record")}
     listed = {cls for module in modules for cls in vars(module).values()
-              if inspect.isclass(cls) and dataclasses.is_dataclass(cls) and cls.__module__ == module.__name__}
+              if inspect.isclass(cls) and dataclasses.is_dataclass(cls) and cls.__module__ == module.__name__
+              and not cls.__name__.startswith("_")}
     pending = [runs[name] for name in runs]
     reached: set[type] = set()
     while pending:
@@ -254,7 +259,8 @@ def config() -> list[str]:
         if cls not in reached:
             reached.add(cls)
             hints = annotations_of(cls, include_extras=True)
-            pending.extend(found for field in dataclasses.fields(cls) for found in reaches(hints[field.name]))
+            pending.extend(found for field in dataclasses.fields(cls) if not field.name.startswith("_")
+                           for found in reaches(hints[field.name]))
     lines = []
     for cls in sorted(listed | reached, key=lambda cls: (cls.__module__, cls.__qualname__)):
         lines.append(f"{cls.__module__}.{cls.__qualname__}")

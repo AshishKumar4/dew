@@ -1574,6 +1574,21 @@ def _holds_prologue(op: MosaicForward, args: tuple, residuals: Kept) -> bool:
     return holds(op) and (rare or holds(dataclasses.replace(op, scaled=True)))
 
 
+def producer_raised(family: mosaic.Family, target: generation.GpuTarget) -> bool:
+    """Whether `family`'s program runs a producer warpgroup lowered beneath its consumers (`Family.roles`'
+    role of weight 0) whose registers it gives them: each consumer's (`Family.registers`) past the program's
+    even share of the multiprocessor's (`resources.entry_registers`), as a compile that honors the raises
+    gives them (`resources.RAISES_HONORED`; FlashAttention 3's 24/240), on `target`'s multiprocessor whatever
+    GPU the call is derived under (`generation.as_target`). The fused backward takes such a layout before a
+    fed one (`MosaicBackward._one_launch`)."""
+    warpgroups = family.roles(family.consumers).roles
+    if not any(role.weight == 0 and not role.warp for role in warpgroups):
+        return False
+    held = sum(role.count for role in warpgroups if not role.warp)
+    with generation.as_target(target):
+        return family.registers(family.consumers) > resources.entry_registers(held)
+
+
 @dataclasses.dataclass(frozen=True)
 class MosaicBackward(_Mainloop[BackwardTiles]):
     """The template's backward on this mainloop (`gradients`) over the call's own arrays (`backward` gives
@@ -2097,7 +2112,13 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # 5.54 full at Qwen3-8B's widths; at width 64, 64 x 64 on two consumers 0.47 ms against 128 x 64 on
         # one, 0.59): another layout than the dQ launch's, whose own fed layout the next launches name, and
         # at two consumers or more, one's softmax under the other's products, which one consumer has not.
-        for layout in (layout for layout in fed if layout.name != family.name):
+        # Before a fed layout, the dQ launch's own where its producer's registers raise its consumers'
+        # (`producer_raised`): an H100's warpgroup MMA at 24/240 (`setmaxnreg`, honoured since post43),
+        # M-NA-8-gh200 20261124T011529Z, the dK/dV launch 1.06 against the fed layout's 1.24 ms at width 64
+        # and 1.86 against 2.18 at 128 (Llama 3.2 1B's, Qwen3-8B's), spill-free; ET-FFED3's choice of the
+        # fed layout predates the raises.
+        producer = [family] if fed and producer_raised(family, target) else []
+        for layout in (*producer, *(layout for layout in fed if layout.name != family.name)):
             def fed_fused(rows: int, walked: int, consumers: int, layout=layout) -> BackwardTiles:
                 return BackwardTiles(walked, rows, 2, consumers, fused=True, family=layout.name)
 

@@ -29,13 +29,26 @@ IGNORING = ("ptxas info    : (C7507) Potential Performance Loss: 'setmaxnreg' ig
 challenge's C7507 (notes/ptxas-re.md §4, 'setmaxnreg' ignored), its threads left at the entry's registers."""
 
 
+DIVERGED = ("ptxas info    : (C7520) Potential Performance Loss: wgmma.mma_async instructions are serialized "
+            "due to program dependence on compiler-inserted WG.AR in divergent path in the function "
+            "'dew_gmm__la5e5fcdee4_mosaic_gpu_kernel'\n"
+            "ptxas info    : Compiling entry function 'dew_gmm__la5e5fcdee4_mosaic_gpu_kernel' for 'sm_90a'\n"
+            "ptxas info    : Used 168 registers, used 16 barriers, 1 bytes smem\n"
+            "    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads")
+"""ptxas's report of M-FS-74's Qwen3.5-4B q input gradient (CUDA 12.9 and 13.0 alike, FS-QDX-SASS3):
+spill-free, every HGMMA of its walk waited, its merge of a shared tile's partials branching on a verdict held
+lane by lane (row 10151)."""
+
+
 @pytest.mark.parametrize(("notes", "registers", "code", "named"),
-                         [(SERIALIZING, 152, "C7512", "serialize"), (IGNORING, 168, "C7507", "setmaxnreg")])
+                         [(SERIALIZING, 152, "C7512", "serialize"), (DIVERGED, 168, "C7520", "serialize"),
+                          (IGNORING, 168, "C7507", "setmaxnreg")])
 def test_a_kernel_ptxas_notes_a_performance_loss_of_fails_the_gate(notes, registers, code, named):
     """A Mosaic GPU kernel ptxas notes a performance loss of fails the compile gate (`mosaic_failures`), its
-    registers and spills clean: one whose warpgroup MMAs it serializes (C7510 to C7515: each HGMMA waited, as
-    a spill-free 152-register recurrence output was) runs its MMAs one at a time (row 3615; the kernel
-    challenge's C7511 at 112 registers, C7512 at 96), and one whose setmaxnreg it ignores (C7507: code after
+    registers and spills clean: one whose warpgroup MMAs it serializes (C7510 to C7515 and C7520: each HGMMA
+    waited, as a spill-free 152-register recurrence output was, and a GEMM whose merge branched on a verdict
+    held lane by lane) runs its MMAs one at a time (rows 3615, 10151; the kernel challenge's C7511 at 112
+    registers, C7512 at 96), and one whose setmaxnreg it ignores (C7507: code after
     the warp roles' split reachable from both budgets, every raise and decrease dropped) keeps its consumers
     at the entry's registers, never the ones its tile was sized for (row 4071)."""
     read = kc.ptxas_read(notes)

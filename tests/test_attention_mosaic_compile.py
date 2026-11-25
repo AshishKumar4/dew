@@ -1631,6 +1631,32 @@ def test_d128_fused_backward_deepens_to_3_stages_without_losing_residency(gen):
         found = compile_mosaic_kernels([case], gen)
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
+@pytest.mark.parametrize("ambient", ["sm80", "sm90"])
+def test_an_h100s_fast_backward_derives_the_same_under_any_gpu_in_effect(ambient):
+    """An H100's fast backward of a plain bf16 causal call 64 wide (Llama 3.2 1B's heads, 32 over 8, 4,096
+    tokens) derived for an explicit H100 target under another GPU in effect (an A100's, which raises no
+    registers) is the one derived under the H100 itself, and legal there: its layout order reads the
+    target's multiprocessor (`attention_mosaic.producer_raised`), not the ambient one's."""
+    h100 = generation.gpu_target("sm90")
+    spans = template.spans(4096, 4096, 1, causal=True)
+    q = jax.ShapeDtypeStruct((1, 4096, 32, 64), jnp.bfloat16)
+    k = jax.ShapeDtypeStruct((1, 4096, 8, 64), jnp.bfloat16)
+    shapes = jax.tree.map(lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), _residuals(q.shape))
+
+    def derived():
+        op, args = attention_mosaic._backward_call(q, k, k, spans, None, q, residuals=shapes, scale=None,
+                                                   natural=attention_mosaic.NATURAL, accurate=False)
+        ba = op.bind(*args, interpret=False)
+        return op, ba, op.derived(ba, h100)
+
+    # The ambient GPU's derivation first: a derivation the H100's own made first is read back.
+    with generation.assumed(ambient):
+        op, ba, config = derived()
+    with generation.assumed("sm90"):
+        _, _, own = derived()
+    assert config is not None and config == own and op.legal(ba, config, h100), (config, own)
+
+
 def test_overlapped_derived_weights_and_from_weights_match_derived_cotangents():
     """Row 5272: split `derived_weights` + `derived_from_weights` match `derived_cotangents` bit-for-bit
     (masked and unmasked), and `streamed_statistics(..., anchored=False)` excludes dead `chosen`."""

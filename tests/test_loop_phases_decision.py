@@ -1,7 +1,7 @@
 """A decision run whose implicit loop's pass count grows with its data's phases (row 5480(a)'s
 acceptance): the tiny Qwen 3.5, its rows batched by their tokens after a step that drops some, so each
 phase reads per share (`dew.data.dataset.StepPhases`), two sources in two phases on the step clock, its
-block [1, 3) run once in the first and twice in the second (`DecoderRunConfig.loop_steps`, `Trainer`'s
+block [1, 3) run once in the first and twice in the second (`DecoderRunConfig.passes`, `Trainer`'s
 `phase_passes`)."""
 
 import csv
@@ -20,7 +20,8 @@ from run_kinds import MostlyKept, trained
 from dew.config import ModelConfig
 from dew.data import Files, Loading, Phase, Steps, phases
 from dew.decision import Decide, decisions
-from dew.decision.config import DecisionRunConfig
+from dew.decision.config import DecisionRunConfig, RowBudgets
+from dew.nn.backbones.decoder_stack import Loop
 
 QWEN35 = Path(__file__).parent / "fixtures" / "hf" / "qwen35-native-tiny"
 """The tiny Qwen 3.5, with its tokenizer, which lays a decision's rows out."""
@@ -57,22 +58,26 @@ def asked(rows: Files):
             .batch(tokens=TOKENS).loading(Loading(workers=0)))
 
 
-def run(root: Path, steps, data) -> DecisionRunConfig:
+LOOP = Loop(STEPS[-1], step_norm=False, layers=(1, 3), implicit=True)
+"""The run's implicit loop over the block [1, 3), at the last phase's count."""
+
+
+def run(root: Path, steps, data, loop: Loop = LOOP) -> DecisionRunConfig:
     del root
     return DecisionRunConfig(pretrained=str(QWEN35),
-                             model=ModelConfig("causal_transformer", {"dtype": "float32"}), max_len=MAX_LEN,
-                             data=data, validation=None, loop_layers=(1, 3), loop_steps=steps,
-                             loop_implicit=True)
+                             model=ModelConfig("causal_transformer", {"dtype": "float32"}),
+                             rows=RowBudgets(max_len=MAX_LEN),
+                             data=data, validation=None, loop=loop, passes=steps)
 
 
 def test_a_phased_decision_run_resumes_with_its_loops_passes_recomputed(tmp_path):
     """A run stopped inside its second phase resumes with its loop's passes recomputed in the backward
-    (`loop_remat`), memory alone: the resume takes it and trains on through the phase, where a change of
+    (`Loop.remat`), memory alone: the resume takes it and trains on through the phase, where a change of
     what the run computes (its phases' passes) it refuses (row 5558)."""
     data = phased(tmp_path)
     trained(run(tmp_path, STEPS, data), tmp_path, "stopped", trainer={"steps": 3,
                                                                       "checkpoint_every": 1})
-    recomputed = dataclasses.replace(run(tmp_path, STEPS, data), loop_remat=True)
+    recomputed = run(tmp_path, STEPS, data, dataclasses.replace(LOOP, remat=True))
     resumed, _ = trained(recomputed, tmp_path, "stopped", trainer={"steps": 4,
                                                                    "checkpoint_every": 1})
     assert int(resumed.step) == 4
@@ -146,19 +151,19 @@ def test_a_decision_run_whose_passes_grow_by_phase_resumes_as_one(tmp_path):
 
 
 def test_a_phased_run_with_a_theta_per_pass_keeps_its_rows_through_its_phases_and_resumes(tmp_path):
-    """The phased run with a θ per later pass (`loop_theta_per_pass`, rows for its largest count): its θ
+    """The phased run with a θ per later pass (`Loop.theta_passes`, rows for its largest count): its θ
     holds its rows through the phase of one pass, whose steps move none, and moves from the second; stopped
     inside the second phase and resumed, it lands where the run nobody stopped lands, bit for bit; its
-    record states the choice and its saved run loads with its rows; and the choice without an implicit loop
-    is refused before anything loads (row 7661)."""
+    record states the choice and its saved run loads with its rows (row 7661)."""
     from dew.checkpoints import RUN_FILE
     from dew.training.budget import Pause
 
     data = phased(tmp_path)
 
     def per_pass(name: str, **trainer):
-        return trained(dataclasses.replace(run(tmp_path, STEPS, data), loop_theta_per_pass=True), tmp_path,
-                       name, trainer={"steps": 4, "checkpoint_every": 1, **trainer})[0]
+        rowed = dataclasses.replace(LOOP, theta_passes=STEPS[-1])
+        return trained(run(tmp_path, STEPS, data, rowed), tmp_path, name,
+                       trainer={"steps": 4, "checkpoint_every": 1, **trainer})[0]
 
     whole = per_pass("whole")
     assert theta(whole).shape[0] == STEPS[-1] - 1 and np.any(theta(whole))
@@ -172,7 +177,8 @@ def test_a_phased_run_with_a_theta_per_pass_keeps_its_rows_through_its_phases_an
     for name, leaf in parameters(whole).items():
         np.testing.assert_array_equal(leaf, parameters(resumed)[name], err_msg=name)
     # The run's record states the choice (its data built in Python, which no record reads back).
-    assert recorded(json.loads((tmp_path / "runs" / "stopped" / RUN_FILE).read_text()), "loop_theta_per_pass")
+    record = json.loads((tmp_path / "runs" / "stopped" / RUN_FILE).read_text())
+    assert recorded(record, "theta_passes") == STEPS[-1]
     loaded = Decide.from_run(str(tmp_path / "runs" / "stopped"))
     assert loaded.model.backbone.loop.theta_passes == STEPS[-1]
 
@@ -194,20 +200,19 @@ def recorded(record, name: str):
 
 @attending("reference")
 def test_a_theta_per_pass_over_a_checkpoints_implicit_loop_starts_each_row_at_its_theta():
-    """A run asking only for a θ per pass over a checkpoint whose implicit loop holds one θ takes it at the
-    checkpoint's own count, each row the checkpoint's θ, so it computes what the checkpoint computed; over a
-    checkpoint whose loop is not implicit it is refused, by the loop (row 7661)."""
-    from dew.config import looping
+    """A run whose loop is a checkpoint's implicit loop with a θ per pass over it (`Loop.theta_passes`)
+    takes each row as the checkpoint's θ, so it computes what the checkpoint computed (row 7661)."""
+    from dew.config import DecoderRunConfig
     from dew.interop.pretrained import Pretrained
 
     loaded = Pretrained.load(str(QWEN35), dtype="float32")
-    implicit = looping(loaded, 3, (1, 3), implicit=True)
+    own = Loop(3, step_norm=False, layers=(1, 3), implicit=True)
+    implicit = DecoderRunConfig(loop=own).looped(loaded)
     (held,) = [leaf for name, leaf in named_leaves(implicit.variables).items() if "loop_theta" in name]
     theta = np.random.default_rng(7661).uniform(0.1, 0.9, held.shape).astype(np.float32)
     implicit = dataclasses.replace(implicit, variables=jax.tree_util.tree_map_with_path(
         lambda path, leaf: theta if "loop_theta" in jax.tree_util.keystr(path) else leaf, implicit.variables))
-    asked = dataclasses.replace(run(Path(), None, None), loop_layers=None, loop_implicit=False,
-                                loop_theta_per_pass=True)
+    asked = DecoderRunConfig(loop=dataclasses.replace(own, theta_passes=3))
     per_pass = asked.looped(implicit)
     assert per_pass.model.loop.theta_passes == 3 and per_pass.model.loop.steps == 3
     (rows,) = [leaf for name, leaf in named_leaves(per_pass.variables).items() if "loop_theta" in name]
@@ -215,9 +220,6 @@ def test_a_theta_per_pass_over_a_checkpoints_implicit_loop_starts_each_row_at_it
     ids = jnp.arange(12, dtype=jnp.int32).reshape(2, 6)
     np.testing.assert_array_equal(np.asarray(per_pass.model.apply(per_pass.variables, ids)),
                                   np.asarray(implicit.model.apply(implicit.variables, ids)))
-    plain = looping(loaded, 3, (1, 3))
-    with pytest.raises(ValueError):
-        asked.looped(plain)
     # Held as shapes alone, as a resume loads its source, its θ rows as its shape.
     shaped = dataclasses.replace(implicit, variables=jax.tree.map(
         lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), np.asarray(leaf).dtype), implicit.variables))
@@ -233,13 +235,13 @@ def test_a_theta_per_pass_over_a_checkpoints_implicit_loop_starts_each_row_at_it
     (rowed_placed,) = [leaf for name, leaf in named_leaves_of(asked.looped(placed).variables)
                        if "loop_theta" in name]
     assert rowed_placed.sharding.spec == jax.sharding.PartitionSpec(None, "x")
-    # A checkpoint holding rows for three passes keeps them, run at two.
-    fewer = dataclasses.replace(asked, loop_steps=2).looped(per_pass)
+    # A checkpoint holding rows for three passes keeps them, run at two passes (`passes`).
+    fewer = DecoderRunConfig(passes=2).looped(per_pass)
     assert fewer.model.loop.theta_passes == 3 and fewer.model.loop.steps == 2
     np.testing.assert_array_equal(np.asarray(fewer.model.apply(fewer.variables, ids)),
                                   np.asarray(per_pass.model.with_passes(2).apply(per_pass.variables, ids)))
     with pytest.raises(ValueError):
-        dataclasses.replace(asked, loop_steps=4).looped(per_pass)
+        DecoderRunConfig(passes=4).looped(per_pass)
 
 
 @pytest.mark.parametrize("phase", range(len(STEPS)), ids=[f"{passes}-passes" for passes in STEPS])

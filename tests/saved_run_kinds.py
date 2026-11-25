@@ -25,7 +25,7 @@ from dew.config import ObjectiveConfig, RunConfig, SourceOptions, TrainerConfig
 from dew.data import Files, Loading, Memory, presets
 from dew.data.sources.tokens import TokenFiles
 from dew.decision import Choice, decisions
-from dew.decision.config import Letters
+from dew.decision.config import CrossContext, Letters, RowBudgets
 from dew.decision.layout import AnswerCue, Instructions, Labels, OptionLines, State, Text, built_in
 from dew.decision.task import Decide
 from dew.inference.images import TextToImage
@@ -70,9 +70,10 @@ def multimodal(root: Path, drawn: bool) -> RunConfig:
 
 
 def segmented(root: Path, drawn: bool) -> RunConfig:
-    """A decision run whose rows are its own segments, option lines among them (`--segments`), the
+    """A decision run whose rows are its own segments, option lines among them (`RowBudgets.segments`), the
     question layout's own row written as segments (`built_in`), as a record holds them (row 2627)."""
-    return dataclasses.replace(decision(root, drawn), segments=built_in(None, "question_first"))
+    return dataclasses.replace(decision(root, drawn),
+                               rows=RowBudgets(segments=built_in(None, "question_first")))
 
 
 def lettered(root: Path, drawn: bool) -> RunConfig:
@@ -90,8 +91,8 @@ def lettered_in_context(root: Path, drawn: bool) -> RunConfig:
                 OptionLines(line="\n{label}. {option}", bare="\n{label}. {option}", join="",
                             noul_first="false"),
                 AnswerCue(template="\nAnswer:", many="\nAnswer:"))
-    return dataclasses.replace(lettered(root, drawn), segments=segments, context_layers=(0,),
-                               head=Letters(labels=labels, count=4))
+    return dataclasses.replace(lettered(root, drawn), rows=RowBudgets(segments=segments),
+                               context=CrossContext(layers=(0,)), head=Letters(labels=labels, count=4))
 
 
 def shared(root: Path, drawn: bool) -> RunConfig:

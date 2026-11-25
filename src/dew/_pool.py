@@ -104,24 +104,25 @@ def selected_gpus(selected: str) -> tuple[int, ...] | None:
     return None if selected == ALL_GPUS else tuple(int(ordinal) for ordinal in selected.split(","))
 
 
-def local_gpus(selected: str = ALL_GPUS) -> tuple[int, ...] | None:
+def local_gpus(selected: str = ALL_GPUS, environ: Mapping[str, str] | None = None) -> tuple[int, ...] | None:
     """The GPUs a process of JAX's selection `selected` opens, by the CUDA driver's ordinals, which its
     memory and placement reads take (`dew._devices.gpu_memory`): those `selected` names, else every one the
-    process may use (`local_gpu_count`); None where they could not be counted."""
+    process may use (`local_gpu_count`, of `environ`, the process's own where None); None where they could
+    not be counted."""
     named = selected_gpus(selected)
     if named is not None:
         return named
-    count = local_gpu_count()
+    count = local_gpu_count(environ)
     return None if count is None else tuple(range(count))
 
 
-def local_gpu_count() -> int | None:
-    """GPUs this process may use: CUDA_VISIBLE_DEVICES when it is set,
-    since jax numbers only those, else every GPU the CUDA driver finds
+def local_gpu_count(environ: Mapping[str, str] | None = None) -> int | None:
+    """GPUs a process of environment `environ` (its own where None) may use: CUDA_VISIBLE_DEVICES when it is
+    set, since jax numbers only those, else every GPU the CUDA driver finds
     (`cuDeviceGetCount`), whether or not the host ships nvidia-smi; None
     where no driver library loads or it fails to start. JAX opens those its
     own selection names of them (`local_gpus`)."""
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    visible = (os.environ if environ is None else environ).get("CUDA_VISIBLE_DEVICES")
     if visible is not None:
         return visible_gpus(visible)
     cuda = cuda_driver()

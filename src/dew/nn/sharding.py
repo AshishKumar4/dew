@@ -62,9 +62,11 @@ from dew.mesh import (
     LogicalAxisRules,
     MeshAxes,
     axis_rules,
+    kept_axes,
     logical_spec,
     mesh_axes,
     row_axes,
+    spec_axes,
 )
 
 if TYPE_CHECKING:
@@ -643,6 +645,74 @@ def constrained[T](x: T, spec: jax.sharding.PartitionSpec | Callable[[], jax.sha
     return jax.lax.with_sharding_constraint(x, auto_part(spec() if callable(spec) else spec, mesh))
 
 
+def gathered_over(x: jax.Array, spec: jax.sharding.PartitionSpec, axes: str | Collection[str]) -> jax.Array:
+    """`x`, placed as `spec`, gathered whole over `axes`, Explicit axes of the mesh in context
+    (`explicit_over`), and a matrix reduced over them (`PartitionSpec`'s `reduced`): every device holds the
+    one copy, and a gradient reaching it through a product stays unreduced, each use's partial sum added
+    as it lies, reduced over `axes` once where its transpose places it back as `spec` places it over the
+    mesh's Explicit axes (a reduce-scatter or all-reduce). A vector (a norm's scale, a bias) is held
+    replicated over `axes`: JAX types no reduced operand beside one the axes split but a product's, so each
+    of its uses reduces its gradient as an Auto axis would. `x` is first placed over the Explicit axes as
+    `spec` places it there (from a type placing it on the mesh the step traces): what
+    `dew.nn.backbones.looping`'s gathered block reads."""
+    mesh = jax.sharding.get_abstract_mesh()
+    explicit = set(mesh.explicit_axes)
+    dropped = {axes} if isinstance(axes, str) else set(axes)
+    placed = jax.sharding.reshard(x, kept_axes(spec, explicit.__contains__))
+    kept = kept_axes(spec, (explicit - dropped).__contains__)
+    if x.ndim < 2:
+        return jax.sharding.reshard(placed, kept)
+    reduced = {name for name in dropped & explicit if mesh.shape[name] > 1}
+    return jax.sharding.reshard(placed, jax.sharding.PartitionSpec(*kept, reduced=frozenset(reduced)))
+
+
+def explicit_over[T](fn: Callable[[jax.Array], T], x: jax.Array) -> T:
+    """`fn(x)` traced with the context mesh's Auto axes Explicit (as `jax.sharding.explicit_axes` traces),
+    so every axis of the mesh in `fn` is Explicit or Manual: JAX's `broadcast_in_dim` keeps a reduced or
+    unreduced placement (a scan transpose's zero accumulators among its results) only where no axis is
+    Auto. `x`, a stream's rows, placed over those axes as `RESIDUAL` places them, what `fn` returns placed
+    back on the mesh in context as its type places it there. An array `fn` reads from outside it is typed
+    on the mesh in context, which no operation inside mixes with its own: `fn` places each it reads
+    (`jax.sharding.reshard`, `gathered_over`), and `typed_on` what it writes elsewhere."""
+    mesh = jax.sharding.get_abstract_mesh()
+    axes = mesh.auto_axes
+    if not axes:
+        return fn(x)
+    explicit = set(mesh.explicit_axes) | set(axes)
+    lead = min(x.ndim, len(RESIDUAL))
+    rows = kept_axes(logical_spec(RESIDUAL[:lead], x.shape[:lead]), explicit.__contains__)
+    region = mesh.update_axis_types(dict.fromkeys(axes, jax.sharding.AxisType.Explicit))
+    with jax.sharding.use_abstract_mesh(region):
+        out = fn(jax.sharding.reshard(x, rows))
+    return typed_on(out, mesh)
+
+
+def typed_on[T](tree: T, mesh: jax.sharding.AbstractMesh) -> T:
+    """`tree` with each array typed on another mesh than `mesh` (one `explicit_over` traced) placed back on
+    `mesh` as its type places it over `mesh`'s Explicit axes, its sums still to take (`reduced`,
+    `unreduced`) over those alone: a sum over an axis `mesh` leaves Auto is taken first, on the mesh it was
+    typed on (an unreduced one reduced, a reduced copy kept whole), which no conversion between the meshes
+    takes; every other leaf as it is."""
+    explicit = frozenset(mesh.explicit_axes)
+
+    def taken(spec: jax.sharding.PartitionSpec) -> jax.sharding.PartitionSpec:
+        # Its sums over `mesh`'s Explicit axes alone, a sum's kind with its axes: none left, none stated.
+        unreduced = spec.unreduced & explicit
+        return spec.update(reduced=spec.reduced & explicit, unreduced=unreduced,
+                           unreduced_kind=spec.unreduced_kind if unreduced else None)
+
+    def back(value):
+        if not isinstance(value, jax.Array) or jax.typeof(value).sharding.mesh == mesh:
+            return value
+        sharding = jax.typeof(value).sharding
+        if (sharding.spec.reduced | sharding.spec.unreduced) - explicit:
+            # On the mesh it is typed on, whichever mesh the context holds.
+            with jax.sharding.use_abstract_mesh(sharding.mesh.abstract_mesh):
+                value = jax.sharding.reshard(value, taken(sharding.spec))
+        with jax.sharding.use_abstract_mesh(mesh):
+            return jax.sharding.reshard(value, taken(kept_axes(jax.typeof(value).sharding.spec,
+                                                               explicit.__contains__)))
+    return jax.tree.map(back, tree)
 def placed_axes(mesh: jax.sharding.AbstractMesh) -> list[str]:
     """The axes of `mesh` a constraint traced here places (`automatic_axes`, those above one device no
     `shard_map` holds): not an Explicit axis, which an array's type places, nor, inside a pipeline's stage
@@ -661,10 +731,7 @@ def auto_part(spec: jax.sharding.PartitionSpec,
     auto = set(mesh.auto_axes)
     if auto == set(mesh.axis_names):
         return spec
-    kept = [entry if entry is jax.sharding.PartitionSpec.UNCONSTRAINED
-            else tuple(axis for axis in mesh_axes(entry) if axis in auto) for entry in spec]
-    return jax.sharding.PartitionSpec(*(axes if axes is jax.sharding.PartitionSpec.UNCONSTRAINED
-                                        else axes[0] if len(axes) == 1 else axes or None for axes in kept))
+    return kept_axes(spec, auto.__contains__)
 
 
 def explicit_placement(aval: ShapedArray) -> jax.sharding.NamedSharding | None:
@@ -688,8 +755,8 @@ def explicit_spec(x: jax.Array, trailing: int = 0) -> jax.sharding.NamedSharding
     if sharding is None:
         return None
     explicit = set(sharding.mesh.explicit_axes)
-    spec = tuple(sharding.spec)
-    if not any(axis in explicit for entry in spec for axis in mesh_axes(entry)):
+    spec = tuple(sharding.spec.partitions)
+    if not spec_axes(sharding.spec) & explicit:
         return None
     padded = (*spec, *(None,) * (x.ndim - len(spec) + trailing))
     return jax.sharding.NamedSharding(sharding.mesh, jax.sharding.PartitionSpec(*padded))
@@ -736,9 +803,11 @@ def contracted_alike(lhs: jax.Array, rhs: jax.Array, dimension_numbers
     if not (isinstance(lhs, jax.Array) and isinstance(rhs, jax.Array)):
         # An operand of no JAX type (a quantized weight a quantizing provider hands its product).
         return lhs, rhs, None
-    if holds_sum(lhs) or holds_sum(rhs):
-        # An operand whose placement carries a sum still to take (`reduced`, `unreduced`) keeps JAX's own
-        # route, which places its product; its spec is no tuple of entries to read (the confirm review).
+    left_placed, right_placed = explicit_placement(jax.typeof(lhs)), explicit_placement(jax.typeof(rhs))
+    if ((left_placed is not None and left_placed.spec.unreduced)
+            or (right_placed is not None and right_placed.spec.unreduced)):
+        # An unreduced operand keeps JAX's own route; a reduced one (a gathered weight) may still contract
+        # a tensor-split axis (`P('tensor', None, reduced={'fsdp'})`).
         return lhs, rhs, None
     left, right = explicit_spec(lhs), explicit_spec(rhs)
     if left is None or right is None:
@@ -755,11 +824,13 @@ def contracted_alike(lhs: jax.Array, rhs: jax.Array, dimension_numbers
         lefts[a] = rights[b] = (common[0] if len(common) == 1 else common) if common else None
         summed.extend(common)
     if lefts != [*left.spec, *(None,) * (lhs.ndim - len(left.spec))]:
-        lhs = jax.sharding.reshard(lhs, jax.sharding.NamedSharding(left.mesh,
-                                                                   jax.sharding.PartitionSpec(*lefts)))
+        left_reduced = left_placed.spec.reduced if left_placed is not None else frozenset()
+        lhs = jax.sharding.reshard(lhs, jax.sharding.NamedSharding(
+            left.mesh, jax.sharding.PartitionSpec(*lefts, reduced=left_reduced)))
     if rights != [*right.spec, *(None,) * (rhs.ndim - len(right.spec))]:
-        rhs = jax.sharding.reshard(rhs, jax.sharding.NamedSharding(right.mesh,
-                                                                   jax.sharding.PartitionSpec(*rights)))
+        right_reduced = right_placed.spec.reduced if right_placed is not None else frozenset()
+        rhs = jax.sharding.reshard(rhs, jax.sharding.NamedSharding(
+            right.mesh, jax.sharding.PartitionSpec(*rights, reduced=right_reduced)))
     if not summed:
         return lhs, rhs, None
     entries = [lefts[d] for d in left_batch]

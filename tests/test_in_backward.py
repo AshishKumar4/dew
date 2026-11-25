@@ -2,6 +2,7 @@
 4796): the same step as the one that takes the whole gradient first, without holding it."""
 
 import dataclasses
+from collections.abc import Mapping
 
 import jax
 import jax.numpy as jnp
@@ -9,7 +10,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
-from model_support import TINY_DECODER, scanning, stacked_as, unrolled
+from model_support import TINY_DECODER, scanning, stacked_as, under_kernels, unrolled
 from reference_error import assert_as_exact, dew_path, widened
 from token_support import token_rows
 
@@ -17,6 +18,8 @@ from dew.distributed.batches import shard_batch
 from dew.nn.backbones.layer_names import group_layers
 from dew.nn.kernels.generation import compile_only_gpus
 from dew.nn.kernels.options import program
+from dew.nn.precision import at_least_fp32
+from dew.objectives.base import Objective, Ratio
 from dew.objectives.lm import LMObjective
 from dew.optim import AdamW, OptimConfig, ParamGroup
 from dew.registry import models
@@ -294,6 +297,119 @@ def test_a_scanned_step_updating_in_its_backward_trains_as_a_layer_at_a_time(opt
                     truth_fn=truth)
 
 
+class _Detached(LMObjective):
+    """An LM whose loss scores its decoder's output detached (`jax.lax.stop_gradient`) beside a term on its
+    token embeddings: the decoder runs in training, its stacked runs' backward never runs."""
+
+    def loss(self, variables, batch, step):
+        stats, aux = super().loss(variables, batch, step)
+        assert isinstance(stats, Ratio), type(stats)
+        embedded = sum(jnp.sum(jnp.square(leaf)) for path, leaf in jax.tree_util.tree_leaves_with_path(
+            variables["params"]) if "embed_tokens" in jax.tree_util.keystr(path))
+        return Ratio(jax.lax.stop_gradient(stats.total) + 1e-3 * embedded * stats.mass, stats.mass), aux
+
+
+class _Twice(LMObjective):
+    """An LM whose loss scores its decoder twice, its statistics summed: each stacked run read twice."""
+
+    def loss(self, variables, batch, step):
+        stats, aux = super().loss(variables, batch, step)
+        again, _ = super().loss(variables, batch, step)
+        return jax.tree.map(lambda first, second: first + second, stats, again), aux
+
+
+def _layer_weights(variables, laid) -> dict:
+    """`variables` with each of its layers' weights `laid(path, leaf)`, a layer at a time or stacked alike
+    (`group_layers`' names)."""
+    def each(path, leaf):
+        stacked = any(isinstance(key, jax.tree_util.DictKey) and isinstance(key.key, str)
+                      and group_layers(key.key) is not None for key in path)
+        return laid(leaf) if stacked else leaf
+    return {**variables, "params": jax.tree_util.tree_map_with_path(each, variables["params"])}
+
+
+class _Substituted(LMObjective):
+    """An LM whose model reads each layer's query projection as a constant in place of the weight, drawn
+    as an initializer draws one (a fixed normal draw of 0.02's spread, each layer's the same), read from
+    nothing of the state: the weight's gradient none, the constant's no weight's."""
+
+    def loss(self, variables, batch, step):
+        def substituted(node):
+            if not isinstance(node, Mapping):
+                return node
+            held = {key: substituted(value) for key, value in node.items()}
+            if "q_proj" in held:
+                # One draw of a layer's shape, every layer's alike, read a layer at a time or stacked.
+                held["q_proj"] = jax.tree.map(lambda leaf: jnp.broadcast_to(jnp.asarray(
+                    np.random.default_rng(0).normal(0.0, 0.02, leaf.shape[-2:]), leaf.dtype), leaf.shape),
+                    held["q_proj"])
+            return held
+        return super().loss({**variables, "params": substituted(variables["params"])}, batch, step)
+
+
+class _Cast(LMObjective):
+    """An LM whose model reads its layers' weights rounded to bfloat16: its gradient reaches the float32
+    weights through the cast, which a rule updating them in place would round as it wrote them."""
+
+    def loss(self, variables, batch, step):
+        return super().loss(_layer_weights(variables, lambda leaf: leaf.astype(jnp.bfloat16)), batch, step)
+
+
+class _Permuted(LMObjective):
+    """An LM whose model reads each of its layers' square weights through a reshape that permutes its last
+    two axes first (`jax.lax.reshape`'s `dimensions`): a transpose by another name."""
+
+    def loss(self, variables, batch, step):
+        def permuted(leaf):
+            if leaf.ndim < 2 or leaf.shape[-1] != leaf.shape[-2]:
+                return leaf
+            order = (*range(leaf.ndim - 2), leaf.ndim - 1, leaf.ndim - 2)
+            return jax.lax.reshape(leaf, leaf.shape, dimensions=order)
+        return super().loss(_layer_weights(variables, permuted), batch, step)
+
+
+class _Swapped(LMObjective):
+    """An LM whose model reads each layer's query projection where its output projection lies and the other
+    way about, both 32 by 32: the same leaves, each read where the other's call states it."""
+
+    def loss(self, variables, batch, step):
+        def swapped(node):
+            if not isinstance(node, Mapping):
+                return node
+            held = {key: swapped(value) for key, value in node.items()}
+            if "q_proj" in held and "o_proj" in held:
+                held["q_proj"], held["o_proj"] = held["o_proj"], held["q_proj"]
+            return held
+        return super().loss({**variables, "params": swapped(variables["params"])}, batch, step)
+
+
+class _Returned(LMObjective):
+    """An LM whose statistics hold its layers' query projections beside its own, which its reduction reads
+    as a term on the weights: a read of them outside the loss's program."""
+
+    def loss(self, variables, batch, step):
+        stats, aux = super().loss(variables, batch, step)
+        queries = [leaf for path, leaf in jax.tree_util.tree_leaves_with_path(variables["params"])
+                   if "q_proj" in jax.tree_util.keystr(path)]
+        return (stats, queries), aux
+
+    def reduce_loss(self, stats):
+        held, queries = stats
+        value, mass = super().reduce_loss(held)
+        return value + 1e-3 * sum(jnp.sum(jnp.square(leaf)) for leaf in queries), mass
+
+
+class _Transposed(LMObjective):
+    """An LM whose model reads each of its layers' square weights transposed on its last two axes (its
+    attention's projections, `TINY_DECODER`'s 32 by 32), a layer at a time or stacked alike: a layout its
+    runs' window sum does not take, which no backward may pool into it."""
+
+    def loss(self, variables, batch, step):
+        def transposed(leaf):
+            square = leaf.ndim >= 2 and leaf.shape[-1] == leaf.shape[-2]
+            return jnp.swapaxes(leaf, -1, -2) if square else leaf
+        return super().loss(_layer_weights(variables, transposed), batch, step)
+
 def _walked(e, *, finite: bool = True, top: float = 1.0, runs: int = 1, through_context: bool = False):
     """Three layers, each `y = a x + sqrt(0 x + s - s' + e) + c k` with `s'` the stop-gradient of `s` and
     `k` a constant: a finite forward, whose gradient is not finite at a layer whose `e` is zero, in its own
@@ -455,10 +571,10 @@ def test_a_decision_step_over_a_scanned_backbone_trains_as_its_ordinary_backward
     steps leave every parameter on par with the same steps through the ordinary backward of an unscanned
     backbone (check 1, against one device's float64), its parameters grouped or not. With `input_lm` or a
     context the backbone encodes in its own pass, the loss differentiates the backbone twice a step, so the
-    step updates none in its backward (`Objective._updates_in_backward`) and trains as the ordinary scan
+    step updates none in its backward (`Transaction._read_once`) and trains as the ordinary scan
     does, on par alike (review of row 12076's fix: finite values alone were checked); a loss that
-    differentiated a run twice and said nothing is refused
-    (`test_a_loss_differentiating_a_scanned_run_twice_is_refused_its_update_in_the_backward`)."""
+    scoring a run twice updates it as unscanned too
+    (`test_a_scanned_step_planned_in_its_backward_but_no_once_read_run_updates_as_unrolled`)."""
     from arm_forms import as_given
     from decision_support import decision_rows
     from test_stage_local import wide
@@ -550,26 +666,326 @@ def test_a_decision_step_over_a_scanned_backbone_trains_as_its_ordinary_backward
                     truth_fn=stepped(scan=False, exact=True))
 
 
-def test_a_loss_differentiating_a_scanned_run_twice_is_refused_its_update_in_the_backward():
-    """A loss that runs a scanned stack twice and differentiates both (a language model's loss counted
-    twice) would take the sum of two updates as its weights were its step to update the stack in its
-    backward (`dew.nn.in_backward`): its plan, handling the run twice, is refused by name
-    (`Objective._updates_in_backward`), never trained silently (row 12076's review)."""
+@pytest.mark.usefixtures("scanned_stacks")
+@pytest.mark.parametrize(("generation", "dtype", "dropout"),
+                         [("sm90", "float32", 0.0), ("sm80", "bfloat16", 0.0), ("sm90", "float32", 0.1)],
+                         ids=["sm90-f32", "sm80-bf16", "sm90-f32-dropout"])
+def test_an_accumulating_scanned_step_holds_no_extra_gradient_buffer(generation, dtype, dropout):
+    """A scanned step that accumulates its update over microbatches, its batches or its batch's split,
+    pools each layer's gradient into the window's accumulator as its backward walks the layer
+    (`Transaction._planned_accumulation`): its temporaries hold no stacked `[L, ...]` gradient beside the
+    accumulator, nor the scan's forward residuals unrematerialized, past what a one-microbatch step holds
+    (row 12080: an sm90 f32 step held 5.6 MB more, an sm80 bf16 one 2.4 MB). One whose layers drop out
+    draws its masks as Linen's scan does, which a layer applied alone in its backward would draw otherwise:
+    it pools none, and holds the stacked gradient as an unpooled step does (`_DRAWS`)."""
+
+    wide = {**TINY_DECODER, "emb_features": 64, "mlp_features": 2048}
+    model = models.build("causal_transformer", vocab_size=96, **wide, num_kv_heads=2, dtype=dtype)
+
+    def ahead(accumulation: int, split: int, rows: int, dropped: float = 0.0):
+        gpu = compile_only_gpus(generation, 1, 64 * 2**30)
+        run = Trainer(LMObjective(model.clone(dropout_rate=dropped), 16),
+                      OptimConfig(optimizer=AdamW(), lr=1e-3),
+                      key=jax.random.key(0), mesh=MeshSpec().build(gpu),
+                      accumulation=accumulation, split=split,
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=256)))
+        run.validate(steps=8)
+        return compile_ahead(run, token_rows(96, rows, 17))
+
+    one = ahead(1, 1, 1)
+    accumulated = ahead(4, 1, 1, dropout)
+    split = ahead(1, 2, 2, dropout)
+    shapes = jax.eval_shape(model.init, jax.random.key(0), jnp.zeros((1, 16), jnp.int32))["params"]
+    narrow = 2 * sum(leaf.size for leaf in jax.tree.leaves(shapes))
+
+    def beside(ahead) -> int:
+        """What a step holds beside its arguments: its outputs that alias none and its temporaries, so a
+        second stacked sum held as an unaliased output counts as one held among its temporaries does."""
+        return ahead.output_bytes - ahead.alias_bytes + ahead.temp_bytes
+
+    # Against a one-microbatch step dropping nothing out, whose runs update in their backward.
+    pooled = not dropout
+    assert (beside(accumulated) - beside(one) < narrow) == pooled, (beside(accumulated), beside(one), narrow)
+    assert (beside(split) - beside(one) < narrow) == pooled, (beside(split), beside(one), narrow)
+
+
+ACCUMULATING_SEEDS = 64
+"""Check 1's seeds for a scanned step pooling in its backward against the unrolled step's window: the
+layer-at-a-time sites' (`RUN_SEEDS`), whose judgement the map judge widens where it needs more units."""
+
+
+class _Penalized(LMObjective):
+    """An LM whose loss adds a term on its stacked layers' parameters themselves, read where they lie beside
+    the layers' scan: a run whose parameters another term reads pools nothing in its backward
+    (`Transaction._read_once`)."""
+
+    def loss(self, variables, batch, step):
+        stats, aux = super().loss(variables, batch, step)
+        assert isinstance(stats, Ratio), type(stats)
+        stacked = [leaf for path, leaf in jax.tree_util.tree_leaves_with_path(variables["params"])
+                   if "layers" in jax.tree_util.keystr(path)]
+        penalty = sum(jnp.sum(jnp.square(leaf.astype(at_least_fp32(leaf.dtype)))) for leaf in stacked)
+        return Ratio(stats.total + 1e-3 * penalty * stats.mass, stats.mass), aux
+
+
+class _Branched(LMObjective):
+    """An LM whose loss runs its decoder in a branch its batch chooses (`jax.lax.cond`): a batch whose first
+    token is even is scored, an odd one's counted, its tokens' mass kept, the decoder never run, its loss
+    none. A run read in a branch pools nothing in its backward (`Transaction._read_once`)."""
+
+    def loss(self, variables, batch, step):
+        def scored(held):
+            return LMObjective.loss(self, held, batch, step)
+
+        stats, aux = jax.eval_shape(scored, variables)
+
+        def counted(held):
+            del held
+            mass = jnp.sum(batch["text"][:, 1:] != 0).astype(stats.mass.dtype)
+            return (Ratio(jnp.zeros(stats.total.shape, stats.total.dtype), mass),
+                    jax.tree.map(lambda shape: jnp.zeros(shape.shape, shape.dtype), aux))
+        return jax.lax.cond(batch["text"][0, 0] % 2 == 0, scored, counted, variables)
+
+
+class _Repeated(LMObjective):
+    """An LM whose loss reads its batch twice in a loop (`jax.lax.scan`), its two passes' statistics summed:
+    a run read in a loop pools nothing in its backward (`Transaction._read_once`)."""
+
+    def loss(self, variables, batch, step):
+        def scored(carry, _):
+            return carry, LMObjective.loss(self, variables, batch, step)
+        _, (stats, aux) = jax.lax.scan(scored, None, None, length=2)
+        assert isinstance(stats, Ratio), type(stats)
+        return (Ratio(jnp.sum(stats.total), jnp.sum(stats.mass)), jax.tree.map(lambda leaf: leaf[0], aux))
+
+
+_NESTED_LOSS = jax.jit(lambda objective, held, rows, step: LMObjective.loss(objective, held, rows, step),
+                       static_argnums=0)
+"""An LM's loss within one jit of its own (`_Nested`), whose cache each trace of a step after the first
+reads without calling the run again."""
+
+
+class _Nested(LMObjective):
+    """An LM whose loss runs within a jit of its own, defined once (`_NESTED_LOSS`), so the step's traces
+    after the first (its gate's, its gradient's) read its program from the jit's cache: a run read within
+    a nested jit pools nothing in its backward (`Transaction._read_once`)."""
+
+    def loss(self, variables, batch, step):
+        return _NESTED_LOSS(self, variables, batch, step)
+
+
+class _Scalar(LMObjective):
+    """An LM whose loss is its microbatch's mean alone, a scalar the step pools with a mass of one
+    (`Objective.reduce_loss`): its gate reduces it as the step does."""
+
+    def loss(self, variables, batch, step):
+        stats, aux = super().loss(variables, batch, step)
+        assert isinstance(stats, Ratio), type(stats)
+        return stats.mean()[0], aux
+
+    def reduce_loss(self, stats):
+        # A scalar's own value, as any objective's (`Objective.reduce_loss`); the LM's reads a ratio.
+        return Objective.reduce_loss(self, stats)
+
+
+OBJECTIVES = {"lm": LMObjective, "penalized": _Penalized, "branched": _Branched, "repeated": _Repeated,
+              "nested": _Nested, "scalar": _Scalar, "transposed": _Transposed, "detached": _Detached,
+              "twice": _Twice, "permuted": _Permuted, "swapped": _Swapped,
+              "substituted": _Substituted, "cast": _Cast, "returned": _Returned}
+"""Each accumulating witness's objective: the LM and its scalar mean, whose runs pool in their backward,
+and those whose runs the step accumulates ordinarily, read beside a term on the weights, in a branch, in a
+loop or within a nested jit."""
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize(("dtype", "clip", "periodic", "objective"), [
+    pytest.param("float32", 0.0, False, "lm", id="fp32",
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
+    pytest.param("bfloat16", 1.0, False, "lm", id="bf16-clipped",
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
+    pytest.param("float32", 0.0, True, "lm", id="periodic",
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
+    pytest.param("float32", 0.0, False, "penalized", id="direct-reader",
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
+    pytest.param("float32", 0.0, False, "branched", id="branched",
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
+    pytest.param("float32", 0.0, False, "repeated", id="repeated",
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
+    pytest.param("float32", 0.0, False, "nested", id="nested-jit",
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
+    pytest.param("float32", 0.0, False, "scalar", id="scalar-loss",
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
+    pytest.param("float32", 0.0, False, "transposed", id="transposed-weights",
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
+    pytest.param("float32", 0.0, False, "permuted", id="permuting-reshape",
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
+    pytest.param("float32", 0.0, False, "swapped", id="swapped-weights",
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
+    pytest.param("float32", 0.0, False, "substituted", id="constant-substitute",
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
+])
+def test_an_accumulating_scanned_step_matches_unrolled(dtype, clip, periodic, objective):
+    """A scanned step accumulating a window of two batches each split in two, its parts of unequal token
+    counts (padding scored as none), leaves its parameters and optimizer state after two updates on par
+    with the unrolled step's (check 1, against one device's float64 unrolled step), on two devices
+    splitting its parameters: pooling its gradient in its backward (`Transaction._planned_accumulation`),
+    clipped with narrow copies, over a periodic stack or under a scalar loss; or accumulating it as an
+    unscanned step does where
+    its loss reads a run beside a term on its weights, in a branch, in a loop, within a nested jit or
+    through a transpose of its weights, a permuting reshape, with two of its weights swapped or one
+    replaced by a constant (`_read_once`)."""
+    _on_par_unrolled(dtype, clip, objective, periodic=periodic, batches=2, split=2)
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("objective", [
+    pytest.param("detached", id="detached", marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
+    pytest.param("twice", id="scored-twice", marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
+    pytest.param("returned", id="weights-in-statistics",
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
+])
+def test_a_scanned_step_planned_in_its_backward_but_no_once_read_run_updates_as_unrolled(objective):
+    """A scanned step of one microbatch an update, which updates its runs in their backward where its
+    loss reads each once and the step's pullback reaches it (`Transaction._read_once`), leaves its
+    parameters and optimizer state after four updates on par with the unrolled step's (check 1, against one
+    device's float64 unrolled step) where its loss detaches its decoder's output (no backward reaches its
+    runs, which then took the zeros left as their weights and moments), scores it twice (each run read
+    twice, which the step refused by name) or returns its weights among its statistics, which its
+    reduction penalizes (a read outside the loss's program, whose cotangent the rule's new weights took
+    as theirs): the step updates them as unscanned (review of row 12080)."""
+    _on_par_unrolled("float32", 0.0, objective, periodic=False, batches=1, split=1)
+
+
+@pytest.mark.usefixtures("scanned_stacks")
+def test_a_scanned_step_whose_loss_casts_its_weights_keeps_them_unrounded():
+    """A scanned one-microbatch AdamW step over a staged state, reading no narrow copies, whose model reads
+    its layers' float32 weights cast to bfloat16 (`_Cast`) updates them as unscanned, through the cast's
+    gradient into the float32 weights: their entries stay off bfloat16's grid after the update as before
+    it. A rule updating them in place read the rounded weights and wrote them back, every entry on that
+    grid (review of row 12080)."""
+    @under_kernels(layer_scan="scanned", narrow_copies="off")
+    def trained():
+        steps = Trainer(_Cast(decoder(num_layers=LAYERS), SEQ), ADAMW, key=jax.random.key(0), mesh=MeshSpec(),
+                        split=1, checkpoints=None, tracker=None,
+                        advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD)))
+        steps.device_mesh = MeshSpec().build(jax.devices()[:1])
+        steps.validate(steps=1)
+        state = steps.staged(steps.initial_state())
+        batch = shard_batch(steps.device_mesh, token_rows(VOCAB, BATCH, SEQ + 1))
+        state, *_ = steps.compile(state, batch)(state, batch)
+        return jax.device_get(steps.stored(state).variables["params"])
+
+    leaves = [np.asarray(leaf) for path, leaf in jax.tree_util.tree_leaves_with_path(trained())
+              if any(isinstance(key, jax.tree_util.DictKey) and isinstance(key.key, str)
+                     and group_layers(key.key) is not None for key in path) and np.size(leaf) > 1]
+    # The share of the layers' float32 weight entries bfloat16 holds exactly.
+    gridded = sum(int(np.sum(leaf == leaf.astype(jnp.bfloat16).astype(np.float32))) for leaf in leaves)
+    assert gridded < sum(leaf.size for leaf in leaves) / 2, gridded
+
+
+def _on_par_unrolled(dtype: str, clip: float, objective: str, *, periodic: bool, batches: int, split: int):
+    """Check 1 of a scanned step against the unrolled step, each over four batches of four rows, an update
+    every `batches` of them each split in `split`, `objective`'s loss (`OBJECTIVES`), in `dtype`, clipped
+    at `clip`, over a periodic stack where `periodic`, on two devices splitting its parameters, against
+    one device's float64 unrolled step."""
+    from arm_forms import as_given
+    from test_stage_local import wide
+
+
+    extra = ({"num_layers": 4, "layer_types": ("sliding_attention", "full_attention") * 2,
+              "kinds": {"sliding_attention": {"window": 4}}}
+             if periodic else {"num_layers": 2})
+    optimizer = OptimConfig(optimizer=AdamW(weight_decay=0.1), lr=1e-2, clip=clip)
+
+    def built(*, exact: bool = False) -> Trainer:
+        model = decoder(dtype="float64" if exact else dtype, **extra)
+        mesh = MeshSpec() if exact else MeshSpec(fsdp=2)
+        scored = OBJECTIVES[objective](model, SEQ, pad_id=0)
+        run = Trainer(scored, optimizer, key=jax.random.key(0), mesh=mesh,
+                      accumulation=batches, split=split, checkpoints=None, tracker=None,
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD)))
+        run.device_mesh = mesh.build(jax.devices()[:1 if exact else 2])
+        run.validate(steps=4)
+        return run
+
+    with jax.enable_x64(new_val=False):
+        start = unrolled(built)().initial_state()
+    init, made = jax.jit(decoder(dtype=dtype, **extra).init), {}
+
+    def initial(drawn: int):
+        # Each seed's own variables, the optimizer state every draw starts from.
+        if drawn not in made:
+            with jax.enable_x64(new_val=False):
+                variables = nn.unbox(init(jax.random.key(drawn), jnp.zeros((1, SEQ), jnp.int32)))
+                variables = jax.tree.map(lambda held, new: jnp.asarray(new, held.dtype), start.variables,
+                                         variables)
+                made[drawn] = dataclasses.replace(start, variables=variables)
+        return made[drawn]
+
+    def stepped(*, scan: bool, exact: bool = False):
+        # Its stack scanned or a layer at a time, a bf16 step reading narrow copies, compiled and stepped
+        # under those choices (`under_kernels`).
+        compiled = []
+
+        @as_given
+        @under_kernels(layer_scan="scanned" if scan else "plain",
+                       narrow_copies="on" if dtype == "bfloat16" and not exact else "off")
+        def run(tokens, drawn):
+            if not compiled:
+                compiled.append(built(exact=exact))
+            steps = compiled[0]
+            first = initial(int(drawn))
+            state = steps.staged(wide(first) if exact else jax.tree.map(jnp.copy, first))
+            placed = [shard_batch(steps.device_mesh, {"text": rows}) for rows in tokens]
+            if len(compiled) == 1:
+                compiled.append(steps.compile(state, placed[0]))
+            for batch in placed:
+                state, *_ = compiled[1](state, batch)
+            stored = steps.stored(state)
+            assert int(stored.updates) == 4 // batches, int(stored.updates)
+            return jax.device_get({"params": stored.variables["params"], "opt_state": stored.opt_state})
+        return run
+
+    def draw(seed):
+        # Four batches of four rows, two updates of two batches each, no token the padding one. Each batch
+        # splits into its even rows and its odd ones, the odd part's second row ending in padding of the
+        # batch's own length, so no two parts count as many tokens; each batch's first token even where it
+        # is the first of its update and odd where it is the second, so a branching loss takes both of its
+        # ways in one update.
+        batches = []
+        for at in range(4):
+            rows = token_rows(VOCAB, 4, SEQ + 1, seed=4 * seed + at, low=1)["text"]
+            rows[3, SEQ + 1 - (at + 2):] = 0
+            rows[0, 0] = 2 if at % 2 == 0 else 1
+            batches.append(rows)
+        return np.stack(batches), np.int64(seed)
+
+    assert_as_exact(stepped(scan=True), stepped(scan=False), draw, f"a scanned step over {objective}",
+                    seeds=ACCUMULATING_SEEDS, truth_fn=stepped(scan=False, exact=True))
+
+
+
+
+def test_an_accumulating_scanned_step_that_watches_its_layers_logs_what_they_made():
+    """A scanned step accumulating two batches that watches its MLPs' outputs (`Inspection.modules`, no
+    cotangents) runs them as the ordinary scan does, which opens the collections its watch reads, and logs
+    their summaries (review of row 12080: its layers, pooled in their backward, ran with no collection
+    open and the watch raised)."""
+    from test_inspection import Kept
+    from token_support import repeated_token_batch
+
     from dew.data.dataset import Loader
+    from dew.training.inspection import Inspection
 
-    class Twice(LMObjective):
-        def loss(self, variables, batch, step):
-            stats, aux = super().loss(variables, batch, step)
-            again, _ = super().loss(variables, batch, step)
-            return jax.tree.map(lambda first, second: first + second, stats, again), aux
-
-    objective = Twice(decoder(), SEQ)
-    tokens = token_rows(VOCAB, 2, SEQ + 1)
-    data = Loader(train=lambda partition: iter([tokens, tokens]), val=None, records=2, batch=2)
-    run = Trainer(objective, OptimConfig(optimizer=AdamW(), lr=1e-2), key=jax.random.key(0),
-                  mesh=MeshSpec(), advanced=TrainerAdvanced(layout=Layout(min_shard=2**30)), split=1,
-                  checkpoints=None,
-                  tracker=None)
+    tracker = Kept()
+    run = Trainer(LMObjective(decoder(num_layers=2), SEQ), ADAMW, key=jax.random.key(0), mesh=MeshSpec(),
+                  accumulation=2, tracker=tracker, checkpoints=None,
+                  advanced=TrainerAdvanced(
+                      layout=Layout(min_shard=2**30),
+                      inspection=Inspection(modules=("*MLP",), cotangents=False, every=1)))
     run.device_mesh = MeshSpec().build(jax.devices()[:1])
-    with pytest.raises(ValueError):
-        scanning(run.fit)(data, steps=1, log_every=1)
+    loader = Loader(train=lambda partition: repeated_token_batch(VOCAB, 4, SEQ + 1), val=None, records=None,
+                    batch=4)
+    scanning(run.fit)(loader, steps=2, log_every=1, eval_every=None)
+    logged = {name for row in tracker.rows.values() for name in row}
+    assert any(name.startswith("inspect/activations/") for name in logged), sorted(logged)

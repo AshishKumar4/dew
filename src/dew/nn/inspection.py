@@ -34,6 +34,10 @@ QK = "qk"
 a QK-Clip reads (`dew.optim`), the observation contract's beside `INSPECTED`, its producers' and readers'
 one name."""
 
+INDEXER_COLLECTION = "indexer"
+"""The collection an attention layer sows its per-query indexer KL under when a caller opens it, as the LM
+objective does to train the indexer (`dew.nn.mla`'s lightning indexer)."""
+
 
 HISTOGRAM_EDGES = tuple(float(edge) for edge in range(-8, 5))
 """The base-10 exponents bounding an opt-in histogram's bins of magnitudes: a value below 1e-8 in the

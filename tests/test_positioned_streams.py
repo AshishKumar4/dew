@@ -245,20 +245,23 @@ def test_a_positioned_read_cut_finer_than_its_store_fills_no_cache_another_topol
 
 
 @pytest.mark.parametrize("resume", ["exact", "relaxed"])
-@pytest.mark.parametrize("shares", [80, 1], ids=["cut-for-its-readers", "read-whole"])
+@pytest.mark.parametrize(("records", "shares"), [(130, 80), (130, 1), (192, 96)],
+                         ids=["cut-for-its-readers", "read-whole", "cut-alike"])
 def test_a_position_saved_under_another_cut_of_its_store_is_refused_and_one_no_cut_dealt_resumes(
-        tmp_path, shares, resume):
+        tmp_path, records, shares, resume, monkeypatch):
     """A positioned store of 130 records in 65 ranges read by 80 shares is cut into 80 ranges
     (`EVEN_CUT`), which each share's position holds: a position saved under the store's first cut, which
     held none, is refused where it resumes (`PlanChanged`, "shards.cut"), never read at the rows its
-    places now hold; one share's read of the store whole cuts nothing and holds no cut, so a position saved
-    so, before any cut was named, resumes at its next row (review of d22: the cut was named in the store's
-    fact whatever its readers, refusing reads it never cut)."""
+    places now hold; one share's read of the store whole cuts nothing and holds no cut, and 192 records in
+    64 ranges read by 96 shares are cut into ranges of two records, as the first cut cut them, so it holds
+    none: a position saved so, before any cut was named, resumes at its next row (review of d22: the cut
+    was named in the store's fact whatever its readers, refusing reads it never cut; Train 1248's review:
+    one cut alike refused), as does one an earlier Dew saved naming the cut alike (`EVEN_CUT`)."""
     from dew._position import PlanChanged
     from dew.training._fit import restored_or_restarted
 
     path = tmp_path / "rows.jsonl"
-    path.write_text("".join(json.dumps({"id": index}) + "\n" for index in range(130)))
+    path.write_text("".join(json.dumps({"id": index}) + "\n" for index in range(records)))
     files = Files(str(path))
     files.provision()
     chain = Pipeline(files).map_with_index(lambda index, row: {**row, "at": np.int64(index)},
@@ -290,10 +293,11 @@ def test_a_position_saved_under_another_cut_of_its_store_is_refused_and_one_no_c
         return [uncut(value) for value in node] if isinstance(node, list) else node
 
     earlier = uncut(saved)
-    assert cuts == (["even"] if shares > 1 else []), cuts
+    named = shares > 1 and records % shares != 0
+    assert cuts == (["even"] if named else []), cuts
     resumed = opened()
     try:
-        if shares > 1:
+        if named:
             # Refused as its restore is asked, exact or relaxed alike, where a relaxed fit reads its data
             # afresh (`dew.training._fit`), never at its first read.
             same = json.dumps(earlier).encode()
@@ -316,6 +320,26 @@ def test_a_position_saved_under_another_cut_of_its_store_is_refused_and_one_no_c
             assert int(next(iter(resumed))["at"][0]) == int(following["at"][0]) != int(first["at"][0])
     finally:
         resumed.close()
+    if shares > 1 and not named:
+        # Saved as an earlier Dew saved it, every cut named, this one alike.
+        from dew.data import shards
+
+        with monkeypatch.context() as patched:
+            patched.setattr(shards, "_changed_cut", lambda manifest, cut: (
+                None if cut == tuple(manifest.shards) else manifest.subdivided_by))
+            tagged = opened()
+            try:
+                next(iter(tagged))
+                legacy = tagged.get_state()
+            finally:
+                tagged.close()
+        assert '"cut": "even"' in json.dumps(json.loads(legacy)), legacy
+        again = opened()
+        try:
+            again.set_state(legacy)
+            assert int(next(iter(again))["at"][0]) == int(following["at"][0])
+        finally:
+            again.close()
 
 
 @pytest.mark.parametrize("positioned", [True, False], ids=["positioned-ranges", "plain-lines"])
@@ -393,3 +417,21 @@ def test_a_single_shard_store_read_by_several_shares_holds_no_cut_and_resumes_ex
         assert np.array_equal(next(iter(resumed))["id"], following["id"])
     finally:
         resumed.close()
+
+
+@pytest.mark.parametrize("places", [1, 2, 3, 7, 64])
+def test_a_streams_shards_are_dealt_in_graines_shuffled_order_every_pass(places):
+    """The shards a stream deals over its passes (`_dealt`'s `_Shuffled`) come in the order Grain's shuffle
+    gives them, place by place and pass by pass (`MapDataset.shuffle`, each pass its own seed), a slice of
+    them alike: a position saved under it names the same shards, though each place is answered once a
+    process (`shuffled`, row 12842: a many-corpus mixture asked the same few places over and over at up to
+    13 ms each)."""
+    import grain.python as grain
+
+    from dew.data.shards import _Shuffled
+
+    for seed in (0, 7, 2**32 - 1):
+        grains = grain.MapDataset.source(range(places)).shuffle(seed=seed).repeat(3)
+        dealt = _Shuffled(grain.MapDataset.source(range(places)), seed=seed).repeat(3)
+        assert [dealt[index] for index in range(3 * places)] == [grains[index] for index in range(3 * places)]
+        assert list(dealt[1::2]) == list(grains[1::2])

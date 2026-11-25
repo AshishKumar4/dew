@@ -947,3 +947,17 @@ def test_a_mesh_of_one_device_traces_a_decoders_gradient_with_no_placement_const
             variables)
     assert [equation for equation in equations(traced)
             if equation.primitive.name == "sharding_constraint"] == []
+
+
+@pytest.mark.parametrize("sums", [{"reduced": frozenset({"data"})}, {"unreduced": frozenset({"data"})}],
+                         ids=["reduced", "unreduced"])
+def test_a_specs_axes_are_its_placements_and_its_filter_keeps_its_sums(sums):
+    """`dew.mesh.spec_axes` reads the axes a spec places dimensions on, not a sum it still carries
+    (`reduced`, `unreduced`); `kept_axes` keeps each dimension's admitted axes, None where it keeps none, an
+    entry left to the partitioner as it is, and the spec's sums (row 12849: one filter of a spec's
+    axes for placement and sharding, whose copies iterated a spec carrying a sum, which JAX refuses)."""
+    from dew.mesh import kept_axes, spec_axes
+
+    spec = P(("fsdp", "tensor"), None, "tensor", P.UNCONSTRAINED, **sums)
+    assert spec_axes(spec) == {"fsdp", "tensor"}
+    assert kept_axes(spec, lambda axis: axis != "tensor") == P("fsdp", None, None, P.UNCONSTRAINED, **sums)

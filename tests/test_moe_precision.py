@@ -606,10 +606,10 @@ def test_a_layers_gate_and_up_as_one_paired_product_hold_check_1_against_the_two
             def linear(rows, kernel):
                 return jnp.asarray(expert_projection(rows, kernel, sizes, dtype, 'auto', None))
             gate, up = swiglu_clamped(linear(tokens, kernels[0]), linear(tokens, kernels[1]), limit)
-            return linear(gated_product(activation)(gate, up), kernels[2])
+            return linear(gated_product(activation)(gate, up), kernels[2]), ()
 
         kernels = tuple(parameters['params'][name]['kernel'] for name in names)
-        slots = expert_dispatch(project, x, jnp.asarray(PAIRED_CHOICES), kernels,
+        slots, _ = expert_dispatch(project, x, jnp.asarray(PAIRED_CHOICES), kernels,
                                 tuple(EXPERT_AXES[name] for name in names), num_experts=8, dispatch='global',
                                 output_dtype=dtype)
         wide = jnp.promote_types(dtype, jnp.float32)
@@ -835,11 +835,11 @@ def test_a_bf16_master_sums_its_expert_gradient_before_rounding(spec, dispatch):
                                        if mesh.shape[axis] > 1)))
 
     def project(tokens, sizes, _ids, kernel):
-        return jnp.asarray(expert_projection(tokens, kernel, sizes, jnp.bfloat16, 'xla', None))
+        return jnp.asarray(expert_projection(tokens, kernel, sizes, jnp.bfloat16, 'xla', None)), ()
 
     def loss(kernel, x, dy, indices):
         out = expert_dispatch(project, x, indices, kernel, [('exp', 'embed', 'mlp')], num_experts=8,
-                              dispatch=dispatch, output_dtype=jnp.bfloat16)[:, 0]
+                              dispatch=dispatch, output_dtype=jnp.bfloat16)[0][:, 0]
         return jnp.sum(out.astype(jnp.float32) * dy), out
 
     arguments = (jax.device_put(jnp.asarray(kernel, jnp.bfloat16), NamedSharding(mesh, P('expert'))),

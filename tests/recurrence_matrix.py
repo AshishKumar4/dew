@@ -23,6 +23,7 @@ import dataclasses
 import functools
 import json
 import os
+from collections.abc import Mapping
 from pathlib import Path
 
 import generation_support
@@ -355,7 +356,7 @@ def _on_par(family: str, case: tuple[str, ...], seeds: int = FEWEST_SEEDS) -> No
         assert any(route.kernel == named["kernel"] for route in found)
     reference = _reference(named)
     upstream = reference.removeprefix("upstream ") if reference.startswith("upstream ") else None
-    if upstream is not None and not os.environ.get(INTERPRETERS[upstream]):
+    if _held_to_a_recording(upstream):
         _on_par_recorded(named, step, with_gradients(truth), upstream, seeds)
         return
     held_to = jax.jit(with_gradients(truth)) if upstream is None else _upstream(named, (1 + REDRAW) * seeds)
@@ -366,6 +367,17 @@ def _on_par(family: str, case: tuple[str, ...], seeds: int = FEWEST_SEEDS) -> No
               f"own chunk math's: {distance}", flush=True)
     assert_as_exact(step, held_to, functools.partial(_drawn, named), "-".join(case), seeds=seeds,
                     truth_fn=with_gradients(truth))
+
+
+def _held_to_a_recording(upstream: str | None, environ: Mapping[str, str] = os.environ) -> bool:
+    """Whether a cell of `upstream` (None: none) is held to its recording (`_on_par_recorded`): on a host of
+    `environ` without its GPU tier reference interpreter (`INTERPRETERS`), but in a GPU tier part's prepare
+    of an upstream with no recording (`RECORDED`), which prepares the site its run, where the interpreter
+    runs, holds it at (`_upstream`, an arm the gate runs as given): asserted against a recording there, a
+    mamba_ssm cell left its site unprepared and its run red (train 1282, `sm90-rated scan-pallas`)."""
+    if upstream is None or environ.get(INTERPRETERS[upstream]):
+        return False
+    return upstream in RECORDED or not tier_wire.preparing(environ)
 
 
 def _on_par_recorded(named: dict[str, str], step, truth, upstream: str, seeds: int) -> None:

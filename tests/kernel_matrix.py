@@ -131,6 +131,12 @@ AXES: dict[str, dict[str, tuple[str, ...]]] = {
         "dtype": ("bfloat16", "float32"),
         "documents": ("one", "packed"),
     },
+    "channel_walk": {
+        "generation": ("sm90", "sm80"),
+        "op": ("diagonal_scan", "wkv4"),
+        "dtype": ("bfloat16", "float32"),
+        "documents": ("one", "packed"),
+    },
     "selective_scan": {
         "generation": ("sm90", "sm80"),
         "case": ("bf16", "fp32", "decays-near-one", "decays-near-zero", "saturated-steps", "documents",
@@ -261,6 +267,7 @@ CELLS: dict[str, tuple[str, str]] = {
     "recurrence_tpu": ("recurrence_matrix", "a_recurrences_training_step_on_a_tpu_is_on_par"),
     "short_conv": ("short_conv_matrix", "a_short_convs_training_step_is_on_par"),
     "selective_scan": ("selective_matrix", "a_selective_scan_is_as_exact_as_mamba_ssm"),
+    "channel_walk": ("walk_matrix", "a_channel_walks_training_step_is_on_par"),
     "delta_decode": ("delta_decode_matrix", "a_decode_token_is_on_par"),
     "norm_swiglu": ("norm_swiglu_matrix", "a_fused_entrys_training_step_is_on_par"),
     "narrow_copies": ("narrow_copies_matrix", "a_narrow_copy_training_run_is_on_par"),

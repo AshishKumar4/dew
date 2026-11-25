@@ -424,17 +424,6 @@ def _ending(started: Callable[[], subprocess.Popen], end: Callable[[subprocess.P
                    *((f"close {stream!r}", stream.close) for stream in streams)], primary=sys.exception())
 
 
-def process_group(command: Sequence[str], *, grace: float = 0.0, interrupt: int = signal.SIGTERM,
-                  **options) -> AbstractContextManager[subprocess.Popen]:
-    """`command` started as the leader of a session and process group of its own (`subprocess.Popen`
-    with `options`), whose group ends with the block on every exit, a success's too (`end_group`),
-    and whose pipes close after it."""
-    def ended(process: subprocess.Popen) -> None:
-        end_group(process, grace, interrupt)
-
-    return _ending(lambda: subprocess.Popen(command, start_new_session=True, **options), ended)
-
-
 def owned_group(command: Sequence[str], *, grace: float = 0.0, interrupt: int = signal.SIGTERM,
                 settle: float = SETTLE_SECONDS, **options) -> AbstractContextManager[subprocess.Popen]:
     """`command` `start`ed (`options` as Popen's), whose group ends with the block on every exit, a

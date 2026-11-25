@@ -114,6 +114,7 @@ class Choice(enum.StrEnum):
     DECODE = 'decode'
     DELTA_DECODE = 'delta_decode'
     DELTA_GATES = 'delta_gates'
+    DIAGONAL_SCAN = 'diagonal_scan'
     GATE_UP = 'gate_up'
     GATED_MLP = 'gated_mlp'
     GATED_DELTA_RULE = 'gated_delta_rule'
@@ -122,8 +123,8 @@ class Choice(enum.StrEnum):
     GROUPED_MATMUL = 'grouped_matmul'
     LAYER_SCAN = 'layer_scan'
     """How a decoder's stack compiles, decided without a selector (`dew.nn.backbones.decoder_stages.scanned`):
-    "scanned" runs each run of like layers and each period's repeats under one scanned body; "plain", the
-    default until row 4074 makes the scan it, runs every layer unrolled."""
+    "scanned", the default (row 4074), runs each run of like layers and each period's repeats under one
+    scanned body; "plain" runs every layer unrolled."""
     LINEAR_CE = 'linear_ce'
     LOW_RANK = 'low_rank'
     MXFP8 = 'mxfp8'
@@ -139,6 +140,7 @@ class Choice(enum.StrEnum):
     SSD = 'ssd'
     SWIGLU = 'swiglu'
     SYRK = 'syrk'
+    WKV4 = 'wkv4'
 
 
 CHOICES = frozenset(choice.value for choice in Choice)

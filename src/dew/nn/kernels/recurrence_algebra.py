@@ -1049,7 +1049,8 @@ def key_memory_sums(out_grads: TileLoad, corrected: TileLoad, value_grads: TileL
 
 def key_memory_block(query: Tile, key: Tile, gates: tuple, last: tuple, sums: tuple, lower: Tile, betas,
                      system, scale: float, dtype, issue: Issue, *, emit: Callable[[str, jax.Array], None],
-                     columns: Callable[[jax.Array], jax.Array] | None = None) -> tuple[jax.Array, jax.Array]:
+                     columns: Callable[[jax.Array], jax.Array] | None = None,
+                     read: Tile | None = None) -> tuple[jax.Array, jax.Array]:
     """One key block's part of a decay a key dimension's backward (`templates.recurrence.key_backward`), its
     queries `query` and keys `key` `[C, BK]`, their prefix from the chunk's start `gates` `[C, BK]` and the
     chunk's last token's `last` as a row's vectors (each its limbs, `Call.prefix_limbs`), and its memory
@@ -1065,7 +1066,10 @@ def key_memory_block(query: Tile, key: Tile, gates: tuple, last: tuple, sums: tu
     (kda-lower5-sm90 at 6e03eb57e). Each sum over the value blocks issued into one accumulator
     (`key_memory_sums`, `memory_gradients`'): a list of each block's products, their accumulators at once,
     spilled 744 bytes a thread on an H100 (kda-gate3 at ee3734584). `columns`, where given, sums a tile's
-    columns (the mainloop's, `summed_pairs`')."""
+    columns (the mainloop's, `summed_pairs`'). Under an erase along reads of their own (`read`, the block's
+    `[C, BK]`: `recurrence.Hooks.erase` 'read', the weights `X (b beta exp2 g)`), the weights' terms are the
+    reads': `emit('dk', ...)` the memory's alone and `emit('dr', ...)` the reads' through the weights, the
+    system's, the log decay's and the write gates' terms on the reads."""
     decays = raised(*gates)
     to_last = range_decay(tuple(limb[None, :] for limb in last), gates)
     query_sum, key_sum, weight_sum = sums
@@ -1089,8 +1093,13 @@ def key_memory_block(query: Tile, key: Tile, gates: tuple, last: tuple, sums: tu
     # `dbeta_p` as fla's `dw = -dw.astype(dtype)` does (row 8716).
     d_weight_narrow = d_weight.astype(dtype)
     d_gated = -(d_weight_narrow.astype(jnp.float32) + issue("weights_merge", lower.T, d_weight_narrow))
-    emit("dk", d_key + d_gated * decays * betas[:, None])
-    gated = keys * decays
+    through = d_gated * decays * betas[:, None]
+    if read is None:
+        emit("dk", d_key + through)
+    else:
+        emit("dk", d_key)
+        emit("dr", through)
+    gated = (keys if read is None else read.value().astype(jnp.float32)) * decays
     gated_rows = Transposed(write_gated(gated, betas).astype(dtype))
     system = system - issue("weights_merge", d_weight_narrow, gated_rows)
     emit("dg", d_decay + gated * d_gated * betas[:, None])
@@ -1176,7 +1185,7 @@ def key_decayed_pairs_back(d_pairs: list, rows: list, keys: Callable[[int], jax.
 
 def key_diagonal_pairs_back(strips: list, own: list, behind: Callable[[jax.Array], tuple],
                             lower: Callable[[jax.Array, jax.Array], jax.Array], d_rows: tuple, d_keys,
-                            *, sub: int = SUB) -> tuple:
+                            *, sub: int = SUB, sheared: bool = False) -> tuple:
     """`key_diagonal_bands`' transpose on one key block, added onto its gradients so far `d_rows` (one a
     pairs' gradient) and `d_keys`: for each offset `e` the band `dP[i, i - e]` of each pairs' gradient
     `strips[p](e)` within `i`'s sub-chunk, a row's vector `[C]` (a row of the pairs' gradients' own bands
@@ -1191,7 +1200,12 @@ def key_diagonal_pairs_back(strips: list, own: list, behind: Callable[[jax.Array
     chunk_kda_bwd_intra's diagonal blocks). A row before its offset is zero on its strips (`own_bands`
     lays them so), its terms a zero strip's: its keys and decays read below its sub-chunk finite
     (`behind`'s, the staged rows below the chunk zeroed), where the gradients' every term held to its mask
-    was a quarter of a B200's own pairs' backward's issues."""
+    was a quarter of a B200's own pairs' backward's issues. A read erase's rows are its reads, declared at
+    most one (`recurrence.Hooks.unit_reads`): undeclared, a read of `2^100` against a pairs' gradient of
+    `-2^60` was `-2^160` before its decay, and the call takes the portable math. Its update `sheared` (its
+    reads not its keys: no projection, which bounds the tied update's cotangents), the pairs' terms summed
+    before their decay where their sum is finite, else each decayed first: cotangents about `2^127` summed
+    to `2^128` where their decay takes them to `2^67` (head review of a84db53d5)."""
     index, _ = _grid(d_keys.shape)
 
     def offset(e, carried):
@@ -1202,12 +1216,19 @@ def key_diagonal_pairs_back(strips: list, own: list, behind: Callable[[jax.Array
         # zeroed), its strip zero there (`own_bands`) its terms'. The keys' terms are moved up from the rows
         # `e` below, each within its sub-chunk where selected.
         bands = [strip(e)[:, None] for strip in strips]
-        d_rows = tuple(total + strip * keys * pair for total, strip in zip(d_rows, bands, strict=True))
         # The rows read where they are weighed, not held across the offsets: held, an sm100's own pairs'
         # backward needed all of its 248 registers, read here 232 (row 5298).
-        weighted = functools.reduce(jnp.add, (strip * row() for strip, row in zip(bands, own, strict=True)))
-        return (d_rows, d_keys + jnp.where(index % sub + e < sub, lower(e, weighted * pair), 0.0), pair,
-                decays)
+        d_rows = tuple(total + strip * keys * pair for total, strip in zip(d_rows, bands, strict=True))
+        # The pairs' terms summed before their decay (each one's decayed apart, two normal terms of
+        # 3 * 2^-128 flushed where their sum decayed is normal); a sheared update's decayed first where
+        # their sum overflows.
+        terms = [strip * row() for strip, row in zip(bands, own, strict=True)]
+        summed = functools.reduce(jnp.add, terms)
+        weighted = summed * pair
+        if sheared:
+            weighted = jnp.where(jnp.isfinite(summed), weighted,
+                                 functools.reduce(jnp.add, (term * pair for term in terms)))
+        return (d_rows, d_keys + jnp.where(index % sub + e < sub, lower(e, weighted), 0.0), pair, decays)
 
     one = jnp.ones(index.shape, jnp.float32)
     d_rows, d_keys, _, _ = jax.lax.fori_loop(0, sub, offset, (d_rows, d_keys, one, one))
@@ -1423,34 +1444,43 @@ def values_gradient(lower, values: TileLoad, blocks: int, u_grads: TileLoad, bet
 
 
 def keys_gradient(lower, keys: TileLoad, columns: int, w_grads: TileLoad, d_l, beta, gate, low, dtype,
-                  issue: Issue, *,
-                  emit: Callable[[str, int, jax.Array], None]) -> tuple[jax.Array, jax.Array, jax.Array]:
+                  issue: Issue, *, emit: Callable[[str, int, jax.Array], None],
+                  reads: TileLoad | None = None) -> tuple[jax.Array, jax.Array, jax.Array]:
     """The WY representation's backward under a decay a head, its keys' part, given the system's gradient
     `d_l` (`system_gradient`'s, a tile its products read as they are, in `dtype`): each key block's gradient,
     through `w` (`X^T dw` scaled, 'inverse_t') and through the system (`dL k` and `dL^T (k beta)`,
     'keys_dl', 'keys_dlt'), to `emit('keys', c, dk)` as it is final. Returns beta's gradient through `w` and
     the system, the decay's range terms through `w` (`summed_ranges`' `after`) and its pair terms
-    `dL (k k^T) beta` (`summed_pairs`'), fp32."""
+    `dL (k k^T) beta` (`summed_pairs`'), fp32. Under an erase along reads of their own (`reads(c)`, a key
+    block of them: `recurrence.Hooks.erase` 'read', the system `beta b k^T` and `w = X (b beta exp2 g)`),
+    the system's rows and `w` are the reads': their gradient through `w` and `dL k` to `emit('reads', c,
+    db)`, the keys' through the system's columns `dL^T (b beta)` to `emit('keys', c, dk)`, beta's and the
+    decay's terms through the reads, the pair terms `dL (b k^T) beta`."""
     decay = raised(gate, low)
     narrow = d_l if isinstance(d_l, jax.Array) else d_l.value()
     weighted_l = (narrow.astype(jnp.float32) * beta[:, None]).astype(dtype)
+    rows = keys if reads is None else reads
     d_betas, d_gate = [], None
     for c in range(columns):
-        key = keys(c)
+        key, read = keys(c), rows(c)
         w_grad = w_grads(c).value().astype(jnp.float32)
         # `X^T dw` decayed, then its sum with `dL k` (each term's own beta its row's): one tile of them live.
         through_w = (w_grad + issue("inverse_t", lower.T, w_grad.astype(dtype))) * decay[:, None]
-        key_value = key.value().astype(jnp.float32)
-        d_gate = _added(d_gate, beta * jnp.sum(through_w * key_value, axis=1))
+        read_value = read.value().astype(jnp.float32)
+        d_gate = _added(d_gate, beta * jnp.sum(through_w * read_value, axis=1))
         combined = through_w + issue("keys_dl", d_l, key)
-        d_betas.append(jnp.sum(combined * key_value, axis=1))
-        # `dL^T (k beta)` as `(beta dL)^T k`: one operand in registers, the keys a tile.
-        emit("keys", c, combined * beta[:, None] + issue("keys_dlt", Transposed(weighted_l), key))
-    # The keys' own pairs once every block's gradient is out: a tile not live beside theirs.
+        d_betas.append(jnp.sum(combined * read_value, axis=1))
+        # `dL^T (b beta)` as `(beta dL)^T b`: one operand in registers, the reads a tile.
+        columned = issue("keys_dlt", Transposed(weighted_l), read)
+        if reads is None:
+            emit("keys", c, combined * beta[:, None] + columned)
+        else:
+            emit("reads", c, combined * beta[:, None])
+            emit("keys", c, columned)
+    # The system's own pairs once every block's gradient is out: a tile not live beside theirs.
     products = None
     for c in range(columns):
-        key = keys(c)
-        products = _added(products, issue("keys_dl", key, key.T))
+        products = _added(products, issue("keys_dl", rows(c), keys(c).T))
     assert products is not None and d_gate is not None, "a chunk's keys take at least a block"
     pairs = narrow.astype(jnp.float32) * (products * beta[:, None])
     return _summed(d_betas), d_gate, pairs

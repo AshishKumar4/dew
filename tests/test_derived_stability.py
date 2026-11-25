@@ -361,3 +361,18 @@ def test_a_rows_gradients_are_at_its_own_shift_and_a_shared_bias_sums_them(witne
                 got = np.asarray(made.score_params[0] if name == "bias" else getattr(made, name), np.float32)
                 held = ~np.isnan(want)
                 np.testing.assert_array_equal(got[held], want[held], err_msg=f"{witness} {mainloop} {name}")
+
+
+def test_the_references_tangent_keeps_a_part_beneath_values_that_cancel():
+    """One fp32 query over four keys of zero logits, values `2^127` in one channel (their sums past the
+    format): the reference's tangent along the values `[2^127, -2^127, 2^-30, 0]` moves the mean by `2^-32`,
+    its mean's contraction a band at a time (`scaled_contraction._banded`), where one exponent for the values
+    flushed `2^-30` before the large ones cancelled and gave 0 (row 12452)."""
+    query = jnp.zeros((1, 1, 1, 1), jnp.float32)
+    key = jnp.zeros((1, 4, 1, 1), jnp.float32)
+    spans = template.spans(1, 4, 1)
+    direction = jnp.asarray([2.0 ** 127, -(2.0 ** 127), 2.0 ** -30, 0.0], jnp.float32).reshape(1, 4, 1, 1)
+    _, tangent = jax.jvp(lambda value: template.reference(query, key, value, spans),
+                         (jnp.full((1, 4, 1, 1), 2.0 ** 127, jnp.float32),), (direction,))
+    np.testing.assert_array_equal(np.asarray(tangent).ravel(), [2.0 ** -32])
+

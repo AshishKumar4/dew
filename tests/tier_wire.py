@@ -13,9 +13,88 @@ PREPARE = "DEW_TIER_PREPARE"
 """Set to 1, a flow prepares rather than runs: on the node's CPU, before its GPU run."""
 TRUTHS = "DEW_TIER_TRUTHS"
 """The directory a part's prepare writes its flows' programs and their truths to, which its run reads."""
+UNPREPARED = "unprepared.json"
+"""A test's record, in its store's directory of the test (`<TRUTHS>/sites/<digest>/`), that it ran
+unprepared (truths_ahead.py's `unprepared`): `{"test", "where", "error", "reasons"}`, its first reason's
+where and why and every reason it gave, each once (a site, an arm, a cell: their count shows a tier
+drifting from its prepares), the GPU tier's list of unprepared tests read from these alone (a ledger row
+each, the tier's), and a dry prepare's (tools/armada/ci.py's `dry_prepared`)."""
+DEFERRED = "deferred.json"
+"""A test's record, in its store's directory of the test, of a GPU flow's cell its prepare deferred to its
+run (tests/gpu_flow.py's `_deferred`), as `UNPREPARED`'s, which its run serves from the store and names
+unprepared, and a dry prepare reads as unprepared (tools/armada/ci.py's `dry_prepared`); a cell that declares
+it compiles at its run (`Cell.at_run`) is recorded neither."""
+TOPOLOGY = "DEW_NODE_TOPOLOGY"
+"""The node's GPUs' serialized topology (a GPU node's session hands a prepare its node's, a dry prepare
+one compile-only GPU's, tools/armada/ci.py's `dry_prepared`): the GPU a flow's programs are compiled for."""
 UNIT = "DEW_TIER_UNIT"
 """The name the lane runs a prepare's unit under (a file, `<file>#G/N` for a group, or a variant's process
 of either), set in the prepare's environment: the unit's flows' needs are filed under it (`needs_file`)."""
+
+
+PREPARE_BY = "DEW_TIER_PREPARE_BY"
+"""The time (`time.monotonic()`, its parent's on the same host) past which a dry prepare starts no further
+test or flow cell (`past_cap`): its group's time, less what its process's end takes, so the programs it
+prepared are kept rather than lost to its task's kill (tools/armada/prepares.py's `process`). Unset or
+empty (a part's prepare clears one it inherits), no cap."""
+CAPPED = "its group's prepare time cap"
+"""Where a test or cell left unprepared by its prepare's cap is recorded (`UNPREPARED`, `DEFERRED`): named
+unprepared and run unprepared on its GPU as any is, but no red of its row (prepares.py's `graded`): a cap is
+its prepare's time, no fault of the test."""
+
+
+PREPARE_HOLDS = "DEW_TIER_PREPARE_HOLDS"
+"""The working set (`dew._cgroups.memory_held`: a cgroup's charge less its inactive page cache) each cgroup
+level binding a dry prepare may hold before the prepare starts no further test, cell or site's draw
+(`past_cap`): a JSON list of `[path, bytes]` pairs, its own cgroup's and each ancestor's that states a
+memory limit, a share of that limit (tools/armada/prepares.py's `held_caps`, read by the task before its
+pytest runs, so no limit is a recorded input of the tests). A process keeps every program it compiled, and a
+flow's own process beside it holds more, so a group of heavy families grew to its container's whole memory
+and was killed, every report lost (a recurrence group's prepare at 10 GiB, trains 1269 and 1274). Unset or
+empty, no cap."""
+
+
+def over_memory(caps: str) -> bool:
+    """Whether any level `caps` names (`PREPARE_HOLDS`) holds more than its cap."""
+    import json
+
+    from dew import _cgroups
+
+    for level, cap in json.loads(caps):
+        held = _cgroups.memory_held(Path(level))
+        if held is not None and held > int(cap):
+            return True
+    return False
+
+
+def past_cap(environ: Mapping[str, str] = os.environ) -> bool:
+    """Whether a dry prepare of `environ` (this process's) is past its cap, its time's (`PREPARE_BY`) or its
+    memory's (`PREPARE_HOLDS`): it starts nothing more."""
+    import time
+
+    if environ.get(PREPARE_BY) and time.monotonic() > float(environ[PREPARE_BY]):
+        return True
+    return bool(environ.get(PREPARE_HOLDS)) and over_memory(environ[PREPARE_HOLDS])
+
+
+class PastCap(Exception):
+    """A dry prepare past its cap between a site's draws (`stop_past_cap`): the site it stops is left to its
+    run (`reference_error._prepare_site`)."""
+
+
+def stop_past_cap(environ: Mapping[str, str] = os.environ) -> None:
+    """Raise `PastCap` where a dry prepare of `environ` is past its cap (`past_cap`): a site's draw is the
+    finest step a prepare stops at, as one site's draws can outlast what the cap keeps for its process's
+    end (a Gemma-sized vocabulary's logits drawn and widened on the CPU, its group's task killed at its
+    deadline with every report lost)."""
+    if past_cap(environ):
+        raise PastCap
+
+
+def capped(why: str) -> str:
+    """The reason a test or cell left unprepared by its prepare's cap gives (`CAPPED`, its where)."""
+    return (f"not prepared: {why} ran past its group's prepare cap (its time or memory); its run compiles it"
+            " on its GPU")
 
 
 def preparing(environ: Mapping[str, str] = os.environ) -> bool:

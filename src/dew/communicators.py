@@ -44,10 +44,10 @@ import time
 import weakref
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
+from typing import Protocol, runtime_checkable
 
 import jax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
-from jaxlib.xla_client import LoadedExecutable
 
 from dew import _pool
 from dew._builds import dew_cache_dir
@@ -307,7 +307,7 @@ def ordinal(device) -> int:
 
 
 def assigned(devices: Iterable) -> tuple[int, ...]:
-    """The `devices` a program loaded on this process runs on (its `LoadedExecutable`'s, `admit`), as ordinals
+    """The `devices` a program loaded on this process runs on (its loaded runtime's, `admit`), as ordinals
     in the order of its device assignment, which its collectives' groups count positions in."""
     return tuple(ordinal(device) for device in devices)
 
@@ -604,6 +604,18 @@ def collectives_kept(fingerprint: bytes, gpus: tuple[int, ...],
     return Collectives.of(positions, gpus)
 
 
+@runtime_checkable
+class _Loaded(Protocol):
+    """A runtime executable this process loaded: the devices it runs on and its fingerprint. Read by what it
+    holds, not by jaxlib's class, which names a loaded executable and an unloaded one alike in some builds
+    (an A100 tier's jaxlib: an unloaded `Executable` passed `isinstance(..., LoadedExecutable)`)."""
+
+    def local_devices(self) -> list: ...
+
+    @property
+    def fingerprint(self) -> bytes | None: ...
+
+
 @dataclasses.dataclass(frozen=True)
 class LoadedProgram:
     """A compiled program as this process loaded it (`loaded_program`): the devices it runs on and its
@@ -615,12 +627,12 @@ class LoadedProgram:
 
 
 def loaded_program(executable: jax.stages.Compiled) -> LoadedProgram | None:
-    """`executable`'s program as this process loaded it (its runtime a `LoadedExecutable`), None for one
+    """`executable`'s program as this process loaded it (its runtime a loaded one, `_Loaded`), None for one
     compiled for devices it has not (`dew.nn.kernels.generation.compile_only_gpus`), which is never loaded
     here: no devices, fingerprint or room of this process's. The one reading of it `admit`, a kept program
     (`dew.training.ahead`) and a step's flops (`dew.training.rungs`) take."""
     runtime = executable.runtime_executable()
-    if runtime is None or not isinstance(runtime, LoadedExecutable):
+    if runtime is None or not isinstance(runtime, _Loaded):
         return None
     fingerprint = runtime.fingerprint
     return LoadedProgram(tuple(runtime.local_devices()),
