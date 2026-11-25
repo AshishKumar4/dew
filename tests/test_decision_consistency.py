@@ -599,34 +599,40 @@ def test_an_input_lm_term_is_the_backbones_own_next_token_loss_over_the_rows_bes
 
 
 @attending("xla")
-def test_a_consistency_term_divides_the_groups_answers_at_the_passes_the_loss_weighs(monkeypatch):
-    """A consistency term over a looped backbone's passes (three) forms the groups' divergence at each pass
-    its loss weighs (`DecisionObjective._weighed`): at the last alone under an exit gate's objective
-    (`exit_entropy`, which weighs no pass's divergence), at all three under `pass_weights`, where every
-    pass's was formed under `exit_entropy` and two of them dropped unread (row 12866)."""
+def test_a_consistency_term_divides_the_groups_answers_at_the_passes_the_loss_weighs():
+    """A consistency term over a looped backbone's passes traces the groups' divergence at each pass its loss
+    weighs (`DecisionObjective._weighed`): under an exit gate's objective (`exit_entropy`, which weighs no
+    pass's divergence) the last alone, so the term adds to a three-pass loss's program what it adds to a
+    one-pass loss's; under `pass_weights` each of the three. Every pass's was traced under `exit_entropy`
+    and two of them dropped unread (row 12866)."""
+    from reference_error import equations
+
     from dew.nn.backbones.decoder_stack import Loop
 
-    backbone = tiny_backbone().clone(max_seq_len=LAYOUT.max_len, loop=Loop(steps=3, exit_gate=True))
     head = JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
-    gated = DecisionObjective(backbone, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT, head=head,
-                              exit_entropy=0.1, consistency=0.5)
-    weighed = DecisionObjective(backbone.clone(loop=Loop(steps=3)), tokenizer=TOKENIZER, specials=SPECIALS,
-                                layout=LAYOUT, head=head, consistency=0.5, pass_weights=(0.2, 0.3, 0.5))
-    reader = decision_rows([NEGATED, NEGATED], None, objective=gated.data(), tokens=LAYOUT.max_len)
-    [batch] = list(itertools.islice(reader.train(DataPartition()), 1))
     step = Step(jnp.asarray(0), jax.random.key(1), None)
-    divided = []
-    divergence = categorical.group_divergence
 
-    def counted(logits, *rest):
-        divided.append(logits.shape)
-        return divergence(logits, *rest)
+    def added(steps: int, **weighing) -> int:
+        """The operations the consistency term adds to a loss over a loop of `steps` passes."""
+        backbone = tiny_backbone().clone(max_seq_len=LAYOUT.max_len,
+                                         loop=Loop(steps=steps, exit_gate="exit_entropy" in weighing))
+        counted = []
+        for consistency in (0.0, 0.5):
+            objective = DecisionObjective(backbone, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
+                                          head=head, consistency=consistency, **weighing)
+            reader = decision_rows([NEGATED, NEGATED], None, objective=objective.data(),
+                                   tokens=LAYOUT.max_len)
+            [batch] = list(itertools.islice(reader.train(DataPartition()), 1))
 
-    monkeypatch.setattr(categorical, "group_divergence", counted)
-    for objective, count in ((gated, 1), (weighed, 3)):
-        divided.clear()
-        objective.loss(objective.init(jax.random.key(0)), batch, step)
-        assert len(divided) == count, (objective, divided)
+            def loss(variables, objective=objective, batch=batch):
+                return objective.loss(variables, batch, step)
+            graph = jax.make_jaxpr(loss)(objective.init(jax.random.key(0)))
+            counted.append(sum(1 for _ in equations(graph)))
+        return counted[1] - counted[0]
+
+    once = added(1, exit_entropy=0.1)
+    assert added(3, exit_entropy=0.1) == once
+    assert added(3, pass_weights=(0.2, 0.3, 0.5)) > once
 
 
 @attending("xla")

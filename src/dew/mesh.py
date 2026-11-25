@@ -171,7 +171,8 @@ def kept_axes(spec: jax.sharding.PartitionSpec, keep: Callable[[str], bool]) -> 
     def kept(entry):
         if entry is jax.sharding.PartitionSpec.UNCONSTRAINED:
             return entry
-        return tuple(axis for axis in mesh_axes(entry) if keep(axis)) or None
+        axes = tuple(axis for axis in mesh_axes(entry) if keep(axis))
+        return axes if axes else None
     return spec.update(partitions=tuple(map(kept, spec.partitions)))
 
 
