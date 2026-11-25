@@ -508,14 +508,19 @@ class _Counting:
 
     def __init__(self, axis: str | None, index: int, loops: int = 0, warp: tuple | None = None,
                  forms: Mapping | None = None, arrivals: _Arrivals | None = None, lanes: int | None = None,
-                 hoisted: dict[tuple, Work] | None = None, sites: Sequence = ()):
+                 hoisted: dict[tuple, Work] | None = None, sites: Sequence = (),
+                 expansions: dict[int, tuple] | None = None):
         self.axis, self.index, self.warp, self.forms = axis, index, warp, forms
         # Static work inside a loop, by its site: computed once outside every loop, as the compiler hoists
-        # it, whichever trip or arm of whichever trial reaches it, so every count of the role shares it
-        # (`hoist`, row 12767); a site is its call path, the equations being counted within (`sites`) and
-        # its own, so a cached body's two calls are two sites.
+        # it, whichever trip or arm of whichever trial reaches it (`hoist`, row 12767), so every count within
+        # that loop shares it; a conditional's arm outside every loop hoists into its own, its arm's (the
+        # review of lane/toolkit 55ba7911d). A site is its call path, the equations being counted within
+        # (`sites`) and its own, so a cached body's two calls are two sites.
         self.hoisted = {} if hoisted is None else hoisted
         self.sites = list(sites)
+        # Each expanded equation's expansion as the count first traced it (`expanded`), the equation held so
+        # its identity names it for the count's length, so its equations' sites hold across visits.
+        self.expansions = {} if expansions is None else expansions
         # The warp of its warpgroup whose 32 lanes run its body where a warp mesh's role runs it
         # (`plgpu.warp_map`), None where its warpgroup's 128 do.
         self.lanes = lanes
@@ -749,7 +754,7 @@ class _Counting:
             return region(self, equation, values, given) or unknown
         elif primitive is derivatives.marked_call_p and isinstance(params["kind"], _MARKS):
             return self.marked(params, values, given)
-        elif (expanded := _expanded(equation)) is not None:
+        elif (expanded := self.expanded(equation)) is not None:
             # The expansion's constants are its trace's own.
             return self.run(expanded[0], values, expanded[1], given, [True] * len(expanded[1]))
         elif primitive not in _FREE:
@@ -802,7 +807,7 @@ class _Counting:
                 inputs[len(consts) + bound] = stop
             trial = _Counting(self.axis, self.index, loops=len(self.loops) + 1, warp=self.warp,
                               forms=self.forms, arrivals=self.arrivals, lanes=self.lanes,
-                              hoisted=self.hoisted, sites=self.sites)
+                              hoisted=self.hoisted, sites=self.sites, expansions=self.expansions)
             trial.run(body, inputs, static=static)
             self.arrivals.left(trial.landing)
             return trial
@@ -834,7 +839,8 @@ class _Counting:
             counted = _Counting(self.axis, self.index, loops=len(self.loops), warp=(name, warp),
                                 forms=self.forms, arrivals=self.arrivals,
                                 lanes=warp if isinstance(mesh, gpu_core.WarpMesh) else self.lanes,
-                                hoisted=self.hoisted, sites=[*self.sites, (name, warp)])
+                                hoisted=self.hoisted, sites=[*self.sites, (name, warp)],
+                                expansions=self.expansions)
             counted.run(inner, barriers)
             if self.loops:
                 self.arrivals.left(counted.landing)
@@ -876,6 +882,13 @@ class _Counting:
         else:
             self.fixed = self.fixed + found.work
 
+    def expanded(self, equation) -> tuple[jax_core.Jaxpr, Sequence] | None:
+        """`equation`'s expansion (`_expanded`), traced once for the count: a loop's trips and trials visit
+        one, so its equations' sites (`hoist`) are one across them (the review of lane/toolkit 55ba7911d)."""
+        if id(equation) not in self.expansions:
+            self.expansions[id(equation)] = (equation, _expanded(equation))
+        return self.expansions[id(equation)][1]
+
     def hoist(self, work: Work) -> None:
         """Static work (of the program's constants alone) at the equation being counted: inside a loop, its
         site's once (`hoisted`, the compiler's hoisting out of every loop, whatever trip or arm reaches it
@@ -900,14 +913,18 @@ class _Counting:
             return taken
         trials = []
         for branch in branches:
+            # Inside a loop its arms' hoisted work leaves the loop with every trip's (shared); outside every
+            # loop an arm's stays in the arm (its own), under the arms' envelope with the arm's other work.
             trial = _Counting(self.axis, self.index, loops=len(self.loops), warp=self.warp,
                               forms=self.forms, arrivals=self.arrivals, lanes=self.lanes,
-                              hoisted=self.hoisted, sites=self.sites)
+                              hoisted=self.hoisted if self.loops else {}, sites=self.sites,
+                              expansions=self.expansions)
             trial.run(branch, operands, static=given[1:])
             if self.loops:
                 self.arrivals.left(trial.landing)
             trials.append(trial)
-        self.fixed = self.fixed + most([trial.fixed for trial in trials])
+        self.fixed = self.fixed + most([trial.fixed if self.loops
+                                        else sum(trial.hoisted.values(), trial.fixed) for trial in trials])
         if any(trial.walks for trial in trials):
             self.walks.append(most([_mean(trial.walks) for trial in trials if trial.walks]))
         if self.loops:
