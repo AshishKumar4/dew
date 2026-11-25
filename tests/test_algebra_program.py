@@ -952,6 +952,17 @@ def test_xlas_schedule_on_a_tpu_prices_what_its_kernels_keep_in_vmem(target_name
     assert product.kept_bytes in kernel_cost.units(product, unmeasured)[1]
 
 
+def test_a_tpu7x_prices_its_fp8_products_at_its_fp8_peak_where_it_states_no_rate_a_clock():
+    """A TPU7x states its catalogued peaks and no MXU rate a clock (row 9026): a whole device prices an FP8
+    product at its FP8 peak, twice its bf16's, and a tile walk, with no clock, prices neither (the review of
+    toolkit/theme-k01-2 5979e2142)."""
+    target = generation.TARGETS["tpu7x"]
+    device, tile = kernel_cost.rates(target, device=True), kernel_cost.rates(target, device=False)
+    assert (device.tensor, device.eight) == (target.bf16_peak, target.fp8_peak)
+    assert target.fp8_peak == 2 * target.bf16_peak
+    assert (tile.tensor, tile.eight) == (None, None)
+
+
 @pytest.mark.parametrize("target_name", ["v5e", "v6e"])
 def test_a_tpu_tile_walks_staged_bytes_are_priced_at_its_vmem_rate(target_name):
     """A Pallas TPU template's staged bytes (`Work.shared_bytes`, its tiles copied into VMEM) are priced on
