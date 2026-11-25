@@ -175,19 +175,7 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
     laid_do = call.given.split(run.laid(zero_padded(do.astype(run.dtype), 3, columns)).reshape(rows, -1))
     dht = zero_padded(zero_padded(dfinal.astype(jnp.float32), 2, width), 3, columns).reshape(-1, columns)
     if call.per_key:
-        # A clamped call's log decays laid, the clamp's derivative's (`chunk_forward.prepared`'s): summed
-        # back over its chunk, a log decay below the floor took the terms' fp32 residue where float64's is
-        # zero. Applied as the decay's gradient is finished (`key_backward.gradients`).
-        clamp = (run.laid(zero_padded(g.astype(jnp.float32), 3, width)).reshape(rows, -1) if call.clamped
-                 else None)
-        (dq, dk, dv, dg, dbeta, dh0, taken, d_reads), key_kept = key_backward.gradients(run, laid_do, dht,
-                                                                                        tiles, clamp=clamp)
-        dg = run.unlaid(dg.reshape(rows, heads, width))[..., :run.key_width]
-        grads = _unlaid(run, (q, k, v, g, beta), dq, dk, dv, dg, run.unlaid(dbeta), dh0, starts)
-        # The reads' gradient a key head's, laid back as the keys' are (`_unlaid`).
-        dreads = (None if d_reads is None or reads is None else run.unlaid(
-            d_reads.reshape(rows, heads // call.group, width))[..., :run.key_width].astype(reads.dtype))
-        return (*_tabled_gradients(run, grads, taken), None, _entered_gradient(run, taken), dreads), key_kept
+        return _key_kept_backward(run, (q, k, v, g, beta), laid_do, dht, tiles, starts, reads)
     local = _local_back(run.q, run.k, laid_do, *run.prefix, run.taken, call, scale=run.scale)
     # Without the delta rule the walk gates the values where their columns are the call's own. Padded, it
     # read a padded copy of them (0.061 ms of Nemotron-H 4B's SSD training on an H100) and its gate took
@@ -301,6 +289,25 @@ def _entered_gradient(run, taken):
     if taken is None or run.table.entries is None:
         return None
     return _taken_up(run, taken)[..., :run.key_width, :run.value_width]
+
+def _key_kept_backward(run, operands: tuple, laid_do, dht, tiles: Tiles, starts, reads) -> tuple:
+    """`kept_backward` under a decay a key dimension (`key_backward.gradients`), its gradients laid back as
+    the call's `operands` `(q, k, v, g, beta)` and its reads' where it erases along them."""
+    call, g = run.call, operands[3]
+    rows, heads, width = call.rows, call.heads, call.width
+    # A clamped call's log decays laid, the clamp's derivative's (`chunk_forward.prepared`'s): summed back
+    # over its chunk, a log decay below the floor took the terms' fp32 residue where float64's is zero.
+    # Applied as the decay's gradient is finished (`key_backward.gradients`).
+    clamp = run.laid(zero_padded(g.astype(jnp.float32), 3, width)).reshape(rows, -1) if call.clamped else None
+    (dq, dk, dv, dg, dbeta, dh0, taken, d_reads), key_kept = key_backward.gradients(run, laid_do, dht, tiles,
+                                                                                    clamp=clamp)
+    dg = run.unlaid(dg.reshape(rows, heads, width))[..., :run.key_width]
+    grads = _unlaid(run, operands, dq, dk, dv, dg, run.unlaid(dbeta), dh0, starts)
+    # The reads' gradient a key head's, laid back as the keys' are (`_unlaid`).
+    dreads = (None if d_reads is None or reads is None else run.unlaid(
+        d_reads.reshape(rows, heads // call.group, width))[..., :run.key_width].astype(reads.dtype))
+    return (*_tabled_gradients(run, grads, taken), None, _entered_gradient(run, taken), dreads), key_kept
+
 
 def _unlaid(run, operands: tuple, dq, dk, dv, dg, dbeta, dh0, starts, *, extra_dk=None) -> tuple:
     """The backward's gradients laid back as the call's operands (`operands`, `(q, k, v, g, beta)`) and in

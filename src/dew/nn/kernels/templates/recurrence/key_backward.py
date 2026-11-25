@@ -180,22 +180,8 @@ def _key_memory_back(q, k, prefix, do, corrected, dv, memory, dh, a, beta, taken
         weights, scratch = staging
         n, h = at["chunks"], at["heads"]
         row, span, last = n * chunk, pl.ds(n * chunk, chunk), n * chunk + chunk - 1
-        keyed, memory_row = h // call.group * width, (n * call.heads + h) * width
-        # Step `i` takes key block `i // value_steps` and that block's value columns `i % value_steps`.
-        views = {**stream_views(lambda i: (0, i % value_steps),
-                                out=given.views(do_ref, row, chunk, h * value_width, value_width),
-                                corrected=held.views(v_new_ref, row, chunk, h * value_width, value_width),
-                                value_grads=grads.views(dv_ref, row, chunk, h * value_width, value_width)),
-                 **stream_views(lambda i: (0, 0), lower=held.views(a_ref, row, chunk, h * chunk, chunk)),
-                 **stream_views(lambda i: (0, i // value_steps),
-                                queries=given.views(q_ref, row, chunk, keyed, width),
-                                keys=given.views(k_ref, row, chunk, keyed, width),
-                                **({"reads": given.views(reads_ref, row, chunk, keyed, width)} if reading
-                                   else {}),
-                                **limb_views(call, prefix_refs, row, chunk, h * width, width)),
-                 **stream_views(lambda i: (i // value_steps, i % value_steps),
-                                entered=memories.views(h_ref, memory_row, width, 0, value_width),
-                                leaving=memories.views(dh_ref, memory_row, width, 0, value_width))}
+        views = _key_memory_views(call, n, h, value_steps, (q_ref, k_ref, reads_ref), prefix_refs,
+                                  (do_ref, v_new_ref, dv_ref, a_ref, h_ref, dh_ref))
         issue = Issuer(call, {"weights_merge": list(weights)})
 
         def sums(slots, carried) -> tuple:
@@ -266,6 +252,34 @@ def _key_memory_back(q, k, prefix, do, corrected, dv, memory, dh, a, beta, taken
                          stages=(1, 2), live=chunk_liveness(len(inputs) - 1), steps=steps, model=products,
                          held=_key_memory_held(call, keys, values, reads=reading), staging=staging,
                          landing=landing)(*inputs)
+
+
+def _key_memory_views(call: Call, n, h, value_steps: int, keyed_refs: tuple, prefix_refs: tuple,
+                      refs: tuple) -> dict:
+    """`_key_memory_back`'s streams' views at chunk `n` and value head `h`, step `i` its key block
+    `i // value_steps` and that block's value columns `i % value_steps`: the output's gradient, the corrected
+    values and their gradient a value block, the inverse once, the queries, keys (and reads, where
+    `keyed_refs` holds them) and prefix a key block, the memories entered and left a key and value block."""
+    from dew.nn.kernels.templates.recurrence.mainloop_backward import _value_grads
+
+    chunk, width, value_width, given = call.chunk, call.width, call.value_width, call.given
+    held, memories = dataclasses.replace(call.held, rows=call.rows), call.memories
+    (q_ref, k_ref, reads_ref), (do_ref, v_new_ref, dv_ref, a_ref, h_ref, dh_ref) = keyed_refs, refs
+    row, keyed, memory_row = n * chunk, h // call.group * width, (n * call.heads + h) * width
+    valued = (row, chunk, h * value_width, value_width)
+    return {**stream_views(lambda i: (0, i % value_steps), out=given.views(do_ref, *valued),
+                           corrected=held.views(v_new_ref, *valued),
+                           value_grads=_value_grads(call).views(dv_ref, *valued)),
+            **stream_views(lambda i: (0, 0), lower=held.views(a_ref, row, chunk, h * chunk, chunk)),
+            **stream_views(lambda i: (0, i // value_steps),
+                           queries=given.views(q_ref, row, chunk, keyed, width),
+                           keys=given.views(k_ref, row, chunk, keyed, width),
+                           **({} if reads_ref is None else {"reads": given.views(reads_ref, row, chunk, keyed,
+                                                                                 width)}),
+                           **limb_views(call, prefix_refs, row, chunk, h * width, width)),
+            **stream_views(lambda i: (i // value_steps, i % value_steps),
+                           entered=memories.views(h_ref, memory_row, width, 0, value_width),
+                           leaving=memories.views(dh_ref, memory_row, width, 0, value_width))}
 
 
 def _key_memory_tiles(call: Call, *, reads: bool = False) -> tuple[int, int]:
@@ -590,15 +604,12 @@ def _key_pairs_back(q, k, prefix, beta, d_scores, d_system, taken, call: Call, *
 
             # The queries and keys read from their slots where each is taken, so neither tile lives across
             # the sub-chunks' turns.
-            def query(c):
-                return stream_tile(slots, "queries", given).value().astype(jnp.float32)
+            def read(name, c):
+                return stream_tile(slots, name, given).value().astype(jnp.float32)
 
-            def key(c):
-                return stream_tile(slots, "keys", given).value().astype(jnp.float32)
-
-            def rows(c):
-                """The system's rows: the reads where the call erases along them, else the keys."""
-                return stream_tile(slots, "reads" if reading else "keys", given).value().astype(jnp.float32)
+            # The system's rows the reads where the call erases along them, else the keys.
+            query, key, rows = (functools.partial(read, name) for name in (
+                "queries", "keys", "reads" if reading else "keys"))
 
             def gated(c):
                 return tuple(tile.value() for tile in limb_tiles(call, slots))

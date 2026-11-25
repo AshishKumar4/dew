@@ -104,8 +104,8 @@ def shifted_keys(call: Call, staged, keys: jax.Array, prefix: tuple):
     intra's 532 M (M-JS-118)."""
     chunk, family = call.chunk, call.family
     width, pad = keys.shape[1], staged.shape[1] - call.chunk
-    rows = (staged.at[index, pl.ds(pad, chunk), pl.ds(0, width)] for index in range(2))
-    _own_rows(call, *rows, keys, prefix)
+    keyed, decayed = (staged.at[index, pl.ds(pad, chunk), pl.ds(0, width)] for index in range(2))
+    _own_rows(call, keyed, decayed, keys, prefix)
     return lambda e: tuple(family.tile_of(staged.at[index, pl.ds(pad - e, chunk), pl.ds(0, width)])
                            for index in range(2))
 
@@ -608,9 +608,15 @@ def pairs_back_stored(call: Call, refs: tuple, at: tuple, keys: int, smem, opera
     own_query, own_key = (0.0, 0.0) if diagonal is None else (diagonal * key, diagonal * query)
     square = fp32_operand(call)
     forms = (square,) * len(refs) if forms is None else forms
-    rows, through = (key if read is None else read), d_keyed * betas[:, None]
-    grads = (d_query + own_query, d_key + own_key + (through if read is None else 0.0),
-             query * d_query + rows * through - key * d_key, *(() if read is None else (through,)))
+    through = d_keyed * betas[:, None]
+    if read is None:
+        # The keys' rows and columns one tile: their log decay's terms one product (`k (beta dk' - dk)`), a
+        # register less live than apart (8 bytes of an H100's own pairs' launch spilled, theme/jsf-pkdab).
+        rows, grads = key, (d_query + own_query, through + d_key + own_key,
+                            query * d_query + key * (through - d_key))
+    else:
+        rows, grads = read, (d_query + own_query, d_key + own_key,
+                             query * d_query + read * through - key * d_key, through)
     for ref, grad, others, form, landing, finish in zip(refs, grads, added, forms, smem, finished,
                                                          strict=True):
         for other in others:
@@ -662,13 +668,8 @@ def key_pairs_own(q, k, prefix, beta, d_scores, d_system, taken, factored, memor
     steps = width // keys
 
     def program(at, q_ref, k_ref, *refs, streams, staging, landing):
-        reads_ref, refs = (refs[0], refs[1:]) if reading else (None, refs)
-        prefix_refs, refs = refs[:len(prefix)], refs[len(prefix):]
-        (beta_ref, ds_ref, da_ref, _taken_ref, factored_q_ref, factored_k_ref, memory_q_ref, memory_k_ref,
-         factored_g_ref, memory_g_ref, ending_ref), refs = refs[:11], refs[11:]
-        clamp_ref, refs = (refs[:1], refs[1:]) if clamped else ((), refs)
-        read_refs, (dq_ref, dk_ref, *grads, db_ref) = (refs[:2], refs[2:]) if reading else ((), refs)
-        dr_ref, dg_ref = grads if reading else (None, *grads)
+        reads_ref, prefix_refs, (beta_ref, ds_ref, da_ref, ending_ref), clamp_ref, adds, outs, db_ref = (
+            _own_back_refs(refs, len(prefix), clamped=clamped, reading=reading))
         shifts, *suffix = staging
         n, h = at["chunks"], at["heads"]
         row, span = n * chunk, pl.ds(n * chunk, chunk)
@@ -685,11 +686,7 @@ def key_pairs_own(q, k, prefix, beta, d_scores, d_system, taken, factored, memor
             query = stream_tile(slots, "queries", given).value().astype(jnp.float32)
             key = stream_tile(slots, "keys", given).value().astype(jnp.float32)
             limbs = tuple(tile.value() for tile in limb_tiles(call, slots))
-            # Each pairs' gradient's band read at each offset, its row (every token's pair `e` back) as a
-            # row's vector, the scores' scaled as their pairs were.
-            def strip(name, scaled, e):
-                return functools.reduce(jnp.add, (family.rows_of(slots[f"{name}{p}"].at[e])
-                                                  for p in range(square.parts))) * scaled
+            strip = functools.partial(_strip, call, slots)
 
             # The scores' own pair (offset zero) summed apart (`pairs_back_stored`'s `diagonal`): its strip
             # scaled to zero there, a scalar's product (a select against a scalar lowers no broadcast).
@@ -709,21 +706,10 @@ def key_pairs_own(q, k, prefix, beta, d_scores, d_system, taken, factored, memor
                 (zero, zero), zero)
             column = h * width + index * keys
             start = family.columns_of(ending_ref.at[n, pl.ds(column, keys)])
-            # The clamp's log decays' view, read once the sums are formed (`_suffix_summed`): read here, its
-            # tile lived through the queries' and keys' stores, an sm100's launch spilling 8 bytes a thread.
-            floor = square.views(clamp_ref[0], row, chunk, column, keys)[0] if clamp_ref else None
-            # The reads' gradient, where the call erases along them, finished as the keys' is.
-            apart = (dr_ref,) if reading else ()
-            finishing = landing.get("summed", landing["block"])
-            d_betas = d_betas + pairs_back_stored(
-                call, (dq_ref, dk_ref, dg_ref, *apart), (row, column), keys,
-                (finishing,) * 2 + (landing["block"],) + (finishing,) * reading, (query, key, betas),
+            d_betas = d_betas + _own_finished(
+                call, outs, adds, (row, column), keys, landing, summed,
+                functools.partial(_suffix_summed, call, suffix, start), clamp_ref, (query, key, betas),
                 (d_query, d_keyed, d_key), diagonal=strip("scores", scale, 0)[:, None],
-                added=((factored_q_ref, memory_q_ref), (factored_k_ref, memory_k_ref),
-                       (factored_g_ref, memory_g_ref), *((tuple(read_refs),) if reading else ())),
-                forms=(summed, summed, square, *((summed,) if reading else ())),
-                finished=(None, None, functools.partial(_suffix_summed, call, suffix, start, floor),
-                          *((None,) if reading else ())),
                 read=rows("reads") if reading else None)
 
             @pl.when(index == steps - 1)
@@ -753,6 +739,48 @@ def key_pairs_own(q, k, prefix, beta, d_scores, d_system, taken, factored, memor
                          swizzles={f"{name}{p}": swizzling.UNSWIZZLED for name in ("scores", "system")
                                    for p in range(fp32_operand(call).parts)})(
         *inputs, *factored, *memory, *decays, ending, *(() if clamp is None else (clamp,)), *read_grads)
+
+
+def _own_back_refs(refs: tuple, prefixes: int, *, clamped: bool, reading: bool) -> tuple:
+    """`key_pairs_own`'s program's refs past the queries' and keys': `(reads, prefix limbs, (beta, the
+    scores' and system's bands, the memory decay's ending terms), the clamp's (a tuple, empty where none),
+    the other launches' parts each gradient adds, the gradients' outputs, the write gates')`, the reads' and
+    their parts and gradient where `reading`."""
+    reads, refs = (refs[0], refs[1:]) if reading else (None, refs)
+    prefix, refs = refs[:prefixes], refs[prefixes:]
+    (beta, ds, da, _taken, factored_q, factored_k, memory_q, memory_k, factored_g, memory_g, ending), refs = (
+        refs[:11], refs[11:])
+    clamp, refs = (refs[:1], refs[1:]) if clamped else ((), refs)
+    read_parts, (dq, dk, *grads, db) = (refs[:2], refs[2:]) if reading else ((), refs)
+    dr, dg = grads if reading else (None, *grads)
+    adds = ((factored_q, memory_q), (factored_k, memory_k), (factored_g, memory_g),
+            *((tuple(read_parts),) if reading else ()))
+    outs = (dq, dk, dg, *(() if dr is None else (dr,)))
+    return reads, prefix, (beta, ds, da, ending), clamp, adds, outs, db
+
+
+def _strip(call: Call, slots, name: str, scaled: float, e) -> jax.Array:
+    """An own pairs' gradient's band read at offset `e` (`key_pairs_own`'s), its row (every token's pair `e`
+    back) as a row's vector, its parts summed, scaled as the pairs were."""
+    return functools.reduce(jnp.add, (call.family.rows_of(slots[f"{name}{p}"].at[e])
+                                      for p in range(fp32_operand(call).parts))) * scaled
+
+
+def _own_finished(call: Call, outs: tuple, adds: tuple, at: tuple, keys: int, landing: dict, summed: Operand,
+                  suffix, clamp: tuple, operands: tuple, grads: tuple, *, diagonal, read) -> jax.Array:
+    """`key_pairs_own`'s key block's gradients finished and stored (`pairs_back_stored`): the queries' and
+    keys' (and the reads', where `read`) in their form `summed` with the other launches' parts `adds`, the
+    log decay's summed back over the chunk (`suffix`, `_suffix_summed` but the clamp's floor) in fp32; the
+    write gates' terms returned. The clamp's log decays' view read once the sums are formed: read before, its
+    tile lived through the queries' and keys' stores, an sm100's launch spilling 8 bytes a thread."""
+    square = fp32_operand(call)
+    floor = square.views(clamp[0], at[0], call.chunk, at[1], keys)[0] if clamp else None
+    finishing, reading = landing.get("summed", landing["block"]), read is not None
+    landings = (finishing,) * 2 + (landing["block"],) + (finishing,) * reading
+    return pairs_back_stored(
+        call, outs, at, keys, landings, operands, grads,
+        diagonal=diagonal, added=adds, forms=(summed, summed, square, *((summed,) if reading else ())),
+        finished=(None, None, functools.partial(suffix, floor), *((None,) if reading else ())), read=read)
 
 
 def _keypair_streams(call: Call, keys: int, *, reads: bool = False) -> dict:
