@@ -280,8 +280,8 @@ def compute_dtype(trainer, start: Start) -> np.dtype:
 def resumed_layout(trainer, step: int | None) -> Layout | None:
     """The layout of the checkpoint `trainer`'s run resumes (as `resume` asks, `Checkpoints.resumed`, the
     step every process agrees), the given one's with the host fields its rung recorded (`host`,
-    `Trainer._checkpoint_envelope`); None for a fresh run. A checkpoint that recorded none trained on the
-    devices."""
+    `dew.training._written.checkpoint_envelope`); None for a fresh run. A checkpoint that recorded none
+    trained on the devices."""
     checkpoints = trainer.checkpoints
     if checkpoints is None or step is None:
         return None
