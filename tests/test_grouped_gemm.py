@@ -283,6 +283,8 @@ def test_cutlass_eligibility_reads_the_dew_cutlass_build_installed_now(tmp_path,
     assert grouped_cutlass.cutlass_built_for("sm80") is None
     ampere = installed((8, 0), "sm80")
     assert ampere["sm80"] == "sm80" and grouped_cutlass.cutlass_built_for("sm80") == "sm80"
+    blackwell = installed((10, 0), "sm100")
+    assert blackwell["sm100"] == "sm100" and blackwell["sm90"] is None
 
 
 def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes, stacked=False, prologued=False):
