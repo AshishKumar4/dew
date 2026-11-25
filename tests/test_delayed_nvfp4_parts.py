@@ -121,8 +121,9 @@ def test_a_run_resumed_partway_through_a_held_update_rolls_what_its_taken_calls_
         # Partway through a held update, a checkpoint holding nothing waiting resumes as written; the same
         # state as an earlier Dew wrote it, the collection alone missing, is refused.
         resaved(3, "current-held", nothing).place()
+        legacy = resaved(3, "legacy-held", None)
         with pytest.raises(ValueError):
-            resaved(3, "legacy-held", None).place()
+            legacy.place()
 
 
 def test_a_ppo_steps_records_are_its_own_passes_its_critics_among_them():
