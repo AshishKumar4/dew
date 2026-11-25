@@ -17,7 +17,7 @@ from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_names import group_layers
 from dew.objectives.lm import LMObjective
-from dew.training import Layout, MeshSpec, Trainer
+from dew.training import Layout, MeshSpec, Trainer, TrainerAdvanced
 
 # Every test here compares a run's checkpoint, placed and read back bank by bank, with the run's own state,
 # bit for bit: no check-1 site, its programs compiled where its run reaches them (rows 11419-11422).
@@ -39,7 +39,8 @@ def decoder(**overrides):
 def trained(directory, objective, layout):
     """One checkpointed step of `objective` under `layout`; returns the state it ends with."""
     checkpoints = Checkpoints(str(directory))
-    trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5), layout=layout,
+    trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5),
+                      advanced=TrainerAdvanced(layout=layout),
                       checkpoints=checkpoints)
     data = Memory(ROWS).shuffle().repeat().batch(jax.device_count()).read("memory").loading(
         Loading(workers=0))

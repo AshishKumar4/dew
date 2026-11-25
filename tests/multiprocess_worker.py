@@ -39,13 +39,14 @@ from rl_support import pooled_rollout, rollout_prompts
 from dew.data import Loading, Phase, Tokens, phases
 from dew.data.dataset import Loader
 from dew.telemetry.records import RECORD_TYPES
-from dew.training import FitPolicy, UpdateBatch
+from dew.training import Layout, TrainerAdvanced
 from dew.training.evaluation import Evaluation
 
 # The test model's parameters are far below the production shard threshold, so
 # the threshold is lowered; at the production value fsdp > 1 would replicate
 # every parameter.
 TINY = 256
+SHARDED = TrainerAdvanced(layout=Layout(min_shard=TINY))
 
 
 def global_images(count: int = BATCH) -> np.ndarray:
@@ -94,11 +95,11 @@ def build_trainer(name, checkpoint_base, fsdp=1, tracker=None, local_dir=None,
     import jax
     import optax
 
-    from dew.training import Checkpoints, Layout, MeshSpec, Trainer
+    from dew.training import Checkpoints, MeshSpec, Trainer
 
     return Trainer(
         make_objective(), optax.adam(1e-3), key=jax.random.key(0),
-        mesh=MeshSpec(fsdp=fsdp), layout=Layout(min_shard=TINY),
+        mesh=MeshSpec(fsdp=fsdp), advanced=SHARDED,
         checkpoints=Checkpoints(str(checkpoint_dir(checkpoint_base, name)), keep=4,
                                 local_directory=local_dir, local_every=local_every),
         tracker=tracker)
@@ -402,14 +403,14 @@ def token_trainer(name, checkpoint_base, fsdp: int, seq_len: int, **options):
 
     from dew.objectives.lm import LMObjective
     from dew.registry import models
-    from dew.training import Checkpoints, Layout, MeshSpec, Trainer
+    from dew.training import Checkpoints, MeshSpec, Trainer
 
     model = models.build("causal_transformer", vocab_size=VOCAB, emb_features=32,
                          num_layers=2, num_heads=4, num_kv_heads=2, mlp_features=64,
                          max_seq_len=seq_len)
     return Trainer(
         LMObjective(model, seq_len), optax.sgd(0.1), key=jax.random.key(0),
-        mesh=MeshSpec(fsdp=fsdp), layout=Layout(min_shard=TINY),
+        mesh=MeshSpec(fsdp=fsdp), advanced=SHARDED,
         **{"checkpoints": Checkpoints(str(checkpoint_dir(checkpoint_base, name)), keep=4), **options})
 
 
@@ -870,7 +871,7 @@ def mode_profile_failure(args) -> dict:
     import optax
 
     from dew._coordination import agree_process_phase
-    from dew.training import ProfileWindow, Trainer
+    from dew.training import ProfileWindow, Trainer, TrainerAdvanced
 
     profile_dir = Path(args.profile_dir)
     if args.process_id == 0:
@@ -878,7 +879,7 @@ def mode_profile_failure(args) -> dict:
         profile_dir.write_text("occupied")  # a file where the capture must mkdir
     loader = indexed_loader(args.records, BATCH // args.processes)
     trainer = Trainer(make_objective(), optax.adam(1e-3), key=jax.random.key(0),
-                      profile=ProfileWindow(str(profile_dir), steps=2, warmup=0))
+                      advanced=TrainerAdvanced(profile=ProfileWindow(str(profile_dir), steps=2, warmup=0)))
     error = None
     try:
         trainer.fit(Loader(lambda partition: iter(loader), None, batch=BATCH, records=None),
@@ -958,13 +959,13 @@ def mode_validate(args) -> dict:
 
     from dew.data.dataset import Loader
     from dew.eval import CLIPDistance
-    from dew.training import Layout, MeshSpec, Trainer
+    from dew.training import MeshSpec, Trainer
 
     tiny = str(FIXTURES / "clip" / "tiny")
     objective, batch = text_to_image(args)
     scored = ScoreRecorder()
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0),
-                      mesh=MeshSpec(fsdp=args.fsdp_size), layout=Layout(min_shard=TINY),
+                      mesh=MeshSpec(fsdp=args.fsdp_size), advanced=SHARDED,
                       checkpoints=None, tracker=scored)
     data = Loader(train=lambda partition: iter([batch] * args.steps), val=lambda partition: iter([batch]),
                    records=BATCH * args.steps, batch=BATCH)
@@ -991,7 +992,7 @@ def mode_tracked(args) -> dict:
     import optax
 
     from dew.data.dataset import Loader
-    from dew.training import Layout, MeshSpec, Trainer
+    from dew.training import MeshSpec, Trainer
     from dew.training.tracker import render
 
     drawn: list = []
@@ -1014,7 +1015,7 @@ def mode_tracked(args) -> dict:
     batch = {"image": global_images()[mine],
              "label": np.arange(BATCH, dtype=np.int32)[mine]}
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0),
-                      mesh=MeshSpec(fsdp=args.fsdp_size), layout=Layout(min_shard=TINY),
+                      mesh=MeshSpec(fsdp=args.fsdp_size), advanced=SHARDED,
                       checkpoints=None, tracker=Drawing())
     data = Loader(train=lambda partition: iter([batch] * args.steps), val=lambda partition: iter([batch]),
                    records=BATCH * args.steps, batch=BATCH)
@@ -1041,13 +1042,13 @@ def pipeline_trainer(stage: int, microbatches, fsdp: int):
 
     from dew.objectives.lm import LMObjective
     from dew.registry import models
-    from dew.training import Layout, MeshSpec, Trainer
+    from dew.training import MeshSpec, Trainer
 
     model = models.build("causal_transformer", vocab_size=VOCAB, emb_features=32, num_layers=4,
                          num_heads=4, num_kv_heads=2, mlp_features=64, max_seq_len=SEQ_LEN)
     return Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
-                   mesh=MeshSpec(fsdp=fsdp, stage=stage), fit=FitPolicy(microbatches=microbatches),
-                   layout=Layout(min_shard=TINY), checkpoints=None, tracker=None)
+                   mesh=MeshSpec(fsdp=fsdp, stage=stage), microbatches=microbatches,
+                   advanced=SHARDED, checkpoints=None, tracker=None)
 
 
 def pipeline_losses(trainer, rows, steps: int):
@@ -1357,11 +1358,11 @@ def mode_evaluation_clocks(args) -> dict:
     import jax
     import optax
 
-    from dew.training import Layout, MeshSpec, Trainer
+    from dew.training import MeshSpec, Trainer
 
     objective, batch = text_to_image(args)
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=MeshSpec(),
-                      layout=Layout(min_shard=TINY), checkpoints=None, tracker=None)
+                      advanced=SHARDED, checkpoints=None, tracker=None)
     state, _, _ = trainer.place()
     data = Loader(train=lambda partition: iter([batch]), val=lambda partition: iter([batch]),
                   records=BATCH, batch=BATCH)
@@ -1380,7 +1381,7 @@ def mode_training_contract(args) -> dict:
 
     from dew.checkpoints import Checkpoints
     from dew.distributed.batches import shard_batch
-    from dew.training import Trainer
+    from dew.training import Trainer, TrainerAdvanced
 
     class Rows(Tiny):
         def loss(self, variables, batch, step):
@@ -1389,7 +1390,8 @@ def mode_training_contract(args) -> dict:
     checkpoints = Checkpoints(args.run_dir)
     def build():
         return Trainer(Rows(composite=True), optax.adamw(.03, weight_decay=.1), key=jax.random.PRNGKey(9),
-                       update=UpdateBatch(batches=2), dynamic_scale=SHORT_SCALE, checkpoints=checkpoints)
+                       accumulation=2, advanced=TrainerAdvanced(dynamic_scale=SHORT_SCALE),
+                       checkpoints=checkpoints)
     trainer = build()
     state, _, _ = trainer.place()
     rank, processes = jax.process_index(), jax.process_count()
@@ -1440,7 +1442,7 @@ def mode_replicated_rollout(args) -> dict:
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.rl import GRPOObjective, RolloutScheduler
     from dew.sampling import Sampling
-    from dew.training import Layout, MeshSpec, Trainer
+    from dew.training import MeshSpec, Trainer
 
     rank, processes = jax.process_index(), jax.process_count()
     model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2,
@@ -1458,7 +1460,7 @@ def mode_replicated_rollout(args) -> dict:
     rollout = RolloutScheduler.sampled(objective, reward, groups=2, max_new_tokens=4,
                                        sampling=Sampling(temperature=0.8, top_k=5, pad_token_id=12))
     trainer = Trainer(objective, optax.sgd(0.01), key=jax.random.key(5), mesh=MeshSpec(tensor=processes),
-                      layout=Layout(min_shard=TINY), rollout=rollout)
+                      advanced=dataclasses.replace(SHARDED, rollout=rollout))
     state, _, _ = trainer.place()
     partition = DataPartition.of(trainer.device_mesh)
     packed = rollout(state, rollout_prompts(), jax.random.key(9), objective=objective)
@@ -1550,7 +1552,7 @@ def mode_rollout(args) -> dict:
     from dew.data.dataset import Loader
     from dew.objectives.rl import GRPOObjective, RolloutScheduler
     from dew.sampling import Sampling, generate
-    from dew.training import Layout, MeshSpec, Trainer
+    from dew.training import MeshSpec, Trainer
 
     rank, processes = jax.process_index(), jax.process_count()
     model, params, batch, local = pooled_rollout()
@@ -1566,8 +1568,8 @@ def mode_rollout(args) -> dict:
     rollout = RolloutScheduler.sampled(objective, lambda text, record: float(len(text)),
                                        groups=2, max_new_tokens=4, sampling=sampling)
     trainer = Trainer(objective, optax.sgd(0.01), key=jax.random.key(5),
-                      mesh=MeshSpec(fsdp=args.fsdp_size), layout=Layout(min_shard=TINY),
-                      rollout=rollout)
+                      mesh=MeshSpec(fsdp=args.fsdp_size),
+                      advanced=dataclasses.replace(SHARDED, rollout=rollout))
     state, _, _ = trainer.place()
     facts = sharding_facts(state.variables)
     began = time.monotonic()
@@ -1862,12 +1864,12 @@ def mixed_validity_trainer(fsdp: int):
 
     from dew.objectives.lm import LMObjective
     from dew.registry import models
-    from dew.training import Layout, MeshSpec, Trainer
+    from dew.training import MeshSpec, Trainer
 
     model = models.build("causal_transformer", vocab_size=VOCAB, emb_features=32, num_layers=4,
                          num_heads=4, num_kv_heads=2, mlp_features=64, max_seq_len=SEQ_LEN)
     return Trainer(LMObjective(model, SEQ_LEN), optax.sgd(MIXED_RATE), key=jax.random.key(0),
-                   mesh=MeshSpec(fsdp=fsdp), layout=Layout(min_shard=TINY),
+                   mesh=MeshSpec(fsdp=fsdp), advanced=SHARDED,
                    checkpoints=None, tracker=None)
 
 
@@ -2166,7 +2168,7 @@ def mode_host_training(args) -> dict:
     from dew.distributed.batches import shard_batch
     from dew.distributed.host import companion_mesh
     from dew.objectives.base import Aux, Objective
-    from dew.training import Layout, MeshSpec, Trainer
+    from dew.training import Layout, MeshSpec, Trainer, TrainerAdvanced
 
     class Coupled(Objective):
         def fresh_variables(self, key, held):
@@ -2201,7 +2203,7 @@ def mode_host_training(args) -> dict:
     for name, host in (("resident", ()), ("host", ("variables",))):
         trainer = SeparateLanes(Coupled(), optax.chain(optax.clip_by_global_norm(.5), optax.sgd(.1)),
                           key=jax.random.key(0), mesh=MeshSpec(fsdp=2),
-                          layout=Layout(host=host, min_shard=1, tolerance=1.))
+                          advanced=TrainerAdvanced(layout=Layout(host=host, min_shard=1, tolerance=1.)))
         state, _, _ = trainer.place()
         batch = shard_batch(trainer.device_mesh, {"x": local})
         state, loss, _, _, _, _ = trainer.compile(state, batch)(state, batch)

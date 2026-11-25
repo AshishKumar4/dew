@@ -193,8 +193,8 @@ def recorded(cell: Cell, backbone: Path, root: Path, examples: int | None = None
     """The cell's run as `dew train` replays it (`Recorded`), bounded to every training example its layout
     keeps, or to `examples` of them where given (`examples`), or to a share of those (`stop`), its context
     read through cross-attention where the cell reads one, each step logged."""
-    given = {"trainer.log_every": "1", "trainer.horizon.steps": "None",
-             "trainer.horizon.examples": str(kept(cell) if examples is None else examples),
+    given = {"trainer.log_every": "1", "trainer.steps": "None",
+             "trainer.examples": str(kept(cell) if examples is None else examples),
              **({"trainer.stop": {"class": "dew.training.budget:Pause", "fields": {"fraction": SHARE}}}
                 if cell.bound == "share" else {}),
              **({"context_layers": CONTEXT_LAYERS} if cell.context else {})}

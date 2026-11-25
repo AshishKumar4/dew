@@ -35,7 +35,6 @@ from dew.inputs import TextCondition
 from dew.registry import ModelConfig
 from dew.sampling import Euler
 from dew.training import Layout, LocalTracker, MeshSpec
-from dew.training.budget import Horizon
 
 TINY_LAYA = Path(__file__).parent / "fixtures" / "laya" / "tiny"
 QWEN_TINY = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
@@ -191,10 +190,13 @@ def trained(run: RunConfig, root: Path, name: str, lowering: LowerTarget | None 
     fsdp shards, its trainer the fields given, over its defaults here: its state, and its step's
     scalars; lowered for `lowering` in place of training where given (`Prepared.lower`), which ends by
     raising."""
-    trainer = TrainerConfig(**{"checkpoint_dir": str(root / "runs"), "horizon": Horizon(steps=1),
+    given = fields.pop("trainer", {})
+    # One step, where the fields name no length of their own.
+    length = {} if {"steps", "epochs", "tokens", "examples"} & set(given) else {"steps": 1}
+    trainer = TrainerConfig(**{"checkpoint_dir": str(root / "runs"), **length,
                                "log_every": 1, "eval_every": None, "checkpoint_every": None,
                                "checkpoint_final": False, "multi_host": False, "mesh": MeshSpec(fsdp=2),
-                               "layout": Layout(min_shard=64), **fields.pop("trainer", {})})
+                               "layout": Layout(min_shard=64), **given})
     prepared = dataclasses.replace(run, trainer=trainer, **fields).prepare()
     if lowering is not None:
         prepared.lower(name, lowering)
@@ -332,7 +334,7 @@ def cli_settings(root: Path, name: str, assigned: Mapping[str, object] = Mapping
     """A run's settings, by dotted path (`RunConfig.override`), for a run named `name` under `root`: one
     step, no evaluation or checkpoint between steps, one host, its programs compiled into the suite's cache,
     which a run naming its own would leave the training process holding; each of `assigned` over them."""
-    return {"trainer.name": name, "trainer.checkpoint_dir": str(root / "runs"), "trainer.horizon.steps": 1,
+    return {"trainer.name": name, "trainer.checkpoint_dir": str(root / "runs"), "trainer.steps": 1,
             "trainer.eval_every": None, "trainer.checkpoint_every": None, "trainer.multi_host": False,
             "trainer.compilation_cache_dir": None, **assigned}
 

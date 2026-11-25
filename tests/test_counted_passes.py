@@ -15,7 +15,6 @@ from dew import _position
 from dew.batch import CONSUMED_COUNT, EXAMPLES_CONSUMED
 from dew.data.dataset import DataPartition
 from dew.training._fit import consumption_counted
-from dew.training.budget import Horizon
 
 PLAIN = Path(__file__).with_name("fixtures") / "plans" / "decision-plain-main-b2d94d559.json"
 """A decision run's plan identity and batch fields, bounded in four steps with no cadence that reads its
@@ -34,8 +33,8 @@ def test_a_step_bounded_run_evaluates_at_each_pass_end_where_a_run_of_its_epochs
     of two epochs over the same data does, each pass's 25 tickets' end (`Loader.pass_examples`), and at
     its own end; it was refused, its `epoch` needing a record count its read has none of."""
     run = decision(tmp_path, drawn=False)
-    trained(run, tmp_path, "epochs", trainer={"horizon": Horizon(epochs=2), "eval_every": "epoch"})
-    trained(run, tmp_path, "steps", trainer={"horizon": Horizon(steps=8), "eval_every": "epoch"})
+    trained(run, tmp_path, "epochs", trainer={"epochs": 2, "eval_every": "epoch"})
+    trained(run, tmp_path, "steps", trainer={"steps": 8, "eval_every": "epoch"})
     passes = evaluated(tmp_path, "epochs")
     assert len(passes) == 2 and evaluated(tmp_path, "steps") == [*passes, 8]
 
@@ -45,12 +44,12 @@ def test_a_resumed_run_counts_its_passes_on_from_where_it_stopped(tmp_path):
     steps evaluates where the run nobody stopped does: its count rides in its checkpoint
     (`CONSUMED_EXAMPLES`) and resumes with it."""
     run = decision(tmp_path, drawn=False)
-    trained(run, tmp_path, "whole", trainer={"horizon": Horizon(steps=8), "eval_every": "epoch"})
+    trained(run, tmp_path, "whole", trainer={"steps": 8, "eval_every": "epoch"})
     whole = evaluated(tmp_path, "whole")
     for stopped in (whole[0], whole[0] + 1):
         name = f"stopped-{stopped}"
         for steps in (stopped, 8):
-            trained(run, tmp_path, name, trainer={"horizon": Horizon(steps=steps), "eval_every": "epoch",
+            trained(run, tmp_path, name, trainer={"steps": steps, "eval_every": "epoch",
                                                   "checkpoint_final": True})
         assert evaluated(tmp_path, name) == sorted({*whole, stopped})
 
@@ -64,7 +63,7 @@ def test_a_run_whose_cadences_read_no_pass_compiles_as_before_and_a_counting_one
     run = decision(tmp_path, drawn=False)
 
     def first(cadence):
-        trainer = dataclasses.replace(run.trainer, horizon=Horizon(steps=4), eval_every=cadence,
+        trainer = dataclasses.replace(run.trainer, steps=4, eval_every=cadence,
                                       checkpoint_every=None)
         loader = dataclasses.replace(run, trainer=trainer).prepare().dataset
         stream = loader.train(DataPartition())

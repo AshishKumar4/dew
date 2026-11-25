@@ -54,7 +54,7 @@ from dew.optim import Muon, Optax, OptimConfig
 from dew.registry import mixers
 from dew.state import TrainState, apart
 from dew.telemetry.compiles import Compiles
-from dew.training import FitPolicy, Trainer, UpdateBatch
+from dew.training import Trainer, TrainerAdvanced
 from dew.training.compiler import UNPLACED_REFUSED
 from dew.training.distributed import microbatch
 from dew.training.memory import (
@@ -287,7 +287,7 @@ def test_a_step_whose_rows_an_explicit_axis_types_is_read_whole():
     spec = MeshSpec(explicit=("data",))
     with pytest.raises(ValueError):
         Trainer(LMObjective(model, seq_len=SEQ), optax.sgd(1e-2), key=jax.random.key(0),
-                fit=FitPolicy(split=2), mesh=spec)
+                split=2, mesh=spec)
     trainer = Trainer(LMObjective(model, seq_len=SEQ), optax.sgd(1e-2), key=jax.random.key(0), mesh=spec)
     assert splits(None, BATCH, MeshSpec().build(jax.devices()[:1]), 1, trainer._shape.split) == [1]
 
@@ -312,8 +312,8 @@ def lm(split="auto", accumulation=1, objective=LMObjective, *, seq=SEQ, width=16
     model = CausalTransformer(vocab_size=vocab, emb_features=width, num_layers=layers, num_heads=2,
                               mlp_features=2 * width, max_seq_len=seq, **fields)
     return one_device(Trainer(objective(model, seq_len=seq), optax.sgd(1e-2), key=jax.random.key(0),
-                              update=UpdateBatch(batches=accumulation),
-                              fit=FitPolicy(split=split, remat=policy)))
+                              accumulation=accumulation,
+                              split=split, remat=policy))
 
 
 def test_a_step_whose_optimizer_state_is_a_class_made_in_its_factory_plans_and_steps():
@@ -330,20 +330,49 @@ def test_a_step_whose_optimizer_state_is_a_class_made_in_its_factory_plans_and_s
     assert int(state.opt_state.steps) == 2
 
 
-def test_a_second_trainer_of_one_step_plans_on_the_executable_the_first_compiled():
-    """A second trainer of a process, its step the same program on the same devices as an earlier one's,
-    plans on the executable the earlier compiled (`dew.nn.kernels.options.hold`): its plan compiles nothing
-    and reads nothing back from the persistent compilation cache, which the compile telemetry would name
-    (`Compiles`, a backend compile or a cache read alike), where every new trainer read its step back (4.4 s
-    of a small model's 11.9 s start on CPU, row 6995); it steps as the first."""
-    from dew.telemetry.compiles import Compiles
+def test_a_dropped_trainer_holds_no_executable_of_its_step():
+    """A trainer that stepped, then dropped: no executable of its step outlives it, its device code and, over
+    several GPUs, its collectives' room freed with it (row 12131: a process-wide store of every plan's
+    executables, 4,096 deep, kept a dropped run's and left a 2xH100's all-reduce no room)."""
+    trainer = lm(split=1)
+    trained(trainer, steps=1)
+    step = weakref.ref(trainer.executable)
+    del trainer
+    gc.collect()
+    assert step() is None
 
-    first = trained(lm(split=1), steps=1)
-    second = lm(split=1)
-    with Compiles(None) as compiles:
-        state = trained(second, steps=1)
-    assert [program.name for program in compiles.programs if program.kind == "compiled"
-            and program.name == "jit(step)"] == []
+
+@pytest.mark.skipif(not jax.config.jax_enable_compilation_cache,
+                    reason="reads its step back from the persistent compilation cache, off in this run")
+def test_a_second_trainer_of_one_step_reads_its_step_back_from_the_persistent_cache():
+    """A second trainer of a process, its step the same program on the same devices as an earlier one's that
+    is dropped, the process's own executables and JAX's in-process caches let go between: no executable of
+    the first is held past it (row 12131: a process-wide store kept a dropped run's device code and its
+    collectives' room), and the second's step compile reads its step back from the persistent compilation
+    cache, compiling nothing anew (`compilation_cache_counts` across the compile alone, its state placed
+    before: hits, and no miss, the cache writing every compile, where row 6995's store answered it from
+    memory; row 12417); it steps as the first."""
+    from dew.telemetry.instrumentation import compilation_cache_counts, count_compilation_cache
+
+    threshold = jax.config.jax_persistent_cache_min_compile_time_secs
+    jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.0)
+    count_compilation_cache()
+    try:
+        first = trained(lm(split=1), steps=1)
+        gc.collect()
+        options.release()
+        jax.clear_caches()
+        second = lm(split=1)
+        state, _, _ = second.place()
+        before = compilation_cache_counts()
+        step = second.compile(state, BATCH)
+        after = compilation_cache_counts()
+        state, *_ = step(state, BATCH)
+    finally:
+        jax.config.update("jax_persistent_cache_min_compile_time_secs", threshold)
+    read = {name: after.get(f"train/cache_{name}", 0) - before.get(f"train/cache_{name}", 0)
+            for name in ("hits", "misses")}
+    assert read["hits"] >= 1 and read["misses"] == 0, read
     for one, other in zip(jax.tree.leaves(first.variables), jax.tree.leaves(state.variables), strict=True):
         np.testing.assert_array_equal(np.asarray(one), np.asarray(other))
 
@@ -370,7 +399,7 @@ def test_a_second_trainer_whose_step_calls_another_host_callback_runs_its_own():
 
     def run(scale: float):
         return one_device(Trainer(LMObjective(model, seq_len=SEQ), scaled_on_the_host(scale),
-                                  key=jax.random.key(0), fit=FitPolicy(split=1)))
+                                  key=jax.random.key(0), split=1))
 
     once, twice = (trained(run(scale), steps=1) for scale in (1.0, 2.0))
     # From one start over one batch: the second's step at its own rate lands elsewhere.
@@ -449,7 +478,6 @@ def test_a_fresh_fit_whose_step_fits_no_plan_before_its_state_is_placed_is_refus
     trained = roomy.fit(Loader(lambda partition: rows, None, None, ROWS), steps=1)
     assert roomy.validation is not None
     room = max(roomy.validation.device_bytes.values()) + 1024
-    options.unhold()
     # Held arrays the start copies, the trained parameters on the device.
     held = {"params": trained.variables["params"]}
     lowered = []
@@ -501,7 +529,6 @@ def test_a_fresh_fit_whose_placed_devices_hold_its_step_trains_after_its_unplace
     roomy.fit(Loader(lambda partition: rows, None, None, ROWS), steps=1)
     assert roomy.validation is not None
     state = max(roomy.validation.device_bytes.values())
-    options.unhold()
 
     def held(device) -> int:
         return sum(array.nbytes for array in jax.live_arrays() if device in array.devices())
@@ -541,7 +568,6 @@ def test_a_fit_of_no_steps_on_devices_holding_no_plan_returns_and_its_trainer_tr
     roomy.fit(Loader(lambda partition: rows, None, None, ROWS), steps=1)
     assert roomy.validation is not None
     room = max(roomy.validation.device_bytes.values()) + 1024
-    options.unhold()
     trainer = lm()
     free_until_placed(monkeypatch, room)
     assert int(trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=0).step) == 0
@@ -556,14 +582,12 @@ def needs(monkeypatch, trainer, run=None):
         trained(trainer, steps=0)
     else:
         run()
-    # Measured as in a process apart: the run a test then counts compiles nothing of it.
-    options.unhold()
     return LIMIT - trainer.plan["probes"][0]["headroom"]
 
 
 def test_a_settled_plan_keeps_no_program_its_search_passed_over(monkeypatch):
     """A search that compiled the step whole, which missed, and split, which fits, keeps the plan's program
-    alone once it settles: its executable held for the process (`options.hold`) and its traced step for a
+    alone once it settles: its executable held for the run (`FitSearch.executables`) and its traced step for a
     refit (`_candidates.candidate_for`), each other program it compiled dropped, whose lowering keys its
     loaded executable and, over several GPUs, its collectives' room outside XLA's pool for as long as it is
     kept (row 12131: 24 kept beside a 4B run's step left an all-reduce no room)."""
@@ -578,7 +602,7 @@ def test_a_settled_plan_keeps_no_program_its_search_passed_over(monkeypatch):
     assert len(trainer.plan["probes"]) >= 2 and trainer.plan["split"] > 1, trainer.plan["probes"]
     kept = [kept.lowered for kept in _candidates._CANDIDATES.values()]
     assert len(kept) == 1, len(kept)
-    assert len(options._HELD) == 1, list(options._HELD)
+    assert len(trainer._compiler._executables) == 1, list(trainer._compiler._executables)
 
 
 def test_a_provisional_plans_search_keeps_no_program_once_its_plan_is_taken(monkeypatch):
@@ -609,7 +633,7 @@ def test_a_provisional_plans_search_keeps_no_program_once_its_plan_is_taken(monk
     assert int(trained.step) == 1 and isinstance(plan, dict) and len(plan["probes"]) >= 2, plan
     gc.collect()
     assert len(_candidates._CANDIDATES) == 1, list(_candidates._CANDIDATES)
-    assert len(options._HELD) == 1, list(options._HELD)
+    assert len(trainer._compiler._executables) == 1, list(trainer._compiler._executables)
 
 
 def test_a_provisional_plans_search_is_released_where_the_placed_search_after_it_refuses(monkeypatch):
@@ -640,7 +664,7 @@ def test_a_provisional_plans_search_is_released_where_the_placed_search_after_it
         trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=1)
     gc.collect()
     assert not _candidates._CANDIDATES, list(_candidates._CANDIDATES)
-    assert not options._HELD, list(options._HELD)
+    assert not trainer._compiler._executables, list(trainer._compiler._executables)
 
 
 def test_a_batch_that_does_not_fit_whole_is_split_before_anything_is_recomputed(monkeypatch):
@@ -882,18 +906,22 @@ def test_the_executable_a_profile_replaces_goes_with_its_program(earlier):
     and the backend holds as many executables as it did with that one alive, though JAX keeps every
     executable it compiled of a program while the program's lowering lives. A handoff that kept the
     admitted executable, or kept both, would hold one more. Where an `earlier` trainer of the same program
-    compiled the unguided step, the trainer takes it and lets it go too: no lowering the earlier trainer kept
-    holds it alive beside the guided one (rows 7988, 8293: three steps live where two were, on a GH200)."""
+    compiled the unguided step and was dropped, its executable goes with it: nothing the earlier trainer
+    kept holds it alive beside the guided one (rows 7988, 8293: three steps live where two were, on a GH200;
+    row 12131: no executable held past its run)."""
     if earlier:
         trained(lm(), steps=0)
+        gc.collect()
     with autopgle(2):
         trainer = lm()
         state, trials = stepped(trainer, trials=functools.partial(Handed, batch=BATCH, profile=COST))
     assert trainer.plan["pgle"] == {"runs": 2, "bytes": len(COST)}
     assert trials.unguided is not None and trials.unguided() is None
     live = live_executables()
-    assert live == trials.live and int(state.step) == 3, (live - trials.live, trials.live - live,
-                                                            holding(live - trials.live))
+    # Nothing live past what the trial held with the admitted step alive: the earlier trainer's, which no
+    # store keeps (row 12131), may be freed with the unguided lowering the two shared.
+    assert not live - trials.live and int(state.step) == 3, (live - trials.live, trials.live - live,
+                                                              holding(live - trials.live))
 
 
 def test_a_profile_window_traces_steps_past_the_first_compile_and_is_refused_under_autopgle(tmp_path,
@@ -937,7 +965,7 @@ def test_a_profile_window_traces_steps_past_the_first_compile_and_is_refused_und
                                   max_seq_len=SEQ)
         window = ProfileWindow(str(directory), steps=3, warmup=0)
         trainer = one_device(Trainer(LMObjective(model, seq_len=SEQ), optax.sgd(1e-2), key=jax.random.key(0),
-                                     tracker=tracker, profile=window))
+                                     tracker=tracker, advanced=TrainerAdvanced(profile=window)))
         rows = Replaying(lambda position: {"text": np.asarray(BATCH["text"])})
         trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=5, log_every=1)
 
@@ -977,7 +1005,9 @@ def test_a_run_that_fails_after_its_profile_window_still_reports_the_window(tmp_
     model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
                               max_seq_len=SEQ)
     trainer = one_device(Trainer(LMObjective(model, seq_len=SEQ), optax.sgd(1e-2), key=jax.random.key(0),
-                                 tracker=tracker, profile=ProfileWindow(str(tmp_path), steps=2, warmup=0)))
+                                 tracker=tracker,
+                                 advanced=TrainerAdvanced(profile=ProfileWindow(str(tmp_path), steps=2,
+                                                                                warmup=0))))
     rows = Replaying(lambda position: {"text": np.asarray(BATCH["text"])})
     with pytest.raises(LaterStepFailed):
         trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=6, log_every=1,
@@ -1005,7 +1035,8 @@ def test_a_run_that_stops_inside_its_profile_window_stops_its_capture_and_report
                               max_seq_len=SEQ)
     trainer = one_device(Trainer(LMObjective(model, seq_len=SEQ), optax.sgd(1e-2), key=jax.random.key(0),
                                  tracker=tracker, checkpoints=Checkpoints(str(tmp_path / "run")),
-                                 profile=ProfileWindow(str(tmp_path / "trace"), steps=4, warmup=0)))
+                                 advanced=TrainerAdvanced(profile=ProfileWindow(str(tmp_path / "trace"),
+                                                                                steps=4, warmup=0))))
     rows = Replaying(lambda position: {"text": np.asarray(BATCH["text"])})
     # The window opens past the first step's compile and holds the second and third, where the run pauses.
     trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=6, log_every=1, stop=Pause(0.5))
@@ -1047,7 +1078,7 @@ from dew.data.dataset import Loader
 from dew.distributed.placement import MeshSpec
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.lm import LMObjective
-from dew.training import ProfileWindow, Trainer
+from dew.training import ProfileWindow, Trainer, TrainerAdvanced
 spec = importlib.util.spec_from_file_location("guest_limits",
                                               {str(root / "site/live/container/guest_limits.py")!r})
 limits = importlib.util.module_from_spec(spec)
@@ -1056,7 +1087,8 @@ limits.install("train")
 model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
                           max_seq_len={SEQ})
 trainer = Trainer(LMObjective(model, seq_len={SEQ}), optax.sgd(1e-2), key=jax.random.key(0),
-                  profile=ProfileWindow({str(tmp_path / "trace")!r}, steps=2, warmup=0, wait=True))
+                  advanced=TrainerAdvanced(profile=ProfileWindow({str(tmp_path / "trace")!r}, steps=2,
+                                                         warmup=0, wait=True)))
 trainer.device_mesh = MeshSpec().build(jax.devices()[:1])
 text = np.asarray((np.arange({ROWS} * {SEQ + 1}).reshape({ROWS}, {SEQ + 1}) * 7) % 64, np.int32)
 rows = Replaying(lambda position: dict(text=text))
@@ -1111,7 +1143,8 @@ def test_a_profile_window_spanning_a_checkpoints_evaluation_holds_the_training_s
     checkpoints = Checkpoints(str(tmp_path / "run"), keep=3)
     trainer = one_device(Trainer(LMObjective(model, seq_len=SEQ), optax.sgd(1e-2), key=jax.random.key(0),
                                  tracker=tracker, checkpoints=checkpoints,
-                                 profile=ProfileWindow(str(tmp_path / "trace"), steps=4, warmup=0)))
+                                 advanced=TrainerAdvanced(profile=ProfileWindow(str(tmp_path / "trace"),
+                                                                                steps=4, warmup=0))))
     rows = Replaying(lambda position: {"text": np.asarray(BATCH["text"])})
     held = {"held": lambda partition: iter([{"text": np.asarray(BATCH["text"])}])}
     trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=6, log_every=1, checkpoint_every=2,
@@ -1191,8 +1224,8 @@ def regression_fit(x, directory, split: int, steps: int):
                    loading=Loading(workers=0, threads=1, read_buffer=1))
     # The optimizer stated as a config, which keys the step, so each seed's fits read the step the first
     # traced (`Trainer._step_key`).
-    trainer = one_device(Trainer(Regression(), OptimConfig(optimizer=Optax('optax:sgd'), learning_rate=0.1),
-                                 key=jax.random.key(0), fit=FitPolicy(split=split),
+    trainer = one_device(Trainer(Regression(), OptimConfig(optimizer=Optax('optax:sgd'), lr=0.1),
+                                 key=jax.random.key(0), split=split,
                                  checkpoints=Checkpoints(str(directory))))
     return trainer.fit(data, steps=steps, checkpoint_every=2).variables["params"]
 
@@ -1367,8 +1400,8 @@ def windowed(directory, split, remat=None, objective=LMObjective, accumulation=1
     model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=2, num_heads=1, mlp_features=16,
                               max_seq_len=8, remat=remat)
     return one_device(Trainer(objective(model, seq_len=4), optax.adam(1e-2), key=jax.random.key(0),
-                              update=UpdateBatch(batches=accumulation), fit=FitPolicy(split=split),
-                              layout=Layout(min_shard=1, tolerance=1.0),
+                              accumulation=accumulation, split=split,
+                              advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)),
                               checkpoints=Checkpoints(str(directory / "run"))))
 
 
@@ -1428,7 +1461,6 @@ def test_a_checkpoint_whose_step_climbed_to_recompute_its_layers_resumes_at_that
 
     def fitted(trainer, steps):
         trainer.fit(windows(corpus), steps=steps, log_every=100, checkpoint_every=1)
-        options.unhold()
         return trainer
 
     free(monkeypatch, LIMIT)
@@ -1764,6 +1796,24 @@ def test_a_plan_made_before_the_state_is_placed_is_searched_again_where_the_plac
         held, whole, halves, [(probe["split"], probe["fits"], probe["headroom"]) for probe in
                               trainer.plan["probes"]], caplog.text)
     assert (trainer.plan["split"], trainer.plan["remat"]) == (1, None), trainer.plan["probes"]
+
+
+def test_a_plan_searched_again_placed_lowers_no_candidate_its_unplaced_search_lowered(monkeypatch):
+    """A fresh fit whose plan made before its state was placed is searched again over the placed state
+    (`test_a_plan_made_before_the_state_is_placed_is_searched_again_where_the_placed_devices_cover_a_miss`)
+    lowers each step it asks once in all: the placed search's batch whole is the step the unplaced one
+    lowered, the state then its shapes and the batch on the host, now placed (row 12465: a 4B search
+    traced and lowered each candidate again, 2 to 4.5 minutes each, its XLA compile a minute)."""
+    whole = needs(monkeypatch, lm())
+    state, _, _ = lm().place()
+    held = sum(leaf.nbytes for leaf in jax.tree.leaves(state) if isinstance(leaf, jax.Array))
+    free(monkeypatch, whole + held)
+    trainer = lm()
+    data = Pipeline(Memory({"text": np.asarray(BATCH["text"])})).repeat().batch(ROWS)
+    lowered, _ = lowered_and_compiled(lambda: trainer.fit(data, steps=1))
+    asked = {(probe["split"], json.dumps(probe["remat"])) for probe in trainer.plan["probes"]}
+    assert (trainer.plan["split"], trainer.plan["remat"]) == (1, None), trainer.plan["probes"]
+    assert lowered <= len(asked) + 1, (lowered, asked)
 
 
 def test_a_plan_at_no_recomputation_stops_before_any_optional_frontier(monkeypatch):
@@ -2115,8 +2165,7 @@ def test_a_tight_start_settles_the_split_beside_one_that_missed_and_compiles_onc
     assert any(probe["split"] == between[0] and not probe["fits"] for probe in probes), probes
     asked = [probe["split"] for probe in probes]
     assert len(set(asked)) == len(asked) <= ROWS and compiles.count <= len(asked), (compiles.count, probes)
-    # A warm process: the cold one's record, none of its executables.
-    options.unhold()
+    # A warm process: the cold one's record, none of its executables, which no trainer holds past itself.
     with Compiles("step") as compiles:
         trained(warm, steps=0)
     assert compiles.count == 1 and warm.plan["split"] == between[1]
@@ -2171,7 +2220,6 @@ def test_a_run_of_one_remat_takes_no_plan_a_run_of_another_recorded(monkeypatch,
     tight = lm(split=1)
     trained(tight, steps=0)
     assert tight.plan["remat"] is not None, tight.plan
-    options.unhold()
     free(monkeypatch, LIMIT)
     none = lm(split=1, policy="none")
     trained(none, steps=0)
@@ -2191,7 +2239,6 @@ def test_a_checkpoints_shape_rung_its_run_s_remat_policy_refuses_is_not_climbed_
     trained(tight, steps=0)
     climbed = tight._compiler.checkpoint_rung()
     assert tight.plan["remat"] is not None and climbed["shapes"], tight.plan
-    options.unhold()
     free(monkeypatch, LIMIT)
     none = lm(split=1, policy="none")
     none._compiler.resume_rung({**none._compiler.rung(), "shapes": climbed["shapes"]})
@@ -2218,9 +2265,9 @@ def muon_lm(remat: str | None = None, **opts) -> Trainer:
     given."""
     model = CausalTransformer(vocab_size=64, emb_features=128, num_layers=4, num_heads=2, mlp_features=256,
                               max_seq_len=SEQ, **({} if remat is None else {"remat": REMAT_POLICIES[remat]}))
-    config = OptimConfig(optimizer=Muon(**opts), learning_rate=1e-2)
+    config = OptimConfig(optimizer=Muon(**opts), lr=1e-2)
     return one_device(Trainer(LMObjective(model, seq_len=SEQ), config, key=jax.random.key(0),
-                              fit=FitPolicy(split=1)))
+                              split=1))
 
 
 def fitted_once(trainer: Trainer) -> None:

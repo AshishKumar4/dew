@@ -215,7 +215,7 @@ def test_a_run_names_its_lettered_question_read_in_context_on_the_command_line(t
                                     *(LABELS.names or ()), "--head.labels.variants", *LABELS.variants,
                                     "--head.labels.cue", LABELS.cue, "--trainer.name", "letters",
                                     "--trainer.checkpoint-dir", str(tmp_path / "runs"),
-                                    "--trainer.horizon.steps",
+                                    "--trainer.steps",
                                     "1", "--trainer.checkpoint-every", "1", "--trainer.eval-every", "None",
                                     "--trainer.multi-host", "False", "--trainer.compilation-cache-dir",
                                     "None"],

@@ -56,7 +56,7 @@ from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.registry import ModelConfig
 from dew.sampling.text import Sampling
-from dew.training import Layout, MeshSpec, Trainer
+from dew.training import Layout, MeshSpec, Trainer, TrainerAdvanced
 
 FIXTURE = Path(__file__).parent / "fixtures" / "hf" / "gemma3-native-tiny"
 
@@ -148,7 +148,7 @@ def test_trainer_update_exports_and_reloads_the_complete_model(source, tmp_path)
         train=lambda partition: iter([{"text": training_inputs}]), val=None, records=rows, batch=rows
     )
     trainer = Trainer(objective, optax.sgd(LEARNING_RATE), key=jax.random.key(3),
-                      mesh=MeshSpec(), layout=Layout(min_shard=2**30))
+                      mesh=MeshSpec(), advanced=TrainerAdvanced(layout=Layout(min_shard=2**30)))
     state = trainer.fit(data, steps=1, log_every=1)
     output = loaded.model.apply(state.variables, inputs.tokens, **inputs.kwargs())
     valid = np.asarray(inputs.token_fields["attention_mask"])
@@ -360,7 +360,7 @@ def test_gemma4_standardization_buffers_are_frozen_by_real_adamw_training(tmp_pa
                             ema_decay=None, pad_id=0)
     data = Loader(train=lambda partition: iter([{"text": repeated}]), val=None, records=rows, batch=rows)
     trainer = Trainer(objective, optax.adamw(1e-3, weight_decay=0.1), key=jax.random.key(12),
-                      mesh=MeshSpec(), layout=Layout(min_shard=2**30))
+                      mesh=MeshSpec(), advanced=TrainerAdvanced(layout=Layout(min_shard=2**30)))
     state = trainer.fit(data, steps=1, log_every=1)
     loaded.save(tmp_path, variables=state.variables)
     before = load_file(str(directory / "model.safetensors"))

@@ -91,7 +91,7 @@ def linear_ce_registers(tiles: Tiles, dtype, *, has_bias: bool, target) -> int |
     if has_bias:
         vectors += family.column_registers(columns, jnp.float32)
     epilogue = epilogue_registers(family, tiles.share, columns, (jnp.float32,), vectors=vectors,
-                                  tile_count=0, has_hook=True)
+                                  has_hook=True)
     return plain + epilogue
 
 
@@ -435,7 +435,7 @@ class MosaicLinearCE(TilesTemplate):
         target = generation.gpu_target()
         bound = self.bind(x, weight, targets, bias, transpose_rhs=transpose_rhs, softcap=softcap,
                           round_logits=round_logits, interpret=interpret)
-        mp = config.cluster if interpret else (target.multiprocessors or 1) * config.programs
+        mp = config.cluster if interpret else unit_cost.wave(target.multiprocessors, config.programs)
         regs = self.registers(bound, config, target)
         shared = regs and self.staged_bytes(bound, config, target)
         out = linear_ce(x, weight, targets, tiles=config, transpose_rhs=transpose_rhs, bias=bias,
@@ -466,7 +466,7 @@ class LinearCECase:
         return self.plan()
 
 
-LINEAR_CE_OP: selection.Op[LinearCECase] = selection.Op(generation.Choice.GROUPED_MATMUL, (
+LINEAR_CE_OP: selection.Op[LinearCECase] = selection.Op(generation.Choice.LINEAR_CE, (
     selection.Kernel("mosaic", (
         selection.Requirement(
             "dtype", lambda case: case.dtype_ok,
@@ -487,9 +487,9 @@ LINEAR_CE_OP: selection.Op[LinearCECase] = selection.Op(generation.Choice.GROUPE
     )),
     selection.Kernel("xla", (), generic=True),
 ))
-"""The LM loss's fused linear cross-entropy selector, under the grouped products' choice: `grouped_matmul`
-named `mosaic` or `xla` names its kernel; any other name the choice takes (`cutlass`, `triton`, a grouped
-product's) is none of CE's, whose loss keeps its chunked XLA program (`mosaic_linear_ce`)."""
+"""The LM loss's fused linear cross-entropy selector, its own choice (`linear_ce`, row 12457): naming the
+grouped products' kernel (`grouped_matmul`) leaves the loss on its chunked XLA program, and only `linear_ce`
+named `mosaic` forces the fused kernel, whose refusals (precision, launch) are then the run's to see."""
 
 
 def mosaic_linear_ce(x: jax.Array, weight: jax.Array, targets: jax.Array,
@@ -502,9 +502,6 @@ def mosaic_linear_ce(x: jax.Array, weight: jax.Array, targets: jax.Array,
     to bf16 before its bias and softmax, as `chunked._tile_logits` does forward and backward."""
     from dew.nn.kernels import gemm
 
-    named = selection.forced(LINEAR_CE_OP.choice)
-    if named is not None and named not in {kernel.name for kernel in LINEAR_CE_OP.kernels}:
-        return None
     dtype_ok = supports_dtype(x.dtype) and jnp.dtype(x.dtype) == jnp.dtype(weight.dtype)
     exact = exact_products(precision, x.dtype) if dtype_ok else False
     # A bf16 head's algorithm (`chunked.BF16`), whose every logit rounds to bf16.

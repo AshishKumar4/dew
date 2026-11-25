@@ -37,7 +37,7 @@ from dew.interop import PretrainedBlockDecoder
 from dew.lora import LoRA
 from dew.objectives.diffusion.block import BlockDiffusionObjective
 from dew.optim import OptimConfig
-from dew.training import Checkpoints, Layout, MeshSpec, Trainer
+from dew.training import Checkpoints, Layout, MeshSpec, Trainer, TrainerAdvanced
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests/fixtures"
 SMOKE_SOURCE = FIXTURES / "hf/diffusion-gemma-workflow"
@@ -116,9 +116,9 @@ def main(config: Config) -> Path:
     data = chat_rows(config, objective, data_source(config.chat).shuffle(seed=0).repeat())
 
     checkpoints = Checkpoints(str(config.out / "checkpoints"), keep=1)
-    trainer = Trainer(objective, OptimConfig(learning_rate=config.learning_rate), key=jax.random.key(1),
+    trainer = Trainer(objective, OptimConfig(lr=config.learning_rate), key=jax.random.key(1),
                       mesh=MeshSpec(fsdp=jax.device_count()),
-                      layout=Layout(host=("variables",)), checkpoints=checkpoints)
+                      advanced=TrainerAdvanced(layout=Layout(host=("variables",))), checkpoints=checkpoints)
     state = trainer.fit(data, steps=config.steps, log_every=1,
                         checkpoint_every=config.steps)
     checkpoints.wait()

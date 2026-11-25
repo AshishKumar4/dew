@@ -36,7 +36,7 @@ from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective, Perplexity, Samples
 from dew.objectives.routing import ExpertBalance
 from dew.sampling import Sampling
-from dew.training import Checkpoints, Layout, MeshSpec, Trainer
+from dew.training import Checkpoints, Layout, MeshSpec, Trainer, TrainerAdvanced
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
@@ -436,7 +436,7 @@ def make_trainer(tmp_path=None, fsdp=1, learning_rate=3e-3, tracker=None, **obje
         optax.adam(learning_rate),
         key=jax.random.key(0),
         mesh=MeshSpec(fsdp=fsdp),
-        layout=Layout(min_shard=TINY),
+        advanced=TrainerAdvanced(layout=Layout(min_shard=TINY)),
         checkpoints=None if tmp_path is None else Checkpoints(str(tmp_path / "lm")),
         tracker=tracker,
     )

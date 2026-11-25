@@ -28,6 +28,7 @@ from jax.extend import core as jcore
 
 from dew import _cache
 from dew._cache import ALGEBRA
+from dew._facts import Held
 from dew.algebra import cost, extract, fusion, rules, terms
 from dew.algebra.extract import Linear
 from dew.nn.derivatives import Activation, Algebra, KernelGlue, Surrogate, marked_call_p
@@ -272,7 +273,7 @@ WINDOWS_HELD = 4096
 distinct windows of the steps it compiles (161 of the 2,799 a UNet's planner traced over its compiles, each
 33 ms on average to derive again; row 3764)."""
 
-_DERIVED: collections.OrderedDict[Hashable, Rewrite] = collections.OrderedDict()
+_DERIVED: collections.OrderedDict[Hashable, Held[Rewrite]] = collections.OrderedDict()
 """Each window's rewrite by what derived it (`_derived`, held through `_cache.holding`), the least recently
 read first."""
 
@@ -995,13 +996,13 @@ def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels
     rewrites = _REWRITTEN.setdefault(closed, collections.OrderedDict())
     # With kernels, the context the substitutions are decided in too (the derivation's: the mesh, the target
     # and the numerics; the kernel choices a call names; the tiles a tuning pins, row 12169: two legal pins of
-    # one launch's tile are two bodies; the launches the compiles refused), so a body rewritten under one
-    # choice is none of another's (spec alignment, 8994). Not fusion's whole choice context: its trace
-    # context holds every context variable set, a call's arrays among them, which this cache, held as long
-    # as the body is, would keep alive.
+    # one launch's tile are two bodies), so a body rewritten under one choice is none of another's (spec
+    # alignment, 8994); the launches its decisions read the refusals of are facts its making read
+    # (`_cache.holding`), not its key (row 12296). Not fusion's whole choice context: its trace context holds
+    # every context variable set, a call's arrays among them, which this cache, held as long as the body is,
+    # would keep alive.
     key = (_deriving(accurate, saturation), kernels,
-           (derive.context(), KERNEL_CHOICES.value, KERNEL_PINS.value, kernel_report.refusal_entries())
-           if kernels else None)
+           (derive.context(), KERNEL_CHOICES.value, KERNEL_PINS.value) if kernels else None)
     fresh: list[_Body] = []
 
     def rewrite() -> _Body:
@@ -1010,8 +1011,8 @@ def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels
         fresh.append(_Body(None if made is closed else made, record, tuple(regions.rewritten)))
         return fresh[0]
 
-    # Held with the facts its rewrite read while each answers alike (`generation.held_trace`).
-    body = generation.held_trace(rewrites, key, rewrite, fusion.DECISIONS_HELD)
+    # Held with the facts its rewrite read while each answers alike (`_cache.holding`).
+    body = _cache.holding(rewrites, key, rewrite, fusion.DECISIONS_HELD)
     reused = not fresh
     # Reported where it is written, as its rewrite reported it, and on a reuse its regions' reports too, so a
     # report around the program holds the body's however often it is written (`fusion._traced`'s, a

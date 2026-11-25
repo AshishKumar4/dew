@@ -285,10 +285,15 @@ def test_cutlass_eligibility_reads_the_dew_cutlass_build_installed_now(tmp_path,
     assert ampere["sm80"] == "sm80" and grouped_cutlass.cutlass_built_for("sm80") == "sm80"
 
 
-def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
+def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes, stacked=False, prologued=False):
     """Where the installed dew-cutlass holds this GPU's kernels, the projection's forward and both
     gradients through CUTLASS's launches, chosen by name and the forward's kernel pinned, are as exact as
-    XLA's ragged dot from float64, unrouted rows and empty groups included."""
+    XLA's ragged dot from float64, unrouted rows and empty groups included. `stacked`, its matrices the
+    second layer of a stack the call reads from its layer's first (a scanned stack's, `gemm._grouped`),
+    which a pinned CUTLASS launch takes as a slice of the stack (row 4074's review). `prologued`, its rows
+    scaled by a side of one value a row, `[rows, 1]` (an input-scaled MoE's routing weights), which a
+    CUTLASS launch forms in XLA before its call (`grouped_cutlass._formed`), its gradient compared too
+    (#3985's review)."""
     # The wheel is optional: a process without it, or whose wheel holds no kernel for its GPU, runs the
     # template's launches, which the suite checks apart.
     here = generation.gpu_target().generation
@@ -298,7 +303,13 @@ def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
 
     def draw(seed):
         x, w, dy, _ = operands(SIZES[sizes], jnp.bfloat16, seed)
-        return tuple(np.asarray(value, jnp.bfloat16) for value in (x, w, dy))
+        weights = np.random.default_rng(seed).uniform(0.5, 1.5, size=(x.shape[0], 1)).astype(np.float32)
+        return (*(np.asarray(value, jnp.bfloat16) for value in (x, w)), weights, np.asarray(dy, jnp.bfloat16))
+
+    def scaled(x, w, weights, dtype=jnp.bfloat16):
+        return gemm.gemm(x.astype(dtype), w.astype(dtype), jnp.asarray(group_sizes, jnp.int32),
+                         prologue=lambda rows, s: rows * s.astype(rows.dtype),
+                         prologue_operands=((weights.astype(dtype), ("rows", None)),), out_dtype=dtype)
 
     def projection(implementation, dtype=jnp.bfloat16):
         return lambda x, w: expert_projection(x, w, jnp.asarray(group_sizes, jnp.int32), dtype,
@@ -308,12 +319,31 @@ def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
     built = grouped_cutlass.cutlass_built_for(here)
     pinned = {grouped_cutlass.CutlassGmm: grouped_cutlass.cutlass_tile(built, jnp.bfloat16)}
 
-    def through_cutlass(x, w, dy):
-        with generation.chosen(grouped_matmul="cutlass"), tuning.pinned(pinned):
-            return with_gradients(projection("pallas"))(x, w, dy)
+    def layer_of_a_stack(x, stack):
+        return gemm.gemm(x, stack, jnp.asarray(group_sizes, jnp.int32), layer=jnp.int32(1),
+                         out_dtype=jnp.bfloat16)
 
-    assert_as_exact(jax.jit(through_cutlass), jax.jit(with_gradients(projection("xla"))), draw,
-                    f"cutlass {sizes}", seeds=SEEDS, truth_fn=with_gradients(projection("xla", jnp.float64)))
+    def through_cutlass(x, w, weights, dy):
+        with generation.chosen(grouped_matmul="cutlass"), tuning.pinned(pinned):
+            if prologued:
+                return with_gradients(scaled)(x, w, weights, dy)
+            if not stacked:
+                return with_gradients(projection("pallas"))(x, w, dy)
+            # The whole stack differentiated: its other layer's gradient zero, its layer's the projection's.
+            out, d_x, d_stack = with_gradients(layer_of_a_stack)(x, jnp.stack([jnp.ones_like(w), w]), dy)
+            return out, d_x, d_stack[1], d_stack[0]
+
+    def plain(x, w, weights, dy, dtype=jnp.bfloat16):
+        if prologued:
+            with generation.chosen(grouped_matmul="xla"):
+                return with_gradients(functools.partial(scaled, dtype=dtype))(x, w, weights, dy)
+        out, d_x, d_w = with_gradients(projection("xla", dtype))(x, w, dy)
+        return (out, d_x, d_w, *((jnp.zeros_like(d_w),) if stacked else ()))
+
+    assert_as_exact(jax.jit(through_cutlass), jax.jit(plain), draw,
+                    f"cutlass {sizes}{' stacked' if stacked else ''}{' prologued' if prologued else ''}",
+                    seeds=SEEDS,
+                    truth_fn=functools.partial(plain, dtype=jnp.float64))
 
 
 def the_template_sums_16_bit_products_into_fp32_as_exactly_as_xla(depth):
@@ -427,7 +457,8 @@ def test_a_dense_kernel_gradient_xla_takes_is_its_own_dot():
     """A dense kernel gradient the selector gives XLA (an A100's declared cell, `grouped_matmul.DECLARED`,
     which DENSE1 timed as XLA's dot) runs XLA's own dot over its rows, as a dense forward does (`xla_dot`): no
     ragged dot of one group, which took an A100's gate_up weight gradient 470 ms against the template's 11.4
-    (W121-a100)."""
+    (W121-a100), and its rows read as they are: a dense call routes every row, and a mask of them was a select
+    XLA kept, up to 23% of the A100's XLA kernel gradient (M-NG-45-a100's 4B key)."""
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     with generation.assumed("sm80"), generation.routes() as routes:
         graph = jax.make_jaxpr(lambda x, dy: gemm.gemm_t(x, dy, None, out_dtype=jnp.bfloat16))(
@@ -435,7 +466,11 @@ def test_a_dense_kernel_gradient_xla_takes_is_its_own_dot():
     assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"xla"}, routes
     names = {equation.primitive.name for equation in equations(graph, platform="cuda")}
     assert "dot_general" in names and "ragged_dot_general" not in names, names
+    masks = [equation for equation in equations(graph, platform="cuda")
+             if equation.primitive.name == "select_n" and equation.outvars[0].aval.shape == (512, 256)]
+    assert not masks, "a dense call's rows are selected whole before its product"
     assert graph.out_avals[0].shape == (1, 256, 384)
+
 
 @pytest.mark.parametrize("product", ["forward", "input gradient", "kernel gradient"])
 def test_an_amperes_gpt_oss_projection_routes_to_a_kernel_that_lowers(product):
@@ -2256,6 +2291,24 @@ def test_sm100_pair_tiles_refuse_depth_splits_in_legal_and_derivation():
         assert pricing.granular_tile(fam, t64, jnp.bfloat16, target=sm100, stream_blocks=scales)
         assert not pricing.granular_tile(
             fam, dataclasses.replace(t64, programs=3), jnp.bfloat16, target=sm100, stream_blocks=scales)
+
+
+def test_the_planner_prices_mma_syncs_row_bound_where_its_grouped_kernel_issues_it():
+    """The planner's register estimate of a one-consumer grouped mma.sync launch, whose products take a row
+    bound, is a dense one's at the same tile and rows and its issuer's registers for the bound
+    (`MmaIssuer.bound_registers`) besides: the dense call's products take none (row 12304)."""
+    gmm, tile = grouped_matmul.MosaicGmm(), tiling.Tiles(128, 128, 32, 3, 1, warpgroups=1, family="mma.sync")
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    calls = {grouped: gmm.bind(bf16((512, 256)), bf16((4 if grouped else 1, 256, 256)),
+                               jax.ShapeDtypeStruct((4 if grouped else 1,), jnp.int32), out_dtype="bfloat16",
+                               trans_rhs=False, interpret=False, dense=not grouped)
+             for grouped in (True, False)}
+    with generation.assumed("sm80"):
+        target = generation.gpu_target()
+        estimated = {grouped: gmm._registers(ba, tile, merging=False, target=target)
+                     for grouped, ba in calls.items()}
+        bound = pricing.family_of(tile, jnp.bfloat16, target).bound_registers
+    assert bound > 0 and estimated[True] - estimated[False] == bound, (bound, estimated)
 
 
 @INTERPRETS

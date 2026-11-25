@@ -35,6 +35,7 @@ from dew.interop.gateway import Gateway, calls
 from dew.interop.harbor import HARBOR_KEY, Harbor, outcome
 from dew.interop.harness import Command, HarnessSource
 from dew.objectives.rl.sessions import Call, Status, Task, Transcript
+from dew.training import TrainerAdvanced
 
 
 @pytest.mark.parametrize("slow_endpoint", ["/health/workers", "/v1/models"])
@@ -482,8 +483,9 @@ def test_a_trial_past_its_timeout_is_interrupted_and_the_scheduler_retries_it(tm
     data = scheduler.tasks(Loader(train=lambda partition: iter(
         lambda: {"task_id": np.arange(tasks, dtype=np.int32)}, None), val=None, records=None, batch=tasks))
     try:
-        trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.key(3), rollout=scheduler,
-                          layout=Layout(min_shard=1, tolerance=1.0))
+        trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.key(3),
+                          advanced=TrainerAdvanced(rollout=scheduler, layout=Layout(min_shard=1,
+                                                                                    tolerance=1.0)))
         state = trainer.fit(data, steps=1, log_every=1)
     finally:
         scheduler.close()

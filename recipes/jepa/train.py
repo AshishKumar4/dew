@@ -1,6 +1,6 @@
 """Train a JEPA encoder (I-JEPA over images, V-JEPA over video).
 
-    python recipes/jepa/train.py --trainer.horizon.epochs 300 --probe-classes 102
+    python recipes/jepa/train.py --trainer.epochs 300 --probe-classes 102
 
 Oxford flowers is the default, its validation split held to score the probes; its data is a chain
 (`dew.data.presets.images`, its size and batch in `default`). The encoder is the run's model, which

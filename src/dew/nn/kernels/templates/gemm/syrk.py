@@ -544,7 +544,7 @@ def syrk_registers(tiles: Tiles, dtype, out_dtype, *, transpose: bool, polynomia
     plain = resources.tile_registers(family, tiles.sharing, (tiles.block_m, columns, tiles.block_k), dtype,
                                      stored=(out_dtype,), rhs_transposed=not transpose)
     epilogue = epilogue_registers(family, tiles.share, columns, (out_dtype,),
-                                  tile_count=1 if polynomial else 0, has_hook=polynomial)
+                                  tiles=(jnp.float32,) if polynomial else (), has_hook=polynomial)
     return plain + epilogue
 
 
@@ -681,7 +681,7 @@ class MosaicSyrk(TilesTemplate):
         del return_residuals
         target = generation.gpu_target()
         bound = self.bind(x, poly_coeffs, transpose=transpose, out_dtype=out_dtype, interpret=interpret)
-        mp = config.cluster if interpret else (target.multiprocessors or 1) * config.programs
+        mp = config.cluster if interpret else unit_cost.wave(target.multiprocessors, config.programs)
         regs = self.registers(bound, config, target)
         shared = regs and self.staged_bytes(bound, config, target)
         out = syrk(x, tiles=config, transpose=transpose, out_dtype=out_dtype, multiprocessors=mp,

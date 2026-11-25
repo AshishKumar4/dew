@@ -31,7 +31,6 @@ from reference_error import as_given, assert_as_exact
 
 from dew.batch import TEXT_KEY
 from dew.nn.kernels import generation
-from dew.training import FitPolicy, UpdateBatch
 
 SEEDS = 8
 CHOICES = frozenset({"narrow_copies", "layer_scan"})
@@ -43,7 +42,7 @@ choices of where its weights are narrowed and how its stack compiles, which have
 ROWS, LENGTH, VOCAB = 16, 9, 64
 """A drawn batch's rows and their tokens, and the decoder's vocabulary: two microbatches' whole rows on each
 of the test mesh's eight row shards."""
-WINDOWS = {"one": {}, "accumulated": {"update": UpdateBatch(batches=2)}, "split": {"fit": FitPolicy(split=2)}}
+WINDOWS = {"one": {}, "accumulated": {"accumulation": 2}, "split": {"split": 2}}
 """The trainer's arguments of each value of the `window` axis: one microbatch an update, two accumulated, or
 one batch read in two parts."""
 STEPS = 2

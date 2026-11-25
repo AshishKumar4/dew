@@ -23,7 +23,6 @@ def searched_again(args) -> dict:
     from test_plan import BATCH, LIMIT, ROWS, lm, trained
 
     from dew.data.dataset import Loader
-    from dew.nn.kernels import options
     from dew.training import MeshSpec
 
     def stated(room: int) -> None:
@@ -36,7 +35,6 @@ def searched_again(args) -> dict:
     def need(trainer) -> int:
         stated(LIMIT)
         trained(trainer, steps=0)
-        options.unhold()
         return LIMIT - trainer.plan["probes"][0]["headroom"]
 
     whole, halves = need(pooled(lm(split=1))), need(pooled(lm(split=2)))

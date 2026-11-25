@@ -371,15 +371,16 @@ def _forward(hidden, table, targets, excluded, chunks: int, tile: tuple[int, int
             and not picked and softcap is None):
         from dew.nn.kernels.templates.gemm import linear_ce
 
-        if linear_ce.supports_dtype(operands):
-            ran = linear_ce.mosaic_linear_ce(
-                flat.astype(operands), table, labels, bias=columns.bias, precision=precision)
-            if ran is not None:
-                loss, peak, mass, rests = ran
-                log_z = peak + jnp.log(mass)
-                return ((loss.reshape(targets.shape), None, log_z.reshape(targets.shape)),
-                        (peak.reshape(targets.shape), mass.reshape(targets.shape),
-                         rests.reshape(targets.shape)))
+        # Its selector reads the operands' dtype: an unsupported one keeps this program, or refuses a
+        # `linear_ce='mosaic'` pin (`LINEAR_CE_OP`'s `dtype`).
+        ran = linear_ce.mosaic_linear_ce(
+            flat.astype(operands), table, labels, bias=columns.bias, precision=precision)
+        if ran is not None:
+            loss, peak, mass, rests = ran
+            log_z = peak + jnp.log(mass)
+            return ((loss.reshape(targets.shape), None, log_z.reshape(targets.shape)),
+                    (peak.reshape(targets.shape), mass.reshape(targets.shape),
+                     rests.reshape(targets.shape)))
 
     def tokens(start, outputs, size):
         states = jax.lax.dynamic_slice_in_dim(flat, start, size).astype(operands)

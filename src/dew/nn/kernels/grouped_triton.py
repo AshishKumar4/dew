@@ -24,7 +24,7 @@ class _Triton(_GroupedLaunch[Tile]):
     def eligible(self, ba, target) -> bool:
         # Every CUDA GPU the template sends the kernels to (`kernels.gemm`), and
         # a CPU, which interprets them, or traces the CUDA branch a GPU's lowering takes; never a TPU (a
-        # paired product the selector hands on apart: `_takes_pair`).
+        # paired product the selector hands on apart: `grouped_matmul._mosaic_takes`).
         return generation.capability(target.generation) is not None and self.derived(ba, target) is not None
 
     def derived(self, ba, target) -> Tile | None:
@@ -70,7 +70,10 @@ class _Triton(_GroupedLaunch[Tile]):
         held = accumulators * rows * columns // (32 * config.warps) < target.multiprocessor.thread_registers
         short = not ba.arguments.get('exact_sums') or self.contraction(config) <= EXACT_STEP
         shared = not (target.wgmma and rows // max(config.warps // 4, 1) % 64)
-        return held and short and shared and super().legal(ba, config, target)
+        # No output stored in a form of its own (`Hooks.out_forms`: the Mosaic template's staged stores
+        # alone), a pin's or a direct call's as the selection's.
+        formless = not ba.arguments['hooks'].out_forms
+        return formless and held and short and shared and super().legal(ba, config, target)
 
     @staticmethod
     @abc.abstractmethod

@@ -16,7 +16,9 @@ import json
 import logging
 import math
 import re
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+import threading
+from collections import OrderedDict
+from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -714,22 +716,150 @@ executable stating its memory and its live set and refusing to run; within it, i
 attempt of a plan is one compile, whole where the step can fit and stopped where it cannot."""
 
 
-def compile_limit(devices: Sequence, held: int, built: int) -> int | None:
+def compile_limit(devices: Sequence, held: int, built: int,
+                  resident: Mapping[Hashable, int] | None = None) -> int | None:
     """The bytes past which no step fits `devices` (`LIMIT_EXIT`), as XLA sums a step (its arguments, its
     outputs that write over none of them and its temporaries): the fit check's own arithmetic
-    (`step_headroom`) solved for that sum. The check places the step's temporaries and new outputs beside
-    its arguments, `built` of them not yet resident, and the `held` bytes the loop keeps beside it, `built`
-    among them, all in the least allocator limit among `devices`; so the most a fitting step's sum reaches
-    is that limit less what is held beside the step outside its arguments (`held - built`: the prefetched
-    batches), where the devices hold nothing but its arguments. A step XLA stops past it fits nowhere the
-    check admits; one within it is compiled whole and the fit check judges it. A 4.8B multimodal
-    transformer's step on a GH200 (row 5805): the
-    limit less all of `held`, the arguments it builds among it counted twice, stopped a step the check
-    admitted, which its first run then refused. None where a device states no limit."""
-    limits = [limit for device in devices if (limit := device_memory(device).get("bytes_limit")) is not None]
-    if not limits or len(limits) < len(devices):
+    (`_admitted`'s margin over all the bytes the allocator can give, `available`) solved for that sum,
+    from the allocators' reading as the compile starts (`step_room`). The check places the step's
+    temporaries and new outputs beside its arguments, `built` of them not yet resident, and the `held`
+    bytes the loop keeps beside it, `built` among them; so the most a fitting step's sum reaches is the
+    least device's room less what is held beside the step outside its arguments (`held - built`: the
+    prefetched batches). A step XLA stops past it fits nowhere the check admits; one within it is compiled
+    whole and the check judges it. A reading of what else the devices hold (a borderline step beside
+    another program's buffers, row 12465) stops a step the check would refuse at its buffer assignment,
+    before its whole codegen. A 4.8B multimodal transformer's step on a GH200 (row 5805): the limit less all
+    of `held`, the arguments it builds among it counted twice, stopped a step the check admitted, which its
+    first run then refused. None where a device states no limit."""
+    rooms = [step_room(device, (resident or {}).get(device, 0)) for device in devices]
+    if not rooms or None in rooms:
         return None
-    return min(limits) - (held - built)
+    return min(room for room in rooms if room is not None) - (held - built)
+
+
+def step_room(device, resident: int = 0) -> int | None:
+    """The most a step's sum (its arguments, its new outputs, its temporaries) can take of `device` before
+    what the loop holds beside it: the bytes its allocator can give (`available`, as the fit check reads
+    them, `_admitted`), and the step's own arguments' `resident` bytes among those in use given back, as
+    the step reuses them; None where the device states no limit. `resident` over what the allocator holds
+    in use counts as all of it: a reading never gives back more than it holds."""
+    memory = device_memory(device)
+    if "bytes_limit" not in memory:
+        return None
+    return available(memory, unclaimed(device, memory)) + min(resident, memory.get("bytes_in_use", 0))
+
+
+def resident_on(*trees: TrainState | Batch) -> dict[Hashable, int]:
+    """The bytes the arrays of `trees` hold on each device of this process now, by device: a placed state's
+    and batch's shards, read before they are abstracted to the shapes a step is lowered over
+    (`dew.training._candidates`); an abstract, host or donated leaf holds none."""
+    held: dict[Hashable, int] = {}
+    for leaf in jax.tree.leaves(trees):
+        if isinstance(leaf, jax.Array) and not leaf.is_deleted():
+            for shard in leaf.addressable_shards:
+                held[shard.device] = held.get(shard.device, 0) + shard.data.nbytes
+    return held
+
+
+def limit_exited(executable: jax.stages.Compiled | None) -> bool:
+    """Whether `executable` is a compile XLA stopped at its buffer assignment, past the limit it compiled
+    under (`LIMIT_EXIT`), as it states (`CompiledMemory.stopped`): its memory stated as a whole compile's,
+    it runs nowhere and is no plan's nor any held step's. A whole binary (one held, compiled ahead or read
+    from the persistent cache, which keys no limit) runs whatever limit a later compile asks, and is judged
+    by its memory alone."""
+    memory = None if executable is None else compiled_memory(executable)
+    return memory is not None and memory.stopped
+
+
+def unlimited(options: jax.stages.CompilerOptions | None) -> jax.stages.CompilerOptions | None:
+    """`options` without a compile's limit (`LIMIT_EXIT`): the program's own, as an executable's key and a
+    guided compile read them."""
+    return {name: value for name, value in (options or {}).items() if name != LIMIT_EXIT} or None
+
+
+HELD_CODE_BYTES = 1 << 30
+"""The device code a run holds for its refits at most (`CodeBounded`): 1 GiB, a few dozen of a large model's
+steps (a 4B decoder's is 20 to 40 MiB of code on an H100), which device code past the allocator's pool holds
+as long as anything references it (row 12131), so a run meeting shape after shape holds no step of a shape
+it left long ago beyond it (row 12385)."""
+
+
+def code_bytes(*executables: jax.stages.Compiled | None) -> int:
+    """The bytes of device code `executables` hold, each distinct one once (`CompiledMemory.generated_code`),
+    none for one whose backend states none: a step's, and its sampled step's where it summarizes what the
+    run inspects."""
+    distinct = {id(executable): executable for executable in executables if executable is not None}
+    stated = [compiled_memory(executable) for executable in distinct.values()]
+    return sum(memory.generated_code for memory in stated if memory is not None)
+
+
+class CodeBounded[K: Hashable, V]:
+    """What a run holds of its compiled steps by key, bounded by the device code they hold (`budget`, by
+    default `HELD_CODE_BYTES` as it reads at construction): the executables its searches hold for each
+    other and its refits (`dew.training.planning.FitSearch.executables`) and the step runners its fit holds
+    by batch signature (`dew.training._fit.FitRun.compiled`). Each read or held marks its key as the latest
+    used, and holding one past the budget lets the least recently used go first, never the one just held,
+    each one let go handed to `released` (its key) once the table's lock is let go. One lock orders every
+    read and write, so a later phase's search off the loop (`dew.training.ahead.LaterPlans`) and the loop
+    share one table. `made` counts the entries held; no key let go is kept."""
+
+    def __init__(self, budget: int | None = None, released: Callable[[K], None] | None = None):
+        self.budget = HELD_CODE_BYTES if budget is None else budget
+        self.bytes = self.made = 0
+        self._released = released
+        self._held: OrderedDict[K, tuple[V, int]] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, key: K) -> V | None:
+        """The value held at `key`, marked the latest used; None where none is held."""
+        with self._lock:
+            if key not in self._held:
+                return None
+            self._held.move_to_end(key)
+            return self._held[key][0]
+
+    def __getitem__(self, key: K) -> V:
+        value = self.get(key)
+        if value is None:
+            raise KeyError(key)
+        return value
+
+    def hold(self, key: K, value: V, charge: int) -> None:
+        """Hold `value` at `key` as the latest used, charged `charge` bytes of device code, letting the least
+        recently used go past the budget."""
+        with self._lock:
+            if key in self._held:
+                self.bytes -= self._held.pop(key)[1]
+            self._held[key], self.bytes = (value, charge), self.bytes + charge
+            self.made += 1
+            gone = []
+            while self.bytes > self.budget and (oldest := next(iter(self._held))) != key:
+                self.bytes -= self._held.pop(oldest)[1]
+                gone.append(oldest)
+        if self._released is not None:
+            for oldest in gone:
+                self._released(oldest)
+
+    def pop(self, key: K, default: V | None = None) -> V | None:
+        """Let `key`'s value go, returned, or `default` where none is held."""
+        with self._lock:
+            if key not in self._held:
+                return default
+            value, charge = self._held.pop(key)
+            self.bytes -= charge
+            return value
+
+    def __contains__(self, key: K) -> bool:
+        with self._lock:
+            return key in self._held
+
+    def __iter__(self) -> Iterator[K]:
+        with self._lock:
+            return iter(list(self._held))
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._held)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -742,6 +872,10 @@ class LiveSet:
 
     scaled: int
     unknown: int
+    made: tuple[tuple[int, str, tuple[str, ...]], ...] = ()
+    """Each buffer not an argument's: its bytes, the `op_name` of the op that made it and the
+    `checkpoint_name` names it carries, which a search reads what a remat rung or a release frees by
+    (`forward_bytes`)."""
 
     @staticmethod
     def of(executable: jax.stages.Compiled, rows: frozenset[tuple[int, int]]) -> LiveSet | None:
@@ -751,14 +885,24 @@ class LiveSet:
         if live is None:
             return None
         scaled = unknown = 0
+        made = []
         for buffer in live:
             if buffer.kind == "parameter":
                 continue
+            made.append((buffer.bytes, buffer.op_name, tuple(buffer.names)))
             if any(dimension is None for dimension in buffer.dims):
                 unknown += buffer.bytes
             elif any(dimension is not None and dimension & rows for dimension in buffer.dims):
                 scaled += buffer.bytes
-        return LiveSet(scaled, unknown)
+        return LiveSet(scaled, unknown, tuple(made))
+
+    def forward_bytes(self, dropped: Callable[[str, tuple[str, ...]], bool]) -> int:
+        """The bytes of the values its step's forward made (its op name's first scope under the step a
+        `jvp(`) that `dropped` (an op name and the names its value carries) says a rung would not keep: those
+        a backward reads, never the backward's own temporaries, which recomputation does not free."""
+        return sum(size for size, op_name, names in self.made
+                   if op_name.split("/")[1:2] and op_name.split("/")[1].startswith("jvp(")
+                   and dropped(op_name, names))
 
 
 def fits_everywhere(read: Callable[[], int | None]) -> tuple[bool, int | None]:
@@ -789,9 +933,13 @@ def step_fits(executable: jax.stages.Compiled | None, mesh: Mesh, held: int = 0,
 
 
 def step_fits_admitted(executable: jax.stages.Compiled | None, mesh: Mesh, held: int = 0, built: int = 0,
-                       *, placed: bool = True) -> tuple[bool, int | None, tuple[int, int, int] | None]:
+                       *, placed: bool = True, options: jax.stages.CompilerOptions | None = None
+                       ) -> tuple[bool, int | None, tuple[int, int, int] | None]:
     """`step_fits`, with the terms this process admitted the step by (`step_admitted`), read within the
-    one agreement, so a process whose read fails ends every process's check with its error."""
+    one agreement, so a process whose read fails ends every process's check with its error. A compile XLA
+    stopped past the limit it compiled under (`CompiledMemory.stopped`) runs nowhere: its headroom is at most
+    that limit, as `options` state it, less its sum, and never zero or more, whatever the allocator reads or
+    where it reads none, so no process admits it; a whole binary is judged by its memory alone."""
     local = [device for device in mesh.devices.flat if device.process_index == jax.process_index()]
     if executable is None:
         return fits_everywhere(lambda: -1)[0], None, None
@@ -799,6 +947,12 @@ def step_fits_admitted(executable: jax.stages.Compiled | None, mesh: Mesh, held:
 
     def read() -> int | None:
         headroom, terms[0] = step_admitted(executable, local, held, built, placed=placed)
+        memory, limit = compiled_memory(executable), (options or {}).get(LIMIT_EXIT)
+        if memory is not None and memory.stopped:
+            # Short by its sum past the limit it stopped at, where `options` state it; refused whatever the
+            # allocator reads, or where it reads none.
+            short = min((limit if isinstance(limit, int) else 0) - memory.summed, -1)
+            headroom = short if headroom is None else min(headroom, short)
         return headroom
 
     fit, headroom = fits_everywhere(read)

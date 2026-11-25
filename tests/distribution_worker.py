@@ -16,6 +16,7 @@ computed in.
 """
 
 import argparse
+import dataclasses
 import functools
 import hashlib
 import json
@@ -25,6 +26,7 @@ from pathlib import Path
 import numpy as np
 
 from dew.optim import Adam
+from dew.training import TrainerAdvanced
 
 VOCAB = 64
 SEQ_LEN = 16
@@ -212,15 +214,17 @@ def main() -> None:
             time.sleep(args.step_seconds)
             yield mine
 
-    def trainer_of(dtype, **options):
+    def trainer_of(dtype, advanced=None, **options):
         """The run's trainer over the model computing in `dtype` (None: the model's own, float32)."""
         model = models.build("causal_transformer", vocab_size=VOCAB, emb_features=32, num_layers=2,
                              num_heads=4, num_kv_heads=2, mlp_features=64, max_seq_len=SEQ_LEN, dtype=dtype)
         # The optimizer as a config, which keys the step (`Trainer._step_key`): each draw's fit reads the step
         # the first traced and lowered (`candidate_for`), where a built optimizer had each trace its own.
-        return Trainer(LMObjective(model, SEQ_LEN), OptimConfig(optimizer=Adam(), learning_rate=1e-2),
+        return Trainer(LMObjective(model, SEQ_LEN), OptimConfig(optimizer=Adam(), lr=1e-2),
                        key=jax.random.key(0),
-                       mesh=MeshSpec(**json.loads(args.mesh)), layout=Layout(min_shard=TINY_SHARD), **options)
+                       mesh=MeshSpec(**json.loads(args.mesh)),
+                       advanced=dataclasses.replace(advanced or TrainerAdvanced(),
+                                                    layout=Layout(min_shard=TINY_SHARD)), **options)
 
     losses = Losses()
     trainer = trainer_of("float64" if args.float64 else None, tracker=losses,

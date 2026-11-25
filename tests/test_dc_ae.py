@@ -35,7 +35,6 @@ from safetensors.numpy import load_file, save_file
 
 from dew.interop.autoencoders.dc_ae import load_dc_ae
 from dew.nn.autoencoders.dc_ae import DCAE
-from dew.training.budget import Horizon
 
 ROOT = Path(__file__).resolve().parents[1]
 FORWARD = 1e-5
@@ -193,7 +192,7 @@ def test_a_latent_run_trains_behind_the_dc_ae_and_leaves_it_frozen(source):
              "dtype": "float32"},
         ),
         data=images_of("tfds://oxford_flowers102", 16, batch=8),
-        trainer=TrainerConfig(horizon=Horizon(steps=2)),
+        trainer=TrainerConfig(steps=2),
         text=TextCondition(encoder=STUB_TEXT, checkpoint="stub-clip"),
         autoencoder=PretrainedAutoencoder(modelname=str(source / "conv"), dtype="float32"),
         objective=ObjectiveConfig("diffusion", {"solver": Euler(), "steps": 2}),

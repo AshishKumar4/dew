@@ -32,7 +32,7 @@ from dew.nn.backbones.decoder_stack import Loop
 from dew.nn.backbones.embeddings import prepared_embeddings
 from dew.nn.cross_pass import MERGE_PREFIX, MESSAGES_UNWRITTEN, CrossPass, CrossPassMerge
 from dew.optim import AdamW
-from dew.training import FitPolicy, UpdateBatch
+from dew.training import TrainerAdvanced
 
 VOCAB = 37
 
@@ -461,8 +461,9 @@ def test_a_loaded_decoder_gains_messages_that_leave_it_as_it_was_and_train_fresh
     layers = source.model.num_layers
     looped = source.with_model(source.model.with_passes(3, (1, layers), messages=MESSAGES), key=3)
     assert looped.fresh and all("cross_pass_" in path for path in looped.fresh)
-    fresh = ParamGroup("fresh", fresh=True, learning_rate_multiplier=10.0, spared=True)
-    claimed = OptimConfig(param_groups=(fresh, ParamGroup("base", ("*",), spared=True))).with_fresh(
+    fresh = ParamGroup("fresh", fresh=True, learning_rate_multiplier=10.0, decay_norms_and_biases=False)
+    claimed = OptimConfig(param_groups=(fresh, ParamGroup("base", ("*",),
+                                                          decay_norms_and_biases=False))).with_fresh(
         (), looped.fresh).param_groups
     assert set(claimed[0].patterns) == set(looped.fresh)
 
@@ -518,7 +519,8 @@ def test_a_loop_passing_messages_trains_sampled_counts_exits_and_narrow_copies()
                                         remat=True, messages=CrossPass(block_size=1, rank=4)))
     batch = token_batch()
     with chosen(narrow_copies="on"):
-        trainer = phased_trainer(model, 0, None, sampled_passes=TRAINED, update=UpdateBatch(batches=2))
+        trainer = phased_trainer(model, 0, None, advanced=TrainerAdvanced(sampled_passes=TRAINED),
+                                 accumulation=2)
         state, _, _ = trainer.place()
         step = trainer.compile(state, batch)
         interval = Interval(0.0, None, microbatches=0)
@@ -563,12 +565,14 @@ def test_a_loop_passing_messages_resumes_as_it_never_stopped(tmp_path):
     assert_same(parameters(whole), parameters(resumed), "the resumed run is not the run unstopped")
 
 
-def test_a_loop_passing_messages_bounds_its_step_memory_across_unrolled_passes():
+@pytest.mark.parametrize("watched", [False, True], ids=["unwatched", "watching its MLPs"])
+def test_a_loop_passing_messages_bounds_its_step_memory_across_unrolled_passes(watched):
     """A bf16 decoder passing messages over an exit-gated loop (`Loop.messages`, `exit_gate=True`), every
     block rematerialized (`full`), compiled ahead on two compile-only H100s splitting its rows: its live
     memory past its arguments grows from three passes to seven by no more than a message-free loop's growth
     plus the added passes' saved banks, rather than holding deferred fp32 merge intermediates or un-summed
-    bank cotangents live across its passes (row 11713)."""
+    bank cotangents live across its passes (row 11713); so too where the step watches its MLPs. Each a cell
+    of its own (row 11902: their six compiles in one cell took 360 s)."""
     from step_memory import MIXER_HEAD, MIXER_LENGTH, MIXER_ROWS, MIXER_WIDTH, STEP_LAYOUT
     from token_support import token_rows
 
@@ -590,10 +594,10 @@ def test_a_loop_passing_messages_bounds_its_step_memory_across_unrolled_passes()
             remat=REMAT_POLICIES["full"],
             loop=Loop(steps, step_norm=False, layers=(0, 4), exit_gate=True, messages=messages))
         trainer = Trainer(LMObjective(model, MIXER_LENGTH, exit_entropy=0.1),
-                          OptimConfig(optimizer=AdamW(), learning_rate=1e-3).build(None),
+                          OptimConfig(optimizer=AdamW(), lr=1e-3).build(None),
                           key=jax.random.key(0),
                           mesh=MeshSpec(fsdp=devices).build(compile_only_gpus("sm90", devices, 2**36)),
-                          layout=STEP_LAYOUT, fit=FitPolicy(split=1), inspection=inspection)
+                          advanced=TrainerAdvanced(layout=STEP_LAYOUT, inspection=inspection), split=1)
         ahead = compile_ahead(trainer, token_rows(512, MIXER_ROWS, MIXER_LENGTH + 1))
         if inspection is None:
             return ahead.live_bytes - ahead.argument_bytes
@@ -610,13 +614,13 @@ def test_a_loop_passing_messages_bounds_its_step_memory_across_unrolled_passes()
     added_banks = 4 * (MIXER_ROWS // devices) * MIXER_LENGTH * 2 * MIXER_WIDTH * 2
     # So too where the step watches its MLPs (row 11820: a watch of other modules leaves the merges to their
     # own rules), its sampled step the one compiled.
-    for inspection in (None, Inspection(modules=("*MLP",), every=1)):
-        msg_two, msg_six = live_past_args(3, spec, inspection), live_past_args(7, spec, inspection)
-        msg_growth = msg_six - msg_two
-        assert msg_growth <= plain_growth + 2 * added_banks, (
-            f"cross-pass live growth {msg_growth} B, watching {inspection}, exceeded plain growth "
-            f"{plain_growth} B + 2 * added_banks {2 * added_banks} B "
-            f"(msg: {msg_two} -> {msg_six}, plain: {plain_two} -> {plain_six})")
+    inspection = Inspection(modules=("*MLP",), every=1) if watched else None
+    msg_two, msg_six = live_past_args(3, spec, inspection), live_past_args(7, spec, inspection)
+    msg_growth = msg_six - msg_two
+    assert msg_growth <= plain_growth + 2 * added_banks, (
+        f"cross-pass live growth {msg_growth} B, watching {inspection}, exceeded plain growth "
+        f"{plain_growth} B + 2 * added_banks {2 * added_banks} B "
+        f"(msg: {msg_two} -> {msg_six}, plain: {plain_two} -> {plain_six})")
 
 
 @attending("reference")

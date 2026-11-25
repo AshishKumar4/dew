@@ -151,7 +151,7 @@ def booked(book: Book, fresh: Book, loss: jax.Array, finite: jax.Array, committe
            aux: Mapping[str, jax.Array]) -> tuple:
     """`bookkeep`'s arguments for a step's results, its counters `book` and those of a fresh interval
     `fresh`: a run's tokens are its committed updates' (`Committed.tokens`); a step of one's own
-    (`Trainer(step=)`), which reports no commit, is its own update."""
+    (`TrainerAdvanced(step=)`), which reports no commit, is its own update."""
     tokens = aux.get(TOKENS, fresh.tokens) if committed is None else committed.tokens
     return (book, loss, finite, committed, aux.get(TRAINING_FLOPS, fresh.training), tokens,
             aux.get(TOKENS, fresh.scored))
@@ -248,8 +248,9 @@ class Interval:
     order, by which a stop names one not finite (`checked_finite`)."""
     skips_nonfinite: bool = False
     """Whether the run drops a step that is not finite, stopping only after `BAD_LOSS_STEPS` in a row: one
-    that skips such steps (`Trainer(skip_nonfinite=True)`) or holds a dynamic loss scale, whose overflowing
-    steps back it off; one that takes such a step as formed stops at the first (`checked_finite`)."""
+    that skips such steps (`TrainerAdvanced(skip_nonfinite=True)`) or holds a dynamic loss scale, whose
+    overflowing steps back it off; one that takes such a step as formed stops at the first
+    (`checked_finite`)."""
     waited: float = 0.0
     compiling: float = 0.0
     compiles: int = 0
@@ -784,11 +785,11 @@ def checked_finite(streak: Streak, step: int, display: TrainingDisplay, *, skips
     """Stop the run (RuntimeError) at the first step since the last check, ending at `step`, whose loss or
     gradient norm was not finite, naming it and them, as torchtitan stops: its update was taken as it was
     formed, so the run cannot go on from it, and no save writes it (`refuse_non_finite`). A run that `skips`
-    such steps (`Trainer(skip_nonfinite=True)`) stops once BAD_LOSS_STEPS of them come in a row, and notes a
-    shorter run. A step whose committed state holds a value not finite (a scaled step accepted on its
-    finite gradient whose update overflowed it) stops the run whatever it skips, naming the first leaf by
-    its path (`kept`): no back-off of the scale brings it back, and a moment gone to infinity stops its
-    parameter with every later loss and gradient finite (row 6748). Checked at the logging cadence so the
+    such steps (`TrainerAdvanced(skip_nonfinite=True)`) stops once BAD_LOSS_STEPS of them come in a row, and
+    notes a shorter run. A step whose committed state holds a value not finite (a scaled step accepted on its
+    finite gradient whose update overflowed it) stops the run whatever it skips, naming the first leaf by its
+    path (`kept`): no back-off of the scale brings it back, and a moment gone to infinity stops its parameter
+    with every later loss and gradient finite (row 6748). Checked at the logging cadence so the
     step loop never synchronises; detection is late by at most that many steps, never missed."""
     worst, layer, first, stepped, broken, leaf, leaves = (int(value) for value in streak.counts)
     if broken:
@@ -802,7 +803,8 @@ def checked_finite(streak: Streak, step: int, display: TrainingDisplay, *, skips
               if layer >= 0 else "")
     if first and not skips:
         raise RuntimeError(f"step {step - stepped + first}'s loss is {loss} and its gradient norm {norm}, "
-                           f"not finite: stopping{walked} (Trainer(skip_nonfinite=True) skips such a step)")
+                           f"not finite: stopping{walked} (TrainerAdvanced(skip_nonfinite=True) skips such a "
+                           "step)")
     if worst >= BAD_LOSS_STEPS:
         raise RuntimeError(f"Loss has been non-finite for {worst} consecutive steps ending near step {step}, "
                            f"stopping{walked}")

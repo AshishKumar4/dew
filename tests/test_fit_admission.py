@@ -27,8 +27,7 @@ from dew.inputs import Field, InputSpec
 from dew.objectives.jepa.objective import JepaObjective
 from dew.objectives.supervised import Supervised
 from dew.registry import ModelConfig
-from dew.training import Trainer
-from dew.training.budget import Horizon
+from dew.training import Trainer, TrainerAdvanced
 from dew.training.observe import Observe
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -52,7 +51,7 @@ def test_a_jepa_predictor_takes_the_width_its_encoder_was_built_at(tmp_path):
                           defaults={"emb_features": 16})
     run = Built(model=encoder, predictor={"num_layers": 1, "predictor_features": 8}, num_target_blocks=2,
                 data=rows.read("memory").loading(Loading(workers=0)),
-                trainer=TrainerConfig(checkpoint_dir=str(tmp_path), horizon=Horizon(steps=1)))
+                trainer=TrainerConfig(checkpoint_dir=str(tmp_path), steps=1))
     objective = run.prepare().train("built")
     assert isinstance(objective, JepaObjective)
     assert (objective.encoder.emb_features, objective.predictor.emb_features) == (16, 16)
@@ -365,7 +364,8 @@ def test_a_step_built_with_its_evaluations_needs_their_room_beside_the_state_onc
             objective.ema = EMASpec(decay=optax.constant_schedule(0.9))
         trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0),
                           mesh=MeshSpec().build(gpus("sm90")),
-                          layout=Layout(min_shard=TINY_SHARD, host=("ema",) if average == "host" else ()))
+                          advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD,
+                                                                 host=("ema",) if average == "host" else ())))
         if scale is None:
             return trainer, compile_ahead(trainer, batch)
         scored = scale * BATCH

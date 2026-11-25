@@ -264,7 +264,7 @@ class Link:
 
     The trainer measures the interconnect when it places a step
     (`dew.training.distributed.link_bandwidth`), or takes it as stated
-    (`Trainer(links=...)`). `down_projection` and
+    (`TrainerAdvanced(links=...)`). `down_projection` and
     `split_positions` set `spread` when they decide to split a projection in
     the step over the axis.
     """
@@ -480,7 +480,7 @@ def split_positions(x: jax.Array, head_shape: tuple[int, int],
     this serves; its weight-gradient sum usually outweighs the saved
     projection, so a GPU's link rarely pays (an H100 would need 2.47 TB/s at
     SDXL's widths); a CPU's devices measure no link and keep the context whole
-    unless the run states one (`Trainer(links=...)`)."""
+    unless the run states one (`TrainerAdvanced(links=...)`)."""
     shards = sequence_shards()
     length = x.shape[1]
     if shards == 1 or length % shards == 0:

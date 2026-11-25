@@ -10,7 +10,7 @@ from dew.checkpoints import Checkpoints
 from dew.distributed.placement import MeshSpec
 from dew.objectives.base import taken_record
 from dew.state import apart, together
-from dew.training import FitPolicy, Trainer
+from dew.training import Trainer, TrainerAdvanced
 
 
 def sequence_learned_bits(state) -> list[np.ndarray]:
@@ -45,7 +45,7 @@ def assert_sequence_filled_invariants(objective, filled, corrupted, repeats, *, 
     all False) commits no update while advancing attempt clocks."""
     mesh = MeshSpec().build(jax.devices()[:1])
     for split in splits:
-        trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.key(3), fit=FitPolicy(split=split),
+        trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.key(3), split=split,
                           checkpoints=None, tracker=None)
         trainer.device_mesh = mesh
         initial = trainer.initial_state()
@@ -68,8 +68,8 @@ def recorded_step_tapes(objective, batch, *, key: int = 7, split: int,
     """Run one recorded step at `split` and return `(stepped_state, ordered_tapes_by_example)`."""
     rows = jax.tree.leaves(batch)[0].shape[0]
     mesh = MeshSpec().build(jax.devices()[:1])
-    trainer = Trainer(objective, optax.sgd(0.05), key=jax.random.key(key), fit=FitPolicy(split=split),
-                      record=True, checkpoints=None, tracker=None)
+    trainer = Trainer(objective, optax.sgd(0.05), key=jax.random.key(key), split=split,
+                      advanced=TrainerAdvanced(record=True), checkpoints=None, tracker=None)
     trainer.device_mesh = mesh
     state = trainer.initial_state()
     if variables is not None:
@@ -91,7 +91,7 @@ def assert_mid_window_resume(objective, batch_a, batch_b, directory: str, *, nud
     """Verify a `split=2` step saved after part 0 and restored resumes part 1 with the stored
     `batch_statistics`, matching an uninterrupted step bit for bit; also return the compiled plan."""
     mesh = MeshSpec().build(jax.devices()[:1])
-    trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.key(10), fit=FitPolicy(split=2),
+    trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.key(10), split=2,
                       checkpoints=None, tracker=None)
     trainer.device_mesh = mesh
     initial = trainer.initial_state()
@@ -131,10 +131,10 @@ def prepare_split_whole_steps(objective, rate: float, run_key: jax.Array, templa
     from dew.objectives.base import EXAMPLE_STREAM
 
     mesh = MeshSpec().build(jax.devices()[:1])
-    split_trainer = Trainer(objective, optax.sgd(rate), key=run_key, fit=FitPolicy(split=2), checkpoints=None,
+    split_trainer = Trainer(objective, optax.sgd(rate), key=run_key, split=2, checkpoints=None,
                             tracker=None)
     split_trainer.device_mesh = mesh
-    whole_trainer = Trainer(objective, optax.sgd(rate), key=run_key, fit=FitPolicy(split=1), checkpoints=None,
+    whole_trainer = Trainer(objective, optax.sgd(rate), key=run_key, split=1, checkpoints=None,
                             tracker=None)
     whole_trainer.device_mesh = mesh
     split_start, whole_start = split_trainer.initial_state(), whole_trainer.initial_state()

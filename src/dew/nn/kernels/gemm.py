@@ -56,24 +56,15 @@ from dew.nn.derivatives import (
     with_gradients_formed,
 )
 from dew.nn.kernels import generation, grouped_matmul, selection, xla_products
-from dew.nn.kernels.formats import (
-    Fp8Weights,
-    MxFp8,
-    NvFp4,
-    NvFp4Block,
-    TernaryWeights,
-    _e2m1_values,
-    fp8_factor,
-    fp8_scale_checked,
-)
+from dew.nn.kernels.formats import MxFp8, NvFp4, NvFp4Block, TernaryWeights, _e2m1_values
 from dew.nn.kernels.templates import axes as side_axes_of, product as product_of
 from dew.nn.kernels.templates.axes import GROUPS
-from dew.nn.kernels.templates.gemm import rows_permuted, scattered, tiling
+from dew.nn.kernels.templates.gemm import epilogue_vjp, rows_permuted, scattered, tiling
 from dew.nn.kernels.templates.gemm.factored import factored
 from dew.nn.kernels.templates.gemm.hooks import NO_HOOKS, Hooks
 from dew.nn.kernels.templates.product import SCALE_DEPTH, bf16_part_count, declared, formed, terms
 from dew.nn.precision import accumulated, asks_default_precision, at_least_fp32, exact_products, twice_scaled
-from dew.nn.programs import called, read_by
+from dew.nn.programs import read_by
 from dew.nn.sharding import automatic_axes, explicit_spec, varying_like
 
 if TYPE_CHECKING:
@@ -101,7 +92,7 @@ def unbuilt():
         _UNBUILT.reset(token)
 
 
-def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | Fp8Weights | TernaryWeights,
+def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights,
          group_sizes: jax.Array | None = None, *,
          transpose_rhs: bool = False, prologue=None, prologue_operands: tuple = (), epilogue=None,
          epilogue_operands: tuple = (), out_dtype, out_dtypes: tuple | None = None,
@@ -152,7 +143,7 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | Fp8Weights | TernaryWeights,
     gradient chained in one accumulator, each kernel gradient its own; no kernels joined, no output split (row
     6794, M-EM-59i); with no other part (`_gemm_refused`). `selected`, a caller's route of the forward
     (`side_by_side`'s), runs as found."""
-    if isinstance(rhs, (NvFp4, Fp8Weights, TernaryWeights)):
+    if isinstance(rhs, (NvFp4, TernaryWeights)):
         return _packed_gemm(lhs, rhs, group_sizes, epilogue=epilogue, epilogue_operands=epilogue_operands,
                             out_dtype=out_dtype, layer=layer, gather=gather, scatter=scatter,
                             interpret_on_cpu=interpret_on_cpu,
@@ -341,10 +332,10 @@ def _gemm_refused(group_sizes, *, prologue, gather, scatter, compute, applied, l
         raise ValueError(f"a formed operand is a prologue's, of the rows' shape {lhs.shape} and dtype "
                          f"{expected}, not {applied.shape} {applied.dtype}")
 
-def _packed_gemm(lhs, matrix: NvFp4 | Fp8Weights | TernaryWeights, group_sizes, *, epilogue,
+def _packed_gemm(lhs, matrix: NvFp4 | TernaryWeights, group_sizes, *, epilogue,
                  epilogue_operands: tuple, out_dtype, layer, gather, scatter, interpret_on_cpu: bool,
                  refused: tuple) -> jax.Array:
-    """`gemm` of a packed weight matrix (`NvFp4`, `Fp8Weights`, `TernaryWeights`: its fp32 sums times its
+    """`gemm` of a packed weight matrix (`NvFp4`, `TernaryWeights`: its fp32 sums times its
     scale, frozen), its epilogue on them in XLA before the one rounding, its rows scattered as any, one
     output; none of `refused` (a transposed matrix, a prologue, its side operands, a pair, a prologue's JVP,
     several outputs) given."""
@@ -357,11 +348,8 @@ def _packed_gemm(lhs, matrix: NvFp4 | Fp8Weights | TernaryWeights, group_sizes, 
     else:
         if gather is not None or layer is not None:
             raise ValueError(f"{type(matrix).__name__} product in gemm does not take gather or layer")
-        summed = (fp8_weight_product(lhs, matrix, group_sizes, out_dtype=jnp.float32,
-                                     interpret_on_cpu=interpret_on_cpu)
-                  if isinstance(matrix, Fp8Weights)
-                  else ternary_weight_product(lhs, matrix, group_sizes, quantize_activations=False,
-                                              out_dtype=jnp.float32, interpret_on_cpu=interpret_on_cpu))
+        summed = ternary_weight_product(lhs, matrix, group_sizes, quantize_activations=False,
+                                        out_dtype=jnp.float32, interpret_on_cpu=interpret_on_cpu)
     if epilogue is not None:
         arrays, axes = _split(epilogue_operands, 'epilogue', group_sizes)
         sizes = jnp.asarray([summed.shape[0]], jnp.int32) if group_sizes is None else group_sizes
@@ -465,7 +453,7 @@ class SyrkCase:
     precision_ok: bool = True
     measured: bool = False
 
-SYRK: selection.Op[SyrkCase] = selection.Op(generation.Choice.GROUPED_MATMUL, (
+SYRK: selection.Op[SyrkCase] = selection.Op(generation.Choice.SYRK, (
     selection.Kernel('mosaic', (
         selection.Requirement(
             'dtype', lambda case: case.dtype in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)),
@@ -489,8 +477,9 @@ SYRK: selection.Op[SyrkCase] = selection.Op(generation.Choice.GROUPED_MATMUL, (
             'launch', lambda case: case.call.eligible('mosaic'),
             "no legal square super-tile holds this symmetric product on the target", SYRK_ROW))),
     selection.Kernel('xla', (), generic=True)))
-"""Symmetric Gram/polynomial selector (`symmetric_gram`, `symmetric_polynomial`): Mosaic SYRK once measured
-or when chosen by name (`generation.chosen(grouped_matmul='mosaic')`), else XLA."""
+"""Symmetric Gram/polynomial selector (`symmetric_gram`, `symmetric_polynomial`), its own choice (`syrk`, row
+12485): Mosaic SYRK once measured or when chosen by name (`generation.chosen(syrk='mosaic')`), else XLA;
+naming the grouped products' kernel (`grouped_matmul`) leaves Muon's products alone."""
 
 
 def _syrk_portable(operand: jax.Array, poly: jax.Array | None, *, transpose: bool, conjugate: bool,
@@ -771,14 +760,11 @@ def gemm_quantized(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None
     raise ValueError(f"gemm_quantized supports E4M3, E5M2, E2M1, MxFp8, or NvFp4Block, got {minifloat}")
 
 
-FP8_WEIGHT_ROW = 'ledger 8548'
-
-
 @dataclasses.dataclass(eq=False)
 class WordPackedCase:
-    """Facts deciding whether a word-packed matrix's product (`fp8_weight_product`,
-    `ternary_weight_product`) runs the inline-decoding Mosaic GEMM mainloop: its tile (`plan`'s), planned
-    only once the requirements before `launch` take the call."""
+    """Facts deciding whether a word-packed matrix's product (`ternary_weight_product`) runs the
+    inline-decoding Mosaic GEMM mainloop: its tile (`plan`'s), planned only once the requirements before
+    `launch` take the call."""
     plan: Callable[[], tiling.Tiles | None]
     whole: bool
 
@@ -808,12 +794,10 @@ def word_packed_op(format_name: str, row: str, receipt: str) -> selection.Op[Wor
     ))
 
 
-FP8_WEIGHT = word_packed_op('FP8', FP8_WEIGHT_ROW, 'M-NG-6')
-
 def _packed_weight_rules(launch: grouped_matmul.MosaicWordPackedGmm, make_bank,
                          interpret: bool, *, dense: bool):
     """Build `(forward, backward, portable)` rules for an inline-decoding packed weight product
-    (`fp8_weight_product`, `ternary_weight_product`); callers wrap `linear_tangent` with `contracted(...)`."""
+    (`ternary_weight_product`); callers wrap `linear_tangent` with `contracted(...)`."""
     def decoded(packed_words: jax.Array) -> jax.Array:
         matrices = make_bank(packed_words).unscaled()
         return matrices[0] if dense else matrices
@@ -844,57 +828,8 @@ def _packed_weight_rules(launch: grouped_matmul.MosaicWordPackedGmm, make_bank,
         return tuple(leaves[index] for index in live)
     return forward, backward, portable
 
-def fp8_weight_product(lhs: jax.Array, weights: Fp8Weights, group_sizes: jax.Array | None = None, *,
-                       out_dtype=None, interpret_on_cpu: bool = False) -> jax.Array:
-    """`lhs @ weights` for free-layout FP8 `weights` (`formats.Fp8Weights`, rows 3733, 8548): decodes staged
-    uint32 E4M3/E5M2 words inline in the GEMM mainloop via `bits.E4M3_BFLOAT16_FORM`/`E5M2_BFLOAT16_FORM` on
-    sm80/sm90, multiplies in bfloat16 with fp32 accumulation, applies `weights.scale`, and rounds once."""
-    from jax.core import Tracer
-
-    if not isinstance(weights.form, Tracer):
-        weights.checked()
-    else:
-        fp8_scale_checked(jnp.shape(weights.scale), weights.shape)
-    rows = lhs.astype(jnp.bfloat16)
-    dense = group_sizes is None
-    if (dense and len(weights.shape) != 2) or (not dense and len(weights.shape) != 3):
-        raise ValueError(f"fp8_weight_product weight rank mismatch for dense={dense}: {weights.shape}")
-    words = jnp.asarray(weights.words if not dense else weights.words[None])
-    sizes = jnp.asarray([rows.shape[0]], jnp.int32) if dense else group_sizes.astype(jnp.int32)
-    launch = grouped_matmul.MosaicFp8PackedGmm()
-
-    def _spec(operand):
-        return jax.ShapeDtypeStruct(jnp.shape(operand), jnp.result_type(operand))
-
-    bank_spec = jax.tree.map(_spec, Fp8Weights(words, jnp.ones((), jnp.float32), weights.form,
-                                               fmt=weights.fmt))
-    with (xla_products.committed_context((rows, words, sizes)),
-          xla_products.interpreted_context(interpret_on_cpu)):
-        interpreting = xla_products.interpreted(interpret_on_cpu)
-        bound = launch.bind(_spec(rows), bank_spec, _spec(sizes), (), (), None, None, None,
-                            out_dtype='float32', trans_rhs=False, interpret=interpreting,
-                            dense=dense, exact_sums=False)
-        case = WordPackedCase(functools.partial(_planned, launch, bound), not automatic_axes())
-        if selection.select(FP8_WEIGHT, case).kernel == 'mosaic':
-            form_b, one = jnp.zeros((8,), jnp.uint8), jnp.ones((), jnp.float32)
-            rules = _packed_weight_rules(launch, lambda w: Fp8Weights(w, one, form_b, fmt=weights.fmt),
-                                         interpret_on_cpu, dense=dense)
-            product = contracted("test_an_fp8_weight_product_holds_every_order")(
-                generation.linear_tangent(*rules, live_cotangents=True, kind=KernelGlue()))
-            operands = (words, sizes)
-        else:
-            product = functools.partial(decoded_product, interpret_on_cpu=interpret_on_cpu)
-            operands = (weights.unscaled(jnp.bfloat16), group_sizes)
-        factor = fp8_factor(jnp.asarray(weights.scale, jnp.float32), sizes, rows.shape[0], weights.shape,
-                            dense)
-        scaled = factored(functools.partial(_interpreted, product, interpret_on_cpu), operands, factor, lhs,
-                          wide=interpreted_wide(interpret_on_cpu),
-                          wide_operands=(weights, group_sizes), prepared=decoded_operands)
-        return scaled.astype(lhs.dtype if out_dtype is None else out_dtype)
-
-
 def decoded_operands(matrix, group_sizes: jax.Array | None) -> tuple:
-    """A packed matrix (`Fp8Weights`, `TernaryWeights`, `NvFp4`) decoded to bf16, beside its group sizes:
+    """A packed matrix (`TernaryWeights`, `NvFp4`) decoded to bf16, beside its group sizes:
     `factored`'s `prepared`, decoded once a rescue, where it runs."""
     decoded = matrix.decoded() if isinstance(matrix, NvFp4) else matrix.unscaled(jnp.bfloat16)
     return decoded, group_sizes
@@ -1012,11 +947,14 @@ def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, 
 
     def portable(lhs, rhs, group_sizes, prologue_arrays, tables):
         lhs, rhs = gathered(lhs, rhs, tables)
-        routed = _routed(group_sizes, lhs.shape[0])
         if prologue is not None:
             sides = _rows(prologue_arrays, prologue_axes, group_sizes, lhs.shape[0])
             lhs = prologue(lhs, *sides).astype(lhs.dtype)
-        lhs = jnp.where(routed[:, None], lhs, 0)
+        if not dense:
+            # A row past the routed ones multiplies nothing. A dense call routes every row, and its mask
+            # was a select XLA kept, the rows read and written again before the product: 0.7 to 23% of an
+            # A100's dense kernel gradients (M-NG-45-a100's XLA arm, 0.068 ms of the 4B key's 0.293).
+            lhs = jnp.where(_routed(group_sizes, lhs.shape[0])[:, None], lhs, 0)
         wide = at_least_fp32(compute)  # an fp64 product's sum in fp64
         # Each group's rows contracted, XLA's ragged dot's own weight gradient (its transpose's form) on the
         # operands as they are: a pullback from a matrix made here would hand a vmapped call (a pipeline
@@ -1214,8 +1152,9 @@ def wide_transpose(cotangent: jax.Array, matrices: jax.Array, sizes: jax.Array |
                     interpret_on_cpu: bool) -> jax.Array:
     """The rows' transpose of a product with decoded bf16 `matrices` (grouped by `sizes`, or one), in fp32:
     the cotangent as its bf16 parts (`_bf16_parts`), each part's product exact and summed in fp32, the
-    parts' sums added in fp32, as the packed kernel's pullback forms it before its one rounding."""
-    parts = _bf16_parts(cotangent, bf16_part_count(jnp.float32))
+    parts' sums added in fp32, as the packed kernel's pullback forms it before its one rounding; a bf16
+    cotangent is its own one part."""
+    parts = _bf16_parts(cotangent, bf16_part_count(cotangent.dtype))
     return functools.reduce(jnp.add, [
         jnp.asarray(gemm(part, matrices, sizes, transpose_rhs=True, out_dtype=jnp.float32,
                          precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret_on_cpu))
@@ -1331,13 +1270,53 @@ def blockwise_fp8_product(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Ar
     blockwise FP8 product (1 x 128 activation tiles, 128 x 128 weight blocks; row 4518). Its forward alone:
     a recipe's gradients are their own FP8 products of requantized operands (row 2513). Its selector
     (`BLOCKWISE_FP8`) runs the template's exactly summed walk where named, else XLA's."""
+    (out,) = _blockwise_fp8(lhs, kernel, group_sizes, row_scales, column_scales,
+                            dtypes=(jnp.dtype(out_dtype),), interpret=interpret_on_cpu)
+    return out
+
+
+def blockwise_fp8_finished(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Array, row_scales: jax.Array,
+                           column_scales: jax.Array, *, epilogue: Callable, out_dtypes: tuple,
+                           epilogue_operands: tuple = (), out_forms: tuple | None = None, dense: bool = False,
+                           interpret_on_cpu: bool = False) -> tuple[jax.Array, ...]:
+    """`blockwise_fp8_product`'s fp32 sums through `epilogue`, its several outputs in `out_dtypes` (the
+    template's epilogue, XLA's the same function of its sums: a next product's rows quantized from them,
+    `quantized.blockwise_fp8_epilogue`, row 8547), each stored as `out_forms` states (`Hooks.out_forms`: an
+    output broadcast across each block's columns stored one value a row a block, transposed, as a next
+    blockwise product reads its rows' scales). `dense`: its one group covers every row (a padded chain's,
+    `projections.blockwise_chain`), which a transposed form's stores need (`quantized.forms_refusal`).
+    `epilogue_operands`, its side tiles (`[rows, columns]` each, the call's output's), the epilogue taking
+    them after the sum (a gated MLP's rounded gate product, its up product's SwiGLU taken here, row 12689)."""
+    return _blockwise_fp8(lhs, kernel, group_sizes, row_scales, column_scales,
+                          dtypes=tuple(jnp.dtype(dtype) for dtype in out_dtypes), epilogue=epilogue,
+                          sides=tuple(epilogue_operands), out_forms=out_forms, dense=dense,
+                          interpret=interpret_on_cpu)
+
+
+def _blockwise_fp8(lhs, kernel, group_sizes, row_scales, column_scales, *, dtypes: tuple,
+                   epilogue: Callable | None = None, sides: tuple = (), out_forms: tuple | None = None,
+                   dense: bool = False, interpret: bool) -> tuple[jax.Array, ...]:
+    """The blockwise FP8 product's outputs (`blockwise_fp8_product`'s, `blockwise_fp8_finished`'s), each a
+    tuple's: the template's step-scaled walk where its selector names it, else XLA's."""
+    from .templates.gemm import quantized
+
     sizes_spec = jax.ShapeDtypeStruct(group_sizes.shape, jnp.int32)
     launch = grouped_matmul.MosaicStepScaledGmm()
     per = kernel.shape[1] // column_scales.shape[-1]
+    # Its outputs' forms, refused as every route's where no several outputs state them (`forms_of`).
+    out_forms = quantized.forms_of(out_forms, len(dtypes)) or None
+    several = epilogue is not None
+    hooks = NO_HOOKS if not several else Hooks(
+        epilogue=epilogue, epilogue_axes=(LAUNCH_AXES['epilogue'],) * len(sides),
+        out_dtypes=tuple(dtype.name for dtype in dtypes), out_forms=out_forms)
+    stored = dtypes[0].name if several else 'float32'
+    if dense and group_sizes.shape != (1,):
+        raise ValueError(f"a dense blockwise product is one group's, not {group_sizes.shape[0]}")
     # A column scale covers each column, or whole weight blocks of them, which a column tile falls within.
-    tile = (_planned(launch, launch.bind(*_abstract(lhs, kernel), sizes_spec, out_dtype='float32',
-                                         trans_rhs=True, interpret=interpret_on_cpu, exact_sums=True,
-                                         scales=_abstract(row_scales, column_scales)))
+    tile = (_planned(launch, launch.bind(*_abstract(lhs, kernel), sizes_spec, out_dtype=stored,
+                                         trans_rhs=True, interpret=interpret, exact_sums=True,
+                                         scales=_abstract(row_scales, column_scales), hooks=hooks,
+                                         dense=dense, epilogue_operands=_abstract(*sides)))
             if per == 1 or per % SCALE_DEPTH == 0 else None)
 
     def portable(lhs, kernel, sizes, row_scales, column_scales):
@@ -1346,17 +1325,29 @@ def blockwise_fp8_product(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Ar
         return xla_products.step_scaled(lhs.astype(jnp.bfloat16), matrices, sizes, row_scales,
                                         column_scales, precision=jax.lax.Precision.DEFAULT)
 
-    def mosaic(lhs, kernel, sizes, row_scales, column_scales, *, interpret):
-        return launch(lhs, kernel, sizes.astype(jnp.int32), out_dtype='float32', trans_rhs=True,
-                      interpret=interpret, exact_sums=True, scales=(row_scales, column_scales))
+
+    def finished(summed, *sides):
+        # XLA's sums through the same epilogue, each output in its dtype and form (`quantized.stored`).
+        outputs = summed if epilogue is None else epilogue(summed, *sides)
+        outputs = outputs if isinstance(outputs, tuple) else (outputs,)
+        forms = out_forms or (None,) * len(dtypes)
+        return tuple(quantized.stored(value.astype(dtype), form)
+                     for value, dtype, form in zip(outputs, dtypes, forms, strict=True))
+
+    def mosaic(lhs, kernel, sizes, row_scales, column_scales, *sides, interpret):
+        out = launch(lhs, kernel, sizes.astype(jnp.int32), out_dtype=stored, trans_rhs=True,
+                     interpret=interpret, exact_sums=True, scales=(row_scales, column_scales), hooks=hooks,
+                     dense=dense, epilogue_operands=sides)
+        return tuple(out) if several else finished(out)
+
+    def portable_finished(lhs, kernel, sizes, row_scales, column_scales, *sides):
+        return finished(portable(lhs, kernel, sizes, row_scales, column_scales), *sides)
 
     if selection.select(BLOCKWISE_FP8, ScaledCase(tile)).kernel == 'mosaic':
         assert tile is not None, "the selector names the template where it plans a tile"
-        summed = xla_products.dispatched(mosaic, portable, interpret_on_cpu, lhs, kernel, group_sizes,
-                                         row_scales, column_scales)
-    else:
-        summed = portable(lhs, kernel, group_sizes, row_scales, column_scales)
-    return summed.astype(out_dtype)
+        return xla_products.dispatched(mosaic, portable_finished, interpret, lhs, kernel, group_sizes,
+                                       row_scales, column_scales, *sides)
+    return portable_finished(lhs, kernel, group_sizes, row_scales, column_scales, *sides)
 
 
 def blockwise_fp8_kernel_gradient(lhs_t: jax.Array, rhs_t: jax.Array, group_blocks: jax.Array,
@@ -1695,13 +1686,13 @@ def _cotangents(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, pr
                 plain: dict, saved: dict | None = None, scatter=None) -> tuple[tuple, tuple, tuple]:
     """Each accumulator's cotangent (one a matrix of `matrices`: the product's, and its `paired`'s), the
     epilogue side operands' and whether each accumulator's passes an output's through in `compute`'s dtype
-    (`_passes_cotangent`): the outputs' own without an epilogue (None for an output no reverse pass
-    reaches), else through the VJP of the epilogue's outputs that have a cotangent, at the accumulators
-    recomputed at their own width, where that VJP reads them (from `lhs`'s rows at `plain`'s `gather`, a
-    gathered product's), or read from the forward's named output `saved` holds where the epilogue reads its
-    accumulator through that output's rounding alone (`_rounded_accumulator`). An output no reverse pass
-    reaches is no part of the VJP, so an output formed for a product of its own (`gemm`'s `applied`)
-    recomputes nothing."""
+    (`epilogue_vjp.passes_cotangent`): the outputs' own without an epilogue (None for an output no reverse
+    pass reaches), else through the VJP of the epilogue's outputs that have a cotangent, at the
+    accumulators recomputed at their own width, where that VJP reads them (from `lhs`'s rows at `plain`'s
+    `gather`, a gathered product's), or read from the forward's named output `saved` holds where the
+    epilogue reads its accumulator through that output's rounding alone (`_rounded_accumulators`, a pair's
+    alike). An output no reverse pass reaches is no part of the VJP, so an output formed for a product of
+    its own (`gemm`'s `applied`) recomputes nothing."""
     count = len(matrices)
     if epilogue is None:
         d_accs = tuple(cotangents[:count])
@@ -1735,11 +1726,11 @@ def _cotangents(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, pr
     acc = jax.eval_shape(zero)
     # The epilogue's VJP, traced once, its accumulators' reads and pass-through cotangents read from it.
     vjp = _epilogue_vjp(kept, count, acc, sides)
-    rounded = _rounded_accumulator(saved or {}, count, epilogue, acc, sides)
+    rounded = _rounded_accumulators(saved or {}, count, epilogue, acc, sides, dtypes=dtypes, vjp=vjp)
     if rounded is not None and _reads_accumulators(vjp, count):
-        # The epilogue reads its accumulator through its rounding alone, which the forward kept under its
-        # name: its VJP at that rounding widened is its VJP at the accumulator (`_rounded_accumulator`).
-        accs = (rounded.astype(acc.dtype),)
+        # The epilogue reads its accumulators through their roundings alone, which the forward kept under
+        # their names: its VJP at them widened is its VJP at the accumulators (`_rounded_accumulators`).
+        accs = tuple(each.astype(acc.dtype) for each in rounded)
     elif _reads_accumulators(vjp, count):
         accs = _as_tuple(_gemm(lhs, matrices[0], group_sizes, prologue, prologue_arrays, prologue_axes, None,
                                (), (), (acc.dtype,) * count, several=count > 1,
@@ -1759,7 +1750,7 @@ def _cotangents(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, pr
     outs, pull = jax.vjp(epilogued, *accs, *epilogue_arrays)
     pulled = pull(tuple(cotangents[at].astype(out.dtype) for at, out in zip(reached, outs, strict=True)))
     reached_dtypes = tuple(dtypes[at] for at in reached)
-    narrow = tuple(_passes_cotangent(vjp, at, reached_dtypes, compute) for at in range(count))
+    narrow = tuple(epilogue_vjp.passes_cotangent(vjp, at, reached_dtypes, compute) for at in range(count))
     return tuple(pulled[:count]), tuple(pulled[count:]), narrow
 
 
@@ -2313,35 +2304,45 @@ def _as_cotangent(cotangent, operand):
     return cotangent if cotangent.dtype == jax.dtypes.float0 else cotangent.astype(operand.dtype)
 
 
-def _rounded_accumulator(kept: dict, count: int, epilogue, acc, sides) -> jax.Array | None:
-    """The forward's kept output (`gemm`'s `named`, by its place among the outputs) that is the epilogue's
-    one accumulator rounded to its dtype, where the epilogue reads that accumulator through the rounding
-    alone (one conversion, which is that output): every value the epilogue computes reads the rounding,
-    so its VJP at the rounding widened back is its VJP at the accumulator, exactly (a rounding to a narrower
-    dtype widened and rounded again is itself). None elsewhere (no output kept, a paired product's two
-    accumulators, an epilogue reading the accumulator otherwise)."""
-    if not kept or count != 1:
+def _rounded_accumulators(kept: dict, count: int, epilogue, acc, sides, *, dtypes: tuple,
+                          vjp: tuple) -> tuple | None:
+    """The forward's kept outputs (`gemm`'s `named`, by their places among the outputs) that are the
+    epilogue's `count` accumulators each as its derivative reads it, None where any is not (an accumulator's
+    output not kept, read otherwise), the derivative then recomputing them. An output is an accumulator's
+    where the epilogue returns it at its own width (an fp32 or fp64 call's, its value the accumulator's) or
+    reads it through one rounding alone, which the output is, stored in a dtype that holds the rounding's
+    values exactly (`dtypes`: the call casts its outputs, a bf16 rounding stored as fp16 not the rounding's
+    value), and the epilogue's derivative (`vjp`, `_epilogue_vjp`'s program) reads the accumulator through
+    that rounding alone too (a custom JVP whose tangent reads the accumulator at its width reads more than
+    the rounding): its VJP at the rounding widened back is then its VJP at the accumulator, exactly. A
+    paired product's two alike (a MoE's gate and up, their activation in the epilogue, each kept: its
+    backward reads them, the pair not recomputed, row 1376)."""
+    if not kept:
         return None
-    jaxpr = jax.make_jaxpr(lambda acc, *sides: _tupled(epilogue, acc, *sides))(acc, *sides).jaxpr
-    rounded = _rounding(jaxpr, jaxpr.invars[0])
-    return next((value for at, value in kept.items() if jaxpr.outvars[at] is rounded), None)
+    jaxpr = jax.make_jaxpr(lambda *values: _tupled(epilogue, *values))(*(acc,) * count, *sides).jaxpr
+    differentiated = vjp[0].jaxpr
 
+    def stored(value, width):
+        # The kept output that is `value`, stored exactly (`epilogue_vjp.lossless_cast`), at any of its
+        # places.
+        return next((kept[out] for out, var in enumerate(jaxpr.outvars) if var is value and out in kept
+                     and epilogue_vjp.lossless_cast(width, dtypes[out])), None)
 
-def _rounding(jaxpr, var):
-    """The value of `jaxpr` that is `var` rounded, where `var`'s one reader is that conversion, or a call
-    whose program's is (`dew.nn.programs.called`: an epilogue its fused consumer's derivative declares,
-    `fused_gemm._declared`), its output then the call's; None otherwise."""
-    reading = [eqn for eqn in jaxpr.eqns if var in eqn.invars]
-    if len(reading) != 1:
-        return None
-    (eqn,) = reading
-    if eqn.primitive is jax.lax.convert_element_type_p:
-        return eqn.outvars[0]
-    body = called(eqn)
-    if body is None or eqn.invars.count(var) != 1:
-        return None
-    inner = _rounding(body, body.invars[eqn.invars.index(var)])
-    return eqn.outvars[body.outvars.index(inner)] if inner in body.outvars else None
+    def read(at: int):
+        var = jaxpr.invars[at]
+        if var in jaxpr.outvars:
+            # Returned at its own width: the output is the accumulator, whatever its derivative reads.
+            return stored(var, acc.dtype)
+        rounded = epilogue_vjp.rounding(jaxpr, var)
+        if rounded is None or rounded not in jaxpr.outvars:
+            return None
+        width = rounded.aval.dtype
+        if not epilogue_vjp.read_rounded_alone(differentiated, differentiated.invars[at], width):
+            return None
+        return stored(rounded, width)
+
+    found = [read(at) for at in range(count)]
+    return None if any(value is None for value in found) else tuple(found)
 
 
 def _reads_accumulators(vjp: tuple, count: int) -> bool:
@@ -2349,20 +2350,6 @@ def _reads_accumulators(vjp: tuple, count: int) -> bool:
     does not, a product with a side operand's does. Read from the VJP's own program, shapes alone."""
     closed, _ = vjp
     return bool(set(closed.jaxpr.invars[:count]) & read_by(closed.jaxpr, closed.jaxpr.outvars))
-
-
-def _passes_cotangent(vjp: tuple, at: int, dtypes: tuple, narrow) -> bool:
-    """Whether the epilogue's VJP (`_epilogue_vjp`'s program) hands its accumulator `at` one output's
-    cotangent unchanged (a bias's, a cast's) whose dtype `narrow` holds exactly: read from the VJP's own
-    program, its result traced back through conversions alone."""
-    closed, cotangents = vjp
-    var = closed.jaxpr.outvars[at]
-    producers = {out: equation for equation in closed.jaxpr.eqns for out in equation.outvars}
-    while var in producers and producers[var].primitive is jax.lax.convert_element_type_p:
-        var = producers[var].invars[0]
-    if var not in cotangents:
-        return False
-    return jnp.promote_types(dtypes[cotangents.index(var)], narrow) == jnp.dtype(narrow)
 
 
 def _epilogue_vjp(epilogue, count: int, acc: jax.ShapeDtypeStruct, sides: tuple):

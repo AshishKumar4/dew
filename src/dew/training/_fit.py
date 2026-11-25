@@ -30,7 +30,7 @@ from flax.training.early_stopping import EarlyStopping
 from jax.sharding import Mesh
 
 from dew import _position
-from dew._coordination import agreed, agreed_next, agreed_reads, agreed_same, pool_size
+from dew._coordination import agreed, agreed_next, agreed_reads, agreed_same, from_every_process, pool_size
 from dew._records import JSON, integers
 from dew.batch import (
     CLOSES_WINDOW,
@@ -75,6 +75,7 @@ from dew.training.cooldown import Branch, Cooldowns
 from dew.training.diloco import regrouped
 from dew.training.evaluation import Declared, EvalSuite, Evaluation, Split, SplitLoss, episodic
 from dew.training.interval import Interval, LogWriter, Taken, TokenClock
+from dew.training.memory import CodeBounded, code_bytes
 from dew.training.model_flops import TOKENS, TRAINING_FLOPS
 from dew.training.observe import Observe
 from dew.training.profiling import ProfileWindow, start_capture, stop_capture
@@ -86,6 +87,7 @@ if TYPE_CHECKING:
     from dew.objectives.base import Objective
     from dew.training._candidates import RunShape
     from dew.training.distributed import StartBuild
+    from dew.training.planning import Planned
     from dew.training.startup import Startup
 
 _log = logging.getLogger(__name__)
@@ -493,10 +495,15 @@ class FitRun:
     reads: dict[Signature, tuple[bool, ...]] = dataclasses.field(default_factory=dict)
     """Which leaves of a batch of each signature its compiled step reads
     (`step_reads`), which the prefetcher alone places."""
-    compiled: dict[Hashable, tuple] = dataclasses.field(default_factory=dict)
+    compiled: CodeBounded[Hashable, tuple] = dataclasses.field(default_factory=CodeBounded[Hashable, tuple])
     """The step compiled for each batch signature the run met, at each pass count its phases run
     (`Trainer._compile_key`), with its measured FLOPs (`Trainer._compiled_for`), which its cooldown branches
-    step too."""
+    step too: bounded by their device code as the compiler's executables are (`CodeBounded`), each charged
+    the most any process's code for it holds, so every process lets the same steps go and compiles a shape
+    it met again together; the step being run is held by its caller."""
+    passes: set[int | None] = dataclasses.field(default_factory=set)
+    """The pass count of each step it compiled (`PhasePasses.current`, None for the objective's own), which a
+    step of a phase no step ran begins afresh by (`PhasePasses.begins`), whatever steps `compiled` let go."""
     cooling: Mapping[str, object] | None = None
     """The cooldown branch the run is to run at its current step before it reads on, resolved
     (`dew.training.cooldown.Pending`): one its checkpoints kept unfinished, as the pool agreed it, or
@@ -591,6 +598,23 @@ class FitRun:
         if self.ran_out:
             batch = drained(batch, interval.consumed, examples)
         return closes_window(batch, examples, last=last), position
+
+    def restarting(self, differs: tuple[str, ...]) -> None:
+        """Note a resume whose data starts again, its saved plan differing in `differs` (`DataRestarted`)."""
+        if not differs:
+            return
+        self.restarted = differs
+        _log.warning("the saved data position's plan differs from this run's in %s, so its data starts "
+                     "again from the beginning of its order while its state resumes (data_resume='relaxed'; "
+                     "'exact' refuses it)", ", ".join(differs))
+
+    def hold_step(self, signature: Hashable, step: tuple, executable: jax.stages.Compiled | None,
+                  planned: Planned | None, passes: int | None) -> None:
+        """Hold `step`, compiled for `signature` at `passes` (`PhasePasses.current`), charged the device code
+        of its `executable` and its `planned` sampled step's as every process charges it (`compiled`)."""
+        sampled = None if planned is None or planned.sampled is None else planned.sampled.executable
+        self.compiled.hold(signature, step, max(from_every_process(code_bytes(executable, sampled))))
+        self.passes.add(passes)
 
     def held(self) -> contextlib.AbstractContextManager[None]:
         """The training stream's placements held for a block of device work beside the steps

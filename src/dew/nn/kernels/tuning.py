@@ -15,7 +15,7 @@ A launch's space, heuristic and measurement are read at its key's shapes
 time a launch takes a config pinned for its kernel (`pinned`), else its own
 shapes' heuristic, its derived config (bible §6: the tuner is off by default,
 and users tune nothing). Only within an opt-in tuning run (`tune`, which
-`Trainer(tune_kernels=True)` and tools/kernel_picks.py call) does it take the
+`TrainerAdvanced(tune_kernels=True)` and tools/kernel_picks.py call) does it take the
 pick stored for its own key on its target GPU model (Dew's picks,
 `KernelOp.get_autotuning_cache`) where the space holds it; a pick serves no
 other key. Dew resolves the config itself, so no tokamax policy measures or
@@ -75,6 +75,7 @@ from jax.extend import core as jax_core
 from jax.extend.backend import get_default_device
 
 from dew import _cache, _coordination, _records
+from dew._facts import Held
 from dew._files import write_atomically
 from dew._records import JSON
 from dew.algebra.terms import opaque, parameter_key
@@ -1007,7 +1008,7 @@ inside another (`dew.nn.kernels.options._Structure`)."""
 @dataclasses.dataclass(eq=False)
 class _Held:
     """A launch's held trace (`lowered_once`): its program, its outputs' structure and the kernels it named
-    (`report.naming`); the facts it read are its holder's (`generation.held_trace`)."""
+    (`report.naming`); the facts it read are its holder's (`_cache.holding`)."""
 
     jaxpr: jax_core.Jaxpr
     outputs: _Structure
@@ -1050,7 +1051,7 @@ def lowered_once(static: tuple[str, ...], *, configured: tuple[str, ...] = (), a
     A launch's trace is held under all it is given and the launch tracing it: its static arguments, its
     operands' types, the trace state (`options.trace_context`, the launch apart, `report.replayed`) and
     the launch (`report.launch_metadata`), whose identity and config its kernels' names read
-    (`report.named`), taken where each fact it read answers as it did (`generation.held_trace`, made again
+    (`report.named`), taken where each fact it read answers as it did (`_cache.holding`, made again
     where one answers otherwise; `LAUNCHES_HELD` of them): a launch given the same traces once however many
     layers and passes call it, each call binding the trace its launch made, its kernels' calls carrying
     that launch as they were traced
@@ -1063,7 +1064,7 @@ def lowered_once(static: tuple[str, ...], *, configured: tuple[str, ...] = (), a
     def decorate(launch: Callable) -> Callable:
         signature = inspect.signature(launch)
         names = tuple(name for name in static if name in signature.parameters)
-        held: collections.OrderedDict[Hashable, tuple[_Held, dict]] = collections.OrderedDict()
+        held: collections.OrderedDict[Hashable, Held[_Held]] = collections.OrderedDict()
 
         def calling(arguments: Mapping[str, object]):
             # `launch` called with `arguments` by name, as `signature.bind` gave them.
@@ -1109,7 +1110,7 @@ def lowered_once(static: tuple[str, ...], *, configured: tuple[str, ...] = (), a
                     made.append(_Held(program.jaxpr, (jax.tree.structure(program.out_info),), tuple(named)))
                     return made[-1]
 
-                found = generation.held_trace(held, key, making, LAUNCHES_HELD)
+                found = _cache.holding(held, key, making, LAUNCHES_HELD)
                 if not made:
                     # A held trace taken: its kernels named for this launch again.
                     report.renamed(found.named)

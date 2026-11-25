@@ -22,6 +22,7 @@ from dew.objectives.lm import LMObjective
 from dew.objectives.rl import RolloutScheduler
 from dew.rl import group_advantage, rloo_advantage
 from dew.sampling import Sampling
+from dew.training import TrainerAdvanced
 
 VOCAB = 8
 PROMPT_WIDTH = 8
@@ -54,7 +55,7 @@ def test_an_identity_rollout_leaves_the_loop_byte_identical():
     assert frozen_trainer().rollout is None
     plain, ident = RecordingTracker(), RecordingTracker()
     alone = frozen_trainer(tracker=plain).fit(dataset(), steps=2, log_every=1)
-    rolled = frozen_trainer(rollout=lambda state, batch, key, *, objective: batch,
+    rolled = frozen_trainer(advanced=TrainerAdvanced(rollout=lambda state, batch, key, *, objective: batch),
                             tracker=ident).fit(dataset(), steps=2, log_every=1)
 
     for left, right in zip(jax.tree.leaves(alone), jax.tree.leaves(rolled), strict=True):
@@ -67,8 +68,8 @@ def test_rollout_keys_fold_forward_and_reproduce():
     """Three steps draw three distinct keys, and a second identical run draws
     the same three: the rollout stream is checkpointed randomness, not noise."""
     first, second = Recorder(), Recorder()
-    frozen_trainer(rollout=first).fit(dataset(), steps=3, log_every=3)
-    frozen_trainer(rollout=second).fit(dataset(), steps=3, log_every=3)
+    frozen_trainer(advanced=TrainerAdvanced(rollout=first)).fit(dataset(), steps=3, log_every=3)
+    frozen_trainer(advanced=TrainerAdvanced(rollout=second)).fit(dataset(), steps=3, log_every=3)
     assert first.steps == [0, 1, 2]
     assert len(set(first.keys)) == 3
     assert first.keys == second.keys
@@ -77,8 +78,8 @@ def test_a_resumed_run_does_not_replay_rollouts(tmp_path):
     """Two steps, then the resumed run samples steps 2 and 3, never 0 and 1
     again."""
     rollout = Recorder()
-    frozen_trainer(tmp_path, rollout=rollout).fit(dataset(), steps=2, log_every=2)
-    frozen_trainer(tmp_path, rollout=rollout).fit(dataset(), steps=4, log_every=4)
+    frozen_trainer(tmp_path, advanced=TrainerAdvanced(rollout=rollout)).fit(dataset(), steps=2, log_every=2)
+    frozen_trainer(tmp_path, advanced=TrainerAdvanced(rollout=rollout)).fit(dataset(), steps=4, log_every=4)
 
     assert rollout.steps == [0, 1, 2, 3]
 
@@ -88,7 +89,8 @@ def test_rollout_seconds_logs_only_with_a_rollout():
     and no such key without one. The run's final goodput line is not a step
     tick, so only ticks with a loss count."""
     tracking = RecordingTracker()
-    frozen_trainer(rollout=Recorder(), tracker=tracking).fit(dataset(), steps=2, log_every=1)
+    frozen_trainer(advanced=TrainerAdvanced(rollout=Recorder()), tracker=tracking).fit(dataset(), steps=2,
+                                                                                       log_every=1)
     ticks = [logged for _, logged in tracking.scalars if "train/loss" in logged]
     assert len(ticks) == 2
     assert all(tick["train/rollout_seconds"] >= 0.0 for tick in ticks)
@@ -113,7 +115,8 @@ def test_a_rollouts_metrics_log_as_of_its_latest_call():
             return super().__call__(state, batch, key, objective=objective)
 
     tracking = RecordingTracker()
-    frozen_trainer(rollout=Counting(), tracker=tracking).fit(dataset(), steps=4, log_every=2)
+    frozen_trainer(advanced=TrainerAdvanced(rollout=Counting()), tracker=tracking).fit(dataset(), steps=4,
+                                                                                       log_every=2)
     ticks = [logged for _, logged in tracking.scalars if "train/loss" in logged]
     assert [tick["rollout/reward/mean"] for tick in ticks] == [1.5, 3.5]
 

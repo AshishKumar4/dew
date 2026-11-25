@@ -114,12 +114,17 @@ bf16 wherever the quantizer clamped far from `x`, and turn a -0 into +0. The est
 release is inference code and the paper names none."""
 
 
+def fp8_block_scale(amax):
+    """A block's power-of-two FP8 scale from its largest magnitude `amax` (act_quant with scale_fmt ue8m0,
+    kernel.py:40-124): amax floored at `AMAX_FLOOR`, the scale the ceiling power of two of amax / 448; the
+    one statement a separate pass (`fp8_scaled_blocks`) and a GEMM epilogue's (`quantized`, row 8547) read."""
+    return _power_of_two_ceil(jnp.maximum(amax, AMAX_FLOOR) * jnp.float32(1 / E4M3_MAX))
+
+
 def fp8_scaled_blocks(x, block: int):
-    """`x` in fp32 blocks of `block` channels and each block's power-of-two scale (act_quant with scale_fmt
-    ue8m0, kernel.py:40-124): amax floored at 1e-4, the scale the ceiling power of two of amax / 448."""
+    """`x` in fp32 blocks of `block` channels and each block's power-of-two scale (`fp8_block_scale`)."""
     blocks = x.astype(at_least_fp32(x.dtype)).reshape(*x.shape[:-1], -1, block)
-    amax = jnp.maximum(jnp.max(jnp.abs(blocks), -1, keepdims=True), 1e-4)
-    return blocks, _power_of_two_ceil(amax * jnp.float32(1 / E4M3_MAX))
+    return blocks, fp8_block_scale(jnp.max(jnp.abs(blocks), -1, keepdims=True))
 
 
 def fp8_codes(values):

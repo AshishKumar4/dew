@@ -28,12 +28,19 @@ from dew.distributed.batches import PREFETCH_DEPTH, batch_shardings, prefetched_
 from dew.distributed.placement import Placement, Validation, allocated_bytes, placed_bytes, placed_shapes
 from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, gpu_mesh
-from dew.nn.kernels.options import held_context, held_until_release, owned_program, program_key
+from dew.nn.kernels.options import (
+    held_context,
+    held_until_release,
+    known_program_key,
+    owned_program,
+    program_key,
+)
 from dew.nn.sharding import Link, Schedule, spread_axes, spread_over
 from dew.state import Accumulation, TrainState, apart, taken, together
 from dew.training._lowering import Routed, kernel_report, routed
 from dew.training.diloco import group_of, windowed
 from dew.training.distributed import microbatch, microbatch_shapes
+from dew.training.memory import resident_on
 from dew.training.model_flops import batch_consumed, batch_tokens
 from dew.training.narrow import holds_copies, narrow_copies, narrowed, state_reads
 from dew.training.planning import Candidate, splits
@@ -101,8 +108,8 @@ class StepSettings[LossT, EffectsT]:
     lower_for: str | None
     state_mesh: Mesh
     skip_nonfinite: bool = False
-    """Whether a step with no loss scale that is not finite is skipped (`Trainer(skip_nonfinite=)`), else
-    taken as formed (`Transaction.skip`)."""
+    """Whether a step with no loss scale that is not finite is skipped (`TrainerAdvanced(skip_nonfinite=)`),
+    else taken as formed (`Transaction.skip`)."""
     ns_group: int | None = None
     """The stacks of one shape the step's Newton-Schulz joins at a time where the run states none, its plan's
     (`dew.newton_schulz.released`, `FitSearch`'s release): None joins them all."""
@@ -158,7 +165,36 @@ decoder's layout choice on stand-in H100s, row 8411), so 32 keep two fits' whole
 where 4 kept none and each fit traced its ladder again."""
 
 _CANDIDATES: collections.OrderedDict[Hashable, Candidate] = collections.OrderedDict()
+_BY_PROGRAM: dict[Hashable, set[Hashable]] = {}
+"""The keys of the kept steps (`_CANDIDATES`) by their program (`program_key`), read as each is kept, so a
+program let go drops its steps without reading any other's (`forget_program`)."""
+_BY_LOWERING: dict[int, Hashable] = {}
+"""The key of each kept step by its lowering's identity (`forget_unplanned`)."""
 _KEEPING = threading.Lock()
+
+
+def _kept(key: Hashable, candidate: Candidate) -> None:
+    """Keep `candidate` under `key` and its indexes, under `_KEEPING`, the oldest past `KEPT_CANDIDATES`
+    let go."""
+    _dropped(key)
+    _CANDIDATES[key] = candidate
+    _BY_PROGRAM.setdefault(program_key(candidate.lowered), set()).add(key)
+    _BY_LOWERING[id(candidate.lowered)] = key
+    while len(_CANDIDATES) > KEPT_CANDIDATES:
+        _dropped(next(iter(_CANDIDATES)))
+
+
+def _dropped(key: Hashable) -> None:
+    """Let the step kept at `key` go, with its indexes, under `_KEEPING`; nothing where none is kept."""
+    candidate = _CANDIDATES.pop(key, None)
+    if candidate is None:
+        return
+    program = known_program_key(candidate.lowered)
+    keys = _BY_PROGRAM.get(program, set())
+    keys.discard(key)
+    if not keys:
+        _BY_PROGRAM.pop(program, None)
+    _BY_LOWERING.pop(id(candidate.lowered), None)
 
 
 class _Kept:
@@ -168,6 +204,8 @@ class _Kept:
     def released(self) -> None:
         with _KEEPING:
             _CANDIDATES.clear()
+            _BY_PROGRAM.clear()
+            _BY_LOWERING.clear()
 
 
 _KEPT = _Kept()
@@ -194,6 +232,16 @@ def _shapes(tree):
                         if hasattr(leaf, "dtype") else leaf, tree)
 
 
+def as_placed[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: TrainState) -> TrainState:
+    """`state`'s shapes as the run places it (`Stepping.shardings`), whether placed yet or not: what a fit
+    check and a plan's candidates prepare and trace over alike (row 12465). As it is where its placement
+    lays it out otherwise (a CPU-owned run's frozen layers, which the step stacks)."""
+    shardings = stepping.shardings(state)
+    if jax.tree.structure(shardings) != jax.tree.structure(state):
+        return state
+    return placed_shapes(state, shardings)
+
+
 def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: TrainState, batch: Batch,
                                    schedule: Schedule, placement, replicated, split: int, narrow: bool, *,
                                    mesh: Mesh | AbstractMesh | None = None,
@@ -204,10 +252,18 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
     states traces its own."""
     # Read as the candidate is made, at the rung the search put the objective at (row 3873).
     stated = stepping.step_key()
+    # What the state's and batch's arrays hold where they lie, the step's arguments XLA counts; a step
+    # lowered for other devices none of this process's.
+    resident = resident_on(state, batch) if mesh is None else {}
+    # Prepared, traced and kept over the shapes the run places them as, whether placed yet or not, so a
+    # search before the state is placed and one after it trace and lower one step (row 12465: a 4B search
+    # traced 2 to 4.5 minutes a candidate, again once placed); a step lowered for other devices over its own.
+    shaped, rows = (state, batch) if mesh is not None else (as_placed(stepping, state),
+                                                            placed_shapes(batch, placement))
     # What the step traces from beside its arguments and the trainer's settings: the compiles' refusals
     # its kernels' derivation reads (a relowering after a spill reads its proposal's), and the context.
     key = None if stated is None else (
-        stated, _shaped(state), _shaped(batch), _shaped(placement), replicated, split, narrow,
+        stated, _shaped(shaped), _shaped(rows), _shaped(placement), replicated, split, narrow,
         stepping.settings.ns_group, mesh,
         platforms, stepping.shape.rows,
         stepping.shape.split, stepping.shape.prefetch, stepping.shape.examples, held_context())
@@ -218,34 +274,37 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
                 # Its links decide as its trace decided them: the key holds their figures (`held_context`).
                 spread_over(kept.spread)
                 sampled = _sampled(stepping, kept, batch, placement, replicated, split, platforms)
-                return dataclasses.replace(kept, sampled=sampled)
-    candidate = _candidate(stepping, state, batch, schedule, placement, replicated, split, narrow,
-                           mesh=mesh, platforms=platforms)
+                return dataclasses.replace(kept, sampled=sampled, resident=resident)
+    candidate = dataclasses.replace(_candidate(stepping, shaped, rows, schedule, placement, replicated, split,
+                                               narrow, mesh=mesh, platforms=platforms), resident=resident)
     if key is not None:
         # Kept detached from this trainer: its batch as shapes, its inspection's step none (`_sampled`
         # builds the reader's own).
         with _KEEPING:
             # Registered as it is published, under one lock, so no release clears the cache between them.
             held_until_release(_KEPT)
-            _CANDIDATES[key] = dataclasses.replace(candidate, micro=_shapes(candidate.micro), sampled=None,
-                                                   spread=spread_axes())
-            while len(_CANDIDATES) > KEPT_CANDIDATES:
-                _CANDIDATES.popitem(last=False)
+            _kept(key, dataclasses.replace(candidate, micro=_shapes(candidate.micro), sampled=None,
+                                           spread=spread_axes()))
     return candidate
 
 
 def forget(lowered: jax.stages.Lowered) -> None:
     """Drop every step this process keeps for a trainer built anew (`candidate_for`) whose program is
     `lowered`'s (`program_key`): one whose executable a compile guided by a profile supersedes
-    (`Planned.guided`), whether compiled from `lowered` or taken from `options._HELD` after an earlier
-    trainer lowered it, so no kept lowering holds the superseded executable alive beside the guided one (JAX
-    keeps each executable of a lowering while it lives)."""
-    target = program_key(lowered)
+    (`Planned.guided`), whether compiled from `lowered` or taken from its run's compiler's executables
+    (`FitSearch.executables`), so no kept lowering holds the superseded executable alive beside the guided
+    one (JAX keeps each executable of a lowering while it lives)."""
+    forget_program(program_key(lowered))
+
+
+def forget_program(target: Hashable) -> None:
+    """Drop every step this process keeps for a trainer built anew (`candidate_for`) whose program is
+    `target` (`program_key`): one whose executable its run's compiler let go
+    (`dew.training.planning.HeldExecutables`), so no kept lowering holds its device code past that bound,
+    or which a guided compile supersedes (`forget`). By the program's own index, no other step read."""
     with _KEEPING:
-        # Its trees first, so only a lowering of the same shapes renders its text to compare.
-        for key in [key for key, kept in _CANDIDATES.items() if kept.lowered is lowered or (
-                kept.lowered.in_tree == lowered.in_tree and program_key(kept.lowered) == target)]:
-            del _CANDIDATES[key]
+        for key in list(_BY_PROGRAM.get(target, ())):
+            _dropped(key)
 
 
 def forget_unplanned(lowerings: Sequence[jax.stages.Lowered],
@@ -254,10 +313,10 @@ def forget_unplanned(lowerings: Sequence[jax.stages.Lowered],
     `lowerings` but `planned`'s (every one, where None), by the lowering itself: a search's losing and
     frontier rungs, whose lowerings key their executables while they live
     (`dew.training.planning.FitSearch.released_unplanned`)."""
-    dropped = {id(lowered) for lowered in lowerings if lowered is not planned}
     with _KEEPING:
-        for key in [key for key, kept in _CANDIDATES.items() if id(kept.lowered) in dropped]:
-            del _CANDIDATES[key]
+        for lowered in lowerings:
+            if lowered is not planned and (key := _BY_LOWERING.get(id(lowered))) is not None:
+                _dropped(key)
 
 
 def _sampled[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], candidate: Candidate, batch: Batch,
@@ -311,21 +370,28 @@ def _candidate[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Trai
     # are two texts of one program (`dew.nn.kernels.options.program_digest`), the types of a helper call's
     # arguments, their shardings among them, telling its functions apart in the module.
     given = placed_shapes(batch, placement)
+    # What its updates' joined stacks a plan's release would part hold by count, each trace's summed over
+    # its Muon transforms (`newton_schulz.joined_held`); a trace JAX's cache answered notes none.
+    joined: list[int] = []
+
+    def noted[T](trace: Callable[[], T]) -> T:
+        traced, count = newton_schulz.joined_held(trace)
+        joined.append(count)
+        return traced
+
     lower = Routed(functools.partial(
-        lambda *arguments: jitted.trace(*arguments).lower(lowering_platforms=platforms),
+        lambda *arguments: noted(lambda: jitted.trace(*arguments).lower(lowering_platforms=platforms)),
         *apart(prepared), given, part))
     tuned = settings.tune_kernels and platforms is None
-    # Whether its updates join stacks a plan's release would part (`newton_schulz.joining`), off its trace.
-    with newton_schulz.joining() as joined:
-        if tuned:
-            lowered, kernels = tuning.tune(lower, measure=True), lower.report()
-        else:
-            # The tuner is off (bible §6): each launch takes its derived config, nothing settled or read.
-            made, found = routed(lambda: jitted.trace(*apart(prepared), given, part))
-            lowered = made.lower(lowering_platforms=platforms)
-            kernels = kernel_report(found, lowered)
+    if tuned:
+        lowered, kernels = tuning.tune(lower, measure=True), lower.report()
+    else:
+        # The tuner is off (bible §6): each launch takes its derived config, nothing settled or read.
+        made, found = routed(lambda: noted(lambda: jitted.trace(*apart(prepared), given, part)))
+        lowered = made.lower(lowering_platforms=platforms)
+        kernels = kernel_report(found, lowered)
     candidate = Candidate(micro, shapes, copies, shardings, prepared, held, built, lowered, kernels,
-                          joins=bool(joined))
+                          joined=max(joined, default=0))
     return dataclasses.replace(candidate, sampled=_sampled(stepping, candidate, batch, placement, replicated,
                                                            split, platforms))
 

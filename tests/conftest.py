@@ -518,16 +518,6 @@ def release_compilations():
 
 
 @pytest.fixture(autouse=True)
-def fresh_held_steps():
-    """Each test plans its steps as a fresh process does: the step executables an earlier test's trainers
-    compiled, which the process holds across trainers (`dew.nn.kernels.options.hold`), are dropped as it
-    begins, so what a test's start compiles is its own. None is held before a test loaded the kernels, and
-    importing them here would make every test's run execute the kernel toolkit (`release`)."""
-    if (options := sys.modules.get("dew.nn.kernels.options")) is not None:
-        options.unhold()
-
-
-@pytest.fixture(autouse=True)
 def released_past_budget():
     """A test that leaves the process past `RSS_BUDGET` resident bytes or `MAPPINGS_BUDGET` mappings
     releases compiled executables as it ends, so no file compiles its way to an OOM kill or the mapping

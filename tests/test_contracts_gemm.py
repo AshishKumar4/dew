@@ -11,6 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from arm_arithmetic import ahead_on_the_host
 from contract_support import EDGES, FORWARD_ORDERS, assert_contract, assert_drawn_contract, normal_draw
 from reference_error import Followed, Rounded, as_given, assert_as_exact, widened
 
@@ -280,6 +281,54 @@ def test_a_blockwise_fp8_projection_holds_every_reverse_order(edge):
 
 
 @pytest.mark.parametrize("edge", EDGES)
+def test_a_blockwise_fp8_chain_holds_every_reverse_order(edge):
+    """`projections.blockwise_chain` (an ungated MLP's two blockwise FP8 projections, the down projection's
+    rows quantized in the up projection's epilogue; its custom VJP each projection's own surrogate): every
+    reverse order, under a nested jit and a scan, in the rows and both matrices, finite wherever float64 is a
+    normal float32 and wherever the plain product of the two through the activation is, at values whose
+    products near float32's ends (row 8547). It takes no forward order: a custom VJP has none."""
+    primals = normal_draw(8547, (256, 128), (1, 128, 256), (1, 256, 128), scale=EDGES[edge])
+    direction = normal_draw(8548, (256, 128), (1, 128, 256), (1, 256, 128), scale=EDGES[edge])
+    (cotangent,) = normal_draw(8549, (256, 128))
+
+    def recipe(rows, up, down):
+        return projections.blockwise_chain(rows, up, down, jax.nn.relu, out_dtype=rows.dtype)
+
+    def plain(rows, up, down):
+        return jax.nn.relu(rows @ up[0]) @ down[0]
+
+    assert_contract(recipe, primals, direction, cotangent, f"a blockwise fp8 chain {edge}", truth_fn=plain,
+                    plain_fn=plain, without=FORWARD_ORDERS)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_gated_blockwise_fp8_chain_holds_every_reverse_order(edge):
+    """`projections.blockwise_chain` with its `gate` (a gated MLP's three blockwise FP8 projections, the
+    gate's product read by the up projection's epilogue and their SwiGLU quantized there; its custom VJP
+    each projection's own surrogate): every reverse order, under a nested jit and a scan, in the rows and
+    the three matrices, finite wherever float64 is a normal float32 and wherever the plain product of the
+    three through SwiGLU is, at values whose products near float32's ends (row 12689). It takes no forward
+    order."""
+    primals = normal_draw(12689, (256, 128), (1, 128, 256), (1, 128, 256), (1, 256, 128),
+                          scale=EDGES[edge])
+    direction = normal_draw(12690, (256, 128), (1, 128, 256), (1, 128, 256), (1, 256, 128),
+                            scale=EDGES[edge])
+    (cotangent,) = normal_draw(12691, (256, 128))
+
+    def swiglu(gate, up):
+        return jax.nn.silu(gate) * up
+
+    def recipe(rows, gate, up, down):
+        return projections.blockwise_chain(rows, up, down, swiglu, out_dtype=rows.dtype, gate=gate)
+
+    def plain(rows, gate, up, down):
+        return swiglu(rows @ gate[0], rows @ up[0]) @ down[0]
+
+    assert_contract(recipe, primals, direction, cotangent, f"a gated blockwise fp8 chain {edge}",
+                    truth_fn=plain, plain_fn=plain, without=FORWARD_ORDERS)
+
+
+@pytest.mark.parametrize("edge", EDGES)
 def test_an_nvfp4_products_kernels_hold_every_order(edge, kernel="xla"):
     """`gemm.nvfp4_product` on its selector's `kernel` (`xla` here, the decoded matrix's product; `packed`,
     the template's mainloop decoding each stage in place through `generation.linear_tangent` as `gemm` is,
@@ -292,9 +341,12 @@ def test_an_nvfp4_products_kernels_hold_every_order(edge, kernel="xla"):
     e2m1 = np.asarray([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
     magnitudes = np.where(codes >= 8, -1.0, 1.0) * e2m1[codes & 7]
     exponents = np.random.default_rng(3622).integers(-2, 3, size=(16, 64))
-    block = jnp.asarray(np.exp2(exponents), jnp.float8_e4m3fn)
-    matrix = formats.NvFp4.of(jnp.asarray(magnitudes, jnp.float32), block, 0.5)
-    values = matrix.decoded().astype(jnp.float32) * matrix.factor
+    # Packed and decoded on the host where a GPU tier part's prepare runs the cell, its device computing
+    # nothing before the contract's sites (row 12377's class: the H100 and A100 flows' packed cells).
+    with ahead_on_the_host():
+        matrix = formats.NvFp4.of(magnitudes.astype(np.float32),
+                                  np.exp2(exponents).astype(jnp.float8_e4m3fn), 0.5)
+        values = np.asarray(matrix.decoded().astype(jnp.float32) * matrix.factor)
     primals = normal_draw(3623, (64, 256), scale=EDGES[edge])
     direction = normal_draw(3624, (64, 256), scale=EDGES[edge])
     (cotangent,) = normal_draw(3625, (64, 64))
@@ -944,7 +996,7 @@ def test_a_symmetric_gram_and_polynomial_hold_every_reverse_order(edge):
     from dew.nn.sharding import automatic_axes
 
     def native_gram_bf(operand):
-        choose = contextlib.nullcontext() if automatic_axes() else generation.chosen(grouped_matmul="mosaic")
+        choose = contextlib.nullcontext() if automatic_axes() else generation.chosen(syrk="mosaic")
         with generation.assumed("sm90"), choose:
             return gemm.symmetric_gram(operand.astype(jnp.bfloat16), out_dtype=jnp.bfloat16,
                                        interpret_on_cpu=True)
@@ -958,7 +1010,7 @@ def test_a_symmetric_gram_and_polynomial_hold_every_reverse_order(edge):
                     truth_fn=plain_gram, plain_fn=plain_gram_bf, without=FORWARD_ORDERS)
 
     def native_poly_bf(operand, poly):
-        choose = contextlib.nullcontext() if automatic_axes() else generation.chosen(grouped_matmul="mosaic")
+        choose = contextlib.nullcontext() if automatic_axes() else generation.chosen(syrk="mosaic")
         with generation.assumed("sm90"), choose:
             return gemm.symmetric_polynomial(operand.astype(jnp.bfloat16), poly, out_dtype=jnp.bfloat16,
                                              interpret_on_cpu=True)
@@ -1009,14 +1061,6 @@ def test_a_compute_prologued_gemm_holds_every_order(edge):
 
 
 @pytest.mark.parametrize("edge", EDGES)
-def test_an_fp8_weight_product_holds_every_order(edge):
-    """`gemm.fp8_weight_product` (free-layout staged FP8 weights decoded inline via
-    `bits.E4M3_BFLOAT16_FORM`, `generation.linear_tangent`): every order in `lhs`, under a nested jit and a
-    scan, finite wherever float64 is a normal float32 and wherever the decoded product is (row 8548)."""
-    _check_packed_weight_product_contract(edge, kind="fp8")
-
-
-@pytest.mark.parametrize("edge", EDGES)
 def test_a_ternary_weight_product_holds_every_order(edge):
     """`gemm.ternary_weight_product` (2-bit packed BitNet b1.58 weights decoded inline, `linear_tangent`):
     every order in `lhs`, plus interpreted packed & portable routes with `quantize_activations=True` checked
@@ -1026,7 +1070,7 @@ def test_a_ternary_weight_product_holds_every_order(edge):
     from dew.nn import precision as prec
     from dew.nn.kernels import formats
 
-    _check_packed_weight_product_contract(edge, kind="ternary")
+    _check_ternary_weight_product_contract(edge)
     if edge != "normal":
         return
     raw_w = normal_draw(1464, (256, 64), scale=1.0)[0]
@@ -1062,13 +1106,12 @@ def test_a_ternary_weight_product_holds_every_order(edge):
         np.testing.assert_array_equal(np.asarray(dy_s), np.asarray(s_tan_oracle))
 
 
-def _check_packed_weight_product_contract(edge: str, *, kind: str) -> None:
+def _check_ternary_weight_product_contract(edge: str) -> None:
     from dew.nn.kernels import formats
 
-    depth = 256 if kind == "ternary" else 64
-    raw_w = normal_draw(8548 if kind == "fp8" else 1464, (depth, 64), scale=1.0)[0]
-    weights = (formats.Fp8Weights.of(raw_w, fmt="e4m3", scale=jnp.float32(0.5)) if kind == "fp8"
-               else formats.TernaryWeights.of(raw_w, scale=jnp.float32(0.5)))
+    depth = 256
+    raw_w = normal_draw(1464, (depth, 64), scale=1.0)[0]
+    weights = formats.TernaryWeights.of(raw_w, scale=jnp.float32(0.5))
     decoded = weights.decoded(jnp.bfloat16)
     (x,) = normal_draw(8549, (64, depth), scale=EDGES[edge])
     (dx,) = normal_draw(8550, (64, depth), scale=EDGES[edge])
@@ -1079,8 +1122,6 @@ def _check_packed_weight_product_contract(edge: str, *, kind: str) -> None:
     def product(rows):
         choose = contextlib.nullcontext() if automatic_axes() else generation.chosen(grouped_matmul="mosaic")
         with choose:
-            if kind == "fp8":
-                return gemm.fp8_weight_product(rows, weights, out_dtype=jnp.float32, interpret_on_cpu=True)
             return gemm.ternary_weight_product(rows, weights, quantize_activations=False,
                                                out_dtype=jnp.float32, interpret_on_cpu=True)
 
@@ -1089,5 +1130,5 @@ def _check_packed_weight_product_contract(edge: str, *, kind: str) -> None:
 
     without = () if generation.placed_platform() == "gpu" else ("jvp of grad, remat", "second jvp, remat")
     with generation.assumed("sm90"):
-        assert_contract(product, (x,), (dx,), cotangent, f"{kind} weight product {edge}",
+        assert_contract(product, (x,), (dx,), cotangent, f"ternary weight product {edge}",
                         truth_fn=plain, plain_fn=plain, without=without)

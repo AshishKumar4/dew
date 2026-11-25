@@ -37,7 +37,7 @@ from dew.objectives.rl.sessions import (
     pooled,
 )
 from dew.rl import group_advantage, rloo_advantage
-from dew.training import Trainer
+from dew.training import Trainer, TrainerAdvanced
 from dew.training.transaction import with_ema
 
 LENGTHS = ((3, 5), (4, 2), (6, 4), (2, 7)) * 8
@@ -443,8 +443,10 @@ def test_a_run_drawing_further_batches_resumes_after_the_last_it_drew(tmp_path):
         stream = Loader(train=replayed(lambda partition: ({"task_id": np.asarray(batch, np.int32)}
                                                           for batch in batches)),
                         val=None, records=None, batch=8)
-        trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(3), rollout=scheduler,
-                          layout=Layout(min_shard=1, tolerance=1.0), checkpoints=checkpoints)
+        trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(3),
+                          advanced=TrainerAdvanced(rollout=scheduler, layout=Layout(min_shard=1,
+                                                                                    tolerance=1.0)),
+                          checkpoints=checkpoints)
         trainer.fit(stream, steps=steps, log_every=steps, checkpoint_every=None if checkpoints is None else 1)
         return collector.collected
 
@@ -471,8 +473,8 @@ def test_a_run_drawing_further_batches_past_its_orders_end_trains_the_groups_it_
     tasks = [0, 0, 0, 0, 1, 1, 0, 0]
     order = compile(Pipeline(Memory({"task_id": np.asarray(tasks, np.int32)})).repeat(1).batch(8), seed=0,
                     loading=Loading(workers=0))
-    trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(3), rollout=scheduler,
-                      layout=Layout(min_shard=1, tolerance=1.0))
+    trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(3),
+                      advanced=TrainerAdvanced(rollout=scheduler, layout=Layout(min_shard=1, tolerance=1.0)))
     state = trainer.fit(order, steps=2, log_every=1)
     assert int(state.step) == 1
     assert [collected for collected, _ in collector.collected] == [tasks]

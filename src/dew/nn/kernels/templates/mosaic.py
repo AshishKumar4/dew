@@ -22,7 +22,6 @@ import contextlib
 import contextvars
 import dataclasses
 import functools
-import math
 import operator
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any, NamedTuple, Self
@@ -53,9 +52,9 @@ from dew.nn.kernels.templates import (
     resources,
     swizzling,
 )
-from dew.nn.kernels.templates.cost import Stated, Work
+from dew.nn.kernels.templates.cost import Stated
 from dew.nn.kernels.templates.rings import CLUSTER, Ref, Turn, besides, drain, loaded_once
-from dew.nn.kernels.templates.stores import column_chunks, column_spans, written
+from dew.nn.kernels.templates.stores import Output, column_chunks, column_spans, written
 from dew.telemetry.instrumentation import MODEL_FLOPS
 
 Operand = Ref | jax.Array
@@ -179,6 +178,14 @@ class Exchange:
 
 _STAGING: contextvars.ContextVar[bool] = contextvars.ContextVar("staging", default=False)
 """Whether a consumer's staged tiles are stored unpublished (`Family.staged_together`)."""
+
+
+def _disjoint(buffers: Sequence) -> None:
+    """Refuse `buffers` where two may alias: two views of one ref."""
+    roots = [id(buffer.ref if isinstance(buffer, state_types.TransformedRef) else buffer)
+             for buffer in buffers]
+    if len(set(roots)) != len(roots):
+        raise ValueError("a staged batch's buffers alias one another: each a buffer of its own")
 
 
 def issuing() -> None:
@@ -394,10 +401,16 @@ _ONCE_PREDICATED = _cache.untraced(contextvars.ContextVar("once_predicated", def
 own)."""
 
 
-def refuse_staging(family, chunks: tuple[int, int] | None) -> None:
-    """Refuses `chunks` (`Family.output_staging`'s) where `family` stages each output tile whole."""
+def refuse_staging(family, chunks: tuple[int, int] | None, outputs: tuple = ()) -> tuple[tuple, ...]:
+    """Refuses `chunks` (`Family.output_staging`'s) where `family` stages each output tile whole, and any of
+    `outputs` stored packed or written by its own write (`stores.Output`'s divisor, transposed form or write,
+    which chunked staging alone takes); `outputs` as `(shape, dtype)` pairs."""
     if chunks is not None:
         raise ValueError(f"{family.name} stages each output tile whole, in no chunks: {chunks}")
+    plain = tuple(map(Output.of, outputs))
+    if any(output.divisor > 1 or output.transposed or output.write is not None for output in plain):
+        raise ValueError(f"{family.name} stages each output tile whole as its issuer writes it, none packed")
+    return tuple((output.shape, output.dtype) for output in plain)
 
 
 def then_read(read: Callable, after: Callable | None) -> Callable:
@@ -460,7 +473,6 @@ def laid(condition, like: jax.Array) -> jax.Array:
     return (jnp.zeros_like(like, jnp.float32) + jnp.asarray(condition, jnp.float32)) != 0.0
 
 
-@emission.stating(lambda: Work())
 def _warpgroup_barrier(ctx) -> None:
     """A warpgroup's barrier (`synced`), inlined: synchronization alone, no work a count prices."""
     del ctx
@@ -708,8 +720,6 @@ class Issuer[Accumulator](abc.ABC):
             taken = group + jnp.clip(rows % period - shift, 0, period - 1)
             return jnp.take_along_axis(tile, taken, axis=0)
 
-        # A warp's shuffles: values moved between its lanes' registers, no work a count prices.
-        @emission.stating(lambda array, by: Work())
         def shifted(ctx, array, by):
             del ctx
             [value] = by.registers.flat
@@ -1266,6 +1276,17 @@ class Issuer[Accumulator](abc.ABC):
         write states its own (`WgmmaIssuer`). The walk's ring waits and releases are its own, outside it."""
         return self.issued_when(~idle, acc, issue)
 
+    bound_registers: int = 0
+    """The registers a consumer thread holds beside its tile where its products take a row bound (`bounded`):
+    none where its instructions take none."""
+
+    def side_bytes(self, dtype) -> int:
+        """The bytes a register holds a value of an epilogue's `[rows, columns]` side tile of `dtype` in, as
+        `side_tile` loads it: its own width in Mosaic GPU's fragmented arrays (a bf16 tile two values a
+        register: an H100's gated blockwise chain, its gate a bf16 side, compiled at 168 registers, row
+        12689)."""
+        return jnp.dtype(dtype).itemsize
+
     def bounded(self, rows: jax.Array) -> Self:
         """This issuer, its products issued for a tile's rows before `rows` alone (an int32, one value across
         the issuing warpgroup: a ragged group's rows in its last tile), the accumulator's rows kept past it,
@@ -1491,7 +1512,6 @@ class Issuer[Accumulator](abc.ABC):
         return plgpu.layout_cast(value, self.layout)
 
 
-@emission.stating(lambda tile, scratch: Work(operations=math.prod(tile.shape)))
 def _column_sums(ctx, tile, scratch):
     """A tile's column sums across the warps holding its rows (`Issuer.column_sums`), inlined: a reduction,
     one addition an element, its warps' partials exchanged through `scratch`."""
@@ -1622,6 +1642,12 @@ class Transport[Allocated, Opened](abc.ABC):
     walks_scoped: bool = False
     """Whether its walks scope their streams apart, each in its own scope (`emit_pipeline`'s slots): a tile
     scoped after a walk then takes the larger of the two (`resources.shared_bytes`)."""
+
+    walks_streamed: bool = False
+    """Whether consumers holding their own blocks walk every streamed step together (`walk_own`'s), each
+    masking the steps outside its own: their per-step meets pair, so a sum across them after the walk
+    (`across.summed_across`) meets paired too. Where not, a consumer passes the steps outside its own
+    range (`passed`) and walks its own alone."""
 
     prefetches_fragments: bool = False
     """Whether its walk takes a step's `prefetch` (`walk`'s): the first fragments of a step's products read
@@ -1797,14 +1823,16 @@ class Transport[Allocated, Opened](abc.ABC):
         return streams
 
     def walk_own[R](self, streams, views: dict, own: tuple, streamed: tuple, wg,
-                    walk: Callable[..., R], *, between=None, counted=0) -> R:
+                    walk: Callable[..., R], *, between=None, counted=0, common: bool = False) -> R:
         """Consumer `wg`'s walk of its own steps `own` (`lo`, `hi`) among its program's `streamed` ones,
         `walk(streams, lo, hi, first)` its walk of steps `lo` to `hi` counted from `first`: on a layout with a
         producer, the steps before and after its own passed (`passed`, `between()` after each), which its
         partners read; on one whose consumers feed their rings (`ConsumerFed.walk_own`), every streamed step
         over its own feed (`fed`), a step none of its own masked by its step, `counted` turns past the rings'
-        first (`after_walk.Decided`'s second pass). Returns `walk`'s value."""
-        del views, wg
+        first (`after_walk.Decided`'s second pass); on one whose consumers run one pipeline together
+        (`CpAsync.walk_own`), `common` states that every consumer's segments of its walk are the same steps,
+        which keeps a pipeline a segment. Returns `walk`'s value."""
+        del views, wg, common
         lo, hi = own
         first = streamed[0] - counted
         self.passed(streams, streamed[0], lo, first=first, between=between)
@@ -2004,8 +2032,7 @@ class Transport[Allocated, Opened](abc.ABC):
         template's allocations count as its own (`resources.Scope`): the whole tile, where a family stages
         it whole, which takes no `chunks` (chunk columns and buffers, `stores.output_staging`'s `staging`)."""
         del consumers
-        refuse_staging(self, chunks)
-        return [plgpu.SMEM(shape, dtype) for shape, dtype in outputs]
+        return [plgpu.SMEM(shape, dtype) for shape, dtype in refuse_staging(self, chunks, outputs)]
 
     def persist_scratch(self, consumers: int, rewrites: tuple[int, ...] = (), *,
                         pingpong: bool = False) -> tuple[tuple, int]:
@@ -2102,6 +2129,12 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
     consumers: int
     """The compute roles a program may take (sm90 two warpgroups, sm80 one)."""
 
+    @property
+    def shared_consumers(self) -> int:
+        """The most compute roles a launch may name (`consumers` where its derivation picks its own): a
+        cp.async family's two over one collective pipeline (`mosaic_sm80.CpAsync`), more than it derives."""
+        return self.consumers
+
     def for_generation(self, generation_name: str) -> "Family":
         """The bundle as a device of `generation_name` runs it (`bundles.groups`, its composition for that
         device): itself, where nothing of it is measured per device."""
@@ -2130,8 +2163,16 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
         """The depths a step may take for operands of `dtype`, widest first: the swizzles its products
         read a block's rows at."""
 
-    def _store_staged(self, value: jax.Array, buffer) -> None:
+    def _store_staged(self, value: jax.Array, buffer, *, bracketed: bool = True) -> None:
+        del bracketed  # Mosaic GPU brackets an optimized store itself
         buffer[...] = value.astype(buffer.dtype)
+
+    @property
+    def brackets_staged(self) -> bool:
+        """Whether its staged stores take the warpgroup's barriers from its own code rather than Mosaic GPU's
+        automatic ones (`_store_staged`'s unoptimized stores, mma.sync's): a batch of them then takes one
+        pair for all (`staged_all`)."""
+        return False
 
     def staged(self, value: jax.Array, buffer) -> Ref:
         """`value` in the shared-memory tile `buffer`, in its dtype, for a product to read: a register
@@ -2143,6 +2184,25 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
         if not _STAGING.get():
             self.published()
         return buffer
+
+    def staged_all(self, pairs: Sequence[tuple[jax.Array, Ref]]) -> list[Ref]:
+        """Each value of `pairs` in its buffer, for products to read, written as one batch and published once:
+        no value read and no product issued between its stores (its values computed before it). An issuer
+        that brackets its stores itself (`brackets_staged`, mma.sync's) takes one barrier before the batch's
+        first store (every warp's reads of the buffers done) and one after its last (every warp's stores
+        seen), where `staged` takes a pair a store (a Kimi intra step's 20 a trip, FS-INTRA-BAR1). Buffers
+        that may alias (two views of one ref) are refused."""
+        buffers = [buffer for _, buffer in pairs]
+        _disjoint(buffers)
+        bracketed = self.brackets_staged
+        if bracketed:
+            synced(interpret=False)
+        for value, buffer in pairs:
+            self._store_staged(value, buffer, bracketed=False)
+        self.published()
+        if bracketed:
+            synced(interpret=False)
+        return buffers
 
     @contextlib.contextmanager
     def staged_together(self) -> Iterator[None]:

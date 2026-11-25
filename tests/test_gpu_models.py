@@ -42,7 +42,9 @@ def test_the_models_run_their_gpu_kernels(without_deterministic_ops):
     one's failure kept and all raised together, Dew's own kernels taking their default schedules
     (`without_deterministic_ops`): XLA parsed the process's flags at its first compile, so taking the flag
     out of the environment moves Dew's trace-time choice of a fused kernel's schedule, the joint head's flash
-    among them, and none of XLA's own (row 5491)."""
+    among them, and none of XLA's own (row 5491). The packed decisions, the NCCL push and the paged decode;
+    the host-precision cells are their own test, each its own task (row 12439: together, a prepare's
+    compiles took 687 s of a train's 667 s bound)."""
     run_cells([
         Cell("a packed window decides each row as the row alone: the joint arm",
              functools.partial(decision_packing.packed_rows_decided_alone, "joint")),
@@ -56,6 +58,14 @@ def test_the_models_run_their_gpu_kernels(without_deterministic_ops):
         Cell("the paged decode kernel decodes on par with the gathered attention, a softcapped model too",
              when(bf16_dot_runs(), BF16_PRODUCTS,
                   kv_cache.the_paged_decode_kernel_decodes_on_par_with_the_gathered_attention)),
+    ])
+
+
+def test_the_models_keep_their_hosts_precision_on_the_gpu(without_deterministic_ops):
+    """The model cells above whose compiled programs keep their host's precision on a GPU, a compiler not
+    the host's, under the suite's XLA flags as the test above (`without_deterministic_ops`, row 5491): a VAE
+    encoder and its VJP at two batches, and a strided convolution's every linearization (row 12439)."""
+    run_cells([
         *(Cell(f"a VAE encoder keeps its host's precision: batch {batch}, {'vjp' if backward else 'encode'}",
                functools.partial(models.a_vae_encoder_keeps_the_host_reference_precision, batch, backward))
           for batch in (1, 4) for backward in (False, True)),

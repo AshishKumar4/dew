@@ -750,10 +750,11 @@ def key_block_pairs(rows: Sequence[Callable[[], jax.Array]], keys: jax.Array, pr
 
 def key_diagonal_bands(rows: list, shifted: Callable[[jax.Array], tuple], *, sub: int = SUB,
                        unit_pairs: bool = False) -> list:
-    """Each sub-chunk's own pairs of one key block under a decay a key dimension, each its own decay, as a
-    band `[C, sub]` a product: its row `i`'s column `e` the pair `(i, i - e)`, `sum_k r_ik k_(i-e)k
-    exp2(g_ik - g_(i-e)k)`, zero where token `i - e` precedes `i`'s sub-chunk (fla_kda's token-parallel
-    diagonal, chunk_kda_fwd_intra_token_parallel). `rows` the products' rows `[C, BK]` fp32, each against the
+    """Each sub-chunk's own pairs of one key block under a decay a key dimension, each its own decay, as the
+    sub-chunks' diagonal blocks `[C, sub]` a product: its row `i`'s column `c` the pair `(i, j)` of the token
+    `j` at `c` in `i`'s sub-chunk, `sum_k r_ik k_jk exp2(g_ik - g_jk)`, zero where `j` follows `i`
+    (fla_kda's token-parallel diagonal, chunk_kda_fwd_intra_token_parallel), as the walk's sums take them in
+    place (`own_pairs.intra_own`). `rows` the products' rows `[C, BK]` fp32, each against the
     block's keys; `shifted(e)` its keys and each token's own decay `(keys, decays)` (`token_decays`), each row
     `i` holding token `i - e`'s, any finite value where `i - e` leaves its sub-chunk (masked). A pair's decay
     is the product of its tokens' own, formed across the offsets as the token recurrence forms it (`pair_e =
@@ -767,8 +768,8 @@ def key_diagonal_bands(rows: list, shifted: Callable[[jax.Array], tuple], *, sub
     from the separated prefix instead (`decay`: two differences, a
     clip, a power of two and an exp2), a B200's Kimi Linear training spent 0.96 ms of an emulated 2.86 in this
     form and its transpose, each issue-bound (an emulated B200 at 8aab1729e65). Summed over a chunk's key
-    blocks, a launch's bands are placed by its caller (`placed_bands`): placed a key block and an offset at a
-    time, the `[C, C]` selects took an H100's Kimi Linear intra launch from 492 to 1982 us (M-JS-50d).
+    blocks, a launch writes its blocks in place (`own_pairs.intra_own`): placed a key block and an offset at
+    a time, the `[C, C]` selects took an H100's Kimi Linear intra launch from 492 to 1982 us (M-JS-50d).
     Where the keys and rows are at most one in size (`unit_pairs`, `mainloop.Call.unit_pairs`), each key
     takes its pair's decay first instead, once for every product (`decayed_key`), and each row's term is a
     fused multiply-add of it (fla's token-parallel diagonal folds it so, into the key): all the decayed key
@@ -781,12 +782,16 @@ def key_diagonal_bands(rows: list, shifted: Callable[[jax.Array], tuple], *, sub
     lane = jax.lax.broadcasted_iota(jnp.int32, (index.shape[0], sub), 1)
     token = jax.lax.broadcasted_iota(jnp.int32, lane.shape, 0)
 
+    def column(e):
+        # A row's pair `e` tokens back, at its column within the sub-chunk's block.
+        return token % sub - e
+
     def offset(e, carried):
         bands, pair, following = carried
         keys, decays = shifted(e)
         pair = pair * following
         summed = [jnp.sum(band_term(row, keys, pair, unit_pairs=False), axis=1) for row in rows]
-        return (tuple(jnp.where(lane == e, total[:, None], band)
+        return (tuple(jnp.where(lane == column(e), total[:, None], band)
                       for band, total in zip(bands, summed, strict=True)), pair, decays)
 
     def folded(e, carried):
@@ -798,12 +803,12 @@ def key_diagonal_bands(rows: list, shifted: Callable[[jax.Array], tuple], *, sub
         pair = pair * following
         keyed = decayed_key(keys, pair)
         summed = [jnp.sum(band_term(row, keyed, None, unit_pairs=True), axis=1) for row in rows]
-        return (tuple(jnp.where(lane == e, total[:, None], band)
+        return (tuple(jnp.where(lane == column(e), total[:, None], band)
                       for band, total in zip(bands, summed, strict=True)), pair, decays)
 
     zero, one = jnp.zeros(lane.shape, jnp.float32), jnp.ones(index.shape, jnp.float32)
     bands = jax.lax.fori_loop(0, sub, folded if unit_pairs else offset, ((zero,) * len(rows), one, one))[0]
-    # Each column written once, by its offset's select; a row before its offset selected out once, at the end.
+    # Each column written once, by its offset's select; a column past its row selected out once, at the end.
     return [jnp.where(token % sub >= lane, band, 0.0) for band in bands]
 
 
@@ -818,21 +823,8 @@ def token_decays(prefix: tuple, earlier: tuple, *, sub: int = SUB) -> jax.Array:
                                                                                        strict=True)))
 
 
-def placed_bands(bands: jax.Array, *, chunk: int, sub: int = SUB) -> jax.Array:
-    """Bands of own pairs (`key_diagonal_bands`'), a call's rows `[R, H * sub]` each row `i`'s column `e`
-    the pair `(i, i - e)`, placed `[R, H * chunk]`: each at its column within its chunk and sub-chunk, zero
-    elsewhere, every chunk and head at once."""
-    rows, heads = bands.shape[0], bands.shape[1] // sub
-    token = jnp.arange(rows)[:, None] % chunk
-    lag = token - jnp.arange(chunk)[None, :]
-    within = (lag >= 0) & (lag <= token % sub)
-    found = jnp.take_along_axis(bands.reshape(rows, heads, sub), jnp.clip(lag, 0, sub - 1)[:, None, :],
-                                axis=2)
-    return jnp.where(within[:, None, :], found, jnp.zeros((), bands.dtype)).reshape(rows, heads * chunk)
-
-
 def own_bands(pairs: jax.Array, *, chunk: int, sub: int = SUB) -> jax.Array:
-    """`placed_bands`' transpose, laid an offset a row: a call's pairs `[R, H * chunk]` (each chunk's square
+    """the own pairs' transpose, laid an offset a row: a call's pairs `[R, H * chunk]` (each chunk's square
     of a head's pairs) as their own pairs' bands `[H * sub, R]`, each head's row `e` the pairs `(i, i - e)` of
     every row `i` within its sub-chunk, zero past it: an offset's band a row a backward reads whole
     (`key_diagonal_pairs_back`'s strips), each column read out of a token's band a select and a sum an offset
@@ -882,11 +874,13 @@ def columns_before(found: jax.Array, start: int) -> jax.Array:
     return jnp.where(_grid(found.shape)[1] < start, found, 0.0)
 
 
-def band_masked(band: jax.Array, *, strict: bool, scale: float) -> jax.Array:
-    """A band of own pairs as its output's sum takes it: its column 0, a token's pair with itself, dropped
-    where `strict` (the system, strictly lower), else kept and `scale`d (the scores)."""
-    lane = jax.lax.broadcasted_iota(jnp.int32, band.shape, 1)
-    return jnp.where(lane > 0, band, 0.0) if strict else band * scale
+def block_masked(block: jax.Array, *, strict: bool, scale: float, sub: int = SUB) -> jax.Array:
+    """A block of own pairs (`key_diagonal_bands`') as its output takes it: a token's pair with itself (its
+    row's column within the sub-chunk) dropped where `strict` (the system, strictly lower), else kept and
+    `scale`d (the scores)."""
+    lane = jax.lax.broadcasted_iota(jnp.int32, block.shape, 1)
+    token = jax.lax.broadcasted_iota(jnp.int32, block.shape, 0)
+    return jnp.where(lane < token % sub, block, 0.0) if strict else block * scale
 
 
 def key_decayed_write(key, gates: tuple, last: tuple):
