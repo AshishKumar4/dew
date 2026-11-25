@@ -2391,6 +2391,13 @@ class OptimConfig:
         interval is the one it clamps to."""
         return {group.name: group.bounds for group in self.param_groups if group.bounds is not None}
 
+    def stacked(self) -> bool:
+        """Whether every rule of this config reads a stage-local run's stacked leaf as its stored layers
+        (`OptimizerSpec.STACKED`), with no decay mask bound to parameter names (`decay_mask`, a mapping),
+        which `whole_reading` checks against the stacked tree instead."""
+        masks = (self.decay_mask, *(group.decay_mask for group in self.param_groups))
+        return self.optimizer.STACKED and not any(isinstance(mask, Mapping) for mask in masks)
+
 
 __all__ = [
     "NEWTON_SCHULZ",

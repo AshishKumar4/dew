@@ -971,6 +971,9 @@ class FitSearch[LossT, EffectsT]:
     one that missed among them, for the plan made on the devices as they stand to judge again in place of
     compiling it; a search that is not holds those that fit alone, and drops a held one that misses on its
     devices, which no plan after it asks for."""
+    stated_remat: bool | None = None
+    """Whether any module the run trains stated its own remat before a saved plan moved it (`remat_stated`),
+    read from `objective` as it stands where None."""
     unplaced: int | None = None
     """The bytes a device holds of the state the search plans over that the devices hold none of yet, None
     where they hold it (`dew.training.compiler.StepCompiler.planned_unplaced`): each candidate is judged with
@@ -1007,7 +1010,8 @@ class FitSearch[LossT, EffectsT]:
             remat_topmost(self.objective)
         self.started = self.remat_rung()
         # Whether the run sets its remat, which it compiles at alone: a module's own, or "none" or "full".
-        self.remat_set = self.remat in ("none", "full") or remat_stated(self.objective)
+        explicit = remat_stated(self.objective) if self.stated_remat is None else self.stated_remat
+        self.remat_set = self.remat in ("none", "full") or explicit
         # The modules at their ladders' tops as the search starts, past which a "selective" one climbs none.
         self.topped = remat_topped(self.objective)
         # Every rung keeps, XLA's defaults' included, the options the modules need to compute right, as the

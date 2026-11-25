@@ -228,19 +228,24 @@ def test_cpu_devices_standing_in_for_gpus_hold_a_layout_to_the_memory_stated_for
 
 
 def test_a_gpu_step_over_fsdp_combines_its_parameter_gathers_a_layer_at_a_time():
-    """A step over fsdp 2 on compile-only H100s, three decoder layers of 3.5M parameters computed in bf16
-    over fp32 ones, under the step's options (`step_compiler_options`, its gathers combined up to its
-    largest layer's parameters as stored, `gathered_layer_bytes`): no all-gather of the compiled step moves
-    more than that layer's bytes (a whole MiB over them), where the 1 GiB of the collective options alone
-    combines them past it (IG-SCALING-2XH100: 4.7 of Qwen3.5-4B's layers a gather, 5 GiB more held)."""
+    """A step over fsdp 2 on compile-only H100s, a six-layer hybrid decoder repeating a three-layer period
+    (two sliding-window layers and a full-attention one, 4.2M parameters each computed in bf16 over fp32),
+    under the step's options (`step_compiler_options`, its gathers combined up to its largest layer's
+    parameters as stored, `gathered_layer_bytes`): no all-gather of the compiled step moves more than that
+    layer's bytes (a whole MiB over them), where the 1 GiB of the collective options alone combines a
+    period's layers past it (IG-SCALING-2XH100: 4.7 of Qwen3.5-4B's layers a gather, 5 GiB more held).
+    Like layers under a scan hold only one layer inside the loop body, so even 1 GiB gathers a layer at a
+    time; a periodic run puts its period's layers in one body, where the threshold still caps them."""
     from dew.telemetry.instrumentation import hlo_instructions
     from dew.telemetry.trace import collective
     from dew.training.memory import layer_gathers
 
     mesh = MeshSpec(fsdp=2).build(compile_only_gpus("sm90", 2, 40 * 2**30))
     layout = Layout(min_shard=TINY_SHARD)
-    model = models.build("causal_transformer", vocab_size=VOCAB, emb_features=512, num_layers=3, num_heads=8,
-                         mlp_features=2048, max_seq_len=SEQ_LEN, dtype=jnp.bfloat16)
+    model = models.build("causal_transformer", vocab_size=VOCAB, emb_features=512, num_layers=6, num_heads=8,
+                         mlp_features=2048, max_seq_len=SEQ_LEN, dtype=jnp.bfloat16,
+                         layer_types=("sliding_attention", "sliding_attention", "full_attention") * 2,
+                         kinds={"sliding_attention": {"window": 4}})
     objective, optimizer = LMObjective(model, SEQ_LEN), optax.adam(1e-3)
     ids = jnp.ones((1, SEQ_LEN), jnp.int32)
     variables = jax.eval_shape(lambda: nn.unbox(model.init(jax.random.key(0), ids)))

@@ -266,3 +266,7 @@ def test_a_last_attempt_that_measured_nothing_parts_no_stacks_at_once_whatever_a
     assert weighed.searched([1, 2], 0) is not None
     assert weighed.compiled[:4] == [(0, None), (0, None), (0, 1), (0, 1)], weighed.compiled
     assert weighed.parting is not None and not weighed.parting.futile, weighed.compiled
+    # The next rung, short by 2 of the count's 20, asked joined and then parted at once, where it fits.
+    following = weighed.compiled[4:]
+    assert [group for _, group in following][-1] == 1 and following[0][1] is None, weighed.compiled
+    assert {place for place, _ in following} == {following[0][0]}, weighed.compiled
