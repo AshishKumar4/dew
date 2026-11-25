@@ -3,20 +3,17 @@ its side tiles, as `grouped_matmul`'s launches bind them and their kernels trace
 
 import dataclasses
 import functools
+from collections.abc import Callable
 from typing import NamedTuple, Protocol, runtime_checkable
 
 import jax
-import jax.extend.core as jax_core
-import jax.extend.linear_util as lu
 import jax.numpy as jnp
-import numpy as np
 from jax._src.pallas.mosaic import core as tpu_core, lowering as mosaic_tpu_lowering
 from jax._src.pallas.mosaic_gpu import (
     core as plgpu_core,  # the lowering's semantics (`_lowers`)
     lowering as mosaic_gpu_lowering,
 )
 
-from dew.nn import programs
 from dew.nn.derivatives import marked_call_p
 from dew.nn.kernels import generation, launches
 from dew.nn.programs import equations
@@ -60,8 +57,13 @@ class Hooks:
         return _unsqueezing(self.prologue, self.prologue_broadcast)
 
     def after(self):
-        """The epilogue as a kernel traces it: on the squeezed side tiles."""
-        return _unsqueezing(self.epilogue, self.epilogue_broadcast, self.accumulators)
+        """The epilogue as a kernel traces it: on the squeezed side tiles, column-local as declared
+        (`ColumnLocal`: a side's dimension of one given back across a chunk's columns as across its
+        tile's)."""
+        after = _unsqueezing(self.epilogue, self.epilogue_broadcast, self.accumulators)
+        if isinstance(self.epilogue, ColumnLocal) and after is not self.epilogue:
+            return ColumnLocal(after)
+        return after
 
     def kernel_options(self) -> dict:
         return {'prologue': self.before(), 'prologue_axes': self.prologue_axes, 'epilogue': self.after(),
@@ -144,104 +146,18 @@ def _lowers(hook, tiles: tuple, sides, rules, *, layout=None) -> bool:
                for equation in equations(traced.jaxpr))
 
 
-PROBE_ROWS, PROBE_COLUMNS = 8, 24
-"""The extents a hook's locality is read at (`column_local`), apart so a vector's axis reads off its
-length."""
+@dataclasses.dataclass(frozen=True)
+class ColumnLocal:
+    """An epilogue `hook` its caller declares column-local: each output column computed from that column of
+    its accumulators and of its side tiles alone, as a prologue's is by the template's contract (applied a
+    depth step's tile at a time, kernel-templates.md §3), so its VJP's (`gemm._prologue_pulled`). A launch
+    reads such a hook's tile out a chunk of columns at a time (`read_out`, `pricing.hook_chunk`); any other
+    hook takes its tile whole."""
 
-SHAPE_PARAMS = frozenset({'shape', 'new_sizes', 'sizes', 'sharding', 'out_sharding'})
-"""The parameters an equation states its result's extents in, which a hook traced at two widths differs in
-alone (`column_local`)."""
+    hook: Callable
 
-
-def _traced(hook, accumulators: int, sides: tuple, rows: int, columns: int):
-    """`hook` traced as a launch's body traces it (`launches.tracing_body`) on `[rows, columns]`
-    accumulators and its side tiles (`sides`, each its axes and dtype) as an epilogue takes them
-    (`axes.by_rows`: along rows or groups, `rows`; along columns, `columns`)."""
-    extents = {'rows': rows, 'groups': rows, 'columns': columns}
-    with launches.tracing_body(interpret=False):
-        return jax.make_jaxpr(hook)(
-            *(jax.ShapeDtypeStruct((rows, columns), jnp.float32),) * accumulators,
-            *(jax.ShapeDtypeStruct(tuple(extents[axis] for axis in side_axes), dtype)
-              for side_axes, dtype in sides))
-
-
-def _entrywise(jaxpr, rows: int, columns: int) -> bool:
-    """Whether every equation of `jaxpr` (traced at `rows` by `columns`, apart), nested ones too, is
-    entrywise on tiles, row vectors, column vectors or scalars, or broadcasts a scalar, a column vector along
-    the rows or a row vector along the columns."""
-    allowed = {(rows, columns), (rows,), (columns,), ()}
-    for equation in jaxpr.eqns:
-        if any(getattr(variable.aval, 'shape', None) not in allowed
-               for variable in (*equation.invars, *equation.outvars)):
-            return False
-        nested = list(jax_core.jaxprs_in_params(equation.params))
-        if nested:
-            if programs.control_flow(equation.primitive) or not all(
-                    _entrywise(inner, rows, columns) for inner in nested):
-                return False
-        elif equation.primitive is jax.lax.broadcast_in_dim_p:
-            operand = equation.invars[0].aval.shape
-            dimensions = tuple(equation.params['broadcast_dimensions'])
-            if (operand, dimensions) not in {((), ()), ((rows,), (0,)), ((columns,), (1,)),
-                                             ((rows, columns), (0, 1))}:
-                return False
-        elif not programs.entrywise(equation.primitive):
-            return False
-    return True
-
-
-def _rule(value) -> bool:
-    """Whether an equation's parameter is a rule each trace builds its own of, from one source (a custom
-    derivative's `jvp_jaxpr_fun`: a `linear_util.WrappedFun`, compared by identity alone)."""
-    return callable(value) or isinstance(value, lu.WrappedFun)
-
-
-def _same(first, second) -> bool:
-    """Whether two traces of one hook at two extents compute alike: equation for equation the same
-    primitive, the same parameters but the extents they state (`SHAPE_PARAMS`), nested ones alike, the same
-    literals and the same constants; a hook reading its tile's extent (scaling by its width) differs."""
-    if len(first.eqns) != len(second.eqns) or len(first.constvars) != len(second.constvars):
-        return False
-    for one, other in zip(first.eqns, second.eqns, strict=True):
-        if one.primitive is not other.primitive or set(one.params) != set(other.params):
-            return False
-        for name, value in one.params.items():
-            if name in SHAPE_PARAMS:
-                continue
-            twin = other.params[name]
-            inner = list(jax_core.jaxprs_in_params({name: value}))
-            if inner:
-                if not all(_same(a, b) for a, b in zip(inner, jax_core.jaxprs_in_params({name: twin}),
-                                                       strict=True)):
-                    return False
-            elif value != twin and not (_rule(value) and _rule(twin)):
-                return False
-        for a, b in zip(one.invars, other.invars, strict=True):
-            literal = isinstance(a, jax_core.Literal)
-            if literal != isinstance(b, jax_core.Literal) or (literal and not np.array_equal(a.val, b.val)):
-                return False
-    return True
-
-
-@functools.lru_cache(maxsize=256)
-def column_local(hook, accumulators: int, sides: tuple, rows: int, columns: int, chunk: int) -> bool:
-    """Whether an epilogue `hook` computes each output column from that column of its `accumulators` and its
-    side tiles alone (`sides`, each its axes and dtype), so a `[rows, columns]` tile may be read out
-    `chunk` columns at a time (`pricing.hook_chunk`): traced at a probe's extents its every equation
-    entrywise (`_entrywise`: none reduces, gathers, reverses or numbers the columns), and traced at the
-    tile's and the chunk's widths alike (`_same`: none reads its width). A hook subtracting its rows'
-    maxima, or scaling by its tile's width, is not; nor one that traces at none of those extents."""
-    try:
-        probe, whole, part = (_traced(hook, accumulators, sides, *extents)
-                              for extents in ((PROBE_ROWS, PROBE_COLUMNS), (rows, columns), (rows, chunk)))
-    except (KeyError, TypeError, ValueError):
-        # A side along another axis, or a hook of fixed extents (a block-scaled one's), takes its tile whole.
-        return False
-    if any(np.ndim(const) for const in (*probe.consts, *whole.consts, *part.consts)):
-        return False
-    return (_entrywise(probe.jaxpr, PROBE_ROWS, PROBE_COLUMNS) and _same(probe.jaxpr, whole.jaxpr)
-            and _same(whole.jaxpr, part.jaxpr)
-            and all(np.array_equal(a, b) for a, b in zip(whole.consts, part.consts, strict=True)))
+    def __call__(self, *tiles):
+        return self.hook(*tiles)
 
 
 class ReadOut(NamedTuple):
@@ -257,22 +173,19 @@ NO_READ_OUT = ReadOut()
 """A launch's read-out where its caller states none: no output narrowed, its issuer's own chunks."""
 
 
-def read_out(family, part: tuple[int, int], dtypes: tuple, forms: tuple, staging, accumulators: int,
-             epilogue, side_axes: tuple, side_operands: tuple) -> ReadOut:
+def read_out(family, part: tuple[int, int], dtypes: tuple, forms: tuple, staging, epilogue) -> ReadOut:
     """A launch's `ReadOut` on `family` at a consumer's `part` of its tile (rows, columns), its outputs'
-    `dtypes` and `forms` (none where empty), its `staging`, and its `epilogue` over `accumulators` and its
-    side operands (`side_operands`, each along its `side_axes`): the one decision its kernel
-    (`mosaic_gpu._finished`) and its register model (`grouped_matmul._epilogue_registers`) both read."""
+    `dtypes` and `forms` (none where empty), its `staging`, and its `epilogue` (a `ColumnLocal` one read out
+    a chunk at a time): the one decision its kernel (`mosaic_gpu._finished`) and its register model
+    (`grouped_matmul._epilogue_registers`) both read."""
     from dew.nn.kernels.templates.gemm import pricing
 
     forms = tuple(forms) or (None,) * len(dtypes)
     narrowed = tuple(1 if form is None or not form.narrowed else form.divisor for form in forms)
     if epilogue is None:
         return ReadOut(narrowed)
-    sides = tuple((tuple(axes), side.dtype) for axes, side in zip(side_axes, side_operands, strict=True))
-    local = functools.partial(column_local, epilogue, accumulators, sides, *part)
     return ReadOut(narrowed, pricing.hook_chunk(family, part[0], part[1], dtypes, forms, staging,
-                                                local=local))
+                                                local=isinstance(epilogue, ColumnLocal)))
 
 
 def lowering_rules(target) -> dict:

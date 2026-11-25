@@ -531,7 +531,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                                 packed_format=packed_format, forms=forms)
     bounded = None if when is None else chained  # each product its own accumulator (`guarded_walk`)
     matrices, streamed, accumulators = _gmm_streamed(paired, scales, joined, bounded)
-    reading = read_out(family, part, dtypes, forms, tiles.staging, accumulators, hooks[2], hooks[3], sides[1])
+    reading = read_out(family, part, dtypes, forms, tiles.staging, epilogue)
     # A pair's tiles: g groups' boundaries, and the unrouted rows.
     grid = (pl.cdiv(m, block_m * pair) + (0 if dense else g), pl.cdiv(n, block_n))
     def body(*gmems):

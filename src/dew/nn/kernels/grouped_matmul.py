@@ -306,8 +306,7 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
                                           hooked=read_out(
                                               family, (config.share, columns), out_dtypes,
                                               quantized.forms_of(hooks.out_forms, out_dtypes), config.staging,
-                                              hooks.accumulators, hooks.after(), hooks.epilogue_axes,
-                                              ba.arguments.get('epilogue_operands', ())).columns)
+                                              hooks.after()).columns)
 
     def _step_sizes(self, ba) -> tuple[int, ...] | None:
         del ba

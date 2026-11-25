@@ -61,7 +61,7 @@ from dew.nn.kernels.templates import axes as side_axes_of, product as product_of
 from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import epilogue_vjp, rows_permuted, scattered, tiling
 from dew.nn.kernels.templates.gemm.factored import factored
-from dew.nn.kernels.templates.gemm.hooks import NO_HOOKS, Formed, Hooks
+from dew.nn.kernels.templates.gemm.hooks import NO_HOOKS, ColumnLocal, Formed, Hooks
 from dew.nn.kernels.templates.product import SCALE_DEPTH, bf16_part_count, declared, formed, terms
 from dew.nn.precision import accumulated, asks_default_precision, at_least_fp32, exact_products, twice_scaled
 from dew.nn.programs import read_by
@@ -1909,6 +1909,7 @@ def _prologue_pulled(prologue, lhs, arrays: tuple, d, matrix, group_sizes, prior
     def formed(x, *sides):
         return prologue(x.astype(dtype), *sides).astype(dtype)
 
+    @ColumnLocal  # as its prologue is by the template's contract, a depth step's tile at a time
     def pulled(acc, *tiles):
         if prior is not None:
             acc, tiles = acc + tiles[0], tiles[1:]

@@ -1,7 +1,7 @@
-"""An epilogue's hook over a Hopper tile read out a chunk of columns at a time (`pricing.hook_chunk`,
-`hooks.column_local`): a hook reading every column of its row still sees them all, and outputs staged at
-different widths each fill whole buffers; each product, the template named at a pinned 128-column tile,
-interpreted, as exact as XLA's from float64."""
+"""An epilogue's hook over a Hopper tile read out a chunk of columns at a time where its caller declares
+it column-local (`hooks.ColumnLocal`, `pricing.hook_chunk`): its outputs staged at different widths each
+fill whole buffers, and a hook reading every column of its row, undeclared, still sees them all; each
+product, the template named at a pinned 128-column tile, interpreted, as exact as XLA's from float64."""
 
 import jax
 import jax.numpy as jnp
@@ -11,6 +11,7 @@ from reference_error import assert_as_exact
 
 from dew.nn.kernels import gemm, generation, grouped_matmul, tuning
 from dew.nn.kernels.templates.gemm import tiling
+from dew.nn.kernels.templates.gemm.hooks import ColumnLocal
 
 SEEDS = 8
 ROWS, DEPTH, WIDTH = 128, 128, 128
@@ -34,18 +35,11 @@ def _centred(dtypes):
     return hook
 
 
-def _width_scaled(dtypes):
-    """A hook scaling each entry by its tile's width: entrywise, but reading the extent it is traced at."""
-    def hook(acc):
-        return ((acc * acc.shape[-1]).astype(dtypes[0]),)
-    return hook
-
-
 def _two_widths(dtypes):
-    """A hook storing two values in `dtypes` (a bf16 one and an FP8 one, staged at different widths)."""
+    """A column-local hook storing two values in `dtypes`, each staged at its own width."""
     def hook(acc):
         return acc.astype(dtypes[0]), (2 * acc).astype(dtypes[1])
-    return hook
+    return ColumnLocal(hook)
 
 
 def _template(hook, out_dtypes):
@@ -63,14 +57,14 @@ def _reference(hook, out_dtypes, wide=jnp.float32):
     return run
 
 
-@pytest.mark.parametrize(("hook", "out_dtypes"), [(_centred, (jnp.float32,)), (_width_scaled, (jnp.float32,)),
-                                                  (_two_widths, (jnp.bfloat16, jnp.float8_e4m3fn))],
-                         ids=["row-maximum", "width-scaled", "two-widths"])
+@pytest.mark.parametrize(("hook", "out_dtypes"), [
+    (_centred, (jnp.float32,)), (_two_widths, (jnp.bfloat16, jnp.float32)),
+    (_two_widths, (jnp.bfloat16, jnp.float8_e4m3fn))], ids=["row-maximum", "bf16-fp32", "bf16-fp8"])
 def test_a_hooked_product_over_a_chunked_tile_is_its_programs(hook, out_dtypes):
-    """A row-maximum hook and one scaling by its tile's width (neither column-local: each takes the tile
-    whole), and a two-dtype hook (its FP8 output staged 128 columns wide where its bf16 one is 64), through
-    the template at a 128-column tile, interpreted as an H100 runs it: as exact as XLA's product and hook,
-    from float64."""
+    """Through the template at a 128-column tile, interpreted as an H100 runs it, as exact as XLA's product
+    and hook from float64: a row-maximum hook (undeclared: its tile read out whole); a column-local hook of a
+    bf16 and an fp32 output (read out 64 columns at a time, each chunk in its turn's buffer); and one of a
+    bf16 and an FP8 output (the FP8 one staged 128 columns wide, so its tile is read out whole)."""
     assert_as_exact(jax.jit(_template(hook, out_dtypes)), jax.jit(_reference(hook, out_dtypes)), _draw,
                     f"chunked hook {hook.__name__}", seeds=SEEDS,
                     truth_fn=_reference(hook, (jnp.float64,) * len(out_dtypes), wide=jnp.float64))
