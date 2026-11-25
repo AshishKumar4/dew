@@ -35,8 +35,9 @@ PREPARE_TARGETS = 4
 """How many of the plan's targets a dry prepare's task may take before its file is prepared in groups
 (`groups_of`), as the tier's run cuts it, each group a task of its own."""
 PREPARE_WALL = 600.0
-"""The most a dry prepare's task runs, its processes' ends included (`run`), whatever its deadline:
-under a train's wall bound, 626 to 696 s (its 900 s target less its warm-up and plan, its finish and a
+"""A dry prepare task's shared budget (`run`), whatever its deadline: its topology, baseline lookups and
+processes draw on it, its last records' publication and its restorations may run past it. It sits under a
+train's wall bound, 626 to 696 s (its 900 s target less its warm-up and plan, its finish and a
 margin). Its groups are cut to its cap (`cap_after`), which holds a group however unevenly its count cut
 (`prepared_cut`) spreads its work (rows 12873, 12429-12439, 12643, 12759: groups cut to 480 s, capped only at
 their task's 1,680 s, ran 665 to 1,650 s and set their trains' walls)."""
@@ -548,8 +549,8 @@ def run(ci, python: str, tests: list[str], split: str, out: Path, deadline: floa
     that declares it compiles at run is neither. A row left no time is said stale. The fixtures are the task's
     own fetch's (ci.py's `task`)."""
     began = time.monotonic()
-    # The whole task within PREPARE_WALL, its topology, baseline lookups and restorations as well as its
-    # processes, so no dry prepare task sets a train's wall.
+    # The task's shared budget, PREPARE_WALL: its topology, baseline lookups and processes draw on it, so no
+    # dry prepare task's pytest sets a train's wall (its records' publication and restores may run past it).
     deadline = min(deadline, PREPARE_WALL)
     names, kept = ci.kept_of([test.removeprefix(TOKEN) for test in tests])
     units = [(name, split) for name in names] + list(kept)
