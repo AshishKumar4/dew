@@ -1069,6 +1069,8 @@ def test_a_run_saved_with_its_loops_choices_flat_loads_and_loops_as_it_did(tmp_p
     from dew.training.phase_passes import SampledPasses
 
     today = LMRunConfig(pretrained=str(QWEN)).record()
+    # A run of today records no saved run's translation.
+    assert "_earlier_loop" not in today["fields"]
     path = tmp_path / "run.json"
     path.write_text(json.dumps({**today, "fields": {**today["fields"], "loop_steps": 2, "loop_layers": [1, 2],
                                                     "loop_exit_gate": True}}))
