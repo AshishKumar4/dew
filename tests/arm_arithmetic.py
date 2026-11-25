@@ -378,9 +378,11 @@ class Written:
 
     def _on_tpu(self, inputs, options):
         """The TPU's compiled twin of a call on `inputs`, None where the TPU compiles none (`ran_on`)."""
-        # Arrays by their types, any other leaf (an option's flag) by its value.
+        # Arrays, JAX's or NumPy's (a draw's host operand, a NumPy scalar), by their types; any other leaf (an
+        # option's flag) by its value.
         leaves, structure = jax.tree.flatten((inputs, options))
-        key = (tuple(jax.typeof(leaf) if isinstance(leaf, jax.Array) else leaf for leaf in leaves), structure)
+        key = (tuple(jax.typeof(leaf) if isinstance(leaf, jax.Array | np.ndarray | np.generic) else leaf
+                     for leaf in leaves), structure)
         if key not in self._compiled:
             try:
                 self._compiled[key] = self.program("tpu").lower(*inputs, **options).compile()

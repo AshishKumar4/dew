@@ -18,12 +18,12 @@ import numpy as np
 import pytest
 from arm_arithmetic import float64_held
 from model_support import attending
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, equations
 from test_decision_objective import SPECIALS, TOKENIZER
 
 from dew.batch import part, thaw
 from dew.decision import Choice
-from dew.decision.head import LabelReadout, SlotReadout
+from dew.decision.head import LabelReadout, SlotReadout, answer_states
 from dew.decision.inputs import DecisionInputs
 from dew.decision.layout import Labels, SegmentLayout
 from dew.decision.model import DecisionModel
@@ -31,7 +31,7 @@ from dew.decision.objective import DecisionObjective
 from dew.interop import Pretrained
 from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.protocols import OutputTable
+from dew.nn.protocols import EXIT_PASSES, EXITS, OutputTable
 from dew.quantization import InputQuantizer
 
 LLAMA = Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny"
@@ -356,6 +356,47 @@ def _exit_passes(gates: np.ndarray, threshold: float) -> np.ndarray:
     kept = np.cumprod(np.concatenate([np.ones_like(hazard[:1]), 1 - hazard[:-1]]), axis=0)
     reached = np.cumsum(hazard * kept, axis=0) >= threshold
     return np.where(reached.any(axis=0), reached.argmax(axis=0) + 1, len(gates))
+
+
+@attending("xla")
+def test_a_decision_models_exit_logits_run_each_later_pass_over_its_rows_still_looping():
+    """Scoring a readout of labels over a backbone whose rows exit whole at its threshold (`exit_by='row'`)
+    through the decision model's `exit_logits`, which opens the exit passes alone, runs each later pass
+    over the batch's halvings that hold its rows still looping (`looping.compacted`, row 12927): eight
+    rows' pass a program for eight, four, two and one. Its threshold set where half the rows exit at the
+    first pass, the later passes run on the bucket of four; its logits and each answer's exit pass are
+    those of a forward whose passes run over every row (one opening a collection beside the exit passes)."""
+    looped = backbone().with_passes(3, (0, 2), exit_gate=True, exit_threshold=0.5)
+    looped = looped.clone(loop=dataclasses.replace(looped.loop, exit_at="block", exit_by="row"))
+    readout = LabelReadout(32, ids())
+    objective = DecisionObjective(looped, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT, head=readout)
+    drawn = objective.init(jax.random.key(0))
+    gate = np.random.default_rng(0x12927).normal(0, 2.0, (looped.emb_features + 1,))
+    params = {**drawn["params"], "backbone": {**drawn["params"]["backbone"], "early_exit_gate": {
+        "kernel": jnp.asarray(gate[:-1, None], jnp.float32), "bias": jnp.asarray(gate[-1:], jnp.float32)}}}
+    variables = {**drawn, "params": params}
+    batch = DecisionInputs.collate(rows_of(0, count=8), SPECIALS.pad)
+    # Each row's first pass's exit chance (its row gate's logit, one a row), the threshold between the
+    # fourth and fifth largest: four rows exit at the first pass, four loop on.
+    _, sown = objective.model.observed_logits(variables, batch, opened=(EXITS,))
+    logit = np.asarray(sown[EXITS]["logits"][0], np.float64).reshape(len(batch.tokens), -1)[:, 0]
+    first = np.sort(1 / (1 + np.exp(-logit)))
+    threshold = float((first[3] + first[4]) / 2)
+    assert first[3] < threshold < first[4]
+    model = DecisionModel(looped.clone(loop=dataclasses.replace(looped.loop, exit_threshold=threshold)),
+                          readout)
+    traced = jax.make_jaxpr(lambda values: model.exit_logits(values, batch))(variables)
+    buckets = [eqn for eqn in equations(traced)
+               if eqn.primitive.name == "cond" and len(eqn.params["branches"]) == 4]
+    assert len(buckets) == looped.loop.steps - 1
+    logits, passes = jax.jit(lambda values: model.exit_logits(values, batch))(variables)
+    whole, sown = jax.jit(lambda values: model.observed_logits(
+        values, batch, opened=(EXIT_PASSES, "intermediates")))(variables)
+    (chosen,) = jax.tree.leaves(sown[EXIT_PASSES])
+    assert np.sum(np.asarray(passes)[:, 0] == 1) == 4
+    np.testing.assert_array_equal(np.asarray(logits), np.asarray(whole))
+    np.testing.assert_array_equal(np.asarray(passes),
+                                  np.asarray(answer_states(chosen[..., None], batch)[..., 0]))
 
 
 @attending("xla")

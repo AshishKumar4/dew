@@ -71,6 +71,7 @@ from dew.nn.sharding import explicit_spec
 __all__ = [
     "ACCURATE",
     "DTYPE_PRESETS",
+    "EXACT_FLOAT32",
     "FP8",
     "FP32_SUMS",
     "L2NORM_EPS",
@@ -103,6 +104,8 @@ __all__ = [
     "compensated_sum",
     "compensated_total",
     "compensates_loops",
+    "computed_dot",
+    "computed_einsum",
     "configurable_precision",
     "configured_precision",
     "correctly_rounded_divide",
@@ -1108,6 +1111,29 @@ def float32_einsum(subscripts: str, *operands, precision: jax.lax.PrecisionLike 
                        preferred_element_type=preferred_element_type)
 
 
+def computed_einsum(subscripts: str, *operands, dtype: DTypeLike) -> jax.Array:
+    """`jnp.einsum` of `operands` cast to `dtype`, the compute dtype the run computes the layer in, summed in
+    at least fp32 at the precision the run's policy gives such operands (`operand_precision`: a bf16 run's
+    Tensor Core product at the `BF16_BF16_F32` algorithm, `Numerics.matmul`'s configured level otherwise,
+    `ACCURATE`'s exact float32): the product a model layer's small contractions take (a cross-pass merge's
+    controller and its depth read, `dew.nn.cross_pass`; `DepthAttention`'s; a decision readout's), in the
+    run's numerics and no level of their own (row 12918)."""
+    compute = jnp.dtype(dtype)
+    return float32_einsum(subscripts, *(operand.astype(compute) for operand in operands),
+                          precision=operand_precision(compute), preferred_element_type=at_least_fp32(compute))
+
+
+def computed_dot(x: jax.Array, kernel: jax.Array, *, dtype: DTypeLike) -> jax.Array:
+    """`x`'s last axis contracted with `kernel`'s first, as `computed_einsum` contracts: a layer's projection
+    in the run's numerics (a cross-pass merge's controller, `dew.nn.cross_pass`), a dot product as a dense
+    layer's is, so a quantization rule over its products' ops reads it as one (row 12918)."""
+    compute = jnp.dtype(dtype)
+    contracted = (((x.ndim - 1,), (0,)), ((), ()))
+    return float32_dot_general(x.astype(compute), kernel.astype(compute), contracted,
+                               precision=operand_precision(compute),
+                               preferred_element_type=at_least_fp32(compute))
+
+
 def _bf16_algorithm(precision: jax.lax.PrecisionLike) -> bool:
     """Whether `precision` names XLA's `BF16_BF16_F32` dot algorithm, which Dew's products run as
     `bf16_dot_general`."""
@@ -1338,6 +1364,11 @@ def numerics_of(given: Numerics | str) -> Numerics:
         return Numerics(DTYPE_PRESETS[given])
     raise ValueError(f"a run's precision is a Numerics record, 'default', one of {sorted(NUMERICS_PRESETS)} "
                      f"or a dtype preset of {sorted(DTYPE_PRESETS)}, not {given!r}")
+
+
+EXACT_FLOAT32 = jax.lax.Precision.HIGHEST
+"""The precision a genuinely exact boundary names, IEEE float32 whatever JAX's configured precision
+(`exact_float32`'s where its call states none): each user names its reason where it reads it (row 12921)."""
 
 
 def exact_float32(precision: jax.lax.PrecisionLike) -> jax.lax.PrecisionLike:

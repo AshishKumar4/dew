@@ -107,6 +107,8 @@ Scope is per rule, because the rules are not all about the same thing:
   `xla_compiled` waits for a compile slot, whatever its pool's width.
 - SLOP033 is about tests (tools/lint_assertions.py): no test pins a choice Dew
   derives to a literal (CONTRIBUTING's banned assertion 2).
+- SLOP034 (tools/lint_precisions.py): no contraction in `src/<package>`
+  names its precision outright outside its precision policy.
 - SLOP029 is about `tests`: no test's every assertion is that a process
   failed, read from its exit status alone (a `returncode`, `subprocess.call`
   or `os.system` unequal to 0, equal to 1, an uncaught error's, or tested for
@@ -165,6 +167,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import lint_assertions as assertion_rules
 import lint_derivatives as derivative_rules
 import lint_divisors as divisor_rules
+import lint_precisions as precision_rules
 import lint_promotions as promotion_rules
 import lint_scopes as scopes
 import lint_tolerances as tolerance_rules
@@ -675,6 +678,13 @@ def divisions(module: Module) -> Iterator[Finding]:
     """SLOP024: a JAX array divided by a constant whose reciprocal rounds (tools/lint_divisors.py)."""
     for line, col, message in divisor_rules.divisions(module.path, module.tree, _parent(module)):
         yield Finding(module.relative, line, col, "SLOP024", message)
+
+
+def precisions(module: Module) -> Iterator[Finding]:
+    """SLOP034: a precision named outright outside the precision policy (tools/lint_precisions.py)."""
+    found = precision_rules.precisions(module.relative, module.package, module.tree, _parent(module))
+    for line, col, message in found:
+        yield Finding(module.relative, line, col, "SLOP034", message)
 
 
 def size(module: Module) -> Iterator[Finding]:
@@ -2013,39 +2023,6 @@ RULE = "tools/lint_tolerances.py"
 """SLOP020's reading of a file (`tolerance_rules`), whose change may grow what the inventory holds."""
 
 
-def _tolerance_comparisons(module: Module) -> Iterator[tuple[ast.expr | ast.stmt, str]]:
-    """SLOP020's comparisons in a module (`tolerance_rules.comparisons`), its imports read from its own
-    package and its calls resolved as SLOP018 resolves them. A function imported by a bare module name
-    from a file beside it, as tests import their support (`from test_pipeline_core import delivered`),
-    is read as that file's own reading proves it (`_support_functions`), as the same function defined in
-    the test would be."""
-    parent = tuple(_parent(module))
-    tables = {id(node): table for node, table in scopes.scoped(module.tree.body, {}, list(parent))}
-
-    def imported(called: str) -> tolerance_rules.Imported | None:
-        source, _, name = called.rpartition(".")
-        path = module.path.parent / f"{source}.py"
-        if not source or "." in source or not path.is_file():
-            return None
-        return _support_functions(path, parent, path.stat().st_mtime_ns).get(name)
-
-    return tolerance_rules.comparisons(module.tree, tables, _Calls(module.tree), imported)
-
-
-@functools.cache
-def _support_functions(path: Path, parent: tuple[str, ...], modified: int
-                       ) -> dict[str, tolerance_rules.Imported]:
-    """What the file at `path` proves of each of its module-level functions
-    (`tolerance_rules.support_functions`), read as of its modification time `modified`."""
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    tables = {id(node): table for node, table in scopes.scoped(tree.body, {}, list(parent))}
-    calls = _Calls(tree)
-    # A name the module binds twice, or to anything but its one definition, is no one's.
-    bound = calls.bindings[id(tree)]
-    return {name: found for name, found in tolerance_rules.support_functions(tree, tables, calls).items()
-            if isinstance(bound.get(name), ast.FunctionDef | ast.AsyncFunctionDef)}
-
-
 def _inventory(checkout: Path) -> dict:
     """The inventory as it is now: read again whenever the file changes, so one process reading two
     states of a checkout sees each."""
@@ -2257,7 +2234,7 @@ def tolerances(module: Module) -> Iterator[Finding]:
     (`ratchet` holds every commit's inventory to its parents')."""
     if not module.relative.startswith(("tests/", "tools/")) or module.relative in GATE:
         return
-    found = sorted(_tolerance_comparisons(module),
+    found = sorted(tolerance_rules.read(module.path, module.tree, _parent(module), _Calls),
                    key=lambda pair: (pair[0].lineno, pair[0].col_offset))
     inventory = _inventory(_checkout(module))
     entry = inventory.get("files", {}).get(module.relative)
@@ -2359,7 +2336,7 @@ def compile_pools(module: Module) -> Iterator[Finding]:
 
 
 CONTRACT_RULES = (contracts, probes, names, imports, calls, authorities, waits, detections, compile_points,
-                  pallas_launches, owned_constructs, derivative_contracts)
+                  pallas_launches, owned_constructs, derivative_contracts, precisions)
 UNIVERSAL_RULES = (suppressions, swallowed, comments, size, jax_private, compile_pools)
 
 

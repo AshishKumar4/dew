@@ -2008,7 +2008,8 @@ def test_a_tpu_twin_as_written_runs_on_its_host_only_where_the_tpu_lowers_no_tra
     """A TPU call's twin as written runs on the TPU, its own arithmetic (rows 12813-12841: on its host, IEEE
     fp32 against a TPU's default-precision products, it failed 29 float32 cells), and on the host only where
     the TPU's compile raises XLA's UNIMPLEMENTED status for an HLO transpose (`TPU_TRANSPOSE`, rows
-    12356-12361, 12118-12123, 12127); any other refusal is raised (`Written.ran_on`)."""
+    12356-12361, 12118-12123, 12127); any other refusal is raised (`Written.ran_on`). A NumPy operand or
+    option keys its call by its type, as a JAX array does (train 1285's v5e: a NumPy leaf was unhashable)."""
     from generation_support import on_a_v5e
 
     rows = jnp.ones((3,), jnp.float32)
@@ -2023,3 +2024,8 @@ def test_a_tpu_twin_as_written_runs_on_its_host_only_where_the_tpu_lowers_no_tra
         with pytest.raises(jax.errors.JaxRuntimeError) as raised:
             _OnATpu(other).ran_on(rows)
         assert raised.value is other
+        # A NumPy operand and a NumPy scalar option, keyed by their types as JAX's arrays are: one compile.
+        twin = _OnATpu(None)
+        assert twin(np.ones((3,), np.float32), scale=np.float32(2)) == "the TPU's"
+        assert twin(np.zeros((3,), np.float32), scale=np.float32(3)) == "the TPU's"
+        assert len(twin._compiled) == 1

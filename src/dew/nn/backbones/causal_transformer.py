@@ -1400,9 +1400,7 @@ class CausalTransformer(LinearProducts):
             # nothing unless a caller opens the collection.
             self.sow(_FINAL, 'states', residual, reduce_fn=lambda _, value: value, init_fn=lambda: None)
         streams, x = self._collapse(residual)
-        hidden = self.exit_states(x)
-        self._gate_exit(hidden)
-        hidden = self.head_states(hidden)
+        hidden = self.head_states(self.exit_states(x))
         # V4's depth input: inference/model.py MTPBlock.forward at b5968e9.
         prediction = hidden if self.mtp_hyper_connections is None else streams
         if (self.mtp_hyper_connections is not None and not self.is_initializing()
@@ -1415,14 +1413,6 @@ class CausalTransformer(LinearProducts):
         """Run the layer stack over `x` once, or as `loop` says (`looping.run_loop`): its block's later
         passes under one scan, so a step's program holds two passes whatever the loop's count."""
         return run_loop(self, x, **stack)
-
-    def _gate_exit(self, normed):
-        """Sow the exit gate's logit for the output's states into `exits`, after each earlier pass's."""
-        if self.loop is None or not self.loop.exit_gate:
-            return
-        logit = self.early_exit_gate(normed)
-        if not self.is_initializing():
-            self.sow(EXITS, 'logits', logit)
 
     def exit_states(self, x):
         """The stack's one residual `x` as it leaves for the head and the exit gate: through the final norm
@@ -1455,12 +1445,14 @@ class CausalTransformer(LinearProducts):
         return normed.astype(wide) / jnp.asarray(self.logits_scaling, wide)
 
     def stack(self, x, *, train: bool, decode: bool, per_layer_input, attention_metadata=None,
-              span: tuple[int, int] | None = None, prior_bank=None):
+              span: tuple[int, int] | None = None, prior_bank=None, kv_store=None):
         """Run the layer stack over `x` as the plain loop, as scanned runs, or as a pipeline over the stages
         (`decoder_stages.stack`), each layer of a looped block that passes messages reading `prior_bank`
-        (`Loop.messages`)."""
+        (`Loop.messages`), its layers' providers' publications read from and left in `kv_store` (a loop's
+        part's, `dew.nn.backbones.looping`; a fresh one where None)."""
         return decoder_stages.stack(self, x, train=train, decode=decode, per_layer_input=per_layer_input,
-                                    attention_metadata=attention_metadata, span=span, prior_bank=prior_bank)
+                                    attention_metadata=attention_metadata, span=span, prior_bank=prior_bank,
+                                    kv_store=kv_store)
 
     def residual_summary(self, x) -> jax.Array:
         """The `[B, S, D]` summary of the residual `x` a block of a looped pass leaves its pass after
@@ -1518,7 +1510,7 @@ class CausalTransformer(LinearProducts):
         return banked_collections(groups, self.variables)
 
     def residual_dtype(self, x, *, train: bool, decode: bool, per_layer_input,
-                       attention_metadata=None, first: int = 0) -> jnp.dtype:
+                       attention_metadata=None, first: int = 0, kv_store=None) -> jnp.dtype:
         """Return the dtype the residual stream settles in: `x`'s promoted with layer `first`'s output.
 
         A scan carries one dtype through, and each pipeline stage takes the
@@ -1531,8 +1523,10 @@ class CausalTransformer(LinearProducts):
         call's own path: opened beyond them, an attention sowing its QK-Clip
         maxima decided a kernel for a mask the call never builds (a cache made
         under a chosen template refused, row 4101). Its routes are no route the
-        call takes (`generation.routes`, alone). A banked store answers from
-        its bank's first row without fetching it.
+        call takes (`generation.routes`, alone). It reads a copy of the
+        publications the span enters with (`kv_store`), so a span opening on
+        a layer that reads its provider's reads them. A banked store answers
+        from its bank's first row without fetching it.
         """
         layer = self.layers[first]
         streams = x.streams if isinstance(x, Carried) else x
@@ -1541,7 +1535,8 @@ class CausalTransformer(LinearProducts):
         with generation.routes(alone=True):
             output = jax.eval_shape(lambda held: layer.apply(
                 held, x, mutable=opened, rngs={'params': jax.random.key(0)},
-                train=train, decode=decode, kv_store={} if self.provides else None,
+                train=train, decode=decode,
+                kv_store=dict(kv_store) if kv_store is not None else ({} if self.provides else None),
                 per_layer_input=None if per_layer_input is None else per_layer_input.layer(first),
                 attention_metadata=attention_metadata), self._layer_shapes_at(first))
         output = output if opened is False else output[0]
