@@ -393,3 +393,22 @@ def test_a_shuffled_limit_rejected_for_passes_reads_on_to_the_pass_that_keeps_on
             assert np.asarray(next(stream)["id"]).ravel().tolist() == [kept]
         finally:
             stream.close()
+
+
+def test_a_mixtures_corpora_read_in_workers_by_their_draw_weights():
+    """A mixture read in eight loading workers that draws one corpus seven times as often as the other
+    reads it in seven of them and the other in one, where an equal share gave each four (the owner's 4B
+    mixture: a corpus drawn 2.74% of the time read in 26 of 52 workers, as many as the 97.26% one), as
+    the position it saves records."""
+    loading = Loading(workers=8, threads=1, read_buffer=1, worker_buffer=1)
+    data = compile(mix([_kept("rare"), _kept("common")], [1.0, 7.0]).batch(1), read="indexed",
+                   loading=loading)
+    reader = data.train(DataPartition())
+    try:
+        next(reader)
+        plan = record(json.loads(reader.get_state())["dew_data_plan"], "saved plan")
+    finally:
+        reader.close()
+    pools = record(record(plan["topology"], "topology")["pools"], "pools")
+    assert sorted(pools.values()) == [1, 7], pools
+    assert next(count for name, count in pools.items() if "common" in name) == 7, pools

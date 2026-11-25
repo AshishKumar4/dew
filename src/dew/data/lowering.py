@@ -35,7 +35,7 @@ import grain.experimental as gx
 import grain.python as pygrain
 import numpy as np
 
-from dew._records import integer, record, strings
+from dew._records import finite, integer, record, strings
 from dew.batch import DRAWS, EXAMPLES_CONSUMED, Batch, Draws
 from dew.data.analysis import (
     _LOCAL,
@@ -205,12 +205,6 @@ def _streamed_take(pipeline: Pipeline, read: str) -> bool:
     bound = examples_limit(pipeline.stages)
     batched = _until(pipeline.stages, (BatchStage,))
     return any(isinstance(stage, Limit) and at != bound for at, stage in enumerate(pipeline.stages[:batched]))
-
-
-def _shared_pool(pool: int, members: int, index: int) -> int:
-    """The loading workers the `index`th of `members` corpora reads in, of a mixture's `pool`: an
-    equal share, the first ones taking what is left over; one given none reads in the reading process."""
-    return pool // members + int(index < pool % members)
 
 
 class _Marked(pygrain.MapDataset):
@@ -1411,8 +1405,12 @@ class _Build:
         """The build of the `index`th corpus a mixture, phases or a concatenation reads, by its own
         analysis, keyed by the name it goes by there (`_member_key`)."""
         members = strings(self.lowering.order["members"], "mixture members")
-        pool = (None if self.pool is None
-                else Workers(_shared_pool(self.pool.count, len(members), index), self.pool.buffer))
+        # A mixture's members share its workers by their draw weights; phases' and a concatenation's,
+        # each read in turn, equally.
+        stated = self.lowering.order.get("weights")
+        weights = ([finite(weight, "mixture weights") for weight in stated] if isinstance(stated, list)
+                   else [1.0] * len(members))
+        pool = None if self.pool is None else self.pool.shared(weights, index)
         loading = self.loading if pool is None else dataclasses.replace(self.loading, workers=pool.count)
         # A member's own mixes stamp nothing: only the phase's mix draws what other phases read on.
         return dataclasses.replace(self, lowering=self.lowering.children[index], loading=loading, pool=pool,
