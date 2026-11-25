@@ -706,7 +706,7 @@ def key_pairs_own(q, k, prefix, beta, d_scores, d_system, taken, factored, memor
                 [functools.partial(rows, "queries"),
                  lambda: algebra.write_gated(rows("reads" if reading else "keys"), betas)],
                 shifted_keys(call, shifts, key, limbs), functools.partial(shifted_up, call),
-                (zero, zero), zero)
+                (zero, zero), zero, bounded=not reading)
             column = h * width + index * keys
             start = family.columns_of(ending_ref.at[n, pl.ds(column, keys)])
             d_betas = d_betas + _own_finished(
@@ -736,7 +736,7 @@ def key_pairs_own(q, k, prefix, beta, d_scores, d_system, taken, factored, memor
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                          grid_names=("chunks", "heads"), blocks=tiles, stages=(1, 2),
                          live=chunk_liveness(len(inputs) - 1), steps=steps, model=terms,
-                         held=_key_own_held(call, keys), staging=staging, landing=landing,
+                         held=_key_own_held(call, keys, reads=reading), staging=staging, landing=landing,
                          name="recurrence_key_pairs_own", issues=False,
                          # The bands read a row at a time, at a traced offset: staged plain.
                          swizzles={f"{name}{p}": swizzling.UNSWIZZLED for name in ("scores", "system")

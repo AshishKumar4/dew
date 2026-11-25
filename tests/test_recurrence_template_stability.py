@@ -517,3 +517,40 @@ def test_a_read_past_its_keys_range_keeps_its_faint_decayed_pair():
     expected = np.zeros((1, length, 1, width), np.float32)
     expected[0, 1, 0, 0] = -1.0
     np.testing.assert_array_equal(np.asarray(out, np.float32), expected)
+
+
+def test_a_read_past_its_keys_range_keeps_its_faint_decayed_pairs_gradient():
+    """The same read erase's gradient (`test_a_read_past_its_keys_range_keeps_its_faint_decayed_pair`'s form,
+    unnormalized): token 0 writes `2^60` along a key on channel 1, token 1 decays channel 0 by `2^-60` and
+    reads `2^100` along it, its write along channel 2, which its query reads. Token 1's output in value column
+    0 moves `-2^100` times token 0's key's channel 0: the read finds that channel's write decayed to `2^-60`
+    of it and corrects the write by `2^100` of that. The template's own pairs' transpose took the pairs'
+    gradient `-2^60` times the read `2^100` before its decay, `-2^160`, a nonfinite gradient
+    (`algebra.key_diagonal_pairs_back`'s `bounded`; head review of 5b2aba881)."""
+    length, width = 64, 32
+    hooks = recurrence.Hooks(decay='vector', erase='read', scale=1.0)
+    unit = np.eye(width, dtype=np.float32)
+    keys = np.zeros((1, length, 1, width), np.float32)
+    keys[0, 0, 0], keys[0, 1, 0] = unit[1], unit[2]
+    queries = np.zeros_like(keys)
+    queries[0, 1, 0] = unit[2]
+    reads = np.zeros_like(keys)
+    reads[0, 1, 0, 0] = 2.0 ** 100
+    values = np.zeros((1, length, 1, width), np.float32)
+    values[0, 0, 0, 0] = 2.0 ** 60
+    beta = np.zeros((1, length, 1), np.float32)
+    beta[0, :2] = 1.0
+    decay = np.zeros((1, length, 1, width), np.float32)
+    decay[0, 1, 0, 0] = -60 * np.log(2.0)
+    d_out = jnp.zeros((1, length, 1, width), jnp.bfloat16).at[0, 1, 0, 0].set(1.0)
+
+    def out(q, k, v, r):
+        operands = Chunk(q, k, v, log_decay=jnp.asarray(decay), beta=jnp.asarray(beta, jnp.bfloat16),
+                         erase_read=r)
+        return chunk_on('mosaic_gpu', hooks, operands)[0]
+
+    with generation.assumed("sm90", interpreted=True):
+        _, pull = jax.vjp(out, *(jnp.asarray(x, jnp.bfloat16) for x in (queries, keys, values, reads)))
+        grads = pull(d_out)
+    assert all(np.isfinite(np.asarray(grad, np.float32)).all() for grad in grads)
+    assert float(grads[1][0, 0, 0, 0]) == -(2.0 ** 100)

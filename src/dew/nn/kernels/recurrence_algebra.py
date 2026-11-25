@@ -1185,7 +1185,7 @@ def key_decayed_pairs_back(d_pairs: list, rows: list, keys: Callable[[int], jax.
 
 def key_diagonal_pairs_back(strips: list, own: list, behind: Callable[[jax.Array], tuple],
                             lower: Callable[[jax.Array, jax.Array], jax.Array], d_rows: tuple, d_keys,
-                            *, sub: int = SUB) -> tuple:
+                            *, sub: int = SUB, bounded: bool = True) -> tuple:
     """`key_diagonal_bands`' transpose on one key block, added onto its gradients so far `d_rows` (one a
     pairs' gradient) and `d_keys`: for each offset `e` the band `dP[i, i - e]` of each pairs' gradient
     `strips[p](e)` within `i`'s sub-chunk, a row's vector `[C]` (a row of the pairs' gradients' own bands
@@ -1200,7 +1200,10 @@ def key_diagonal_pairs_back(strips: list, own: list, behind: Callable[[jax.Array
     chunk_kda_bwd_intra's diagonal blocks). A row before its offset is zero on its strips (`own_bands`
     lays them so), its terms a zero strip's: its keys and decays read below its sub-chunk finite
     (`behind`'s, the staged rows below the chunk zeroed), where the gradients' every term held to its mask
-    was a quarter of a B200's own pairs' backward's issues."""
+    was a quarter of a B200's own pairs' backward's issues. Not `bounded` (rows a read erase's reads, which
+    no hook bounds), each term is formed as its value allows (`_decayed_term`), its strips weighed apart:
+    a pairs' gradient of `-2^60` times a read of `2^100` was `-2^160` before its decay `2^-60` took it to
+    the key's `-2^100` (head review of 5b2aba881)."""
     index, _ = _grid(d_keys.shape)
 
     def offset(e, carried):
@@ -1211,16 +1214,30 @@ def key_diagonal_pairs_back(strips: list, own: list, behind: Callable[[jax.Array
         # zeroed), its strip zero there (`own_bands`) its terms'. The keys' terms are moved up from the rows
         # `e` below, each within its sub-chunk where selected.
         bands = [strip(e)[:, None] for strip in strips]
-        d_rows = tuple(total + strip * keys * pair for total, strip in zip(d_rows, bands, strict=True))
         # The rows read where they are weighed, not held across the offsets: held, an sm100's own pairs'
         # backward needed all of its 248 registers, read here 232 (row 5298).
-        weighted = functools.reduce(jnp.add, (strip * row() for strip, row in zip(bands, own, strict=True)))
-        return (d_rows, d_keys + jnp.where(index % sub + e < sub, lower(e, weighted * pair), 0.0), pair,
-                decays)
+        if bounded:
+            d_rows = tuple(total + strip * keys * pair for total, strip in zip(d_rows, bands, strict=True))
+            weighted = functools.reduce(jnp.add, (strip * row() for strip, row in zip(bands, own,
+                                                                                        strict=True))) * pair
+        else:
+            d_rows = tuple(total + _decayed_term(strip, keys, pair)
+                           for total, strip in zip(d_rows, bands, strict=True))
+            weighted = functools.reduce(jnp.add, (_decayed_term(strip, row(), pair)
+                                                  for strip, row in zip(bands, own, strict=True)))
+        return (d_rows, d_keys + jnp.where(index % sub + e < sub, lower(e, weighted), 0.0), pair, decays)
 
     one = jnp.ones(index.shape, jnp.float32)
     d_rows, d_keys, _, _ = jax.lax.fori_loop(0, sub, offset, (d_rows, d_keys, one, one))
     return d_rows, d_keys
+
+
+def _decayed_term(left, right, decay):
+    """`left right decay` (`decay` at most one) formed as its value allows: the two first, or where their
+    product overflows, the decay taken by the right first, which then underflows for no value whose product
+    overflowed (it would take a factor past `2^277`)."""
+    near = left * right
+    return jnp.where(jnp.isfinite(near), near * decay, left * (right * decay))
 
 
 def scores_gradient(queries: TileLoad, keys: TileLoad, columns: int, values: TileLoad, out_grads: TileLoad,
