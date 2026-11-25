@@ -52,6 +52,7 @@ if TYPE_CHECKING:
 
     from dew.distributed.placement import Layout, Placement
     from dew.objectives.base import Objective
+    from dew.optim import OptimConfig
     from dew.training.diloco import DiLoCo
     from dew.training.inspection import Inspection
 
@@ -113,6 +114,10 @@ class StepSettings[LossT, EffectsT]:
     ns_group: int | None = None
     """The stacks of one shape the step's Newton-Schulz joins at a time where the run states none, its plan's
     (`dew.newton_schulz.released`, `FitSearch`'s release): None joins them all."""
+    optimizer_source: OptimConfig | optax.GradientTransformation | None = None
+    """What the run's optimizer was made from: its config (`OptimConfig`), which states its code by the
+    classes it holds, or the transformation a run handed in, whose code its functions are
+    (`dew.training.rungs`)."""
 
     @property
     def optimizer(self) -> optax.GradientTransformation:

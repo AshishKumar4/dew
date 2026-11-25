@@ -13,6 +13,7 @@ the second (78.4 ms, docs/performance.md).
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import importlib.metadata
 import json
@@ -40,8 +41,8 @@ _log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from dew.batch import Batch
-    from dew.objectives.base import Objective
     from dew.state import TrainState
+    from dew.training._candidates import StepSettings
     from dew.training.trainer import StepFn
 
 
@@ -58,15 +59,15 @@ RECORD_VERSION = 3
 
 def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], splits: Sequence[int],
              mesh: Mesh, step: Callable[..., StepFn] | None = None, remat: str = "auto", *,
-             objective: Objective | None = None) -> dict[str, JSON] | None:
+             settings: StepSettings | None = None) -> dict[str, JSON] | None:
     """What a recorded rung was decided for, read before the step traces: the
     configuration of the `modules` its programs run at the rung it starts from
     (`Objective.program_key`) and a custom `step`, as an identity states them
-    (`dew._stated.stated`), the code that builds them (`_code`): the step's compiler, the `objective` whose
-    loss it traces, its classes' and what it holds, and those modules, each with every module of Dew's it
-    can import, all of Dew's where any is a function, the step's `arguments` (their tree's structure and
-    each leaf's abstract value and placement, stated alike), the `splits` its plan chooses among (one where
-    the run pins it), the mesh and its devices' kind and allocator limit, the kernels their
+    (`dew._stated.stated`), the code that builds them (`_code`): the step's compiler, what the run's
+    `settings` hold (its objective and optimizer among them) and those modules, each with every module of
+    Dew's it can import, all of Dew's where any is a function, the step's `arguments` (their tree's
+    structure and each leaf's abstract value and placement, stated alike), the `splits` its plan chooses
+    among (one where the run pins it), the mesh and its devices' kind and allocator limit, the kernels their
     generation runs (`gpu_target`), what a model reads from context as it traces
     (`trace_context`), the libraries that compile it and the allocator and
     XLA_FLAGS settings it compiles under, and the recomputation the run's fit policy asks (`remat`,
@@ -94,30 +95,37 @@ def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], spl
     # builds for two GPUs of a generation (their multiprocessors) never share a record.
     target = (repr(gpu_target()) if jax.default_backend() == 'gpu' or assumption() is not None
               else jax.default_backend())
-    code = _code(objective, modules, step)
+    code = _code(settings, modules, step)
     program = json.dumps([RECORD_VERSION, traced, code, list(splits), dict(mesh.shape), target,
                           jax.__version__, importlib.metadata.version('jaxlib'), allocator, remat])
     return {'program': hashlib.sha256(program.encode()).hexdigest(), 'devices': devices_seen,
             'xla_flags': ' '.join(settings)}
 
 
-def _code(objective: Objective | None, modules: Sequence[object],
+def _code(settings: StepSettings | None, modules: Sequence[object],
           step: Callable[..., StepFn] | None) -> list[str]:
     """The digests of the code that builds a step (`provenance_code`): the step's compiler and the modules of
-    Dew's defining the `objective` (its class and every base) and what it holds, its program's `modules` and
-    a custom `step`, each with every module of Dew's it can import. All of Dew's where any is a function no
-    class states, or the objective's class is none of Dew's (a user's subclass): its loss is code no value
-    names, which may call any of Dew's. Not every file of Dew's otherwise: a run keying a rung on them all
-    read all 794, so its tests' CI key was every file (22% of the suite's rows)."""
-    if objective is not None and not stated_class(type(objective)):
+    Dew's defining what its `settings` hold (its objective, every base of its class among them, a model-free
+    objective's loss its base's, and what its optimizer was made from), its program's `modules` and a custom
+    `step`, each with every module of Dew's it can import. All of Dew's where any is a function no class
+    states (an optimizer handed in as a transformation, a user's criterion), or the objective's class is
+    none of Dew's (a user's subclass): their code is no value's, and may call any of Dew's. Not every file
+    of Dew's otherwise: a run keying a rung on them all read all 794, so its tests' CI key was every file
+    (22% of the suite's rows)."""
+    if settings is None:
+        return provenance_code("dew.training.compiler", provenance([*modules, step]))
+    objective = settings.objective
+    if not stated_class(type(objective)):
         return [whole_digest()]
-    built = [] if objective is None else [objective, *type(objective).__mro__]
-    return provenance_code("dew.training.compiler", provenance([*built, *modules, step]))
+    # The optimizer as built is functions; what it was made from (`optimizer_source`) states its code.
+    held = dataclasses.replace(settings, built_optimizer=None)
+    return provenance_code("dew.training.compiler",
+                           provenance([held, *type(objective).__mro__, *modules, step]))
 
 
 def recorded_rung(modules: Sequence[object], arguments: tuple[TrainState, Batch], splits: Sequence[int],
                   mesh: Mesh, step: Callable[..., StepFn] | None = None, remat: str = "auto", *,
-                  objective: Objective | None = None) -> tuple[Path | None, dict[str, JSON], JSON]:
+                  settings: StepSettings | None = None) -> tuple[Path | None, dict[str, JSON], JSON]:
     """Where the rung of the step over `arguments` on `mesh` is recorded, its key
     (`rung_key`), and the rung the record holds (None if there is none). A
     process of a pool keeps no record: its processes agree on the rung; nor does a step its key states
@@ -128,7 +136,7 @@ def recorded_rung(modules: Sequence[object], arguments: tuple[TrainState, Batch]
     directory = rung_records()
     if directory is None or jax.process_count() > 1:
         return None, {}, None
-    key = rung_key(modules, arguments, splits, mesh, step, remat, objective=objective)
+    key = rung_key(modules, arguments, splits, mesh, step, remat, settings=settings)
     if key is None:
         return None, {}, None
     path = directory / f"{hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()}.json"

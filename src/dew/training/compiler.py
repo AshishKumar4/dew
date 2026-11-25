@@ -1366,7 +1366,7 @@ class StepCompiler[L, E]:
         # Read before anything traces, so a recorded rung is the first one lowered: a record of a run of this
         # policy alone (`rung_key`).
         record_path, key, recorded = recorded_rung(self.objective.program_key(), (state, batch), candidates,
-                                                   mesh, settings.step, self.remat, objective=self.objective)
+                                                   mesh, settings.step, self.remat, settings=settings)
         source = record_path
         if self.ahead is not None and self.ahead.plan is not None:
             recorded, source = self.ahead.plan, "the ahead step"

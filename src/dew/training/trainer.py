@@ -425,7 +425,8 @@ class Trainer(Generic[Loss, Effects]):
                             self.device_mesh, self.accumulation,
                             self.step, self.dynamic_scale, self.diloco, self.tune_kernels, self.inspection,
                             self.microbatches, self.record, self.lower_for, self.state_mesh,
-                            self.skip_nonfinite, self._compiler.ns_group)
+                            self.skip_nonfinite, self._compiler.ns_group,
+                            self._config if self._config is not None else self._given)
 
     # ------------------------------------------------------------------ The state
     # ------------------------------------------------------------------
