@@ -1995,7 +1995,7 @@ def test_reuse_pulls_sibling_rsqrt_into_division_windows_and_drops_sqrt(case):
         x0, z0 = rows(0, (16, 32), (16, 32))
         before = jax.make_jaxpr(fn)(x0, z0)
         after = jax.make_jaxpr(algebra.rewritten(fn))(x0, z0)
-        before_eqs, after_eqs = equations(before.jaxpr), equations(after.jaxpr)
+        before_eqs, after_eqs = list(equations(before.jaxpr)), list(equations(after.jaxpr))
         assert any(eq.primitive is jax.lax.sqrt_p for eq in before_eqs)
         assert not any(eq.primitive is jax.lax.sqrt_p for eq in after_eqs)
         assert sum(eq.primitive is jax.lax.rsqrt_p for eq in after_eqs) == 1
@@ -2011,6 +2011,8 @@ def test_reuse_refuses_unfloored_root_rewrites_reduce_sum_and_keys_jit_context()
     `reduce_sum` reciprocal `1 / y` rewrites `a / y[:, None]` end-to-end through `algebra.rewritten`,
     `enabling_dev` refuses accuracy-measured `bounded` sets (`stable`), and one `jax.jit(rewritten(fn))`
     callable traces separately across off -> on -> off `enabling_dev("reuse")` transitions."""
+    from jax.extend import core as jcore
+
     def unfloored(a, v):
         pos = jnp.abs(v)
         return jnp.tanh(a) / jnp.sqrt(pos)[:, None], jax.lax.rsqrt(pos)
@@ -2037,7 +2039,7 @@ def test_reuse_refuses_unfloored_root_rewrites_reduce_sum_and_keys_jit_context()
         win_sm, _ = windows_sm[0]
         assert sum(eq.primitive is jax.lax.div_p for eq in win_sm.eqns) == 2
         done_sm = program._region(
-            jax.extend.core.ClosedJaxpr(win_sm, []), accurate=False, saturation=algebra.SATURATION,
+            jcore.ClosedJaxpr(win_sm, []), accurate=False, saturation=algebra.SATURATION,
             ranges=program._declared(win_sm, program._held(closed_sm.jaxpr)))
         assert done_sm.report.fired["reuse"] > 0
         assert_as_exact(

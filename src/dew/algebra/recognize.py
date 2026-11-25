@@ -42,7 +42,7 @@ from dew.algebra.forms import aval
 from dew.nn.derivatives import Protected, marked_call_p
 from dew.nn.kernels import generation
 from dew.nn.kernels.generation import Choice
-from dew.nn.programs import bodies
+from dew.nn.programs import bodies, control_flow, entrywise, purely_called
 from dew.nn.sharding import sequence_shards
 
 REACH = 8
@@ -234,10 +234,15 @@ def _chosen(index: fusion.Index, places: tuple[int, ...], members: Sequence[Cand
 
 
 def _holds(equation: jcore.JaxprEqn, primitive: jcore.Primitive) -> bool:
-    """Whether `equation` binds `primitive`, or a nested program whose body does (`bodies`), as a jit
-    `jax.nn.silu` traces holds its sigmoid, or is it (`_read_as`: Dew's one logistic): the region around it
-    reads the call whole, and its equality its body inlined (`normal_form.canonical`)."""
-    return _binds(equation, (primitive,))
+    """Whether `equation` binds `primitive`, is it (`_read_as`: Dew's one logistic), or is a transparent call
+    (`purely_called`, as a jit `jax.nn.silu` traces holds its sigmoid) whose body does: never control flow or
+    barriers (`scan`, `while`, `cond`, `remat`, `custom_vjp`), whose bodies are searched apart (row 12465)."""
+    if (read := _read_as(equation)) is not None:
+        return read is primitive
+    if equation.primitive is primitive:
+        return True
+    body = purely_called(equation)
+    return body is not None and primitive in _bound(body)
 
 
 def _binds(equation: jcore.JaxprEqn, primitives: Sequence[jcore.Primitive]) -> bool:
@@ -480,8 +485,9 @@ def _forward(index: fusion.Index, var: jcore.Var, reach: int = REACH) -> dict[jc
     return _walked(index, "forward", var, reach)
 
 
-def _walked_forward(index: fusion.Index, var: jcore.Var, reach: int) -> dict[jcore.Var, int]:
-    """`_forward`'s walk, stopping at barriers and effects no recognized region may hold (`_barriers`)."""
+def _walked_forward(index: fusion.Index, var: jcore.Var, reach: int,
+                    allowed: frozenset[int] | None = None) -> dict[jcore.Var, int]:
+    """`_forward`'s walk, stopping at barriers (`_barriers`) and outside `allowed` when given."""
     found, frontier = {var: 0}, collections.deque([var])
     eqns, readers, barriers = index.jaxpr.eqns, index.readers, _barriers(index)
     while frontier:
@@ -491,7 +497,7 @@ def _walked_forward(index: fusion.Index, var: jcore.Var, reach: int) -> dict[jco
             continue
         nxt = depth + 1
         for place in readers[value]:
-            if place in barriers:
+            if place in barriers or (allowed is not None and place not in allowed):
                 continue
             for out in eqns[place].outvars:
                 if out not in found:
@@ -509,19 +515,22 @@ def _walked(index: fusion.Index, direction: str, var: jcore.Var, reach: int) -> 
     """A walk from `var` in `direction` within `reach` equations, walked once a body and held on its index:
     every candidate of an anchor walks from the same rows and results again."""
     if (direction, var, reach) not in index.walks:
-        walk = _walked_forward if direction == "forward" else _walked_back
-        index.walks[direction, var, reach] = walk(index, var, reach)
+        allowed = _entrywise_places(index) if direction.startswith("entrywise_") else None
+        walk = _walked_forward if direction.endswith("forward") else _walked_back
+        index.walks[direction, var, reach] = walk(index, var, reach, allowed)
     return index.walks[direction, var, reach]
 
 
-def _walked_back(index: fusion.Index, var: jcore.Var, reach: int) -> dict[jcore.Var, int]:
-    """`_backward`'s walk, stopping at barriers and effects no recognized region may hold (`_barriers`)."""
+def _walked_back(index: fusion.Index, var: jcore.Var, reach: int,
+                 allowed: frozenset[int] | None = None) -> dict[jcore.Var, int]:
+    """`_backward`'s walk, stopping at barriers (`_barriers`) and outside `allowed` when given."""
     found, frontier = {var: 0}, collections.deque([var])
     eqns, producer, barriers = index.jaxpr.eqns, index.producer, _barriers(index)
     while frontier:
         value = frontier.popleft()
         place = producer.get(value)
-        if place is None or found[value] == reach or place in barriers:
+        if (place is None or found[value] == reach or place in barriers
+                or (allowed is not None and place not in allowed)):
             continue
         nxt = found[value] + 1
         for atom in eqns[place].invars:
@@ -600,6 +609,49 @@ def _barriers(index: fusion.Index) -> frozenset[int]:
     return index.barriers
 
 
+def _entrywise_eqn(equation: jcore.JaxprEqn) -> bool:
+    """Whether `equation` computes one elementwise result: a direct entrywise primitive, Dew's stated
+    entrywise operation (`_read_as`), or a transparent call (`purely_called`, e.g. `jax.nn.silu`) whose body
+    binds only entrywise primitives, nested transparent calls, or broadcasts."""
+    if len(equation.outvars) != 1:
+        return False
+    if (read := _read_as(equation)) is not None:
+        return entrywise(read)
+    if entrywise(equation.primitive):
+        return True
+    body = purely_called(equation)
+    if body is None:
+        return False
+    bound = _bound(body)
+    return bool(bound) and all(
+        entrywise(p) or p.transparent_call or p is jax.lax.broadcast_in_dim_p for p in bound)
+
+
+def _entrywise_places(index: fusion.Index) -> frozenset[int]:
+    """Places of single-output, barrier-free elementwise equations (`_entrywise_eqn`), cached on `index`."""
+    if index.entrywise is None:
+        barriers = _barriers(index)
+        index.entrywise = frozenset(
+            place for place, equation in enumerate(index.jaxpr.eqns)
+            if place not in barriers and _entrywise_eqn(equation))
+    return index.entrywise
+
+
+def _scalar_anchor(index: fusion.Index, place: int) -> bool:
+    """Whether `place` can anchor a single-value recognition (`_norms`, `_attentions`): not a barrier,
+    making one output, and (when a nested call) binding no matrix product or control flow whose body is
+    searched apart (row 12465)."""
+    if place in _barriers(index):
+        return False
+    equation = index.jaxpr.eqns[place]
+    if len(equation.outvars) != 1:
+        return False
+    body = purely_called(equation)
+    if body is None:
+        return True
+    return not any(p is jax.lax.dot_general_p or control_flow(p) for p in _bound(body))
+
+
 def _scalars(index: fusion.Index, places: Sequence[int],
              primitives: Sequence[jcore.Primitive]) -> list[float]:
     """The scalar floating constants the equations at `places` binding one of `primitives` read, each once:
@@ -634,10 +686,12 @@ def _norms(index: fusion.Index, place: int) -> Iterator[Candidate]:
     is tried as a
     stream's too, the sum among the results. The weight's side of the cast and its association (folded
     into the inverse first, Flax's `x (r w)`, `weight_first`) are each the call's own choices."""
-    if place in _barriers(index):
+    if not _scalar_anchor(index, place):
         return
     anchor = index.jaxpr.eqns[place].outvars[0]
     rows = _summed_rows(index, anchor)
+    if not rows:
+        return
     outputs_by_shape: dict[tuple[int, ...], list[jcore.Var]] = collections.defaultdict(list)
     for _, var in sorted(((distance, var) for var, distance in _forward(index, anchor).items()
                           if var is not anchor and aval(var).ndim >= 1), key=lambda pair: -pair[0]):
@@ -723,22 +777,26 @@ def _swiglus(index: fusion.Index, place: int) -> Iterator[Candidate]:
     from dew.nn.activations import gated_product, packed_gated_product
     from dew.nn.kernels import norm_swiglu
 
-    if place in _barriers(index):
+    if place not in _entrywise_places(index):
         return
     anchor = index.jaxpr.eqns[place].outvars[0]
-    gates = sorted(((distance, var) for var, distance in _backward(index, anchor, 3).items()
+    gates = sorted(((distance, var)
+                    for var, distance in _walked(index, "entrywise_backward", anchor, 3).items()
                     if var is not anchor and aval(var).ndim >= 1), key=lambda pair: -pair[0])
+    if not gates:
+        return
     outputs_by_shape: dict[tuple[int, ...], list[jcore.Var]] = collections.defaultdict(list)
-    for _, var in sorted(((distance, var) for var, distance in _forward(index, anchor, 4).items()
+    for _, var in sorted(((distance, var)
+                          for var, distance in _walked(index, "entrywise_forward", anchor, 4).items()
                           if var is not anchor and aval(var).ndim >= 1), key=lambda pair: -pair[0]):
         outputs_by_shape[aval(var).shape].append(var)
     for _, gate in gates:
         matched = outputs_by_shape.get(aval(gate).shape)
         if not matched:
             continue
-        # `gate` is <= 3 hops before `anchor` and `output` <= 4 hops after, so every SwiGLU path lies within
-        # `REACH` (8) hops, avoiding 16-hop cross-layer fanout on deep models (row 12465).
-        descendants = _forward(index, gate, REACH)
+        # Every SwiGLU equation between `gate` and `output` is elementwise within `REACH` hops, avoiding
+        # cross-layer / cross-projection fanout on deep models (row 12465).
+        descendants = _walked(index, "entrywise_forward", gate, REACH)
         for output in matched:
             if output not in descendants:
                 continue
@@ -834,14 +892,16 @@ def _attentions(index: fusion.Index, place: int) -> Iterator[Candidate]:
     product (Flax's) or on the float32 logits after it (jax.nn's), each tried. Its declaration is the call's
     portable path, on its reference path (`implementation='reference'`), its products as its kernels compute
     them."""
-    if place in _barriers(index):
+    if not _scalar_anchor(index, place):
         return
     anchor = index.jaxpr.eqns[place].outvars[0]
     logits = _nearest_product(index, _backward(index, anchor), upstream=True)
-    weighed = _nearest_product(index, _forward(index, anchor), upstream=False)
-    if logits is None or weighed is None:
+    if logits is None:
         return
     reached = _forward(index, anchor)
+    weighed = _nearest_product(index, reached, upstream=False)
+    if weighed is None:
+        return
     query, key = index.jaxpr.eqns[logits].invars
     values = next((atom for atom in index.jaxpr.eqns[weighed].invars if atom not in reached), None)
     if not (isinstance(query, jcore.Var) and isinstance(key, jcore.Var) and isinstance(values, jcore.Var)):

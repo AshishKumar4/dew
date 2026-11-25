@@ -1005,3 +1005,60 @@ def test_swiglu_recognition_stays_local_on_deep_residual_chains_and_barriers():
         found = recognize.recognized(closed.jaxpr, index, recognize.NORMS)
     assert len(found) == 1
     assert found[0].outputs == tuple(closed.jaxpr.outvars)
+
+
+def test_outer_containers_never_anchor_recognition_and_swiglu_stays_inside_elementwise_ops():
+    """Outer `scan`, `pjit[layer]`, and `remat` equations binding `logistic`/`rsqrt`/`exp` inside nested
+    bodies emit no outer candidates in `_swiglus`/`_norms`/`_attentions`, and `_swiglus` walks never cross
+    `dot_general`, while inner recognition still finds both SwiGLU and RMSNorm (row 12465)."""
+    from dew.algebra import fusion, recognize
+    from dew.nn.programs import bodies
+
+    @jax.jit
+    def layer(x, w_norm, w_gate, w_up, w_down):
+        normed = widened_rms(x, w_norm)
+        gate = normed @ w_gate
+        up = normed @ w_up
+        return x + gated_product_of(gate, up) @ w_down
+
+    def stacked(x, w_norm, w_gate, w_up, w_down):
+        def step(carry, _):
+            return layer(carry, w_norm, w_gate, w_up, w_down), None
+        out, _ = jax.lax.scan(step, x, None, length=2)
+        return out
+
+    shapes = (
+        jax.ShapeDtypeStruct((256, 256), jnp.bfloat16),
+        jax.ShapeDtypeStruct((256,), jnp.bfloat16),
+        jax.ShapeDtypeStruct((256, 512), jnp.bfloat16),
+        jax.ShapeDtypeStruct((256, 512), jnp.bfloat16),
+        jax.ShapeDtypeStruct((512, 256), jnp.bfloat16),
+    )
+    closed = jax.make_jaxpr(stacked)(*shapes)
+    outer_index = fusion.Index(closed.jaxpr)
+    for place, eq in enumerate(closed.jaxpr.eqns):
+        assert not recognize._holds(eq, jax.lax.logistic_p)
+        assert not recognize._holds(eq, jax.lax.rsqrt_p)
+        assert list(recognize._swiglus(outer_index, place)) == []
+        assert list(recognize._norms(outer_index, place)) == []
+        assert list(recognize._attentions(outer_index, place)) == []
+
+    # Even directly around `pjit[layer]`, outer `_swiglus`/`_norms` emit 0 candidates (container holds dot).
+    closed_call = jax.make_jaxpr(layer)(*shapes)
+    call_index = fusion.Index(closed_call.jaxpr)
+    for place in range(len(closed_call.jaxpr.eqns)):
+        assert list(recognize._swiglus(call_index, place)) == []
+        assert list(recognize._norms(call_index, place)) == []
+
+    # Inside `layer`'s body: elementwise walks never cross `dot_general`, and both norm & SwiGLU match.
+    (inner_jaxpr,) = bodies(closed_call.jaxpr.eqns[0])
+    inner_index = fusion.Index(inner_jaxpr)
+    (anchor_place,) = [p for p, eq in enumerate(inner_jaxpr.eqns) if recognize._holds(eq, jax.lax.logistic_p)]
+    anchor_var = inner_jaxpr.eqns[anchor_place].outvars[0]
+    back = recognize._walked(inner_index, "entrywise_backward", anchor_var, 3)
+    fwd = recognize._walked(inner_index, "entrywise_forward", anchor_var, 4)
+    assert inner_jaxpr.invars[0] not in back
+    assert inner_jaxpr.outvars[0] not in fwd
+    with generation.assumed("sm90"):
+        found = recognize.recognized(inner_jaxpr, inner_index, recognize.NORMS)
+    assert len(found) == 2

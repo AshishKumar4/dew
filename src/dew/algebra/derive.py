@@ -554,6 +554,10 @@ def _moment_means() -> list:
         rule(eq(mu).to(s.binary(String("div"), d, p)), masked_first_sum(s, x, mask, a),
              masked_counts(n, mask, a), safe_count(d, n),
              eq(shape(s)).to(shape(n))).then(masked_mean_of(mu, s, n, x, mask, a)),
+        rule(mean_of(mu, s, n, x, w, a), eq(shape(mu)).to(Vec[i64].empty())).then(
+            mean_lifted(mu, s, n, x, w, a)),
+        rule(masked_mean_of(mu, s, n, x, mask, a), eq(shape(mu)).to(Vec[i64].empty())).then(
+            masked_mean_lifted(mu, s, n, x, mask, a)),
         rule(eq(t).to(mu.shaped(layout, p)), mean_of(mu, s, n, x, w, a), inserts_axis(p, a)).then(
             mean_lifted(t, s, n, x, w, a)),
         rule(eq(t).to(mu.shaped(layout, p)), masked_mean_of(mu, s, n, x, mask, a), inserts_axis(p, a)).then(

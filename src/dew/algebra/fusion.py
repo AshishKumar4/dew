@@ -200,6 +200,7 @@ class Index:
         self.key: Hashable | None = None
         self.constants: frozenset[jcore.Var] | None = None
         self.barriers: frozenset[int] | None = None
+        self.entrywise: frozenset[int] | None = None
         self.walks: dict[tuple[str, jcore.Var, int], dict[jcore.Var, int]] = {}
 
 
