@@ -5,6 +5,7 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
 from lane_environment import outside_any_cluster
 from process_support import coordinator_port, output, owned
 
@@ -136,3 +137,11 @@ def test_dew_launch_shows_each_process_its_own_gpus_alone():
     pool = launch.pool(["localhost"])
     assert [(process.env["CUDA_VISIBLE_DEVICES"], process.env[LOCAL_DEVICES]) for process in pool] == [
         ("4,5", "0,1"), ("6,7", "0,1")]
+    # A host whose GPUs no one counted (a CPU host has no driver) and whose pool lists none: each process its
+    # host's own ordinals from its first, as JAX_LOCAL_DEVICE_IDS named them.
+    counted_by_none = Launch(command=("python", "train.py"), processes_per_host=2, devices_per_process=1,
+                             env=("JAX_PLATFORMS=cuda",))
+    with pytest.MonkeyPatch.context() as patch:
+        patch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+        uncounted = counted_by_none.pool(["localhost"])
+    assert [process.env["CUDA_VISIBLE_DEVICES"] for process in uncounted] == ["0", "1"]

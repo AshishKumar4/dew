@@ -344,7 +344,7 @@ class Launch:
             holds = "each with every local device" if per_host > 1 else "with every local device"
         emit(f"pool: {count} process{'es' if count > 1 else ''} on {', '.join(hosts)}, "
              f"{holds}, coordinator {address}")
-        processes, ordinals = [], {}
+        processes = []
         for rank in range(count):
             host = hosts[rank // per_host]
             first = (rank % per_host) * (devices or 0)
@@ -353,22 +353,26 @@ class Launch:
             if devices is not None:
                 # Its GPUs alone visible to it, so it opens none of its neighbours' whatever pool it joins
                 # and, holding one, keeps XLA's CUDA graphs (row 12761); JAX numbers them from 0.
-                if host not in ordinals:
-                    ordinals[host] = self.ordinals(host)
-                env["CUDA_VISIBLE_DEVICES"] = ",".join(ordinals[host][first:first + devices])
+                env["CUDA_VISIBLE_DEVICES"] = ",".join(self.ordinals(host, first, devices))
             processes.append(Process(rank, host, self.remote_argv(host, env), env,
                                      env.get("CUDA_VISIBLE_DEVICES", "")))
         return processes
 
-    def ordinals(self, host: str) -> list[str]:
-        """The CUDA ordinals a pool process on `host` may take, in order: those the pool's
-        CUDA_VISIBLE_DEVICES lists (--env, or this machine's own here), else the host's every GPU by its
-        driver's numbering."""
-        env = {**(os.environ if host in LOCAL_HOSTS else {}), **self.extra_env()}
-        visible = env.get("CUDA_VISIBLE_DEVICES")
-        if visible is not None:
-            return [device.strip() for device in visible.split(",") if device.strip()]
-        return [str(device) for device in range(gpu_count(host, None) or 0)]
+    def ordinals(self, host: str, first: int, devices: int) -> list[str]:
+        """The CUDA ordinals of a pool process on `host` taking `devices` GPUs from its host's `first`: those
+        places of the pool's CUDA_VISIBLE_DEVICES (--env, or this machine's own here), refused where it lists
+        too few; else the host's own ordinals from `first`, as JAX_LOCAL_DEVICE_IDS named them, whether or
+        not the host's GPUs could be counted (`layout`)."""
+        environment = {**(os.environ if host in LOCAL_HOSTS else {}), **self.extra_env()}
+        visible = environment.get("CUDA_VISIBLE_DEVICES")
+        if visible is None:
+            return [str(device) for device in range(first, first + devices)]
+        listed = [device.strip() for device in visible.split(",") if device.strip()]
+        if first + devices > len(listed):
+            raise ValueError(f"{host}'s CUDA_VISIBLE_DEVICES lists {len(listed)} GPUs, too few for a process "
+                             f"taking {devices} from its {first}th; ask for fewer with --processes-per-host "
+                             f"or --devices-per-process")
+        return listed[first:first + devices]
 
     def remote_argv(self, host: str, env: dict[str, str]) -> tuple[str, ...]:
         """The argv that starts the command on `host`: the command itself
