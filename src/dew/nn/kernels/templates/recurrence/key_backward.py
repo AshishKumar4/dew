@@ -582,7 +582,7 @@ def _key_pairs_back(q, k, prefix, beta, d_scores, d_system, taken, call: Call, *
             with family.staged_together():
                 for (ref, scaled), buffers in zip(((ds_ref, scale), (da_ref, 1.0)), squares, strict=True):
                     (view,) = square.views(ref, row, chunk, h * chunk, chunk)
-                    d_pairs.append(operands.staged(family, family.tile_of(view) * scaled, buffers))
+                    d_pairs.append(operands.staged(call, family.tile_of(view) * scaled, buffers))
             return d_pairs
 
         def step(index, slots, d_betas, accumulators, loaded):
@@ -622,13 +622,13 @@ def _key_pairs_back(q, k, prefix, beta, d_scores, d_system, taken, call: Call, *
                 """A pairs' rows gated down staged once a key block in `_parted`'s form, its own set, its
                 parts published once (`Family.staged_together`)."""
                 with family.staged_together():
-                    return operands.staged(family, value.astype(jnp.float32), next(staged_rows))
+                    return operands.staged(call, value.astype(jnp.float32), next(staged_rows))
 
             def raised(value):
                 """A sub-chunk's keys gated up staged in `_parted`'s form, every pairs' product reads, its
                 parts published once."""
                 with family.staged_together():
-                    return operands.staged(family, value.astype(jnp.float32), keyed)
+                    return operands.staged(call, value.astype(jnp.float32), keyed)
 
             found = {}
             algebra.key_decayed_pairs_back(

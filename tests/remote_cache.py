@@ -83,6 +83,7 @@ r2 = _armada("r2")  # the Worker's one client and its contract (tools/armada/r2.
 HOST = _armada("host")  # the host's CPU class, which keys a bundle (tools/armada/host.py)
 WATCHED = _armada("watched")  # inotify's one reader (tools/armada/watched.py's `Writes`)
 GRADING = _armada("grading")  # which test file a node is of (tools/armada/grading.py's `owning`)
+RECYCLE = _armada("recycle")  # a later process of one row's task (tools/armada/recycle.py's `CONTINUES`)
 
 MAX_BYTES = r2.MAX_BYTES
 """The largest bundle sent or read: the Worker's bound (tools/armada/r2.json)."""
@@ -354,48 +355,95 @@ class RemoteCache:
                     self._moved_on()
                 written = list(self.written.get(file, []))
                 used = self.used.get(file, set())
-                fetched = [key for key in self.fetched.get(file, []) if file in self.blind or key in used]
+                every = self.fetched.get(file, [])
+                loaded = [key for key in every if key in used]
+                # A run that loaded under half of what it fetched ran a part of its file's tests (a test
+                # node's row, a `-k`, a recycled row's later process, a site's map): it keeps what it did not
+                # load, which the rest of its file's tests load. Pruned so, each part rewrote the bundle the
+                # next part's run had to compile again and rewrite (2026-11-24: one file's bundle written
+                # 7,459 times in a day, as often as it was read). A whole run prunes what it did not load.
+                # One that loaded none of it and compiled as many as it held found it stale (its file's code
+                # changed): it prunes.
+                # A later process of a dry prepare's task (`RECYCLE.CONTINUES`) keeps it whole too: an earlier
+                # process of its row compiled and wrote what it holds, and its own tests used none of it.
+                keeps = file in self.blind or bool(os.environ.get(RECYCLE.CONTINUES)) or (
+                    2 * len(loaded) < len(every) and (bool(loaded) or len(written) < len(every)))
+                fetched = every if keeps else loaded
                 self.sealed.add(file)
+                # A run that loaded none of it and compiled none writes nothing, whatever it fetched (a recut
+                # group's borrowed programs, `_siblings`, among them).
+                if not loaded and not written and file not in self.blind:
+                    return
                 # What it keeps: the fetched programs its run loaded (a recut group's, borrowed from its
                 # file's other cuts, `_siblings`, written under its own cut once), and those it compiled.
                 wanted = {*written, *fetched}
                 if not wanted or wanted == self.queued.get(file) or wanted == self.held.get(file):
                     return
-            chunks: list[list[tuple[str, bytes]]] = [[]]
-            size = 0
-            for key in dict.fromkeys([*fetched, *written]):
-                path = self.directory / f"{key}{SUFFIX}"
-                if not path.exists():
-                    continue
-                cost = HEADER.size + len(key.encode()) + path.stat().st_size
-                if cost > MAX_BYTES:  # a program past the bound goes without; the rest may fit
-                    continue
-                if size + cost > MAX_BYTES:
-                    if len(chunks) == CHUNKS:
-                        continue
-                    chunks.append([])
-                    size = 0
-                value = path.read_bytes()
-                size += HEADER.size + len(key.encode()) + len(value)
-                chunks[-1].append((key, value))
+            # Laid out by the programs' sizes alone, no payload read: one bundle's payloads read once, for the
+            # chunks it sends.
+            layout, displaced = self._layout([*fetched, *written])
+            # A kept bundle that leaves no room for a program its run compiled drops what the run did not
+            # load, where that makes room for it.
+            if keeps and displaced & set(written):
+                pruned, still = self._layout([*loaded, *written])
+                if displaced & set(written) - still:
+                    fetched, layout = loaded, pruned
+                    wanted = {*written, *fetched}
+        except UNREACHABLE as error:
+            self._failed(error)
+            return
+        kept = {key for keys in layout for key in keys}
+        with self.state:
+            if not kept or kept == self.held.get(file, set()):
+                self.queued[file] = wanted
+                return  # nothing new fits: the Worker's bundle stays as it is
+            held = self.chunked.get(file, [])
+        changed = [index for index, keys in enumerate(layout) if index >= len(held) or keys != held[index]]
+        # Its changed chunks' payloads read before anything is held sent: a close that cannot read one sends
+        # nothing, and the next sends it.
+        try:
+            bodies = [(index, packed(self._payloads(layout[index]))) for index in changed]
         except UNREACHABLE as error:
             self._failed(error)
             return
         with self.state:
             self.queued[file] = wanted
-            kept = {key for entries in chunks for key, _ in entries}
-            if not kept or kept == self.held.get(file, set()):
-                return  # nothing new fits: the Worker's bundle stays as it is
             self.held[file] = kept
-            held = self.chunked.get(file, [])
-            changed = [index for index, entries in enumerate(chunks)
-                       if index >= len(held) or [key for key, _ in entries] != held[index]]
-            self.chunked[file] = [[key for key, _ in entries] for entries in chunks]
-        for index in changed:
-            self.uploads.put((self._chunk(file, index), packed(chunks[index])))
+            self.chunked[file] = [list(keys) for keys in layout]
+        for index, body in bodies:
+            self.uploads.put((self._chunk(file, index), body))
         # The chunks it held past those it now fills, deleted, so the next fetch ends where this bundle does.
-        for index in range(len(chunks), len(held)):
+        for index in range(len(layout), len(held)):
             self.uploads.put((self._chunk(file, index), None))
+
+    def _payloads(self, keys: list[str]) -> list[tuple[str, bytes]]:
+        """`keys`' programs as the directory holds them. One gone since its layout (JAX's cache evicts) or
+        that cannot be read fails the whole (OSError): the close sends nothing and holds nothing, so the
+        next lays its bundle out again."""
+        return [(key, (self.directory / f"{key}{SUFFIX}").read_bytes()) for key in keys]
+
+    def _layout(self, keys: list[str]) -> tuple[list[list[str]], set[str]]:
+        """`keys`' programs of the directory laid out by their sizes in chunks of at most `MAX_BYTES`
+        (`CHUNKS` of them), in order, no payload read; and those a full layout displaced. A program past the
+        bound, which no chunk holds, goes without and is none displaced."""
+        layout: list[list[str]] = [[]]
+        size, displaced = 0, set()
+        for key in dict.fromkeys(keys):
+            path = self.directory / f"{key}{SUFFIX}"
+            if not path.exists():
+                continue
+            cost = HEADER.size + len(key.encode()) + path.stat().st_size
+            if cost > MAX_BYTES:  # a program past the bound goes without; the rest may fit
+                continue
+            if size + cost > MAX_BYTES:
+                if len(layout) == CHUNKS:
+                    displaced.add(key)
+                    continue
+                layout.append([])
+                size = 0
+            size += cost
+            layout[-1].append(key)
+        return layout, displaced
 
     def _uploading(self) -> None:
         while True:

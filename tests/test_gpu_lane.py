@@ -225,7 +225,7 @@ def dry_checkout(root: Path) -> None:
     """A checkout at `root` holding a dry prepare's recipe (prepares.py's `RECIPE`), its topology's writer
     (which writes the generation's name), the suite's side (`UNPREPARING`) and a GPU tier file
     (`VAE_FILE`)."""
-    for name in ("tools/armada/prepares.py", "tests/tier_wire.py"):
+    for name in ("tools/armada/prepares.py", "tests/tier_wire.py", "tools/armada/recycle.py"):
         (root / name).parent.mkdir(parents=True, exist_ok=True)
         (root / name).write_text("")
     (root / "tests/generation_support.py").write_text(

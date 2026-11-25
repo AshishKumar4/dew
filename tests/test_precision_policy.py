@@ -1566,6 +1566,52 @@ def test_an_exact_power_of_two_in_a_python_float_is_jaxs_float():
     np.testing.assert_array_equal(found, np.asarray([1.0, 8.0, 2.0 ** -126, 0.0], np.float32))
 
 
+def test_a_whole_power_of_two_is_the_integer_forms_at_every_exponent_it_takes():
+    """`float_bits.whole_power2` of an integral float32 exponent is `exact_power2`'s of the integer, bit for
+    bit, compiled, at every exponent it takes (`WHOLE_POWERS`: +0 at the least, infinity at the largest)."""
+    from dew.nn.float_bits import WHOLE_POWERS, exact_power2, whole_power2
+
+    exponents = np.arange(WHOLE_POWERS[0], WHOLE_POWERS[1] + 1)
+    found = np.asarray(jax.jit(whole_power2)(jnp.asarray(exponents, jnp.float32)))
+    expected = np.asarray(jax.jit(exact_power2)(jnp.asarray(exponents, jnp.int32)))
+    np.testing.assert_array_equal(found.view(np.uint32), expected.view(np.uint32))
+
+
+def test_an_integral_exponents_float_halves_scale_as_its_integer_halves_bit_for_bit():
+    """`power2` at a stated reach of two factors, `k` stated `integral` (its halves floats,
+    `float_bits.whole_power2`), is its integer halves' value bit for bit, compiled: at every integral `k`
+    from -300 to 300 and at both infinities, on operands whose half-scaled products round below the least
+    normal (a significand of 24 bits at 2^-125) and past the largest, a zero's, an infinity's and a NaN's;
+    a NaN `k` (no integer) on a NaN operand, `recurrence_algebra.raised`'s, a NaN; and at fractional
+    reaches, a weak one float32's clip rounds to an integer and a float64 one an x64 clip keeps, each of
+    which clipped an integral `k` to a fraction the float halves rounded (head review e25adf11a)."""
+    from dew.nn.precision import power2
+
+    exponents = np.asarray([*range(-300, 301), np.inf, -np.inf], np.float32)
+    operands = np.asarray([0.0, -0.0, 0.5, 0.75, 1.0, np.nextafter(np.float32(2), np.float32(0)), -1.25,
+                           (1 + 2.0 ** -22 + 2.0 ** -23) * 2.0 ** -125, 1.5 * 2.0 ** 100, 2.0 ** -100,
+                           float(np.finfo(np.float32).max), np.inf, -np.inf, np.nan], np.float32)
+
+    def scaled(*, integral: bool):
+        return np.asarray(jax.jit(lambda x, k: power2(x[:, None], k[None, :], TWO_FACTOR_REACH,
+                                                      integral=integral))(operands, exponents))
+
+    found, expected = scaled(integral=True), scaled(integral=False)
+    np.testing.assert_array_equal(np.isnan(found), np.isnan(expected))
+    numbers = ~np.isnan(expected)
+    np.testing.assert_array_equal(found.view(np.uint32)[numbers], expected.view(np.uint32)[numbers])
+    nan = np.float32(np.nan)
+    assert np.isnan(np.asarray(power2(nan, nan, TWO_FACTOR_REACH, integral=True)))
+    # A fractional reach, one float32 rounds to an integer and one float64 keeps fractional, as the
+    # integer halves take them.
+    clipped = np.asarray([-3, -2, 2, 3], np.float32)
+    for reach, wide in ((1.75, False), (1.999999999, False), (np.float64(1.999999999), True)):
+        with jax.enable_x64(new_val=wide):
+            found = np.asarray(power2(np.float32(1), clipped, reach, integral=True))
+            expected = np.asarray(power2(np.float32(1), clipped, reach))
+        np.testing.assert_array_equal(found, expected, err_msg=str(reach))
+
+
 def test_a_stated_reach_past_two_normal_halves_scales_a_large_operand_exactly():
     """`dew.nn.precision.power2` at a reach past `TWO_FACTOR_REACH` (254, float32's twice its largest
     exponent) takes `2^127` and `1.5 2^127` by `2^-253` to the normal `2^-126` and `1.5 2^-126` exactly,

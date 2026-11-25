@@ -171,19 +171,23 @@ def raised(whole, part: jax.Array | float = 0.0):
     float64; and exp2 of a whole exponent, which a CPU takes as `exp(x ln 2)`, rounds its product with ln 2
     the same way. Its power of two within `TWO_FACTOR_REACH` (`power2`'s two factors, both normal powers): the
     fraction's exp2 lies in [1, 2), so `n` past fp32's exponents gives zero or infinity at any reach, and the
-    two factors held an A100's query_key launch spill-free where three spilled it (ledger 2519)."""
+    two factors held an A100's query_key launch spill-free where three spilled it (ledger 2519), each set
+    from `n` as a float (`power2`'s `integral`)."""
     n = _floor(whole)
-    return power2(jnp.exp2((whole - n) + part), n, reach=TWO_FACTOR_REACH)
+    return power2(jnp.exp2((whole - n) + part), n, reach=TWO_FACTOR_REACH, integral=True)
 
 
 def _floor(x):
     """`floor(x)` of fp32 `x` from its truncation toward zero, the same value (a zero's sign aside): every
-    fp32 of magnitude 2^23 or more is an integer, and infinities and NaNs are their own floor. Mosaic GPU
-    lowers `jnp.floor` too (one cvt.rmi since post81), but there the sm100 Kimi delta attention two-role
-    training launch (`recurrence_intra`, the compensated prefix's whole part) spills 8 bytes at its
-    residency's 248-register share, which this form holds at with none: its least spill-free cap is 240
-    either way (audit K2-1, jsf-calib-floor), ptxas not monotone between them."""
-    truncated = jnp.clip(x, -2.0 ** 23, 2.0 ** 23).astype(jnp.int32).astype(x.dtype)
+    fp32 of magnitude 2^23 or more is an integer, and infinities and NaNs are their own floor, so their
+    truncation, whatever its conversion gives past an int32 or of a NaN, is never taken: the conversion's
+    own clamps (FS-CONV-SASS1) bound it, where a clip to 2^23 before it issued two more an element. Mosaic
+    GPU lowers `jnp.floor` too (one cvt.rmi since post81), but there an H100's write-gated forked training
+    certified a consumer past its first rung and its fp32 turned training step held in no config's compile
+    (theme/jsf-intradiet e04820c37), as the sm100 Kimi delta attention two-role training launch spilled 8
+    bytes at its residency's 248-register share (audit K2-1, jsf-calib-floor): ptxas is not monotone
+    between them."""
+    truncated = x.astype(jnp.int32).astype(x.dtype)
     floor = jnp.where(truncated > x, truncated - 1.0, truncated)
     return jnp.where(jnp.abs(x) < 2.0 ** 23, floor, x)
 
