@@ -1151,8 +1151,9 @@ def test_a_terms_arithmetic_is_what_the_kernels_counter_prices_its_operation_at(
 def test_an_xla_programs_division_prices_on_its_target_at_its_dtype():
     """An XLA program's fp32 division priced for an H100 issues `div.rn.f32`'s MUFU and refinement
     (`emission.IEEE_DIVISION`, M-FS-77) on whatever host prices it, and for a TPU an operation an element; an
-    int32 division and a bfloat16 one an operation an element on either (the review of lane/toolkit
-    58143d37f: the algebra priced on the process's own target, every division at fp32)."""
+    int32 division and a bfloat16 one an operation an element on either, a division of a program of other
+    than fp32 values unproven fp32 (the review of lane/toolkit 58143d37f: the algebra priced on the
+    process's own target, every division at fp32)."""
     hopper, tpu = generation.TARGETS["sm90"], generation.TARGETS["v5e"]
     elements = 64 * 128
 
