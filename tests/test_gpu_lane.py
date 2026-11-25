@@ -406,7 +406,8 @@ def test_a_cell_its_prepares_cap_left_is_named_and_counted_but_reds_no_row(ci):
     sharing = {"test": "tests/test_gpu_vae.py::test_flow[x] @ y]", "where": "a site", "error": "e"}
     skipped_x = {ci.prepares.identity({**skipped, "test": "tests/test_gpu_vae.py::test_flow[x]"})}
     assert graded([sharing], before=skipped_x)["exitCode"] == 1
-    reused_sharing = {"name": name, "exitCode": 0, "output": "", "unprepared": [ci.prepares.identity(sharing)]}
+    reused_sharing = {"name": name, "exitCode": 0, "output": "",
+                      "unprepared": [ci.prepares.identity(sharing)]}
     assert graded([], before=skipped_x, found=reused_sharing)["exitCode"] == 1
 
 
