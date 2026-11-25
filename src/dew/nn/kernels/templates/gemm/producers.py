@@ -70,10 +70,7 @@ def rungs(op, ba, config: tiling.Tiles, target=None) -> Iterator[tiling.Tiles]:
     whether or not the last spilled, so certification asks them in turn, the first that holds taken
     (`tuning.KernelOp._climbed`); none where it gathers nothing (a spill beside a producer of TMA copies
     alone is its consumers', which a raise of the producer starves). The assembler, not a model, finds a
-    producer's registers. The ladder ends before a rung no compile refused that its launch does not take
-    (`legal`: a cap its program's roles cannot hold), so certification asks no tile its launch refuses and
-    its foot's refusal refuses the tile (`settled`): a rung past it left a refused tile unrefused to its
-    derivation, which offered it again (train 1286's lightning flow, Exhausted)."""
+    producer's registers."""
     target = op.launch_target() if target is None else target
     with generation.as_target(target):
         top = _top(op, ba, config, target)
@@ -82,8 +79,6 @@ def rungs(op, ba, config: tiling.Tiles, target=None) -> Iterator[tiling.Tiles]:
         stated, _ = _stated(op, ba, config, top, target)
         while (stepped := config.producers.stepped({op.KERNEL: top}, stated)) is not None:
             config = dataclasses.replace(config, producers=stepped)
-            if not _spilled(op, ba, config, target) and not op.legal(ba, config, target):
-                return
             yield config
 
 
