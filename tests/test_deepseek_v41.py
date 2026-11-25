@@ -246,18 +246,30 @@ def test_the_candidate_pool_decides_the_logits(source):
 
 
 def test_a_candidate_pool_of_no_blocks_is_refused(source):
-    """A candidate source whose pool holds no block (`candidate_blocks` or `candidate_block_size` zero)
-    pools nothing, which would leave a restricting layer reading another source's pool: refused, so every
-    source writes the pool it declares (`DeepseekV4Mixer.publications`)."""
+    """A candidate source whose pool holds no block (`candidate_blocks` or `candidate_block_size` below
+    one) pools nothing, which would leave a restricting layer reading another source's pool: refused, so
+    every source writes the pool it declares (`DeepseekV4Mixer.publications`). Its readers searching
+    unrestricted and its `index_topk` one, so no capacity check refuses it first; a pool of one block of one
+    entry runs."""
     _, plain, _ = source
     ids = jnp.ones((1, 4), jnp.int32)
-    held = next(name for name, kind in plain.kinds.items()
+    kinds = dict(plain.kinds)
+    for name, kind in plain.kinds.items():
+        if isinstance(kind.mixer, DeepseekV4Mixer) and kind.mixer.candidates == "restrict":
+            kinds[name] = dataclasses.replace(kind, mixer=dataclasses.replace(
+                kind.mixer, candidates=None, candidate_blocks=None, candidate_block_size=None))
+    held = next(name for name, kind in kinds.items()
                 if isinstance(kind.mixer, DeepseekV4Mixer) and kind.mixer.candidates == "source")
-    for empty in ({"candidate_blocks": 0}, {"candidate_block_size": 0}):
-        kinds = dict(plain.kinds)
-        kinds[held] = dataclasses.replace(kinds[held], mixer=dataclasses.replace(kinds[held].mixer, **empty))
+
+    def pooled(**geometry):
+        source = dict(kinds)
+        source[held] = dataclasses.replace(kinds[held], mixer=dataclasses.replace(
+            kinds[held].mixer, index_topk=1, **geometry))
+        return plain.clone(kinds=flax.core.freeze(source))
+    pooled(candidate_blocks=1, candidate_block_size=1).init(jax.random.key(0), ids)
+    for empty in ({"candidate_blocks": 0}, {"candidate_block_size": 0}, {"candidate_block_size": -1}):
         with pytest.raises(ValueError):
-            plain.clone(kinds=flax.core.freeze(kinds)).init(jax.random.key(0), ids)
+            pooled(**{"candidate_blocks": 1, "candidate_block_size": 1, **empty}).init(jax.random.key(0), ids)
 
 
 @attending("reference")

@@ -650,7 +650,8 @@ class DeepseekV4Attention(FakeQuantizing):
         if self.candidates is not None:
             if self.candidates not in CANDIDATES:
                 raise ValueError(f"candidates is one of {CANDIDATES} or None, got {self.candidates!r}")
-            if not (self.candidate_blocks and self.candidate_block_size):
+            if (self.candidate_blocks is None or self.candidate_block_size is None
+                    or self.candidate_blocks < 1 or self.candidate_block_size < 1):
                 raise ValueError("a candidate pool is candidate_blocks blocks of candidate_block_size, "
                                  "each at least one: a pool of none holds no candidate")
             # A Reuse layer rides its Full layer's kind and computes no selection.
@@ -794,6 +795,8 @@ class DeepseekV4Attention(FakeQuantizing):
             scores = self.indexer.weighed(agreements, x)
             blocks, block_size = self.candidate_blocks, self.candidate_block_size
             if self.candidates == 'source' and kv_store is not None:
+                # Setup holds a source's pool to at least one block of one entry.
+                assert blocks is not None and block_size is not None
                 sow_selection(self, scores, agreements, seen, top_k, blocks=blocks, block_size=block_size)
                 kv_store[_CSA2_CANDIDATES] = candidate_pool(scores, seen, blocks, block_size)
             else:
