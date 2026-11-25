@@ -774,14 +774,6 @@ class Trainer(Generic[Loss, Effects]):
         ahead runs the programs compiled with it as compiled (`AheadOfTime.taking`), compiling none."""
         return contextlib.nullcontext() if self._compiler.ahead is None else self._compiler.ahead.taking()
 
-    def _first_stepped(self, run: FitRun, loss: jax.Array) -> None:
-        """The run's first step done (`loss` ready): its startup's record of it (`Startup.first_step`), and
-        the fault record installed again past the handlers the step's collectives installed over it (UCX's),
-        which it hands each signal on to (`faults.Recording.rearmed`)."""
-        loss.block_until_ready()
-        run.first_step = run.startup.first_step(run.started)
-        run.faults.rearmed()
-
     def _run_directory(self) -> str | None:
         """The run's directory, where its checkpoints are and its fault record goes (`faults`); None for a run
         that keeps none."""
@@ -1227,11 +1219,11 @@ class Trainer(Generic[Loss, Effects]):
         # The main thread's waits on the data's workers take a signal however it lands (`signal_wake`),
         # from the plan's first read of the data on.
         # A fatal signal's stacks go to the run's directory for the fit's whole length, its teardown's
-        # included (`faults.recording`), armed again once its first step has run (`_first_stepped`).
-        with faults.recording(self._run_directory()) as record, signal_wake():
+        # included (`faults.recording`).
+        with faults.recording(self._run_directory()), signal_wake():
             self._handed_ahead()
             plan = self._fit_plan(dataset, **asked)
-            run = FitRun(time.perf_counter(), plan.startup, faults=record)
+            run = FitRun(time.perf_counter(), plan.startup)
             # Each fit plans its step as the trainer's first did, at the split it was given, so a refit's
             # first step is keyed as that fit's was and reads the step it traced (row 6022); a state that
             # pools a window binds its own split as it compiles (`StepCompiler.compile`).
@@ -1447,7 +1439,8 @@ class Trainer(Generic[Loss, Effects]):
                 # The step's batch is no cooldown branch's to hold beside its own (`_cooled`).
                 batch = device = None
                 if run.first_step is None:
-                    self._first_stepped(run, loss)
+                    loss.block_until_ready()
+                    run.first_step = run.startup.first_step(run.started)
             # The step row is complete once its scope exits; the window's last step closes it before the work
             # after it, whose evaluations, saves and cooldowns run outside it (`FitRun.outside_window`).
             if run.tracing and profile is not None:
@@ -2001,7 +1994,7 @@ class Trainer(Generic[Loss, Effects]):
         reading, run.ahead = run.train is not None, None
         if run.train is not None:
             run.train.close()
-        branched = FitRun(run.started, run.startup, run.faults, current=run.current, partition=run.partition,
+        branched = FitRun(run.started, run.startup, current=run.current, partition=run.partition,
                           reads=run.reads, compiled=run.compiled, passes=run.passes, marked=run.marked)
         # The branch's own clock of committed tokens, from the run's, which a schedule's stages end at
         # as the run's do (`_scheduled`), read off the devices where its steps may have reached what it
