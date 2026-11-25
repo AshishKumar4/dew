@@ -448,6 +448,11 @@ def _interned(params: list, products: dict[int, Product], indexed: dict[Hashable
 def parameters_key(primitive: jcore.Primitive, values: Mapping) -> tuple[jcore.Primitive, Hashable]:
     """An equation's primitive and parameters as a region holds them: two equations of one primitive whose
     parameters are one (`parameter_key`) share one entry of its table (`Region.params`), the first's."""
+    if not values:
+        return primitive, ()
+    if len(values) == 1:
+        name, value = next(iter(values.items()))
+        return primitive, ((name, parameter_key(value)),)
     return primitive, tuple((name, parameter_key(value)) for name, value in sorted(values.items()))
 
 
@@ -487,8 +492,21 @@ def parameter_key(value) -> Hashable:
     hashed (JAX's `WrappedFun` of a derivative rule, hashing an `Unhashable` tree) by its identity, held alive
     by the key (`_Identity`), so it is equal to itself alone. `value` is any parameter JAX's primitives take,
     which share no type."""
-    if value is None or isinstance(value, (bool, str)):
-        return type(value).__name__, value
+    kind = type(value)
+    if value is None or kind is bool or kind is str:
+        return kind.__name__, value
+    if kind is int:
+        return "int", value
+    if kind is float:
+        return "float", value.hex()
+    if kind is tuple:
+        return "sequence", "builtins.tuple", tuple(parameter_key(part) for part in value)
+    if kind is ShapedArray:
+        return _abstract_key(value)
+    if kind is list:
+        return "sequence", "builtins.list", tuple(parameter_key(part) for part in value)
+    if isinstance(value, (bool, str)):
+        return kind.__name__, value
     if isinstance(value, (int, np.integer)):
         return "int", int(value)
     if isinstance(value, (float, np.floating)):
@@ -498,7 +516,7 @@ def parameter_key(value) -> Hashable:
     if isinstance(value, np.dtype):
         return "dtype", value.name
     if isinstance(value, enum.Enum):
-        return "enum", _named(type(value)), value.name
+        return "enum", _named(kind), value.name
     if isinstance(value, (np.ndarray, jax.Array)) and not isinstance(value, jax_core.Tracer):
         # The key type's printed form, which a key kept in another process can read.
         _, array = held_bits(value)
@@ -506,6 +524,10 @@ def parameter_key(value) -> Hashable:
                 hashlib.sha256(np.ascontiguousarray(array).tobytes()).hexdigest())
     if isinstance(value, ShapedArray):
         return _abstract_key(value)
+    if isinstance(value, jcore.Jaxpr):
+        digest, opaques = jaxpr_digest(value)
+        consts = tuple(parameter_key(const) for const in value.consts) if value.consts else ()
+        return "jaxpr", digest, opaques, consts
     if value is Layout.AUTO:
         # The layout XLA chooses, one singleton.
         return "layout", "auto"
@@ -550,6 +572,84 @@ def parameter_key(value) -> Hashable:
         # them: keyed by its identity.
         return "object", _named(type(value)), _Identity(value)
     return "object", _named(type(value)), value
+
+
+_JAXPR_DIGESTS: weakref.WeakKeyDictionary[jcore.Jaxpr, tuple[str, tuple[Hashable, ...]]] = (
+    weakref.WeakKeyDictionary())
+"""Structural `(blake2b_hex, opaque_objects)` digest per `jcore.Jaxpr`, held while the jaxpr lives."""
+
+
+def _collect_opaque(key: Hashable, opaques: list[Hashable]) -> Hashable:
+    """Hoist any `("object", cls, held)` entries out of `key` into `opaques`, replacing each with a
+    deterministic positional reference so the remaining key hashes cross-process without object addresses."""
+    if type(key) is not tuple:
+        return key
+    if len(key) == 3 and key[0] == "object":
+        slot = len(opaques)
+        opaques.append(key)
+        return "object_ref", key[1], slot
+    return tuple(_collect_opaque(part, opaques) for part in key)
+
+
+def jaxpr_digest(jaxpr: jcore.Jaxpr) -> tuple[str, tuple[Hashable, ...]]:
+    """Structural `(hex_digest, opaques)` of `jaxpr` (constvars/invars avals, equations, parameters,
+    contexts, literals, outvars, and effects; excluding `jaxpr.consts` values), memoized per `Jaxpr` object.
+    Plain data (`ast.literal_eval`-safe and `_stated._plain`-safe) whenever `opaques` is empty, while
+    preserving in-process equality and `_Identity` soundness for opaque parameters such as `WrappedFun`."""
+    if (cached := _JAXPR_DIGESTS.get(jaxpr)) is not None:
+        return cached
+    hasher = hashlib.blake2b(digest_size=20)
+    opaques: list[Hashable] = []
+    ctx_keys: dict[int, Hashable] = {}
+    position: dict[jcore.Var, int] = {}
+
+    def feed(part: Hashable) -> None:
+        hasher.update(repr(part).encode())
+        hasher.update(b"\0")
+
+    def feed_atom(atom) -> None:
+        if isinstance(atom, jcore.Literal):
+            dtype, value = held_bits(atom.val)
+            raw = np.ascontiguousarray(value).tobytes()
+            feed(("lit", str(dtype), value.shape, len(raw),
+                  _collect_opaque(parameter_key(atom.aval), opaques)))
+            hasher.update(raw)
+            hasher.update(b"\0")
+        else:
+            feed(("var", position[atom]))
+
+    def var_key(var: jcore.Var) -> Hashable:
+        return isinstance(var, jcore.DropVar), _collect_opaque(parameter_key(var.aval), opaques)
+
+    feed(("constvars", tuple(var_key(var) for var in jaxpr.constvars)))
+    feed(("invars", tuple(var_key(var) for var in jaxpr.invars)))
+    for var in (*jaxpr.constvars, *jaxpr.invars):
+        position[var] = len(position)
+    feed(("eqns", len(jaxpr.eqns)))
+    for equation in jaxpr.eqns:
+        ctx = equation.ctx
+        if (ctx_key := ctx_keys.get(id(ctx))) is None:
+            ctx_key = _collect_opaque(parameter_key((
+                ctx.compute_type, ctx.threefry_partitionable, ctx.xla_metadata,
+                str(ctx.cur_layout_mode), ctx.remove_size_one_mesh_axis)), opaques)
+            ctx_keys[id(ctx)] = ctx_key
+        params_key = (_collect_opaque(parameters_key(equation.primitive, equation.params)[1], opaques)
+                      if equation.params else ())
+        effects_key = _collect_opaque(parameter_key(equation.effects), opaques) if equation.effects else ()
+        feed((_named(type(equation.primitive)), equation.primitive.name, params_key, ctx_key, effects_key,
+              len(equation.invars),
+              tuple(var_key(var) for var in equation.outvars)))
+        for atom in equation.invars:
+            feed_atom(atom)
+        for var in equation.outvars:
+            position[var] = len(position)
+    feed(("outvars", len(jaxpr.outvars)))
+    for atom in jaxpr.outvars:
+        feed_atom(atom)
+    feed(("effects", _collect_opaque(parameter_key(jaxpr.effects), opaques) if jaxpr.effects else ()))
+    result = (hasher.hexdigest(), tuple(opaques))
+    _JAXPR_DIGESTS[jaxpr] = result
+    return result
 
 
 class _Identity:

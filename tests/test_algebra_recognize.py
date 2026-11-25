@@ -1082,3 +1082,162 @@ def test_swiglu_recognition_keeps_unit_axis_reshapes_around_activation():
         found = recognize.recognized(closed.jaxpr, index, recognize.NORMS)
     assert len(found) == 1
     assert found[0].outputs == tuple(closed.jaxpr.outvars)
+
+
+def _gdn_step_math(state, qf, kf, vf, gt, bt, *, subtract: bool = True, flipped: bool = False):
+    """Core token arithmetic of a plain-JAX gated delta rule step (no Dew imports or `swapaxes`)."""
+    decay = jnp.exp(gt)[..., None]
+    write = bt[..., None]
+    scaled_k = (kf * decay)[..., :, None]
+    retrieved = jnp.sum(state * scaled_k if flipped else scaled_k * state, axis=-2)
+    corrected = vf - retrieved if subtract else vf + retrieved
+    outer = (kf * write)[..., :, None] * corrected[..., None, :]
+    out = (jnp.sum((qf * decay)[..., :, None] * state, axis=-2)
+           + jnp.sum(qf[..., :, None] * outer, axis=-2))
+    return state * decay[..., :, None] + outer, out
+
+
+def _gdn_scan_natural(state, q, k, v, g, beta):
+    """Plain-JAX `jax.lax.scan` gated delta rule written with natural `[K, V]` outer product and flipped
+    `state * (k * decay)` order."""
+    def step(s, xs):
+        qt, kt, vt, gt, bt = xs
+        next_s, out = _gdn_step_math(s, qt.astype(jnp.float32), kt.astype(jnp.float32),
+                                     vt.astype(jnp.float32), gt, bt, flipped=True)
+        return next_s, out.astype(vt.dtype)
+
+    return jax.lax.scan(step, state, (q, k, v, g, beta))
+
+
+def _gdn_scan_grouped_scaled(state, g, v, q, beta, k):
+    """Plain-JAX `jax.lax.scan` gated delta rule with permuted operand order, grouped key/value heads
+    (`Hv = 2 * Hk`), and explicit query scaling `Dk ** -0.5`."""
+    scale = 64.0 ** -0.5
+
+    def step(s, xs):
+        gt, vt, qt, bt, kt = xs
+        group = s.shape[1] // qt.shape[1]
+        qf = jnp.repeat(qt.astype(jnp.float32) * scale, group, axis=1)
+        kf = jnp.repeat(kt.astype(jnp.float32), group, axis=1)
+        next_s, out = _gdn_step_math(s, qf, kf, vt.astype(jnp.float32), gt, bt)
+        return next_s, out.astype(vt.dtype)
+
+    return jax.lax.scan(step, state, (g, v, q, beta, k))
+
+
+def _gdn_scan_f64_truth(state, q, k, v, g, beta, *, scale: float | None = None):
+    """Float64 token-by-token truth for the gated delta rule scan."""
+    def step(s, xs):
+        qt, kt, vt, gt, bt = xs
+        group = s.shape[1] // qt.shape[1]
+        qf = jnp.repeat(qt if scale is None else qt * scale, group, axis=1)
+        kf = jnp.repeat(kt, group, axis=1)
+        return _gdn_step_math(s, qf, kf, vt, gt, bt)
+
+    return jax.lax.scan(step, state, (q, k, v, g, beta))
+
+
+@pytest.mark.parametrize("case", ["natural", "grouped_scaled"])
+def test_a_plain_gated_delta_net_scan_runs_dews_recurrence_kernel_through_dew_jit(case):
+    """A plain-JAX `jax.lax.scan` gated delta rule compiled through `dew.jit` on an assumed H100 lowers to
+    Dew's chunked recurrence kernel (`RECURRENCES`, row 3450) across operand orders, grouped heads, query
+    scales, and natural non-`swapaxes` outer products, and holds check 1 under the interpreted template."""
+    from reference_error import assert_as_exact
+
+    import dew
+    from dew.algebra.recognize import KEPT
+    from dew.nn.kernels import recurrence, recurrence_chunk
+
+    seq, batch, hk, hv, dk, dv = 64, 1, (2 if case == "natural" else 1), 2, 64, 64
+    scale = None if case == "natural" else (64.0 ** -0.5)
+    hooks = recurrence.Hooks(decay="scalar", delta=True, scale=scale)
+    state_s = jax.ShapeDtypeStruct((batch, hv, dk, dv), jnp.float32)
+    q_s = jax.ShapeDtypeStruct((seq, batch, hk, dk), jnp.bfloat16)
+    k_s = jax.ShapeDtypeStruct((seq, batch, hk, dk), jnp.bfloat16)
+    v_s = jax.ShapeDtypeStruct((seq, batch, hv, dv), jnp.bfloat16)
+    g_s = jax.ShapeDtypeStruct((seq, batch, hv), jnp.float32)
+    b_s = jax.ShapeDtypeStruct((seq, batch, hv), jnp.float32)
+    if case == "natural":
+        fn, shapes = _gdn_scan_natural, (state_s, q_s, k_s, v_s, g_s, b_s)
+    else:
+        fn, shapes = _gdn_scan_grouped_scaled, (state_s, g_s, v_s, q_s, b_s, k_s)
+
+    def own(state, q, k, v, g, beta):
+        out, final = recurrence_chunk.chunk(
+            hooks, recurrence_chunk.Chunk(
+                state=state, query=jnp.swapaxes(q, 0, 1), key=jnp.swapaxes(k, 0, 1),
+                value=jnp.swapaxes(v, 0, 1), log_decay=jnp.swapaxes(g, 0, 1),
+                beta=jnp.swapaxes(beta, 0, 1)), dtype=jnp.bfloat16)
+        return final, jnp.swapaxes(out, 0, 1)
+
+    with generation.assumed("sm90"):
+        assert not _routes("gated_delta_rule", lambda: jax.jit(fn).trace(*shapes))
+        expected = {kernel for kernel in _routes(
+            "gated_delta_rule", lambda: jax.jit(own).trace(state_s, q_s, k_s, v_s, g_s, b_s))
+            if kernel not in KEPT}
+        assert expected and set(_routes("gated_delta_rule", lambda: dew.jit(fn).trace(*shapes))) == expected
+
+    def draw(seed: int):
+        rng = np.random.default_rng(101 + seed)
+        state = jnp.asarray(rng.standard_normal((batch, hv, dk, dv)).astype(np.float32) * 0.1)
+        q = jnp.asarray(rng.standard_normal((seq, batch, hk, dk)) * (dk ** -0.5), jnp.bfloat16)
+        k = jnp.asarray(rng.standard_normal((seq, batch, hk, dk)) * (dk ** -0.5), jnp.bfloat16)
+        v = jnp.asarray(rng.standard_normal((seq, batch, hv, dv)) * 0.5, jnp.bfloat16)
+        g = jnp.asarray(rng.uniform(-1.0, -0.05, (seq, batch, hv)).astype(np.float32))
+        beta = jnp.asarray(rng.uniform(0.05, 0.5, (seq, batch, hv)).astype(np.float32))
+        return (state, q, k, v, g, beta) if case == "natural" else (state, g, v, q, beta, k)
+
+    def truth(*args):
+        if case == "natural":
+            return _gdn_scan_f64_truth(*args, scale=scale)
+        state, g, v, q, beta, k = args
+        return _gdn_scan_f64_truth(state, q, k, v, g, beta, scale=scale)
+
+    with generation.chosen(gated_delta_rule="mosaic_gpu"):
+        assert_as_exact(dew.jit(fn), jax.jit(fn), draw, f"dew.jit gated delta scan ({case})",
+                        seeds=2, truth_fn=truth)
+
+
+def test_non_matching_or_barred_recurrence_scans_stay_as_written():
+    """Reverse scans, narrow bf16 state carries, checkpointed step bodies, and mismatched step arithmetic
+    never lower through `RECURRENCES`."""
+    import dew
+
+    seq, batch, hv, dk, dv = 64, 1, 2, 64, 64
+    state_f32 = jax.ShapeDtypeStruct((batch, hv, dk, dv), jnp.float32)
+    state_bf16 = jax.ShapeDtypeStruct((batch, hv, dk, dv), jnp.bfloat16)
+    q_s = jax.ShapeDtypeStruct((seq, batch, hv, dk), jnp.bfloat16)
+    k_s = jax.ShapeDtypeStruct((seq, batch, hv, dk), jnp.bfloat16)
+    v_s = jax.ShapeDtypeStruct((seq, batch, hv, dv), jnp.bfloat16)
+    g_s = jax.ShapeDtypeStruct((seq, batch, hv), jnp.float32)
+    b_s = jax.ShapeDtypeStruct((seq, batch, hv), jnp.float32)
+    std_shapes = (state_f32, q_s, k_s, v_s, g_s, b_s)
+
+    def make_step(*, subtract: bool = True, narrow_state: bool = False):
+        def step(s, xs):
+            qt, kt, vt, gt, bt = xs
+            next_s, out = _gdn_step_math(
+                s.astype(jnp.float32) if narrow_state else s,
+                qt.astype(jnp.float32), kt.astype(jnp.float32), vt.astype(jnp.float32),
+                gt, bt, subtract=subtract)
+            return (next_s.astype(s.dtype) if narrow_state else next_s), out.astype(vt.dtype)
+        return step
+
+    def reversed_scan(state, q, k, v, g, beta):
+        return jax.lax.scan(make_step(), state, (q, k, v, g, beta), reverse=True)
+
+    def bf16_state_scan(state, q, k, v, g, beta):
+        return jax.lax.scan(make_step(narrow_state=True), state, (q, k, v, g, beta))
+
+    def barred_scan(state, q, k, v, g, beta):
+        return jax.lax.scan(jax.checkpoint(make_step()), state, (q, k, v, g, beta))
+
+    def wrong_sign_scan(state, q, k, v, g, beta):
+        return jax.lax.scan(make_step(subtract=False), state, (q, k, v, g, beta))
+
+    with generation.assumed("sm90"):
+        assert not _routes("gated_delta_rule", lambda: dew.jit(reversed_scan).trace(*std_shapes))
+        assert not _routes("gated_delta_rule", lambda: dew.jit(bf16_state_scan).trace(
+            state_bf16, q_s, k_s, v_s, g_s, b_s))
+        assert not _routes("gated_delta_rule", lambda: dew.jit(barred_scan).trace(*std_shapes))
+        assert not _routes("gated_delta_rule", lambda: dew.jit(wrong_sign_scan).trace(*std_shapes))

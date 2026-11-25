@@ -165,12 +165,32 @@ def rewritten_program(closed: jcore.Jaxpr, *, saturation: Saturation) -> jcore.J
     return _passed(closed, generation.numerics().forms == "accurate", saturation, kernels=True)
 
 
+class _Scope(NamedTuple):
+    """Pass-scoped keys computed once outside `shard_map` contexts (`_passed`, `_within`)."""
+
+    deriving: Hashable
+    kernels_key: Hashable
+    fusion_base: tuple[Hashable, Hashable] | None
+
+
+def _scope_for(accurate: bool, saturation: Saturation, kernels: bool) -> _Scope:
+    """Compute derivation and kernel-choice keys once for the current trace and mesh context."""
+    deriving = _deriving(accurate, saturation)
+    if not kernels:
+        return _Scope(deriving, None, None)
+    from dew._cache import KERNEL_CHOICES, KERNEL_PINS
+
+    base = fusion.base_context()
+    return _Scope(deriving, (base[0], KERNEL_CHOICES.value, KERNEL_PINS.value), base)
+
+
 def _passed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels: bool) -> jcore.Jaxpr:
     """One program's pass (`_rewritten`), its whole seconds, its walks of the program among them, recorded
     beside the regions' own (`report.record_pass`): where both entries run it, a jit's trace at the compile
     point (`rewritten_program`) and a function's own (`rewritten`'s `rewrite`)."""
     began = time.perf_counter()
-    made = _rewritten(closed, accurate, saturation, kernels)
+    scope = _scope_for(accurate, saturation, kernels)
+    made = _rewritten(closed, accurate, saturation, kernels, _scope=scope)
     kernel_report.record_pass(time.perf_counter() - began)
     return made
 
@@ -238,7 +258,8 @@ of another read from outside it."""
 
 
 def _windowed(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation,
-              spliced: dict[int, list[jcore.JaxprEqn]] | None = None) -> jcore.Jaxpr:
+              spliced: dict[int, list[jcore.JaxprEqn]] | None = None, *,
+              _deriving_key: Hashable | None = None) -> jcore.Jaxpr:
     """`jaxpr` with the values its windows yield (`_windows`) computed in their cheapest forms, where those
     are cheaper than the windows as traced: each cluster saturated in an e-graph of its own (one e-graph of
     every window's terms grew its extraction with the program, past 500 seconds a gemma3n training step's),
@@ -250,7 +271,8 @@ def _windowed(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation,
     made_by = {var: equation for equation in jaxpr.eqns for var in equation.outvars}
     spliced = {} if spliced is None else spliced
     windows = _windows(jaxpr)
-    deriving = _deriving(accurate, saturation) if windows else None
+    deriving = ((_deriving(accurate, saturation) if _deriving_key is None else _deriving_key)
+                if windows else None)
     held = _held(jaxpr) if windows else None
     for window, yielded in windows:
         began = time.perf_counter()
@@ -459,6 +481,11 @@ def _windows(jaxpr: jcore.Jaxpr) -> list[tuple[jcore.Jaxpr, list[jcore.Var]]]:
     share an equation joined up to `CLUSTER` equations; its inputs each value it reads from outside it, its
     outputs each value it makes that the program reads outside it (the values the rewrite may compute anew),
     in program order; and those values as `jaxpr` names them. None where `jaxpr` holds no head."""
+    active = rules.head_primitives()
+    candidates = [(equation, name) for equation in jaxpr.eqns
+                  if (name := terms.spoken_as(equation)) is not None and name in active]
+    if not candidates:
+        return []
     made = {var: equation for equation in jaxpr.eqns for var in equation.outvars}
 
     def maker(atom) -> jcore.JaxprEqn | None:
@@ -470,11 +497,8 @@ def _windows(jaxpr: jcore.Jaxpr) -> list[tuple[jcore.Jaxpr, list[jcore.Var]]]:
         operand = maker(atom)
         return None if operand is None else terms.spoken_as(operand)
 
-    def heads_window(equation: jcore.JaxprEqn) -> bool:
-        name = terms.spoken_as(equation)
-        return name is not None and rules.heads(name, [made_as(atom) for atom in equation.invars])
-
-    heads = [equation for equation in jaxpr.eqns if heads_window(equation)]
+    heads = [equation for equation, name in candidates
+             if rules.heads(name, [made_as(atom) for atom in equation.invars])]
     if not heads:
         return []
     rsqrts, reciprocals, fma_readers = _reuse_siblings(jaxpr, heads)
@@ -959,7 +983,8 @@ def _holds_regions(equation: jcore.JaxprEqn) -> bool:
     return (primitive.inlined_call and primitive is not marked_call_p) or control_flow(primitive)
 
 
-def _within(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels: bool) -> jcore.Jaxpr:
+def _within(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels: bool, *,
+            _scope: _Scope | None = None) -> jcore.Jaxpr:
     """`jaxpr`, its constants kept, with each body (`_holds_regions`) of its equations rewritten, the equation
     itself kept: `jaxpr` itself, and each equation itself, where no body changes. A program's identity is what
     JAX shares its lowering by: every call site of one jitted function holds one body, lowered once (one
@@ -982,11 +1007,12 @@ def _within(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels:
                 _marked(equation, (Algebra,)) and _opening(equation) is None):
             params = with_bodies(
                 equation.params,
-                lambda body, c=cleaned: _closed(body, accurate, saturation, kernels, _cleaned=c))
+                lambda body, c=cleaned: _closed(body, accurate, saturation, kernels, _cleaned=c,
+                                                _scope=_scope))
         elif _opening(equation) is not None:
             # Its body's own bodies rewritten, its math left to the region it opens into (`_opened`).
             params = with_bodies(equation.params,
-                                 lambda body: _within(body, accurate, saturation, kernels))
+                                 lambda body: _within(body, accurate, saturation, kernels, _scope=_scope))
         else:
             params = equation.params
         if any(params[name] is not value for name, value in equation.params.items()):
@@ -1062,7 +1088,7 @@ def _opening(equation: jcore.JaxprEqn) -> jcore.Jaxpr | None:
 
 
 def _rewritten(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels: bool,
-               *, _cleaned: bool = False) -> jcore.Jaxpr:
+               *, _cleaned: bool = False, _scope: _Scope | None = None) -> jcore.Jaxpr:
     """`closed`'s bodies rewritten in place (`_within`), then its own math (`_windowed`) with each Algebra
     span's body opened into it (`_opened`), so a window reaches across the span's boundary, where the run's
     numerics admit a rewrite of it (`_saturating`), then, with `kernels`, its products fused with their
@@ -1073,14 +1099,16 @@ def _rewritten(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kern
     so nothing it discards is derived, written as a kernel, certified or built; nested bodies visited after
     an enclosing `_read` (`_cleaned`) skip redundant recursive DCE passes."""
     read = closed if _cleaned else _read(closed)
-    made = _within(read, accurate, saturation, kernels)
+    made = _within(read, accurate, saturation, kernels, _scope=_scope)
     if _saturating(accurate):
         spans: list[_Span] = []
         opened = _opened(made, spans)
         spliced: dict[int, list[jcore.JaxprEqn]] = {}
-        windowed = _windowed(opened, accurate, saturation, spliced)
+        windowed = _windowed(opened, accurate, saturation, spliced,
+                             _deriving_key=None if _scope is None else _scope.deriving)
         made = made if windowed is opened else _reclosed(windowed, spans, spliced)
-    made = fusion.fused_program(made) if kernels else made
+    made = (fusion.fused_program(made, _base=None if _scope is None else _scope.fusion_base)
+            if kernels else made)
     return closed if made is read else made
 
 
@@ -1142,17 +1170,22 @@ class _Body:
     rewrites: tuple
 
 
-_REWRITTEN: weakref.WeakKeyDictionary[jcore.Jaxpr, collections.OrderedDict[Hashable, tuple[_Body, dict]]] = (
+_REWRITTEN: weakref.WeakKeyDictionary[jcore.Jaxpr, collections.OrderedDict[Hashable, Held[_Body]]] = (
     weakref.WeakKeyDictionary())
 """Each body's rewrites (`_closed`) by what a rewrite read (the numerics' forms, the saturation, the
 switch's target), held while the body lives: every call site of one body, and every retrace that holds it
 (JAX's tracing cache gives a function's one body), takes one rewritten object, which JAX lowers once. A body
 nothing changes holds None, not itself, which would keep it alive."""
 
+STRUCTURAL_HELD = 1024
+"""Bounded LRU of const-free body rewrites keyed by structural `terms.jaxpr_digest` (`_STRUCTURAL_CLOSED`),
+so identical bodies freshly traced across layers or search candidates reuse rewrites without re-walking."""
+
+_STRUCTURAL_CLOSED: collections.OrderedDict[Hashable, Held[_Body]] = collections.OrderedDict()
 
 
 def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels: bool,
-            *, _cleaned: bool = False) -> jcore.Jaxpr:
+            *, _cleaned: bool = False, _scope: _Scope | None = None) -> jcore.Jaxpr:
     """A body's program rewritten, over the same inputs, weak types included, and the same outputs, the same
     object for every call site and retrace of one body (`_REWRITTEN`), the body itself where nothing
     changes; a body whose constants another holds (an open jaxpr), or that reads a value of no shape, as it
@@ -1161,9 +1194,7 @@ def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels
         return closed
     if not all(isinstance(aval, ShapedArray) for aval in closed.in_avals):
         return closed
-    from dew._cache import KERNEL_CHOICES, KERNEL_PINS
-    from dew.algebra import derive
-
+    scope = _scope_for(accurate, saturation, kernels) if _scope is None else _scope
     rewrites = _REWRITTEN.setdefault(closed, collections.OrderedDict())
     # With kernels, the context the substitutions are decided in too (the derivation's: the mesh, the target
     # and the numerics; the kernel choices a call names; the tiles a tuning pins, row 12169: two legal pins of
@@ -1172,18 +1203,27 @@ def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels
     # (`_cache.holding`), not its key (row 12296). Not fusion's whole choice context: its trace context holds
     # every context variable set, a call's arrays among them, which this cache, held as long as the body is,
     # would keep alive.
-    key = (_deriving(accurate, saturation), kernels,
-           (derive.context(), KERNEL_CHOICES.value, KERNEL_PINS.value) if kernels else None)
+    key = (scope.deriving, kernels, scope.kernels_key)
     fresh: list[_Body] = []
 
     def rewrite() -> _Body:
         with kernel_report.recording() as regions:
             made, record = fusion.recorded(
-                lambda: _rewritten(closed, accurate, saturation, kernels, _cleaned=_cleaned))
+                lambda: _rewritten(closed, accurate, saturation, kernels, _cleaned=_cleaned, _scope=scope))
         fresh.append(_Body(None if made is closed else made, record, tuple(regions.rewritten)))
         return fresh[0]
+
+    def resolve() -> _Body:
+        if closed.consts or closed.constvars:
+            return rewrite()
+        struct_key = (terms.jaxpr_digest(closed), key, bool(_cleaned))
+        hit = _cache.holding(_STRUCTURAL_CLOSED, struct_key, rewrite, STRUCTURAL_HELD)
+        if hit.made is None or hit.made.debug_info == closed.debug_info:
+            return hit
+        return _Body(hit.made.replace(debug_info=closed.debug_info), hit.record, hit.rewrites)
+
     # Held with the facts its rewrite read while each answers alike (`_cache.holding`).
-    body = _cache.holding(rewrites, key, rewrite, fusion.DECISIONS_HELD)
+    body = _cache.holding(rewrites, key, resolve, fusion.DECISIONS_HELD)
     reused = not fresh
     # Reported where it is written, as its rewrite reported it, and on a reuse its regions' reports too, so a
     # report around the program holds the body's however often it is written (`fusion._traced`'s, a

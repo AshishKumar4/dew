@@ -2126,3 +2126,83 @@ def test_shared_divisor_fanout_stays_bounded_and_proven_matches_region_on_chaine
     p_held, p_apart = terms.proven(closed_b.jaxpr)
     assert p_held == reg.held
     assert p_apart == reg.apart
+
+
+def test_jaxpr_parameter_key_hashes_structure_and_isolates_opaques_and_consts():
+    """`terms.parameter_key` hashes `jcore.Jaxpr` structurally (`terms.jaxpr_digest`), keeping pure jaxprs
+    JSON-safe (`_stated._plain`) and cross-process stable (`terms.opaque`) while distinguishing different
+    arithmetic, constants, and opaque `custom_vjp` `WrappedFun` closures."""
+    from dew import _stated
+
+    shape = jax.ShapeDtypeStruct((4, 8), jnp.float32)
+    c1 = jax.make_jaxpr(lambda x: jnp.sin(x) + 1.0)(shape)
+    c2 = jax.make_jaxpr(lambda x: jnp.sin(x) + 1.0)(shape)
+    c3 = jax.make_jaxpr(lambda x: jnp.cos(x) + 1.0)(shape)
+    k1, k2, k3 = terms.parameter_key(c1), terms.parameter_key(c2), terms.parameter_key(c3)
+    assert k1 == k2 and k1 != k3
+    assert terms.jaxpr_digest(c1) == terms.jaxpr_digest(c2)
+    assert terms.opaque(k1) == k1
+    assert isinstance(_stated._plain(k1, "pure_jaxpr"), list)
+
+    # Closed-over constants differentiate `parameter_key` even when the jaxpr body matches structurally.
+    arr_a, arr_b = np.ones((4, 8), np.float32), np.full((4, 8), 2.0, np.float32)
+    ca = jax.make_jaxpr(lambda x: x + arr_a)(shape)
+    cb = jax.make_jaxpr(lambda x: x + arr_b)(shape)
+    assert terms.jaxpr_digest(ca) == terms.jaxpr_digest(cb)
+    assert terms.parameter_key(ca) != terms.parameter_key(cb)
+
+    # Distinct `custom_vjp` rules embed distinct opaque `WrappedFun`s that never collide and refuse `_plain`.
+    def make_vjp(scale: float):
+        @jax.custom_vjp
+        def f(x):
+            return x * 2.0
+
+        f.defvjp(lambda x: (x * 2.0, None), lambda _, g: (g * scale,))
+        return jax.make_jaxpr(f)(shape)
+
+    v1, v2 = make_vjp(2.0), make_vjp(3.0)
+    kv1, kv2 = terms.parameter_key(v1), terms.parameter_key(v2)
+    assert kv1 != kv2
+    assert terms.opaque(kv1) == terms.opaque(kv2)
+    with pytest.raises(_stated.Unestablished):
+        _stated._plain(kv1, "custom_vjp_jaxpr")
+
+
+def test_structural_closed_reuses_const_free_body_preserving_debug_info_and_reports():
+    """Fresh structurally identical const-free bodies hit `program._STRUCTURAL_CLOSED`, replaying routes and
+    rewrite reports while keeping each body's own `debug_info` and computing identical values."""
+    from jax._src import core as jax_core
+
+    from dew.nn.kernels import report as kernel_report
+
+    def norm_a(x, w):
+        mean_sq = jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)
+        return (x.astype(jnp.float32) * jax.lax.rsqrt(mean_sq + 1e-6)).astype(x.dtype) * w
+
+    def norm_b(x, w):
+        mean_sq = jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)
+        return (x.astype(jnp.float32) * jax.lax.rsqrt(mean_sq + 1e-6)).astype(x.dtype) * w
+
+    shapes = (jax.ShapeDtypeStruct((256, 256), jnp.bfloat16), jax.ShapeDtypeStruct((256,), jnp.bfloat16))
+    ca, cb = jax.make_jaxpr(norm_a)(*shapes), jax.make_jaxpr(norm_b)(*shapes)
+    assert ca is not cb and ca.debug_info != cb.debug_info
+    with generation.assumed("sm90"):
+        with generation.routes() as routes_a, kernel_report.recording():
+            out_a = program._closed(ca, False, algebra.SATURATION, True)
+        with generation.routes() as routes_b, kernel_report.recording():
+            out_b = program._closed(cb, False, algebra.SATURATION, True)
+    assert out_a is not ca and out_b is not cb
+    assert out_a.debug_info == ca.debug_info
+    assert out_b.debug_info == cb.debug_info
+    assert any(r.choice == "rms_norm" and r.kernel != "xla" for r in routes_a)
+    assert any(r.choice == "rms_norm" and r.kernel != "xla" for r in routes_b)
+    jax_core.check_jaxpr(out_b.jaxpr)
+
+    # `rules.head_primitives()` and `rules.heads()` stay aligned with and without dev rule sets enabled.
+    base_prims = algebra.rules.head_primitives()
+    assert "add" in base_prims and "div" not in base_prims
+    with algebra.rules.enabling_dev("reuse"):
+        reuse_prims = algebra.rules.head_primitives()
+        assert "div" in reuse_prims
+        assert algebra.rules.heads("div", [None, "sqrt"])
+        assert not algebra.rules.heads("div", [None, None])
