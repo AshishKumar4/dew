@@ -284,8 +284,7 @@ def _leader_added(bands_ref, place: tuple, total, leader) -> None:
                            for value in place)
     word = arith.addi(arith.muli(arith.addi(arith.muli(output, arith.constant(i32, rows)), row),
                                  arith.constant(i32, columns)), column)
-    base = llvm.ptrtoint(i64, utils.memref_ptr(bands_ref, memory_space=3))
-    address = arith.addi(base, arith.extui(i64, arith.muli(word, arith.constant(i32, 4))))
+    address = llvm.ptrtoint(i64, utils.getelementptr(utils.memref_ptr(bands_ref), [word], ir.F32Type.get()))
     ptx = "{ .reg .f32 w; @$0 ld.shared.f32 w, [$1]; add.f32 w, w, $2; @$0 st.shared.f32 [$1], w; }"
     llvm.inline_asm(ir.Type.parse("!llvm.void"), [leader, address, total], ptx, "b,l,f,~{memory}",
                     has_side_effects=True)
