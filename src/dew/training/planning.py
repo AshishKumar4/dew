@@ -1196,8 +1196,12 @@ class FitSearch[LossT, EffectsT]:
                 executable, taken = kept, True
             else:
                 # A run that inspects compiles its sampled step beside the step, at once (`report.attempts`),
-                # its compile kept only where the step fits, as the step's own is kept first.
-                early = None if candidate.sampled is None else candidate.sampled()
+                # its compile kept only where the step fits, as the step's own is kept first: until the
+                # search has missed once, past which most of its compiles miss and the sampled step is
+                # lowered and compiled for a step that fits alone (below), where each missed rung lowered,
+                # traced and compiled it for nothing (rows 8411, 10960: half an inspecting climb's time).
+                missed = any(not probe.fits for probe in self.probes)
+                early = None if candidate.sampled is None or missed else candidate.sampled()
                 firsts = report.attempts([(candidate.lowered, options)]
                                          + ([] if early is None else [(early, options)]))
                 relowered = Relowered(lambda: self.relowering(split))
