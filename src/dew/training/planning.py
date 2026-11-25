@@ -1175,8 +1175,9 @@ class FitSearch[LossT, EffectsT]:
         (`ahead`); the candidate its executable compiled from, lowered afresh where a kernel spilled
         (`compiled_if_it_fits`, `Relowered`); and the measure of its fit (`Probe`), the search's state
         else untouched. A run that inspects compiles the candidate's sampled step too
-        (`Candidate.sampled`), at once with the step (`report.attempts`), or takes the one compiled ahead
-        with the step (`AheadOfTime.sampled`), which
+        (`Candidate.sampled`): at once with the step (`report.attempts`) until the search has missed, after
+        which only once the step fits; or takes the one compiled ahead with the step
+        (`AheadOfTime.sampled`), which
         must fit as the step must, so a rung fits only where both do; it is `sampled` until the next
         measure."""
         options = self.compiled_options(candidate)
