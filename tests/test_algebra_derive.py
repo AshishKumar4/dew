@@ -1340,11 +1340,12 @@ def test_zero_mass_scaled_covariance_ad():
             np.testing.assert_array_equal(np.asarray(gy), np.zeros((1, 2), np.float32))
 
     # Multi-tile and same-tile witnesses: finite scaled derivatives, `2^127` sign cancel, small entries beside
-    # large entries, two high-band entries needing different scales (`1.5*2^63` and `2^64` beside `2^127` with
-    # `dw = 2^-126`), and one-sided nonzero shifts beside `±2^127`.
+    # large entries, boundary finite (`1.25*2^63`) and overflowing (`2^64`) entries beside `2^127` and `fmax`
+    # with minimum-normal `dw = 2^-126`, multi-scale high-band merges, and one-sided shifts beside `±2^127`.
     huge = np.float32(2.0 ** 127)
+    fmax = np.finfo(np.float32).max
     mid_big = np.float32(2.0 ** 63)
-    hi_mid = np.float32(1.5 * 2.0 ** 63)
+    near_ov = np.float32(1.25 * 2.0 ** 63)
     hi_ov = np.float32(2.0 ** 64)
     small = np.float32(2.0 ** -45)
     tiny = float(np.finfo(np.float32).tiny)
@@ -1360,8 +1361,9 @@ def test_zero_mass_scaled_covariance_ad():
         ([-mid_big, mid_big, small, 0.0], [-mid_big, mid_big, small, 0.0], [0.0, 0.0, 0.0, 1.0],
          [0.0, 0.0, 1.0, 0.0], float(small * small)),
         ([-huge, huge, mid_big], [-huge, huge, mid_big], [0.0, 0.0, 0.0], [0.0, 0.0, tiny], 1.0),
-        ([-huge, huge, hi_mid], [-huge, huge, hi_mid], [0.0, 0.0, 0.0], [0.0, 0.0, tiny], 2.25),
+        ([-huge, huge, near_ov], [-huge, huge, near_ov], [0.0, 0.0, 0.0], [0.0, 0.0, tiny], 1.5625),
         ([-huge, huge, hi_ov], [-huge, huge, hi_ov], [0.0, 0.0, 0.0], [0.0, 0.0, tiny], 4.0),
+        ([-fmax, fmax, hi_ov], [-fmax, fmax, hi_ov], [0.0, 0.0, 0.0], [0.0, 0.0, tiny], 4.0),
         ([-huge, huge, 2.0, 1.0], [-huge, huge, 2.0, 1.0], [0.0, 0.0, 0.0, 1.0], [0.0, 0.0, tiny, 0.0], tiny),
         ([-huge, huge, hi_ov, 0.0], [-huge, huge, hi_ov, 0.0], [0.0, 0.0, 0.0, 1.0], [0.0, 0.0, tiny, 0.0],
          4.0),
@@ -1374,19 +1376,23 @@ def test_zero_mass_scaled_covariance_ad():
             val, dval = jax.jvp(
                 lambda w_, x_=xc, y_=yc, m=mode: direct_eval(x_, y_, w_, tile=1, mode=m), (wc,), (dwc,))
             assert float(val) == 0.0 and float(dval) == expect
-    for x_row, dw_row, expect in (
-        ([-mid_big, mid_big, small], [0.0, 0.0, 1.0], float(small * small)),
-        ([-huge, huge, small], [0.0, 0.0, 1.0], float(small * small)),
-        ([-huge, huge, mid_big], [0.0, 0.0, tiny], 1.0),
-        ([-huge, huge, hi_mid], [0.0, 0.0, tiny], 2.25),
-        ([-huge, huge, hi_ov], [0.0, 0.0, tiny], 4.0),
+    for x_row, dw_row, expect, tile in (
+        ([-mid_big, mid_big, small], [0.0, 0.0, 1.0], float(small * small), 3),
+        ([-huge, huge, small], [0.0, 0.0, 1.0], float(small * small), 3),
+        ([-huge, huge, mid_big], [0.0, 0.0, tiny], 1.0, 3),
+        ([-huge, huge, near_ov], [0.0, 0.0, tiny], 1.5625, 3),
+        ([-fmax, fmax, near_ov], [0.0, 0.0, tiny], 1.5625, 3),
+        ([-huge, huge, hi_ov], [0.0, 0.0, tiny], 4.0, 3),
+        ([-fmax, fmax, hi_ov], [0.0, 0.0, tiny], 4.0, 3),
+        ([hi_ov, -hi_ov, -huge, huge], [tiny, 0.0, 0.0, 0.0], 4.0, 2),
     ):
         xs_mix = jnp.asarray([x_row], jnp.float32)
-        ws_mix = jnp.asarray([[0.0, 0.0, 0.0]], jnp.float32)
+        ws_mix = jnp.zeros((1, len(x_row)), jnp.float32)
         dws_mix = jnp.asarray([dw_row], jnp.float32)
-        val, dval = jax.jvp(lambda w_, x_=xs_mix: direct_eval(x_, x_, w_, tile=3, mode="walk"),
-                            (ws_mix,), (dws_mix,))
-        assert float(val) == 0.0 and float(dval) == expect
+        for mode in ("walk", "merge"):
+            val, dval = jax.jvp(lambda w_, x_=xs_mix, t=tile, m=mode: direct_eval(x_, x_, w_, tile=t, mode=m),
+                                (ws_mix,), (dws_mix,))
+            assert float(val) == 0.0 and float(dval) == expect
     gw_mix = jax.grad(lambda w_: direct_eval(
         jnp.asarray([[-mid_big, mid_big, small]], jnp.float32),
         jnp.asarray([[-mid_big, mid_big, small]], jnp.float32), w_, tile=3, mode="walk"))(
