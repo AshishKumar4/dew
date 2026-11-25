@@ -2337,6 +2337,15 @@ def pinned(argv: list[str]) -> None:
                          str(Path(__file__).resolve()), *argv])
 
 
+def entry() -> int:
+    """`main` as armada's task process runs it: a task's (`task`) ends leaving its progress out of its
+    artifacts (`progress.finished`), as nothing reads it once the task has ended."""
+    code = main()
+    if sys.argv[1:2] == ["task"]:
+        progress.finished()
+    return code
+
+
 if __name__ == "__main__":
     pinned(sys.argv[1:])
-    raise SystemExit(main())
+    raise SystemExit(entry())
