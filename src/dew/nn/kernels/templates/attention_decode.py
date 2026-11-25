@@ -232,19 +232,25 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     # A config its caller chooses (a pin held for the forward, or an opted-in tuning run's picks) is retiled
     # as its streaming walk retiles it, never priced over.
     chosen_by_caller = op.pinned(ba) is not None or tuning.reads_picks()
+    # Priced over every key a row holds (`spans.keys`): a call's own intervals (a cache's lengths, its
+    # documents) its launches count no work of, their extents its data's (a decode step's every launch
+    # priced none, its plan the heuristic's alone: M-NA-27-gh200 at fb6a6daa2).
+    every = spans if spans.form == "full" else key_spans(query.shape[1], spans.keys, query.shape[0])
     priced = None if chosen_by_caller else _priced_slices(
-        query, key, value, spans, walked, (config, op, ba), counts, scale=scale, target=target, table=table,
+        query, key, value, every, walked, config, counts, scale=scale, target=target, table=table,
         sources=sources, scales=scales, chosen=chosen, in_key=in_key,
         initial=hooks is not None and hooks.initial is not None)
     if priced is not None:
-        slices, tile, sliced_op, sliced_ba = priced
+        slices, tile = priced
         if slices == 1:
             return planned(config, op, ba, 1)
-        # The priced tile certified alone (a refusal recorded); where it is refused, its streaming walk's own
-        # config at those slices, certified (`_streamed`).
-        certified = sliced_op._certified(sliced_ba, tile)
+        # The priced tile certified alone at the call's own launch (a refusal recorded); where it is refused,
+        # its streaming walk's own config at those slices, certified (`_streamed`).
+        proposed = _proposed(query, key, value, spans, walked, scale=scale, target=target, table=table,
+                             sources=sources, scales=scales, splits=slices, chosen=chosen, in_key=in_key)
+        certified = None if proposed is None else proposed[1]._certified(proposed[2], tile)
         if isinstance(certified, attention_mosaic.Tiles):
-            return planned(certified, sliced_op, sliced_ba, slices)
+            return planned(certified, proposed[1], proposed[2], slices)
     else:
         # The most slices whose programs keep the device's stream in flight at once (`MosaicForward.streamed`,
         # at most those it holds), where the cost model prices no step of them.
@@ -256,39 +262,41 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     return planned(config, op, ba, 1) if found is None else planned(*found, slices)
 
 
-def _priced_slices(query, key, value, spans: KeySpans, hooks: Hooks | None, single: tuple, counts: list[int],
-                   *, scale: float | None, target: generation.GpuTarget, table, sources, scales,
-                   chosen: Walk, in_key: bool, initial: bool) -> tuple | None:
-    """The slice count of `counts` (one beside them, `single`'s launch) and key tile whose step the cost model
-    prices least, with the op and bound arguments of its launch: its walk (`MosaicForward.price_config`, its
-    programs' warps hiding each other's issue intervals) and, past one slice, the merge of its slices
-    (`merged.launch_work`, its passes' waited loads: the state form's merge, a proxy of a finished step's, its
-    cast, its heads' layout and its output hook aside). One slice prices `single`'s certified tile alone; each
-    further count, the tiles its derived config's walk may stream at (`MosaicForward.streamings`), uncertified
-    here, the chosen one certified as it launches. None where the model prices some step none. A GH200's B8
-    over 32768 keys at width 128 walked 346.0 us on 2 slices of K128 and 309.3 on 4 of K64 at two programs a
-    multiprocessor (M-NA-21-gh200), which a walk priced at its device bytes alone ranked level and its
-    programs' issue intervals rank right (FS-5274-LAT1)."""
-    config, op, ba = single
-    prices = {(1, config): (op.price_config(ba, config, target, issued=True), op, ba)}
-    if prices[1, config][0] is None:
+def _priced_slices(query, key, value, spans: KeySpans, hooks: Hooks | None, single: attention_mosaic.Tiles,
+                   counts: list[int], *, scale: float | None, target: generation.GpuTarget, table, sources,
+                   scales, chosen: Walk, in_key: bool, initial: bool
+                   ) -> tuple[int, attention_mosaic.Tiles] | None:
+    """The slice count of `counts` (one beside them, at the certified `single` tile) and key tile whose step
+    the cost model prices least over `spans`: its walk (`MosaicForward.price_config`, its programs' warps
+    hiding each other's issue intervals) and, past one slice, the merge of its slices (`merged.launch_work`,
+    its passes' waited loads: the state form's merge, a proxy of a finished step's, its cast, its heads'
+    layout and its output hook aside). Each further count prices the tiles its derived config's walk may
+    stream at (`MosaicForward.streamings`), uncertified here; the caller certifies the chosen one at its own
+    launch. None where the model prices some step none. A GH200's B8 over 32768 keys at width 128 walked
+    346.0 us on 2 slices of K128 and 309.3 on 4 of K64 at two programs a multiprocessor (M-NA-21-gh200),
+    which a walk priced at its device bytes alone ranked level and its programs' issue intervals rank right
+    (FS-5274-LAT1)."""
+    proposals = {count: _proposed(query, key, value, spans, hooks, scale=scale, target=target, table=table,
+                                  sources=sources, scales=scales, splits=count, chosen=chosen, in_key=in_key)
+                 for count in (1, *counts)}
+    if proposals[1] is None:
+        return None
+    _, op, ba = proposals[1]
+    prices = {(1, single): op.price_config(ba, single, target, issued=True)}
+    if prices[1, single] is None:
         return None
     for count in counts:
-        proposed = _proposed(query, key, value, spans, hooks, scale=scale, target=target, table=table,
-                             sources=sources, scales=scales, splits=count, chosen=chosen, in_key=in_key)
-        if proposed is None:
+        if proposals[count] is None:
             continue
-        tiles, sliced_op, sliced_ba = proposed
+        tiles, sliced_op, sliced_ba = proposals[count]
         for tile in tiles:
             walk = sliced_op.price_config(sliced_ba, tile, target, issued=True)
             if walk is None:
                 return None
-            merge = _merge_seconds(query, value, spans, tile, count, target=target, initial=initial)
-            prices[count, tile] = (walk + merge, sliced_op, sliced_ba)
+            prices[count, tile] = walk + _merge_seconds(query, value, spans, tile, count, target=target,
+                                                        initial=initial)
     # The least price, then the fewer slices, then the smaller key tile.
-    (count, tile), (_, chosen_op, chosen_ba) = min(
-        prices.items(), key=lambda priced: (priced[1][0], priced[0][0], priced[0][1].block_k))
-    return count, tile, chosen_op, chosen_ba
+    return min(prices, key=lambda chosen_plan: (prices[chosen_plan], chosen_plan[0], chosen_plan[1].block_k))
 
 
 def _proposed(query, key, value, spans: KeySpans, hooks: Hooks | None, *, scale: float | None,
