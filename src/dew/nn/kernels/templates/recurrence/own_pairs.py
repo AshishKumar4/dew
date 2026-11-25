@@ -13,11 +13,12 @@ from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
+from jax._src.lib.mlir.dialects import llvm
 from jax.experimental import pallas as pl
 from jax.experimental.mosaic.gpu import utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend.mlir import ir
-from jax.extend.mlir.dialects import arith, llvm, memref, scf
+from jax.extend.mlir.dialects import arith, memref, scf
 
 from dew.algebra import scan as prefix_scan
 from dew.nn.kernels import recurrence_algebra as algebra
