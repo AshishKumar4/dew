@@ -1140,9 +1140,58 @@ def test_chunked_moments_preserves_zero_weight_derivatives_and_extreme_anchor_di
         )(w_ext0)
         assert float(dv_e0[0, 1]) == 0.0
 
-    # Small normal weights near float32 min normal: merge correction must stay normal (never subnormal/FTZ).
-    x_tiny = jnp.asarray([[-0.5, 0.5]], jnp.float32)
-    w_tiny = jnp.asarray([[2.0 ** -124, 2.0 ** -124]], jnp.float32)
+    # Large-offset zero-mass covariance merges (`L = 2^70`): intermediate zero-mass scale avoids `inf - inf`.
+    large = np.float32(2.0 ** 70)
+    for x_row, y_row, w_row, dw_row, tile in (
+        ([large, 0.0, large], [large, 0.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0], 1),
+        ([large, large, 0.0], [0.0, large, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], 1),
+        ([large, 0.0, large, large], [large, 0.0, 0.0, 0.0], [0.0, 0.0, 1.0, 1.0], [1.0, 0.0, 0.0, 0.0], 2),
+        ([large, 0.0], [0.0, large], [0.0, 0.0], [1.0, 0.0], 1),
+    ):
+        xl = jnp.asarray([x_row], jnp.float32)
+        yl = jnp.asarray([y_row], jnp.float32)
+        wl = jnp.asarray([w_row], jnp.float32)
+        dwl = jnp.asarray([dw_row], jnp.float32)
+        for mode in ("walk", "merge"):
+            def cov_fn(w_, x_=xl, y_=yl, t=tile, m=mode):
+                return moments.chunked_covariance(x_, y_, w_, tile=t, mode=m)[2]
+            val_l, jvp_l = jax.jvp(cov_fn, (wl,), (dwl,))
+            grad_l = jax.grad(lambda w_, f=cov_fn: f(w_).sum())(wl)
+            assert float(val_l[0]) == 0.0 and float(jvp_l[0]) == 0.0
+            assert np.all(np.isfinite(np.asarray(grad_l))) and float(grad_l[0, 0]) == 0.0
+
+    # Value gradients (dx, dy) and explicit sharding (`out_sharding` on synthetic midpoint reductions).
+    xv = jnp.asarray([[1.0, 3.0, 5.0, 7.0]], jnp.float32)
+    yv = jnp.asarray([[2.0, -1.0, 4.0, 6.0]], jnp.float32)
+    wv = jnp.asarray([[0.5, 1.5, 2.0, 1.0]], jnp.float32)
+    ref_dx = jax.grad(lambda x_: moments.weighted_moments(x_, wv)[1].sum())(xv)
+    ref_cov_dxy = jax.grad(lambda x_, y_: moments.weighted_covariance(x_, y_, wv)[2].sum(), argnums=(0, 1))(
+        xv, yv)
     for mode in ("walk", "merge"):
-        m_t, v_t = moments.chunked_moments(x_tiny, w_tiny, tile=1, mode=mode)
-        assert float(m_t[0]) == 0.0 and float(v_t[0]) == 0.25
+        got_dx = jax.grad(lambda x_, m=mode: moments.chunked_moments(x_, wv, tile=2, mode=m)[1].sum())(xv)
+        got_dxy = jax.grad(
+            lambda x_, y_, m=mode: moments.chunked_covariance(x_, y_, wv, tile=2, mode=m)[2].sum(),
+            argnums=(0, 1))(xv, yv)
+        np.testing.assert_array_equal(np.asarray(got_dx), np.asarray(ref_dx))
+        for g, r in zip(got_dxy, ref_cov_dxy, strict=True):
+            np.testing.assert_array_equal(np.asarray(g), np.asarray(r))
+
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec as P
+    mesh = jax.make_mesh((1,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:1])
+    sharding = NamedSharding(mesh, P("data", None))
+    with jax.set_mesh(mesh):
+        xs, ws = jax.device_put(xv, sharding), jax.device_put(wv, sharding)
+        for mode in ("walk", "merge"):
+            ms, vs = jax.jit(lambda a, b, m=mode: moments.chunked_moments(a, b, tile=2, mode=m))(xs, ws)
+            ref_ms, ref_vs = moments.weighted_moments(xv, wv)
+            np.testing.assert_array_equal(np.asarray(ms), np.asarray(ref_ms))
+            np.testing.assert_array_equal(np.asarray(vs), np.asarray(ref_vs))
+
+    # Minimum-normal float32 weights (`2^-126`): `sqrt(n_min) / sqrt(denom)` stays normal (no FTZ flush).
+    for x_pair, w_scale, expect_var in (([-0.5, 0.5], 2.0 ** -124, 0.25),
+                                        ([-1.0, 1.0], float(np.finfo(np.float32).tiny), 1.0)):
+        x_tiny = jnp.asarray([x_pair], jnp.float32)
+        w_tiny = jnp.asarray([[w_scale, w_scale]], jnp.float32)
+        for mode in ("walk", "merge"):
+            m_t, v_t = moments.chunked_moments(x_tiny, w_tiny, tile=1, mode=mode)
+            assert float(m_t[0]) == 0.0 and float(v_t[0]) == expect_var
