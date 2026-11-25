@@ -22,7 +22,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
-from jax._src import ad_util, core as jax_core, hijax, pjit, xla_bridge
+from jax._src import ad_util, core as jax_core, hijax, pjit
 from jax._src.lax import control_flow
 from jax._src.pallas import mpmd, pallas_call, primitives as pallas
 from jax._src.pallas.mosaic import primitives as tpu
@@ -1062,13 +1062,13 @@ def _expanded(equation) -> tuple[jax_core.Jaxpr, Sequence] | None:
 def _platform_branch(platforms) -> int:
     """The branch of a `lax.platform_dependent` whose platforms (`platform_index`'s `platforms`, a branch's
     names, or None for its default) hold the priced platform's (`generation.backend`: a TPU's, a CPU's; a
-    GPU's `cuda` where an `sm` generation is assumed, else the placed GPU's own, CUDA's or ROCm's, as JAX
-    lowers for it)."""
+    GPU's `cuda` where the priced target is an NVIDIA generation's, `sm`, whether assumed or the selected
+    device's, else unpriced: no other GPU's lowering platform is Dew's to name)."""
     name = generation.backend()
     if name == "gpu":
-        assumed = generation.assumption()
-        named = assumed is not None and not assumed.interpreted and assumed.generation.startswith("sm")
-        name = "cuda" if named else xla_bridge.canonicalize_platform("gpu")
+        if not generation.gpu_target().generation.startswith("sm"):
+            raise Unpriced(f"a platform choice among {platforms} on a GPU of no NVIDIA generation")
+        name = "cuda"
     named = [index for index, names in enumerate(platforms) if names is not None and name in names]
     defaults = [index for index, names in enumerate(platforms) if names is None]
     if not named and not defaults:
