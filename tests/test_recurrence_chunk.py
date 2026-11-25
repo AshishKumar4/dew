@@ -890,11 +890,11 @@ def test_a_forked_call_on_an_explicit_row_axis_is_the_call_whole(hooks, along):
 
         return differentiated
 
-    split = arm(lambda tree: jax.tree.map(lambda x: jax.device_put(x, rows), tree))
+    split = jax.jit(arm(lambda tree: jax.tree.map(lambda x: jax.device_put(x, rows), tree)))
     with jax.set_mesh(mesh):
-        assert_as_exact(jax.jit(split), jax.jit(arm(lambda tree: tree)), drawn,
+        assert_as_exact(split, jax.jit(arm(lambda tree: tree)), drawn,
                         f'forked {hooks} on an explicit row axis, {along}', seeds=FEWEST_SEEDS)
-        found = jax.jit(split)(*drawn(0))
+        found = split(*drawn(0))
     for placed in found if along != 'pulled back' else (*found[0], found[1].value):
         assert jax.typeof(placed).sharding.spec[0] == 'data'
 
