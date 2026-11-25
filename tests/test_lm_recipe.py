@@ -266,7 +266,7 @@ def pretrained_config(tokens, pretrained, *args, model_config="{}", **fields):
     choices beside its data (a run's `loop`, which no flag states)."""
     return recipe_run(LMRunConfig, tokens, "--pretrained", str(pretrained), *args, model_config=model_config,
                       default=LMRunConfig(data=windows(tokens), validation=windows(tokens, held=True),
-                                          **fields))
+                                          pretrained=str(pretrained), **fields))
 
 
 @attending("reference")
