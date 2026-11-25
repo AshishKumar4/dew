@@ -24,6 +24,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     Tiles,
     Walked,
     _parts,
+    _solved,
     _solves_apart,
     _states,
     _weighted,
@@ -51,6 +52,7 @@ def observed() -> Iterator[list[Call]]:
 
 
 def _record_observed(call: Call) -> None:
+    """Record `call` when an `observed()` block is active outside tile planning (`PLANNED`)."""
     if (calls := _OBSERVED.get()) is not None and PLANNED.get() is None:
         calls.append(call)
 
