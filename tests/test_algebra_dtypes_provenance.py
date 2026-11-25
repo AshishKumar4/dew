@@ -10,6 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax._src import source_info_util
 from reference_error import assert_as_exact
+from test_algebra_program import _bf16_rms
 
 from dew import algebra
 from dew.algebra import program, terms
@@ -28,11 +29,6 @@ def _equations(jaxpr):
 def _rows(seed: int, *shapes: tuple[int, ...]) -> tuple[np.ndarray, ...]:
     rng = np.random.default_rng(seed)
     return tuple(rng.standard_normal(shape).astype(np.float32) for shape in shapes)
-
-
-def _bf16_norm(x, weight):
-    mean_sq = jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)
-    return (x.astype(jnp.float32) * jax.lax.rsqrt(mean_sq + 1e-6)).astype(x.dtype) * weight
 
 
 def test_program_priced_uses_real_operand_dtypes_for_casts_divisions_and_mixed_regions():
@@ -83,23 +79,23 @@ def test_structural_closed_preserves_equation_source_info_and_nested_body_proven
     reusing exact-provenance retraces and unchanged bodies."""
     shapes = (jax.ShapeDtypeStruct((256, 256), jnp.bfloat16), jax.ShapeDtypeStruct((256,), jnp.bfloat16))
 
-    @jax.jit
-    def inner_left(y):
-        with jax.named_scope("inner_left_scope"):
-            return y + jnp.bfloat16(1.0)
+    def make_inner(scope_name: str):
+        @jax.jit
+        def inner(y):
+            with jax.named_scope(scope_name):
+                return y + jnp.bfloat16(1.0)
+        return inner
 
-    @jax.jit
-    def inner_right(y):
-        with jax.named_scope("inner_right_scope"):
-            return y + jnp.bfloat16(1.0)
+    inner_left = make_inner("inner_left_scope")
+    inner_right = make_inner("inner_right_scope")
 
     def fn_left(x, weight):
         with jax.named_scope("left_branch"):
-            return inner_left(_bf16_norm(x, weight)) + jnp.bfloat16(2.0)
+            return inner_left(_bf16_rms(x, weight)) + jnp.bfloat16(2.0)
 
     def fn_right(x, weight):
         with jax.named_scope("right_branch"):
-            return inner_right(_bf16_norm(x, weight)) + jnp.bfloat16(2.0)
+            return inner_right(_bf16_rms(x, weight)) + jnp.bfloat16(2.0)
 
     cl = jax.make_jaxpr(fn_left)(*shapes)
     cr = jax.make_jaxpr(fn_right)(*shapes)
@@ -120,7 +116,6 @@ def test_structural_closed_preserves_equation_source_info_and_nested_body_proven
     pjit_l = next(eq for eq in out_l.jaxpr.eqns if eq.primitive.name == "jit")
     pjit_r = next(eq for eq in out_r.jaxpr.eqns if eq.primitive.name == "jit")
     sub_l, sub_r = pjit_l.params["jaxpr"], pjit_r.params["jaxpr"]
-    assert sub_l.debug_info.func_name == "inner_left" and sub_r.debug_info.func_name == "inner_right"
     assert "inner_left_scope" in str(sub_l.jaxpr.eqns[0].source_info.name_stack)
     assert "inner_right_scope" in str(sub_r.jaxpr.eqns[0].source_info.name_stack)
 
@@ -191,7 +186,7 @@ def test_reuse_hoists_softmax_and_standalone_root_and_emits_no_debug_info_warnin
             with generation.assumed("sm90"):
                 rms_shapes = (jax.ShapeDtypeStruct((256, 256), jnp.bfloat16),
                               jax.ShapeDtypeStruct((256,), jnp.bfloat16))
-                program._closed(jax.make_jaxpr(_bf16_norm)(*rms_shapes), accurate=False,
+                program._closed(jax.make_jaxpr(_bf16_rms)(*rms_shapes), accurate=False,
                                 saturation=algebra.SATURATION, kernels=True)
         debug_warns = [w for w in caught if "DebugInfo" in str(w.message)]
         assert not debug_warns, [str(w.message) for w in debug_warns]

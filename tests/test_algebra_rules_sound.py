@@ -487,7 +487,7 @@ def _operand(name: str, shape: tuple, symbolic: bool, *, positive: bool = False)
     (a fresh shape's check), cached read-only."""
     count = math.prod(shape)
     if not symbolic:
-        arr = np.arange(1.0, count + 1.0).reshape(shape) + 0.5
+        arr = np.asarray(np.arange(1.0, count + 1.0).reshape(shape) + 0.5)
     else:
         symbols = sympy.symbols(f"{name}_0:{count}", real=True, positive=positive or None) if count else ()
         arr = np.asarray(symbols, dtype=object).reshape(shape)

@@ -40,8 +40,12 @@ def _apart(activation, limit, *, truth: bool = False):
 
 
 @pytest.mark.parametrize(("form", "generation_name"), [
-    ("fused", g) for g in generations("sm90", "sm100")
-] + [("wide", g) for g in generations("sm80", "sm90", "sm100")])
+    pytest.param("fused", g.values[0], marks=g.marks, id=f"fused-{g.values[0]}")
+    for g in generations("sm90", "sm100")
+] + [
+    pytest.param("wide", g.values[0], marks=g.marks, id=f"wide-{g.values[0]}")
+    for g in generations("sm80", "sm90", "sm100")
+])
 @pytest.mark.parametrize(("activation", "limit"), ACTIVATIONS, ids=lambda value: str(value))
 def test_the_fused_mlp_holds_check_1_with_its_gradients(form, generation_name, activation, limit):
     """Both fused gated MLP forms (`fused_products` paired and Formulation (C) `wide_products`) on the

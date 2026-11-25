@@ -431,14 +431,18 @@ class _SoftmaxTrack:
       nonnegative terms, proving `floor = 0` (`s >= 1`), `positive = True`, finite `UNIT + 1 + log2(N)`."""
 
     def __init__(self, max_of: dict | None = None, nonpos_max: dict | None = None,
-                 unit_exp: dict | None = None) -> None:
+                 unit_exp: dict | None = None, neg_inf: set[jcore.Var] | None = None) -> None:
         self.origin: dict[jcore.Var, jcore.Var] = {}
         self.max_of: dict[jcore.Var, tuple[jcore.Var, tuple[int | None, ...]]] = dict(max_of or {})
         self.nonpos_max: dict[jcore.Var, frozenset[int]] = dict(nonpos_max or {})
         self.unit_exp: dict[jcore.Var, frozenset[int]] = dict(unit_exp or {})
+        self.neg_inf: set[jcore.Var] = set(neg_inf or ())
 
     def _canon(self, var: jcore.Var) -> jcore.Var:
         return self.origin.get(var, var)
+
+    def _is_neg_inf_atom(self, atom) -> bool:
+        return _is_neg_inf(atom) or (isinstance(atom, jcore.Var) and atom in self.neg_inf)
 
     def passthrough(self, src: jcore.Var, out: jcore.Var) -> None:
         """Forward softmax provenance across a value-preserving barrier (`stop_gradient_p`)."""
@@ -449,6 +453,8 @@ class _SoftmaxTrack:
             self.nonpos_max[out] = self.nonpos_max[src]
         if src in self.unit_exp:
             self.unit_exp[out] = self.unit_exp[src]
+        if src in self.neg_inf:
+            self.neg_inf.add(out)
 
     def step(self, equation: jcore.JaxprEqn, bound: Magnitude | None, proved: Apart,
              apart_of: Callable[..., Apart]) -> tuple[Magnitude | None, Apart]:
@@ -457,6 +463,9 @@ class _SoftmaxTrack:
         if len(equation.outvars) != 1 or not isinstance(out_aval := equation.outvars[0].aval, ShapedArray):
             return bound, proved
         prim, out, invars = equation.primitive, equation.outvars[0], equation.invars
+        if (prim in (jax.lax.convert_element_type_p, jax.lax.broadcast_in_dim_p, jax.lax.reshape_p)
+                and self._is_neg_inf_atom(invars[0]) and jnp.issubdtype(out_aval.dtype, jnp.floating)):
+            self.neg_inf.add(out)
         if prim is jax.lax.convert_element_type_p and isinstance(invars[0], jcore.Var):
             if _lossless_float_cast(invars[0], out):
                 self.passthrough(invars[0], out)
@@ -471,7 +480,7 @@ class _SoftmaxTrack:
         if prim is jax.lax.max_p and len(invars) == 2:
             for i in (0, 1):
                 cand, other = invars[i], invars[1 - i]
-                if isinstance(cand, jcore.Var) and cand in self.max_of and _is_neg_inf(other):
+                if isinstance(cand, jcore.Var) and cand in self.max_of and self._is_neg_inf_atom(other):
                     self.max_of[out] = self.max_of[cand]
             return bound, proved
         if prim in (jax.lax.broadcast_in_dim_p, jax.lax.reshape_p) and isinstance(invars[0], jcore.Var):
@@ -519,7 +528,8 @@ class _SoftmaxTrack:
                      if (e := self.max_of.get(o)) is not None and e[0] in by_origin}
         nonpos_child = {i: self.nonpos_max[o] for o, i in pairs if o in self.nonpos_max}
         exp_child = {i: self.unit_exp[o] for o, i in pairs if o in self.unit_exp}
-        return _SoftmaxTrack(max_child, nonpos_child, exp_child)
+        neg_inf_child = {i for o, i in pairs if o in self.neg_inf}
+        return _SoftmaxTrack(max_child, nonpos_child, exp_child, neg_inf_child)
 
 
 def _same_atom(a, b) -> bool:

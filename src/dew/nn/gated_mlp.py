@@ -122,13 +122,14 @@ class GatedCase:
         if gate.shape[-1] % wide.GROUP:
             return False
         saved = not _recomputes_gate_up()
-        wide_kernel = jax.ShapeDtypeStruct((gate.shape[0], 2 * gate.shape[-1]), self.dtype)
+        wide_kernel = jax.ShapeDtypeStruct((1, gate.shape[0], 2 * gate.shape[-1]), self.dtype)
+        sizes = jax.ShapeDtypeStruct((1,), jnp.int32)
         hidden = jax.ShapeDtypeStruct((self.rows.shape[0], gate.shape[-1]), self.dtype)
         epilogue = wide.Gated(self.hook, self.dtype, saved)
         with generation.routes(alone=True):
             try:
                 call, product = gemm._gemm_call(
-                    self.rows, wide_kernel, None, None, (), (), epilogue, (), (),
+                    self.rows, wide_kernel, sizes, None, (), (), epilogue, (), (),
                     (self.dtype,) * (1 + saved), several=True, transpose_rhs=False, interpret=False,
                     precision=self.precision, dense=True, paired=None, first=None, gather=None,
                     scatter=None, summed_as=())
