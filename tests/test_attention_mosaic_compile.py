@@ -1066,6 +1066,17 @@ def test_every_approximated_operation_in_a_hook_takes_exact_math(operation):
         query=(64, 64, jnp.bfloat16))
 
 
+@lowers("sm90")
+def test_an_output_hook_taking_erf_lowers_for_an_h100():
+    """An output hook taking erf (a GELU gate, `o * Φ(o)`) lowers in the Mosaic forward for an H100, whose
+    warpgroup layout inference had no rule for math.erf ('No layout inference rule defined for math.erf
+    vector<64x64xf32>', row 12426; Dew's fork from post132)."""
+    shape = jax.ShapeDtypeStruct((1, 256, 2, 64), jnp.bfloat16)
+    hooks = template.Hooks(output_mod=lambda o: o * 0.5 * (1.0 + jax.lax.erf(o * 0.7071067811865476)))
+    spans = template.spans(256, 256, 1, causal=True)
+    lowered_for(lambda q, k, v: attention_mosaic.forward(q, k, v, spans, hooks), (shape,) * 3, "sm90")
+
+
 def _fullest(op, ba, target):
     """The fitting config of `op`'s launch of `ba` on `target` that stages the most shared memory."""
     return max(op.fitting(ba, target), key=lambda config: op.staged_bytes(ba, config, target))
