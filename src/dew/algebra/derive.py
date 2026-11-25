@@ -525,10 +525,11 @@ def _moment_means() -> list:
         n.compare(String("eq"), z, p).select(mu, c),
         z.compare(String("eq"), n, p).select(mu, c),
     )
-    for mean_fact, ref in ((mean_of, w), (masked_mean_of, mask)):
-        for guard in guards:
-            found.append(rule(eq(t).to(guard), mean_fact(mu, s, n, x, ref, a), zero(z), zero(c)).then(
-                mean_fact(t, s, n, x, ref, a)))
+    found.extend(
+        rule(eq(t).to(guard), mean_fact(mu, s, n, x, ref, a), zero(z), zero(c)).then(
+            mean_fact(t, s, n, x, ref, a))
+        for mean_fact, ref in ((mean_of, w), (masked_mean_of, mask))
+        for guard in guards)
     return found
 
 
@@ -837,7 +838,8 @@ def _walking(scaled: bool = False):
              local(y), left_of(p, c, d)).then(summed(t), set_(anchored(t)).to(d)),
         rule(eq(t).to(x.dot(y, p)), eq(walked(y)).to(a), contracts_right(p, a), scales(y, k, name, e, s, c),
              local(x), right_of(p, c, d)).then(summed(t), set_(anchored(t)).to(d)),
-    ] + _moment_walking()
+        *_moment_walking(),
+    ]
     return ruleset(*walking, name="walking scaled" if scaled else "walking")
 
 

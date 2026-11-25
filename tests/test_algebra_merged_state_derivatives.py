@@ -6,13 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from test_algebra_merged_state import (
-    _apart,
-    _assert_site_on_par,
-    _moved,
-    _on_par,
-    _second,
-)
+from test_algebra_merged_state import _apart, _assert_site_on_par, _moved, _on_par, _second
 from test_algebra_scaled import WAYS, _state
 
 DERIVATIVE_SITES = {
