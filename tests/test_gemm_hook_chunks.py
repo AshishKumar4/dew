@@ -3,8 +3,6 @@
 different widths each fill whole buffers; each product, the template named at a pinned 128-column tile,
 interpreted, as exact as XLA's from float64."""
 
-import functools
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -66,4 +64,4 @@ def test_a_hooked_product_over_a_chunked_tile_is_its_programs(hook, out_dtypes):
     as an H100 runs it: as exact as XLA's product and hook, from float64."""
     assert_as_exact(jax.jit(_template(hook, out_dtypes)), jax.jit(_reference(hook, out_dtypes)), _draw,
                     f"chunked hook {hook.__name__}", seeds=SEEDS,
-                    truth_fn=functools.partial(_reference(hook, out_dtypes), wide=jnp.float64))
+                    truth_fn=_reference(hook, out_dtypes, wide=jnp.float64))
