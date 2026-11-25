@@ -13,7 +13,6 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import datetime
-import faulthandler
 import functools
 import hashlib
 import logging
@@ -777,11 +776,11 @@ class Trainer(Generic[Loss, Effects]):
 
     def _first_stepped(self, run: FitRun, loss: jax.Array) -> None:
         """The run's first step done (`loss` ready): its startup's record of it (`Startup.first_step`), and
-        the fault record armed again past the handlers the step's collectives installed (UCX's), which then
-        chain to it (`faults`)."""
+        the fault record installed again past the handlers the step's collectives installed over it (UCX's),
+        which it hands each signal on to (`faults.Recording.rearmed`)."""
         loss.block_until_ready()
         run.first_step = run.startup.first_step(run.started)
-        faults.armed(self._run_directory())
+        run.faults.rearmed()
 
     def _run_directory(self) -> str | None:
         """The run's directory, where its checkpoints are and its fault record goes (`faults`); None for a run
@@ -1227,14 +1226,12 @@ class Trainer(Generic[Loss, Effects]):
         """
         # The main thread's waits on the data's workers take a signal however it lands (`signal_wake`),
         # from the plan's first read of the data on.
-        with signal_wake():
+        # A fatal signal's stacks go to the run's directory for the fit's whole length, its teardown's
+        # included (`faults.recording`), armed again once its first step has run (`_first_stepped`).
+        with faults.recording(self._run_directory()) as record, signal_wake():
             self._handed_ahead()
             plan = self._fit_plan(dataset, **asked)
-            run = FitRun(time.perf_counter(), plan.startup)
-            # A fatal signal's stacks to the run's directory, armed again once its first step has run
-            # (`faults`), and the process's handler as the fit found it after.
-            handling, directory = faulthandler.is_enabled(), self._run_directory()
-            faults.armed(directory)
+            run = FitRun(time.perf_counter(), plan.startup, faults=record)
             # Each fit plans its step as the trainer's first did, at the split it was given, so a refit's
             # first step is keyed as that fit's was and reads the step it traced (row 6022); a state that
             # pools a window binds its own split as it compiles (`StepCompiler.compile`).
@@ -1258,7 +1255,6 @@ class Trainer(Generic[Loss, Effects]):
                 if plan.restore_best and run.preempted is None:
                     trained = self._best_model(trained, run)
             finally:
-                faults.restored(handling)
                 primary = sys.exception()
                 error = self._closed(run, primary, profiler)
                 # After the run's log, tracker and outcome closed: a plan still running off the loop is
@@ -2005,7 +2001,7 @@ class Trainer(Generic[Loss, Effects]):
         reading, run.ahead = run.train is not None, None
         if run.train is not None:
             run.train.close()
-        branched = FitRun(run.started, run.startup, current=run.current, partition=run.partition,
+        branched = FitRun(run.started, run.startup, run.faults, current=run.current, partition=run.partition,
                           reads=run.reads, compiled=run.compiled, passes=run.passes, marked=run.marked)
         # The branch's own clock of committed tokens, from the run's, which a schedule's stages end at
         # as the run's do (`_scheduled`), read off the devices where its steps may have reached what it

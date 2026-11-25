@@ -74,6 +74,7 @@ from dew.training.cadence import Cadence, Counted
 from dew.training.cooldown import Branch, Cooldowns
 from dew.training.diloco import regrouped
 from dew.training.evaluation import Declared, EvalSuite, Evaluation, Split, SplitLoss, episodic
+from dew.training.faults import Recording
 from dew.training.interval import Interval, LogWriter, Taken, TokenClock
 from dew.training.memory import CodeBounded, code_bytes
 from dew.training.model_flops import TOKENS, TRAINING_FLOPS
@@ -399,6 +400,8 @@ class FitRun:
     started: float
     startup: Startup
     """Its startup phases, as its plan timed them (`FitPlan.startup`)."""
+    faults: Recording
+    """Its fault record (`dew.training.faults.recording`), installed again once its first step has run."""
     restarted: tuple[str, ...] | None = None
     """What differed between a relaxed resume's saved data plan and the run's, which started its data
     again (`dew.data.plan.PlanChanged.differs`); None where the data read on or the run did not resume."""
