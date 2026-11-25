@@ -579,9 +579,9 @@ def test_a_dry_prepares_baseline_is_mains_whatever_cut_main_made_of_it(ci, monke
     """A dry prepare's baseline (prepares.py's `before`) is every cell main's runs of its file's prepare for
     its generation and process left unprepared, in one cut main's commit names whole (listed once), so a
     row this run cut otherwise is held to main's all the same. Main with no run of it at all is
-    `BOOTSTRAP`, as is a run of main's own commit (a train's base), whose baseline it is; else a cut read in
-    part, a Worker that fails, a listing or a read that stalls past its time, a run main named with no
-    baseline, or a time already past, `UNREAD`."""
+    `BOOTSTRAP`, as is a run of main's own commit (a train's base) that reads none whole, whose baseline it
+    is; else a cut read in part, a Worker that fails, a listing or a read that stalls past its time, a run
+    main named with no baseline, or a time already past, `UNREAD`."""
     kept = {"3.12:tests/test_gpu_a.py#1/2@prepare-sm90": ["tests/test_gpu_a.py::test_a @ cell"],
             "3.12:tests/test_gpu_a.py#2/2@prepare-sm90": ["tests/test_gpu_a.py::test_b @ cell"],
             "3.12:tests/test_gpu_a.py#1/3@prepare-sm90": ["tests/test_gpu_a.py::test_c @ cell"],
@@ -629,12 +629,15 @@ def test_a_dry_prepares_baseline_is_mains_whatever_cut_main_made_of_it(ci, monke
     def before(name: str, group: str, seconds: float = 600.0):
         return ci.prepares.before(ci, "3.12", name, group, time.monotonic() + seconds)
 
-    # A run of main's own commit (a train's base) is its baseline, whatever main's earlier runs of it
-    # wrote: a cut left part-written (its other group red) holds it to nothing, never stale.
+    # A run of main's own commit (a train's base) reading no whole baseline of it is its baseline: a cut
+    # left part-written (its other group red) holds it to nothing, never stale. One reading a whole
+    # baseline is held to it as its heads are.
     monkeypatch.setattr(ci.run_keys, "head_commit", lambda: "main")
     named.add("3.12:tests/test_gpu_a.py#1/3@prepare-sm90-users")
     assert before("tests/test_gpu_a.py", "1/3@prepare-sm90-users") == ci.prepares.BOOTSTRAP
     named.clear()
+    assert before("tests/test_gpu_a.py", "@prepare-sm90") == {
+        "tests/test_gpu_a.py::test_a @ cell", "tests/test_gpu_a.py::test_b @ cell"}
     monkeypatch.setattr(ci.run_keys, "head_commit", lambda: "a head")
 
     assert before("tests/test_gpu_a.py", "@prepare-sm90") == {
