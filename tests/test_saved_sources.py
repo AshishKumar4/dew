@@ -958,3 +958,14 @@ def test_a_decision_run_saved_with_its_budgets_and_context_flat_loads_them_whole
     unread = DecisionRunConfig.read(earlier_run({**record, "fields": {**today, "max_len": 768,
                                                                      "context_layers": None}}))
     assert unread.rows == RowBudgets(max_len=768) and unread.context is None
+
+
+def test_an_override_sets_a_decision_runs_context_and_a_field_of_it_in_one_point(tmp_path):
+    """One override point that sets a decision run's unset context and a field of it (`context` with
+    `context.layers`, the context's own fields under it) builds the run its whole point describes: a path
+    under a section the point sets is placed in that section, the run built once, never part-set."""
+    from dew.decision.config import CrossContext
+
+    run = decision(tmp_path, drawn=False).override({"context": {}, "context.layers": [0, 1],
+                                                    "context.length": 32})
+    assert isinstance(run, DecisionRunConfig) and run.context == CrossContext(layers=(0, 1), length=32)

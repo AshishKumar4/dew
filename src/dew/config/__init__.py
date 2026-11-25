@@ -624,6 +624,25 @@ def _placed(config: "RunConfig", path: str) -> tuple[list[str], dict[str, JSON]]
     return [*groups, field], unset
 
 
+def _declared_path(kind: type, record: Mapping[str, JSON], path: str) -> list[str]:
+    """The keys of `path`'s value in a record of the run class `kind` whose sections along it the record
+    holds (`record`, set by a shallower path of an override's point): each section by the one dataclass its
+    field declares, beside None, its field one that class declares; KeyError for any other."""
+    *groups, field = path.split(".")
+    node: object = record
+    for group in groups:
+        declared = registry.declared_type(kind, group)
+        kinds = [member for member in (declared, *typing.get_args(declared))
+                 if isinstance(member, type) and dataclasses.is_dataclass(member)]
+        held = node.get(group) if isinstance(node, Mapping) else None
+        if len(kinds) != 1 or not isinstance(held, Mapping):
+            raise KeyError(f"{path} names no group of the run record")
+        kind, node = kinds[0], held
+    if not (dataclasses.is_dataclass(kind) and field in _names(kind)):
+        raise KeyError(f"{path} names no field of the run record")
+    return [*groups, field]
+
+
 def _names(held: "DataclassInstance | type[DataclassInstance]") -> set[str]:
     """The fields a dataclass declares."""
     return {field.name for field in dataclasses.fields(held)}
@@ -822,7 +841,9 @@ class RunConfig:
             try:
                 keys, unset = _placed(self, path)
             except KeyError:
-                keys, unset = _placed(type(self).from_dict(record), path)
+                # A section the run holds unset that a shallower path of the point set: placed by its
+                # declared class, the run built once, from the completed record.
+                keys, unset = _declared_path(type(self), record, path), {}
             *groups, field = keys
             node = record
             for group in groups:

@@ -631,6 +631,10 @@ def to_record(value, annotation) -> JSON:
         return to_record(value.value, None)
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
+    if isinstance(value, type) and _declares_callable(annotation):
+        # A class named where a callable is declared (a rollout's reward by its class), recorded by its import
+        # path as a function is, which reads back as the class (`from_record`).
+        return {"function": import_path(value)}
     if not isinstance(value, type) and _owned(type(value), called=False):
         # A plain class of Dew's or a trusted package's, rebuilt from its
         # constructor's parameters as `_built` builds one; it declares no
@@ -640,6 +644,18 @@ def to_record(value, annotation) -> JSON:
         f"{type(value).__name__} is not something a run record can carry; a "
         f"config field holds JSON scalars, sequences, mappings, dataclasses and "
         f"functions with an import path")
+
+
+def _declares_callable(annotation) -> bool:
+    """Whether `annotation` declares a callable (`Callable[...]`), through an alias, `Annotated` and an
+    optional's union."""
+    if isinstance(annotation, typing.TypeAliasType):
+        return _declares_callable(annotation.__value__)
+    if typing.get_origin(annotation) is typing.Annotated:
+        return _declares_callable(typing.get_args(annotation)[0])
+    if typing.get_origin(annotation) in (types.UnionType, typing.Union):
+        return any(_declares_callable(member) for member in typing.get_args(annotation))
+    return annotation is Callable or typing.get_origin(annotation) is Callable
 
 
 def _record_of(value: Recorded | DataclassInstance, annotation: Annotation) -> dict[str, JSON]:

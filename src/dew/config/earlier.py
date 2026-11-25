@@ -1064,21 +1064,22 @@ def earlier_decision_rows(record: Mapping[str, object]) -> Mapping[str, object]:
 def earlier_reward(record: Mapping[str, object]) -> Mapping[str, object]:
     """A saved LM run's record whose GRPO rollout named its reward by its import path, a string
     (`PromptRollout.reward` before row 11937): the record of what the path names, `{"function": path}`,
-    which reads as the function it names, or as the class, the rollout's reward its instance at its
-    defaults, as the path read before. Carried to 1.0 (ledger 1552)."""
-    from dew.config.lm import LMRunConfig
-
+    which reads as the function it names, or as the class, whose instance at its defaults the rollout
+    calls, as the path read before, recorded by its path again. Carried to 1.0 (ledger 1552)."""
     named = registry.class_record(record)
-    if named is None or named[0] not in registry.runs:
-        return record
-    run_class = registry.runs[named[0]]
-    rollout = named[1].get("rollout")
-    if not (isinstance(run_class, type) and issubclass(run_class, LMRunConfig)
-            and isinstance(rollout, Mapping)):
+    rollout = None if named is None else named[1].get("rollout")
+    if named is None or named[0] not in registry.runs or not isinstance(rollout, Mapping):
         return record
     classed = "class" in rollout and isinstance(rollout.get("fields"), Mapping)
     held = rollout["fields"] if classed else rollout
     if not (isinstance(held, Mapping) and isinstance(held.get("reward"), str)):
+        return record
+    # A reward named by a string: an LM run's rollout's, no other run's (a diffusion rollout names its
+    # reward by an alias).
+    from dew.config.lm import LMRunConfig
+
+    run_class = registry.runs[named[0]]
+    if not (isinstance(run_class, type) and issubclass(run_class, LMRunConfig)):
         return record
     restated = {**held, "reward": {"function": held["reward"]}}
     rollout = {**rollout, "fields": restated} if classed else restated

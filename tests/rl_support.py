@@ -93,6 +93,17 @@ def completion_length(text: str, record) -> float:
     return float(len(text))
 
 
+class LengthReward:
+    """A reward of a completion's length, as `completion_length`, by a class whose instance at its defaults
+    is called: a plain class, no dataclass, named by its import path."""
+
+    def __init__(self, scale: float = 1.0):
+        self.factor = scale
+
+    def __call__(self, text: str, record) -> float:
+        return self.factor * float(len(text))
+
+
 def recorded_grpo_config(tmp_path, *cli: str, prompt: str = "hi there " * 8, **objective_fields):
     """An LM run that names GRPO and records its rollout (`LMRunConfig.rollout`): a one-layer decoder over
     the tiny chat tokenizer, eight rows of `prompt` (by default longer than the width of 8 ids, whose last 8

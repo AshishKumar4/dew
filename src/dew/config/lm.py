@@ -80,11 +80,12 @@ class PromptRollout:
     `max_new_tokens`, ramping over its last `overlong_cache` tokens (a quarter of it where None);
     `estimator` is then the method's.
 
-    `reward` is a function of a completion's text and its prompt's record (`dew.objectives.rl.Reward`), or
-    an instance of a class whose instances are (`dew.rl.sandbox.MathReward()`), a class given read as its
-    instance at its defaults; the command line names it by its import path (`--rollout.reward
-    dew.rl.sandbox:MathReward`). A reward outside Dew is imported before the run loads, as any class a run
-    names is (`dew.registry.imported`).
+    `reward` is a function of a completion's text and its prompt's record (`dew.objectives.rl.Reward`), an
+    instance of a class whose instances are (`dew.rl.sandbox.MathReward()`), or such a class, which the
+    rollout calls an instance of at its defaults, recorded by its import path as a function is; the command
+    line names a function or a class by its import path (`--rollout.reward dew.rl.sandbox:MathReward`). A
+    reward outside Dew is imported before the run loads, as any class a run names is
+    (`dew.registry.imported`).
 
     `served`, where given, draws the completions ahead of the trainer from Dew's own server
     (`ServedRollout`, `--rollout.served.slots 8`) in place of each step's own generation."""
@@ -105,9 +106,6 @@ class PromptRollout:
         from dew.objectives.rl.methods import method
         from dew.objectives.rl.sessions import check_estimator, check_truncation
 
-        if isinstance(self.reward, type):
-            # A class names its instance at its defaults, the reward it calls (`MathReward`).
-            object.__setattr__(self, "reward", self.reward())
         if not callable(self.reward):
             raise ValueError("reward is a function of a completion and its prompt's record, not "
                              f"{self.reward!r}")
@@ -157,7 +155,8 @@ class PromptRollout:
         from dew.data.prompts import PromptRecord
         from dew.objectives.rl import RolloutScheduler
 
-        scorer = self.reward
+        # A class names its instance at its defaults, the reward it calls (`MathReward`).
+        scorer = self.reward() if isinstance(self.reward, type) else self.reward
 
         def reward(text: str, record: PromptRecord) -> float:
             score = scorer(text, record)

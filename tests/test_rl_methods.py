@@ -510,27 +510,31 @@ def test_rloo_pays_its_reference_penalty_in_the_reward_before_the_baseline():
     np.testing.assert_array_equal(np.asarray(packed[ADVANTAGES_KEY]) * mask, per_session(packed, expected))
 
 
-def test_a_rollouts_reward_is_the_callable_its_command_line_names_by_its_path(tmp_path):
-    """A GRPO run's reward (`PromptRollout.reward`) is a callable: the command line names it by its import
-    path, a function as itself and a class as its instance at its defaults (`MathReward`), and a run saved
-    naming it by its path, a string before row 11937, loads holding the function the path names."""
+@pytest.mark.parametrize("path", ["rl_support:completion_length", "rl_support:LengthReward",
+                                  "dew.rl.sandbox:MathReward"])
+def test_a_rollouts_reward_is_the_callable_its_command_line_names_by_its_path(tmp_path, path):
+    """A GRPO run's reward (`PromptRollout.reward`) is a callable the command line names by its import path,
+    a function or a class, whose instance at its defaults the rollout calls; the run's record names it by
+    that path, so it loads holding the function or the class again, a plain class's (`LengthReward`) whose
+    constructor's arguments its instance holds under other names among them; and a run saved naming it by
+    a string, as before row 11937, loads as one naming it so."""
     import json
 
     import rl_support
 
     from dew.config import earlier_run
     from dew.config.lm import LMRunConfig
-    from dew.rl.sandbox import MathReward
+    from dew.registry import imported
 
-    named = rl_support.recorded_grpo_config(tmp_path, "--rollout.reward", "rl_support:completion_length")
-    assert named.rollout is not None and named.rollout.reward is completion_length
-    classed = rl_support.recorded_grpo_config(tmp_path, "--rollout.reward", "dew.rl.sandbox:MathReward")
-    assert classed.rollout is not None and isinstance(classed.rollout.reward, MathReward)
-    record = json.loads(json.dumps(named.record()))
+    named = imported(path)
+    run = rl_support.recorded_grpo_config(tmp_path, "--rollout.reward", path)
+    assert run.rollout is not None and run.rollout.reward is named
+    record = json.loads(json.dumps(run.record()))
+    loaded = LMRunConfig.read(record).rollout
+    assert loaded is not None and loaded.reward is named
     rollout = record["fields"]["rollout"]
     # Its rollout's record, its fields or a class record of them, with the reward named by its path.
-    fields = {**rollout.get("fields", rollout), "reward": "rl_support:completion_length"}
+    fields = {**rollout.get("fields", rollout), "reward": path}
     rollout = {**rollout, "fields": fields} if "class" in rollout else fields
-    earlier = {**record, "fields": {**record["fields"], "rollout": rollout}}
-    loaded = LMRunConfig.read(earlier_run(earlier)).rollout
-    assert loaded is not None and loaded.reward is completion_length
+    earlier = LMRunConfig.read(earlier_run({**record, "fields": {**record["fields"], "rollout": rollout}}))
+    assert earlier.rollout is not None and earlier.rollout.reward is named
