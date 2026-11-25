@@ -369,9 +369,9 @@ def test_a_transposed_letter_no_factor_reads_forms_no_product_over_the_others():
 
 def test_a_transposes_unit_operand_takes_no_band_from_the_groups_beside_it():
     """`y[d] = w[d] s_0 sum_k x[k]` times 57 scalars, each a group: `x`'s cotangent against `2^127` and
-    `2^-30` at `w = [0, 1]` is `2^-30` at every `k`, exactly. The transpose's unit operand along `k` and the
-    scalars sum no letter and lie at their largest, so the cotangent's and the weight's groups keep their
-    band; counted as groups they left none, and the sum, unbanded, read `2^-30` beneath `2^127` as zero."""
+    `2^-30` at `w = [0, 1]` is `2^-30` at every `k`, exactly. The transpose's unit operand along `k`, a group
+    of its own, counts as the factor beside the cotangent it is (`Form.padded`), so the term keeps its band;
+    counted as a group it left none, and the sum, unbanded, read `2^-30` beneath `2^127` as zero."""
     scalars = 58
     subscripts = ("k", "d", *("",) * scalars)
     weight = ((1, 1), (2, 1))
@@ -382,3 +382,13 @@ def test_a_transposes_unit_operand_takes_no_band_from_the_groups_beside_it():
     _, pull = jax.vjp(lambda x: contract(form, x, w, *ones), jnp.ones(3, jnp.float32))
     (found,) = pull(jnp.asarray([2.0 ** 127, 2.0 ** -30], jnp.float32))
     np.testing.assert_array_equal(np.asarray(found), np.full(3, 2.0 ** -30, np.float32))
+
+
+def test_a_scalar_group_keeps_its_band_beside_a_term_that_cancels():
+    """`sum_k a[k] s - t` at `a = [1, 2^-60]`, `s = t = 1`, each operand a group: `2^-60`, the small part in
+    a band of its own beneath the `1 - 1` that cancels, where a band wide enough to hold both rounded it
+    away."""
+    form = Form(("k", "", ""), ((1, (((0, 1),), ((1, 1),))), (-1, (((2, 1),),))), "")
+    a = jnp.asarray([1.0, 2.0 ** -60], jnp.float32)
+    one = jnp.float32(1.0)
+    np.testing.assert_array_equal(np.asarray(contract(form, a, one, one)), np.float32(2.0 ** -60))
