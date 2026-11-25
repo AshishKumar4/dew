@@ -88,7 +88,7 @@ class ShortConvSite(nn.Module):
             scale = math.sqrt(2 * self.kernel + 1)
         if held is not None:
             kept(held, jnp.asarray(history, held.value.dtype), "conv_state")
-        return ((convolved.astype(wide) + x.astype(wide)) / scale).astype(x.dtype)
+        return ((jnp.asarray(convolved, wide) + x.astype(wide)) / scale).astype(x.dtype)
 
     @nn.nowrap
     def _dynamic(self, x, taps, projected, tokens, history):

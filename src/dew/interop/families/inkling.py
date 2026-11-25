@@ -210,11 +210,11 @@ def _text_config(text: Mapping[str, object]) -> DecoderFields:
         norm_eps=record_float(text, 'rms_norm_eps', 1e-6),
         qk_norm=False, v_norm=True, output_gate=True, embedding_norm=True, embedding_norm_reads='lookup',
         tie_embeddings=False, final_logit_softcap=record_float(text, 'final_logit_softcapping'),
-        mixture=None, attention_residuals=None, mlp=None)
+        mixture=None, attention_residuals=None,
+        mlp=native_fields(Situ)(beta=record_float(text, 'mlp_gate_softcap'),
+                                linear_beta=record_float(text, 'mlp_up_softcap')))
     config.update(
         kinds=kinds, mixture=_mixture(text, layers),
-        mlp=native_fields(Situ)(beta=record_float(text, 'mlp_gate_softcap'),
-                                linear_beta=record_float(text, 'mlp_up_softcap')),
         attention_residuals=native_fields(AttentionResiduals)(
             block_size=record_int(text, 'n_layers_per_attn_res_block'),
             normalize_values=bool(text.get('attn_res_normalize_values', True)), scaled=True,
