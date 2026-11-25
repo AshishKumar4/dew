@@ -184,17 +184,10 @@ def inverse(k, beta, exponents: Exponents, lane: Lane) -> Iv:
     return solved(where(_lags(size) > 0, system, point(np.zeros((size, size)))), lane)
 
 
-def solved(system: Iv, lane: Lane) -> Iv:
-    """`algebra.solved` of a chunk's strictly lower system `[C, C]`: `algebra.doubled` on `-system`, each
-    level's two merges staged in fp16 (a 16-bit call's), less the unit diagonal."""
-    lower_a = neg(system)
-    size = system.lo.shape[0]
-    rows, cols = np.indices((size, size))
-    identity = (rows == cols).astype(np.float64)
-    first = (rows % 2 == 1) & (cols == rows - 1)
-    current = Iv(identity + np.where(first, lower_a.lo, 0.0), identity + np.where(first, lower_a.hi, 0.0))
-
-    # Each call's doubling merges as `mainloop._merged`: fp16 where `lane.merged` is zero, else fp32 parts.
+def _merges(lane: Lane) -> tuple:
+    """`(merge, merged)`: a value staged in the form the doubling's merges take (`mainloop._merged`: fp16
+    where `lane.merged` is zero, else fp32 parts), and a product of two so staged, as the tensor cores sum it
+    (`dot`)."""
     merge_lane = dataclasses.replace(lane, held=lane.merged, wide=True) if lane.merged else None
 
     def merge(x: Iv) -> Iv:
@@ -205,6 +198,19 @@ def solved(system: Iv, lane: Lane) -> Iv:
             return dot(x, y, merge_lane, parts=(lane.merged, lane.merged))
         return dot(x, y, lane, FLOAT16)
 
+    return merge, merged
+
+
+def solved(system: Iv, lane: Lane) -> Iv:
+    """`algebra.solved` of a chunk's strictly lower system `[C, C]`: `algebra.doubled` on `-system`, each
+    level's two merges staged in fp16 (a 16-bit call's), less the unit diagonal."""
+    lower_a = neg(system)
+    size = system.lo.shape[0]
+    rows, cols = np.indices((size, size))
+    identity = (rows == cols).astype(np.float64)
+    first = (rows % 2 == 1) & (cols == rows - 1)
+    current = Iv(identity + np.where(first, lower_a.lo, 0.0), identity + np.where(first, lower_a.hi, 0.0))
+    merge, merged = _merges(lane)
     width = 2
     while width < size:
         lower = ((rows // width) % 2 == 1) & (cols // width == rows // width - 1)
@@ -214,6 +220,58 @@ def solved(system: Iv, lane: Lane) -> Iv:
         current = fp32(add(current, joined), lane)
         width *= 2
     return Iv(current.lo - identity, current.hi - identity)
+
+
+def own_inverses(system: Iv, lane: Lane, sub: int) -> list[Iv]:
+    """Each sub-chunk's own block of a chunk's strictly lower system inverted, `(I + D)^-1`, as
+    `own_pairs._inverted` forms it: a column at a time, `x_i = -sum_{m < i} D_im x_m` past its unit entry,
+    an fp32 sum in order of `m` whose each product an add may contract (`fused`), zero above the unit;
+    staged in the merges' form (`_merges`)."""
+    merge, _ = _merges(lane)
+    columns = np.arange(sub)
+    inverses = []
+    for start in range(0, system.lo.shape[0], sub):
+        block = slice(start, start + sub)
+        lo, hi = system.lo[block, block], system.hi[block, block]
+        found: list[Iv] = []
+        for i in range(sub):
+            total = point(np.zeros(sub))
+            for m in range(i):
+                entry = Iv(np.full(sub, lo[i, m]), np.full(sub, hi[i, m]))
+                total = fp32(add(total, fused(mul(entry, found[m]), lane)), lane)
+            found.append(Iv(np.where(columns > i, 0.0, np.where(columns == i, 1.0, -total.hi)),
+                            np.where(columns > i, 0.0, np.where(columns == i, 1.0, -total.lo))))
+        inverses.append(merge(Iv(np.stack([row.lo for row in found]), np.stack([row.hi for row in found]))))
+    return inverses
+
+
+def solved_blocks(system: Iv, lane: Lane) -> Iv:
+    """The intra walk's inverse of a chunk's strictly lower system `[C, C]` under a decay a key dimension
+    (`intra._solved`, since the solve joined the walk): each sub-chunk's own block inverted (`own_inverses`),
+    then a row block of blocks at a time `X_b = X_bb (E_b - L_b X)`, `L_b` the pairs before its sub-chunk
+    (`algebra.columns_before`) and `X` the row blocks solved before it, each staged in the merges' form
+    (`_merges`, zero past them), `E_b - L_b X` fp32 and staged, each product summed as the tensor cores sum
+    it; each row block stored less its unit diagonal, fp32. The doubling (`solved`) puts its roundings
+    elsewhere: Kimi delta attention's native inverse lay outside its enclosure at 0.1% of its entries on an
+    H100 (row 12981)."""
+    merge, merged = _merges(lane)
+    size, sub = system.lo.shape[0], SUB
+    identity = np.eye(size)
+    # The row blocks solved so far as staged, zero past them; and the inverse as stored, a row block each.
+    stacked, solved_rows = (Iv(np.zeros((size, size)), np.zeros((size, size))) for _ in range(2))
+    for b, inverse in enumerate(own_inverses(system, lane, sub)):
+        rows = slice(b * sub, (b + 1) * sub)
+        unit = point(identity[rows])
+        right = unit
+        if b:
+            before = np.arange(size) < b * sub
+            pairs = Iv(np.where(before, system.lo[rows], 0.0), np.where(before, system.hi[rows], 0.0))
+            right = fp32(add(unit, neg(merged(merge(pairs), stacked))), lane)
+        found = merged(inverse, merge(right))
+        stored, kept = fp32(add(found, neg(unit)), lane), merge(found)
+        for whole, part in ((solved_rows, stored), (stacked, kept)):
+            whole.lo[rows], whole.hi[rows] = part.lo, part.hi
+    return solved_rows
 
 
 def weighted(lower, tile, beta, decay: Iv | None, lane: Lane) -> tuple[Iv, Iv]:
@@ -466,7 +524,7 @@ def key_enclosures(step: Step, scale: float, lane: Lane) -> dict[str, Iv]:
     queries = staged(fp32(mul(fp32(mul(point(step.q), raised), lane), factor), lane), lane)
     left = Iv(np.concatenate([queries.lo, scores.lo], 1), np.concatenate([queries.hi, scores.hi], 1))
     right = point(np.concatenate([step.h, step.c], 0))
-    return {"a": staged(solved(system, lane), lane), "w": w, "c": c, "h": leaving,
+    return {"a": staged(solved_blocks(system, lane), lane), "w": w, "c": c, "h": leaving,
             "o": out(dot(left, right, lane), lane)}
 
 
