@@ -354,26 +354,55 @@ class Written:
     platform the context places a call on."""
 
     def __init__(self, fn, compile: Callable = jax.jit):
-        self.fn, self.compile, self._made = fn, compile, {}
+        self.fn, self.compile, self._made, self._compiled = fn, compile, {}, {}
 
     def program(self, platform: str):
         if platform not in self._made:
             self._made[platform] = self.compile(products_held(self.fn), compiler_options=as_written(platform))
         return self._made[platform]
 
-    def __call__(self, *inputs, **options):
+    def ran_on(self, *inputs, **options) -> str:
+        """The platform a call on `inputs` runs its twin on: the platform the call runs on
+        (`_platform_of`), its own arithmetic (a TPU's products at its default precision); but a TPU's host
+        CPU, in IEEE fp32, where the TPU compiles no such program, XLA's TPU backend lowering an HLO transpose
+        only through the simplifier the as-written options leave off (`TPU_TRANSPOSE`; rows 12356-12361,
+        12118-12123, 12127), a cell then comparing against a host twin. Decided once a call's input types
+        and options, by the TPU program's compile, which the call then runs (rows 12813-12841: every TPU
+        twin on its host compared a TPU's default-precision products against IEEE fp32's)."""
         platform = _platform_of(inputs)
-        if platform == "tpu":
-            inputs = jax.device_put(inputs, jax.devices("cpu")[0])
-        return self.program(_written_on(platform))(*inputs, **options)
+        if platform != "tpu":
+            return platform
+        return "tpu" if self._on_tpu(inputs, options) is not None else "cpu"
+
+    def _on_tpu(self, inputs, options):
+        """The TPU's compiled twin of a call on `inputs`, None where the TPU compiles none (`ran_on`)."""
+        leaves, structure = jax.tree.flatten(inputs)
+        key = (tuple(map(jax.typeof, leaves)), structure, tuple(sorted(options.items())))
+        if key not in self._compiled:
+            try:
+                self._compiled[key] = self.program("tpu").lower(*inputs, **options).compile()
+            except jax.errors.JaxRuntimeError as refused:
+                if not _transpose_unimplemented(refused):
+                    raise
+                self._compiled[key] = None
+        return self._compiled[key]
+
+    def __call__(self, *inputs, **options):
+        platform = self.ran_on(*inputs, **options)
+        compiled = self._on_tpu(inputs, options) if platform == "tpu" else None
+        if compiled is not None:
+            return compiled(*inputs, **options)
+        if platform != _platform_of(inputs):
+            # A TPU's call its host runs (`ran_on`).
+            inputs = jax.device_put(inputs, jax.devices(platform)[0])
+        return self.program(platform)(*inputs, **options)
 
     @property
     def placed(self):
-        """Its program for the platform the context places a call on (`generation.placed_platform`), a
-        TPU's on its host (`_written_on`)."""
+        """Its program for the platform the context places a call on (`generation.placed_platform`)."""
         from dew.nn.kernels.generation import placed_platform
 
-        return self.program(_written_on(placed_platform()))
+        return self.program(placed_platform())
 
     def lower(self, *inputs, **options):
         return self.placed.lower(*inputs, **options)
@@ -383,12 +412,14 @@ class Written:
         return self.placed.trace
 
 
-def _written_on(platform: str) -> str:
-    """Where a twin as written (`Written`) of a call on `platform` runs: its own platform, but a TPU's host
-    CPU, as a TPU's float64 truths do (`float64_host`): XLA's TPU backend lowers a transpose only through
-    the simplifier the as-written options leave off ("HLO transpose is not implemented on TPU", rows 12118
-    and 12356), and IEEE fp32 on the host is the written arithmetic of the twin's fp32 program."""
-    return "cpu" if platform == "tpu" else platform
+TPU_TRANSPOSE = "UNIMPLEMENTED: HLO transpose is not implemented on TPU"
+"""XLA's TPU backend's refusal of an HLO transpose its simplifier did not lower, its status and its words:
+what a twin as written raises there (`Written.ran_on`)."""
+
+
+def _transpose_unimplemented(refused: jax.errors.JaxRuntimeError) -> bool:
+    """Whether `refused` is XLA's UNIMPLEMENTED status for an HLO transpose on a TPU (`TPU_TRANSPOSE`)."""
+    return str(refused).startswith(TPU_TRANSPOSE)
 
 
 class Truth:
