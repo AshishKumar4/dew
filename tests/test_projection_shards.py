@@ -342,3 +342,48 @@ def test_a_batched_projection_runs_its_members_as_one_grouped_gemm():
         assert_as_exact(under("mosaic", run), under("xla", run), draw, "a batched projection's grouped GEMM",
                         seeds=8, truth_fn=truth)
     assert ("grouped_matmul", "mosaic") in {(route.choice, route.kernel) for route in routes}, routes
+
+
+@pytest.mark.parametrize("axis", ["data", "fsdp"])
+def test_a_mapped_stacks_weight_reductions_complete_per_layer(axis):
+    """A rematerialized stack of four bf16 Dense layers mapped per shard (`on_shards`, `mapped_shards`)
+    under the trainer's collective combiner (`dew.training.memory.COLLECTIVES`) on two compile-only H100s:
+    each layer's weight-gradient collective (`all-reduce` on `data`, `reduce-scatter` on `fsdp`) completes
+    before its input cotangent enters the layer below (`sharding.on_shards` tying them with
+    `formed_together`, row 12898), so XLA's combiner cannot merge all four layers' unreduced weight
+    gradients into one collective at the step's end."""
+    from kernel_compile import _device
+
+    from dew.training.memory import COLLECTIVES
+
+    layers = 4
+    mesh = _device("sm90", ((axis, 2),))
+    x_shape = (2, 1024, 512)
+    w_shape = (512, 512)
+    with (jax.sharding.use_abstract_mesh(mesh.abstract_mesh), nn.logical_axis_rules(DEFAULT_RULES),
+          _declared()):
+        weight = _kernel("first", w_shape, jnp.bfloat16)
+
+    def loss(x, kernels):
+        def block(h, kernel):
+            return h + Dense(512, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, use_bias=False,
+                             kernel_axes=KERNEL_AXES, name="first").apply({"params": {"kernel": kernel}}, h)
+
+        for kernel in kernels:
+            x = jax.checkpoint(block)(x, kernel)
+        return jnp.sum(x.astype(jnp.float32))
+
+    x_spec = jax.ShapeDtypeStruct(x_shape, jnp.bfloat16,
+                                  sharding=jax.sharding.NamedSharding(mesh, PartitionSpec(axis)))
+    w_spec = jax.ShapeDtypeStruct(w_shape, jnp.bfloat16,
+                                  sharding=jax.sharding.NamedSharding(mesh, weight))
+    kernels = (w_spec,) * layers
+    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"), jax.set_mesh(mesh),
+          nn.logical_axis_rules(DEFAULT_RULES), placing(LAYOUT), _declared()):
+        step = jax.jit(jax.grad(loss, argnums=(0, 1))).lower(x_spec, kernels).compile(
+            compiler_options=COLLECTIVES)
+    expected = "reduce-scatter" if any(weight) else "all-reduce"
+    w_elems = math.prod(w_shape) // (2 if any(weight) else 1)
+    reduces = [shapes for op, shapes in collectives(step)
+               if op == expected and sum(math.prod(shape) for shape in shapes) >= w_elems]
+    assert len(reduces) == layers, (expected, reduces)

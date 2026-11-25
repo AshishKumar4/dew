@@ -143,6 +143,28 @@ def test_a_gated_stacks_backward_holds_no_layers_outputs_past_its_layer(generati
     assert grown <= 2 * (residual + weights) + hidden, (grown, residual, weights, hidden)
 
 
+def test_a_dense_bf16_xla_mainloop_writes_bf16_directly():
+    """A dense bf16 product on XLA's mainloop (`gemm.xla_mainloop` and `_gemm_t`, row 12898) writes its
+    bfloat16 output directly from cuBLASLt instead of allocating an fp32 matmul output and casting it back:
+    a trailing fp32->bf16 convert broke multi-output reduction fusion in nGPT's backward and held 16.78 MB a
+    layer past earlier layers."""
+    from dew.telemetry.instrumentation import hlo_instructions
+
+    def loss(x, w):
+        return jnp.sum(jnp.tanh(gemm.gemm(x, w, None, out_dtype=jnp.bfloat16)).astype(jnp.float32))
+
+    shapes = (jax.ShapeDtypeStruct((2048, 512), jnp.bfloat16),
+              jax.ShapeDtypeStruct((512, 2048), jnp.bfloat16))
+    with generation.chosen(grouped_matmul="xla"):
+        compiled = lowered_for(jax.grad(loss, argnums=(0, 1)), shapes, "sm90").compile(
+            compiler_options={"xla_gpu_enable_triton_gemm": False})
+    matmuls = [(inst.target, inst.arrays[:1], inst.shapes[:1])
+               for inst in hlo_instructions(compiled).values()
+               if "cublas" in inst.target]
+    assert matmuls, "expected cuBLAS matmuls for dense bf16 forward and gradients"
+    assert all(arrays == ("bf16",) for _, arrays, _ in matmuls), matmuls
+
+
 def _placed(mesh, leaf, spec=None):
     """`leaf`'s shape and dtype placed on `mesh` by `spec`, whole where None."""
     from jax.sharding import NamedSharding, PartitionSpec
