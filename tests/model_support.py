@@ -94,6 +94,12 @@ def recorded_site(path: Path, site: str, inputs_of, truth_fn):
     return (*indexed_recording(recording(path), site, seeds, inputs_of=inputs_of, truth_fn=truth_fn), seeds)
 
 
+def method_run(model, method):
+    """`model`'s `method` as a jitted `(variables, ids)` forward: the form a test unrolls a model's
+    computation by hand in, held against the model's own forward."""
+    return jax.jit(lambda variables, ids: model.apply(variables, ids, method=method))
+
+
 def model_draw(model, shape: tuple[int, ...], vocab: int):
     """Check 1's draw for `model` (tests/reference_error.py): a seed's variables and `shape` tokens below
     `vocab`, the variables initialized compiled."""
@@ -145,17 +151,25 @@ def decode_steps(model, compiled=jax.jit):
     return compiled(made, static_argnums=1), compiled(step)
 
 
+def decode_with(steps, params, prompt, rest, *, prefilled: bool = False):
+    """Prefill `prompt`, then feed `rest` one token at a time through `steps` (`(made, step)` from
+    `decode_steps`): [B, 1 + len(rest), V], or with `prefilled` every prefill position's logits too,
+    [B, len(prompt) + len(rest), V]. Reads no `@functools.cache` global, so a check-1 arm calling it has a
+    statement (`truths_ahead.arm_role`)."""
+    made, step = steps
+    logits, cache = step(params, made(params, prompt.shape[0]), prompt)
+    outputs = [logits if prefilled else logits[:, -1:]]
+    for position in range(rest.shape[1]):
+        logits, cache = step(params, cache, rest[:, position:position + 1])
+        outputs.append(logits[:, -1:])
+    return jnp.concatenate(outputs, axis=1)
+
+
 def decode_logits(model, params, prompt, rest, steps=None, *, prefilled: bool = False):
     """Prefill `prompt`, then feed `rest` one token at a time: [B, 1 + len(rest), V], or with `prefilled`
     every prefill position's logits too, [B, len(prompt) + len(rest), V]; by `steps`, the model's compiled
     cache and step where its caller holds them (`decode_steps`)."""
-    made, step = steps or decode_steps(model)
-    logits, cache = step(params, made(params, prompt.shape[0]), prompt)
-    steps = [logits if prefilled else logits[:, -1:]]
-    for position in range(rest.shape[1]):
-        logits, cache = step(params, cache, rest[:, position:position + 1])
-        steps.append(logits[:, -1:])
-    return jnp.concatenate(steps, axis=1)
+    return decode_with(steps or decode_steps(model), params, prompt, rest, prefilled=prefilled)
 
 
 def two_documents(rng: np.random.Generator, rows: int, length: int):

@@ -154,24 +154,17 @@ def _ngpt(model: CausalTransformer, kinds: Mapping[str, ResolvedKind]):
             raise ValueError(f"nGPT's gains and unit norms are the attention's and the dense gated "
                              f"feed-forward's; {layer_type!r} runs {mixer!r}")
 
-def _messaged_blocks(model: CausalTransformer, kinds: Mapping[str, ResolvedKind],
-                     messages: CrossPass) -> None:
+def _messaged_blocks(model: CausalTransformer, messages: CrossPass) -> None:
     """Refuse a loop passing messages (`Loop.messages`) where its blocks' summaries are not one stream's:
     hyper-connections and AltUp carry several, a normed residual makes each sublayer's normed input the
-    stream a merge would leave as it is, a provider's store would break at a block's end, and under
-    attention residuals a block's summary is the depth state's partial sum, whole only where the message
-    blocks are the depth blocks. The one statement of these refusals (row 10858)."""
+    stream a merge would leave as it is, and under attention residuals a block's summary is the depth
+    state's partial sum, whole only where the message blocks are the depth blocks. A provider's store
+    carries across a pass's message blocks (`looping._passed`, row 12929). The one statement of these
+    refusals (row 10858)."""
     if model.hyper_connections is not None or model.altup is not None or model.normed_residual:
         raise ValueError("a loop passing messages summarizes each block by its one residual stream and "
                          "merges into a sublayer's input, leaving that stream as it is: hyper-connections "
                          "and AltUp carry several, and a normed residual makes the normed input the stream")
-    publishing = [layer_type for layer_type, kind in sorted(kinds.items())
-                  if (mixer := kind.mixer or model.layer_mixer) is not None
-                  and mixer.publishes(kv_shared=False)]
-    if model.sharing_layers or publishing:
-        raise ValueError("a loop passing messages runs its block's layers a message block at a time, and a "
-                         "layer leaving keys, values or publications for a later one would leave them across "
-                         "a block's end: kv_shared_layers and publishing mixers take no messages")
     residuals, loop = model.attention_residuals, model.loop
     assert loop is not None
     if residuals is not None and loop.exiting:
@@ -245,13 +238,9 @@ def refuse_unbuildable(model: CausalTransformer, kinds: Mapping[str, ResolvedKin
         raise ValueError(f"a loop norms the one residual between its passes, and {carried} carry "
                          "others beside it; a model with them runs its stack once (loop=None)")
     if messages is not None:
-        _messaged_blocks(model, kinds, messages)
-    if model.loop is not None and model.loop.layers is not None:
-        if model.loop.layers[1] > model.num_layers:
-            raise ValueError(f"the loop's block {model.loop.layers} ends past layer {model.num_layers}")
-        if model.sharing_layers:
-            raise ValueError("a loop over a block reads its layers' keys and values apart from the rest, "
-                             "and kv_shared_layers reads them across it; loop the whole stack")
+        _messaged_blocks(model, messages)
+    if model.loop is not None and model.loop.layers is not None and model.loop.layers[1] > model.num_layers:
+        raise ValueError(f"the loop's block {model.loop.layers} ends past layer {model.num_layers}")
     if model.num_heads % model.kv_heads:
         raise ValueError(
             f"num_heads ({model.num_heads}) must be a multiple of num_kv_heads "

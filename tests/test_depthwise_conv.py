@@ -7,9 +7,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from jax.core import ShapedArray
 from reference_error import assert_fp32_reduction_bound
 
-from dew.nn.conv import Conv, _materialized_depthwise_3x3, _polyphase_depthwise_3x3
+from dew.nn.conv import Conv, _conv_general_dilated, _materialized_depthwise_3x3, _polyphase_depthwise_3x3
+from dew.nn.precision import EXACT_FLOAT32
+from dew.nn.programs import equations
 from dew.nn.ssm import SpatialFusionConv
 
 
@@ -180,3 +183,23 @@ def test_depthwise_quantization_keeps_the_original_provider_output(training):
     np.testing.assert_array_equal(before, after)
 
 
+
+
+def test_the_polyphase_form_convolves_at_its_layers_precision():
+    """The bf16 dilated depthwise convolution's CUDA form (polyphase, over its `dilation ** 2` grids)
+    convolves at the precision its layer states, an exact float32 inside a run whose default is bf16's
+    (each traced convolution's typed `precision`), as the form beside it does (row 12920)."""
+    x, w = jnp.ones((1, 8, 8, 4), jnp.bfloat16), jnp.ones((3, 3, 1, 4), jnp.bfloat16)
+
+    def run(x, w):
+        return _conv_general_dilated(x, w, (1, 1), 'SAME', rhs_dilation=(2, 2),
+                                     dimension_numbers=('NHWC', 'HWIO', 'NHWC'), feature_group_count=4,
+                                     precision=EXACT_FLOAT32)
+    with jax.default_matmul_precision("bfloat16"):
+        found = [each for each in equations(jax.make_jaxpr(run)(x, w).jaxpr)
+                 if each.primitive.name == "conv_general_dilated"]
+    polyphase = [each for each in found
+                 if isinstance(aval := each.invars[0].aval, ShapedArray) and aval.shape[0] == 4]
+    assert polyphase, "no polyphase convolution traced"
+    exact = jax.lax.Precision.HIGHEST
+    assert all(each.params["precision"] in (exact, (exact, exact)) for each in polyphase)

@@ -24,13 +24,13 @@ from model_support import (
     model_draw,
     with_logit_cotangent,
 )
-from reference_error import assert_as_exact, with_gradients
+from reference_error import assert_as_exact, equations, with_gradients
 
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_stack import Loop
 from dew.nn.backbones.embeddings import prepared_embeddings
-from dew.nn.cross_pass import MERGE_PREFIX, MESSAGES_UNWRITTEN, CrossPass, CrossPassMerge
+from dew.nn.cross_pass import MERGE_PREFIX, MESSAGES_UNWRITTEN, CrossPass, CrossPassMerge, merged_sites
 from dew.optim import AdamW
 from dew.training import TrainerAdvanced
 
@@ -173,6 +173,69 @@ def test_a_merge_is_its_formula(spec):
 
     assert_as_exact(jax.jit(merge.apply), by_hand(jnp.float32), draw, "a merge", seeds=SEEDS["merge"],
                     truth_fn=by_hand(jnp.float64))
+
+
+def products(closed) -> list:
+    """`closed`'s dot products, every jaxpr's it holds."""
+    return [eqn for eqn in equations(closed) if eqn.primitive.name == "dot_general"]
+
+
+def test_an_attention_layers_sites_read_their_bank_once_each_by_its_formula():
+    """Three merges of one bank into one sublayer input, as an attention layer's query, key and value sites
+    run them (`merged_sites`), each its own parameters drawn off its init: each computes its own formula
+    (`merged_by_hand`, check 1 against it in float64), the bank read by the products one site's read takes
+    for them all (its keys' scores and its mixture, each over every site's query: row 12923), and each
+    site's controller as many as that read (its down and up projections over the joined kernels, where
+    apart it took five: row 12922)."""
+    merges = tuple(CrossPassMerge(MESSAGES, 16, 1e-6, name=f"site_{index}") for index in range(3))
+    shape = (2, 5, 3, 16)
+
+    def draw(seed):
+        rng = np.random.default_rng([0xC406, seed])
+        read = rng.normal(size=shape[:2] + shape[3:]).astype(np.float32)
+        bank = rng.normal(size=shape).astype(np.float32)
+        def drawn(leaf):
+            return jnp.asarray(rng.normal(scale=0.3, size=leaf.shape), leaf.dtype)
+        params = tuple(jax.tree.map(drawn, nn.unbox(merge.init(jax.random.key(seed), read, bank)))["params"]
+                       for merge in merges)
+        return params, read, bank
+
+    def ours(params, read, bank):
+        bound = tuple(merge.bind({"params": each}) for merge, each in zip(merges, params, strict=True))
+        return merged_sites(bound, read, bank)
+
+    def by_hand(dtype):
+        def formula(params, read, bank):
+            return tuple(merged_by_hand(each, read, bank, MESSAGES, 1e-6, dtype) for each in params)
+        return jax.jit(formula)
+
+    assert_as_exact(jax.jit(ours), by_hand(jnp.float32), draw, "an attention layer's sites",
+                    seeds=SEEDS["merge"], truth_fn=by_hand(jnp.float64))
+    # Counted against one site traced alike, however this platform's programs form a product (`accumulated`).
+    params, read, bank = draw(0)
+
+    def reading(dots):
+        return sum(any(var.aval.shape == shape for var in eqn.invars) for eqn in dots)
+    one = products(jax.make_jaxpr(merges[0].apply)({"params": params[0]}, read, bank))
+    together = products(jax.make_jaxpr(ours)(params, read, bank))
+    # A site's controller as many products as its depth read: one down, one up (two scores and a sum).
+    assert len(one) - reading(one) == reading(one)
+    assert reading(together) == reading(one)
+    assert len(together) == reading(one) + len(merges) * (len(one) - reading(one))
+
+
+def test_a_bf16_merge_contracts_in_bf16_under_the_runs_precision():
+    """A merge whose sublayer computes in bf16 takes every product of its depth read and its controller in
+    bf16, at the precision the run gives bf16 operands (`dew.nn.precision.operand_precision`: a bf16 run's
+    Tensor Cores), not widened to float32 at a precision of its own (row 12918)."""
+    merge = CrossPassMerge(MESSAGES, 16, 1e-6)
+    read = jnp.ones((2, 5, 16), jnp.bfloat16)
+    bank = jnp.ones((2, 5, 3, 16), jnp.bfloat16)
+    variables = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16),
+                             nn.unbox(merge.init(jax.random.key(0), read, bank)))
+    dots = products(jax.make_jaxpr(merge.apply)(variables, read, bank))
+    assert dots
+    assert {str(var.aval.dtype) for eqn in dots for var in eqn.invars} == {"bfloat16"}
 
 
 def _messages_by_hand(module, ids):
@@ -426,20 +489,18 @@ def test_a_decoder_drawn_at_one_pass_holds_every_merge_a_later_pass_reads():
     lambda: dataclasses.replace(decoder("depth", steps=2), loop=Loop(
         2, step_norm=False, layers=(2, 4), messages=CrossPass(block_size=1))).init(
         jax.random.key(0), jnp.zeros((1, 4), jnp.int32)),
-    lambda: dataclasses.replace(decoder("attention"), kv_shared_layers=(3,), loop=Loop(
-        2, step_norm=False, messages=MESSAGES)).init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32)),
     lambda: decoder("attention", steps=2, messages=None).with_passes(3, messages=MESSAGES),
     lambda: dataclasses.replace(decoder("attention", steps=2), normed_residual=True).init(
         jax.random.key(0), jnp.zeros((1, 4), jnp.int32)),
     lambda: decoder("depth", steps=2, exit_gate=True).init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))],
     ids=["a step norm", "implicit", "an empty block", "an empty message block", "depth blocks misaligned",
-         "a message block not the depth block", "shared keys", "messages joining a loop of passes",
+         "a message block not the depth block", "messages joining a loop of passes",
          "a normed residual", "exits over depth residuals"])
 def test_a_loop_whose_messages_cannot_summarize_its_blocks_is_refused(refused):
     """A loop passing messages is refused where its passes would not each enter at the block's input (a
     step norm, the θ-method), where it banks nothing (an empty block or message block), where under
     attention residuals a summary would not be a whole depth block's partial sum or a pass would exit
-    through a depth state uncollapsed, where a layer's keys would cross a message block's end, and where
+    through a depth state uncollapsed, and where
     it would join a loop already of several passes, changing what it computes at the merges' draw, and
     where a normed residual makes a sublayer's normed input the stream its merge would leave as it is."""
     with pytest.raises(ValueError):
@@ -751,3 +812,18 @@ def test_a_rule_over_a_merges_own_path_owns_its_matmuls_and_not_its_depth_mixtur
               "op_names": (op,)} for op in ("dot_general", "einsum")]
     _, unused = qwix_owned("qt", rules, dataclasses.replace(MESSAGES, additive=False))
     assert [tuple(rule.op_names) for rule in unused] == [("einsum",)]
+
+
+def test_a_watched_merge_reads_its_bank_as_its_sites_do():
+    """A merge a caller watches (`capture_intermediates`) runs through its module, and reads its bank in
+    the read's dtype as the merges a block reads together do: a bf16 read beside a float32 bank merges
+    alike, bit for bit, watched or not."""
+    merge = CrossPassMerge(MESSAGES, 16, 1e-6)
+    rng = np.random.default_rng(0x3A7)
+    read = jnp.asarray(rng.normal(size=(2, 5, 16)), jnp.bfloat16)
+    bank = jnp.asarray(rng.normal(size=(2, 5, 3, 16)), jnp.float32)
+    variables = merge.init(jax.random.key(0), read, bank)
+    variables = jax.tree.map(lambda leaf: leaf + 0.1, variables)
+    plain = merge.apply(variables, read, bank)
+    watched, _ = merge.apply(variables, read, bank, capture_intermediates=True, mutable=["intermediates"])
+    np.testing.assert_array_equal(np.asarray(watched), np.asarray(plain))
