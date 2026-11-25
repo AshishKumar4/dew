@@ -569,10 +569,15 @@ def test_syrk_measured_gates_grams_and_polynomials_to_measured_bf16_cells():
             lowered_for(lambda a: gemm.symmetric_gram(a),
                         (jax.ShapeDtypeStruct(shape, jnp.bfloat16),), "sm90")
         assert any(r.kernel == "mosaic" for r in measured_seen), (shape, measured_seen)
-    with generation.routes() as polynomial_seen:
-        lowered_for(lambda a: gemm.symmetric_polynomial(a, jnp.asarray([3.4445, -4.7750, 2.0315])),
-                    (jax.ShapeDtypeStruct((28, 2560, 2560), jnp.bfloat16),), "sm90")
-    assert any(r.kernel == "mosaic" for r in polynomial_seen), polynomial_seen
+    # A polynomial its caller states symmetric (a Gram's, Newton-Schulz's) takes the launch; a square operand
+    # of any values keeps XLA's program, whose `a @ a` the launch's mirrored upper triangle is not.
+    for symmetric, kernel in ((True, "mosaic"), (False, "xla")):
+        with generation.routes() as polynomial_seen:
+            lowered_for(lambda a, symmetric=symmetric: gemm.symmetric_polynomial(
+                a, jnp.asarray([3.4445, -4.7750, 2.0315]), symmetric=symmetric),
+                (jax.ShapeDtypeStruct((28, 2560, 2560), jnp.bfloat16),), "sm90")
+        assert {r.kernel for r in polynomial_seen if r.choice == "syrk"} == {kernel}, (symmetric,
+                                                                                    polynomial_seen)
     for shape, out_dtype in (((1, 512, 512), jnp.bfloat16), ((28, 2560, 4096), jnp.float32)):
         with generation.routes() as unmeasured_seen:
             lowered_for(lambda a, dt=out_dtype: gemm.symmetric_gram(a, out_dtype=dt),

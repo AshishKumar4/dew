@@ -41,14 +41,9 @@ from . import generation, grouped_cells, selection
 from .formats import TernaryWeights
 from .generation import INHERENT
 from .grouped_cells import (
-    FOUR_B_CELLS,
     M_EM_2,
-    M_EM_65,
-    M_EM_67,
     M_FS_34,
     MEASURED,
-    NORMED_08B,
-    NORMED_4B_8B,
     REFERENCE,
     SCOREBOARDS,
     TEMPLATE,
@@ -56,6 +51,7 @@ from .grouped_cells import (
     Kind,
     Made,
     Timed,
+    timings,
 )
 from .grouped_cutlass import CutlassGmm, CutlassTgmm
 from .grouped_launch import INTERPRETED, _GroupedLaunch
@@ -2072,26 +2068,19 @@ each its own."""
 
 
 def _declared() -> dict[tuple[str | None, Kind], tuple[selection.Kernel[GroupedCase], str]]:
-    """`DECLARED`, from the receipts that hold its cells (`grouped_cells`): each scoreboard's kinds and, on a
-    kind XLA keeps, the products the template timed at parity (`SCOREBOARDS`), the A10's and L4's kinds
-    (`M_FS_34`), the A100's grouped forward (`M_EM_2`), products in one launch timed apart (`TOGETHER`), and
-    the products other receipts timed (normed projections formed, M-EM-65 and M-EM-67; the 4B's,
-    `FOUR_B_CELLS`) where their winner is not their kind's route, none returning to XLA on a kind a
-    scoreboard put on the template."""
+    """`DECLARED`, from the receipts that hold its cells (`grouped_cells`): each scoreboard's kinds
+    (`SCOREBOARDS`), the A10's and L4's (`M_FS_34`), the A100's grouped forward (`M_EM_2`), products in one
+    launch timed apart (`TOGETHER`), and every product a receipt timed (`grouped_cells.timings`, the one
+    record its recognition reads too) where its winner is not its kind's route, none returning to XLA on a
+    kind a scoreboard put on the template."""
     cells: dict[tuple[str | None, Kind], tuple[selection.Kernel[GroupedCase], str]] = {}
     replaced = set()
     for board in SCOREBOARDS:
-        for made, projections in board.times.items():
+        for made in board.times:
             if board.winner(made) == TEMPLATE:
                 replaced.add((board.generation, made))
-                continue
-            cells[board.generation, Kind(dense=True, made=made)] = (XLA, board.why(made))
-            for projection in projections:
-                if board.at_parity(made, projection):
-                    cells[board.generation, Kind(dense=True, made=made,
-                                                 matrix=grouped_cells.PROJECTIONS[projection],
-                                                 span=(board.rows, board.rows))] = (
-                        MOSAIC, board.why(made, projection))
+            else:
+                cells[board.generation, Kind(dense=True, made=made)] = (XLA, board.why(made))
     for name, receipt in M_FS_34.items():
         for made in (Made.FORWARD, Made.INPUT_GRADIENT, Made.KERNEL_GRADIENT):
             cells[name, Kind(dense=True, made=made)] = (XLA, receipt)
@@ -2102,18 +2091,14 @@ def _declared() -> dict[tuple[str | None, Kind], tuple[selection.Kernel[GroupedC
                                            span=receipt.timed.span)] = (
                 {MOSAIC.name: MOSAIC, APART.name: PRODUCTS_APART}[receipt.winner], receipt.evidence)
     routes = {TEMPLATE: MOSAIC, REFERENCE: XLA}
-    timed = [((name, made, matrix, False, (24576, 49152)), (winner, receipt))
-             for (name, made, matrix), (winner, receipt) in FOUR_B_CELLS.items()]
-    for normed, receipt, generations in (
-            (Timed(frozenset(NORMED_08B), 12288, 12288), M_EM_65, ('sm80', 'sm90')),
-            (Timed(frozenset(NORMED_4B_8B), 4096, 12288), M_EM_67, ('sm90',))):
-        timed += [((name, made, matrix, True, normed.span), (TEMPLATE, receipt)) for name, made, matrix in
-                  itertools.product(generations, (Made.FORWARD, Made.KERNEL_GRADIENT), normed.matrices)]
-    for (name, made, matrix, formed, span), (winner, receipt) in timed:
-        kind = XLA if (name, Kind(dense=True, made=made)) in cells else MOSAIC
-        if routes[winner] is not kind and not (winner == REFERENCE and (name, made) in replaced):
-            cells[name, Kind(dense=True, made=made, matrix=matrix, formed=formed, span=span)] = (
-                routes[winner], receipt)
+    for timing in timings():
+        kind = XLA if (timing.generation, Kind(dense=True, made=timing.made)) in cells else MOSAIC
+        route = routes[timing.winner]
+        if route is not kind and not (timing.winner == REFERENCE
+                                      and (timing.generation, timing.made) in replaced):
+            cells[timing.generation, Kind(dense=True, made=timing.made, matrix=timing.matrix,
+                                          formed=timing.formed, span=timing.timed.span)] = (
+                route, timing.evidence)
     return cells
 
 
@@ -2171,10 +2156,14 @@ def grouped_case(launches, arguments, options, *, product: Product, whole: bool)
     # 4B's normed projections keep the template FOUR_B's receipts measured).
     name = call.target.generation
 
+    arithmetic = jnp.dtype(arguments[0].dtype).name
+
     def timed(*, formed: bool) -> Timed | None:
-        """The receipt timing this product's matrix over its rows, formed or not, None where none did."""
+        """The receipt timing this product's matrix over its rows in its arithmetic, formed or not, None
+        where none did."""
         return None if matrix is None else next(
-            (timed for timed in MEASURED.get((name, made, formed), ()) if timed.holds(matrix, rows)), None)
+            (timed for timed in MEASURED.get((name, made, formed), ())
+             if timed.holds(matrix, rows, arithmetic)), None)
 
     formed_by = timed(formed=True) if options['hooks'].prologue is not None else None
     formed = formed_by is not None
@@ -2185,9 +2174,8 @@ def grouped_case(launches, arguments, options, *, product: Product, whole: bool)
     if together is not None:
         # Of the arithmetic the receipt timed: its operands' dtype too (base review b68fc2382 F4: an fp16
         # chain inherited the bf16 win).
-        arithmetic = (name, made, jnp.dtype(arguments[0].dtype).name)
-        found = next((receipt.timed for receipt in TOGETHER if receipt.timed.holds(together, rows)
-                      and (receipt.generation, receipt.made, receipt.dtype) == arithmetic), None)
+        found = next((receipt.timed for receipt in TOGETHER if receipt.timed.holds(together, rows, arithmetic)
+                      and (receipt.generation, receipt.made) == (name, made)), None)
         matrix_of = together if found is not None else None
     else:
         found = formed_by if formed else timed(formed=False)

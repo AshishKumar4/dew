@@ -553,9 +553,10 @@ def _syrk_portable(operand: jax.Array, poly: jax.Array | None, *, transpose: boo
 
 
 def _syrk_select(operand: jax.Array, *, has_poly: bool, transpose: bool,
-                 precision: PrecisionLike, out_dtype, interpret_on_cpu: bool) -> bool:
+                 precision: PrecisionLike, out_dtype, interpret_on_cpu: bool, symmetric: bool = True) -> bool:
     """Run `SYRK` kernel selection once without emitting jaxpr equations, resolving committed operand
-    placement first so CUDA-committed inputs under `default_device(cpu)` see their device (row 12026)."""
+    placement first so CUDA-committed inputs under `default_device(cpu)` see their device (row 12026); a
+    polynomial admitted unnamed only where its caller states its operand `symmetric`, a Gram always."""
     from .templates import base
     from .templates.gemm import syrk as syrk_mod
 
@@ -569,9 +570,9 @@ def _syrk_select(operand: jax.Array, *, has_poly: bool, transpose: bool,
         interpreting = xla_products.interpreted(interpret_on_cpu)
         call = base.call((syrk_mod.MOSAIC_SYRK,), flat, poly_spec, transpose=transpose,
                          out_dtype=out_dtype.name, interpret=interpreting)
-        admitted = not interpreting and syrk_mod.measured(generation.gpu_target(), flat.shape, op_dtype,
-                                                          transpose=transpose, out_dtype=out_dtype,
-                                                          polynomial=has_poly)
+        admitted = (not interpreting and symmetric
+                    and syrk_mod.measured(generation.gpu_target(), flat.shape, op_dtype, transpose=transpose,
+                                          out_dtype=out_dtype, polynomial=has_poly))
         case = SyrkCase(op_dtype, out_dtype, call, no_x64=not jax.config.jax_enable_x64,
                         no_auto=not automatic_axes(), precision_ok=exact_products(precision, op_dtype),
                         measured=admitted)
@@ -694,18 +695,19 @@ _symmetric_poly_vjp = contracted("test_a_symmetric_gram_and_polynomial_hold_ever
 
 
 def symmetric_polynomial(a: jax.Array, coeffs, *, precision: PrecisionLike = None, out_dtype=None,
-                         interpret_on_cpu: bool = False) -> jax.Array:
+                         interpret_on_cpu: bool = False, symmetric: bool = False) -> jax.Array:
     """Symmetric matrix polynomial `c0 * I + c1 * a + c2 * (a @ a)` for square `[..., m, m]` and 3-element
     `coeffs` `(c0, c1, c2)`. Both the portable XLA path and the reverse-mode pullback differentiate
     `c0 * I + c1 * a + c2 * (a @ a)` at `precision`; the native Mosaic SYRK launch assumes symmetric real
     16-bit `a == a^T` so `a @ a^T == a @ a` and upper-triangle mirror stores match `a` (rows 11941,
-    11981)."""
+    11981). `symmetric`: the caller states `a == a^T` (a Gram's, Newton-Schulz's), which the launch's
+    unnamed admission needs (`syrk.measured`); unstated, only a call naming the kernel takes it."""
     if a.ndim < 2 or a.shape[-2] != a.shape[-1]:
         raise ValueError(f"symmetric_polynomial expects square [..., m, m], got {a.shape}")
     out = a.dtype if out_dtype is None else jnp.dtype(out_dtype)
     c = jnp.asarray(coeffs).reshape(3)
     if not _syrk_select(a, has_poly=True, transpose=False, precision=precision, out_dtype=out,
-                        interpret_on_cpu=interpret_on_cpu):
+                        interpret_on_cpu=interpret_on_cpu, symmetric=symmetric):
         return _syrk_portable(a, c, transpose=False, conjugate=False, precision=precision, out_dtype=out)
     return _symmetric_poly_vjp(a, c.astype(at_least_fp32(a.dtype)), precision, out, interpret_on_cpu)
 

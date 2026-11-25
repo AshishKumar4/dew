@@ -102,17 +102,20 @@ def test_a_narrowed_output_takes_tiles_holding_whole_pairs_of_runs(family, block
     """A launch stores the wide product's narrowed output (`quantized.forms_refusal`) at a tile whose
     columns, and every piece its issuer reads out at once (tcgen05's 64), hold whole pairs of runs
     (`wide.UNIT`), on a family that places a narrowed output (`stores_narrowed`); else it refuses the tile,
-    which the derivation passes over."""
+    which the derivation passes over; a grouped call's, whatever its tile."""
     tile = tiling.Tiles(128, block_n, 64, 3, block_n, family=family)
-    refusal = quantized.forms_refusal((quantized.Form(2, narrowed=True),), tile, dense=True)
+    form = (quantized.Form(2, narrowed=wide.GROUP),)
+    refusal = quantized.forms_refusal(form, tile, dense=True)
     assert (refusal is not None) is refused, refusal
+    # A grouped call's rows may land through a table, a row at a time, none narrowed.
+    assert quantized.forms_refusal(form, tile, dense=False) is not None
 
 
 def test_a_tpu_launch_stores_no_narrowed_output():
     """A TPU core's launch stages each output tile whole and places none narrower (`stores_narrowed`), so it
     refuses the wide product's narrowed output, which then runs XLA's program."""
     tile = tiling.Tiles(128, 128, 128, 2, 128, family="mxu")
-    assert quantized.forms_refusal((quantized.Form(2, narrowed=True),), tile, dense=True) is not None
+    assert quantized.forms_refusal((quantized.Form(2, narrowed=wide.GROUP),), tile, dense=True) is not None
 
 
 def _wide_gated_4b(saved):

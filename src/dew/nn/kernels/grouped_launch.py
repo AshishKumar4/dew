@@ -67,10 +67,9 @@ def _sizes(specs: list[jax.ShapeDtypeStruct], seed: int, rows: int) -> jax.Array
     return jnp.asarray(sizes)
 
 
-TRACED_TILE = 64
-"""The square tile a launch's hooks are traced at to key its picks (`_GroupedLaunch.traced`): one a hook
-traces whole, the least a wide product's epilogue splits (`templates.gemm.wide.UNIT`: a pair of 32-column
-runs; at 16 its split had no whole run to read)."""
+TRACED_TILE = 16
+"""The square tile a launch's hooks are traced at to key its picks (`_GroupedLaunch.traced`), widened for an
+epilogue that narrows whole runs of columns to the least tile holding one (`quantized.Form.unit`)."""
 
 
 class _GroupedLaunch[Config: Hashable](base.Template[Config]):
@@ -138,17 +137,23 @@ class _GroupedLaunch[Config: Hashable](base.Template[Config]):
         if not isinstance(value, Hooks):
             return value if isinstance(value, str) else None
 
-        def program(hook, axes_of: tuple, dtypes: tuple, tiles: int = 1) -> str | None:
+        from .templates.gemm import quantized
+
+        traced = math.lcm(TRACED_TILE, *(form.unit for form in quantized.forms_of(
+            value.out_forms, value.out_dtypes or ()) if form is not None))
+
+        def program(hook, axes_of: tuple, dtypes: tuple, tiles: int = 1,
+                    extent: int = TRACED_TILE) -> str | None:
             if hook is None:
                 return None
             tile, *sides = dtypes
-            return tuning.program(hook, *(jax.ShapeDtypeStruct((TRACED_TILE, TRACED_TILE), tile),) * tiles,
-                                  *(jax.ShapeDtypeStruct((TRACED_TILE,) * len(axes), dtype)
+            return tuning.program(hook, *(jax.ShapeDtypeStruct((extent, extent), tile),) * tiles,
+                                  *(jax.ShapeDtypeStruct((extent,) * len(axes), dtype)
                                     for axes, dtype in zip(axes_of, sides, strict=True)))
 
         return "hooks:" + repr((program(value.before(), value.prologue_axes, value.prologue_dtypes),
                                 program(value.after(), value.epilogue_axes, value.epilogue_dtypes,
-                                        value.accumulators),
+                                        value.accumulators, traced),
                                 value.prologue_axes, value.epilogue_axes, value.out_dtypes,
                                 value.prologue_broadcast, value.epilogue_broadcast, value.accumulators,
                                 value.out_forms))

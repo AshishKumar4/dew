@@ -251,14 +251,21 @@ class Form(NamedTuple):
     across each `divisor`-column block, one a row a block (a next product's block scales, `reduced`),
     `transposed` its rows contiguous (`[columns // divisor, rows]`, as a block-scaled product reads them).
     `packed`: two 4-bit codes a byte (`divisor` 2, row-major), the even column's in its low nibble, as a
-    sub-byte array packs them (NVFP4's E2M1 codes, `paired`; row 12743). `narrowed`: its epilogue computes
-    it a `divisor`-th as wide as the tile (`[rows, columns // divisor]`, row-major), stored as computed (a
-    wide gated product's hidden activation, one of each gate and up pair, `templates.gemm.wide`)."""
+    sub-byte array packs them (NVFP4's E2M1 codes, `paired`; row 12743). `narrowed`, where nonzero: its
+    epilogue computes it a `divisor`-th as wide as the tile (`[rows, columns // divisor]`, row-major) from
+    whole runs of `narrowed` columns, `divisor` of them a stored run (a wide gated product's hidden
+    activation, one of each gate and up run, `templates.gemm.wide.GROUP`), stored as computed; a tile, and
+    every piece its issuer reads out at once, holds whole `unit`s."""
 
     divisor: int
     transposed: bool = False
     packed: bool = False
-    narrowed: bool = False
+    narrowed: int = 0
+
+    @property
+    def unit(self) -> int:
+        """The tile columns its epilogue narrows whole (`divisor` runs of `narrowed`), else its `divisor`."""
+        return self.divisor * self.narrowed if self.narrowed else self.divisor
 
 
 def forms_of(out_forms: tuple | None, dtypes: tuple) -> tuple:
@@ -402,18 +409,21 @@ def forms_refusal(out_forms: tuple | None, config, *, dense: bool) -> str | None
     grouped tile's share starts mid-tile); a narrowed output (`Form.narrowed`) where the tile's family stores
     one (`mosaic.Transport.stores_narrowed`), its stated chunk whole multiples of its divisor."""
     from dew.nn.kernels.templates import bundles
-    from dew.nn.kernels.templates.gemm import wide
 
     narrowed = [form for form in _formed(out_forms) if form is not None and form.narrowed]
     if narrowed:
         family = bundles.named(config.family, jnp.bfloat16, None)
         if not family.stores_narrowed:
             return f"a {config.family} launch stores no output narrower than its tile"
-        # Its epilogue narrows whole pairs of runs (`wide.split`): every tile's and every piece its issuer
-        # reads out at once (tcgen05's 64 columns), and its stated chunk whole stored columns.
-        if any(each % wide.UNIT for each in config.issued(family)):
-            return (f"a {config.issued(family)} tile's columns and pieces hold no whole {wide.UNIT}-column "
-                    "pairs of a narrowed output's runs")
+        if not dense:
+            return ("a narrowed output is a dense call's (a scattered one's rows land a row at a time, none "
+                    "narrowed)")
+        # Its epilogue narrows whole runs (`Form.unit`): every tile's and every piece its issuer reads out at
+        # once (tcgen05's 64 columns), and its stated chunk whole stored columns.
+        unit = math.lcm(*(form.unit for form in narrowed))
+        if any(each % unit for each in config.issued(family)):
+            return (f"a {config.issued(family)} tile's columns and pieces hold no whole {unit}-column runs "
+                    "of a narrowed output")
         if config.staging is not None and any(config.staging[0] % form.divisor for form in narrowed):
             return f"a chunk of {config.staging[0]} columns holds no whole column groups of a narrowed output"
     unit = _chunk_unit(out_forms)

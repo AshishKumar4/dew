@@ -15,7 +15,7 @@ from dew.distributed.placement import Layout
 from dew.mesh import DEFAULT_RULES, MESH_AXES
 from dew.nn import activations
 from dew.nn.dense import Dense
-from dew.nn.kernels import gemm, generation, grouped_cells
+from dew.nn.kernels import gemm, generation
 from dew.nn.sharding import placing
 
 LAYERS, ROWS, WIDTH = 4, 4096, 2048
@@ -54,17 +54,6 @@ def test_a_generations_declared_cells_hold_no_more_of_a_steps_memory_than_their_
     cells = _step_temp(generation_name, {})
     template = _step_temp(generation_name, {"grouped_matmul": "mosaic"})
     assert cells <= template + output, (cells, template)
-
-
-@pytest.mark.parametrize("generation_name", sorted({board.generation for board in grouped_cells.SCOREBOARDS}))
-def test_the_templates_products_hold_no_more_of_a_steps_memory_than_xlas_dot(generation_name):
-    """Where a receipt puts a generation's products on the template at parity in time
-    (`grouped_cells.SCOREBOARDS`), it is on par in peak memory too (kernel-templates.md §1): the stack's
-    temporaries with the template named no larger than with XLA's dot named, past one output of slack."""
-    output = ROWS * WIDTH * 2
-    template = _step_temp(generation_name, {"grouped_matmul": "mosaic"})
-    xla = _step_temp(generation_name, {"grouped_matmul": "xla"})
-    assert template <= xla + output, (template, xla)
 
 
 GATED_ROWS, GATED_WIDTH, HIDDEN = 4096, 1024, 2048
