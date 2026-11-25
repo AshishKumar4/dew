@@ -335,9 +335,8 @@ def test_a_per_key_spreads_masked_key_carries_no_derivative():
 
 
 def test_a_per_key_paired_faint_product_keeps_value_and_gradient_within_and_across_sub_chunks():
-    """`scan._paired` keeps a faint key (`2^-100`) paired with a large read (`2^100`) through a small decay
-    (`2^-60`) both within a sub-chunk (`twice_scaled`) and across `SUB` (`_channel_shift`), preserves mixed
-    sub-chunks without overflow/underflow, and holds `faint_read_call` on portable math (row 12888)."""
+    """Pair a faint key with a large read through a small decay, within and across sub-chunks. The
+    value and cotangents remain finite, including through the portable read-erase recurrence (row 12888)."""
     from test_recurrence_template_stability import faint_read_call
 
     from dew.nn.kernels.recurrence_algebra import SUB
@@ -379,7 +378,7 @@ def test_a_per_key_paired_faint_product_keeps_value_and_gradient_within_and_acro
     assert float(dk_faint[0, 0, 0, 0]) == float(np.float32(-(2.0 ** 100)))
 
 
-def test_a_balanced_pair_keeps_a_normal_factor_after_decay():
+def test_a_cross_block_pair_keeps_its_normal_factor_after_decay():
     from dew.nn.kernels.recurrence_algebra import SUB
 
     left, right = (np.zeros((SUB + 2, 2), np.float32) for _ in range(2))
@@ -404,3 +403,26 @@ def test_a_decayed_dot_retains_finite_read_cotangents():
     expected = np.zeros_like(left)
     expected[SUB, 0] = 2.0 ** 100
     np.testing.assert_array_equal(gradient, expected)
+
+
+def test_a_diagonal_pair_keeps_its_read_cotangent_after_a_faint_decay():
+    rows = jnp.asarray([[0.0, 0.0], [1.0, 0.0]], jnp.float32)
+    keys = jnp.asarray([[2.0 ** 100, 0.0], [0.0, 0.0]], jnp.float32)
+    decay = jnp.zeros((2, 2, 2), jnp.float32).at[1, 0, 0].set(2.0 ** -80)
+    result, pull = jax.vjp(lambda x: scan._paired(x, keys, decay)[1, 0], rows)
+    assert result == 2.0 ** 20
+    (gradient,) = pull(jnp.float32(2.0 ** -80))
+    np.testing.assert_array_equal(gradient, [[0.0, 0.0], [2.0 ** -60, 0.0]])
+
+
+def test_a_batched_faint_pair_does_not_hide_a_live_nan():
+    from dew.nn.kernels.recurrence_algebra import SUB
+
+    rows, keys = (np.zeros((2, SUB + 1, 2), np.float32) for _ in range(2))
+    rows[:, SUB, 0], keys[:, 0, 0] = 2.0 ** 100, 2.0 ** -100
+    rows[0, SUB, 1] = np.nan
+    decay = np.zeros((2, SUB + 1, SUB + 1, 2), np.float32)
+    decay[:, SUB, SUB - 1] = 1.0
+    decay[:, SUB - 1:, 0] = (2.0 ** -60, 1.0)
+    values = jax.jit(jax.vmap(scan._paired))(rows, keys, decay)
+    np.testing.assert_array_equal(values[:, SUB, 0], [np.nan, 2.0 ** -60])

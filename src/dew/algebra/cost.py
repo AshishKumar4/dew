@@ -19,7 +19,8 @@ from egglog import DagCostModel, EGraph, get_callable_args
 
 from dew._cache import ALGEBRA
 from dew.algebra.extract import Level
-from dew.algebra.rules import CONTRACTED, dtype as dtype_fact, shape
+from dew.algebra.rules import CONTRACTED, param_dtype, shape
+from dew.algebra.rules import dtype as dtype_fact
 from dew.algebra.terms import RESCALE, Region, Term, integer, key, text
 from dew.nn import programs
 from dew.nn.kernels import generation
@@ -103,15 +104,24 @@ def _priced(primitive, params, shapes: list[tuple[int, ...]], made: tuple[int, .
                            fp32=dtype == VALUE)
 
 
-def _elementwise(graph: EGraph, node, primitive, params, operands, held: dict | None,
-                 on: generation.GpuTarget | None = None) -> Work:
-    """An elementwise node's arithmetic (`_priced` on `on`), reading real operand dtypes from the e-graph
-    (`dtype_of`), its result its operands' shapes broadcast; nothing where one shape is unknown."""
+def _elementwise(graph: EGraph, primitive, params, operands, held: dict | None,
+                 on: generation.GpuTarget | None = None, *, parameter=None, predicate: bool = False) -> Work:
+    """Price the operands' dtype facts and the equation's stated result dtype. A borrowed e-graph cannot
+    evaluate the output term in a cost callback, only its supplied operands and parameter index."""
     shapes = _shapes(graph, operands, held)
     if shapes is None:
         return Work()
     in_dtypes = [dtype_of(graph, operand, held) for operand in operands]
-    out_dt = dtype_of(graph, node, held)
+    stated = None if parameter is None else graph.lookup_function_value(param_dtype(parameter))
+    if stated is not None:
+        out_dt = jnp.dtype(text(stated))
+    elif predicate:
+        out_dt = jnp.dtype(jnp.bool_)
+    else:
+        values = (in_dtypes[1:] if primitive is jax.lax.select_n_p else in_dtypes[1:2]
+                  if primitive is jax.lax.clamp_p else in_dtypes)
+        first = values[0]
+        out_dt = first if all(value == first for value in values[1:]) else None
     return _priced(primitive, params, shapes, np.broadcast_shapes(*shapes), on, out_dt, in_dtypes=in_dtypes)
 
 
@@ -198,17 +208,19 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None,
         return Work()
     # Each other elementwise operation by its primitive, its parameters' entry (`Region.params`); a
     # selection's and a clamp's their own. A layout change computes nothing.
-    if (args := get_callable_args(node, Term.unary)) is not None:
-        return _elementwise(graph, node, *region.params[integer(args[2])], args[:1], held, on)
-    if (args := get_callable_args(node, Term.convert)) is not None:
-        return _elementwise(graph, node, *region.params[integer(args[1])], args[:1], held, on)
+    for constructor, position in ((Term.unary, 2), (Term.convert, 1)):
+        if (args := get_callable_args(node, constructor)) is not None:
+            param = args[position]
+            return _elementwise(graph, *region.params[integer(param)], args[:1], held, on, parameter=param)
     for constructor in (Term.binary, Term.compare):
         if (args := get_callable_args(node, constructor)) is not None:
-            primitive, params = region.params[integer(args[3])]
-            return _elementwise(graph, node, primitive, params, (args[0], args[2]), held, on)
+            param = args[3]
+            primitive, params = region.params[integer(param)]
+            return _elementwise(graph, primitive, params, (args[0], args[2]), held, on, parameter=param,
+                                predicate=constructor is Term.compare)
     for constructor, primitive in ((Term.select, jax.lax.select_n_p), (Term.clamp, jax.lax.clamp_p)):
         if (args := get_callable_args(node, constructor)) is not None:
-            return _elementwise(graph, node, primitive, {}, args[:3], held, on)
+            return _elementwise(graph, primitive, {}, args[:3], held, on)
     return Work()
 
 

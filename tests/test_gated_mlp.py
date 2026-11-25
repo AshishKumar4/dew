@@ -195,6 +195,7 @@ def test_a_mixed_gate_up_mlp_keeps_its_projection_dtypes_when_wide_is_named():
 
 def test_saving_only_the_up_projection_keeps_the_wide_residual():
     from jax._src.ad_checkpoint import saved_residuals
+    from jax.core import ShapedArray
 
     from dew.nn.gated_mlp import wide_products
     from dew.nn.residuals import Residual
@@ -210,8 +211,8 @@ def test_saving_only_the_up_projection_keeps_the_wide_residual():
         drop_all = jax.checkpoint_policies.nothing_saveable
         kept = saved_residuals(jax.checkpoint(block, policy=keep_up), rows, gate, up, down)
         dropped = saved_residuals(jax.checkpoint(block, policy=drop_all), rows, gate, up, down)
-    assert shape in {aval.shape for aval, _ in kept}
-    assert shape not in {aval.shape for aval, _ in dropped}
+    assert shape in {aval.shape for aval, _ in kept if isinstance(aval, ShapedArray)}
+    assert shape not in {aval.shape for aval, _ in dropped if isinstance(aval, ShapedArray)}
 
 
 @pytest.mark.parametrize("generation_name", ["sm90", "sm100"])
