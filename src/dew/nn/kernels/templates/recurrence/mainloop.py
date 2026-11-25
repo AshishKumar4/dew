@@ -1541,7 +1541,6 @@ def _weighted_held(call: Call, block: int) -> Held:
            if call.delta else []),))
 
 
-@building(lambda launch: ("recurrence_weighted", "recurrence_decayed_keys"))
 def _last_prefix(call: Call, prefix_refs: tuple, row, column, keyed: int) -> tuple:
     """`_weighted`'s key block's last token's prefix, a column's vector a limb from `column` on, read from
     global memory ahead of its step's slots' wait, its latency the wait's: read after the values' weights,
@@ -1550,6 +1549,7 @@ def _last_prefix(call: Call, prefix_refs: tuple, row, column, keyed: int) -> tup
     return tuple(call.family.columns_of(ref.at[row + call.chunk - 1, ends]) for ref in prefix_refs)
 
 
+@building(lambda launch: ("recurrence_weighted", "recurrence_decayed_keys"))
 def _weighted(k, v, a, prefix: tuple, beta, taken, call: Call):
     """`(w [R, HV * Dk], u [R, HV * Dv])` as `call.held` (`algebra.weighted`): the inverse against the decayed
     write-gated keys and against the write-gated values, under the decay's `prefix` (`chunk_forward._Run`'s);
