@@ -858,8 +858,9 @@ def gated_experts(x: jax.Array | Gathered, gate: jax.Array | Layered, up: jax.Ar
         # A packed bank's matrices are its codes, of no product's shape a launch reads (`None`).
         fused = paired is not None and fuses_grouped(
             jax.ShapeDtypeStruct((_sorted_rows(x), gate_stack.shape[-2]), compute),
-            None if packed else (jax.ShapeDtypeStruct(gate_stack.shape, compute),
-                                 jax.ShapeDtypeStruct(down_stack.shape, compute)),
+            # One layer's experts' matrices, `[experts, in, out]`, of a stack of layers' too.
+            None if packed else (jax.ShapeDtypeStruct(gate_stack.shape[-3:], compute),
+                                 jax.ShapeDtypeStruct(down_stack.shape[-3:], compute)),
             precision, hook, paired=down_layer is paired[-1],
             down_prologue=not packed and not _recipe_takes_experts(down_stack))
     if not fused:
