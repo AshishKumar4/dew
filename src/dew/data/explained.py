@@ -9,6 +9,8 @@ import json
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Literal
 
+from dew._records import record
+
 if TYPE_CHECKING:
     from dew.data.dataset import Loader, Loading
     from dew.data.sources.base import Read
@@ -83,7 +85,7 @@ def explained(loader: Loader) -> str:
     if (plan := loader.plan) is not None:
         lines.append(f"order: {'one global order' if plan.lowering == 'global' else 'cut per share'}")
         lines.extend(f"  {name}: {json.dumps(value, sort_keys=True, separators=(',', ':'))}"
-                     for name, value in plan.order.items())
+                     for name, value in record(plan.spelled_order(), "data plan order").items())
         lines.extend(f"step: {step.name} {step.config}" for step in plan.manifest.steps)
         lines.extend(f"derived: {name} {value}" for name, value in plan.derived.items())
         lines.extend(f"cache: {reference}" for reference in plan.cache)
