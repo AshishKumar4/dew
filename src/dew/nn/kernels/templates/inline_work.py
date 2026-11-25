@@ -20,7 +20,7 @@ from jax.extend.mlir import ir
 from jax.extend.mlir.dialects import arith, func
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates.cost import Work
+from dew.nn.kernels.templates.cost import Work, most, repeated
 
 LANES = 128
 """The threads of a warpgroup, whose lanes a body's ops issue over: an op issues for each warp a lane of which
@@ -89,7 +89,11 @@ def body_work(fn: Callable, avals: Sequence, arg_types: Sequence, values: Sequen
     the lanes its predicates take are read; once a body, target, operands, their layouts, values and warp
     (`_held`). Raises `Uncounted` where its code holds what no rule counts."""
     known = tuple(_scalar(aval, value) for aval, value in itertools.zip_longest(avals, values))
-    capability = generation.capability(generation.gpu_target().generation) or (9, 0)
+    capability = (generation.capability(generation.gpu_target().generation)
+                  or generation.capability(generation.interpreted_target().generation))
+    if capability is None:
+        raise Uncounted("an inline Mosaic GPU body counted for no CUDA capability, its process's nor the "
+                        "interpreted target's")
     key = (capability, tuple(map(str, avals)), tuple(map(str, arg_types)), known, warp)
     found = _held.get(fn, {})
     if key not in found:
@@ -225,7 +229,7 @@ class _Lanes:
                 if start in self.varying or carried in self.varying:
                     self.varying.add(argument)
             if trips > WALKED_TRIPS:
-                return _repeated(self.region(op.regions[0], active), trips)
+                return repeated(self.region(op.regions[0], active), trips)
             return self.trips(op, trips, active)
         if name == "scf.if":
             maybe, surely = self.bounds(op.operands[0])
@@ -234,7 +238,7 @@ class _Lanes:
                 # takes an unknown conditional. Where data a lane holds decides it, a warp's lanes may part
                 # and run both, each over every lane (below).
                 branches = [self.region(region, active) for region in op.regions if region.blocks]
-                return functools.reduce(_most, branches, Work())
+                return most(branches)
             # Each branch over the lanes that may take it: a lane its place decides takes one, a lane data
             # decides may take either.
             work = self.region(op.regions[0], active & maybe)
@@ -423,7 +427,7 @@ class _Lanes:
 
 _PTX_FLOAT = ("fma.", "mul.", "add.", "sub.", "max.", "min.", "neg.", "abs.")
 _PTX_SPECIAL = ("ex2.", "lg2.", "rcp.", "rsqrt.", "sqrt.", "tanh.", "sin.", "cos.")
-_PTX_FREE = ("shfl.", "mov.", "setp.", "selp.", "bar.", "barrier.", "fence.", "membar.", "elect.", "vote.",
+_PTX_FREE = ("shfl.", "mov.", "bar.", "barrier.", "fence.", "membar.", "elect.", "vote.",
              "activemask.", "mbarrier.", "cp.async.commit_group", "cp.async.wait_group", "cp.async.wait_all",
              "cp.async.mbarrier")
 _PTX_INTEGER = ("lop3.", "shf.", "prmt.", "and.", "or.", "xor.", "not.", "shl.", "shr.", "bfe.", "bfi.",
@@ -434,9 +438,12 @@ _PTX_MULTIPLY = ("mul.", "mad.")
 def _assembly(text: str, active: np.ndarray, operand: Callable) -> Work:
     """Inline PTX's work, an instruction at a time: float arithmetic on the fp32 lanes (a packed pair's, `x2`,
     two an instruction), special functions on their units, integer arithmetic and bit manipulation on the
-    integer units (a multiply on the FMA pipe), a conversion at the conversions' rate, a load or store its
-    active lanes' bytes; a shuffle, a move, a predicate and synchronization free (scalar, a lane's
-    exchange); a global atomic its word read and written by each lane that runs it. An instruction guarded
+    integer units (a multiply on the FMA pipe; a compare's setp and a select's selp each an issue, ISETP and
+    SEL, as `BitOp.issues` prices them; unpredicated 32-bit adds accumulating into one register, after an
+    immediate's move or an add into it, one IADD3 of up to three operands, as ptxas fuses them), a
+    conversion at the conversions' rate, a load or store its active lanes' bytes; a shuffle, a move and
+    synchronization free (scalar, a lane's exchange); a global atomic its word read and written by each lane
+    that runs it. An instruction guarded
     (`@p`, `@!p`) runs on the `active` lanes that may take its guard: an operand's (`$N`, `operand`), or a
     predicate the block sets itself from operands and immediates whose lanes are known (`setp`, and-ed or
     or-ed with another predicate: an elected lane's, a last arriver's among it); a memory instruction whose
@@ -459,10 +466,22 @@ def _assembly(text: str, active: np.ndarray, operand: Callable) -> Work:
             return operand(int(word[1:]))[1]
         return predicates.get(word, unknown)
 
+    # The three-way add being formed (`IADD3`): its register, its operands so far, whether an add issued it,
+    # and the lanes its immediate's move issues it on where no add does.
+    adding: tuple[str, int, bool, float] | None = None
+
+    def closed(pending: tuple[str, int, bool, float] | None) -> Work:
+        # A three-way add no add issued: its immediate's move materializes the constant, an issue (an IADD3 of
+        # its immediate alone, `BitOp.issues`).
+        return Work() if pending is None or pending[2] else Work(integer_operations=pending[3])
+
     for line in _statements(text):
         words = line.split()
         running = active
         guard = None
+        # Whether a predicate guards it, apart from whether its lanes are known (`guard`): only unpredicated
+        # adds fuse (the review of lane/toolkit a1b861d7f2d, F1).
+        predicated = bool(words) and words[0].startswith("@")
         if words and words[0].startswith("@"):
             negated = words[0].startswith("@!")
             guard, words = words[0].lstrip("@!"), words[1:]
@@ -478,7 +497,24 @@ def _assembly(text: str, active: np.ndarray, operand: Callable) -> Work:
         moving = float(running.sum())
         if words and words[0].startswith("setp."):
             predicates[words[1].strip(",")] = _set(words, lanes_of, bounds_of)
+            work, adding = work + closed(adding) + _instruction(words, issued, moving), None
             continue
+        if not predicated and words and words[0] == "mov.b32" and len(words) == 3 and (
+                _ptx_integer(words[2]) is not None):
+            # An immediate's move: an add accumulating into its register issues the IADD3 it starts (the
+            # unpredicated 32-bit sequence `BitForm` writes an IADD3 as).
+            work, adding = work + closed(adding), (words[1].strip(","), 1, False, issued)
+            continue
+        if not predicated and words and words[0] in ("add.u32", "sub.u32") and len(words) == 4:
+            out, first = words[1].strip(","), words[2].strip(",")
+            if adding is not None and out == first == adding[0] and adding[1] < 3:
+                issued_already, adding = adding[2], (out, adding[1] + 1, True, adding[3])
+                if issued_already:
+                    continue
+            else:
+                work, adding = work + closed(adding), (out, 2, True, issued)
+        elif words and not words[0].startswith("//"):
+            work, adding = work + closed(adding), None
         if " ".join(words).startswith(COPIED):
             # A launch context's copy (`_Launch`): its bytes once, where any lane reaches it and takes
             # its issuer's guard.
@@ -492,7 +528,7 @@ def _assembly(text: str, active: np.ndarray, operand: Callable) -> Work:
         if guard is not None and words[0].startswith(("ld.", "st.", "atom.", "red.", "cp.async.")):
             raise Uncounted(f"a memory instruction under a guard of unknown lanes ({guard}): {words[0]}")
         work = work + _instruction(words, issued, moving)
-    return work
+    return work + closed(adding)
 
 
 def _statements(text: str) -> list[str]:
@@ -515,6 +551,9 @@ def _instruction(words: list[str], issued: float, moving: float) -> Work:
     mnemonic = words[0]
     elements = 2 if "x2" in mnemonic else 1
     floating = any(kind in mnemonic for kind in ("f32", "f16", "bf16", "f64"))
+    if mnemonic.startswith(("setp.", "selp.")):
+        # A compare's or a select's one issue: FSETP or FSEL on the fp32 lanes, ISETP or SEL on the ALU.
+        return Work(operations=elements * issued) if floating else Work(integer_operations=elements * issued)
     if mnemonic.startswith(_PTX_FLOAT) and floating:
         return Work(operations=elements * issued)
     if mnemonic.startswith(_PTX_SPECIAL):
@@ -625,10 +664,11 @@ def _lane_values(name: str, op, operands: list[np.ndarray]) -> np.ndarray | None
             return first - last
         case "arith.muli":
             return first * last
-        case "arith.divui" | "arith.divsi" | "arith.floordivsi":
-            return np.where(last == 0, 0, first // np.where(last == 0, 1, last))
-        case "arith.remui" | "arith.remsi":
-            return np.where(last == 0, 0, first % np.where(last == 0, 1, last))
+        case ("arith.floordivsi" | "arith.divsi" | "arith.remsi" | "arith.shrsi" | "arith.minsi"
+              | "arith.maxsi"):
+            return _signed(name, first, last, _width(op.results[0].type))
+        case "arith.divui" | "arith.remui" | "arith.shrui" | "arith.minui" | "arith.maxui":
+            return _unsigned(name, first, last, _width(op.results[0].type))
         case "arith.andi":
             return first & last
         case "arith.ori":
@@ -637,12 +677,6 @@ def _lane_values(name: str, op, operands: list[np.ndarray]) -> np.ndarray | None
             return first ^ last
         case "arith.shli":
             return first << last
-        case "arith.shrui" | "arith.shrsi":
-            return first >> last
-        case "arith.minsi" | "arith.minui":
-            return np.minimum(first, last)
-        case "arith.maxsi" | "arith.maxui":
-            return np.maximum(first, last)
         case "arith.cmpi":
             width = _width(op.operands[0].type)
             return None if width is None else _compared(int(op.attributes["predicate"].value), first, last,
@@ -650,6 +684,42 @@ def _lane_values(name: str, op, operands: list[np.ndarray]) -> np.ndarray | None
         case "arith.select":
             return np.where(first.astype(bool), operands[1], last)
     return None
+
+
+def _signed(name: str, first: np.ndarray, last: np.ndarray, width: int | None) -> np.ndarray | None:
+    """A signed integer op over lanes held as their bits (a truncation's unsigned, `_lane_values`): its
+    operands read signed at `width` bits (Python's integers, so 64 bits' least overflows nothing), its result
+    held signed at them again; None where the width is unknown (the review of lane/toolkit a1b861d7f2d, F7).
+    LLVM's sdiv and srem truncate toward zero, the remainder taking the dividend's sign; floordivsi floors."""
+    if width is None:
+        return None
+    first, last = (_at_width(side, width, signed=True) for side in (first, last))
+    divisor = np.where(last == 0, 1, last)
+    floored = first // divisor
+    # Toward zero: a floored quotient one up where the division is inexact and its signs differ.
+    truncated = floored + ((first % divisor != 0) & ((first < 0) != (divisor < 0)))
+    signed = {"arith.floordivsi": lambda: np.where(last == 0, 0, floored),
+              "arith.divsi": lambda: np.where(last == 0, 0, truncated),
+              "arith.remsi": lambda: np.where(last == 0, 0, first - divisor * truncated),
+              "arith.shrsi": lambda: first >> last,
+              "arith.minsi": lambda: np.minimum(first, last),
+              "arith.maxsi": lambda: np.maximum(first, last)}[name]()
+    return _at_width(signed, width, signed=True).astype(np.int64)
+
+
+def _unsigned(name: str, first: np.ndarray, last: np.ndarray, width: int | None) -> np.ndarray | None:
+    """An unsigned integer op over lanes held signed: its operands read unsigned at `width` bits, its result
+    held signed at them again; None where the width is unknown."""
+    if width is None:
+        return None
+    first, last = (_at_width(side, width, signed=False) for side in (first, last))
+    divisor = np.where(last == 0, 1, last)
+    unsigned = {"arith.divui": lambda: np.where(last == 0, 0, first // divisor),
+                "arith.remui": lambda: np.where(last == 0, 0, first % divisor),
+                "arith.shrui": lambda: first >> last,
+                "arith.minui": lambda: np.minimum(first, last),
+                "arith.maxui": lambda: np.maximum(first, last)}[name]()
+    return _at_width(unsigned, width, signed=True).astype(np.int64)
 
 
 def _compared(predicate: int, first: np.ndarray, second: np.ndarray, width: int) -> np.ndarray:
@@ -679,16 +749,6 @@ def _trips(lower, upper, step) -> int | None:
     if any(bound is None or np.any(bound != bound[0]) for bound in (lower, upper, step)):
         return None
     return max(0, -(-(int(upper[0]) - int(lower[0])) // int(step[0])))
-
-
-def _repeated(work: Work, count: int) -> Work:
-    return Work(**{field.name: getattr(work, field.name) * count for field in dataclasses.fields(Work)
-                   if field.name not in ("span", "chains")})
-
-
-def _most(first: Work, second: Work) -> Work:
-    return Work(**{field.name: max(getattr(first, field.name), getattr(second, field.name))
-                   for field in dataclasses.fields(Work) if field.name not in ("span", "chains")})
 
 
 def _thread(name: str) -> bool:
@@ -734,7 +794,8 @@ def _element_offsets(op, offsets: list, known: bool) -> np.ndarray | None:
     narrow = isinstance(index_type, ir.IntegerType) and index_type.width < 64
     if stride is None or (narrow and not known):
         return None
-    return base + (_signed(offsets[1], index_type.width) if narrow else offsets[1]) * stride
+    return base + (_at_width(offsets[1], index_type.width, signed=True).astype(np.int64) if narrow
+                   else offsets[1]) * stride
 
 
 def _stride(element: ir.Type) -> int | None:
@@ -753,12 +814,6 @@ def _stride(element: ir.Type) -> int | None:
         return None
     count = _elements(element)
     return _bytes(element) if count & (count - 1) == 0 else None
-
-
-def _signed(values: np.ndarray, width: int) -> np.ndarray:
-    """`values`' low `width` bits read as a signed integer."""
-    half = 1 << (width - 1)
-    return (values + half) % (1 << width) - half if width < 64 else values
 
 
 def _bytes(value_type: ir.Type) -> int:

@@ -777,18 +777,222 @@ def test_an_integer_multiply_counts_on_the_fma_pipe_at_its_own_rate_beside_the_f
     IMAD, the FMA pipe's, as a bit form's left shifts by a multiply are, `bits.BitForm.work`) and nothing of
     the ALU's or the fp32 lanes'; a launch of them is priced at the target's IMAD rate
     (`Architecture.integer_multiply_adds_per_clock`), its seconds the fp32 lanes' unit's, so an FFMA beside it
-    adds to them: on sm90, 64 a clock against 256 FLOPs of FFMA, where read as FFMA work they cost a quarter
-    (the review of 3580, F3)."""
+    adds to them: on sm90, 64 a clock against the lanes' 128 instructions, where read as fp32 instructions
+    they cost half (the review of 3580, F3)."""
     row = jax.ShapeDtypeStruct((1, 128), jnp.int32)
     role = _emitted(lambda x: x * 3, row).roles[0]
     assert (role.fixed.integer_multiply_adds, role.fixed.integer_operations, role.fixed.operations) == (
         128, 0, 0), role.fixed
     target = generation.gpu_target("sm90")
     rates = cost.rates(target, device=False)
-    assert rates.multiply_adds == 64 / 256 * rates.cuda
+    assert rates.multiply_adds == 64 / 128 * rates.cuda
     alone, _ = cost.units(Work(integer_multiply_adds=128), rates)
     beside, _ = cost.units(Work(integer_multiply_adds=128, operations=256), rates)
     assert beside[1] == alone[1] + 256 / rates.cuda
+
+
+def _read_twice(product, z):
+    """`product + z` times `product`: one multiply's output read by an add and by a multiply."""
+    return (product + z) * product
+
+
+@pytest.mark.parametrize(("body", "fused"), [
+    (lambda x, y, z: x * y + z, 128), (lambda x, y, z: jnp.maximum(x * y, z), 0),
+    (lambda x, y, z: _read_twice(x * y, z), 0), (lambda x, y, z: lax.add(lax.mul(x[0, 0], y[0, 0]), z), 0)],
+    ids=["multiply-add", "maximum", "product-read-twice", "scalar-product-into-a-row"])
+def test_an_fp32_multiply_whose_one_use_is_an_add_counts_as_one_fused_instruction(body, fused):
+    """An fp32 multiply whose result an add alone reads is one FFMA with it (ptxas's --fmad, its default):
+    the body counts the pair fused (`Work.fused_multiply_adds`), an element each; a maximum of a product, a
+    product read twice, or one scalar product added to a row's every element (the review of lane/toolkit
+    5cbbe66c586, P1) keeps its multiply an instruction of its own."""
+    row = jax.ShapeDtypeStruct((1, 128), jnp.float32)
+    role = _emitted(body, row, row, row).roles[0]
+    assert role.fixed.fused_multiply_adds == fused, role.fixed
+
+
+def test_a_walk_issuing_one_warp_a_scheduler_waits_each_instructions_dependent_latency():
+    """A GH200 program of one warpgroup, one resident a multiprocessor, issues one warp a scheduler: each of
+    its instructions waits the one before it (`Multiprocessor.issue_interval`, 4.6 clocks: M-NA-21's decode
+    walk at one warp a scheduler, 4.56, and M-FS-70's KDA intra at two, 57% not issued, 4.65), so its walk
+    takes its issue slots 4.6 times over, beyond its ALU's 2; twice the programs of the same work, two
+    resident, issue two warps a scheduler and take the same time (M-NA-21: K64 at two resident 309 us
+    against K128 at one 346 us, the same bytes in flight). An RTX 3090's interval unmeasured, its walk is
+    its units'."""
+    hopper, unmeasured = generation.gpu_target("NVIDIA GH200 480GB"), generation.gpu_target("sm86")
+    program = Work(integer_operations=128 * 1000)
+
+    def launched(target, count: int, resident: int, warps: float) -> float:
+        work = Work(integer_operations=program.integer_operations * count, kernels=1)
+        return cost.launch_seconds(work, count, target, resident=resident, warps=warps)
+
+    sms, issue = hopper.multiprocessors, cost.rates(hopper, device=False).issue
+    assert sms is not None and issue is not None
+    slots, launch = program.integer_operations / issue, hopper.launch_seconds or 0.0
+    # One warp a scheduler waits the interval each instruction; two, each its half, a multiprocessor's two.
+    assert launched(hopper, sms, 1, 4) == slots * 4.6 + launch
+    assert launched(hopper, 2 * sms, 2, 4) == 2 * (slots * (4.6 / 2)) + launch
+    # Three a multiprocessor at two resident: a wave of two, then one alone (the review of lane/toolkit
+    # 61dd3c7d2).
+    assert launched(hopper, 3 * sms, 2, 4) == 2 * (slots * (4.6 / 2)) + slots * 4.6 + launch
+    filled = unmeasured.multiprocessors or 1
+    assert launched(unmeasured, filled, 1, 4) == launched(unmeasured, filled, 1, 0)
+
+
+def test_a_walks_issue_latency_follows_the_warps_its_steps_spread_over():
+    """A GH200 program of two warpgroups walking a row doubled a step, its trips its data's (a while
+    loop's), one program a multiprocessor (`emission.warps_of`, `cost.latency_bound`): one warpgroup walking
+    S steps beside an idle one issues over 4 warps; two walking S steps each (S twice over, every consumer's
+    steps stated, `cost.Stated.steps`) over 8; two splitting S over 8, each warp's chain half, the least
+    bound."""
+    target = generation.gpu_target("NVIDIA GH200 480GB")
+    rates = cost.rates(target, device=False)
+    row = jax.ShapeDtypeStruct((128,), jnp.float32)
+    trips = jax.ShapeDtypeStruct((1,), jnp.int32)
+
+    def priced(*, both: bool, steps: int) -> tuple[float, float]:
+        def body(trips_ref, x_ref, o_ref):
+            def step(index, row):
+                mosaic.step_index(index)
+                return row * 2.0
+
+            def walk():
+                o_ref[...] = lax.fori_loop(0, trips_ref[0], step, x_ref[...])
+
+            if both:
+                walk()
+            else:
+                pl.when(lax.axis_index("wg") == 0)(walk)
+
+        launch = plgpu.kernel(body, out_type=row, num_threads=2, thread_name="wg")
+        traced = jax.make_jaxpr(emission.costed(launch, Stated(steps=steps, bytes_accessed=0)))(trips, row)
+        (kernel,) = [equation for equation in programs.equations(traced.jaxpr)
+                     if "cost_estimate" in equation.params]
+        warps = emission.warps_of(kernel)
+        work = emission.work_of(kernel)
+        assert warps is not None and work is not None
+        return warps, cost.latency_bound(work, rates, target, held=warps)
+
+    one, alone = priced(both=False, steps=64)
+    both, twice = priced(both=True, steps=128)
+    split, halved = priced(both=True, steps=64)
+    assert (one, both, split) == (4, 8, 8), (one, both, split)
+    # Each warpgroup's work outside its walk (a guard's cast) shares its program's warps, so the bounds
+    # differ by it; their steps' chains order them (the exact arithmetic, `test_a_walk_issuing_one_warp_*`).
+    assert halved < twice and halved < alone, (alone, twice, halved)
+
+
+def test_a_programs_launches_price_in_sequence_and_an_uncounted_one_leaves_it_unknown():
+    """A program of two costed launches (`emission.launches_seconds`) prices each at its own launch's seconds
+    (`cost.launch_seconds` of its work, programs and warps), their sum, through a call alike; one launch its
+    emission does not count, or launches under a scan (the review of lane/toolkit 61dd3c7d2), leave the
+    program's price unknown, never 0."""
+    target = generation.gpu_target("NVIDIA GH200 480GB")
+    row = jax.ShapeDtypeStruct((128,), jnp.float32)
+
+    def doubled(x_ref, o_ref):
+        o_ref[...] = lax.fori_loop(0, 8, lambda index, value: value * 2.0, x_ref[...])
+
+    launch = plgpu.kernel(doubled, out_type=row, num_threads=1, thread_name="wg")
+    counted = emission.costed(launch, Stated(steps=8, bytes_accessed=1024))
+    traced = jax.make_jaxpr(lambda x: counted(counted(x)))(row).jaxpr
+    kernels = [equation for equation in programs.equations(traced) if "cost_estimate" in equation.params]
+    each = [cost.launch_seconds(emission.work_of(kernel), emission.launch_programs(kernel), target,
+                                warps=emission.warps_of(kernel) or 0.0) for kernel in kernels]
+    assert len(kernels) == 2 and emission.launches_seconds(traced, target) == each[0] + each[1], each
+    def halved(x_ref, o_ref):
+        o_ref[...] = x_ref[...] * 0.5
+
+    # A launch of a body no costed launch traced (one that did answers with its count, `work_of`).
+    alone = plgpu.kernel(halved, out_type=row, num_threads=1, thread_name="wg")
+    uncounted = jax.make_jaxpr(lambda x: alone(counted(x)))(row).jaxpr
+    assert emission.launches_seconds(uncounted, target) is None
+    # Through a call, priced as its launches; under a scan, whose trips no sequence states, unknown.
+    called = jax.make_jaxpr(jax.jit(lambda x: counted(counted(x))))(row).jaxpr
+    assert emission.launches_seconds(called, target) == each[0] + each[1]
+    scanned = jax.make_jaxpr(lambda x: lax.scan(lambda carry, _: (counted(carry), None), x, None,
+                                                length=4)[0])(row).jaxpr
+    assert emission.launches_seconds(scanned, target) is None
+
+
+@pytest.mark.parametrize(("generation_name", "lanes"), [("sm80", 64), ("sm86", 128), ("sm89", 128),
+                                                        ("sm90", 128), ("sm100", 128), ("sm120", 128)])
+def test_an_fp32_instruction_takes_a_lane_a_clock_a_fused_pair_one(generation_name, lanes):
+    """A CUDA multiprocessor's fp32 lanes each run one instruction a clock, an FFMA's two FLOPs or a lone
+    add's, maximum's or select's one (`Architecture.vector_per_clock` its lanes' FLOPs, two a lane): 1024
+    lone operations take 1024 lane-clocks, and 1024 multiplies with their 1024 fused adds the same, where the
+    lanes' FLOP rate priced the lone ones at half (M-FS-70: the KDA intra launch's FMNMX, a quarter of its
+    instructions, none fused)."""
+    target = generation.gpu_target(generation_name)
+    rates = cost.rates(target, device=False)
+    alone = cost.units(Work(operations=1024), rates)[0][1]
+    paired = cost.units(Work(operations=1024, fused_multiply_adds=1024), rates)[0][1]
+    assert alone == paired == 1024 / (lanes * target.loaded_clock_hz), (alone, paired)
+
+
+def test_a_tpus_vector_units_take_a_fused_pairs_add_as_an_operation_of_its_own():
+    """A TPU's VPU rate is calibrated at two operations a multiply-add (`generation._TPUS`), so a pair's add
+    (`Work.fused_multiply_adds`) is an operation there beside its multiply, where a CUDA multiprocessor's
+    lanes run it within the multiply's FFMA (the review of lane/toolkit 5cbbe66c586, P1)."""
+    rates = cost.rates(generation.TARGETS["v5e"], device=False)
+    paired = cost.units(Work(operations=1024, fused_multiply_adds=1024), rates)[0][1]
+    assert paired == 2048 / rates.cuda, paired
+
+
+def _multiply_add_or_adds(row, index):
+    """A conditional its data decides: a multiply-add an element, or two lone adds an element."""
+    return lax.switch(index, [lambda row: row * row + row, lambda row: row + row + row], row)
+
+
+def test_a_tpu_counts_a_bodys_multiply_adds_as_its_vector_units_run_them():
+    """A TPU's VPU runs a multiply and its add as two operations (`generation._TPUS`' calibration), so its
+    count fuses none: a conditional of 128 multiply-adds or 256 lone adds keeps 256 operations, where a
+    fused branch's credit beside the other's adds priced 384 (the review of lane/toolkit c9307c11146, P1)."""
+    with generation.assumed("v5e"):
+        fixed = _emitted(_multiply_add_or_adds, _ROW, jax.ShapeDtypeStruct((), jnp.int32)).roles[0].fixed
+    assert (fixed.operations, fixed.fused_multiply_adds) == (256, 0), fixed
+
+
+def _issued_branches(*branches) -> float:
+    """The issue slots of a conditional its data decides among `branches`, each of a row and 64 integers."""
+    def branched(row, bits, index):
+        return lax.switch(index, list(branches), row, bits)
+
+    return cost.issued(_emitted(branched, _ROW, jax.ShapeDtypeStruct((64,), jnp.int32),
+                                jax.ShapeDtypeStruct((), jnp.int32)).roles[0].fixed)
+
+
+def test_an_unknown_branch_takes_the_issue_slots_its_costliest_branch_does():
+    """A conditional its data decides, one branch 128 fp32 adds, the other 64 integer xors, issues one
+    branch's instructions: the costlier's slots, as a conditional of that branch beside one doing nothing,
+    where its units' most taken unit by unit counted both mixes (the review of lane/toolkit c9307c11146,
+    P2)."""
+    added, xored, kept = (lambda row, bits: (row + row, bits)), (lambda row, bits: (row, bits ^ bits)), (
+        lambda row, bits: (row, bits))
+    both = _issued_branches(added, xored)
+    assert both == max(_issued_branches(added, kept), _issued_branches(kept, xored)), both
+
+
+def test_an_unknown_branch_prices_the_most_lane_instructions_any_branch_issues():
+    """A conditional its data decides, one branch 128 multiply-adds an FFMA each, the other 256 lone adds:
+    its lanes run the costlier's 256 instructions, which a credit for the first's pairs, taken unit by unit
+    over the branches' most, would cut to 128 (the review of lane/toolkit 5cbbe66c586, P1)."""
+    fixed = _emitted(_multiply_add_or_adds, _ROW, jax.ShapeDtypeStruct((), jnp.int32)).roles[0].fixed
+    rates = cost.rates(generation.gpu_target("sm90"), device=False)
+    assert cost.units(fixed, rates)[0][1] == 256 / rates.cuda, fixed
+
+
+def test_a_multiprocessor_issues_four_warps_instructions_a_clock_whichever_units_run_them():
+    """An H100's four warp schedulers each issue one instruction a clock (CUDA C++ Programming Guide §16.8.1),
+    128 threads' a clock: 1024 fp32 operations beside 512 integer ones take 1536 threads' issue slots, 12
+    clocks, where each unit alone takes 8 (the lanes' 128 a clock, the ALU's 64); the whole device's schedule
+    (XLA's fusion, its units in series) holds no issue slot of its own."""
+    target = generation.gpu_target("sm90")
+    work = Work(operations=1024, integer_operations=512)
+    seconds = cost.units(work, cost.rates(target, device=False))[0]
+    assert max(seconds) == 1536 / (128 * target.loaded_clock_hz), seconds
+    device = sum(cost.units(work, cost.rates(target, device=True))[0])
+    per_device = target.loaded_clock_hz * target.multiprocessors
+    assert device == 1024 / (128 * per_device) + 512 / (64 * per_device), device
 
 
 @pytest.mark.parametrize("generation_name", ["sm75", "sm80", "sm86", "sm89", "sm90", "sm100", "sm120"])

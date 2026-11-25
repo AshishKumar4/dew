@@ -325,7 +325,7 @@ class BitForm:
         (`templates.cost.Work`, row 5386): each step's issues on its unit (`issues`), the ALU's as integer
         operations (`Work.integer_operations`) and the FMA pipe's as integer multiply-adds (IMAD, beside the
         fp32 lanes' FFMA at its own rate, `Work.integer_multiply_adds`); a step two output registers read
-        counted once, as ptxas computes it once in the kernel's whole PTX (`ptx`)."""
+        counted once, as its PTX writes it once (`ptx_registers`)."""
         issues = self.issues
         return Work(integer_operations=issues[Unit.ALU] * words,
                     integer_multiply_adds=issues[Unit.FMA] * words)
@@ -366,20 +366,11 @@ class BitForm:
         registers = jnp.stack(self.traced(words), axis=-1)
         return jax.lax.bitcast_convert_type(registers, dtype).reshape(*words.shape[:-1], -1)
 
-    def ptx(self, output: int) -> str:
-        """Output register `output` of the form as one PTX block over its stored word `$1` into `$0`, the
-        steps it reads each on the pipe its step names (`_PTX`), for a kernel's inline assembly (Pallas's
-        `elementwise_inline_asm`, constraints `=r,r`, which takes one result a block): a register's block
-        apiece, each holding the steps it reads, so a step two registers share is written twice and ptxas,
-        which optimizes the kernel's PTX whole, may compute it once (the consumer's compile report shows
-        whether it does)."""
-        return self._block((self.outputs[output],))
-
     def ptx_registers(self) -> str:
         """Every output register of the form as one PTX block over its stored word (`$N`, N its outputs'
-        count) into `$0` to `$N-1`, each step it reads written once (`ptx`'s steps, which a block apiece
-        writes again where two registers share them): a kernel's inline assembly of several results
-        (`inline_forms.registers`), so what it emits is the form's work (`work`)."""
+        count) into `$0` to `$N-1`, each step it reads written once on the pipe its step names (`_PTX`): a
+        kernel's inline assembly of several results (`inline_forms.registers`), so what it emits is the
+        form's work (`work`)."""
         return self._block(self.outputs)
 
     def _block(self, outputs: Sequence[int]) -> str:
@@ -759,9 +750,10 @@ E4M3_SCALE_OWED = 2.0 ** 120
 
 def scales_decoded(codes: jax.Array) -> jax.Array:
     """Block scales' E4M3 codes (uint8 or uint32, a code each) as float32, exactly, by the declared
-    transform (`E4M3_SCALE_FORM`, `traced`: a kernel's portable path; its PTX, `BitForm.ptx`, where inline
-    assembly runs) and the one restore rule (`float_bits.raised_exactly`, the register's owed 2^120 from its
-    bits: a subnormal scale as its mantissa's integer times 2^-9, never through a flushing lane); E4M3's two
+    transform (`E4M3_SCALE_FORM`, `traced`: a kernel's portable path; its PTX, `BitForm.ptx_registers`,
+    where inline assembly runs) and the one restore rule (`float_bits.raised_exactly`, the register's owed
+    2^120 from its bits: a subnormal scale as its mantissa's integer times 2^-9, never through a flushing
+    lane); E4M3's two
     NaN codes, 0x7F and 0xFF, NaN, as a cast of them is, so a block of a NaN scale is NaN wherever it is
     decoded, where the form's fields read them as 480 and -480 (the review of 3580, F1)."""
     held = codes.astype(jnp.uint32)
@@ -930,8 +922,9 @@ def encode_form(minifloat: Minifloat) -> BitForm:
     by a cheaper program of one or two that Z3 proves equal on every input), from 41 issues to 37 for each
     of e4m3, e5m2 and e2m1, the same program but for the minifloat's constants (its largest finite value,
     its bias, its mantissa's width, its NaN code and its sign's place). Proven against `encoded` on every
-    fp32 word by its test; its PTX (`BitForm.ptx`) a kernel's inline encode on a family with no satfinite
-    cvt (sm80, sm86), where its consumer's timing decides it against the compiler's lowering of `encoded`."""
+    fp32 word by its test; its PTX (`BitForm.ptx_registers`) a kernel's inline encode on a family with no
+    satfinite cvt (sm80, sm86), where its consumer's timing decides it against the compiler's lowering of
+    `encoded`."""
     m = minifloat.mantissa
     nan = minifloat.largest if minifloat.nan is None else minifloat.nan
     alu = Unit.ALU
