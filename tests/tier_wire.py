@@ -46,7 +46,7 @@ its prepare's time, no fault of the test."""
 PREPARE_HOLDS = "DEW_TIER_PREPARE_HOLDS"
 """The working set (`dew._cgroups.memory_held`: a cgroup's charge less its inactive page cache) each cgroup
 level binding a dry prepare may hold before the prepare starts no further test, cell or site's draw
-(`past_cap`): `path=bytes` pairs joined by `os.pathsep`, its own cgroup's and each ancestor's that states a
+(`past_cap`): a JSON list of `[path, bytes]` pairs, its own cgroup's and each ancestor's that states a
 memory limit, a share of that limit (tools/armada/prepares.py's `held_caps`, read by the task before its
 pytest runs, so no limit is a recorded input of the tests). A process keeps every program it compiled, and a
 flow's own process beside it holds more, so a group of heavy families grew to its container's whole memory
@@ -56,10 +56,11 @@ empty, no cap."""
 
 def over_memory(caps: str) -> bool:
     """Whether any level `caps` names (`PREPARE_HOLDS`) holds more than its cap."""
+    import json
+
     from dew import _cgroups
 
-    for pair in caps.split(os.pathsep):
-        level, _, cap = pair.rpartition("=")
+    for level, cap in json.loads(caps):
         held = _cgroups.memory_held(Path(level))
         if held is not None and held > int(cap):
             return True

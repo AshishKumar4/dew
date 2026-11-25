@@ -207,13 +207,13 @@ allocation within a unit may outgrow it."""
 def held_caps(ci) -> str:
     """The working set each cgroup level binding this task may hold in its dry prepare (tests/tier_wire.py's
     `PREPARE_HOLDS`): `HELD_SHARE` of the memory limit of its own cgroup and of each ancestor that states one,
-    under DEW_CGROUP_ROOT (host.py's), as `path=bytes` pairs. Read here, in the task, so its pytest reads no
-    limit, which would key every prepare row by its host's (followed.py's `LIMITS`); "" where none states
-    one."""
+    under DEW_CGROUP_ROOT (host.py's), its caps. Read here, in the task, so its pytest reads no
+    limit, which would key every prepare row by its host's (followed.py's `LIMITS`); a JSON list of
+    `[path, bytes]` pairs (a cgroup's name may hold any separator), "" where none states one."""
     reader, root = ci.host.cgroups(), ci.host.cgroup_root()
-    return os.pathsep.join(f"{level}={int(limit * HELD_SHARE)}"
-                           for level in reader.levels(reader.own(root), root)
-                           if (limit := reader.memory(level)) is not None)
+    caps = [[str(level), int(limit * HELD_SHARE)] for level in reader.levels(reader.own(root), root)
+            if (limit := reader.memory(level)) is not None]
+    return json.dumps(caps) if caps else ""
 
 
 def planned(files: list[tuple[str, bool, int]], took: Callable[[str, str], tuple[float, float] | None],

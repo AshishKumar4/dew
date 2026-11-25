@@ -423,12 +423,14 @@ def test_a_dry_prepare_is_past_its_memory_cap_where_a_limit_binding_its_task_is_
     more (its charge less its inactive page cache): every process under it counts, a flow's own beside the
     prepare's. The limits are read by the task, the pytest reading only what each level holds, so no limit
     keys its rows; a part's prepare runs under no such cap."""
+    # A cgroup's name may hold the path separator the old wire split on.
+    root = tmp_path / "worker:prepare"
     membership = tmp_path / "cgroup"
-    membership.write_text(cgroup_tree(tmp_path / "root", levels))
+    membership.write_text(cgroup_tree(root, levels))
     reader = ci.host.cgroups()
     real_own = reader.own
     monkeypatch.setattr(reader, "own", lambda root: real_own(root, membership))
-    monkeypatch.setenv("DEW_CGROUP_ROOT", str(tmp_path / "root"))
+    monkeypatch.setenv("DEW_CGROUP_ROOT", str(root))
     seen = []
 
     def tested(python, files, group, verdict, seconds, *args, **kwargs):
@@ -440,7 +442,7 @@ def test_a_dry_prepare_is_past_its_memory_cap_where_a_limit_binding_its_task_is_
                             threads="1", users=False, variant="@prepare-sm90", capped=capped)
     dry, part = (environ[tier_wire.PREPARE_HOLDS] for environ in seen)
     # The pytest reads no limit: with every `memory.max` gone it judges alike.
-    for limit in (tmp_path / "root").rglob("memory.max"):
+    for limit in root.rglob("memory.max"):
         limit.unlink()
     assert part == "" and tier_wire.past_cap({tier_wire.PREPARE_HOLDS: dry}) is past
 
