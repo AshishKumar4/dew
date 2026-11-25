@@ -48,7 +48,7 @@ from test_recurrence_stability import (
     stressed,
 )
 
-from dew.nn.kernels import generation
+from dew.nn.kernels import generation, recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk
 from dew.nn.kernels.templates.recurrence import template
 
@@ -483,3 +483,37 @@ def test_an_own_score_past_fp32s_range_reads_as_it_is():
     expected = jnp.zeros(out.shape, jnp.float32).at[0, 1].set(jnp.inf)
     np.testing.assert_array_equal(np.asarray(out, np.float32), np.asarray(expected))
     assert np.isfinite(np.asarray(final)).all()
+
+
+def test_a_read_past_its_keys_range_keeps_its_faint_decayed_pair():
+    """A delta rule erasing along reads of its own under a decay a key dimension, its keys and queries unit
+    and its write gates at most one (`Hooks(l2norm=True, write_bound=1)`), keeps a pair whose read restores
+    what its decay took: token 0 writes `2^60` along a key whose channel 0 is `2^-100`, channel 0 decays by
+    `2^-60` at token 1, whose read `2^100` along it finds `1` and corrects its write to `-1`, which token 1's
+    query reads (every later write gate zero). The template's own pairs folded each decay into the key before
+    the read, `2^-160` rounding to zero, its output zero (`recurrence_chunk._unit_pairs`: the reads take no
+    bound; head review of 675cd1ecc)."""
+    length, width = 64, 32
+    hooks = recurrence.Hooks(decay='vector', erase='read', l2norm=True, write_bound=1.0, scale=1.0)
+    unit = np.eye(width, dtype=np.float32)
+    keys = np.tile(unit[3], (1, length, 1, 1))
+    keys[0, 0, 0] = 2.0 ** -100 * unit[0] + unit[1]
+    keys[0, 1, 0] = unit[2]
+    queries = np.tile(unit[3], (1, length, 1, 1))
+    queries[0, 1, 0] = unit[2]
+    reads = np.zeros_like(keys)
+    reads[0, 1, 0, 0] = 2.0 ** 100
+    values = np.zeros((1, length, 1, width), np.float32)
+    values[0, 0, 0, 0] = 2.0 ** 60
+    beta = np.zeros((1, length, 1), np.float32)
+    beta[0, :2] = 1.0
+    decay = np.zeros((1, length, 1, width), np.float32)
+    decay[0, 1, 0, 0] = -60 * np.log(2.0)
+    operands = Chunk(*(jnp.asarray(x, jnp.bfloat16) for x in (queries, keys, values)),
+                     log_decay=jnp.asarray(decay), beta=jnp.asarray(beta, jnp.bfloat16),
+                     erase_read=jnp.asarray(reads, jnp.bfloat16))
+    with generation.assumed("sm90", interpreted=True):
+        out, _ = chunk_on('mosaic_gpu', hooks, operands)
+    expected = np.zeros((1, length, 1, width), np.float32)
+    expected[0, 1, 0, 0] = -1.0
+    np.testing.assert_array_equal(np.asarray(out, np.float32), expected)
