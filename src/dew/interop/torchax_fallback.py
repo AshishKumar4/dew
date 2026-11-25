@@ -1541,15 +1541,17 @@ class TorchCausalLM(nn.Module):
         if any(value not in (None, False) for value in (backprop_steps, remat, implicit, exit_gate,
                                                          exit_threshold, exits, theta_passes, messages)):
             return None
-        held = self.loop or Loop()
+        if self.loop is None and steps is None:
+            return None
+        held = self.loop or Loop(steps=steps)
         loop = replace(held, steps=held.steps if steps is None else steps,
-                                   layers=held.layers if layers is None else layers)
+                       layers=held.layers if layers is None else layers)
         return self.with_loop(loop)
 
     @nn.nowrap
     def with_loop(self, loop: Loop) -> Self:
         """The source running `loop` whole (`loop`'s refusals)."""
-        stated, plain = vars(loop), vars(Loop())
+        stated, plain = vars(loop), vars(Loop(steps=loop.steps))
         unrun = sorted(name for name in stated
                        if name not in ('steps', 'layers', 'step_norm') and stated[name] != plain[name])
         if unrun:
