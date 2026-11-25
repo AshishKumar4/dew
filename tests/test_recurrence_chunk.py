@@ -863,11 +863,10 @@ def test_an_additive_erase_keeps_its_rows_on_an_explicit_axis():
 def test_a_forked_call_on_an_explicit_row_axis_is_the_call_whole(hooks, along):
     """A forked call (`Chunk.loads`: documents taking their memories up from its table, entry writes) on the
     portable math, its operands' rows split over an Explicit mesh axis before it is differentiated: its
-    output, last memory and every operand's gradient (`pulled back`), or its tangent along its values
-    (`pushed forward`), on par from float64 with the same call whole (check 1), each placed as its rows are
-    (row 9690: its walk's carries, seeded within the rows' map whole, met the rows' token maps split in a
-    gather JAX refuses; a no-decay call's gates, formed whole, its map's). A case a direction: both in one
-    compiled every arm's gradient and tangent together, 151 to 186 s a case (row 12802)."""
+    output, last memory and every operand's gradient (`pulled back`), or its tangent along its values, on
+    par from float64 with the same call whole (check 1), each placed as its rows are (row 9690: its walk's
+    carries, seeded within the rows' map whole, met the rows' token maps split in a gather JAX refuses; a
+    no-decay call's gates, formed whole, its map's). Both directions in one case took 151 to 186 s (12802)."""
     mesh = jax.make_mesh((2,), ('data',), (jax.sharding.AxisType.Explicit,), devices=jax.devices()[:2])
     rows = jax.sharding.NamedSharding(mesh, P('data'))
     run = functools.partial(chunk_on, 'xla', hooks, chunk_size=CHUNK)
@@ -878,8 +877,7 @@ def test_a_forked_call_on_an_explicit_row_axis_is_the_call_whole(hooks, along):
         return transitioned(hooks, operands, seed), seeded, tangent
 
     def arm(place):
-        # The draw's operands, cotangents and tangent placed as `place` places them before the call is
-        # differentiated, its documents laid within it (as `assert_forked_on_par`'s) and placed alike.
+        # The draw placed by `place` before the call is differentiated, its documents laid within it alike.
         def ran(operands):
             return run(place(entering_documents(operands)))
 
@@ -887,11 +885,8 @@ def test_a_forked_call_on_an_explicit_row_axis_is_the_call_whole(hooks, along):
             operands, cotangents, tangent = place((operands, cotangents, tangent))
             if along == 'pulled back':
                 return with_gradients(ran)(operands, cotangents)
-
-            def moved(value):
-                return ran(dataclasses.replace(operands, value=value))
-
-            return jax.jvp(moved, (operands.value,), (tangent,))[1]
+            return jax.jvp(lambda value: ran(dataclasses.replace(operands, value=value)), (operands.value,),
+                           (tangent,))[1]
 
         return differentiated
 
@@ -900,10 +895,7 @@ def test_a_forked_call_on_an_explicit_row_axis_is_the_call_whole(hooks, along):
         assert_as_exact(jax.jit(split), jax.jit(arm(lambda tree: tree)), drawn,
                         f'forked {hooks} on an explicit row axis, {along}', seeds=FEWEST_SEEDS)
         found = jax.jit(split)(*drawn(0))
-    if along == 'pulled back':
-        (out, last), grads = found
-        found = (out, last, grads.value)
-    for placed in found:
+    for placed in found if along != 'pulled back' else (*found[0], found[1].value):
         assert jax.typeof(placed).sharding.spec[0] == 'data'
 
 
