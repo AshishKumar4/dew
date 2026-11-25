@@ -1009,6 +1009,17 @@ def _moment_combine_parts(ref: Term, n0: Term, n1: Term, ops: dict[str, i64]) ->
     )
 
 
+def _moment_one_side_scale(either: Term, both: Term, safe_max: Term, n_drop: Term, zero_n: Term,
+                           one_n: Term, ops: dict[str, i64]) -> tuple[Term, ...]:
+    """Double-where partition of one-sided denominator `smax_1` across `< 1` vs `>= 1` so reverse-mode
+    VJP neither overflows `ct / tiny` nor sends `inf * 0` into `smax_1` on `L = 2^70`."""
+    smax_1 = either.select(one_n, both.select(safe_max, one_n))
+    g1_n = either.select(zero_n, both.select(n_drop, zero_n))
+    small_s = one_n.compare(String("gt"), smax_1, ops["gt"])
+    return (smax_1, small_s, small_s.select(smax_1, one_n), small_s.select(one_n, smax_1),
+            small_s.select(g1_n, zero_n), small_s.select(zero_n, g1_n))
+
+
 def _moment_ssa_combine_u_rules(ops: dict[str, i64], binds: dict[str, tuple]) -> list:
     """Linear SSA rules combining normalized first-moment residuals across zero-mass, single-sided, and
     two-sided boundaries."""
@@ -1024,7 +1035,8 @@ def _moment_ssa_combine_u_rules(ops: dict[str, i64], binds: dict[str, tuple]) ->
     shift_ext = _m_ext_mul(ref, extreme, _m_double_if(big_u, n_min), safe_max, d_eff)
     base_u = extreme.select(p_kept.binary(String("mul"), kept_u, ops["mul"]), kept_u)
     u_both = base_u.binary(String("add"), extreme.select(shift_norm, shift_ext), ops["add"])
-    smax_1 = either.select(one_n, both.select(safe_max, one_n))
+    smax_1, small_s, smax_hi, smax_lo, n_hi, n_lo = _moment_one_side_scale(
+        either, both, safe_max, n_drop, zero_n, one_n, ops)
     d_zero = _m_diff(String("val"), ref, kept_a, drop_a, zero_n, zero_n)
     big_z = _m_diff(String("big"), ref, kept_a, drop_a, zero_n, zero_n)
 
@@ -1037,11 +1049,13 @@ def _moment_ssa_combine_u_rules(ops: dict[str, i64], binds: dict[str, tuple]) ->
     u_zero = kept_u.binary(String("add"), drop_u, ops["add"]).binary(
         String("add"), _m_double_if(big_z, g0(n_drop)).binary(String("mul"), g0(d_zero), ops["mul"]),
         ops["add"])
+    u_shift_hi = _m_double_if(big_z, n_hi).binary(String("mul"), g1(d_zero), ops["mul"]).binary(
+        String("div"), smax_hi, ops["div"])
+    u_shift_lo = _m_double_if(big_z, n_lo.binary(String("div"), smax_lo, ops["div"])).binary(
+        String("mul"), g1(d_zero), ops["mul"])
     u_one = p_kept.binary(String("mul"), kept_u, ops["mul"]).binary(
-        String("add"),
-        g1(drop_u).binary(String("add"), _m_double_if(big_z, g1(n_drop)).binary(
-            String("mul"), g1(d_zero), ops["mul"]), ops["add"]).binary(String("div"), smax_1, ops["div"]),
-        ops["add"])
+        String("add"), g1(drop_u).binary(String("div"), smax_1, ops["div"]), ops["add"]).binary(
+        String("add"), small_s.select(u_shift_hi, u_shift_lo), ops["add"])
     return [
         rewrite(_m_combine_u(ref, n0, ax0, ux0, n1, ax1, ux1)).to(
             _m_combine_u_body(ref, either_p, both_p, ext_p, nmin_p, nd_p, smax_p, k0_p.select(ax1, ax0),
@@ -1051,7 +1065,7 @@ def _moment_ssa_combine_u_rules(ops: dict[str, i64], binds: dict[str, tuple]) ->
         rewrite(_m_combine_u_body(ref, either, both, extreme, n_min, n_drop, safe_max, kept_a, drop_a,
                                   kept_u, drop_u, p_kept, p_drop)).to(
             either.select(u_zero, both.select(u_one, u_both)),
-            *fill_bind, *_need(lit_binds, "zero", "one"), *_need(binds, "add", "mul", "div")),
+            *fill_bind, *_need(lit_binds, "zero", "one"), *_need(binds, "gt", "add", "mul", "div")),
     ]
 
 
@@ -1067,7 +1081,8 @@ def _moment_ssa_combine_c_rules(ops: dict[str, i64], binds: dict[str, tuple]) ->
     _, consts, fill_bind, lit_binds = _moment_ref_consts(ref)
     zero_n, one_n = consts["zero"], consts["one"]
     k0_p, either_p, both_p, ext_p, smax_p, p0_p, p1_p, nmin_p, nd_p = _moment_combine_parts(ref, n0, n1, ops)
-    smax_1 = either.select(one_n, both.select(safe_max, one_n))
+    smax_1, small_s, smax_hi, smax_lo, n_hi, n_lo = _moment_one_side_scale(
+        either, both, safe_max, n_drop, zero_n, one_n, ops)
 
     def g0(term: Term) -> Term:
         return either.select(term, zero_n)
@@ -1091,11 +1106,17 @@ def _moment_ssa_combine_c_rules(ops: dict[str, i64], binds: dict[str, tuple]) ->
     cross_0 = _m_double_if(by_0, g0(drop_ux)).binary(String("mul"), g0(dy_0), ops["mul"]).binary(
         String("add"), _m_double_if(bx_0, g0(drop_uy)).binary(String("mul"), g0(dx_0), ops["mul"]),
         ops["add"])
-    shift_1 = _m_double_if(by_1, _m_double_if(bx_1, g1(n_drop))).binary(
+    shift_1_hi = _m_double_if(by_1, _m_double_if(bx_1, n_hi)).binary(
+        String("mul"), g1(dx_1), ops["mul"]).binary(String("mul"), g1(dy_1), ops["mul"]).binary(
+        String("div"), smax_hi, ops["div"])
+    n_lo_q = n_lo.binary(String("div"), smax_lo, ops["div"])
+    shift_1_lo = _m_double_if(by_1, _m_double_if(bx_1, n_lo_q)).binary(
         String("mul"), g1(dx_1), ops["mul"]).binary(String("mul"), g1(dy_1), ops["mul"])
-    cross_1 = _m_double_if(by_1, g1(drop_ux)).binary(String("mul"), g1(dy_1), ops["mul"]).binary(
-        String("add"), _m_double_if(bx_1, g1(drop_uy)).binary(String("mul"), g1(dx_1), ops["mul"]),
-        ops["add"])
+    shift_1 = small_s.select(shift_1_hi, shift_1_lo)
+    cross_1 = _m_double_if(by_1, g1(drop_ux).binary(String("div"), smax_1, ops["div"])).binary(
+        String("mul"), g1(dy_1), ops["mul"]).binary(
+        String("add"), _m_double_if(bx_1, g1(drop_uy).binary(String("div"), smax_1, ops["div"])).binary(
+            String("mul"), g1(dx_1), ops["mul"]), ops["add"])
     c_base = _m_combine_base(ref, ext_p, k0_p, nmin_p, smax_p, c0, c1, p0_p, p1_p)
     c_corr = _m_combine_corr(
         ref, both_p, ext_p, nmin_p, smax_p, p0_p.binary(String("mul"), p1_p, ops["mul"]),
@@ -1122,9 +1143,8 @@ def _moment_ssa_combine_c_rules(ops: dict[str, i64], binds: dict[str, tuple]) ->
         c_zero_rhs = ck_v.binary(String("add"), cd_v, ops["add"]).binary(
             String(op), shift_0.binary(String("add"), cross_0, ops["add"]), ops[op])
         c_one_rhs = p_kept.binary(String("mul"), ck_v, ops["mul"]).binary(
-            String("add"),
-            g1(cd_v).binary(String(op), shift_1.binary(String("add"), cross_1, ops["add"]),
-                            ops[op]).binary(String("div"), smax_1, ops["div"]), ops["add"])
+            String("add"), g1(cd_v).binary(String("div"), smax_1, ops["div"]), ops["add"]).binary(
+            String(op), shift_1.binary(String("add"), cross_1, ops["add"]), ops[op])
         c_zero_call = _m_combine_zero_c(
             ref, either_p, k0_p.select(c1, c0), k0_p.select(c0, c1), nd_p,
             _m_diff(String("val"), ref, kax, dax, zero_n, zero_n),
@@ -1140,7 +1160,7 @@ def _moment_ssa_combine_c_rules(ops: dict[str, i64], binds: dict[str, tuple]) ->
             _m_diff(String("big"), ref, kay, day, kuy, zero_n), dux, duy, i64(sign_i))
         c_both_rhs = c_base.binary(String(op), c_corr, ops[op])
         zero_ops = ("add", "mul") if sign_i == 1 else ("add", "sub", "mul")
-        one_ops = ("add", "mul", "div") if sign_i == 1 else ("add", "sub", "mul", "div")
+        one_ops = ("gt", "add", "mul", "div") if sign_i == 1 else ("gt", "add", "sub", "mul", "div")
         c_ops = ("min", "mul", "add") if sign_i == 1 else ("min", "mul", "sub")
         made += [
             rewrite(_m_combine_zero_c(ref, either, ck_v, cd_v, n_drop, dx_0, bx_0, dy_0, by_0,
