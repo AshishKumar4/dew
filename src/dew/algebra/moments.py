@@ -12,7 +12,7 @@ from typing import Literal
 import jax
 import jax.numpy as jnp
 
-from dew.algebra import derive, program
+from dew.algebra import derive, program, ratios, windows
 from dew.algebra.forms import Derived
 from dew.nn.derivatives import Protected, contracted, declared_tangent
 
@@ -157,36 +157,21 @@ def _weighted_term(tw: jax.Array, operand: jax.Array, sn: jax.Array) -> jax.Arra
     return jnp.where(small_tw, (tw_mf * operand) / sn_mf, (tw_df / sn_df) * operand)
 
 
-def _split_range(mask: jax.Array, sn: jax.Array, *values: jax.Array):
-    """Double-where partition of `(sn, *values)` across `mask`: `(sn_t, sn_f, vals_t, vals_f)`."""
-    return (jnp.where(mask, sn, 1.0), jnp.where(mask, 1.0, sn),
-            tuple(jnp.where(mask, value, 0.0) for value in values),
-            tuple(jnp.where(mask, 0.0, value) for value in values))
+_WEIGHT_DIV = ratios.Ratio(((1.0, (("v", 0), ("v", 1))),), ((1.0, (("v", 2),)),), 0,
+                           reduced=True, units=windows.Units())
+_WEIGHT_COV = ratios.Ratio(((1.0, (("v", 0), ("v", 1), ("v", 2))), (-1.0, (("v", 0), ("v", 3)))),
+                           ((1.0, (("v", 4),)),), 0, reduced=True, units=windows.Units())
 
 
 def _safe_tangent_div(dtw: jax.Array, numerator: jax.Array, sn: jax.Array) -> jax.Array:
-    """Linear-in-`dtw` evaluation of `dtw * numerator / sn` without `0 * inf` in forward or reverse mode."""
-    qmax = jnp.asarray(0.25 * jnp.finfo(numerator.dtype).max, numerator.dtype)
-    hi = sn > 1.0
-    sn_hi, sn_lo, (num_hi, dtw_hi), (num_lo, dtw_lo) = _split_range(hi, sn, numerator, dtw)
-    safe_lo = jnp.abs(num_lo) <= sn_lo * qmax
-    _, sn_big, (num_safe, dtw_safe), (num_big, dtw_big) = _split_range(safe_lo, sn_lo, num_lo, dtw_lo)
-    lo_term = dtw_safe * (num_safe / sn_lo) + (dtw_big * num_big) / sn_big
-    return jnp.where(hi, dtw_hi * (num_hi / sn_hi), lo_term)
+    """Multiply the weight direction and divide by mass before landing, including in its transpose."""
+    return ratios.ratio([dtw[None], numerator[None], sn[None]], _WEIGHT_DIV)
 
 
-def _safe_tangent_quad(dtw: jax.Array, big_c: jax.Array, sml_c: jax.Array, sn: jax.Array) -> jax.Array:
-    """Linear-in-`dtw` evaluation of `dtw * big_c * sml_c / sn`, applying `dtw` before `big_c * sml_c`
-    overflows with double-where guards across all range arms."""
-    qmax = jnp.asarray(0.25 * jnp.finfo(big_c.dtype).max, big_c.dtype)
-    hi = sn > 1.0
-    sn_hi, sn_lo, (big_hi, sml_hi, dtw_hi), (big_lo, sml_lo, dtw_lo) = _split_range(
-        hi, sn, big_c, sml_c, dtw)
-    safe_lo = jnp.abs(sml_lo) <= sn_lo * qmax
-    _, sn_b, (big_s, sml_s, dtw_s), (big_b, sml_b, dtw_b) = _split_range(
-        safe_lo, sn_lo, big_lo, sml_lo, dtw_lo)
-    lo_term = (dtw_s * big_s) * (sml_s / sn_lo) + ((dtw_b * big_b) * sml_b) / sn_b
-    return jnp.where(hi, (dtw_hi * (big_hi / sn_hi)) * sml_hi, lo_term)
+def _safe_tangent_quad(dtw: jax.Array, cx: jax.Array, cy: jax.Array,
+                       cov: jax.Array, sn: jax.Array) -> jax.Array:
+    """Hold the centered product and covariance correction unlanded when the product can overflow."""
+    return ratios.ratio([dtw[None], cx[None], cy[None], cov[None], sn[None]], _WEIGHT_COV)
 
 
 def _cov_tangent_tile(
@@ -219,9 +204,8 @@ def _cov_tangent_tile(
                                  jnp.where(prod_ovf, 1.0, sn))
     dtw_ov = jnp.where(prod_ovf, dtw, 0.0)
     sn_ov = jnp.where(prod_ovf, sn, 1.0)
-    d_cov_ov = (_safe_tangent_quad(dtw_ov, jnp.where(prod_ovf, big_c, 0.0),
-                                   jnp.where(prod_ovf, sml_c, 0.0), sn_ov)
-                - _safe_tangent_div(dtw_ov, jnp.where(prod_ovf, cov_term, 0.0), sn_ov))
+    d_cov_ov = _safe_tangent_quad(dtw_ov, jnp.where(prod_ovf, big_c, 0.0), jnp.where(prod_ovf, sml_c, 0.0),
+                                  jnp.where(prod_ovf, cov_term, 0.0), sn_ov)
     d_cov_w = jnp.where(prod_ovf, d_cov_ov, d_cov_no)
     d_cov_raw = jnp.sum(pw_cy * dtx + pw_cx * dty + d_cov_w, axis=-1)
     return d_mx, d_my, d_cov_raw, jnp.sum(pw_cy, axis=-1), jnp.sum(pw_cx, axis=-1), jnp.sum(dtw, axis=-1)
