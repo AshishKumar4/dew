@@ -210,6 +210,26 @@ def test_a_cuda_targets_verdict_key_names_the_ptxas_jax_gives_xla_and_none_stati
     assert unstated is None
 
 
+@COMPILES_ON_CPU
+def test_a_cuda_targets_verdict_key_names_each_nvjitlink_the_loader_could_open(tmp_path):
+    """XLA assembles a Pallas-Triton kernel through the libnvJitLink its stub opens by soname, a system one
+    where no wheel provides it: a CUDA target's verdict key names each the process's loader could find (its
+    `LD_LIBRARY_PATH`'s here), by its contents' size and age, so one updated in place keys a launch afresh,
+    and the same one keys it alike (row 12166: the key read the nvJitLink wheels' versions alone)."""
+    from process_support import fresh
+
+    library = tmp_path / "lib" / "libnvJitLink.so.13"
+    library.parent.mkdir()
+
+    def key(contents: bytes, modified: int) -> str | None:
+        library.write_bytes(contents)
+        os.utime(library, ns=(modified, modified))
+        return fresh(VERDICT_KEYS, "sm90", variables={"LD_LIBRARY_PATH": str(library.parent)})["sm90"]
+
+    first, again, updated = key(b"build 1", 10**18), key(b"build 1", 10**18), key(b"build 22", 2 * 10**18)
+    assert first is not None and first == again != updated
+
+
 def test_a_tpu_targets_verdict_key_reads_no_gpu_assembler():
     """A TPU target's verdict key, on an install whose Mosaic GPU bindings do not import (a TPU-only one),
     names no GPU assembler: reading Mosaic GPU's raised there for every MXU launch certified."""
