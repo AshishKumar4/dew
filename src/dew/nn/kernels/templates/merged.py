@@ -355,8 +355,13 @@ def _launch_for_block(units: windows.Units, padded: jax.ShapeDtypeStruct, stacke
                 rows * (3 * slices * read_width * padded_item + init_reads * width * padded_item
                         + width * out_item + blocks * (3 * slices + init_reads) * 2 * stacked_item)
                 + output_bytes)
+    # A program's passes each wait on its chunk's loads before the next (`means.merged_state_chunked`'s
+    # joining, placing and summing passes, a chunk a trip): the copies its dependent path waits on, a
+    # part's copy latency each. A GH200's merge at one row, 8 and 16 slices of 64 channels, took 3.84 and 7.10
+    # us (M-NA-20-gh200), its device work priced 1.30 and 1.72 without them (FS-5274-LAT1).
+    waited = cost.Chain(copies=float(passes), copy_bytes=total_device_bytes / launched, stages=1)
     total = dataclasses.replace(emitted_total, device_bytes=total_device_bytes, span=float(passes),
-                                kernels=1.0)
+                                kernels=1.0, chains=(*emitted_total.chains, waited))
     return total, launched
 
 

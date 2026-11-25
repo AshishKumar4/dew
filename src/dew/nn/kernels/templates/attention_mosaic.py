@@ -746,10 +746,14 @@ class MosaicForward(_Mainloop[Tiles]):
                     and self.resident(ba, candidate, target) == base_resident):
                 return candidate
         return config
-    def price_config(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget
-                     ) -> float | None:
+    def price_config(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget, *,
+                     issued: bool = False) -> float | None:
         """Price `config`'s main launch on `target` (`cost.launch_seconds` over `emission.work_of`), traced
-        through `tuning.lowered_once` under `report.launching`. As its hookless call (its hooks, their
+        through `tuning.lowered_once` under `report.launching`; with `issued`, its programs' warps hiding each
+        other's issue intervals too (`emission.warps_of`, `Multiprocessor.issue_interval`: a decode walk's,
+        whose one consumer a multiprocessor's residency decides, M-NA-21 and FS-5274-LAT1), which a
+        prefill's derivation does not yet read (its register model's misses at three consumers,
+        FS-LANE-FWD-TIP). As its hookless call (its hooks, their
         parameters and their kinds none), so a launch keyed by its hooks' fingerprints (`KernelOp.keyed`,
         which traces none) prices, and chooses, as its live call does. A heuristic proxy of the live call's
         price, not that price less a common cost: a score hook's work scales with each candidate's entries
@@ -782,8 +786,11 @@ class MosaicForward(_Mainloop[Tiles]):
             work = emission.work_of(kernel)
             if work is None:
                 return None
-            total += cost.launch_seconds(work, emission.launch_programs(kernel), target, resident=resident)
+            warps = (emission.warps_of(kernel) or 0.0) if issued else 0.0
+            total += cost.launch_seconds(work, emission.launch_programs(kernel), target, resident=resident,
+                                         warps=warps)
         return total
+
     def _choose_consumers(self, ba: tokamax.BoundArguments, candidates: list[Tiles], *,
                           target: generation.GpuTarget, launch: Callable[[Tiles], Tiles | None] | None = None
                           ) -> Tiles:

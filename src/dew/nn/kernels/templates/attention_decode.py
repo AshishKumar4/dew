@@ -36,7 +36,7 @@ from jax.extend import core as jaxpr_core
 
 from dew.nn import programs
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import attention_algebra as algebra, attention_mosaic, emission, merged
+from dew.nn.kernels.templates import attention_algebra as algebra, attention_mosaic, cost, emission, merged
 from dew.nn.kernels.templates.attention import (
     Hooks,
     Initial,
@@ -190,12 +190,13 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     op's refusals (`report.refuse_launch`): a scaled launch ptxas refused steps down at its own config, never
     at the plain op's, which the pin would hold it to (row 5420).
     One where the programs already fill the multiprocessors (a slice's merge would cost and its keys gain
-    nothing). Else as many as keep the device's stream in flight (`MosaicForward.streamed`, at most those its
-    residency holds, `MosaicForward.resident`), but each slice at least twice its ring's stages of key tiles:
-    a shorter slice's walk spends its prologue's loads, `stages` tiles, without as many steps of products to
-    hide them (ET-DECODE2-h100: 32 slices of one key tile each, at batch 1 over 4096 keys, took 22 us where
-    cuDNN's whole step took 13). Each slice writes its fp32 state, which the step merges with the initial
-    state (`merged.merged_split`), at a config derived for them."""
+    nothing). Else the count of slices whose step the cost model prices least, walk and merge
+    (`_priced_slices`), each slice at least twice its ring's stages of key tiles: a shorter slice's walk
+    spends its prologue's loads, `stages` tiles, without as many steps of products to hide them
+    (ET-DECODE2-h100: 32 slices of one key tile each, at batch 1 over 4096 keys, took 22 us where cuDNN's
+    whole step took 13); where it prices none, as many as keep the device's stream in flight
+    (`MosaicForward.streamed`, at most those its residency holds). Each slice writes its fp32 state, which
+    the step merges with the initial state (`merged.merged_split`), at a config derived for them."""
     chosen = WALKS[walk]
     single_hooks = (None if hooks is None else dataclasses.replace(
         hooks, initial=None, output_mod=None, output_params=())) if defer_output else hooks
@@ -217,25 +218,88 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     if programs >= processors:
         return planned(config, op, ba, 1)
 
-    def sliced(config, op, ba) -> int:
-        # The most slices whose programs keep the device's stream in flight at once (`MosaicForward.streamed`,
-        # at most those it holds), none past them: one program past those it holds waits a whole walk for a
-        # slot (ceil(132 / 8) = 17 slices of one row's 8 key heads is 136 programs, 4 of them a second wave as
-        # long as the first), and one past those that stream it only lengthens the merge.
-        longest = math.ceil(spans.keys / config.block_k) // (2 * min(config.stages, 2))
-        return max(1, min(processors * op.streamed(ba, config, target) // programs, longest))
-    if sliced(config, op, ba) == 1:
-        return planned(config, op, ba, 1)
     walked = None if hooks is None else dataclasses.replace(
         hooks, initial=None, output_mod=None, output_params=())
     streamed = functools.partial(_streamed, query, key, value, spans, walked, scale=scale, target=target,
                                  table=table, sources=sources, out_dtype=jnp.float32, scales=scales,
                                  chosen=chosen, in_key=in_key)
-    found = streamed()
-    slices = 1 if found is None else sliced(*found)
-    # The sliced launch's own op, at its slices.
+    # Each slice at least twice its ring's stages of key tiles: a shorter slice's walk spends its prologue's
+    # loads without as many steps of products to hide them (ET-DECODE2-h100).
+    longest = math.ceil(spans.keys / config.block_k) // (2 * min(config.stages, 2))
+    counts = [1 << power for power in range(1, max(longest, 1).bit_length()) if 1 << power <= longest]
+    priced = _priced_slices(query, key, value, spans, walked, (config, op, ba), counts, scale=scale,
+                            target=target, table=table, sources=sources, scales=scales, chosen=chosen,
+                            in_key=in_key, initial=hooks is not None and hooks.initial is not None)
+    if priced is not None:
+        slices = priced
+    else:
+        # The most slices whose programs keep the device's stream in flight at once (`MosaicForward.streamed`,
+        # at most those it holds), where the cost model prices no step of them.
+        found = streamed()
+        slices = 1 if found is None else max(1, min(
+            processors * found[1].streamed(found[2], found[0], target) // programs, longest))
+    # The sliced launch's own op, at its slices, certified (`_certified_stream`).
     found = None if slices == 1 else streamed(splits=slices)
     return planned(config, op, ba, 1) if found is None else planned(*found, slices)
+
+
+def _priced_slices(query, key, value, spans: KeySpans, hooks: Hooks | None, single: tuple, counts: list[int],
+                   *, scale: float | None, target: generation.GpuTarget, table, sources, scales,
+                   chosen: Walk, in_key: bool, initial: bool) -> int | None:
+    """The slice count of `counts` (one beside them, `single`'s launch) whose step the cost model prices
+    least: its walk (`MosaicForward.price_config`, its programs' warps hiding each other's issue intervals)
+    and, past one slice, the merge of its slices (`merged.launch_work`, its passes' waited loads). Each
+    count's config is its derivation's at the key tile its walk streams at (`MosaicForward.streaming`),
+    uncertified here; the chosen one is certified as it launches. None where the model prices some step
+    none: a GH200's B8 over 32768 keys at width 128 walked 346.0 us on 2 slices of K128 and 309.3 on 4 of
+    K64 at two programs a multiprocessor (M-NA-21-gh200), which a walk priced at its device bytes alone
+    ranked level (FS-5274-LAT1)."""
+    config, op, ba = single
+    prices = {1: op.price_config(ba, config, target, issued=True)}
+    for count in counts:
+        proposed = _proposed(query, key, value, spans, hooks, scale=scale, target=target, table=table,
+                             sources=sources, scales=scales, splits=count, chosen=chosen, in_key=in_key)
+        if proposed is None:
+            continue
+        tiles, sliced_op, sliced_ba = proposed
+        walk = sliced_op.price_config(sliced_ba, tiles, target, issued=True)
+        merge = _merge_seconds(query, value, spans, tiles, count, target=target, initial=initial)
+        prices[count] = None if walk is None else walk + merge
+    if any(price is None for price in prices.values()):
+        return None
+    return min(prices, key=lambda count: (prices[count], count))
+
+
+def _proposed(query, key, value, spans: KeySpans, hooks: Hooks | None, *, scale: float | None,
+              target: generation.GpuTarget, table, sources, scales, splits: int, chosen: Walk, in_key: bool):
+    """`_streamed`'s config, op and bound arguments for `splits` slices, as derived (`MosaicForward.derived`
+    at the key tile its walk streams at, `streaming`), certifying none: a price's proposal. None where none
+    derives."""
+    op, args = attention_mosaic._forward_call(query, key, value, spans, hooks, scale=scale, natural=False,
+                                              out_dtype=jnp.float32, masked=hooks is None or hooks.output_mod
+                                              is None, splits=splits, table=table, sources=sources,
+                                              subtracted=True, scales=scales, scaled=chosen.scaled,
+                                              bounded=chosen.bounded, in_key=in_key)
+    ba = op.bind(*args, residuals=Kept.OUTPUT, interpret=False)
+    derived = op.derived(ba, target)
+    return None if derived is None else (op.streaming(ba, derived, target), op, ba)
+
+
+def _merge_seconds(query, value, spans: KeySpans, config: attention_mosaic.Tiles, slices: int, *,
+                   target: generation.GpuTarget, initial: bool) -> float:
+    """The seconds of the merge of a split walk's `slices` (`merged.launch_work`): the walk's outputs as its
+    launch writes them, `[B, S, Qp, H, Dvp]` fp32 and their maxima and denominators `[2, B, H, S, Qp]`
+    (`attention_mosaic_forward.SplitOutput`)."""
+    family = attention_mosaic.bundle_of(config, query.dtype, target=target)
+    rows = attention_mosaic._padded(query.shape[1], spans.keys, config)[0]
+    width = attention_mosaic._width(value.shape[-1], family, query.dtype)
+    batch, heads = query.shape[0], query.shape[2]
+    padded = jax.ShapeDtypeStruct((batch, slices, rows, heads, width), jnp.float32)
+    stacked = jax.ShapeDtypeStruct((2, batch, heads, slices, rows), jnp.float32)
+    spec = algebra.finished_form(_spec(query, spans, Hooks(), scale=None))
+    work = merged.launch_work(spec, padded, stacked, query.shape[1], value.shape[-1], target,
+                              has_initial=initial)
+    return cost.seconds(work, target)
 
 
 def _streamed(query, key, value, spans: KeySpans, hooks: Hooks | None, *, scale: float | None,
