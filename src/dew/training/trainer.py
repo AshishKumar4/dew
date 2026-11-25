@@ -2358,17 +2358,17 @@ def _waiting_restored(template: TrainState) -> TrainState:
 
 
 def _refuse_lost_waiting(state: TrainState, checkpoints: Checkpoints, step: int | str) -> None:
-    """Refuse a restored state whose optimizer holds an input it took (an `optax.MultiSteps` window part
-    filled) while nothing waits to roll into its amax histories (`NVFP4_PENDING`): every call taken in
-    records a largest for each projection it ran, so this is a checkpoint an earlier Dew wrote mid-window,
-    without what its taken calls recorded, which no restore can recover (row 12994)."""
+    """Refuse a restored state whose checkpoint holds no record of what waits to roll into its amax
+    histories (`NVFP4_PENDING`, which an earlier Dew wrote none of) while its optimizer holds an input it
+    took (an `optax.MultiSteps` window part filled): what that taken call recorded is lost, and no restore
+    can recover it (row 12994). A checkpoint that holds the collection restores it as it was written,
+    nothing waiting among what it may hold."""
     if NVFP4_PENDING not in state.variables or not bool(input_held(state.opt_state)):
         return
-    if all(bool((leaf < 0).all()) for leaf in jax.tree.leaves(state.variables[NVFP4_PENDING])):
+    if NVFP4_PENDING not in (checkpoints.stored(step).get("variables") or {}):
         raise ValueError(
             f"the checkpoint at step {step} in {checkpoints.directory} was written partway through an "
             f"update its optimizer holds back, by a Dew that kept no record of the amax its taken calls "
             f"recorded ({NVFP4_PENDING!r}), so the delayed-scaling NVFP4 histories that update rolls cannot "
             f"be restored; resume it from a checkpoint written where an update applied, or with the Dew "
             f"that wrote it")
-

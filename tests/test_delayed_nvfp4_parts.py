@@ -2,6 +2,7 @@
 (row 12721): an average of the weights, which reads the committed histories, and a critic drawn apart."""
 
 import dataclasses
+import functools
 
 import jax
 import jax.numpy as jnp
@@ -70,7 +71,7 @@ def test_what_waits_rolls_once_an_update_applies_and_a_skipped_input_waits_for_n
     history nothing waited for keeps as it was (row 12994's review)."""
     from dew.nn.dense import pending_amax, rolled_waiting
 
-    started = {"ran": jnp.zeros((3,)), "earlier": jnp.zeros((3,)), "zero": jnp.zeros((3,)),
+    started = {"ran": jnp.zeros((3,)), "earlier": jnp.zeros((3,)), "zero": jnp.asarray([1.0, 2.0, 3.0]),
                "never": jnp.asarray([5.0, 4.0, 3.0])}
     yes, no = jnp.asarray(a=True), jnp.asarray(a=False)
     waiting = pending_amax(started)
@@ -78,7 +79,7 @@ def test_what_waits_rolls_once_an_update_applies_and_a_skipped_input_waits_for_n
     _, waiting = rolled_waiting(started, waiting, {"ran": 9.0}, no, no)
     rolled, after = rolled_waiting(started, waiting, {"ran": 3.0}, yes, yes)
     assert {name: np.asarray(value).tolist() for name, value in rolled.items()} == {
-        "ran": [3.0, 0.0, 0.0], "earlier": [7.0, 0.0, 0.0], "zero": [0.0, 0.0, 0.0], "never": [5.0, 4.0, 3.0]}
+        "ran": [3.0, 0.0, 0.0], "earlier": [7.0, 0.0, 0.0], "zero": [0.0, 1.0, 2.0], "never": [5.0, 4.0, 3.0]}
     assert all(float(value) == -1.0 for value in jax.tree.leaves(after))
 
 
@@ -98,20 +99,30 @@ def test_a_run_resumed_partway_through_a_held_update_rolls_what_its_taken_calls_
             data(), steps=4, checkpoint_every=1)
         for one, other in zip(histories(resumed), histories(whole), strict=True):
             np.testing.assert_array_equal(one, other)
-        for step, held in ((2, False), (3, True)):
-            source = delayed_lm(1, Checkpoints(str(tmp_path / "run")), optimizer=_every_second())
-            state = source.checkpoints.restore(source.place()[0], step)[0]
-            legacy = Checkpoints(str(tmp_path / f"legacy-{step}"))
-            legacy.save(step, dataclasses.replace(state, variables={
-                name: value for name, value in state.variables.items() if name != NVFP4_PENDING}))
-            legacy.wait()
-            again = delayed_lm(1, Checkpoints(str(tmp_path / f"legacy-{step}")), optimizer=_every_second())
-            if held:
-                with pytest.raises(ValueError):
-                    again.place()
-            else:
-                waits = again.place()[0].variables[NVFP4_PENDING]
-                assert all(float(leaf.max()) == -1.0 for leaf in jax.tree.leaves(waits))
+        source = delayed_lm(1, Checkpoints(str(tmp_path / "run")), optimizer=_every_second())
+        start = source.place()[0]
+
+        def resaved(step: int, name: str, waiting) -> Trainer:
+            """The run's checkpoint at `step` written again at `name` with `waiting` as what waits to roll
+            (`NVFP4_PENDING`): None, as an earlier Dew wrote it, holds none."""
+            state = source.checkpoints.restore(start, step)[0]
+            variables = {key: value for key, value in state.variables.items() if key != NVFP4_PENDING}
+            if waiting is not None:
+                variables[NVFP4_PENDING] = waiting(state.variables[NVFP4_PENDING])
+            written = Checkpoints(str(tmp_path / name))
+            written.save(step, dataclasses.replace(state, variables=variables))
+            written.wait()
+            return delayed_lm(1, Checkpoints(str(tmp_path / name)), optimizer=_every_second())
+
+        nothing = functools.partial(jax.tree.map, lambda leaf: jnp.full_like(leaf, -1.0))
+        # Where an update applied, an earlier Dew's checkpoint resumes, nothing waiting.
+        waits = resaved(2, "legacy-applied", None).place()[0].variables[NVFP4_PENDING]
+        assert all(float(leaf.max()) == -1.0 for leaf in jax.tree.leaves(waits))
+        # Partway through a held update, a checkpoint holding nothing waiting resumes as written; one an
+        # earlier Dew wrote is refused, naming what it lacks.
+        resaved(3, "current-held", nothing).place()
+        with pytest.raises(ValueError, match=NVFP4_PENDING):
+            resaved(3, "legacy-held", None).place()
 
 
 def test_a_ppo_steps_records_are_its_own_passes_its_critics_among_them():
