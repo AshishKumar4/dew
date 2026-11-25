@@ -318,8 +318,18 @@ class _Program:
         integrality[:len(self.nodes)] = 1
         lower = np.asarray([low for _, low, _ in self.rows])
         upper = np.asarray([high for _, _, high in self.rows])
-        optimum = milp(cost, constraints=(matrix, lower, upper), integrality=integrality,
-                       bounds=(np.zeros(self.width), self.upper), options={"mip_rel_gap": 0.0})
+
+        def solved(*, presolve: bool):
+            return milp(cost, constraints=(matrix, lower, upper), integrality=integrality,
+                        bounds=(np.zeros(self.width), self.upper),
+                        options={"mip_rel_gap": 0.0, "presolve": presolve})
+
+        optimum = solved(presolve=True)
+        if optimum.status == 2:
+            # Infeasible by HiGHS's presolve alone, proved again without it: a level held within its slack
+            # over pieces a millionth of its unit (a decode merge's, priced by issue: one level's bound met by
+            # the chosen DAG, which presolve's tightened rows refused, FS-4132-ILP1) is feasible.
+            optimum = solved(presolve=False)
         if optimum.status == 2:
             raise ValueError(f"no DAG of the e-graph's nodes holds its root: {optimum.message}")
         if not optimum.success or optimum.x is None:

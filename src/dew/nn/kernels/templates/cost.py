@@ -179,6 +179,11 @@ class Work:
     """The issue slots `issued` counts of a most taken unit by unit (a conditional's branches', `emission`'s
     envelope; its walking roles', a launch's) beyond the most any one of them issues: none of them issues
     another's mix (the review of lane/toolkit c9307c11146), so `issued` takes it off."""
+    shuffles: float = 0.0
+    """The lane instructions exchanging values among a warp's lanes (SHFL: an inline body's `shfl.sync`, its
+    PTX's `shfl.`), each an issue slot a lane (`issued`); the shuffle pipe's own rate, a quarter of a
+    multiprocessor's issue (32 lanes a clock), unpriced. A kernel's reductions' butterflies are not counted
+    here: the lanes a row spans are its layout's, which its jaxpr does not state (row 12889)."""
     global_reductions: float = 0.0
     """The bytes a body reduces into global memory an element at a time through L2's atomic units
     (`red.global`: mma.sync's dQ adds, `atomic_store_p`), each its own memory instruction a lane, at the
@@ -355,12 +360,12 @@ def multiplied(field: str, flops: float) -> Work:
 def issued(work: Work) -> float:
     """The instructions `work`'s threads issue on a CUDA multiprocessor's units, each taking one of its
     schedulers' slots (`Multiprocessor.issue_per_clock`): its fp32 lanes' (`units`' CUDA cores'), its integer
-    ALU's and FMA pipe's, its special-function units' and its reductions into global memory (one a lane, four
-    bytes each), less what a most taken unit by unit counts beyond any one alternative's
+    ALU's and FMA pipe's, its special-function units', its shuffles and its reductions into global memory
+    (one a lane, four bytes each), less what a most taken unit by unit counts beyond any one alternative's
     (`Work.issue_excess`); its tensor-core and memory instructions, each a warp's work of many elements, are
     none."""
     return (work.operations + work.conversions + work.integer_operations + work.integer_multiply_adds
-            + work.exponentials + work.global_reductions / 4 - work.issue_excess)
+            + work.exponentials + work.shuffles + work.global_reductions / 4 - work.issue_excess)
 
 def spanned(work: Work, latency: float | None) -> tuple[float, float]:
     """`work`'s span at a dependent step's `latency` (`Work.span`), and its span at no latency stated

@@ -19,7 +19,9 @@ from dew.nn.kernels import tuning
 from dew.nn.kernels.templates import (
     attention_algebra as algebra,
     attention_gradient as gradient,
+    attention_mosaic_tail as tail,
     mosaic,
+    mosaic_sm90,
     swizzling,
 )
 from dew.nn.kernels.templates.attention import DQ_GRADS, Draw, Kind, by_power
@@ -174,8 +176,8 @@ def _splits_scores(walk: _Backward) -> bool:
 def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
                  coords: algebra.Coords | functools.partial[algebra.Coords], whole,
                  shape: tuple[int, int], *, masked: bool | None, whole_operands: bool = False,
-                 on_weights: Callable | None = None, after_weights: Callable | None = None
-                 ) -> tuple[jax.Array, jax.Array]:
+                 on_weights: Callable | None = None, after_weights: Callable | None = None,
+                 lean: bool = False) -> tuple[jax.Array, jax.Array]:
     """A queries-first step's tile of a fast-form call whose score hook, if any, takes no parameters
     (`_fused_step`'s, `_coop_step`'s): its `S` and `dP` products (issued together, `summed_together`,
     overlapping `_score_weights` with `dP` where `_splits_scores` and `masked is not None`), masked where
@@ -184,7 +186,10 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
     issues `dV` before computing `dS`. Returns its weights narrowed for dV (`algebra.value_weights`), a
     dropping call's dropped (`algebra.drawn`), and its score cotangents through the hook (`gradient.pulled`),
     one part in the operands' dtype (dK's and dQ's); with `whole_operands` (fp16's, `algebra.running_parts`),
-    both fp32: the normalized weights, dropped, and the scaled cotangents."""
+    both fp32: the normalized weights, dropped, and the scaled cotangents. `lean` (the fused launch's): its
+    bf16 cotangents narrowed saturating in one conversion on wgmma (`attention_mosaic_tail.saturated_bf16`);
+    a launch at its registers' edge takes none (the shared-keys dK/dV at width 256 spilled 24 bytes at 255
+    with it)."""
     family = walk.program.family
     (q_slot, do_slot), (keys, values) = slots, resident
     held, values_t = keys.transpose((1, 0)), values.transpose((1, 0))
@@ -250,8 +255,12 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
             exponentials, weights, cotangents = scores(is_masked=masked)
     if whole_operands:
         return weights, cotangents * walk.grad_scale
-    part = mosaic.unscaled_part(*algebra.cotangent_parts(cotangents * walk.grad_scale, q_slot.dtype,
-                                                         accurate=False))
+    if (lean and q_slot.dtype == jnp.bfloat16 and not walk.interpret
+            and isinstance(family, mosaic_sm90.WgmmaIssuer)):
+        part = tail.saturated_bf16(cotangents * walk.grad_scale)
+    else:
+        part = mosaic.unscaled_part(*algebra.cotangent_parts(cotangents * walk.grad_scale, q_slot.dtype,
+                                                             accurate=False))
     return algebra.value_weights(exponentials, weights, do_slot.dtype, walk.dropped), part
 
 
