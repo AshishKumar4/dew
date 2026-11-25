@@ -348,26 +348,17 @@ def test_a_transposed_letter_no_factor_reads_forms_no_product_over_the_others():
     """The masses' cotangent of the attention mean at the sm90 matrix cell's width (1024 queries and keys,
     256 channels, eight heads in four groups): the divisor's term reads `k` through the masses alone, its
     unit operand along `k` held apart from the cotangent's group it is a factor of (`Form.units`), so no
-    part's product spans more than an operand does, where held with it the group formed `bhgqdk`, 8 GiB,
-    four held at once (row 12979). Traced only."""
-    from dew.nn.kernels.templates.scaled_contraction import scaled_contraction_p
+    array the lowered program forms is larger than the masses, where held with it the group formed
+    `bhgqdk`, 8 GiB, four held at once (row 12979). Lowered, never compiled or run."""
+    import re
 
     masses = jax.ShapeDtypeStruct((1, 4, 2, 1024, 1024), jnp.float32)
     values = jax.ShapeDtypeStruct((1, 1024, 4, 256), jnp.float32)
-    pulled = jax.make_jaxpr(jax.grad(lambda m, v: jnp.sum(contract(ATTENTION_MEAN, m, v)), argnums=(0, 1)))(
-        masses, values)
-    bound = masses.size
-    sums = [equation for equation in pulled.jaxpr.eqns if equation.primitive is scaled_contraction_p]
-    assert len(sums) > 1
-    for equation in sums:
-        form = equation.params["form"]
-        extents = {letter: size for subscript, operand in zip(form.subscripts, equation.invars, strict=True)
-                   for letter, size in zip(subscript, operand.aval.shape, strict=True)}
-        for _, groups in (*form.terms, *form.divisor):
-            for group in groups:
-                rest = tuple(factor for factor in group if factor[0] not in form.units)
-                for part in ((rest,) if rest else ()) + tuple((f,) for f in group if f[0] in form.units):
-                    assert int(np.prod([extents[letter] for letter in form.letters(part)])) <= bound, part
+    pulled = jax.jit(jax.grad(lambda m, v: jnp.sum(contract(ATTENTION_MEAN, m, v)), argnums=(0, 1)))
+    text = pulled.lower(masses, values).as_text()
+    shapes = re.findall(r"tensor<((?:\d+x)+)\w+>", text)
+    largest = max(int(np.prod([int(size) for size in shape.rstrip("x").split("x")])) for shape in shapes)
+    assert largest <= masses.size, largest
 
 
 def test_a_transposes_unit_operand_takes_no_band_from_the_groups_beside_it():
@@ -427,3 +418,9 @@ def test_a_quotients_transposes_transpose_keeps_its_unit_beside_the_divisors_fac
     cotangent = jnp.asarray([2.0 ** 127, 2.0 ** -30], jnp.float32)
     (back,) = jax.linear_transpose(pull, jnp.float32(1.0))((cotangent,))
     np.testing.assert_array_equal(np.asarray(back), np.float32(2.0 ** -30))
+
+
+def test_an_empty_group_is_the_scalar_one():
+    """A term of one empty group is the product of no factors: one."""
+    form = Form(("",), ((1, ((),)),), "")
+    np.testing.assert_array_equal(np.asarray(contract(form, jnp.float32(3.0))), np.float32(1.0))

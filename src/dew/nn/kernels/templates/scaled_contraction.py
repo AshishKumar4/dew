@@ -141,6 +141,8 @@ def _parts(form: Form, group: tuple[Factor, ...], arrays: Sequence[jax.Array], d
     unit's significand one and its exponent zero, so the parts' product is the group's, each part's
     offsets the group's, with no product over the unit's letters formed."""
     units = [factor for factor in group if factor[0] in form.units]
+    if not units:
+        return [_held(form, group, arrays, dtype)]
     rest = tuple(factor for factor in group if factor[0] not in form.units)
     parts = ((rest,) if rest else ()) + tuple((unit,) for unit in units)
     return [_held(form, part, arrays, dtype) for part in parts]
