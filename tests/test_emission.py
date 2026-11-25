@@ -856,7 +856,7 @@ def test_a_walk_issuing_one_warp_a_scheduler_waits_each_instructions_dependent_l
 def test_a_mosaic_launch_states_the_warps_its_issue_spreads_over():
     """A Mosaic GPU kernel's issuing warps (`emission.warps_of`): each walking warpgroup's four, weighted by
     its walk's issue slots against its busiest's: two warpgroups walking alike 8, one walking beside one that
-    does not 4."""
+    does not 4 and the other's sliver (its guard's few issues a step, 4.004)."""
     def walked(both: bool):
         def body(x_ref, o_ref):
             def walk():
@@ -871,11 +871,12 @@ def test_a_mosaic_launch_states_the_warps_its_issue_spreads_over():
                             thread_name="wg")
 
     row = jax.ShapeDtypeStruct((128,), jnp.float32)
-    for both, warps in ((True, 8), (False, 4)):
+    for both, least, most in ((True, 8, 8), (False, 4, 4.05)):
         traced = jax.make_jaxpr(emission.costed(walked(both), Stated(steps=16, bytes_accessed=0)))(row)
         (kernel,) = [equation for equation in programs.equations(traced.jaxpr)
                      if "cost_estimate" in equation.params]
-        assert emission.warps_of(kernel) == warps, (both, emission.warps_of(kernel))
+        found = emission.warps_of(kernel)
+        assert found is not None and least <= found <= most, (both, found)
 
 
 def test_a_programs_launches_price_in_sequence_and_an_uncounted_one_leaves_it_unknown():
