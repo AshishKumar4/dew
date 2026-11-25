@@ -328,6 +328,13 @@ BACKWARD_STATE = ("B", "C", "decay", "write", "states before", "C dy", "cotangen
 the state's operands, its decay and write, the states before each token, C dy and the cotangent after each
 token, counted from `backward`."""
 
+BACKWARD_FORKED = ("firsts", "entered", "lasts", "isolated", "products", "injected")
+"""The token vectors a forked call's state turn holds beside `BACKWARD_STATE` (`DocumentsBack.scans`): its
+documents' first tokens, the states they enter and the tokens ending them, the isolated cotangents, each
+token's suffix product of its document's decays and the cotangents injected at the next document's first:
+uncounted, an H100's forked backward at its plan spilled 288 bytes a thread and an A100's at 16 tokens and
+two programs 1,200 (row 12905)."""
+
 BACKWARD_SCALARS = {"addresses": 20, "block scan": 8, "state loop": 12}
 """The registers a backward thread holds apart from its token vectors and a thread's control
 (`resources.CONTROL_REGISTERS`): its refs' 64-bit addresses, the block scan's running pair, lane and warp
@@ -341,11 +348,11 @@ across the warp, three warpgroup barriers, a shared store and load of the warps'
 them, and the apply to the thread's tokens. The backward runs two a state, forward and reverse."""
 
 
-def backward_registers(positions: int) -> int:
+def backward_registers(positions: int, *, forked: bool = False) -> int:
     """The registers a backward thread holds at `positions` tokens: its token vectors (`BACKWARD_CARRIED`,
-    `BACKWARD_STATE`), each `positions` fp32 words, its scalars (`BACKWARD_SCALARS`) and a thread's control
-    (`resources.CONTROL_REGISTERS`)."""
-    vectors = len(BACKWARD_CARRIED) + len(BACKWARD_STATE)
+    `BACKWARD_STATE`, and a `forked` call's `BACKWARD_FORKED`), each `positions` fp32 words, its scalars
+    (`BACKWARD_SCALARS`) and a thread's control (`resources.CONTROL_REGISTERS`)."""
+    vectors = len(BACKWARD_CARRIED) + len(BACKWARD_STATE) + len(BACKWARD_FORKED) * forked
     return vectors * positions + sum(BACKWARD_SCALARS.values()) + resources.CONTROL_REGISTERS
 
 
@@ -360,7 +367,7 @@ def backward_programs(registers: int, target: generation.GpuTarget) -> int:
     return model.resident(registers)
 
 
-def backward_plan(target: generation.GpuTarget) -> tuple[int, int]:
+def backward_plan(target: generation.GpuTarget, *, forked: bool = False) -> tuple[int, int]:
     """The backward's tokens a thread and the programs a multiprocessor holds of it at their registers
     (`backward_registers`, `backward_programs`), which its compile caps a thread's registers at
     (`mosaic.compiler_params`' `resident`): of the token counts whose registers a thread holds, the one whose
@@ -375,17 +382,17 @@ def backward_plan(target: generation.GpuTarget) -> tuple[int, int]:
         positions, programs = fit
         return (2 * positions + 2 * SCAN_STEPS) / (positions * programs), -programs
 
-    return min(backward_fits(target), key=steps)
+    return min(backward_fits(target, forked=forked), key=steps)
 
 
-def backward_fits(target: generation.GpuTarget) -> list[tuple[int, int]]:
+def backward_fits(target: generation.GpuTarget, *, forked: bool = False) -> list[tuple[int, int]]:
     """Each backward token count a thread of `target` holds the registers of, from one doubling
     (`backward_registers`), with the programs a multiprocessor holds of it (`backward_programs`), those
     holding one at least: the plans `backward_plan` weighs and the tuner times (`Selective.neighbours`)."""
     fits = []
     positions = 1
-    while backward_registers(positions) <= target.multiprocessor.thread_registers:
-        if programs := backward_programs(backward_registers(positions), target):
+    while backward_registers(positions, forked=forked) <= target.multiprocessor.thread_registers:
+        if programs := backward_programs(backward_registers(positions, forked=forked), target):
             fits.append((positions, programs))
         positions *= 2
     return fits
@@ -759,7 +766,7 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, *, family: mosaic
     # The backward's plan its caller derived (`Selective.derived`), else this device's, interpreted the
     # interpreted target's (`generation.interpreted_target`).
     positions, resident = plan or backward_plan(generation.interpreted_target() if interpret
-                                                else generation.gpu_target())
+                                                else generation.gpu_target(), forked=forked is not None)
     if block_scan.THREADS * positions % chunk:
         raise ValueError(f"a chunk of {chunk} tokens divides no backward block of "
                          f"{block_scan.THREADS * positions}: its blocks start at no kept state")
@@ -912,8 +919,8 @@ class Selective(base.Template[Tiles]):
         longer chunk walks no more padding): on an H100 Mamba-1's bf16 forward at 8x2048x5120 took 1.21 ms at
         16 tokens a chunk, 1.14 at 32 and 1.12 to 1.14 at 64 and 128, its training step 6.51, 6.39 to 6.43 and
         6.34 to 6.40 (sel-chunk-sxm at 5bf70d36b)."""
-        facts = self._facts(ba, target)
-        positions, resident = backward_plan(facts)
+        facts, forked = self._facts(ba, target), ba.arguments.get("forked") is not None
+        positions, resident = backward_plan(facts, forked=forked)
         chunk, length = CHUNK, ba.arguments["x"].shape[1]
         padded = -(-length // CHUNK) * CHUNK
         while (2 * chunk <= block_scan.THREADS and padded % (2 * chunk) == 0 and self.staged_bytes(
@@ -928,7 +935,8 @@ class Selective(base.Template[Tiles]):
             if not backward or tiles.positions == 1:
                 return None
             fewer = tiles.positions // 2
-            tiles = Tiles(tiles.chunk, fewer, backward_programs(backward_registers(fewer), facts))
+            held = backward_registers(fewer, forked=forked)
+            tiles = Tiles(tiles.chunk, fewer, backward_programs(held, facts))
         return tiles
 
     def neighbours(self, ba: tokamax.BoundArguments, config: Tiles) -> list[Tiles]:
@@ -939,7 +947,9 @@ class Selective(base.Template[Tiles]):
         f3040b154); and the forward's chunk halved and doubled. An A100 ran 4 tokens at four programs (119
         registers, occupancy 24.9%), its backward 14.33 ms beside mamba_ssm's 9.91 (M-JS-240, M-JS-241)."""
         facts = self._facts(ba, self.launch_target())
-        stepped = [Tiles(config.chunk, positions, programs) for positions, programs in backward_fits(facts)
+        forked = ba.arguments.get("forked") is not None
+        stepped = [Tiles(config.chunk, positions, programs)
+                   for positions, programs in backward_fits(facts, forked=forked)
                    if positions != config.positions]
         fewer = [dataclasses.replace(config, resident=config.resident - 1)] if config.resident > 1 else []
         chunks = [dataclasses.replace(config, chunk=chunk) for chunk in (config.chunk // 2, 2 * config.chunk)
@@ -965,7 +975,7 @@ class Selective(base.Template[Tiles]):
 
     def registers(self, ba: tokamax.BoundArguments, config: Tiles) -> int | None:
         """The backward thread's registers at the config's tokens (`backward_registers`)."""
-        return backward_registers(config.positions)
+        return backward_registers(config.positions, forked=ba.arguments.get("forked") is not None)
 
     def register_budget(self, config: Tiles) -> int:
         """A thread's share of a multiprocessor's registers at the config's residency."""

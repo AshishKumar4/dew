@@ -635,12 +635,13 @@ def test_the_backward_holds_its_registers_at_the_residency_it_launches(packed):
 @pytest.mark.parametrize('target', [pytest.param(name, marks=lowers(name)) for name in ('sm80', 'sm90')])
 def test_a_forked_calls_training_step_compiles(target):
     """The selective scan's training step over a forked call (`FORKED`'s, each row's documents from its
-    table) compiled for an A100 and an H100 (`kernel_compile`): both launches lower (`failures`; a spill is
-    its residency's, row 12905), where a document's state taken up from its table selected each vector of
-    it on a scalar (its slot's load), which no warpgroup lowering broadcasts (a GH200's forked exactness
-    test, 2026-11-19, and both compiles failed so, row 12904)."""
+    table) compiled for an A100 and an H100 (`kernel_compile`): both launches lower and none spills
+    (`mosaic_failures`), where a document's state taken up from its table selected each vector of it on a
+    scalar (its slot's load), which no warpgroup lowering broadcasts (a GH200's forked exactness test,
+    2026-11-19, and both compiles failed so, row 12904), and the backward's plan counted none of its
+    documents' token vectors, its thread spilling 288 bytes on an H100 (row 12905)."""
     from fla_gdn_support import KernelCase
-    from kernel_compile import compile_mosaic_kernels, failures
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     forked = FORKED["shared and chained"]
     rows, length, channels, states = 2, 2048, 256, 16
@@ -661,7 +662,7 @@ def test_a_forked_calls_training_step_compiles(target):
         return trained, operands
 
     (record,) = compile_mosaic_kernels([KernelCase('selective forked training', call)], target)
-    assert not failures([record]), failures([record])
+    assert not mosaic_failures([record]), mosaic_failures([record])
     names = [kernel['kernel'] for kernel in record['kernels']]
     assert [name for name in names if 'selective_scan_backward' in name], names
     assert [name for name in names if 'selective_scan' in name and 'backward' not in name], names
