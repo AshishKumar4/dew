@@ -2008,13 +2008,11 @@ def test_reuse_pulls_sibling_rsqrt_into_division_windows_and_drops_sqrt(case):
 
 def test_reuse_refuses_unfloored_root_rewrites_reduce_sum_and_keys_jit_context():
     """An unfloored divisor `v` is never rewritten from `a / sqrt(v)` to `a * rsqrt(v)`, a floored
-    `reduce_sum` divisor rewrites `a / sqrt(y)[:, None]` end-to-end through `algebra.rewritten` (dropping
-    `sqrt_p` and one `div_p` and matching float64 Check 1), `softmax_like` fires `reuse` and matches Check 1
-    through `algebra.rewritten`, `enabling_dev` refuses accuracy-measured `bounded` sets (`stable`), and one
-    `jax.jit(rewritten(fn))` callable traces separately across off -> on -> off `enabling_dev("reuse")`
-    transitions."""
-    from jax.extend import core as jcore
-
+    `reduce_sum` divisor rewrites both `a / sqrt(y)[:, None]` (dropping `sqrt_p` and one `div_p`) and direct
+    reciprocal reuse `b + a / y[:, None]` with sibling `1 / y` (leaving only the one shared reciprocal
+    `div_p` and matching float64 Check 1), `enabling_dev` refuses accuracy-measured `bounded` sets (`stable`),
+    and one `jax.jit(rewritten(fn))` callable traces separately across off -> on -> off
+    `enabling_dev("reuse")` transitions."""
     def unfloored(a, v):
         pos = jnp.abs(v)
         return jnp.tanh(a) / jnp.sqrt(pos)[:, None], jax.lax.rsqrt(pos)
@@ -2023,10 +2021,10 @@ def test_reuse_refuses_unfloored_root_rewrites_reduce_sum_and_keys_jit_context()
         y = jnp.sum(jnp.square(jnp.tanh(z)) + 1.0, axis=-1)
         return a / jnp.sqrt(y)[:, None], jax.lax.rsqrt(y)
 
-    def softmax_like(a, z):
+    def softmax_like(a, b, z):
         y = jnp.sum(jnp.square(jnp.tanh(z)) + 1.0, axis=-1)
         inv = 1.0 / y
-        return a / y[:, None], inv
+        return b + a / y[:, None], inv
 
     def gated(a, z):
         v = jnp.sum(jnp.square(jnp.tanh(z)), axis=-1) / float(z.shape[-1]) + 1.0
@@ -2034,7 +2032,7 @@ def test_reuse_refuses_unfloored_root_rewrites_reduce_sum_and_keys_jit_context()
 
     with pytest.raises(ValueError), algebra.rules.enabling_dev("stable"):
         pass
-    a0, z0 = rows(0, (8, 16), (8, 16))
+    a0, b0, z0 = rows(0, (8, 16), (8, 16), (8, 16))
     v0 = np.full((8,), 2.0, np.float32)
     with algebra.rules.enabling_dev("reuse"):
         after_unfloored = jax.make_jaxpr(algebra.rewritten(unfloored))(a0, v0)
@@ -2050,18 +2048,12 @@ def test_reuse_refuses_unfloored_root_rewrites_reduce_sum_and_keys_jit_context()
         assert_as_exact(jax.jit(algebra.rewritten(reduce_sum_root)), jax.jit(reduce_sum_root),
                         lambda seed: rows(seed, (8, 16), (8, 16)), "reuse reduce_sum root", seeds=8)
 
-        closed_sm = jax.make_jaxpr(softmax_like)(a0, z0)
-        windows_sm = program._windows(closed_sm.jaxpr)
-        assert len(windows_sm) == 1
-        win_sm, _ = windows_sm[0]
-        assert sum(eq.primitive is jax.lax.div_p for eq in win_sm.eqns) == 2
-        done_sm = program._region(
-            jcore.ClosedJaxpr(win_sm, []), accurate=False, saturation=algebra.SATURATION,
-            ranges=program._declared(win_sm, program._held(closed_sm.jaxpr)))
-        assert done_sm.report.fired["reuse"] > 0
+        before_sm = list(equations(jax.make_jaxpr(softmax_like)(a0, b0, z0).jaxpr))
+        after_sm = list(equations(jax.make_jaxpr(algebra.rewritten(softmax_like))(a0, b0, z0).jaxpr))
+        assert sum(eq.primitive is jax.lax.div_p for eq in before_sm) == 2
+        assert sum(eq.primitive is jax.lax.div_p for eq in after_sm) == 1
         assert_as_exact(jax.jit(algebra.rewritten(softmax_like)), jax.jit(softmax_like),
-                        lambda seed: rows(seed, (8, 16), (8, 16)), "reuse reduce_sum", seeds=8)
-
+                        lambda seed: rows(seed, (8, 16), (8, 16), (8, 16)), "reuse reduce_sum", seeds=8)
     # One jitted callable must trace separately across off -> on -> off scope transitions.
     jitted = jax.jit(algebra.rewritten(gated))
     off_before = equations(jitted.trace(a0, z0).jaxpr.jaxpr)
@@ -2119,7 +2111,7 @@ def test_shared_divisor_fanout_stays_bounded_and_proven_matches_region_on_chaine
         return tuple(outs), inv
 
     z0 = np.ones((8, 16), np.float32)
-    xs0 = tuple(np.ones((8, 16), np.float32) for _ in range(60))
+    xs0 = tuple(np.ones((8, 16), np.float32) for _ in range(120))
     with algebra.rules.enabling_dev("reuse"):
         closed_fan = jax.make_jaxpr(fanout)(xs0, z0)
         wins = program._windows(closed_fan.jaxpr)

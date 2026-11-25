@@ -520,7 +520,8 @@ def _windows(jaxpr: jcore.Jaxpr) -> list[tuple[jcore.Jaxpr, list[jcore.Var]]]:
             equations.append(equation.replace(invars=invars, outvars=outvars))
         for equation in members:
             out = equation.outvars[0]
-            if out in returned or read.get(out, set()) - cluster.keys():
+            readers = read.get(out, ())
+            if out in returned or len(readers) > len(cluster) or any(r not in cluster for r in readers):
                 outputs.append(fresh[out])
                 yielded.append(out)
         windows.append((jcore.Jaxpr([], list(outside), outputs, equations), yielded))
