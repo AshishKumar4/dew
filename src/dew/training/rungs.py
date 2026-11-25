@@ -88,7 +88,7 @@ def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], spl
     devices_seen: list[JSON] = [*sorted(limits)]
     # In their order, as XLA reads a flag given twice by its last value (row 10797: sorted, two orders of one
     # flag's two values were one key).
-    settings = computation_flags()
+    flags = computation_flags()
     allocator = sorted(f"{name}={value}" for name, value in os.environ.items()
                        if name.startswith(('XLA_PYTHON_CLIENT_', 'TF_GPU_ALLOCATOR')))
     # The GPU its kernels are chosen for: this process's, or the one a CPU host builds for (`assumed`), so two
@@ -99,7 +99,7 @@ def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], spl
     program = json.dumps([RECORD_VERSION, traced, code, list(splits), dict(mesh.shape), target,
                           jax.__version__, importlib.metadata.version('jaxlib'), allocator, remat])
     return {'program': hashlib.sha256(program.encode()).hexdigest(), 'devices': devices_seen,
-            'xla_flags': ' '.join(settings)}
+            'xla_flags': ' '.join(flags)}
 
 
 def _code(settings: StepSettings | None, modules: Sequence[object],
@@ -117,10 +117,12 @@ def _code(settings: StepSettings | None, modules: Sequence[object],
     objective = settings.objective
     if not stated_class(type(objective)):
         return [whole_digest()]
-    # The optimizer as built is functions; what it was made from (`optimizer_source`) states its code.
-    held = dataclasses.replace(settings, built_optimizer=None)
+    # The optimizer as built is functions, what it was made from (`optimizer_source`) states its code; the
+    # meshes are devices, which the key states apart (a mesh is callable, a context of JAX's).
+    held = [getattr(settings, field.name) for field in dataclasses.fields(settings)
+            if field.name not in ("built_optimizer", "device_mesh", "state_mesh")]
     return provenance_code("dew.training.compiler",
-                           provenance([held, *type(objective).__mro__, *modules, step]))
+                           provenance([*held, *type(objective).__mro__, *modules, step]))
 
 
 def recorded_rung(modules: Sequence[object], arguments: tuple[TrainState, Batch], splits: Sequence[int],
