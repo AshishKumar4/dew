@@ -92,9 +92,8 @@ def _tiled(operands: dict[str, jax.Array], tile: int) -> dict[str, jax.Array]:
             for name, value in common.items()}
 
 
-def _run_chunked(kind: Literal["weighted", "masked", "covariance"], operands: dict[str, jax.Array], *,
-                 tile: int, mode: Literal["walk", "merge"] = "merge", out_dtype=None):
-    tiled = _tiled(operands, tile)
+def _eval_derived(kind: Literal["weighted", "masked", "covariance"], tiled: dict[str, jax.Array],
+                  mode: Literal["walk", "merge"]):
     first = {name: tile_stack[0] for name, tile_stack in tiled.items()}
     rank = next(iter(first.values())).ndim
     forms = derived(kind, rank)
@@ -102,24 +101,127 @@ def _run_chunked(kind: Literal["weighted", "masked", "covariance"], operands: di
     empty = forms.init(shapes)
     if mode == "walk":
         state, _ = jax.lax.scan(lambda carry, chunk: (forms.step(carry, chunk), None), empty, tiled)
-        finished = forms.finish(state, first, shapes=shapes)
-    else:
-        partials = jax.vmap(lambda chunk: forms.step(empty, chunk))(tiled)
-        while partials[0].shape[0] > 1:
-            count = partials[0].shape[0]
-            limit = 2 * (count // 2)
-            left = jax.tree.map(lambda state, end=limit: state[:end:2], partials)
-            right = jax.tree.map(lambda state, end=limit: state[1:end:2], partials)
-            merged = jax.vmap(lambda a, b: forms.merge(a, b, shapes=shapes))(left, right)
-            if count % 2:
-                tail = jax.tree.map(lambda state: state[-1:], partials)
-                merged = jax.tree.map(lambda a, b: jnp.concatenate([a, b], axis=0), merged, tail)
-            partials = merged
-        final = jax.tree.map(lambda state: state[0], partials)
-        finished = forms.finish(final, first, shapes=shapes)
-    if out_dtype is not None:
-        finished = jax.tree.map(lambda value: value.astype(out_dtype), finished)
+        return state, forms.finish(state, first, shapes=shapes)
+    partials = jax.vmap(lambda chunk: forms.step(empty, chunk))(tiled)
+    while partials[0].shape[0] > 1:
+        count = partials[0].shape[0]
+        limit = 2 * (count // 2)
+        left = jax.tree.map(lambda state, end=limit: state[:end:2], partials)
+        right = jax.tree.map(lambda state, end=limit: state[1:end:2], partials)
+        merged = jax.vmap(lambda a, b: forms.merge(a, b, shapes=shapes))(left, right)
+        if count % 2:
+            tail = jax.tree.map(lambda state: state[-1:], partials)
+            merged = jax.tree.map(lambda a, b: jnp.concatenate([a, b], axis=0), merged, tail)
+        partials = merged
+    final = jax.tree.map(lambda state: state[0], partials)
+    return final, forms.finish(final, first, shapes=shapes)
+
+
+def _weighted_term(tw: jax.Array, val: jax.Array, sn: jax.Array, pos: jax.Array) -> jax.Array:
+    """Range-safe `(tw / sn) * val`, zeroed where `not pos` or `tw == 0`."""
+    nz = pos & (tw > 0)
+    safe_val = jnp.where(nz, val, 0.0)
+    small_tw = (tw <= 1.0) & (sn > 1.0)
+    return jnp.where(nz, jnp.where(small_tw, (tw * safe_val) / sn, (tw / sn) * safe_val), 0.0)
+
+
+def _safe_tangent_div(dtw: jax.Array, num: jax.Array, sn: jax.Array) -> jax.Array:
+    """Linear-in-`dtw` evaluation of `dtw * num / sn` without `0 * inf` in forward or reverse mode."""
+    qmax = jnp.asarray(0.25 * jnp.finfo(num.dtype).max, num.dtype)
+    hi = sn > 1.0
+    sn_hi = jnp.where(hi, sn, 1.0)
+    sn_lo = jnp.where(hi, 1.0, sn)
+    safe_lo = jnp.abs(num) <= sn_lo * qmax
+    num_safe = jnp.where(safe_lo, num, 0.0)
+    num_big = jnp.where(safe_lo, 0.0, num)
+    sn_big = jnp.where(safe_lo, 1.0, sn_lo)
+    lo_term = dtw * (num_safe / sn_lo) + (dtw * num_big) / sn_big
+    return jnp.where(hi, dtw * (num / sn_hi), lo_term)
+
+
+def _cov_tangent_tile(tx: jax.Array, ty: jax.Array, tw: jax.Array,
+                      dtx: jax.Array, dty: jax.Array, dtw: jax.Array,
+                      mu_x: jax.Array, mu_y: jax.Array, cov: jax.Array,
+                      n: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Exact final-center linear tangent `(d_mu_x, d_mu_y, d_cov)` of one tile for both `n > 0` and
+    `n == 0` boundaries without multi-tile zero-mass exponent overflow."""
+    pos = n[..., None] > 0
+    sn = jnp.where(pos, n[..., None], 1.0)
+    cx = tx - mu_x[..., None]
+    cy = ty - mu_y[..., None]
+    d_mx = jnp.sum(_weighted_term(tw, dtx, sn, pos) + _safe_tangent_div(dtw, cx, sn), axis=-1)
+    d_my = jnp.sum(_weighted_term(tw, dty, sn, pos) + _safe_tangent_div(dtw, cy, sn), axis=-1)
+    pw_cy = _weighted_term(tw, cy, sn, pos)
+    pw_cx = _weighted_term(tw, cx, sn, pos)
+    hi = sn > 1.0
+    sn_hi = jnp.where(hi, sn, 1.0)
+    big_c = jnp.where(jnp.abs(cx) >= jnp.abs(cy), cx, cy)
+    sml_c = jnp.where(jnp.abs(cx) >= jnp.abs(cy), cy, cx)
+    c_dw_hi = (big_c / sn_hi) * sml_c - cov[..., None] / sn_hi
+    safe_cx = jnp.where(hi, 0.0, cx)
+    safe_cy = jnp.where(hi, 0.0, cy)
+    c_dw_lo = safe_cx * safe_cy - cov[..., None]
+    d_cov_w = jnp.where(hi, dtw * c_dw_hi, _safe_tangent_div(dtw, c_dw_lo, jnp.where(hi, 1.0, sn)))
+    d_cov = jnp.sum(pw_cy * dtx + pw_cx * dty + d_cov_w, axis=-1)
+    return d_mx, d_my, d_cov
+
+
+def _tile_array(value: jax.Array, shape: tuple[int, ...], tile: int) -> jax.Array:
+    n_tiles = shape[-1] // tile
+    return jnp.moveaxis(jnp.broadcast_to(value, shape).reshape(*shape[:-1], n_tiles, tile), -2, 0)
+
+
+def _tiled_tangents(x: jax.Array, y: jax.Array, w: jax.Array,
+                    dx: jax.Array, dy: jax.Array, dw: jax.Array,
+                    mu_x: jax.Array, mu_y: jax.Array, cov: jax.Array, n: jax.Array,
+                    tile: int, mode: Literal["walk", "merge"]) -> tuple[jax.Array, jax.Array, jax.Array]:
+    shape = jnp.broadcast_shapes(x.shape, y.shape, w.shape)
+    stacks = tuple(_tile_array(arr, shape, tile) for arr in (x, y, w, dx, dy, dw))
+    if mode == "walk":
+        zeros = (jnp.zeros_like(mu_x), jnp.zeros_like(mu_y), jnp.zeros_like(cov))
+
+        def step(acc, chunk):
+            d_mx, d_my, d_cov = _cov_tangent_tile(*chunk, mu_x, mu_y, cov, n)
+            return (acc[0] + d_mx, acc[1] + d_my, acc[2] + d_cov), None
+
+        totals, _ = jax.lax.scan(step, zeros, stacks)
+        return totals
+    d_mx, d_my, d_cov = jax.vmap(
+        lambda tx, ty, tw, dtx, dty, dtw: _cov_tangent_tile(tx, ty, tw, dtx, dty, dtw, mu_x, mu_y, cov, n)
+    )(*stacks)
+    return jnp.sum(d_mx, axis=0), jnp.sum(d_my, axis=0), jnp.sum(d_cov, axis=0)
+
+
+@functools.partial(jax.custom_jvp, nondiff_argnums=(2, 3))
+def _run_chunked_weighted(x: jax.Array, w: jax.Array, tile: int,
+                          mode: Literal["walk", "merge"]) -> tuple[jax.Array, jax.Array]:
+    _, finished = _eval_derived("weighted", _tiled({"x": x, "w": w}, tile), mode)
     return finished
+
+
+@_run_chunked_weighted.defjvp
+def _run_chunked_weighted_jvp(tile: int, mode: Literal["walk", "merge"], primals, tangents):
+    x, w = primals
+    dx, dw = tangents
+    state, (mean, var) = _eval_derived("weighted", _tiled({"x": x, "w": w}, tile), mode)
+    d_mean, _, d_var = _tiled_tangents(x, x, w, dx, dx, dw, mean, mean, var, state[0], tile, mode)
+    return (mean, var), (d_mean, d_var)
+
+
+@functools.partial(jax.custom_jvp, nondiff_argnums=(3, 4))
+def _run_chunked_cov(x: jax.Array, y: jax.Array, w: jax.Array, tile: int,
+                     mode: Literal["walk", "merge"]) -> tuple[jax.Array, jax.Array, jax.Array]:
+    _, finished = _eval_derived("covariance", _tiled({"x": x, "y": y, "w": w}, tile), mode)
+    return finished
+
+
+@_run_chunked_cov.defjvp
+def _run_chunked_cov_jvp(tile: int, mode: Literal["walk", "merge"], primals, tangents):
+    x, y, w = primals
+    dx, dy, dw = tangents
+    state, (mean_x, mean_y, cov) = _eval_derived("covariance", _tiled({"x": x, "y": y, "w": w}, tile), mode)
+    d_mx, d_my, d_cov = _tiled_tangents(x, y, w, dx, dy, dw, mean_x, mean_y, cov, state[0], tile, mode)
+    return (mean_x, mean_y, cov), (d_mx, d_my, d_cov)
 
 
 def _floating_dtype(*arrays: jax.Array):
@@ -133,6 +235,10 @@ def _working_dtype(dtype):
     return jnp.promote_types(dtype, jnp.float32)
 
 
+def _cast_back(outputs, work, out_dtype):
+    return outputs if work == out_dtype else jax.tree.map(lambda value: value.astype(out_dtype), outputs)
+
+
 def chunked_moments(x: jax.Array, w: jax.Array, *, tile: int,
                     mode: Literal["walk", "merge"] = "merge") -> tuple[jax.Array, jax.Array]:
     """Compute weighted or boolean-masked `(mean, variance)` of `x` along its last axis in `tile`-wide chunks
@@ -144,12 +250,12 @@ def chunked_moments(x: jax.Array, w: jax.Array, *, tile: int,
     if w_arr.dtype == jnp.bool_:
         out_dtype = _floating_dtype(x_arr)
         work = _working_dtype(out_dtype)
-        return _run_chunked("masked", {"x": x_arr.astype(work), "mask": w_arr}, tile=tile, mode=mode,
-                            out_dtype=None if work == out_dtype else out_dtype)
+        _, finished = _eval_derived("masked", _tiled({"x": x_arr.astype(work), "mask": w_arr}, tile), mode)
+        return _cast_back(finished, work, out_dtype)
     out_dtype = _floating_dtype(x_arr, w_arr)
     work = _working_dtype(out_dtype)
-    return _run_chunked("weighted", {"x": x_arr.astype(work), "w": w_arr.astype(work)}, tile=tile,
-                        mode=mode, out_dtype=None if work == out_dtype else out_dtype)
+    return _cast_back(_run_chunked_weighted(x_arr.astype(work), w_arr.astype(work), tile, mode),
+                      work, out_dtype)
 
 
 def chunked_covariance(x: jax.Array, y: jax.Array, w: jax.Array, *, tile: int,
@@ -161,6 +267,5 @@ def chunked_covariance(x: jax.Array, y: jax.Array, w: jax.Array, *, tile: int,
     x_arr, y_arr, w_arr = jnp.asarray(x), jnp.asarray(y), jnp.asarray(w)
     out_dtype = _floating_dtype(x_arr, y_arr, w_arr)
     work = _working_dtype(out_dtype)
-    return _run_chunked("covariance",
-                        {"x": x_arr.astype(work), "y": y_arr.astype(work), "w": w_arr.astype(work)},
-                        tile=tile, mode=mode, out_dtype=None if work == out_dtype else out_dtype)
+    return _cast_back(_run_chunked_cov(x_arr.astype(work), y_arr.astype(work), w_arr.astype(work), tile,
+                                       mode), work, out_dtype)

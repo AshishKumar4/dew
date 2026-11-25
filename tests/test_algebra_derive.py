@@ -990,12 +990,15 @@ def test_chunked_moments_contract_broadcasts_promotes_scans_and_rejects_empty():
             jax.jit(ref_mixed), draw_mixed, f"mixed broadcast moments ({mode})", seeds=16)
 
     # Walk stages one scan body regardless of tile count.
+    from dew.nn.programs import equations
+
     j2 = jax.make_jaxpr(lambda a, b: moments.chunked_moments(a, b, tile=16, mode="walk"))(
         np.ones((2, 32), np.float32), np.ones((2, 32), np.float32)).jaxpr
     j8 = jax.make_jaxpr(lambda a, b: moments.chunked_moments(a, b, tile=16, mode="walk"))(
         np.ones((2, 128), np.float32), np.ones((2, 128), np.float32)).jaxpr
-    assert any(eq.primitive is jax.lax.scan_p for eq in j2.eqns)
-    assert len(j2.eqns) == len(j8.eqns)
+    eq2, eq8 = list(equations(j2)), list(equations(j8))
+    assert any(eq.primitive is jax.lax.scan_p for eq in eq2)
+    assert len(eq2) == len(eq8)
 
 
 @pytest.mark.parametrize("dtype", [jnp.float16, jnp.bfloat16])
@@ -1089,14 +1092,16 @@ def test_chunked_moments_preserves_zero_weight_derivatives_and_extreme_anchors()
             np.asarray(jax.grad(lambda w_, m=mode: moments.chunked_moments(
                 x_three, w_, tile=1, mode=m)[1].sum())(w_three)), np.asarray(ref_v3))
 
-    # Large-offset and cross-scale zero-mass covariance merges (independent per-axis zero-mass scales).
+    # Large-offset, cross-scale, and >277-bit zero-mass covariance merges (final-center JVP/VJP).
     large, hi_x, lo_y = np.float32(2.0 ** 70), np.float32(2.0 ** 120), np.float32(2.0 ** -100)
-    big, tiny = np.float32(2.0 ** 127), np.finfo(np.float32).tiny
+    small, big, tiny = np.float32(2.0 ** -20), np.float32(2.0 ** 127), np.finfo(np.float32).tiny
     for x_row, y_row, w_row, dw_row, tile, expect_jvp in (
         ([large, 0.0, large], [large, 0.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0], 1, 0.0),
         ([large, large, 0.0], [0.0, large, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], 1, 0.0),
         ([large, 0.0, large, large], [large, 0.0, 0.0, 0.0], [0.0, 0.0, 1.0, 1.0],
          [1.0, 0.0, 0.0, 0.0], 2, 0.0),
+        ([hi_x, 0.0, small], [0.0, hi_x, small], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0], 1, float(2.0 ** -40)),
+        ([hi_x, 0.0, small], [0.0, hi_x, small], [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], 1, 0.0),
         ([hi_x, 0.0], [lo_y, 0.0], [0.0, 0.0], [1.0, 0.0], 1, float(2.0 ** 20)),
         ([hi_x, 0.0], [lo_y, 0.0], [0.0, 0.0], [1.0, 0.0], 2, float(2.0 ** 20)),
         ([hi_x, 0.0, 0.0], [lo_y, 0.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0], 1, float(2.0 ** 20)),
@@ -1150,14 +1155,40 @@ def test_chunked_moments_balances_unequal_scales_value_gradients_and_explicit_sh
                 assert np.all(np.isfinite(np.asarray(got_cov))) and float(got_cov[0]) != 0.0
                 np.testing.assert_array_equal(np.asarray(got_cov), np.asarray(ref_cov))
 
-    # Minimum-normal float32 weights (`2^-126`): balanced combine keeps every intermediate normal.
-    for x_pair, w_scale, expect_var in (([-0.5, 0.5], 2.0 ** -124, 0.25),
-                                        ([-1.0, 1.0], float(np.finfo(np.float32).tiny), 1.0)):
+    # Minimum-normal float32 weights (`2^-126`): normalized monoid keeps primal and value VJPs finite/exact
+    # both through `chunked_covariance` and through direct `derive.derive` without `custom_jvp`.
+    tiny = float(np.finfo(np.float32).tiny)
+    for x_pair, w_scale, expect_var in (([-0.5, 0.5], 2.0 ** -124, 0.25), ([-1.0, 1.0], tiny, 1.0)):
         x_tiny = jnp.asarray([x_pair], jnp.float32)
         w_tiny = jnp.asarray([[w_scale, w_scale]], jnp.float32)
         for mode in ("walk", "merge"):
             m_t, v_t = moments.chunked_moments(x_tiny, w_tiny, tile=1, mode=mode)
             assert float(m_t[0]) == 0.0 and float(v_t[0]) == expect_var
+
+    x_mn = jnp.asarray([[0.0, 16.0]], jnp.float32)
+    y_mn = jnp.asarray([[0.0, 32.0]], jnp.float32)
+    w_mn = jnp.asarray([[tiny, tiny]], jnp.float32)
+    forms_cov = derive.derive(moments.declaration("covariance"), accurate=False, saturation=SATURATION)
+    shapes_cov = {name: ((1, 1), jnp.float32) for name in ("x", "y", "w")}
+
+    def direct_cov(x_, y_, w_):
+        s0 = forms_cov.step(forms_cov.init(shapes_cov), {"x": x_[:, :1], "y": y_[:, :1], "w": w_[:, :1]})
+        s1 = forms_cov.step(s0, {"x": x_[:, 1:], "y": y_[:, 1:], "w": w_[:, 1:]})
+        return forms_cov.finish(s1, {"x": x_[:, :1], "y": y_[:, :1], "w": w_[:, :1]},
+                                shapes=shapes_cov)[2].sum()
+
+    assert float(direct_cov(x_mn, y_mn, w_mn)) == 128.0
+    dgx, dgy = jax.grad(direct_cov, argnums=(0, 1))(x_mn, y_mn, w_mn)
+    np.testing.assert_array_equal(np.asarray(dgx), np.asarray([[-8.0, 8.0]], np.float32))
+    np.testing.assert_array_equal(np.asarray(dgy), np.asarray([[-4.0, 4.0]], np.float32))
+    for tile in (1, 2):
+        for mode in ("walk", "merge"):
+            gx, gy, gw = jax.grad(
+                lambda x_, y_, w_, t=tile, m=mode: moments.chunked_covariance(
+                    x_, y_, w_, tile=t, mode=m)[2].sum(), argnums=(0, 1, 2))(x_mn, y_mn, w_mn)
+            np.testing.assert_array_equal(np.asarray(gx), np.asarray([[-8.0, 8.0]], np.float32))
+            np.testing.assert_array_equal(np.asarray(gy), np.asarray([[-4.0, 4.0]], np.float32))
+            np.testing.assert_array_equal(np.asarray(gw), np.asarray([[0.0, 0.0]], np.float32))
 
     # Ordinary value gradients (`dx`, `dy`): Check 1 (`assert_as_exact`) against the declared reductions.
     def draw_xyw(seed):
@@ -1174,7 +1205,7 @@ def test_chunked_moments_balances_unequal_scales_value_gradients_and_explicit_sh
                 x_, y_, w_)[2].sum(), argnums=(0, 1))),
             draw_xyw, f"chunked covariance value gradients ({mode})", seeds=8)
 
-    # Explicit sharding (`AxisType.Explicit`): synthetic midpoint reductions carry `out_sharding=None`.
+    # Explicit sharding (`AxisType.Explicit`): derived walk and merge lower cleanly under explicit meshes.
     xv = jnp.asarray([[1.0, 3.0, 5.0, 7.0]], jnp.float32)
     wv = jnp.asarray([[0.5, 1.5, 1.0, 1.0]], jnp.float32)
     mesh = jax.make_mesh((1,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:1])
