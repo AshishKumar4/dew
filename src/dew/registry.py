@@ -631,6 +631,10 @@ def to_record(value, annotation) -> JSON:
         return to_record(value.value, None)
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
+    if isinstance(value, type) and _declares_callable(annotation):
+        # A class named where a callable is declared (a rollout's reward by its class), recorded by its import
+        # path as a function is, which reads back as the class (`from_record`).
+        return {"function": import_path(value)}
     if not isinstance(value, type) and _owned(type(value), called=False):
         # A plain class of Dew's or a trusted package's, rebuilt from its
         # constructor's parameters as `_built` builds one; it declares no
@@ -640,6 +644,13 @@ def to_record(value, annotation) -> JSON:
         f"{type(value).__name__} is not something a run record can carry; a "
         f"config field holds JSON scalars, sequences, mappings, dataclasses and "
         f"functions with an import path")
+
+
+def _declares_callable(annotation) -> bool:
+    """Whether `annotation` declares a callable (`Callable[...]`), any member of its union (`_union_members`,
+    through its aliases and `Annotated`)."""
+    return any(resolve_alias(member) is Callable or typing.get_origin(resolve_alias(member)) is Callable
+               for member in _union_members(annotation))
 
 
 def _record_of(value: Recorded | DataclassInstance, annotation: Annotation) -> dict[str, JSON]:
@@ -2245,6 +2256,26 @@ def record_argument[Value](annotation: type[Value]) -> tyro.constructors.Primiti
     )
 
 
+_IMPORTABLE = (type, types.FunctionType, types.BuiltinFunctionType, types.MethodType)
+"""What `import_path` names by its own path (`Importable`), as an instance check reads it."""
+
+
+def imported_argument() -> tyro.constructors.PrimitiveConstructorSpec[Callable[..., Configured]]:
+    """A callable field written on the command line as its import path, `module:name` (`imported`): the
+    function or the class it names, a class read by the field's own class as its instance at its defaults
+    is called (`dew.config.lm.PromptRollout.reward`); written back as the import path of the function or
+    the class, or of an instance's class. A run's record holds the callable's own record (`to_record`). Use
+    it as the field's metadata: `Annotated[Reward, imported_argument()]`."""
+    return tyro.constructors.PrimitiveConstructorSpec(
+        nargs=1,
+        metavar="MODULE:NAME",
+        instance_from_str=lambda given: imported(given[0]),
+        is_instance=callable,
+        str_from_instance=lambda given: [
+            import_path(given if isinstance(given, _IMPORTABLE) else type(given))],
+    )
+
+
 __all__ = [
     "KINDS",
     "Aliases",
@@ -2259,6 +2290,7 @@ __all__ = [
     "import_path",
     "import_trusted",
     "imported",
+    "imported_argument",
     "metrics",
     "mixers",
     "models",

@@ -337,9 +337,11 @@ def test_a_run_over_one_state_trains_and_its_task_asks_a_requests_questions_in_o
 
     from dew.data import Memory
     from dew.decision import Decide, decisions
+    from dew.decision.config import RowBudgets
 
     rows = Memory([{"example": example} for example in examples()]).read("memory").pipe(decisions).batch(8)
-    run = dataclasses.replace(lettered(tmp_path, drawn=False), data=rows, validation=None, shared_state=3)
+    run = dataclasses.replace(lettered(tmp_path, drawn=False), data=rows, validation=None,
+                              rows=RowBudgets(shared_state=3))
     assert run.pretrained == str(QWEN_TINY)
     trained(run, tmp_path, "hybrid")
     # Over a vocabulary that spells A to D as one unknown token, labels it spells apart (`run_kinds.shared`).

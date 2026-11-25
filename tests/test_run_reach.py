@@ -444,9 +444,10 @@ def test_a_decision_run_draws_its_context_blocks_beside_its_source_in_its_numeri
     from test_decision_recipe import QWEN
 
     from dew.batch import FROZEN
+    from dew.decision.config import CrossContext
 
-    run = dataclasses.replace(decision(tmp_path, drawn=False), pretrained=str(QWEN), context_layers=(0,),
-                              context_length=16)
+    run = dataclasses.replace(decision(tmp_path, drawn=False), pretrained=str(QWEN),
+                              context=CrossContext(layers=(0,), length=16))
     state, _ = trained(run, tmp_path, "context", trainer={"precision": Numerics(DTYPE_PRESETS["bf16-true"])})
     drawn = jax.tree_util.tree_leaves_with_path(state.variables["params"])
     assert any("cross_attention" in jax.tree_util.keystr(path) for path, _ in drawn)

@@ -587,11 +587,16 @@ def _unset_default(owner: "RunConfig | DataclassInstance | type[DataclassInstanc
                    ) -> "DataclassInstance | None":
     """The value an optional record field `group` of `owner` takes where it holds none and a path steps into
     it (`trainer.layout.min_shard` of an unset `TrainerConfig.layout`): its one dataclass's defaults; None
-    for a field of no such type (row 9635)."""
+    for a field of no such type (row 9635), or of one with no default to take, a field it needs stated (a
+    decision run's `CrossContext.layers`)."""
     annotation = registry.declared_type(owner if isinstance(owner, type) else type(owner), group)
     kinds = [kind for kind in typing.get_args(annotation)
              if isinstance(kind, type) and dataclasses.is_dataclass(kind)]
-    return kinds[0]() if len(kinds) == 1 and type(None) in typing.get_args(annotation) else None
+    if len(kinds) != 1 or type(None) not in typing.get_args(annotation):
+        return None
+    stated = [field.name for field in dataclasses.fields(kinds[0]) if field.init
+              and field.default is dataclasses.MISSING and field.default_factory is dataclasses.MISSING]
+    return None if stated else kinds[0]()
 
 
 def _placed(config: "RunConfig", path: str) -> tuple[list[str], dict[str, JSON]]:
@@ -615,6 +620,30 @@ def _placed(config: "RunConfig", path: str) -> tuple[list[str], dict[str, JSON]]
             raise KeyError(f"{path} names no argument of {held.name}")
         return [*groups, "fields", field], unset
     if not (dataclasses.is_dataclass(held) and field in _names(held)):
+        raise KeyError(f"{path} names no field of the run record")
+    return [*groups, field], unset
+
+
+def _declared_path(kind: type, record: Mapping[str, JSON], path: str) -> tuple[list[str], dict[str, JSON]]:
+    """`_placed` read off a record of the run class `kind` (`record`, a section of which a shallower path of
+    an override's point set) and the classes its fields declare, building no run: the keys of `path`'s
+    value, each section by the one dataclass its field declares beside None, and the record of the default
+    each section the record holds unset takes (`_unset_default`), by its key; KeyError for any other."""
+    *groups, field = path.split(".")
+    node: object = record
+    unset: dict[str, JSON] = {}
+    for group in groups:
+        declared = registry.declared_type(kind, group)
+        kinds = [member for member in (declared, *typing.get_args(declared))
+                 if isinstance(member, type) and dataclasses.is_dataclass(member)]
+        held = node.get(group) if isinstance(node, Mapping) else None
+        if held is None and (default := _unset_default(kind, group)) is not None:
+            held = unset[group] = registry.to_record(default, type(default))
+            kinds = [type(default)]
+        if len(kinds) != 1 or not isinstance(held, Mapping):
+            raise KeyError(f"{path} names no group of the run record")
+        kind, node = kinds[0], held
+    if not (dataclasses.is_dataclass(kind) and field in _names(kind)):
         raise KeyError(f"{path} names no field of the run record")
     return [*groups, field], unset
 
@@ -809,10 +838,18 @@ class RunConfig:
         """
         chained = {path: value for path, value in point.items() if path.partition(".")[0] in CHAINS}
         record = self._fields_record()
-        for path, value in point.items():
+        # The shallower paths first: a path under a section no run holds unset that the same point sets
+        # (`context`, then `context.encoder`) is placed in the run as the point sets that section.
+        for path in sorted(point, key=lambda path: path.count(".")):
+            value = point[path]
             if path in chained:
                 continue
-            keys, unset = _placed(self, path)
+            try:
+                keys, unset = _placed(self, path)
+            except KeyError:
+                # A section the run holds unset that a shallower path of the point set: placed by its
+                # declared class, the run built once, from the completed record.
+                keys, unset = _declared_path(type(self), record, path)
             *groups, field = keys
             node = record
             for group in groups:

@@ -939,13 +939,15 @@ def test_a_decision_run_chooses_its_head_by_its_subcommand():
 
 
 def test_a_decision_run_trains_its_backbone_beside_its_context_layers_on_the_command_line():
-    """`--no-context-frozen` with `--context-layers` trains the backbone whole beside the blocks; by
-    default it holds frozen."""
+    """`context:cross-context --context.layers` reads a decision run's context through those layers, the
+    backbone frozen beside their blocks by default, trained whole with `--context.no-frozen`."""
     from dew.decision.config import DecisionRunConfig
 
-    flags = ["--trainer.multi-host", "False", "--context-layers", "0", "1"]
-    assert DecisionRunConfig.cli(flags).context_frozen
-    assert not DecisionRunConfig.cli([*flags, "--no-context-frozen"]).context_frozen
+    flags = ["--trainer.multi-host", "False", "context:cross-context", "--context.layers", "0", "1"]
+    held = DecisionRunConfig.cli(flags).context
+    assert held is not None and held.layers == (0, 1) and held.frozen
+    trained = DecisionRunConfig.cli([*flags, "--context.no-frozen"]).context
+    assert trained is not None and not trained.frozen
 
 
 def test_a_run_branches_into_the_cooldowns_its_command_line_names():

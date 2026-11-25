@@ -667,6 +667,14 @@ QUESTION_ROW = "question row"
 """The metadata mark of a `SegmentLayout` field only a row a question reads, which a joint row holds at its
 default (`SegmentLayout.joint_row`)."""
 
+type SplitAt = Literal["part", "question", "whole"]
+"""Where a question row splits into the blocks its backbone reads (`SegmentLayout.split`): at its second
+part, at its question, or nowhere, the whole row one block."""
+
+type OptionText = Literal["named", "described"]
+"""How a question row writes a choice's option (`SegmentLayout.option_text`): its key beside its
+description, or its description alone."""
+
 type Form = Literal["marker", "state_first", "joint"]
 """The row a `SegmentLayout` writes: Laya's marker row (the question, a marker before each option, then the
 state, for a bidirectional backbone), a state-first row (for a causal backbone), each a row a question;
@@ -734,7 +742,7 @@ class SegmentLayout(Layout):
     follows). A backbone that reads blocks attends to each whole, and the second to the first in
     order. Off, every row is read in order."""
 
-    split: Literal["part", "question", "whole"] | None = dataclasses.field(default=None,
+    split: SplitAt | None = dataclasses.field(default=None,
                                                                           metadata={QUESTION_ROW: True})
     """Where a row in `blocks` splits: at its second part (`part`, a row of segments' own law: a
     state-first row's question from its header on, a question-first row's state from its first token
@@ -753,7 +761,7 @@ class SegmentLayout(Layout):
     """Which of the row's streams each reads (`Reads`), where its question's segments stand in a stream
     of the row's own (`Instructions.stream`); None for a row read in order."""
 
-    option_text: Literal["named", "described"] = dataclasses.field(
+    option_text: OptionText = dataclasses.field(
         default="named", repr=False, metadata={QUESTION_ROW: True, _records.ADDED: True})
     """How a choice's option is written (`options`): `named`, its key and its description
     (`key: description`), as Laya's release reads its rows; or `described`, its description alone, the
@@ -2322,7 +2330,7 @@ def per_question(layout: Layout | None) -> TypeGuard[SegmentLayout]:
     return isinstance(layout, SegmentLayout) and not layout.joint
 
 
-def layout_writing(layout: Layout) -> Literal["named", "described"]:
+def layout_writing(layout: Layout) -> OptionText:
     """How `layout`'s rows write a choice's option (`SegmentLayout.option_text`): a question row's own
     writing, and a joint row's `named`, its schema naming each option by its key beside its description."""
     return layout.option_text if per_question(layout) else "named"
