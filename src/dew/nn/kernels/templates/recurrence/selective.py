@@ -143,12 +143,12 @@ def _slot_at(row, slot, slots: int):
 def _entered(scan: Scan, row, load, given, stored):
     """The state a document taking slot `load` up enters, every leaf of it (`given(at)`, `stored(at)` its
     given and stored slots' at a slot's index): a given slot's, past the given slots a stored one's, and a
-    zero state where `load` is zero. The forward's and the backward's one reading of a chunk's table."""
+    zero state where `load` is zero. The forward's and the backward's one reading of a chunk's table, each
+    leaf selected on the scalar `load` as a splat (`mosaic.selected`)."""
     state = given(_slot_at(row, load, scan.count))
     if scan.held:
-        kept = stored(_slot_at(row, load - scan.count, scan.held))
-        state = jax.tree.map(lambda kept, entered: jnp.where(load > scan.count, kept, entered), kept, state)
-    return jax.tree.map(lambda leaf: jnp.where(load > 0, leaf, 0.0), state)
+        state = mosaic.selected(load > scan.count, stored(_slot_at(row, load - scan.count, scan.held)), state)
+    return mosaic.selected(load > 0, state, jax.tree.map(jnp.zeros_like, state))
 
 
 @dataclasses.dataclass(frozen=True)

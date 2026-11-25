@@ -160,181 +160,6 @@ def _multiplying(family, lhs: str, rhs: str, interpret):
     return step
 
 
-FED_STEPS = 5
-FED_ROWS, FED_WIDTH = 64, 128
-
-
-def _fed_products(p, x, *, interpret, consumers: int = 2, lo: int = 0, unrolled: bool = False,
-                  in_flight: int = 0):
-    """`p @ x` and `2 * p @ x` over `FED_STEPS` steps of 64 rows of `x` (`p`'s 64 columns a step), on
-    warpgroup MMA without a producer (`mosaic_sm90.FED`): every consumer walks every step of one ring the
-    first fills (`Family.fed`), each multiplying its share of the step's rows (two consumers: a 32-row
-    contraction, its blocks staged at `swizzling.swizzle_for`'s 64 bytes), and their sums meet before one
-    store each, twice in one scope reused (`across.summed_across`), in a scope after the rings'
-    (`Family.scoped` returns); the walk's steps counted from `lo`, its ring counters from 0 (`first`)."""
-    from dew.nn.kernels.templates import mosaic_sm90
-    family, share = mosaic_sm90.FED, FED_ROWS // consumers
-    swizzle = swizzling.swizzle_for(jnp.bfloat16, share)
-
-    def body(p_gmem, x_gmem, out_gmem, doubled_gmem):
-        allocated = family.streams({'p': ((FED_ROWS, FED_ROWS), jnp.bfloat16),
-                                    'x': ((FED_ROWS, FED_WIDTH), jnp.bfloat16)}, STAGES, consumers,
-                                   swizzles={'p': swizzle, 'x': swizzle})
-        wg = jax.lax.axis_index("wg")
-
-        def walked(*, streams):
-            first = jnp.int32(lo)
-            # A plain walk's views take its own step indices, as a producer's stream gives them.
-            views = {'p': (p_gmem, lambda j: (0, j - first)), 'x': (x_gmem, lambda j: (j - first, 0))}
-            feed = family.fed(family.opened(streams), views, first, first + FED_STEPS, wg)
-
-            def step(at, slots, carry, accumulators):
-                del at
-                (acc,) = accumulators
-                block, rows = slots['p'], slots['x']
-                product = family.products(acc, block.at[:, pl.ds(wg * share, share)],
-                                          rows.at[pl.ds(wg * share, share)])
-                return carry, (product,)
-
-            return family.walk(feed, ((step, first, first + FED_STEPS),), (), ((FED_ROWS, FED_WIDTH),),
-                               interpret, first=first, unrolled=unrolled, in_flight=in_flight)[1][0]
-
-        summed = family.scoped(walked, streams=allocated)
-
-        def total(**scratch):
-            for value, out in ((summed, out_gmem), (summed * 2, doubled_gmem)):
-                across.summed_across(value, scratch, wg, consumers,
-                                     lambda value, out=out: out.__setitem__(slice(None), value))
-
-        pl.run_scoped(total, **across.summing((FED_ROWS, FED_WIDTH), consumers), collective_axes="wg")
-
-    out = jax.ShapeDtypeStruct((FED_ROWS, FED_WIDTH), jnp.float32)
-    return family.kernel(body, out_type=(out, out), grid=(1,), grid_names=("programs",), consumers=consumers,
-                         interpret=interpret, name="fed")(p, x)
-
-
-def _fed_staged_over_rings(p, x, *, interpret, ordered: bool):
-    """Two consumers without a producer walk `_fed_products`' ring, each its share of a step's rows, and
-    stage their partial products after their walks in a tile over the ring's slots
-    (`Family.stages_over_rings`: the slots and the tile one union, `after_walk.over_rings_scoped`), each its
-    own `[64, 128]` fp32 part, past the barrier every consumer passes first (`walked`), or, not `ordered`,
-    without passing it: `[2, 64, 128]` partials, `p @ x` their sum."""
-    from dew.nn.kernels.templates import mosaic_sm90
-    family, consumers = mosaic_sm90.FED, 2
-    share = FED_ROWS // consumers
-    swizzle = swizzling.swizzle_for(jnp.bfloat16, share)
-
-    def body(p_gmem, x_gmem, out_gmem):
-        allocated = family.streams({'p': ((FED_ROWS, FED_ROWS), jnp.bfloat16),
-                                    'x': ((FED_ROWS, FED_WIDTH), jnp.bfloat16)}, STAGES, consumers,
-                                   swizzles={'p': swizzle, 'x': swizzle})
-        wg = jax.lax.axis_index("wg")
-
-        def program(*, streams, after, walked):
-            views = {'p': (p_gmem, lambda j: (0, j)), 'x': (x_gmem, lambda j: (j, 0))}
-            feed = family.fed(family.opened(streams), views, jnp.int32(0), jnp.int32(FED_STEPS), wg)
-
-            def step(at, slots, carry, accumulators):
-                del at
-                (acc,) = accumulators
-                block, rows = slots['p'], slots['x']
-                return carry, (family.products(acc, block.at[:, pl.ds(wg * share, share)],
-                                               rows.at[pl.ds(wg * share, share)]),)
-
-            (part,) = family.walk(feed, ((step, 0, FED_STEPS),), (), ((FED_ROWS, FED_WIDTH),), interpret)[1]
-            if ordered:
-                walked()
-
-            def staged(stage):
-                stage.at[wg][...] = part
-                out_gmem.at[wg][...] = stage.at[wg][...]
-
-            after(staged)
-
-        family.scoped(program, streams=allocated, over_rings=True,
-                      after_walks=(plgpu.SMEM((consumers, FED_ROWS, FED_WIDTH), jnp.float32),))
-
-    out = jax.ShapeDtypeStruct((consumers, FED_ROWS, FED_WIDTH), jnp.float32)
-    return family.kernel(body, out_type=(out,), grid=(1,), grid_names=("programs",), consumers=consumers,
-                         interpret=interpret, name="fed_over_rings")(p, x)
-
-
-def _fed_operands():
-    """Small integers, so the product is exact in fp32 whatever its order: NumPy's (a GPU tier's prepare
-    computes on no device)."""
-    rng = np.random.default_rng(1)
-    p = rng.integers(-4, 4, (FED_ROWS, FED_STEPS * FED_ROWS)).astype(jnp.bfloat16)
-    x = rng.integers(-4, 4, (FED_STEPS * FED_ROWS, FED_WIDTH)).astype(jnp.bfloat16)
-    return p, x
-
-
-def _fed_expected(p, x):
-    product = np.asarray(p, np.float32) @ np.asarray(x, np.float32)
-    return product, 2 * product
-
-
-@INTERPRETS
-def test_consumers_staging_over_their_rings_write_only_past_every_consumers_reads_interpreted():
-    """Interpreted with the interpreter's race detection: two consumers that stage their partial products
-    over their ring's slots after their walks (`_fed_staged_over_rings`: a consumer's tile shares bytes with
-    the slots its partner reads in its last step) write none of it while either reads a slot, each passing
-    the barrier of their walks' ends first (`walked`), and their partials sum to `p @ x` exactly (small
-    integers); the same consumers not passing it write a tile a product still reads, which the detector
-    names."""
-    from jax._src.pallas.mosaic_gpu.interpret import interpret_pallas_call as interpreter
-
-    p, x = _fed_operands()
-    # A race is recorded and the kernel runs on (`on_race="warn"`), so each arm reads the detector's verdict.
-    races = plgpu.InterpretGPUParams(detect_races=True, on_race="warn")
-    # Each arm is run whole before its verdict is read: a dispatch returns before the kernel ran, and the
-    # detector's state is the last kernel's.
-    (parts,) = jax.block_until_ready(_fed_staged_over_rings(p, x, interpret=races, ordered=True))
-    assert not interpreter.get_races().races_found
-    np.testing.assert_array_equal(np.asarray(parts).sum(axis=0), _fed_expected(p, x)[0])
-    jax.block_until_ready(_fed_staged_over_rings(p, x, interpret=races, ordered=False))
-    assert interpreter.get_races().races_found
-
-
-@INTERPRETS
-@pytest.mark.parametrize("unrolled", [False, True])
-@pytest.mark.parametrize("in_flight", [0, 1])
-@pytest.mark.parametrize(("consumers", "lo"), [(1, 0), (2, 0), (2, 3)])
-def test_consumers_feeding_their_own_ring_split_a_step_and_meet_before_the_store(consumers, lo, in_flight,
-                                                                                  unrolled):
-    """Interpreted: consumers with no producer walk every step of one ring through slot reuse (five steps
-    over two slots), each its share of a step's rows, and store their sum once, twice through one scratch:
-    exactly the product and its double; a walk whose steps start past 0 (a later key block's), its ring
-    counters from its own first (`first`), alike; a step's products running on past it or not, and the
-    walk a step a trip or a rotation of its ring a trip (`mosaic.stepping`: two whole rotations and the
-    fifth step alone)."""
-    p, x = _fed_operands()
-    got = _fed_products(p, x, interpret=INTERPRETED, consumers=consumers, lo=lo, unrolled=unrolled,
-                        in_flight=in_flight)
-    for value, expected in zip(got, _fed_expected(p, x), strict=True):
-        np.testing.assert_array_equal(np.asarray(value), expected)
-
-
-@pytest.mark.parametrize("consumers", [1, 2])
-def test_the_fed_walk_lowers_for_an_h100(consumers):
-    """The fed walk's kernel, two consumers' 32-row contraction staged at 64 bytes, lowers for an H100 on any
-    host."""
-    p, x = (jax.ShapeDtypeStruct(each.shape, each.dtype) for each in _fed_operands())
-    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
-    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
-        jax.jit(functools.partial(_fed_products, interpret=False, consumers=consumers)).trace(p, x).lower(
-            lowering_platforms=("cuda",))
-
-
-def consumers_feeding_their_own_ring_split_a_step_on_an_h100(consumers, lo):
-    """The fed walk compiled and run on an H100, where the interpreter's no-op waits are real, its program
-    compiled in a tier's prepare (`ahead_arm`)."""
-    p, x = _fed_operands()
-    got = ahead_arm(jax.jit(functools.partial(_fed_products, interpret=False, consumers=consumers, lo=lo)),
-                    f"a fed walk's products: {consumers} consumers from {lo}")(p, x)
-    for value, expected in zip(got, _fed_expected(p, x), strict=True):
-        np.testing.assert_array_equal(np.asarray(value), expected)
-
-
 @pytest.mark.parametrize("unrolled", [False, True])
 @pytest.mark.parametrize("stages", [2, 3, 4, 5])
 def test_a_walk_takes_each_step_of_its_range_once_in_order_at_its_turn(stages, unrolled):
@@ -937,13 +762,15 @@ def _padded(rows: int, family) -> int:
 
 
 def _persisted_products(x, w, *, family, interpret, rows: int | None = None, resident: int = 1,
-                        staging: tuple[int, int] | None = None):
+                        staging: tuple[int, int] | None = None, consumers: int = 1):
     """`x @ w` a tile at a time through `family`'s persistent walk (`Family.persist`): each tile the
     family's least rows covering `rows` (its own least where None; `_padded`), of which it stores `rows`,
     tile `t` the tiles' rows `t` on, each step `PERSISTED_DEPTH` of the contraction, the middle tile
     multiplying nothing (zeros); each tile issued (`issue`'s walk) and finished (`Issuer.chunks`, each
     chunk stored at its columns), on the family's roles, launched for `resident` programs a multiprocessor,
-    its output staged in `staging`'s chunk columns and buffers (`stores.output_staging`'s by default)."""
+    its output staged in `staging`'s chunk columns and buffers (`stores.output_staging`'s by default).
+    Two `consumers` each walk every tile, and the first alone stores it, as a balanced tail's last program
+    to arrive does."""
     stored = family.rows if rows is None else rows
     rows, columns = _padded(stored, family), w.shape[1]
     family = family.specialized(rows, columns)
@@ -963,21 +790,25 @@ def _persisted_products(x, w, *, family, interpret, rows: int | None = None, res
                 return walk(_multiplying(family, 'x', 'w', interpret), None, (shape,))[1]
 
             def finish(wg, tile, accs, store, *, active):
-                del wg, active
-                for first, (value,) in family.chunks(accs):
-                    store(0, value, o_gmem, (tile * rows, 0, stored, first, rows))
+                del active
 
-            family.persist(streams, (PERSISTED_TILES,), schedule, issue, finish, consumers=1, axis="programs",
-                           outputs=((shape, jnp.float32),), interpret=interpret, accumulators=(shape,),
-                           chunks=staging)
+                def stored_tile():
+                    for first, (value,) in family.chunks(accs):
+                        store(0, value, o_gmem, (tile * rows, 0, stored, first, rows))
 
-        family.scoped(scope, streams=family.streams(blocks, 2, 1))
+                pl.when(wg == 0)(stored_tile)
+
+            family.persist(streams, (PERSISTED_TILES,), schedule, issue, finish, consumers=consumers,
+                           axis="programs", outputs=((shape, jnp.float32),), interpret=interpret,
+                           accumulators=(shape,), chunks=staging)
+
+        family.scoped(scope, streams=family.streams(blocks, 2, consumers))
 
     # Its outputs as its operands' axes where its rows are `x`'s (`outputs.Output`), padded past them a shape.
     out = (outputs.output(jnp.float32, outputs.axis(x, 0), outputs.axis(w, 1))
            if x.shape[0] == PERSISTED_TILES * rows else
            jax.ShapeDtypeStruct((PERSISTED_TILES * rows, columns), jnp.float32))
-    return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
+    return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=consumers,
                          interpret=interpret, name="persisted", resident=resident)(x, w)
 
 
@@ -989,6 +820,24 @@ def _persisted_operands(rows: int):
     x = rng.integers(-4, 4, (PERSISTED_TILES * rows, depth)).astype(jnp.bfloat16)
     w = rng.integers(-4, 4, (depth, 128)).astype(jnp.bfloat16)
     return x, w
+
+
+def _persisted_expected(x, w, rows: int) -> np.ndarray:
+    """`_persisted_products`' value: each tile's rows its product, the middle tile's zeros."""
+    expected = np.asarray(x, np.float32) @ np.asarray(w, np.float32)
+    expected[rows:2 * rows] = 0
+    return expected
+
+
+@INTERPRETS
+def test_two_mma_sync_consumers_finish_each_tile_when_one_alone_stores_it():
+    """Interpreted: two mma.sync consumers' persistent tiles, each finished by both and stored by the first
+    alone (a balanced tail's last program to arrive for one consumer): every tile stored, exactly `x @ w`
+    (the store's own collective scope waited for a consumer that never stores, and hung)."""
+    family = bundles.named("mma.sync", jnp.bfloat16, None)
+    x, w = _persisted_operands(family.rows)
+    got = _persisted_products(x, w, family=family, interpret=INTERPRETED, consumers=2)
+    np.testing.assert_array_equal(np.asarray(got), _persisted_expected(x, w, family.rows))
 
 
 def test_a_kernels_outputs_stated_as_its_operands_axes_are_stated_on_its_call():
@@ -1043,9 +892,7 @@ def test_tcgen05_tiles_walk_into_tensor_memory_and_their_epilogue_reads_it_out_i
     x, w = _persisted_operands(family.rows)
     with generation.assumed("sm100"):
         got = np.asarray(_persisted_products(x, w, family=family, interpret=INTERPRETED, staging=staging))
-    expected = np.asarray(x, np.float32) @ np.asarray(w, np.float32)
-    expected[family.rows:2 * family.rows] = 0
-    np.testing.assert_array_equal(got, expected)
+    np.testing.assert_array_equal(got, _persisted_expected(x, w, family.rows))
 
 
 def test_a_tcgen05_tiles_stated_chunk_holds_no_more_than_the_piece_its_epilogue_reads_out():
@@ -1298,9 +1145,7 @@ def test_a_tpu_core_walks_the_persistent_tiles_interpreted():
     x, w = _persisted_operands(family.rows)
     with on_the_host():
         got = np.asarray(_persisted_products(x, w, family=family, interpret=True))
-    expected = np.asarray(x, np.float32) @ np.asarray(w, np.float32)
-    expected[family.rows:2 * family.rows] = 0
-    np.testing.assert_array_equal(got, expected)
+    np.testing.assert_array_equal(got, _persisted_expected(x, w, family.rows))
 
 
 def test_the_tpu_persistent_walk_lowers_for_a_v5e():
@@ -1797,6 +1642,82 @@ def test_groups_summed_together_on_tcgen05_issue_every_product_before_one_commit
     assert order[first + 3:first + 5] == ["tcgen05_commit_arrive", "barrier_wait"], order
 
 
+def _staged_three(x, *, interpret: bool, batched: bool, aliased: bool = False):
+    """`x` (16 x 64), twice and thrice it, staged in bf16 by an mma.sync issuer whose warps split a tile's
+    columns (its stores bracketed by its own barriers), in one batch (`Family.staged_all`) or a store apiece
+    (`Family.staged`), and each read back; `aliased`, its first buffer given twice."""
+    family = bundles.named("mma.sync", jnp.bfloat16, None).specialized(16, 64)
+
+    def body(x_gmem, *outs):
+        def scoped(*buffers):
+            value = x_gmem[...] if interpret else family.zeros((16, 64))
+            targets = (buffers[0], buffers[0], buffers[2]) if aliased else buffers
+            pairs = [(value * times, buffer) for times, buffer in zip((1, 2, 3), targets, strict=True)]
+            if batched:
+                family.staged_all(pairs)
+            else:
+                for each, buffer in pairs:
+                    family.staged(each, buffer)
+            if interpret:
+                for out, buffer in zip(outs, buffers, strict=True):
+                    out[...] = family.tile_of(buffer).astype(jnp.float32)
+
+        pl.run_scoped(scoped, *(plgpu.SMEM((16, 64), jnp.bfloat16) for _ in range(3)))
+
+    out = jax.ShapeDtypeStruct((16, 64), jnp.float32)
+    return family.kernel(body, out_type=(out,) * 3, grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=interpret, name="staged")(x)
+
+
+@INTERPRETS
+def test_a_staged_batch_holds_each_value_in_its_buffer():
+    """Interpreted: three values staged in one batch (`Family.staged_all`) read back exactly from their own
+    buffers."""
+    x = jax.random.randint(jax.random.key(7), (16, 64), -4, 4).astype(jnp.float32)
+    got = _staged_three(x, interpret=INTERPRETED, batched=True)
+    for times, value in zip((1, 2, 3), got, strict=True):
+        np.testing.assert_array_equal(np.asarray(value), times * np.asarray(x))
+
+
+def _barriers(call) -> int:
+    """The barriers (`gpu.barrier`, `nvvm.barrier`) in the typed module `call` lowers to for an A100."""
+    import jax.experimental.mosaic.gpu as mgpu
+    from kernel_compile import lowered_for
+
+    from dew.nn.kernels.lowered import kernel_calls
+
+    lowered = lowered_for(call, (jax.ShapeDtypeStruct((16, 64), jnp.float32),), "sm80")
+    (kernel,) = [each for each in kernel_calls(lowered) if each.kind == "mosaic_gpu"]
+    module = mgpu.deserialized(kernel.ir)
+    pending, found = [module.operation], 0
+    with module.context:
+        while pending:
+            for region in pending.pop().regions:
+                for block in region.blocks:
+                    for inner in block.operations:
+                        found += inner.operation.name in ("gpu.barrier", "nvvm.barrier")
+                        pending.append(inner.operation)
+    return found
+
+
+@COMPILES_ON_CPU
+def test_an_mma_sync_staged_batch_takes_one_barrier_pair_where_its_stores_took_one_each():
+    """Lowered for an A100: three tiles staged by an mma.sync issuer whose warps split a tile's columns take
+    one pair of warpgroup barriers in one batch (`Family.staged_all`), four fewer than a store apiece's pair
+    each (`staged`; a Kimi intra step's 20 a trip, FS-INTRA-BAR1)."""
+    apiece, batch = (_barriers(functools.partial(_staged_three, interpret=False, batched=batched))
+                     for batched in (False, True))
+    assert batch >= 2 and apiece - batch == 4, (apiece, batch)
+
+
+def test_a_staged_batch_refuses_a_buffer_twice():
+    """A batch given one shared-memory buffer twice is refused as it traces, before any store: its stores go
+    unbracketed against each other."""
+    with generation.assumed("sm80"), pytest.raises(ValueError):
+        jax.make_jaxpr(functools.partial(_staged_three, interpret=False, batched=True, aliased=True))(
+            jax.ShapeDtypeStruct((16, 64), jnp.float32))
+
+
 def _staged_together(x, w, *, interpret, shared: bool):
     """`x_0 @ w_0` and `2 x_0 @ w_0` on tcgen05's chunks, summed together by one prepared-operand issuer
     (`operands.Issuer.summed_together`): each group's left operand a register value its product name stages
@@ -1987,9 +1908,10 @@ def test_an_mma_sync_walks_shared_memory_is_what_its_pipeline_scopes_for_its_cop
     device the family runs on makes (`CpAsync.lifetimes`, read from JAX's own builder, row 6135): a slot of
     each block a stage and no barrier, whatever GPU is assumed (an sm120, whose copies would be TMA's and
     take a barrier a stage, runs no mma.sync on cp.async: `bundles.legal`); a walk of fewer steps than stages
-    as many slots as steps, also planned inside a jit's trace over a mesh of its own. That the plan is the
-    kernel's own allocation the compile gate checks of every launch (`kernel_compile.mosaic_failures`: its
-    planned shared bytes against those the compiled kernel asks for)."""
+    as many slots as steps, also planned inside a jit's trace over a mesh of its own; two consumers running
+    it together, the two barriers they meet at, as the builder scopes them for its thread axis. That the plan
+    is the kernel's own allocation the compile gate checks of every launch (`kernel_compile.mosaic_failures`:
+    its planned shared bytes against those the compiled kernel asks for)."""
     family = bundles.named("mma.sync", jnp.bfloat16, None)
     streams = family.streams({"lhs": ((64, 32), jnp.bfloat16), "rhs": ((32, 64), jnp.bfloat16)}, 3, 1)
 
@@ -2001,6 +1923,9 @@ def test_an_mma_sync_walks_shared_memory_is_what_its_pipeline_scopes_for_its_cop
     for target in ("sm80", "sm120"):
         with generation.assumed(target):
             assert walked() == ([(3, 64, 32), (3, 32, 64)], []), target
+    streams = family.streams({"lhs": ((64, 32), jnp.bfloat16), "rhs": ((32, 64), jnp.bfloat16)}, 3, 2)
+    assert walked() == ([(3, 64, 32), (3, 32, 64)], [2])
+    streams = family.streams({"lhs": ((64, 32), jnp.bfloat16), "rhs": ((32, 64), jnp.bfloat16)}, 3, 1)
     planned = []
     mesh = Mesh(np.array(jax.devices("cpu")[:1]), ("data",))
     with jax.set_mesh(mesh):

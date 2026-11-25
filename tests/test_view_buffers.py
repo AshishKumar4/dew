@@ -36,10 +36,13 @@ PROGRAMS = {"the sum the result": (_summed_with_its_reverse, lambda a: -(a + a[:
 
 def a_value_read_through_a_reversed_view_is_summed_exactly(program: str) -> None:
     """`program` compiled once on this process's default device and run three times, each run its exact
-    integer result."""
+    integer result: an arm with no site (`reference_error.ahead_arm`), in a GPU tier part prepared into its
+    store and run from it (row 11859: compiled where its run held the GPU), elsewhere the program jitted."""
+    from reference_error import ahead_arm
+
     fn, result = PROGRAMS[program]
     a = np.arange(SIZE, dtype=np.int32)
-    run = jax.jit(fn)
+    run = ahead_arm(jax.jit(fn), f"a reversed view's sum: {program}")
     want = result(a)
     for _ in range(3):
         got = np.asarray(run(a))

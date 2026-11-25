@@ -5,13 +5,16 @@ import functools
 import itertools
 import json
 import os
+import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import jax
 import pytest
 import tier_wire
+import truths_ahead
 from armada_support import LANE_TEST, cached, fetcher, gpu_driver, gpu_lane_at, interpreter, loaded
 from tool_support import load
 
@@ -138,7 +141,8 @@ def test_a_lanes_prepare_runs_on_the_cpu_what_its_run_will_hold_and_records_noth
         "    with open(f'{kind}.log', 'a') as log:\n"
         "        log.write(' '.join([name, os.environ.get('JAX_PLATFORMS', '-'),\n"
         f"                            os.environ.get('{tier_wire.TRUTHS}', '-'),\n"
-        f"                            os.environ.get('{tier_wire.UNIT}', '-')]) + chr(10))\n"
+        f"                            os.environ.get('{tier_wire.UNIT}', '-'),\n"
+        f"                            os.environ.get('{tier_wire.PREPARE_BY}') or '-']) + chr(10))\n"
         + "".join(f"{'@pytest.mark.prepares' + chr(10) if index % 2 else ''}"
                   f"def test_{index}():\n    said('test_{index}')\n" for index in range(6)))
     (tmp_path / "tests/test_plain.py").write_text(LANE_TEST)
@@ -157,6 +161,8 @@ def test_a_lanes_prepare_runs_on_the_cpu_what_its_run_will_hold_and_records_noth
     (resume / "progress.jsonl").write_text(
         json.dumps({"node": "tests/test_flows.py::test_1", "seconds": 1.0}) + "\n")
     monkeypatch.setenv("ARMADA_RESUME", str(resume))
+    # A cap the lane's own environment carries, expired: its prepare clears it.
+    monkeypatch.setenv(tier_wire.PREPARE_BY, "1.0")
     prepared = {}
     for group in ("1/2", "2/2"):
         name = f"tests/test_flows.py#{group}"
@@ -164,8 +170,9 @@ def test_a_lanes_prepare_runs_on_the_cpu_what_its_run_will_hold_and_records_noth
         assert [(row["name"], row["exitCode"]) for row in json.loads(out.read_text())["rows"]] == [
             (f"3.12:{name}", 0), ("3.12:tests/test_plain.py", 0)]
         lines = said("prepared")
-        # Each told the unit it prepares, as the lane names it, under which its programs' memory is filed.
-        assert {tuple(line[1:]) for line in lines} == {("cpu", str(tmp_path / "truths"), name)}
+        # Each told the unit it prepares, as the lane names it, under which its programs' memory is filed;
+        # no time cap, as its run reads every program it prepares (only a dry prepare's is capped).
+        assert {tuple(line[1:]) for line in lines} == {("cpu", str(tmp_path / "truths"), name, "-")}
         prepared[group] = {line[0] for line in lines}
     assert fetched.is_file() and not lane_runs(tmp_path, "test_plain"), "one that prepares nothing is skipped"
     assert not stored, "a prepare records no row"
@@ -177,6 +184,604 @@ def test_a_lanes_prepare_runs_on_the_cpu_what_its_run_will_hold_and_records_noth
                            deadline=600.0) == 0
         assert {line[0] for line in said("ran")} & marked == prepared[group], group
     assert stored, "its run's rows are recorded as any lane's"
+
+
+VAE_FILE = (
+    "import os, pytest\nfrom pathlib import Path\n"
+    "pytestmark = pytest.mark.gpu(reason='its kernels')\n"
+    "def said(name):\n"
+    "    with open('prepared.log', 'a') as log:\n"
+    "        log.write(' '.join([name, os.environ['JAX_PLATFORMS'],\n"
+    f"            os.environ['{tier_wire.PREPARE}'], Path(os.environ['{tier_wire.TOPOLOGY}']).read_text(),\n"
+    f"            os.environ['{tier_wire.UNIT}'],\n"
+    "            os.environ.get('DEW_TEST_USERS_ARITHMETIC', '-')]) + chr(10))\n"
+    "@pytest.mark.crashes\ndef test_encodes():\n    said('test_encodes')\n"
+    "def test_decodes():\n    said('test_decodes')\n"
+    "@pytest.mark.users_process\ndef test_as_a_user():\n    said('test_as_a_user')\n")
+"""A GPU tier file: a test whose prepare fails before its first check-1 site, one that prepares, and one of
+a user's process, each saying the word, platform, GPU, unit and arithmetic it prepared under."""
+
+UNPREPARING = (
+    "import json, os, pytest\nfrom pathlib import Path\n"
+    "def pytest_configure(config):\n"
+    "    for mark in ('gpu', 'crashes', 'users_process'):\n"
+    "        config.addinivalue_line('markers', mark)\n"
+    "def pytest_runtest_setup(item):\n"
+    "    users = os.environ.get('DEW_TEST_USERS_ARITHMETIC') == '1'\n"
+    "    if users != (item.get_closest_marker('users_process') is not None):\n"
+    "        pytest.skip('runs in the other process')\n"
+    "def pytest_runtest_call(item):\n"
+    f"    if os.environ.get('{tier_wire.PREPARE}') == '1' and item.get_closest_marker('crashes'):\n"
+    f"        store = Path(os.environ['{tier_wire.TRUTHS}']) / 'sites' / item.name\n"
+    "        store.mkdir(parents=True)\n"
+    f"        (store / '{tier_wire.UNPREPARED}').write_text(json.dumps({{'test': item.nodeid, "
+    "'where': 'tests/test_gpu_vae.py:9', 'error': 'lowered for the CPU', 'reasons': []}))\n"
+    "        pytest.skip('computes before its first check-1 site')\n")
+"""The suite's conftest's side, as tests/conftest.py has it: a GPU test runs in its own process's variant
+alone, and a test that fails in its prepare before its first site is recorded unprepared and skipped."""
+
+
+def dry_checkout(root: Path) -> None:
+    """A checkout at `root` holding a dry prepare's recipe (prepares.py's `RECIPE`), its topology's writer
+    (which writes the generation's name), the suite's side (`UNPREPARING`) and a GPU tier file
+    (`VAE_FILE`)."""
+    for name in ("tools/armada/prepares.py", "tests/tier_wire.py"):
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_text("")
+    (root / "tests/generation_support.py").write_text(
+        "def node_topology(path, gpu):\n    path.write_text(gpu)\n    return path\n")
+    (root / "tests/conftest.py").write_text(UNPREPARING)
+    (root / "tests/test_gpu_vae.py").write_text(VAE_FILE)
+
+
+def test_a_dry_prepare_runs_the_tiers_processes_for_one_compile_only_gpu_and_keeps_what_they_left_unprepared(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A dry prepare (`dry_prepared`) runs a GPU tier file's processes as the tier's part does (prepares.py's
+    `process`): on the CPU under the prepare's word, for a node's topology of one GPU of its row's
+    generation, each under its row's name as its unit, a user's process under a user's arithmetic, into a
+    store of its own. Each row keeps the cells it left unprepared, is green where main has no run of it to
+    hold it to (`BOOTSTRAP`), and is recorded as any row, so its next run on the same inputs reuses it,
+    preparing nothing."""
+    url, stored, _ = cache_worker
+    cached(monkeypatch, url)
+    monkeypatch.setattr(ci, "mainline", lambda: "f" * 40)
+    interpreter(tmp_path, "3.12")
+    dry_checkout(tmp_path)
+    out, log = tmp_path / "verdict.json", tmp_path / "prepared.log"
+    lane, users = "3.12:tests/test_gpu_vae.py#@prepare-sm90", "3.12:tests/test_gpu_vae.py#@prepare-sm90-users"
+    encodes = "tests/test_gpu_vae.py::test_encodes @ tests/test_gpu_vae.py:9"
+    expected = {"@prepare-sm90": [(lane, 0, [encodes])],
+                "@prepare-sm90-users": [(users, 0, [])]}
+    for split, rows in expected.items():
+        assert ci.dry_prepared("3.12", ["prepare:tests/test_gpu_vae.py"], split, out, 600.0, "on") == 0
+        assert [(row["name"], row["exitCode"], row["unprepared"])
+                for row in json.loads(out.read_text())["rows"]] == rows
+    assert stored
+    assert sorted(log.read_text().splitlines()) == [
+        f"test_as_a_user cpu 1 sm90 {users} 1", f"test_decodes cpu 1 sm90 {lane} -"]
+    log.unlink()
+    for split, rows in expected.items():
+        assert ci.dry_prepared("3.12", ["prepare:tests/test_gpu_vae.py"], split, out, 600.0, "on") == 0
+        assert [(row["name"], row["exitCode"], row["unprepared"])
+                for row in json.loads(out.read_text())["rows"]] == rows
+    assert not log.exists(), "each row was reused from its record"
+
+
+def test_a_flows_deferred_cell_is_read_unprepared_and_a_row_left_no_time_is_stale(ci, tmp_path):
+    """A dry prepare reads a flow's cell its prepare deferred to its run (tests/tier_wire.py's `DEFERRED`,
+    which the run names unprepared) as unprepared, beside the tests recorded so (`UNPREPARED`), each with its
+    first reason (prepares.py's `unprepared_in`); and a task with no time left for its rows says each stale,
+    none started (prepares.py's `run`), the plan's next run of it its grade."""
+    store = tmp_path / "sites"
+    flow, encodes = "tests/test_gpu_vae.py::test_flow", "tests/test_gpu_vae.py::test_encodes"
+    for name, test, record, cells in (("a", flow, ci.tier_wire().DEFERRED, ("one", "two")),
+                                      ("b", encodes, ci.tier_wire().UNPREPARED, (None,))):
+        for cell in cells:
+            truths_ahead.reasoned(store / name / record, test, "tests/test_gpu_vae.py:9",
+                                  f"{cell or 'a site'}: lowered", cell)
+    found = ci.prepares.unprepared_in(tmp_path, (ci.tier_wire().UNPREPARED, ci.tier_wire().DEFERRED),
+                                      ci.grading.owning)
+    # The flow's two cells deferred at one line are each their own.
+    assert sorted(ci.prepares.identity(record) for record in found["tests/test_gpu_vae.py"]) == [
+        f"{encodes} @ tests/test_gpu_vae.py:9", f"{flow} @ tests/test_gpu_vae.py:9 [one]",
+        f"{flow} @ tests/test_gpu_vae.py:9 [two]"]
+    out = tmp_path / "verdict.json"
+    assert ci.prepares.run(ci, "3.12", ["prepare:tests/test_gpu_vae.py"], "@prepare-sm90", out, 1.0,
+                           "off") == 3
+    [row] = json.loads(out.read_text())["rows"]
+    assert (row["name"], row["kind"]) == ("3.12:tests/test_gpu_vae.py#@prepare-sm90", ci.grading.STALE)
+
+
+def test_a_dry_prepares_row_is_red_for_each_cell_it_left_unprepared_that_mains_run_did_not(ci):
+    """A dry prepare's row (prepares.py's `graded`) is red where it left a cell unprepared that main's run of
+    the row did not (its test and where in it: one deferred cell of a test is no mask for a sibling), its
+    new cells its `new_unprepared`, whether this run prepared it (the store's records) or it was reused
+    (its record's kept list, read again against the baseline that stands now), red as its group as it ran;
+    main with no run of it (`BOOTSTRAP`) reds none; main's not read whole (`UNREAD`) says a row that left
+    any unprepared stale, never green, and one that left none green; a row red already stays red, and a
+    stale one stays stale."""
+    name = "3.12:tests/test_gpu_vae.py#@prepare-sm90"
+    held = [{"test": "tests/test_gpu_vae.py::test_flow", "where": where, "error": "lowered"}
+            for where in ("cell one", "cell two")]
+    cells = [ci.prepares.identity(record) for record in held]
+
+    def graded(before, code=0, reused=False, records=held, kind=None):
+        found = {"name": name, "exitCode": code, "output": "", **({"kind": kind} if kind else {}),
+                 **({"unprepared": [ci.prepares.identity(record) for record in records]} if reused else {})}
+        [row] = ci.prepares.graded([found], {} if reused else {"tests/test_gpu_vae.py": records}, before,
+                                   "sm90", lambda named: ci.grading.owning(ci.parsed_row(named)[1]),
+                                   ci.grading.STALE, ci.tier_wire().CAPPED)
+        return row
+    for reused in (False, True):
+        red = graded({cells[0]}, reused=reused)
+        assert (red["exitCode"], red["kind"], red["failed"]) == (1, "group", [])
+        assert (red["unprepared"], red["new_unprepared"]) == (sorted(cells), [cells[1]])
+        greens = [graded(before, reused=reused)["exitCode"] for before in (set(cells), ci.prepares.BOOTSTRAP)]
+        assert greens == [0, 0]
+        unread = graded(ci.prepares.UNREAD, reused=reused)
+        assert (unread["exitCode"], unread["kind"]) == (1, ci.grading.STALE)
+        assert graded(ci.prepares.UNREAD, reused=reused, records=[])["exitCode"] == 0
+    assert graded(set(cells), code=1)["exitCode"] == 1
+    assert graded(set(cells), code=1, kind=ci.grading.STALE)["kind"] == ci.grading.STALE
+
+
+def test_a_cell_its_prepares_cap_left_is_named_and_counted_but_reds_no_row(ci):
+    """A cell a dry prepare's cap left unprepared (tests/tier_wire.py's `CAPPED`, its where exactly) is named
+    among its row's unprepared and counted apart (`capped`, its output; kept as the row is reused), but no
+    red of its row against main's run, nor stale where main's is unread (prepares.py's `graded`): its
+    prepare's time, no fault of the test. A cell left otherwise stays red, and one whose node id merely
+    holds the cap's words is no capped cell."""
+    name = "3.12:tests/test_gpu_vae.py#@prepare-sm90"
+    wire = ci.tier_wire()
+    capped = {"test": "tests/test_gpu_vae.py::test_flow", "where": wire.CAPPED, "error": "capped",
+              "cell": "two"}
+    lowered = {"test": "tests/test_gpu_vae.py::test_flow", "where": "cell one", "error": "lowered"}
+    named = {"test": f"tests/test_gpu_vae.py::test_flow[x @ {wire.CAPPED}]", "where": "a site", "error": "e"}
+
+    def graded(records, before=frozenset(), found=None):
+        found = found or {"name": name, "exitCode": 0, "output": "ran"}
+        [row] = ci.prepares.graded(
+            [found], {} if "unprepared" in found else {"tests/test_gpu_vae.py": records},
+            before if isinstance(before, str) else set(before), "sm90",
+            lambda named_: ci.grading.owning(ci.parsed_row(named_)[1]), ci.grading.STALE, wire.CAPPED)
+        return row
+    row = graded([capped])
+    assert (row["exitCode"], row["unprepared"], row["capped"]) == (
+        0, [ci.prepares.identity(capped)], [ci.prepares.identity(capped)])
+    assert ci.prepares.identity(capped) in row["output"] and row["output"].endswith("ran")
+    # Reused from its record (the row as it was rendered): its capped cells kept, still judged by neither,
+    # its banner said once.
+    reused = graded([], found=row)
+    assert (reused["exitCode"], reused["capped"], reused["output"]) == (0, row["capped"], row["output"])
+    # Its baseline not written: stale, its cap's fields and banner kept.
+    [unwritten] = ci.unbaselined("3.12", [row], {name})
+    assert (unwritten["kind"], unwritten["capped"], unwritten["unprepared"]) == (
+        ci.grading.STALE, row["capped"], row["unprepared"])
+    assert row["output"] in unwritten["output"]
+    # Main's runs unread: a row that left only capped cells is no stale.
+    assert graded([capped], before=ci.prepares.UNREAD).get("kind") != ci.grading.STALE
+    assert graded([capped, lowered], before=ci.prepares.UNREAD)["kind"] == ci.grading.STALE
+    red = graded([capped, lowered])
+    assert (red["exitCode"], red["new_unprepared"]) == (1, [ci.prepares.identity(lowered)])
+    assert graded([named])["new_unprepared"] == [ci.prepares.identity(named)]
+
+
+@pytest.mark.parametrize("capped", [False, True])
+def test_only_a_dry_prepare_runs_under_a_time_cap(ci, tmp_path, monkeypatch, capped):
+    """A dry prepare's process (prepares.py's `process`, `capped`) runs under a cap (tests/tier_wire.py's
+    `PREPARE_BY`, on the monotonic clock) its end's margin short of the time it has, past which it starts
+    nothing more; a GPU tier part's prepare (ci.py's `gpu_prepared`), whose run reads every program it
+    prepares, never."""
+    import time
+
+    seen = {}
+
+    def tested(python, files, group, verdict, seconds, *args, **kwargs):
+        seen["seconds"], seen["environ"] = seconds, args[3]
+        return 0
+    monkeypatch.setattr(ci, "tested", tested)
+    began = time.monotonic()
+    ci.prepares.process(ci, "3.12", "tests/test_gpu_vae.py", "", tmp_path / "v.json", 1500.0, unit="u",
+                        threads="1", users=False, variant="@prepare-sm90", capped=capped)
+    wire = ci.tier_wire()
+    if not capped:
+        # Cleared, so a cap the caller's environment carries reaches no part's prepare.
+        assert seen["environ"][wire.PREPARE_BY] == "" and not wire.past_cap(seen["environ"])
+        return
+    cap = float(seen["environ"][wire.PREPARE_BY])
+    assert began + seen["seconds"] - ci.prepares.CAP_MARGIN <= cap <= time.monotonic() + seen["seconds"]
+
+
+def cgroup_tree(root, levels):
+    """A cgroup (v2) hierarchy under `root` this process is a member of, `levels` from the root down: each a
+    memory limit (None: `max`), a charge and its inactive page cache, in bytes. Its membership's text."""
+    group = root
+    for index, (limit, current, inactive) in enumerate(levels):
+        group = group / f"level{index}" if index else group
+        group.mkdir(parents=True, exist_ok=True)
+        (group / "memory.max").write_text("max\n" if limit is None else f"{limit}\n")
+        (group / "memory.current").write_text(f"{current}\n")
+        (group / "memory.stat").write_text(f"anon {current}\ninactive_file {inactive}\n")
+    return "0::/" + "/".join(f"level{index}" for index in range(1, len(levels))) + "\n"
+
+
+@pytest.mark.parametrize(("levels", "past"), [
+    # The task's own cgroup unlimited, its parent's limit binding: its working set past the share.
+    ([(None, 0, 0), (10_000, 9_000, 1_000), (None, 8_000, 0)], True),
+    # Its charge past the share, but most of it page cache the kernel reclaims first.
+    ([(None, 0, 0), (10_000, 9_000, 4_000), (None, 5_000, 0)], False),
+    # Under every limit's share.
+    ([(None, 0, 0), (10_000, 6_000, 0), (8_000, 5_000, 0)], False),
+    # No level states a limit.
+    ([(None, 0, 0), (None, 9_000, 0)], False),
+])
+def test_a_dry_prepare_is_past_its_memory_cap_where_a_limit_binding_its_task_is_mostly_held(
+        ci, tmp_path, monkeypatch, levels, past):
+    """A dry prepare's task (prepares.py's `process`) caps the working set of each cgroup level binding it,
+    its own or an ancestor's under DEW_CGROUP_ROOT, at `HELD_SHARE` of that level's limit
+    (tests/tier_wire.py's `PREPARE_HOLDS`), and its pytest is past its cap (`past_cap`) where any level holds
+    more (its charge less its inactive page cache): every process under it counts, a flow's own beside the
+    prepare's. The limits are read by the task, the pytest reading only what each level holds, so no limit
+    keys its rows; a part's prepare runs under no such cap."""
+    # A cgroup's name may hold the path separator the old wire split on.
+    root = tmp_path / "worker:prepare"
+    membership = tmp_path / "cgroup"
+    membership.write_text(cgroup_tree(root, levels))
+    reader = ci.host.cgroups()
+    real_own = reader.own
+    monkeypatch.setattr(reader, "own", lambda root: real_own(root, membership))
+    monkeypatch.setenv("DEW_CGROUP_ROOT", str(root))
+    seen = []
+
+    def tested(python, files, group, verdict, seconds, *args, **kwargs):
+        seen.append(args[3])
+        return 0
+    monkeypatch.setattr(ci, "tested", tested)
+    for capped in (True, False):
+        ci.prepares.process(ci, "3.12", "tests/test_gpu_vae.py", "", tmp_path / "v.json", 1500.0, unit="u",
+                            threads="1", users=False, variant="@prepare-sm90", capped=capped)
+    dry, part = (environ[tier_wire.PREPARE_HOLDS] for environ in seen)
+    # The pytest reads no limit: with every `memory.max` gone it judges alike.
+    for limit in root.rglob("memory.max"):
+        limit.unlink()
+    assert part == "" and tier_wire.past_cap({tier_wire.PREPARE_HOLDS: dry}) is past
+
+
+def test_the_plan_prepares_each_gpu_tier_file_dry_for_each_generation(ci, tmp_path):
+    """The plan's dry prepares (prepares.py's `entries`): each file holding a `gpu`-marked test (a mark in a
+    string is none) for each generation of `PREPARED` (sm90 alone at first), its lane's process and, where it
+    holds a test of a user's process, that process's, each row a task of its own whose tests name it as a
+    prepare's (`TOKEN`), weighed by its row's last seconds or `PREPARE_SECONDS`."""
+    dry_checkout(tmp_path)
+    (tmp_path / "tests/test_gpu_vae.py").unlink()
+    (tmp_path / "tests/test_gpu_a.py").write_text("import pytest\npytestmark = pytest.mark.gpu\n"
+                                                  "def test_one():\n    pass\n")
+    (tmp_path / "tests/test_b.py").write_text("import pytest\n@pytest.mark.gpu(reason='x')\n"
+                                              "@pytest.mark.users_process\ndef test_one():\n    pass\n")
+    (tmp_path / "tests/test_c.py").write_text("TEXT = 'pytest.mark.gpu'\ndef test_one():\n    pass\n")
+    timed = "3.12:tests/test_gpu_a.py#@prepare-sm90"
+    entries = ci.prepares.entries(ci, "3.12", {"rows": {timed: 41.0}}, 120.0, "on", {"cache": "on"})
+    expected = {timed, "3.12:tests/test_b.py#@prepare-sm90", "3.12:tests/test_b.py#@prepare-sm90-users"}
+    assert {entry["rows"][0]: (entry["tests"], entry["split"]) for entry in entries} == {
+        row: (ci.prepares.TOKEN + row.partition(":")[2].partition("#")[0], row.partition("#")[2])
+        for row in expected}
+    assert {entry["rows"][0]: entry["weight"] for entry in entries} == {
+        row: 41.0 if row == timed else ci.prepares.PREPARE_SECONDS for row in expected}
+    assert all(re.fullmatch(r"[A-Za-z0-9._-]{1,80}", entry["name"]) for entry in entries)
+
+
+def test_a_kept_prepare_rows_token_keeps_its_group_and_a_slow_prepare_is_cut_by_its_work(ci, tmp_path):
+    """A kept dry prepare's token (`kept_token`, its group a process variant's, `@prepare-<gen>`) reads back
+    its file, its whole group and where its green run is kept (`kept_of`, the locator after the last `@`). The
+    plan's dry prepares (`entries`) cut a file by its work, at the plan's target of 120 s each group within
+    480 s (`PREPARE_TARGETS` targets, under `PREPARE_SHARE` of a task's deadline): the rows `measured_cut`
+    sums (`measured_rows`), never an older cut's, and where the longest of them ran out of its time (past
+    `CUT_SHORT` of it) twice what they took, a floor of its work (train 1247: seven groups cut to their whole
+    deadline were killed at it, and timed so, would be cut alike again); never capped by a record's count of
+    its tests. Before any run is timed, one group a `gpu`-marked test of the record."""
+    token = ci.kept_token("tests/test_gpu_a.py", "1/2@prepare-sm90-users", "AuthenticAMD-25-17:feed")
+    assert ci.kept_of([token]) == ([], {("tests/test_gpu_a.py", "1/2@prepare-sm90-users"):
+                                        ("AuthenticAMD-25-17", "feed")})
+    name = "tests/test_gpu_flows_x.py"
+    (tmp_path / name).write_text(FLOWS_FILE.format(flows=6))
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+        {f"{name}::test_flow[{index}]": [0.0, None, 0] for index in range(6)}))
+
+    def planned(rows: dict[str, float]) -> list[str]:
+        found = ci.prepares.entries(ci, "3.12", {"rows": {f"3.12:{name}#{group}@prepare-sm90": seconds
+                                                           for group, seconds in rows.items()}},
+                                    120.0, "off", {})
+        return [entry["split"] for entry in found if entry["tests"] == f"prepare:{name}"]
+    # Timed at two cuts: the two groups' 400 s, one group; the whole file's older 1,583 s, which ran out of
+    # its time, doubles nothing.
+    assert planned({"": 1583.0, "1/2": 200.0, "2/2": 200.0}) == ["@prepare-sm90"]
+    # Two groups killed at their deadline: 6,332 s of work at least, fourteen groups of six tests' record.
+    assert len(planned({"1/2": 1583.0, "2/2": 1583.0})) == 14
+    assert planned({}) == [f"{index}/6@prepare-sm90" for index in range(1, 7)]
+    text = ("import pytest\n@pytest.mark.gpu\ndef test_a(): pass\ndef test_cpu(): pass\n"
+            "@pytest.mark.gpu(reason='x')\nclass TestB:\n"
+            "    def test_b(self): pass\n    def test_c(self): pass\n"
+            "@pytest.mark.parametrize('x', [pytest.param(1, marks=pytest.mark.gpu)])\ndef test_d(x): pass\n")
+    assert ci.prepares.marked_tests(text, "gpu") == {"test_a", "TestB::test_b", "TestB::test_c", "test_d"}
+    # Counted by the record's node ids, each parameter its own; its marked functions where it holds none.
+    nodes = ["tests/x.py::test_a[1]", "tests/x.py::test_a[2]", "tests/x.py::test_cpu",
+             "tests/x.py::TestB::test_b"]
+    assert ci.prepares.gpu_tests("tests/x.py", text, nodes) == 3
+    assert ci.prepares.gpu_tests("tests/x.py", text, []) == 4
+
+
+FLOWS_FILE = (
+    "import pytest\n"
+    "def said(name):\n"
+    "    with open('prepared.log', 'a') as log:\n"
+    "        log.write(name + chr(10))\n"
+    "def test_cpu():\n    said('test_cpu')\n"
+    "@pytest.mark.gpu\n@pytest.mark.parametrize('index', range({flows}))\n"
+    "def test_flow(index):\n    said(f'test_flow[{{index}}]')\n")
+"""A GPU tier file of `flows` parametrized GPU flows and one CPU test, each saying it ran."""
+
+
+def test_a_dry_prepares_groups_are_its_tests_by_count_in_its_task_and_its_key(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A dry prepare's groups (`1/3@prepare-sm90`) are its file's tests cut by their count (prepares.py's
+    `prepared_cut`): in its task, whose split takes its cut from its row's variant alone
+    (`session.SPLIT_EVENLY`), and in its key (`members`), so its row is reused for the tests it holds. Not by
+    the durations record, which times its GPU tests at nothing on the CPU (train 1247: 18 flows cut 5, 13 and
+    16 empty groups), nor by a stored cut of the file, which here packs four flows into one group. A file
+    whose collection is not its record's tests (a parameter added, or removed) runs its groups as collected,
+    each recorded with no key; a group its cut leaves no test is green at no seconds (`nothing_timed`)."""
+    url, stored, _ = cache_worker
+    cached(monkeypatch, url)
+    monkeypatch.setattr(ci, "mainline", lambda: "f" * 40)
+    interpreter(tmp_path, "3.12")
+    dry_checkout(tmp_path)
+    name = "tests/test_gpu_flows_x.py"
+    (tmp_path / name).write_text(FLOWS_FILE.format(flows=6))
+    nodes = [f"{name}::test_cpu", *(f"{name}::test_flow[{index}]" for index in range(6))]
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+        {node: [0.002 if node.endswith("[1]") else 0.0, None, 0] for node in nodes}))
+    (tmp_path / "tests/test_cuts.json").write_text(json.dumps({name: [nodes[5], nodes[6]]}))
+    out, log = tmp_path / "verdict.json", tmp_path / "prepared.log"
+
+    def ran(group: str) -> tuple[list[str], dict]:
+        log.unlink(missing_ok=True)
+        assert ci.dry_prepared("3.12", [f"prepare:{name}"], f"{group}@prepare-sm90", out, 600.0, "on") == 0
+        [row] = json.loads(out.read_text())["rows"]
+        assert (row["name"], row["exitCode"]) == (f"3.12:{name}#{group}@prepare-sm90", 0)
+        return sorted(log.read_text().split()) if log.exists() else [], row
+
+    def record(group: str) -> dict:
+        return json.loads(stored["/" + ci.record_key("3.12", f"3.12:{name}#{group}@prepare-sm90",
+                                                     ci.run_keys.device_class())])
+
+    assert [ran(f"{index}/3")[0] for index in range(1, 4)] == [
+        ["test_cpu", "test_flow[0]"], ["test_flow[1]", "test_flow[2]"],
+        ["test_flow[3]", "test_flow[4]", "test_flow[5]"]]
+    assert [ci.run_keys.members(name, f"{index}/3", evenly=True) for index in range(1, 4)] == [
+        nodes[:2], nodes[2:4], nodes[4:]]
+    assert record("1/3")["key"] is not None
+    # Its row's tests unchanged, it is reused.
+    assert ran("1/3")[0] == []
+    # A flow collected since, which no record names: its group runs it, its record keeps no key.
+    (tmp_path / name).write_text(FLOWS_FILE.format(flows=7))
+    assert ran("3/3")[0] == ["test_flow[4]", "test_flow[5]", "test_flow[6]"]
+    assert record("3/3")["key"] is None
+    # A flow gone since, which the record still names: its groups run as collected, keyed by none.
+    (tmp_path / name).write_text(FLOWS_FILE.format(flows=5))
+    assert ran("1/3")[0] == ["test_cpu", "test_flow[0]"]
+    assert record("1/3")["key"] is None
+    # Cut finer than it has tests, a group holds none: green at no seconds.
+    found, row = ran("7/7")
+    assert (found, row["seconds"], set(row["timings"].values())) == ([], 0.0, {0.0})
+
+
+def test_a_dry_prepares_baseline_is_mains_whatever_cut_main_made_of_it(ci, monkeypatch):
+    """A dry prepare's baseline (prepares.py's `before`) is every cell main's runs of its file's prepare for
+    its generation and process left unprepared, in one cut main's commit names whole (listed once), so a
+    row this run cut otherwise is held to main's all the same. Main with no run of it at all is
+    `BOOTSTRAP`, as is a run of main's own commit (a train's base), whose baseline it is; else a cut read in
+    part, a Worker that fails, a listing or a read that stalls past its time, a run main named with no
+    baseline, or a time already past, `UNREAD`."""
+    kept = {"3.12:tests/test_gpu_a.py#1/2@prepare-sm90": ["tests/test_gpu_a.py::test_a @ cell"],
+            "3.12:tests/test_gpu_a.py#2/2@prepare-sm90": ["tests/test_gpu_a.py::test_b @ cell"],
+            "3.12:tests/test_gpu_a.py#1/3@prepare-sm90": ["tests/test_gpu_a.py::test_c @ cell"],
+            "3.12:tests/test_gpu_a.py#1/2@prepare-sm80": ["tests/test_gpu_a.py::test_d @ cell"]}
+    named: set[str] = set()
+    stalls: dict[str, float] = {}
+    failing: set[str] = set()
+    shapes: dict[str, object] = {}
+
+    def waited(where: str, until: float) -> None:
+        """A stall at `where`, cut short at `until` as the Worker's request is (r2's `request`)."""
+        stall = stalls.get(where, 0.0)
+        if stall:
+            time.sleep(max(0.0, min(stall, until - time.monotonic())))
+            if time.monotonic() >= until:
+                raise ci.r2.Unavailable(f"{where} timed out")
+
+    class Store:
+        def __init__(self, url: str, token: str, bucket: str, *, timeout: float, send) -> None:
+            self.timeout = timeout
+
+        def keys(self, prefix: str, until: float):
+            waited("keys", until)
+            if "keys" in failing:
+                raise ci.r2.R2Error("the Worker failed")
+            listed = kept if "-baseline/" in prefix else named
+            for row_name in listed if prefix.endswith("tests/test_gpu_a.py/") else []:
+                yield ci.row_place(row_name, "cls").rpartition("/")[2]
+
+        def get(self, key: str, limit: int, until: float) -> bytes | None:
+            waited("get", until)
+            kind, _, place = key.partition("/")
+            if place not in kept:
+                return None
+            found = shapes.get(kind, {"unprepared": kept[place]})
+            return json.dumps(found).encode()
+
+    monkeypatch.setenv("DEW_XLA_CACHE_URL", "http://cache")
+    monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
+    monkeypatch.setattr(ci.r2, "Store", Store)
+    monkeypatch.setattr(ci, "mainline", lambda: "main")
+    monkeypatch.setattr(ci.run_keys, "device_class", lambda: "cls")
+    monkeypatch.setattr(ci, "baseline_key", lambda commit, python, place, held: f"baseline/{place}")
+
+    def before(name: str, group: str, seconds: float = 600.0):
+        return ci.prepares.before(ci, "3.12", name, group, time.monotonic() + seconds)
+
+    # A run of main's own commit (a train's base) is its baseline, whatever main's earlier runs of it
+    # wrote: a cut left part-written (its other group red) holds it to nothing, never stale.
+    monkeypatch.setattr(ci.run_keys, "head_commit", lambda: "main")
+    named.add("3.12:tests/test_gpu_a.py#1/3@prepare-sm90-users")
+    assert before("tests/test_gpu_a.py", "1/3@prepare-sm90-users") == ci.prepares.BOOTSTRAP
+    named.clear()
+    monkeypatch.setattr(ci.run_keys, "head_commit", lambda: "a head")
+
+    assert before("tests/test_gpu_a.py", "@prepare-sm90") == {
+        "tests/test_gpu_a.py::test_a @ cell", "tests/test_gpu_a.py::test_b @ cell"}
+    assert before("tests/test_gpu_a.py", "1/3@prepare-sm90-users") == ci.prepares.BOOTSTRAP
+    assert before("tests/test_gpu_b.py", "@prepare-sm90") == ci.prepares.BOOTSTRAP
+    # A run main named whose baseline is not kept (its write lost) is no first run.
+    named.add("3.12:tests/test_gpu_a.py#1/3@prepare-sm90-users")
+    assert before("tests/test_gpu_a.py", "1/3@prepare-sm90-users") == ci.prepares.UNREAD
+    named.clear()
+    assert before("tests/test_gpu_a.py", "@prepare-sm90", seconds=-1) == ci.prepares.UNREAD
+    failing.add("keys")
+    assert before("tests/test_gpu_a.py", "@prepare-sm90") == ci.prepares.UNREAD
+    failing.clear()
+    # A stall inside the lookup (a page of its listing, a record's read) past its time is no answer, and the
+    # lookup ends at its time, not the stall's.
+    for where in ("keys", "get"):
+        stalls[where] = 5.0
+        began = time.monotonic()
+        assert before("tests/test_gpu_a.py", "@prepare-sm90", seconds=0.2) == ci.prepares.UNREAD
+        assert time.monotonic() - began < 1.0
+        stalls.clear()
+    # A malformed baseline (its cells a string, none, a record no object) is no answer either.
+    for kind, shape in (("baseline", {"unprepared": "a cell"}), ("baseline", {}),
+                        ("baseline", ["no", "record"])):
+        shapes[kind] = shape
+        assert before("tests/test_gpu_a.py", "@prepare-sm90") == ci.prepares.UNREAD, (kind, shape)
+        shapes.clear()
+    # A cut one of whose groups is unread is none (1/3 alone of three); 2/2 unread, the 1/2 cut is none too.
+    del kept["3.12:tests/test_gpu_a.py#2/2@prepare-sm90"]
+    assert before("tests/test_gpu_a.py", "@prepare-sm90") == ci.prepares.UNREAD
+
+
+def test_a_task_takes_mains_commit_from_its_plan_its_checkout_holding_no_origin_main(ci, monkeypatch,
+                                                                                       tmp_path):
+    """A task's checkout on armada holds no origin/main, so its own merge-base names no main: main's commit is
+    its plan's, given as --main, which its dry prepare's baselines are listed at (prepares.py's `before`), for
+    that task alone; an empty --main leaves the checkout's own, and one that is no full commit id names none,
+    so no baseline is read at it nor its absence taken for main's first run. With no --main, the commit its
+    caller's environment gives (the land queue's regrades) stands."""
+    listed: list[str] = []
+
+    class Store:
+        def __init__(self, url: str, token: str, bucket: str, *, timeout: float, send) -> None:
+            pass
+
+        def keys(self, prefix: str, until: float):
+            listed.append(prefix)
+            return iter(())
+
+    def dry_prepared(python, tests, split, out, deadline, cache):
+        until = time.monotonic() + 5
+        seen.append(ci.prepares.before(ci, python, "tests/test_gpu_a.py", "@prepare-sm90", until))
+        return 0
+
+    monkeypatch.setenv("DEW_XLA_CACHE_URL", "http://cache")
+    monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
+    monkeypatch.delenv(ci.MAINLINE, raising=False)
+    monkeypatch.setattr(ci.r2, "Store", Store)
+    monkeypatch.setattr(ci.run_keys, "device_class", lambda network=False: "cls")
+    monkeypatch.setattr(ci.records, "merge_base", lambda: None)
+    monkeypatch.setattr(ci, "dry_prepared", dry_prepared)
+    seen: list[object] = []
+    def run(*main: str) -> None:
+        monkeypatch.setattr(sys, "argv", ["ci.py", "task", "--python=3.12",
+                                          "--tests=prepare:tests/test_gpu_a.py",
+                                          f"--out={tmp_path / 'rows.json'}", "--cache=on", *main])
+        assert ci.main() == 0
+
+    for given in ("a" * 40, "", "main"):
+        run(f"--main={given}")
+        assert ci.MAINLINE not in os.environ
+    # A regrade the land queue runs gives it by its environment alone, kept where no --main is named.
+    monkeypatch.setenv(ci.MAINLINE, "b" * 40)
+    run()
+    assert os.environ[ci.MAINLINE] == "b" * 40
+    assert seen == [ci.prepares.BOOTSTRAP, ci.prepares.UNREAD, ci.prepares.UNREAD, ci.prepares.BOOTSTRAP]
+    assert [prefix.split("-baseline/")[1].split("/")[0] for prefix in listed if "-baseline/" in prefix] == [
+        "a" * 40, "b" * 40]
+
+
+def test_a_commits_baseline_is_its_green_prepares_and_a_red_run_writes_none(ci, monkeypatch, cache_worker):
+    """A dry prepare's green row keeps the cells it left unprepared as the commit's baseline (`baselined`,
+    `baseline_key`); a red run of the same inputs, which writes over the green record, writes no baseline,
+    so main's stays readable; a row that is no dry prepare has none due."""
+    url, stored, _ = cache_worker
+    monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
+    monkeypatch.setattr(ci.run_keys, "head_commit", lambda: "main")
+    place = "3.12:tests/test_gpu_a.py#1/2@prepare-sm90"
+    baseline = "/" + ci.baseline_key("main", "3.12", place, "cls")
+    assert ci.run_keys.baselined("3.12", place, "cls", "token", {"exitCode": 1, "unprepared": ["a @ x"]})
+    assert baseline not in stored
+    assert ci.run_keys.baselined("3.12", place, "cls", "token", {"exitCode": 0, "unprepared": ["a @ x"]})
+    assert json.loads(stored[baseline]) == {"unprepared": ["a @ x"]}
+    assert ci.run_keys.baselined("3.12", place, "cls", "token", {"exitCode": 0})
+    assert json.loads(stored[baseline]) == {"unprepared": ["a @ x"]}
+
+
+@pytest.mark.parametrize("taken", [True, False])
+def test_a_green_dry_row_keeps_its_baseline_whatever_its_record_does(ci, monkeypatch, cache_worker, tmp_path,
+                                                                      taken):
+    """A green dry prepare's baseline is written whatever of its record is kept: a row its record skips (here
+    no log of its file's run, so no record nor key, as where the record's write fails or its epoch is
+    unread) still leaves the commit its baseline. One the store did not take is returned unnamed, its row
+    stale (`unbaselined`), never green with no baseline a later prepare is held to."""
+    url, stored, _ = cache_worker
+    monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
+    monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
+    monkeypatch.setattr(ci.run_keys, "head_commit", lambda: "main")
+    monkeypatch.setattr(ci.run_keys, "device_class", lambda network=False: "cls")
+    writes = ci.written
+    monkeypatch.setattr(ci.run_keys, "written", lambda key, *args, **kwargs: (
+        taken or "-baseline/" not in key) and writes(key, *args, **kwargs))
+    place = "3.12:tests/test_gpu_a.py#1/2@prepare-sm90"
+    log = tmp_path / "lifetime.log"
+    log.write_text("")
+    green = [{"name": place, "exitCode": 0, "unprepared": ["a @ x"]}]
+    unnamed = ci.run_keys.record("3.12", green, log, "common")
+    assert (unnamed, "/" + ci.baseline_key("main", "3.12", place, "cls") in stored) == (
+        (set(), True) if taken else ({place}, False))
+
+
+@pytest.mark.parametrize(("exit_code", "taken"), [(0, True), (1, True), (0, False)])
+def test_a_reused_row_is_named_the_commits_only_as_its_grade_leaves_it_green(ci, monkeypatch, tmp_path,
+                                                                          exit_code, taken):
+    """A row reused from its record is named the commit's (`named_at_commit`) only after it is graded, where
+    its grade leaves it green and its baseline is written (`baselined`): a reuse graded red publishes
+    nothing, and a green one whose baseline the store did not take is named nowhere and stands stale."""
+    row = {"name": "3.12:tests/test_gpu_a.py#@prepare-sm90", "exitCode": 0, "unprepared": ["a @ x"]}
+    calls = []
+
+    def reused_rows(python, tests, group, common, network, kept, named, reading):
+        named[row["name"]] = ("cls", "key")
+        return [{**row, "cached": "key"}]
+
+    monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
+    monkeypatch.setattr(ci, "reused_rows", reused_rows)
+    monkeypatch.setattr(ci, "row", lambda python, name, group: row["name"])
+    monkeypatch.setattr(ci.run_keys, "baselined", lambda *args: taken)
+    monkeypatch.setattr(ci.run_keys, "named_at_commit", lambda *args: calls.append(args))
+    ci.tested("3.12", ["tests/test_gpu_a.py"], "", tmp_path / "rows.json", 60.0, "on", 5.0, "common", {},
+              judged=lambda rows: [{**found, "exitCode": exit_code} for found in rows])
+    named = [(row["name"], "cls", "key")] if exit_code == 0 and taken else []
+    assert [call[1:4] for call in calls] == named
+    [written] = json.loads((tmp_path / "rows.json").read_text())["rows"]
+    assert (written["exitCode"], written.get("kind")) == ((0, None) if exit_code == 0 and taken else
+                                                          (1, None) if exit_code else (1, ci.grading.STALE))
 
 
 def test_a_file_that_does_not_collect_is_its_own_red_row_and_the_lanes_other_files_run(
@@ -375,7 +980,7 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     # The spawner's child took its fraction, so it holds two shares: 12 GiB beside the others' 24.
     common = ci.lane_inputs("3.12")
     for name, inputs in itertools.product([*names, "tests/test_spawner.py"], (None, common)):
-        at = "/" + ci.record_key("3.12", ci.row("3.12", name, ""), ci.device_class(), inputs)
+        at = "/" + ci.record_key("3.12", ci.row("3.12", name, ""), ci.run_keys.device_class(), inputs)
         stored[at] = json.dumps({"key": None, "depends": [name], "row": {}, "reads": [], "peak": 4 * 2 ** 30,
                                  "shares": int(name == "tests/test_spawner.py"), "pools": 0}).encode()
     # Their first green runs gone, as the bucket's expiry takes them, so the lane runs them again by these
@@ -688,7 +1293,7 @@ def test_a_tier_cut_group_is_admitted_on_the_most_its_file_held_and_no_need_is_c
 
     def measured(row_name: str, peak: int, shares: int = 0, followed: bool = True) -> None:
         for inputs in (None, common):
-            at = "/" + ci.record_key("3.12", row_name, ci.device_class(), inputs)
+            at = "/" + ci.record_key("3.12", row_name, ci.run_keys.device_class(), inputs)
             stored[at] = json.dumps({"key": None, "depends": ["tests/test_long.py"] if followed else None,
                                      "row": {}, "reads": [], "peak": peak, "shares": shares,
                                      "pools": 0}).encode()
@@ -767,7 +1372,7 @@ def test_a_unit_is_given_no_less_than_dews_admission_of_the_programs_its_prepare
     def measured() -> None:
         # Its measured 2 GiB, as each run here records its own (with no GPU, none) over it.
         for inputs in (None, ci.lane_inputs("3.12")):
-            at = "/" + ci.record_key("3.12", "3.12:tests/test_flow.py", ci.device_class(), inputs)
+            at = "/" + ci.record_key("3.12", "3.12:tests/test_flow.py", ci.run_keys.device_class(), inputs)
             stored[at] = json.dumps({"key": None, "depends": ["tests/test_flow.py"], "row": {}, "reads": [],
                                      "peak": 2 * gib, "shares": 0, "pools": 0}).encode()
 
@@ -813,7 +1418,8 @@ def test_a_unit_is_given_no_less_than_dews_admission_of_the_programs_its_prepare
         assert need > budget and len(lane_runs(tmp_path, "test_flow")) == runs and row["exitCode"] == 1
         # No verdict of its tests (`grading.STALE`): Platform's harness evidence, never its file's verdict.
         assert row["kind"] == ci.grading.STALE and f"{need / gib:.2f} GiB" in row["output"]
-        assert ci.device_class() in row["output"] and ("holds it" in row["output"]) == (need <= whole)
+        held = ci.run_keys.device_class()
+        assert held in row["output"] and ("holds it" in row["output"]) == (need <= whole)
 
 
 def test_gpu_holds_says_what_a_lane_needs_to_run_each_file_as_its_largest_measured_class_held_it(

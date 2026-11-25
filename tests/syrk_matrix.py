@@ -116,7 +116,7 @@ def a_symmetric_product_is_on_par(case: tuple[str, ...]) -> None:
         return y, pull(cot.astype(out_dtype))[0]
 
     with generation.routes() as routes:
-        assert_as_exact(jax.jit(run), jax.jit(plain), draw, f"native syrk {form}", seeds=4,
+        assert_as_exact(jax.jit(run), jax.jit(plain), draw, f"native syrk {form}", seeds=8,
                         truth_fn=functools.partial(plain, dtype=jnp.float64, out_dtype=jnp.float64))
     recorded = {(found.choice, found.kernel) for found in routes}
     unnamed = sorted(pair for pair in recorded if pair[0] not in CHOICES and pair[1] != "xla")

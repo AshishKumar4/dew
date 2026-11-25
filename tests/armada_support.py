@@ -29,8 +29,10 @@ def loaded(tmp_path: Path, monkeypatch):
 
 
 APART = ("DEW_XLA_CACHE_URL", "DEW_XLA_CACHE_TOKEN", "DEW_XLA_CACHE_READ_TOKEN", "DEW_TEST_CACHE",
-         "ARMADA_ARTIFACTS", "ARMADA_RESUME")
-"""What CI's environment names that these tests' runs of its tools must not see (`apart`)."""
+         "ARMADA_ARTIFACTS", "ARMADA_RESUME", "DEW_UNRECORDED", "DEW_SPLIT_EVENLY")
+"""What CI's environment names that these tests' runs of its tools must not see (`apart`): the task's own
+test cache, artifacts and recalled progress, and its split task's report of the tests its record lacks and
+its cut (split.py), which a nested run must neither write nor take."""
 
 
 def apart(monkeypatch) -> None:
@@ -62,9 +64,11 @@ def cached(monkeypatch, url: str) -> None:
 
 
 def lifetime_task(ci, tmp_path, monkeypatch, cache_worker, files: dict[str, str],
-                  sources: dict[str, str]) -> Callable[[], list[bool]]:
+                  sources: dict[str, str], together: bool = False) -> Callable[[], list[bool]]:
     """`files` under tests/ and `sources` under src/ written, run as one 3.12 task with the test cache
-    on: whether each test file's row is reused now, in the files' order."""
+    on (`together`: in one pytest, as a census or a coverage run holds several files, else each file in its
+    own, as ci.py's `task` runs a task's): whether each test file's row is reused now, in the files'
+    order."""
     url, _, _ = cache_worker
     cached(monkeypatch, url)
     written(tmp_path, files)
@@ -73,7 +77,11 @@ def lifetime_task(ci, tmp_path, monkeypatch, cache_worker, files: dict[str, str]
         (tmp_path / "src" / name).write_text(source)
     interpreter(tmp_path, "3.12")
     tests = [f"tests/{name}" for name in files if name.startswith("test_")]
-    ci.task("3.12", tests, "", tmp_path / "verdict.json", 600.0)
+    if together:
+        ci.tested("3.12", tests, "", tmp_path / "verdict.json", 600.0, "on", ci.session.GRACE,
+                  ci.shared("3.12"), {})
+    else:
+        ci.task("3.12", tests, "", tmp_path / "verdict.json", 600.0)
     rows = json.loads((tmp_path / "verdict.json").read_text())["rows"]
     assert all(row["exitCode"] == 0 for row in rows), rows
     return lambda: reusable_now(ci, tests)
@@ -134,7 +142,7 @@ def cached_checkout(ci, root: Path, monkeypatch, cache_worker) -> Path:
     input)."""
     interpreter(root, "3.12")
     url, _, _ = cache_worker
-    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
+    monkeypatch.setattr(ci.run_keys, "cpu_class", lambda: "GenuineIntel-6-143")
     cached(monkeypatch, url)
     (root / ".verdict").mkdir()
     return root / ".verdict/verdict.json"

@@ -233,7 +233,8 @@ def test_restored_blockwise_cublaslt_references_prepare_on_sm90(tmp_path, monkey
     import generation_support
     import model_flows
     import tier_wire
-    from truths_ahead import AT_RUN, DEFERRED, HELD, SITE, UNPREPARED, prepared
+    from tier_wire import DEFERRED
+    from truths_ahead import AT_RUN, HELD, SITE, UNPREPARED, prepared
 
     monkeypatch.setenv(model_flows.TOPOLOGY, str(generation_support.node_topology(tmp_path / "topology.bin",
                                                                                    gpu="sm90")))
@@ -248,3 +249,230 @@ def test_restored_blockwise_cublaslt_references_prepare_on_sm90(tmp_path, monkey
     with_ref = [h for h in arm_sites
                 if any(k.startswith("dew ") for k in h) and any(k.startswith("reference ") for k in h)]
     assert len(with_ref) == 2, [list(h.keys()) for h in arm_sites]
+
+
+@pytest.mark.parametrize("rows", [256, 384])
+def test_a_blockwise_chain_through_the_template_is_its_two_projections_apart(rows):
+    """An ungated MLP's two blockwise FP8 projections chained (`projections.blockwise_chain`), on an H100,
+    interpreted, through the template named: the down projection's rows quantized in the up projection's
+    epilogue and stored there (E4M3 codes and 1 x 128 scales `[hidden / 128, rows]`, transposed,
+    `quantized.reduced`), its value and every gradient bitwise the two projections apart with the
+    activation between them in XLA, as a recipe's run takes them today (row 8547); and the up projection's
+    launch the template's, its scales output in its form (`Hooks.out_forms`). 384 rows end in a share past
+    the last row tile's pair of 128 (its stores whole shares, the tensor's bound clipping them)."""
+    group_blocks = jnp.asarray([rows // 128], jnp.int32)
+    rng = np.random.default_rng(8547)
+    x = jnp.asarray(rng.normal(size=(rows, 256)), jnp.bfloat16)
+    up = jnp.asarray(rng.normal(size=(1, 256, 384)) / 16, jnp.bfloat16)
+    down = jnp.asarray(rng.normal(size=(1, 384, 256)) / 16, jnp.bfloat16)
+    cotangent = jnp.asarray(rng.normal(size=(rows, 256)), jnp.bfloat16)
+
+    def chained(x, up, down):
+        return projections.blockwise_chain(x, up, down, jax.nn.gelu, out_dtype=jnp.bfloat16,
+                                           interpret_on_cpu=True)
+
+    def apart(x, up, down):
+        hidden = projections.blockwise_fp8_projection(x, up, group_blocks, out_dtype=jnp.bfloat16,
+                                                      interpret_on_cpu=True)
+        return projections.blockwise_fp8_projection(jax.nn.gelu(hidden).astype(jnp.bfloat16), down,
+                                                    group_blocks, out_dtype=jnp.bfloat16,
+                                                    interpret_on_cpu=True)
+
+    with generation.assumed("sm90"), generation.chosen(blockwise_fp8="mosaic"), generation.routes() as routes:
+        fused = jax.jit(with_gradients(chained))(x, up, down, cotangent)
+        separate = jax.jit(with_gradients(apart))(x, up, down, cotangent)
+    for name, got, want in zip(("value", "d_x", "d_up", "d_down"), fused, separate, strict=True):
+        assert got.dtype == want.dtype, (name, got.dtype, want.dtype)
+        bits = np.dtype(f"uint{8 * got.dtype.itemsize}")
+        np.testing.assert_array_equal(np.asarray(got).view(bits), np.asarray(want).view(bits), err_msg=name)
+    assert ("blockwise_fp8", "mosaic") in {(route.choice, route.kernel) for route in routes}
+
+
+def test_a_blockwise_fp8_epilogues_codes_and_scales_are_the_recipes():
+    """The blockwise quantizing epilogue (`quantized.blockwise_fp8_epilogue`) on XLA's route of a product:
+    its stored product rounded once, and its codes and transposed 1 x 128 scales of the activated product,
+    bitwise `projections.rows_quantized` of the activation of that rounded product (row 8547), including
+    rows of zeros (amax floored at 1e-4), a block past E4M3's range, and blocks holding an infinity and a
+    NaN beside finite and zero values."""
+    from dew.nn.kernels.templates.gemm import quantized
+
+    rng = np.random.default_rng(8550)
+    values = rng.normal(size=(128, 256)).astype(np.float32)
+    values[3] = 0.0
+    values[5, :128] *= 1e4
+    values[7, 0], values[7, 1:4] = np.inf, (1.0, 0.0, -2.0)  # an infinite block's codes: the recipe's
+    values[9, 130], values[9, 131:134] = np.nan, (1.0, 0.0, -2.0)  # a NaN block's
+    acc = jnp.asarray(values)
+    rounded, codes, scales = quantized.blockwise_fp8_epilogue(jax.nn.relu)(acc)
+    stored_scales = quantized.stored(scales, (128, True))
+    want_codes, want_scales = projections.rows_quantized(jax.nn.relu(acc.astype(jnp.bfloat16)).astype(
+        jnp.bfloat16))
+    np.testing.assert_array_equal(np.asarray(rounded).view(np.uint16),
+                                  np.asarray(acc.astype(jnp.bfloat16)).view(np.uint16))
+    np.testing.assert_array_equal(np.asarray(codes).view(np.uint8), np.asarray(want_codes).view(np.uint8))
+    np.testing.assert_array_equal(np.asarray(stored_scales).view(np.uint32),
+                                  np.asarray(want_scales.T).view(np.uint32))
+
+
+@pytest.mark.parametrize("rows", [200, 256])
+def test_an_ungated_mlps_recipe_chain_is_its_two_recipe_projections_apart(rows):
+    """Under a run's blockwise FP8 recipe, an ungated MLP's chain (`projections.recipe_chain`) of any rows
+    count, laid in whole 128-row blocks and the padding dropped: its value and every gradient bitwise the two
+    `recipe_projection` calls apart with the activation between them in XLA (row 8547); and outside the
+    recipe, None, which the two apart take."""
+    from dew.nn.precision import FP8, projection_role
+
+    rng = np.random.default_rng(8551)
+    x = jnp.asarray(rng.normal(size=(rows, 256)), jnp.bfloat16)
+    up = jnp.asarray(rng.normal(size=(256, 384)) / 16, jnp.bfloat16)
+    down = jnp.asarray(rng.normal(size=(384, 256)) / 16, jnp.bfloat16)
+    cotangent = jnp.asarray(rng.normal(size=(rows, 256)), jnp.bfloat16)
+
+    def chained(x, up, down):
+        return projections.recipe_chain(x, up, down, jax.nn.gelu, out_dtype=jnp.bfloat16)
+
+    def apart(x, up, down):
+        hidden = projections.recipe_projection(x, up, out_dtype=jnp.bfloat16)
+        return projections.recipe_projection(jax.nn.gelu(hidden).astype(jnp.bfloat16), down,
+                                             out_dtype=jnp.bfloat16)
+
+    assert chained(x, up, down) is None
+    with generation.run_precision(FP8), projection_role("mlp"):
+        fused = jax.jit(with_gradients(chained))(x, up, down, cotangent)
+        separate = jax.jit(with_gradients(apart))(x, up, down, cotangent)
+    for name, got, want in zip(("value", "d_x", "d_up", "d_down"), fused, separate, strict=True):
+        assert got.dtype == want.dtype, (name, got.dtype, want.dtype)
+        bits = np.dtype(f"uint{8 * got.dtype.itemsize}")
+        np.testing.assert_array_equal(np.asarray(got).view(bits), np.asarray(want).view(bits), err_msg=name)
+
+
+def _swiglu(gate, up):
+    """A gated MLP's SwiGLU of its rounded gate and up, in fp32."""
+    return jax.nn.silu(gate.astype(jnp.float32)) * up.astype(jnp.float32)
+
+
+@pytest.mark.parametrize("rows", [256, 384])
+def test_a_gated_blockwise_chain_through_the_template_is_its_three_projections_apart(rows):
+    """A gated MLP's three blockwise FP8 projections chained (`projections.blockwise_chain`'s `gate`), on an
+    H100, interpreted, through the template named: the gate's product stored and read by the up projection's
+    epilogue as a tile beside its sum, their SwiGLU quantized there as the down projection's rows; its value
+    and every gradient bitwise the three projections apart with SwiGLU between them in XLA (row 12689)."""
+    group_blocks = jnp.asarray([rows // 128], jnp.int32)
+    rng = np.random.default_rng(12689)
+    x = jnp.asarray(rng.normal(size=(rows, 256)), jnp.bfloat16)
+    gate, up = (jnp.asarray(rng.normal(size=(1, 256, 384)) / 16, jnp.bfloat16) for _ in range(2))
+    down = jnp.asarray(rng.normal(size=(1, 384, 256)) / 16, jnp.bfloat16)
+    cotangent = jnp.asarray(rng.normal(size=(rows, 256)), jnp.bfloat16)
+
+    def chained(x, gate, up, down):
+        return projections.blockwise_chain(x, up, down, _swiglu, out_dtype=jnp.bfloat16, gate=gate,
+                                           interpret_on_cpu=True)
+
+    def apart(x, gate, up, down):
+        def projected(rows, matrix):
+            return projections.blockwise_fp8_projection(rows, matrix, group_blocks, out_dtype=jnp.bfloat16,
+                                                        interpret_on_cpu=True)
+
+        hidden = _swiglu(projected(x, gate), projected(x, up)).astype(jnp.bfloat16)
+        return projected(hidden, down)
+
+    with generation.assumed("sm90"), generation.chosen(blockwise_fp8="mosaic"), generation.routes() as routes:
+        fused = jax.jit(with_gradients(chained))(x, gate, up, down, cotangent)
+        separate = jax.jit(with_gradients(apart))(x, gate, up, down, cotangent)
+    for name, got, want in zip(("value", "d_x", "d_gate", "d_up", "d_down"), fused, separate, strict=True):
+        assert got.dtype == want.dtype, (name, got.dtype, want.dtype)
+        bits = np.dtype(f"uint{8 * got.dtype.itemsize}")
+        np.testing.assert_array_equal(np.asarray(got).view(bits), np.asarray(want).view(bits), err_msg=name)
+    assert ("blockwise_fp8", "mosaic") in {(route.choice, route.kernel) for route in routes}
+
+
+def test_a_gated_mlps_recipe_chain_is_its_three_recipe_projections_apart():
+    """Under a run's blockwise FP8 recipe, a gated MLP's chain (`projections.recipe_chain`'s `gate`) of 200
+    rows: its value and every gradient bitwise its three `recipe_projection` calls apart with SwiGLU between
+    them in XLA (row 12689)."""
+
+    rng = np.random.default_rng(12690)
+    x = jnp.asarray(rng.normal(size=(200, 256)), jnp.bfloat16)
+    gate, up = (jnp.asarray(rng.normal(size=(256, 384)) / 16, jnp.bfloat16) for _ in range(2))
+    down = jnp.asarray(rng.normal(size=(384, 256)) / 16, jnp.bfloat16)
+    cotangent = jnp.asarray(rng.normal(size=(200, 256)), jnp.bfloat16)
+
+    _assert_gated_chain_is_apart(_swiglu, x, gate, up, down, cotangent)
+
+
+
+@pytest.mark.parametrize("activation", ["nonzero at zero", "nonfinite derivative at zero"])
+def test_a_padded_gated_recipe_chain_keeps_its_padding_out_of_every_gradient(activation):
+    """A gated recipe chain of one row (127 padding rows in its 128-row block) through an activation whose
+    padding is not inert, nonzero at zero (`where(gate == 0, 256, up)`, which would set the down kernel
+    gradient's token-block scale and round the real row away) or of a nonfinite derivative there
+    (`sqrt(gate) + up`): its value and every gradient bitwise the three recipe projections apart, the
+    padding held out of the backward (`_chain_backward`'s `live`, row 12689's review)."""
+
+    act = {"nonzero at zero": lambda gate, up: jnp.where(gate == 0, 256.0, up),
+           "nonfinite derivative at zero": lambda gate, up: jnp.sqrt(gate) + up}[activation]
+    rng = np.random.default_rng(12693)
+    x = jnp.asarray(np.abs(rng.normal(size=(1, 256))), jnp.bfloat16)
+    gate = jnp.asarray(np.abs(rng.normal(size=(256, 384))) / 16, jnp.bfloat16)
+    up = jnp.asarray(rng.normal(size=(256, 384)) / 4096, jnp.bfloat16)
+    down = jnp.asarray(rng.normal(size=(384, 256)) / 16, jnp.bfloat16)
+    cotangent = jnp.asarray(rng.normal(size=(1, 256)), jnp.bfloat16)
+
+    _assert_gated_chain_is_apart(act, x, gate, up, down, cotangent)
+
+
+def _assert_gated_chain_is_apart(activation, x, gate, up, down, cotangent) -> None:
+    """A gated recipe chain's value and every gradient (`projections.recipe_chain`'s `gate`) bitwise its
+    three `recipe_projection` calls apart with `activation` between them in XLA, each finite, under a run's
+    blockwise FP8 recipe (row 12689)."""
+    from dew.nn.precision import FP8, projection_role
+
+    def chained(x, gate, up, down):
+        return projections.recipe_chain(x, up, down, activation, out_dtype=jnp.bfloat16, gate=gate)
+
+    def apart(x, gate, up, down):
+        def projected(rows, matrix):
+            return projections.recipe_projection(rows, matrix, out_dtype=jnp.bfloat16)
+
+        return projected(activation(projected(x, gate), projected(x, up)).astype(jnp.bfloat16), down)
+
+    with generation.run_precision(FP8), projection_role("mlp"):
+        fused = jax.jit(with_gradients(chained))(x, gate, up, down, cotangent)
+        separate = jax.jit(with_gradients(apart))(x, gate, up, down, cotangent)
+    for name, got, want in zip(("value", "d_x", "d_gate", "d_up", "d_down"), fused, separate, strict=True):
+        assert np.all(np.isfinite(np.asarray(got, np.float32))), name
+        bits = np.dtype(f"uint{8 * got.dtype.itemsize}")
+        np.testing.assert_array_equal(np.asarray(got).view(bits), np.asarray(want).view(bits), err_msg=name)
+
+
+@pytest.mark.parametrize("activation", ["nonzero at zero", "nonfinite derivative at zero"])
+def test_a_padded_recipe_chain_keeps_its_padding_out_of_every_gradient(activation):
+    """A recipe chain of one row (127 padding rows in its 128-row block) through an activation whose padding
+    is not inert, nonzero at zero (`where(value == 0, 256, value)`, which would set the down kernel gradient's
+    token-block scale and round the real row away) or of a nonfinite derivative there (`sqrt`): its value and
+    every gradient bitwise the two recipe projections apart, the padding held out of the backward
+    (`_chain_backward`'s `live`, row 12689's review)."""
+    from dew.nn.precision import FP8, projection_role
+
+    act = {"nonzero at zero": lambda value: jnp.where(value == 0, 256.0, value / 4096),
+           "nonfinite derivative at zero": jnp.sqrt}[activation]
+    rng = np.random.default_rng(12693)
+    x = jnp.asarray(np.abs(rng.normal(size=(1, 256))), jnp.bfloat16)
+    up = jnp.asarray(np.abs(rng.normal(size=(256, 384))) / 16, jnp.bfloat16)
+    down = jnp.asarray(rng.normal(size=(384, 256)) / 16, jnp.bfloat16)
+    cotangent = jnp.asarray(rng.normal(size=(1, 256)), jnp.bfloat16)
+
+    def chained(x, up, down):
+        return projections.recipe_chain(x, up, down, act, out_dtype=jnp.bfloat16)
+
+    def apart(x, up, down):
+        hidden = projections.recipe_projection(x, up, out_dtype=jnp.bfloat16)
+        return projections.recipe_projection(act(hidden).astype(jnp.bfloat16), down, out_dtype=jnp.bfloat16)
+
+    with generation.run_precision(FP8), projection_role("mlp"):
+        fused = jax.jit(with_gradients(chained))(x, up, down, cotangent)
+        separate = jax.jit(with_gradients(apart))(x, up, down, cotangent)
+    for name, got, want in zip(("value", "d_x", "d_up", "d_down"), fused, separate, strict=True):
+        assert np.all(np.isfinite(np.asarray(got, np.float32))), name
+        bits = np.dtype(f"uint{8 * got.dtype.itemsize}")
+        np.testing.assert_array_equal(np.asarray(got).view(bits), np.asarray(want).view(bits), err_msg=name)

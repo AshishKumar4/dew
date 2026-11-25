@@ -282,7 +282,7 @@ KERNEL_CELLS = (kernels.flash_through_dews_attention_refuses_rows_it_would_misre
                 kernels.single_query_cudnn_decode_matches_float64_attention_and_gradients,
                 kernels.a_kernels_requirements_are_what_the_kernel_takes_on_this_gpu)
 """test_kernels' fused and Triton kernels on a GPU of cuDNN's bf16 floor (sm80) or later; its mesh cell
-is the two-GPU flow's (tests/test_gpu_mesh.py)."""
+is the two-GPU flow's (tests/test_gpu_mesh_attention.py)."""
 
 LIBRARY_AXES = ("implementation", "kernel", "causal", "sunk", "window", "sinks", "as_mask", "call", "case")
 """A library kernel's native axes, the parameters of its checks a GPU alone shows (Main, 11-11): a library's

@@ -394,12 +394,14 @@ def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
                                                                "tests/test_pass.py::test_skip"}
     assert ci.node_of(ET.Element("testcase", classname="tests.test_split.TestB", name="test_b")) == \
         "tests/test_split.py::TestB::test_b"
-    # A process that dies after its report is written leaves every row it ran red, green cases included.
+    # A process that dies after its report is written leaves every row it ran red, green cases included;
+    # each file of a task runs in a process of its own (ci.py's `task`), so a file beside it stays green.
     (tmp_path / "tests/test_dies.py").write_text("import atexit, os\natexit.register(lambda: os._exit(3))\n"
                                                  "def test_ok(): pass\n")
     ci.task("3.12", ["tests/test_pass.py", "tests/test_dies.py"], "", out, 600.0)
-    assert {row["name"]: (row["exitCode"], row["kind"]) for row in json.loads(out.read_text())["rows"]} == {
-        "3.12:tests/test_pass.py": (1, "whole"), "3.12:tests/test_dies.py": (1, "whole")}
+    rows = json.loads(out.read_text())["rows"]
+    assert {row["name"]: (row["exitCode"], row.get("kind")) for row in rows} == {
+        "3.12:tests/test_pass.py": (0, None), "3.12:tests/test_dies.py": (1, "whole")}
 
 
 def assert_green_task(ci, tmp_path, name: str, source: str) -> None:
@@ -482,7 +484,8 @@ def said_why(ci, stored) -> None:
     """Each file the gpu tier's test runs that started a process no record follows says in its record what
     it started and from where (`followed.WHY`); a file that keeps its key says nothing."""
     names = ("test_machine.py", "test_spawn.py", "test_forkserver.py", "test_fork.py", "test_shell.py")
-    why = {name: json.loads(stored["/" + ci.record_key("3.12", f"3.12:tests/{name}", ci.cpu_class())])["why"]
+    held = ci.run_keys.cpu_class()
+    why = {name: json.loads(stored["/" + ci.record_key("3.12", f"3.12:tests/{name}", held)])["why"]
            for name in names}
     assert why.pop("test_machine.py") is None
     starts = {"test_spawn.py": "SpawnProcess (spawn start)", "test_fork.py": "ForkProcess (fork start)",
@@ -579,7 +582,7 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
             f"3.12:{name}": 0 for name in tests}
     (tmp_path / "tests/plain.py").write_text("def helper(): return 2 - 1\n")
     # A group of test_lost.py's the Worker lists and does not return.
-    stored["/" + ci.record_key("3.12", "3.12:tests/test_lost.py#2/2", ci.cpu_class())] = None
+    stored["/" + ci.record_key("3.12", "3.12:tests/test_lost.py#2/2", ci.run_keys.cpu_class())] = None
     assert ci.gpu_tier("3.12") == {
         "tests/test_imported.py": ["tests/devices.py:placed"],
         "tests/test_imported_too.py": ["tests/devices.py:placed"],
@@ -725,18 +728,21 @@ def test_a_tasks_wall_time_is_apportioned_by_its_files_tests_times(ci):
         "tests/test_a.py": 1.0, "tests/test_b.py": 1.0}
 
 
-def test_a_tasks_rows_share_its_wall_time_by_their_tests_times(ci, tmp_path):
+def test_the_rows_of_files_one_pytest_runs_share_its_wall_time_by_their_tests_times(ci, tmp_path):
     """The plan weighs a file by what a task spends on it, its import and
-    collection included, so a task's rows add up to its wall time, split by
-    their tests' own times (`apportioned`): at least what the tests slept, at
-    most the task's wall time, and the longer sleep the larger row."""
+    collection included, so the rows of files one pytest runs together (a
+    coverage, census or split task's: `tested`) add up to its wall time, split
+    by their tests' own times (`task_shares`): at least what the tests slept,
+    at most the process's wall time, and the longer sleep the larger row. A
+    packed task's whole files each run apart, each row its own process's."""
     (tmp_path / "tests").mkdir(exist_ok=True)
     (tmp_path / "tests/test_short.py").write_text("import time\ndef test_a(): time.sleep(0.3)\n")
     (tmp_path / "tests/test_long.py").write_text("import time\ndef test_b(): time.sleep(0.9)\n")
     interpreter(tmp_path, "3.12")
     out = tmp_path / "verdict.json"
     began = time.monotonic()
-    ci.task("3.12", ["tests/test_short.py", "tests/test_long.py"], "", out, 60.0)
+    ci.tested("3.12", ["tests/test_short.py", "tests/test_long.py"], "", out, 60.0, "on", ci.session.GRACE,
+              ci.shared("3.12"), {})
     wall = time.monotonic() - began
     rows = {row["name"]: row["seconds"] for row in json.loads(out.read_text())["rows"]}
     short, long = rows["3.12:tests/test_short.py"], rows["3.12:tests/test_long.py"]
@@ -769,6 +775,8 @@ def test_the_census_plans_the_whole_suite_cold_whatever_its_environment_says(ci,
     assert all(entry["split"] != ci.COLLECT for entry in census)
     pushed = planned()
     assert {(entry["cache"], entry["census"]) for entry in pushed} == {("on", "0")}
+    # Each entry carries main's commit as its plan found it (`mainline`), which its task's checkout lacks.
+    assert {entry["main"] for entry in pushed} == {ci.mainline() or ""}
     assert any(entry["split"] == ci.COLLECT for entry in pushed)
 
 
@@ -788,7 +796,7 @@ def test_a_census_task_runs_its_tests_under_the_census_and_records_no_row(ci, tm
     interpreter(tmp_path, "3.12")
     url, stored, _ = cache_worker
     cached(monkeypatch, url)
-    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
+    monkeypatch.setattr(ci.run_keys, "cpu_class", lambda: "GenuineIntel-6-143")
     out = tmp_path / "verdict.json"
     [row] = armada_task(ci, monkeypatch, out, census=True)
     assert row["exitCode"] == 0, row["output"]
@@ -853,8 +861,8 @@ def test_a_task_the_fleet_recalled_goes_on_from_the_tests_its_attempt_passed(ci,
     armada starts after recalling one (ARMADA_RESUME, the artifacts the recalled attempt kept, #4544) sets
     those aside and runs the rest: its row green with every test's seconds, the earlier attempt's among them,
     its progress carrying them for a later recall, and no record written, as no record holds the earlier
-    attempt's opens. It sets aside exactly those tests, never one whose id theirs begins (pytest's --deselect
-    matches by prefix: train 671's review)."""
+    attempt's opens. A whole file's tests are set aside only where its process ended 0; a split group's
+    where it did not end red."""
     (tmp_path / "tests/test_resumed.py").write_text(
         "import time\n"
         "from pathlib import Path\n"
@@ -869,25 +877,29 @@ def test_a_task_the_fleet_recalled_goes_on_from_the_tests_its_attempt_passed(ci,
     interpreter(tmp_path, "3.12")
     url, stored, _ = cache_worker
     cached(monkeypatch, url)
-    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
+    monkeypatch.setattr(ci.run_keys, "cpu_class", lambda: "GenuineIntel-6-143")
     monkeypatch.setenv("ARMADA_ARTIFACTS", str(tmp_path / "artifacts"))
     out = tmp_path / "verdict.json"
     # An attempt that ran whole kept both tests as it went.
     [row] = armada_task(ci, monkeypatch, out, policy="off")
     assert row["exitCode"] == 0, row["output"]
     progress = tmp_path / "artifacts" / "progress.jsonl"
-    kept = [json.loads(line)["node"] for line in progress.read_text().splitlines()]
+    lines = [json.loads(line) for line in progress.read_text().splitlines()]
+    kept = [line["node"] for line in lines if "node" in line]
     assert kept == ["tests/test_resumed.py::test_first", "tests/test_resumed.py::test_first_again"]
+    # Its process's exit sealed them, kept as it exited (row 3932's review).
+    assert [line["code"] for line in lines if "ended" in line] == [0]
     # Its seconds are its setup's, call's and teardown's, as JUnit times it and as its `compiled` counts:
     # a fixture's 0.3 s among them (row 7939's review).
-    assert json.loads(progress.read_text().splitlines()[0])["seconds"] >= 0.3
-    # The next, recalled after its first test: that one set aside, the one its name begins run, both in
-    # its row.
+    assert lines[0]["seconds"] >= 0.3
+    # The next, recalled after a process that ended 0 passed the first test: that one set aside, the one its
+    # name begins run (pytest's --deselect matches by prefix: train 671's review), both in its row. The test
+    # it passed had compiled a program the shared cache lacked: its row still times it cold, and the progress
+    # carried on says so for a later recall (row 7939's review).
     (tmp_path / "resume").mkdir()
-    # The test it passed had compiled a program the shared cache lacked: its row still times it cold, and the
-    # progress carried on says so for a later recall (row 7939's review).
-    first = {**json.loads(progress.read_text().splitlines()[0]), "cold": True}
-    (tmp_path / "resume" / "progress.jsonl").write_text(json.dumps(first) + "\n")
+    resume = tmp_path / "resume" / "progress.jsonl"
+    sealed = [line for line in lines if "ended" in line]
+    resume.write_text("".join(json.dumps(line) + "\n" for line in [{**lines[0], "cold": True}, *sealed]))
     progress.unlink()
     (tmp_path / "ran").unlink()
     monkeypatch.setenv("ARMADA_RESUME", str(tmp_path / "resume"))
@@ -897,9 +909,17 @@ def test_a_task_the_fleet_recalled_goes_on_from_the_tests_its_attempt_passed(ci,
     assert (tmp_path / "ran").read_text() == "again "
     assert set(row["tests"]) == {f"tests/test_resumed.py::test_first{end}" for end in ("", "_again")}
     assert row["cold"] == ["tests/test_resumed.py::test_first"]
-    carried = [json.loads(line) for line in progress.read_text().splitlines()]
+    carried = [json.loads(line) for line in progress.read_text().splitlines() if "node" in json.loads(line)]
     assert [line["node"] for line in carried] == kept and carried[0]["cold"] and "cold" not in carried[1]
     assert stored == {}
+    # Recalled after its first test passed, before its process ended: that pass may yet fail with its exit
+    # (an exit's crash), so the whole file runs again (row 3932's review).
+    resume.write_text(json.dumps(lines[0]) + "\n")
+    progress.unlink()
+    (tmp_path / "ran").unlink()
+    [row] = armada_task(ci, monkeypatch, out, policy="off")
+    assert row["exitCode"] == 0, row["output"]
+    assert (tmp_path / "ran").read_text() == "first again "
     # A split group resumed sets its tests aside after split.py cuts its file, as every group's container
     # cuts it whole: a cut of the rest alone would run another group's tests and none of some (train 674's
     # review: weights 1, 3, 1, 3 cut in three, the second group's first test passed, its second never ran).
@@ -946,7 +966,7 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
     out = tmp_path / "verdict.json"
 
     def run(cpu, policy="on"):
-        monkeypatch.setattr(ci, "cpu_class", lambda: cpu)
+        monkeypatch.setattr(ci.run_keys, "cpu_class", lambda: cpu)
         [only] = armada_task(ci, monkeypatch, out, policy)
         assert (only["exitCode"] == 0) == (not os.environ.get("FAIL") and not os.environ.get("EXIT"))
         return len((tmp_path / "runs").read_text())
@@ -1294,7 +1314,8 @@ def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cu
     together, alone = [nodes[0], nodes[2]], [nodes[1]]
     assert {row["name"]: sorted(row["tests"]) for row in rows} == {
         "3.12:tests/test_shared.py#1/2": [*together, nodes[3]], "3.12:tests/test_shared.py#2/2": alone}
-    assert [ci.members("tests/test_shared.py", f"{group}/2") for group in (1, 2)] == [together, alone]
+    members = ci.run_keys.members
+    assert [members("tests/test_shared.py", f"{group}/2") for group in (1, 2)] == [together, alone]
     assert sorted((tmp_path / "runs").read_text()) == ["0", "1", "2", "3"]
     # Recorded b, a, c, each its own group; a new test sorted before b shares a's setup: it rides with a,
     # whose group keeps a's place, so each task runs the recorded tests the plan gave it.
@@ -1312,7 +1333,7 @@ def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cu
         "3.12:tests/test_order.py#1/3": [order["1b"]],
         "3.12:tests/test_order.py#2/3": [order["0new"], order["2a"]],
         "3.12:tests/test_order.py#3/3": [order["3c"]]}
-    assert [ci.members("tests/test_order.py", f"{group}/3") for group in (1, 2, 3)] == [
+    assert [ci.run_keys.members("tests/test_order.py", f"{group}/3") for group in (1, 2, 3)] == [
         [order["1b"]], [order["2a"]], [order["3c"]]]
     # A new lone test, or a new setup's pair, before recorded a, b, c joins the first group, a, b and c each
     # staying in its planned group, and the file's groups are not reused.
@@ -1334,7 +1355,7 @@ def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cu
         assert {row["name"]: sorted(row["tests"]) for row in rows if f"test_{name}" in row["name"]} == {
             f"3.12:tests/test_{name}.py#{group}/3": sorted(node[name, test] for test in tests)
             for group, tests in enumerate(cut, start=1)}
-        assert [ci.members(f"tests/test_{name}.py", f"{group}/3") for group in (1, 2, 3)] == [
+        assert [ci.run_keys.members(f"tests/test_{name}.py", f"{group}/3") for group in (1, 2, 3)] == [
             [node[name, test]] for test in ("1a", "2b", "3c")]
         common = ci.shared("3.12")
         assert [ci.reused("3.12", f"tests/test_{name}.py", f"{group}/3", common) for group in (1, 2, 3)] == [
@@ -1389,7 +1410,8 @@ def test_a_parameters_shared_setup_runs_its_tests_in_one_group_across_functions_
         assert key(node.format(f"test_forward[{beyond}]"), ("models", r"^.")) is None
     assert key(node.format("test_forward[m-a-tiny]"), ("models", r"m-[a-z]-tiny")) == ("models", "m-a-tiny")
     count = len(ran)
-    assert [set(ci.members("tests/test_models.py", f"{group}/{count}")) for group in range(1, count + 1)] == [
+    members = ci.run_keys.members
+    assert [set(members("tests/test_models.py", f"{group}/{count}")) for group in range(1, count + 1)] == [
         ran[f"3.12:tests/test_models.py#{group}/{count}"] for group in range(1, count + 1)]
     assert sorted((tmp_path / "runs").read_text().splitlines()) == sorted(
         f"{kind} {model}" for kind in "fg" for model in models)
@@ -1474,7 +1496,7 @@ def test_a_run_that_writes_a_checkout_file_it_read_keeps_no_key_by_any_writer(ci
     handle that reads and writes, a truncation, a mapped page, a removal and a new file in its place, through
     an alias of what it read, under a nested hidden directory, a copy that puts the file's time back, or a
     native writer (sqlite's); nor does one that found a file absent and made it, a package beside a module
-    it imported among them, which only its key's import lookups cover (`ci.inputs`; row 10800): its key would
+    it imported among them, which only its key's import lookups cover (`inputs`; row 10800): its key would
     hash the checkout the run left, not what it read, so it is never reused and runs again (row 2559 and its
     review), its record saying so (row 10775). A file a run only writes, as each run here appends to `runs`,
     is no input and leaves its key."""
@@ -1532,13 +1554,13 @@ def test_a_run_that_writes_a_checkout_file_it_read_keeps_no_key_by_any_writer(ci
         first = run()
         if test == "shadowed":
             # Its first run's record, before the second (which finds the package made) records its own.
-            place = "/" + ci.record_key("3.12", "3.12:tests/test_a.py", ci.cpu_class())
+            place = "/" + ci.record_key("3.12", "3.12:tests/test_a.py", ci.run_keys.cpu_class())
             kept = json.loads(cache_worker[1][place])
             assert kept["key"] is None and "its task wrote its input src/held" in kept["why"], kept["why"]
         assert [first, run()] == ([1, 1] if test == "plain" else [1, 2]), test
         # Its record keeps what it read all the same, which a change's reach reads (`reached`).
         if test == "python":
-            place = "/" + ci.record_key("3.12", "3.12:tests/test_a.py", ci.cpu_class())
+            place = "/" + ci.record_key("3.12", "3.12:tests/test_a.py", ci.run_keys.cpu_class())
             kept = json.loads(cache_worker[1][place])
             assert kept["key"] is None and kept["depends"] is None
             assert any(path.partition(ci.followed.CODE)[0].endswith("docs/page.txt") for path in kept["read"])
@@ -1546,10 +1568,10 @@ def test_a_run_that_writes_a_checkout_file_it_read_keeps_no_key_by_any_writer(ci
 
 
 def test_a_lookups_entries_are_its_names_alone(ci):
-    """A write counts against an import lookup (`ci.looked_entry`) only where it is an entry the lookup
+    """A write counts against an import lookup (`run_keys.looked_entry`) only where it is an entry the lookup
     lists: its name, a module or package of any suffix beside it, a package's own __init__; none of another
     name, a deeper file, or one under a namesake package (review: `held/__init__report.json`)."""
-    entry = ci.looked_entry
+    entry = ci.run_keys.looked_entry
     assert all(entry(path, "src/held") for path in ("src/held", "src/held.py", "src/held.cpython-312.so",
                                                     "src/held/__init__.py", "src/held/__init__.pyc"))
     assert not any(entry(path, "src/held") for path in ("src/held/__init__report.json", "src/held/mod.py",
@@ -1572,7 +1594,7 @@ def test_a_conftest_fixture_is_the_input_of_the_files_whose_runs_took_it_alone(c
         "test_none.py": "def test_none():\n" + counted.format("none") + "    assert True\n"})
     interpreter(tmp_path, "3.12")
     url, _, _ = cache_worker
-    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
+    monkeypatch.setattr(ci.run_keys, "cpu_class", lambda: "GenuineIntel-6-143")
     cached(monkeypatch, url)
     out, names = tmp_path / "verdict.json", ("user", "none")
 
@@ -2163,7 +2185,7 @@ def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests
         for name, package in (("uses", "pkg.space.sub.used"), ("lone", "other.lone"))})
     interpreter(tmp_path, "3.12")
     url, _, _ = cache_worker
-    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
+    monkeypatch.setattr(ci.run_keys, "cpu_class", lambda: "GenuineIntel-6-143")
     cached(monkeypatch, url)
     out = tmp_path / "verdict.json"
 
@@ -2216,7 +2238,7 @@ def test_a_tools_init_added_or_a_helper_of_a_shadowing_name_reruns_the_rows_whos
                           "    assert value() and json.dumps(1)\n"})
     interpreter(tmp_path, "3.12")
     url, _, _ = cache_worker
-    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
+    monkeypatch.setattr(ci.run_keys, "cpu_class", lambda: "GenuineIntel-6-143")
     cached(monkeypatch, url)
     out = tmp_path / "verdict.json"
 
@@ -2354,8 +2376,9 @@ def test_the_lint_job_runs_every_gate_on_armada_against_the_merge_base_and_shows
     import yaml
 
     workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+    # The step that maps the gates onto armada, by what it runs, whatever it is titled.
     [step] = [step for step in workflow["jobs"]["lint"]["steps"]
-              if step.get("name") == "Every cheap gate (tools/check.sh), each on armada"]
+              if "armada map" in step.get("run", "") and "gates_told.py" in step.get("run", "")]
     gates = [line.split("\t")[0] for line in (ROOT / "tools/check_gates").read_text().splitlines()
              if line and not line.startswith("#")]
     # A checkout whose main moved on past its merge-base, as CI's (fetch-depth 0) holds it.
@@ -2394,13 +2417,16 @@ def test_the_lint_job_runs_every_gate_on_armada_against_the_merge_base_and_shows
         ran = subprocess.run(["bash", "-c", script], cwd=checkout, capture_output=True, text=True, timeout=60,
                              env=environment)
         assert ran.returncode == (1 if red else 0), ran.stdout + ran.stderr
-        # The last gate's line, and under it, when red, what it printed.
-        assert ran.stdout.splitlines()[-3 if red else -1:] == (
-            [f"{red}: exit 1 in 1 s", "  | ==src/a.py:[1:8]", "  | ==src/b.py:[3:10]"] if red
-            else [f"{gates[-1]}: exit 0 in 1 s"]), ran.stdout
-        assert (tmp_path / "items").read_text().splitlines() == gates
+        # Each gate's verdict as armada gave it (RUNNER_TEMP/lint.jsonl, which gates_told.py reads), and a red
+        # one's tail, which the job shows under its name.
+        told = [json.loads(line) for line in (tmp_path / "lint.jsonl").read_text().splitlines()]
+        assert {each["item"]: each["exitCode"] for each in told} == {gate: int(gate == red) for gate in gates}
+        assert {each["item"]: each["tail"] for each in told if each["exitCode"]} == (
+            {red: "==src/a.py:[1:8]\n==src/b.py:[3:10]"} if red else {})
+        assert all(line in ran.stdout for line in ("==src/a.py:[1:8]", "==src/b.py:[3:10]")) == bool(red)
+        assert set((tmp_path / "items").read_text().split()) == set(gates)
         words = (tmp_path / "words").read_text().split()
-        assert words[:2] == ["map", f"--commit={'a' * 40}"] and words[-2:] == [base, "{item}"]
+        assert {f"--commit={'a' * 40}", base} <= set(words)
         assert [word for word in words if word.startswith("--priority")] == priority
 
 

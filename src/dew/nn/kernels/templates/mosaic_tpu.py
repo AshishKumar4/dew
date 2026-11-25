@@ -335,8 +335,8 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
         # Each output's tile staged in VMEM twice its rows: a store's window shifted back to the output's
         # last rows holds the tile at the shift (`persist`'s `store`), whole, in no chunks.
         _one(consumers)
-        mosaic.refuse_staging(self, chunks)
-        return [pltpu.VMEM((2 * shape[0], *shape[1:]), dtype) for shape, dtype in outputs]
+        return [pltpu.VMEM((2 * shape[0], *shape[1:]), dtype)
+                for shape, dtype in mosaic.refuse_staging(self, chunks, outputs)]
 
     def opened(self, allocated, views: dict | None = None):
         if views is None:
@@ -439,9 +439,9 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
         return carry
 
     def walk_own[R](self, streams, views: dict, own: tuple, streamed: tuple, wg,
-                    walk: Callable[..., R], *, between=None, counted=0) -> R:
+                    walk: Callable[..., R], *, between=None, counted=0, common: bool = False) -> R:
         # One role a core: no partner reads a step it passes, so it walks its own steps alone.
-        del views, wg, between
+        del views, wg, between, common
         lo, hi = own
         return walk(streams, lo, hi, streamed[0] - counted)
 

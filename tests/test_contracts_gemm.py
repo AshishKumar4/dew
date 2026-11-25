@@ -11,6 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from arm_arithmetic import ahead_on_the_host
 from contract_support import EDGES, FORWARD_ORDERS, assert_contract, assert_drawn_contract, normal_draw
 from reference_error import Followed, Rounded, as_given, assert_as_exact, widened
 
@@ -280,6 +281,54 @@ def test_a_blockwise_fp8_projection_holds_every_reverse_order(edge):
 
 
 @pytest.mark.parametrize("edge", EDGES)
+def test_a_blockwise_fp8_chain_holds_every_reverse_order(edge):
+    """`projections.blockwise_chain` (an ungated MLP's two blockwise FP8 projections, the down projection's
+    rows quantized in the up projection's epilogue; its custom VJP each projection's own surrogate): every
+    reverse order, under a nested jit and a scan, in the rows and both matrices, finite wherever float64 is a
+    normal float32 and wherever the plain product of the two through the activation is, at values whose
+    products near float32's ends (row 8547). It takes no forward order: a custom VJP has none."""
+    primals = normal_draw(8547, (256, 128), (1, 128, 256), (1, 256, 128), scale=EDGES[edge])
+    direction = normal_draw(8548, (256, 128), (1, 128, 256), (1, 256, 128), scale=EDGES[edge])
+    (cotangent,) = normal_draw(8549, (256, 128))
+
+    def recipe(rows, up, down):
+        return projections.blockwise_chain(rows, up, down, jax.nn.relu, out_dtype=rows.dtype)
+
+    def plain(rows, up, down):
+        return jax.nn.relu(rows @ up[0]) @ down[0]
+
+    assert_contract(recipe, primals, direction, cotangent, f"a blockwise fp8 chain {edge}", truth_fn=plain,
+                    plain_fn=plain, without=FORWARD_ORDERS)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_gated_blockwise_fp8_chain_holds_every_reverse_order(edge):
+    """`projections.blockwise_chain` with its `gate` (a gated MLP's three blockwise FP8 projections, the
+    gate's product read by the up projection's epilogue and their SwiGLU quantized there; its custom VJP
+    each projection's own surrogate): every reverse order, under a nested jit and a scan, in the rows and
+    the three matrices, finite wherever float64 is a normal float32 and wherever the plain product of the
+    three through SwiGLU is, at values whose products near float32's ends (row 12689). It takes no forward
+    order."""
+    primals = normal_draw(12689, (256, 128), (1, 128, 256), (1, 128, 256), (1, 256, 128),
+                          scale=EDGES[edge])
+    direction = normal_draw(12690, (256, 128), (1, 128, 256), (1, 128, 256), (1, 256, 128),
+                            scale=EDGES[edge])
+    (cotangent,) = normal_draw(12691, (256, 128))
+
+    def swiglu(gate, up):
+        return jax.nn.silu(gate) * up
+
+    def recipe(rows, gate, up, down):
+        return projections.blockwise_chain(rows, up, down, swiglu, out_dtype=rows.dtype, gate=gate)
+
+    def plain(rows, gate, up, down):
+        return swiglu(rows @ gate[0], rows @ up[0]) @ down[0]
+
+    assert_contract(recipe, primals, direction, cotangent, f"a gated blockwise fp8 chain {edge}",
+                    truth_fn=plain, plain_fn=plain, without=FORWARD_ORDERS)
+
+
+@pytest.mark.parametrize("edge", EDGES)
 def test_an_nvfp4_products_kernels_hold_every_order(edge, kernel="xla"):
     """`gemm.nvfp4_product` on its selector's `kernel` (`xla` here, the decoded matrix's product; `packed`,
     the template's mainloop decoding each stage in place through `generation.linear_tangent` as `gemm` is,
@@ -292,9 +341,12 @@ def test_an_nvfp4_products_kernels_hold_every_order(edge, kernel="xla"):
     e2m1 = np.asarray([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
     magnitudes = np.where(codes >= 8, -1.0, 1.0) * e2m1[codes & 7]
     exponents = np.random.default_rng(3622).integers(-2, 3, size=(16, 64))
-    block = jnp.asarray(np.exp2(exponents), jnp.float8_e4m3fn)
-    matrix = formats.NvFp4.of(jnp.asarray(magnitudes, jnp.float32), block, 0.5)
-    values = matrix.decoded().astype(jnp.float32) * matrix.factor
+    # Packed and decoded on the host where a GPU tier part's prepare runs the cell, its device computing
+    # nothing before the contract's sites (row 12377's class: the H100 and A100 flows' packed cells).
+    with ahead_on_the_host():
+        matrix = formats.NvFp4.of(magnitudes.astype(np.float32),
+                                  np.exp2(exponents).astype(jnp.float8_e4m3fn), 0.5)
+        values = np.asarray(matrix.decoded().astype(jnp.float32) * matrix.factor)
     primals = normal_draw(3623, (64, 256), scale=EDGES[edge])
     direction = normal_draw(3624, (64, 256), scale=EDGES[edge])
     (cotangent,) = normal_draw(3625, (64, 64))

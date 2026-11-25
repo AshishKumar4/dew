@@ -378,9 +378,14 @@ class _Run:
 
     def at(self, *arguments):
         """Its program's leaves at `arguments` (a seeded draw's, `_on_a_mesh`), run in its context, a failure
-        named by its site and order."""
+        named by its site and order: an arm with no site (`reference_error.ahead_arm`), in a GPU tier part's
+        prepare compiled into its store and zeros, in its run that executable, elsewhere the program itself
+        (rows 12377, 12378: run eagerly, its prepare's compile-only device computed none of a case)."""
+        from reference_error import ahead_arm
+
         with self.context():
-            return ran(lambda: self.program(*arguments), self.site, self.name)
+            return ran(lambda: ahead_arm(self.program, f"{self.site}, {self.name}")(*arguments), self.site,
+                       self.name)
 
 
 def _on_a_mesh(fn, mesh, meshed: dict, *, truth_fn, draw, seeds, held) -> None:
@@ -428,10 +433,16 @@ def _on_a_mesh(fn, mesh, meshed: dict, *, truth_fn, draw, seeds, held) -> None:
 
 def _training_mesh():
     """Training's mesh of two of this process's devices (`MeshSpec`'s, its data axis two) a case's orders run
-    on (`_on_a_mesh`); None where the cell set its own mesh, under which its orders already run."""
+    on (`_on_a_mesh`); None where the cell set its own mesh, under which its orders already run, and in a GPU
+    tier part (`store_wire.COMPILED`): its prepare's devices are its host's CPUs and its store compiles for
+    one compile-only GPU, so no mesh of its run's devices is one its prepare holds, and a launch's specs
+    over a mesh are each order's own on the CPU lane's devices, where every case runs too (the GEMM lane's
+    dry prepare of the NVFP4 product's cell: "Received incompatible devices for jitted computation")."""
+    from store_wire import COMPILED
+
     from dew.training import MeshSpec
 
-    if not jax.sharding.get_abstract_mesh().empty:
+    if not jax.sharding.get_abstract_mesh().empty or COMPILED.get() is not None:
         return None
     return MeshSpec().build(jax.devices()[:2])
 
@@ -456,8 +467,13 @@ def _compiled_ahead(runs: list[_Run]) -> None:
     by Dew's compile of several (`report.attempts`), which its run's lowering finds: a convex mean's
     narrow, float64 and mesh programs of one order, 141,776 operations each, compiled one after another took
     its cell 140 s cold (row 11720). A compile's error is raised named by its site and order (`running`)."""
+    from store_wire import COMPILED
+
     from dew.nn.kernels.templates import report
 
+    if COMPILED.get() is not None:
+        # A GPU tier part's store compiles each in its prepare and its run reads them (`_Run.at`).
+        return
     for run, attempt in zip(runs, report.attempts([(run.lowered(), None) for run in runs]), strict=True):
         if attempt.error is not None:
             with running(run.site, run.name):

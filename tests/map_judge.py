@@ -85,7 +85,7 @@ def host_class() -> str:
     one (`check1_judge._pooled_draws`)."""
     from tool_support import load
 
-    return load("ci", "tools/armada").device_class()
+    return load("ci", "tools/armada").run_keys.device_class()
 
 
 def _file(site: str) -> str:

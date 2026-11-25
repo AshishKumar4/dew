@@ -670,6 +670,42 @@ def test_a_forked_backwards_compiled_shared_memory_is_its_described_scratch():
     assert backward['shared'] == resources.shared_bytes(family, resources.Scope(program=scratch)), backward
 
 
+@COMPILES_ON_CPU
+@pytest.mark.parametrize('target', [pytest.param(name, marks=lowers(name)) for name in ('sm80', 'sm90')])
+def test_a_forked_calls_training_step_compiles(target):
+    """The selective scan's training step over a forked call (`FORKED`'s, each row's documents from its
+    table) compiled for an A100 and an H100 (`kernel_compile`): both launches lower (`failures`; a spill is
+    its residency's, row 12905), where a document's state taken up from its table selected each vector of
+    it on a scalar (its slot's load), which no warpgroup lowering broadcasts (a GH200's forked exactness
+    test, 2026-11-19, and both compiles failed so, row 12904)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, failures
+
+    forked = FORKED["shared and chained"]
+    rows, length, channels, states = 2, 2048, 256, 16
+    operands = (jax.ShapeDtypeStruct((rows, length, channels), jnp.bfloat16),) * 2 + (
+        jax.ShapeDtypeStruct((channels, states), jnp.float32),
+        *(jax.ShapeDtypeStruct((rows, length, states), jnp.bfloat16),) * 2,
+        jax.ShapeDtypeStruct((channels,), jnp.float32),
+        # The table's one given state a row (`FORKED`'s).
+        jax.ShapeDtypeStruct((rows, 1, channels, states), jnp.float32))
+    family = bundles.of(target, jnp.bfloat16)
+
+    def call():
+        def trained(*given):
+            out, pull = jax.vjp(lambda *a: selective.selective_scan(*a, family=family, forked=forked)[0],
+                                *given)
+            return pull(out)
+
+        return trained, operands
+
+    (record,) = compile_mosaic_kernels([KernelCase('selective forked training', call)], target)
+    assert not failures([record]), failures([record])
+    names = [kernel['kernel'] for kernel in record['kernels']]
+    assert [name for name in names if 'selective_scan_backward' in name], names
+    assert [name for name in names if 'selective_scan' in name and 'backward' not in name], names
+
+
 @lowers('sm90')
 def test_a_launchs_backward_kernel_carries_its_launch():
     """The selective scan's training step lowered for an H100 (`kernel_compile.lowered_for`): its backward

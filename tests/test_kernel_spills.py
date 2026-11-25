@@ -1165,6 +1165,8 @@ class TwoKernels(grouped_matmul.MosaicGmm):
     def _fwd(self, tokens, kernel, sizes, *args, **kwargs):
         whole, residuals = super()._fwd(tokens, kernel, sizes, *args, **kwargs)
         half, _ = super()._fwd(tokens[: tokens.shape[0] // 2], kernel, sizes // 2, *args, **kwargs)
+        # One output: no several outputs' forms (`Hooks.out_forms`) bound.
+        assert isinstance(whole, jax.Array) and isinstance(half, jax.Array)
         return whole.at[: half.shape[0]].add(half), residuals
 
 

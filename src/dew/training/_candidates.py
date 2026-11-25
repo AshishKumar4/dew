@@ -370,21 +370,28 @@ def _candidate[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Trai
     # are two texts of one program (`dew.nn.kernels.options.program_digest`), the types of a helper call's
     # arguments, their shardings among them, telling its functions apart in the module.
     given = placed_shapes(batch, placement)
+    # What its updates' joined stacks a plan's release would part hold by count, each trace's summed over
+    # its Muon transforms (`newton_schulz.joined_held`); a trace JAX's cache answered notes none.
+    joined: list[int] = []
+
+    def noted[T](trace: Callable[[], T]) -> T:
+        traced, count = newton_schulz.joined_held(trace)
+        joined.append(count)
+        return traced
+
     lower = Routed(functools.partial(
-        lambda *arguments: jitted.trace(*arguments).lower(lowering_platforms=platforms),
+        lambda *arguments: noted(lambda: jitted.trace(*arguments).lower(lowering_platforms=platforms)),
         *apart(prepared), given, part))
     tuned = settings.tune_kernels and platforms is None
-    # Whether its updates join stacks a plan's release would part (`newton_schulz.joining`), off its trace.
-    with newton_schulz.joining() as joined:
-        if tuned:
-            lowered, kernels = tuning.tune(lower, measure=True), lower.report()
-        else:
-            # The tuner is off (bible §6): each launch takes its derived config, nothing settled or read.
-            made, found = routed(lambda: jitted.trace(*apart(prepared), given, part))
-            lowered = made.lower(lowering_platforms=platforms)
-            kernels = kernel_report(found, lowered)
+    if tuned:
+        lowered, kernels = tuning.tune(lower, measure=True), lower.report()
+    else:
+        # The tuner is off (bible §6): each launch takes its derived config, nothing settled or read.
+        made, found = routed(lambda: noted(lambda: jitted.trace(*apart(prepared), given, part)))
+        lowered = made.lower(lowering_platforms=platforms)
+        kernels = kernel_report(found, lowered)
     candidate = Candidate(micro, shapes, copies, shardings, prepared, held, built, lowered, kernels,
-                          joins=bool(joined))
+                          joined=max(joined, default=0))
     return dataclasses.replace(candidate, sampled=_sampled(stepping, candidate, batch, placement, replicated,
                                                            split, platforms))
 

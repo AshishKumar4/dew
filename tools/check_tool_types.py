@@ -287,30 +287,41 @@ SKIPPED_BUILDS = {"MAMBA_SKIP_CUDA_BUILD": "TRUE", "CAUSAL_CONV1D_SKIP_CUDA_BUIL
 """A release that compiles CUDA kernels at install, installed without them: pyright reads its Python alone."""
 
 
-def checked(environment: Path, paths: list[Path]) -> dict[Path, list[str]]:
-    """Each of `paths` with pyright's errors in it, its imports resolved in the virtual environment
-    `environment`: pyproject.toml's configuration with its environment named there (a configuration's `venv`
-    outranks `--pythonpath`, so a reference tool read Dew's environment, its libraries unresolved), every path
-    in it made absolute, since pyright reads them from the configuration's own directory."""
-    configuration = tomllib.loads((ROOT / "pyproject.toml").read_text())["tool"]["pyright"]
+def pyright_report(root: Path, overrides: dict, paths: list[str], written: Path,
+                   arguments: tuple[str, ...] = ()) -> list[dict]:
+    """Pyright's diagnostics for `paths` of checkout `root`: `root`'s pyproject.toml configuration, every path
+    in it made absolute, since pyright reads them from the configuration's own directory (`written`, where it
+    is written), the checkout first among its import roots (read in place, the configuration's directory is
+    the root `import tools.x` resolves from), with `overrides` over it, run from `root` with `arguments`."""
+    configuration = tomllib.loads((root / "pyproject.toml").read_text())["tool"]["pyright"]
     configuration = {**{name: value for name, value in configuration.items() if name != "include"},
-                     "venvPath": str(environment.parent), "venv": environment.name,
-                     "stubPath": str(ROOT / configuration["stubPath"]),
-                     # The checkout first: read in place, the configuration's own directory is the root
-                     # `import tools.x` resolves from; this one is read from beside the environment.
-                     "extraPaths": [str(ROOT), *(str(ROOT / path) for path in configuration["extraPaths"])],
+                     "stubPath": str(root / configuration["stubPath"]),
+                     "extraPaths": [str(root), *(str(root / path) for path in configuration["extraPaths"])],
                      "executionEnvironments": [
-                         {**each, "root": str(ROOT / each["root"]),
-                          "extraPaths": [str(ROOT / path) for path in each.get("extraPaths", [])]}
-                         for each in configuration.get("executionEnvironments", [])]}
-    (ROOT / ENVIRONMENTS).mkdir(exist_ok=True)
-    written = ROOT / ENVIRONMENTS / f"pyright-{environment.name}.json"
+                         {**each, "root": str(root / each["root"]),
+                          "extraPaths": [str(root / path) for path in each.get("extraPaths", [])]}
+                         for each in configuration.get("executionEnvironments", [])],
+                     **overrides}
     written.write_text(json.dumps(configuration))
-    ran = subprocess.run(["uvx", PYRIGHT, "--project", str(written), "--outputjson",
-                          *(str(path) for path in paths)], cwd=ROOT, capture_output=True, text=True,
+    ran = subprocess.run(["uvx", PYRIGHT, "--project", str(written), "--outputjson", *arguments, *paths],
+                         cwd=root, capture_output=True, text=True,
                          env={**os.environ, "NODE_OPTIONS": "--max-old-space-size=8192"}, check=False)
+    report = json.loads(ran.stdout or "{}")
+    if "generalDiagnostics" not in report:
+        raise SystemExit(f"pyright gave no report: {ran.stderr[-2000:]}")
+    return report["generalDiagnostics"]
+
+
+def checked(environment: Path, paths: list[Path]) -> dict[Path, list[str]]:
+    """Each of `paths` with pyright's errors in it (`pyright_report`), its imports resolved in the virtual
+    environment `environment`, named in the configuration (a configuration's `venv` outranks
+    `--pythonpath`, so a reference tool read Dew's environment, its libraries unresolved)."""
+    (ROOT / ENVIRONMENTS).mkdir(exist_ok=True)
+    diagnostics = pyright_report(ROOT, {"venvPath": str(environment.parent), "venv": environment.name},
+                                 [str(path) for path in paths],
+                                 ROOT / ENVIRONMENTS / f"pyright-{environment.name}.json")
     found: dict[Path, list[str]] = {path: [] for path in paths}
-    for diagnostic in json.loads(ran.stdout)["generalDiagnostics"]:
+    for diagnostic in diagnostics:
         if diagnostic["severity"] == "error":
             at, line = Path(diagnostic["file"]), diagnostic["range"]["start"]["line"] + 1
             said = f"{diagnostic['message'].splitlines()[0]} ({diagnostic.get('rule', '')})"

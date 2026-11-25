@@ -166,11 +166,12 @@ def committed(step):
 
 
 @pytest.mark.parametrize(("shape", "scan"), [(shape, scan) for scan in (False, True) for shape in SHAPES
-                                             if (shape, scan) != ("altup", True)])
+                                             if (shape, scan) not in SIZED_STEP_SEEDS])
 def test_recomputed_blocks_train_the_same_model(shape, scan):
-    """`assert_recomputed_blocks_train_the_same_model` over every block but the scanned AltUp one, whose
-    128 seeds run as map tasks of their own
-    (`test_a_recomputed_scanned_altup_block_trains_the_same_model`)."""
+    """`assert_recomputed_blocks_train_the_same_model` over every block but the scanned AltUp and latent-
+    attention ones, whose sized seeds run as map tasks of their own
+    (`test_a_recomputed_scanned_altup_block_trains_the_same_model`,
+    `test_a_recomputed_scanned_latent_attention_block_trains_the_same_model`)."""
     assert_recomputed_blocks_train_the_same_model(shape, scan=scan)
 
 
@@ -179,6 +180,13 @@ def test_a_recomputed_scanned_altup_block_trains_the_same_model():
     """`assert_recomputed_blocks_train_the_same_model` over the scanned AltUp block, its step's 128 sized
     seeds drawn in map tasks of 32 (ledger 3827: 141 s in one task)."""
     assert_recomputed_blocks_train_the_same_model("altup", scan=True)
+
+
+@pytest.mark.check1_shards(seeds=512, per_task=128)
+def test_a_recomputed_scanned_latent_attention_block_trains_the_same_model():
+    """`assert_recomputed_blocks_train_the_same_model` over the scanned latent-attention block, its step's
+    512 sized seeds drawn in map tasks of 128 (row 12444: 109 s in one task on armada, 125 s in CI)."""
+    assert_recomputed_blocks_train_the_same_model("mla", scan=True)
 
 
 def assert_recomputed_blocks_train_the_same_model(shape, *, scan):
