@@ -79,12 +79,15 @@ def test_a_looped_decoders_features_composed_plan_and_step(drawn, implicit, copi
 def test_a_drawn_pass_count_read_in_parts_is_refused_where_its_objective_computes_its_batchs_statistics():
     """An objective computing statistics of a step's whole batch (`batch_statistics`) computes them at its
     first part, by that part's pass count, and reads them at every part: a drawn count read in two parts a
-    step is refused, naming why, where read whole it plans and steps (row 10770's composition audit)."""
+    step is refused, naming why, before its plan compiles any step (row 12867: refused once its search had
+    climbed its ladder, 80 minutes on a 4B run), where read whole it plans and steps (row 10770's
+    composition audit)."""
     import optax
 
     from dew.distributed.placement import MeshSpec
     from dew.nn.kernels.generation import compile_only_gpus
     from dew.objectives.lm import LMObjective
+    from dew.telemetry.compiles import Ledger
     from dew.training import Layout, Trainer
     from dew.training.ahead import compile_ahead
 
@@ -108,8 +111,11 @@ def test_a_drawn_pass_count_read_in_parts_is_refused_where_its_objective_compute
         step.drawn(Interval(0.0, None, microbatches=0), 0)
         return float(step(state, batch)[1])
 
-    with pytest.raises(ValueError):
-        stepped(trainer_of(2))
+    refused = trainer_of(2)
+    state, _, _ = refused.place()
+    with Ledger(None) as compiles, pytest.raises(ValueError):
+        refused.compile(state, batch)
+    assert not [made for made in compiles.programs if made.kind == "compiled"], compiles.programs
     # A build ahead builds the step as the run does, and refuses alike.
     def built(law=TRAINED):
         trainer = trainer_of(2, law)
