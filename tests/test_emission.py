@@ -738,6 +738,42 @@ def test_a_steps_mask_of_its_tiles_indices_issues_once_and_one_of_its_place_each
     assert selected == selected_placed == 128, (selected, selected_placed)
 
 
+def test_a_cached_body_called_twice_counts_each_calls_invariant():
+    """One jitted body called on an iota and on an iota plus one (its trace cached, its equations one
+    object): two calls, each its invariant multiply's work, as two bodies' calls count (the review of
+    lane/toolkit 61dd3c7d2, P1: the second call charged nothing)."""
+    def body(first, second):
+        def taken(row):
+            indices = lax.iota(jnp.int32, 128)
+            return row + (first(indices) + second(indices + 1)).astype(jnp.float32)
+
+        return taken
+
+    tripled = jax.jit(lambda x: x * 3)
+    shared = _emitted(body(tripled, tripled), _ROW).roles[0].fixed
+    apart = _emitted(body(tripled, jax.jit(lambda x: x * 3)), _ROW).roles[0].fixed
+    assert shared.integer_operations == apart.integer_operations > 0, (shared, apart)
+
+
+def test_an_invariant_only_odd_steps_reach_counts_once():
+    """A walk whose odd steps alone add `iota // 16` (iotas and literals) computes it once: the loop's odd
+    trip finds it, its work the program's whatever trips the loop keeps (the review of lane/toolkit
+    61dd3c7d2, P1: found in a trip the loop discards, charged nowhere)."""
+    def walk(row, trips):
+        def step(index, row):
+            mosaic.step_index(index)
+            shifted = lax.cond(index % 2 == 1, lambda: (lax.iota(jnp.int32, 128) // 16).astype(jnp.float32),
+                               lambda: jnp.zeros(128, jnp.float32))
+            return row + shifted
+
+        return lax.fori_loop(0, trips, step, row)
+
+    alone = _emitted(lambda row: row + (lax.iota(jnp.int32, 128) // 16).astype(jnp.float32),
+                     _ROW).roles[0].fixed.integer_operations
+    walked = _emitted(walk, _ROW, _TRIPS).roles[0].fixed.integer_operations
+    assert walked >= alone > 0, (walked, alone)
+
+
 def test_a_scans_invariant_counts_once_and_its_trips_work_each_trip():
     """A static scan of 4 trips adding `iota // 16` (iotas and literals alone) to its carried row computes the
     division once and the add each trip: its integer operations those of one trip, its fp32 adds four times
@@ -849,6 +885,9 @@ def test_a_walk_issuing_one_warp_a_scheduler_waits_each_instructions_dependent_l
     # One warp a scheduler waits the interval each instruction; two, each its half, a multiprocessor's two.
     assert launched(hopper, sms, 1, 4) == slots * 4.6 + launch
     assert launched(hopper, 2 * sms, 2, 4) == 2 * (slots * (4.6 / 2)) + launch
+    # Three a multiprocessor at two resident: a wave of two, then one alone (the review of lane/toolkit
+    # 61dd3c7d2).
+    assert launched(hopper, 3 * sms, 2, 4) == 2 * (slots * (4.6 / 2)) + slots * 4.6 + launch
     filled = unmeasured.multiprocessors or 1
     assert launched(unmeasured, filled, 1, 4) == launched(unmeasured, filled, 1, 0)
 
@@ -856,7 +895,7 @@ def test_a_walk_issuing_one_warp_a_scheduler_waits_each_instructions_dependent_l
 def test_a_mosaic_launch_states_the_warps_its_issue_spreads_over():
     """A Mosaic GPU kernel's issuing warps (`emission.warps_of`): each walking warpgroup's four, weighted by
     its walk's issue slots against its busiest's: two warpgroups walking alike 8, one walking beside one that
-    does not 4 and the other's sliver (its guard's few issues a step, 4.004)."""
+    does not 4, the other's sliver of issues (its guard's) hiding no interval."""
     def walked(both: bool):
         def body(x_ref, o_ref):
             def walk():
@@ -871,18 +910,18 @@ def test_a_mosaic_launch_states_the_warps_its_issue_spreads_over():
                             thread_name="wg")
 
     row = jax.ShapeDtypeStruct((128,), jnp.float32)
-    for both, least, most in ((True, 8, 8), (False, 4, 4.05)):
+    for both, warps in ((True, 8), (False, 4)):
         traced = jax.make_jaxpr(emission.costed(walked(both), Stated(steps=16, bytes_accessed=0)))(row)
         (kernel,) = [equation for equation in programs.equations(traced.jaxpr)
                      if "cost_estimate" in equation.params]
-        found = emission.warps_of(kernel)
-        assert found is not None and least <= found <= most, (both, found)
+        assert emission.warps_of(kernel) == warps, (both, emission.warps_of(kernel))
 
 
 def test_a_programs_launches_price_in_sequence_and_an_uncounted_one_leaves_it_unknown():
     """A program of two costed launches (`emission.launches_seconds`) prices each at its own launch's seconds
-    (`cost.launch_seconds` of its work, programs and warps), their sum; one launch its emission does not count
-    leaves the program's price unknown, never 0."""
+    (`cost.launch_seconds` of its work, programs and warps), their sum, through a call alike; one launch its
+    emission does not count, or launches under a scan (the review of lane/toolkit 61dd3c7d2), leave the
+    program's price unknown, never 0."""
     target = generation.gpu_target("NVIDIA GH200 480GB")
     row = jax.ShapeDtypeStruct((128,), jnp.float32)
 
@@ -898,6 +937,12 @@ def test_a_programs_launches_price_in_sequence_and_an_uncounted_one_leaves_it_un
     assert len(kernels) == 2 and emission.launches_seconds(traced, target) == each[0] + each[1], each
     uncounted = jax.make_jaxpr(lambda x: launch(counted(x)))(row).jaxpr
     assert emission.launches_seconds(uncounted, target) is None
+    # Through a call, priced as its launches; under a scan, whose trips no sequence states, unknown.
+    called = jax.make_jaxpr(jax.jit(lambda x: counted(counted(x))))(row).jaxpr
+    assert emission.launches_seconds(called, target) == each[0] + each[1]
+    scanned = jax.make_jaxpr(lambda x: lax.scan(lambda carry, _: (counted(carry), None), x, None,
+                                                length=4)[0])(row).jaxpr
+    assert emission.launches_seconds(scanned, target) is None
 
 
 @pytest.mark.parametrize(("generation_name", "lanes"), [("sm80", 64), ("sm86", 128), ("sm89", 128),
