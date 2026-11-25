@@ -586,6 +586,11 @@ def mask_readers(config: Mapping[str, JSON]) -> tuple[list[JSON], Sequence[Mappi
     return groups, held if groups else ([] if config.get("spared", True) else [config])
 
 
+TYPED_OPTIMIZER = "typed_optimizer"
+"""The custom-metadata key an intermediate Dew saved each step under as its optimizer's spec built it
+(main f124c76b5 until row 12338): a step saved so holds its decay as its record states it, whatever mark
+lies beside its run (`MASKED_DECAY_MARK`). No Dew writes it now; deleted at 1.0 with the mark."""
+
 MASKED_DECAY_MARK = "earlier-masked-decay.json"
 """The file an intermediate Dew (main f124c76b5 until row 12338's deletion of its restore translation) kept
 beside a run whose earlier record masked its decay off as it rewrote that record, its masked parts' decay

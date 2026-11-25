@@ -34,7 +34,6 @@ from dew.data.facts import largest_bounds
 from dew.data.handoff import pool_of
 from dew.data.lowering import (
     _cache_inputs,
-    _CachedOutputs,
     _ConsumedAt,
     _counts_rows,
     _fill,
@@ -49,6 +48,7 @@ from dew.data.pipeline import (
     Artifact,
     Batched,
     BatchedGroups,
+    CachedOutputs,
     Combined,
     Concatenated,
     FlatMap,
@@ -189,7 +189,7 @@ def _memory_inputs(
             for index, outputs in enumerate(filling):
                 if not isinstance(outputs, tuple):
                     raise TypeError("cached input must return its tuple of expansion outputs")
-                for child, value in enumerate(_CachedOutputs().flat_map(outputs)):
+                for child, value in enumerate(CachedOutputs().flat_map(outputs)):
                     if isinstance(value, Rejected):
                         counter.dropped(value)
                     elif automatic:

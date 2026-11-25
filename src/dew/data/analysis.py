@@ -828,6 +828,15 @@ def _regrouped(pipeline: Pipeline, read: Read, eager: int) -> None:
                              f"row's group anew: {', or '.join(remedies)}")
 
 
+def indexable(stages: Sequence[Stage]) -> bool:
+    """Whether `stages` make one record of each, in any order alike: maps alone, none dropping a record it
+    cannot make (`rejects`), none on a pool of its own, none reading what may change (`_volatile`), which
+    a read by index may run in its window's order (`dew.data.lowering._ShardSteps.indexed`,
+    `dew.data.shards.IndexedMap`)."""
+    return all(type(stage) is Map and not stage.rejects and stage.pool is None and not _volatile(stage)
+               for stage in stages)
+
+
 def rejects(stage: Stage) -> bool:
     """Whether `stage` drops a record it cannot make (`rejects`: a decode's failure), keeping every other
     one for one."""

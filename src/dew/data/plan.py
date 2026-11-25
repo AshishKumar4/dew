@@ -662,10 +662,12 @@ def _locked() -> str:
     it parses every installed distribution's metadata, most of a second, which no compilation
     changes."""
     locked = [_checkout.ROOT / name for name in ("pyproject.toml", "uv.lock", "constraints.txt")]
+    # Each distribution's metadata parsed once, its name and version read from it: `Distribution.version`
+    # and each `metadata` read parse it again (row 12475: 1,416 parses a process).
     dependencies = {
-        distribution.metadata["Name"]: distribution.version
-        for distribution in importlib.metadata.distributions()
-        if distribution.metadata["Name"]
+        metadata["Name"]: metadata["Version"]
+        for metadata in (distribution.metadata for distribution in importlib.metadata.distributions())
+        if metadata["Name"]
     }
     return fingerprint(
         {

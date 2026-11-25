@@ -43,12 +43,14 @@ from dew._coordination import agree_process_phase, agreed, agreed_same
 from dew._files import write_atomically
 from dew._records import JSON
 from dew.checkpoints import RUN_FILE, Checkpoints
+from dew.checkpoints._step_records import saved_under
 from dew.config.earlier import (
     ADDITIVE_UNSETTABLE,
     KERNELS_SPLIT,
     LAYOUT_UNSETTABLE,
     MARKERS,
     MASKED_DECAY_MARK,
+    TYPED_OPTIMIZER,
     _LoopChange,
     earlier_run,
     unmarked,
@@ -1096,7 +1098,7 @@ class RunConfig:
         (`MASKED_DECAY_MARK`), decided by the step its resume restores (`Checkpoints.latest`), here, where
         its process has joined its pool (`resumed`, after `prepare_process`): its optimizer's decay masked off
         as that run's (`unmarked`), or as it is where that step is the intermediate Dew's own
-        (`typed_optimizer`), saved under the record it rewrote."""
+        (`TYPED_OPTIMIZER`), saved under the record it rewrote."""
         name = self.trainer.name
         assert name is not None, "a run resumes under its name"
         mark = epath.Path(self.trainer.directory(name)) / MASKED_DECAY_MARK
@@ -1107,7 +1109,7 @@ class RunConfig:
             return self
         with self.trainer.checkpoints(name) as checkpoints:
             step = checkpoints.latest
-            if step is not None and checkpoints.saved_with(step, "typed_optimizer") is True:
+            if step is not None and saved_under(checkpoints, step, TYPED_OPTIMIZER) is True:
                 return self
         earlier = unmarked(self.record(), _records.record(marked, MASKED_DECAY_MARK))
         fields = _records.record(earlier["fields"], "run fields")
