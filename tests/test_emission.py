@@ -813,6 +813,55 @@ def test_an_fp32_multiply_whose_one_use_is_an_add_counts_as_one_fused_instructio
     assert role.fixed.fused_multiply_adds == fused, role.fixed
 
 
+def test_a_walk_issuing_one_warp_a_scheduler_waits_each_instructions_dependent_latency():
+    """A GH200 program of one warpgroup, one resident a multiprocessor, issues one warp a scheduler: each of
+    its instructions waits the one before it (`Multiprocessor.issue_interval`, 4.6 clocks: M-NA-21's decode
+    walk at one warp a scheduler, 4.56, and M-FS-70's KDA intra at two, 57% not issued, 4.65), so its walk
+    takes its issue slots 4.6 times over, beyond its ALU's 2; twice the programs of the same work, two
+    resident, issue two warps a scheduler and take the same time (M-NA-21: K64 at two resident 309 us
+    against K128 at one 346 us, the same bytes in flight). An A100's interval unmeasured, its walk is its
+    units'."""
+    hopper, ampere = generation.gpu_target("NVIDIA GH200 480GB"), generation.gpu_target("sm80")
+    program = Work(integer_operations=128 * 1000)
+
+    def launched(target, count: int, resident: int, warps: float) -> float:
+        work = Work(integer_operations=program.integer_operations * count, kernels=1)
+        return cost.launch_seconds(work, count, target, resident=resident, warps=warps)
+
+    sms = hopper.multiprocessors
+    assert sms is not None
+    waited = 4.6 * 1000 / hopper.loaded_clock_hz + (hopper.launch_seconds or 0.0)
+    assert launched(hopper, sms, 1, 4) == pytest.approx(waited, rel=1e-12)
+    assert launched(hopper, 2 * sms, 2, 4) == pytest.approx(waited, rel=1e-12)
+    filled = ampere.multiprocessors or 1
+    assert launched(ampere, filled, 1, 4) == launched(ampere, filled, 1, 0)
+
+
+def test_a_mosaic_launch_states_the_warps_its_issue_spreads_over():
+    """A Mosaic GPU kernel's issuing warps (`emission.warps_of`): each walking warpgroup's four, weighted by
+    its walk's issue slots against its busiest's: two warpgroups walking alike 8, one walking beside one that
+    does not 4."""
+    def walked(both: bool):
+        def body(x_ref, o_ref):
+            def walk():
+                o_ref[...] = lax.fori_loop(0, 8, lambda index, row: row * 2.0, x_ref[...])
+
+            if both:
+                walk()
+            else:
+                pl.when(lax.axis_index("wg") == 0)(walk)
+
+        return plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((128,), jnp.float32), num_threads=2,
+                            thread_name="wg")
+
+    row = jax.ShapeDtypeStruct((128,), jnp.float32)
+    for both, warps in ((True, 8), (False, 4)):
+        traced = jax.make_jaxpr(emission.costed(walked(both), Stated(steps=16, bytes_accessed=0)))(row)
+        (kernel,) = [equation for equation in programs.equations(traced.jaxpr)
+                     if "cost_estimate" in equation.params]
+        assert emission.warps_of(kernel) == warps, (both, emission.warps_of(kernel))
+
+
 @pytest.mark.parametrize(("generation_name", "lanes"), [("sm80", 64), ("sm86", 128), ("sm89", 128),
                                                         ("sm90", 128), ("sm100", 128), ("sm120", 128)])
 def test_an_fp32_instruction_takes_a_lane_a_clock_a_fused_pair_one(generation_name, lanes):
