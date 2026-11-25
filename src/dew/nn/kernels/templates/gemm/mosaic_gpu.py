@@ -80,7 +80,13 @@ from dew.nn.kernels.templates.gemm import (
     sides_padded,
 )
 from dew.nn.kernels.templates.gemm.chained import Chained, Partition, flag_row, flags_declared, guarded_walk
-from dew.nn.kernels.templates.gemm.pricing import dense_tail, family_of, tile_columns, tile_rows
+from dew.nn.kernels.templates.gemm.pricing import (
+    dense_tail,
+    family_of,
+    tail_workspace,
+    tile_columns,
+    tile_rows,
+)
 from dew.nn.kernels.templates.gemm.row_tiles import TMA_ROWS
 from dew.nn.kernels.templates.gemm.tiling import GMM, GUARDED_GMM, TGMM, Tiles
 from dew.nn.kernels.templates.product import SCALE_DEPTH, block_format
@@ -569,7 +575,9 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                 finished = functools.partial(
                     _gmm_finished, accs, wg=wg, store=store, family=family, part=part,
                     share_row=tiles.share_row(wg), m=m, g=g, dense=dense, row_tile=block_m * pair,
-                    whole=any(form is not None and form[1] for form in forms),
+                    whole=any(form is not None and form.transposed for form in forms),
+                    narrowed=tuple(form.divisor if form is not None and form.narrowed else 1
+                                   for form in forms),
                     epilogue=epilogue, flags=(flags_gmem, pair, tiles.sharing),
                     sides=tuple(zip(side_gmems, epilogue_axes, side_smems, side_barriers, strict=True)),
                     partials=None if tail is None else (workspace, ready))
@@ -606,18 +614,19 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                                          parts=(tail, scales if scales is not None else packed_format,
                                                 mx_scales, gather, chained), beside=beside))
     return kernel(*(operands if dense else (table, *operands)), *prologue_operands, *epilogue_operands,
-                  *_workspace(tail, (pair, pairs, 2, consumers, *part), interpret))
+                  *_workspace(tail, tail_workspace(tiles, family, pair * pairs), interpret))
 
 
 def _gmm_forms_refused(tiles: Tiles, family: mosaic.Family, k: int, n: int, mx_scales, step_scales, *,
                        parts: tuple, transpose_rhs: bool, transpose_lhs: bool, exact_sums: bool) -> None:
     """Dew: `gmm`'s refusal of an MX product's or a depth split's form it cannot run (`_mx_refused`,
-    `_gmm_split_refused`), `parts` its prologue, epilogue, pair and scales: a step-scaled product's epilogue
-    reads its sums as any product's (its next product's rows quantized there, row 8547)."""
+    `_gmm_split_refused`), `parts` its prologue, epilogue, pair and scales: a step-scaled or block-scaled
+    product's epilogue reads its sums as any product's (its next product's rows quantized there, rows 8547
+    and 12721)."""
     prologue, _, paired, scales = parts
     hooked = any(each is not None for each in parts[:3])
     _mx_refused(mx_scales, tiles, family, transpose_rhs=transpose_rhs,
-                plain=all(each is None for each in (*parts, step_scales))
+                plain=all(each is None for each in (prologue, paired, scales, step_scales))
                 and not (transpose_lhs or exact_sums))
     _gmm_split_refused(tiles, k, n, step_scales, exact_sums=exact_sums, hooked=hooked,
                        plain=all(each is None for each in (prologue, paired, scales)) and not transpose_lhs)
@@ -760,14 +769,17 @@ def _declared(lhs, rhs, gather, shape: tuple[int, int, int | None], splits: int,
 
 def _gmm_finished(accs: tuple, tile: tuple, wg, store, *, family: mosaic.Family, part: tuple, share_row,
                   m: int, g: int, dense: bool, row_tile: int, epilogue, o_gmems: tuple, sides: tuple,
-                  partials, flags: tuple = (None, 1, 1), whole: bool = False) -> None:
+                  partials, flags: tuple = (None, 1, 1), whole: bool = False, narrowed: tuple = ()) -> None:
     """Dew: a consumer's share of a `gmm` tile stored (`_finished`) from its accumulators: at once, or,
     a balanced tail's tile (`partials`: its workspace and readiness flags), once its program's partial and
     the other programs' are added (`mosaic.Family.fixed_up`); with `flags` (`chained.flags_declared`'s, the
     pair and the consumers sharing a tile's rows, `Tiles.sharing`), its row share's written at its table
     entry (`chained.flag_row`): a ping-pong consumer's whole tile's the one slot, as it alone finishes the
     tile (`persistent`'s ping-pong walk; 3b97e20f F5); with `whole`, each share's whole rows (a transposed
-    output's, `stores.transposed_rows`, the tensor's bound clipping those past its last)."""
+    output's, `stores.transposed_rows`, the tensor's bound clipping those past its last); `narrowed`, each
+    output's divisor where its epilogue computes it narrower than the tile (`quantized.Form.narrowed`), its
+    first column its own: the column tile's index times its own width, a multiple of the stores' tiling the
+    lowering sees, where a tile's column over the divisor is no multiple it can prove."""
     group, row_start, ni, _, gathered, program, split, entry = tile
     flags_gmem, pair, sharing = flags
     nonfinite = None if flags_gmem is None else flags_gmem.at[
@@ -784,7 +796,9 @@ def _gmm_finished(accs: tuple, tile: tuple, wg, store, *, family: mosaic.Family,
         _finished, family=family, wg=wg, epilogue=epilogue, o_gmems=o_gmems, store=store, sides=sides,
         origins={'rows': pl.ds(part_row, part[0]), 'columns': pl.ds(column, part[1])},
         group=_side_group(group, g), nonfinite=nonfinite,
-        place=(part_row, first, stored, column, min(part[0], m), TMA_ROWS if dense else 1))
+        place=(part_row, first, stored, column, min(part[0], m), TMA_ROWS if dense else 1),
+        narrowed=tuple(None if divisor == 1 else (divisor, ni * (part[1] // divisor))
+                       for divisor in narrowed))
     if partials is None or partials[0] is None:
         finished(*accs)
         return
@@ -859,7 +873,7 @@ def _fixed_loaded(family: mosaic.Family, prologue_gmems, prologue_axes: tuple, f
 
 
 def _finished(*accs, family: mosaic.Family, wg, epilogue, o_gmems: tuple, store, sides: tuple, origins: dict,
-              group, place: tuple, nonfinite=None) -> None:
+              group, place: tuple, nonfinite=None, narrowed: tuple = ()) -> None:
     """Dew: a consumer's share of a `gmm` tile from its accumulators (`accs`), read out a chunk of columns
     at a time (`mosaic.Issuer.chunks`: all of them at once where its registers hold them): its epilogue on
     its side tiles' same columns (`sides`, each its global ref, axes, staging and barrier, loaded at
@@ -869,7 +883,9 @@ def _finished(*accs, family: mosaic.Family, wg, epilogue, o_gmems: tuple, store,
     `nonfinite` (a one-entry int32 ref, `flags_declared`), whether any value the share stores is non-finite
     written there: the stored value's, converted once, as a finite fp32 sum can overflow its output's dtype
     (base review b1ab251ac F1: 65536, the joined sum where the products' was 65504, an fp16 infinity), of its
-    stored rows alone: another group's, by this entry's matrix, may overflow (base review d0bc7dee6 F3)."""
+    stored rows alone: another group's, by this entry's matrix, may overflow (base review d0bc7dee6 F3). An
+    output `narrowed` names (its divisor and first column, `_gmm_finished`'s) is stored at its own column, a
+    chunk's a `divisor`-th of its tile column."""
     family.loaded([(gmem.at[axes.named(side_axes, origins | axes.at_group(side_axes, gmem.shape, group))],
                     smem.at[wg], barrier.at[wg])
                    for gmem, side_axes, smem, barrier in sides],
@@ -880,21 +896,25 @@ def _finished(*accs, family: mosaic.Family, wg, epilogue, o_gmems: tuple, store,
     layout = family.layout if family.budgets_registers else None
     for start, chunk in family.chunks(accs):
         columns = {'columns': slice(start, start + chunk[0].shape[-1])}
+        # The epilogue and each output's store in the accumulator's layout: a form's write reads it (a
+        # packed output's pairs, `quantized.paired`).
         with quantized.epilogue_layout(layout):
             values = chunk if epilogue is None else epilogue(*chunk, *(
                 axes.by_rows(family.side_tile(smem.at[wg].at[axes.placed(axes.held(side_axes), columns)],
                                               axes.held(side_axes)), side_axes, rows)
                 for _, side_axes, smem, _ in sides))
-        values = values if isinstance(values, tuple) else (values,)
-        for output, (o_gmem, value) in enumerate(zip(o_gmems, values, strict=True)):
-            value = value.astype(_stored_dtype(o_gmem))
-            if nonfinite is not None:
-                # An entry times zero is NaN where it is infinite or NaN, zero elsewhere, of the rows the
-                # share stores: a predicate reduced over the warpgroup by a barrier, no scratch.
-                kept = family.iota(value.shape, 0) - first
-                stored_rows = (kept >= 0) & (kept < stored)
-                seen = seen | jnp.any(stored_rows & jnp.isnan(value * 0))
-            store(output, value, o_gmem, (row_start, first, stored, column + start, *ladder))
+            values = values if isinstance(values, tuple) else (values,)
+            for output, (o_gmem, value) in enumerate(zip(o_gmems, values, strict=True)):
+                value = value.astype(_stored_dtype(o_gmem))
+                if nonfinite is not None:
+                    # An entry times zero is NaN where it is infinite or NaN, zero elsewhere, of the rows the
+                    # share stores: a predicate reduced over the warpgroup by a barrier, no scratch.
+                    kept = family.iota(value.shape, 0) - first
+                    stored_rows = (kept >= 0) & (kept < stored)
+                    seen = seen | jnp.any(stored_rows & jnp.isnan(value * 0))
+                own = narrowed[output] if narrowed else None
+                at = column + start if own is None else own[1] + start // own[0]
+                store(output, value, o_gmem, (row_start, first, stored, at, *ladder))
     if nonfinite is not None:
         nonfinite[...] = jnp.broadcast_to(seen.astype(jnp.int32), (1,))
 
@@ -1008,9 +1028,10 @@ def _mx_refused(mx_scales, tiles: Tiles, family: mosaic.Family, *, transpose_rhs
     row order, a gathered product's its tokens' at the table (the caller's gather, `gemm._block_scaled`, row
     4851); FP8 or E2M1 rows times a K-major matrix of theirs, each block of each scaled in the products,
     `mosaic.Issuer.scaled_products`) it does not take: but on a family whose products take block scales, its
-    matrix K-major, with no hook, pair, packed matrix, step scales, transposed rows, exact sums or split, its
-    tile whole 128s of rows, columns and depth (the scales' tiles), each group's rows whole 128-row tiles (the
-    caller's)."""
+    matrix K-major, with no prologue, pair, packed matrix, step scales, transposed rows, exact sums or split,
+    its tile whole 128s of rows, columns and depth (the scales' tiles), each group's rows whole 128-row tiles
+    (the caller's). An epilogue reads its sums as any product's (its tensor scales applied and its next
+    product's rows quantized there, `gemm.nvfp4_block_finished`, row 12721)."""
     if mx_scales is None:
         return
     if not (family.block_formats and transpose_rhs and plain and tiles.splits == 1
@@ -2204,7 +2225,8 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                            resident=tiles.programs, scalars=len(groups),
                            cost=unit_cost.estimate(2 * k * m * n, lhs, rhs, *prologue_operands, out_type))
     return kernel(*groups, lhs, rhs, *(table for table in tables if table is not None), *(step_scales or ()),
-                  *prologue_operands, *_workspace(tail, (pair, pairs, 2, consumers, *part), interpret))
+                  *prologue_operands,
+                  *_workspace(tail, tail_workspace(tiles, family, pair * pairs), interpret))
 
 def _tgmm_finished(wg, tile: tuple, summed, store, *, active, family: mosaic.Family, tiles: Tiles, m: int,
                    o_gmem, partials) -> None:

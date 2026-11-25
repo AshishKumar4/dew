@@ -1375,13 +1375,14 @@ def _configured_name(precision: jax.lax.PrecisionLike) -> str | None:
     return name.lower() if name in jax.lax.Precision.__members__ else name
 
 
-def configured_precision(precision: jax.lax.PrecisionLike):
+def configured_precision(precision: jax.lax.PrecisionLike, *, exact: bool = False):
     """A context in which a product that takes no precision of its own (jax.nn's xla attention)
-    multiplies at `precision`, through `jax.default_matmul_precision`; an unset or default
-    precision changes nothing, a floor the configured one meets. A precision no config names
-    (`configurable_precision`) is refused."""
+    multiplies at `precision`, through `jax.default_matmul_precision`; an unset precision changes nothing,
+    and a default one nothing unless `exact`, where it overrides an outer higher one (splash's arms, each
+    at exactly its own). A precision no config names (`configurable_precision`) is refused."""
     name = _configured_name(precision)
-    return contextlib.nullcontext() if name in (None, 'default') else jax.default_matmul_precision(name)
+    kept = name is None or (name == 'default' and not exact)
+    return contextlib.nullcontext() if kept else jax.default_matmul_precision(name)
 
 
 def operand_precision(dtype: Dtype | None, precision: jax.lax.PrecisionLike = None) -> jax.lax.PrecisionLike:
@@ -1895,10 +1896,14 @@ def twice_scaled(product: jax.Array, first: jax.Array, second: jax.Array) -> jax
     input's block scale near float32's largest (2**113 for inputs near 2**122) overflows the codes' product
     the kernel's scale (2**-9) brings back in range, and one near the least normal underflows it the other
     way (ledger 2715), as two tensor scales near 2**-76 do multiplied first (an NVFP4 product of operands
-    near 2**-65), so no one order holds both ends; the result overflows only where the product does."""
+    near 2**-65), so no one order holds both ends; the result overflows only where the product does. Its
+    tests are comparisons alone (finite: a magnitude below infinity), so a kernel's epilogue runs it as XLA
+    does: Mosaic GPU lowers no `is_finite` (`gemm.nvfp4_block_finished`, row 12721)."""
     tiny = jnp.finfo(product.dtype).tiny
     once = product * first
-    kept = jnp.isfinite(once) & ((jnp.abs(once) >= tiny) | (product == 0))
+    magnitude = jnp.abs(once)
+    # Not `jnp.isfinite`: Mosaic GPU lowers no is_finite, and the fused NVFP4 epilogue runs this in a kernel.
+    kept = (magnitude < np.inf) & ((magnitude >= tiny) | (product == 0))
     return jnp.where(kept, once, product * second) * jnp.where(kept, second, first)  # no cotangent unchosen
 
 

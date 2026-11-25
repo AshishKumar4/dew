@@ -36,7 +36,7 @@ import struct
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import IO, BinaryIO
 
@@ -218,24 +218,36 @@ def merged_arrays(units: Sequence[Path], base: Path | None = None) -> dict[str, 
     if common is None:
         raise ValueError("a fixture merges at least one unit")
     if base is not None:
-        with np.load(base, allow_pickle=False) as part:
-            recorded = json.loads(str(part["provenance"]))
-            named, device = recorded.pop("devices", None), recorded.pop("device")
-            if recorded != common:
-                raise ValueError(f"{base} was recorded under another provenance ({recorded}) than its units "
-                                 f"({common}): record every site of it again")
-            owner = {site: name for name, sites in named.items() for site in sites} if named else {}
-            redone = {key.split(".", 1)[0] for key in stored}
-            for key, value in part.items():
-                site = key.split(".", 1)[0]
-                if key == "provenance" or site in redone:
-                    continue
-                stored[key] = value
-                placed(site, owner[site] if named else device)
+        kept, placed_on = kept_sites(base, {key.split(".", 1)[0] for key in stored}, common)
+        stored.update(kept)
+        for site, device in placed_on.items():
+            placed(site, device)
     named = {"device": next(iter(devices))} if len(devices) == 1 else {"device": " and ".join(devices),
                                                                        "devices": devices}
     stored["provenance"] = np.asarray(json.dumps({**common, **named}))
     return stored
+
+
+def kept_sites(base: Path, redone: Collection[str],
+               common: Mapping[str, object]) -> tuple[dict[str, np.ndarray], dict[str, str]]:
+    """What a recording of the sites `redone` keeps of its pinned recording `base`: the keys of every other
+    site, in their order, and each kept site's device. Refused where a site is kept and `base` was recorded
+    under another provenance than `common` (the new recording's, its device aside): its sites cannot sit
+    beside the new ones. A recording of every site again keeps none, whatever `base`'s provenance (row
+    12337: a whole re-recording under a new release was refused). The one overlay of a pinned recording, a
+    merge of units' (`merged_arrays`) and a recorder's own (tools/mamba2_reference.py's `write_seeded`)."""
+    with np.load(base, allow_pickle=False) as part:
+        recorded = json.loads(str(part["provenance"]))
+        named, device = recorded.pop("devices", None), recorded.pop("device")
+        names = [key for key in part.files if key != "provenance" and key.split(".", 1)[0] not in redone]
+        if names and recorded != common:
+            raise ValueError(f"{base} was recorded under another provenance ({recorded}) than its sites "
+                             f"recorded again ({common}): record every site of it again")
+        # Each kept key read alone, once its keeping is allowed: a site recorded again is never decompressed.
+        kept = {key: part[key] for key in names}
+    owner = {site: name for name, sites in named.items() for site in sites} if named else {}
+    sites = dict.fromkeys(key.split(".", 1)[0] for key in kept)
+    return kept, {site: owner[site] if named else device for site in sites}
 
 
 def pinned_base(fixture: Path) -> Path | None:

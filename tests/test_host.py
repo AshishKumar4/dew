@@ -17,4 +17,4 @@ def test_a_host_s_class_is_its_microarchitecture_byte_for_byte_as_the_records_ha
     is this one."""
     assert cpu_class(ZEN4) == "AuthenticAMD-25-17"
     assert cpu_class(NEOVERSE) == "0x41-8-0xd4f"
-    assert load("ci", "tools/armada").cpu_class() == cpu_class()
+    assert load("ci", "tools/armada").run_keys.cpu_class() == cpu_class()

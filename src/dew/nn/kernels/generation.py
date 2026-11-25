@@ -114,6 +114,7 @@ class Choice(enum.StrEnum):
     DECODE = 'decode'
     DELTA_DECODE = 'delta_decode'
     DELTA_GATES = 'delta_gates'
+    DIAGONAL_SCAN = 'diagonal_scan'
     GATE_UP = 'gate_up'
     GATED_MLP = 'gated_mlp'
     GATED_DELTA_RULE = 'gated_delta_rule'
@@ -139,6 +140,7 @@ class Choice(enum.StrEnum):
     SSD = 'ssd'
     SWIGLU = 'swiglu'
     SYRK = 'syrk'
+    WKV4 = 'wkv4'
 
 
 CHOICES = frozenset(choice.value for choice in Choice)
@@ -260,7 +262,12 @@ class Multiprocessor:
     `block_shared`, the static shared memory a block declares without opting in), the threads of a warp
     (`warp_threads`), the allocator's `register_step` a thread (256 a warp), the shared memory the driver
     reserves for each resident block (`reserved_shared`), the bytes its shared memory serves a clock
-    (`shared_bytes_per_clock`), and the range its warpgroups' `setmaxnreg` moves a thread's registers in
+    (`shared_bytes_per_clock`), the threads' instructions its warp schedulers issue a clock
+    (`issue_per_clock`: four schedulers, each one warp's instruction a clock, CUDA C++ Programming Guide 12.6
+    §16.6.1 to §16.8.1 for compute capabilities 7.x to 9.0; 10.x and 12.x, which no edition of it describes,
+    taken alike), the clocks between one warp's issues in a walk (`issue_interval`: its instructions'
+    dependent latency over a walk's mix, so `issue_interval` warps a scheduler keep it issuing; measured, None
+    where not), and the range its warpgroups' `setmaxnreg` moves a thread's registers in
     (`register_raises`, None before Hopper). The defaults are the facts every CUDA compute capability from 7.5
     to 12.x shares (CUDA C++ Programming Guide §5.1, Tables 33 and 34; 128 bytes a clock measured 126 to 128
     on an A100 and an H800, Luo et al. 2025, "Dissecting the NVIDIA Hopper Architecture through
@@ -278,6 +285,8 @@ class Multiprocessor:
     register_step: int = 8
     reserved_shared: int = 1024
     shared_bytes_per_clock: int = 128
+    issue_per_clock: int = 4 * 32
+    issue_interval: float | None = None
     register_raises: RegisterRaises | None = SETMAXNREG
 
     def raises(self) -> RegisterRaises:
@@ -321,6 +330,16 @@ class Architecture:
     exponentials_per_clock: float | None = None
     integer_per_clock: float | None = None
     integer_multiply_adds_per_clock: float | None = None
+    global_reduction_bytes_per_clock: float | None = None
+    """The bytes a multiprocessor reduces into global memory a clock an element at a time (`red.global`,
+    `Work.global_reductions`), an effective rate fitted to whole kernels: on an A100 (M-NA-9,
+    A100-SXM4-40GB at 1.095 GHz) the fused attention backward's predicated-on RED.E.ADD.F32 lanes' bytes
+    (its dQ, dK and dV adds, four bytes a lane) over its whole kernel's elapsed clocks were 2.97, 3.00 and
+    3.69 bytes a clock a multiprocessor at head widths 64, 128 and 256, stated at the two narrower's 3.0. Its
+    counters beside them, observations rather than a measured ceiling: lg_throttle 38-51% of the kernel's
+    not-issued samples, 90-95% of those at the adds, L2's atomic input 26-33% busy. None where unmeasured,
+    where the reductions are work at no rate (`dew.algebra.cost.cheaper`: a form adding more of them is
+    never cheaper)."""
     tma: bool = False
     dependent_launch: bool = False
     tmem_columns: int | None = None
@@ -390,9 +409,16 @@ slowest of add, shift, logic and comparison) and the integer multiply-adds its F
 every compute capability from 7.5 to 12.1 alike (the CUDA C++ Best Practices Guide 13.5's §12.1.1 Table 5:
 shl.b32, xor.b32 and mad.lo.s32 at 64; add.s32 at 128, min.s32 at 64 to 128)."""
 _AMPERE = Architecture(('mma.sync',), {'16bit': 2048, 'tf32': 1024},
-                       Multiprocessor(resident_threads=2048, resident_blocks=32, register_raises=None),
+                       # A warp's issue interval in a walk, 8.7 clocks on an A100: M-NA-9's attention
+                       # backwards under ncu (sm__inst_executed a multiprocessor a clock over the warps each
+                       # scheduler held), the template's at one warp a scheduler and FA2's at two alike, d64
+                       # 6.9 and 6.6, d128 9.1 and 8.0, d256 12.0 and 11.0: their geometric mean, the
+                       # interval growing with the head width's mix.
+                       Multiprocessor(resident_threads=2048, resident_blocks=32, register_raises=None,
+                                      issue_interval=8.7),
                        vector_per_clock=128, exponentials_per_clock=CUDA_EXPONENTIALS,
-                       integer_per_clock=INTEGER_PER_CLOCK, integer_multiply_adds_per_clock=INTEGER_PER_CLOCK)
+                       integer_per_clock=INTEGER_PER_CLOCK, integer_multiply_adds_per_clock=INTEGER_PER_CLOCK,
+                       global_reduction_bytes_per_clock=3.0)
 _AMPERE_CONSUMER = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512},
                                 Multiprocessor(register_raises=None),
                                 vector_per_clock=256, exponentials_per_clock=CUDA_EXPONENTIALS,
@@ -409,7 +435,11 @@ _TURING = Architecture((), {'16bit': 1024}, Multiprocessor(resident_threads=1024
 # Hopper issues wgmma (sm_90a) and mma.sync, its TMA multicast to a pair of multiprocessors a cluster (the
 # pair CUTLASS's grouped GEMM and cuBLASLt take on an H100).
 _HOPPER = Architecture(('wgmma', 'mma.sync'), {'16bit': 4096, 'tf32': 2048, '8bit': 8192},
-                       Multiprocessor(resident_threads=2048, resident_blocks=32),
+                       # A warp's issue interval in a walk, 4.6 clocks on a GH200: M-NA-21's decode walk
+                       # (Q16/K128, three stages, one warpgroup a program and one resident, one warp a
+                       # scheduler) 345.1 us over its 75.66 us of issue slots, 4.56; M-FS-70's KDA intra
+                       # launch at two warps a scheduler 57% not issued, 2 / 0.43 = 4.65.
+                       Multiprocessor(resident_threads=2048, resident_blocks=32, issue_interval=4.6),
                        vector_per_clock=256, exponentials_per_clock=CUDA_EXPONENTIALS,
                        integer_per_clock=INTEGER_PER_CLOCK, integer_multiply_adds_per_clock=INTEGER_PER_CLOCK,
                        tma=True, dependent_launch=True, cluster=2)
@@ -610,6 +640,20 @@ class GpuTarget:
     def architecture(self) -> Architecture:
         """The target's instruction family's facts (`architecture`), none where it belongs to none."""
         return architecture(self.generation) or Architecture(())
+
+    @property
+    def reference_workspace(self) -> int | None:
+        """The nominal ceiling XLA sets for one cuBLAS GEMM's workspace on this GPU, its library's rule by
+        compute capability: 32 MiB from Hopper on, 4 MiB before (xla/service/gpu/matmul_utils.h's
+        `kHopperWorkspace` and `kDefaultWorkspace`, applied by xla/backends/gpu/transforms/gemm_rewriter.cc,
+        which clamps a legacy GEMM's to its operands' bytes). A template's launch holds no more beside its
+        operands and outputs (a split's fp32 partials, a balanced tail's, `pricing.within_workspace`); its
+        peak-memory parity with the reference (kernel-templates.md §1) is measured apart. None off a CUDA
+        GPU."""
+        found = capability(self.generation)
+        if found is None:
+            return None
+        return (32 if found >= (9, 0) else 4) * 2**20
 
     @property
     def tensor_rates(self) -> Mapping[str, int]:

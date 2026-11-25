@@ -9,16 +9,14 @@ import threading
 from collections.abc import Mapping, Sequence
 from typing import overload
 
-import grain.experimental as gx
 import grain.python as grain
 import numpy as np
 from grain._src.python.dataset.transformations.shuffle import _reshuffle_window, _WindowShuffleDatasetIterator
-from grain._src.python.experimental.index_shuffle.python import index_shuffle_module as index_shuffle
 
 from dew.batch import Batch
 from dew.data.dataset import Ranges
 from dew.data.pipeline import Pipeline, Repeat
-from dew.data.shards import Window, passed, served
+from dew.data.shards import Window, passed, served, shuffled
 
 
 class BlockShuffle(grain.MapDataset[Batch]):
@@ -69,7 +67,7 @@ class BlockShuffle(grain.MapDataset[Batch]):
         seed = int(np.random.SeedSequence([self._seed, epoch, block]).generate_state(1)[0])
         # Grain's shuffle of an integer range, `MapDataset.range(size).shuffle(seed)`, at one index
         # of its first epoch (`ShuffleMapDataset._shuffled_index`).
-        offset = gx.index_shuffle(place, max_index=blocks.counts[block] - 1, seed=seed, rounds=4)
+        offset = shuffled(place, blocks.counts[block] - 1, seed)
         for member in members:
             if offset < self._sizes[member]:
                 return epoch * self._total + self._shards.start(member) + offset
@@ -156,8 +154,7 @@ class _WindowShuffled(_WindowShuffleDatasetIterator[Batch]):
         """The place in the served window of the record it gives `given`th: Grain's (`_reshuffle_window`'s
         list of the window's places by `index_shuffle`, given from its last), drawn alone."""
         held = self._served.held if self._served is not None else 0
-        return index_shuffle.index_shuffle(held - 1 - given, max_index=held - 1,
-                                           seed=self._global_seed + self._window_index, rounds=4)
+        return shuffled(held - 1 - given, held - 1, self._global_seed + self._window_index)
 
     def __next__(self) -> Batch:
         while True:

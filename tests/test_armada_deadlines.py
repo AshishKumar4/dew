@@ -46,10 +46,42 @@ def test_a_task_past_its_deadline_is_interrupted_its_hung_file_red_and_the_rest_
     # The deadline, the interrupt's grace, one settle budget and the reader's join, with room to spare.
     assert time.monotonic() - began < 3.0 + 2.0 + ci.SETTLE + 10 + 15
     rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
-    assert {name: (row["exitCode"], row["kind"]) for name, row in rows.items()} == {
-        "3.12:tests/test_quick.py": (1, ci.STALE), "3.12:tests/test_hangs.py": (1, "deadline"),
+    # Each file runs in a process of its own (ci.py's `task`): the one before the hang is graded green.
+    assert {name: (row["exitCode"], row.get("kind")) for name, row in rows.items()} == {
+        "3.12:tests/test_quick.py": (0, None), "3.12:tests/test_hangs.py": (1, "deadline"),
         "3.12:tests/test_zlast.py": (1, ci.STALE)}
     assert "spent in tests/test_hangs.py" in rows["3.12:tests/test_zlast.py"]["output"]
+
+
+def test_a_file_cut_short_by_another_files_deadline_is_run_again_not_green(ci):
+    """Where tests of two files interleave (A[0], B[0], A[1]) and the deadline falls in B[0], file A has a
+    case, but not every test its collection selected reported: it is not graded green but said stale and run
+    again (`grading.graded`, row 12179); with every selected test reported (its set-aside ones among the
+    deselected) it is green, and a failed case is still its red."""
+    import xml.etree.ElementTree as ET
+
+    def case(name: str, failed: bool = False) -> ET.Element:
+        found = ET.Element("testcase", classname="tests.test_a", name=name, file="tests/test_a.py")
+        if failed:
+            ET.SubElement(found, "failure", message="assert 1 == 2")
+        return found
+
+    def grade(own: list, collected: int, deselected: int = 0) -> tuple:
+        counted = {"collected": collected, "deselected": deselected}
+        red, _, cause = ci.grading.graded("tests/test_a.py", own, own, counted, reported=True, returncode=-2,
+                                          expired=3.0, running="tests/test_b.py")
+        return bool(red), cause.get("kind")
+
+    assert grade([case("test_0")], collected=2) == (True, ci.STALE)
+    assert grade([case("test_0")], collected=3, deselected=2) == (False, None)
+    assert grade([case("test_0", failed=True)], collected=2) == (True, "nodes")
+    # A case skipped on a missing import says the file red whole, cut short or not.
+    skipped = case("test_0")
+    ET.SubElement(skipped, "skipped", message="could not import 'absent'")
+    red, _, cause = ci.grading.graded("tests/test_a.py", [skipped], [skipped],
+                                      {"collected": 2, "deselected": 0}, reported=True, returncode=-2,
+                                      expired=3.0, running="tests/test_b.py")
+    assert red and cause["kind"] == "whole"
 
 
 STALLS = {
@@ -175,9 +207,11 @@ def test_a_task_past_its_deadline_times_the_file_it_stopped_in_at_the_least_it_n
     first, stuck, never = (rows[f"3.12:tests/test_{name}.py"] for name in ("first", "stuck", "never"))
     slept = first["tests"]["tests/test_first.py::test_first"]
     assert (first["exitCode"], stuck["kind"], never["kind"]) == (0, "deadline", ci.STALE)
-    assert slept >= 0.5 and first["seconds"] == slept
+    # Each file runs in a process of its own (ci.py's `task`), timed at its process's wall time, its start
+    # among it, which the file costs a container.
+    assert slept >= 0.5 and first["seconds"] >= slept
     # The file the deadline stopped holds the wall time the finished file's own did not.
-    assert stuck["seconds"] + slept >= deadline
+    assert stuck["seconds"] + first["seconds"] >= deadline
     assert stuck["timings"] == {"3.12:tests/test_stuck.py": stuck["seconds"]}
     # The rows claim no more than the task took, and a file that never started none of it.
     assert sum(row["seconds"] for row in rows.values()) <= wall
@@ -187,6 +221,21 @@ def test_a_task_past_its_deadline_times_the_file_it_stopped_in_at_the_least_it_n
     # The stall's record among this task's own artifacts (`stalls.kept`), never an enclosing task's.
     [kept] = stuck["artifacts"]
     assert (tmp_path / "artifacts" / kept).is_file()
+
+
+def test_a_files_process_that_stalls_before_any_test_holds_its_tasks_time(ci, tmp_path):
+    """A file whose own process stalls before any test begins (its import, its collection) is the deadline's
+    red and holds the time its task spent, never a file that never started, which armada weighs no plan by
+    (row 3924's review)."""
+    (tmp_path / "tests").mkdir(exist_ok=True)
+    (tmp_path / "tests/test_importing.py").write_text(
+        "import time\ntime.sleep(60)\ndef test_never():\n    pass\n")
+    interpreter(tmp_path, "3.12")
+    out = tmp_path / "verdict.json"
+    ci.task("3.12", ["tests/test_importing.py"], "", out, 3.0, cache="off", grace=2.0)
+    [row] = json.loads(out.read_text())["rows"]
+    assert (row["exitCode"], row["kind"]) == (1, "deadline")
+    assert "unobserved" not in row and row["seconds"] >= 3.0
 
 
 def test_a_pytest_that_never_began_runs_again_and_one_a_signal_ended_is_red_with_its_signal(ci, tmp_path):

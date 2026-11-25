@@ -14,6 +14,7 @@ multiprocessor's (`generation.Multiprocessor.shared_bytes_per_clock`). Nothing r
 import dataclasses
 import functools
 import math
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, NamedTuple
 
 from jax.experimental import pallas as pl
@@ -166,6 +167,23 @@ class Work:
     """Elementwise operations no rule prices (`emission.operation_work`: an atan2's, an erf_inv's, which no
     kernel's body holds and no probe has measured), one an output element, at no rate (`units`): a form
     taking more of them is never cheaper (`dew.algebra.cost.cheaper`), its price never a guess."""
+    fused_multiply_adds: float = 0.0
+    """The adds the assembler fuses into the multiply each alone reads (FFMA, ptxas's --fmad, its default),
+    an element each, their multiplies among `operations`: a body's multiply whose one use is an add of its
+    shape (`emission`), a product's on the CUDA cores (`Precision.HIGHEST`'s FLOPs, an FFMA two,
+    `multiplied`). A CUDA multiprocessor's lanes run each within its multiply's instruction, a TPU's VPU as
+    an operation of its own (`Rates.fused`); counted apart, so every field stays work a unit issues and a
+    branch's or a role's most of each unit is never another's credit (the review of lane/toolkit
+    5cbbe66c586)."""
+    issue_excess: float = 0.0
+    """The issue slots `issued` counts of a most taken unit by unit (a conditional's branches', `emission`'s
+    envelope; its walking roles', a launch's) beyond the most any one of them issues: none of them issues
+    another's mix (the review of lane/toolkit c9307c11146), so `issued` takes it off."""
+    global_reductions: float = 0.0
+    """The bytes a body reduces into global memory an element at a time through L2's atomic units
+    (`red.global`: mma.sync's dQ adds, `atomic_store_p`), each its own memory instruction a lane, at the
+    rate its multiprocessor's requests reach them (`Architecture.global_reduction_bytes_per_clock`); a TMA
+    reduction (`copy_smem_to_gmem`'s `add`) is a copy's bytes, not these."""
     chains: tuple[Chain, ...] = dataclasses.field(default=(), metadata=_NOT_ISSUED)
 
     def __add__(self, other: "Work") -> "Work":
@@ -191,7 +209,9 @@ class Rates(NamedTuple):
     """A target's rate of each unit `units` prices, per second (`rates`), read by name: the tensor cores'
     16-bit, TF32 and FP8 modes, the CUDA cores, the special-function units, shared memory, the on-chip memory
     XLA's fusion keeps its kernels' operands and results in, the integer units (a CUDA multiprocessor's
-    ALU), its FMA pipe's integer multiply-adds and device memory; None where the target states none. Named,
+    ALU), its FMA pipe's integer multiply-adds, device memory, the element-wise reductions into global
+    memory and a multiprocessor's schedulers' issue slots, and the adds fused into multiplies (none of a CUDA
+    multiprocessor's time, infinite; a TPU's at its vector units'); None where the target states none. Named,
     so a unit added among them misreads no consumer (the review of train 1074, F5)."""
 
     tensor: float | None
@@ -204,6 +224,9 @@ class Rates(NamedTuple):
     integer: float | None
     multiply_adds: float | None
     device: float | None
+    reductions: float | None
+    issue: float | None
+    fused: float | None
 
 
 @functools.cache
@@ -213,11 +236,17 @@ def rates(target: generation.GpuTarget, *, device: bool) -> Rates:
     vector units (the CUDA cores, a TPU's VPU), the special-function units, shared memory, the on-chip memory
     XLA's fusion keeps its kernels' operands and results in (`Work.kept_bytes`), the integer units (a CUDA
     multiprocessor's ALU, `Architecture.integer_per_clock`), its FMA pipe's integer multiply-adds
-    (`Architecture.integer_multiply_adds_per_clock`) and device memory. Each is a multiprocessor's at
+    (`Architecture.integer_multiply_adds_per_clock`), device memory, the element-wise reductions into
+    global memory (`Architecture.global_reduction_bytes_per_clock`) and the instructions its schedulers
+    issue (`Multiprocessor.issue_per_clock`). A CUDA multiprocessor's vector units are its fp32 lanes, an
+    instruction a lane a clock (`Architecture.vector_per_clock` their FLOPs, two a lane). Each is a
+    multiprocessor's at
     the clock the target holds under a step's tensor-core load (`GpuTarget.loaded_clock_hz`: a B200's
     measured 1.549 GHz, not its 1.965 GHz boost), or with `device` the whole device's (its multiprocessors at
     that clock, the tensor cores at its datasheet's dense peak where it states no clock), where a tile walk's
-    device bytes and XLA's fusion's staged bytes cost nothing (infinite). What XLA's fusion keeps on chip is a
+    device bytes and XLA's fusion's staged bytes cost nothing (infinite), and the issue slots (each kernel of
+    XLA's fusion runs its units in series, `dew.algebra.cost.Fused`, which no slot shares), as on a target of
+    no CUDA multiprocessor. What XLA's fusion keeps on chip is a
     TPU's VMEM traffic, with `device` at its VMEM rate (`GpuTarget.vmem_rate`), and nothing a GPU's or a tile
     walk's (infinite); a TPU tile walk's staged bytes are its VMEM's too, at that rate (its shared memory's
     slot). None for a unit the target states no rate of (a TPU's vector and transcendental units, an
@@ -242,34 +271,96 @@ def rates(target: generation.GpuTarget, *, device: bool) -> Rates:
     eight = rate(target.tensor_rate("8bit")) or tensor
     kept = target.vmem_rate if device and tpu else math.inf
     staged = target.vmem_rate if tpu else rate(None if held is None else held.shared_bytes_per_clock)
+    vector = architecture.vector_per_clock
+    lanes = vector / 2 if vector is not None and held is not None else vector
+    issue = math.inf if device or held is None else rate(held.issue_per_clock)
     return Rates(tensor=tensor, tf32=rate(target.tensor_rate("tf32")), eight=eight,
-                 cuda=rate(architecture.vector_per_clock), special=rate(architecture.exponentials_per_clock),
+                 cuda=rate(lanes), special=rate(architecture.exponentials_per_clock),
                  shared=math.inf if device else staged, kept=kept,
                  integer=rate(architecture.integer_per_clock),
                  multiply_adds=rate(architecture.integer_multiply_adds_per_clock),
-                 device=target.memory_rate if device else math.inf)
+                 device=target.memory_rate if device else math.inf,
+                 reductions=rate(architecture.global_reduction_bytes_per_clock), issue=issue,
+                 fused=rate(vector) if held is None else math.inf)
 
 
 def units(work: Work, at: Rates) -> tuple[list[float], tuple[float, ...]]:
     """`work`'s seconds on each unit at the rates `at` (`rates`'): the tensor cores (their 16-bit, TF32 and
-    FP8 modes in turn), the CUDA cores (operations and conversions, and the integer multiply-adds their FMA
-    pipe issues beside them at its own rate), the special-function units, on-chip
-    memory (shared memory's bytes, then what XLA's fusion keeps there, one memory's two levels, so a TPU's
-    one VMEM is one unit), device memory, the integer units and the operations no rule prices
-    (`Work.unpriced_operations`, at no rate); and, level by level, the work at a rate the target states none
-    of, which no time prices (0 where one does)."""
+    FP8 modes in turn), the CUDA cores (their instructions, operations and conversions; the adds fused into
+    a multiply, `Work.fused_multiply_adds`, at their own rate; and the integer multiply-adds their FMA pipe
+    issues beside them at its own rate), the special-function units, on-chip memory (shared memory's bytes,
+    then what XLA's
+    fusion keeps there, one memory's two levels, so a TPU's one VMEM is one unit), device memory, the integer
+    units, the element-wise reductions into global memory, the issue slots every instruction of those units
+    takes (`issued`) and the operations no rule prices (`Work.unpriced_operations`, at no rate); and, level
+    by level, the work at a rate the target states none of, which no time prices (0 where one does)."""
     grouped = (((work.flops, at.tensor), (work.tf32_flops, at.tf32), (work.fp8_flops, at.eight)),
-               ((work.operations + work.conversions, at.cuda),
+               ((work.operations + work.conversions, at.cuda), (work.fused_multiply_adds, at.fused),
                 (work.integer_multiply_adds, at.multiply_adds)),
                ((work.exponentials, at.special),),
                ((work.shared_bytes, at.shared), (work.kept_bytes, at.kept)),
                ((work.device_bytes, at.device),), ((work.integer_operations, at.integer),),
+               ((work.global_reductions, at.reductions),), ((issued(work), at.issue),),
                ((work.unpriced_operations, None),))
     priced = [sum((amount / per_second for amount, per_second in unit if amount and per_second is not None),
                   0.0) for unit in grouped]
     unpriced = tuple(amount if per_second is None else 0.0 for unit in grouped for amount, per_second in unit)
     return priced, unpriced
 
+
+
+def repeated(work: Work, count: float) -> Work:
+    """`work` repeated `count` times in a chain: its every unit's, its span and each of its paths'; its
+    kernels its own (a loop's trips run in one), `emission`'s and `inline_work`'s alike."""
+    return Work(**{field.name: getattr(work, field.name) * count for field in dataclasses.fields(Work)
+                   if field.name not in ("kernels", "chains")}, kernels=work.kernels,
+                chains=tuple(chain.times(count) for chain in work.chains))
+
+def most(works: Sequence[Work]) -> Work:
+    """The most of each unit any of `works` holds, alternatives of which one runs (a conditional's branches,
+    `emission`'s and `inline_work`'s; none, `Work()`): its span the longest, every path none of the others
+    outlasts (as works side by side keep them), and its issue slots the most any one of them issues
+    (`Work.issue_excess`), none issuing another's mix."""
+    if not works:
+        return Work()
+    taken = Work(**{field.name: max(getattr(work, field.name) for work in works)
+                    for field in dataclasses.fields(Work) if field.name not in ("chains", "issue_excess")},
+                 chains=sum(works, Work()).chains)
+    return dataclasses.replace(taken, issue_excess=max(0.0, issued(taken) - max(map(issued, works))))
+
+def latency_bound(work: Work, at: Rates, target: generation.GpuTarget, *, held: float) -> float:
+    """`work`'s issue slots (`issued`) at the rate `at` takes them, when a multiprocessor's schedulers hold
+    `held` warps issuing it: a warp issues once a `Multiprocessor.issue_interval` clocks, so a scheduler of
+    fewer warps than that interval issues that share of its clocks (`issue_interval / warps` the issue
+    slots' seconds over, M-NA-21's one warp a scheduler 4.56); 0 where the target states no interval or no
+    warps are held."""
+    multiprocessor = target.architecture.multiprocessor
+    if (multiprocessor is None or multiprocessor.issue_interval is None or held <= 0
+            or at.issue in (None, math.inf)):
+        return 0.0
+    interval = multiprocessor.issue_interval
+    # Each scheduler issues one warp's instruction a clock, 32 threads' (`Multiprocessor.issue_per_clock`).
+    schedulers = multiprocessor.issue_per_clock / 32
+    return issued(work) / at.issue * max(1.0, interval / (held / schedulers))
+
+
+def multiplied(field: str, flops: float) -> Work:
+    """A product's `flops` in the unit its mode takes (`product.product_mode`'s field): on the CUDA cores
+    (`operations`, `Precision.HIGHEST`'s fp32), each multiply an operation and its add fused into it, an FFMA
+    a pair (`Work.fused_multiply_adds`)."""
+    if field != "operations":
+        return dataclasses.replace(Work(), **{field: flops})
+    return Work(operations=flops / 2, fused_multiply_adds=flops / 2)
+
+def issued(work: Work) -> float:
+    """The instructions `work`'s threads issue on a CUDA multiprocessor's units, each taking one of its
+    schedulers' slots (`Multiprocessor.issue_per_clock`): its fp32 lanes' (`units`' CUDA cores'), its integer
+    ALU's and FMA pipe's, its special-function units' and its reductions into global memory (one a lane, four
+    bytes each), less what a most taken unit by unit counts beyond any one alternative's
+    (`Work.issue_excess`); its tensor-core and memory instructions, each a warp's work of many elements, are
+    none."""
+    return (work.operations + work.conversions + work.integer_operations + work.integer_multiply_adds
+            + work.exponentials + work.global_reductions / 4 - work.issue_excess)
 
 def spanned(work: Work, latency: float | None) -> tuple[float, float]:
     """`work`'s span at a dependent step's `latency` (`Work.span`), and its span at no latency stated
@@ -370,18 +461,32 @@ def streamed(per_program_bytes: float, busiest: int, bandwidth: float, multiproc
 
 
 def launch_seconds(work: Work, programs: int, target: generation.GpuTarget, *,
-                   resident: int = 1) -> float:
+                   resident: int = 1, warps: float = 0.0) -> float:
     """One kernel launch's seconds on `target` for `programs` programs at `resident` programs per
-    multiprocessor: the longer of the busiest multiprocessor's throughput work (`ceil(n / SMs)` programs
-    sharing one multiprocessor's units), its overlapped latency waves (`ceil(n / wave)` waves of `path`),
-    plus launch latency, against the whole launch's device bound (`seconds`). Co-resident programs share one
-    multiprocessor's throughput units rather than multiplying its peak by `resident`, while overlapping
-    their dependent paths (rows 6216, 10809, 10810)."""
+    multiprocessor, each issuing over `warps` warps (`emission.warps_of`; 0 where unknown): the longer of
+    the busiest multiprocessor's throughput work (`ceil(n / SMs)` programs sharing one multiprocessor's
+    units), its overlapped latency waves (`ceil(n / wave)` waves of `path`), plus launch latency, against
+    the whole launch's device bound (`seconds`). Co-resident programs share one multiprocessor's throughput
+    units rather than multiplying its peak by `resident`, while overlapping their dependent paths (rows
+    6216, 10809, 10810). Its issue slots take a warp's issue interval (`Multiprocessor.issue_interval`) over
+    the warps each scheduler holds, where fewer warps than that interval leave it idle between a warp's
+    instructions (`latency_bound`: rows 5274, 4123)."""
     count = max(programs, 1)
     shared = {unit: getattr(work, unit) / count for unit in (*ISSUED_UNITS, "device_bytes")}
     per_program = dataclasses.replace(work, **shared, kernels=0)
     per_sm = spread(count, target.multiprocessors or 1)
     waves = spread(count, wave(target.multiprocessors, resident))
-    unit_seconds = max(units(per_program, rates(target, device=False))[0])
-    wave_seconds = max(per_sm * unit_seconds, waves * path(per_program, target))
+    at = rates(target, device=False)
+    throughput = max(units(per_program, at)[0])
+
+    def resident_wave(held: int) -> float:
+        # `held` programs at once on a multiprocessor: their units shared, their warps hiding each other's
+        # issue intervals.
+        return held * max(throughput, latency_bound(per_program, at, target, held=held * warps))
+
+    # Its full waves at the residency it holds, then its last at the programs left (the review of
+    # lane/toolkit 61dd3c7d2: three programs at two resident are a wave of two and one of one).
+    full, left = divmod(per_sm, max(1, min(resident, per_sm)))
+    busiest = full * resident_wave(min(resident, per_sm)) + (resident_wave(left) if left else 0.0)
+    wave_seconds = max(busiest, waves * path(per_program, target))
     return max(wave_seconds + (target.launch_seconds or 0.0), seconds(work, target))

@@ -1086,6 +1086,39 @@ def test_an_mlps_projections_run_as_one_recipe_chain_bitwise_their_projections_a
         np.testing.assert_array_equal(_bits(mine), _bits(theirs))
 
 
+@pytest.mark.parametrize("activation", ["gelu", "swiglu"])
+def test_an_mlps_recipe_chain_keeps_its_products_under_a_remat_policy_saving_its_residuals(activation):
+    """An MLP whose projections run as one blockwise FP8 chain (`GatedMLP._chained`) names the chain's gate
+    and up products as its projections apart name them (`Residual.GATE_PROJ`, `Residual.UP_PROJ`): its
+    training step under a remat policy saving the MLP's residuals (a decoder block's minimal policies')
+    runs as many products as without remat, its backward recomputing neither first projection nor their
+    quantizing epilogue (row 12758)."""
+    from reference_error import equations
+
+    from dew.nn.mlp import GatedMLP
+    from dew.nn.precision import projection_role
+    from dew.nn.residuals import Residual
+
+    mlp = GatedMLP(hidden_features=256, out_features=128, activation=activation, dtype=jnp.bfloat16)
+    x = jax.random.normal(jax.random.key(0), (2, 64, 128), jnp.bfloat16)
+    variables = nn.unbox(mlp.init(jax.random.key(1), x))
+
+    def loss(variables, x):
+        return jnp.sum(jnp.asarray(mlp.apply(variables, x), jnp.float32))
+
+    def products(fn) -> int:
+        graph = jax.make_jaxpr(jax.grad(fn, argnums=(0, 1)))(variables, x)
+        return sum(equation.primitive.name in ("dot_general", "ragged_dot_general")
+                   for equation in equations(graph, platform="cpu"))
+
+    policy = jax.checkpoint_policies.save_only_these_names(Residual.GATE_PROJ, Residual.UP_PROJ,
+                                                           Residual.DOWN_PROJ)
+    with generation.run_precision(RECIPE_NUMERICS["blockwise_fp8"]), projection_role("mlp"):
+        plain, kept = products(loss), products(jax.checkpoint(loss, policy=policy))
+        recomputed = products(jax.checkpoint(loss, policy=jax.checkpoint_policies.nothing_saveable))
+    assert kept == plain < recomputed, (kept, plain, recomputed)
+
+
 def _bits(leaf) -> np.ndarray:
     """`leaf`'s raw bit patterns, so a bitwise comparison tells -0.0 from +0.0."""
     held = np.asarray(leaf)

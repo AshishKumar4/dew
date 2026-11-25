@@ -99,7 +99,6 @@ from dew.data.mixing import (
     KeyedMix,
     Streak,
     TokenDeficit,
-    _weights,
     mix_end,
     mixed_indexed,
     rewound,
@@ -209,12 +208,6 @@ def _streamed_take(pipeline: Pipeline, read: str) -> bool:
     bound = examples_limit(pipeline.stages)
     batched = _until(pipeline.stages, (BatchStage,))
     return any(isinstance(stage, Limit) and at != bound for at, stage in enumerate(pipeline.stages[:batched]))
-
-
-def _shared_pool(pool: int, members: int, index: int) -> int:
-    """The loading workers the `index`th of `members` corpora reads in, of a mixture's `pool`: an
-    equal share, the first ones taking what is left over; one given none reads in the reading process."""
-    return pool // members + int(index < pool % members)
 
 
 class _Marked(pygrain.MapDataset):
@@ -1408,8 +1401,10 @@ class _Build:
         """The build of the `index`th corpus a mixture, phases or a concatenation reads, by its own
         analysis, keyed by the name it goes by there (`_member_key`)."""
         members = strings(self.lowering.order["members"], "mixture members")
-        pool = (None if self.pool is None
-                else Workers(_shared_pool(self.pool.count, len(members), index), self.pool.buffer))
+        # A mixture's members share its workers by their draw weights (`_Lowering.draws`); phases' and a
+        # concatenation's, each read in turn, equally.
+        weights = list(self.lowering.draws) or [1.0] * len(members)
+        pool = None if self.pool is None else self.pool.shared(weights, index)
         loading = self.loading if pool is None else dataclasses.replace(self.loading, workers=pool.count)
         # A member's own mixes stamp nothing: only the phase's mix draws what other phases read on.
         return dataclasses.replace(self, lowering=self.lowering.children[index], loading=loading, pool=pool,
@@ -1553,8 +1548,9 @@ class _Build:
         known = [length for length in lengths if length is not None]
         end = mix_end(known, source) if len(known) == len(lengths) else None
         # A token mix whose members state their counts weighs each by them (`STATED_SHARES`), as its indexed
-        # read does (`mixed_indexed`); a record mix by its weights.
-        weights = _weights(source) if stated else source.weights
+        # read does (`mixed_indexed`); a record mix by its weights: the draws its workers are shared by
+        # (`_Lowering.draws`).
+        weights = self.lowering.draws
         return KeyedMix(streams, weights, keys, source.seed, stamped=self.stamped, end=end)
 
     def member_records(self, member: Pipeline, index: int) -> int | None:

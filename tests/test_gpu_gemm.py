@@ -19,6 +19,9 @@ one process (`gpu_flow`), each cell its own file's property:
   accumulator width and on a two-CTA pair, the pair also on extents no tile divides (test_gemm_tcgen05).
 - The NVFP4 product's packed kernel (its mainloop decoding each stage in place) holds every order on an
   H100 and an A100 (test_contracts_gemm).
+- A delayed NVFP4 MLP's chain on a Blackwell, its up projection's block-scaled epilogue storing the down
+  projection's rows as codes two a byte and transposed block scales, is bitwise its projections apart,
+  value and every gradient, gated and ungated (test_gemm_nvfp4_chain; rows 12721, 12743).
 - A grouped product whose producer gathers its rows from the tokens by a table (cp.async, row 1376) holds
   check 1 on an H100, plain and paired, the paired one's rows stored where a permutation says; a kernel
   gradient reading its tokens and its cotangent through tables is bitwise its gathered rows' on an H100;
@@ -55,6 +58,7 @@ import test_contracts_gemm as contracts_gemm
 import test_fed_walks as fed_walks
 import test_gemm_blockwise as gemm_blockwise
 import test_gemm_gather as gemm_gather
+import test_gemm_nvfp4_chain as gemm_nvfp4_chain
 import test_gemm_paired as gemm_paired
 import test_gemm_tcgen05 as gemm_tcgen05
 import test_gemm_template as gemm_template
@@ -62,7 +66,7 @@ import test_gemm_widths as gemm_widths
 import test_grouped_gemm as grouped_gemm
 import test_mosaic_toolkit as mosaic_toolkit
 import test_warpgroup_scan as warpgroup_scan
-from gpu_flow import Cell, cells_of, covering, run_cells, when
+from gpu_flow import Cell, cells_of, covering, in_parts, parted, run_cells, when
 from jax.experimental.pallas import fuser
 from reference_error import ahead_arm, assert_as_exact
 from test_gemm_template import rms_norm as template_rms_norm
@@ -133,20 +137,23 @@ def a_fused_projection_trains_its_producer_and_epilogue():
 
 def native_hopper_cluster2_balanced_tail_holds_check_1():
     """Native Hopper `cluster=2` dense forward with a verified nonempty balanced `Tail` holds check 1
-    against XLA dot_general from float64 truth at Qwen3.5-4B q dX outlier shape (row 10151)."""
+    against XLA dot_general from float64 truth (row 10151), at a 128 x 128 tile whose partials' workspace
+    the reference's holds on the GPU's whole wave (`GpuTarget.reference_workspace`; a 128 x 256 tile's over
+    a GH200's 132 multiprocessors, 33 MiB, is past it, row 12850): 2048 x 8192 by 1280, 80 super-tiles a
+    wave and a part."""
     from dew.nn.kernels import gemm, grouped_matmul, tuning
     from dew.nn.kernels.templates.gemm import tiling
-    tile = tiling.Tiles(128, 256, 64, 4, 8, warpgroups=2, cluster=2, family="wgmma")
+    tile = tiling.Tiles(128, 128, 64, 4, 8, warpgroups=2, cluster=2, family="wgmma")
     target = generation.gpu_target()
     launch = grouped_matmul.MosaicGmm()
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
-    ba = launch.bind(bf16((2048, 8192)), bf16((1, 8192, 2560)), jax.ShapeDtypeStruct((1,), jnp.int32),
+    ba = launch.bind(bf16((2048, 8192)), bf16((1, 8192, 1280)), jax.ShapeDtypeStruct((1,), jnp.int32),
                      out_dtype="bfloat16", trans_rhs=False, interpret=False, dense=True)
     assert launch.legal(ba, tile, target) and launch._tail(ba, tile, target)[1] is not None
     def draw(seed):
         rng = np.random.default_rng(10151 + seed)
         return ((rng.normal(size=(2048, 8192)) / np.sqrt(8192)).astype(jnp.bfloat16),
-                (rng.normal(size=(8192, 2560)) / np.sqrt(8192)).astype(jnp.bfloat16))
+                (rng.normal(size=(8192, 1280)) / np.sqrt(8192)).astype(jnp.bfloat16))
 
     def dew_fn(x, w):
         with generation.chosen(grouped_matmul="mosaic"), tuning.pinned({grouped_matmul.MosaicGmm: tile}):
@@ -155,7 +162,7 @@ def native_hopper_cluster2_balanced_tail_holds_check_1():
     def plain(x, w, *, wide=jnp.float32, out=jnp.bfloat16):
         return jax.lax.dot(x.astype(wide), w.astype(wide), preferred_element_type=wide).astype(out)
 
-    assert_as_exact(jax.jit(dew_fn), jax.jit(plain), draw, "hopper cluster=2 balanced tail 2048x8192x2560",
+    assert_as_exact(jax.jit(dew_fn), jax.jit(plain), draw, "hopper cluster=2 balanced tail 2048x8192x1280",
                     seeds=8, truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
 
 def _syrk_and_tail_cells():
@@ -210,11 +217,21 @@ def _toolkit_cells() -> list[Cell]:
     ]
 
 
-def test_the_gemm_kernels_run_on_this_gpu():
+KERNEL_PARTS = 4
+"""The kernels flow's parts (`in_parts`): its prepare alone 164 s warm on a GH200's host (MAINGPU-63d4814e1),
+and with the join matrix's 665 s cold in a train's prepare group (row 12759), past the train's bound."""
+
+JOIN_PARTS = 2
+"""The join matrix's parts (`in_parts`): its prepare 153 s warm on a GH200's host (MAINGPU-63d4814e1)."""
+
+
+@in_parts(KERNEL_PARTS)
+def test_the_gemm_kernels_run_on_this_gpu(part):
     """The GEMM and toolkit cells above a GPU runs (`gpu_flow.covering`: each kept for a GPU-only fault by
     name, the fewest others covering its native axes, every other the CPU's, interpreted and through the
-    compile gate), each one's failure kept and all raised together; the toolkit's apart (`_toolkit_cells`)."""
-    run_cells(covering([
+    compile gate), each one's failure kept and all raised together, a part's share of them (`in_parts`); the
+    toolkit's apart (`_toolkit_cells`)."""
+    run_cells(parted(covering([
         Cell("a fused projection trains its producer and epilogue",
              a_fused_projection_trains_its_producer_and_epilogue, "sm90",
              native={"launch": "fused prologue and epilogue", "pass": "training"}),
@@ -293,6 +310,11 @@ def test_the_gemm_kernels_run_on_this_gpu():
                                 "k_major": k_major})
           for name, dtype in (("float32", jnp.float32), ("bfloat16", jnp.bfloat16))
           for k_major in (False, True)),
+        *(Cell(f"a delayed NVFP4 chain is its projections apart: {'gated' if gated else 'ungated'}",
+               functools.partial(gemm_nvfp4_chain.a_delayed_nvfp4_chain_is_its_projections_apart, gated,
+                                 interpret=False),
+               "sm100", native={"launch": "nvfp4 chain", "epilogue": "packed codes and scales"})
+          for gated in (False, True)),
         *(Cell(f"a pair's partial extents hold check 1: {rows}x{depth}x{width}{' transposed' * transposed}",
                functools.partial(gemm_tcgen05.a_pairs_partial_extents_hold_check_1_on_blackwell, rows, depth,
                                  width, transposed), "sm100", native={"launch": "tcgen05 pair partial"})
@@ -312,7 +334,7 @@ def test_the_gemm_kernels_run_on_this_gpu():
                native={"launch": "warpgroup scan", "reverse": str(reverse), "exclusive": str(exclusive)})
           for positions in warpgroup_scan.POSITIONS for reverse in (False, True)
           for exclusive in (False, True)),
-    ]))
+    ]), part, KERNEL_PARTS))
 
 
 def _cutlass_cells() -> tuple:
@@ -380,12 +402,14 @@ def test_the_mx_matrix_holds_on_this_gpu():
         native=lambda case: dict(zip(("format", "out_dtype"), (case[1], case[4]), strict=True)))))
 
 
-def test_the_join_matrix_holds_on_this_gpu():
+@in_parts(JOIN_PARTS)
+def test_the_join_matrix_holds_on_this_gpu(part):
     """The joined projections' check-1 matrix (tests/join_matrix.py): a layer's training step with two of its
     projections joined, or an attention layer's query, key and value side by side, on par with them apart,
     each cell on a GPU of its generation (its pin): Hopper's side-by-side forward and chained input gradient
-    on the warpgroup MMA, which the CPU only interprets (head review of 0099a4701 F6)."""
-    run_cells(cells_of(kernel_matrix.check("join")))
+    on the warpgroup MMA, which the CPU only interprets (head review of 0099a4701 F6); a part's share of them
+    (`in_parts`)."""
+    run_cells(parted(cells_of(kernel_matrix.check("join")), part, JOIN_PARTS))
 
 
 def test_the_linear_ce_matrix_holds_on_this_gpu():
@@ -445,6 +469,9 @@ def test_an_adapted_products_backward_keeps_a_narrow_presets_fp32_products_wide(
 
     preset = jax.lax.DotAlgorithmPreset.F16_F16_F32
     x = np.zeros((8, 16), np.float16)
+    # Every arm computed before any is checked: a GPU tier's prepare computes nothing, so a check between
+    # them stops it before the next arm (row 12871).
+    gradients = []
     for kernel_entry, a_entry, scale, out_dtype, cotangent in (
             (2.0 ** -10, 0.0, 1.0, np.float32, 2.0 ** 16), (0.0, 2.0 ** -10, 2.0 ** 16, np.float16, 1.0)):
         kernel = np.full((16, 8), kernel_entry, np.float16)
@@ -460,6 +487,7 @@ def test_an_adapted_products_backward_keeps_a_narrow_presets_fp32_products_wide(
             return pull(dy)[0]
 
         label = f"an adapted product's rows gradient into {np.dtype(out_dtype)}"
-        d_x = ahead_arm(jax.jit(rows_gradient), label)(x, kernel, a, b, dy)
+        gradients.append((scale, out_dtype, ahead_arm(jax.jit(rows_gradient), label)(x, kernel, a, b, dy)))
+    for scale, out_dtype, d_x in gradients:
         assert np.all(np.isfinite(np.asarray(d_x, np.float32))), (out_dtype, d_x[0])
         assert np.asarray(d_x[0, 0], np.float32) == 64.0 * (4.0 if scale > 1 else 1.0), (out_dtype, d_x[0])

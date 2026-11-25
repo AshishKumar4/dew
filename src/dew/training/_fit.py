@@ -407,7 +407,7 @@ class FitRun:
     unworked: bool = False
     """Whether a per-share stream reads its data in the training process, no loading workers sized for it
     (row 5852), asked through the wrappers it reads under (`dew.data.dataset.Forwarding.in_process`), which
-    its log says once where it starves the step (`Trainer._written`)."""
+    its log says once where it starves the step (`dew.training._written.written`)."""
     current: int = 0
     loss: jax.Array | None = None
     evaluation: Evaluation | None = None
@@ -448,7 +448,8 @@ class FitRun:
     marked: Callable[[Batch], Batch] | None = None
     """How its reader marks each batch it reads with the rows it counts (`marked`), once it is open."""
     writer: LogWriter = dataclasses.field(default_factory=LogWriter)
-    """Where the logs the loop takes are read and reported, off the loop (`Trainer._read_taken`)."""
+    """Where the logs the loop takes are read and reported, off the loop
+    (`dew.training._written.read_taken`)."""
     scored: frozenset[str] = frozenset()
     """The suites `evaluation` scored at its step, which a run whose stream ends there scores once."""
     ahead: tuple[Batch | None] | None = None
@@ -542,7 +543,8 @@ class FitRun:
     def close_window(self, profiler: Profiler) -> None:
         """Stop the window's owned capture (`stop_capture`), its reports exported beside the steps after
         it until the run's cleanup waits for them and its outcome reports the window
-        (`Trainer._reported_outcome`); a capture stopped for work beside the steps has stopped already."""
+        (`dew.training._written.reported_outcome`); a capture stopped for work beside the steps has stopped
+        already."""
         if not self.window_paused:
             stop_capture(profiler, self.loss, wait=self.window_waits)
         self.window, self.window_paused = None, False

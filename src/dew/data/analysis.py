@@ -926,6 +926,10 @@ class _Lowering:
     """Whether the cache holds one record for each input (`_indexed_cache`), so a memory or indexed
     read reads it by index, in the order the uncached stages would make (`dew.data.lowering._Inputs`)."""
     stages: tuple[Stage, ...]
+    draws: tuple[float, ...] = ()
+    """A mixture's draw weights as its read draws its members (`_draws`): its weights, or by tokens of
+    stated counts, the shares those counts make; empty for any other source. Recorded nowhere: what a
+    mixture's members share its loading workers by (`dew.data.lowering._Build.child`)."""
 
     @property
     def split(self) -> bool:
@@ -1063,7 +1067,7 @@ def _analyzed(
         None if absorbed is None else absorbed[0],
         epochs,
         tuple(at for at, stage in enumerate(stages) if at >= eager and isinstance(stage, TokenSplit)),
-        _order(source, lowered, stages, streamed=per_share and read != "memory"),
+        order := _order(source, lowered, stages, streamed=per_share and read != "memory"),
         parts_unending,
         unending,
         records_unending,
@@ -1071,11 +1075,25 @@ def _analyzed(
         not repeats and not any(ends(stage) for stage in steps),
         cache is not None and _indexed_cache(stages[:cache], read),
         tuple(stages),
+        _draws(source, order),
     )
     configured = any(isinstance(stage, Configured) for stage in steps)
     if per_share and lowering.split and not validation and not configured:
         raise ValueError(f"token split in {_name(pipeline)} needs a global record order, not one per share")
     return lowering
+
+
+def _draws(source: Source | Combined, order: Mapping[str, object]) -> tuple[float, ...]:
+    """`source`'s draw weights where it is a mixture (`_Lowering.draws`): by tokens of stated counts
+    (`STATED_SHARES`), the shares its members' stated rows and valid targets make
+    (`dew.data.mixing.token_weights`), as its read draws them; else its weights."""
+    if not isinstance(source, Mixture):
+        return ()
+    if order.get("shares") == STATED_SHARES:
+        from dew.data.mixing import _weights
+
+        return tuple(_weights(source))
+    return tuple(source.weights)
 
 
 STATED_SHARES = "tokens, by stated counts"

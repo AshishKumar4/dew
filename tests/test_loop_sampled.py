@@ -13,7 +13,7 @@ import optax
 import pytest
 from generation_support import lowers
 from model_support import attending, float64_twin
-from reference_error import assert_as_exact, dew_path
+from reference_error import assert_as_exact, assert_computes_the_oracle, dew_path
 from scipy import integrate, optimize, special, stats
 from test_pass_weights import PASS_SEEDS, drawn, looped, phased_trainer
 
@@ -666,28 +666,38 @@ class Replayed(LMObjective):
 
 
 @pytest.mark.parametrize("grouped", [False, True], ids=["own-window", "diloco"])
-def test_a_sampled_run_whose_window_replays_its_microbatches_is_refused(grouped):
+def test_a_sampled_run_whose_window_replays_its_microbatches_trains_as_the_pooled_one(grouped):
     """A loss whose statistics are no mean its window pools replays each microbatch of an update at the
-    count closing it: a sampled run of two microbatches a step is refused (row 7884), its own window and
-    DiLoCo's groups' alike (`TrainState.window`), the statistics alike at every count; read one microbatch
-    an update, it steps."""
+    count it drew, which its held batch carries (`LOOP_PASSES`): a sampled run of two microbatches a step,
+    its own window and DiLoCo's groups' alike (`TrainState.window`), drawing more than one count, trains as
+    the same loss written as a `Ratio`, which its window pools, to the rounding of its float64 arithmetic
+    (row 12867: it was refused as replaying each at the count closing its window, row 7884)."""
     from dew.training import Layout, Trainer
     from dew.training.diloco import DiLoCo
 
-    def trainer(split):
+    def trained(objective_of) -> tuple[np.ndarray, list[int]]:
         grouping = DiLoCo(every=2, rate=0.7, momentum=0.9) if grouped else None
-        return Trainer(Replayed(looped(steps=CAP), 16), optax.sgd(0.1), key=jax.random.key(0),
-                       advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0),
-                                                sampled_passes=TRAINED, diloco=grouping), split=split)
+        trainer = Trainer(objective_of(float64_twin(looped(steps=CAP)), 16), optax.sgd(0.1),
+                          key=jax.random.key(0), split=2,
+                          advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0),
+                                                   sampled_passes=TRAINED, diloco=grouping,
+                                                   param_dtype="float64"))
+        state, _, _ = trainer.place()
+        step = trainer.compile(state, token_batch())
+        assert isinstance(step, DrawingStep)
+        counts = []
+        for index in range(2):
+            state, *_ = step(state, token_batch(2 + index))
+            counts.extend(step.counts)
+        parameters = np.concatenate([np.ravel(leaf) for leaf in jax.tree.leaves(state.variables["params"])])
+        return parameters, counts
 
-    batch = token_batch()
-    replayed = trainer(2)
-    state, _, _ = replayed.place()
-    with pytest.raises(ValueError):
-        replayed.compile(state, batch)
-    whole = trainer(1)
-    state, _, _ = whole.place()
-    assert isinstance(whole.compile(state, batch), DrawingStep)
+    with jax.enable_x64(new_val=True):
+        (pooled, counts), (replayed, replayed_counts) = trained(LMObjective), trained(Replayed)
+    assert counts == replayed_counts and len(set(counts)) > 1, (counts, replayed_counts)
+    assert pooled.dtype == np.float64, pooled.dtype
+    assert_computes_the_oracle(replayed, pooled, "a replayed sampled window against the pooled one",
+                               roundings=2 * 16 * 256)
 
 
 @pytest.mark.parametrize("fields", [{"mean": 2.0, "dispersion": 0.5, "cap": 4, "law": "lognormal"},

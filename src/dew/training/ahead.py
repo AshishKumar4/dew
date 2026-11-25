@@ -1603,9 +1603,6 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
                 start.abstract, start.shardings, trainer.device_mesh)
             stepped = step_batch(trainer, batch)
             planned = trainer._compiled_plan(start.abstract, stepped, None, frontier)
-            if trainer.phase_passes.sampled is not None:
-                # A build ahead refuses a sampled run's window as the run does (`sampled_step`).
-                trainer._compiler._refuse_sampled_window(planned)
             with attempting(begun):
                 starts = started(trainer, start, planned, plan)
     except Unlowerable as refused:

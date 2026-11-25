@@ -368,8 +368,9 @@ def test_the_backward_repeats_its_state_gradients_bit_for_bit_where_reductions_a
     the same over repeated runs of one compiled step, B's and C's too, which the default's atomic adds sum
     in whatever order their programs run (row 4448's declared contract)."""
     shape = (1, 256, 512, 16)
-    family = bundles.of(here(), jnp.float32)
-    template = functools.partial(selective.selective_scan, family=family)
+    # The template stated by its bundle's generation and dtype (`taken_scan`): closing over a family object,
+    # which no identity states, its arm ran unprepared on a GPU tier (row 12662).
+    template = taken_scan(jnp.float32)
     inputs, starts, dy = draw(jnp.float32, 0, *shape, packed=False)
     # The step as an arm of no site (`ahead_arm`): a GPU tier's prepare compiles it, its run calls it.
     step = ahead_arm(jax.jit(with_gradients(scanned(template, starts))), "the ordered backward, repeated")
@@ -629,6 +630,42 @@ def test_the_backward_holds_its_registers_at_the_residency_it_launches(packed):
     (record,) = compile_mosaic_kernels([KernelCase('selective backward', call)], 'sm90')
     assert not mosaic_failures([record]), mosaic_failures([record])
     assert [kernel for kernel in record['kernels'] if 'selective_scan_backward' in kernel['kernel']], record
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize('target', [pytest.param(name, marks=lowers(name)) for name in ('sm80', 'sm90')])
+def test_a_forked_calls_training_step_compiles(target):
+    """The selective scan's training step over a forked call (`FORKED`'s, each row's documents from its
+    table) compiled for an A100 and an H100 (`kernel_compile`): both launches lower (`failures`; a spill is
+    its residency's, row 12905), where a document's state taken up from its table selected each vector of
+    it on a scalar (its slot's load), which no warpgroup lowering broadcasts (a GH200's forked exactness
+    test, 2026-11-19, and both compiles failed so, row 12904)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, failures
+
+    forked = FORKED["shared and chained"]
+    rows, length, channels, states = 2, 2048, 256, 16
+    operands = (jax.ShapeDtypeStruct((rows, length, channels), jnp.bfloat16),) * 2 + (
+        jax.ShapeDtypeStruct((channels, states), jnp.float32),
+        *(jax.ShapeDtypeStruct((rows, length, states), jnp.bfloat16),) * 2,
+        jax.ShapeDtypeStruct((channels,), jnp.float32),
+        # The table's one given state a row (`FORKED`'s).
+        jax.ShapeDtypeStruct((rows, 1, channels, states), jnp.float32))
+    family = bundles.of(target, jnp.bfloat16)
+
+    def call():
+        def trained(*given):
+            out, pull = jax.vjp(lambda *a: selective.selective_scan(*a, family=family, forked=forked)[0],
+                                *given)
+            return pull(out)
+
+        return trained, operands
+
+    (record,) = compile_mosaic_kernels([KernelCase('selective forked training', call)], target)
+    assert not failures([record]), failures([record])
+    names = [kernel['kernel'] for kernel in record['kernels']]
+    assert [name for name in names if 'selective_scan_backward' in name], names
+    assert [name for name in names if 'selective_scan' in name and 'backward' not in name], names
 
 
 @lowers('sm90')

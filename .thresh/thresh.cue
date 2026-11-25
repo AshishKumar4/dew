@@ -149,33 +149,37 @@ seams: "scan-cells": {
 
 seams: "grouped-cells": {
 	kind:    "declared-set"
-	purpose: "each cell routes the grouped GEMM to the route its receipt timed fastest, a timed product a cell of its own; a cell leaves once the template catches up"
-	paths:   ["src/dew/nn/kernels/grouped_matmul.py"]
-	entries: "DECLARED"
+	purpose: "the 4B's projections a receipt timed at 24,576-49,152 tokens, each a cell where its winner is not its kind's route (grouped_matmul.DECLARED, derived with the scoreboards' kinds and parity cells, grouped_cells.SCOREBOARDS); a cell leaves once the template catches up"
+	paths:   ["src/dew/nn/kernels/grouped_cells.py"]
+	entries: "FOUR_B_CELLS"
 	declared: {
-		"(mma.sync, Kind(dense=True, made=Made.FORWARD))":          "XLA's dense forward on an A100 (DENSE1)"
-		"(mma.sync, Kind(dense=True, made=Made.INPUT_GRADIENT))":   "XLA's dense input gradient on an A100 (DENSE1)"
-		"(mma.sync, Kind(dense=True, made=Made.KERNEL_GRADIENT))":  "XLA's dense kernel gradient on an A100 (DENSE1)"
-		"(mma.sync, Kind(dense=False, made=Made.FORWARD))":        "CUTLASS's grouped forward on an A100 (M-EM-2, 1.07x)"
-		"(wgmma, Kind(dense=True, made=Made.FORWARD))": "XLA's dense forward on an H100 (DENSE1)"
-		"(wgmma, Kind(dense=True, made=Made.INPUT_GRADIENT))": "XLA's dense input gradient on an H100 (DENSE1)"
-		"(wgmma, Kind(dense=True, made=Made.KERNEL_GRADIENT))": "XLA's dense kernel gradient on an H100 (DENSE1)"
-		"(wgmma, Kind(dense=True, made=Made.FORWARD, matrix=(2560, 9216)))": "the template's forward of the 4B's 2560 x 9216 on a GH200 (M-EM-36-gh200, 0.866x)"
-		"(wgmma, Kind(dense=True, made=Made.FORWARD, matrix=(9216, 2560)))": "XLA's forward of the 4B's 9216 x 2560 on a GH200 (M-EM-36-gh200, 1.01x)"
-		"(wgmma, Kind(dense=True, made=Made.FORWARD, matrix=(2560, 1024)))": "the template's forward of the 4B's 2560 x 1024 on a GH200 (M-EM-36-gh200, 0.96x)"
-		"(wgmma, Kind(dense=True, made=Made.FORWARD, matrix=(2560, 64)))": "XLA's forward of the 4B's 2560 x 64 on a GH200 (M-EM-36-gh200, 1.294x)"
-		"(wgmma, Kind(dense=True, made=Made.INPUT_GRADIENT, matrix=(2560, 9216)))": "the template's input gradient of the 4B's 2560 x 9216 on a GH200 (M-EM-36-gh200, 0.943x)"
-		"(wgmma, Kind(dense=True, made=Made.INPUT_GRADIENT, matrix=(9216, 2560)))": "the template's input gradient of the 4B's 9216 x 2560 on a GH200 (M-EM-36-gh200, 0.912x)"
-		"(wgmma, Kind(dense=True, made=Made.INPUT_GRADIENT, matrix=(2560, 1024)))": "the template's input gradient of the 4B's 2560 x 1024 on a GH200 (M-EM-36-gh200, 0.949x)"
-		"(wgmma, Kind(dense=True, made=Made.INPUT_GRADIENT, matrix=(2560, 64)))": "the template's input gradient of the 4B's 2560 x 64 on a GH200 (M-EM-36-gh200, 0.93x)"
-		"(wgmma, Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 9216)))": "XLA's kernel gradient of the 4B's 2560 x 9216 on a GH200 (M-EM-36-gh200, 1.095x)"
-		"(wgmma, Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(9216, 2560)))": "the template's kernel gradient of the 4B's 9216 x 2560 on a GH200 (M-EM-36-gh200, 0.975x)"
-		"(wgmma, Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 1024)))": "the template's kernel gradient of the 4B's 2560 x 1024 on a GH200 (M-EM-36-gh200, 0.973x)"
-		"(wgmma, Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 64)))": "the template's kernel gradient of the 4B's 2560 x 64 on a GH200 (M-EM-36-gh200, 0.376x)"
-		"(tcgen05, Kind(dense=True, made=Made.FORWARD, matrix=(2560, 64)))": "XLA's forward of the 4B's 2560 x 64 on a B200 (the B200 grid, 1.216x)"
-		"(tcgen05, Kind(dense=True, made=Made.INPUT_GRADIENT, matrix=(2560, 9216)))": "XLA's input gradient of the 4B's 2560 x 9216 on a B200 (em35d, 1.009x)"
-		"(tcgen05, Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 9216)))": "XLA's kernel gradient of the 4B's 2560 x 9216 on a B200 (the B200 grid, 1.355x)"
-		"(tcgen05, Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 1024)))": "XLA's kernel gradient of the 4B's 2560 x 1024 on a B200 (the B200 grid, 1.148x)"
+		"(sm90, Made.FORWARD, (2560, 9216))": "the template's forward of the 4B's 2560 x 9216 (M-EM-36-gh200)"
+		"(sm90, Made.FORWARD, (9216, 2560))": "XLA's forward of the 4B's 9216 x 2560 (M-EM-36-gh200)"
+		"(sm90, Made.FORWARD, (2560, 1024))": "the template's forward of the 4B's 2560 x 1024 (M-EM-36-gh200)"
+		"(sm90, Made.FORWARD, (2560, 64))": "XLA's forward of the 4B's 2560 x 64 (M-EM-36-gh200)"
+		"(sm90, Made.INPUT_GRADIENT, (2560, 9216))": "the template's input gradient of the 4B's 2560 x 9216 (M-EM-36-gh200)"
+		"(sm90, Made.INPUT_GRADIENT, (9216, 2560))": "the template's input gradient of the 4B's 9216 x 2560 (M-EM-36-gh200)"
+		"(sm90, Made.INPUT_GRADIENT, (2560, 1024))": "the template's input gradient of the 4B's 2560 x 1024 (M-EM-36-gh200)"
+		"(sm90, Made.INPUT_GRADIENT, (2560, 64))": "the template's input gradient of the 4B's 2560 x 64 (M-EM-36-gh200)"
+		"(sm90, Made.KERNEL_GRADIENT, (2560, 9216))": "XLA's kernel gradient of the 4B's 2560 x 9216 (M-EM-52-gh200)"
+		"(sm90, Made.KERNEL_GRADIENT, (9216, 2560))": "the template's kernel gradient of the 4B's 9216 x 2560 (M-EM-52-gh200)"
+		"(sm90, Made.KERNEL_GRADIENT, (2560, 1024))": "the template's kernel gradient of the 4B's 2560 x 1024 (M-EM-52-gh200)"
+		"(sm90, Made.KERNEL_GRADIENT, (2560, 64))": "the template's kernel gradient of the 4B's 2560 x 64 (M-EM-52-gh200)"
+		"(sm100, Made.FORWARD, (2560, 64))": "XLA's forward of the 4B's 2560 x 64 (the B200 grid)"
+		"(sm100, Made.INPUT_GRADIENT, (2560, 9216))": "XLA's input gradient of the 4B's 2560 x 9216 (em35d)"
+		"(sm100, Made.KERNEL_GRADIENT, (2560, 9216))": "XLA's kernel gradient of the 4B's 2560 x 9216 (the B200 grid)"
+		"(sm100, Made.KERNEL_GRADIENT, (2560, 1024))": "XLA's kernel gradient of the 4B's 2560 x 1024 (the B200 grid)"
+	}
+}
+
+seams: "grouped-kinds": {
+	kind:    "declared-set"
+	purpose: "the generations whose dense kinds stay XLA's by kind alone, their receipts' cells too noisy to part (grouped_matmul.DECLARED)"
+	paths:   ["src/dew/nn/kernels/grouped_cells.py"]
+	entries: "M_FS_34"
+	declared: {
+		"sm86": "an A10's dense kinds on XLA (M-FS-34, 1.28x / 1.58x / 1.49x)"
+		"sm89": "an L4's dense kinds on XLA (M-FS-34, 1.21x / 1.45x / 1.21x)"
 	}
 }
 

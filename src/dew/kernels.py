@@ -43,6 +43,7 @@ class Kernels:
     decode: Literal['cudnn', 'decode', 'reference', 'template', 'xla'] | None = None
     delta_decode: Literal['fused', 'step', 'xla'] | None = None
     delta_gates: Literal['apart', 'joined'] | None = None
+    diagonal_scan: Literal['mosaic_gpu', 'xla'] | None = None
     gate_up: Literal['apart', 'joined'] | None = None
     gated_delta_rule: Literal['fla', 'mosaic_gpu', 'xla'] | None = None
     gated_mlp: Literal['apart', 'fused'] | None = None
@@ -65,6 +66,7 @@ class Kernels:
     ssd: Literal['mosaic_gpu', 'pallas', 'tpu', 'xla'] | None = None
     swiglu: Literal['pallas', 'xla'] | None = None
     syrk: Literal['mosaic', 'xla'] | None = None
+    wkv4: Literal['mosaic_gpu', 'xla'] | None = None
 
     def named(self) -> dict[str, str]:
         """The ops it names and the kernel each runs, those it leaves to their picks omitted."""

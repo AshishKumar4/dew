@@ -12,6 +12,10 @@
 # pins whose markers its machine meets).
 # Usage, from the checkout: sh tools/lock_environment.sh
 set -eu
+# A few downloads at once: a staging index states no core metadata of a release's wheels, so a lock reads each
+# wheel itself from GitHub's releases, which refused uv's default 50 at once (HTTP/2 REFUSED_STREAM: train
+# 1274's lint, one container). Where to fetch from, what resolves and every hash are unchanged.
+export UV_CONCURRENT_DOWNLOADS="${UV_CONCURRENT_DOWNLOADS:-4}"
 # Every lock resolves for the oldest supported Python, so the interpreter running this changes nothing.
 RESOLVED=2026-10-12T00:00:00Z
 # Dew's own FlashAttention wheels resolve as they stood when 0.3.12 was published (PyPI's upload times,

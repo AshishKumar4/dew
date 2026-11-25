@@ -5,7 +5,7 @@ exit gate or none, each pair of them met at least once and all four together, ea
 stepped on the CPU."""
 
 
-import dataclasses
+import functools
 
 import jax
 import jax.numpy as jnp
@@ -15,9 +15,12 @@ from model_support import attending
 from test_loop_sampled import CAP, TRAINED, token_batch
 from test_pass_weights import phased_trainer
 
+from dew.batch import LOOP_PASSES
+from dew.data.dataset import rows_of
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_stack import Loop
 from dew.nn.kernels.generation import chosen
+from dew.objectives.base import Ratio
 from dew.training import TrainerAdvanced
 from dew.training.compiler import DrawingStep
 from dew.training.interval import Interval
@@ -76,10 +79,11 @@ def test_a_looped_decoders_features_composed_plan_and_step(drawn, implicit, copi
 
 
 @attending("xla")
-def test_a_drawn_pass_count_read_in_parts_is_refused_where_its_objective_computes_its_batchs_statistics():
-    """An objective computing statistics of a step's whole batch (`batch_statistics`) computes them at its
-    first part, by that part's pass count, and reads them at every part: a drawn count read in two parts a
-    step is refused, naming why, where read whole it plans and steps (row 10770's composition audit)."""
+def test_a_drawn_pass_count_read_in_parts_computes_its_batchs_statistics_at_each_parts_count():
+    """An objective computing statistics of a step's whole batch (`batch_statistics`) reads each part cut from
+    the whole batch, which carries each part's drawn pass count (`LOOP_PASSES`): read in two parts a step
+    at two counts, the statistic is every row's own count, summed, both at the run and compiled ahead
+    (row 12867: refused as reading the first part's count at every part, row 10770's audit)."""
     import optax
 
     from dew.distributed.placement import MeshSpec
@@ -88,38 +92,44 @@ def test_a_drawn_pass_count_read_in_parts_is_refused_where_its_objective_compute
     from dew.training import Layout, Trainer
     from dew.training.ahead import compile_ahead
 
-    class Normalized(LMObjective):
+    class Counted(LMObjective):
+        """The LM objective whose loss is its step's whole batch's pass counts, summed (`batch_statistics`):
+        a mean of that sum over its targets, so its window's loss reads it whatever the update pools."""
+
         def batch_statistics(self, variables, part_at, split):
-            return (jnp.float32(split),)
+            return (functools.reduce(jnp.add, [jnp.sum(part_at(jnp.int32(index))[0][LOOP_PASSES])
+                                               for index in range(split)]).astype(jnp.float32),)
+
+        def loss(self, variables, batch, step):
+            stats, aux = super().loss(variables, batch, step)
+            assert isinstance(stats, Ratio), type(stats)
+            counted = (jnp.sum(batch[LOOP_PASSES]).astype(jnp.float32) if step.batch_statistics is None
+                       else step.batch_statistics[0])
+            return Ratio(counted * jax.lax.stop_gradient(stats.mass), jax.lax.stop_gradient(stats.mass)), aux
 
     model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=3, num_heads=2, mlp_features=48,
                               max_seq_len=128, loop=Loop(CAP, layers=(1, 2)))
     batch = token_batch()
 
-    def trainer_of(split: int, law=TRAINED):
-        looped_for = model if law.cap == CAP else model.with_passes(law.cap)
-        return Trainer(Normalized(looped_for, 16), optax.sgd(0.1), key=jax.random.key(0),
+    def trainer_of(split: int) -> Trainer:
+        return Trainer(Counted(model, 16), optax.sgd(0.1), key=jax.random.key(0),
                        advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0), phase_passes=None,
-                                                sampled_passes=law), accumulation=2, split=split)
+                                                sampled_passes=TRAINED), split=split)
 
-    def stepped(trainer) -> float:
-        state, _, _ = trainer.place()
-        step = trainer.compile(state, batch)
-        step.drawn(Interval(0.0, None, microbatches=0), 0)
-        return float(step(state, batch)[1])
-
-    with pytest.raises(ValueError):
-        stepped(trainer_of(2))
-    # A build ahead builds the step as the run does, and refuses alike.
-    def built(law=TRAINED):
-        trainer = trainer_of(2, law)
-        trainer.device_mesh = MeshSpec().build(compile_only_gpus("sm90", 1, 80 * 2 ** 30))
-        return compile_ahead(trainer, batch)
-
-    with pytest.raises(ValueError):
-        built()
-    # The same build of a one-count law, which reads no other count's statistics, is made.
-    assert built(dataclasses.replace(TRAINED, cap=1)) is not None
-    assert np.isfinite(stepped(trainer_of(1)))
-    # A law of one count's parts read the statistics of their own count.
-    assert np.isfinite(stepped(trainer_of(2, dataclasses.replace(TRAINED, cap=1))))
+    trainer = trainer_of(2)
+    state, _, _ = trainer.place()
+    step = trainer.compile(state, batch)
+    assert isinstance(step, DrawingStep)
+    seen = set()
+    for index in range(4):
+        step.drawn(Interval(0.0, None, microbatches=0), index)
+        state, loss, *_ = step(state, batch)
+        counts = step.counts
+        seen.update(counts)
+        # Each part holds every other row: half the batch's rows at each part's count.
+        assert float(loss) == sum(counts) * rows_of(batch) // len(counts), (float(loss), counts)
+    assert len(seen) > 1, seen
+    # A build ahead builds the step as the run does.
+    ahead = trainer_of(2)
+    ahead.device_mesh = MeshSpec().build(compile_only_gpus("sm90", 1, 80 * 2 ** 30))
+    assert compile_ahead(ahead, batch) is not None

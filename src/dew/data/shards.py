@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import grain.experimental as experimental
 import grain.python as grain
+from grain._src.python.dataset.transformations.shuffle import ShuffleMapDataset
 
 from dew import _position
 from dew._records import boolean, integer, integers, listed, record
@@ -191,13 +192,33 @@ def _shards(manifest: ShardManifest, *, partition: DataPartition, loading: Loadi
     return tuple(shards)
 
 
+@functools.lru_cache(maxsize=1 << 16)
+def shuffled(index: int, max_index: int, seed: int) -> int:
+    """Grain's place of `index` in its shuffle of `range(max_index + 1)` under `seed` (`index_shuffle`, four
+    rounds), each answered once a process: its cost grows as its range shrinks (13 ms a call over two
+    places, 4 us over a million), and a many-corpus mixture asks the same few of it over and over, each
+    corpus's places of its few shards alike under one seed (row 12842: 5,225 calls, 184 of them distinct,
+    43 of a 200-corpus mixture's 45 s to its first batch)."""
+    return experimental.index_shuffle(index, max_index=max_index, seed=seed, rounds=4)
+
+
+class _Shuffled(ShuffleMapDataset):
+    """Grain's shuffle of a parent (`MapDataset.shuffle`), its seed, statistics and element spec Grain's own,
+    each pass's place answered once a process (`shuffled`)."""
+
+    def _shuffled_index(self, index: int) -> int:
+        length = len(self._parent)
+        epoch, place = divmod(index, length)
+        return shuffled(place, length - 1, (self._seed + epoch) % 2**32) + epoch * length
+
+
 def _dealt(shards: tuple[Shard, ...], *, seed: int | None, epochs: int | None) -> grain.MapDataset:
     """The `shards` a stream reads (`_shards`), place by place over every pass, before the shares are cut
     from them: shuffled where `seed` is given (each pass its own order) and repeated `epochs` times
     (endlessly where None)."""
     root = grain.MapDataset.source(shards)
     if seed is not None:
-        root = root.shuffle(seed=seed)
+        root = _Shuffled(root, seed=seed)
     if epochs != 1:
         root = root.repeat(epochs)
     return root

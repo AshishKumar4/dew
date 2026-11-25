@@ -77,6 +77,9 @@ kernel's segment sums formed as a matmul against a 0/1 triangle stay finite (an 
 thousands of resets in a walk's sum stay far inside fp32's range, and the compensated prefix keeps each
 difference of two partials exact past them."""
 
+State = tuple[tuple[int, ...], jnp.dtype]
+"""A state's shape and dtype (`Scan.state`)."""
+
 Reads = Literal["after", "before", "apart"]
 """Where a scan's readout reads its state (`Scan.reads`): after its token's update, as it enters, or after its
 decay apart from its group's writes (`Scan.group`)."""
@@ -107,13 +110,16 @@ class Scan:
     cancelled catastrophically (one row 13 times its reference in 48 seeds, row 7402). A correction reads
     apart from a group of one alone: each token reads the state after its decay, before its own corrected
     write, its pairs with the chunk's earlier tokens' corrected writes (row 7608); a group past one beside a
-    correction is refused, its tokens' writes correcting the state its group's earlier writes left."""
+    correction is refused, its tokens' writes correcting the state its group's earlier writes left.
+    A `state` that is a pair of one shape and dtype is a coupled pair's (`coupled_scan`): `update((h, m),
+    **token)` both states after the token and `readout((h, m), **token)` its output, their forms derived
+    apart (`coupled_scan.derive_coupled`)."""
 
     update: Callable
     readout: Callable
     operands: Mapping[str, Axes]
     walked: str
-    state: tuple[tuple[int, ...], jnp.dtype]
+    state: State | tuple[State, State]
     reset: str | None = None
     ranges: Mapping[str, float | tuple[float, float]] = dataclasses.field(default_factory=dict)
     reads: Reads = "after"
@@ -121,22 +127,31 @@ class Scan:
 
 
 def _traced(declaration: Scan, function: Callable, names: tuple[str, ...], chunk: Mapping):
-    """`function` (the declaration's update or readout) traced at one token of `chunk`: the state's type and
-    each operand's without its walked axis, jit disabled so a jitted library function's equations are the
-    declaration's own."""
-    shape, dtype = declaration.state
-
+    """`function` (the declaration's update or readout) traced at one token of `chunk`: the state's type (a
+    pair's two, `paired`) and each operand's without its walked axis, jit disabled so a jitted library
+    function's equations are the declaration's own."""
     def named(h, *xs):
         return function(h, **dict(zip(names, xs, strict=True)))
 
-    def token(name: str) -> jax.ShapeDtypeStruct:
-        axes = zip(chunk[name].shape, declaration.operands[name], strict=True)
-        return jax.ShapeDtypeStruct(tuple(extent for extent, axis in axes if axis != declaration.walked),
-                                    chunk[name].dtype)
-
-    tokens = [token(name) for name in names]
+    states = declaration.state
+    typed = (tuple(jax.ShapeDtypeStruct(*state) for state in states) if paired(states)
+             else jax.ShapeDtypeStruct(*states))
+    tokens = [token_type(declaration, chunk, name) for name in names]
     with jax.disable_jit():
-        return jax.make_jaxpr(named)(jax.ShapeDtypeStruct(shape, dtype), *tokens)
+        return jax.make_jaxpr(named)(typed, *tokens)
+
+
+def paired(states) -> bool:
+    """Whether a declaration's `Scan.state` is a pair's, two shapes and dtypes, rather than one's."""
+    return len(states) == 2 and all(
+        isinstance(state, tuple) and len(state) == 2 and isinstance(state[0], tuple) for state in states)
+
+
+def token_type(declaration: Scan, chunk: Mapping, name: str) -> jax.ShapeDtypeStruct:
+    """`chunk`'s operand `name` at one token: its type without the walked axis."""
+    axes = zip(chunk[name].shape, declaration.operands[name], strict=True)
+    return jax.ShapeDtypeStruct(tuple(extent for extent, axis in axes if axis != declaration.walked),
+                                chunk[name].dtype)
 
 
 def derive_scan(declaration: Scan, *, saturation: program.Saturation,
@@ -170,10 +185,10 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
     product) forming and joining a walk's transfer. The same forms without one take Dew's products, the
     portable route's; a chunk's transition, which a walk that carries its transfer composes (`prepare(chunk,
     transition=True)`), is always Dew's, formed chunk-parallel."""
+    if paired(declaration.state):
+        return _coupled(declaration, saturation)
     names = tuple(name for name in declaration.operands if name != declaration.reset)
-    shape, dtype = declaration.state
-    if len(shape) != 2:
-        raise Refused("a state of rank other than two (keys by values) has no chunk form here")
+    shape, dtype = _keyed_state(declaration)
 
     # The token's affine map by its operands' types and what its derivation reads where it runs
     # (`derive.context`: the mesh, the target, the numerics, the matmul precision its products' parameters
@@ -236,8 +251,8 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
             return prepared
         return dataclasses.replace(prepared, transition=_transition(prepared, jnp.zeros(shape, carried)))
 
-    def mapped(prepared, state, issue=None):
-        # Dew's products where no mainloop issues them (`_issued`): a readout's the portable math's.
+    def mapped(prepared, state, kept=None, issue=None):
+        # Dew's products where no mainloop issues them (`_issued`): the portable math's; `kept` None.
         (outputs,) = prepared.split.emit(prepared.values[1], state[1], issue or _issued)
         entering = prepared.entering
         return outputs if entering is None else _entered(outputs, entering, prepared.values_read, state[1])
@@ -259,6 +274,21 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
     return Derived(init, _stepped, merge, finish, mapped,
                    {"rounding": "compensated prefix", "walked": declaration.walked},
                    functools.partial(_replay_backward, replay, names), prepare, replay=replay)
+
+
+def _keyed_state(declaration: Scan) -> tuple:
+    """A declaration's one state's shape and dtype, refused unless it is keys by values."""
+    shape, dtype = declaration.state
+    if len(shape) != 2:
+        raise Refused("a state of rank other than two (keys by values) has no chunk form here")
+    return shape, dtype
+
+
+def _coupled(declaration: Scan, saturation: program.Saturation) -> Derived:
+    """A pair's forms (`coupled_scan.derive_coupled`)."""
+    from dew.algebra.coupled_scan import derive_coupled
+
+    return derive_coupled(declaration, saturation=saturation)
 
 
 def _segment_parts(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, window=None):
@@ -322,14 +352,15 @@ def _apart(declaration: Scan, affine, tokens: int) -> int:
 
 
 def _stepped(state, prepared: Prepared, issue=None):
-    """A walk's state after a prepared chunk (`derive_scan`'s `step`): its decay summed, its state the
-    chunk's carry from it, and where the walk carries its transfer, the chunk's transition composed on it."""
+    """A walk's state after a prepared chunk and what it keeps for the chunk's outputs (`derive_scan`'s
+    `step`, `Derived`'s scans): its decay summed, its state the chunk's carry from it, and where the walk
+    carries its transfer, the chunk's transition composed on it; a single state keeps nothing (None)."""
     decay, h = state[:2]
     natural, values = prepared.values
     (leaving,) = prepared.split.carry(values, h, issue)
     decay = _held(decay + natural.astype(decay.dtype))
     if not isinstance(state, Walk):
-        return decay, leaving
+        return (decay, leaving), None
     if prepared.corrected and state.transfer is None:
         raise Refused("a walk started for tokens that do not correct the state steps a chunk whose do")
     if state.transfer is not None and prepared.transition is None:
@@ -337,7 +368,7 @@ def _stepped(state, prepared: Prepared, issue=None):
                       "(`prepare(chunk, transition=True)`)")
     transfer = (None if state.transfer is None
                 else (issue or _issued)("transfer_compose", prepared.transition, state.transfer))
-    return Walk(decay, leaving, transfer, _summed(state.across, prepared.across))
+    return Walk(decay, leaving, transfer, _summed(state.across, prepared.across)), None
 
 
 def _at_token(declaration: Scan, names: Sequence[str], affine, token: Mapping) -> tuple:
@@ -998,23 +1029,8 @@ def _token(parts: linear_scan.Parts, token: tuple) -> tuple:
     `Q`, free readout `R` (zeros where the readout has none) and exponent along the values `E` (zeros where
     its update decays none, `linear_scan.Parts.across`): the affine map's parts
     (`linear_scan.Parts`) at the token's values, each in float32 at least."""
-    shape = aval(parts.update.jaxpr.invars[0]).shape
-    zero = jnp.zeros(shape, aval(parts.update.jaxpr.invars[0]).dtype)
-    carried = at_least_fp32(zero.dtype)  # the parts' constants': a float64 run's are float64
-    envs: dict = {}
-
-    def read(index: int):
-        traced, atom = parts.atoms[index]
-        if isinstance(atom, jcore.Literal):
-            return jnp.asarray(atom.val)
-        env = envs.setdefault(id(traced), environment(traced, (zero, *token), {}))
-        evaluate(traced, env, read_by(traced.jaxpr, {atom}))
-        return env[atom].astype(at_least_fp32(env[atom].dtype))
-
-    def along(term, extent: int):
-        value = linear_scan.value_of(term, read, shape[0], carried)
-        return jnp.broadcast_to(jnp.reshape(value, (-1,)) if jnp.ndim(value) == 2 else value, (extent,))
-
+    shape, along = token_terms(parts, token)
+    carried = at_least_fp32(aval(parts.update.jaxpr.invars[0]).dtype)
     keys, values = shape
     B, U = along(parts.left, keys), along(parts.right, values)
     corrects = parts.correction is not None
@@ -1026,6 +1042,33 @@ def _token(parts: linear_scan.Parts, token: tuple) -> tuple:
     across = jnp.zeros((values,), carried) if parts.across is None else along(parts.across, values)
     erase = jnp.zeros_like(B) if parts.erase is None else along(parts.erase, keys)
     return exponent, B, U, s, C, along(parts.reader, reader), along(parts.free, out), across, erase
+
+
+def token_terms(parts, token: tuple, states: int = 1) -> tuple[tuple[int, ...], Callable]:
+    """The state's shape and `along(term, extent)`: a term of the update's or readout's parts free of the
+    state (`linear_scan.Parts`', `Coupled`'s) at one token's values, `[extent]` in float32 at least, its
+    traced programs evaluated from `states` zero states (a pair's two) and `token`."""
+    shape = aval(parts.update.jaxpr.invars[0]).shape
+    zero = jnp.zeros(shape, aval(parts.update.jaxpr.invars[0]).dtype)
+    carried = at_least_fp32(zero.dtype)  # the parts' constants': a float64 run's are float64
+    envs: dict = {}
+
+    def read(index: int):
+        traced, atom = parts.atoms[index]
+        if isinstance(atom, jcore.Literal):
+            return jnp.asarray(atom.val)
+        env = envs.setdefault(id(traced), environment(traced, (*(zero,) * states, *token), {}))
+        evaluate(traced, env, read_by(traced.jaxpr, {atom}))
+        return env[atom].astype(at_least_fp32(env[atom].dtype))
+
+    def along(term, extent: int | None):
+        """`term`'s value broadcast to `[extent]`, or as it is where `extent` is None (a scalar)."""
+        value = linear_scan.value_of(term, read, shape[0], carried)
+        if extent is None:
+            return value
+        return jnp.broadcast_to(jnp.reshape(value, (-1,)) if jnp.ndim(value) == 2 else value, (extent,))
+
+    return shape, along
 
 
 @functools.cache

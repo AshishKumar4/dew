@@ -654,8 +654,11 @@ def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monk
     # that judgement placed beside the step, not the unplaced search's charge of the state it planned
     # before placing, which the placed step holds among its arguments (row 8962).
     # Here what it places beside the step, its outputs and its batches, is under the state's bytes.
+    # Its admitted terms the placed judgement's too: what they place beside the step what it says it
+    # placed (review of the T83 follow-up: the unplaced search's terms stood beside the placed figures).
     placed, own = run.plan["placed"], run.plan["probes"][0]
     assert own["headroom"] == placed["headroom"] and own["beside"] < state, (own, placed, state)
+    assert own["admitted"] is not None and own["admitted"][1] == own["beside"], own
 
 
 def test_a_fresh_plan_refused_with_its_copies_built_deletes_them_before_it_is_searched_again(monkeypatch):
@@ -1018,27 +1021,43 @@ def test_a_steps_reads_of_its_parameters_pass_over_another_collections_attribute
 
 def test_a_fit_over_a_state_holding_a_packed_collection_of_attribute_leaves_steps_with_its_copies():
     """A fit whose state holds, beside its parameters, a collection of structured leaves its step reads no
-    copy of (a packed checkpoint's `quantization`, an NvFp4 weight's attributes), its narrow copies on, plans
-    and steps, and the step it runs builds copies of its parameters alone, the collection's leaves held
-    through it as they were (row 11730: its first step raised on those attribute paths before it ran; row
-    11779: its proof read the analysis alone)."""
+    copy of (a packed checkpoint's `quantization`, an NvFp4 weight's attributes), and among its parameters
+    one reached through attributes that its loss reads cast to bfloat16, as it reads a weight it copies,
+    its narrow copies on, plans and steps: the step it runs builds copies of its mapped parameters alone
+    (`held_copies`), none of the attribute-reached one, which it trains through its cast; the collection's
+    leaves held through it as they were (row 11730: its first step raised on those attribute paths before
+    it ran; rows 11779, 11773: its proof read the analysis alone)."""
     from typing import NamedTuple
 
     from token_support import repeated_token_batch
 
     from dew.data.dataset import Loader
+    from dew.objectives.base import Ratio
     from dew.objectives.lm import LMObjective
     from dew.training import Layout, MeshSpec, Trainer
+    from dew.training.narrow import held_copies
 
     class Packed(NamedTuple):
         """Leaves reached through attributes, as a packed weight's are."""
         values: jax.Array
         scale: jax.Array
 
+    class Reading(LMObjective):
+        """An LM whose loss reads the attribute-reached parameter's values cast to bfloat16, as a weight
+        a copy is planned for is read: a read no copy's overlay reaches."""
+
+        def loss(self, variables, batch, step):
+            stats, aux = super().loss(variables, batch, step)
+            assert isinstance(stats, Ratio), type(stats)
+            read = jnp.sum(variables["params"]["attribute"].values.astype(jnp.bfloat16)).astype(jnp.float32)
+            return Ratio(stats.total + read * stats.mass, stats.mass), aux
+
     plain, _ = _decoder()
     variables = dict(plain.init(jax.random.key(0)))
     variables["quantization"] = {"head": Packed(jnp.ones((4, 2), jnp.uint8), jnp.ones((4,), jnp.float32))}
-    objective = LMObjective(plain.model, seq_len=8, pad_id=0, variables=variables)
+    attribute = Packed(jnp.full((4, 2), 2.0, jnp.float32), jnp.ones((4,), jnp.float32))
+    variables["params"] = {**variables["params"], "attribute": attribute}
+    objective = Reading(plain.model, seq_len=8, pad_id=0, variables=variables)
     with chosen(narrow_copies="on"):
         trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=MeshSpec(),
                           advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)))
@@ -1049,13 +1068,21 @@ def test_a_fit_over_a_state_holding_a_packed_collection_of_attribute_leaves_step
     # holds none past its end): copies of its parameters alone, the packed collection's two leaves held
     # through the step as they were.
     _, batch = _decoder()
+    # Where the fit left the attribute-reached parameter, read before the step donates the state.
+    before = np.asarray(state.variables["params"]["attribute"].values)
     with chosen(narrow_copies="on"):
         stepped, *_ = trainer.compile(state, batch)(state, batch)
     copied = {path[0].key for path, _ in jax.tree_util.tree_flatten_with_path(stepped.compute or {})[0]}
     assert copied == {"params"}, copied
+    copies = held_copies(stepped.compute)
+    assert copies and not any(path[0] == "attribute" for path in copies), copies
     held = stepped.variables["quantization"]["head"]
     np.testing.assert_array_equal(np.asarray(held.values), np.ones((4, 2), np.uint8))
     np.testing.assert_array_equal(np.asarray(held.scale), np.ones(4))
+    # Trained through its cast by its read, by the fit and again by the step.
+    reached = stepped.variables["params"]["attribute"]
+    assert not np.array_equal(before, np.full((4, 2), 2.0)), before
+    assert not np.array_equal(np.asarray(reached.values), before), reached
 
 
 @attending("template")

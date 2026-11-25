@@ -25,12 +25,12 @@ FAMILIES = {family: name for name in reversed(generation.TARGETS)
 generation in the table: a family added there is a family the contract's tests run on."""
 
 
-def _step_temp(generation_name: str, chosen: dict) -> int:
+def _step_temp(generation_name: str, chosen: dict, memory: int = 2**25) -> int:
     """The temporaries a `LAYERS`-deep stack of dense products takes, its forward and its reverse, on a
-    compile-only device of `generation_name` stating 32 MiB, below the step's need, so XLA's scheduler
-    holds the least it can and the temporaries are the route's alone (an H100's 80 GB let it hold the
-    declared cells' 117 MB against the template's 67 MB; a compile-only GPU stated 0 bytes before row
-    8768), its products routed as `chosen` names (`generation.chosen`)."""
+    compile-only device of `generation_name` stating `memory`: by default 32 MiB, below the step's need, so
+    XLA's scheduler holds the least it can and the temporaries are the route's alone (an H100's 80 GB let it
+    hold the declared cells' 117 MB against the template's 67 MB; a compile-only GPU stated 0 bytes before
+    row 8768), its products routed as `chosen` names (`generation.chosen`)."""
     def loss(x, weights):
         for w in weights:
             x = jnp.tanh(gemm.gemm(x, w, None, out_dtype=jnp.bfloat16))
@@ -39,7 +39,7 @@ def _step_temp(generation_name: str, chosen: dict) -> int:
     shapes = (jax.ShapeDtypeStruct((ROWS, WIDTH), jnp.bfloat16),
               tuple(jax.ShapeDtypeStruct((WIDTH, WIDTH), jnp.bfloat16) for _ in range(LAYERS)))
     with generation.chosen(**chosen):
-        return lowered_for(jax.grad(loss, argnums=(0, 1)), shapes, generation_name, memory=2**25).compile(
+        return lowered_for(jax.grad(loss, argnums=(0, 1)), shapes, generation_name, memory=memory).compile(
             ).memory_analysis().temp_size_in_bytes
 
 
@@ -54,6 +54,19 @@ def test_a_generations_declared_cells_hold_no_more_of_a_steps_memory_than_their_
     cells = _step_temp(generation_name, {})
     template = _step_temp(generation_name, {"grouped_matmul": "mosaic"})
     assert cells <= template + output, (cells, template)
+
+
+@pytest.mark.parametrize("generation_name", sorted(FAMILIES.values()))
+def test_the_templates_launches_hold_no_more_of_a_step_than_xlas_dot(generation_name):
+    """The template's launches hold no more of a step's memory than XLA's dot in their place
+    (kernel-templates.md §1: on par in peak memory): a split's fp32 partials and a balanced tail's within
+    the workspace XLA hands cuBLAS (`GpuTarget.reference_workspace`), where an A100's dense kernel gradients
+    split two ways held 80 MiB of a four-layer step's temporaries against XLA's 64 (row 12850). On a device
+    stating more than the step needs (16 GiB), where XLA rematerializes nothing of either; below it, XLA
+    recomputes its own dots and no launch's."""
+    template = _step_temp(generation_name, {"grouped_matmul": "mosaic"}, memory=2**34)
+    xla = _step_temp(generation_name, {"grouped_matmul": "xla"}, memory=2**34)
+    assert template <= xla, (template, xla)
 
 
 GATED_ROWS, GATED_WIDTH, HIDDEN = 4096, 1024, 2048

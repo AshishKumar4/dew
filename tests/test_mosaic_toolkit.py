@@ -650,6 +650,39 @@ def test_a_tiles_partials_merge_in_the_programs_order_whatever_their_count(block
                                   functools.reduce(combine, np.asarray(partials)))
 
 
+@COMPILES_ON_CPU
+def test_a_tile_its_programs_share_merges_without_serializing_their_warpgroup_mmas():
+    """M-FS-74's Qwen3.5-4B q input gradient (2048 x 8192 against 2560 x 8192 bf16, the right operand
+    transposed) at a 128 x 256 tile on an H100: 160 tiles over its 132 multiprocessors, so programs share a
+    tile's depth and its last arriver merges their partials (`Family.fixed_up`, `across.arrived`). Its merge's
+    branch on a verdict ptxas held lane by lane put a compiler-inserted warpgroup arrive in a divergent path
+    and serialized every HGMMA of the walk (C7520: 1.23x XLA's time on a GH200, row 10151): the binary its
+    compile assembles notes no C7520, nor does the gate's own assembly of its PTX by each CUDA build's ptxas
+    note any serialization (`assembled.SERIALIZED`)."""
+    import kernel_compile
+    from fla_gdn_support import KernelCase
+
+    from dew.nn.kernels import gemm, grouped_matmul, tuning
+    from dew.nn.kernels.templates.gemm.tiling import Tiles
+    from dew.nn.kernels.templates.resources import Producers
+
+    tile = Tiles(block_m=128, block_n=256, block_k=64, stages=4, grid_block_n=8, warpgroups=2, cluster=2,
+                 family="wgmma", programs=1, splits=1, swapped=False, pingpong=False,
+                 producers=Producers(caps=()), staging=None)
+    operands = (jax.ShapeDtypeStruct((2048, 8192), jnp.bfloat16),
+                jax.ShapeDtypeStruct((2560, 8192), jnp.bfloat16))
+    call = functools.partial(gemm.gemm, transpose_rhs=True, out_dtype=jnp.bfloat16)
+    with generation.chosen(grouped_matmul="mosaic"), tuning.pinned({grouped_matmul.MosaicGmm: tile}):
+        [record] = kernel_compile.compile_mosaic_kernels([KernelCase("q-dx", lambda: (call, operands))],
+                                                         "sm90")
+    assert record.get("binaries"), record.get("error")
+    diverged = [(binary["kernel"], note["message"]) for binary in record["binaries"]
+                for note in binary["notes"] if note["code"] == "C7520"]
+    serialized = [(kernel["kernel"], code) for kernel in record["kernels"] for code in kernel["losses"]
+                  if code in assembled.SERIALIZED]
+    assert (diverged, serialized) == ([], []), (diverged, serialized)
+
+
 def test_a_plan_holds_no_more_programs_than_its_target_runs_threads_for():
     """`resources.plan` for one mma.sync consumer at 32 registers a thread and 1 KiB a program, whose
     registers alone would hold sixteen programs: on an A10, an RTX PRO 6000 and an A100 its plan fits each

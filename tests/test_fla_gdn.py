@@ -646,7 +646,10 @@ def test_a_cached_continuation_whose_history_varies_in_a_checked_map_runs(kind):
     assert np.isfinite(np.asarray(got)).all()
 
 
-@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("dtype", [
+    # The fp32 site's 128 seeds took 137 to 148 s in one process (row 12443): four map tasks of 32.
+    pytest.param(jnp.float32, id="float32", marks=pytest.mark.check1_shards(seeds=128, per_task=32)),
+    pytest.param(jnp.bfloat16, id="bfloat16")])
 def test_a_gated_delta_net_on_fla_matches_it_on_xla(dtype):
     """The layer where a GPU runs the port hands it its projections' dtype and its keys on their own
     heads: its output and its parameters' and input's gradients on par with the same layer on the portable

@@ -110,11 +110,19 @@ CASES = (
 
 
 def _step(model, variables, kernel: str):
-    """The adapted projection's training step as `run(factors, x, cotangent)`, `low_rank` named `kernel`."""
+    """The adapted projection's training step as `run(factors, x, cotangent)`, `low_rank` named `kernel` and
+    the other choices XLA over the whole step: its pullback too, which runs outside the forward's call
+    (`with_gradients`) and selects the backward's products there (row 12755: named in the forward alone, the
+    fused form's input gradient took the template on an sm90)."""
     def projected(factors, x):
+        return model.apply(_merged(variables, factors), x)
+
+    step = with_gradients(projected)
+
+    def run(*inputs):
         with generation.chosen(**XLA, low_rank=kernel):
-            return model.apply(_merged(variables, factors), x)
-    return with_gradients(projected)
+            return step(*inputs)
+    return run
 
 
 def _truth(case: dict[str, str], variables):

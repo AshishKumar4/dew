@@ -592,7 +592,7 @@ class _SubKey:
     """Memoized structural key for a `jcore.Jaxpr` with O(1) cached hash and DAG-bounded equality
     (`_subkeys_equal`), held by child reference so shared nested-jit DAGs stay O(V) in work and slots."""
 
-    __slots__ = ("digest", "opaques", "_hash")
+    __slots__ = ("_hash", "digest", "opaques")
 
     def __init__(self, digest: str, opaques: tuple[Hashable, ...]) -> None:
         self.digest = digest

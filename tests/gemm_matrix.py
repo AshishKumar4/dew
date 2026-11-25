@@ -202,12 +202,12 @@ def _reported(case: dict[str, str], kernel: str | None, *,
 
 def _cutlass_takes(case: dict[str, str]) -> bool:
     """Whether CUTLASS's launches take each product of `case`'s training step (`_Cutlass.in_contract`: its
-    kernels' contract, wherever dew-cutlass holds them) on a generation whose instruction family declares a
-    CUTLASS cell (`grouped_matmul.DECLARED`): read from that table and contract, since only the GPU tier's
-    Hopper node installs the library a selection would ask for."""
-    family = generation.family(case["generation"])
+    kernels' contract, wherever dew-cutlass holds them) on a generation that declares a CUTLASS cell
+    (`grouped_matmul.DECLARED`): read from that table and contract, since only the GPU tier's Hopper node
+    installs the library a selection would ask for."""
     declared = grouped_matmul.DECLARED.items()
-    if not any(cell[0] == family and kernel is grouped_matmul.CUTLASS for cell, (kernel, _) in declared):
+    if not any(cell[0] == case["generation"] and kernel is grouped_matmul.CUTLASS
+               for cell, (kernel, _) in declared):
         return False
     if case["form"] != "grouped":
         return False

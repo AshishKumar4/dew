@@ -249,3 +249,32 @@ def test_a_memory_recomputes_its_chunks_only_where_its_rung_names_them():
         return jax.jit(jax.grad(loss)).lower(params, x).compile().cost_analysis()["flops"]
 
     assert flops(()) < flops(("memory_chunk",))
+
+
+def test_a_steps_forward_is_read_in_the_control_flow_it_runs_in():
+    """The bytes a step's forward made (`LiveSet.forward_bytes`) are those whose first scope under the step
+    and the control flow it runs in is a `jvp(`, a replayed window's forward inside its conditional and
+    loop among them (row 12884: a decision step's replay held 6,971 MiB there, which the climb read as no
+    forward's), and never a backward's (`transpose(`)."""
+    from dew.training.memory import LiveSet
+
+    replayed = "jit(step)/cond/branch_1_fun/while/body"
+    live = LiveSet(0, 0, ((100, f"{replayed}/jvp(Model)/dot_general", ()),
+                          (50, f"{replayed}/transpose(jvp(Model))/dot_general", ()),
+                          (30, "jit(step)/jvp(Model)/tanh", ()),
+                          (7, "jit(step)/convert_element_type", ())))
+    assert live.forward_bytes(lambda op_name, names: True) == 130
+
+
+def test_a_host_placed_array_holds_none_of_its_devices_memory():
+    """The bytes a step's arguments hold where they lie (`resident_on`), which its compile's limit gives
+    back, are those in each device's own memory: an array placed in its host's pinned memory
+    (`Layout(host=...)`'s banks) holds none (row 12883: counted, a host-offloaded run's limit gave back bytes
+    its device never held)."""
+    from dew.training.memory import resident_on
+
+    device = jax.devices()[0]
+    host = jax.sharding.SingleDeviceSharding(device, memory_kind="pinned_host")
+    on_device = jax.device_put(jnp.ones((64,), jnp.float32), device)
+    on_host = jax.device_put(jnp.ones((256,), jnp.float32), host)
+    assert resident_on({"device": on_device, "host": on_host}) == {device: on_device.nbytes}

@@ -409,7 +409,8 @@ class Probe:
                 "headroom": self.headroom, "temp": self.temp, "argument": self.argument,
                 "ahead": self.ahead,
                 "compile_seconds": self.compile_seconds,
-                "beside": self.beside, "spent": dict(self.spent)}
+                "beside": self.beside, "admitted": None if self.admitted is None else list(self.admitted),
+                "spent": dict(self.spent)}
 
     def named(self) -> str:
         tile = ("" if self.rung["head_tile"] is None else ", the head tiled" if self.rung["head_fused"]
@@ -1200,8 +1201,9 @@ class FitSearch[LossT, EffectsT]:
         (`ahead`); the candidate its executable compiled from, lowered afresh where a kernel spilled
         (`compiled_if_it_fits`, `Relowered`); and the measure of its fit (`Probe`), the search's state
         else untouched. A run that inspects compiles the candidate's sampled step too
-        (`Candidate.sampled`), at once with the step (`report.attempts`), or takes the one compiled ahead
-        with the step (`AheadOfTime.sampled`), which
+        (`Candidate.sampled`): at once with the step (`report.attempts`) until the search has missed, after
+        which only once the step fits; or takes the one compiled ahead with the step
+        (`AheadOfTime.sampled`), which
         must fit as the step must, so a rung fits only where both do; it is `sampled` until the next
         measure."""
         options = self.compiled_options(candidate)
@@ -1221,8 +1223,12 @@ class FitSearch[LossT, EffectsT]:
                 executable, taken = kept, True
             else:
                 # A run that inspects compiles its sampled step beside the step, at once (`report.attempts`),
-                # its compile kept only where the step fits, as the step's own is kept first.
-                early = None if candidate.sampled is None else candidate.sampled()
+                # its compile kept only where the step fits, as the step's own is kept first: until the
+                # search has missed once, past which most of its compiles miss and the sampled step is
+                # lowered and compiled for a step that fits alone (below), where each missed rung lowered,
+                # traced and compiled it for nothing (rows 8411, 10960: half an inspecting climb's time).
+                missed = any(not probe.fits for probe in self.probes)
+                early = None if candidate.sampled is None or missed else candidate.sampled()
                 firsts = report.attempts([(candidate.lowered, options)]
                                          + ([] if early is None else [(early, options)]))
                 relowered = Relowered(lambda: self.relowering(split))

@@ -1027,9 +1027,9 @@ def seen(spec: Forward, coords: Coords, like: jax.Array) -> jax.Array | None:
     if coords.spans is not None:
         ids = None if coords.ids is None else (coords.queries(coords.ids[0], like),
                                                coords.keys(coords.ids[1], like))
-        visible = functools.reduce(jnp.logical_or, (within(coords.k_pos, coords.queries(start, like),
-                                                           coords.queries(end, like), ids)
-                                                    for start, end in coords.spans))
+        runs = [within(coords.k_pos, coords.queries(start, like), coords.queries(end, like), ids)
+                for start, end in coords.spans]  # counted, not or-ed: one select an entry (FS-6766-MAIN1)
+        visible = runs[0] if len(runs) == 1 else jnp.asarray(sum(r.astype(jnp.int32) for r in runs)) > 0
     elif spec.form == "causal":
         visible = _keys_before(coords, coords.q_pos + 1)
     if spec.form != "spans" and (spec.keys % coords.key_count(like) or spec.walked_keys is not None):

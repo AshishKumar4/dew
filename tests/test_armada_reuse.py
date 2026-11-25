@@ -11,6 +11,8 @@ import re
 import shutil
 import subprocess
 import sys
+import time
+import types
 from collections.abc import Callable
 from pathlib import Path
 
@@ -102,7 +104,7 @@ def ran_by_script(ci, root: Path, cache_worker, names: tuple[str, ...], module: 
     whose .armada.json pins its tasks to this host's class: the environment a plan of theirs runs in, which
     names the cache and its tokens."""
     interpreter(root, "3.12")
-    held = ci.cpu_class().split("-")
+    held = ci.run_keys.cpu_class().split("-")
     config = json.loads((ROOT / ".armada.json").read_text())
     config["task"]["cpu"] = {"vendor": held[0], "family": int(held[1]), "model": int(held[2])}
     (root / ".armada.json").write_text(json.dumps(config))
@@ -360,14 +362,18 @@ def test_a_plan_spreads_its_kept_rows_over_tasks_of_the_targets_lookups(ci, tmp_
 
 def test_a_kept_tasks_entry_stays_within_what_a_process_starts_with_however_high_the_target(
         ci, tmp_path, monkeypatch, cache_worker):
-    """However many lookups the target allows, a kept task's entry, which armada hands its task whole as one
-    environment string (ARMADA_ITEM), and its tokens, one argument (--tests), stay within the 131,071 bytes
-    Linux starts a process with, and every kept row is reused (2026-10-31: main de315f9a05's kept rows were
-    one task, whose 149,515-byte argument started none)."""
+    """However many lookups the target allows, a kept task's tokens and row names stay within `KEPT_BYTES`,
+    so its entry, which armada hands its task whole as one environment string (ARMADA_ITEM), and its tokens,
+    one argument (--tests), stay within twice that: the 131,071 bytes Linux starts a process with, as ci.py
+    bounds it; and every kept row is reused (2026-10-31: main de315f9a05's kept rows were one task, whose
+    149,515-byte argument started none). Here at a bound of 4,096 bytes, which 40 files' rows pass: each file
+    runs in a pytest of its own, and 300 files to pass the real bound took this test past its group's 120 s
+    (row 12406)."""
+    monkeypatch.setattr(ci, "KEPT_BYTES", 4096)
     verdict, _ = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
     # Files of long names (beside a fetched fixture's manifest name, within a file system's 255 bytes), enough
-    # that their kept rows' tokens and names pass what a process starts with together.
-    names = [f"tests/test_{index:03d}{'x' * 200}.py" for index in range(300)]
+    # that their kept rows' tokens and names pass the bound together.
+    names = [f"tests/test_{index:03d}{'x' * 200}.py" for index in range(40)]
     written(tmp_path, {Path(name).name: f"def test_{index}():\n    pass\n"
                        for index, name in enumerate(names)})
     durations = tmp_path / "tests/test_durations.json"
@@ -378,8 +384,9 @@ def test_a_kept_tasks_entry_stays_within_what_a_process_starts_with_however_high
     every = sorted(f"3.12:{name}" for name in [*names, *(f"tests/test_{letter}.py" for letter in "abc")])
     assert sorted(row for entry in entries for row in entry["rows"]) == every
     assert all(ci.session.KEPT_AT in token for entry in entries for token in entry["tests"].split())
-    assert max(len(f"ARMADA_ITEM={json.dumps(entry)}".encode()) for entry in entries) <= 131_071
-    assert max(len(f"--tests={entry['tests']}".encode()) for entry in entries) <= 131_071
+    assert len(entries) > 1
+    assert max(len(f"ARMADA_ITEM={json.dumps(entry)}".encode()) for entry in entries) <= 2 * ci.KEPT_BYTES
+    assert max(len(f"--tests={entry['tests']}".encode()) for entry in entries) <= ci.KEPT_BYTES
     rows = armada_task(ci, monkeypatch, verdict, target=100_000.0)
     assert sorted((row["name"], row["exitCode"]) for row in rows) == [(name, 0) for name in every]
     assert [len((tmp_path / f"runs-{name}").read_text()) for name in "abc"] == [1, 1, 1]
@@ -511,7 +518,7 @@ def test_a_task_on_another_pinned_class_reuses_the_rows_its_plan_kept(
     armada_task(ci, monkeypatch, verdict)
     (tmp_path / "tests/test_c.py").write_text((tmp_path / "tests/test_c.py").read_text() + "\nCHANGED = 1\n")
     assert planned() == ["tests/test_a.py tests/test_b.py", "tests/test_c.py"]
-    monkeypatch.setattr(ci, "cpu_class", lambda: "AuthenticAMD-25-17")
+    monkeypatch.setattr(ci.run_keys, "cpu_class", lambda: "AuthenticAMD-25-17")
     rows = armada_task(ci, monkeypatch, verdict)
     assert len(rows) == 3 and all(row["exitCode"] == 0 for row in rows)
     assert [len((tmp_path / f"runs-{name}").read_text()) for name in "abc"] == [1, 1, 2]
@@ -526,7 +533,7 @@ def test_mains_own_run_of_a_row_is_found_behind_a_lanes_later_run_on_its_branch(
     the row runs again."""
     verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
     commit = {"head": "a" * 40}
-    monkeypatch.setattr(ci, "head_commit", lambda: commit["head"])
+    monkeypatch.setattr(ci.run_keys, "head_commit", lambda: commit["head"])
     monkeypatch.setattr(ci, "mainline", lambda: "a" * 40)
     armada_task(ci, monkeypatch, verdict)
     test_a = tmp_path / "tests/test_a.py"
@@ -645,13 +652,13 @@ def test_a_red_that_read_the_rows_state_before_another_red_still_revokes_the_gre
     def red(stale: bool = False) -> None:
         read = []
 
-        def send(method: str, url: str, headers, body, timeout: float):
+        def send(method: str, url: str, headers, body, timeout: float, until=None):
             # Its first read of the row's state as before the other red's write: the row had none then.
             if stale and method == "GET" and ("-reds/" in url or "-epochs/" in url) and "test_a" in url \
                     and not read:
                 read.append(url)
                 return 404, {}, io.BytesIO(b"")
-            return sender(method, url, headers, body, timeout)
+            return sender(method, url, headers, body, timeout, until)
 
         with monkeypatch.context() as patched:
             patched.setattr(ci.records, "SEND", send)
@@ -677,10 +684,10 @@ def test_a_lookup_whose_epoch_is_unread_or_gone_reuses_nothing(ci, tmp_path, mon
     # The Worker unavailable for the rows' epochs alone.
     sender = ci.records.SEND
 
-    def send(method: str, url: str, headers, body, timeout: float):
+    def send(method: str, url: str, headers, body, timeout: float, until=None):
         if "-epochs/" in url:
             raise ConnectionResetError("the connection to the Worker was reset")
-        return sender(method, url, headers, body, timeout)
+        return sender(method, url, headers, body, timeout, until)
 
     with monkeypatch.context() as patched:
         patched.setattr(ci.records, "SEND", send)
@@ -693,6 +700,107 @@ def test_a_lookup_whose_epoch_is_unread_or_gone_reuses_nothing(ci, tmp_path, mon
     assert planned() == ["tests/test_a.py", "tests/test_b.py", "tests/test_c.py"]
 
 
+def test_a_green_run_whose_epoch_a_red_rotated_while_it_ran_is_kept_nowhere(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A green run records its verdict only within the epoch it began in (`epochs_of`, read before its
+    pytest): where a red run of the row began the next epoch while it ran, its older verdict is kept nowhere,
+    so no plan reuses it (row 12180: a delayed green stamped with the red's new epoch stood as current); a run
+    that began in the epoch it ends in is kept."""
+    verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    with monkeypatch.context() as patched:
+        patched.setattr(ci, "epochs_of", lambda python, names, common, held, until: dict.fromkeys(
+            names, "an-epoch-a-red-replaced"))
+        armada_task(ci, monkeypatch, verdict)
+    assert planned() == ["tests/test_a.py", "tests/test_b.py", "tests/test_c.py"]
+    armada_task(ci, monkeypatch, verdict)
+    assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
+
+
+def test_a_run_reads_its_epochs_only_where_it_records_its_rows_and_an_unread_one_publishes_no_green(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A run reads its rows' epochs before its pytest only where it records them (`tested`'s `recording`),
+    within EPOCH_SECONDS: the census's reads none and records none. An epoch the Worker did not give in time
+    is `UNREAD`, and the row it ran is kept nowhere, published green by no run (row 12180)."""
+    verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    unreused = ["tests/test_a.py", "tests/test_b.py", "tests/test_c.py"]
+    asked: list[float] = []
+    epochs = ci.epochs_of
+
+    def counted(python, names, common, held, until):
+        asked.append(until - time.monotonic())
+        return epochs(python, names, common, held, until)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(ci, "EPOCH_SECONDS", 0.0)
+        armada_task(ci, monkeypatch, verdict)
+    assert planned() == unreused
+    with monkeypatch.context() as patched:
+        patched.setattr(ci, "epochs_of", counted)
+        armada_task(ci, monkeypatch, verdict, census=True)
+        assert asked == [] and planned() == unreused
+        armada_task(ci, monkeypatch, verdict)
+        assert asked and all(0 < left <= ci.EPOCH_SECONDS for left in asked)
+    assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
+
+
+def test_a_run_with_no_time_left_after_its_epochs_runs_no_pytest_and_its_rows_are_stale(ci, tmp_path,
+                                                                                       monkeypatch):
+    """A late group whose task's time is spent reading its epochs (each read within what is left of its
+    time, never EPOCH_SECONDS past it) starts no pytest: its rows are stale, run again, never red for a time
+    they were not given (row 12180's review)."""
+    asked: list[float] = []
+
+    def slow(python, names, common, held, until):
+        asked.append(until - time.monotonic())
+        time.sleep(max(0.0, until - time.monotonic()))
+        return dict.fromkeys(names, ci.UNREAD)
+
+    monkeypatch.setattr(ci, "epochs_of", slow)
+    monkeypatch.setattr(ci, "watched_pytest", lambda *args: pytest.fail("pytest ran with no time left"))
+    out = tmp_path / "rows.json"
+    assert ci.tested("3.12", ["tests/test_a.py"], "", out, 0.3, "off", 5.0, "common", {}) == 0
+    rows = json.loads(out.read_text())["rows"]
+    assert asked and all(left <= 0.3 for left in asked)
+    assert [row["kind"] for row in rows] == [ci.STALE]
+
+
+def test_a_runs_pytest_is_given_what_is_left_of_its_task_after_its_epochs(ci, tmp_path, monkeypatch):
+    """The time a run spends reading its epochs, and everything before them, is its task's: its pytest is
+    given what is left of the task's one end, read as it starts, charged once (row 12180's review)."""
+    given: list[float] = []
+    clock = [100.0]
+
+    class Started(Exception):
+        pass
+
+    def slow(python, names, common, held, until):
+        clock[0] += 0.5
+        return dict.fromkeys(names, ci.UNREAD)
+
+    def started(command, environment, left, *args):
+        given.append(left)
+        raise Started
+
+    faked = types.SimpleNamespace(monotonic=lambda: clock[0], time=time.time, sleep=time.sleep)
+    monkeypatch.setattr(ci, "time", faked)
+    monkeypatch.setattr(ci, "epochs_of", slow)
+    monkeypatch.setattr(ci, "watched_pytest", started)
+    with pytest.raises(Started):
+        ci.tested("3.12", ["tests/test_a.py"], "", tmp_path / "rows.json", 3.0, "off", 5.0, "common", {})
+    assert given == [2.5]
+
+
+@pytest.mark.parametrize("found", [b"null", b"[]", b'{"epoch": 3}', b'{"name": "e"}'])
+def test_an_epoch_record_that_is_no_epoch_is_unread(ci, monkeypatch, cache_worker, found):
+    """An epoch's record that is no object naming its epoch (null, a list, a name no string) is `Unread`,
+    never a crash before the run's pytest: the run goes on, publishing no green under it."""
+    url, stored, _ = cache_worker
+    monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
+    stored["/" + ci.records.epoch_key("3.12", "3.12:tests/test_a.py", "cls", "common")] = found
+    with pytest.raises(ci.records.Unread):
+        ci.records.epoch("3.12", "3.12:tests/test_a.py", "cls", "common", "token")
+
+
 def test_a_red_runs_epoch_write_sent_again_after_a_later_one_never_puts_it_back(
         ci, tmp_path, monkeypatch, cache_worker):
     """An epoch's write sent again after a later epoch replaced it (a retry of a write the Worker took but
@@ -703,10 +811,10 @@ def test_a_red_runs_epoch_write_sent_again_after_a_later_one_never_puts_it_back(
     sent: list[tuple] = []
     sender = ci.records.SEND
 
-    def keeping(method: str, url: str, headers, body, timeout: float):
+    def keeping(method: str, url: str, headers, body, timeout: float, until=None):
         if method == "PUT" and "-epochs/" in url and "test_a" in url:
             sent.append((method, url, dict(headers), body, timeout))
-        return sender(method, url, headers, body, timeout)
+        return sender(method, url, headers, body, timeout, until)
 
     def red() -> None:
         with monkeypatch.context() as patched:

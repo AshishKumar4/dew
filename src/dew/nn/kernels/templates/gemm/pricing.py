@@ -162,7 +162,29 @@ def dense_tail(tiles: "Tiles", dtype, extents: tuple[int, int, int], itemsizes: 
     waves, rem = divmod(grid[0] * grid[1], pairs)
     if tiles.cluster > 1 and (waves > 1 or rem > pairs // 2):
         return None
+    # Its partials' workspace is the launch's beside its operands and output, no more than the reference's
+    # (`GpuTarget.reference_workspace`): a GH200's 128 x 256 tiles' over 132 programs, 33 MiB, held past
+    # cuBLAS's 32 (M-NG-45b's 34.6 MB temporaries a cell, row 12850).
+    if not within_workspace(target, math.prod(tail_workspace(tiles, family, programs)) * 4):
+        return None
     return balanced_tail(tiles, grid, -(-k // tiles.block_k), itemsizes, target, programs, dtype=dtype)
+
+
+def tail_workspace(tiles: "Tiles", family: mosaic.Family, programs: int) -> tuple[int, ...]:
+    """A balanced tail's fp32 partials' shape, the one its planner bounds (`dense_tail`) and its launches
+    allocate (`mosaic_gpu._workspace`): each of a launch's `programs` (cluster pairs of `tiles.cluster`), two
+    tiles' (the one its range starts inside and the one it walks the first step of), each consumer's share
+    of the tile's rows by its columns (a tail's tile is no ping-pong one, `fixes_up`)."""
+    return (tiles.cluster, programs // tiles.cluster, 2, tiles.warpgroups, tiles.share,
+            tile_columns(tiles, family))
+
+
+def within_workspace(target: generation.GpuTarget | None, held: float) -> bool:
+    """Whether a launch's `held` bytes beside its operands and outputs (a split's fp32 partials, a balanced
+    tail's) are within the CUDA libraries' nominal ceiling for one GEMM's on `target`
+    (`GpuTarget.reference_workspace`), where it states one."""
+    bound = None if target is None else target.reference_workspace
+    return bound is None or held <= bound
 
 
 def handoff_steps(tiles: "Tiles", target, itemsizes: tuple[int, int]) -> float:
@@ -176,24 +198,27 @@ def handoff_steps(tiles: "Tiles", target, itemsizes: tuple[int, int]) -> float:
 def split_count(tiles: "Tiles", *, groups: int, rows: int, depth: int, width: int, itemsizes: tuple[int, int],
                 stored: float, multiprocessors: int, step_seconds: float | None, bandwidth: float | None,
                 launch_seconds: float | None, partial_rows: int | None = None,
-                target: generation.GpuTarget | None = None) -> int:
+                target: generation.GpuTarget | None = None, partial_bytes: float | None = None) -> int:
     """Dew: the slices a contraction of `rows` splits into at `tiles` (`Tiles.splits`: a kernel gradient's,
     `tgmm`, a decode product's or an underfilled dense product's, `gmm`), derived from the call's extents and
     the device's facts in MMA steps (`step_seconds`, rows 10151, 3613, 483)."""
     walk = split_walk(tiles, groups=groups, rows=rows, depth=depth, width=width, itemsizes=itemsizes,
                       stored=stored, multiprocessors=multiprocessors, step_seconds=step_seconds,
                       bandwidth=bandwidth, launch_seconds=launch_seconds, partial_rows=partial_rows,
-                      target=target)
+                      target=target, partial_bytes=partial_bytes)
     return best_splits(walk, tiles.stages)
 
 
 def best_splits(walk: "SplitWalk | None", stages: int) -> int:
-    """The split count `walk` prices least among whole-step shares keeping at least `stages + 1` steps."""
+    """The split count `walk` prices least among whole-step shares keeping at least `stages + 1` steps whose
+    partials the launch holds within the reference's workspace (`SplitWalk.holds`: an A100's 2048 x 2048
+    kernel gradient at 4,096 rows split two ways held 32 MiB of fp32 partials where cuBLAS holds 4, a
+    four-layer step's peak 80 MiB against XLA's 64, row 12850)."""
     if walk is None:
         return 1
     steps = walk.steps
     counts = sorted({-(-steps // -(-steps // count)) for count in range(1, steps // (stages + 1) + 1)})
-    return min([1, *counts], key=walk.seconds)
+    return min([1, *filter(walk.holds, counts)], key=walk.seconds)
 
 
 def epilogue_registers(family: mosaic.Family, share: int, columns: int, stored: tuple, *,
@@ -306,6 +331,17 @@ class SplitWalk:
     stored: float
     drift_horizon: float = 0.0
     drift_extra: float = 0.0
+    partial_bytes: float = 0.0
+    """One slice's fp32 partials of the output as its launch declares them (its rows padded, gathered or
+    scattered), which a split launch holds `splits` of until their sum."""
+    workspace: float | None = None
+    """The most a launch holds beside its operands and output (`GpuTarget.reference_workspace`), which a
+    split's partials stay within (`best_splits`); None where the target states none."""
+
+    def holds(self, splits: int) -> bool:
+        """Whether `splits` slices' partials stay within the reference's workspace (`workspace`): one
+        slice holds none, its tile summed in registers."""
+        return splits == 1 or self.workspace is None or splits * self.partial_bytes <= self.workspace
 
     def walk(self, splits: int) -> float:
         """The busiest program's walk at `splits` slices a tile, in steps: its waves' share of every tile's
@@ -331,7 +367,8 @@ class SplitWalk:
                                     self.multiprocessors) / self.step_seconds
         base = max(busiest, stream)
         if self.drift_horizon > 0.0 and slice_steps > self.drift_horizon:
-            base += -(-programs // self.wave) * (slice_steps - self.drift_horizon) * self.drift_extra
+            waves = unit_cost.spread(programs, self.wave)
+            base += waves * (slice_steps - self.drift_horizon) * self.drift_extra
         return base
 
     def seconds(self, splits: int) -> float:
@@ -353,7 +390,8 @@ class SplitWalk:
 def split_walk(tiles: "Tiles", *, groups: int, rows: int, depth: int, width: int, itemsizes: tuple[int, int],
                stored: float, multiprocessors: int, step_seconds: float | None, bandwidth: float | None,
                launch_seconds: float | None, partial_rows: int | None = None,
-               target: generation.GpuTarget | None = None) -> SplitWalk | None:
+               target: generation.GpuTarget | None = None,
+               partial_bytes: float | None = None) -> SplitWalk | None:
     """Dew: the walk `split_count` prices at `tiles` (its arguments'), None where the device states no rate
     or the call has no whole tile: its wave every program a multiprocessor runs at once, its output tiles
     each program's (a pair's CTA's its rows by the pair's columns, `tile_columns`), `step_seconds` a step at
@@ -384,12 +422,14 @@ def split_walk(tiles: "Tiles", *, groups: int, rows: int, depth: int, width: int
                      held * width * 4 / bandwidth / step_seconds,
                      0.0 if launch_seconds is None else launch_seconds / step_seconds,
                      held * width * stored / bandwidth / step_seconds,
-                     drift_horizon, drift_extra)
+                     drift_horizon, drift_extra,
+                     held * width * 4.0 if partial_bytes is None else partial_bytes,
+                     None if target is None else target.reference_workspace)
 
 
 def decode_contraction(tiles: "Tiles", target, *, rows: int, groups: int, depth: int, width: int,
                        columns: int | None, held: int, operands: tuple, stored: float,
-                       multiprocessors: int) -> dict:
+                       multiprocessors: int, partial_bytes: float | None = None) -> dict:
     """A product's walk at `tiles` as `split_walk` and `split_count` price it (their keywords): swapped
     (`Tiles.swapped`), its matrix the rows (`width`) over its `depth`, the call's `rows` its padded `columns`;
     multi-row-tile calls (`rows > groups * block_m`), all `rows` over `depth` (row 10151); else each
@@ -408,7 +448,8 @@ def decode_contraction(tiles: "Tiles", target, *, rows: int, groups: int, depth:
     unswapped = dataclasses.replace(tiles, swapped=False)
     return {**shape, 'itemsizes': itemsizes, 'stored': stored, 'multiprocessors': multiprocessors,
             'step_seconds': step_seconds(unswapped, target, itemsizes, decoded),
-            'bandwidth': target.memory_rate, 'launch_seconds': target.launch_seconds, 'target': target}
+            'bandwidth': target.memory_rate, 'launch_seconds': target.launch_seconds, 'target': target,
+            'partial_bytes': partial_bytes}
 
 
 def walk_seconds(tiles: "Tiles", contraction: dict) -> float:
