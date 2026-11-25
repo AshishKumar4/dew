@@ -1337,9 +1337,9 @@ def test_mosaic_planning_uses_explicit_target_not_ambient_gpu():
 
 @lowers("sm90")
 def test_gemm_register_model_fits_sm90_epilogue_and_tgmm_census():
-    """The GEMM register model holds legal multi-output epilogues and `dew_tgmm` spill-free under sm90 ptxas
-    while refusing wide multi-output tiles past the single-warpgroup budget, and scopes wgmma `tgmm` scalar
-    addressing away from tcgen05 (rows 8723, 11946, 11947)."""
+    """The GEMM register model holds legal multi-output epilogues, a hook's a 64-column chunk at a time, and
+    `dew_tgmm` spill-free under sm90 ptxas, and scopes wgmma `tgmm` scalar addressing away from tcgen05
+    (rows 8723, 11946, 11947, 1958)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels
 
@@ -1365,11 +1365,14 @@ def test_gemm_register_model_fits_sm90_epilogue_and_tgmm_census():
         # 128-col mixed (bf16, fp32) exercises per-output staging widths: 64-col bf16 and 32-col fp32.
         t128 = tiling.Tiles(64, 128, 64, 3, 56, warpgroups=1, family="wgmma")
         assert gmm.legal(ba_two, t256, sm90)
-        assert not gmm.legal(ba_wide_last, t256, sm90)
+        # A hook takes 64 columns at a time (`pricing.hook_chunk`): the wide mixed tile its model holds
+        # compiles spill-free, which its whole-tile hook's model refused (row 1958).
+        assert gmm.legal(ba_wide_last, t256, sm90)
         assert gmm.legal(ba_wide_last, t128, sm90)
         assert tgmm.legal(ba_dw, t256, sm90)
         cases = [
             KernelCase("two_out_64x256", lambda: gmm.lowering(ba_two, t256)),
+            KernelCase("mixed_64x256", lambda: gmm.lowering(ba_wide_last, t256)),
             KernelCase("mixed_64x128", lambda: gmm.lowering(ba_wide_last, t128)),
             KernelCase("tgmm_64x256", lambda: tgmm.lowering(ba_dw, t256)),
         ]

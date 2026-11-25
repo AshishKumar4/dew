@@ -1588,6 +1588,11 @@ class Transport[Allocated, Opened](abc.ABC):
     Hopper: `mosaic_sm80.Mma.persist`), so its epilogue holds its share of the stored tile beside the
     accumulator (`resources.tile_registers`)."""
 
+    stores_chunks: bool = False
+    """Whether its stores take a tile's output a chunk of its columns at a time, each at its own column
+    (`stores.staged_chunks`: a ring family's), so an epilogue may compute it so (`pricing.hook_chunk`); a
+    family staging each output tile whole as one value takes it whole."""
+
     stores_narrowed: bool = False
     """Whether its stores take an output its epilogue computes narrower than the tile (`stores.Output`'s
     `narrowed`: a `divisor`-th of its columns, placed at the column its caller gives, its own): a

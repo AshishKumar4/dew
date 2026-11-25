@@ -2137,18 +2137,23 @@ each its own."""
 
 def _declared() -> dict[tuple[str | None, Kind], tuple[selection.Kernel[GroupedCase], str]]:
     """`DECLARED`, from the receipts that hold its cells (`grouped_cells`): each scoreboard's kinds
-    (`SCOREBOARDS`), the A10's and L4's (`M_FS_34`), the A100's grouped forward (`M_EM_2`), products in one
-    launch timed apart (`TOGETHER`), and every product a receipt timed (`grouped_cells.timings`, the one
-    record its recognition reads too) where its winner is not its kind's route, none returning to XLA on a
-    kind a scoreboard put on the template."""
+    (`SCOREBOARDS`), the template's only where every product a receipt timed of that kind is at parity
+    (none lagging, `Timing.winner`, whichever receipt timed it), the A10's and L4's (`M_FS_34`), the A100's
+    grouped forward (`M_EM_2`), products in one launch timed apart (`TOGETHER`), and every product a receipt
+    timed (`grouped_cells.timings`, the one record its recognition reads too) where its winner is not its
+    kind's route."""
     cells: dict[tuple[str | None, Kind], tuple[selection.Kernel[GroupedCase], str]] = {}
-    replaced = set()
+    lagging = {}
+    for timing in timings():
+        if timing.winner == REFERENCE:
+            lagging.setdefault((timing.generation, timing.made), timing.evidence)
     for board in SCOREBOARDS:
         for made in board.times:
-            if board.winner(made) == TEMPLATE:
-                replaced.add((board.generation, made))
-            else:
+            if board.winner(made) == REFERENCE:
                 cells[board.generation, Kind(dense=True, made=made)] = (XLA, board.why(made))
+            elif (board.generation, made) in lagging:
+                cells[board.generation, Kind(dense=True, made=made)] = (XLA, (
+                    f"{board.why(made)}; but {lagging[board.generation, made]}"))
     for name, receipt in M_FS_34.items():
         for made in (Made.FORWARD, Made.INPUT_GRADIENT, Made.KERNEL_GRADIENT):
             cells[name, Kind(dense=True, made=made)] = (XLA, receipt)
@@ -2161,12 +2166,10 @@ def _declared() -> dict[tuple[str | None, Kind], tuple[selection.Kernel[GroupedC
     routes = {TEMPLATE: MOSAIC, REFERENCE: XLA}
     for timing in timings():
         kind = XLA if (timing.generation, Kind(dense=True, made=timing.made)) in cells else MOSAIC
-        route = routes[timing.winner]
-        if route is not kind and not (timing.winner == REFERENCE
-                                      and (timing.generation, timing.made) in replaced):
+        if routes[timing.winner] is not kind:
             cells[timing.generation, Kind(dense=True, made=timing.made, matrix=timing.matrix,
                                           formed=timing.formed, span=timing.timed.span)] = (
-                route, timing.evidence)
+                routes[timing.winner], timing.evidence)
     return cells
 
 
@@ -2175,12 +2178,11 @@ DECLARED = _declared()
 template's default on a generation, each with its receipt (owner, bible da64ae5; "whatever is the
 best/fastest remains the route until our templates catch up", ops 361caffc; bible §6 2026-11-24: "templates
 should replace ref routes on parity"): (device generation, kind of call) to (that route's kernel, the
-receipt). A kind takes the template once every product its receipt timed is at parity, whole
+receipt). A kind takes the template once every product any receipt timed of it is at parity, whole
 (`grouped_cells.Scoreboard`: the template matching or beating the best kernel at every shape it serves,
 kernel-templates.md §1), and a generation no receipt timed takes the template; on a kind XLA keeps, a product
 of a matrix a receipt timed (`MEASURED`) at parity over its rows is the template's, a cell of its own, and
-any other its kind's (`GroupedCase.cell`). The list shrinks as the template climbs: no product returns to
-XLA on a kind the template took.
+any other its kind's (`GroupedCase.cell`). The list shrinks as the template climbs.
 A cell's route holds no more of a step's memory than the template's: each product's reverse mode returns
 its rows' cotangent only with its kernel gradient formed (`derivatives.with_gradients_formed`, row 6027),
 whichever route forms it (tests/test_declared_cells_memory.py). Nothing is ranked at runtime. A

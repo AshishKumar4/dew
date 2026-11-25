@@ -223,11 +223,11 @@ def best_splits(walk: "SplitWalk | None", stages: int) -> int:
 
 def hook_chunk(family: mosaic.Family, columns: int, units: tuple[int, ...] = ()) -> int:
     """The columns an epilogue's hook takes at a time on `family` (`Issuer.hook_columns`), the kernel's
-    (`mosaic_gpu._finished`) and its register model's (`epilogue_registers`): whole where a chunk would hold
-    no whole unit of an output's form (`units`, `quantized.Form.unit`: a reduced output's block, a narrowed
-    one's runs)."""
+    (`mosaic_gpu._finished`) and its register model's (`epilogue_registers`): whole where its stores take no
+    chunk (`mosaic.Transport.stores_chunks`: sm80's whole-tile staging) or a chunk would hold no whole unit
+    of an output's form (`units`, `quantized.Form.unit`: a reduced output's block, a narrowed one's runs)."""
     chunk = family.hook_columns(columns)
-    return columns if any(chunk % unit for unit in units) else chunk
+    return columns if not family.stores_chunks or any(chunk % unit for unit in units) else chunk
 
 
 def epilogue_registers(family: mosaic.Family, share: int, columns: int, stored: tuple, *,

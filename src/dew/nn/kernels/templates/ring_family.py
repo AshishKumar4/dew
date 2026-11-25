@@ -70,6 +70,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     takes_pingpong = True
     walks_once = True
     stores_narrowed = True
+    stores_chunks = True
     # Mosaic GPU's default for a warpgroup (its CompilerParams' 128 x 4 x 4 bytes).
     warpgroup_reduction_scratch = 2048
     stores_through_registers = False
