@@ -922,11 +922,12 @@ def test_a_resume_recomputes_its_loop_freely_as_a_saved_run_did(tmp_path):
     from dew.nn.backbones.decoder_stack import Loop
 
     run = dataclasses.replace(lm(tmp_path, drawn=False), pretrained=str(QWEN))
-    looped = dataclasses.replace(run, loop=Loop(2, step_norm=False, layers=(0, 1)))
+    loop = Loop(2, step_norm=False, layers=(0, 1))
+    looped = dataclasses.replace(run, loop=loop)
     saved = earlier_run(json.loads(json.dumps(looped.record())))
-    dataclasses.replace(looped, loop=dataclasses.replace(looped.loop, remat=True)).check_resume(saved)
+    dataclasses.replace(looped, loop=dataclasses.replace(loop, remat=True)).check_resume(saved)
     with pytest.raises(ValueError):
-        dataclasses.replace(looped, loop=dataclasses.replace(looped.loop, steps=3)).check_resume(saved)
+        dataclasses.replace(looped, loop=dataclasses.replace(loop, steps=3)).check_resume(saved)
     record = json.loads(json.dumps(run.record()))
     for change, refused in (({"loop_remat": True}, False),
                             ({"loop_remat": True, "loop_exit_gate": True}, True)):
