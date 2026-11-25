@@ -379,7 +379,9 @@ def test_a_shared_bias_summed_a_slab_at_a_time_is_its_exact_sum(monkeypatch):
     np.testing.assert_array_equal(slabbed.view(np.uint32), whole.view(np.uint32))
     truth = sum(grad[row].astype(np.float64) * 2.0 ** int(np.asarray(shift).ravel()[row]) for row in range(4))
     np.testing.assert_array_equal(slabbed[0, :, :, :8], np.float32(truth[:, :, :8]))
-    # A negative axis the sum's own: rows of 64 summed whole, never slabbed along themselves.
+    # A negative axis the sum's own: rows of 64 summed whole, never slabbed along themselves (at a cap of 64
+    # entries a slab, two slabs of the kept axis).
+    monkeypatch.setattr(template, "RAISED_ELEMENTS", 64)
     ones = jnp.ones((2, 64), jnp.float32)
     np.testing.assert_array_equal(np.asarray(template.raised_sum(ones, jnp.zeros((2, 1), jnp.int32), (-1,))),
                                   np.full((2, 1), 64.0, np.float32))

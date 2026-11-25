@@ -2103,8 +2103,7 @@ def raised_sum(grad: jax.Array, shift: jax.Array, axes: tuple[int, ...]) -> jax.
     kept = [axis for axis in range(grad.ndim) if axis not in axes and grad.shape[axis] > 1]
     if not kept or grad.size <= RAISED_ELEMENTS:
         return _raised(grad, shift, axes)
-    slabs, axis = min((_slabs(grad.size, grad.shape[axis]), -axis) for axis in kept)
-    axis = -axis
+    slabs, axis = _slab_axis(grad.size, {axis: grad.shape[axis] for axis in kept})
 
     def split(x):
         # `x` in `slabs` along `axis`, the slab its leading axis; one of no extent there each slab's whole.
@@ -2124,11 +2123,17 @@ RAISED_ELEMENTS = 1 << 24
 levels of int32), so 0.7 GiB a slab."""
 
 
-def _slabs(size: int, extent: int) -> int:
-    """The fewest slabs of an axis of `extent` (a divisor of it) that hold `size` entries `RAISED_ELEMENTS`
-    or fewer a slab, or `extent` where none does."""
+def _slab_axis(size: int, extents: dict[int, int]) -> tuple[int, int]:
+    """The slab count and axis of `extents` (axis: extent) to sum `size` entries in, `RAISED_ELEMENTS` or
+    fewer a slab: the fewest slabs of equal size (a divisor of its extent) that fit, over every axis; where
+    no axis's do, the axis of most slabs, each its extent's one, the least a slab holds."""
     wanted = -(-size // RAISED_ELEMENTS)
-    return next((count for count in range(wanted, extent + 1) if extent % count == 0), extent)
+    fitting = [(min(count for count in range(wanted, extent + 1) if extent % count == 0), axis)
+               for axis, extent in extents.items() if extent >= wanted]
+    if fitting:
+        return min(fitting)
+    axis = max(extents, key=extents.__getitem__)
+    return extents[axis], axis
 
 
 def _raised(grad: jax.Array, shift: jax.Array, axes: tuple[int, ...]) -> jax.Array:
