@@ -706,7 +706,7 @@ def key_pairs_own(q, k, prefix, beta, d_scores, d_system, taken, factored, memor
                 [functools.partial(rows, "queries"),
                  lambda: algebra.write_gated(rows("reads" if reading else "keys"), betas)],
                 shifted_keys(call, shifts, key, limbs), functools.partial(shifted_up, call),
-                (zero, zero), zero)
+                (zero, zero), zero, sheared=reading)
             column = h * width + index * keys
             start = family.columns_of(ending_ref.at[n, pl.ds(column, keys)])
             d_betas = d_betas + _own_finished(

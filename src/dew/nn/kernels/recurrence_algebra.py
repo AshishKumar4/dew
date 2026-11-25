@@ -1185,7 +1185,7 @@ def key_decayed_pairs_back(d_pairs: list, rows: list, keys: Callable[[int], jax.
 
 def key_diagonal_pairs_back(strips: list, own: list, behind: Callable[[jax.Array], tuple],
                             lower: Callable[[jax.Array, jax.Array], jax.Array], d_rows: tuple, d_keys,
-                            *, sub: int = SUB) -> tuple:
+                            *, sub: int = SUB, sheared: bool = False) -> tuple:
     """`key_diagonal_bands`' transpose on one key block, added onto its gradients so far `d_rows` (one a
     pairs' gradient) and `d_keys`: for each offset `e` the band `dP[i, i - e]` of each pairs' gradient
     `strips[p](e)` within `i`'s sub-chunk, a row's vector `[C]` (a row of the pairs' gradients' own bands
@@ -1202,7 +1202,10 @@ def key_diagonal_pairs_back(strips: list, own: list, behind: Callable[[jax.Array
     (`behind`'s, the staged rows below the chunk zeroed), where the gradients' every term held to its mask
     was a quarter of a B200's own pairs' backward's issues. A read erase's rows are its reads, declared at
     most one (`recurrence.Hooks.unit_reads`): undeclared, a read of `2^100` against a pairs' gradient of
-    `-2^60` was `-2^160` before its decay, and the call takes the portable math."""
+    `-2^60` was `-2^160` before its decay, and the call takes the portable math. Its update `sheared` (its
+    reads not its keys: no projection, which bounds the tied update's cotangents), the pairs' terms summed
+    before their decay where their sum is finite, else each decayed first: cotangents about `2^127` summed
+    to `2^128` where their decay takes them to `2^67` (head review of a84db53d5)."""
     index, _ = _grid(d_keys.shape)
 
     def offset(e, carried):
@@ -1216,9 +1219,16 @@ def key_diagonal_pairs_back(strips: list, own: list, behind: Callable[[jax.Array
         # The rows read where they are weighed, not held across the offsets: held, an sm100's own pairs'
         # backward needed all of its 248 registers, read here 232 (row 5298).
         d_rows = tuple(total + strip * keys * pair for total, strip in zip(d_rows, bands, strict=True))
-        weighted = functools.reduce(jnp.add, (strip * row() for strip, row in zip(bands, own, strict=True)))
-        return (d_rows, d_keys + jnp.where(index % sub + e < sub, lower(e, weighted * pair), 0.0), pair,
-                decays)
+        # The pairs' terms summed before their decay (each one's decayed apart, two normal terms of
+        # 3 * 2^-128 flushed where their sum decayed is normal); a sheared update's decayed first where
+        # their sum overflows.
+        terms = [strip * row() for strip, row in zip(bands, own, strict=True)]
+        summed = functools.reduce(jnp.add, terms)
+        weighted = summed * pair
+        if sheared:
+            weighted = jnp.where(jnp.isfinite(summed), weighted,
+                                 functools.reduce(jnp.add, (term * pair for term in terms)))
+        return (d_rows, d_keys + jnp.where(index % sub + e < sub, lower(e, weighted), 0.0), pair, decays)
 
     one = jnp.ones(index.shape, jnp.float32)
     d_rows, d_keys, _, _ = jax.lax.fori_loop(0, sub, offset, (d_rows, d_keys, one, one))

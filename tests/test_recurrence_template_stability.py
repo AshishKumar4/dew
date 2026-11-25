@@ -485,14 +485,14 @@ def test_an_own_score_past_fp32s_range_reads_as_it_is():
     assert np.isfinite(np.asarray(final)).all()
 
 
-def faint_read(length: int, width: int) -> tuple:
-    """A read erase's operands past its keys' range but its queries' and keys': token 1 reads `2^100` along
-    channel 0, which its decay takes by `2^-60`, token 0 writes `2^60` to value column 0, the first two
-    tokens' write gates one: `(reads, values, write gates, log decays)` fp32."""
+def faint_read(length: int, width: int, read: float = 2.0 ** 100, value: float = 2.0 ** 60) -> tuple:
+    """A read erase's operands at its range's edge: token 1 reads `read` along channel 0, which its decay
+    takes by `2^-60`, token 0 writes `value` to value column 0, the first two tokens' write gates one:
+    `(reads, values, write gates, log decays)` fp32."""
     reads = np.zeros((1, length, 1, width), np.float32)
-    reads[0, 1, 0, 0] = 2.0 ** 100
+    reads[0, 1, 0, 0] = read
     values = np.zeros_like(reads)
-    values[0, 0, 0, 0] = 2.0 ** 60
+    values[0, 0, 0, 0] = value
     beta = np.zeros((1, length, 1), np.float32)
     beta[0, :2] = 1.0
     decay = np.zeros_like(reads)
@@ -538,3 +538,32 @@ def test_a_read_past_its_keys_range_takes_the_portable_math_which_keeps_its_grad
     assert {route.kernel for route in found if route.choice == generation.Choice.GATED_DELTA_RULE} == {'xla'}
     assert all(np.isfinite(np.asarray(grad, np.float32)).all() for grad in grads)
     assert float(grads[1][0, 0, 0, 0]) == -(2.0 ** 100)
+
+
+def test_a_key_decays_own_pairs_gradient_near_fp32s_range_is_finite_where_the_recurrences_is():
+    """A read erase of unit reads (`Hooks.unit_reads`) under a decay a key dimension on the template, its
+    cotangents near fp32's largest: token 0 writes `2^127` to value column 0 along channel 1, token 1 decays
+    channel 0 by `2^-60`, reads `-1` along it and writes along channel 2, its query `(3/4)` on channel 0 and
+    `(5/8)` on 2, its output's column 0 gradient `3/2`. Token 0's key's channel 0 takes the scores' term and
+    the system's, `(18/16) 2^127` and `(15/16) 2^127`, both decayed by `2^-60`: `(33/16) 2^67`. The own pairs'
+    transpose summed the two before the decay, `2^128` past fp32's range, the gradient `+inf`
+    (`algebra.key_diagonal_pairs_back`; head review of a84db53d5)."""
+    length, width = 64, 32
+    unit = np.eye(width, dtype=np.float32)
+    keys = np.zeros((1, length, 1, width), np.float32)
+    keys[0, 0, 0], keys[0, 1, 0] = unit[1], unit[2]
+    queries = np.zeros_like(keys)
+    queries[0, 1, 0] = 0.75 * unit[0] + 0.625 * unit[2]
+    reads, values, beta, decay = faint_read(length, width, read=-1.0, value=2.0 ** 127)
+    hooks = recurrence.Hooks(decay='vector', erase='read', unit_reads=True, scale=1.0)
+    d_out = jnp.zeros((1, length, 1, width), jnp.bfloat16).at[0, 1, 0, 0].set(1.5)
+
+    def run(q, k, v, r):
+        return chunk_on('mosaic_gpu', hooks, Chunk(q, k, v, log_decay=jnp.asarray(decay),
+                                                   beta=jnp.asarray(beta, jnp.bfloat16), erase_read=r))[0]
+
+    with generation.assumed("sm90", interpreted=True):
+        _, pull = jax.vjp(run, *(jnp.asarray(x, jnp.bfloat16) for x in (queries, keys, values, reads)))
+        grads = pull(d_out)
+    assert all(np.isfinite(np.asarray(grad, np.float32)).all() for grad in grads)
+    assert float(grads[1][0, 0, 0, 0]) == 33 / 16 * 2.0 ** 67
