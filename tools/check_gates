@@ -3,7 +3,10 @@
 # the ref SLOP020's ratchet holds the inventory to (origin/main, or the target a promotion lands on). check.sh
 # runs them all, one, or lists them (`--list`); the lanes' lint gate on armada reads this file at a commit and
 # runs each gate on its own container. Lines starting with # are comments.
-locks	sh tools/lock_environment.sh && git diff --exit-code --stat locks/
+# The locks resolved again only where an input of theirs differs from BASE (the lock script, its pins and
+# constraints, the Python it resolves for, the locks themselves): each resolve fetches every staged wheel the
+# index lists, and a suspect's 35 lint runs at once were refused by GitHub's releases (train 1273), main's own.
+locks	sh tools/base_history.sh && if git diff --quiet "$BASE" -- tools/lock_environment.sh pyproject.toml constraints.txt .python-version locks; then echo "locks: no lock input differs from $BASE"; else sh tools/lock_environment.sh && git diff --exit-code --stat locks/; fi
 flake8	"$PYTHON" -m flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics --extend-exclude=.venv*
 ruff	"$PYTHON" -m ruff check $ruff_inputs
 slop	JAX_PLATFORMS=cpu "$PYTHON" tools/lint_slop.py
