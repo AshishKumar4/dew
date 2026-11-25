@@ -1158,6 +1158,21 @@ def test_weighted_moments_keep_the_direction_when_dividing_first_would_flush(mod
     np.testing.assert_array_equal(weight_gradient, [[2.0 ** -120, 0.0]])
 
 
+@pytest.mark.parametrize("mode", ["walk", "merge"])
+def test_zero_weighted_values_keep_zero_tangents_when_finite_weights_overflow_the_mass(mode):
+    from dew.algebra import moments
+
+    x = jnp.zeros((1, 2), jnp.float32)
+    w = jnp.full_like(x, 2.0 ** 127)
+    dw = jnp.asarray([[1.0, 0.0]], jnp.float32)
+
+    def run(weights):
+        return moments.chunked_moments(x, weights, tile=1, mode=mode)
+
+    value, tangent = jax.jvp(run, (w,), (dw,))
+    np.testing.assert_array_equal(jnp.stack((*value, *tangent)), np.zeros((4, 1), np.float32))
+
+
 def test_chunked_moments_directed_overflow_mixed_zero_weight_and_direct_jvp():
     """Weight tangents stay finite when `cx * cy` overflows, mixed 2nd derivatives at zero individual and
     all-zero weights match the plain declaration, and direct `derive` forms preserve zero-weight JVP."""

@@ -170,7 +170,11 @@ _WEIGHT_DIV = ratios.Ratio(((1.0, (("v", 0), ("v", 1))),), ((1.0, (("v", 2),)),)
 
 def _safe_tangent_div(dtw: jax.Array, numerator: jax.Array, sn: jax.Array) -> jax.Array:
     """Multiply the weight direction and divide by mass before landing, including in its transpose."""
-    return ratios.ratio([dtw[None], numerator[None], sn[None]], _WEIGHT_DIV)
+    finite = jnp.isfinite(numerator) & jnp.isfinite(sn)
+    mass, exceptional, (value, direction), (other, d_other) = _split_range(finite, sn, numerator, dtw)
+    scaled = ratios.ratio([direction[None], value[None], mass[None]], _WEIGHT_DIV)
+    # IEEE handles exceptional values; the scaled quotient's error compensation assumes a finite mass.
+    return jnp.where(finite, scaled, d_other * (other / exceptional))
 
 
 def _safe_tangent_quad(dtw: jax.Array, big_c: jax.Array, sml_c: jax.Array, sn: jax.Array) -> jax.Array:
