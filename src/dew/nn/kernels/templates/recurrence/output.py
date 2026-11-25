@@ -125,7 +125,11 @@ def _output_held(call: Call, bv: int, swizzle: int | None = None) -> Held:
         values = [f32(chunk, bv), *held_tile(held, chunk, bv), f32(chunk, chunk),
                   *held_tile(held, chunk, chunk),
                   *products]
-        return Held(phases=(values, [f32(chunk, call.block)] * (2 + call.prefix_limbs)))
+        # Every key block's queries (their parts joined in fp32) and prefix read before any is gated
+        # (`_gated_queries`), one block's gating at a time beside them.
+        query = held_tile(given, chunk, call.block) if given.parts == 1 else [f32(chunk, call.block)]
+        read = (query + [f32(chunk, call.block)] * call.prefix_limbs) * (call.width // call.block - 1)
+        return Held(phases=(values, [f32(chunk, call.block)] * (2 + call.prefix_limbs) + read))
     # Accurate three-part products each take a fresh accumulator (`Issuer.apart`), the memory's output
     # beside the local product's sums: two stated, an unrounded fp32 write gate's output was admitted where
     # ptxas serialized its warpgroup MMAs (C7512, sm90; armada output-values-fresh-sums). Two parts issue

@@ -1521,8 +1521,11 @@ def _weighted_held(call: Call, block: int) -> Held:
     # H100's ptxas asked 58 registers of the 48 its residency left with the gated copy unstated,
     # jsf-kdaintra6).
     vb = call.value_block
+    # The key block's last-token prefix, a column's vector a limb, read before the step's wait and held
+    # through its value block's product (`_weighted`).
     valued = ([held_tile(held, chunk, chunk) + held_tile(call.given, chunk, vb) + [f32(chunk, vb)] * 2
-               + product_fragments(call, (held, chunk, chunk), (held, chunk, vb))]
+               + product_fragments(call, (held, chunk, chunk), (held, chunk, vb))
+               + [f32(4, block)] * call.prefix_limbs]
               if call.per_key and call.delta else [])
     return Held(phases=(
         *valued,
