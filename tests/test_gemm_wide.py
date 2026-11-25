@@ -90,10 +90,10 @@ def test_a_saved_wide_products_residual_is_stored_where_a_derivative_is_taken_al
     from kernel_compile import stated_outputs
 
     product, shapes = _wide_4b(True)
-    devices = jax.sharding.Mesh(np.array(generation.compile_only_gpus("sm90")), ("data",))
-    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90")):
-        stored = {name: sorted(count for count, _ in stated_outputs(jax.jit(fn).trace(*shapes).lower(),
-                                                                   custom_call_targets.MOSAIC_GPU) if count)
+    with generation.assumed("sm90"):
+        stored = {name: sorted(count for count, _ in stated_outputs(
+                      jax.jit(fn).trace(*shapes).lower(lowering_platforms=("cuda",)),
+                      custom_call_targets.MOSAIC_GPU) if count)
                   for name, fn in (("inference", product), ("gradient", _gradient_of(product)))}
     assert stored["inference"] == [1], stored
     assert 2 in stored["gradient"], stored
