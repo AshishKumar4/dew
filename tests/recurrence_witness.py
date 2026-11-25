@@ -524,7 +524,7 @@ def key_enclosures(step: Step, scale: float, lane: Lane) -> dict[str, Iv]:
     queries = staged(fp32(mul(fp32(mul(point(step.q), raised), lane), factor), lane), lane)
     left = Iv(np.concatenate([queries.lo, scores.lo], 1), np.concatenate([queries.hi, scores.hi], 1))
     right = point(np.concatenate([step.h, step.c], 0))
-    return {"a": staged(solved_blocks(system, lane), lane), "w": w, "c": c, "h": leaving,
+    return {"a": staged(solved_blocks(system, lane.solving()), lane), "w": w, "c": c, "h": leaving,
             "o": out(dot(left, right, lane), lane)}
 
 
@@ -609,6 +609,8 @@ class Run:
     tf32: Literal["plain", "rna", "read"]
     """How a one-part fp32 operand reaches its product (`Lane.tf32`): its family's issuer's, or plain where
     the launches were interpreted."""
+    solve: tuple[int, Literal["plain", "rna", "read"]]
+    """`merged` and `tf32` as a decay a key dimension's solve takes them (`Lane.solve`, `solve_family`)."""
     trained: bool
     """Whether the template trains the call (`Mosaic.trains`): its records the training forward's, the primal
     of the route's VJP, and its fast backward the template's; else the inference forward's."""
@@ -777,6 +779,17 @@ def call_form(family, *, wide: bool, delta: bool, rounded: bool) -> tuple[int, i
     return given, held, "delta" if delta else ("keys" if held == 1 else "values")
 
 
+def solve_family(dtype):
+    """The bundle a call of `dtype`'s decay a key dimension's solve issues by: the intra walk's
+    (`intra.sub_chunked`, `pairs_family` on the target its launches plan for), else the call's
+    (`mainloop.issued`)."""
+    from dew.nn.kernels import generation
+
+    family, interpreted = mainloop.issued(dtype)
+    target = generation.interpreted_target() if interpreted else generation.gpu_target()
+    return intra.pairs_family(target.generation, dtype) or family
+
+
 def tf32_conversion(family) -> Literal["plain", "rna", "read"]:
     """How `family`'s products take a one-part fp32 operand (`Lane.tf32`): as itself where the launches
     are interpreted, else rounded first where the family rounds (`Family.rounds_tf32`), else read."""
@@ -816,6 +829,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
     if rounded is None:
         rounded = route_rounding(delta, dtype)
     family = mainloop.issued(dtype)[0]
+    solving = solve_family(dtype)
     wide = jnp.dtype(dtype) == jnp.float32
     given, held, write = call_form(family, wide=wide, delta=delta, rounded=rounded)
     route = witnessed_route(delta, scale=scale, rounded=rounded, starts=starts, max_segments=max_segments,
@@ -892,6 +906,8 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
                pairing=intra.pairing_parts(held),
                merged=mainloop.merge_parts(family, jnp.float32 if wide else dtype, held=held, ranged=False),
                tf32=tf32_conversion(family), trained=bool(trained), unit_pairs=unit_pairs,
+               solve=(mainloop.merge_parts(solving, jnp.float32 if wide else dtype, held=held, ranged=False),
+                      tf32_conversion(solving)),
                rounded_prefix=mainloop.prefix_limbs(np.ndim(g) == 4, decay_bound, chunk, dtype) == 1,
                clamped=mainloop.clamps(np.ndim(g) == 4, decay_bound, chunk, dtype),
                c=chunked(c, value_width), o=output.transpose(0, 2, 1, 3), carries=np.stack(carries),
@@ -953,7 +969,7 @@ def enclosed(run: Run, lane: Lane) -> dict[str, Iv]:
     writes = {"delta": enclosures, "keys": keys_gated_enclosures, "values": values_gated_enclosures}
     enclose = writes[run.write]
     lane = dataclasses.replace(lane, held=run.held, given=run.given, wide=run.wide, pairing=run.pairing,
-                               merged=run.merged, tf32=run.tf32, unit_pairs=run.unit_pairs,
+                               merged=run.merged, tf32=run.tf32, solve=run.solve, unit_pairs=run.unit_pairs,
                                rounded_prefix=run.rounded_prefix, clamped=run.clamped)
     found: dict[str, list] = {}
     for n in range(run.chunks):
@@ -1556,7 +1572,7 @@ def back_witnessed(back: BackRun, lane: Lane) -> dict[str, np.ndarray]:
     it (the initial memory's, `dh0`, for the first)."""
     run = back.run
     lane = dataclasses.replace(lane, held=run.held, given=run.given, wide=run.wide, pairing=run.pairing,
-                               merged=run.merged, tf32=run.tf32, unit_pairs=run.unit_pairs,
+                               merged=run.merged, tf32=run.tf32, solve=run.solve, unit_pairs=run.unit_pairs,
                                rounded_prefix=run.rounded_prefix, clamped=run.clamped)
 
     def stored(iv: Iv, dtype, name: str) -> Iv:
