@@ -1188,3 +1188,41 @@ def test_a_pipeline_stage_modules_cotangent_is_refused():
                                                                  cotangents=True)))
     with pytest.raises(ValueError):
         inspected(run, {"text": np.random.default_rng(1).integers(1, 64, size=(8, 17)).astype(np.int32)})
+
+
+def test_an_inspecting_search_past_a_miss_compiles_no_sampled_step_for_a_step_that_misses(monkeypatch):
+    """An inspecting run's search compiles its sampled step beside its first candidate's step, and once a
+    candidate has missed, only beside a step that fits: a search whose every candidate misses lowers the
+    sampled step once, where it lowered, traced and compiled one beside every rung it asked (rows 8411,
+    10960: half an inspecting climb's time)."""
+    from test_plan import BATCH, free, one_device
+
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+    from dew.training import Inspection, Trainer, TrainerAdvanced
+    from dew.training.planning import PlanRefused
+
+    model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
+                              max_seq_len=16)
+    # Its split and recomputation stated, so its search climbs its head's rungs alone.
+    trainer = one_device(Trainer(LMObjective(model, seq_len=16), optax.sgd(1e-2), key=jax.random.key(0),
+                                 split=1, remat="selective",
+                                 advanced=TrainerAdvanced(inspection=Inspection(modules=("*Attention",),
+                                                                                cotangents=True))))
+    state, _, _ = trainer.place()
+    lowered: list[float] = []
+
+    def lowering(event, seconds, *, fun_name=None, **_):
+        if event == "/jax/core/compile/jaxpr_to_mlir_module_duration" and fun_name == "jit(step)":
+            lowered.append(seconds)
+
+    free(monkeypatch, 1 << 10)
+    jax.monitoring.register_event_duration_secs_listener(lowering)
+    try:
+        with pytest.raises(PlanRefused) as refused:
+            trainer.compile(state, BATCH)
+    finally:
+        jax.monitoring.unregister_event_duration_listener(lowering)
+    probes = refused.value.probes
+    # Each step lowered once at most a candidate, its sampled step beside the first alone.
+    assert len(probes) > 2 and len(lowered) <= len(probes) + 1, (len(lowered), len(probes))
