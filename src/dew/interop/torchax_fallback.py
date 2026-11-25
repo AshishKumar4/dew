@@ -6,12 +6,14 @@ transformers' own forward runs it, and `Pretrained.load(source,
 fallback="torchax")` takes it for any source. It builds the model with
 transformers on the host and hands its forward to torchax, which runs every
 torch op as a JAX op, so the model jits, differentiates and shards like any
-other JAX function. Dew knows nothing about the architecture: no Dew
-kernels but its attention's, no logical sharding declarations. What Dew
-supplies is the seam: a Flax module over the torch forward, the parameters
-split from the buffers, Dew's attention and decode cache where the model asks
-transformers' attention interface for its attention, and a `Layout` that
-places tensors by their torch names.
+other JAX function. Dew reads no architecture of it: it computes what the
+model asks transformers' interfaces for, its attention and decode cache
+(`AttentionInterface`) and its routed experts (`ExpertsInterface`, `EXPERTS`),
+and the experts transformers loops over in Python (`functional_parts`), with
+its own kernels; it places each tensor by its torch name under the logical axes
+transformers' tensor-parallel plan states (`planned_axes`, `TorchLayout`); and
+it wraps the torch forward in a Flax module, its parameters split from its
+buffers.
 
 The split is `JittableModule`'s. Its `params` are the trainable
 `nn.Parameter`s and go under the `params` collection, the one the optimizer
@@ -30,6 +32,7 @@ import contextvars
 import copy
 import functools
 import importlib.metadata
+import inspect
 import json
 import math
 import warnings
@@ -92,12 +95,13 @@ class TransformersTierWarning(UserWarning):
     registered family's."""
 
 
-EXPERTS = "batched_mm"
-"""The routed-experts implementation tier 3 builds transformers' models with: its batched products
-over each token's chosen experts, whose shapes the token count fixes, where the default
-(`grouped_mm`) has no torchax lowering and an eager loop selects tokens by `nonzero`. A model whose
-experts do not dispatch through transformers' `ExpertsInterface` runs its own, which `admitted`
-observes."""
+EXPERTS = "dew"
+"""The routed-experts implementation tier 3 builds transformers' models with, registered in transformers'
+`ExpertsInterface` (`_registered`): Dew's grouped expert dispatch (`_dew_experts`) for experts its gated
+product computes, transformers' batched products over each token's chosen experts otherwise
+(`batched_mm`, whose shapes the token count fixes, where `grouped_mm` has no torchax lowering and the
+eager loop selects tokens by `nonzero`). A model whose experts do not dispatch through the interface runs
+its own, which `admitted` observes."""
 
 
 def _summary(reasons: Mapping[str, str], shown: int = 3) -> str:
@@ -599,13 +603,16 @@ def _dew_attention(module, query, key, value, attention_mask, scaling=None, drop
 def _registered() -> None:
     """Dew's attention (`_dew_attention`) and the probe's (`_probe_attention`, over transformers' eager
     mask, additive and always built, which a model computing its own attention adds to its scores) in
-    transformers' attention interfaces, once a process."""
+    transformers' attention interfaces, and Dew's experts (`_dew_experts`) in its experts interface, once a
+    process."""
     from transformers import AttentionInterface
+    from transformers.integrations.moe import ExpertsInterface
     from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, AttentionMaskInterface
 
     AttentionInterface.register(_ATTENTION, _dew_attention)
     AttentionInterface.register(_PROBE, _probe_attention)
     AttentionMaskInterface.register(_PROBE, ALL_MASK_ATTENTION_FUNCTIONS["eager"])
+    ExpertsInterface.register(EXPERTS, _dew_experts)
 
 
 _MOVING = ("dynamic", "longrope")
@@ -763,12 +770,12 @@ def functional_experts(model: torch.nn.Module) -> None:
             setattr(model.get_submodule(parent), attribute, _functional_experts()(module))
 
 
-@functools.cache
-def _functional_experts() -> type:
-    """The torch module `functional_experts` substitutes (built on first use)."""
-    import torch
-
-    from dew.interop.parts import gated_activation
+def _routed_slots(x, index, weights, kernels, *, routed: int, activation: str):
+    """Each token's experts, weighted and summed in at least fp32, its slots routed (an index below `routed`,
+    the expert's gated product through Dew's grouped dispatch, `dew.nn.moe.expert_dispatch`, over the rows
+    sorted by expert: the gate's and up projection's `kernels[:2]` one paired product, `activation`'s gate,
+    the down projection `kernels[2]`, each `[experts, in, out]`) or identity (one past them, which the
+    dispatch's sentinel holds at zero: the token itself); none routed where `kernels` is empty."""
     from dew.nn.activations import gated_product
     from dew.nn.moe import (
         EXPERT_AXES,
@@ -778,13 +785,72 @@ def _functional_experts() -> type:
         paired_projections,
     )
 
+    identity = index >= routed
+    slots = jnp.zeros((*index.shape, x.shape[-1]), x.dtype)
+    if kernels:
+        compute = expert_compute_dtype(x, *kernels, dtype=None)
+
+        def project(tokens, sizes, _ids, held):
+            gate, up = paired_projections(tokens, held[0], held[1], sizes, compute, "xla", None)
+            gated = gated_product(activation)(gate, up)
+            # No history: a fallback's experts take no delayed-scaling recipe's state.
+            return jnp.asarray(expert_projection(gated, held[2], sizes, compute, "xla", None)), ()
+
+        slots, _ = expert_dispatch(project, x, jnp.where(identity, routed, index), kernels,
+                                   tuple(EXPERT_AXES[name] for name in ("gate_proj", "up_proj", "down_proj")),
+                                   num_experts=routed, dispatch="global", output_dtype=compute)
+    held = jnp.where(identity[..., None], x[:, None, :], slots)
+    wide = at_least_fp32(x.dtype)
+    return jnp.sum(held.astype(wide) * weights[..., None].astype(wide), axis=1).astype(x.dtype)
+
+
+def _dew_experts(module, hidden_states, top_k_index, top_k_weights):
+    """transformers' experts interface's forward for tier 3 (`EXPERTS`): a gated experts module's routed
+    slots through Dew's grouped dispatch (`_routed_slots`), its concatenated gate and up projection
+    (`gate_up_proj` `[E, 2I, D]`, or `[E, D, 2I]` transposed) and down projection read as Dew's `[E, in,
+    out]` kernels; an index past its experts (an expert-parallel sentinel, whose weight transformers zeroes)
+    no slot. A module whose experts Dew's gated product does not compute (biased, ungated, interleaved, a
+    gate of its own, an activation Dew gates by none) runs transformers' batched products. A program of its
+    own, attested token by token (`sequence_causality.TOKENWISE`): its dispatch sorts the tokens by expert,
+    and each token's output reads its own input alone."""
+    from torchax.interop import jax_view, torch_view
+    from transformers.integrations.moe import _default_apply_gate, batched_mm_experts_forward
+
+    from dew.interop.parts import Ambiguous, gated_activation
+
+    gate = inspect.getattr_static(type(module), "_apply_gate", None)
+    plain = (module.has_gate and not module.has_bias and module.is_concatenated
+             and gate is _default_apply_gate)
+    try:
+        activation = gated_activation(module.act_fn) if plain else None
+    except Ambiguous:
+        activation = None
+    if activation is None:
+        return batched_mm_experts_forward(module, hidden_states, top_k_index, top_k_weights)
+    gate_up, down = jax_view(module.gate_up_proj), jax_view(module.down_proj)
+    if module.is_transposed:
+        width = gate_up.shape[2] // 2
+        kernels = (gate_up[..., :width], gate_up[..., width:], down)
+    else:
+        width = gate_up.shape[1] // 2
+        kernels = (jnp.swapaxes(gate_up[:, :width], 1, 2), jnp.swapaxes(gate_up[:, width:], 1, 2),
+                   jnp.swapaxes(down, 1, 2))
+    x, index, weights = (jax_view(tensor) for tensor in (hidden_states, top_k_index, top_k_weights))
+    slots = functools.partial(_routed_slots, routed=int(module.num_experts), activation=activation)
+    return torch_view(attested(slots, TOKENWISE)(x, index, weights, kernels))
+
+
+@functools.cache
+def _functional_experts() -> type:
+    """The torch module `functional_experts` substitutes (built on first use)."""
+    import torch
+
+    from dew.interop.parts import gated_activation
+
     class FunctionalExperts(torch.nn.Module):
         """Routed experts beside identity experts at static shapes, through Dew's grouped expert
-        dispatch (`dew.nn.moe.expert_dispatch`): each routed slot runs its expert's gated product
-        (`expert_projection` over the rows sorted by expert), an identity slot (numbered past the
-        routed experts, which the dispatch's sentinel holds at zero) passes its token, and the slots sum
-        weighted by their routing weights in at least fp32, as transformers' loop computes them expert by
-        expert. Its parameters are the replaced module's; one of identity experts alone holds none."""
+        dispatch (`_routed_slots`), as transformers' loop computes them expert by expert. Its parameters
+        are the replaced module's; one of identity experts alone holds none."""
 
         def __init__(self, replaced: torch.nn.Module):
             super().__init__()
@@ -805,32 +871,9 @@ def _functional_experts() -> type:
                 width = gate_up.shape[1] // 2
                 kernels = (jnp.swapaxes(gate_up[:, :width], 1, 2), jnp.swapaxes(gate_up[:, width:], 1, 2),
                            jnp.swapaxes(jax_view(self.down_proj), 1, 2))
-            # A program of its own, attested token by token to a walk of the program's causality
-            # (`sequence_causality.TOKENWISE`): its dispatch sorts the tokens by expert, and each token's
-            # output reads its own input alone.
-            return torch_view(attested(self.tokenwise, TOKENWISE)(x, index, weights, kernels))
-
-        def tokenwise(self, x, index, weights, kernels):
-            """Each token's experts, weighted and summed, its slots routed or identity."""
-            identity = index >= self.routed
-            slots = jnp.zeros((*index.shape, x.shape[-1]), x.dtype)
-            if self.routed:
-                compute = expert_compute_dtype(x, *kernels, dtype=None)
-
-                def project(tokens, sizes, _ids, held):
-                    # The gate's and the up projection's products of the same rows, one paired product.
-                    gate, up = paired_projections(tokens, held[0], held[1], sizes, compute, "xla", None)
-                    gated = gated_product(self.activation)(gate, up)
-                    # No history: a fallback's experts take no delayed-scaling recipe's state.
-                    return jnp.asarray(expert_projection(gated, held[2], sizes, compute, "xla", None)), ()
-
-                slots, _ = expert_dispatch(project, x, jnp.where(identity, self.routed, index), kernels,
-                                        tuple(EXPERT_AXES[name] for name in ("gate_proj", "up_proj",
-                                                                             "down_proj")),
-                                        num_experts=self.routed, dispatch="global", output_dtype=compute)
-            held = jnp.where(identity[..., None], x[:, None, :], slots)
-            wide = at_least_fp32(x.dtype)
-            return jnp.sum(held.astype(wide) * weights[..., None].astype(wide), axis=1).astype(x.dtype)
+            # A program of its own, attested token by token (`_dew_experts`).
+            slots = functools.partial(_routed_slots, routed=self.routed, activation=self.activation)
+            return torch_view(attested(slots, TOKENWISE)(x, index, weights, kernels))
 
     return FunctionalExperts
 

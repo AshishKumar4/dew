@@ -1682,3 +1682,49 @@ def test_a_functional_rotary_computes_the_tables_its_source_rotary_computes(fami
         for theirs, ours in zip(expected, computed, strict=True):
             assert ours.dtype == theirs.dtype
             assert torch.equal(ours, theirs)
+
+
+MIXTRAL = {**TINY, "num_key_value_heads": 2, "num_local_experts": 4, "num_experts_per_tok": 2,
+           "intermediate_size": 32, "tie_word_embeddings": False}
+"""A tiny Mixtral, its routed experts dispatched through transformers' experts interface."""
+
+
+@attending("reference")
+def test_experts_the_interface_dispatches_run_through_dews_grouped_dispatch(tmp_path, monkeypatch):
+    """A Mixtral taken to tier 3, its routed experts asked of transformers' experts interface (`EXPERTS`):
+    Dew's grouped dispatch computes every layer's (`_routed_slots`, through `_dew_experts`), and its logits
+    over drawn ids hold check 1 against transformers' eager experts, its float64 twin the truth."""
+    from dew.interop import torchax_fallback
+
+    torch.manual_seed(0)
+    model = transformers.MixtralForCausalLM(transformers.MixtralConfig(**MIXTRAL)).eval()
+    model.save_pretrained(tmp_path)
+    dispatched = []
+    routed = torchax_fallback._routed_slots
+    def counted(*args, **kwargs):
+        dispatched.append(kwargs["routed"])
+        return routed(*args, **kwargs)
+    monkeypatch.setattr(torchax_fallback, "_routed_slots", counted)
+    loaded = Pretrained.load(tmp_path, dtype="float32", fallback="torchax")
+    assert isinstance(loaded, PretrainedFallback)
+    forward = jax.jit(loaded.model.apply)
+    tokens = token_draw(0x13044, MIXTRAL["vocab_size"], (2, 12))
+    forward.lower(loaded.variables, *tokens(0))
+    assert dispatched == [MIXTRAL["num_local_experts"]] * MIXTRAL["num_hidden_layers"], dispatched
+
+    def built(dtype):
+        built = transformers.AutoModelForCausalLM.from_config(
+            model.config, dtype=dtype, attn_implementation="eager", experts_implementation="eager").eval()
+        built.load_state_dict(model.state_dict())
+        return built
+
+    def theirs(source, precision=contextlib.nullcontext):
+        def run(ids):
+            with precision(), torch.no_grad():
+                return source(torch.from_numpy(ids).long()).logits.double().numpy()
+        return as_given(run)
+    with float64():
+        wide = built(torch.float64)
+    assert_as_exact(as_given(lambda ids: np.asarray(forward(loaded.variables, ids), np.float64)),
+                    theirs(built(torch.float32)), tokens, "interface experts logits", seeds=8,
+                    truth_fn=theirs(wide, float64))
