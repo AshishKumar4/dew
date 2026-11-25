@@ -5,7 +5,8 @@ the form's own instructions on the pipes its steps name rather than XLA's loweri
 reading (`BitForm.traced`, which an interpreter runs, where no inline assembly does); and a register tile's
 IEEE fp32 quotients the same way (`quotients`: PTX's `div.rn.f32`), and its 4-bit codes two a byte
 (`paired`: PTX's `bfi.b32`); and a register tile's alternate column groups apart (`split_groups`), its
-registers read where they lie, no instruction."""
+registers read where they lie, no instruction; and an fp32 register tile rounded to bf16 saturating, a pair
+an instruction (`satfinite_bf16`: PTX's `cvt.rn.satfinite.bf16x2.f32`)."""
 
 
 import numpy as np
@@ -103,6 +104,38 @@ def split_groups(tile, group: int, layout) -> tuple:
                      for half in (0, 1))
 
     return tuple(plgpu.inline_mgpu(arg_types=(layout,), return_type=(typed, typed))(split)(tile))
+
+
+def satfinite_bf16(value, layout):
+    """`value` (an fp32 register tile in `layout`, whose registers hold whole pairs: mma.sync's, WGMMA's,
+    tcgen05's) rounded to bf16, saturating at bf16's largest finite value, a NaN a NaN: `jnp.clip(value,
+    -BF16_LARGEST, BF16_LARGEST).astype(jnp.bfloat16)` bit for bit, as PTX's `cvt.rn.satfinite.bf16x2.f32`
+    a pair (sm_80 on, PTX ISA 8.1) rounds and then saturates, BF16_LARGEST itself a bf16. The clip lowered
+    to two clamps an element (`max.NaN`, `min.NaN`) before the pair's conversion: 272 of Kimi delta
+    attention's intra walk's 1552 issues a step, its staged parts' (`product.bf16_parts`, M-JS-272)."""
+    typed = plgpu.ShapeDtypeStruct(value.shape, jnp.dtype(jnp.bfloat16), layout=layout)
+
+    def narrowed(ctx, tile):
+        del ctx
+        i32 = mgpu_ir.IntegerType.get_signless(32)
+        out = np.empty_like(tile.registers)
+        for index, register in np.ndenumerate(tile.registers):
+            [count] = mgpu_ir.VectorType(register.type).shape
+            if count % 2:
+                raise ValueError(f"{layout}'s registers hold {count} elements, no whole pairs")
+            words = []
+            for at in range(0, count, 2):
+                low, high = (mgpu_vector.extract(register, dynamic_position=[],
+                                                 static_position=mgpu_ir.DenseI64ArrayAttr.get([at + i]))
+                             for i in (0, 1))
+                # The pair's later element in the word's upper half, `cvt`'s first operand.
+                words.append(mgpu_llvm.inline_asm(i32, [high, low], "cvt.rn.satfinite.bf16x2.f32 $0, $1, $2;",
+                                                  "=r,f,f"))
+            packed = mgpu_vector.from_elements(mgpu_ir.VectorType.get([count // 2], i32), words)
+            out[index] = mgpu_vector.bitcast(mgpu_ir.VectorType.get([count], mgpu_ir.BF16Type.get()), packed)
+        return (mgpu_fragments.FragmentedArray(_registers=out, _layout=tile.layout, _is_signed=None),)
+
+    return plgpu.inline_mgpu(arg_types=(layout,), return_type=(typed,))(narrowed)(value)[0]
 
 
 def halved(layout):

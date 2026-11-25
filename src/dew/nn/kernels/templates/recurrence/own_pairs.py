@@ -379,7 +379,7 @@ def intra_own(q, k, prefix, beta, taken, call: Call, *, scale: float, products: 
                 if threaded and form.parts == 1:
                     # A one-part form copied from the summed blocks straight, scaled and rounded as each
                     # word is copied: no landing.
-                    copied_by_thread(threaded[-1].at[o], views[0], scale=scale)
+                    copied_by_thread((threaded[-1].at[o],), (views[0],), scale=scale)
                     continue
                 block = family.tile_of(threaded[-1].at[o]) if threaded else bands[o]
                 masked = algebra.block_masked(block, strict=False, scale=scale)

@@ -46,6 +46,7 @@ from dew.nn.kernels.templates import (
     bodies,
     emission,
     handoffs,
+    inline_forms,
     outputs,
     product,
     report,
@@ -2176,6 +2177,14 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
         automatic ones (`_store_staged`'s unoptimized stores, mma.sync's): a batch of them then takes one
         pair for all (`staged_all`)."""
         return False
+
+    def formed(self, value: jax.Array, count: int, interpret: bool) -> tuple[jax.Array, ...]:
+        """fp32 `value`'s `count` bf16 parts (`product.formed`), natively each saturating one in the family's
+        register layout a pair an instruction (`inline_forms.satfinite_bf16`), the same bits."""
+        if interpret:
+            return product.formed(value, count)
+        narrowed = functools.partial(inline_forms.satfinite_bf16, layout=self.layout)
+        return product.formed(value, count, narrowed)
 
     def staged(self, value: jax.Array, buffer) -> Ref:
         """`value` in the shared-memory tile `buffer`, in its dtype, for a product to read: a register
