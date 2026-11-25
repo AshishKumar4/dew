@@ -1488,21 +1488,22 @@ path (`_verdicts_path`: a compile target's in the compilation cache the process 
 the store holds them (`encoded`)."""
 
 
-_KEPT_IN: list[str] = []
-"""The directories the verdicts are kept in in place of the compilation cache's (`verdicts_kept_in`), the
-innermost last."""
+_KEPT_IN: contextvars.ContextVar[str | None] = _cache.untraced(
+    contextvars.ContextVar("verdicts_kept_in", default=None))
+"""The directory a block keeps the verdicts in in place of the compilation cache's (`verdicts_kept_in`)."""
 
 
 @contextlib.contextmanager
 def verdicts_kept_in(directory: str) -> Iterator[None]:
     """Certification's verdicts and the derived choices kept in `directory` for the block, in place of
     beside the compilation cache (`_verdicts_path`): a store of their own, as a host that never certified
-    holds, the compilation cache itself untouched."""
-    _KEPT_IN.append(directory)
+    holds, the compilation cache itself untouched; the block's context's alone (its replays' workers copy
+    it, `report.capture`)."""
+    token = _KEPT_IN.set(directory)
     try:
         yield
     finally:
-        _KEPT_IN.pop()
+        _KEPT_IN.reset(token)
 
 
 def _verdicts_path(target: str) -> str:
@@ -1513,8 +1514,8 @@ def _verdicts_path(target: str) -> str:
     Read and written under deterministic ops too, which keep no picks (`dew._cache.keeps_picks`): a verdict
     is what the assembler said of a compile, the same in every process alike in what its key states, the
     run's XLA flags among them (row 7308: the cuda lane's warm start certified every launch again)."""
-    if _KEPT_IN:
-        return os.path.join(_KEPT_IN[-1], f"certified {target}.json")
+    if (kept := _KEPT_IN.get()) is not None:
+        return os.path.join(kept, f"certified {target}.json")
     return _cache.kernel_picks_path(f"certified {target}")
 
 
