@@ -246,9 +246,10 @@ def test_compile_mosaic_kernels_reports_both_xla_uniquified_triton_cubins():
 def test_report_binaries_distinguishes_sm100_tmem_mosaic_cubins_from_non_tmem_triton_cubins():
     """Row 7263: `assembled.binaries(..., decoded=True)` sets `uses_tmem=True` on an sm100 Mosaic GPU TMEM
     cubin (tcgen05's persistent walk, its accumulators in tensor memory), `uses_tmem=False` on an sm100
-    Triton cubin that allocates no TMEM (an fp32 row doubled), and `uses_tmem=None` when `decoded=False`;
-    each the least kernel of its kind, where an attention forward and an fp32 decode took 122 s (row
-    12717)."""
+    Triton cubin that allocates no TMEM (an fp32 row doubled, named as a template launch), and
+    `uses_tmem=None` when `decoded=False`; each the least kernel of its kind, where an attention forward
+    and an fp32 decode's four Triton kernels took 122 s (row 12717; the decode alone 66 s, FS-12717-TRITON1;
+    these two 21 s, FS-12717-TMEM3)."""
     import functools
 
     import numpy as np
@@ -275,7 +276,10 @@ def test_report_binaries_distinguishes_sm100_tmem_mosaic_cubins_from_non_tmem_tr
 
     row = jax.ShapeDtypeStruct((1024,), jnp.float32)
     with generation.assumed("sm100"):
-        doubling = pl.pallas_call(doubled, out_shape=row, compiler_params=pltriton.CompilerParams())
+        # Named as a template launch is (`assembled.LAUNCH_SUFFIX`): `binaries` reads a Triton launch's
+        # cubin by its name.
+        doubling = pl.pallas_call(doubled, out_shape=row, compiler_params=pltriton.CompilerParams(),
+                                  name="doubled__l0123456789")
         exe_t = kc.lowered_for(doubling, (row,), "sm100").compile()
     triton_decoded = [b for b in assembled.binaries(exe_t, decoded=True) if b.kind == "triton"]
     triton_raw = [b for b in assembled.binaries(exe_t, decoded=False) if b.kind == "triton"]
