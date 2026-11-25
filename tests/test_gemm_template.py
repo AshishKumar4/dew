@@ -229,8 +229,7 @@ def _plain(case, *, truth: bool = False):
     def run(x, w, ms, nw, b, u, s):
         drawn, h = (x, w, ms, nw, b, u, s), x
         if case.prologue is not None:
-            sides = (side.value for side in case.prologue_sides(*drawn))
-            h = operand(case.prologue(x, *sides), jnp.bfloat16)
+            h = operand(case.prologue(x, *(side.value for side in case.prologue_sides(*drawn))), jnp.bfloat16)
         wide = jnp.promote_types(x.dtype, jnp.float32)
         matrix = operand(w, jnp.bfloat16).astype(h.dtype)
         if case.dense:
