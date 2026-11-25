@@ -10,26 +10,21 @@ from types import MappingProxyType
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from jax import lax
-from jax._src.lib.mlir.dialects import vector
 from jax.experimental import pallas as pl
-from jax.experimental.mosaic.gpu import fragmented_array as mgpu_fragments, utils as mgpu_utils
-from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend import core as jax_core
-from jax.extend.mlir import ir
-from jax.extend.mlir.dialects import arith
 
 from dew.nn import programs
 from dew.nn.kernels import tuning
 from dew.nn.kernels.templates import (
     attention_algebra as algebra,
     attention_gradient as gradient,
+    attention_mosaic_tail as tail,
     mosaic,
     mosaic_sm90,
     swizzling,
 )
-from dew.nn.kernels.templates.attention import DQ_GRADS, LOG2E, Draw, Kind, by_power
+from dew.nn.kernels.templates.attention import DQ_GRADS, Draw, Kind, by_power
 from dew.nn.kernels.templates.attention_backward_algebra import (
     derived_cotangents,
     derived_from_weights,
@@ -192,14 +187,15 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
     dropping call's dropped (`algebra.drawn`), and its score cotangents through the hook (`gradient.pulled`),
     one part in the operands' dtype (dK's and dQ's); with `whole_operands` (fp16's, `algebra.running_parts`),
     both fp32: the normalized weights, dropped, and the scaled cotangents. `lean` (the fused launch's): its
-    bf16 weights alone where nothing reads the unnormalized ones (`base_two_weights`), and its bf16
-    cotangents narrowed saturating in one conversion on wgmma (`saturated_bf16`); a launch at its registers'
+    bf16 weights alone where nothing reads the unnormalized ones (`attention_mosaic_tail.weighed`), and its
+    bf16 cotangents narrowed saturating in one conversion on wgmma (`attention_mosaic_tail.saturated_bf16`);
+    a launch at its registers'
     edge takes neither (the shared-keys dK/dV at width 256 spilled 24 bytes at 255 with both)."""
     family = walk.program.family
     (q_slot, do_slot), (keys, values) = slots, resident
     held, values_t = keys.transpose((1, 0)), values.transpose((1, 0))
     # The normalized weights alone where nothing reads the unnormalized ones (`value_weights`' bf16 operand),
-    # an entry's two fused multiply-adds and exponential (`base_two_weights`).
+    # an entry's fused centring, exponential and share (`attention_mosaic_tail.weighed`).
     normalized = lean and not walk.dropped and not whole_operands and do_slot.dtype == jnp.bfloat16
     # S's products and dP's, issued together (`Issuer.summed_together`).
     score_products = (lambda acc: family.products(acc, q_slot, held),
@@ -267,99 +263,13 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
         return weights, cotangents * walk.grad_scale
     if (lean and q_slot.dtype == jnp.bfloat16 and not walk.interpret
             and isinstance(family, mosaic_sm90.WgmmaIssuer)):
-        part = saturated_bf16(cotangents * walk.grad_scale)
+        part = tail.saturated_bf16(cotangents * walk.grad_scale)
     else:
         part = mosaic.unscaled_part(*algebra.cotangent_parts(cotangents * walk.grad_scale, q_slot.dtype,
                                                              accurate=False))
     return algebra.value_weights(exponentials, weights, do_slot.dtype, walk.dropped), part
 
 
-WGMMA = plgpu.Layout.WGMMA
-"""wgmma's accumulators' layout, a tile `saturated_bf16` narrows and `base_two_weights` weighs in its
-registers."""
-
-
-WEIGHED = ("{ .reg .f32 x; fma.rn.f32 x, $1, $2, $3; fma.rn.f32 x, x, $4, $5; "
-           "ex2.approx.ftz.f32 $0, x; }")
-"""`BaseTwoWeights`' entry: its centred logit, its base-2 exponent, its weight."""
-
-
-@dataclasses.dataclass(frozen=True, eq=False)
-class BaseTwoWeights:
-    """`base_two_weights`' body (`plgpu.inline_mgpu`'s): each entry `2^((s scale - m) log2(e) - log2(T))`, its
-    centring in the logits' natural units by one fused multiply-add (`s scale - m`, a logit at its maximum 0
-    whatever their size), its base-2 exponent the next (`x log2(e) - log2(T)`), then `ex2.approx`: where
-    `exp(s scale - m) / T` took a multiply, a subtraction, two multiplies and the exponential (M-NA-28-gh200:
-    the fused dK/dV's 283M FMUL against FlashAttention 3's 70M, row 5272). Equal only to itself
-    (`inline_work.body_work`)."""
-
-    scale: float
-
-    def __call__(self, ctx, scores, below, log_total):
-        del ctx
-        f32 = ir.F32Type.get()
-        scale = arith.constant(f32, ir.FloatAttr.get(f32, self.scale))
-        log2e = arith.constant(f32, ir.FloatAttr.get(f32, LOG2E))
-        registers = np.empty_like(scores.registers)
-        for index, register in np.ndenumerate(scores.registers):
-            lanes = []
-            for lane in range(ir.VectorType(register.type).shape[0]):
-                entry, peak, total = (vector.extract(array.registers[index], [], [lane])
-                                      for array in (scores, below, log_total))
-                lanes.append(mgpu_utils.inline_ptx(WEIGHED, entry, scale, peak, log2e, total,
-                                                   result_types=f32))
-            registers[index] = vector.from_elements(register.type, lanes)
-        return mgpu_fragments.FragmentedArray(_registers=registers, _layout=scores.layout, _is_signed=None)
-
-
-def base_two_weights(scores: jax.Array, peak: jax.Array, total: jax.Array, scale: float) -> jax.Array:
-    """A queries-first tile's normalized weights from its products or hooked logits `scores` (fp32, wgmma's
-    layout, -inf where unseen) at `scale`, its queries' maxima `peak` and denominators `total`
-    (`BaseTwoWeights`): `softmax_weights`' second value, a query that saw nothing (peak -inf, `safe_peak`'s
-    +inf) weighing 0, a total of 0 taken as 1."""
-    below = jnp.broadcast_to(-gradient.safe_peak(peak)[:, None], scores.shape)
-    log_total = jnp.broadcast_to(-jnp.log2(jnp.where(total == 0, 1.0, total))[:, None], scores.shape)
-    inline = plgpu.inline_mgpu(arg_types=(WGMMA, WGMMA, WGMMA),
-                               return_type=plgpu.ShapeDtypeStruct(scores.shape, jnp.dtype(jnp.float32),
-                                                                  layout=WGMMA))
-    return inline(BaseTwoWeights(scale))(scores, below, log_total)
-
-
-@dataclasses.dataclass(frozen=True, eq=False)
-class SaturatedBf16:
-    """`saturated_bf16`'s body (`plgpu.inline_mgpu`'s): each register's pair of fp32 entries narrowed to bf16
-    by one `cvt.rn.satfinite.bf16x2.f32`, an entry past bf16's largest its largest (an infinity's too), a NaN
-    a NaN: `product.bf16_parts`' saturating leading part, its clamp's two FMNMX an entry the conversion's own
-    (M-NA-28-gh200: the fused dK/dV's 136M FMNMX, FlashAttention 3's none, row 5272). Equal only to itself,
-    so its counted work is keyed by the body a trace holds (`inline_work.body_work`)."""
-
-    def __call__(self, ctx, tile):
-        del ctx
-        i32 = ir.IntegerType.get_signless(32)
-        pair = ir.VectorType.get((2,), ir.BF16Type.get())
-        registers = np.empty_like(tile.registers)
-        for index, register in np.ndenumerate(tile.registers):
-            if ir.VectorType(register.type).shape != [2]:
-                raise ValueError(f"saturated_bf16 narrows fp32 pairs, not {register.type}")
-            low, high = (vector.extract(register, [], [lane]) for lane in range(2))
-            # The first operand the pair's upper half, the second its lower (PTX's packed conversions).
-            packed = mgpu_utils.inline_ptx("cvt.rn.satfinite.bf16x2.f32 $0, $1, $2;", high, low,
-                                           result_types=i32)
-            registers[index] = mgpu_utils.bitcast(packed, pair)
-        return mgpu_fragments.FragmentedArray(_registers=registers, _layout=tile.layout, _is_signed=None)
-
-
-SATURATED_BF16 = SaturatedBf16()
-"""The one `SaturatedBf16` body every `saturated_bf16` inlines."""
-
-
-def saturated_bf16(tile: jax.Array) -> jax.Array:
-    """An fp32 tile in wgmma's accumulator layout (`WGMMA`) narrowed to bf16 saturating at its largest, a
-    conversion a pair of entries (`SaturatedBf16`): `product.bf16_parts(tile, 1, saturating=1)`'s one part."""
-    inline = plgpu.inline_mgpu(arg_types=(WGMMA,),
-                               return_type=plgpu.ShapeDtypeStruct(tile.shape, jnp.dtype(jnp.bfloat16),
-                                                                  layout=WGMMA))
-    return inline(SATURATED_BF16)(tile)
 
 
 def _score_logits(walk: _Backward, coords: algebra.Coords, params: tuple, s, *, masked: bool):
@@ -381,17 +291,19 @@ def _score_weights(walk: _Backward, coords: algebra.Coords, params: tuple, s, pe
     """First half of `_scores` (row 11659): mask, hooked logits + slopes, and derived unnormalized and
     normalized weights from `s`, `peak`, and `total` (runnable while `dP` is in flight). Where its caller
     reads the `normalized` weights alone (the fused launch's bf16 tail, `_tile_scores`' `lean`) on wgmma at
-    approximate exponentials, those an entry's two fused multiply-adds and its exponential
-    (`base_two_weights`), each returned in the unnormalized weights' place too."""
+    approximate exponentials, those an entry's fused centring, its exponential and its share
+    (`attention_mosaic_tail.weighed`), each returned in the unnormalized weights' place too."""
     if (normalized and walk.how == algebra.PLAIN and walk.approx_math and not walk.interpret
             and not coords.keys_first and isinstance(walk.program.family, mosaic_sm90.WgmmaIssuer)):
+        # The mask taken after the weights (a scale of 0 or below admitted: a hidden entry's product times it
+        # is no -inf), the unhooked products scaled in the body, the hooked logits as they are.
         if walk.spec.score_mod is None:
             seen = algebra.seen(walk.spec, coords, s) if masked else None
-            scores, scale, slopes = gradient.where_seen(seen, s, -jnp.inf), walk.spec.scale, None
+            scores, scale, slopes = s, walk.spec.scale, None
         else:
             scores, slopes, seen = _score_logits(walk, coords, params, s, masked=masked)
             scale = 1.0
-        weights = base_two_weights(scores, _read(peak), _read(total), scale)
+        weights = gradient.where_seen(seen, tail.weighed(scores, _read(peak), _read(total), scale), 0.0)
         return weights, weights, slopes, seen
     logits, slopes, seen = _score_logits(walk, coords, params, s, masked=masked)
     exponentials, weights = derived_weights(
