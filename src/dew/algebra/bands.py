@@ -41,40 +41,34 @@ def summed(load, chunks: int, *, axis: int, width: int, lower: int, bins: int, d
     digit_mask = (1 << width) - 1
     parts = (mantissa + 2 * width - 1) // width
 
-    def digits(value, exponent):
-        held = scaled.scaled(value)
-        _, sign, biased, fraction = raw_fields(held.significand)
-        word = fraction | ((biased != 0).astype(fraction.dtype) << mantissa)
-        placed = held.exponent + exponent - mantissa
-        first, offset = jnp.divmod(placed - lower, width)
-        columns = []
-        for part in range(parts):
-            shift = part * width - offset
-            digit = jnp.where(shift >= 0, word >> jnp.maximum(shift, 0).astype(word.dtype),
-                              word << jnp.maximum(-shift, 0).astype(word.dtype)) & digit_mask
-            columns.append((first + part, jnp.where(sign != 0, -digit.astype(jnp.int32),
-                                                    digit.astype(jnp.int32))))
-        return columns
-
-    def of_chunk(index, carry):
-        for high, low, exponent in load(index):
-            for value in (high, low):
-                for places, parts in digits(value, exponent):
-                    slots, values = (jnp.moveaxis(part, axis, -1) for part in (places, parts))
-                    shape = jnp.broadcast_shapes(carry.shape[:-1], slots.shape[:-1])
-                    slots = jnp.broadcast_to(slots, (*shape, slots.shape[-1]))
-                    values = jnp.broadcast_to(values, (*shape, values.shape[-1]))
-                    slots = slots.reshape(math.prod(shape), slots.shape[-1])
-                    values = values.reshape(math.prod(shape), values.shape[-1])
-                    taken = jnp.broadcast_to(carry, (*shape, bins)).reshape(math.prod(shape), bins)
-                    carry = jax.vmap(lambda row, at, digit: row.at[at].add(digit, mode="drop",
-                                                                            wrap_negative_indices=False))(
-                        taken, slots, values).reshape(*shape, bins)
-        return carry
-
     shape = jnp.broadcast_shapes(*(part.shape for term in load(0) for part in term))
     rows = tuple(size for at, size in enumerate(shape) if at != axis)
     initial = jnp.zeros((*rows, bins), jnp.int32)
+    steps = jnp.arange(parts, dtype=jnp.int32)
+
+    def of_chunk(index, carry):
+        # One digit extractor and scatter for the chunk's terms, rather than an unrolled graph per
+        # significand word and digit, which compounds when higher derivatives carry several band sums.
+        terms = load(index)
+        words = jnp.stack([jnp.broadcast_to(value, shape) for high, low, _ in terms for value in (high, low)],
+                          axis=-1)
+        exponents = jnp.stack([jnp.broadcast_to(exponent, shape) for _, _, exponent in terms], axis=-1)
+        exponents = jnp.repeat(exponents, 2, axis=-1)
+        held = scaled.scaled(words)
+        _, sign, biased, fraction = raw_fields(held.significand)
+        word = (fraction | ((biased != 0).astype(fraction.dtype) << mantissa))[..., None]
+        first, offset = jnp.divmod(held.exponent + exponents - mantissa - lower, width)
+        shift = steps * width - offset[..., None]
+        digit = jnp.where(shift >= 0, word >> jnp.maximum(shift, 0).astype(word.dtype),
+                          word << jnp.maximum(-shift, 0).astype(word.dtype)) & digit_mask
+        signed = jnp.where(sign[..., None] != 0, -digit.astype(jnp.int32), digit.astype(jnp.int32))
+        places = first[..., None] + steps
+        flat_rows = math.prod(rows)
+        loaded = shape[axis] * 2 * len(terms) * parts
+        slots, values = (jnp.moveaxis(part, axis, -3).reshape(flat_rows, loaded) for part in (places, signed))
+        placed = jax.vmap(lambda row, at, value: row.at[at].add(value, mode="drop", wrap_negative_indices=False))(
+            carry.reshape(flat_rows, bins), slots, values)
+        return placed.reshape(*rows, bins)
     sums = of_chunk(0, initial) if chunks == 1 else jax.lax.fori_loop(0, chunks, of_chunk, initial)
     live = sums != 0
     positions = jnp.cumsum(live, axis=-1, dtype=jnp.int32)
