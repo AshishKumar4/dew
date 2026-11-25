@@ -344,15 +344,18 @@ def test_a_saturating_narrowing_compiles_and_counts_a_conversion_a_pair(generati
     from dew.nn.kernels.templates import bundles, inline_forms
     from dew.nn.kernels.templates.cost import Stated
 
-    # Its rows whole 32-byte sectors in bf16, as a register tile's store to device memory takes them.
     shape = (64, 64)
     layout = bundles.of(generation, jnp.bfloat16).layout
 
-    def body(x_ref, out_ref):
-        out_ref[...] = inline_forms.satfinite_bf16(plgpu.layout_cast(x_ref[...], layout), layout)
+    def body(x_ref, out_ref, narrowed_ref):
+        # Through shared memory, as a staged operand lands: a thread's bf16 pair is half of a 32-byte sector.
+        narrowed_ref[...] = inline_forms.satfinite_bf16(plgpu.layout_cast(x_ref[...], layout), layout)
+        plgpu.commit_smem()
+        plgpu.copy_smem_to_gmem(narrowed_ref, out_ref)
+        plgpu.wait_smem_to_gmem(0)
 
     launch = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct(shape, jnp.bfloat16), num_threads=1,
-                          thread_name="wg")
+                          thread_name="wg", scratch_types=[plgpu.SMEM(shape, jnp.bfloat16)])
     given = jax.ShapeDtypeStruct(shape, jnp.float32)
     case = KernelCase("narrowed", lambda: (launch, (given,)))
     assert not (failed := mosaic_failures(compile_mosaic_kernels([case], generation))), failed
