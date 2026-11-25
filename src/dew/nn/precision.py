@@ -1355,13 +1355,14 @@ def _configured_name(precision: jax.lax.PrecisionLike) -> str | None:
     return name.lower() if name in jax.lax.Precision.__members__ else name
 
 
-def configured_precision(precision: jax.lax.PrecisionLike):
+def configured_precision(precision: jax.lax.PrecisionLike, *, exact: bool = False):
     """A context in which a product that takes no precision of its own (jax.nn's xla attention)
-    multiplies at `precision`, through `jax.default_matmul_precision`; an unset or default
-    precision changes nothing, a floor the configured one meets. A precision no config names
-    (`configurable_precision`) is refused."""
+    multiplies at `precision`, through `jax.default_matmul_precision`; an unset precision changes nothing,
+    and a default one nothing unless `exact`, where it overrides an outer higher one (splash's arms, each
+    at exactly its own). A precision no config names (`configurable_precision`) is refused."""
     name = _configured_name(precision)
-    return contextlib.nullcontext() if name in (None, 'default') else jax.default_matmul_precision(name)
+    kept = name is None or (name == 'default' and not exact)
+    return contextlib.nullcontext() if kept else jax.default_matmul_precision(name)
 
 
 def operand_precision(dtype: Dtype | None, precision: jax.lax.PrecisionLike = None) -> jax.lax.PrecisionLike:

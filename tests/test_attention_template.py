@@ -1083,3 +1083,122 @@ def test_the_reference_arithmetic_multiplies_ieee_float32_as_an_a100_runs_it():
     narrowed = {(str(stated), shapes) for stated, dtype, shapes in precisions
                 if dtype == jnp.float32 and stated != highest}
     assert precisions and not narrowed, narrowed
+
+
+def _state_mean(query, key, value, spans, m, total):
+    """The reference's output beside a valueless state of maximum `m` and mass `total` (`Initial`)."""
+    acc = jnp.zeros((*m.shape, value.shape[-1]), value.dtype)
+    hooks = template.Hooks(initial=template.Initial(m, total, acc, valueless=True))
+    return template.reference(query, key, value, spans, hooks, scale=1.0)
+
+
+def test_the_references_mean_past_the_format_differentiates_beside_any_state():
+    """The reference's mean whose sums pass the format, or whose total does `2^+-63`, differentiates at
+    every order as the convex mean law does (`held_mean`, `_law_mean`, rows 2654 and 12388), beside a
+    valueless state at every edge of its mass: a query that sees no key beside a state of no mass passes
+    back finite zeros, as does a call of no keys; two keys of zero logit over values of 2^127 beside a state
+    of no mass move with that mass as `-2^126`, and beside a mass of 2^100 as `-2^28` along 2^100, its second
+    derivative forward over reverse and reverse over reverse alike `2^-71`; beside a mass of 2^127 the
+    output moves by -2 along it (weights of 2^-127, subnormal) and by 2 along the values; values of 2^127
+    moved by 2^-100 move their mean by 2^-100; and beside a state of mass 2 at the keys' own maximum 2^24
+    each key weighs 1/4, its values' direction of ones giving 1/2 (`2^24 + log 2` rounds back to `2^24`).
+    Every fixed-order fp32 formula broke one of these (a quotient's derivative through `total^-2`, a
+    transpose of a division summing `-2^127` cotangents, a direction taken at the values' binades)."""
+    query = jnp.zeros((1, 1, 1, 8), jnp.float32)
+    key = jnp.zeros((1, 2, 1, 8), jnp.float32)
+    value = jnp.full((1, 2, 1, 8), 2.0 ** 127, jnp.float32)
+    state = jnp.zeros((1, 1, 1), jnp.float32)
+
+    unseen = template.spans(1, 2, 1, lengths=jnp.zeros((1,), jnp.int32))
+    out, pull = jax.vjp(lambda v, t: _state_mean(query, key, v, unseen, state, t), value, state)
+    grads = pull(jnp.ones_like(out))
+    np.testing.assert_array_equal(np.asarray(out), 0.0)
+    for grad in grads:
+        np.testing.assert_array_equal(np.asarray(grad), 0.0)
+
+    seen = template.spans(1, 2, 1)
+    _, moved = jax.jvp(lambda t: _state_mean(query, key, value, seen, state, t), (state,),
+                       (jnp.ones_like(state),))
+    np.testing.assert_array_equal(np.asarray(moved), -(2.0 ** 126))
+    massive = jnp.full_like(state, 2.0 ** 100)
+    _, moved = jax.jvp(lambda t: _state_mean(query, key, value, seen, state, t), (massive,), (massive,))
+    np.testing.assert_array_equal(np.asarray(moved), -(2.0 ** 28))
+    # Forward over reverse at that mass: the mass's gradient of one output column, 2^128 / (2 + T) (one
+    # column, so no cotangent's product with the values passes the format itself), moves as its second
+    # derivative times 2^100, 2 * 2^128 * 2^100 / 2^300 = 2^-71.
+    _, curved = jax.jvp(jax.grad(lambda t: jnp.sum(_state_mean(query, key, value, seen, state, t)[..., 0])),
+                        (massive,), (massive,))
+    np.testing.assert_array_equal(np.asarray(curved), 2.0 ** -71)
+    # Reverse over reverse, the same second derivative: the keys' cotangents of their shared total summed
+    # (-2^127 each) took -inf where the parts were divided by the total itself.
+    column = jax.grad(lambda t: jnp.sum(_state_mean(query, key, value, seen, state, t)[..., 0]))
+    np.testing.assert_array_equal(np.asarray(jax.grad(lambda t: jnp.sum(2.0 ** 100 * column(t)))(massive)),
+                                  2.0 ** -71)
+    # At a mass of 2^127 moved by 2^127 the output, 2^128 / (2 + T) a column, moves by -2: each key's weight
+    # 2^-127 is subnormal, which a backend flushing subnormals took to 0 where the weights were formed.
+    largest = jnp.full_like(state, 2.0 ** 127)
+    _, moved = jax.jvp(lambda t: _state_mean(query, key, value, seen, state, t)[..., 0], (largest,),
+                       (largest,))
+    np.testing.assert_array_equal(np.asarray(moved), -2.0)
+    # Beside that mass the values moved by themselves move the output by itself, 2: their direction's sums
+    # at the values' own size passed the format where they were summed before any scale.
+    _, moved = jax.jvp(lambda v: _state_mean(query, key, v, seen, state, largest)[..., 0], (value,), (value,))
+    np.testing.assert_array_equal(np.asarray(moved), 2.0)
+    # Values of 2^127 moved by 2^-100 beside a state of no mass move their mean by 2^-100: a direction taken
+    # at the values' own binades flushed it.
+    _, moved = jax.jvp(lambda v: _state_mean(query, key, v, seen, state, state), (value,),
+                       (jnp.full_like(value, 2.0 ** -100),))
+    np.testing.assert_array_equal(np.asarray(moved), 2.0 ** -100)
+    # One key of value 2^126 beside a mass of 2^62 moved by itself: the output 2^126 / (1 + 2^62) moves by
+    # -2^64, where the quotient's own derivative formed 2^126 x 2^62 first, infinite.
+    single = template.spans(1, 1, 1)
+    lone = jnp.full((1, 1, 1, 8), 2.0 ** 126, jnp.float32)
+    reach = jnp.full_like(state, 2.0 ** 62)
+    _, moved = jax.jvp(lambda t: _state_mean(query, key[:, :1], lone, single, state, t)[..., 0], (reach,),
+                       (reach,))
+    np.testing.assert_array_equal(np.asarray(moved), -(2.0 ** 64))
+    # A state of mass 1 and zero sums at the key's own maximum beside one key of value 0: the output is half
+    # the state's sums, so moving them by one moves it by 1/2.
+    zero_value = jnp.zeros((1, 1, 1, 8), jnp.float32)
+
+    def beside_sums(acc):
+        hooks = template.Hooks(initial=template.Initial(state, jnp.ones_like(state), acc, valueless=True))
+        return template.reference(query, key[:, :1], zero_value, single, hooks, scale=1.0)
+
+    _, moved = jax.jvp(beside_sums, (jnp.zeros_like(zero_value),), (jnp.ones_like(zero_value),))
+    np.testing.assert_array_equal(np.asarray(moved), 0.5)
+    # One zero-logit key of value 2^62 beside a valueless state of mass 2^62 moved by 2^100: the output
+    # 2^62 / (1 + 2^62) moves by -2^38, where the quotient's own derivative formed `-2^100 x 2^62 x 2^-124`,
+    # -inf, at sums and a total within any fixed reach.
+    reaching = jnp.full((1, 1, 1, 8), 2.0 ** 62, jnp.float32)
+    _, moved = jax.jvp(lambda t: _state_mean(query, key[:, :1], reaching, single, state, t)[..., 0],
+                       (jnp.full_like(state, 2.0 ** 62),), (jnp.full_like(state, 2.0 ** 100),))
+    np.testing.assert_array_equal(np.asarray(moved), -(2.0 ** 38))
+    # A call of no keys beside a state of mass 2: the output 0, its gradients finite zeros.
+    none = template.spans(1, 0, 1)
+    out, pull = jax.vjp(lambda t: _state_mean(query, key[:, :0], value[:, :0], none, state, t),
+                        jnp.full_like(state, 2.0))
+    np.testing.assert_array_equal(np.asarray(out), 0.0)
+    np.testing.assert_array_equal(np.asarray(pull(jnp.ones_like(out))[0]), 0.0)
+
+    peaked = jnp.zeros((1, 1, 1, 8), jnp.float32).at[..., 0].set(2.0 ** 12)
+    keys = jnp.zeros((1, 2, 1, 8), jnp.float32).at[..., 0].set(2.0 ** 12)
+    _, tangent = jax.jvp(
+        lambda v: _state_mean(peaked, keys, v, seen, jnp.full((1, 1, 1), 2.0 ** 24, jnp.float32),
+                              jnp.full((1, 1, 1), 2.0, jnp.float32)), (value,), (jnp.ones_like(value),))
+    np.testing.assert_array_equal(np.asarray(tangent), 0.5)
+
+
+def test_the_references_fp32_query_gradient_at_values_near_the_largest():
+    """An fp32 query `0` over keys `[0, 1]` at scale 1 and eight channels of values `2^127` and `1.5 x 2^127`,
+    a unit cotangent: its weights 1/2, `dS = [-2^127, 2^127]`, so `dQ = 2^127`, where an fp32 weight's
+    identity narrowing landed the scores' part (`dP / T`, inf) apart from the total's (`-D / T`, -inf):
+    NaN."""
+    spans = template.spans(1, 2, 1)
+    query = jnp.zeros((1, 1, 1, 1), jnp.float32)
+    key = jnp.asarray([0.0, 1.0], jnp.float32).reshape(1, 2, 1, 1)
+    value = jnp.stack([jnp.full(8, 2.0 ** 127), jnp.full(8, 1.5 * 2.0 ** 127)]).astype(jnp.float32)
+    value = value.reshape(1, 2, 1, 8)
+    out, pull = jax.vjp(lambda q: template.reference(q, key, value, spans, template.Hooks(), scale=1.0),
+                        query)
+    np.testing.assert_array_equal(np.asarray(pull(jnp.ones_like(out))[0]), 2.0 ** 127)
