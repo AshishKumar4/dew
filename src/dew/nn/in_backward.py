@@ -24,7 +24,7 @@ import contextvars
 import dataclasses
 import functools
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from typing import NamedTuple
+from typing import ClassVar, NamedTuple
 
 import jax
 import jax.extend.core as jcore
@@ -32,6 +32,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.core import ShapedArray
 
+from dew import _cache
 from dew.nn.derivatives import (
     Surrogate,
     contracted,
@@ -64,7 +65,10 @@ class RunRule(Surrogate):
     """The rule of a run updating or pooling in its backward (`scanned_run`): a surrogate (its cotangents
     the step's new state), which a step's gate tells from every other custom rule by its kind
     (`dew.training.transaction._run_reads`): an outer rule wrapping it, which may scale what it pools, is
-    no run's."""
+    no run's. Never held in `derivatives._SPANS`: its forward mutates `_Traced` as it traces and its
+    backward reads the untraced `_GATE` and `_FINITE` contexts."""
+
+    held: ClassVar[bool] = False
 
 
 RUN_RULE = RunRule()
@@ -218,10 +222,15 @@ class InBackward:
     moments and norms, None for what it reads beside them (its input, its rows' values)."""
 
 
-_PLAN: contextvars.ContextVar[InBackward | None] = contextvars.ContextVar("dew_in_backward", default=None)
-_GATE: contextvars.ContextVar[jax.Array | None] = contextvars.ContextVar("dew_in_backward_gate", default=None)
-_FINITE: contextvars.ContextVar[jax.Array | None] = contextvars.ContextVar("dew_in_backward_finite",
-                                                                          default=None)
+_PLAN: contextvars.ContextVar[InBackward | None] = _cache.untraced(
+    contextvars.ContextVar("dew_in_backward", default=None))
+_GATE: contextvars.ContextVar[jax.Array | None] = _cache.untraced(
+    contextvars.ContextVar("dew_in_backward_gate", default=None))
+_FINITE: contextvars.ContextVar[jax.Array | None] = _cache.untraced(
+    contextvars.ContextVar("dew_in_backward_finite", default=None))
+"""Per-step tracing contexts for `scanned_run`, marked untraced (`_cache.untraced`) so global trace caches
+keyed by `options.trace_context()` (`derivatives._SPANS`, `projections._DECISIONS`, `algebra.fusion`) neither
+thrash per trace nor retain `InBackward.update` closures, transactions, trainers, executables, or tracers."""
 
 
 @contextlib.contextmanager

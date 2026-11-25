@@ -295,6 +295,13 @@ class TrainerAdvanced(Generic[Loss, Effects]):
     """A looped model's pass count drawn per microbatch (`dew.training.phase_passes`)."""
 
 
+def _objective_axes(objective: Objective[Loss, Effects]) -> Callable[[], dict[tuple[str, ...], LogicalAxes]]:
+    """Read `objective`'s declared parameter axes (`Objective.parameter_axes`) without closing over its
+    `Trainer`, so `declaring` never pins a dropped trainer and its compiled executables through its
+    optimizer."""
+    return lambda: objective.parameter_axes
+
+
 class Trainer(Generic[Loss, Effects]):
     """Runs an `Objective`: gradients, sharding, EMA, checkpoints and logging."""
 
@@ -360,9 +367,10 @@ class Trainer(Generic[Loss, Effects]):
         self.objective = objective
         # A config's groups take what the objective draws fresh (`OptimConfig.claiming`); a built one keys.
         self._given = optimizer if isinstance(optimizer, optax.GradientTransformation) else None
-        self._config, self._optimizer = ((None, declaring(objective.optimizer(optimizer), self._boxed_axes))
-                                         if isinstance(optimizer, optax.GradientTransformation) else
-                                         (optimizer.claiming(*objective.fresh_trained()), None))
+        self._config, self._optimizer = (
+            (None, declaring(objective.optimizer(optimizer), _objective_axes(objective)))
+            if isinstance(optimizer, optax.GradientTransformation) else
+            (optimizer.claiming(*objective.fresh_trained()), None))
         from dew.nn.inputs import seed_of
         # A seed's key is made when first read, after `fit` readies the process (`key`).
         self.seed, self._given_key, self._key = seed_of(key), key, None
@@ -1337,7 +1345,7 @@ class Trainer(Generic[Loss, Effects]):
             return
         built = self._config.build(updates, clocked=self._shape.examples is not None, stated=True)
         self._shape = dataclasses.replace(self._shape, updates=updates)
-        self._optimizer = declaring(self.objective.optimizer(built), self._boxed_axes)
+        self._optimizer = declaring(self.objective.optimizer(built), _objective_axes(self.objective))
 
     def _training_loop(self, plan: FitPlan, run: FitRun, profiler: Profiler | None,
                        tracer: Profiler | None, profile: ProfileWindow | None,
