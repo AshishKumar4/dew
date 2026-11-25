@@ -44,7 +44,7 @@ import jax.numpy as jnp
 from jax.custom_derivatives import zero_from_primal
 from jax.sharding import PartitionSpec as P
 
-from dew.mesh import logical_spec, mesh_axes
+from dew.mesh import logical_spec, mesh_axes, spec_axes
 from dew.nn.categorical import (
     kl_divergence,
     label_entry,
@@ -1237,7 +1237,7 @@ def _sharded_head(mesh, hidden, table, targets, excluded, cap, columns, head, co
     sums = column_logits is None and reference is None
     operands = (hidden, table, targets, excluded, cap, columns, *(() if reference is None else (reference,)))
     spec = token_spec(jax.tree.leaves(targets)[0].shape)
-    axes = {axis for entry in spec for axis in mesh_axes(entry)}
+    axes = spec_axes(spec)
     if not axes:
         return head(*operands)
     # The head arrives in its own shards on the token axes and is gathered

@@ -40,7 +40,7 @@ from flax.linen.transforms import lift_direct_transform
 from jax.sharding import NamedSharding
 
 from dew.batch import sows_appended, unboxed
-from dew.mesh import FSDP_AXIS, mesh_axes
+from dew.mesh import FSDP_AXIS, spec_axes
 from dew.nn.dense import captures_any_method
 
 from ..precision import at_least_fp32, softplus
@@ -437,8 +437,8 @@ def _gathered_passes(model, every_pass: Callable, x, inputs: dict, passes, prelu
         return every_pass(module, x, *inside)
 
     def run_inside(x):
-        token_axes = {name for entry in jax.typeof(x).sharding.spec.partitions[:x.ndim - 1]
-                      for name in mesh_axes(entry)}
+        placed = jax.typeof(x).sharding.spec.partitions[:x.ndim - 1]
+        token_axes = spec_axes(jax.sharding.PartitionSpec(*placed))
         mapped = nn.map_variables(
             held, mapped_collections=True, init=False, mutable=True,
             trans_in_fn=functools.partial(gathered, axes=token_axes | {FSDP_AXIS}),
