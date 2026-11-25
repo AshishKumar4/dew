@@ -21,7 +21,7 @@ from dew.data.pipeline import Refused, Rejected
 from dew.data.sources import Memory
 from dew.data.text import ByteTokenizer, HFTokenizer
 from dew.decision import Choice, Decide, Example, Noul
-from dew.decision.config import DecisionRunConfig, Letters
+from dew.decision.config import DecisionRunConfig, Letters, RowBudgets
 from dew.decision.data import GroupedExamples, decisions
 from dew.decision.head import DecisionHead
 from dew.decision.layout import Labels, SegmentLayout, Specials
@@ -440,7 +440,7 @@ def _run(backbone: Path, count: int, *, stated: bool = False, **budgets) -> Fitt
     trainer = dataclasses.replace(default.trainer, multi_host=False, compilation_cache_dir=None)
     # A window that holds a question of 151 intents whole under either tokenizer.
     return dataclasses.replace(default, pretrained=str(backbone), trainer=trainer, head=Letters(),
-                               max_len=6144, **budgets)
+                               rows=RowBudgets(max_len=6144, **budgets))
 
 
 @pytest.mark.parametrize("count", [77, 151])
@@ -565,7 +565,7 @@ def test_a_release_runs_question_budgets_name_where_each_came_from(tmp_path):
                               if field.init}).prepare().train("x")
     assert summary["capacities"]["question"] == {"tokens": 48, "from": "release"}
     assert summary["capacities"]["option"] == {"tokens": 48, "from": "laya"}
-    stated = dataclasses.replace(run, option_tokens=12)
+    stated = dataclasses.replace(run, rows=RowBudgets(option_tokens=12))
     _, _, summary = Fitted(**{field.name: getattr(stated, field.name) for field in dataclasses.fields(stated)
                               if field.init}).prepare().train("x")
     assert summary["capacities"]["option"] == {"tokens": 12, "from": "stated"}

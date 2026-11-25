@@ -15,7 +15,7 @@ import numpy as np
 import optax
 import pytest
 from reference_error import assert_as_exact, assert_computes_the_oracle, chain_roundings
-from rl_support import TinyHead
+from rl_support import TinyHead, completion_length
 
 from dew.config import ObjectiveConfig
 from dew.config.lm import PromptRollout
@@ -85,7 +85,7 @@ def composed(name, model, seq_len, *, max_new_tokens=8, overlong_cache=None, **f
     naming it (`PromptRollout.method`), whose settings the run derives into the objective's
     (`ObjectiveConfig.build`, refusing `fields` the method fixes) and its scheduler's
     (`PromptRollout.scheduler_settings`)."""
-    rollout = PromptRollout(reward="rl_support:completion_length", method=name, max_new_tokens=max_new_tokens,
+    rollout = PromptRollout(reward=completion_length, method=name, max_new_tokens=max_new_tokens,
                             overlong_cache=overlong_cache)
     objective = ObjectiveConfig("grpo", fields).build(model=model, seq_len=seq_len,
                                                        **rollout.objective_settings())
@@ -508,3 +508,29 @@ def test_rloo_pays_its_reference_penalty_in_the_reward_before_the_baseline():
         found = np.asarray(rloo_advantage(jnp.asarray(returns, jnp.float32), 3))
         expected.update({token(task, sample): float(value) for sample, value in enumerate(found)})
     np.testing.assert_array_equal(np.asarray(packed[ADVANTAGES_KEY]) * mask, per_session(packed, expected))
+
+
+def test_a_rollouts_reward_is_the_callable_its_command_line_names_by_its_path(tmp_path):
+    """A GRPO run's reward (`PromptRollout.reward`) is a callable: the command line names it by its import
+    path, a function as itself and a class as its instance at its defaults (`MathReward`), and a run saved
+    naming it by its path, a string before row 11937, loads holding the function the path names."""
+    import json
+
+    import rl_support
+
+    from dew.config import earlier_run
+    from dew.config.lm import LMRunConfig
+    from dew.rl.sandbox import MathReward
+
+    named = rl_support.recorded_grpo_config(tmp_path, "--rollout.reward", "rl_support:completion_length")
+    assert named.rollout is not None and named.rollout.reward is completion_length
+    classed = rl_support.recorded_grpo_config(tmp_path, "--rollout.reward", "dew.rl.sandbox:MathReward")
+    assert classed.rollout is not None and isinstance(classed.rollout.reward, MathReward)
+    record = json.loads(json.dumps(named.record()))
+    rollout = record["fields"]["rollout"]
+    # Its rollout's record, its fields or a class record of them, with the reward named by its path.
+    fields = {**rollout.get("fields", rollout), "reward": "rl_support:completion_length"}
+    rollout = {**rollout, "fields": fields} if "class" in rollout else fields
+    earlier = {**record, "fields": {**record["fields"], "rollout": rollout}}
+    loaded = LMRunConfig.read(earlier_run(earlier)).rollout
+    assert loaded is not None and loaded.reward is completion_length

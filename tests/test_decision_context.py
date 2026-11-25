@@ -22,6 +22,7 @@ from dew.batch import FROZEN, part, thaw, unboxed
 from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
 from dew.decision import Choice, Decide, Example
+from dew.decision.config import CrossContext
 from dew.decision.images import Images
 from dew.decision.inputs import DecisionInputs
 from dew.decision.layout import SegmentLayout, Specials
@@ -874,9 +875,9 @@ def test_a_configured_context_encoder_is_frozen_unless_trained_and_counted_as_it
 
 
 def test_a_runs_configured_context_encoder_computes_in_its_dtype_and_reads_text(tmp_path):
-    """A decision run's `--context-text` builds its encoder in the run's compute dtype, as a diffusion run's
-    text condition is, a pretrained tower (`clip_text`) among them, and trains a step with it frozen; an
-    encoder that reads no text into the states context layers read (an audio tower, a denoiser's
+    """A decision run's context's text encoder (`CrossContext.text`) builds in the run's compute dtype, as a
+    diffusion run's text condition is, a pretrained tower (`clip_text`) among them, and trains a step with it
+    frozen; an encoder that reads no text into the states context layers read (an audio tower, a denoiser's
     conditioner) and a diffusion run's field or unconditional text are refused. The run built the tower in
     float32 and took any registered encoder, which failed at its first trace (theme 22's review). Its task
     loaded computes its encoder as the run did, or in the dtype the load asks for."""
@@ -888,8 +889,8 @@ def test_a_runs_configured_context_encoder_computes_in_its_dtype_and_reads_text(
     from dew.registry import ModelConfig
 
     text = TextCondition(encoder="clip_text", checkpoint=str(TINY))
-    run = dataclasses.replace(decision(tmp_path, drawn=False), context_layers=(0,), context_length=32,
-                              context_text=text, calibrate=False,
+    context = CrossContext(layers=(0,), length=32, text=text)
+    run = dataclasses.replace(decision(tmp_path, drawn=False), context=context, calibrate=False,
                               model=ModelConfig("causal_transformer", {"dtype": "bfloat16"}))
     objective = run.prepare().objective
     assert jnp.dtype(objective.model.context.encoder.dtype) == jnp.dtype("bfloat16")
@@ -904,13 +905,13 @@ def test_a_runs_configured_context_encoder_computes_in_its_dtype_and_reads_text(
     # A character table is taken; one differing from it in its declarations alone (`reads_captions`,
     # `keyword`) is refused, as an audio tower and a denoiser's conditioner are.
     table = TextCondition(encoder="char_table", checkpoint="char_table")
-    assert isinstance(dataclasses.replace(run, context_text=table).prepare().objective.model.context.encoder,
-                      CharTable)
+    tabled = dataclasses.replace(run, context=dataclasses.replace(context, text=table))
+    assert isinstance(tabled.prepare().objective.model.context.encoder, CharTable)
     for refused in (dataclasses.replace(text, field="caption"), dataclasses.replace(text, unconditional="x"),
                     dataclasses.replace(table, encoder=f"{__name__}:Captionless"),
                     dataclasses.replace(table, encoder=f"{__name__}:Conditioning")):
         with pytest.raises(ValueError):
-            dataclasses.replace(run, context_text=refused).prepare()
+            dataclasses.replace(context, text=refused)
 
 
 def test_a_run_from_a_saved_run_holds_its_configured_encoders_weights_frozen_or_trained(tmp_path):
@@ -929,9 +930,9 @@ def test_a_run_from_a_saved_run_holds_its_configured_encoders_weights_frozen_or_
     from dew.optim import OptimConfig
 
     text = TextCondition(encoder="clip_text", checkpoint=str(TINY))
-    first = dataclasses.replace(decision(tmp_path, drawn=False), context_layers=(0,), context_length=32,
-                                context_text=text, context_text_trained=True, calibrate=False,
-                                optim=OptimConfig(lr=1e-2))
+    first = dataclasses.replace(decision(tmp_path, drawn=False), context=CrossContext(layers=(0,), length=32,
+                                                                                       text=text),
+                                context_text_trained=True, calibrate=False, optim=OptimConfig(lr=1e-2))
     # Two steps: the cross-attention's gate opens from zero on the first, so the second reaches the encoder.
     state, _ = trained(first, tmp_path, "first", trainer={"steps": 2,
                                                           "checkpoint_final": True})
@@ -953,21 +954,21 @@ def test_a_run_from_a_saved_run_holds_its_configured_encoders_weights_frozen_or_
 
 
 def test_a_shared_cross_attention_reads_a_configured_encoder_of_the_backbones_width(tmp_path):
-    """`--context-form shared` reads a configured encoder's states in the layer's own attention, at the
-    backbone's width: an encoder of that width (`Wide`, 128 features as the tiny Laya backbone) trains a
-    step, and one of another width (char_table's 16) is refused by the layer's own width check. Every
-    configured encoder was refused under the shared form (row 7613)."""
+    """A shared context form (`CrossContext.form`) reads a configured encoder's states in the layer's own
+    attention, at the backbone's width: an encoder of that width (`Wide`, 128 features as the tiny Laya
+    backbone) trains a step, and one of another width (char_table's 16) is refused by the layer's own width
+    check. Every configured encoder was refused under the shared form (row 7613)."""
     from run_kinds import decision, trained
 
     from dew.inputs.spec import TextCondition
 
-    run = dataclasses.replace(decision(tmp_path, drawn=False), context_layers=(0,), context_length=32,
-                              context_form="shared", calibrate=False,
-                              context_text=TextCondition(encoder=f"{__name__}:Wide", checkpoint="char_table"))
+    context = CrossContext(layers=(0,), length=32, form="shared",
+                           text=TextCondition(encoder=f"{__name__}:Wide", checkpoint="char_table"))
+    run = dataclasses.replace(decision(tmp_path, drawn=False), context=context, calibrate=False)
     state, _ = trained(run, tmp_path, "shared")
     assert "context" in state.variables[FROZEN]
     table = TextCondition(encoder="char_table", checkpoint="char_table")
-    narrow = dataclasses.replace(run, context_text=table)
+    narrow = dataclasses.replace(run, context=dataclasses.replace(context, text=table))
     with pytest.raises(ValueError):
         trained(narrow, tmp_path, "narrow")
 
@@ -988,8 +989,9 @@ def test_a_configured_encoder_is_placed_by_its_own_axes_frozen_or_trained(tmp_pa
 
     text = TextCondition(encoder="clip_text", checkpoint=str(TINY))
     for trains in (False, True):
-        run = dataclasses.replace(decision(tmp_path, drawn=False), context_layers=(0,), context_length=32,
-                                  context_text=text, context_text_trained=trains, calibrate=False)
+        run = dataclasses.replace(decision(tmp_path, drawn=False),
+                                  context=CrossContext(layers=(0,), length=32, text=text),
+                                  context_text_trained=trains, calibrate=False)
         objective = run.prepare().objective
         trainer = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0), mesh=LAYOUT,
                           advanced=TrainerAdvanced(layout=Placement(min_shard=MIN_SHARD)), tracker=None)

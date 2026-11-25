@@ -96,8 +96,8 @@ def completion_length(text: str, record) -> float:
 def recorded_grpo_config(tmp_path, *cli: str, prompt: str = "hi there " * 8, **objective_fields):
     """An LM run that names GRPO and records its rollout (`LMRunConfig.rollout`): a one-layer decoder over
     the tiny chat tokenizer, eight rows of `prompt` (by default longer than the width of 8 ids, whose last 8
-    the preset's `long='truncate'` keeps), its completions' length the reward (`completion_length`, by
-    import path), two groups of four new tokens; one step, logged, checkpointed under `tmp_path`, its GRPO
+    the preset's `long='truncate'` keeps), its completions' length the reward (`completion_length`), two
+    groups of four new tokens; one step, logged, checkpointed under `tmp_path`, its GRPO
     objective's `objective_fields` stated, and `cli`'s flags on top (`LMRunConfig.cli`, a later flag over an
     earlier). test_grpo's recorded and served
     runs and a scenario's online RL cell each build from it."""
@@ -110,7 +110,7 @@ def recorded_grpo_config(tmp_path, *cli: str, prompt: str = "hi there " * 8, **o
 
     tokenizer = str(Path(__file__).resolve().parent / "fixtures" / "tokenizers" / "tiny-chat")
     rows = [{"prompt": prompt, "data_source": "rule", "ground_truth": "a"}] * 8
-    rollout = PromptRollout(reward=f"{__name__}:completion_length", groups=2, max_new_tokens=4)
+    rollout = PromptRollout(reward=completion_length, groups=2, max_new_tokens=4)
     model = ModelConfig("causal_transformer", {"emb_features": 16, "num_layers": 1, "num_heads": 2,
                                                "dtype": "float32"})
     default = LMRunConfig(data=Memory(rows).pipe(presets.prompts, tokenizer, max_prompt_len=8, batch=8),

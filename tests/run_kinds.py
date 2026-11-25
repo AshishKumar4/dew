@@ -28,7 +28,7 @@ from dew.data import TFDS, Files, Loading, images as image_steps, presets
 from dew.data.pipeline import Rejected
 from dew.data.sources.tokens import TokenFiles
 from dew.decision import decisions
-from dew.decision.config import DecisionRunConfig, Letters
+from dew.decision.config import DecisionRunConfig, Letters, RowBudgets
 from dew.decision.layout import Labels, QuestionSegment, built_in, per_question
 from dew.diffusion.presets import Flow
 from dew.inputs import TextCondition
@@ -272,7 +272,7 @@ def shared(root: Path, drawn: bool) -> RunConfig:
     run = lettered(root, drawn)
     assert isinstance(run.head, Letters)
     labels = dataclasses.replace(run.head.labels, names=("token4", "token5", "token6", "token7"))
-    return dataclasses.replace(run, pretrained=str(GEMMA_TINY), shared_state=3,
+    return dataclasses.replace(run, pretrained=str(GEMMA_TINY), rows=RowBudgets(shared_state=3),
                                head=dataclasses.replace(run.head, labels=labels))
 
 

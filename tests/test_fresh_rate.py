@@ -235,10 +235,12 @@ def context_run(root):
     from run_kinds import decision
     from test_decision_recipe import QWEN
 
+    from dew.decision.config import CrossContext
     from dew.lora import LoRA
 
-    return dataclasses.replace(decision(root, drawn=False), pretrained=str(QWEN), context_layers=(0,),
-                               context_length=16, lora=LoRA(rank=2, modules=("q_proj",)))
+    return dataclasses.replace(decision(root, drawn=False), pretrained=str(QWEN),
+                               context=CrossContext(layers=(0,), length=16),
+                               lora=LoRA(rank=2, modules=("q_proj",)))
 
 
 SAVING = {"checkpoint_every": 1}
@@ -386,7 +388,7 @@ def test_a_tied_readout_takes_no_default_group_and_is_refused_a_named_one(tmp_pa
     from dew.decision.layout import Labels
 
     # A tied readout over the fixture's tokenizer, whose letters each spell one token as "{}" variants.
-    tied = dataclasses.replace(context_run(tmp_path), context_layers=None, lora=None,
+    tied = dataclasses.replace(context_run(tmp_path), context=None, lora=None,
                                head=Letters(labels=Labels(variants=("{}",)), count=4))
     trained(tied, tmp_path, "tied")
     assert groups(tmp_path, "tied") == ()

@@ -569,7 +569,7 @@ def with_a_tokenizer(fixture: Path, release: Path) -> Path:
 
 @pytest.mark.parametrize("fixture", ["deepseek-v3-tiny", "deepseek-v4-tiny"])
 def test_a_decision_run_reads_its_context_through_a_deepseek_backbones_own_attention(tmp_path, fixture):
-    """A decision run in the shared form (`--context-form shared`) over a DeepSeek V3 release (MLA) and a
+    """A decision run in the shared form (`--context.form shared`) over a DeepSeek V3 release (MLA) and a
     V4 one reads its rows' context, each question and its lettered options, through the context layer's
     own attention behind the gate it adds (ledger 2678): parsed from the command line, it trains two
     steps, its loss finite and the gate moved off zero, the context's signal reaching it."""
@@ -582,16 +582,17 @@ def test_a_decision_run_reads_its_context_through_a_deepseek_backbones_own_atten
 
     release = with_a_tokenizer(HF / fixture, tmp_path / "release")
     rows = Memory([{"example": example} for example in examples()]).read("memory").pipe(decisions).batch(8)
-    config = DecisionRunConfig.cli(["--pretrained", str(release), "--segments",
-                                    json.dumps(to_record(SEGMENTS, tuple[Segment, ...])), "--context-layers",
-                                    "0", "--context-form", "shared", "head:letters", "--head.count", "4",
+    config = DecisionRunConfig.cli(["--pretrained", str(release), "--rows.segments",
+                                    json.dumps(to_record(SEGMENTS, tuple[Segment, ...])),
+                                    "head:letters", "--head.count", "4",
                                     "--head.labels.names", *(LABELS.names or ()), "--head.labels.variants",
                                     *LABELS.variants, "--head.labels.cue", LABELS.cue, "--trainer.name",
                                     "shared", "--trainer.checkpoint-dir", str(tmp_path / "runs"),
                                     "--trainer.steps", "2", "--trainer.checkpoint-every", "None",
                                     "--trainer.eval-every", "None", "--trainer.log-every", "1",
                                     "--trainer.multi-host", "False", "--trainer.compilation-cache-dir",
-                                    "None"],
+                                    "None", "context:cross-context", "--context.layers", "0",
+                                    "--context.form", "shared"],
                                    default=stated(DecisionRunConfig(data=rows),
                                                   model_fields={"dtype": "float32"}))
     state = config.run()

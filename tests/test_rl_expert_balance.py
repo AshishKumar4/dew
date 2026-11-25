@@ -289,7 +289,9 @@ def test_a_policy_runs_balance_flag_builds_a_policy_that_balances_its_routers(ki
     spec = json.dumps({"class": "dew.objectives.routing:ExpertBalance",
                        "fields": {"balance_rate": RATE, "aux_loss_alpha": 0.2}})
     # A GRPO run trains on what its rollout draws, which it names.
-    rollout = {"rollout": PromptRollout(reward="rl_support:completion_length")} if kind == "grpo" else {}
+    from rl_support import completion_length
+
+    rollout = {"rollout": PromptRollout(reward=completion_length)} if kind == "grpo" else {}
     run = dataclasses.replace(LMRunConfig(), objective=ObjectiveConfig(kind, {"balance": json.loads(spec)}),
                               **rollout)
     objective = run.objective

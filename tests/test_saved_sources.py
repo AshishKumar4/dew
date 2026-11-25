@@ -69,7 +69,7 @@ def test_a_decision_run_starts_from_a_saved_decision_run_as_from_its_export(tmp_
     # A run naming a head of its own over the Laya release draws it over the release's backbone, its rows
     # laid out by the release's own tokenizer, which the backbone alone does not hold, and trains.
     joint = ["head:joint-shape", "--head.width", "16", "--head.routing-layers", "1", "--head.layers", "1",
-             "--head.heads", "2", "--head.feedforward", "32", "--max-len", "768"]
+             "--head.heads", "2", "--head.feedforward", "32", "--rows.max-len", "768"]
     drawn = started(source, "fresh_head", "--source.step", "latest", *joint)
     assert int(drawn.step) == 1
 
@@ -280,7 +280,7 @@ def joint_flags() -> list[str]:
 
     return ["--pretrained", str(QWEN_TINY), "head:joint-shape", "--head.width", "16",
             "--head.routing-layers", "1", "--head.layers", "1", "--head.heads", "2",
-            "--head.feedforward", "32", "--max-len", "768"]
+            "--head.feedforward", "32", "--rows.max-len", "768"]
 
 
 @pytest.fixture(scope="module")
@@ -339,7 +339,8 @@ def test_a_decision_run_starts_from_a_saved_chat_format_decision_run(chat_decisi
 
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     source, state = chat_decision_run
-    run = DecisionRunConfig.cli(["--pretrained", str(source), "--source.step", "latest", "--max-len", "768"],
+    run = DecisionRunConfig.cli(["--pretrained", str(source), "--source.step", "latest", "--rows.max-len",
+                                 "768"],
                                 default=decision(tmp_path, drawn=False))
     started = run.prepare().objective.init(jax.random.key(0))
     leaves_alike(started["params"]["head"], state.variables["params"]["head"])
@@ -937,3 +938,23 @@ def test_a_resume_recomputes_its_loop_freely_as_a_saved_run_did(tmp_path):
                 run.check_resume(earlier)
         else:
             run.check_resume(earlier)
+
+
+def test_a_decision_run_saved_with_its_budgets_and_context_flat_loads_them_whole(tmp_path):
+    """A decision run saved with its rows' budgets and its context layers' fields flat (`max_len`,
+    `option_tokens`, `context_layers`, `context_length`, `context_form` before row 11937) loads holding
+    them as its `rows` (`RowBudgets`) and its `context` (`CrossContext`); one that read no context
+    (`context_layers` None) holds none."""
+    from dew.config import earlier_run
+    from dew.decision.config import CrossContext, RowBudgets
+
+    record = json.loads(json.dumps(decision(tmp_path, drawn=False).record()))
+    today = {key: value for key, value in record["fields"].items() if key not in ("rows", "context")}
+    flat = {"max_len": 768, "option_tokens": 12, "context_layers": [0], "context_length": 32,
+            "context_form": "shared"}
+    loaded = DecisionRunConfig.read(earlier_run({**record, "fields": {**today, **flat}}))
+    assert loaded.rows == RowBudgets(max_len=768, option_tokens=12)
+    assert loaded.context == CrossContext(layers=(0,), length=32, form="shared")
+    unread = DecisionRunConfig.read(earlier_run({**record, "fields": {**today, "max_len": 768,
+                                                                     "context_layers": None}}))
+    assert unread.rows == RowBudgets(max_len=768) and unread.context is None

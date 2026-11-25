@@ -16,7 +16,7 @@ from run_kinds import stated
 from dew.config import RunConfig
 from dew.data import Files, Loading, Memory
 from dew.decision import Choice, Decide, decisions, mixture
-from dew.decision.config import DecisionRunConfig
+from dew.decision.config import CrossContext, DecisionRunConfig, RowBudgets
 from dew.decision.layout import SegmentLayout, per_question
 from dew.decision.scoring import ScoringRule
 from dew.registry import from_record
@@ -140,8 +140,9 @@ def test_a_lora_run_over_a_decision_release_trains_its_factors_and_reloads(tmp_p
     default = Fitted(data=asked)
     # The release serves long rows; training pads each to the layout's length, so the run budgets it.
     config = dataclasses.replace(default, pretrained=str(release), lora=LoRA(rank=2, modules=("q_proj",)),
-                                 max_len=512, trainer=dataclasses.replace(default.trainer, multi_host=False,
-                                                                          compilation_cache_dir=None))
+                                 rows=RowBudgets(max_len=512),
+                                 trainer=dataclasses.replace(default.trainer, multi_host=False,
+                                                             compilation_cache_dir=None))
     objective, dataset = config.prepare().train("adapted")
     assert objective.layout.max_len == 512
     assert per_question(objective.layout)
@@ -840,30 +841,31 @@ def context_run() -> DecisionRunConfig:
                          "context": {"plan": plan}} for text, label, plan in tickets]
                        ).pipe(decisions).read("memory").batch(8).loading(Loading(workers=0))
     return Fitted(data=contexted, pretrained=str(QWEN), source=SourceOptions(text_only=True),
-                  context_layers=(0,), context_length=64)
+                  context=CrossContext(layers=(0,), length=64))
 
 
 @pytest.mark.parametrize("encoder", ["table", "backbone"])
 def test_a_decision_run_holds_its_backbone_frozen_beside_its_context_layers_by_default(tmp_path, encoder):
     """By default a run with context layers holds its backbone frozen and trains the layers' blocks alone,
-    its context read through the backbone's token table or its own frozen pass (`context_encoder`, row
+    its context read through the backbone's token table or its own frozen pass (`CrossContext.encoder`, row
     6119): a step moves the blocks and leaves the backbone, and the saved run loads back as a task answering
-    with its trained probabilities. Without context layers `--no-context-frozen` is refused."""
+    with its trained probabilities."""
     from dew.batch import FROZEN
     from dew.nn.cross_attention import crossing
 
-    run = dataclasses.replace(context_run(), context_encoder=encoder)
+    run = context_run()
+    assert run.context is not None
+    run = dataclasses.replace(run, context=dataclasses.replace(run.context, encoder=encoder))
     frozen = stepped_once(tmp_path / "frozen", run, reloaded=True)
     assert any(path.startswith(FROZEN) for path in frozen)
     assert not any(moved for path, moved in frozen.items() if path.startswith(FROZEN))
     assert any(moved for path, moved in frozen.items() if crossing(path))
-    with pytest.raises(ValueError):
-        dataclasses.replace(run, context_frozen=False, context_layers=None).prepare()
 
 
 @pytest.mark.parametrize("adapter", [None, "lora"])
 def test_a_decision_run_trains_its_backbone_whole_beside_its_context_layers_where_asked(tmp_path, adapter):
-    """`--no-context-frozen` trains the backbone whole beside the context layers' blocks, a full fine-tune,
+    """A context that freezes nothing (`CrossContext.frozen` off) trains the backbone whole beside the context
+    layers' blocks, a full fine-tune,
     its weights in one collection, a step moving the backbone too; with LoRA the adapter trains beside the
     blocks over its frozen base."""
     from dew.batch import FROZEN
@@ -871,7 +873,9 @@ def test_a_decision_run_trains_its_backbone_whole_beside_its_context_layers_wher
     from dew.nn.cross_attention import crossing
 
     lora = None if adapter is None else LoRA(rank=2, modules=("q_proj",))
-    run = dataclasses.replace(context_run(), context_frozen=False, lora=lora)
+    run = context_run()
+    assert run.context is not None
+    run = dataclasses.replace(run, context=dataclasses.replace(run.context, frozen=False), lora=lora)
     moved = stepped_once(tmp_path / "whole", run)
     if lora is None:
         assert not any(path.startswith(FROZEN) for path in moved)
@@ -921,11 +925,12 @@ def test_a_joint_run_refuses_a_cue_its_rows_cannot_render():
 
     default = Fitted(data=TICKETS)
     trainer = dataclasses.replace(default.trainer, multi_host=False, compilation_cache_dir=None)
-    run = dataclasses.replace(default, pretrained=str(QWEN), trainer=trainer, head=JointShape(), max_len=1024,
-                              segments=(Schema(), State()))
+    run = dataclasses.replace(default, pretrained=str(QWEN), trainer=trainer, head=JointShape(),
+                              rows=RowBudgets(max_len=1024, segments=(Schema(), State())))
     run.prepare()
     with pytest.raises(ValueError):
-        dataclasses.replace(run, segments=(Schema(), State(), AnswerCue())).prepare()
+        dataclasses.replace(run, rows=RowBudgets(max_len=1024, segments=(Schema(), State(), AnswerCue()))
+                            ).prepare()
 
 
 def test_a_backbone_reading_its_own_media_in_blocks_keeps_a_joint_layout():
@@ -939,7 +944,7 @@ def test_a_backbone_reading_its_own_media_in_blocks_keeps_a_joint_layout():
     trainer = dataclasses.replace(default.trainer, multi_host=False, compilation_cache_dir=None)
     run = dataclasses.replace(default, pretrained=str(Path(__file__).parent / "fixtures" / "hf" /
                                                        "gemma4-unified-native-tiny"),
-                              trainer=trainer, head=JointShape(), max_len=128)
+                              trainer=trainer, head=JointShape(), rows=RowBudgets(max_len=128))
     objective, _ = run.prepare().train("x")
     assert (isinstance(objective.layout, SegmentLayout) and objective.layout.joint)
 
@@ -1006,12 +1011,12 @@ def test_a_decision_runs_rows_its_head_or_source_cannot_hold_are_refused():
     plain = dataclasses.replace(default, pretrained=str(QWEN), trainer=trainer,
                                 source=SourceOptions(text_only=True))
     with pytest.raises(ValueError):
-        dataclasses.replace(plain, order="re_read", split="whole").prepare()
+        dataclasses.replace(plain, rows=RowBudgets(order="re_read", split="whole")).prepare()
     with pytest.raises(ValueError):
-        dataclasses.replace(plain, order="re_read", segments=(Instructions({"choice": "{}"}), OptionLines(),
-                                                              State(), AnswerCue())).prepare()
+        dataclasses.replace(plain, rows=RowBudgets(order="re_read", segments=(
+            Instructions({"choice": "{}"}), OptionLines(), State(), AnswerCue()))).prepare()
     with pytest.raises(ValueError):
-        dataclasses.replace(plain, order="re_read", framing=Framing()).prepare()
+        dataclasses.replace(plain, rows=RowBudgets(order="re_read", framing=Framing())).prepare()
 
 
 def test_a_lora_decision_runs_source_loads_onto_its_trainers_mesh():

@@ -30,8 +30,9 @@ from dew.config import DecoderRunConfig, MetricConfig, ObjectiveConfig, Prepared
 from dew.data.text import HFTokenizer, tokenizer_for
 from dew.objectives.drawn import WHOLE, drawn_once
 from dew.objectives.lm.objective import Samples
+from dew.objectives.rl.rollout import Reward
 from dew.optim import AdamW, OptimConfig
-from dew.registry import ModelConfig, objectives
+from dew.registry import ModelConfig, imported_argument, objectives
 from dew.sampling.text import Sampling
 
 if TYPE_CHECKING:
@@ -79,15 +80,16 @@ class PromptRollout:
     `max_new_tokens`, ramping over its last `overlong_cache` tokens (a quarter of it where None);
     `estimator` is then the method's.
 
-    `reward` names it by its import path: a function of a completion's text and its prompt's record
-    (`dew.objectives.rl.Reward`), or a class whose instance at its defaults is one
-    (`dew.rl.sandbox:MathReward`). A reward outside Dew is imported before the run loads, as any
-    class a run names is (`dew.registry.imported`).
+    `reward` is a function of a completion's text and its prompt's record (`dew.objectives.rl.Reward`), or
+    an instance of a class whose instances are (`dew.rl.sandbox.MathReward()`), a class given read as its
+    instance at its defaults; the command line names it by its import path (`--rollout.reward
+    dew.rl.sandbox:MathReward`). A reward outside Dew is imported before the run loads, as any class a run
+    names is (`dew.registry.imported`).
 
     `served`, where given, draws the completions ahead of the trainer from Dew's own server
     (`ServedRollout`, `--rollout.served.slots 8`) in place of each step's own generation."""
 
-    reward: str
+    reward: Annotated[Reward, imported_argument(Reward)]
     groups: int = 4
     max_new_tokens: int = 32
     estimator: str | None = None
@@ -103,8 +105,12 @@ class PromptRollout:
         from dew.objectives.rl.methods import method
         from dew.objectives.rl.sessions import check_estimator, check_truncation
 
-        if ":" not in self.reward:
-            raise ValueError(f"reward names a reward by its import path, `module:name`, not {self.reward!r}")
+        if isinstance(self.reward, type):
+            # A class names its instance at its defaults, the reward it calls (`MathReward`).
+            object.__setattr__(self, "reward", self.reward())
+        if not callable(self.reward):
+            raise ValueError("reward is a function of a completion and its prompt's record, not "
+                             f"{self.reward!r}")
         if type(self.groups) is not int or self.groups < 2:
             raise ValueError("groups is the completions drawn of each prompt, at least two for an advantage")
         if type(self.max_new_tokens) is not int or self.max_new_tokens < 1:
@@ -150,16 +156,13 @@ class PromptRollout:
 
         from dew.data.prompts import PromptRecord
         from dew.objectives.rl import RolloutScheduler
-        from dew.registry import imported
 
-        # An import path names a function or a class, which an instance of at its defaults is a reward.
-        named = imported(self.reward)
-        scorer = named() if isinstance(named, type) else named
+        scorer = self.reward
 
         def reward(text: str, record: PromptRecord) -> float:
             score = scorer(text, record)
             if not isinstance(score, Real):
-                raise ValueError(f"the reward {self.reward} scored {type(score).__name__}, not a number")
+                raise ValueError(f"the reward {scorer!r} scored {type(score).__name__}, not a number")
             return float(score)
         settings: PromptSettings = {"decode": decode, "groups": self.groups,
                                     "max_new_tokens": self.max_new_tokens, "truncation": self.truncation,

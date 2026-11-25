@@ -214,12 +214,12 @@ def test_a_run_names_its_schema_read_in_context_on_the_command_line():
     from dew.registry import to_record
 
     segments = (Text("STATE:\n"), State(), Schema(stream="context"), Text("\n"))
-    config = DecisionRunConfig.cli(["--pretrained", str(LLAMA), "--segments",
+    config = DecisionRunConfig.cli(["--pretrained", str(LLAMA), "--rows.segments",
                                     json.dumps(to_record(segments, tuple[Segment, ...])),
-                                    "--context-layers", "0", "1"])
-    assert config.segments == segments
+                                    "context:cross-context", "--context.layers", "0", "1"])
+    assert config.rows.segments == segments
     with pytest.raises(ValueError):
-        dataclasses.replace(config, context_layers=None).prepare()
+        dataclasses.replace(config, context=None).prepare()
 
 
 @attending("reference")

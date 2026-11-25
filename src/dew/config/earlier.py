@@ -34,7 +34,9 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     `dynamic_scale` as it trained under it; a Muon run's Newton-Schulz precision as a dot algorithm
     (`earlier_newton_schulz`); a profile window's capture options as its capture's (`earlier_profile`); a
     decision run's option text as its rows wrote it (`earlier_option_text`), and the fewest options its
-    rows drew "none of the above" on as they drew it (`earlier_none_of_the_above`); a world model's
+    rows drew "none of the above" on as they drew it (`earlier_none_of_the_above`), and its rows' budgets
+    and context layers as the records that hold them (`earlier_decision_rows`, row 11937); an LM run's
+    rollout's reward named by its import path as that path's record (`earlier_reward`); a world model's
     tokenizer's and its dynamics model's positions as they learned them (`earlier_tokenizer_positions`,
     `earlier_dynamics_positions`); a trainer layout recorded at `Layout()`'s defaults as unset
     (`earlier_trainer_layout`); its data plan version
@@ -61,6 +63,9 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     earlier = earlier_none_of_the_above(earlier_profile(earlier_trainer(
         moved if unsettable else earlier_trainer_layout(moved))))
     earlier = earlier_option_text(earlier_dynamics_positions(earlier_tokenizer_positions(earlier)))
+    # A decision run's budgets and context layers by the records they are held in now, and an LM run's
+    # reward by the record of what its import path names (row 11937).
+    earlier = earlier_reward(earlier_decision_rows(earlier))
     earlier = earlier_newton_schulz(earlier_retired(earlier_packed_experts(earlier), additive_unset=additive))
     # Its optimizer's and trainer's settings by the names a run's surface gives them now (`earlier_surface`).
     earlier = earlier_surface(earlier)
@@ -1016,3 +1021,65 @@ def _earlier_loop(fields: Mapping[str, JSON]) -> dict[str, JSON]:
     elif fields.get("loop_steps") is not None:
         kept["passes"] = fields["loop_steps"]
     return kept
+
+
+EARLIER_ROW_FIELDS = ("max_len", "head_max_len", "option_tokens", "max_state_tokens", "segments", "reads",
+                      "parallel", "shared_state", "siblings", "unit", "order", "split", "framing")
+"""A decision run's flat budgets of its rows' layout an earlier Dew recorded, read as its `rows`
+(`dew.decision.config.RowBudgets`, row 11937)."""
+
+EARLIER_CONTEXT_FIELDS = {"context_layers": "layers", "context_frozen": "frozen", "context_length": "length",
+                          "context_encoder": "encoder", "context_text": "text", "context_form": "form"}
+"""A decision run's flat fields of the layers that read its context an earlier Dew recorded, by the name
+each has in its `context` (`dew.decision.config.CrossContext`, row 11937)."""
+
+
+def earlier_decision_rows(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A saved decision run's record that states its rows' budgets and its context layers flat
+    (`EARLIER_ROW_FIELDS`, `EARLIER_CONTEXT_FIELDS`): its budgets as its `rows`, and its context layers'
+    fields as its `context`, none where it read no context (`context_layers` None, its other context
+    fields then its defaults, which it refused stated). Carried to 1.0 (ledger 1552)."""
+    named = registry.class_record(record)
+    if named is None or named[0] not in registry.runs or not any(
+            key in named[1] for key in (*EARLIER_ROW_FIELDS, *EARLIER_CONTEXT_FIELDS)):
+        return record
+    # A run of a class that holds its budgets and context layers so (a decision run), no other run's
+    # fields of those names.
+    run_class = registry.runs[named[0]]
+    held = ({field.name for field in dataclasses.fields(run_class)}
+            if isinstance(run_class, type) and dataclasses.is_dataclass(run_class) else set())
+    if not {"rows", "context"} <= held:
+        return record
+    fields = {key: value for key, value in named[1].items()
+              if key not in EARLIER_ROW_FIELDS and key not in EARLIER_CONTEXT_FIELDS}
+    rows = {key: named[1][key] for key in EARLIER_ROW_FIELDS if key in named[1]}
+    if rows:
+        fields["rows"] = rows
+    if named[1].get("context_layers") is not None:
+        fields["context"] = {renamed: named[1][key] for key, renamed in EARLIER_CONTEXT_FIELDS.items()
+                             if key in named[1]}
+    return {**record, "fields": fields}
+
+
+def earlier_reward(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A saved LM run's record whose GRPO rollout named its reward by its import path, a string
+    (`PromptRollout.reward` before row 11937): the record of what the path names, `{"function": path}`,
+    which reads as the function it names, or as the class, the rollout's reward its instance at its
+    defaults, as the path read before. Carried to 1.0 (ledger 1552)."""
+    from dew.config.lm import LMRunConfig
+
+    named = registry.class_record(record)
+    if named is None or named[0] not in registry.runs:
+        return record
+    run_class = registry.runs[named[0]]
+    rollout = named[1].get("rollout")
+    if not (isinstance(run_class, type) and issubclass(run_class, LMRunConfig)
+            and isinstance(rollout, Mapping)):
+        return record
+    classed = "class" in rollout and isinstance(rollout.get("fields"), Mapping)
+    held = rollout["fields"] if classed else rollout
+    if not (isinstance(held, Mapping) and isinstance(held.get("reward"), str)):
+        return record
+    restated = {**held, "reward": {"function": held["reward"]}}
+    rollout = {**rollout, "fields": restated} if classed else restated
+    return {**record, "fields": {**named[1], "rollout": rollout}}
