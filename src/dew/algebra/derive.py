@@ -61,6 +61,7 @@ from egglog.bindings import EggSmolError
 from dew import _cache
 from dew._cache import ALGEBRA, unintercepted
 from dew.algebra import cost, derive_moments, extract, program, rules, terms
+from dew.algebra.cost import Work
 from dew.algebra.derive_moments import (
     MOMENT_SSA,
     anchor_slot,
@@ -77,7 +78,6 @@ from dew.algebra.derive_moments import (
     unit_array,
     unreduced,
 )
-from dew.algebra.cost import Work
 from dew.algebra.forms import Accumulated, Added, Derived, Merged, Refused, evaluated, evaluator, inlined
 from dew.algebra.terms import Term
 from dew.nn.kernels import generation

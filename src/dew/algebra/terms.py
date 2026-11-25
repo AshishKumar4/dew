@@ -1710,8 +1710,7 @@ def _aligned_explicit(*operands: jax.Array) -> tuple[jax.Array, ...]:
     any replicated operand (`explicit_spec is None`) onto the explicit placement shared by split siblings of
     the same shape, which JAX's `select_n` requires under `AxisType.Explicit`."""
     from dew.nn.sharding import explicit_spec
-
-    aligned = jax_core.auto_insert_reshard(*operands)
+    aligned = tuple(jax_core.auto_insert_reshard(*operands))
     specs = [explicit_spec(operand) if isinstance(operand, jax.Array) else None for operand in aligned]
     found = next(((spec, operand.shape) for operand, spec in zip(aligned, specs, strict=True)
                   if spec is not None), None)
