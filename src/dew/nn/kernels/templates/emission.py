@@ -1275,7 +1275,9 @@ def _laid_reduction(layout: fragments.TiledLayout, value, axes: Sequence[int], t
 
     if spread(reduced.warp_dims) > spread(layout.warp_dims):
         return None
-    every_lane = all(isinstance(dim, fragments.Replicated) for dim in reduced.lane_dims)
+    # As the lowering decides: every lane dimension one the reduction collapses (`all_lanes`).
+    every_lane = all(isinstance(target, fragments.Replicated) and not isinstance(source, fragments.Replicated)
+                     for source, target in zip(layout.lane_dims, reduced.lane_dims, strict=True))
     if every_lane and _redux(primitive, value.dtype):
         return None
     rounds = int(math.log2(spread(reduced.lane_dims) // spread(layout.lane_dims)))
