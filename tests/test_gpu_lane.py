@@ -541,11 +541,14 @@ def test_a_kept_prepare_rows_token_keeps_its_group_and_a_slow_prepare_is_cut_by_
                                                            for group, seconds in rows.items()}},
                                     120.0, "off", {})
         return [entry["split"] for entry in found if entry["tests"] == f"prepare:{name}"]
-    # Timed at two cuts: the two groups' 400 s, two groups of the 260 s cap; the whole file's older 1,583 s,
-    # which ran out of its time, doubles nothing.
-    assert planned({"": 1583.0, "1/2": 200.0, "2/2": 200.0}) == ["1/2@prepare-sm90", "2/2@prepare-sm90"]
-    # Two groups past the cap: 6,332 s of work at least, twenty-five groups of six tests' record.
+    # Timed at two cuts: the two groups' 400 s, each past CUT_SHORT of the 260 s cap, so 800 s of work at
+    # least, four groups; the whole file's older 1,583 s, an older cut's, counts nothing.
+    assert planned({"": 1583.0, "1/2": 200.0, "2/2": 200.0}) == [f"{index}/4@prepare-sm90"
+                                                                 for index in range(1, 5)]
+    # Two groups past the cap: 6,332 s of work at least, twenty-five groups of six tests' record; two well
+    # within it, one group.
     assert len(planned({"1/2": 1583.0, "2/2": 1583.0})) == 25
+    assert planned({"1/2": 100.0, "2/2": 100.0}) == ["@prepare-sm90"]
     assert planned({}) == [f"{index}/6@prepare-sm90" for index in range(1, 7)]
     text = ("import pytest\n@pytest.mark.gpu\ndef test_a(): pass\ndef test_cpu(): pass\n"
             "@pytest.mark.gpu(reason='x')\nclass TestB:\n"

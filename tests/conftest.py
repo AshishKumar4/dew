@@ -689,7 +689,7 @@ def cache_worker():
             if not self._authorized():
                 return
             if any(part in self.path for part in seen.refusing):
-                self._answer(503)
+                self._answer(503, close=True)
                 return
             if not bounds["min_bytes"] <= int(self.headers["Content-Length"]) <= bounds["max_bytes"]:
                 self._answer(413, close=True)
