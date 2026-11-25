@@ -60,6 +60,8 @@ class CrossPass:
     rank: int = 64
     additive: bool = True
     normalize_values: bool = True
+    scaled: bool = False
+    """Each message score over the root of the width (Inkling 2's, `AttentionResiduals.scaled`)."""
     scale_by_input_rms: bool = True
     normalize_message: bool = True
     norm_eps: float | None = None
@@ -98,7 +100,8 @@ class CrossPassMerge(nn.Module):
     def setup(self):
         width, rank = self.emb_features, self.spec.rank
         self.depth = DepthAttention(width, norm_eps=self.norm_eps,
-                                    normalize_values=self.spec.normalize_values, name='depth')
+                                    normalize_values=self.spec.normalize_values, scaled=self.spec.scaled,
+                                    name='depth')
         down = declared(nn.initializers.normal(1 / math.sqrt(2 * width)), ('embed', None))
         up = declared(nn.initializers.zeros, (None, 'embed'))
         self.input_down = self.param('input_down', down, (width, rank), jnp.float32)
@@ -153,7 +156,7 @@ def merged_sites(merges: Sequence[CrossPassMerge], read: jax.Array | tuple[jax.A
         queries = jnp.stack([scale.astype(wide) * kernel[:, 0].astype(wide)
                              for scale, kernel, *_ in parameters], axis=1)
         mixed = depth_read(bank.astype(reads[0].dtype), queries, norm_eps=depth.norm_eps,
-                           normalize_values=depth.normalize_values)
+                           normalize_values=depth.normalize_values, scaled=depth.scaled)
         return tuple(_merged(each, mixed[:, :, site], controller, spec, eps)
                      for site, (each, (_, _, *controller)) in enumerate(zip(reads, parameters, strict=True)))
     parameters = tuple((merge.depth.scale, merge.depth.kernel, *merge.controller()) for merge in merges)

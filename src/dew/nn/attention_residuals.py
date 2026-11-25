@@ -42,10 +42,12 @@ from .precision import at_least_fp32, computed_einsum
 class AttentionResiduals:
     """The block size the depth softmax groups layers by, `attn_res_block_size`, and whether each depth
     mixture sums its sources as its keys read them, each at unit RMS (`normalize_values`, Inkling 2
-    Mini's `attn_res_normalize_values`; Kimi K3's mix them as they are)."""
+    Mini's `attn_res_normalize_values`; Kimi K3's mix them as they are), and whether its scores are each
+    query's dot product over the root of the width (`scaled`, Inkling 2's; Kimi K3's are the products)."""
 
     block_size: int
     normalize_values: bool = False
+    scaled: bool = False
 
     def blocks(self, num_layers: int) -> int:
         """The finished blocks after `num_layers` layers: every layer opening one counts."""
@@ -54,7 +56,7 @@ class AttentionResiduals:
     def site(self, index: int) -> ResidualSite:
         """Layer `index`'s place in the blocks."""
         return ResidualSite(finished=-(-index // self.block_size), opens=index % self.block_size == 0,
-                            normalize_values=self.normalize_values)
+                            normalize_values=self.normalize_values, scaled=self.scaled)
 
 
 NORMALIZED_UNWRITTEN = ("the source's format mixes its attention residuals' values as they are, and this "
@@ -70,12 +72,13 @@ class ResidualSite:
     `finished` counts the blocks done before the layer runs, which its
     attention input mixes with the partial sum; `opens` makes the layer
     close the partial it received into block `finished` and restart it;
-    `normalize_values` is its mixtures' (`AttentionResiduals.normalize_values`).
+    `normalize_values` and `scaled` are its mixtures' (`AttentionResiduals`).
     """
 
     finished: int
     opens: bool
     normalize_values: bool = False
+    scaled: bool = False
 
 
 def sources(state, finished: int, partial):
@@ -97,6 +100,7 @@ class DepthAttention(nn.Module):
     emb_features: int
     norm_eps: float = 1e-5
     normalize_values: bool = False
+    scaled: bool = False
 
     def setup(self):
         self.scale = self.param('scale', nn.initializers.ones, (self.emb_features,), jnp.float32)
@@ -120,38 +124,46 @@ class DepthAttention(nn.Module):
         # or a caller watches runs as it is (`watched_or_owned`).
         if watched_or_owned(self):
             return depth_attended(values, self.scale, self.kernel, norm_eps=self.norm_eps,
-                                  normalize_values=self.normalize_values)
+                                  normalize_values=self.normalize_values, scaled=self.scaled)
 
         def attended(values, parameters):
             return depth_attended(values, *parameters, norm_eps=self.norm_eps,
-                                  normalize_values=self.normalize_values)
+                                  normalize_values=self.normalize_values, scaled=self.scaled)
         return portable_formed(attended)(values, (self.scale, self.kernel))
 
 
 def depth_attended(values: jax.Array, scale: jax.Array, kernel: jax.Array, *, norm_eps: float,
-                   normalize_values: bool) -> jax.Array:
+                   normalize_values: bool, scaled: bool = False) -> jax.Array:
     """`DepthAttention`'s mixture of `values` `[B, S, n, D]` by its query's `scale` `[D]` and `kernel`
     `[D, 1]`, in `values`' dtype (`depth_read`'s of one query)."""
     query = scale.astype(at_least_fp32(values.dtype)) * kernel[:, 0].astype(at_least_fp32(values.dtype))
-    return depth_read(values, query[:, None], norm_eps=norm_eps, normalize_values=normalize_values)[:, :, 0]
+    return depth_read(values, query[:, None], norm_eps=norm_eps, normalize_values=normalize_values,
+                      scaled=scaled)[:, :, 0]
 
 
 def depth_read(values: jax.Array, queries: jax.Array, *, norm_eps: float,
-               normalize_values: bool) -> jax.Array:
+               normalize_values: bool, scaled: bool = False) -> jax.Array:
     """`values` `[B, S, n, D]` mixed over their `n` sources by each of `queries` `[D, q]` (each a
     `DepthAttention`'s pseudo-query, `scale * kernel`), `[B, S, q, D]` in `values`' dtype: the sources read
     and normalized once for every query (keys at unit RMS, their statistics in fp32), each query's softmax
     over the sources in fp32, and both contractions in `values`' compute dtype under the run's precision
     (`dew.nn.precision.computed_einsum`: a bf16 run's Tensor Cores, `ACCURATE`'s exact float32; row 12918).
-    With `normalize_values` the mixture sums the sources as their keys read them."""
+    With `normalize_values` the mixture sums the sources as their keys read them; with `scaled` each score
+    is over the root of the width."""
     keys = unweighted_rmsnorm(values, norm_eps, implementation='xla')
-    return depth_mixed(keys, queries, keys if normalize_values else values).astype(values.dtype)
+    mixed = depth_mixed(keys, queries, keys if normalize_values else values, scaled=scaled)
+    return mixed.astype(values.dtype)
 
 
-def depth_mixed(keys: jax.Array, queries: jax.Array, values: jax.Array) -> jax.Array:
+def depth_mixed(keys: jax.Array, queries: jax.Array, values: jax.Array, *, scaled: bool = False) -> jax.Array:
     """`values` `[B, S, n, D]` summed over their `n` sources by the softmax over the sources of `keys`
     (alike) against each of `queries` `[D, q]`, `[B, S, q, D]` in at least fp32: the scores and the sum
-    `computed_einsum`'s, in the sources' compute dtype under the run's precision."""
+    `computed_einsum`'s, in the sources' compute dtype under the run's precision, each score over the root
+    of the width `D` in at least fp32 where `scaled`, before its softmax."""
     compute = values.dtype
-    weights = jax.nn.softmax(computed_einsum('bsnd,dq->bsnq', keys, queries, dtype=compute), axis=2)
+    scores = computed_einsum('bsnd,dq->bsnq', keys, queries, dtype=compute)
+    if scaled:
+        wide = at_least_fp32(scores.dtype)
+        scores = scores.astype(wide) * jnp.asarray(keys.shape[-1] ** -0.5, wide)
+    weights = jax.nn.softmax(scores, axis=2)
     return computed_einsum('bsnq,bsnd->bsqd', weights, values, dtype=compute)

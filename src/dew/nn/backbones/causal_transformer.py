@@ -838,6 +838,7 @@ class CausalTransformer(LinearProducts):
         if self.attention_residuals is not None:
             self.output_res = DepthAttention(emb_features=self.emb_features, norm_eps=self.norm_eps,
                                              normalize_values=self.attention_residuals.normalize_values,
+                                             scaled=self.attention_residuals.scaled,
                                              name='output_res')
         if self.engram is not None:
             self.engram_hashes = EngramHashes(spec=self.engram, vocab_size=self.vocab_size,
