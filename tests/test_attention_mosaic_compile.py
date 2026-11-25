@@ -38,6 +38,7 @@ from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
     attention as template,
     attention_mosaic,
+    attention_mosaic_derivation,
     attention_mosaic_program,
     attention_mosaic_registers,
     attention_route,
@@ -607,8 +608,8 @@ def test_a_short_training_calls_backward_compiles_spill_free_for_an_a100(tokens,
     """A bf16 training step's template attention over fewer tokens than a role's 64 rows, four query heads
     over two 32 wide, its backward one launch or, under --xla_gpu_deterministic_ops, two, lowered and
     compiled by ptxas for an A100 on this CPU, within its shared memory and spilling nothing: a backward's
-    tiles hold a role's rows of keys however few the call's (`attention_mosaic._role_rows`), where a
-    forward's few-query tile (`query_rows`) under 64 query rows lowered in neither launch ("Cannot cast to
+    tiles hold a role's rows of keys however few the call's (`attention_mosaic_derivation._role_rows`), where
+    a forward's few-query tile (`query_rows`) under 64 query rows lowered in neither launch ("Cannot cast to
     layout" of 16 key rows to a consumer's 64; at 32 the one launch's "cannot relayout"; row 5326)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
@@ -1582,8 +1583,9 @@ def test_derived_one_consumer_heights_are_compared_by_choose():
     def fits(cfg):
         return (cfg.block_q == 128 and cfg.block_k == 32) or (cfg.block_q == 64 and cfg.block_k == 64)
 
-    picked = attention_mosaic._derived(family, jnp.bfloat16, 512, 512, tiles, fits, overlapped=True,
-                                       walks=program.walked_extents, choose=choose)
+    derive = attention_mosaic_derivation._derived
+    picked = derive(family, jnp.bfloat16, 512, 512, tiles, fits, overlapped=True,
+                    walks=program.walked_extents, choose=choose)
     assert picked is not None and (picked.block_q, picked.block_k) == (64, 64), (picked, seen)
     assert any({(c.block_q, c.block_k) for c in group} >= {(128, 32), (64, 64)} for group in seen), seen
 

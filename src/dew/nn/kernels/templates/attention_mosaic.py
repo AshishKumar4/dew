@@ -751,8 +751,10 @@ class MosaicForward(_Mainloop[Tiles]):
         """Price `config`'s main launch on `target` (`cost.launch_seconds` over `emission.work_of`), traced
         through `tuning.lowered_once` under `report.launching`. As its hookless call (its hooks, their
         parameters and their kinds none), so a launch keyed by its hooks' fingerprints (`KernelOp.keyed`,
-        which traces none) prices, and chooses, as its live call does: a hook's work is its every candidate's
-        alike, entry for entry, which its choice among them reads past."""
+        which traces none) prices, and chooses, as its live call does. A heuristic proxy of the live call's
+        price, not that price less a common cost: a score hook's work scales with each candidate's entries
+        alike, but its absence can change the surrogate's own schedule (an output hook's rewalk in place, a
+        transcendental hook's approximate math)."""
         hooks = ("score_params", "output_params", "query_params")
         names = ("query", "key", "value", "start", "end", "query_ids", "key_ids", "score_params",
                  "output_params", "initial", "drop", "table", "sources", "scales", "query_params")
