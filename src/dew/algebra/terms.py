@@ -702,6 +702,25 @@ def _body_key_of(jaxpr: jcore.Jaxpr) -> _SubKey | None:
     return made
 
 
+def _dataclass_param_key(value, kind: type, *, reject_device: bool) -> Hashable:
+    """In-process structural key for a dataclass instance preserving exact class identity and guarding
+    non-field attributes (so factory-made callable dataclasses with identical qualnames never collide)."""
+    fields = dataclasses.fields(value)
+    field_names = {field.name for field in fields}
+    extra_dict = hasattr(value, "__dict__") and not set(value.__dict__).issubset(field_names)
+    extra_slots = any(
+        not set((slots,) if isinstance(slots, str) else slots).issubset(
+            field_names | {"__dict__", "__weakref__"})
+        for cls in kind.__mro__ if (slots := cls.__dict__.get("__slots__")) is not None)
+    if extra_dict or extra_slots:
+        if reject_device:
+            raise _Unshareable
+        return "object", _named(kind), _Identity(value)
+    return "record", ("object", "class", kind), tuple(
+        (field.name, _in_process_param_key(getattr(value, field.name), reject_device=reject_device))
+        for field in fields)
+
+
 def _in_process_param_key(value, *, reject_device: bool) -> Hashable:
     """In-process structural key for an equation parameter preserving executable callable, primitive, and
     extended-dtype identities while never copying `jax.Array` device buffers to host."""
@@ -737,9 +756,7 @@ def _in_process_param_key(value, *, reject_device: bool) -> Hashable:
     if isinstance(value, types.FunctionType):
         return "object", _named(kind), value
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return "record", _named(kind), tuple(
-            (field.name, _in_process_param_key(getattr(value, field.name), reject_device=reject_device))
-            for field in dataclasses.fields(value))
+        return _dataclass_param_key(value, kind, reject_device=reject_device)
     if isinstance(value, (tuple, list)):
         return "sequence", _named(kind), tuple(
             _in_process_param_key(part, reject_device=reject_device) for part in value)
@@ -1216,6 +1233,9 @@ class _NormTrack:
         def move(kept: tuple[int | None, ...]) -> tuple[int | None, ...] | None:
             if prim is jax.lax.broadcast_in_dim_p:
                 return _broadcast_kept(kept, in_shape, out_shape, equation.params["broadcast_dimensions"])
+            dims = equation.params.get("dimensions")
+            if dims is not None and tuple(dims) != tuple(range(len(in_shape))):
+                return None
             return _reshape_kept(kept, in_shape, out_shape)
 
         if (entry := self.sq_sum.get(src)) is not None and (moved := move(entry[1])) is not None:
@@ -1226,13 +1246,15 @@ class _NormTrack:
             self.pos_norm[out] = (entry[0], moved)
 
     def _unit_check(self, scaled: jcore.Var | jcore.Literal, divisor: jcore.Var | jcore.Literal,
-                    table: Mapping[jcore.Var, tuple[jcore.Var, tuple[int | None, ...]]]) -> bool:
+                    table: Mapping[jcore.Var, tuple[jcore.Var, tuple[int | None, ...]]]) -> tuple[bool, bool]:
         if not (isinstance(scaled, jcore.Var) and isinstance(divisor, jcore.Var)):
-            return False
+            return False, False
         if (entry := table.get(divisor)) is None:
-            return False
+            return False, False
         src, kept = entry
-        return self._canon(scaled) is src and _aligned_unit_axes(kept, len(_shape(scaled)))
+        if self._canon(scaled) is not src or not _aligned_unit_axes(kept, len(_shape(scaled))):
+            return False, False
+        return True, bool(kept) and kept[-1] is None
 
     def _step_cast(self, src: jcore.Var, out: jcore.Var) -> None:
         if not _lossless_float_cast(src, out):
@@ -1289,34 +1311,41 @@ class _NormTrack:
             if (entry := self.sq_sum.get(invars[0])) is not None and entry[2]:
                 (self.inv_norm if prim is jax.lax.rsqrt_p else self.pos_norm)[out] = (entry[0], entry[1])
             return None
-        if prim is jax.lax.mul_p and len(invars) == 2 and (
-                self._unit_check(invars[0], invars[1], self.inv_norm)
-                or self._unit_check(invars[1], invars[0], self.inv_norm)):
-            return UNIT + 1, _held_apart(Apart(None, 0, number=True, finite=True), out_aval.dtype)
-        if prim is jax.lax.div_p and len(invars) == 2 and self._unit_check(
-                invars[0], invars[1], self.pos_norm):
-            return UNIT + 1, _held_apart(Apart(None, 0, number=True, finite=True), out_aval.dtype)
+        if prim is jax.lax.mul_p and len(invars) == 2:
+            hit0, last0 = self._unit_check(invars[0], invars[1], self.inv_norm)
+            hit1, last1 = (False, False) if hit0 else self._unit_check(invars[1], invars[0], self.inv_norm)
+            if hit0 or hit1:
+                return UNIT + 1, _held_apart(
+                    Apart(None, 0, number=True, finite=True, unit_norm=last0 or last1), out_aval.dtype)
+        if prim is jax.lax.div_p and len(invars) == 2:
+            hit, last = self._unit_check(invars[0], invars[1], self.pos_norm)
+            if hit:
+                return UNIT + 1, _held_apart(
+                    Apart(None, 0, number=True, finite=True, unit_norm=last), out_aval.dtype)
         return None
 
     def child(self, outer_invars: Sequence, inner_invars: Sequence[jcore.Var]) -> _NormTrack:
         """Map tracked norm entries into a peeled call body when both source and sum enter the call."""
+        pairs = [(o, i) for o, i in zip(outer_invars, inner_invars, strict=True) if isinstance(o, jcore.Var)]
         by_origin: dict[jcore.Var, jcore.Var] = {}
-        for outer, inner in zip(outer_invars, inner_invars, strict=True):
-            if isinstance(outer, jcore.Var):
-                by_origin.setdefault(self._canon(outer), inner)
-        sub_sq = {inner: (by_origin[entry[0]], entry[1], entry[2])
-                  for outer, inner in zip(outer_invars, inner_invars, strict=True)
-                  if isinstance(outer, jcore.Var) and (entry := self.sq_sum.get(outer)) is not None
-                  and entry[0] in by_origin}
-        sub_inv = {inner: (by_origin[entry[0]], entry[1])
-                   for outer, inner in zip(outer_invars, inner_invars, strict=True)
-                   if isinstance(outer, jcore.Var) and (entry := self.inv_norm.get(outer)) is not None
-                   and entry[0] in by_origin}
-        sub_pos = {inner: (by_origin[entry[0]], entry[1])
-                   for outer, inner in zip(outer_invars, inner_invars, strict=True)
-                   if isinstance(outer, jcore.Var) and (entry := self.pos_norm.get(outer)) is not None
-                   and entry[0] in by_origin}
-        return _NormTrack(sub_sq, sub_inv, sub_pos)
+        for outer, inner in pairs:
+            by_origin.setdefault(self._canon(outer), inner)
+
+        def remap(table: Mapping) -> dict:
+            return {inner: (by_origin[e[0]], *e[1:]) for outer, inner in pairs
+                    if (e := table.get(outer)) is not None and e[0] in by_origin}
+
+        return _NormTrack(remap(self.sq_sum), remap(self.inv_norm), remap(self.pos_norm))
+
+
+def _same_atom(a, b) -> bool:
+    """Literal-safe identity/value match between two Jaxpr atoms (JAX 0.12 `Literal` is unhashable)."""
+    if a is b:
+        return True
+    if isinstance(a, jcore.Literal) and isinstance(b, jcore.Literal):
+        ha, hb = _host_array(a.val), _host_array(b.val)
+        return ha is not None and hb is not None and ha.dtype == hb.dtype and bool(np.array_equal(ha, hb))
+    return False
 
 
 def _nan_guard_apart(equation: jcore.JaxprEqn, made_eq: Mapping[jcore.Var, jcore.JaxprEqn],
@@ -1328,25 +1357,25 @@ def _nan_guard_apart(equation: jcore.JaxprEqn, made_eq: Mapping[jcore.Var, jcore
     if equation.primitive is not jax.lax.select_n_p or len(equation.invars) != 3:
         return None
     pred, false_val, true_val = equation.invars
-    if not isinstance(pred, jcore.Var) or (pred_eq := made_eq.get(pred)) is None:
-        return None
-    if pred_eq.primitive is not jax.lax.ne_p or pred_eq.invars[0] is not pred_eq.invars[1]:
+    pred_eq = made_eq.get(pred) if isinstance(pred, jcore.Var) else None
+    if pred_eq is None or pred_eq.primitive is not jax.lax.ne_p or pred_eq.invars[0] is not pred_eq.invars[1]:
         return None
     diff = pred_eq.invars[0]
-    if not isinstance(diff, jcore.Var) or (diff_eq := made_eq.get(diff)) is None:
-        return None
-    if diff_eq.primitive is not jax.lax.sub_p:
+    diff_eq = made_eq.get(diff) if isinstance(diff, jcore.Var) else None
+    if diff_eq is None or diff_eq.primitive is not jax.lax.sub_p:
         return None
     left, right = diff_eq.invars
-    bounded_finite = ((apart_of(left).finite and magnitude_of(left) is not None)
-                      or (apart_of(right).finite and magnitude_of(right) is not None))
-    if not bounded_finite:
+    if not ((apart_of(left).finite and magnitude_of(left) is not None)
+            or (apart_of(right).finite and magnitude_of(right) is not None)):
         return None
-    if true_val is left or true_val is right:
+    if _same_atom(true_val, left) or _same_atom(true_val, right):
         return apart_of(false_val)
-    if (isinstance(true_val, jcore.Var) and (true_eq := made_eq.get(true_val)) is not None
-            and true_eq.primitive is jax.lax.add_p and set(true_eq.invars) == {left, right}):
-        return apart_of(false_val)
+    true_eq = made_eq.get(true_val) if isinstance(true_val, jcore.Var) else None
+    if true_eq is not None and true_eq.primitive is jax.lax.add_p and len(true_eq.invars) == 2:
+        a0, a1 = true_eq.invars
+        if ((_same_atom(a0, left) and _same_atom(a1, right))
+                or (_same_atom(a0, right) and _same_atom(a1, left))):
+            return apart_of(false_val)
     return None
 
 
@@ -1359,9 +1388,9 @@ def _shared_sign(operands: Sequence[Apart], bounds: Sequence[Magnitude | None]) 
     return 0
 
 
-def _concat_facts(operands: Sequence[Apart], bounds: Sequence[Magnitude | None],
-                  dtype) -> tuple[Magnitude | None, Apart]:
-    """Intersect sign, floor, finiteness, and magnitude bounds across every operand of `concatenate_p`."""
+def _concat_facts(operands: Sequence[Apart], bounds: Sequence[Magnitude | None], dtype,
+                  *, keep_unit: bool = False) -> tuple[Magnitude | None, Apart]:
+    """Intersect sign, floor, finiteness, unit-norm, and magnitude bounds across `concatenate_p` operands."""
     if not operands:
         return None, NOWHERE
     sign = _shared_sign(operands, bounds)
@@ -1371,7 +1400,8 @@ def _concat_facts(operands: Sequence[Apart], bounds: Sequence[Magnitude | None],
     bound = max(known_bounds) if len(known_bounds) == len(bounds) else None
     finite = all(h.finite for h in operands) and (
         not jnp.issubdtype(dtype, jnp.floating) or _within(bound, dtype))
-    proved = _held_apart(Apart(floor, sign, all(h.number for h in operands), finite), dtype)
+    unit = keep_unit and all(h.unit_norm for h in operands)
+    proved = _held_apart(Apart(floor, sign, all(h.number for h in operands), finite, unit_norm=unit), dtype)
     return (bound if proved.finite else None), proved
 
 
@@ -1383,6 +1413,11 @@ def _deep_refine(equation: jcore.JaxprEqn, bound: Magnitude | None, proved: Apar
     out = equation.outvars[0]
     if (unit := norm_track.step(equation, apart_of)) is not None:
         bound, proved = unit
+    if (equation.primitive is jax.lax.convert_element_type_p and proved.finite
+            and apart_of(equation.invars[0]).unit_norm
+            and isinstance(out.aval, ShapedArray) and jnp.issubdtype(out.aval.dtype, jnp.floating)
+            and jnp.dtype(out.aval.dtype).itemsize >= 2):
+        proved = proved._replace(unit_norm=True)
     if equation.primitive is jax.lax.select_n_p:
         guarded = _nan_guard_apart(equation, made_eq, magnitude_of, apart_of)
         if guarded is not None:
@@ -1408,9 +1443,10 @@ def _deep_nonlang(equation: jcore.JaxprEqn, held: dict[jcore.Var, Magnitude | No
     if (prim is jax.lax.concatenate_p and len(equation.outvars) == 1
             and isinstance(out_aval := equation.outvars[0].aval, ShapedArray)):
         out = equation.outvars[0]
+        keep_unit = out_aval.ndim > 0 and equation.params.get("dimension") != out_aval.ndim - 1
         held[out], apart[out] = _concat_facts(
             [apart_of(atom) for atom in equation.invars],
-            [magnitude_of(atom) for atom in equation.invars], out_aval.dtype)
+            [magnitude_of(atom) for atom in equation.invars], out_aval.dtype, keep_unit=keep_unit)
         return True
     if (depth < 6 and (body := programs.called(equation)) is not None
             and len(body.consts) == len(body.constvars)):
@@ -1548,6 +1584,7 @@ class Apart(NamedTuple):
     sign: int = 0
     number: bool = False
     finite: bool = False
+    unit_norm: bool = False
 
     @property
     def above(self) -> int | None:
@@ -1596,9 +1633,11 @@ def _held_apart(apart: Apart, dtype) -> Apart:
     if not apart.number:
         return NOWHERE
     floats = jnp.finfo(dtype)
-    if apart.floor is not None and not int(floats.minexp) <= apart.floor < int(floats.maxexp):
-        return apart._replace(floor=None)
-    return apart
+    unit = apart.unit_norm and jnp.dtype(dtype).itemsize >= 2
+    floor = (apart.floor if apart.floor is not None and int(floats.minexp) <= apart.floor < int(floats.maxexp)
+             else None)
+    return apart if (floor == apart.floor and unit == apart.unit_norm) else apart._replace(
+        floor=floor, unit_norm=unit)
 
 
 def _constant_apart(value) -> Apart:
@@ -1815,9 +1854,9 @@ def _float_apart(equation: jcore.JaxprEqn, operands: list[Apart], bounds: list[M
         if name.startswith("reduce_") and _reduced(equation) < 1:
             return NOWHERE
         if name == "convert_element_type" and not _keeps_sign(source, equation.outvars[0]):
-            return first._replace(floor=None, sign=0)
+            return first._replace(floor=None, sign=0, unit_norm=False)
         floating = isinstance(source.aval, ShapedArray) and jnp.issubdtype(source.aval.dtype, jnp.floating)
-        return first if floating else first._replace(floor=None)
+        return first._replace(unit_norm=False) if floating else first._replace(floor=None, unit_norm=False)
     if name == "reduce_sum":
         if _reduced(equation) < 1:
             return WHOLE
