@@ -141,12 +141,16 @@ UNIT = 2 ** 23
 into two limbs exactly and their carries leave each beneath it."""
 
 
-def _band(groups: tuple) -> int:
+def _band(form: Form, groups: tuple) -> int:
     """The binades a group's band spans in a term of `groups` (each `_held`'s group, its factors counted):
     a band tuple's product of significands each within `[2^-(band + n), 2^n]` stays a normal fp32
-    (`2^-120`); 0 where the term's groups and factors leave none (its sum taken unbanded, one tuple)."""
+    (`2^-120`); 0 where the term's groups and factors leave none (its sum taken unbanded, one tuple). A
+    group that sums none of its letters (each `form.out`'s: a transpose's unit operand along a letter no
+    other factor reads) lies at its largest, its offset 0, in band 0 alone: its factors count, its band
+    none."""
     factors = sum(len(group) for group in groups)
-    return max(0, (120 - factors) // len(groups))
+    banded = sum(1 for group in groups if not set(form.letters(group)) <= set(form.out))
+    return max(0, (120 - factors) // banded) if banded else 0
 
 
 def _dtype(arrays) -> jnp.dtype:
@@ -187,11 +191,12 @@ def _sum(arrays, form: Form, terms: tuple[Term, ...], out: str, dtype):
     plain = jnp.where(special, landed, high + low), jnp.where(special, joined, exponent)
     # A band past the first in a group of a term a band holds: the sum again a band tuple at a time.
     wide = [functools.reduce(jnp.maximum, [jnp.max(-offset, initial=0) for _, _, offset, _ in parts])
-            >= _band(groups) for (_, groups), parts in zip(terms, held, strict=True) if _band(groups)]
+            >= _band(shaped, groups) for (_, groups), parts in zip(terms, held, strict=True)
+            if _band(shaped, groups)]
     if not wide:
         return plain
     banded = jax.lax.cond(functools.reduce(jnp.logical_or, wide),
-                          lambda: _banded(terms, held, scales, contracted), lambda: plain)
+                          lambda: _banded(shaped, terms, held, scales, contracted), lambda: plain)
     return jnp.where(special, landed, banded[0]), jnp.where(special, joined, banded[1])
 
 
@@ -211,7 +216,8 @@ def _descending(parts: list) -> tuple[jax.Array, jax.Array, jax.Array]:
         for at in range(len(parts))])
 
 
-def _banded(terms: tuple[Term, ...], held: list, scales: list, contracted) -> tuple[jax.Array, jax.Array]:
+def _banded(form: Form, terms: tuple[Term, ...], held: list, scales: list,
+            contracted) -> tuple[jax.Array, jax.Array]:
     """`_sum`'s terms contracted a band of each group at a time (`_band`: a finite value whose offset
     beneath its group's largest lies in `[-(i + 1) band, -i band)` in band `i`, raised `2^(i band)`), the
     band tuples its values occupy walked by a carry over their digits (no count of them formed), summed a
@@ -223,7 +229,7 @@ def _banded(terms: tuple[Term, ...], held: list, scales: list, contracted) -> tu
     sums that cancel survives them, and a sum rounds only within its tuple's contraction, as fp32's."""
     specs = []
     for (sign, groups), parts, scale in zip(terms, held, scales, strict=True):
-        width = _band(groups)
+        width = _band(form, groups)
         finite = [jnp.where(jnp.isfinite(significand), significand, 0) for _, significand, _, _ in parts]
         offsets = [offset for _, _, offset, _ in parts]
         specs.append((sign, parts, scale, width, finite, offsets,

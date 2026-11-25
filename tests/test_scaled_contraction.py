@@ -336,3 +336,49 @@ def test_terms_that_cancel_keep_the_term_beneath_them():
     big = jnp.float32(2.0 ** 127)
     np.testing.assert_array_equal(np.asarray(contract(form, big, big, jnp.float32(2.0 ** -30))), 2.0 ** -30)
 
+
+
+ATTENTION_MEAN = Form(("bhgqk", "bkhd"), ((1, (((0, 1),), ((1, 1),))),), "bhgqd",
+                      divisor=((1, (((0, 1),),)),), divided="bhgq")
+"""The reference attention's mean (`attention._scaled_mean`): masses over keys `k` against values, divided by
+the masses' own sum over `k`, which the result does not read."""
+
+
+def test_a_transposed_letter_no_factor_reads_forms_no_product_over_the_others():
+    """The masses' cotangent of the attention mean at the sm90 matrix cell's width (1024 queries and keys,
+    256 channels, eight heads in four groups): the divisor's term reads `k` through the masses alone, its
+    unit operand along `k` a group of its own, so no group's product spans more than an operand does, where
+    one in the cotangent's group formed `bhgqdk`, 8 GiB, four held at once (row 12979). Traced only."""
+    from dew.nn.kernels.templates.scaled_contraction import scaled_contraction_p
+
+    masses = jax.ShapeDtypeStruct((1, 4, 2, 1024, 1024), jnp.float32)
+    values = jax.ShapeDtypeStruct((1, 1024, 4, 256), jnp.float32)
+    pulled = jax.make_jaxpr(jax.grad(lambda m, v: jnp.sum(contract(ATTENTION_MEAN, m, v)), argnums=(0, 1)))(
+        masses, values)
+    bound = masses.size
+    sums = [equation for equation in pulled.jaxpr.eqns if equation.primitive is scaled_contraction_p]
+    assert len(sums) > 1
+    for equation in sums:
+        form = equation.params["form"]
+        extents = {letter: size for subscript, operand in zip(form.subscripts, equation.invars, strict=True)
+                   for letter, size in zip(subscript, operand.aval.shape, strict=True)}
+        for _, groups in (*form.terms, *form.divisor):
+            for group in groups:
+                assert int(np.prod([extents[letter] for letter in form.letters(group)])) <= bound, group
+
+
+def test_a_transposes_unit_operand_takes_no_band_from_the_groups_beside_it():
+    """`y[d] = w[d] s_0 sum_k x[k]` times 57 scalars, each a group: `x`'s cotangent against `2^127` and
+    `2^-30` at `w = [0, 1]` is `2^-30` at every `k`, exactly. The transpose's unit operand along `k` and the
+    scalars sum no letter and lie at their largest, so the cotangent's and the weight's groups keep their
+    band; counted as groups they left none, and the sum, unbanded, read `2^-30` beneath `2^127` as zero."""
+    scalars = 58
+    subscripts = ("k", "d", *("",) * scalars)
+    weight = ((1, 1), (2, 1))
+    groups = (weight, ((0, 1),), *(((3 + index, 1),) for index in range(scalars - 1)))
+    form = Form(subscripts, ((1, groups),), "d")
+    ones = [jnp.float32(1.0)] * scalars
+    w = jnp.asarray([0.0, 1.0], jnp.float32)
+    _, pull = jax.vjp(lambda x: contract(form, x, w, *ones), jnp.ones(3, jnp.float32))
+    (found,) = pull(jnp.asarray([2.0 ** 127, 2.0 ** -30], jnp.float32))
+    np.testing.assert_array_equal(np.asarray(found), np.full(3, 2.0 ** -30, np.float32))
