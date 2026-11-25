@@ -159,47 +159,76 @@ def _product_of(coefficient, sums, values, dtype):
 
 
 def _directional_products(form: Ratio):
-    """Products split into one affine factor over states and the sums constant over that factor."""
-    if not form.reduced or not form.directions:
+    """Each product's equivalent choices of an entrywise direction and the sums held beside it."""
+    if not form.reduced or not any(form.directions):
         return ()
     groups = tuple(frozenset(indices) for indices in form.directions)
     split = []
     for coefficient, sums in form.products:
         operands = [{index for _, factors in each.terms for factor in factors for index in factor[1:]}
                     for each in sums]
-        for indices in groups:
+        choices: dict[int, tuple] = {}
+        for group, indices in enumerate(groups):
             moving = [at for at, read in enumerate(operands) if indices & read]
             if len(moving) == 1:
                 (at,) = moving
-                break
-        else:
+                direction = sums[at]
+                if direction.reduced and not direction.over:
+                    choices.setdefault(at, (group, coefficient, direction, sums[:at] + sums[at + 1:]))
+        if not choices:
             return ()
-        direction = sums[at]
-        if not direction.reduced or direction.over:
-            return ()
-        split.append((coefficient, direction, sums[:at] + sums[at + 1:]))
+        split.append(tuple(choices.values()))
     return split
 
 
-def _directions_summed(split, values, arrays, count: int, rank: int, form: Ratio, dtype):
-    """Cancel coefficients of each live direction before reducing across states. A stationary sample
-    cannot then hide another sample's small direction in a separately rounded sum."""
+def _direction_spreads(operands, form: Ratio, groups: set[int]):
+    """The span of nonzero binades in each active direction, per row and before any state sum lands."""
+    axis = form.axis
+    spreads = {}
+    for group in sorted(groups):
+        lower, upper = [], []
+        for index in form.directions[group]:
+            factor = scaled.scaled(operands[index])
+            live = (factor.significand != 0) & jnp.isfinite(factor.significand)
+            lower.append(jnp.min(jnp.where(live, factor.exponent, -_NONE), axis=axis, keepdims=True))
+            upper.append(jnp.max(jnp.where(live, factor.exponent, _NONE), axis=axis, keepdims=True))
+        least = functools.reduce(jnp.minimum, lower)
+        most = functools.reduce(jnp.maximum, upper)
+        spreads[group] = jnp.maximum(0, most - least)
+    return spreads
+
+
+def _directions_summed(plans, values, operands, arrays, count: int, rank: int, form: Ratio, dtype):
+    """Cancel coefficients before reducing samples; keep the most widely separated direction entrywise
+    if an equivalent mixed contraction can stream either operand."""
     load, chunks = arrays
-    multipliers = [tuple(jnp.expand_dims(part, form.axis) for part in _product_of(c, sums, values, dtype))
-                   for c, _, sums in split]
-    summed = [_Sum(direction.terms, form.axis, (), count) for _, direction, _ in split]
+    spreads = _direction_spreads(operands, form, {group for choices in plans if len(choices) > 1
+                                                for group, _, _, _ in choices})
+    summed = []
+    for choices in plans:
+        best = None
+        if len(choices) > 1:
+            ordered = jnp.broadcast_arrays(*(spreads[group] for group, _, _, _ in choices))
+            best = jnp.argmax(jnp.stack(ordered), axis=0)
+        for at, (_, coefficient, direction, sums) in enumerate(choices):
+            hi, lo, exponent = (jnp.expand_dims(part, form.axis)
+                                for part in _product_of(coefficient, sums, values, dtype))
+            if best is not None:
+                kept = best == at
+                hi, lo, exponent = jnp.where(kept, hi, 0), jnp.where(kept, lo, 0), jnp.where(kept, exponent, 0)
+            summed.append((_Sum(direction.terms, form.axis, (), count), (hi, lo, exponent)))
 
     def summands_of(chunk):
         inputs, valid = load(chunk)
         factors = _factor_values(inputs, form.units, rank)
         terms = []
-        for each, multiplier in zip(summed, multipliers, strict=True):
+        for each, multiplier in summed:
             for parts in each._placed_summands(inputs, factors, valid, dtype, empty_exponent=0):
                 hi, lo, exponent = _times(parts, multiplier)
                 terms.append((hi, lo, jnp.where(hi != 0, exponent, _NONE)))
         return [jax.lax.optimization_barrier(tuple(terms))]
 
-    bits = (count * sum(len(each.terms) for each in summed)).bit_length()
+    bits = (count * sum(len(each.terms) for each, _ in summed)).bit_length()
     (value,) = _windows(summands_of, chunks, [(form.axis,)], [bits], dtype)
     return tuple(jnp.squeeze(part, form.axis) for part in value)
 
@@ -217,7 +246,8 @@ def _products_summed(operands, form: Ratio):
     # The denominator's own sum where a product takes it (the quotient rule's `D`), formed once for both.
     own = Summed(form.denominator, reduced=True) if form.denominator else None
     directional = _directional_products(form)
-    products = (sums for _, _, sums in directional) if directional else (sums for _, sums in form.products)
+    products = (sums for choices in directional for _, _, _, sums in choices) if directional else (
+        sums for _, sums in form.products)
     distinct = list(dict.fromkeys(each for sums in products for each in sums))
     reduced = [each for each in distinct if each.reduced and each != own]
     entrywise = [each for each in distinct if not each.reduced]
@@ -239,7 +269,7 @@ def _products_summed(operands, form: Ratio):
                   for each, value in values.items()}
     dtype = laid[0].dtype
     if directional:
-        return _directions_summed(directional, values, arrays, count, rank, form, dtype), denominator
+        return _directions_summed(directional, values, laid, arrays, count, rank, form, dtype), denominator
     products = [_product_of(coefficient, sums, values, dtype) for coefficient, sums in form.products]
     if len(products) == 1:
         return products[0], denominator

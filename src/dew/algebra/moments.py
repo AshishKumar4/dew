@@ -166,7 +166,7 @@ def _covariance_form(second: int, weight: int) -> ratios.Ratio:
     joint, sx, sy = _weighted_sum(0, second, weight), _weighted_sum(0, weight), _weighted_sum(second, weight)
     return ratios.Ratio((), mass.terms, 0, reduced=True, units=windows.Units(), power=3,
                         products=((1.0, (joint, mass, mass)), (-1.0, (sx, sy, correction))),
-                        direction_groups=((weight, weight + 1, weight + 2), tuple(range(weight))))
+                        direction_groups=((weight, weight + 1, weight + 2), *((i,) for i in range(weight))))
 
 
 _COV_FORM = _covariance_form(1, 2)
