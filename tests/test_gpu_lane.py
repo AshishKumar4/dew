@@ -428,8 +428,8 @@ def test_a_dry_prepare_is_past_its_memory_cap_where_a_limit_binding_its_task_is_
     membership = tmp_path / "cgroup"
     membership.write_text(cgroup_tree(root, levels))
     reader = ci.host.cgroups()
-    real_own = reader.own
-    monkeypatch.setattr(reader, "own", lambda root: real_own(root, membership))
+    real_limits = reader.memory_limits
+    monkeypatch.setattr(reader, "memory_limits", lambda root: real_limits(root, membership))
     monkeypatch.setenv("DEW_CGROUP_ROOT", str(root))
     seen = []
 

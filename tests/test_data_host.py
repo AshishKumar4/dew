@@ -58,7 +58,9 @@ def test_a_cgroups_reclaimable_page_cache_is_room_for_automatic_loading(tmp_path
     (limits / "memory.max").write_text(f"{2 * 2**30}\n")
     (limits / "memory.current").write_text(f"{int(1.9 * 2**30)}\n")
     (limits / "memory.stat").write_text(f"anon {int(0.4 * 2**30)}\ninactive_file {int(1.5 * 2**30)}\n")
-    host = Host.current(own, root=tmp_path)
+    membership = tmp_path / "cgroup"
+    membership.write_text("0::/session\n")
+    host = Host.current(tmp_path, membership)
     assert host.cpus == min(2, len(os.sched_getaffinity(0)))
     assert host.memory == 2 * 2**30 - int(1.9 * 2**30) + int(1.5 * 2**30)
 
@@ -100,14 +102,16 @@ def test_a_process_reads_its_cgroups_limits_through_the_reader_a_tool_loads_befo
         f"root = Path({str(root)!r})\n"
         f"group = cgroups.own(root, Path({str(membership)!r}))\n"
         "levels = list(cgroups.levels(group, root))\n"
+        f"stated = cgroups.memory_limits(root, Path({str(membership)!r}))\n"
+        "limits = [[level.name, limit] for level, limit in stated]\n"
         "import json\n"
-        "print(json.dumps([group.name, [cgroups.cpus(level) for level in levels],\n"
-        "                  [cgroups.memory(level) for level in levels],\n"
+        "print(json.dumps([group.name, [cgroups.cpus(level) for level in levels], limits,\n"
         "                  [cgroups.memory_peak(level) for level in levels],\n"
         "                  any(name.split('.')[0] == 'dew' for name in sys.modules)]))\n")
     (own / "memory.peak").write_text(f"{7 * 2**30}\n")
     done = subprocess.run([sys.executable, "-I", "-c", program], capture_output=True, text=True, check=True)
-    assert json.loads(done.stdout) == ["session", [None, 3], [3 * 2**30, None], [7 * 2**30, None], False]
+    assert json.loads(done.stdout) == ["session", [None, 3], [["session", 3 * 2**30]], [7 * 2**30, None],
+                                       False]
 
 
 class _Filled:

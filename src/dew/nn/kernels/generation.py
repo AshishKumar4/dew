@@ -2068,7 +2068,8 @@ def host_memory_share() -> int:
 
     import jax
 
-    limits = [os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"), *_cgroups.memory_limits()]
+    limits = [os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"),
+              *(limit for _, limit in _cgroups.memory_limits())]
     address, _ = resource.getrlimit(resource.RLIMIT_AS)
     if address != resource.RLIM_INFINITY:
         limits.append(address)

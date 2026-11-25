@@ -375,22 +375,20 @@ class Host:
         return worker_start_seconds() if self.worker_start is None else self.worker_start
 
     @classmethod
-    def current(cls, cgroup: Path | None = None, root: Path = cgroups.ROOT) -> Host:
-        """This process's host, read through `cgroup`, its own cgroup (v2) directory, which
-        /proc/self/cgroup names under `root` by default, and every ancestor of it up to `root`:
-        a container's limit on a parent binds an unlimited child, so each level's CPU quota and
-        the memory its limit leaves bound the host's. Under a memory limit the page cache the
-        kernel reclaims first (`inactive_file`) is room, as the kubelet counts a container's
-        working set: a run that has read its corpus once holds it in cache, charged to its
-        cgroup, and counting that as taken left room for no worker beside it."""
+    def current(cls, root: Path = cgroups.ROOT, membership: Path = cgroups.MEMBERSHIP) -> Host:
+        """This process's host, read through the cgroups `membership` (/proc/self/cgroup) names it in under
+        `root`, its own and every ancestor of it: a container's limit on a parent binds an unlimited child,
+        so each level's CPU quota and the memory its limit leaves (`cgroups.memory_limits`, v2's and v1's)
+        bound the host's. Under a memory limit the page cache the kernel reclaims first (`inactive_file`) is
+        room, as the kubelet counts a container's working set: a run that has read its corpus once holds it
+        in cache, charged to its cgroup, and counting that as taken left room for no worker beside it. A
+        level that states no charge (`cgroups.memory_held`: v1's) is bounded by its limit alone."""
         import psutil
 
-        group = cgroups.own(root) if cgroup is None else cgroup
+        group = cgroups.own(root, membership)
         cpus, memory = cgroups.usable_cpus(group, root), psutil.virtual_memory().available
-        for level in cgroups.levels(group, root):
-            limit, held = cgroups.memory(level), cgroups.memory_held(level)
-            if limit is not None and held is not None:
-                memory = min(memory, max(0, limit - held))
+        for level, limit in cgroups.memory_limits(root, membership):
+            memory = min(memory, max(0, limit - (cgroups.memory_held(level) or 0)))
         return cls(cpus, memory)
 
 

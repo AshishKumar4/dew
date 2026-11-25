@@ -91,13 +91,12 @@ def usable_cpus(group: Path | None = None, root: Path = ROOT) -> int:
     return usable
 
 
-def memory(level: Path) -> int | None:
-    """The bytes `level`'s limit (`memory.max`) allows, None where it states none."""
-    maximum = level / "memory.max"
-    if not maximum.is_file():
-        return None
-    limit = maximum.read_text().strip()
-    return None if limit == "max" else int(limit)
+def _limit(stated: Path) -> int | None:
+    """The bytes the limit file `stated` allows: None where it states none (v2's 'max') or cannot be read
+    (`_read`)."""
+    text = _read(stated)
+    limit = "" if text is None else text.strip()
+    return None if limit in ("", "max") else int(limit)
 
 
 MEMORY_LIMITS = {"": ("", "memory.max"), "memory": ("memory", "memory.limit_in_bytes")}
@@ -105,13 +104,13 @@ MEMORY_LIMITS = {"": ("", "memory.max"), "memory": ("memory", "memory.limit_in_b
 its mount) and v1's memory controller's (`memory.limit_in_bytes`, at its own mount beside it)."""
 
 
-def memory_limits(root: Path = ROOT, membership: Path = MEMBERSHIP) -> list[int]:
-    """The memory limits on every cgroup this process runs in (`membership`: v2's unified group, v1's memory
-    controller's), each group's own and every ancestor's up to its hierarchy's mount under `root`, any of
-    which bounds it: a group its mount does not show (a container's, whose own group is its mount's root)
-    states its limit at that root, an ancestor that does. v2's 'max' states none, nor a file unreadable as it
-    is read (`_read`)."""
-    limits = []
+def memory_limits(root: Path = ROOT, membership: Path = MEMBERSHIP) -> Iterator[tuple[Path, int]]:
+    """Each cgroup directory whose memory limit bounds this process, and that limit in bytes: in every
+    hierarchy `membership` names it in that bounds memory (v2's unified group, v1's memory controller's), its
+    group and every ancestor up to the hierarchy's mount under `root`. A group its mount does not show (a
+    container's, whose own group is its mount's root) states its limit at that root, an ancestor that does.
+    The one walk of them a CPU call's memory share (`dew.nn.kernels.generation`), a data host's sizing
+    (`dew.data.dataset.Host`) and CI's limit key (tools/armada/host.py) take."""
     for controllers, path in _memberships(membership):
         hierarchy = next((controller for controller in ("", "memory")
                           if controller == controllers or controller in controllers.split(",")), None)
@@ -120,10 +119,9 @@ def memory_limits(root: Path = ROOT, membership: Path = MEMBERSHIP) -> list[int]
         mount, name = MEMORY_LIMITS[hierarchy]
         parts = [part for part in path.split("/") if part]
         for depth in range(len(parts), -1, -1):
-            stated = _read(root.joinpath(mount, *parts[:depth], name))
-            if stated is not None and (limit := stated.strip()) not in ("", "max"):
-                limits.append(int(limit))
-    return limits
+            level = root.joinpath(mount, *parts[:depth])
+            if (limit := _limit(level / name)) is not None:
+                yield level, limit
 
 
 def memory_peak(level: Path) -> int | None:

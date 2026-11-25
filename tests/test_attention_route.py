@@ -1222,7 +1222,8 @@ def test_a_process_is_held_to_its_control_groups_least_memory_limit(tmp_path, gr
         (tmp_path / path).write_text(limit + "\n")
     from dew import _cgroups
 
-    assert min(_cgroups.memory_limits(tmp_path / "sys/fs/cgroup", tmp_path / "proc/self/cgroup")) == least
+    stated = _cgroups.memory_limits(tmp_path / "sys/fs/cgroup", tmp_path / "proc/self/cgroup")
+    assert min(limit for _, limit in stated) == least
 
 
 def test_a_cgroup_limit_unreadable_as_it_is_read_leaves_the_others(tmp_path):
@@ -1244,9 +1245,10 @@ def test_a_cgroup_limit_unreadable_as_it_is_read_leaves_the_others(tmp_path):
     hidden = tmp_path / "sys/fs/cgroup/outer/inner/memory.max"
     hidden.write_text("1073741824\n")
     hidden.chmod(0)
-    assert _cgroups.memory_limits(tmp_path / "sys/fs/cgroup", membership) == [2147483648]
+    root = tmp_path / "sys/fs/cgroup"
+    assert list(_cgroups.memory_limits(root, membership)) == [(root / "outer", 2147483648)]
     membership.chmod(0)
-    assert _cgroups.memory_limits(tmp_path / "sys/fs/cgroup", membership) == []
+    assert list(_cgroups.memory_limits(root, membership)) == []
 
 
 @pytest.mark.parametrize("filled", [False, True], ids=["blocks", "filled"])

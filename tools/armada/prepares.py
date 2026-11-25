@@ -221,8 +221,7 @@ def held_caps(ci) -> str:
     limit, which would key every prepare row by its host's (followed.py's `LIMITS`); a JSON list of
     `[path, bytes]` pairs (a cgroup's name may hold any separator), "" where none states one."""
     reader, root = ci.host.cgroups(), ci.host.cgroup_root()
-    caps = [[str(level), int(limit * HELD_SHARE)] for level in reader.levels(reader.own(root), root)
-            if (limit := reader.memory(level)) is not None]
+    caps = [[str(level), int(limit * HELD_SHARE)] for level, limit in reader.memory_limits(root)]
     return json.dumps(caps) if caps else ""
 
 
