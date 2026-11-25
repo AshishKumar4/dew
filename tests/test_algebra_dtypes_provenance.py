@@ -113,8 +113,10 @@ def test_structural_closed_preserves_equation_source_info_and_nested_body_proven
     assert "right_branch" in str(add_r[-1].source_info.name_stack)
     assert source_info_util.user_frame(add_l[-1].source_info.traceback) != source_info_util.user_frame(
         add_r[-1].source_info.traceback)
-    pjit_l = next(eq for eq in out_l.jaxpr.eqns if eq.primitive.name == "jit")
-    pjit_r = next(eq for eq in out_r.jaxpr.eqns if eq.primitive.name == "jit")
+    pjit_l = next(
+        eq for eq in out_l.jaxpr.eqns if eq.primitive.name == "jit" and eq.params.get("name") == "inner")
+    pjit_r = next(
+        eq for eq in out_r.jaxpr.eqns if eq.primitive.name == "jit" and eq.params.get("name") == "inner")
     sub_l, sub_r = pjit_l.params["jaxpr"], pjit_r.params["jaxpr"]
     assert "inner_left_scope" in str(sub_l.jaxpr.eqns[0].source_info.name_stack)
     assert "inner_right_scope" in str(sub_r.jaxpr.eqns[0].source_info.name_stack)
@@ -172,6 +174,11 @@ def test_reuse_hoists_softmax_and_standalone_root_and_emits_no_debug_info_warnin
         _, apart_b = terms.proven(c_bad.jaxpr)
         assert apart_b[c_bad.jaxpr.outvars[0]].floor is None
 
+    def plain_softmax(x):
+        peak = jnp.max(x, axis=-1, keepdims=True)
+        exps = jnp.exp(x - peak)
+        return exps / jnp.sum(exps, axis=-1, keepdims=True)
+
     def standalone_root(x, z):
         denom = jnp.mean(jnp.square(jnp.tanh(z)), axis=-1, keepdims=True) + jnp.float32(1e-5)
         return x / jnp.sqrt(denom)
@@ -180,8 +187,8 @@ def test_reuse_hoists_softmax_and_standalone_root_and_emits_no_debug_info_warnin
     with algebra.rules.enabling_dev("reuse"):
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always", DeprecationWarning)
-            sm_before = list(_equations(jax.make_jaxpr(jax.nn.softmax)(x0).jaxpr))
-            sm_after = list(_equations(jax.make_jaxpr(algebra.rewritten(jax.nn.softmax))(x0).jaxpr))
+            sm_before = list(_equations(jax.make_jaxpr(plain_softmax)(x0).jaxpr))
+            sm_after = list(_equations(jax.make_jaxpr(algebra.rewritten(plain_softmax))(x0).jaxpr))
             rt_after = list(_equations(jax.make_jaxpr(algebra.rewritten(standalone_root))(x0, z0).jaxpr))
             with generation.assumed("sm90"):
                 rms_shapes = (jax.ShapeDtypeStruct((256, 256), jnp.bfloat16),
@@ -196,7 +203,7 @@ def test_reuse_hoists_softmax_and_standalone_root_and_emits_no_debug_info_warnin
         assert not any(eq.primitive is jax.lax.sqrt_p for eq in rt_after)
         assert not any(eq.primitive is jax.lax.div_p for eq in rt_after)
         assert any(eq.primitive is jax.lax.rsqrt_p for eq in rt_after)
-        assert_as_exact(jax.jit(algebra.rewritten(jax.nn.softmax)), jax.jit(jax.nn.softmax),
+        assert_as_exact(jax.jit(algebra.rewritten(plain_softmax)), jax.jit(plain_softmax),
                         lambda seed: _rows(seed, (16, 64)), "reuse softmax hoist", seeds=8)
         assert_as_exact(jax.jit(algebra.rewritten(standalone_root)), jax.jit(standalone_root),
                         lambda seed: _rows(seed, (16, 64), (16, 64)), "reuse standalone root", seeds=8)

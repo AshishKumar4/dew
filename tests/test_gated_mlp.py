@@ -492,7 +492,8 @@ def test_wide_gated_mlp_selector_handoffs_and_remat_recompute(generation_name):
 
     def kernels(layer, **choose):
         params = jax.eval_shape(layer.init, jax.random.key(0), x)
-        with (generation.assumed(generation_name), dew.kernels.use(dew.kernels.Kernels(**choose)),
+        with (generation.assumed(generation_name),
+              dew.kernels.use(dew.kernels.Kernels(grouped_matmul="mosaic", **choose)),
               generation.routes() as routes):
             jax.eval_shape(layer.apply, params, x)
         return [route.kernel for route in routes if route.choice == "gated_mlp"]

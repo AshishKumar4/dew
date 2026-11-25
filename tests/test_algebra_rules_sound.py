@@ -209,6 +209,8 @@ class Evaluated:
                 return 1 / x
             symbolic, numeric = _unary(op)
             return symbolic(x) if np.asarray(x).dtype == object else numeric(x)
+        if name == "convert":
+            return values[0]
         if name == "dot":
             return _dot(values[0], values[1], values[2])
         if name == "shaped":
