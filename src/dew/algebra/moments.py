@@ -161,10 +161,21 @@ _TANGENT_DIV = ratios.Ratio(
     ((1.0, (("v", 0), ("v", 1))),), ((1.0, (("v", 2),)),), 0, reduced=True, units=windows.Units())
 """Elementwise `dtw * numerator / sn` along a leading unit axis (`_safe_tangent_div`)."""
 
-_TANGENT_COV = ratios.Ratio(
-    ((1.0, (("v", 0), ("v", 1), ("v", 2))), (-1.0, (("v", 0), ("v", 3)))),
-    ((1.0, (("v", 4),)),), 0, reduced=True, units=windows.Units())
-"""Elementwise `(dtw * cx * cy - dtw * cov) / sn` along a leading unit axis (`_safe_tangent_cov`)."""
+_COV_W_TANGENT = ratios.Ratio(
+    (), ((1.0, (("v", 2),)),), 0, reduced=True, units=windows.Units(), power=2,
+    products=(
+        (1.0, (ratios.Summed(((1.0, (("v", 3), ("v", 0), ("v", 1))),), reduced=True),
+               ratios.Summed(((1.0, (("v", 2),)),), reduced=True))),
+        (-1.0, (ratios.Summed(((1.0, (("v", 2), ("v", 0), ("v", 1))),), reduced=True),
+                ratios.Summed(((1.0, (("v", 3),)),), reduced=True))),
+    ))
+"""Streamed `((sum dw*cx*cy)*(sum w) - (sum w*cx*cy)*(sum dw)) / (sum w)^2` along axis 0: keeps centered
+products and covariance at identical unlanded double-word precision across overflow, underflow, and
+stationary points."""
+
+_COV_W_ZERO = ratios.Ratio(
+    ((1.0, (("v", 2), ("v", 0), ("v", 1))),), (), 0, reduced=True, units=windows.Units())
+"""Streamed `sum dw*cx*cy` along axis 0 at the all-zero-weight (`n == 0`) boundary."""
 
 
 def _safe_tangent_div(dtw: jax.Array, numerator: jax.Array, sn: jax.Array) -> jax.Array:
@@ -173,19 +184,12 @@ def _safe_tangent_div(dtw: jax.Array, numerator: jax.Array, sn: jax.Array) -> ja
     return ratios.ratio([dtw[None], numerator[None], sn[None]], _TANGENT_DIV)
 
 
-def _safe_tangent_cov(dtw: jax.Array, cx: jax.Array, cy: jax.Array, cov: jax.Array,
-                      sn: jax.Array) -> jax.Array:
-    """Range-safe `(dtw * cx * cy - dtw * cov) / sn` via one singleton `ratios.ratio_p`, subtracting both
-    signed terms unlanded before dividing by `sn` so overflow, underflow, and cancellation stay exact."""
-    return ratios.ratio([dtw[None], cx[None], cy[None], cov[None], sn[None]], _TANGENT_COV)
-
-
 def _cov_tangent_tile(
     tx: jax.Array, ty: jax.Array, tw: jax.Array,
     dtx: jax.Array, dty: jax.Array, dtw: jax.Array,
-    mu_x: jax.Array, mu_y: jax.Array, cov: jax.Array, n: jax.Array,
+    mu_x: jax.Array, mu_y: jax.Array, n: jax.Array,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Exact final-center linear tangent `(d_mu_x, d_mu_y, d_cov_raw, sum_pw_cy, sum_pw_cx, d_n)` of one
+    """Exact final-center linear tangent `(d_mu_x, d_mu_y, d_cov_xy, sum_pw_cy, sum_pw_cx, d_n)` of one
     tile for both `n > 0` and `n == 0` boundaries without multi-tile zero-mass exponent overflow."""
     pos = n[..., None] > 0
     sn = jnp.where(pos, n[..., None], 1.0)
@@ -197,23 +201,8 @@ def _cov_tangent_tile(
     d_my = jnp.sum(_weighted_term(tw, dty, sn) + _safe_tangent_div(dtw, ty - mu_y_pos, sn), axis=-1)
     pw_cy = _weighted_term(tw, jnp.where((tw > 0) | jnp.isfinite(cy), cy, 0.0), sn)
     pw_cx = _weighted_term(tw, jnp.where((tw > 0) | jnp.isfinite(cx), cx, 0.0), sn)
-    cov_term = jnp.where(pos, cov[..., None], 0.0)
-    cx_sg, cy_sg = jax.lax.stop_gradient(cx), jax.lax.stop_gradient(cy)
-    cov_sg = jax.lax.stop_gradient(cov_term)
-    prod_sg = cx_sg * cy_sg
-    prod_ovf = (jnp.isfinite(cx_sg) & jnp.isfinite(cy_sg) & jnp.isfinite(cov_sg)
-                & (~jnp.isfinite(prod_sg) | ~jnp.isfinite(prod_sg - cov_sg)))
-    cx_safe = jnp.where(prod_ovf, 0.0, cx)
-    cy_safe = jnp.where(prod_ovf, 0.0, cy)
-    d_cov_no = _safe_tangent_div(jnp.where(prod_ovf, 0.0, dtw),
-                                 cx_safe * cy_safe - jnp.where(prod_ovf, 0.0, cov_term),
-                                 jnp.where(prod_ovf, 1.0, sn))
-    d_cov_ov = _safe_tangent_cov(jnp.where(prod_ovf, dtw, 0.0), jnp.where(prod_ovf, cx, 0.0),
-                                 jnp.where(prod_ovf, cy, 0.0), jnp.where(prod_ovf, cov_term, 0.0),
-                                 jnp.where(prod_ovf, sn, 1.0))
-    d_cov_w = jnp.where(prod_ovf, d_cov_ov, d_cov_no)
-    d_cov_raw = jnp.sum(pw_cy * dtx + pw_cx * dty + d_cov_w, axis=-1)
-    return d_mx, d_my, d_cov_raw, jnp.sum(pw_cy, axis=-1), jnp.sum(pw_cx, axis=-1), jnp.sum(dtw, axis=-1)
+    d_cov_xy = jnp.sum(pw_cy * dtx + pw_cx * dty, axis=-1)
+    return d_mx, d_my, d_cov_xy, jnp.sum(pw_cy, axis=-1), jnp.sum(pw_cx, axis=-1), jnp.sum(dtw, axis=-1)
 
 
 def _tile_array(value: jax.Array, shape: tuple[int, ...], tile: int) -> jax.Array:
@@ -240,20 +229,32 @@ def _tiled_tangents(
 
         def step(acc, chunk):
             tx, ty, tw, dtx, dty, dtw = chunk
-            parts = _cov_tangent_tile(tx, ty, tw, dtx, dty, dtw, mu_x, mu_y, cov, n)
+            parts = _cov_tangent_tile(tx, ty, tw, dtx, dty, dtw, mu_x, mu_y, n)
             return tuple(prev + delta for prev, delta in zip(acc, parts, strict=True)), None
 
-        d_mx, d_my, d_cov_raw, sum_pw_cy, sum_pw_cx, d_n = jax.lax.scan(
+        d_mx, d_my, d_cov_xy, sum_pw_cy, sum_pw_cx, d_n = jax.lax.scan(
             step, zeros, (tx_s, ty_s, tw_s, dtx_s, dty_s, dtw_s))[0]
     else:
         d_mx_s, d_my_s, d_cov_s, sum_cy_s, sum_cx_s, d_n_s = jax.vmap(
             lambda tx, ty, tw, dtx, dty, dtw: _cov_tangent_tile(
-                tx, ty, tw, dtx, dty, dtw, mu_x, mu_y, cov, n)
+                tx, ty, tw, dtx, dty, dtw, mu_x, mu_y, n)
         )(tx_s, ty_s, tw_s, dtx_s, dty_s, dtw_s)
-        d_mx, d_my, d_cov_raw = jnp.sum(d_mx_s, axis=0), jnp.sum(d_my_s, axis=0), jnp.sum(d_cov_s, axis=0)
+        d_mx, d_my, d_cov_xy = jnp.sum(d_mx_s, axis=0), jnp.sum(d_my_s, axis=0), jnp.sum(d_cov_s, axis=0)
         sum_pw_cy, sum_pw_cx, d_n = (jnp.sum(sum_cy_s, axis=0), jnp.sum(sum_cx_s, axis=0),
                                      jnp.sum(d_n_s, axis=0))
-    d_cov = d_cov_raw - d_mx * sum_pw_cy - d_my * sum_pw_cx
+    pos = n > 0
+    cx0 = jnp.moveaxis(jnp.broadcast_to(x, shape) - mu_x[..., None], -1, 0)
+    cy0 = jnp.moveaxis(jnp.broadcast_to(y, shape) - mu_y[..., None], -1, 0)
+    w0 = jnp.moveaxis(jnp.broadcast_to(w, shape), -1, 0)
+    dw0 = jnp.moveaxis(jnp.broadcast_to(dw, shape), -1, 0)
+    pos0 = pos[None]
+    unit0 = jnp.zeros((shape[-1],) + (1,) * (len(shape) - 1), w0.dtype).at[0].set(1.0)
+    w_pos = jnp.where(pos0, w0, unit0)
+    dw_pos = jnp.where(pos0, dw0, 0.0)
+    dw_zero = jnp.where(pos0, 0.0, dw0)
+    d_cov_w = jnp.where(pos, ratios.ratio([cx0, cy0, w_pos, dw_pos], _COV_W_TANGENT),
+                        ratios.ratio([cx0, cy0, dw_zero], _COV_W_ZERO))
+    d_cov = d_cov_xy + d_cov_w - d_mx * sum_pw_cy - d_my * sum_pw_cx
     return d_mx, d_my, d_cov, d_n
 
 
