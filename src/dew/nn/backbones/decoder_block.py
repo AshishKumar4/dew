@@ -1170,11 +1170,11 @@ class DecoderBlock(nn.Module):
             held = AttentionMetadata() if attention_metadata is None else attention_metadata
             state = self._crossed(state, held.context, decode, train, held.progress,
                                   CrossContext.queries_of(held.coordinates))
-        state, read, site = self._read(state, "attention")
+        state, taken, site = self._read(state, "attention")
         # Each mixer site's own depth read under `depth_sites`, the first site's the layer's read.
-        site_reads = read if isinstance(read, dict) else None
         sites = self._mixer_sites()
-        read = read if site_reads is None else site_reads[sites[0]]
+        site_reads = taken if isinstance(taken, dict) else None
+        read = taken[sites[0]] if isinstance(taken, dict) else taken
         bank = prior_bank if self.cross_pass is not None else None
         if self.cross_pass is not None and bank is None and self.is_initializing():
             # A first pass reads no bank; its merges' parameters are declared all the same, so a decoder
@@ -1228,6 +1228,8 @@ class DecoderBlock(nn.Module):
                 state, read, site = self._read(state, "mlp")
             else:
                 state, read, site = self._read(state, "mlp")
+                # Only a mixer's sites read their own depth (`depth_sites`); the feed-forward reads one.
+                assert not isinstance(read, dict), "a feed-forward reads one input"
                 if bank is not None:
                     # The feed-forward's site (and a parallel branch's, which reads it unnormed).
                     read = self.cross_pass_merges['mlp'](read, bank)

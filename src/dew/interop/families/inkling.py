@@ -104,7 +104,7 @@ def _kinds(text: Mapping[str, object], layers: int) -> tuple[tuple[str, ...], di
     clip = native_fields(QKClip)(threshold=record_float(text, 'qk_l2_clip_threshold'))
     floor, alpha = record_float(text, 'log_scaling_n_floor'), record_float(text, 'log_scaling_alpha')
 
-    def attention(*, overall: bool) -> dict[str, object]:
+    def attention(*, overall: bool) -> Mapping[str, object]:
         return {'nope': True, 'qk_clip': clip, 'projected_sinks': True, 'gate_projection': 'own',
                 'relative_bias': native_fields(RelativeBias)(
                     **relative, extent=record_int(text, 'rel_extent') if overall else window,
@@ -139,7 +139,7 @@ _LOOP_FIELDS = frozenset({'core_start', 'core_end', 'num_passes', 'gate_rank', '
 """`loop_config`'s fields, as the release states them."""
 
 
-def _loop(text: Mapping[str, object], layers: int) -> dict[str, object] | None:
+def _loop(text: Mapping[str, object], layers: int) -> Mapping[str, object] | None:
     """`loop_config`'s passes over its core layers, each later pass's sites merging the pass before's
     messages (modeling_inkling2_loop.py:79-96, :142-170, :1320-1393)."""
     loop = text.get('loop_config')
@@ -258,8 +258,8 @@ _NAMES: Renames = (
     *((f'controllers.{theirs}', f'cross_pass_{site}') for site, theirs in _SITES.items()),
     ('mlp.gate.bias', 'mlp.gate.e_score_correction_bias'))
 """The release's names (model.safetensors.index.json of thinkingmachines/Inkling-2-Mini at c9d0283, its text
-decoder under `model.llm.`) onto the shared decoder's and this family's own (`_LAYER_LEAVES`), as transformers'
-conversion reads them (conversion_mapping.py `inkling2_text`, `inkling2_loop_text`)."""
+decoder under `model.llm.`) onto the shared decoder's and this family's own (`_LAYER_LEAVES`), as
+transformers' conversion reads them (conversion_mapping.py `inkling2_text`, `inkling2_loop_text`)."""
 
 _LAYER_LEAVES: Leaves = {
     'attn_query': ('attention_res', 'kernel'), 'k_query': ('attention_res_k', 'kernel'),

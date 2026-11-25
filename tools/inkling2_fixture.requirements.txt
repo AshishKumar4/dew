@@ -1,4 +1,0 @@
-# The transformers tools/inkling2_fixture.py records the Inkling 2 fixture with, over the suite's own environment
-# (uv venv --system-site-packages -p .venv-3.12/bin/python .venv-inkling2; uv pip install -p .venv-inkling2 -r
-# tools/inkling2_fixture.requirements.txt): the commit whose models/inkling2_loop the fixture is read against.
-transformers @ git+https://github.com/huggingface/transformers@3a96649547593bacad4b65d43442ccdf15d0ae0f

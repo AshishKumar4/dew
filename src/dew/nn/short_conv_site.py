@@ -74,8 +74,6 @@ class ShortConvSite(nn.Module):
         held = cache_variables(self, self.cache_spec(batch))["conv_state"] if call.decode else None
         taps, _ = conv()
         wide = at_least_fp32(x.dtype)
-        convolved: jax.Array
-        history: jax.Array
         if dynamic_input is None or self.dynamic_heads is None:
             convolved, history = held_conv1d(x, taps, tokens.valid, None if held is None else held.value,
                                              segments=tokens.segments, right_padded=tokens.right_padded,
@@ -89,7 +87,7 @@ class ShortConvSite(nn.Module):
                                                None if held is None else held.value)
             scale = math.sqrt(2 * self.kernel + 1)
         if held is not None:
-            kept(held, history.astype(held.value.dtype), "conv_state")
+            kept(held, jnp.asarray(history, held.value.dtype), "conv_state")
         return ((convolved.astype(wide) + x.astype(wide)) / scale).astype(x.dtype)
 
     @nn.nowrap

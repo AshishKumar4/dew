@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """The Inkling 2 fixture tests/test_inkling2.py checks against, from transformers' own Inkling 2
 (huggingface/transformers at REVISION, models/inkling2_loop/modeling_inkling2_loop.py), which the suite's
-transformers predates: it runs in the suite's environment with that transformers over it
-(tools/inkling2_fixture.requirements.txt):
+transformers predates: it runs in the suite's environment with that transformers over it, its cohort's
+(`COHORT`, tools/reference_releases.py):
 
-    uv venv --system-site-packages -p .venv-3.12/bin/python .venv-inkling2
-    uv pip install -p .venv-inkling2 -r tools/inkling2_fixture.requirements.txt
-    PYTHONPATH=src:tools:tests .venv-inkling2/bin/python tools/inkling2_fixture.py [--quantized] [--recording]
+    uv pip install --target .inkling2 --no-deps \
+        'transformers @ git+https://github.com/huggingface/transformers@3a96649547593bacad4b65d43442ccdf15d0ae0f'
+    PYTHONPATH=.inkling2:src:tools:tests .venv-3.12/bin/python tools/inkling2_fixture.py \
+        [--quantized] [--recording]
 
 tests/fixtures/hf/inkling2-tiny/ is a random Inkling2LoopForCausalLM at `TEXT`, the release's text config
 (thinkingmachines/Inkling-2-Mini's config.json) at eight layers: two global, one inside the loop's core
@@ -28,8 +29,11 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from reference_releases import commit
 
-REVISION = '3a96649547593bacad4b65d43442ccdf15d0ae0f'
+COHORT = 'inkling2'
+"""The reference releases this tool runs against (tools/reference_releases.py)."""
+REVISION = commit(COHORT, 'transformers')
 TINY = Path(__file__).resolve().parents[1] / 'tests' / 'fixtures' / 'hf' / 'inkling2-tiny'
 QUANTIZED = TINY.parent / 'inkling2-tiny-nvfp4'
 NVFP4_LAYERS = 6
@@ -184,8 +188,9 @@ def write_quantized() -> None:
         if found is None:
             stored[name] = tensor
         else:
-            nvfp4 = int(found[1]) < NVFP4_LAYERS
-            stored.update(quantized_experts(name, tuple(tensor.shape), nvfp4, generator))
+            experts, rows, columns = tensor.shape
+            stored.update(quantized_experts(name, (experts, rows, columns), int(found[1]) < NVFP4_LAYERS,
+                                            generator))
     save_file(stored, QUANTIZED / 'model.safetensors', metadata={'format': 'pt'})
     wrapper = {**json.loads((TINY / 'config.json').read_text()),
                'quantization_config': {'quant_method': 'modelopt', 'quant_algo': 'NVFP4'}}
@@ -215,7 +220,7 @@ def write_recording(directory: Path) -> None:
     truth = float64_twin(model, lambda: modeling.Inkling2LoopForCausalLM(model.config))
     truth.config._experts_implementation = 'eager'
     flag = ' --quantized' if directory == QUANTIZED else ''
-    command = ('PYTHONPATH=src:tools:tests .venv-inkling2/bin/python tools/inkling2_fixture.py'
+    command = ('PYTHONPATH=.inkling2:src:tools:tests .venv-3.12/bin/python tools/inkling2_fixture.py'
                f'{flag} --recording')
     record_logits(directory, model, truth, command, draw=draw, stepped=STEPPED,
                   reference='Inkling2LoopForCausalLM (transformers)',

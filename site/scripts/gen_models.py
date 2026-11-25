@@ -73,6 +73,8 @@ DECODERS = {
     "deepseek_v41": ("DeepSeek V4.1", "Mixture of experts"),
     "kimi_k2": ("Kimi K2", "Mixture of experts"),
     "kimi_k25": ("Kimi K2.5, text", "Mixture of experts"),
+    **dict.fromkeys(("inkling2_loop", "inkling2_loop_text"),
+                    ("Inkling 2 (looped), text", "Mixture of experts")),
     "qwen3_next": ("Qwen3-Next", "Hybrid and linear attention"),
     "nemotron_h": ("Nemotron-H", "Hybrid and linear attention"),
     "glm5_next_text": ("GLM-5.3-Flash, text", "Hybrid and linear attention"),
