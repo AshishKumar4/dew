@@ -686,14 +686,15 @@ PER_SHARD_STEPS = {"expert layer": _expert_layer_step, "rms norm": _norm_step, "
 """Each op whose kernels run per shard (row 1923, bible §7), its step at a number of rows. Each lane adds its
 ops here."""
 
-PER_SHARD_KERNELS = {"selective scan": "selective_scan", "packed recurrence": "recurrence"}
-"""The name prefix of an op's own kernels, where its step launches others too (a Mamba layer's
-projections)."""
+PER_SHARD_KERNELS = {"selective scan": ("selective_scan",), "packed recurrence": ("recurrence", "short_conv")}
+"""The name prefixes of an op's own kernels, where its step launches others too (a layer's projections, the
+GEMM's)."""
 
-def _kernel_launches(loss, args, generation: str, devices: int, prefix: str = "") -> tuple[list, list]:
+def _kernel_launches(loss, args, generation: str, devices: int,
+                     prefix: tuple[str, ...] = ("",)) -> tuple[list, list]:
     """The Pallas launches (`kernel_calls`, each a compile compiles) of `loss`'s value and gradient lowered
     for `generation`'s GPU on an abstract mesh of `devices` that splits the rows, those whose kernel's name
-    starts with `prefix`, and the program's operations (`_operations`)."""
+    starts with one of `prefix`, and the program's operations (`_operations`)."""
     from jax.sharding import AbstractMesh, AxisType
 
     from dew.nn.kernels.lowered import kernel_calls
@@ -715,7 +716,7 @@ def test_every_kernel_launch_takes_its_own_devices_rows_on_a_two_device_mesh(gen
     there (its device's rows, its replicated parameters whole), never the whole batch; and the program's
     only collective is the reduction of its replicated parameters' gradients over the data axis."""
     loss, args = PER_SHARD_STEPS[op](384)
-    prefix = PER_SHARD_KERNELS.get(op, "")
+    prefix = PER_SHARD_KERNELS.get(op, ("",))
     whole, _ = _kernel_launches(loss, args, generation, 1, prefix)
     split, operations = _kernel_launches(loss, args, generation, 2, prefix)
 
