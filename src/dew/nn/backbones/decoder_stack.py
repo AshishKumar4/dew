@@ -31,7 +31,7 @@ from jax.sharding import PartitionSpec as P
 from dew._cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.batch import Variables, merge, part, sows_appended
 from dew.mesh import STAGE_AXIS, LayoutRefused, row_axes
-from dew.nn.inspection import QK
+from dew.nn.inspection import INDEXER_COLLECTION, QK
 from dew.nn.protocols import StagedStacks, fixed_remat
 from dew.quantization import held_scales, holds_quantized
 
@@ -43,7 +43,6 @@ from ..hyper_connections import Carried
 from ..inspection import counted, current_component, current_positions, watched_positions
 from ..kernels import generation
 from ..kv_cache import cache_at_layer, cache_from_layer
-from ..mla import INDEXER_COLLECTION
 from ..moe import BANKED_EXPERTS, ROUTER_COLLECTION, at_iteration, experts_apart, holds_experts
 from ..residuals import RESIDUALS
 from ..sharding import constrained, microbatched, microbatches, pipeline_stage, pipeline_stages

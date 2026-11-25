@@ -1825,4 +1825,4 @@ def _theta_rows(variables, passes: int):
 
 __all__ = ["DecoderRunConfig", "Diagnostics", "LowerTarget", "MetricConfig", "ObjectiveConfig", "Prepared",
            "Release", "RunConfig", "SourceOptions", "Suite", "TrainerConfig",
-           "flag_selected", "looping"]
+           "flag_selected"]
