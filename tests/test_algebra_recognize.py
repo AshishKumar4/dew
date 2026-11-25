@@ -1352,11 +1352,11 @@ def test_non_matching_or_barred_recurrence_scans_stay_as_written():
 
 
 def test_recurrence_recognition_guards_range_tracers_tokens_and_training_vjp():
-    """`RECURRENCES` preserves unbounded bf16 `Q=K=2^80, beta=2^-80` token scans (avoiding FLA `Q·K`
+    """`RECURRENCES` preserves unbounded bf16 `Q=K=2^80, beta=2^-80` token scans (avoiding FLA `Q @ K^T`
     overflow), handles closed-over outer tracers without `TracerArrayConversionError`, skips effect-free
     token-carry scans, and leaves forward-only forced Mosaic training routes intact so `jax.vjp` succeeds."""
     import dew
-    from dew.nn.kernels.generation import Numerics
+    from dew.nn.precision import Numerics
 
     seq, batch, hv, dk, dv = 64, 1, 2, 64, 64
     std_shapes = (

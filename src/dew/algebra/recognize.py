@@ -1188,16 +1188,16 @@ def _recurrence_bounded(
     key_width: int, common, scale: float | None, delta: bool, has_beta: bool,
 ) -> bool:
     """Whether chunked WY and score products stay within `common` and fp32 range (row 3450): requires
-    statically bounded finite `Q` and `K` (`Q·K` and `K·K` below the dtype cap), plus bounded `beta`
+    statically bounded finite `Q` and `K` (`Q @ K^T` and `K @ K^T` below the dtype cap), plus bounded `beta`
     (contractive `0 <= beta <= 2` for delta-rule WY triangular solves)."""
     if q_bound is None or k_bound is None:
         return False
     cap = min(60, int(jnp.finfo(common).maxexp) - 2)
     key_bits = math.ceil(math.log2(max(key_width, 1)))
     scale_bits = max(0, math.ceil(math.log2(scale))) if scale is not None and scale > 0 else 0
-    if q_bound != terms.NOTHING and k_bound != terms.NOTHING:
-        if q_bound + k_bound + key_bits + scale_bits > cap:
-            return False
+    if (q_bound != terms.NOTHING and k_bound != terms.NOTHING
+            and q_bound + k_bound + key_bits + scale_bits > cap):
+        return False
     if k_bound != terms.NOTHING and 2 * k_bound + key_bits > cap:
         return False
     if not has_beta:

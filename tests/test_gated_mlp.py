@@ -452,9 +452,9 @@ def test_grouped_gated_experts_selector_defaults_apart_and_honors_named_and_hand
 
 
 def test_grouped_gated_experts_hands_off_default_a100_cutlass_down():
-    """On default A100 (`sm80`), the ordinary grouped down cell chooses CUTLASS which forms the prologue in
-    XLA, so `fuses_grouped` hands off to `'apart'` unless `grouped_matmul='mosaic'` is selected; with Mosaic
-    forced and gather/scatter tables (unsupported on `mma.sync`), `fuses_grouped` hands off cleanly."""
+    """On A100 (`sm80`), the ordinary grouped down cell chooses CUTLASS which forms the prologue in XLA, and
+    `mma.sync` takes no side-tile prologue (`takes_prologue_tiles = False`), so `fuses_grouped` hands off to
+    `'apart'` under both the default selector and forced Mosaic without escaping `KernelRefused`."""
     from dew.nn import gated_mlp
 
     rows = jax.ShapeDtypeStruct((256, 128), jnp.bfloat16)
@@ -466,6 +466,6 @@ def test_grouped_gated_experts_hands_off_default_a100_cutlass_down():
         with generation.chosen(gated_mlp="fused"):
             assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook)
         with generation.chosen(grouped_matmul="mosaic", gated_mlp="fused"):
-            assert gated_mlp.fuses_grouped(rows, (gate, down), None, hook)
+            assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook)
             assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook, gather=table)
             assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook, scatter=table)

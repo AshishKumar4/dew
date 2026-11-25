@@ -177,14 +177,14 @@ def _grouped_launched(rows: jax.ShapeDtypeStruct, gate: jax.ShapeDtypeStruct, do
             # Mirror `gemm._gemm`: only when no tabled launch takes `gather`/`scatter` (`XLA`), `gemm._gemm`
             # gathers/scatters around the untabled grouped launch; CUTLASS runs with an XLA-formed prologue.
             pair_picked = pair_name(rows, gather)
-            if pair_picked != mosaic:
-                if pair_picked != xla or gather is None or pair_name(
-                        jax.ShapeDtypeStruct((sorted_rows, rows.shape[-1]), dtype), None) != mosaic:
-                    return False
+            if pair_picked != mosaic and (
+                    pair_picked != xla or gather is None or pair_name(
+                        jax.ShapeDtypeStruct((sorted_rows, rows.shape[-1]), dtype), None) != mosaic):
+                return False
             down_picked = down_name(scatter)
-            if down_picked != mosaic:
-                if down_picked != xla or scatter is None or down_name(None) != mosaic:
-                    return False
+            if down_picked != mosaic and (
+                    down_picked != xla or scatter is None or down_name(None) != mosaic):
+                return False
         except KernelRefused:
             return False
     return True

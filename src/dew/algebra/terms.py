@@ -605,7 +605,7 @@ class _SubKey:
     def __hash__(self) -> int:
         return self._hash
 
-    def __eq__(self, other: object) -> bool:
+    def __eq__(self, other) -> bool:
         if self is other:
             return True
         if not isinstance(other, _SubKey) or self._hash != other._hash or self.digest != other.digest:
@@ -613,7 +613,7 @@ class _SubKey:
         return _subkeys_equal(self, other)
 
 
-def _subkey_child(entry: Hashable) -> _SubKey | None:
+def _subkey_child(entry) -> _SubKey | None:
     """Return the child `_SubKey` wrapped by `("object", "subkey", child)`, or None."""
     if (isinstance(entry, tuple) and len(entry) == 3 and entry[0] == "object"
             and entry[1] == "subkey" and isinstance(entry[2], _SubKey)):
@@ -1225,32 +1225,47 @@ class _NormTrack:
         if (entry := self.pos_norm.get(src)) is not None and (moved := move(entry[1])) is not None:
             self.pos_norm[out] = (entry[0], moved)
 
-    def _unit_check(self, num: object, denom: object,
+    def _unit_check(self, scaled: jcore.Var | jcore.Literal, divisor: jcore.Var | jcore.Literal,
                     table: Mapping[jcore.Var, tuple[jcore.Var, tuple[int | None, ...]]]) -> bool:
-        if not (isinstance(num, jcore.Var) and isinstance(denom, jcore.Var)):
+        if not (isinstance(scaled, jcore.Var) and isinstance(divisor, jcore.Var)):
             return False
-        if (entry := table.get(denom)) is None:
+        if (entry := table.get(divisor)) is None:
             return False
         src, kept = entry
-        return self._canon(num) is src and _aligned_unit_axes(kept, len(_shape(num)))
+        return self._canon(scaled) is src and _aligned_unit_axes(kept, len(_shape(scaled)))
+
+    def _step_cast(self, src: jcore.Var, out: jcore.Var) -> None:
+        if not _lossless_float_cast(src, out):
+            return
+        self.origin[out] = self._canon(src)
+        if src in self.sq_sum:
+            self.sq_sum[out] = self.sq_sum[src]
+        if src in self.inv_norm:
+            self.inv_norm[out] = self.inv_norm[src]
+        if src in self.pos_norm:
+            self.pos_norm[out] = self.pos_norm[src]
+
+    def _step_add_max(self, prim: jcore.Primitive, invars: Sequence, out: jcore.Var,
+                      apart_of: Callable[..., Apart]) -> None:
+        for i in (0, 1):
+            cand, other = invars[i], invars[1 - i]
+            if not isinstance(cand, jcore.Var):
+                continue
+            if (entry := self.sq_sum.get(cand)) is not None and (oa := apart_of(other)).sign > 0:
+                self.sq_sum[out] = (entry[0], entry[1], entry[2] or oa.positive)
+            if (prim is jax.lax.max_p and (pos := self.pos_norm.get(cand)) is not None
+                    and apart_of(other).sign > 0):
+                self.pos_norm[out] = pos
 
     def step(self, equation: jcore.JaxprEqn,
              apart_of: Callable[..., Apart]) -> tuple[Magnitude | None, Apart] | None:
         """Update norm provenance for `equation`, returning unit-norm facts when `equation` divides/scales
         `x` by a verified positive-floored L2 norm of `x`."""
-        if len(equation.outvars) != 1 or not isinstance(equation.outvars[0].aval, ShapedArray):
+        if len(equation.outvars) != 1 or not isinstance(out_aval := equation.outvars[0].aval, ShapedArray):
             return None
         prim, out, invars = equation.primitive, equation.outvars[0], equation.invars
         if prim is jax.lax.convert_element_type_p and isinstance(invars[0], jcore.Var):
-            src = invars[0]
-            if _lossless_float_cast(src, out):
-                self.origin[out] = self._canon(src)
-                if src in self.sq_sum:
-                    self.sq_sum[out] = self.sq_sum[src]
-                if src in self.inv_norm:
-                    self.inv_norm[out] = self.inv_norm[src]
-                if src in self.pos_norm:
-                    self.pos_norm[out] = self.pos_norm[src]
+            self._step_cast(invars[0], out)
             return None
         if (prim is jax.lax.square_p
                 or (prim is jax.lax.integer_pow_p and equation.params.get("y") == 2)
@@ -1268,31 +1283,19 @@ class _NormTrack:
             self._propagate_layout(equation, invars[0], out)
             return None
         if prim in (jax.lax.add_p, jax.lax.max_p) and len(invars) == 2:
-            for i in (0, 1):
-                cand, other = invars[i], invars[1 - i]
-                if isinstance(cand, jcore.Var) and (entry := self.sq_sum.get(cand)) is not None:
-                    other_apart = apart_of(other)
-                    if other_apart.sign > 0:
-                        self.sq_sum[out] = (entry[0], entry[1], entry[2] or other_apart.positive)
-                if (prim is jax.lax.max_p and isinstance(cand, jcore.Var)
-                        and (pos := self.pos_norm.get(cand)) is not None and apart_of(other).sign > 0):
-                    self.pos_norm[out] = pos
+            self._step_add_max(prim, invars, out, apart_of)
             return None
-        if prim is jax.lax.rsqrt_p and isinstance(invars[0], jcore.Var):
+        if prim in (jax.lax.rsqrt_p, jax.lax.sqrt_p) and isinstance(invars[0], jcore.Var):
             if (entry := self.sq_sum.get(invars[0])) is not None and entry[2]:
-                self.inv_norm[out] = (entry[0], entry[1])
-            return None
-        if prim is jax.lax.sqrt_p and isinstance(invars[0], jcore.Var):
-            if (entry := self.sq_sum.get(invars[0])) is not None and entry[2]:
-                self.pos_norm[out] = (entry[0], entry[1])
+                (self.inv_norm if prim is jax.lax.rsqrt_p else self.pos_norm)[out] = (entry[0], entry[1])
             return None
         if prim is jax.lax.mul_p and len(invars) == 2 and (
                 self._unit_check(invars[0], invars[1], self.inv_norm)
                 or self._unit_check(invars[1], invars[0], self.inv_norm)):
-            return UNIT + 1, _held_apart(Apart(None, 0, number=True, finite=True), out.aval.dtype)
+            return UNIT + 1, _held_apart(Apart(None, 0, number=True, finite=True), out_aval.dtype)
         if prim is jax.lax.div_p and len(invars) == 2 and self._unit_check(
                 invars[0], invars[1], self.pos_norm):
-            return UNIT + 1, _held_apart(Apart(None, 0, number=True, finite=True), out.aval.dtype)
+            return UNIT + 1, _held_apart(Apart(None, 0, number=True, finite=True), out_aval.dtype)
         return None
 
     def child(self, outer_invars: Sequence, inner_invars: Sequence[jcore.Var]) -> _NormTrack:
@@ -1341,10 +1344,19 @@ def _nan_guard_apart(equation: jcore.JaxprEqn, made_eq: Mapping[jcore.Var, jcore
         return None
     if true_val is left or true_val is right:
         return apart_of(false_val)
-    if isinstance(true_val, jcore.Var) and (true_eq := made_eq.get(true_val)) is not None:
-        if true_eq.primitive is jax.lax.add_p and set(true_eq.invars) == {left, right}:
-            return apart_of(false_val)
+    if (isinstance(true_val, jcore.Var) and (true_eq := made_eq.get(true_val)) is not None
+            and true_eq.primitive is jax.lax.add_p and set(true_eq.invars) == {left, right}):
+        return apart_of(false_val)
     return None
+
+
+def _shared_sign(operands: Sequence[Apart], bounds: Sequence[Magnitude | None]) -> int:
+    """Common sign (`1` if all `>= 0`, `-1` if all `<= 0`, else `0`) honoring exact zero `NOTHING`."""
+    if all(_side_matches(h, b, 1) for h, b in zip(operands, bounds, strict=True)):
+        return 1
+    if all(_side_matches(h, b, -1) for h, b in zip(operands, bounds, strict=True)):
+        return -1
+    return 0
 
 
 def _concat_facts(operands: Sequence[Apart], bounds: Sequence[Magnitude | None],
@@ -1352,9 +1364,7 @@ def _concat_facts(operands: Sequence[Apart], bounds: Sequence[Magnitude | None],
     """Intersect sign, floor, finiteness, and magnitude bounds across every operand of `concatenate_p`."""
     if not operands:
         return None, NOWHERE
-    all_pos = all(_side_matches(h, b, 1) for h, b in zip(operands, bounds, strict=True))
-    all_neg = all(_side_matches(h, b, -1) for h, b in zip(operands, bounds, strict=True))
-    sign = 1 if all_pos and not all_neg else -1 if all_neg and not all_pos else 1 if all_pos else 0
+    sign = _shared_sign(operands, bounds)
     floors = [h.floor for h in operands if h.floor is not None]
     floor = min(floors) if len(floors) == len(operands) else None
     known_bounds = [b for b in bounds if b is not None]
@@ -1396,11 +1406,11 @@ def _deep_nonlang(equation: jcore.JaxprEqn, held: dict[jcore.Var, Magnitude | No
         held[out], apart[out] = magnitude_of(equation.invars[0]), apart_of(equation.invars[0])
         return True
     if (prim is jax.lax.concatenate_p and len(equation.outvars) == 1
-            and isinstance(equation.outvars[0].aval, ShapedArray)):
+            and isinstance(out_aval := equation.outvars[0].aval, ShapedArray)):
         out = equation.outvars[0]
         held[out], apart[out] = _concat_facts(
             [apart_of(atom) for atom in equation.invars],
-            [magnitude_of(atom) for atom in equation.invars], out.aval.dtype)
+            [magnitude_of(atom) for atom in equation.invars], out_aval.dtype)
         return True
     if (depth < 6 and (body := programs.called(equation)) is not None
             and len(body.consts) == len(body.constvars)):
@@ -1752,9 +1762,7 @@ def _float_apart(equation: jcore.JaxprEqn, operands: list[Apart], bounds: list[M
     every = known if len(known) == len(floors) else None
     if name in ("add", "sub"):
         shifted = operands if name == "add" else [operands[0], operands[1]._replace(sign=-operands[1].sign)]
-        all_pos = all(_side_matches(h, b, 1) for h, b in zip(shifted, bounds, strict=True))
-        all_neg = all(_side_matches(h, b, -1) for h, b in zip(shifted, bounds, strict=True))
-        sign = 1 if all_pos and not all_neg else -1 if all_neg and not all_pos else 1 if all_pos else 0
+        sign = _shared_sign(shifted, bounds)
         floor = max((found for found in floors if found is not None), default=None) if sign else None
         return Apart(floor, sign, numbers and (finite or sign != 0), finite)
     if name == "mul":
@@ -1779,10 +1787,7 @@ def _float_apart(equation: jcore.JaxprEqn, operands: list[Apart], bounds: list[M
     if name == "select_n":
         cases, case_bounds = operands[1:], bounds[1:]
         kept = [held.floor for held in cases if held.floor is not None]
-        all_pos = all(_side_matches(h, b, 1) for h, b in zip(cases, case_bounds, strict=True))
-        all_neg = all(_side_matches(h, b, -1) for h, b in zip(cases, case_bounds, strict=True))
-        sign = 1 if all_pos and not all_neg else -1 if all_neg and not all_pos else 1 if all_pos else 0
-        return Apart(min(kept) if len(kept) == len(cases) else None, sign,
+        return Apart(min(kept) if len(kept) == len(cases) else None, _shared_sign(cases, case_bounds),
                      all(held.number for held in cases), all(held.finite for held in cases))
     if name == "neg":
         return first._replace(sign=-first.sign)
@@ -1792,25 +1797,8 @@ def _float_apart(equation: jcore.JaxprEqn, operands: list[Apart], bounds: list[M
         return first._replace(sign=1)
     if name in ("square", "integer_pow"):
         return _power_apart(equation, first, bounds[0], dtype)
-    if name in ("exp", "exp2"):
-        floor = None
-        if first.finite and bounds[0] is not None and bounds[0] <= 6:
-            floor = -(math.floor(2 ** bounds[0] * (math.log2(math.e) if name == "exp" else 1.0)) + 2)
-        return Apart(floor, 1, first.number, first.finite or (first.number and first.sign < 0))
-    if name == "sqrt":
-        real, above = first.number and first.sign > 0, first.above
-        return Apart(None if above is None else above // 2, 1, real, real and first.finite)
-    if name == "rsqrt":
-        real = first.number and first.sign > 0
-        floor = (-bounds[0]) // 2 - 1 if real and first.finite and bounds[0] not in (None, NOTHING) else None
-        return Apart(floor, 1 if first.positive else 0, real, first.positive)
-    if name == "logistic":
-        return Apart(None, 1, first.number, first.number)
-    if name in ("log", "log2"):
-        return Apart(None, 0, first.number and first.sign > 0, first.positive and first.finite)
-    if name == "log1p":
-        nonneg = _side_matches(first, bounds[0], 1)
-        return Apart(None, 1 if nonneg else 0, first.number and nonneg, first.finite and nonneg)
+    if name in ("exp", "exp2", "sqrt", "rsqrt", "logistic", "log", "log2", "log1p"):
+        return _transcendental_apart(name, first, bounds[0])
     if name == "dot_general":
         return Apart(None, 0, number=False, finite=finite)
     if name in BOUNDED:
@@ -1836,6 +1824,28 @@ def _float_apart(equation: jcore.JaxprEqn, operands: list[Apart], bounds: list[M
         return Apart(first.floor if first.sign else None, first.sign, first.number and first.sign != 0,
                      first.finite)
     return NOWHERE
+
+
+def _transcendental_apart(name: str, first: Apart, bound: Magnitude | None) -> Apart:
+    """`Apart` for elementary unary transcendentals and roots (`_float_apart`)."""
+    if name in ("exp", "exp2"):
+        floor = None
+        if first.finite and bound is not None and bound <= 6:
+            floor = -(math.floor(2 ** bound * (math.log2(math.e) if name == "exp" else 1.0)) + 2)
+        return Apart(floor, 1, first.number, first.finite or (first.number and first.sign < 0))
+    if name == "sqrt":
+        real, above = first.number and first.sign > 0, first.above
+        return Apart(None if above is None else above // 2, 1, real, real and first.finite)
+    if name == "rsqrt":
+        real = first.number and first.sign > 0
+        floor = (-bound) // 2 - 1 if real and first.finite and bound not in (None, NOTHING) else None
+        return Apart(floor, 1 if first.positive else 0, real, first.positive)
+    if name == "logistic":
+        return Apart(None, 1, first.number, first.number)
+    if name in ("log", "log2"):
+        return Apart(None, 0, first.number and first.sign > 0, first.positive and first.finite)
+    nonneg = _side_matches(first, bound, 1)
+    return Apart(None, 1 if nonneg else 0, first.number and nonneg, first.finite and nonneg)
 
 
 def _power_apart(equation: jcore.JaxprEqn, operand: Apart, bound: Magnitude | None,
