@@ -1143,8 +1143,11 @@ def _launched(kernel, stated: Stated) -> tuple[Work, float]:
                 device_bytes=stated.bytes_accessed, span=walked, kernels=1, chains=counted.paths(walked))
     # Its walking roles' issue slots, the most one of them issues a step (`Work.issue_excess`).
     issuing = counted.issued(issue_slots, stated.steps, programs)
+    # A Mosaic GPU program's warps: a core map's (`plgpu.kernel`) or a call compiled with Mosaic GPU's
+    # parameters (`forms_of`); another backend's unknown.
+    mosaic = kernel.primitive is mpmd.mpmd_map_p or forms is not None
     return (dataclasses.replace(work, issue_excess=max(0.0, issue_slots(work) - issuing)),
-            _warps(counted) if forms is not None else 0.0)
+            _warps(counted) if mosaic else 0.0)
 
 
 def _warps(counted: Emitted) -> float:
