@@ -899,7 +899,12 @@ def test_a_programs_launches_price_in_sequence_and_an_uncounted_one_leaves_it_un
     each = [cost.launch_seconds(emission.work_of(kernel), emission.launch_programs(kernel), target,
                                 warps=emission.warps_of(kernel) or 0.0) for kernel in kernels]
     assert len(kernels) == 2 and emission.launches_seconds(traced, target) == each[0] + each[1], each
-    uncounted = jax.make_jaxpr(lambda x: launch(counted(x)))(row).jaxpr
+    def halved(x_ref, o_ref):
+        o_ref[...] = x_ref[...] * 0.5
+
+    # A launch of a body no costed launch traced (one that did answers with its count, `work_of`).
+    alone = plgpu.kernel(halved, out_type=row, num_threads=1, thread_name="wg")
+    uncounted = jax.make_jaxpr(lambda x: alone(counted(x)))(row).jaxpr
     assert emission.launches_seconds(uncounted, target) is None
     # Through a call, priced as its launches; under a scan, whose trips no sequence states, unknown.
     called = jax.make_jaxpr(jax.jit(lambda x: counted(counted(x))))(row).jaxpr
