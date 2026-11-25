@@ -74,7 +74,9 @@ class ShortConvSite(nn.Module):
         held = cache_variables(self, self.cache_spec(batch))["conv_state"] if call.decode else None
         taps, _ = conv()
         wide = at_least_fp32(x.dtype)
-        if dynamic_input is None:
+        convolved: jax.Array
+        history: jax.Array
+        if dynamic_input is None or self.dynamic_heads is None:
             convolved, history = held_conv1d(x, taps, tokens.valid, None if held is None else held.value,
                                              segments=tokens.segments, right_padded=tokens.right_padded,
                                              dtype=wide, activation=False)
