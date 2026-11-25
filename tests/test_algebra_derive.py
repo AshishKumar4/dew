@@ -1159,6 +1159,11 @@ def test_chunked_moments_preserves_scaled_tangent_under_large_total_weight():
     dx_unif = jnp.asarray([[np.float32(2.0 ** 100), np.float32(2.0 ** 100)]], jnp.float32)
     w_gw = jnp.asarray([[0.0, np.float32(2.0 ** 60)]], jnp.float32)
     dx_gw = jnp.asarray([[np.float32(2.0 ** 70), 0.0]], jnp.float32)
+    x_ovq = jnp.asarray([[np.float32(1.5 * 2.0 ** 127), 0.0]], jnp.float32)
+    dw_ovq = jnp.asarray([[np.float32(2.0 ** -100), 0.0]], jnp.float32)
+    x_sub = jnp.asarray([[np.finfo(np.float32).tiny, 0.0]], jnp.float32)
+    w_sub = jnp.asarray([[0.0, np.float32(1.5 * np.finfo(np.float32).tiny)]], jnp.float32)
+    dw_sub = jnp.asarray([[1.0, 0.0]], jnp.float32)
     x_cn = jnp.asarray([[np.float32(2.0 ** 50), np.float32(-(2.0 ** 50))]], jnp.float32)
     w_cn = jnp.asarray([[np.float32(2.0 ** 50), np.float32(2.0 ** 50)]], jnp.float32)
     for mode in ("walk", "merge"):
@@ -1204,6 +1209,18 @@ def test_chunked_moments_preserves_scaled_tangent_under_large_total_weight():
                 (x_u,), (dx_gw,))
             np.testing.assert_array_equal(
                 np.asarray(d_gw), np.asarray([[np.float32(2.0 ** 10), 0.0]], np.float32))
+            _, (_, dv_ovq) = jax.jvp(
+                lambda w_, t=tile, m=mode: moments.chunked_moments(x_ovq, w_, tile=t, mode=m),
+                (w_u,), (dw_ovq,))
+            assert float(dv_ovq[0]) == float(np.float32(2.25 * 2.0 ** 54))
+            _, (_, _, dc_ovsub) = jax.jvp(
+                lambda w_, t=tile, m=mode: moments.chunked_covariance(x_ovq, x_sub, w_, tile=t, mode=m),
+                (w_u,), (dw_u,))
+            assert float(dc_ovsub[0]) == float(np.float32(3.0))
+            _, (dm_sub, _) = jax.jvp(
+                lambda w_, t=tile, m=mode: moments.chunked_moments(x_sub, w_, tile=t, mode=m),
+                (w_sub,), (dw_sub,))
+            assert float(dm_sub[0]) == float(np.float32(2.0 / 3.0))
             _, (_, dv_cn) = jax.jvp(
                 lambda w_, t=tile, m=mode: moments.chunked_moments(x_cn, w_, tile=t, mode=m),
                 (w_cn,), (dw_u,))

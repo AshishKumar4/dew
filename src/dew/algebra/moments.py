@@ -170,28 +170,34 @@ def _primal_exponent(value: jax.Array) -> jax.Array:
 def _shifted_tangent_div(dtw: jax.Array, numerator: jax.Array, sn: jax.Array,
                          extra_shift: jax.Array | int = 0) -> jax.Array:
     """Linear-in-`dtw` evaluation of `dtw * numerator * 2**extra_shift / sn` using `dew.nn.precision.power2`:
-    normalizes `sn` into `[1, 2)`, moves `q = numerator / u_sn` only toward 1 (or puts all shift onto zero
-    `q` so `dtw` never overflows into `inf * 0`), and applies the remainder to `dtw`."""
+    applies any upward scale to `numerator` before dividing by normalized `u_sn` (in `[0.5, 1)` near
+    `minexp` so minimum-normal numerators never flush to subnormal, `[1, 2)` elsewhere so `fmax` never
+    overflows), puts upward shift onto zero `numerator` to avoid `inf * 0`, and applies the rest to `dtw`."""
+    minexp = int(jnp.finfo(numerator.dtype).minexp)
     e_sn = _primal_exponent(sn)
-    u_sn = power2(sn, -e_sn)
-    q = numerator / u_sn
-    plain_q = jax.lax.stop_gradient(q)
-    zero_q = plain_q == 0
-    e_q = _primal_exponent(q)
-    e_eff = e_sn - extra_shift
+    plain_num = jax.lax.stop_gradient(numerator)
+    zero_num = plain_num == 0
+    e_num = _primal_exponent(numerator)
+    sn_shift = jnp.where((~zero_num) & (e_num <= minexp + 1), e_sn + 1, e_sn)
+    u_sn = power2(sn, -sn_shift)
+    e_eff = sn_shift - extra_shift
     k_num = jnp.where(
-        e_eff > 0, -jnp.minimum(e_eff, jnp.maximum(e_q, 0)),
-        jnp.where(zero_q, -e_eff, jnp.minimum(-e_eff, jnp.maximum(-e_q, 0))))
+        e_eff > 0, -jnp.minimum(e_eff, jnp.maximum(e_num, 0)),
+        jnp.where(zero_num, -e_eff, jnp.minimum(-e_eff, jnp.maximum(-e_num, 0))))
     k_dtw = -e_eff - k_num
-    return power2(dtw, k_dtw) * power2(q, k_num)
+    return power2(dtw, k_dtw) * (power2(numerator, k_num) / u_sn)
 
 
 def _safe_tangent_quad(dtw: jax.Array, big_c: jax.Array, sml_c: jax.Array, sn: jax.Array) -> jax.Array:
-    """Linear-in-`dtw` evaluation of `dtw * big_c * sml_c / sn` via `power2` normalization of `big_c`,
-    avoiding both overflow and underflow of `big_c * sml_c` without extra control flow."""
+    """Linear-in-`dtw` evaluation of `dtw * big_c * sml_c / sn` via `power2` normalization of `big_c` into
+    `[0.5, 1)` when `e_sml > 0` (preventing `u_big * sml_c` overflow at `1.5*2^127`) and `[1, 2)` otherwise
+    (preventing underflow or subnormal flush of minimum-normal `sml_c`)."""
     e_big = _primal_exponent(big_c)
-    u_big = power2(big_c, -e_big)
-    return _shifted_tangent_div(dtw, u_big * sml_c, sn, extra_shift=e_big)
+    e_sml = _primal_exponent(sml_c)
+    nonzero_big = jax.lax.stop_gradient(big_c) != 0
+    shift_big = jnp.where(nonzero_big & (e_sml > 0), e_big + 1, e_big)
+    u_big = power2(big_c, -shift_big)
+    return _shifted_tangent_div(dtw, u_big * sml_c, sn, extra_shift=shift_big)
 
 
 def _cov_tangent_tile(
