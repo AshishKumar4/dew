@@ -45,7 +45,8 @@ def test_native_attention_witness_cells_prepare_without_deferring(tmp_path, monk
     import test_native_certificates as certs
     import tier_wire
     from gpu_flow import run_cells
-    from truths_ahead import DEFERRED, UNPREPARED, prepared
+    from tier_wire import DEFERRED
+    from truths_ahead import UNPREPARED, prepared
 
     topology = generation_support.node_topology(tmp_path / "topology.bin", gpu="sm90")
     monkeypatch.setenv(model_flows.TOPOLOGY, str(topology))

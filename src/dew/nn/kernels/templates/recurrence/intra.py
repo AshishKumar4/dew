@@ -420,15 +420,14 @@ def _sub_chunk_walk(q, k, prefix, beta, taken, own: tuple, call: Call, *, scale:
             held: list = []
             for j in range(later):
                 first = (j + 1) * algebra.SUB
-                if j and len(raised) == 1:
-                    # One buffer for every sub-chunk's keys (`_sub_chunk_staged`): the last sub-chunk's
-                    # products read it before this one's keys overwrite it.
-                    mosaic.synced(call.interpret)
-                # A sub-chunk's keys staged and published once (`Family.staged_together`), the row sets' gated
-                # rows with the first's, its products issued then.
-                with family.staged_together():
-                    keyed = operands.staged(family, gated_up(j + 1), raised[j % len(raised)]).T
-                    held = held or [operands.staged(family, value, lefts[r]) for r, value in enumerate(gated)]
+                # A sub-chunk's keys staged and published in one batch (`operands.staged_all`), the row sets'
+                # gated rows with the first's, its products issued then: the batch's opening barrier (each
+                # store's own where Mosaic GPU brackets it) keeps this sub-chunk's keys from overwriting one
+                # buffer the last's products still read (`_sub_chunk_staged`).
+                batch = [(gated_up(j + 1), raised[j % len(raised)]),
+                         *([] if held else [(value, lefts[r]) for r, value in enumerate(gated)])]
+                staged = operands.staged_all(family, batch)
+                keyed, held = staged[0].T, held or staged[1:]
                 for r, tile in enumerate(held):
                     at = _sum_index(call, r, j)
                     pair = ("pairs", tile.rows(first, algebra.SUB), keyed)

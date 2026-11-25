@@ -148,7 +148,8 @@ class _GroupedLaunch[Config: Hashable](base.Template[Config]):
                                 program(value.after(), value.epilogue_axes, value.epilogue_dtypes,
                                         value.accumulators),
                                 value.prologue_axes, value.epilogue_axes, value.out_dtypes,
-                                value.prologue_broadcast, value.epilogue_broadcast, value.accumulators))
+                                value.prologue_broadcast, value.epilogue_broadcast, value.accumulators,
+                                value.out_forms))
 
     def keyed(self, ba):
         """`tuning.KernelOp.keyed`, a call's tables (`gather`, `scatter`) bucketed as the tokens' rows are,

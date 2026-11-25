@@ -208,9 +208,10 @@ def test_a_module_imported_by_name_is_its_files_input_and_no_earlier_files(ci, t
 
 def test_a_file_a_session_parameter_revisits_takes_what_ran_between_its_visits(ci, tmp_path, monkeypatch,
                                                                                 cache_worker):
-    """A session-scoped parameter runs A[0], B[0], A[1], B[1]: what B's first visit executed and cached
-    serves A's second, so it is A's input though A ran first; an edit to it reruns A."""
-    reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
+    """A session-scoped parameter runs A[0], B[0], A[1], B[1] in one process (a census's or a coverage run's,
+    which hold several files in one pytest): what B's first visit executed and cached serves A's second, so
+    it is A's input though A ran first; an edit to it reruns A."""
+    reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, together=True, files={
         "conftest.py": ON_SRC + "import pytest\n@pytest.fixture(scope='session', params=[0, 1])\n"
                                 "def visit(request):\n    return request.param\n",
         "holder.py": "VALUES = {}\n",
@@ -218,7 +219,7 @@ def test_a_file_a_session_parameter_revisits_takes_what_ran_between_its_visits(c
                      "    assert visit == 0 or holder.VALUES['m'] == 1\n",
         "test_b.py": "import holder\ndef test_b(visit):\n    import m\n"
                      "    holder.VALUES.setdefault('m', m.VALUE)\n"},
-        {"m.py": "VALUE = 1\n"})
+        sources={"m.py": "VALUE = 1\n"})
     assert reused() == [True, True]
     (tmp_path / "src/m.py").write_text("VALUE = 2\n")
     assert reused() == [False, False]
@@ -262,7 +263,7 @@ class Shape:
 
 @pytest.mark.parametrize(("edit", "rerun"), [
     (("def unused(x):\n    return x - 1", "def unused(x):\n    return x - 2"), [False, False]),
-    (("    return x * by", "    return by * x + 0"), [True, True]),
+    (("    return x * by", "    return by * x + 0"), [True, False]),
     (("        return side * side", "        return side ** 2"), [False, True]),
     (("        return self.sides * side", "        return side * self.sides"), [False, False]),
     (("def scaled(x, by=2):", "def scaled(x, by=3):"), [True, True]),
@@ -276,8 +277,8 @@ def test_an_edit_reruns_the_files_whose_run_executed_what_it_changed(ci, tmp_pat
     """A file's key covers the code its run executed, each function it ran and the top level of each module
     it imported (all but function bodies: its imports, constants, classes' attributes and methods'
     signatures, defaults and decorators), not a module's whole text: an edit to a function no run executed,
-    or one that only moves lines, reruns no file, and an edit to what a run executed reruns it and the files
-    its process ran after it, which what it ran may serve."""
+    or one that only moves lines, reruns no file, and an edit to what a run executed reruns it alone, each
+    file of a task run in a process of its own (ci.py's `task`)."""
     reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
         "test_a.py": ON_SRC + "import m\ndef test_a():\n    assert m.scaled(2) == 4\n",
         "test_b.py": ON_SRC + "import m\ndef test_b():\n    assert m.Shape().area(3) == 9\n"},
@@ -377,14 +378,18 @@ def test_a_process_ending_1_after_its_tests_passed_is_red(ci, tmp_path, monkeypa
         == [(1, True)] * 2
 
 
-def test_each_files_record_is_its_own_where_files_share_a_process(ci, tmp_path, monkeypatch, cache_worker):
+@pytest.mark.parametrize("together", [True, False], ids=["one process", "a process a file"])
+def test_each_files_record_is_its_own_where_files_share_a_process(ci, tmp_path, monkeypatch, cache_worker,
+                                                                  together):
     """Each input moves exactly the files that may have seen it (row 2642): a fixture's arrival reruns its
     prober, the process's last file, alone; a helper shadowing a name only a file's child imported reruns
-    that file alone; a module one file imported lazily reruns it and every file the process ran after it,
-    which what it left may serve; and two files whose records share inputs never take each other's row."""
+    that file alone; a module one file imported lazily reruns it, and, where files share a process (a
+    census's, a coverage run's), every file the process ran after it, which what it left may serve, none
+    where each file runs in its own (ci.py's `task`); and two files whose records share inputs never take
+    each other's row."""
     child = ("import site, sysconfig; site.addsitedir(sysconfig.get_paths()['purelib']); "
              "import tabnanny")
-    reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
+    reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, together=together, files={
         "test_child.py": f"import subprocess, sys\ndef test_child():\n"
                          f"    subprocess.run([sys.executable, '-c', {child!r}], check=True)\n",
         "test_lazy.py": ON_SRC + "import holder\ndef test_lazy():\n    import lazy\n"
@@ -392,7 +397,7 @@ def test_each_files_record_is_its_own_where_files_share_a_process(ci, tmp_path, 
         "test_later.py": "import holder\ndef test_later():\n    assert holder.VALUES.get('lazy', 1) == 1\n",
         "test_probe.py": "import os\ndef test_probe():\n"
                          "    assert not os.path.exists('tests/fixtures/f.txt')\n",
-        "holder.py": "VALUES = {}\n"}, {"lazy.py": "VALUE = 1\n"})
+        "holder.py": "VALUES = {}\n"}, sources={"lazy.py": "VALUE = 1\n"})
     assert reused() == [True, True, True, True]
     (tmp_path / "tests/fixtures").mkdir()
     (tmp_path / "tests/fixtures/f.txt").write_text("")
@@ -402,7 +407,7 @@ def test_each_files_record_is_its_own_where_files_share_a_process(ci, tmp_path, 
     assert reused() == [False, True, True, True]
     (tmp_path / "tests/tabnanny.py").unlink()
     (tmp_path / "src/lazy.py").write_text("VALUE = 2\n")
-    assert reused() == [True, False, False, False]
+    assert reused() == [True, False, not together, not together]
     (tmp_path / "src/lazy.py").write_text("VALUE = 1\n")
     common = ci.shared("3.12")
     names = ("tests/test_lazy.py", "tests/test_later.py")

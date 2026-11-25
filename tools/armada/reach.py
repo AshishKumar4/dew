@@ -23,7 +23,7 @@ def last_inputs(python: str, rows: list[tuple[str, str]]) -> dict[tuple[str, str
     found), whatever shared inputs it ran on, so a change to those reads no less (review: rows read only on
     the head's own shared inputs left a change to them reaching nothing); [] where its record holds none;
     None where no record was read (no read token, none there, the Worker unread), which runs."""
-    token, held = os.environ.get(ci.READ_TOKEN), ci.pinned_classes() or [ci.cpu_class()]
+    token, held = os.environ.get(ci.READ_TOKEN), ci.pinned_classes() or [ci.run_keys.cpu_class()]
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return dict.fromkeys(rows)
 
@@ -57,15 +57,15 @@ def reached(python: str, rows: list[tuple[str, str]], kept: Container[tuple[str,
     def keyed() -> tuple[dict[tuple[str, str], str], Callable[[str], str]]:
         # A side's own reading: its digests, and whether a path is a build's output, its checkout's (review).
         ci.digests.built_input.cache_clear()
-        common, reading = ci.shared(python), ci.Reading()
+        common, reading = ci.shared(python), ci.run_keys.Reading()
         alone: dict[str, str] = {}
 
         def single(item: str) -> str:
             # One input's own key, which says whether that input moved (`moved`).
             if item not in alone:
-                alone[item] = ci.cache_key("", "", "", [item], reading)
+                alone[item] = ci.run_keys.cache_key("", "", "", [item], reading)
             return alone[item]
-        return ({(name, group): ci.cache_key(common, name, group, depends, reading)
+        return ({(name, group): ci.run_keys.cache_key(common, name, group, depends, reading)
                  for name, group in rows if (depends := last.get((name, group)))}, single)
 
     now, single_now = keyed()
@@ -74,7 +74,7 @@ def reached(python: str, rows: list[tuple[str, str]], kept: Container[tuple[str,
         then, single_then = keyed()
         # Each input as the key covers it (`inputs`: the test's own code whole, the lookups that found each
         # module), so a changed lookup or the test's own change is a tier-one move (review).
-        moved = {each: [item for item in ci.inputs(each[0], last[each] or [])
+        moved = {each: [item for item in ci.run_keys.inputs(each[0], last[each] or [])
                         if single_then(item) != single_now(item)]
                  for each, key in now.items() if then.get(each) != key}
     finally:

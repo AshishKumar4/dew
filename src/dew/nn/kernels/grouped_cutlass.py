@@ -6,24 +6,31 @@ from __future__ import annotations
 
 import dataclasses
 import importlib
-from collections.abc import Callable
 from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
 
+from dew.nn import sharding
+
 from . import generation
 from .grouped_launch import _GroupedLaunch
+from .templates.axes import GROUPS
 from .templates.gemm import tiling
 from .templates.gemm.hooks import NO_HOOKS, Hooks
 
 
-def _cutlass_call(target: int, out: jax.ShapeDtypeStruct) -> Callable:
-    """dew_cutlass's FFI call giving `out` of the `target`-th of the targets the wheel names
-    (`dew_cutlass.TARGETS`: its grouped GEMM, then its weight gradient), a mapped call running its maps in
-    turn, one launch each (row 4389: JAX's FFI batching refuses a call that states no rule)."""
+def _cutlass_call(target: int, out: jax.ShapeDtypeStruct, *operands, **attributes) -> jax.Array:
+    """dew_cutlass's FFI call of the `target`-th of the targets the wheel names (`dew_cutlass.TARGETS`: its
+    grouped GEMM, then its weight gradient) on `operands`, giving `out`, a mapped call running its maps in
+    turn, one launch each (row 4389: JAX's FFI batching refuses a call that states no rule). Under a
+    checked `shard_map` its operands vary alike and its result varies as they do (`sharding.varied_alike`,
+    `sharding.computed_from`): an FFI call requires the first and states its result's type as given, so a
+    layer's matrices sliced at each device's own layer (`CutlassGmm._fwd`) were typed the same on every
+    device (#3976's review P0)."""
     name = importlib.import_module('dew_cutlass').TARGETS[target]
-    return jax.ffi.ffi_call(name, out, vmap_method='sequential')
+    call = jax.ffi.ffi_call(name, sharding.computed_from(out, *operands), vmap_method='sequential')
+    return call(*sharding.varied_alike(operands), **attributes)
 
 
 def cutlass_tile(architecture: str, out_dtype) -> tiling.Tiles:
@@ -71,15 +78,20 @@ class _Cutlass(_GroupedLaunch[tiling.Tiles]):
         """Whether its kernels take the call wherever dew_cutlass holds them (`eligible` adds the installed
         library's generations): bf16 operands, bf16 or fp32 out, int32 sizes, every extent a multiple of 8
         elements (16-byte aligned rows of every operand and output, as its TMA copies and each group's
-        pointers need), no hooks or exact sums, compiled (no interpreter), its stack read whole."""
+        pointers need), no epilogue or exact sums, compiled (no interpreter). A stack's layer it reads as a
+        slice of its matrices, and rows a prologue forms (its sides by row or depth, none by group) as XLA
+        forms them before the call (`_formed`)."""
+        hooks = ba.arguments['hooks']
         operands = [value for name, value in ba.arguments.items()
                     if name in ('tokens', 'kernel', 'cotangent')]
         extents = {extent for operand in operands for extent in operand.shape[1:]}
         return (all(operand.dtype == jnp.bfloat16 for operand in operands)
                 and jnp.dtype(ba.arguments['out_dtype']) in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32))
                 and ba.arguments['sizes'].dtype == jnp.int32 and all(extent % 8 == 0 for extent in extents)
-                and ba.arguments['hooks'] == NO_HOOKS and not ba.arguments.get('exact_sums')
-                and not ba.arguments['interpret'] and ba.arguments.get('first') is None)
+                and hooks.epilogue is None and hooks.out_dtypes is None and not hooks.out_forms
+                and not any(GROUPS in axes for axes in hooks.prologue_axes)
+                and not ba.arguments.get('exact_sums')
+                and not ba.arguments['interpret'])
 
     def space(self, ba) -> tuple[tiling.Tiles, ...]:
         tile = self.tile(ba)
@@ -91,9 +103,30 @@ class _Cutlass(_GroupedLaunch[tiling.Tiles]):
 
     def legal(self, ba, config: tiling.Tiles, target) -> bool:
         """Whether `config` runs the call: its build's one kernel (`space`), which CUTLASS sized to every part
-        of its architecture, its shared memory and registers its own; a pin or a tuned pick names it."""
+        of its architecture, its shared memory and registers its own; a pin or a tuned pick names it, of a
+        call its kernels take (`in_contract`)."""
         del target
-        return config in self.space(ba)
+        return config in self.space(ba) and self.in_contract(ba)
+
+
+def _formed(tokens: jax.Array, prologue_operands: tuple, hooks: Hooks) -> jax.Array:
+    """The rows a CUTLASS launch multiplies: `tokens` through the call's prologue where it has one, formed by
+    XLA before the call in the tokens' dtype, as `gemm`'s portable program forms them (the copy a call naming
+    CUTLASS takes where the template forms them tile by tile: an input-scaled MoE's rows times their routing
+    weights, models-28's review). Rows read through tables hand on before a CUTLASS launch
+    (`grouped_matmul`'s 'tables' need). Its side operands' dimensions of one the launch squeezed out
+    (`Hooks.prologue_broadcast`) come back as dimensions of one, the arrays the call was given, where a
+    kernel's tile broadcasts them across its own (`Hooks.before`): a `[rows, 1]` side a hook reduces along
+    its singleton reads one value a row, as the portable program's (#3985's review). As that program, it
+    forms the whole array at once, every row through the hook (`gemm`'s hooks act on each row's values)."""
+    prologue = hooks.prologue
+    if prologue is None:
+        return tokens
+    assert callable(prologue), prologue
+    positions = hooks.prologue_broadcast or ((),) * len(prologue_operands)
+    sides = tuple(jnp.expand_dims(side, where) if where else side
+                  for side, where in zip(prologue_operands, positions, strict=True))
+    return jnp.asarray(prologue(tokens, *sides), tokens.dtype)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -110,15 +143,20 @@ class CutlassGmm(_Cutlass):
              trans_rhs: bool, interpret: bool,
              hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
              dense: bool = False, config: tiling.Tiles, return_residuals: bool = False):
-        # No hooks, side operands, second matrix, stack read from a first matrix or exact sums: the launch is
-        # not eligible for them (`_Cutlass.eligible`); a dense call is one group, as any.
-        del prologue_operands, epilogue_operands, paired, first, gather, scatter, interpret, hooks, exact_sums
-        del dense, config, joined, beside, chained
+        # No epilogue, second matrix or exact sums: the launch is not eligible for them (`_Cutlass.eligible`);
+        # a dense call is one group, as any.
+        del epilogue_operands, paired, gather, scatter, interpret, exact_sums, dense, config, joined, beside
+        del chained
+        tokens = _formed(tokens, prologue_operands, hooks)
+        if first is not None:
+            # A stacked layer's call (a scanned stack's, `gemm._grouped`) reads its groups' matrices from the
+            # stack's `first`: the library takes one array of them, so it gets the layer's as a slice, the
+            # copy a stack read whole made before the scanned default (row 4074's review).
+            kernel = jax.lax.dynamic_slice_in_dim(kernel, first, sizes.shape[0])
         importlib.import_module('dew_cutlass').registered()
         width = kernel.shape[1] if trans_rhs else kernel.shape[2]
         out = jax.ShapeDtypeStruct((tokens.shape[0], width), jnp.dtype(out_dtype))
-        call = _cutlass_call(0, out)
-        return call(tokens, kernel, sizes, transpose_w=trans_rhs), None
+        return _cutlass_call(0, out, tokens, kernel, sizes, transpose_w=trans_rhs), None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -139,8 +177,9 @@ class CutlassTgmm(_Cutlass):
              hooks: Hooks = NO_HOOKS,
              exact_sums: bool = False, dense: bool = False, config: tiling.Tiles,
              return_residuals: bool = False):
-        del prologue_operands, gather, interpret, hooks, exact_sums, dense, config  # as `CutlassGmm._fwd`'s
+        del gather, interpret, exact_sums, dense, config  # as `CutlassGmm._fwd`'s
+        tokens = _formed(tokens, prologue_operands, hooks)
         importlib.import_module('dew_cutlass').registered()
         out = jax.ShapeDtypeStruct((sizes.shape[0], tokens.shape[1], cotangent.shape[1]),
                                    jnp.dtype(out_dtype))
-        return _cutlass_call(1, out)(tokens, cotangent, sizes), None
+        return _cutlass_call(1, out, tokens, cotangent, sizes), None

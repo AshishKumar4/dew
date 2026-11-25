@@ -7,10 +7,18 @@ reviewed (`REVIEWED`) or resolved by the literal table it selects from (`SELECTE
 any other, or a lazy table no literal states, is keyed by the whole package instead (`whole_digest`),
 logged, so a site added unreviewed costs warm records, never a stale one.
 
-Every read is of one snapshot of the tree a process takes once (`_snapshot`: each file's digest), so a
-closure and its digest state one revision, the one its imports read. A closure
-is walked once a tree and kept in Dew's cache, so a start reads its files' bytes, not their syntax: a walk
-parses an op's 153 files in about a second."""
+Every read is of one snapshot of the tree a process takes (`_snapshot`: each module's file as it is first
+looked up, its bytes as first read), so a closure and its digest state one revision, the one its imports
+read, and a digest reads, and lists, its closure's files alone: a test of a kernel's records reads
+the files its kernel's code is, not every file of Dew's (2026-11-23: a snapshot that read every file whole
+made each such test's CI key every file of Dew's, so any edit anywhere ran 61% of the suite again). A
+closure is walked once a tree and kept in Dew's cache, so a start reads its files' bytes, not their syntax:
+a walk parses an op's 153 files in about a second.
+
+A process's digests are of its files as it first reads them: a source file of Dew's edited in place inside a
+running process is not supported (a module imported before the edit runs code its digest does not state).
+Edit a checkout no process runs, or start the process again; a module made a package or a package a module
+under a running process is untied, its records keyed by that process alone (`_tied`)."""
 
 import contextlib
 import dataclasses
@@ -18,7 +26,9 @@ import functools
 import hashlib
 import json
 import logging
+import os
 import sys
+import threading
 from collections.abc import Collection, Mapping, Sequence
 from pathlib import Path
 
@@ -77,6 +87,7 @@ REVIEWED = {
         "dew._cache:unintercepted:sys.modules", "dew._devices:_seen:sys.modules",
         "dew._devices:backend_open:sys.modules", "dew._devices:flags_hold:sys.modules",
         "dew._devices:opens_tpu:sys.modules",
+        "dew._code:_tied:sys.modules",
         "dew._sources:file_of:sys.modules", "dew._sources:function_reads:sys.modules",
         "dew._sources:generated_fields:sys.modules", "dew._sources:own_source:sys.modules",
         "dew._sources:recorded:sys.modules", "dew._sources:source_file:sys.modules",
@@ -102,36 +113,76 @@ def code_digest(*roots: str) -> str:
     each by its path and contents as this process's snapshot of the tree holds them (`_snapshot`), the
     release's version (`dew._version`) not read: what a record of what those modules computed keys on. The
     whole package's (`whole_digest`) where the closure holds a dynamic import site not `REVIEWED`, which is
-    logged (its code could import any module), or where a file the walk reads is no longer the snapshot's
-    (`_Changed`): keyed by the snapshot, as the process's imports are by the tree they read."""
+    logged (its code could import any module), or where a file the walk reads is gone since the tree was
+    listed (`_Changed`): keyed by the snapshot, as the process's imports are by the tree they read."""
     try:
         modules, sites = _kept_closure(roots)
+        unreviewed = sorted(set(sites) - REVIEWED.keys())
+        if unreviewed:
+            _log.warning("the code of %s imports by computed names at %s, none reviewed "
+                         "(dew._code.REVIEWED): its records are keyed by all of Dew's code",
+                         ", ".join(roots), ", ".join(unreviewed))
+            return whole_digest()
+        return _digest(modules)
     except _Changed:
         return whole_digest()
-    unreviewed = sorted(set(sites) - REVIEWED.keys())
-    if unreviewed:
-        _log.warning("the code of %s imports by computed names at %s, none reviewed (dew._code.REVIEWED): "
-                     "its records are keyed by all of Dew's code", ", ".join(roots), ", ".join(unreviewed))
-        return whole_digest()
-    return _digest(modules)
+    except _Untied as untied:
+        return _untied_digest(str(untied))
 
 
 @functools.cache
 def whole_digest() -> str:
     """The digest of every module of Dew's as this process's snapshot holds them (`_snapshot`), the release's
     version not read: what a record of code no closure bounds keys on (a launch with a hook,
-    `provenance_code`; a rung, a verified mapping, a saved source's export)."""
-    return _digest(_snapshot())
+    `provenance_code`; a rung, a verified mapping, a saved source's export), which reads every file. A
+    file gone since the tree was listed is none of it. Every file of the packages is read, a module's whose
+    name is no identifier among them (importlib loads `dew/extra-name.py`)."""
+    digest = hashlib.sha256()
+    try:
+        for relative in _listed():
+            with contextlib.suppress(_Changed):
+                digest.update(f"{relative}\0{_contents_at(relative)}\0".encode())
+    except _Untied as untied:
+        return _untied_digest(str(untied))
+    return digest.hexdigest()
+
+
+@functools.cache
+def _untied_digest(why: str) -> str:
+    """A digest no other process computes: this process's code where a file it reads cannot be tied to the
+    revision it imported (`_Untied`), so no record it keys is another process's, nor kept for one."""
+    _log.warning("%s: records this process computes are keyed by it alone", why)
+    return hashlib.sha256(b"untied\0" + os.urandom(16)).hexdigest()
 
 
 def _digest(modules: Collection[str]) -> str:
-    """The digest of `modules` by their paths and contents as this process's snapshot holds them."""
+    """The digest of `modules` by their paths and contents as this process's snapshot holds them
+    (`_contents`): the files of `modules` alone are read."""
     files = _snapshot()
     digest = hashlib.sha256()
     for module in sorted(modules):
-        relative, contents = files[module]
-        digest.update(f"{relative}\0{contents}\0".encode())
+        digest.update(f"{files[module]}\0{_contents(module)}\0".encode())
     return digest.hexdigest()
+
+
+def _contents(module: str) -> str:
+    """The digest of `module`'s contents as this process's snapshot holds them (`_source`)."""
+    return _contents_at(_file(module))
+
+
+def _file(module: str) -> str:
+    """Dew's `module`'s file under `SOURCE` in this process's snapshot of the tree (`_snapshot`); LookupError
+    where it holds none."""
+    found = _snapshot().get(module)
+    if found is None:
+        raise LookupError(f"no module of Dew's is named {module}")
+    return found
+
+
+@functools.cache
+def _contents_at(relative: str) -> str:
+    """The digest of the file at `relative` under `SOURCE` as this process first read it (`_read`)."""
+    return hashlib.sha256(_read(relative)).hexdigest()
 
 
 def provenance(values: Sequence[object]) -> frozenset[str] | None:
@@ -186,41 +237,80 @@ def _held(value) -> Sequence[object]:
 
 
 class _Changed(Exception):
-    """A source file is not the one this process's snapshot of Dew's source holds (`_snapshot`)."""
+    """A source file the tree's listing named is gone (`_snapshot`)."""
 
 
-def _listed() -> dict[str, tuple[str, str]]:
-    """Each module of Dew's packages as its source is now: its file's path under `SOURCE` and the digest of
-    its contents, by its name."""
-    files = {}
+class _Untied(Exception):
+    """A source file of a module this process imported whose bytes are not those it imported (`_tied`)."""
+
+
+def _listed() -> list[str]:
+    """Each Python file of Dew's packages, by its path under `SOURCE`, a module's whose name is no identifier
+    among them, but the release's version (`VERSION_FILE`) and a file a link places outside `SOURCE`: a
+    listing of the whole tree, which `whole_digest` alone reads (a directory listed is a read of it)."""
+    root = SOURCE.resolve()
+    files = []
     for package in PACKAGES:
         for path in sorted((SOURCE / package).rglob("*.py")):
             relative = path.relative_to(SOURCE)
-            # The release's version, which no code of Dew's computes from, is no part of its source here: a
-            # release that moves it alone keeps every record (`VERSION_FILE`).
-            if relative == Path("dew", VERSION_FILE):
-                continue
-            name = ".".join(relative.with_suffix("").parts).removesuffix(".__init__")
-            # A package's `__init__` is what its name imports where a module file of that name is beside it.
-            shadowed = name in files and files[name][0].endswith("/__init__.py")
-            if (contents := _hashed(path)) is not None and not shadowed:
-                files[name] = (relative.as_posix(), contents)
+            if relative != Path("dew", VERSION_FILE) and path.resolve().is_relative_to(root):
+                files.append(relative.as_posix())
     return files
 
 
-def _hashed(path: Path) -> str | None:
-    """The digest of `path`'s contents; None for a file removed since it was listed, which is absent."""
-    with contextlib.suppress(FileNotFoundError):
-        return hashlib.sha256(path.read_bytes()).hexdigest()
+class _Tree(Mapping[str, str]):
+    """Dew's modules by name, each looked up as it is asked for, its file's path under `SOURCE`: no directory
+    is listed, so a closure's walk reads, and its run is keyed by, the files of its closure alone. Each name's
+    answer is the snapshot's (`looked`), the same at every later ask."""
+
+    def __init__(self) -> None:
+        self.looked: dict[str, str | None] = {}
+
+    def __getitem__(self, module: str) -> str:
+        if module not in self.looked:
+            self.looked[module] = _located(module)
+        found = self.looked[module]
+        if found is None:
+            raise KeyError(module)
+        return found
+
+    def __iter__(self):
+        named = (".".join(Path(relative).with_suffix("").parts).removesuffix(".__init__")
+                 for relative in _listed())
+        return iter([name for name in named if name in self])
+
+    def __len__(self) -> int:
+        return sum(1 for _ in self)
+
+
+def _located(module: str) -> str | None:
+    """Dew's `module`'s file under `SOURCE`, by its name, or None: a package's `__init__.py` where a module
+    file of its name is beside it, as the import system finds it; the release's version (`VERSION_FILE`),
+    which no code of Dew's computes from, none, so a release that moves it alone keeps every record."""
+    parts = module.split(".")
+    # Any name importlib takes (`dew.extra-name` among them), none that would leave the package's directory.
+    if parts[0] not in PACKAGES or any(not part or part in (".", "..") or "/" in part or "\\" in part
+                                       for part in parts):
+        return None
+    for relative in (Path(*parts, "__init__.py"), Path(*parts).with_suffix(".py")):
+        if relative != Path("dew", VERSION_FILE) and (SOURCE / relative).is_file():
+            return relative.as_posix()
     return None
 
 
-@functools.cache
-def _snapshot() -> dict[str, tuple[str, str]]:
-    """Dew's source as this process first read it (`_listed`): which modules exist, where, and what each
-    holds. A closure is walked from it (`_path`, `_source`) and a digest computed from it, one tree
-    throughout, however the files change after."""
-    return _listed()
+_trees: list[_Tree] = []
+_walks: list[Walk] = []
+_making = threading.Lock()
+
+
+def _snapshot() -> _Tree:
+    """Dew's source as this process first finds it: each module's file as first looked up (`_Tree`), and its
+    bytes as first read (`_source`), one tree throughout, however the files change after, made once however
+    many threads ask at once."""
+    with _making:
+        if not _trees:
+            _trees.append(_Tree())
+        return _trees[0]
 
 
 def _kept_closure(roots: tuple[str, ...]) -> tuple[frozenset[str], tuple[str, ...]]:
@@ -232,26 +322,54 @@ def _kept_closure(roots: tuple[str, ...]) -> tuple[frozenset[str], tuple[str, ..
     directory = kept_beside("dew-code")
     if directory is None:
         return closure(*roots)
-    named = hashlib.sha256(json.dumps(roots).encode()).hexdigest()[:16]
-    kept = directory / "{}-{}.{}-{}".format(whole_digest(), *sys.version_info[:2], named)
+    named = hashlib.sha256(json.dumps([roots, _policy()]).encode()).hexdigest()[:16]
+    kept = directory / "{}.{}-{}".format(*sys.version_info[:2], named)
     found = read_kept(kept)
     if isinstance(found, dict) and _sound(found, roots):
         held, at = found["modules"], found["sites"]
         assert isinstance(held, list) and isinstance(at, list)
         return frozenset(map(str, held)), tuple(map(str, at))
     modules, sites = closure(*roots)
-    record: dict[str, JSON] = {"roots": [*roots], "modules": [*sorted(modules)], "sites": [*sites]}
+    record: dict[str, JSON] = {"roots": [*roots], "modules": [*sorted(modules)], "sites": [*sites],
+                               "digests": {module: _contents(module) for module in sorted(modules)},
+                               "looked": {name: _snapshot().get(name)
+                                          for name in sorted(_walk().footprint(modules))}}
     keep(kept, record, f"the closure of {', '.join(roots)}")
     return modules, sites
 
 
+
+
+
+@functools.cache
+def _policy() -> str:
+    """The digest of how a closure is walked: the walker's code (`dew._imports`) and the sites it follows by
+    their tables (`SELECTED`), which a kept closure's name holds, so a change to either walks every closure
+    again, though no closure imports the walker."""
+    walker = _read("dew/_imports.py")
+    return hashlib.sha256(walker + json.dumps(SELECTED, sort_keys=True).encode()).hexdigest()
+
+
 def _sound(found: dict[str, JSON], roots: tuple[str, ...]) -> bool:
-    """Whether `found` is a closure of `roots` as `_kept_closure` keeps one."""
+    """Whether `found` is a closure of `roots` as `_kept_closure` keeps one, the tree as its walk found it:
+    each module of it the same file, its contents the same, and each name the walk looked up (`_Tree`) found
+    where it was, or still absent. A closure's own code states what it imports, by names whose lookups the
+    walk made: where all of those find what they found, so does the walk, whatever changed beside it (a file
+    added that a guarded import would now find, a module become a package, is a lookup that differs)."""
     modules, sites = found.get("modules"), found.get("sites")
-    if found.get("roots") != list(roots) or not isinstance(modules, list) or not isinstance(sites, list):
+    digests, looked = found.get("digests"), found.get("looked")
+    if found.get("roots") != list(roots) or not isinstance(modules, list) or not isinstance(sites, list) \
+            or not isinstance(digests, dict) or not isinstance(looked, dict):
         return False
-    return (all(isinstance(module, str) and _path(module) is not None for module in modules)
-            and set(roots) <= set(modules) and all(isinstance(site, str) for site in sites))
+    tree = _snapshot()
+    if not (all(isinstance(site, str) for site in sites) and set(roots) <= set(modules) == set(digests)
+            and all(tree.get(name) == where for name, where in looked.items())
+            and all(isinstance(module, str) and tree.get(module) is not None for module in modules)):
+        return False
+    try:
+        return all(isinstance(module, str) and _contents(module) == digests[module] for module in modules)
+    except _Changed:
+        return False
 
 
 def closure(*roots: str) -> tuple[frozenset[str], tuple[str, ...]]:
@@ -261,31 +379,61 @@ def closure(*roots: str) -> tuple[frozenset[str], tuple[str, ...]]:
     return _walk().closure(*roots)
 
 
-@functools.cache
 def _walk() -> Walk:
     """The walk of this process's snapshot of Dew's source (`_snapshot`), each module read checked against it
-    (`_source`)."""
-    return Walk({module: relative for module, (relative, _) in _snapshot().items()}, _source, SELECTED)
+    (`_source`), made once however many threads ask at once: a closure and its footprint read one walk."""
+    tree = _snapshot()
+    with _making:
+        if not _walks:
+            _walks.append(Walk(tree, _source, SELECTED))
+        return _walks[0]
 
 
 def _path(module: str) -> Path | None:
     """The source file of Dew's `module` in this process's snapshot of the tree (`_snapshot`), None where
     it holds none (a library's, an absent one)."""
     found = _snapshot().get(module)
-    return None if found is None else SOURCE / found[0]
+    return None if found is None else SOURCE / found
 
 
-@functools.cache
 def _source(module: str) -> bytes:
-    """`module`'s source as this process's snapshot of the tree holds it (`_snapshot`); `_Changed` where
-    its file holds another now."""
-    path = _path(module)
-    if path is None:
-        raise LookupError(f"no module of Dew's is named {module}")
-    try:
-        contents = path.read_bytes()
-    except FileNotFoundError as missing:
-        raise _Changed(f"{path} was removed after this process first read Dew's source") from missing
-    if hashlib.sha256(contents).hexdigest() != _snapshot()[module][1]:
-        raise _Changed(f"{path} changed after this process first read Dew's source")
-    return contents
+    """`module`'s source as this process's snapshot of the tree holds it (`_snapshot`, `_read`)."""
+    return _read(_file(module))
+
+
+_reads: dict[str, bytes] = {}
+_reading = threading.Lock()
+
+
+def _read(relative: str) -> bytes:
+    """The bytes of the file at `relative` under `SOURCE` as this process first reads them, one read however
+    many threads ask at once, so a closure's walk parses and its digest hashes the same bytes; `_Changed`
+    where the file is gone since the tree was listed, `_Untied` where its module was imported from another
+    file (`_tied`)."""
+    with _reading:
+        if relative not in _reads:
+            path = SOURCE / relative
+            try:
+                source = path.read_bytes()
+            except FileNotFoundError as missing:
+                raise _Changed(f"{path} was removed after this process first listed Dew's source") \
+                    from missing
+            _tied(relative)
+            _reads[relative] = source
+        return _reads[relative]
+
+
+def _tied(relative: str) -> None:
+    """Raise `_Untied` where a module this process imported from another file is now located at `relative`
+    (a module made a package, or a package a module, after its import): its imports were read from a file
+    its digest does not hash. Only the file the module's name finds now, as an import would (`_located`): a
+    module file a package of its name shadows, which `whole_digest` reads too, is no module's. An edit of a
+    file in place inside a running process is not checked (see the module's doc)."""
+    name = ".".join(Path(relative).with_suffix("").parts).removesuffix(".__init__")
+    if _located(name) != relative:
+        return
+    loaded = sys.modules.get(name)
+    spec = None if loaded is None else loaded.__spec__
+    if spec is not None and spec.origin is not None and \
+            Path(spec.origin).resolve() != (SOURCE / relative).resolve():
+        raise _Untied(f"dew's {name} was imported from {spec.origin}, and is now at {relative}")

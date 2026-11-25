@@ -209,11 +209,12 @@ def test_a_matrix_case_pinned_to_the_nodes_generation_runs_in_its_prepare(tmp_pa
 
 def test_a_cell_that_computes_in_a_parts_prepare_is_deferred_to_its_run(tmp_path, monkeypatch):
     """In a GPU tier part's prepare (`tier_wire.preparing`, its store open), a cell that raises, computing
-    where nothing computes, is recorded deferred, where it raised (`truths_ahead.DEFERRED`), and the flow
+    where nothing computes, is recorded deferred, where it raised (`tier_wire.DEFERRED`), and the flow
     passes its prepare, its other cells run; outside a prepare the same cell fails its flow (rows 8505 and
     8506: such a cell beside a flow's prepared sites turned its test red in the prepare)."""
     import tier_wire
-    from truths_ahead import DEFERRED, UNPREPARED, compiled_truths
+    from tier_wire import DEFERRED
+    from truths_ahead import UNPREPARED, compiled_truths
 
     def computing():
         raise AttributeError("'jaxlib._jax.Executable' object has no attribute 'local_devices'")
@@ -231,6 +232,79 @@ def test_a_cell_that_computes_in_a_parts_prepare_is_deferred_to_its_run(tmp_path
     assert raised.value.labels == ["computes"]
 
 
+def test_a_cell_past_its_prepares_cap_is_deferred_to_its_run_and_not_run(tmp_path, monkeypatch):
+    """In a part's prepare past its cap (`tier_wire.PREPARE_BY`), a flow runs the cells before it and defers
+    each after, unrun, to its run (`tier_wire.DEFERRED`, where `tier_wire.CAPPED`), its flow passing its
+    prepare: the cells it prepared kept, those it left named unprepared."""
+    import json
+    import time
+
+    import tier_wire
+    from truths_ahead import compiled_truths
+
+    ran = []
+
+    def first():
+        ran.append("first")
+        monkeypatch.setenv(tier_wire.PREPARE_BY, repr(time.monotonic() - 1.0))
+
+    flow = [Cell("first", first), Cell("second", lambda: ran.append("second")),
+            Cell("third", lambda: ran.append("third"))]
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    monkeypatch.setenv(tier_wire.PREPARE_BY, repr(time.monotonic() + 600.0))
+    with compiled_truths(tmp_path, prepare=True, stamp="a"):
+        run_cells(flow)
+    assert ran == ["first"]
+    record = json.loads((tmp_path / tier_wire.DEFERRED).read_text())
+    assert [(reason["where"], reason["cell"]) for reason in record["reasons"]] == [
+        (tier_wire.CAPPED, "second"), (tier_wire.CAPPED, "third")]
+
+
+def test_a_test_opening_its_own_store_past_its_prepares_cap_is_named_unprepared_and_not_run(tmp_path):
+    """In a part's prepare past its cap, a test marked `prepares` (a flow's, which opens its own store, as
+    tests/test_gpu_flows.py's does, and starts its compile in its body) is skipped before its body, named
+    unprepared where its prepare's records are read (tests/conftest.py's `compiled_ahead`, where
+    `tier_wire.CAPPED`), never run past the cap."""
+    import json
+    import os
+    import subprocess
+    import sys
+    import time
+    from pathlib import Path
+
+    import tier_wire
+    from truths_ahead import UNPREPARED
+
+    ran = tmp_path / "ran"
+    (tmp_path / "test_own_store.py").write_text(
+        "import pathlib\nimport pytest\n\n\n@pytest.mark.prepares\ndef test_flow():\n"
+        f"    pathlib.Path({str(ran)!r}).write_text('ran')\n")
+    tests = Path(__file__).parent
+    # The node's one GPU, as its driver lists it (a prepare counts its run's devices by it).
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    (tools / "nvidia-smi").write_text("#!/bin/sh\necho 'GPU 0: NVIDIA H100 80GB HBM3 (UUID: GPU-0)'\n")
+    (tools / "nvidia-smi").chmod(0o755)
+    done = subprocess.run(
+        [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", "--rootdir", str(tmp_path),
+         "--junitxml", str(tmp_path / "report.xml"),
+         "-c", str(tests.parent / "pyproject.toml"), "-p", "conftest", str(tmp_path / "test_own_store.py")],
+        env={**os.environ, "PATH": f"{tools}:{os.environ['PATH']}", "JAX_PLATFORMS": "cpu",
+             "PYTHONPATH": str(tests), tier_wire.PREPARE: "1",
+             tier_wire.TRUTHS: str(tmp_path / "truths"), tier_wire.PREPARE_BY: repr(time.monotonic() - 1.0)},
+        capture_output=True, text=True, timeout=600, cwd=tests.parent)
+    import xml.etree.ElementTree as ElementTree
+
+    suite = ElementTree.parse(tmp_path / "report.xml").getroot().find("testsuite")
+    assert done.returncode == 0 and suite is not None
+    assert (suite.get("tests"), suite.get("skipped")) == ("1", "1")
+    assert not ran.exists()
+    [record] = list((tmp_path / "truths").rglob(UNPREPARED))
+    held = json.loads(record.read_text())
+    assert (held["test"].endswith("test_own_store.py::test_flow"),
+            [reason["where"] for reason in held["reasons"]]) == (True, [tier_wire.CAPPED])
+
+
 def test_a_cell_raising_after_its_prepare_compiled_its_programs_passes_it_unrecorded(tmp_path, monkeypatch):
     """In a GPU tier part's prepare, a cell that compiled a site and then raised, checking what its prepare
     gives in its programs' place (`ahead_arm`'s zeros), passes its prepare with nothing recorded, its run
@@ -243,7 +317,8 @@ def test_a_cell_raising_after_its_prepare_compiled_its_programs_passes_it_unreco
     import numpy as np
     import tier_wire
     from reference_error import ahead_arm, assert_as_exact
-    from truths_ahead import DEFERRED, UNPREPARED, CompiledTruths, compiled_truths
+    from tier_wire import DEFERRED
+    from truths_ahead import UNPREPARED, CompiledTruths, compiled_truths
 
     def checked():
         made = ahead_arm(jax.jit(lambda x: x + 1.0), "a checked product")(np.zeros(3, np.float32))
@@ -319,7 +394,8 @@ def test_a_cell_compiling_at_its_run_is_passed_by_in_a_parts_prepare(tmp_path, m
     deferred, and its flow passes its prepare; outside a prepare it runs, its failure its flow's (rows 8074,
     8635: every such cell was deferred and its test named unprepared)."""
     import tier_wire
-    from truths_ahead import DEFERRED, compiled_truths
+    from tier_wire import DEFERRED
+    from truths_ahead import compiled_truths
 
     ran = []
 
@@ -460,10 +536,52 @@ def test_a_parts_prepare_passes_by_its_cells_placed_on_the_hosts_cpu(tmp_path, m
     import test_gpu_numerics
     import tier_wire
     from generation_support import node_target
-    from truths_ahead import DEFERRED, prepared
+    from tier_wire import DEFERRED
+    from truths_ahead import prepared
 
     monkeypatch.setenv(model_flows.TOPOLOGY, str(node_topology(tmp_path / "topology.bin", gpu="sm90")))
     monkeypatch.setenv(tier_wire.PREPARE, "1")
     with prepared(tmp_path / "store", stamp="a", target=node_target()):
         run_cells([*test_gpu_numerics.projection_cells(), *test_gpu_numerics.seams_cells(None)])
     assert not (tmp_path / "store" / DEFERRED).exists()
+
+
+def test_a_prepared_sites_draw_whose_shape_reads_its_value_keys_its_own_program():
+    """A site's prepare reads each draw's shapes traced abstractly and draws in full one seed of each shapes
+    (`arm_store._first_draws`): the draws it keeps name exactly the programs every draw drawn in full names,
+    each its first seed's draw. A draw whose shape reads a value it drew (a length from its seed's key) is
+    drawn in full for its shapes, every seed of it, and warned of (`ConcreteDraws`), each seed of other
+    shapes keying its own program; one of fixed shapes keeps its first seed's draw alone, warned of by none
+    (row 12431: a Gemma vocabulary's 1,280 draws of a 64 MiB head made in full for one program)."""
+    import warnings
+
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from arm_arithmetic import drawn_on_the_host
+    from arm_store import ConcreteDraws, _first_draws
+    from truths_ahead import named
+
+    def fixed(seed):
+        return jax.random.normal(jax.random.key(seed), (4, 3)), jnp.arange(2)
+
+    def read(seed):
+        return (jnp.ones((int(jax.random.randint(jax.random.key(seed), (), 1, 4)), 3)),)
+
+    seeds = range(12)
+    for draw, concrete in ((fixed, 0), (read, len(seeds))):
+        every: dict[str, int] = {}
+        for seed in seeds:
+            every.setdefault(named("truth", drawn_on_the_host(draw, seed)), seed)
+        with warnings.catch_warnings(record=True) as warned:
+            warnings.simplefilter("always")
+            kept = _first_draws(draw, seeds, "a site")
+        programs: dict[str, tuple] = {}
+        for inputs in kept:
+            programs.setdefault(named("truth", inputs), inputs)
+        assert list(programs) == list(every)
+        for name, inputs in programs.items():
+            jax.tree.map(np.testing.assert_array_equal, inputs, drawn_on_the_host(draw, every[name]))
+        assert len(kept) == (concrete or 1) and (len(every) > 1 if concrete else len(every) == 1)
+        assert [(item.category, f"{concrete} of its draws" in str(item.message)) for item in warned] == (
+            [(ConcreteDraws, True)] if concrete else [])

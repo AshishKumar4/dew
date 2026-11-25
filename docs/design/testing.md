@@ -80,7 +80,7 @@ half of sharded against unsharded has no fleet to run on
 
 Implementations come from their registries. A new implementation cannot opt out by being absent from a hand-kept test list.
 
-**CPU tier (every CI run):** real architectures from their real configs, scaled down (layers, width), plus small real checkpoints that fit (for example SmolLM2-135M). Each scenario takes minutes. Multiprocess and multihost behavior uses real processes, readers and meshes. A single-process mesh simulation is useful evidence for that simulation only. The GPU mesh axis (`tests/test_gpu_mesh.py`, and the mesh-marked `gpu` cells of `tests/test_attention_route.py` and `tests/test_kernel_spills.py`) runs on no fleet of Dew's, whose GPUs are single (owner, 2026-10-30, ledger 2221): NCCL collectives, sharded cuDNN attention and a mesh's FFI calls are unqualified by Dew's CI, and a CPU multi-device mesh qualifies the sharding logic alone.
+**CPU tier (every CI run):** real architectures from their real configs, scaled down (layers, width), plus small real checkpoints that fit (for example SmolLM2-135M). Each scenario takes minutes. Multiprocess and multihost behavior uses real processes, readers and meshes. A single-process mesh simulation is useful evidence for that simulation only. The GPU mesh axis (`tests/test_gpu_mesh.py`, `tests/test_gpu_mesh_attention.py`, and the mesh-marked `gpu` cells of `tests/test_attention_route.py` and `tests/test_kernel_spills.py`) runs on no fleet of Dew's, whose GPUs are single (owner, 2026-10-30, ledger 2221): NCCL collectives, sharded cuDNN attention and a mesh's FFI calls are unqualified by Dew's CI, and a CPU multi-device mesh qualifies the sharding logic alone.
 
 ## GPU landing
 

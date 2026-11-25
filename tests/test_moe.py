@@ -413,11 +413,14 @@ def test_float32_expert_routing_with_x64_keeps_its_output_and_gradients():
         np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-7)
 
 
-def test_experts_served_from_packed_banks_are_on_par_with_their_values_dense():
+@pytest.mark.parametrize("scale_inputs", [False, True])
+def test_experts_served_from_packed_banks_are_on_par_with_their_values_dense(scale_inputs):
     """An expert layer whose matrices are packed NVFP4 banks in its `QUANTIZATION` collection, no parameter
     beside them (a served 4-bit checkpoint's, row 4516: `dew.nn.dense.packed_matrix`), multiplied as NVFP4
     products (`gemm.nvfp4_product`): on par with the layer holding the banks' values as dense parameters in
-    the same compute dtype, bf16 (check 1, truth the values in float64)."""
+    the same compute dtype, bf16 (check 1, truth the values in float64). A layer scaling its inputs by their
+    routing weights (Llama 4's) hands the packed products its rows scaled, as no packed product takes a
+    prologue (`moe._streamed`)."""
     from arm_arithmetic import float64_held
     from packed_experts import packed_banks
     from reference_error import assert_as_exact
@@ -432,17 +435,18 @@ def test_experts_served_from_packed_banks_are_on_par_with_their_values_dense():
     packed = {QUANTIZATION: {name: {"kernel": bank} for name, (bank, _) in banks.items()}}
 
     def layer(dtype):
-        return ExpertMLP(num_experts=experts, hidden_features=hidden, out_features=width, dtype=dtype)
+        return ExpertMLP(num_experts=experts, hidden_features=hidden, out_features=width, dtype=dtype,
+                         scale_inputs=scale_inputs)
 
     def draw(seed: int):
-        streams = jax.random.split(jax.random.key(seed), 2)
+        streams = jax.random.split(jax.random.key(seed), 3)
         x = jax.random.normal(streams[0], (tokens, width), jnp.bfloat16)
         indices = jax.random.randint(streams[1], (tokens, top_k), 0, experts)
-        return x, jnp.full((tokens, top_k), 1.0 / top_k, jnp.float32), indices
+        return x, jax.random.uniform(streams[2], (tokens, top_k), jnp.float32, 0.25, 1.0), indices
 
     assert_as_exact(jax.jit(lambda *inputs: layer(None).apply(packed, *inputs)),
                     jax.jit(lambda *inputs: layer(jnp.bfloat16).apply(dense, *inputs)), draw,
-                    "packed experts", seeds=8,
+                    f"packed experts{', inputs scaled' if scale_inputs else ''}", seeds=8,
                     truth_fn=lambda *inputs: layer(None).apply(float64_held(dense), *inputs))
 
 
@@ -504,3 +508,107 @@ def test_a_runs_stacked_packed_banks_decode_as_each_layers_bank_does():
     decoded = decoded_banks({QUANTIZATION: {"experts": {"up_proj": {"kernel": stacked}}}})
     np.testing.assert_array_equal(np.asarray(decoded["params"]["experts"]["up_proj"]["kernel"]),
                                   np.stack([values for _, values in layers]))
+
+
+@pytest.mark.parametrize("part", [
+    pytest.param("values", id="values"),
+    pytest.param("gradients", id="gradients", marks=pytest.mark.check1_shards(seeds=8, per_task=2)),
+])
+def test_a_layers_paired_and_scaled_expert_products_are_one_launch_as_exact_as_apart(part, request):
+    """A stack's layer's gate and up projections over a scaled stream (`Gathered.scales`, Llama 4's scaled
+    input) are, on an H100's routes, one paired launch (`paired_projections`) taking both whole stacks, the
+    layer's offset into them, the rows' table and the scale in its prologue: no copy of the rows gathered or
+    scaled, nor of the layer's matrices sliced (`grouped_matmul.weighed`, its route the template's). Its
+    outputs and its gradients of the tokens, both stacks and the scales are as exact as the products of the
+    rows gathered and scaled and the layer's matrices sliced, each multiplied apart, both from float64
+    truth (check 1; row 12306). The kernels run interpreted on this CPU, as the H100's: the binding and the
+    values one case (16 s), the gradients another, their draws in map tasks of two (128 s a task of four).
+    """
+    from generation_support import here
+    from map_judge import marked_seeds
+    from reference_error import as_given, assert_as_exact, with_gradients
+
+    from dew.nn import moe
+    from dew.nn.kernels import gemm, generation, grouped_matmul
+
+    layers, experts, depth, width, tokens, top_k = 2, 2, 128, 256, 68, 2
+    slots = tokens * top_k
+    sizes = jnp.asarray([70, 66], jnp.int32)
+    order = np.random.default_rng(12306).permutation(slots).astype(np.int32)
+    rows, where = jnp.asarray(order // top_k), jnp.arange(slots, dtype=jnp.int32)
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(rng.normal(size=(tokens, depth)), jnp.bfloat16),
+                *(jnp.asarray(rng.normal(size=(layers, experts, depth, width)) / 8, jnp.bfloat16)
+                  for _ in range(2)),
+                jnp.asarray(rng.uniform(0.25, 1.0, size=slots), jnp.float32),
+                tuple(jnp.asarray(rng.normal(size=(slots, width)), jnp.bfloat16) for _ in range(2)))
+
+    def dew(x, gate, up, scales):
+        layer = jnp.asarray(1, jnp.int32)
+        return moe.paired_projections(moe.Gathered(x, rows, where, scales), moe.Layered(gate, layer),
+                                      moe.Layered(up, layer), sizes, jnp.bfloat16, "auto", None)
+
+    # This process's own platform, read before `generation.assumed` states another.
+    on_a_cpu = here() == "cpu"
+
+    def launched(x, gate, up, scales):
+        # The paired call `dew` makes (its binding asserted below) run as the H100's launch: on a GPU the
+        # projections themselves; on this CPU the template's interpreter over the same hand-off
+        # (`moe._streamed`), which product code never asks for (`interpret_on_cpu`).
+        if not on_a_cpu:
+            return dew(x, gate, up, scales)
+        tokens, gather, prologue = moe._streamed(moe.Gathered(x, rows, where, scales), jnp.bfloat16)
+        return gemm.gemm(tokens, gate, sizes, compute=jnp.bfloat16, out_dtype=jnp.bfloat16,
+                         out_dtypes=(jnp.bfloat16, jnp.bfloat16), paired=up, layer=jnp.asarray(1, jnp.int32),
+                         gather=gather, **prologue, interpret_on_cpu=True)
+
+    def plain(x, gate, up, scales, wide=jnp.float32, out=jnp.bfloat16):
+        # The rows scaled as the prologue scales them, in the products' dtype; float64 truth rounds nothing.
+        scaled = (x[rows] * scales.astype(x.dtype)[:, None] if wide == jnp.float32
+                  else x[rows].astype(wide) * scales.astype(wide)[:, None]).astype(wide)
+
+        def projected(stack):
+            return jnp.concatenate([scaled[:70] @ stack[1, 0].astype(wide),
+                                    scaled[70:] @ stack[1, 1].astype(wide)]).astype(out)
+        return projected(gate), projected(up)
+
+    def valued(f):
+        """`f` of the drawn inputs but the cotangent."""
+        return lambda x, gate, up, scales, cotangent: f(x, gate, up, scales)
+
+    truth = functools.partial(plain, wide=jnp.float64, out=jnp.float64)
+    with generation.assumed("sm90", interpreted=True), generation.chosen(grouped_matmul="mosaic"):
+        with grouped_matmul.weighed() as calls:
+            jax.eval_shape(dew, *draw(0)[:4])
+        paired = [(next(iter(call.bound.values()))[1].arguments, kernel) for call, kernel in calls
+                  if next(iter(call.bound.values()))[1].arguments["paired"] is not None]
+        assert paired, [kernel for _, kernel in calls]
+        for arguments, kernel in paired:
+            assert kernel == "mosaic", kernel
+            assert arguments["kernel"].shape == arguments["paired"].shape == (layers * experts, depth, width)
+            assert arguments["first"] is not None and arguments["gather"].shape == (slots,)
+            assert arguments["tokens"].shape == (tokens, depth) and arguments["hooks"].prologue is not None
+        label = "a layer's paired experts over scaled rows"
+        if part == "gradients":
+            # The gradients eagerly, as the Mosaic interpreters' ordered callbacks need (`as_given`).
+            assert_as_exact(as_given(with_gradients(launched)), jax.jit(with_gradients(plain)), draw,
+                            f"{label}, gradients", seeds=marked_seeds(request),
+                            truth_fn=with_gradients(truth))
+            return
+        with generation.routes() as routes:
+            assert_as_exact(jax.jit(valued(launched)), jax.jit(valued(plain)), draw, label, seeds=8,
+                            truth_fn=valued(truth))
+        assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"mosaic"}
+
+    # Stacks read at two indices are each read at its own: no pair, the second stack at its layer.
+    with grouped_matmul.weighed() as calls:
+        jax.eval_shape(lambda x, gate, up, scales: moe.paired_projections(
+            moe.Gathered(x, rows, where, scales), moe.Layered(gate, jnp.asarray(0, jnp.int32)),
+            moe.Layered(up, jnp.asarray(1, jnp.int32)), sizes, jnp.bfloat16, "auto", None), *draw(0)[:4])
+    assert all(next(iter(call.bound.values()))[1].arguments["paired"] is None for call, _ in calls)
+    x, gate, up, scales, _ = draw(0)
+    _, apart = moe.paired_projections(moe.Gathered(x, rows, where, scales), moe.Layered(gate, jnp.asarray(0)),
+                                      moe.Layered(up, jnp.asarray(1)), sizes, jnp.bfloat16, "xla", None)
+    np.testing.assert_array_equal(np.asarray(apart), np.asarray(plain(x, gate, up, scales)[1]))

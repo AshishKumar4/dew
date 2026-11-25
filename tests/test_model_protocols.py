@@ -75,7 +75,7 @@ from checkpoint_cases import (
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jepa_cases import MASK
 from model_support import attending, float64_twin, floating_gradient, moved
-from reference_error import Followed, Rounded, as_given, assert_as_exact, summed_as_run, widened
+from reference_error import Followed, Rounded, as_given, assert_as_exact, dew_path, summed_as_run, widened
 from tiny_models import build_model, tiny_inputs
 
 from dew.batch import coordinates
@@ -570,11 +570,15 @@ def _scored(programs: _Served, variables, *, wide: bool = False):
 def _reference(name: str, call: tuple) -> tuple[Callable, Callable]:
     """`name`'s reference arm over `_continued` draws (`_scored`), each draw's scores kept once a process,
     and its float64 truth following an arm's roundings (`Followed`): the cache-capacity and
-    packed-projection tests judge their programs against the same two."""
+    packed-projection tests judge their programs against the same two. Each claims the model computes
+    alike another way (another cache's capacity, its projections packed), so the reference is the model's
+    own path (`dew_path`), run under the rewrite as the arm and the tests' greedy decodes run it: one
+    program for all of them, which unrewritten was compiled again for each token shape (row 12473)."""
     variables = loaded(name).variables
 
     results: dict[bytes, object] = {}
 
+    @dew_path
     @as_given
     def reference(tokens, forced):
         key = np.asarray(tokens).tobytes() + np.asarray(forced).tobytes()

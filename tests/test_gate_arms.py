@@ -3,6 +3,7 @@ as the reference is."""
 
 import contextlib
 import itertools
+import pickle
 
 import jax
 import jax.numpy as jnp
@@ -121,6 +122,49 @@ def test_a_prepared_sites_arms_report_the_routes_their_unprepared_run_reports(tm
     unprepared = reported()
     reported(prepare=True)
     assert unprepared and reported(prepare=False) == unprepared, unprepared
+
+
+def test_a_site_past_its_prepares_cap_is_named_unprepared_and_not_compiled(tmp_path, monkeypatch):
+    """In a part's prepare past its cap (tests/tier_wire.py's `PREPARE_BY`), a site compiles nothing and is
+    named unprepared by its label (where `tier_wire.CAPPED`), so a flow's cell of many sites stops at the cap
+    (test_gpu_numerics' norm cell, its configs' sites, outlasted its dry prepare's task)."""
+    import json
+    import time
+
+    import tier_wire
+
+    label = "a site past its cap"
+    monkeypatch.setenv(tier_wire.PREPARE_BY, repr(time.monotonic() - 1.0))
+    with compiled_truths(tmp_path, prepare=True, stamp="here"):
+        assert_as_exact(_combined, _combined, _cancelling, label, seeds=8)
+    held = json.loads((tmp_path / UNPREPARED).read_text())
+    assert [(reason["where"], reason["cell"]) for reason in held["reasons"]] == [(tier_wire.CAPPED, label)]
+    assert not list(tmp_path.rglob("site.json"))
+
+
+def test_a_site_its_cap_passes_as_it_draws_is_named_unprepared_and_left_untried(tmp_path, monkeypatch):
+    """A dry prepare whose cap passes as a site draws stops at its next draw (`tier_wire.stop_past_cap`), so
+    one site's draws (a Gemma-sized vocabulary's logits, drawn and widened on the CPU) never outlast what the
+    cap keeps for the process's end: the site is named unprepared by its label, untried (its store's
+    `preparing`), and nothing of it is kept."""
+    import json
+    import time
+
+    import tier_wire
+
+    label = "a site whose cap passes as it draws"
+    monkeypatch.setenv(tier_wire.PREPARE_BY, repr(time.monotonic() + 600.0))
+
+    def capping(seed):
+        monkeypatch.setenv(tier_wire.PREPARE_BY, repr(time.monotonic() - 1.0))
+        return _cancelling(seed)
+
+    with compiled_truths(tmp_path, prepare=True, stamp="here") as store:
+        assert_as_exact(_combined, _combined, capping, label, seeds=8)
+        assert label not in store.tried
+    held = json.loads((tmp_path / UNPREPARED).read_text())
+    assert [(reason["where"], reason["cell"]) for reason in held["reasons"]] == [(tier_wire.CAPPED, label)]
+    assert not list(tmp_path.rglob("site.json"))
 
 
 def test_a_prepared_sites_reference_as_written_is_prepared_and_fails_dews_arm_in_its_run(tmp_path):
@@ -290,6 +334,40 @@ def test_an_arm_whose_launch_takes_a_local_hook_runs_from_its_store(tmp_path):
             found = np.asarray(ahead_arm(doubled, "a doubled product, stored")(x, w))
     assert not (tmp_path / UNPREPARED).exists(), (tmp_path / UNPREPARED).read_text()
     np.testing.assert_array_equal(found, expected)
+
+
+def test_a_held_records_source_traceback_is_held_as_none():
+    """A source traceback a site's held record holds (a held launch's equation's, beside its program), which
+    pickle refuses, is held as none (`truths_ahead._held_bytes`), never refusing the store (row 12665:
+    test_algebra_fusion's normed prologues failed their dry prepare with 'cannot pickle
+    jaxlib._jax.Traceback objects')."""
+    import truths_ahead
+    from jax._src.lib import xla_client
+
+    traceback = xla_client.Traceback.get_traceback()
+    assert traceback is not None
+    held = pickle.loads(truths_ahead._held_bytes({"launches": [{"where": traceback, "kept": 3}]}))
+    assert held == {"launches": [{"where": None, "kept": 3}]}
+
+
+def test_a_held_function_pickle_refuses_by_its_type_is_held_by_its_name(monkeypatch):
+    """A function in a site's held record that pickle refuses with a TypeError (a closure holding a jaxlib
+    Traceback, as a fused GEMM's hook does) is held by its name like one pickle cannot name, never refusing
+    the store (a dry prepare of tests/test_gpu_gemm.py: its fused cells went unprepared, row 12665)."""
+    import copyreg
+    import types
+
+    import truths_ahead
+
+    def hook(acc):
+        return acc
+
+    def refused(function):
+        raise TypeError(function)
+
+    monkeypatch.setitem(copyreg.dispatch_table, types.FunctionType, refused)
+    held = pickle.loads(truths_ahead._held_bytes({"hook": hook}))
+    assert held == {"hook": truths_ahead.HeldName(f"{hook.__module__}.{hook.__qualname__}")}
 
 
 def test_an_arm_ahead_called_again_at_its_program_in_a_prepare_reuses_it_and_refuses_another(tmp_path):

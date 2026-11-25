@@ -91,7 +91,7 @@ def linear_ce_registers(tiles: Tiles, dtype, *, has_bias: bool, target) -> int |
     if has_bias:
         vectors += family.column_registers(columns, jnp.float32)
     epilogue = epilogue_registers(family, tiles.share, columns, (jnp.float32,), vectors=vectors,
-                                  tile_count=0, has_hook=True)
+                                  has_hook=True)
     return plain + epilogue
 
 

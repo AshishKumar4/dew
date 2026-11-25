@@ -4,6 +4,7 @@ never reaches it, and an answer cut short, or arriving too slowly, is no object.
 
 import contextlib
 import http.server
+import socket
 import threading
 import time
 
@@ -34,9 +35,9 @@ def test_a_callers_own_sender_carries_every_request_with_the_workers_protocol(ca
     url, _, _ = cache_worker
     sent = []
 
-    def recording(method, address, headers, body, timeout):
+    def recording(method, address, headers, body, timeout, until=None):
         sent.append((method, headers["Authorization"], headers["User-Agent"]))
-        return r2.urllib_send(method, address, headers, body, timeout)
+        return r2.urllib_send(method, address, headers, body, timeout, until)
 
     store = r2.Store(url, "token", "dew-pooled", timeout=10, send=recording)
     store.put("records/a", b"a")
@@ -162,6 +163,161 @@ def test_an_answer_arriving_slower_than_its_floor_is_unavailable_within_its_dead
         with pytest.raises(r2.Unavailable):
             store.get("records/slow")
         assert time.monotonic() - began < 3
+    finally:
+        server.shutdown()
+
+
+def answering(body: bytes, late: str | None = None) -> type[http.server.BaseHTTPRequestHandler]:
+    """A Worker that answers every GET 200 with `body`, a path beginning `late` after 0.05 s, else at once."""
+
+    class Answering(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            if late is not None and self.path.startswith(late):
+                time.sleep(0.05)
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    return Answering
+
+
+@pytest.mark.parametrize("page", [
+    b'{"keys": "abc", "cursor": null}', b'{"keys": ["a"]}', b'{"keys": ["a", 1], "cursor": null}', b'["a"]',
+    b'{"keys": [], "cursor": 3}', b"not json"], ids=[
+    "keys a string", "no cursor", "a key no string", "no object", "a cursor no string", "no JSON"])
+def test_a_listing_page_that_is_no_page_of_keys_is_malformed(page):
+    """A listing's page that is no object of a list of string keys and a cursor (a string, or null at its
+    end) is `Malformed`, an `R2Error`: never keys read from its characters, nor an empty listing."""
+    server = served(answering(page))
+    try:
+        store = r2.Store(f"http://127.0.0.1:{server.server_address[1]}", "token", "dew-test", timeout=5)
+        with pytest.raises(r2.Malformed):
+            list(store.keys("records/"))
+    finally:
+        server.shutdown()
+
+
+class HeadersTrickle(http.server.BaseHTTPRequestHandler):
+    """A Worker that sends its answer's headers a byte every 0.2 s, each receive within a socket's timeout."""
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        head = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n" + b"X-Slow: " + b"y" * 64 + b"\r\n\r\nok"
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+            for byte in head:
+                self.wfile.write(bytes([byte]))
+                self.wfile.flush()
+                time.sleep(0.2)
+
+
+class ChunkTrickle(http.server.BaseHTTPRequestHandler):
+    """A Worker that answers at once, chunked and closing its connection after, then sends its first chunk's
+    size line a byte every 0.2 s."""
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Transfer-Encoding", "chunked")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.flush()
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+            for byte in b"00000000000000000000000000000002\r\nok\r\n0\r\n\r\n":
+                self.wfile.write(bytes([byte]))
+                self.wfile.flush()
+                time.sleep(0.2)
+
+
+@pytest.mark.parametrize("worker", [HeadersTrickle, ChunkTrickle], ids=["headers", "chunks"])
+@SENDERS
+def test_an_answer_that_trickles_ends_at_its_callers_end(send, worker):
+    """A Worker that sends its headers a byte at a time, or its headers at once (chunked and detached from its
+    connection by `Connection: close`) then a chunk's size line a byte at a time, each within the socket's
+    timeout, holds a request given `until` no longer than until it, whichever sender carries it."""
+    server = served(worker)
+    try:
+        store = r2.Store(f"http://127.0.0.1:{server.server_address[1]}", "token", "dew-test", timeout=5,
+                         send=send)
+        began = time.monotonic()
+        with pytest.raises(r2.R2Error):
+            store.get("records/slow", until=began + 1)
+        assert time.monotonic() - began < 2
+    finally:
+        server.shutdown()
+
+
+@SENDERS
+def test_a_connect_that_stalls_ends_at_its_callers_end_and_closes_what_it_makes_late(send, monkeypatch):
+    """A connect whose handshake stalls (held here until its request has ended) ends at the caller's end, not
+    the socket's timeout; the connection it makes late is closed by the connect left to finish, never left
+    open."""
+    listener = socket.create_server(("127.0.0.1", 0))
+    listener.settimeout(5)
+    released = threading.Event()
+    connected = socket.create_connection
+
+    def stalled(address, *args, **kwargs):
+        released.wait(5)
+        return connected(listener.getsockname(), *args, **kwargs)
+
+    monkeypatch.setattr(socket, "create_connection", stalled)
+    try:
+        store = r2.Store("http://127.0.0.1:9", "token", "dew-test", timeout=10, send=send)
+        began = time.monotonic()
+        with pytest.raises(r2.R2Error):
+            store.get("records/a", until=began + 0.5)
+        assert time.monotonic() - began < 1.5
+        released.set()
+        accepted, _ = listener.accept()
+        with accepted:
+            accepted.settimeout(5)
+            assert accepted.recv(1) == b""
+    finally:
+        released.set()
+        listener.close()
+
+
+def test_a_request_at_its_deadline_leaves_no_shutdown_for_the_next_on_a_kept_connection():
+    """A request answered right at its caller's end, its guard firing as it closes, leaves its kept connection
+    to the next request only where it was disarmed first: the next request, sent at once, is answered whole
+    every time, never shut down by a guard that fired after its connection was kept."""
+    server = served(answering(b"ok", late="/records/late"))
+    try:
+        store = r2.Store(f"http://127.0.0.1:{server.server_address[1]}", "token", "dew-test", timeout=5,
+                         send=r2.KeptSend())
+        for _ in range(40):
+            with contextlib.suppress(r2.R2Error):
+                store.get("records/late", until=time.monotonic() + 0.05)
+            assert store.get("records/next", until=time.monotonic() + 5) == b"ok"
+    finally:
+        server.shutdown()
+
+
+def test_a_refusals_unread_body_is_drained_within_its_callers_end():
+    """A refusal whose body trickles is read off for the kept connection's next request at most until the
+    caller's end, never the whole drain past it."""
+    server = served(trickling(403))
+    try:
+        store = r2.Store(f"http://127.0.0.1:{server.server_address[1]}", "token", "dew-test", timeout=5,
+                         send=r2.KeptSend())
+        began = time.monotonic()
+        with pytest.raises(r2.Refused):
+            store.get("records/refused", until=began + 0.3)
+        assert time.monotonic() - began < 0.3 + 0.5
     finally:
         server.shutdown()
 

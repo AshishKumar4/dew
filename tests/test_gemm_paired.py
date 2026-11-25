@@ -13,7 +13,8 @@ import numpy as np
 import pytest
 from generation_support import COMPILES_ON_CPU, generations, lowers, runs
 from jax.sharding import Mesh
-from reference_error import ahead_arm, assert_as_exact, with_gradients
+from map_judge import marked_seeds
+from reference_error import ahead_arm, assert_as_exact, equations, with_gradients
 from test_gemm_template import CASES, SEEDS, _dew, _draw, _drop, _rounded_through
 
 from dew.nn.kernels import gemm, generation, grouped_launch, xla_products
@@ -344,14 +345,16 @@ def test_matrices_side_by_side_are_each_ones_product_in_one_launch(dense):
                        dense=dense, beside=matrices[1:])
 
 
+@pytest.mark.check1_shards(seeds=8, per_task=4)
 @pytest.mark.parametrize("kernel", ["mosaic", "xla"])
 @pytest.mark.parametrize("dense", [True, False], ids=["dense", "grouped"])
-def test_projections_side_by_side_are_on_par_with_their_gradients(kernel, dense):
+def test_projections_side_by_side_are_on_par_with_their_gradients(kernel, dense, request):
     """`gemm.gemm` of bf16 rows by a query's, a key's and a value's matrices side by side (`beside`; widths
     512, 128, 128 at a depth of 200, which no step divides, each matrix's padded) on an H100, interpreted,
     its launch Mosaic GPU's one side-by-side launch or XLA's products, fp32 outputs: the outputs, the rows'
     gradient (the three cotangents' products chained in one accumulator) and each matrix's on par with
-    XLA's products apart against float64, a dense call's and a grouped call's (row 6794)."""
+    XLA's products apart against float64, a dense call's and a grouped call's (row 6794). Its draws run in map
+    tasks of 4: the grouped template's took 130 s in one, past the group target (row 12637)."""
     sizes = (200,) if dense else (70, 0, 130)
     group_sizes = None if dense else jnp.asarray(sizes, jnp.int32)
     draw = _side_by_side_draw(dense, 200, sizes)
@@ -369,7 +372,8 @@ def test_projections_side_by_side_are_on_par_with_their_gradients(kernel, dense)
         return with_gradients(lambda rows, matrices: _apart(rows, matrices, sizes, dense))(rows, matrices,
                                                                                             cotangents)
 
-    assert_as_exact(jax.jit(through), jax.jit(apart), draw, f"projections side by side {kernel}", seeds=SEEDS)
+    assert_as_exact(jax.jit(through), jax.jit(apart), draw, f"projections side by side {kernel}",
+                    seeds=marked_seeds(request))
 
 
 def test_side_by_side_gradients_read_a_wide_cotangent_wide():
@@ -1461,3 +1465,171 @@ def test_an_adapted_products_backward_keeps_fp32_products_whole_under_any_preset
         if own is None or own.digits >= 24:
             assert kept is preset, (preset, kept)
 
+
+
+_SIZES_1376 = (70, 0, 58)
+
+
+def _paired_pullback(epilogue, names, x, gate, up, out_dtypes):
+    """A paired product of `x` through `gate` and `up` (its groups `_SIZES_1376`) whose `epilogue` returns
+    its activation then each projection's own output, the outputs `names` names (`gemm`'s `named`): its
+    activation and gate outputs, and their pullback at a live cotangent of each, the up output unused (no
+    cotangent reaches it)."""
+    sizes = jnp.asarray(_SIZES_1376, jnp.int32)
+
+    def outputs(x, gate, up):
+        hidden, gate_out, *_ = gemm.gemm(x, gate, sizes, paired=up, epilogue=epilogue,
+                                         out_dtype=out_dtypes[0], out_dtypes=out_dtypes, named=names)
+        return hidden, gate_out
+
+    (hidden, gate_out), pull = jax.vjp(outputs, x, gate, up)
+    return hidden, gate_out, *pull((jnp.ones_like(hidden), jnp.full_like(gate_out, 0.5)))
+
+
+def _forward_pairs(names, epilogue, operands, out_dtypes) -> int:
+    """How many forward products (the rows through a matrix, `[rows, width]` each) the pullback's program
+    computes on the CPU's route (`equations`' platform branch), its primal and every gradient live."""
+    x, gate, _ = operands
+    graph = jax.make_jaxpr(functools.partial(_paired_pullback, epilogue, names, out_dtypes=out_dtypes))(
+        *operands)
+    return sum(eqn.primitive.name in ("ragged_dot_general", "dot_general")
+               and eqn.invars[0].aval.shape == x.shape and eqn.outvars[0].aval.shape == (x.shape[0],
+                                                                                        gate.shape[-1])
+               for eqn in equations(graph, platform="cpu"))
+
+
+def _assert_named_pullback(epilogue, operands, out_dtypes, *, kept: bool,
+                           named: tuple = (None, "gate_proj", "up_proj")) -> None:
+    """The paired pullback with the projections' outputs `named` against unnamed: its outputs and gradients
+    raw-bit equal, and its forward products one pair (two) where the backward reads its kept accumulators
+    (`kept`), else the same as unnamed (the pair recomputed)."""
+    unnamed = (None,) * len(named)
+    got, want = (_paired_pullback(epilogue, names, *operands, out_dtypes) for names in (named, unnamed))
+    for name, g, w in zip(("hidden", "gate", "d_x", "d_gate", "d_up"), got, want, strict=True):
+        assert g.dtype == w.dtype, name
+        bits = np.dtype(f"uint{8 * g.dtype.itemsize}")
+        np.testing.assert_array_equal(np.asarray(g).view(bits), np.asarray(w).view(bits), err_msg=name)
+    pairs = [_forward_pairs(names, epilogue, operands, out_dtypes) for names in (named, unnamed)]
+    assert pairs == ([2, 4] if kept else [4, 4]), pairs
+
+
+def _operands_1376(dtype, seed=1376):
+    rng = np.random.default_rng(seed)
+    x = jnp.asarray(rng.integers(-3, 4, size=(128, 128)), dtype)
+    gate, up = (jnp.asarray(rng.normal(size=(3, 128, 64)), dtype) for _ in range(2))
+    return x, gate, up
+
+
+def _swiglu_of_roundings(width):
+    def epilogue(gate_acc, up_acc):
+        gate_rows, up_rows = gate_acc.astype(width), up_acc.astype(width)
+        hidden = jax.nn.silu(gate_rows.astype(jnp.float32)) * up_rows.astype(jnp.float32)
+        return hidden.astype(width), gate_rows, up_rows
+    return epilogue
+
+
+def test_a_paired_epilogues_kept_roundings_are_its_backwards_accumulators_and_it_recomputes_no_pair():
+    """A paired product (a MoE's gate and up) whose epilogue rounds each accumulator to bf16 and returns both
+    roundings beside SwiGLU of them, the roundings named (`gemm`'s `named`: its derivative's residuals): its
+    reverse pass reads its accumulators from those kept outputs (`gemm._rounded_accumulators`), one forward
+    pair on the CPU's route where unnamed computes two, its outputs and gradients raw-bit the unnamed
+    call's, with a live cotangent on the gate output and none on the up's (row 1376)."""
+    _assert_named_pullback(_swiglu_of_roundings(jnp.bfloat16), _operands_1376(jnp.bfloat16),
+                           (jnp.bfloat16,) * 3, kept=True)
+
+
+def test_a_paired_epilogues_rounding_stored_in_another_dtype_is_recomputed_not_read():
+    """A paired epilogue rounding its accumulators to fp16 whose outputs the call stores as bf16: the kept
+    values are not the roundings the epilogue read (bf16 holds no fp16 exactly), so its backward recomputes
+    the pair, its gradients raw-bit the unnamed call's (#4039's review)."""
+    _assert_named_pullback(_swiglu_of_roundings(jnp.float16), _operands_1376(jnp.bfloat16),
+                           (jnp.bfloat16,) * 3, kept=False)
+
+
+def test_a_paired_custom_jvp_epilogue_reading_its_accumulators_wide_is_recomputed_not_read():
+    """A paired epilogue whose primal reads its accumulators through bf16 roundings and whose declared
+    tangent reads them at fp32 (`jax.custom_jvp`): its derivative reads more than the roundings, so its
+    backward recomputes the pair, its gradients raw-bit the unnamed call's (#4039's review)."""
+    @jax.custom_jvp
+    def epilogue(gate_acc, up_acc):
+        # Its primal reads each accumulator through its bf16 rounding alone, which it returns.
+        gate_rows, up_rows = gate_acc.astype(jnp.bfloat16), up_acc.astype(jnp.bfloat16)
+        hidden = jax.nn.silu(gate_rows.astype(jnp.float32)) * up_rows.astype(jnp.float32)
+        return hidden.astype(jnp.bfloat16), gate_rows, up_rows
+
+    @epilogue.defjvp
+    def _(primals, tangents):
+        gate_acc, up_acc = primals
+        d_gate, d_up = tangents
+        # Its tangent reads the accumulators at their fp32 width.
+        d_hidden = (jax.nn.sigmoid(gate_acc) * up_acc * d_gate + jax.nn.silu(gate_acc) * d_up)
+        return epilogue(gate_acc, up_acc), (d_hidden.astype(jnp.bfloat16), d_gate.astype(jnp.bfloat16),
+                                            d_up.astype(jnp.bfloat16))
+
+    _assert_named_pullback(epilogue, _operands_1376(jnp.bfloat16), (jnp.bfloat16,) * 3, kept=False)
+
+
+@pytest.mark.parametrize("width", ["float32", "float64"])
+def test_a_paired_epilogue_returning_its_accumulators_at_their_width_recomputes_no_pair(width):
+    """An fp32 or fp64 paired product whose epilogue returns its accumulators themselves beside SwiGLU of
+    them, named: each output the accumulator, its backward reads them (`gemm._rounded_accumulators`), one
+    forward pair where unnamed computes two, raw-bit the unnamed call's (#4042's review)."""
+    dtype = jnp.dtype(width)
+
+    def epilogue(gate_acc, up_acc):
+        return jax.nn.silu(gate_acc) * up_acc, gate_acc, up_acc
+
+    with jax.enable_x64(new_val=bool(dtype == jnp.float64)):
+        _assert_named_pullback(epilogue, _operands_1376(dtype), (dtype,) * 3, kept=True)
+
+
+def test_a_nonlinear_paired_epilogues_rounded_cotangents_are_its_products_bf16_operands():
+    """A bf16 paired product whose nonlinear epilogue reads its accumulators through bf16 roundings: each
+    accumulator's cotangent is that rounding's, bf16's values widened (`epilogue_vjp.passes_cotangent`), so
+    the input gradient's products read them in bf16 on the CPU's route, as a joined launch takes them, not
+    fp32 (#4042's review)."""
+    x, gate, up = _operands_1376(jnp.bfloat16)
+    graph = jax.make_jaxpr(functools.partial(_paired_pullback, _swiglu_of_roundings(jnp.bfloat16),
+                                             (None, None, None), out_dtypes=(jnp.bfloat16,) * 3))(x, gate, up)
+    cotangent_products = [eqn for eqn in equations(graph, platform="cpu")
+                          if eqn.primitive.name in ("ragged_dot_general", "dot_general")
+                          and eqn.invars[0].aval.shape == (x.shape[0], gate.shape[-1])]
+    assert cotangent_products, "the input gradient multiplies the accumulators' cotangents"
+    assert {eqn.invars[0].aval.dtype for eqn in cotangent_products} == {jnp.dtype(jnp.bfloat16)}, [
+        eqn.invars[0].aval.dtype for eqn in cotangent_products]
+
+
+def test_a_paired_epilogues_integer_rounding_stored_as_fp32_is_recomputed_not_read():
+    """A paired fp32 epilogue rounding its accumulators to int32 whose outputs the call stores as fp32: fp32
+    holds no int32 exactly (2**24 + 1 rounds), so its backward recomputes the pair
+    (`epilogue_vjp.lossless_cast`, #4050's review)."""
+    def epilogue(gate_acc, up_acc):
+        hidden = jax.nn.silu(gate_acc) * up_acc
+        # The cotangents land on the activation and its copy; the integer roundings are named, unused.
+        return hidden, hidden, gate_acc.astype(jnp.int32), up_acc.astype(jnp.int32)
+
+    _assert_named_pullback(epilogue, _operands_1376(jnp.float32), (jnp.float32,) * 4, kept=False,
+                           named=(None, None, "gate_proj", "up_proj"))
+
+
+def test_a_paired_float8_fake_quant_epilogue_reads_its_kept_e4m3_roundings():
+    """A bf16 paired epilogue fake-quantizing its accumulators to E4M3 (`f32 -> float8_e4m3fn -> f32`): its
+    reverse pass runs (no type promotion asked of float8 and fp32, which JAX refuses), and bf16 holds every
+    E4M3 value, so it reads the kept roundings, one forward pair (#4050's review)."""
+    def epilogue(gate_acc, up_acc):
+        gate_rows, up_rows = gate_acc.astype(jnp.float8_e4m3fn), up_acc.astype(jnp.float8_e4m3fn)
+        hidden = jax.nn.silu(gate_rows.astype(jnp.float32)) * up_rows.astype(jnp.float32)
+        return hidden.astype(jnp.bfloat16), gate_rows, up_rows
+
+    _assert_named_pullback(epilogue, _operands_1376(jnp.bfloat16), (jnp.bfloat16,) * 3, kept=True)
+
+
+def test_a_paired_epilogue_returning_a_rounding_twice_reads_the_named_one():
+    """A paired epilogue returning its gate's bf16 rounding twice, only the second named: its backward
+    reads that kept output, one forward pair, the duplicate's first place no obstacle (#4050's review)."""
+    def epilogue(gate_acc, up_acc):
+        hidden, gate_rows, up_rows = _swiglu_of_roundings(jnp.bfloat16)(gate_acc, up_acc)
+        return hidden, gate_rows, gate_rows, up_rows
+
+    _assert_named_pullback(epilogue, _operands_1376(jnp.bfloat16), (jnp.bfloat16,) * 4, kept=True,
+                           named=(None, None, "gate_proj", "up_proj"))

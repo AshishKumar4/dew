@@ -52,6 +52,7 @@ import numpy as np
 import pytest
 import syrk_matrix
 import test_contracts_gemm as contracts_gemm
+import test_fed_walks as fed_walks
 import test_gemm_blockwise as gemm_blockwise
 import test_gemm_gather as gemm_gather
 import test_gemm_paired as gemm_paired
@@ -63,7 +64,8 @@ import test_mosaic_toolkit as mosaic_toolkit
 import test_warpgroup_scan as warpgroup_scan
 from gpu_flow import Cell, cells_of, covering, run_cells, when
 from jax.experimental.pallas import fuser
-from reference_error import assert_as_exact
+from reference_error import ahead_arm, assert_as_exact
+from test_gemm_template import rms_norm as template_rms_norm
 
 from dew.nn.kernels import fused_gemm, generation
 from dew.nn.norms import rms_normalized
@@ -88,7 +90,7 @@ def _fused_projection_training():
 
     def reference(x, params):
         work = jnp.promote_types(x.dtype, jnp.float32)
-        normalized = gemm_template.rms_norm(x, params["norm"])
+        normalized = template_rms_norm(x, params["norm"])
         matrices = params["weight"].astype(x.dtype).astype(work)
         # Rows past the routed ones take no expert: ragged_dot leaves them zero.
         projected = jax.lax.ragged_dot(normalized.astype(work), matrices, groups, preferred_element_type=work)
@@ -154,7 +156,7 @@ def native_hopper_cluster2_balanced_tail_holds_check_1():
         return jax.lax.dot(x.astype(wide), w.astype(wide), preferred_element_type=wide).astype(out)
 
     assert_as_exact(jax.jit(dew_fn), jax.jit(plain), draw, "hopper cluster=2 balanced tail 2048x8192x2560",
-                    seeds=4, truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
+                    seeds=8, truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
 
 def _syrk_and_tail_cells():
     return [
@@ -175,6 +177,9 @@ PARTIAL_TILE = "a TMA copy of a partial tile, which reads zeros and clips stores
 RING = "a ring's asynchronous slots, which the interpreter walks in one order"
 """Why the toolkit's rings stay on the GPU (the GEMM lane, 11-11)."""
 
+SHARED = "a collective cp.async pipeline's meets, which the interpreter takes as no-ops (row 5272)"
+"""Why two mma.sync consumers' shared walk stays on an A100 (row 12652)."""
+
 CLUSTER = "a cluster's multicast of a shared block, which the interpreter loads whole in each program"
 """Why a pair of multiprocessors' cooperative tile stays on the GPU (the GEMM lane, 11-12)."""
 
@@ -182,10 +187,33 @@ BALANCED_TAIL = "a balanced tail's partials fixed up across programs, which the 
 """Why a dense kernel gradient's balanced tail stays on the GPU (the GEMM lane, 11-12)."""
 
 
+def _toolkit_cells() -> list[Cell]:
+    """The toolkit's rings and walks on the GPUs whose waits the interpreter takes as no-ops: an H100's rings
+    and reads, an A100's shared cp.async pipeline (each kept by name for its fault)."""
+    return [
+        *(Cell(f"a ring streams tiles of their own trip counts: {consumers} consumers",
+               functools.partial(mosaic_toolkit.a_ring_streams_tiles_of_their_own_trip_counts_on_an_h100,
+                                 consumers), "sm90", fault=RING)
+          for consumers in (1, 2)),
+        *(Cell(f"every warpgroup read lands its products: {path}",
+               functools.partial(mosaic_toolkit.every_warpgroup_read_lands_its_products_on_an_h100, path),
+               "sm90", fault="ptxas's fold of a read path's sign op (row 4346)")
+          for path in mosaic_toolkit.READS),
+        *(Cell(f"consumers feeding their own ring split a step: {consumers} consumers from {lo}",
+               functools.partial(fed_walks.consumers_feeding_their_own_ring_split_a_step_on_an_h100,
+                                 consumers, lo), "sm90", fault=RING)
+          for consumers, lo in ((1, 0), (2, 0), (2, 3))),
+        *(Cell(f"consumers sharing one cp.async pipeline: {consumers} consumers{', split' * split}",
+               functools.partial(fed_walks.consumers_sharing_one_pipeline_on_an_a100, consumers, split),
+               "sm80", fault=SHARED)
+          for consumers, split in ((1, False), (2, False), (2, True))),
+    ]
+
+
 def test_the_gemm_kernels_run_on_this_gpu():
     """The GEMM and toolkit cells above a GPU runs (`gpu_flow.covering`: each kept for a GPU-only fault by
     name, the fewest others covering its native axes, every other the CPU's, interpreted and through the
-    compile gate), each one's failure kept and all raised together; the toolkit's on an H100 alone."""
+    compile gate), each one's failure kept and all raised together; the toolkit's apart (`_toolkit_cells`)."""
     run_cells(covering([
         Cell("a fused projection trains its producer and epilogue",
              a_fused_projection_trains_its_producer_and_epilogue, "sm90",
@@ -194,12 +222,7 @@ def test_the_gemm_kernels_run_on_this_gpu():
              when(generation.triton_runs(), "needs a GPU the Pallas kernels compile for",
                   gemm_template.a_dense_products_exact_sums_survive_one_row_tile),
              native={"launch": "dense", "pass": "forward"}),
-        *(Cell(f"CUTLASS runs the projection as exactly as XLA where chosen: {sizes}",
-               functools.partial(grouped_gemm.cutlass_runs_the_projection_as_exactly_as_xla_where_chosen,
-                                 sizes),
-               fault="CUTLASS's launches, which no CPU runs" if sizes == "ragged" else None,
-               native={"launch": "cutlass", "groups": sizes})
-          for sizes in grouped_gemm.SIZES if any(grouped_gemm.SIZES[sizes])),
+        *_cutlass_cells(),
         *(Cell(f"the template sums 16-bit products into fp32 as exactly as XLA: depth {depth}",
                functools.partial(grouped_gemm.the_template_sums_16_bit_products_into_fp32_as_exactly_as_xla,
                                  depth),
@@ -255,18 +278,7 @@ def test_the_gemm_kernels_run_on_this_gpu():
                                  shared), native={"launch": "cutlass", "groups": "mapped",
                                                   "matrices": "shared" if shared else "mapped"})
           for shared in (False, True)),
-        *(Cell(f"a ring streams tiles of their own trip counts: {consumers} consumers",
-               functools.partial(mosaic_toolkit.a_ring_streams_tiles_of_their_own_trip_counts_on_an_h100,
-                                 consumers), "sm90", fault=RING)
-          for consumers in (1, 2)),
-        *(Cell(f"every warpgroup read lands its products: {path}",
-               functools.partial(mosaic_toolkit.every_warpgroup_read_lands_its_products_on_an_h100, path),
-               "sm90", fault="ptxas's fold of a read path's sign op (row 4346)")
-          for path in mosaic_toolkit.READS),
-        *(Cell(f"consumers feeding their own ring split a step: {consumers} consumers from {lo}",
-               functools.partial(mosaic_toolkit.consumers_feeding_their_own_ring_split_a_step_on_an_h100,
-                                 consumers, lo), "sm90", fault=RING)
-          for consumers, lo in ((1, 0), (2, 0), (2, 3))),
+        *_toolkit_cells(),
         Cell("the shared GEMM mainloop runs on Blackwell's tcgen05",
              gemm_tcgen05.the_shared_mainloop_runs_exactly_on_blackwell, "sm100",
              native={"launch": "tcgen05 mainloop"}),
@@ -301,6 +313,21 @@ def test_the_gemm_kernels_run_on_this_gpu():
           for positions in warpgroup_scan.POSITIONS for reverse in (False, True)
           for exclusive in (False, True)),
     ]))
+
+
+def _cutlass_cells() -> tuple:
+    """The GPU flow's CUTLASS cells: the projection through CUTLASS's launches against XLA's, at each
+    group sizing, plain, a stack's layer and its rows scaled by a prologue."""
+    return tuple(
+        Cell(f"CUTLASS runs the projection as exactly as XLA where chosen: {sizes}"
+             + (", a stack's layer" if stacked else "") + (", its rows scaled" if prologued else ""),
+             functools.partial(grouped_gemm.cutlass_runs_the_projection_as_exactly_as_xla_where_chosen,
+                               sizes, stacked, prologued),
+             fault=("CUTLASS's launches, which no CPU runs"
+                    if sizes == "ragged" and not (stacked or prologued) else None),
+             native={"launch": "cutlass", "groups": sizes, "stacked": stacked, "prologued": prologued})
+        for sizes in grouped_gemm.SIZES if any(grouped_gemm.SIZES[sizes])
+        for stacked, prologued in ((False, False), (True, False), (False, True)))
 
 
 @pytest.mark.users_process
@@ -386,15 +413,23 @@ def test_the_low_rank_matrix_holds_on_this_gpu():
 def test_an_adapted_products_factor_gradients_hold_fp32_under_a_bf16_preset():
     """An adapted product of fp32 rows under the BF16_BF16_F32 preset, which a GPU's dot takes: its factor
     `a`'s gradient, `rowsᵀ · (scale · dy · bᵀ)`, keeps fp32's digits (`low_rank._kept`), so a row entry of
-    `1 + 2**-20`, which bf16 rounds to 1, reaches it: exactly float64's (row 12394)."""
+    `1 + 2**-20`, which bf16 rounds to 1, reaches it: exactly float64's (row 12394). Its operands are
+    NumPy's and its gradient an arm (`ahead_arm`), so a GPU tier part's prepare compiles it (row 12663)."""
     from dew.nn.kernels.low_rank import low_rank
 
-    rows = jnp.zeros((8, 16), jnp.float32).at[0, 0].set(1.0 + 2.0 ** -20)
-    kernel, a = jnp.zeros((16, 8), jnp.float32), jnp.zeros((16, 4), jnp.float32)
-    b = jnp.zeros((4, 8), jnp.float32).at[0, 0].set(1.0)
-    _, pull = jax.vjp(lambda a_: low_rank(rows, kernel, a_, b, 1.0, out_dtype=jnp.float32,
-                                          precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32), a)
-    (d_a,) = pull(jnp.zeros((8, 8), jnp.float32).at[0, 0].set(1.0))
+    rows = np.zeros((8, 16), np.float32)
+    rows[0, 0] = 1.0 + 2.0 ** -20
+    kernel, a = np.zeros((16, 8), np.float32), np.zeros((16, 4), np.float32)
+    b, dy = np.zeros((4, 8), np.float32), np.zeros((8, 8), np.float32)
+    b[0, 0] = dy[0, 0] = 1.0
+
+    def factor_gradient(rows, kernel, a, b, dy):
+        _, pull = jax.vjp(lambda a_: low_rank(rows, kernel, a_, b, 1.0, out_dtype=jnp.float32,
+                                              precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32), a)
+        return pull(dy)[0]
+
+    d_a = ahead_arm(jax.jit(factor_gradient), "an adapted product's factor gradient under a bf16 preset")(
+        rows, kernel, a, b, dy)
     want = np.zeros((16, 4), np.float32)
     want[0, 0] = 1.0 + 2.0 ** -20
     np.testing.assert_array_equal(np.asarray(d_a), want)
@@ -404,19 +439,27 @@ def test_an_adapted_products_backward_keeps_a_narrow_presets_fp32_products_wide(
     """An adapted product of fp16 rows under the F16_F16_F32 dot preset, which a GPU's dot takes: an fp32
     cotangent of 2**16 against a 2**-10 kernel, and an fp16 one of 1 through a scale of 2**16 and a factor of
     2**-10, each give the rows 64; the backward's products of fp32 operands keep them at fp32 (`_kept`), not
-    narrowed back to fp16's inf (row 1304)."""
+    narrowed back to fp16's inf (row 1304). Its operands are NumPy's and each gradient an arm of its own
+    (`ahead_arm`), so a GPU tier part's prepare compiles them (row 12664)."""
     from dew.nn.kernels.low_rank import low_rank
 
     preset = jax.lax.DotAlgorithmPreset.F16_F16_F32
-    x = jnp.zeros((8, 16), jnp.float16)
-    for kernel, a, scale, out_dtype, dy in (
-            (jnp.full((16, 8), 2.0 ** -10, jnp.float16), jnp.zeros((16, 4), jnp.float16), 1.0, jnp.float32,
-             2.0 ** 16),
-            (jnp.zeros((16, 8), jnp.float16), jnp.full((16, 4), 2.0 ** -10, jnp.float16), 2.0 ** 16,
-             jnp.float16, 1.0)):
-        b = jnp.zeros((4, 8), jnp.float16).at[:, 0].set(1.0 if scale > 1 else 0.0)
-        _, pull = jax.vjp(lambda rows, kernel=kernel, a=a, b=b, scale=scale, out_dtype=out_dtype: low_rank(
-            rows, kernel, a, b, scale, out_dtype=out_dtype, precision=preset), x)
-        (d_x,) = pull(jnp.zeros((8, 8), out_dtype).at[0, 0].set(dy))
+    x = np.zeros((8, 16), np.float16)
+    for kernel_entry, a_entry, scale, out_dtype, cotangent in (
+            (2.0 ** -10, 0.0, 1.0, np.float32, 2.0 ** 16), (0.0, 2.0 ** -10, 2.0 ** 16, np.float16, 1.0)):
+        kernel = np.full((16, 8), kernel_entry, np.float16)
+        a = np.full((16, 4), a_entry, np.float16)
+        b = np.zeros((4, 8), np.float16)
+        b[:, 0] = 1.0 if scale > 1 else 0.0
+        dy = np.zeros((8, 8), out_dtype)
+        dy[0, 0] = cotangent
+
+        def rows_gradient(rows, kernel, a, b, dy, scale=scale, out_dtype=out_dtype):
+            _, pull = jax.vjp(lambda rows: low_rank(rows, kernel, a, b, scale, out_dtype=out_dtype,
+                                                    precision=preset), rows)
+            return pull(dy)[0]
+
+        label = f"an adapted product's rows gradient into {np.dtype(out_dtype)}"
+        d_x = ahead_arm(jax.jit(rows_gradient), label)(x, kernel, a, b, dy)
         assert np.all(np.isfinite(np.asarray(d_x, np.float32))), (out_dtype, d_x[0])
         assert np.asarray(d_x[0, 0], np.float32) == 64.0 * (4.0 if scale > 1 else 1.0), (out_dtype, d_x[0])

@@ -257,3 +257,24 @@ def test_a_command_lines_flags_hold_as_it_runs_again_with_them_set_before_jaxlib
                           cwd=ROOT, check=False)
     assert done.returncode == 0, done.stderr
     assert done.stdout.strip().splitlines() == ["true"]
+
+
+@pytest.mark.parametrize(("visible", "listed", "stated", "ungraphed"), [
+    ("0,1", None, None, True),
+    (None, 2, None, True),
+    ("0", 2, None, False),
+    (None, 1, None, False),
+    (None, None, None, False),
+    ("0,1", None, "--xla_gpu_enable_command_buffer=FUSION,CUBLAS", False),
+])
+def test_a_process_driving_more_than_one_gpu_graphs_no_peer_wait_unless_its_run_named_the_commands(
+        visible, listed, stated, ungraphed):
+    """`import dew` keeps XLA's conditionals and one-shot collective kernels out of its CUDA graphs in a
+    process that drives more than one GPU, where one GPU's graph waited on its peer while the peer's host
+    held the driver (row 12714): its visible GPUs where it names them, else those nvidia-smi lists; one GPU,
+    an uncounted host or a run naming the commands keeps XLA's list."""
+    from dew._devices import peer_waits_ungraphed
+
+    env = {} if visible is None else {"CUDA_VISIBLE_DEVICES": visible}
+    env |= {} if stated is None else {"XLA_FLAGS": stated}
+    assert peer_waits_ungraphed(env, lambda: listed) is ungraphed

@@ -125,11 +125,11 @@ def test_an_unreachable_remote_only_slows_a_task_by_its_first_failed_requests(mo
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
-    # Each request the cache's sender makes of the URL (r2's, over http.client).
+    # Each request the cache's sender makes of the URL (r2's, over http.client): its connection's attempt.
     opened = []
-    request = http.client.HTTPConnection.request
-    monkeypatch.setattr(http.client.HTTPConnection, "request",
-                        lambda self, *args, **kwargs: opened.append(args) or request(self, *args, **kwargs))
+    connect = http.client.HTTPConnection.connect
+    monkeypatch.setattr(http.client.HTTPConnection, "connect",
+                        lambda self, *args, **kwargs: opened.append(args) or connect(self, *args, **kwargs))
     cache = remote_cache.RemoteCache(tmp_path, f"http://127.0.0.1:{port}", "token", "jax/cpu")
     began = time.monotonic()
     for index in range(10):
@@ -203,13 +203,13 @@ print(remote.programs_fetched, remote.uploaded, int(counts.get("train/cache_miss
     [key] = stored
     assert key.startswith(f"/{remote_cache.FORMAT}/jaxlib{__import__('jaxlib').__version__}/")
     assert key.endswith(f"/cpu/{remote_cache.HOST.cpu_class()}/bundles/tests/test_step.py")
-    programs = len(list(remote_cache.unpacked(stored[key])))
+    programs = len(list(remote_cache.unpacked(stored[key])[0]))
     assert programs >= 1
     # Read back, nothing compiles: JAX's persistent cache misses nothing.
     assert run("second") == ["18.0", str(programs), "0", "0"]
     assert run("bumped", release="bumped") == ["18.0", str(programs), "0", "0"]
     assert run("third", "more") == ["18.0", str(programs), "1", "1"]
-    assert len(list(remote_cache.unpacked(stored[key]))) > programs
+    assert len(list(remote_cache.unpacked(stored[key])[0])) > programs
 
 
 def test_a_slow_remote_never_holds_a_process_exit(tmp_path):
@@ -400,14 +400,14 @@ def test_a_bundle_holds_every_program_its_files_tests_compiled_however_they_ran(
         cache.closed(file)
     cache.drain()
     [key] = [key for key in stored if key.endswith("/bundles/tests/a.py")]
-    assert dict(remote_cache.unpacked(stored[key])) == dict.fromkeys(
+    assert dict(remote_cache.unpacked(stored[key])[0]) == dict.fromkeys(
         ("jit_collected-1", "jit_first-1", "jit_second-1"), b"executable")
     for group in ("1/2", "2/2"):
         cache.opened(remote_cache.bundle("tests/split.py::test_x", group, None))
         compiled(tmp_path, f"jit_{group[0]}-1")
         cache.closed(remote_cache.bundle("tests/split.py::test_x", group, None))
     cache.drain()
-    assert [len(remote_cache.unpacked(stored[f"/jax/cpu/bundles/tests/split.py/{group}-of-2"]))
+    assert [len(remote_cache.unpacked(stored[f"/jax/cpu/bundles/tests/split.py/{group}-of-2"])[0])
             for group in "12"] == [1, 1]
     whole = remote_cache.packed([("jit_cut-1", b"cut"), ("jit_cut-2", b"cut")])
     for name, body in (("cut", whole[:-3]), ("header", whole + b"\0\0"),
@@ -427,7 +427,7 @@ def test_a_bundles_program_whose_bytes_changed_within_its_frame_is_dropped_and_s
     bundle = bytearray(remote_cache.packed([("jit_a-1", b"program a"), ("jit_b-1", b"program b")]))
     bundle[-1] ^= 1
     with caplog.at_level(logging.WARNING, logger=remote_cache.logger.name):
-        assert remote_cache.unpacked(bytes(bundle)) == [("jit_a-1", b"program a")]
+        assert remote_cache.unpacked(bytes(bundle)) == ([("jit_a-1", b"program a")], 1)
     assert [record.levelname for record in caplog.records if record.name == remote_cache.logger.name] == [
         "WARNING"]
 
@@ -470,7 +470,7 @@ def test_a_recut_group_restores_what_its_overlapping_groups_held(cache_worker, t
     loaded(new, "jit_front-1")
     recut.closed(group)
     recut.drain()
-    assert [key for key, _ in remote_cache.unpacked(stored["/jax/cpu/bundles/tests/split.py/1-of-3"])] == [
+    assert [key for key, _ in remote_cache.unpacked(stored["/jax/cpu/bundles/tests/split.py/1-of-3"])[0]] == [
         "jit_front-1"]
 
 
@@ -519,7 +519,7 @@ def test_a_bundle_keeps_what_its_run_loaded_or_compiled_and_drops_the_chunks_it_
     after.opened("tests/shrinks.py")
     loaded(tmp_path / "next", "jit_a-1")
     after.drain()
-    assert [key for key, _ in remote_cache.unpacked(stored[bundle])] == ["jit_a-1"] and rest not in stored
+    assert [key for key, _ in remote_cache.unpacked(stored[bundle])[0]] == ["jit_a-1"] and rest not in stored
     again = remote_cache.RemoteCache(tmp_path / "again", url, "token", "jax/cpu")
     again.opened("tests/shrinks.py")
     assert programs(tmp_path / "again") == {"jit_a-1": b"a" * 600}
@@ -543,7 +543,7 @@ def test_a_bundle_that_runs_again_after_another_keeps_what_it_loaded_in_each_sti
     loaded(tmp_path, "jit_y-1")
     cache.closed("tests/a.py")
     cache.drain()
-    kept = {key for key, _ in remote_cache.unpacked(stored["/jax/cpu/bundles/tests/a.py"])}
+    kept = {key for key, _ in remote_cache.unpacked(stored["/jax/cpu/bundles/tests/a.py"])[0]}
     assert kept == {"jit_x-1", "jit_y-1"}
 
 
@@ -595,7 +595,7 @@ def test_a_bundle_fetched_while_another_file_runs_is_not_that_files(tmp_path):
     stored = bundles_while_one_is_on_its_way(tmp_path, lambda: compiled(tmp_path, "jit_other-1"))
     assert programs(tmp_path)["jit_slow-1"] == b"slow"
     bundle = stored["/jax/cpu/bundles/tests/other.py"]
-    assert [key for key, _ in remote_cache.unpacked(bundle)] == ["jit_other-1"]
+    assert [key for key, _ in remote_cache.unpacked(bundle)[0]] == ["jit_other-1"]
 
 
 def test_a_tasks_switches_of_bundle_list_the_cache_directory_once_and_each_keeps_its_own(cache_worker,
@@ -633,7 +633,7 @@ def test_a_tasks_switches_of_bundle_list_the_cache_directory_once_and_each_keeps
     assert len(listed) == 1
     # Each bundle holds what its tests compiled; the restored program its tests never loaded is dropped.
     for index, file in enumerate(files):
-        held = {key for key, _ in remote_cache.unpacked(stored[f"/jax/cpu/bundles/{file}"])}
+        held = {key for key, _ in remote_cache.unpacked(stored[f"/jax/cpu/bundles/{file}"])[0]}
         assert held == {f"jit_{index}-1"}, file
 
 
@@ -660,8 +660,8 @@ def test_a_bundle_past_the_bound_keeps_every_program_in_chunks_each_sent_once(ca
     cache.closed("tests/big.py")
     cache.drain()
     bundle, rest = "/jax/cpu/bundles/tests/big.py", "/jax/cpu/bundles/tests/big.py/=1"
-    assert [[key for key, _ in remote_cache.unpacked(stored[at])] for at in (bundle, rest)] == [["jit_a-1"],
-                                                                                              ["jit_b-1"]]
+    held = [[key for key, _ in remote_cache.unpacked(stored[at])[0]] for at in (bundle, rest)]
+    assert held == [["jit_a-1"], ["jit_b-1"]]
     assert seen.count(bundle) == 2 and seen.count(rest) == 1  # its GET and one PUT; one PUT
     after = remote_cache.RemoteCache(tmp_path / "next", url, "token", "jax/cpu")
     after.opened("tests/big.py")
@@ -680,8 +680,24 @@ def test_a_bundle_that_grows_sends_the_chunks_it_changed_alone(cache_worker, tmp
     compiled(tmp_path / "next", "jit_c-1", b"c" * 100)
     after.drain()
     rest = "/jax/cpu/bundles/tests/grows.py/=1"
-    assert [key for key, _ in remote_cache.unpacked(stored[rest])] == ["jit_b-1", "jit_c-1"]
+    assert [key for key, _ in remote_cache.unpacked(stored[rest])[0]] == ["jit_b-1", "jit_c-1"]
     assert seen.count("/jax/cpu/bundles/tests/grows.py") == 1 and seen.count(rest) == 2  # GETs; one PUT
+
+
+def test_programs_dropped_for_their_bytes_are_counted_by_a_fetch_ahead_and_a_caches_summary(
+        cache_worker, tmp_path):
+    """A bundle's program dropped as not the bytes written (`unpacked`) is counted where a run reads it: a
+    fetch ahead returns it beside the programs it wrote, and a process's cache counts it (`programs_dropped`),
+    which its summary says, ending a task's log (row 12021: row 9797's drops were seen in no run)."""
+    url, stored, _ = cache_worker
+    torn = bytearray(remote_cache.packed([("jit_a-1", b"program a"), ("jit_b-1", b"program b")]))
+    torn[-1] ^= 1
+    stored["/jax/gpu/bundles/tests/torn.py"] = stored["/jax/cpu/bundles/tests/torn.py"] = bytes(torn)
+    assert remote_cache.prefetch(tmp_path / "ahead", url, "token", "jax/gpu", ["tests/torn.py"]) == (1, 1)
+    cache = remote_cache.RemoteCache(tmp_path / "run", url, "token", "jax/cpu")
+    cache.opened("tests/torn.py")
+    cache.closed("tests/torn.py")
+    assert cache.programs_dropped == 1
 
 
 def test_a_bundle_fetched_ahead_is_restored_with_no_request_and_grows_as_one_fetched_would(
@@ -695,7 +711,7 @@ def test_a_bundle_fetched_ahead_is_restored_with_no_request_and_grows_as_one_fet
     key = "/jax/gpu/bundles/tests/ahead.py"
     stored[key] = remote_cache.packed([("jit_a-1", b"a" * 600)])
     stored[f"{key}/=1"] = remote_cache.packed([("jit_b-1", b"b" * 600)])
-    assert remote_cache.prefetch(tmp_path, url, "token", "jax/gpu", ["tests/ahead.py"]) == 2
+    assert remote_cache.prefetch(tmp_path, url, "token", "jax/gpu", ["tests/ahead.py"]) == (2, 0)
     seen.clear()
     cache = remote_cache.RemoteCache(tmp_path, url, "token", "jax/gpu")
     cache.opened("tests/ahead.py")
@@ -706,7 +722,7 @@ def test_a_bundle_fetched_ahead_is_restored_with_no_request_and_grows_as_one_fet
     compiled(tmp_path, "jit_c-1", b"c" * 100)
     cache.closed("tests/ahead.py")
     cache.drain()
-    assert [found for found, _ in remote_cache.unpacked(stored[f"{key}/=1"])] == ["jit_b-1", "jit_c-1"]
+    assert [found for found, _ in remote_cache.unpacked(stored[f"{key}/=1"])[0]] == ["jit_b-1", "jit_c-1"]
     assert seen.count(key) == 0
 
 
@@ -720,7 +736,7 @@ def test_a_recut_group_fetched_ahead_restores_its_overlapping_groups_programs_wi
     stored["/jax/gpu/bundles/tests/split.py/1-of-2"] = remote_cache.packed([("jit_front-1", b"f")])
     stored["/jax/gpu/bundles/tests/split.py/2-of-2"] = remote_cache.packed([("jit_back-1", b"b")])
     group = remote_cache.bundle("tests/split.py", "1/3", None)
-    assert remote_cache.prefetch(tmp_path, url, "token", "jax/gpu", [group]) == 1
+    assert remote_cache.prefetch(tmp_path, url, "token", "jax/gpu", [group]) == (1, 0)
     seen.clear()
     cache = remote_cache.RemoteCache(tmp_path, url, "token", "jax/gpu")
     cache.opened(group)
@@ -728,7 +744,7 @@ def test_a_recut_group_fetched_ahead_restores_its_overlapping_groups_programs_wi
     loaded(tmp_path, "jit_front-1")
     cache.closed(group)
     cache.drain()
-    assert [key for key, _ in remote_cache.unpacked(stored["/jax/gpu/bundles/tests/split.py/1-of-3"])] == [
+    assert [key for key, _ in remote_cache.unpacked(stored["/jax/gpu/bundles/tests/split.py/1-of-3"])[0]] == [
         "jit_front-1"]
 
 
@@ -772,7 +788,7 @@ def test_a_bundle_whose_program_could_not_be_read_goes_up_once_it_can(cache_work
     cache.closed("tests/read.py")
     cache.drain()
     bundle = stored["/jax/cpu/bundles/tests/read.py"]
-    assert [key for key, _ in remote_cache.unpacked(bundle)] == ["jit_read-1"]
+    assert [key for key, _ in remote_cache.unpacked(bundle)[0]] == ["jit_read-1"]
 
 
 def test_a_program_another_file_compiled_while_a_bundle_was_on_its_way_stays_that_files(tmp_path):
@@ -780,7 +796,7 @@ def test_a_program_another_file_compiled_while_a_bundle_was_on_its_way_stays_tha
     leaves the program the other file's: its bundle carries it."""
     stored = bundles_while_one_is_on_its_way(tmp_path, lambda: compiled(tmp_path, "jit_slow-1", b"mine"))
     bundle = stored["/jax/cpu/bundles/tests/other.py"]
-    assert dict(remote_cache.unpacked(bundle)) == {"jit_slow-1": b"mine"}
+    assert dict(remote_cache.unpacked(bundle)[0]) == {"jit_slow-1": b"mine"}
 
 
 def test_a_bundle_takes_what_fits_within_the_workers_bound_and_round_trips(cache_worker, tmp_path):
@@ -815,7 +831,7 @@ def test_a_program_past_the_cap_leaves_its_files_bundle_as_it_was(cache_worker, 
     compiled(tmp_path, "jit_big-1", b"b" * 2000)
     cache.closed("tests/big.py")
     cache.drain()
-    assert dict(remote_cache.unpacked(stored["/jax/cpu/bundles/tests/big.py"])) == {"jit_old-1": b"old"}
+    assert dict(remote_cache.unpacked(stored["/jax/cpu/bundles/tests/big.py"])[0]) == {"jit_old-1": b"old"}
     assert seen.count("/jax/cpu/bundles/tests/big.py") == 1  # its GET alone
 
 

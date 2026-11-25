@@ -10,7 +10,8 @@ tools/lint_layers.py holds Dew's layers by it, tools/gen_exports.py writes a laz
 It reads the standard library alone, so a tool loads it by its path without importing Dew."""
 
 import ast
-from collections.abc import Callable, Iterator, Mapping
+import threading
+from collections.abc import Callable, Iterable, Iterator, Mapping
 
 _IMPORTERS = frozenset({"import_module", "__import__"})
 _LOADERS = frozenset({"spec_from_file_location", "exec_module", "run_path", "run_module"})
@@ -19,7 +20,8 @@ _LOADERS = frozenset({"spec_from_file_location", "exec_module", "run_path", "run
 class Walk:
     """A source tree's import closures: `files`, each of its modules' file by name (a package's its
     `__init__.py`), `read`, a module's source, and `selected`, each dynamic site a literal table of its module
-    resolves (`module:function:expression` to the table's name, whose dotted names it imports)."""
+    resolves (`module:function:expression` to the table's name, whose dotted names it imports). Each name it
+    looks up in `files` is kept as the footprint of the module whose imports it was reading (`footprint`)."""
 
     def __init__(self, files: Mapping[str, str], read: Callable[[str], bytes],
                  selected: Mapping[str, str] | None = None):
@@ -28,25 +30,43 @@ class Walk:
         self._trees: dict[str, ast.Module] = {}
         self._tables: dict[str, dict[str, str] | None] = {}
         self._imports: dict[str, tuple[frozenset[str], tuple[str, ...]]] = {}
+        self._looked: dict[str, frozenset[str]] = {}
+        self._table_looked: dict[str, frozenset[str]] = {}
+        self._looking: list[set[str]] = []
+        # One closure walked at a time: its lookups land in the footprints of the modules it reads alone.
+        self._walking = threading.RLock()
+
+    def _found(self, name: str) -> str | None:
+        """`name`'s file in `files`, the lookup kept in each footprint being read (`imports`, `table`)."""
+        for footprint in self._looking:
+            footprint.add(name)
+        return self.files.get(name)
 
     def holds(self, module: str) -> bool:
-        return module in self.files
+        return self._found(module) is not None
 
     def is_package(self, module: str) -> bool:
-        return self.files.get(module, "").endswith("__init__.py")
+        return (self._found(module) or "").endswith("__init__.py")
 
     def ours(self, module: str) -> set[str]:
         """`module` and each package above it, those the tree holds alone: what importing it runs."""
         parts = module.split(".")
         prefixes = (".".join(parts[:end]) for end in range(1, len(parts) + 1))
-        return {name for name in prefixes if name in self.files}
+        return {name for name in prefixes if self.holds(name)}
+
+    def footprint(self, modules: Iterable[str]) -> frozenset[str]:
+        """The names the walk looked up in `files` reading the imports of `modules` (`imports`), each walked:
+        what a closure of them depends on of the tree beyond their own files, so a closure kept for later
+        is held to those lookups alone, not to every lookup the process made (`dew._code`'s `_sound`)."""
+        with self._walking:
+            return frozenset().union(*(self._looked[module] for module in modules))
 
     def parsed(self, module: str) -> ast.Module:
         """`module`'s whole tree, its TYPE_CHECKING blocks among it, parsed once a walk: what a type checker
         reads of it (tools/lint_layers.py's named imports), and what `tree` prunes."""
         parsed = self._parsed.get(module)
         if parsed is None:
-            parsed = self._parsed[module] = ast.parse(self.read(module), self.files[module])
+            parsed = self._parsed[module] = ast.parse(self.read(module), self._found(module) or module)
         return parsed
 
     def tree(self, module: str) -> ast.Module:
@@ -69,23 +89,36 @@ class Walk:
         `_SUBMODULES` (its submodules by name). Empty for a module that exports lazily none; None where a
         table is no literal, which no reading resolves."""
         if package not in self._tables:
-            self._tables[package] = table(self.tree(package), package) if self.is_package(package) else {}
+            self._looking.append(set())
+            try:
+                self._tables[package] = table(self.tree(package), package) if self.is_package(package) else {}
+            finally:
+                self._table_looked[package] = frozenset(self._looking.pop())
+        # Its lookups each footprint holds, though read once a walk.
+        for footprint in self._looking:
+            footprint.update(self._table_looked[package])
         return self._tables[package]
 
     def imports(self, module: str) -> tuple[frozenset[str], tuple[str, ...]]:
         """The modules of the tree `module`'s code imports, and its dynamic import sites, read once a walk."""
-        if module in self._imports:
+        with self._walking:
+            if module in self._imports:
+                return self._imports[module]
+            self._looking.append(set())
+            try:
+                found = _Imports(self, module)
+                # Every binding first, so a name its code reads before the statement that binds it (a
+                # function's, read at its call) resolves as after it.
+                tree = self.tree(module)
+                for node in ast.walk(tree):
+                    if isinstance(node, (ast.Import, ast.ImportFrom)):
+                        found.visit(node)
+                found.visit(tree)
+            finally:
+                looked = frozenset(self._looking.pop())
+            self._looked[module] = looked
+            self._imports[module] = frozenset(found.modules - {module}), tuple(sorted(found.sites))
             return self._imports[module]
-        found = _Imports(self, module)
-        # Every binding first, so a name its code reads before the statement that binds it (a function's,
-        # read at its call) resolves as after it.
-        tree = self.tree(module)
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
-                found.visit(node)
-        found.visit(tree)
-        self._imports[module] = frozenset(found.modules - {module}), tuple(sorted(found.sites))
-        return self._imports[module]
 
     def closure(self, *roots: str) -> tuple[frozenset[str], tuple[str, ...]]:
         """The modules `roots` name and their code can import, and the dynamic import sites among them. A
@@ -93,26 +126,27 @@ class Walk:
         the imports and tables it read of them kept: a process's walk (`dew._code`'s) held every module's
         tree past it (1.1M of a cold recurrent step's 4.7M live objects, its full collection 3.9 s and
         its exit 18 s, row 8420)."""
-        absent = [root for root in roots if root not in self.files]
-        if absent:
-            raise LookupError(f"no module of the tree is named {', '.join(absent)}")
-        seen: set[str] = set()
-        sites: set[str] = set()
-        pending = list(roots)
-        try:
-            while pending:
-                module = pending.pop()
-                if module in seen:
-                    continue
-                seen.add(module)
-                imported, found = self.imports(module)
-                sites.update(found)
-                pending.extend(imported - seen)
-        finally:
-            # Let go however the walk ends, a module changed under it among them (`_Changed`).
-            self._parsed.clear()
-            self._trees.clear()
-        return frozenset(seen), tuple(sorted(sites))
+        with self._walking:
+            absent = [root for root in roots if not self.holds(root)]
+            if absent:
+                raise LookupError(f"no module of the tree is named {', '.join(absent)}")
+            seen: set[str] = set()
+            sites: set[str] = set()
+            pending = list(roots)
+            try:
+                while pending:
+                    module = pending.pop()
+                    if module in seen:
+                        continue
+                    seen.add(module)
+                    imported, found = self.imports(module)
+                    sites.update(found)
+                    pending.extend(imported - seen)
+            finally:
+                # Let go however the walk ends, a module changed under it among them (`_Changed`).
+                self._parsed.clear()
+                self._trees.clear()
+            return frozenset(seen), tuple(sorted(sites))
 
 
 def resolved(name: str, package: str) -> str:

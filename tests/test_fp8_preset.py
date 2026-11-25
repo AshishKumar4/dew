@@ -4,6 +4,7 @@ dtypes."""
 
 import contextlib
 import dataclasses
+import functools
 
 import flax.linen as nn
 import jax
@@ -795,3 +796,115 @@ def test_the_blockwise_recipes_scales_meet_its_products_in_range():
     with generation.run_precision(RECIPE_NUMERICS["blockwise_fp8"]), projection_role("mlp"):
         out = np.asarray(jax.jit(layer.apply)(params, x), np.float32)
     np.testing.assert_array_equal(out, np.full((4, 128), 2.0 ** 117, np.float32))
+
+
+
+@pytest.mark.parametrize("activation", ["gelu", "swiglu"])
+def test_an_mlps_projections_run_as_one_recipe_chain_bitwise_their_projections_apart(activation):
+    """An MLP whose projections DeepSeek-V3's blockwise FP8 recipe takes in its role runs them as one chain
+    (`projections.recipe_chain`): an ungated one's up and down (row 8547), a gated one's gate, up and down,
+    its gated product in the up projection's epilogue (row 12689). One recipe region of the recipe's
+    derivative where the projections apart held one each (`dew.nn.derivatives.Surrogate`), its rows any
+    count (laid in whole blocks), and its output and every gradient, the rows' and every kernel's, bitwise
+    the projections apart with its activation between them (`projections.recipe_projection`)."""
+    from reference_error import equations
+
+    from dew.nn.activations import gated_product, ungated_activation
+    from dew.nn.derivatives import Surrogate
+    from dew.nn.mlp import GatedMLP
+    from dew.nn.precision import projection_role
+
+    fp8 = RECIPE_NUMERICS["blockwise_fp8"]
+    mlp = GatedMLP(hidden_features=256, out_features=128, activation=activation, dtype=jnp.bfloat16)
+    x = jax.random.normal(jax.random.key(0), (2, 100, 128), jnp.bfloat16)
+    variables = nn.unbox(mlp.init(jax.random.key(1), x))
+    gated = activation == "swiglu"
+
+    def chained(variables, x):
+        return mlp.apply(variables, x)
+
+    def apart(variables, x):
+        rows = x.reshape(-1, x.shape[-1])
+
+        def projected(rows, name):
+            kernel = variables["params"][name]["kernel"].astype(x.dtype)
+            return projections.recipe_projection(rows, kernel, out_dtype=x.dtype)
+
+        up = projected(rows, "up_proj")
+        hidden = (gated_product(activation)(projected(rows, "gate_proj"), up) if gated
+                  else ungated_activation(activation, up))
+        out = projected(hidden, "down_proj")
+        return out.reshape(*x.shape[:-1], out.shape[-1])
+
+    with generation.run_precision(fp8), projection_role("mlp"):
+        graph = jax.make_jaxpr(chained)(variables, x)
+        regions = [equation for equation in equations(graph) if equation.primitive.name == "marked_call"
+                   and isinstance(equation.params.get("kind"), Surrogate)]
+        assert len(regions) == 1, len(regions)
+        cotangent = jax.random.normal(jax.random.key(2), (2, 100, 128), jnp.bfloat16)
+        ran = [jax.jit(with_gradients(form))(variables, x, cotangent) for form in (chained, apart)]
+    for mine, theirs in zip(*(jax.tree.leaves(each) for each in ran), strict=True):
+        np.testing.assert_array_equal(_bits(mine), _bits(theirs))
+
+
+def _bits(leaf) -> np.ndarray:
+    """`leaf`'s raw bit patterns, so a bitwise comparison tells -0.0 from +0.0."""
+    held = np.asarray(leaf)
+    return held.view(np.dtype(f"u{held.dtype.itemsize}"))
+
+
+@pytest.mark.parametrize(("kind", "activation"), [
+    pytest.param("a function of its own", "relu", id="a function of its own"),
+    *(pytest.param(kind, activation, id=f"{kind}-{activation}")
+      for kind in ("mixed dtypes", "a sequence axis", "float64", "a promotion of its own")
+      for activation in ("gelu", "swiglu")),
+])
+def test_an_mlp_the_chain_cannot_read_runs_its_projections_apart(kind, activation):
+    """An MLP the recipe's chain cannot run as its projections apart, ungated or gated, runs them apart, one
+    recipe region each (`dew.nn.derivatives.Surrogate`): an activation given as a function of its own, which
+    the chain would call on its rows flattened and padded (a function of one placement or mixing positions
+    reads them otherwise); kernels of two dtypes, whose products promote apart (a bf16 up projection's into a
+    float32 down projection's, its output float32); rows a sequence axis splits, which the chain would
+    flatten past the hidden activation's placement; float64, which its quantizing epilogue does not write;
+    and a projection promoting its operands by a function of its own, which the chain would skip."""
+    from flax.linen.dtypes import promote_dtype as flax_promote_dtype
+    from jax.sharding import AbstractMesh, AxisType
+    from reference_error import equations
+
+    from dew.nn.dense import Dense
+    from dew.nn.derivatives import Surrogate
+    from dew.nn.mlp import GatedMLP
+    from dew.nn.precision import projection_role
+
+    fp8 = RECIPE_NUMERICS["blockwise_fp8"]
+    mixed, wide = kind == "mixed dtypes", kind == "float64"
+
+    def promoted(*operands, dtype=None):
+        # Flax's promotion, then the inputs doubled: a promotion of the layer's own.
+        inputs, *rest = flax_promote_dtype(*operands, dtype=dtype)
+        return (inputs * 2, *rest)
+
+    linear = (functools.partial(Dense, promote_dtype=promoted) if kind == "a promotion of its own"
+              else None)
+    mlp = GatedMLP(hidden_features=256, out_features=128,
+                   activation=jax.nn.relu if kind == "a function of its own" else activation,
+                   dtype=None if mixed else jnp.float64 if wide else jnp.bfloat16,
+                   **({} if linear is None else {"linear": linear}))
+    # A float64 run's whole: its rows drawn, its parameters made and its graph traced under x64.
+    widened = jax.enable_x64(new_val=True) if wide else contextlib.nullcontext()
+    with widened:
+        x = jax.random.normal(jax.random.key(0), (2, 100, 128), jnp.float64 if wide else jnp.bfloat16)
+        variables = nn.unbox(mlp.init(jax.random.key(1), x))
+    if mixed:
+        params = variables["params"]
+        variables = {"params": {name: {"kernel": params[name]["kernel"].astype(
+            jnp.float32 if name == "down_proj" else jnp.bfloat16)} for name in params}}
+    placed = (jax.sharding.use_abstract_mesh(AbstractMesh((2,), ("sequence",), axis_types=(AxisType.Auto,)))
+              if kind == "a sequence axis" else contextlib.nullcontext())
+    with generation.run_precision(fp8), projection_role("mlp"), placed, widened:
+        graph = jax.make_jaxpr(lambda variables, x: mlp.apply(variables, x))(variables, x)
+        out = jax.eval_shape(lambda variables, x: mlp.apply(variables, x), variables, x)
+    regions = [equation for equation in equations(graph) if equation.primitive.name == "marked_call"
+               and isinstance(equation.params.get("kind"), Surrogate)]
+    assert len(regions) == (3 if activation == "swiglu" else 2), len(regions)
+    assert out.dtype == (jnp.float32 if mixed else jnp.float64 if wide else jnp.bfloat16)

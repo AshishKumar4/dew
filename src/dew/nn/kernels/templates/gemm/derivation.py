@@ -23,15 +23,15 @@ from collections.abc import Callable
 
 from jax import numpy as jnp
 
-from dew.nn.kernels.templates import mosaic, resources, swizzling
+from dew.nn.kernels.templates import mosaic, resources, stores, swizzling
 from dew.nn.kernels.templates.gemm import pricing
-from dew.nn.kernels.templates.gemm.tiling import CONSUMERS, Tiles
+from dew.nn.kernels.templates.gemm.tiling import ACCUMULATOR_COLUMNS, CONSUMERS, Tiles
 
 
 def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, multiprocessors: int, target,
             candidate, launch_of, grouped: bool, depths: tuple[int, ...] | None = None, ragged: bool = False,
             units: tuple[int, int, int] = (1, 1, 1), dense: bool = False,
-            programs: int | None = None) -> Tiles | None:
+            programs: int | None = None, outputs: tuple = ()) -> Tiles | None:
     """The one tile a GEMM mainloop runs on an instruction family's `layouts` (`bundles.layouts`, its bundles
     in preference order, which share its facts but their loaders and registers) for a call whose output has
     `rows` rows (a group's, on average, where `grouped`: a product's rows split among its groups) and `width`
@@ -44,7 +44,8 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
     call whose rows are one group's (`gmm`'s `dense`), its walk banded as a dense walk's (`resources.band`).
     `candidate(tile)` is the launch's legality apart from its resources (its granularity, its blocks dividing
     the call, its side operands' copies), and `launch_of(tile)` the launch whose ring and residency the
-    planner sizes (`resources.plan`: its allocations a stage, its registers within a consumer's) on `target`.
+    planner sizes (`resources.plan`: its allocations a stage, its registers within a consumer's) on `target`;
+    `outputs`, the dtypes its tiles store, where the derivation states their staging (`_ring_staged`).
 
     - Layout: at each shape and step, the first layout whose planner holds it (`resources.placed`): a
       producer's where its consumers' registers hold the tile, else one whose first consumer issues the
@@ -83,7 +84,8 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
       planner every template's derivation reads), at least those the walk keeps busy (those loading ahead,
       `Family.loads_ahead`, beside the one consumed and those whose products the family keeps in flight,
       `Family.in_flight`); a tile that cannot stage that deep gives way to the next narrower or shorter one,
-      or a shallower step.
+      or a shallower step. A ring its consumers feed held at that least depth is deepened where a smaller
+      output staging leaves it room (`_ring_staged`).
     - Cluster: where the call's rows (a group's on average, a kernel gradient's output rows) hold a tile's
       on a family whose cluster takes a pair (`Family.cluster`), a pair of multiprocessors whose row tiles
       load the block they share once (a matrix, a kernel gradient's cotangent: cuBLASLt's cluster on the
@@ -114,7 +116,8 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
                                      width=width, padded=padded)
         held_tile = functools.partial(_held_tile, role=role, steps=steps, shaped=shaped,
                                       candidate=candidate, launch_of=launch_of, layouts=layouts,
-                                      target=target, programs=programs, price_of=price_of)
+                                      target=target, programs=programs, price_of=price_of,
+                                      outputs=outputs)
         # Qwen3-8B's gate/up so takes 128 x 128, its 192-wide tile's rows shortened to 64 by its stages
         # (64 x 192 ran 1.21-1.30x XLA's time against 128 x 128's 1.10-1.14, FSA100POST32). Where no width
         # stages busy at its balance, the widest staging busy at all, then the widest that holds.
@@ -196,11 +199,12 @@ def _tile_cost(tile: Tiles, *, family: mosaic.Family, target, dtype, rows: int, 
 
 def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], shaped: Callable,
                candidate: Callable, launch_of: Callable, layouts: tuple, target, programs: int,
-               price_of: Callable) -> tuple["Tiles | None", bool]:
+               price_of: Callable, outputs: tuple = ()) -> tuple["Tiles | None", bool]:
     """`derived`'s tile at a width: the rows its registers or VMEM hold there (`held_rows`), shortened where
     its stages do not fit, at the first step that plans busy, taking the least-priced busy tile under the
     shared cost model (`_tile_cost`), and whether it stages deep enough to stay busy (those its family loads
-    ahead, beside the one consumed and those it keeps in flight)."""
+    ahead, beside the one consumed and those it keeps in flight); a ring its consumers feed at that least
+    depth deepened where a smaller staging of its outputs leaves room (`_ring_staged`)."""
     family = layouts[0]
     busy = 1 + family.loads_ahead + family.in_flight
     fallback = None
@@ -219,6 +223,9 @@ def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], sha
             if not candidate(tile):
                 # A tile a compile of this process found spilling (`report.refused`) gives way to the next.
                 continue
+            if tile.stages == busy and layout.feeds_itself and outputs:
+                tile = _ring_staged(tile, layout, outputs, candidate=candidate, launch_of=launch_of,
+                                    target=target, programs=programs)
             if tile.stages >= busy:
                 price = price_of(tile)
                 if price is None:
@@ -230,6 +237,51 @@ def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], sha
     if best is not None:
         return best[1], True
     return fallback, False
+
+
+def _ring_staged(tile: Tiles, layout: mosaic.Family, outputs: tuple, *, candidate: Callable,
+                 launch_of: Callable, target, programs: int) -> Tiles:
+    """`tile`, whose ring its consumers feed (`mosaic.Transport.feeds_itself`) at its least busy depth, with
+    its outputs (`outputs`, their dtypes) staged in smaller buffers where that leaves the ring deeper: of
+    the stagings at the widest output's unstated chunk (`stores.output_staging`) and its halvings, in one
+    buffer or two, legal for the tile's issuer as the tile specializes it and each output
+    (`Tiles.staging_refusal`: whole accumulator atoms, whole TMA rows) and its buffers
+    (`Family.output_staging`) smaller than the unstated ones, the most bytes first and one buffer before
+    two on a tie, the first the planner places deeper, at the deepest ring it holds there
+    (`resources.plan`) and no compile of this process refused (`candidate`). Its loading consumer issues a
+    step's loads between its own products, no producer running ahead, so a ring at its least busy depth
+    leaves a load's latency no slack: an RTX PRO 6000's input gradient at 128 x 256 x 32, two stages beside
+    32 KB of output staging, slept on its full barriers in 14.4% of its samples (M-NG-1's ncu). The ring
+    serves every step and the staging a tile's store once, CUTLASS's order (StageCountAutoCarveout: the
+    epilogue's shared memory carved out first, the ring the rest). One buffer first: sm120's three-stage
+    128 x 256 forward compiled spill-free at (64, 1) and (32, 1), 227-229 registers, where CUDA 12.9's
+    allocator took (32, 2) to 255 and spilled 148 bytes, its live values no more (row 12667). The tile as
+    it was where no smaller staging deepens it."""
+    columns = pricing.tile_columns(tile, layout)
+    piece = layout.chunk_columns(columns)
+    shapes = tuple(((tile.share, columns), dtype) for dtype in outputs)
+
+    def staged_bytes(staging: tuple[int, int] | None) -> int:
+        return resources.allocated(*(resources.stored_bytes(buffer.shape, buffer.dtype)
+                                     for buffer in layout.output_staging(shapes, tile.warpgroups, staging)))
+
+    widest = max(stores.output_staging(columns, (dtype,), piece=piece)[0] for dtype in outputs)
+    issuer = layout.specialized(tile.share, columns)
+    halved = [(widest >> shift, count) for shift in range(widest.bit_length()) for count in (1, 2)
+              if widest >> shift >= ACCUMULATOR_COLUMNS]
+    legal = [staging for staging in halved
+             if dataclasses.replace(tile, staging=staging).staging_refusal(outputs, issuer) is None]
+    unstated = staged_bytes(None)
+    sized = {staging: size for staging in legal if (size := staged_bytes(staging)) < unstated}
+    for staging in sorted(sized, key=lambda staging: (-sized[staging], staging[1])):
+        staged = dataclasses.replace(tile, staging=staging)
+        planned = resources.plan([launch_of(staged)], layout, target, programs=programs)
+        if planned is None or planned[0].stages <= tile.stages:
+            continue
+        deeper = dataclasses.replace(staged, stages=planned[0].stages)
+        if candidate(deeper):
+            return deeper
+    return tile
 
 
 def _best_width(widths: list[tuple[int, int]], held_tile: Callable, side: int, *,
