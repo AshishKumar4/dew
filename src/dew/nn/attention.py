@@ -602,6 +602,27 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
         logits = capped_logits(logits, softcap)
     if bias is not None:
         logits = logits + bias
+    weights = _weights(logits, mask=mask, mask_fill=mask_fill, skipped=skipped, sinks=sinks,
+                       logit_floor=logit_floor, wide=force_fp32_for_softmax, dtype=dtype)
+    if dropout_rate:
+        if dropout_seed is None:
+            raise ValueError("training attention dropout requires dropout_seed")
+        # The keep bits are the draw's, shared with the kernels; the scale 1 / (1 - rate) takes the product's
+        # dtype, rounded once from its double (ledger 1533: a bf16 1 / (1 - rate) biases every kept weight).
+        # The weights round once, to their dtype.
+        wide = at_least_fp32(dtype)
+        keep = template.dropout_keep(dropout_seed, dropout_rate, weights.shape, dropout_places)
+        scale = jnp.asarray(1.0 / (1.0 - dropout_rate), wide)
+        weights = (weights.astype(wide) * jnp.where(keep, scale, 0)).astype(dtype)
+    return _weighted(weights, value, skipped=skipped, sinks=sinks, precision=values_precision)
+
+
+def _weights(logits: jax.Array, *, mask, mask_fill, skipped, sinks, logit_floor, wide: bool, dtype
+             ) -> jax.Array:
+    """`reference_attention`'s weights of its `logits` `[..., H, Q, K]`: masked (`mask_fill`, -inf beside
+    `sinks`), a walk's `skipped` keys -inf after, then softmaxed beside the sinks, from `logit_floor`, or
+    from the row's own maximum, in fp32 at least where `wide` (`force_fp32_for_softmax`)."""
+    heads, length = logits.shape[-3], logits.shape[-2]
     if mask is not None:
         # Beside a sink a masked key is -inf, so it weighs nothing whatever the sink's logit: the sink
         # keeps every row's denominator finite. Without one the finite floor keeps a row every key
@@ -615,41 +636,38 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
     if sinks is not None:
         if sinks.shape != (heads,):
             raise ValueError(f"sinks must have one logit per query head, got {sinks.shape}")
-        wide = jnp.promote_types(logits.dtype, sinks.dtype)
-        weights = sink_softmax(logits, sinks, at_least_fp32(wide) if force_fp32_for_softmax else None)
-    elif logit_floor is not None or skipped is not None:
+        widest = jnp.promote_types(logits.dtype, sinks.dtype)
+        return sink_softmax(logits, sinks, at_least_fp32(widest) if wide else None)
+    if logit_floor is not None or skipped is not None:
         # A row every key of which a walk skips weighs none (-inf its starting maximum where none is given).
-        weights = _floored_softmax(logits.astype(at_least_fp32(dtype)) if force_fp32_for_softmax else logits,
+        weights = _floored_softmax(logits.astype(at_least_fp32(dtype)) if wide else logits,
                                    -jnp.inf if logit_floor is None else logit_floor)
-        weights = weights if force_fp32_for_softmax else weights.astype(dtype)
-    elif force_fp32_for_softmax and dtype != jnp.float32:
-        weights = jax.nn.softmax(logits.astype(at_least_fp32(dtype)))
-    else:
-        # A bias wider than the logits widens them; the softmax runs there and its weights round after.
-        weights = jax.nn.softmax(logits).astype(dtype)
-    if dropout_rate:
-        if dropout_seed is None:
-            raise ValueError("training attention dropout requires dropout_seed")
-        # The keep bits are the draw's, shared with the kernels; the scale 1 / (1 - rate) takes the product's
-        # dtype, rounded once from its double (ledger 1533: a bf16 1 / (1 - rate) biases every kept weight).
-        # The weights round once, to their dtype.
-        wide = at_least_fp32(dtype)
-        keep = template.dropout_keep(dropout_seed, dropout_rate, weights.shape, dropout_places)
-        scale = jnp.asarray(1.0 / (1.0 - dropout_rate), wide)
-        weights = (weights.astype(wide) * jnp.where(keep, scale, 0)).astype(dtype)
+        return weights if wide else weights.astype(dtype)
+    if wide and dtype != jnp.float32:
+        return jax.nn.softmax(logits.astype(at_least_fp32(dtype)))
+    # A bias wider than the logits widens them; the softmax runs there and its weights round after.
+    return jax.nn.softmax(logits).astype(dtype)
+
+
+def _weighted(weights: jax.Array, value: jax.Array, *, skipped, sinks, precision) -> jax.Array:
+    """`reference_attention`'s output: its `weights` `[..., H, Q, K]` times `value` (`[..., K, KV, Dv]`, its
+    heads repeated where it went through `repeat_kv_heads`), each query block's over the keys it visits where
+    a walk `skipped` some, grouped by key head beside `sinks` (`[..., Q, H, Dv]`)."""
     if skipped is not None:
         return _by_query_block(
             lambda weights_of, visited: weighted_values(
                 '...hqk,...khd->...qhd', weights_of,
-                jnp.where(visited, value, jnp.zeros((), value.dtype)), precision=values_precision),
+                jnp.where(visited, value, jnp.zeros((), value.dtype)), precision=precision),
             weights, skipped, query_axis=-2, out_axis=-3)
     if sinks is None:
-        return weighted_values('...hqk,...khd->...qhd', weights, value, precision=values_precision)
+        return weighted_values('...hqk,...khd->...qhd', weights, value, precision=precision)
+    *rows, heads, length, keys = weights.shape
+    kv_heads = value.shape[-2]
     if kv_heads == 1:
         return float32_einsum('...gts,...sd->...tgd', weights.astype(value.dtype), value[..., 0, :],
-                              precision=values_precision)
+                              precision=precision)
     groups = weights.astype(value.dtype).reshape(*rows, kv_heads, heads // kv_heads, length, keys)
-    return float32_einsum('...kgts,...skd->...tkgd', groups, value, precision=values_precision).reshape(
+    return float32_einsum('...kgts,...skd->...tkgd', groups, value, precision=precision).reshape(
         *rows, length, heads, value.shape[-1])
 
 
