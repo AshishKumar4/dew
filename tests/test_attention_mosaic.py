@@ -53,6 +53,7 @@ from dew.nn.kernels.templates import (
     bundles,
     mosaic_sm90,
 )
+from dew.nn.kernels.templates.hooks import Hook, Side
 
 pytestmark = pytest.mark.kernel
 
@@ -301,7 +302,7 @@ def _check_spans(label: str, spans: template.KeySpans | Callable[[], template.Ke
                  gate: bool = False, dtype=jnp.bfloat16, natural: bool = False, seeds: int | None = None,
                  width: int = 64, param_rows: int | None = None, pins: tuple | None = None,
                  target: generation.GpuTarget | None = None, routed: bool = True,
-                 keys: int | None = None):
+                 keys: int | None = None, plain_axes: bool = False):
     """The forward, or the backward in the form `form` names (`_backward_form`), over `spans` at `_form_tiles`
     (64 wide) under the score hooks `score` (`test_attention_triton.score_hooks`, their parameters and
     initial state drawn with the operands) and with `gate` an output gate (`hooks_for`), draws of `shape`
@@ -310,7 +311,9 @@ def _check_spans(label: str, spans: template.KeySpans | Callable[[], template.Ke
     values, the hook's parameters and the initial state, over `seeds` draws where given (the site's own,
     else the template site's); its launches at the forward's and backward's configs `pins` where given
     (`_pinned`), interpreted for `target` where given (`_device`), the backward the one the route takes
-    where `routed`, else this mainloop's (a TPU core's, which the route's CUDA facts do not read)."""
+    where `routed`, else this mainloop's (a TPU core's, which the route's CUDA facts do not read). With
+    `plain_axes`, the call names its hook's side operands' axes by the plain tuples of their kinds, the
+    reference by the kinds."""
     rows, queries, heads, _ = shape
     make_spans = spans if callable(spans) else (lambda: spans)
     if keys is not None:
@@ -325,17 +328,17 @@ def _check_spans(label: str, spans: template.KeySpans | Callable[[], template.Ke
     def draw(seed):
         return *draw_operands(seed), *draw_hooks(seed)
 
-    def hooked(params, initial):
+    def hooked(params, initial, plain: bool = False):
         output = hooks_for(HOOKS["gate" if gate else "none"], queries, width, gate_of(queries, width))
-        return template.Hooks(score_mod, tuple(template.Param(value, kind)
-                                               for value, kind in zip(params, kinds, strict=True)), initial,
-                              output.output_mod, output.output_params)
+        sides = tuple(Side(value, tuple(kind) if plain else kind)
+                      for value, kind in zip(params, kinds, strict=True))
+        return template.Hooks(score=Hook(score_mod, sides), initial=initial, output=output.output)
 
     accurate, config = _backward_form(form)
 
     def ours(query, key, value, dout, params, initial):
         built_spans = make_spans()
-        hooks = hooked(params, initial)
+        hooks = hooked(params, initial, plain_axes)
         # The forward at the call forms' tiles 64 wide, else at its derivation's (two consumers' hooked sums
         # 128 wide pass their registers, and a hooked training forward's natural walk theirs 64 wide).
         pinned = pins or (_form_tiles() if width == 64 and not (backward and score) else None, config)
@@ -416,6 +419,17 @@ def test_a_hooks_streamed_parameters_hold_check_1_through_the_rings_rotations_in
             attention_mosaic.BackwardTiles(64, 64, 2, 1, family=WGMMA, dkv_family=WGMMA))
     _check_spans("causal", spans, (1, 256, 2, 1), interpret=True, backward=True, score=STREAMED_HOOKS[hooks],
                  pins=pins)
+
+
+@INTERPRETS
+def test_a_streamed_tile_bias_named_by_its_plain_axes_holds_check_1_interpreted():
+    """A dense bias whose axes are the plain tuple ('batch', 'heads', 'queries', 'keys') rather than
+    `Kind.TILE`, streamed by an H100's producer on the keys' rings over 256 causal tokens: on par with the
+    reference (check 1), where its launch had taken it as a vector's stream, its block one row (row 13032,
+    Train 1291's review)."""
+    spans = template.spans(256, 256, 1, causal=True)
+    _check_spans("causal", spans, (1, 256, 2, 1), interpret=True, score=STREAMED_HOOKS["tile-bias"],
+                 pins=(attention_mosaic.Tiles(64, 64, 2, 2, family=WGMMA), None), plain_axes=True)
 
 
 @INTERPRETS
@@ -605,8 +619,8 @@ def test_a_hook_reads_its_places_as_a_vector_only_where_every_run_of_it_reads_th
         return jax.lax.scan(lambda carry, _: (carry + q_pos.astype(carry.dtype), None), score, None,
                             length=0)[0]
 
-    assert attention_mosaic_program.score_places(template.Hooks(helper)) == (True, False)
-    assert attention_mosaic_program.score_places(template.Hooks(looped)) == (False, False)
+    assert attention_mosaic_program.score_places(template.Hooks(score=Hook(helper))) == (True, False)
+    assert attention_mosaic_program.score_places(template.Hooks(score=Hook(looped))) == (False, False)
 
 
 @INTERPRETS
@@ -838,7 +852,7 @@ def test_values_their_keys_columns_are_the_keys_as_given_under_a_key_prologue_in
     twos from the key's slot)."""
     shape = (1, 64, 1, 64)
     spans = template.spans(shape[1], shape[1], shape[0], causal=False)
-    hooks = template.Hooks(key_mod=lambda key, *_: key * 2)
+    hooks = template.Hooks(key=Hook(lambda key, *_: key * 2))
     query, key = jnp.zeros(shape, jnp.bfloat16), jnp.ones(shape, jnp.bfloat16)
     with _device(interpret=True, target=generation.gpu_target("sm90")):
         found = attention_mosaic.forward(query, key, key, spans, hooks, natural=False, interpret=True,
@@ -862,7 +876,7 @@ def test_a_call_whose_values_its_key_slot_cannot_serve_is_declined_as_one_handin
     their issuing role."""
     shape = (1, 64, 1, 64)
     spans = template.spans(shape[1], shape[1], shape[0], causal=True)
-    hooks = template.Hooks(key_mod=lambda key, *_: key * 2) if case == "prologued" else None
+    hooks = template.Hooks(key=Hook(lambda key, *_: key * 2)) if case == "prologued" else None
     residuals = template.Kept.SPLIT if case == "trained" else template.Kept.NONE
     query, key = jnp.zeros(shape, dtype), jnp.ones(shape, dtype)
     with generation.assumed(generation_name):
@@ -1192,8 +1206,8 @@ def test_padding_rows_reach_no_hook_gradient_interpreted(queries, form):
         return s / temperature + bias
 
     def hooked(temperature, bias):
-        return template.Hooks(score_mod, (template.Param(temperature, template.Kind.QUERY),
-                                          template.Param(bias, template.Kind.HEAD)))
+        return template.Hooks(score=Hook(score_mod, (Side(temperature, template.Kind.QUERY),
+                                          Side(bias, template.Kind.HEAD))))
 
     params = (jnp.ones((1, 1, queries), jnp.float32), jnp.zeros((1,), jnp.float32))
     hooks = hooked(*params)
@@ -1458,7 +1472,7 @@ def test_a_scaled_forward_derives_wherever_its_common_one_does(target, width, ho
     spans = template.spans(queries, queries, 1, causal=True)
     score_mod, kinds, draw = score_hooks(hooks, queries, queries, width, rows=1, heads=4)
     params, initial = draw(0)
-    hooked = template.Hooks(score_mod, tuple(map(template.Param, params, kinds)), initial)
+    hooked = template.Hooks(score=Hook(score_mod, tuple(map(Side, params, kinds))), initial=initial)
     arrays = [jnp.zeros((1, queries, heads, width), dtype) for heads in (4, 2, 2)]
     with generation.assumed(target):
         op, args = attention_mosaic._forward_call(*arrays, spans, hooked, scale=None,
@@ -1555,11 +1569,11 @@ def test_a_hooked_sm80_backward_of_an_integer_parameter_compiles_at_fewer_rows_a
     tokens, heads = 256, 4
     spans = template.spans(tokens, tokens, 1, causal=True)
     query = jnp.zeros((1, tokens, heads, 64), jnp.bfloat16)
-    buckets = template.Param(jnp.zeros((1, heads, tokens), jnp.int32), template.Kind.KEY)
+    buckets = Side(jnp.zeros((1, heads, tokens), jnp.int32), template.Kind.KEY)
     with generation.assumed("sm80"):
         target = generation.gpu_target()
         op, args = attention_mosaic._backward_call(query, query, query, spans,
-                                                   template.Hooks(bucketed, (buckets,)), query,
+                                                   template.Hooks(score=Hook(bucketed, (buckets,))), query,
                                                    _residuals(query.shape), scale=None,
                                                    natural=attention_mosaic.NATURAL, accurate=True)
         ba = op.bind(*args, interpret=False)
@@ -1688,8 +1702,8 @@ def test_a_hook_shaped_to_the_launchs_tile_is_taken():
         return query, key, value, gate
 
     def hooked(gate):
-        return template.Hooks(output_mod=lambda out, g: out * jax.nn.sigmoid(g.reshape((-1, 128))),
-                              output_params=(template.Param(gate, template.Kind.OUTPUT),))
+        return template.Hooks(output=Hook(lambda out, g: out * jax.nn.sigmoid(g.reshape((-1, 128))),
+                                          (Side(gate, template.Kind.OUTPUT),)))
 
     def ours(query, key, value, gate):
         with _device(interpret=True):

@@ -20,6 +20,7 @@ from test_gemm_template import CASES, SEEDS, _dew, _draw, _drop, _rounded_throug
 from dew.nn.kernels import gemm, generation, grouped_launch, xla_products
 from dew.nn.kernels.templates import mosaic_sm90, resources
 from dew.nn.kernels.templates.gemm import chained, derivation, mosaic_gpu, tiling
+from dew.nn.kernels.templates.hooks import Hook
 
 
 def swiglu(gate, up):
@@ -65,7 +66,7 @@ def test_the_templates_paired_product_holds_check_1(generation_name, grouped):
                 jnp.asarray(rng.normal(size=(rows, width)), jnp.bfloat16))
 
     def dew(x, gate, up):
-        return gemm.gemm(x, gate, sizes, paired=up, epilogue=swiglu, out_dtype=jnp.bfloat16,
+        return gemm.gemm(x, gate, sizes, paired=up, epilogue=Hook(swiglu), out_dtype=jnp.bfloat16,
                              interpret_on_cpu=True)
 
     def plain(x, gate, up, wide=jnp.float32, out=jnp.bfloat16):
@@ -111,7 +112,7 @@ def test_a_paired_products_epilogue_reads_its_fp32_accumulators_in_every_mode(ge
                 jnp.asarray(rng.normal(size=(rows, width)), jnp.float32))
 
     def dew(x, gate, up):
-        return gemm.gemm(x, gate, sizes, paired=up, epilogue=lambda g, u: g * u, compute=jnp.bfloat16,
+        return gemm.gemm(x, gate, sizes, paired=up, epilogue=Hook(lambda g, u: g * u), compute=jnp.bfloat16,
                              out_dtype=jnp.float32, precision="default", interpret_on_cpu=True)
 
     def plain(x, gate, up, dtype=jnp.bfloat16):
@@ -1478,7 +1479,7 @@ def _paired_pullback(epilogue, names, x, gate, up, out_dtypes):
     sizes = jnp.asarray(_SIZES_1376, jnp.int32)
 
     def outputs(x, gate, up):
-        hidden, gate_out, *_ = gemm.gemm(x, gate, sizes, paired=up, epilogue=epilogue,
+        hidden, gate_out, *_ = gemm.gemm(x, gate, sizes, paired=up, epilogue=Hook(epilogue),
                                          out_dtype=out_dtypes[0], out_dtypes=out_dtypes, named=names)
         return hidden, gate_out
 

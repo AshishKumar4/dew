@@ -27,6 +27,7 @@ from dew.nn.kernels.templates import (
     attention_backward_algebra,
     attention_portable,
 )
+from dew.nn.kernels.templates.hooks import Hook, Side
 from dew.nn.precision import float32_einsum
 
 SOURCE = Path(__file__).resolve().parents[1] / "src"
@@ -461,7 +462,7 @@ def test_a_query_a_hook_empties_takes_no_cotangent():
     (`attention.launch_arguments`)."""
     query, key, value, dout = one_key(jnp.float32, [[0.0], [0.0]], [[0.0]], [[2.0 ** 127]],
                                              [[0.0], [4.0]])
-    hooks = template.Hooks(score_mod=first_query_only)
+    hooks = template.Hooks(score=Hook(first_query_only))
     spans = template.spans(2, 1, 1)
     _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans, hooks), query, key, value)
     assert all(np.isfinite(np.asarray(grad)).all() for grad in pull(dout))
@@ -546,8 +547,8 @@ def test_a_derived_backward_masks_its_hook_cotangents_where_padding_reads_no_key
     rng = np.random.default_rng(0)
     query, key, value, dout = (jnp.asarray(rng.standard_normal((1, 1, 1, 8)), jnp.float32) for _ in range(4))
     spans = template.spans(1, 1, 1)
-    temperature = template.Param(jnp.ones((1, 1, 1), jnp.float32), template.Kind.QUERY)
-    hooks = template.Hooks(score_mod=tempered, score_params=(temperature,))
+    temperature = Side(jnp.ones((1, 1, 1), jnp.float32), template.Kind.QUERY)
+    hooks = template.Hooks(score=Hook(tempered, (temperature,)))
     with fast():
         grads = attention_portable.backward(attention_portable.Tiles(8, 8, 8), query, key, value, spans,
                                             hooks, dout)
@@ -854,8 +855,8 @@ def test_staged_logits_is_skipped_when_unstaged_already_fits_shared_memory_at_sa
 
     bias = jax.ShapeDtypeStruct((1, 8, 1024), jnp.float16)
     hooks = template.Hooks(
-        score_mod=lambda s, _q, _k, a, b: s + a.astype(s.dtype) + 2.0 * b.astype(s.dtype),
-        score_params=(template.Param(bias, template.Kind.KEY), template.Param(bias, template.Kind.KEY)))
+        score=Hook(lambda s, _q, _k, a, b: s + a.astype(s.dtype) + 2.0 * b.astype(s.dtype),
+                   (Side(bias, template.Kind.KEY), Side(bias, template.Kind.KEY))))
     with generation.assumed("sm80"):
         target = generation.gpu_target()
         op, ba = backward_ba(256, hooks)
@@ -1087,9 +1088,9 @@ def test_row_indexed_hooks_take_and_lower_at_fewer_rows_on_mma_sync():
     docs = jnp.where(jnp.arange(512, dtype=jnp.int32)[None, :] < 256, 1, 2)
     cases = [
         (template.spans(512, 512, 1, causal=True),
-         template.Hooks(score_mod=lambda s, q_pos, _k: s + 0.01 * q_pos[:, :1].astype(s.dtype))),
+         template.Hooks(score=Hook(lambda s, q_pos, _k: s + 0.01 * q_pos[:, :1].astype(s.dtype)))),
         (template.spans(512, 512, 1, causal=True, segment_ids=docs),
-         template.Hooks(score_mod=lambda s, q_pos, k_pos: s + 0.01 * (q_pos - k_pos).astype(s.dtype))),
+         template.Hooks(score=Hook(lambda s, q_pos, k_pos: s + 0.01 * (q_pos - k_pos).astype(s.dtype)))),
     ]
     pins = [attention_mosaic.BackwardTiles(block_q=rows, block_k=32, stages=2, consumers=1, fused=False,
                                            family="mma.sync") for rows in (32, 64)]

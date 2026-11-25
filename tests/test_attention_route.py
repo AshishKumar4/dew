@@ -48,6 +48,7 @@ from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.inputs import counted_places
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import attention as template, attention_route
+from dew.nn.kernels.templates.hooks import Hook, Side
 from dew.nn.precision import Numerics
 
 HEADS, KV_HEADS, WIDTH = 4, 2, 32
@@ -1044,11 +1045,11 @@ def test_the_route_takes_score_hooks_and_the_initial_state_and_refuses_an_output
     query, key, value, sinks, _ = drawing(QUERIES, KEYS, jnp.float32, sinks=True)(0)
     assert sinks is not None
     spans = template.spans(QUERIES, KEYS, ROWS, causal=True)
-    hooks = template.Hooks(score_mod=template.Capped(SOFTCAP),
+    hooks = template.Hooks(score=Hook(template.Capped(SOFTCAP)),
                            initial=template.sinks(sinks, ROWS, QUERIES, WIDTH))
     assert attention_route.attend(query, key, value, spans, hooks).shape == (ROWS, QUERIES, HEADS, WIDTH)
     with pytest.raises(ValueError):
-        attention_route.attend(query, key, value, spans, template.Hooks(output_mod=jnp.tanh))
+        attention_route.attend(query, key, value, spans, template.Hooks(output=Hook(jnp.tanh)))
 
 
 @pytest.mark.parametrize("generation_name", ["sm86", "sm120"])
@@ -1373,13 +1374,10 @@ def test_bare_attention_route_supports_jvp_and_higher_order_with_hooks():
 
     def make_hooks(b_p, s_v, qs):
         return template.Hooks(
-            score_mod=score_mod,
-            score_params=(template.Param(b_p, template.Kind.TILE),
-                          template.Param(pos_i, template.Kind.QUERY)),
+            score=Hook(score_mod, (Side(b_p, template.Kind.TILE), Side(pos_i, template.Kind.QUERY))),
             initial=template.sinks(s_v, b, q_len, d),
             drop=drop,
-            query_mod=q_mod,
-            query_params=(template.Param(qs, template.Kind.HEAD),),
+            query=Hook(q_mod, (Side(qs, template.Kind.HEAD),)),
         )
 
     def route_fn(qi, ki, vi, b_p, s_v, qs):
@@ -1425,13 +1423,12 @@ def test_bare_attention_route_supports_jvp_and_higher_order_with_hooks():
         return s + b_p if b_p.dtype == jnp.float32 else s
 
     def bf_route(b_in):
-        hk = template.Hooks(score_mod=dtype_checked_score,
-                            score_params=(template.Param(b_in, template.Kind.TILE),))
+        hk = template.Hooks(score=Hook(dtype_checked_score, (Side(b_in, template.Kind.TILE),)))
         return attention_route.attend(q, k, v, spans, hk)
 
     def bf_ref(b_in):
-        hk = template.Hooks(score_mod=dtype_checked_score,
-                            score_params=(template.Param(b_in.astype(jnp.float32), template.Kind.TILE),))
+        hk = template.Hooks(score=Hook(dtype_checked_score,
+                                       (Side(b_in.astype(jnp.float32), template.Kind.TILE),)))
         return template.reference(q, k, v, spans, hk)
 
     _, jvp_bf = jax.jvp(bf_route, (bf_bias,), (db_bf,))
