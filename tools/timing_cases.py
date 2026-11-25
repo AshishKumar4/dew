@@ -53,6 +53,7 @@ lane's Triton GEMMs as upstream XLA keeps them under deterministic ops); a user'
 """
 import atexit
 import contextlib
+import sys
 
 import jax
 import jax.numpy as jnp
@@ -164,12 +165,13 @@ def gated(cell: dict, implementation: str) -> tuple:
     if cell["kind"] == "train":
         arguments = (*arguments, jnp.asarray(rng.normal(size=x.shape), x.dtype))
     function = trained if cell["kind"] == "train" else layer.apply
-    with (generation.chosen(grouped_matmul="mosaic", gated_mlp=implementation),
-          generation.routes() as routes):
+    choices = {} if implementation == "apart" else {"grouped_matmul": "mosaic"}
+    with generation.chosen(gated_mlp=implementation, **choices), generation.routes() as routes:
         lowered = jax.jit(function).lower(*arguments)
     taken = {route.kernel for route in routes if route.choice == "gated_mlp"}
     if taken != {implementation}:
         raise ValueError(f"MLP arm {implementation!r} cannot be timed as {taken}")
+    print(f"gated {cell}: {implementation} routes: {[(r.choice, r.kernel) for r in routes]}", file=sys.stderr)
     return lowered.compile(), lambda index: arguments
 
 

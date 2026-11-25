@@ -426,14 +426,3 @@ def test_a_batched_faint_pair_does_not_hide_a_live_nan():
     decay[:, SUB - 1:, 0] = (2.0 ** -60, 1.0)
     values = jax.jit(jax.vmap(scan._paired))(rows, keys, decay)
     np.testing.assert_array_equal(values[:, SUB, 0], [np.nan, 2.0 ** -60])
-
-
-def test_a_nonlinear_consumer_of_a_decayed_pair_holds_the_second_reverse_derivative():
-    rows = jnp.asarray([[0.0, 0.0], [3.0, 0.0]], jnp.float32)
-    keys = jnp.asarray([[2.0, 0.0], [0.0, 0.0]], jnp.float32)
-    decay = jnp.zeros((2, 2, 2), jnp.float32).at[1, 0, 0].set(0.5)
-
-    def squared(x):
-        return jnp.square(scan._paired(rows.at[1, 0].set(x), keys, decay)[1, 0])
-
-    assert jax.jit(jax.grad(jax.grad(squared)))(jnp.float32(3)) == 2

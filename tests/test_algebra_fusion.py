@@ -517,22 +517,23 @@ def test_a_models_gated_product_is_its_gate_projections_epilogue():
                         "a model's gated product under the pass", seeds=8, truth_fn=with_gradients(wide))
 
 
+def gated_projection(gate, up, down):
+    from dew.nn import activations
+
+    return activations.gated_product("swiglu")(gate, up) @ down
+
+
 @lowers("sm90")
 def test_a_gated_activation_can_feed_the_next_products_prologue():
     from contract_support import normal_drawn
     from reference_error import assert_as_exact, with_gradients
-
-    from dew.nn import activations
-
-    def projected(gate, up, down):
-        return activations.gated_product("swiglu")(gate, up) @ down
 
     dims = ((256, 512), (256, 512), (512, 256))
     operands = normal_drawn(3422, *dims, (256, 256), dtype=jnp.bfloat16)
     shapes = tuple(jax.ShapeDtypeStruct(shape, jnp.bfloat16) for shape in dims)
     with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic", gemm_prologue="fused"),
           generation.routes() as routes):
-        jax.jit(algebra.rewritten(projected, kernels=True)).trace(*shapes)
+        jax.jit(algebra.rewritten(gated_projection, kernels=True)).trace(*shapes)
     assert any(route.choice == "gemm_prologue" and route.kernel == "fused" for route in routes)
 
     def truth(gate, up, down):
@@ -546,10 +547,10 @@ def test_a_gated_activation_can_feed_the_next_products_prologue():
 
     with (generation.assumed("sm90", interpreted=True),
           generation.chosen(grouped_matmul="mosaic", gemm_prologue="fused")):
-        assert_as_exact(jax.jit(with_gradients(functools.partial(_passed, projected))),
-                        jax.jit(with_gradients(projected)), operands, "gated product before a projection",
+        assert_as_exact(jax.jit(with_gradients(functools.partial(_passed, gated_projection))),
+                        jax.jit(with_gradients(gated_projection)), operands, "gated product before a projection",
                         seeds=8, truth_fn=with_gradients(truth))
-        assert_as_exact(directional(functools.partial(_passed, projected)), directional(projected),
+        assert_as_exact(directional(functools.partial(_passed, gated_projection)), directional(gated_projection),
                         normal_drawn(3423, *dims, *dims, dtype=jnp.bfloat16), "gated projection tile JVP",
                         seeds=8, truth_fn=directional(truth))
 

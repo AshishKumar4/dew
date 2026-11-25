@@ -1166,27 +1166,10 @@ def _paired(left, right, between, issue: Callable | None = None, role: str = "sc
 
 
 def _pair_sum(factors: tuple[jax.Array, ...]) -> jax.Array:
-    """Sum a pairing's factors along their leading key axis without landing a product first.
-
-    Ratios elide zero terms for zero-mass states; a pairing instead keeps IEEE nonfinite products.
-    The nonfinite mask is formed only from unshifted factors, never from a rounded finite intermediate.
-    """
+    """Contract the leading key axis without landing a product before it meets the other factors."""
     form = ratios.Ratio(((1.0, tuple(("v", i) for i in range(len(factors)))),), (), 0,
-                        reduced=True, units=windows.Units())
-    finite = tuple(jnp.isfinite(factor) for factor in factors)
-    value = ratios.ratio([jnp.where(keep, operand, 0.0)
-                          for operand, keep in zip(factors, finite, strict=True)], form)
-    # Preserve the signs of finite factors meeting infinity, without allowing finite underflow or overflow
-    # in these products to turn an infinite term into NaN or a finite term into infinity.
-    exceptional = jnp.ones((), value.dtype)
-    for operand, keep in zip(factors, finite, strict=True):
-        _, _, exponent, mantissa = float_bits.raw_fields(operand)
-        is_zero = (exponent == 0) & (mantissa == 0)
-        exceptional = exceptional * jnp.where(keep, jnp.copysign(jnp.where(is_zero, 0.0, 1.0), operand),
-                                              operand)
-    all_finite = functools.reduce(jnp.logical_and, finite)
-    special = jnp.sum(jnp.where(all_finite, 0.0, exceptional), axis=0)
-    return value + lax.stop_gradient(special)
+                        reduced=True, units=windows.Units(), ieee_products=True)
+    return ratios.ratio(list(factors), form)
 
 
 def _tiny_factor(operand, decay, product):
@@ -1247,7 +1230,7 @@ def _batch_pair_dispatch(size, batched, *operands):
     return _pair_dispatch(*placed), True
 
 
-_portable_pairs = contracted("test_a_nonlinear_consumer_of_a_decayed_pair_holds_the_second_reverse_derivative")(
+_portable_pairs = contracted("test_a_decayed_pair_holds_its_derivatives")(
     declared_tangent(Protected(), _pair_dispatch, _portable_pair_jvp, symbolic_zeros=True))
 
 

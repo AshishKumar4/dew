@@ -634,21 +634,41 @@ def _split(producer, values):
                                     if axis is not None))
                 for array, side_axes in zip(arrays[1:], axes, strict=True)]
     named = tuple(tuple(axis for axis in side_axes if axis is not None) for side_axes in axes)
-    function = functools.partial(_prologue_tile, whole, tuple(jax.typeof(array) for array in arrays), axes)
+    types = tuple(jax.typeof(array) for array in arrays)
+    function = functools.partial(_prologue_tile, whole, types, axes)
     places = tuple(given.get(var) for var in (base, *sides))
     # Priced (`Formed`): the element stage the prologue runs, counted as its launch's body is (`priced`), and
     # XLA's programs beside it.
     # XLA's program of the sides: the producer's, read back from them (its extraction prices what they read
     # alone); none where every side is an input the stage reads as given.
     computed = any(not isinstance(var, jax_core.Literal) and var not in jaxpr.invars for var in sides)
-    # Differentiate the tiled stage when all its operands are direct inputs and inlining lost no
-    # custom derivative. The whole-producer JVP is only needed for computed sides, or a custom rule.
-    own_rule = any(programs.own_derivative(equation.primitive) for equation in programs.equations(source.jaxpr))
-    jvp = (functools.partial(_whole_jvp, flat, tuple(leaves), places, tuple(array.shape for array in arrays))
-           if computed or own_rule else None)
+    whole_jvp = functools.partial(_whole_jvp, flat, tuple(leaves), places, tuple(array.shape for array in arrays))
+    if computed or any(not jnp.issubdtype(array.dtype, jnp.inexact) for array in arrays):
+        jvp = whole_jvp
+    elif any(programs.own_derivative(eq.primitive) for eq in programs.equations(source.jaxpr)):
+        jvp = _tile_jvp(whole_jvp, arrays, types, axes)
+    else:
+        jvp = None
     formed = Formed(staged, closed.replace(jaxpr=jaxpr.replace(outvars=list(sides))) if computed else None,
                     closed, float(sum(array.size * array.dtype.itemsize for array in squeezed)))
     return arrays[0], function, squeezed, named, jvp, formed
+
+
+def _tile_jvp(whole_jvp, arrays: list, types: tuple, axes: tuple):
+    """Trace the producer's own derivative before tiling it, with primal and tangent sides on the
+    same axes. There are no computed sides, so no derivative reads a whole-row statistic."""
+    count = len(arrays)
+
+    def push(*values):
+        return whole_jvp(*values[:count])(*values[count:])
+
+    derivative = jax.make_jaxpr(push)(*arrays, *arrays)
+    return functools.partial(_jvp_on_tile, functools.partial(_inlined, derivative), (*types, *types),
+                             (*axes, PROLOGUE_AXES, *axes))
+
+
+def _jvp_on_tile(derivative, types, axes, base, *sides):
+    return functools.partial(_prologue_tile, derivative, types, axes, base, *sides)
 
 
 def _whole_jvp(flat, leaves: tuple, places: tuple, shapes: tuple, base, *sides):

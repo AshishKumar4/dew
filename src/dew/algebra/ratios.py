@@ -32,6 +32,7 @@ from dew.algebra.windows import (
     _without_axis,
     chunk_width,
 )
+from dew.nn.float_bits import raw_fields
 
 
 @dataclasses.dataclass(frozen=True)
@@ -53,6 +54,8 @@ class Ratio:
     `Summed`), its `numerator` then none: a derivative's whose denominator moves, `(dP D - q P dD) / D^(q+1)`
     (`_ratio_jvp`), each sum formed once, unlanded, so no quotient is landed apart from the terms it cancels
     against (the merge P0's base review 9, F2: a landed quotient of 2^-156 lost the derivative's -2^-66).
+    A plain product sum can retain IEEE nonfinite terms rather than annihilate them with zero
+    (ieee_products, a portable recurrence pairing). This choice follows the term through AD.
     A zero lands as +0. A value (`scaled._valued`)."""
 
     numerator: tuple
@@ -64,6 +67,7 @@ class Ratio:
     across: tuple[int, ...] = ()
     power: int = 1
     products: tuple = ()
+    ieee_products: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -208,11 +212,38 @@ def _ratio_sum(operands, form: Ratio):
 
 
 
+def _exceptional_products(operands, form: Ratio, rank: int):
+    """IEEE nonfinite products, summed on the same axes as the plain product sum."""
+    held = []
+    for operand in operands:
+        laid = _laid_to(operand, rank)
+        finite = jnp.isfinite(laid)
+        _, _, exponent, mantissa = raw_fields(laid)
+        sign = jnp.copysign(jnp.where((exponent == 0) & (mantissa == 0), 0.0, 1.0), laid)
+        held.append((finite, jnp.where(finite, sign, laid)))
+    axes = (*form.over, form.axis) if form.reduced else form.over
+    terms = []
+    for coefficient, factors in form.numerator:
+        values = [held[index] for _, index in factors]
+        finite = functools.reduce(jnp.logical_and, (keep for keep, _ in values))
+        sign = functools.reduce(jnp.multiply, (value for _, value in values), coefficient)
+        terms.append(jnp.sum(jnp.where(finite, 0.0, sign), axis=axes, keepdims=True))
+    total = functools.reduce(jnp.add, terms)
+    total = jnp.sum(total, axis=form.across, keepdims=True)
+    return jnp.squeeze(total, form.axis) if form.reduced else total
+
+
 def _ratio_value(*operands, form: Ratio):
     """A ratio's value (`Ratio`): its sum (`_ratio_sum`) landed once (`_landed`), over its operands' whole
     extent (`_ratio_abstract`'s), each of its sums broadcast to it."""
-    landed = _landed(_ratio_sum(operands, form), operands[0].dtype)
     rank = max(operand.ndim for operand in operands)
+    if form.ieee_products:
+        finite = tuple(jnp.where(jnp.isfinite(operand), operand, 0.0) for operand in operands)
+        total = _landed(_ratio_sum(finite, form), operands[0].dtype)
+        special = _exceptional_products(operands, form, rank)
+        landed = jnp.where(jnp.isfinite(special), total, special)
+    else:
+        landed = _landed(_ratio_sum(operands, form), operands[0].dtype)
     shape = np.broadcast_shapes(*(_laid_to(operand, rank).shape for operand in operands))
     whole = tuple(1 if place in (*form.over, *form.across) else size for place, size in enumerate(shape)
                   if not (form.reduced and place == form.axis))
