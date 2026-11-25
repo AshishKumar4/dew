@@ -1221,9 +1221,8 @@ class _NormTrack:
     `proven(..., deep=True)` so `x * rsqrt(sum(x^2) + eps)` and `x / sqrt(sum(x^2) + eps)` prove unit norm
     (`bound = UNIT + 1`, finite number) without false positives across mismatched axes or operands."""
 
-    def __init__(self, sq_sum: dict[jcore.Var, tuple[jcore.Var, tuple[int | None, ...], bool]] | None = None,
-                 inv_norm: dict[jcore.Var, tuple[jcore.Var, tuple[int | None, ...]]] | None = None,
-                 pos_norm: dict[jcore.Var, tuple[jcore.Var, tuple[int | None, ...]]] | None = None) -> None:
+    def __init__(self, sq_sum: dict | None = None, inv_norm: dict | None = None,
+                 pos_norm: dict | None = None) -> None:
         self.origin: dict[jcore.Var, jcore.Var] = {}
         self.squared: dict[jcore.Var, jcore.Var] = {}
         self.sq_sum: dict[jcore.Var, tuple[jcore.Var, tuple[int | None, ...], bool]] = dict(sq_sum or {})
@@ -1234,8 +1233,7 @@ class _NormTrack:
         return self.origin.get(var, var)
 
     def _propagate_layout(self, equation: jcore.JaxprEqn, src: jcore.Var, out: jcore.Var) -> None:
-        in_shape, out_shape = _shape(src), _shape(out)
-        prim = equation.primitive
+        in_shape, out_shape, prim = _shape(src), _shape(out), equation.primitive
 
         def move(kept: tuple[int | None, ...]) -> tuple[int | None, ...] | None:
             if prim is jax.lax.broadcast_in_dim_p:
@@ -1247,19 +1245,16 @@ class _NormTrack:
 
         if (entry := self.sq_sum.get(src)) is not None and (moved := move(entry[1])) is not None:
             self.sq_sum[out] = (entry[0], moved, entry[2])
-        if (entry := self.inv_norm.get(src)) is not None and (moved := move(entry[1])) is not None:
-            self.inv_norm[out] = (entry[0], moved)
-        if (entry := self.pos_norm.get(src)) is not None and (moved := move(entry[1])) is not None:
-            self.pos_norm[out] = (entry[0], moved)
+        for table in (self.inv_norm, self.pos_norm):
+            if (entry := table.get(src)) is not None and (moved := move(entry[1])) is not None:
+                table[out] = (entry[0], moved)
 
     def _unit_check(self, scaled: jcore.Var | jcore.Literal, divisor: jcore.Var | jcore.Literal,
                     table: Mapping[jcore.Var, tuple[jcore.Var, tuple[int | None, ...]]],
                     out_shape: tuple[int, ...]) -> tuple[bool, bool]:
-        if not (isinstance(scaled, jcore.Var) and isinstance(divisor, jcore.Var)):
+        if not (isinstance(scaled, jcore.Var) and isinstance(divisor, jcore.Var)) or divisor not in table:
             return False, False
-        if (entry := table.get(divisor)) is None:
-            return False, False
-        src, kept = entry
+        src, kept = table[divisor]
         if (self._canon(scaled) is not src or _shape(scaled) != out_shape
                 or not _aligned_unit_axes(kept, len(out_shape))):
             return False, False
@@ -1269,12 +1264,9 @@ class _NormTrack:
         if not _lossless_float_cast(src, out):
             return
         self.origin[out] = self._canon(src)
-        if src in self.sq_sum:
-            self.sq_sum[out] = self.sq_sum[src]
-        if src in self.inv_norm:
-            self.inv_norm[out] = self.inv_norm[src]
-        if src in self.pos_norm:
-            self.pos_norm[out] = self.pos_norm[src]
+        for table in (self.sq_sum, self.inv_norm, self.pos_norm):
+            if src in table:
+                table[out] = table[src]
 
     def _step_add_max(self, prim: jcore.Primitive, invars: Sequence, out: jcore.Var,
                       apart_of: Callable[..., Apart]) -> None:
@@ -1320,16 +1312,14 @@ class _NormTrack:
             if (entry := self.sq_sum.get(invars[0])) is not None and entry[2]:
                 (self.inv_norm if prim is jax.lax.rsqrt_p else self.pos_norm)[out] = (entry[0], entry[1])
             return None
-        if prim is jax.lax.mul_p and len(invars) == 2:
+        if prim in (jax.lax.mul_p, jax.lax.div_p) and len(invars) == 2:
             out_shape = tuple(out_aval.shape)
-            hit0, last0 = self._unit_check(invars[0], invars[1], self.inv_norm, out_shape)
-            hit1, last1 = ((False, False) if hit0
-                           else self._unit_check(invars[1], invars[0], self.inv_norm, out_shape))
-            if hit0 or hit1:
-                return UNIT + 1, _held_apart(
-                    Apart(None, 0, number=True, finite=True, unit_norm=last0 or last1), out_aval.dtype)
-        if prim is jax.lax.div_p and len(invars) == 2:
-            hit, last = self._unit_check(invars[0], invars[1], self.pos_norm, tuple(out_aval.shape))
+            if prim is jax.lax.mul_p:
+                hit, last = self._unit_check(invars[0], invars[1], self.inv_norm, out_shape)
+                if not hit:
+                    hit, last = self._unit_check(invars[1], invars[0], self.inv_norm, out_shape)
+            else:
+                hit, last = self._unit_check(invars[0], invars[1], self.pos_norm, out_shape)
             if hit:
                 return UNIT + 1, _held_apart(
                     Apart(None, 0, number=True, finite=True, unit_norm=last), out_aval.dtype)
@@ -1341,12 +1331,9 @@ class _NormTrack:
         by_origin: dict[jcore.Var, jcore.Var] = {}
         for outer, inner in pairs:
             by_origin.setdefault(self._canon(outer), inner)
-
-        def remap(table: Mapping) -> dict:
-            return {inner: (by_origin[e[0]], *e[1:]) for outer, inner in pairs
-                    if (e := table.get(outer)) is not None and e[0] in by_origin}
-
-        return _NormTrack(remap(self.sq_sum), remap(self.inv_norm), remap(self.pos_norm))
+        return _NormTrack(*({i: (by_origin[e[0]], *e[1:]) for o, i in pairs
+                             if (e := t.get(o)) is not None and e[0] in by_origin}
+                            for t in (self.sq_sum, self.inv_norm, self.pos_norm)))
 
 
 def _same_atom(a, b) -> bool:
