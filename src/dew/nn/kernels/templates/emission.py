@@ -120,7 +120,7 @@ def emitted(body: jax_core.Jaxpr, warpgroups: int, axis: str | None, *, device: 
         for index in range(warpgroups):
             counting = _Counting(axis, index, forms=forms, arrivals=arrivals)
             counting.run(body, values)
-            roles.append(Role(counting.fixed, tuple(counting.walks)))
+            roles.append(Role(sum(counting.hoisted.values(), counting.fixed), tuple(counting.walks)))
         return roles
 
     roles = counted()
@@ -507,8 +507,15 @@ class _Counting:
     of its warpgroup's warps where it is one's (`warps`)."""
 
     def __init__(self, axis: str | None, index: int, loops: int = 0, warp: tuple | None = None,
-                 forms: Mapping | None = None, arrivals: _Arrivals | None = None, lanes: int | None = None):
+                 forms: Mapping | None = None, arrivals: _Arrivals | None = None, lanes: int | None = None,
+                 hoisted: dict[tuple, Work] | None = None, sites: Sequence = ()):
         self.axis, self.index, self.warp, self.forms = axis, index, warp, forms
+        # Static work inside a loop, by its site: computed once outside every loop, as the compiler hoists
+        # it, whichever trip or arm of whichever trial reaches it, so every count of the role shares it
+        # (`hoist`, row 12767); a site is its call path, the equations being counted within (`sites`) and
+        # its own, so a cached body's two calls are two sites.
+        self.hoisted = {} if hoisted is None else hoisted
+        self.sites = list(sites)
         # The warp of its warpgroup whose 32 lanes run its body where a warp mesh's role runs it
         # (`plgpu.warp_map`), None where its warpgroup's 128 do.
         self.lanes = lanes
@@ -613,7 +620,11 @@ class _Counting:
             values = [read(atom) for atom in equation.invars]
             given = [isinstance(atom, jax_core.Literal) or atom in self.static for atom in equation.invars]
             self.returned = None
-            outputs = self.moved(equation, values, live) or self.equation(equation, values, given)
+            self.sites.append(id(equation))
+            try:
+                outputs = self.moved(equation, values, live) or self.equation(equation, values, given)
+            finally:
+                self.sites.pop()
             held.update(zip(equation.outvars, outputs, strict=True))
             # A body it ran here states its outputs' provenance (a call's, a scope's, a branch's); else the
             # operation's own (`_static`).
@@ -683,8 +694,13 @@ class _Counting:
                 and all(value is not None for value in values[1:])):
             return [values[1 + int(values[0])]]
         if _static(equation, given):
-            # Of the program's constants alone: folded by its compile or computed once outside every loop. A
-            # call of them runs on, its body's folds the values a later guard reads.
+            # Of the program's constants alone: hoisted out of every loop it lies in, computed once (`hoist`),
+            # else where its path runs it. A call of them runs on, its body's folds the values a later guard
+            # reads.
+            if primitive in _ARITHMETIC:
+                self.hoist(operation_work(primitive, [variable.aval for variable in equation.invars],
+                                          [variable.aval for variable in equation.outvars], params,
+                                          forms=self.forms))
             return unknown
         if primitive in _ARITHMETIC:
             self.add(operation_work(primitive, [variable.aval for variable in equation.invars],
@@ -785,7 +801,8 @@ class _Counting:
                 inputs[len(consts) + counter] = _Place(at, start, stop, parity)
                 inputs[len(consts) + bound] = stop
             trial = _Counting(self.axis, self.index, loops=len(self.loops) + 1, warp=self.warp,
-                              forms=self.forms, arrivals=self.arrivals, lanes=self.lanes)
+                              forms=self.forms, arrivals=self.arrivals, lanes=self.lanes,
+                              hoisted=self.hoisted, sites=self.sites)
             trial.run(body, inputs, static=static)
             self.arrivals.left(trial.landing)
             return trial
@@ -813,9 +830,11 @@ class _Counting:
         steps, marks = [], 0.0
         barriers = [_barrier(var) for var in inner.invars]
         for warp in range(count):
+            # Each warp's static work its own (its instructions), its sites marked by its warp.
             counted = _Counting(self.axis, self.index, loops=len(self.loops), warp=(name, warp),
                                 forms=self.forms, arrivals=self.arrivals,
-                                lanes=warp if isinstance(mesh, gpu_core.WarpMesh) else self.lanes)
+                                lanes=warp if isinstance(mesh, gpu_core.WarpMesh) else self.lanes,
+                                hoisted=self.hoisted, sites=[*self.sites, (name, warp)])
             counted.run(inner, barriers)
             if self.loops:
                 self.arrivals.left(counted.landing)
@@ -857,6 +876,16 @@ class _Counting:
         else:
             self.fixed = self.fixed + found.work
 
+    def hoist(self, work: Work) -> None:
+        """Static work (of the program's constants alone) at the equation being counted: inside a loop, its
+        site's once (`hoisted`, the compiler's hoisting out of every loop, whatever trip or arm reaches it
+        and however often); outside every loop, its path's own, beside the rest of its work (under a
+        conditional's arms' envelope, a call's at each call)."""
+        if not self.loops:
+            self.fixed = _then(self.fixed, work)
+        else:
+            self.hoisted.setdefault(tuple(self.sites), work)
+
     def cond(self, branches, values: list, given: list[bool]) -> list:
         """A conditional: its branch where its index is concrete (a role's, by its warpgroup), else every
         branch's envelope, unit by unit (the most of each any branch issues, as the custom call's FLOP count
@@ -872,7 +901,8 @@ class _Counting:
         trials = []
         for branch in branches:
             trial = _Counting(self.axis, self.index, loops=len(self.loops), warp=self.warp,
-                              forms=self.forms, arrivals=self.arrivals, lanes=self.lanes)
+                              forms=self.forms, arrivals=self.arrivals, lanes=self.lanes,
+                              hoisted=self.hoisted, sites=self.sites)
             trial.run(branch, operands, static=given[1:])
             if self.loops:
                 self.arrivals.left(trial.landing)
