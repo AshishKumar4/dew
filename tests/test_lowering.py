@@ -709,7 +709,9 @@ def test_every_kernel_launch_takes_its_own_devices_rows_on_a_two_device_mesh(gen
     that splits its rows, launches the kernels it launches on one device, each reading fewer elements than
     there (its device's rows, its replicated parameters whole), never the whole batch; and the program's
     only collective is the reduction of its replicated parameters' gradients over the data axis."""
-    loss, args = PER_SHARD_STEPS[op](384)
+    # 256 rows, an attention's two sequences of 128: its kernels' emission walks each block of its keys, and
+    # 384 rows took sm80's attention 67 s to lower on one device and two against 42 s (row 8946).
+    loss, args = PER_SHARD_STEPS[op](256)
     whole, _ = _kernel_launches(loss, args, generation, 1)
     split, operations = _kernel_launches(loss, args, generation, 2)
 
