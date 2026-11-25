@@ -48,13 +48,16 @@ def _planned_stages(family: mosaic.Family, scope_of: Callable[[int], resources.S
                     target: generation.GpuTarget, *, consumers: int, registers: int | None,
                     floor: int, most: int, resident: int) -> int:
     """Deepest ring in `[floor, most]` whose `scope_of(stages)` fits `target`'s share at `resident`
-    programs per SM via `resources.plan` (rows 10948, 10962, 10993)."""
+    programs per SM via `resources.plan` (rows 10948, 10962, 10993), every register fact `target`'s whatever
+    GPU is in effect (an H100's backward deepened with an A100 in effect read the A100's setmaxnreg and
+    raised, row 12800)."""
     if most <= floor or not family.budgets_registers:
         return floor
-    capped = None if registers is None else min(registers, family.registers(consumers))
-    launch = resources.Launch(scope=scope_of, consumers=consumers, registers=capped,
-                              floor=floor, most=most)
-    planned = resources.plan((launch,), family, target, programs=resident)
+    with generation.as_target(target):
+        capped = None if registers is None else min(registers, family.registers(consumers))
+        launch = resources.Launch(scope=scope_of, consumers=consumers, registers=capped,
+                                  floor=floor, most=most)
+        planned = resources.plan((launch,), family, target, programs=resident)
     return floor if planned is None else planned[0].stages
 
 
