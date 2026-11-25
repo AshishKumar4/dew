@@ -22,7 +22,15 @@ from jax.experimental.pallas import tpu as pltpu
 
 from dew.nn import programs
 from dew.nn.kernels import generation, launches
-from dew.nn.kernels.templates import emission, handoffs, mosaic, outputs as stated_outputs, persistent, rings
+from dew.nn.kernels.templates import (
+    emission,
+    handoffs,
+    mosaic,
+    outputs as stated_outputs,
+    persistent,
+    product,
+    rings,
+)
 from dew.nn.kernels.templates.cost import Stated
 
 STAGES = 2
@@ -93,6 +101,11 @@ class MxuIssuer(mosaic.Issuer[jax.Array]):
     @property
     def lane_columns(self) -> int:
         raise NotImplementedError(self._VALUES)
+
+    def formed(self, value: jax.Array, count: int, interpret: bool) -> tuple[jax.Array, ...]:
+        """`product.formed`'s parts as Mosaic TPU lowers them: no register layout an inline form reads."""
+        del interpret
+        return product.formed(value, count)
 
     def held_area(self, consumers: int) -> int:
         # Its accumulator and each step's product beside it, both fp32 values Mosaic TPU holds in VMEM: the
