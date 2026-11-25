@@ -2021,6 +2021,10 @@ def _states_held(call: Call, values: Operand, keys: Operand, bv: int) -> Held:
     # unstated, 63 registers against an H100's need of 96 on Nemotron-H 4B's fp32 forward.
     rows = 0 if call.per_key else (2 if call.delta else 3)
     carried = [f32(call.width, bv)] + [f32(chunk, 4)] * rows
+    if call.per_key:
+        # The next chunk's last prefix, a key slice's row a limb (`_prefetched_ends`), carried across the
+        # step beside the one it reads (head review of 41be48b1a).
+        carried += [f32(call.block, 4)] * (call.width // call.block * call.prefix_limbs)
     # In turn: the weighted keys against the memory slice, the delta rule's (`algebra.corrected`); the keys
     # read transposed against the corrected values (`algebra.carried`'s 'write').
     written = product_fragments(call, (keys, call.block, chunk), (held, chunk, bv))
