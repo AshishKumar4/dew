@@ -254,9 +254,12 @@ def test_a_shared_cache_keeps_each_rows_exiting_pass_when_its_rows_exit_apart():
     variables, ids = _gated(model_draw(looped, (5, 4), looped.vocab_size), looped.emb_features, 0xE98)(0)
     made, step = decode_steps(looped)
     _, cache = step(variables, made(variables, ids.shape[0]), ids[:, :3])
-    stepped = jax.jit(lambda v, c, token: looped.apply({**v, "cache": c}, token, decode=True,
-                                                       mutable=["cache", "exits"]))
-    _, sown = stepped(variables, cache, ids[:, 3:4])
+    _, kept = step(variables, cache, ids[:, 3:4])
+    # Every pass's exit logit, read off a call that opens them (which runs every pass, the threshold's
+    # choice made by none: `EXITS`).
+    opened = jax.jit(lambda v, c, token: looped.apply({**v, "cache": c}, token, decode=True,
+                                                      mutable=["cache", "exits"]))
+    _, sown = opened(variables, cache, ids[:, 3:4])
     hazards = jax.nn.sigmoid(np.asarray(sown["exits"]["logits"], np.float64).reshape(looped.loop.steps, -1))
     reached = 1 - np.cumprod(1 - hazards, axis=0) >= looped.loop.exit_threshold
     exits = np.where(reached.any(axis=0), reached.argmax(axis=0), looped.loop.steps - 1)
@@ -271,8 +274,8 @@ def test_a_shared_cache_keeps_each_rows_exiting_pass_when_its_rows_exit_apart():
         return [np.take(np.asarray(leaf), index, axis=list(leaf.shape).index(ids.shape[0]))
                 for leaf in jax.tree.leaves(tree) if ids.shape[0] in leaf.shape]
     for index, exited in enumerate(exits.tolist()):
-        for kept, every in zip(row(sown["cache"], index), row(passes[exited], index), strict=True):
-            np.testing.assert_array_equal(kept, every)
+        for held, every in zip(row(kept, index), row(passes[exited], index), strict=True):
+            np.testing.assert_array_equal(held, every)
 
 
 @attending("reference")
