@@ -585,7 +585,7 @@ _JAXPR_DIGESTS: weakref.WeakKeyDictionary[jcore.Jaxpr, tuple[str, tuple[Hashable
 """Structural `(blake2b_hex, opaque_objects)` digest per `jcore.Jaxpr`, held while the jaxpr lives."""
 
 
-def _collect_opaque(key: Hashable, opaques: list[Hashable]) -> Hashable:
+def _collect_opaque(key, opaques: list[Hashable]) -> Hashable:
     """Hoist any `("object", cls, held)` entries out of `key` into `opaques`, replacing each with a
     deterministic positional reference so the remaining key hashes cross-process without object addresses."""
     if not isinstance(key, tuple):

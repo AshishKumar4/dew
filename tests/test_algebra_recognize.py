@@ -1195,7 +1195,7 @@ def test_a_plain_gated_delta_net_scan_runs_dews_recurrence_kernel_through_dew_ji
 
     with generation.chosen(gated_delta_rule="mosaic_gpu"):
         assert_as_exact(dew.jit(fn), jax.jit(fn), draw, f"dew.jit gated delta scan ({case})",
-                        seeds=2, truth_fn=truth)
+                        seeds=8, truth_fn=truth)
 
 
 def test_non_matching_or_barred_recurrence_scans_stay_as_written():
