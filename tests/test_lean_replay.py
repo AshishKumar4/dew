@@ -55,11 +55,12 @@ class Squared(Objective):
 
 
 def fitted(weighted: bool, terms: int = 1, split: int = 2) -> tuple[Trainer, TrainState]:
-    """A trainer of `Squared` fit two steps of ROWS rows, each read in `split` microbatches, and its
-    state."""
+    """A trainer of `Squared` fit two steps of ROWS rows in float64, each read in `split` microbatches, and
+    its state."""
     x = np.random.default_rng(0).standard_normal((4 * ROWS, WIDTH))
     trainer = Trainer(Squared(weighted, terms), optax.sgd(0.1), key=jax.random.key(0), split=split)
-    return trainer, trainer.fit(Pipeline(Memory({"x": x})).repeat().batch(ROWS), steps=2)
+    with jax.enable_x64(new_val=True):
+        return trainer, trainer.fit(Pipeline(Memory({"x": x})).repeat().batch(ROWS), steps=2)
 
 
 def parameters(state: TrainState) -> np.ndarray:
