@@ -1139,7 +1139,7 @@ class CausalSelfAttention(nn.Module):
                                  "history: serve this layer by the dense cache")
             attention = self._mixed_attended(query, key, value, positions, attention_metadata)
             return self._output(attention, gate, B, S, own_value, progress)
-        sinks = self.sink_proj(x).astype(jnp.float32) if self.projected_sinks else self.sinks
+        sinks = self.sink_proj(x).astype(at_least_fp32(x.dtype)) if self.projected_sinks else self.sinks
         if self._runs_local(attention_metadata, decode) and not (self.ctx.attention_dropout_rate and train):
             attention = checkpoint_name(local_attention(
                 query, key, value, window=self.ctx.sliding_window, chunk=self.ctx.attention_chunk,

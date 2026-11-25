@@ -57,9 +57,9 @@ class RelativeBias:
     ones), clipped to `clip` where given (`clipped`) and scaled by the query's temperature where
     `temperature`, against a learned `[rank, extent]` bank (`relative_bank`, at zeros), read at the
     query's distance from each key (its place less the key's) and zero outside `[0, extent)` (Inkling 2,
-    modeling_inkling2_loop.py:231-262). It enters the logits as an fp32 `[B, H, Q, K]` dense bias beside the
-    call's own (`AttentionMetadata.position_bias`), O(Q K) memory at a prefill: a bias the fused kernels
-    take where they take a dense one, the reference's elsewhere."""
+    modeling_inkling2_loop.py:231-262). It enters the logits as a `[B, H, Q, K]` dense bias in at least fp32
+    beside the call's own (`AttentionMetadata.position_bias`), O(Q K) memory at a prefill: a bias the fused
+    kernels take where they take a dense one, the reference's elsewhere."""
 
     rank: int
     extent: int
@@ -73,11 +73,12 @@ class RelativeBias:
 
 def relative_logits(states: jax.Array, bank: jax.Array, query_places: jax.Array, key_places: jax.Array,
                     ) -> jax.Array:
-    """The bias `[B, H, Q, K]` in fp32 of each query's relative states `states` `[B, Q, H, rank]` against
-    `bank` `[rank, extent]`, read at the query's place less each key's (`query_places` `[B, Q]` or `[Q]`,
-    `key_places` `[B, K]` or `[K]`) and zero outside `[0, extent)` (`RelativeBias`)."""
+    """The bias `[B, H, Q, K]` in at least fp32 of each query's relative states `states` `[B, Q, H, rank]`
+    against `bank` `[rank, extent]`, read at the query's place less each key's (`query_places` `[B, Q]` or
+    `[Q]`, `key_places` `[B, K]` or `[K]`) and zero outside `[0, extent)` (`RelativeBias`)."""
     extent = bank.shape[-1]
-    profile = computed_einsum("bqhr,re->bhqe", states, bank, dtype=jnp.float32)
+    wide = at_least_fp32(jnp.result_type(states, bank))
+    profile = computed_einsum("bqhr,re->bhqe", states, bank, dtype=wide)
     queries, keys = jnp.atleast_2d(query_places), jnp.atleast_2d(key_places)
     distance = (queries[:, :, None] - keys[:, None, :]).astype(jnp.int32)
     index = jnp.broadcast_to(jnp.clip(distance, 0, extent - 1)[:, None],
