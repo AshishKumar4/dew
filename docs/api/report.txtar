@@ -559,7 +559,7 @@ dew.config.lm.LMRunConfig
   pretrained: str | None = None
   rollout: Annotated[PromptRollout, tyro.conf.subcommand('rollout')] | None = None
 dew.config.lm.PromptRollout
-  reward: str
+  reward: Annotated[Reward, imported_argument(Reward)]
   groups: int = 4
   max_new_tokens: int = 32
   estimator: str | None = None
@@ -651,6 +651,17 @@ dew.data.dataset.Ramp
   start: int
   increment: int
   samples: int
+dew.data.prompts.PromptRecord
+  data_source: str = ''
+  ground_truth: str = ''
+  extra_info: str = ''
+dew.decision.config.CrossContext
+  layers: tuple[int, ...]
+  frozen: bool = True
+  length: int = 256
+  encoder: ContextEncoder = 'table'
+  text: TextCondition | None = None
+  form: Literal['idefics', 'shared'] = 'idefics'
 dew.decision.config.DecisionRunConfig
   model: ModelConfig = (lambda: ModelConfig('causal_transformer', {}))()
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
@@ -674,27 +685,10 @@ dew.decision.config.DecisionRunConfig
   remat: str | None = None
   head: JointShape | Letters | None = None
   calibrate: bool = True
-  max_len: int | None = None
-  head_max_len: int | None = None
-  option_tokens: int | None = None
-  max_state_tokens: int | None = None
-  option_text: Literal['named', 'described'] | None = None
-  segments: Annotated[tuple[RowSegment, ...], record_argument(tuple[RowSegment, ...])] | None = None
-  reads: Annotated[Reads, record_argument(Reads)] | None = None
-  parallel: bool | None = None
-  shared_state: int | None = None
-  siblings: bool | None = None
-  unit: Unit | None = None
-  order: RowOrder | None = None
-  split: Literal['part', 'question', 'whole'] | None = None
-  framing: Framing | None = None
-  context_layers: tuple[int, ...] | None = None
-  context_frozen: bool = True
-  context_length: int = 256
-  context_encoder: ContextEncoder = 'table'
-  context_text: TextCondition | None = None
+  rows: RowBudgets = dew.decision.config.RowBudgets()
+  option_text: OptionText | None = None
+  context: CrossContext | None = None
   context_text_trained: bool = False
-  context_form: Literal['idefics', 'shared'] = 'idefics'
 dew.decision.config.JointShape
   width: int = 1024
   routing_layers: int = 2
@@ -705,6 +699,20 @@ dew.decision.config.Letters
   labels: Labels = dew.decision.layout.Labels()
   count: int | None = None
   untied: bool = False
+dew.decision.config.RowBudgets
+  max_len: int | None = None
+  head_max_len: int | None = None
+  option_tokens: int | None = None
+  max_state_tokens: int | None = None
+  segments: Annotated[tuple[RowSegment, ...], record_argument(tuple[RowSegment, ...])] | None = None
+  reads: Annotated[Reads, record_argument(Reads)] | None = None
+  parallel: bool | None = None
+  shared_state: int | None = None
+  siblings: bool | None = None
+  unit: Unit | None = None
+  order: RowOrder | None = None
+  split: SplitAt | None = None
+  framing: Framing | None = None
 dew.decision.layout.Again
   parts: tuple[Literal['instructions', 'options'], ...] = ('instructions', 'options')
   over: int = 0
