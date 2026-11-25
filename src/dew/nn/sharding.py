@@ -700,8 +700,11 @@ def typed_on[T](tree: T, mesh: jax.sharding.AbstractMesh) -> T:
             return value
         with jax.sharding.use_abstract_mesh(mesh):
             spec = kept_axes(jax.typeof(value).sharding.spec, explicit.__contains__)
-            return jax.sharding.reshard(value, spec.update(reduced=spec.reduced & explicit,
-                                                           unreduced=spec.unreduced & explicit))
+            unreduced = spec.unreduced & explicit
+            # A sum's kind goes with its axes: none left, none stated, as JAX's own conversion does it.
+            return jax.sharding.reshard(value, spec.update(
+                reduced=spec.reduced & explicit, unreduced=unreduced,
+                unreduced_kind=spec.unreduced_kind if unreduced else None))
     return jax.tree.map(back, tree)
 
 

@@ -1286,27 +1286,35 @@ def test_a_gathered_loop_trains_the_same_model(mesh_shape, loop):
 
 
 @pytest.mark.mesh(devices=8)
-def test_a_reduced_copy_a_gathered_region_writes_out_is_placed_back_whole():
-    """A matrix gathered reduced over the FSDP axis inside a gathered loop's Explicit region
-    (`sharding.gathered_over`, `explicit_over`), written out of it as a pass's sown value is
-    (`sharding.typed_on`), is placed back on the step's mesh whole, the copy it is: its sum over an axis
-    that mesh leaves Auto is no placement there, which JAX refused (the row 12849 review)."""
+@pytest.mark.parametrize("sum_", ["reduced", "unreduced"])
+def test_a_sum_a_gathered_region_writes_out_is_placed_back_taken(sum_):
+    """A value a gathered loop's Explicit region (`sharding.explicit_over`) writes out as a pass's sown value
+    is (`sharding.typed_on`), whose placement carries a sum over the FSDP axis the step's mesh leaves Auto, is
+    placed back on that mesh with the sum taken: a matrix gathered reduced (`gathered_over`), the copy it
+    is; a product's partial sums over the axis (`unreduced`), their total. Its sum over an Auto axis is no
+    placement there, which JAX refused, with its kind too where no axis was left (the row 12849 review)."""
     from dew.nn.sharding import explicit_over, gathered_over, typed_on
     from dew.training import MeshSpec
 
     mesh = MeshSpec(fsdp=8).build(jax.devices()[:8])
     weight = np.arange(64, dtype=np.float32).reshape(16, 4)
+    # Whole numbers, whose products and sums float32 holds exactly in any order.
+    columns = np.arange(32, dtype=np.float32).reshape(8, 4)
     with jax.set_mesh(mesh):
         held = jax.device_put(weight, jax.sharding.PartitionSpec("fsdp"))
-        rows = jax.device_put(np.ones((8, 4), np.float32), jax.sharding.PartitionSpec("fsdp"))
+        rows = jax.device_put(columns, jax.sharding.PartitionSpec("fsdp"))
         outer = jax.sharding.get_abstract_mesh()
 
-        def written(rows):
-            return explicit_over(lambda rows: typed_on(
-                gathered_over(held, jax.sharding.PartitionSpec("fsdp"), {"fsdp"}), outer), rows)
+        def inside(rows):
+            if sum_ == "reduced":
+                return gathered_over(held, jax.sharding.PartitionSpec("fsdp"), {"fsdp"})
+            # Each device's rows' product, unreduced over the axis that splits them.
+            return jnp.einsum("bd,be->de", rows, rows,
+                              out_sharding=jax.sharding.PartitionSpec(unreduced={"fsdp"}))
 
-        out = jax.jit(written)(rows)
-    np.testing.assert_array_equal(np.asarray(out), weight)
+        out = jax.jit(lambda rows: explicit_over(lambda rows: typed_on(inside(rows), outer), rows))(rows)
+    expected = weight if sum_ == "reduced" else columns.T @ columns
+    np.testing.assert_array_equal(np.asarray(out), expected)
 
 
 def test_a_gathered_loop_traced_under_no_layout_is_the_loop():
