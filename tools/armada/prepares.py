@@ -382,6 +382,10 @@ test it leaves unprepared reds."""
 UNREAD = "unread"
 """A dry prepare's baseline where the Worker gave none whole within its time (`before`): no grade of the tests
 it leaves unprepared, which says the row stale and runs it again."""
+PARTIAL = "partial"
+"""Main's baselines of a row read, but none whole (`_before`): a run named with no baseline, or every cut
+listed short of a group. `before` gives it as `UNREAD`, but to a run of main's own commit, which is the
+baseline (`BOOTSTRAP`)."""
 RECORD_BYTES = 1 << 20
 """The most a baseline's record may hold (`before`): a row's record, its unprepared tests among it."""
 
@@ -446,19 +450,22 @@ def before(ci, python: str, name: str, group: str, until: float) -> set[str] | s
     instant), and a read past it is none."""
     found = _before(ci, python, name, group, until)
     commit = ci.mainline()
-    if found == UNREAD and commit is not None and commit == ci.run_keys.head_commit():
+    if found == PARTIAL and commit is not None and commit == ci.run_keys.head_commit():
         # A run of main's own commit (a train's base, main's CI) that reads no whole baseline of it: what it
         # leaves unprepared is main's, the baseline it writes once green (`run_keys.baselined`). Said stale,
         # a cut main's earlier run left part-written (a group red, so unwritten) would never be green to be
         # written whole: every run of main red on it, every train's base with them (train 1275's
         # test_gpu_compile_ahead.py users prepare). One that reads a whole baseline is held to it as its
-        # heads are: a base let pass on a cell its heads were red for returned them all (train 1282).
+        # heads are: a base let pass on a cell its heads were red for returned them all (train 1282), and
+        # one that failed to read them (`UNREAD`) is no run that read none whole.
         return BOOTSTRAP
-    return found
+    return UNREAD if found == PARTIAL else found
 
 
 def _before(ci, python: str, name: str, group: str, until: float) -> set[str] | str:
-    """`before`'s read of main's baselines, whatever commit this checkout is."""
+    """`before`'s read of main's baselines, whatever commit this checkout is: `PARTIAL` where they were read
+    and are not whole (a run named with no baseline, or no cut every group of which is listed), `UNREAD`
+    where they could not be read."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN") or os.environ.get(ci.READ_TOKEN)
     commit = ci.mainline()
     if not token or commit is None or "DEW_XLA_CACHE_URL" not in os.environ or time.monotonic() >= until:
@@ -474,13 +481,17 @@ def _before(ci, python: str, name: str, group: str, until: float) -> set[str] | 
             # A run main named whose baseline is not kept (its write lost; `named_at_commit` names a run only
             # once its baseline is written, but a run before baselines named its alone) is no first run.
             if listed_cuts(store, f"{ci.CACHE_PREFIX}-main/{commit}/{python}/{place}", row_variant, until):
-                raise Unread("main named a run of it whose baseline is not kept")
+                print(f"dry prepare: main named a run of {name} whose baseline is not kept; its row is not "
+                      "graded", file=sys.stderr)
+                return PARTIAL
             return BOOTSTRAP
         # One cut of main's whole, every group of it read with its list: a missing one would read its tests as
         # new to the row.
+        whole = False
         for count, held_cuts in sorted(cuts.items(), key=lambda item: item[0] != "whole"):
             if count != "whole" and len(held_cuts) != int(count):
                 continue
+            whole = True
             found: set[str] = set()
             for cut in held_cuts:
                 held_row = ci.row(python, name, ci.varied("" if cut == "whole" else cut.replace("-of-", "/"),
@@ -496,7 +507,8 @@ def _before(ci, python: str, name: str, group: str, until: float) -> set[str] | 
         print(f"dry prepare: main's runs of {name} not read whole ({type(failure).__name__}: {failure}); its "
               "row is not graded", file=sys.stderr)
         return UNREAD
-    return UNREAD
+    # Every cut listed short of a group (`PARTIAL`), or one whole whose baseline was not read (`UNREAD`).
+    return UNREAD if whole else PARTIAL
 
 
 def run(ci, python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str) -> int:

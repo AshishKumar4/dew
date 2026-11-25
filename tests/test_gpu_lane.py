@@ -638,6 +638,13 @@ def test_a_dry_prepares_baseline_is_mains_whatever_cut_main_made_of_it(ci, monke
     named.clear()
     assert before("tests/test_gpu_a.py", "@prepare-sm90") == {
         "tests/test_gpu_a.py::test_a @ cell", "tests/test_gpu_a.py::test_b @ cell"}
+    # One whose read of a whole baseline fails is no run that read none whole: stale, as a head's.
+    failing.add("keys")
+    assert before("tests/test_gpu_a.py", "@prepare-sm90") == ci.prepares.UNREAD
+    failing.clear()
+    shapes["baseline"] = {}
+    assert before("tests/test_gpu_a.py", "@prepare-sm90") == ci.prepares.UNREAD
+    shapes.clear()
     monkeypatch.setattr(ci.run_keys, "head_commit", lambda: "a head")
 
     assert before("tests/test_gpu_a.py", "@prepare-sm90") == {
