@@ -950,11 +950,10 @@ def _row_reduced(laid_out, where: str = "inline", shape: tuple[int, int] = (64, 
         if laid_out is not None:
             tile = plgpu.layout_cast(tile, laid_out)
         if where == "scoped":
-            def scope(scratch):
-                del scratch
+            def scope():
                 out_ref[...] = rows(tile)
 
-            pl.run_scoped(scope, plgpu.SMEM((8,), jnp.float32))
+            pl.run_scoped(scope)
         else:
             out_ref[...] = jax.jit(rows)(tile) if where == "called" else rows(tile)
 
@@ -991,20 +990,23 @@ def test_a_laid_out_row_reduction_issues_its_butterfly_once(laid_out, rounds, wh
 
 def test_a_replicated_rows_reduction_combines_each_copy():
     """A 1 x 64 fp32 row a row at a time (`swizzling._row_layout`: two values a lane, every warp of the
-    warpgroup a copy) reduced along it: each of the 128 threads combines its two values, then five rounds
+    warpgroup a copy) summed along it: each of the 128 threads combines its two values, then five rounds
     across the warp's 32 lanes, a shuffle and a combine each, 768 combines where the row's 64 elements
-    alone counted 576 (the review of lane/toolkit ca6da710b, P2)."""
+    alone counted 576 (the review of lane/toolkit ca6da710b, P2). Its maximum, which a Blackwell may take
+    by one `redux.sync` across the warp, keeps the elements' price (the review of 8d026cf4a, P2)."""
     from dew.nn.kernels.templates import swizzling
 
     def body(out_ref, smem):
         row = plgpu.layout_cast(smem[...], swizzling._row_layout((1, 64), jnp.float32))
-        out_ref[...] = jnp.max(row, axis=1)
+        out_ref[...] = reduce(row, axis=1)
 
-    launch = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((1,), jnp.float32), num_threads=1,
-                          thread_name="wg", scratch_types=[plgpu.SMEM((1, 64), jnp.float32)])
-    traced = jax.make_jaxpr(launch)().jaxpr
-    fixed = emission.emitted(traced, 1, "wg", forms=emission.ACCURATE_FORMS).roles[0].fixed
-    assert fixed.operations == 128 * (1 + 5) and fixed.shuffles == 128 * 5, fixed
+    for reduce, work in ((jnp.sum, Work(operations=128 * (1 + 5), shuffles=128 * 5)),
+                         (jnp.max, Work(operations=64))):
+        launch = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((1,), jnp.float32), num_threads=1,
+                              thread_name="wg", scratch_types=[plgpu.SMEM((1, 64), jnp.float32)])
+        traced = jax.make_jaxpr(launch)().jaxpr
+        fixed = emission.emitted(traced, 1, "wg", forms=emission.ACCURATE_FORMS).roles[0].fixed
+        assert (fixed.operations, fixed.shuffles) == (work.operations, work.shuffles), (reduce, fixed)
 
 
 def test_an_attention_forwards_walk_issues_its_row_reductions_butterflies():
