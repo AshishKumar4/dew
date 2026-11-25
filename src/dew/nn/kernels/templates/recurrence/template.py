@@ -164,7 +164,16 @@ def backward_holds(q, k, v, g, beta, h0=None, *, tiles: mainloop.Tiles, family: 
                     rounded=rounded, apart=apart, values_gated=values_gated, unit_pairs=unit_pairs,
                     decay_bound=decay_bound, wide=wide,
                     ranged=ranged, skip=skip, forked=_shaped(forked), reads=reads)
-    return holds(both, family, generation.shared_budget(target))
+    shared = generation.shared_budget(target)
+    # A read erase's key memory launch spills on the 99 KB parts its register model holds it on (Kimi
+    # Linear's PKDA training, sm86 and sm120, 32 and 184 bytes a thread; row 12890): its gradient the
+    # portable math's below `READS_SHARED`.
+    return (reads is None or shared >= READS_SHARED) and holds(both, family, shared)
+
+
+READS_SHARED = 160 * 1024
+"""The least shared memory a block of a part whose fast backward takes a read erase (`backward_holds`):
+sm80's 164 KB and sm90's 227 KB compile its launches clean, sm86's and sm120's 99 KB spill (row 12890)."""
 
 PLANS_KEPT = 1024
 """The plans `_planned` keeps, the least recently read given way first: a Qwen3.5-4B-width step's
