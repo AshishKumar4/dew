@@ -155,8 +155,10 @@ def mesh_axes(assignment: MeshAxes) -> tuple[str, ...]:
 
 def spec_axes(spec: jax.sharding.PartitionSpec) -> set[str]:
     """Every mesh axis `spec` places a dimension on (its `partitions`, so a spec carrying a sum still to take,
-    `reduced` or `unreduced`, reads as its placement alone)."""
-    return {axis for entry in spec.partitions for axis in mesh_axes(entry)}
+    `reduced` or `unreduced`, reads as its placement alone; an entry left to the partitioner, `UNCONSTRAINED`,
+    places none)."""
+    return {axis for entry in spec.partitions if entry is not jax.sharding.PartitionSpec.UNCONSTRAINED
+            for axis in mesh_axes(entry)}
 
 
 def kept_axes(spec: jax.sharding.PartitionSpec, keep: Callable[[str], bool]) -> jax.sharding.PartitionSpec:
