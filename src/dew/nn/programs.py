@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import enum
 import functools
+import re
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import NamedTuple, TypeGuard
 
@@ -66,13 +67,17 @@ jax/_src/pallas/mpmd.py)."""
 
 
 
-def lowering_platform(device) -> str:
+def lowering_platform(device) -> str | None:
     """The platform JAX lowers a program on `device` for, its lowering rules' name: a GPU's `cuda` or
     `rocm`, as its client's platform version states (`PjRtClient::platform_version`, a compile-only
-    target's its device kind, CUDA's); any other device's own platform."""
+    target's its device kind, CUDA's), an abstract one's (a compile-only mesh's, which holds no client)
+    `cuda` where it states an NVIDIA compute capability, else None; any other device's own platform."""
     if device.platform != "gpu":
         return device.platform
-    return "rocm" if "rocm" in str(device.client.platform_version).lower() else "cuda"
+    if (client := getattr(device, "client", None)) is not None:
+        return "rocm" if "rocm" in str(client.platform_version).lower() else "cuda"
+    capability = getattr(device, "compute_capability", None)
+    return "cuda" if capability and re.fullmatch(r"\d+\.\d+", str(capability)) else None
 
 def opaque(equation: jcore.JaxprEqn) -> bool:
     """Whether XLA sees nothing of `equation`'s body: a native Pallas kernel's (`NATIVE_KERNELS`), one
