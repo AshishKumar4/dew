@@ -156,9 +156,9 @@ _MUL_DIV = Ratio(
     reduced=True,
     units=Units(),
 )
-_COV_VALUE_TANGENT = Ratio(
-    numerator=((1.0, (("v", 0), ("v", 2), ("v", 3))), (-1.0, (("v", 1), ("v", 2), ("v", 3)))),
-    denominator=((1.0, (("v", 4),)),),
+_COV_SHIFT_DIV = Ratio(
+    numerator=((1.0, (("v", 0), ("v", 1), ("v", 2))),),
+    denominator=((0.5, (("v", 3),)),),
     axis=0,
     reduced=True,
     units=Units(),
@@ -177,6 +177,15 @@ def _scaled_ratio(form: Ratio, *operands: jax.Array) -> jax.Array:
     singleton axis (`axis=0`), matching `means.finished`/`resumed` so products, differences, quotients, and
     higher-order derivatives stay in scaled double-float arithmetic."""
     return ratio([operand[None] for operand in operands], form)
+
+
+def _cov_value_tangent(dval: jax.Array, dmean: jax.Array, other_c: jax.Array, tw: jax.Array,
+                       sn: jax.Array) -> jax.Array:
+    """`(dval - dmean) * other_c * tw / sn` via `ratio` over a 2-state axis holding `[dval, -dmean]`: one
+    linear operand (valid under partial VJPs such as weight-only `grad(cov)(w)`), cancelling uniform shifts
+    before dividing by `sn` (`0.5 * sn` summed twice equals `sn` exactly)."""
+    packed = jnp.stack([dval, -jnp.broadcast_to(dmean[..., None], dval.shape)], axis=0)
+    return ratio([packed, other_c[None], tw[None], sn[None]], _COV_SHIFT_DIV)
 
 
 def _mean_tangent_tile(
@@ -211,8 +220,8 @@ def _cov_tangent_tile(
     cy_safe = jnp.where((tw > 0) | jnp.isfinite(cy), cy, 0.0)
     cx_safe = jnp.where((tw > 0) | jnp.isfinite(cx), cx, 0.0)
     cov_term = jnp.where(pos, cov[..., None], 0.0)
-    d_cov_x = _scaled_ratio(_COV_VALUE_TANGENT, dtx, d_mx[..., None], cy_safe, tw, sn)
-    d_cov_y = _scaled_ratio(_COV_VALUE_TANGENT, dty, d_my[..., None], cx_safe, tw, sn)
+    d_cov_x = _cov_value_tangent(dtx, d_mx, cy_safe, tw, sn)
+    d_cov_y = _cov_value_tangent(dty, d_my, cx_safe, tw, sn)
     d_cov_w = _scaled_ratio(_COV_WEIGHT_TANGENT, dtw, cx, cy, cov_term, sn)
     return jnp.sum(d_cov_x + d_cov_y + d_cov_w, axis=-1)
 

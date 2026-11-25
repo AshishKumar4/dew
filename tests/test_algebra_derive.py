@@ -1218,6 +1218,14 @@ def test_chunked_moments_preserves_scaled_tangent_under_large_total_weight():
                 lambda w_, t=tile, m=mode: moments.chunked_moments(x_cn, w_, tile=t, mode=m),
                 (w_cn,), (dw_u,))
             assert float(dv_cn[0]) == 0.0
+            gw_cov = jax.grad(
+                lambda w_, t=tile, m=mode: moments.chunked_covariance(x_u, x_u, w_, tile=t, mode=m)[2].sum()
+            )(w_u)
+            assert np.all(np.isfinite(np.asarray(gw_cov))) and float(gw_cov[0, 1]) == 0.0
+            _, pb_cw = jax.vjp(
+                lambda w_, t=tile, m=mode: moments.chunked_covariance(x_u, x_u, w_, tile=t, mode=m)[2], w_u)
+            (gw_cw,) = pb_cw(jnp.asarray([np.float32(2.0 ** 100)], jnp.float32))
+            assert float(gw_cw[0, 0]) == float(np.float32(2.0 ** -120)) and float(gw_cw[0, 1]) == 0.0
 
 
 def test_chunked_moments_directed_overflow_mixed_zero_weight_and_direct_jvp():
