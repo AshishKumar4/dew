@@ -689,6 +689,19 @@ def _moment_ref_consts(ref: Term) -> tuple[dict[str, i64], dict[str, Term], tupl
     return lits, consts, fill_bind, lit_binds
 
 
+def _moment_tile_consts(
+    ref: Term, ops: dict[str, i64],
+) -> tuple[Vec[i64], i64, i64, dict[str, Term], dict[str, Term], Term, tuple, dict[str, tuple]]:
+    """Shared tile-shape axes, broadcast indices, positive-mass predicate, and tile-filled constants."""
+    axes = var("axes", Vec[i64])
+    lift_x, fill_x = vars_("lift_x fill_x", i64)
+    lits, consts, fill_bind, lit_binds = _moment_ref_consts(ref)
+    tile = {name: Term.literal(idx).shaped(String("broadcast_in_dim"), fill_x)
+            for name, idx in lits.items()}
+    pos = ref.compare(String("gt"), consts["zero"], ops["gt"])
+    return axes, lift_x, fill_x, consts, tile, pos, fill_bind, lit_binds
+
+
 def _need(table: dict[str, tuple], *names: str) -> tuple:
     return tuple(clause for name in names for clause in table[name])
 
@@ -1213,13 +1226,9 @@ def _moment_ssa_finish_rules(ops: dict[str, i64], binds: dict[str, tuple]) -> li
 def _moment_ssa_tile_scale_rules(ops: dict[str, i64], binds: dict[str, tuple]) -> list:
     """Linear SSA rules detecting per-element zero-mass overflow and its tile scale factor."""
     ref, x, y = vars_("ref x y", Term)
-    axes = var("axes", Vec[i64])
-    p_max, lift_x, fill_x = vars_("p_max lift_x fill_x", i64)
-    lits, consts, fill_bind, lit_binds = _moment_ref_consts(ref)
-    zero_n, one_n = consts["zero"], consts["one"]
-    one_x = Term.literal(lits["one"]).shaped(String("broadcast_in_dim"), fill_x)
-    qmax_x = Term.literal(lits["qmax"]).shaped(String("broadcast_in_dim"), fill_x)
-    pos = ref.compare(String("gt"), zero_n, ops["gt"])
+    p_max = var("p_max", i64)
+    axes, lift_x, fill_x, consts, tile, pos, fill_bind, lit_binds = _moment_tile_consts(ref, ops)
+    one_n, one_x, qmax_x = consts["one"], tile["one"], tile["qmax"]
     dx_z = x.binary(String("sub"), _m_tile_anchor(ref, x, axes).shaped(String("broadcast_in_dim"), lift_x),
                     ops["sub"])
     dy_z = y.binary(String("sub"), _m_tile_anchor(ref, y, axes).shaped(String("broadcast_in_dim"), lift_x),
@@ -1248,13 +1257,9 @@ def _moment_ssa_tile_rules(ops: dict[str, i64], binds: dict[str, tuple]) -> list
     """Linear SSA rules for tile-local weighted and masked means, residuals, and central second moments."""
     ref, x, y, w, mask, z, dx, dy_s, big_d, small_d, sc_x = vars_(
         "ref x y w mask z dx dy_s big_d small_d sc_x", Term)
-    axes = var("axes", Vec[i64])
-    p, lift_x, fill_x = vars_("p lift_x fill_x", i64)
-    lits, consts, fill_bind, lit_binds = _moment_ref_consts(ref)
-    zero_n, one_n = consts["zero"], consts["one"]
-    zero_x = Term.literal(lits["zero"]).shaped(String("broadcast_in_dim"), fill_x)
-    one_x = Term.literal(lits["one"]).shaped(String("broadcast_in_dim"), fill_x)
-    pos = ref.compare(String("gt"), zero_n, ops["gt"])
+    p = var("p", i64)
+    axes, lift_x, fill_x, consts, tile, pos, fill_bind, lit_binds = _moment_tile_consts(ref, ops)
+    zero_n, one_n, zero_x, one_x = consts["zero"], consts["one"], tile["zero"], tile["one"]
     pos_x = pos.shaped(String("broadcast_in_dim"), lift_x)
     safe_x = _m_safe_x(ref, lift_x)
     mf = _m_wmul_first(ref, w, lift_x, fill_x)
