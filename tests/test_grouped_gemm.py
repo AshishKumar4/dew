@@ -7,6 +7,7 @@ import dataclasses
 import functools
 import importlib
 import itertools
+import math
 import sys
 
 import jax
@@ -1662,6 +1663,42 @@ def test_hopper_cluster2_balanced_tail_holds_check_1(rows, depth, mp):
             assert_as_exact(dw_native, jax.jit(dw_plain), draw_dw, f"cluster2 tail dw 768x256x{depth}",
                             seeds=SEEDS,
                             truth_fn=functools.partial(dw_plain, wide=jnp.float64, out=jnp.float64))
+
+
+@pytest.mark.parametrize("swapped", [False, True], ids=["rows", "swapped"])
+def test_a_splits_partials_are_priced_as_its_launch_declares_them(swapped, monkeypatch):
+    """A split's fp32 partials as its legality and its price count them (`MosaicGmm._slice_bytes`, row
+    12850) are the ones its launch declares (`mosaic_gpu._declared`), its width in whole column units and,
+    swapped, its rows padded to whole column tiles: an A100's 264 x 1985 product (its width launched 2016
+    wide) and a 16-row decode by 20,480 columns swapped."""
+    from dew.nn.kernels.templates.gemm import mosaic_gpu
+
+    launch = grouped_matmul.MosaicGmm()
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    one = jax.ShapeDtypeStruct((1,), jnp.int32)
+    rows, depth, width = (16, 4096, 20480) if swapped else (264, 1024, 1985)
+    declared = []
+    real = mosaic_gpu._declared
+
+    def recording(*args, **kwargs):
+        found = real(*args, **kwargs)
+        declared.extend(each for each in found if each.dtype == jnp.float32)
+        return found
+
+    monkeypatch.setattr(mosaic_gpu, "_declared", recording)
+    with generation.assumed("sm80"):
+        target = generation.gpu_target()
+        ba = launch.bind(bf16((rows, depth)), bf16((1, depth, width)), one, out_dtype="bfloat16",
+                         trans_rhs=False, interpret=False, dense=True)
+        if swapped:
+            tile = dataclasses.replace(launch._derived(launch._swapped(ba, target), target), swapped=True)
+        else:
+            tile = launch.derived(ba, target)
+        tile = dataclasses.replace(tile, splits=2)
+        fn, args = launch.lowering(ba, tile)
+        jax.eval_shape(fn, *args)
+        assert len(declared) == 1, declared
+        assert 2 * launch._slice_bytes(ba, tile, target) == math.prod(declared[0].shape) * 4, declared
 
 
 def _traced_on(target, fn, args):
