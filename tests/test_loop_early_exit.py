@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from jax.extend import core as jex_core
-from model_support import TINY_DECODER, attending, decode_steps, model_draw, with_logit_cotangent
+from model_support import TINY_DECODER, attending, decode_steps, model_draw, stacked, with_logit_cotangent
 from reference_error import assert_as_exact, with_gradients
 
 from dew.interop.hf_decoders import translate_config
@@ -427,7 +427,8 @@ def test_a_row_exit_over_cross_attention_stops_its_passes_over_every_row():
 
 @attending("reference")
 @pytest.mark.parametrize("looped", [
-    pytest.param(lambda: _decoder("gemma4-kvshare").with_passes(2, (2, 4)), id="a block opening on a reader"),
+    pytest.param(lambda: _from("gemma-tiny", num_hidden_layers=6).clone(kv_shared_layers=(4, 5))
+                 .with_passes(2, (4, 6)), id="a scanned block opening on a reader"),
     pytest.param(lambda: _from("gemma-tiny", num_hidden_layers=6).clone(kv_shared_layers=(5,))
                  .with_passes(2, (5, 6)), id="a provider closing a scanned prelude"),
 ])
@@ -441,7 +442,8 @@ def test_a_loops_parts_carry_their_providers_publications(looped):
 
     def unrolled(module):
         return jax.jit(lambda variables, ids: module.apply(variables, ids, method=_sharing_by_hand))
-    assert_as_exact(jax.jit(model.apply), unrolled(model), draw, "a loop's parts' publications",
+    scanned = stacked(scanned=True)(jax.jit(model.apply))
+    assert_as_exact(scanned, unrolled(model), draw, "a loop's parts' publications",
                     seeds=SEEDS["sharing parts"], truth_fn=unrolled(model.clone(dtype=jnp.float64)))
 
 
@@ -456,3 +458,75 @@ def test_a_counted_loop_runs_where_its_coda_reads_none_of_its_blocks_publication
     run = jax.jit(lambda variables, ids: counted.apply(variables, ids, loop_passes=jnp.int32(2)))
     assert_as_exact(run, jax.jit(fixed.apply), draw, "a counted loop over a block's own sharing",
                     seeds=SEEDS["counted sharing"], truth_fn=jax.jit(fixed.clone(dtype=jnp.float64).apply))
+
+
+def _reindexed() -> CausalTransformer:
+    """DeepSeek V4.1's tiny release cut to six layers: a CSA2 Full layer at 2 publishing its entries
+    (compressed two to one) and Reindex layers after it reading them, none sharing keys and values."""
+    config = json.loads((FIXTURES / "deepseek-v41-tiny" / "config.json").read_text())
+    text = config["text_config"]
+    ratios = text["compress_ratios"][:4] + [2] * 2 + text["compress_ratios"][text["num_hidden_layers"]:]
+    config = {**config, "text_config": {
+        **text, "num_hidden_layers": 6, "compress_ratios": ratios, "kv_source_layer_ids": [2],
+        "index_source_layer_ids": [2, 3, 4, 5], "candidate_source_layer_id": 2,
+        "engram_layer_ids": [1], "engram_num_embeddings": text["engram_num_embeddings"][:1],
+        "dspark_target_layer_ids": [3, 4, 5]}}
+    return CausalTransformer(**{**translate_config(config), "dtype": "float32"})
+
+
+def test_a_block_gate_refuses_a_coda_reindexing_its_blocks_entries():
+    """A loop over a CSA2 Full layer whose Reindex layers after it read its entries, sharing nothing: a
+    gate on the block's output running the coda once over its tokens' exiting states is refused, as for a
+    sharing layer's reads; one pass, which hands on its own publications, is not."""
+    model = _reindexed()
+    ids = jnp.ones((2, 8), jnp.int32)
+    gated = model.with_passes(2, (2, 3), exit_gate=True, exit_threshold=0.6)
+    gated = gated.clone(loop=dataclasses.replace(gated.loop, exit_at="block"))
+    with pytest.raises(ValueError):
+        gated.init(jax.random.key(0), ids)
+    once = gated.clone(loop=dataclasses.replace(gated.loop, steps=1))
+    variables = once.init(jax.random.key(0), ids)
+    plain = once.clone(loop=dataclasses.replace(once.loop, exit_threshold=None))
+    np.testing.assert_array_equal(np.asarray(jax.jit(once.apply)(variables, ids)),
+                                  np.asarray(jax.jit(plain.apply)(variables, ids)))
+
+
+def test_a_row_exit_over_compressed_publications_stops_over_every_row():
+    """A row-exit loop over a CSA2 Full layer, whose entries `[B, S // 2, D]` hold its rows but not its
+    tokens: scoring under its threshold stops its passes over every row, compacting none, its logits
+    finite."""
+    model = _reindexed().with_passes(3, (2, 3), exit_gate=True, exit_threshold=0.6)
+    model = model.clone(loop=dataclasses.replace(model.loop, exit_by="row"))
+    variables, ids = _gated(model_draw(model, (2, 12), model.vocab_size), model.emb_features, 0xEA0)(0)
+    assert np.all(np.isfinite(np.asarray(jax.jit(model.apply)(variables, ids))))
+
+
+def test_a_rows_host_mask_is_gathered_with_its_rows():
+    """A row-exit loop scored under a host (NumPy) pairwise mask: each compacted pass reads its rows' own
+    mask as it reads a JAX array's, its logits the same, bit for bit."""
+    rows = _rows_exiting()
+    variables, ids = _gated(model_draw(rows, (2, 12), rows.vocab_size), rows.emb_features, 0xEA1)(0)
+    mask = np.broadcast_to(np.tril(np.ones((12, 12), bool)), (2, 12, 12))
+    host = rows.apply(variables, ids, attention_pairwise_mask=mask)
+    device = rows.apply(variables, ids, attention_pairwise_mask=jnp.asarray(mask))
+    np.testing.assert_array_equal(np.asarray(host), np.asarray(device))
+
+
+def test_a_cached_block_gate_collects_exits_where_no_earlier_coda_runs():
+    """A cached call collecting every pass's exit under a gate on the block's output runs where no earlier
+    pass runs a coda (a loop over the stack's last layers); one capturing every method's output, which no
+    switch returns, is refused where it keeps each row's exiting pass's cache."""
+    looped = _decoder("qwen35-tiny")
+    whole = looped.with_passes(3, (1, looped.num_layers), exit_gate=True, exit_threshold=0.6)
+    whole = whole.clone(loop=dataclasses.replace(whole.loop, exit_at="block", shared_cache=True))
+    variables, ids = model_draw(whole, (2, 12), whole.vocab_size)(0)
+    made, _ = decode_steps(whole)
+    _, sown = whole.apply({**variables, "cache": made(variables, 2)}, ids[:, :1], decode=True,
+                          mutable=["cache", "exits"])
+    assert sown["exits"]["logits"]
+    block = _tokens_exiting(shared_cache=True)
+    variables, ids = model_draw(block, (2, 12), block.vocab_size)(0)
+    made, _ = decode_steps(block)
+    with pytest.raises(ValueError):
+        block.apply({**variables, "cache": made(variables, 2)}, ids[:, :1], decode=True,
+                    mutable=["cache", "intermediates"], capture_intermediates=lambda module, method: True)

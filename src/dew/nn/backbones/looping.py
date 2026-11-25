@@ -33,6 +33,7 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 from flax.core import lift, meta
 from flax.core.scope import DenyList
@@ -43,6 +44,7 @@ from dew.batch import sows_appended, unboxed
 from dew.mesh import FSDP_AXIS, mesh_axes
 from dew.nn.dense import captures_any_method
 
+from ..kv_cache import row_axis
 from ..precision import at_least_fp32, softplus
 from ..protocols import EXIT_PASSES, EXITS, fixed_remat
 from ..sharding import explicit_over, gathered_over, placed_layout, typed_on
@@ -323,24 +325,30 @@ def _exit_state(model, x, step: int, *, train: bool, decode: bool, store=None, *
 
 
 def _coda_reads_block(model) -> bool:
-    """Whether a layer after a loop's block reads what a layer of the block publishes (`kv_store`): a
-    sharing layer after it whose provider (`kv_sharing`: the keys and values it reads) or latest publisher
-    before it (a CSA2 layer reads the latest selection, `deepseek_v4._published`) lies in the block. Its coda
-    then reads the last pass's publications, as the unlooped stack's reads its provider's (`_Passes.fixed`
-    traces that pass unrolled); a coda reading none drops them across the passes' scan."""
+    """Whether a layer after a loop's block may read what a layer of the block publishes (`kv_store`): a
+    reader after it (`_reads_publications`: a sharing layer, or a layer of a publishing kind, which may read
+    the latest publications whether it shares or not: CSA2's Reindex reads its entries and index keys)
+    whose provider (`kv_sharing`) lies in the block, or which has none and follows a publisher in it. Its
+    coda then reads the last pass's publications, as the unlooped stack's reads its provider's
+    (`_Passes.fixed` traces that pass unrolled); a coda reading none drops them across the passes' scan."""
     first, end = model.loop.layers or (0, model.num_layers)
     specs, providers = model.specs, model.kv_sharing
-
-    def inside(index: int | None) -> bool:
-        return index is not None and first <= index < end
+    publishes_in_block = any(spec.provider is not None for spec in specs[first:end])
     for layer in range(end, model.num_layers):
-        if not specs[layer].kv_shared:
+        if not _reads_publications(model, specs[layer]):
             continue
-        latest = max((earlier for earlier in range(layer) if specs[earlier].provider is not None),
-                     default=None)
-        if inside(providers.get(layer)) or inside(latest):
+        provider = providers.get(layer)
+        if (provider is not None and first <= provider < end) or (publishes_in_block and provider is None):
             return True
     return False
+
+
+def _reads_publications(model, spec) -> bool:
+    """Whether a layer of `spec` may read the store's publications: a sharing layer, or one of a kind that
+    publishes in either role (`MixerBase.publishes`), whose layers read the latest publications."""
+    mixer = spec.kind.mixer or model.mixer
+    return spec.kv_shared or (mixer is not None and (mixer.publishes(kv_shared=True)
+                                                     or mixer.publishes(kv_shared=False)))
 
 
 def _entered(model, x, bank, injected, *, stop: bool, normed=None, theta=None):
@@ -385,7 +393,8 @@ def run_loop(model, x, *, train: bool, decode: bool, passes=None, **inputs):
     if passes is not None and _coda_reads_block(model):
         raise ValueError("a count of passes given per call runs its passes under one scan, which leaves no "
                          "publication of its last pass for the layers after the block, which read one")
-    if loop.exit_threshold is not None and loop.exit_at == "block" and _coda_reads_block(model):
+    if (loop.exit_threshold is not None and loop.exit_at == "block" and loop.steps > 1
+            and _coda_reads_block(model)):
         raise ValueError("a gate on the block's output runs the coda once over its tokens' exiting states, "
                          "each exiting pass's publications its own: a coda reading the block's exits at the "
                          "coda (Loop.exit_at='coda')")
@@ -573,7 +582,9 @@ class _Passes:
                 raise ValueError("a row's exit gate pools the row's tokens, which in decode are the tokens "
                                  "so far and in a packed row its documents': exit by token there "
                                  "(Loop.exit_by='token')")
-        if self.decode and self.gates_block and model.is_mutable_collection(EXITS):
+        _, end = self.span
+        if (self.decode and self.gates_block and model.is_mutable_collection(EXITS) and loop.steps > 1
+                and end < model.num_layers):
             # Each earlier pass's coda would run for its exit, in a cache a gate on the block keeps none of
             # (`pass_entries`).
             raise ValueError("a cached call collecting every pass's exit runs each pass's coda, whose cache "
@@ -646,10 +657,16 @@ class _Passes:
         """Every later pass, the cut static: the passes before it scanned, the one it cuts, alone, and
         those after it scanned; under a shared cache the last after the scan, as the first runs. A loop
         that may stop at its threshold (`stops`) runs `stopping` instead."""
-        if self.stops and (not self.decode or x.shape[1] == 1) and not captures_any_method(self.model):
+        if self.stops and (not self.decode or x.shape[1] == 1):
             # A cached call of several tokens runs every pass (`Loop`'s doc); a capture of any method keeps
-            # what no switch returns (a method's non-array return), each pass unrolled.
-            return self.stopping(x, bank)
+            # what no switch returns (a method's non-array return), each pass unrolled, where no cache keeps
+            # each row's exiting pass's writes (`_kept_exits`).
+            if not captures_any_method(self.model):
+                return self.stopping(x, bank)
+            if self.decode:
+                raise ValueError("a cached call keeps each row's exiting pass's cache by switches, which "
+                                 "return no method's non-array: capture the modules' calls "
+                                 "(capture_intermediates=True)")
         loop, shared = self.loop, self.shared
         # A coda reading the block's publications reads the last pass's, which it leaves traced unrolled, and
         # an exiting pass's coda its own pass's: each pass unrolled (`_coda_reads_block`).
@@ -771,7 +788,7 @@ class _Passes:
         batch = choice.shape[0]
 
         def kept(axis: int, *passes):
-            # `axis` an entry's rows: after its layers in a banked run's (`decoder_cache`, `stacked_spec`).
+            # `axis` an entry's rows: after its layers in a banked run's (`row_axis`).
             last = passes[-1]
             if last.ndim <= axis or all(each is last for each in passes):
                 return last
@@ -783,10 +800,10 @@ class _Passes:
             index = choice.reshape(1, *(1,) * axis, batch, *(1,) * (last.ndim - axis - 1))
             return jnp.take_along_axis(stacked, index, axis=0)[0]
         for name in caches[-1]:
-            run = group_layers(name)
-            axis = 0 if run is None or run.stop - run.start == 1 else 1
-            module.put_variable('cache', name, jax.tree.map(functools.partial(kept, axis),
-                                                            *(cache[name] for cache in caches)))
+            module.put_variable('cache', name, jax.tree_util.tree_map_with_path(
+                lambda path, *passes, name=name: kept(row_axis((jax.tree_util.DictKey(name), *path)),
+                                                      *passes),
+                *(cache[name] for cache in caches)))
 
     def own_view(self, step: int):
         first, end = self.span
@@ -931,14 +948,15 @@ class _Passes:
 
 
 def _token_aligned(passes: _Passes, x: jax.Array) -> bool:
-    """Whether every array of the call's inputs and the prelude's publications that holds the call's rows
-    holds its tokens beside them (`[B, S, ...]`), as `compacted` gathers them: a cross-attention's context
-    `[B, C, D]`, its lengths `[B]` or a bias over heads `[B, H, S, S]` holds the rows alone, and a pass
-    reading one runs over every row."""
+    """Whether every array, JAX's or the host's, of the call's inputs, the prelude's publications and the
+    last pass's that holds the call's rows holds its tokens beside them (`[B, S, ...]`), as `compacted`
+    gathers and scatters them: a cross-attention's context `[B, C, D]`, its lengths `[B]`, a bias over heads
+    `[B, H, S, S]` or a CSA2 layer's compressed entries `[B, S // rate, D]` holds the rows alone, and a pass
+    reading or leaving one runs over every row."""
     batch, length = x.shape[:2]
-    return all(not isinstance(leaf, jax.Array) or leaf.ndim == 0 or leaf.shape[0] != batch
+    return all(not isinstance(leaf, jax.Array | np.ndarray) or leaf.ndim == 0 or leaf.shape[0] != batch
                or leaf.shape[:2] == (batch, length)
-               for leaf in jax.tree.leaves((passes.inputs, passes.prelude)))
+               for leaf in jax.tree.leaves((passes.inputs, passes.prelude, passes.left)))
 
 
 def compacted(ran: Callable, module, carry, normed, rows: jax.Array, passes: _Passes):
@@ -962,10 +980,10 @@ def compacted(ran: Callable, module, carry, normed, rows: jax.Array, passes: _Pa
     def rowed(leaf) -> bool:
         # A row's array: its leading axes the call's rows and tokens (a state, its bank, an input, a mask, a
         # publication), not a table of the tokens' (a position's rotation), whatever its sizes.
-        return isinstance(leaf, jax.Array) and leaf.shape[:2] == (batch, length)
+        return isinstance(leaf, jax.Array | np.ndarray) and leaf.shape[:2] == (batch, length)
 
     def taken(tree, picked):
-        return jax.tree.map(lambda leaf: leaf[picked] if rowed(leaf) else leaf, tree)
+        return jax.tree.map(lambda leaf: jnp.asarray(leaf)[picked] if rowed(leaf) else leaf, tree)
 
     def put(whole, part, picked):
         return jax.tree.map(lambda full, each: full.at[picked].set(each) if rowed(full) else each,

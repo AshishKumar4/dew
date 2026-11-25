@@ -121,7 +121,9 @@ class CrossPassMerge(nn.Module):
         its depth mixture, each product in the merge's own scope, else as a block's sites read their bank
         together (`merged_sites`)."""
         if watched_or_owned(self) or watched_or_owned(self.depth):
-            return _merged(read, self.depth(bank), self.controller(), self.spec, self.norm_eps)
+            # The bank in the read's dtype, as the sites read it together.
+            return _merged(read, self.depth(bank.astype(read.dtype)), self.controller(), self.spec,
+                           self.norm_eps)
         return merged_sites((self,), read, bank)[0]
 
 
