@@ -325,30 +325,26 @@ def _exit_state(model, x, step: int, *, train: bool, decode: bool, store=None, *
 
 
 def _coda_reads_block(model) -> bool:
-    """Whether a layer after a loop's block may read what a layer of the block publishes (`kv_store`): a
-    reader after it (`_reads_publications`: a sharing layer, or a layer of a publishing kind, which may read
-    the latest publications whether it shares or not: CSA2's Reindex reads its entries and index keys)
-    whose provider (`kv_sharing`) lies in the block, or which has none and follows a publisher in it. Its
-    coda then reads the last pass's publications, as the unlooped stack's reads its provider's
-    (`_Passes.fixed` traces that pass unrolled); a coda reading none drops them across the passes' scan."""
+    """Whether a layer after a loop's block reads what a layer of the block publishes (`kv_store`): a
+    sharing layer after it whose provider (`kv_sharing`) lies in the block, or a layer after it reading a key
+    whose last writer before it, from the block's start, lies in the block (`MixerBase.publications`: CSA2's
+    Reindex reading the entries a Full layer wrote, a Reuse layer the selection a Reindex layer wrote).
+    Its coda then reads the last pass's publications, as the unlooped stack's reads its provider's
+    (`_Passes.fixed` traces that pass unrolled); a coda reading none, or only what it writes itself, drops
+    them across the passes' scan."""
     first, end = model.loop.layers or (0, model.num_layers)
     specs, providers = model.specs, model.kv_sharing
-    publishes_in_block = any(spec.provider is not None for spec in specs[first:end])
-    for layer in range(end, model.num_layers):
-        if not _reads_publications(model, specs[layer]):
-            continue
-        provider = providers.get(layer)
-        if (provider is not None and first <= provider < end) or (publishes_in_block and provider is None):
+    if any(first <= providers.get(layer, -1) < end for layer in range(end, model.num_layers)):
+        return True
+    written: dict[str, int] = {}
+    for layer in range(first, model.num_layers):
+        mixer = specs[layer].kind.mixer or model.mixer
+        reads, writes = (frozenset(), frozenset()) if mixer is None else mixer.publications(
+            kv_shared=specs[layer].kv_shared)
+        if layer >= end and any(first <= written.get(key, -1) < end for key in reads):
             return True
+        written.update(dict.fromkeys(writes, layer))
     return False
-
-
-def _reads_publications(model, spec) -> bool:
-    """Whether a layer of `spec` may read the store's publications: a sharing layer, or one of a kind that
-    publishes in either role (`MixerBase.publishes`), whose layers read the latest publications."""
-    mixer = spec.kind.mixer or model.mixer
-    return spec.kv_shared or (mixer is not None and (mixer.publishes(kv_shared=True)
-                                                     or mixer.publishes(kv_shared=False)))
 
 
 def _entered(model, x, bank, injected, *, stop: bool, normed=None, theta=None):

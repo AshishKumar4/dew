@@ -1128,6 +1128,20 @@ class DeepseekV4Mixer(MixerBase):
         Reindex layer its selection."""
         return self.compressor == 'csa2' and (self.reindex or not kv_shared)
 
+    def publications(self, kv_shared: bool) -> tuple[frozenset[str], frozenset[str]]:
+        """`MixerBase.publications`: a CSA2 Reuse layer (sharing) reads the entries and selection; a Reindex
+        layer reads the entries and index keys, and the candidates where it restricts to them, and writes
+        its selection; a Full layer writes its entries, index keys and selection (its candidates only where
+        a call pools them, left undeclared: `DeepseekV4Attention`, `_published`)."""
+        if self.compressor != 'csa2':
+            return frozenset(), frozenset()
+        if kv_shared:
+            return frozenset({_CSA2_ENTRIES, _CSA2_SELECTED}), frozenset()
+        if self.reindex:
+            restricted = {_CSA2_CANDIDATES} if self.candidates == 'restrict' else set()
+            return frozenset({_CSA2_ENTRIES, _CSA2_INDEX_KEYS, *restricted}), frozenset({_CSA2_SELECTED})
+        return frozenset(), frozenset({_CSA2_ENTRIES, _CSA2_INDEX_KEYS, _CSA2_SELECTED})
+
     def drafter(self, ctx: MixerContext) -> Callable[..., nn.Module]:
         """This kind's attention as a DSpark stage's (`DSparkAttention`)."""
         if self.compressor is not None:

@@ -460,9 +460,10 @@ def test_a_counted_loop_runs_where_its_coda_reads_none_of_its_blocks_publication
                     seeds=SEEDS["counted sharing"], truth_fn=jax.jit(fixed.clone(dtype=jnp.float64).apply))
 
 
-def _reindexed() -> CausalTransformer:
-    """DeepSeek V4.1's tiny release cut to six layers: a CSA2 Full layer at 2 publishing its entries
-    (compressed two to one) and Reindex layers after it reading them, none sharing keys and values."""
+def _reindexed(**fields) -> CausalTransformer:
+    """DeepSeek V4.1's tiny release cut to six layers on a plain residual (no mHC, engram or DSpark, which
+    a loop refuses): a CSA2 Full layer at 2 publishing its entries (compressed two to one) and Reindex
+    layers after it reading them and writing their selections, `fields` over its own."""
     config = json.loads((FIXTURES / "deepseek-v41-tiny" / "config.json").read_text())
     text = config["text_config"]
     ratios = text["compress_ratios"][:4] + [2] * 2 + text["compress_ratios"][text["num_hidden_layers"]:]
@@ -471,24 +472,34 @@ def _reindexed() -> CausalTransformer:
         "index_source_layer_ids": [2, 3, 4, 5], "candidate_source_layer_id": 2,
         "engram_layer_ids": [1], "engram_num_embeddings": text["engram_num_embeddings"][:1],
         "dspark_target_layer_ids": [3, 4, 5]}}
-    return CausalTransformer(**{**translate_config(config), "dtype": "float32"})
+    translated = {key: value for key, value in translate_config(config).items()
+                  if key not in ("hyper_connections", "engram", "dspark")}
+    return CausalTransformer(**{**translated, "dtype": "float32", **fields})
 
 
-def test_a_block_gate_refuses_a_coda_reindexing_its_blocks_entries():
-    """A loop over a CSA2 Full layer whose Reindex layers after it read its entries, sharing nothing: a
-    gate on the block's output running the coda once over its tokens' exiting states is refused, as for a
-    sharing layer's reads; one pass, which hands on its own publications, is not."""
-    model = _reindexed()
+def _block_gated(model: CausalTransformer, layers: tuple[int, int], steps: int = 2) -> CausalTransformer:
+    gated = model.with_passes(steps, layers, exit_gate=True, exit_threshold=0.6)
+    return gated.clone(loop=dataclasses.replace(gated.loop, exit_at="block"))
+
+
+def test_a_block_gate_refuses_a_coda_reading_its_blocks_publications():
+    """A gate on the block's output runs the coda once over its tokens' exiting states, so a coda reading a
+    key its block's last writer left (`MixerBase.publications`) is refused: Reindex layers after a looped
+    Full layer reading its entries, and a Reuse layer after a looped Reindex layer reading its selection.
+    A coda that reads only what it writes itself (each Reindex after a looped Reindex writing its own
+    selection), and a single pass, which hands on its own publications, run, the latter as the loop
+    without a threshold does, bit for bit."""
     ids = jnp.ones((2, 8), jnp.int32)
-    gated = model.with_passes(2, (2, 3), exit_gate=True, exit_threshold=0.6)
-    gated = gated.clone(loop=dataclasses.replace(gated.loop, exit_at="block"))
-    with pytest.raises(ValueError):
-        gated.init(jax.random.key(0), ids)
-    once = gated.clone(loop=dataclasses.replace(gated.loop, steps=1))
+    plain = _reindexed()
+    for refused in (_block_gated(plain, (2, 3)), _block_gated(plain.clone(kv_shared_layers=(5,)), (3, 5))):
+        with pytest.raises(ValueError):
+            refused.init(jax.random.key(0), ids)
+    _block_gated(plain, (3, 4)).init(jax.random.key(0), ids)
+    once = _block_gated(plain, (2, 3), steps=1)
     variables = once.init(jax.random.key(0), ids)
-    plain = once.clone(loop=dataclasses.replace(once.loop, exit_threshold=None))
+    free = once.clone(loop=dataclasses.replace(once.loop, exit_threshold=None))
     np.testing.assert_array_equal(np.asarray(jax.jit(once.apply)(variables, ids)),
-                                  np.asarray(jax.jit(plain.apply)(variables, ids)))
+                                  np.asarray(jax.jit(free.apply)(variables, ids)))
 
 
 def test_a_row_exit_over_compressed_publications_stops_over_every_row():
@@ -496,15 +507,17 @@ def test_a_row_exit_over_compressed_publications_stops_over_every_row():
     tokens: scoring under its threshold stops its passes over every row, compacting none, its logits
     finite."""
     model = _reindexed().with_passes(3, (2, 3), exit_gate=True, exit_threshold=0.6)
-    model = model.clone(loop=dataclasses.replace(model.loop, exit_by="row"))
+    model = model.clone(loop=dataclasses.replace(model.loop, exit_by="row", exit_at="coda"))
     variables, ids = _gated(model_draw(model, (2, 12), model.vocab_size), model.emb_features, 0xEA0)(0)
     assert np.all(np.isfinite(np.asarray(jax.jit(model.apply)(variables, ids))))
 
 
 def test_a_rows_host_mask_is_gathered_with_its_rows():
-    """A row-exit loop scored under a host (NumPy) pairwise mask: each compacted pass reads its rows' own
-    mask as it reads a JAX array's, its logits the same, bit for bit."""
-    rows = _rows_exiting()
+    """A row-exit loop over softmax attention scored under a host (NumPy) pairwise mask, its rows exiting at
+    different passes: each compacted pass reads its rows' own mask as it reads a JAX array's, its logits the
+    same, bit for bit."""
+    rows = _from("gemma-tiny", num_hidden_layers=4).with_passes(3, (1, 3), exit_gate=True, exit_threshold=0.6)
+    rows = rows.clone(loop=dataclasses.replace(rows.loop, exit_at="block", exit_by="row"))
     variables, ids = _gated(model_draw(rows, (2, 12), rows.vocab_size), rows.emb_features, 0xEA1)(0)
     mask = np.broadcast_to(np.tril(np.ones((12, 12), bool)), (2, 12, 12))
     host = rows.apply(variables, ids, attention_pairwise_mask=mask)

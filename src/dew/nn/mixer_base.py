@@ -238,6 +238,14 @@ class MixerBase:
         CSA2 layers, `DeepseekV4Mixer.publishes`), which the stack then threads to it; none by default."""
         return False
 
+    def publications(self, kv_shared: bool) -> tuple[frozenset[str], frozenset[str]]:
+        """The store's keys a layer of this kind reads and those it surely writes (`kv_store`, beside the
+        keys and values a sharing layer reads, `CausalTransformer.kv_sharing`): a loop's coda reads its
+        block's where a key's last writer before it lies in the block (`looping._coda_reads_block`). A
+        write left undeclared keeps an earlier writer live, so it may refuse a loop but never hides a
+        read; none by default."""
+        return frozenset(), frozenset()
+
     @property
     def indexed_mixers(self) -> tuple[MLAMixer, ...]:
         """The kinds within this one that carry an indexer an objective trains (latent attention's,

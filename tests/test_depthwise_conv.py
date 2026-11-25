@@ -7,11 +7,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from jax.extend import core as jex_core
 from reference_error import assert_fp32_reduction_bound
 
 from dew.nn.conv import Conv, _conv_general_dilated, _materialized_depthwise_3x3, _polyphase_depthwise_3x3
 from dew.nn.precision import EXACT_FLOAT32
+from dew.nn.programs import equations
 from dew.nn.ssm import SpatialFusionConv
 
 
@@ -190,23 +190,13 @@ def test_the_polyphase_form_convolves_at_its_layers_precision():
     (each traced convolution's typed `precision`), as the form beside it does (row 12920)."""
     x, w = jnp.ones((1, 8, 8, 4), jnp.bfloat16), jnp.ones((3, 3, 1, 4), jnp.bfloat16)
 
-    def convolutions(jaxpr):
-        for equation in jaxpr.eqns:
-            if equation.primitive.name == "conv_general_dilated":
-                yield equation
-            for value in equation.params.values():
-                for inner in value if isinstance(value, tuple | list) else (value,):
-                    if isinstance(inner, jex_core.ClosedJaxpr):
-                        yield from convolutions(inner.jaxpr)
-                    elif isinstance(inner, jex_core.Jaxpr):
-                        yield from convolutions(inner)
-
     def run(x, w):
         return _conv_general_dilated(x, w, (1, 1), 'SAME', rhs_dilation=(2, 2),
                                      dimension_numbers=('NHWC', 'HWIO', 'NHWC'), feature_group_count=4,
                                      precision=EXACT_FLOAT32)
     with jax.default_matmul_precision("bfloat16"):
-        found = list(convolutions(jax.make_jaxpr(run)(x, w).jaxpr))
+        found = [each for each in equations(jax.make_jaxpr(run)(x, w).jaxpr)
+                 if each.primitive.name == "conv_general_dilated"]
     polyphase = [each for each in found if each.invars[0].aval.shape[0] == 4]
     assert polyphase, "no polyphase convolution traced"
     exact = jax.lax.Precision.HIGHEST
