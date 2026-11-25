@@ -557,6 +557,14 @@ def _described(value, walking: tuple[int, ...] = ()) -> tuple[JSON, bool]:
             return ({"mapping": [[name if isinstance(name, str) else repr(name), entry]
                                  for name, (entry, _) in entries]},
                     all(isinstance(name, str) and own for name, (_, own) in entries))
+        case jax.Array() if jax.dtypes.issubdtype(value.dtype, jax.dtypes.prng_key):
+            # A typed PRNG key (a transform's seed field), which NumPy cannot read: its key data's bits and
+            # its key type, its implementation stated by its parts (`dew._stated`), as a trace closing over
+            # it states it (`terms.held_bits`).
+            from dew.algebra import terms  # read where called, as `dew._stated` reads it
+
+            dtype, bits = terms.held_bits(value)
+            return {"array": content_fingerprint(bits).hex(), "key": stated(dtype, "a step's key type")}, True
         case np.ndarray() | jax.Array():
             return {"array": content_fingerprint(np.asarray(value)).hex()}, True
         case np.generic():
