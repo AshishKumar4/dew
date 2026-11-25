@@ -1699,11 +1699,25 @@ class Transaction:
                              "_updates_in_backward must say so")
         return realized, planned
 
+    def _lean(self, state: TrainState, planned: _Planned | None, probing, *, host: bool) -> bool:
+        """Whether the window the step replays, its loss unscaled and its update taken whole, reads no
+        gradient of a microbatch's own (`_pulled`): the commit replays the window's every microbatch, this
+        one realized afresh, under the pooled loss's cotangent, so its forward's residuals live through no
+        backward and no replay (a decision step whose loss weighs its consistency term, 8 layers of a 4B
+        model at split 2: 28.4 GiB a step and 82 s to compile against 18.5 GiB and 43 s). A host step, one
+        that updates its runs in their backward or summarizes its cotangents takes its own."""
+        return (not host and state.accumulation is not None and not self.shared and state.scale is None
+                and not holds_back(state.opt_state) and planned is None and probing is None)
+
     def _pulled(self, realized: Realization, cotangent, planned: _Planned | None, *, whole: bool,
-                masters: bool) -> tuple[Variables, Variables | None, Applied | None]:
+                masters: bool, lean: bool = False) -> tuple[Variables, Variables | None, Applied | None]:
         """The microbatch's gradient, its probes' where it summarizes them from the same backward (`whole`),
         and what its runs that updated in their backward left (`split_planned`), whose backward reads
-        whether the step commits (`dew.nn.in_backward.gated`), known once its forward is."""
+        whether the step commits (`dew.nn.in_backward.gated`), known once its forward is; zeros of its
+        shape, no backward run, for a lean window, whose commit replays it (`_lean`)."""
+        if lean:
+            shapes = jax.eval_shape(realized.pullback, cotangent)
+            return jax.tree.map(lambda leaf: jnp.zeros(leaf.shape, leaf.dtype), shapes), None, None
         if planned is not None:
             loss, active = self.objective.reduce_loss(realized.stats)
             # A run that updates in its backward holds no loss scale (`consumed_where_made`), so where it
@@ -1805,26 +1819,14 @@ class Transaction:
             # the microbatch is its update's whole window; otherwise from the pooled loss's, below.
             probing = realized.probed
             whole = probing is not None and self.size == 1
-            # A window it replays, its loss unscaled and its update taken whole (`lean`), reads no gradient
-            # of a microbatch's own: the commit replays the window's every microbatch, this one realized
-            # afresh, under the pooled loss's cotangent, so this forward's residuals live through no
-            # backward and no replay (a decision step whose loss weighs its consistency term, 8 layers of a
-            # 4B model at split 2: 28.4 GiB a step and 82 s to compile against 18.5 GiB and 43 s).
-            lean = (not host and state.accumulation is not None and not self.shared and state.scale is None
-                    and not holds_back(state.opt_state) and planned is None and probing is None)
-            if lean:
-                gradient = jax.tree.map(lambda leaf: jnp.zeros(leaf.shape, leaf.dtype),
-                                        jax.eval_shape(realized.pullback, cotangent))
-                probed, applied = None, None
-            else:
-                gradient, probed, applied = self._pulled(realized, cotangent, planned, whole=whole,
-                                                         masters=state.compute is not None)
+            lean = self._lean(state, planned, probing, host=host)
+            gradient, probed, applied = self._pulled(realized, cotangent, planned, whole=whole,
+                                                     masters=state.compute is not None, lean=lean)
             if state.compute is None or self.size > 1:
                 gradient = unscale(gradient, factor)
-            # Otherwise no loss scale divides it (`dew.training._candidates.prepared_for`),
-            # and a copied parameter's gradient stays bf16 until the update
-            # widens it as it reads it. A window of several microbatches
-            # widens it as it pools it, so the window sums in fp32.
+            # Otherwise no loss scale divides it (`dew.training._candidates.prepared_for`), and a copied
+            # parameter's gradient stays bf16 until the update widens it as it reads it. A window of several
+            # microbatches widens it as it pools it, so the window sums in fp32.
             pending = prepare(state, realized.stats, realized.aux, loss, gradient, closing)
             pending = pending.replace(applied=applied)
             if probing is not None and not whole:
@@ -1842,7 +1844,6 @@ class Transaction:
 
             def replay(_):
                 cot = pooled(pending.pooled, realized.stats, factor)
-                # A lean window's microbatch realized again where its gradient is read (`lean`).
                 current = self._realized(realize, read, batch, step_info, factor) if lean else realized
                 combined = unscale(current.pullback(cot), factor)
                 def one(index, carried):
