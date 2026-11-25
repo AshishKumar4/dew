@@ -1408,6 +1408,36 @@ def test_chunked_covariance_keeps_both_independent_value_directions(mode):
     np.testing.assert_array_equal(checked(dy, dx), expected)
 
 
+@pytest.mark.parametrize("mode", ["walk", "merge"])
+def test_mixed_covariance_pullback_keeps_faint_stationary_coefficients(mode):
+    from dew.algebra import moments
+
+    big, small = 2.0 ** 125, 2.0 ** -40
+    w = jnp.full((1, 4), 0.25, jnp.float32)
+    x = jnp.zeros_like(w)
+    direction = jnp.asarray([[big, big / 2, big / 2, small]], jnp.float32)
+
+    def covariance(a, b):
+        return moments.chunked_covariance(a, b, w, tile=1, mode=mode)[2].sum()
+
+    def out(direction):
+        reverse_after = jax.grad(lambda y: jax.jvp(lambda a: covariance(a, y), (x,), (direction,))[1])(x)
+        forward_after = jax.jvp(lambda a: jax.grad(lambda b: covariance(a, b))(x), (x,), (direction,))[1]
+        return reverse_after, forward_after
+
+    for pullback in jax.jit(out)(direction):
+        np.testing.assert_array_equal(pullback, [[big / 8, -small / 16, -small / 16, -big / 8]])
+
+
+def test_a_dyadic_bin_keeps_integer_totals_past_float32_precision():
+    from dew.algebra import bands
+
+    exact = [(1 << 24) + 1, -(1 << 24) - 1, (1 << 31) - 1, -(1 << 31), 1, 0]
+    high, low, exponent = bands.placed_totals(jnp.asarray(exact, jnp.int32), 0, jnp.float32, may_round=True)
+    found = np.ldexp(np.asarray(high, np.float64) + np.asarray(low, np.float64), np.asarray(exponent))
+    np.testing.assert_array_equal(found, exact)
+
+
 @pytest.mark.parametrize(("rows", "states"), [(0, 4), (1, 65536)])
 def test_mixed_covariance_in_a_constant_direction_is_zero(rows, states):
     from dew.algebra import moments

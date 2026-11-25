@@ -161,10 +161,10 @@ def _carries_direction(each: Summed, active: frozenset[int]) -> bool:
 
 
 def _directional_sums(form: Ratio) -> tuple[Summed, ...]:
-    """Preserve bands when independent directions occur in different sums of a product."""
+    """Keep independent direction sums, and sums that a pullback subtracts from entrywise values."""
     active = frozenset(form.directions)
     sums = [tuple(each for each in term if _carries_direction(each, active)) for _, term in form.products]
-    if not any(len(term) > 1 for term in sums):
+    if form.reduced and not any(len(term) > 1 for term in sums):
         return ()
     return tuple(dict.fromkeys(each for term in sums for each in term))
 
@@ -211,7 +211,8 @@ def _banded_sum(each: Summed, arrays, count: int, rank: int, form: Ratio, dtype)
     load, chunks = arrays
     number = scaled.format_of(dtype)
     capacity = min(jnp.iinfo(jnp.int32).bits - 1, number.mantissa + 1)
-    width = max(1, min(16, capacity - (2 * count * len(each.terms)).bit_length()))
+    terms_per_bin = 2 * count * len(each.terms)
+    width = max(1, min(16, capacity - terms_per_bin.bit_length()))
     powers = [(math.frexp(coefficient)[1], len(factors)) for coefficient, factors in each.terms]
     lower = min(exponent - (degree + 2) * number.reach - number.mantissa for exponent, degree in powers)
     upper = max(exponent + (degree + 1) * (number.largest + 2) for exponent, degree in powers)
@@ -222,8 +223,9 @@ def _banded_sum(each: Summed, arrays, count: int, rank: int, form: Ratio, dtype)
         factors = windows._factor_values(inputs, form.units, rank)
         return summation._placed_summands(inputs, factors, valid, dtype, empty_exponent=0)
 
+    may_round = terms_per_bin * ((1 << width) - 1) > 1 << (number.mantissa + 1)
     return bands.summed(terms, chunks, axis=form.axis, width=width, lower=lower,
-                        bins=(upper - lower) // width + 1, dtype=dtype)
+                        bins=(upper - lower) // width + 1, dtype=dtype, may_round=may_round)
 
 
 def _band_products(products, values, expanded, dtype):
@@ -233,7 +235,8 @@ def _band_products(products, values, expanded, dtype):
              for coefficient, sums in products]
     length = max(bound for _, _, _, bound in plans)
     width = chunk_width(length)
-    live_length = functools.reduce(jnp.maximum, [jnp.max(jnp.asarray(steps), initial=0) for _, _, steps, _ in plans])
+    live_length = functools.reduce(jnp.maximum,
+                                   [jnp.max(jnp.asarray(steps), initial=0) for _, _, steps, _ in plans])
 
     def block(chunk):
         term = chunk * width + jnp.arange(width, dtype=jnp.int32)
@@ -272,7 +275,7 @@ def _products_summed(operands, form: Ratio):
     count = -(-states // chunk_width(states)) * chunk_width(states)
     # The denominator's own sum where a product takes it (the quotient rule's `D`), formed once for both.
     own = Summed(form.denominator, reduced=True) if form.denominator else None
-    expanded = _directional_sums(form) if form.reduced else set()
+    expanded = _directional_sums(form)
     directional = () if expanded else _directional_products(form)
     products = (sums for _, _, sums in directional) if directional else (sums for _, sums in form.products)
     distinct = list(dict.fromkeys(each for sums in products for each in sums if each not in expanded))
@@ -297,6 +300,9 @@ def _products_summed(operands, form: Ratio):
     dtype = laid[0].dtype
     if expanded:
         values_by_band = {each: _banded_sum(each, arrays, count, rank, form, dtype) for each in expanded}
+        if not form.reduced:
+            values_by_band = {each: jax.tree.map(lambda part: jnp.expand_dims(part, form.axis), band)
+                              for each, band in values_by_band.items()}
         return _band_products(form.products, values, values_by_band, dtype), denominator
     if directional:
         return _directions_summed(directional, values, arrays, count, rank, form, dtype), denominator
@@ -579,7 +585,8 @@ def _cotangent_of(index: int, aval, form: Ratio, full: list, held: int, rank: in
         raise TypeError("a ratio's operand is summed over other axes in one product than in another")
     (own_axes,) = reduced
     fresh = {axis: rank + place for place, axis in enumerate(own_axes)}
-    outside = functools.partial(_taken_apart, full, fresh, {})
+    moved: dict[int, int] = {}
+    outside = functools.partial(_taken_apart, full, fresh, moved)
     denominator_terms = outside(form.denominator)
     cotangent_at = _moved_apart(full, held, fresh) if fresh else held
     # Each product's terms holding the operand, it replaced: by the cotangent where the product's value at a
@@ -623,7 +630,9 @@ def _cotangent_of(index: int, aval, form: Ratio, full: list, held: int, rank: in
         return None
     transposed = _classic(dataclasses.replace(
         form, numerator=(), denominator=denominator_terms, products=products, reduced=False, over=within,
-        across=(*(axis for axis in broadcast if axis not in within), *fresh.values()), directions=()))
+        across=(*(axis for axis in broadcast if axis not in within), *fresh.values()),
+        directions=tuple(direction for i in form.directions if i != index
+                         for direction in ((i, moved[i]) if i in moved else (i,)))))
     made = ratio(full, transposed)
     # Laid to the ratio's rank: along a fresh axis (a sum's channels', `_apart_axes`, or the operand's sum's,
     # summed across) the value one or broadcast, so its first place is the whole.

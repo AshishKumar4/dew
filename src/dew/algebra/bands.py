@@ -16,7 +16,24 @@ from dew.algebra import scaled
 from dew.nn.float_bits import raw_fields
 
 
-def summed(load, chunks: int, *, axis: int, width: int, lower: int, bins: int, dtype):
+def placed_totals(values, exponent, dtype, *, may_round: bool):
+    """Convert signed integer bin totals to double floats, even past one word's exact precision."""
+    if not may_round:
+        held = scaled.scaled(values.astype(dtype))
+        return held.significand, jnp.zeros_like(held.significand), exponent + held.exponent
+
+    # Both halves of an int32 total fit in float32; keep their relative scale without adding them.
+    low = (values & 65535).astype(dtype)
+    high = scaled.scaled((values >> 16).astype(dtype))
+    lower = scaled.scaled(low)
+    has_high = high.significand != 0
+    upper_exp = high.exponent + 16
+    return (jnp.where(has_high, high.significand, lower.significand),
+            jnp.where(has_high, jnp.ldexp(low, -upper_exp), 0.0),
+            exponent + jnp.where(has_high, upper_exp, lower.exponent))
+
+
+def summed(load, chunks: int, *, axis: int, width: int, lower: int, bins: int, dtype, may_round: bool):
     """Sum scaled double-float terms from ``load(chunk)`` into exact dyadic bins along ``axis``.
 
     Width leaves enough headroom for all the digits of a bin in a signed word and in the
@@ -73,6 +90,4 @@ def summed(load, chunks: int, *, axis: int, width: int, lower: int, bins: int, d
         return values, exponents
 
     values, exponent = jax.vmap(compressed)(sums.reshape(-1, bins), indices.reshape(-1, bins))
-    held = scaled.scaled(values.reshape(sums.shape).astype(dtype))
-    placed = held.exponent + exponent.reshape(sums.shape)
-    return (held.significand, jnp.zeros_like(held.significand), placed), count
+    return placed_totals(values.reshape(sums.shape), exponent.reshape(sums.shape), dtype, may_round=may_round), count
