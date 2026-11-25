@@ -5,11 +5,11 @@ the places a phase's run trained already (`Skipping`)."""
 from __future__ import annotations
 
 import bisect
+import functools
 import threading
 from collections.abc import Mapping, Sequence
 from typing import overload
 
-import grain.experimental as gx
 import grain.python as grain
 import numpy as np
 from grain._src.python.dataset.transformations.shuffle import _reshuffle_window, _WindowShuffleDatasetIterator
@@ -20,6 +20,15 @@ from dew.data.dataset import Ranges
 from dew.data.pipeline import Pipeline, Repeat
 from dew.data.shards import Window, passed, served
 
+
+@functools.lru_cache(maxsize=1 << 16)
+def shuffled(index: int, max_index: int, seed: int) -> int:
+    """Grain's place of `index` in its shuffle of `range(max_index + 1)` under `seed` (`index_shuffle`, four
+    rounds), each answered once a process: its cost grows as its range shrinks (13 ms a call over two
+    places, 4 us over a million), and a many-corpus mixture asks the same few of it over and over, each
+    corpus's windows and blocks alike under one seed (row 12842: 5,225 calls, 184 of them distinct, 43 of a
+    200-corpus mixture's 45 s to its first batch)."""
+    return index_shuffle.index_shuffle(index, max_index=max_index, seed=seed, rounds=4)
 
 class BlockShuffle(grain.MapDataset[Batch]):
     def __init__(self, parent: grain.MapDataset[Batch], sizes: tuple[int, ...], block: int, seed: int):
@@ -69,7 +78,7 @@ class BlockShuffle(grain.MapDataset[Batch]):
         seed = int(np.random.SeedSequence([self._seed, epoch, block]).generate_state(1)[0])
         # Grain's shuffle of an integer range, `MapDataset.range(size).shuffle(seed)`, at one index
         # of its first epoch (`ShuffleMapDataset._shuffled_index`).
-        offset = gx.index_shuffle(place, max_index=blocks.counts[block] - 1, seed=seed, rounds=4)
+        offset = shuffled(place, blocks.counts[block] - 1, seed)
         for member in members:
             if offset < self._sizes[member]:
                 return epoch * self._total + self._shards.start(member) + offset
@@ -156,8 +165,7 @@ class _WindowShuffled(_WindowShuffleDatasetIterator[Batch]):
         """The place in the served window of the record it gives `given`th: Grain's (`_reshuffle_window`'s
         list of the window's places by `index_shuffle`, given from its last), drawn alone."""
         held = self._served.held if self._served is not None else 0
-        return index_shuffle.index_shuffle(held - 1 - given, max_index=held - 1,
-                                           seed=self._global_seed + self._window_index, rounds=4)
+        return shuffled(held - 1 - given, held - 1, self._global_seed + self._window_index)
 
     def __next__(self) -> Batch:
         while True:
