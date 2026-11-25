@@ -1094,6 +1094,23 @@ def test_a_compile_only_gpu_mesh_lowers_for_cuda_unassumed():
     assert fixed.operations == 0, fixed
 
 
+def test_a_devices_lowering_platform_is_one_rule_for_concrete_and_abstract_gpus():
+    """The platform JAX lowers for on a GPU device, one rule (`programs.lowering_platform`) the count reads
+    too (`generation.lowering_platform`): a client's ROCm build's `rocm`, an abstract device's (a compile-only
+    mesh's, no client) `cuda` where it states an NVIDIA compute capability and None where it states none
+    (train 1286's review: generation's own rule read a concrete ROCm device as unnamed)."""
+    from types import SimpleNamespace
+
+    from jax._src.mesh import AbstractDevice
+
+    from dew.nn import programs
+
+    rocm = SimpleNamespace(platform="gpu", client=SimpleNamespace(platform_version="rocm 6.4.1"))
+    assert programs.lowering_platform(rocm) == "rocm"
+    assert programs.lowering_platform(AbstractDevice("NVIDIA H100", 132, "gpu", "9.0")) == "cuda"
+    assert programs.lowering_platform(AbstractDevice("a GPU", 1, "gpu")) is None
+
+
 def test_a_walks_platform_chosen_mask_is_static():
     """A walk's step reading a platform-chosen index tile (an iota or its reverse, `lax.platform_dependent`)
     times a literal: the choice is its compile's, a constant, so the multiply is of the program's constants
