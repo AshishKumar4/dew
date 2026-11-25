@@ -834,22 +834,23 @@ def test_a_walk_issuing_one_warp_a_scheduler_waits_each_instructions_dependent_l
     walk at one warp a scheduler, 4.56, and M-FS-70's KDA intra at two, 57% not issued, 4.65), so its walk
     takes its issue slots 4.6 times over, beyond its ALU's 2; twice the programs of the same work, two
     resident, issue two warps a scheduler and take the same time (M-NA-21: K64 at two resident 309 us
-    against K128 at one 346 us, the same bytes in flight). An A100's interval unmeasured, its walk is its
-    units'."""
-    hopper, ampere = generation.gpu_target("NVIDIA GH200 480GB"), generation.gpu_target("sm80")
+    against K128 at one 346 us, the same bytes in flight). An RTX 3090's interval unmeasured, its walk is
+    its units'."""
+    hopper, unmeasured = generation.gpu_target("NVIDIA GH200 480GB"), generation.gpu_target("sm86")
     program = Work(integer_operations=128 * 1000)
 
     def launched(target, count: int, resident: int, warps: float) -> float:
         work = Work(integer_operations=program.integer_operations * count, kernels=1)
         return cost.launch_seconds(work, count, target, resident=resident, warps=warps)
 
-    sms = hopper.multiprocessors
-    assert sms is not None
-    waited = 4.6 * 1000 / hopper.loaded_clock_hz + (hopper.launch_seconds or 0.0)
-    assert launched(hopper, sms, 1, 4) == pytest.approx(waited, rel=1e-12)
-    assert launched(hopper, 2 * sms, 2, 4) == pytest.approx(waited, rel=1e-12)
-    filled = ampere.multiprocessors or 1
-    assert launched(ampere, filled, 1, 4) == launched(ampere, filled, 1, 0)
+    sms, issue = hopper.multiprocessors, cost.rates(hopper, device=False).issue
+    assert sms is not None and issue is not None
+    slots, launch = program.integer_operations / issue, hopper.launch_seconds or 0.0
+    # One warp a scheduler waits the interval each instruction; two, each its half, a multiprocessor's two.
+    assert launched(hopper, sms, 1, 4) == slots * 4.6 + launch
+    assert launched(hopper, 2 * sms, 2, 4) == 2 * (slots * (4.6 / 2)) + launch
+    filled = unmeasured.multiprocessors or 1
+    assert launched(unmeasured, filled, 1, 4) == launched(unmeasured, filled, 1, 0)
 
 
 def test_a_mosaic_launch_states_the_warps_its_issue_spreads_over():
