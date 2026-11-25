@@ -27,6 +27,7 @@ from model_support import (
     attending,
     decode_logits,
     decode_steps,
+    decode_with,
     model_draw,
     with_logit_cotangent,
 )
@@ -1731,11 +1732,13 @@ def a_bf16_decoder_trains_and_serves_through_its_gpu_kernels():
       (docs/performance.md, the prefill's attention), on par with the full pass over the real tokens."""
     model = tiny(dtype=jnp.bfloat16, num_kv_heads=2, head_dim=32)
     wide = float64(model)
-    # Its batch's layout made on the host in a GPU tier prepare (`ahead_on_the_host`, rows 7858, 7859).
-    with ahead_on_the_host():
-        _, segment_ids, positions = packed_pair(jax.random.key(0))
-        cotangent = jax.random.normal(jax.random.key(1), (2, SEQ, VOCAB), jnp.float32)
-        valid = jnp.ones((2, SEQ), bool).at[0, :3].set(False)
+    # Its batch's layout and cotangent made on the host as NumPy arrays (`ahead_on_the_host(wherever=True)`):
+    # identical bits and no device sharding in the arms' statements across CPU prepare and GPU run (rows
+    # 7858, 7859, 11967).
+    with ahead_on_the_host(wherever=True):
+        _, segment_ids, positions = jax.device_get(packed_pair(jax.random.key(0)))
+        cotangent = jax.device_get(jax.random.normal(jax.random.key(1), (2, SEQ, VOCAB), jnp.float32))
+        valid = jax.device_get(jnp.ones((2, SEQ), bool).at[0, :3].set(False))
     packed = {"positions": positions, "segment_ids": segment_ids}
     prompt = 4
     made, step = decode_steps(model)
@@ -1780,7 +1783,7 @@ def a_bf16_decoder_trains_and_serves_through_its_gpu_kernels():
         gradients, logits = training(params, ids)
         return {"packed logits": logits, "packed gradients": gradients,
                 "cached prefill": step(params, made(params, ids.shape[0]), ids)[0],
-                "decode steps": decode_logits(model, params, ids[:, :prompt], ids[:, prompt:], (made, step)),
+                "decode steps": decode_with((made, step), params, ids[:, :prompt], ids[:, prompt:]),
                 "padded prefill": held(prefill(params, made(params, ids.shape[0]), ids))}
 
     assert_as_exact(ours, stepped_reference, drawn(model), "a bf16 decoder on its GPU kernels",
