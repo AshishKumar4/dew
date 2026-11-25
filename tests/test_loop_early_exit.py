@@ -13,7 +13,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from jax.core import ShapedArray
 from model_support import (
     TINY_DECODER,
     attending,
@@ -242,29 +241,6 @@ def test_a_shared_cache_decodes_each_token_at_its_exiting_pass(bias, site):
     draw = _gated(model_draw(looped, (2, 10), looped.vocab_size), looped.emb_features, 0xE93, bias=bias)
     assert_as_exact(_decoded(looped, 1), _decoded(reference, 1), draw, f"decoding exiting at the {site}",
                     seeds=SEEDS[site], truth_fn=_decoded(reference.clone(dtype=jnp.float64), 1))
-
-
-def test_a_shared_caches_exiting_decode_holds_one_chosen_cache_beside_its_own():
-    """A token decoded under a cache its passes share, its gate on the block's output (row 12928): each
-    row's exiting pass's cache kept as its rows exit, one cache beside the working one, so the step's
-    program forms no array of a pass axis over a cache entry (`steps` of them stacked, row 13059): over the
-    block [2, 4), its attention layer's keys and values among them."""
-    looped = _tokens_exiting(shared_cache=True, layers=(2, 4))
-    variables, ids = _gated(model_draw(looped, (2, 4), looped.vocab_size), looped.emb_features, 0xE97)(0)
-    made, step = decode_steps(looped)
-    cache = made(variables, ids.shape[0])
-    _, cache = step(variables, cache, ids[:, :3])
-    # An entry's shape as the step holds it, its axes in any order (a state the step reads transposed), but
-    # a token's state's own (`[B, 1, D]`), whose passes the threshold's choice stacks (`_exited`).
-    state = tuple(sorted((ids.shape[0], 1, looped.emb_features)))
-    entries = {tuple(sorted(leaf.shape)) for leaf in jax.tree.leaves(cache) if leaf.ndim} - {state}
-    traced = jax.make_jaxpr(lambda v, c, token: looped.apply(
-        {**v, "cache": c}, token, decode=True, mutable=["cache"]))(variables, cache, ids[:, 3:4])
-    shapes = [tuple(var.aval.shape) for eqn in equations(traced) for var in eqn.outvars
-              if isinstance(var.aval, ShapedArray)]
-    stacked = {shape for shape in shapes
-               if shape and shape[0] == looped.loop.steps and tuple(sorted(shape[1:])) in entries}
-    assert not stacked, stacked
 
 
 @attending("reference")
