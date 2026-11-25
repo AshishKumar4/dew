@@ -414,7 +414,7 @@ class Fitted(Residuals):
 model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=1, mlp_features=8,
                           max_seq_len=8)
 lm = LMObjective(model, 4)
-criterion = Supervised(model, lambda outputs, batch: outputs.sum())
+criterion = Supervised(model, lambda outputs, batch: outputs.sum(), inputs="text")
 whole = [whole_digest()]
 print(json.dumps({"lm": _code(lm, lm.program_key(), None),
                   "opaque": [_code(Fitted(), (), None) == whole,
