@@ -682,6 +682,20 @@ def test_a_launch_lowered_once_keeps_its_program_only_for_a_hook_it_may_hold(mad
         assert (kept() is not None) == cached
 
 
+def test_a_held_launch_binds_the_constants_its_trace_hoisted():
+    """A launch whose trace holds a constant array (a scalar it makes of a static, which JAX hoists out of the
+    traced program as arguments ahead of its operands) runs from its held trace (`tuning.lowered_once`) as it
+    traced, its constants bound first, the second call too: its held program ran with its operands alone and
+    raised (an sm120 attention training step, Main's G4 run, "foreach() argument 2 is shorter")."""
+    @tuning.lowered_once(("scale",))
+    def launch(x, *, scale):
+        return x * jnp.asarray(scale, jnp.float32) + jnp.asarray(1.0, jnp.float32)
+
+    x = jnp.arange(4.0)
+    for _ in range(2):
+        assert jnp.array_equal(jax.jit(functools.partial(launch, scale=3.0))(x), 3 * x + 1)
+
+
 def _halved_score(scores):
     """A module's score hook (the prepared-hook witness's)."""
     return scores * 0.5 + 1.0
