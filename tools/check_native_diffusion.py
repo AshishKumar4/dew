@@ -271,20 +271,21 @@ def train_and_reload(task, source, reference, key, given, noise):
         return value.total / value.mass
     value, grads = jax.jit(jax.value_and_grad(loss))(variables["params"])
     updated = jax.tree.map(lambda p, g: p - 1e-3 * g, variables["params"], grads)
-    after = loss(updated)
+    after = jax.jit(loss)(updated)
     assert float(after) < float(value), (value, after)
     trained = {**variables, "params": updated}
     with tempfile.TemporaryDirectory(prefix="dew-native-reload-") as saved:
         source.save(saved, variables=trained)
         restored = bundle(saved)
-        before = source.model.apply(trained, noise, jnp.asarray([10]), **given)
-        loaded = restored.model.apply(restored.variables, noise, jnp.asarray([10]), **given)
+        # Each through one compiled program, not op by op (row 7004).
+        before = jax.jit(source.model.apply)(trained, noise, jnp.asarray([10]), **given)
+        loaded = jax.jit(restored.model.apply)(restored.variables, noise, jnp.asarray([10]), **given)
         np.testing.assert_array_equal(loaded, before)
         diffusers_reads(task, source.source, saved, restored.model, restored.variables, noise, given)
         if restored.autoencoder is None or source.autoencoder is None:
             raise ValueError(f"the {task} pipeline holds no autoencoder")
-        np.testing.assert_array_equal(restored.autoencoder.decode(restored.variables["autoencoder"], noise),
-                                      source.autoencoder.decode(trained["autoencoder"], noise))
+        np.testing.assert_array_equal(jax.jit(restored.autoencoder.decode)(restored.variables["autoencoder"], noise),
+                                      jax.jit(source.autoencoder.decode)(trained["autoencoder"], noise))
         if source.finish is not None:
             if restored.finish is None:
                 raise ValueError(f"the {task} pipeline lost its safety checker on reload")
