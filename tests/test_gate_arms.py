@@ -216,7 +216,7 @@ def test_a_written_twin_of_a_cublas_reference_keeps_its_compiler_options():
     let XLA's Triton GEMM take it as a split-K fusion (rows 12983, 12984). An arm of no options of its own
     compiles as written alone."""
     import generation_support
-    from arm_arithmetic import as_written
+    from arm_arithmetic import Unrewritten, Written, as_written
     from arm_forms import _Paired, _written_twin, own_options, with_own_options
     from arm_store import _arm_compile
     from jax.sharding import NamedSharding, PartitionSpec
@@ -230,10 +230,13 @@ def test_a_written_twin_of_a_cublas_reference_keeps_its_compiler_options():
     shapes = (jax.ShapeDtypeStruct((256, 128), jnp.float8_e4m3fn),
               jax.ShapeDtypeStruct((128, 256), jnp.float8_e4m3fn))
     reference = without_ynn(fp8_dot, compiler_options=generation_support.CUBLAS)
-    twin = _written_twin(jax.jit(fp8_dot), reference)
-    live = twin.without.wrapped if isinstance(twin, _Paired) else twin.wrapped
-    plain = _written_twin(jax.jit(fp8_dot), jax.jit(fp8_dot))
-    plain_live = plain.without.wrapped if isinstance(plain, _Paired) else plain.wrapped
+    def written(twin) -> Written:
+        held = twin.without if isinstance(twin, _Paired) else twin
+        assert isinstance(held, Unrewritten) and isinstance(held.wrapped, Written), held
+        return held.wrapped
+
+    live = written(_written_twin(jax.jit(fp8_dot), reference))
+    plain_live = written(_written_twin(jax.jit(fp8_dot), jax.jit(fp8_dot)))
     assert own_options(jax.jit(fp8_dot)) is None
 
     mesh = _device("sm90")

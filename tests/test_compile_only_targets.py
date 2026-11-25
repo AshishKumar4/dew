@@ -68,7 +68,7 @@ def test_a_compile_only_hopper_lowers_fp8_dots_to_cublaslt_as_its_host_gpu_does(
     (`compile_only_gpus`) and for a GH200 host's own serialized topology (`host_gpus`), lower their FP8 dots
     to cuBLASLt's FP8 target (`__cublas$lt$matmul$f8`) with no FP16 widening and no XLA dot: XLA's
     `GemmRewriter` requires CUDA runtime >= 12.0.0 (`device_description.runtime_version`), and a compile-only
-    Hopper stating none (`0.0.0`) widened both FP8 operands to fp16 and ran `__cublas$lt$matmul`, 2331x–3112x
+    Hopper stating none (`0.0.0`) widened both FP8 operands to fp16 and ran `__cublas$lt$matmul`, 2331x-3112x
     more exact than Hopper's FP8 WGMMA accumulator (rows 12983, 12984)."""
     import base64
     from pathlib import Path

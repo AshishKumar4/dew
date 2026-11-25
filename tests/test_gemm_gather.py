@@ -978,6 +978,7 @@ def test_a_refused_gathered_tile_still_offers_its_ladders_next_rung():
     [ba] = [bound for _, bound in launches.taken if bound.arguments.get("paired") is not None
             and not bound.arguments.get("trans_rhs")]
     op = ba.op
+    assert isinstance(op, grouped_matmul.MosaicGmm), op
     with generation.assumed("sm90"), report.refusals():
         target = generation.gpu_target()
         tile = op.derived(ba, target)
