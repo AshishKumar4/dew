@@ -72,6 +72,7 @@ from ..protocols import (
 )
 from ..residuals import ATTENTION_RESIDUALS, MLP_RESIDUALS, QKV_RESIDUALS, RESIDUALS, Residual, recomputing
 from ..sharding import RESIDUAL, constrain, declared
+from ..short_conv_site import ShortConvSite
 
 if TYPE_CHECKING:
     from .causal_transformer import CausalTransformer
@@ -771,6 +772,7 @@ class DecoderBlock(nn.Module):
     residual_multiplier: float = 1.0  # each sublayer's output scaled before it joins the residual
     residual_site: ResidualSite | None = None  # Kimi K3's place in the depth mixture
     depth_sites: bool = False  # each mixer input site its own depth query and norm (`LayerKind`)
+    feedforward_conv: int | None = None  # taps of a short convolution over its feed-forward output
     cross_pass: CrossPass | None = None
     """The messages a looped pass merges into the block's sublayer inputs (`Loop.messages`): a merge for
     each of its mixer's input sites and its feed-forward's (`CrossPassMerge`), which a call reads given the
@@ -1012,6 +1014,11 @@ class DecoderBlock(nn.Module):
         self.dropout = Dropout(rate=self.dropout_rate)
         if self.cross_pass is not None:
             self.cross_pass_merges = self._cross_pass_merges(self.cross_pass)
+        if self.feedforward_conv is not None:
+            if self.feedforward is None:
+                raise ValueError("a feed-forward's convolution convolves its output: the layer has none")
+            self.mlp_conv = ShortConvSite(self.emb_features, self.feedforward_conv, dtype=self.dtype,
+                                          name='mlp_conv')
 
     def _depth_reads(self, residual_site: ResidualSite, norm: Callable[..., nn.Module]):
         """The layer's depth mixtures over Kimi K3's blocks (`residual_site`): its attention's, each of its
@@ -1067,7 +1074,8 @@ class DecoderBlock(nn.Module):
         out."""
         holders = {'self_attn': self.self_attn,
                    **({'engram': self.engram_layer} if self.engram is not None else {}),
-                   **({CROSS_ATTENTION: self.cross_attention} if self.cross is not None else {})}
+                   **({CROSS_ATTENTION: self.cross_attention} if self.cross is not None else {}),
+                   **({'mlp_conv': self.mlp_conv} if self.feedforward_conv is not None else {})}
         held = {name: cache_of(holder, rows) for name, holder in holders.items()}
         return {name: spec for name, spec in held.items() if spec}
 
@@ -1224,6 +1232,9 @@ class DecoderBlock(nn.Module):
                                      and self.mlp.reads_train else {}))
                 if self.parallel is not None:
                     hidden = self.moe(read, hidden, **routes)
+            if self.feedforward_conv is not None:
+                # Convolved over the call's tokens behind its own history, before it joins the residual.
+                hidden = self.mlp_conv(hidden, MixerCall(attention_metadata, decode))
             if self.wiring.output_norms:
                 hidden = residual_normed(self.mlp_output_norm, hidden)
             mlp_branch = self._branch(hidden, train, "mlp")

@@ -11,6 +11,7 @@ from reference_error import assert_as_exact
 
 from dew.batch import coordinates
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.inputs import AttentionMetadata, MixerCall
 from dew.nn.mixers import AttentionMixer
 from dew.nn.short_conv_site import ShortConvs, ShortConvSite
@@ -92,10 +93,13 @@ def test_a_sites_history_carries_its_rows_real_inputs_alone(dynamic):
 
 @pytest.mark.parametrize("dynamic", [False, True], ids=["static", "dynamic"])
 def test_a_layer_with_short_convolutions_decodes_as_it_prefills(dynamic):
-    """A decoder whose attention convolves its keys, values and output, decoded a token at a time after a
-    prompt of five, on par with its prefill over every token (check 1 against it in float64)."""
+    """A decoder whose attention convolves its keys, values and output and whose blocks convolve their
+    feed-forward's output (`LayerKind.feedforward_conv`), decoded a token at a time after a prompt of five,
+    on par with its prefill over every token (check 1 against it in float64)."""
     model = CausalTransformer(**{**TINY_DECODER, "vocab_size": 64, "num_kv_heads": 2, "dtype": "float32",
-                                 "mixer": AttentionMixer(short_convs=ShortConvs(KERNEL, dynamic=dynamic))})
+                                 "mixer": AttentionMixer(short_convs=ShortConvs(KERNEL, dynamic=dynamic)),
+                                 "layer_types": ("full_attention",) * TINY_DECODER["num_layers"],
+                                 "kinds": {"full_attention": LayerKind(feedforward_conv=KERNEL)}})
     made, step = decode_steps(model)
 
     def decoded(variables, ids):
