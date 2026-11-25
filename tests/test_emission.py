@@ -770,6 +770,20 @@ def test_a_conditionals_arms_invariants_count_as_one_arm_runs():
     assert fixed.integer_multiply_adds == 128, fixed
 
 
+def test_a_conditionals_arm_issues_its_static_and_its_other_work_together():
+    """A conditional its data decides, one arm adding `iota * 3` (a multiply, a conversion and an add, the
+    first two static), the other three adds: either arm issues 384 slots, so the conditional does, its static
+    work under the arms' envelope with the rest (the review of lane/toolkit f7b349470: 640, one arm's static
+    work beside the other's adds)."""
+    def body(row):
+        indices = lax.iota(jnp.int32, 128)
+        return lax.cond(row[0] > 0, lambda row: row + (indices * 3).astype(jnp.float32),
+                        lambda row: ((row + 1.0) + 2.0) + 3.0, row)
+
+    fixed = _emitted(body, _ROW).roles[0].fixed
+    assert cost.issued(fixed) == 3 * 128, fixed
+
+
 def test_an_invariant_only_odd_steps_reach_counts_once():
     """A walk whose odd steps alone add `iota // 16` (iotas and literals) computes it once: the loop's odd
     trip finds it, its work the program's whatever trips the loop keeps (the review of lane/toolkit
@@ -907,33 +921,45 @@ def test_a_walk_issuing_one_warp_a_scheduler_waits_each_instructions_dependent_l
     assert launched(unmeasured, filled, 1, 4) == launched(unmeasured, filled, 1, 0)
 
 
-def test_a_mosaic_launch_states_the_warps_its_issue_spreads_over():
-    """A Mosaic GPU kernel's issuing warps (`emission.warps_of`): each walking warpgroup's four, weighted by
-    its walk's issue slots against its busiest's: two warpgroups walking alike 8, one walking beside one that
-    does not 4, the other's sliver of issues (its guard's) hiding no interval."""
-    def walked(both: bool):
-        def body(x_ref, o_ref):
+def test_a_walks_issue_latency_follows_the_warps_its_steps_spread_over():
+    """A GH200 program of two warpgroups walking a row doubled a step, its trips its data's (a while
+    loop's), one program a multiprocessor (`emission.warps_of`, `cost.latency_bound`): one warpgroup walking
+    S steps beside an idle one issues over 4 warps; two walking S steps each (S twice over, every consumer's
+    steps stated, `cost.Stated.steps`) over 8, each warp's chain the same, so the same latency bound; two
+    splitting S over 8, each chain half, half the bound."""
+    target = generation.gpu_target("NVIDIA GH200 480GB")
+    rates = cost.rates(target, device=False)
+    row = jax.ShapeDtypeStruct((128,), jnp.float32)
+    trips = jax.ShapeDtypeStruct((1,), jnp.int32)
+
+    def priced(*, both: bool, steps: int) -> tuple[float, float]:
+        def body(trips_ref, x_ref, o_ref):
             def step(index, row):
                 mosaic.step_index(index)
                 return row * 2.0
 
             def walk():
-                o_ref[...] = lax.fori_loop(0, 8, step, x_ref[...])
+                o_ref[...] = lax.fori_loop(0, trips_ref[0], step, x_ref[...])
 
             if both:
                 walk()
             else:
                 pl.when(lax.axis_index("wg") == 0)(walk)
 
-        return plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((128,), jnp.float32), num_threads=2,
-                            thread_name="wg")
-
-    row = jax.ShapeDtypeStruct((128,), jnp.float32)
-    for both, warps in ((True, 8), (False, 4)):
-        traced = jax.make_jaxpr(emission.costed(walked(both), Stated(steps=16, bytes_accessed=0)))(row)
+        launch = plgpu.kernel(body, out_type=row, num_threads=2, thread_name="wg")
+        traced = jax.make_jaxpr(emission.costed(launch, Stated(steps=steps, bytes_accessed=0)))(trips, row)
         (kernel,) = [equation for equation in programs.equations(traced.jaxpr)
                      if "cost_estimate" in equation.params]
-        assert emission.warps_of(kernel) == warps, (both, emission.warps_of(kernel))
+        warps = emission.warps_of(kernel)
+        work = emission.work_of(kernel)
+        assert warps is not None and work is not None
+        return warps, cost.latency_bound(work, rates, target, held=warps)
+
+    one, alone = priced(both=False, steps=64)
+    both, twice = priced(both=True, steps=128)
+    split, halved = priced(both=True, steps=64)
+    assert (one, both, split) == (4, 8, 8), (one, both, split)
+    assert twice == alone and 2 * halved == alone > 0, (alone, twice, halved)
 
 
 def test_a_programs_launches_price_in_sequence_and_an_uncounted_one_leaves_it_unknown():
