@@ -331,12 +331,14 @@ def test_a_forms_inline_block_compiles_for_an_h100(form):
     assert not (failed := mosaic_failures(compile_mosaic_kernels([case], "sm90"))), failed
 
 
-@pytest.mark.parametrize("generation", ["sm80", "sm90", "sm100", "sm120"])
+@pytest.mark.parametrize("generation", ["sm90", "sm100", "sm120"])
 def test_a_saturating_narrowing_compiles_and_counts_a_conversion_a_pair(generation):
     """An fp32 tile narrowed to bf16 saturating (`inline_forms.satfinite_bf16`, PTX's
     `cvt.rn.satfinite.bf16x2.f32` a register pair: a staged operand's parts, `Family.formed`) in the
-    family's register layout compiles for each GPU on any host, and its kernel counts one conversion a pair
-    and no clamp, where the clip it stands for issued two an element."""
+    family's register layout compiles for each GPU with a tensor memory accelerator on any host, its tile
+    landed by one, and its kernel counts one conversion a pair and no clamp, where the clip it stands for
+    issued two an element. An A100's compiles in Kimi delta attention's intra walk (the recurrence gate's
+    sm80 cells), whose stores land through its threads."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
