@@ -77,18 +77,24 @@ def _operation_work(primitive, inputs, outputs, params, on: generation.GpuTarget
     return emission.operation_work(primitive, inputs, outputs, params, on)
 
 
-def _priced(primitive, params, shapes: list[tuple[int, ...]], made: tuple[int, ...]) -> Work:
-    """An equation's arithmetic as the kernels' counter prices its primitive (`_operation_work`), its
-    operands of `shapes` and the value it makes of `made` at `VALUE`."""
-    return _operation_work(primitive, [jax.ShapeDtypeStruct(known, VALUE) for known in shapes],
-                           [jax.ShapeDtypeStruct(made, VALUE)], params)
+def _priced(primitive, params, shapes: list[tuple[int, ...]], made: tuple[int, ...],
+            on: generation.GpuTarget | None = None, dtype=None) -> Work:
+    """An equation's arithmetic as the kernels' counter prices its primitive (`_operation_work`) on `on`, its
+    operands of `shapes` and the value it makes of `made` at `VALUE`; a division at its term's `dtype` where
+    traced (an fp32 one's price is its own, `emission.IEEE_DIVISION`; another width's and an integer's not),
+    a rewrite's, which no trace typed, at `VALUE` as every other term."""
+    held = dtype if primitive is jax.lax.div_p and dtype is not None else VALUE
+    return _operation_work(primitive, [jax.ShapeDtypeStruct(known, held) for known in shapes],
+                           [jax.ShapeDtypeStruct(made, held)], params, on)
 
 
-def _elementwise(graph: EGraph, primitive, params, operands, held: dict | None) -> Work:
-    """An elementwise node's arithmetic (`_priced`), its result its operands' shapes broadcast; nothing where
-    one is unknown."""
+def _elementwise(graph: EGraph, primitive, params, operands, held: dict | None,
+                 on: generation.GpuTarget | None = None, dtype=None) -> Work:
+    """An elementwise node's arithmetic (`_priced` on `on`, a division at `dtype`), its result its operands'
+    shapes broadcast; nothing where one is unknown."""
     shapes = _shapes(graph, operands, held)
-    return Work() if shapes is None else _priced(primitive, params, shapes, np.broadcast_shapes(*shapes))
+    return (Work() if shapes is None
+            else _priced(primitive, params, shapes, np.broadcast_shapes(*shapes), on, dtype))
 
 
 def _product(left: tuple[int, ...], right: tuple[int, ...], params, product) -> tuple[Work, int]:
@@ -108,7 +114,8 @@ def _product(left: tuple[int, ...], right: tuple[int, ...], params, product) -> 
     return done, math.prod(extents)
 
 
-def work(graph: EGraph, node, region: Region, held: dict | None = None) -> Work:
+def work(graph: EGraph, node, region: Region, held: dict | None = None,
+         on: generation.GpuTarget | None = None) -> Work:
     """`node`'s work alone (the cost vocabulary, the module's account): its arithmetic the kernels' counter's
     for its primitive (`_operation_work`, the one rule: a product's FLOPs in its mode and passes, a
     reduction's operations an operand element, a special function's exponentials and a conversion's
@@ -126,7 +133,8 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None) -> Work:
     (`Work.kept_bytes`, a TPU's VMEM traffic, row 7283): a leaf's bytes read once into the vector registers,
     a reduction's and a product's result written once and read once by its reader (a product's at its
     result's dtype, a reduction's at a vector lane's four bytes an element, as the e-graph holds no dtype),
-    and elementwise work fused into a kernel none, its values in the registers."""
+    and elementwise work fused into a kernel none, its values in the registers. Priced on `on` (the
+    schedule's target), else the process's."""
     if (args := get_callable_args(node, Term.leaf)) is not None:
         # The leaf's own shape from its region (a callback may read no table at a node it was not given).
         leaf = key(Term.leaf(args[0]))
@@ -140,7 +148,7 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None) -> Work:
             return read
         equation = outside.equation
         return read + _operation_work(equation.primitive, [atom.aval for atom in equation.invars],
-                                      [variable.aval for variable in equation.outvars], equation.params)
+                                      [variable.aval for variable in equation.outvars], equation.params, on)
     if (args := get_callable_args(node, Term.reduce)) is not None:
         operand = shape_of(graph, args[0], held)
         if operand is None:
@@ -148,7 +156,7 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None) -> Work:
         primitive, params = region.params[integer(args[3])]
         # Its value: its operand's unreduced extents (an empty reduction's too).
         unreduced = tuple(size for axis, size in enumerate(operand) if axis not in params["axes"])
-        return (_priced(primitive, params, [operand], unreduced)
+        return (_priced(primitive, params, [operand], unreduced, on)
                 + Work(kernels=1.0, kept_bytes=kept(math.prod(unreduced))))
     if (args := get_callable_args(node, Term.dot)) is not None:
         left, right = (shape_of(graph, operand, held) for operand in args[:2])
@@ -170,16 +178,17 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None) -> Work:
         return Work()
     # Each other elementwise operation by its primitive, its parameters' entry (`Region.params`); a
     # selection's and a clamp's their own. A layout change computes nothing.
+    typed = region.dtypes.get(key(node))
     if (args := get_callable_args(node, Term.unary)) is not None:
-        return _elementwise(graph, *region.params[integer(args[2])], args[:1], held)
+        return _elementwise(graph, *region.params[integer(args[2])], args[:1], held, on, typed)
     if (args := get_callable_args(node, Term.convert)) is not None:
-        return _elementwise(graph, *region.params[integer(args[1])], args[:1], held)
+        return _elementwise(graph, *region.params[integer(args[1])], args[:1], held, on, typed)
     for constructor in (Term.binary, Term.compare):
         if (args := get_callable_args(node, constructor)) is not None:
-            return _elementwise(graph, *region.params[integer(args[3])], (args[0], args[2]), held)
+            return _elementwise(graph, *region.params[integer(args[3])], (args[0], args[2]), held, on, typed)
     for constructor, primitive in ((Term.select, jax.lax.select_n_p), (Term.clamp, jax.lax.clamp_p)):
         if (args := get_callable_args(node, constructor)) is not None:
-            return _elementwise(graph, primitive, {}, args[:3], held)
+            return _elementwise(graph, primitive, {}, args[:3], held, on)
     return Work()
 
 
@@ -259,7 +268,10 @@ class Schedule(Protocol):
     """A schedule (the module's account): the seconds it gives a work, the larger of its `pieces` and its
     span's (`spanned`), each piece linear in the work, which extraction sums node by node (`extract.Level`);
     what tells two works of one time apart, linear too; and the work it gives no time, at a rate its target
-    states none of (`templates.cost.units`)."""
+    states none of (`templates.cost.units`). Its `facts`, the target it prices on, a node's work's too
+    (`model`)."""
+
+    facts: generation.GpuTarget
 
     def pieces(self, done: Work) -> tuple[float, ...]: ...
 
@@ -358,7 +370,7 @@ def model(region: Region, schedule: Schedule) -> DagCostModel[Seconds]:
     held: dict = {}
 
     def marginal(graph: EGraph, node) -> Seconds:
-        return Seconds(work(graph, node, region, held), schedule)
+        return Seconds(work(graph, node, region, held, schedule.facts), schedule)
 
     return DagCostModel(marginal_cost=marginal, identity=Seconds(Work(), schedule))
 
@@ -378,7 +390,7 @@ def stable(region: Region, schedule: Schedule) -> DagCostModel[Seconds]:
     held: dict = {}
 
     def marginal(graph: EGraph, node) -> Seconds:
-        done = work(graph, node, region, held)
+        done = work(graph, node, region, held, schedule.facts)
         for constructor in (Term.unary, Term.binary):
             if (args := get_callable_args(node, constructor)) is not None:
                 # Each operation's name follows its first operand; a fused multiply-add's is its primitive's.
