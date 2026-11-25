@@ -149,6 +149,29 @@ def test_a_recycled_rows_last_process_that_reports_none_of_the_tests_left_is_red
     assert row["exitCode"] != 0
 
 
+def test_a_recycled_rows_last_process_that_reports_only_some_of_the_tests_left_is_red(
+        ci, tmp_path, monkeypatch):
+    """A dry prepare's row whose first process recycled after test_a, its last dropping test_c from its
+    collection unreported (no deselection), running and reporting test_b alone and exiting 0, is red: the last
+    report must hold every test its collection selected, the tests left."""
+    written(tmp_path, {"test_short.py": "def test_a():\n    pass\ndef test_b():\n    pass\n"
+                                        "def test_c():\n    pass\n"})
+    conftest = tmp_path / "tests" / "conftest.py"
+    conftest.write_text((conftest.read_text() if conftest.is_file() else "")
+                        + "\nimport os\n\n\ndef pytest_collection_modifyitems(items):\n"
+                          "    if os.environ.get('DEW_CONTINUES_ROW'):\n"
+                          "        items[:] = [item for item in items if not item.name.endswith('_c')]\n")
+    interpreter(tmp_path, "3.12")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ARMADA_ARTIFACTS", str(tmp_path / "artifacts"))
+    out = tmp_path / "verdict.json"
+    # Recycled after test_a alone: a bound only the first process passes.
+    ci.tested("3.12", ["tests/test_short.py"], "", out, 600.0, "off", 5.0, "", {}, recorded=False,
+              recycle_at=1)
+    [row] = json.loads(out.read_text())["rows"]
+    assert row["exitCode"] != 0
+
+
 def test_a_report_its_killed_pytest_cut_short_greens_nothing_and_the_tasks_other_files_are_graded(
         ci, tmp_path, monkeypatch):
     """A file whose pytest left its JUnit report and its collection's record cut short (killed as it wrote

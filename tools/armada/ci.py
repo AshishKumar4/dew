@@ -1501,6 +1501,16 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         red, failed, cause = grading.graded(name, own, terminal, counts.get(grading.owning(name), {}),
                                             reported, returncode, deadline if expired else None,
                                             running, pid.is_file(), running)
+        if segments > 1:
+            # Run past a recycle: its last process must report every test it selected, the tests left, as its
+            # collection counted them (executed.py): one that dropped some unreported is no whole run of them.
+            counted = counts.get(grading.owning(name))
+            left = counted["collected"] - counted["deselected"] if counted else None
+            reported_left = len({grading.node_of(case) for case in own if case.get("classname")})
+            if left is None or reported_left < left:
+                red.append(f"its last process reported {reported_left} of the "
+                           f"{left if left is not None else 'uncounted'} tests it selected, the tests left "
+                           "after its row recycled")
         if before := [case for case in earlier if grading.of(case, name)]:
             # Its earlier processes each reported, recycled (`tested`'s loop): their failures are its too,
             # and their cases its tests, timings and cells beside the last's.
