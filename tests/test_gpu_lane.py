@@ -428,8 +428,8 @@ def test_a_dry_prepare_is_past_its_memory_cap_where_a_limit_binding_its_task_is_
     membership = tmp_path / "cgroup"
     membership.write_text(cgroup_tree(root, levels))
     reader = ci.host.cgroups()
-    real_own = reader.own
-    monkeypatch.setattr(reader, "own", lambda root: real_own(root, membership))
+    real_limits = reader.memory_limits
+    monkeypatch.setattr(reader, "memory_limits", lambda root: real_limits(root, membership))
     monkeypatch.setenv("DEW_CGROUP_ROOT", str(root))
     seen = []
 
@@ -445,6 +445,28 @@ def test_a_dry_prepare_is_past_its_memory_cap_where_a_limit_binding_its_task_is_
     for limit in root.rglob("memory.max"):
         limit.unlink()
     assert part == "" and tier_wire.past_cap({tier_wire.PREPARE_HOLDS: dry}) is past
+
+
+def test_a_v1_groups_working_set_past_its_limits_share_is_past_its_prepares_cap(ci, tmp_path, monkeypatch):
+    """A dry prepare's cap of a v1 group (prepares.py's `held_caps`: `HELD_SHARE` of its memory controller's
+    `memory.limit_in_bytes`) is judged by what the group holds (tests/tier_wire.py's `past_cap`): its
+    `memory.usage_in_bytes` less the inactive page cache under it (`memory.stat`'s `total_inactive_file`),
+    8,000 of a 7,500 cap, where a v1 group's charge read as none passed every cap (row 13035)."""
+    membership = tmp_path / "cgroup"
+    membership.write_text("5:memory:/job\n")
+    job = tmp_path / "memory/job"
+    job.mkdir(parents=True)
+    (job / "memory.limit_in_bytes").write_text("10000\n")
+    (job / "memory.usage_in_bytes").write_text("9000\n")
+    # The group's own inactive cache, beside the hierarchy's its usage counts.
+    (job / "memory.stat").write_text("inactive_file 4000\ntotal_inactive_file 1000\n")
+    reader = ci.host.cgroups()
+    real_limits = reader.memory_limits
+    monkeypatch.setattr(reader, "memory_limits", lambda root: real_limits(root, membership))
+    monkeypatch.setenv("DEW_CGROUP_ROOT", str(tmp_path))
+    caps = ci.prepares.held_caps(ci)
+    assert json.loads(caps) == [[str(job), 7500]]
+    assert tier_wire.past_cap({tier_wire.PREPARE_HOLDS: caps})
 
 
 def test_the_plan_prepares_each_gpu_tier_file_dry_for_each_generation(ci, tmp_path):

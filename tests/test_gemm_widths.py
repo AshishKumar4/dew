@@ -14,6 +14,7 @@ from generation_support import INTERPRETS
 
 from dew.nn.kernels import gemm, generation, grouped_matmul
 from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing
+from dew.nn.kernels.templates.hooks import Hook, Side
 
 WIDTHS = [(96, 100), (200, 72)]
 """Depths and widths no tile of any family divides: on a TMA family 96 x 100's depth runs partial and its
@@ -66,8 +67,8 @@ def test_a_tma_family_runs_a_partial_step_and_column_tile_where_its_rows_are_who
 
     def product(x, w, weight, bias):
         return gemm.gemm(x, w, jnp.asarray([1024] * 4, jnp.int32), transpose_rhs=True, out_dtype=jnp.float32,
-                         prologue=normed, prologue_operands=((weight, ("depth",)),),
-                         epilogue=biased, epilogue_operands=((bias, ("columns",)),))
+                         prologue=Hook(normed, (Side(weight, ("depth",)),)),
+                         epilogue=Hook(biased, (Side(bias, ("columns",)),)))
 
     specs = (jax.ShapeDtypeStruct((4096, 200), jnp.bfloat16),
              jax.ShapeDtypeStruct((4, 136, 200), jnp.bfloat16),

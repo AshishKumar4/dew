@@ -17,6 +17,7 @@ from reference_error import with_gradients
 from dew.algebra import bits
 from dew.nn.kernels import formats, gemm, generation, projections
 from dew.nn.kernels.templates.gemm import quantized
+from dew.nn.kernels.templates.hooks import Hook, Side
 
 
 def _swiglu(gate, up):
@@ -187,7 +188,7 @@ def test_nvfp4_codes_stored_two_a_byte_read_back_as_their_float4_codes():
     blocks = jnp.asarray([1], jnp.int32)
     with pytest.raises(ValueError):
         gemm.nvfp4_block_finished(want, formats.NvFp4Block.quantized(x[None]), blocks,
-                                  epilogue=lambda acc: (acc, acc), out_dtypes=(jnp.float32, jnp.int16),
+                                  epilogue=Hook(lambda acc: (acc, acc)), out_dtypes=(jnp.float32, jnp.int16),
                                   out_forms=(None, quantized.Form(2, packed=True)), dense=True)
 
 
@@ -200,8 +201,9 @@ def _finished_up_projection():
             rows = formats.NvFp4Block.quantized(x, jnp.float32(2.0 ** -6))
             return gemm.nvfp4_block_finished(
                 rows, formats.NvFp4Block.quantized(w_up), jnp.asarray([8], jnp.int32),
-                epilogue=quantized.nvfp4_epilogue(_swiglu, jnp.bfloat16),
-                out_dtypes=(jnp.bfloat16, jnp.uint8, jnp.float8_e4m3fn), epilogue_operands=(gate,),
+                epilogue=Hook(quantized.nvfp4_epilogue(_swiglu, jnp.bfloat16),
+                              (Side(gate, ("rows", "columns")),)),
+                out_dtypes=(jnp.bfloat16, jnp.uint8, jnp.float8_e4m3fn),
                 epilogue_scalars=(jnp.float32(2.0 ** -9),), dense=True,
                 out_forms=(None, quantized.Form(2, packed=True), quantized.Form(16, transposed=True)))
 

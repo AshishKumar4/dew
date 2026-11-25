@@ -81,13 +81,14 @@ def _shapes(graph: EGraph, operands, held: dict | None) -> list[tuple[int, ...]]
     return known if len(known) == len(shapes) else None
 
 
-def _operation_work(primitive, inputs, outputs, params, on: generation.GpuTarget | None = None) -> Work:
+def _operation_work(primitive, inputs, outputs, params, on: generation.GpuTarget | None = None,
+                    fp32: bool | None = None) -> Work:
     """`emission.operation_work`, the kernels' counter's one rule, imported where a price first asks: the
     emission's module loads the templates' resources, which no process reading the algebra alone imports (the
     test cache keys a row on each module it loads)."""
     from dew.nn.kernels.templates import emission
 
-    return emission.operation_work(primitive, inputs, outputs, params, on)
+    return emission.operation_work(primitive, inputs, outputs, params, on, fp32=fp32)
 
 
 def _priced(primitive, params, shapes: list[tuple[int, ...]], made: tuple[int, ...],
@@ -232,8 +233,12 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None,
         return Work()
     # Each other elementwise operation by its primitive, its parameters' entry (`Region.params`); a
     # selection's and a clamp's their own. A layout change computes nothing.
+    # Proven fp32 where the region's program holds fp32 values alone, unproven otherwise (an e-graph's node
+    # names no dtype; `Region.dtypes` its traced terms'): a division, a special function and a power priced
+    # at their measured forms only where proven.
+    fp32 = region.single_float32
     if (args := get_callable_args(node, Term.unary)) is not None:
-        return _elementwise(graph, *region.params[integer(args[2])], args[:1], held, on)
+        return _elementwise(graph, *region.params[integer(args[2])], args[:1], held, on, fp32)
     if (args := get_callable_args(node, Term.convert)) is not None:
         return _elementwise(graph, *region.params[integer(args[1])], args[:1], held, on)
     for constructor in (Term.binary, Term.compare):

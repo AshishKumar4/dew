@@ -29,6 +29,7 @@ from dew.nn.kernels.templates import (
     attention_portable,
     attention_triton,
 )
+from dew.nn.kernels.templates.hooks import Hook, Side
 from dew.parity import FEWEST_SEEDS
 
 ON_GPU = not interprets()
@@ -105,12 +106,12 @@ def hooks_for(names: tuple[str, ...], queries: int, value_width: int, gate=None)
 
     scoring = "softcap" in names or "alibi" in names
     return template.Hooks(
-        score_mod if scoring else None,
-        (template.Param(slopes, template.Kind.HEAD),) if "alibi" in names else (),
-        template.sinks(jnp.asarray(SINKS, jnp.float32), ROWS, queries, value_width) if "sinks" in names
-        else None,
-        output_mod if "gate" in names else None,
-        (template.Param(jnp.asarray(gate), template.Kind.OUTPUT),) if "gate" in names else ())
+        score=Hook(score_mod if scoring else None,
+                   (Side(slopes, template.Kind.HEAD),) if "alibi" in names else ()),
+        initial=(template.sinks(jnp.asarray(SINKS, jnp.float32), ROWS, queries, value_width)
+                 if "sinks" in names else None),
+        output=Hook(output_mod if "gate" in names else None,
+                    (Side(jnp.asarray(gate), template.Kind.OUTPUT),) if "gate" in names else ()))
 
 
 HOOKS = {"none": (), "softcap": ("softcap",), "sinks": ("sinks",),
@@ -166,7 +167,7 @@ def check_each(case: dict, names: tuple[str, ...], dtype, configs, *, residuals:
     def ours(query, key, value):
         spans, hooks = setup()
         spec = algebra.Forward(spans.form, keys, ids=spans.query_ids is not None, scale=scale,
-                               score_mod=hooks.score_mod, natural=natural, initial=hooks.initial is not None,
+                               score_mod=hooks.score.fn, natural=natural, initial=hooks.initial is not None,
                                prescale=power)
         return {str(config): at(config, query, key, value, spans, hooks, spec) for config in configs}
 
@@ -421,8 +422,8 @@ def check_backward_each(case: dict, names: tuple, dtype, configs, *, width: int 
         return query, key, value, dout.astype(dtype), *draw_hooks(seed)
 
     def hooked(params, initial):
-        return template.Hooks(score_mod, tuple(template.Param(value, kind)
-                                               for value, kind in zip(params, kinds, strict=True)), initial)
+        sides = tuple(Side(value, kind) for value, kind in zip(params, kinds, strict=True))
+        return template.Hooks(score=Hook(score_mod, sides), initial=initial)
 
     def at(config, dkv_config, spans, query, key, value, dout, params, initial):
         if mainloop == "portable":
@@ -479,7 +480,7 @@ def test_a_wide_parameter_computes_as_its_fp32_value_and_its_gradient_returns_wi
         slope = slopes.astype(jnp.float64) if wide else slopes
         with tuning.pinned({attention_triton.TritonBackward: joint(PINNED[0])}):
             grads = attention_triton.backward(query, key, value, spans,
-                                              template.Hooks(score_mod, (template.Param(slope, kinds[0]),)),
+                                              template.Hooks(score=Hook(score_mod, (Side(slope, kinds[0]),))),
                                               dout, interpret=not ON_GPU)
         return grads.score_params[0], grads.query
 
@@ -492,7 +493,7 @@ def test_a_wide_parameter_computes_as_its_fp32_value_and_its_gradient_returns_wi
         spans = template.spans(queries, keys, ROWS, **arguments(case))
         def attend(q, sl):
             return template.reference(q, key, value, spans,
-                                      template.Hooks(score_mod, (template.Param(sl, kinds[0]),)))
+                                      template.Hooks(score=Hook(score_mod, (Side(sl, kinds[0]),))))
         _, pull = jax.vjp(attend, query, slopes)
         dq, dsl = pull(dout)
         return dsl, dq, dsl, dq
@@ -530,7 +531,7 @@ def test_an_integer_parameter_keys_and_runs():
     def setup():
         spans = template.spans(queries, keys, ROWS, **arguments(case))
         buckets = jnp.broadcast_to(jnp.arange(keys, dtype=jnp.int32), (ROWS, 4, keys))
-        return spans, template.Hooks(bucketed, (template.Param(buckets, template.Kind.KEY),))
+        return spans, template.Hooks(score=Hook(bucketed, (Side(buckets, template.Kind.KEY),)))
 
     def ours(query, key, value, dout):
         spans, hooks = setup()
@@ -592,7 +593,7 @@ def test_an_output_hook_of_the_call_s_own_width_keys_and_runs():
     def output_mod(o):
         return o * jnp.arange(32, dtype=o.dtype)
 
-    hooks = template.Hooks(output_mod=output_mod)
+    hooks = template.Hooks(output=Hook(output_mod))
     pins = {attention_triton.TritonForward: PINNED[1]}
 
     def ours(query, key, value):
@@ -855,7 +856,7 @@ def _staged_launches(generation_name: str, dtype, width: int, hooks: tuple, conf
     params, initial = jax.eval_shape(lambda: draw(0))
 
     def hooked(params, initial):
-        return template.Hooks(score_mod, tuple(map(template.Param, params, kinds)), initial)
+        return template.Hooks(score=Hook(score_mod, tuple(map(Side, params, kinds))), initial=initial)
 
     if step:
         def call(query, key, value, dout, params, initial):
@@ -1068,8 +1069,8 @@ def test_a_hook_through_a_custom_vjp_lowers_and_compiles_on_tritons_compiler(tar
     from kernel_compile import compile_kernels, failures
 
     spans = template.spans(256, 256, 1, causal=True)
-    score = template.Hooks(score_mod=lambda s, q_pos, k_pos: custom_softcap(s))
-    hooks = template.Hooks(score_mod=score.score_mod, output_mod=custom_softcap)
+    score = template.Hooks(score=Hook(lambda s, q_pos, k_pos: custom_softcap(s)))
+    hooks = template.Hooks(score=score.score, output=Hook(custom_softcap))
     shape = jax.ShapeDtypeStruct((1, 256, 2, 64), jnp.float32)
     pins = {attention_triton.TritonForward: PINNED[0], attention_triton.TritonBackward: joint(PINNED[0])}
 
@@ -1323,8 +1324,9 @@ def test_triton_arms_state_without_device_bound_arrays():
 
         def backward_arm(query, key, value, dout, params, initial, _mod=score_mod, _kinds=kinds):
             spans = template.spans(queries, keys, ROWS, **arguments(case))
-            hooks = template.Hooks(_mod, tuple(template.Param(val, kind)
-                                               for val, kind in zip(params, _kinds, strict=True)), initial)
+            hooks = template.Hooks(score=Hook(_mod, tuple(Side(val, kind)
+                                                          for val, kind in zip(params, _kinds, strict=True))),
+                                   initial=initial)
             return attention_triton.backward(query, key, value, spans, hooks, dout, interpret=not ON_GPU)
 
         for arm in (forward_arm, backward_arm):

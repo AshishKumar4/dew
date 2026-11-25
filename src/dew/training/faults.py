@@ -55,14 +55,23 @@ def recording(directory: str | None):
     """The process's fault handler writing to its record in the run directory `directory` for the block,
     to standard error again after it: re-pointed, nothing installed, the handler the process's from here
     on where nothing made it so before (`owned`: no JAX read). None where the handler is another owner's,
-    or the run keeps no directory on this host's file system (no checkpoints, or a bucket's)."""
+    the run keeps no directory on this host's file system (no checkpoints, or a bucket's), or its record
+    cannot be made there, which a warning names; an error of the block is the block's own."""
     owned()
     if (stream := _OWNED[0]) is None or directory is None or "://" in directory:
         yield None
         return
     path = record_path(directory)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as record:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        record = path.open("a")
+    except OSError as error:
+        # A run directory it cannot keep a record in (a regular file named as its directory beside the
+        # checkpoints, a read-only mount): the fit runs, its faults on standard error (row 13017).
+        _log.warning("no fault record at %s (%s): a fatal signal's stacks go to standard error", path, error)
+        yield None
+        return
+    with record:
         faulthandler.enable(record, all_threads=True)
         try:
             yield path

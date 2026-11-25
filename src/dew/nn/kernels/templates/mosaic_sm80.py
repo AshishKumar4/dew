@@ -273,6 +273,12 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
     """A consumer's shared-memory tile its register left operands relay through where its warps split their
     columns (`relaying`, `relay_bytes`)."""
 
+    def published(self) -> None:
+        """Nothing to publish: its products read shared memory through ldmatrix, the warpgroup's own loads,
+        which the stores' barriers order, on any movement (cp.async's, TMA rings a consumer or a producer
+        fills); an async proxy's fence would order no reader (a Kimi intra walk's three a step on a GH200,
+        M-JS-272)."""
+
     row_bound: Any = None
     """The tile's rows its products issue before, an int32 (`bounded`): each warp's 16-row blocks at or past
     it issue none, its accumulator's rows kept; None issues every row. Its identity's: a family bounded at
@@ -1113,11 +1119,6 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
             view[...] = view[...] + value
         else:
             plgpu.atomic_add(view, value, optimized=False)
-
-    def published(self) -> None:
-        # Its products read shared memory through ldmatrix, the warpgroup's own loads, which the store's
-        # automatic barriers order.
-        pass
 
 
 
