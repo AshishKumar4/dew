@@ -485,6 +485,21 @@ def test_an_own_score_past_fp32s_range_reads_as_it_is():
     assert np.isfinite(np.asarray(final)).all()
 
 
+def faint_read(length: int, width: int) -> tuple:
+    """A read erase's operands past its keys' range but its queries' and keys': token 1 reads `2^100` along
+    channel 0, which its decay takes by `2^-60`, token 0 writes `2^60` to value column 0, the first two
+    tokens' write gates one: `(reads, values, write gates, log decays)` fp32."""
+    reads = np.zeros((1, length, 1, width), np.float32)
+    reads[0, 1, 0, 0] = 2.0 ** 100
+    values = np.zeros_like(reads)
+    values[0, 0, 0, 0] = 2.0 ** 60
+    beta = np.zeros((1, length, 1), np.float32)
+    beta[0, :2] = 1.0
+    decay = np.zeros_like(reads)
+    decay[0, 1, 0, 0] = -60 * np.log(2.0)
+    return reads, values, beta, decay
+
+
 def test_a_read_past_its_keys_range_keeps_its_faint_decayed_pair():
     """A delta rule erasing along reads of its own under a decay a key dimension, its keys and queries unit
     and its write gates at most one (`Hooks(l2norm=True, write_bound=1)`), keeps a pair whose read restores
@@ -501,14 +516,7 @@ def test_a_read_past_its_keys_range_keeps_its_faint_decayed_pair():
     keys[0, 1, 0] = unit[2]
     queries = np.tile(unit[3], (1, length, 1, 1))
     queries[0, 1, 0] = unit[2]
-    reads = np.zeros_like(keys)
-    reads[0, 1, 0, 0] = 2.0 ** 100
-    values = np.zeros((1, length, 1, width), np.float32)
-    values[0, 0, 0, 0] = 2.0 ** 60
-    beta = np.zeros((1, length, 1), np.float32)
-    beta[0, :2] = 1.0
-    decay = np.zeros((1, length, 1, width), np.float32)
-    decay[0, 1, 0, 0] = -60 * np.log(2.0)
+    reads, values, beta, decay = faint_read(length, width)
     operands = Chunk(*(jnp.asarray(x, jnp.bfloat16) for x in (queries, keys, values)),
                      log_decay=jnp.asarray(decay), beta=jnp.asarray(beta, jnp.bfloat16),
                      erase_read=jnp.asarray(reads, jnp.bfloat16))
@@ -534,14 +542,7 @@ def test_a_read_past_its_keys_range_keeps_its_faint_decayed_pairs_gradient():
     keys[0, 0, 0], keys[0, 1, 0] = unit[1], unit[2]
     queries = np.zeros_like(keys)
     queries[0, 1, 0] = unit[2]
-    reads = np.zeros_like(keys)
-    reads[0, 1, 0, 0] = 2.0 ** 100
-    values = np.zeros((1, length, 1, width), np.float32)
-    values[0, 0, 0, 0] = 2.0 ** 60
-    beta = np.zeros((1, length, 1), np.float32)
-    beta[0, :2] = 1.0
-    decay = np.zeros((1, length, 1, width), np.float32)
-    decay[0, 1, 0, 0] = -60 * np.log(2.0)
+    reads, values, beta, decay = faint_read(length, width)
     d_out = jnp.zeros((1, length, 1, width), jnp.bfloat16).at[0, 1, 0, 0].set(1.0)
 
     def out(q, k, v, r):
