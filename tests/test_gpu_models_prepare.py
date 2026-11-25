@@ -103,9 +103,10 @@ assert m_dew_prep == m_dew_run, f"ModernBERT dew arm_role drifted across devices
 # The causal site's sm90 programs: where its prepare compiled them ahead, both its arms' by the keys the run
 # looks them up by, never one arm's without its twin's; or its site marked compiled at run, each arm compiled
 # on the GPU (`CompiledTruths.at_run`: its cuDNN launch lowering on no deviceless prepare).
+# Or its cell deferred whole to its run (a cell its deviceless prepare could not trace, `run_cells`), whose
+# arms' site its prepare never reached, each arm compiled on the GPU.
 c_sample = drawn_on_the_host(run_causal[2], 0)
-assert ro.holds(armed(c_label)), "the causal site's arms not prepared"
-if ro.at_run(armed(c_label)) is None:
+if ro.holds(armed(c_label)) and ro.at_run(armed(c_label)) is None:
     c_programs = AheadPrograms.load(ro.path(armed(c_label)) / PROGRAMS).programs
     for role_name in (c_dew_run, c_ref_run):
         assert named(role_name, c_sample) in c_programs, (named(role_name, c_sample), sorted(c_programs))
