@@ -164,12 +164,12 @@ def sixteen_bit_forward(seed):
     return sixteen_bit_read_erase(seed)[:-1]
 
 
-def but_beta(fn):
-    """`with_gradients(fn)` for `fn(query, key, value, log_decay, beta, state, reads)`, its write gates closed
-    over: every input's gradient but theirs."""
+def but_state(fn):
+    """`with_gradients(fn)` for `fn(query, key, value, log_decay, beta, state, reads)`, its entering memory
+    closed over: every input's gradient but its."""
     def run(query, key, value, log_decay, beta, state, reads, cotangent):
-        out, pull = jax.vjp(lambda q, k, v, g, s, r: fn(q, k, v, g, beta, s, r), query, key, value, log_decay,
-                            state, reads)
+        out, pull = jax.vjp(lambda q, k, v, g, b, r: fn(q, k, v, g, b, state, r), query, key, value, log_decay,
+                            beta, reads)
         return out, *pull(cotangent)
     return run
 
@@ -502,15 +502,15 @@ def test_the_rule_runs_in_a_shard_map_that_checks_varying_axes():
 
 
 KEY_DECAY_CASES = {
-    'head decays': (but_beta(with_key_decays), but_beta(read_erased_forward), but_beta(read_erased),
+    'head decays': (but_state(with_key_decays), but_state(read_erased_forward), but_state(read_erased),
                     sixteen_bit_read_erase),
     'along its keys': (with_gradients(along_its_keys), with_gradients(kimis),
                        with_gradients(recurrence_along_its_keys), key_decayed_along_its_keys),
 }
 """The template's read erase under a decay a key dimension (PKDA's), its reference and truth (its
 recurrence a token at a time in float64) and draw: each key's decay the head's against the same call under
-that decay a head, every leaf but the write gates' gradient; each key its own decay, reading along its keys,
-against Kimi's delta attention, every leaf."""
+that decay a head, every leaf but the entering memory's gradient; each key its own decay, reading along its
+keys, against Kimi's delta attention, every leaf."""
 
 
 @pytest.mark.parametrize('case', KEY_DECAY_CASES)
@@ -522,10 +522,9 @@ def test_a_key_decays_read_erase_on_the_template_is_as_exact_as_its_reference(ca
     with a reference (check 1): 'head decays', each key's decay the head's, against the same call under that
     decay a head, whose read erase check 1 holds to the recurrence at the accurate forms: a system whose rows
     and columns trade the reads and the keys, weights formed from the keys, or a gradient landing on the
-    other, lands far past it; every leaf but the write gates' gradient, which a decay a key dimension's
-    backward sums from three launches' parts where a decay a head's sums two, 1.87 times the latter's
-    distance on Kimi's delta attention itself against the gated delta net (scratch jsf-beta2, no read
-    erase). 'along its keys', each key its own decay, reading along its keys, against Kimi's delta attention
+    other, lands far past it; every leaf but the entering memory's gradient, which a decay a key
+    dimension's reverse walk forms 1.87 times as far from float64 as a decay a head's on Kimi's delta
+    attention itself against the gated delta net (scratch jsf-beta2, no read erase: check 1's leaf `[6]`). 'along its keys', each key its own decay, reading along its keys, against Kimi's delta attention
     on the template, every leaf, the keys' gradient its reads' and its own summed, which check 1 holds to
     fla's recorded sites (`test_recurrence_mosaic_gradient`): a read's decay taken from another key's, or a
     term lost between the reads' gradient and the keys', moves it far past. fla's recorded PKDA sites hold
