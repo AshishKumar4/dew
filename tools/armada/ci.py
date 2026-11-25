@@ -1502,9 +1502,10 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                                             reported, returncode, deadline if expired else None,
                                             running, pid.is_file(), running)
         if before := [case for case in earlier if grading.of(case, name)]:
-            # Its earlier processes each reported, recycled (`tested`'s loop): their failures are its too.
+            # Its earlier processes each reported, recycled (`tested`'s loop): their failures are its too,
+            # and their cases its tests, timings and cells beside the last's.
             red_before, failed_before, _ = grading.graded(name, before, earlier, {}, True, 0, None, None)
-            red, failed = red_before + red, failed_before + failed
+            red, failed, own = red_before + red, failed_before + failed, before + own
         # A file that never started in a task that ran out of time has no seconds (`deadline_shares`): its
         # row is `unobserved`, and armada weighs no plan by it.
         unobserved = name not in shares
