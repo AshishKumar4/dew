@@ -55,8 +55,8 @@ from dew.nn.derivatives import (
     with_gradients_formed,
 )
 from dew.nn.kernels import generation, grouped_matmul, selection, xla_products
-from dew.nn.kernels.gemm_xla import XlaConfig, as_tuple, direct_dtype, side_rows, xla_mainloop
 from dew.nn.kernels.formats import MxFp8, NvFp4, NvFp4Block, TernaryWeights
+from dew.nn.kernels.gemm_xla import XlaConfig, as_tuple, direct_dtype, side_rows, xla_mainloop
 from dew.nn.kernels.templates import product as product_of
 from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import epilogue_vjp, rows_permuted, scattered, tiling

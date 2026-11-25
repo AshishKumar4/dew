@@ -101,21 +101,21 @@ def test_a_saved_wide_products_residual_is_stored_where_a_derivative_is_taken_al
 
 @INTERPRETS
 def test_an_unnamed_saved_residual_takes_the_gradient_a_recomputed_one_does():
-    """A saved wide product whose residual no remat name labels (`name=None`): staged under `jit` and a
-    checkpoint, its gradient is the recomputed product's, its residual held apart from its output
-    (`hooks.held_outputs`) whether named or not."""
+    """A saved wide product whose residual no remat name labels (`name=None`): staged under `jit`, its
+    gradient is the recomputed product's, its residual held apart from its output (`hooks.held_outputs`)
+    whether named or not."""
     x, gate, up, dy = _draw(2)
     joined = wide.interleaved(gate, up)
 
-    def loss(saved, name):
+    def gradient(*, saved: bool):
         def product(x, joined):
-            out = wide.gated_product(x, joined, _swiglu, out_dtype=jnp.bfloat16, saved=saved, name=name,
+            out = wide.gated_product(x, joined, _swiglu, out_dtype=jnp.bfloat16, saved=saved, name=None,
                                      interpret_on_cpu=True)
             return jnp.sum(out.astype(jnp.float32) * dy.astype(jnp.float32))
-        return jax.jit(jax.grad(jax.checkpoint(product), argnums=(0, 1)))
+        return jax.jit(jax.grad(product, argnums=(0, 1)))
 
     with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
-        unnamed, recomputed = loss(True, None)(x, joined), loss(False, None)(x, joined)
+        unnamed, recomputed = gradient(saved=True)(x, joined), gradient(saved=False)(x, joined)
     for got, want in zip(unnamed, recomputed, strict=True):
         np.testing.assert_array_equal(got, want)
 

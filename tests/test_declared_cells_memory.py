@@ -160,6 +160,16 @@ def _cublas_dtypes(compiled) -> list[str]:
             if "cublas" in instruction.target]
 
 
+def _dot_dtypes(lowered) -> list[str]:
+    """The result element type of each dot of `lowered`'s program, read from its operations."""
+    from jax.extend.mlir import ir
+
+    from dew.nn.kernels.lowered import read_operations
+
+    return read_operations(lowered, lambda operation: str(ir.RankedTensorType(
+        operation.results[0].type).element_type) if operation.name == "stablehlo.dot_general" else None)
+
+
 def test_a_primal_dense_bf16_xla_fallback_stores_bf16_as_xlas_own_dot_does():
     """A dense bf16 product the template leaves to XLA, lowered for an H100 with no derivative taken
     (`gemm_xla.direct_dtype`, row 12898): its cuBLAS product stores bfloat16, as XLA's own dense dot (Dense's)
@@ -183,7 +193,8 @@ def test_a_primal_dense_bf16_xla_fallback_stores_bf16_as_xlas_own_dot_does():
     with generation.chosen(grouped_matmul="xla"):
         assert set(stored(product, x, w)) == {"bf16"}
         assert set(stored(gradient, x, x)) == {"bf16"}
-        assert set(stored(product, one_row, w)) == {"f32"}
+        # A one-row product XLA reduces as a vector: its dot's own dtype, not cuBLAS's store.
+        assert set(_dot_dtypes(lowered_for(product, (one_row, w), "sm90"))) == {"f32"}
         with jax.default_matmul_precision("F32_F32_F32"):
             assert set(stored(gradient, x, x)) == {"f32"}
     devices = generation.compile_only_gpus("sm90", 2, 2**36)
