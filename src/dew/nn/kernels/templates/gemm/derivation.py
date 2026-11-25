@@ -203,8 +203,8 @@ def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], sha
     """`derived`'s tile at a width: the rows its registers or VMEM hold there (`held_rows`), shortened where
     its stages do not fit, at the first step that plans busy, taking the least-priced busy tile under the
     shared cost model (`_tile_cost`), and whether it stages deep enough to stay busy (those its family loads
-    ahead, beside the one consumed and those it keeps in flight); a ring its consumers feed at that least
-    depth deepened where a smaller staging of its outputs leaves room (`_ring_staged`)."""
+    ahead, beside the one consumed and those it keeps in flight); a ring short of that depth, or one its
+    consumers feed at it, deepened where a smaller staging of its outputs leaves room (`_ring_staged`)."""
     family = layouts[0]
     busy = 1 + family.loads_ahead + family.in_flight
     fallback = None
@@ -223,7 +223,10 @@ def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], sha
             if not candidate(tile):
                 # A tile a compile of this process found spilling (`report.refused`) gives way to the next.
                 continue
-            if tile.stages == busy and layout.feeds_itself and outputs:
+            if outputs and (tile.stages < busy or (tile.stages == busy and layout.feeds_itself)):
+                # A ring short of busy (a hooked epilogue's outputs and side tiles beside it: the paired
+                # backward's pulled launch, three outputs and two sides, row 1958), or one its consumers
+                # feed at its least busy depth, deepened by a smaller staging of its outputs.
                 tile = _ring_staged(tile, layout, outputs, candidate=candidate, launch_of=launch_of,
                                     target=target, programs=programs)
             if tile.stages >= busy:
@@ -241,8 +244,9 @@ def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], sha
 
 def _ring_staged(tile: Tiles, layout: mosaic.Family, outputs: tuple, *, candidate: Callable,
                  launch_of: Callable, target, programs: int) -> Tiles:
-    """`tile`, whose ring its consumers feed (`mosaic.Transport.feeds_itself`) at its least busy depth, with
-    its outputs (`outputs`, their dtypes) staged in smaller buffers where that leaves the ring deeper: of
+    """`tile`, whose ring is short of busy or its consumers feed (`mosaic.Transport.feeds_itself`) at its least
+    busy depth, with its outputs (`outputs`, their dtypes) staged in smaller buffers where that leaves the
+    ring deeper: of
     the stagings at the widest output's unstated chunk (`stores.output_staging`) and its halvings, in one
     buffer or two, legal for the tile's issuer as the tile specializes it and each output
     (`Tiles.staging_refusal`: whole accumulator atoms, whole TMA rows) and its buffers
