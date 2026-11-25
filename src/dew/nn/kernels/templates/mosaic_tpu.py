@@ -366,7 +366,8 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
             total *= extent
 
         def run(*staging):
-            def store(output, value, ref, place):
+            def store(output, value, ref, place, within=None):
+                del within  # each tile stored whole, its stores no chunks' (`stores_chunks` off)
                 # A DMA's HBM rows start at whole tiles of the layout (`copies_tiled_rows`): a tile's rows of
                 # the output stored as a whole window of them, read back first and its rows outside
                 # `first`'s `stored` kept (another group's); a window past the output's last row shifted

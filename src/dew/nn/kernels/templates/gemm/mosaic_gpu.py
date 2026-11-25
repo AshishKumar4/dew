@@ -80,7 +80,7 @@ from dew.nn.kernels.templates.gemm import (
     sides_padded,
 )
 from dew.nn.kernels.templates.gemm.chained import Chained, Partition, flag_row, flags_declared, guarded_walk
-from dew.nn.kernels.templates.gemm.hooks import ReadOut, read_out
+from dew.nn.kernels.templates.gemm.hooks import NO_READ_OUT, read_out
 from dew.nn.kernels.templates.gemm.pricing import (
     dense_tail,
     family_of,
@@ -531,7 +531,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                                 packed_format=packed_format, forms=forms)
     bounded = None if when is None else chained  # each product its own accumulator (`guarded_walk`)
     matrices, streamed, accumulators = _gmm_streamed(paired, scales, joined, bounded)
-    reading = read_out(family, part, dtypes, forms, tiles.staging, accumulators, *hooks[2:], sides[1])
+    reading = read_out(family, part, dtypes, forms, tiles.staging, accumulators, hooks[2], hooks[3], sides[1])
     # A pair's tiles: g groups' boundaries, and the unrouted rows.
     grid = (pl.cdiv(m, block_m * pair) + (0 if dense else g), pl.cdiv(n, block_n))
     def body(*gmems):
@@ -770,7 +770,7 @@ def _declared(lhs, rhs, gather, shape: tuple[int, int, int | None], splits: int,
 
 def _gmm_finished(accs: tuple, tile: tuple, wg, store, *, family: mosaic.Family, part: tuple, share_row,
                   m: int, g: int, dense: bool, row_tile: int, epilogue, o_gmems: tuple, sides: tuple,
-                  partials, flags: tuple = (None, 1, 1), whole: bool = False, reading=ReadOut()) -> None:
+                  partials, flags: tuple = (None, 1, 1), whole: bool = False, reading=NO_READ_OUT) -> None:
     """Dew: a consumer's share of a `gmm` tile stored (`_finished`) from its accumulators: at once, or,
     a balanced tail's tile (`partials`: its workspace and readiness flags), once its program's partial and
     the other programs' are added (`mosaic.Family.fixed_up`); with `flags` (`chained.flags_declared`'s, the
@@ -874,7 +874,7 @@ def _fixed_loaded(family: mosaic.Family, prologue_gmems, prologue_axes: tuple, f
 
 
 def _finished(*accs, family: mosaic.Family, wg, epilogue, o_gmems: tuple, store, sides: tuple, origins: dict,
-              group, place: tuple, nonfinite=None, reading=ReadOut()) -> None:
+              group, place: tuple, nonfinite=None, reading=NO_READ_OUT) -> None:
     """Dew: a consumer's share of a `gmm` tile from its accumulators (`accs`), read out a chunk of columns
     at a time (`mosaic.Issuer.chunks`: all of them at once where its registers hold them): its epilogue on
     its side tiles' same columns (`sides`, each its global ref, axes, staging and barrier, loaded at

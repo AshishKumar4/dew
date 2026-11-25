@@ -153,17 +153,15 @@ alone (`column_local`)."""
 
 
 def _traced(hook, accumulators: int, sides: tuple, rows: int, columns: int):
-    """`hook` traced on `[rows, columns]` accumulators and its side tiles (`sides`, each its axes and dtype)
-    as an epilogue takes them (`axes.by_rows`: along rows or groups, `rows`; along columns, `columns`), None
-    where a side's axes name another extent or the hook does not trace."""
+    """`hook` traced as a launch's body traces it (`launches.tracing_body`) on `[rows, columns]`
+    accumulators and its side tiles (`sides`, each its axes and dtype) as an epilogue takes them
+    (`axes.by_rows`: along rows or groups, `rows`; along columns, `columns`)."""
     extents = {'rows': rows, 'groups': rows, 'columns': columns}
-    try:
+    with launches.tracing_body(interpret=False):
         return jax.make_jaxpr(hook)(
             *(jax.ShapeDtypeStruct((rows, columns), jnp.float32),) * accumulators,
             *(jax.ShapeDtypeStruct(tuple(extents[axis] for axis in side_axes), dtype)
               for side_axes, dtype in sides))
-    except (KeyError, TypeError, ValueError):
-        return None
 
 
 def _entrywise(jaxpr, rows: int, columns: int) -> bool:
@@ -209,7 +207,8 @@ def _same(first, second) -> bool:
                 if not all(_same(a, b) for a, b in zip(inner, jax_core.jaxprs_in_params({name: twin}),
                                                        strict=True)):
                     return False
-            elif value != twin:
+            elif value != twin and not (callable(value) and callable(twin)):
+                # A rule's callables (a custom derivative's) are each trace's own, of one source.
                 return False
         for a, b in zip(one.invars, other.invars, strict=True):
             literal = isinstance(a, jax_core.Literal)
@@ -225,12 +224,14 @@ def column_local(hook, accumulators: int, sides: tuple, rows: int, columns: int,
     `chunk` columns at a time (`pricing.hook_chunk`): traced at a probe's extents its every equation
     entrywise (`_entrywise`: none reduces, gathers, reverses or numbers the columns), and traced at the
     tile's and the chunk's widths alike (`_same`: none reads its width). A hook subtracting its rows'
-    maxima, or scaling by its tile's width, is not; one whose constants do not trace is not."""
-    probe = _traced(hook, accumulators, sides, PROBE_ROWS, PROBE_COLUMNS)
-    whole = _traced(hook, accumulators, sides, rows, columns)
-    part = _traced(hook, accumulators, sides, rows, chunk)
-    if probe is None or whole is None or part is None or any(
-            np.ndim(const) for const in (*probe.consts, *whole.consts, *part.consts)):
+    maxima, or scaling by its tile's width, is not; nor one that traces at none of those extents."""
+    try:
+        probe, whole, part = (_traced(hook, accumulators, sides, *extents)
+                              for extents in ((PROBE_ROWS, PROBE_COLUMNS), (rows, columns), (rows, chunk)))
+    except (KeyError, TypeError, ValueError):
+        # A side along another axis, or a hook of fixed extents (a block-scaled one's), takes its tile whole.
+        return False
+    if any(np.ndim(const) for const in (*probe.consts, *whole.consts, *part.consts)):
         return False
     return (_entrywise(probe.jaxpr, PROBE_ROWS, PROBE_COLUMNS) and _same(probe.jaxpr, whole.jaxpr)
             and _same(whole.jaxpr, part.jaxpr)
@@ -244,6 +245,10 @@ class ReadOut(NamedTuple):
 
     narrowed: tuple = ()
     columns: int | None = None
+
+
+NO_READ_OUT = ReadOut()
+"""A launch's read-out where its caller states none: no output narrowed, its issuer's own chunks."""
 
 
 def read_out(family, part: tuple[int, int], dtypes: tuple, forms: tuple, staging, accumulators: int,
