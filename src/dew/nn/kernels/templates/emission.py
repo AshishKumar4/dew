@@ -269,7 +269,8 @@ kinds (`_kind`: fp32, bf16, a 16-bit float, an 8-bit float, an integer), from sm
 `cvt.rn.f16x2.f32`, `cvt.rn.satfinite.e4m3x2.f32`); a bf16 widened by its bits, a PRMT and an IMAD.U32 a
 pair; an fp16 by an HADD2.F32 an element; an e4m3 unpacked to fp16 pairs (F2FP.UNPACK_B) and widened alike;
 an fp32 to an int32 an F2I beside its saturating clamp's two FMNMX; an int32 to an fp32 an I2FP; a bf16 to
-an fp16 through fp32. Any other pair a conversion an element, unmeasured."""
+an fp16 through fp32. One to its own dtype nothing, anywhere (FS-CONV-SASS2); any other pair a
+conversion an element, unmeasured."""
 
 TRITON_FORMS: Mapping = {**{function: Work(exponentials=1) for function in APPROXIMATED},
                          precision.correctly_rounded_divide_p: Work(exponentials=1, operations=6)}
@@ -1152,6 +1153,9 @@ def operation_work(primitive, inputs: Sequence, outputs: Sequence, params: Mappi
         return Work(unpriced_operations=elements) if form is None else repeated(form, elements)
     if primitive is lax.convert_element_type_p:
         elements = sum(_elements(aval) for aval in outputs)
+        if inputs[0].dtype == outputs[0].dtype:
+            # Its own dtype (a weak type made strong): no instruction (FS-CONV-SASS2's fp32 to fp32).
+            return Work()
         if forms in (APPROXIMATE_FORMS, ACCURATE_FORMS):
             form = CONVERSION_FORMS.get((_kind(inputs[0].dtype), _kind(outputs[0].dtype)))
             if form is not None:

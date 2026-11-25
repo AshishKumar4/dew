@@ -915,22 +915,25 @@ def _read_twice(product, z):
     (jnp.float8_e4m3fn, jnp.float32, Work(conversions=64, operations=128)),
     (jnp.float32, jnp.int32, Work(conversions=128, operations=256)),
     (jnp.int32, jnp.float32, Work(conversions=128)),
-    (jnp.bfloat16, jnp.float16, Work(integer_operations=128, conversions=64))],
+    (jnp.bfloat16, jnp.float16, Work(integer_operations=128, conversions=64)),
+    (jnp.float32, jnp.float32, Work())],
     ids=["f32-bf16", "f32-f16", "f32-e4m3", "bf16-f32", "f16-f32", "e4m3-f32", "f32-s32", "s32-f32",
-         "bf16-f16"])
+         "bf16-f16", "f32-f32"])
 def test_a_kernels_conversion_issues_as_its_assembler_lowers_it(source, target, expected):
     """A Mosaic GPU kernel's element type conversion issues what sm90's SASS of one issues, 128 elements
     (FS-CONV-SASS1): a narrowing to a 16- or 8-bit float one packed pair's F2FP, half a conversion an element;
     a bf16 widened by its bits (a PRMT and an IMAD.U32 a pair), an fp16 by an HADD2.F32 an element, an e4m3
     unpacked to fp16 pairs and widened alike; an fp32 to an int32 an F2I beside its saturating clamp's two
-    FMNMX; an int32 to an fp32 an I2FP. XLA's conversions, unmeasured, stay a conversion an element."""
+    FMNMX; an int32 to an fp32 an I2FP; one to its own dtype nothing, in a kernel or in XLA's program alike.
+    XLA's other conversions, unmeasured, stay a conversion an element."""
     row_in, row_out = jax.ShapeDtypeStruct((128,), source), jax.ShapeDtypeStruct((128,), target)
     params = {"new_dtype": target, "weak_type": False, "sharding": None}
     found = emission.operation_work(lax.convert_element_type_p, [row_in], [row_out], params,
                                     generation.gpu_target("sm90"), forms=emission.ACCURATE_FORMS)
     assert found == expected, found
+    unchanged = Work() if source == target else Work(conversions=128)
     assert emission.operation_work(lax.convert_element_type_p, [row_in], [row_out], params,
-                                   generation.gpu_target("sm90")) == Work(conversions=128)
+                                   generation.gpu_target("sm90")) == unchanged
 
 
 def test_a_correctly_rounded_division_prices_as_its_backend_lowers_it():
