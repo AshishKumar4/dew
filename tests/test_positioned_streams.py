@@ -417,3 +417,21 @@ def test_a_single_shard_store_read_by_several_shares_holds_no_cut_and_resumes_ex
         assert np.array_equal(next(iter(resumed))["id"], following["id"])
     finally:
         resumed.close()
+
+
+@pytest.mark.parametrize("places", [1, 2, 3, 7, 64])
+def test_a_streams_shards_are_dealt_in_graines_shuffled_order_every_pass(places):
+    """The shards a stream deals over its passes (`_dealt`'s `_Shuffled`) come in the order Grain's shuffle
+    gives them, place by place and pass by pass (`MapDataset.shuffle`, each pass its own seed), a slice of
+    them alike: a position saved under it names the same shards, though each place is answered once a
+    process (`shuffled`, row 12842: a many-corpus mixture asked the same few places over and over at up to
+    13 ms each)."""
+    import grain.python as grain
+
+    from dew.data.shards import _Shuffled
+
+    for seed in (0, 7, 2**32 - 1):
+        grains = grain.MapDataset.source(range(places)).shuffle(seed=seed).repeat(3)
+        dealt = _Shuffled(grain.MapDataset.source(range(places)), seed).repeat(3)
+        assert [dealt[index] for index in range(3 * places)] == [grains[index] for index in range(3 * places)]
+        assert list(dealt[1::2]) == list(grains[1::2])
