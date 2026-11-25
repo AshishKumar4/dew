@@ -199,7 +199,7 @@ def test_automatic_workers_hold_as_many_batches_ready_as_their_slowest_takes_mea
         loading = Loading(workers="auto", host=Host(2, memory, worker_start=0.0), **fields)
         resolved = loading.resolved(sampled, reads=1, batches=10**6)
         assert resolved.workers == 2
-        return resolved.ahead
+        return resolved.worker_buffer
 
     spiked = _Slowed(0.0, slow=4, slowest=0.16)
     assert ahead(spiked) == 8
