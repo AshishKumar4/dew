@@ -51,14 +51,17 @@ class CrossPass:
     """How a looped block's passes pass messages (`Loop.messages`, the module doc): the layers a bank
     summary closes (`block_size`), the controller's rank, whether the message adds a term of its own
     (`additive`), whether the depth mixture sums the summaries at unit RMS (`normalize_values`), whether
-    the message joins at the input's RMS (`scale_by_input_rms`), and the merge's norm epsilon (None: the
-    decoder's `norm_eps`)."""
+    the message joins at the input's RMS (`scale_by_input_rms`), whether the message the gain scales is
+    the depth mixture at unit RMS or as it is (`normalize_message`: the controller reads it at unit RMS
+    either way; Inkling 2's merge scales it as it is, modeling_inkling2_loop.py:79-96), and the merge's
+    norm epsilon (None: the decoder's `norm_eps`)."""
 
     block_size: int = 4
     rank: int = 64
     additive: bool = True
     normalize_values: bool = True
     scale_by_input_rms: bool = True
+    normalize_message: bool = True
     norm_eps: float | None = None
 
     def __post_init__(self):
@@ -162,12 +165,13 @@ def _merged(read: jax.Array, mixed: jax.Array, controller, spec: CrossPass, eps:
     compute = read.dtype
     wide = at_least_fp32(compute)
     u = read.astype(wide)
-    message = unweighted_rmsnorm(mixed.astype(wide), eps, implementation='xla')
+    raw = mixed.astype(wide)
+    message = unweighted_rmsnorm(raw, eps, implementation='xla')
     sigma = jnp.sqrt(jnp.mean(jnp.square(u), axis=-1, keepdims=True) + jnp.asarray(eps, wide))
     state = computed_dot(jnp.concatenate([u / sigma, message], axis=-1),
                          jnp.concatenate([input_down, message_down], axis=0), dtype=compute)
     gates = jnp.tanh(computed_dot(state, jnp.concatenate(ups, axis=1), dtype=compute))
     gain, forget, *added = jnp.split(gates, len(ups), axis=-1)
-    sent = gain * message + (added[0] if added else 0)
+    sent = gain * (message if spec.normalize_message else raw) + (added[0] if added else 0)
     kept = (1 - forget) * u
     return (kept + (sigma * sent if spec.scale_by_input_rms else sent)).astype(read.dtype)
