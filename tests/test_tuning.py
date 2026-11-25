@@ -682,18 +682,25 @@ def test_a_launch_lowered_once_keeps_its_program_only_for_a_hook_it_may_hold(mad
         assert (kept() is not None) == cached
 
 
-def test_a_held_launch_binds_the_constants_its_trace_hoisted():
-    """A launch whose trace holds a constant array (a scalar it makes of a static, which JAX hoists out of the
-    traced program as arguments ahead of its operands) runs from its held trace (`tuning.lowered_once`) as it
-    traced, its constants bound first, the second call too: its held program ran with its operands alone and
-    raised (an sm120 attention training step, Main's G4 run, "foreach() argument 2 is shorter")."""
-    @tuning.lowered_once(("scale",))
-    def launch(x, *, scale):
-        return x * jnp.asarray(scale, jnp.float32) + jnp.asarray(1.0, jnp.float32)
+def test_a_launch_whose_trace_reads_a_value_of_the_trace_around_it_runs_itself():
+    """A launch whose trace reads a value of the trace around it that is none of its operands (one its caller
+    left where the launch reads it) is no function of its key, so no trace of it is held: it runs itself, each
+    call reading its own, where its held trace ran without the value it read and raised ("foreach() argument
+    2 is shorter than argument 1": an sm120 attention training step's fused backward, Main's G4 run)."""
+    around = []
+
+    @tuning.lowered_once(())
+    def launch(x):
+        return x + around[-1]
+
+    @jax.jit
+    def step(x, y):
+        around.append(y)
+        return launch(x)
 
     x = jnp.arange(4.0)
-    for _ in range(2):
-        assert jnp.array_equal(jax.jit(functools.partial(launch, scale=3.0))(x), 3 * x + 1)
+    for y in (1.0, 2.0):
+        assert jnp.array_equal(step(x, jnp.float32(y)), x + y)
 
 
 def _halved_score(scores):
