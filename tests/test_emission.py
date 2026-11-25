@@ -1146,8 +1146,9 @@ def test_an_fp32_division_in_a_kernel_issues_a_reciprocal_and_its_refinement():
     """An fp32 division in a Mosaic GPU kernel issues a MUFU.RCP beside its refinement, never one instruction
     as a multiply does: `div.full.f32`, with `approx_math` or without, one MUFU, five FMULs and two FSETPs an
     element (ptxas 13.0's sm90 SASS, FS-DIV-SASS1 and FS-DIV-SASS5), so `a / y` prices above `a * r`, which a
-    reciprocal held already makes of it. XLA's own fp32 division, another width's (fp64's, bf16's) and a
-    TPU's, unmeasured, stay an operation an element, as an integer division does."""
+    reciprocal held already makes of it. XLA's own fp32 division is IEEE `div.rn.f32` (its PTX for a GH200,
+    M-FS-77): a MUFU.RCP beside five FFMAs and an FCHK an element on its common path. Another width's
+    (fp64's, bf16's) and a TPU's, unmeasured, stay an operation an element, as an integer division does."""
     hopper, tpu = generation.gpu_target("sm90"), generation.TARGETS["v5e"]
 
     def priced(dtype, target, forms) -> Work:
@@ -1159,7 +1160,8 @@ def test_an_fp32_division_in_a_kernel_issues_a_reciprocal_and_its_refinement():
         assert priced(jnp.float64, hopper, forms) == priced(jnp.bfloat16, hopper, forms) == Work(
             operations=128)
         assert priced(jnp.float32, tpu, forms) == Work(operations=128)
-    assert priced(jnp.float32, hopper, None) == Work(operations=128)
+    assert priced(jnp.float32, hopper, None) == Work(exponentials=128, operations=6 * 128)
+    assert priced(jnp.float32, tpu, None) == Work(operations=128)
     assert priced(jnp.int32, hopper, emission.ACCURATE_FORMS) == Work(integer_operations=128)
 
 
