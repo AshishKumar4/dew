@@ -68,14 +68,17 @@ jax/_src/pallas/mpmd.py)."""
 
 
 def lowering_platform(device) -> str | None:
-    """The platform JAX lowers a program on `device` for, its lowering rules' name: a GPU's `cuda` or
-    `rocm`, as its client's platform version states (`PjRtClient::platform_version`, a compile-only
-    target's its device kind, CUDA's), an abstract one's (a compile-only mesh's, which holds no client)
-    `cuda` where it states an NVIDIA compute capability, else None; any other device's own platform."""
+    """The platform JAX lowers a program on `device` for, its lowering rules' name: a GPU's `rocm`,
+    `oneapi` or `cuda` as its client's platform version names it (`PjRtClient::platform_version`), else
+    `cuda` where it states an NVIDIA compute capability (a compile-only target's, whose version is its
+    device kind; an abstract one's, a compile-only mesh's, which holds no client), else None; any other
+    device's own platform."""
     if device.platform != "gpu":
         return device.platform
-    if (client := getattr(device, "client", None)) is not None:
-        return "rocm" if "rocm" in str(client.platform_version).lower() else "cuda"
+    version = str(getattr(getattr(device, "client", None), "platform_version", "")).lower()
+    for platform, names in (("rocm", ("rocm",)), ("oneapi", ("oneapi", "sycl")), ("cuda", ("cuda",))):
+        if any(name in version for name in names):
+            return platform
     capability = getattr(device, "compute_capability", None)
     return "cuda" if capability and re.fullmatch(r"\d+\.\d+", str(capability)) else None
 

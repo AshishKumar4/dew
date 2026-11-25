@@ -745,7 +745,7 @@ class _Counting:
         if isinstance(layout, fragments.TiledLayout):
             threads = inline_work.WARP if self.lanes is not None else resources.THREADS
             reduced = _laid_reduction(layout, equation.invars[0].aval, equation.params["axes"], threads,
-                                      equation.primitive, generation.gpu_target())
+                                      equation.primitive, generation.lowering_capability())
             if reduced is not None:
                 return reduced
         return operation_work(equation.primitive, [variable.aval for variable in equation.invars],
@@ -1260,19 +1260,19 @@ def _computes(equation) -> tuple | None:
             *(equation.params.get(name) for name in _REDUCTION_PARAMS))
 
 
-def _redux(primitive, dtype, target: generation.GpuTarget) -> bool:
+def _redux(primitive, dtype, capability: tuple[int, int] | None) -> bool:
     """Whether Mosaic GPU lowers a reduction across all of a warp's lanes by `redux.sync`, no shuffle
     (`FragmentedArray.reduce`'s `redux_op`): a 32-bit integer's sum, maximum or minimum, and an fp32 maximum
-    or minimum on `target` a datacenter Blackwell (compute capability 10.x, which alone has the float form;
-    a Hopper's shuffles five rounds)."""
+    or minimum where the kernel lowers for compute `capability` 10.x (a datacenter Blackwell's, which alone
+    has the float form, `generation.lowering_capability`; a Hopper's shuffles five rounds)."""
     if np.dtype(dtype).itemsize == 4 and np.issubdtype(dtype, np.integer):
         return primitive in (lax.reduce_sum_p, lax.reduce_max_p, lax.reduce_min_p)
-    blackwell = (generation.capability(target.generation) or (0, 0))[0] == 10
+    blackwell = capability is not None and capability[0] == 10
     return blackwell and np.dtype(dtype) == np.float32 and primitive in (lax.reduce_max_p, lax.reduce_min_p)
 
 
 def _laid_reduction(layout: fragments.TiledLayout, value, axes: Sequence[int], threads: int,
-                    primitive, target: generation.GpuTarget) -> Work | None:
+                    primitive, capability: tuple[int, int] | None) -> Work | None:
     """A reduction of `value`, laid out as `layout`, along `axes`, as Mosaic GPU lowers it
     (`FragmentedArray.reduce`): each thread combines the values its registers hold of each output it keeps
     (a replicated layout's copies each thread's own), then
@@ -1297,7 +1297,7 @@ def _laid_reduction(layout: fragments.TiledLayout, value, axes: Sequence[int], t
     # As the lowering decides: every lane dimension one the reduction collapses (`all_lanes`).
     every_lane = all(isinstance(target, fragments.Replicated) and not isinstance(source, fragments.Replicated)
                      for source, target in zip(layout.lane_dims, reduced.lane_dims, strict=True))
-    if every_lane and _redux(primitive, value.dtype, target):
+    if every_lane and _redux(primitive, value.dtype, capability):
         return None
     rounds = int(math.log2(spread(reduced.lane_dims) // spread(layout.lane_dims)))
     # A thread's values in and out as its registers hold them (a replicated layout's every copy's).

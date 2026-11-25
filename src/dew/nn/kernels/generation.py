@@ -2143,6 +2143,17 @@ def backend() -> str:
     return generation
 
 
+def lowering_capability() -> tuple[int, int] | None:
+    """The CUDA compute capability a call's kernels lower for, as Mosaic GPU infers its architecture:
+    within a non-interpreted `assumed`, its generation's; else the placed device's (`placed_device`,
+    concrete or a compile-only mesh's abstract one), whichever backend the process opened. None off a CUDA
+    GPU, or interpreted."""
+    if (found := assumption()) is not None:
+        return None if found.interpreted else capability(found.generation)
+    device = placed_device()
+    return capability(_generation(device)) if device.platform == 'gpu' else None
+
+
 def lowering_platform() -> str | None:
     """The platform JAX lowers a call's code for, as `lax.platform_dependent` names it: within a
     non-interpreted `assumed`, its generation's (`cuda` for an `smXY`, `tpu` for a TPU's); else the placed
