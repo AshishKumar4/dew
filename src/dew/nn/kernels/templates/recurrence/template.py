@@ -164,23 +164,7 @@ def backward_holds(q, k, v, g, beta, h0=None, *, tiles: mainloop.Tiles, family: 
                     rounded=rounded, apart=apart, values_gated=values_gated, unit_pairs=unit_pairs,
                     decay_bound=decay_bound, wide=wide,
                     ranged=ranged, skip=skip, forked=_shaped(forked), reads=reads)
-    return (reads_trained(target, reads=reads is not None, per_key=g.ndim == 4)
-            and holds(both, family, generation.shared_budget(target)))
-
-
-READS_SHARED = 160 * 1024
-"""The least shared memory a block of a part whose fast backward takes a read erase under a decay a key
-dimension (`reads_trained`): sm80's 164 KB and sm90's 227 KB compile its launches clean, sm86's and
-sm120's 99 KB spill (row 12890)."""
-
-
-def reads_trained(target: generation.GpuTarget, *, reads: bool, per_key: bool) -> bool:
-    """Whether the fast backward takes a call's read erase (`reads`) on `target`, as the training selector
-    (`Mosaic.trains`) and the rule's own gradient (`backward_holds`) both read it: under a decay a head
-    always, under a decay a key dimension where a block's shared memory is `READS_SHARED`: its key memory
-    launch spills on the 99 KB parts its register model holds it on (Kimi Linear's PKDA training, sm86 and
-    sm120, 32 and 184 bytes a thread; row 12890), its gradient the portable math's there."""
-    return not (reads and per_key) or generation.shared_budget(target) >= READS_SHARED
+    return holds(both, family, generation.shared_budget(target))
 
 PLANS_KEPT = 1024
 """The plans `_planned` keeps, the least recently read given way first: a Qwen3.5-4B-width step's
@@ -997,9 +981,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         both = self.launches(ba, tiles, target, backward=True)
         family = bundle(target, _dtype(ba))
         assert family is not None
-        reads, per_key = ba.arguments.get("reads") is not None, ba.arguments["g"].ndim == 4
-        return (reads_trained(target, reads=reads, per_key=per_key)
-                and holds(both, family, generation.shared_budget(target)))
+        return holds(both, family, generation.shared_budget(target))
 
     def states_held(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget,
                     *, training: bool = False) -> int:
