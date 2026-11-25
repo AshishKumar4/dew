@@ -11,7 +11,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from kernel_compile import lowered_for
 from reference_error import ahead_arm
 
-from dew.nn import programs
+from dew.nn import precision, programs
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import cost, emission, mosaic
 from dew.nn.kernels.templates.cost import Stated, Work
@@ -904,6 +904,40 @@ def test_an_integer_multiply_counts_on_the_fma_pipe_at_its_own_rate_beside_the_f
 def _read_twice(product, z):
     """`product + z` times `product`: one multiply's output read by an add and by a multiply."""
     return (product + z) * product
+
+
+def test_a_correctly_rounded_division_prices_as_its_backend_lowers_it():
+    """A correctly rounded fp32 division (`precision.correctly_rounded_divide`) prices as each backend lowers
+    it (row 12886): in a Pallas Triton kernel, read from the launch's own compiler parameters (a
+    `CompilerParams` instance, as `pallas_call` binds it), its native `div.rn.f32`, one MUFU beside five FFMAs
+    and an FCHK an element on its common path (FS-DIV-SASS5); in a Mosaic GPU kernel and in XLA's program its
+    software division (`precision._correctly_rounded_divide`), counted through its protected and marked
+    calls: its significands' division beside the plain quotient, two of a Mosaic GPU kernel's divisions an
+    element and more, and nothing of it unpriced, where a flat count reached the plain quotient alone."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import triton as pltriton
+
+    hopper = generation.gpu_target("sm90")
+    row = jax.ShapeDtypeStruct((128,), jnp.float32)
+
+    def divided(x_ref, y_ref, o_ref):
+        o_ref[...] = precision.correctly_rounded_divide(x_ref[...], y_ref[...])
+
+    launch = pl.pallas_call(divided, out_shape=row, compiler_params=pltriton.CompilerParams())
+    traced = jax.make_jaxpr(emission.costed(launch, Stated(steps=0, bytes_accessed=0)))(row, row)
+    (kernel,) = [equation for equation in programs.equations(traced.jaxpr)
+                 if "cost_estimate" in equation.params]
+    native = emission.work_of(kernel)
+    assert native is not None
+    assert (native.exponentials, native.operations) == (128, 6 * 128), native
+
+    def software(forms) -> Work:
+        return emission.operation_work(precision.correctly_rounded_divide_p, [row, row], [row], {}, hopper,
+                                       forms=forms)
+
+    mosaic, xla = software(emission.ACCURATE_FORMS), software(None)
+    assert mosaic.unpriced_operations == xla.unpriced_operations == 0, (mosaic, xla)
+    assert mosaic.exponentials >= 2 * 128 and cost.issued(xla) > 2 * 128, (mosaic, xla)
 
 
 def test_an_fp32_division_in_a_kernel_issues_a_reciprocal_and_its_refinement():
