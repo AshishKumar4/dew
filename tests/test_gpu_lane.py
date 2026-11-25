@@ -850,7 +850,10 @@ def test_a_reused_row_is_named_the_commits_only_as_its_grade_leaves_it_green(ci,
         seen.refusing.add("-baseline/")
     row = run(exit_code)
     named = exit_code == 0 and taken
-    assert "cached" in row and first["name"] == row["name"]
+    # The second run reused the first's green record: a reuse graded green keeps it (`cached`), and one whose
+    # baseline the Worker refused stands stale in its place.
+    assert first["exitCode"] == 0 and first["name"] == row["name"]
+    assert ("cached" in row) == (exit_code != 0 or taken)
     kinds = {key.split("-")[2].split("/")[0] for key in published()}
     assert kinds == ({"baseline", "main"} if named else set())
     assert (row["exitCode"], row.get("kind")) == ((0, None) if named else

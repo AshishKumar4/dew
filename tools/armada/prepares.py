@@ -43,9 +43,10 @@ margin). Its groups are cut to its cap (`cap_after`), which holds a group howeve
 their task's 1,680 s, ran 665 to 1,650 s and set their trains' walls)."""
 CUT_SHORT = 0.75
 """The share of a dry prepare's full cap (`cap_after` of `PREPARE_WALL`) past which a timed row ran out of its
-time (`planned`): what it took is no more than a floor of its work, which counts twice. Its process may
-start a quarter of that cap late (its task's topology and baseline lookup draw on the same budget), its own
-cap that much earlier (a cold attention cut capped at 217 s, 2026-11-25)."""
+time (`planned`): what it took is no more than a floor of its work, which counts twice. A tuning heuristic,
+no bound: a process starts late where its task's topology, baseline lookup and earlier rows drew on the shared
+budget, its cap that much earlier (a cold attention cut capped at 217 s, 2026-11-25), and a row that
+completes may take past it too, counting twice all the same."""
 TOPOLOGY_SCRIPT = ("import sys; from pathlib import Path; sys.path.insert(0, 'tests'); "
                    "import generation_support; "
                    "generation_support.node_topology(Path(sys.argv[1]), sys.argv[2])")
