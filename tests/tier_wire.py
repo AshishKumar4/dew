@@ -44,17 +44,26 @@ its prepare's time, no fault of the test."""
 
 
 PREPARE_HOLDS = "DEW_TIER_PREPARE_HOLDS"
-"""The bytes a dry prepare's process may hold resident before it starts no further test, cell or site's draw
-(`past_cap`): its container's memory, less what its process's end takes (tools/armada/prepares.py's
-`process`). A process keeps every program it compiled (JAX's and XLA's caches), so a group of heavy families
-grows to its container's whole memory and is killed, every report lost (a recurrence group's prepare at a
-medium's 10 GiB, train 1269). Unset or empty, no cap."""
+"""The share of each memory limit binding a dry prepare (its cgroup's and each ancestor's `memory.max`, as
+`dew._cgroups` reads them under DEW_CGROUP_ROOT) its level may hold in working set (`memory_held`: its charge
+less its inactive page cache) before the prepare starts no further test, cell or site's draw (`past_cap`):
+the rest is the unit running as it passes it and its process's end (tools/armada/prepares.py's `process`). A
+process keeps every program it compiled (JAX's and XLA's caches), and a flow's own process beside it holds
+more, so a group of heavy families grew to its container's whole memory and was killed, every report lost (a
+recurrence group's prepare at 10 GiB, trains 1269 and 1274). Unset or empty, no cap."""
 
 
-def held() -> int:
-    """The bytes this process holds resident (its `/proc/self/statm` pages)."""
-    with open("/proc/self/statm") as statm:
-        return int(statm.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+def over_memory(share: float) -> bool:
+    """Whether any level binding this process holds more than `share` of its memory limit
+    (`PREPARE_HOLDS`)."""
+    from dew import _cgroups
+
+    root = Path(os.environ.get("DEW_CGROUP_ROOT", str(_cgroups.ROOT)))
+    for level in _cgroups.levels(_cgroups.own(root), root):
+        limit, held = _cgroups.memory(level), _cgroups.memory_held(level)
+        if limit is not None and held is not None and held > share * limit:
+            return True
+    return False
 
 
 def past_cap(environ: Mapping[str, str] = os.environ) -> bool:
@@ -64,7 +73,7 @@ def past_cap(environ: Mapping[str, str] = os.environ) -> bool:
 
     if environ.get(PREPARE_BY) and time.monotonic() > float(environ[PREPARE_BY]):
         return True
-    return bool(environ.get(PREPARE_HOLDS)) and held() > int(environ[PREPARE_HOLDS])
+    return bool(environ.get(PREPARE_HOLDS)) and over_memory(float(environ[PREPARE_HOLDS]))
 
 
 class PastCap(Exception):

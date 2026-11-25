@@ -183,10 +183,9 @@ def process(ci, python: str, file: str, group: str, verdict: Path, left: float, 
     # Past its cap a dry prepare starts no further test or cell (tests/tier_wire.py's `past_cap`), so what it
     # prepared is kept, its end in time to upload it: a cap of the time it has but its end's.
     # A part's clears any cap it inherits (its environment's, its caller's).
-    # Of memory, the container's but its end's share (`HELD_SHARE`), where its container states it.
-    held = contained_bytes() if capped else None
+    # Of memory, a share of each limit binding it (`HELD_SHARE`), its end's the rest.
     cap = {wire.PREPARE_BY: repr(time.monotonic() + max(mine - CAP_MARGIN, mine / 2)) if capped else "",
-           wire.PREPARE_HOLDS: str(int(held * HELD_SHARE)) if held else ""}
+           wire.PREPARE_HOLDS: repr(HELD_SHARE) if capped else ""}
     return ci.tested(python, [file], group, verdict, mine, cache, ci.session.GRACE, common,
                      {"JAX_PLATFORMS": "cpu", wire.PREPARE: "1", "OMP_NUM_THREADS": threads,
                       **(VARIANTS["users"][1] if users else {}), wire.UNIT: unit, **cap, **(environ or {})},
@@ -199,18 +198,10 @@ running at its cap, its programs' upload to the shared cache, its report."""
 
 
 HELD_SHARE = 0.75
-"""The share of its container's memory a dry prepare's process may hold before it starts nothing more
-(`process`, tests/tier_wire.py's `PREPARE_HOLDS`): the rest is the test, cell or draw running as it passes
-its cap, its process's end, and the task's own processes beside it."""
-
-
-def contained_bytes(limit: Path = Path("/sys/fs/cgroup/memory.max")) -> int | None:
-    """The bytes this container may hold (its cgroup's `memory.max`); None where it states no limit."""
-    try:
-        stated = limit.read_text().strip()
-    except OSError:
-        return None
-    return int(stated) if stated.isdigit() else None
+"""The share of each memory limit binding a dry prepare its level may hold in working set before it starts
+nothing more (`process`, tests/tier_wire.py's `PREPARE_HOLDS`): the rest is the test, cell or draw running as
+it passes it, its process's end and its programs' upload. A starting margin, not a bound: one compile's
+allocation within a unit may outgrow it."""
 
 
 def planned(files: list[tuple[str, bool, int]], took: Callable[[str, str], tuple[float, float] | None],
@@ -322,8 +313,9 @@ def graded(rows: list[dict], unprepared: Mapping[str, list[dict]], before: set[s
 def capped_banner(capped: list[str]) -> str:
     """What a row whose prepare's cap left `capped` says first (`graded`)."""
     return "\n".join([
-        f"{len(capped)} left unprepared by its prepare's time cap, each run unprepared on its GPU (its "
-        "group's prepare is too long: cut it finer or make its tests cheaper to prepare):", *capped])
+        f"{len(capped)} left unprepared by its prepare's cap, its time's or its memory's, each run "
+        "unprepared on its GPU (its group's prepare is too long or holds too much: cut it finer or make its "
+        "tests cheaper to prepare):", *capped])
 
 
 def nothing_timed(row: dict) -> dict:

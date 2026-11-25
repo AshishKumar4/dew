@@ -392,41 +392,60 @@ def test_only_a_dry_prepare_runs_under_a_time_cap(ci, tmp_path, monkeypatch, cap
     assert began + seen["seconds"] - ci.prepares.CAP_MARGIN <= cap <= time.monotonic() + seen["seconds"]
 
 
-@pytest.mark.parametrize(("limit", "holds"), [("10737418240\n", str(int(10737418240 * 0.75))),
-                                              ("max\n", ""), (None, "")])
-def test_a_dry_prepare_holds_no_more_than_its_container_allows(ci, tmp_path, monkeypatch, limit, holds):
+@pytest.mark.parametrize("capped", [False, True])
+def test_only_a_dry_prepare_runs_under_a_memory_cap(ci, tmp_path, monkeypatch, capped):
     """A dry prepare's process (prepares.py's `process`, `capped`) runs under a memory cap
-    (tests/tier_wire.py's `PREPARE_HOLDS`) of its container's limit (its cgroup's `memory.max`) less its end's
-    share (`HELD_SHARE`), so a group whose programs outgrow its container is capped rather than killed with
-    every report; none where its container states no limit (`max`) or no cgroup is read, and a part's prepare
-    never."""
-    stated = tmp_path / "memory.max"
-    if limit is not None:
-        stated.write_text(limit)
-    contained = ci.prepares.contained_bytes
-    monkeypatch.setattr(ci.prepares, "contained_bytes", lambda: contained(stated))
+    (tests/tier_wire.py's `PREPARE_HOLDS`) of `HELD_SHARE` of each memory limit binding it, so a group whose
+    programs outgrow its container is capped rather than killed with every report; a part's prepare never,
+    clearing one it inherits."""
     seen = {}
 
     def tested(python, files, group, verdict, seconds, *args, **kwargs):
-        seen.setdefault("environ", []).append(args[3])
+        seen["environ"] = args[3]
         return 0
     monkeypatch.setattr(ci, "tested", tested)
-    for capped in (True, False):
-        ci.prepares.process(ci, "3.12", "tests/test_gpu_vae.py", "", tmp_path / "v.json", 1500.0, unit="u",
-                            threads="1", users=False, variant="@prepare-sm90", capped=capped)
-    wire = ci.tier_wire()
-    dry, part = seen["environ"]
-    assert (dry[wire.PREPARE_HOLDS], part[wire.PREPARE_HOLDS]) == (holds, "")
+    ci.prepares.process(ci, "3.12", "tests/test_gpu_vae.py", "", tmp_path / "v.json", 1500.0, unit="u",
+                        threads="1", users=False, variant="@prepare-sm90", capped=capped)
+    assert seen["environ"][ci.tier_wire().PREPARE_HOLDS] == (repr(ci.prepares.HELD_SHARE) if capped else "")
 
 
-def test_a_process_past_the_memory_it_may_hold_is_past_its_cap():
-    """A dry prepare's process holding more than its memory cap (tests/tier_wire.py's `PREPARE_HOLDS`) is
-    past its cap (`past_cap`), so it starts no further test, cell or draw; one holding less, or under no
-    memory cap, is not."""
-    holds = tier_wire.held()
-    assert holds > 0
-    assert tier_wire.past_cap({tier_wire.PREPARE_HOLDS: str(holds // 2)})
-    assert not tier_wire.past_cap({tier_wire.PREPARE_HOLDS: str(holds * 4)})
+def cgroup_tree(root, levels):
+    """A cgroup (v2) hierarchy under `root` this process is a member of, `levels` from the root down: each a
+    memory limit (None: `max`), a charge and its inactive page cache, in bytes."""
+    group = root
+    for index, (limit, current, inactive) in enumerate(levels):
+        group = group / f"level{index}" if index else group
+        group.mkdir(parents=True, exist_ok=True)
+        (group / "memory.max").write_text("max\n" if limit is None else f"{limit}\n")
+        (group / "memory.current").write_text(f"{current}\n")
+        (group / "memory.stat").write_text(f"anon {current}\ninactive_file {inactive}\n")
+    return "0::/" + "/".join(f"level{index}" for index in range(1, len(levels))) + "\n"
+
+
+@pytest.mark.parametrize(("levels", "past"), [
+    # The task's own cgroup unlimited, its parent's limit binding: its working set past the share.
+    ([(None, 0, 0), (10_000, 9_000, 1_000), (None, 8_000, 0)], True),
+    # Its charge past the share, but most of it page cache the kernel reclaims first.
+    ([(None, 0, 0), (10_000, 9_000, 4_000), (None, 5_000, 0)], False),
+    # Under every limit's share.
+    ([(None, 0, 0), (10_000, 6_000, 0), (8_000, 5_000, 0)], False),
+    # No level states a limit.
+    ([(None, 0, 0), (None, 9_000, 0)], False),
+])
+def test_a_prepare_is_past_its_memory_cap_where_a_limit_binding_it_is_mostly_held(tmp_path, monkeypatch,
+                                                                                  levels, past):
+    """A dry prepare is past its memory cap (tests/tier_wire.py's `past_cap`) where any cgroup level binding
+    its process, its own or an ancestor's under DEW_CGROUP_ROOT, holds in working set (its charge less its
+    inactive page cache) more than its cap's share of that level's limit: every process under it counts, a
+    flow's own process beside the prepare's among them."""
+    from dew import _cgroups
+
+    membership = tmp_path / "cgroup"
+    membership.write_text(cgroup_tree(tmp_path / "root", levels))
+    real_own = _cgroups.own
+    monkeypatch.setattr(_cgroups, "own", lambda root: real_own(root, membership))
+    monkeypatch.setenv("DEW_CGROUP_ROOT", str(tmp_path / "root"))
+    assert tier_wire.past_cap({tier_wire.PREPARE_HOLDS: "0.75"}) is past
     assert not tier_wire.past_cap({tier_wire.PREPARE_HOLDS: ""})
 
 
