@@ -94,8 +94,10 @@ def staged_columns(columns: int, dtypes, *, swizzle: int = STAGED_BYTES,
         return math.gcd(columns, swizzle // max(jnp.dtype(dtype).itemsize for dtype in dtypes))
     within = columns if piece is None else math.gcd(columns, piece)
     # A narrowed output stores a swizzle's row of its own columns a chunk where the tile holds one, its
-    # tile columns that many times its divisor.
-    narrowing = max((output.divisor for output in packed if output.narrowed), default=1)
+    # tile columns that many times its divisor; staged beside any other output, a chunk is bounded by each
+    # one's own row, the least of them.
+    narrowing = (min(output.divisor for output in packed)
+                 if len(dtypes) == len(packed) and all(output.narrowed for output in packed) else 1)
     chunk = math.gcd(within, narrowing * swizzle // max(jnp.dtype(dtype).itemsize for dtype in dtypes))
     return next((wider for wider in range(chunk, within + 1, chunk)
                  if not within % wider and _packed_refusal(wider, packed) is None), columns)

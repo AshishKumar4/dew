@@ -1572,8 +1572,8 @@ class Transport[Allocated, Opened](abc.ABC):
 
     stores_narrowed: bool = False
     """Whether its stores take an output its epilogue computes narrower than the tile (`stores.Output`'s
-    `narrowed`: a `divisor`-th of its columns, placed at the tile's column over it): a chunk-staging
-    family's (`ring_family.RingFamily`'s, `stores.staged`) and a whole-tile one that places it
+    `narrowed`: a `divisor`-th of its columns, placed at the column its caller gives, its own): a
+    chunk-staging family's (`ring_family.RingFamily`'s, `stores.staged`) and a whole-tile one that places it
     (`mosaic_sm80.CpAsync`'s); `refuse_staging` refuses one elsewhere."""
 
     copy_extent: int | None = None

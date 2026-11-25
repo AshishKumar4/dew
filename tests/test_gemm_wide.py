@@ -114,12 +114,12 @@ def test_a_tpu_launch_stores_no_narrowed_output():
     assert quantized.forms_refusal((quantized.Form(2, narrowed=True),), tile, dense=True) is not None
 
 
-def _wide_gated_4b(generation_name):
-    """Qwen3.5-4B's gate and up as one wide product (8192 x 2560 by 2560 x 18432), forward only, through
-    the template named."""
+def _wide_gated_4b(saved):
+    """Qwen3.5-4B's gate and up as one wide product (8192 x 2560 by 2560 x 18432) through the template
+    named, its rounded product stored beside the gated one where `saved` (a training forward's)."""
     def product(x, joined):
         with generation.chosen(grouped_matmul="mosaic"):
-            return gemm.wide_gated(x, joined, _swiglu, out_dtype=jnp.bfloat16)
+            return gemm.wide_gated(x, joined, _swiglu, out_dtype=jnp.bfloat16, saved=saved)
 
     return product, (jax.ShapeDtypeStruct((8192, 2560), jnp.bfloat16),
                      jax.ShapeDtypeStruct((2560, 2 * 9216), jnp.bfloat16))
@@ -127,14 +127,16 @@ def _wide_gated_4b(generation_name):
 
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("generation_name", ["sm80", "sm90", "sm100"])
-def test_a_wide_gated_product_compiles_within_each_familys_resources(generation_name):
-    """The 4B's wide gated product (`_wide_gated_4b`), compiled by Mosaic for each compile-only GPU family
-    through ptxas (tests/kernel_compile.py): a template kernel within its shared memory, no register spilled,
-    its epilogue's split of the accumulator a selection of registers."""
+@pytest.mark.parametrize("saved", [False, True], ids=["forward", "saved"])
+def test_a_wide_gated_product_compiles_within_each_familys_resources(generation_name, saved):
+    """The 4B's wide gated product (`_wide_gated_4b`), its narrowed output alone or beside the whole rounded
+    product, compiled by Mosaic for each compile-only GPU family through ptxas (tests/kernel_compile.py): a
+    template kernel within its shared memory, no register spilled, its epilogue's split of the accumulator a
+    selection of registers."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
-    found = compile_mosaic_kernels([KernelCase("wide gated 4b", lambda: _wide_gated_4b(generation_name))],
+    found = compile_mosaic_kernels([KernelCase("wide gated 4b", lambda: _wide_gated_4b(saved))],
                                    generation_name)
     assert found and not mosaic_failures(found), "\n".join(mosaic_failures(found))
     assert all(record.get("kernels") for record in found), found
