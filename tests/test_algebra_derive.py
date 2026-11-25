@@ -1415,7 +1415,7 @@ def test_mixed_covariance_in_a_constant_direction_is_zero(rows, states):
     def mixed(x, dx, dy):
         def first(y):
             def covariance(v):
-                return moments.chunked_covariance(v, y, w, tile=128, mode="merge")[2]
+                return moments.chunked_covariance(v, y, w, tile=min(states, 128), mode="merge")[2]
 
             return jax.jvp(covariance, (x,), (dx,))[1]
 
