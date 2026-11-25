@@ -577,8 +577,13 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
         # (`mosaic_gpu.tgmm`'s `roles`).
         roles = config.warpgroups + self.rewritten(ba, family)
         # Its producer at the registers its tile states, as its kernel lowers it: a derived tile's its
-        # ladder's first rung (`producers.started`), a pin's as pinned.
-        return resources.Launch(scope, roles, registers, most=most, producer=config.producers.of(self.KERNEL))
+        # ladder's first rung (`producers.started`), a pin's as pinned. A stated producer's tile is the
+        # assembler's to hold, not the register model's (`producers.rungs`): certification asks each rung,
+        # so the planner holds its ring and residency alone (row 12972: every rung of a refused paired tile
+        # modelled at 240 registers past its consumers' budget, the rung certification held refused again).
+        producer = config.producers.of(self.KERNEL)
+        return resources.Launch(scope, roles, None if producer is not None else registers, most=most,
+                                producer=producer)
 
     def rewritten(self, ba, family: mosaic.Family) -> bool:
         """Whether the launch's staged rows are rewritten by `family`'s own role (`rewrites_in_persist`): its
