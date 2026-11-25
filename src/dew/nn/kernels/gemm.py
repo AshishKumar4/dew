@@ -1915,12 +1915,12 @@ def _prologue_pulled(prologue, lhs, arrays: tuple, d, matrix, group_sizes, prior
         operand, pull = jax.vjp(formed, *tiles)
         return (*pull(acc.astype(dtype)), operand)
 
-    pulled = ColumnLocal(pulled) if column_local(prologue) else pulled  # as its prologue is declared
+    hook = ColumnLocal(pulled) if column_local(prologue) else pulled  # as its prologue is declared
     sides = (*(() if prior is None else (prior,)), lhs, *arrays)
     outs = (jnp.dtype(lhs.dtype), *(jnp.dtype(array.dtype) for array in arrays), dtype)
-    if not _keeps_launch(d, matrix, group_sizes, pulled, sides, outs, (dtype,), options):
+    if not _keeps_launch(d, matrix, group_sizes, hook, sides, outs, (dtype,), options):
         return None
-    d_lhs, *d_sides, operand = _gemm(d, matrix, group_sizes, None, (), (), pulled, sides,
+    d_lhs, *d_sides, operand = _gemm(d, matrix, group_sizes, None, (), (), hook, sides,
                                      (('rows', 'columns'),) * len(sides), outs, several=True,
                                      summed_as=(dtype,), **options)
     return d_lhs, tuple(d_sides), operand

@@ -89,16 +89,20 @@ def test_an_undeclared_prologues_pullback_reads_its_tile_whole():
     """An undeclared prologue's pulled cotangent (`gemm._prologue_pulled`), here one reading its tile's
     width, through the template at a pinned 128-column tile its depth's width: read out whole, its rows'
     gradient as exact as XLA's from float64 (read out 64 columns at a time, it would scale by 64)."""
-    def dew(x, w):
+    def product(x, w):
+        return gemm.gemm(x, w, None, prologue=_width_scaled, applied=_width_scaled(x), out_dtype=jnp.bfloat16,
+                         interpret_on_cpu=True)
+
+    def dew(*arguments):
+        # Forward and reverse pass traced on the GPU named, the template pinned at the tile.
         with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"),
               tuning.pinned({grouped_matmul.MosaicGmm: TILE})):
-            return gemm.gemm(x, w, None, prologue=_width_scaled, applied=_width_scaled(x),
-                             out_dtype=jnp.bfloat16, interpret_on_cpu=True)
+            return with_gradients(product)(*arguments)
 
     def plain(x, w, wide=jnp.float32):
         formed = _width_scaled(x.astype(wide)).astype(x.dtype if wide == jnp.float32 else wide)
         return jnp.dot(formed.astype(wide), w.astype(wide)).astype(x.dtype if wide == jnp.float32 else wide)
 
-    assert_as_exact(with_gradients(dew), jax.jit(with_gradients(plain)), _draw_rows,
+    assert_as_exact(dew, jax.jit(with_gradients(plain)), _draw_rows,
                     "undeclared width-scaled prologue's pullback", seeds=SEEDS,
                     truth_fn=with_gradients(functools.partial(plain, wide=jnp.float64)))
