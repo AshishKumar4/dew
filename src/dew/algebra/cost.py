@@ -77,13 +77,6 @@ def _operation_work(primitive, inputs, outputs, params, on: generation.GpuTarget
     return emission.operation_work(primitive, inputs, outputs, params, on)
 
 
-def _single_float32(region: Region) -> bool:
-    """Whether every value `region`'s program traced is fp32 (`Region.dtypes`): a division of it, traced or a
-    rewrite's, fp32 too."""
-    return all(np.dtype(dtype) == VALUE for dtype in region.dtypes.values()
-               if not jnp.issubdtype(dtype, jax.dtypes.extended))
-
-
 def _priced(primitive, params, shapes: list[tuple[int, ...]], made: tuple[int, ...],
             on: generation.GpuTarget | None = None, dtype=None) -> Work:
     """An equation's arithmetic as the kernels' counter prices its primitive (`_operation_work`) on `on`, its
@@ -199,7 +192,7 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None,
             primitive, params = region.params[integer(args[3])]
             # A division's dtype: fp32 where its program holds fp32 values alone, unproven otherwise (an
             # e-graph's node names no dtype; `Region.dtypes` its traced terms').
-            typed = VALUE if primitive is jax.lax.div_p and _single_float32(region) else None
+            typed = VALUE if primitive is jax.lax.div_p and region.single_float32 else None
             return _elementwise(graph, primitive, params, (args[0], args[2]), held, on, typed)
     for constructor, primitive in ((Term.select, jax.lax.select_n_p), (Term.clamp, jax.lax.clamp_p)):
         if (args := get_callable_args(node, constructor)) is not None:
