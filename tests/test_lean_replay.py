@@ -15,7 +15,8 @@ from dew.objectives.base import Aux, Objective, Ratio, Weighted
 from dew.state import TrainState
 from dew.training import Trainer
 
-WIDTH, ROWS = 256, 64
+WIDTH, ROWS = 64, 2048
+"""Narrow layers over many rows: the step's activations, which a backward keeps, outweigh its gradients."""
 
 
 class Deep(nn.Module):
