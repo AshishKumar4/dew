@@ -51,6 +51,7 @@ from dew.nn.kernels.templates.attention import (
     head_width,
     kept_dtype,
     key_tiles,
+    kind_of,
     shared_place,
     whole,
 )
@@ -746,7 +747,7 @@ def _hook_jaxprs(hooks: Hooks, tile: tuple[int, int], value_width: int, *,
     if callable(hooks.output.fn):
         traced.append(jax.make_jaxpr(hooks.output.fn)(
             jax.ShapeDtypeStruct((tile[0], value_width), jnp.float32),
-            *(_entries(param.axes, param.value.dtype, (tile[0], value_width))
+            *(_entries(kind_of(param), param.value.dtype, (tile[0], value_width))
               for param in hooks.output.sides)).jaxpr)
     return traced
 

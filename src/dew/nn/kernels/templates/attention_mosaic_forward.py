@@ -58,6 +58,7 @@ from dew.nn.kernels.templates.attention import (
     by_power,
     head_width,
     kept,
+    kind_of,
     kinds_of,
     output_hooked,
     output_split,
@@ -1106,7 +1107,7 @@ def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, sp
         coords = coords._replace(q_pos=family.as_tile(coords.q_pos))
     streamed = riding(family, kinds_of(hooks.score.sides), "keys")
     laid = zip(hooked.score, hooks.score.sides, params_held, strict=True)
-    params = tuple(_param(family, ref, param.axes, row, head, first, s, k_first, held=kept,
+    params = tuple(_param(family, ref, kind_of(param), row, head, first, s, k_first, held=kept,
                           slot=slots[score_stream(index)] if index in streamed else None, at=(share, 0))
                    for index, (ref, param, kept) in enumerate(laid))
     is_masked = jnp.logical_not(whole(index)) if masked is None else masked
@@ -1226,7 +1227,7 @@ def _prologued(family: mosaic.Family, mod: Callable, hooks: Hooks, refs: tuple, 
         return algebra.expand(family.rows_of(ref.at[shared_row, shared_head, pl.ds(first, rows)]), tile)
 
     positions = (first + jnp.arange(rows, dtype=jnp.int32))[:, None]
-    params = (param(ref, value.axes) for ref, value in zip(refs, hooks.query.sides, strict=True))
+    params = (param(ref, kind_of(value)) for ref, value in zip(refs, hooks.query.sides, strict=True))
     taken = mod(tile, positions, *params).astype(q_smem.dtype)
     q_smem[...] = taken if power == 1.0 else taken * jnp.asarray(power, q_smem.dtype)
     family.published()
@@ -1565,7 +1566,7 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
         # its rows' are: formed before the walk, its query block's base was held across it (a B200's scaled
         # fp32 walk at 64 x 64, two consumers, spilled 12 bytes).
         out_view = stored().out
-        out_params = tuple(_param(family, ref, param.axes, row, head, first, state.acc)
+        out_params = tuple(_param(family, ref, kind_of(param), row, head, first, state.acc)
                            for ref, param in zip(hooked.output, hooks.output.sides, strict=True))
         if isinstance(state.acc, mosaic.Kept):
             # Sums its issuer keeps past the walk (`Issuer.accumulated`'s `mosaic.Kept`: a plain walk's, its

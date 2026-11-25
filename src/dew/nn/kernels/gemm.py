@@ -149,15 +149,15 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights,
                                      out_dtypes, applied, beside, selected))
     prologue_arrays, prologue_axes = hook_sides.split(prologue.sides, 'prologue', group_sizes)
     epilogue_arrays, epilogue_axes = hook_sides.split(epilogue.sides, 'epilogue', group_sizes)
-    prologue, epilogue = prologue.fn, epilogue.fn
+    before, after = prologue.fn, epilogue.fn
     _gemm_refused(group_sizes, gather=gather, scatter=scatter, compute=compute, applied=applied,
-                  prologue=prologue, lhs=lhs,
-                  beside=beside and (prologue, epilogue, paired, gather, scatter, applied, compute, layer,
+                  prologue=before, lhs=lhs,
+                  beside=beside and (before, after, paired, gather, scatter, applied, compute, layer,
                                      out_dtypes, *named))
     straight = compute is not None
     compute = jnp.dtype(lhs.dtype if compute is None else compute)
     dense = group_sizes is None and layer is None
-    prologue = _prologued(prologue, prologue_jvp)
+    before = _prologued(before, prologue_jvp)
     paired = None if paired is None else _grouped(lhs, paired, group_sizes, layer)[0]
     beside = tuple(_grouped(lhs, matrix, group_sizes, layer)[0] for matrix in beside)
     rhs, group_sizes, first = _grouped(lhs, rhs, group_sizes, layer)
@@ -169,10 +169,10 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights,
     def value(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather, scatter,
               applied, beside):
         if applied is not None:
-            return _gemm(applied, rhs, group_sizes, None, (), (), epilogue, epilogue_arrays, epilogue_axes,
+            return _gemm(applied, rhs, group_sizes, None, (), (), after, epilogue_arrays, epilogue_axes,
                          dtypes, several=several, paired=paired, first=first, scatter=scatter, **plain)
-        return _gemm(lhs.astype(compute), rhs, group_sizes, prologue, prologue_arrays, prologue_axes,
-                     epilogue, epilogue_arrays, epilogue_axes, dtypes, several=several, paired=paired,
+        return _gemm(lhs.astype(compute), rhs, group_sizes, before, prologue_arrays, prologue_axes,
+                     after, epilogue_arrays, epilogue_axes, dtypes, several=several, paired=paired,
                      first=first, gather=gather, scatter=scatter, beside=beside, selected=selected, **plain)
 
     def portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather, scatter,
@@ -182,7 +182,7 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights,
         config = XlaConfig(transpose_rhs, precision, compute if straight else None, dense)
         lhs = lhs if gather is None else lhs[gather]
         return scattered(xla_mainloop(config, lhs if straight else lhs.astype(compute), rhs, group_sizes,
-                                       prologue, prologue_arrays, prologue_axes, epilogue, epilogue_arrays,
+                                       before, prologue_arrays, prologue_axes, after, epilogue_arrays,
                                        epilogue_axes, dtypes, several, paired=paired, first=first,
                                        beside=beside), scatter)
 
@@ -190,7 +190,7 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights,
         out = value(*operands)
         return _named_residuals(out, named, several) if any(named) else (out, ())
 
-    call = _Call(prologue, prologue_axes, epilogue, epilogue_axes, dtypes, several, compute, plain,
+    call = _Call(before, prologue_axes, after, epilogue_axes, dtypes, several, compute, plain,
                  tuple(at for at, name in enumerate(named) if name is not None))
 
     def backward(saved, operands, cotangent, live):
@@ -1287,13 +1287,13 @@ def blockwise_fp8_finished(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.A
     output broadcast across each block's columns stored one value a row a block, transposed, as a next
     blockwise product reads its rows' scales). `dense`: its one group covers every row (a padded chain's,
     `projections.blockwise_chain`), which a transposed form's stores need (`quantized.forms_refusal`).
-    The epilogue's side operands (`hooks.Side`s on the output's `('rows', 'columns')`, `sides.tiles`), its
+    The epilogue's side operands (`hooks.Side`s on the output's `('rows', 'columns')`, `sides.finished`), its
     side tiles, which it takes after the sum (a gated MLP's rounded gate product, its up product's SwiGLU
     taken here, row 12689)."""
+    finish, tiles = hook_sides.finished(epilogue)
     return _blockwise_fp8(lhs, kernel, group_sizes, row_scales, column_scales,
-                          dtypes=tuple(jnp.dtype(dtype) for dtype in out_dtypes), epilogue=epilogue.fn,
-                          sides=hook_sides.tiles(epilogue), out_forms=out_forms, dense=dense,
-                          interpret=interpret_on_cpu)
+                          dtypes=tuple(jnp.dtype(dtype) for dtype in out_dtypes), epilogue=finish,
+                          sides=tiles, out_forms=out_forms, dense=dense, interpret=interpret_on_cpu)
 
 
 
@@ -1568,21 +1568,21 @@ def nvfp4_block_finished(lhs: NvFp4Block, matrices: NvFp4Block, group_blocks: ja
     sums scaled there before any function of them, XLA's the same function of its sums (a next product's
     rows quantized from them, `quantized.nvfp4_epilogue`, row 12721), each stored as `out_forms` states
     (`Hooks.out_forms`: an output broadcast across each block's columns stored one value a row a block,
-    transposed). The epilogue's side operands, its side tiles (`[rows, columns]` each, `sides.tiles`), it
+    transposed). The epilogue's side operands, its side tiles (`[rows, columns]` each, `sides.finished`), it
     takes after the sums; `epilogue_scalars`, fp32 scalars after them (a delayed recipe's next tensor scale,
     refused unless one scalar as every tensor scale is, `bits.nvfp4_given_scale`), each a tile of its value
     there, carried as a vector over the rows (the launch's side of one value a row: a
     register a thread where a thread holds a row, tcgen05's, where a vector over the columns held a chunk's
     64 and spilled 7108 bytes; witness/b1-probe-3). `dense`: its one group covers every row, which a
     transposed form's stores need (`quantized.forms_refusal`)."""
-    tiles = hook_sides.tiles(epilogue)
+    finish, tiles = hook_sides.finished(epilogue)
     vectors = tuple(jnp.broadcast_to(bits.nvfp4_given_scale(scalar), lhs.codes.shape[:1])
                     for scalar in (lhs.scale, matrices.scale, *epilogue_scalars))
 
     def scaled(acc, *sides):
         held, wide = sides[:len(tiles)], [jax.lax.broadcast_in_dim(vector, acc.shape, (0,))
                                           for vector in sides[len(tiles):]]
-        return epilogue.fn(twice_scaled(acc, *wide[:2]), *held, *wide[2:])
+        return finish(twice_scaled(acc, *wide[:2]), *held, *wide[2:])
 
     side_axes = (hook_sides.LAUNCH_AXES['epilogue'],) * len(tiles) + (('rows',),) * len(vectors)
     return _block_scaled(lhs, matrices, group_blocks, NVFP4_BLOCK_OP, interpret_on_cpu, epilogue=scaled,

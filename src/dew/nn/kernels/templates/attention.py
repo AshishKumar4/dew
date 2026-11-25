@@ -698,9 +698,14 @@ class Kind(tuple, enum.Enum):
     of 1 every head shares."""
 
 
+def kind_of(side: Side) -> Kind:
+    """A hook's side operand's kind: its axes, as `Kind` names them."""
+    return Kind(side.axes)
+
+
 def kinds_of(sides: tuple[Side, ...]) -> tuple[Kind, ...]:
-    """Each of a hook's side operands' kind: its axes, as `Kind` names them."""
-    return tuple(Kind(side.axes) for side in sides)
+    """Each of a hook's side operands' kind (`kind_of`)."""
+    return tuple(map(kind_of, sides))
 
 
 def scored(tile: jax.Array, kind: Kind) -> jax.Array:
@@ -1111,7 +1116,7 @@ def _prologue_param(param: Side, row: jax.Array, head: jax.Array) -> jax.Array:
     """A prologue's `param` as a batch row's and head's tile reads it (`prologued`): a head's scalar, its
     rows' `[T, 1]`, a width's `[1, D]`, each from the row and head it shares (`shared_place`)."""
     value = param.value
-    match param.axes:
+    match kind_of(param):
         case Kind.HEAD:
             return value[head]
         case Kind.WIDTH:
@@ -1141,7 +1146,7 @@ def _per_head(param: Side, row: jax.Array, head: jax.Array) -> jax.Array:
     value = param.value
     if param.axes in (Kind.QUERY, Kind.KEY, Kind.TILE):
         row, head = shared_place(value.shape, row, head)
-    match param.axes:
+    match kind_of(param):
         case Kind.HEAD:
             return value[head]
         case Kind.QUERY:
@@ -1622,7 +1627,7 @@ def _padded(param: Side, queries: int, keys: int, value_width: int, *, widened: 
     value = param.value
     if widened and jnp.issubdtype(value.dtype, jnp.floating):
         value = value.astype(jnp.float32)
-    match param.axes:
+    match kind_of(param):
         case Kind.HEAD:
             return jnp.pad(value, (0, power_of_two(value.shape[0]) - value.shape[0]))
         case Kind.QUERY:
@@ -2036,7 +2041,7 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
         dv = dv.reshape(batch, padded_k, kv_heads, group, padded_dv).sum(axis=3)
     grads = []
     for param in hooks.score.sides:
-        match param.axes:
+        match kind_of(param):
             case Kind.HEAD:
                 grads.append(dq_grads.pop(0).sum(axis=(0, 1))[:param.value.shape[0], 0])
             case Kind.QUERY:

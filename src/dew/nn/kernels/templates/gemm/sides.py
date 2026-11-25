@@ -1,6 +1,8 @@
 """Dew: a GEMM's hooks' side operands (`templates.hooks.Side`) as its launches take them: each checked against
 the launch axes its hook's operands follow (`split`), read at each row by XLA's program (`rows`), squeezed of
-its dimensions of one for a launch (`launchable`), or taken as an output's tiles (`tiles`)."""
+its dimensions of one for a launch (`launchable`), or taken as an output's tiles (`finished`)."""
+
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -55,10 +57,12 @@ def launchable(arrays: tuple, axes_of: tuple) -> tuple[tuple, tuple, tuple]:
     return squeezed, named, positions if any(positions) else ()
 
 
-def tiles(epilogue: Hook) -> tuple[jax.Array, ...]:
-    """A finished product's epilogue's side operands, each a tile of the output's (`[rows, columns]`,
-    `LAUNCH_AXES['epilogue']`), as the launch takes them."""
+def finished(epilogue: Hook) -> tuple[Callable, tuple[jax.Array, ...]]:
+    """A finished product's epilogue as its launch takes it: its function, which it needs, and its side
+    operands, each a tile of the output's (`[rows, columns]`, `LAUNCH_AXES['epilogue']`)."""
+    if epilogue.fn is None:
+        raise ValueError("a finished product takes an epilogue")
     if any(tuple(side.axes) != LAUNCH_AXES['epilogue'] for side in epilogue.sides):
         raise ValueError(f"a finished product's epilogue takes side tiles on {LAUNCH_AXES['epilogue']}, not "
                          f"{[side.axes for side in epilogue.sides]}")
-    return tuple(side.value for side in epilogue.sides)
+    return epilogue.fn, tuple(side.value for side in epilogue.sides)

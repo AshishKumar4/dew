@@ -1634,12 +1634,11 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
     `MosaicForward.bounded`), so a plan of it derives that launch's config and reads that launch's
     refusals (`attention_decode.plan`). A query prologue its consumers take where they load the query
     (`MosaicForward.query_mod`) where the launch keeping `residuals` holds it at its own config
-    (`_holds_prologue`), else XLA's program before the launch takes it. Score parameters no score hook reads
-    are none of the launch's: no operand, stream or load of them (an unread key bias's stream on tcgen05's
-    rows, whose issuer streams the keys and values alone, was never released and hung the launch)."""
+    (`_holds_prologue`), else XLA's program before the launch takes it. A hook's side operands are its
+    function's (`hooks.Hook`): no score side operand reaches a launch without a score hook to read it (an
+    unread key bias's stream on tcgen05's rows, whose issuer streams the keys and values alone, was never
+    released and hung the launch)."""
     hooks = Hooks() if hooks is None else hooks
-    if hooks.score.fn is None and hooks.score.sides:
-        hooks = dataclasses.replace(hooks, score=dataclasses.replace(hooks.score, sides=()))
     fp32 = all(jnp.dtype(x.dtype) == jnp.dtype(jnp.float32) for x in (query, key, value))
     parts = product.bf16_part_count(accurate=True) if fp32 else 1
     if hooks.query.fn is not None and (parts > 1 or head_width(query.shape[3]) != query.shape[3]):
