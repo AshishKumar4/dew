@@ -1805,8 +1805,20 @@ class Transaction:
             # the microbatch is its update's whole window; otherwise from the pooled loss's, below.
             probing = realized.probed
             whole = probing is not None and self.size == 1
-            gradient, probed, applied = self._pulled(realized, cotangent, planned, whole=whole,
-                                                     masters=state.compute is not None)
+            # A window it replays, its loss unscaled and its update taken whole (`lean`), reads no gradient
+            # of a microbatch's own: the commit replays the window's every microbatch, this one realized
+            # afresh, under the pooled loss's cotangent, so this forward's residuals live through no
+            # backward and no replay (a decision step whose loss weighs its consistency term, 8 layers of a
+            # 4B model at split 2: 28.4 GiB a step and 82 s to compile against 18.5 GiB and 43 s).
+            lean = (not host and state.accumulation is not None and not self.shared and state.scale is None
+                    and not holds_back(state.opt_state) and planned is None and probing is None)
+            if lean:
+                gradient = jax.tree.map(lambda leaf: jnp.zeros(leaf.shape, leaf.dtype),
+                                        jax.eval_shape(realized.pullback, cotangent))
+                probed, applied = None, None
+            else:
+                gradient, probed, applied = self._pulled(realized, cotangent, planned, whole=whole,
+                                                         masters=state.compute is not None)
             if state.compute is None or self.size > 1:
                 gradient = unscale(gradient, factor)
             # Otherwise no loss scale divides it (`dew.training._candidates.prepared_for`),
@@ -1830,7 +1842,9 @@ class Transaction:
 
             def replay(_):
                 cot = pooled(pending.pooled, realized.stats, factor)
-                combined = unscale(realized.pullback(cot), factor)
+                # A lean window's microbatch realized again where its gradient is read (`lean`).
+                current = self._realized(realize, read, batch, step_info, factor) if lean else realized
+                combined = unscale(current.pullback(cot), factor)
                 def one(index, carried):
                     accumulated, kept = carried
                     replayed, records, step_info = self.replay_input(state, pending.fill, index,
