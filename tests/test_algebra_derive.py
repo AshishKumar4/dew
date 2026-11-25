@@ -1173,6 +1173,22 @@ def test_zero_weighted_values_keep_zero_tangents_when_finite_weights_overflow_th
     np.testing.assert_array_equal(jnp.stack((*value, *tangent)), np.zeros((4, 1), np.float32))
 
 
+def test_a_normal_weight_quotient_preserves_stationary_covariance_rounding():
+    from dew.algebra import moments
+
+    x = jnp.asarray([[2.0 ** 64, -(2.0 ** 64)]], jnp.float32)
+    y = jnp.asarray([[2.0 ** 63, -(2.0 ** 63)]], jnp.float32)
+    w = jnp.full_like(x, 0.75)
+    dw = jnp.asarray([[1.5 + 2.0 ** -22, 0.0]], jnp.float32)
+
+    def covariance(weights):
+        return moments.chunked_covariance(x, y, weights, tile=1, mode="merge")[2]
+
+    value, tangent = jax.jvp(covariance, (w,), (dw,))
+    np.testing.assert_array_equal(value, [2.0 ** 127])
+    np.testing.assert_array_equal(tangent, [0.0])
+
+
 def test_chunked_moments_directed_overflow_mixed_zero_weight_and_direct_jvp():
     """Weight tangents stay finite when `cx * cy` overflows, mixed 2nd derivatives at zero individual and
     all-zero weights match the plain declaration, and direct `derive` forms preserve zero-weight JVP."""

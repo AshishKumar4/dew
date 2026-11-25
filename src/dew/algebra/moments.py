@@ -15,6 +15,7 @@ import jax.numpy as jnp
 from dew.algebra import derive, program, ratios, windows
 from dew.algebra.forms import Derived
 from dew.nn.derivatives import Protected, contracted, declared_tangent
+from dew.nn.float_bits import raw_fields
 
 SATURATION = program.Saturation(growth=64, depth=4)
 """Derivation limits for central-moment walks."""
@@ -169,12 +170,20 @@ _WEIGHT_DIV = ratios.Ratio(((1.0, (("v", 0), ("v", 1))),), ((1.0, (("v", 2),)),)
 
 
 def _safe_tangent_div(dtw: jax.Array, numerator: jax.Array, sn: jax.Array) -> jax.Array:
-    """Multiply the weight direction and divide by mass before landing, including in its transpose."""
-    finite = jnp.isfinite(numerator) & jnp.isfinite(sn)
-    mass, exceptional, (value, direction), (other, d_other) = _split_range(finite, sn, numerator, dtw)
-    scaled = ratios.ratio([direction[None], value[None], mass[None]], _WEIGHT_DIV)
-    # IEEE handles exceptional values; the scaled quotient's error compensation assumes a finite mass.
-    return jnp.where(finite, scaled, d_other * (other / exceptional))
+    """Move the direction ahead of the quotient only where dividing first would lose its coefficient."""
+    hi = sn > 1.0
+    _, _, exponent, fraction = raw_fields(numerator)
+    # Keep ordinary quotient rounding; the covariance overflow arm subtracts a product rounded alike.
+    rescue = hi & jnp.isfinite(sn) & ((exponent != 0) | (fraction != 0)) & (
+        jnp.abs(numerator) < jnp.finfo(numerator.dtype).tiny * sn)
+    mass, plain_mass, (value, direction), (plain, d_plain) = _split_range(rescue, sn, numerator, dtw)
+    repaired = ratios.ratio([direction[None], value[None], mass[None]], _WEIGHT_DIV)
+    qmax = jnp.asarray(0.25 * jnp.finfo(numerator.dtype).max, numerator.dtype)
+    sn_hi, sn_lo, (num_hi, dtw_hi), (num_lo, dtw_lo) = _split_range(hi, plain_mass, plain, d_plain)
+    safe_lo = jnp.abs(num_lo) <= sn_lo * qmax
+    _, sn_big, (num_safe, dtw_safe), (num_big, dtw_big) = _split_range(safe_lo, sn_lo, num_lo, dtw_lo)
+    lo_term = dtw_safe * (num_safe / sn_lo) + (dtw_big * num_big) / sn_big
+    return jnp.where(rescue, repaired, jnp.where(hi, dtw_hi * (num_hi / sn_hi), lo_term))
 
 
 def _safe_tangent_quad(dtw: jax.Array, big_c: jax.Array, sml_c: jax.Array, sn: jax.Array) -> jax.Array:
