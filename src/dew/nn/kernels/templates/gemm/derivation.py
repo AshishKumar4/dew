@@ -244,9 +244,9 @@ def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], sha
 
 def _ring_staged(tile: Tiles, layout: mosaic.Family, outputs: tuple, *, candidate: Callable,
                  launch_of: Callable, target, programs: int) -> Tiles:
-    """`tile`, whose ring is short of busy or its consumers feed (`mosaic.Transport.feeds_itself`) at its least
-    busy depth, with its outputs (`outputs`, their dtypes) staged in smaller buffers where that leaves the
-    ring deeper: of
+    """`tile`, whose ring is short of busy or its consumers feed (`mosaic.Transport.feeds_itself`) at its
+    least busy depth, with its outputs (`outputs`, their dtypes) staged in smaller buffers where that leaves
+    the ring deeper: of
     the stagings at the widest output's unstated chunk (`stores.output_staging`) and its halvings, in one
     buffer or two, legal for the tile's issuer as the tile specializes it and each output
     (`Tiles.staging_refusal`: whole accumulator atoms, whole TMA rows) and its buffers
