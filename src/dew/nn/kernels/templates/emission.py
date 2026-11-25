@@ -224,14 +224,13 @@ APPROXIMATE_FORMS: Mapping = {
     lax.log_p: Work(exponentials=1, operations=1), lax.log2_p: Work(exponentials=1),
     lax.tanh_p: Work(exponentials=1), lax.sin_p: Work(exponentials=1), lax.cos_p: Work(exponentials=1),
     lax.sqrt_p: Work(exponentials=1, operations=3), lax.rsqrt_p: Work(exponentials=1, operations=3),
-    lax.logistic_p: Work(exponentials=2, operations=3), lax.div_p: Work(exponentials=1, operations=7)}
+    lax.logistic_p: Work(exponentials=2, operations=3)}
 """Each special function's issue an element in a Mosaic GPU kernel compiled with `approx_math` (attention's):
 the hardware's approximate form, one MUFU (an exp's and a log's beside the multiply scaling it to base 2; a
 logistic's two, its exp and its reciprocal, beside a negation, a multiply and an add), counted from the PTX
 of a warpgroup kernel of one fp32 tile on sm90 and sm100 alike (FS-APPROX-FORMS3, row 10824); a square root's
 and its reciprocal's MUFU beside two FMULs and an FSETP scaling a subnormal, in their SASS (FS-SQRT2,
-FS-SQRT4); an fp32 division's `div.full.f32`, as without it, its MUFU.RCP beside five FMULs and two FSETPs
-(FS-DIV-SASS5). log1p and pow have none: Mosaic GPU lowers neither."""
+FS-SQRT4). log1p and pow have none: Mosaic GPU lowers neither."""
 
 ACCURATE_FORMS: Mapping = {
     lax.exp_p: Work(exponentials=1, operations=7, conversions=1, integer_operations=1),
@@ -240,8 +239,7 @@ ACCURATE_FORMS: Mapping = {
     lax.log2_p: Work(operations=23, conversions=1, integer_operations=4),
     lax.tanh_p: Work(exponentials=2, operations=13, integer_operations=3),
     lax.logistic_p: Work(exponentials=2, operations=9, conversions=1, integer_operations=1),
-    lax.sqrt_p: Work(exponentials=1, operations=3), lax.rsqrt_p: Work(exponentials=1, operations=3),
-    lax.div_p: Work(exponentials=1, operations=7)}
+    lax.sqrt_p: Work(exponentials=1, operations=3), lax.rsqrt_p: Work(exponentials=1, operations=3)}
 """Each special function's issue an element in a Mosaic GPU kernel compiled without `approx_math` (every
 GEMM launch's), from the same PTX (FS-APPROX-FORMS3, sm90 and sm100): an exp the MUFU beside seven fp32
 instructions (its range reduction's four FMAs, an add, a negation and a multiply), a saturating convert and a
@@ -250,14 +248,7 @@ a reciprocal) beside thirteen fp32 instructions and three integer ones; a log an
 polynomial of 21 and 23 fp32 instructions (its FMAs, selects and compares) beside four integer ones and a
 convert; exp2, sqrt and rsqrt their approximate forms. A sin's and a cos's accurate form branches to a slow
 reduction for large arguments, which a static count misstates: unpriced, with log1p and pow, which Mosaic
-GPU lowers in neither form. An fp32 division `div.full.f32`, its MUFU.RCP beside five FMULs and two FSETPs
-(sm90's SASS, FS-DIV-SASS1)."""
-
-ROUNDED_DIVISION = Work(exponentials=1, operations=6)
-"""An fp32 division correctly rounded, XLA's (`fdiv`'s `div.rn.f32`) and
-`precision.correctly_rounded_divide`'s alike: on its common path a MUFU.RCP beside five FFMAs and an FCHK,
-an element; its slow path, a subnormal's or an extreme's, a call a count takes as not run (sm90's SASS,
-FS-DIV-SASS5)."""
+GPU lowers in neither form."""
 
 
 _FREE = frozenset({
@@ -1026,14 +1017,6 @@ def _expanded(equation) -> tuple[jax_core.Jaxpr, Sequence] | None:
     return traced.jaxpr, traced.consts
 
 
-def _divides_on_cuda(outputs: Sequence, target: generation.GpuTarget | None) -> bool:
-    """Whether a division of results `outputs` is a floating one on a CUDA multiprocessor (`target`, else the
-    process's own), whose MUFU and refinement Dew measured."""
-    held = target or generation.gpu_target()
-    return (held.architecture.multiprocessor is not None
-            and all(jnp.issubdtype(aval.dtype, jnp.floating) for aval in outputs))
-
-
 def _operated(primitive, inputs: Sequence, outputs: Sequence) -> Work:
     """An elementwise operation's work, one an output element, a clamp's two (a maximum and a minimum: no
     instruction bounds a value on both sides, and every lowering, XLA's, Mosaic GPU's and Triton's, issues
@@ -1090,12 +1073,7 @@ def operation_work(primitive, inputs: Sequence, outputs: Sequence, params: Mappi
     (`product.product_mode`: on a TPU, an fp32 product's bfloat16 passes); what moves and computes nothing
     nothing (`_FREE`: a layout change, a barrier); any other primitive's output elements unpriced
     (`Work.unpriced_operations`). With `forms` (a kernel's: `APPROXIMATE_FORMS`, `ACCURATE_FORMS`), a special
-    function issues its form an output element, one with none unpriced; an fp32 division on a CUDA target its
-    form's (`div_p`'s, in a kernel's `forms`) or its correctly rounded one (`ROUNDED_DIVISION`, XLA's), a MUFU
-    and its refinement, an integer's and a TPU's an operation an element, unmeasured."""
-    if primitive in (lax.div_p, precision.correctly_rounded_divide_p) and _divides_on_cuda(outputs, target):
-        form = (forms or {}).get(primitive, ROUNDED_DIVISION)
-        return repeated(form, sum(_elements(aval) for aval in outputs))
+    function issues its form an output element, one with none unpriced."""
     if primitive in _OPERATIONS:
         return _operated(primitive, inputs, outputs)
     if primitive in _REDUCTIONS:
