@@ -350,14 +350,20 @@ def test_a_transposed_letter_no_factor_reads_forms_no_product_over_the_others():
     unit operand along `k` held apart from the cotangent's group it is a factor of (`Form.units`), so no
     array the lowered program forms is larger than the masses, where held with it the group formed
     `bhgqdk`, 8 GiB, four held at once (row 12979). Lowered, never compiled or run."""
-    import re
+    from jax.extend.mlir import ir
+
+    from dew.nn.kernels.lowered import read_operations
 
     masses = jax.ShapeDtypeStruct((1, 4, 2, 1024, 1024), jnp.float32)
     values = jax.ShapeDtypeStruct((1, 1024, 4, 256), jnp.float32)
     pulled = jax.jit(jax.grad(lambda m, v: jnp.sum(contract(ATTENTION_MEAN, m, v)), argnums=(0, 1)))
-    text = pulled.lower(masses, values).as_text()
-    shapes = re.findall(r"tensor<((?:\d+x)+)\w+>", text)
-    largest = max(int(np.prod([int(size) for size in shape.rstrip("x").split("x")])) for shape in shapes)
+
+    def size(operation):
+        ranked = [ir.RankedTensorType(result.type) for result in operation.results
+                  if isinstance(result.type, ir.RankedTensorType)]
+        return max((int(np.prod(kind.shape)) for kind in ranked), default=None)
+
+    largest = max(read_operations(pulled.lower(masses, values), size))
     assert largest <= masses.size, largest
 
 
