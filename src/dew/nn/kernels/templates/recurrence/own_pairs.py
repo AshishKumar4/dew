@@ -77,8 +77,11 @@ def _own_rows(call: Call, keyed, decayed, keys: jax.Array, prefix: tuple) -> Non
     earlier = tuple(family.row_shifted(half, 1, period=algebra.SUB, interpret=call.interpret)
                     for half in whole)
     mosaic.synced(call.interpret)
+    # The decays formed before either store, as the backward's shifted reads were tuned: formed between
+    # them, an H100's Kimi Linear own pairs' backward spilled 8 bytes.
+    decays = algebra.token_decays(whole, earlier)
     plgpu.store(keyed, keys.astype(keyed.dtype), optimized=False)
-    plgpu.store(decayed, algebra.token_decays(whole, earlier), optimized=False)
+    plgpu.store(decayed, decays, optimized=False)
     mosaic.synced(call.interpret)
 
 
