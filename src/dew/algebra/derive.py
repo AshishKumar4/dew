@@ -539,7 +539,7 @@ def _m_part(tag: String, ref: Term, n0: Term, n1: Term) -> Term: ...
 @function
 def _m_diff(tag: String, ref: Term, a0: Term, a1: Term, u0: Term, u1: Term) -> Term: ...
 @function
-def _m_double_if(flag: Term, value: Term) -> Term: ...
+def _m_double_if(doubled: Term, value: Term) -> Term: ...
 @function
 def _m_prod_div(zero_t: Term, one_t: Term, product: Term, factor: Term, denom: Term) -> Term: ...
 @function
@@ -851,8 +851,8 @@ def _need(table: dict[str, tuple], *names: str) -> tuple:
 def _moment_ssa_prob_rules(ops: dict[str, i64], binds: dict[str, tuple]) -> list:
     """Linear SSA rules for merge probabilities, adaptive scaled differences, and guarded product-div."""
     ref, n0, n1, a0, a1, u0, u1 = vars_("ref n0 n1 a0 a1 u0 u1", Term)
-    flag, value, zero_t, one_t, product, factor, denom = vars_(
-        "flag value zero_t one_t product factor denom", Term)
+    doubled, value, zero_t, one_t, product, factor, denom = vars_(
+        "doubled value zero_t one_t product factor denom", Term)
     _, consts, fill_bind, lit_binds = _moment_ref_consts(ref)
     zero_n, one_n, half_n = consts["zero"], consts["one"], consts["half"]
     qmax, rflr = consts["qmax"], consts["rflr"]
@@ -914,8 +914,8 @@ def _moment_ssa_prob_rules(ops: dict[str, i64], binds: dict[str, tuple]) -> list
         rewrite(_m_diff(String("val"), ref, a0, a1, u0, u1)).to(
             big_d.select(raw, halved),
             *fill_bind, *_need(lit_binds, "zero", "half"), *_need(binds, "add", "sub", "mul")),
-        rewrite(_m_double_if(flag, value)).to(
-            flag.select(value, value.binary(String("add"), value, ops["add"])), *_need(binds, "add")),
+        rewrite(_m_double_if(doubled, value)).to(
+            doubled.select(value, value.binary(String("add"), value, ops["add"])), *_need(binds, "add")),
         rewrite(_m_prod_div(zero_t, one_t, product, factor, denom)).to(
             big_p.select(
                 big_p.select(product, zero_t).binary(String("mul"), factor, ops["mul"]).binary(

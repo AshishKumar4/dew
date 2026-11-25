@@ -1142,19 +1142,23 @@ def test_chunked_moments_balances_unequal_scales_value_gradients_and_explicit_sh
 
     from dew.algebra import moments
 
-    # Unequal covariance scales (`x ~ 2^100, y ~ 2^-100, w ~ 2^-100`): balanced associativity stays normal.
+    # Unequal covariance scales (`x ~ 2^100, y ~ 2^-100, w ~ 2^-100`): balanced associativity stays normal
+    # and matches float64 truth even where naive float32 `(w * dx) * dy` underflows to zero.
     big_d, sml_d = np.float32(2.0 ** 100), np.float32(2.0 ** -100)
     for x_pair, y_pair, w_pair in (([0.0, big_d], [0.0, sml_d], [1.0, sml_d]),
                                    ([0.0, sml_d], [0.0, big_d], [1.0, sml_d]),
                                    ([0.0, big_d], [0.0, sml_d], [big_d, 1.0])):
         xu, yu, wu = (jnp.asarray([vals], jnp.float32) for vals in (x_pair, y_pair, w_pair))
-        _, _, ref_cov = moments.weighted_covariance(xu, yu, wu)
+        w64 = np.asarray(w_pair, np.float64)
+        exact_cov = np.asarray(
+            [(w64[0] / w64.sum()) * (w64[1] / w64.sum())
+             * (float(x_pair[1]) - float(x_pair[0])) * (float(y_pair[1]) - float(y_pair[0]))],
+            np.float32)
         for tile in (1, 2):
             for mode in ("walk", "merge"):
                 _, _, got_cov = moments.chunked_covariance(xu, yu, wu, tile=tile, mode=mode)
                 assert np.all(np.isfinite(np.asarray(got_cov))) and float(got_cov[0]) != 0.0
-                np.testing.assert_array_equal(np.asarray(got_cov), np.asarray(ref_cov))
-
+                np.testing.assert_array_equal(np.asarray(got_cov), exact_cov)
     # Minimum-normal float32 weights (`2^-126`): normalized monoid keeps primal and value VJPs finite/exact
     # both through `chunked_covariance` and through direct `derive.derive` without `custom_jvp`.
     tiny = float(np.finfo(np.float32).tiny)
