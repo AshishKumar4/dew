@@ -25,6 +25,7 @@ from dew.nn.kernels.templates import (
     attention_algebra as algebra,
     attention_gradient as gradient,
     mosaic,
+    mosaic_sm90,
     swizzling,
 )
 from dew.nn.kernels.templates.attention import DQ_GRADS, LOG2E, Draw, Kind, by_power
@@ -263,7 +264,7 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
             exponentials, weights, cotangents = scores(is_masked=masked)
     if whole_operands:
         return weights, cotangents * walk.grad_scale
-    if q_slot.dtype == jnp.bfloat16 and not walk.interpret and getattr(family, "layout", None) == WGMMA:
+    if q_slot.dtype == jnp.bfloat16 and not walk.interpret and isinstance(family, mosaic_sm90.WgmmaIssuer):
         part = saturated_bf16(cotangents * walk.grad_scale)
     else:
         part = mosaic.unscaled_part(*algebra.cotangent_parts(cotangents * walk.grad_scale, q_slot.dtype,
