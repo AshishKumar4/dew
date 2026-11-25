@@ -187,16 +187,12 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
     dropping call's dropped (`algebra.drawn`), and its score cotangents through the hook (`gradient.pulled`),
     one part in the operands' dtype (dK's and dQ's); with `whole_operands` (fp16's, `algebra.running_parts`),
     both fp32: the normalized weights, dropped, and the scaled cotangents. `lean` (the fused launch's): its
-    bf16 weights alone where nothing reads the unnormalized ones (`attention_mosaic_tail.weighed`), and its
     bf16 cotangents narrowed saturating in one conversion on wgmma (`attention_mosaic_tail.saturated_bf16`);
-    a launch at its registers'
-    edge takes neither (the shared-keys dK/dV at width 256 spilled 24 bytes at 255 with both)."""
+    a launch at its registers' edge takes none (the shared-keys dK/dV at width 256 spilled 24 bytes at 255
+    with it)."""
     family = walk.program.family
     (q_slot, do_slot), (keys, values) = slots, resident
     held, values_t = keys.transpose((1, 0)), values.transpose((1, 0))
-    # The normalized weights alone where nothing reads the unnormalized ones (`value_weights`' bf16 operand),
-    # an entry's fused centring, exponential and share (`attention_mosaic_tail.weighed`).
-    normalized = lean and not walk.dropped and not whole_operands and do_slot.dtype == jnp.bfloat16
     # S's products and dP's, issued together (`Issuer.summed_together`).
     score_products = (lambda acc: family.products(acc, q_slot, held),
                       lambda acc: family.products(acc, do_slot, values_t))
@@ -208,8 +204,7 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
         stages_weights = on_weights is not None or after_weights is not None
 
         def prepare_weights(s):
-            exps, w, sl, sn = _score_weights(walk, tile_coords, (), s, rows[0], rows[1], masked=masked,
-                                             normalized=normalized)
+            exps, w, sl, sn = _score_weights(walk, tile_coords, (), s, rows[0], rows[1], masked=masked)
             if on_weights is not None and not whole_operands:
                 on_weights(algebra.value_weights(exps, w, do_slot.dtype, walk.dropped))
             return w, sl, sn
@@ -248,8 +243,7 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
         def scores(*, is_masked: bool):
             # A tile every query sees whole (`is_masked` False) takes no mask (`_dq_step`'s choice).
             tile_coords = _read(coords)
-            exps, w, cot, sl, sn = _scores(walk, tile_coords, (), s, dp, *rows, masked=is_masked,
-                                           normalized=normalized)
+            exps, w, cot, sl, sn = _scores(walk, tile_coords, (), s, dp, *rows, masked=is_masked)
             multiplier = algebra.drawn(tile_coords, tile_coords.q_pos, tile_coords.k_pos)
             if multiplier is not None:
                 exps, w = exps * multiplier, w * multiplier
@@ -270,8 +264,6 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
     return algebra.value_weights(exponentials, weights, do_slot.dtype, walk.dropped), part
 
 
-
-
 def _score_logits(walk: _Backward, coords: algebra.Coords, params: tuple, s, *, masked: bool):
     """Shared mask and hooked-logits prologue for `_score_weights` and `_scores`."""
     if walk.hooked[0]:
@@ -287,24 +279,9 @@ def _score_logits(walk: _Backward, coords: algebra.Coords, params: tuple, s, *, 
 
 
 def _score_weights(walk: _Backward, coords: algebra.Coords, params: tuple, s, peak, total, *,
-                   masked: bool, normalized: bool = False):
+                   masked: bool):
     """First half of `_scores` (row 11659): mask, hooked logits + slopes, and derived unnormalized and
-    normalized weights from `s`, `peak`, and `total` (runnable while `dP` is in flight). Where its caller
-    reads the `normalized` weights alone (the fused launch's bf16 tail, `_tile_scores`' `lean`) on wgmma at
-    approximate exponentials, those an entry's fused centring, its exponential and its share
-    (`attention_mosaic_tail.weighed`), each returned in the unnormalized weights' place too."""
-    if (normalized and walk.how == algebra.PLAIN and walk.approx_math and not walk.interpret
-            and not coords.keys_first and isinstance(walk.program.family, mosaic_sm90.WgmmaIssuer)):
-        # The mask taken after the weights (a scale of 0 or below admitted: a hidden entry's product times it
-        # is no -inf), the unhooked products scaled in the body, the hooked logits as they are.
-        if walk.spec.score_mod is None:
-            seen = algebra.seen(walk.spec, coords, s) if masked else None
-            scores, scale, slopes = s, walk.spec.scale, None
-        else:
-            scores, slopes, seen = _score_logits(walk, coords, params, s, masked=masked)
-            scale = 1.0
-        weights = gradient.where_seen(seen, tail.weighed(scores, _read(peak), _read(total), scale), 0.0)
-        return weights, weights, slopes, seen
+    normalized weights from `s`, `peak`, and `total` (runnable while `dP` is in flight)."""
     logits, slopes, seen = _score_logits(walk, coords, params, s, masked=masked)
     exponentials, weights = derived_weights(
         keys_first=bool(coords.keys_first), how=walk.how, accurate=walk.accurate).mapped(
@@ -322,7 +299,7 @@ def _score_cotangents(coords: algebra.Coords, weights, dp, anchor, delta, seen):
 
 
 def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak, total, anchor, delta,
-            chosen, *, masked: bool, normalized: bool = False):
+            chosen, *, masked: bool):
     """A backward tile's weights unnormalized and over `total`, its score cotangents
     (`attention_backward_algebra.softmax_cotangents`) and the score hook's slopes (`gradient.tile_logits`),
     from its products `s` and `dp`, its coordinates, its hook parameters `params`, its mask (`algebra.seen`
@@ -331,7 +308,7 @@ def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak,
     multiplier = algebra.drawn(coords, coords.q_pos, coords.k_pos)
     if not walk.accurate and multiplier is None:
         exponentials, weights, slopes, seen = _score_weights(walk, coords, params, s, peak, total,
-                                                             masked=masked, normalized=normalized)
+                                                             masked=masked)
         cotangents = _score_cotangents(coords, weights, dp, anchor, delta, seen)
         return exponentials, weights, cotangents, slopes, seen
     logits, slopes, seen = _score_logits(walk, coords, params, s, masked=masked)
