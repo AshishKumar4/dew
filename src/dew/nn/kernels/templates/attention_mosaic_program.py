@@ -672,7 +672,7 @@ def reducing(family: mosaic.Family, consumers: int, hooked: bool, *, scaled: boo
     `hooked` launch's hook's (`hook_reduces`: a unit row, which the fork selects by a reduction across warps,
     ledger 1428; an output hook's, untraced), a `scaled` step's tile reduced to its largest across the warps
     holding its rows (`algebra.running_parts`, an fp16 fused backward's), or a scaled walk's keys' value
-    `magnitudes`, its value tile's columns reduced across the warps holding them (`Family.key_magnitudes`,
+    `magnitudes`, its value tile's columns reduced across the warps holding them (`Family.keys_read`,
     `algebra.SCALED_WALK`), so every warpgroup of a launch that runs such a hook or scales; none otherwise.
     A launch's rows flagged to their block's flag reserve none: the flag is its warpgroup's vote
     (`attention_mosaic_forward._status_stored`, `bar.red.or.pred`)."""
