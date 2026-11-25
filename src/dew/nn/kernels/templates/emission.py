@@ -668,9 +668,15 @@ class _Counting:
             copied = _bytes(params["tree"].unflatten([variable.aval for variable in equation.invars])[1])
             self.add(Work(device_bytes=copied, shared_bytes=copied))
         elif primitive is gpu.atomic_store_p:
-            # An atomic update of device memory (an add into a sum other programs add to): its value's bytes.
-            value = params["args_tree"].unflatten([variable.aval for variable in equation.invars])[2]
-            self.add(Work(device_bytes=_bytes(value)))
+            # An atomic update (an add into a sum other programs or roles add to): its value's bytes, in
+            # device memory each lane's reduced at L2 an element at a time (`red.global`); in shared memory
+            # (`red.shared::cta`), shared bytes alone.
+            ref, _, value = params["args_tree"].unflatten([variable.aval for variable in equation.invars])
+            moved = _bytes(value)
+            if isinstance(ref, state_types.AbstractRef) and ref.memory_space == gpu_core.SMEM:
+                self.add(Work(shared_bytes=moved))
+            else:
+                self.add(Work(device_bytes=moved, global_reductions=moved))
         elif primitive is lax.dot_general_p:
             # A TPU core's product on its MXU: `2 m n k`, its output's elements over its contracted ones,
             # one pass in its operands' mode. Not `product_mode`'s passes: Mosaic TPU lowers a body's product

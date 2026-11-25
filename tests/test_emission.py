@@ -858,3 +858,44 @@ def test_launch_seconds_shares_sm_units_overlaps_paths_and_prices_integer_work()
     got_path_r1 = cost.launch_seconds(path_work, 176, target, resident=1)
     got_path_r2 = cost.launch_seconds(path_work, 176, target, resident=2)
     assert got_path_r2 < got_path_r1, (got_path_r2, got_path_r1)
+
+
+@pytest.mark.parametrize("memory", ["global", "shared"])
+def test_an_atomic_add_counts_its_bytes_reduced_where_global_and_an_a100_prices_them(memory):
+    """A launch of `SMs + 1` programs, each adding a 64 x 64 fp32 tile into memory an element at a time
+    (`plgpu.atomic_add`): into global memory (`red.global`) the launch counts every program's 16 KiB among its
+    global reductions (`Work.global_reductions`), which an A100 prices at its fitted 3 bytes a multiprocessor
+    a clock (M-NA-9), two programs' worth on its busiest multiprocessor whatever their residency, and an H100
+    leaves unpriced; into shared memory (`red.shared::cta`) none, its bytes shared ones."""
+    ampere, hopper = generation.gpu_target("sm80"), generation.gpu_target("sm90")
+    assert ampere.multiprocessors is not None
+    launched = ampere.multiprocessors + 1
+    tile = jax.ShapeDtypeStruct((64, 64), jnp.float32)
+
+    def body(x_ref, o_ref):
+        if memory == "global":
+            plgpu.atomic_add(o_ref, x_ref[...])
+        else:
+            def scoped(smem):
+                plgpu.atomic_add(smem, x_ref[...])
+                o_ref[...] = smem[...]
+
+            pl.run_scoped(scoped, plgpu.SMEM((64, 64), jnp.float32))
+
+    launch = plgpu.kernel(body, out_type=tile, grid=(launched,), grid_names=("programs",))
+    traced = jax.make_jaxpr(emission.costed(launch, Stated(steps=0, bytes_accessed=0)))(tile)
+    (kernel,) = [equation for equation in programs.equations(traced.jaxpr)
+                 if "cost_estimate" in equation.params]
+    work = emission.work_of(kernel)
+    if memory == "shared":
+        assert work.global_reductions == 0 and work.shared_bytes == launched * 64 * 64 * 4
+        return
+    assert work.global_reductions == launched * 64 * 64 * 4
+    reductions = cost.rates(ampere, device=False).reductions
+    assert reductions == 3.0 * ampere.loaded_clock_hz
+    busiest = 2 * ((work.global_reductions / launched) / reductions) + (ampere.launch_seconds or 0.0)
+    for resident in (1, 2):
+        priced = cost.launch_seconds(work, launched, ampere, resident=resident)
+        assert priced == busiest, (resident, priced, busiest)
+    assert cost.rates(hopper, device=False).reductions is None
+    assert work.global_reductions in cost.units(work, cost.rates(hopper, device=False))[1]
