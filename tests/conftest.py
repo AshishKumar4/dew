@@ -621,6 +621,8 @@ class WorkerRequests(list):
     def __init__(self):
         super().__init__()
         self.connections: set[int] = set()
+        # The writes the Worker answers 503, as an unavailable one does: each to a path holding one of these.
+        self.refusing: set[str] = set()
 
 
 @pytest.fixture
@@ -685,6 +687,9 @@ def cache_worker():
 
         def do_PUT(self):
             if not self._authorized():
+                return
+            if any(part in self.path for part in seen.refusing):
+                self._answer(503)
                 return
             if not bounds["min_bytes"] <= int(self.headers["Content-Length"]) <= bounds["max_bytes"]:
                 self._answer(413, close=True)

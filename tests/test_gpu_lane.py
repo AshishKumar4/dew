@@ -818,29 +818,40 @@ def test_a_green_dry_row_keeps_its_baseline_whatever_its_record_does(ci, monkeyp
 
 @pytest.mark.parametrize(("exit_code", "taken"), [(0, True), (1, True), (0, False)])
 def test_a_reused_row_is_named_the_commits_only_as_its_grade_leaves_it_green(ci, monkeypatch, tmp_path,
-                                                                          exit_code, taken):
-    """A row reused from its record is named the commit's (`named_at_commit`) only after it is graded, where
-    its grade leaves it green and its baseline is written (`baselined`): a reuse graded red publishes
-    nothing, and a green one whose baseline the store did not take is named nowhere and stands stale."""
-    row = {"name": "3.12:tests/test_gpu_a.py#@prepare-sm90", "exitCode": 0, "unprepared": ["a @ x"]}
-    calls = []
+                                                                          cache_worker, exit_code, taken):
+    """A dry prepare's row reused from its record (`tested` again on the same inputs, the cache Worker's) is
+    named the commit's (`named_at_commit`) only after it is graded, where its grade leaves it green and the
+    Worker takes its baseline (`baselined`): a reuse graded red publishes nothing, and a green one whose
+    baseline the Worker refused is named nowhere and stands stale (row 13005: through the Worker, not its
+    writers replaced)."""
+    url, stored, seen = cache_worker
+    cached(monkeypatch, url)
+    (tmp_path / "tests/test_gpu_a.py").write_text("def test_a():\n    pass\n")
+    interpreter(tmp_path, "3.12")
+    commit(tmp_path, "the commit")
+    out = tmp_path / "rows.json"
 
-    def reused_rows(python, tests, group, common, network, kept, named, reading):
-        named[row["name"]] = ("cls", "key")
-        return [{**row, "cached": "key"}]
+    def run(code: int) -> dict:
+        ci.tested("3.12", ["tests/test_gpu_a.py"], "", out, 60.0, "on", 5.0, "common", {},
+                  variant="@prepare-sm90",
+                  judged=lambda rows: [{**each, "exitCode": code, "unprepared": ["a @ x"]} for each in rows])
+        [row] = json.loads(out.read_text())["rows"]
+        return row
 
-    monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
-    monkeypatch.setattr(ci, "reused_rows", reused_rows)
-    monkeypatch.setattr(ci, "row", lambda python, name, group: row["name"])
-    monkeypatch.setattr(ci.run_keys, "baselined", lambda *args: taken)
-    monkeypatch.setattr(ci.run_keys, "named_at_commit", lambda *args: calls.append(args))
-    ci.tested("3.12", ["tests/test_gpu_a.py"], "", tmp_path / "rows.json", 60.0, "on", 5.0, "common", {},
-              judged=lambda rows: [{**found, "exitCode": exit_code} for found in rows])
-    named = [(row["name"], "cls", "key")] if exit_code == 0 and taken else []
-    assert [call[1:4] for call in calls] == named
-    [written] = json.loads((tmp_path / "rows.json").read_text())["rows"]
-    assert (written["exitCode"], written.get("kind")) == ((0, None) if exit_code == 0 and taken else
-                                                          (1, None) if exit_code else (1, ci.grading.STALE))
+    def published() -> set[str]:
+        return {key for key in stored if "-baseline/" in key or "-main/" in key}
+    first = run(0)
+    for key in published():
+        del stored[key]
+    if not taken:
+        seen.refusing.add("-baseline/")
+    row = run(exit_code)
+    named = exit_code == 0 and taken
+    assert "cached" in row and first["name"] == row["name"]
+    kinds = {key.split("-")[2].split("/")[0] for key in published()}
+    assert kinds == ({"baseline", "main"} if named else set())
+    assert (row["exitCode"], row.get("kind")) == ((0, None) if named else
+                                                  (1, None) if exit_code else (1, ci.grading.STALE))
 
 
 def test_a_file_that_does_not_collect_is_its_own_red_row_and_the_lanes_other_files_run(
