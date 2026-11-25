@@ -1337,9 +1337,9 @@ def test_mosaic_planning_uses_explicit_target_not_ambient_gpu():
 
 @lowers("sm90")
 def test_gemm_register_model_fits_sm90_epilogue_and_tgmm_census():
-    """The GEMM register model holds legal multi-output epilogues, a hook's a 64-column chunk at a time, and
-    `dew_tgmm` spill-free under sm90 ptxas, and scopes wgmma `tgmm` scalar addressing away from tcgen05
-    (rows 8723, 11946, 11947, 1958)."""
+    """The GEMM register model admits multi-output epilogue tiles that compile spill-free under sm90 ptxas
+    (a column-local hook read out 64 columns at a time, so the 64 x 256 mixed-output tile too), and `dew_tgmm`
+    likewise, and scopes wgmma `tgmm` scalar addressing away from tcgen05 (rows 8723, 11946, 11947, 1958)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels
 

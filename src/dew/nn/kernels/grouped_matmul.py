@@ -286,7 +286,7 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
         (row 11982)."""
         from .templates.axes import held as held_axes
         from .templates.gemm import pricing, quantized
-        from .templates.gemm.hooks import column_local
+        from .templates.gemm.hooks import read_out
 
         hooks = ba.arguments['hooks']
         family = pricing.family_of(config, ba.arguments['tokens'].dtype, target)
@@ -303,14 +303,11 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
         out_dtypes = hooks.out_dtypes or stored
         return pricing.epilogue_registers(family, config.share, columns, out_dtypes, vectors=vectors,
                                           tiles=tiles, has_hook=True, staging=config.staging,
-                                          hooked=pricing.hook_chunk(
-                                              family, config.share, columns, out_dtypes,
-                                              quantized.forms_of(hooks.out_forms, out_dtypes),
-                                              config.staging, local=column_local(
-                                                  hooks.after(), hooks.accumulators,
-                                                  tuple((held_axes(axes), side.dtype) for side, axes in zip(
-                                                      ba.arguments.get('epilogue_operands', ()),
-                                                      hooks.epilogue_axes, strict=True)))))
+                                          hooked=read_out(
+                                              family, (config.share, columns), out_dtypes,
+                                              quantized.forms_of(hooks.out_forms, out_dtypes), config.staging,
+                                              hooks.accumulators, hooks.after(), hooks.epilogue_axes,
+                                              ba.arguments.get('epilogue_operands', ())).columns)
 
     def _step_sizes(self, ba) -> tuple[int, ...] | None:
         del ba
@@ -2149,14 +2146,16 @@ def _declared() -> dict[tuple[str | None, Kind], tuple[selection.Kernel[GroupedC
     lagging = {}
     for timing in timings():
         if timing.winner == REFERENCE:
-            lagging.setdefault((timing.generation, timing.made), timing.evidence)
+            lagging.setdefault((timing.generation, timing.made), timing)
     for board in SCOREBOARDS:
         for made in board.times:
             if board.winner(made) == REFERENCE:
                 cells[board.generation, Kind(dense=True, made=made)] = (XLA, board.why(made))
-            elif (board.generation, made) in lagging:
+            elif (witness := lagging.get((board.generation, made))) is not None:
+                fewest, most = witness.timed.span
                 cells[board.generation, Kind(dense=True, made=made)] = (XLA, (
-                    f"{board.why(made)}; but {lagging[board.generation, made]}"))
+                    f"{board.why(made)}; but its {witness.matrix[0]} x {witness.matrix[1]} product at "
+                    f"{fewest}-{most} rows lags: {witness.evidence}"))
     for name, receipt in M_FS_34.items():
         for made in (Made.FORWARD, Made.INPUT_GRADIENT, Made.KERNEL_GRADIENT):
             cells[name, Kind(dense=True, made=made)] = (XLA, receipt)

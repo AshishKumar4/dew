@@ -913,7 +913,8 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         staging = self.output_staging(outputs, consumers, chunks)
         opened: list = []
 
-        def store(output, value, ref, place):
+        def store(output, value, ref, place, within=None):
+            del within  # each tile staged whole (`stores_chunks` off): a hook reads it out whole
             # A narrowed output (`stores.Output.narrowed`) is staged whole at its stored shape, its `place`
             # its own columns (its caller's), as a chunk-staging family's stores take it (`stores.staged`).
             # Interpreted pipelines use barrier-tracked copies, not cp.async groups.

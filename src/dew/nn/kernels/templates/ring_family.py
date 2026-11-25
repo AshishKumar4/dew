@@ -245,16 +245,17 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         `divisor` tile columns a stored column, perhaps transposed), and stored by TMA, waiting only for a
         buffer's last store to read it before it writes it again (`stores.staged_chunks`,
         `stores.buffer_waits`)."""
-        def store(output, value, ref, place):
+        def store(output, value, ref, place, within=None):
             form = forms[output] if forms else None
             if form is None:
-                staged_chunks(smems[output].at[index], value, ref, place, write=self.written)
+                staged_chunks(smems[output].at[index], value, ref, place, write=self.written, within=within)
                 return
             if form.write is not None and isinstance(ref, Scattered):
                 raise ValueError("a scattered output's rows land a row at a time as computed, no write of "
                                  "its own")
             staged_chunks(smems[output].at[index], value, ref, place, write=form.write or self.written,
-                          divisor=form.divisor, transposed=form.transposed, narrowed=form.narrowed)
+                          divisor=form.divisor, transposed=form.transposed, narrowed=form.narrowed,
+                          within=within)
 
         return store
 

@@ -34,6 +34,13 @@ def _centred(dtypes):
     return hook
 
 
+def _width_scaled(dtypes):
+    """A hook scaling each entry by its tile's width: entrywise, but reading the extent it is traced at."""
+    def hook(acc):
+        return ((acc * acc.shape[-1]).astype(dtypes[0]),)
+    return hook
+
+
 def _two_widths(dtypes):
     """A hook storing two values in `dtypes` (a bf16 one and an FP8 one, staged at different widths)."""
     def hook(acc):
@@ -56,13 +63,14 @@ def _reference(hook, out_dtypes, wide=jnp.float32):
     return run
 
 
-@pytest.mark.parametrize(("hook", "out_dtypes"), [(_centred, (jnp.float32,)),
+@pytest.mark.parametrize(("hook", "out_dtypes"), [(_centred, (jnp.float32,)), (_width_scaled, (jnp.float32,)),
                                                   (_two_widths, (jnp.bfloat16, jnp.float8_e4m3fn))],
-                         ids=["row-maximum", "two-widths"])
+                         ids=["row-maximum", "width-scaled", "two-widths"])
 def test_a_hooked_product_over_a_chunked_tile_is_its_programs(hook, out_dtypes):
-    """A row-maximum hook (no column-local one: it takes the tile whole) and a two-dtype hook (its FP8 output
-    staged 128 columns wide where its bf16 one is 64) through the template at a 128-column tile, interpreted
-    as an H100 runs it: as exact as XLA's product and hook, from float64."""
+    """A row-maximum hook and one scaling by its tile's width (neither column-local: each takes the tile
+    whole), and a two-dtype hook (its FP8 output staged 128 columns wide where its bf16 one is 64), through
+    the template at a 128-column tile, interpreted as an H100 runs it: as exact as XLA's product and hook,
+    from float64."""
     assert_as_exact(jax.jit(_template(hook, out_dtypes)), jax.jit(_reference(hook, out_dtypes)), _draw,
                     f"chunked hook {hook.__name__}", seeds=SEEDS,
                     truth_fn=_reference(hook, (jnp.float64,) * len(out_dtypes), wide=jnp.float64))

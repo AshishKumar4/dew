@@ -224,7 +224,7 @@ def column_chunks(value: jax.Array, width: int) -> list[tuple[int, jax.Array]]:
 
 def staged_chunks(smem, value: jax.Array, ref, place: tuple, *, write: Callable = written,
                   waits: tuple[int, ...] | None = None, divisor: int = 1, transposed: bool = False,
-                  narrowed: bool = False) -> None:
+                  narrowed: bool = False, within: tuple[int, int] | None = None) -> None:
     """A consumer's share `value` of an output tile staged through its chunk buffers (`smem`, `[buffers,
     rows, columns]`) a buffer's columns at a time (`column_chunks`) and stored to `ref` at `place`
     (`(row_start, first, stored, column, *ladder)`, `staged_rows`), each chunk's buffer written once the
@@ -234,14 +234,18 @@ def staged_chunks(smem, value: jax.Array, ref, place: tuple, *, write: Callable 
     every chunk staged commits at least one (`buffer_waits`). An output stored packed (`divisor`,
     `Output.divisor`) stages a buffer's columns times it of the tile a chunk, stored at its tile column over
     it; `transposed` (`Output.transposed`), its buffer `[columns, rows]`, stored whole (`transposed_rows`);
-    `narrowed` (`Output.narrowed`), its value and `place` already its stored columns, a buffer's at a time."""
+    `narrowed` (`Output.narrowed`), its value and `place` already its stored columns, a buffer's at a time.
+    `within` (the value's first column in its tile and the tile's columns, where an epilogue reads its tile
+    out a part at a time, `hooks.ReadOut.columns`): its chunks the tile's from that column on, each in its
+    turn's buffer, waiting as the tile's whole sequence of chunks does."""
     pl.when(place[2] > 0)(functools.partial(staged, smem, value, ref, place, write=write, waits=waits,
-                                            divisor=divisor, transposed=transposed, narrowed=narrowed))
+                                            divisor=divisor, transposed=transposed, narrowed=narrowed,
+                                            within=within))
 
 
 def staged(smem, value: jax.Array, ref, place: tuple, *, write: Callable = written,
            waits: tuple[int, ...] | None = None, divisor: int = 1, transposed: bool = False,
-           narrowed: bool = False) -> None:
+           narrowed: bool = False, within: tuple[int, int] | None = None) -> None:
     """`staged_chunks`' chunks staged whatever rows `place` stores: each its buffer's wait, its write and
     its stores."""
     buffers, width = smem.shape[0], smem.shape[-2 if transposed else -1]
@@ -262,14 +266,18 @@ def staged(smem, value: jax.Array, ref, place: tuple, *, write: Callable = writt
     # A narrowed value and its place are its stored columns already (its caller's: a tile's column over the
     # divisor is no multiple of the stores' tiling the lowering can prove); a packed one's its tile's.
     chunks = column_chunks(value, width if narrowed else width * divisor)
-    waits = buffer_waits(len(chunks), buffers) if waits is None else waits
+    # A part of its tile (`within`): its chunks the tile's from its first column's on, in that turn.
+    offset, total = (0, len(chunks)) if within is None else (
+        within[0] // (width * divisor), -(-within[1] // (width * divisor)))
+    waits = buffer_waits(total, buffers)[offset:] if waits is None else waits
     for chunk, (start, piece) in enumerate(chunks):
         plgpu.wait_smem_to_gmem(waits[chunk], wait_read_only=True)
         at = column + start if narrowed else (column + start) // divisor
+        buffer = smem.at[(offset + chunk) % buffers]
         if transposed:
-            transposed_rows(smem.at[chunk % buffers], piece, ref, row_start, at, write=write)
+            transposed_rows(buffer, piece, ref, row_start, at, write=write)
             continue
-        staged_rows(smem.at[chunk % buffers], piece, ref, row_start, first, stored, at, *ladder, write=write)
+        staged_rows(buffer, piece, ref, row_start, first, stored, at, *ladder, write=write)
 
 
 def _whole_shares(rows: int, columns: int, extent: int, first, stored) -> None:
