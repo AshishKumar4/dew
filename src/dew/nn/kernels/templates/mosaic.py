@@ -1519,7 +1519,7 @@ def _column_sums(ctx, tile, scratch):
     return tile.reduce("add", axis=0, scratch=scratch)
 
 
-def _selected(predicate, taken, other):
+def selected(predicate, taken, other):
     """`taken` where `predicate` holds, else `other`, leaf by leaf: a splat predicate's select, which keeps
     each leaf in its own layout (an implicit broadcast lowers in no warpgroup semantics)."""
     return jax.tree.map(lambda one, two: jnp.where(jnp.full(one.shape, predicate), one, two), taken, other)
@@ -2321,7 +2321,7 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
                     reads = [read(partials, other, column, width) for other in others]
                     value = combine(value, reads[0])
                     for i, partial in enumerate(reads[1:], 1):
-                        value = _selected(start + i < gathered, combine(value, partial), value)
+                        value = selected(start + i < gathered, combine(value, partial), value)
                     parts.append(value)
                 return parts[0] if len(parts) == 1 else across.joined(parts, widest)
 
