@@ -22,8 +22,6 @@ import os
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING
 
-from dew import _cgroups
-
 if TYPE_CHECKING:
     from jax.sharding import AbstractMesh, Mesh
 
@@ -2043,6 +2041,8 @@ def host_memory_share() -> int:
     import resource
 
     import jax
+
+    from dew import _cgroups
 
     limits = [os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"), *_cgroups.memory_limits()]
     address, _ = resource.getrlimit(resource.RLIMIT_AS)
