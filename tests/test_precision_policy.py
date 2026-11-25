@@ -1582,9 +1582,9 @@ def test_an_integral_exponents_float_halves_scale_as_its_integer_halves_bit_for_
     `float_bits.whole_power2`), is its integer halves' value bit for bit, compiled: at every integral `k`
     from -300 to 300 and at both infinities, on operands whose half-scaled products round below the least
     normal (a significand of 24 bits at 2^-125) and past the largest, a zero's, an infinity's and a NaN's;
-    a NaN `k` (no integer) on a NaN operand, `recurrence_algebra.raised`'s, a NaN; and at a fractional
-    reach and one float32 rounds to an integer, the first of which clipped an integral `k` to a fraction the
-    float halves rounded up and the second a floor of took below float32's clip (head review e25adf11a)."""
+    a NaN `k` (no integer) on a NaN operand, `recurrence_algebra.raised`'s, a NaN; and at fractional
+    reaches, a weak one float32's clip rounds to an integer and a float64 one an x64 clip keeps, each of
+    which clipped an integral `k` to a fraction the float halves rounded (head review e25adf11a)."""
     from dew.nn.precision import power2
 
     exponents = np.asarray([*range(-300, 301), np.inf, -np.inf], np.float32)
@@ -1602,11 +1602,14 @@ def test_an_integral_exponents_float_halves_scale_as_its_integer_halves_bit_for_
     np.testing.assert_array_equal(found.view(np.uint32)[numbers], expected.view(np.uint32)[numbers])
     nan = np.float32(np.nan)
     assert np.isnan(np.asarray(power2(nan, nan, TWO_FACTOR_REACH, integral=True)))
-    # A fractional reach, and one float32 rounds to an integer, as the integer halves take them.
+    # A fractional reach, one float32 rounds to an integer and one float64 keeps fractional, as the
+    # integer halves take them.
     clipped = np.asarray([-3, -2, 2, 3], np.float32)
-    for reach in (1.75, 1.999999999):
-        np.testing.assert_array_equal(np.asarray(power2(np.float32(1), clipped, reach, integral=True)),
-                                      np.asarray(power2(np.float32(1), clipped, reach)), err_msg=str(reach))
+    for reach, wide in ((1.75, False), (1.999999999, False), (np.float64(1.999999999), True)):
+        with jax.enable_x64(new_val=wide):
+            found = np.asarray(power2(np.float32(1), clipped, reach, integral=True))
+            expected = np.asarray(power2(np.float32(1), clipped, reach))
+        np.testing.assert_array_equal(found, expected, err_msg=str(reach))
 
 
 def test_a_stated_reach_past_two_normal_halves_scales_a_large_operand_exactly():
