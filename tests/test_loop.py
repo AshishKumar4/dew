@@ -1285,6 +1285,30 @@ def test_a_gathered_loop_trains_the_same_model(mesh_shape, loop):
                     seeds=SEEDS['gathered'], truth_fn=result(apart.clone(dtype=jnp.float64), placed=False))
 
 
+@pytest.mark.mesh(devices=8)
+def test_a_reduced_copy_a_gathered_region_writes_out_is_placed_back_whole():
+    """A matrix gathered reduced over the FSDP axis inside a gathered loop's Explicit region
+    (`sharding.gathered_over`, `explicit_over`), written out of it as a pass's sown value is
+    (`sharding.typed_on`), is placed back on the step's mesh whole, the copy it is: its sum over an axis
+    that mesh leaves Auto is no placement there, which JAX refused (the row 12849 review)."""
+    from dew.nn.sharding import explicit_over, gathered_over, typed_on
+    from dew.training import MeshSpec
+
+    mesh = MeshSpec(fsdp=8).build(jax.devices()[:8])
+    weight = np.arange(64, dtype=np.float32).reshape(16, 4)
+    with jax.set_mesh(mesh):
+        held = jax.device_put(weight, jax.sharding.PartitionSpec("fsdp"))
+        rows = jax.device_put(np.ones((8, 4), np.float32), jax.sharding.PartitionSpec("fsdp"))
+        outer = jax.sharding.get_abstract_mesh()
+
+        def written(rows):
+            return explicit_over(lambda rows: typed_on(
+                gathered_over(held, jax.sharding.PartitionSpec("fsdp"), {"fsdp"}), outer), rows)
+
+        out = jax.jit(written)(rows)
+    np.testing.assert_array_equal(np.asarray(out), weight)
+
+
 def test_a_gathered_loop_traced_under_no_layout_is_the_loop():
     """Under no traced layout (an initialization, a server's forward), a gathered loop reads its block where
     it lies: its program is the plain loop's, equation for equation (`Loop.gathered`)."""
