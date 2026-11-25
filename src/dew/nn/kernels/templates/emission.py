@@ -1061,14 +1061,10 @@ def _expanded(equation) -> tuple[jax_core.Jaxpr, Sequence] | None:
 
 def _platform_branch(platforms) -> int:
     """The branch of a `lax.platform_dependent` whose platforms (`platform_index`'s `platforms`, a branch's
-    names, or None for its default) hold the priced platform's (`generation.backend`: a TPU's, a CPU's; a
-    GPU's `cuda` where the priced target is an NVIDIA generation's, `sm`, whether assumed or the selected
-    device's, else unpriced: no other GPU's lowering platform is Dew's to name)."""
-    name = generation.backend()
-    if name == "gpu":
-        if not generation.gpu_target().generation.startswith("sm"):
-            raise Unpriced(f"a platform choice among {platforms} on a GPU of no NVIDIA generation")
-        name = "cuda"
+    names, or None for its default) hold the platform the call lowers for (`generation.lowering_platform`),
+    unpriced where its facts do not name one."""
+    if (name := generation.lowering_platform()) is None:
+        raise Unpriced(f"a platform choice among {platforms} on a GPU whose platform its facts do not name")
     named = [index for index, names in enumerate(platforms) if names is not None and name in names]
     defaults = [index for index, names in enumerate(platforms) if names is None]
     if not named and not defaults:

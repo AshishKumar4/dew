@@ -2143,6 +2143,25 @@ def backend() -> str:
     return generation
 
 
+def lowering_platform() -> str | None:
+    """The platform JAX lowers a call's code for, as `lax.platform_dependent` names it: within a
+    non-interpreted `assumed`, its generation's (`cuda` for an `smXY`, `tpu` for a TPU's); else the placed
+    platform's (`placed_platform`), a GPU's `cuda` where its device (`placed_device`, concrete or a
+    compile-only mesh's abstract one) states an NVIDIA compute capability. None where those facts do not name
+    it (a GPU device stating none)."""
+    import re
+
+    if (found := assumption()) is not None and not found.interpreted:
+        if found.generation.startswith('sm'):
+            return 'cuda'
+        return 'tpu' if found.generation in TARGETS and tpu(TARGETS[found.generation]) else found.generation
+    platform = placed_platform()
+    if platform != 'gpu':
+        return platform
+    stated = _compute_capability(placed_device())
+    return 'cuda' if stated and re.fullmatch(r'\d+\.\d+', stated) else None
+
+
 def triton_runs() -> bool:
     """Return whether Dew's Pallas GPU (Triton) kernels can run here.
 
