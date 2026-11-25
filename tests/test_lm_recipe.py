@@ -901,7 +901,7 @@ def test_a_pretrained_run_loops_its_decoder_as_a_decision_run_does(tmp_path):
     config = recipe_run(Started, tokens, "--pretrained", str(checkpoint), "--trainer.steps", "1",
                         "--max-new-tokens", "0",
                         default=Started(data=windows(tokens), validation=windows(tokens, held=True),
-                                        loop=loop))
+                                        pretrained=str(checkpoint), loop=loop))
     objective = config.prepare().train("looped")
     assert objective.model.loop == loop
     loaded = Pretrained.load(checkpoint, dtype="float32")

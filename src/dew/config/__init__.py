@@ -1703,14 +1703,16 @@ class DecoderRunConfig(RunConfig):
     (`CausalTransformer.loop`) and the pass counts its steps take, each the run's choice over the
     checkpoint's own. The language-model and the decision runs take it."""
 
-    loop: Annotated[Loop | None, tyro.conf.Suppress] = None
+    loop: Annotated[Loop | LoopChange | None, tyro.conf.Suppress] = None
     """The loop the decoder runs (`dew.nn.backbones.decoder_stack.Loop`: its block, passes, recompute, exits,
     θ and messages), in place of the checkpoint's own: a pretrained decoder with no loop gains it over its
     own layers, as Qwen 3.5's middle block repeated twice (`Loop(2, layers=(8, 16), step_norm=False)`),
     and a looped one's loop is replaced whole (`dataclasses.replace(its_loop, exit_gate=True)` changes
     one of its choices). A loop that gives its layers parameters of their own (an implicit loop's θ, an exit
     gate, the messages' merges) draws them at their zeros beside the loaded weights, so the decoder
-    starts as the one loaded computes (`Pretrained.with_model`). None keeps the checkpoint's own."""
+    starts as the one loaded computes (`Pretrained.with_model`). None keeps the checkpoint's own. A saved
+    run's record read from before a run stated its loop whole holds its changes to the checkpoint's
+    (`dew.config.earlier.LoopChange`, read only from a record, carried to 1.0)."""
     passes: Annotated[PassPolicy | None, tyro.conf.Suppress] = None
     """The passes the loop runs each step (`PassPolicy`): one count (an int); one count a phase of the
     run's data (a tuple, `dew.data.phases`, `Trainer`'s `phase_passes`), each phase's step compiled with its
