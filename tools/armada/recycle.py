@@ -8,6 +8,7 @@ reads as its word to run again. This module imports no pytest: ci.py reads its n
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 RECYCLE_AT = "DEW_RECYCLE_AT"
 """What names the resident bytes past which a dry prepare's pytest ends after the test running."""
@@ -21,7 +22,7 @@ CONTINUES = "DEW_CONTINUES_ROW"
 """Set in each later process of one row's task (ci.py's `tested`): the shared XLA cache's bundles it writes
 keep every program it fetched, its row's earlier processes' among them (tests/remote_cache.py)."""
 
-_session: dict[str, object] = {}
+_session: dict[str, Any] = {}
 
 
 def resident() -> int:

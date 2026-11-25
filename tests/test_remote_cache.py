@@ -525,6 +525,13 @@ def test_a_bundle_keeps_what_its_run_loaded_or_compiled_and_drops_the_chunks_it_
     assert programs(tmp_path / "again") == {"jit_a-1": b"a" * 600}
 
 
+def closed_and_kept(cache, stored: dict, file: str) -> set[str]:
+    """The programs `file`'s bundle keeps once `cache` closed it and sent what it holds."""
+    cache.closed(file)
+    cache.drain()
+    return {key for key, _ in remote_cache.unpacked(stored[f"/jax/cpu/bundles/{file}"])[0]}
+
+
 def test_a_bundle_that_runs_again_after_another_keeps_what_it_loaded_in_each_stint(cache_worker, tmp_path):
     """A file's bundle closed, another's run, then the first's again (A, B, A): a fetched program the first
     loads only in its second stint stays in its bundle with the one it loaded in its first (review,
@@ -541,10 +548,7 @@ def test_a_bundle_that_runs_again_after_another_keeps_what_it_loaded_in_each_sti
     cache.closed("tests/b.py")
     cache.opened("tests/a.py")
     loaded(tmp_path, "jit_y-1")
-    cache.closed("tests/a.py")
-    cache.drain()
-    kept = {key for key, _ in remote_cache.unpacked(stored["/jax/cpu/bundles/tests/a.py"])[0]}
-    assert kept == {"jit_x-1", "jit_y-1"}
+    assert closed_and_kept(cache, stored, "tests/a.py") == {"jit_x-1", "jit_y-1"}
 
 
 def test_a_later_process_of_one_rows_task_keeps_its_bundles_earlier_programs(
@@ -559,10 +563,7 @@ def test_a_later_process_of_one_rows_task_keeps_its_bundles_earlier_programs(
     cache = remote_cache.RemoteCache(tmp_path, url, "token", "jax/cpu")
     cache.opened("tests/a.py")
     compiled(tmp_path, "jit_b-1")
-    cache.closed("tests/a.py")
-    cache.drain()
-    kept = {key for key, _ in remote_cache.unpacked(stored["/jax/cpu/bundles/tests/a.py"])[0]}
-    assert kept == {"jit_x-1", "jit_b-1"}
+    assert closed_and_kept(cache, stored, "tests/a.py") == {"jit_x-1", "jit_b-1"}
 
 
 def test_a_url_that_is_no_address_leaves_the_local_cache_as_it_is(tmp_path):
