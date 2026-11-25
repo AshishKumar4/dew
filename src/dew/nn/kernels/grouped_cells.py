@@ -366,10 +366,11 @@ STEP_HELD: dict[tuple[str, Made], str] = {
 }
 """Kinds the template's products are at parity in, in time and each product's temporaries (`SCOREBOARDS`),
 held on XLA's dot by evidence about the step around them, each with it (kernel-templates.md §1: peak
-memory). The GH200's dense input gradient's step leaks were the mapped projections' and XLA's dot's
-(row 12898: fixed in `sharding.on_shards` and `gemm.xla_mainloop`); it stays held until a GEMM-routed
-step's two route-reading tests read their route (tests/test_lowering.py's launch count,
-tests/test_miss_driven_rungs.py's checkpoint names through a reshape)."""
+memory). The GH200's dense input gradient's step leaked through the mapped projections' weight reductions
+(row 12898, fixed in `sharding.on_shards`); it stays held while an nGPT block's step still holds 13-17 MB
+more with it (tests/test_step_memory_3.py: its dense bf16 products' XLA dots, an fp32 product and a convert,
+whose output no reduction fuses) and the step's checkpoint names are lost through `platform_dependent`'s
+inlined branch (tests/test_miss_driven_rungs.py)."""
 
 M_FS_34 = {
     'sm86': ("M-FS-34 / LF-P0-sm86-a10 (an A10, main 45131ca01, XLA tuned on the GPU): the template "
