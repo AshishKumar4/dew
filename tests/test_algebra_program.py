@@ -2249,7 +2249,7 @@ def test_structural_closed_isolates_callbacks_device_consts_and_prng_impls():
     """`program._STRUCTURAL_CLOSED` and `terms.body_key` distinguish `pure_callback` closures from the same
     factory, same-tag `define_prng_impl` specs with distinct implementations, and decline structural sharing
     without touching device memory when a nested `pjit` holds a concrete `jax.Array`."""
-    from jax.core import eval_jaxpr
+    from jax.core import ShapedArray, eval_jaxpr
     from jax.extend import random as jrandom
 
     def make_cb_body(offset: float):
@@ -2317,8 +2317,7 @@ def test_structural_closed_isolates_callbacks_device_consts_and_prng_impls():
         rp_b = program._closed(p_b, accurate=False, saturation=algebra.SATURATION, kernels=True)
     assert rp_a is not p_a and rp_b is not p_b and rp_a.jaxpr is not rp_b.jaxpr
     a0, b0 = rp_a.in_avals[0], rp_b.in_avals[0]
-    assert isinstance(a0, jax.core.ShapedArray) and isinstance(b0, jax.core.ShapedArray)
-    assert a0.dtype != b0.dtype
+    assert isinstance(a0, ShapedArray) and isinstance(b0, ShapedArray) and a0.dtype != b0.dtype
     cpu_a = program._closed(p_a, accurate=False, saturation=algebra.SATURATION, kernels=True)
     cpu_b = program._closed(p_b, accurate=False, saturation=algebra.SATURATION, kernels=True)
     assert int(eval_jaxpr(cpu_a.jaxpr, cpu_a.consts, key_a, x_in, w_in)[0][0]) == 11
