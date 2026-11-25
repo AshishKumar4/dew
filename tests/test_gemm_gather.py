@@ -980,8 +980,12 @@ def test_a_refused_gathered_tile_still_offers_its_ladders_next_rung():
     with generation.assumed("sm90"), report.refusals():
         target = generation.gpu_target()
         tile = op.derived(ba, target)
-        refused = [tile, *list(producers.rungs(op, ba, tile, target))[:3]]
-        report.refuse([(report._identity(op, ba, target), each, frozenset({op.KERNEL})) for each in refused])
+        identity = report._identity(op, ba, target)
+        report.refuse([(identity, tile, frozenset({op.KERNEL}))])
+        rungs = list(producers.rungs(op, ba, tile, target))[:3]
+        assert rungs, "a gathered tile's producer steps"
+        report.refuse([(identity, rung, frozenset({op.KERNEL})) for rung in rungs])
+        refused = [tile, *rungs]
         offered = op.remaining(ba)
         assert offered is not None and offered not in refused and op.legal(ba, offered, target), offered
 
