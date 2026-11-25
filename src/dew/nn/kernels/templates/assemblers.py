@@ -60,8 +60,8 @@ def triton() -> tuple[str, ...] | None:
     gives each compile (`jax._src.lib.cuda_path`: `CUDA_ROOT`'s, else the nvcc wheel's), by its build
     (`ptxas_build`), beside the nvJitLink XLA's automatic mode assembles with instead where one loads: the
     wheels' by version, and each library the loader could open by soname (`nvjitlink_libraries`). None
-    where JAX names no directory: XLA's own search finds its ptxas, which no key states. Read once a
-    process."""
+    where JAX names no directory (XLA's own search finds its ptxas, which no key states) or the loader's
+    libraries cannot be listed. Read once a process."""
     from jax._src.lib import cuda_path
 
     if cuda_path is None:
@@ -69,30 +69,46 @@ def triton() -> tuple[str, ...] | None:
         return None
     if (build := ptxas_build(os.path.join(cuda_path, "bin", "ptxas"))) is None:
         return None
+    if (libraries := nvjitlink_libraries()) is None:
+        _log.info("certification stores no Pallas-Triton kernel's verdict: the linker cache cannot be listed")
+        return None
     named = (((distribution.metadata.get("Name") or "").lower(), distribution)
              for distribution in importlib.metadata.distributions())
     return (build, *sorted(f"{name}=={distribution.version}" for name, distribution in named
-                           if re.fullmatch(r"nvidia-nvjitlink(-cu\d+)?", name)), *nvjitlink_libraries())
+                           if re.fullmatch(r"nvidia-nvjitlink(-cu\d+)?", name)), *libraries)
 
 
-def nvjitlink_libraries() -> list[str]:
+DEFAULT_LIBRARY_DIRECTORIES = ("/lib64", "/usr/lib64", "/lib", "/usr/lib", "/lib/x86_64-linux-gnu",
+                               "/usr/lib/x86_64-linux-gnu", "/lib/aarch64-linux-gnu",
+                               "/usr/lib/aarch64-linux-gnu")
+"""The directories the dynamic loader searches last, its cache aside (ld.so(8)'s defaults, Debian's multiarch
+ones among them)."""
+
+
+def nvjitlink_libraries() -> list[str] | None:
     """Each libnvJitLink the process's dynamic loader could open by soname, as XLA's nvJitLink stub opens
-    one: those in `LD_LIBRARY_PATH`'s directories and the linker cache's (`ldconfig -p`), each by its path,
-    size and modification, so a system library updated in place where no wheel provides one keys its
-    launches afresh (row 12166). A cache that does not list stands for none."""
-    paths = [str(path) for directory in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep) if directory
-             for path in sorted(Path(directory).glob("libnvJitLink.so*"))]
+    one: those in `LD_LIBRARY_PATH`'s directories, the linker cache's (`ldconfig -p`) and the loader's
+    default directories, each by the name it is found by, the file that name resolves to, and that file's
+    size and modification, so a system library updated in place where no wheel provides one, or a soname
+    pointed at another file, keys its launches afresh (row 12166). None where the linker cache cannot be
+    listed (no `ldconfig`): the inventory unknown, no verdict of a Triton launch is stored."""
     ldconfig = shutil.which("ldconfig") or "/sbin/ldconfig"
     try:
-        listed = subprocess.run([ldconfig, "-p"], capture_output=True, text=True, timeout=60).stdout
-    except (OSError, subprocess.TimeoutExpired):
-        listed = ""
+        listed = subprocess.run([ldconfig, "-p"], capture_output=True, text=True, timeout=60,
+                                check=True).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    searched = [directory for directory in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep)
+                if directory]
+    paths = [str(path) for directory in (*searched, *DEFAULT_LIBRARY_DIRECTORIES)
+             for path in sorted(Path(directory).glob("libnvJitLink.so*"))]
     paths += re.findall(r"^\s*libnvJitLink\.so\S*\s.*=>\s*(\S+)$", listed, flags=re.M)
     named = []
-    for path in dict.fromkeys(os.path.realpath(path) for path in paths):
+    for path in dict.fromkeys(paths):
+        resolved = os.path.realpath(path)
         with contextlib.suppress(OSError):
-            held = os.stat(path)
-            named.append(f"{path}:{held.st_size}:{held.st_mtime_ns}")
+            held = os.stat(resolved)
+            named.append(f"{path}->{resolved}:{held.st_size}:{held.st_mtime_ns}")
     return named
 
 
