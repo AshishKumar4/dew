@@ -174,14 +174,17 @@ class _Scope(NamedTuple):
     structural_safe: bool
 
 
-def _holds_device_array(value) -> bool:
-    """Whether `value` contains any concrete `jax.Array` (checked before storing a context in a cache key)."""
-    if isinstance(value, jax.Array):
+def _holds_retained_object(value) -> bool:
+    """Whether `value` contains a concrete `jax.Array` or an identity-pinning `_cache.Same` wrapper
+    (checked before storing a trace context in `_STRUCTURAL_CLOSED`)."""
+    if isinstance(value, (jax.Array, _cache.Same)):
         return True
     if isinstance(value, (tuple, list, frozenset, set)):
-        return any(_holds_device_array(part) for part in value)
+        return any(_holds_retained_object(part) for part in value)
     if isinstance(value, Mapping):
-        return any(_holds_device_array(k) or _holds_device_array(v) for k, v in value.items())
+        return any(_holds_retained_object(k) or _holds_retained_object(v) for k, v in value.items())
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return any(_holds_retained_object(getattr(value, field.name)) for field in dataclasses.fields(value))
     return False
 
 
@@ -196,7 +199,7 @@ def _scope_for(accurate: bool, saturation: Saturation, kernels: bool) -> _Scope:
     base = fusion.base_context()
     kernels_key = (base[0], generation.backend(), generation.assumption(), KERNEL_CHOICES.value,
                    KERNEL_PINS.value, generation.draws(), deterministic_ops_requested())
-    return _Scope(deriving, kernels_key, base, structural_safe=not _holds_device_array(base))
+    return _Scope(deriving, kernels_key, base, structural_safe=not _holds_retained_object(base))
 
 
 def _passed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels: bool) -> jcore.Jaxpr:

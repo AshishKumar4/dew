@@ -2316,3 +2316,83 @@ def test_structural_closed_keys_on_drawing_context_in_both_orders():
     assert any(r.choice == "rms_norm" and r.kernel != "xla" for r in real_r2)
     assert not any(r.choice == "rms_norm" and r.kernel != "xla" for r in draw_r2)
     assert out_d1 is d1 and out_n1 is not n1 and out_n2 is not n2 and out_d2 is d2
+
+
+def test_body_key_handles_float0_dag_scaling_equation_context_and_scoped_array_gc():
+    """`terms.body_key` and `_STRUCTURAL_CLOSED` handle `float0` tangent dtypes from integer gradients, stay
+    linear on depth-30 shared nested-jit DAGs, preserve equation-local `cur_abstract_mesh` contexts in both
+    cache orders, and never pin a `jax.Array` held only in a scoped `ContextVar`."""
+    import contextvars
+    import gc
+
+    from jax.sharding import AbstractMesh, AxisType
+
+    import dew
+
+    # 1. `float0` tangent literals/avals from differentiating integer operands never crash `_extended_dtype`.
+    grad_int = jax.grad(lambda x, i: (x * i).sum(), allow_int=True)
+    f0_closed = jax.make_jaxpr(grad_int)(
+        jax.ShapeDtypeStruct((4,), jnp.float32), jax.ShapeDtypeStruct((4,), jnp.int32))
+    assert terms.body_key(f0_closed) is not None
+    assert terms.jaxpr_digest(f0_closed, in_process=True)[0]
+    rewritten_f0 = program._closed(f0_closed, accurate=False, saturation=algebra.SATURATION, kernels=True)
+    assert rewritten_f0 is not None
+    got_g = dew.jit(grad_int)(jnp.ones((4,), jnp.float32), jnp.arange(4, dtype=jnp.int32))
+    np.testing.assert_array_equal(np.asarray(got_g), np.arange(4, dtype=np.float32))
+
+    # 2. Depth-30 shared nested-jit diamond DAG keys and compares in O(depth), never O(2**depth).
+    def build_dag(offset: float):
+        fn = jax.jit(lambda x: x + offset)
+        for _ in range(30):
+            prev = fn
+            fn = jax.jit(lambda x, f=prev: f(x) + f(x + 1.0))
+        return jax.make_jaxpr(fn)(jax.ShapeDtypeStruct((4,), jnp.float32))
+
+    dag_a, dag_b, dag_diff = build_dag(1.0), build_dag(1.0), build_dag(2.0)
+    ka, kb, kd = terms.body_key(dag_a), terms.body_key(dag_b), terms.body_key(dag_diff)
+    assert ka is not None and ka == kb and ka != kd
+    assert terms.jaxpr_digest(dag_a, in_process=True) == terms.jaxpr_digest(dag_b, in_process=True)
+    assert terms.jaxpr_digest(dag_a, in_process=True) != terms.jaxpr_digest(dag_diff, in_process=True)
+
+    # 3. Equation-local `cur_abstract_mesh` isolates structural reuse in both cache orders.
+    mesh_a = AbstractMesh((2,), ("data",), axis_types=(AxisType.Explicit,))
+    mesh_b = AbstractMesh((4,), ("data",), axis_types=(AxisType.Explicit,))
+    shapes = (jax.ShapeDtypeStruct((256, 256), jnp.bfloat16), jax.ShapeDtypeStruct((256,), jnp.bfloat16))
+
+    def make_scoped_body(mesh: AbstractMesh, name: str):
+        def body(x, w):
+            normed = _bf16_rms(x, w)
+            with jax.sharding.use_abstract_mesh(mesh):
+                return normed + jnp.asarray(1.0, normed.dtype)
+
+        body.__name__ = name
+        return jax.make_jaxpr(body)(*shapes)
+
+    for first_mesh, second_mesh, tag in ((mesh_a, mesh_b, "ab"), (mesh_b, mesh_a, "ba")):
+        c_first = make_scoped_body(first_mesh, f"ctx_{tag}_1")
+        c_second = make_scoped_body(second_mesh, f"ctx_{tag}_2")
+        assert terms.body_key(c_first) != terms.body_key(c_second)
+        assert terms.jaxpr_digest(c_first) != terms.jaxpr_digest(c_second)
+        with generation.assumed("sm90"):
+            r_first = program._closed(c_first, accurate=False, saturation=algebra.SATURATION, kernels=True)
+            r_second = program._closed(c_second, accurate=False, saturation=algebra.SATURATION, kernels=True)
+        assert r_first.jaxpr.eqns[-1].ctx.cur_abstract_mesh == first_mesh
+        assert r_second.jaxpr.eqns[-1].ctx.cur_abstract_mesh == second_mesh
+
+    # 4. A concrete `jax.Array` held only in a scoped `ContextVar` is never pinned by `_STRUCTURAL_CLOSED`.
+    scoped_var: contextvars.ContextVar = contextvars.ContextVar("test_scoped_device_array", default=None)
+
+    def run_in_scope() -> weakref.ref:
+        buf = jnp.ones((16, 16), jnp.float32)
+        ref = weakref.ref(buf)
+        token = scoped_var.set(buf)
+        try:
+            traced = jax.make_jaxpr(lambda x: x + 1.0)(jax.ShapeDtypeStruct((4,), jnp.float32))
+            program._closed(traced, accurate=False, saturation=algebra.SATURATION, kernels=True)
+        finally:
+            scoped_var.reset(token)
+        return ref
+
+    arr_ref = run_in_scope()
+    gc.collect()
+    assert arr_ref() is None
