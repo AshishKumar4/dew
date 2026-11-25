@@ -6,11 +6,14 @@ sits below both the data and the model layers."""
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import sys
 from collections.abc import Iterator
 from pathlib import Path
+
+_log = logging.getLogger(__name__)
 
 ROOT = Path("/sys/fs/cgroup")
 """Where the cgroup (v2) hierarchy is mounted."""
@@ -28,11 +31,22 @@ def own(root: Path = ROOT, membership: Path = MEMBERSHIP) -> Path:
     return group if group.is_dir() else root
 
 
+def _read(path: Path) -> str | None:
+    """`path`'s text, None where it cannot be read: a group removed or made unreadable as it is read (a
+    process moved out of one), which leaves its other limits readable."""
+    try:
+        return path.read_text()
+    except OSError as error:
+        _log.debug("cgroup file %s unreadable: %s", path, error)
+        return None
+
+
 def _memberships(membership: Path) -> list[tuple[str, str]]:
     """Each hierarchy `membership` names this process in: its controllers ('' for v2's unified one) and its
-    group's path; none where the file is absent (a host that is not Linux)."""
-    lines = membership.read_text().splitlines() if membership.is_file() else []
-    return [(controllers, path.strip()) for _, controllers, path in (line.split(":", 2) for line in lines)]
+    group's path, verbatim (a group's name may end in a space); none where the file is absent or unreadable
+    (a host that is not Linux)."""
+    lines = (_read(membership) or "").splitlines()
+    return [(controllers, path) for _, controllers, path in (line.split(":", 2) for line in lines)]
 
 
 def levels(group: Path, root: Path = ROOT) -> Iterator[Path]:
@@ -95,7 +109,8 @@ def memory_limits(root: Path = ROOT, membership: Path = MEMBERSHIP) -> list[int]
     """The memory limits on every cgroup this process runs in (`membership`: v2's unified group, v1's memory
     controller's), each group's own and every ancestor's up to its hierarchy's mount under `root`, any of
     which bounds it: a group its mount does not show (a container's, whose own group is its mount's root)
-    states its limit at that root, an ancestor that does. v2's 'max' states none."""
+    states its limit at that root, an ancestor that does. v2's 'max' states none, nor a file unreadable as it
+    is read (`_read`)."""
     limits = []
     for controllers, path in _memberships(membership):
         hierarchy = next((controller for controller in ("", "memory")
@@ -105,8 +120,8 @@ def memory_limits(root: Path = ROOT, membership: Path = MEMBERSHIP) -> list[int]
         mount, name = MEMORY_LIMITS[hierarchy]
         parts = [part for part in path.split("/") if part]
         for depth in range(len(parts), -1, -1):
-            stated = root.joinpath(mount, *parts[:depth], name)
-            if stated.is_file() and (limit := stated.read_text().strip()) != "max":
+            stated = _read(root.joinpath(mount, *parts[:depth], name))
+            if stated is not None and (limit := stated.strip()) not in ("", "max"):
                 limits.append(int(limit))
     return limits
 
