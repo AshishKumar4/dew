@@ -222,12 +222,12 @@ def read_erase_operands(seed):
     return tuple(hosted(x) for x in drawn)
 
 
-def templated(*operands, kernel: str = "mosaic_gpu"):
+def templated(*operands, kernel: str = "mosaic_gpu", target: str = "sm90"):
     """`chunked` with the delta rule on `kernel` (the recurrence template's where unnamed) under the run's
     fast forms, where an fp32 call's products round as fla's do (`recurrence_chunk.fast_rounding`), at an
     H100's facts."""
     fast = dataclasses.replace(generation.numerics(), forms='fast')
-    with (generation.assumed("sm90" if INTERPRETED else None, interpreted=INTERPRETED),
+    with (generation.assumed(target if INTERPRETED else None, interpreted=INTERPRETED),
           generation.run_precision(fast), generation.chosen(gated_delta_rule=kernel)):
         return chunked(*operands)
 
@@ -377,6 +377,25 @@ def test_a_read_erase_under_a_decay_a_key_dimension_trains_on_the_template():
     # Beside its routes, its derivative's portable tangent's (`_per_product`).
     assert {route.kernel for route in found if route.choice == generation.Choice.GATED_DELTA_RULE} == {
         'mosaic_gpu', 'xla'}
+
+
+@pytest.mark.parametrize(('per_key', 'taken'), [(True, {'xla'}), (False, {'mosaic_gpu', 'xla'})],
+                         ids=['pkda', 'pgdn'])
+def test_a_read_erases_training_on_a_99_kb_part_takes_the_route_its_launches_hold(per_key, taken):
+    """A 16-bit training call naming the template on an sm86 (99 KB a block), traced through the public
+    gradient: PKDA's decay a key dimension the portable math's, its key memory launch past the part's
+    registers with its reads (`template.reads_trained`, row 12890; the selector and the rule's gradient one
+    predicate, where the selector's alone gave it the template and its gradient refused), PGDN's decay a head
+    the template's: the kernels its traced routes name, beside the portable tangent's."""
+    drawn = operands(per_key=per_key, shape=TEMPLATED)(0)[:-1]
+    drawn = (*(x.astype(jnp.bfloat16) for x in drawn[:3]), *drawn[3:])
+
+    def loss(*given):
+        return templated(*given, target="sm86")[0].astype(jnp.float32).sum()
+
+    with generation.routes() as found:
+        jax.eval_shape(jax.grad(loss, argnums=(0, 1, 2)), *drawn)
+    assert {route.kernel for route in found if route.choice == generation.Choice.GATED_DELTA_RULE} == taken
 
 
 def test_atks_walk_on_the_template_is_as_exact_over_packed_spans():
