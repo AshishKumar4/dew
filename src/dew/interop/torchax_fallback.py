@@ -155,7 +155,7 @@ def admitted(unmapped: verify.Unmapped) -> TorchAdmission:
                          "which tier 3 runs")
     fields = {key: value for key, value in _records.decoded_floats(unmapped.fields).items()
               if key != "model_type"}
-    config = AutoConfig.for_model(model_type, **fields, experts_implementation=EXPERTS)
+    config = AutoConfig.for_model(model_type, **fields, experts_implementation=_experts())
     _registered()
     # Built as `load` builds it (its config's own attention, which transformers refuses where it has none
     # of the kind), then on the probe's.
@@ -229,7 +229,7 @@ def qualified(config: Mapping[str, object], unavailable: verify.ProbeUnavailable
         raise ValueError(f"model_type {model_type!r}'s probe does not run ({unavailable}), and transformers "
                          "builds no causal LM for it, which tier 3 runs")
     fields = {key: value for key, value in _records.decoded_floats(config).items() if key != "model_type"}
-    source = AutoConfig.for_model(model_type, **fields, experts_implementation=EXPERTS)
+    source = AutoConfig.for_model(model_type, **fields, experts_implementation=_experts())
     _registered()
     context = fields.get("max_position_embeddings")
     stated = None if context is None else _records.integer(context, "max_position_embeddings")
@@ -597,6 +597,13 @@ def _dew_attention(module, query, key, value, attention_mask, scaling=None, drop
     else:
         out = attested(causal, CAUSAL_ATTENTION)(q, k, v, call.documents, call.valid, sinks, rng)
     return torch_view(out.astype(q.dtype)), None
+
+
+def _experts() -> str:
+    """`EXPERTS`, once Dew's implementation is registered under it (`_registered`): transformers checks a
+    model's experts implementation against its interface's names as it builds the model."""
+    _registered()
+    return EXPERTS
 
 
 @functools.cache
@@ -1781,7 +1788,7 @@ def _shrunk_plain_head(config: Mapping[str, object]) -> bool:
     probed = verify.shallow(verify.ModelSource(model_type), verify.shrink(config))
     fields = {key: value for key, value in _records.decoded_floats(probed).items() if key != "model_type"}
     stated = AutoConfig.for_model(model_type, **fields)
-    model = AutoModelForCausalLM.from_config(stated, dtype=torch.float32, experts_implementation=EXPERTS)
+    model = AutoModelForCausalLM.from_config(stated, dtype=torch.float32, experts_implementation=_experts())
     return _plain_head(model.eval(), model.get_output_embeddings())
 
 
@@ -1823,17 +1830,18 @@ def _built(directory: Path, param_dtype: str, weights: bool
         built_as = next((getattr(torch, dtype.name) for dtype in floating), None)
     if not weights:
         with torch.device("meta"):
-            built = AutoModelForCausalLM.from_config(stated, dtype=built_as, experts_implementation=EXPERTS)
+            built = AutoModelForCausalLM.from_config(stated, dtype=built_as,
+                                                     experts_implementation=_experts())
         return built, None
     with init_empty_weights(include_buffers=False):
-        model = AutoModelForCausalLM.from_config(stated, dtype=built_as, experts_implementation=EXPERTS)
+        model = AutoModelForCausalLM.from_config(stated, dtype=built_as, experts_implementation=_experts())
     # Its tied parameters one, as transformers' load ties them, which `_stored_tensors` reads by each name.
     model.tie_weights()
     stored = _stored_tensors(model, shards)
     if stored is not None:
         return model, stored
     loaded = AutoModelForCausalLM.from_pretrained(
-        str(directory), dtype=storage, local_files_only=True, experts_implementation=EXPERTS,
+        str(directory), dtype=storage, local_files_only=True, experts_implementation=_experts(),
         output_loading_info=True)
     # The model and what its load read and drew (`output_loading_info`).
     assert isinstance(loaded, tuple)
