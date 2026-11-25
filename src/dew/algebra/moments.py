@@ -119,9 +119,15 @@ def _tiled(operands: dict[str, jax.Array], tile: int) -> dict[str, jax.Array]:
 
 
 def _eval_derived(forms: Derived, tiled: dict[str, jax.Array], mode: Literal["walk", "merge"]):
+    from dew.nn.sharding import explicit_spec
+
     first = {name: tile_stack[0] for name, tile_stack in tiled.items()}
     shapes = {name: (value.shape, value.dtype) for name, value in first.items()}
     empty = forms.init(shapes)
+    placed = explicit_spec(first["x"])
+    if placed is not None and placed.spec[-1] is None:
+        state_spec = jax.sharding.NamedSharding(placed.mesh, jax.sharding.PartitionSpec(*placed.spec[:-1]))
+        empty = jax.tree.map(lambda value: jax.sharding.reshard(value, state_spec), empty)
     if mode == "walk":
         state, _ = jax.lax.scan(lambda carry, chunk: (forms.step(carry, chunk), None), empty, tiled)
         return forms.finish(state, first, shapes=shapes)
