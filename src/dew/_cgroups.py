@@ -31,11 +31,11 @@ def own(root: Path = ROOT, membership: Path = MEMBERSHIP) -> Path:
     return group if group.is_dir() else root
 
 
-def _read(path: Path) -> str | None:
-    """`path`'s text, None where it cannot be read: a group removed or made unreadable as it is read (a
-    process moved out of one), which leaves its other limits readable."""
+def _read(path: Path) -> bytes | None:
+    """`path`'s bytes as the kernel wrote them, None where it cannot be read: a group removed or made
+    unreadable as it is read (a process moved out of one), which leaves its other limits readable."""
     try:
-        return path.read_text()
+        return path.read_bytes()
     except OSError as error:
         _log.debug("cgroup file %s unreadable: %s", path, error)
         return None
@@ -43,10 +43,11 @@ def _read(path: Path) -> str | None:
 
 def _memberships(membership: Path) -> list[tuple[str, str]]:
     """Each hierarchy `membership` names this process in: its controllers ('' for v2's unified one) and its
-    group's path, verbatim (a group's name may end in a space or hold a separator `str.splitlines` splits on,
-    U+2028 among them: the file's lines end in a newline alone); none where the file is absent or unreadable
-    (a host that is not Linux)."""
-    lines = [line for line in (_read(membership) or "").split("\n") if line]
+    group's path, verbatim: the file's lines its bytes, each ending in a newline alone, a group's name any
+    byte but '/' and a newline (one ending in a space, holding a carriage return or U+2028, which a text read
+    or `str.splitlines` splits on, or no UTF-8, `os.fsdecode`'s escapes); none where the file is absent or
+    unreadable (a host that is not Linux)."""
+    lines = [os.fsdecode(line) for line in (_read(membership) or b"").split(b"\n") if line]
     return [(controllers, path) for _, controllers, path in (line.split(":", 2) for line in lines)]
 
 
@@ -96,8 +97,8 @@ def _limit(stated: Path) -> int | None:
     """The bytes the limit file `stated` allows: None where it states none (v2's 'max') or cannot be read
     (`_read`)."""
     text = _read(stated)
-    limit = "" if text is None else text.strip()
-    return None if limit in ("", "max") else int(limit)
+    limit = b"" if text is None else text.strip()
+    return None if limit in (b"", b"max") else int(limit)
 
 
 MEMORY_LIMITS = {"": ("", "memory.max"), "memory": ("memory", "memory.limit_in_bytes")}
@@ -156,7 +157,7 @@ def memory_held(level: Path) -> int | None:
     charge, or its charge cannot be read (`_read`)."""
     for charge, inactive in CHARGES.items():
         if (current := _read(level / charge)) is not None:
-            stated = [line.split() for line in (_read(level / "memory.stat") or "").splitlines()]
-            reclaimed = next((int(value) for name, value in stated if name == inactive), 0)
+            stated = [line.split() for line in (_read(level / "memory.stat") or b"").splitlines()]
+            reclaimed = next((int(value) for name, value in stated if name == inactive.encode()), 0)
             return max(0, int(current) - reclaimed)
     return None
