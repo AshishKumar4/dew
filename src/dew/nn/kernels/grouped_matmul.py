@@ -462,7 +462,8 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
                                       ragged=self._ragged(ba, tried[0]),
                                       units=self._vector_units(ba, tried[0]), programs=programs,
                                       outputs=_stored_dtypes(ba),
-                                      hooked=ba.arguments['hooks'].epilogue is not None)
+                                      hooked=(ba.arguments['hooks'].epilogue is not None
+                                              and not ba.arguments['hooks'].out_forms))
             if tile is not None:
                 return formed(tile)
         return None

@@ -231,7 +231,8 @@ def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], sha
                 # 1958), or one its consumers feed at its least busy depth, deepened by a smaller staging of
                 # its outputs.
                 tile = _ring_staged(tile, layout, outputs, candidate=candidate, launch_of=launch_of,
-                                    target=target, programs=programs)
+                                    target=target, programs=programs,
+                                    least=mosaic.HOOK_COLUMNS if tile.stages < busy else ACCUMULATOR_COLUMNS)
             if tile.stages >= busy:
                 price = price_of(tile)
                 if price is None:
@@ -246,7 +247,7 @@ def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], sha
 
 
 def _ring_staged(tile: Tiles, layout: mosaic.Family, outputs: tuple, *, candidate: Callable,
-                 launch_of: Callable, target, programs: int) -> Tiles:
+                 launch_of: Callable, target, programs: int, least: int = ACCUMULATOR_COLUMNS) -> Tiles:
     """`tile`, whose ring is short of busy or its consumers feed (`mosaic.Transport.feeds_itself`) at its
     least busy depth, with its outputs (`outputs`, their dtypes) staged in smaller buffers where that leaves
     the ring deeper: of
@@ -263,7 +264,9 @@ def _ring_staged(tile: Tiles, layout: mosaic.Family, outputs: tuple, *, candidat
     epilogue's shared memory carved out first, the ring the rest). One buffer first: sm120's three-stage
     128 x 256 forward compiled spill-free at (64, 1) and (32, 1), 227-229 registers, where CUDA 12.9's
     allocator took (32, 2) to 255 and spilled 148 bytes, its live values no more (row 12667). The tile as
-    it was where no smaller staging deepens it."""
+    it was where no smaller staging deepens it. Its chunks no narrower than `least` columns: a hooked
+    epilogue's short ring no narrower than a hook's chunk (`mosaic.HOOK_COLUMNS`), where an 8-column
+    staging deepened a row-scaled forward's ring past the registers its schedule left a consumer."""
     columns = pricing.tile_columns(tile, layout)
     piece = layout.chunk_columns(columns)
     shapes = tuple(((tile.share, columns), dtype) for dtype in outputs)
@@ -275,7 +278,7 @@ def _ring_staged(tile: Tiles, layout: mosaic.Family, outputs: tuple, *, candidat
     widest = max(stores.output_staging(columns, (dtype,), piece=piece)[0] for dtype in outputs)
     issuer = layout.specialized(tile.share, columns)
     halved = [(widest >> shift, count) for shift in range(widest.bit_length()) for count in (1, 2)
-              if widest >> shift >= ACCUMULATOR_COLUMNS]
+              if widest >> shift >= least]
     legal = [staging for staging in halved
              if dataclasses.replace(tile, staging=staging).staging_refusal(outputs, issuer) is None]
     unstated = staged_bytes(None)
