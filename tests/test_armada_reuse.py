@@ -116,8 +116,10 @@ def ran_by_script(ci, root: Path, cache_worker, names: tuple[str, ...], module: 
         {f"tests/test_{name}.py::test_{name}": 250.0 for name in names}))
     (root / ".verdict").mkdir()
     url, _, _ = cache_worker
+    # Its artifacts outside its checkout, as armada's are: what a task keeps there (its progress, which it removes
+    # as it ends) is no input of the files it runs.
     env = {**os.environ, "DEW_XLA_CACHE_URL": url, "DEW_XLA_CACHE_TOKEN": "token",
-           "DEW_XLA_CACHE_READ_TOKEN": "token"}
+           "DEW_XLA_CACHE_READ_TOKEN": "token", "ARMADA_ARTIFACTS": str(root.parent / f"{root.name}-artifacts")}
     verdict = root / ".verdict/verdict.json"
     tests = "--tests=" + " ".join(f"tests/test_{name}.py" for name in names)
     subprocess.run([sys.executable, SCRIPT, "task", "--python=3.12", tests, f"--out={verdict}", "--cache=on"],
