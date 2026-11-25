@@ -1128,9 +1128,10 @@ def layouts(jaxpr) -> dict:
 
 
 
-def _laid_out(jaxpr, given: Sequence, found: dict) -> list:
-    """The layouts of `jaxpr`'s outputs, its inputs' `given`, each value's noted in `found` (a value two
-    visits lay out apart, a body's two calls', none)."""
+def _laid_out(jaxpr, given: Sequence, found: dict, consts: Sequence = ()) -> list:
+    """The layouts of `jaxpr`'s outputs, its inputs' `given` and its constants' `consts` (a scope's operands,
+    none other's), each value's noted in `found` (a value two visits lay out apart, a body's two calls',
+    none)."""
     known: dict = {}
 
     def note(var, layout) -> None:
@@ -1144,7 +1145,8 @@ def _laid_out(jaxpr, given: Sequence, found: dict) -> list:
     def of(atom):
         return known.get(atom) if isinstance(atom, jax_core.Var) else None
 
-    for var, layout in zip(jaxpr.invars, given, strict=True):
+    for var, layout in [*zip(jaxpr.invars, given, strict=True),
+                        *zip(jaxpr.constvars, consts or [None] * len(jaxpr.constvars), strict=True)]:
         note(var, layout)
     for equation in jaxpr.eqns:
         laid = _equation_layouts(equation, [of(atom) for atom in equation.invars], found)
@@ -1185,8 +1187,9 @@ def _equation_layouts(equation, given: list, found: dict) -> list:
                 if layout is not None and tuple(getattr(atom.aval, "shape", ())) == shape}
         return [next(iter(held))] if len(held) == 1 else unknown
     if primitive is pallas.run_scoped_p:
+        # Its operands its body's constants (`pallas.run_scoped`), its inputs the refs it allocates.
         body = params["jaxpr"]
-        return _laid_out(body, [None] * len(body.invars), found)
+        return _laid_out(body, [None] * len(body.invars), found, consts=given)
     if primitive is mpmd.mpmd_map_p:
         # A warp mesh's or a kernel's regions, each its own body over its refs.
         for region in params["jaxprs"]:
@@ -1223,19 +1226,26 @@ def _equation_layouts(equation, given: list, found: dict) -> list:
     return unknown
 
 
+_REDUCTION_PARAMS = ("axes", "accumulator_ilp", "out_sharding")
+"""The parameters a reduction binds (its lowering's: `accumulator_ilp` its grouping), its merge key's."""
+
+
 def _computes(equation) -> tuple | None:
     """What a reduction of a variable computes, a key two reductions of one body computing the same share:
-    its primitive, its axes and its operand (the variable itself); None for any other equation. Only
-    reductions merge here: a repeated product's readers decide its fusion (`_Counting.fused`), which a
-    merge would have to rewrite."""
-    if equation.primitive not in _REDUCTIONS or not isinstance(equation.invars[0], jax_core.Var):
+    its primitive, its operand (the variable itself) and each parameter it binds; None for any other
+    equation, or a reduction binding one beyond `_REDUCTION_PARAMS`. Only reductions merge here: a repeated
+    product's readers decide its fusion (`_Counting.fused`), which a merge would have to rewrite."""
+    if (equation.primitive not in _REDUCTIONS or not isinstance(equation.invars[0], jax_core.Var)
+            or not set(equation.params) <= set(_REDUCTION_PARAMS)):
         return None
-    return equation.primitive, tuple(equation.params["axes"]), equation.invars[0]
+    return (equation.primitive, equation.invars[0],
+            *(equation.params.get(name) for name in _REDUCTION_PARAMS))
 
 
 def _laid_reduction(layout: fragments.TiledLayout, value, axes: Sequence[int], threads: int) -> Work | None:
     """A reduction of `value`, laid out as `layout`, along `axes`, as Mosaic GPU lowers it
-    (`FragmentedArray.reduce`): each thread combines the values it holds of each output it keeps, then
+    (`FragmentedArray.reduce`): each thread combines the values its registers hold of each output it keeps
+    (a replicated layout's copies each thread's own), then
     exchanges them across the lanes the layout spreads `axes` over, log2 of them rounds of a shuffle of each
     32-bit word and a combine of each value, on each of the role's `threads`; None where the layout states
     no such lowering here (a scalar's, an axis no tile holds, an exchange across warps). The attention
@@ -1254,10 +1264,13 @@ def _laid_reduction(layout: fragments.TiledLayout, value, axes: Sequence[int], t
     if spread(reduced.warp_dims) > spread(layout.warp_dims):
         return None
     rounds = int(math.log2(spread(reduced.lane_dims) // spread(layout.lane_dims)))
-    held = math.prod(reduced.registers_shape(kept)) * reduced.vector_length * threads
+    # A thread's values in and out as its registers hold them (a replicated layout's every copy's).
+    given = math.prod(layout.registers_shape(shape)) * layout.vector_length
+    kept_values = math.prod(reduced.registers_shape(kept)) * reduced.vector_length
     words = math.prod(reduced.registers_shape(kept)) * math.ceil(
-        reduced.vector_length * np.dtype(value.dtype).itemsize / 4) * threads
-    return Work(operations=_elements(value) - held + rounds * held, shuffles=rounds * words)
+        reduced.vector_length * np.dtype(value.dtype).itemsize / 4)
+    return Work(operations=(given - kept_values + rounds * kept_values) * threads,
+                shuffles=rounds * words * threads)
 
 
 def _divides_on_cuda(outputs: Sequence, target: generation.GpuTarget | None) -> bool:
