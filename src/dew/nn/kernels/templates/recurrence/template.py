@@ -164,7 +164,7 @@ def backward_holds(q, k, v, g, beta, h0=None, *, tiles: mainloop.Tiles, family: 
                     rounded=rounded, apart=apart, values_gated=values_gated, unit_pairs=unit_pairs,
                     decay_bound=decay_bound, wide=wide,
                     ranged=ranged, skip=skip, forked=_shaped(forked), reads=reads)
-    return (reads_trained(reads is not None, g.ndim == 4, target)
+    return (reads_trained(target, reads=reads is not None, per_key=g.ndim == 4)
             and holds(both, family, generation.shared_budget(target)))
 
 
@@ -174,7 +174,7 @@ dimension (`reads_trained`): sm80's 164 KB and sm90's 227 KB compile its launche
 sm120's 99 KB spill (row 12890)."""
 
 
-def reads_trained(reads: bool, per_key: bool, target: generation.GpuTarget) -> bool:
+def reads_trained(target: generation.GpuTarget, *, reads: bool, per_key: bool) -> bool:
     """Whether the fast backward takes a call's read erase (`reads`) on `target`, as the training selector
     (`Mosaic.trains`) and the rule's own gradient (`backward_holds`) both read it: under a decay a head
     always, under a decay a key dimension where a block's shared memory is `READS_SHARED`: its key memory
@@ -997,8 +997,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
         both = self.launches(ba, tiles, target, backward=True)
         family = bundle(target, _dtype(ba))
         assert family is not None
-        arguments = ba.arguments
-        return (reads_trained(arguments.get("reads") is not None, arguments["g"].ndim == 4, target)
+        reads, per_key = ba.arguments.get("reads") is not None, ba.arguments["g"].ndim == 4
+        return (reads_trained(target, reads=reads, per_key=per_key)
                 and holds(both, family, generation.shared_budget(target)))
 
     def states_held(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget,

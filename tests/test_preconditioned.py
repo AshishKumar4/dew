@@ -14,7 +14,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import interprets
+from generation_support import INTERPRETS, interprets
 from reference_error import assert_as_exact, with_gradients
 from test_recurrence_chunk import assert_packed_on_par, hosted, marked, sigmoid, softplus
 
@@ -363,23 +363,7 @@ def test_a_read_erase_along_its_keys_under_distinct_key_decays_is_kimis_delta_at
         np.testing.assert_array_equal(np.asarray(found, np.float32), np.asarray(expected, np.float32))
 
 
-def test_a_read_erase_under_a_decay_a_key_dimension_trains_on_the_template():
-    """PKDA's 16-bit training call naming the template runs there (its keys' erase along reads of their own
-    under a decay a key dimension: `chunk_forward._paired` and `key_backward.gradients`' reads): the
-    kernels its traced routes name, beside the portable tangent's."""
-    drawn = operands(per_key=True, shape=TEMPLATED)(0)[:-1]
-    drawn = (*(x.astype(jnp.bfloat16) for x in drawn[:3]), *drawn[3:])
-
-    def loss(*given):
-        return templated(*given)[0].astype(jnp.float32).sum()
-
-    with generation.routes() as found:
-        jax.eval_shape(jax.grad(loss, argnums=(0, 1, 2)), *drawn)
-    # Beside its routes, its derivative's portable tangent's (`_per_product`).
-    assert {route.kernel for route in found if route.choice == generation.Choice.GATED_DELTA_RULE} == {
-        'mosaic_gpu', 'xla'}
-
-
+@INTERPRETS
 @pytest.mark.parametrize('target', ['sm90', 'sm86'])
 def test_a_key_decays_read_erase_trains_on_the_template_where_its_launches_hold(target):
     """PKDA's 16-bit training call naming the template, traced through the public gradient: on an H100 the
@@ -558,6 +542,8 @@ def test_a_key_decays_read_erase_on_the_template_is_as_exact_as_its_reference(ca
     (`test_recurrence_mosaic_gradient`): a read's decay taken from another key's, or a term lost between the
     reads' gradient and the keys', moves it far past. fla's recorded PKDA sites hold it once M-JS-266b's
     fixture lands (rows 1459, 12696)."""
+    if not template.reads_trained(template.Mosaic.launched(), reads=True, per_key=True):
+        pytest.skip("a key decay's read erase trains on the portable math on this part (row 12890)")
     dew, reference, truth, draw = KEY_DECAY_CASES[case]
     assert_as_exact(jax.jit(dew), jax.jit(reference), draw,
                     f"a key decay's read erase on the template: {case}", seeds=SEEDS, truth_fn=jax.jit(truth))
