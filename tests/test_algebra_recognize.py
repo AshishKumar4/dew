@@ -1062,3 +1062,23 @@ def test_outer_containers_never_anchor_recognition_and_swiglu_stays_inside_eleme
     with generation.assumed("sm90"):
         found = recognize.recognized(inner_jaxpr, inner_index, recognize.NORMS)
     assert len(found) == 2
+
+
+def test_swiglu_recognition_keeps_unit_axis_reshapes_around_activation():
+    """A bf16 SwiGLU whose widened gate is reshaped to `[..., H, 1]` before `jax.nn.silu` and reshaped back
+    before rounding and multiplying by `up` is still recognized (`normal_form._erased` removes the unit axes
+    and `_entrywise_eqn` admits unit-axis-only layouts)."""
+    from dew.algebra import fusion, recognize
+
+    def reshaped_swiglu(gate, up):
+        widened = gate.astype(jnp.float32).reshape(*gate.shape, 1)
+        activated = jax.nn.silu(widened).reshape(gate.shape)
+        return activated.astype(gate.dtype) * up
+
+    shapes = [jax.ShapeDtypeStruct(ROWS, jnp.bfloat16)] * 2
+    closed = jax.make_jaxpr(reshaped_swiglu)(*shapes)
+    index = fusion.Index(closed.jaxpr)
+    with generation.assumed("sm90"):
+        found = recognize.recognized(closed.jaxpr, index, recognize.NORMS)
+    assert len(found) == 1
+    assert found[0].outputs == tuple(closed.jaxpr.outvars)

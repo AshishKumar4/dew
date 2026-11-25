@@ -609,22 +609,38 @@ def _barriers(index: fusion.Index) -> frozenset[int]:
     return index.barriers
 
 
+_UNIT_LAYOUTS = (jax.lax.reshape_p, jax.lax.squeeze_p, jax.lax.broadcast_in_dim_p)
+"""Layout primitives that may insert or remove unit axes around an activation (`normal_form._erased`)."""
+
+
+def _unit_layout(equation: jcore.JaxprEqn) -> bool:
+    """Whether `equation` only inserts or removes size-1 axes without changing non-unit extents."""
+    if equation.primitive not in _UNIT_LAYOUTS or len(equation.invars) != 1 or len(equation.outvars) != 1:
+        return False
+    source = equation.invars[0]
+    if not isinstance(source, jcore.Var):
+        return False
+    return (tuple(d for d in aval(source).shape if d != 1)
+            == tuple(d for d in aval(equation.outvars[0]).shape if d != 1))
+
+
 def _entrywise_eqn(equation: jcore.JaxprEqn) -> bool:
-    """Whether `equation` computes one elementwise result: a direct entrywise primitive, Dew's stated
-    entrywise operation (`_read_as`), or a transparent call (`purely_called`, e.g. `jax.nn.silu`) whose body
-    binds only entrywise primitives, nested transparent calls, or broadcasts."""
+    """Whether `equation` computes one elementwise result: a direct entrywise primitive, a unit-axis-only
+    layout (`_unit_layout`), Dew's stated entrywise operation (`_read_as`), or a transparent call
+    (`purely_called`, e.g. `jax.nn.silu`) whose body binds only entrywise primitives, nested transparent
+    calls, or unit-axis layouts."""
     if len(equation.outvars) != 1:
         return False
     if (read := _read_as(equation)) is not None:
         return entrywise(read)
-    if entrywise(equation.primitive):
+    if entrywise(equation.primitive) or _unit_layout(equation):
         return True
     body = purely_called(equation)
     if body is None:
         return False
     bound = _bound(body)
     return bool(bound) and all(
-        entrywise(p) or p.transparent_call or p is jax.lax.broadcast_in_dim_p for p in bound)
+        entrywise(p) or p.transparent_call or p in _UNIT_LAYOUTS for p in bound)
 
 
 def _entrywise_places(index: fusion.Index) -> frozenset[int]:

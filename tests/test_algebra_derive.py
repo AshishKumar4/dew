@@ -996,3 +996,104 @@ def test_chunked_moments_contract_broadcasts_promotes_scans_and_rejects_empty():
         np.ones((2, 128), np.float32), np.ones((2, 128), np.float32)).jaxpr
     assert any(eq.primitive is jax.lax.scan_p for eq in j2.eqns)
     assert len(j2.eqns) == len(j8.eqns)
+
+
+@pytest.mark.parametrize("dtype", [jnp.float16, jnp.bfloat16])
+@pytest.mark.parametrize("mode", ["walk", "merge"])
+def test_chunked_moments_handles_narrow_float16_and_bfloat16_inputs(dtype, mode):
+    """Same-dtype float16 and bfloat16 inputs work in weighted, masked, and covariance chunked moments in
+    both walk and merge modes, returning the input floating dtype and matching float64 truth (Check 1)."""
+    from dew.algebra import moments
+
+    def draw_weighted(seed):
+        rng = np.random.default_rng([9041, seed])
+        return ((10.0 + rng.standard_normal((4, 32))).astype(dtype),
+                rng.uniform(0.25, 2.0, (4, 32)).astype(dtype))
+
+    def draw_masked(seed):
+        rng = np.random.default_rng([9042, seed])
+        mask = rng.random((4, 32)) > 0.25
+        mask[:, 0] = True
+        return (10.0 + rng.standard_normal((4, 32))).astype(dtype), mask
+
+    def draw_cov(seed):
+        rng = np.random.default_rng([9043, seed])
+        return ((10.0 + rng.standard_normal((4, 32))).astype(dtype),
+                (-5.0 + rng.standard_normal((4, 32))).astype(dtype),
+                rng.uniform(0.25, 2.0, (4, 32)).astype(dtype))
+
+    x0, w0 = draw_weighted(0)
+    mean_w, var_w = moments.chunked_moments(x0, w0, tile=8, mode=mode)
+    assert mean_w.dtype == jnp.dtype(dtype) and var_w.dtype == jnp.dtype(dtype)
+    assert_as_exact(
+        jax.jit(lambda x_, w_, kind=mode: moments.chunked_moments(x_, w_, tile=8, mode=kind)),
+        jax.jit(moments.weighted_moments), draw_weighted, f"narrow weighted {dtype} ({mode})", seeds=8)
+
+    xm0, m0 = draw_masked(0)
+    mean_m, var_m = moments.chunked_moments(xm0, m0, tile=8, mode=mode)
+    assert mean_m.dtype == jnp.dtype(dtype) and var_m.dtype == jnp.dtype(dtype)
+    assert_as_exact(
+        jax.jit(lambda x_, m_, kind=mode: moments.chunked_moments(x_, m_, tile=8, mode=kind)),
+        jax.jit(moments.masked_moments), draw_masked, f"narrow masked {dtype} ({mode})", seeds=8)
+
+    xc0, yc0, wc0 = draw_cov(0)
+    mx_c, my_c, cov_c = moments.chunked_covariance(xc0, yc0, wc0, tile=8, mode=mode)
+    assert mx_c.dtype == jnp.dtype(dtype) and my_c.dtype == jnp.dtype(dtype)
+    assert cov_c.dtype == jnp.dtype(dtype)
+    assert_as_exact(
+        jax.jit(lambda x_, y_, w_, kind=mode: moments.chunked_covariance(x_, y_, w_, tile=8, mode=kind)),
+        jax.jit(moments.weighted_covariance), draw_cov, f"narrow cov {dtype} ({mode})", seeds=8)
+
+
+def test_chunked_moments_preserves_zero_weight_derivatives_and_extreme_anchor_differences():
+    """Derived central moments preserve exact JVP and VJP derivatives with respect to zero weights both
+    within a tile (`tile=2`) and across tiles (`tile=1`, both orders and modes), and keep opposite-sign
+    extreme anchors (`x=[-2^127, 2^127], y=[-1, 1], w=[0.25, 0.25]`) finite and accurate without overflow."""
+    from dew.algebra import moments
+
+    for x_vals, w_vals in (([0.0, 2.0], [1.0, 0.0]), ([10.0, 12.0], [1.0, 0.0]),
+                           ([12.0, 10.0], [0.0, 1.0])):
+        x = jnp.asarray([x_vals], jnp.float32)
+        w = jnp.asarray([w_vals], jnp.float32)
+        dw = jnp.asarray([[1.0, 1.0]], jnp.float32)
+        ref_val, ref_jvp = jax.jvp(lambda w_, x_=x: moments.weighted_moments(x_, w_), (w,), (dw,))
+        ref_grad_mean = jax.grad(lambda w_, x_=x: moments.weighted_moments(x_, w_)[0].sum())(w)
+        ref_grad_var = jax.grad(lambda w_, x_=x: moments.weighted_moments(x_, w_)[1].sum())(w)
+        for tile in (1, 2):
+            for mode in ("walk", "merge"):
+                def run(w_, x_=x, t=tile, m=mode):
+                    return moments.chunked_moments(x_, w_, tile=t, mode=m)
+                got_val, got_jvp = jax.jvp(run, (w,), (dw,))
+                got_grad_mean = jax.grad(lambda w_, f=run: f(w_)[0].sum())(w)
+                got_grad_var = jax.grad(lambda w_, f=run: f(w_)[1].sum())(w)
+                for g, r in (*zip(got_val, ref_val, strict=True), *zip(got_jvp, ref_jvp, strict=True),
+                             (got_grad_mean, ref_grad_mean), (got_grad_var, ref_grad_var)):
+                    assert np.all(np.isfinite(np.asarray(g)))
+                    np.testing.assert_array_equal(np.asarray(g), np.asarray(r))
+
+    # Bilinear covariance zero-weight derivative across tiles.
+    xc = jnp.asarray([[10.0, 12.0]], jnp.float32)
+    yc = jnp.asarray([[20.0, 25.0]], jnp.float32)
+    wc = jnp.asarray([[1.0, 0.0]], jnp.float32)
+    ref_cov_grad = jax.grad(lambda w_: moments.weighted_covariance(xc, yc, w_)[2].sum())(wc)
+    for tile in (1, 2):
+        for mode in ("walk", "merge"):
+            got_cov_grad = jax.grad(
+                lambda w_, t=tile, m=mode: moments.chunked_covariance(xc, yc, w_, tile=t, mode=m)[2].sum()
+            )(wc)
+            assert np.all(np.isfinite(np.asarray(got_cov_grad)))
+            np.testing.assert_array_equal(np.asarray(got_cov_grad), np.asarray(ref_cov_grad))
+
+    # Opposite-sign extreme anchors (`2^127 - (-2^127)` would overflow float32 if subtracted unscaled).
+    big = np.float32(2.0 ** 127)
+    for x_pair, y_pair in (([-big, big], [-1.0, 1.0]), ([big, -big], [1.0, -1.0])):
+        x_ext = jnp.asarray([x_pair], jnp.float32)
+        y_ext = jnp.asarray([y_pair], jnp.float32)
+        w_ext = jnp.asarray([[0.25, 0.25]], jnp.float32)
+        for mode in ("walk", "merge"):
+            mx, my, cov = moments.chunked_covariance(x_ext, y_ext, w_ext, tile=1, mode=mode)
+            assert np.all(np.isfinite(np.asarray(mx))) and float(mx[0]) == 0.0
+            assert np.all(np.isfinite(np.asarray(my))) and float(my[0]) == 0.0
+            assert np.all(np.isfinite(np.asarray(cov)))
+            # Within 1 ULP of exact 2^127 (sqrt(0.125) rounds by <= 0.5 ULP in fp32).
+            assert abs(float(cov[0]) - float(big)) <= float(np.spacing(big))

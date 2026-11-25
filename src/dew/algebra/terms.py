@@ -687,28 +687,22 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
     laid: dict[jcore.Var, tuple[jcore.Var, tuple[int, ...]]] = {}
     opaque: list[Opaque] = []
     for equation in jaxpr.eqns:
-        if (equation.primitive is jax.lax.broadcast_in_dim_p
-                and not isinstance(equation.invars[0], jcore.Literal) and equation.invars[0] in laid):
-            source, inner = laid[equation.invars[0]]
-            outer = tuple(equation.params["broadcast_dimensions"])
-            composed = {**equation.params, "broadcast_dimensions": tuple(outer[axis] for axis in inner)}
+        composed, facts = _propagate_facts(equation, laid, magnitude_of, apart_of)
+        if composed is not None and facts is not None:
+            origin, params_ = composed
             out = equation.outvars[0]
-            env[out] = read(source).shaped("broadcast_in_dim", param(equation.primitive, composed))
+            env[out] = read(origin).shaped("broadcast_in_dim", param(equation.primitive, params_))
             shapes.append((env[out], _shape(out)))
-            _typed(dtypes, magnitudes, env[out], out, magnitudes[key(env[source])])
-            apart[out] = apart_of(source)
-            laid[out] = (source, composed["broadcast_dimensions"])
-            depths[out] = depths.get(source, 0) + 1
+            bound, apart[out] = facts
+            _typed(dtypes, magnitudes, env[out], out, bound)
+            depths[out] = depths.get(origin, 0) + 1
             continue
-        if (equation.primitive is jax.lax.broadcast_in_dim_p
-                and not isinstance(equation.invars[0], jcore.Literal)):
-            laid[equation.outvars[0]] = (equation.invars[0], tuple(equation.params["broadcast_dimensions"]))
         term = _term(equation, read, param)
-        if term is not None:
+        if term is not None and facts is not None:
             out = equation.outvars[0]
             env[out] = term
             shapes.append((term, _shape(out)))
-            bound, apart[out] = _prove_equation(equation, magnitude_of, apart_of)
+            bound, apart[out] = facts
             _typed(dtypes, magnitudes, term, out, bound)
             depths[out] = 1 + max((depths.get(atom, 0) for atom in equation.invars
                                    if not isinstance(atom, jcore.Literal)), default=0)
@@ -761,6 +755,53 @@ def _prove_equation(equation: jcore.JaxprEqn, magnitude_of: Callable[..., Magnit
     return (bound if proved.finite else None), proved
 
 
+def _in_language(equation: jcore.JaxprEqn) -> Operation | None:
+    """`equation`'s declared `Operation` where the term language speaks it (one output, matching arity)."""
+    operation = OPERATIONS.get(equation.primitive)
+    if operation is None or len(equation.outvars) != 1:
+        return None
+    return operation if len(equation.invars) == WRITTEN[operation.kind].arity else None
+
+
+def _composed_broadcast(
+    equation: jcore.JaxprEqn,
+    laid: dict[jcore.Var, tuple[jcore.Var, tuple[int, ...]]],
+) -> tuple[jcore.Var, dict] | None:
+    """Where `equation` broadcasts a variable already broadcast (`laid`), compose both into one broadcast
+    from the original source and record it in `laid`; for a first broadcast of a variable, record it in `laid`
+    and return None."""
+    if equation.primitive is not jax.lax.broadcast_in_dim_p or isinstance(equation.invars[0], jcore.Literal):
+        return None
+    source = equation.invars[0]
+    outer = tuple(equation.params["broadcast_dimensions"])
+    out = equation.outvars[0]
+    if source in laid:
+        origin, inner = laid[source]
+        composed = {**equation.params, "broadcast_dimensions": tuple(outer[axis] for axis in inner)}
+        laid[out] = (origin, composed["broadcast_dimensions"])
+        return origin, composed
+    laid[out] = (source, outer)
+    return None
+
+
+def _propagate_facts(
+    equation: jcore.JaxprEqn,
+    laid: dict[jcore.Var, tuple[jcore.Var, tuple[int, ...]]],
+    magnitude_of: Callable[..., Magnitude | None],
+    apart_of: Callable[..., Apart],
+) -> tuple[tuple[jcore.Var, dict] | None, tuple[Magnitude | None, Apart] | None]:
+    """The single shared fact-transfer step for `_region` and `proven`: composed broadcasts keep their
+    origin's magnitude and `Apart`, other in-language equations propagate via `_prove_equation`, and opaque
+    equations return `(None, None)`."""
+    composed = _composed_broadcast(equation, laid)
+    if composed is not None:
+        origin, _ = composed
+        return composed, (magnitude_of(origin), apart_of(origin))
+    if _in_language(equation) is not None:
+        return None, _prove_equation(equation, magnitude_of, apart_of)
+    return None, None
+
+
 def _apart_of(atom, apart: Mapping[jcore.Var, Apart]) -> Apart:
     """`atom`'s proven `Apart` from `apart`, or its constant `Apart` for a literal."""
     if isinstance(atom, jcore.Literal):
@@ -771,7 +812,8 @@ def _apart_of(atom, apart: Mapping[jcore.Var, Apart]) -> Apart:
 
 def proven(jaxpr: jcore.Jaxpr) -> tuple[dict[jcore.Var, Magnitude | None], dict[jcore.Var, Apart]]:
     """What `jaxpr` proves of each variable (`held` magnitudes and `apart`), its constants taken as inputs,
-    without building terms or interning parameters (`dew.algebra.program._held`)."""
+    without building terms or interning parameters (`dew.algebra.program._held`), sharing `_propagate_facts`
+    with `_region` so both produce identical facts."""
     held: dict[jcore.Var, Magnitude | None] = {}
     apart: dict[jcore.Var, Apart] = {}
     for var in (*jaxpr.constvars, *jaxpr.invars):
@@ -784,12 +826,13 @@ def proven(jaxpr: jcore.Jaxpr) -> tuple[dict[jcore.Var, Magnitude | None], dict[
 
     def apart_of(atom) -> Apart:
         return _apart_of(atom, apart)
+
+    laid: dict[jcore.Var, tuple[jcore.Var, tuple[int, ...]]] = {}
     for equation in jaxpr.eqns:
-        operation = OPERATIONS.get(equation.primitive)
-        if (operation is not None and len(equation.outvars) == 1
-                and len(equation.invars) == WRITTEN[operation.kind].arity):
+        _, facts = _propagate_facts(equation, laid, magnitude_of, apart_of)
+        if facts is not None:
             out = equation.outvars[0]
-            held[out], apart[out] = _prove_equation(equation, magnitude_of, apart_of)
+            held[out], apart[out] = facts
             continue
         for var in equation.outvars:
             held[var] = None
@@ -1567,12 +1610,10 @@ def _term[Node: (Term, Skeleton)](equation: jcore.JaxprEqn, read: Callable[..., 
                                    param: Callable) -> Node | None:
     """`equation` as a term over its inputs' (`read`), written as its operation's kind is (`WRITTEN`), or
     None where it is outside the language."""
-    operation, primitive = OPERATIONS.get(equation.primitive), equation.primitive
-    if operation is None or len(equation.outvars) != 1:
+    operation, primitive = _in_language(equation), equation.primitive
+    if operation is None:
         return None
     written = WRITTEN[operation.kind]
-    if len(equation.invars) != written.arity:
-        return None
     first, *others = (read(atom) for atom in equation.invars)
     write = getattr(first, written.constructor)
     if operation.kind in ("select", "clamp"):

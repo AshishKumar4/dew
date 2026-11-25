@@ -480,7 +480,8 @@ def _windows(jaxpr: jcore.Jaxpr) -> list[tuple[jcore.Jaxpr, list[jcore.Var]]]:
     rsqrts, reciprocals = _reuse_siblings(jaxpr, heads)
     order = {id(equation): index for index, equation in enumerate(jaxpr.eqns)}
     live_clusters: list[dict[int, jcore.JaxprEqn] | None] = []
-    owners: dict[int, list[int]] = {}
+    owners: dict[int, set[int]] = {}
+    capped: set[int] = set()
     for head in heads:
         window, frontier = {id(head): head}, [(head, 0)]
         while frontier:
@@ -492,7 +493,7 @@ def _windows(jaxpr: jcore.Jaxpr) -> list[tuple[jcore.Jaxpr, list[jcore.Var]]]:
                     frontier.append((operand, depth + 1))
         if head.primitive is jax.lax.div_p:
             _pull_reuse_siblings(head, maker, rsqrts, reciprocals, window)
-        _merge_cluster(live_clusters, owners, window)
+        _merge_cluster(live_clusters, owners, capped, window)
     clusters = [cluster for cluster in live_clusters if cluster is not None]
     read: dict[jcore.Var, set[int]] = {}
     for equation in jaxpr.eqns:
@@ -527,32 +528,57 @@ def _windows(jaxpr: jcore.Jaxpr) -> list[tuple[jcore.Jaxpr, list[jcore.Var]]]:
 
 
 def _merge_cluster(live_clusters: list[dict[int, jcore.JaxprEqn] | None],
-                   owners: dict[int, list[int]], window: dict[int, jcore.JaxprEqn]) -> None:
+                   owners: dict[int, set[int]], capped: set[int],
+                   window: dict[int, jcore.JaxprEqn]) -> None:
     """Join `window` into any live clusters sharing an equation where the union stays within `CLUSTER`,
-    indexed by `owners` so lookup is O(window) rather than O(clusters)."""
-    shared_ids = sorted({cid for key in window for cid in owners.get(key, ())
-                         if live_clusters[cid] is not None})
-    if shared_ids:
+    keeping live owner links directly and marking keys whose combined owners already exceed `CLUSTER` in
+    `capped` so high-fanout shared producers stay O(1) per head."""
+    if not any(key in capped for key in window):
+        shared_ids: set[int] = set()
         union_keys = set(window)
-        for cid in shared_ids:
-            shared = live_clusters[cid]
-            if shared is not None:
+        overflow = False
+        for key in window:
+            for cid in owners.get(key, ()):
+                if cid in shared_ids:
+                    continue
+                shared = live_clusters[cid]
+                if shared is None:
+                    continue
+                shared_ids.add(cid)
                 union_keys.update(shared)
-        if len(union_keys) <= CLUSTER:
+                if len(union_keys) > CLUSTER:
+                    overflow = True
+                    break
+            if overflow:
+                break
+        if shared_ids and not overflow:
             merged: dict[int, jcore.JaxprEqn] = {}
-            for cid in shared_ids:
+            for cid in sorted(shared_ids):
                 shared = live_clusters[cid]
                 if shared is not None:
                     merged.update(shared)
                     live_clusters[cid] = None
+                    for key in shared:
+                        if (owned := owners.get(key)) is not None:
+                            owned.discard(cid)
             merged.update(window)
             window = merged
     new_id = len(live_clusters)
     live_clusters.append(window)
     for key in window:
-        kept = [cid for cid in owners.get(key, ()) if live_clusters[cid] is not None]
-        kept.append(new_id)
-        owners[key] = kept
+        if key in capped:
+            continue
+        owned = owners.setdefault(key, set())
+        owned.add(new_id)
+        if len(owned) > 1:
+            key_union: set[int] = set()
+            for cid in owned:
+                if (member := live_clusters[cid]) is not None:
+                    key_union.update(member)
+                    if len(key_union) > CLUSTER:
+                        capped.add(key)
+                        owners.pop(key, None)
+                        break
 
 
 def _is_unit_literal(atom) -> bool:
@@ -925,17 +951,20 @@ def _within(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels:
     changed = False
     equations = []
     for equation in jaxpr.eqns:
+        cleaned = equation.primitive in partial_eval.dce_rules
         if _mapped(equation):
             # A manual mesh's body, each device's program, rewritten in its own context (`_manual`), within
             # the context the equation was recorded in (its abstract mesh among it: a map staged on a mesh of
             # its own beside the caller's, JAX's replay of an equation, `JaxprEqn.ctx`).
             with equation.ctx.manager, _manual(equation.params):
-                params = with_bodies(equation.params,
-                                     lambda body: _closed(body, accurate, saturation, kernels))
+                params = with_bodies(
+                    equation.params,
+                    lambda body, c=cleaned: _closed(body, accurate, saturation, kernels, _cleaned=c))
         elif _holds_regions(equation) or _marked(equation, WITHIN) or (
                 _marked(equation, (Algebra,)) and _opening(equation) is None):
-            params = with_bodies(equation.params,
-                                 lambda body: _closed(body, accurate, saturation, kernels))
+            params = with_bodies(
+                equation.params,
+                lambda body, c=cleaned: _closed(body, accurate, saturation, kernels, _cleaned=c))
         elif _opening(equation) is not None:
             # Its body's own bodies rewritten, its math left to the region it opens into (`_opened`).
             params = with_bodies(equation.params,
@@ -1104,7 +1133,8 @@ nothing changes holds None, not itself, which would keep it alive."""
 
 
 
-def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels: bool) -> jcore.Jaxpr:
+def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels: bool,
+            *, _cleaned: bool = False) -> jcore.Jaxpr:
     """A body's program rewritten, over the same inputs, weak types included, and the same outputs, the same
     object for every call site and retrace of one body (`_REWRITTEN`), the body itself where nothing
     changes; a body whose constants another holds (an open jaxpr), or that reads a value of no shape, as it
@@ -1131,10 +1161,9 @@ def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels
     def rewrite() -> _Body:
         with kernel_report.recording() as regions:
             made, record = fusion.recorded(
-                lambda: _rewritten(closed, accurate, saturation, kernels, _cleaned=True))
+                lambda: _rewritten(closed, accurate, saturation, kernels, _cleaned=_cleaned))
         fresh.append(_Body(None if made is closed else made, record, tuple(regions.rewritten)))
         return fresh[0]
-
     # Held with the facts its rewrite read while each answers alike (`_cache.holding`).
     body = _cache.holding(rewrites, key, rewrite, fusion.DECISIONS_HELD)
     reused = not fresh

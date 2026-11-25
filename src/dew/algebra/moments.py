@@ -93,7 +93,7 @@ def _tiled(operands: dict[str, jax.Array], tile: int) -> dict[str, jax.Array]:
 
 
 def _run_chunked(kind: Literal["weighted", "masked", "covariance"], operands: dict[str, jax.Array], *,
-                 tile: int, mode: Literal["walk", "merge"] = "merge"):
+                 tile: int, mode: Literal["walk", "merge"] = "merge", out_dtype=None):
     tiled = _tiled(operands, tile)
     first = {name: tile_stack[0] for name, tile_stack in tiled.items()}
     rank = next(iter(first.values())).ndim
@@ -102,20 +102,24 @@ def _run_chunked(kind: Literal["weighted", "masked", "covariance"], operands: di
     empty = forms.init(shapes)
     if mode == "walk":
         state, _ = jax.lax.scan(lambda carry, chunk: (forms.step(carry, chunk), None), empty, tiled)
-        return forms.finish(state, first, shapes=shapes)
-    partials = jax.vmap(lambda chunk: forms.step(empty, chunk))(tiled)
-    while partials[0].shape[0] > 1:
-        count = partials[0].shape[0]
-        limit = 2 * (count // 2)
-        left = jax.tree.map(lambda state, end=limit: state[:end:2], partials)
-        right = jax.tree.map(lambda state, end=limit: state[1:end:2], partials)
-        merged = jax.vmap(lambda a, b: forms.merge(a, b, shapes=shapes))(left, right)
-        if count % 2:
-            tail = jax.tree.map(lambda state: state[-1:], partials)
-            merged = jax.tree.map(lambda a, b: jnp.concatenate([a, b], axis=0), merged, tail)
-        partials = merged
-    final = jax.tree.map(lambda state: state[0], partials)
-    return forms.finish(final, first, shapes=shapes)
+        result = forms.finish(state, first, shapes=shapes)
+    else:
+        partials = jax.vmap(lambda chunk: forms.step(empty, chunk))(tiled)
+        while partials[0].shape[0] > 1:
+            count = partials[0].shape[0]
+            limit = 2 * (count // 2)
+            left = jax.tree.map(lambda state, end=limit: state[:end:2], partials)
+            right = jax.tree.map(lambda state, end=limit: state[1:end:2], partials)
+            merged = jax.vmap(lambda a, b: forms.merge(a, b, shapes=shapes))(left, right)
+            if count % 2:
+                tail = jax.tree.map(lambda state: state[-1:], partials)
+                merged = jax.tree.map(lambda a, b: jnp.concatenate([a, b], axis=0), merged, tail)
+            partials = merged
+        final = jax.tree.map(lambda state: state[0], partials)
+        result = forms.finish(final, first, shapes=shapes)
+    if out_dtype is not None:
+        result = jax.tree.map(lambda value: value.astype(out_dtype), result)
+    return result
 
 
 def _floating_dtype(*arrays: jax.Array):
@@ -123,28 +127,40 @@ def _floating_dtype(*arrays: jax.Array):
     return dtype if jnp.issubdtype(dtype, jnp.floating) else jnp.result_type(dtype, jnp.float32)
 
 
+def _working_dtype(dtype):
+    """Accumulation dtype for central-moment walks: at least float32 so narrow 16-bit inputs do not trigger
+    implicit widen-reduce-narrow casts inside `jnp.sum`."""
+    return jnp.promote_types(dtype, jnp.float32)
+
+
 def chunked_moments(x: jax.Array, w: jax.Array, *, tile: int,
                     mode: Literal["walk", "merge"] = "merge") -> tuple[jax.Array, jax.Array]:
     """Compute weighted or boolean-masked `(mean, variance)` of `x` along its last axis in `tile`-wide chunks
     using derived Chan-Golub-LeVeque forms (`mode="walk"` via `lax.scan`, `mode="merge"` via vmapped
     pairwise tree reduction). Operands broadcast to a common shape of rank >= 1 and positive walked extent
-    divisible by `tile`; non-boolean weights must be nonnegative and promote with `x` to a floating dtype."""
+    divisible by `tile`; non-boolean weights must be nonnegative and promote with `x` to a floating dtype
+    (accumulated in at least float32 for narrow float16/bfloat16 inputs and cast back)."""
     x_arr, w_arr = jnp.asarray(x), jnp.asarray(w)
     if w_arr.dtype == jnp.bool_:
-        dtype = _floating_dtype(x_arr)
-        return _run_chunked("masked", {"x": x_arr.astype(dtype), "mask": w_arr}, tile=tile, mode=mode)
-    dtype = _floating_dtype(x_arr, w_arr)
-    return _run_chunked("weighted", {"x": x_arr.astype(dtype), "w": w_arr.astype(dtype)}, tile=tile,
-                        mode=mode)
+        out_dtype = _floating_dtype(x_arr)
+        work = _working_dtype(out_dtype)
+        return _run_chunked("masked", {"x": x_arr.astype(work), "mask": w_arr}, tile=tile, mode=mode,
+                            out_dtype=None if work == out_dtype else out_dtype)
+    out_dtype = _floating_dtype(x_arr, w_arr)
+    work = _working_dtype(out_dtype)
+    return _run_chunked("weighted", {"x": x_arr.astype(work), "w": w_arr.astype(work)}, tile=tile,
+                        mode=mode, out_dtype=None if work == out_dtype else out_dtype)
 
 
 def chunked_covariance(x: jax.Array, y: jax.Array, w: jax.Array, *, tile: int,
                        mode: Literal["walk", "merge"] = "merge") -> tuple[jax.Array, jax.Array, jax.Array]:
     """Compute weighted `(mean_x, mean_y, covariance)` of `(x, y)` along their last axis in `tile`-wide
     chunks using derived Chan-Golub-LeVeque forms. Operands broadcast to a common shape of rank >= 1 and
-    positive walked extent divisible by `tile`, with nonnegative `w` promoted to one floating dtype."""
+    positive walked extent divisible by `tile`, with nonnegative `w` promoted to one floating dtype
+    (accumulated in at least float32 for narrow float16/bfloat16 inputs and cast back)."""
     x_arr, y_arr, w_arr = jnp.asarray(x), jnp.asarray(y), jnp.asarray(w)
-    dtype = _floating_dtype(x_arr, y_arr, w_arr)
+    out_dtype = _floating_dtype(x_arr, y_arr, w_arr)
+    work = _working_dtype(out_dtype)
     return _run_chunked("covariance",
-                        {"x": x_arr.astype(dtype), "y": y_arr.astype(dtype), "w": w_arr.astype(dtype)},
-                        tile=tile, mode=mode)
+                        {"x": x_arr.astype(work), "y": y_arr.astype(work), "w": w_arr.astype(work)},
+                        tile=tile, mode=mode, out_dtype=None if work == out_dtype else out_dtype)
