@@ -134,7 +134,7 @@ def read_log[L, E](trainer: Trainer[L, E], run: FitRun, taken: Taken) -> tuple[R
 
 def written[L, E](trainer: Trainer[L, E], run: FitRun, taken: Taken, reading: tuple[Reading, float]) -> None:
     """Report `taken`'s interval's scalars (`logged_scalars`) on rank zero, on the writer's reporter
-    thread (`_read_taken`); every other rank has nothing to report."""
+    thread (`read_taken`); every other rank has nothing to report."""
     if jax.process_index() != 0:
         return
     read, elapsed = reading
