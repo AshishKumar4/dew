@@ -686,7 +686,7 @@ PER_SHARD_STEPS = {"expert layer": _expert_layer_step, "rms norm": _norm_step, "
 """Each op whose kernels run per shard (row 1923, bible §7), its step at a number of rows. Each lane adds its
 ops here."""
 
-PER_SHARD_KERNELS = {"selective scan": "selective_scan"}
+PER_SHARD_KERNELS = {"selective scan": "selective_scan", "packed recurrence": "recurrence"}
 """The name prefix of an op's own kernels, where its step launches others too (a Mamba layer's
 projections)."""
 
@@ -1058,10 +1058,18 @@ def test_a_packed_recurrence_runs_on_each_devices_own_rows():
     template on the global rows, and each layer's offsets took 97 loops of a token an iteration (row 1897,
     bible 7's multi-device lowering). The final executable's loops need a GPU's compile; this proves their
     cause absent from the program it compiles."""
+    from dew.nn.kernels.lowered import kernel_calls
+
     (sharded, parameters), (local, _) = _packed_step(rows=2, devices=2), _packed_step(rows=1, devices=1)
     operations = _operations(sharded)
-    calls = _mosaic_calls(operations)
-    assert calls and calls == _mosaic_calls(_operations(local))
+
+    def recurrences(lowered) -> list:
+        # The recurrence's own launches: its projections' (the GEMM's) run on XLA's mesh, not a map's.
+        return [call.operands for call in kernel_calls(lowered, unrun=True)
+                if call.kind == "mosaic_gpu" and call.name.startswith(PER_SHARD_KERNELS["packed recurrence"])]
+
+    calls = recurrences(sharded)
+    assert calls and calls == recurrences(local)
     scanned = [operands for name, target, operands, _ in operations
                if name == "stablehlo.reduce_window" or (name == "func.call" and target.startswith("cumsum"))]
     assert scanned and all(2 * 128 not in shape for operand in scanned for shape, _ in operand), scanned
