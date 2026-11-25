@@ -4,7 +4,7 @@ Each stage kind has one definition here, which every read applies and the
 memory executor (`dew.data.materialize`) calls for the stages it runs over
 the whole source: `_outputs` for a record step, `_reordered` for an order
 stage over indexed rows, `_TokenSplit` for a token split, `dew.data.packing.packed_documents`
-for a pack's packer, and `_fill` with `_CachedOutputs` for opening a cache and
+for a pack's packer, and `_fill` with `CachedOutputs` for opening a cache and
 reading what it holds.
 
 `_Build` lowers a pipeline's stages in the order they are written, as the
@@ -37,6 +37,7 @@ import numpy as np
 
 from dew._records import integer, record, strings
 from dew.batch import DRAWS, EXAMPLES_CONSUMED, Batch, Draws
+from dew.data import shards as passes
 from dew.data.analysis import (
     _LOCAL,
     _VIEWS,
@@ -56,6 +57,7 @@ from dew.data.analysis import (
     _volatile,
     _written,
     groups_held,
+    indexable,
 )
 from dew.data.cache import _Mapped
 from dew.data.completion import Completed, Numbered, cuts, reach, released
@@ -113,6 +115,8 @@ from dew.data.pipeline import (
     Batched,
     BatchedGroups,
     BatchStage,
+    CachedOne,
+    CachedOutputs,
     Combined,
     Concatenated,
     Configured,
@@ -581,6 +585,9 @@ def _through(rows: Rows, run: tuple[RecordStage, ...], name: str, label: str, lo
         return Concurrently(_as_iter(rows, loading), lowered, pool)
     if any(isinstance(stage, FlatMap) for stage in run):
         return _expanded(_as_iter(rows, loading), run, name, label, unplaced=unplaced)
+    if seed is None and isinstance(rows, pygrain.IterDataset) and indexable(run):
+        # One record of each, so a window shuffle after it can read its window by index through it.
+        return passes.IndexedMap(rows, lowered, functools.partial(passes.made_one, lowered))
     return rows.map(lowered) if seed is None else rows.random_map(lowered, seed=seed)
 
 
@@ -646,9 +653,9 @@ class _ShardSteps:
     def __call__(self, shard: Shard, options: pygrain.ReadOptions | None = None) -> pygrain.IterDataset:
         rows = self.reader(shard, options)
         if self.cached and self.transparent:
-            rows = rows.map(_CachedOne())
+            rows = rows.map(CachedOne())
         elif self.cached:
-            rows = gx.FlatMapIterDataset(rows, _CachedOutputs())
+            rows = gx.FlatMapIterDataset(rows, CachedOutputs())
         start = 0
         while start < len(self.stages):
             run = _run(self.stages, start, len(self.stages), marked=True, indexed=False)
@@ -656,15 +663,14 @@ class _ShardSteps:
             start += len(run)
         return rows
 
-
-@dataclasses.dataclass(frozen=True)
-class _CachedOutputs:
-    """What a cache holds for one input, as rows: its outputs, a missing one
-    and an empty expansion each rejected, which every read of a cache uses."""
-
-    def flat_map(self, outputs: Sequence[Record]) -> tuple[Record, ...]:
-        held = tuple(Rejected("missing") if value is None else value for value in outputs)
-        return held if held else (Rejected("empty_expansion"),)
+    def indexed(self, shard: Shard) -> base.ShardRows | None:
+        """The shard's records by index through these steps (`base.ShardRows`), where its reader serves them
+        so and every step is a map, none drawing, reading a record's place or on a pool of its own: one
+        record of each, the stream's count kept. None for a cached shard or any other step's, a stream."""
+        plain = not self.cached and indexable(self.stages)
+        rows = self.reader.indexed(shard) if plain and isinstance(self.reader, base.IndexedShards) else None
+        return rows if rows is None or not self.stages else base.MappedRows(
+            rows, functools.partial(passes.made_one, _Rows(self.stages)))
 
 
 def _transparent(pipeline: Pipeline, cache: int) -> bool:
@@ -677,15 +683,6 @@ def _transparent(pipeline: Pipeline, cache: int) -> bool:
 def _automatic_cache(stage: Stage) -> bool:
     """Whether `stage` is a run's automatic cache (`dew.data.compile._automatic`)."""
     return isinstance(stage, Artifact) and stage.automatic
-
-
-class _CachedOne:
-    """What a cache of steps that keep or reject each input holds for one, as the uncached steps make
-    it: its record, or the marker of its rejection; a missing one rejected (`_CachedOutputs`)."""
-
-    def __call__(self, outputs: Record | tuple[Record, ...]) -> Record:
-        (value,) = outputs if isinstance(outputs, tuple) else (outputs,)
-        return Rejected("missing") if value is None else value
 
 
 def _filled(stage: Artifact) -> Cache:
@@ -1595,7 +1592,7 @@ class _Build:
         Without a cache the root is dense: an order batched by index needs a
         record at every position. A source held in memory may hold missing
         records (None), so its root is the records it holds, each keeping its
-        source position (`_Present`); a cache rejects a missing record as it reads it (`_CachedOutputs`)."""
+        source position (`_Present`); a cache rejects a missing record as it reads it (`CachedOutputs`)."""
         records = source.records(self.read)
         stored = pygrain.MapDataset.source(records)
         cache = self.lowering.cache
@@ -1650,7 +1647,7 @@ class _Build:
             # marker, read as the uncached run's rows are read and dropped (`record_stage`), so a position
             # either saves resumes in the other, the cache on or off (row 803); a chain's own cache keeps
             # the form its positions saved.
-            single = view.map(_CachedOne())
+            single = view.map(CachedOne())
             if self.in_order:
                 # Read by index in its inputs' order, as the uncached run's workers read them (`in_order`).
                 return single, cache + 1, None
@@ -1659,7 +1656,7 @@ class _Build:
             return kept, cache + 1, None
         # A stage on a thread pool of its own among the cached steps reads that many inputs at once, as the
         # read's threads do (`dew.data.compile._build`).
-        flat = gx.FlatMapIterDataset(_as_iter(view, self.loading), _CachedOutputs())
+        flat = gx.FlatMapIterDataset(_as_iter(view, self.loading), CachedOutputs())
         return (flat if marked else self.accepted(flat, _name(pipeline), _label(pipeline))), cache + 1, None
 
     @property

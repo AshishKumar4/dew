@@ -152,6 +152,62 @@ class ShardOpener(Protocol):
     def __call__(self, shard: Shard, options: pygrain.ReadOptions | None = None) -> pygrain.IterDataset: ...
 
 
+class ShardRows(Protocol):
+    """A shard's records by index, as its stream (`ShardOpener`) gives them in order, none read until asked:
+    a window shuffle reads the records it gives where a stream would read the window ahead of them
+    (`dew.data.ordering.WindowShuffle`, `dew.data.shards._SequentialIterator.window`)."""
+
+    def rows(self, limit: int) -> int:
+        """How many records the shard holds, at most `limit`: read only as far as `limit` needs."""
+        ...
+
+    def __getitem__(self, index: int) -> Batch:
+        """The `index`th record the shard's stream gives."""
+        ...
+
+    def state_at(self, index: int) -> Mapping[str, object]:
+        """The position its stream's iterator saves once it gave `index` records (`get_state`)."""
+        ...
+
+    def index_of(self, state: Mapping[str, object]) -> int:
+        """How many records its stream's iterator gave at `state`, the inverse of `state_at`."""
+        ...
+
+    def close(self) -> None: ...
+
+
+@runtime_checkable
+class IndexedShards(Protocol):
+    """A shard opener that serves a shard's records by index too (`ShardRows`), None for a shard whose stream
+    it cannot (a compressed file, a record format read whole)."""
+
+    def indexed(self, shard: Shard) -> ShardRows | None: ...
+
+
+@dataclasses.dataclass
+class MappedRows:
+    """`held` with `step` made of each record, one record of each: what a stream of them through `step`
+    gives, at its stream's positions (a map holds none of its own)."""
+
+    held: ShardRows
+    step: Callable[[Batch], Batch]
+
+    def rows(self, limit: int) -> int:
+        return self.held.rows(limit)
+
+    def __getitem__(self, index: int) -> Batch:
+        return self.step(self.held[index])
+
+    def state_at(self, index: int) -> Mapping[str, object]:
+        return self.held.state_at(index)
+
+    def index_of(self, state: Mapping[str, object]) -> int:
+        return self.held.index_of(state)
+
+    def close(self) -> None:
+        self.held.close()
+
+
 @dataclasses.dataclass(frozen=True)
 class ShardManifest:
     """A streamed source's shards, in canonical order, and the reader that
@@ -192,6 +248,9 @@ class ShardManifest:
     `dew.data.shards.cut`): a read's position names its places in the shards it was dealt, so one saved
     under another cut is refused where it resumes (`dew.data.shards._Passing`), and one of a read its store
     cut by an unchanged rule, or not at all, resumes as it was."""
+    alike: str | None = None
+    """The rule its shards were cut finer by where it cut them as the first rule does (`cut` none): a
+    position an earlier Dew saved naming it reads the same rows (`dew.data.shards._Passing`)."""
 
     @property
     def digest(self) -> str:
