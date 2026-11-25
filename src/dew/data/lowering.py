@@ -35,7 +35,7 @@ import grain.experimental as gx
 import grain.python as pygrain
 import numpy as np
 
-from dew._records import finite, integer, record, strings
+from dew._records import integer, record, strings
 from dew.batch import DRAWS, EXAMPLES_CONSUMED, Batch, Draws
 from dew.data.analysis import (
     _LOCAL,
@@ -1405,11 +1405,9 @@ class _Build:
         """The build of the `index`th corpus a mixture, phases or a concatenation reads, by its own
         analysis, keyed by the name it goes by there (`_member_key`)."""
         members = strings(self.lowering.order["members"], "mixture members")
-        # A mixture's members share its workers by their draw weights; phases' and a concatenation's,
-        # each read in turn, equally.
-        stated = self.lowering.order.get("weights")
-        weights = ([finite(weight, "mixture weights") for weight in stated] if isinstance(stated, list)
-                   else [1.0] * len(members))
+        # A mixture's members share its workers by their draw weights (`_Lowering.draws`); phases' and a
+        # concatenation's, each read in turn, equally.
+        weights = list(self.lowering.draws) or [1.0] * len(members)
         pool = None if self.pool is None else self.pool.shared(weights, index)
         loading = self.loading if pool is None else dataclasses.replace(self.loading, workers=pool.count)
         # A member's own mixes stamp nothing: only the phase's mix draws what other phases read on.

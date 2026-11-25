@@ -1014,8 +1014,12 @@ class Workers:
         if self.count < len(drawn):
             heaviest = sorted(drawn, key=lambda at: (-weights[at], at))[:self.count]
             return Workers(int(index in heaviest), self.buffer)
-        total = sum(weights[at] for at in drawn)
-        exact = {at: self.count * weights[at] / total for at in drawn}
+        # Each weight a share of the largest first, so no product or sum of weights a mix may state
+        # overflows (Grain's mix scales them down by its least).
+        largest = max(weights[at] for at in drawn)
+        scaled = {at: weights[at] / largest for at in drawn}
+        total = sum(scaled.values())
+        exact = {at: self.count * scaled[at] / total for at in drawn}
         held = {at: math.floor(share) for at, share in exact.items()}
         for at in sorted(drawn, key=lambda at: (held[at] - exact[at], at))[:self.count - sum(held.values())]:
             held[at] += 1

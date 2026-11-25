@@ -406,6 +406,8 @@ def test_a_shuffled_limit_rejected_for_passes_reads_on_to_the_pass_that_keeps_on
     (3, [1.0, 1.0, 1.0, 1.0], [1, 1, 1, 0]),
     (4, [0.0, 1.0, 1.0], [0, 2, 2]),
     (7, [1.0, 1.0, 1.0], [3, 2, 2]),
+    # Weights as large as a mix may state, no product or sum of them overflowing.
+    (8, [1e308, 1e308], [4, 4]),
 ])
 def test_a_mixtures_corpora_share_its_workers_by_their_draw_weights(workers, weights, shares):
     """A mixture's loading workers dealt to its corpora by their draw weights (`Workers.shared`, which a
@@ -422,7 +424,9 @@ def test_a_mixtures_corpora_share_its_workers_by_their_draw_weights(workers, wei
 def test_a_streamed_weighted_mixture_read_in_loading_workers_reads():
     """A weighted mix of two streamed corpora read in eight loading workers, each worker's copy of the mix
     cut to its slice: its corpora take the slice (`dew.data.mixing.sliced`) and the read delivers rows,
-    where the mix called a `set_slice` Grain's datasets do not define (row 12843)."""
+    where the mix called a `set_slice` Grain's datasets do not define (row 12843); and drawing one corpus
+    seven times as often as the other, it reads that one in seven of the workers, as the position it saves
+    records."""
 
     def corpus(name: str) -> Pipeline:
         return Pipeline(Memory([{"id": index} for index in range(16)], shard_rows=1), name=name).repeat()
@@ -430,4 +434,14 @@ def test_a_streamed_weighted_mixture_read_in_loading_workers_reads():
     loading = Loading(workers=8, threads=1, read_buffer=1, worker_buffer=1)
     data = compile(mix([corpus("rare"), corpus("common")], [1.0, 7.0]).batch(1), read="streamed",
                    loading=loading)
-    assert set(_ids(data.train(DataPartition()), 8)) <= set(range(16))
+    reader = data.train(DataPartition())
+    try:
+        ids = [int(value) for _ in range(8) for value in np.asarray(next(reader)["id"])]
+        plan = record(json.loads(reader.get_state())["dew_data_plan"], "saved plan")
+    finally:
+        reader.close()
+    assert set(ids) <= set(range(16))
+    # Its corpora read in workers by their draw weights, as the position it saves records them.
+    pools = record(record(plan["topology"], "topology")["pools"], "pools")
+    assert sorted(pools.values()) == [1, 7], pools
+    assert next(count for name, count in pools.items() if "common" in name) == 7, pools
