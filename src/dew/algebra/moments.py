@@ -170,21 +170,28 @@ def _primal_exponent(value: jax.Array) -> jax.Array:
 def _shifted_tangent_div(dtw: jax.Array, numerator: jax.Array, sn: jax.Array,
                          extra_shift: jax.Array | int = 0) -> jax.Array:
     """Linear-in-`dtw` evaluation of `dtw * numerator * 2**extra_shift / sn` using `dew.nn.precision.power2`:
-    applies any upward scale to `numerator` before dividing by normalized `u_sn` (in `[0.5, 1)` near
-    `minexp` so minimum-normal numerators never flush to subnormal, `[1, 2)` elsewhere so `fmax` never
-    overflows), puts upward shift onto zero `numerator` to avoid `inf * 0`, and applies the rest to `dtw`."""
+    balances `k_dtw` and `q = power2(numerator, k_num) / u_sn` so both factors move in the same direction
+    (`>= 1` when `|R| >= 1`, `<= 1` when `|R| < 1`), lifting `<= minexp` numerators above `minexp` before
+    dividing by `u_sn in [1, 2)` so normal quotients never flush to subnormal on XLA:CPU, and putting
+    positive shift onto zero `numerator` to avoid `inf * 0`."""
     minexp = int(jnp.finfo(numerator.dtype).minexp)
     e_sn = _primal_exponent(sn)
+    u_sn = power2(sn, -e_sn)
     plain_num = jax.lax.stop_gradient(numerator)
     zero_num = plain_num == 0
     e_num = _primal_exponent(numerator)
-    sn_shift = jnp.where((~zero_num) & (e_num <= minexp + 1), e_sn + 1, e_sn)
-    u_sn = power2(sn, -sn_shift)
-    e_eff = sn_shift - extra_shift
-    k_num = jnp.where(
-        e_eff > 0, -jnp.minimum(e_eff, jnp.maximum(e_num, 0)),
-        jnp.where(zero_num, -e_eff, jnp.minimum(-e_eff, jnp.maximum(-e_num, 0))))
-    k_dtw = -e_eff - k_num
+    m_q = jnp.abs(power2(plain_num, -e_num)) / jax.lax.stop_gradient(u_sn)
+    q_ge_1 = m_q >= 1.0
+    e_total = extra_shift - e_sn
+    e_r = e_num + e_total - jnp.where(q_ge_1, jnp.int32(0), jnp.int32(1))
+    need = -e_num + jnp.where(q_ge_1, jnp.int32(0), jnp.int32(1))
+    drop = -e_num - jnp.where(q_ge_1, jnp.int32(1), jnp.int32(0))
+    k_up = jnp.where(need > 0, need, jnp.minimum(e_total, jnp.int32(0)))
+    k_dn_base = jnp.where(drop < 0, drop, jnp.maximum(e_total, jnp.int32(0)))
+    k_dn = jnp.where(e_num + k_dn_base <= minexp,
+                     jnp.minimum(drop, jnp.int32(minexp + 1) - e_num), k_dn_base)
+    k_num = jnp.where(zero_num, jnp.maximum(e_total, jnp.int32(0)), jnp.where(e_r >= 0, k_up, k_dn))
+    k_dtw = e_total - k_num
     return power2(dtw, k_dtw) * (power2(numerator, k_num) / u_sn)
 
 
