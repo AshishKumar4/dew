@@ -704,14 +704,12 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
             # padded nor partial, so selection and the launch judge the same operands (c3b97e20f F3: a first
             # depth of 80 padded to 128 was derived on, and refused as bound).
             whole = {**whole, 'depth': extents['depth']}
-        if whole == extents:
+        if whole == extents or whole_tiles:
             return extents, whole
-        def shaped(leaf):
-            return jax.ShapeDtypeStruct(leaf.shape, leaf.dtype) if isinstance(leaf, jax.Array) else leaf
+        from . import tuning
 
-        shapes = type(ba)(ba.op, jax.tree.map(shaped, ba.arguments))
-        depth_partial, width_partial = ((False, False) if whole_tiles
-                                        else self._partial_axes(shapes, family, target))
+        shapes = type(ba)(ba.op, tuning.shapes(ba.arguments))
+        depth_partial, width_partial = self._partial_axes(shapes, family, target)
         partial = {'depth': depth_partial, 'width': width_partial}
         return extents, {axis: extent if partial.get(axis) else whole[axis]
                          for axis, extent in extents.items()}
