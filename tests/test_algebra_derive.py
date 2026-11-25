@@ -772,3 +772,142 @@ def test_an_equation_outside_the_language_over_a_walks_total_is_refused():
     forms = derive.derive(declared(sinh_total), accurate=False, saturation=SATURATION)
     with pytest.raises(derive.Refused):
         walked_whole(forms)(*draw(0))
+
+
+@pytest.mark.parametrize("mode", ["walk", "merge"])
+def test_weighted_central_moments_derive_and_match_float64_at_high_mean(mode):
+    """Chan-Golub-LeVeque central-moment derivation (`derive._moment_decoupled`, `moments.chunked_moments`,
+    row 9036) handles shifted high-mean data (`1e4 + N(0, 1)` where naive `E[x^2] - E[x]^2` cancels all
+    float32 variance bits) on par with the declared function in float64, both sequentially and via parallel
+    tree merge."""
+    from dew.algebra import moments
+
+    def draw_shifted(seed):
+        rng = np.random.default_rng([9036, seed])
+        x = (1e4 + rng.standard_normal((8, 96))).astype(np.float32)
+        w = rng.uniform(0.25, 2.0, (8, 96)).astype(np.float32)
+        return x, w
+
+    assert_as_exact(
+        jax.jit(lambda x, w: moments.chunked_moments(x, w, tile=32, mode=mode)),
+        jax.jit(moments.weighted_moments),
+        draw_shifted, f"weighted central moments ({mode})", seeds=16)
+
+
+@pytest.mark.parametrize("mode", ["walk", "merge"])
+def test_masked_central_moments_handle_empty_tiles_and_empty_rows(mode):
+    """Masked unweighted variance (`moments.chunked_masked_moments`) with wholly-masked tiles (first tile
+    empty, middle tile empty) and an all-masked row stays finite and matches the declared function (check 1),
+    with zero `0 / 0` NaNs."""
+    from dew.algebra import moments
+
+    def draw_masked(seed):
+        rng = np.random.default_rng([9037, seed])
+        x = (500.0 + rng.standard_normal((6, 96))).astype(np.float32)
+        mask = rng.random((6, 96)) > 0.35
+        mask[0, :] = False
+        mask[1, :32] = False
+        mask[2, 32:64] = False
+        mask[3, 64:] = False
+        return x, mask
+
+    assert_as_exact(
+        jax.jit(lambda x, m: moments.chunked_masked_moments(x, m, tile=32, mode=mode)),
+        jax.jit(moments.masked_moments),
+        draw_masked, f"masked central moments ({mode})", seeds=16)
+    x0, m0 = draw_masked(0)
+    mean, var = moments.chunked_masked_moments(x0, m0, tile=32, mode=mode)
+    assert np.all(np.isfinite(mean)) and np.all(np.isfinite(var))
+    assert float(mean[0]) == 0.0 and float(var[0]) == 0.0
+
+
+@pytest.mark.parametrize("mode", ["walk", "merge"])
+def test_weighted_covariance_derives_and_merges_over_tiles(mode):
+    """Bilinear central covariance (`moments.chunked_covariance`, `sum(w * (x - mu_x) * (y - mu_y))`)
+    derives Chan-Golub-LeVeque step and merge forms and matches float64 truth (check 1)."""
+    from dew.algebra import moments
+
+    def draw_pair(seed):
+        rng = np.random.default_rng([9038, seed])
+        base = rng.standard_normal((8, 96))
+        x = (1e3 + base + 0.5 * rng.standard_normal((8, 96))).astype(np.float32)
+        y = (-2e3 + 0.7 * base + rng.standard_normal((8, 96))).astype(np.float32)
+        w = rng.uniform(0.1, 3.0, (8, 96)).astype(np.float32)
+        return x, y, w
+
+    assert_as_exact(
+        jax.jit(lambda x, y, w: moments.chunked_covariance(x, y, w, tile=32, mode=mode)),
+        jax.jit(moments.weighted_covariance),
+        draw_pair, f"weighted covariance ({mode})", seeds=16)
+
+
+def test_central_moment_derivation_handles_keepdims_scalar_1d_and_square_op():
+    """Central-moment derivation handles `keepdims=True`, 1D scalar reductions, `jnp.square`, `** 2`, and
+    unguarded `s / n` declarations even when an individual tile has zero total weight."""
+    def keepdims_var(x, w):
+        n = jnp.sum(w, axis=-1, keepdims=True)
+        mean = jnp.sum(w * x, axis=-1, keepdims=True) / n
+        return jnp.sum(w * jnp.square(x - mean), axis=-1) / jnp.squeeze(n, axis=-1)
+
+    def scalar_1d_var(x, w):
+        n = jnp.sum(w, axis=0)
+        mean = jnp.sum(w * x, axis=0) / n
+        return jnp.sum(w * ((x - mean) ** 2), axis=0) / n
+
+    forms_kd = derive.derive(derive.Reduction(keepdims_var, {"x": ("r", "k"), "w": ("r", "k")}, walked="k"),
+                             accurate=False, saturation=SATURATION)
+    rng = np.random.default_rng(9039)
+    x = (1e3 + rng.standard_normal((4, 64))).astype(np.float32)
+    w = rng.uniform(0.5, 2.0, (4, 64)).astype(np.float32)
+    w[0, :32] = 0.0
+    shapes = {"x": ((4, 32), jnp.float32), "w": ((4, 32), jnp.float32)}
+    t0, t1 = {"x": x[:, :32], "w": w[:, :32]}, {"x": x[:, 32:], "w": w[:, 32:]}
+    st = forms_kd.step(forms_kd.step(forms_kd.init(shapes), t0), t1)
+    got = np.asarray(forms_kd.finish(st, t0, shapes=shapes))
+    assert np.all(np.isfinite(got))
+    assert_as_exact(
+        jax.jit(lambda x_, w_: forms_kd.finish(
+            forms_kd.step(forms_kd.step(forms_kd.init(shapes), {"x": x_[:, :32], "w": w_[:, :32]}),
+                          {"x": x_[:, 32:], "w": w_[:, 32:]}),
+            {"x": x_[:, :32], "w": w_[:, :32]}, shapes=shapes)),
+        jax.jit(keepdims_var),
+        lambda seed: ((1e3 + np.random.default_rng(seed).standard_normal((4, 64))).astype(np.float32),
+                      np.random.default_rng(seed + 100).uniform(0.5, 2.0, (4, 64)).astype(np.float32)),
+        "keepdims variance", seeds=16)
+
+    forms_1d = derive.derive(derive.Reduction(scalar_1d_var, {"x": ("k",), "w": ("k",)}, walked="k"),
+                             accurate=False, saturation=SATURATION)
+    shapes_1d = {"x": ((32,), jnp.float32), "w": ((32,), jnp.float32)}
+    assert_as_exact(
+        jax.jit(lambda x_, w_: forms_1d.finish(
+            forms_1d.merge(forms_1d.step(forms_1d.init(shapes_1d), {"x": x_[:32], "w": w_[:32]}),
+                           forms_1d.step(forms_1d.init(shapes_1d), {"x": x_[32:], "w": w_[32:]}),
+                           shapes=shapes_1d),
+            {"x": x_[:32], "w": w_[:32]}, shapes=shapes_1d)),
+        jax.jit(scalar_1d_var),
+        lambda seed: ((1e3 + np.random.default_rng(seed).standard_normal((64,))).astype(np.float32),
+                      np.random.default_rng(seed + 200).uniform(0.5, 2.0, (64,)).astype(np.float32)),
+        "1d scalar variance", seeds=16)
+
+
+def test_uncovered_moments_and_misaligned_mean_broadcasts_are_refused():
+    """Higher central moments (third moment) and misaligned mean broadcasts on a square tile (`mean[None, :]`
+    along the walked axis instead of `mean[:, None]`) are refused by `derive.derive`."""
+    def third_moment(x, w):
+        n = jnp.sum(w, axis=-1)
+        mean = jnp.sum(w * x, axis=-1) / n
+        diff = x - mean[:, None]
+        return jnp.sum(w * diff * diff * diff, axis=-1) / n
+
+    def misaligned_square(x, w):
+        n = jnp.sum(w, axis=-1)
+        mean = jnp.sum(w * x, axis=-1) / n
+        diff = x - mean[None, :]
+        return jnp.sum(w * diff * diff, axis=-1) / n
+
+    shapes = {"x": ((8, 8), jnp.float32), "w": ((8, 8), jnp.float32)}
+    for fn in (third_moment, misaligned_square):
+        forms = derive.derive(derive.Reduction(fn, {"x": ("r", "k"), "w": ("r", "k")}, walked="k"),
+                              accurate=False, saturation=SATURATION)
+        with pytest.raises(derive.Refused):
+            forms.init(shapes)

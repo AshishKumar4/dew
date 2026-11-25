@@ -565,43 +565,75 @@ _FLOORED = Drawn(((64, 1024), (64, 1024)), scale=lambda rng, shape, drawn: (
 def _reuse() -> tuple[RuleFamily, ...]:
     """A value the program already computed read in a new one's place (§1.4's reuse): a quotient by a value
     whose reciprocal the program holds, `a / y` as `a (1 / y)`, and by a root whose reciprocal root it holds,
-    `a / sqrt(v)` as `a rsqrt(v)` (a normalization's `x / max(|y|, eps)` beside its reciprocal, a norm's
-    `rsqrt(mean(x^2) + eps)`), a reciprocal's divisor made by a maximum or a sum (an epsilon's floor, so a
-    window opens at a division by one alone, not at every division a program holds). Each reorders a
-    rounding, and each fires only where the reciprocal is a normal finite float and the product finite
-    (§6.3's dominance rule): the divisor held away from zero
-    (`log2_floor`: its reciprocal at most `2**-floor`, under the program's reach), and bounded (`log2_bound`:
-    its reciprocal at least `2**-bound`, above the narrowest float's least normal power, so no flushing lane
-    reads it as zero), and the dividend's bound with the reciprocal's under the reach. A reciprocal of an
-    unguarded divisor overflows where the quotient is finite (a subnormal one) and makes a NaN of a zero
-    dividend, so it is never shared (the reuse probe, 2026-11-05)."""
+    `a / sqrt(v)` as `a rsqrt(v)` (directly or broadcast along trailing axes: a norm's `x / sqrt(v)[:, None]`
+    beside `rsqrt(v)`, a normalization's `x / max(|y|, eps)` or `x / sum(...)` beside its reciprocal). Each
+    reorders a rounding, and each fires only where the reciprocal is a normal finite float and the product
+    finite (§6.3's dominance rule): the divisor held away from zero (`log2_floor`: its reciprocal at most
+    `2**-floor`, under the program's reach) and bounded (`log2_bound`: its reciprocal at least `2**-bound`,
+    above the narrowest float's least normal power, so no flushing lane reads it as zero), and either the
+    divisor is at least 1 (`floor >= 0`, so `0 < |1/y| <= 1` can never overflow any finite dividend `a`) or
+    the dividend's bound with the reciprocal's stays under the reach. A reciprocal of an unguarded divisor
+    overflows where the quotient is finite (a subnormal one) and makes a NaN of a zero dividend, so it is
+    never shared (the reuse probe, 2026-11-05)."""
     a, u, w, v, one, t, r = vars_("a u w v one t r", Term)
-    divided, inverted, rooted, reciprocal, multiplied, made = vars_(
-        "divided inverted rooted reciprocal multiplied made", i64)
+    axes, extent = vars_("axes extent", Vec[i64])
+    divided, inverted, rooted, reciprocal, multiplied, made, laid = vars_(
+        "divided inverted rooted reciprocal multiplied made laid", i64)
     floor, bound, held, reached, lowest = vars_("floor bound held reached lowest", i64)
-    guarded = (eq(reached).to(reach()), eq(lowest).to(least()), eq(held).to(log2_bound(a)),
-               eq(multiplied).to(stock("mul")), plain(divided), eq(shape(a)).to(shape(t)))
-    # A divisor's reciprocal is a normal finite float, the product finite (the docstring's guards).
+    common = (eq(reached).to(reach()), eq(lowest).to(least()), eq(multiplied).to(stock("mul")),
+              plain(divided), eq(shape(a)).to(shape(t)))
+    # A divisor's reciprocal is a normal finite float (above least normal and under reach).
     normal = (i64(0) - floor <= reached, lowest <= i64(0) - bound - 1)
     reciprocals = []
-    for maker in ("max", "add"):
-        y = u.binary(maker, w, made)
-        reciprocals.append(rule(
-            eq(t).to(a.binary("div", y, divided)), eq(r).to(one.binary("div", y, inverted)), unit(one),
-            plain(inverted), eq(shape(r)).to(shape(t)), eq(floor).to(log2_floor(y)),
-            eq(bound).to(log2_bound(y)), *guarded, *normal, held - floor <= reached).then(
-            union(t).with_(a.binary("mul", r, multiplied))))
+    makers = (
+        (u.binary("max", w, made), (eq(shape(u)).to(shape(w)),)),
+        (u.binary("add", w, made), (eq(shape(u)).to(shape(w)),)),
+        (u.reduce("sum", axes, made), ()),
+    )
+    r_laid = r.shaped("broadcast_in_dim", laid)
+    for y, maker_cond in makers:
+        for dividend_guard in ((eq(held).to(log2_bound(a)), held - floor <= reached), (i64(0) <= floor,)):
+            reciprocals += [
+                rule(
+                    eq(t).to(a.binary("div", y, divided)), eq(r).to(one.binary("div", y, inverted)), unit(one),
+                    plain(inverted), *maker_cond, eq(shape(r)).to(shape(t)), eq(floor).to(log2_floor(y)),
+                    eq(bound).to(log2_bound(y)), *common, *normal, *dividend_guard).then(
+                    union(t).with_(a.binary("mul", r, multiplied))),
+                rule(
+                    eq(t).to(a.binary("div", y.shaped("broadcast_in_dim", laid), divided)),
+                    eq(r).to(one.binary("div", y, inverted)), unit(one), plain(inverted), *maker_cond,
+                    eq(shape(r)).to(shape(y)), eq(extent).to(shape(t)), eq(floor).to(log2_floor(y)),
+                    eq(bound).to(log2_bound(y)), *common, *normal, *dividend_guard).then(
+                    union(t).with_(a.binary("mul", r_laid, multiplied)), set_(shape(r_laid)).to(extent)),
+            ]
+    roots = []
+    for dividend_guard in ((eq(held).to(log2_bound(a)), held + (i64(0) - floor).max(i64(0)) <= reached),
+                           (i64(0) <= floor,)):
+        roots += [
+            rule(
+                eq(t).to(a.binary("div", v.unary("sqrt", rooted), divided)),
+                eq(r).to(v.unary("rsqrt", reciprocal)), positive(v), eq(shape(r)).to(shape(t)),
+                eq(floor).to(log2_floor(v)), eq(bound).to(log2_bound(v)), *common, *normal,
+                *dividend_guard).then(union(t).with_(a.binary("mul", r, multiplied))),
+            rule(
+                eq(t).to(a.binary("div", v.unary("sqrt", rooted).shaped("broadcast_in_dim", laid), divided)),
+                eq(r).to(v.unary("rsqrt", reciprocal)), positive(v), eq(shape(r)).to(shape(v)),
+                eq(extent).to(shape(t)), eq(floor).to(log2_floor(v)), eq(bound).to(log2_bound(v)),
+                *common, *normal, *dividend_guard).then(
+                union(t).with_(a.binary("mul", r_laid, multiplied)), set_(shape(r_laid)).to(extent)),
+            rule(
+                eq(t).to(a.binary("div", v.shaped("broadcast_in_dim", laid).unary("sqrt", rooted), divided)),
+                eq(r).to(v.unary("rsqrt", reciprocal)), positive(v), eq(shape(r)).to(shape(v)),
+                eq(extent).to(shape(t)), eq(floor).to(log2_floor(v)), eq(bound).to(log2_bound(v)),
+                *common, *normal, *dividend_guard).then(
+                union(t).with_(a.binary("mul", r_laid, multiplied)), set_(shape(r_laid)).to(extent)),
+        ]
     return (
         RuleFamily("a quotient by a value whose reciprocal the program holds", tuple(reciprocals),
                    (lambda a, y: a / jnp.maximum(y, 1e-3), lambda a, y: a * (1 / jnp.maximum(y, 1e-3)),
                     _FLOORED)),
-        RuleFamily("a quotient by a root whose reciprocal the program holds", (rule(
-            eq(t).to(a.binary("div", v.unary("sqrt", rooted), divided)),
-            eq(r).to(v.unary("rsqrt", reciprocal)), positive(v), eq(shape(r)).to(shape(t)),
-            eq(floor).to(log2_floor(v)), eq(bound).to(log2_bound(v)), *guarded, *normal,
-            held + (i64(0) - floor).max(i64(0)) <= reached).then(
-            union(t).with_(a.binary("mul", r, multiplied))),),
-            (lambda a, v: a / jnp.sqrt(v), lambda a, v: a * jax.lax.rsqrt(v), _FLOORED)))
+        RuleFamily("a quotient by a root whose reciprocal the program holds", tuple(roots),
+                   (lambda a, v: a / jnp.sqrt(v), lambda a, v: a * jax.lax.rsqrt(v), _FLOORED)))
 
 
 def _linear() -> tuple[RuleFamily, ...]:

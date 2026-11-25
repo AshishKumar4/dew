@@ -177,15 +177,16 @@ glue is (§6.2), reorderings over its values held by the dominance rule alone (�
     every program the pass saw, bodies included) the only pattern of note was a divisor shared by several
     quotients (42 to 452 of 423 to 794 divisions a suite). A shared reciprocal unguarded overflows where `a /
     y` is finite (a subnormal `y`), makes a NaN of a zero `a`, and flushes to zero where a large `y`'s quotient
-    keeps its value, so each rule reads a divisor an epsilon floors (a maximum's or a sum's, so a window
-    opens at a division by one alone) and fires only where its divisor is held away from zero (its floor,
-    `rules.log2_floor`) and bounded (`log2_bound`: the reciprocal a normal float above the narrowest float's
-    least normal power, `rules.least`) and its dividend bounded, the product under the reach (§6.3). A
-    training step's values are mostly unbounded, so it fires on bounded ones alone (an epsilon's floor over a
-    bounded operand);
-  - **decoupled reductions** (dev time): dependent nonlinear reductions broken with correction terms (the running-max
-    rescale of online softmax, log-sum-exp merges and folds, moment merges; the moment merges are not built:
-    no rule, declaration or consumer of one exists);
+    keeps its value, so each rule reads a divisor an epsilon floors (a maximum's, a sum's, or a `reduce_sum`'s,
+    directly or broadcast along trailing axes) and fires only where its divisor is held away from zero (its
+    floor, `rules.log2_floor`) and bounded (`log2_bound`: the reciprocal a normal float above the narrowest
+    float's least normal power, `rules.least`) and either the divisor is at least 1 (`floor >= 0`, so its
+    reciprocal is in `(0, 1]` and can never overflow any finite dividend) or the dividend is bounded with the
+    product under the reach (§6.3). Window formation (`program._windows`) pulls sibling `rsqrt` and unit
+    reciprocal equations sharing a division head's radicand or divisor into the window;
+  - **decoupled reductions** (dev time): dependent nonlinear reductions broken with correction terms (the
+    running-max rescale of online softmax, log-sum-exp merges and folds, and Chan-Golub-LeVeque central-moment
+    merges for weighted and masked variance and bilinear covariance in `derive.py` / `moments.py`, row 9036);
   - **stable forms** (`stable`, dev time; §1.5; row 9037): `log1p` and `expm1`, a sum's logarithm taken out
     of its exponent (the log-sum-exp fold), logarithms of exponentials in log space (`log(exp(a) / exp(b))`
     as `a - b`, a KL's divergence of two softmaxes; `log(exp(a) exp(b))`, `log(exp(a))`), differences of

@@ -265,6 +265,406 @@ def floor_of(literal: Term) -> i64: ...
 """The class of a literal's value among the walk's floors (`_floors`): literals of one value one class."""
 
 
+@function
+def unit_array(term: Term) -> Unit: ...
+"""A value of ones (a literal 1, or a layout or cast of one)."""
+
+
+@function
+def boolean(term: Term) -> Unit: ...
+"""A boolean value (a mask)."""
+
+
+@function
+def is_square(params: i64) -> Unit: ...
+"""An `integer_pow` of exponent 2."""
+
+
+@function
+def inserts_axis(params: i64, axis: i64) -> Unit: ...
+"""A broadcast or reshape inserting `axis` while keeping every other axis in order."""
+
+
+@function
+def identity_broadcast(params: i64) -> Unit: ...
+"""A `broadcast_in_dim` keeping every axis in place (`broadcast_dimensions == range(rank)`)."""
+
+
+@function(merge=lambda old, new: old)
+def zero_of(term: Term) -> i64: ...
+"""The literal index of 0 in `term`'s floating dtype."""
+
+
+@function(merge=lambda old, new: old)
+def one_of(term: Term) -> i64: ...
+"""The literal index of 1 in `term`'s floating dtype."""
+
+
+@function(merge=lambda old, new: old)
+def filled(to: Vec[i64]) -> i64: ...
+"""The `broadcast_in_dim` parameters lifting a scalar to shape `to`."""
+
+
+@function(merge=lambda old, new: old)
+def unreduced(to: Vec[i64], axis: i64) -> i64: ...
+"""The `broadcast_in_dim` parameters lifting a shape without `axis` back to `to`."""
+
+
+@function(merge=lambda old, new: old)
+def comp_gt() -> i64: ...
+"""The parameters index of `lax.gt_p`."""
+
+
+@function(merge=lambda old, new: old)
+def logic_and() -> i64: ...
+"""The parameters index of `lax.and_p`."""
+
+
+@function
+def indicator(term: Term, mask: Term) -> Unit: ...
+"""A 0/1 indicator of boolean `mask` (`mask.astype(dtype)` or `where(mask, 1, 0)`)."""
+
+
+@function
+def counts(total: Term, weight: Term, axis: i64) -> Unit: ...
+"""`total` is the walked sum of local `weight` along `axis`."""
+
+
+@function
+def masked_counts(total: Term, mask: Term, axis: i64) -> Unit: ...
+"""`total` is the walked sum of `mask`'s 0/1 indicator along `axis`."""
+
+
+@function
+def first_sum(total: Term, value: Term, weight: Term, axis: i64) -> Unit: ...
+"""`total` is the walked sum of `weight * value` along `axis`."""
+
+
+@function
+def masked_first_sum(total: Term, value: Term, mask: Term, axis: i64) -> Unit: ...
+"""`total` is the walked sum of `where(mask, value, 0)` along `axis`."""
+
+
+@function
+def safe_count(term: Term, count: Term) -> Unit: ...
+"""`term` equals `count` wherever `count > 0` (`count` itself, or guarded against zero)."""
+
+
+@function
+def count_lifted(term: Term, count: Term, axis: i64) -> Unit: ...
+"""`term` is `count` lifted across `axis` (`keepdims`)."""
+
+
+@function
+def safe_count_lifted(term: Term, count: Term, axis: i64) -> Unit: ...
+"""`term` is a zero-safe `count` lifted across `axis` (`keepdims`)."""
+
+
+@function
+def first_lifted(term: Term, total: Term, value: Term, weight: Term, axis: i64) -> Unit: ...
+"""`term` is `first_sum` `total` lifted across `axis` (`keepdims`)."""
+
+
+@function
+def masked_first_lifted(term: Term, total: Term, value: Term, mask: Term, axis: i64) -> Unit: ...
+"""`term` is `masked_first_sum` `total` lifted across `axis` (`keepdims`)."""
+
+
+@function
+def mean_of(mu: Term, total: Term, count: Term, value: Term, weight: Term, axis: i64) -> Unit: ...
+"""`mu` is the weighted mean `total / count` of `value` under `weight` along `axis`."""
+
+
+@function
+def masked_mean_of(mu: Term, total: Term, count: Term, value: Term, mask: Term, axis: i64) -> Unit: ...
+"""`mu` is the masked mean `total / count` of `value` under `mask` along `axis`."""
+
+
+@function
+def mean_lifted(mu: Term, total: Term, count: Term, value: Term, weight: Term, axis: i64) -> Unit: ...
+"""`mu` is `mean_of` broadcast along `axis` keeping all other axes in order."""
+
+
+@function
+def masked_mean_lifted(mu: Term, total: Term, count: Term, value: Term, mask: Term, axis: i64) -> Unit: ...
+"""`mu` is `masked_mean_of` broadcast along `axis` keeping all other axes in order."""
+
+
+@function
+def centered(diff: Term, value: Term, total: Term, count: Term, weight: Term, axis: i64, sign: i64) -> Unit: ...
+"""`diff` is `sign * (value - mean)` along `axis` under `weight`."""
+
+
+@function
+def masked_centered(diff: Term, value: Term, total: Term, count: Term, mask: Term, axis: i64,
+                    sign: i64) -> Unit: ...
+"""`diff` is `sign * (value - mean)` along `axis` under `mask`."""
+
+
+@function
+def centered_pair(term: Term, sx: Term, sy: Term, count: Term, x: Term, y: Term, weight: Term, axis: i64,
+                  sign: i64) -> Unit: ...
+"""`term` is `sign * (x - mu_x) * (y - mu_y)` along `axis` under `weight`."""
+
+
+@function
+def masked_centered_pair(term: Term, sx: Term, sy: Term, count: Term, x: Term, y: Term, mask: Term, axis: i64,
+                         sign: i64) -> Unit: ...
+"""`term` is `sign * (x - mu_x) * (y - mu_y)` along `axis` under `mask`."""
+
+
+@function
+def weighted_central(term: Term, sx: Term, sy: Term, count: Term, x: Term, y: Term, weight: Term, axis: i64,
+                     sign: i64) -> Unit: ...
+"""`term` is `sign * weight * (x - mu_x) * (y - mu_y)` along `axis`."""
+
+
+@function
+def masked_weighted_central(term: Term, sx: Term, sy: Term, count: Term, x: Term, y: Term, mask: Term,
+                            z: Term, axis: i64, sign: i64) -> Unit: ...
+"""`term` is `where(mask, sign * (x - mu_x) * (y - mu_y), z)` along `axis` (`z` zero)."""
+
+
+@function
+def central_moment(term: Term, sx: Term, sy: Term, count: Term, x: Term, y: Term, weight: Term, axis: i64,
+                   sign: i64) -> Unit: ...
+"""`term` is the walked central second moment `sum(weight * (x - mu_x) * (y - mu_y))` along `axis`."""
+
+
+@function
+def masked_central_moment(term: Term, sx: Term, sy: Term, count: Term, x: Term, y: Term, mask: Term,
+                          z: Term, axis: i64, sign: i64) -> Unit: ...
+"""`term` is the walked masked central second moment `sum(where(mask, (x - mu_x) * (y - mu_y), z))`."""
+
+
+def _moment_walking() -> list:
+    """The facts' rules recognizing weighted and masked central second moments (variance and covariance)
+    along the walked axis, for Chan-Golub-LeVeque decoupling (`_moment_decoupled`)."""
+    x, y, z, w, mask, ind, t, n, s, sx, sy, d, c, mu, dx, dy, pair, m = vars_(
+        "x y z w mask ind t n s sx sy d c mu dx dy pair m", Term)
+    layout = var("layout", String)
+    p, q, r, a, sign = vars_("p q r a sign", i64)
+    axes = var("axes", Vec[i64])
+    shape = rules.shape
+    found = [
+        # Ones and booleans through layouts and casts; 0/1 mask indicators.
+        rule(eq(t).to(x.shaped(layout, p)), unit_array(x)).then(unit_array(t)),
+        rule(eq(t).to(x.convert(p)), unit_array(x)).then(unit_array(t)),
+        rule(eq(t).to(x.shaped(layout, p)), boolean(x)).then(boolean(t)),
+        rule(eq(t).to(mask.convert(p)), boolean(mask)).then(indicator(t, mask)),
+        rule(eq(t).to(mask.select(z, x)), boolean(mask), zero(z), unit_array(x)).then(indicator(t, mask)),
+        # Counts and first sums along the walked axis.
+        rule(eq(n).to(w.reduce(String("sum"), axes, p)), local(w), eq(walked(w)).to(a),
+             eq(axes).to(Vec[i64](a))).then(counts(n, w, a), safe_count(n, n)),
+        rule(eq(n).to(ind.reduce(String("sum"), axes, p)), indicator(ind, mask), local(mask),
+             eq(walked(mask)).to(a), eq(axes).to(Vec[i64](a))).then(masked_counts(n, mask, a),
+                                                                    safe_count(n, n)),
+        rule(eq(s).to(w.binary(String("mul"), x, q).reduce(String("sum"), axes, p)), local(x), local(w),
+             eq(walked(x)).to(a), eq(walked(w)).to(a), eq(axes).to(Vec[i64](a))).then(first_sum(s, x, w, a)),
+        rule(eq(s).to(x.binary(String("mul"), w, q).reduce(String("sum"), axes, p)), local(x), local(w),
+             eq(walked(x)).to(a), eq(walked(w)).to(a), eq(axes).to(Vec[i64](a))).then(first_sum(s, x, w, a)),
+        rule(eq(s).to(mask.select(z, x).reduce(String("sum"), axes, p)), boolean(mask), zero(z), local(x),
+             local(mask), eq(walked(x)).to(a), eq(walked(mask)).to(a),
+             eq(axes).to(Vec[i64](a))).then(masked_first_sum(s, x, mask, a)),
+        # Zero-safe count denominators (`where(n > 0, n, c)`, `where(0 < n, n, c)`, `where(n != 0, n, c)`,
+        # `where(n == 0, c, n)`).
+        rule(eq(d).to(n.compare(String("gt"), z, p).select(c, n)), safe_count(n, n), zero(z)).then(
+            safe_count(d, n)),
+        rule(eq(d).to(z.compare(String("lt"), n, p).select(c, n)), safe_count(n, n), zero(z)).then(
+            safe_count(d, n)),
+        rule(eq(d).to(n.compare(String("ne"), z, p).select(c, n)), safe_count(n, n), zero(z)).then(
+            safe_count(d, n)),
+        rule(eq(d).to(n.compare(String("eq"), z, p).select(n, c)), safe_count(n, n), zero(z)).then(
+            safe_count(d, n)),
+        rule(eq(d).to(z.compare(String("eq"), n, p).select(n, c)), safe_count(n, n), zero(z)).then(
+            safe_count(d, n)),
+        # Keepdims lifts (inserting the walked axis at its exact place before dividing).
+        rule(eq(t).to(n.shaped(layout, p)), counts(n, w, a), inserts_axis(p, a)).then(
+            count_lifted(t, n, a), safe_count(t, t)),
+        rule(eq(t).to(n.shaped(layout, p)), masked_counts(n, mask, a), inserts_axis(p, a)).then(
+            count_lifted(t, n, a), safe_count(t, t)),
+        rule(eq(t).to(d.shaped(layout, p)), safe_count(d, n), inserts_axis(p, a)).then(
+            safe_count_lifted(t, n, a)),
+        rule(count_lifted(c, n, a), safe_count(d, c)).then(safe_count_lifted(d, n, a)),
+        rule(eq(t).to(s.shaped(layout, p)), first_sum(s, x, w, a), inserts_axis(p, a)).then(
+            first_lifted(t, s, x, w, a)),
+        rule(eq(t).to(s.shaped(layout, p)), masked_first_sum(s, x, mask, a), inserts_axis(p, a)).then(
+            masked_first_lifted(t, s, x, mask, a)),
+        # Weighted and masked means, plus axis-aligned broadcasts back to `x`'s shape.
+        rule(eq(mu).to(s.binary(String("div"), d, p)), first_sum(s, x, w, a), counts(n, w, a),
+             safe_count(d, n), eq(shape(s)).to(shape(n))).then(mean_of(mu, s, n, x, w, a)),
+        rule(eq(mu).to(s.binary(String("div"), d, p)), masked_first_sum(s, x, mask, a),
+             masked_counts(n, mask, a), safe_count(d, n),
+             eq(shape(s)).to(shape(n))).then(masked_mean_of(mu, s, n, x, mask, a)),
+        rule(eq(t).to(mu.shaped(layout, p)), mean_of(mu, s, n, x, w, a), inserts_axis(p, a)).then(
+            mean_lifted(t, s, n, x, w, a)),
+        rule(eq(t).to(mu.shaped(layout, p)), masked_mean_of(mu, s, n, x, mask, a), inserts_axis(p, a)).then(
+            masked_mean_lifted(t, s, n, x, mask, a)),
+        rule(eq(mu).to(c.binary(String("div"), d, p)), first_lifted(c, s, x, w, a),
+             safe_count_lifted(d, n, a), counts(n, w, a),
+             eq(shape(s)).to(shape(n))).then(mean_lifted(mu, s, n, x, w, a)),
+        rule(eq(mu).to(c.binary(String("div"), d, p)), masked_first_lifted(c, s, x, mask, a),
+             safe_count_lifted(d, n, a), masked_counts(n, mask, a),
+             eq(shape(s)).to(shape(n))).then(masked_mean_lifted(mu, s, n, x, mask, a)),
+        rule(eq(t).to(mu.shaped(String("broadcast_in_dim"), p)), mean_lifted(mu, s, n, x, w, a),
+             identity_broadcast(p), eq(shape(t)).to(shape(x))).then(mean_lifted(t, s, n, x, w, a)),
+        rule(eq(t).to(mu.shaped(String("broadcast_in_dim"), p)), masked_mean_lifted(mu, s, n, x, mask, a),
+             identity_broadcast(p), eq(shape(t)).to(shape(x))).then(masked_mean_lifted(t, s, n, x, mask, a)),
+        # Centered differences (both `x - mu` and `mu - x`).
+        rule(eq(dx).to(x.binary(String("sub"), mu, p)), mean_lifted(mu, s, n, x, w, a),
+             eq(shape(x)).to(shape(mu))).then(centered(dx, x, s, n, w, a, i64(1))),
+        rule(eq(dx).to(mu.binary(String("sub"), x, p)), mean_lifted(mu, s, n, x, w, a),
+             eq(shape(x)).to(shape(mu))).then(centered(dx, x, s, n, w, a, i64(-1))),
+        rule(eq(dx).to(x.binary(String("sub"), mu, p)), masked_mean_lifted(mu, s, n, x, mask, a),
+             eq(shape(x)).to(shape(mu))).then(masked_centered(dx, x, s, n, mask, a, i64(1))),
+        rule(eq(dx).to(mu.binary(String("sub"), x, p)), masked_mean_lifted(mu, s, n, x, mask, a),
+             eq(shape(x)).to(shape(mu))).then(masked_centered(dx, x, s, n, mask, a, i64(-1))),
+        # Centered squares (`square(dx)` and `dx ** 2`).
+        rule(eq(pair).to(dx.unary(String("square"), p)), centered(dx, x, sx, n, w, a, sign)).then(
+            centered_pair(pair, sx, sx, n, x, x, w, a, i64(1))),
+        rule(eq(pair).to(dx.unary(String("integer_pow"), p)), is_square(p),
+             centered(dx, x, sx, n, w, a, sign)).then(centered_pair(pair, sx, sx, n, x, x, w, a, i64(1))),
+        rule(eq(pair).to(dx.unary(String("square"), p)), masked_centered(dx, x, sx, n, mask, a, sign)).then(
+            masked_centered_pair(pair, sx, sx, n, x, x, mask, a, i64(1))),
+        rule(eq(pair).to(dx.unary(String("integer_pow"), p)), is_square(p),
+             masked_centered(dx, x, sx, n, mask, a, sign)).then(
+            masked_centered_pair(pair, sx, sx, n, x, x, mask, a, i64(1))),
+    ]
+    # Guarded zero-means (`where(n > 0, mu, 0)` and `where(n == 0, 0, mu)`).
+    for mean_fact, ref in ((mean_of, w), (masked_mean_of, mask)):
+        for guard in (lambda: n.compare(String("gt"), z, p).select(c, mu),
+                      lambda: z.compare(String("lt"), n, p).select(c, mu),
+                      lambda: n.compare(String("ne"), z, p).select(c, mu),
+                      lambda: n.compare(String("eq"), z, p).select(mu, c),
+                      lambda: z.compare(String("eq"), n, p).select(mu, c)):
+            found.append(rule(eq(t).to(guard()), mean_fact(mu, s, n, x, ref, a), zero(z), zero(c)).then(
+                mean_fact(t, s, n, x, ref, a)))
+    # Centered products `dx * dy` and every association of `w * dx * dy`.
+    for s1 in (1, -1):
+        for s2 in (1, -1):
+            prod_sign = i64(s1 * s2)
+            found += [
+                rule(eq(pair).to(dx.binary(String("mul"), dy, p)),
+                     centered(dx, x, sx, n, w, a, i64(s1)), centered(dy, y, sy, n, w, a, i64(s2))).then(
+                    centered_pair(pair, sx, sy, n, x, y, w, a, prod_sign)),
+                rule(eq(pair).to(dx.binary(String("mul"), dy, p)),
+                     masked_centered(dx, x, sx, n, mask, a, i64(s1)),
+                     masked_centered(dy, y, sy, n, mask, a, i64(s2))).then(
+                    masked_centered_pair(pair, sx, sy, n, x, y, mask, a, prod_sign)),
+                rule(eq(t).to(w.binary(String("mul"), dx, q).binary(String("mul"), dy, p)),
+                     centered(dx, x, sx, n, w, a, i64(s1)), centered(dy, y, sy, n, w, a, i64(s2))).then(
+                    weighted_central(t, sx, sy, n, x, y, w, a, prod_sign)),
+                rule(eq(t).to(dx.binary(String("mul"), w, q).binary(String("mul"), dy, p)),
+                     centered(dx, x, sx, n, w, a, i64(s1)), centered(dy, y, sy, n, w, a, i64(s2))).then(
+                    weighted_central(t, sx, sy, n, x, y, w, a, prod_sign)),
+                rule(eq(t).to(dx.binary(String("mul"), w.binary(String("mul"), dy, q), p)),
+                     centered(dx, x, sx, n, w, a, i64(s1)), centered(dy, y, sy, n, w, a, i64(s2))).then(
+                    weighted_central(t, sx, sy, n, x, y, w, a, prod_sign)),
+                rule(eq(t).to(dx.binary(String("mul"), dy.binary(String("mul"), w, q), p)),
+                     centered(dx, x, sx, n, w, a, i64(s1)), centered(dy, y, sy, n, w, a, i64(s2))).then(
+                    weighted_central(t, sx, sy, n, x, y, w, a, prod_sign)),
+            ]
+    found += [
+        rule(eq(t).to(w.binary(String("mul"), pair, p)),
+             centered_pair(pair, sx, sy, n, x, y, w, a, sign)).then(
+            weighted_central(t, sx, sy, n, x, y, w, a, sign)),
+        rule(eq(t).to(pair.binary(String("mul"), w, p)),
+             centered_pair(pair, sx, sy, n, x, y, w, a, sign)).then(
+            weighted_central(t, sx, sy, n, x, y, w, a, sign)),
+        rule(eq(t).to(mask.select(z, pair)), boolean(mask), zero(z),
+             masked_centered_pair(pair, sx, sy, n, x, y, mask, a, sign)).then(
+            masked_weighted_central(t, sx, sy, n, x, y, mask, z, a, sign)),
+        rule(eq(m).to(t.reduce(String("sum"), axes, p)), eq(axes).to(Vec[i64](a)),
+             weighted_central(t, sx, sy, n, x, y, w, a, sign)).then(
+            summed(m), central_moment(m, sx, sy, n, x, y, w, a, sign)),
+        rule(eq(m).to(t.reduce(String("sum"), axes, p)), eq(axes).to(Vec[i64](a)),
+             masked_weighted_central(t, sx, sy, n, x, y, mask, z, a, sign)).then(
+            summed(m), masked_central_moment(m, sx, sy, n, x, y, mask, z, a, sign)),
+    ]
+    return found
+
+
+def _moment_decoupled() -> list:
+    """Chan-Golub-LeVeque step and merge rules for weighted and masked central second moments
+    (`central_moment`, `masked_central_moment`):
+    `M_AB = M_A + M_B + where((n_A > 0) & (n_B > 0), d_x * d_y * (n_A / (n_A + n_B)) * n_B, 0)`
+    with zero-safe denominators so empty states and wholly-masked tiles introduce no `0 / 0` NaNs."""
+    t, u, sx, sy, n, x, y, w, mask, z = vars_("t u sx sy n x y w mask z", Term)
+    axes = var("axes", Vec[i64])
+    to_x, to_y, to_n = vars_("to_x to_y to_n", Vec[i64])
+    p, a, i, i_n, i_sx, i_sy = vars_("p a i i_n i_sx i_sy", i64)
+    added, subtracted, multiplied, divided = vars_("added subtracted multiplied divided", i64)
+    gt_idx, and_idx, z_n, o_n = vars_("gt_idx and_idx z_n o_n", i64)
+    fill_n, lift_x, lift_y = vars_("fill_n lift_x lift_y", i64)
+    stock = rules.stock
+    shape = rules.shape
+
+    def combine(m0, n0, sx0, sy0, m1, n1, sx1, sy1, sign_val: int):
+        zero_n = Term.literal(z_n).shaped(String("broadcast_in_dim"), fill_n)
+        one_n = Term.literal(o_n).shaped(String("broadcast_in_dim"), fill_n)
+        pos0 = n0.compare(String("gt"), zero_n, gt_idx)
+        pos1 = n1.compare(String("gt"), zero_n, gt_idx)
+        both = pos0.binary(String("and"), pos1, and_idx)
+        safe0 = pos0.select(one_n, n0)
+        safe1 = pos1.select(one_n, n1)
+        total = n0.binary(String("add"), n1, added)
+        safe_total = both.select(one_n, total)
+        mu_x0 = sx0.binary(String("div"), safe0, divided)
+        mu_x1 = sx1.binary(String("div"), safe1, divided)
+        mu_y0 = sy0.binary(String("div"), safe0, divided)
+        mu_y1 = sy1.binary(String("div"), safe1, divided)
+        dx = mu_x1.binary(String("sub"), mu_x0, subtracted)
+        dy = mu_y1.binary(String("sub"), mu_y0, subtracted)
+        weight = n0.binary(String("div"), safe_total, divided).binary(String("mul"), n1, multiplied)
+        corr = both.select(zero_n, dx.binary(String("mul"), dy, multiplied).binary(String("mul"), weight,
+                                                                                   multiplied))
+        summed_m = m0.binary(String("add"), m1, added)
+        return (summed_m.binary(String("add"), corr, added) if sign_val == 1
+                else summed_m.binary(String("sub"), corr, subtracted))
+
+    def tile_pair(sign_val: int):
+        zero_n = Term.literal(z_n).shaped(String("broadcast_in_dim"), fill_n)
+        one_n = Term.literal(o_n).shaped(String("broadcast_in_dim"), fill_n)
+        safe_tile = n.compare(String("gt"), zero_n, gt_idx).select(one_n, n)
+        mu_x_tile = sx.binary(String("div"), safe_tile, divided).shaped(String("broadcast_in_dim"), lift_x)
+        mu_y_tile = sy.binary(String("div"), safe_tile, divided).shaped(String("broadcast_in_dim"), lift_y)
+        dx_tile = x.binary(String("sub"), mu_x_tile, subtracted)
+        dy_tile = (y.binary(String("sub"), mu_y_tile, subtracted) if sign_val == 1
+                   else mu_y_tile.binary(String("sub"), y, subtracted))
+        return dx_tile.binary(String("mul"), dy_tile, multiplied)
+
+    common = (
+        eq(t).to(u.reduce(String("sum"), axes, p)),
+        eq(i).to(slot(t)), eq(i_n).to(slot(n)), eq(i_sx).to(slot(sx)), eq(i_sy).to(slot(sy)),
+        eq(added).to(stock("add")), eq(subtracted).to(stock("sub")),
+        eq(multiplied).to(stock("mul")), eq(divided).to(stock("div")),
+        eq(gt_idx).to(comp_gt()), eq(and_idx).to(logic_and()),
+        eq(z_n).to(zero_of(n)), eq(o_n).to(one_of(n)),
+        eq(z_n).to(zero_of(sx)), eq(z_n).to(zero_of(sy)), eq(z_n).to(zero_of(t)),
+        eq(to_n).to(shape(n)), eq(shape(sx)).to(to_n), eq(shape(sy)).to(to_n), eq(shape(t)).to(to_n),
+        eq(fill_n).to(filled(to_n)),
+        eq(to_x).to(shape(x)), eq(to_y).to(shape(y)),
+        eq(lift_x).to(unreduced(to_x, a)), eq(lift_y).to(unreduced(to_y, a)),
+    )
+    made = []
+    for sign_val in (1, -1):
+        w_tile = w.binary(String("mul"), tile_pair(sign_val), multiplied).reduce(String("sum"), axes, p)
+        m_tile = mask.select(z, tile_pair(sign_val)).reduce(String("sum"), axes, p)
+        w_cond = (central_moment(t, sx, sy, n, x, y, w, a, i64(sign_val)), *common)
+        m_cond = (masked_central_moment(t, sx, sy, n, x, y, mask, z, a, i64(sign_val)), *common)
+        for cond, tile_m in ((w_cond, w_tile), (m_cond, m_tile)):
+            made += [
+                rewrite(t.stepped()).to(
+                    combine(Term.state(i, 0), Term.state(i_n, 0), Term.state(i_sx, 0), Term.state(i_sy, 0),
+                            tile_m, n, sx, sy, sign_val), *cond),
+                rewrite(t.merged()).to(
+                    combine(Term.state(i, 0), Term.state(i_n, 0), Term.state(i_sx, 0), Term.state(i_sy, 0),
+                            Term.state(i, 1), Term.state(i_n, 1), Term.state(i_sx, 1), Term.state(i_sy, 1),
+                            sign_val), *cond),
+            ]
+    return made
+
+
 def _exponentials(scaled: bool = False) -> list:
     """The rules that find what scales as `exp(-k)` of an anchor `k` (`scales`), from its exponential; and
     `scaled`, as `exp(-c k)`, an exponential of a difference times a positive literal `c` (raw logits, the
@@ -413,16 +813,17 @@ def _walking(scaled: bool = False):
              local(y), left_of(p, c, d)).then(summed(t), set_(anchored(t)).to(d)),
         rule(eq(t).to(x.dot(y, p)), eq(walked(y)).to(a), contracts_right(p, a), scales(y, k, name, e, s, c),
              local(x), right_of(p, c, d)).then(summed(t), set_(anchored(t)).to(d)),
-    ]
+    ] + _moment_walking()
     return ruleset(*walking, name="walking scaled" if scaled else "walking")
 
 
 def _shapes():
     """The shapes of the values the derivation's rules make: a carried state its reduction's, a value a step,
-    merge, finish or carried state reads its own, a select its operands', a clamp its operand's, a lifted
-    correction its broadcast's target."""
+    merge, finish or carried state reads its own, a comparison its operands', a select its operands', a clamp
+    its operand's, a lifted correction or broadcast its target."""
     x, y, z, w = vars_("x y z w", Term)
-    side, at = vars_("side at", i64)
+    name = var("name", String)
+    side, at, p = vars_("side at p", i64)
     extent = var("extent", Vec[i64])
     given, to = vars_("given to", Vec[i64])
     shape = rules.shape
@@ -431,9 +832,15 @@ def _shapes():
         rule(eq(extent).to(shape(x)), eq(y).to(x.stepped())).then(set_(shape(y)).to(extent)),
         rule(eq(extent).to(shape(x)), eq(y).to(x.merged())).then(set_(shape(y)).to(extent)),
         rule(eq(extent).to(shape(x)), eq(y).to(x.finished())).then(set_(shape(y)).to(extent)),
-        rule(eq(extent).to(shape(y)), eq(z).to(x.select(y, z))).then(set_(shape(x.select(y, z))).to(extent)),
+        rule(eq(w).to(x.compare(name, y, p)), eq(extent).to(shape(x)), eq(shape(y)).to(extent)).then(
+            set_(shape(w)).to(extent)),
+        rule(eq(extent).to(shape(y)), eq(w).to(x.select(y, z))).then(set_(shape(w)).to(extent)),
         rule(eq(extent).to(shape(y)), eq(w).to(x.clamp(y, z))).then(set_(shape(w)).to(extent)),
         rule(eq(y).to(x.shaped(String("broadcast_in_dim"), lifts(given, to, at)))).then(
+            set_(shape(y)).to(to)),
+        rule(eq(y).to(x.shaped(String("broadcast_in_dim"), filled(to)))).then(
+            set_(shape(y)).to(to)),
+        rule(eq(y).to(x.shaped(String("broadcast_in_dim"), unreduced(to, at)))).then(
             set_(shape(y)).to(to)),
         name="derived shapes")
 
@@ -531,7 +938,11 @@ def _decoupled(rescaling: bool = False):
                                    local_of(t), stocked, slotted),
             rewrite(t.finished()).to(Term.state(i, 0), which(t), slotted),
         ]
-    derived.append(rewrite(t.held(side)).to(Term.state(i, side), peaked(t), slotted))
+    derived += [
+        rewrite(t.held(side)).to(Term.state(i, side), peaked(t), slotted),
+        rewrite(t.held(side)).to(Term.state(i, side), summed(t), local_of(t), slotted),
+    ]
+    derived += _moment_decoupled()
 
     # A sum along the walked axis of values that scale with an anchor `k`: its carried value rescaled by
     # exp(k carried - k now), lifted to its shape, beside the tile's sum at the anchor now; the anchor now
@@ -836,6 +1247,7 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
             graph.register(set_(rules.shape(Term.state(i64(index), i64(side)))).to(
                 Vec[i64](*(i64(size) for size in region.shape(reduction)))))
     _lift(graph, region, reductions)
+    _moment_layouts(graph, region, reductions)
     outputs = list(region.outputs)
     along = [term is not None and _walked(graph, term) for term in outputs]
     for term, is_along in zip(outputs, along, strict=True):
@@ -924,14 +1336,25 @@ def _register(graph: EGraph, region: terms.Region, closed, names, walked_axes) -
     the derivation's own), and each input's walked axis."""
     program.stated(graph, region)
     _least(graph, region)
-    for index, (primitive, params) in enumerate(region.params):
+    _dtype_constants(graph, region)
+    for index, (primitive, params) in enumerate(list(region.params)):
         declared = terms.OPERATIONS.get(primitive)
         kind = None if declared is None else declared.kind
         if kind in ("binary", "unary", "comparison", "cast"):
             graph.register(keeps(i64(index)))
+            if primitive is jax.lax.integer_pow_p and params.get("y") == 2:
+                graph.register(is_square(i64(index)))
         elif primitive is jax.lax.broadcast_in_dim_p:
-            for axis, to in enumerate(params["broadcast_dimensions"]):
-                graph.register(lays(i64(index), i64(axis), i64(int(to))))
+            dims = tuple(int(d) for d in params["broadcast_dimensions"])
+            after = tuple(int(s) for s in params["shape"])
+            for axis, to in enumerate(dims):
+                graph.register(lays(i64(index), i64(axis), i64(to)))
+            if dims == tuple(range(len(after))):
+                graph.register(identity_broadcast(i64(index)))
+            elif len(dims) == len(after) - 1:
+                missing = [axis for axis in range(len(after)) if axis not in dims]
+                if len(missing) == 1 and dims == tuple(p for p in range(len(after)) if p != missing[0]):
+                    graph.register(inserts_axis(i64(index), i64(missing[0])))
         elif primitive is jax.lax.transpose_p:
             permutation = list(params["permutation"])
             for axis in range(len(permutation)):
@@ -939,6 +1362,9 @@ def _register(graph: EGraph, region: terms.Region, closed, names, walked_axes) -
         elif primitive in (jax.lax.squeeze_p, jax.lax.reshape_p):
             for axis, to in _moved(primitive, params, region, index):
                 graph.register(lays(i64(index), i64(axis), i64(to)))
+            if primitive is jax.lax.reshape_p and params.get("dimensions") is None:
+                for axis in _inserted_reshape_axes(region, index):
+                    graph.register(inserts_axis(i64(index), i64(axis)))
         elif kind == "reduction":
             reduced = {int(axis) for axis in params["axes"]}
             for axis in range(_rank_before(region, index, reduced)):
@@ -978,11 +1404,18 @@ def _register(graph: EGraph, region: terms.Region, closed, names, walked_axes) -
             graph.register(set_(walked(leaf)).to(i64(walked_axes[input_name])))
         else:
             graph.register(unwalked(leaf))
+    region.params.append((jax.lax.gt_p, {}))
+    graph.register(set_(comp_gt()).to(i64(len(region.params) - 1)))
+    region.params.append((jax.lax.and_p, {}))
+    graph.register(set_(logic_and()).to(i64(len(region.params) - 1)))
     for index, value in enumerate(region.literals):
         literal = Term.literal(i64(index))
         graph.register(local(literal), unwalked(literal))
-        if np.all(np.asarray(value) == 0):
-            graph.register(zero(literal))
+        if not terms.typed_key(value):
+            if np.all(np.asarray(value) == 0):
+                graph.register(zero(literal))
+            elif np.all(np.asarray(value) == 1):
+                graph.register(unit_array(literal))
 
 
 def _least(graph: EGraph, region: terms.Region) -> None:
@@ -1001,6 +1434,77 @@ def _least(graph: EGraph, region: terms.Region) -> None:
             region.shaped(literal, ())
             graph.register(set_(rules.shape(literal)).to(Vec[i64]()))
         graph.register(set_(least(term)).to(i64(floors[dtype])))
+
+
+def _dtype_constants(graph: EGraph, region: terms.Region) -> None:
+    """Each floating value's dtype's 0 and 1 literals (`zero_of`, `one_of`) and each boolean value (`boolean`),
+    registered for Chan-Golub-LeVeque zero-count guards and masked indicators."""
+    zeros: dict[np.dtype, int] = {}
+    ones: dict[np.dtype, int] = {}
+    for term, _ in list(region.shapes):
+        dtype = region.dtypes.get(terms.key(term))
+        if dtype is None:
+            continue
+        if dtype == np.bool_:
+            graph.register(boolean(term))
+            continue
+        if not jnp.issubdtype(dtype, jnp.floating):
+            continue
+        if dtype not in zeros:
+            for table, value in ((zeros, 0.0), (ones, 1.0)):
+                region.literals.append(np.asarray(value, dtype))
+                table[dtype] = len(region.literals) - 1
+                literal = Term.literal(i64(table[dtype]))
+                region.shaped(literal, ())
+                graph.register(set_(rules.shape(literal)).to(Vec[i64]()))
+        graph.register(set_(zero_of(term)).to(i64(zeros[dtype])),
+                       set_(one_of(term)).to(i64(ones[dtype])))
+
+
+def _inserted_reshape_axes(region: terms.Region, index: int) -> list[int]:
+    """Every axis `a` that a `reshape` of parameters `index` inserts as size 1 across all terms using `index`,
+    keeping every other axis in order."""
+    pairs = []
+    for term, after in region.shapes:
+        if (args := get_callable_args(term, Term.shaped)) is not None and terms.integer(args[2]) == index:
+            pairs.append((region.shape(args[0]), tuple(after)))
+    if not pairs:
+        return []
+    after = pairs[0][1]
+    if any(len(after) != len(before) + 1 or end != after for before, end in pairs):
+        return []
+    return [axis for axis in range(len(after))
+            if after[axis] == 1 and all(before == (*after[:axis], *after[axis + 1:]) for before, _ in pairs)]
+
+
+def _moment_layouts(graph: EGraph, region: terms.Region, reductions) -> None:
+    """Register `filled(to)` broadcasts (scalar to each reduction's shape) and `unreduced(to, axis)`
+    broadcasts (reduced shape back to each walked shape) for central-moment rules."""
+    done_fill: set[tuple[int, ...]] = set()
+    for reduction in reductions:
+        to = tuple(region.shape(reduction))
+        if to in done_fill:
+            continue
+        done_fill.add(to)
+        region.params.append((jax.lax.broadcast_in_dim_p,
+                              {"shape": to, "broadcast_dimensions": (), "sharding": None}))
+        graph.register(set_(filled(Vec[i64](*(i64(size) for size in to)))).to(
+            i64(len(region.params) - 1)))
+    done_unreduced: set[tuple[tuple[int, ...], int]] = set()
+    for term, extent in list(region.shapes):
+        axis_val = graph.lookup_function_value(walked(term))
+        if axis_val is None:
+            continue
+        axis = terms.integer(axis_val)
+        to = tuple(extent)
+        if (to, axis) in done_unreduced:
+            continue
+        done_unreduced.add((to, axis))
+        dims = tuple(p for p in range(len(to)) if p != axis)
+        region.params.append((jax.lax.broadcast_in_dim_p,
+                              {"shape": to, "broadcast_dimensions": dims, "sharding": None}))
+        graph.register(set_(unreduced(Vec[i64](*(i64(size) for size in to)), i64(axis))).to(
+            i64(len(region.params) - 1)))
 
 
 def _moved(primitive, params, region: terms.Region, index: int) -> list[tuple[int, int]]:

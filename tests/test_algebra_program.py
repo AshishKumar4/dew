@@ -1970,3 +1970,83 @@ def test_a_checkpoints_body_holding_a_span_of_a_constant_lowers_as_written():
     assert cheaper_spliced(both, *rows(20, *SHAPES_MARKED))
     assert_as_exact(jax.jit(algebra.rewritten(both)), jax.jit(both), lambda seed: rows(seed, *SHAPES_MARKED),
                     "a checkpoint's span of a constant beside joined sums", seeds=8)
+
+
+def _with_reuse_active(monkeypatch):
+    """Temporarily activate the dev-time `reuse` set and its window heads for end-to-end window tests."""
+    active = dataclasses.replace(algebra.rules.RULES["reuse"], dev=False)
+    monkeypatch.setitem(algebra.rules.RULES, "reuse", active)
+    heads = {root: set(made) for root, made in algebra.rules._HEADS.items()}
+    for family in active.families:
+        for written in family.rules:
+            head = algebra.rules._head(written)
+            if head is not None:
+                heads.setdefault(head[0], set()).add(head[1])
+    monkeypatch.setattr(algebra.rules, "_HEADS", heads)
+
+
+@pytest.mark.parametrize("case", ["same_shape", "broadcast_after_sqrt", "sqrt_after_broadcast", "unbounded_a"])
+def test_reuse_pulls_sibling_rsqrt_into_division_windows_and_drops_sqrt(monkeypatch, case):
+    """When `reuse` is active, `program._windows` pulls sibling `rsqrt(v)` equations into `a / sqrt(v)`'s
+    window (same-shape, broadcast after `sqrt`, `sqrt` after broadcast, and unbounded dividend `a` when
+    `v >= 1`, i.e. `floor >= 0`), eliminating `sqrt` and `div` while holding check 1 against float64."""
+    _with_reuse_active(monkeypatch)
+
+    def fn(a, z):
+        v = jnp.mean(jnp.square(jnp.tanh(z)), axis=-1) + 1.0
+        r = jax.lax.rsqrt(v)
+        if case == "same_shape":
+            q = jnp.tanh(a[:, 0]) / jnp.sqrt(v)
+        elif case == "broadcast_after_sqrt":
+            q = jnp.tanh(a) / jnp.sqrt(v)[:, None]
+        elif case == "sqrt_after_broadcast":
+            q = jnp.tanh(a) / jnp.sqrt(v[:, None])
+        else:
+            q = a / jnp.sqrt(v)[:, None]
+        return q, r
+
+    def draw_inputs(seed):
+        rng = np.random.default_rng([1400, seed])
+        return (rng.standard_normal((16, 32)).astype(np.float32),
+                rng.standard_normal((16, 32)).astype(np.float32))
+
+    x0, z0 = draw_inputs(0)
+    before = jax.make_jaxpr(fn)(x0, z0)
+    after = jax.make_jaxpr(algebra.rewritten(fn))(x0, z0)
+    assert any(eq.primitive is jax.lax.sqrt_p for eq in equations(before.jaxpr))
+    assert not any(eq.primitive is jax.lax.sqrt_p for eq in equations(after.jaxpr))
+    assert not any(eq.primitive is jax.lax.div_p for eq in equations(after.jaxpr))
+    assert_as_exact(jax.jit(algebra.rewritten(fn)), jax.jit(fn), draw_inputs, f"reuse {case}", seeds=8)
+
+
+def test_reuse_refuses_unfloored_root_and_matches_broadcast_reduce_sum_reciprocal(monkeypatch):
+    """An unfloored divisor `v` (able to approach zero) is never rewritten from `a / sqrt(v)` to
+    `a * rsqrt(v)`, while a floored `reduce_sum` reciprocal `1 / y` is pulled into `a / y[:, None]`'s window
+    and matched by `reuse` in the e-graph."""
+    _with_reuse_active(monkeypatch)
+
+    def unfloored(a, v):
+        pos = jnp.abs(v)
+        return jnp.tanh(a) / jnp.sqrt(pos)[:, None], jax.lax.rsqrt(pos)
+
+    a0 = np.ones((8, 16), np.float32)
+    v0 = np.full((8,), 2.0, np.float32)
+    after = jax.make_jaxpr(algebra.rewritten(unfloored))(a0, v0)
+    assert any(eq.primitive is jax.lax.sqrt_p for eq in equations(after.jaxpr))
+
+    def softmax_like(a, z):
+        y = jnp.sum(jnp.square(jnp.tanh(z)) + 1.0, axis=-1)
+        inv = 1.0 / y
+        return a / y[:, None], inv
+
+    closed = jax.make_jaxpr(softmax_like)(a0, a0)
+    windows = algebra.program._windows(closed.jaxpr)
+    assert windows and any(
+        any(eq.primitive is jax.lax.div_p and algebra.program._is_unit_literal(eq.invars[0])
+            for eq in win.eqns)
+        for win, _ in windows)
+    proven = algebra.program._held(closed.jaxpr)
+    win, _ = windows[0]
+    done = algebra.program._region(win, accurate=False, saturation=algebra.SATURATION,
+                                   ranges=algebra.program._declared(win, proven))
+    assert done.report.fired["reuse"] > 0
