@@ -253,12 +253,14 @@ def test_a_shared_caches_exiting_decode_holds_one_chosen_cache_beside_its_own():
     made, step = decode_steps(looped)
     cache = made(variables, ids.shape[0])
     _, cache = step(variables, cache, ids[:, :3])
-    entries = {tuple(leaf.shape) for leaf in jax.tree.leaves(cache) if leaf.ndim}
+    # An entry's shape as the step holds it, its axes in any order (a state the step reads transposed).
+    entries = {tuple(sorted(leaf.shape)) for leaf in jax.tree.leaves(cache) if leaf.ndim}
     traced = jax.make_jaxpr(lambda v, c, token: looped.apply(
         {**v, "cache": c}, token, decode=True, mutable=["cache"]))(variables, cache, ids[:, 3:4])
     shapes = [tuple(var.aval.shape) for eqn in equations(traced) for var in eqn.outvars
               if isinstance(var.aval, ShapedArray)]
-    stacked = {shape for shape in shapes if shape and shape[0] == looped.loop.steps and shape[1:] in entries}
+    stacked = {shape for shape in shapes
+               if shape and shape[0] == looped.loop.steps and tuple(sorted(shape[1:])) in entries}
     assert not stacked, stacked
 
 
