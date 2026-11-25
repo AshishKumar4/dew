@@ -232,8 +232,10 @@ def _read_checked(hooks: recurrence.Hooks, operands: Chunk) -> dict:
         raise ValueError(f"{tokens} tokens of {hooks.substeps} updates each take keys, values and write "
                          f"gates of {tokens * hooks.substeps} and a decay of {tokens}, not {stepped | held}")
     if operands.loads is None:
-        if operands.state is not None and operands.state.ndim != 4:
-            raise ValueError(f"an unforked call's `state` is 4-dimensional [B, Hv, Dk, Dv], not "
+        # A coupled momentum's state its pair `[B, Hv, 2, Dk, Dv]`, the memory then the momentum.
+        rank, laid = (5, "[B, Hv, 2, Dk, Dv]") if hooks.coupled is not None else (4, "[B, Hv, Dk, Dv]")
+        if operands.state is not None and operands.state.ndim != rank:
+            raise ValueError(f"an unforked call's `state` is {rank}-dimensional {laid}, not "
                              f"{operands.state.shape} (a table [B, S', Hv, Dk, Dv] takes `loads`)")
         fields = {'stores': operands.stores, 'entry_key': operands.entry_key,
                   'entry_value': operands.entry_value, 'entry_weight': operands.entry_weight,
