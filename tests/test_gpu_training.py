@@ -88,7 +88,7 @@ def test_a_runs_training_reads_this_gpu(tmp_path_factory):
         Cell("a step that fails on its first run states the room outside XLA's pool",
              in_own(failed, "failed"), at_run=AT_RUN),
         # The test's own grid of dtypes (`cells_of`), each cell in a directory of its own.
-        *(dataclasses.replace(cell, run=in_own(cell.run, f"repeats-{index}"))
+        *(dataclasses.replace(cell, run=in_own(cell.run, f"repeats-{index}"), at_run=AT_RUN)
           for index, cell in enumerate(cells_of(repeats))),
         Cell("a conv model trains to the bit again after another run measured kernels into its cache",
              in_own(conv, "conv"), at_run=AT_RUN),

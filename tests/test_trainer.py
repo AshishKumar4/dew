@@ -993,7 +993,6 @@ def test_overlapping_token_windows_resume_in_a_fresh_trainer_bit_exactly(tmp_pat
     assert _position.read(resumed_place).records == 4 * BATCH
 
 
-@pytest.mark.compiles_at_run(reason="trains and resumes on this GPU, judged bit for bit: no check-1 site")
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
 def a_cuda_lm_repeats_and_resumes_bit_exactly_with_deterministic_ops(tmp_path, dtype):
     """Repeated token IDs share embedding-gradient updates. CUDA's default
