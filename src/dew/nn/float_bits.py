@@ -236,7 +236,7 @@ def widened_exactly(x: jax.typing.ArrayLike, dtype: DTypeLike) -> jax.Array:
                     sharding.spec.reduced or sharding.spec.unreduced):
                 axes = frozenset(sharding.spec.reduced) | frozenset(sharding.spec.unreduced)
                 spec = sharding.spec.update(partitions=())
-                with jax.sharding.use_abstract_mesh(sharding.mesh):
+                with jax.sharding.use_abstract_mesh(sharding.mesh.abstract_mesh):
                     return jax.shard_map(
                         lambda part: _widened_bits(part, resolved),
                         mesh=sharding.mesh, in_specs=spec, out_specs=spec,

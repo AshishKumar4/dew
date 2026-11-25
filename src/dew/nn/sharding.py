@@ -661,17 +661,17 @@ def gathered_over(x: jax.Array, spec: jax.sharding.PartitionSpec, axes: str | Co
     if x.ndim < 2:
         return jax.sharding.reshard(placed, kept)
     reduced = {name for name in dropped & explicit if mesh.shape[name] > 1}
-    return jax.sharding.reshard(placed, jax.sharding.PartitionSpec(*kept, reduced=reduced))
+    return jax.sharding.reshard(placed, jax.sharding.PartitionSpec(*kept, reduced=frozenset(reduced)))
 
 
 def explicit_over[T](fn: Callable[[jax.Array], T], x: jax.Array) -> T:
-    """`fn(x)` traced with the context mesh's Auto axes Explicit (`jax.sharding.explicit_axes`), so every
-    axis of the mesh in `fn` is Explicit or Manual: JAX's `broadcast_in_dim` keeps a reduced or unreduced
-    placement (a scan transpose's zero accumulators among its results) only where no axis is Auto. `x`, a
-    stream's rows, placed over those axes as `RESIDUAL` places them, what `fn` returns placed back on the
-    mesh in context as its type places it there. An array `fn` reads from outside it is typed on the mesh in
-    context, which no operation inside mixes with its own: `fn` places each it reads (`jax.sharding.reshard`,
-    `gathered_over`), and `typed_on` what it writes elsewhere."""
+    """`fn(x)` traced with the context mesh's Auto axes Explicit (as `jax.sharding.explicit_axes` traces),
+    so every axis of the mesh in `fn` is Explicit or Manual: JAX's `broadcast_in_dim` keeps a reduced or
+    unreduced placement (a scan transpose's zero accumulators among its results) only where no axis is
+    Auto. `x`, a stream's rows, placed over those axes as `RESIDUAL` places them, what `fn` returns placed
+    back on the mesh in context as its type places it there. An array `fn` reads from outside it is typed
+    on the mesh in context, which no operation inside mixes with its own: `fn` places each it reads
+    (`jax.sharding.reshard`, `gathered_over`), and `typed_on` what it writes elsewhere."""
     mesh = jax.sharding.get_abstract_mesh()
     axes = mesh.auto_axes
     if not axes:
@@ -679,7 +679,10 @@ def explicit_over[T](fn: Callable[[jax.Array], T], x: jax.Array) -> T:
     explicit = set(mesh.explicit_axes) | set(axes)
     lead = min(x.ndim, len(RESIDUAL))
     rows = _only(logical_spec(RESIDUAL[:lead], x.shape[:lead]), explicit)
-    return jax.sharding.explicit_axes(fn, axes=axes, in_sharding=(rows,))(x)
+    region = mesh.update_axis_types(dict.fromkeys(axes, jax.sharding.AxisType.Explicit))
+    with jax.sharding.use_abstract_mesh(region):
+        out = fn(jax.sharding.reshard(x, rows))
+    return typed_on(out, mesh)
 
 
 def typed_on[T](tree: T, mesh: jax.sharding.AbstractMesh) -> T:
