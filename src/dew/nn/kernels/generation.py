@@ -114,6 +114,7 @@ class Choice(enum.StrEnum):
     DECODE = 'decode'
     DELTA_DECODE = 'delta_decode'
     DELTA_GATES = 'delta_gates'
+    DIAGONAL_SCAN = 'diagonal_scan'
     GATE_UP = 'gate_up'
     GATED_MLP = 'gated_mlp'
     GATED_DELTA_RULE = 'gated_delta_rule'
@@ -139,6 +140,7 @@ class Choice(enum.StrEnum):
     SSD = 'ssd'
     SWIGLU = 'swiglu'
     SYRK = 'syrk'
+    WKV4 = 'wkv4'
 
 
 CHOICES = frozenset(choice.value for choice in Choice)

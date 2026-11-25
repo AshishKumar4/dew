@@ -58,7 +58,7 @@ Branch coverage of src/dew over the scenario suite (the files ci.py SCENARIO_SUI
 | src/dew/nn/kernels/templates/recurrence/conv.py | 200 | 200 | 30 | 0 | 0.0% |
 | src/dew/nn/kernels/templates/recurrence/selective.py | 495 | 495 | 68 | 0 | 0.0% |
 | src/dew/nn/kernels/templates/recurrence/step.py | 332 | 332 | 62 | 0 | 0.0% |
-| src/dew/nn/kernels/wkv4.py | 69 | 69 | 2 | 0 | 0.0% |
+| src/dew/nn/kernels/rwkv4.py | 69 | 69 | 2 | 0 | 0.0% |
 | src/dew/nn/memory.py | 498 | 498 | 100 | 0 | 0.0% |
 | src/dew/nn/mixers/memory.py | 16 | 16 | 2 | 0 | 0.0% |
 | src/dew/nn/safety.py | 31 | 31 | 0 | 0 | 0.0% |

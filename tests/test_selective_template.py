@@ -368,8 +368,9 @@ def test_the_backward_repeats_its_state_gradients_bit_for_bit_where_reductions_a
     the same over repeated runs of one compiled step, B's and C's too, which the default's atomic adds sum
     in whatever order their programs run (row 4448's declared contract)."""
     shape = (1, 256, 512, 16)
-    family = bundles.of(here(), jnp.float32)
-    template = functools.partial(selective.selective_scan, family=family)
+    # The template stated by its bundle's generation and dtype (`taken_scan`): closing over a family object,
+    # which no identity states, its arm ran unprepared on a GPU tier (row 12662).
+    template = taken_scan(jnp.float32)
     inputs, starts, dy = draw(jnp.float32, 0, *shape, packed=False)
     # The step as an arm of no site (`ahead_arm`): a GPU tier's prepare compiles it, its run calls it.
     step = ahead_arm(jax.jit(with_gradients(scanned(template, starts))), "the ordered backward, repeated")
