@@ -1522,10 +1522,11 @@ def _weighted_held(call: Call, block: int) -> Held:
     # jsf-kdaintra6).
     vb = call.value_block
     # The key block's last-token prefix, a column's vector a limb, read before the step's wait and held
-    # through its value block's product (`_weighted`).
+    # through its value block's product (`_weighted`): a column vector's lanes hold its columns as a
+    # 32-row tile's (`f32(32, n)`, the output's and the states' column vectors).
     valued = ([held_tile(held, chunk, chunk) + held_tile(call.given, chunk, vb) + [f32(chunk, vb)] * 2
                + product_fragments(call, (held, chunk, chunk), (held, chunk, vb))
-               + [f32(4, block)] * call.prefix_limbs]
+               + [f32(32, block)] * call.prefix_limbs]
               if call.per_key and call.delta else [])
     return Held(phases=(
         *valued,
