@@ -1453,7 +1453,7 @@ def test_a_checkpoint_whose_step_climbed_to_recompute_its_layers_resumes_at_that
     """A run whose devices hold its step only recomputing its layers (`remat`) climbs to that rung and
     checkpoints there, its model's record stating the recompute; a run resuming that checkpoint on devices
     that hold either computes the same step, a recompute saying how layers execute and not what they compute
-    (`RunConfig.EXECUTED`), so it resumes, at the rung its checkpoint holds (`Trainer.plan`'s first probe;
+    (`dew._records.RUNS`), so it resumes, at the rung its checkpoint holds (`Trainer.plan`'s first probe;
     a resume was refused as another computation, `model.fields.remat`)."""
     corpus = token_files(tmp_path)
 
