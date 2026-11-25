@@ -31,6 +31,14 @@ from jax import lax
 
 
 def _lse_folded_probabilities_0(x1, x2, x3):
+    v4 = lax.log_p.bind(x3, accuracy=None)
+    v5 = lax.add_p.bind(x2, v4)
+    v6 = lax.sub_p.bind(x1, v5)
+    v7 = lax.exp_p.bind(v6, accuracy=None)
+    return (v7,)
+
+
+def _lse_folded_probabilities_1(x1, x2, x3):
     v4 = lax.sub_p.bind(x1, x2)
     v5 = lax.exp_p.bind(v4, accuracy=None)
     v6 = lax.div_p.bind(v5, x3)
@@ -54,7 +62,7 @@ def lse_folded_probabilities(*operands, policy: str = 'default', target: str = '
         ('default', 'sm90', (((64, 256), 'float32'), ((64, 256), 'float32'), ((64, 256), 'float32'))):
             _lse_folded_probabilities_0,
         ('accurate', 'sm90', (((64, 256), 'float32'), ((64, 256), 'float32'), ((64, 256), 'float32'))):
-            _lse_folded_probabilities_0,
+            _lse_folded_probabilities_1,
     }
     return forms[(policy, target, case)](*operands)[0]
 
