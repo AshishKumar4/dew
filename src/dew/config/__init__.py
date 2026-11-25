@@ -654,17 +654,6 @@ class RunConfig:
     it trains, which the resume must keep (`check_resume`), and so does `trainer.quantization`, which
     changes the forward pass the weights train through."""
 
-    EXECUTED: ClassVar[tuple[tuple[str, ...], ...]] = (("loop", "fields", "remat"),
-                                                       ("earlier_loop", "fields", "remat"))
-    """The paths into a run's record of the fields that say how a model's layers execute and not what they
-    compute or store: a looped block's passes recomputed in its backward or held (the run's loop's
-    `Loop.remat`, `DecoderRunConfig.loop`, and a saved run's `LoopChange.remat`), memory alone, compute the
-    same step, so a run resumes under either (`check_resume`). A model's own fields that
-    say how it runs, its recompute (`remat`) among them, are its class's to mark (`dew._records.RUNS`), which
-    a resume reads by its class (`registry.computing_fields`). A source's
-    weights packed or decoded (`SourceOptions.packed_weights`) are not: packed, its banks are no trainable
-    parameters and hold no optimizer moments, so a resume across them is refused by name."""
-
     BUILT: ClassVar[tuple[str, ...]] = ("source.param_dtype", "source.step", "data_plan_version")
     """The fields, by their dotted paths, a run may leave None for its build or its pinning to resolve,
     whose resolution a later Dew, or a later state of what it reads, may change: the storage of the
@@ -904,8 +893,7 @@ class RunConfig:
         if recorded is None:
             raise ValueError(f"the run to resume is no {type(self).__name__}; resume it as the run it "
                              "records, or train under another name")
-        before, now = (self._computing(record)
-                       for record in (recorded._fields_record(), self._fields_record()))
+        before, now = (run._resumed_as()._fields_record() for run in (recorded, self))
         # A field the saved run left to its build and its record holds unresolved, which no checkpoint
         # states either (`earlier_checkpointed`), is the one this build resolves (`BUILT`).
         unresolved = {path for path in self.BUILT if "." not in path and before.get(path) is None}
@@ -929,10 +917,15 @@ class RunConfig:
             raise ValueError(f"the run to resume trained other {', '.join(changed)}; resume it as it "
                              "recorded them, or train under another name")
 
-    def _computing(self, record: dict[str, JSON]) -> dict[str, JSON]:
-        """A run's fields' `record` as a resume compares it: without the fields that say how its layers
-        execute (`EXECUTED`)."""
-        return _records.without_paths(record, self.EXECUTED)
+    def _resumed_as(self) -> Self:
+        """This run as a resume compares it (`check_resume`): with the fields that say how its layers execute
+        and not what they compute or store read as their defaults, a subclass's; memory alone, they compute
+        the same step, so a run resumes under either. A model's own fields that say how it runs, its
+        recompute (`remat`) among them, are its class's to mark (`dew._records.RUNS`), which a resume reads by
+        its class (`registry.computing_fields`). A source's weights packed or decoded
+        (`SourceOptions.packed_weights`) are not: packed, its banks are no trainable parameters and hold no
+        optimizer moments, so a resume across them is refused by name."""
+        return self
 
     def _saved_as(self, saved: Mapping[str, object]) -> Self | None:
         """The saved run whose record is `saved` read as this class reads it (`from_dict`), a field the
@@ -1782,16 +1775,13 @@ class DecoderRunConfig(RunConfig):
                              f"{EXIT_ENTROPY}")
         return {}
 
-    def _computing(self, record: dict[str, JSON]) -> dict[str, JSON]:
-        """`RunConfig._computing`, and a saved run's change to its checkpoint's loop that changed how it
-        executes alone (`LoopChange.remat`) read as no change: a run resumed stating none resumes it."""
-        held = super()._computing(record)
-        with registry.recording():
-            idle = to_record(LoopChange(), declared_type(type(self), "earlier_loop"))
-        if held.get("earlier_loop") == _records.without_paths({"earlier_loop": idle},
-                                                                self.EXECUTED)["earlier_loop"]:
-            held = {**held, "earlier_loop": None}
-        return held
+    def _resumed_as(self) -> Self:
+        """`RunConfig._resumed_as`: its loop's passes recomputed in its backward or held (`Loop.remat`),
+        memory alone, read as held; and a saved run's change to its checkpoint's loop (`earlier_loop`) so,
+        none where it changed that alone."""
+        loop = None if self.loop is None else dataclasses.replace(self.loop, remat=False)
+        earlier = None if self.earlier_loop is None else dataclasses.replace(self.earlier_loop, remat=False)
+        return dataclasses.replace(self, loop=loop, earlier_loop=None if earlier == LoopChange() else earlier)
 
     def looped(self, start: "Pretrained") -> "Pretrained":
         """`start` with its block run as the run asks: under the run's loop (`loop`), at the run's pass

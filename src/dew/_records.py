@@ -22,7 +22,7 @@ import json
 import math
 import re
 import typing
-from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from numbers import Real
 from typing import TYPE_CHECKING
 
@@ -535,22 +535,6 @@ def earlier_described_fields(value: JSON) -> JSON:
                 else planned(entry) for key, entry in kept(step).items()}
 
     return planned(value)
-
-
-def without_paths(record: dict[str, JSON], paths: Collection[tuple[str, ...]]) -> dict[str, JSON]:
-    """`record` without the value at each of `paths` (keys into the records it nests) that it holds, every
-    other value as it is: a field of a field's record (`RunConfig.EXECUTED`, a loop's `remat`), not every
-    key of its name at any depth, which a model's own records may hold saying what it computes."""
-    def without(value: JSON, path: tuple[str, ...]) -> JSON:
-        if not isinstance(value, dict) or path[0] not in value:
-            return value
-        if len(path) == 1:
-            return {key: part for key, part in value.items() if key != path[0]}
-        return {**value, path[0]: without(value[path[0]], path[1:])}
-
-    for path in paths:
-        record = without(record, path)
-    return record
 
 
 def annotations_of(owner: type, **options) -> Mapping[str, object]:

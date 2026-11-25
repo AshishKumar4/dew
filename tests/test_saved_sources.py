@@ -893,7 +893,7 @@ def test_a_multimodal_run_passing_messages_reloads_from_its_native_release_as_it
 def test_a_resume_compares_a_model_kind_named_remat(tmp_path):
     """A model's layer kind named `remat` (`CausalTransformer.kinds`) says what it computes: a resume that
     widens its window is refused (`RunConfig.check_resume`), where a run's loop's recompute
-    (`RunConfig.EXECUTED`, a path into the run's record, not every field of its name) is not (row 11937's
+    (`DecoderRunConfig._resumed_as`, the loop's field, not every field of its name) is not (row 11937's
     review)."""
     from dew.config import RunConfig, earlier_run
     from dew.nn.backbones.layer_plan import LayerKind
