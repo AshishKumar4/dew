@@ -418,9 +418,9 @@ def cgroup_tree(root, levels):
 def test_a_dry_prepare_is_past_its_memory_cap_where_a_limit_binding_its_task_is_mostly_held(
         ci, tmp_path, monkeypatch, levels, past):
     """A dry prepare's task (prepares.py's `process`) caps the working set of each cgroup level binding it,
-    its own or an ancestor's under DEW_CGROUP_ROOT, at `HELD_SHARE` of that level's limit (tests/tier_wire.py's
-    `PREPARE_HOLDS`), and its pytest is past its cap (`past_cap`) where any level holds more (its charge less
-    its inactive page cache): every process under it counts, a flow's own beside the prepare's. The limits are
+    its own or an ancestor's under DEW_CGROUP_ROOT, at `HELD_SHARE` of that level's limit
+    (tests/tier_wire.py's `PREPARE_HOLDS`), and its pytest is past its cap (`past_cap`) where any level holds
+    more (its charge less its inactive page cache): every process under it counts, a flow's own beside the prepare's. The limits are
     read by the task, the pytest reading only what each level holds, so no limit keys its rows; a part's
     prepare runs under no such cap."""
     membership = tmp_path / "cgroup"
