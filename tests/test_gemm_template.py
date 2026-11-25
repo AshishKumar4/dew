@@ -1166,12 +1166,12 @@ def test_a_dense_kernel_gradients_balanced_tail_holds_check_1(rows, depth, width
     a_dense_kernel_gradients_balanced_tail_holds_check_1(rows, depth, width, out_dtype)
 
 
-def a_dense_kernel_gradients_balanced_tail_holds_check_1(rows: int, depth: int, width: int,
-                                                         out_dtype) -> None:
+def a_dense_kernel_gradients_balanced_tail_holds_check_1(rows: int, depth: int, width: int, out_dtype,
+                                                         generation_name: str = "sm90") -> None:
     """`test_a_dense_kernel_gradients_balanced_tail_holds_check_1`'s check at one shape and output dtype,
     interpreted on a CPU and compiled on a Hopper GPU."""
     draw = _dense_draw(rows, depth, width, cotangent=True)
-    target = dataclasses.replace(generation.gpu_target("sm90"), multiprocessors=8, measured={})
+    target = dataclasses.replace(generation.gpu_target(generation_name), multiprocessors=8, measured={})
     spec = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     gradient = grouped_matmul.MosaicTgmm()
     exact = jnp.dtype(out_dtype) == jnp.float32
@@ -1208,7 +1208,7 @@ def test_a_dense_forwards_balanced_tail_holds_check_1_through_its_hooks(rows, de
     tile does not divide. The template's interpreted route launches one program, so this calls the kernel
     (row 3587), on a Hopper part whose hand-off is unmeasured, so the tail is taken at these few steps a
     tile."""
-    target = dataclasses.replace(generation.gpu_target("sm90"), multiprocessors=8, measured={})
+    target = dataclasses.replace(generation.gpu_target(generation_name), multiprocessors=8, measured={})
     grid = (-(-rows // COOPERATIVE.block_m), width // COOPERATIVE.block_n)
     steps = depth // COOPERATIVE.block_k
     assert pricing.balanced_tail(COOPERATIVE, grid, steps, (2, 2), target, 8) is not None
@@ -1245,7 +1245,7 @@ def test_a_dense_depth_split_whose_last_wave_would_balance_walks_its_runs():
     runs unscheduled and stored a run's slices through a 2-D store), and over small integers sums bitwise
     the unsplit launch's."""
     rows, depth, width = 1408, 128, 128
-    target = dataclasses.replace(generation.gpu_target("sm90"), multiprocessors=8, measured={})
+    target = dataclasses.replace(generation.gpu_target(generation_name), multiprocessors=8, measured={})
     grid = (-(-rows // COOPERATIVE.block_m), width // COOPERATIVE.block_n)
     assert pricing.balanced_tail(COOPERATIVE, grid, depth // COOPERATIVE.block_k, (2, 2), target,
                                     8) is not None

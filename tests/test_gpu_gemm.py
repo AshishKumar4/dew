@@ -163,6 +163,35 @@ def native_hopper_cluster2_balanced_tail_holds_check_1():
     assert_as_exact(jax.jit(dew_fn), jax.jit(plain), draw, "hopper cluster=2 balanced tail 2048x8192x2560",
                     seeds=8, truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
 
+def native_hopper_cluster2_balanced_tail_kernel_gradient_holds_check_1():
+    """The Qwen3.5-4B q outlier's kernel gradient (8192 rows, 2560 by 2048: 80 tiles over a GH200's 66
+    pairs, 14 of them a balanced tail) at a pinned 128 x 256 cluster tile, its tail tiles' first partials a
+    slot a tile (`tail.slots`, NG29): check 1 against XLA's from float64 truth."""
+    from dew.nn.kernels import gemm, grouped_matmul, tuning
+    from dew.nn.kernels.templates.gemm import tiling
+    tile = tiling.Tiles(128, 256, 64, 4, 8, warpgroups=2, cluster=2, family="wgmma")
+    launch, bf16 = grouped_matmul.MosaicTgmm(), functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    ba = launch.bind(bf16((8192, 2560)), bf16((8192, 2048)), jax.ShapeDtypeStruct((1,), jnp.int32),
+                     out_dtype="float32", interpret=False, dense=True)
+    target = generation.gpu_target()
+    assert launch.legal(ba, tile, target) and launch.balanced(ba, tile, target)
+
+    def draw(seed):
+        rng = np.random.default_rng(29 + seed)
+        return ((rng.normal(size=(8192, 2560)) / np.sqrt(8192)).astype(jnp.bfloat16),
+                rng.normal(size=(8192, 2048)).astype(jnp.bfloat16))
+
+    def dew_fn(x, dy):
+        with generation.chosen(grouped_matmul="mosaic"), tuning.pinned({grouped_matmul.MosaicTgmm: tile}):
+            return gemm.gemm_t(x, dy, None, out_dtype=jnp.float32)[0]
+
+    def plain(x, dy, *, wide=jnp.float32):
+        return jnp.dot(x.T.astype(wide), dy.astype(wide))
+
+    assert_as_exact(jax.jit(dew_fn), jax.jit(plain), draw, "hopper cluster=2 balanced tail dW 2560x8192x2048",
+                    seeds=8, truth_fn=functools.partial(plain, wide=jnp.float64))
+
+
 def _syrk_and_tail_cells():
     return [
         # The family's cells as its own grid states them, each pinned to its GPU (`gpu_flow.cells_of`).
@@ -173,6 +202,9 @@ def _syrk_and_tail_cells():
         Cell("native Hopper cluster=2 balanced tail holds check 1",
              native_hopper_cluster2_balanced_tail_holds_check_1, "sm90", fault=BALANCED_TAIL,
              native={"launch": "cluster2 tail", "pass": "forward"}),
+        Cell("native Hopper cluster=2 balanced tail's kernel gradient holds check 1",
+             native_hopper_cluster2_balanced_tail_kernel_gradient_holds_check_1, "sm90", fault=BALANCED_TAIL,
+             native={"launch": "cluster2 tail", "pass": "kernel gradient"}),
     ]
 
 
@@ -258,6 +290,10 @@ def test_the_gemm_kernels_run_on_this_gpu(part):
                functools.partial(gemm_template.a_dense_kernel_gradients_balanced_tail_holds_check_1, rows,
                                  depth, width, dtype), "sm90", fault=BALANCED_TAIL)
           for rows, depth, width in gemm_template.BALANCED_TAILS for dtype in (jnp.bfloat16, jnp.float32)),
+        *(Cell(f"an A100's dense kernel gradient's balanced tail holds check 1: {rows}x{depth}x{width}",
+               functools.partial(gemm_template.a_dense_kernel_gradients_balanced_tail_holds_check_1, rows,
+                                 depth, width, jnp.bfloat16, "sm80"), "sm80", fault=BALANCED_TAIL)
+          for rows, depth, width in gemm_template.BALANCED_TAILS),
         *(Cell(f"a chained input gradient holds check 1: {case}",
                functools.partial(gemm_paired.a_chained_input_gradient_holds_check_1, case), name,
                native={"launch": "chained", "generation": name, "case": case})
