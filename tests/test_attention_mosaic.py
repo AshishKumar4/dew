@@ -228,8 +228,13 @@ def _device(interpret: bool, target: generation.GpuTarget | None = None):
     family of its own, `target`'s facts and bundles, run where the process places them (where None, the GPU
     the interpreted cell runs as, `INTERPRETED_ON`; `generation.assumed`'s `interpreted`); the process's own
     compiled."""
-    return (generation.assumed(target or _INTERPRETED.get(), interpreted=True) if interpret
-            else contextlib.nullcontext())
+    return _device_at(interpret, target or _INTERPRETED.get())
+
+
+def _device_at(interpret: bool, where: generation.GpuTarget | str):
+    """`_device` at `where`, resolved before an arm reads it: an arm a GPU's prepare compiles states what it
+    computes (`truths_ahead.arm_role`), which a context variable it reads has no form of (row 12497)."""
+    return generation.assumed(where, interpreted=True) if interpret else contextlib.nullcontext()
 
 
 def _pinned(forward: attention_mosaic.Tiles | None = None,
@@ -267,10 +272,12 @@ def _check_forward(call: str, dtype, shape, *, natural: bool, interpret: bool, w
                                                           shape[1], value_width))
         return spans, hooks
 
+    where = target or _INTERPRETED.get()
+
     def ours(query, key, value, dout):
         del dout
         spans, hooks = setup()
-        with _device(interpret, target), _pinned(tiles):
+        with _device_at(interpret, where), _pinned(tiles):
             out = attention_mosaic.forward(query, key, value, spans, hooks, natural=natural,
                                            residuals=training, interpret=interpret)
         return out if training is template.Kept.NONE else out[0]
@@ -332,6 +339,7 @@ def _check_spans(label: str, spans: template.KeySpans | Callable[[], template.Ke
                               output.output_mod, output.output_params)
 
     accurate, config = _backward_form(form)
+    where = target or _INTERPRETED.get()
 
     def ours(query, key, value, dout, params, initial):
         built_spans = make_spans()
@@ -339,7 +347,7 @@ def _check_spans(label: str, spans: template.KeySpans | Callable[[], template.Ke
         # The forward at the call forms' tiles 64 wide, else at its derivation's (two consumers' hooked sums
         # 128 wide pass their registers, and a hooked training forward's natural walk theirs 64 wide).
         pinned = pins or (_form_tiles() if width == 64 and not (backward and score) else None, config)
-        with _device(interpret, target), _pinned(*pinned):
+        with _device_at(interpret, where), _pinned(*pinned):
             if not backward:
                 return attention_mosaic.forward(query, key, value, built_spans, hooks, natural=natural,
                                                 interpret=interpret)
@@ -496,11 +504,12 @@ def _check_backward(call: str, shape, *, form: str | None, interpret: bool, keys
     # Another mainloop's forward keeps its split sums (its `residuals` True).
     trained = (functools.partial(attention_mosaic.forward, residuals=kept) if residuals_from is None
                else functools.partial(residuals_from, residuals=True))
+    where = target or _INTERPRETED.get()
 
     def ours(query, key, value, dout):
         built_spans = make_spans()
         hooks = _dropping(shape) if drop else None
-        with _device(interpret, target):
+        with _device_at(interpret, where):
             residuals = trained(query, key, value, built_spans, hooks, interpret=interpret)[1:]
             with _pinned(backward=config):
                 grads = attention_mosaic.backward(query, key, value, built_spans, hooks, dout,
