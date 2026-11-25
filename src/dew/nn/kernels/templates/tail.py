@@ -11,6 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
+from jax.experimental import pallas as pl
 
 from dew.nn.kernels.templates import cost
 
@@ -46,8 +47,9 @@ class Tail:
     def segment(self, index, programs: int, tiles: int) -> tuple:
         """A program's `index`-th segment (`(segment, program)`): its tile's place in the snake, the first
         of the tile's steps it walks and how many, and the programs that walk a part of the tile, the first
-        (which walks its first step) and the exclusive end (`mosaic.Family.fixed_up`'s); a segment past the
-        program's range walks none, at a tile its descriptors can take."""
+        (which walks its first step) and the exclusive end, and its tail tile's slot
+        (`mosaic.Family.fixed_up`'s `firsts`); a segment past the program's range walks none, at a tile its
+        descriptors can take."""
         segment, program = index
         whole = segment < self.waves
         lo = jnp.minimum(program, self.partitions) * self.iterations // self.partitions
@@ -64,8 +66,11 @@ class Tail:
         gathered = jnp.where(whole, program + 1,
                              -(-((tail_tile + 1) * self.steps * self.partitions) // self.iterations))
         tile = jnp.where(whole, segment * programs + program, self.waves * programs + tail_tile)
+        # The tail tile's slot of its first program's partial (`mosaic.Family.fixed_up`'s `firsts`): a slot a
+        # tile, which a segment past the tail's tiles (walking none) reads as its last.
+        slot = jnp.minimum(jnp.where(whole, 0, tail_tile), -(-self.iterations // self.steps) - 1)
         return (jnp.minimum(tile, tiles - 1), start, jnp.maximum(end - start, 0),
-                (first, jnp.minimum(gathered, self.partitions)))
+                (first, jnp.minimum(gathered, self.partitions), slot))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -179,6 +184,14 @@ def _rounds(tail: Tail, rows: np.ndarray, columns: np.ndarray, traffic: Traffic)
     active = np.bincount(turn, minlength=rounds)
     issued = traffic.step_seconds * cost.spread(active, traffic.multiprocessors)
     return float(np.maximum(issued, missed / traffic.bandwidth).sum())
+
+
+def slots(workspace, cta, consumer, pairs: int) -> tuple:
+    """A consumer's slots of a balanced tail's workspace (`gemm.pricing.tail_workspace`): each of its
+    `pairs` programs', then each tail tile's first program's (`mosaic.Family.fixed_up`'s `partials` and
+    `firsts`), of cluster member `cta`."""
+    return (workspace.at[cta, pl.ds(0, pairs), consumer],
+            workspace.at[cta, pl.ds(pairs, workspace.shape[1] - pairs), consumer])
 
 
 def ordered(tail: Tail | None, index: tuple, programs: int, interpreted: bool) -> tuple:

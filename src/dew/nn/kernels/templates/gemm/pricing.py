@@ -165,18 +165,29 @@ def dense_tail(tiles: "Tiles", dtype, extents: tuple[int, int, int], itemsizes: 
     # Its partials' workspace is the launch's beside its operands and output, no more than the reference's
     # (`GpuTarget.reference_workspace`): a GH200's 128 x 256 tiles' over 132 programs, 33 MiB, held past
     # cuBLAS's 32 (M-NG-45b's 34.6 MB temporaries a cell, row 12850).
-    if not within_workspace(target, math.prod(tail_workspace(tiles, family, programs)) * 4):
+    tail = balanced_tail(tiles, grid, -(-k // tiles.block_k), itemsizes, target, programs, dtype=dtype)
+    held = None if tail is None else math.prod(tail_workspace(tiles, family, programs, tail)) * 4
+    if held is None or not within_workspace(target, held):
         return None
-    return balanced_tail(tiles, grid, -(-k // tiles.block_k), itemsizes, target, programs, dtype=dtype)
+    return tail
 
 
-def tail_workspace(tiles: "Tiles", family: mosaic.Family, programs: int) -> tuple[int, ...]:
+def tail_workspace(tiles: "Tiles", family: mosaic.Family, programs: int,
+                   tail: tail_of.Tail) -> tuple[int, ...]:
     """A balanced tail's fp32 partials' shape, the one its planner bounds (`dense_tail`) and its launches
-    allocate (`mosaic_gpu._workspace`): each of a launch's `programs` (cluster pairs of `tiles.cluster`), two
-    tiles' (the one its range starts inside and the one it walks the first step of), each consumer's share
-    of the tile's rows by its columns (a tail's tile is no ping-pong one, `fixes_up`)."""
-    return (tiles.cluster, programs // tiles.cluster, 2, tiles.warpgroups, tiles.share,
+    allocate (`mosaic_gpu._workspace`): a slot each of a launch's `programs` (cluster pairs of
+    `tiles.cluster`), the partial of the tile its range starts inside, then one each of the tail's tiles
+    (`tail_slots`), its first program's partial of it (`Family.fixed_up`'s `firsts`), each a consumer's
+    share of the tile's rows by its columns (a tail's tile is no ping-pong one, `fixes_up`): a slot a tile,
+    not a second one a program, where the tail's tiles are fewer than its programs (a GH200's 128 x 256
+    outlier's 66 pairs and 14 tiles: 21 MiB where two a program held 33, past cuBLAS's 32, NG29)."""
+    return (tiles.cluster, programs // tiles.cluster + tail_slots(tail), tiles.warpgroups, tiles.share,
             tile_columns(tiles, family))
+
+
+def tail_slots(tail: tail_of.Tail) -> int:
+    """The tiles of a balanced tail (its iterations, a tile's steps each), each a slot of its workspace."""
+    return -(-tail.iterations // tail.steps)
 
 
 def within_workspace(target: generation.GpuTarget | None, held: float) -> bool:

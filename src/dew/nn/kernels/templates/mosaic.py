@@ -2288,7 +2288,7 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
         return resources.register_programs(self, consumers, registers, producer, joined)
 
     def fixed_up(self, summed, partials, ready, program, first, gathered, store,
-                 combine=operator.add, firsts=None) -> None:
+                 combine=operator.add, firsts=None, slot=None) -> None:
         """A consumer's share of a tile that programs `first` to `gathered` (exclusive) each walk a part of
         (a balanced tail's, `tail.Tail`; a split walk's), `summed` from this program's steps: left in
         `partials` (each program's, this consumer's; the tile's first program's in `firsts` where given, a
@@ -2307,13 +2307,16 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
         `firsts` are a workspace, a slot written only where programs share a tile (none where one program
         walks it, nor the combining program's own interpreted): refs the launch takes in place (a
         `lax.empty` ref, `gemm.mosaic_gpu._workspace`), never declared outputs, which would be left
-        partly unwritten (NSNAN-2)."""
+        partly unwritten (NSNAN-2). `slot`, where given, is the tile's own slot of `firsts` (a balanced
+        tail's, `tail.Tail.segment`: a slot a tail tile, not a program), which its first program writes and
+        its combiner reads; the first program's index elsewhere."""
         opening = partials if firsts is None else firsts
+        opened = first if slot is None else slot
 
-        def left(refs) -> None:
+        def left(refs, at=program) -> None:
             # Unoptimized: a partial's leaf may move less than a cache line (a 16-row decode's statistics,
             # 64 bytes), which an optimized global transfer refuses.
-            jax.tree.map(lambda leaf, ref: plgpu.store(ref.at[program], leaf, optimized=False), summed, refs)
+            jax.tree.map(lambda leaf, ref: plgpu.store(ref.at[at], leaf, optimized=False), summed, refs)
 
         def read(refs, other, column=0, width=None):
             # The partials' structure read off the running value's: a ref may itself be a tree; the widest
@@ -2369,11 +2372,11 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
         @pl.when(gathered - first > 1)
         def _():
             pl.when(program != first)(lambda: left(partials))
-            pl.when(program == first)(lambda: left(opening))
+            pl.when(program == first)(lambda: left(opening, opened))
             last = across.arrived(ready.at[gathered - 1], gathered - first)
             # The first program's partial read back from its slot by any last arriver: selected against its
             # own value, both stayed live through the merge (267 registers at a 128 x 256 dW tile, EM-probe2).
-            pl.when(last == 1)(lambda: combined(read(opening, first)))
+            pl.when(last == 1)(lambda: combined(read(opening, opened)))
 
     def scoped(self, body, *allocations, streams, products: tuple | None = None, **after):
         """`Transport.scoped` (`after`), and with `products`, `(consumers, widths, lefts)`, the issuer's

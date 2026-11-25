@@ -137,23 +137,21 @@ def a_fused_projection_trains_its_producer_and_epilogue():
 
 def native_hopper_cluster2_balanced_tail_holds_check_1():
     """Native Hopper `cluster=2` dense forward with a verified nonempty balanced `Tail` holds check 1
-    against XLA dot_general from float64 truth (row 10151), at a 128 x 128 tile whose partials' workspace
-    the reference's holds on the GPU's whole wave (`GpuTarget.reference_workspace`; a 128 x 256 tile's over
-    a GH200's 132 multiprocessors, 33 MiB, is past it, row 12850): 2048 x 8192 by 1280, 80 super-tiles a
-    wave and a part."""
+    against XLA dot_general from float64 truth at Qwen3.5-4B q dX outlier shape (row 10151), its tail's
+    first partials a slot a tail tile (`tail.slots`, NG29)."""
     from dew.nn.kernels import gemm, grouped_matmul, tuning
     from dew.nn.kernels.templates.gemm import tiling
-    tile = tiling.Tiles(128, 128, 64, 4, 8, warpgroups=2, cluster=2, family="wgmma")
+    tile = tiling.Tiles(128, 256, 64, 4, 8, warpgroups=2, cluster=2, family="wgmma")
     target = generation.gpu_target()
     launch = grouped_matmul.MosaicGmm()
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
-    ba = launch.bind(bf16((2048, 8192)), bf16((1, 8192, 1280)), jax.ShapeDtypeStruct((1,), jnp.int32),
+    ba = launch.bind(bf16((2048, 8192)), bf16((1, 8192, 2560)), jax.ShapeDtypeStruct((1,), jnp.int32),
                      out_dtype="bfloat16", trans_rhs=False, interpret=False, dense=True)
     assert launch.legal(ba, tile, target) and launch._tail(ba, tile, target)[1] is not None
     def draw(seed):
         rng = np.random.default_rng(10151 + seed)
         return ((rng.normal(size=(2048, 8192)) / np.sqrt(8192)).astype(jnp.bfloat16),
-                (rng.normal(size=(8192, 1280)) / np.sqrt(8192)).astype(jnp.bfloat16))
+                (rng.normal(size=(8192, 2560)) / np.sqrt(8192)).astype(jnp.bfloat16))
 
     def dew_fn(x, w):
         with generation.chosen(grouped_matmul="mosaic"), tuning.pinned({grouped_matmul.MosaicGmm: tile}):
@@ -162,7 +160,7 @@ def native_hopper_cluster2_balanced_tail_holds_check_1():
     def plain(x, w, *, wide=jnp.float32, out=jnp.bfloat16):
         return jax.lax.dot(x.astype(wide), w.astype(wide), preferred_element_type=wide).astype(out)
 
-    assert_as_exact(jax.jit(dew_fn), jax.jit(plain), draw, "hopper cluster=2 balanced tail 2048x8192x1280",
+    assert_as_exact(jax.jit(dew_fn), jax.jit(plain), draw, "hopper cluster=2 balanced tail 2048x8192x2560",
                     seeds=8, truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
 
 def _syrk_and_tail_cells():
