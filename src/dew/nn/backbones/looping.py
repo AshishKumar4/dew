@@ -782,8 +782,11 @@ class _Passes:
         """The block's entries of the cache as the pass that just ran left them (its layers', a run's among
         them: `group_layers`)."""
         first, end = self.span
-        return {name: value for name, value in module.variables.get('cache', {}).items()
-                if (run := group_layers(name)) is not None and first <= run.start and run.stop <= end}
+        # Its own containers: Flax publishes a later pass's writes into the scope's dicts in place
+        # (`Scope.put_variable`), which entries held by reference would follow (row 12928).
+        return jax.tree.map(lambda leaf: leaf, {
+            name: value for name, value in module.variables.get('cache', {}).items()
+            if (run := group_layers(name)) is not None and first <= run.start and run.stop <= end})
 
     @staticmethod
     def _kept_exits(chosen: dict, latest: dict, exited: jax.Array) -> dict:

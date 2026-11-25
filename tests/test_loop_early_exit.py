@@ -244,6 +244,35 @@ def test_a_shared_cache_decodes_each_token_at_its_exiting_pass(bias, site):
 
 
 @attending("reference")
+def test_a_shared_cache_keeps_each_rows_exiting_pass_when_its_rows_exit_apart():
+    """A token decoded under a cache its passes share, five rows exiting at different passes (row 12928):
+    each row's cache after the step is, bit for bit, the one the loop leaves running as many passes as
+    that row's token did, threshold or none, from the same cache; the rows keep more than one pass's.
+    The passes' caches held by reference all followed the last pass's writes, every row its last pass's."""
+    looped = _tokens_exiting(shared_cache=True, layers=(2, 4))
+    variables, ids = _gated(model_draw(looped, (5, 4), looped.vocab_size), looped.emb_features, 0xE98)(0)
+    made, step = decode_steps(looped)
+    _, cache = step(variables, made(variables, ids.shape[0]), ids[:, :3])
+    _, kept = step(variables, cache, ids[:, 3:4])
+    def ran(count: int):
+        every = looped.clone(loop=dataclasses.replace(looped.loop, steps=count, exit_threshold=None))
+        return decode_steps(every)[1](variables, cache, ids[:, 3:4])[1]
+    passes = [ran(count) for count in range(1, looped.loop.steps + 1)]
+
+    def row(tree, index):
+        return [np.take(np.asarray(leaf), index, axis=list(leaf.shape).index(ids.shape[0]))
+                for leaf in jax.tree.leaves(tree) if ids.shape[0] in leaf.shape]
+    exited = []
+    for index in range(ids.shape[0]):
+        matched = [count for count, every in enumerate(passes)
+                   if all(np.array_equal(a, b)
+                          for a, b in zip(row(kept, index), row(every, index), strict=True))]
+        assert matched, index
+        exited.append(matched[0])
+    assert len(set(exited)) > 1, exited
+
+
+@attending("reference")
 def test_a_tokens_exit_and_output_read_no_later_token():
     """A loop exiting each token at its threshold, its gate on the block's output and its coda run once on
     the tokens' chosen states: a row's tokens after `t` changed, its tokens up to `t` keep their exit
