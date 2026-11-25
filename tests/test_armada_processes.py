@@ -130,9 +130,10 @@ def test_a_recycled_rows_last_process_that_leaves_no_report_is_red(ci, tmp_path,
 
 def test_a_recycled_rows_last_process_that_reports_none_of_the_tests_left_is_red(
         ci, tmp_path, monkeypatch):
-    """A dry prepare's row whose first process recycled after reporting, its last writing a valid report of no
-    test (its collection's hook dropping the tests left without deselecting them, pytest's exit 5), is red: the
-    last report is graded by its own cases alone, an earlier process's no evidence of the tests left."""
+    """A dry prepare's row whose first process recycled after reporting, its last writing a valid report of
+    no test (its collection's hook dropping the tests left without deselecting them, pytest's exit 5), is
+    red: the last report is graded by its own cases alone, an earlier process's no evidence of the tests
+    left."""
     written(tmp_path, {"test_dropped.py": "def test_a():\n    pass\ndef test_b():\n    pass\n"})
     conftest = tmp_path / "tests" / "conftest.py"
     conftest.write_text((conftest.read_text() if conftest.is_file() else "")
