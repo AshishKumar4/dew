@@ -200,15 +200,30 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     chosen = WALKS[walk]
     single_hooks = (None if hooks is None else dataclasses.replace(
         hooks, initial=None, output_mod=None, output_params=())) if defer_output else hooks
-    found = _streamed(query, key, value, spans, single_hooks, scale=scale, target=target, table=table,
-                      sources=sources, out_dtype=jnp.float32 if defer_output else None, scales=scales,
-                      chosen=chosen, in_key=in_key)
-    if found is None:
+    op, ba = _stream_op(query, key, value, spans, single_hooks, scale=scale, table=table, sources=sources,
+                        out_dtype=jnp.float32 if defer_output else None, scales=scales, chosen=chosen,
+                        in_key=in_key)
+    # A config its caller chooses (a pin held for the forward, or an opted-in tuning run's picks) is retiled
+    # as its streaming walk retiles it, never priced over.
+    chosen_by_caller = op.pinned(ba) is not None or tuning.reads_picks()
+    # The one-slice launch's config as derived (`remaining`, its refusals read) at the tile its walk
+    # streams at, certified only where the plan takes it (`single`): a split plan compiles no config of a
+    # launch it never runs (row 12697: a hooked one-row step certified the one-slice walk's three configs
+    # before it split, 70 of its 168 s on a compile-only B200).
+    derived = None if chosen_by_caller else op.remaining(ba)
+    if chosen_by_caller or derived is None:
+        config = _certified_stream(op, ba, target)
+    else:
+        config = op.streaming(ba, derived, target)
+    if config is None:
         return None
-    config, op, ba = found
 
     def planned(config, op, ba, slices: int) -> Plan:
         return Plan(config, slices, op.deciding(ba, config, target=target))
+
+    def single() -> Plan | None:
+        certified = config if chosen_by_caller or derived is None else _certified_stream(op, ba, target)
+        return None if certified is None else planned(certified, op, ba, 1)
 
     processors = target.multiprocessors or 1
     tiles = math.ceil(query.shape[1] / (config.consumers * config.block_q))
@@ -216,7 +231,7 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     # (`MosaicForward.parts`), as many programs again each (a merging launch's every one resident).
     programs = op.parts * query.shape[0] * query.shape[2] * tiles
     if programs >= processors:
-        return planned(config, op, ba, 1)
+        return single()
 
     walked = None if hooks is None else dataclasses.replace(
         hooks, initial=None, output_mod=None, output_params=())
@@ -229,9 +244,6 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     # No more slices than four programs a multiprocessor take: past them a slice's programs wait a wave.
     most = min(longest, max(2, 4 * processors // programs))
     counts = [1 << power for power in range(1, most.bit_length()) if 1 << power <= most]
-    # A config its caller chooses (a pin held for the forward, or an opted-in tuning run's picks) is retiled
-    # as its streaming walk retiles it, never priced over.
-    chosen_by_caller = op.pinned(ba) is not None or tuning.reads_picks()
     # Priced over every key a row holds (`spans.keys`): a call's own intervals (a cache's lengths, its
     # documents) its launches count no work of, their extents its data's (a decode step's every launch
     # priced none, its plan the heuristic's alone: M-NA-27-gh200 at fb6a6daa2).
@@ -239,11 +251,12 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     priced = None if chosen_by_caller else _priced_slices(
         query, key, value, every, walked, config, counts, scale=scale, target=target, table=table,
         sources=sources, scales=scales, chosen=chosen, in_key=in_key,
-        initial=hooks is not None and hooks.initial is not None)
+        initial=hooks is not None and hooks.initial is not None,
+        single_launch=(single_hooks, jnp.float32 if defer_output else None))
     if priced is not None:
         slices, tile = priced
         if slices == 1:
-            return planned(config, op, ba, 1)
+            return single()
         # The priced tile completed and legal at the call's own bound arguments (`_launchable`: its rules, a
         # recorded refusal among them), certified, and the certified config taken there too; else its
         # streaming walk's own config at those slices, certified (`_streamed`).
@@ -259,20 +272,26 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
                 return planned(certified, sliced_op, sliced_ba, slices)
     else:
         # The most slices whose programs keep the device's stream in flight at once (`MosaicForward.streamed`,
-        # at most those it holds), where the cost model prices no step of them.
-        found = streamed()
+        # at most those it holds), where the cost model prices no step of them: sized at its stateless walk's
+        # derived tile, uncertified as the priced path's are, a pin's or a pick's certified.
+        sizing_op, sizing_ba = _bound(query, key, value, spans, walked, scale=scale, table=table,
+                                      sources=sources, scales=scales, splits=1, chosen=chosen, in_key=in_key)
+        sizing = None if chosen_by_caller else sizing_op.remaining(sizing_ba)
+        found = (streamed() if sizing is None
+                 else (sizing_op.streaming(sizing_ba, sizing, target), sizing_op, sizing_ba))
         slices = 1 if found is None else max(1, min(
             processors * found[1].streamed(found[2], found[0], target) // programs, longest))
     # The sliced launch's own op, at its slices, certified (`_certified_stream`).
     found = None if slices == 1 else streamed(splits=slices)
-    return planned(config, op, ba, 1) if found is None else planned(*found, slices)
+    return single() if found is None else planned(*found, slices)
 
 
 def _priced_slices(query, key, value, spans: KeySpans, hooks: Hooks | None, single: attention_mosaic.Tiles,
                    counts: list[int], *, scale: float | None, target: generation.GpuTarget, table, sources,
-                   scales, chosen: Walk, in_key: bool, initial: bool
+                   scales, chosen: Walk, in_key: bool, initial: bool, single_launch: tuple
                    ) -> tuple[int, attention_mosaic.Tiles] | None:
-    """The slice count of `counts` (one beside them, at the certified `single` tile) and key tile whose step
+    """The slice count of `counts` (one beside them, at the derived `single` tile as `single_launch`'s hooks
+    and written dtype run it, the plan's one-slice launch) and key tile whose step
     the cost model prices least over `spans`: its walk (`MosaicForward.price_config`, its programs' warps
     hiding each other's issue intervals) and, past one slice, the merge of its slices (`merged.launch_work`,
     its passes' waited loads: the state form's merge, a proxy of a finished step's, its cast, its heads'
@@ -284,8 +303,11 @@ def _priced_slices(query, key, value, spans: KeySpans, hooks: Hooks | None, sing
     (FS-5274-LAT1)."""
     bound = functools.partial(_bound, query, key, value, spans, hooks, scale=scale, table=table,
                               sources=sources, scales=scales, chosen=chosen, in_key=in_key)
-    # The certified single tile priced only where it launches at these spans too.
-    op, ba = bound(splits=1)
+    # The single tile priced as its one-slice launch runs (`single_launch`: its hooks, its initial state
+    # among them, and the dtype it writes, `plan`'s), only where it launches at these spans too.
+    single_hooks, single_out = single_launch
+    op, ba = _stream_op(query, key, value, spans, single_hooks, scale=scale, table=table, sources=sources,
+                        out_dtype=single_out, scales=scales, chosen=chosen, in_key=in_key)
     alone = None if op._launchable(ba, single, target) is None else op.price_config(ba, single, target,
                                                                                      issued=True)
     if alone is None:
@@ -309,13 +331,10 @@ def _priced_slices(query, key, value, spans: KeySpans, hooks: Hooks | None, sing
 
 def _bound(query, key, value, spans: KeySpans, hooks: Hooks | None, *, scale: float | None, table, sources,
            scales, splits: int, chosen: Walk, in_key: bool) -> tuple:
-    """A split walk's op over `splits` slices and its bound arguments, deriving none."""
-    op, args = attention_mosaic._forward_call(query, key, value, spans, hooks, scale=scale, natural=False,
-                                              out_dtype=jnp.float32, masked=hooks is None or hooks.output_mod
-                                              is None, splits=splits, table=table, sources=sources,
-                                              subtracted=True, scales=scales, scaled=chosen.scaled,
-                                              bounded=chosen.bounded, in_key=in_key)
-    return op, op.bind(*args, residuals=Kept.OUTPUT, interpret=False)
+    """A split walk's op over `splits` slices, its fp32 state written, and its bound arguments, deriving
+    none (`_stream_op`)."""
+    return _stream_op(query, key, value, spans, hooks, scale=scale, table=table, sources=sources,
+                      out_dtype=jnp.float32, scales=scales, splits=splits, chosen=chosen, in_key=in_key)
 
 
 def _merge_seconds(query, value, spans: KeySpans, config: attention_mosaic.Tiles, slices: int, *,
@@ -340,16 +359,26 @@ def _streamed(query, key, value, spans: KeySpans, hooks: Hooks | None, *, scale:
               chosen: Walk = WALKS["plain"], in_key: bool = False):
     """The forward's config for a packed call's launch of the walk `chosen` names (`WALKS`) writing
     `out_dtype` (the query's where None) over `splits` slices, certified at the key tile its walk streams at
-    (`_certified_stream`), with its op and bound arguments, the op its launch runs (`in_key` its values'
-    stream or the key's slot); None where none derives or certification refuses every config."""
+    (`_certified_stream`), with its op and bound arguments (`_stream_op`); None where none derives or
+    certification refuses every config."""
+    op, ba = _stream_op(query, key, value, spans, hooks, scale=scale, table=table, sources=sources,
+                        out_dtype=out_dtype, scales=scales, splits=splits, chosen=chosen, in_key=in_key)
+    config = _certified_stream(op, ba, target)
+    return None if config is None else (config, op, ba)
+
+
+def _stream_op(query, key, value, spans: KeySpans, hooks: Hooks | None, *, scale: float | None, table,
+               sources, out_dtype, scales=None, splits: int = 1, chosen: Walk = WALKS["plain"],
+               in_key: bool = False) -> tuple:
+    """The op a packed call's launch of the walk `chosen` names runs, writing `out_dtype` (the query's where
+    None) over `splits` slices (`in_key` its values' stream or the key's slot), and its bound arguments,
+    deriving none."""
     masked = hooks is None or hooks.output_mod is None
     op, args = attention_mosaic._forward_call(query, key, value, spans, hooks, scale=scale, natural=False,
                                               out_dtype=out_dtype, masked=masked, splits=splits, table=table,
                                               sources=sources, subtracted=True, scales=scales,
                                               scaled=chosen.scaled, bounded=chosen.bounded, in_key=in_key)
-    ba = op.bind(*args, residuals=Kept.OUTPUT if out_dtype is not None else Kept.NONE, interpret=False)
-    config = _certified_stream(op, ba, target)
-    return None if config is None else (config, op, ba)
+    return op, op.bind(*args, residuals=Kept.OUTPUT if out_dtype is not None else Kept.NONE, interpret=False)
 
 
 def _certified_stream(op: attention_mosaic.MosaicForward, ba, target: generation.GpuTarget
