@@ -182,7 +182,7 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
                  coords: algebra.Coords | functools.partial[algebra.Coords], whole,
                  shape: tuple[int, int], *, masked: bool | None, whole_operands: bool = False,
                  on_weights: Callable | None = None, after_weights: Callable | None = None,
-                 keys_scaled: bool = False) -> tuple[jax.Array, jax.Array]:
+                 keys_scaled: bool = False, lean: bool = False) -> tuple[jax.Array, jax.Array]:
     """A queries-first step's tile of a fast-form call whose score hook, if any, takes no parameters
     (`_fused_step`'s, `_coop_step`'s): its `S` and `dP` products (issued together, `summed_together`,
     overlapping `_score_weights` with `dP` where `_splits_scores` and `masked is not None`), masked where
@@ -193,13 +193,16 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
     one part in the operands' dtype (dK's and dQ's); with `whole_operands` (fp16's, `algebra.running_parts`),
     both fp32: the normalized weights, dropped, and the scaled cotangents. Where its resident keys carry the
     query's power already (`keys_scaled`, the fused launch's, `attention_mosaic_fused._keys_powered`), its
-    logits' product reads the query as its slot holds it."""
+    logits' product reads the query as its slot holds it. `lean` (the fused launch's): its weights from the
+    query's log-sum-exp alone where nothing reads the unnormalized ones, and its bf16 cotangents narrowed
+    saturating in one conversion on wgmma (`saturated_bf16`); a launch at its registers' edge takes neither
+    (the shared-keys dK/dV at width 256 spilled 24 bytes at 255 with both)."""
     family = walk.program.family
     (q_slot, do_slot), (keys, values) = slots, resident
     held, values_t = keys.transpose((1, 0)), values.transpose((1, 0))
     # The normalized weights alone where nothing reads the unnormalized ones (`value_weights`' bf16 operand,
     # fp16's whole operands), from the query's log-sum-exp in base 2 (`_score_weights`).
-    normalized = not walk.dropped and (whole_operands or do_slot.dtype == jnp.bfloat16)
+    normalized = lean and not walk.dropped and (whole_operands or do_slot.dtype == jnp.bfloat16)
     # S's products and dP's, issued together (`Issuer.summed_together`).
     score_products = (lambda acc: family.products(acc, q_slot, held),
                       lambda acc: family.products(acc, do_slot, values_t))
@@ -264,7 +267,8 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
             exponentials, weights, cotangents = scores(is_masked=masked)
     if whole_operands:
         return weights, cotangents * walk.grad_scale
-    if q_slot.dtype == jnp.bfloat16 and not walk.interpret and isinstance(family, mosaic_sm90.WgmmaIssuer):
+    if (lean and q_slot.dtype == jnp.bfloat16 and not walk.interpret
+            and isinstance(family, mosaic_sm90.WgmmaIssuer)):
         part = saturated_bf16(cotangents * walk.grad_scale)
     else:
         part = mosaic.unscaled_part(*algebra.cotangent_parts(cotangents * walk.grad_scale, q_slot.dtype,
