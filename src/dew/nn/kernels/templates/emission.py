@@ -1085,6 +1085,28 @@ def _software_division(operands: tuple, target: generation.GpuTarget, forms: str
     return counted.fixed + sum(counted.walks, Work())
 
 
+QUAD = 4
+"""The lanes a row of a Mosaic GPU kernel's MMA-family tile spans (WGMMA's and mma.sync's accumulators: a
+row's columns on a warp's four lanes), which a reduction along the row combines by a butterfly."""
+
+
+def _reduced(value, result, params, forms) -> Work:
+    """A reduction of `value` to `result`: an operation an element of `value`; in a Mosaic GPU kernel, a
+    reduction along a tile's last axis (its rows') also its quad's butterfly an output: `QUAD` lanes each
+    combining its own columns, then two rounds (log2 `QUAD`) of a shuffle and a combine a lane, so
+    `QUAD (log2 QUAD - 1)` combines and `QUAD log2 QUAD` shuffles beyond its elements' (FS-REDSHFL3: the
+    attention forward's walk, 12 SHFL a step for its three row reductions of 64 rows, sm90 and sm80).
+    Another axis's or another backend's, unmeasured, as before."""
+    elements = _elements(value)
+    shape = tuple(getattr(value, "shape", ()))
+    along_rows = len(shape) >= 2 and tuple(params.get("axes", ())) == (len(shape) - 1,)
+    if forms in _KERNEL_FORMS.values() and along_rows:
+        rounds = int(math.log2(QUAD))
+        rows = _elements(result)
+        return Work(operations=elements + QUAD * (rounds - 1) * rows, shuffles=QUAD * rounds * rows)
+    return Work(operations=elements)
+
+
 def _divides_on_cuda(outputs: Sequence, target: generation.GpuTarget | None) -> bool:
     """Whether a division of results `outputs` is an fp32 one on a CUDA multiprocessor (`target`, else the
     process's own), whose MUFU and refinement Dew measured; fp64's and narrower floats' unmeasured."""
@@ -1168,7 +1190,7 @@ def operation_work(primitive, inputs: Sequence, outputs: Sequence, params: Mappi
     if primitive in _OPERATIONS:
         return _operated(primitive, inputs, outputs)
     if primitive in _REDUCTIONS:
-        return Work(operations=_elements(inputs[0]))
+        return _reduced(inputs[0], outputs[0], params, forms)
     if primitive in SPECIAL_FUNCTIONS:
         elements = sum(_elements(aval) for aval in outputs)
         if forms is None:

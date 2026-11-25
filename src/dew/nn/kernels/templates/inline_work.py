@@ -55,12 +55,12 @@ _MEMORY = frozenset({"memref.load", "memref.store", "vector.load", "vector.store
 
 _FREE_PREFIXES = ("llvm.mlir.", "builtin.unrealized_conversion_cast", "gpu.thread_id",
                   "gpu.block_id", "gpu.block_dim", "gpu.grid_dim", "nvvm.read.ptx.sreg", "nvvm.barrier",
-                  "nvvm.bar.", "nvvm.fence", "nvvm.shfl.sync", "nvvm.elect.sync", "nvvm.mbarrier",
+                  "nvvm.bar.", "nvvm.fence", "nvvm.elect.sync", "nvvm.mbarrier",
                   "nvvm.cp.async.commit", "nvvm.cp.async.wait", "nvvm.cp.async.mbarrier")
-"""Ops that move a value between registers or name a thread's place (a shuffle's lanes, a barrier's wait),
-which compute nothing a unit's rate prices: register moves, addresses (`llvm.getelementptr`'s arithmetic),
-a thread's indices, synchronization and a shuffle's exchange, which `emission` prices for no reduction
-either."""
+"""Ops that move a value between registers or name a thread's place (a barrier's wait), which compute
+nothing a unit's rate prices: register moves, addresses (`llvm.getelementptr`'s arithmetic), a thread's
+indices and synchronization. A shuffle (`nvvm.shfl.sync`) issues on every lane of its warps
+(`Work.shuffles`)."""
 
 _FREE = frozenset({
     "arith.constant", "arith.index_cast", "arith.index_castui", "arith.extsi", "arith.extui", "arith.trunci",
@@ -385,6 +385,8 @@ class _Lanes:
                         if active.any() and len(known) == len(places) else moving)
             moved = _bytes(value) * distinct
             return Work(shared_bytes=moved) if _shared(address.type) else Work(device_bytes=moved)
+        if name.startswith("nvvm.shfl.sync"):
+            return Work(shuffles=issued)
         if name in _FREE or name.startswith(_FREE_PREFIXES):
             return Work()
         if name == "llvm.inline_asm":
