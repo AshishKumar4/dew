@@ -43,9 +43,10 @@ def _read(path: Path) -> str | None:
 
 def _memberships(membership: Path) -> list[tuple[str, str]]:
     """Each hierarchy `membership` names this process in: its controllers ('' for v2's unified one) and its
-    group's path, verbatim (a group's name may end in a space); none where the file is absent or unreadable
+    group's path, verbatim (a group's name may end in a space or hold a separator `str.splitlines` splits on,
+    U+2028 among them: the file's lines end in a newline alone); none where the file is absent or unreadable
     (a host that is not Linux)."""
-    lines = (_read(membership) or "").splitlines()
+    lines = [line for line in (_read(membership) or "").split("\n") if line]
     return [(controllers, path) for _, controllers, path in (line.split(":", 2) for line in lines)]
 
 
