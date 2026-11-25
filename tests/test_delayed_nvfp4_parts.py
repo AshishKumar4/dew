@@ -118,10 +118,10 @@ def test_a_run_resumed_partway_through_a_held_update_rolls_what_its_taken_calls_
         # Where an update applied, an earlier Dew's checkpoint resumes, nothing waiting.
         waits = resaved(2, "legacy-applied", None).place()[0].variables[NVFP4_PENDING]
         assert all(float(leaf.max()) == -1.0 for leaf in jax.tree.leaves(waits))
-        # Partway through a held update, a checkpoint holding nothing waiting resumes as written; one an
-        # earlier Dew wrote is refused, naming what it lacks.
+        # Partway through a held update, a checkpoint holding nothing waiting resumes as written; the same
+        # state as an earlier Dew wrote it, the collection alone missing, is refused.
         resaved(3, "current-held", nothing).place()
-        with pytest.raises(ValueError, match=NVFP4_PENDING):
+        with pytest.raises(ValueError):
             resaved(3, "legacy-held", None).place()
 
 

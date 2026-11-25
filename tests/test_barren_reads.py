@@ -494,11 +494,15 @@ def test_a_window_shuffled_stream_holds_the_index_of_its_current_file_alone(tmp_
         (tmp_path / f"part-{part:02d}.jsonl").write_text(
             "".join(json.dumps({"id": part * 10 + index}) + "\n" for index in range(5)))
     chain = Pipeline(Files(str(tmp_path / "part-*.jsonl"), format="jsonl")).shuffle(3, window=5).batch(1)
-    reader = compile(chain, read="streamed", loading=Loading(workers=0)).train(DataPartition())
-    try:
-        read = [int(np.asarray(next(reader)["id"])[0]) for _ in range(140)]
-        gc.collect()
-        held = [found for found in gc.get_objects() if isinstance(found, files._ShardLines)]
-    finally:
-        reader.close()
-    assert len(set(read)) > 100 and len(held) <= 2
+    def read_then_held(reader) -> tuple[list[int], list]:
+        """140 rows' ids, and the shards' tables alive as the reader stands after them."""
+        try:
+            ids = [int(np.asarray(next(reader)["id"])[0]) for _ in range(140)]
+            gc.collect()
+            return ids, [found for found in gc.get_objects() if isinstance(found, files._ShardLines)]
+        finally:
+            reader.close()
+
+    data = compile(chain, read="streamed", loading=Loading(workers=0))
+    ids, held = read_then_held(data.train(DataPartition()))
+    assert len(set(ids)) > 100 and len(held) <= 2

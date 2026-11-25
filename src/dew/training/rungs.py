@@ -27,7 +27,7 @@ import jax
 from jax.sharding import Mesh
 
 from dew import _cache
-from dew._code import held, provenance, provenance_code, stated_class, whole_digest
+from dew._code import provenance, provenance_code, stated_class, states_its_code, whole_digest
 from dew._devices import device_memory
 from dew._records import JSON, json_value, record
 from dew._stated import Unestablished, stated
@@ -102,10 +102,6 @@ def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], spl
             'xla_flags': ' '.join(flags)}
 
 
-_DATA = frozenset({"builtins", "numpy", "jax", "jaxlib", "ml_dtypes"})
-"""The packages whose instances a step's settings hold as data, no code of their own run as it builds."""
-
-
 def _code(settings: StepSettings, modules: Sequence[object], step: Callable[..., StepFn] | None) -> list[str]:
     """The digests of the code that builds a step (`provenance_code`): the step's compiler and the modules of
     Dew's defining what its `settings` hold (its objective, every base of its class among them, a model-free
@@ -117,18 +113,16 @@ def _code(settings: StepSettings, modules: Sequence[object], step: Callable[...,
     names outside Optax (`dew.optim.Optax`, its factory found by the registry, which no closure follows).
     Not every file of Dew's otherwise: a run keying a rung on them all read all 794, so its tests' CI key was
     every file (22% of the suite's rows)."""
-    from dew.optim import Optax
+    from dew.optim import Optax, OptimConfig
 
     objective = settings.objective
     # The optimizer as built is functions, what it was made from (`optimizer_source`) states its code; the
     # meshes are devices, which the key states apart (a mesh is callable, a context of JAX's).
     values = [*(getattr(settings, field.name) for field in dataclasses.fields(settings)
                 if field.name not in ("built_optimizer", "device_mesh", "state_mesh")), *modules, step]
-    parts = held(values)
-    if not stated_class(type(objective)) or any(
-            not isinstance(part, type) and not stated_class(type(part))
-            and type(part).__module__.partition(".")[0] not in _DATA for part in parts) or any(
-            isinstance(part, Optax) and not part.path.startswith("optax:") for part in parts):
+    pathed = [value.optimizer for value in values if isinstance(value, OptimConfig)]
+    if not stated_class(type(objective)) or not states_its_code(values) or any(
+            isinstance(optimizer, Optax) and not optimizer.path.startswith("optax:") for optimizer in pathed):
         return [whole_digest()]
     return provenance_code("dew.training.compiler", provenance([*values, *type(objective).__mro__]))
 

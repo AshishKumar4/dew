@@ -77,7 +77,6 @@ from dew.data.elastic_order import _InputOrder, _StreamOrder
 from dew.data.handoff import (
     EXPANDED_DRAWS,
     RecordStage,
-    _Barren,
     _carried,
     _elastic_cut,
     _Ended,
@@ -101,9 +100,9 @@ from dew.data.mixing import (
     TokenDeficit,
     mix_end,
     mixed_indexed,
-    rewound,
 )
 from dew.data.ordering import Skipping, place_of
+from dew.data.passes import Passes
 from dew.data.pipeline import (
     ACCOUNTS,
     CONSUMED,
@@ -1035,81 +1034,15 @@ def _repeated(rows: Rows, epochs: int | None, name: str, loading: Loading, *, re
     a rejecting step keeps none of, which read on forever. A pass a step emptied that may yield rows next
     time (a fetch that failed for now, a draw, `varying` naming those steps) is read on, saying so at each
     empty pass after the first: the share, the passes so far and those steps. Every pass of a stream
-    goes on counting its corpus (`_Passes`). A worker's pass of its inputs and the markers of what they
+    goes on counting its corpus (`Passes`). A worker's pass of its inputs and the markers of what they
     dropped that holds nothing (`barren`) holds no input at all, which ends it (`_Barren`)."""
     if isinstance(rows, pygrain.MapDataset):
         if epochs is None and not len(rows):
             raise ValueError(f"a pass of {name} holds no rows, so repeating it reads nothing forever")
         return rows.repeat(epochs, reseed_each_epoch=reseed)
     parent = _as_iter(rows, loading)
-    passes = _Passes(parent, name, endless=epochs is None, certain=certain, barren=barren, varying=varying)
+    passes = Passes(parent, name, endless=epochs is None, certain=certain, barren=barren, varying=varying)
     return gx.RepeatIterDataset(passes, epochs)
-
-
-class _Passes(pygrain.IterDataset):
-    """A stream a repeat reads pass after pass, each going on counting its corpus. Endlessly read
-    (`endless`), a pass that yields no row is refused where that is certain to repeat (`certain`),
-    and said at each empty pass after the first otherwise, naming the steps that may yield another row
-    on a later pass (`varying`)."""
-
-    def __init__(self, parent: pygrain.IterDataset, name: str, *, endless: bool, certain: bool,
-                 barren: bool = False, varying: tuple[str, ...] = ()):
-        super().__init__(parent)
-        self._rows, self._name, self._endless, self._certain = parent, name, endless, certain
-        self._barren, self._varying = barren, varying
-
-    def __iter__(self) -> pygrain.DatasetIterator:
-        return _PassesIterator(self._rows.__iter__(), self._name, self._endless, self._certain, self._barren,
-                               self._varying)
-
-
-class _PassesIterator(pygrain.DatasetIterator):
-    """Its parent's rows and position. The repeat restarts a pass by restoring, right after one
-    ends, the very position it took as the first pass's start (Grain's `_parent_starting_state`,
-    the first this iterator gives); any other restore, a checkpoint's even once the last pass
-    ended, lands where its position says, with the counts it holds."""
-
-    def __init__(self, parent: pygrain.DatasetIterator, name: str, endless: bool, certain: bool,
-                 barren: bool = False, varying: tuple[str, ...] = ()):
-        super().__init__(parent)
-        self._rows, self._name, self._endless, self._certain = parent, name, endless, certain
-        self._barren, self._varying = barren, varying
-        self._yielded = self._ended = False
-        self._empty = 0
-        self._opening: object | None = None
-
-    def __next__(self):
-        try:
-            value = next(self._rows)
-        except StopIteration:
-            if not self._yielded and self._barren:
-                raise _Barren(self._name) from None
-            if not self._yielded and self._endless:
-                if self._certain:
-                    raise ValueError(f"a pass of {self._name} yields no rows, so repeating it reads "
-                                     "nothing forever") from None
-                self._empty += 1
-                # Every empty pass after the first, loudly: a read that is not moving says why it reads on.
-                if self._empty > 1:
-                    _log.warning("%s yielded no row in its last %d passes; it reads on, as %s may make "
-                                 "a row on a later pass", self._name, self._empty,
-                                 ", ".join(self._varying) or "a step before its repeat")
-            self._ended = True
-            raise
-        self._yielded, self._empty = True, 0
-        return value
-
-    def get_state(self):
-        state = self._rows.get_state()
-        if self._opening is None:
-            self._opening = state
-        return state
-
-    def set_state(self, state) -> None:
-        # The repeat rewinding the pass that just ended keeps the corpus's counts.
-        rewinding = self._ended and state is self._opening
-        self._rows.set_state(rewound(state, self._rows.get_state()) if rewinding else state)
-        self._yielded, self._ended = not rewinding, False
 
 
 def _varies(stage: Stage) -> bool:
@@ -1134,7 +1067,7 @@ def _same_each_pass(stages: Sequence[Stage], shares: int) -> bool:
     shares, derived stage by stage from its input's: none that varies (`_varies`); a shuffle reseeded each
     pass keeps its input's records in another order, so a step after it that keeps records by their place
     (a limit, a slice, a layout, a batch) holds others, as does the cut of several shares
-    (`index::count`). So a pass that keeps no row keeps none on any (`_PassesIterator`, `Accepted`)."""
+    (`index::count`). So a pass that keeps no row keeps none on any (`PassesIterator`, `Accepted`)."""
     ordered = True
     for stage in stages:
         if _varies(stage):
@@ -2056,7 +1989,7 @@ class _Build:
         if isinstance(stage, Shuffle) and stage.block_shards is not None:
             return self.block_shuffle(rows, stage, pipeline, partition)
         if isinstance(stage, Repeat):
-            # A stream's passes replay its first (`_PassesIterator`), its shuffles and its share's cut alike:
+            # A stream's passes replay its first (`PassesIterator`), its shuffles and its share's cut alike:
             # only a step that varies (`_varies`) may make another row on a later pass.
             before = pipeline.stages[:at]
             moving = tuple(_identity(written).name for written in before if _varies(written))

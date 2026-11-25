@@ -1159,8 +1159,11 @@ def test_a_step_holding_a_typed_key_is_stated_by_its_key_data_and_implementation
     assert config(jax.random.wrap_key_data(data, impl="rbg")) != config(
         jax.random.wrap_key_data(data, impl="unsafe_rbg"))
     chain = Pipeline(ROWS).map(Keyed(jax.random.key(0))).batch(2)
-    reader = compile(chain, loading=READ).train(DataPartition())
-    try:
-        assert next(reader)["id"].shape == (2,)
-    finally:
-        reader.close()
+
+    def first(reader):
+        try:
+            return next(reader)
+        finally:
+            reader.close()
+
+    assert first(compile(chain, loading=READ).train(DataPartition()))["id"].shape == (2,)

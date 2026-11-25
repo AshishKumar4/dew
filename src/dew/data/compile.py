@@ -1704,16 +1704,21 @@ def _compile_phases(
     def statistics() -> Mapping[str, float]:
         return statistics_of(tuple(reading.values()))
 
-    # One read serves every phase (`read`): a faster one is named only where every phase would take it.
-    first = built[0][0].reading
-    agreed = first is not None and all(
-        loaded.reading is not None and loaded.reading.faster == first.faster for loaded, _ in built)
-    shared = None if first is None else dataclasses.replace(first, faster=first.faster if agreed else None)
     return dataclasses.replace(built[0][0], train=training, statistics=statistics, tail=built[-1][0].tail,
-                               order_records=None, reading=shared,
+                               order_records=None, reading=_phases_read([loaded for loaded, _ in built]),
                                token_ends=source.ends if tokens else None, batches=batches, stages=stages,
                                token_batches=tuple(loaded.batch_tokens for loaded, _ in built),
                                widths=merge_facts(loaded.widths for loaded, _ in built))
+
+
+def _phases_read(loaders: Sequence[Loader]) -> TrainingRead | None:
+    """The training read of phases each `loaders` reads, its first's: one read serves every phase, so a faster
+    one is named only where every phase would take it."""
+    first = loaders[0].reading
+    if first is None:
+        return None
+    agreed = all(loaded.reading is not None and loaded.reading.faster == first.faster for loaded in loaders)
+    return dataclasses.replace(first, faster=first.faster if agreed else None)
 
 
 def _in_one_order(source: Phases, first: _Staged, staged_at: Callable[[int, Mapping[str, _Trained]], _Staged]

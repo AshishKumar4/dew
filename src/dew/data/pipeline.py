@@ -1063,7 +1063,8 @@ def allocation(count: int, weights: tuple[float, ...], capacities: tuple[int | N
         if (limit := limits.get(at)) is not None and held[at] > limit:
             spare, held[at] = spare + held[at] - limit, limit
     for at in sorted(drawn, key=lambda at: (-weights[at], at)):
-        room = spare if limits.get(at) is None else min(spare, limits[at] - held[at])
+        limit = limits.get(at)
+        room = spare if limit is None else min(spare, limit - held[at])
         held[at], spare = held[at] + room, spare - room
     return tuple(held[at] for at in range(len(weights)))
 
