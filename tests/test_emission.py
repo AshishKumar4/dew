@@ -951,6 +951,21 @@ def test_a_platform_choice_counts_the_branch_its_target_runs(platform, operation
     assert fixed.operations == operations, fixed
 
 
+def test_a_compile_only_gpu_mesh_lowers_for_cuda_unassumed():
+    """A call placed on a compile-only GPU mesh, nothing assumed, lowers for CUDA as its abstract device's
+    compute capability states, a registered GPU backend or none, so its platform choice counts its `cuda`
+    branch (the review of lane/toolkit ee127f37c)."""
+    mesh = jax.sharding.Mesh(np.array(generation.compile_only_gpus("sm90")), ("data",))
+
+    def chosen(row):
+        return lax.platform_dependent(row, cuda=lambda row: row, default=lambda row: row * 2.0 + 1.0)
+
+    with jax.sharding.use_abstract_mesh(generation.gpu_mesh(mesh, "sm90")):
+        assert generation.lowering_platform() == "cuda"
+        fixed = _emitted(chosen, _ROW).roles[0].fixed
+    assert fixed.operations == 0, fixed
+
+
 def test_a_walks_platform_chosen_mask_is_static():
     """A walk's step reading a platform-chosen index tile (an iota or its reverse, `lax.platform_dependent`)
     times a literal: the choice is its compile's, a constant, so the multiply is of the program's constants

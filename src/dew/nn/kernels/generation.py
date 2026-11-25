@@ -2151,13 +2151,10 @@ def lowering_platform() -> str | None:
     it (a GPU device stating none)."""
     import re
 
-    if (found := assumption()) is not None and not found.interpreted:
-        if found.generation.startswith('sm'):
-            return 'cuda'
-        return 'tpu' if found.generation in TARGETS and tpu(TARGETS[found.generation]) else found.generation
-    platform = placed_platform()
-    if platform != 'gpu':
+    if (platform := backend()) != 'gpu':
         return platform
+    if (found := assumption()) is not None and not found.interpreted:
+        return 'cuda'
     stated = _compute_capability(placed_device())
     return 'cuda' if stated and re.fullmatch(r'\d+\.\d+', stated) else None
 
