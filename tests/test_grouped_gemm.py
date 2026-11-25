@@ -1279,7 +1279,8 @@ def test_a_timed_product_is_recognized_over_its_receipts_rows_and_arithmetic_alo
         rows = timing.timed.fewest
         assert _dense_case(timing.generation, timing.made, timing.matrix, rows).kind.span == timing.timed.span
         others = grouped_cells.MEASURED[timing.generation, timing.made, False]
-        if not any(timed.holds(timing.matrix, rows - 1) for timed in others):
+        stored = jnp.dtype(grouped_cells.STORED[timing.made]).name
+        if not any(timed.holds(timing.matrix, rows - 1, timing.timed.dtype, stored) for timed in others):
             assert _dense_case(timing.generation, timing.made, timing.matrix, rows - 1).kind.matrix is None
         wide = _dense_case(timing.generation, timing.made, timing.matrix, rows, dtype=jnp.float32,
                            stored=jnp.float32)
