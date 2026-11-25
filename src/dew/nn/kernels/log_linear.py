@@ -132,6 +132,6 @@ def _within(q, k, v, g, weights, positions, *, scale: float, documents: int, pac
     # A key head's value heads, its queries and keys unmapped among them, so their scores are formed once a
     # key head (each value head repeating them formed log-linear-mamba2's 64 a block, an fp32 product of 234
     # us in a GH200's forward, M-JS-146ll); then a block's key heads, then every row's blocks.
-    each = jax.vmap(head, in_axes=(None, None, 1, 1, 1), out_axes=1)
-    out = jax.vmap(jax.vmap(each, in_axes=1, out_axes=1))(q, k, v, g, weights)
+    value_heads = jax.vmap(head, in_axes=(None, None, 1, 1, 1), out_axes=1)
+    out = jax.vmap(jax.vmap(value_heads, in_axes=1, out_axes=1))(q, k, v, g, weights)
     return unlaid((scale * out).reshape(rows, count * WITHIN, heads, -1))
