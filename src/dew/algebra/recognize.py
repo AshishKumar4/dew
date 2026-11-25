@@ -1191,7 +1191,7 @@ def _nonpositive_decay(bound: terms.Magnitude | None, proved: terms.Apart) -> bo
     return proved.number and (proved.sign < 0 or bound == terms.NOTHING)
 
 
-_RECURRENCE_ROUTES: collections.OrderedDict[Hashable, Held[frozenset[str] | None]] = (
+_RECURRENCE_ROUTES: collections.OrderedDict[Hashable, Held[tuple[bool, frozenset[str]]]] = (
     collections.OrderedDict())
 """Selected forward or training recurrence kernels by `(kind, operand shapes/dtypes, options, context)`."""
 
@@ -1357,14 +1357,14 @@ def _recurrence_chunk_call(*values, hooks, roles: tuple[tuple[str, int], ...], o
 
 
 def _recurrence_kernels(call: Callable, operands: Sequence[jcore.Var], options: Hashable, *,
-                        vjp: bool) -> frozenset[str] | None:
-    """Non-portable recurrence kernels selected for `call` in forward (`vjp=False`, None if none/refused) or
-    training (`vjp=True`, None if `KernelRefused`, empty set if backward uses portable `'xla'`)."""
+                        vjp: bool) -> tuple[bool, frozenset[str]]:
+    """`(admitted, kernels)` for `call` in forward (`vjp=False`, admitted only when a non-portable kernel
+    takes it) or training (`vjp=True`, admitted whenever VJP succeeds without `KernelRefused`)."""
     shapes = tuple(_shape(var) for var in operands)
     key = ("recurrence_vjp" if vjp else "recurrence_fwd",
            tuple((aval(var).shape, aval(var).dtype) for var in operands), options, fusion.choice_context())
 
-    def probe() -> frozenset[str] | None:
+    def probe() -> tuple[bool, frozenset[str]]:
         from dew.nn.kernels.selection import KernelRefused
 
         with generation.routes(alone=True) as found:
@@ -1373,11 +1373,12 @@ def _recurrence_kernels(call: Callable, operands: Sequence[jcore.Var], options: 
                 if vjp:
                     jax.eval_shape(lambda xs, ct: jax.vjp(call, *xs)[1](ct), shapes, out_shapes)
             except KernelRefused:
-                return None
+                # A kernel named or selected that refuses this call leaves the plain scan intact.
+                return False, frozenset()
             kernels = frozenset(route.kernel for route in found
                                 if route.choice in (Choice.GATED_DELTA_RULE, Choice.SSD)
                                 and route.kernel not in KEPT)
-            return kernels if (vjp or kernels) else None
+            return (vjp or bool(kernels)), kernels
 
     return _cache.holding(_RECURRENCE_ROUTES, key, probe, fusion.DECISIONS_HELD)
 
@@ -1396,9 +1397,9 @@ def _recurrence_route_admits(
     equivalence is proven; under `precision="accurate"` leaves plain token scans intact."""
     if generation.numerics().forms == "accurate":
         return False
-    fwd_kernels = _recurrence_kernels(call, operands, options, vjp=False)
-    bwd_kernels = _recurrence_kernels(call, operands, options, vjp=True)
-    if fwd_kernels is None or bwd_kernels is None:
+    fwd_ok, fwd_kernels = _recurrence_kernels(call, operands, options, vjp=False)
+    bwd_ok, bwd_kernels = _recurrence_kernels(call, operands, options, vjp=True)
+    if not (fwd_ok and bwd_ok):
         return False
     active = fwd_kernels | bwd_kernels
     if not active:
@@ -1483,7 +1484,7 @@ def _recurrence_candidates(
                         yield Candidate(
                             operands, outputs, call, declared,
                             lambda call=call, operands=operands, opts=opts: (
-                                _recurrence_kernels(call, operands, opts, vjp=False) is not None),
+                                _recurrence_kernels(call, operands, opts, vjp=False)[0]),
                             body=scan_body, key=(opts, operand_facts), training_ok=admit)
 
 
