@@ -1309,13 +1309,14 @@ def _laid_reduction(layout: fragments.TiledLayout, value, axes: Sequence[int], t
                 shuffles=rounds * words * threads)
 
 
-def _fp32_on_cuda(outputs: Sequence, target: generation.GpuTarget | None) -> bool:
+def _fp32_on_cuda(outputs: Sequence, target: generation.GpuTarget | None, fp32: bool | None = None) -> bool:
     """Whether an operation of results `outputs` is an fp32 one on a CUDA multiprocessor (`target`, else the
-    process's own), whose forms Dew measured (a division's, XLA's special functions'); fp64's and narrower
-    floats' unmeasured."""
+    process's own), whose forms Dew measured (a division's, XLA's special functions'): by `fp32` where a
+    caller states it (the algebra's evidence, whose terms hold no dtype), else by its results' dtypes; fp64's
+    and narrower floats' unmeasured."""
     held = target or generation.gpu_target()
-    return (held.architecture.multiprocessor is not None
-            and all(aval.dtype == jnp.float32 for aval in outputs))
+    typed = all(aval.dtype == jnp.float32 for aval in outputs) if fp32 is None else fp32
+    return held.architecture.multiprocessor is not None and typed
 
 
 
@@ -1365,7 +1366,8 @@ def _static(equation, given: Sequence[bool]) -> bool:
 
 
 def operation_work(primitive, inputs: Sequence, outputs: Sequence, params: Mapping,
-                   target: generation.GpuTarget | None = None, *, forms: Mapping | None = None) -> Work:
+                   target: generation.GpuTarget | None = None, *, forms: Mapping | None = None,
+                   fp32: bool | None = None) -> Work:
     """What one equation of `primitive` computes over operands and results of the avals `inputs` and
     `outputs` (each its shape and dtype), with `params`, on `target` (the process's own, or the one it
     assumes, where None: `generation.gpu_target`): the one rule the counter prices a kernel body's
@@ -1383,14 +1385,15 @@ def operation_work(primitive, inputs: Sequence, outputs: Sequence, params: Mappi
     its native form where a kernel's forms state one (a Triton kernel's, `TRITON_FORMS`), else the software
     division it lowers to (XLA's and Mosaic GPU's, `precision._correctly_rounded_divide`), counted as a
     kernel's body is, through its calls (row 12886). An integer power issues its repeated squaring's
-    multiplies, a negative one beside the division of one by them (row 12948)."""
+    multiplies, a negative one beside the division of one by them (row 12948). Whether an operation is fp32
+    its results' dtypes say, or `fp32` where a caller states it (the algebra's terms hold no dtype)."""
     if primitive is precision.correctly_rounded_divide_p:
         if (native := (forms or {}).get(primitive)) is not None:
             return repeated(native, sum(_elements(aval) for aval in outputs))
         kind = next((name for name, table in _KERNEL_FORMS.items() if forms == table), None)
         return _software_division(tuple((tuple(aval.shape), np.dtype(aval.dtype)) for aval in inputs),
                                   target or generation.gpu_target(), kind)
-    if primitive is lax.div_p and _fp32_on_cuda(outputs, target) and (
+    if primitive is lax.div_p and _fp32_on_cuda(outputs, target, fp32) and (
             (form := IEEE_DIVISION if forms is None else forms.get(primitive)) is not None):
         return repeated(form, sum(_elements(aval) for aval in outputs))
     if primitive is lax.integer_pow_p:
@@ -1399,7 +1402,7 @@ def operation_work(primitive, inputs: Sequence, outputs: Sequence, params: Mappi
         squared = _operated(lax.mul_p, inputs, outputs)
         squarings = repeated(squared, max(power.bit_length() + power.bit_count() - 2, 0))
         return squarings if params["y"] >= 0 else squarings + operation_work(
-            lax.div_p, [*inputs, *inputs], outputs, {}, target, forms=forms)
+            lax.div_p, [*inputs, *inputs], outputs, {}, target, forms=forms, fp32=fp32)
     if primitive in _OPERATIONS:
         return _operated(primitive, inputs, outputs)
     if primitive in _REDUCTIONS:
@@ -1407,7 +1410,7 @@ def operation_work(primitive, inputs: Sequence, outputs: Sequence, params: Mappi
     if primitive in SPECIAL_FUNCTIONS:
         elements = sum(_elements(aval) for aval in outputs)
         if forms is None:
-            measured = XLA_FORMS.get(primitive) if _fp32_on_cuda(outputs, target) else None
+            measured = XLA_FORMS.get(primitive) if _fp32_on_cuda(outputs, target, fp32) else None
             return Work(exponentials=elements) if measured is None else repeated(measured, elements)
         form = forms.get(primitive)
         return Work(unpriced_operations=elements) if form is None else repeated(form, elements)
