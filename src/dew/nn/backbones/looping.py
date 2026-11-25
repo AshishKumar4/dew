@@ -711,6 +711,7 @@ class _Passes:
         selected, output, gated = self.exit_of(model, x, 0, stop=False)
         first = self.sown(model, output, gated)
         assert first is not None, "a loop stopping at its threshold gates its exits"
+        assert selected is not None, "a threshold selects a state: the coda's, or the block's own"
         logits = [first]
         self.exited.append((selected, first))
         exited = reached(logits, threshold)

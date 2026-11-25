@@ -14,7 +14,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from jax.extend import core as jex_core
 from map_judge import marked_seeds
 from model_support import (
     TINY_DECODER,
@@ -25,7 +24,7 @@ from model_support import (
     model_draw,
     with_logit_cotangent,
 )
-from reference_error import assert_as_exact, with_gradients
+from reference_error import assert_as_exact, equations, with_gradients
 
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -174,23 +173,6 @@ def test_a_merge_is_its_formula(spec):
 
     assert_as_exact(jax.jit(merge.apply), by_hand(jnp.float32), draw, "a merge", seeds=SEEDS["merge"],
                     truth_fn=by_hand(jnp.float64))
-
-
-def equations(closed) -> list:
-    """Every equation of `closed`'s jaxpr, those of the jaxprs its equations hold among them."""
-    found = []
-
-    def walk(jaxpr):
-        for eqn in jaxpr.eqns:
-            found.append(eqn)
-            for value in eqn.params.values():
-                for each in value if isinstance(value, (tuple, list)) else (value,):
-                    if isinstance(each, jex_core.ClosedJaxpr):
-                        walk(each.jaxpr)
-                    elif isinstance(each, jex_core.Jaxpr):
-                        walk(each)
-    walk(closed.jaxpr)
-    return found
 
 
 def products(closed) -> list:

@@ -96,21 +96,11 @@ def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer
     # supplied layout; the scan's init=True pass would draw over it first.
     if (decoder.is_initializing() and stages == 1 and not decode
             and not decoder.has_variable('params', f'layers_{first}')):
-        # A run draws its layers under one scan where they draw alike: a layer whose start is its own
-        # (DEX's heads and lambda_init, an adapter's own factors: `drawn_like`) draws apart, and its run
-        # stacks it after.
-        drawn = tuple(decoder.drawn_like(index) for index in range(decoder.num_layers))
-        groups = tuple((first + start, count)
-                       for start, count in scan_groups(drawn[first:end], decoder.bank_layers))
-        if any(count > 1 for _, count in groups):
-            view = StackView(groups)
-            run = nn.map_variables(stacked, mapped_collections=True, trans_in_fn=view.stack,
-                                   trans_out_fn=view.unstack, init=True, mutable=True)
-            # Its providers write the store the layers after the span read (a loop's next part).
-            x, left = run(decoder, view, x, train, decode, per_layer_input, attention_metadata, prior_bank,
-                          store)
-            _taken_back(store, left)
-            return x
+        drawn = _drawn_in_runs(decoder, x, (first, end), train=train, decode=decode,
+                               per_layer_input=per_layer_input,
+                               attention_metadata=attention_metadata, prior_bank=prior_bank, store=store)
+        if drawn is not None:
+            return drawn
     if decoder.is_initializing() or (stages == 1 and not scanned()):
         return unrolled()
     staged = stored_by_stage(decoder.variables)
@@ -170,6 +160,26 @@ def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer
     x, left = run(decoder, view, x, train, decode, per_layer_input, attention_metadata, prior_bank, store)
     _taken_back(store, left)
     return outside(x, decoder.num_layers - split.suffix, decoder.num_layers)
+
+
+def _drawn_in_runs(decoder: CausalTransformer, x, span: tuple[int, int], *, train: bool, decode: bool,
+                   per_layer_input, attention_metadata, prior_bank, store):
+    """An initialization's layers [first, end) drawn under one scan a run where they draw alike, a layer
+    whose start is its own (DEX's heads and lambda_init, an adapter's own factors: `drawn_like`) apart and
+    its run stacking it after; None where no run scans. Its providers write `store`, which the layers
+    after the span read (a loop's next part)."""
+    first, end = span
+    drawn = tuple(decoder.drawn_like(index) for index in range(decoder.num_layers))
+    groups = tuple((first + start, count)
+                   for start, count in scan_groups(drawn[first:end], decoder.bank_layers))
+    if not any(count > 1 for _, count in groups):
+        return None
+    view = StackView(groups)
+    run = nn.map_variables(stacked, mapped_collections=True, trans_in_fn=view.stack,
+                           trans_out_fn=view.unstack, init=True, mutable=True)
+    x, left = run(decoder, view, x, train, decode, per_layer_input, attention_metadata, prior_bank, store)
+    _taken_back(store, left)
+    return x
 
 
 @nn.compact

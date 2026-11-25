@@ -24,7 +24,6 @@ from model_support import (
     attending,
     compiled_apply,
     decode_steps,
-    method_run,
     model_draw,
     unrolled as layer_at_a_time,
     with_logit_cotangent,
@@ -701,7 +700,7 @@ def test_the_exit_objective_is_the_expected_cross_entropy_less_its_entropy(name,
                     truth_fn=jax.jit(formula(looped.clone(dtype=jnp.float64))))
 
 
-EXITING_SEEDS = {"forward": 8, "decode": 8, "shared": 8}
+EXITING_SEEDS = {"decode": 8, "shared": 8}
 """Check 1's declared seeds for a loop that exits each token at its threshold, sized by `seeds_for` on
 armada."""
 
@@ -752,19 +751,6 @@ def _passes_exiting(module, ids):
     for y, reached in reversed(leaving):
         out = jnp.where(reached[..., None], y, out)
     return module.logits_from_hidden(module.norm(out))
-
-
-@attending("reference")
-def test_a_loop_exits_each_token_at_its_threshold_through_each_passs_coda():
-    """Qwen 3.5 looping a block before its coda, each pass weighed by its exit gate through its own coda:
-    its logits, each token at the pass its threshold exits at, on par with the passes and codas unrolled
-    here from the stack's own spans (`_passes_exiting`, check 1 against it in float64)."""
-    looped = _exiting()
-    draw = _with_gate(model_draw(looped, (8, 16), looped.vocab_size), looped.emb_features, 0xE81)
-
-    assert_as_exact(jax.jit(looped.apply), method_run(looped, _passes_exiting), draw,
-                    "a loop exiting at its threshold", seeds=EXITING_SEEDS["forward"],
-                    truth_fn=method_run(looped.clone(dtype=jnp.float64), _passes_exiting))
 
 
 @attending("reference")

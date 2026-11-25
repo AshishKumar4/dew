@@ -12,7 +12,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from jax.extend import core as jex_core
 from model_support import (
     TINY_DECODER,
     attending,
@@ -22,7 +21,8 @@ from model_support import (
     stacked,
     with_logit_cotangent,
 )
-from reference_error import assert_as_exact, with_gradients
+from reference_error import assert_as_exact, equations, with_gradients
+from test_loop import _exiting, _passes_exiting
 
 from dew.interop.hf_decoders import translate_config
 from dew.nn.backbones.call_metadata import call_metadata
@@ -35,7 +35,7 @@ from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS
 
 FIXTURES = Path(__file__).with_name("fixtures") / "hf"
 
-SEEDS = {"rows": 8, "first pass": 8, "last pass": 8, "sharing": 8, "sharing backward": 8,
+SEEDS = {"coda": 8, "block": 8, "first pass": 8, "last pass": 8, "sharing": 8, "sharing backward": 8,
          "sharing decode": 8, "sharing parts": 8, "counted sharing": 8, "cross rows": 8}
 """Check 1's declared seeds for each site of the file."""
 
@@ -102,50 +102,30 @@ def _rows_by_hand(module, ids):
 
 
 @attending("reference")
-def test_a_row_exits_whole_at_its_threshold_and_its_coda_runs_once():
-    """A gate on the block's output exiting each row whole (`Loop.exit_at='block'`, `exit_by='row'`):
-    every row's logits read its exiting pass's block output through one coda, on par with the passes
-    unrolled here from the stack's own spans (`_rows_by_hand`, check 1 against it in float64), rows of a
-    batch exiting at different passes and those still looping run apart (row 12927)."""
-    looped = _rows_exiting()
-    draw = _gated(model_draw(looped, (8, 12), looped.vocab_size), looped.emb_features, 0xE91)
-
-    assert_as_exact(jax.jit(looped.apply), method_run(looped, _rows_by_hand), draw,
-                    "rows exiting at the block", seeds=SEEDS["rows"],
-                    truth_fn=method_run(looped.clone(dtype=jnp.float64), _rows_by_hand))
+@pytest.mark.parametrize("exit_at", ["coda", "block"])
+def test_a_loop_exits_at_its_threshold_as_its_passes_unrolled_do(exit_at):
+    """Qwen 3.5 looping a block before its coda under an exit gate, on par with its passes unrolled here from
+    the stack's own spans (check 1 against them in float64): each token at the pass its threshold exits at,
+    each pass weighed through its own coda (`exit_at='coda'`, `test_loop._passes_exiting`), or each row
+    whole at its block's output, read through one coda (`exit_at='block'`, `exit_by='row'`, `_rows_by_hand`,
+    rows of a batch exiting at different passes and those still looping run apart, row 12927)."""
+    looped, by_hand, shape, salt = ((_exiting(), _passes_exiting, (8, 16), 0xE81) if exit_at == "coda"
+                                    else (_rows_exiting(), _rows_by_hand, (8, 12), 0xE91))
+    draw = _gated(model_draw(looped, shape, looped.vocab_size), looped.emb_features, salt)
+    assert_as_exact(jax.jit(looped.apply), method_run(looped, by_hand), draw,
+                    f"a loop exiting at its {exit_at}", seeds=SEEDS[exit_at],
+                    truth_fn=method_run(looped.clone(dtype=jnp.float64), by_hand))
 
 
 def _conds(closed) -> list:
     """Every conditional of `closed`'s jaxpr, those of the jaxprs it holds among them."""
-    found = []
-
-    def walk(jaxpr):
-        for eqn in jaxpr.eqns:
-            if eqn.primitive.name == "cond":
-                found.append(eqn)
-            for value in eqn.params.values():
-                for each in value if isinstance(value, (tuple, list)) else (value,):
-                    if isinstance(each, jex_core.ClosedJaxpr):
-                        walk(each.jaxpr)
-                    elif isinstance(each, jex_core.Jaxpr):
-                        walk(each)
-    walk(closed.jaxpr)
-    return found
+    return [eqn for eqn in equations(closed) if eqn.primitive.name == "cond"]
 
 
 def _rows_of_products(jaxpr) -> set[int]:
     """The leading sizes of every dot product's operands in `jaxpr`, those it holds among them."""
-    sizes = set()
-    for eqn in jaxpr.eqns:
-        if eqn.primitive.name == "dot_general":
-            sizes |= {var.aval.shape[0] for var in eqn.invars if var.aval.shape}
-        for value in eqn.params.values():
-            for each in value if isinstance(value, (tuple, list)) else (value,):
-                if isinstance(each, jex_core.ClosedJaxpr):
-                    sizes |= _rows_of_products(each.jaxpr)
-                elif isinstance(each, jex_core.Jaxpr):
-                    sizes |= _rows_of_products(each)
-    return sizes
+    return {var.aval.shape[0] for eqn in equations(jaxpr) if eqn.primitive.name == "dot_general"
+            for var in eqn.invars if var.aval.shape}
 
 
 def test_a_loop_runs_no_pass_after_every_token_exits():

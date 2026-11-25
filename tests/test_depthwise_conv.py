@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from jax.core import ShapedArray
 from reference_error import assert_fp32_reduction_bound
 
 from dew.nn.conv import Conv, _conv_general_dilated, _materialized_depthwise_3x3, _polyphase_depthwise_3x3
@@ -197,7 +198,8 @@ def test_the_polyphase_form_convolves_at_its_layers_precision():
     with jax.default_matmul_precision("bfloat16"):
         found = [each for each in equations(jax.make_jaxpr(run)(x, w).jaxpr)
                  if each.primitive.name == "conv_general_dilated"]
-    polyphase = [each for each in found if each.invars[0].aval.shape[0] == 4]
+    polyphase = [each for each in found
+                 if isinstance(aval := each.invars[0].aval, ShapedArray) and aval.shape[0] == 4]
     assert polyphase, "no polyphase convolution traced"
     exact = jax.lax.Precision.HIGHEST
     assert all(each.params["precision"] in (exact, (exact, exact)) for each in polyphase)
