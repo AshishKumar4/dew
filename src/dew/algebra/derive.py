@@ -751,7 +751,7 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
         made = forms(shapes)
         avals = [jax.ShapeDtypeStruct(*shapes[name]) for name in names]
         slot_terms = (*made.reductions, *made.anchors, *made.scales)
-        slot_floors = (*made.floors, *(0.0,) * len(made.anchors), *(1.0,) * len(made.scales))
+        slot_floors = (*made.floors, *(math.inf,) * len(made.anchors), *(1.0,) * len(made.scales))
         typed = jax.eval_shape(lambda *values: tuple(evaluated(made.region, reduction,
                                                                [*made.consts, *values], {})
                                                      for reduction in slot_terms), *avals)

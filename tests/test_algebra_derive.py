@@ -1344,11 +1344,12 @@ def test_zero_mass_scaled_covariance_ad_and_clamp_explicit_sharding():
             np.testing.assert_array_equal(np.asarray(gx), np.zeros((1, 2), np.float32))
             np.testing.assert_array_equal(np.asarray(gy), np.zeros((1, 2), np.float32))
 
-    # Multi-tile zero-mass + positive-mass witnesses, finite scaled derivative, and `2^127` sign cancel.
+    # Multi-tile zero-mass + positive-mass witnesses, finite scaled derivatives, and `2^127` sign cancel.
     huge = np.float32(2.0 ** 127)
     for x_vals, y_vals, w_vals, dw_vals, expect in (
         ([big, 0.0, big], [big, 0.0, big], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0], 0.0),
         ([big, 0.0, 0.0], [big, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0], 0.0),
+        ([big, 0.0], [big, 0.0], [0.0, 0.0], [2.0 ** -70, 0.0], float(big)),
         ([big, 0.0], [big, 0.0], [0.0, 1.0], [2.0 ** -70, 0.0], float(big)),
         ([huge, huge], [huge, -huge], [0.0, 1.0], [1.0, 0.0], 0.0),
     ):
@@ -1366,7 +1367,7 @@ def test_zero_mass_scaled_covariance_ad_and_clamp_explicit_sharding():
     lo_v = jnp.asarray([[0.0, 0.0], [0.0, 0.0]], jnp.float32)
     mid_v = jnp.asarray([[-1.0, 2.0], [0.5, 4.0]], jnp.float32)
     hi_v = jnp.asarray([[1.0, 1.0], [1.0, 1.0]], jnp.float32)
-    region = terms.Region(jax.make_jaxpr(jax.lax.clamp)(lo_v, mid_v, hi_v).jaxpr)
+    region = terms.region(jax.make_jaxpr(jax.lax.clamp)(lo_v, mid_v, hi_v))
     out_term = region.outputs[0]
     assert out_term is not None
     mesh = jax.make_mesh((1,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:1])
