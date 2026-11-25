@@ -975,10 +975,18 @@ def _token_aligned(passes: _Passes, x: jax.Array) -> bool:
 
 
 def _coordinates(node) -> bool:
-    """Whether `node` is a call's token coordinates (`dew.batch.Coordinates`), every array of which is a
-    row's own (its tokens' fields `[B, S]`, its documents' `firsts` and forks' parents `[B, D]`, each
-    numbered within its row): `compacted` gathers them by row whole."""
+    """Whether `node` is a call's token coordinates (`dew.batch.Coordinates`), whose arrays are its rows'
+    own (its tokens' fields `[B, S]`, its documents' `firsts` and forks' parents `[B, D]`, each numbered
+    within its row) but for positions every row shares (`[S]`, `Coordinates.places`): `compacted` gathers
+    them by row (`_coordinates_of_rows`)."""
     return isinstance(node, Coordinates)
+
+
+def _coordinates_of_rows(coordinates: Coordinates, picked: jax.Array) -> Coordinates:
+    """`coordinates` of the rows `picked`: each array of a row a field (two axes or more) gathered by row,
+    the positions every row shares (one axis, `[S]`) kept."""
+    return jax.tree.map(lambda array: jnp.asarray(array)[picked] if jnp.ndim(array) >= 2 else array,
+                        coordinates)
 
 
 def compacted(ran: Callable, module, carry, normed, rows: jax.Array, passes: _Passes):
@@ -987,9 +995,9 @@ def compacted(ran: Callable, module, carry, normed, rows: jax.Array, passes: _Pa
     B // 2, ..., 1]`, one program a size under `lax.switch`), with every array of the call's inputs, the
     prelude's publications, the block's input and the step norm's `normed` whose leading axes are the
     call's rows and tokens, and scattered back: a pass over fewer rows computes fewer, a row that exited
-    none (row 12927). The call's coordinates gather by row whole (`_coordinates`). A row in the bucket beside
-    them runs the pass too, its state no output reads. A call holding a row-holding array beside them
-    (`_token_aligned`) runs its passes over every row."""
+    none (row 12927). The call's coordinates gather by row (`_coordinates_of_rows`). A row in the bucket
+    beside them runs the pass too, its state no output reads. A call holding a row-holding array beside
+    them (`_token_aligned`) runs its passes over every row."""
     x, _ = carry
     batch, length = x.shape[:2]
     sizes = [batch]
@@ -1008,7 +1016,7 @@ def compacted(ran: Callable, module, carry, normed, rows: jax.Array, passes: _Pa
     def taken(tree, picked):
         def row_of(leaf):
             if _coordinates(leaf):
-                return jax.tree.map(lambda array: jnp.asarray(array)[picked], leaf)
+                return _coordinates_of_rows(leaf, picked)
             return jnp.asarray(leaf)[picked] if rowed(leaf) else leaf
         return jax.tree.map(row_of, tree, is_leaf=_coordinates)
 

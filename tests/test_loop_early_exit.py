@@ -172,17 +172,20 @@ def test_a_loop_runs_no_pass_after_every_token_exits():
     assert zeros(30.0) > zeros(-30.0)
 
 
-@pytest.mark.parametrize("opened", [(), (EXIT_PASSES,)], ids=["closed", "exit passes"])
-def test_a_pass_runs_over_the_rows_still_looping_alone(opened):
+@pytest.mark.parametrize(("opened", "shared"), [((), False), ((EXIT_PASSES,), False), ((EXIT_PASSES,), True)],
+                         ids=["closed", "exit passes", "exit passes, shared positions"])
+def test_a_pass_runs_over_the_rows_still_looping_alone(opened, shared):
     """Scoring whose rows exit whole (`exit_by='row'`) runs each later pass over the batch's halvings, the
     smallest that holds its rows still looping (`compacted`, row 12927): eight rows' pass a program for
     eight, four, two and one, each branch's products over its own rows. So too where the call opens the
     exit passes alone, as a decision model's scoring does (`DecisionModel.exit_logits`), which are sown
     once over every row after the passes: its logits and each row's exit pass those of a call whose passes
-    run over every row (one opening a collection beside them, which a pass may write a row of)."""
+    run over every row (one opening a collection beside them, which a pass may write a row of), whether
+    the call's positions are each row's or one `[S]` every row shares, which no bucket gathers."""
     looped = _rows_exiting()
     variables, ids = _gated(model_draw(looped, (8, 12), looped.vocab_size), looped.emb_features, 0xE95)(0)
-    scored = functools.partial(looped.apply, mutable=list(opened)) if opened else looped.apply
+    fields = {"positions": jnp.arange(ids.shape[1]) + 3} if shared else {}
+    scored = functools.partial(looped.apply, mutable=list(opened), **fields) if opened else looped.apply
     buckets = [eqn for eqn in _conds(jax.make_jaxpr(scored)(variables, ids))
                if len(eqn.params["branches"]) == 4]
     # One a later pass, each branch's products over its bucket's rows (or its rows' tokens, flattened).
@@ -192,7 +195,7 @@ def test_a_pass_runs_over_the_rows_still_looping_alone(opened):
             rows = _rows_of_products(branch.jaxpr)
             assert size in rows or size * ids.shape[1] in rows
     if opened:
-        compact, whole = (jax.jit(functools.partial(looped.apply, mutable=mutable))(variables, ids)
+        compact, whole = (jax.jit(functools.partial(looped.apply, mutable=mutable, **fields))(variables, ids)
                           for mutable in ([EXIT_PASSES], [EXIT_PASSES, "intermediates"]))
         chosen = np.asarray(compact[1][EXIT_PASSES]["chosen"][0])
         assert len(np.unique(chosen)) > 1
