@@ -121,12 +121,11 @@ ROW_BLOCKS = 12
 """The heuristic reverse's row blocks a program walks at least, so the two fp32
 partial rows it writes stay a small share of what it reads."""
 MAX_PROGRAMS = 1024
-ELEMENT_BLOCK = 1024
-PACKED_BLOCK = 4096
-"""The packed SwiGLU's heuristic columns a program. Of the configs measured at Qwen3.5-0.8B's
-24576 rows of 2 x 3584 (bf16, 2026-10-15), a whole row of 4096 with four warps was the fastest
-forward on an A100 80GB and an H100 and within 1% of the fastest reverse, level with the apart
-kernel's best (forward 0.323 against 0.315 ms on the A100, 0.181 against 0.178 on the H100), where
+ROW_BLOCK = 4096
+"""A SwiGLU launch's heuristic columns a program, a row's block (apart or packed). Of the configs measured
+at Qwen3.5-0.8B's 24576 rows of 2 x 3584 (bf16, 2026-10-15), a whole row of 4096 with four warps was the
+fastest packed forward on an A100 80GB and an H100 and within 1% of the fastest reverse, level with the
+apart kernel's best (forward 0.323 against 0.315 ms on the A100, 0.181 against 0.178 on the H100), where
 512 columns, the largest power of two dividing the width, lost 3 to 10%."""
 
 
@@ -1327,31 +1326,39 @@ def _gradients(gate, up, dy):
     return dy * slope * up, dy * activated
 
 
+def _row_block(width: int, block: int):
+    """A program's row of a `[rows, width]` launch (`_Rows`), its block of columns and their mask: a row and
+    a column index, whose offset the lowering widens to 64 bits where an operand passes 2^32 bytes, so no
+    index outgrows int32 however many elements the operands hold (row 12971: 168 x 4096 rows of 9216, 6.3e9
+    elements, overflowed a flat launch's int32 index)."""
+    columns = pl.program_id(1) * block + jnp.arange(block)
+    return pl.program_id(0), columns, columns < width
+
+
 def _swiglu_forward(gate_ref, up_ref, y_ref, *, block: int, interpret: bool):
-    index = pl.program_id(0) * block + jnp.arange(block)
-    mask = index < gate_ref.shape[0]
-    gate = plgpu.load(gate_ref.at[index], mask=mask, other=0).astype(jnp.float32)
-    up = plgpu.load(up_ref.at[index], mask=mask, other=0).astype(jnp.float32)
-    plgpu.store(y_ref.at[index], _product(gate, up, gate_ref.dtype, interpret).astype(y_ref.dtype), mask=mask)
+    row, columns, mask = _row_block(gate_ref.shape[1], block)
+    gate = plgpu.load(gate_ref.at[row, columns], mask=mask, other=0).astype(jnp.float32)
+    up = plgpu.load(up_ref.at[row, columns], mask=mask, other=0).astype(jnp.float32)
+    y = _product(gate, up, gate_ref.dtype, interpret)
+    plgpu.store(y_ref.at[row, columns], y.astype(y_ref.dtype), mask=mask)
 
 
 def _swiglu_backward(gate_ref, up_ref, dy_ref, dg_ref, du_ref, *, block: int, interpret: bool):
-    index = pl.program_id(0) * block + jnp.arange(block)
-    mask = index < gate_ref.shape[0]
-    gate = plgpu.load(gate_ref.at[index], mask=mask, other=0).astype(jnp.float32)
-    up = plgpu.load(up_ref.at[index], mask=mask, other=0).astype(jnp.float32)
-    dy = plgpu.load(dy_ref.at[index], mask=mask, other=0).astype(jnp.float32)
+    row, columns, mask = _row_block(gate_ref.shape[1], block)
+    gate = plgpu.load(gate_ref.at[row, columns], mask=mask, other=0).astype(jnp.float32)
+    up = plgpu.load(up_ref.at[row, columns], mask=mask, other=0).astype(jnp.float32)
+    dy = plgpu.load(dy_ref.at[row, columns], mask=mask, other=0).astype(jnp.float32)
     dg, du = _gradients(gate, up, dy)
-    plgpu.store(dg_ref.at[index], dg.astype(gate_ref.dtype), mask=mask)
-    plgpu.store(du_ref.at[index], du.astype(up_ref.dtype), mask=mask)
+    plgpu.store(dg_ref.at[row, columns], dg.astype(dg_ref.dtype), mask=mask)
+    plgpu.store(du_ref.at[row, columns], du.astype(du_ref.dtype), mask=mask)
 
 
 def _halves(gate_up_ref, block: int):
     """A packed program's row of `[rows, 2 * width]`, its block of columns, their mask, and the
     gate's and up's columns: contiguous runs, which the loads vectorize."""
     width = gate_up_ref.shape[1] // 2
-    columns = pl.program_id(1) * block + jnp.arange(block)
-    return pl.program_id(0), columns, columns < width, columns + width
+    row, columns, mask = _row_block(width, block)
+    return row, columns, mask, columns + width
 
 
 def _packed_forward(gate_up_ref, y_ref, *, block: int, interpret: bool):
@@ -1373,17 +1380,21 @@ def _packed_backward(gate_up_ref, dy_ref, d_ref, *, block: int, interpret: bool)
 
 
 @dataclasses.dataclass(frozen=True)
-class _Elementwise(tuning.KernelOp):
-    """An elementwise launch over flat operands: `ELEMENT_BLOCK` elements and
-    four warps a program."""
+class _Rows(tuning.KernelOp):
+    """An elementwise launch over `[rows, width]` operands (`_row_block`): a program a row's block of
+    columns, the whole row up to `ROW_BLOCK` columns, four warps."""
 
     config_cls: ClassVar[type[BlockConfig]] = BlockConfig
 
+    def _width(self, ba) -> int:
+        """The columns a row of the call's output holds."""
+        return ba.arguments['gate'].shape[1]
+
     def _get_heuristics_config(self, ba) -> BlockConfig:
-        return BlockConfig(ELEMENT_BLOCK, 4)
+        return BlockConfig(min(ROW_BLOCK, pl.next_power_of_2(self._width(ba))), 4)
 
     def variants(self, ba) -> tuple[BlockConfig, ...]:
-        return _neighbours(ba.heuristics_config, block=(128, 4 * PACKED_BLOCK), warps=WARPS)
+        return _neighbours(ba.heuristics_config, block=(128, 4 * ROW_BLOCK), warps=WARPS)
 
 
 def _launch(kernel, name: str, operands, outputs, grid: tuple[int, ...], config: BlockConfig,
@@ -1392,39 +1403,42 @@ def _launch(kernel, name: str, operands, outputs, grid: tuple[int, ...], config:
                      interpret=interpret, arithmetic=(('block', config.block),)), None
 
 
+def _row_grid(rows: int, width: int, config: BlockConfig) -> tuple[int, int]:
+    """A `_Rows` launch's grid: a program a row's block of columns."""
+    return rows, pl.cdiv(width, config.block)
+
+
 @dataclasses.dataclass(frozen=True)
-class SwigluForward(_Elementwise):
-    """SwiGLU's forward launch over flat `gate` and `up` (`_swiglu_forward`)."""
+class SwigluForward(_Rows):
+    """SwiGLU's forward launch over `[rows, width]` `gate` and `up` (`_swiglu_forward`)."""
 
     ROWS: ClassVar[tuple[str, ...]] = ('gate', 'up')
 
     def _fwd(self, gate: jax.Array, up: jax.Array, *, interpret: bool, config: BlockConfig,
              return_residuals: bool = False):
-        return _launch(_swiglu_forward, "swiglu_forward", (gate, up),
-                       _Out(gate.dtype, ((0, 0),)), (pl.cdiv(gate.size, config.block),),
-                       config, interpret)
+        return _launch(_swiglu_forward, "swiglu_forward", (gate, up), _Out(gate.dtype, ((0, 0), (0, 1))),
+                       _row_grid(*gate.shape, config), config, interpret)
 
 
 @dataclasses.dataclass(frozen=True)
-class SwigluBackward(_Elementwise):
+class SwigluBackward(_Rows):
     """SwiGLU's reverse launch (`_swiglu_backward`): both inputs' gradients."""
 
     ROWS: ClassVar[tuple[str, ...]] = ('gate', 'up', 'dy')
 
     def _fwd(self, gate: jax.Array, up: jax.Array, dy: jax.Array, *, interpret: bool, config: BlockConfig,
              return_residuals: bool = False):
-        outputs = (_Out(gate.dtype, ((0, 0),)), _Out(up.dtype, ((1, 0),)))
+        outputs = (_Out(gate.dtype, ((0, 0), (0, 1))), _Out(up.dtype, ((1, 0), (1, 1))))
         return _launch(_swiglu_backward, "swiglu_backward", (gate, up, dy), outputs,
-                       (pl.cdiv(gate.size, config.block),), config, interpret)
+                       _row_grid(*gate.shape, config), config, interpret)
 
 
 @dataclasses.dataclass(frozen=True)
-class _Packed(_Elementwise):
-    """A packed projection's launch over `[rows, 2 * width]`, gate then up in each row: a program a
-    row's block of columns, the whole row up to `PACKED_BLOCK` columns."""
+class _Packed(_Rows):
+    """A packed projection's launch over `[rows, 2 * width]`, gate then up in each row (`_halves`)."""
 
-    def _get_heuristics_config(self, ba) -> BlockConfig:
-        return BlockConfig(min(PACKED_BLOCK, pl.next_power_of_2(ba.arguments['gate_up'].shape[1] // 2)), 4)
+    def _width(self, ba) -> int:
+        return ba.arguments['gate_up'].shape[1] // 2
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1435,10 +1449,9 @@ class PackedSwigluForward(_Packed):
 
     def _fwd(self, gate_up: jax.Array, *, interpret: bool, config: BlockConfig,
              return_residuals: bool = False):
-        rows, width = gate_up.shape[0], gate_up.shape[1] // 2
         return _launch(_packed_forward, "swiglu_forward", (gate_up,),
                        _Out(gate_up.dtype, ((0, 0), (0, 1, 2))),
-                       (rows, pl.cdiv(width, config.block)), config, interpret)
+                       _row_grid(gate_up.shape[0], gate_up.shape[1] // 2, config), config, interpret)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1450,8 +1463,7 @@ class PackedSwigluBackward(_Packed):
     def _fwd(self, gate_up: jax.Array, dy: jax.Array, *, interpret: bool, config: BlockConfig,
              return_residuals: bool = False):
         return _launch(_packed_backward, "swiglu_backward", (gate_up, dy),
-                       _Out(gate_up.dtype, ((0, 0), (0, 1))),
-                       (gate_up.shape[0], pl.cdiv(dy.shape[1], config.block)), config, interpret)
+                       _Out(gate_up.dtype, ((0, 0), (0, 1))), _row_grid(*dy.shape, config), config, interpret)
 
 
 _SWIGLU_FORWARD = SwigluForward()
@@ -1460,13 +1472,18 @@ _PACKED_FORWARD = PackedSwigluForward()
 _PACKED_BACKWARD = PackedSwigluBackward()
 
 
+def _by_rows(value):
+    """`value` as a `_Rows` launch's `[rows, width]` operand: its last axis a row's, a vector one row."""
+    return value.reshape(-1, value.shape[-1]) if value.ndim else value.reshape(1, 1)
+
+
 def _swiglu(gate, up, interpret: bool):
-    return _SWIGLU_FORWARD(gate.reshape(-1), up.reshape(-1), interpret=interpret).reshape(gate.shape)
+    return _SWIGLU_FORWARD(_by_rows(gate), _by_rows(up), interpret=interpret).reshape(gate.shape)
 
 
 def _swiglu_bwd(interpret: bool, residual, dy):
     gate, up = residual
-    dg, du = _SWIGLU_BACKWARD(gate.reshape(-1), up.reshape(-1), dy.reshape(-1), interpret=interpret)
+    dg, du = _SWIGLU_BACKWARD(_by_rows(gate), _by_rows(up), _by_rows(dy), interpret=interpret)
     return dg.reshape(gate.shape), du.reshape(up.shape)
 
 

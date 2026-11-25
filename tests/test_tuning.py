@@ -123,7 +123,7 @@ def test_a_pin_of_another_kind_within_a_pinned_block_keeps_the_blocks_pins():
     with (tuning.pinned({norm_swiglu.RmsForward: norm_swiglu.RowsConfig(1, 1)}),
           tuning.pinned({norm_swiglu.SwigluForward: norm_swiglu.BlockConfig(4096, 8)})):
         nested = launches(step(), *operands(15))
-    assert nested["rms_norm_forward"] == ((15,), 1) and nested["swiglu_forward"] == ((1,), 8), nested
+    assert nested["rms_norm_forward"] == ((15,), 1) and nested["swiglu_forward"] == ((15, 1), 8), nested
 
 
 def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
@@ -148,7 +148,7 @@ def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
     keys = {kind: dict(ba.autotuning_cache_key) for kind, ba in ops.items()}
     assert keys[norm_swiglu.RmsForward]["x"].shape == (16, 64)
     assert keys[norm_swiglu.RmsBackward]["dy"].shape == (16, 64)
-    assert keys[norm_swiglu.SwigluBackward]["gate"].shape == (2048,)
+    assert keys[norm_swiglu.SwigluBackward]["gate"].shape == (16, 96)
     assert keys == {type(ba.op): dict(ba.autotuning_cache_key) for ba in thirteen}
 
     usual = launches(step(), *operands(15))
@@ -158,7 +158,7 @@ def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
                         norm_swiglu.SwigluForward: norm_swiglu.BlockConfig(4096, 8)}):
         pinned = launches(step(), *operands(15))
     assert pinned["rms_norm_forward"] == ((15,), 1) and pinned["rms_norm_backward"] == ((15,), 2)
-    assert pinned["swiglu_forward"] == ((1,), 8) and pinned["swiglu_backward"] == usual["swiglu_backward"]
+    assert pinned["swiglu_forward"] == ((15, 1), 8) and pinned["swiglu_backward"] == usual["swiglu_backward"]
     with (tuning.pinned({norm_swiglu.RmsForward: norm_swiglu.BlockConfig(1024, 4)}),
           pytest.raises(tuning.Unpinnable) as refused):
         launches(step(), *operands(15))
@@ -172,7 +172,7 @@ def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
                              norm_swiglu.SwigluForward: norm_swiglu.BlockConfig(4096, 8)}),
               tuning.pinned_where_taken(rms.op, rms)):
             taken = launches(step(), *operands(15))
-        assert taken["rms_norm_forward"] == rows and taken["swiglu_forward"] == ((1,), 8)
+        assert taken["rms_norm_forward"] == rows and taken["swiglu_forward"] == ((15, 1), 8)
     # The op's own config (a measured candidate's) likewise: kept where it can take it, else its own.
     for own, kept in ((norm_swiglu.BlockConfig(1024, 4), None), (norm_swiglu.RowsConfig(1, 1),
                                                                  norm_swiglu.RowsConfig(1, 1))):
@@ -201,7 +201,7 @@ def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
     heuristics = json.loads(json.dumps(heuristics))
     for rows in ("13", "15"):
         assert stored[rows]["rms_norm_forward"] == [[-(-int(rows) // 8)], 4]
-        assert stored[rows]["swiglu_backward"] == [[-(-int(rows) * 96 // 512)], 4]
+        assert stored[rows]["swiglu_backward"] == [[int(rows), 1], 4]
         assert stored[rows]["rms_norm_backward"] == [[1], 8]
     assert stored["40"] == heuristics["40"]
     assert tuned is True
