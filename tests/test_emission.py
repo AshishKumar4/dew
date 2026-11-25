@@ -878,6 +878,27 @@ def test_a_mosaic_launch_states_the_warps_its_issue_spreads_over():
         assert emission.warps_of(kernel) == warps, (both, emission.warps_of(kernel))
 
 
+def test_a_programs_launches_price_in_sequence_and_an_uncounted_one_leaves_it_unknown():
+    """A program of two costed launches (`emission.launches_seconds`) prices each at its own launch's seconds
+    (`cost.launch_seconds` of its work, programs and warps), their sum; one launch its emission does not count
+    leaves the program's price unknown, never 0."""
+    target = generation.gpu_target("NVIDIA GH200 480GB")
+    row = jax.ShapeDtypeStruct((128,), jnp.float32)
+
+    def doubled(x_ref, o_ref):
+        o_ref[...] = lax.fori_loop(0, 8, lambda index, value: value * 2.0, x_ref[...])
+
+    launch = plgpu.kernel(doubled, out_type=row, num_threads=1, thread_name="wg")
+    counted = emission.costed(launch, Stated(steps=8, bytes_accessed=1024))
+    traced = jax.make_jaxpr(lambda x: counted(counted(x)))(row).jaxpr
+    kernels = [equation for equation in programs.equations(traced) if "cost_estimate" in equation.params]
+    each = [cost.launch_seconds(emission.work_of(kernel), emission.launch_programs(kernel), target,
+                                warps=emission.warps_of(kernel) or 0.0) for kernel in kernels]
+    assert len(kernels) == 2 and emission.launches_seconds(traced, target) == each[0] + each[1], each
+    uncounted = jax.make_jaxpr(lambda x: launch(counted(x)))(row).jaxpr
+    assert emission.launches_seconds(uncounted, target) is None
+
+
 @pytest.mark.parametrize(("generation_name", "lanes"), [("sm80", 64), ("sm86", 128), ("sm89", 128),
                                                         ("sm90", 128), ("sm100", 128), ("sm120", 128)])
 def test_an_fp32_instruction_takes_a_lane_a_clock_a_fused_pair_one(generation_name, lanes):
