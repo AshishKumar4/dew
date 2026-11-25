@@ -2200,14 +2200,14 @@ def _tpu_specs(documents, rows, heads):
 class SelectiveCase:
     """A selective scan (Mamba's, `dew.nn.mixers.mamba.selective_scan`) as its selector reads it
     (`SELECTIVE`): whether a shard_map that checks varying axes holds its operands, its operands' dtype and
-    its states' rows' narrower one (B's or C's, which stream each in its own: the narrower's rows are the
-    shorter), its tokens, channels and states, whether the run's forms are the fast ones (its template forms
-    its products whole in fp32 whatever the run's precision)
-    and its device's instruction family (None off a GPU); the forward and the training step route alike."""
+    its states' rows' (B's and C's, which stream each in its own), its tokens, channels and states, whether
+    the run's forms are the fast ones (its template forms its products whole in fp32 whatever the run's
+    precision) and its device's instruction family (None off a GPU); the forward and the training step
+    route alike."""
 
     varying: bool
     dtype: np.dtype
-    state_dtype: np.dtype
+    state_dtypes: tuple[np.dtype, np.dtype]
     length: int
     channels: int
     states: int
@@ -2241,9 +2241,11 @@ SELECTIVE_SUPPORTS: tuple[Requirement[SelectiveCase], ...] = (
     Requirement('states', lambda case: case.states <= SELECTIVE_STATES,
                 lambda case: f"{case.states} states, past the {SELECTIVE_STATES} a thread's registers hold "
                              "three times", row='ledger 1300'),
-    Requirement('state rows', lambda case: copies.whole_rows(case.states, case.state_dtype),
-                lambda case: f"{case.states} states of {case.state_dtype}, a B or C row of no whole number "
-                             f"of a bulk copy's {copies.ROW_BYTES} bytes, which its streams copy unpadded",
+    Requirement('state rows',
+                lambda case: all(copies.whole_rows(case.states, dtype) for dtype in case.state_dtypes),
+                lambda case: f"{case.states} states of B's and C's {case.state_dtypes}, a row of no whole "
+                             f"number of a bulk copy's {copies.ROW_BYTES} bytes, which its streams copy "
+                             "unpadded",
                 row='ledger 1300'),
     Requirement('tokens', lambda case: case.length >= _selective().CHUNK,
                 lambda case: f"{case.length} tokens, fewer than a chunk of {_selective().CHUNK}: a decode "
@@ -2282,8 +2284,7 @@ def selective_kernel(x, A, B, C) -> str:
     bundled = on_gpu and bundles.of(generation.device_generation(), x.dtype) is not None
     family = generation.family(generation.device_generation()) if bundled else None
     case = SelectiveCase(varying=bool(jax.typeof(x).mat.varying), dtype=jnp.dtype(x.dtype),
-                         state_dtype=min(jnp.dtype(jnp.result_type(B)), jnp.dtype(jnp.result_type(C)),
-                                         key=lambda dtype: dtype.itemsize),
+                         state_dtypes=(jnp.dtype(jnp.result_type(B)), jnp.dtype(jnp.result_type(C))),
                          length=x.shape[1], channels=x.shape[-1], states=A.shape[-1],
                          fast=generation.numerics().forms == 'fast',
                          family=family)
