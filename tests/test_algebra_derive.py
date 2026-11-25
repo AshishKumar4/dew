@@ -1290,6 +1290,16 @@ def test_chunked_moments_balanced_quotient_direction_jvp_and_vjp():
                 (x_qu,), (dx_up,))
             np.testing.assert_array_equal(
                 np.asarray(d_gup), np.asarray([[np.float32(1.5 * 2.0 ** 127), 0.0]], np.float32))
+            x_ww = jnp.asarray([[np.float32(2.0 ** -100), 0.0]], jnp.float32)
+            w_ww = jnp.asarray([[0.0, np.float32(2.0 ** -40)]], jnp.float32)
+            dw_ww = jnp.asarray([[np.float32(2.0 ** 99), np.float32(2.0 ** 99)]], jnp.float32)
+            _, d_gww = jax.jvp(
+                lambda w_, t=tile, m=mode: jax.grad(
+                    lambda w__: moments.chunked_moments(x_ww, w__, tile=t, mode=m)[0].sum())(w_),
+                (w_ww,), (dw_ww,))
+            np.testing.assert_array_equal(
+                np.asarray(d_gww),
+                np.asarray([[np.float32(-1.5 * 2.0 ** 80), np.float32(-(2.0 ** 79))]], np.float32))
 
 
 def test_chunked_moments_directed_overflow_mixed_zero_weight_and_direct_jvp():

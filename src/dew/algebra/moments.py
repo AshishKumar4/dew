@@ -14,9 +14,7 @@ import jax.numpy as jnp
 
 from dew.algebra import derive, program, ratios, windows
 from dew.algebra.forms import Derived
-from dew.nn import float_bits
 from dew.nn.derivatives import Protected, contracted, declared_tangent
-from dew.nn.precision import power2
 
 SATURATION = program.Saturation(growth=64, depth=4)
 """Derivation limits for central-moment walks."""
@@ -159,57 +157,25 @@ def _weighted_term(tw: jax.Array, operand: jax.Array, sn: jax.Array) -> jax.Arra
     return jnp.where(small_tw, (tw_mf * operand) / sn_mf, (tw_df / sn_df) * operand)
 
 
-def _primal_exponent(value: jax.Array) -> jax.Array:
-    """`floor(log2(|value|))` of primal `value` (`int32`, stopped for AD), 0 where zero or nonfinite."""
-    plain = jax.lax.stop_gradient(value)
-    _, biased, fraction, _, exponent = float_bits.float_bits(plain)
-    valid = jnp.isfinite(plain) & ((biased != 0) | (fraction != 0))
-    return jnp.where(valid, exponent.astype(jnp.int32), jnp.int32(0))
+_TANGENT_DIV = ratios.Ratio(
+    ((1.0, (("v", 0), ("v", 1))),), ((1.0, (("v", 2),)),), 0, reduced=True, units=windows.Units())
+"""Elementwise `dtw * numerator / sn` along a leading unit axis (`_safe_tangent_div`)."""
+
+_TANGENT_QUAD = ratios.Ratio(
+    ((1.0, (("v", 0), ("v", 1), ("v", 2))),), ((1.0, (("v", 3),)),), 0, reduced=True, units=windows.Units())
+"""Elementwise `dtw * cx * cy / sn` along a leading unit axis (`_safe_tangent_quad`)."""
 
 
 def _safe_tangent_div(dtw: jax.Array, numerator: jax.Array, sn: jax.Array) -> jax.Array:
-    """Linear-in-`dtw` evaluation of `dtw * numerator / sn` using `dew.nn.precision.power2`: balances
-    `k_dtw` and `q = power2(numerator, k_n) / u_den` so both factors move in the same direction (`>= 1` when
-    `|R| >= 1`, `<= 1` when `|R| < 1`), halves `u_sn` when `k_num > 0` so `power2(dx, k_num - 1)` cannot
-    overflow ahead of `/ u_den`, moves `/ u_sn` onto `scaled_dtw` when `e_sn >= 0` and `e_num <= minexp`,
-    and puts positive shift onto zero `numerator` to avoid `inf * 0`."""
-    minexp = int(jnp.finfo(numerator.dtype).minexp)
-    e_sn = _primal_exponent(sn)
-    u_sn = power2(sn, -e_sn)
-    plain_num = jax.lax.stop_gradient(numerator)
-    zero_num = plain_num == 0
-    e_num = _primal_exponent(numerator)
-    m_q = jnp.abs(power2(plain_num, -e_num)) / jax.lax.stop_gradient(u_sn)
-    q_ge_1 = m_q >= 1.0
-    e_total = -e_sn
-    e_r = e_num + e_total - jnp.where(q_ge_1, jnp.int32(0), jnp.int32(1))
-    need = -e_num + jnp.where(q_ge_1, jnp.int32(0), jnp.int32(1))
-    drop = -e_num - jnp.where(q_ge_1, jnp.int32(1), jnp.int32(0))
-    k_up = jnp.where(need > 0, need, jnp.minimum(e_total, jnp.int32(0)))
-    k_dn = jnp.where(drop < 0, drop, jnp.maximum(e_total, jnp.int32(0)))
-    k_num = jnp.where(zero_num, jnp.maximum(e_total, jnp.int32(0)), jnp.where(e_r >= 0, k_up, k_dn))
-    k_dtw = e_total - k_num
-    div_on_dtw = (~zero_num) & (e_r < 0) & (drop >= 0) & (e_total <= 0) & (e_num <= minexp)
-    scaled_dtw = power2(dtw, k_dtw)
-    k_n = jnp.where(k_num > 0, k_num - jnp.int32(1), k_num)
-    u_den = jnp.where(k_num > 0, u_sn * 0.5, u_sn)
-    on_dtw = (jnp.where(div_on_dtw, scaled_dtw, 0.0) / u_sn) * jnp.where(div_on_dtw, numerator, 0.0)
-    on_num = (jnp.where(div_on_dtw, 0.0, scaled_dtw)
-              * (power2(jnp.where(div_on_dtw, 0.0, numerator), k_n) / u_den))
-    return jnp.where(div_on_dtw, on_dtw, on_num)
+    """Range-safe `dtw * numerator / sn` via singleton `ratios.ratio_p`, keeping primal and higher-order
+    mixed derivatives in one scaled-product operation without primal-only normalization."""
+    return ratios.ratio([dtw[None], numerator[None], sn[None]], _TANGENT_DIV)
 
 
 def _safe_tangent_quad(dtw: jax.Array, cx: jax.Array, cy: jax.Array, sn: jax.Array) -> jax.Array:
     """Range-safe `dtw * cx * cy / sn` via singleton `ratios.ratio_p`, keeping primal and higher-order
-    mixed derivatives in one scaled-product operation without primal-only exponent scaling of `cx`."""
-    form = ratios.Ratio(
-        numerator=((1.0, (("v", 0), ("v", 1), ("v", 2))),),
-        denominator=((1.0, (("v", 3),)),),
-        axis=dtw.ndim,
-        reduced=True,
-        units=windows.Units(),
-    )
-    return ratios.ratio([dtw[..., None], cx[..., None], cy[..., None], sn[..., None]], form)
+    mixed derivatives in one scaled-product operation without primal-only normalization."""
+    return ratios.ratio([dtw[None], cx[None], cy[None], sn[None]], _TANGENT_QUAD)
 
 
 def _cov_tangent_tile(
