@@ -7,6 +7,7 @@ ATK's walk on the recurrence template beside it, packed over spans; and the squa
 saturates. A 16-bit call carries fla's own roundings, which no walk runs: it is held to fla's chunked release
 (row 12696's recorded arm)."""
 
+import contextlib
 import dataclasses
 import functools
 
@@ -222,13 +223,14 @@ def read_erase_operands(seed):
     return tuple(hosted(x) for x in drawn)
 
 
-def templated(*operands, kernel: str = "mosaic_gpu", target: str = "sm90"):
-    """`chunked` with the delta rule on `kernel` (the recurrence template's where unnamed) under the run's
-    fast forms, where an fp32 call's products round as fla's do (`recurrence_chunk.fast_rounding`), at an
-    H100's facts."""
+def templated(*operands, kernel: str | None = "mosaic_gpu", target: str = "sm90"):
+    """`chunked` with the delta rule on `kernel` (the recurrence template's where unnamed; the selector's
+    own choice where None) under the run's fast forms, where an fp32 call's products round as fla's do
+    (`recurrence_chunk.fast_rounding`), at `target`'s facts (an H100's)."""
     fast = dataclasses.replace(generation.numerics(), forms='fast')
     with (generation.assumed(target if INTERPRETED else None, interpreted=INTERPRETED),
-          generation.run_precision(fast), generation.chosen(gated_delta_rule=kernel)):
+          generation.run_precision(fast),
+          generation.chosen(gated_delta_rule=kernel) if kernel else contextlib.nullcontext()):
         return chunked(*operands)
 
 
@@ -379,19 +381,18 @@ def test_a_read_erase_under_a_decay_a_key_dimension_trains_on_the_template():
         'mosaic_gpu', 'xla'}
 
 
-@pytest.mark.parametrize(('per_key', 'taken'), [(True, {'xla'}), (False, {'mosaic_gpu', 'xla'})],
-                         ids=['pkda', 'pgdn'])
-def test_a_read_erases_training_on_a_99_kb_part_takes_the_route_its_launches_hold(per_key, taken):
-    """A 16-bit training call naming the template on an sm86 (99 KB a block), traced through the public
-    gradient: PKDA's decay a key dimension the portable math's, its key memory launch past the part's
-    registers with its reads (`template.reads_trained`, row 12890; the selector and the rule's gradient one
-    predicate, where the selector's alone gave it the template and its gradient refused), PGDN's decay a head
-    the template's: the kernels its traced routes name, beside the portable tangent's."""
-    drawn = operands(per_key=per_key, shape=TEMPLATED)(0)[:-1]
+@pytest.mark.parametrize(('target', 'taken'), [('sm90', {'mosaic_gpu', 'xla'}), ('sm86', {'xla'})])
+def test_a_key_decays_read_erase_trains_where_its_launches_hold(target, taken):
+    """PKDA's 16-bit training call, its kernel the selector's own, traced through the public gradient: on an
+    H100 the template's, on an sm86 (99 KB a block) the portable math's, its key memory launch past the
+    part's registers with its reads (`template.reads_trained`, row 12890), the selector and the rule's
+    gradient one predicate (the selector's alone gave it the template, whose gradient then refused it):
+    the kernels its traced routes name, beside the portable tangent's."""
+    drawn = operands(per_key=True, shape=TEMPLATED)(0)[:-1]
     drawn = (*(x.astype(jnp.bfloat16) for x in drawn[:3]), *drawn[3:])
 
     def loss(*given):
-        return templated(*given, target="sm86")[0].astype(jnp.float32).sum()
+        return templated(*given, kernel=None, target=target)[0].astype(jnp.float32).sum()
 
     with generation.routes() as found:
         jax.eval_shape(jax.grad(loss, argnums=(0, 1, 2)), *drawn)
