@@ -1,32 +1,43 @@
-"""A run's native fault record (row 6497): Python's fault handler armed for every thread into a file of the
-run's directory for a fit's whole length, so a fatal signal in it (a segfault in any thread, native code's or
-Python's) leaves each thread's Python stack, and on Python 3.14 the faulting thread's C frames by library and
-offset (`faulthandler`'s `c_stack`), where the run's checkpoints are. Nothing runs until a fatal signal.
+"""A run's native fault record (row 6497): Python's fault handler for every thread, the process's one owner of
+its fatal signals from its start (`owned`), its stacks written into a file of the run's directory while a fit
+runs (`recording`), so a fatal signal in it (a segfault in any thread, native code's or Python's) leaves each
+thread's Python stack, and on Python 3.14 the faulting thread's C frames by library and offset
+(`faulthandler`'s `c_stack`), where the run's checkpoints are. Nothing runs until a fatal signal.
 
-The record is the fatal signals' one owner for the fit. NCCL's UCX transport would install handlers of its own
-over it as its first collectives start, each saving the one it replaced and, on a signal, putting back what it
-saved and raising again; a chain of the two re-raises into a handler already spent. So a fit asks UCX for none
-(`UCX_ERROR_SIGNALS` empty, where its environment names none); a process whose UCX started before the fit
-keeps UCX's, which the record, enabled over it, hands each signal on to. A process whose fault handler another
-owner enabled (pytest, `PYTHONFAULTHANDLER`) keeps it: the record is that owner's stream, untouched."""
+The handler is enabled once, as the process is readied (`runtime.ready_process`), and never disabled: a
+handler installed over it (UCX's, as NCCL's transport starts, each saving the one it replaced and, on a
+signal, putting it back and raising again) hands each signal back to it, which writes its stacks and hands
+on to what it found. A fit re-points it at the run's file and back at standard error after, which installs
+nothing. The process's policy asks UCX for no handler of its own where its environment names none
+(`UCX_ERROR_SIGNALS` empty, read once as UCX starts), as Dew's other environment defaults are; a process
+whose fault handler another owner enabled (pytest, `PYTHONFAULTHANDLER`) keeps it, and records nothing."""
 
 import contextlib
-import ctypes
 import faulthandler
 import logging
 import os
-import signal
 import socket
 import sys
 from pathlib import Path
 
 _log = logging.getLogger(__name__)
 
-FATAL = (signal.SIGSEGV, signal.SIGFPE, signal.SIGABRT, signal.SIGBUS, signal.SIGILL)
-"""The signals `faulthandler` handles."""
+_OWNED: list[bool] = []
+"""Whether this process's fault handler is Dew's, decided once as it is readied (`owned`)."""
 
-_SIGACTION_BYTES = 256
-"""Room for a `struct sigaction` (152 bytes on x86-64 and aarch64 Linux), read and written whole."""
+
+def owned() -> None:
+    """The process's fatal signals Python's fault handler's, for every thread, to standard error, and UCX
+    asked for none where the environment names its own policy (`UCX_ERROR_SIGNALS`): once a process,
+    before NCCL starts. Where another owner enabled the handler, it stays theirs."""
+    if _OWNED:
+        return
+    if faulthandler.is_enabled() or sys.__stderr__ is None:
+        _OWNED.append(False)
+        return
+    os.environ.setdefault("UCX_ERROR_SIGNALS", "")
+    faulthandler.enable(sys.__stderr__, all_threads=True)
+    _OWNED.append(True)
 
 
 def record_path(directory: str) -> Path:
@@ -35,52 +46,20 @@ def record_path(directory: str) -> Path:
     return Path(directory) / "faults" / f"{socket.gethostname()}-{os.getpid()}.txt"
 
 
-def _actions() -> dict[int, bytes]:
-    """Each fatal signal's installed `struct sigaction`, as the kernel holds it; none off Linux."""
-    if not sys.platform.startswith("linux"):
-        return {}
-    libc, held = ctypes.CDLL(None, use_errno=True), {}
-    for number in FATAL:
-        action = ctypes.create_string_buffer(_SIGACTION_BYTES)
-        if libc.sigaction(int(number), None, action) == 0:
-            held[int(number)] = action.raw
-    return held
-
-
-def _handler(action: bytes) -> bytes:
-    """An action's handler, its first word: what tells one owner's installation from another's."""
-    return action[:ctypes.sizeof(ctypes.c_void_p)]
-
-
 @contextlib.contextmanager
 def recording(directory: str | None):
-    """A fit's fault record in `directory` for the block's length: none where the run keeps no directory on
-    this host's file system (no checkpoints, or a bucket's), or where another owner enabled the process's
-    fault handler, which keeps it. Ending, it disables the handler it enabled, keeping any action installed
-    over it since for its signal, and puts the environment's UCX setting back."""
-    if directory is None or "://" in directory:
-        yield None
-        return
-    if faulthandler.is_enabled():
-        _log.info("the fault handler is the process's own owner's: no fault record in %s", directory)
+    """The process's fault handler writing to its record in the run directory `directory` for the block,
+    to standard error again after it: re-pointed, nothing installed. None where the handler is another
+    owner's (`owned`), or the run keeps no directory on this host's file system (no checkpoints, or a
+    bucket's)."""
+    if not (_OWNED and _OWNED[0]) or directory is None or "://" in directory:
         yield None
         return
     path = record_path(directory)
     path.parent.mkdir(parents=True, exist_ok=True)
-    asked = "UCX_ERROR_SIGNALS" not in os.environ
     with path.open("a") as record:
-        if asked:
-            os.environ["UCX_ERROR_SIGNALS"] = ""
         faulthandler.enable(record, all_threads=True)
-        ours = {number: _handler(action) for number, action in _actions().items()}
         try:
             yield path
         finally:
-            installed = {number: action for number, action in _actions().items()
-                         if _handler(action) != ours.get(number)}
-            faulthandler.disable()
-            libc = ctypes.CDLL(None) if installed else None
-            for number, action in installed.items():
-                libc.sigaction(number, ctypes.create_string_buffer(action, _SIGACTION_BYTES), None)
-            if asked:
-                os.environ.pop("UCX_ERROR_SIGNALS", None)
+            faulthandler.enable(sys.__stderr__, all_threads=True)

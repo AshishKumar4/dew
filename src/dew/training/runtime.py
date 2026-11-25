@@ -44,6 +44,7 @@ from dew._devices import (
 from dew._logging import configure as configure_logging
 from dew._pool import PREEMPTED_EXIT, joins_pool, refuse_idle_gpus, runs_on_gpu, slurm_tasks_here
 from dew.clusters import ClusterEnvironment, Joining, Scheduler, detected_environment
+from dew.training import faults
 
 _log = logging.getLogger(__name__)
 
@@ -183,9 +184,12 @@ def ready_process() -> None:
     share it, or JAX_ENABLE_COMPILATION_CACHE=false leaves alone, and the refusal of a machine with
     an NVIDIA GPU whose JAX opened with none (`dew._devices.refuse_cpu_only_jax`) and of a GPU holding
     tensor memory under a cuBLAS that frees it twice (`dew._devices.refuse_unsafe_cublas`), which open the
-    backend, so the cache's flags come first. `prepare_process` readies the process once
-    its flags are set and its pool joined, and `Trainer.fit` readies one no `prepare_process` did;
-    each step is idempotent."""
+    backend, so the cache's flags come first; first of all, its fatal signals Python's fault handler's
+    (`dew.training.faults.owned`), which a fit's record writes through. `prepare_process` readies the
+    process once its flags are set and its pool joined, and `Trainer.fit` readies one no `prepare_process`
+    did; each step is idempotent."""
+    # Its fatal signals Python's fault handler's before NCCL starts (`faults.owned`).
+    faults.owned()
     # A process that joined its pool of processes itself (`jax.distributed.initialize`) joins one.
     pooled(joins=jax.distributed.is_initialized())
     configure_logging()
