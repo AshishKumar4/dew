@@ -725,7 +725,8 @@ class _Counting:
         work = operation_work(equation.primitive, [variable.aval for variable in equation.invars],
                               [variable.aval for variable in equation.outvars], equation.params,
                               forms=self.forms)
-        if equation.primitive in _REDUCTIONS and (layout := self.laid.get(equation.invars[0])) is not None:
+        layout = self.laid.get(equation.invars[0]) if equation.primitive in _REDUCTIONS else None
+        if isinstance(layout, fragments.TiledLayout):
             threads = inline_work.WARP if self.lanes is not None else resources.THREADS
             work = work + _butterfly(layout, equation.invars[0].aval, equation.params["axes"], threads)
         return work
