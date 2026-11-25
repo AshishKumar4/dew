@@ -282,13 +282,17 @@ _KERNEL_FORMS: Mapping = {"approximate": APPROXIMATE_FORMS, "accurate": ACCURATE
 """A Mosaic GPU kernel's two forms tables by name, which a kernel's forms are by equality (a copy of one
 alike), so a price cached by name (`_software_division`) reads the same table."""
 
+IEEE_DIVISION = Work(exponentials=1, operations=6)
+"""An fp32 division as PTX's `div.rn.f32` lowers on sm90, an element: on its common path a MUFU.RCP beside
+five FFMAs and an FCHK, its slow path, a subnormal's or an extreme's, a call a count takes as not run (the
+SASS of a hand-written kernel of one, FS-DIV-SASS5). XLA's own fp32 division is it (M-FS-77: plain LLVM
+`fdiv`, PTX `div.rn.f32`)."""
+
 TRITON_FORMS: Mapping = {**{function: Work(exponentials=1) for function in APPROXIMATED},
-                         precision.correctly_rounded_divide_p: Work(exponentials=1, operations=6)}
+                         precision.correctly_rounded_divide_p: IEEE_DIVISION}
 """A Pallas Triton kernel's forms (`forms_of`): each special function one exponential an element, as a
 kernel of no measured forms; a correctly rounded fp32 division its native `div.rn.f32`
-(`precision.triton_lowerings`), on its common path a MUFU.RCP beside five FFMAs and an FCHK an element, its
-slow path, a subnormal's or an extreme's, a call a count takes as not run (sm90's SASS of a hand-written
-kernel of one, FS-DIV-SASS5; row 12886)."""
+(`precision.triton_lowerings`, `IEEE_DIVISION`; row 12886)."""
 
 
 _FREE = frozenset({
@@ -1357,18 +1361,19 @@ def operation_work(primitive, inputs: Sequence, outputs: Sequence, params: Mappi
     nothing (`_FREE`: a layout change, a barrier); any other primitive's output elements unpriced
     (`Work.unpriced_operations`). With `forms` (a kernel's: `APPROXIMATE_FORMS`, `ACCURATE_FORMS`), a special
     function issues its form an output element, one with none unpriced. An fp32 division on a CUDA target
-    issues its kernel's form (`MOSAIC_DIVISION`); XLA's own, other widths' and a TPU's, unmeasured, an
-    operation an element. A correctly rounded one issues its native form where a kernel's forms state one (a
-    Triton kernel's, `TRITON_FORMS`), else the software division it lowers to (XLA's and Mosaic GPU's,
-    `precision._correctly_rounded_divide`), counted as a kernel's body is, through its calls (row 12886)."""
+    issues its kernel's form (`MOSAIC_DIVISION`), XLA's own `div.rn.f32`'s (`IEEE_DIVISION`, M-FS-77);
+    other widths' and a TPU's, unmeasured, an operation an element. A correctly rounded one issues its
+    native form where a kernel's forms state one (a Triton kernel's, `TRITON_FORMS`), else the software
+    division it lowers to (XLA's and Mosaic GPU's, `precision._correctly_rounded_divide`), counted as a
+    kernel's body is, through its calls (row 12886)."""
     if primitive is precision.correctly_rounded_divide_p:
         if (native := (forms or {}).get(primitive)) is not None:
             return repeated(native, sum(_elements(aval) for aval in outputs))
         kind = next((name for name, table in _KERNEL_FORMS.items() if forms == table), None)
         return _software_division(tuple((tuple(aval.shape), np.dtype(aval.dtype)) for aval in inputs),
                                   target or generation.gpu_target(), kind)
-    if primitive is lax.div_p and forms is not None and _divides_on_cuda(outputs, target) and (
-            (form := forms.get(primitive)) is not None):
+    if primitive is lax.div_p and _divides_on_cuda(outputs, target) and (
+            (form := IEEE_DIVISION if forms is None else forms.get(primitive)) is not None):
         return repeated(form, sum(_elements(aval) for aval in outputs))
     if primitive in _OPERATIONS:
         return _operated(primitive, inputs, outputs)
