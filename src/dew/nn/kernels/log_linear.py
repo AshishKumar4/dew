@@ -114,8 +114,12 @@ def _within(q, k, v, g, weights, positions, *, scale: float, documents: int, pac
     def blocked(x):
         return laid(x).reshape(rows * count, WITHIN, *x.shape[2:])
 
-    q, k = (jnp.repeat(x, heads // groups, axis=2) for x in (q, k))
-    q, k, v, g, weights = (blocked(x) for x in (q, k, v, g, weights))
+    def grouped(x):
+        # A value head's operand beside its key head's: `[blocks, WITHIN, G, H / G, ...]`.
+        return x.reshape(*x.shape[:2], groups, heads // groups, *x.shape[3:])
+
+    q, k = (blocked(x) for x in (q, k))
+    v, g, weights = (grouped(blocked(x)) for x in (v, g, weights))
     # A pair's level: zero for a token's own key, else the bit length of their offsets' XOR (the exponent
     # `frexp` gives, 1 for 1, 0 for 0); past the sequence's levels, a pair of slots no token takes.
     offsets = np.arange(WITHIN)
@@ -125,6 +129,9 @@ def _within(q, k, v, g, weights, positions, *, scale: float, documents: int, pac
         pairs = weight[offsets[:, None], level]
         return scan.spread(query, key, value, scan.between(decay[:, None]), weights=pairs)
 
-    # A block's heads, then every row's blocks.
-    out = jax.vmap(jax.vmap(head, in_axes=1, out_axes=1))(q, k, v, g, weights)
+    # A key head's value heads, its queries and keys unmapped among them, so their scores are formed once a
+    # key head (each value head repeating them formed log-linear-mamba2's 64 a block, an fp32 product of 234
+    # us in a GH200's forward, M-JS-146ll); then a block's key heads, then every row's blocks.
+    each = jax.vmap(head, in_axes=(None, None, 1, 1, 1), out_axes=1)
+    out = jax.vmap(jax.vmap(each, in_axes=1, out_axes=1))(q, k, v, g, weights)
     return unlaid((scale * out).reshape(rows, count * WITHIN, heads, -1))
