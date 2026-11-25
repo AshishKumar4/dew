@@ -10,7 +10,7 @@ import jax.numpy as jnp
 
 from dew.algebra import SATURATION, derive
 from dew.nn.kernels.templates import attention_algebra as algebra, attention_gradient as gradient
-from dew.nn.kernels.templates.attention import REFERENCE_PRECISION
+from dew.nn.kernels.templates.attention import LOG2E, REFERENCE_PRECISION
 from dew.nn.precision import float32_einsum
 
 
@@ -26,6 +26,23 @@ def softmax_weights(logits, peak, total, *, keys_first: bool = False,
                        safe=not accurate)
     over = per_query(1.0 / jnp.where(total == 0, 1.0, total))
     return e, e * over
+
+
+def normalized_weights(logits2, peak, total, *, keys_first: bool = False):
+    """A fast-form backward tile's normalized weights alone, in base 2 (`softmax_weights`' second value,
+    FlashAttention 3's form): each `2^(l2 - L)` from its base-2 logits `logits2` (the logits times log2(e),
+    -inf where unseen) against its query's base-2 log-sum-exp `L = m log2(e) + log2(T)` of its maximum `peak`
+    and denominator `total`, one exponential and one subtraction an entry where `exp(s - m)` and its product
+    by `1/T` took two multiplies more (M-NA-28-gh200: the fused dK/dV's 2.02B instructions against
+    FlashAttention 3's 1.08B, row 5272); +inf where the query saw no key (its peak -inf), so each of its
+    weights is 0 (`gradient.safe_peak`'s). Its plain recomputation's alone: no exact largest weight, no raw
+    products."""
+    def per_query(x):
+        return x[None, :] if keys_first else x[:, None]
+
+    log_total = jnp.log2(jnp.where(total == 0, 1.0, total))
+    sums = jnp.where(peak == -jnp.inf, jnp.inf, peak * LOG2E + log_total)
+    return jnp.exp2(logits2 - per_query(sums))
 
 
 def softmax_from_weights(weights, products, anchor, delta, seen=None, *, keys_first: bool = False):
@@ -112,6 +129,16 @@ def derived_weights(keys_first: bool, how: algebra.Recompute = algebra.PLAIN,
     axes = {"logits": tile, "peak": ("rows",), "total": ("rows",)}
     declared = functools.partial(softmax_weights, keys_first=keys_first, how=how, accurate=accurate)
     return derive.derive(derive.Reduction(declared, axes, walked="keys", exponent="e"), accurate=accurate,
+                         saturation=SATURATION)
+
+
+@functools.cache
+def derived_normalized(keys_first: bool) -> derive.Derived:
+    """Derived form of `normalized_weights` (the fast form's normalized weights in base 2, row 5272)."""
+    tile = ("keys", "rows") if keys_first else ("rows", "keys")
+    axes = {"logits2": tile, "peak": ("rows",), "total": ("rows",)}
+    declared = functools.partial(normalized_weights, keys_first=keys_first)
+    return derive.derive(derive.Reduction(declared, axes, walked="keys", exponent="e"), accurate=False,
                          saturation=SATURATION)
 
 
