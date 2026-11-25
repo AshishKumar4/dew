@@ -63,6 +63,7 @@ from dew.nn.precision import (
     compensated_add,
     renormalized_add,
     rounding_alone,
+    twice_scaled,
     uncontracted,
     vanishing,
 )
@@ -1204,15 +1205,9 @@ def _pair_factors(left, right, decay, after):
                                        jnp.moveaxis(after, -1, 0)[..., None, :])
 
 
-@jax.custom_jvp
-def _portable_pairs(left, right, decay, after):
-    return _pair_dispatch(left, right, decay, after)
-
-
-@functools.partial(_portable_pairs.defjvp, symbolic_zeros=True)
 def _portable_pair_jvp(primals, tangents):
     moving = tuple(i for i, t in enumerate(tangents) if t is not None and not isinstance(t, SymbolicZero))
-    value = _pair_dispatch(*primals)
+    value = _portable_pairs(*primals)
     if not moving:
         return value, SymbolicZero(jax.typeof(value).to_tangent_aval())
 
@@ -1247,8 +1242,13 @@ def _pair_dispatch(left, right, decay, after):
 def _batch_pair_dispatch(size, batched, *operands):
     # Reduce across the batch before choosing the path so vmap does not evaluate both. Shape-safe
     # broadcasting allows further enclosing maps to add axes using this same rule.
-    placed = jax.tree.map(lambda x, b: x if b else jnp.broadcast_to(x, (size, *x.shape)), operands, tuple(batched))
+    placed = jax.tree.map(lambda x, b: x if b else jnp.broadcast_to(x, (size, *x.shape)),
+                         operands, tuple(batched))
     return _pair_dispatch(*placed), True
+
+
+_portable_pairs = contracted("test_a_nonlinear_consumer_of_a_decayed_pair_holds_the_second_reverse_derivative")(
+    declared_tangent(Protected(), _pair_dispatch, _portable_pair_jvp, symbolic_zeros=True))
 
 
 def _factored(left, right, between, joined, issue: Callable, role: str, *, back: bool = False):
@@ -1284,9 +1284,11 @@ def _factored(left, right, between, joined, issue: Callable, role: str, *, back:
             else:
                 reference = first - 1
                 before, after = between[own, reference], between[reference + back, keys]
-                blocks.append(_portable_pairs(left[own].astype(work), right[keys].astype(work),
-                                              before.astype(work), after.astype(work)) if issue is _issued else
-                              issue(role, left[own] * before, (right[keys] * after).T))
+                if issue is _issued:
+                    blocks.append(_portable_pairs(left[own].astype(work), right[keys].astype(work),
+                                                  before.astype(work), after.astype(work)))
+                else:
+                    blocks.append(issue(role, left[own] * before, (right[keys] * after).T))
         rows.append(jnp.concatenate(blocks, axis=1))
     return jnp.concatenate(rows, axis=0)
 

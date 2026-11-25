@@ -19,8 +19,7 @@ from egglog import DagCostModel, EGraph, get_callable_args
 
 from dew._cache import ALGEBRA
 from dew.algebra.extract import Level
-from dew.algebra.rules import CONTRACTED, param_dtype, shape
-from dew.algebra.rules import dtype as dtype_fact
+from dew.algebra.rules import CONTRACTED, dtype as dtype_fact, param_dtype, shape
 from dew.algebra.terms import RESCALE, Region, Term, integer, key, text
 from dew.nn import programs
 from dew.nn.kernels import generation
@@ -208,10 +207,12 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None,
         return Work()
     # Each other elementwise operation by its primitive, its parameters' entry (`Region.params`); a
     # selection's and a clamp's their own. A layout change computes nothing.
-    for constructor, position in ((Term.unary, 2), (Term.convert, 1)):
-        if (args := get_callable_args(node, constructor)) is not None:
-            param = args[position]
-            return _elementwise(graph, *region.params[integer(param)], args[:1], held, on, parameter=param)
+    if (args := get_callable_args(node, Term.unary)) is not None:
+        param = args[2]
+        return _elementwise(graph, *region.params[integer(param)], args[:1], held, on, parameter=param)
+    if (args := get_callable_args(node, Term.convert)) is not None:
+        param = args[1]
+        return _elementwise(graph, *region.params[integer(param)], args[:1], held, on, parameter=param)
     for constructor in (Term.binary, Term.compare):
         if (args := get_callable_args(node, constructor)) is not None:
             param = args[3]

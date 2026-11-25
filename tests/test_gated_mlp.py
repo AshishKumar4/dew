@@ -186,8 +186,7 @@ def test_a_mixed_gate_up_mlp_keeps_its_projection_dtypes_when_wide_is_named():
     params = {"params": {"gate_proj": {"kernel": jax.ShapeDtypeStruct((FEATURES, HIDDEN), jnp.bfloat16)},
                          "up_proj": {"kernel": jax.ShapeDtypeStruct((FEATURES, HIDDEN), jnp.float32)},
                          "down_proj": {"kernel": jax.ShapeDtypeStruct((HIDDEN, FEATURES), jnp.bfloat16)}}}
-    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic", gated_mlp="wide"),
-          generation.routes() as routes):
+    with generation.assumed("sm90"), generation.chosen(gated_mlp="wide"), generation.routes() as routes:
         value = jax.eval_shape(layer.apply, params, x)
     assert value.dtype == jnp.float32
     assert [route.kernel for route in routes if route.choice == "gated_mlp"] == ["apart"]

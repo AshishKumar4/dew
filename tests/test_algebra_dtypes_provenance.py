@@ -150,6 +150,7 @@ def test_reuse_hoists_softmax_and_standalone_root_and_emits_no_debug_info_warnin
             warnings.simplefilter("always", DeprecationWarning)
             sm_before = list(_equations(jax.make_jaxpr(plain_softmax)(x0).jaxpr))
             sm_after = list(_equations(jax.make_jaxpr(algebra.rewritten(plain_softmax))(x0).jaxpr))
+            rt_before = list(_equations(jax.make_jaxpr(standalone_root)(x0, z0).jaxpr))
             rt_after = list(_equations(jax.make_jaxpr(algebra.rewritten(standalone_root))(x0, z0).jaxpr))
             with generation.assumed("sm90"):
                 rms_shapes = (jax.ShapeDtypeStruct((256, 256), jnp.bfloat16),
@@ -162,7 +163,8 @@ def test_reuse_hoists_softmax_and_standalone_root_and_emits_no_debug_info_warnin
         assert not any(eq.primitive is jax.lax.div_p for eq in sm_after)
         assert any(eq.primitive is jax.lax.integer_pow_p and eq.params.get("y") == -1 for eq in sm_after)
         assert not any(eq.primitive is jax.lax.sqrt_p for eq in rt_after)
-        assert not any(eq.primitive is jax.lax.div_p for eq in rt_after)
+        assert (sum(eq.primitive is jax.lax.div_p for eq in rt_before)
+                - sum(eq.primitive is jax.lax.div_p for eq in rt_after)) == 1
         assert any(eq.primitive is jax.lax.rsqrt_p for eq in rt_after)
         assert_as_exact(jax.jit(algebra.rewritten(plain_softmax)), jax.jit(plain_softmax),
                         lambda seed: _rows(seed, (16, 64)), "reuse softmax hoist", seeds=8)

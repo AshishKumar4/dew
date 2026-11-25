@@ -539,11 +539,19 @@ def test_a_gated_activation_can_feed_the_next_products_prologue():
         gate, up, down = (part.astype(jnp.float64) for part in (gate, up, down))
         return (jax.nn.silu(gate) * up) @ down
 
+    def directional(call):
+        def run(*values):
+            return jax.jvp(call, values[:3], values[3:])
+        return jax.jit(run)
+
     with (generation.assumed("sm90", interpreted=True),
           generation.chosen(grouped_matmul="mosaic", gemm_prologue="fused")):
         assert_as_exact(jax.jit(with_gradients(functools.partial(_passed, projected))),
                         jax.jit(with_gradients(projected)), operands, "gated product before a projection",
                         seeds=8, truth_fn=with_gradients(truth))
+        assert_as_exact(directional(functools.partial(_passed, projected)), directional(projected),
+                        normal_drawn(3423, *dims, *dims, dtype=jnp.bfloat16), "gated projection tile JVP",
+                        seeds=8, truth_fn=directional(truth))
 
 
 def test_a_gated_product_of_no_product_stays_its_region():
