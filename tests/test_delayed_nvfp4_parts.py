@@ -3,6 +3,7 @@
 
 import dataclasses
 import functools
+import shutil
 
 import jax
 import jax.numpy as jnp
@@ -93,19 +94,25 @@ def test_a_run_resumed_partway_through_a_held_update_rolls_what_its_taken_calls_
 
     with generation.run_precision(DELAYED):
         whole = delayed_lm(1, optimizer=_every_second()).fit(data(), steps=4)
-        delayed_lm(1, Checkpoints(str(tmp_path / "run")), optimizer=_every_second()).fit(
+        delayed_lm(1, Checkpoints(str(tmp_path / "held")), optimizer=_every_second()).fit(
             data(), steps=3, checkpoint_every=1)
+        # Step 3's checkpoint, partway through the second update, read again below as it was written.
+        shutil.copytree(tmp_path / "held", tmp_path / "run")
         resumed = delayed_lm(1, Checkpoints(str(tmp_path / "run")), optimizer=_every_second()).fit(
             data(), steps=4, checkpoint_every=1)
         for one, other in zip(histories(resumed), histories(whole), strict=True):
             np.testing.assert_array_equal(one, other)
-        source = delayed_lm(1, Checkpoints(str(tmp_path / "run")), optimizer=_every_second())
-        start = source.place()[0]
+        # A run's checkpoint where its update applied (step 2): one keeps its latest step alone.
+        delayed_lm(1, Checkpoints(str(tmp_path / "applied")), optimizer=_every_second()).fit(
+            data(), steps=2, checkpoint_every=2)
 
         def resaved(step: int, name: str, waiting) -> Trainer:
-            """The run's checkpoint at `step` written again at `name` with `waiting` as what waits to roll
-            (`NVFP4_PENDING`): None, as an earlier Dew wrote it, holds none."""
-            state = source.checkpoints.restore(start, step)[0]
+            """The run's checkpoint at `step` (step 2's run's, else the resumed one's step 3) written again at
+            `name` with `waiting` as what waits to roll (`NVFP4_PENDING`): None, as an earlier Dew wrote it,
+            holds none."""
+            source = delayed_lm(1, Checkpoints(str(tmp_path / ("applied" if step == 2 else "held"))),
+                                optimizer=_every_second())
+            state = source.checkpoints.restore(source.place()[0], step)[0]
             variables = {key: value for key, value in state.variables.items() if key != NVFP4_PENDING}
             if waiting is not None:
                 variables[NVFP4_PENDING] = waiting(state.variables[NVFP4_PENDING])
