@@ -1440,10 +1440,9 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
         # its step's last wait is its product of the weights' on the role's `done` (`register_products`), and
         # a commit there right behind it, with nothing pending and no warpgroup barrier between, completes
         # the next phase before a lagging warp of the role has polled the last; that warp reads the phase
-        # after as the one it awaits, and the role waits on it for good (the 4B forward with its sums kept, a
-        # priority schedule of nvgpu-lean's B200 at its 31st query tile, 4 of 4 seeds,
-        # hang-20261114035236). Each barrier's own commits are a step apart, a warpgroup barrier between
-        # (the step's read of its logits).
+        # after as the one it awaits, and the role waits on it for good (a 4B forward with its sums kept hung
+        # so on a B200's simulated schedule). Each barrier's own commits are a step apart, a warpgroup
+        # barrier between (the step's read of its logits).
         del pending
         if _PRODUCTS.get() is None:
             return
