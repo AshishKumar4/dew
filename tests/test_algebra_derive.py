@@ -1135,6 +1135,42 @@ def test_chunked_moments_preserves_zero_weight_derivatives_and_extreme_anchors()
         assert float(dv_e0[0, 1]) == 0.0
 
 
+def test_chunked_moments_preserves_scaled_tangent_under_large_total_weight():
+    """Zero-weight directional tangents and scaled VJPs stay exact under huge total weight (`x=[0, 2^-60]`,
+    `w=[0, 2^100]`, `dw=[2^100, 0]`) and underflowing centered products (`x=[0, 2^-70]`, `w=[0, 2^-70]`,
+    `dw=[2^70, 0]`) in both `walk` and `merge` modes across 1- and 2-tile layouts (row 12992)."""
+    from dew.algebra import moments
+
+    x_u = jnp.asarray([[0.0, np.float32(2.0 ** -60)]], jnp.float32)
+    w_u = jnp.asarray([[0.0, np.float32(2.0 ** 100)]], jnp.float32)
+    dw_u = jnp.asarray([[np.float32(2.0 ** 100), 0.0]], jnp.float32)
+    x_q = jnp.asarray([[0.0, np.float32(2.0 ** -70)]], jnp.float32)
+    w_q = jnp.asarray([[0.0, np.float32(2.0 ** -70)]], jnp.float32)
+    dw_q = jnp.asarray([[np.float32(2.0 ** 70), 0.0]], jnp.float32)
+    for mode in ("walk", "merge"):
+        for tile in (1, 2):
+            (m_u, v_u), (dm_u, dv_u) = jax.jvp(
+                lambda w_, t=tile, m=mode: moments.chunked_moments(x_u, w_, tile=t, mode=m),
+                (w_u,), (dw_u,))
+            assert float(m_u[0]) == float(np.float32(2.0 ** -60)) and float(v_u[0]) == 0.0
+            assert float(dm_u[0]) == float(np.float32(-(2.0 ** -60)))
+            assert float(dv_u[0]) == float(np.float32(2.0 ** -120))
+            _, (dmx_u, dmy_u, dc_u) = jax.jvp(
+                lambda w_, t=tile, m=mode: moments.chunked_covariance(x_u, x_u, w_, tile=t, mode=m),
+                (w_u,), (dw_u,))
+            assert float(dmx_u[0]) == float(np.float32(-(2.0 ** -60)))
+            assert float(dmy_u[0]) == float(np.float32(-(2.0 ** -60)))
+            assert float(dc_u[0]) == float(np.float32(2.0 ** -120))
+            _, pb_u = jax.vjp(
+                lambda w_, t=tile, m=mode: moments.chunked_moments(x_u, w_, tile=t, mode=m), w_u)
+            (gw_u,) = pb_u((jnp.asarray([np.float32(2.0 ** 100)], jnp.float32), jnp.zeros((1,), jnp.float32)))
+            assert float(gw_u[0, 0]) == float(np.float32(-(2.0 ** -60))) and float(gw_u[0, 1]) == 0.0
+            _, (_, dv_q) = jax.jvp(
+                lambda w_, t=tile, m=mode: moments.chunked_moments(x_q, w_, tile=t, mode=m),
+                (w_q,), (dw_q,))
+            assert float(dv_q[0]) == 1.0
+
+
 def test_chunked_moments_directed_overflow_mixed_zero_weight_and_direct_jvp():
     """Weight tangents stay finite when `cx * cy` overflows, mixed 2nd derivatives at zero individual and
     all-zero weights match the plain declaration, and direct `derive` forms preserve zero-weight JVP."""
@@ -1151,7 +1187,6 @@ def test_chunked_moments_directed_overflow_mixed_zero_weight_and_direct_jvp():
             lambda w_, m=mode: moments.chunked_covariance(x_ov, x_ov, w_, tile=1, mode=m),
             (w_ov,), (dw_ov,))
         assert float(dc_ov[0]) == float(scale_ov)
-
     # Mixed 2nd-order derivatives at zero individual weights and all-zero weights match plain declaration.
     x_zm = jnp.asarray([[0.0, 2.0]], jnp.float32)
     dw_unit = jnp.asarray([[0.0, 1.0]], jnp.float32)
