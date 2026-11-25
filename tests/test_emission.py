@@ -936,17 +936,37 @@ def test_a_kernels_conversion_issues_as_its_assembler_lowers_it(source, target, 
                                    generation.gpu_target("sm90")) == unchanged
 
 
-def test_a_platform_choice_counts_the_branch_its_target_runs():
+@pytest.mark.parametrize(("platform", "operations"), [("sm90", 0), ("cpu", 128), ("v5e", 256)])
+def test_a_platform_choice_counts_the_branch_its_target_runs(platform, operations):
     """A body choosing its work by the platform it lowers for (`lax.platform_dependent`) counts the branch the
-    priced target's platform takes, a CUDA GPU's `cuda` branch or else the default, never the most of the
-    branches: here CUDA's none and the default's two operations an element (the review of lane/toolkit
-    2da46a78b)."""
+    priced platform takes, never the most of the branches: a CUDA GPU's `cuda` branch (none), a CPU's `cpu`
+    (one operation an element), a TPU's the default (two) (the reviews of lane/toolkit 2da46a78b and
+    28af34cca)."""
     def chosen(row):
-        return lax.platform_dependent(row, cuda=lambda row: row, default=lambda row: row * 2.0 + 1.0)
+        return lax.platform_dependent(row, cuda=lambda row: row, cpu=lambda row: row * 2.0,
+                                      default=lambda row: row * 2.0 + 1.0)
+
+    with generation.assumed(platform):
+        fixed = _emitted(chosen, _ROW).roles[0].fixed
+    assert fixed.operations == operations, fixed
+
+
+def test_a_walks_platform_chosen_mask_is_static():
+    """A walk's step reading a platform-chosen index tile (an iota or its reverse, `lax.platform_dependent`)
+    times a literal: the choice is its compile's, a constant, so the multiply is of the program's constants
+    and issues nothing a step (the review of lane/toolkit 28af34cca)."""
+    def walk(row, trips):
+        def step(index, row):
+            mosaic.step_index(index)
+            indices = lax.platform_dependent(cuda=lambda: lax.iota(jnp.int32, 128),
+                                             default=lambda: lax.rev(lax.iota(jnp.int32, 128), (0,)))
+            return row + (indices * 3).astype(jnp.float32)
+
+        return lax.fori_loop(0, trips, step, row)
 
     with generation.assumed("sm90"):
-        fixed = _emitted(chosen, _ROW).roles[0].fixed
-    assert fixed.operations == 0, fixed
+        role = _emitted(walk, _ROW, _TRIPS).roles[0]
+    assert role.step(lambda work: work.integer_multiply_adds) == 0, role
 
 
 def test_a_folded_scalars_cast_to_its_own_dtype_issues_nothing():
