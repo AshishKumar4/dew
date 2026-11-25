@@ -347,6 +347,12 @@ class SampledPasses:
         return cumulative
 
 
+type PassPolicy = int | tuple[int, ...] | SampledPasses
+"""The passes a looped model's loop runs each step of a run (`dew.config.DecoderRunConfig.passes`): one
+count; one count a phase of the run's data (`Trainer`'s `phase_passes`); or a count drawn afresh for each
+microbatch (`SampledPasses`, `Trainer`'s `sampled_passes`)."""
+
+
 def _mode(counts: np.ndarray, location: float, dispersion: float) -> np.ndarray:
     """The log rate at which each count's log integrand peaks (`SampledPasses.cumulative`), at real counts
     `counts` too: the root of its derivative `dispersion² (count - exp(x)) - (x - location)`, decreasing in

@@ -16,6 +16,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from dew.nn.fake_quant import FakeQuantizing, fake_quant_fp4, fake_quant_fp8, straight_through
+from dew.nn.kernels import generation
 
 _SIGNATURES = {name: inspect.signature(getattr(FakeQuantizing, name)) for name in ("fp8", "fp4")}
 
@@ -77,7 +78,10 @@ def rounding(decided: dict | None = None):
     rounding's output is the next blocks of its kind from them, its gradient straight through as the
     quantizer's own (`straight_through`), so the run rounds where that arm rounded and computes every other
     value itself. A following run that leaves an arm's decision untaken, or takes one it never made, is
-    refused: it is another computation than the arm's."""
+    refused: it is another computation than the arm's. A decoder's stack runs inside a layer at a time
+    (`layer_scan="plain"`): a scanned stack traces one body for all its layers, so its layers' roundings
+    are neither met in call order nor each taken from the arm's in turn (its body's values left the scan's
+    trace)."""
     met, taken = Roundings(), dict.fromkeys(decided or (), 0)
 
     def intercepted(call, args, kwargs, context):
@@ -97,7 +101,7 @@ def rounding(decided: dict | None = None):
         met.met(name, block, x, out)
         return out
 
-    with nn.intercept_methods(intercepted):
+    with generation.chosen(layer_scan="plain"), nn.intercept_methods(intercepted):
         yield met
     left = {name: decided[name].shape[0] - count for name, count in taken.items()
             if decided is not None and count != decided[name].shape[0]}

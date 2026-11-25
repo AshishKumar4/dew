@@ -54,9 +54,10 @@ def launch_name(kernel: str, launch: str | None, index: str | None = None) -> st
 
 MOSAIC_TARGET = b"mosaic_gpu_v2"
 """The custom call target of a Mosaic GPU kernel, which its thunk names (`_kernels`)."""
-SERIALIZED = frozenset({*(f"C751{digit}" for digit in range(6)), "C7519"})
+SERIALIZED = frozenset({*(f"C751{digit}" for digit in range(6)), "C7519", "C7520"})
 """The codes of ptxas's notes (`AssemblerNote`) of a kernel's warpgroup MMAs serialized, each product waited
-for before the next issues (C7510 to C7515; C7519, a dependence in a divergent path): a run refuses a kernel
+for before the next issues (C7510 to C7515; C7519; C7520, a warpgroup arrive ptxas inserted in a divergent
+path, as a branch on a verdict it holds lane by lane puts one, row 10151): a run refuses a kernel
 so noted as a spilling one (`Binary.refused`), and the compile gate fails it (tests/kernel_compile.py): the
 ranking's sm90 attention backward held its registers and serialized its products (C7512)."""
 IGNORED_RAISE = "C7507"

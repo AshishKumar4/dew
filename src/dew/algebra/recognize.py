@@ -42,7 +42,7 @@ from dew.algebra.forms import aval
 from dew.nn.derivatives import Protected, marked_call_p
 from dew.nn.kernels import generation
 from dew.nn.kernels.generation import Choice
-from dew.nn.programs import bodies
+from dew.nn.programs import bodies, control_flow, entrywise, purely_called
 from dew.nn.sharding import sequence_shards
 
 REACH = 8
@@ -234,10 +234,15 @@ def _chosen(index: fusion.Index, places: tuple[int, ...], members: Sequence[Cand
 
 
 def _holds(equation: jcore.JaxprEqn, primitive: jcore.Primitive) -> bool:
-    """Whether `equation` binds `primitive`, or a nested program whose body does (`bodies`), as a jit
-    `jax.nn.silu` traces holds its sigmoid, or is it (`_read_as`: Dew's one logistic): the region around it
-    reads the call whole, and its equality its body inlined (`normal_form.canonical`)."""
-    return _binds(equation, (primitive,))
+    """Whether `equation` binds `primitive`, is it (`_read_as`: Dew's one logistic), or is a transparent call
+    (`purely_called`, as a jit `jax.nn.silu` traces holds its sigmoid) whose body does: never control flow or
+    barriers (`scan`, `while`, `cond`, `remat`, `custom_vjp`), whose bodies are searched apart (row 12465)."""
+    if (read := _read_as(equation)) is not None:
+        return read is primitive
+    if equation.primitive is primitive:
+        return True
+    body = purely_called(equation)
+    return body is not None and primitive in _bound(body)
 
 
 def _binds(equation: jcore.JaxprEqn, primitives: Sequence[jcore.Primitive]) -> bool:
@@ -480,17 +485,23 @@ def _forward(index: fusion.Index, var: jcore.Var, reach: int = REACH) -> dict[jc
     return _walked(index, "forward", var, reach)
 
 
-def _walked_forward(index: fusion.Index, var: jcore.Var, reach: int) -> dict[jcore.Var, int]:
-    """`_forward`'s walk."""
+def _walked_forward(index: fusion.Index, var: jcore.Var, reach: int,
+                    allowed: frozenset[int] | None = None) -> dict[jcore.Var, int]:
+    """`_forward`'s walk, stopping at barriers (`_barriers`) and outside `allowed` when given."""
     found, frontier = {var: 0}, collections.deque([var])
+    eqns, readers, barriers = index.jaxpr.eqns, index.readers, _barriers(index)
     while frontier:
         value = frontier.popleft()
-        if found[value] == reach:
+        depth = found[value]
+        if depth == reach:
             continue
-        for place in index.readers[value]:
-            for out in index.jaxpr.eqns[place].outvars:
+        nxt = depth + 1
+        for place in readers[value]:
+            if place in barriers or (allowed is not None and place not in allowed):
+                continue
+            for out in eqns[place].outvars:
                 if out not in found:
-                    found[out] = found[value] + 1
+                    found[out] = nxt
                     frontier.append(out)
     return found
 
@@ -504,58 +515,70 @@ def _walked(index: fusion.Index, direction: str, var: jcore.Var, reach: int) -> 
     """A walk from `var` in `direction` within `reach` equations, walked once a body and held on its index:
     every candidate of an anchor walks from the same rows and results again."""
     if (direction, var, reach) not in index.walks:
-        walk = _walked_forward if direction == "forward" else _walked_back
-        index.walks[direction, var, reach] = walk(index, var, reach)
+        allowed = _entrywise_places(index) if direction.startswith("entrywise_") else None
+        walk = _walked_forward if direction.endswith("forward") else _walked_back
+        index.walks[direction, var, reach] = walk(index, var, reach, allowed)
     return index.walks[direction, var, reach]
 
 
-def _walked_back(index: fusion.Index, var: jcore.Var, reach: int) -> dict[jcore.Var, int]:
-    """`_backward`'s walk."""
+def _walked_back(index: fusion.Index, var: jcore.Var, reach: int,
+                 allowed: frozenset[int] | None = None) -> dict[jcore.Var, int]:
+    """`_backward`'s walk, stopping at barriers (`_barriers`) and outside `allowed` when given."""
     found, frontier = {var: 0}, collections.deque([var])
+    eqns, producer, barriers = index.jaxpr.eqns, index.producer, _barriers(index)
     while frontier:
         value = frontier.popleft()
-        place = index.producer.get(value)
-        if place is None or found[value] == reach:
+        place = producer.get(value)
+        if (place is None or found[value] == reach or place in barriers
+                or (allowed is not None and place not in allowed)):
             continue
-        for atom in index.jaxpr.eqns[place].invars:
+        nxt = found[value] + 1
+        for atom in eqns[place].invars:
             if isinstance(atom, jcore.Var) and atom not in found:
-                found[atom] = found[value] + 1
+                found[atom] = nxt
                 frontier.append(atom)
     return found
 
 
-def _extras(index: fusion.Index, row: jcore.Var | Sequence[jcore.Var], output: jcore.Var,
-            most: int) -> list[jcore.Var] | None:
+def _extras(index: fusion.Index, row: jcore.Var | Sequence[jcore.Var], output: jcore.Var, most: int, *,
+            reach: int = 2 * REACH, reached: Sequence[dict[jcore.Var, int]] | None = None
+            ) -> list[jcore.Var] | None:
     """The values beside `row` (one value, or several: attention's query, keys and values) the equations
     from it to `output` read: each a value of the body made from neither it nor constants alone (a weight,
-    a gate, a branch, a bias), in the order first read; None where `output` is not made from every one, or
-    where it reads more than `most`, which no caller takes. Made from a row is read as far as a candidate's
-    operands lie from its results (twice `REACH`).
-
-    The walk back from `output` stops when it finds more than `most` extras: a caller refuses such a pair,
-    so the values the walk has not yet reached need no visit. A family walks every pair of an anchor's
-    operands and results (`_swiglus`), and where a result lies a layer past its operand (a convolution is
-    one equation), walking the pair whole crosses most of the layer (row 5524)."""
+    a gate, a branch, a bias), in the order first read; None where `output` is not made from every one,
+    where it crosses a barrier or exceeds `SPAN` equations (`_between` refuses both), or where it reads
+    more than `most`, which no caller takes. Made from a row is read as far as `reach` (default twice
+    `REACH`, or tighter where the caller's anchor bounds the subgraph, e.g. `_swiglus`)."""
     rows = (row,) if isinstance(row, jcore.Var) else tuple(row)
-    reached = [_forward(index, source, 2 * REACH) for source in rows]
-    if not all(output in found for found in reached):
+    walks = [_forward(index, source, reach) for source in rows] if reached is None else reached
+    if not all(output in found for found in walks):
         return None
-    descendants = reached[0] if len(reached) == 1 else set().union(*reached)
+    descendants = walks[0] if len(walks) == 1 else set().union(*walks)
+    consts, barriers = _constants(index), _barriers(index)
+    eqns, producer = index.jaxpr.eqns, index.producer
     extras: dict[jcore.Var, None] = {}
-    seen, frontier = set(), [output]
+    seen: set[jcore.Var] = set()
+    places: set[int] = set()
+    frontier = [output]
     while frontier:
         var = frontier.pop()
         if var in seen or var in rows:
             continue
         seen.add(var)
-        if var not in descendants and not _constant(index, var):
+        if var not in descendants and var not in consts:
             extras[var] = None
             if len(extras) > most:
                 return None
             continue
-        place = index.producer.get(var)
+        place = producer.get(var)
         if place is not None:
-            frontier += [atom for atom in index.jaxpr.eqns[place].invars if isinstance(atom, jcore.Var)]
+            if place in barriers:
+                return None
+            if place not in places:
+                places.add(place)
+                if len(places) > SPAN:
+                    return None
+                frontier.extend(atom for atom in eqns[place].invars if isinstance(atom, jcore.Var))
     return list(extras)
 
 
@@ -575,6 +598,74 @@ def _constants(index: fusion.Index) -> frozenset[jcore.Var]:
                 found.update(equation.outvars)
         index.constants = frozenset(found)
     return index.constants
+
+
+def _barriers(index: fusion.Index) -> frozenset[int]:
+    """Places of equations no recognized region may hold (effects or `BARRIERS`), cached once on `index`."""
+    if index.barriers is None:
+        index.barriers = frozenset(
+            place for place, equation in enumerate(index.jaxpr.eqns)
+            if equation.effects or _binds(equation, BARRIERS))
+    return index.barriers
+
+
+_UNIT_LAYOUTS = (jax.lax.reshape_p, jax.lax.squeeze_p, jax.lax.broadcast_in_dim_p)
+"""Layout primitives that may insert or remove unit axes around an activation (`normal_form._erased`)."""
+
+
+def _unit_layout(equation: jcore.JaxprEqn) -> bool:
+    """Whether `equation` only inserts or removes size-1 axes without changing non-unit extents."""
+    if equation.primitive not in _UNIT_LAYOUTS or len(equation.invars) != 1 or len(equation.outvars) != 1:
+        return False
+    source = equation.invars[0]
+    if not isinstance(source, jcore.Var):
+        return False
+    return (tuple(d for d in aval(source).shape if d != 1)
+            == tuple(d for d in aval(equation.outvars[0]).shape if d != 1))
+
+
+def _entrywise_eqn(equation: jcore.JaxprEqn) -> bool:
+    """Whether `equation` computes one elementwise result: a direct entrywise primitive, a unit-axis-only
+    layout (`_unit_layout`), Dew's stated entrywise operation (`_read_as`), or a transparent call
+    (`purely_called`, e.g. `jax.nn.silu`) whose body binds only entrywise primitives, nested transparent
+    calls, or unit-axis layouts."""
+    if len(equation.outvars) != 1:
+        return False
+    if (read := _read_as(equation)) is not None:
+        return entrywise(read)
+    if entrywise(equation.primitive) or _unit_layout(equation):
+        return True
+    body = purely_called(equation)
+    if body is None:
+        return False
+    bound = _bound(body)
+    return bool(bound) and all(
+        entrywise(p) or p.transparent_call or p in _UNIT_LAYOUTS for p in bound)
+
+
+def _entrywise_places(index: fusion.Index) -> frozenset[int]:
+    """Places of single-output, barrier-free elementwise equations (`_entrywise_eqn`), cached on `index`."""
+    if index.entrywise is None:
+        barriers = _barriers(index)
+        index.entrywise = frozenset(
+            place for place, equation in enumerate(index.jaxpr.eqns)
+            if place not in barriers and _entrywise_eqn(equation))
+    return index.entrywise
+
+
+def _scalar_anchor(index: fusion.Index, place: int) -> bool:
+    """Whether `place` can anchor a single-value recognition (`_norms`, `_attentions`): not a barrier,
+    making one output, and (when a nested call) binding no matrix product or control flow whose body is
+    searched apart (row 12465)."""
+    if place in _barriers(index):
+        return False
+    equation = index.jaxpr.eqns[place]
+    if len(equation.outvars) != 1:
+        return False
+    body = purely_called(equation)
+    if body is None:
+        return True
+    return not any(p is jax.lax.dot_general_p or control_flow(p) for p in _bound(body))
 
 
 def _scalars(index: fusion.Index, places: Sequence[int],
@@ -611,26 +702,39 @@ def _norms(index: fusion.Index, place: int) -> Iterator[Candidate]:
     is tried as a
     stream's too, the sum among the results. The weight's side of the cast and its association (folded
     into the inverse first, Flax's `x (r w)`, `weight_first`) are each the call's own choices."""
+    if not _scalar_anchor(index, place):
+        return
     anchor = index.jaxpr.eqns[place].outvars[0]
-    rows = [(0, row) for row in _summed_rows(index, anchor)]
-    outputs = sorted(((distance, var) for var, distance in _forward(index, anchor).items()
-                      if var is not anchor and aval(var).ndim >= 1), key=lambda pair: -pair[0])
-    for (_, row), (_, output) in itertools.product(rows, outputs):
-        made = aval(output)
-        if aval(row).shape != made.shape or not jnp.issubdtype(made.dtype, jnp.floating):
+    rows = _summed_rows(index, anchor)
+    if not rows:
+        return
+    outputs_by_shape: dict[tuple[int, ...], list[jcore.Var]] = collections.defaultdict(list)
+    for _, var in sorted(((distance, var) for var, distance in _forward(index, anchor).items()
+                          if var is not anchor and aval(var).ndim >= 1), key=lambda pair: -pair[0]):
+        made = aval(var)
+        if jnp.issubdtype(made.dtype, jnp.floating):
+            outputs_by_shape[made.shape].append(var)
+    for row in rows:
+        matched = outputs_by_shape.get(aval(row).shape)
+        if not matched:
             continue
-        found = _extras(index, row, output, most=2)
-        if found is None:
-            continue
-        width = aval(row).shape[-1]
-        for extras in itertools.product(*(_chain(index, var) for var in found)):
-            weights = [var for var in extras if aval(var).shape == (width,)]
-            gates = [var for var in extras if aval(var).shape == aval(row).shape]
-            if len(weights) > 1 or len(gates) > 1 or len(weights) + len(gates) != len(extras):
+        descendants = _forward(index, row, 2 * REACH)
+        for output in matched:
+            if output not in descendants:
                 continue
-            epsilons = _scalars(index, _between(index, (row, *extras), (output,)) or (), (jax.lax.add_p,))
-            yield from _norm_candidates(index, row, output, weights[0] if weights else None,
-                                        gates[0] if gates else None, epsilons)
+            found = _extras(index, row, output, most=2, reached=(descendants,))
+            if found is None:
+                continue
+            width = aval(row).shape[-1]
+            for extras in itertools.product(*(_chain(index, var) for var in found)):
+                weights = [var for var in extras if aval(var).shape == (width,)]
+                gates = [var for var in extras if aval(var).shape == aval(row).shape]
+                if len(weights) > 1 or len(gates) > 1 or len(weights) + len(gates) != len(extras):
+                    continue
+                epsilons = _scalars(index, _between(index, (row, *extras), (output,)) or (),
+                                    (jax.lax.add_p,))
+                yield from _norm_candidates(index, row, output, weights[0] if weights else None,
+                                            gates[0] if gates else None, epsilons)
 
 
 def _norm_candidates(index: fusion.Index, row: jcore.Var, output: jcore.Var, weight: jcore.Var | None,
@@ -689,36 +793,52 @@ def _swiglus(index: fusion.Index, place: int) -> Iterator[Candidate]:
     from dew.nn.activations import gated_product, packed_gated_product
     from dew.nn.kernels import norm_swiglu
 
+    if place not in _entrywise_places(index):
+        return
     anchor = index.jaxpr.eqns[place].outvars[0]
-    gates = sorted(((distance, var) for var, distance in _backward(index, anchor, 3).items()
+    gates = sorted(((distance, var)
+                    for var, distance in _walked(index, "entrywise_backward", anchor, 3).items()
                     if var is not anchor and aval(var).ndim >= 1), key=lambda pair: -pair[0])
-    outputs = sorted(((distance, var) for var, distance in _forward(index, anchor, 4).items()
-                      if var is not anchor and aval(var).ndim >= 1), key=lambda pair: -pair[0])
-    for (_, gate), (_, output) in itertools.product(gates, outputs):
-        if aval(gate).shape != aval(output).shape:
+    if not gates:
+        return
+    outputs_by_shape: dict[tuple[int, ...], list[jcore.Var]] = collections.defaultdict(list)
+    for _, var in sorted(((distance, var)
+                          for var, distance in _walked(index, "entrywise_forward", anchor, 4).items()
+                          if var is not anchor and aval(var).ndim >= 1), key=lambda pair: -pair[0]):
+        outputs_by_shape[aval(var).shape].append(var)
+    for _, gate in gates:
+        matched = outputs_by_shape.get(aval(gate).shape)
+        if not matched:
             continue
-        extras = _extras(index, gate, output, most=1)
-        if extras is None or len(extras) != 1:
-            continue
-        ups = [var for var in _chain(index, extras[0]) if aval(var).shape == aval(gate).shape]
-        if not ups:
-            continue
-        up, dtype = ups[-1], aval(output).dtype
-        packed = _packed(index, gate, up)
-        if packed is not None:
-            def halves(gate_up, implementation='auto', dtype=dtype):
-                return packed_gated_product("swiglu", implementation=implementation)(gate_up).astype(dtype)
+        # Every SwiGLU equation between `gate` and `output` is elementwise within `REACH` hops, avoiding
+        # cross-layer / cross-projection fanout on deep models (row 12465).
+        descendants = _walked(index, "entrywise_forward", gate, REACH)
+        for output in matched:
+            if output not in descendants:
+                continue
+            extras = _extras(index, gate, output, most=1, reach=REACH, reached=(descendants,))
+            if extras is None or len(extras) != 1:
+                continue
+            ups = [var for var in _chain(index, extras[0]) if aval(var).shape == aval(gate).shape]
+            if not ups:
+                continue
+            up, dtype = ups[-1], aval(output).dtype
+            packed = _packed(index, gate, up)
+            if packed is not None:
+                def halves(gate_up, implementation='auto', dtype=dtype):
+                    made = packed_gated_product("swiglu", implementation=implementation)(gate_up)
+                    return made.astype(dtype)
 
-            yield Candidate((packed,), (output,), halves, functools.partial(halves, implementation='xla'),
-                            lambda packed=packed: norm_swiglu.packed_swiglu_kernel("auto", _shape(packed))
-                            == "pallas")
+                yield Candidate((packed,), (output,), halves, functools.partial(halves, implementation='xla'),
+                                lambda packed=packed: norm_swiglu.packed_swiglu_kernel(
+                                    "auto", _shape(packed)) == "pallas")
 
-        def product(g, u, implementation='auto', dtype=dtype):
-            return gated_product("swiglu", implementation=implementation)(g, u).astype(dtype)
+            def product(g, u, implementation='auto', dtype=dtype):
+                return gated_product("swiglu", implementation=implementation)(g, u).astype(dtype)
 
-        yield Candidate((gate, up), (output,), product, functools.partial(product, implementation='xla'),
-                        lambda gate=gate, up=up: norm_swiglu.swiglu_kernel("auto", _shape(gate), _shape(up))
-                        == "pallas")
+            yield Candidate((gate, up), (output,), product, functools.partial(product, implementation='xla'),
+                            lambda gate=gate, up=up: norm_swiglu.swiglu_kernel(
+                                "auto", _shape(gate), _shape(up)) == "pallas")
 
 
 def _packed(index: fusion.Index, gate: jcore.Var, up: jcore.Var) -> jcore.Var | None:
@@ -788,12 +908,16 @@ def _attentions(index: fusion.Index, place: int) -> Iterator[Candidate]:
     product (Flax's) or on the float32 logits after it (jax.nn's), each tried. Its declaration is the call's
     portable path, on its reference path (`implementation='reference'`), its products as its kernels compute
     them."""
+    if not _scalar_anchor(index, place):
+        return
     anchor = index.jaxpr.eqns[place].outvars[0]
     logits = _nearest_product(index, _backward(index, anchor), upstream=True)
-    weighed = _nearest_product(index, _forward(index, anchor), upstream=False)
-    if logits is None or weighed is None:
+    if logits is None:
         return
     reached = _forward(index, anchor)
+    weighed = _nearest_product(index, reached, upstream=False)
+    if weighed is None:
+        return
     query, key = index.jaxpr.eqns[logits].invars
     values = next((atom for atom in index.jaxpr.eqns[weighed].invars if atom not in reached), None)
     if not (isinstance(query, jcore.Var) and isinstance(key, jcore.Var) and isinstance(values, jcore.Var)):

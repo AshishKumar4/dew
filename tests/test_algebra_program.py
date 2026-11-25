@@ -1100,7 +1100,9 @@ def test_a_products_mode_prices_it():
     half, tf32, highest = (product(None, jnp.bfloat16), product(jax.lax.Precision.DEFAULT, jnp.float32),
                            product(jax.lax.Precision.HIGHEST, jnp.float32))
     flops = 2.0 * 64 ** 3
-    assert (half.flops, tf32.tf32_flops, highest.operations) == (flops, flops, flops)
+    # The CUDA cores' FFMAs, a multiply an instruction and its add fused into it (`Work.fused_multiply_adds`).
+    assert (half.flops, tf32.tf32_flops, highest.operations, highest.fused_multiply_adds) == (
+        flops, flops, flops / 2, flops / 2)
     # A dot algorithm by its fields is its preset's: three 16-bit products.
     spelled = jax.lax.DotAlgorithm(jnp.bfloat16, jnp.bfloat16, jnp.float32, num_primitive_operations=3)
     assert product(spelled, jnp.float32) == product(jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X3, jnp.float32)
@@ -1144,6 +1146,33 @@ def test_a_terms_arithmetic_is_what_the_kernels_counter_prices_its_operation_at(
     counted = emission.emitted(traced.jaxpr, 1, None).fixed
     fields = ("operations", "exponentials", "conversions")
     assert [getattr(price.work, field) for field in fields] == [getattr(counted, field) for field in fields]
+
+
+def test_an_xla_programs_division_prices_on_its_target_at_its_dtype():
+    """An XLA program's fp32 division priced for an H100 issues `div.rn.f32`'s MUFU and refinement
+    (`emission.IEEE_DIVISION`, M-FS-77) on whatever host prices it, and for a TPU an operation an element; an
+    int32 division and a bfloat16 one an operation an element on either, a division of a program of other
+    than fp32 values unproven fp32 (the review of lane/toolkit 58143d37f: the algebra priced on the
+    process's own target, every division at fp32)."""
+    hopper, tpu = generation.TARGETS["sm90"], generation.TARGETS["v5e"]
+    elements = 64 * 128
+
+    def priced(dtype, target):
+        rows = jax.ShapeDtypeStruct((64, 128), dtype)
+        closed = jax.make_jaxpr(lambda x, y: jax.lax.div(x, y))(rows, rows).jaxpr
+        return program.priced(closed, target).work
+
+    assert (priced(jnp.float32, hopper).exponentials, priced(jnp.float32, hopper).operations) == (
+        elements, 6 * elements)
+    for dtype, target in ((jnp.float32, tpu), (jnp.int32, hopper), (jnp.bfloat16, hopper)):
+        assert priced(dtype, target).exponentials == 0, (dtype, target)
+    # A masked fp32 division (its mask's bools beside its fp32 values) is fp32's.
+    rows = jax.ShapeDtypeStruct((64, 128), jnp.float32)
+    masked = jax.make_jaxpr(lambda x, y: jnp.where(y > 0, x / y, 0.0))(rows, rows).jaxpr
+    assert program.priced(masked, hopper).work.exponentials == elements
+    # A quotient a rewrite made, which no trace typed (`rules._ranged`'s of a bfloat16 program), its dtype
+    # unproven: an operation an element, as a bfloat16 one (the review of lane/toolkit f8963150b).
+    assert cost._priced(jax.lax.div_p, {}, [(64,), (64,)], (64,), hopper) == cost.Work(operations=64)
 
 
 def test_an_operation_no_rule_prices_makes_no_form_cheaper_for_taking_more_of_it():
@@ -1970,3 +1999,159 @@ def test_a_checkpoints_body_holding_a_span_of_a_constant_lowers_as_written():
     assert cheaper_spliced(both, *rows(20, *SHAPES_MARKED))
     assert_as_exact(jax.jit(algebra.rewritten(both)), jax.jit(both), lambda seed: rows(seed, *SHAPES_MARKED),
                     "a checkpoint's span of a constant beside joined sums", seeds=8)
+
+
+@pytest.mark.parametrize(
+    "case", ["same_shape", "broadcast_after_sqrt", "sqrt_after_broadcast", "unbounded_a"])
+def test_reuse_pulls_sibling_rsqrt_into_division_windows_and_drops_sqrt(case):
+    """When `reuse` is active, `program._windows` pulls sibling `rsqrt(v)` equations into `a / sqrt(v)`'s
+    window (same-shape, broadcast after `sqrt`, `sqrt` after broadcast, and unbounded dividend `a` when
+    `|v| >= 1`, i.e. `floor >= 0`), eliminating `sqrt` and `div` while holding check 1 against float64."""
+    def fn(a, z):
+        v = jnp.sum(jnp.square(jnp.tanh(z)), axis=-1) / float(z.shape[-1]) + 1.0
+        r = jax.lax.rsqrt(v)
+        if case == "same_shape":
+            q = jnp.tanh(a[:, 0]) / jnp.sqrt(v)
+        elif case == "broadcast_after_sqrt":
+            q = jnp.tanh(a) / jnp.sqrt(v)[:, None]
+        elif case == "sqrt_after_broadcast":
+            q = jnp.tanh(a) / jnp.sqrt(v[:, None])
+        else:
+            q = a / jnp.sqrt(v)[:, None]
+        return q, r
+
+    with algebra.rules.enabling_dev("reuse"):
+        x0, z0 = rows(0, (16, 32), (16, 32))
+        before = jax.make_jaxpr(fn)(x0, z0)
+        after = jax.make_jaxpr(algebra.rewritten(fn))(x0, z0)
+        before_eqs, after_eqs = list(equations(before.jaxpr)), list(equations(after.jaxpr))
+        assert any(eq.primitive is jax.lax.sqrt_p for eq in before_eqs)
+        assert not any(eq.primitive is jax.lax.sqrt_p for eq in after_eqs)
+        assert sum(eq.primitive is jax.lax.rsqrt_p for eq in after_eqs) == 1
+        divs_before = sum(eq.primitive is jax.lax.div_p for eq in before_eqs)
+        divs_after = sum(eq.primitive is jax.lax.div_p for eq in after_eqs)
+        assert divs_after == divs_before - 1
+        assert_as_exact(jax.jit(algebra.rewritten(fn)), jax.jit(fn),
+                        lambda seed: rows(seed, (16, 32), (16, 32)), f"reuse {case}", seeds=8)
+
+
+def test_reuse_refuses_unfloored_root_rewrites_reduce_sum_and_keys_jit_context():
+    """An unfloored divisor `v` is never rewritten from `a / sqrt(v)` to `a * rsqrt(v)`, a floored
+    `reduce_sum` divisor rewrites both `a / sqrt(y)[:, None]` (dropping `sqrt_p` and one `div_p`) and direct
+    reciprocal reuse `b + a / y[:, None]` with sibling `1 / y` (leaving only the one shared reciprocal
+    `div_p` and matching float64 Check 1), `enabling_dev` refuses accuracy-measured `bounded` sets (`stable`),
+    and one `jax.jit(rewritten(fn))` callable traces separately across off -> on -> off
+    `enabling_dev("reuse")` transitions."""
+    def unfloored(a, v):
+        pos = jnp.abs(v)
+        return jnp.tanh(a) / jnp.sqrt(pos)[:, None], jax.lax.rsqrt(pos)
+
+    def reduce_sum_root(a, z):
+        y = jnp.sum(jnp.square(jnp.tanh(z)) + 1.0, axis=-1)
+        return a / jnp.sqrt(y)[:, None], jax.lax.rsqrt(y)
+
+    def softmax_like(a, b, z):
+        y = jnp.sum(jnp.square(jnp.tanh(z)) + 1.0, axis=-1)
+        inv = 1.0 / y
+        return b + a / y[:, None], inv
+
+    def gated(a, z):
+        v = jnp.sum(jnp.square(jnp.tanh(z)), axis=-1) / float(z.shape[-1]) + 1.0
+        return jnp.tanh(a) / jnp.sqrt(v)[:, None], jax.lax.rsqrt(v)
+
+    with pytest.raises(ValueError), algebra.rules.enabling_dev("stable"):
+        pass
+    a0, b0, z0 = rows(0, (8, 16), (8, 16), (8, 16))
+    v0 = np.full((8,), 2.0, np.float32)
+    with algebra.rules.enabling_dev("reuse"):
+        after_unfloored = jax.make_jaxpr(algebra.rewritten(unfloored))(a0, v0)
+        assert any(eq.primitive is jax.lax.sqrt_p for eq in equations(after_unfloored.jaxpr))
+
+        before_rs = list(equations(jax.make_jaxpr(reduce_sum_root)(a0, z0).jaxpr))
+        after_rs = list(equations(jax.make_jaxpr(algebra.rewritten(reduce_sum_root))(a0, z0).jaxpr))
+        assert any(eq.primitive is jax.lax.sqrt_p for eq in before_rs)
+        assert not any(eq.primitive is jax.lax.sqrt_p for eq in after_rs)
+        assert sum(eq.primitive is jax.lax.rsqrt_p for eq in after_rs) == 1
+        assert (sum(eq.primitive is jax.lax.div_p for eq in after_rs)
+                == sum(eq.primitive is jax.lax.div_p for eq in before_rs) - 1)
+        assert_as_exact(jax.jit(algebra.rewritten(reduce_sum_root)), jax.jit(reduce_sum_root),
+                        lambda seed: rows(seed, (8, 16), (8, 16)), "reuse reduce_sum root", seeds=8)
+
+        before_sm = list(equations(jax.make_jaxpr(softmax_like)(a0, b0, z0).jaxpr))
+        after_sm = list(equations(jax.make_jaxpr(algebra.rewritten(softmax_like))(a0, b0, z0).jaxpr))
+        assert sum(eq.primitive is jax.lax.div_p for eq in before_sm) == 2
+        assert sum(eq.primitive is jax.lax.div_p for eq in after_sm) == 1
+        assert_as_exact(jax.jit(algebra.rewritten(softmax_like)), jax.jit(softmax_like),
+                        lambda seed: rows(seed, (8, 16), (8, 16), (8, 16)), "reuse reduce_sum", seeds=8)
+    # One jitted callable must trace separately across off -> on -> off scope transitions.
+    jitted = jax.jit(algebra.rewritten(gated))
+    off_before = equations(jitted.trace(a0, z0).jaxpr.jaxpr)
+    assert any(eq.primitive is jax.lax.sqrt_p for eq in off_before)
+    with algebra.rules.enabling_dev("reuse"):
+        on_inside = equations(jitted.trace(a0, z0).jaxpr.jaxpr)
+        assert not any(eq.primitive is jax.lax.sqrt_p for eq in on_inside)
+    off_after = equations(jitted.trace(a0, z0).jaxpr.jaxpr)
+    assert any(eq.primitive is jax.lax.sqrt_p for eq in off_after)
+
+
+def test_dead_nested_result_behind_custom_vmap_is_cleaned_and_unreported():
+    """`custom_vmap_p` registers no JAX DCE rule, so `_within` must still run `_read` inside its body: a
+    dead secondary SwiGLU inside a nested `jit` called by a live `custom_vmap` is removed and emits no
+    `swiglu` route."""
+    from jax.custom_batching import custom_vmap
+
+    @jax.jit
+    def inner(a, b):
+        live = a + b
+        dead_swiglu = jax.nn.silu(a.astype(jnp.float32)).astype(a.dtype) * b
+        return live, dead_swiglu
+
+    @custom_vmap
+    def wrapped_dead(a, b):
+        live, _ = inner(a, b)
+        return live
+
+    wrapped_dead.def_vmap(lambda size, batched, a, b: (wrapped_dead(a, b), batched[0]))
+
+    @custom_vmap
+    def wrapped_live(a, b):
+        live, used_swiglu = inner(a, b)
+        return live + used_swiglu
+
+    wrapped_live.def_vmap(lambda size, batched, a, b: (wrapped_live(a, b), batched[0]))
+
+    shapes = [jax.ShapeDtypeStruct((256, 1024), jnp.bfloat16)] * 2
+    with generation.assumed("sm90"), generation.routes() as found_dead:
+        jax.jit(algebra.rewritten(wrapped_dead, kernels=True)).trace(*shapes)
+    assert not any(route.choice == "swiglu" for route in found_dead)
+    with generation.assumed("sm90"), generation.routes() as found_live:
+        jax.jit(algebra.rewritten(wrapped_live, kernels=True)).trace(*shapes)
+    assert any(route.choice == "swiglu" and route.kernel != "xla" for route in found_live)
+
+
+def test_shared_divisor_fanout_stays_bounded_and_proven_matches_region_on_chained_broadcasts():
+    """High-fanout shared producers hitting `CLUSTER` stay capped in `program._windows`, and `terms.proven`
+    matches `terms.region` bit-for-bit on chained broadcasts of unbounded float inputs."""
+    def fanout(xs, z):
+        v = jnp.sum(jnp.square(jnp.tanh(z)), axis=-1) / float(z.shape[-1]) + 1.0
+        root = jnp.sqrt(v)[:, None]
+        inv = jax.lax.rsqrt(v)
+        outs = [xs[i] / root for i in range(len(xs))]
+        return tuple(outs), inv
+
+    z0 = np.ones((8, 16), np.float32)
+    xs0 = tuple(np.ones((8, 16), np.float32) for _ in range(120))
+    with algebra.rules.enabling_dev("reuse"):
+        closed_fan = jax.make_jaxpr(fanout)(xs0, z0)
+        wins = program._windows(closed_fan.jaxpr)
+    assert wins and all(len(win.eqns) <= program.CLUSTER for win, _ in wins)
+
+    def chained_bcast(x):
+        b1 = jax.lax.broadcast_in_dim(x, (4, 8, 1), (0, 1))
+        return jax.lax.broadcast_in_dim(b1, (4, 8, 16), (0, 1, 2))
+
+    closed_b = jax.make_jaxpr(chained_bcast)(jax.ShapeDtypeStruct((4, 8), jnp.float32))
+    reg = terms.region(closed_b)
+    p_held, p_apart = terms.proven(closed_b.jaxpr)
+    assert p_held == reg.held
+    assert p_apart == reg.apart

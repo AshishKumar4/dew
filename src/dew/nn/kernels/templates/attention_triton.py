@@ -58,11 +58,13 @@ from dew.nn.kernels.templates.attention import (
     kernel_rows,
     key_tiles,
     launch_arguments,
+    launch_cotangent,
     output_split,
     padded_call,
     prescaled,
     prologues_taken,
     scored,
+    shared_place,
     within,
 )
 from dew.nn.kernels.templates.base import Template
@@ -599,12 +601,13 @@ def _split(ba: tokamax.BoundArguments) -> bool:
 def _derived[T: (Tiles, BackwardTiles)](launch: Template[T], ba: tokamax.BoundArguments,
                                        target: generation.GpuTarget, tiles: Callable[[int, int, int], T], *,
                                        held: int, walked: int) -> T | None:
-    """A launch's tile from the facts (design §7, as the Mosaic mainloop's `attention_mosaic._derived`), no
-    space ranked: the tile a program holds whole (a forward's queries, a backward's keys, the dK/dV launch's
-    accumulated rows) `BLOCK`, four warps of `ROWS` each, FlashAttention 2's 128 a program, and
-    the tile it walks the largest of `EXTENTS` whose program holds (`legal`: the block's shared memory
-    and a thread's registers), stepping down the held tile only where no walked one does; each dividing the
-    call's padded extent it lies along (`held`, `walked`; a longer tile holds padding alone).
+    """A launch's tile from the facts (design §7, as the Mosaic mainloop's
+    `attention_mosaic_derivation._derived`), no space ranked: the tile a program holds whole (a forward's
+    queries, a backward's keys, the dK/dV launch's accumulated rows) `BLOCK`, four warps of `ROWS` each,
+    FlashAttention 2's 128 a program, and the tile it walks the largest of `EXTENTS` whose program holds
+    (`legal`: the block's shared memory and a thread's registers), stepping down the held tile only where no
+    walked one does; each dividing the call's padded extent it lies along (`held`, `walked`; a longer tile
+    holds padding alone).
     `tiles(held, walked, warps)` builds the config. At width 128, bf16: a forward takes 128 by 64, the order
     measured within 6% of the fastest on an A100 and an H100 (ATT-ZERO3-a100, ATT-ZERO4-h100), a training walk
     64 by 64, the tile measured fastest of it where its anchor row puts 128 rows past a thread's registers
@@ -654,12 +657,23 @@ def _resident[T: (Tiles, BackwardTiles)](launch: Template[T], ba: tokamax.BoundA
 
 def _param_spec(kind: Kind, param: jax.Array, block_q: int, keys: int) -> pl.BlockSpec:
     """How a program reads a hook parameter of `kind` (`Kind.axes`): a head's scalar from the whole `[H]`,
-    else its batch row's and head's block of its queries' block, every key and the whole width."""
+    else its batch row's and head's block (`_block_of`) of its queries' block, every key and the whole
+    width."""
     if kind is Kind.HEAD:
         return pl.BlockSpec(param.shape, lambda i, b, h: (0,))
     extents = {"batch": None, "heads": None, "queries": block_q, "keys": keys, "width": param.shape[-1]}
     return pl.BlockSpec(axes.named(kind.axes, extents),
-                        lambda i, b, h: axes.placed(kind.axes, {"batch": b, "heads": h, "queries": i}, 0))
+                        lambda i, b, h: _block_of(kind, param, b, h, queries=i))
+
+
+def _block_of(kind: Kind, param: jax.Array, row, head, **walked) -> tuple:
+    """The block a program of batch row `row` and query head `head` reads of a parameter of `kind`, at its
+    `walked` axes' blocks and every other's first: a query's, key's or tile's `[B or 1, H or 1, ...]` at the
+    row and head it shares where it holds one for every row or head (`shared_place`: T5's `[1, H, Q, K]`
+    table read by every row, never broadcast), an output's at its own."""
+    if kind in (Kind.QUERY, Kind.KEY, Kind.TILE):
+        row, head = shared_place(param.shape, row, head)
+    return axes.placed(kind.axes, {"batch": row, "heads": head, **walked}, 0)
 
 
 @overload
@@ -1118,9 +1132,12 @@ def _backward_registers(ba: tokamax.BoundArguments, config: BackwardTiles, *, dq
     return (config.block_k * (width + value_width) + tile) // (32 * config.dkv_warps)
 
 
-def _like(param: jax.Array) -> outputs.Output:
-    """A score hook parameter's gradient, fp32, as the parameter's own axes (`outputs.Output`)."""
-    return outputs.output(jnp.float32, *(outputs.axis(param, index) for index in range(param.ndim)))
+def _per_row(query: jax.Array, param: jax.Array) -> outputs.Output:
+    """A score hook parameter's gradient, fp32, a batch row's and query head's apiece (`outputs.Output`):
+    the query's rows and heads, then the parameter's own axes, whatever rows and heads it shares
+    (`template.gradients` sums those, `hook_gradient`)."""
+    return outputs.output(jnp.float32, outputs.axis(query, 0), outputs.axis(query, 2),
+                          *(outputs.axis(param, index) for index in range(2, param.ndim)))
 
 
 def _geometry(query, key, value, start, end, query_ids, key_ids, block_q: int, block_k: int):
@@ -1188,7 +1205,7 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
                 out_shape.append(outputs.output(jnp.float32, positions // block_q, rows, heads_of, 1))
                 out_specs.append(pl.BlockSpec((None, None, None, 1), lambda i, b, h: (i, b, h, 0)))
             case Kind.QUERY:
-                out_shape.append(_like(param))
+                out_shape.append(_per_row(query, param))
                 out_specs.append(per_head)
     kernel = functools.partial(_dq_kernel, ids=ids, score_kinds=score_kinds,
                                score_mod=score_mod, scale=scale, prescale=prescale, grad_scale=grad_scale,
@@ -1243,15 +1260,16 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
     aliases = {}
     for param, kind in zip(score_params, score_kinds, strict=True):
         if kind == Kind.KEY:
-            out_shape.append(_like(param))
+            out_shape.append(_per_row(query, param))
             out_specs.append(pl.BlockSpec((None, None, block_k), lambda j, b, h: (b, h, j)))
         elif kind == Kind.TILE:
             # Entries no program visits keep their zeros: the output aliases a zero input.
             columns = pl.BlockSpec((None, None, queries, block_k), lambda j, b, h: (b, h, 0, j))
             aliases[len(arrays)] = len(out_shape)
             in_specs.append(columns)
-            arrays.append(launches.filled(param.shape, jnp.float32, query, dout))
-            out_shape.append(_like(param))
+            arrays.append(launches.filled((query.shape[0], query.shape[2], *param.shape[2:]), jnp.float32,
+                                          query, dout))
+            out_shape.append(_per_row(query, param))
             out_specs.append(columns)
     kernel = functools.partial(_dkv_kernel, ids=ids, score_kinds=score_kinds,
                                score_mod=score_mod, scale=scale, prescale=prescale, grad_scale=grad_scale,
@@ -1268,14 +1286,14 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
 
 def _key_param_spec(kind: Kind, param: jax.Array, queries: int, block_k: int) -> pl.BlockSpec:
     """How a dK/dV program reads a hook parameter of `kind` (`Kind.axes`): a head's scalar from the whole
-    `[H]`, else its batch row's and head's block of every query and its key block."""
+    `[H]`, else its batch row's and head's block (`_block_of`) of every query and its key block."""
     if kind is Kind.OUTPUT:
         raise ValueError("an output hook's parameter has no score tile")
     if kind is Kind.HEAD:
         return pl.BlockSpec(param.shape, lambda j, b, h: (0,))
     extents = {"batch": None, "heads": None, "queries": queries, "keys": block_k}
     return pl.BlockSpec(axes.named(kind.axes, extents),
-                        lambda j, b, h: axes.placed(kind.axes, {"batch": b, "heads": h, "keys": j}, 0))
+                        lambda j, b, h: _block_of(kind, param, b, h, keys=j))
 
 
 def _backward_op(*, score_mod, score_kinds: tuple[Kind, ...], score_dtypes: tuple[str, ...], scale: float,
@@ -1304,6 +1322,7 @@ def backward_unfitted(query: jax.Array, key: jax.Array, value: jax.Array, spans:
     fits the GPU (`Template.fits`), and where `certified` holds as its assembler builds it (`_holding`), or
     None: the route then takes another mainloop (`attention_route`)."""
     hooks = Hooks() if hooks is None else hooks
+    dout = launch_cotangent(dout, query.dtype, hooks, residuals[1])
     arrays, params, _ = launch_arguments(query, key, value, spans, hooks, dout, residuals, block=BLOCK,
                                          scale=scale)
     op = _backward_op(**params, split=True, natural=natural, accurate=accurate,

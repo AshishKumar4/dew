@@ -26,18 +26,27 @@ from test_attention_mosaic import ON_HOPPER
 
 from dew.nn.attention import AttentionImpl, scaled_dot_product_attention
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import attention as template, attention_mosaic, attention_route, bundles
+from dew.nn.kernels.templates import (
+    attention as template,
+    attention_mosaic,
+    attention_mosaic_derivation,
+    attention_route,
+    bundles,
+)
 from dew.nn.precision import at_least_fp32
 
 TILES = attention_mosaic.BackwardTiles
 CALLS = {
     "fused-64": (64, 8, 2, TILES(128, 64, 2, 2, fused=True, family="wgmma.fed")),
     "fused-128": (128, 8, 2, TILES(64, 64, 2, 2, fused=True, family="wgmma.fed")),
+    "producer-64": (64, 8, 2, TILES(128, 64, 2, 2, fused=True, family="wgmma")),
+    "producer-128": (128, 8, 2, TILES(64, 64, 2, 2, fused=True, family="wgmma")),
     "shared-256": (256, 8, 4, TILES(64, 64, 2, 2, fused=True, family="wgmma.fed", shared_keys=True)),
 }
-"""The one launch's forms on an H100, by head width: the queries-first launch at widths 64 and 128 and the
-shared-keys launch at 256 (`MosaicBackward.derived`'s picks where it takes one launch), 8 query heads over 2
-or 4 key heads, each pinned so the check holds wherever the derived default goes."""
+"""The one launch's forms on an H100, by head width: the queries-first launch at widths 64 and 128, on the
+fed layout and on its producer's (`attention_mosaic.producer_raised`), and the shared-keys launch at 256
+(`MosaicBackward.derived`'s picks where it takes one launch), 8 query heads over 2 or 4 key heads, each
+pinned so the check holds wherever the derived default goes."""
 LENGTH = 1024
 HEADS = 8
 SEEDS = 8
@@ -90,9 +99,9 @@ padding over 1024 keys (ids from 1: 0 is padding), a window of 256, 8 query head
 
 def one_launch(width: int, step_operands: tuple) -> TILES:
     """The one launch on wgmma's fed rings that the backward's derivation gives row 3171's call at `width`
-    on this GPU (`MosaicBackward.derived`'s search over the fed layout, `attention_mosaic._derived`, each
-    config held to this GPU's legality): the config the call's backward is pinned to, whichever the
-    derivation takes over that layout here."""
+    on this GPU (`MosaicBackward.derived`'s search over the fed layout,
+    `attention_mosaic_derivation._derived`, each config held to this GPU's legality): the config the call's
+    backward is pinned to, whichever the derivation takes over that layout here."""
     query, key, value, dout = step_operands
     spans = _spans()
     # The residuals' shapes alone: legality reads no value.
@@ -107,9 +116,10 @@ def one_launch(width: int, step_operands: tuple) -> TILES:
     def fed_fused(rows: int, walked: int, consumers: int) -> TILES:
         return TILES(walked, rows, 2, consumers, fused=True, family=fed.name)
 
-    taken = attention_mosaic._derived(fed, query.dtype, key.shape[1], query.shape[1], fed_fused,
-                                      lambda config: op.legal(ba, config, target),
-                                      least_held=attention_mosaic._role_rows, overlapped=True)
+    taken = attention_mosaic_derivation._derived(fed, query.dtype, key.shape[1], query.shape[1], fed_fused,
+                                                 lambda config: op.legal(ba, config, target),
+                                                 least_held=attention_mosaic_derivation._role_rows,
+                                                 overlapped=True)
     assert taken is not None, f"no one launch on wgmma's fed rings holds row 3171's call at width {width}"
     return taken
 

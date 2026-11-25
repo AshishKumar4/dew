@@ -237,7 +237,8 @@ def test_restored_blockwise_cublaslt_references_prepare_on_sm90(tmp_path, monkey
     import generation_support
     import model_flows
     import tier_wire
-    from truths_ahead import AT_RUN, DEFERRED, HELD, SITE, UNPREPARED, prepared
+    from tier_wire import DEFERRED
+    from truths_ahead import AT_RUN, HELD, SITE, UNPREPARED, prepared
 
     monkeypatch.setenv(model_flows.TOPOLOGY, str(generation_support.node_topology(tmp_path / "topology.bin",
                                                                                    gpu="sm90")))

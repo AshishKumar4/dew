@@ -13,6 +13,7 @@ from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation, launches, tuning
 from dew.nn.kernels.templates import (
+    across,
     attention_algebra as algebra,
     mosaic,
     outputs,
@@ -64,6 +65,17 @@ class FusedStaging:
     streamed: int
     typed: bool
     allocations: tuple[list, dict, list]
+
+
+def dq_summed(family: mosaic.Family, consumers: int) -> bool:
+    """Whether a fused launch's consumers sum each query tile's dQ between them before one add
+    (`across.summed_across`): consumers each holding their own keys and walking every streamed step paired
+    (`Transport.walks_streamed`), on a family whose adds are element-wise atomics in global memory, no
+    stage between them (`Transport.adds_through_shared` false, an A100's `red.global.add.f32`), whose count
+    the sum halves: FlashAttention 2's one add a query tile a 128-key block, where an A100's dK/dV launch of
+    one consumer spent 38 to 51% of its unissued cycles throttled on the global queue, 90 to 95% of them at
+    dQ's adds, 2.05 to 2.12 times FlashAttention 2's (M-NA-9-a100, row 5272)."""
+    return consumers > 1 and family.walks_streamed and not family.adds_through_shared
 
 
 def fused_reduces(family: mosaic.Family, reduced: int) -> bool:
@@ -155,17 +167,18 @@ def _fused_gradients(family: mosaic.Family, key: jax.Array, value: jax.Array, wi
 
     return grad_out(key), grad_out(value)
 def walked_sums(walk: _Backward, streams, views, reach: tuple, streamed: tuple, index, segments,
-                shapes: tuple, *, scaled: bool) -> tuple[jax.Array, jax.Array]:
+                shapes: tuple, *, scaled: bool, common: bool = False) -> tuple[jax.Array, jax.Array]:
     """A fused consumer `index`'s dK and dV sums, its walk over `reach` among the tiles its program streams
-    (`Family.walk_own`, `segments(lo, hi)` its steps, `shapes` its sums'); where `scaled`, fp16's running
-    scales carried, dV's and dK's (`_sixteen_step`'s and `attention_mosaic_coop`'s), and its sums taken back
-    by them (`algebra.running_restored`)."""
+    (`Family.walk_own`, `segments(lo, hi)` its steps, `shapes` its sums; `common` where every consumer's
+    segments are the same steps, `_walked_run`'s paired ones, a pipeline a segment); where `scaled`, fp16's
+    running scales carried, dV's and dK's (`_sixteen_step`'s and `attention_mosaic_coop`'s), and its sums
+    taken back by them (`algebra.running_restored`)."""
     family = walk.program.family
     start = (jnp.float32(-jnp.inf),) * 2 if scaled else ()
     scales, (dk, dv) = family.walk_own(
         streams, views, reach, streamed, index,
         lambda streams, lo, hi, counted: family.walk(streams, segments(lo, hi), start, shapes, walk.interpret,
-                                                     first=counted))
+                                                     first=counted), common=common)
     if scales:
         dv, dk = (algebra.running_restored(sums, scale) for sums, scale in zip((dv, dk), scales, strict=True))
     return dk, dv
@@ -193,7 +206,9 @@ def _fused_allocations(family: mosaic.Family, config: BackwardTiles, width: int,
     FlashAttention 3's 21.8k); and the output stage scoped after the walks where no add reads it, the walks'
     slots its memory (`Family.scoped`'s `after_walks`: two mma.sync consumers' 64 x 64 launch then fits an
     A100, FS-4324-TWO2's 229,424 bytes held whole against its 166,912); where dK and dV leave `typed`
-    (`fused_staging`), in `dtype` through a stage of their own after the walks, rounded once there."""
+    (`fused_staging`), in `dtype` through a stage of their own after the walks, rounded once there; where the
+    consumers sum each tile's dQ before its add (`dq_summed`), the sum's parts and barriers
+    (`across.summing`) held across the walks after the load barriers."""
     consumers, block_q, block_k = config.consumers, config.block_q, config.block_k
     held = family.adds_through_shared
     # Double-buffer held chunked fp32 add stages (`stores.staged_columns`: 2 x 32 cols = 32 KB at d128) when
@@ -202,7 +217,12 @@ def _fused_allocations(family: mosaic.Family, config: BackwardTiles, width: int,
     stage_width = stores.staged_columns(width, (jnp.float32,)) if held and width <= 128 else width
     stage_shape = ((consumers, buffers, max(block_q, block_k), stage_width) if buffers > 1
                    else (consumers, max(block_q, block_k), stage_width))
-    stage = family.staged_memory(stage_shape, jnp.float32)
+    # The stage's fp32 rows at the narrowest swizzle where its adds read it: a wgmma accumulator's stores
+    # into it then take no select a register pair (the 128-byte swizzle's: 256 FSEL of the fused dK/dV's
+    # 3,432 instructions, a compile-only sm90's at Qwen3-8B's widths; 32-byte, 80, and 9 registers fewer;
+    # M-NA-28-gh200's 160M FSEL against FlashAttention 3's 68M, row 5272).
+    stage = family.staged_memory(stage_shape, jnp.float32,
+                                 swizzling.NARROWEST_SWIZZLE_BYTES if held else None)
     kv_swizzles = transposed_swizzles(config, "keys", "values")
     staged_swizzle = swizzling.UNSWIZZLED if family.relay_bytes(block_q, block_k) else None
     scoped = [family.staged_memory((consumers, block_k, width), dtype, kv_swizzles.get("keys")),
@@ -210,7 +230,8 @@ def _fused_allocations(family: mosaic.Family, config: BackwardTiles, width: int,
               family.staged_memory((consumers, 2 * staged_parts(dtype), block_q, block_k), dtype,
                                    staged_swizzle),
               *([stage] if held else []),
-              family.load_barriers(consumers), family.load_barriers(consumers)]
+              family.load_barriers(consumers), family.load_barriers(consumers),
+              *(across.summing((block_q, width), consumers).values() if dq_summed(family, consumers) else ())]
     blocks = {"queries": ((block_q, width), dtype), "douts": ((block_q, width), dtype),
               **{name: ((block_q,), STATISTICS[name])
                  for name in streamed_statistics_order(streamed, anchored=anchored)}}
@@ -270,14 +291,15 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
     if q_slot.dtype == jnp.float16:
         return _sixteen_step(walk, k_smem, staged, add_dq, slots, carry, accumulators, q_first, _tile_scores(
             walk, (q_slot, do_slot), resident, rows_of(slots, q_first), coords, whole(index), shape,
-            masked=masked, whole_operands=True))
+            masked=masked, whole_operands=True, lean=True))
     cotangents_staged = staged.at[1]
     if masked is not None and _splits_scores(walk):
         _, part = _tile_scores(
             walk, (q_slot, do_slot), resident, rows_of(slots, q_first), coords, whole(index), shape,
             masked=masked,
             on_weights=lambda narrowed: family.staged(narrowed, staged.at[0]),
-            after_weights=lambda: family.looped_products(dv_acc, staged.at[0].transpose((1, 0)), do_slot))
+            after_weights=lambda: family.looped_products(dv_acc, staged.at[0].transpose((1, 0)), do_slot),
+            lean=True)
         family.staged(part, cotangents_staged)
         _, dq = family.product_with(
             cotangents_staged, k_smem, (tiles.block_q, k_smem.shape[-1]),
@@ -286,7 +308,7 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
         add_dq(q_first, dq)
         return carry, (dk_acc, dv_acc)
     narrowed, part = _tile_scores(walk, (q_slot, do_slot), resident, rows_of(slots, q_first), coords,
-                                  whole(index), shape, masked=masked)
+                                  whole(index), shape, masked=masked, lean=True)
     # Stage P and dS under one proxy fence so narrowed and part free before products (`dq_and_dkv`).
     with family.staged_together():
         family.staged(narrowed, staged.at[0])
@@ -369,13 +391,16 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
     where key heads are shared, each query head's dK and dV added into its key head's own (FlashAttention 3's
     grouped epilogue, hopper/epilogue_bwd.hpp's CollectiveEpilogueBwdGQA: Qwen3-8B's step 1.7% the faster
     causal, 1.3% full, ET-GQA1-h100, where XLA summed fp32 copies a query head's), into one ref of both
-    (`_fused_called`), else stored (their zeros cost an ungrouped D64 step 1.7%). Returns dQ `[B, Qp, H, D]`,
+    (`_fused_called`), else stored (their zeros cost an ungrouped D64 step 1.7%). Where the consumers walk
+    paired over element-wise adds (`dq_summed`), each query tile's dQ is the consumers' sum, added once
+    (`_dq_summed`). Returns dQ `[B, Qp, H, D]`,
     dK and dV `[B, Kp, KV, D]`: dQ fp32, dK and dV the keys' and values' dtype where it stores them so
     (`stores_typed`), fp32 otherwise."""
     batch, queries, heads, width = query.shape
     keys_padded, kv_heads = key.shape[1], key.shape[2]
     program, consumers = walk.program, walk.consumers
     family = program.family
+    summed = dq_summed(family, consumers)
     block_q, block_k = program.tiles.block_q, program.tiles.block_k
     pair = consumers * block_k
     q_steps = queries // block_q
@@ -393,9 +418,7 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
             dk_ref, dv_ref = stacked.views([dkv_ref], groups)
         else:
             dq_ref, dk_ref, dv_ref, *refs = refs
-        # The output stage where the walks' adds read it; else the epilogue's own, scoped after the walks.
-        k_smem, v_smem, staged, *out_smem, k_loaded, v_loaded = refs
-        out_smem = out_smem[0] if out_smem else None
+        k_smem, v_smem, staged, out_smem, k_loaded, v_loaded, summing = _held_refs(refs, summed=summed)
         row, head = family.program_index("batch"), family.program_index("heads")
         key_head = lax.div(head, group)
         statistics, rows_of = _statistics(family, stat_refs, row, head, block_q, streamed=stats_streamed,
@@ -419,19 +442,20 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
             coords_of = functools.partial(_coords, family, spans_of, row, k_first=k_first,
                                           shape=(block_q, block_k),
                                           draw=None if drop_of is None else drop_of.draw(row, head))
-            adds = functools.partial(_dq_added, walk, dq_ref, out_smem, (row, head), index)
+            adds = _adds_of(walk, dq_ref, out_smem, (row, head), index, summing)
             step = functools.partial(_fused_step, walk, (k_smem.at[index], v_smem.at[index]), rows_of,
                                      staged.at[index], coords_of, whole, adds)
             shapes = ((block_k, width), (block_k, width))
-            run = program.whole_run(k_first, q_steps, spans_of)
+            run = _walked_run(program, consumers, (pair_first, k_first), q_steps, spans_of)
             segments = functools.partial(program.segmented, step, run)
 
             # The tiles its partner reads around its own (`Family.walk_own`); on a layout whose consumers
             # feed their rings, every tile any of the program's keys' readers reads, a tile none of a
             # consumer's own keys sees masked whole, its weights and its dQ zero (FlashAttention 3's two
             # warpgroups a CTA, each its own keys over one query stream).
+            # Paired consumers' segments are their runs intersected (`_walked_run`), the same steps for each.
             dk, dv = walked_sums(walk, streams, views, (lo, hi), streamed, index, segments, shapes,
-                                 scaled=staged_parts(query.dtype) > 1)
+                                 scaled=staged_parts(query.dtype) > 1, common=summed)
             out_view = head_slice(family, row, key_head, pl.ds(k_first, block_k), dk_ref.dtype, width=width)
             outs = (dk_ref.at[out_view], dv_ref.at[out_view])
             finished = functools.partial(_fused_out, family, (dk, dv), outs, index, block_k, grouped=grouped,
@@ -465,7 +489,7 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
         # (`modelled`): dQ's, dK's, dV's and dP's.
         cost=stated(walk.spec, batch, heads, query, key, value, dout,
                     tile_walk=TileWalk((queries, keys_padded), (block_q, block_k), consumers, keyed=True,
-                                       common=family.feeds_itself)),
+                                       common=family.walks_streamed)),
         model_flops=modelled(walk.spec, batch, heads, walk.spec.queries or queries,
                              2 * width + 2 * value.shape[-1]))
     query, key, value, dout = (head_layout(family, arr) for arr in (query, key, value, dout))
@@ -475,6 +499,51 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
                                grouped=grouped, dq_shape=(*dq_axes, width))
     return (head_unlayout(family, dq, heads), head_unlayout(family, dk, kv_heads),
             head_unlayout(family, dv, kv_heads))
+
+
+def _held_refs(refs: list, *, summed: bool) -> tuple:
+    """A fused program's allocations (`_fused_allocations`' order): its resident keys and values, its staged
+    weights and cotangents, the output stage where the walks' adds read it (else None, the epilogue's own
+    scoped after the walks), the two loads' barriers, and the dQ sum's parts and barriers where its
+    consumers sum it (`dq_summed`, `across.summing`'s), else None."""
+    summing = dict(zip(("parts", "ready", "read"), refs[len(refs) - 3:], strict=True)) if summed else None
+    k_smem, v_smem, staged, *out_smem, k_loaded, v_loaded = refs[:len(refs) - 3] if summed else refs
+    return k_smem, v_smem, staged, out_smem[0] if out_smem else None, k_loaded, v_loaded, summing
+
+
+def _adds_of(walk: _Backward, dq_ref, out_smem, place: tuple, index, summing: dict | None) -> Callable:
+    """Consumer `index`'s `add_dq(first query, dQ)`: its own tile's add (`_dq_added`), or where its program's
+    consumers sum each tile's dQ (`summing`, `dq_summed`) its part of the sum (`_dq_summed`)."""
+    if summing is None:
+        return functools.partial(_dq_added, walk, dq_ref, out_smem, place, index)
+    return functools.partial(_dq_summed, walk, dq_ref, out_smem, place, summing)
+
+
+def _walked_run(program, consumers: int, firsts: tuple, q_steps: int, spans_of):
+    """The run of query tiles a consumer walks unmasked (`whole_run`, its keys from `firsts[1]`): where its
+    program's consumers meet at every step to sum its dQ (`dq_summed`), the tiles every consumer's key block
+    from `firsts[0]` sees whole (their runs intersected, None where any is), so every consumer walks the same
+    segments and meets the other in the same branch of each step (its masked or its whole one): each
+    consumer's own run put them in different branches at a step (an A100's two consumers, causal: one
+    masked tile before one's run, two before the other's)."""
+    family, block_k = program.family, program.tiles.block_k
+    pair_first, k_first = firsts
+    if not dq_summed(family, consumers):
+        return program.whole_run(k_first, q_steps, spans_of)
+    runs = [program.whole_run(pair_first + index * block_k, q_steps, spans_of) for index in range(consumers)]
+    if any(run is None for run in runs):
+        return None
+    starts, ends = zip(*runs, strict=True)
+    return functools.reduce(jnp.maximum, starts), functools.reduce(jnp.minimum, ends)
+
+
+def _dq_summed(walk: _Backward, dq_ref, out_smem, place: tuple, summing: dict, q_first, dq) -> None:
+    """A query tile's dQ `dq`, a consumer's part, summed across the program's consumers in their order
+    (`across.summed_across` over `summing`, its parts and barriers) and the sum added once into dQ at its
+    queries from `q_first` by the first consumer (`_dq_added`, its own copy's interpreted), each consumer
+    calling it at every streamed step (`dq_summed`)."""
+    across.summed_across(dq, summing, lax.axis_index("wg"), walk.consumers,
+                         lambda total: _dq_added(walk, dq_ref, out_smem, place, 0, q_first, total))
 
 
 def _fused_called(launch: Callable, operands: tuple, grads: tuple, *, copies: int, grouped: bool,

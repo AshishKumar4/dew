@@ -1482,19 +1482,18 @@ class Issuer[Accumulator](abc.ABC):
         TPU core's copy into its scalar memory."""
         return ref[0]
 
-    def key_magnitudes(self, tile) -> jax.Array:
-        """Each key's largest value magnitude, fp32, from a values tile `tile` `[keys, columns]` in shared
-        memory: read transposed, its keys an accumulator tile's columns, and reduced over its own columns,
-        so the vector is in a column's layout (`column`, a logits tile's keys'), as
-        `attention_algebra.weighed_reach` reads it; no pass over the values outside the launch. In the values'
-        own dtype until the reduction is done (a magnitude's maximum is exact in any), so the tile holds half
-        an fp32 tile's registers. A value narrower than the accumulator layout's rows is read in four warps of
-        a quarter of its rows each, whose column vector is the accumulator's (`swizzling.rows_read`): a
-        32-wide value is no 64-row tile of an H100's mma.sync, wgmma or tcgen05 layout (IG-FINAL3-h100's
-        cast). A value no finite number weighs nothing (`attention_algebra.magnitudes`)."""
+    def keys_read(self, tile) -> tuple[jax.Array, int]:
+        """A values tile `tile` `[keys, columns]` in shared memory read for its keys' largest magnitudes, and
+        the axis its columns lie along, which the one rule reduces (`attention_algebra.magnitudes`): read
+        transposed, its keys an accumulator tile's columns, so the reduction over its columns is in a
+        column's layout (`column`, a logits tile's keys'), as `attention_algebra.weighed_reach` reads it; no
+        pass over the values outside the launch. In the values' own dtype (a magnitude's maximum is exact in
+        any), so the tile holds half an fp32 tile's registers. A value narrower than the accumulator layout's
+        rows is read in four warps of a quarter of its rows each, whose column vector is the accumulator's
+        (`swizzling.rows_read`): a 32-wide value is no 64-row tile of an H100's mma.sync, wgmma or tcgen05
+        layout (IG-FINAL3-h100's cast)."""
         layout = swizzling.rows_read(self.layout, tile.shape[1])
-        values = plgpu.load(tile.transpose((1, 0)), layout=layout, optimized=False)
-        return jnp.max(jnp.where(jnp.abs(values) < jnp.inf, jnp.abs(values), 0), axis=0).astype(jnp.float32)
+        return plgpu.load(tile.transpose((1, 0)), layout=layout, optimized=False), 0
 
     column_scratch: int
     """The fp32 entries of shared memory a consumer's `column_sums` takes: a reduction across the warps
@@ -1541,7 +1540,7 @@ def _column_sums(ctx, tile, scratch):
     return tile.reduce("add", axis=0, scratch=scratch)
 
 
-def _selected(predicate, taken, other):
+def selected(predicate, taken, other):
     """`taken` where `predicate` holds, else `other`, leaf by leaf: a splat predicate's select, which keeps
     each leaf in its own layout (an implicit broadcast lowers in no warpgroup semantics)."""
     return jax.tree.map(lambda one, two: jnp.where(jnp.full(one.shape, predicate), one, two), taken, other)
@@ -1638,12 +1637,6 @@ class Transport[Allocated, Opened](abc.ABC):
     """Whether its copies move a one-dimensional block untiled (TMA's), where cp.async spreads a copy over a
     warpgroup's threads, 128 elements at least ('CP_ASYNC requires the number of elements to be a multiple
     of 128', R9-gpu-a100): a step reads a side vector it does not copy from global memory instead."""
-
-    adds_vectors: bool = True
-    """Whether `added` takes a vector of fewer entries than a warpgroup's threads (TMA's reduction from shared
-    memory), where Mosaic GPU refuses atomic stores from a layout that replicates its entries across
-    threads (mma.sync's row and column layouts): a program writes such a sum to a place of its own
-    instead."""
 
     adds_through_shared: bool = True
     """Whether `added` reads its value through its `smem` (TMA's reduction from a staged tile), which is then
@@ -2357,7 +2350,7 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
                     reads = [read(partials, other, column, width) for other in others]
                     value = combine(value, reads[0])
                     for i, partial in enumerate(reads[1:], 1):
-                        value = _selected(start + i < gathered, combine(value, partial), value)
+                        value = selected(start + i < gathered, combine(value, partial), value)
                     parts.append(value)
                 return parts[0] if len(parts) == 1 else across.joined(parts, widest)
 

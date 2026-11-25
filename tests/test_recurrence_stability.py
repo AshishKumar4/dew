@@ -458,12 +458,26 @@ TPU_ACCELERATED = [pytest.param(name, regime, id=f'{name}-{regime}-tpu',
 
 CHECK1_SHARDS = {
     "test_the_chunked_ops_gradient_at_a_long_regime_is_as_exact_as_the_recurrences[rated-a-fading-memory]":
-        {"seeds": 256, "per_task": 64},
+        {"seeds": 256, "per_task": 32},
     "test_the_chunked_ops_gradient_at_a_long_regime_is_as_exact_as_the_recurrences[turned-decays-near-zero]":
         {"seeds": 128, "per_task": 32},
+    "test_the_chunked_ops_gradient_at_a_long_regime_is_as_exact_as_the_recurrences[rated-a-long-sequence]":
+        {"seeds": 32, "per_task": 16},
+    "test_the_chunked_ops_gradient_at_a_long_regime_is_as_exact_as_the_recurrences[turned-a-long-sequence]":
+        {"seeds": 8, "per_task": 4},
+    "test_the_chunked_ops_gradient_at_a_long_regime_is_as_exact_as_the_recurrences[turned-a-fading-memory]":
+        {"seeds": 8, "per_task": 4},
+    "test_the_chunked_ops_gradient_at_a_long_regime_is_as_exact_as_the_recurrences[mamba3-a-long-sequence]":
+        {"seeds": 8, "per_task": 4},
+    "test_the_chunked_ops_gradient_at_a_long_regime_is_as_exact_as_the_recurrences[mamba3-a-fading-memory]":
+        {"seeds": 8, "per_task": 4},
 }
 """The gradient's cases past two minutes in one process (246 s, train 270's CI on 66a222273, ledger 2125; the
-turned state's decays near zero 167 s, train 1080's on 1ee8fe13e, ledger 8937), by node id, a literal the
+turned state's decays near zero 167 s, train 1080's on 1ee8fe13e, ledger 8937; the rated scan's long
+sequence 135 s and Mamba-3's 127 s, train 1246's on 87b230470, ledger 12408, beside the turned state's and
+Mamba-3's long sequence and fading memory at 114 to 125 s, main's tests/test_durations.json at fc1a40b63;
+the rated scan's fading memory's tasks of 64 draws 172 to 188 s, jsf-b22-a at 3c408b8a5, now of 32),
+by node id, a literal the
 CI plan reads as it reads a mark's (tools/armada/ci.py): their check 1's draws, each its case's
 `GRADIENT_SEEDS`, run as armada's map tasks of a quarter of them and a judge. The one list of them: a case
 is long where its id is here (`long_gradient`)."""

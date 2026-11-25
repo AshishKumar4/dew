@@ -864,9 +864,26 @@ def test_two_mamba_layers_lower_the_template_scans_launches_once():
     """Two Mamba layers of one shape, forward and backward, lowered for an H100: each of the selective
     template's launches is one Mosaic GPU call in the lowered program, which both layers call
     (`tuning.lowered_once`), as many as one layer's. Built in each call, a model's layers' identical
-    launches were each traced and lowered again (row 2969)."""
+    launches were each traced and lowered again (row 2969). The selective template's alone: the second
+    layer's input projection takes its input's gradient, which the first's has none of, its own launch."""
+    from jax.extend.mlir import ir
+
+    from dew.nn.kernels.lowered import kernel_call
+
     def launches(layers: int) -> int:
-        return len(_mosaic_calls(_operations(_mamba1_lowered("sm90", layers))))
+        found = []
+
+        def visit(operation: ir.Operation) -> ir.WalkResult:
+            if "call_target_name" in operation.attributes:
+                call = kernel_call(ir.StringAttr(operation.attributes["call_target_name"]).value, operation)
+                if call is not None and call.kind == "mosaic_gpu" and call.name.startswith("selective_scan"):
+                    found.append(call.name)
+            return ir.WalkResult.ADVANCE
+
+        module = _mamba1_lowered("sm90", layers).compiler_ir(dialect="stablehlo")
+        with module.context:
+            module.operation.walk(visit, ir.WalkOrder.PRE_ORDER)
+        return len(found)
 
     one = launches(1)
     assert one > 0 and launches(2) == one

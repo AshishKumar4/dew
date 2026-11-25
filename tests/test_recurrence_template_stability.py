@@ -36,7 +36,7 @@ from generation_support import COMPILES_ON_CPU
 from map_judge import sharded
 from reference_error import FEWEST_SEEDS, assert_as_exact, widened, with_gradients
 from test_recurrence_chunk import against_the_portable_math, chunk_on, oracle, token_by_token
-from test_recurrence_mosaic import REFUSED, refuses_its_gradient, taken, template_call
+from test_recurrence_mosaic import NARROW, REFUSED, refuses_its_gradient, taken, template_call
 from test_recurrence_stability import (
     GRADIENT_SEEDS,
     REGIMES,
@@ -48,7 +48,7 @@ from test_recurrence_stability import (
     stressed,
 )
 
-from dew.nn.kernels import generation
+from dew.nn.kernels import generation, recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk
 from dew.nn.kernels.templates.recurrence import template
 
@@ -222,7 +222,11 @@ def the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime,
     with under(forms):
         if not runs(dew, hooks, operands, drawn, product):
             pytest.skip(f"the template refuses {name}'s {product}: a refusal, not numerical coverage")
+        # A site a form: a name's accurate and fast forms' sites under one label left the second's truths
+        # replacing the first's in a GPU tier's store, every case unprepared and its run red (rows 11010,
+        # 12254).
         label = f'the template, {name} under {regime}, its {product}'
+        label = label if forms is None else f'{label} ({forms} forms)'
         # The finite draws and the distance against the portable math run the case's programs outside its
         # sites: a GPU tier's prepare, whose device runs none, reaches its sites past them, its run checking
         # them.
@@ -340,15 +344,18 @@ interpreted, and their gradients everywhere, which the GPU tier runs whole (test
 
 SHARDED_ORDINARY = (('vector delta', 'resets on chunk edges'), ('vector delta', 'the decay bound'),
                     ('rated', 'resets on chunk edges'), ('gated', 'resets on chunk edges'),
-                    ('scalar delta', 'resets on chunk edges'))
+                    ('scalar delta', 'resets on chunk edges'), ('gated', 'saturated gates'),
+                    ('gated', 'spread gates'))
 """The ordinary regimes' cases past a task whole, each a check-1 site of its own recorded seeds over map
 tasks: Kimi delta attention's 32 seeds of 23 interpreted chunks (its 18 documents laid apart) at 10 s a draw
 (16 before its unit queries' recording, M-JS-233), and its 64 seeds under the decay bound at 2.2 s (179 and
 146 s whole at CI's rate, train of 2026-11-14 05:20Z); the rated scan's 64 seeds under resets on chunk
 edges, each of its forms (121 s whole under the accurate ones, train 861's CI); the gated delta net's 32
 there (130 to 143 s whole, tests/test_durations.json at dc7ebf822, row 10861); the gated delta net with a
-decay a head, its 32 draws there (125 s whole, train 1196's CI, row 11974). Their marks are literal
-parameters (`pytest.param`), as the plan reads a site's from the source."""
+decay a head, its 32 draws there (125 s whole, train 1196's CI, row 11974); the gated delta net's 128
+under saturated gates and under spread gates, the accurate forms' (186 and 141 s whole, main's
+tests/test_durations.json at fc1a40b63, row 12442). Their marks are literal parameters (`pytest.param`), as
+the plan reads a site's from the source."""
 
 
 @pytest.mark.parametrize(('name', 'regime', 'forms'), [
@@ -365,7 +372,11 @@ parameters (`pytest.param`), as the plan reads a site's from the source."""
     pytest.param('gated', 'resets on chunk edges', 'accurate', id='gated-resets_on_chunk_edges-accurate',
                  marks=pytest.mark.check1_shards(seeds=32, per_task=16)),
     pytest.param('scalar delta', 'resets on chunk edges', None, id='scalar_delta-resets_on_chunk_edges',
-                 marks=pytest.mark.check1_shards(seeds=32, per_task=16))])
+                 marks=pytest.mark.check1_shards(seeds=32, per_task=16)),
+    pytest.param('gated', 'saturated gates', 'accurate', id='gated-saturated_gates-accurate',
+                 marks=pytest.mark.check1_shards(seeds=128, per_task=32)),
+    pytest.param('gated', 'spread gates', 'accurate', id='gated-spread_gates-accurate',
+                 marks=pytest.mark.check1_shards(seeds=128, per_task=32))])
 def test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted(name, regime, forms):
     """`test_each_form_the_template_takes_stays_finite_and_on_par_interpreted` under the regimes of a draw's
     own tokens (`ORDINARY`): the CPU twin of each form's forward cell of the GPU tier's, each case a test of
@@ -420,7 +431,8 @@ def test_kimis_unit_keys_under_tiny_gates_at_the_floor_stays_finite_interpreted(
 
 
 @COMPILES_ON_CPU
-@pytest.mark.check1_shards(seeds=8, per_task=2)
+# A draw a task: two took 125 to 151 s (jsf-b22-a at 3c408b8a5, row 12442).
+@pytest.mark.check1_shards(seeds=8, per_task=1)
 def test_kimis_faint_cross_terms_are_as_exact_as_fla_interpreted():
     """Kimi delta attention's 16-bit gradient through the template, interpreted, over one key under faint
     write gates beside large ones and no decay (fla_sites' `FAINT_CROSS`): its output, final memory and
@@ -452,3 +464,106 @@ def test_the_narrow_gated_delta_gradient_compiles_for_an_h100():
     from kernel_compile import mosaic_failures
 
     assert mosaic_failures(compiled_gradient(HOOKS, 'the narrow gated delta gradient')) == []
+
+
+def test_an_own_score_past_fp32s_range_reads_as_it_is():
+    """Under a decay a key dimension a token's own score past fp32's range is `+inf` in the output, as the
+    recurrence gives it, and every other entry is what its zero queries make it: one chunk of one head, unit
+    decays, the queries and keys zero but one channel of token 1's, `2^64` each, so the token's own score is
+    `2^128`; every write gate `2^-64` and value `2^64`, every corrected value one. The intra walk's read once
+    placed each sub-chunk's own scores on its diagonal by a product against a shifted identity, `+inf` times
+    the identity's zeros a NaN in token 1's column 0, which the causal mask keeps: its output was NaN."""
+    length, width = 64, 64
+    big = 2.0 ** 64
+    keys = jnp.zeros((1, length, 1, width), jnp.bfloat16).at[0, 1, 0, 0].set(big)
+    values = jnp.full((1, length, 1, width), big, jnp.bfloat16)
+    decay = jnp.zeros((1, length, 1, width), jnp.float32)
+    gates = jnp.full((1, length, 1), 2.0 ** -64, jnp.bfloat16)
+    out, final = template.mosaic_rule(keys, keys, values, decay, gates, tiles=NARROW, scale=1.0)
+    expected = jnp.zeros(out.shape, jnp.float32).at[0, 1].set(jnp.inf)
+    np.testing.assert_array_equal(np.asarray(out, np.float32), np.asarray(expected))
+    assert np.isfinite(np.asarray(final)).all()
+
+
+def faint_read(length: int, width: int, read: float = 2.0 ** 100, value: float = 2.0 ** 60) -> tuple:
+    """A read erase's operands at its range's edge: token 1 reads `read` along channel 0, which its decay
+    takes by `2^-60`, token 0 writes `value` to value column 0, the first two tokens' write gates one:
+    `(reads, values, write gates, log decays)` fp32."""
+    reads = np.zeros((1, length, 1, width), np.float32)
+    reads[0, 1, 0, 0] = read
+    values = np.zeros_like(reads)
+    values[0, 0, 0, 0] = value
+    beta = np.zeros((1, length, 1), np.float32)
+    beta[0, :2] = 1.0
+    decay = np.zeros_like(reads)
+    decay[0, 1, 0, 0] = -60 * np.log(2.0)
+    return reads, values, beta, decay
+
+
+def faint_read_call(length: int, width: int):
+    """`faint_read`'s read erase, its keys and queries, and its call `(q, k, v, r) -> output` on `kernel` (the
+    delta rule's, `chunk_on`) under a decay a key dimension, its reads undeclared (`Hooks.unit_reads`): token
+    0 writes `2^60` along a key whose channel 0 is `2^-100`, token 1 decays channel 0 by `2^-60`, reads
+    `2^100` along it and writes along channel 2, which its query reads."""
+    unit = np.eye(width, dtype=np.float32)
+    keys = np.zeros((1, length, 1, width), np.float32)
+    keys[0, 0, 0], keys[0, 1, 0] = 2.0 ** -100 * unit[0] + unit[1], unit[2]
+    queries = np.zeros_like(keys)
+    queries[0, 1, 0] = unit[2]
+    reads, values, beta, decay = faint_read(length, width)
+    hooks = recurrence.Hooks(decay='vector', erase='read', scale=1.0)
+
+    def run(kernel, q, k, v, r):
+        operands = Chunk(q, k, v, log_decay=jnp.asarray(decay), beta=jnp.asarray(beta, jnp.bfloat16),
+                         erase_read=r)
+        return chunk_on(kernel, hooks, operands)[0]
+
+    return tuple(jnp.asarray(x, jnp.bfloat16) for x in (queries, keys, values, reads)), run
+
+
+def test_a_read_past_its_keys_range_takes_the_portable_math_which_keeps_its_gradient():
+    """A read erase whose reads no hook declares at most one in size (`Hooks.unit_reads`) takes the portable
+    math, the template handing it over where a call names it: its own pairs hold every factor at most one,
+    which an unbounded read breaks (heads review of 675cd1ecc, 5b2aba881 and 4ab0cbdd1: folded into the key
+    before the read its pair rounded to zero; in their transpose a pairs' gradient of `-2^60` times the read
+    `2^100` was `-2^160` before its decay, the gradient nonfinite). On the portable math (`faint_read_call`)
+    token 1's output in value column 0 moves `-2^100` times token 0's key's channel 0, every gradient finite.
+    The portable math's forward loses that faint pair itself, `2^-100` decayed by `2^-60` (row 12888)."""
+    length, width = 64, 32
+    operands, run = faint_read_call(length, width)
+    d_out = jnp.zeros((1, length, 1, width), jnp.bfloat16).at[0, 1, 0, 0].set(1.0)
+    with generation.assumed("sm90", interpreted=True), generation.routes() as found:
+        _, pull = jax.vjp(functools.partial(run, 'mosaic_gpu'), *operands)
+        grads = pull(d_out)
+    assert {route.kernel for route in found if route.choice == generation.Choice.GATED_DELTA_RULE} == {'xla'}
+    assert all(np.isfinite(np.asarray(grad, np.float32)).all() for grad in grads)
+    assert float(grads[1][0, 0, 0, 0]) == -(2.0 ** 100)
+
+
+def test_a_key_decays_own_pairs_gradient_near_fp32s_range_is_finite_where_the_recurrences_is():
+    """A read erase of unit reads (`Hooks.unit_reads`) under a decay a key dimension on the template, its
+    cotangents near fp32's largest: token 0 writes `2^127` to value column 0 along channel 1, token 1 decays
+    channel 0 by `2^-60`, reads `-1` along it and writes along channel 2, its query `(3/4)` on channel 0 and
+    `(5/8)` on 2, its output's column 0 gradient `3/2`. Token 0's key's channel 0 takes the scores' term and
+    the system's, `(18/16) 2^127` and `(15/16) 2^127`, both decayed by `2^-60`: `(33/16) 2^67`. The own pairs'
+    transpose summed the two before the decay, `2^128` past fp32's range, the gradient `+inf`
+    (`algebra.key_diagonal_pairs_back`; head review of a84db53d5)."""
+    length, width = 64, 32
+    unit = np.eye(width, dtype=np.float32)
+    keys = np.zeros((1, length, 1, width), np.float32)
+    keys[0, 0, 0], keys[0, 1, 0] = unit[1], unit[2]
+    queries = np.zeros_like(keys)
+    queries[0, 1, 0] = 0.75 * unit[0] + 0.625 * unit[2]
+    reads, values, beta, decay = faint_read(length, width, read=-1.0, value=2.0 ** 127)
+    hooks = recurrence.Hooks(decay='vector', erase='read', unit_reads=True, scale=1.0)
+    d_out = jnp.zeros((1, length, 1, width), jnp.bfloat16).at[0, 1, 0, 0].set(1.5)
+
+    def run(q, k, v, r):
+        return chunk_on('mosaic_gpu', hooks, Chunk(q, k, v, log_decay=jnp.asarray(decay),
+                                                   beta=jnp.asarray(beta, jnp.bfloat16), erase_read=r))[0]
+
+    with generation.assumed("sm90", interpreted=True):
+        _, pull = jax.vjp(run, *(jnp.asarray(x, jnp.bfloat16) for x in (queries, keys, values, reads)))
+        grads = pull(d_out)
+    assert all(np.isfinite(np.asarray(grad, np.float32)).all() for grad in grads)
+    assert float(grads[1][0, 0, 0, 0]) == 33 / 16 * 2.0 ** 67

@@ -4,13 +4,14 @@
 import jax
 import jax.numpy as jnp
 import pytest
+from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.mosaic.gpu import utils as mgpu_utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend.mlir import ir
-from jax.extend.mlir.dialects import arith, memref, scf
+from jax.extend.mlir.dialects import arith, math, memref, scf
 
-from dew.nn.kernels.templates import emission
+from dew.nn.kernels.templates import cost, emission
 from dew.nn.kernels.templates.cost import Work
 
 _ROW = jax.ShapeDtypeStruct((128,), jnp.float32)
@@ -53,6 +54,35 @@ def test_a_bodys_lane_work_counts_over_the_warpgroup():
     assert _counted(body) == Work(operations=128, shared_bytes=2 * 4 * 128)
 
 
+def test_a_shuffle_issues_on_every_lane_of_its_warps():
+    """A body each lane of which exchanges its word with its butterfly partner (`shfl.sync.bfly`) issues a
+    shuffle a lane, as the SASS of a kernel's does (KDA's intra_own: 102,400 lane shuffles a program counted
+    against 102,656 SHFL executed, M-JS-272), where shuffles counted nothing."""
+
+    def body(ctx, ref):
+        del ctx
+        index = ir.IndexType.get()
+        thread = arith.index_cast(index, mgpu_utils.thread_idx())
+        memref.store(mgpu_utils.shfl_bfly(memref.load(ref, [thread]), 1), ref, [thread])
+
+    counted = _counted(body)
+    assert counted.shuffles == 128, counted
+
+
+def test_a_lane_broadcasts_ptx_shuffle_issues_on_every_lane():
+    """`across.uniform`'s lane-0 broadcast, one `shfl.sync.idx` a thread in its inline PTX, issues a shuffle
+    a lane, where the PTX's shuffles counted nothing."""
+    from dew.nn.kernels.templates import across
+
+    def kernel(out_gmem):
+        del out_gmem
+        across.uniform(lax.axis_index("wg"))
+
+    launched = plgpu.kernel(kernel, out_type=_ROW, num_threads=1, thread_name="wg")
+    counted = emission.emitted(jax.make_jaxpr(launched)().jaxpr, 1, "wg").roles[0].fixed
+    assert counted.shuffles == 128, counted
+
+
 def test_a_branch_a_lanes_place_decides_issues_for_its_warps_and_moves_its_lanes_bytes():
     """A branch the first 16 lanes take issues for their one warp, all 32 of its lanes, and moves the 16
     lanes' words alone."""
@@ -62,6 +92,99 @@ def test_a_branch_a_lanes_place_decides_issues_for_its_warps_and_moves_its_lanes
             _scaled(ref)
 
     assert _counted(body) == Work(operations=32, shared_bytes=2 * 4 * 16)
+
+
+def _uniform_branch(*, multiplied: bool, exponentiated: bool):
+    """A body branching on a word every lane loads at one place, data its lanes hold alike: its then arm a
+    multiply a lane where `multiplied` (the fp32 lanes'), its else arm an exponential a lane where
+    `exponentiated` (the special-function units')."""
+    def body(ctx, ref):
+        del ctx
+        first = memref.load(ref, [arith.constant(ir.IndexType.get(), 0)])
+        positive = arith.cmpf(arith.CmpFPredicate.OGT, first, arith.constant(ir.F32Type.get(), 0.0))
+        branch = scf.IfOp(positive, [], has_else=True)
+        with ir.InsertionPoint(branch.then_block):
+            if multiplied:
+                arith.mulf(first, first)
+            scf.YieldOp([])
+        with ir.InsertionPoint(branch.else_block):
+            if exponentiated:
+                math.exp2(first)
+            scf.YieldOp([])
+
+    return body
+
+
+def test_a_uniform_branch_issues_its_costliest_arms_slots():
+    """A branch data every lane holds alike decides runs one arm, so its issue slots are the costlier arm's,
+    a body with that arm alone: its arms' most taken unit by unit (one arm's fp32 multiplies beside the
+    other's exponentials) counted a mix neither issues (the review of lane/toolkit 4667ed46469)."""
+    both = cost.issued(_counted(_uniform_branch(multiplied=True, exponentiated=True)))
+    alone = max(cost.issued(_counted(_uniform_branch(multiplied=True, exponentiated=False))),
+                cost.issued(_counted(_uniform_branch(multiplied=False, exponentiated=True))))
+    assert both == alone, (both, alone)
+
+
+def _guarded_on(predicate, operation, divisor: int, wanted: int):
+    """A body scaling each word whose lane's `(tid - 64) operation divisor` compares to `wanted` by
+    `predicate`."""
+    def body(ctx, ref):
+        del ctx
+        i32 = ir.IntegerType.get_signless(32)
+        shifted = arith.subi(mgpu_utils.thread_idx(), arith.constant(i32, 64))
+        taken = arith.cmpi(predicate, operation(shifted, arith.constant(i32, divisor)),
+                           arith.constant(i32, wanted))
+        with mgpu_utils.when(taken):
+            _scaled(ref)
+
+    return body
+
+
+def test_a_guard_reads_a_signed_quotient_truncated_and_a_logical_shift_unsigned():
+    """A lane's integers as LLVM computes them (the review of train 1261, F7): `(tid - 64) divsi 32` is 0 on
+    lanes 33 to 95, truncated toward zero (floored, 64 to 95), two warps issuing for 63 lanes; `(tid - 64)
+    shrui 31` is 1 on lanes 0 to 63, their negative words read unsigned (shifted signed, -1)."""
+    assert _counted(_guarded_on(arith.CmpIPredicate.eq, arith.divsi, 32, 0)) == Work(
+        operations=64, shared_bytes=2 * 4 * 63)
+    assert _counted(_guarded_on(arith.CmpIPredicate.eq, arith.shrui, 31, 1)) == Work(
+        operations=64, shared_bytes=2 * 4 * 64)
+
+
+def test_adds_under_a_predicate_and_its_negation_each_issue_on_their_warps():
+    """`@p add.u32` and `@!p add.u32` into one register, `p` the first warp's: each issues on its own warps
+    (one, then three), neither fused into the other as an unpredicated IADD3's adds are (the review of
+    lane/toolkit a1b861d7f2d, F1: the second dropped, 32 lanes' issues counted of 128), beside the setp's
+    and the immediate's move's warpgroup-wide issues."""
+    def body(ctx, ref):
+        del ctx, ref
+        i32 = ir.IntegerType.get_signless(32)
+        thread = arith.remui(mgpu_utils.thread_idx(), arith.constant(i32, 128))
+        mgpu_utils.inline_ptx("""{
+            .reg .pred p;
+            .reg .b32 r;
+            setp.lt.u32 p, $1, 32;
+            mov.b32 r, 0;
+            @p add.u32 r, r, 1;
+            @!p add.u32 r, r, 2;
+            mov.b32 $0, r;
+            }""", thread, result_types=i32, has_side_effects=True)
+
+    assert _counted(body) == Work(integer_operations=128 + 128 + 32 + 96)
+
+
+def test_a_narrow_signed_quotient_reads_its_operands_at_their_width():
+    """`(tid - 65)` truncated to i8 (its bits held unsigned, -65 as 191) divided signed by 2 is -32 on the
+    lanes whose value is -65 or -64, the first two (the review of lane/toolkit a1b861d7f2d, F7: 191 / 2, 95,
+    on none)."""
+    def body(ctx, ref):
+        del ctx
+        i8, i32 = ir.IntegerType.get_signless(8), ir.IntegerType.get_signless(32)
+        narrow = arith.trunci(i8, arith.subi(mgpu_utils.thread_idx(), arith.constant(i32, 65)))
+        halved = arith.divsi(narrow, arith.constant(i8, 2))
+        with mgpu_utils.when(arith.cmpi(arith.CmpIPredicate.eq, halved, arith.constant(i8, -32))):
+            _scaled(ref)
+
+    assert _counted(body) == Work(operations=32, shared_bytes=2 * 4 * 2)
 
 
 def test_a_static_loop_counts_its_trips_and_a_concrete_operand_its_lanes():
@@ -115,7 +238,8 @@ def test_a_warps_tensor_core_product_counts_its_operations_in_its_mode():
 def test_a_store_its_operand_guards_counts_the_lanes_that_take_it():
     """A store guarded by an operand (`inline_ptx`'s predicate: the first lane's) moves that lane's word
     alone; one guarded by a predicate the block sets itself of a constant moves what that predicate's lanes
-    move (none), and one of the data is unpriced, its lanes unknown."""
+    move (none), its setp an ISETP on every lane it issues on (the review of train 1261, F1), and one of the
+    data is unpriced, its lanes unknown."""
     def elected(ctx, ref):
         del ctx, ref
         i32 = ir.IntegerType.get_signless(32)
@@ -133,9 +257,9 @@ def test_a_store_its_operand_guards_counts_the_lanes_that_take_it():
                                   arith.constant(i32, 1), word, has_side_effects=True)
         return body
 
-    # A predicate the block sets of a constant: no lane holds it, so the store moves nothing.
+    # A predicate the block sets of a constant: no lane holds it, so the store moves nothing; the setp issues.
     i32 = ir.IntegerType.get_signless
-    assert _counted(guarded(lambda ref: arith.constant(i32(32), 1))) == Work()
+    assert _counted(guarded(lambda ref: arith.constant(i32(32), 1))) == Work(integer_operations=128)
 
     def loaded(ref):
         # A word of the data: which lanes hold the predicate set of it is unknown.
@@ -158,7 +282,8 @@ def test_a_copy_through_the_launch_context_moves_its_shared_tile_once():
 def test_a_tickets_elected_and_last_lanes_move_their_words_alone():
     """A ticket's PTX (`across.arrived`'s) guards its atomic by the lane it elects itself (`setp` on an
     operand whose lanes are known: the first thread) and its reset by the last arriver among it: the atomic
-    moves one lane's word, the reset at most that lane's, where a block's own predicate once refused it."""
+    moves one lane's word, the reset at most that lane's, where a block's own predicate once refused it; its
+    two setps and its selp issue on the warpgroup's every lane (the review of train 1261, F1)."""
     def ticket(ctx, ref):
         del ctx, ref
         i32 = ir.IntegerType.get_signless(32)
@@ -174,7 +299,7 @@ def test_a_tickets_elected_and_last_lanes_move_their_words_alone():
             selp.u32 $0, 1, 0, last;
             }""", thread, count, count, result_types=i32, has_side_effects=True)
 
-    assert _counted(ticket) == Work(device_bytes=8 + 4)
+    assert _counted(ticket) == Work(device_bytes=8 + 4, integer_operations=3 * 128)
 
 
 def test_a_launch_contexts_copy_counts_under_its_branch_and_loop():
@@ -248,7 +373,8 @@ def test_a_store_a_branch_holds_under_a_guard_of_the_data_is_refused():
 def test_a_comparison_reads_its_sides_at_their_width_and_signedness():
     """A thread's index less one compared unsigned with 32 bits' largest (PTX's octal `037777777777`, and
     arith's `ult` against -1) holds on the first lane alone, its -1 being that largest: a store it guards
-    moves one word, and a branch on it runs one lane's."""
+    moves one word (its setp an ISETP a lane, the review of train 1261, F1), and a branch on it runs one
+    lane's."""
     def octal(ctx, ref):
         del ctx, ref
         i32 = ir.IntegerType.get_signless(32)
@@ -257,7 +383,7 @@ def test_a_comparison_reads_its_sides_at_their_width_and_signedness():
         mgpu_utils.inline_ptx("{ .reg .pred p; setp.eq.u32 p, $1, 037777777777; @p st.shared.u32 [$0], $1; }",
                               arith.constant(i32, 1), below, has_side_effects=True)
 
-    assert _counted(octal) == Work(shared_bytes=4)
+    assert _counted(octal) == Work(shared_bytes=4, integer_operations=128)
 
     def unsigned(ctx, ref):
         del ctx

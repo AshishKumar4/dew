@@ -28,7 +28,7 @@ from dew._builds import (
     newest_build,
     runs_on,
 )
-from dew._pool import answered, cuda_driver, named_platforms, runs_on_gpu, visible_gpus
+from dew._pool import answered, cuda_driver, named_platforms, runs_on_gpu
 from dew._records import JSON
 
 _log = logging.getLogger(__name__)
@@ -216,41 +216,39 @@ def unpartition_gpu_pool() -> None:
                  "--xla_gpu_enable_allocator_spatial_partitioning=false")
 
 
-PEER_WAITS_UNGRAPHED = "--xla_gpu_enable_command_buffer=-CONDITIONAL,-COLLECTIVES_KERNEL"
-"""XLA's commands graphed but its conditionals and one-shot collective kernels (`ungraph_peer_waits`)."""
+MULTI_GPU_UNGRAPHED = "--xla_gpu_enable_command_buffer="
+"""XLA's commands graphed none: every thunk run from the host (`ungraph_multi_gpu`)."""
 
 
-def ungraph_peer_waits() -> None:
-    """Keep XLA's conditionals and its one-shot collective kernels out of its CUDA graphs in a process
-    that drives more than one GPU, unless the run named which commands XLA graphs
-    (`--xla_gpu_enable_command_buffer`).
+def ungraph_multi_gpu() -> None:
+    """Keep every command out of XLA's CUDA graphs in a process that drives more than one GPU, unless the run
+    named which commands XLA graphs (`--xla_gpu_enable_command_buffer`); a process of one GPU keeps XLA's.
 
-    A one-shot collective kernel graphed (`COLLECTIVES_KERNEL`) waits on the device for its peers to
-    launch theirs, with no rendezvous on the host before the graph launches
-    (xla/backends/gpu/runtime/collective_kernel_thunk.cc, `Record`); a conditional graphed
-    (`CONDITIONAL`) loads the kernels that steer it, as PTX, only as its graph is recorded
-    (xla/stream_executor/cuda/cuda_command_buffer.cc, `CreateSetCaseConditionNode`). In one process
-    driving two H100s, one GPU's graph waited inside a collective while the other's host thread loaded
-    PTX and instantiated a graph under the CUDA driver's lock, which waited on the first: a sharded
-    model's first validation never ended, and ended in a minute with both left out (row 12714). Without
-    them XLA runs a conditional's branch and a one-shot kernel from the host, other commands still
-    graphed; a process of one GPU keeps them graphed. `import dew` sets it before the backend opens, as
-    `unpartition_gpu_pool`."""
+    In one process driving two H100s a sharded model's first validation never ended: as its scores' program
+    first ran, both GPUs' host threads were in `cuGraphInstantiateWithFlags`, one spinning with its GPU busy,
+    the other waiting on the CUDA driver's lock. It hung so with XLA's conditionals and one-shot collective
+    kernels already left out of its graphs, and with only fusions, cuBLAS, cuDNN, custom calls and dynamic
+    slices graphed; which of XLA's callers instantiates there, and what the busy GPU waits on, is not yet
+    established (row 12714). `import dew` sets it before the backend opens, as `unpartition_gpu_pool`."""
     if backend_open() or not cuda_plugin():
         return
-    if peer_waits_ungraphed(os.environ, lambda: _pool.listed_gpus(("nvidia-smi", "-L"), 10)):
-        _gpu_default("xla_gpu_enable_command_buffer", PEER_WAITS_UNGRAPHED)
+    if multi_gpu_ungraphed(os.environ, _pool.local_gpus):
+        _gpu_default("xla_gpu_enable_command_buffer", MULTI_GPU_UNGRAPHED)
 
 
-def peer_waits_ungraphed(env: Mapping[str, str], listed: Callable[[], int | None]) -> bool:
-    """Whether a CUDA process of environment `env` leaves XLA's peer-waiting commands out of its graphs
-    (`ungraph_peer_waits`): its XLA_FLAGS name no commands to graph, and it drives more than one GPU, those
-    CUDA_VISIBLE_DEVICES lists where set, else those `listed` counts (nvidia-smi's; None uncounted)."""
+def multi_gpu_ungraphed(env: Mapping[str, str],
+                        opens: Callable[[str, Mapping[str, str]], tuple[int, ...] | None]) -> bool:
+    """Whether a CUDA process of environment `env` graphs no command (`ungraph_multi_gpu`): its XLA_FLAGS
+    name no commands to graph, and it may open more than one GPU, those `opens` counts as its restriction
+    already stands (`dew._pool.local_gpus`: its CUDA_VISIBLE_DEVICES, else every GPU its driver counts; None
+    uncounted). A place a pool would pin it to (`dew launch`'s JAX_LOCAL_DEVICE_IDS, a Slurm task's local
+    rank) narrows nothing: the process takes it only where it joins its pool, which a one-task Slurm step and
+    a run stating `multi_host=False` do not, and a process that opens two GPUs alone hung (row 12761's
+    review)."""
     if _flag(env.get("XLA_FLAGS", ""), "xla_gpu_enable_command_buffer") is not None:
         return False
-    visible = env.get("CUDA_VISIBLE_DEVICES")
-    gpus = visible_gpus(visible) if visible is not None else listed()
-    return gpus is not None and gpus > 1
+    gpus = opens(_pool.ALL_GPUS, env)
+    return gpus is not None and len(gpus) > 1
 
 
 def divide_exactly() -> None:

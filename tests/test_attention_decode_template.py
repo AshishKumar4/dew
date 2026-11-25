@@ -925,6 +925,33 @@ def test_a_walk_its_compile_refused_plans_a_config_its_launch_pins(dtype):
     assert chosen != refused
 
 
+@pytest.mark.parametrize("lengths", [False, True], ids=["full", "lengths"])
+def test_a_split_walk_its_compile_refused_plans_and_traces_another_config(lengths):
+    """A split decode step whose priced walk a compile refused (its kernel spilled, `report.refuse_launch`)
+    plans another config of its slices and its step traces, a cache's lengths or none: the priced tile is
+    completed and legal at the call's own spans before it is certified, a refused one falling to its
+    streaming walk's own config at those slices, never pinned as refused (the reviews of b11a701f4f0 and
+    97072e2e343: a refused priced tile, priced over a cache's whole extent, raised `Unpinnable`)."""
+    keys = 4096
+    query = jnp.zeros((1, 1, 32, 64), jnp.bfloat16)
+    key = value = jnp.zeros((1, keys, 8, 64), jnp.bfloat16)
+    spans = template.spans(1, keys, 1, lengths=jnp.full((1,), keys, jnp.int32) if lengths else None)
+    with generation.assumed("sm90"):
+        work, rows, row_spans, _ = attention_decode.planned(query, key, value, spans, template.Hooks())
+        plan = work["plain"]
+        assert plan.slices > 1, plan
+        op, args = attention_mosaic._forward_call(rows, key, value, row_spans, template.Hooks(), scale=None,
+                                                  natural=False, out_dtype=jnp.float32, masked=True,
+                                                  splits=plan.slices, subtracted=True)
+        launch = op.bind(*args, residuals=template.Kept.OUTPUT, interpret=False)
+        refused = op.completed(launch, plan.config)
+        with report.refusals():
+            report.refuse_launch(op, launch, refused, {"attention_forward_split"})
+            again = attention_decode.planned(query, key, value, spans, template.Hooks())[0]["plain"]
+            jax.make_jaxpr(lambda q, k, v: attention_decode.attend(q, k, v, spans))(query, key, value)
+    assert op.completed(launch, again.config) != refused or again.slices != plan.slices, (plan, again)
+
+
 @COMPILES_ON_CPU
 def test_a_decode_steps_price_reads_its_keys_and_a_paged_pool_walks_no_fewer_steps():
     """A decode step's price (`attention_decode.priced_step`: its launches' work as their emission counts it,
@@ -992,11 +1019,12 @@ def test_a_split_launchs_span_is_its_longest_slice(form, queries, keys, consumer
     work as its costed launch counts it (`_split_work`) spans its longest program's walk
     (`cost.Stated.longest`), where its programs' mean was 10/3 for ten tiles in three (row 8844; the base
     review of 31b5fe85b, F2), and issues its consumers' steps as the kernel slices and streams them: its
-    walk's tensor products and exponentials its unsplit launch's by their ratio to its steps
+    walk's tensor products its unsplit launch's by their ratio to its steps
     (`attention_mosaic_program.walks`), and every other unit its body issues (`cost.ISSUED_UNITS`, its
     integer work among them, row 10793) no less than that share, each slice its own epilogue, staging and
-    index arithmetic beside its walk; a causal launch's integer work, its diagonal's masks, counted at all
-    (row 12008: a share of none holds of none)."""
+    index arithmetic beside its walk: its exponentials too, its epilogue's normalizing division a MUFU each
+    (`emission.MOSAIC_DIVISION`); a causal launch's integer work, its diagonal's masks, counted at all (row
+    12008: a share of none holds of none)."""
     split = _split_work(form, queries, keys, consumers, family, splits)
     unsplit = _split_work(form, queries, keys, consumers, family, 1)
     assert split.span == span
@@ -1005,7 +1033,7 @@ def test_a_split_launchs_span_is_its_longest_slice(form, queries, keys, consumer
     assert form != "causal" or min(split.integer_operations, unsplit.integer_operations) > 0
     for unit in cost.ISSUED_UNITS:
         shares = getattr(split, unit) * steps[1], getattr(unsplit, unit) * steps[0]
-        assert shares[0] == shares[1] if unit in ("flops", "exponentials") else shares[0] >= shares[1], unit
+        assert shares[0] == shares[1] if unit == "flops" else shares[0] >= shares[1], unit
 
 
 def test_a_decode_step_of_no_split_is_priced_at_its_keys_reads():

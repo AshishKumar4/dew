@@ -58,11 +58,14 @@ class Derived(NamedTuple):
     `mapped(tiles)` its outputs along the walked axis, a tile's own (each reads no walked reduction: a
     backward's dQ, walking queries), each form None in the other's outputs' places; `report` what the
     derivation decoupled and its rounding class; `prepare(tiles)` a tile's values that read no state, which a
-    walk computes for every tile at once (a reduction's tiles as they are). A scan's (`scan.derive_scan`)
-    `step(state, prepared)` and `mapped(prepared, state)` read a chunk's prepared values and the state alone
-    (the carry, and a chunk's outputs from the state entering it); its `backward(tiles, state, d_state,
-    d_outputs)` is a chunk's adjoint: the cotangent of the state entering it and of each of its operands, from
-    the state entering it and the cotangents of the state leaving it and of its outputs (a reduction's
+    walk computes for every tile at once (a reduction's tiles as they are). A scan's (`scan.derive_scan`,
+    `coupled_scan.derive_coupled`) `step(state, prepared)` returns `(state, kept)`, the state after the
+    chunk and what it solved that its outputs read again (a coupled pair's inputs; a single state's None),
+    and `mapped(prepared, state, kept)` the chunk's outputs from the state entering it and that `kept`: each
+    reads a chunk's prepared values and the state alone, and a walk solves each chunk once; its
+    `backward(tiles, state, d_state, d_outputs)` is a chunk's adjoint: the cotangent of the state entering it
+    and of each of its operands, from the state entering it and the cotangents of the state leaving it and of
+    its outputs (a reduction's
     backward is a declaration of its own, None here), the derivative of its `replay(tiles, h)`, the chunk
     walked token by token from the state `h` entering it: its outputs and the state leaving it, which forward
     mode differentiates too. A reduction's `slots(shapes)` names each carried state's

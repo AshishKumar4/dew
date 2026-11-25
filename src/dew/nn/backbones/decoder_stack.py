@@ -31,7 +31,8 @@ from jax.sharding import PartitionSpec as P
 from dew._cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.batch import Variables, merge, part, sows_appended
 from dew.mesh import STAGE_AXIS, LayoutRefused, row_axes
-from dew.nn.inspection import QK
+from dew.nn.dense import NVFP4_AMAX
+from dew.nn.inspection import INDEXER_COLLECTION, QK
 from dew.nn.protocols import StagedStacks, fixed_remat
 from dew.quantization import held_scales, holds_quantized
 
@@ -41,11 +42,12 @@ from ..derivatives import formed_together
 from ..host_memory import fetched, fetched_at, on_host
 from ..hyper_connections import Carried
 from ..inspection import counted, current_component, current_positions, watched_positions
+from ..kernels import generation
 from ..kv_cache import cache_at_layer, cache_from_layer
-from ..mla import INDEXER_COLLECTION
 from ..moe import BANKED_EXPERTS, ROUTER_COLLECTION, at_iteration, experts_apart, holds_experts
+from ..residuals import RESIDUALS
 from ..sharding import constrained, microbatched, microbatches, pipeline_stage, pipeline_stages
-from .decoder_block import REMAT_POLICIES, DecoderBlock, RematPolicy
+from .decoder_block import DecoderBlock, RematPolicy, scanned_remat
 from .layer_names import array_rows, group_layers, group_name, stage_count
 from .layer_plan import LayerSpec, run_period
 
@@ -172,7 +174,7 @@ def _rows_recomputed(remat: RematPolicy | None) -> Callable[..., bool]:
     kept each iteration's rows among the scan's residuals."""
     layer = (jax.checkpoint_policies.save_from_both_policies(
                  jax.checkpoint_policies.dots_saveable,
-                 jax.checkpoint_policies.save_only_these_names(*_KEPT_WITHOUT_A_RUNG.save))
+                 jax.checkpoint_policies.save_only_these_names(*_kept_without_a_rung(remat)))
              if remat is None or remat.recompute
              else remat.checkpoint_policy() or jax.checkpoint_policies.nothing_saveable)
 
@@ -274,6 +276,27 @@ class Loop:
     the loop takes no step norm, reinjection or implicit step; under `backprop_steps` the cut stops the
     bank, so the prelude still trains through every pass after it. Its merges are parameters, so a resume
     compares it (not `PASSED`).
+
+    With `gathered`, a block whose parameters fully sharded data parallelism splits (the run's FSDP axis,
+    `dew.mesh.FSDP_AXIS`) reads them gathered whole over that axis, and every other its tokens are split over
+    (a hybrid run's data axis, a sequence axis), once, before its first pass, and every pass reads that one
+    copy (`looping.run_loop`): no all-gather inside the passes' loop, forward or recomputed, where each pass
+    gathered its own (`steps` times the block's gathers). Nor a matrix's gradient reduction: the passes run
+    with every axis of the mesh Explicit and each matrix's copy reduced over those axes
+    (`sharding.gathered_over`), so each pass's gradient of it stays its devices' partial sum, the passes'
+    partial sums are added where they lie, and their total is reduced once, after the loop (one reduce-scatter
+    where each pass reduced its own); a vector's (a norm's scale, a bias), held replicated, is reduced each
+    pass, as without it. The copy held whole over those axes throughout the loop, which the block's memory
+    must allow (an opt-in for a block that fits). The gradient is the same sum, summed in another order. It
+    gathers the parameters as the step reads them: a run's narrow copies (`dew.training.narrow`), the compute
+    dtype's, where it holds them, else the stored dtype, a quantized stored kernel's as it is stored. The
+    decoder's own parameters the passes read (its step and reinjection norms) are gathered with the block's,
+    and under `exiting`, where every pass runs the coda, the final norm and the head, theirs too; the prelude,
+    and the coda, final norm and head the last pass alone runs, keep their placement. A decode (a server's
+    step) and a store banked by run read the block where it lies, as without it. Every operation of the passes
+    is typed on the mesh, so one with no rule for it fails as it traces. The block's layers run one by one in
+    each pass (a scan over them takes no reduced copy), and its projections as the partitioner places them, no
+    launch mapped per shard.
     """
     steps: int
     step_norm: bool = True
@@ -288,13 +311,15 @@ class Loop:
     exits: bool = False
     theta_passes: int | None = None
     messages: CrossPass | None = None
+    gathered: bool = False
 
     PASSED: ClassVar[tuple[str, ...]] = ("steps", "backprop_steps", "remat", "implicit", "exit_threshold",
-                                         "exits")
+                                         "exits", "gathered")
     """The fields a run sets as it runs the loop's passes over the same parameters, a phase of its data its
     own (`dew.nn.protocols.Looping.with_passes`, `dew.training.phase_passes`): how many passes run, train,
-    recompute, are taken implicitly and exit, none of which makes the parameters mean another thing, so a
-    resume compares none of them (`dew.training.startup.computation_differs`)."""
+    recompute, are taken implicitly, exit and read their parameters gathered, none of which makes the
+    parameters mean another thing, so a resume compares none of them
+    (`dew.training.startup.computation_differs`)."""
 
     @property
     def exiting(self) -> bool:
@@ -514,67 +539,96 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
             # and the call's metadata alone (`_updated_in_backward`).
             x = _updated_in_backward(run, x, attention_metadata=attention_metadata, remat=remat)
         else:
-            # A longer run's layers share keys or own them, so they only read the store: a provider
-            # is always a run of one (`run_stack`).
-            # The layers the run holds a row each (`LAYER_ROWS`) are closed over whole, each iteration
-            # reading its row in place, by the iteration's index, into the collections they join
-            # (`_rows_joined`), recomputed in the backward (`_rows_recomputed`); every other collection
-            # scans its stacked layers.
-            rows = tuple(run.variables.get(LAYER_ROWS, {}))
-            repeats = count // len(run.specs) if periodic else count
-            # A served quantized run's scales read as the unrolled stack reads them (`held_scales`).
-            quantized = (not run.is_mutable_collection('params')
-                         and holds_quantized(run.variables.get('params', {})))
-
-            policy = _rows_recomputed(remat)
-
-            def scanned(layer, carry, index, *, store=store, step=step, rows=rows, inputs=inputs,
-                        policy=policy, quantized=quantized):
-                # The iteration's per-layer input, its layers along axis 2.
-                per_layer_input = jax.tree.map(
-                    lambda leaf: jax.lax.dynamic_index_in_dim(leaf, index, axis=2, keepdims=False), inputs)
-
-                def layered(layer, carry):
-                    return step(layer, carry, per_layer_input, store)[0]
-
-                if quantized:
-                    # Its layer's params, sliced from the stacked rows: each scale held there alone.
-                    layered = nn.map_variables(layered, 'params', init=False, mutable=False,
-                                               trans_in_fn=held_scales)
-                if not rows:
-                    return layered(layer, carry), None
-
-                def read(layer, carry, index):
-                    return nn.map_variables(layered, (LAYER_ROWS, *rows), init=False, mutable=False,
-                                            trans_in_fn=functools.partial(_rows_joined, index=index))(
-                        layer, carry)
-                # Under no scope of its own: the rows' policy keeps what a rung keeps by its names, every
-                # product besides under none or one recomputing named residuals (`_rows_recomputed`), each
-                # value a rung's to keep or drop as a block's; the rows it read it never keeps.
-                rematted = nn.remat(read, policy=policy, prevent_cse=False)
-                return rematted(layer, carry, index), None
-            # A parameter its module boxed (`nn.with_logical_partitioning`) stacks with an unnamed layer
-            # axis, which the run's view cuts off again per layer (`_rows`). A decode step's rows it
-            # broadcasts exist before the scan and it outputs nothing broadcast, so flax's trace of its body
-            # for what it broadcasts is not taken (`check_constancy_invariants`): that check refuses a body
-            # holding an effect that reads the carry, an interpreted launch's (row 12077: a quantized paged
-            # step). Every other call keeps it, whose trace its random streams advance through, so an init
-            # draws as it did.
-            x, _ = nn.scan(scanned, variable_axes={nn.DenyList(LAYER_ROWS) if rows else True: 0},
-                           variable_broadcast=LAYER_ROWS if rows else False, split_rngs={True: True},
-                           length=repeats, metadata_params={nn.PARTITION_NAME: None},
-                           check_constancy_invariants=not decode)(
-                run, x, jnp.arange(repeats))
+            x = _scanned_run(run, x, step, store, inputs, count=count, periodic=periodic, fetching=fetching,
+                             train=train, decode=decode, remat=remat)
     return x
+
+
+def _scanned_run(run: nn.Module, x, step: Callable, store, inputs, *, count: int, periodic: bool,
+                 fetching: bool, train: bool, decode: bool, remat: RematPolicy | None):
+    """A run of `count` like layers (a periodic run's repeats of its period) under flax's scan, each
+    iteration calling `step` on its layer (`_scanned_runs`)."""
+    # A longer run's layers share keys or own them, so they only read the store: a provider
+    # is always a run of one (`run_stack`).
+    # The layers the run holds a row each (`LAYER_ROWS`) are closed over whole, each iteration
+    # reading its row in place, by the iteration's index, into the collections they join
+    # (`_rows_joined`), recomputed in the backward (`_rows_recomputed`); every other collection
+    # scans its stacked layers.
+    rows = tuple(run.variables.get(LAYER_ROWS, {}))
+    repeats = count // len(run.specs) if periodic else count
+    # A served quantized run's scales read as the unrolled stack reads them (`held_scales`).
+    quantized = (not run.is_mutable_collection('params')
+                 and holds_quantized(run.variables.get('params', {})))
+    # A decoding run whose params it reads alone hands its experts' kernels to each iteration whole beside
+    # its index, which the grouped matmul reads in place (`dew.nn.moe.Layered`), as a bank's run does
+    # (`_apart`): sliced by the scan, each layer's experts were copied out every step, 45% of a
+    # Qwen3-30B-A3B decode step on an H100 (row 1346). A training or non-decode run scans them on their layer
+    # axis: broadcast whole as a scan constant, reverse mode accumulates full-stack cotangents per layer and
+    # narrow copies never follow a scan's constants. A fetched run's kernels lie in host memory, of which
+    # each iteration fetches its layer's alone (`fetched`): handed whole, every iteration would copy every
+    # layer's to the device.
+    experts = (decode and not train and not quantized and not fetching
+               and not run.is_mutable_collection('params')
+               and holds_experts(run.variables.get('params', {})))
+    whole = tuple(name for name, held in ((LAYER_ROWS, rows), (BANKED_EXPERTS, experts)) if held)
+
+    policy = _rows_recomputed(remat)
+
+    def scanned(layer, carry, index, *, store=store, step=step, rows=rows, inputs=inputs,
+                policy=policy, quantized=quantized, experts=experts):
+        # The iteration's per-layer input, its layers along axis 2.
+        per_layer_input = jax.tree.map(
+            lambda leaf: jax.lax.dynamic_index_in_dim(leaf, index, axis=2, keepdims=False), inputs)
+
+        def layered(layer, carry):
+            return step(layer, carry, per_layer_input, store)[0]
+
+        if experts:
+            layered = nn.map_variables(layered, (BANKED_EXPERTS,), init=False, mutable=False,
+                                       trans_in_fn=functools.partial(at_iteration, layer=index))
+
+        if quantized:
+            # Its layer's params, sliced from the stacked rows: each scale held there alone.
+            layered = nn.map_variables(layered, 'params', init=False, mutable=False,
+                                       trans_in_fn=held_scales)
+        if not rows:
+            return layered(layer, carry), None
+
+        def read(layer, carry, index):
+            return nn.map_variables(layered, (LAYER_ROWS, *rows), init=False, mutable=False,
+                                    trans_in_fn=functools.partial(_rows_joined, index=index))(
+                layer, carry)
+        # Under no scope of its own: the rows' policy keeps what a rung keeps by its names, every
+        # product besides under none or one recomputing named residuals (`_rows_recomputed`), each
+        # value a rung's to keep or drop as a block's; the rows it read it never keeps.
+        rematted = nn.remat(read, policy=policy, prevent_cse=False)
+        return rematted(layer, carry, index), None
+    # A parameter its module boxed (`nn.with_logical_partitioning`) stacks with an unnamed layer
+    # axis, which the run's view cuts off again per layer (`_rows`). A decode step's rows it
+    # broadcasts exist before the scan and it outputs nothing broadcast, so flax's trace of its body
+    # for what it broadcasts is not taken (`check_constancy_invariants`): that check refuses a body
+    # holding an effect that reads the carry, an interpreted launch's (row 12077: a quantized paged
+    # step). Every other call keeps it, whose trace its random streams advance through, so an init
+    # draws as it did.
+    scanning = nn.scan(scanned, variable_axes={nn.DenyList(whole) if whole else True: 0},
+                       variable_broadcast=whole or False, split_rngs={True: True},
+                       length=repeats, metadata_params={nn.PARTITION_NAME: None},
+                       check_constancy_invariants=not decode)
+    if experts:
+        # The expert kernels moved out of the scanned params into the collection it broadcasts.
+        scanning = nn.map_variables(scanning, ('params', BANKED_EXPERTS), init=False, mutable=False,
+                                    trans_in_fn=experts_apart)
+    return scanning(run, x, jnp.arange(repeats))[0]
 
 
 def _updates_in_backward(run: nn.Module, specs: Sequence[LayerSpec], *, train: bool, decode: bool,
                          fetching: bool, store, inputs) -> bool:
     """Whether a scanned run updates in its backward (`dew.nn.in_backward`): inside a step's plan, a
     training forward of a run of like layers, or of a period's layers repeated, that holds its parameters
-    as the plan's state does, writes nothing but its output (no cache, routing statistics or probes:
-    `WRITTEN`), reads no store, per-layer input or host bank, routes no layer (`specs`), and runs under no
-    interceptor (an adapter's, a quantizer's), whose scope a layer applied on its own would leave."""
+    as the plan's state does, writes nothing but its output (no cache, routing statistics, probes or
+    delayed-scaling NVFP4 amaxes: `WRITTEN`, `NVFP4_AMAX`, which a layer applied on its own would sow into
+    nothing, row 12721), reads no store, per-layer input or host bank, routes no layer (`specs`), and runs
+    under no interceptor (an adapter's, a quantizer's), whose scope a layer applied on its own would leave."""
     current = in_backward.plan()
     if current is None or not train or decode or fetching or store is not None:
         return False
@@ -585,21 +639,23 @@ def _updates_in_backward(run: nn.Module, specs: Sequence[LayerSpec], *, train: b
     held = run.variables
     if LAYER_ROWS in held or any(name not in held for name in (*current.moments, in_backward.NORMS)):
         return False
-    return not any(run.is_mutable_collection(name) for name in (*WRITTEN, "intermediates"))
+    return not any(run.is_mutable_collection(name) for name in (*WRITTEN, "intermediates", NVFP4_AMAX))
 
 
-_KEPT_WITHOUT_A_RUNG = REMAT_POLICIES['minimal_with_scan_and_conv']
-"""What a run updating in its backward keeps of a layer whose block names no rung: every named residual
-(its attention's, its scan's and conv's, its MLP's), recomputing the values between them as XLA's fusions
-of a layer at a time do, so its stacked residuals hold no more than that loop's (row 4098)."""
+def _kept_without_a_rung(remat: RematPolicy | None) -> tuple[str, ...]:
+    """Every named residual (`RESIDUALS`) a scanned run keeps where its block names no saving rung,
+    dropping any `remat.recompute` asks the layers to recompute themselves, while recomputing the
+    elementwise values between them as XLA's fusions of a layer at a time do (row 4098)."""
+    recomputed = () if remat is None else remat.recompute
+    return tuple(name for name in RESIDUALS if name not in recomputed)
 
 
 def _updated_in_backward(run: nn.Module, x, *, attention_metadata, remat: RematPolicy | None):
     """A scanned run as `dew.nn.in_backward.scanned_run` computes it: each layer the run's own module
     applied on its row of the run's weights, its dropout drawn from a key of its own split from the run's,
-    under the layer's rung, or where it names none or recomputes named residuals itself what a layer at a time
-    keeps (`_KEPT_WITHOUT_A_RUNG`): no more than the ladder's next rung, as unscanned, where the recomputing
-    rung kept every value, more than no rung.
+    under the layer's rung, or where it names none or recomputes named residuals itself every named residual
+    it does not recompute (`_kept_without_a_rung`): no more than the ladder's next rung, as unscanned, where
+    the recomputing rung kept every value, more than no rung.
     Its masks are this program's own, as a stack's a layer at a time and its scan's each are: Linen's scan
     splits the run's key below the scope's own fold, which no public form reads."""
     held = run.variables
@@ -618,11 +674,13 @@ def _updated_in_backward(run: nn.Module, x, *, attention_metadata, remat: RematP
     def applied(weights_i, carry, own, metadata):
         key, constants_i = own
         rngs = None if key is None else {"dropout": key}
-        return alone.apply({"params": weights_i, **constants_i}, carry, train=True, decode=False,
-                           kv_store=None, per_layer_input=None, attention_metadata=metadata, rngs=rngs)
+        with scanned_remat():
+            return alone.apply({"params": weights_i, **constants_i}, carry, train=True, decode=False,
+                               kv_store=None, per_layer_input=None, attention_metadata=metadata, rngs=rngs)
 
     layer = applied if remat is not None and not remat.recompute else jax.checkpoint(
-        fixed_remat(applied), policy=_KEPT_WITHOUT_A_RUNG.checkpoint_policy(), prevent_cse=False)
+        fixed_remat(applied),
+        policy=jax.checkpoint_policies.save_only_these_names(*_kept_without_a_rung(remat)), prevent_cse=False)
 
     return in_backward.scanned_run(
         (*current_component(), *run.path), layer, weights, held.get(in_backward.MASTERS),
@@ -785,10 +843,11 @@ def _opened(run: DecoderBlock, spec: LayerSpec, probed: list[tuple[LayerSpec, li
         variables = {**read, **state} if cache is None else {**read, **state, 'cache': cache}
         # A provider writes its keys and values into the store it is given: the
         # abstract run writes into a copy, so nothing it traces leaves it.
-        _, changed = jax.eval_shape(lambda variables: _applied(
-            run, None if store is None else dict(store), variables, {}, None, hidden,
-            per_layer_slice, opened=True, train=train, decode=decode,
-            attention_metadata=attention_metadata), variables)
+        with generation.routes(alone=True):
+            _, changed = jax.eval_shape(lambda variables: _applied(
+                run, None if store is None else dict(store), variables, {}, None, hidden,
+                per_layer_slice, opened=True, train=train, decode=decode,
+                attention_metadata=attention_metadata), variables)
         written = list(changed)
         probed.append((spec, written))
     # Capture filters may select one module name but not another with the same layer spec. Keep
@@ -1752,8 +1811,9 @@ def _settled(module: nn.Module, prefixes: tuple[str, ...], x: jax.Array, layer: 
                 for name in names if name in tree or name in staged}
         if held:
             first[collection] = held
-    output = jax.eval_shape(lambda held: BlockStage(layer, 1, run, parent=None).apply(
-        held, x, None, rows, mutable=True, rngs={'params': jax.random.key(0)})[0], first)
+    with generation.routes(alone=True):
+        output = jax.eval_shape(lambda held: BlockStage(layer, 1, run, parent=None).apply(
+            held, x, None, rows, mutable=True, rngs={'params': jax.random.key(0)})[0], first)
     return jnp.result_type(x.dtype, output.dtype)
 
 

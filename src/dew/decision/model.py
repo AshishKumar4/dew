@@ -16,6 +16,7 @@ from dew.inputs.condition import BackboneCall, BackboneEncoder, ConditionEncoder
 from dew.inputs.spec import Condition, encode_conditions, token_widths
 from dew.nn.backbones.looping import never_exiting
 from dew.nn.cross_attention import ContextEncoder, encode_context
+from dew.nn.dense import NVFP4_AMAX
 from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, CONTEXT_SEGMENTS, ModelInputs
 from dew.nn.inspection import INSPECTED, QK, component, in_parts
 from dew.nn.progress import END, Progress, ReadsProgress, progressed
@@ -347,8 +348,9 @@ class DecisionModel(HeadedModel):
                 for state in (*earlier, states)]
         sown = {name: value for name, value in sown.items() if name != EXITS}
         head = dict(read[-1][1])
-        if QK in opened:
-            head[QK] = functools.reduce(sows_appended, (held.get(QK, {}) for _, held in read), {})
+        # Every scored exit's records, as its maxima are: the history takes the largest any exit read.
+        for name in {QK, NVFP4_AMAX} & set(opened):
+            head[name] = functools.reduce(sows_appended, (held.get(name, {}) for _, held in read), {})
         return PassLogits(tuple(logits for logits, _ in read), gates, exited.ran,
                           beside_head(sown, head, opened))
 
@@ -402,14 +404,15 @@ class DecisionModel(HeadedModel):
 def beside_head(sown: Variables, head: Variables, opened: Sequence[str]) -> Variables:
     """What a row's backbone sowed (`sown`) with what its head sowed (`head`) beside it, in each collection
     the step `opened`: the attention logit maxima (`qk`) of each under its own parameters' name
-    (`backbone`, `head`), so a QK-Clip finds every layer's maxima where it finds its weights (row 1608);
-    the watched activations (`inspected`) each under its part of the model's variables
+    (`backbone`, `head`), so a QK-Clip finds every layer's maxima where it finds its weights (row 1608), and
+    the delayed-scaling NVFP4 projections' largest magnitudes (`nvfp4_amax`) so, where their histories
+    lie (row 12721); the watched activations (`inspected`) each under its part of the model's variables
     (`dew.nn.inspection.in_parts`), which the log names them by (`backbone/...`, `head/...`); every other
     collection the head sowed into, alike."""
     merged = dict(sown)
     for name in opened:
-        if name == QK:
-            merged[QK] = {"backbone": sown.get(QK, {}), "head": head.get(QK, {})}
+        if name in (QK, NVFP4_AMAX):
+            merged[name] = {"backbone": sown.get(name, {}), "head": head.get(name, {})}
         elif name == INSPECTED or head.get(name):
             merged[name] = in_parts({"backbone": sown.get(name, {}), "head": head.get(name, {})})
     return merged

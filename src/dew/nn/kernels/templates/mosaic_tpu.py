@@ -135,9 +135,9 @@ class MxuIssuer(mosaic.Issuer[jax.Array]):
         return pl.run_scoped(lambda held: (pltpu.sync_copy(ref.at[pl.ds(0, 1)], held), held[0])[1],
                              pltpu.SMEM((1,), ref.dtype))
 
-    def key_magnitudes(self, tile) -> jax.Array:
-        held = jnp.abs(tile[...])
-        return jnp.max(jnp.where(held < jnp.inf, held, 0), axis=1).astype(jnp.float32)
+    def keys_read(self, tile) -> tuple[jax.Array, int]:
+        # A core's tile as it lies, its columns along its second axis.
+        return tile[...], 1
 
     def column_sums(self, value: jax.Array, scratch, interpret: bool) -> jax.Array:
         del scratch, interpret
@@ -195,8 +195,6 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
     copies_in_pieces = False
 
     copies_vectors = True
-
-    adds_vectors = False
 
     walks_scoped = False
 

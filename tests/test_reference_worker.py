@@ -340,10 +340,7 @@ def test_a_recordings_units_merge_into_one_fixture_naming_each_devices_sites(tmp
     monkeypatch.setattr(fetched_fixtures, "save", save)
 
     def unit(name: str, device: str, keys: list[str], revision: str = "1") -> Path:
-        recorded = {"reference": "fla", "revision": revision, "device": device, "command": "c"}
-        np.savez(tmp_path / name, provenance=np.asarray(json.dumps(recorded)),
-                 **{key: np.zeros(1) for key in keys})
-        return tmp_path / name
+        return _recording(tmp_path / name, dict.fromkeys(keys, 0.0), revision, device=device)
 
     first = unit("a.npz", "H100", ["gdn.out", "gdn.final"])
     second = unit("b.npz", "A100", ["kda.out"])
@@ -394,9 +391,33 @@ def test_a_few_sites_recorded_again_merge_over_the_pinned_fixture_keeping_its_ot
 
 
 def test_a_pinned_fixture_recorded_under_another_revision_is_no_base_to_merge_over(tmp_path):
-    """`merged_arrays` refuses a base whose provenance is not its units': its sites recorded against
-    another reference cannot sit beside theirs."""
+    """`merged_arrays` refuses a base whose provenance is not its units' where it would keep a site of it:
+    its sites recorded against another reference cannot sit beside theirs. A recording of every site of it
+    again keeps none of it, and merges under the new reference (row 12337: refused before)."""
+    import json
+
     base = _recording(tmp_path / "base.npz", {"gdn.out": 0.0}, revision="0", device="H100")
     unit = _recording(tmp_path / "unit.npz", {"kda.out": 1.0}, device="H100")
     with pytest.raises(ValueError):
         protocol.merged_arrays([unit], base)
+    again = _recording(tmp_path / "again.npz", {"gdn.out": 1.0, "kda.out": 1.0}, device="H100")
+    merged = protocol.merged_arrays([again], base)
+    assert {key: float(merged[key][0]) for key in merged if key != "provenance"} == {"gdn.out": 1.0,
+                                                                                    "kda.out": 1.0}
+    assert json.loads(str(merged["provenance"]))["revision"] == "1"
+
+
+def test_a_recording_of_a_few_sites_keeps_the_pinned_recordings_others_and_their_devices(tmp_path):
+    """`kept_sites`, the one overlay of a pinned recording (a merge's and tools/mamba2_reference.py's
+    `write_seeded`'s): every key of a site not recorded again, in order, each site's device, whether the
+    recording names one device or each device's sites; refused where a site is kept under another
+    provenance."""
+    held = {"gdn.out": 0.0, "kda.out": 0.0, "kda.old": 0.0, "rwkv.out": 0.0}
+    common = {"reference": "fla", "revision": "1", "command": "c"}
+    base = _recording(tmp_path / "base.npz", held, devices={"H100": ["gdn", "kda"], "A100": ["rwkv"]})
+    kept, placed = protocol.kept_sites(base, {"kda"}, common)
+    assert list(kept) == ["gdn.out", "rwkv.out"] and placed == {"gdn": "H100", "rwkv": "A100"}
+    single = _recording(tmp_path / "single.npz", held, device="cpu")
+    assert protocol.kept_sites(single, {"gdn", "rwkv"}, common)[1] == {"kda": "cpu"}
+    with pytest.raises(ValueError):
+        protocol.kept_sites(single, {"gdn"}, {**common, "revision": "2"})

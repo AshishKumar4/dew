@@ -136,15 +136,16 @@ def _placed_rows(mesh: Mesh) -> Callable[[tuple[int, ...]], tuple[int, ...]]:
     return placed
 
 
-def placed_abstract(mesh: Mesh, batch: Batch) -> Batch:
+def placed_abstract(mesh: Mesh, batch: Batch, *, whole: bool = False) -> Batch:
     """The batch `shard_batch` would place from this process's share `batch`, as shapes with their
     shardings and nothing transferred: what a run reads a step's plan and its whole state from before
-    any array of it is on a device (`Trainer.fit`)."""
+    any array of it is on a device (`Trainer.fit`). Given the `whole` batch every process reads, as one
+    (`Trainer.validate`), its rows are its own; its host fields and scalars as they are either way."""
     device, host = split_fields(batch)
     if host:
-        return with_host(placed_abstract(mesh, device), host)
-    batch = filled_validity(batch) if jax.process_count() > 1 else batch
-    placed = _placed_rows(mesh)
+        return with_host(placed_abstract(mesh, device, whole=whole), host)
+    batch = filled_validity(batch) if jax.process_count() > 1 and not whole else batch
+    placed = (lambda shape: shape) if whole else _placed_rows(mesh)
 
     def shape(leaf, sharding: NamedSharding) -> jax.ShapeDtypeStruct:
         return jax.ShapeDtypeStruct(placed(np.shape(leaf)), jnp.result_type(leaf), sharding=sharding)

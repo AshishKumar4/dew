@@ -209,12 +209,17 @@ def test_the_exchange_agrees_forward_and_backward_where_heads_split_further(spec
                                         f"sequence {spec.sequence}")
 
 
-def _dropping_draw(seed):
-    """Queries, keys and values of `heads`' shapes, and an output cotangent."""
+def _draw(seed, heads: int = 4, kv_heads: int = 2):
+    """Queries of `heads` heads, keys and values of `kv_heads`, and an output cotangent."""
     q_key, k_key, v_key, c_key = jax.random.split(jax.random.key(seed), 4)
-    query = jax.random.normal(q_key, (BATCH, SEQ_LEN, 4, 8), jnp.float32)
-    key, value = (jax.random.normal(k, (BATCH, SEQ_LEN, 2, 8), jnp.float32) for k in (k_key, v_key))
+    query = jax.random.normal(q_key, (BATCH, SEQ_LEN, heads, 8), jnp.float32)
+    key, value = (jax.random.normal(k, (BATCH, SEQ_LEN, kv_heads, 8), jnp.float32) for k in (k_key, v_key))
     return query, key, value, jax.random.normal(c_key, query.shape, jnp.float32)
+
+
+_dropping_draw = _draw
+_gathered_draw = functools.partial(_draw, heads=3, kv_heads=1)
+"""Three query heads over one key head, which no two-way sequence's all-to-all divides: the gather."""
 
 
 @pytest.mark.mesh
@@ -255,6 +260,255 @@ def test_the_entry_drops_over_a_split_sequence():
     call = {"causal": True, "dropout_rate": 0.3, "dropout_rng": jax.random.key(7), "deterministic": False}
     entry = with_gradients(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call))
     assert_exchanged_on_par(entry, entry, SPLIT, _dropping_draw, "the entry, dropping over a split sequence")
+
+
+def _groups(offsets: tuple[int, ...]) -> jnp.ndarray:
+    """`[BATCH, SEQ_LEN]` block numbers: each row two blocks of four keys from its offset, -1 elsewhere."""
+    rows = [[(column - offset) // 4 if 0 <= column - offset < 8 else -1 for column in range(SEQ_LEN)]
+            for offset in offsets]
+    return jnp.asarray(rows, jnp.int32)
+
+
+VISIBLE = {
+    "blocks": {"causal": True, "block_groups": _groups((0, 1, 2, 3, 4, 5, 6, 7))},
+    "images": {"causal": True, "sliding_window": 6, "image_groups": _groups((7, 6, 5, 4, 3, 2, 1, 0))},
+    "documents and blocks": {
+        "causal": True, "block_groups": _groups((2,) * BATCH),
+        "segment_ids": jnp.asarray(packed_batch()["text_coordinates"].segments[:, :-1], jnp.int32)},
+    "starts": {"key_value_seq_starts": jnp.asarray([0, 3, 5, 1, 0, 7, 2, 4], jnp.int32),
+               "key_value_seq_lengths": jnp.asarray([16, 9, 12, 16, 11, 16, 8, 13], jnp.int32)},
+    "slots": {"causal": True, "query_slots": jnp.broadcast_to(jnp.arange(SEQ_LEN, dtype=jnp.int32),
+                                                              (BATCH, SEQ_LEN)),
+              "block_groups": _groups((4,) * BATCH)},
+}
+"""Calls whose visibility is per-token ids (row 1495): block and image groups, documents beside blocks, key
+starts, a cached call's query slots."""
+
+GATHERED_VISIBLE = {
+    **VISIBLE,
+    # Real keys and places a window counts by: row r's places step by one past each of its first r keys.
+    "valid keys and places": {
+        "causal": True, "sliding_window": 5,
+        "key_valid": jnp.asarray([[column % 5 != 3 for column in range(SEQ_LEN)]] * BATCH),
+        "places": jnp.asarray([[column + min(column, row) for column in range(SEQ_LEN)]
+                               for row in range(BATCH)], jnp.int32)},
+    # Each query's runs a row apiece `[B, Q, R, 2]` and every row's `[Q, R, 2]`: its own key on and the first.
+    "runs": {"causal": True, "key_runs": jnp.broadcast_to(jnp.asarray(
+        [[[0, 2], [q, SEQ_LEN]] for q in range(SEQ_LEN)], jnp.int32), (BATCH, SEQ_LEN, 2, 2))},
+    "shared runs": {"key_runs": jnp.asarray([[[0, 1], [q // 2, q + 1]] for q in range(SEQ_LEN)], jnp.int32)},
+    # A cached call's live slots in no index order: query q's own key 15 - q.
+    "reversed slots": {"causal": True, "block_groups": _groups((3,) * BATCH),
+                       "query_slots": jnp.broadcast_to(SEQ_LEN - 1 - jnp.arange(SEQ_LEN, dtype=jnp.int32),
+                                                       (BATCH, SEQ_LEN))},
+    # A cached call's slots with padding, its queries reading the block holding their slot.
+    "padded slots": {"causal": True, "block_groups": _groups((1,) * BATCH),
+                     "query_slots": jnp.asarray([[column if column < 12 + row % 4 else -1
+                                                  for column in range(SEQ_LEN)] for row in range(BATCH)],
+                                                jnp.int32)},
+}
+"""`VISIBLE` and the ids it holds none of: key validity, places, runs a row apiece and every row's, live slots
+in no index order and padded slots (row 1495's gather path)."""
+
+
+EXCHANGED_VISIBLE = [("all-to-all", name) for name in sorted(VISIBLE)] + [
+    ("gather", name) for name in sorted(GATHERED_VISIBLE)]
+"""Each exchange's calls of per-token ids: the all-to-all's (`_dropping_draw`'s heads, which it divides) and
+the gather's (`_gathered_draw`'s, which it does not)."""
+
+
+def _exchanged(exchange: str) -> tuple[dict, object]:
+    """`exchange`'s calls and the draw whose heads take it (`EXCHANGED_VISIBLE`)."""
+    return (VISIBLE, _dropping_draw) if exchange == "all-to-all" else (GATHERED_VISIBLE, _gathered_draw)
+
+
+@pytest.mark.mesh
+@pytest.mark.parametrize("implementation", ["reference", "xla", "template"])
+@pytest.mark.parametrize(("exchange", "name"), EXCHANGED_VISIBLE,
+                         ids=[" ".join(pair) for pair in EXCHANGED_VISIBLE])
+def test_per_token_visibility_passes_through_either_exchange(exchange, name, implementation):
+    """The entry over a split sequence whose call reads per-token ids hands them to the kernel, so no global
+    `[B, 1, S, S]` mask is built (row 1495; a kernel that reads masks builds its shard's own, the template
+    none): the all-to-all whole beside the whole sequences it gives (`VISIBLE`), the gather its key-side ids
+    whole, each striped query reading them at its slot (`GATHERED_VISIBLE`,
+    `attention_parallel._striped_visibility`). Its output and its gradients, forward and backward, on par
+    with the whole sequence's (check 1) from float64, the reference's where the kernel takes no float64
+    (the template)."""
+    calls, draw = _exchanged(exchange)
+    call = dict(calls[name], implementation=implementation)
+    entry = with_gradients(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call))
+    whole = entry if implementation != "template" else with_gradients(
+        lambda q, k, v: scaled_dot_product_attention(q, k, v, **dict(call, implementation="reference")))
+    assert_exchanged_on_par(entry, whole, SPLIT, draw,
+                            f"the entry through the {exchange}, {name}, {implementation}")
+    with jax.set_mesh(SPLIT.build()):
+        program = jax.make_jaxpr(entry)(*draw(0))
+    masks = [var.aval.shape for var in _variables(program.jaxpr)
+             if var.aval.dtype == jnp.bool_ and var.aval.shape[-2:] == (SEQ_LEN, SEQ_LEN)
+             and var.aval.shape[0] == BATCH]
+    assert not masks, masks
+
+
+@pytest.mark.mesh
+def test_a_cross_call_through_the_gather_takes_its_visibility_as_a_mask():
+    """A cross call (eight queries over sixteen keys) of heads the all-to-all does not divide takes its key
+    validity as the mask it means (`attention_parallel.CROSS_GATHERED`: its queries hold no slots among its
+    keys), on par with the whole call's."""
+    call = {"key_valid": jnp.asarray([[column % 3 != 1 for column in range(SEQ_LEN)]] * BATCH),
+            "implementation": "reference"}
+
+    def draw(seed):
+        query, key, value, _ = _gathered_draw(seed)
+        cotangent = jax.random.normal(jax.random.key(seed + 99), (BATCH, 8, 3, 8), jnp.float32)
+        return query[:, :8], key, value, cotangent
+
+    entry = with_gradients(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call))
+    assert_exchanged_on_par(entry, entry, SPLIT, draw, "a cross call's key validity through the gather")
+
+
+@pytest.mark.mesh
+@pytest.mark.parametrize(("exchange", "name"), EXCHANGED_VISIBLE,
+                         ids=[" ".join(pair) for pair in EXCHANGED_VISIBLE])
+def test_the_template_builds_no_mask_of_a_split_calls_visibility(exchange, name):
+    """The template over a split sequence reads a call's per-token ids as its spans, on each device beside
+    the all-to-all's whole sequences or at each striped query's slot through the gather, so its program
+    holds no `[rows, 1, queries, S]` mask at all, its shard's or the batch's (row 1495; a key length's
+    `[rows, 1, 1, S]` is no query's)."""
+    calls, draw = _exchanged(exchange)
+    call = dict(calls[name], implementation="template")
+    entry = with_gradients(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call))
+    with jax.set_mesh(SPLIT.build()):
+        program = jax.make_jaxpr(entry)(*draw(0))
+    masks = [var.aval.shape for var in _variables(program.jaxpr)
+             if var.aval.dtype == jnp.bool_ and len(var.aval.shape) == 4 and var.aval.shape[1] == 1
+             and var.aval.shape[2] > 1 and var.aval.shape[-1] == SEQ_LEN]
+    assert not masks, masks
+
+
+SHARED = MeshSpec(fsdp=2, sequence=2)
+"""Batch rows split two ways beside the sequence: a shared vector of the batch's length (`B == K == 4`)."""
+
+
+def _square_draw(seed):
+    """Four rows of four tokens, four query heads over two key heads, and an output cotangent."""
+    q_key, k_key, v_key, c_key = jax.random.split(jax.random.key(seed), 4)
+    query = jax.random.normal(q_key, (4, 4, 4, 8), jnp.float32)
+    key, value = (jax.random.normal(k, (4, 4, 2, 8), jnp.float32) for k in (k_key, v_key))
+    return query, key, value, jax.random.normal(c_key, query.shape, jnp.float32)
+
+
+SHARED_IDS = {
+    "key_valid": jnp.asarray([True, True, False, True]),
+    "query_slots": jnp.arange(4, dtype=jnp.int32),
+    # Every query's runs `[R, 2]` and every row's `[Q, R, 2]`, each of the batch's leading length.
+    "key_runs": jnp.asarray([[0, 1], [1, 1], [2, 3], [3, 4]], jnp.int32),
+    "key_runs by query": jnp.asarray([[[0, 1], [q, q + 1]] for q in range(4)], jnp.int32),
+}
+"""Ids every row shares whose leading length is the batch's (four): `[K]` validity, `[Q]` slots, `[R, 2]` and
+`[Q, R, 2]` runs (row 12701)."""
+
+
+@pytest.mark.mesh
+@pytest.mark.parametrize("name", sorted(SHARED_IDS))
+def test_a_shared_id_of_the_batchs_length_stays_whole(name):
+    """A shared `[K]` validity, `[Q]` slots or `[R, 2]` and `[Q, R, 2]` runs of the batch's length (four rows
+    of four tokens, the rows split two ways) travels whole, the keys' or the queries' as it is, not split as
+    rows (reviews of #4023 and #4026, row 12701): the entry on par with whole sequences, forward and
+    backward."""
+    call = {"causal": True, name.split(" by ")[0]: SHARED_IDS[name], "implementation": "reference"}
+    entry = with_gradients(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call))
+    assert_exchanged_on_par(entry, entry, SHARED, _square_draw, f"a shared {name} of the batch's length")
+
+
+@pytest.mark.mesh
+def test_runs_of_another_batch_are_refused_before_the_exchange():
+    """Runs a row apiece `[2, Q, R, 2]` beside a batch of four, its rows split two ways, are refused before
+    the all-to-all, where replicated whole each shard read its own two rows' runs as its rows' and rows two
+    and three took rows zero and one's visibility (review of #4035)."""
+    runs = jnp.broadcast_to(jnp.asarray([[0, 2]], jnp.int32), (2, 4, 1, 2))
+    query, key, value, _ = _square_draw(0)
+    with jax.set_mesh(SHARED.build()), pytest.raises(ValueError):
+        jax.jit(lambda q, k, v: scaled_dot_product_attention(
+            q, k, v, causal=True, key_runs=runs, implementation="reference")).trace(query, key, value)
+
+
+def _cross_draw(seed):
+    """Four rows of four tokens, three query heads over one key head (the gather on `SHARED`), and an
+    output cotangent."""
+    query, key, value, cotangent = _draw(seed, heads=3, kv_heads=1)
+    return query[:4, :4], key[:4, :4], value[:4, :4], cotangent[:4, :4]
+
+
+def _documents(rows: int):
+    """Cross documents of equal lengths, `rows` rows: queries `[1, 2, 2, 2]` over keys `[1, 1, 2, 2]`."""
+    from dew.nn.documents import CrossDocuments
+
+    return CrossDocuments(jnp.asarray([[1, 2, 2, 2]] * rows, jnp.int32),
+                          jnp.asarray([[1, 1, 2, 2]] * rows, jnp.int32))
+
+
+@pytest.mark.mesh
+@pytest.mark.parametrize("implementation", ["reference", "cudnn"])
+def test_equal_length_cross_documents_through_the_gather_keep_their_alignment(implementation):
+    """Causal cross documents of equal lengths through the gather align each query to its document's last
+    keys (query 0 sees keys 0 and 1), taken as their mask (`attention_parallel.ALIGNED_GATHERED`), where the
+    striped indices as slots overwrote the alignment and query 0 saw key 0 alone (review of #4052); a call
+    naming cuDNN runs that mask on the masked kernel (`kernel_for_materialized_mask`; review of #4053): on
+    par with the whole call's xla, forward and backward."""
+    def attend(name):
+        call = {"causal": True, "segment_ids": _documents(4), "implementation": name}
+        return with_gradients(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call))
+
+    assert_exchanged_on_par(attend(implementation), attend("reference" if implementation == "reference"
+                                                          else "xla"), SHARED, _cross_draw,
+                            f"equal-length cross documents through the gather, {implementation}")
+
+
+@pytest.mark.mesh
+def test_documents_of_another_batch_are_refused_before_their_mask():
+    """Cross documents of two rows beside a batch of four, its rows split two ways, are refused before the
+    gather's masked route folds them into a mask, where that `[2, 1, 4, 4]` mask replicated and rows two and
+    three read rows zero and one's documents (review of #4053)."""
+    query, key, value, _ = _cross_draw(0)
+    call = {"causal": True, "segment_ids": _documents(2), "implementation": "reference"}
+    with jax.set_mesh(SHARED.build()), pytest.raises(ValueError):
+        jax.jit(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call)).trace(query, key, value)
+
+
+@pytest.mark.mesh
+def test_key_lengths_of_another_batch_are_refused_before_the_exchange():
+    """Key lengths of two rows beside a batch of four, its rows split two ways, are refused before the
+    gather, where replicated whole each shard read rows zero and one's lengths as its own (review of
+    #4052)."""
+    query, key, value, _ = _cross_draw(0)
+    call = {"key_value_seq_lengths": jnp.asarray([1, 2], jnp.int32),
+            "key_valid": jnp.ones((4, 4), bool), "implementation": "reference"}
+    with jax.set_mesh(SHARED.build()), pytest.raises(ValueError):
+        jax.jit(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call)).trace(query, key, value)
+
+
+@pytest.mark.mesh
+def test_a_call_naming_cudnn_takes_its_visibility_on_the_masked_kernel():
+    """A call naming cuDNN whose visibility is per-token ids, over a split sequence, runs on the kernel a
+    built mask takes (`kernel_for_materialized_mask`: cuDNN takes no mask), as it did when the ids were
+    that mask (review of #4023): on par with xla's whole sequences."""
+    split = with_gradients(lambda q, k, v: scaled_dot_product_attention(
+        q, k, v, **dict(VISIBLE["blocks"], implementation="cudnn")))
+    whole = with_gradients(lambda q, k, v: scaled_dot_product_attention(
+        q, k, v, **dict(VISIBLE["blocks"], implementation="xla")))
+    assert_exchanged_on_par(split, whole, SPLIT, _dropping_draw, "blocks naming cudnn over a split sequence")
+
+
+def _variables(jaxpr) -> list:
+    """Every variable `jaxpr` and the programs it holds define."""
+    found = []
+    for equation in jaxpr.eqns:
+        found.extend(equation.outvars)
+        for value in equation.params.values():
+            for inner in (value if isinstance(value, (tuple, list)) else (value,)):
+                held = getattr(inner, "jaxpr", inner)
+                if hasattr(held, "eqns"):
+                    found.extend(_variables(held))
+    return found
 
 
 @pytest.mark.mesh

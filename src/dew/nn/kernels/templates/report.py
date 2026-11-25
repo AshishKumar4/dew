@@ -1066,7 +1066,7 @@ def _lowered_verdict_key(calls) -> str | None:
 
 
 def stored_key(provenance: frozenset[str] | None, *fields) -> str | None:
-    """What decides a stored launch decision (`attention_mosaic._choice_key`) for a compile
+    """What decides a stored launch decision (`attention_mosaic_derivation._choice_key`) for a compile
     target before it traces: its code (`dew._code.provenance_code`: an edit of it invalidates the stored
     entry), the installed JAX, jaxlib and CUDA plugins, whose Mosaic GPU and XLA lower and compile it (the
     Pallas lowering cache's seal of them), caller-specific `fields`, and the environment a kernel's lowering
@@ -1245,17 +1245,18 @@ def _certifying_device():
 
 def _lowered_launch(op, arguments: tokamax.BoundArguments, config: Hashable, device, reverse: bool
                     ) -> tuple[jax.stages.Lowered, dict, str | None]:
-    """`op`'s launch of `arguments` at `config` lowered alone for `device` (as reverse mode runs it where
-    `reverse`), beside its kernels' modules (a Triton call's config) by name, and their verdict's key
+    """`op`'s launch of `arguments` at `config` lowered alone, certified for `device` (as reverse mode runs it
+    where `reverse`), beside its kernels' modules (a Triton call's config) by name, and their verdict's key
     (`_lowered_verdict_key`)."""
     from dew.nn.kernels.options import owned_program
     from dew.nn.programs import meshless
 
     mesh, manual = _certifying_placement(device)
     placed = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
-    # A program of its own on one device (`meshless`): none of the enclosing trace's mesh nor its axes, its
-    # operands' too, but the mesh its program runs on where that is one device's (`_certifying_placement`),
-    # within a map holding the axes manual its program's call holds manual (`sharding.manual_map`'s).
+    # A program of its own (`meshless`): none of the enclosing trace's mesh nor its axes, its operands' too,
+    # but the mesh its program runs on where that holds `device` (`_certifying_placement`), its operands
+    # whole on each device, within a map holding the axes manual its program's call holds manual
+    # (`sharding.manual_map`'s).
     with meshless(mesh):
         launch, shapes = op.lowering(arguments, config)
         if manual:
@@ -1381,18 +1382,23 @@ def _launch_binaries(lowered: jax.stages.Lowered, modules: dict) -> dict[str, tu
 
 def _certifying_placement(device) -> tuple[jax.sharding.Mesh, frozenset]:
     """The mesh certification places a launch's operands on `device` on and sets its program on
-    (`_lowered_launch`), and the axes its launch holds manual: its program's where that runs
-    on `device` alone (the concrete mesh, `jax.set_mesh`'s, its axes manual where the call is in a map
-    holding them, `sharding.manual_map`'s), so the launch lowers to the jaxpr and the mesh its program's call
-    does (the GPU it states and each jit's recorded mesh among them) and the program reads its kernels'
-    lowerings back (the Pallas lowering cache keys both); else a mesh of its own on `device`, as a program of
-    no mesh or a launch of many devices' (row 6327): its own compile cannot hold the program's devices, so
-    its program lowers its kernels again."""
+    (`_lowered_launch`), and the axes its launch holds manual: its program's where that holds `device` (the
+    concrete mesh, `jax.set_mesh`'s, one GPU's or many's, its axes manual where the call is in a map holding
+    them, `sharding.manual_map`'s), so the launch lowers to the jaxpr and the mesh its program's call does
+    (the GPU it states and each jit's recorded mesh among them) and the program reads its kernels' lowerings
+    back (the Pallas lowering cache keys both: a shard's launch on two GPUs certified on a mesh of its own was
+    lowered twice, rows 6327 and 12462), where the call holds every axis of more than one device manual, as a
+    kernel's launch needs (`sharding.per_shard`: it reads its operands whole, each device its own rows); else
+    a mesh of its own on `device`, as a program of no mesh, of other devices, or certified outside its call's
+    map (a run's compile: a recurrence's states launch certified there on its program's two-device data axis,
+    automatic, was refused, train 1275)."""
     from jax._src import mesh as mesh_lib
 
     placed = mesh_lib.get_concrete_mesh()
-    if not placed.empty and list(placed.devices.flat) == [device]:
-        return placed, frozenset(jax.sharding.get_abstract_mesh().manual_axes)
+    manual = frozenset(jax.sharding.get_abstract_mesh().manual_axes)
+    if (not placed.empty and device in placed.devices.flat
+            and all(size == 1 or name in manual for name, size in placed.shape.items())):
+        return placed, manual
     return jax.sharding.Mesh([device], ("launch",)), frozenset()
 
 

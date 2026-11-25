@@ -2,19 +2,27 @@
 
 from __future__ import annotations
 
+import bisect
 import dataclasses
+import functools
+import itertools
 import logging
 import threading
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import grain.experimental as experimental
 import grain.python as grain
+from grain._src.python.dataset.transformations.shuffle import ShuffleMapDataset
 
 from dew import _position
 from dew._records import boolean, integer, integers, listed, record
 
 from .dataset import LONG_RUN, DataPartition, Loading, logged_run, restore_parent
-from .sources.base import Shard, ShardManifest, ShardOpener
+from .sources.base import IndexedShards, Shard, ShardManifest, ShardOpener, ShardRows
+
+if TYPE_CHECKING:
+    from dew.batch import Batch
 
 _log = logging.getLogger(__name__)
 
@@ -47,18 +55,19 @@ def streamed(
         return grain.MapDataset.source(()).to_iter_dataset()
     shards = _shards(manifest, partition=partition, loading=loading)
     # The cut its places were dealt from, which its position holds (`_Passing`): the manifest's own, or
-    # the changed rule that cut it finer here (`ShardManifest.subdivided_by`).
-    dealt = manifest.cut or (manifest.subdivided_by if shards != tuple(manifest.shards) else None)
+    # the changed rule that cut it finer here (`_changed_cut`).
+    dealt = manifest.cut or _changed_cut(manifest, shards)
+    alike = manifest.alike or _cut_alike(manifest, shards)
     if places is not None:
         reader = _Taken(manifest.reader)
         return _ShardPass(grain.MapDataset.source(places), reader, cycle_length, loading, described,
-                          dealt=dealt)
+                          dealt=dealt, alike=alike)
     # An endless read whose shards are found empty, every place this reader can read, with no row read
     # between, reads nothing forever, which data.md §10 refuses (`_EmptyRun`), whether or not its store counts
     # its rows, as a store whose shards all state none is refused above.
     root = _dealt(shards, seed=seed, epochs=epochs)[partition.cut()]
     return _ShardPass(root, manifest.reader, cycle_length, loading, described, quota,
-                      (seed is not None, len(shards)) if epochs is None else None, dealt)
+                      (seed is not None, len(shards)) if epochs is None else None, dealt, alike)
 
 
 def bounded(manifest: ShardManifest, *, partition: DataPartition, seed: int | None, loading: Loading,
@@ -145,7 +154,26 @@ def cut(manifest: ShardManifest, *, partition: DataPartition, loading: Loading) 
     if shards == manifest.shards:
         return manifest
     return dataclasses.replace(manifest, shards=shards, subdivide=None, counted=None,
-                               cut=manifest.subdivided_by)
+                               cut=_changed_cut(manifest, shards), alike=_cut_alike(manifest, shards))
+
+
+def _changed_cut(manifest: ShardManifest, shards: tuple[Shard, ...]) -> str | None:
+    """The changed rule `manifest`'s shards were cut finer by into `shards` (`ShardManifest.subdivided_by`),
+    where its cut differs from the first rule's: ranges of as many records each, which the even cut's are
+    where its readers' count divides its records (`dew.data.sources.base.EVEN_CUT`), so a position the
+    first rule saved resumes there (Train 1248's review). None where it was not cut, or cut alike."""
+    if shards == tuple(manifest.shards) or len({shard.rows for shard in shards}) <= 1:
+        return None
+    return manifest.subdivided_by
+
+
+def _cut_alike(manifest: ShardManifest, shards: tuple[Shard, ...]) -> str | None:
+    """The changed rule `manifest`'s shards were cut finer by into `shards` where its cut is the first
+    rule's (`_changed_cut` names none): an earlier Dew named it in its positions, which read the same rows
+    here (`_Passing.set_state`)."""
+    if shards == tuple(manifest.shards) or _changed_cut(manifest, shards) is not None:
+        return None
+    return manifest.subdivided_by
 
 
 def _shards(manifest: ShardManifest, *, partition: DataPartition, loading: Loading) -> tuple[Shard, ...]:
@@ -164,13 +192,33 @@ def _shards(manifest: ShardManifest, *, partition: DataPartition, loading: Loadi
     return tuple(shards)
 
 
+@functools.lru_cache(maxsize=1 << 16)
+def shuffled(index: int, max_index: int, seed: int) -> int:
+    """Grain's place of `index` in its shuffle of `range(max_index + 1)` under `seed` (`index_shuffle`, four
+    rounds), each answered once a process: its cost grows as its range shrinks (13 ms a call over two
+    places, 4 us over a million), and a many-corpus mixture asks the same few of it over and over, each
+    corpus's places of its few shards alike under one seed (row 12842: 5,225 calls, 184 of them distinct,
+    43 of a 200-corpus mixture's 45 s to its first batch)."""
+    return experimental.index_shuffle(index, max_index=max_index, seed=seed, rounds=4)
+
+
+class _Shuffled(ShuffleMapDataset):
+    """Grain's shuffle of a parent (`MapDataset.shuffle`), its seed, statistics and element spec Grain's own,
+    each pass's place answered once a process (`shuffled`)."""
+
+    def _shuffled_index(self, index: int) -> int:
+        length = len(self._parent)
+        epoch, place = divmod(index, length)
+        return shuffled(place, length - 1, (self._seed + epoch) % 2**32) + epoch * length
+
+
 def _dealt(shards: tuple[Shard, ...], *, seed: int | None, epochs: int | None) -> grain.MapDataset:
     """The `shards` a stream reads (`_shards`), place by place over every pass, before the shares are cut
     from them: shuffled where `seed` is given (each pass its own order) and repeated `epochs` times
     (endlessly where None)."""
     root = grain.MapDataset.source(shards)
     if seed is not None:
-        root = root.shuffle(seed=seed)
+        root = _Shuffled(root, seed=seed)
     if epochs != 1:
         root = root.repeat(epochs)
     return root
@@ -184,11 +232,11 @@ class _ShardPass[Place](grain.IterDataset):
 
     def __init__(self, root: grain.MapDataset, reader: Callable[..., grain.IterDataset], cycle: int,
                  loading: Loading, name: str, quota: int | None = None,
-                 endless: tuple[bool, int] | None = None, dealt: str | None = None):
+                 endless: tuple[bool, int] | None = None, dealt: str | None = None, alike: str | None = None):
         super().__init__(root)
         self.root, self.reader = root, reader
         self.cycle, self.loading, self.name, self.quota, self.endless = cycle, loading, name, quota, endless
-        self.dealt = dealt
+        self.dealt, self.alike = dealt, alike
 
     def reachable(self) -> int | None:
         """The distinct places an endless read can read on this reader (and this loading worker's slice),
@@ -212,12 +260,12 @@ class _ShardPass[Place](grain.IterDataset):
         if not len(self.root) or self.quota == 0:
             # A worker dealt no place or no row of the bound reads nothing (Grain's interleave of no dataset
             # raises).
-            return _Passing(None, self.dealt)
+            return _Passing(None, self.dealt, self.alike)
         reader = _Reader(self.reader, _EmptyRun(self.name, self.reachable()), self.loading)
         rows = (_Sequential(self.root, reader, self.loading) if self.cycle == 1
                 else interleaved(self.root, reader, self.cycle, self.loading))
         limited = rows if self.quota is None else experimental.LimitIterDataset(rows, self.quota)
-        return _Passing(limited.__iter__(), self.dealt)
+        return _Passing(limited.__iter__(), self.dealt, self.alike)
 
 
 def interleaved(places: grain.MapDataset, reader: Callable[..., grain.IterDataset], cycle: int,
@@ -256,6 +304,65 @@ class _SequentialIterator(grain.DatasetIterator):
         super().__init__()
         self.places, self.reader, self.loading = places, reader, loading
         self.place, self.rows = 0, None
+        # Each place's records by index, read as a window asks for them (`window`), by its place: none holds
+        # its file open between reads (`ShardRows`).
+        self._indexed: dict[Hashable, ShardRows | None] = {}
+
+    def _by_index(self, place: int) -> ShardRows | None:
+        """Place `place`'s records by index (`_Reader.indexed`), opened once, None where its reader serves
+        none so."""
+        held = self.places[place]
+        if held not in self._indexed:
+            self._indexed[held] = self.reader.indexed(held) if isinstance(self.reader, _Reader) else None
+        return self._indexed[held]
+
+    def window(self, limit: int) -> Window | None:
+        """The next `limit` records at most from where it stands, by index, none read (`Window`), every place
+        on the way read by index; None where one is not, holds no record (a run of empty places is read as
+        a stream, which watches it, `_EmptyRun`), or its position is unknown to its index."""
+        place = self.place
+        rows = None if place >= len(self.places) else self._by_index(place)
+        if place < len(self.places) and rows is None:
+            return None
+        row = 0 if self.rows is None or rows is None else rows.index_of(
+            record(self.rows.get_state()["parent"], "a place's rows"))
+        parts: list[tuple[int, int, int, ShardRows]] = []
+        held = 0
+        while held < limit and place < len(self.places):
+            rows = self._by_index(place)
+            if rows is None:
+                return None
+            count = rows.rows(row + limit - held) - row
+            if not count and not row:
+                return None
+            if count:
+                parts.append((place, row, count, rows))
+                held += count
+            if held < limit:
+                place, row = place + 1, 0
+        return Window(tuple(parts), held)
+
+    def skip(self, window: Window) -> None:
+        """Stand past `window`'s records, as reading them would have left it (its rows' position the
+        stream's there, `ShardRows.state_at`), none read."""
+        if not window.parts:
+            return
+        place, row, count, rows = window.parts[-1]
+        assert isinstance(self.reader, _Reader)
+        for passed, _, _, _ in window.parts[:-1]:
+            # Each place read through holds rows: no run of empty ones goes on past it (`_EmptyRun`).
+            self.reader.empty.ended(yielded=True, place=self.places[passed])
+        self.reader.empty.rows += window.held
+        for passed_place, _, _, rows_passed in window.parts[:-1]:
+            # A place read through holds its records' places no longer, but where the window's last part
+            # reads the same shard (a repeated pass's places are one shard's, `_by_index`).
+            if rows_passed is not rows:
+                self._indexed.pop(self.places[passed_place], None)
+                rows_passed.close()
+        self._close_rows()
+        self.place = place
+        self.rows = iter(self.reader(self.places[place]))
+        self.rows.set_state(self.reader.watched(rows.state_at(row + count)))
 
     def __next__(self):
         # Each place read to its end, then the next opened, until the last ends.
@@ -273,7 +380,7 @@ class _SequentialIterator(grain.DatasetIterator):
         return {"place": self.place, "rows": None if self.rows is None else self.rows.get_state()}
 
     def set_state(self, state: Mapping[str, object]) -> None:
-        self.close()
+        self._close_rows()
         position = _sequential_position(state)
         self.place = integer(position["place"], "sequential shard pass's place")
         rows = position["rows"]
@@ -281,10 +388,113 @@ class _SequentialIterator(grain.DatasetIterator):
             self.rows = iter(self.reader(self.places[self.place]))
             self.rows.set_state(record(rows, "sequential shard pass's rows"))
 
-    def close(self) -> None:
+    def _close_rows(self) -> None:
         if self.rows is not None:
             self.rows.close()
         self.rows = None
+
+    def close(self) -> None:
+        self._close_rows()
+        for rows in self._indexed.values():
+            if rows is not None:
+                rows.close()
+        self._indexed = {}
+
+
+def made_one(step: Callable, record: Batch) -> Batch:
+    """`record` through `step`, maps alone, each making one record of one (`dew.data.analysis.indexable`)."""
+    made = step(record)
+    assert isinstance(made, Mapping), type(made)
+    return made
+
+
+class IndexedMap(grain.IterDataset):
+    """`parent` through `step`, a run of maps making one record of each, as Grain's map runs it, its
+    position its parent's; its next records served by index through `made` (`step`'s, each record a
+    batch) where its parent serves its own so (`served`): a window shuffle after it reads the records it
+    gives alone (`dew.data.ordering.WindowShuffle`)."""
+
+    def __init__(self, parent: grain.IterDataset, step: Callable, made: Callable[[Batch], Batch]):
+        super().__init__(parent)
+        self.parent, self.step, self.made = parent, step, made
+
+    def __iter__(self) -> grain.DatasetIterator:
+        return _IndexedMapIterator(iter(self.parent), self.step, self.made)
+
+
+class _IndexedMapIterator(grain.DatasetIterator):
+    def __init__(self, parent: grain.DatasetIterator, step: Callable, made: Callable[[Batch], Batch]):
+        super().__init__(parent)
+        self.parent, self.step, self.made = parent, step, made
+
+    def __next__(self):
+        # As Grain's map: an element none passes through (`_MapDatasetIterator`).
+        element = next(self.parent)
+        return None if element is None else self.step(element)
+
+    def get_state(self):
+        return self.parent.get_state()
+
+    def set_state(self, state) -> None:
+        self.parent.set_state(state)
+
+    def window(self, limit: int) -> Window | None:
+        window = served(self.parent, limit)
+        return None if window is None else window.mapped(self.made)
+
+    def skip(self, window: Window) -> None:
+        passed(self.parent, window)
+
+
+@runtime_checkable
+class ServesWindows(Protocol):
+    """An iterator whose next records can be served by index (`Window`) and stood past, none read: a shard
+    pass's (`_Passing`), or one of maps after it (`IndexedMap`)."""
+
+    def window(self, limit: int) -> Window | None: ...
+
+    def skip(self, window: Window) -> None: ...
+
+
+def served(rows: grain.DatasetIterator, limit: int) -> Window | None:
+    """The next `limit` records of `rows` at most, by index, none read, where `rows` serves them so
+    (`ServesWindows`); None for any other, read as a stream."""
+    return rows.window(limit) if isinstance(rows, ServesWindows) else None
+
+
+def passed(rows: grain.DatasetIterator, window: Window) -> None:
+    """Stand `rows`, the iterator that served `window` (`served`), past its records."""
+    assert isinstance(rows, ServesWindows)
+    rows.skip(window)
+
+
+@dataclasses.dataclass(frozen=True)
+class Window:
+    """Records ahead of a stream's position, by index (`_SequentialIterator.window`): `held` of them, from
+    each of `parts` in order: a place, the index its records start at there, how many and its records by
+    index."""
+
+    parts: tuple[tuple[int, int, int, ShardRows], ...]
+    held: int
+    steps: tuple[Callable[[Batch], Batch], ...] = ()
+    """What each record is made through after it is read, in order (`mapped`)."""
+
+    @functools.cached_property
+    def starts(self) -> list[int]:
+        """Where each part's records start among the window's."""
+        return list(itertools.accumulate((count for _, _, count, _ in self.parts[:-1]), initial=0))
+
+    def mapped(self, step: Callable[[Batch], Batch]) -> Window:
+        """This window, its records each made through `step` too (`IndexedMap`)."""
+        return dataclasses.replace(self, steps=(*self.steps, step))
+
+    def __getitem__(self, index: int) -> Batch:
+        part = bisect.bisect_right(self.starts, index) - 1
+        _, row, _, rows = self.parts[part]
+        made = rows[row + index - self.starts[part]]
+        for step in self.steps:
+            made = step(made)
+        return made
 
 
 _INTERLEAVED = frozenset({"iterators_in_use_indices", "exhausted", "iterators_in_use_states",
@@ -328,9 +538,10 @@ class _Passing(grain.DatasetIterator):
     its rows' position, and a position saved under another cut, or none, is refused (`PlanChanged`), its
     places other rows; one of a share no cut dealt holds none, as before any cut was named."""
 
-    def __init__(self, rows: grain.DatasetIterator | None, dealt: str | None = None):
+    def __init__(self, rows: grain.DatasetIterator | None, dealt: str | None = None,
+                 alike: str | None = None):
         super().__init__(() if rows is None else rows)
-        self._rows, self.dealt = rows, dealt
+        self._rows, self.dealt, self.alike = rows, dealt, alike
 
     def __next__(self):
         if self._rows is None:
@@ -343,7 +554,9 @@ class _Passing(grain.DatasetIterator):
 
     def set_state(self, state: Mapping[str, object]) -> None:
         saved = state.get("cut") if "rows" in state and "cut" in state else None
-        if saved != self.dealt:
+        # A position an earlier Dew saved under a cut it named that cuts as the first rule does (`alike`)
+        # reads the rows it named.
+        if saved != self.dealt and not (self.dealt is None and saved is not None and saved == self.alike):
             raise _position.PlanChanged(
                 ("shards.cut",),
                 f"the share's position was saved under its store's {saved or 'first'} cut and it reads "
@@ -356,6 +569,17 @@ class _Passing(grain.DatasetIterator):
     def close(self) -> None:
         if self._rows is not None:
             self._rows.close()
+
+    def window(self, limit: int) -> Window | None:
+        """Its rows' next `limit` records by index (`_SequentialIterator.window`), None where they are read as
+        a stream alone (an interleave, a bound in examples) or it was dealt none."""
+        rows = self._rows
+        return rows.window(limit) if isinstance(rows, _SequentialIterator) else None
+
+    def skip(self, window: Window) -> None:
+        """Stand past `window`'s records (`_SequentialIterator.skip`)."""
+        assert isinstance(self._rows, _SequentialIterator)
+        self._rows.skip(window)
 
 
 class _EmptyRun:
@@ -415,6 +639,19 @@ class _Reader[Place]:
     def __call__(self, place: Place) -> grain.IterDataset:
         options = grain.ReadOptions(self.loading.threads, self.loading.read_buffer)
         return _Watched(self.reader(place, options), self.empty, place)
+
+    def indexed(self, place: Place) -> ShardRows | None:
+        """`place`'s records by index as `__call__` reads them, a shard's whose reader serves them so
+        (`IndexedShards`); None for any other, a bound's `(shard, rows)` place among them."""
+        if not isinstance(place, Shard) or not isinstance(self.reader, IndexedShards):
+            return None
+        return self.reader.indexed(place)
+
+    @staticmethod
+    def watched(state: Mapping[str, object]) -> Mapping[str, object]:
+        """The position of a place's watched rows (`_WatchedIterator`) whose reader stands at `state`,
+        having read a row: one placed past rows read by index (`_SequentialIterator.skip`)."""
+        return {"parent": state, "yielded": True}
 
 
 class _Watched(grain.IterDataset):

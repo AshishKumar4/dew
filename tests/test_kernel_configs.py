@@ -182,6 +182,70 @@ def test_the_short_convs_kernels_compile_within_each_gpus_resources(target):
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 
+def _diagonal_case(*, packed: bool) -> support.KernelCase:
+    """The diagonal scan's training step through its VJP (`templates.recurrence.diagonal`, its four launches:
+    16 spans a row) over bf16 writes at HGRN 1.3B's 2048 channels, eight rows of 4096 tokens, whole or
+    packed."""
+    from dew.nn.kernels.templates.recurrence import diagonal, mainloop
+
+    def call():
+        x = jax.ShapeDtypeStruct((8, 4096, 2048), jnp.bfloat16)
+        g = jax.ShapeDtypeStruct(x.shape, jnp.float32)
+        state = jax.ShapeDtypeStruct((8, 2048), jnp.float32)
+        starts = jax.ShapeDtypeStruct(x.shape[:2], jnp.bool_) if packed else None
+
+        def grads(x, g, state, starts):
+            family, _ = mainloop.issued(jnp.float32)
+
+            def loss(x, g, state):
+                out, final = diagonal.diagonal_scan(x, g, state, starts, family=family, interpret=False)
+                return jnp.sum(out.astype(jnp.float32)) + jnp.sum(final)
+
+            return jax.grad(loss, argnums=(0, 1, 2))(x, g, state)
+        return grads, (x, g, state, starts)
+    return support.KernelCase("diagonal/packed" if packed else "diagonal", call)
+
+
+def _wkv4_case(*, packed: bool) -> support.KernelCase:
+    """RWKV4's WKV's training step through its VJP (`templates.recurrence.wkv4`, its four launches: 32 spans
+    a row) over bf16 keys and values at RWKV-4 1.5B's 2048 channels, eight rows of 4096 tokens, whole or
+    packed."""
+    from dew.nn.kernels.templates.recurrence import mainloop, wkv4
+
+    def call():
+        channel = jax.ShapeDtypeStruct((2048,), jnp.float32)
+        key = jax.ShapeDtypeStruct((8, 4096, 2048), jnp.bfloat16)
+        state = jax.ShapeDtypeStruct((8, 3, 2048), jnp.float32)
+        starts = jax.ShapeDtypeStruct(key.shape[:2], jnp.bool_) if packed else None
+
+        def grads(decay, bonus, key, value, state, starts):
+            family, _ = mainloop.issued(jnp.float32)
+
+            def loss(decay, bonus, key, value, state):
+                out, final = wkv4.wkv4(decay, bonus, key, value, state, starts, family=family,
+                                       interpret=False)
+                return jnp.sum(out.astype(jnp.float32)) + jnp.sum(final)
+
+            return jax.grad(loss, argnums=(0, 1, 2, 3, 4))(decay, bonus, key, value, state)
+        return grads, (channel, channel, key, key, state, starts)
+    return support.KernelCase("wkv4/packed" if packed else "wkv4", call)
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("target", gate_generations(scoped=True))
+def test_the_channel_walks_kernels_compile_within_each_gpus_resources(target):
+    """The channel walks' training launches (`templates.recurrence.walks`: the diagonal scan's and RWKV4's
+    WKV's) over whole rows and packed ones, lowered as on the GPU and compiled by Mosaic for a compile-only
+    device on this CPU through ptxas (tests/kernel_compile.py): within the block's shared memory (each
+    backward's kept states), no register spilled."""
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    cases = [case(packed=packed) for case in (_diagonal_case, _wkv4_case) for packed in (False, True)]
+    found = compile_mosaic_kernels(cases, target)
+    assert len(found) == len(cases)
+    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
 
 @COMPILES_ON_CPU
 @lowers("sm90")

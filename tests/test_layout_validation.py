@@ -90,6 +90,19 @@ def leaf_path(path) -> str:
     return jax.tree_util.keystr(path, simple=True, separator="/")
 
 
+def test_a_validated_batch_holding_a_scalar_and_a_host_field_reads_as_its_arrays_alone():
+    """A fine-tune validated over a batch holding, beside its token rows, a nested Python number (a device
+    field with no dtype of its own) and a field of strings no device holds reports what it reports over the
+    rows alone: the batch read as the run places it, its scalar and host field as they are (review of the
+    T83 follow-up: a Python number's `dtype` was read, and raised)."""
+    mesh = MeshSpec().build(jax.devices()[:1])
+    rows = step_batch()
+    plain = fine_tune(mesh, Layout()).validate(rows)
+    mixed = fine_tune(mesh, Layout()).validate({**rows, "meta": {"weight": 1.0},
+                                                "names": [f"row {index}" for index in range(BATCH)]})
+    assert mixed.device_bytes == plain.device_bytes, (mixed.device_bytes, plain.device_bytes)
+
+
 @pytest.mark.mesh(devices=8)
 @pytest.mark.parametrize("case", list(CASES))
 def test_a_validated_fine_tune_is_placed_and_held_as_its_report_said(case):
@@ -228,19 +241,24 @@ def test_cpu_devices_standing_in_for_gpus_hold_a_layout_to_the_memory_stated_for
 
 
 def test_a_gpu_step_over_fsdp_combines_its_parameter_gathers_a_layer_at_a_time():
-    """A step over fsdp 2 on compile-only H100s, three decoder layers of 3.5M parameters computed in bf16
-    over fp32 ones, under the step's options (`step_compiler_options`, its gathers combined up to its
-    largest layer's parameters as stored, `gathered_layer_bytes`): no all-gather of the compiled step moves
-    more than that layer's bytes (a whole MiB over them), where the 1 GiB of the collective options alone
-    combines them past it (IG-SCALING-2XH100: 4.7 of Qwen3.5-4B's layers a gather, 5 GiB more held)."""
+    """A step over fsdp 2 on compile-only H100s, a six-layer hybrid decoder repeating a three-layer period
+    (two sliding-window layers and a full-attention one, 4.2M parameters each computed in bf16 over fp32),
+    under the step's options (`step_compiler_options`, its gathers combined up to its largest layer's
+    parameters as stored, `gathered_layer_bytes`): no all-gather of the compiled step moves more than that
+    layer's bytes (a whole MiB over them), where the 1 GiB of the collective options alone combines a
+    period's layers past it (IG-SCALING-2XH100: 4.7 of Qwen3.5-4B's layers a gather, 5 GiB more held).
+    Like layers under a scan hold only one layer inside the loop body, so even 1 GiB gathers a layer at a
+    time; a periodic run puts its period's layers in one body, where the threshold still caps them."""
     from dew.telemetry.instrumentation import hlo_instructions
     from dew.telemetry.trace import collective
     from dew.training.memory import layer_gathers
 
     mesh = MeshSpec(fsdp=2).build(compile_only_gpus("sm90", 2, 40 * 2**30))
     layout = Layout(min_shard=TINY_SHARD)
-    model = models.build("causal_transformer", vocab_size=VOCAB, emb_features=512, num_layers=3, num_heads=8,
-                         mlp_features=2048, max_seq_len=SEQ_LEN, dtype=jnp.bfloat16)
+    model = models.build("causal_transformer", vocab_size=VOCAB, emb_features=512, num_layers=6, num_heads=8,
+                         mlp_features=2048, max_seq_len=SEQ_LEN, dtype=jnp.bfloat16,
+                         layer_types=("sliding_attention", "sliding_attention", "full_attention") * 2,
+                         kinds={"sliding_attention": {"window": 4}})
     objective, optimizer = LMObjective(model, SEQ_LEN), optax.adam(1e-3)
     ids = jnp.ones((1, SEQ_LEN), jnp.int32)
     variables = jax.eval_shape(lambda: nn.unbox(model.init(jax.random.key(0), ids)))

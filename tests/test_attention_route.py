@@ -22,7 +22,7 @@ from attention_oracle import attention_terms, kept, traced_attention_terms
 from flax import linen as nn
 from generation_support import here
 from jax.sharding import Mesh, PartitionSpec
-from reference_error import assert_as_exact, with_gradients
+from reference_error import FEWEST_SEEDS, assert_as_exact, with_gradients
 from sharded import MOVES, assert_runs_per_shard
 from test_attention_template import (
     DTYPES,
@@ -733,20 +733,16 @@ DENSE_BIAS_SEEDS = 8
 """Check 1's declared seeds for a dense bias named onto the template."""
 
 
-@pytest.mark.parametrize("deterministic", [True, False], ids=["deterministic", "fast"])
 @pytest.mark.parametrize("rows, heads", [(2, HEADS), (1, HEADS), (1, 1)],
                          ids=["a bias a row", "one bias every row", "one bias every row and head"])
-def test_a_dense_bias_named_onto_the_template_is_on_par_with_the_reference_path(rows, heads, deterministic,
-                                                                                request):
+def test_a_dense_bias_named_onto_the_template_is_on_par_with_the_reference_path(rows, heads):
     """A causal bf16 call whose bias varies by query, `[B or 1, H or 1, Q, K]` (a learned relative
     position's, T5's one table for every row), named onto the template: its score hook reads the bias a
     tile at a time where it is shared, never broadcast (`template.Biased`, a `Kind.TILE` parameter at
     `template.shared_place`), on par (check 1) with the reference path's dense bias from float64, its
-    output and the query's, key's, value's and bias's gradients, the bias's in its own shape (rows 2081,
-    2523). In both of the Mosaic backward's schedules for a shared bias: deterministic mode's, each program
-    its own place summed after, and the default's, the programs' adds into one place (the flag set or
-    dropped whatever the lane's, `with_deterministic_ops`, `without_deterministic_ops`; row 2645)."""
-    request.getfixturevalue("with_deterministic_ops" if deterministic else "without_deterministic_ops")
+    output and the query's, key's, value's and bias's gradients, the bias's in its own shape, each row's
+    written apiece and summed across the rows it shares after (`template.hook_gradient`; rows 2081, 2523).
+    """
     queries = 40
 
     def drawn(seed):
@@ -883,14 +879,18 @@ def _causal_terms(length: int):
     gradient's terms its own, the keys' and values' the root of the blocks' summed squares; a function of a
     draw `(query, key, value, sinks, dout)`, the sinks' gradient none."""
     def terms(query, key, value, sinks, dout):
+        # A program a GPU part's prepare traces (`traced_attention_terms`), its operands traced: no host
+        # array of them (a prepare-sm90 run's TracerArrayConversionError where host terms read them).
         del sinks
         blocks = []
-        for first in range(0, length, TRUTH_ROWS):
-            rows = slice(first, first + TRUTH_ROWS)
-            keep = (np.arange(first, first + TRUTH_ROWS)[:, None] >= np.arange(length)[None, :])[None, None]
-            blocks.append(attention_terms(query[:, rows], key, value, dout[:, rows], keep))
-        out, d_query = (np.concatenate([block[leaf] for block in blocks], axis=1) for leaf in (0, 1))
-        d_key, d_value = (np.sqrt(sum(np.square(block[leaf]) for block in blocks)) for leaf in (2, 3))
+        with jax.enable_x64(new_val=True):
+            for first in range(0, length, TRUTH_ROWS):
+                rows = slice(first, first + TRUTH_ROWS)
+                queries = np.arange(first, first + TRUTH_ROWS)[:, None]
+                keep = (queries >= np.arange(length)[None, :])[None, None]
+                blocks.append(traced_attention_terms(query[:, rows], key, value, dout[:, rows], keep))
+            out, d_query = (jnp.concatenate([block[leaf] for block in blocks], axis=1) for leaf in (0, 1))
+            d_key, d_value = (jnp.sqrt(sum(jnp.square(block[leaf]) for block in blocks)) for leaf in (2, 3))
         return out, d_query, d_key, d_value, None
 
     return terms
@@ -1351,3 +1351,143 @@ def test_backward_route_declines_and_runs_with_its_rounded_flag():
         grads = attention_route.backward(q, q, q, spans, template.Hooks(), q, residuals=residuals,
                                          rounded=False, interpret=True)
     assert grads.key.dtype == jnp.float32 and grads.value.dtype == jnp.float32
+
+
+def test_bare_attention_route_supports_jvp_and_higher_order_with_hooks():
+    """Row 2654: bare `attention_route.attend` supports `jax.jvp`, `jax.jvp(jax.grad(...))`, and
+    `jax.grad(jax.grad(...))` without `forward_mode_attention()`, including `score_mod` (with both floating
+    and integer `score_params`), `sinks`, `dropout`, and `query_mod` prologues."""
+    from dew.nn.kernels.templates import attention_route
+
+    b, q_len, k_len, h, d = 2, 16, 16, 4, 16
+    pos_i = jnp.arange(q_len, dtype=jnp.int32)[None, None, :]
+    spans = template.spans(q_len, k_len, b, causal=True)
+    drop = template.Dropout(jnp.array([11, 22], jnp.uint32), jnp.arange(b, dtype=jnp.int32),
+                            jnp.arange(h, dtype=jnp.int32), 0.1)
+
+    def score_mod(s, _qp, _kp, b_p, p_i):
+        return s + b_p + (p_i > 0).astype(s.dtype) * 0.05
+
+    def q_mod(x, _qp, s_h):
+        return x * s_h
+
+    def make_hooks(b_p, s_v, qs):
+        return template.Hooks(
+            score_mod=score_mod,
+            score_params=(template.Param(b_p, template.Kind.TILE),
+                          template.Param(pos_i, template.Kind.QUERY)),
+            initial=template.sinks(s_v, b, q_len, d),
+            drop=drop,
+            query_mod=q_mod,
+            query_params=(template.Param(qs, template.Kind.HEAD),),
+        )
+
+    def route_fn(qi, ki, vi, b_p, s_v, qs):
+        return attention_route.attend(qi, ki, vi, spans, make_hooks(b_p, s_v, qs))
+
+    def ref_fn(qi, ki, vi, b_p, s_v, qs):
+        return template.reference(qi, ki, vi, spans, make_hooks(b_p, s_v, qs))
+
+    def draw(seed: int):
+        rng = np.random.default_rng([26540, seed])
+        q = jnp.asarray(rng.standard_normal((b, q_len, h, d)), jnp.float32)
+        k = jnp.asarray(rng.standard_normal((b, k_len, h, d)), jnp.float32)
+        v = jnp.asarray(rng.standard_normal((b, k_len, h, d)), jnp.float32)
+        bias = jnp.asarray(rng.standard_normal((1, h, q_len, k_len)) * 0.25, jnp.float32)
+        sinks = jnp.asarray(rng.standard_normal((h,)) * 0.25, jnp.float32)
+        q_scale = jnp.asarray(1.0 + rng.standard_normal((h,)) * 0.1, jnp.float32)
+        primals = (q, k, v, bias, sinks, q_scale)
+        tangents = tuple(jnp.asarray(rng.standard_normal(p.shape) * 0.25, jnp.float32) for p in primals)
+        cot = jnp.asarray(rng.standard_normal((b, q_len, h, d)), jnp.float32)
+        return (*primals, *tangents, cot)
+
+    def orders_of(fn):
+        def eval_all(qi, ki, vi, b_p, s_v, qs, dqi, dki, dvi, db, ds, dqs, cot):
+            pr = (qi, ki, vi, b_p, s_v, qs)
+            tg = (dqi, dki, dvi, db, ds, dqs)
+            out, dout = jax.jvp(fn, pr, tg)
+            g, hvp = jax.jvp(
+                jax.grad(lambda *args: jnp.sum(fn(*args) * cot), argnums=(0, 1, 2, 3, 4, 5)), pr, tg)
+            return out, dout, g, hvp
+
+        return eval_all
+
+    assert_as_exact(jax.jit(orders_of(route_fn)), jax.jit(orders_of(ref_fn)), draw,
+                    "bare attention_route jvp and hvp with hooks", seeds=FEWEST_SEEDS)
+    q, k, v, bias, sink_v, q_scale, *_, cot = draw(0)
+    d2q = jax.grad(lambda qi: jnp.sum(
+        jax.grad(lambda qx: jnp.sum(route_fn(qx, k, v, bias, sink_v, q_scale) * cot))(qi) ** 2))(q)
+    assert jnp.all(jnp.isfinite(d2q))
+    # BF16-stored score parameters reach `score_mod` widened to fp32 in forward, backward, and JVP alike.
+    bf_bias = bias.astype(jnp.bfloat16)
+    db_bf = draw(1)[3].astype(jnp.bfloat16)
+    def dtype_checked_score(s, _qp, _kp, b_p):
+        return s + b_p if b_p.dtype == jnp.float32 else s
+
+    def bf_route(b_in):
+        hk = template.Hooks(score_mod=dtype_checked_score,
+                            score_params=(template.Param(b_in, template.Kind.TILE),))
+        return attention_route.attend(q, k, v, spans, hk)
+
+    def bf_ref(b_in):
+        hk = template.Hooks(score_mod=dtype_checked_score,
+                            score_params=(template.Param(b_in.astype(jnp.float32), template.Kind.TILE),))
+        return template.reference(q, k, v, spans, hk)
+
+    _, jvp_bf = jax.jvp(bf_route, (bf_bias,), (db_bf,))
+    _, ref_jvp_bf = jax.jvp(bf_ref, (bf_bias,), (db_bf,))
+    assert jnp.any(jvp_bf != 0) and jnp.all(jnp.isfinite(jvp_bf))
+    np.testing.assert_array_equal(np.asarray(jvp_bf), np.asarray(ref_jvp_bf))
+    # Explicit non-default precision stays forward-mode differentiable on the template route.
+    out_hi, dout_hi = jax.jvp(
+        lambda qi, ki, vi: attention.scaled_dot_product_attention(
+            qi, ki, vi, implementation="template", precision="highest"),
+        (q, k, v), (jnp.ones_like(q), jnp.zeros_like(k), jnp.zeros_like(v)))
+    assert jnp.all(jnp.isfinite(out_hi)) and jnp.all(jnp.isfinite(dout_hi))
+
+
+def test_a_routes_tangent_of_a_mean_past_the_format_is_its_values_mean():
+    """A query of zero logits over two fp32 values of 2^127 (their sum past fp32's largest, their mean
+    2^127): the routed output is 2^127 and its tangent along the values, ones, is 1, the mean's, where the
+    portable rule differentiated the unnormalized sum, inf, to 0 (the head review of 0320fa0a3f9, F1)."""
+    spans = template.spans(1, 2, 1)
+    query = jnp.zeros((1, 1, 1, 8), jnp.float32)
+    key = jnp.zeros((1, 2, 1, 8), jnp.float32)
+    value = jnp.full((1, 2, 1, 8), 2.0 ** 127, jnp.float32)
+    out, tangent = jax.jvp(lambda v: attention_route.attend(query, key, v, spans, template.Hooks()),
+                           (value,), (jnp.ones_like(value),))
+    np.testing.assert_array_equal(np.asarray(out), 2.0 ** 127)
+    np.testing.assert_array_equal(np.asarray(tangent), 1.0)
+
+
+def test_a_routes_score_gradient_past_the_format_has_a_finite_tangent():
+    """A query of logits `[0, -0.25 k]` over fp32 values `2^127` and `1.5 * 2^127` (a finite mean and a finite
+    score gradient, its unnormalized sum past fp32's largest): the query gradient's tangent along the query
+    and a moving output cotangent (forward over reverse, the portable rule's) is on par with its float64
+    truth, where the overflowing sum left in the differentiated graph gave NaN (the head review's delta
+    confirm of d64daf1a049)."""
+    spans = template.spans(1, 2, 1)
+    query = np.zeros((1, 1, 1, 8), np.float32)
+    query[..., 0] = 1.0
+    # A cotangent on one column, so no product of it with the values passes the format itself.
+    cotangent = np.zeros((1, 1, 1, 8), np.float32)
+    cotangent[..., 0] = 1.0
+
+    def tangent_of(attend):
+        def tangent(q, k, v, ct):
+            def query_gradient(x, c):
+                _, pull = jax.vjp(lambda y: attend(y, k, v, spans, template.Hooks()), x)
+                return pull(c)[0]
+
+            return jax.jvp(query_gradient, (q, ct), (jnp.full_like(q, 0.5), ct * 0.5))[1]
+
+        return tangent
+
+    def draw(seed: int):
+        key = np.zeros((1, 2, 1, 8), np.float32)
+        key[0, 1, 0, 0] = -0.25 * (seed + 1)
+        value = np.stack([np.ones(8), np.full(8, 1.5)])[None, :, None, :] * 2.0 ** 127
+        return query, key, value.astype(np.float32), cotangent
+
+    assert_as_exact(jax.jit(tangent_of(attention_route.attend)), jax.jit(tangent_of(template.reference)),
+                    draw, "a route's score gradient's tangent past the format", seeds=FEWEST_SEEDS)

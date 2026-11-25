@@ -118,7 +118,6 @@ __all__ = [
     "head_product",
     "iteration_dtype",
     "l2_squares",
-    "l2_unit",
     "l2norm",
     "numerics_of",
     "operand_precision",
@@ -994,25 +993,24 @@ def l2norm(x: jax.Array, eps: float = L2NORM_EPS) -> jax.Array:
     """`x` over its L2 length along the last axis, `x * rsqrt(sum(x**2) + eps)` with `eps` added under
     the root, computed in at least fp32 (`at_least_fp32`, a float64 input's in float64) and rounded
     once to `x`'s dtype: the normalization of FLA's `l2norm` (the linear attentions' queries and
-    keys, modeling_qwen3_next.py:368-371) and of nGPT's `justnorm` (its residual stream and
-    weights)."""
-    return l2_unit(*l2_squares(x), x.dtype, eps)
+    keys, modeling_qwen3_next.py:368-371) and of nGPT's `justnorm` (its residual stream, queries, keys
+    and weights), its derivative the unit norm's own (`l2_normed`, row 12771)."""
+    return l2_normed(x, x.dtype, eps)
 
 
 def l2_squares(x: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """`x` in at least fp32 and its rows' sums of squares: `l2norm`'s reduction, which a reverse that keeps
-    them reads (nGPT's join, `dew.nn.ngpt`)."""
+    """`x` in at least fp32 and its rows' sums of squares: `l2_normed`'s reduction."""
     wide = x.astype(at_least_fp32(x.dtype))
     return wide, jnp.sum(jnp.square(wide), axis=-1, keepdims=True)
 
 
 def l2_normed(x: jax.Array, dtype, eps: float = L2NORM_EPS) -> jax.Array:
-    """`l2norm` of `x`'s rows rounded once to `dtype`, as `l2_unit(*l2_squares(x), dtype, eps)` computes it,
-    its derivative the unit norm's own, `r (t - y <y, t>)` for the unit row `y = x r` and its transpose
-    `r (c - y <y, c>)`: every term at the row's own scale, where JAX's derivative of `rsqrt` reads
-    `rsqrt(s) / s`, which flushes to zero at a row of length 2^55 and leaves a radial cotangent its
-    `r c` term alone, 2^-55 where the exact gradient is 0 (nGPT's join and hidden norm, row 11940's
-    review: their written transposes cancelled it)."""
+    """`x`'s rows over their L2 lengths, `wide * rsqrt(squares + eps)` of their wide copy and sums of
+    squares (`l2_squares`), rounded once to `dtype`: `l2norm`, its derivative the unit norm's own, `r (t -
+    y <y, t>)` for the unit row `y = x r` and its transpose `r (c - y <y, c>)`: every term at the row's
+    own scale, where JAX's derivative of `rsqrt` reads `rsqrt(s) / s`, which flushes to zero at a row of
+    length 2^55 and leaves a radial cotangent its `r c` term alone, 2^-55 where the exact gradient is 0
+    (nGPT's join and hidden norm, row 11940's review: their written transposes cancelled it)."""
     return _unit_rows(eps, *l2_squares(x)).astype(dtype)
 
 
@@ -1065,11 +1063,6 @@ derivative the rows' own (`_unit_rows`')."""
 _unit_rows = contracted("test_ngpts_join_and_normed_hidden_hold_every_order")(
     declared_tangent(Protected(), _unit_rows_value, _unit_rows_tangent, nondiff_argnums=(0,)))
 """`_unit_rows_value` with the unit norm's own tangent, every term at the row's scale (`l2_normed`)."""
-
-
-def l2_unit(wide: jax.Array, squares: jax.Array, dtype, eps: float = L2NORM_EPS) -> jax.Array:
-    """`l2norm` of the rows `wide` from their sums of squares (`l2_squares`), rounded once to `dtype`."""
-    return (wide * jax.lax.rsqrt(squares + eps)).astype(dtype)
 
 
 def float32_dot_general(lhs, rhs, dimension_numbers, precision: jax.lax.PrecisionLike = None,
@@ -1369,13 +1362,14 @@ def _configured_name(precision: jax.lax.PrecisionLike) -> str | None:
     return name.lower() if name in jax.lax.Precision.__members__ else name
 
 
-def configured_precision(precision: jax.lax.PrecisionLike):
+def configured_precision(precision: jax.lax.PrecisionLike, *, exact: bool = False):
     """A context in which a product that takes no precision of its own (jax.nn's xla attention)
-    multiplies at `precision`, through `jax.default_matmul_precision`; an unset or default
-    precision changes nothing, a floor the configured one meets. A precision no config names
-    (`configurable_precision`) is refused."""
+    multiplies at `precision`, through `jax.default_matmul_precision`; an unset precision changes nothing,
+    and a default one nothing unless `exact`, where it overrides an outer higher one (splash's arms, each
+    at exactly its own). A precision no config names (`configurable_precision`) is refused."""
     name = _configured_name(precision)
-    return contextlib.nullcontext() if name in (None, 'default') else jax.default_matmul_precision(name)
+    kept = name is None or (name == 'default' and not exact)
+    return contextlib.nullcontext() if kept else jax.default_matmul_precision(name)
 
 
 def operand_precision(dtype: Dtype | None, precision: jax.lax.PrecisionLike = None) -> jax.lax.PrecisionLike:

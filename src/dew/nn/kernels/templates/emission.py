@@ -10,27 +10,44 @@ operation of the CUDA cores its output's elements; a copy between memories its b
 shared memory. A primitive no rule here prices raises (`Unpriced`): the count states every instruction a
 kernel emits."""
 
+import collections
 import dataclasses
 import functools
 import math
 import weakref
 from collections.abc import Callable, Hashable, Mapping, Sequence
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
 from jax._src import ad_util, core as jax_core, hijax, pjit
+from jax._src.lax import control_flow
 from jax._src.pallas import mpmd, pallas_call, primitives as pallas
 from jax._src.pallas.mosaic import primitives as tpu
 from jax._src.pallas.mosaic_gpu import core as gpu_core, primitives as gpu
+from jax._src.pallas.triton import core as triton_core
 from jax._src.state import primitives as state, types as state_types
 from jax.experimental import pallas as pl
+from jax.experimental.mosaic.gpu import fragmented_array as fragments
+from jax.experimental.mosaic.gpu.mma import MMALayouts
 
 from dew.nn import derivatives, precision, programs
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import inline_work, resources
-from dew.nn.kernels.templates.cost import ISSUED_UNITS, Chain, Stated, Work, followed
+from dew.nn.kernels.templates.cost import (
+    ISSUED_UNITS,
+    Chain,
+    Stated,
+    Work,
+    followed,
+    issued as issue_slots,
+    launch_seconds,
+    most,
+    multiplied,
+    repeated,
+)
 from dew.nn.kernels.templates.product import product_mode
 
 
@@ -101,13 +118,14 @@ def emitted(body: jax_core.Jaxpr, warpgroups: int, axis: str | None, *, device: 
     4123)."""
     values = [_DEVICE if at in device else _barrier(var) for at, var in enumerate(body.invars)]
     arrivals = _Arrivals()
+    laid = layouts(body) if forms in _KERNEL_FORMS.values() else {}
 
     def counted() -> list[Role]:
         roles = []
         for index in range(warpgroups):
-            counting = _Counting(axis, index, forms=forms, arrivals=arrivals)
+            counting = _Counting(axis, index, forms=forms, arrivals=arrivals, laid=laid)
             counting.run(body, values)
-            roles.append(Role(counting.fixed, tuple(counting.walks)))
+            roles.append(Role(counting.held(), tuple(counting.walks)))
         return roles
 
     roles = counted()
@@ -206,18 +224,23 @@ and an FSETP scaling a subnormal: Mosaic GPU's `sqrt.approx.f32` a MUFU.SQRT and
 MUFU.RSQ, and XLA's `sqrt.rn.f32` a MUFU.RSQ refined on the FMA pipe (ptxas 13.0's SASS, probes FS-SQRT2 and
 FS-SQRT4, 2026-11-16), as an exp's MUFU.EX2 is one beside its scaling FMUL."""
 
+MOSAIC_DIVISION = Work(exponentials=1, operations=7)
+"""An fp32 division in a Mosaic GPU kernel, an element: `div.full.f32`, with or without `approx_math`, its
+MUFU.RCP beside five FMULs and two FSETPs (sm90's SASS, FS-DIV-SASS1 and FS-DIV-SASS5)."""
+
 APPROXIMATE_FORMS: Mapping = {
     lax.exp_p: Work(exponentials=1, operations=1), lax.exp2_p: Work(exponentials=1),
     lax.log_p: Work(exponentials=1, operations=1), lax.log2_p: Work(exponentials=1),
     lax.tanh_p: Work(exponentials=1), lax.sin_p: Work(exponentials=1), lax.cos_p: Work(exponentials=1),
     lax.sqrt_p: Work(exponentials=1, operations=3), lax.rsqrt_p: Work(exponentials=1, operations=3),
-    lax.logistic_p: Work(exponentials=2, operations=3)}
+    lax.logistic_p: Work(exponentials=2, operations=3), lax.div_p: MOSAIC_DIVISION}
 """Each special function's issue an element in a Mosaic GPU kernel compiled with `approx_math` (attention's):
 the hardware's approximate form, one MUFU (an exp's and a log's beside the multiply scaling it to base 2; a
 logistic's two, its exp and its reciprocal, beside a negation, a multiply and an add), counted from the PTX
 of a warpgroup kernel of one fp32 tile on sm90 and sm100 alike (FS-APPROX-FORMS3, row 10824); a square root's
 and its reciprocal's MUFU beside two FMULs and an FSETP scaling a subnormal, in their SASS (FS-SQRT2,
-FS-SQRT4). log1p and pow have none: Mosaic GPU lowers neither."""
+FS-SQRT4); an fp32 division its one form (`MOSAIC_DIVISION`). log1p and pow have none: Mosaic GPU lowers
+neither."""
 
 ACCURATE_FORMS: Mapping = {
     lax.exp_p: Work(exponentials=1, operations=7, conversions=1, integer_operations=1),
@@ -226,7 +249,8 @@ ACCURATE_FORMS: Mapping = {
     lax.log2_p: Work(operations=23, conversions=1, integer_operations=4),
     lax.tanh_p: Work(exponentials=2, operations=13, integer_operations=3),
     lax.logistic_p: Work(exponentials=2, operations=9, conversions=1, integer_operations=1),
-    lax.sqrt_p: Work(exponentials=1, operations=3), lax.rsqrt_p: Work(exponentials=1, operations=3)}
+    lax.sqrt_p: Work(exponentials=1, operations=3), lax.rsqrt_p: Work(exponentials=1, operations=3),
+    lax.div_p: MOSAIC_DIVISION}
 """Each special function's issue an element in a Mosaic GPU kernel compiled without `approx_math` (every
 GEMM launch's), from the same PTX (FS-APPROX-FORMS3, sm90 and sm100): an exp the MUFU beside seven fp32
 instructions (its range reduction's four FMAs, an add, a negation and a multiply), a saturating convert and a
@@ -235,7 +259,40 @@ a reciprocal) beside thirteen fp32 instructions and three integer ones; a log an
 polynomial of 21 and 23 fp32 instructions (its FMAs, selects and compares) beside four integer ones and a
 convert; exp2, sqrt and rsqrt their approximate forms. A sin's and a cos's accurate form branches to a slow
 reduction for large arguments, which a static count misstates: unpriced, with log1p and pow, which Mosaic
-GPU lowers in neither form."""
+GPU lowers in neither form. An fp32 division its one form (`MOSAIC_DIVISION`)."""
+
+_F32, _BF16, _F16, _E4M3, _S32 = (np.dtype(jnp.float32), np.dtype(jnp.bfloat16), np.dtype(jnp.float16),
+                                   np.dtype(jnp.float8_e4m3fn), np.dtype(jnp.int32))
+CONVERSION_FORMS: Mapping = {
+    (_F32, _BF16): Work(conversions=0.5), (_F32, _F16): Work(conversions=0.5),
+    (_F32, _E4M3): Work(conversions=0.5),
+    (_BF16, _F32): Work(integer_operations=1), (_F16, _F32): Work(operations=1),
+    (_E4M3, _F32): Work(conversions=0.5, operations=1), (_F32, _S32): Work(conversions=1, operations=2),
+    (_S32, _F32): Work(conversions=1), (_BF16, _F16): Work(integer_operations=1, conversions=0.5)}
+"""An element type conversion's issue an element in a Mosaic GPU kernel, by its source's and its target's
+exact dtypes, from sm90's SASS of a kernel of one
+(FS-CONV-SASS1): a narrowing to a 16- or 8-bit float one F2FP a packed pair (`cvt.rn.bf16x2.f32`,
+`cvt.rn.f16x2.f32`, `cvt.rn.satfinite.e4m3x2.f32`); a bf16 widened by its bits, a PRMT and an IMAD.U32 a
+pair; an fp16 by an HADD2.F32 an element; an e4m3 unpacked to fp16 pairs (F2FP.UNPACK_B) and widened alike;
+an fp32 to an int32 an F2I beside its saturating clamp's two FMNMX; an int32 to an fp32 an I2FP; a bf16 to
+an fp16 through fp32. One to its own dtype nothing, anywhere (FS-CONV-SASS2); any other pair a
+conversion an element, unmeasured."""
+
+_KERNEL_FORMS: Mapping = {"approximate": APPROXIMATE_FORMS, "accurate": ACCURATE_FORMS}
+"""A Mosaic GPU kernel's two forms tables by name, which a kernel's forms are by equality (a copy of one
+alike), so a price cached by name (`_software_division`) reads the same table."""
+
+IEEE_DIVISION = Work(exponentials=1, operations=6)
+"""An fp32 division as PTX's `div.rn.f32` lowers on sm90, an element: on its common path a MUFU.RCP beside
+five FFMAs and an FCHK, its slow path, a subnormal's or an extreme's, a call a count takes as not run (the
+SASS of a hand-written kernel of one, FS-DIV-SASS5). XLA's own fp32 division is it (M-FS-77: plain LLVM
+`fdiv`, PTX `div.rn.f32`)."""
+
+TRITON_FORMS: Mapping = {**{function: Work(exponentials=1) for function in APPROXIMATED},
+                         precision.correctly_rounded_divide_p: IEEE_DIVISION}
+"""A Pallas Triton kernel's forms (`forms_of`): each special function one exponential an element, as a
+kernel of no measured forms; a correctly rounded fp32 division its native `div.rn.f32`
+(`precision.triton_lowerings`, `IEEE_DIVISION`; row 12886)."""
 
 
 _FREE = frozenset({
@@ -320,13 +377,6 @@ def _elements(aval) -> int:
 
 def _bytes(aval) -> int:
     return _elements(aval) * jnp.dtype(aval.dtype).itemsize
-
-
-def repeated(work: Work, count: float) -> Work:
-    """`work` repeated `count` times in a chain: its every unit's, its span and each of its paths'."""
-    return Work(**{field.name: getattr(work, field.name) * count for field in dataclasses.fields(Work)
-                   if field.name not in ("kernels", "chains")}, kernels=work.kernels,
-                chains=tuple(chain.times(count) for chain in work.chains))
 
 
 def _tensor(dtype, flops: float) -> Work:
@@ -501,11 +551,29 @@ class _Counting:
     of its warpgroup's warps where it is one's (`warps`)."""
 
     def __init__(self, axis: str | None, index: int, loops: int = 0, warp: tuple | None = None,
-                 forms: Mapping | None = None, arrivals: _Arrivals | None = None, lanes: int | None = None):
+                 forms: Mapping | None = None, arrivals: _Arrivals | None = None, lanes: int | None = None,
+                 hoisted: dict[tuple, Work] | None = None, sites: Sequence = (),
+                 expansions: dict[int, tuple] | None = None, laid: Mapping | None = None):
         self.axis, self.index, self.warp, self.forms = axis, index, warp, forms
+        # Static work inside a loop, by its site: computed once outside every loop, as the compiler hoists
+        # it, whichever trip or arm of whichever trial reaches it (`hoist`, row 12767), so every count within
+        # that loop shares it; a conditional's arm outside every loop hoists into its own, its arm's (the
+        # review of lane/toolkit 55ba7911d). A site is its call path, the equations being counted within
+        # (`sites`) and its own, so a cached body's two calls are two sites.
+        self.hoisted = {} if hoisted is None else hoisted
+        self.sites = list(sites)
+        # Each expanded equation's expansion as the count first traced it (`expanded`), the equation held so
+        # its identity names it for the count's length, so its equations' sites hold across visits.
+        self.expansions = {} if expansions is None else expansions
+        # Each value's register layout its provenance names (`layouts`, a Mosaic GPU kernel's), read where
+        # an op's instructions are its layout's (a reduction's butterfly, `_butterfly`).
+        self.laid = {} if laid is None else laid
         # The warp of its warpgroup whose 32 lanes run its body where a warp mesh's role runs it
         # (`plgpu.warp_map`), None where its warpgroup's 128 do.
         self.lanes = lanes
+        # Whether its target's assembler fuses a multiply into the add that alone reads it (`fused`): a
+        # CUDA multiprocessor's ptxas; a TPU's VPU runs them as two operations.
+        self.fuses = generation.gpu_target().architecture.multiprocessor is not None
         self.arrivals = _Arrivals() if arrivals is None else arrivals
         self.fixed = Work()
         self.walks: list[Work] = []
@@ -594,14 +662,32 @@ class _Counting:
                 return np.asarray(atom.val)[()] if np.ndim(atom.val) == 0 else atom.val
             return held.get(atom)
 
-        # The variables a later equation or the jaxpr's outputs read: a swap's old value is live where read.
-        live = {atom for atoms in (*(equation.invars for equation in jaxpr.eqns), jaxpr.outvars)
-                for atom in atoms if isinstance(atom, jax_core.Var)}
+        # How often a later equation or the jaxpr's outputs read each variable: a swap's old value is live
+        # where read, and a multiply an add alone reads fuses with it (`fused`).
+        live = collections.Counter(atom for atoms in (*(equation.invars for equation in jaxpr.eqns),
+                                                      jaxpr.outvars)
+                                   for atom in atoms if isinstance(atom, jax_core.Var))
+        products: set = set()
+        # Each reduction's outputs by what it computes (`_computes`): one repeating it computes nothing, as
+        # the lowering's CSE merges it (Mosaic GPU's `canonicalize,cse`).
+        computed: dict = {}
         for equation in jaxpr.eqns:
+            computes = _computes(equation)
+            if computes is not None and (first := computed.get(computes)) is not None:
+                held.update(zip(equation.outvars, (held.get(variable) for variable in first), strict=True))
+                for variable, original in zip(equation.outvars, first, strict=True):
+                    (self.static.add if original in self.static else self.static.discard)(variable)
+                continue
+            if computes is not None:
+                computed[computes] = equation.outvars
             values = [read(atom) for atom in equation.invars]
             given = [isinstance(atom, jax_core.Literal) or atom in self.static for atom in equation.invars]
             self.returned = None
-            outputs = self.moved(equation, values, live) or self.equation(equation, values, given)
+            self.sites.append(id(equation))
+            try:
+                outputs = self.moved(equation, values, live) or self.equation(equation, values, given)
+            finally:
+                self.sites.pop()
             held.update(zip(equation.outvars, outputs, strict=True))
             # A body it ran here states its outputs' provenance (a call's, a scope's, a branch's); else the
             # operation's own (`_static`).
@@ -609,10 +695,49 @@ class _Counting:
                      else [_static(equation, given)] * len(outputs))
             for variable, known in zip(equation.outvars, fixed, strict=True):
                 (self.static.add if known else self.static.discard)(variable)
+            self.fused(equation, outputs, live, products)
         self.returned = [isinstance(atom, jax_core.Literal) or atom in self.static for atom in jaxpr.outvars]
         return [read(atom) for atom in jaxpr.outvars]
 
-    def moved(self, equation, values: list, live: set) -> list | None:
+    def fused(self, equation, outputs: list, live: collections.Counter, products: set) -> None:
+        """A floating multiply the count issued (its value unknown, not of the program's constants) whose
+        output one equation alone reads (`live`) is kept in `products`; an add or a subtract the count issued
+        reading one of its own shape, an element each, fuses with it into one instruction an element (the
+        assembler's FFMA, ptxas's --fmad, its default): its operations, just counted, become adds fused
+        (`Work.fused_multiply_adds`) in the same count, however many of its operands are products. A scalar
+        product added to a row's every element is one multiply for many adds, none fused (the review of
+        lane/toolkit 5cbbe66c586). A target whose assembler fuses none (a TPU's, `fuses`) counts both."""
+        primitive = equation.primitive
+        if not self.fuses or primitive not in (lax.mul_p, lax.add_p, lax.sub_p):
+            return
+        (output,) = equation.outvars
+        if (not jnp.issubdtype(output.aval.dtype, jnp.floating) or outputs[0] is not None
+                or output in self.static):
+            return
+        if primitive is lax.mul_p:
+            if live[output] == 1:
+                products.add(output)
+        elif any(isinstance(atom, jax_core.Var) and atom in products
+                 and getattr(atom.aval, "shape", ()) == getattr(output.aval, "shape", ())
+                 for atom in equation.invars):
+            added = _elements(output.aval)
+            self.add(Work(operations=-added, fused_multiply_adds=added))
+
+    def computed(self, equation) -> Work:
+        """An arithmetic equation's work (`operation_work`), a reduction's beside it its exchange across the
+        lanes its operand's layout spreads it over where its provenance names that layout (`_butterfly`)."""
+        layout = self.laid.get(equation.invars[0]) if equation.primitive in _REDUCTIONS else None
+        if isinstance(layout, fragments.TiledLayout):
+            threads = inline_work.WARP if self.lanes is not None else resources.THREADS
+            reduced = _laid_reduction(layout, equation.invars[0].aval, equation.params["axes"], threads,
+                                      equation.primitive)
+            if reduced is not None:
+                return reduced
+        return operation_work(equation.primitive, [variable.aval for variable in equation.invars],
+                              [variable.aval for variable in equation.outvars], equation.params,
+                              forms=self.forms)
+
+    def moved(self, equation, values: list, live: collections.Counter) -> list | None:
         """A read or write of a ref in device memory (`emitted`'s `device`) counted as the bytes it moves,
         its outputs unknown; None for any other equation. A read and a swap read the old value where it is
         `live` (a later equation or the jaxpr's outputs read it: a swap a load and a store, as Triton lowers
@@ -635,10 +760,15 @@ class _Counting:
         if (primitive in programs.SCALAR_FOLDED and values and (operands := programs.admitted(
                 values, [atom.aval.dtype for atom in equation.invars])) is not None):
             if primitive is lax.convert_element_type_p:
-                self.add(Work(conversions=1))
+                self.add(operation_work(primitive, [atom.aval for atom in equation.invars],
+                                        [atom.aval for atom in equation.outvars], params, forms=self.forms))
             return _folded(equation, operands)
         if (placed := _placed(primitive, values)) is not None:
             return [placed]
+        if primitive is control_flow.platform_index_p:
+            # The platform a program lowers for, its compile's choice: the priced target's, so a platform's
+            # branch (`lax.platform_dependent`) counts as its own runs.
+            return [_platform_branch(params["platforms"])]
         if primitive is pallas.multiple_of_p:
             # A divisibility hint: its operand's value, nothing computed.
             return [values[0]]
@@ -646,13 +776,16 @@ class _Counting:
                 and all(value is not None for value in values[1:])):
             return [values[1 + int(values[0])]]
         if _static(equation, given):
-            # Of the program's constants alone: folded by its compile or computed once outside every loop. A
-            # call of them runs on, its body's folds the values a later guard reads.
+            # Of the program's constants alone: hoisted out of every loop it lies in, computed once (`hoist`),
+            # else where its path runs it. A call of them runs on, its body's folds the values a later guard
+            # reads.
+            if primitive in _ARITHMETIC:
+                self.hoist(operation_work(primitive, [variable.aval for variable in equation.invars],
+                                          [variable.aval for variable in equation.outvars], params,
+                                          forms=self.forms))
             return unknown
         if primitive in _ARITHMETIC:
-            self.add(operation_work(primitive, [variable.aval for variable in equation.invars],
-                                    [variable.aval for variable in equation.outvars], params,
-                                    forms=self.forms))
+            self.add(self.computed(equation))
         elif primitive in _PRODUCTS:
             self.add(_product(equation))
         elif primitive is gpu.mma_p:
@@ -668,9 +801,15 @@ class _Counting:
             copied = _bytes(params["tree"].unflatten([variable.aval for variable in equation.invars])[1])
             self.add(Work(device_bytes=copied, shared_bytes=copied))
         elif primitive is gpu.atomic_store_p:
-            # An atomic update of device memory (an add into a sum other programs add to): its value's bytes.
-            value = params["args_tree"].unflatten([variable.aval for variable in equation.invars])[2]
-            self.add(Work(device_bytes=_bytes(value)))
+            # An atomic update (an add into a sum other programs or roles add to): its value's bytes, in
+            # device memory each lane's reduced at L2 an element at a time (`red.global`); in shared memory
+            # (`red.shared::cta`), shared bytes alone.
+            ref, _, value = params["args_tree"].unflatten([variable.aval for variable in equation.invars])
+            moved = _bytes(value)
+            if isinstance(ref, state_types.AbstractRef) and ref.memory_space == gpu_core.SMEM:
+                self.add(Work(shared_bytes=moved))
+            else:
+                self.add(Work(device_bytes=moved, global_reductions=moved))
         elif primitive is lax.dot_general_p:
             # A TPU core's product on its MXU: `2 m n k`, its output's elements over its contracted ones,
             # one pass in its operands' mode. Not `product_mode`'s passes: Mosaic TPU lowers a body's product
@@ -690,7 +829,7 @@ class _Counting:
             return region(self, equation, values, given) or unknown
         elif primitive is derivatives.marked_call_p and isinstance(params["kind"], _MARKS):
             return self.marked(params, values, given)
-        elif (expanded := _expanded(equation)) is not None:
+        elif (expanded := self.expanded(equation)) is not None:
             # The expansion's constants are its trace's own.
             return self.run(expanded[0], values, expanded[1], given, [True] * len(expanded[1]))
         elif primitive not in _FREE:
@@ -742,7 +881,9 @@ class _Counting:
                 inputs[len(consts) + counter] = _Place(at, start, stop, parity)
                 inputs[len(consts) + bound] = stop
             trial = _Counting(self.axis, self.index, loops=len(self.loops) + 1, warp=self.warp,
-                              forms=self.forms, arrivals=self.arrivals, lanes=self.lanes)
+                              forms=self.forms, arrivals=self.arrivals, lanes=self.lanes,
+                              hoisted=self.hoisted, sites=self.sites, expansions=self.expansions,
+                              laid=self.laid)
             trial.run(body, inputs, static=static)
             self.arrivals.left(trial.landing)
             return trial
@@ -770,9 +911,12 @@ class _Counting:
         steps, marks = [], 0.0
         barriers = [_barrier(var) for var in inner.invars]
         for warp in range(count):
+            # Each warp's static work its own (its instructions), its sites marked by its warp.
             counted = _Counting(self.axis, self.index, loops=len(self.loops), warp=(name, warp),
                                 forms=self.forms, arrivals=self.arrivals,
-                                lanes=warp if isinstance(mesh, gpu_core.WarpMesh) else self.lanes)
+                                lanes=warp if isinstance(mesh, gpu_core.WarpMesh) else self.lanes,
+                                hoisted=self.hoisted, sites=[*self.sites, (name, warp)],
+                                expansions=self.expansions, laid=self.laid)
             counted.run(inner, barriers)
             if self.loops:
                 self.arrivals.left(counted.landing)
@@ -814,6 +958,30 @@ class _Counting:
         else:
             self.fixed = self.fixed + found.work
 
+    def held(self) -> Work:
+        """Its work outside its walks and what it hoisted out of its loops (`hoisted`), together."""
+        total = self.fixed
+        for work in self.hoisted.values():
+            total = total + work
+        return total
+
+    def expanded(self, equation) -> tuple[jax_core.Jaxpr, Sequence] | None:
+        """`equation`'s expansion (`_expanded`), traced once for the count: a loop's trips and trials visit
+        one, so its equations' sites (`hoist`) are one across them (the review of lane/toolkit 55ba7911d)."""
+        if id(equation) not in self.expansions:
+            self.expansions[id(equation)] = (equation, _expanded(equation))
+        return self.expansions[id(equation)][1]
+
+    def hoist(self, work: Work) -> None:
+        """Static work (of the program's constants alone) at the equation being counted: inside a loop, its
+        site's once (`hoisted`, the compiler's hoisting out of every loop, whatever trip or arm reaches it
+        and however often); outside every loop, its path's own, beside the rest of its work (under a
+        conditional's arms' envelope, a call's at each call)."""
+        if not self.loops:
+            self.fixed = _then(self.fixed, work)
+        else:
+            self.hoisted.setdefault(tuple(self.sites), work)
+
     def cond(self, branches, values: list, given: list[bool]) -> list:
         """A conditional: its branch where its index is concrete (a role's, by its warpgroup), else every
         branch's envelope, unit by unit (the most of each any branch issues, as the custom call's FLOP count
@@ -828,17 +996,21 @@ class _Counting:
             return taken
         trials = []
         for branch in branches:
+            # Inside a loop its arms' hoisted work leaves the loop with every trip's (shared); outside every
+            # loop an arm's stays in the arm (its own), under the arms' envelope with the arm's other work.
             trial = _Counting(self.axis, self.index, loops=len(self.loops), warp=self.warp,
-                              forms=self.forms, arrivals=self.arrivals, lanes=self.lanes)
+                              forms=self.forms, arrivals=self.arrivals, lanes=self.lanes,
+                              hoisted=self.hoisted if self.loops else {}, sites=self.sites,
+                              expansions=self.expansions, laid=self.laid)
             trial.run(branch, operands, static=given[1:])
             if self.loops:
                 self.arrivals.left(trial.landing)
             trials.append(trial)
-        self.fixed = self.fixed + _envelope(trial.fixed for trial in trials)
+        self.fixed = self.fixed + most([trial.fixed if self.loops else trial.held() for trial in trials])
         if any(trial.walks for trial in trials):
-            self.walks.append(_envelope(_mean(trial.walks) for trial in trials if trial.walks))
+            self.walks.append(most([_mean(trial.walks) for trial in trials if trial.walks]))
         if self.loops:
-            self.loops[-1].work = self.loops[-1].work + _envelope(trial.loops[-1].work for trial in trials)
+            self.loops[-1].work = self.loops[-1].work + most([trial.loops[-1].work for trial in trials])
             self.loops[-1].marks += max(trial.loops[-1].marks for trial in trials)
         return [None] * len(branches[0].outvars)
 
@@ -921,6 +1093,216 @@ def _expanded(equation) -> tuple[jax_core.Jaxpr, Sequence] | None:
     return traced.jaxpr, traced.consts
 
 
+def _platform_branch(platforms) -> int:
+    """The branch of a `lax.platform_dependent` whose platforms (`platform_index`'s `platforms`, a branch's
+    names, or None for its default) hold the platform the call lowers for (`generation.lowering_platform`),
+    unpriced where its facts do not name one."""
+    if (name := generation.lowering_platform()) is None:
+        raise Unpriced(f"a platform choice among {platforms} on a GPU whose platform its facts do not name")
+    named = [index for index, names in enumerate(platforms) if names is not None and name in names]
+    defaults = [index for index, names in enumerate(platforms) if names is None]
+    if not named and not defaults:
+        raise Unpriced(f"no branch of a platform choice among {platforms} runs on {name}")
+    return (named or defaults)[0]
+
+
+@functools.lru_cache(maxsize=64)
+def _software_division(operands: tuple, target: generation.GpuTarget, forms: str | None) -> Work:
+    """A correctly rounded division's software form (`precision._correctly_rounded_divide`, XLA's and Mosaic
+    GPU's lowering) over operands of `(shape, dtype)` `operands`, traced for `target` (its platform's
+    arithmetic chosen as its program's is) and counted as a kernel's body is, through its protected and
+    marked calls, with a Mosaic GPU kernel's `forms` (by name) or none (row 12886); once an operand set."""
+    with generation.assumed(target):
+        traced = jax.make_jaxpr(precision._correctly_rounded_divide)(
+            *(jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in operands))
+        counted = emitted(traced.jaxpr, 1, None, forms=_KERNEL_FORMS.get(forms or "")).roles[0]
+    return counted.fixed + sum(counted.walks, Work())
+
+
+def layouts(jaxpr) -> dict:
+    """Each array value of a Mosaic GPU kernel's body (`jaxpr`, its nested bodies' too) whose register layout
+    its provenance names, as Mosaic GPU's layout inference assigns it (row 12889): a warpgroup product's
+    accumulator (WGMMA's, `wgmma_accumulator_deref`; mma.sync's, `mma`'s by its split), a stated layout
+    (`layout_cast`), an elementwise op's operands' one layout, a reduction's its operand's reduced
+    (`TiledLayout.reduce`), through scoped bodies, calls, a conditional's agreeing arms, a loop's carries
+    its trips keep and any call's program (`programs.called`). A value of any other provenance
+    is not among them: its layout is inference's choice from its uses, which no rule here reads."""
+    found: dict = {}
+    _laid_out(jaxpr, [None] * len(jaxpr.invars), found)
+    return found
+
+
+
+def _laid_out(jaxpr, given: Sequence, found: dict, consts: Sequence = ()) -> list:
+    """The layouts of `jaxpr`'s outputs, its inputs' `given` and its constants' `consts` (a scope's operands,
+    none other's), each value's noted in `found` (a value two visits lay out apart, a body's two calls',
+    none)."""
+    known: dict = {}
+
+    def note(var, layout) -> None:
+        # Each visit's layout of `var` joins its others': one visit's unknown or another layout, none.
+        if isinstance(var, jax_core.DropVar):
+            return
+        found[var] = layout if found.get(var, layout) == layout else None
+        if layout is not None:
+            known[var] = layout
+
+    def of(atom):
+        return known.get(atom) if isinstance(atom, jax_core.Var) else None
+
+    for var, layout in [*zip(jaxpr.invars, given, strict=True),
+                        *zip(jaxpr.constvars, consts or [None] * len(jaxpr.constvars), strict=True)]:
+        note(var, layout)
+    for equation in jaxpr.eqns:
+        laid = _equation_layouts(equation, [of(atom) for atom in equation.invars], found)
+        for var, layout in zip(equation.outvars, laid, strict=True):
+            note(var, layout)
+    return [of(atom) for atom in jaxpr.outvars]
+
+
+def _equation_layouts(equation, given: list, found: dict) -> list:
+    """`equation`'s outputs' layouts (`_laid_out`'s rules), its operands' `given`."""
+    primitive, params, outs = equation.primitive, equation.params, equation.outvars
+    unknown = [None] * len(outs)
+    if primitive is gpu_core.layout_cast_p:
+        # As its lowering reads it (`new_layout.to_mgpu()`).
+        return [params["new_layout"].to_mgpu()]
+    if primitive is gpu.wgmma_accumulator_deref_p:
+        return [fragments.WGMMA_LAYOUT]
+    if primitive is gpu.mma_p:
+        m, n = outs[0].aval.shape
+        held = params.get("m_warps")
+        split = (MMALayouts(outs[0].aval.dtype, m_warps=held) if held is not None
+                 else MMALayouts.for_shape(outs[0].aval.dtype, m, n))
+        return [split.acc]
+    if primitive in _REDUCTIONS:
+        layout, shape = given[0], tuple(equation.invars[0].aval.shape)
+        if not isinstance(layout, fragments.TiledLayout):
+            return unknown
+        untiled = len(shape) - len(layout.base_tile_shape)
+        axes = tuple(params["axes"])
+        if any(axis < untiled for axis in axes) or len(axes) == len(shape):
+            # A reduction to a scalar holds no tiled layout.
+            return unknown
+        return [layout.reduce(tuple(axis - untiled for axis in axes))]
+    if primitive in _OPERATIONS or primitive in SPECIAL_FUNCTIONS or primitive in (
+            lax.convert_element_type_p, lax.select_n_p, lax.integer_pow_p):
+        shape = tuple(getattr(outs[0].aval, "shape", ()))
+        held = {layout for layout, atom in zip(given, equation.invars, strict=True)
+                if layout is not None and tuple(getattr(atom.aval, "shape", ())) == shape}
+        return [next(iter(held))] if len(held) == 1 else unknown
+    if primitive is pallas.run_scoped_p:
+        # Its operands its body's constants (`pallas.run_scoped`), its inputs the refs it allocates.
+        body = params["jaxpr"]
+        return _laid_out(body, [None] * len(body.invars), found, consts=given)
+    if primitive is mpmd.mpmd_map_p:
+        # A warp mesh's or a kernel's regions, each its own body over its refs.
+        for region in params["jaxprs"]:
+            _laid_out(region, [None] * len(region.invars), found)
+        return unknown
+    if primitive is lax.cond_p:
+        arms = [_laid_out(branch.jaxpr, given[1:], found) for branch in params["branches"]]
+        return [first if all(arm[index] == first for arm in arms) else None
+                for index, first in enumerate(arms[0])]
+    if primitive is lax.while_p:
+        consts = params["cond_nconsts"] + params["body_nconsts"]
+        carried = list(given[consts:])
+        body_consts = given[params["cond_nconsts"]:consts]
+        # Each pass keeps a carry's layout its trip keeps (a carry only loses one), so passes stop by the
+        # carries' count; each pass's facts join the others' (`_laid_out`), so the fixed point's stand.
+        while True:
+            out = _laid_out(params["body_jaxpr"].jaxpr, [*body_consts, *carried], found)
+            kept = [before if before == after else None for before, after in zip(carried, out, strict=True)]
+            if kept == carried:
+                return carried
+            carried = kept
+    if primitive is lax.scan_p:
+        consts, carried, xs = map(list, params["ft_in"].update(given).unpack())
+        while True:
+            out = _laid_out(params["jaxpr"].jaxpr, [*consts, *carried, *([None] * len(xs))], found)
+            kept = [before if before == after else None
+                    for before, after in zip(carried, out[:len(carried)], strict=True)]
+            if kept == carried:
+                return carried + [None] * (len(outs) - len(carried))
+            carried = kept
+    if (inner := programs.called(equation)) is not None:
+        # A call (a jit's, a custom rule's, a custom batching's): its program on its operands one for one.
+        return _laid_out(inner, given, found)
+    return unknown
+
+
+_REDUCTION_PARAMS = ("axes", "accumulator_ilp", "out_sharding")
+"""The parameters a reduction binds (its lowering's: `accumulator_ilp` its grouping), its merge key's."""
+
+
+def _computes(equation) -> tuple | None:
+    """What a reduction of a variable computes, a key two reductions of one body computing the same share:
+    its primitive, its operand (the variable itself) and each parameter it binds; None for any other
+    equation, or a reduction binding one beyond `_REDUCTION_PARAMS`. Only reductions merge here: a repeated
+    product's readers decide its fusion (`_Counting.fused`), which a merge would have to rewrite."""
+    if (equation.primitive not in _REDUCTIONS or not isinstance(equation.invars[0], jax_core.Var)
+            or not set(equation.params) <= set(_REDUCTION_PARAMS)):
+        return None
+    return (equation.primitive, equation.invars[0],
+            *(equation.params.get(name) for name in _REDUCTION_PARAMS))
+
+
+def _redux(primitive, dtype) -> bool:
+    """Whether Mosaic GPU may lower a reduction across all of a warp's lanes by `redux.sync`, no shuffle
+    (`FragmentedArray.reduce`'s `redux_op`): a 32-bit integer's sum, maximum or minimum, and on a
+    Blackwell an fp32 maximum or minimum, which this count, knowing no architecture, takes as possible."""
+    if np.dtype(dtype).itemsize == 4 and np.issubdtype(dtype, np.integer):
+        return primitive in (lax.reduce_sum_p, lax.reduce_max_p, lax.reduce_min_p)
+    return np.dtype(dtype) == np.float32 and primitive in (lax.reduce_max_p, lax.reduce_min_p)
+
+
+def _laid_reduction(layout: fragments.TiledLayout, value, axes: Sequence[int], threads: int,
+                    primitive) -> Work | None:
+    """A reduction of `value`, laid out as `layout`, along `axes`, as Mosaic GPU lowers it
+    (`FragmentedArray.reduce`): each thread combines the values its registers hold of each output it keeps
+    (a replicated layout's copies each thread's own), then
+    exchanges them across the lanes the layout spreads `axes` over, log2 of them rounds of a shuffle of each
+    32-bit word and a combine of each value, on each of the role's `threads`; None where the layout states
+    no such lowering here (a scalar's, an axis no tile holds, an exchange across warps, one across all of a
+    warp's lanes `redux.sync` may take, `_redux`). The attention
+    forward's walk issues 12 SHFL a thread a step for its three row reductions of a WGMMA (sm90) or mma.sync
+    (sm80) tile, two rows a thread and two rounds each (FS-REDSHFL4)."""
+    shape = tuple(value.shape)
+    untiled = len(shape) - len(layout.base_tile_shape)
+    kept = tuple(size for axis, size in enumerate(shape) if axis not in axes)
+    if not kept or any(axis < untiled for axis in axes):
+        return None
+    reduced = layout.reduce(tuple(axis - untiled for axis in axes))
+
+    def spread(dims) -> int:
+        return math.prod(dim.times for dim in dims if isinstance(dim, fragments.Replicated))
+
+    if spread(reduced.warp_dims) > spread(layout.warp_dims):
+        return None
+    # As the lowering decides: every lane dimension one the reduction collapses (`all_lanes`).
+    every_lane = all(isinstance(target, fragments.Replicated) and not isinstance(source, fragments.Replicated)
+                     for source, target in zip(layout.lane_dims, reduced.lane_dims, strict=True))
+    if every_lane and _redux(primitive, value.dtype):
+        return None
+    rounds = int(math.log2(spread(reduced.lane_dims) // spread(layout.lane_dims)))
+    # A thread's values in and out as its registers hold them (a replicated layout's every copy's).
+    given = math.prod(layout.registers_shape(shape)) * layout.vector_length
+    kept_values = math.prod(reduced.registers_shape(kept)) * reduced.vector_length
+    words = math.prod(reduced.registers_shape(kept)) * math.ceil(
+        reduced.vector_length * np.dtype(value.dtype).itemsize / 4)
+    return Work(operations=(given - kept_values + rounds * kept_values) * threads,
+                shuffles=rounds * words * threads)
+
+
+def _divides_on_cuda(outputs: Sequence, target: generation.GpuTarget | None) -> bool:
+    """Whether a division of results `outputs` is an fp32 one on a CUDA multiprocessor (`target`, else the
+    process's own), whose MUFU and refinement Dew measured; fp64's and narrower floats' unmeasured."""
+    held = target or generation.gpu_target()
+    return (held.architecture.multiprocessor is not None
+            and all(aval.dtype == jnp.float32 for aval in outputs))
+
+
+
 def _operated(primitive, inputs: Sequence, outputs: Sequence) -> Work:
     """An elementwise operation's work, one an output element, a clamp's two (a maximum and a minimum: no
     instruction bounds a value on both sides, and every lowering, XLA's, Mosaic GPU's and Triton's, issues
@@ -960,7 +1342,8 @@ def _static(equation, given: Sequence[bool]) -> bool:
     conversions among them (FS-SOLVE-SASS2), their floor division and its truncating form to one binary
     (M-JS-258, row 4123). A value the count holds concretely of a thread's place or a trip's (a warpgroup's
     index, a step's parity, a scan's carry) is none of them."""
-    if equation.primitive is lax.iota_p:
+    if equation.primitive in (lax.iota_p, control_flow.platform_index_p):
+        # An iota's, and the platform its program's compile chooses for (`_platform_branch`).
         return True
     return equation.primitive in _PURE and bool(given) and all(given)
 
@@ -977,7 +1360,21 @@ def operation_work(primitive, inputs: Sequence, outputs: Sequence, params: Mappi
     (`product.product_mode`: on a TPU, an fp32 product's bfloat16 passes); what moves and computes nothing
     nothing (`_FREE`: a layout change, a barrier); any other primitive's output elements unpriced
     (`Work.unpriced_operations`). With `forms` (a kernel's: `APPROXIMATE_FORMS`, `ACCURATE_FORMS`), a special
-    function issues its form an output element, one with none unpriced."""
+    function issues its form an output element, one with none unpriced. An fp32 division on a CUDA target
+    issues its kernel's form (`MOSAIC_DIVISION`), XLA's own `div.rn.f32`'s (`IEEE_DIVISION`, M-FS-77);
+    other widths' and a TPU's, unmeasured, an operation an element. A correctly rounded one issues its
+    native form where a kernel's forms state one (a Triton kernel's, `TRITON_FORMS`), else the software
+    division it lowers to (XLA's and Mosaic GPU's, `precision._correctly_rounded_divide`), counted as a
+    kernel's body is, through its calls (row 12886)."""
+    if primitive is precision.correctly_rounded_divide_p:
+        if (native := (forms or {}).get(primitive)) is not None:
+            return repeated(native, sum(_elements(aval) for aval in outputs))
+        kind = next((name for name, table in _KERNEL_FORMS.items() if forms == table), None)
+        return _software_division(tuple((tuple(aval.shape), np.dtype(aval.dtype)) for aval in inputs),
+                                  target or generation.gpu_target(), kind)
+    if primitive is lax.div_p and _divides_on_cuda(outputs, target) and (
+            (form := IEEE_DIVISION if forms is None else forms.get(primitive)) is not None):
+        return repeated(form, sum(_elements(aval) for aval in outputs))
     if primitive in _OPERATIONS:
         return _operated(primitive, inputs, outputs)
     if primitive in _REDUCTIONS:
@@ -989,14 +1386,25 @@ def operation_work(primitive, inputs: Sequence, outputs: Sequence, params: Mappi
         form = forms.get(primitive)
         return Work(unpriced_operations=elements) if form is None else repeated(form, elements)
     if primitive is lax.convert_element_type_p:
-        return Work(conversions=sum(_elements(aval) for aval in outputs))
+        elements = sum(_elements(aval) for aval in outputs)
+        # Its target the dtype it names (`new_dtype`), which the algebra's terms, every value priced at fp32
+        # (`cost.VALUE`), state where their avals do not.
+        source, made = np.dtype(inputs[0].dtype), np.dtype(params.get("new_dtype") or outputs[0].dtype)
+        if source == made:
+            # Its own dtype (a weak type made strong): no instruction (FS-CONV-SASS2's fp32 to fp32).
+            return Work()
+        if forms in _KERNEL_FORMS.values():
+            form = CONVERSION_FORMS.get((source, made))
+            if form is not None:
+                return repeated(form, elements)
+        return Work(conversions=elements)
     if primitive is lax.dot_general_p:
         (contracted, _), _ = params["dimension_numbers"]
         lhs, rhs = inputs[:2]
         field, passes = product_mode(params.get("precision"), lhs.dtype, rhs.dtype,
                                      target or generation.gpu_target())
         flops = 2 * _elements(outputs[0]) * math.prod(lhs.shape[dimension] for dimension in contracted)
-        return dataclasses.replace(Work(), **{field: flops * passes})
+        return multiplied(field, flops * passes)
     if primitive in _FREE:
         return Work()
     return Work(unpriced_operations=sum(_elements(aval) for aval in outputs))
@@ -1013,15 +1421,6 @@ def _mean(walks: Sequence[Work]) -> Work:
     next through the ring they share (`cost.followed`), each loop's weight kept, before the mean."""
     paths = functools.reduce(followed, (walk.chains for walk in walks))
     return repeated(dataclasses.replace(sum(walks, Work()), chains=paths), 1 / len(walks))
-
-
-def _envelope(works) -> Work:
-    """The most of each unit any of `works` holds, and every path none of the others outlasts (as works side
-    by side keep them)."""
-    works = list(works)
-    return Work(**{field.name: max(getattr(work, field.name) for work in works)
-                   for field in dataclasses.fields(Work) if field.name != "chains"},
-                chains=sum(works, Work()).chains)
 
 
 def built_with(cost: pl.CostEstimate | Stated | None) -> pl.CostEstimate | None:
@@ -1053,7 +1452,8 @@ def _filled(jaxpr: jax_core.Jaxpr, stated: Stated) -> jax_core.Jaxpr:
     rule's, `plgpu.kernel`'s) rewritten around it."""
     def rewritten(equation):
         if equation.primitive in (mpmd.mpmd_map_p, pallas_call.pallas_call_p):
-            work = _WORKS[_body(equation)] = launch_work(equation, stated)
+            launched = _LAUNCHED[_body(equation)] = _launched(equation, stated)
+            work = launched.work
             return equation.replace(params={**equation.params, "cost_estimate": _estimate(work)})
         return equation.replace(params={name: _filled(value, stated) if isinstance(value, jax_core.Jaxpr)
                                         else value for name, value in equation.params.items()})
@@ -1074,6 +1474,11 @@ def launch_work(kernel, stated: Stated) -> Work:
     times and the rest each program's (`Emitted.issued`), the bytes it states its device's, its span the
     steps its longest program walks (`Stated.longest`, else their mean), and one kernel. Its cost
     estimate's (`_estimate`) and a step's price (`work_of`, `attention_decode.priced_step`) alike."""
+    return _launched(kernel, stated)[0]
+
+
+def _launched(kernel, stated: Stated) -> "Launched":
+    """`launch_work`'s work, and the warps a program's issue spreads over (`warps_of`)."""
     forms = forms_of(kernel.params["compiler_params"])
     programs = launch_programs(kernel)
     if kernel.primitive is mpmd.mpmd_map_p:
@@ -1088,8 +1493,30 @@ def launch_work(kernel, stated: Stated) -> Work:
     # The steps on its critical path: its longest program's walk where it states one, else their mean.
     walked = stated.steps / programs if stated.longest is None else stated.longest
 
-    return Work(**{unit: issued(unit) for unit in ISSUED_UNITS}, device_bytes=stated.bytes_accessed,
-                span=walked, kernels=1, chains=counted.paths(walked))
+    work = Work(**{unit: issued(unit) for unit in ISSUED_UNITS if unit != "issue_excess"},
+                device_bytes=stated.bytes_accessed, span=walked, kernels=1, chains=counted.paths(walked))
+    # Its walking roles' issue slots, the most one of them issues a step (`Work.issue_excess`).
+    issuing = counted.issued(issue_slots, stated.steps, programs)
+    # A Mosaic GPU program's warps: a core map's (`plgpu.kernel`) or a call compiled with Mosaic GPU's
+    # parameters (`forms_of`); another backend's unknown.
+    mosaic = kernel.primitive is mpmd.mpmd_map_p or forms in _KERNEL_FORMS.values()
+    return Launched(dataclasses.replace(work, issue_excess=max(0.0, issue_slots(work) - issuing)),
+                    _warps(counted) if mosaic else 0.0)
+
+
+def _warps(counted: Emitted) -> float:
+    """The warps a Mosaic GPU program's issue spreads over, from the population its issue slots count
+    (`Emitted.issued`: the busiest walking warpgroup's step, the steps they walk together): each warpgroup
+    whose step is of the busiest's scale (at least half its issue slots) its four, weighted by its share of
+    the busiest's, a step of its walk's where any walks, else outside it. A warpgroup issuing a sliver of
+    them (a producer's copies) hides no interval the slots count (the review of lane/toolkit 61dd3c7d2)."""
+    walking = [role for role in counted.roles if role.walks]
+    slots = ([issue_slots(_mean(role.walks)) for role in walking] if walking
+             else [issue_slots(role.fixed) for role in counted.roles])
+    busiest = max(slots, default=0.0)
+    if busiest <= 0:
+        return 0.0
+    return 4 * sum(each for each in slots if 2 * each >= busiest) / busiest
 
 
 def _estimate(work: Work) -> pl.CostEstimate:
@@ -1099,17 +1526,30 @@ def _estimate(work: Work) -> pl.CostEstimate:
                            transcendentals=int(work.exponentials), bytes_accessed=int(work.device_bytes))
 
 
-_WORKS: "weakref.WeakKeyDictionary[jax_core.Jaxpr, Work]" = weakref.WeakKeyDictionary()
-"""Each costed launch's work (`launch_work`) by its kernel's body, as `_filled` counted it: a program a
+class Launched(NamedTuple):
+    """A costed launch as its emission counted it once: its work (`launch_work`) and the warps its programs
+    issue over (`_warps`)."""
+
+    work: Work
+    warps: float
+
+
+_LAUNCHED: "weakref.WeakKeyDictionary[jax_core.Jaxpr, Launched]" = weakref.WeakKeyDictionary()
+"""Each costed launch's count (`Launched`) by its kernel's body, as `_filled` counted it: a program a
 launch's lowering cache holds (`tuning.lowered_once`) answers with the body it traced once."""
 
 
 def forms_of(compiler_params) -> Mapping | None:
     """The special functions' forms a kernel compiled with `compiler_params` lowers them to (a kernel
     equation's own, `launch_work`; a launch's family's, `Family.compiled_with`): a Mosaic GPU kernel's
-    approximate forms where they ask `approx_math`, its accurate ones elsewhere; None for another backend's (a
-    Mosaic TPU or Triton kernel), counted by `operation_work`'s one rule."""
-    held = compiler_params.get("mosaic_gpu") if isinstance(compiler_params, Mapping) else compiler_params
+    approximate forms where they ask `approx_math`, its accurate ones elsewhere; a Pallas Triton kernel's its
+    own (`TRITON_FORMS`), read from the parameters it binds (a `CompilerParams` instance or a mapping of
+    one); None for another backend's (a Mosaic TPU kernel), counted by `operation_work`'s one rule."""
+    held = compiler_params
+    if isinstance(compiler_params, Mapping):
+        held = compiler_params.get("mosaic_gpu") or compiler_params.get("triton")
+    if isinstance(held, triton_core.CompilerParams):
+        return TRITON_FORMS
     if not isinstance(held, gpu_core.CompilerParams):
         return None
     return APPROXIMATE_FORMS if held.approx_math else ACCURATE_FORMS
@@ -1120,7 +1560,53 @@ def _body(kernel) -> jax_core.Jaxpr:
     return kernel.params["jaxprs"][0] if kernel.primitive is mpmd.mpmd_map_p else kernel.params["jaxpr"]
 
 
+def warps_of(kernel) -> float | None:
+    """The warps a kernel equation's programs issue over as its costed launch counted them (`_warps`: a
+    Mosaic GPU program's; 0 for another backend's), None where no costed launch counted it."""
+    launched = _LAUNCHED.get(_body(kernel))
+    return None if launched is None else launched.warps
+
+
+def resident_of(kernel) -> int:
+    """The programs a multiprocessor holds of a kernel equation's launch as its plan compiled it: its Mosaic
+    GPU parameters' `min_blocks_per_sm` (`mosaic.compiler_params`' `resident`), one where it states none."""
+    params = kernel.params.get("compiler_params")
+    held = params.get("mosaic_gpu") if isinstance(params, Mapping) else params
+    if not isinstance(held, gpu_core.CompilerParams):
+        return 1
+    return max(1, held.min_blocks_per_sm)
+
+
+def launches_seconds(jaxpr: jax_core.Jaxpr, target: generation.GpuTarget, *,
+                     resident: Callable[[jax_core.JaxprEqn], int] = resident_of) -> float | None:
+    """A traced program's native launches priced on `target`, in sequence: each kernel's work as its costed
+    launch counted it (`work_of`), over its programs (`launch_programs`) at the residency its plan gives it
+    (`resident`; its compiled plan's by default, `resident_of`) and the warps it issues over (`warps_of`),
+    through `cost.launch_seconds`,
+    through the calls it makes (`_expanded`); None where any launch's work its emission does not count, or a
+    launch lies under a loop or a branch, whose trips or taken arm no sequence states (the review of
+    lane/toolkit 61dd3c7d2): its price unknown, never 0. What XLA runs beside them is the algebra's to price
+    (`dew.algebra.program.priced`)."""
+    total = 0.0
+    for equation in jaxpr.eqns:
+        if equation.primitive in programs.NATIVE_KERNELS:
+            launched = _LAUNCHED.get(_body(equation))
+            if launched is None:
+                return None
+            total += launch_seconds(launched.work, launch_programs(equation), target,
+                                    resident=resident(equation), warps=launched.warps)
+        elif (expanded := _expanded(equation)) is not None:
+            called = launches_seconds(expanded[0], target, resident=resident)
+            if called is None:
+                return None
+            total += called
+        elif any(inner.primitive in programs.NATIVE_KERNELS for inner in programs.equations(jaxpr.replace(
+                eqns=[equation]))):
+            return None
+    return total
+
 def work_of(kernel) -> Work | None:
     """A kernel equation's work as its costed launch counted it (`launch_work`), None where no costed launch
     counted it (a launch whose cost its emission does not count, `costed`)."""
-    return _WORKS.get(_body(kernel))
+    launched = _LAUNCHED.get(_body(kernel))
+    return None if launched is None else launched.work

@@ -13,6 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
+from arm_arithmetic import Written
 from arm_forms import ROUNDED, over_windows, run_to_run
 from check1_wire import CENSUS
 from gate_cases import a_product_draw, cancelling, cancelling_draw, product_draws
@@ -1973,3 +1974,52 @@ def test_one_of_dews_own_paths_as_the_reference_is_one_program_with_dews_arm():
                     truth_fn=as_given(lambda x: np.tanh(np.asarray(x, np.float64)) * 2))
     assert len(traced) == 1
 
+
+class _Compiling:
+    """A twin's TPU program whose compile raises `error`, or compiles where it is None, its run the TPU's."""
+
+    def __init__(self, error):
+        self.error = error
+
+    def lower(self, *inputs, **options):
+        return self
+
+    def compile(self):
+        if self.error is not None:
+            raise self.error
+        return self
+
+    def __call__(self, *inputs, **options):
+        return "the TPU's"
+
+
+class _OnATpu(Written):
+    """A twin as written (`Written`) whose TPU program compiles as `_Compiling` does."""
+
+    def __init__(self, error):
+        super().__init__(jnp.negative)
+        self.error = error
+
+    def program(self, platform: str):
+        return _Compiling(self.error) if platform == "tpu" else super().program(platform)
+
+
+def test_a_tpu_twin_as_written_runs_on_its_host_only_where_the_tpu_lowers_no_transpose():
+    """A TPU call's twin as written runs on the TPU, its own arithmetic (rows 12813-12841: on its host, IEEE
+    fp32 against a TPU's default-precision products, it failed 29 float32 cells), and on the host only where
+    the TPU's compile raises XLA's UNIMPLEMENTED status for an HLO transpose (`TPU_TRANSPOSE`, rows
+    12356-12361, 12118-12123, 12127); any other refusal is raised (`Written.ran_on`)."""
+    from generation_support import on_a_v5e
+
+    rows = jnp.ones((3,), jnp.float32)
+    with on_a_v5e():
+        assert _OnATpu(None)(rows) == "the TPU's"
+    from arm_arithmetic import TPU_TRANSPOSE
+
+    with on_a_v5e():
+        assert _OnATpu(None).ran_on(rows) == "tpu"
+        assert _OnATpu(jax.errors.JaxRuntimeError(f"{TPU_TRANSPOSE}.")).ran_on(rows) == "cpu"
+        other = jax.errors.JaxRuntimeError("UNIMPLEMENTED: another operation is not implemented on TPU.")
+        with pytest.raises(jax.errors.JaxRuntimeError) as raised:
+            _OnATpu(other).ran_on(rows)
+        assert raised.value is other

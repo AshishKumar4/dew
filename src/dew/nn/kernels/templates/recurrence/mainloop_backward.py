@@ -138,12 +138,12 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
                   inverse=None, kept=None, delta: bool = True,
                   rounded: bool = False, apart: int = 0, values_gated: bool = False,
                   unit_pairs: bool = False, decay_bound: float | None = None, ranged: bool = False,
-                  skip=None,
-                  forked: ForkedTable | None = None) -> tuple[tuple, "Kept | key_backward.KeyKept"]:
+                  skip=None, forked: ForkedTable | None = None,
+                  reads=None) -> tuple[tuple, "Kept | key_backward.KeyKept"]:
     """The fast backward of the gated delta rule, a decay a head (`forward`'s, `g` `[B, T, HV]`), in a 16-bit
     call, or of a call without it whose form it takes (`fast_backward_form`):
-    `(dq, dk, dv, dg, dbeta, dh0, dskip, dentries)` for the output's and final memory's gradients `do`,
-    `dfinal`, fla's
+    `(dq, dk, dv, dg, dbeta, dh0, dskip, dentries, dreads)` for the output's and final memory's gradients
+    `do`, `dfinal`, fla's
     DAG (recomputing the forward's values, as fla does) through the algebra's backward tile functions:
     `_local_back`, `_reverse`, `_scores_back`, `_query_key`, `_system_back`, `_values_back`, `_keys_back`, the
     decay's gradient summed token by token (`algebra.summed_pairs`, `algebra.summed_ranges`) and the memory's
@@ -158,7 +158,8 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
     skip). Returns them with each launch's outputs as stored (`Kept`; a decay a key dimension's,
     `key_backward.KeyKept`), the forward's `kept_forward` beside it. A `forked` call's
     (`chunk_forward.ForkedTable`) `dh0` is its given memories' and `dentries` its entry write's
-    (`_tabled_gradients`, `_entered_gradient`), None for another."""
+    (`_tabled_gradients`, `_entered_gradient`), None for another. Under reads of their own (`reads`,
+    `chunk_forward.forward`'s) the system's rows and weights are theirs, `dreads` their gradient."""
     dtype = jnp.result_type(q, k, v)
     if not fast_backward_form(delta, rounded, dtype, per_key=g.ndim == 4, wide=jnp.dtype(do.dtype) != dtype):
         raise NotImplementedError("the fast backward takes the delta rule (under a decay a key dimension "
@@ -168,22 +169,13 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
                    tiles=tiles, family=family, interpret=interpret, inverse=inverse, kept=kept,
                    firsts=firsts, rounded=rounded, apart=apart, values_gated=values_gated,
                    unit_pairs=unit_pairs, decay_bound=decay_bound, ranged=ranged, forked=forked,
-                   skipped=skip is not None)
+                   skipped=skip is not None, reads=reads)
     call = run.call
     rows, heads, width, columns = call.rows, call.heads, call.width, call.value_width
     laid_do = call.given.split(run.laid(zero_padded(do.astype(run.dtype), 3, columns)).reshape(rows, -1))
     dht = zero_padded(zero_padded(dfinal.astype(jnp.float32), 2, width), 3, columns).reshape(-1, columns)
     if call.per_key:
-        # A clamped call's log decays laid, the clamp's derivative's (`chunk_forward.prepared`'s): summed
-        # back over its chunk, a log decay below the floor took the terms' fp32 residue where float64's is
-        # zero. Applied as the decay's gradient is finished (`key_backward.gradients`).
-        clamp = (run.laid(zero_padded(g.astype(jnp.float32), 3, width)).reshape(rows, -1) if call.clamped
-                 else None)
-        (dq, dk, dv, dg, dbeta, dh0, taken), key_kept = key_backward.gradients(run, laid_do, dht, tiles,
-                                                                               clamp=clamp)
-        dg = run.unlaid(dg.reshape(rows, heads, width))[..., :run.key_width]
-        grads = _unlaid(run, (q, k, v, g, beta), dq, dk, dv, dg, run.unlaid(dbeta), dh0, starts)
-        return (*_tabled_gradients(run, grads, taken), None, _entered_gradient(run, taken)), key_kept
+        return _key_kept_backward(run, (q, k, v, g, beta), laid_do, dht, tiles, starts, reads)
     local = _local_back(run.q, run.k, laid_do, *run.prefix, run.taken, call, scale=run.scale)
     # Without the delta rule the walk gates the values where their columns are the call's own. Padded, it
     # read a padded copy of them (0.061 ms of Nemotron-H 4B's SSD training on an H100) and its gate took
@@ -204,11 +196,15 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
                  *[None] * 7)
     chunks = call.chunks
     dskip = None
+    d_reads = None
     if delta:
-        d_l = _system_back(run.a, run.k, run.v, dw, dv2, *run.prefix, run.beta, run.taken, call)
+        # The system's rows and the weights the reads' where the call erases along reads of its own.
+        rows_of = run.k if run.reads is None else run.reads
+        d_l = _system_back(run.a, rows_of, run.v, dw, dv2, *run.prefix, run.beta, run.taken, call)
         dv, dbeta_u = _values_back(run.a, run.v, dv2, run.beta, run.taken, call)
-        dk_w, dbeta_k, after_w, decay_w = _keys_back(run.a, run.k, dw, d_l, *run.prefix, run.beta,
-                                                     run.taken, call)
+        dk_w, *d_reads, dbeta_k, after_w, decay_w = _keys_back(run.a, run.k, dw, d_l, *run.prefix, run.beta,
+                                                              run.taken, call, reads=run.reads)
+        d_reads = d_reads[0] if d_reads else None
         kept_ = kept_._replace(d_l=d_l, values=dv, values_beta=dbeta_u, keys=dk_w, keys_beta=dbeta_k,
                                keys_after=after_w, keys_decay=decay_w)
         # The keys launch's terms a key block's, summed (each linear in them).
@@ -243,7 +239,9 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
     extra = None if dk_w is None else keyed(headed(dk_w, width))
     grads = _unlaid(run, (q, k, v, g, beta), dq, dk, dv, run.unlaid(dg), run.unlaid(dbeta), dh0, starts,
                     extra_dk=extra)
-    return (*_tabled_gradients(run, grads, taken), dskip, _entered_gradient(run, taken)), kept_
+    dreads = (None if d_reads is None or reads is None
+              else keyed(headed(call.held.joined(d_reads), width)).astype(reads.dtype))
+    return (*_tabled_gradients(run, grads, taken), dskip, _entered_gradient(run, taken), dreads), kept_
 
 
 def _taken_up(run, taken):
@@ -291,6 +289,25 @@ def _entered_gradient(run, taken):
     if taken is None or run.table.entries is None:
         return None
     return _taken_up(run, taken)[..., :run.key_width, :run.value_width]
+
+def _key_kept_backward(run, operands: tuple, laid_do, dht, tiles: Tiles, starts, reads) -> tuple:
+    """`kept_backward` under a decay a key dimension (`key_backward.gradients`), its gradients laid back as
+    the call's `operands` `(q, k, v, g, beta)` and its reads' where it erases along them."""
+    call, g = run.call, operands[3]
+    rows, heads, width = call.rows, call.heads, call.width
+    # A clamped call's log decays laid, the clamp's derivative's (`chunk_forward.prepared`'s): summed back
+    # over its chunk, a log decay below the floor took the terms' fp32 residue where float64's is zero.
+    # Applied as the decay's gradient is finished (`key_backward.gradients`).
+    clamp = run.laid(zero_padded(g.astype(jnp.float32), 3, width)).reshape(rows, -1) if call.clamped else None
+    (dq, dk, dv, dg, dbeta, dh0, taken, d_reads), key_kept = key_backward.gradients(run, laid_do, dht, tiles,
+                                                                                    clamp=clamp)
+    dg = run.unlaid(dg.reshape(rows, heads, width))[..., :run.key_width]
+    grads = _unlaid(run, operands, dq, dk, dv, dg, run.unlaid(dbeta), dh0, starts)
+    # The reads' gradient a key head's, laid back as the keys' are (`_unlaid`).
+    dreads = (None if d_reads is None or reads is None else run.unlaid(
+        d_reads.reshape(rows, heads // call.group, width))[..., :run.key_width].astype(reads.dtype))
+    return (*_tabled_gradients(run, grads, taken), None, _entered_gradient(run, taken), dreads), key_kept
+
 
 def _unlaid(run, operands: tuple, dq, dk, dv, dg, dbeta, dh0, starts, *, extra_dk=None) -> tuple:
     """The backward's gradients laid back as the call's operands (`operands`, `(q, k, v, g, beta)`) and in
@@ -1482,7 +1499,7 @@ def _values_back(a, v, du, beta, taken, call: Call):
 
 
 @lowered_once
-def _keys_back(a, k, dw, dl, hi, lo, beta, taken, call: Call):
+def _keys_back(a, k, dw, dl, hi, lo, beta, taken, call: Call, reads=None):
     """`dk [R, HV * Dk]` as `call.held` and `(dbeta, after, decay [blocks, HV, R])` fp32: the WY
     representation's backward's keys' part a key block of a chunk and value head at a time
     (`algebra.keys_gradient`), given the system's gradient `dl` (`_system_back`'s): the keys' gradient through
@@ -1490,13 +1507,18 @@ def _keys_back(a, k, dw, dl, hi, lo, beta, taken, call: Call):
     from the pair terms (`algebra.summed_pairs`, in the launch), each a key block's, which `gradients` sums
     (each linear in its block's terms). A program takes one key block: a program walking a chunk's key blocks
     held each block's operand fragments across the walk, 64 to 200 bytes a thread past an A100's 255
-    registers."""
+    registers. Under reads of their own (`reads` `[R, H * Dk]`, `recurrence.Hooks.erase` 'read'), `(dk,
+    dreads, dbeta, after, decay)`: the keys' gradient through the system's columns alone, the reads' through
+    `w` and its rows (`algebra.keys_gradient`'s `reads`), their key block streamed beside the keys'."""
     chunk = call.chunk
     width, family = call.width, call.family
     held, given = dataclasses.replace(call.held, rows=call.rows), call.given
+    reading = reads is not None
 
-    def program(at, a_ref, k_ref, dw_ref, dl_ref, hi_ref, lo_ref, beta_ref, taken_ref, dk_ref, dbeta_ref,
-                after_ref, decay_ref, *, streams, staging, landing):
+    def program(at, a_ref, k_ref, dw_ref, dl_ref, hi_ref, lo_ref, beta_ref, taken_ref, *refs, streams,
+                staging, landing):
+        reads_ref, refs = (refs[0], refs[1:]) if reading else (None, refs)
+        dk_ref, dreads_ref, dbeta_ref, after_ref, decay_ref = refs if reading else (refs[0], None, *refs[1:])
         c, n, h = at["blocks"], at["chunks"], at["heads"]
         row, span = n * chunk, pl.ds(n * chunk, chunk)
         # The weighted system's tile and, where a chunk is wider than a key block, a block's apart: the
@@ -1504,11 +1526,13 @@ def _keys_back(a, k, dw, dl, hi, lo, beta, taken, call: Call):
         square, *rest = staging
         blocked, summing = (rest[0], rest[1:]) if chunk != call.block else (square, rest)
         column = c * call.block
+        keyed = h // call.group * width + column
         views = stream_views(lower=held.views(a_ref, row, chunk, h * chunk, chunk),
-                             keys=given.views(k_ref, row, chunk, h // call.group * width + column,
-                                              call.block),
+                             keys=given.views(k_ref, row, chunk, keyed, call.block),
                              w_grads=held.views(dw_ref, row, chunk, h * width + column, call.block),
-                             system=held.views(dl_ref, row, chunk, h * chunk, chunk))
+                             system=held.views(dl_ref, row, chunk, h * chunk, chunk),
+                             **({"reads": given.views(reads_ref, row, chunk, keyed, call.block)}
+                                if reading else {}))
 
         def step(index, slots, carry, accumulators):
             del index
@@ -1519,14 +1543,17 @@ def _keys_back(a, k, dw, dl, hi, lo, beta, taken, call: Call):
 
             gate, low = family.rows_of(hi_ref.at[h, span]), family.rows_of(lo_ref.at[h, span])
             beta = family.rows_of(beta_ref.at[h, span])
-            stored = block_stored(call, dk_ref, row, h * width + column, landing["block"])
+            stores = {name: block_stored(call, ref, row, h * width + column, landing["block"])
+                      for name, ref in (("keys", dk_ref), ("reads", dreads_ref)) if ref is not None}
+
+            def stored(kind: str, index: int, grad) -> None:
+                stores[kind](kind, index, grad)
 
             d_beta, after, pairs = algebra.keys_gradient(
                 stream_tile(slots, "lower", held), functools.partial(whole, "keys", given), 1,
                 functools.partial(whole, "w_grads", held), stream_tile(slots, "system", held), beta, gate,
-                                                         low,
-                held.dtype, Issuer(call, {"inverse_t": blocked, "keys_dlt": square}),
-                emit=stored)
+                low, held.dtype, Issuer(call, {"inverse_t": blocked, "keys_dlt": square}), emit=stored,
+                reads=functools.partial(whole, "reads", given) if reading else None)
             summed, columns = summed_issuer(tuple(summing), call)
             decay_ref.at[c, h, span][...] = algebra.summed_pairs(pairs, summed, columns)
             dbeta_ref.at[c, h, span][...] = d_beta
@@ -1536,10 +1563,11 @@ def _keys_back(a, k, dw, dl, hi, lo, beta, taken, call: Call):
         return mosaic.Walk(views, step)
 
     tiles = stream_blocks(lower=((chunk, chunk), held), keys=((chunk, call.block), given),
-                          w_grads=((chunk, call.block), held), system=((chunk, chunk), held))
+                          w_grads=((chunk, call.block), held), system=((chunk, chunk), held),
+                          **({"reads": ((chunk, call.block), given)} if reading else {}))
     blocks = width // call.block
     terms = jax.ShapeDtypeStruct((blocks, call.heads, call.rows), jnp.float32)
-    out_type = (held.shape(call.heads * width), terms, terms, terms)
+    out_type = (*(held.shape(call.heads * width),) * (1 + reading), terms, terms, terms)
     # The key block's products through `w` and the system, and its keys' own pairs: the model's.
     model = 2 * chunk * chunk * (4 * call.block)
     # The system's gradient narrow and scaled by beta beside the key block's terms: through `w`, the keys in
@@ -1550,8 +1578,11 @@ def _keys_back(a, k, dw, dl, hi, lo, beta, taken, call: Call):
     keyed = largest_live_set(
         product_fragments(call, (held, chunk, chunk), (held, chunk, call.block)),
         product_fragments(call, (held, chunk, chunk), (given, chunk, call.block)))
+    # Under reads of their own a block's reads in fp32 beside its keys; the reads' gradient and the keys' are
+    # stored in turn through one landing (`algebra.keys_gradient`), neither beside the other.
+    apart = [f32(chunk, call.block)] * reading
     held_tiles = Held(phases=(
-        held_tile(held, chunk, chunk) * 2 + [f32(chunk, call.block)] * 4
+        held_tile(held, chunk, chunk) * 2 + [f32(chunk, call.block)] * 4 + apart
         + keyed,
         held_tile(held, chunk, chunk) + [f32(chunk, chunk)] * 4 + masks(chunk, chunk)))
     if held.parts > 1 and product_results(call) == "registers":
@@ -1560,7 +1591,7 @@ def _keys_back(a, k, dw, dl, hi, lo, beta, taken, call: Call):
         # triangle and their partial sums.
         rows = f32(chunk, 4)
         held_tiles = Held(phases=(
-            held_tile(held, chunk, chunk) * 2 + [f32(chunk, call.block)] * 4 + [rows] * 4
+            held_tile(held, chunk, chunk) * 2 + [f32(chunk, call.block)] * 4 + apart + [rows] * 4
             + keyed,
             held_tile(Operand(call.rows, 3, jnp.dtype(jnp.float32)), chunk, chunk)
             + held_tile(Operand(call.rows, 1, jnp.dtype(jnp.bfloat16)), chunk, chunk)
@@ -1571,5 +1602,5 @@ def _keys_back(a, k, dw, dl, hi, lo, beta, taken, call: Call):
                          steps=1, model=model, held=held_tiles,
                          staging=(staging_tiles(held, *dict.fromkeys(((chunk, chunk), (chunk, call.block))))
                                   + summing_staging(call)),
-                         landing={"block": held.landing(chunk, call.block)})(a, k, dw, dl, hi, lo, beta,
-                                                                             taken)
+                         landing={"block": held.landing(chunk, call.block)})(
+        a, k, dw, dl, hi, lo, beta, taken, *(() if reads is None else (reads,)))

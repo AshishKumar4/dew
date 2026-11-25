@@ -112,6 +112,19 @@ def combined_attention_mask(query_length: int, key_length: int, causal: bool,
     return visibility_mask(query_length, key_length, causal, sliding_window, mask=mask)
 
 
+def _check_runs(key_runs, query_length: int) -> None:
+    """Refuse `key_runs` of no form `key_spans` reads: integer `[B, Q, R, 2]`, `[Q, R, 2]` or `[R, 2]`, their
+    queries the call's own `query_length`, so no shape is guessed at as rows and no fraction truncated
+    (row 12701)."""
+    if key_runs is None:
+        return
+    shape = jnp.shape(key_runs)
+    queries = {4: shape[1:2], 3: shape[:1], 2: (query_length,)}.get(len(shape))
+    if shape[-1:] != (2,) or queries != (query_length,) or not jnp.issubdtype(key_runs.dtype, jnp.integer):
+        raise ValueError(f"key_runs of shape {shape} and dtype {key_runs.dtype} is none of the integer "
+                         f"[B, Q, R, 2], [Q, R, 2] or [R, 2] over the call's {query_length} queries")
+
+
 def key_spans(query_length: int, key_length: int, causal: bool, sliding_window: int | None,
               segment_ids=None, key_value_seq_lengths=None, key_value_seq_starts=None, *, block_groups=None,
               image_groups=None, key_valid=None, key_runs=None, places=None, chunk: int | None = None,
@@ -120,19 +133,23 @@ def key_spans(query_length: int, key_length: int, causal: bool, sliding_window: 
     coordinates `scaled_dot_product_attention` takes: causality, a window, a chunk of `chunk` places
     (`chunk_mask`), documents (`CrossDocuments` aligned to their last keys), key lengths and starts, block
     and image groups, and the keys' validity `key_valid` `[B, K]`, and each query's key runs `key_runs`
-    `[B, Q, R, 2]`, whose union it may see (`template.spans`'s `runs`). `places` `[B, S]` are a call's own
+    `[B, Q, R, 2]`, every row's `[Q, R, 2]` or every query's `[R, 2]`, whose union it may see
+    (`template.spans`'s `runs`), its rows the leading axis of the first form alone (row 12701: a shared
+    form's queries or runs were read as rows). `places` `[B, S]` are a call's own
     tokens' places a window or a chunk counts by (`counted_places`), by default their indices, or a pair,
     its queries' `[B, Q]` and its keys' `[B, K]`. `query_slots` `[B, Q]` are the queries' own keys in a
     cache call, -1 for padding (`template.spans`' `slots`). `rows` is the call's batch, by default the
     coordinates' own, or one where none carries it, which every row shares."""
     pair = places if isinstance(places, tuple) else (places, places)
+    _check_runs(key_runs, query_length)
     if rows is None:
         # The batch the coordinates broadcast to: a row's lengths and starts `[B]`, every other one's
         # leading axis where it has a row axis.
         rowed = [None if segment_ids is None else document_ids(segment_ids)[0], block_groups, image_groups,
-                 key_valid, key_runs, pair[0], query_slots]
+                 key_valid, pair[0], query_slots]
         batches = [(jnp.shape(x)[0],) for x in (key_value_seq_lengths, key_value_seq_starts) if x is not None]
         batches += [(jnp.shape(x)[0],) for x in rowed if x is not None and jnp.ndim(x) >= 2]
+        batches += [(jnp.shape(key_runs)[0],)] if key_runs is not None and jnp.ndim(key_runs) == 4 else []
         rows = int(np.broadcast_shapes(*batches, (1,))[0])
     lengths, starts = (None if x is None else jnp.asarray(x, jnp.int32)
                        for x in (key_value_seq_lengths, key_value_seq_starts))
@@ -142,10 +159,12 @@ def key_spans(query_length: int, key_length: int, causal: bool, sliding_window: 
                      jnp.broadcast_to(jnp.atleast_2d(pair[1]), (rows, key_length)))
     valid = None if key_valid is None else jnp.broadcast_to(key_valid, (rows, key_length))
     slots = None if query_slots is None else jnp.broadcast_to(query_slots, (rows, query_length))
+    runs = None if key_runs is None else jnp.broadcast_to(
+        key_runs, (rows, query_length, *jnp.shape(key_runs)[-2:]))
     return template.spans(query_length, key_length, rows, causal=causal, sliding_window=sliding_window,
                           chunk=chunk, positions=positions, segment_ids=segment_ids, lengths=lengths,
                           starts=starts, block_groups=block_groups, image_groups=image_groups, valid=valid,
-                          runs=key_runs, slots=slots)
+                          runs=runs, slots=slots)
 
 
 def visibility_mask(query_length: int, key_length: int, causal: bool, sliding_window: int | None, mask=None,

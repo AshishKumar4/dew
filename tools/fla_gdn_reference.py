@@ -230,7 +230,7 @@ def write_seeded(worker, names: list[str], out: Path) -> None:
 
     import jax
     from fla_sites import ruled, sites
-    from recorded_references import held_to_the_oracle, provenance, record_case
+    from recorded_references import oracle_held, provenance, record_case
     from reference_error import chain_roundings, widened
     from reference_worker import arms
     from test_recurrence_chunk import chunk_on, token_by_token
@@ -265,10 +265,7 @@ def write_seeded(worker, names: list[str], out: Path) -> None:
         with jax.enable_x64(new_val=True):
             roundings = chain_roundings(jax.make_jaxpr(exact_run)(widened(sample)))
 
-        def evaluate(arrays, fla=fla, exact_run=exact_run, roundings=roundings, name=name):
-            reference, truth = fla(arrays)
-            held_to_the_oracle(exact_run, arrays, truth, roundings, f"fla {name}")
-            return reference, truth
+        evaluate = oracle_held(fla, exact_run, roundings, f"fla {name}")
 
         if site.paired:
             # Sized paired with the template's own arm: the site's errors are

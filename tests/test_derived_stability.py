@@ -32,7 +32,13 @@ from reference_error import widened
 from test_recurrence_chunk import chunk_on, token_by_token
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import attention as template, attention_portable, attention_route
+from dew.nn.kernels.templates import (
+    attention as template,
+    attention_mosaic,
+    attention_portable,
+    attention_route,
+    attention_triton,
+)
 
 
 @contextlib.contextmanager
@@ -215,3 +221,157 @@ def test_the_derived_chunk_holds_every_order_at_the_decays_edges(edge, name):
         with np.errstate(over="ignore"):
             finite = np.isfinite(np.asarray(theirs).astype(np.float32))
         assert np.isfinite(np.asarray(ours))[finite].all(), f"{name} {edge} {leaf}"
+
+
+WIDTH = 64
+"""The witnesses' head width, every mainloop's 16-bit one: each value and cotangent in its first channel."""
+
+
+def _channel(rows: list[list[float]]) -> jax.Array:
+    """`[B, N, 1, WIDTH]` bf16 of each batch row's `N` entries in the first channel, zeros past it."""
+    first = jnp.asarray(rows, jnp.float32)[:, :, None, None]
+    return jnp.pad(first, ((0, 0), (0, 0), (0, 0), (0, WIDTH - 1))).astype(jnp.bfloat16)
+
+
+def _held(rows: list) -> np.ndarray:
+    """`rows` as float32, an entry None (one no truth holds: an `inf` cotangent's own) NaN, unchecked."""
+    return np.asarray([[np.nan if entry is None else entry for entry in row] for row in rows], np.float32)
+
+
+def _witness(keys: list[float], values: list[list[float]], douts: list[list[float]], bias: list[list[float]],
+             gradients: dict[str, list], *, shared: bool, bounds: dict | None = None) -> tuple:
+    """A call of queries of zeros over keys whose first channel is `keys` (every row's), its `values` and
+    output cotangents `douts` each row's, each row's keys `bounds`' (`template.spans`' `lengths` and
+    `starts`) or all, under a tile bias `[B or 1, 1, Q, K]` (`bias` its queries' rows, one table for every
+    row where `shared`), and its exact gradients at a logit scale of 1, each leaf's first channel
+    (`gradients`, the bias's whole; `_held`'s None unchecked, in every channel), every other channel's 0."""
+    batch, queries, count = len(values), len(douts[0]), len(keys)
+    query = jnp.zeros((batch, queries, 1, WIDTH), jnp.bfloat16)
+    key = jnp.broadcast_to(_channel([keys]), (batch, count, 1, WIDTH))
+    table = jnp.asarray(bias, jnp.float32)[None, None]
+    hooks = template.Hooks(lambda s, q_pos, k_pos, bias: s + bias.astype(s.dtype), (template.Param(
+        table if shared else jnp.broadcast_to(table, (batch, 1, queries, count)), template.Kind.TILE),))
+    # An unchecked entry's every channel unchecked: an inf cotangent's NaN reaches them all.
+    expected = {name: np.where(np.isnan(first), np.nan, np.pad(first, ((0, 0),) * 3 + ((0, WIDTH - 1),)))
+                for name, rows in gradients.items() if name != "bias"
+                for first in (_held(rows)[:, :, None, None],)}
+    expected["bias"] = _held(gradients["bias"]).reshape(hooks.score_params[0].value.shape)
+    spans = template.spans(queries, count, batch, **{name: jnp.asarray(bound, jnp.int32)
+                                                      for name, bound in (bounds or {}).items()})
+    return (query, key, _channel(values), _channel(douts), hooks, spans), expected
+
+
+def _witnesses(name: str) -> list[tuple]:
+    """`name`'s calls (`WITNESSES`), each with and without a bias the rows share where both are finite."""
+    sharing = (False, True)
+    match name:
+        case "a row beside one at fp32's largest":
+            # Row A's values at fp32's largest take its values beneath a shift (`attention.value_shift`),
+            # row B's `[0, 2^-120]` none: its weights 1/2, `dS = [-2^5, 2^5]`, its dQ `2^5` (keys `[0, 1]`),
+            # where one shift for the call took its 2^-120 beneath 2^-248 and gave 0.
+            return [_witness([0.0, 1.0], [[2.0 ** 127, 2.0 ** 127], [0.0, 2.0 ** -120]],
+                             [[2.0 ** 127], [2.0 ** 127]], [[0.0, 0.0]],
+                             {"query": [[0.0], [32.0]], "key": [[0.0, 0.0]] * 2,
+                              "value": [[2.0 ** 126, 2.0 ** 126]] * 2,
+                              "bias": [[-32.0, 32.0]] if shared else [[0.0, 0.0], [-32.0, 32.0]]},
+                             shared=shared) for shared in sharing]
+        case "rows at their own scales":
+            # Row A's `dO V` past fp32's largest by one binade (a shift of 1), row B's within it (none):
+            # each row's bias gradient `[-2^119, 2^119]` at its own scale, the shared one their sum.
+            return [_witness([0.0, 0.0], [[2.0 ** 126, 2.0 ** 126 + 2.0 ** 120], [0.0, 1.0]],
+                             [[2.0], [2.0 ** 121]], [[0.0, 0.0]],
+                             {"query": [[0.0]] * 2, "key": [[0.0, 0.0]] * 2,
+                              "value": [[1.0, 1.0], [2.0 ** 120, 2.0 ** 120]],
+                              "bias": [[-(2.0 ** 120), 2.0 ** 120]] if shared
+                                      else [[-(2.0 ** 119), 2.0 ** 119]] * 2},
+                             shared=shared) for shared in sharing]
+        case "rows past fp32 that cancel":
+            # Each row's bias gradient `±2^252` past fp32's largest, opposite: the shared one's sum 0,
+            # where each row's raised first was `±inf` and their sum NaN.
+            return [_witness([0.0, 0.0], [[0.0, 2.0 ** 127], [0.0, -(2.0 ** 127)]],
+                             [[2.0 ** 127], [2.0 ** 127]], [[0.0, 0.0]],
+                             {"query": [[0.0]] * 2, "key": [[0.0, 0.0]] * 2,
+                              "value": [[2.0 ** 126, 2.0 ** 126]] * 2, "bias": [[0.0, 0.0]]}, shared=True)]
+        case "an empty query of cotangent inf":
+            # A query the bias empties, its cotangent inf, beside a visited one of cotangent 0, values at
+            # fp32's largest: the launch's cotangent there 0 (`attention.launch_cotangent`) before its
+            # shift, so every gradient 0, where its inf took the row beneath a shift of 257 and its
+            # restoring factors inf.
+            return [_witness([0.0, 0.0], [[2.0 ** 127, 2.0 ** 127]] * 2, [[0.0, np.inf]] * 2,
+                             [[0.0, 0.0], [-np.inf, -np.inf]],
+                             {"query": [[0.0, 0.0]] * 2, "key": [[0.0, 0.0]] * 2,
+                              "value": [[0.0, 0.0]] * 2, "bias": [[0.0, 0.0]] * 2}, shared=True)]
+        case "rows that cancel to a subnormal":
+            # Each row's bias gradient normal and unshifted, `±2^-125` and `±(2^-125 + 2^-132)`, opposite:
+            # the shared one's sum `±2^-132`, a subnormal, which fp32's sum flushed on XLA's CPU.
+            return [_witness([0.0, 0.0], [[0.0, 2.0 ** -123], [2.0 ** -123 + 2.0 ** -130, 0.0]],
+                             [[1.0], [1.0]], [[0.0, 0.0]],
+                             {"query": [[0.0]] * 2, "key": [[0.0, 0.0]] * 2, "value": [[0.5, 0.5]] * 2,
+                              "bias": [[2.0 ** -132, -(2.0 ** -132)]] if shared
+                                      else [[-(2.0 ** -125), 2.0 ** -125],
+                                            [2.0 ** -125 + 2.0 ** -132, -(2.0 ** -125 + 2.0 ** -132)]]},
+                             shared=shared) for shared in sharing]
+        case "keys beside an inf cotangent's":
+            # Row A sees key 0 alone under a cotangent of inf (a shift of 257), row B keys 1 and 2 (`[0, 1]`
+            # under 1, its bias gradient there `[-1/4, 1/4]`): row A's 0 at the keys it does not see raised
+            # is 0, so the shared bias's sum there is row B's, where `0 * 2^128 * 2^129` was NaN. Row A's own
+            # gradients, an inf cotangent's, are checked by none.
+            return [_witness([0.0, 0.0, 0.0], [[2.0 ** 127, 0.0, 0.0], [0.0, 0.0, 1.0]], [[np.inf], [1.0]],
+                             [[0.0, 0.0, 0.0]],
+                             {"query": [[None], [0.0]], "key": [[None] * 3, [0.0] * 3],
+                              "value": [[None] * 3, [0.0, 0.5, 0.5]], "bias": [[None, -0.25, 0.25]]},
+                             shared=True, bounds={"lengths": [1, 3], "starts": [0, 1]})]
+    raise KeyError(name)
+
+
+WITNESSES = ["a row beside one at fp32's largest", "rows at their own scales", "rows past fp32 that cancel",
+             "an empty query of cotangent inf", "rows that cancel to a subnormal",
+             "keys beside an inf cotangent's"]
+"""Calls whose rows' values the backward takes beneath shifts of their own (`attention.value_shift`), their
+gradients exact (`_witnesses`): a shared bias's summed across its rows at each one's scale
+(`attention.hook_gradient`)."""
+
+
+def _mainloops(query, key, value, dout, hooks, spans) -> dict[str, template.Gradients]:
+    """The call's gradients at a logit scale of 1 on each mainloop: the plain-JAX one's, and the
+    Pallas-Triton one's and the Mosaic one's as an H100's, interpreted."""
+    natural, accurate = attention_route.run_forms()
+    form = {"scale": 1.0, "natural": natural, "accurate": accurate}
+    made = {"plain-JAX": attention_portable.backward(attention_portable.Tiles(block_q=8, block_k=8, pad=8),
+                                                     query, key, value, spans, hooks, dout, **form)}
+    with generation.assumed("sm90", interpreted=True):
+        made["Pallas-Triton"] = attention_triton.backward(query, key, value, spans, hooks, dout,
+                                                          interpret=True, **form)
+        residuals = attention_mosaic.forward(query, key, value, spans, hooks, scale=1.0, natural=natural,
+                                             residuals=template.Kept.SPLIT, interpret=True)[1:]
+        made["Mosaic"] = attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals,
+                                                   interpret=True, **form)
+    return made
+
+
+@pytest.mark.parametrize("witness", WITNESSES)
+def test_a_rows_gradients_are_at_its_own_shift_and_a_shared_bias_sums_them(witness):
+    """Each witness's every gradient its exact one on every mainloop (`WITNESSES`): a row's own taken at its
+    own shift, whatever the rows share, and a bias the rows share summed across them at each one's, rounded
+    once (`attention.hook_gradient`)."""
+    for call, expected in _witnesses(witness):
+        for mainloop, made in _mainloops(*call).items():
+            for name, want in expected.items():
+                got = np.asarray(made.score_params[0] if name == "bias" else getattr(made, name), np.float32)
+                held = ~np.isnan(want)
+                np.testing.assert_array_equal(got[held], want[held], err_msg=f"{witness} {mainloop} {name}")
+
+
+def test_the_references_tangent_keeps_a_part_beneath_values_that_cancel():
+    """One fp32 query over four keys of zero logits, values `2^127` in one channel (their sums past the
+    format): the reference's tangent along the values `[2^127, -2^127, 2^-30, 0]` moves the mean by `2^-32`,
+    its mean's contraction a band at a time (`scaled_contraction._banded`), where one exponent for the values
+    flushed `2^-30` before the large ones cancelled and gave 0 (row 12452)."""
+    query = jnp.zeros((1, 1, 1, 1), jnp.float32)
+    key = jnp.zeros((1, 4, 1, 1), jnp.float32)
+    spans = template.spans(1, 4, 1)
+    direction = jnp.asarray([2.0 ** 127, -(2.0 ** 127), 2.0 ** -30, 0.0], jnp.float32).reshape(1, 4, 1, 1)
+    _, tangent = jax.jvp(lambda value: template.reference(query, key, value, spans),
+                         (jnp.full((1, 4, 1, 1), 2.0 ** 127, jnp.float32),), (direction,))
+    np.testing.assert_array_equal(np.asarray(tangent).ravel(), [2.0 ** -32])
+

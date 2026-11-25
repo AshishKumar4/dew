@@ -45,12 +45,10 @@ def split(session, tests: list[float], seconds: float, target: float, cut: int =
 """How far past the target a split file's heaviest group may run before the file is cut again."""
 
 
-def measured_cut(groups: Mapping[str, float]) -> tuple[float, int] | None:
-    """What a file took at the cut its rows name, and that cut's count, from its rows' seconds by their
-    `groups` (a whole file's row under ""; ci.py's `measured_cut` reads them from armada's timings): its
-    groups' rows summed where every group of a count has its row (the most groups if several counts do),
-    else its whole row, else None. A row's median is measured at the cut its name holds, unlike the file's
-    median, which mixes the cuts of the runs it remembers. A collection's row, a site's judge's and a GPU
+def measured_rows(groups: Mapping[str, float]) -> list[float] | None:
+    """The seconds of the rows a file's measure is taken from (`measured_cut`), by their `groups` (a whole
+    file's row under ""): each group's of a count every group of which has its row (the most groups if
+    several counts do), else its whole row's, else None. A collection's row, a site's judge's and a GPU
     lane's process variant's are no group of a cut (`CUT`)."""
     counts: dict[int, dict[int, float]] = {}
     for group, seconds in groups.items():
@@ -58,8 +56,17 @@ def measured_cut(groups: Mapping[str, float]) -> tuple[float, int] | None:
             counts.setdefault(int(found[2]), {})[int(found[1])] = seconds
     complete = [count for count, held in counts.items() if len(held) == count]
     if complete:
-        return sum(counts[max(complete)].values()), max(complete)
-    return (groups[""], 1) if "" in groups else None
+        return list(counts[max(complete)].values())
+    return [groups[""]] if "" in groups else None
+
+
+def measured_cut(groups: Mapping[str, float]) -> tuple[float, int] | None:
+    """What a file took at the cut its rows name, and that cut's count, from its rows' seconds by their
+    `groups` (ci.py's `measured_cut` reads them from armada's timings): its `measured_rows` summed. A row's
+    median is measured at the cut its name holds, unlike the file's median, which mixes the cuts of the runs
+    it remembers."""
+    rows = measured_rows(groups)
+    return None if rows is None else (sum(rows), len(rows))
 
 
 def weighed(session, tests: list[float], seconds: float, target: float,

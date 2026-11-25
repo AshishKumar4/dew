@@ -828,6 +828,10 @@ class Looping(Protocol):
                     exit_threshold: float | None = None, exits: bool | None = None,
                     theta_passes: int | None = None, messages: CrossPass | None = None) -> Self | None: ...
 
+    def with_loop(self, loop: Loop) -> Self:
+        """The same model running `loop` in place of its own, whole (`dew.config.DecoderRunConfig.loop`)."""
+        ...
+
 
 @runtime_checkable
 class RematChoosing(Protocol):

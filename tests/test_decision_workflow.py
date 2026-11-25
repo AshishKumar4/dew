@@ -34,7 +34,7 @@ from dew.config import ObjectiveConfig
 from dew.data import Files
 from dew.data.dataset import Loading
 from dew.decision import Choice, Example, decisions
-from dew.decision.config import DecisionRunConfig, JointShape, Letters
+from dew.decision.config import DecisionRunConfig, JointShape, Letters, RowBudgets
 from dew.decision.data import Group
 from dew.decision.head import DecisionHead, JointSchemaHead, LabelReadout
 from dew.decision.sources import PretrainedDecision
@@ -168,11 +168,11 @@ def run_of(cell: Cell, backbone: Path, root: Path) -> DecisionRunConfig:
                 .loading(Loading(workers=0)))
     return DecisionRunConfig(
         pretrained=str(backbone), model=ModelConfig("causal_transformer", {"dtype": "float32"}),
-        head=HEADS[cell.head], max_len=MAX_LEN[cell.head],
+        head=HEADS[cell.head],
         # A question head's rows a question each, as Laya's release lays them; a letter readout's as its
         # layout derives them, a request's questions over one copy of its state.
-        shared_state=1 if cell.head == "question" else None,
-        option_tokens=None if cell.joint else OPTION_TOKENS,
+        rows=RowBudgets(max_len=MAX_LEN[cell.head], shared_state=1 if cell.head == "question" else None,
+                        option_tokens=None if cell.joint else OPTION_TOKENS),
         objective=ObjectiveConfig("decision", {"consistency": cell.consistency}), calibrate=False,
         data=read(TRAIN[0], "train"), validation=read(HELD[0], "held"))
 
@@ -197,7 +197,7 @@ def recorded(cell: Cell, backbone: Path, root: Path, examples: int | None = None
              "trainer.examples": str(kept(cell) if examples is None else examples),
              **({"trainer.stop": {"class": "dew.training.budget:Pause", "fields": {"fraction": SHARE}}}
                 if cell.bound == "share" else {}),
-             **({"context_layers": CONTEXT_LAYERS} if cell.context else {})}
+             **({"context": {"layers": CONTEXT_LAYERS}} if cell.context else {})}
     return Recorded(saved_record(run_of(cell, backbone, root), root, "cell"),
                     cli_settings(root, "cell", given), devices=1)
 

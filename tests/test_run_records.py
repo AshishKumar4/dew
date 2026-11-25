@@ -120,14 +120,18 @@ def test_a_run_saved_scanning_its_stack_resumes_scanned():
     resume's among them, where it resumed a layer at a time and its host placement raised (the API02 review on
     API02a); its own choice, where it names one, stands."""
     from dew.nn.backbones.decoder_stages import scanned
+    from dew.nn.kernels.generation import chosen
 
     held = json.loads(PUBLISHED.read_text())
     source = {**held["fields"]["source"], "scan_layers": True}
     run = RunConfig.read(earlier_run({**held, "fields": {**held["fields"], "source": source}}))
     assert run.diagnostics.kernels == Kernels(layer_scan="scanned")
-    with run.traced():
-        assert scanned()
-    assert not scanned()
+    # Within a block that runs its stacks unrolled, the run's own choice scans them, and the block's stands
+    # again past it: the scanned default would hide either.
+    with chosen(layer_scan="plain"):
+        with run.traced():
+            assert scanned()
+        assert not scanned()
     diagnostics = {**held["fields"]["diagnostics"], "kernels": {"layer_scan": "plain"}}
     named = {**held, "fields": {**held["fields"], "source": source, "diagnostics": diagnostics}}
     assert RunConfig.read(earlier_run(named)).diagnostics.kernels == Kernels(layer_scan="plain")

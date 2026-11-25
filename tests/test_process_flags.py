@@ -259,22 +259,45 @@ def test_a_command_lines_flags_hold_as_it_runs_again_with_them_set_before_jaxlib
     assert done.stdout.strip().splitlines() == ["true"]
 
 
-@pytest.mark.parametrize(("visible", "listed", "stated", "ungraphed"), [
-    ("0,1", None, None, True),
-    (None, 2, None, True),
-    ("0", 2, None, False),
-    (None, 1, None, False),
-    (None, None, None, False),
-    ("0,1", None, "--xla_gpu_enable_command_buffer=FUSION,CUBLAS", False),
-])
-def test_a_process_driving_more_than_one_gpu_graphs_no_peer_wait_unless_its_run_named_the_commands(
-        visible, listed, stated, ungraphed):
-    """`import dew` keeps XLA's conditionals and one-shot collective kernels out of its CUDA graphs in a
-    process that drives more than one GPU, where one GPU's graph waited on its peer while the peer's host
-    held the driver (row 12714): its visible GPUs where it names them, else those nvidia-smi lists; one GPU,
-    an uncounted host or a run naming the commands keeps XLA's list."""
-    from dew._devices import peer_waits_ungraphed
+LAUNCHED = {"JAX_COORDINATOR_ADDRESS": "host-0:8476", "DEW_PROCESS_COUNT": "8", "DEW_PROCESS_ID": "3"}
+"""A process `dew launch --processes-per-host 8` started (`dew.clusters.Launched`), but its accelerators."""
 
-    env = {} if visible is None else {"CUDA_VISIBLE_DEVICES": visible}
-    env |= {} if stated is None else {"XLA_FLAGS": stated}
-    assert peer_waits_ungraphed(env, lambda: listed) is ungraphed
+SLURM_TASK = {"SLURM_JOB_ID": "7", "SLURM_STEP_NODELIST": "node-0", "SLURM_NTASKS": "8", "SLURM_PROCID": "3",
+              "SLURM_LOCALID": "3"}
+"""A Slurm step's task of eight on one node, its GPU the one at its local rank, as JAX places it."""
+
+
+@pytest.mark.parametrize(("env", "counted", "ungraphed"), [
+    ({"CUDA_VISIBLE_DEVICES": "0,1"}, None, True),
+    ({"CUDA_VISIBLE_DEVICES": "0"}, None, False),
+    # A place a pool would pin the process to narrows nothing (row 12761's review): `dew launch`'s rank and
+    # a Slurm task open every GPU they see where they join no pool (`multi_host=False`), and a Slurm step of
+    # one task joins none (`joins_pool`).
+    ({**LAUNCHED, "JAX_LOCAL_DEVICE_IDS": "3", "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7"}, None, True),
+    ({**SLURM_TASK, "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7"}, None, True),
+    ({**SLURM_TASK, "SLURM_NTASKS": "1", "SLURM_PROCID": "0", "SLURM_LOCALID": "0",
+      "CUDA_VISIBLE_DEVICES": "0,1"}, None, True),
+    ({}, 2, True),
+    ({}, 1, False),
+    ({}, None, False),
+    ({"CUDA_VISIBLE_DEVICES": "0,1", "XLA_FLAGS": "--xla_gpu_enable_command_buffer=FUSION,CUBLAS"}, None,
+     False),
+    ({"CUDA_VISIBLE_DEVICES": "0,1", "XLA_FLAGS": "--xla_gpu_enable_command_buffer="}, None, False),
+])
+def test_a_process_that_may_open_more_than_one_gpu_graphs_nothing_unless_its_run_named_the_commands(
+        env, counted, ungraphed):
+    """`import dew` keeps every command out of XLA's CUDA graphs in a process that may open more than one
+    GPU, where both GPUs' host threads hung instantiating graphs (row 12714): its visible GPUs, else those its
+    CUDA driver counts
+    (`dew._pool.local_gpus`), never a place a pool it may not join would pin it to; one GPU, an uncounted
+    host or a run naming the commands keeps XLA's list. An environment that names its GPUs is read by Dew's
+    own count; one that names none, by the driver's count `counted` (None uncounted).
+    `prepare_process(multi_host=False)` under a Slurm step of eight tasks joins no pool, so its process opens
+    every GPU it sees, as the eight-task row reads it."""
+    from dew import _pool
+    from dew._devices import multi_gpu_ungraphed
+
+    named = "CUDA_VISIBLE_DEVICES" in env
+    uncounted = None if counted is None else tuple(range(counted))
+    opens = _pool.local_gpus if named else lambda selected, environ: uncounted
+    assert multi_gpu_ungraphed(env, opens) is ungraphed

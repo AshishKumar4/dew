@@ -69,7 +69,7 @@ def test_a_decision_run_starts_from_a_saved_decision_run_as_from_its_export(tmp_
     # A run naming a head of its own over the Laya release draws it over the release's backbone, its rows
     # laid out by the release's own tokenizer, which the backbone alone does not hold, and trains.
     joint = ["head:joint-shape", "--head.width", "16", "--head.routing-layers", "1", "--head.layers", "1",
-             "--head.heads", "2", "--head.feedforward", "32", "--max-len", "768"]
+             "--head.heads", "2", "--head.feedforward", "32", "--rows.max-len", "768"]
     drawn = started(source, "fresh_head", "--source.step", "latest", *joint)
     assert int(drawn.step) == 1
 
@@ -280,7 +280,7 @@ def joint_flags() -> list[str]:
 
     return ["--pretrained", str(QWEN_TINY), "head:joint-shape", "--head.width", "16",
             "--head.routing-layers", "1", "--head.layers", "1", "--head.heads", "2",
-            "--head.feedforward", "32", "--max-len", "768"]
+            "--head.feedforward", "32", "--rows.max-len", "768"]
 
 
 @pytest.fixture(scope="module")
@@ -339,7 +339,8 @@ def test_a_decision_run_starts_from_a_saved_chat_format_decision_run(chat_decisi
 
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     source, state = chat_decision_run
-    run = DecisionRunConfig.cli(["--pretrained", str(source), "--source.step", "latest", "--max-len", "768"],
+    run = DecisionRunConfig.cli(["--pretrained", str(source), "--source.step", "latest", "--rows.max-len",
+                                 "768"],
                                 default=decision(tmp_path, drawn=False))
     started = run.prepare().objective.init(jax.random.key(0))
     leaves_alike(started["params"]["head"], state.variables["params"]["head"])
@@ -865,11 +866,12 @@ def test_a_multimodal_run_passing_messages_reloads_from_its_native_release_as_it
     from saved_run_kinds import MULTIMODAL, multimodal
 
     from dew.interop import Pretrained
+    from dew.nn.backbones.decoder_stack import Loop
     from dew.nn.cross_pass import CrossPass
     from dew.nn.multimodal import MultimodalTransformer
 
-    looped = dataclasses.replace(multimodal(tmp_path, drawn=False), loop_steps=2, loop_layers=(0, 2),
-                                 loop_messages=True, loop_message_block_size=1)
+    looped = dataclasses.replace(multimodal(tmp_path, drawn=False), loop=Loop(
+        2, step_norm=False, layers=(0, 2), messages=CrossPass(block_size=1)))
     state, _ = trained(looped, tmp_path, "messaged", trainer={"checkpoint_final": True})
     loaded = Pretrained.load(str(released_run(tmp_path / "runs" / "messaged")), dtype="float32")
     assert isinstance(loaded.model, MultimodalTransformer)
@@ -888,3 +890,89 @@ def test_a_multimodal_run_passing_messages_reloads_from_its_native_release_as_it
     with pytest.raises(ValueError):
         loaded.with_model(loaded.model.with_passes(messages=CrossPass(block_size=1, rank=8)), key=0)
 
+
+def test_a_resume_compares_a_model_kind_named_remat(tmp_path):
+    """A model's layer kind named `remat` (`CausalTransformer.kinds`) says what it computes: a resume that
+    widens its window is refused (`RunConfig.check_resume`), where a run's loop's recompute
+    (`DecoderRunConfig._resumed_as`, the loop's field, not every field of its name) is not (row 11937's
+    review)."""
+    from dew.config import RunConfig, earlier_run
+    from dew.nn.backbones.layer_plan import LayerKind
+
+    run = lm(tmp_path, drawn=False)
+
+    def kinded(window: int) -> RunConfig:
+        return dataclasses.replace(run, model=dataclasses.replace(run.model, fields={
+            **run.model.fields, "layer_types": ("remat",), "kinds": {"remat": LayerKind(window=window)}}))
+
+    saved = earlier_run(json.loads(json.dumps(kinded(4).record())))
+    kinded(4).check_resume(saved)
+    with pytest.raises(ValueError):
+        kinded(8).check_resume(saved)
+
+
+def test_a_resume_recomputes_its_loop_freely_as_a_saved_run_did(tmp_path):
+    """A run's loop's recompute (`Loop.remat`) says how its passes execute, not what they compute: a run
+    resumes with it changed, and refused a loop that computes otherwise (more passes); a saved run whose
+    earlier record changed its checkpoint's loop's recompute alone (`loop_remat`, `_LoopChange.remat`)
+    resumes stating no loop, and one that changed what it computes (an exit gate) is refused (row 11937's
+    review: it was refused as a changed loop)."""
+    from test_decision_recipe import QWEN
+
+    from dew.config import earlier_run
+    from dew.nn.backbones.decoder_stack import Loop
+
+    run = dataclasses.replace(lm(tmp_path, drawn=False), pretrained=str(QWEN))
+    loop = Loop(2, step_norm=False, layers=(0, 1))
+    looped = dataclasses.replace(run, loop=loop)
+    saved = earlier_run(json.loads(json.dumps(looped.record())))
+    dataclasses.replace(looped, loop=dataclasses.replace(loop, remat=True)).check_resume(saved)
+    with pytest.raises(ValueError):
+        dataclasses.replace(looped, loop=dataclasses.replace(loop, steps=3)).check_resume(saved)
+    record = json.loads(json.dumps(run.record()))
+    for change, refused in (({"loop_remat": True}, False),
+                            ({"loop_remat": True, "loop_exit_gate": True}, True)):
+        earlier = earlier_run({**record, "fields": {**record["fields"], **change}})
+        if refused:
+            with pytest.raises(ValueError):
+                run.check_resume(earlier)
+        else:
+            run.check_resume(earlier)
+
+
+def test_a_decision_run_saved_with_its_budgets_and_context_flat_loads_them_whole(tmp_path):
+    """A decision run saved with its rows' budgets and its context layers' fields flat (`max_len`,
+    `option_tokens`, `context_layers`, `context_length`, `context_form` before row 11937) loads holding
+    them as its `rows` (`RowBudgets`) and its `context` (`CrossContext`); one that read no context
+    (`context_layers` None) holds none."""
+    from dew.config import earlier_run
+    from dew.decision.config import CrossContext, RowBudgets
+
+    record = json.loads(json.dumps(decision(tmp_path, drawn=False).record()))
+    today = {key: value for key, value in record["fields"].items() if key not in ("rows", "context")}
+    flat = {"max_len": 768, "option_tokens": 12, "context_layers": [0], "context_length": 32,
+            "context_form": "shared"}
+    loaded = DecisionRunConfig.read(earlier_run({**record, "fields": {**today, **flat}}))
+    assert loaded.rows == RowBudgets(max_len=768, option_tokens=12)
+    assert loaded.context == CrossContext(layers=(0,), length=32, form="shared")
+    unread = DecisionRunConfig.read(earlier_run({**record, "fields": {**today, "max_len": 768,
+                                                                     "context_layers": None}}))
+    assert unread.rows == RowBudgets(max_len=768) and unread.context is None
+
+
+def test_an_override_sets_a_decision_runs_context_and_a_field_of_it_in_one_point(tmp_path):
+    """One override point that sets a decision run's unset context and a field of it (`context` with
+    `context.layers`, the context's own fields under it) builds the run its whole point describes: a path
+    under a section the point sets is placed in that section, the run built once, never part-set."""
+    from dew.decision.config import CrossContext
+    from dew.inputs.spec import TextCondition
+
+    run = decision(tmp_path, drawn=False).override({"context": {}, "context.layers": [0, 1],
+                                                    "context.length": 32})
+    assert isinstance(run, DecisionRunConfig) and run.context == CrossContext(layers=(0, 1), length=32)
+    # A field of a section the section it sets holds unset steps into that section's defaults, as a path
+    # into any unset section of the run does (`_unset_default`).
+    texted = decision(tmp_path, drawn=False).override({"context": {"layers": [0, 1]},
+                                                       "context.text.max_length": 32})
+    assert isinstance(texted, DecisionRunConfig) and texted.context == CrossContext(
+        layers=(0, 1), text=TextCondition(max_length=32))

@@ -1734,7 +1734,7 @@ def _largest(program: _Program, hooked: _Hooked, place: tuple, k_first, slots, c
     the call's (`_Hooked.magnitudes`, at the batch row and key head `place` and the tile's first key
     `k_first`) where it holds them (a scaled op's launch, whose value tiles' transposed load the
     accumulator's layout need not take: a column block 32 wide is 32 of wgmma's 64 rows), else from its
-    value slot (`Family.key_magnitudes`, whose transposed load a cache walk's 16-row tiles take at any value
+    value slot (`Family.keys_read`, whose transposed load a cache walk's 16-row tiles take at any value
     width): a quantized call's from the tile its codes were converted into (`_Codes`), an fp32 call's from
     its first part (`_Program.parted`), within its rounding of each value, which the scaled walk's binade
     below fp32's largest takes (`algebra.HEADROOM`)."""
@@ -1750,7 +1750,13 @@ def _largest(program: _Program, hooked: _Hooked, place: tuple, k_first, slots, c
         tile = slots["values"] if converted is None else converted
     if program.parts > 1:
         tile = tile.at[pl.ds(0, program.tiles.block_k)]
-    return functools.partial(family.key_magnitudes, tile)
+
+    def largest() -> jax.Array:
+        # The family's read of its keys' values, reduced by the one rule a nonfinite value weighs nothing by.
+        values, axis = family.keys_read(tile)
+        return algebra.magnitudes(values, axis=axis)
+
+    return largest
 
 
 def _magnitudes(value: jax.Array, hooked: _Hooked, parts: int) -> jax.Array:

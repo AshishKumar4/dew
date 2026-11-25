@@ -125,9 +125,9 @@ def pytest_environment(environ: Mapping[str, str]) -> dict[str, str]:
     (`UNKEYED`), `environ` over it, the Hub closed, and tools/armada on the path, where the plugins a task
     loads (split.py, executed.py) import from: what a run selects and loads is its command's alone, which
     every row's key holds (row 2558: an inherited PYTEST_ADDOPTS could reuse a green row its run would not
-    give)."""
+    give), and how it cuts its file its row's alone (`SPLIT_EVENLY`)."""
     path = os.pathsep.join(filter(None, [str(Path(__file__).resolve().parent), os.environ.get("PYTHONPATH")]))
-    inherited = {name: value for name, value in os.environ.items() if name not in UNKEYED}
+    inherited = {name: value for name, value in os.environ.items() if name not in (*UNKEYED, SPLIT_EVENLY)}
     return {**inherited, **environ, **CLOSED_HUB, "PYTHONPATH": path}
 
 
@@ -570,6 +570,12 @@ def own(recorded: Mapping[str, float], sites: Container[str]) -> dict[str, float
     (`declared_marks`, `site_name`), which run apart: what the plan cuts the file by (ci.py's `own_tests`)
     and every task of it cuts alike (split.py)."""
     return {node: seconds for node, seconds in recorded.items() if site_name(node, sites) not in sites}
+
+
+SPLIT_EVENLY = "DEW_SPLIT_EVENLY"
+"""Set to 1 in a dry prepare's task (ci.py's `tested`, from its row's variant): its groups are its file's
+tests cut by their count (tools/armada/prepares.py's `prepared_cut`, split.py), as its plan keys them
+(ci.py's `members`); never inherited (`pytest_environment`), so no other task cuts so."""
 
 
 def cut_record() -> Path:

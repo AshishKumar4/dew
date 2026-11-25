@@ -326,7 +326,8 @@ def _mosaic_served(name: str):
 
 
 @COMPILES_ON_CPU
-@pytest.mark.parametrize("cases", ["widths-narrow", "widths-wide", "shapes-finished", "shapes-long"])
+@pytest.mark.parametrize("cases", ["widths-narrow", "widths-wide", "shapes-finished", "shapes-resumed",
+                                   "shapes-long-64", "shapes-long-256"])
 @pytest.mark.parametrize("name", ["sm80", "sm90", "sm100"])
 def test_a_padded_merge_compiles_as_one_launch(name, cases):
     """The padded merge's one Mosaic GPU launch (`merged_mosaic.launch`, row 9795) compiles spill-free for
@@ -379,12 +380,15 @@ def test_a_padded_merge_compiles_as_one_launch(name, cases):
                        lambda: (finished_with_initial(4, 128, jnp.bfloat16, 32),
                                 (finished_padded, finished_stacked, init_m, init_t, init_acc))),
         ],
-        "shapes-long": [
+        "shapes-resumed": [
             KernelCase("small-finished-initial",
                        lambda: (finished_with_initial(2, 16, jnp.float32, 2),
                                 (small_p, small_s, small_m, small_m, small_a))),
-            *(one_case(f"slices-{slices}", slices=slices, width=128) for slices in (64, 256)),
         ],
+        # Each long split and the resumed shape a case of its own: together a Blackwell's took 151 s, and the
+        # two long splits 145 s (row 12698).
+        **{f"shapes-long-{slices}": [one_case(f"slices-{slices}", slices=slices, width=128)]
+           for slices in (64, 256)},
     }
     with generation.assumed(name), _mosaic_served(name):
         records = compile_mosaic_kernels(named[cases], name)
@@ -401,13 +405,16 @@ def test_a_padded_merge_compiles_as_one_launch(name, cases):
         assert kernels[0]["spilled"] == 0 and kernels[0]["shared"] == 0, record
 
 @COMPILES_ON_CPU
-def test_a_padded_merge_lowers_on_triton_where_mosaic_measured_slower():
+@pytest.mark.parametrize("where", [*sorted(merged.MOSAIC_SLOWER), "hooked", "pinned"])
+def test_a_padded_merge_lowers_on_triton_where_mosaic_measured_slower(where):
     """Rows 9795, 12398: the generations where Mosaic GPU's merge measured slower (`merged.MOSAIC_SLOWER`,
     an A100's and a GH200's) merge on Pallas Triton's launch, as their compiled executables carry it: a
     plain merge, and a finished one with a resumed state (`Initial`, the form row 11857's GPU run found
     Pallas Triton refusing), each unhooked as the measured one was. Mosaic serves there a hooked merge (a
     sigmoid output hook) and one whose config is pinned, as its executable carries its kernel; Pallas Triton
-    lowers no Mosaic GPU primitive rule's `platform_index`."""
+    lowers no Mosaic GPU primitive rule's `platform_index`. Each generation's Triton compiles, and the
+    Hopper's hooked and pinned Mosaic ones, a case of its own (`where`: together 189 s, the two Mosaic
+    compiles 161 s, row 12698)."""
     from fla_gdn_support import KernelCase
     from jax._src.pallas.mosaic_gpu import core as plgpu_core, lowering as mosaic_lowering
     from jax.extend import core as jcore
@@ -437,19 +444,22 @@ def test_a_padded_merge_lowers_on_triton_where_mosaic_measured_slower():
     launches._register_mosaic_gpu_lowerings()
     assert jcore.primitives.platform_index_p not in mosaic_lowering.mosaic_lowering_rules[
         plgpu_core.WGxWG_SEMANTICS]
-    for name in sorted(merged.MOSAIC_SLOWER):
-        with generation.assumed(name):
+    if where in merged.MOSAIC_SLOWER:
+        with generation.assumed(where):
             records = compile_kernels([
                 KernelCase("plain", lambda: (plain, (padded, stacked))),
-                KernelCase("resumed", lambda: (resumed, (*small, init_m, init_m, init_acc)))], name)
+                KernelCase("resumed", lambda: (resumed, (*small, init_m, init_m, init_acc)))], where)
         for record in records:
             assert "error" not in record and sorted(record["thunks"]) == ["merged_padded"], record
+        return
     with generation.assumed("sm90"):
-        hooked_records = compile_mosaic_kernels([KernelCase("hooked", lambda: (hooked, small))], "sm90")
-        with tuning.pinned({merged.MergedPadded: merged.MergeConfig(16)}):
-            pinned_records = compile_mosaic_kernels(
-                [KernelCase("pinned", lambda: (plain, (padded, stacked)))], "sm90")
-    for record in (*hooked_records, *pinned_records):
+        if where == "hooked":
+            records = compile_mosaic_kernels([KernelCase("hooked", lambda: (hooked, small))], "sm90")
+        else:
+            with tuning.pinned({merged.MergedPadded: merged.MergeConfig(16)}):
+                records = compile_mosaic_kernels(
+                    [KernelCase("pinned", lambda: (plain, (padded, stacked)))], "sm90")
+    for record in records:
         assert not mosaic_failures([record]), record
         assert [kernel["kernel"] for kernel in record["kernels"]] == ["merged_padded"], record
 

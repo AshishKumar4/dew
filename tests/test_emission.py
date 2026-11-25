@@ -1,6 +1,8 @@
 """A launch's work counted from its kernel's emission (`templates.emission`, row 5895): a step of its walk
 counted from its body, as each warpgroup runs it."""
 
+import math
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -11,7 +13,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from kernel_compile import lowered_for
 from reference_error import ahead_arm
 
-from dew.nn import programs
+from dew.nn import precision, programs
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import cost, emission, mosaic
 from dew.nn.kernels.templates.cost import Stated, Work
@@ -735,6 +737,116 @@ def test_a_steps_mask_of_its_tiles_indices_issues_nothing_and_one_of_its_place_c
     assert selected == selected_placed == 128, (selected, selected_placed)
 
 
+def _static_multiply(factor: int) -> jax.Array:
+    """`iota * factor` as a row's floats: an integer multiply of iotas and literals alone, 128 of them."""
+    return (lax.iota(jnp.int32, 128) * factor).astype(jnp.float32)
+
+
+def test_static_work_a_loop_reaches_is_hoisted_once_whichever_trips_reach_it():
+    """Static work (iotas and literals) inside a loop is computed once outside it, as the compiler hoists
+    it, whichever of its trips or arms reach it (row 12767): a walk whose parity picks `iota * 3` or
+    `iota * 5` computes both, 256 multiplies; a two-trip scan whose second trip alone takes `iota * 3`
+    computes it, 128; a two-trip scan whose arms its data decides computes both, 256."""
+    def parity(row, trips):
+        def step(index, row):
+            mosaic.step_index(index)
+            return row + lax.cond(index % 2 == 1, lambda: _static_multiply(3), lambda: _static_multiply(5))
+
+        return lax.fori_loop(0, trips, step, row)
+
+    def later(row):
+        def step(index, row):
+            return lax.cond(index == 1, lambda row: row + _static_multiply(3), lambda row: row, row)
+
+        return lax.fori_loop(0, 2, step, row)
+
+    def decided(row):
+        def step(row, _):
+            return lax.cond(row[0] > 0, lambda row: row + _static_multiply(3),
+                            lambda row: row + _static_multiply(5), row), None
+
+        return lax.scan(step, row, None, length=2)[0]
+
+    walked = _emitted(parity, _ROW, _TRIPS).roles[0].fixed
+    assert walked.integer_multiply_adds == 2 * 128, walked
+    assert _emitted(later, _ROW).roles[0].fixed.integer_multiply_adds == 128
+    assert _emitted(decided, _ROW).roles[0].fixed.integer_multiply_adds == 2 * 128
+
+
+def test_static_work_hoisted_from_an_arms_loop_stays_in_its_arm():
+    """A one-shot conditional its data decides, each arm a two-trip scan adding `iota * 3` or `iota * 5`:
+    hoisting a multiply out of its arm's scan leaves it in its arm, so the conditional's arms' envelope takes
+    one arm's, 128 multiplies, never both arms' 256 (the review of lane/toolkit 55ba7911d, P1)."""
+    def scanned(factor: int):
+        def arm(row):
+            return lax.scan(lambda row, _: (row + _static_multiply(factor), None), row, None, length=2)[0]
+
+        return arm
+
+    def body(row):
+        return lax.cond(row[0] > 0, scanned(3), scanned(5), row)
+
+    assert _emitted(body, _ROW).roles[0].fixed.integer_multiply_adds == 128
+
+
+_TRIPLED_ROW: list = []
+
+
+def _tripled_row():
+    """An operation of the construct's own (`scaled.primitive`) whose value adds `iota * 3` to its row: its
+    expansion, which a count traces (`emission._expanded`), holds a static multiply."""
+    if not _TRIPLED_ROW:
+        from dew.algebra import scaled
+
+        _TRIPLED_ROW.append(scaled.primitive(
+            "tripled_row", lambda row: row + (lax.iota(jnp.int32, row.shape[0]) * 3).astype(row.dtype),
+            lambda row: row))
+    return _TRIPLED_ROW[0]
+
+
+def test_an_expanded_operations_static_work_in_a_loop_is_hoisted_once():
+    """A four-trip scan applying an operation the count expands (`scaled.primitive`'s) whose expansion
+    multiplies an iota: the multiply hoisted once, 128 multiplies, its expansion's sites one across the
+    scan's trips (the review of lane/toolkit 55ba7911d, P2: each visit retraced, its sites new or a freed
+    trace's reused)."""
+    tripled = _tripled_row()
+
+    def body(row):
+        return lax.scan(lambda row, _: (tripled.bind(row), None), row, None, length=4)[0]
+
+    assert _emitted(body, _ROW).roles[0].fixed.integer_multiply_adds == 128
+
+
+def test_static_work_outside_loops_runs_on_its_path_once_a_call():
+    """Static work outside every loop runs where its path does: in a conditional its data decides, its arm's
+    under the arms' envelope with the arm's other work (`iota * 3`'s multiply, conversion and add against
+    one add: 384 issues; against three adds, 384 too, never 640), and once at each call of a cached jitted
+    body (two calls, 256 multiplies) (row 12767)."""
+    def chosen(first, other):
+        def body(row):
+            return lax.cond(row[0] > 0, first, other, row)
+
+        return cost.issued(_emitted(body, _ROW).roles[0].fixed)
+
+    def tripled_row(row):
+        return row + _static_multiply(3)
+
+    # The predicate and its branch index alone, which each conditional below issues beside its arms.
+    baseline = chosen(lambda row: row, lambda row: row)
+    against_one = chosen(tripled_row, lambda row: row + 1.0)
+    against_three = chosen(tripled_row, lambda row: ((row + 1.0) + 2.0) + 3.0)
+    assert against_one - baseline == against_three - baseline == 3 * 128, (baseline, against_one,
+                                                                           against_three)
+
+    tripled = jax.jit(lambda x: x * 3)
+
+    def called(row):
+        indices = lax.iota(jnp.int32, 128)
+        return row + (tripled(indices) + tripled(indices + 1)).astype(jnp.float32)
+
+    assert _emitted(called, _ROW).roles[0].fixed.integer_multiply_adds == 2 * 128
+
+
 @pytest.mark.parametrize("held", ["step", "scope", "branch"])
 def test_a_steps_mask_of_a_runtime_value_counts_its_integer_operations_each_step(held):
     """A walk step's mask of its tile's indices offset by its parity (`index % 2`, a value the count holds
@@ -777,18 +889,519 @@ def test_an_integer_multiply_counts_on_the_fma_pipe_at_its_own_rate_beside_the_f
     IMAD, the FMA pipe's, as a bit form's left shifts by a multiply are, `bits.BitForm.work`) and nothing of
     the ALU's or the fp32 lanes'; a launch of them is priced at the target's IMAD rate
     (`Architecture.integer_multiply_adds_per_clock`), its seconds the fp32 lanes' unit's, so an FFMA beside it
-    adds to them: on sm90, 64 a clock against 256 FLOPs of FFMA, where read as FFMA work they cost a quarter
-    (the review of 3580, F3)."""
+    adds to them: on sm90, 64 a clock against the lanes' 128 instructions, where read as fp32 instructions
+    they cost half (the review of 3580, F3)."""
     row = jax.ShapeDtypeStruct((1, 128), jnp.int32)
     role = _emitted(lambda x: x * 3, row).roles[0]
     assert (role.fixed.integer_multiply_adds, role.fixed.integer_operations, role.fixed.operations) == (
         128, 0, 0), role.fixed
     target = generation.gpu_target("sm90")
     rates = cost.rates(target, device=False)
-    assert rates.multiply_adds == 64 / 256 * rates.cuda
+    assert rates.multiply_adds == 64 / 128 * rates.cuda
     alone, _ = cost.units(Work(integer_multiply_adds=128), rates)
     beside, _ = cost.units(Work(integer_multiply_adds=128, operations=256), rates)
     assert beside[1] == alone[1] + 256 / rates.cuda
+
+
+def _read_twice(product, z):
+    """`product + z` times `product`: one multiply's output read by an add and by a multiply."""
+    return (product + z) * product
+
+
+@pytest.mark.parametrize(("source", "target", "expected"), [
+    (jnp.float32, jnp.bfloat16, Work(conversions=64)),
+    (jnp.float32, jnp.float16, Work(conversions=64)),
+    (jnp.float32, jnp.float8_e4m3fn, Work(conversions=64)),
+    (jnp.bfloat16, jnp.float32, Work(integer_operations=128)),
+    (jnp.float16, jnp.float32, Work(operations=128)),
+    (jnp.float8_e4m3fn, jnp.float32, Work(conversions=64, operations=128)),
+    (jnp.float32, jnp.int32, Work(conversions=128, operations=256)),
+    (jnp.int32, jnp.float32, Work(conversions=128)),
+    (jnp.bfloat16, jnp.float16, Work(integer_operations=128, conversions=64)),
+    (jnp.float32, jnp.float32, Work())],
+    ids=["f32-bf16", "f32-f16", "f32-e4m3", "bf16-f32", "f16-f32", "e4m3-f32", "f32-s32", "s32-f32",
+         "bf16-f16", "f32-f32"])
+def test_a_kernels_conversion_issues_as_its_assembler_lowers_it(source, target, expected):
+    """A Mosaic GPU kernel's element type conversion issues what sm90's SASS of one issues, 128 elements
+    (FS-CONV-SASS1): a narrowing to a 16- or 8-bit float one packed pair's F2FP, half a conversion an element;
+    a bf16 widened by its bits (a PRMT and an IMAD.U32 a pair), an fp16 by an HADD2.F32 an element, an e4m3
+    unpacked to fp16 pairs and widened alike; an fp32 to an int32 an F2I beside its saturating clamp's two
+    FMNMX; an int32 to an fp32 an I2FP; one to its own dtype nothing, in a kernel or in XLA's program alike.
+    XLA's other conversions, unmeasured, stay a conversion an element."""
+    row_in, row_out = jax.ShapeDtypeStruct((128,), source), jax.ShapeDtypeStruct((128,), target)
+    params = {"new_dtype": target, "weak_type": False, "sharding": None}
+    found = emission.operation_work(lax.convert_element_type_p, [row_in], [row_out], params,
+                                    generation.gpu_target("sm90"), forms=emission.ACCURATE_FORMS)
+    assert found == expected, found
+    unchanged = Work() if source == target else Work(conversions=128)
+    assert emission.operation_work(lax.convert_element_type_p, [row_in], [row_out], params,
+                                   generation.gpu_target("sm90")) == unchanged
+
+
+def _row_reduced(laid_out, where: str = "inline", shape: tuple[int, int] = (64, 64)) -> Work:
+    """A one-warpgroup Mosaic GPU kernel's fixed work: an fp32 tile of `shape` it loads from shared memory
+    and lays out as `laid_out` (a `layout_cast`'s, or none), then reduces along its rows, twice: inline, in
+    a jitted helper its tile an argument of, or in a scope (`pl.run_scoped`) its tile a constant of."""
+    def rows(tile):
+        return jnp.max(tile, axis=1) + jnp.max(tile, axis=1)
+
+    def body(out_ref, smem):
+        tile = smem[...]
+        if laid_out is not None:
+            tile = plgpu.layout_cast(tile, laid_out)
+        if where == "scoped":
+            def scope():
+                out_ref[...] = rows(tile)
+
+            pl.run_scoped(scope)
+        else:
+            out_ref[...] = jax.jit(rows)(tile) if where == "called" else rows(tile)
+
+    launch = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct(shape[:1], jnp.float32), num_threads=1,
+                          thread_name="wg", scratch_types=[plgpu.SMEM(shape, jnp.float32)])
+    traced = jax.make_jaxpr(launch)().jaxpr
+    return emission.emitted(traced, 1, "wg", forms=emission.ACCURATE_FORMS).roles[0].fixed
+
+
+@pytest.mark.parametrize(("laid_out", "rounds", "where"), [
+    (plgpu.Layout.WGMMA, 2, "inline"), (plgpu.Layout.WGMMA_TRANSPOSED, 3, "inline"), (None, 0, "inline"),
+    (plgpu.Layout.WGMMA, 2, "called"), (plgpu.Layout.WGMMA, 2, "scoped")],
+    ids=["wgmma", "transposed", "unknown", "wgmma-in-a-call", "wgmma-in-a-scope"])
+def test_a_laid_out_row_reduction_issues_its_butterfly_once(laid_out, rounds, where):
+    """A kernel's reduction along a tile's rows, its tile's layout named by its provenance (here a
+    `layout_cast`), issues its butterfly across the lanes that layout spreads a row over, as Mosaic GPU
+    lowers it: log2 of them rounds of a shuffle and a combine of each 32-bit word of the result's registers
+    a thread (WGMMA's four lanes, two rounds; WGMMA_TRANSPOSED's eight, three); none where no provenance
+    names the layout (inference's choice). Each thread first combines the values it holds of each of its
+    rows, so a reduction combines its elements less the values a thread keeps, then a round's each. The same
+    reduction twice issues it once, as the lowering's CSE merges them; a jitted helper's reduction of its
+    laid-out argument, and a scope's of its captured tile, alike. Where shuffles went uncounted (row 12889);
+    the two maxima's sum 64 more."""
+    fixed = _row_reduced(laid_out, where)
+    if laid_out is None:
+        assert fixed.shuffles == 0 and fixed.operations == 64 * 64 + 64, fixed
+        return
+    result = laid_out.to_mgpu().reduce((1,))
+    # Each fp32 value one 32-bit word, each shuffled once a round, on each of the warpgroup's 128 threads.
+    held = math.prod(result.registers_shape((64,))) * result.vector_length * 128
+    assert fixed.shuffles == rounds * held, (fixed, held)
+    assert fixed.operations == 64 * 64 - held + rounds * held + 64, (fixed, held)
+
+
+def test_a_replicated_rows_reduction_combines_each_copy():
+    """A 1 x 64 fp32 row a row at a time (`swizzling._row_layout`: two values a lane, every warp of the
+    warpgroup a copy) summed along it: each of the 128 threads combines its two values, then five rounds
+    across the warp's 32 lanes, a shuffle and a combine each, 768 combines where the row's 64 elements
+    alone counted 576 (the review of lane/toolkit ca6da710b, P2). Its maximum, which a Blackwell may take
+    by one `redux.sync` across the warp, keeps the elements' price (the review of 8d026cf4a, P2)."""
+    from dew.nn.kernels.templates import swizzling
+
+    def body(out_ref, smem):
+        row = plgpu.layout_cast(smem[...], swizzling._row_layout((1, 64), jnp.float32))
+        out_ref[...] = reduce(row, axis=1)
+
+    for reduce, work in ((jnp.sum, Work(operations=128 * (1 + 5), shuffles=128 * 5)),
+                         (jnp.max, Work(operations=64))):
+        launch = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((1,), jnp.float32), num_threads=1,
+                              thread_name="wg", scratch_types=[plgpu.SMEM((1, 64), jnp.float32)])
+        traced = jax.make_jaxpr(launch)().jaxpr
+        fixed = emission.emitted(traced, 1, "wg", forms=emission.ACCURATE_FORMS).roles[0].fixed
+        assert (fixed.operations, fixed.shuffles) == (work.operations, work.shuffles), (reduce, fixed)
+
+
+def test_a_half_warp_rows_integer_maximum_shuffles_across_its_lanes():
+    """A 1 x 16 int32 row over 16 lanes, the warp's two halves each a copy (lane dimensions a replica and
+    the row's): its maximum reduces across 16 of the warp's lanes, not all, so Mosaic GPU exchanges by
+    shuffles, four rounds, no `redux.sync` (the review of lane/toolkit b4abd20a1, P2)."""
+    from jax.experimental.mosaic.gpu import fragmented_array as mgpu_fragments
+
+    halves = plgpu.Layout.TILED(mgpu_fragments.Tiling(((1, 16), (1,))),
+                                warp_dims=(mgpu_fragments.Replicated(mgpu_fragments.WARPS_IN_WARPGROUP),),
+                                lane_dims=(mgpu_fragments.Replicated(2), -2), vector_dim=-1)
+
+    def body(out_ref, smem):
+        out_ref[...] = jnp.max(plgpu.layout_cast(smem[...], halves), axis=1)
+
+    launch = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((1,), jnp.int32), num_threads=1,
+                          thread_name="wg", scratch_types=[plgpu.SMEM((1, 16), jnp.int32)])
+    traced = jax.make_jaxpr(launch)().jaxpr
+    fixed = emission.emitted(traced, 1, "wg", forms=emission.ACCURATE_FORMS).roles[0].fixed
+    assert fixed.shuffles == 4 * 128, fixed
+
+
+def test_an_attention_forwards_walk_issues_its_row_reductions_butterflies():
+    """The attention forward's walk, traced for an H100 at 64 x 128 tiles with two consumers and for an A100
+    at 64 x 64 (its scaled kernel, the one each compiles), issues 12 shuffles a thread a step, as their SASS
+    does (FS-REDSHFL4): three distinct row reductions of a product's accumulator (WGMMA's or mma.sync's
+    layout, by provenance), two rows a thread, two rounds each, the scaled kernel's repeated max and sum
+    merged as the lowering's CSE merges them."""
+    from dew.nn.attention import scaled_dot_product_attention
+    from dew.nn.kernels import tuning
+    from dew.nn.kernels.templates import attention_mosaic
+
+    for gen, tiles in (("sm90", attention_mosaic.Tiles(64, 128, 2, 2, family="wgmma")),
+                       ("sm80", attention_mosaic.Tiles(64, 64, 2, 1, family="mma.sync"))):
+        operand = jax.ShapeDtypeStruct((1, 2048, 8, 64), jnp.bfloat16)
+
+        def forward(q, k, v, tiles=tiles):
+            with tuning.pinned({attention_mosaic.MosaicForward: tiles}):
+                return scaled_dot_product_attention(q, k, v, causal=False, implementation="template")
+
+        with generation.assumed(gen):
+            traced = jax.make_jaxpr(forward)(operand, operand, operand)
+            (scaled,) = [equation for equation in programs.equations(traced.jaxpr)
+                         if equation.primitive in programs.NATIVE_KERNELS
+                         and str(equation.params.get("name", "")).startswith("attention_forward_scaled")]
+            mesh = scaled.params.get("mesh")
+            forms = emission.forms_of(scaled.params["compiler_params"])
+            counted = (emission.emitted(emission._body(scaled), mesh.num_threads or 1, mesh.thread_name,
+                                        forms=forms) if mesh is not None
+                       else emission.emitted(emission._body(scaled), 1, None, forms=forms))
+        assert counted.roles[0].step(lambda work: work.shuffles) == 12 * 128, gen
+
+
+@pytest.mark.parametrize(("platform", "operations"), [("sm90", 0), ("cpu", 128), ("v5e", 256)])
+def test_a_platform_choice_counts_the_branch_its_target_runs(platform, operations):
+    """A body choosing its work by the platform it lowers for (`lax.platform_dependent`) counts the branch the
+    priced platform takes, never the most of the branches: a CUDA GPU's `cuda` branch (none), a CPU's `cpu`
+    (one operation an element), a TPU's the default (two) (the reviews of lane/toolkit 2da46a78b and
+    28af34cca)."""
+    def chosen(row):
+        return lax.platform_dependent(row, cuda=lambda row: row, cpu=lambda row: row * 2.0,
+                                      default=lambda row: row * 2.0 + 1.0)
+
+    with generation.assumed(platform):
+        fixed = _emitted(chosen, _ROW).roles[0].fixed
+    assert fixed.operations == operations, fixed
+
+
+def test_a_compile_only_gpu_mesh_lowers_for_cuda_unassumed():
+    """A call placed on a compile-only GPU mesh, nothing assumed, lowers for CUDA as its abstract device's
+    compute capability states, a registered GPU backend or none, so its platform choice counts its `cuda`
+    branch (the review of lane/toolkit ee127f37c)."""
+    mesh = jax.sharding.AbstractMesh((1,), ("data",))
+
+    def chosen(row):
+        return lax.platform_dependent(row, cuda=lambda row: row, default=lambda row: row * 2.0 + 1.0)
+
+    with jax.sharding.use_abstract_mesh(generation.gpu_mesh(mesh, "sm90")):
+        assert generation.lowering_platform() == "cuda"
+        fixed = _emitted(chosen, _ROW).roles[0].fixed
+    assert fixed.operations == 0, fixed
+
+
+def test_a_walks_platform_chosen_mask_is_static():
+    """A walk's step reading a platform-chosen index tile (an iota or its reverse, `lax.platform_dependent`)
+    times a literal: the choice is its compile's, a constant, so the multiply is of the program's constants
+    and issues nothing a step (the review of lane/toolkit 28af34cca)."""
+    def walk(row, trips):
+        def step(index, row):
+            mosaic.step_index(index)
+            indices = lax.platform_dependent(cuda=lambda: lax.iota(jnp.int32, 128),
+                                             default=lambda: lax.rev(lax.iota(jnp.int32, 128), (0,)))
+            return row + (indices * 3).astype(jnp.float32)
+
+        return lax.fori_loop(0, trips, step, row)
+
+    with generation.assumed("sm90"):
+        role = _emitted(walk, _ROW, _TRIPS).roles[0]
+    assert role.step(lambda work: work.integer_multiply_adds) == 0, role
+
+
+def test_a_correctly_rounded_division_prices_as_its_backend_lowers_it():
+    """A correctly rounded fp32 division (`precision.correctly_rounded_divide`) prices as each backend lowers
+    it (row 12886): in a Pallas Triton kernel, read from the launch's own compiler parameters (a
+    `CompilerParams` instance, as `pallas_call` binds it), its native `div.rn.f32`, one MUFU beside five FFMAs
+    and an FCHK an element on its common path (FS-DIV-SASS5); in a Mosaic GPU kernel and in XLA's program its
+    software division (`precision._correctly_rounded_divide`), counted through its protected and marked
+    calls: its significands' division beside the plain quotient, two of a Mosaic GPU kernel's divisions an
+    element and more, and nothing of it unpriced, where a flat count reached the plain quotient alone."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import triton as pltriton
+
+    hopper = generation.gpu_target("sm90")
+    row = jax.ShapeDtypeStruct((128,), jnp.float32)
+
+    def divided(x_ref, y_ref, o_ref):
+        o_ref[...] = precision.correctly_rounded_divide(x_ref[...], y_ref[...])
+
+    launch = pl.pallas_call(divided, out_shape=row, compiler_params=pltriton.CompilerParams())
+    traced = jax.make_jaxpr(emission.costed(launch, Stated(steps=0, bytes_accessed=0)))(row, row)
+    (kernel,) = [equation for equation in programs.equations(traced.jaxpr)
+                 if "cost_estimate" in equation.params]
+    native = emission.work_of(kernel)
+    assert native is not None
+    assert (native.exponentials, native.operations) == (128, 6 * 128), native
+
+    def software(forms) -> Work:
+        return emission.operation_work(precision.correctly_rounded_divide_p, [row, row], [row], {}, hopper,
+                                       forms=forms)
+
+    mosaic, xla = software(emission.ACCURATE_FORMS), software(None)
+    assert mosaic.unpriced_operations == xla.unpriced_operations == 0, (mosaic, xla)
+    assert mosaic.exponentials >= 2 * 128 and cost.issued(xla) > 2 * 128, (mosaic, xla)
+
+
+def test_an_fp32_division_in_a_kernel_issues_a_reciprocal_and_its_refinement():
+    """An fp32 division in a Mosaic GPU kernel issues a MUFU.RCP beside its refinement, never one instruction
+    as a multiply does: `div.full.f32`, with `approx_math` or without, one MUFU, five FMULs and two FSETPs an
+    element (ptxas 13.0's sm90 SASS, FS-DIV-SASS1 and FS-DIV-SASS5), so `a / y` prices above `a * r`, which a
+    reciprocal held already makes of it. XLA's own fp32 division is IEEE `div.rn.f32` (its PTX for a GH200,
+    M-FS-77): a MUFU.RCP beside five FFMAs and an FCHK an element on its common path. Another width's
+    (fp64's, bf16's) and a TPU's, unmeasured, stay an operation an element, as an integer division does."""
+    hopper, tpu = generation.gpu_target("sm90"), generation.TARGETS["v5e"]
+
+    def priced(dtype, target, forms) -> Work:
+        row = jax.ShapeDtypeStruct((128,), dtype)
+        return emission.operation_work(lax.div_p, [row, row], [row], {}, target, forms=forms)
+
+    for forms in (emission.ACCURATE_FORMS, emission.APPROXIMATE_FORMS):
+        assert priced(jnp.float32, hopper, forms) == Work(exponentials=128, operations=7 * 128)
+        assert priced(jnp.float64, hopper, forms) == priced(jnp.bfloat16, hopper, forms) == Work(
+            operations=128)
+        assert priced(jnp.float32, tpu, forms) == Work(operations=128)
+    assert priced(jnp.float32, hopper, None) == Work(exponentials=128, operations=6 * 128)
+    assert priced(jnp.float32, tpu, None) == Work(operations=128)
+    assert priced(jnp.int32, hopper, emission.ACCURATE_FORMS) == Work(integer_operations=128)
+
+
+@pytest.mark.parametrize(("body", "fused"), [
+    (lambda x, y, z: x * y + z, 128), (lambda x, y, z: jnp.maximum(x * y, z), 0),
+    (lambda x, y, z: _read_twice(x * y, z), 0), (lambda x, y, z: lax.add(lax.mul(x[0, 0], y[0, 0]), z), 0),
+    (lambda x, y, z: (x * y + z) * (x * y), 128)],
+    ids=["multiply-add", "maximum", "product-read-twice", "scalar-product-into-a-row", "product-repeated"])
+def test_an_fp32_multiply_whose_one_use_is_an_add_counts_as_one_fused_instruction(body, fused):
+    """An fp32 multiply whose result an add alone reads is one FFMA with it (ptxas's --fmad, its default):
+    the body counts the pair fused (`Work.fused_multiply_adds`), an element each; a maximum of a product, a
+    product read twice, or one scalar product added to a row's every element (the review of lane/toolkit
+    5cbbe66c586, P1) keeps its multiply an instruction of its own. A product computed twice, once into an add,
+    once read alone, is two products, the first fused (the review of lane/toolkit f69e7b74a, P1)."""
+    row = jax.ShapeDtypeStruct((1, 128), jnp.float32)
+    role = _emitted(body, row, row, row).roles[0]
+    assert role.fixed.fused_multiply_adds == fused, role.fixed
+
+
+def test_a_walk_issuing_one_warp_a_scheduler_waits_each_instructions_dependent_latency():
+    """A GH200 program of one warpgroup, one resident a multiprocessor, issues one warp a scheduler: each of
+    its instructions waits the one before it (`Multiprocessor.issue_interval`, 4.6 clocks: M-NA-21's decode
+    walk at one warp a scheduler, 4.56, and M-FS-70's KDA intra at two, 57% not issued, 4.65), so its walk
+    takes its issue slots 4.6 times over, beyond its ALU's 2; twice the programs of the same work, two
+    resident, issue two warps a scheduler and take the same time (M-NA-21: K64 at two resident 309 us
+    against K128 at one 346 us, the same bytes in flight). An RTX 3090's interval unmeasured, its walk is
+    its units'."""
+    hopper, unmeasured = generation.gpu_target("NVIDIA GH200 480GB"), generation.gpu_target("sm86")
+    program = Work(integer_operations=128 * 1000)
+
+    def launched(target, count: int, resident: int, warps: float) -> float:
+        work = Work(integer_operations=program.integer_operations * count, kernels=1)
+        return cost.launch_seconds(work, count, target, resident=resident, warps=warps)
+
+    sms, issue = hopper.multiprocessors, cost.rates(hopper, device=False).issue
+    assert sms is not None and issue is not None
+    slots, launch = program.integer_operations / issue, hopper.launch_seconds or 0.0
+    # One warp a scheduler waits the interval each instruction; two, each its half, a multiprocessor's two.
+    assert launched(hopper, sms, 1, 4) == slots * 4.6 + launch
+    assert launched(hopper, 2 * sms, 2, 4) == 2 * (slots * (4.6 / 2)) + launch
+    # Three a multiprocessor at two resident: a wave of two, then one alone (the review of lane/toolkit
+    # 61dd3c7d2).
+    assert launched(hopper, 3 * sms, 2, 4) == 2 * (slots * (4.6 / 2)) + slots * 4.6 + launch
+    filled = unmeasured.multiprocessors or 1
+    assert launched(unmeasured, filled, 1, 4) == launched(unmeasured, filled, 1, 0)
+
+
+def test_a_walks_issue_latency_follows_the_warps_its_steps_spread_over():
+    """A GH200 program of two warpgroups walking a row doubled a step, its trips its data's (a while
+    loop's), one program a multiprocessor (`emission.warps_of`, `cost.latency_bound`): one warpgroup walking
+    S steps beside an idle one issues over 4 warps; two walking S steps each (S twice over, every consumer's
+    steps stated, `cost.Stated.steps`) over 8; two splitting S over 8, each warp's chain half, the least
+    bound."""
+    target = generation.gpu_target("NVIDIA GH200 480GB")
+    rates = cost.rates(target, device=False)
+    row = jax.ShapeDtypeStruct((128,), jnp.float32)
+    trips = jax.ShapeDtypeStruct((1,), jnp.int32)
+
+    def priced(*, both: bool, steps: int) -> tuple[float, float]:
+        def body(trips_ref, x_ref, o_ref):
+            def step(index, row):
+                mosaic.step_index(index)
+                return row * 2.0
+
+            def walk():
+                o_ref[...] = lax.fori_loop(0, trips_ref[0], step, x_ref[...])
+
+            if both:
+                walk()
+            else:
+                pl.when(lax.axis_index("wg") == 0)(walk)
+
+        launch = plgpu.kernel(body, out_type=row, num_threads=2, thread_name="wg")
+        traced = jax.make_jaxpr(emission.costed(launch, Stated(steps=steps, bytes_accessed=0)))(trips, row)
+        (kernel,) = [equation for equation in programs.equations(traced.jaxpr)
+                     if "cost_estimate" in equation.params]
+        warps = emission.warps_of(kernel)
+        work = emission.work_of(kernel)
+        assert warps is not None and work is not None
+        return warps, cost.latency_bound(work, rates, target, held=warps)
+
+    one, alone = priced(both=False, steps=64)
+    both, twice = priced(both=True, steps=128)
+    split, halved = priced(both=True, steps=64)
+    assert (one, both, split) == (4, 8, 8), (one, both, split)
+    # Each warpgroup's work outside its walk (a guard's cast) shares its program's warps, so the bounds
+    # differ by it; their steps' chains order them (the exact arithmetic, `test_a_walk_issuing_one_warp_*`).
+    assert halved < twice and halved < alone, (alone, twice, halved)
+
+
+def test_a_launch_states_the_residency_its_plan_compiled_it_for():
+    """A Mosaic GPU launch compiled for two programs a multiprocessor (`mosaic.compiler_params(resident=2)`,
+    its `min_blocks_per_sm`) states it (`emission.resident_of`), and a program's launches price at it by
+    default (`emission.launches_seconds`): a grid of two programs a GH200 multiprocessor, issue-bound, prices
+    as one wave of two, apart from two waves of one; one compiled for none states one (row 4123: the KDA
+    recurrence's launches priced at one resident where their plans ran two, M-FS-73b's join median 0.65
+    against 0.78 at their plans')."""
+    from dew.nn.kernels.templates import mosaic as mosaic_templates
+
+    target = generation.gpu_target("NVIDIA GH200 480GB")
+    assert target.multiprocessors is not None
+    row = jax.ShapeDtypeStruct((128,), jnp.float32)
+
+    def doubled(x_ref, o_ref):
+        o_ref[...] = lax.fori_loop(0, 64, lambda index, value: value * 2.0 + 1.0, x_ref[...])
+
+    def launched(params):
+        launch = plgpu.kernel(doubled, out_type=row, grid=(2 * target.multiprocessors,), grid_names=("p",),
+                              num_threads=1, thread_name="wg", compiler_params=params)
+        counted = emission.costed(launch, Stated(steps=0, bytes_accessed=0))
+        traced = jax.make_jaxpr(counted)(row).jaxpr
+        (kernel,) = [equation for equation in programs.equations(traced)
+                     if "cost_estimate" in equation.params]
+        return traced, kernel
+
+    traced, kernel = launched(mosaic_templates.compiler_params(resident=2))
+    assert emission.resident_of(kernel) == 2
+    work = emission.work_of(kernel)
+    assert work is not None
+
+    def at(resident: int) -> float:
+        return cost.launch_seconds(work, emission.launch_programs(kernel), target, resident=resident,
+                                   warps=emission.warps_of(kernel) or 0.0)
+
+    assert emission.launches_seconds(traced, target) == at(2) != at(1), (at(1), at(2))
+    assert emission.resident_of(launched(None)[1]) == 1
+
+
+def test_a_programs_launches_price_in_sequence_and_an_uncounted_one_leaves_it_unknown():
+    """A program of two costed launches (`emission.launches_seconds`) prices each at its own launch's seconds
+    (`cost.launch_seconds` of its work, programs and warps), their sum, through a call alike; one launch its
+    emission does not count, or launches under a scan (the review of lane/toolkit 61dd3c7d2), leave the
+    program's price unknown, never 0."""
+    target = generation.gpu_target("NVIDIA GH200 480GB")
+    row = jax.ShapeDtypeStruct((128,), jnp.float32)
+
+    def doubled(x_ref, o_ref):
+        o_ref[...] = lax.fori_loop(0, 8, lambda index, value: value * 2.0, x_ref[...])
+
+    launch = plgpu.kernel(doubled, out_type=row, num_threads=1, thread_name="wg")
+    counted = emission.costed(launch, Stated(steps=8, bytes_accessed=1024))
+    traced = jax.make_jaxpr(lambda x: counted(counted(x)))(row).jaxpr
+    kernels = [equation for equation in programs.equations(traced) if "cost_estimate" in equation.params]
+    each = [cost.launch_seconds(emission.work_of(kernel), emission.launch_programs(kernel), target,
+                                warps=emission.warps_of(kernel) or 0.0) for kernel in kernels]
+    assert len(kernels) == 2 and emission.launches_seconds(traced, target) == each[0] + each[1], each
+    def halved(x_ref, o_ref):
+        o_ref[...] = x_ref[...] * 0.5
+
+    # A launch of a body no costed launch traced (one that did answers with its count, `work_of`).
+    alone = plgpu.kernel(halved, out_type=row, num_threads=1, thread_name="wg")
+    uncounted = jax.make_jaxpr(lambda x: alone(counted(x)))(row).jaxpr
+    assert emission.launches_seconds(uncounted, target) is None
+    # Through a call, priced as its launches; under a scan, whose trips no sequence states, unknown.
+    called = jax.make_jaxpr(jax.jit(lambda x: counted(counted(x))))(row).jaxpr
+    assert emission.launches_seconds(called, target) == each[0] + each[1]
+    scanned = jax.make_jaxpr(lambda x: lax.scan(lambda carry, _: (counted(carry), None), x, None,
+                                                length=4)[0])(row).jaxpr
+    assert emission.launches_seconds(scanned, target) is None
+
+
+@pytest.mark.parametrize(("generation_name", "lanes"), [("sm80", 64), ("sm86", 128), ("sm89", 128),
+                                                        ("sm90", 128), ("sm100", 128), ("sm120", 128)])
+def test_an_fp32_instruction_takes_a_lane_a_clock_a_fused_pair_one(generation_name, lanes):
+    """A CUDA multiprocessor's fp32 lanes each run one instruction a clock, an FFMA's two FLOPs or a lone
+    add's, maximum's or select's one (`Architecture.vector_per_clock` its lanes' FLOPs, two a lane): 1024
+    lone operations take 1024 lane-clocks, and 1024 multiplies with their 1024 fused adds the same, where the
+    lanes' FLOP rate priced the lone ones at half (M-FS-70: the KDA intra launch's FMNMX, a quarter of its
+    instructions, none fused)."""
+    target = generation.gpu_target(generation_name)
+    rates = cost.rates(target, device=False)
+    alone = cost.units(Work(operations=1024), rates)[0][1]
+    paired = cost.units(Work(operations=1024, fused_multiply_adds=1024), rates)[0][1]
+    assert alone == paired == 1024 / (lanes * target.loaded_clock_hz), (alone, paired)
+
+
+def test_a_tpus_vector_units_take_a_fused_pairs_add_as_an_operation_of_its_own():
+    """A TPU's VPU rate is calibrated at two operations a multiply-add (`generation._TPUS`), so a pair's add
+    (`Work.fused_multiply_adds`) is an operation there beside its multiply, where a CUDA multiprocessor's
+    lanes run it within the multiply's FFMA (the review of lane/toolkit 5cbbe66c586, P1)."""
+    rates = cost.rates(generation.TARGETS["v5e"], device=False)
+    paired = cost.units(Work(operations=1024, fused_multiply_adds=1024), rates)[0][1]
+    assert paired == 2048 / rates.cuda, paired
+
+
+def _multiply_add_or_adds(row, index):
+    """A conditional its data decides: a multiply-add an element, or two lone adds an element."""
+    return lax.switch(index, [lambda row: row * row + row, lambda row: row + row + row], row)
+
+
+def test_a_tpu_counts_a_bodys_multiply_adds_as_its_vector_units_run_them():
+    """A TPU's VPU runs a multiply and its add as two operations (`generation._TPUS`' calibration), so its
+    count fuses none: a conditional of 128 multiply-adds or 256 lone adds keeps 256 operations, where a
+    fused branch's credit beside the other's adds priced 384 (the review of lane/toolkit c9307c11146, P1)."""
+    with generation.assumed("v5e"):
+        fixed = _emitted(_multiply_add_or_adds, _ROW, jax.ShapeDtypeStruct((), jnp.int32)).roles[0].fixed
+    assert (fixed.operations, fixed.fused_multiply_adds) == (256, 0), fixed
+
+
+def _issued_branches(*branches) -> float:
+    """The issue slots of a conditional its data decides among `branches`, each of a row and 64 integers."""
+    def branched(row, bits, index):
+        return lax.switch(index, list(branches), row, bits)
+
+    return cost.issued(_emitted(branched, _ROW, jax.ShapeDtypeStruct((64,), jnp.int32),
+                                jax.ShapeDtypeStruct((), jnp.int32)).roles[0].fixed)
+
+
+def test_an_unknown_branch_takes_the_issue_slots_its_costliest_branch_does():
+    """A conditional its data decides, one branch 128 fp32 adds, the other 64 integer xors, issues one
+    branch's instructions: the costlier's slots, as a conditional of that branch beside one doing nothing,
+    where its units' most taken unit by unit counted both mixes (the review of lane/toolkit c9307c11146,
+    P2)."""
+    added, xored, kept = (lambda row, bits: (row + row, bits)), (lambda row, bits: (row, bits ^ bits)), (
+        lambda row, bits: (row, bits))
+    both = _issued_branches(added, xored)
+    assert both == max(_issued_branches(added, kept), _issued_branches(kept, xored)), both
+
+
+def test_an_unknown_branch_prices_the_most_lane_instructions_any_branch_issues():
+    """A conditional its data decides, one branch 128 multiply-adds an FFMA each, the other 256 lone adds:
+    its lanes run the costlier's 256 instructions, which a credit for the first's pairs, taken unit by unit
+    over the branches' most, would cut to 128 (the review of lane/toolkit 5cbbe66c586, P1)."""
+    fixed = _emitted(_multiply_add_or_adds, _ROW, jax.ShapeDtypeStruct((), jnp.int32)).roles[0].fixed
+    rates = cost.rates(generation.gpu_target("sm90"), device=False)
+    assert cost.units(fixed, rates)[0][1] == 256 / rates.cuda, fixed
+
+
+def test_a_multiprocessor_issues_four_warps_instructions_a_clock_whichever_units_run_them():
+    """An H100's four warp schedulers each issue one instruction a clock (CUDA C++ Programming Guide §16.8.1),
+    128 threads' a clock: 1024 fp32 operations beside 512 integer ones take 1536 threads' issue slots, 12
+    clocks, where each unit alone takes 8 (the lanes' 128 a clock, the ALU's 64); the whole device's schedule
+    (XLA's fusion, its units in series) holds no issue slot of its own."""
+    target = generation.gpu_target("sm90")
+    work = Work(operations=1024, integer_operations=512)
+    seconds = cost.units(work, cost.rates(target, device=False))[0]
+    assert max(seconds) == 1536 / (128 * target.loaded_clock_hz), seconds
+    device = sum(cost.units(work, cost.rates(target, device=True))[0])
+    per_device = target.loaded_clock_hz * target.multiprocessors
+    assert device == 1024 / (128 * per_device) + 512 / (64 * per_device), device
 
 
 @pytest.mark.parametrize("generation_name", ["sm75", "sm80", "sm86", "sm89", "sm90", "sm100", "sm120"])
@@ -858,3 +1471,44 @@ def test_launch_seconds_shares_sm_units_overlaps_paths_and_prices_integer_work()
     got_path_r1 = cost.launch_seconds(path_work, 176, target, resident=1)
     got_path_r2 = cost.launch_seconds(path_work, 176, target, resident=2)
     assert got_path_r2 < got_path_r1, (got_path_r2, got_path_r1)
+
+
+@pytest.mark.parametrize("memory", ["global", "shared"])
+def test_an_atomic_add_counts_its_bytes_reduced_where_global_and_an_a100_prices_them(memory):
+    """A launch of `SMs + 1` programs, each adding a 64 x 64 fp32 tile into memory an element at a time
+    (`plgpu.atomic_add`): into global memory (`red.global`) the launch counts every program's 16 KiB among its
+    global reductions (`Work.global_reductions`), which an A100 prices at its fitted 3 bytes a multiprocessor
+    a clock (M-NA-9), two programs' worth on its busiest multiprocessor whatever their residency, and an H100
+    leaves unpriced; into shared memory (`red.shared::cta`) none, its bytes shared ones."""
+    ampere, hopper = generation.gpu_target("sm80"), generation.gpu_target("sm90")
+    assert ampere.multiprocessors is not None
+    launched = ampere.multiprocessors + 1
+    tile = jax.ShapeDtypeStruct((64, 64), jnp.float32)
+
+    def body(x_ref, o_ref):
+        if memory == "global":
+            plgpu.atomic_add(o_ref, x_ref[...])
+        else:
+            def scoped(smem):
+                plgpu.atomic_add(smem, x_ref[...])
+                o_ref[...] = smem[...]
+
+            pl.run_scoped(scoped, plgpu.SMEM((64, 64), jnp.float32))
+
+    launch = plgpu.kernel(body, out_type=tile, grid=(launched,), grid_names=("programs",))
+    traced = jax.make_jaxpr(emission.costed(launch, Stated(steps=0, bytes_accessed=0)))(tile)
+    (kernel,) = [equation for equation in programs.equations(traced.jaxpr)
+                 if "cost_estimate" in equation.params]
+    work = emission.work_of(kernel)
+    if memory == "shared":
+        assert work.global_reductions == 0 and work.shared_bytes == launched * 64 * 64 * 4
+        return
+    assert work.global_reductions == launched * 64 * 64 * 4
+    reductions = cost.rates(ampere, device=False).reductions
+    assert reductions == 3.0 * ampere.loaded_clock_hz
+    busiest = 2 * ((work.global_reductions / launched) / reductions) + (ampere.launch_seconds or 0.0)
+    for resident in (1, 2):
+        priced = cost.launch_seconds(work, launched, ampere, resident=resident)
+        assert priced == busiest, (resident, priced, busiest)
+    assert cost.rates(hopper, device=False).reductions is None
+    assert work.global_reductions in cost.units(work, cost.rates(hopper, device=False))[1]

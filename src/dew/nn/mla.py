@@ -41,7 +41,7 @@ from dew.nn.inputs import (
     counted_places,
     document_reach,
 )
-from dew.nn.inspection import QK
+from dew.nn.inspection import INDEXER_COLLECTION, QK
 from dew.nn.kv_cache import (
     CURSOR,
     KVCache,
@@ -118,10 +118,6 @@ def open_latent_cache(module: nn.Module, store: KVSpec, index: Opened | None, ke
 INDEXER = 'indexer'
 """The indexer's name under its attention layer, which the parameter paths
 of the indexer's weights carry and nothing else in the tree does."""
-
-INDEXER_COLLECTION = 'indexer'
-"""The collection an attention layer sows its per-query indexer KL under
-when a caller opens it, as the LM objective does to train the indexer."""
 
 SELECTIONS = 'selections'
 """The collection a lightning indexer sows what it selects by under when a caller opens it, as a

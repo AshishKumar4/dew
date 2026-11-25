@@ -22,9 +22,9 @@ import json
 import math
 import re
 import typing
-from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from numbers import Real
-from typing import TYPE_CHECKING, overload
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -535,20 +535,6 @@ def earlier_described_fields(value: JSON) -> JSON:
                 else planned(entry) for key, entry in kept(step).items()}
 
     return planned(value)
-
-
-@overload
-def without_fields(value: dict[str, JSON], names: Collection[str]) -> dict[str, JSON]: ...
-@overload
-def without_fields(value: JSON, names: Collection[str]) -> JSON: ...
-def without_fields(value: JSON, names: Collection[str]) -> JSON:
-    """`value` without a field of `names` in any record it nests, a list's records among them; a record
-    stays the record it is."""
-    if isinstance(value, list):
-        return [without_fields(part, names) for part in value]
-    if isinstance(value, dict):
-        return {key: without_fields(part, names) for key, part in value.items() if key not in names}
-    return value
 
 
 def annotations_of(owner: type, **options) -> Mapping[str, object]:
