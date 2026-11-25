@@ -2138,7 +2138,7 @@ def _states(k, w, u, prefix: tuple, beta, h0, sequences, taken, call: Call, tile
                 corrected = algebra.corrected(tile, weights, state, held.dtype, issue)
             else:
                 # A decay a key dimension's prefetch its prefix's alone (`_prefetched_ends`).
-                betas = family.rows_of(beta_ref.at[h, span]) if call.per_key else loaded[2]
+                betas = family.rows_of(beta_ref.at[h, span]) if call.per_key or loaded is None else loaded[2]
                 written = algebra.weighted("apply_u", None, tile, betas, issue)
                 corrected = algebra.corrected(written, None, state, held.dtype, issue)
             before_store()
