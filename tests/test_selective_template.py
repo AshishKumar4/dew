@@ -631,6 +631,45 @@ def test_the_backward_holds_its_registers_at_the_residency_it_launches(packed):
     assert [kernel for kernel in record['kernels'] if 'selective_scan_backward' in kernel['kernel']], record
 
 
+@COMPILES_ON_CPU
+@lowers('sm80')
+def test_a_forked_backwards_compiled_shared_memory_is_its_described_scratch():
+    """The selective scan's forked backward compiled for an A100 (`kernel_compile`) at 16 tokens a thread, a
+    block of 2,048: the shared memory its launch asks for is its described scratch's
+    (`selective.backward_scratch`, which `Selective.staged_bytes` prices), so its allocation and its block's
+    geometry cannot drift from the planner's (row 6131; the review of lane/toolkit 57aba49e3)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    from dew.nn.kernels.templates import resources
+
+    forked = FORKED["shared and chained"]
+    rows, length, channels, states = 2, 4096, 256, 16
+    operands = (jax.ShapeDtypeStruct((rows, length, channels), jnp.bfloat16),) * 2 + (
+        jax.ShapeDtypeStruct((channels, states), jnp.float32),
+        *(jax.ShapeDtypeStruct((rows, length, states), jnp.bfloat16),) * 2,
+        jax.ShapeDtypeStruct((channels,), jnp.float32),
+        # The table's one given state a row (`FORKED`'s), as the forked exactness test gives it.
+        jax.ShapeDtypeStruct((rows, 1, channels, states), jnp.float32))
+    family = bundles.of("sm80", jnp.bfloat16)
+
+    def call():
+        def trained(*given):
+            def scanned(*operands):
+                return selective.selective_scan(*operands, family=family, plan=(16, 2), forked=forked)[0]
+
+            out, pull = jax.vjp(scanned, *given)
+            return pull(out)
+
+        return trained, operands
+
+    (record,) = compile_mosaic_kernels([KernelCase('selective forked backward', call)], 'sm80')
+    assert not mosaic_failures([record]), mosaic_failures([record])
+    (backward,) = [kernel for kernel in record['kernels'] if 'selective_scan_backward' in kernel['kernel']]
+    scratch = selective.backward_scratch(states, selective.block_positions(length, 16), forked=True)
+    assert backward['shared'] == resources.shared_bytes(family, resources.Scope(program=scratch)), backward
+
+
 @lowers('sm90')
 def test_a_launchs_backward_kernel_carries_its_launch():
     """The selective scan's training step lowered for an H100 (`kernel_compile.lowered_for`): its backward
