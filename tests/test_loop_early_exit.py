@@ -13,7 +13,15 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from jax.extend import core as jex_core
-from model_support import TINY_DECODER, attending, decode_steps, model_draw, stacked, with_logit_cotangent
+from model_support import (
+    TINY_DECODER,
+    attending,
+    decode_steps,
+    method_run,
+    model_draw,
+    stacked,
+    with_logit_cotangent,
+)
 from reference_error import assert_as_exact, with_gradients
 
 from dew.interop.hf_decoders import translate_config
@@ -102,11 +110,9 @@ def test_a_row_exits_whole_at_its_threshold_and_its_coda_runs_once():
     looped = _rows_exiting()
     draw = _gated(model_draw(looped, (8, 12), looped.vocab_size), looped.emb_features, 0xE91)
 
-    def unrolled(model):
-        return jax.jit(lambda variables, ids: model.apply(variables, ids, method=_rows_by_hand))
-
-    assert_as_exact(jax.jit(looped.apply), unrolled(looped), draw, "rows exiting at the block",
-                    seeds=SEEDS["rows"], truth_fn=unrolled(looped.clone(dtype=jnp.float64)))
+    assert_as_exact(jax.jit(looped.apply), method_run(looped, _rows_by_hand), draw,
+                    "rows exiting at the block", seeds=SEEDS["rows"],
+                    truth_fn=method_run(looped.clone(dtype=jnp.float64), _rows_by_hand))
 
 
 def _conds(closed) -> list:
@@ -440,11 +446,10 @@ def test_a_loops_parts_carry_their_providers_publications(looped):
     model = looped()
     draw = model_draw(model, (2, 12), model.vocab_size)
 
-    def unrolled(module):
-        return jax.jit(lambda variables, ids: module.apply(variables, ids, method=_sharing_by_hand))
     scanned = stacked(scanned=True)(jax.jit(model.apply))
-    assert_as_exact(scanned, unrolled(model), draw, "a loop's parts' publications",
-                    seeds=SEEDS["sharing parts"], truth_fn=unrolled(model.clone(dtype=jnp.float64)))
+    assert_as_exact(scanned, method_run(model, _sharing_by_hand), draw, "a loop's parts' publications",
+                    seeds=SEEDS["sharing parts"],
+                    truth_fn=method_run(model.clone(dtype=jnp.float64), _sharing_by_hand))
 
 
 @attending("reference")

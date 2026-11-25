@@ -24,6 +24,7 @@ from model_support import (
     attending,
     compiled_apply,
     decode_steps,
+    method_run,
     model_draw,
     unrolled as layer_at_a_time,
     with_logit_cotangent,
@@ -761,11 +762,9 @@ def test_a_loop_exits_each_token_at_its_threshold_through_each_passs_coda():
     looped = _exiting()
     draw = _with_gate(model_draw(looped, (8, 16), looped.vocab_size), looped.emb_features, 0xE81)
 
-    def unrolled(model):
-        return jax.jit(lambda variables, ids: model.apply(variables, ids, method=_passes_exiting))
-
-    assert_as_exact(jax.jit(looped.apply), unrolled(looped), draw, "a loop exiting at its threshold",
-                    seeds=EXITING_SEEDS["forward"], truth_fn=unrolled(looped.clone(dtype=jnp.float64)))
+    assert_as_exact(jax.jit(looped.apply), method_run(looped, _passes_exiting), draw,
+                    "a loop exiting at its threshold", seeds=EXITING_SEEDS["forward"],
+                    truth_fn=method_run(looped.clone(dtype=jnp.float64), _passes_exiting))
 
 
 @attending("reference")

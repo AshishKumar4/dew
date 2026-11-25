@@ -426,18 +426,19 @@ def run_loop(model, x, *, train: bool, decode: bool, passes=None, **inputs):
     if loop.exit_gate and loop.exit_at == "block":
         # The last pass's gate reads its block output as every earlier pass's does (`gate_logit`).
         _final_gate(model, model.exit_states(x), valid)
-    chosen = loop.exit_threshold is not None and not model.is_mutable_collection(EXITS)
-    if chosen and loop.exit_at == "block":
+    # A collecting call runs every pass, whatever its threshold.
+    threshold = None if model.is_mutable_collection(EXITS) else loop.exit_threshold
+    if threshold is not None and loop.exit_at == "block":
         # A gate on the block's output: each row's exiting pass's block output, the coda run once on them.
-        x = _handed_on(model, exited, x, loop.exit_threshold)
+        x = _handed_on(model, exited, x, threshold)
     if end < layers:
         x = model.stack(x, span=(end, layers), train=train, decode=decode,
                         kv_store=None if left is None else dict(left), **inputs)
     if loop.exit_gate and loop.exit_at == "coda":
         _final_gate(model, model.exit_states(x), valid)
-    if not chosen or loop.exit_at == "block":
+    if threshold is None or loop.exit_at == "block":
         return x
-    return _handed_on(model, exited, x, loop.exit_threshold)
+    return _handed_on(model, exited, x, threshold)
 
 
 def _final_gate(model, states: jax.Array, valid: jax.Array | None) -> None:
@@ -702,13 +703,17 @@ class _Passes:
         scoring each pass runs over the rows still looping alone (`compacted`, row 12927); a cached call's
         rows keep their exiting passes' cache writes (`_kept_exits`, row 12928)."""
         model, loop = self.model, self.loop
+        threshold = loop.exit_threshold
+        assert threshold is not None, "a loop stops at its threshold (`stops`)"
         _, end = self.span
         real = jnp.ones(x.shape[:2], bool) if self.valid is None else self.valid.astype(bool)
         caches = [self.block_cache(model)] if self.decode else []
         selected, output, gated = self.exit_of(model, x, 0, stop=False)
-        logits = [self.sown(model, output, gated)]
-        self.exited.append((selected, logits[0]))
-        exited = reached(logits, loop.exit_threshold)
+        first = self.sown(model, output, gated)
+        assert first is not None, "a loop stopping at its threshold gates its exits"
+        logits = [first]
+        self.exited.append((selected, first))
+        exited = reached(logits, threshold)
         normed_output = end == model.num_layers and model.normed_output
         for step in range(1, loop.steps):
             done = jnp.all(exited | ~real)
@@ -721,15 +726,15 @@ class _Passes:
             if step == loop.steps - 1:
                 break
             held = (jnp.zeros_like(selected), None if output is None else jnp.zeros_like(output),
-                    jnp.full(logits[0].shape, NEVER_EXITS, logits[0].dtype))
+                    jnp.full(first.shape, NEVER_EXITS, first.dtype))
             selected, output, logit = _sown_switch(
                 (~done).astype(jnp.int32), (lambda module, x, held=held: held,
                                             functools.partial(self.stopped_exit, step=step)), model, x)
             self.exited.append((selected, logit))
             logits.append(logit)
-            exited = exited | reached(logits, loop.exit_threshold)
+            exited = exited | reached(logits, threshold)
         if self.decode:
-            self._kept_exits(model, caches, logits)
+            self._kept_exits(model, caches, logits, threshold)
         return x, bank
 
     def held_pass(self, module, carry):
@@ -775,12 +780,12 @@ class _Passes:
         return {name: value for name, value in module.variables.get('cache', {}).items()
                 if (run := group_layers(name)) is not None and first <= run.start and run.stop <= end}
 
-    def _kept_exits(self, module, caches: list[dict], logits) -> None:
+    def _kept_exits(self, module, caches: list[dict], logits, threshold: float) -> None:
         """Each row's cache entries of the block as its exiting pass left them (`exit_choice`, one pass a
         row under `exit_by='row'`), of `caches`, each pass's (`block_cache`): a later call's tokens read each
         earlier row's exiting pass's keys, values and states. An entry holding no row axis (a pool of pages)
         keeps no row's pass, and is refused."""
-        choice = exit_choice(logits, self.loop.exit_threshold)[:, 0]
+        choice = exit_choice(logits, threshold)[:, 0]
         batch = choice.shape[0]
 
         def kept(axis: int, *passes):
