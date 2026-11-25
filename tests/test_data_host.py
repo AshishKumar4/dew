@@ -85,6 +85,23 @@ def test_a_v1_memory_controllers_limit_bounds_automatic_loading_by_what_its_work
     assert Host.current(tmp_path, membership).memory == 2**30 - int(0.9 * 2**30) + 2**28
 
 
+def test_a_groups_cache_read_past_its_sampled_charge_leaves_no_more_than_its_limit(tmp_path):
+    """A group's charge and its cache are read one after the other, and v1's charge is approximate: cache
+    grown past the charge read before it holds nothing, so the group leaves no more than its limit, as
+    cAdvisor counts a working set, where the working set read negative left room past the limit (row
+    13035)."""
+    from dew.data.dataset import Host
+
+    membership = tmp_path / "cgroup"
+    membership.write_text("5:memory:/job\n")
+    job = tmp_path / "memory/job"
+    job.mkdir(parents=True)
+    (job / "memory.limit_in_bytes").write_text(f"{2**20}\n")
+    (job / "memory.usage_in_bytes").write_text(f"{2**19}\n")
+    (job / "memory.stat").write_text(f"total_inactive_file {2**20}\n")
+    assert Host.current(tmp_path, membership).memory == 2**20
+
+
 def test_a_process_reads_its_cgroups_limits_through_the_reader_a_tool_loads_before_dew(tmp_path):
     """The cgroup reader Dew's loading sizes by is the one a tool loads by its path before Dew is
     importable, as CI's host keys do (row 4161): in a fresh interpreter that imports none of Dew, it
