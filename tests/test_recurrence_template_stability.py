@@ -222,7 +222,10 @@ def the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime,
     with under(forms):
         if not runs(dew, hooks, operands, drawn, product):
             pytest.skip(f"the template refuses {name}'s {product}: a refusal, not numerical coverage")
-        label = f'the template, {name} under {regime}, its {product}'
+        # Each of a form's forms its own sites (`CASES`): one label for two put the second's compiled truths
+        # in the first's store (train 1278, `[template stability: rated]`).
+        under_forms = '' if forms is None else f' ({forms} forms)'
+        label = f'the template, {name} under {regime}, its {product}{under_forms}'
         # The finite draws and the distance against the portable math run the case's programs outside its
         # sites: a GPU tier's prepare, whose device runs none, reaches its sites past them, its run checking
         # them.
