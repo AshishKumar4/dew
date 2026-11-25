@@ -354,30 +354,27 @@ class RemoteCache:
                     self._moved_on()
                 written = list(self.written.get(file, []))
                 used = self.used.get(file, set())
-                fetched = [key for key in self.fetched.get(file, []) if file in self.blind or key in used]
+                every = self.fetched.get(file, [])
+                loaded = [key for key in every if key in used]
+                # A run that loaded under half of what it fetched ran a part of its file's tests (a test
+                # node's row, a `-k`, a recycled row's later process, a site's map): it keeps what it did not
+                # load, which the rest of its file's tests load. Pruned so, each part rewrote the bundle the
+                # next part's run had to compile again and rewrite (2026-11-24: one file's bundle written
+                # 7,459 times in a day, as often as it was read). A whole run prunes what it did not load.
+                keeps = file in self.blind or 2 * len(loaded) < len(every)
+                fetched = every if keeps else loaded
                 self.sealed.add(file)
                 # What it keeps: the fetched programs its run loaded (a recut group's, borrowed from its
                 # file's other cuts, `_siblings`, written under its own cut once), and those it compiled.
                 wanted = {*written, *fetched}
                 if not wanted or wanted == self.queued.get(file) or wanted == self.held.get(file):
                     return
-            chunks: list[list[tuple[str, bytes]]] = [[]]
-            size = 0
-            for key in dict.fromkeys([*fetched, *written]):
-                path = self.directory / f"{key}{SUFFIX}"
-                if not path.exists():
-                    continue
-                cost = HEADER.size + len(key.encode()) + path.stat().st_size
-                if cost > MAX_BYTES:  # a program past the bound goes without; the rest may fit
-                    continue
-                if size + cost > MAX_BYTES:
-                    if len(chunks) == CHUNKS:
-                        continue
-                    chunks.append([])
-                    size = 0
-                value = path.read_bytes()
-                size += HEADER.size + len(key.encode()) + len(value)
-                chunks[-1].append((key, value))
+            chunks, dropped = self._chunks([*fetched, *written])
+            # A kept bundle that leaves no room for what its run compiled drops what the run did not load.
+            if keeps and dropped & set(written):
+                fetched = loaded
+                wanted = {*written, *fetched}
+                chunks, _ = self._chunks([*fetched, *written])
         except UNREACHABLE as error:
             self._failed(error)
             return
@@ -396,6 +393,30 @@ class RemoteCache:
         # The chunks it held past those it now fills, deleted, so the next fetch ends where this bundle does.
         for index in range(len(chunks), len(held)):
             self.uploads.put((self._chunk(file, index), None))
+
+    def _chunks(self, keys: list[str]) -> tuple[list[list[tuple[str, bytes]]], set[str]]:
+        """`keys`' programs of the directory in chunks of at most `MAX_BYTES` (`CHUNKS` of them), in order,
+        and those past the bound that went without."""
+        chunks: list[list[tuple[str, bytes]]] = [[]]
+        size, dropped = 0, set()
+        for key in dict.fromkeys(keys):
+            path = self.directory / f"{key}{SUFFIX}"
+            if not path.exists():
+                continue
+            cost = HEADER.size + len(key.encode()) + path.stat().st_size
+            if cost > MAX_BYTES:  # a program past the bound goes without; the rest may fit
+                dropped.add(key)
+                continue
+            if size + cost > MAX_BYTES:
+                if len(chunks) == CHUNKS:
+                    dropped.add(key)
+                    continue
+                chunks.append([])
+                size = 0
+            value = path.read_bytes()
+            size += HEADER.size + len(key.encode()) + len(value)
+            chunks[-1].append((key, value))
+        return chunks, dropped
 
     def _uploading(self) -> None:
         while True:

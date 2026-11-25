@@ -525,6 +525,32 @@ def test_a_bundle_keeps_what_its_run_loaded_or_compiled_and_drops_the_chunks_it_
     assert programs(tmp_path / "again") == {"jit_a-1": b"a" * 600}
 
 
+def test_a_run_of_part_of_a_files_tests_keeps_its_bundle_whole_and_writes_nothing_it_did_not_compile(
+        cache_worker, tmp_path):
+    """A run that loads under half of what its file's bundle holds (a part of the file's tests: a test node's
+    row, a `-k`) keeps the bundle whole and, compiling nothing, writes nothing: pruned to its part, the next
+    part's run compiled the rest again and rewrote it, each part's in turn (2026-11-24: one bundle written
+    7,459 times in a day). One that compiles a program keeps every fetched one beside it."""
+    url, stored, _ = cache_worker
+    bundle = "/jax/cpu/bundles/tests/part.py"
+    stored[bundle] = remote_cache.packed([(f"jit_{name}-1", name.encode()) for name in "abcd"])
+    part = remote_cache.RemoteCache(tmp_path / "part", url, "token", "jax/cpu")
+    part.opened("tests/part.py")
+    loaded(tmp_path / "part", "jit_a-1")
+    held = stored[bundle]
+    part.closed("tests/part.py")
+    part.drain()
+    assert stored[bundle] is held  # never written: a write replaces the stored body with its own
+    grown = remote_cache.RemoteCache(tmp_path / "grown", url, "token", "jax/cpu")
+    grown.opened("tests/part.py")
+    loaded(tmp_path / "grown", "jit_b-1")
+    compiled(tmp_path / "grown", "jit_e-1")
+    grown.closed("tests/part.py")
+    grown.drain()
+    kept = {key for key, _ in remote_cache.unpacked(stored[bundle])[0]}
+    assert kept == {f"jit_{name}-1" for name in "abcde"}
+
+
 def test_a_bundle_that_runs_again_after_another_keeps_what_it_loaded_in_each_stint(cache_worker, tmp_path):
     """A file's bundle closed, another's run, then the first's again (A, B, A): a fetched program the first
     loads only in its second stint stays in its bundle with the one it loaded in its first (review,
