@@ -1302,18 +1302,20 @@ def _splash_portable(
 
     del dq_mask_info, dkv_mask_info
     wide = jnp.promote_types(q.dtype, jnp.float32)
+    # The scores' product on the operands' own dtype into fp32 sums, the value product's in fp32.
     products = Products(
         programs.mosaic_tpu_dot_precision(q.dtype, k.dtype, blocks.block_q, q.shape[-1],
                                           blocks.block_kv_compute),
         programs.mosaic_tpu_dot_precision(jnp.float32, jnp.float32, blocks.block_q, blocks.block_kv_compute,
-                                          v.shape[-1]))
+                                          v.shape[-1]),
+        logits=wide, weighted=wide)
     visited, entry = _splash_mask(fwd_mask_info, segment_ids, q_seq_len=q.shape[1], kv_seq_len=k.shape[1],
                                   blocks=blocks, call=call)
     out = reference_attention(
-        jnp.swapaxes(q, 0, 1)[None], jnp.swapaxes(k, 0, 1)[None], jnp.swapaxes(v, 0, 1).astype(wide)[None],
+        jnp.swapaxes(q, 0, 1)[None], jnp.swapaxes(k, 0, 1)[None], jnp.swapaxes(v, 0, 1)[None],
         mask=entry, sinks=None if sinks is None else sinks.astype(wide), softcap=call.attn_logits_soft_cap,
         precision=products, mask_fill=call.mask_value, query_scale=1.0,
-        logit_floor=call.mask_value if sinks is None else None,
+        logit_floor=call.mask_value if sinks is None else -jnp.inf,
         skipped=None if visited is None else jnp.logical_not(visited[:, ::blocks.block_q, :]))
     return jnp.swapaxes(out[0], 0, 1).astype(q.dtype)
 

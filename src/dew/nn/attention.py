@@ -21,6 +21,7 @@ import jax.numpy as jnp
 import tokamax
 from flax.linen.dtypes import promote_dtype
 from jax.ad_checkpoint import checkpoint_name
+from jax.typing import DTypeLike
 
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent, with_tangents_formed_at
 from dew.nn.programs import own_preset
@@ -492,11 +493,16 @@ def weighted_values(equation, weights, value, *, precision=None) -> jax.Array:
 
 
 class Products(NamedTuple):
-    """`reference_attention`'s precision for its two products apart: the logits' (`scores`) and the value
-    product's (`values`), as a kernel's portable rule states each (Splash's, `_splash_portable`)."""
+    """`reference_attention`'s two products apart, as a kernel's portable rule states each (Splash's,
+    `_splash_portable`): the logits' precision (`scores`), their sums' dtype where it names one (`logits`:
+    the query's and key's own operands, fp32 sums), the value product's precision (`values`), and its dtype
+    where it names one (`weighted`: the weights unrounded and the values widened to it, the query and key
+    left in theirs)."""
 
-    scores: object
-    values: object
+    scores: jax.lax.PrecisionLike
+    values: jax.lax.PrecisionLike
+    logits: DTypeLike | None = None
+    weighted: DTypeLike | None = None
 
 
 def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, softcap=None, dtype=None,
@@ -547,14 +553,18 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
     block's products read, so a skipped key's non-finite value or tangent never forms `0 * NaN` (row
     2654), a row of no weight left 0; and `precision` its two products' apart (`Products`).
     """
-    scores_precision, values_precision = (precision if isinstance(precision, Products)
-                                          else (precision, precision))
-    query, key, value = promote_dtype(query, key, value, dtype=dtype)
+    products = precision if isinstance(precision, Products) else Products(precision, precision)
+    scores_precision, values_precision = products.scores, products.values
+    if products.weighted is None:
+        query, key, value = promote_dtype(query, key, value, dtype=dtype)
+    else:
+        (query, key), value = promote_dtype(query, key, dtype=dtype), value.astype(products.weighted)
     dtype = query.dtype
     *rows, length, heads, width = query.shape
     kv_heads, keys = key.shape[-2], key.shape[-3]
     grouped = kv_heads != heads and value.shape[-2] == kv_heads
-    if scale_logits and sinks is None and not dropout_rate and grouped and skipped is None:
+    if (scale_logits and sinks is None and not dropout_rate and grouped and skipped is None
+            and query_scale is None and logit_floor is None and products.weighted is None):
         attend = functools.partial(reference_attention, softcap=softcap, precision=precision,
                                    force_fp32_for_softmax=force_fp32_for_softmax, wide_logits=wide_logits,
                                    scale_logits=True, mask_fill=mask_fill)
@@ -569,7 +579,7 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
         scaled_query, scoring = query * jnp.asarray(query_scale, dtype), key
     # jax.nn's logits are its product's fp32 sums, never rounded to the operands' dtype, at the dot algorithm
     # it names (`_jax_nn_algorithm`).
-    formed = at_least_fp32(dtype) if scale_logits else None
+    formed = at_least_fp32(dtype) if scale_logits else products.logits
     algorithm = _jax_nn_algorithm(dtype, scores_precision) if scale_logits else None
 
     def logits_of(subscripts: str, lhs: jax.Array, rhs: jax.Array) -> jax.Array:
@@ -633,15 +643,18 @@ def _weights(logits: jax.Array, *, mask, mask_fill, skipped, sinks, logit_floor,
     if skipped is not None:
         rows_per_block = length // skipped.shape[-2]
         logits = jnp.where(jnp.repeat(skipped, rows_per_block, axis=-2), -jnp.inf, logits)
-    if sinks is not None:
-        if sinks.shape != (heads,):
-            raise ValueError(f"sinks must have one logit per query head, got {sinks.shape}")
+    walked = logit_floor is not None or skipped is not None
+    if sinks is not None and sinks.shape != (heads,):
+        raise ValueError(f"sinks must have one logit per query head, got {sinks.shape}")
+    if sinks is not None and not walked:
         widest = jnp.promote_types(logits.dtype, sinks.dtype)
         return sink_softmax(logits, sinks, at_least_fp32(widest) if wide else None)
-    if logit_floor is not None or skipped is not None:
-        # A row every key of which a walk skips weighs none (-inf its starting maximum where none is given).
-        weights = _floored_softmax(logits.astype(at_least_fp32(dtype)) if wide else logits,
-                                   -jnp.inf if logit_floor is None else logit_floor)
+    if walked:
+        # A walk's softmax: from its starting maximum (the floor, the sink beside it), a row of no weight
+        # none, never NaN, its sink's -inf and every key's (row 12848's review).
+        widest = jnp.promote_types(logits.dtype, sinks.dtype) if sinks is not None else logits.dtype
+        weights = _floored_softmax(logits.astype(at_least_fp32(widest)) if wide else logits,
+                                   -jnp.inf if logit_floor is None else logit_floor, sinks)
         return weights if wide else weights.astype(dtype)
     if wide and dtype != jnp.float32:
         return jax.nn.softmax(logits.astype(at_least_fp32(dtype)))
@@ -671,14 +684,21 @@ def _weighted(weights: jax.Array, value: jax.Array, *, skipped, sinks, precision
         *rows, length, heads, value.shape[-1])
 
 
-def _floored_softmax(logits: jax.Array, floor) -> jax.Array:
-    """The softmax of `logits` over the keys from a starting maximum `floor` (`reference_attention`'s
-    `logit_floor`): `m = max(m, floor)`, each weight `exp(logit - m)` over their sum, a row of no weight 0."""
+def _floored_softmax(logits: jax.Array, floor, sinks: jax.Array | None = None) -> jax.Array:
+    """The softmax of `logits` `[..., H, Q, K]` over the keys from a starting maximum `floor`
+    (`reference_attention`'s `logit_floor`) and each head's sink `[H]` beside them where given: `m = max(m,
+    floor, sink)`, each weight `exp(logit - m)` over their sum and the sink's `exp(sink - m)`, a row of no
+    weight 0, its maximum -inf shifting by none."""
     most = jnp.maximum(jnp.max(logits, axis=-1, initial=-jnp.inf), jnp.asarray(floor, logits.dtype))
+    sink = None if sinks is None else sinks.astype(logits.dtype)[:, None]
+    if sink is not None:
+        most = jnp.maximum(most, sink)
     shift = jnp.where(jnp.isfinite(most), most, 0.0)
     exponentials = jnp.exp(logits - shift[..., None])
-    total = jnp.sum(exponentials, axis=-1, keepdims=True)
-    return jnp.where(total > 0, exponentials / jnp.where(total > 0, total, 1.0), 0.0)
+    total = jnp.sum(exponentials, axis=-1)
+    if sink is not None:
+        total = total + jnp.where(jnp.isfinite(most), jnp.exp(sink - shift), 0.0)
+    return jnp.where(total[..., None] > 0, exponentials / jnp.where(total > 0, total, 1.0)[..., None], 0.0)
 
 
 def _by_query_block(product: Callable, operand: jax.Array, skipped: jax.Array, *, query_axis: int,
