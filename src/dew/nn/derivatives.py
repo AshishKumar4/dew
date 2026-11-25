@@ -24,6 +24,7 @@ Each lane moves its sites onto them (rows 4026 to 4030); then the slop check ref
 from __future__ import annotations
 
 import collections
+import contextvars
 import dataclasses
 import functools
 import inspect
@@ -31,7 +32,7 @@ import json
 import logging
 import math
 from collections.abc import Callable, Collection, Hashable, Sequence
-from typing import TYPE_CHECKING, ClassVar, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -393,10 +394,7 @@ def stated_operation(equation) -> Callable | None:
 @dataclasses.dataclass(frozen=True)
 class Surrogate:
     """A surrogate's bodies (`surrogate`): rewritten within, never related to autodiff's derivative of its
-    forward. `held` is False for a surrogate whose trace mutates state or reads an untraced context
-    (`dew.nn.in_backward.RunRule`), which `_SPANS` never caches."""
-
-    held: ClassVar[bool] = True
+    forward."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -573,7 +571,7 @@ def _span_key(kind: Kind, function: Callable, structure, flat: Sequence) -> Hash
     from dew.nn.kernels import options
     from dew.nn.kernels.templates import report
 
-    if report.launch_tracing() or (isinstance(kind, Surrogate) and not kind.held):
+    if report.launch_tracing() or any(variable.get() is not None for variable in _UNHELD_WHILE):
         # Within a launch's trace (a Mosaic kernel's body): the launch's own, which its held trace holds
         # (`tuning.lowered_once`); keyed here, its pending launch would miss at every launch and pin its
         # frames (row 11002's review, F4). Asked without the launch's digest, whose identity traces the
@@ -586,6 +584,20 @@ def _span_key(kind: Kind, function: Callable, structure, flat: Sequence) -> Hash
         return None
     return (kind, structure, statement, tuple(jax.typeof(leaf) for leaf in flat), options.held_context(),
             tuple(sorted(np.geterr().items())))
+
+
+_UNHELD_WHILE: list[contextvars.ContextVar] = []
+"""The contexts within which no marked span is held (`unheld_while`)."""
+
+
+def unheld_while(variable: contextvars.ContextVar) -> contextvars.ContextVar:
+    """`variable`, a context a trace reads that no trace's key states (`dew._cache.untraced`), registered so
+    that no marked span traced while it holds a value is held or taken from `_SPANS` (`_span_key`): a span
+    held there would carry what the context made it trace into every later trace of the same key, the
+    context set or not, a span enclosing one that reads it among them, whose key states only its own kind
+    (`dew.nn.in_backward`'s plan and gates, row 12980's review)."""
+    _UNHELD_WHILE.append(variable)
+    return variable
 
 
 def marked[Result](kind: Kind, function: Callable[..., Result]) -> Callable[..., Result]:

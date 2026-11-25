@@ -24,7 +24,7 @@ import contextvars
 import dataclasses
 import functools
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from typing import ClassVar, NamedTuple
+from typing import NamedTuple
 
 import jax
 import jax.extend.core as jcore
@@ -38,6 +38,7 @@ from dew.nn.derivatives import (
     contracted,
     declared_derivative,
     marked_call_p,
+    unheld_while,
     with_gradients_formed,
 )
 from dew.nn.finite import zeroed_unless
@@ -65,10 +66,7 @@ class RunRule(Surrogate):
     """The rule of a run updating or pooling in its backward (`scanned_run`): a surrogate (its cotangents
     the step's new state), which a step's gate tells from every other custom rule by its kind
     (`dew.training.transaction._run_reads`): an outer rule wrapping it, which may scale what it pools, is
-    no run's. Never held in `derivatives._SPANS`: its forward mutates `_Traced` as it traces and its
-    backward reads the untraced `_GATE` and `_FINITE` contexts."""
-
-    held: ClassVar[bool] = False
+    no run's."""
 
 
 RUN_RULE = RunRule()
@@ -222,15 +220,17 @@ class InBackward:
     moments and norms, None for what it reads beside them (its input, its rows' values)."""
 
 
-_PLAN: contextvars.ContextVar[InBackward | None] = _cache.untraced(
-    contextvars.ContextVar("dew_in_backward", default=None))
-_GATE: contextvars.ContextVar[jax.Array | None] = _cache.untraced(
-    contextvars.ContextVar("dew_in_backward_gate", default=None))
-_FINITE: contextvars.ContextVar[jax.Array | None] = _cache.untraced(
-    contextvars.ContextVar("dew_in_backward_finite", default=None))
-"""Per-step tracing contexts for `scanned_run`, marked untraced (`_cache.untraced`) so global trace caches
-keyed by `options.trace_context()` (`derivatives._SPANS`, `projections._DECISIONS`, `algebra.fusion`) neither
-thrash per trace nor retain `InBackward.update` closures, transactions, trainers, executables, or tracers."""
+_PLAN: contextvars.ContextVar[InBackward | None] = unheld_while(_cache.untraced(
+    contextvars.ContextVar("dew_in_backward", default=None)))
+_GATE: contextvars.ContextVar[jax.Array | None] = unheld_while(_cache.untraced(
+    contextvars.ContextVar("dew_in_backward_gate", default=None)))
+_FINITE: contextvars.ContextVar[jax.Array | None] = unheld_while(_cache.untraced(
+    contextvars.ContextVar("dew_in_backward_finite", default=None)))
+"""A step's plan and gates for `scanned_run`, which no trace's key states (`_cache.untraced`), so a trace kept
+by `options.trace_context()` (`projections._DECISIONS`, `algebra.fusion`, keyed by their operands and
+regions) neither misses at every step nor holds the plan's update closures, its transaction, its trainer and
+executables, or its tracers (row 12980); and within which no marked span is held (`unheld_while`), whose
+trace may read them."""
 
 
 @contextlib.contextmanager

@@ -1059,3 +1059,34 @@ def test_a_scanned_runs_gated_backward_is_not_cached_across_gates():
     closed = stepped(kernel, x, jnp.asarray(a=False))
     np.testing.assert_array_equal(np.asarray(closed), np.asarray(kernel))
     assert not np.array_equal(np.asarray(opened), np.asarray(kernel))
+
+
+def _gate_read(x):
+    """Twice `x` where a step's gates are open (`in_backward.gated`), thrice otherwise: a span whose trace
+    reads a context no key states."""
+    from dew.nn import in_backward
+
+    return x * (2.0 if in_backward._GATE.get() is not None else 3.0)
+
+
+@pytest.mark.parametrize("gated_first", [True, False])
+def test_a_span_traced_within_a_steps_gates_is_held_for_no_other_trace(gated_first):
+    """A marked span traced while a step's gates are open (`in_backward.gated`) is neither held for nor
+    taken by any other trace of the same span (`derivatives.unheld_while`): two fresh traces of one span
+    over the same arguments, one within the gates and one without, in either order, each compute what its
+    own context made it trace (row 12980's review: a span held under the gates handed its program to a
+    trace without them, an outer span enclosing a run's rule among them)."""
+    from dew.nn import in_backward
+    from dew.nn.derivatives import Surrogate, marked
+
+    x = jnp.ones((4,), jnp.float32)
+
+    def traced(open_gates: bool) -> float:
+        span = jax.jit(lambda x: marked(Surrogate(), _gate_read)(x))
+        if not open_gates:
+            return float(span(x)[0])
+        with in_backward.gated(jnp.asarray(a=True)):
+            return float(span(x)[0])
+
+    order = (True, False) if gated_first else (False, True)
+    assert {gates: traced(gates) for gates in order} == {True: 2.0, False: 3.0}
