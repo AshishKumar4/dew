@@ -38,6 +38,7 @@ from dew.nn.kernels.templates.cost import (
     Work,
     followed,
     issued as issue_slots,
+    launch_seconds,
     most,
     multiplied,
     repeated,
@@ -1196,6 +1197,24 @@ def warps_of(kernel) -> float | None:
     Mosaic GPU program's; 0 for another backend's), None where no costed launch counted it."""
     return _WARPS.get(_body(kernel))
 
+
+def launches_seconds(jaxpr: jax_core.Jaxpr, target: generation.GpuTarget, *,
+                     resident: Callable[[jax_core.JaxprEqn], int] = lambda kernel: 1) -> float | None:
+    """A traced program's native launches priced on `target`, in sequence: each kernel's work as its costed
+    launch counted it (`work_of`), over its programs (`launch_programs`) at the residency its plan gives it
+    (`resident`; one by default) and the warps it issues over (`warps_of`), through `cost.launch_seconds`;
+    None where any launch's work its emission does not count, its price unknown, never 0. What XLA runs
+    beside them is the algebra's to price (`dew.algebra.program.priced`)."""
+    total = 0.0
+    for kernel in programs.equations(jaxpr):
+        if kernel.primitive not in programs.NATIVE_KERNELS:
+            continue
+        work = work_of(kernel)
+        if work is None:
+            return None
+        total += launch_seconds(work, launch_programs(kernel), target, resident=resident(kernel),
+                                warps=warps_of(kernel) or 0.0)
+    return total
 
 def work_of(kernel) -> Work | None:
     """A kernel equation's work as its costed launch counted it (`launch_work`), None where no costed launch
