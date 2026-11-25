@@ -13,6 +13,7 @@ import contextlib
 import importlib.util
 import os
 from pathlib import Path
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -196,31 +197,50 @@ PRODUCTION = ("qwen3.5-27b-gdn", "kimi-linear-kda")
 """The geometries whose 16-bit calls the recurrence resource gate requires to derive tiles on every family,
 Dew's production cells (tests/test_recurrence_mosaic.py's `production_refusals`)."""
 
-FAST_BACKWARD_REFUSED: dict[tuple[str, str, bool], int] = {("qwen3.5-27b-gdn", "sm120", True): 13064}
+class Refusal(NamedTuple):
+    """A declared refusal of a production geometry's 16-bit training (`FAST_BACKWARD_REFUSED`): the open row
+    tracking it, and the launches whose spill it covers (`spills`: a derivation refused when every config's
+    compile spilled one of them, `report.refused_at`), or none for its fast backward refused by its model
+    (`template.backward_holds`)."""
+
+    row: int
+    spills: frozenset[str] = frozenset()
+
+
+FAST_BACKWARD_REFUSED: dict[tuple[str, str, bool], Refusal] = {
+    ("qwen3.5-27b-gdn", "sm120", True): Refusal(13064, frozenset({"recurrence_keys_back"}))}
 """The production geometries' 16-bit training refused on a target, over packed documents or one row
-(`bool`): its fast backward not holding at its derived tiles (`template.backward_holds`), or a launch of
-every config it derives spilling (`report.refused_at`), its gradient the port's or the portable math's there,
-each by the open row tracking it. The gate fails a refusal not declared here and a declared one that holds
-again, so a declaration retires with its row (`production_refusals`). Qwen3.5-27B's packed training on an
-sm120: its keys' backward at 255 registers spills 8 bytes where one row's fits (row 13064)."""
+(`bool`), its gradient the port's or the portable math's there, each as declared (`Refusal`). The gate fails
+a refusal not declared here, one past its declaration (a backward's model where it declares spills, a spill
+of a launch it does not name), and a declared one that holds again, so a declaration retires with its row
+(`production_refusals`). Qwen3.5-27B's packed training on an sm120: its keys' backward at 255 registers
+spills 8 bytes where one row's fits (row 13064)."""
 
 
-def production_refusals(target, group: tuple, refused: list[str]) -> list[str]:
+def production_refusals(target, group: tuple, refused: list[str], spilled: set[str]) -> list[str]:
     """The recurrence resource gate's failures of `group` (`GATE_GROUPS`') on `target` over the calls it
-    refused (`refused`): a production geometry's 16-bit call that derived no tiles, or whose fast backward
-    was refused, where `FAST_BACKWARD_REFUSED` declares no training refusal; and, where it declares one, a
-    training group at its derived tiles refused nothing."""
+    refused (`refused`) and the kernels its step-down refused for spilling (`spilled`): a production
+    geometry's 16-bit call that derived no tiles, or whose fast backward was refused, past what
+    `FAST_BACKWARD_REFUSED` declares of it; and, where it declares a refusal, a training group at its derived
+    tiles that refused nothing."""
     name, dtype, training, packed, variant = group
     if name not in PRODUCTION or dtype != jnp.bfloat16:
         return []
     declared = FAST_BACKWARD_REFUSED.get((name, str(target), bool(packed))) if training else None
-    if declared is None:
-        return [f"{case}: its fast backward does not hold, no open row declaring it"
-                if "fast backward" in case else f"{case}: no tiles derived" for case in refused]
-    if not isinstance(variant, int) and not refused:
+    if declared is not None and not isinstance(variant, int) and not refused:
         return [f"{name}{' packed' if packed else ''} on {target}: its training holds; strike it from "
-                f"FAST_BACKWARD_REFUSED (row {declared})"]
-    return []
+                f"FAST_BACKWARD_REFUSED (row {declared.row})"]
+
+    def covered(case: str) -> bool:
+        if declared is None:
+            return False
+        if "fast backward" in case:
+            return not declared.spills
+        return bool(spilled) and all(kernel.startswith(tuple(declared.spills)) for kernel in spilled)
+
+    return [f"{case}: its fast backward does not hold, no open row declaring it" if "fast backward" in case
+            else f"{case}: no tiles derived (spilled: {sorted(spilled)})"
+            for case in refused if not covered(case)]
 
 
 def on_the_host():
