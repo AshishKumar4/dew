@@ -1774,7 +1774,7 @@ def _cotangents(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, pr
         outs = _tupled(epilogue, *args)
         return tuple(outs[at] for at in reached)
 
-    rows = functools.partial(_rows, axes_of=epilogue_axes, group_sizes=group_sizes, rows=acc_shape[0])
+    rows = functools.partial(side_rows, axes_of=epilogue_axes, group_sizes=group_sizes, rows=acc_shape[0])
     sides = jax.eval_shape(rows, epilogue_arrays)
     # The accumulator the products sum in: fp32, an fp64 product's fp64 (`xla_mainloop`). The epilogue's
     # derivative reads it at that width (a row scale's gradient sums it times the cotangent), so it is
