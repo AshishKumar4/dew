@@ -390,6 +390,8 @@ import json
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.lm import LMObjective
 from dew.objectives.residuals import Residuals
+from dew._code import provenance, provenance_code
+from dew.nn.kernels.templates.attention import Capped
 from dew.training.rungs import _code
 
 
@@ -404,7 +406,8 @@ class Fitted(Residuals):
 lm = LMObjective(CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=1, mlp_features=8,
                                    max_seq_len=8), 4)
 print(json.dumps({"lm": _code(lm, lm.program_key(), None),
-                  "fitted": _code(Fitted(), Fitted().program_key(), None)}))
+                  "fitted": _code(Fitted(), Fitted().program_key(), None),
+                  "capped": provenance_code("dew.nn.kernels.templates.report", provenance([Capped(30.0)]))}))
 """
 
 
@@ -413,7 +416,9 @@ def test_a_rung_records_code_is_its_step_its_objective_and_its_models_and_none_e
     Dew's: a file no step's code imports leaves an LM's and a model-free objective's alike, the LM's model's
     module moves the LM's, and a model-free objective's base (`Residuals`, which nothing of Dew's imports,
     its loss its own) moves that objective's and leaves the LM's. Every file's digest made each rung test's
-    CI key every file of Dew's (22% of the suite's rows)."""
+    CI key every file of Dew's (22% of the suite's rows). A kernel launch's records holding a hook of Dew's
+    class (`Capped`), keyed by every file before, now key on its class's module: an edit there moves them,
+    an unrelated file's leaves them."""
     tree = tmp_path / "src"
     for name in ("dew", "_dew_torch"):
         shutil.copytree(REPO_ROOT / "src" / name, tree / name, ignore=shutil.ignore_patterns("__pycache__"))
@@ -428,6 +433,8 @@ def test_a_rung_records_code_is_its_step_its_objective_and_its_models_and_none_e
     (package / "_spare_rung.py").write_text("")
     before = codes()
     assert codes(package / "_spare_rung.py") == before
+    hooked = codes(package / "nn" / "kernels" / "templates" / "attention.py")
+    assert hooked["capped"] != before["capped"]
     model = codes(package / "nn" / "backbones" / "causal_transformer.py")
     assert model["lm"] != before["lm"]
     base = codes(package / "objectives" / "residuals.py")
