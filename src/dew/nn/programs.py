@@ -27,7 +27,7 @@ from jax.core import ShapedArray
 from jax.experimental.pallas import pallas_call_p
 from jax.extend.backend import backends
 
-from dew._devices import compute_capability
+from dew._devices import _compute_capability
 
 
 def holes[Tree, Leaf](tree: Tree, selected: Callable[[Leaf], bool] | Sequence[bool],
@@ -81,7 +81,7 @@ def lowering_platform(device) -> str | None:
     for platform, names in (("rocm", ("rocm",)), ("oneapi", ("oneapi", "sycl")), ("cuda", ("cuda",))):
         if any(name in version for name in names):
             return platform
-    capability = compute_capability(device)
+    capability = _compute_capability(device)
     return "cuda" if capability and re.fullmatch(r"\d+\.\d+", str(capability)) else None
 
 

@@ -1386,9 +1386,9 @@ def device_generation() -> str:
 def _generation(device) -> str:
     """`device`'s own generation: a CUDA device's by its compute capability, a TPU's by its kind, another
     platform's its name."""
-    from dew._devices import compute_capability
+    from dew._devices import _compute_capability
 
-    capability = compute_capability(device) if device.platform == 'gpu' else None
+    capability = _compute_capability(device) if device.platform == 'gpu' else None
     if capability:
         return 'sm' + capability.replace('.', '')
     if device.platform == 'tpu':
